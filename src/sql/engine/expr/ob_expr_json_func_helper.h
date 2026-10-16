@@ -1,0 +1,777 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_SQL_OB_EXPR_JSON_FUNC_HELPER_H_
+#define OCEANBASE_SQL_OB_EXPR_JSON_FUNC_HELPER_H_
+
+#include "sql/engine/expr/ob_expr_util.h"
+#include "sql/engine/expr/ob_expr_lob_utils.h"
+#include "share/object/ob_obj_cast.h"
+#include "objit/common/ob_item_type.h"
+#include "sql/session/ob_sql_session_info.h"
+#include "lib/lob/ob_lob_base.h"
+#include "lib/json_type/ob_json_tree.h"
+#include "lib/json_type/ob_json_base.h"
+#include "lib/json_type/ob_json_bin.h"
+#include "lib/json_type/ob_json_parse.h"
+#include "lib/json_type/ob_json_wrapper.h"
+#include "lib/json_type/ob_json_schema.h"
+#include "lib/json_type/ob_json_diff.h"
+#include "sql/engine/expr/ob_expr_result_type_util.h"
+#include "storage/lob/common/ob_lob_util.h"
+#include "sql/engine/expr/ob_expr_multi_mode_func_helper.h"
+#include "sql/engine/ob_exec_context.h"
+
+using namespace oceanbase::common;
+
+namespace oceanbase
+{
+namespace storage
+{
+class ObLobCursor;
+}
+
+namespace sql
+{
+const static int32_t OB_LITERAL_MAX_INT_LEN = 21;
+
+class ObJsonMemCtx : public ObExprOperatorCtx
+{
+public:
+  ObJsonMemCtx()
+  : ObExprOperatorCtx(), ctx_arena_("JsonMemCtx", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
+    scratch_arena_("JsonMemScratch", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()), allocator_(nullptr),
+    json_max_depth_config_(100), path_cache_(nullptr)
+  {}
+  virtual ~ObJsonMemCtx() {}
+
+  int init(uint64_t expr_type, uint64_t tenant_id, bool need_path_cache = false);
+  void reuse()
+  {
+    if (allocator_ != nullptr) {
+      allocator_->reuse();
+    }
+  }
+
+  MultimodeAlloctor *get_allocator() { return allocator_; }
+  int32_t get_json_max_depth_config() const { return json_max_depth_config_; }
+  void set_json_max_depth_config(int32_t config) { json_max_depth_config_ = config; }
+  ObJsonPathCache *get_path_cache() { return path_cache_; }
+  common::ObIAllocator &get_ctx_allocator() { return ctx_arena_; }
+
+private:
+  // Persistent data throughout the expression lifetime, e.g. MultimodeAlloctor, ObJsonPathCache
+  common::ObArenaAllocator ctx_arena_;
+  // Temporary data within a single row / batch, e.g. json string contents
+  common::ObArenaAllocator scratch_arena_;
+  // Safely manages per-row memory; the object itself is allocated on ctx_arena_,
+  // while the memory it manages belongs to scratch_arena_
+  MultimodeAlloctor *allocator_;
+  int32_t json_max_depth_config_;
+  ObJsonPathCache *path_cache_;
+};
+
+struct ObJsonExprParam {
+public:
+  ObJsonExprParam()
+  : truncate_(0),
+    format_json_(0),
+    wrapper_(0),
+    empty_type_(0),
+    error_type_(0),
+    pick_(T_NULL),
+    is_empty_default_const_(false),
+    is_error_default_const_(false),
+    is_asis_(false),
+    is_multivalue_(false),
+    empty_val_(),
+    error_val_(),
+    on_mismatch_(),
+    on_mismatch_type_(),
+    accuracy_(),
+    dst_type_(),
+    pretty_type_(0),
+    ascii_type_(0),
+    scalars_type_(0),
+    path_str_(),
+    json_path_(nullptr),
+    is_init_from_cache_(false)
+  {}
+  virtual ~ObJsonExprParam() {}
+public:
+  int8_t truncate_;
+  int8_t format_json_;
+  int8_t wrapper_;
+  int8_t empty_type_;
+  int8_t error_type_;
+  ObItemType pick_;
+  bool is_empty_default_const_;
+  bool is_error_default_const_;
+  bool is_asis_;
+  bool is_multivalue_;
+  ObDatum *empty_val_;
+  ObDatum *error_val_;
+  common::ObSEArray<int8_t, 1, common::ModulePageAllocator, true> on_mismatch_;
+  common::ObSEArray<int8_t, 1, common::ModulePageAllocator, true> on_mismatch_type_;
+  ObAccuracy accuracy_;
+  ObObjType dst_type_;
+  int8_t pretty_type_;
+  int8_t ascii_type_;
+  int8_t scalars_type_;
+  ObString path_str_;
+  ObJsonPath* json_path_;
+  bool is_init_from_cache_;
+};
+
+class ObJsonParamCacheCtx : public ObExprOperatorCtx
+{
+  public:
+  ObJsonParamCacheCtx(common::ObIAllocator *allocator)
+    : ObExprOperatorCtx(),
+      path_cache_(allocator),
+      is_first_exec_(true),
+      is_json_path_const_(false),
+      json_param_(),
+      view_hits_(),
+      cand_cache_inited_(false),
+      cand_is_null_(false),
+      cand_wrapper_()
+  {}
+  virtual ~ObJsonParamCacheCtx() {}
+  ObJsonPathCache *get_path_cache() { return &path_cache_; }
+
+private:
+  ObJsonPathCache path_cache_;
+public:
+  bool is_first_exec_;
+  bool is_json_path_const_;
+  ObJsonExprParam json_param_;
+  // reused across rows to avoid per-row ObSEArray construction/destruction in the fast path.
+  // Call view_hits_.reuse() before each seek to clear stale results from the previous row.
+  ObSEArray<common::ObJsonWrapper, 1> view_hits_;
+  bool cand_cache_inited_;
+  bool cand_is_null_;
+  common::ObJsonWrapper cand_wrapper_;
+};
+
+struct ObConv2JsonParam {
+  ObConv2JsonParam(bool to_bin) :
+  to_bin_(to_bin),
+  deep_copy_(false),
+  relax_type_(true),
+  format_json_(false),
+  is_schema_(false)
+  {}
+  ObConv2JsonParam(bool to_bin, bool deep_copy) :
+  to_bin_(to_bin),
+  deep_copy_(deep_copy),
+  relax_type_(true),
+  format_json_(false),
+  is_schema_(false)
+  {}
+  ObConv2JsonParam(bool to_bin, bool deep_copy, bool relax_type) :
+  to_bin_(to_bin),
+  deep_copy_(deep_copy),
+  relax_type_(relax_type),
+  format_json_(false),
+  is_schema_(false)
+  {}
+  ObConv2JsonParam(bool to_bin, bool deep_copy, bool relax_type, bool format_json) :
+  to_bin_(to_bin),
+  deep_copy_(deep_copy),
+  relax_type_(relax_type),
+  format_json_(format_json),
+  is_schema_(false)
+  {}
+  ObConv2JsonParam(bool to_bin, bool deep_copy, bool relax_type, bool format_json, bool is_schema) :
+  to_bin_(to_bin),
+  deep_copy_(deep_copy),
+  relax_type_(relax_type),
+  format_json_(format_json),
+  is_schema_(is_schema)
+  {}
+
+  ObConv2JsonParam(bool to_bin, bool deep_copy, bool relax_type, bool format_json, bool is_schema, bool is_wrap_fail) :
+    to_bin_(to_bin),
+    deep_copy_(deep_copy),
+    relax_type_(relax_type),
+    format_json_(format_json),
+    is_schema_(is_schema),
+    wrap_on_fail_(is_wrap_fail) {}
+  bool to_bin_;
+  bool deep_copy_ = false;
+  bool relax_type_ = true;
+  bool format_json_ = false;
+  bool is_schema_ = false;
+  bool wrap_on_fail_ = false;
+};
+
+class ObJsonExprHelper final
+{
+  class ObJsonPathCacheCtx : public ObExprOperatorCtx
+  {
+  public:
+    ObJsonPathCacheCtx(common::ObIAllocator *allocator)
+      : ObExprOperatorCtx(),
+        path_cache_(allocator)
+    {}
+    virtual ~ObJsonPathCacheCtx() {}
+    ObJsonPathCache *get_path_cache() { return &path_cache_; }
+  private:
+    ObJsonPathCache path_cache_;
+  };
+  class ObJsonSchemaCacheCtx : public ObExprOperatorCtx
+  {
+  public:
+    ObJsonSchemaCacheCtx(common::ObIAllocator *allocator)
+      : ObExprOperatorCtx(),
+        schema_cache_(allocator)
+    {}
+    virtual ~ObJsonSchemaCacheCtx() {}
+    ObJsonSchemaCache *get_schema_cache() { return &schema_cache_; }
+  private:
+    ObJsonSchemaCache schema_cache_;
+  };
+public:
+  static ObJsonParamCacheCtx* get_param_cache_ctx(const uint64_t& id, ObExecContext *exec_ctx);
+  static int get_json_or_str_data(ObExpr *expr, ObEvalCtx &ctx,
+                                  common::ObIAllocator &allocator,
+                                  ObString& str, bool& is_null);
+  static int get_json_or_str_data(ObExpr *expr, ObEvalCtx &ctx,
+                                  MultimodeAlloctor &allocator,
+                                  ObString& str, bool& is_null);
+  // Fast overload: caller already holds the evaluated datum (skips re-eval, null check, type check).
+  static int get_json_or_str_data(ObExpr *expr, ObDatum *datum,
+                                  MultimodeAlloctor &allocator,
+                                  ObString &str, ObEvalCtx &ctx);
+  static int get_json_wrapper(ObExpr *expr, ObDatum *datum,
+                              MultimodeAlloctor &allocator,
+                              ObEvalCtx &ctx,
+                              common::ObJsonWrapper &wrapper,
+                              bool need_set_baseline_size);
+  /*
+  get json doc to JsonWrapper in static_typing_engine (doc semantics).
+  Same pipeline as get_json_wrapper above but takes an arg index and does
+  eval/null/type-check/error-mapping itself, mirroring get_json_doc so callers
+  need no boilerplate. The partial-update branch is intentionally omitted: it is
+  gated on OB_JSON_PARTIAL_UPDATE_ALLOW which is only set on write-side exprs
+  (JSON_SET/REPLACE/REMOVE), so read functions never take it.
+  Named get_json_doc_wrapper to mirror get_json_doc; the value-semantics
+  counterpart (scalar-capable) is get_json_val_wrapper below.
+  @param[in]  expr          the input arguments
+  @param[in]  ctx           the eval context
+  @param[in]  allocator     the Allocator in context
+  @param[in]  index         the input arguments index
+  @param[out] wrapper       the output JsonWrapper
+  @param[out] is_null       the flag for null situation
+  @param[in]  relax         allow relaxed json syntax (oracle only)
+  @param[in]  preserve_dup  preserve duplicate keys during parse
+  @return Returns OB_SUCCESS on success, error code otherwise.
+  */
+  static int get_json_doc_wrapper(const ObExpr &expr, ObEvalCtx &ctx,
+                                  MultimodeAlloctor &allocator,
+                                  uint16_t index, common::ObJsonWrapper &wrapper,
+                                  bool &is_null, bool relax = false,
+                                  bool preserve_dup = false);
+  /*
+  get json value to JsonWrapper in static_typing_engine (value semantics).
+  Wraps get_json_val's full type coverage (json column / json string / raw /
+  collection / bare scalar int/bool/double/...) into an ObJsonWrapper, mirroring
+  get_json_val so callers need no boilerplate. Distinct from get_json_doc_wrapper
+  (doc semantics, json/string only, bin-view fast path): this one converts bare
+  SQL scalars to a tree DOM — needed by MEMBER OF whose candidate is a bare
+  scalar (e.g. 17 MEMBER OF ('[1,2,17]')). A JSON-binary arg still takes the
+  zero-copy ObJsonBinView path (delegating to get_json_doc_wrapper above);
+  everything else builds a tree DOM via get_json_val.
+  @param[in]  expr          the input arguments
+  @param[in]  ctx           the eval context
+  @param[in]  allocator     the Allocator in context
+  @param[in]  index         the input arguments index
+  @param[out] wrapper       the output JsonWrapper
+  @param[out] is_null       the flag for null situation
+  @return Returns OB_SUCCESS on success, error code otherwise.
+  */
+  static int get_json_val_wrapper(const ObExpr &expr, ObEvalCtx &ctx,
+                                  MultimodeAlloctor &allocator,
+                                  uint16_t index, common::ObJsonWrapper &wrapper,
+                                  bool &is_null);
+  /*
+  get the "candidate" json wrapper, dispatching on whether the candidate arg is
+  a whole-execution constant. A constant candidate is parsed once and reused
+  across rows (get_json_candidate_wrapper_with_cache, requires a non-NULL
+  param_ctx); a non-constant candidate is parsed per row via
+  get_json_doc_wrapper (doc semantics) or get_json_val_wrapper (val semantics,
+  scalar-capable, for MEMBER OF). Whether the candidate is constant is derived
+  internally from expr.args_[index]->is_static_const_expr(); it is NOT inferred
+  from param_ctx, since in json_contains the param_ctx is also fetched when a
+  third path argument exists, so param_ctx != NULL does not imply a constant
+  candidate.
+  @param[in]  expr              the input arguments
+  @param[in]  ctx               the eval context
+  @param[in]  allocator         the per-row temp allocator
+  @param[in]  index             the candidate argument index
+  @param[in]  param_ctx         the runtime cache ctx (from get_param_cache_ctx);
+                                only used when the candidate is constant; may be
+                                NULL otherwise
+  @param[in]  use_val_semantics true -> get_json_val_wrapper (scalar-capable,
+                                for MEMBER OF); false -> get_json_doc_wrapper
+  @param[out] wrapper          the output candidate wrapper
+  @param[out] is_null           the flag for null situation
+  @return Returns OB_SUCCESS on success, error code otherwise.
+  */
+  static int get_json_candidate_wrapper(const ObExpr &expr, ObEvalCtx &ctx,
+                                        MultimodeAlloctor &allocator,
+                                        uint16_t index,
+                                        ObJsonParamCacheCtx *param_ctx,
+                                        bool use_val_semantics,
+                                        common::ObJsonWrapper &wrapper,
+                                        bool &is_null);
+  /*
+  get json doc to JsonBase in static_typing_engine
+  @param[in]  expr       the input arguments
+  @param[in]  ctx        the eval context
+  @param[in]  allocator  the Allocator in context
+  @param[in]  index      the input arguments index
+  @param[out] j_base     the pointer to JsonBase
+  @param[out] is_null    the flag for null situation
+  @return Returns OB_SUCCESS on success, error code otherwise.
+  */
+  static int get_json_doc(const ObExpr &expr, ObEvalCtx &ctx,
+                          MultimodeAlloctor &allocator,
+                          uint16_t index, ObIJsonBase*& j_base,
+                          bool &is_null, bool need_to_tree=true, 
+                          bool relax = true, bool preserve_dup = false);
+  static int get_json_schema(const ObExpr &expr, ObEvalCtx &ctx,
+                            MultimodeAlloctor &allocator,
+                            uint16_t index, ObIJsonBase*& j_base,
+                            bool &is_null);
+
+
+  static int get_json_for_partial_update(
+      const ObExpr &expr,
+      const ObExpr &json_expr,
+      ObEvalCtx &ctx,
+      ObIAllocator &allocator,
+      ObDatum &json_datum,
+      ObIJsonBase *&j_base);
+
+  static int get_partial_json_bin(
+      ObIAllocator &allocator,
+      ObILobCursor *cursor,
+      ObJsonBinUpdateCtx *update_ctx, 
+      ObIJsonBase *&j_base);
+  static int get_json_for_partial_update_with_curosr(
+      const ObExpr &expr,
+      const ObExpr &json_expr,
+      ObEvalCtx &ctx,
+      ObIAllocator &allocator,
+      ObDatum &json_datum,
+      ObIJsonBase *&j_base);
+
+
+  static int cast_to_json_tree(ObString &text, 
+                               common::ObIAllocator *allocator, 
+                               uint32_t parse_flag = 0,
+                               uint32_t max_depth_config = JSON_DOCUMENT_MAX_DEPTH);
+  /*
+  get json value to JsonBase in static_typing_engine
+  @param[in]  expr       the input arguments
+  @param[in]  ctx        the eval context
+  @param[in]  allocator  the Allocator in context
+  @param[in]  index      the input arguments index
+  @param[out] j_base     the pointer to JsonBase
+  @param[in]  to_bin     expect value is binary or not
+  @return Returns OB_SUCCESS on success, error code otherwise.
+  */
+  static int get_json_val(const ObExpr &expr, ObEvalCtx &ctx,
+                          common::ObIAllocator *allocator, uint16_t index,
+                          ObIJsonBase*& j_base, bool to_bin = false, bool format_json = false, 
+                          uint32_t parse_flag = ObJsonParser::JSN_RELAXED_FLAG);
+  static int get_const_json_schema(const common::ObObj &data, const char* func_name, 
+                                   common::ObIAllocator *allocator, ObIJsonBase*& j_schema);
+
+  /*
+  get json value to JsonBase in old_typing_engine
+  @param[in]  data       the input argument
+  @param[in]  is_bool    whether input data is JsonBoolean
+  @param[in]  ctx        the eval context
+  @param[in]  allocator  the Allocator in context
+  @param[in]  to_bin     expect value is binary or not
+  @param[out] j_base     the pointer to JsonBase
+  @return Returns OB_SUCCESS on success, error code otherwise.
+  */
+  static int get_json_val(const common::ObObj &data, ObExecContext *ctx,
+                          bool is_bool, common::ObIAllocator *allocator,
+                          ObIJsonBase*& j_base, bool to_bin= false);
+  static int refine_range_json_value_const(
+                          const common::ObObj &data, ObExecContext *ctx,
+                          bool is_bool, common::ObIAllocator *allocator,
+                          ObIJsonBase*& j_base, bool to_bin = false);
+  static int get_json_val(const common::ObDatum &data, 
+                          ObExecContext &ctx,
+                          ObExpr* expr,
+                          common::ObIAllocator *allocator,
+                          ObObjType val_type,
+                          ObCollationType &cs_type,
+                          ObIJsonBase*& j_base, bool to_bin = false);
+  static int oracle_datum2_json_val(const ObDatum *json_datum,  ObObjMeta& data_meta, common::ObIAllocator *allocator,
+                                    ObBasicSessionInfo *session, ObIJsonBase*& j_base, bool is_bool_data_type,
+                                    bool format_json = false, bool is_strict = false, bool is_bin = false);
+  
+  static int eval_oracle_json_val(ObExpr *expr, ObEvalCtx &ctx, MultimodeAlloctor *allocator,
+                                ObIJsonBase*& j_base, bool format_json = false, bool is_strict = false, bool is_bin = false, bool is_absent_null = false);
+ 
+  /*
+  replace json_old with json_new in json_doc
+  @param[in]  json_old   the old json node to be replaced
+  @param[in]  json_new   the new json node to replace
+  @param[in]  json_doc   the root json node of old json node
+  @return Returns OB_SUCCESS on success, error code otherwise.
+  */
+  static int json_base_replace(ObIJsonBase *json_old, ObIJsonBase *json_new,
+                               ObIJsonBase *&json_doc);
+
+  static int find_and_add_cache(ObIAllocator &allocator,
+                                ObJsonPathCache* path_cache, ObJsonPath*& res_path,
+                                ObString& path_str, int arg_idx, bool enable_wildcard, 
+                                bool is_const);
+  static int find_and_add_schema_cache(ObJsonSchemaCache* schema_cache, ObIJsonBase*& j_schema,
+                                      ObString& schema_str, int arg_idx, const ObJsonInType& in_type);
+
+  // Validate and cache simple path for fast path optimization
+  static int validate_and_cache_simple_path(ObJsonPathCache* path_cache,
+                                             ObString& path_str,
+                                             ObIAllocator &allocator,
+                                             int arg_idx);
+  static int parse_and_cache_path_keys(ObJsonPathCache *path_cache,
+                                        ObString &path_str,
+                                        ObIAllocator &allocator,
+                                        int arg_idx);
+
+  static ObJsonPathCache* get_path_cache_ctx(const uint64_t& id, ObExecContext *exec_ctx);
+  static ObJsonSchemaCache* get_schema_cache_ctx(const uint64_t& id, ObExecContext *exec_ctx);
+
+  static int is_json_zero(const ObString& data, int& result);
+
+  static int is_json_true(const ObString& data, int& result);
+
+  static int get_sql_scalar_type(ObEvalCtx& ctx,
+                                 int64_t origin, 
+                                 ObObjType& scalar_type, 
+                                 int32_t& scalar_len,
+                                 int32_t& precision,
+                                 int32_t& scale,
+                                 ObAccuracy& accuracy,
+                                 ObLengthSemantics& length_semantics);
+  
+  /*
+  try to transfrom scalar data to jsonBase
+  @param[in]  datum          the input datum
+  @param[in]  type           the type of input argument
+  @param[in]  allocator      the Allocator in context
+  @param[in]  scale          the scale for json decimal
+  @param[in]  ObTimeZoneInfo the timeZone info
+  @param[out] j_base        the pointer to ObIJsonBase
+  @param[in]  to_bin         whether convert to binary
+  @return Returns OB_SUCCESS on success, error code otherwise.
+  */
+  template <typename T>
+  static int transform_scalar_2jsonBase(const T &datum,
+                                        ObObjType type,
+                                        common::ObIAllocator *allocator,
+                                        ObScale scale,
+                                        const ObTimeZoneInfo *tz_info,
+                                        ObBasicSessionInfo *session,
+                                        ObIJsonBase*& j_base,
+                                        bool to_bin,
+                                        bool is_bool = false);
+  /*
+  try to transfrom from type which is_convertible_to_json to jsonBase
+  @param[in]  datum          the input datum
+  @param[in]  type           the type of input argument
+  @param[in]  allocator      the Allocator in context
+  @param[in]  cs_type        the collation type
+  @param[out] j_base         the pointer to jsonBase
+  @param[in]  to_bin         whether convert to binary
+  @param[in]  deep_copy      whether deep copy input string from datum
+  @return Returns OB_SUCCESS on success, error code otherwise.
+  */
+  template <typename T>
+  static int transform_convertible_2jsonBase(const T &datum,
+                                             ObObjType type,
+                                             common::ObIAllocator *allocator,
+                                             ObCollationType cs_type,
+                                             ObIJsonBase*& j_base,
+                                             ObConv2JsonParam flags);
+
+  static bool is_cs_type_bin(ObCollationType &cs_type);
+  static int get_timestamp_str_in_oracle_mode(ObEvalCtx &ctx,
+                                              const ObDatum &datum,
+                                              ObObjType type,
+                                              ObScale scale,
+                                              const ObTimeZoneInfo *tz_info,
+                                              ObJsonBuffer &j_buf);
+
+  static bool is_convertible_to_json(const ObObjType type);
+  static int is_valid_for_json(ObExprResType* types_stack, uint32_t index, const char* func_name);
+  static int is_valid_for_json(ObExprResType& type, uint32_t index, const char* func_name);
+  static int is_valid_for_path(ObExprResType* types_stack, uint32_t index);
+  static void set_type_for_value(ObExprResType* types_stack, uint32_t index);
+  static int ensure_collation(ObObjType type, ObCollationType cs_type);
+  static ObJsonInType get_json_internal_type(ObObjType type);
+  static int convert_string_collation_type(ObCollationType in, 
+                                           ObCollationType dst,
+                                           ObIAllocator* allocator,
+                                           ObString& in_str,
+                                           ObString &out_str);
+  template <typename T>
+  static int pack_json_str_res(const ObExpr &expr,
+                               ObEvalCtx &ctx,
+                               ObDatum &res,
+                               T &str,
+                               common::ObIAllocator *allocator = nullptr)
+  {
+    int ret = OB_SUCCESS;
+    ObTextStringDatumResult text_result(expr.datum_meta_.type_, &expr, &ctx, &res);
+    if (OB_FAIL(text_result.init(str.length(), allocator))) {
+      LOG_WARN("init lob result failed");
+    } else if (OB_FAIL(text_result.append(str.ptr(), str.length()))) {
+      LOG_WARN("failed to append realdata", K(ret), K(str), K(text_result));
+    } else {
+      text_result.set_result();
+    }
+    return ret;
+  }
+
+  static int pack_json_res(
+      const ObExpr &expr, 
+      ObEvalCtx &ctx,
+      ObIAllocator &temp_allocator,
+      ObIJsonBase *json_doc,
+      ObDatum &res);
+
+  /**
+   * the following 3 functions is used for json_query and json_mergepatch 
+   * as the returning type is the same
+   * 
+   *  get_cast_type 
+   *  set_dest_type 
+   *  get_cast_string_len
+   *
+  */
+  static int get_cast_type(const ObExprResType param_type2, ObExprResType &dst_type, ObExprTypeCtx &type_ctx);
+  // check item function and returning type
+  static int check_item_func_with_return(ObJsonPathNodeType path_type, ObObjType dst_type, common::ObCollationType dst_coll_type, int8_t JSON_EXPR_FLAG);
+  static int set_dest_type(ObExprResType &type1, ObExprResType &type, 
+                           ObExprResType &dst_type, ObExprTypeCtx &type_ctx);
+  static int get_expr_option_value(const ObExprResType param_type2, int8_t &dst_type);
+  static int calc_asciistr_in_expr(const ObString &src,
+                                  const ObCollationType src_cs_type,
+                                  const ObCollationType dst_cs_type,
+                                  char* buf, const int64_t buf_len, int32_t &pos);
+  static int get_dest_type(const ObExpr &expr, int64_t pos,
+                          ObEvalCtx& ctx,
+                          ObObjType &dest_type, int64_t &dst_len);
+  
+  static int get_cast_inttc_len(ObExprResType &type1,
+                                ObExprResType &type2,
+                                common::ObExprTypeCtx &type_ctx,
+                                int32_t &res_len,
+                                int16_t &length_semantics,
+                                common::ObCollationType conn);
+  static int get_cast_string_len(ObExprResType &type1,
+                                 ObExprResType &type2,
+                                 common::ObExprTypeCtx &type_ctx,
+                                 int32_t &res_len,
+                                 int16_t &length_semantics,
+                                 common::ObCollationType conn);
+  static int eval_and_check_res_type(int64_t value, ObObjType& type, int32_t& dst_len);
+  static int parse_res_type(ObExprResType& type1,
+                            ObExprResType& json_res_type,
+                            ObExprResType& result_type,
+                            ObExprTypeCtx& type_ctx);
+  static int parse_asc_option(ObExprResType& asc,
+                              ObExprResType& type1,
+                              ObExprResType& res_type,
+                              ObExprTypeCtx& type_ctx);
+  static int pre_default_value_check(ObObjType dst_type, ObString val_str, ObObjType val_type, size_t length);
+
+  static int character2_ascii_string(common::ObIAllocator *allocator, 
+                                     const ObExpr &expr,
+                                     ObEvalCtx &ctx,
+                                     ObString& result,
+                                     int32_t reserve_len = 0);
+  static int cast_to_res(ObIAllocator &allocator, 
+                          ObDatum &src_datum, 
+                          const ObExpr &expr, 
+                          const ObExpr &default_expr, 
+                          ObEvalCtx &ctx, 
+                          ObDatum &res, 
+                          bool xt_need_acc_check);
+  static void get_accuracy_from_expr(const ObExpr &expr, ObAccuracy &accuracy);
+  static int get_clause_opt(ObExpr *expr,
+                            ObEvalCtx &ctx,
+                            int8_t &type);
+  static bool check_pick_type_match(ObJsonNodeType json_type, ObItemType pick_type);
+  static bool is_json_depth_exceed_limit(uint32_t depth)
+  {
+    return depth > JSON_DOCUMENT_MAX_DEPTH && depth > get_json_max_depth_config();
+  }
+  static int32_t get_json_max_depth_config();
+  static int32_t get_json_max_depth_config(ObSQLSessionInfo *session);
+  static int32_t get_json_max_depth_config(ObEvalCtx &ctx);
+  static int is_allow_partial_update(const ObExpr &expr, ObEvalCtx &ctx, const ObString &locator_str, bool &allow_partial_update);
+  static bool is_json_partial_update_mode(const ObExpr &expr);
+  static bool is_json_partial_update_mode(const uint64_t flag) { return (flag & OB_JSON_PARTIAL_UPDATE_ALLOW) != 0; }
+  static bool is_json_partial_update_last_expr(const uint64_t flag) { return (flag & OB_JSON_PARTIAL_UPDATE_LAST_EXPR) != 0; }
+  static bool is_json_partial_update_first_expr(const uint64_t flag) { return (flag & OB_JSON_PARTIAL_UPDATE_FIRST_EXPR) != 0; }
+
+  static int pack_json_diff_res(
+    const ObExpr &expr,
+    ObEvalCtx &ctx,
+    ObIAllocator &temp_allocator,
+    ObIJsonBase *json_doc,
+    ObDatum &res);
+
+  static int refresh_root_when_bin_rebuild_all(ObIJsonBase *j_base);
+
+  static int init_json_expr_extra_info(
+      ObIAllocator *allocator,
+      const ObRawExpr &raw_expr,
+      const ObExprOperatorType type, 
+      ObExpr &rt_expr);
+
+  static int get_session_query_timeout_ts(ObEvalCtx &ctx, int64_t &timeout_ts);
+  static bool is_json_special_same_as_expr(ObItemType type, int64_t index);
+  static bool check_json_inner_same_as(const ObSysFunRawExpr *expr1, 
+                                       const ObSysFunRawExpr *expr2, 
+                                       int64_t index, 
+                                       ObExprEqualCheckContext *check_context);
+  static bool check_json_path_can_pushdown(const ObRawExpr &path_expr);
+  static bool check_json_expr_can_pushdown(const ObRawExpr &json_expr);
+  static int get_sub_column_path_from_json_expr(ObIAllocator& allocator, const ObRawExpr &json_expr, share::ObSubColumnPath& sub_col_path);
+
+public:
+  uint64_t tenant_id;
+
+private:
+  /*
+  get the "candidate" json wrapper with cross-row caching for a constant arg.
+  Used by json_contains (arg1) and json_member_of (arg0): when the argument is a
+  whole-execution constant, the parsed wrapper is identical on every row, so we
+  parse once, deep-copy its raw binary into the exec-ctx (persistent) allocator,
+  and reuse the cached wrapper afterwards — avoiding per-row re-parse. The caller
+  must only invoke this on a constant candidate with a non-NULL param_ctx; a
+  non-constant candidate is handled by the caller via get_json_doc_wrapper /
+  get_json_val_wrapper (this function never runs for it).
+  @param[in]  expr        the input arguments
+  @param[in]  ctx         the eval context
+  @param[in]  allocator   the per-row temp allocator (used only on the first row
+                          to parse tmp_wrapper before deep-copying into the
+                          persistent allocator; the cached wrapper does not
+                          reference it)
+  @param[in]  index       the candidate argument index
+  @param[in]  param_ctx   the runtime cache ctx (from get_param_cache_ctx);
+                          must be non-NULL — the caller ensures this is only
+                          fetched when the candidate is a static constant
+  @param[in]  use_val_semantics  true -> get_json_val_wrapper (scalar-capable,
+                          for MEMBER OF); false -> get_json_doc_wrapper (CONTAINS)
+  @param[out] wrapper     the output candidate wrapper
+  @param[out] is_null     the flag for null situation
+  @return Returns OB_SUCCESS on success, error code otherwise.
+  */
+  static int get_json_candidate_wrapper_with_cache(const ObExpr &expr, ObEvalCtx &ctx,
+                                                   MultimodeAlloctor &allocator,
+                                                   uint16_t index,
+                                                   ObJsonParamCacheCtx *param_ctx,
+                                                   bool use_val_semantics,
+                                                   common::ObJsonWrapper &wrapper,
+                                                   bool &is_null);
+  const static uint32_t RESERVE_MIN_BUFF_SIZE = 32;
+  DISALLOW_COPY_AND_ASSIGN(ObJsonExprHelper);
+};
+
+/**
+ * Fast path utility class for JSON bin format extraction
+ * This class provides optimized methods to directly access JSON binary format
+ * without full parsing, improving performance for simple key lookups
+ *
+ * Performance optimization: meta is stored as member variable to avoid parameter passing overhead
+ * in hot path (especially in binary search loop)
+ */
+class ObJsonBinFastLocator final
+{
+public:
+  // Metadata structure for JSON bin object
+
+  ObJsonBinFastLocator() :
+    type_(0), entry_type_(0), entry_size_(0), element_count_(0),
+    key_offset_start_(0), value_offset_start_(0),
+    data_ptr_(nullptr), total_len_(0), use_lexicographical_order_(false), extend_seg_offset_(0),
+    inline_buf_{0}, root_data_ptr_(nullptr), root_total_len_(0)
+  {}
+  ~ObJsonBinFastLocator() {}
+
+  int init(const char *data, int64_t length);
+  int reset_to_root();
+  int seek(const ObIArray<ObString> &keys, char *&res_ptr, int64_t &res_len, uint8_t &res_type);
+  int get_raw_binary(ObString &buf, uint8_t type, char *res_ptr, int64_t res_len,
+                     ObIAllocator *allocator) const;
+  int pack_json_str_res(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res, char *res_ptr,
+                        int64_t res_len, uint8_t &res_type);
+
+private:
+  int seek(const ObString &key, char *&res_ptr, int64_t &res_len, uint8_t &res_type);
+  int parse_json_bin_header(const char *ptr, int64_t len);
+  int get_key_in_object(size_t i, ObString &key);
+  int lookup_index(const ObString &key, size_t *idx);
+  int get_value_offset_len(size_t idx, char *&res_ptr, int64_t &res_len, uint8_t &res_type);
+
+  template <typename DecodeFunc, typename ValType>
+  static int decode_impl(ObString &json_str, int64_t &offset, ValType *val, DecodeFunc decode_func,
+                         int64_t max_len);
+  static int decode_vi64(ObString &json_str, int64_t &offset, int64_t *val);
+  static uint64_t get_var_local(const char *ptr, uint8_t type);
+  // extend_seg_offset_ pointing past the doc indicates an extension segment is present
+  static inline bool has_extend_segment(const ObJsonBinDocHeader *doc_header, int64_t length)
+  {
+    return doc_header->extend_seg_offset_ != static_cast<uint64_t>(length);
+  }
+
+  static constexpr int64_t DOC_HEADER_SIZE = sizeof(ObJsonBinDocHeader);
+  static constexpr int64_t BIN_HEADER_SIZE = sizeof(ObJsonBinHeader);
+
+private:
+  uint8_t type_;              // node type for current node
+  uint8_t entry_type_;        // the size describe var size of key_entry, val_entry
+  uint8_t entry_size_;        // cached ObJsonVar::get_var_size(entry_type_) to avoid repeated calls in hot path
+  uint64_t element_count_;
+  uint64_t key_offset_start_;
+  uint64_t value_offset_start_;
+  char *data_ptr_;               // Cached json_str_.ptr() to avoid repeated function calls
+  int64_t total_len_;           // Cached json_str_.length() to avoid repeated function calls
+  bool use_lexicographical_order_;
+  uint64_t extend_seg_offset_;
+  // vi64 encoding needs up to 10 bytes (64-bit value / 7 bits per byte, rounded up)
+  static constexpr int64_t INLINE_BUF_SIZE = 10;
+  char inline_buf_[INLINE_BUF_SIZE];  // Buffer for inlined values, avoids dangling pointer to stack
+  char *root_data_ptr_;         // root object start saved by init(), used by reset_to_root()
+  int64_t root_total_len_;
+};
+
+struct ObJsonZeroVal
+{
+  static const int32_t OB_JSON_ZERO_VAL_LENGTH = sizeof(ObLobCommon) + 2;
+  ObJsonZeroVal() : header_(), json_bin_() {
+    json_bin_[0] = '\0';
+    json_bin_[1] = '\0';
+  }
+  ObLobCommon header_;
+  char json_bin_[4];
+};
+
+} // sql
+} // oceanbase
+#endif // OCEANBASE_SQL_OB_EXPR_JSON_FUNC_HELPER_H_

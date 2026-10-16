@@ -1,0 +1,11 @@
+| class | sizeof(class) |
+| --- | --- |
+| ObStmt | 32 |
+| ObDMLStmt | 1056 |
+| ObSelectStmt | 1992 |
+| ObDelUpdStmt | 1424 |
+| ObInsertStmt | 2024 |
+| ObInsertAllStmt | 1464 |
+| ObUpdateStmt | 1464 |
+| ObDeleteStmt | 1464 |
+| ObMergeStmt | 2360 |

@@ -1,0 +1,75 @@
+# set(OBSERVER_TEST_SRCS
+#         env/ob_simple_server.cpp
+#         env/ob_simple_server_restart_helper.cpp
+#         env/ob_simple_cluster_test_base.cpp
+#         )
+# 
+# add_library(observer_test ${OBSERVER_TEST_SRCS})
+# 
+# target_include_directories(observer_test PUBLIC
+#   ${CMAKE_SOURCE_DIR}/unittest ${CMAKE_SOURCE_DIR}/mittest)
+# target_link_libraries(observer_test PUBLIC
+#   oceanbase
+#   mit_env
+# )
+function(ob_unittest_observer case)
+  ob_unittest(${ARGV})
+  target_link_libraries(${case} PRIVATE gtest gmock observer_test oceanbase)
+  target_link_directories(${case} PUBLIC ${CMAKE_SOURCE_DIR}/mittest)
+  set_tests_properties(${case} PROPERTIES TIMEOUT 3600)
+endfunction()
+
+ob_unittest_observer(test_prewarm_by_size test_prewarm_by_size.cpp)
+ob_unittest_observer(test_ss_local_minor_upload_watermark test_ss_local_minor_upload_watermark.cpp)
+ob_unittest_observer(test_shared_storage_tx_data_gc test_shared_storage_tx_data_gc.cpp)
+ob_unittest_observer(test_storage_cache_policy_cold test_storage_cache_policy_cold.cpp)
+ob_unittest_observer(test_macro_cache_evict test_macro_cache_evict.cpp)
+ob_unittest_observer(test_ss_macro_cache_clean_deleted_tablet test_ss_macro_cache_clean_deleted_tablet.cpp)
+# TODO(yongle.xh): 本版本完全禁用分区分裂，相关单测排除
+ob_unittest_observer(test_tiered_metadata_store test_tiered_metadata_store.cpp)
+ob_unittest_observer(test_tenant_slog_ckpt_ss test_tenant_slog_ckpt_ss.cpp)
+ob_unittest_observer(test_async_index_compaction test_async_index_compaction.cpp)
+ob_unittest_observer(test_async_index_compaction_integration test_async_index_compaction_integration.cpp)
+# Keep the existing farm exclusion until both split executables are validated.
+# The integration executable isolates refresh/DAG/GC state from the basic cases.
+set_tests_properties(test_async_index_compaction test_async_index_compaction_integration
+  PROPERTIES LABELS "simpleserver")
+ob_unittest_observer(test_on_demand_scan_ss test_on_demand_scan_ss.cpp)
+ob_unittest_observer(test_ss_window_compaction_observer test_ss_window_compaction_observer.cpp)
+ob_unittest_observer(test_ss_meta_ctrl_table_operator test_ss_meta_ctrl_table_operator.cpp)
+ob_unittest_observer(test_ss_meta_ctrl_iterator test_ss_meta_ctrl_iterator.cpp)
+ob_unittest_observer(test_ss_meta_ctrl_page_iterator test_ss_meta_ctrl_page_iterator.cpp)
+ob_unittest_observer(test_ss_meta_table_iterator test_ss_meta_table_iterator.cpp)
+ob_unittest_observer(test_ss_meta_iter_wrapper test_ss_meta_iter_wrapper.cpp)
+ob_unittest_observer(test_shared_gc_task_table_operator test_shared_gc_task_table_operator.cpp)
+ob_unittest_observer(test_shared_gc_control_operator test_shared_gc_control_operator.cpp)
+ob_unittest_observer(test_shared_meta_reserved_operator test_shared_meta_reserved_operator.cpp)
+ob_unittest_observer(test_shared_meta_reserved_mgr test_shared_meta_reserved_mgr.cpp)
+ob_unittest_observer(test_shared_meta_reserved_iterator test_shared_meta_reserved_iterator.cpp)
+ob_unittest_observer(test_atomic_protocol_concurrency test_atomic_protocol_concurrency.cpp)
+ob_unittest_observer(test_tablet_atomic_protocol test_tablet_atomic_protocol.cpp)
+ob_unittest_observer(test_sstable_atomic_protocol test_sstable_atomic_protocol.cpp)
+ob_unittest_observer(test_ls_atomic_protocol test_ls_atomic_protocol.cpp)
+ob_unittest_observer(test_checkpoint_atomic_protocol test_checkpoint_atomic_protocol.cpp)
+ob_unittest_observer(test_ss_meta_base_operator test_ss_meta_base_operator.cpp)
+ob_unittest_observer(test_ss_fail_gc_gen_task test_ss_fail_gc_gen_task.cpp)
+ob_unittest_observer(test_shared_meta_service test_shared_meta_service.cpp test_ss_ls_ckpt_dag.cpp)
+ob_unittest_observer(test_ss_meta_atomic_op test_ss_meta_atomic_op.cpp)
+ob_unittest_observer(test_ss_meta_table_helper test_ss_meta_table_helper.cpp)
+ob_unittest_observer(test_ss_lock_row_gc_task test_ss_lock_row_gc_task.cpp)
+ob_unittest_observer(test_ss_ls_meta_gc_task test_ss_ls_meta_gc_task.cpp)
+ob_unittest_observer(test_ss_mark_sweep_gc test_ss_mark_sweep_gc.cpp)
+ob_unittest_observer(test_ss_data_check test_ss_data_check.cpp)
+if (OB_ERRSIM)
+  ob_unittest_observer(test_ss_data_check_errsim test_ss_data_check_errsim.cpp)
+  set_tests_properties(test_ss_data_check_errsim PROPERTIES TIMEOUT 120)
+endif()
+ob_unittest_observer(test_ss_data_check_expected_source test_ss_data_check_expected_source.cpp)
+ob_unittest_observer(test_ss_data_check_server_event test_ss_data_check_server_event.cpp)
+ob_unittest_observer(test_ss_data_check_e2e test_ss_data_check_e2e.cpp)
+ob_unittest_observer(test_ss_data_check_schedule_entry test_ss_data_check_schedule_entry.cpp)
+ob_unittest_observer(test_ss_gc_del_and_kept_calculation test_ss_gc_del_and_kept_calculation.cpp)
+ob_unittest_observer(test_ss_fail_gc test_ss_fail_gc.cpp)
+ob_unittest_observer(test_ss_checkpoint_gc test_ss_checkpoint_gc.cpp)
+ob_unittest_observer(test_ss_gc_exec_dag_event test_ss_gc_exec_dag_event.cpp)
+ob_unittest_observer(test_ss_window_compaction_finish test_ss_window_compaction_finish.cpp)

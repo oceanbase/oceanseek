@@ -1,0 +1,54 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include "storage/tablet/ob_tablet_complex_addr.h"
+
+using namespace oceanbase::common;
+
+namespace oceanbase
+{
+namespace storage
+{
+
+template <>
+int64_t ObTabletComplexAddr<share::ObTabletAutoincSeq>::to_string(char *buf, const int64_t buf_len) const
+{
+  int64_t pos = 0;
+
+  if (OB_ISNULL(buf) || buf_len <= 0) {
+    // do nothing
+  } else {
+    databuff_printf(buf, buf_len, pos, "{ptr:%p", static_cast<void*>(ptr_));
+    if (nullptr != ptr_) {
+      databuff_printf(buf, buf_len, pos, ", auto_inc_seq:");
+      databuff_print_obj(buf, buf_len, pos, *ptr_);
+    }
+    databuff_print_json_kv_comma(buf, buf_len, pos, "addr", addr_);
+    databuff_printf(buf, buf_len, pos, "}");
+  }
+  return pos;
+}
+
+template <>
+int64_t ObTabletComplexAddr<ObTabletTableStore>::to_string(char *buf, const int64_t buf_len) const
+{
+  int64_t pos = 0;
+
+  if (OB_ISNULL(buf) || buf_len <= 0) {
+    // do nothing
+  } else if (nullptr != ptr_) {
+    J_OBJ_START();
+    J_KV(KP_(ptr), K_(addr), "majors", ptr_->get_major_sstables(), "inc_majors", ptr_->get_inc_major_sstables(), "minors", ptr_->get_minor_sstables());
+    J_OBJ_END();
+  } else {
+    J_OBJ_START();
+    J_KV(KP_(ptr), K_(addr));
+    J_OBJ_END();
+  }
+  return pos;
+}
+
+} // namespace storage
+} // namespace oceanbase

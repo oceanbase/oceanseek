@@ -1,0 +1,61 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#define USING_LOG_PREFIX SQL_ENG
+#include "ob_p2p_dh_rpc_proxy.h"
+#include "sql/engine/px/p2p_datahub/ob_p2p_dh_mgr.h"
+#include "lib/allocator/ob_malloc.h"
+
+using namespace oceanbase::common;
+using namespace oceanbase::sql;
+
+OB_DEF_SERIALIZE(ObPxP2PDatahubArg)
+{
+  int ret = OB_SUCCESS;
+  CK(OB_NOT_NULL(msg_));
+  OB_UNIS_ENCODE(msg_->get_msg_type());
+  OB_UNIS_ENCODE(*msg_);
+  return ret;
+}
+
+OB_DEF_DESERIALIZE(ObPxP2PDatahubArg)
+{
+  int ret =  OB_SUCCESS;
+  CK(OB_NOT_NULL(CURRENT_CONTEXT));
+  ObP2PDatahubMsgBase::ObP2PDatahubMsgType msg_type = ObP2PDatahubMsgBase::NOT_INIT;
+  OB_UNIS_DECODE(msg_type);
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(PX_P2P_DH.alloc_msg_for_rpc_receive(msg_type, msg_))) {
+    LOG_WARN("fail to alloc msg", K(ret));
+  } else {
+    OB_UNIS_DECODE(*msg_);
+  }
+  if (OB_FAIL(ret) && OB_NOT_NULL(msg_)) {
+    msg_->destroy();
+    ob_free(msg_);
+    msg_ = nullptr;
+  }
+  return ret;
+}
+
+OB_DEF_SERIALIZE_SIZE(ObPxP2PDatahubArg)
+{
+  int64_t len = 0;
+
+  LST_DO_CODE(OB_UNIS_ADD_LEN, msg_->get_msg_type(), *msg_);
+  return len;
+}
+
+void ObPxP2PDatahubArg::destroy_arg()
+{
+  if (OB_NOT_NULL(msg_)) {
+    msg_->destroy();
+    ob_free(msg_);
+    msg_ = nullptr;
+  }
+}
+
+OB_SERIALIZE_MEMBER(ObPxP2PDatahubMsgResponse, rc_);
+
+OB_SERIALIZE_MEMBER(ObPxP2PClearMsgArg, p2p_dh_ids_, px_seq_id_);

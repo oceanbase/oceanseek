@@ -1,0 +1,6 @@
+storage_dml_unittest(test_das_async_token_op)
+storage_dml_unittest(test_das_async_token_helper)
+storage_dml_unittest(test_das_async_match_phrase_op)
+storage_dml_unittest(test_inv_idx_prewarm_mem)
+storage_dml_unittest(test_inv_idx_clustered_index)
+storage_dml_unittest(test_inv_sstable_merge)

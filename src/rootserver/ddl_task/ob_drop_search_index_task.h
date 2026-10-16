@@ -1,0 +1,104 @@
+/**
+ * Copyright (c) 2024 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_ROOTSERVER_OB_DROP_SEARCH_INDEX_TASK_H
+#define OCEANBASE_ROOTSERVER_OB_DROP_SEARCH_INDEX_TASK_H
+
+#include "rootserver/ddl_task/ob_drop_index_task.h"
+
+namespace oceanbase
+{
+namespace rootserver
+{
+
+class ObDropSearchIndexTask : public ObDDLTask
+{
+public:
+  ObDropSearchIndexTask();
+  virtual ~ObDropSearchIndexTask();
+
+  int init(
+      const uint64_t tenant_id,
+      const int64_t task_id,
+      const uint64_t data_table_id,
+      const share::ObDDLType ddl_type,
+      const ObFTSDDLChildTaskInfo &search_def_index,
+      const ObFTSDDLChildTaskInfo &search_data_index,
+      const ObFTSDDLChildTaskInfo &async_delete,
+      const ObString &ddl_stmt_str,
+      const int64_t schema_version,
+      const int64_t consumer_group_id,
+      const int64_t target_object_id);
+  int init(const ObDDLTaskRecord &task_record);
+  virtual int process() override;
+  virtual int serialize_params_to_message(
+      char *buf,
+      const int64_t buf_size,
+      int64_t &pos) const override;
+  virtual int deserialize_params_from_message(
+      const uint64_t tenant_id,
+      const char *buf,
+      const int64_t buf_size,
+      int64_t &pos) override;
+  virtual int64_t get_serialize_param_size() const override;
+  virtual int on_child_task_finish(const uint64_t child_task_key, const int ret_code) override { return OB_SUCCESS; }
+  int update_task_message(common::ObISQLClient &proxy);
+  OB_INLINE void set_drop_def_index_task_id(const int64_t task_id) { search_def_index_.task_id_ = task_id; }
+  OB_INLINE void set_drop_data_index_task_id(const int64_t task_id) { search_data_index_.task_id_ = task_id; }
+  OB_INLINE void set_drop_async_delete_task_id(const int64_t task_id) { async_delete_.task_id_ = task_id; }
+  INHERIT_TO_STRING_KV("ObDDLTask", ObDDLTask, K_(search_def_index), K_(search_data_index), K_(async_delete));
+
+private:
+  int check_switch_succ();
+  int prepare(const share::ObDDLTaskStatus &status);
+  int check_and_wait_finish(const share::ObDDLTaskStatus &status);
+  int check_drop_index_finish(
+      const uint64_t tenant_id,
+      const int64_t task_id,
+      const int64_t table_id,
+      bool &has_finished);
+  int wait_drop_child_task_finish(
+      const ObFTSDDLChildTaskInfo &child_task_id,
+      bool &has_finished);
+  int send_and_wait_drop_index_task(
+      ObFTSDDLChildTaskInfo &child_task_info,
+      ObSchemaGetterGuard &schema_guard,
+      bool &has_finished);
+  int prepare_async_delete_index(ObSchemaGetterGuard &schema_guard);
+  int create_drop_index_task(
+      share::schema::ObSchemaGetterGuard &guard,
+      const uint64_t index_tid,
+      const common::ObString &index_name,
+      int64_t &task_id);
+  int succ();
+  int fail();
+  virtual int cleanup_impl() override;
+  virtual bool is_error_need_retry(const int ret_code) override
+  {
+    UNUSED(ret_code);
+    // we should always retry on drop index task
+    return task_status_ <= share::ObDDLTaskStatus::WAIT_CHILD_TASK_FINISH;
+  }
+
+private:
+  bool is_async_search_task() const
+  { return share::ObDDLType::DDL_DROP_ASYNC_SEARCH_INDEX == task_type_; }
+
+  // 同步 Search 删除沿用 v1；v2 仅用于携带 async_delete 的异步 Search 删除任务。
+  static const int64_t OB_DROP_SEARCH_INDEX_TASK_VERSION = 1;
+  static const int64_t OB_DROP_ASYNC_SEARCH_INDEX_TASK_VERSION = 2;
+  ObRootService *root_service_;
+  ObFTSDDLChildTaskInfo search_def_index_;
+  ObFTSDDLChildTaskInfo search_data_index_;
+  ObFTSDDLChildTaskInfo async_delete_;
+  bool drop_def_index_finish_;
+  bool drop_data_index_finish_;
+  bool drop_async_delete_index_finish_;
+};
+
+} // end namespace rootserver
+} // end namespace oceanbase
+
+#endif // OCEANBASE_ROOTSERVER_OB_DROP_SEARCH_INDEX_TASK_H

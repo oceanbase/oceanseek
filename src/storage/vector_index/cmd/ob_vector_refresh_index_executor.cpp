@@ -1,0 +1,1940 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+// #define DBMS_VECTOR_MOCK_TEST
+#define USING_LOG_PREFIX STORAGE
+
+#include "storage/vector_index/cmd/ob_vector_refresh_index_executor.h"
+#include "storage/vector_index/ob_vector_index_refresh.h"
+#include "share/vector_index/ob_vector_index_async_task.h"
+#include "share/vector_index/ob_plugin_vector_index_util.h"
+#include "pl/ob_pl.h"
+#include "share/ob_vec_index_builder_util.h"
+#include "storage/vector_index/ob_vector_index_sched_job_utils.h"
+
+namespace oceanbase {
+namespace storage {
+
+ObVectorRefreshIndexExecutor::ObVectorRefreshIndexExecutor()
+  : ctx_(nullptr), session_info_(nullptr), tenant_id_(OB_INVALID_TENANT_ID), allocator_(lib::ObLabel("VecRefreshExec")) {}
+
+ObVectorRefreshIndexExecutor::~ObVectorRefreshIndexExecutor() {}
+
+int ObVectorRefreshIndexExecutor::execute_refresh(
+    pl::ObPLExecCtx &ctx, const ObVectorRefreshIndexArg &arg) {
+  int ret = OB_SUCCESS;
+  ctx_ = ctx.exec_ctx_;
+  pl_ctx_ = &ctx;
+  CK(OB_NOT_NULL(ctx_));
+  CK(OB_NOT_NULL(session_info_ = ctx_->get_my_session()));
+  CK(OB_NOT_NULL(ctx_->get_sql_ctx()));
+  CK(OB_NOT_NULL(ctx_->get_sql_ctx()->schema_guard_));
+  OV(OB_LIKELY(arg.is_valid()), OB_INVALID_ARGUMENT, arg);
+  OZ(schema_checker_.init(*(ctx_->get_sql_ctx()->schema_guard_),
+                          session_info_->get_server_sid()));
+  OX(tenant_id_ = session_info_->get_effective_tenant_id());
+  // Reject manual triggers during cluster upgrade (mixed-version window):
+  // the new framework writes STANDBY status / new columns that older observers
+  // cannot interpret. Allow only after cluster fully upgraded to 4_6_0_1.
+  OZ(ObVectorRefreshIndexExecutor::check_min_data_version(
+      tenant_id_, DATA_VERSION_4_6_0_1,
+      "vector index task is not supported during cluster upgrade, "
+      "please retry after the cluster has fully upgraded to 4.6.0.1."));
+  OZ(resolve_refresh_arg(arg));
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(do_refresh())) {
+    LOG_WARN("fail to do refresh", KR(ret));
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::execute_refresh_inner(
+  pl::ObPLExecCtx &ctx, const ObVectorRefreshIndexInnerArg &arg)
+{
+  int ret = OB_SUCCESS;
+  bool in_recycle_bin = false;
+  ctx_ = ctx.exec_ctx_;
+  pl_ctx_ = &ctx;
+  CK(OB_NOT_NULL(ctx_));
+  CK(OB_NOT_NULL(session_info_ = ctx_->get_my_session()));
+  CK(OB_NOT_NULL(ctx_->get_sql_ctx()));
+  CK(OB_NOT_NULL(ctx_->get_sql_ctx()->schema_guard_));
+  OV(OB_LIKELY(arg.is_valid()), OB_INVALID_ARGUMENT, arg);
+  OZ(schema_checker_.init(*(ctx_->get_sql_ctx()->schema_guard_),
+                          session_info_->get_server_sid()));
+  OX(tenant_id_ = session_info_->get_effective_tenant_id());
+  // See execute_refresh: reject manual triggers during cluster upgrade.
+  OZ(ObVectorRefreshIndexExecutor::check_min_data_version(
+      tenant_id_, DATA_VERSION_4_6_0_1,
+      "vector index task is not supported during cluster upgrade, "
+      "please retry after the cluster has fully upgraded to 4.6.0.1."));
+  OZ(resolve_refresh_inner_arg(arg, in_recycle_bin));
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_UNLIKELY(in_recycle_bin)) {
+    // do nothing
+    LOG_INFO("[VEC_INDEX][REFRESH] delta buffer table is in recyclebin, do nothing");
+  } else if (OB_FAIL(do_refresh_with_retry())) {
+    LOG_WARN("fail to do refresh", KR(ret));
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::execute_flush(
+    pl::ObPLExecCtx &ctx, const ObVectorRefreshIndexArg &arg)
+{
+  int ret = OB_SUCCESS;
+  bool in_recycle_bin = false;
+  ctx_ = ctx.exec_ctx_;
+  pl_ctx_ = &ctx;
+  CK(OB_NOT_NULL(ctx_));
+  CK(OB_NOT_NULL(session_info_ = ctx_->get_my_session()));
+  CK(OB_NOT_NULL(ctx_->get_sql_ctx()));
+  CK(OB_NOT_NULL(ctx_->get_sql_ctx()->schema_guard_));
+  OV(OB_LIKELY(arg.is_valid()), OB_INVALID_ARGUMENT, arg);
+  OZ(schema_checker_.init(*(ctx_->get_sql_ctx()->schema_guard_),
+                          session_info_->get_server_sid()));
+  OX(tenant_id_ = session_info_->get_effective_tenant_id());
+  // See execute_refresh: reject manual triggers during cluster upgrade.
+  OZ(ObVectorRefreshIndexExecutor::check_min_data_version(
+      tenant_id_, DATA_VERSION_4_6_0_1,
+      "vector index task is not supported during cluster upgrade, "
+      "please retry after the cluster has fully upgraded to 4.6.0.1."));
+  if (OB_SUCC(ret) &&
+      !share::ObPluginVectorIndexHelper::enable_persist_vector_index_incremental(tenant_id_)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("persist_vector_index_incremental is false, flush is not supported", KR(ret));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "_persist_vector_index_incremental is false, flush is");
+  }
+  OZ(resolve_refresh_arg(arg));
+
+  if (OB_FAIL(ret)) {
+  } else {
+    const share::schema::ObTableSchema *base_table_schema = nullptr;
+    const share::schema::ObTableSchema *domain_table_schema = nullptr;
+    const share::schema::ObTableSchema *index_id_table_schema = nullptr;
+    if (OB_FAIL(resolve_table_id_and_check_table_valid(
+                domain_tb_id_, base_table_schema, domain_table_schema,
+                index_id_table_schema, in_recycle_bin))) {
+      LOG_WARN("fail to resolve table id and check table valid", KR(ret), K(domain_tb_id_));
+    } else if (!domain_table_schema->is_vec_hnsw_index()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("flush index which is not hnsw index is not supported", KR(ret), K(domain_table_schema));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "flush index which is not hnsw index is");
+    } else if (OB_UNLIKELY(in_recycle_bin)) {
+      LOG_DEBUG("delta buffer table is in recyclebin, do nothing");
+    } else if (OB_ISNULL(domain_table_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("table_schema is null", K(ret), KP(domain_table_schema));
+    } else {
+      share::ObVecTaskManager manager(
+          tenant_id_, domain_table_schema->get_table_id(),
+          share::ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_INDEX_FREEZE);
+      if (OB_FAIL(manager.create_task(share::ObVecIndexAsyncTaskStatus::OB_VECTOR_ASYNC_TASK_STANDBY))) {
+        LOG_WARN("failed to create flush task", K(ret), K(manager));
+      } else {
+        LOG_INFO("flush index task created", K(ret), K(domain_table_schema->get_table_id()), K(arg.table_name_), K(arg.idx_name_));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::execute_compact(
+    pl::ObPLExecCtx &ctx, const ObVectorRefreshIndexArg &arg)
+{
+  int ret = OB_SUCCESS;
+  bool in_recycle_bin = false;
+  ctx_ = ctx.exec_ctx_;
+  pl_ctx_ = &ctx;
+  CK(OB_NOT_NULL(ctx_));
+  CK(OB_NOT_NULL(session_info_ = ctx_->get_my_session()));
+  CK(OB_NOT_NULL(ctx_->get_sql_ctx()));
+  CK(OB_NOT_NULL(ctx_->get_sql_ctx()->schema_guard_));
+  OV(OB_LIKELY(arg.is_valid()), OB_INVALID_ARGUMENT, arg);
+  OZ(schema_checker_.init(*(ctx_->get_sql_ctx()->schema_guard_),
+                          session_info_->get_server_sid()));
+  OX(tenant_id_ = session_info_->get_effective_tenant_id());
+  // See execute_refresh: reject manual triggers during cluster upgrade.
+  OZ(ObVectorRefreshIndexExecutor::check_min_data_version(
+      tenant_id_, DATA_VERSION_4_6_0_1,
+      "vector index task is not supported during cluster upgrade, "
+      "please retry after the cluster has fully upgraded to 4.6.0.1."));
+  if (OB_SUCC(ret) &&
+      !share::ObPluginVectorIndexHelper::enable_persist_vector_index_incremental(tenant_id_)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("persist_vector_index_incremental is false, compact is not supported", KR(ret));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "_persist_vector_index_incremental is false, compact is");
+  }
+  OZ(resolve_refresh_arg(arg));
+
+  if (OB_FAIL(ret)) {
+  } else {
+    const share::schema::ObTableSchema *base_table_schema = nullptr;
+    const share::schema::ObTableSchema *domain_table_schema = nullptr;
+    const share::schema::ObTableSchema *index_id_table_schema = nullptr;
+    if (OB_FAIL(resolve_table_id_and_check_table_valid(
+                domain_tb_id_, base_table_schema, domain_table_schema,
+                index_id_table_schema, in_recycle_bin))) {
+      LOG_WARN("fail to resolve table id and check table valid", KR(ret), K(domain_tb_id_));
+    } else if (!domain_table_schema->is_vec_hnsw_index()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("compact index which is not hnsw index is not supported", KR(ret), K(domain_table_schema));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "compact index which is not hnsw index is");
+    } else if (OB_UNLIKELY(in_recycle_bin)) {
+      LOG_DEBUG("delta buffer table is in recyclebin, do nothing");
+    } else if (OB_ISNULL(index_id_table_schema)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("index id table is invalid", KR(ret), KP(index_id_table_schema));
+    } else {
+      share::ObVecTaskManager manager(
+          tenant_id_, index_id_table_schema->get_table_id(),
+          share::ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_INDEX_MERGE);
+      if (OB_FAIL(manager.create_task(share::ObVecIndexAsyncTaskStatus::OB_VECTOR_ASYNC_TASK_STANDBY))) {
+        LOG_WARN("failed to create compact task", K(ret), K(manager));
+      } else {
+        LOG_INFO("compact index task created", K(ret), K(index_id_table_schema->get_table_id()), K(arg.table_name_), K(arg.idx_name_));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::execute_alter_index_params(
+    pl::ObPLExecCtx &ctx, const ObVectorAlterIndexParamsArg &arg) {
+  int ret = OB_SUCCESS;
+  const share::schema::ObTableSchema *base_table_schema = nullptr;
+  const share::schema::ObTableSchema *domain_table_schema = nullptr;
+  const share::schema::ObTableSchema *index_id_table_schema = nullptr;
+  ObString new_index_params;
+  bool has_change = false;
+  bool need_rebuild = false;
+  ctx_ = ctx.exec_ctx_;
+  pl_ctx_ = &ctx;
+  CK(OB_NOT_NULL(ctx_));
+  CK(OB_NOT_NULL(session_info_ = ctx_->get_my_session()));
+  CK(OB_NOT_NULL(ctx_->get_sql_ctx()));
+  CK(OB_NOT_NULL(ctx_->get_sql_ctx()->schema_guard_));
+  OV(OB_LIKELY(arg.is_valid()), OB_INVALID_ARGUMENT, arg);
+  OZ(schema_checker_.init(*(ctx_->get_sql_ctx()->schema_guard_),
+                          session_info_->get_server_sid()));
+  OX(tenant_id_ = session_info_->get_effective_tenant_id());
+  OZ(ObVectorRefreshIndexExecutor::check_min_data_version(
+      tenant_id_, DATA_VERSION_4_6_3_0,
+      "DBMS_VECTOR.ALTER_INDEX_PARAMS is not supported during cluster upgrade, "
+      "please retry after the cluster has fully upgraded to 4.6.3.0."));
+  if (OB_SUCC(ret) &&
+      !share::ObPluginVectorIndexHelper::enable_persist_vector_index_incremental(tenant_id_)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("persist_vector_index_incremental is false, alter index params is not supported",
+             KR(ret));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                   "_persist_vector_index_incremental is false, "
+                   "DBMS_VECTOR.ALTER_INDEX_PARAMS is");
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(resolve_and_check_table_valid(
+                 arg.idx_name_, arg.table_name_, ObString(), base_table_schema,
+                 domain_table_schema, index_id_table_schema, true))) {
+    LOG_WARN("fail to resolve table for alter index params", KR(ret), K(arg));
+  } else if (OB_ISNULL(base_table_schema) || OB_ISNULL(domain_table_schema) ||
+             OB_ISNULL(index_id_table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("missing hnsw table schema for alter index params", KR(ret),
+             KP(base_table_schema), KP(domain_table_schema),
+             KP(index_id_table_schema));
+  } else if (base_table_schema->is_logic_table()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("alter vector index params on logic table is not supported", KR(ret),
+             KPC(base_table_schema));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                   "alter vector index params on logic table is");
+  } else if (!domain_table_schema->is_vec_hnsw_index()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("alter index params only supports hnsw index family", KR(ret),
+             KPC(domain_table_schema));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                   "DBMS_VECTOR.ALTER_INDEX_PARAMS on non-HNSW vector index is");
+  } else if (OB_FAIL(share::ObVectorIndexUtil::merge_and_validate_index_params(
+                 *base_table_schema, *domain_table_schema, arg.idx_parameters_,
+                 allocator_, new_index_params, has_change, need_rebuild))) {
+    LOG_WARN("fail to merge and validate alter index params", KR(ret), K(arg),
+             K(domain_table_schema->get_index_params()));
+  } else if (!has_change) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("alter index params does not change index parameters", KR(ret),
+             K(arg), K(new_index_params));
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                   "DBMS_VECTOR.ALTER_INDEX_PARAMS: index parameters are unchanged");
+  } else if (OB_FAIL(submit_alter_index_params(
+                 *base_table_schema, *domain_table_schema, new_index_params,
+                 need_rebuild, arg.idx_parallel_build_))) {
+    LOG_WARN("fail to submit alter index params", KR(ret), K(arg),
+             K(new_index_params), K(need_rebuild));
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::submit_alter_index_params(
+    const share::schema::ObTableSchema &base_table_schema,
+    const share::schema::ObTableSchema &domain_table_schema,
+    const ObString &new_index_params, const bool need_rebuild,
+    const int64_t idx_parallel_build) {
+  int ret = OB_SUCCESS;
+  const share::schema::ObDatabaseSchema *database_schema = nullptr;
+  const int64_t ddl_rpc_timeout = GCONF._ob_ddl_timeout;
+  common::ObAddr rs_addr;
+  obrpc::ObCommonRpcProxy *common_rpc_proxy = GCTX.rs_rpc_proxy_;
+  if (OB_UNLIKELY(
+          new_index_params.empty() ||
+          idx_parallel_build < share::OB_ALTER_INDEX_PARAMS_MIN_PARALLEL_BUILD ||
+          idx_parallel_build > share::OB_ALTER_INDEX_PARAMS_MAX_PARALLEL_BUILD)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid alter index params submit argument", KR(ret),
+             K(new_index_params), K(need_rebuild), K(idx_parallel_build));
+  } else if (OB_FAIL(schema_checker_.get_database_schema(
+                 tenant_id_, domain_table_schema.get_database_id(),
+                 database_schema))) {
+    LOG_WARN("fail to get database schema for alter index params", KR(ret),
+             K(tenant_id_), K(domain_table_schema.get_database_id()));
+  } else if (OB_ISNULL(database_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("database schema is null for alter index params", KR(ret));
+  } else {
+    SMART_VAR(obrpc::ObAlterVectorIndexParamsArg, alter_params_arg) {
+      obrpc::ObAlterTableRes alter_params_res;
+      alter_params_arg.tenant_id_ = tenant_id_;
+      alter_params_arg.exec_tenant_id_ = tenant_id_;
+      alter_params_arg.session_id_ = session_info_->get_server_sid();
+      alter_params_arg.database_name_ =
+          database_schema->get_database_name_str();
+      alter_params_arg.table_name_ = base_table_schema.get_table_name_str();
+      alter_params_arg.index_name_ = domain_table_schema.get_table_name_str();
+      alter_params_arg.index_table_id_ = domain_table_schema.get_table_id();
+      alter_params_arg.index_action_type_ = obrpc::ObIndexArg::ALTER_INDEX;
+      alter_params_arg.parallelism_ = idx_parallel_build;
+      alter_params_arg.index_params_ = new_index_params;
+      alter_params_arg.need_rebuild_ = need_rebuild;
+      if (OB_FAIL(alter_params_arg.based_schema_object_infos_.push_back(
+              share::schema::ObBasedSchemaObjectInfo(
+                  domain_table_schema.get_table_id(),
+                  share::schema::TABLE_SCHEMA,
+                  domain_table_schema.get_schema_version(), tenant_id_)))) {
+        LOG_WARN("fail to add based schema object for alter index params",
+                 KR(ret));
+      } else if (OB_ISNULL(GCTX.rs_mgr_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("root server manager is null", KR(ret));
+      } else if (OB_FAIL(GCTX.rs_mgr_->get_master_root_server(rs_addr))) {
+        LOG_WARN("fail to get root server address", KR(ret));
+      } else if (OB_ISNULL(common_rpc_proxy)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("common rpc proxy is null", KR(ret));
+      } else if (OB_FAIL(common_rpc_proxy->to(rs_addr)
+                             .timeout(ddl_rpc_timeout)
+                             .alter_vec_index_params(alter_params_arg,
+                                                     alter_params_res))) {
+        LOG_WARN("fail to send alter index params rpc", KR(ret), K(rs_addr),
+                 K(ddl_rpc_timeout), K(alter_params_arg));
+      } else {
+        LOG_INFO("alter index params committed", K(rs_addr), K(alter_params_arg));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::execute_rebuild(
+    pl::ObPLExecCtx &ctx, const ObVectorRebuildIndexArg &arg) {
+  int ret = OB_SUCCESS;
+  ctx_ = ctx.exec_ctx_;
+  pl_ctx_ = &ctx;
+  CK(OB_NOT_NULL(ctx_));
+  CK(OB_NOT_NULL(session_info_ = ctx_->get_my_session()));
+  CK(OB_NOT_NULL(ctx_->get_sql_ctx()));
+  CK(OB_NOT_NULL(ctx_->get_sql_ctx()->schema_guard_));
+  OV(OB_LIKELY(arg.is_valid()), OB_INVALID_ARGUMENT, arg);
+  OZ(schema_checker_.init(*(ctx_->get_sql_ctx()->schema_guard_),
+                          session_info_->get_server_sid()));
+  OX(tenant_id_ = session_info_->get_effective_tenant_id());
+  // See execute_refresh: reject manual triggers during cluster upgrade.
+  OZ(ObVectorRefreshIndexExecutor::check_min_data_version(
+      tenant_id_, DATA_VERSION_4_6_0_1,
+      "vector index task is not supported during cluster upgrade, "
+      "please retry after the cluster has fully upgraded to 4.6.0.1."));
+  OZ(resolve_rebuild_arg(arg));
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(do_rebuild())) {
+    LOG_WARN("fail to do refresh", KR(ret));
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::execute_rebuild_inner(
+  pl::ObPLExecCtx &ctx, const ObVectorRebuildIndexInnerArg &arg)
+{
+  int ret = OB_SUCCESS;
+  bool in_recycle_bin = false;
+  ctx_ = ctx.exec_ctx_;
+  pl_ctx_ = &ctx;
+  CK(OB_NOT_NULL(ctx_));
+  CK(OB_NOT_NULL(session_info_ = ctx_->get_my_session()));
+  CK(OB_NOT_NULL(ctx_->get_sql_ctx()));
+  CK(OB_NOT_NULL(ctx_->get_sql_ctx()->schema_guard_));
+  OV(OB_LIKELY(arg.is_valid()), OB_INVALID_ARGUMENT, arg);
+  OZ(schema_checker_.init(*(ctx_->get_sql_ctx()->schema_guard_),
+                          session_info_->get_server_sid()));
+  OX(tenant_id_ = session_info_->get_effective_tenant_id());
+  // See execute_refresh: reject manual triggers during cluster upgrade.
+  OZ(ObVectorRefreshIndexExecutor::check_min_data_version(
+      tenant_id_, DATA_VERSION_4_6_0_1,
+      "vector index task is not supported during cluster upgrade, "
+      "please retry after the cluster has fully upgraded to 4.6.0.1."));
+  OZ(resolve_rebuild_inner_arg(arg, in_recycle_bin));
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_UNLIKELY(in_recycle_bin)) {
+    // do nothing
+    LOG_DEBUG("delta buffer table is in recyclebin, do nothing");
+  } else if (OB_FAIL(do_rebuild_with_retry())) {
+    LOG_WARN("fail to do refresh", KR(ret));
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::check_min_data_version(
+    const uint64_t tenant_id, const uint64_t min_data_version,
+    const char *errmsg) {
+  int ret = OB_SUCCESS;
+  uint64_t compat_version = 0;
+  if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, compat_version))) {
+    LOG_WARN("fail to get data version", KR(ret), K(tenant_id));
+  } else if (OB_UNLIKELY(compat_version < min_data_version)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("version lower than 4.3 does not support this operation", KR(ret),
+             K(tenant_id), K(compat_version), K(min_data_version));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, errmsg);
+  }
+  return ret;
+}
+
+void ObVectorRefreshIndexExecutor::upper_db_table_name(
+    const ObNameCaseMode case_mode, const bool is_oracle_mode, ObString &name) {
+  if (is_oracle_mode) {
+    str_toupper(name.ptr(), name.length());
+  } else {
+    if (OB_LOWERCASE_AND_INSENSITIVE == case_mode) {
+      str_tolower(name.ptr(), name.length());
+    }
+  }
+}
+
+int ObVectorRefreshIndexExecutor::resolve_table_name(
+    const ObCollationType cs_type, const ObNameCaseMode case_mode,
+    const bool is_oracle_mode, const ObString &name, ObString &database_name,
+    ObString &table_name) {
+  int ret = OB_SUCCESS;
+  static const char split_character = '.';
+  database_name.reset();
+  table_name.reset();
+  if (OB_UNLIKELY(name.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid args", KR(ret), K(name));
+  } else {
+    ObString name_str = name;
+    const char *p = name_str.find(split_character);
+    if (p == nullptr) {
+      table_name = name_str;
+    } else {
+      database_name = name_str.split_on(p);
+      table_name = name_str;
+      if (OB_UNLIKELY(database_name.empty() || table_name.empty() ||
+                      nullptr != table_name.find(split_character))) {
+        ret = OB_WRONG_TABLE_NAME;
+        LOG_WARN("wrong table name", KR(ret), K(name));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      const bool preserve_lettercase =
+          is_oracle_mode ? true : (case_mode != OB_LOWERCASE_AND_INSENSITIVE);
+      upper_db_table_name(case_mode, is_oracle_mode, database_name);
+      upper_db_table_name(case_mode, is_oracle_mode, table_name);
+      if (!database_name.empty() &&
+          OB_FAIL(ObSQLUtils::check_and_convert_db_name(
+              cs_type, preserve_lettercase, database_name))) {
+        LOG_WARN("fail to check and convert database name", KR(ret),
+                 K(database_name));
+      } else if (OB_FAIL(ObSQLUtils::check_and_convert_table_name(
+                     cs_type, preserve_lettercase, table_name,
+                     is_oracle_mode))) {
+        LOG_WARN("fail to check and convert table name", KR(ret), K(cs_type),
+                 K(preserve_lettercase), K(table_name));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::generate_vector_aux_index_name(
+    VectorIndexAuxType index_type, const uint64_t data_table_id,
+    const ObString &index_name, ObString &real_index_name) {
+  int ret = OB_SUCCESS;
+  char *name_buf = nullptr;
+  ObIAllocator *allocator = pl_ctx_->allocator_;
+  CK(OB_NOT_NULL(allocator));
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(name_buf = static_cast<char *>(
+                    allocator->alloc(OB_MAX_TABLE_NAME_LENGTH)))) {
+    ret = common::OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("fail to alloc mem", K(ret));
+  } else {
+    int64_t pos = 0;
+    ObString suffix_index_name;
+    if (VectorIndexAuxType::DOMAIN_INDEX == index_type) {
+      if (OB_FAIL(databuff_printf(name_buf, OB_MAX_TABLE_NAME_LENGTH, pos,
+                                  "%.*s",
+                                  index_name.length(), index_name.ptr()))) {
+        LOG_WARN("failed to print", K(ret));
+      }
+    } else if (VectorIndexAuxType::INDEX_ID_INDEX == index_type) {
+      if (OB_FAIL(databuff_printf(name_buf, OB_MAX_TABLE_NAME_LENGTH, pos,
+                                  "%.*s%s", index_name.length(),
+                                  index_name.ptr(),
+                                  ObVecIndexBuilderUtil::INDEX_ID_TABLE_NAME_SUFFIX))) {
+        LOG_WARN("failed to print", K(ret));
+      }
+    } else if (VectorIndexAuxType::MOCK_INDEX_1 == index_type) {
+      if (OB_FAIL(databuff_printf(name_buf, OB_MAX_TABLE_NAME_LENGTH, pos,
+                                  "%.*s1", index_name.length(),
+                                  index_name.ptr()))) {
+        LOG_WARN("failed to print", K(ret));
+      }
+    } else if (VectorIndexAuxType::MOCK_INDEX_2 == index_type) {
+      if (OB_FAIL(databuff_printf(name_buf, OB_MAX_TABLE_NAME_LENGTH, pos,
+                                  "%.*s2", index_name.length(),
+                                  index_name.ptr()))) {
+        LOG_WARN("failed to print", K(ret));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (FALSE_IT(suffix_index_name.assign_ptr(
+                   name_buf, static_cast<int32_t>(pos)))) {
+    } else if (OB_FAIL(ObTableSchema::build_index_table_name(
+                   *allocator, data_table_id, suffix_index_name,
+                   real_index_name))) {
+      LOG_WARN("fail to build index table name", K(ret), K(data_table_id),
+               K(suffix_index_name), K(real_index_name));
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::mock_check_idx_col_name(
+    const ObString &idx_col_name,
+    const share::schema::ObTableSchema *base_table_schema,
+    const share::schema::ObTableSchema *delta_buf_table_schema,
+    const share::schema::ObTableSchema *index_id_table_schema) {
+  int ret = OB_SUCCESS;
+  CK(OB_NOT_NULL(base_table_schema),
+     OB_NOT_NULL(delta_buf_table_schema),
+     OB_NOT_NULL(index_id_table_schema));
+  if (OB_FAIL(ret)) {
+  } else {
+    const ObIndexInfo &delta_table_idx_info =
+        delta_buf_table_schema->get_index_info();
+    const ObIndexInfo &index_id_idx_info =
+        index_id_table_schema->get_index_info();
+    uint64_t delta_table_idx_col_id = OB_INVALID_ID;
+    uint64_t index_id_idx_col_id = OB_INVALID_ID;
+    const ObColumnSchemaV2 *col_schema = nullptr;
+    if (OB_UNLIKELY(1 != delta_table_idx_info.get_size() ||
+                    1 != index_id_idx_info.get_size())) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("the count of index column is not 1", KR(ret),
+              K(delta_table_idx_info.get_size()),
+              K(index_id_idx_info.get_size()));
+    } else if (OB_ISNULL(delta_table_idx_info.get_column(0))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("column is null", K(ret));
+    } else if (OB_ISNULL(index_id_idx_info.get_column(0))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("column is null", K(ret));
+    } else if (FALSE_IT(delta_table_idx_col_id =
+                            delta_table_idx_info.get_column(0)->column_id_)) {
+    } else if (FALSE_IT(index_id_idx_col_id =
+                            index_id_idx_info.get_column(0)->column_id_)) {
+    } else if (OB_UNLIKELY(delta_table_idx_col_id != index_id_idx_col_id)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("delta_buf_table & index_id_idx have different index column id",
+              KR(ret), K(delta_table_idx_col_id), K(index_id_idx_col_id));
+    } else if (FALSE_IT(col_schema = base_table_schema->get_column_schema(
+                            delta_table_idx_col_id))) {
+    } else if (OB_ISNULL(col_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("column not exist", KR(ret), K(delta_table_idx_col_id));
+    } else if (OB_UNLIKELY(idx_col_name != col_schema->get_column_name_str())) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("idx column name does not match with index table", KR(ret),
+              K(idx_col_name), K(col_schema->get_column_name_str()));
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::check_idx_col_name(
+    const ObString &idx_col_name,
+    const share::schema::ObTableSchema *base_table_schema,
+    const share::schema::ObTableSchema *delta_buf_table_schema,
+    const share::schema::ObTableSchema *index_id_table_schema) {
+  int ret = OB_SUCCESS;
+  CK(OB_NOT_NULL(base_table_schema),
+     OB_NOT_NULL(delta_buf_table_schema),
+     OB_NOT_NULL(index_id_table_schema));
+  if (OB_FAIL(ret)) {
+  } else {
+    const ObIndexInfo &delta_table_idx_info =
+        delta_buf_table_schema->get_index_info();
+    const ObIndexInfo &index_id_idx_info =
+        index_id_table_schema->get_index_info();
+    uint64_t delta_table_idx_col_id = OB_INVALID_ID;
+    uint64_t index_id_idx_col_id = OB_INVALID_ID;
+    const ObColumnSchemaV2 *col_schema = nullptr;
+    if (OB_UNLIKELY(1 != delta_table_idx_info.get_size() ||
+                    1 != index_id_idx_info.get_size())) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("the count of index column is not 1", KR(ret),
+              K(delta_table_idx_info.get_size()),
+              K(index_id_idx_info.get_size()));
+    } else if (OB_ISNULL(delta_table_idx_info.get_column(0))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("column is null", K(ret));
+    } else if (OB_ISNULL(index_id_idx_info.get_column(0))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("column is null", K(ret));
+    } else if (FALSE_IT(delta_table_idx_col_id =
+                            delta_table_idx_info.get_column(0)->column_id_)) {
+    } else if (FALSE_IT(index_id_idx_col_id =
+                            index_id_idx_info.get_column(0)->column_id_)) {
+    } else if (OB_UNLIKELY(delta_table_idx_col_id != index_id_idx_col_id)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("delta_buf_table & index_id_idx have different index column id",
+              KR(ret), K(delta_table_idx_col_id), K(index_id_idx_col_id));
+    } else if (FALSE_IT(col_schema = base_table_schema->get_column_schema(
+                            delta_table_idx_col_id))) {
+    } else if (OB_ISNULL(col_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("column not exist", KR(ret), K(delta_table_idx_col_id));
+    } else if (OB_UNLIKELY(idx_col_name != col_schema->get_column_name_str())) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("idx column name does not match with index table", KR(ret),
+              K(idx_col_name), K(col_schema->get_column_name_str()));
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "index column name");
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::mock_resolve_and_check_table_valid(
+    const ObString &arg_idx_name, const ObString &arg_base_name,
+    const ObString &idx_col_name,
+    const share::schema::ObTableSchema *&base_table_schema,
+    const share::schema::ObTableSchema *&domain_table_schema,
+    const share::schema::ObTableSchema *&index_id_table_schema) {
+  int ret = OB_SUCCESS;
+  ObNameCaseMode case_mode = OB_NAME_CASE_INVALID;
+  ObCollationType cs_type = CS_TYPE_INVALID;
+  if (OB_ISNULL(session_info_)) {
+    ret =  OB_ERR_UNEXPECTED;
+    LOG_WARN("session info is null", KR(ret));
+  } else if (OB_FAIL(session_info_->get_name_case_mode(case_mode))) {
+    LOG_WARN("fail to get name case mode", KR(ret));
+  } else if (OB_FAIL(session_info_->get_collation_connection(cs_type))) {
+    LOG_WARN("fail to get collation_connection", KR(ret));
+  } else {
+    ObString base_db_name, base_name, index_db_name, index_name;
+    ObString new_base_db_name, new_base_name;
+    ObString domain_table_name, index_id_table_name;
+    bool has_synonym = false;
+    base_table_schema = domain_table_schema = index_id_table_schema = nullptr;
+    uint64_t base_table_id = -1;
+    if (OB_FAIL(ObVectorRefreshIndexExecutor::resolve_table_name(
+            cs_type, case_mode, lib::is_oracle_mode(), arg_base_name,
+            base_db_name, base_name))) {
+      LOG_WARN("fail to resolve table name", KR(ret), K(cs_type), K(case_mode),
+              K(arg_base_name));
+      LOG_USER_ERROR(OB_WRONG_TABLE_NAME,
+                    static_cast<int>(arg_base_name.length()),
+                    arg_base_name.ptr());
+    } else if (OB_FAIL(ObVectorRefreshIndexExecutor::resolve_table_name(
+                  cs_type, case_mode, lib::is_oracle_mode(), arg_idx_name,
+                  index_db_name, index_name))) {
+      LOG_WARN("fail to resolve table name", KR(ret), K(cs_type), K(case_mode),
+              K(arg_idx_name));
+      LOG_USER_ERROR(OB_WRONG_TABLE_NAME, static_cast<int>(arg_idx_name.length()),
+                    arg_idx_name.ptr());
+    } else if (base_db_name.empty() &&
+              FALSE_IT(base_db_name = session_info_->get_database_name())) {
+    } else if (index_db_name.empty() &&
+              FALSE_IT(index_db_name = session_info_->get_database_name())) {
+    } else if (OB_UNLIKELY(base_db_name.empty() || index_db_name.empty())) {
+      ret = OB_ERR_NO_DB_SELECTED;
+      LOG_WARN("No database selected", KR(ret));
+    } else if (OB_UNLIKELY(base_db_name != index_db_name)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("different db name is not supported.");
+    } else if (OB_FAIL(schema_checker_.get_table_schema_with_synonym(
+                  tenant_id_, base_db_name, base_name, false /*is_index_table*/,
+                  has_synonym, new_base_db_name, new_base_name,
+                  base_table_schema))) {
+      LOG_WARN("fail to get table schema with synonym", KR(ret), K(base_db_name),
+              K(base_name));
+    } else if (OB_ISNULL(base_table_schema)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("base table not exist", KR(ret), K(base_db_name), K(base_name),
+              KP(base_table_schema));
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "base table name");
+    } else if (FALSE_IT(base_table_id = base_table_schema->get_table_id())) {
+    } else if (OB_FAIL(generate_vector_aux_index_name(
+                  VectorIndexAuxType::MOCK_INDEX_1, base_table_id, index_name,
+                  domain_table_name))) {
+      LOG_WARN("fail to generate delta buf index table name", KR(ret),
+              K(base_table_id), K(index_name));
+    } else if (OB_FAIL(generate_vector_aux_index_name(
+                  VectorIndexAuxType::MOCK_INDEX_2, base_table_id, index_name,
+                  index_id_table_name))) {
+      LOG_WARN("fail to generate index id index table name", KR(ret),
+              K(base_table_id), K(index_name));
+    } else if (OB_FAIL(schema_checker_.get_table_schema(
+                  tenant_id_, index_db_name, domain_table_name, true,
+                  domain_table_schema))) {
+      LOG_WARN("fail to get table schema", KR(ret), K(index_db_name),
+              K(domain_table_name));
+    } else if (OB_FAIL(schema_checker_.get_table_schema(tenant_id_, index_db_name,
+                                                        index_id_table_name, true,
+                                                        index_id_table_schema,
+                                                        false, /*with_hidden_flag*/
+                                                        true /*is_built_in_index*/))) {
+      LOG_WARN("fail to get table schema", KR(ret), K(index_db_name),
+              K(index_id_table_name));
+    } else if (OB_ISNULL(domain_table_schema) ||
+              OB_ISNULL(index_id_table_schema)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("delta_buf_table or index_id_table is not exist", KR(ret), K(arg_idx_name),
+               KP(domain_table_schema), KP(index_id_table_schema));
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "idx name");
+    } else if (!idx_col_name.empty() &&
+              OB_FAIL(mock_check_idx_col_name(idx_col_name, base_table_schema,
+                                              domain_table_schema,
+                                              index_id_table_schema))) {
+      LOG_WARN("fail to check idx column name", KR(ret), K(idx_col_name));
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::resolve_and_check_table_valid(
+    const ObString &arg_idx_name, const ObString &arg_base_name,
+    const ObString &idx_col_name,
+    const share::schema::ObTableSchema *&base_table_schema,
+    const share::schema::ObTableSchema *&domain_table_schema,
+    const share::schema::ObTableSchema *&index_id_table_schema,
+    const bool skip_col_name_check) {
+  int ret = OB_SUCCESS;
+  ObNameCaseMode case_mode = OB_NAME_CASE_INVALID;
+  ObCollationType cs_type = CS_TYPE_INVALID;
+  if (OB_ISNULL(session_info_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("session info is null", KR(ret));
+  } else if (OB_FAIL(session_info_->get_name_case_mode(case_mode))) {
+    LOG_WARN("fail to get name case mode", KR(ret));
+  } else if (OB_FAIL(session_info_->get_collation_connection(cs_type))) {
+    LOG_WARN("fail to get collation_connection", KR(ret));
+  } else {
+    ObString base_db_name, base_name, index_db_name, index_name;
+    ObString new_base_db_name, new_base_name;
+    ObString index_id_table_name;
+    ObString domain_index_table_name;
+    bool has_synonym = false;
+    base_table_schema = domain_table_schema = index_id_table_schema = nullptr;
+    uint64_t base_table_id = -1;
+    ObString base_vector_index_col_name;
+    if (OB_FAIL(ObVectorRefreshIndexExecutor::resolve_table_name(
+            cs_type, case_mode, lib::is_oracle_mode(), arg_base_name,
+            base_db_name, base_name))) {
+      LOG_WARN("fail to resolve table name", KR(ret), K(cs_type), K(case_mode),
+              K(arg_base_name));
+      LOG_USER_ERROR(OB_WRONG_TABLE_NAME,
+                    static_cast<int>(arg_base_name.length()),
+                    arg_base_name.ptr());
+    } else if (OB_FAIL(ObVectorRefreshIndexExecutor::resolve_table_name(
+                  cs_type, case_mode, lib::is_oracle_mode(), arg_idx_name,
+                  index_db_name, index_name))) {
+      LOG_WARN("fail to resolve table name", KR(ret), K(cs_type), K(case_mode),
+              K(arg_idx_name));
+      LOG_USER_ERROR(OB_WRONG_TABLE_NAME, static_cast<int>(arg_idx_name.length()),
+                    arg_idx_name.ptr());
+    } else if (base_db_name.empty() &&
+              FALSE_IT(base_db_name = session_info_->get_database_name())) {
+    } else if (index_db_name.empty() &&
+              FALSE_IT(index_db_name = session_info_->get_database_name())) {
+    } else if (OB_UNLIKELY(base_db_name.empty() || index_db_name.empty())) {
+      ret = OB_ERR_NO_DB_SELECTED;
+      LOG_WARN("No database selected", KR(ret));
+    } else if (OB_UNLIKELY(base_db_name != index_db_name)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("different db name is not supported.");
+    } else if (OB_FAIL(schema_checker_.get_table_schema_with_synonym(
+                  tenant_id_, base_db_name, base_name, false /*is_index_table*/,
+                  has_synonym, new_base_db_name, new_base_name,
+                  base_table_schema))) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("fail to get table schema with synonym", KR(ret), K(base_db_name),
+              K(base_name));
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "base table name");
+    } else if (OB_ISNULL(base_table_schema)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("base table not exist", KR(ret), K(base_db_name), K(base_name),
+              KP(base_table_schema));
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "base table name");
+    } else if (FALSE_IT(base_table_id = base_table_schema->get_table_id())) {
+    } else if (OB_FAIL(generate_vector_aux_index_name(
+                  VectorIndexAuxType::DOMAIN_INDEX, base_table_id, index_name,
+                  domain_index_table_name))) {
+      LOG_WARN("fail to generate delta buf index table name", KR(ret),
+              K(base_table_id), K(index_name));
+    } else if (OB_FAIL(schema_checker_.get_table_schema(
+                  tenant_id_, index_db_name, domain_index_table_name, true,
+                  domain_table_schema))) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("fail to get table schema", KR(ret), K(index_db_name),
+              K(domain_index_table_name));
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "index name");
+    } else if (OB_ISNULL(domain_table_schema)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("domain index table is not exist", KR(ret), K(domain_index_table_name));
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "index name");
+    } else if (!domain_table_schema->is_vec_index()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("rebuild or refresh not vector index is not support ", K(ret), K(domain_index_table_name));
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "rebuild or refresh not vector index is");
+    }
+    // get 
+    if (OB_FAIL(ret)) {
+    } else if (domain_table_schema->is_vec_hnsw_index()) {
+      if (OB_FAIL(generate_vector_aux_index_name(
+                  VectorIndexAuxType::INDEX_ID_INDEX, 
+                  base_table_id, index_name, index_id_table_name))) {
+        LOG_WARN("fail to generate index id index table name", KR(ret),
+                K(base_table_id), K(index_name));
+      } else if (OB_FAIL(schema_checker_.get_table_schema(tenant_id_, index_db_name,
+                                                          index_id_table_name, true,
+                                                          index_id_table_schema,
+                                                          false, /*with_hidden_flag*/
+                                                          true /*is_built_in_index*/))) {
+        LOG_WARN("fail to get table schema", KR(ret), K(index_db_name),
+                K(index_id_table_name));
+      } else if (OB_ISNULL(index_id_table_schema)) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("index_id_table is not exist", 
+          KR(ret), K(arg_idx_name), KP(index_id_table_schema));
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "index name");
+      }
+    }
+    // check index column match
+    if (OB_FAIL(ret)) {
+    } else if (skip_col_name_check) { // only for set_attribute
+    } else if (!idx_col_name.empty() &&
+              OB_FAIL(get_vector_index_column_name(
+                  base_table_schema, domain_table_schema,
+                  base_vector_index_col_name))) {
+      LOG_WARN("fail to get vector index column name", KR(ret));
+    } else if (!idx_col_name.empty() &&
+              0 != idx_col_name.case_compare(base_vector_index_col_name)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("vector index column name is not match", KR(ret), K(idx_col_name),
+              K(base_vector_index_col_name));
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::resolve_table_id_and_check_table_valid(
+  const int64_t idx_table_id,
+  const share::schema::ObTableSchema *&base_table_schema,
+  const share::schema::ObTableSchema *&domain_table_schema,
+  const share::schema::ObTableSchema *&index_id_table_schema,
+  bool& in_recycle_bin)
+{
+  int ret = OB_SUCCESS;
+  ObNameCaseMode case_mode = OB_NAME_CASE_INVALID;
+  ObCollationType cs_type = CS_TYPE_INVALID;
+  base_table_schema = domain_table_schema = index_id_table_schema = nullptr;
+  ObString user_index_name;
+  ObString index_id_table_name;
+  const ObDatabaseSchema *database_schema = nullptr;
+  in_recycle_bin = false;
+  if (OB_ISNULL(session_info_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("session info is null", KR(ret));
+  } else if (OB_FAIL(session_info_->get_name_case_mode(case_mode))) {
+    LOG_WARN("fail to get name case mode", KR(ret));
+  } else if (OB_FAIL(session_info_->get_collation_connection(cs_type))) {
+    LOG_WARN("fail to get collation_connection", KR(ret));
+  } else if (OB_FAIL(schema_checker_.get_table_schema(tenant_id_, idx_table_id, domain_table_schema))) {
+    LOG_WARN("fail to get index id table table schema", KR(ret), K(idx_table_id));
+  } else if (OB_ISNULL(domain_table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table_schema is null", K(ret), KP(domain_table_schema));
+  } else if (OB_UNLIKELY(domain_table_schema->is_in_recyclebin())) {
+    in_recycle_bin = true;
+    LOG_DEBUG("domain table is in recyclebin, do nothing");
+  } else if (OB_UNLIKELY(!domain_table_schema->is_vec_domain_index())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("invalid index table type", KR(ret), K(domain_table_schema->is_vec_domain_index()));
+  } else if (OB_FAIL(schema_checker_.get_table_schema(tenant_id_, domain_table_schema->get_data_table_id(), base_table_schema))) {
+    LOG_WARN("fail to get base table schema", KR(ret), K(idx_table_id));
+  } else if (OB_ISNULL(base_table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table_schema is null", K(ret), KP(base_table_schema));
+  } else if (OB_FAIL(schema_checker_.get_database_schema(tenant_id_, domain_table_schema->get_database_id(), database_schema))) {
+    LOG_WARN("fail to get database schema", KR(ret), K(tenant_id_), K(domain_table_schema->get_database_id()));
+  } else if (OB_ISNULL(database_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("database_schema is null", K(ret), KP(database_schema));
+  }  
+  // get index id table schema if need 
+  if (OB_FAIL(ret)) {
+  } else if (!domain_table_schema->is_vec_hnsw_index()) {   // skip not hnsw index
+  } else if (OB_FAIL(ObTableSchema::get_index_name(domain_table_schema->get_table_name_str(), user_index_name))) {
+    LOG_WARN("fail to get user index name", K(ret), K(domain_table_schema->get_table_name_str()));
+  } else if (OB_FAIL(generate_vector_aux_index_name(
+                     VectorIndexAuxType::INDEX_ID_INDEX, domain_table_schema->get_data_table_id(), 
+                     user_index_name, index_id_table_name))) {
+    LOG_WARN("fail to generate index id index table name", KR(ret),
+              K(domain_table_schema->get_data_table_id()), K(user_index_name));
+  } else if (OB_FAIL(schema_checker_.get_table_schema(tenant_id_, database_schema->get_database_name_str(),
+                                                      index_id_table_name, true,
+                                                      index_id_table_schema,
+                                                      false, /*with_hidden_flag*/
+                                                      true /*is_built_in_index*/))) {
+    LOG_WARN("fail to get table schema", KR(ret), K(database_schema->get_database_name_str()),
+            K(index_id_table_name));
+  } else if (OB_ISNULL(index_id_table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table_schema is null", K(ret), KP(index_id_table_schema));
+  } else if (OB_UNLIKELY(!index_id_table_schema->is_vec_index_id_type())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("invalid index table type", KR(ret), K(index_id_table_schema->is_vec_index_id_type()));
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::to_refresh_method(
+    const ObString &arg_refresh_method,
+    share::schema::ObVectorRefreshMethod &method, bool is_rebuild) {
+  int ret = OB_SUCCESS;
+  if (is_rebuild) {
+    method = schema::ObVectorRefreshMethod::REBUILD_COMPLETE;
+  } else if (arg_refresh_method.empty() ||
+             0 == arg_refresh_method.case_compare("FAST")) {
+    method = schema::ObVectorRefreshMethod::REFRESH_DELTA;
+  } else {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("Vector index refresh method is not supported.", KR(ret),
+             K(arg_refresh_method));
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::to_vector_index_organization(
+    const ObString &idx_organization_str,
+    share::schema::ObVectorIndexOrganization &idx_organization) {
+  int ret = OB_SUCCESS;
+  if (idx_organization_str.empty() ||
+      0 == idx_organization_str.case_compare("IN MEMORY NEIGHBOR GRAPH")) {
+    idx_organization = ObVectorIndexOrganization::IN_MEMORY_NEIGHBOR_GRAPH;
+  } else if (0 == idx_organization_str.case_compare("NEIGHBOR PARTITION")) {
+    idx_organization = ObVectorIndexOrganization::NEIGHBOR_PARTITION;
+  } else {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("Vector index organization is not supported.", KR(ret),
+             K(idx_organization_str));
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::to_vector_index_distance_metric(
+    const ObString &idx_distance_metric_str,
+    share::schema::ObVetcorIndexDistanceMetric &idx_distance_metric) {
+  int ret = OB_SUCCESS;
+  if (idx_distance_metric_str.empty() ||
+      0 == idx_distance_metric_str.case_compare("EUCLIDEAN")) {
+    idx_distance_metric = ObVetcorIndexDistanceMetric::EUCLIDEAN;
+  } else if (0 == idx_distance_metric_str.case_compare("EUCLIDEAN_SQUARED")) {
+    idx_distance_metric = ObVetcorIndexDistanceMetric::EUCLIDEAN_SQUARED;
+  } else if (0 == idx_distance_metric_str.case_compare("DOT")) {
+    idx_distance_metric = ObVetcorIndexDistanceMetric::DOT;
+  } else if (0 == idx_distance_metric_str.case_compare("COSINE")) {
+    idx_distance_metric = ObVetcorIndexDistanceMetric::COSINE;
+  } else if (0 == idx_distance_metric_str.case_compare("MANHATTAN")) {
+    idx_distance_metric = ObVetcorIndexDistanceMetric::MANHATTAN;
+  } else if (0 == idx_distance_metric_str.case_compare("HAMMING")) {
+    idx_distance_metric = ObVetcorIndexDistanceMetric::HAMMING;
+  } else {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("Vector index distance metrics is not supported.", KR(ret),
+             K(idx_distance_metric_str));
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::get_vector_index_column_name(
+    const share::schema::ObTableSchema *base_table_schema,
+    const share::schema::ObTableSchema *domain_index_schema,
+    ObString &col_name) {
+  int ret = OB_SUCCESS;
+  col_name.reset();
+  CK(OB_NOT_NULL(base_table_schema),
+     OB_NOT_NULL(domain_index_schema));
+  if (OB_FAIL(ret)) {
+  } else if (OB_UNLIKELY(!domain_index_schema->is_vec_domain_index())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table is not a domain index table", KR(ret), K(domain_index_schema));
+  } else {
+    ObSEArray<ObString, 1> col_names;
+    if (OB_FAIL(ObVectorIndexUtil::get_vector_index_column_name(*base_table_schema,
+                                                                *domain_index_schema,
+                                                                col_names))) {
+      LOG_WARN("fail to get vector index col name", K(ret));
+    } else if (col_names.count() < 1) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get col name array wrong", K(col_names));
+    } else {
+      col_name = col_names.at(0);
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::is_refresh_retry_ret_code(int ret_code) {
+  return OB_OLD_SCHEMA_VERSION == ret_code || OB_EAGAIN == ret_code ||
+         OB_INVALID_QUERY_TIMESTAMP == ret_code ||
+         OB_TASK_EXPIRED == ret_code || is_master_changed_error(ret_code) ||
+         is_partition_change_error(ret_code) ||
+         is_ddl_stmt_packet_retry_err(ret_code);
+}
+
+int ObVectorRefreshIndexExecutor::resolve_refresh_arg(
+    const ObVectorRefreshIndexArg &arg) {
+  int ret = OB_SUCCESS;
+  const share::schema::ObTableSchema *base_table_schema = nullptr;
+  const share::schema::ObTableSchema *domain_table_schema = nullptr;
+  const share::schema::ObTableSchema *index_id_table_schema = nullptr;
+
+#ifdef DBMS_VECTOR_MOCK_TEST
+  if (OB_FAIL(mock_resolve_and_check_table_valid(
+          arg.idx_name_, arg.table_name_, arg.idx_vector_col_,
+          base_table_schema, domain_table_schema, index_id_table_schema)))
+#else
+  if (OB_FAIL(resolve_and_check_table_valid(
+          arg.idx_name_, arg.table_name_, arg.idx_vector_col_,
+          base_table_schema, domain_table_schema, index_id_table_schema)))
+#endif
+  {
+    LOG_WARN("fail to resolve and check table valid", KR(ret), K(arg));
+  } else if (OB_ISNULL(base_table_schema) ||
+             OB_ISNULL(domain_table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table_schemas are null", K(ret), KP(base_table_schema), KP(domain_table_schema));
+  } else if (domain_table_schema->is_vec_ivf_index()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("refresh ivf index is not support", K(ret), K(domain_table_schema));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "refresh ivf index is");
+  } else if (domain_table_schema->is_vec_spiv_index()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("refresh sparse vector index is not support", K(ret), K(domain_table_schema));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "refresh sparse vector index is");
+  } else if (domain_table_schema->is_vec_hnsw_index() && OB_ISNULL(index_id_table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table_schemas are null", K(ret), KP(index_id_table_schema));
+  } else {
+    base_tb_id_ = base_table_schema->get_table_id();
+    domain_tb_id_ = domain_table_schema->get_table_id();
+    index_id_tb_id_ = index_id_table_schema == nullptr ? OB_INVALID_ID : index_id_table_schema->get_table_id();
+    refresh_threshold_ = arg.refresh_threshold_;
+  }
+  // resolve method
+  if (OB_SUCC(ret)) {
+    refresh_method_ = schema::ObVectorRefreshMethod::MAX;
+    if (OB_FAIL(ObVectorRefreshIndexExecutor::to_refresh_method(
+            arg.refresh_type_, refresh_method_))) {
+      LOG_WARN("fail to resolve refresh method", KR(ret));
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::resolve_refresh_inner_arg(const ObVectorRefreshIndexInnerArg &arg,
+                                                            bool& in_recycle_bin)
+{
+  int ret = OB_SUCCESS;
+  const share::schema::ObTableSchema *base_table_schema = nullptr;
+  const share::schema::ObTableSchema *domain_table_schema = nullptr;
+  const share::schema::ObTableSchema *index_id_table_schema = nullptr;
+  in_recycle_bin = false;
+  if (OB_FAIL(resolve_table_id_and_check_table_valid(arg.idx_table_id_, base_table_schema, domain_table_schema, index_id_table_schema, in_recycle_bin))) {
+    LOG_WARN("fail to resolve table id and check table valid", KR(ret), K(arg));
+  } else if (OB_UNLIKELY(in_recycle_bin)) {
+    LOG_DEBUG("delta buffer table is in recyclebin, do nothing");
+  } else if (OB_ISNULL(base_table_schema) ||
+             OB_ISNULL(domain_table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table_schemas are null", K(ret), KP(base_table_schema), KP(domain_table_schema));
+  } else if (domain_table_schema->is_vec_hnsw_index() && OB_ISNULL(index_id_table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table_schemas are null", K(ret), KP(index_id_table_schema));
+  } else {
+    base_tb_id_ = base_table_schema->get_table_id();
+    domain_tb_id_ = domain_table_schema->get_table_id();
+    index_id_tb_id_ = index_id_table_schema == nullptr ? OB_INVALID_ID : index_id_table_schema->get_table_id();
+    refresh_threshold_ = arg.refresh_threshold_;
+  }
+
+  if (OB_SUCC(ret) && !in_recycle_bin) {
+    refresh_method_ = schema::ObVectorRefreshMethod::MAX;
+    if (OB_FAIL(ObVectorRefreshIndexExecutor::to_refresh_method(
+            arg.refresh_type_, refresh_method_))) {
+      LOG_WARN("fail to resolve refresh method", KR(ret));
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::resolve_rebuild_arg(
+    const ObVectorRebuildIndexArg &arg) {
+  int ret = OB_SUCCESS;
+  const share::schema::ObTableSchema *base_table_schema = nullptr;
+  const share::schema::ObTableSchema *domain_table_schema = nullptr;
+  const share::schema::ObTableSchema *index_id_table_schema = nullptr;
+
+#ifdef DBMS_VECTOR_MOCK_TEST
+  if (OB_FAIL(mock_resolve_and_check_table_valid(
+          arg.idx_name_, arg.table_name_, arg.idx_vector_col_,
+          base_table_schema, domain_table_schema, index_id_table_schema)))
+#else
+  if (OB_FAIL(resolve_and_check_table_valid(
+          arg.idx_name_, arg.table_name_, arg.idx_vector_col_,
+          base_table_schema, domain_table_schema, index_id_table_schema)))
+#endif
+  {
+    LOG_WARN("fail to resolve and check table valid", KR(ret), K(arg));
+  } else if (OB_ISNULL(base_table_schema) || OB_ISNULL(domain_table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table_schemas are null", K(ret), KP(base_table_schema), KP(domain_table_schema));
+  } else if (base_table_schema->is_logic_table()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("rebuild vector index on logic table is not supported", K(ret),
+             "table_id", base_table_schema->get_table_id());
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "rebuild vector index on logic table is");
+  } else if (domain_table_schema->is_vec_spiv_index()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("rebuild sparse vector index is not support", K(ret), K(domain_table_schema));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "rebuild sparse vector index is");
+  } else if (domain_table_schema->is_hybrid_vec_index_log_type()
+             && arg.idx_parameters_.empty()
+             && ObPluginVectorIndexHelper::enable_persist_vector_index_incremental(tenant_id_)) {
+    // Partition-level rebuild (no params change) on hybrid vector index is taken over
+    // by freeze/merge tasks when incr=true. Reject manual entry to avoid silent no-op;
+    // table-level rebuild with changed params is still allowed (follows normal index behavior).
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("partition-level rebuild on hybrid vector index is not supported when _persist_vector_index_incremental is true",
+             KR(ret), K(domain_table_schema));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                   "partition-level rebuild on hybrid vector index when _persist_vector_index_incremental is true is");
+  } else if (domain_table_schema->is_vec_hnsw_index() && OB_ISNULL(index_id_table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table_schemas are null", K(ret), KP(index_id_table_schema));
+  } else {
+    base_tb_id_ = base_table_schema->get_table_id();
+    domain_tb_id_ = domain_table_schema->get_table_id();
+    index_id_tb_id_ = index_id_table_schema == nullptr ? OB_INVALID_ID : index_id_table_schema->get_table_id();
+    refresh_method_ = schema::ObVectorRefreshMethod::REBUILD_COMPLETE;
+    // TODO:(@wangmiao) resolve vector index and check if it is the same as the
+    // origin parameter.
+    idx_parameters_ = arg.idx_parameters_;
+    // TODO:(@wangmiao) idx_parallel_creation is not effective now.
+    idx_parallel_creation_ = arg.idx_parallel_creation_;
+    delta_rate_threshold_ = arg.delta_rate_threshold_;
+  }
+  // resolve idx_organization
+  if (OB_SUCC(ret)) {
+    // TODO:(@wangmiao) check if it is the same as origin idx_organization.
+    if (OB_FAIL(ObVectorRefreshIndexExecutor::to_vector_index_organization(
+            arg.idx_organization_, idx_organization_))) {
+      LOG_WARN("fail to vector index organization", KR(ret));
+    }
+  }
+  // resolve idx_distance_metric
+  if (OB_SUCC(ret)) {
+    // TODO:(@wangmiao) check if it is the same as origin idx_distance_metrics.
+    if (OB_FAIL(ObVectorRefreshIndexExecutor::to_vector_index_distance_metric(
+            arg.idx_distance_metrics_, idx_distance_metrics_))) {
+      LOG_WARN("fail to vector index distance metric", KR(ret));
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::resolve_rebuild_inner_arg(const ObVectorRebuildIndexInnerArg &arg,
+                                                            bool& in_recycle_bin)
+{
+  int ret = OB_SUCCESS;
+  const share::schema::ObTableSchema *base_table_schema = nullptr;
+  const share::schema::ObTableSchema *domain_table_schema = nullptr;
+  const share::schema::ObTableSchema *index_id_table_schema = nullptr;
+  in_recycle_bin = false;
+  if (OB_FAIL(resolve_table_id_and_check_table_valid(arg.idx_table_id_, base_table_schema, domain_table_schema, index_id_table_schema, in_recycle_bin))) {
+    LOG_WARN("fail to resolve table id and check table valid", KR(ret), K(arg));
+  } else if (OB_UNLIKELY(in_recycle_bin)) {
+    LOG_DEBUG("domain table is in recyclebin, do nothing");
+  } else if (OB_ISNULL(base_table_schema) ||
+             OB_ISNULL(domain_table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table_schema is null", K(ret), KP(base_table_schema), KP(domain_table_schema));
+  } else if (domain_table_schema->is_vec_hnsw_index() && OB_ISNULL(index_id_table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("table_schema is null", K(ret), KP(index_id_table_schema));
+  } else {
+    base_tb_id_ = base_table_schema->get_table_id();
+    domain_tb_id_ = domain_table_schema->get_table_id();
+    index_id_tb_id_ = index_id_table_schema != nullptr ? index_id_table_schema->get_table_id() : OB_INVALID_ID;
+    refresh_method_ = schema::ObVectorRefreshMethod::REBUILD_COMPLETE;
+    idx_parameters_ = arg.idx_parameters_;
+    idx_parallel_creation_ = arg.idx_parallel_creation_;
+    delta_rate_threshold_ = arg.delta_rate_threshold_;
+  }
+
+  if (OB_SUCC(ret) && !in_recycle_bin) {
+    if (OB_FAIL(ObVectorRefreshIndexExecutor::to_vector_index_organization(
+            arg.idx_organization_, idx_organization_))) {
+      LOG_WARN("fail to vector index organization", KR(ret));
+    }
+  }
+  if (OB_SUCC(ret) && !in_recycle_bin) {
+    if (OB_FAIL(ObVectorRefreshIndexExecutor::to_vector_index_distance_metric(
+            arg.idx_distance_metrics_, idx_distance_metrics_))) {
+      LOG_WARN("fail to vector index distance metric", KR(ret));
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::do_freeze_tablet()
+{
+  int ret = OB_SUCCESS;
+  // freeze major tablet
+  ObArray<uint64_t> tablet_ids;
+  SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+    common::sqlclient::ObMySQLResult *result = nullptr;
+    ObSqlString select_sql;
+    if (OB_FAIL(select_sql.append_fmt(
+            "select tablet_id from oceanbase.DBA_OB_TABLE_LOCATIONS where table_id = %lu",
+            domain_tb_id_))) {
+      LOG_WARN("fail to assign sql", KR(ret));
+    } else if (OB_FAIL(ctx_->get_sql_proxy()->read(
+                   res, tenant_id_, select_sql.ptr()))) {
+      LOG_WARN("fail to execute select sql", KR(ret), K(select_sql),
+               K(tenant_id_));
+    } else if (OB_ISNULL(result = res.get_result())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("result is NULL", K(ret));
+    } else {
+      while (OB_SUCC(ret)) {
+        uint64_t tablet_id = 0;
+        if (OB_FAIL(result->next())) {
+          if (OB_ITER_END != ret) {
+            LOG_WARN("next failed", K(ret));
+          }
+        } else {
+          EXTRACT_INT_FIELD_MYSQL(*result, "tablet_id", tablet_id, uint64_t);
+          if (OB_FAIL(tablet_ids.push_back(tablet_id))) {
+            LOG_WARN("failed to store tablet id", K(ret));
+          }
+        }
+      }
+
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && tablet_ids.count() > 0) {
+    LOG_INFO("get freeze tablet id", K(tablet_ids));
+    // Only do minor/major freeze for first tablet, to maintain compatibility with the legacy behavior while minimizing CPU resource usage.
+    for (int i = 0 ; OB_SUCC(ret) && i < 1; ++i) {
+      int64_t affected_rows = 0;
+      uint64_t tablet_id = tablet_ids.at(i);
+      ObSqlString freeze_sql;
+      if (OB_FAIL(freeze_sql.append_fmt(
+            "alter system minor freeze tablet_id = %lu", tablet_id))) {
+        LOG_WARN("fail to assign sql", KR(ret));
+      } else if (OB_FAIL(ctx_->get_sql_proxy()->write(tenant_id_, freeze_sql.ptr(), affected_rows))) {
+        ret = OB_SUCCESS;
+        LOG_WARN("fail to execute minor freeze sql, continue other tablet id", K(tablet_id),
+                  K(tenant_id_), K(freeze_sql));
+      } else {
+        LOG_INFO("execute minor freeze success", K(tablet_id), K(affected_rows));
+      }
+      ObSqlString major_sql;
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(major_sql.append_fmt(
+            "alter system major freeze tablet_id = %lu", tablet_id))) {
+        LOG_WARN("fail to assign sql", KR(ret));
+      } else if (OB_FAIL(ctx_->get_sql_proxy()->write(tenant_id_, major_sql.ptr(), affected_rows))) {
+        ret = OB_SUCCESS;
+        LOG_WARN("fail to execute major freeze sql, continue other tablet id", K(tablet_id),
+                  K(tenant_id_), K(major_sql));
+      } else {
+        LOG_INFO("execute major freeze success", K(tablet_id), K(affected_rows));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::do_refresh() {
+  int ret = OB_SUCCESS;
+  ObVectorRefreshIndexCtx refresh_ctx;
+  refresh_ctx.tenant_id_ = tenant_id_;
+  refresh_ctx.base_tb_id_ = base_tb_id_;
+  refresh_ctx.domain_tb_id_ = domain_tb_id_;
+  refresh_ctx.index_id_tb_id_ = index_id_tb_id_;
+  refresh_ctx.refresh_method_ = refresh_method_;
+  refresh_ctx.refresh_threshold_ = refresh_threshold_;
+
+  ObVectorRefreshIdxTransaction trans;
+  ObVectorIndexRefresher refresher;
+  int64_t start_time_us = common::ObTimeUtility::fast_current_time();
+  CK(OB_NOT_NULL(ctx_));
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(trans.start(ctx_->get_my_session(), ctx_->get_sql_proxy()))) {
+    LOG_WARN("fail to start trans", KR(ret));
+  } else if (FALSE_IT(refresh_ctx.trans_ = &trans)) {
+  } else if (OB_FAIL(refresher.init(*ctx_, refresh_ctx))) {
+    LOG_WARN("fail to init refresher", KR(ret), K(refresh_ctx));
+  } else if (OB_FAIL(refresher.refresh())) {
+    LOG_WARN("fail to do refresh", KR(ret), K(refresh_ctx));
+  }
+  if (trans.is_started()) {
+    int tmp_ret = OB_SUCCESS;
+    if (OB_SUCCESS != (tmp_ret = trans.end(OB_SUCC(ret)))) {
+      LOG_WARN("failed to commit trans", KR(ret), KR(tmp_ret));
+      ret = COVER_SUCC(tmp_ret);
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (refresh_ctx.need_major_merge_) {
+      if (OB_FAIL(do_freeze_tablet())) {
+        LOG_WARN("fail to do freeze tablet", K(ret));
+      }
+    }
+  }
+  if (ret == OB_EAGAIN) {
+    ret = OB_OP_NOT_ALLOW;
+    LOG_USER_ERROR(OB_OP_NOT_ALLOW, "Calling dbms_vector.refresh when other refresh/rebuild tasks may be running is");
+  }
+  int64_t cost_ms = (common::ObTimeUtility::fast_current_time() - start_time_us) / 1000;
+  // Periodic/user refresh no-ops for async-index tables should not emit INFO noise.
+  if (refresh_ctx.skip_refresh_) {
+    LOG_DEBUG("skip vector refresh for async index table", K(ret), K(cost_ms), K(refresh_ctx));
+  } else {
+    FLOG_INFO("[VEC_INDEX][REFRESH] refresh index cost", K(ret), K(cost_ms), K(refresh_ctx));
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::do_refresh_with_retry()
+{
+  int ret = OB_SUCCESS;
+  ObVectorRefreshIndexCtx refresh_ctx;
+  refresh_ctx.tenant_id_ = tenant_id_;
+  refresh_ctx.base_tb_id_ = base_tb_id_;
+  refresh_ctx.domain_tb_id_ = domain_tb_id_;
+  refresh_ctx.index_id_tb_id_ = index_id_tb_id_;
+  refresh_ctx.refresh_method_ = refresh_method_;
+  refresh_ctx.refresh_threshold_ = refresh_threshold_;
+  int retry_cnt = 0;
+  int64_t start_time_us = common::ObTimeUtility::fast_current_time();
+
+  CK(OB_NOT_NULL(ctx_));
+  while (OB_SUCC(ret) && OB_SUCC(ctx_->check_status())) {
+    ObVectorRefreshIdxTransaction trans;
+    ObVectorIndexRefresher refresher;
+    if (OB_FAIL(trans.start(ctx_->get_my_session(), ctx_->get_sql_proxy()))) {
+      LOG_WARN("fail to start trans", KR(ret));
+    } else if (FALSE_IT(refresh_ctx.trans_ = &trans)) {
+    } else if (OB_FAIL(refresher.init(*ctx_, refresh_ctx))) {
+      LOG_WARN("fail to init refresher", KR(ret), K(refresh_ctx));
+    } else if (OB_FAIL(refresher.refresh())) {
+      LOG_WARN("fail to do refresh", KR(ret), K(refresh_ctx));
+    }
+    if (trans.is_started()) {
+      int tmp_ret = OB_SUCCESS;
+      if (OB_SUCCESS != (tmp_ret = trans.end(OB_SUCC(ret)))) {
+        LOG_WARN("failed to commit trans", KR(ret), KR(tmp_ret));
+        ret = COVER_SUCC(tmp_ret);
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (refresh_ctx.need_major_merge_) {
+        if (OB_FAIL(do_freeze_tablet())) {
+          LOG_WARN("fail to do freeze tablet", K(ret));
+        }
+      }
+    }
+    if (OB_FAIL(ret)) {
+      if (retry_cnt < MAX_REFRESH_RETRY_THRESHOLD &&
+          ObVectorRefreshIndexExecutor::is_refresh_retry_ret_code(ret)) {
+        ret = OB_SUCCESS;
+        refresh_ctx.reuse();
+        ++retry_cnt;
+        ob_usleep(1LL * 1000 * 1000);
+      }
+    } else {
+      break;
+    }
+  }
+  int64_t cost_ms = (common::ObTimeUtility::fast_current_time() - start_time_us) / 1000;
+  // Periodic refresh may hit this no-op every round, so keep it at DEBUG level.
+  if (refresh_ctx.skip_refresh_) {
+    LOG_DEBUG("skip standalone vector refresh with retry for async index table",
+              K(ret), K(cost_ms), K(retry_cnt), K(refresh_ctx));
+  } else {
+    FLOG_INFO("[VEC_INDEX][REFRESH] refresh index with retry cost", K(ret), K(cost_ms), K(retry_cnt), K(refresh_ctx));
+  }
+  return ret;
+}
+
+/*
+
+DBMS_VECTOR.rebuild_index_inner(500013, 0.200000, "", "", "", 8)
+
+*/
+
+int ObVectorRefreshIndexExecutor::parse_string_value_to_int(const ObString &string_value, int64_t &int_value)
+{
+  int ret = OB_SUCCESS;
+  if (string_value.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid parallel number", K(ret), K(string_value));
+  } else {
+    ObString tmp_str_val = string_value.trim();
+    const char *str = tmp_str_val.ptr();
+    for (int64_t i = 0; OB_SUCC(ret) && i < tmp_str_val.length(); ++i) {
+      if (str[i] < '0' || str[i] > '9') {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid parallel number", K(ret), K(string_value));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(ObSchemaUtils::str_to_int(tmp_str_val, int_value))) {
+        LOG_WARN("fail to get str value", K(ret), K(tmp_str_val));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::set_attribute(pl::ObPLExecCtx &ctx, const ObVectorRebuildIndexArg &arg)
+{
+  int ret = OB_SUCCESS;
+  ctx_ = ctx.exec_ctx_;
+  pl_ctx_ = &ctx;
+  CK(OB_NOT_NULL(ctx_));
+  CK(OB_NOT_NULL(session_info_ = ctx_->get_my_session()));
+  CK(OB_NOT_NULL(ctx_->get_sql_ctx()));
+  CK(OB_NOT_NULL(ctx_->get_sql_ctx()->schema_guard_));
+  OV(OB_LIKELY(arg.is_valid()), OB_INVALID_ARGUMENT, arg);
+  OZ(schema_checker_.init(*(ctx_->get_sql_ctx()->schema_guard_), session_info_->get_server_sid()));
+  OX(tenant_id_ = session_info_->get_effective_tenant_id());
+  OZ(ObVectorRefreshIndexExecutor::check_min_data_version(
+      tenant_id_, DATA_VERSION_4_5_1_0,
+      "tenant's data version is below 4.5.1.0, refreshing vector index is not "
+      "supported."));
+  
+  const share::schema::ObTableSchema *base_table_schema = nullptr;
+  const share::schema::ObTableSchema *domain_table_schema = nullptr;
+  const share::schema::ObTableSchema *index_id_table_schema = nullptr;
+  ObSqlString target_job_name;
+  ObString attribute_str_trim = arg.attribute_.trim();
+  ObString attribute_str("");
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(resolve_and_check_table_valid(
+      arg.idx_name_, arg.table_name_, arg.idx_vector_col_, 
+      base_table_schema, domain_table_schema, index_id_table_schema, true))) {
+    LOG_WARN("failed to resolver and check table valid", K(ret), K(arg));
+  } else if (!domain_table_schema->is_vec_delta_buffer_type()) {
+    LOG_WARN("failed to set attribute", K(ret));
+  } else if (OB_FAIL(ObVectorIndexUtil::check_index_rebuild_conflit(tenant_id_, 
+      domain_table_schema->get_data_table_id(), domain_table_schema->get_table_id()))) {
+    LOG_WARN("fail to check index rebuild conflit", K(ret));
+  } else if (OB_FAIL(ob_simple_low_to_up(allocator_, attribute_str_trim, attribute_str))) {
+    LOG_WARN("string low to up failed", K(ret), K(arg.attribute_));
+  } else if (OB_FAIL(get_target_dbms_job_name(attribute_str, domain_table_schema->get_table_id(), target_job_name))) {
+    LOG_WARN("fail to get target job name", K(ret), K(attribute_str));
+  } else if (OB_FAIL(set_attribute_inner(target_job_name.string(), attribute_str, arg.value_))) {
+    LOG_WARN("failed to do refresh", KR(ret), K(arg));
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::get_target_dbms_job_name(
+    const ObString &attribute, const int64_t domain_table_id, ObSqlString &target_job_name)
+{
+  int ret = OB_SUCCESS;
+  if (attribute.empty() || OB_INVALID_ID == domain_table_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(attribute), K(domain_table_id));
+  } else if (0 == attribute.compare("PARALLEL") || 
+             0 == attribute.compare("REBUILD_TRIGGER_PERCENTAGE") ||
+             0 == attribute.compare("REBUILD_REPEAT_INTERVAL")) {
+    if (OB_FAIL(target_job_name.assign_fmt("%lu_rebuild", domain_table_id))) {
+      LOG_WARN("failed to generate refresh job name", K(ret));
+    } 
+  } else if (0 == attribute.compare("REFRESH_TRIGGER_THRESHOLD") || 
+             0 == attribute.compare("REFRESH_REPEAT_INTERVAL")) {
+    if (OB_FAIL(target_job_name.assign_fmt("%lu_refresh", domain_table_id))) {
+      LOG_WARN("failed to generate refresh job name", K(ret));
+    } 
+  } else {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected attribute", K(ret), K(attribute), K(domain_table_id));
+  }
+  return ret; 
+}
+
+/*
+  e.g. FREQ=SECONDLY; INTERVAL=86400
+*/
+int ObVectorRefreshIndexExecutor::check_time_interval_is_valid(
+    const int64_t tenant_id, const ObString &value, const bool is_rebuild)
+{
+  int ret = OB_SUCCESS;
+  if (tenant_id == OB_INVALID_TENANT_ID || value.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(tenant_id), K(value));
+  } else if (OB_FAIL(dbms_scheduler::ObDBMSSchedJobUtils::check_is_valid_repeat_interval(tenant_id, value))) {
+    LOG_WARN("invalid repeat_interval", KR(ret), K(value));
+  } else {
+    ObArray<ObString> tmp_value_strs;
+    ObString tmp_value("");
+    
+    if (OB_FAIL(ob_write_string(allocator_, value, tmp_value))) {
+      LOG_WARN("fail to write string", K(ret), K(value));
+    } else if (tmp_value.empty()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected repeat interval", K(ret), K(value));
+    } else if (OB_FAIL(split_on(tmp_value, ';', tmp_value_strs))) {
+      LOG_WARN("fail to split func expr", K(ret), K(tmp_value));
+    } else if (tmp_value_strs.count() < 2) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected repeat interval", K(ret), K(tmp_value_strs), K(value));
+    } else {
+      ObArray<ObString> tmp_first_value_strs;
+      ObArray<ObString> tmp_second_value_strs;
+      ObString first_value_str = tmp_value_strs.at(0).trim();
+      ObString second_value_str = tmp_value_strs.at(1).trim();
+
+      if (first_value_str.empty() || second_value_str.empty()) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid repeat interval", K(ret), K(tmp_value_strs));
+      } else if (OB_FAIL(split_on(first_value_str, '=', tmp_first_value_strs))) {
+        LOG_WARN("fail to split func expr", K(ret), K(first_value_str));
+      } else if (OB_FAIL(split_on(second_value_str, '=', tmp_second_value_strs))) {
+        LOG_WARN("fail to split func expr", K(ret), K(second_value_str));
+      } else if (tmp_first_value_strs.count() != 2 || tmp_second_value_strs.count() != 2) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected count", K(ret), K(tmp_first_value_strs), K(tmp_second_value_strs));
+      } else {
+        ObString freq_value = tmp_first_value_strs.at(1).trim();
+        ObString interval_value = tmp_second_value_strs.at(1).trim();
+        int64_t interval = -1;
+  
+        if (OB_FAIL(parse_string_value_to_int(interval_value, interval))) {
+          LOG_WARN("fail to parse string to int", K(ret), K(interval_value));
+        } else if (freq_value.compare("SECONDLY") == 0) {
+          if (is_rebuild && interval < REBUILD_TIME_INTERVAL_SECOND_LOWER_LIMIT) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("invalid rebuild interval", K(ret), K(interval), K(value));
+          } else if (!is_rebuild && interval < REFRESH_TIME_INTERVAL_SECOND_LOWER_LIMIT) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("invalid refresh interval", K(ret), K(interval), K(value));
+          }
+        } else if (freq_value.compare("MINUTELY") == 0) {
+          if (is_rebuild && interval * 60 < REBUILD_TIME_INTERVAL_SECOND_LOWER_LIMIT) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("invalid rebuild interval", K(ret), K(interval), K(value));
+          } 
+          // large than 1min, refresh no need check
+        } else if (freq_value.compare("HOURLY") == 0) {
+          if (is_rebuild && interval * 3600 < REBUILD_TIME_INTERVAL_SECOND_LOWER_LIMIT) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("invalid rebuild interval", K(ret), K(interval), K(value));
+          }
+          // large than 1hour, refresh no need check
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::set_attribute_inner(
+    const ObString &rebuild_job_name, const ObString &attribute, const ObString &value)
+{
+  int ret = OB_SUCCESS;
+  int64_t tenant_id = MTL_ID();
+
+  dbms_scheduler::ObDBMSSchedJobInfo job_info;
+  ObMySQLTransaction trans;
+  if (rebuild_job_name.empty() || value.empty() || attribute.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(rebuild_job_name), K(value));
+  } else if (OB_FAIL(trans.start(GCTX.sql_proxy_, tenant_id))) {
+    LOG_WARN("failed to start trans", KR(ret));
+  } else if (OB_FAIL(dbms_scheduler::ObDBMSSchedJobUtils::get_dbms_sched_job_info(*GCTX.sql_proxy_, 
+                                                                              tenant_id, 
+                                                                              false, // is_oracle_tenant
+                                                                              rebuild_job_name,
+                                                                              allocator_,
+                                                                              job_info))) {
+    LOG_WARN("get job failed", K(ret));
+    if (ret == OB_ENTRY_NOT_EXIST) {
+      ret = OB_ERR_EVENT_NOT_EXIST;
+    }
+  } else {
+    if (0 == attribute.compare("PARALLEL")) {
+      if (OB_FAIL(set_rebuild_parallel(trans, job_info, value))) {
+        LOG_WARN("fail to set rebuild parallel", K(ret), K(attribute), K(value));
+      }
+    } else if (0 == attribute.compare("REBUILD_REPEAT_INTERVAL")) {
+      if (OB_FAIL(check_time_interval_is_valid(tenant_id, value, true /* rebuild */))) {
+        LOG_WARN("fail to check time interval is valid", K(ret), K(value));
+      } else if (OB_FAIL(ObVectorIndexUtil::set_rebuild_repeat_interval(trans, job_info, value))) {
+        LOG_WARN("fail to set rebuild repeat interval", K(ret), K(attribute), K(value));
+      }
+    } else if (0 == attribute.compare("REBUILD_TRIGGER_PERCENTAGE")) {
+      if (OB_FAIL(set_rebuild_trigger_percentage(trans, job_info, value))) {
+        LOG_WARN("fail to set refresh trigger threshold", K(ret), K(attribute), K(value));
+      }
+    } else if (0 == attribute.compare("REFRESH_TRIGGER_THRESHOLD")) {
+      if (OB_FAIL(set_refresh_trigger_threshold(trans, job_info, value))) {
+        LOG_WARN("fail to set refresh trigger threshold", K(ret), K(attribute), K(value));
+      }
+    } else if (0 == attribute.compare("REFRESH_REPEAT_INTERVAL")) {
+      if (OB_FAIL(check_time_interval_is_valid(tenant_id, value, false /* refresh */))) {
+        LOG_WARN("fail to check time interval is valid", K(ret), K(value));
+      } else if (OB_FAIL(ObVectorIndexUtil::set_rebuild_repeat_interval(trans, job_info, value))) {
+        LOG_WARN("fail to set rebuild repeat interval", K(ret), K(attribute), K(value));
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("not support attribute", K(ret), K(attribute));
+    }
+  }
+
+  if (trans.is_started()) {
+    int tmp_ret = OB_SUCCESS;
+    if (OB_SUCCESS != (tmp_ret = trans.end(OB_SUCC(ret)))) {
+      LOG_WARN("failed to commit trans", KR(ret), KR(tmp_ret));
+      ret = OB_SUCC(ret) ? tmp_ret : ret;
+    }
+  }
+  LOG_INFO("set repeat interval", K(ret), K(rebuild_job_name), K(attribute), K(value));
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::set_rebuild_parallel(
+    common::ObISQLClient &trans, dbms_scheduler::ObDBMSSchedJobInfo &job_info, const ObString &value)
+{
+  int ret = OB_SUCCESS;
+  ObString &job_action = job_info.get_job_action();
+  ObString tmp_job_action;
+  ObArray<ObString> tmp_param_strs;
+  ObSqlString new_job_action_str;
+  int64_t parallel_value = 0; // default 1
+
+  if (OB_FAIL(parse_string_value_to_int(value, parallel_value))) {
+    LOG_WARN("fail to get parallel value", K(ret), K(value));
+  } else if (OB_FAIL(ob_write_string(allocator_, job_action, tmp_job_action))) {
+    LOG_WARN("fail to write string", K(ret), K(job_action));
+  } else if (tmp_job_action.empty()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected job action", K(ret), K(tmp_job_action));
+  } else if (OB_FAIL(split_on(tmp_job_action, ',', tmp_param_strs))) {
+    LOG_WARN("fail to split func expr", K(ret), K(tmp_job_action));
+  } else if (tmp_param_strs.count() < 2) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected job action", K(ret), K(tmp_param_strs));
+  } else {
+    ObString split_str_first = tmp_param_strs.at(0).trim();
+    ObString split_str_second = tmp_param_strs.at(1).trim();
+    if (OB_FAIL(new_job_action_str.append_fmt("%.*s, ", split_str_first.length(), split_str_first.ptr()))) {
+      LOG_WARN("fail to append fmt", K(ret), K(split_str_first));
+    } else {
+      ObArray<ObString> split_str_second_strs;
+      if (OB_FAIL(split_on(split_str_second, ')', split_str_second_strs))) {
+        LOG_WARN("fail to split func expr", K(ret), K(split_str_second));
+      } else if (split_str_second_strs.count() == 0) { // use split_str_second
+        if (OB_FAIL(new_job_action_str.append_fmt("%.*s, ", split_str_second.length(), split_str_second.ptr()))) {
+          LOG_WARN("fail to append fmt", K(ret), K(split_str_second));
+        }
+      } else { // split_str_second="xxx)"
+        ObString tmp_split_str_second = split_str_second_strs.at(0).trim();
+        if (OB_FAIL(new_job_action_str.append_fmt("%.*s, ", tmp_split_str_second.length(), tmp_split_str_second.ptr()))) {
+          LOG_WARN("fail to append fmt", K(ret), K(tmp_split_str_second), K(split_str_first));
+        }
+      }
+    }
+    // set rest
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(new_job_action_str.append_fmt("\"\", \"\", \"\", %ld)", parallel_value))) {
+        LOG_WARN("fail to append fmt", K(ret), K(value), K(parallel_value));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ObString job_action("job_action");
+    ObObj job_action_str;
+    job_action_str.set_char(new_job_action_str.string());
+    OZ (dbms_scheduler::ObDBMSSchedJobUtils::update_dbms_sched_job_info(trans, job_info, job_action, job_action_str));
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::copy_string(
+    common::ObIAllocator &allocator, const ObString &src, ObString &dst)
+{
+  int ret = OB_SUCCESS;
+  if (src.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(src));
+  } else {
+    const char *src_ptr = src.ptr();
+    const int64_t src_len = src.length();
+    char *dst_ptr = nullptr;
+    void *ptr = nullptr;
+    if (nullptr == (ptr = allocator.alloc(src_len + 1))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("allocate memory failed", K(ret), K(src_len));
+    } else {
+      dst_ptr = static_cast<char *>(ptr);
+      for (int64_t i = 0; i < src_len; ++i) {
+        dst_ptr[i] = src_ptr[i];
+      }
+      dst_ptr[src_len] = '\0';
+      dst.assign_ptr(dst_ptr, src_len + 1);
+      LOG_INFO("end copy_string", K(src), K(dst));
+    }
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::set_rebuild_trigger_percentage(
+    common::ObISQLClient &trans, dbms_scheduler::ObDBMSSchedJobInfo &job_info, const ObString &value)
+{
+  int ret = OB_SUCCESS;
+  ObString &job_action = job_info.get_job_action();
+  ObString tmp_job_action;
+  ObArray<ObString> tmp_param_strs;
+  ObSqlString new_job_action_str;
+  double d_value = ObVectorIndexSchedJobUtils::DEFAULT_REBUILD_TRIGGER_THRESHOLD;
+  ObString trim_value = value.trim();
+  ObString tmp_trim_value;
+
+  if (value.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(value));
+  } else if (OB_FAIL(copy_string(allocator_, trim_value, tmp_trim_value))) {
+    LOG_WARN("fail to copy float string", K(ret), K(trim_value));
+  } else {
+    char* endptr = nullptr;
+    
+    d_value = std::strtod(tmp_trim_value.ptr(), &endptr);
+    if (OB_ISNULL(endptr) || OB_UNLIKELY('\0' != *endptr)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid argument", K(ret), K(tmp_trim_value), K(value));
+    } else if (d_value > 1.0 || d_value <= 0.0) { // low limit > 0
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid argument", K(ret), K(d_value), K(trim_value), K(value));
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(ob_write_string(allocator_, job_action, tmp_job_action))) {
+    LOG_WARN("fail to write string", K(ret), K(job_action));
+  } else if (tmp_job_action.empty()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected job action", K(ret), K(tmp_job_action));
+  } else if (OB_FAIL(split_on(tmp_job_action, ',', tmp_param_strs))) {
+    LOG_WARN("fail to split func expr", K(ret), K(tmp_job_action));
+  } else if (tmp_param_strs.count() < 2) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected job action", K(ret), K(tmp_param_strs));
+  } else {
+    ObString tmp_split_str = tmp_param_strs.at(0).trim();
+    if (OB_FAIL(new_job_action_str.append_fmt("%.*s, ", tmp_split_str.length(), tmp_split_str.ptr()))) {
+      LOG_WARN("fail to append fmt", K(ret), K(tmp_split_str), K(tmp_param_strs));
+    } else {
+      if (tmp_param_strs.count() == 2) {  // str=DBMS_VECTOR.rebuild_index_inner(500009, 0.200000)
+        if (OB_FAIL(new_job_action_str.append_fmt("%lf)", d_value))) {
+          LOG_WARN("fail to append fmt", K(ret), K(value), K(tmp_param_strs));
+        }
+      } else { // str=DBMS_VECTOR.rebuild_index_inner(500009, 0.200000, "", "", "", 1)
+        if (OB_FAIL(new_job_action_str.append_fmt("%lf", d_value))) {
+          LOG_WARN("fail to append fmt", K(ret), K(value), K(tmp_param_strs));
+        }
+      }
+    }
+    // set rest
+    for (int64_t i = 2; OB_SUCC(ret) && i < tmp_param_strs.count(); ++i) {
+      ObString tmp_split_str = tmp_param_strs.at(i).trim();
+      if (OB_FAIL(new_job_action_str.append_fmt(", %.*s", tmp_split_str.length(), tmp_split_str.ptr()))) {
+        LOG_WARN("fail to append fmt", K(ret), K(tmp_split_str), K(tmp_param_strs));
+      }
+    }
+    LOG_INFO("print new_job_action_str", K(new_job_action_str));
+  }
+  if (OB_SUCC(ret)) {
+    ObString job_action("job_action");
+    ObObj job_action_str;
+    job_action_str.set_char(new_job_action_str.string());
+    OZ (dbms_scheduler::ObDBMSSchedJobUtils::update_dbms_sched_job_info(trans, job_info, job_action, job_action_str));
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::set_refresh_trigger_threshold(
+    common::ObISQLClient &trans, dbms_scheduler::ObDBMSSchedJobInfo &job_info, const ObString &value)
+{
+  int ret = OB_SUCCESS;
+  ObString &job_action = job_info.get_job_action();
+  ObString tmp_job_action;
+  ObArray<ObString> tmp_param_strs;
+  ObSqlString new_job_action_str;
+  int64_t refresh_trigger_value = ObVectorIndexSchedJobUtils::DEFAULT_REFRESH_TRIGGER_THRESHOLD;
+
+  if (OB_FAIL(parse_string_value_to_int(value, refresh_trigger_value))) {
+    LOG_WARN("fail to get parallel value", K(ret), K(value));
+  } else if (refresh_trigger_value < REFRESH_TRIGGER_THRESHOLD_LOWER_LIMIT) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid refresh_trigger_value", K(refresh_trigger_value));
+  } else if (OB_FAIL(ob_write_string(allocator_, job_action, tmp_job_action))) {
+    LOG_WARN("fail to write string", K(ret), K(job_action));
+  } else if (tmp_job_action.empty()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected job action", K(ret), K(tmp_job_action));
+  } else if (OB_FAIL(split_on(tmp_job_action, ',', tmp_param_strs))) {
+    LOG_WARN("fail to split func expr", K(ret), K(tmp_job_action));
+  } else if (tmp_param_strs.count() != 2) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected job action", K(ret), K(tmp_param_strs));
+  } else {
+    // set param 1 and param 2
+    ObString tmp_split_str = tmp_param_strs.at(0).trim();
+    if (OB_FAIL(new_job_action_str.append_fmt("%.*s, ", tmp_split_str.length(), tmp_split_str.ptr()))) {
+      LOG_WARN("fail to append fmt", K(ret), K(tmp_split_str), K(tmp_param_strs));
+    } else if (OB_FAIL(new_job_action_str.append_fmt("%ld)", refresh_trigger_value))) {
+      LOG_WARN("fail to append fmt", K(ret), K(value), K(refresh_trigger_value), K(tmp_param_strs));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ObString job_action("job_action");
+    ObObj job_action_str;
+    job_action_str.set_char(new_job_action_str.string());
+    OZ (dbms_scheduler::ObDBMSSchedJobUtils::update_dbms_sched_job_info(trans, job_info, job_action, job_action_str));
+  }
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::do_rebuild() {
+  int ret = OB_SUCCESS;
+  ObVectorRefreshIndexCtx refresh_ctx;
+  refresh_ctx.tenant_id_ = tenant_id_;
+  refresh_ctx.base_tb_id_ = base_tb_id_;
+  refresh_ctx.domain_tb_id_ = domain_tb_id_;
+  refresh_ctx.index_id_tb_id_ = index_id_tb_id_;
+  refresh_ctx.refresh_method_ = refresh_method_;
+  refresh_ctx.idx_organization_ = idx_organization_;
+  refresh_ctx.idx_distance_metric_ = idx_distance_metrics_;
+  refresh_ctx.idx_parameters_ = idx_parameters_;
+  refresh_ctx.idx_parallel_creation_ = idx_parallel_creation_;
+  refresh_ctx.delta_rate_threshold_ = delta_rate_threshold_;
+
+  ObVectorIndexRefresher refresher;
+  CK(OB_NOT_NULL(ctx_));
+  int64_t start_time_us = common::ObTimeUtility::fast_current_time();
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(refresher.init(*ctx_, refresh_ctx))) {
+    LOG_WARN("fail to init refresher", KR(ret), K(refresh_ctx));
+  } else if (OB_FAIL(refresher.refresh())) {
+    LOG_WARN("fail to do refresh", KR(ret), K(refresh_ctx));
+  }
+  if (ret == OB_EAGAIN) {
+    ret = OB_OP_NOT_ALLOW;
+    LOG_USER_ERROR(OB_OP_NOT_ALLOW, "Calling dbms_vector.rebuild when other rebuild tasks may be running is");
+  }
+  int64_t cost_ms = (common::ObTimeUtility::fast_current_time() - start_time_us) / 1000;
+  FLOG_INFO("[VEC_INDEX][REBUILD] rebuild index cost", K(ret), K(cost_ms), K(refresh_ctx));
+  return ret;
+}
+
+int ObVectorRefreshIndexExecutor::do_rebuild_with_retry()
+{
+  int ret = OB_SUCCESS;
+  ObVectorRefreshIndexCtx refresh_ctx;
+  refresh_ctx.tenant_id_ = tenant_id_;
+  refresh_ctx.base_tb_id_ = base_tb_id_;
+  refresh_ctx.domain_tb_id_ = domain_tb_id_;
+  refresh_ctx.index_id_tb_id_ = index_id_tb_id_;
+  refresh_ctx.refresh_method_ = refresh_method_;
+  refresh_ctx.idx_organization_ = idx_organization_;
+  refresh_ctx.idx_distance_metric_ = idx_distance_metrics_;
+  refresh_ctx.idx_parameters_ = idx_parameters_;
+  refresh_ctx.idx_parallel_creation_ = idx_parallel_creation_;
+  refresh_ctx.delta_rate_threshold_ = delta_rate_threshold_;
+  int retry_cnt = 0;
+  int64_t start_time_us = common::ObTimeUtility::fast_current_time();
+
+  CK(OB_NOT_NULL(ctx_));
+  while (OB_SUCC(ret) && OB_SUCC(ctx_->check_status())) {
+    ObVectorIndexRefresher refresher;
+    if (OB_FAIL(refresher.init(*ctx_, refresh_ctx))) {
+      LOG_WARN("fail to init refresher", KR(ret), K(refresh_ctx));
+    } else if (OB_FAIL(refresher.refresh())) {
+      LOG_WARN("fail to do refresh", KR(ret), K(refresh_ctx));
+    }
+    if (OB_FAIL(ret)) {
+      if (retry_cnt < MAX_REFRESH_RETRY_THRESHOLD &&
+          ObVectorRefreshIndexExecutor::is_refresh_retry_ret_code(ret)) {
+        ret = OB_SUCCESS;
+        refresh_ctx.reuse();
+        ++retry_cnt;
+        ob_usleep(1LL * 1000 * 1000);
+      }
+    } else {
+      break;
+    }
+  }
+  int64_t cost_ms = (common::ObTimeUtility::fast_current_time() - start_time_us) / 1000;
+  FLOG_INFO("[VEC_INDEX][REBUILD] rebuild index with retry cost", K(ret), K(cost_ms), K(refresh_ctx));
+  return ret;
+}
+
+} // namespace storage
+} // namespace oceanbase

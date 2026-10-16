@@ -1,0 +1,629 @@
+/**
+ * Copyright (c) 2023 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include "object/ob_object.h"
+#define USING_LOG_PREFIX STORAGE_FTS
+
+#include "storage/fts/ob_fts_plugin_helper.h"
+
+#include "lib/json_type/ob_json_base.h"
+#include "lib/json_type/ob_json_tree.h"
+#include "lib/worker.h"
+#include "plugin/legacy/interface/ob_plugin_ftparser_intf.h"
+#include "plugin/legacy/sys/ob_plugin_helper.h"
+#include "share/ob_force_print_log.h"
+#include "storage/fts/ob_fts_parser_property.h"
+#include "storage/fts/ob_fts_stop_token_check.h"
+#include "storage/fts/ob_ft_token_processor.h"
+#include "storage/fts/analyzer/ob_analyzer.h"
+#include "storage/fts/analyzer/ob_token_stream.h"
+#include "storage/fts/analyzer/ob_token_stream_factory.h"
+
+using namespace oceanbase::plugin;
+
+namespace oceanbase
+{
+namespace storage
+{
+
+const char *ObFTParser::NAME_STR[ObFTParser::ParserType::FTP_MAX + 1] = {
+  "non-builtin",
+#define FT_PARSER_TYPE(ftp_type, parser_name) #parser_name,
+  FTS_BUILD_IN_PARSER_LIST
+#undef FT_PARSER_TYPE
+  "max type of parser"
+};
+
+// The plugin_name comes from index table schema and consists of two parts: name and
+// version, e.g. default_parser.1, separated by dot.
+int ObFTParser::parse_from_str(const char *plugin_name, const int64_t buf_len)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(plugin_name)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("plugin name is nullptr", K(ret), KP(plugin_name));
+  } else if (OB_UNLIKELY(buf_len >= share::OB_PLUGIN_NAME_LENGTH)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("plugin name is too long", K(ret), K(buf_len));
+  } else {
+    char name[share::OB_PLUGIN_NAME_LENGTH];
+    char *saveptr = nullptr;
+    char *token = nullptr;
+    char *end_ptr = nullptr;
+    MEMCPY(name, plugin_name, buf_len);
+    name[buf_len] = '\0';
+    if (OB_ISNULL(token = STRTOK_R(name, ".", &saveptr))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected error, plugin name is illegal", K(ret), KCSTRING(name));
+    } else if (OB_FAIL(parser_name_.set_name(token))) {
+      LOG_WARN("fail to set parser name", K(ret), KCSTRING(token));
+    } else if (OB_ISNULL(token = STRTOK_R(nullptr, ".", &saveptr))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected error, plugin name is illegal", K(ret), KCSTRING(name));
+    } else if (OB_FAIL(ob_strtoll(token, end_ptr, parser_version_))) {
+      LOG_WARN("failed to convert str to ll", KCSTRING(token));
+    } else if (OB_NOT_NULL(token = STRTOK_R(nullptr, ".", &saveptr))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected error, plugin name is illegal", K(ret), KCSTRING(name));
+    } else if (OB_UNLIKELY(!is_valid())) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("plugin name isn't valid fulltext parser", K(ret), KCSTRING(plugin_name), KPC(this));
+    }
+  }
+  return ret;
+}
+
+// The fulltext parser name consists of two parts: name and version, e.g. default_parser.1,
+// separated by dot. This function is designed to serialize them into cstring.
+int ObFTParser::serialize_to_str(char *buf, const int64_t buf_len)
+{
+  int ret = OB_SUCCESS;
+  int64_t pos = 0;
+  if (OB_ISNULL(buf) || OB_UNLIKELY(buf_len < share::OB_PLUGIN_NAME_LENGTH)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments", K(ret), KP(buf), K(buf_len));
+  } else if (OB_UNLIKELY(!is_valid())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("invalid fulltext parser doesn't support to serialize_to_str", K(ret), KPC(this));
+  } else if (OB_FAIL(common::databuff_printf(buf, buf_len, pos, "%.*s.%ld", parser_name_.len(), parser_name_.str(),
+          parser_version_))) {
+    LOG_WARN("fail to printf", K(ret), K(buf_len), K(parser_name_), K(parser_version_));
+  }
+  return ret;
+}
+////////////////////////////////////////////////////////////////////////////////
+// ObFTParsePluginData
+
+static ObFTParsePluginData *g_ftparse_plugin_data = nullptr;
+static constexpr const char *FTPARSE_PLUGIN_DATA_MEMORY_LABEL = "FtParse";
+
+int ObFTParsePluginData::init_global()
+{
+  int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(g_ftparse_plugin_data)) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("ftparse plugin data init twice", K(ret));
+  } else if (OB_ISNULL(g_ftparse_plugin_data = OB_NEW(ObFTParsePluginData, FTPARSE_PLUGIN_DATA_MEMORY_LABEL))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate memory", K(ret), K(sizeof(ObFTParsePluginData)));
+  } else if (OB_FAIL(g_ftparse_plugin_data->init())) {
+    LOG_WARN("failed to init global ftparse plugin data object", K(ret));
+  }
+  return ret;
+}
+
+void ObFTParsePluginData::deinit_global()
+{
+  if (OB_NOT_NULL(g_ftparse_plugin_data)) {
+    OB_DELETE(ObFTParsePluginData, FTPARSE_PLUGIN_DATA_MEMORY_LABEL, g_ftparse_plugin_data);
+    g_ftparse_plugin_data = nullptr;
+  }
+}
+
+ObFTParsePluginData &ObFTParsePluginData::instance()
+{
+  return *g_ftparse_plugin_data;
+}
+
+ObFTParsePluginData::~ObFTParsePluginData()
+{
+  destroy();
+}
+
+int ObFTParsePluginData::init()
+{
+  int ret = OB_SUCCESS;
+  lib::ObMemAttr mem_attr;
+  mem_attr.label_ = FTPARSE_PLUGIN_DATA_MEMORY_LABEL;
+
+  if (OB_FAIL(handler_allocator_.init(lib::ObMallocAllocator::get_instance(),
+                                      OB_MALLOC_NORMAL_BLOCK_SIZE,
+                                      mem_attr))) {
+    LOG_WARN("fail to init tenant plugin handler allocator", K(ret));
+  } else if (OB_FAIL(init_stop_token_checker_gen())) {
+    LOG_WARN("fail to init and set stopword list", K(ret));
+  } else {
+    is_inited_ = true;
+    FLOG_INFO("succeed to initialize ObTenantFTPluginMgr", KP(this));
+  }
+
+  if (OB_UNLIKELY(!is_inited_)) {
+    destroy();
+  }
+  return ret;
+}
+
+int ObFTParsePluginData::get_stop_token_checker(
+    const ObCollationType coll,
+    ObStopTokenChecker &stop_token_checker)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("the ObFTParsePluginData is not initialized", K(ret));
+  } else if (OB_FAIL(stop_token_checker_gen_->get_stop_token_checker_by_coll(coll, stop_token_checker))) {
+    LOG_WARN("failed to get stop token checker", K(ret), K(coll));
+  }
+  return ret;
+}
+
+int ObFTParsePluginData::init_stop_token_checker_gen()
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(stop_token_checker_gen_ = OB_NEWx(ObStopTokenCheckerGen, &handler_allocator_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to create stop token checker gen", K(ret));
+  } else if (OB_FAIL(stop_token_checker_gen_->init())) {
+    LOG_WARN("failed to init stop token checker gen", K(ret));
+  }
+  if (OB_FAIL(ret)) {
+    OB_DELETEx(ObStopTokenCheckerGen, &handler_allocator_, stop_token_checker_gen_);
+    stop_token_checker_gen_ = nullptr;
+  }
+  return ret;
+}
+
+void ObFTParsePluginData::destroy()
+{
+  if (OB_NOT_NULL(stop_token_checker_gen_)) {
+    stop_token_checker_gen_->reset();
+    OB_DELETEx(ObStopTokenCheckerGen, &handler_allocator_, stop_token_checker_gen_);
+    stop_token_checker_gen_ = nullptr;
+  }
+
+  handler_allocator_.reset();
+  is_inited_ = false;
+}
+
+ObFTParseHelper::ObFTParseHelper()
+    : allocator_(nullptr),
+    analyzer_allocator_(common::ObMemAttr(MTL_ID(), "FTAnalyzer")),
+    fts_analyzer_allocator_(common::ObMemAttr(MTL_ID(), "FTCAnalyzer")),
+    fts_analyzer_(nullptr),
+    analyzer_collation_(CS_TYPE_INVALID),
+    parser_desc_(nullptr),
+    plugin_param_(nullptr),
+    parser_name_(),
+    process_token_flag_(),
+    props_(),
+    parser_property_(),
+    analyzer_spec_(nullptr),
+    fts_index_type_(share::schema::OB_FTS_INDEX_TYPE_INVALID),
+    is_ddl_mode_(false),
+    is_inited_(false)
+{
+}
+
+ObFTParseHelper::~ObFTParseHelper()
+{
+  reset();
+}
+
+int ObFTParseHelper::init(
+    common::ObIAllocator *allocator,
+    const common::ObString &plugin_name,
+    const common::ObString &plugin_properties,
+    const share::schema::ObFTSIndexType fts_index_type,
+    const bool is_ddl_mode)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(is_inited_)) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("this fulltext parse helper has been initialized", K(ret), KP(parser_desc_), K(is_inited_));
+  } else if (OB_ISNULL(allocator) || OB_UNLIKELY(plugin_name.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(allocator), K(plugin_name));
+  } else if (ObFTParser::is_analyzer_parser_name(plugin_name)) {
+    // New analyzer framework: store analysis JSON, skip legacy plugin lookup
+    if (OB_UNLIKELY(plugin_properties.empty())) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("analysis json is empty for analyzer parser", K(ret));
+    } else {
+      share::ObPluginName analyzer_plugin_name;
+      if (OB_FAIL(analyzer_plugin_name.set_name(ObFTSLiteral::PARSER_NAME_ANALYZER))) {
+        LOG_WARN("fail to set analyzer plugin name", K(ret));
+      } else if (OB_FAIL(ObAnalyzerSpecFactory::create_analyzer_spec(
+          plugin_properties, analyzer_allocator_, analyzer_spec_))) {
+        LOG_WARN("failed to create analyzer spec during init", K(ret), K(plugin_properties));
+      } else if (OB_FAIL(ob_write_string(analyzer_allocator_, plugin_properties, analysis_json_))) {
+        LOG_WARN("fail to deep copy analysis json", K(ret), K(plugin_properties));
+      } else {
+        parser_name_.set_name_and_version(analyzer_plugin_name, ANALYZER_PARSER_VERSION_PLACEHOLDER);
+        fts_index_type_ = fts_index_type;
+        allocator_ = allocator;
+        is_inited_ = true;
+        process_token_flag_.set_groupby_token();
+        LOG_TRACE("succeeded to init ft parser helper for analyzer", K(ret), K(plugin_name),
+                  K(plugin_properties), K(fts_index_type));
+      }
+    }
+  } else if (OB_FAIL(parser_name_.parse_from_str(plugin_name.ptr(), plugin_name.length()))) {
+    LOG_WARN("fail to parse name from cstring", K(ret), K(plugin_name));
+  } else if (OB_FAIL(props_.init())) {
+    LOG_WARN("fail to init props", K(ret));
+  } else if (OB_FAIL(props_.parse_from_valid_str(plugin_properties))) {
+    LOG_WARN("fail to parse parser property from cstring", K(ret), K(plugin_properties), K(parser_name_));
+  } else if (OB_FAIL(parser_property_.parse_for_parser_helper(parser_name_, props_))) {
+    LOG_WARN("fail to parse parser property from cstring", K(ret), K(plugin_properties), K(parser_name_));
+  } else if (OB_FAIL(ObPluginHelper::find_ftparser(parser_name_.get_parser_name().str(),
+                                                   parser_desc_, plugin_param_))) {
+    if (OB_FUNCTION_NOT_DEFINED == ret) {
+      LOG_DEBUG("no such parser", K(parser_name_), K(ret));
+    } else {
+      LOG_WARN("fail to open plugin handler", K(ret), K(plugin_name));
+    }
+  } else if (OB_ISNULL(parser_desc_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected error, parse desc is nullptr", K(ret), KP(parser_desc_));
+  } else if (OB_FAIL(set_process_token_flag(*parser_desc_))) {
+    LOG_WARN("fail to set add word flag", K(ret), K(parser_name_));
+  } else {
+    allocator_ = allocator;
+    fts_index_type_ = fts_index_type;
+    is_ddl_mode_ = is_ddl_mode;
+    is_inited_ = true;
+    LOG_TRACE("succeed to init ft parser helper", K(ret), K(plugin_name), K(plugin_properties), K(fts_index_type), KPC(this));
+  }
+  if (OB_FAIL(ret) && OB_UNLIKELY(!is_inited_)) {
+    reset();
+  }
+  return ret;
+}
+
+void ObFTParseHelper::free_analyzer_spec_()
+{
+  if (OB_NOT_NULL(analyzer_spec_)) {
+    ObAnalyzerSpecFactory::destroy_analyzer_spec(analyzer_allocator_, analyzer_spec_);
+  }
+  analyzer_spec_ = nullptr;
+}
+
+void ObFTParseHelper::free_fts_analyzer_() const
+{
+  if (OB_NOT_NULL(fts_analyzer_)) {
+    // Run component destructors before releasing their arena. In particular, a
+    // legacy IK tokenizer owns dictionary-related parser state in this arena.
+    fts_analyzer_->~ObFTSAnalyzer();
+    fts_analyzer_ = nullptr;
+  }
+  fts_analyzer_allocator_.reset();
+  analyzer_collation_ = CS_TYPE_INVALID;
+}
+
+void ObFTParseHelper::reset()
+{
+  free_fts_analyzer_();
+  free_analyzer_spec_();
+  analyzer_allocator_.reset();
+  parser_desc_ = nullptr;
+  plugin_param_ = nullptr;
+  allocator_ = nullptr;
+  process_token_flag_.clear();
+  analysis_json_.reset();
+  fts_index_type_ = share::schema::OB_FTS_INDEX_TYPE_INVALID;
+  props_.reset();
+  is_ddl_mode_ = false;
+  is_inited_ = false;
+}
+
+int ObFTParseHelper::prepare_fts_analyzer_(const ObObjMeta &meta) const
+{
+  int ret = OB_SUCCESS;
+  const ObCollationType collation = meta.get_collation_type();
+  if (OB_UNLIKELY(CS_TYPE_INVALID == collation)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid analyzer collation", K(ret), K(meta));
+  } else {
+    if (OB_NOT_NULL(fts_analyzer_) && analyzer_collation_ != collation) {
+      // The tokenizer pipeline is built for a fixed source collation. It is
+      // safe to share one only while the source collation remains unchanged.
+      free_fts_analyzer_();
+    }
+    if (OB_ISNULL(fts_analyzer_)) {
+      ObFTAnalyzerParam analyzer_param;
+      analyzer_param.legacy_tokenizer_type_ = parser_name_.to_tokenizer_type();
+      analyzer_param.parser_property_ = &parser_property_;
+      analyzer_param.fts_index_type_ = fts_index_type_;
+      analyzer_param.process_token_flag_ = process_token_flag_;
+      analyzer_param.meta_ = meta;
+      analyzer_param.alloc_ = &fts_analyzer_allocator_;
+      analyzer_param.is_ddl_mode_ = is_ddl_mode_;
+      analyzer_param.need_casedown_ = process_token_flag_.casedown_token();
+      if (OB_FAIL(create_analyzer(analyzer_param, fts_analyzer_))) {
+        LOG_WARN("fail to create cached fts analyzer", K(ret), K(meta), K(parser_name_));
+        free_fts_analyzer_();
+      } else if (OB_ISNULL(fts_analyzer_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("cached fts analyzer is null after creation", K(ret), K(meta), K(parser_name_));
+        free_fts_analyzer_();
+      } else {
+        analyzer_collation_ = collation;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObFTParseHelper::create_analyzer(
+    const ObFTAnalyzerParam &param,
+    ObFTSAnalyzer *&fts_analyzer) const
+{
+  int ret = OB_SUCCESS;
+  fts_analyzer = nullptr;
+  if (OB_UNLIKELY(IS_NOT_INIT)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("fulltext parser helper is not initialized", K(ret), K_(is_inited));
+  } else if (OB_UNLIKELY(!param.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid analyzer param", K(ret), K(param));
+  } else if (parser_name_.is_legacy_parser()) {
+    if (OB_FAIL(ObTokenStreamFactory::create_analyzer_from_legacy_parser(param, fts_analyzer))) {
+      LOG_WARN("fail to create analyzer from legacy parser", K(ret), K(parser_name_));
+    } else if (OB_ISNULL(fts_analyzer)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("fts analyzer is null after creation", K(ret), K(param), K(parser_name_));
+    }
+  } else if (is_analyzer_parser()) {
+    if (OB_ISNULL(analyzer_spec_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("analyzer spec is null", K(ret));
+    } else if (OB_FAIL(ObTokenStreamFactory::create_analyzer(*analyzer_spec_, param.meta_.get_collation_type(), 
+                                                             *param.alloc_, fts_analyzer))) {
+      LOG_WARN("fail to create analyzer from spec", K(ret), KPC_(analyzer_spec));
+    } else if (OB_ISNULL(fts_analyzer)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("fts analyzer is null after creation", K(ret), KPC_(analyzer_spec));
+    }
+  } else {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("unsupported analyzer type", K(ret), K(parser_name_));
+  }
+  return ret;
+}
+
+int ObFTParseHelper::segment(
+    const ObObjMeta &meta,
+    const char *fulltext,
+    const int64_t fulltext_len,
+    int64_t &doc_length,
+    ObFTTokenMap &ft_token_map) const
+{
+  int ret = OB_SUCCESS;
+  ObCollationType type = meta.get_collation_type();
+  doc_length = 0;
+  ft_token_map.reuse();
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("this fulltext parser helper hasn't been initialized", K(ret), K(is_inited_));
+  } else if (OB_UNLIKELY(CS_TYPE_INVALID == type || type >= CS_TYPE_PINYIN_BEGIN_MARK ||
+                         nullptr == fulltext || fulltext_len <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(type), KP(fulltext), K(fulltext_len));
+  } else {
+    ObFTTokenProcessor token_processor(*allocator_);
+    ObITokenStream *token_stream = nullptr;
+
+    if (OB_FAIL(prepare_fts_analyzer_(meta))) {
+      LOG_WARN("fail to prepare cached fts analyzer", K(ret), K(meta));
+    } else if (OB_FAIL(token_processor.init(parser_property_, meta, process_token_flag_, &ft_token_map))) {
+      LOG_WARN("fail to initialize add word", K(ret), K(token_processor));
+    } else if (OB_FAIL(fts_analyzer_->analyze(fulltext, fulltext_len, *allocator_, token_stream))) {
+      LOG_WARN("fail to analyze text via analyzer", K(ret));
+    } else if (OB_ISNULL(token_stream)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected error, token stream is nullptr", K(ret));
+    } else {
+      ObTokenAttr token;
+      int64_t token_interval_cnt = 0;
+      int64_t position = -1;  // pos_inc_ semantics: position starts at -1, first token = -1 + 1 = 0
+      constexpr int64_t FTS_SEGMENT_CHECK_STATUS_TOKEN_INTERVAL_CNT = 100;
+      const bool need_pos_list = (fts_index_type_ == share::schema::OB_FTS_INDEX_TYPE_PHRASE_MATCH);
+      while (OB_SUCC(ret)) {
+        if (OB_FAIL(token_stream->get_next_token(token))) {
+          if (OB_ITER_END != ret) {
+            LOG_WARN("fail to get next token from analyzer", K(ret));
+          }
+        } else if (FALSE_IT(position += token.pos_inc_)) {
+        } else {
+          ObString token_string;
+          if (OB_FAIL(ob_write_string(*allocator_, token.to_ob_string(), token_string))) {
+            LOG_WARN("fail to deep copy token", K(ret), K(token));
+          }
+          if (OB_FAIL(ret)) {
+          } else if (OB_FAIL(token_processor.process_token(
+                         need_pos_list, token_string.ptr(), token_string.length(), position))) {
+            LOG_WARN("fail to process token", K(ret), K(token), K(need_pos_list));
+          } else if (++token_interval_cnt >= FTS_SEGMENT_CHECK_STATUS_TOKEN_INTERVAL_CNT) {
+            if (OB_FAIL(THIS_WORKER.check_status())) {
+              LOG_WARN("worker interrupt during fulltext segment", K(ret));
+            } else {
+              token_interval_cnt = 0;
+            }
+          }
+        }
+      }
+      if (OB_ITER_END == ret) {
+        doc_length = token_processor.get_non_stop_token_count();
+        ret = OB_SUCCESS;
+      }
+    }
+  }
+  LOG_DEBUG("ft parse segment", K(ret), K(type), K(process_token_flag_), K(parser_name_),
+      K(ObString(fulltext_len, fulltext)), K(ft_token_map.size()));
+  return ret;
+}
+
+int ObFTParseHelper::check_is_the_same(
+    const common::ObString &plugin_name,
+    const common::ObString &plugin_properties,
+    const share::schema::ObFTSIndexType fts_index_type,
+    bool &is_same) const
+{
+  int ret = OB_SUCCESS;
+  is_same = false;
+  if (is_inited_) {
+    if (OB_UNLIKELY(plugin_name.empty())) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid argument", K(ret), K(plugin_name));
+    } else if (ObFTParser::is_analyzer_parser_name(plugin_name)) {
+      if (parser_name_.is_analyzer_parser()
+          && 0 == analysis_json_.compare(plugin_properties)
+          && fts_index_type == fts_index_type_) {
+        is_same = true;
+      }
+    } else {
+      storage::ObFTParser parser_name;
+      ObFTParserJsonProps props;
+      ObFTParserProperty parser_property;
+      if (OB_FAIL(parser_name.parse_from_str(plugin_name.ptr(), plugin_name.length()))) {
+        LOG_WARN("fail to parse name from cstring", K(ret), K(plugin_name));
+      } else if (OB_FAIL(props.init())) {
+        LOG_WARN("fail to init props", K(ret));
+      } else if (OB_FAIL(props.parse_from_valid_str(plugin_properties))) {
+        LOG_WARN("fail to parse parser property from cstring", K(ret), K(plugin_properties), K(parser_name_));
+      } else if (OB_FAIL(parser_property.parse_for_parser_helper(parser_name, props))) {
+        LOG_WARN("fail to parse parser property from cstring", K(ret), K(plugin_properties), K(parser_name_));
+      } else if (parser_name == parser_name_
+          && parser_property.is_equal(parser_property_)
+          && fts_index_type == fts_index_type_) {
+        is_same = true;
+      }
+    }
+  }
+  LOG_TRACE("ft parse helper check is the same", K(is_same), K(plugin_name), K(plugin_properties),
+      K(fts_index_type), K_(parser_name), K_(parser_property), K_(fts_index_type));
+  return ret;
+}
+
+int ObFTParseHelper::make_detail_json(
+    const ObFTTokenMap &ft_token_map,
+    const int64_t doc_length,
+    common::ObIJsonBase *&json_root)
+{
+ int ret = OB_SUCCESS;
+
+ ObJsonObject *root_obj = nullptr;
+
+ ObJsonInt *cnt = nullptr;
+
+ ObJsonArray *token_array = nullptr;
+
+ if (OB_ISNULL(root_obj = OB_NEWx(ObJsonObject, allocator_, allocator_))) {
+   ret = OB_ALLOCATE_MEMORY_FAILED;
+   LOG_WARN("Fail to alloc memory for json", K(ret));
+ } else if (OB_ISNULL(cnt = OB_NEWx(ObJsonInt, allocator_, doc_length))) {
+   ret = OB_ALLOCATE_MEMORY_FAILED;
+   LOG_WARN("Fail to alloc memory for json", K(ret));
+ } else if (OB_ISNULL(token_array = OB_NEWx(ObJsonArray, allocator_, allocator_))) {
+   ret = OB_ALLOCATE_MEMORY_FAILED;
+   LOG_WARN("Fail to alloc memory for json", K(ret));
+ } else {
+   for (ObFTTokenMap::const_iterator it = ft_token_map.begin(); OB_SUCC(ret) && it != ft_token_map.end(); ++it) {
+     ObString key = it->first.get_token().get_string();
+     ObJsonObject *node = nullptr;
+     ObJsonInt *token_cnt_node = nullptr;
+     if (OB_ISNULL(node = OB_NEWx(ObJsonObject, allocator_, allocator_))) {
+       ret = OB_ALLOCATE_MEMORY_FAILED;
+       LOG_WARN("Fail to alloc memory for json int", K(ret));
+     } else if (OB_ISNULL(token_cnt_node = OB_NEWx(ObJsonInt, allocator_, it->second.count_))) {
+       ret = OB_ALLOCATE_MEMORY_FAILED;
+       LOG_WARN("Fail to alloc memory for json", K(ret));
+     } else if (OB_FAIL(node->add(key, token_cnt_node))) {
+       LOG_WARN("Fail to add token count to json", K(ret));
+     } else if (OB_FAIL(token_array->append(node))) {
+       LOG_WARN("Fail to append json object", K(ret));
+     } else {
+       // pass
+     }
+
+     if (OB_FAIL(ret)) {
+       OB_DELETEx(ObJsonObject, allocator_, node);
+       OB_DELETEx(ObJsonInt, allocator_, token_cnt_node);
+     }
+   } // for
+
+   if (OB_SUCC(ret)) {
+     if (OB_FAIL(root_obj->add(ENTRY_NAME_TOKENS, token_array))) {
+       LOG_WARN("Fail to add token array to json", K(ret));
+     } else if (OB_FAIL(root_obj->add(ENTRY_NAME_DOC_LEN, cnt))) {
+       LOG_WARN("Fail to add doc len to json", K(ret));
+     }
+   }
+ }
+  if (OB_SUCC(ret)) {
+    json_root = root_obj;
+  } else {
+    OB_DELETEx(ObJsonObject, allocator_, root_obj);
+    OB_DELETEx(ObJsonInt, allocator_, cnt);
+    OB_DELETEx(ObJsonArray, allocator_, token_array);
+  }
+
+  return ret;
+}
+
+int ObFTParseHelper::make_token_array_json(
+    const ObFTTokenMap &ft_token_map,
+    common::ObIJsonBase *&json_root)
+{
+  int ret = OB_SUCCESS;
+  ObJsonArray *token_array = nullptr;
+  if (OB_UNLIKELY(OB_ISNULL(token_array = OB_NEWx(ObJsonArray, allocator_, allocator_)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("Fail to alloc memory for json", K(ret));
+  } else {
+    for (ObFTTokenMap::const_iterator it = ft_token_map.begin(); OB_SUCC(ret) && it != ft_token_map.end(); ++it) {
+      ObString key = it->first.get_token().get_string();
+      ObJsonString *token = nullptr;
+      if (OB_UNLIKELY(OB_ISNULL(token = OB_NEWx(ObJsonString, allocator_, key)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("Fail to alloc memory for json int", K(ret));
+      } else {
+        if (OB_FAIL(token_array->append(token))) {
+          LOG_WARN("Fail to append json string", K(ret));
+          OB_DELETEx(ObJsonString, allocator_, token);
+        } else {
+        }
+      }
+    } // for
+  }
+  if (OB_SUCC(ret)) {
+    json_root = token_array;
+  } else {
+    OB_DELETEx(ObJsonArray, allocator_, token_array);
+  }
+  return ret;
+}
+
+int ObFTParseHelper::set_process_token_flag(const ObIFTParserDesc &ftparser_desc)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(ftparser_desc.get_add_word_flag(process_token_flag_))) {
+    LOG_WARN("failed to set process token flag", K(ret));
+  }
+  return ret;
+}
+
+} // end namespace storage
+} // end namespace oceanbase

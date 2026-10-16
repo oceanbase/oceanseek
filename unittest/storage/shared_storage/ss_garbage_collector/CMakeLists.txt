@@ -1,0 +1,4 @@
+storage_unittest(test_mark_sweep_pipeline test_mark_sweep_pipeline.cpp)
+storage_unittest(test_tablet_study_info test_tablet_study_info.cpp)
+storage_unittest(test_ss_mark_sweep_diag test_ss_mark_sweep_diag.cpp)
+storage_unittest(test_ss_mark_sweep_diag_cleanup test_ss_mark_sweep_diag_cleanup.cpp)

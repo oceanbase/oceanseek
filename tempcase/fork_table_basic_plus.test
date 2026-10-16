@@ -1,0 +1,378 @@
+#####################
+# owner : fork-table
+# owner group : storage
+# description : 从 oceanbase-lite(share-nothing) 的 fork_table_basic_plus.test 适配到 SS obtest --
+#               fork 表的基础功能补充: 交叉增删改隔离(有主键)、堆表(无主键)、无主键唯一索引、
+#               自增列继承, 以及视图/物化视图/临时表/系统表等不可 fork 对象的提交期拒绝。
+#
+# 源文件中以下 case 未搬运:
+#   - fk(源18)/trigger(源19)/fk+trigger 复合(源22): 本架构不支持外键与触发器,按需求不测。
+#   - 带索引表 fork(源21): 已由 fork_table_index.test 覆盖;其"fork 内部辅助表"在 SS 下命名不同、价值低。
+#   - 含 GLOBAL 索引的复杂表 fork 报错(源23): 核心(global index 令 fork 被拒)已由 fork_table_reject.test 覆盖。
+# 注: fork 拒绝类错误码沿用源文件(SN)取值, SS 下若错误码不同需按实际调整。
+#####################
+
+--echo "1. =========== bootstrap shared-storage cluster ==========="
+ob1=OBI(cluster=1:1:1, proxy_num=0, init_unit_cpu=0);
+source include/mini_ob_config.inc;
+ob1.set extra_config=$mini_ob_config;
+ob1.reboot;
+
+let $proxy_ip = deploy_get_value(ob1.z1.obs0.ip);
+let $proxy_port = deploy_get_value(ob1.z1.obs0.mysql_port);
+connect(sys_conn, $proxy_ip, root@sys,,oceanbase, $proxy_port);
+
+--echo "2. =========== create mysql tenant ==========="
+source include/create_unit_config.inc;
+ob1.mysql CREATE RESOURCE POOL fork_plus_pool UNIT = "2c2g", UNIT_NUM = 1, ZONE_LIST = ('z1', 'z2', 'z3');
+ob1.mysql CREATE TENANT fork_plus_tenant RESOURCE_POOL_LIST=('fork_plus_pool'), locality='F@z1,F@z2,F@z3', primary_zone='z1' SET ob_tcp_invited_nodes='%';
+let $tenant_id = deploy_get_value(ob1.select select tenant_id from oceanbase.__all_tenant where tenant_name='fork_plus_tenant', tenant_id, 1);
+
+connect(mysql_conn, $proxy_ip, root@fork_plus_tenant,,test, $proxy_port);
+connection mysql_conn;
+set recyclebin = off;
+
+--echo "3. =========== 交叉增删改隔离(有主键): 源表与 fork 表互不影响 ==========="
+create table t_cross (id int primary key, name varchar(50), v int);
+insert into t_cross values (1, 'S_A', 10), (2, 'S_B', 20), (3, 'S_C', 30);
+set @fork_sql = 'fork table t_cross to t_cross_fork'; prepare fork_cross_stmt from @fork_sql; execute fork_cross_stmt; deallocate prepare fork_cross_stmt;
+connection sys_conn;
+ob1.check_until_timeout select count(*) from oceanbase.__all_virtual_ddl_task_status where tenant_id = $tenant_id and ddl_type = 1019, 0, 180;
+connection mysql_conn;
+# fork 后 dst 等于源快照
+let $cross_dst0 = query_get_value(select count(*) as cnt from t_cross_fork, cnt, 1);
+if ($cross_dst0 != 3)
+{
+  --echo ERROR: fork dst row count should be 3
+  --exit
+}
+# fork 表: 改 id=1、删 id=2、插 id=99
+update t_cross_fork set name = 'F_A', v = 11 where id = 1;
+delete from t_cross_fork where id = 2;
+insert into t_cross_fork values (99, 'F_NEW', 99);
+# 源表: 改 id=3、删 id=1、插 id=88
+update t_cross set name = 'S_C_U', v = 31 where id = 3;
+delete from t_cross where id = 1;
+insert into t_cross values (88, 'S_NEW', 88);
+# 各自数量(同 ID 写入之前)
+let $cross_src_cnt = query_get_value(select count(*) as cnt from t_cross, cnt, 1);
+if ($cross_src_cnt != 3)
+{
+  --echo ERROR: source row count should be 3 after its own edits
+  --exit
+}
+let $cross_dst_cnt = query_get_value(select count(*) as cnt from t_cross_fork, cnt, 1);
+if ($cross_dst_cnt != 3)
+{
+  --echo ERROR: fork row count should be 3 after its own edits
+  --exit
+}
+# fork 表的改动只体现在 fork 表
+let $cross_dst_u = query_get_value(select count(*) as cnt from t_cross_fork where id = 1 and name = 'F_A' and v = 11, cnt, 1);
+if ($cross_dst_u != 1)
+{
+  --echo ERROR: fork-side update on id=1 missing
+  --exit
+}
+let $cross_dst_d = query_get_value(select count(*) as cnt from t_cross_fork where id = 2, cnt, 1);
+if ($cross_dst_d != 0)
+{
+  --echo ERROR: fork-side delete on id=2 not applied
+  --exit
+}
+# 源表改 id=3 不应泄漏到 fork 表(fork 表 id=3 仍是快照值 v=30)
+let $cross_dst_iso = query_get_value(select count(*) as cnt from t_cross_fork where id = 3 and v = 30, cnt, 1);
+if ($cross_dst_iso != 1)
+{
+  --echo ERROR: source update on id=3 leaked into fork
+  --exit
+}
+# 源表新插 id=88 不应出现在 fork 表
+let $cross_dst_leak = query_get_value(select count(*) as cnt from t_cross_fork where id = 88, cnt, 1);
+if ($cross_dst_leak != 0)
+{
+  --echo ERROR: source insert id=88 leaked into fork
+  --exit
+}
+# 源表的改动只体现在源表
+let $cross_src_d = query_get_value(select count(*) as cnt from t_cross where id = 1, cnt, 1);
+if ($cross_src_d != 0)
+{
+  --echo ERROR: source-side delete on id=1 not applied
+  --exit
+}
+let $cross_src_u = query_get_value(select count(*) as cnt from t_cross where id = 3 and name = 'S_C_U' and v = 31, cnt, 1);
+if ($cross_src_u != 1)
+{
+  --echo ERROR: source-side update on id=3 missing
+  --exit
+}
+# fork 表删 id=2 不应影响源表(源表 id=2 仍在)
+let $cross_src_iso = query_get_value(select count(*) as cnt from t_cross where id = 2 and v = 20, cnt, 1);
+if ($cross_src_iso != 1)
+{
+  --echo ERROR: fork delete on id=2 leaked into source
+  --exit
+}
+# fork 表新插 id=99 不应出现在源表
+let $cross_src_leak = query_get_value(select count(*) as cnt from t_cross where id = 99, cnt, 1);
+if ($cross_src_leak != 0)
+{
+  --echo ERROR: fork insert id=99 leaked into source
+  --exit
+}
+# 同 ID 分别写入不同内容,各自独立
+insert into t_cross values (100, 'S_100', 100);
+insert into t_cross_fork values (100, 'F_100', 1000);
+let $cross_same_src = query_get_value(select count(*) as cnt from t_cross where id = 100 and name = 'S_100' and v = 100, cnt, 1);
+if ($cross_same_src != 1)
+{
+  --echo ERROR: same-id row in source mismatch
+  --exit
+}
+let $cross_same_dst = query_get_value(select count(*) as cnt from t_cross_fork where id = 100 and name = 'F_100' and v = 1000, cnt, 1);
+if ($cross_same_dst != 1)
+{
+  --echo ERROR: same-id row in fork mismatch
+  --exit
+}
+
+--echo "4. =========== 堆表 fork(无主键): 数据一致与双向隔离 ==========="
+create table t_heap (c1 int, c2 varchar(20));
+insert into t_heap values (1, 'H_A'), (2, 'H_B'), (3, 'H_C');
+set @fork_sql = 'fork table t_heap to t_heap_fork'; prepare fork_heap_stmt from @fork_sql; execute fork_heap_stmt; deallocate prepare fork_heap_stmt;
+connection sys_conn;
+ob1.check_until_timeout select count(*) from oceanbase.__all_virtual_ddl_task_status where tenant_id = $tenant_id and ddl_type = 1019, 0, 180;
+connection mysql_conn;
+let $heap_dst0 = query_get_value(select count(*) as cnt from t_heap_fork, cnt, 1);
+if ($heap_dst0 != 3)
+{
+  --echo ERROR: heap fork dst row count should be 3
+  --exit
+}
+# fork 表新增/更新, 源表删除
+insert into t_heap_fork values (4, 'H_FORK');
+update t_heap_fork set c2 = 'H_B_U' where c1 = 2;
+delete from t_heap where c1 = 1;
+# fork 新增 c1=4 只在 fork 表
+let $heap_dst_new = query_get_value(select count(*) as cnt from t_heap_fork where c1 = 4, cnt, 1);
+if ($heap_dst_new != 1)
+{
+  --echo ERROR: fork-side insert c1=4 missing
+  --exit
+}
+let $heap_src_no4 = query_get_value(select count(*) as cnt from t_heap where c1 = 4, cnt, 1);
+if ($heap_src_no4 != 0)
+{
+  --echo ERROR: fork insert c1=4 leaked into source
+  --exit
+}
+# 源表删 c1=1 不影响 fork 表
+let $heap_src_del = query_get_value(select count(*) as cnt from t_heap where c1 = 1, cnt, 1);
+if ($heap_src_del != 0)
+{
+  --echo ERROR: source-side delete c1=1 not applied
+  --exit
+}
+let $heap_dst_keep = query_get_value(select count(*) as cnt from t_heap_fork where c1 = 1 and c2 = 'H_A', cnt, 1);
+if ($heap_dst_keep != 1)
+{
+  --echo ERROR: source delete c1=1 leaked into fork
+  --exit
+}
+# fork 表更新 c1=2 不影响源表
+let $heap_dst_upd = query_get_value(select count(*) as cnt from t_heap_fork where c1 = 2 and c2 = 'H_B_U', cnt, 1);
+if ($heap_dst_upd != 1)
+{
+  --echo ERROR: fork-side update c1=2 missing
+  --exit
+}
+let $heap_src_keep = query_get_value(select count(*) as cnt from t_heap where c1 = 2 and c2 = 'H_B', cnt, 1);
+if ($heap_src_keep != 1)
+{
+  --echo ERROR: fork update c1=2 leaked into source
+  --exit
+}
+# 同值分别写入两边
+insert into t_heap values (100, 'S_100');
+insert into t_heap_fork values (100, 'F_100');
+let $heap_same_src = query_get_value(select count(*) as cnt from t_heap where c1 = 100 and c2 = 'S_100', cnt, 1);
+if ($heap_same_src != 1)
+{
+  --echo ERROR: same-value row in source mismatch
+  --exit
+}
+let $heap_same_dst = query_get_value(select count(*) as cnt from t_heap_fork where c1 = 100 and c2 = 'F_100', cnt, 1);
+if ($heap_same_dst != 1)
+{
+  --echo ERROR: same-value row in fork mismatch
+  --exit
+}
+# 最终数量: 源 3 行(2,3,100), fork 5 行(1,2,3,4,100)
+let $heap_src_cnt = query_get_value(select count(*) as cnt from t_heap, cnt, 1);
+if ($heap_src_cnt != 3)
+{
+  --echo ERROR: final source row count should be 3
+  --exit
+}
+let $heap_dst_cnt = query_get_value(select count(*) as cnt from t_heap_fork, cnt, 1);
+if ($heap_dst_cnt != 5)
+{
+  --echo ERROR: final fork row count should be 5
+  --exit
+}
+
+--echo "5. =========== 无主键但有唯一索引: 唯一约束在源/fork 两侧各自生效 ==========="
+create table t_nopk_unique (c1 int, c2 varchar(20), unique key uk_c1(c1));
+insert into t_nopk_unique values (1, 'U_A'), (2, 'U_B');
+set @fork_sql = 'fork table t_nopk_unique to t_nopk_unique_fork'; prepare fork_uniq_stmt from @fork_sql; execute fork_uniq_stmt; deallocate prepare fork_uniq_stmt;
+connection sys_conn;
+ob1.check_until_timeout select count(*) from oceanbase.__all_virtual_ddl_task_status where tenant_id = $tenant_id and ddl_type = 1019, 0, 180;
+connection mysql_conn;
+let $uniq_dst0 = query_get_value(select count(*) as cnt from t_nopk_unique_fork, cnt, 1);
+if ($uniq_dst0 != 2)
+{
+  --echo ERROR: unique-index fork dst row count should be 2
+  --exit
+}
+# fork 表唯一约束生效: 重复 c1=1 被拒, 新 c1=3 成功
+--error 1062
+insert into t_nopk_unique_fork values (1, 'U_DUP');
+insert into t_nopk_unique_fork values (3, 'U_C');
+# 源表唯一约束生效
+--error 1062
+insert into t_nopk_unique values (1, 'U_DUP');
+insert into t_nopk_unique values (3, 'U_C_A');
+# 插入 c1=3 后两侧各自数量为 3
+let $uniq_src_cnt = query_get_value(select count(*) as cnt from t_nopk_unique, cnt, 1);
+if ($uniq_src_cnt != 3)
+{
+  --echo ERROR: source unique table row count should be 3
+  --exit
+}
+let $uniq_dst_cnt = query_get_value(select count(*) as cnt from t_nopk_unique_fork, cnt, 1);
+if ($uniq_dst_cnt != 3)
+{
+  --echo ERROR: fork unique table row count should be 3
+  --exit
+}
+# c1=3 两侧内容相互隔离
+let $uniq_dst_c3 = query_get_value(select count(*) as cnt from t_nopk_unique_fork where c1 = 3 and c2 = 'U_C', cnt, 1);
+if ($uniq_dst_c3 != 1)
+{
+  --echo ERROR: fork c1=3 content mismatch
+  --exit
+}
+let $uniq_src_c3 = query_get_value(select count(*) as cnt from t_nopk_unique where c1 = 3 and c2 = 'U_C_A', cnt, 1);
+if ($uniq_src_c3 != 1)
+{
+  --echo ERROR: source c1=3 content mismatch
+  --exit
+}
+
+--echo "6. =========== 自增列: fork 继承自增, 手动插大值后续自增递增, 源/fork 独立 ==========="
+create table t_auto (id int auto_increment primary key, name varchar(20));
+insert into t_auto(name) values ('A1'), ('A2');
+set @fork_sql = 'fork table t_auto to t_auto_fork'; prepare fork_auto_stmt from @fork_sql; execute fork_auto_stmt; deallocate prepare fork_auto_stmt;
+connection sys_conn;
+ob1.check_until_timeout select count(*) from oceanbase.__all_virtual_ddl_task_status where tenant_id = $tenant_id and ddl_type = 1019, 0, 180;
+connection mysql_conn;
+let $auto_dst0 = query_get_value(select count(*) as cnt from t_auto_fork, cnt, 1);
+if ($auto_dst0 != 2)
+{
+  --echo ERROR: auto_increment fork dst row count should be 2
+  --exit
+}
+# fork 表手动插入较大 id, 之后自增应大于 1000
+insert into t_auto_fork values (1000, 'F_1000');
+insert into t_auto_fork(name) values ('F_NEXT');
+let $auto_next = query_get_value(select id from t_auto_fork where name = 'F_NEXT', id, 1);
+if ($auto_next <= 1000)
+{
+  --echo ERROR: fork auto_increment should advance beyond the manually inserted 1000
+  --exit
+}
+# 源表自增独立于 fork 的 1000: 源表下一条 id 应为 3
+insert into t_auto(name) values ('S_NEXT');
+let $auto_src_next = query_get_value(select id from t_auto where name = 'S_NEXT', id, 1);
+if ($auto_src_next != 3)
+{
+  --echo ERROR: source auto_increment should advance independently to 3
+  --exit
+}
+
+--echo "7. =========== 视图不支持 fork(报错且不创建目标) ==========="
+create table t_view_base (id int primary key, name varchar(50), age int);
+insert into t_view_base values (1, 'Alice', 25), (2, 'Bob', 30);
+create view v_test as select id, name, age from t_view_base where age > 20;
+--error 1347
+set @fork_sql = 'fork table v_test to v_test_fork'; prepare fork_view_stmt from @fork_sql; execute fork_view_stmt;
+# 源视图仍然存在且可用
+let $view_cnt = query_get_value(select count(*) as cnt from v_test, cnt, 1);
+if ($view_cnt != 2)
+{
+  --echo ERROR: source view should remain usable after rejected fork
+  --exit
+}
+# 目标视图不应被创建
+let $view_dst = query_get_value(select count(*) as cnt from information_schema.tables where table_schema = database() and table_name = 'v_test_fork', cnt, 1);
+if ($view_dst != 0)
+{
+  --echo ERROR: rejected fork must not create the destination view
+  --exit
+}
+drop view v_test;
+drop table t_view_base;
+
+--echo "8. =========== 物化视图不支持 fork(报错且不创建目标) ==========="
+create table base_t1(a int primary key, b int);
+create table base_t2(c int primary key, d int);
+create materialized view log on base_t1 with(b);
+create materialized view log on base_t2 with(d);
+create materialized view mv
+REFRESH fast
+START WITH sysdate()
+NEXT sysdate() + INTERVAL 1 second
+as
+select a, b, c, d
+from base_t1
+join base_t2 on base_t1.a = base_t2.c;
+insert into base_t1 values(1, 10);
+insert into base_t2 values(1, 100);
+--error 1347
+set @fork_sql = 'fork table mv to mv_fork'; prepare fork_mv_stmt from @fork_sql; execute fork_mv_stmt;
+# 目标物化视图不应被创建
+let $mv_dst = query_get_value(select count(*) as cnt from information_schema.tables where table_schema = database() and table_name = 'mv_fork', cnt, 1);
+if ($mv_dst != 0)
+{
+  --echo ERROR: rejected fork must not create the destination materialized view
+  --exit
+}
+drop materialized view mv;
+drop materialized view log on base_t1;
+drop materialized view log on base_t2;
+drop table base_t1;
+drop table base_t2;
+
+--echo "9. =========== 临时表不支持 ==========="
+--error 1235
+create temporary table t_temp (id int primary key, name varchar(50));
+
+--echo "10. =========== 系统表不支持 fork ==========="
+--error 1347
+set @fork_sql = 'fork table oceanbase.__all_table to __all_table_fork'; prepare fork_sys1_stmt from @fork_sql; execute fork_sys1_stmt;
+--error 1347
+set @fork_sql = 'fork table information_schema.tables to tables_fork'; prepare fork_sys2_stmt from @fork_sql; execute fork_sys2_stmt;
+# 系统表仍然存在且可用
+let $sys_ok = query_get_value(select count(*) > 0 as ok from oceanbase.__all_table, ok, 1);
+if ($sys_ok != 1)
+{
+  --echo ERROR: system table should remain usable after rejected fork
+  --exit
+}
+
+--echo "11. =========== cleanup ==========="
+connection sys_conn;
+drop tenant fork_plus_tenant force;
+
+--echo "fork_table_basic_plus finished"

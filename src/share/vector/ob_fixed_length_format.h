@@ -1,0 +1,443 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#ifndef OCEANBASE_SHARE_VECTOR_OB_FIXED_LENGTH_FORMAT_H_
+#define OCEANBASE_SHARE_VECTOR_OB_FIXED_LENGTH_FORMAT_H_
+
+#include "share/vector/ob_fixed_length_base.h"
+#include "share/vector/ob_uniform_format.h"
+#include "share/vector/ob_discrete_base.h"
+#include "share/vector/ob_continuous_base.h"
+#include "sql/engine/basic/ob_compact_row.h"
+#include "lib/number/ob_number_v2.h"
+#include "lib/oblog/ob_log_module.h"
+
+namespace oceanbase
+{
+namespace common
+{
+
+template<typename ValueType>
+class ObFixedLengthFormat : public ObFixedLengthBase
+{
+public:
+  ObFixedLengthFormat(char *data, sql::ObBitVector *nulls)
+    : ObFixedLengthBase(nulls, sizeof(ValueType), data)
+  {}
+
+  OB_INLINE VectorFormat get_format() const override final { return VEC_FIXED; }
+
+  OB_INLINE void get_payload(const int64_t idx,
+                          const char *&payload,
+                          ObLength &length) const override final;
+  OB_INLINE void get_payload(const int64_t idx,
+                          bool &is_null,
+                          const char *&payload,
+                          ObLength &length) const override final;
+  OB_INLINE const char *get_payload(const int64_t idx) const override final;
+  OB_INLINE ObLength get_length(const int64_t idx) const override final { return sizeof(ValueType); }
+  OB_INLINE void set_length(const int64_t idx, const ObLength length) override  { /*do nothing*/ }
+  OB_INLINE void set_payload(const int64_t idx,
+                          const void *payload,
+                          const ObLength length) override final {
+    OB_ASSERT(length == sizeof(ValueType));
+    if (std::is_same<ValueType, char[0]>::value) {
+      // do nothing
+    } else {
+      if (OB_UNLIKELY(nulls_->at(idx))) {
+        unset_null(idx);
+      }
+      (reinterpret_cast<ValueType *>(data_))[idx] = *(static_cast<const ValueType *>(payload));
+    }
+  }
+
+  OB_INLINE void set_payload_shallow(const int64_t idx,
+                                  const void *payload,
+                                  const ObLength length) override final {
+    set_payload(idx, payload, length);
+  };
+
+  OB_INLINE void append_rows_multiple_times(const sql::ObBitVector *src_nulls,
+                              char *values, ObLength len,
+                              const int64_t src_start_idx,
+                              const int64_t src_end_idx,
+                              const int64_t times,
+                              const int64_t dst_start_idx) override final {
+    const int64_t interval = src_end_idx - src_start_idx;
+    const ValueType *src = reinterpret_cast<const ValueType *>(values) + src_start_idx;
+    ValueType *dst = reinterpret_cast<ValueType *>(data_) + dst_start_idx;
+    if (interval > MEMCPY_THRESHOLD) {
+      for (int64_t i = 0; i < times; ++i) {
+        MEMCPY(dst + i * interval, src, sizeof(ValueType) * interval);
+      }
+    } else {
+      for (int64_t i = 0; i < interval; ++i) {
+        for (int64_t j = 0; j < times; ++j) {
+          dst[i + j * interval] = src[i];
+        }
+      }
+    }
+    repeat_nulls_in_append_rows(src_nulls, src_start_idx, src_end_idx, dst_start_idx, times);
+  };
+
+  OB_INLINE int from_rows(const sql::RowMeta &row_meta, const sql::ObCompactRow **stored_rows,
+                          const int64_t size, const int64_t col_idx) override final;
+
+  OB_INLINE int from_rows(const sql::RowMeta &row_meta, const sql::ObCompactRow **stored_rows,
+                          const uint16_t selector[], const int64_t size,
+                          const int64_t col_idx) override final;
+
+  OB_INLINE int from_row(const sql::RowMeta &row_meta, const sql::ObCompactRow *stored_row,
+                         const int64_t row_idx, const int64_t col_idx) override final;
+
+  OB_INLINE int to_row(const sql::RowMeta &row_meta, sql::ObCompactRow *stored_row,
+                       const uint64_t row_idx, const int64_t col_idx) const override final;
+  OB_INLINE int to_row(const sql::RowMeta &row_meta, sql::ObCompactRow *stored_row,
+                       const uint64_t row_idx, const int64_t col_idx, const int64_t remain_size,
+                       const bool is_fixed_length_data, int64_t &row_size) const override final;
+  OB_INLINE int32_t type_size() const { return sizeof(ValueType); }
+  DEF_VEC_READ_INTERFACES(ObFixedLengthFormat<ValueType>);
+  DEF_VEC_WRITE_INTERFACES(ObFixedLengthFormat<ValueType>);
+
+protected:
+  // Implement four pure virtual functions of ObIVector (protected, only called by from_vector_ivector)
+  // New naming: from_vector_xxx
+  int from_vector_fixed(const ObFixedLengthBase *src_fixed,
+                             const sql::ObBitVector *skip,
+                             const int64_t start,
+                             const int64_t end) override;
+  
+  int from_vector_uniform(const ObUniformBase *src_uniform,
+                                VectorFormat src_format,
+                                const sql::ObBitVector *skip,
+                                const int64_t start,
+                                const int64_t end) override;
+  
+  int from_vector_discrete(const ObDiscreteBase *src_discrete,
+                                 const sql::ObBitVector *skip,
+                                 const int64_t start,
+                                 const int64_t end) override;
+  
+  int from_vector_continuous(const ObContinuousBase *src_continuous,
+                                   const sql::ObBitVector *skip,
+                                   const int64_t start,
+                                   const int64_t end) override;
+};
+
+template<typename ValueType>
+OB_INLINE void ObFixedLengthFormat<ValueType>::get_payload(const int64_t idx,
+                                                        bool &is_null,
+                                                        const char *&payload,
+                                                        ObLength &length) const
+{
+  is_null = nulls_->at(idx);
+  if (!is_null) {
+    payload = reinterpret_cast<const char *>(data_ + sizeof(ValueType) * idx);
+    length = type_size();
+  }
+}
+
+template<typename ValueType>
+OB_INLINE void ObFixedLengthFormat<ValueType>::get_payload(
+                  const int64_t idx, const char *&payload, ObLength &length) const
+{
+  payload = reinterpret_cast<const char *>(data_ + sizeof(ValueType) * idx);
+  length = type_size();
+}
+
+template<typename ValueType>
+OB_INLINE const char *ObFixedLengthFormat<ValueType>::get_payload(const int64_t idx) const
+{
+  return reinterpret_cast<const char *>(data_ + sizeof(ValueType) * idx);
+};
+
+template <typename ValueType>
+OB_INLINE int ObFixedLengthFormat<ValueType>::from_rows(const sql::RowMeta &row_meta,
+                                                        const sql::ObCompactRow **stored_rows,
+                                                        const int64_t size, const int64_t col_idx)
+{
+  int ret = OB_SUCCESS;
+  if (row_meta.is_reordered_fixed_expr(col_idx)) {
+    const int64_t offset = row_meta.fixed_offsets(col_idx);
+    if (!has_null()) {
+      for (int64_t i = 0; i < size; i++) {
+        if (nullptr == stored_rows[i]) {
+          continue;
+        }
+        if (stored_rows[i]->is_null(col_idx)) {
+          set_null(i);
+        } else {
+          const char *payload = stored_rows[i]->payload() + offset;
+          if (!std::is_same<ValueType, char[0]>::value) {
+            (reinterpret_cast<ValueType *>(data_))[i] = *(reinterpret_cast<const ValueType *>(payload));
+          }
+        }
+      }
+    } else {
+      for (int64_t i = 0; i < size; i++) {
+        if (nullptr == stored_rows[i]) {
+          continue;
+        }
+        if (stored_rows[i]->is_null(col_idx)) {
+          set_null(i);
+        } else {
+          const char *payload = stored_rows[i]->payload() + offset;
+          set_payload_shallow(i, payload, sizeof(ValueType));
+        }
+      }
+    }
+  } else {
+    const int64_t var_idx = row_meta.var_idx(col_idx);
+    for (int64_t i = 0; i < size; i++) {
+      if (nullptr == stored_rows[i]) {
+        continue;
+      }
+      if (stored_rows[i]->is_null(col_idx)) {
+        set_null(i);
+      } else {
+        const int32_t *var_offset_arr = stored_rows[i]->var_offsets(row_meta);
+        const ObLength len = var_offset_arr[var_idx + 1] - var_offset_arr[var_idx];
+        const char *payload = stored_rows[i]->var_data(row_meta) + var_offset_arr[var_idx];
+        set_payload_shallow(i, payload, len);
+      }
+    }
+  }
+  return ret;
+}
+
+template <typename ValueType>
+OB_INLINE int ObFixedLengthFormat<ValueType>::from_rows(const sql::RowMeta &row_meta,
+                                                        const sql::ObCompactRow **stored_rows,
+                                                        const uint16_t selector[],
+                                                        const int64_t size, const int64_t col_idx)
+{
+  int ret = OB_SUCCESS;
+  if (row_meta.is_reordered_fixed_expr(col_idx)) {
+    const int64_t offset = row_meta.fixed_offsets(col_idx);
+    if (!has_null()) {
+      for (int64_t i = 0; i < size; i++) {
+        if (nullptr == stored_rows[i]) {
+          continue;
+        }
+        int64_t row_idx = selector[i];
+        if (stored_rows[i]->is_null(col_idx)) {
+          set_null(row_idx);
+        } else {
+          const char *payload = stored_rows[i]->payload() + offset;
+          if (!std::is_same<ValueType, char[0]>::value) {
+            (reinterpret_cast<ValueType *>(data_))[row_idx] = *(reinterpret_cast<const ValueType *>(payload));
+          }
+        }
+      }
+    } else {
+      for (int64_t i = 0; i < size; i++) {
+        if (nullptr == stored_rows[i]) {
+          continue;
+        }
+        int64_t row_idx = selector[i];
+        if (stored_rows[i]->is_null(col_idx)) {
+          set_null(row_idx);
+        } else {
+          const char *payload = stored_rows[i]->payload() + offset;
+          set_payload_shallow(row_idx, payload, sizeof(ValueType));
+        }
+      }
+    }
+  } else {
+    const int64_t var_idx = row_meta.var_idx(col_idx);
+    for (int64_t i = 0; i < size; i++) {
+      if (nullptr == stored_rows[i]) {
+        continue;
+      }
+      int64_t row_idx = selector[i];
+      if (stored_rows[i]->is_null(col_idx)) {
+        set_null(row_idx);
+      } else {
+        const int32_t *var_offset_arr = stored_rows[i]->var_offsets(row_meta);
+        const ObLength len = var_offset_arr[var_idx + 1] - var_offset_arr[var_idx];
+        const char *payload = stored_rows[i]->var_data(row_meta) + var_offset_arr[var_idx];
+        set_payload_shallow(row_idx, payload, len);
+      }
+    }
+  }
+  return ret;
+}
+
+template <typename ValueType>
+int ObFixedLengthFormat<ValueType>::from_row(const sql::RowMeta &row_meta,
+                                             const sql::ObCompactRow *stored_row,
+                                             const int64_t row_idx, const int64_t col_idx)
+{
+  int ret = OB_SUCCESS;
+  if (stored_row->is_null(col_idx)) {
+    set_null(row_idx);
+  } else {
+    const char *payload = stored_row->get_cell_payload(row_meta, col_idx);
+    set_payload_shallow(row_idx, payload, sizeof(ValueType));
+  }
+
+  return ret;
+}
+
+template <typename ValueType>
+int ObFixedLengthFormat<ValueType>::to_row(const sql::RowMeta &row_meta,
+                                           sql::ObCompactRow *stored_row, const uint64_t row_idx,
+                                           const int64_t col_idx) const
+{
+  int ret = OB_SUCCESS;
+  if (is_null(row_idx)) {
+    stored_row->set_null(row_meta, col_idx);
+  } else {
+    const char *payload = NULL;
+    ObLength len = 0;
+    get_payload(row_idx, payload, len);
+    stored_row->set_cell_payload(row_meta, col_idx, payload, len);
+  }
+  return ret;
+}
+
+template <typename ValueType>
+int ObFixedLengthFormat<ValueType>::to_row(const sql::RowMeta &row_meta,
+                                           sql::ObCompactRow *stored_row, const uint64_t row_idx,
+                                           const int64_t col_idx, const int64_t remain_size,
+                                           const bool is_fixed_length_data,
+                                           int64_t &row_size) const
+{
+  int ret = OB_SUCCESS;
+  UNUSED(is_fixed_length_data);
+  int64_t need_size = 0;
+  bool size_calced = row_meta.fixed_expr_reordered();
+  if (is_null(row_idx)) {
+    need_size = size_calced ? 0 : sizeof(ValueType);
+    row_size += need_size;
+    if (need_size > remain_size) {
+      ret = OB_BUF_NOT_ENOUGH;
+    }
+    stored_row->set_null(row_meta, col_idx);
+  } else {
+    const char *payload = NULL;
+    ObLength len = 0;
+    get_payload(row_idx, payload, len);
+    if (!size_calced) {
+      row_size += len;
+    }
+    if (!size_calced && len > remain_size) {
+      ret = OB_BUF_NOT_ENOUGH;
+    } else {
+      stored_row->set_cell_payload(row_meta, col_idx, payload, len);
+    }
+  }
+  return ret;
+}
+
+
+template <typename ValueType>
+int ObFixedLengthFormat<ValueType>::from_vector_fixed(const ObFixedLengthBase *src_fixed,
+                                                            const sql::ObBitVector *skip,
+                                                            const int64_t start,
+                                                            const int64_t end)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(src_fixed)) {
+    ret = OB_INVALID_ARGUMENT;
+    SQL_ENG_LOG(WARN, "src_fixed is null", K(ret));
+  } else if (OB_FAIL(from_vector_bitmap_null(src_fixed, skip, start, end))) {
+    SQL_ENG_LOG(WARN, "failed to copy null", K(ret));
+  } else if (src_fixed->get_length() != len_) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_ENG_LOG(WARN, "fixed vector length mismatch, type conversion should be done before evaluation",
+             K(ret), K(src_fixed->get_length()), K(len_), K(sizeof(ValueType)));
+  } else if (sizeof(ValueType) != static_cast<int64_t>(len_)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_ENG_LOG(WARN, "type_size mismatch with len_", K(ret), K(sizeof(ValueType)), K(len_));
+  } else {
+    const char *src_data = src_fixed->get_data();
+    const int64_t type_size = sizeof(ValueType);
+    if (skip == nullptr) {
+      const int64_t copy_bytes = (end - start) * type_size;
+      MEMCPY(data_ + start * type_size, src_data + start * type_size, copy_bytes);
+    } else {
+      for (int64_t i = start; i < end; ++i) {
+        if (!skip->at(i)) {
+          MEMCPY(data_ + i * type_size, src_data + i * type_size, type_size);
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+template <typename ValueType>
+int ObFixedLengthFormat<ValueType>::from_vector_uniform(const ObUniformBase *src_uniform,
+                                                              VectorFormat src_format,
+                                                              const sql::ObBitVector *skip,
+                                                              const int64_t start,
+                                                              const int64_t end)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(src_uniform)) {
+    ret = OB_INVALID_ARGUMENT;
+    SQL_ENG_LOG(WARN, "src_uniform is null", K(ret));
+  } else if (OB_FAIL(from_vector_bitmap_null(src_uniform, skip, start, end))) {
+    SQL_ENG_LOG(WARN, "failed to copy null", K(ret));
+  } else {
+    const ObLength expected_len = sizeof(ValueType);
+    const ObDatum *src_datums = src_uniform->get_datums();
+    const bool is_const = (src_format == VEC_UNIFORM_CONST);
+    for (int64_t i = start; i < end; ++i) {
+      if (skip != nullptr && skip->at(i)) {
+        continue;
+      }
+      const int64_t src_idx = is_const ? 0 : i;
+      if (!src_datums[src_idx].is_null()) {
+        if (src_datums[src_idx].len_ == expected_len) {
+          MEMCPY(data_ + i * expected_len, src_datums[src_idx].ptr_, expected_len);
+        } else {
+          ret = OB_ERR_UNEXPECTED;
+          SQL_ENG_LOG(WARN, "uniform vector datum length mismatch", K(ret), K(i), K(src_datums[src_idx].len_), K(expected_len));
+          break;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+template <typename ValueType>
+int ObFixedLengthFormat<ValueType>::from_vector_discrete(const ObDiscreteBase *src_discrete,
+                                                               const sql::ObBitVector *skip,
+                                                               const int64_t start,
+                                                               const int64_t end)
+{
+  UNUSED(src_discrete);
+  UNUSED(skip);
+  UNUSED(start);
+  UNUSED(end);
+  // FIXED format cannot copy from DISCRETE
+  int ret = OB_NOT_SUPPORTED;
+  SQL_ENG_LOG(WARN, "fixed format cannot copy from discrete format", K(ret));
+  return ret;
+}
+
+template <typename ValueType>
+int ObFixedLengthFormat<ValueType>::from_vector_continuous(const ObContinuousBase *src_continuous,
+                                                                  const sql::ObBitVector *skip,
+                                                                  const int64_t start,
+                                                                  const int64_t end)
+{
+  UNUSED(src_continuous);
+  UNUSED(skip);
+  UNUSED(start);
+  UNUSED(end);
+  // FIXED format cannot copy from CONTINUOUS
+  int ret = OB_NOT_SUPPORTED;
+  SQL_ENG_LOG(WARN, "fixed format cannot copy from continuous format", K(ret));
+  return ret;
+}
+
+}
+}
+#endif // OCEANBASE_SHARE_VECTOR_OB_FIXED_LENGTH_FORMAT_H_
+
+

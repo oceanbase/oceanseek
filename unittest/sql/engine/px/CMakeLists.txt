@@ -1,0 +1,8 @@
+sql_unittest(test_random_affi)
+#sql_unittest(test_slice_calc)
+sql_unittest(test_adaptive_slide_window)
+sql_unittest(test_ob_small_hashset)
+sql_unittest(test_dop_auto_scaling)
+sql_unittest(test_gambling_bound)
+sql_unittest(test_px_bloom_filter)
+sql_unittest(test_row_heap_error_propagation)

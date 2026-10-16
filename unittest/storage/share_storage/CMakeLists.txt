@@ -1,0 +1,6 @@
+if(OB_BUILD_CLOSE_MODULES)
+  storage_unittest(test_ss_update_tablet_log)
+  storage_unittest(test_ss_meta_common_info)
+  storage_unittest(test_ss_meta_info_util)
+  storage_unittest(test_ss_tablet_meta_info_iterator_grow)
+endif()

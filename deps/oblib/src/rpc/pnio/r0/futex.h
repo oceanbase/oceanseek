@@ -1,0 +1,7 @@
+/**
+ * Copyright (c) 2023 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+ 
+extern int rk_futex_wake(int *p, int val);
+extern int rk_futex_wait(int *p, int val, const struct timespec *timeout);

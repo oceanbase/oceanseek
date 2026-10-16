@@ -1,0 +1,38 @@
+set GLOBAL ob_query_timeout = 1000000000000;
+set GLOBAL ob_trx_timeout = 10000000000000;
+set GLOBAL ob_trx_idle_timeout = 10000000000;
+alter system set _lcl_op_interval = '10ms';
+set global ob_sql_audit_percentage = 50;
+commit;
+drop table if exists deadlock_test;
+create table deadlock_test(a int primary key, b int);
+commit;
+begin;
+insert into deadlock_test values(1, 1);
+insert into deadlock_test values(1000, 1);
+insert into deadlock_test values(1001, 1);
+update deadlock_test set b = 2 where a = 1;
+begin;
+insert into deadlock_test values(1002, 1);
+insert into deadlock_test values(2, 1);
+insert into deadlock_test values(1003, 1);
+begin;
+insert into deadlock_test values(1004, 1);
+insert into deadlock_test values(1005, 1);
+insert into deadlock_test values(3, 1);
+insert into deadlock_test values(1, 1);
+insert into deadlock_test values(2, 1);
+insert into deadlock_test values(3, 1);
+ERROR HY000: Deadlock found when trying to get lock
+rollback;
+rollback;
+rollback;
+drop table deadlock_test;
+commit;
+select EXTRA_NAME1,EXTRA_VALUE1,EXTRA_NAME3,EXTRA_VALUE3 from oceanbase.DBA_OB_DEADLOCK_EVENT_HISTORY order by REPORT_TIME desc, EXTRA_VALUE1 desc limit 3;
+EXTRA_NAME1	EXTRA_VALUE1	EXTRA_NAME3	EXTRA_VALUE3
+wait_sql	Y0-0000000000000000-0-0:insert into deadlock_test values(3, 1)	hold_sql	insert into deadlock_test values(2, 1)
+wait_sql	Y0-0000000000000000-0-0:insert into deadlock_test values(2, 1)	hold_sql	update deadlock_test set b = 2 where a = 1
+wait_sql	Y0-0000000000000000-0-0:insert into deadlock_test values(1, 1)	hold_sql	insert into deadlock_test values(3, 1)
+alter system flush sql audit global;
+set global ob_sql_audit_percentage = 3;

@@ -1,0 +1,1486 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+
+#ifndef OCEANBASE_SHARE_PLUGIN_VECTOR_INDEX_ADAPTOR_H_
+#define OCEANBASE_SHARE_PLUGIN_VECTOR_INDEX_ADAPTOR_H_
+
+#include "share/scn.h"
+#include "share/datum/ob_datum.h"
+#include "roaring/roaring64.h"
+#include "common/object/ob_obj_type.h"
+#include "common/row/ob_row_iterator.h"
+#include "share/vector_index/ob_vector_index_common_define.h"
+#include "share/vector_index/ob_vector_index_segment.h"
+#include "share/vector_index/ob_plugin_vector_index_util.h"
+#include "storage/ob_i_store.h"
+#include "share/ob_ls_id.h"
+#include "share/rc/ob_tenant_base.h"
+#include "lib/oblog/ob_log_module.h"
+#include "share/vector_index/ob_plugin_vector_index_serialize.h"
+#include "share/allocator/ob_tenant_vector_allocator.h"
+#include "ob_vector_index_util.h"
+#include "sql/engine/expr/ob_expr_vector.h"
+
+
+namespace oceanbase
+{
+namespace storage
+{
+struct ObMigrationVectorIndexAdaptorMeta;
+}
+namespace share
+{
+struct ObVecIndexAsyncTaskCtx;
+class ObVsagMemContext;
+class ObPluginVectorIndexMgr;
+
+struct ObVectorIndexInfo
+{
+public:
+  ObVectorIndexInfo();
+  ~ObVectorIndexInfo() { reset(); }
+  void reset();
+  static const int64_t OB_VECTOR_INDEX_STATISTICS_SIZE = 4096;
+  static const int64_t OB_VECTOR_INDEX_SYNC_INFO_SIZE = 1024;
+  TO_STRING_KV(K_(ls_id),
+               K_(rowkey_vid_table_id), K_(vid_rowkey_table_id), K_(inc_index_table_id),
+               K_(vbitmap_table_id), K_(snapshot_index_table_id), K_(data_table_id), K_(embedded_table_id),
+               K_(rowkey_vid_tablet_id), K_(vid_rowkey_tablet_id), K_(inc_index_tablet_id),
+               K_(vbitmap_tablet_id), K_(snapshot_index_tablet_id), K_(data_tablet_id), K_(embedded_tablet_id),
+               K_(statistics), K_(sync_info), K_(index_type));
+public:
+  int64_t ls_id_;
+  // table_id
+  int64_t rowkey_vid_table_id_;
+  int64_t vid_rowkey_table_id_;
+  int64_t inc_index_table_id_;
+  int64_t vbitmap_table_id_;
+  int64_t snapshot_index_table_id_;
+  int64_t data_table_id_;
+  int64_t embedded_table_id_;
+  // tablet_id
+  int64_t rowkey_vid_tablet_id_;
+  int64_t vid_rowkey_tablet_id_;
+  int64_t inc_index_tablet_id_;
+  int64_t vbitmap_tablet_id_;
+  int64_t snapshot_index_tablet_id_;
+  int64_t data_tablet_id_;
+  int64_t embedded_tablet_id_;
+  char statistics_[OB_VECTOR_INDEX_STATISTICS_SIZE];
+  char sync_info_[OB_VECTOR_INDEX_SYNC_INFO_SIZE];
+  ObVectorIndexAlgorithmType index_type_;
+};
+
+struct ObVectorSegmentInfo
+{
+public:
+  ObVectorSegmentInfo();
+  ~ObVectorSegmentInfo() { reset(); }
+  int set_segment_params(const ObString &segment_params) { return segment_params_.assign(segment_params); }
+  void reset();
+  TO_STRING_KV(K_(data_table_id), K_(data_tablet_id), K_(vbitmap_tablet_id),
+               K_(inc_index_tablet_id), K_(snapshot_index_tablet_id), K_(block_count),
+               K_(segment_type), K_(index_type), K_(mem_used), K_(min_vid), K_(max_vid),
+               K_(vector_cnt), K_(ref_cnt), K_(segment_state), K_(scn), K_(segment_params));
+
+public:
+  int64_t data_table_id_;
+  int64_t data_tablet_id_;
+  int64_t vbitmap_tablet_id_;
+  int64_t inc_index_tablet_id_;
+  int64_t snapshot_index_tablet_id_;
+  int64_t block_count_;
+  ObVectorIndexSegmentType segment_type_;
+  ObVectorIndexAlgorithmType index_type_;
+  int64_t mem_used_;
+  int64_t min_vid_;
+  int64_t max_vid_;
+  int64_t vector_cnt_;
+  int64_t ref_cnt_;
+  ObVectorIndexSegmentState segment_state_;
+  int64_t scn_;
+  ObVectorIndexParamString segment_params_;
+};
+
+
+enum ObAdaptorReadyState
+{
+  ADAPTOR_INC_ONLY = 0,
+  ADAPTOR_COMPLETE = 1,
+};
+
+enum ObAdaptorMigState
+{
+  MIG_INVALID = 0,
+  MIG_INIT = 1,
+  MIG_DOING = 2,
+  MIG_SUCC = 3,
+  MIG_FAIL = 4,
+};
+
+enum PluginVectorQueryResStatus
+{
+  PVQ_START,
+  PVQ_WAIT, 
+  PVQ_LACK_SCN, 
+  PVQ_OK, // ok
+  PVQ_COM_DATA,
+  PVQ_INVALID_SCN,
+  PVQ_REFRESH,
+  PVQ_MAX
+};
+
+enum ObVectorQueryProcessFlag
+{
+  PVQP_FIRST, 
+  PVQP_SECOND, 
+  PVQP_MAX,
+};
+
+enum ObVBitmapCompleteResult
+{
+  VBITMAP_NOT_COMPLETED,
+  VBITMAP_CTX_ONLY,
+  VBITMAP_SHARED_COMPLETED,
+};
+
+struct ObVectorParamData
+{
+  int64_t dim_;
+  int64_t count_;
+  int64_t curr_idx_;
+  int64_t extra_column_count_;
+  ObObj *vectors_; // need do init by yourself
+  ObObj *vids_;
+  ObVecExtraInfoObj* extra_info_objs_; // need do init by yourself
+  static const int64_t VI_PARAM_DATA_BATCH_SIZE = 1000;
+  TO_STRING_KV(K_(dim), K_(count), K_(curr_idx), KP_(vectors), KP_(vids), KP_(extra_info_objs));
+};
+
+class ObHnswBitmapFilter : public obvsag::FilterInterface
+{
+public:
+  static const uint64_t NORMAL_BITMAP_MAX_SIZE = 10000000;
+  enum FilterType {
+    BYTE_ARRAY = 0,
+    ROARING_BITMAP = 1,
+    SIMPLE_RANGE = 2,
+  };
+public:
+  ObHnswBitmapFilter(uint64_t tenant_id,
+               FilterType type = FilterType::BYTE_ARRAY,
+               uint64_t capacity = 0,
+               ObIAllocator *allocator = nullptr,
+               uint8_t *bitmap = nullptr) : 
+               tenant_id_(tenant_id),
+               type_(type),
+               capacity_(capacity),
+               base_(0),
+               valid_cnt_(0),
+               allocator_(allocator),
+               bitmap_(bitmap),
+               rk_range_(),
+               selectivity_(0),
+               is_external_bitmap_(false),
+               segment_handle_(),
+               tmp_alloc_("extmpalloc", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id),
+               extra_buffer_(nullptr),
+               tmp_objs_(nullptr),
+               extra_in_rowkey_idxs_(nullptr),
+               valid_vid_(nullptr) {}
+  ~ObHnswBitmapFilter() {}
+  void reset();
+  int init(const int64_t &min, const int64_t &max, bool is_sparse_vector_index = false);
+  int init(void *adaptor,
+           double selectivity,
+           const ObIArray<const ObNewRange*> &range,
+           const sql::ExprFixedArray& rowkey_exprs,
+           const ObIArray<int64_t> &extra_in_rowkey_idxs);
+  bool is_valid() { return OB_NOT_NULL(bitmap_); }
+  bool is_range_filter() { return type_ == FilterType::SIMPLE_RANGE; }
+  bool test(int64_t id) override;
+  bool test(const char* data) override;
+  int add(int64_t id);
+  int get_valid_cnt();
+  float get_valid_ratio(int64_t total_cnt);
+  bool is_subset(roaring::api::roaring64_bitmap_t *bitmap);
+  void operator=(ObHnswBitmapFilter &filter) {
+    tenant_id_ = filter.tenant_id_;
+    type_ = filter.type_;
+    capacity_ = filter.capacity_;
+    base_ = filter.base_;
+    valid_cnt_ = filter.valid_cnt_;
+    allocator_ = filter.allocator_;
+    bitmap_ = filter.bitmap_;
+    rk_range_.assign(filter.rk_range_);
+    selectivity_ = filter.selectivity_;
+    segment_handle_= filter.segment_handle_;
+    is_external_bitmap_ = filter.is_external_bitmap_;
+    extra_buffer_ = filter.extra_buffer_;
+    tmp_objs_ = filter.tmp_objs_;
+    extra_in_rowkey_idxs_ = filter.extra_in_rowkey_idxs_;
+    valid_vid_ = filter.valid_vid_;
+  }
+  void set_roaring_bitmap(roaring::api::roaring64_bitmap_t *bitmap) {
+    type_ = FilterType::ROARING_BITMAP;
+    roaring_bitmap_ = bitmap;
+  }
+  bool is_empty() {
+    return type_ == FilterType::ROARING_BITMAP && 
+           OB_NOT_NULL(roaring_bitmap_) &&
+           (roaring64_bitmap_get_cardinality(roaring_bitmap_) == 0);
+  }
+  TO_STRING_KV(K(tenant_id_), K_(type), K_(capacity), K_(base), K_(valid_cnt), KP_(allocator), KP_(bitmap), K_(segment_handle));
+private:
+  int upgrade_to_roaring_bitmap();
+  uint8_t mask(int64_t low, int64_t high) const { return ((0xFF >> (7 - high)) & (0xFF << low)); }
+public:
+  uint64_t tenant_id_;
+  FilterType type_;
+  uint64_t capacity_;
+  uint64_t base_;
+  uint64_t valid_cnt_;
+  ObIAllocator *allocator_;
+  union {
+    uint8_t *bitmap_; // byte_array
+    roaring::api::roaring64_bitmap_t *roaring_bitmap_;
+    void *adaptor_; // ObPluginVectorIndexAdaptor
+  };
+  ObArray<const ObNewRange *> rk_range_;
+  double selectivity_;
+  bool is_external_bitmap_;  // Indicates if bitmap is externally managed
+  ObVectorIndexSegmentHandle segment_handle_;
+  ObArenaAllocator tmp_alloc_;
+  char *extra_buffer_;
+  ObObj *tmp_objs_;
+  const ObIArray<int64_t> *extra_in_rowkey_idxs_;
+  ObVecIdxVidArray *valid_vid_; // for sparse vector index
+};
+
+class ObVsagSearchAlloc : public vsag::Allocator
+{
+public:
+  ObVsagSearchAlloc(uint64_t tenant_id):
+    alloc_("VsagSearch", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id) 
+  {}
+
+  std::string Name() override { return "ObVsagSearchAlloc"; }
+  void* Allocate(size_t size) override;
+  void Deallocate(void* p) override { alloc_.free(p); };
+  void* Reallocate(void* p, size_t size) override;
+  int64_t hold() { return alloc_.total(); }
+  int64_t used() { return alloc_.used(); }
+  void reset() { alloc_.reset(); }
+  void reuse() { alloc_.reuse(); }
+
+private:
+  ObArenaAllocator alloc_;
+
+  constexpr static int64_t MEM_PTR_HEAD_SIZE = sizeof(int64_t);
+};
+
+struct ObVecIdxQueryResult {
+  ObSEArray<const float*, 4> distances_;
+  ObSEArray<ObVectorIndexSegmentHandle, 4> segments_;
+  int brute_cnt;
+
+  ObVecIdxQueryResult() : distances_(), segments_(), brute_cnt(0) {}
+
+  ~ObVecIdxQueryResult() {
+    for (int64_t i = 0; i < segments_.count(); ++i) {
+      segments_.at(i).reset();
+    }
+  }
+};
+
+struct ObVectorIndexSegmentQuerier
+{
+  ObVectorIndexSegmentQuerier():
+    handle_(), is_incr_(false), is_active_(false), filter_(nullptr), reverse_filter_(false),
+    iter_ctx_(nullptr), valid_vid_(nullptr), valid_vid_count_(0)
+  {}
+  void reset() {
+    handle_.reset();
+    is_incr_ = false;
+    is_active_ = false;
+    filter_ = nullptr;
+    reverse_filter_ = false;
+    if (nullptr != iter_ctx_) {
+      obvectorutil::delete_iter_ctx(iter_ctx_);
+      iter_ctx_ = nullptr;
+    }
+    valid_vid_ = nullptr;
+    valid_vid_count_ = 0;
+  }
+  bool is_extra_info_filter() const { return nullptr != filter_ && filter_->is_range_filter(); }
+
+  TO_STRING_KV(KP(this), K_(handle), K_(is_incr), K_(is_active), KP_(filter), K_(reverse_filter),
+      KP_(iter_ctx), "is_extra_info_filter", is_extra_info_filter(), KP_(valid_vid), K_(valid_vid_count));
+
+  ObVectorIndexSegmentHandle handle_;
+  bool is_incr_;
+  bool is_active_;
+  ObHnswBitmapFilter *filter_;
+  bool reverse_filter_;
+  void* iter_ctx_;
+  int64_t *valid_vid_;
+  int64_t valid_vid_count_;
+};
+
+class ObVectorQueryAdaptorResultContext {
+public:
+  friend class ObPluginVectorIndexAdaptor;
+  friend class ObVectorIndexSegQueryHandler;
+  ObVectorQueryAdaptorResultContext(uint64_t tenant_id,
+                                    const share::ObLSID &ls_id,
+                                    int64_t extra_column_count,
+                                    ObIAllocator *allocator,
+                                    ObIAllocator *tmp_allocator)
+    : status_(PVQ_START),
+      flag_(PVQP_MAX),
+      tenant_id_(tenant_id),
+      ls_id_(ls_id),
+      extra_column_count_(extra_column_count),
+      bitmaps_(nullptr),
+      pre_filter_(nullptr),
+      vec_data_(),
+      allocator_(allocator),
+      tmp_allocator_(tmp_allocator),
+      batch_allocator_("BATCHALLOC", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
+      search_allocator_(tenant_id),
+      ifilter_(nullptr),
+      dfilter_(nullptr),
+      ls_leader_(true),
+      is_sparse_vector_(false),
+      is_async_query_(false),
+      is_refresh_adaptor_(false),
+      complete_delta_lock_(nullptr),
+      task_ctx_(nullptr),
+      scn_(),
+      overlay_active_(false),
+      overlay_snapshotted_(false),
+      overlay_covers_meta_(false) {};
+  ~ObVectorQueryAdaptorResultContext();
+  int init_bitmaps();
+  int init_prefilter(const int64_t &min, const int64_t &max);
+  int init_prefilter(void *adaptor, double selectivity, const ObIArray<const ObNewRange *> &range,
+                     const sql::ExprFixedArray &rowkey_exprs, const ObIArray<int64_t> &extra_in_rowkey_idxs);
+  int init_prefilter(uint8_t *bitmap, int64_t min_vid_bound, int64_t max_vid_bound, uint64_t capacity, uint64_t valid_cnt);
+  int init_prefilter(roaring::api::roaring64_bitmap_t *roaring_bitmap);
+  bool is_bitmaps_valid();
+  bool is_prefilter_valid();
+  bool is_range_prefilter();
+  ObObj *get_vids() { return vec_data_.vids_; }
+  ObObj *get_vectors() { return vec_data_.vectors_; }
+  int64_t get_curr_idx() { return vec_data_.curr_idx_; }
+  int64_t get_vec_cnt() { return vec_data_.count_ - vec_data_.curr_idx_ > ObVectorParamData::VI_PARAM_DATA_BATCH_SIZE ? 
+                                ObVectorParamData::VI_PARAM_DATA_BATCH_SIZE : 
+                                vec_data_.count_ - vec_data_.curr_idx_; }
+  int64_t get_dim() { return vec_data_.dim_; }
+  int64_t get_extra_column_count() { return extra_column_count_; }
+  int64_t get_count() { return vec_data_.count_; }
+  bool if_next_batch() { return vec_data_.count_ > vec_data_.curr_idx_; }
+  bool is_query_end() { return get_curr_idx() + get_vec_cnt() >= get_count();}
+  PluginVectorQueryResStatus get_status() { return status_; }
+  ObVectorQueryProcessFlag get_flag() { return flag_; }
+  ObIAllocator *get_allocator() { return allocator_; }
+  ObIAllocator *get_tmp_allocator() { return tmp_allocator_; }
+  void set_temp_allocator(ObIAllocator *tmp_allocator) { tmp_allocator_ = tmp_allocator; }
+  ObIAllocator *get_batch_allocator() { return &batch_allocator_; }
+  int set_vector(int64_t index, const char *ptr, common::ObString::obstr_size_t size);
+  int set_vector(int64_t index, ObObj &obj);
+  void set_vectors(ObObj *vectors) { vec_data_.vectors_ = vectors; }
+  int set_extra_info(int64_t index, const ObRowkey &rowkey, const ObIArray<int64_t> &extra_in_rowkey_idxs);
+  void set_extra_infos(ObVecExtraInfoObj *extra_info_objs) { vec_data_.extra_info_objs_ = extra_info_objs; }
+  void set_status(PluginVectorQueryResStatus status) { status_ = status; }
+  void set_flag(ObVectorQueryProcessFlag flag) {flag_ = flag; }
+  void set_ls_leader(const bool ls_leader) { ls_leader_ = ls_leader; }
+  bool get_ls_leader() { return ls_leader_; }
+  void set_is_refresh_adaptor(const bool is_refresh_adaptor) { is_refresh_adaptor_ = is_refresh_adaptor; }
+  bool get_is_refresh_adaptor() { return is_refresh_adaptor_; }
+  void set_scn(const SCN scn) { scn_ = scn; }
+  SCN get_scn() const { return scn_; }
+  const share::ObLSID &get_ls_id() const { return ls_id_; }
+
+  inline void set_sparse_vector(const bool is_sparse) { is_sparse_vector_ = is_sparse; }
+
+  inline bool is_sparse_vector() { return is_sparse_vector_; }
+  inline void set_async_query(const bool is_async_query) { is_async_query_ = is_async_query; }
+  inline bool is_async_query() const { return is_async_query_; }
+
+  void do_next_batch()
+  {
+    int64_t curr_cnt = get_vec_cnt();
+    vec_data_.curr_idx_ += curr_cnt;
+  }
+
+  int add_segment_querier(
+      ObVectorIndexSegmentHandle &handle, const bool is_incr, const bool is_active,
+      ObHnswBitmapFilter* filter, const bool reverse_filter);
+  void set_complete_delta_lock(TCRWLock *lock) { complete_delta_lock_ = lock; }
+  TCRWLock *get_complete_delta_lock() { return complete_delta_lock_; }
+  void set_task_ctx(ObVecIndexAsyncTaskCtx *task_ctx) { task_ctx_ = task_ctx; }
+  ObVecIndexAsyncTaskCtx *get_task_ctx() { return task_ctx_; }
+
+  int snapshot_overlay_for_query(ObPluginVectorIndexAdaptor *adapter, int64_t meta_scn = 0);
+  void reset_query_overlay_snapshot()
+  {
+    query_overlay_.reset();
+    overlay_active_ = false;
+    overlay_snapshotted_ = false;
+    overlay_covers_meta_ = false;
+  }
+  const ObVectorBoundedReadOverlayHandle &get_query_overlay() const { return query_overlay_; }
+  bool is_overlay_active() const { return overlay_active_; }
+  bool is_overlay_covers_meta() const { return overlay_covers_meta_; }
+
+private:
+  PluginVectorQueryResStatus status_;
+  ObVectorQueryProcessFlag flag_;
+  uint64_t tenant_id_;
+  share::ObLSID ls_id_;
+  int64_t extra_column_count_;
+  ObVectorIndexRoaringBitMap *bitmaps_;
+  ObHnswBitmapFilter *pre_filter_;  // pre filter only
+  ObVectorParamData vec_data_;
+  ObIAllocator *allocator_;       // allocator for vec_lookup_op, used to allocate memory for final query result
+  ObIAllocator *tmp_allocator_;   // used to temporarily allocate memory during the query process and does not affect the final query results
+  ObArenaAllocator batch_allocator_; // Used to complete_delta_buffer_data in batches, reuse after each batch of data is completed
+  ObVsagSearchAlloc search_allocator_;
+  ObSEArray<ObVectorIndexSegmentQuerier*, 4> segments_;
+  ObHnswBitmapFilter *ifilter_;
+  ObHnswBitmapFilter *dfilter_;
+  bool ls_leader_;
+  bool is_sparse_vector_;
+  bool is_async_query_;
+  bool is_refresh_adaptor_;
+  // hold complete lock
+  TCRWLock *complete_delta_lock_;
+  ObVecIndexAsyncTaskCtx *task_ctx_;
+  SCN scn_;
+  ObVectorBoundedReadOverlayHandle query_overlay_;
+  bool overlay_active_;
+  bool overlay_snapshotted_;
+  bool overlay_covers_meta_;
+};
+
+// Base class for vector query conditions (shared by HNSW and IVF)
+class ObVecQueryCondBase {
+public:
+  ObVecQueryCondBase()
+    : query_limit_(0),
+      query_order_(true),
+      is_post_with_filter_(false),
+      query_vector_(),
+      query_scn_(),
+      extra_column_count_(0),
+      rel_count_(0),
+      rel_map_ptr_(nullptr),
+      distance_threshold_(FLT_MAX) {}
+  virtual ~ObVecQueryCondBase() {}
+
+  virtual bool is_inited() { return query_vector_.length() > 0; }
+  virtual void reset() {
+    query_vector_.reset();
+    is_post_with_filter_ = false;
+  }
+
+  TO_STRING_KV(K_(query_limit), K_(query_order), K_(query_vector), K_(query_scn), K_(distance_threshold));
+
+  uint32_t query_limit_;
+  bool query_order_;               // true: asc, false: desc
+  bool is_post_with_filter_;
+  ObString query_vector_;
+  SCN query_scn_;
+  int64_t extra_column_count_;
+  int64_t rel_count_;
+  common::hash::ObHashMap<int64_t, double*> *rel_map_ptr_;
+  float distance_threshold_;
+};
+
+// HNSW-specific query conditions
+class ObVectorQueryConditions : public ObVecQueryCondBase {
+public:
+  ObVectorQueryConditions()
+    : ObVecQueryCondBase(),
+      only_complete_data_(false),
+      ef_search_(0),
+      row_iter_(nullptr),
+      is_last_search_(false),
+      scan_param_(nullptr),
+      ob_sparse_drop_ratio_search_(0),
+      n_candidate_(0),
+      last_distance_(-FLT_MAX) {};
+  ~ObVectorQueryConditions() { query_vector_.reset(); }
+  bool is_inited() override { return query_vector_.length() > 0 && ef_search_ > 0; }
+  void reset() override {
+    ObVecQueryCondBase::reset();
+    ef_search_ = 0;
+    is_last_search_ = false;
+    ob_sparse_drop_ratio_search_ = 0;
+    n_candidate_ = 0;
+    only_complete_data_ = false;
+    last_distance_ = -FLT_MAX;
+  }
+  TO_STRING_KV(K_(query_limit), K_(query_order), K_(ef_search), K_(query_vector), K_(query_scn), K_(ob_sparse_drop_ratio_search), K_(n_candidate), K_(last_distance));
+
+  bool only_complete_data_; // true when search brute force
+  int64_t ef_search_;
+  common::ObNewRowIterator *row_iter_; // index_snapshot_data_table iter
+  bool is_last_search_;
+  ObTableScanParam *scan_param_;  // scan param of row_iter_
+  float ob_sparse_drop_ratio_search_;
+  int64_t n_candidate_;
+  float last_distance_;
+};
+
+struct ObVecIndexLoadInfo {
+  uint64_t insert_vids_cnt_;
+  uint64_t delete_vids_cnt_;
+  TO_STRING_KV(K_(insert_vids_cnt), K_(delete_vids_cnt));
+};
+
+typedef ObSEArray<ObVecIndexLoadInfo, 2> ObVecIndexLoadInfos;  // insert vids cnt, delete vids cnt
+struct ObVectorIndexDumpInfo {
+  ObVectorIndexDumpInfo() : dump_info_lock_(common::ObLatchIds::VECTOR_ADAPTER_MAP_LOCK)
+  {
+    incr_complete_info_.set_attr(ObMemAttr(MTL_ID(), "VecDumpInfo"));
+    vbitmap_table_load_info_.set_attr(ObMemAttr(MTL_ID(), "VecDumpInfo"));
+    snap_table_load_info_.set_attr(ObMemAttr(MTL_ID(), "VecDumpInfo"));
+  }
+  ~ObVectorIndexDumpInfo() { reset(); }
+
+  OB_INLINE void reset()
+  {
+    common::ObSpinLockGuard guard(dump_info_lock_);
+    incr_complete_info_.reset();
+    vbitmap_table_load_info_.reset();
+    snap_table_load_info_.reset();
+  }
+  OB_INLINE void record_incr_complete(uint64_t insert_vids_cnt = 0, uint64_t delete_vids_cnt = 0)
+  {
+    common::ObSpinLockGuard guard(dump_info_lock_);
+    incr_complete_info_.push_back({insert_vids_cnt, delete_vids_cnt});
+  }
+  OB_INLINE void record_vbitmap_table_load(uint64_t insert_vids_cnt = 0, uint64_t delete_vids_cnt = 0)
+  {
+    common::ObSpinLockGuard guard(dump_info_lock_);
+    vbitmap_table_load_info_.push_back({insert_vids_cnt, delete_vids_cnt});
+  }
+
+  OB_INLINE void record_snap_table_load(uint64_t insert_vids_cnt = 0, uint64_t delete_vids_cnt = 0)
+  {
+    common::ObSpinLockGuard guard(dump_info_lock_);
+    snap_table_load_info_.push_back({insert_vids_cnt, delete_vids_cnt});
+  }
+
+  int64_t to_string(char *buf, const int64_t buf_len) const
+  {
+    int64_t pos = 0;
+    common::ObSpinLockGuard guard(dump_info_lock_);
+    J_OBJ_START();
+    J_KV(K_(incr_complete_info), K_(vbitmap_table_load_info), K_(snap_table_load_info));
+    J_OBJ_END();
+    return pos;
+  }
+  mutable common::ObSpinLock dump_info_lock_;
+  ObVecIndexLoadInfos incr_complete_info_;
+  ObVecIndexLoadInfos vbitmap_table_load_info_;
+  ObVecIndexLoadInfos snap_table_load_info_;
+};
+
+struct ObVectorIndexFollowerSyncStatic
+{
+public:
+  const int64_t VEC_INDEX_OPTIMIZE_RATIO = 20; //actually is 20%
+
+  ObVectorIndexFollowerSyncStatic()
+    : incr_count_(0),
+      vbitmap_count_(0),
+      snap_count_(0),
+      snap_incr_seg_cnt_(0),
+      snap_incr_vec_cnt_(0),
+      snap_base_seg_cnt_(0),
+      snap_base_vec_cnt_(0),
+      sync_count_(0),
+      sync_fail_(0),
+      idle_count_(0),
+      last_succ_time_(0),
+      last_fail_time_(0),
+      last_fail_code_(0),
+      optimze_threashold_(VEC_INDEX_OPTIMIZE_RATIO),
+      use_new_check_(false)
+  {}
+  void reset() { 
+    incr_count_ = 0;
+    vbitmap_count_ = 0;
+    snap_count_ = 0;
+    snap_incr_seg_cnt_ = 0;
+    snap_incr_vec_cnt_ = 0;
+    snap_base_seg_cnt_ = 0;
+    snap_base_vec_cnt_ = 0;
+    sync_count_ = 0;
+    sync_fail_ = 0;
+    idle_count_ = 0;
+    last_succ_time_ = 0;
+    last_fail_time_ = 0;
+    last_fail_code_ = 0;
+    optimze_threashold_ = VEC_INDEX_OPTIMIZE_RATIO;
+    use_new_check_ = false;
+  }
+  TO_STRING_KV(K_(incr_count), K_(vbitmap_count), K_(snap_count),
+               K_(snap_incr_seg_cnt), K_(snap_incr_vec_cnt),
+               K_(snap_base_seg_cnt), K_(snap_base_vec_cnt),
+               K_(sync_count), K_(sync_fail), K_(idle_count),
+               K_(optimze_threashold), K_(use_new_check));
+  int64_t incr_count_;
+  int64_t vbitmap_count_;
+  int64_t snap_count_;
+  int64_t snap_incr_seg_cnt_;
+  int64_t snap_incr_vec_cnt_;
+  int64_t snap_base_seg_cnt_;
+  int64_t snap_base_vec_cnt_;
+
+  int64_t sync_count_;
+  int64_t sync_fail_;
+  int64_t idle_count_; // loops not receive sync
+  int64_t last_succ_time_;
+  int64_t last_fail_time_;
+  int last_fail_code_;
+  int64_t optimze_threashold_;
+  bool use_new_check_;
+};
+
+struct ObVectorIndexAcquireCtx
+{
+  ObVectorIndexAcquireCtx()
+    : inc_tablet_id_(),
+      vbitmap_tablet_id_(),
+      snapshot_tablet_id_(),
+      data_tablet_id_(),
+      embedded_tablet_id_(),
+      inc_table_id_(OB_INVALID_ID),
+      vbitmap_table_id_(OB_INVALID_ID),
+      snapshot_table_id_(OB_INVALID_ID),
+      data_table_id_(OB_INVALID_ID),
+      embedded_table_id_(OB_INVALID_ID),
+      rowkey_vid_tablet_id_(),
+      vid_rowkey_tablet_id_(),
+      rowkey_vid_table_id_(OB_INVALID_ID),
+      vid_rowkey_table_id_(OB_INVALID_ID)
+  {}
+
+  bool is_inc_valid() const { return inc_tablet_id_.is_valid(); }
+
+  bool is_complete() const
+  {
+    return inc_tablet_id_.is_valid()
+           && vbitmap_tablet_id_.is_valid()
+           && snapshot_tablet_id_.is_valid()
+           && data_tablet_id_.is_valid()
+           && inc_table_id_ != OB_INVALID_ID
+           && vbitmap_table_id_ != OB_INVALID_ID
+           && snapshot_table_id_ != OB_INVALID_ID
+           && data_table_id_ != OB_INVALID_ID;
+  }
+
+  void reset()
+  {
+    inc_tablet_id_.reset();
+    vbitmap_tablet_id_.reset();
+    snapshot_tablet_id_.reset();
+    data_tablet_id_.reset();
+    embedded_tablet_id_.reset();
+    inc_table_id_ = OB_INVALID_ID;
+    vbitmap_table_id_ = OB_INVALID_ID;
+    snapshot_table_id_ = OB_INVALID_ID;
+    data_table_id_ = OB_INVALID_ID;
+    embedded_table_id_ = OB_INVALID_ID;
+    rowkey_vid_tablet_id_.reset();
+    vid_rowkey_tablet_id_.reset();
+    rowkey_vid_table_id_ = OB_INVALID_ID;
+    vid_rowkey_table_id_ = OB_INVALID_ID;
+  }
+
+  TO_STRING_KV(K_(inc_tablet_id), K_(vbitmap_tablet_id), K_(snapshot_tablet_id),
+               K_(data_tablet_id), K_(embedded_tablet_id),
+               K_(inc_table_id), K_(vbitmap_table_id), K_(snapshot_table_id),
+               K_(data_table_id), K_(embedded_table_id),
+               K_(rowkey_vid_tablet_id), K_(vid_rowkey_tablet_id),
+               K_(rowkey_vid_table_id), K_(vid_rowkey_table_id));
+
+  // tablet_id
+  ObTabletID inc_tablet_id_;
+  ObTabletID vbitmap_tablet_id_;
+  ObTabletID snapshot_tablet_id_;
+  ObTabletID data_tablet_id_;
+  ObTabletID embedded_tablet_id_;
+  // table_id
+  uint64_t inc_table_id_;
+  uint64_t vbitmap_table_id_;
+  uint64_t snapshot_table_id_;
+  uint64_t data_table_id_;
+  uint64_t embedded_table_id_;
+  // index organized table only
+  ObTabletID rowkey_vid_tablet_id_;
+  ObTabletID vid_rowkey_tablet_id_;
+  uint64_t rowkey_vid_table_id_;
+  uint64_t vid_rowkey_table_id_;
+};
+
+class ObPluginVectorIndexAdaptor
+{
+public:
+  static int64_t instacnce_cnt_;
+public:
+  friend class ObVsagMemContext;
+  ObPluginVectorIndexAdaptor(common::ObIAllocator *allocator, lib::MemoryContext &entity, uint64_t tenant_id);
+  ~ObPluginVectorIndexAdaptor();
+
+  int init(ObString init_str, int64_t dim, lib::MemoryContext &parent_mem_ctx, uint64_t *all_vsag_use_mem);
+  // only used for background maintance handle aux table no.4 / 5 before get index aux table no.3
+  int init(lib::MemoryContext &parent_mem_ctx, uint64_t *all_vsag_use_mem);
+  int set_param(ObString init_str, int64_t dim);
+  int update_index_param(const ObVectorIndexParam &param, const ObString &index_param);
+  const ObString &get_index_param() const { return index_param_; }
+  int get_index_type() { return type_; };
+  uint64_t get_tenant_id() {return tenant_id_; };
+
+  // -- start 调试使用
+  void init_incr_tablet() {inc_tablet_id_ = ObTabletID(common::ObTabletID::MIN_VALID_TABLET_ID); }
+  // -- end 调试使用
+
+  bool is_snap_tablet_valid() { return snapshot_tablet_id_.is_valid(); }
+  bool is_inc_tablet_valid() { return inc_tablet_id_.is_valid(); }
+  bool is_vbitmap_tablet_valid() { return vbitmap_tablet_id_.is_valid(); }
+  bool is_data_tablet_valid() { return data_tablet_id_.is_valid(); }
+  bool is_embedded_tablet_valid() { return embedded_tablet_id_.is_valid(); }
+  bool is_vid_rowkey_info_valid() { return rowkey_vid_table_id_ != OB_INVALID_ID && rowkey_vid_tablet_id_.is_valid(); }
+  OB_INLINE bool is_ready_complete() const { return ATOMIC_LOAD(&ready_state_) == ADAPTOR_COMPLETE; }
+  OB_INLINE ObAdaptorReadyState get_ready_state() const { return ATOMIC_LOAD(&ready_state_); }
+  OB_INLINE void set_ready_state(ObAdaptorReadyState state) { ATOMIC_STORE(&ready_state_, state); }
+  OB_INLINE ObAdaptorMigState get_mig_state() const { return ATOMIC_LOAD(&mig_state_); }
+  OB_INLINE void set_mig_state(ObAdaptorMigState state) { ATOMIC_STORE(&mig_state_, state); }
+  void build_acquire_ctx(ObVectorIndexAcquireCtx &ctx) const;
+  int try_fill_tablet_info(const ObVectorIndexAcquireCtx &ctx, bool &became_complete);
+  bool is_need_async_optimal() { return need_be_optimized_ && ! has_frozen(); }
+  bool has_frozen() const { return frozen_data_.is_valid() && frozen_data_->has_frozen(); }
+  bool is_frozen_finish() const { return frozen_data_.is_valid() && frozen_data_->is_frozen_finish(); }
+
+  ObTabletID& get_inc_tablet_id() { return inc_tablet_id_; }
+  ObTabletID& get_vbitmap_tablet_id() { return vbitmap_tablet_id_; }
+  ObTabletID& get_snap_tablet_id() { return snapshot_tablet_id_; }
+  ObTabletID& get_data_tablet_id() { return data_tablet_id_; }
+  ObTabletID& get_embedded_tablet_id() { return embedded_tablet_id_; }
+  ObTabletID& get_rowkey_vid_tablet_id() { return rowkey_vid_tablet_id_; }
+  ObTabletID& get_vid_rowkey_tablet_id() { return vid_rowkey_tablet_id_; }
+
+  const ObVecIdxActiveDataHandle& get_incr_data() const { return incr_data_; }
+  ObVecIdxActiveDataHandle& get_incr_data() { return incr_data_; }
+  const ObVecIdxVBitmapDataHandle& get_vbitmap_data() const { return vbitmap_data_; }
+  ObVecIdxVBitmapDataHandle& get_vbitmap_data() { return vbitmap_data_; }
+  int get_vbitmap_start_scn(SCN &bitmap_start_scn) const;
+  const ObVecIdxFrozenDataHandle& get_frozen_data() const { return frozen_data_; }
+  ObVecIdxFrozenDataHandle& get_frozen_data() { return frozen_data_; }
+  const ObVecIdxSnapshotDataHandle& get_snap_data() const { return snap_data_; }
+  ObVecIdxSnapshotDataHandle& get_snap_data() { return snap_data_; }
+
+  uint64_t get_inc_table_id() { return inc_table_id_; }
+  uint64_t get_vbitmap_table_id() { return vbitmap_table_id_; }
+  uint64_t get_snapshot_table_id() { return snapshot_table_id_; }
+  uint64_t get_data_table_id() { return data_table_id_; }
+  uint64_t get_embedded_table_id() { return embedded_table_id_; }
+  uint64_t get_rowkey_vid_table_id() { return rowkey_vid_table_id_; }
+  uint64_t get_vid_rowkey_table_id() { return vid_rowkey_table_id_; }
+  void set_snap_data_has_complete() {
+    if (snap_data_.is_valid()) {
+      snap_data_->has_complete_ = true;
+    }
+  }
+
+  bool get_snap_has_complete() const { return snap_data_.is_valid() && snap_data_->has_complete_; }
+
+  int renew_single_snap_index(bool mem_saving_mode);
+  int renew_snapdata_in_lock();
+  int set_adaptor_ctx_flag(ObVectorQueryAdaptorResultContext *ctx);
+
+  bool is_valid() { return (is_inc_tablet_valid() || is_vbitmap_tablet_valid() || is_snap_tablet_valid()) && is_data_tablet_valid(); }
+  bool is_complete();
+  void set_need_cancel_task() { ATOMIC_STORE(&need_cancel_task_, true); }
+  void reset_need_cancel_task() { ATOMIC_STORE(&need_cancel_task_, false); }
+  bool is_need_cancel_task() { return ATOMIC_LOAD(&need_cancel_task_); }
+  OB_INLINE bool has_bounded_overlay() const { return ATOMIC_LOAD(&has_bounded_overlay_); }
+  OB_INLINE void set_has_bounded_overlay(bool v) { ATOMIC_STORE(&has_bounded_overlay_, v); }
+  void inc_ref();
+  bool dec_ref_and_check_release();
+  void inc_ls_ref() { ATOMIC_AAF(&ls_ref_, 1); }
+  int64_t dec_ls_ref() { return ATOMIC_SAF(&ls_ref_, 1); }
+  int64_t get_ls_ref() const { return ATOMIC_LOAD(&ls_ref_); }
+  void inc_zero_ref_time() { ATOMIC_AAF(&zero_ref_time_, 1); }
+  int64_t get_zero_ref_time() const { return ATOMIC_LOAD(&zero_ref_time_); }
+  static int64_t get_zero_ref_time_threshold() { return ZERO_REF_TIME_THRESHOLD; }
+  void reset_zero_ref_time() { ATOMIC_STORE(&zero_ref_time_, 0); }
+  void inc_idle() { idle_cnt_++; }
+  void reset_idle() { idle_cnt_ = 0; }
+  bool is_deprecated() { return idle_cnt_ > VEC_INDEX_ADAPTER_MAX_IDLE_COUNT; }
+  int set_tablet_id(ObVectorIndexRecordType type, ObTabletID tablet_id);
+
+  int set_table_id(ObVectorIndexRecordType type, uint64_t table_id);
+  int merge_incr_data(ObPluginVectorIndexAdaptor *other,
+      const bool merge_frozen = true,
+      const bool merge_snapshot = false);
+
+  int check_tablet_valid(ObVectorIndexRecordType type);
+
+  int get_dim(int64_t &dim);
+  int get_hnsw_param(ObVectorIndexParam *&param);
+  int vsag_query_vids(
+      float *vector,
+      const int64_t *vids,
+      int64_t count,
+      ObVecIdxQueryResult &result,
+      uint32_t sparse_byte_len = 0);
+  int get_extra_info_by_ids(const int64_t *vids, int64_t count, char *extra_info_buf_ptr, bool is_snap);
+
+  // for virtual table
+  int fill_vector_index_info(ObVectorIndexInfo &info);
+  int fill_mem_context_detail_info(char *buf, int64_t buf_len, int64_t &pos);
+  int fill_vector_index_all_segments(common::ObIArray<ObVectorSegmentInfo> &segment_infos);
+
+  // for migration
+  int get_adaptor_meta(storage::ObMigrationVectorIndexAdaptorMeta &meta);
+
+  void update_delta_refresh_scn(share::SCN &current_scn);
+  void update_index_id_read_scn();
+  void update_last_dml_scn(share::SCN &current_scn);
+  share::SCN get_delta_refresh_scn();
+  share::SCN get_index_id_read_scn();
+  share::SCN get_last_dml_scn();
+  bool is_pruned_read_index_id();
+  void update_can_skip(ObCanSkip3rdAnd4thVecIndex can_skip);
+  ObCanSkip3rdAnd4thVecIndex get_can_skip();
+
+  // VSAG ADD
+  int insert_rows(blocksstable::ObDatumRow *rows,
+                  const int64_t vid_idx,
+                  const int64_t type_idx,
+                  const int64_t vector_idx,
+                  const ObIArray<ObExtraIdxType>& extra_info_ids,
+                  const int64_t row_count);
+  // handle del type
+  int handle_insert_incr_table_rows(blocksstable::ObDatumRow *rows,
+                                    const int64_t vid_idx,
+                                    const int64_t type_idx,
+                                    int64_t row_count);
+  // handle insert type and VSAG ADD
+  int handle_insert_embedded_table_rows(blocksstable::ObDatumRow *rows,
+                                        const int64_t vid_idx,
+                                        const int64_t vector_idx,
+                                        const ObIArray<ObExtraIdxType>& extra_info_id_types,
+                                        int64_t row_count);
+  int add_extra_valid_vid(ObVectorQueryAdaptorResultContext *ctx, int64_t vid);
+  int add_extra_valid_vid_without_malloc_guard(ObVectorQueryAdaptorResultContext *ctx, int64_t vid);
+  int add_snap_index(float *vectors, int64_t *vids, ObVecExtraInfoObj *extra_objs, int64_t extra_column_count, int num, uint32_t *lens = nullptr);
+  // Query Processor first
+  int check_delta_buffer_table_readnext_status(ObVectorQueryAdaptorResultContext *ctx,
+                                               common::ObNewRowIterator *row_iter,
+                                               SCN query_scn,
+                                               ObVecIndexAsyncTaskCtx *task_ctx = nullptr,
+                                               const common::ObTabletID &mem_sync_tablet_id = common::ObTabletID());
+  int complete_delta_buffer_table_data(ObVectorQueryAdaptorResultContext *ctx);
+  // Query Processor second
+  int check_index_id_table_readnext_status(ObVectorQueryAdaptorResultContext *ctx,
+                                           common::ObNewRowIterator *row_iter,
+                                            SCN query_scn,
+                                           ObVecIndexAsyncTaskCtx *task_ctx = nullptr,
+                                           const common::ObTabletID &mem_sync_tablet_id = common::ObTabletID());
+  // Query Processor third
+  int check_snapshot_table_wait_status(ObVectorQueryAdaptorResultContext *ctx);
+
+  int query_result(ObLSID &ls_id,
+                   ObVectorQueryAdaptorResultContext *ctx,
+                   ObVectorQueryConditions *query_cond,
+                   ObVectorQueryVidIterator *&vids_iter);
+  int deserialize_snap_data(const ObLSID &ls_id,
+                            ObVectorQueryConditions *query_cond,
+                            blocksstable::ObDatumRow *row);
+  int query_next_result(ObVectorQueryAdaptorResultContext *ctx,
+                        ObVectorQueryConditions *query_cond,
+                        ObVectorQueryVidIterator *&vids_iter);
+
+  static int param_deserialize(char *ptr, int32_t length, 
+                                    ObIAllocator *allocator, 
+                                    ObVectorIndexAlgorithmType &type,
+                                    void *&param);
+  static int cast_roaringbitmap_to_stdmap(const roaring::api::roaring64_bitmap_t *bitmap, 
+                                          std::map<int, bool> &mymap,
+                                          uint64_t tenant_id);
+  uint64_t get_all_vsag_mem_used() {
+    return ATOMIC_LOAD(all_vsag_use_mem_);
+  }
+  int64_t get_incr_vsag_mem_used();
+  int64_t get_incr_vsag_mem_hold();
+  int64_t get_snap_vsag_mem_used();
+  int64_t get_snap_vsag_mem_hold();
+  int64_t get_frozen_data_mem_used();
+  int64_t get_frozen_data_mem_hold();
+  int64_t get_adapter_mem_hold();
+  ObIAllocator *get_allocator() { return allocator_; }
+
+  void *get_algo_data() { return ATOMIC_LOAD(&algo_data_); }
+  
+  bool check_if_complete_data(ObVectorQueryAdaptorResultContext *ctx);
+  int complete_index_mem_data(ObVectorQueryAdaptorResultContext *ctx,
+                              SCN read_scn,
+                              common::ObNewRowIterator *row_iter,
+                              blocksstable::ObDatumRow *last_row,
+                              int64_t &i_vid_count,
+                              ObVBitmapCompleteResult &complete_result,
+                              ObVecIndexAsyncTaskCtx *task_ctx = nullptr,
+                              const common::ObTabletID &mem_sync_tablet_id = common::ObTabletID());
+  int prepare_delta_mem_data(roaring::api::roaring64_bitmap_t *gene_bitmap,
+                             ObVectorQueryAdaptorResultContext *ctx);
+  int serialize(ObIAllocator *allocator, ObOStreamBuf::CbParam &cb_param, ObOStreamBuf::Callback &cb);
+  int complete_delta_mem_data(roaring::api::roaring64_bitmap_t *gene_bitmap, 
+                              roaring::api::roaring64_bitmap_t *delta_bitmap, 
+                              ObIAllocator *allocator);
+
+  int check_need_sync_to_follower_or_do_opt_task(ObPluginVectorIndexMgr *mgr, bool is_leader, bool &need_sync);
+  int check_snapshot_table_can_read_index(bool &can_read_index);
+  int check_can_sync_to_follower(ObPluginVectorIndexMgr *mgr, int64_t current_snapshot_count, bool &need_sync);
+
+  int check_need_freeze(const int64_t freeze_threshold, bool &need_freeze);
+  int check_can_freeze(ObLSID ls_id, const int64_t freeze_threshold, bool &can_freeze,
+                       const bool force_rotate_active = false);
+  int check_need_merge(const int64_t merge_base_percentage, bool &need_merge);
+  int check_need_alter_param_merge(const ObVectorIndexParam &target, bool &need_merge);
+  int freeze_active_segment(
+      const ObLSID &ls_id,
+      const ObVectorIndexParam *target_param = nullptr,
+      const ObString *target_param_str = nullptr);
+  int update_vbitmap_memdata(const ObLSID &ls_id,
+      const share::SCN &target_scn, ObIAllocator &allocator);
+  int persist_incr_segment(
+      const ObLSID &ls_id, ObVecIndexAsyncTaskCtx *task_ctx = nullptr);
+  void free_result(const ObVecIdxQueryResult& dist_result);
+
+  void sync_finish() { follower_sync_statistics_.sync_count_++; }
+  void sync_succ() {
+    sync_finish();
+    reset_sync_idle_count();
+    follower_sync_statistics_.last_succ_time_ = ObTimeUtility::current_time();
+  }
+  void sync_fail(int ret) {
+    sync_finish();
+    reset_sync_idle_count();
+    follower_sync_statistics_.sync_fail_++;
+    follower_sync_statistics_.last_fail_time_ = ObTimeUtility::current_time();
+    follower_sync_statistics_.last_fail_code_ = ret;
+  }
+
+  void inc_sync_idle_count() { follower_sync_statistics_.idle_count_++; }
+  void reset_sync_idle_count() { follower_sync_statistics_.idle_count_ = 0;}
+  int64_t get_sync_idle_count() { return follower_sync_statistics_.idle_count_; }
+  template<typename T>
+  int init_mem(ObVectorIndexMemDataHandle<T> &memdata_handle);
+  int init_mem_data(ObVectorIndexRecordType type, ObVectorIndexAlgorithmType enforce_type = VIAT_MAX);
+  int init_snap_data_without_lock(ObVectorIndexAlgorithmType enforce_type = VIAT_MAX);
+  int check_snap_index();
+  bool is_mem_data_init_atomic(ObVectorIndexRecordType type);
+  int try_init_mem_data(ObVectorIndexRecordType type, ObVectorIndexAlgorithmType enforce_type = VIAT_MAX) {
+    int ret = OB_SUCCESS;
+    if (!is_mem_data_init_atomic(type)) {
+      ret = init_mem_data(type, enforce_type);
+    }
+    return ret;
+  }
+
+  ObVectorIndexAlgorithmType get_snap_index_type();
+  // Keep the BQ query path while any frozen or persisted segment is BQ,
+  // even if the adaptor already follows a new schema.
+  ObVectorIndexAlgorithmType get_query_runtime_index_type();
+  ObVectorIndexAlgorithmType get_incr_index_type();
+  OB_INLINE int64_t get_extra_column_count()
+  {
+    return extra_info_column_count_;
+  }
+  OB_INLINE void set_extra_column_count(int64_t extra_info_column_count)
+  {
+    extra_info_column_count_ = extra_info_column_count;
+  }
+  int get_extra_info_actual_size(int64_t &extra_info_actual_size);
+  bool has_doing_vector_index_task() 
+  { 
+    common::ObSpinLockGuard ctx_guard(opt_task_lock_);
+    bool bret = is_in_opt_task_;
+    if (!bret) {
+      is_in_opt_task_ = true;
+    }
+    return bret;
+  }
+  bool is_in_opt_task() const { return is_in_opt_task_; }
+
+  int check_if_need_optimize();
+
+  int check_need_freeze_by_optimize_ratio(const int64_t freeze_threshold, bool &need_freeze);
+
+  void vector_index_task_finish() 
+  { 
+    common::ObSpinLockGuard ctx_guard(opt_task_lock_);
+    is_in_opt_task_ = false;  // multiple thread modify is_in_opt_task_
+    need_be_optimized_ = false;   // single thread modify need_be_optimized_
+  }
+
+  void vector_embedding_task_finish() 
+  { 
+    common::ObSpinLockGuard ctx_guard(opt_task_lock_);
+    is_in_opt_task_ = false;  // multiple thread modify is_in_opt_task_
+  }
+
+  ObString &get_snapshot_key_prefix() { return snapshot_key_prefix_; }
+
+  int set_snapshot_key_prefix(const ObString &key_prefix);
+  int set_snapshot_key_prefix(uint64_t tablet_id, uint64_t scn, uint64_t max_length);
+  int set_snapshot_key_scn(const int64_t &snapshot_key_scn);
+  int get_snapshot_key_scn(SCN &snapshot_key_scn);
+  int copy_meta_info(ObPluginVectorIndexAdaptor &other);
+  int copy_meta_info(const ObMigrationVectorIndexAdaptorMeta &meta);
+  int64_t get_snapshot_scn() const { return snap_data_.is_valid() ? (snap_data_->meta_.scn()) : 0;}
+  int64_t get_bounded_read_base_scn() const { return ATOMIC_LOAD(&bounded_read_base_scn_); }
+  int64_t get_bounded_overlay_generation() const { return ATOMIC_LOAD(&bounded_overlay_generation_); }
+  void on_base_reloaded(const ObVectorIndexMeta &meta);
+  int get_bounded_overlay_snapshot(ObVectorBoundedReadOverlayHandle &out,
+                                   int64_t &loaded_base_scn,
+                                   int64_t &overlay_generation);
+  int merge_bounded_visibility_for_query(ObVectorQueryAdaptorResultContext *ctx,
+                                         roaring::api::roaring64_bitmap_t *insert_bitmap,
+                                         roaring::api::roaring64_bitmap_t *delete_bitmap);
+  int publish_bounded_overlay(ObVectorBoundedReadOverlayHandle &candidate_handle,
+                              ObVectorBoundedReadOverlay *candidate_overlay,
+                              ObVectorBoundedRefreshResult &result);
+  int get_adaptor_scn(share::SCN &out_scn);
+  int get_current_scn(share::SCN &current_scn);
+
+  int set_replace_scn(const SCN &replace_scn);
+  SCN get_replace_scn();
+  int advance_async_query_scn(const SCN &async_query_scn);
+  SCN get_async_query_scn() const { return async_query_scn_.atomic_load(); }
+  void reset_async_query_scn() { async_query_scn_.atomic_store(SCN::invalid_scn()); }
+  int check_query_barrier_scn(
+      const ObLSID &ls_id, const SCN &query_scn,
+      const bool is_async_query, SCN &query_barrier_scn);
+
+  void set_reload_finish(const bool value) { reload_finish_ = value; };
+  bool get_reload_finish() { return reload_finish_; };
+  void set_identity_ts(int64_t ts) { ATOMIC_STORE(&identity_ts_, ts); }
+  int64_t get_identity_ts() const { return ATOMIC_LOAD(&identity_ts_); }
+  bool need_identity_refresh(int64_t mgr_ts) const { return mgr_ts > 0 && ATOMIC_LOAD(&identity_ts_) != mgr_ts; }
+  void do_identity_refresh(int64_t mgr_ts);
+  int get_inc_index_row_cnt(int64_t &count);
+  int get_snap_index_row_cnt(int64_t &count);
+  int get_vbitmap_row_cnt_safe(int64_t &count);
+  int get_vbitmap_delete_cnt_safe(int64_t &count);
+  int get_inc_index_row_cnt_safe(int64_t &count);
+  int get_snap_index_row_cnt_safe(int64_t &count);
+  int get_snap_vbitmap_cnt_safe(int64_t &insert_count, int64_t &delete_count);
+
+  common::RWLock& get_query_lock() { return query_lock_; }
+  common::RWLock& get_bounded_overlay_lock() { return bounded_overlay_lock_; }
+  common::ObSpinLock& get_reload_lock() { return reload_lock_; }
+  bool is_hybrid_index();
+  ObString get_endpoint()
+  {
+    ObString result;
+    ObVectorIndexParam *param = static_cast<ObVectorIndexParam*>(algo_data_);
+    if (OB_NOT_NULL(param)) {
+      result =  ObString(strlen(param->endpoint_), param->endpoint_);
+    }
+    return result;
+  }
+  ObVectorIndexContentType get_content_type() const
+  {
+    ObVectorIndexContentType result = VICT_TEXT;
+    ObVectorIndexParam *param = static_cast<ObVectorIndexParam*>(algo_data_);
+    if (OB_NOT_NULL(param)) {
+      result = param->content_type_;
+    }
+    return result;
+  }
+  bool check_need_embedding();
+  int get_vid_bound(ObVidBound &bound);
+  share::SCN get_last_empty_scan_scn() const { return last_empty_scan_scn_; }
+  void set_last_empty_scan_scn(const share::SCN &scn) { last_empty_scan_scn_ = scn; }
+
+  bool validate_tablet_ids(const ObVectorIndexAcquireCtx& ctx) {
+    // Only validate fields that are already filled (INC_ONLY may have partial info)
+#define MATCH_IF_VALID(field, ctx_field) \
+    (!field.is_valid() || !ctx_field.is_valid() || field == ctx_field)
+    bool is_valid = (MATCH_IF_VALID(inc_tablet_id_, ctx.inc_tablet_id_)
+                    && MATCH_IF_VALID(vbitmap_tablet_id_, ctx.vbitmap_tablet_id_)
+                    && MATCH_IF_VALID(snapshot_tablet_id_, ctx.snapshot_tablet_id_)
+                    && MATCH_IF_VALID(data_tablet_id_, ctx.data_tablet_id_));
+    if (is_hybrid_index()) {
+      is_valid = is_valid && MATCH_IF_VALID(embedded_tablet_id_, ctx.embedded_tablet_id_);
+    }
+#undef MATCH_IF_VALID
+    return is_valid;
+  }
+  OB_INLINE bool get_is_need_vid()
+  {
+    return is_need_vid_;
+  }
+  OB_INLINE void set_is_need_vid(bool is_need_vid)
+  {
+    is_need_vid_ = is_need_vid;
+  }
+
+  inline bool is_sparse_vector_index_type()
+  {
+    bool is_sparse;
+    if (algo_data_ == nullptr) {
+      is_sparse = false;
+    } else {
+      ObVectorIndexParam *param = static_cast<ObVectorIndexParam *>(algo_data_);
+      is_sparse = (param->type_ == VIAT_IPIVF || param->type_ == VIAT_IPIVF_SQ) ? true : false;
+    }
+    return is_sparse;
+  }
+
+  inline bool is_support_meta() { return ! is_sparse_vector_index_type(); }
+  inline bool check_has_meta() { return is_support_meta() && snap_data_.is_valid() && snap_data_->meta_.is_persistent(); }
+
+  int parse_sparse_vector(char *data, int num, uint32_t *sparse_byte_lens, ObArenaAllocator *allocator, uint32_t **lens,
+    uint32_t **dims, float **vals);
+  void reset_complete();
+  bool check_bitmap_is_delta_bitmap_subset(roaring::api::roaring64_bitmap_t *bitmap);
+  bool check_index_bitmap_is_delta_bitmap_subset();
+  void set_index_statistics_updated(bool value) { index_statistics_updated_ = value; }
+
+  // incr init
+  int init_incr_data(ObVecIdxActiveDataHandle &mem_data, ObVectorIndexAlgorithmType enforce_type, ObVectorIndexParam *param);
+  int create_incr_active_segment(
+      ObVectorIndexSegmentHandle &segment_handle,
+      const ObVectorIndexAlgorithmType enforce_type = VIAT_MAX,
+      const ObVectorIndexParam *target_param = nullptr,
+      const ObString *target_param_str = nullptr);
+
+  // vbitmap init
+  int init_vbitmap_data(ObVecIdxVBitmapDataHandle &mem_data);
+  int create_vbitmap_data(ObVecIdxVBitmapDataHandle &vbitmap);
+  int check_vbitmap_is_subset(roaring::api::roaring64_bitmap_t *delta_bitmap, bool &is_subset);
+
+  // snap init
+  bool is_snap_inited() const { return snap_data_.is_valid() && snap_data_->is_inited(); }
+  int init_snap_data_for_build(const bool is_init_bitmap);
+  int init_snap_data_for_build(ObVectorIndexParam *param, const bool is_buffer_mode);
+  bool is_sanp_builder_inited() const
+  {
+    return is_snap_inited() && OB_NOT_NULL(snap_data_->builder_) && snap_data_->builder_->is_inited();
+  }
+  int inner_init_snap_builder(ObVectorIndexParam *param, const bool is_buffer_mode);
+  int try_init_snap_for_deserialize(ObVectorIndexAlgorithmType actual_type);
+
+  int get_full_incr_bitmap(roaring::api::roaring64_bitmap_t *&bitmap);
+  int complete_bitmap_data(
+      const SCN& frozen_scn, common::ObNewRowIterator *row_iter);
+  int write_into_bitmap_without_lock(
+      ObVecIdxVBitmapDataHandle &vbitmap, int64_t dim, SCN read_scn,
+      common::ObIArray<uint64_t> &i_vids, common::ObIArray<uint64_t> &d_vids);
+
+  // for index serialize and deserialize
+  int serialize_snapshot(ObHNSWSerializeCallback::CbParam &param, const bool skip_for_merge = true);
+  int build_snap_meta(
+      const ObTabletID &tablet_id, const int64_t snapshot_version, const int64_t &data_block_cnt);
+  int build_and_serialize_meta_data(const ObTabletID &tablet_id,
+      const int64_t snapshot_version, const int64_t &data_block_cnt,
+      ObIAllocator &allocator, ObString &meta_data);
+  int deserialize_snap_meta(const ObString& meta_data);
+  int deserialize_snap_data(
+      const ObLSID &ls_id, const share::SCN &scn,
+      const ObString &meta_data, const int64_t meta_scn);
+  int deserialize_snap_data(const ObLSID &ls_id, ObVectorQueryConditions *query_cond);
+  int deserialize_snap_data(ObHNSWDeserializeCallback::CbParam &param, ObString &row_key);
+  int deserialize_snap_data(ObHNSWDeserializeCallback::CbParam &param);
+
+  // for incr segment persistence
+  int check_bitmap_before_persist();
+  int delete_incr_table_data(
+    ObIAllocator &allocator, const ObLSID &ls_id, transaction::ObTxReadSnapshot &snapshot,
+    transaction::ObTxDesc *tx_desc, const int64_t timeout,
+    const share::SCN& frozen_scn, const ObVectorIndexRoaringBitMap *bitmap,
+    ObVecIndexAsyncTaskCtx *task_ctx = nullptr);
+
+  // for segment
+  int create_mem_ctx(ObVsagMemContext *&mem_ctx);
+  int create_snap_segment(const ObVectorIndexAlgorithmType enforce_type, ObVectorIndexSegmentHandle &segment_handle);
+  int create_snap_segment(const ObVectorIndexAlgorithmType enforce_type, ObVectorIndexSegmentMeta &seg_meta);
+  // Migration dest: install deserialized segment into snap_data_.meta_ (bases_ or incrs_).
+  int install_migrated_segment_handle(
+      const int64_t segment_idx,
+      const ObVectorIndexSegmentMeta &src_seg_meta,
+      ObVectorIndexSegmentHandle &segment_handle,
+      const ObVectorIndexMetaHeader &meta_header,
+      bool has_complete,
+      bool is_last_segment);
+  // Migration dest: on DAG retry, wipe whatever segments were installed by a
+  // failed attempt.
+  int clear_migrated_segments();
+  void set_created_by_segment_merge(const bool value) { created_by_segment_merge_ = value; }
+  bool is_created_by_segment_merge() const { return created_by_segment_merge_; }
+  void set_created_by_tablet_rebuild(const bool value) { created_by_tablet_rebuild_ = value; }
+  bool is_created_by_tablet_rebuild() const { return created_by_tablet_rebuild_; }
+
+  void set_skip_merge_sched() { skip_merge_sched_ = true; }
+  bool is_skip_merge_sched() const { return skip_merge_sched_; }
+
+public:
+
+  void log_deseri_snap_without_lock(ObVectorIndexAlgorithmType index_type, const ObString &target_prefix,
+                                    const ObString &key_prefix, int64_t cost_ms);
+  int print_adapter_info(char *buf, int64_t buf_len, int64_t &pos);
+  void reset_dump_info() { dump_info_.reset(); }
+
+  TO_STRING_KV(KP(this), K_(ready_state), K_(type), KP_(algo_data),
+              K_(incr_data), K_(frozen_data), K_(snap_data), K_(vbitmap_data), K_(tenant_id),
+              K_(data_tablet_id),K_(rowkey_vid_tablet_id), K_(vid_rowkey_tablet_id),
+              K_(inc_tablet_id), K_(vbitmap_tablet_id), K_(snapshot_tablet_id), K_(embedded_tablet_id),
+              K_(data_table_id), K_(rowkey_vid_table_id), K_(vid_rowkey_table_id),
+              K_(inc_table_id), K_(vbitmap_table_id), K_(snapshot_table_id), K_(embedded_table_id),
+              K_(ref_cnt), K_(ls_ref), K_(zero_ref_time), K_(idle_cnt), KP_(allocator),
+              K_(follower_sync_statistics),
+              K_(mem_check_cnt), K_(is_mem_limited), K_(is_need_vid), K_(dump_info), K_(snapshot_key_prefix),
+              K_(replace_scn), K_(async_query_scn), K_(reload_finish), K_(need_be_optimized),
+              K_(is_in_opt_task), K_(need_cancel_task), K_(created_by_segment_merge),
+              K_(created_by_tablet_rebuild),
+              K_(identity_ts), K_(mig_state), K_(skip_merge_sched));
+
+private:
+  bool has_bounded_read_base() const
+  {
+    return is_snap_inited() && get_bounded_read_base_scn() > 0;
+  }
+  bool is_bounded_read_migration_safe() const
+  {
+    const ObAdaptorMigState state = get_mig_state();
+    return ObAdaptorMigState::MIG_INVALID == state || ObAdaptorMigState::MIG_SUCC == state;
+  }
+  void reset_bounded_read_state();
+  int do_fill_vector_index_all_segments(common::ObIArray<ObVectorSegmentInfo> &segment_infos);
+  int add_datum_row_into_array(blocksstable::ObDatumRow *datum_row, 
+                               common::ObIArray<uint64_t> &i_vids,
+                               common::ObIArray<uint64_t> &d_vids);
+  bool check_if_complete_index(SCN read_scn);
+  int check_if_complete_delta(ObVectorQueryAdaptorResultContext *ctx, roaring::api::roaring64_bitmap_t *gene_bitmap, int64_t count, bool &res);
+  int write_into_delta_mem(ObVectorQueryAdaptorResultContext *ctx,
+                           int64_t count,
+                           float *vectors,
+                           uint64_t *vids,
+                           ObVecExtraInfoObj *extra_objs,
+                           int64_t extra_column_count,
+                           ObVidBound vid_bound,
+                           uint64_t *null_vids,
+                           int64_t null_count,
+                           bool& has_written,
+                           uint32_t *sparse_byte_lens = nullptr);
+  int write_into_index_mem(ObVecIdxVBitmapDataHandle &vbitmap, int64_t dim, SCN read_scn, common::ObIArray<uint64_t> &i_vids, common::ObIArray<uint64_t> &d_vids);
+  int generate_snapshot_valid_bitmap(ObVectorQueryAdaptorResultContext *ctx,
+                                     common::ObNewRowIterator *row_iter,
+                                     SCN query_scn);
+  int try_cover_or_mark_refresh_with_bounded_overlay(ObLSID &ls_id,
+                                                     ObVectorQueryAdaptorResultContext *ctx,
+                                                     const int64_t meta_scn);
+  int load_snap_data_with_snap_meta(ObLSID &ls_id,
+                                    ObVectorQueryAdaptorResultContext *ctx,
+                                    const int64_t meta_scn);
+
+  void output_bitmap(roaring::api::roaring64_bitmap_t *bitmap);
+  int print_bitmap(roaring::api::roaring64_bitmap_t *bitmap);
+  void print_vids(uint64_t *vids, int64_t count);
+  void print_vectors(float *vecs, int64_t count, int64_t dim);
+  void print_sparse_vectors(uint32_t *lens, uint32_t *dims, float *vals, int64_t count);
+
+  int merge_and_generate_bitmap(ObVectorQueryAdaptorResultContext *ctx,
+                                ObHnswBitmapFilter &iFilter,
+                                ObHnswBitmapFilter &dFilter);
+
+  int vsag_query_vids(ObVectorQueryAdaptorResultContext *ctx,
+                      ObVectorQueryConditions *query_cond,
+                      int64_t dim, float *query_vector,
+                      ObVectorQueryVidIterator *&vids_iter);
+
+  bool is_sync_index();
+
+  int init_sparse_vector_type();
+  void free_sparse_vector_type_mem();
+  int set_index_param(const ObString &index_param);
+private:
+  const double_t VEC_INDEX_OPTIMIZE_RATIO = 0.2;
+  ObAdaptorReadyState ready_state_;
+  ObVectorIndexAlgorithmType type_;
+  void *algo_data_;
+  ObString index_param_; // raw index parameter string, owned by allocator_
+  ObVecIdxActiveDataHandle incr_data_;
+  ObVecIdxSnapshotDataHandle snap_data_;
+  ObVecIdxVBitmapDataHandle vbitmap_data_;
+  ObVecIdxFrozenDataHandle frozen_data_;
+
+  uint64_t tenant_id_;
+
+  ObTabletID snapshot_tablet_id_;
+  ObTabletID inc_tablet_id_;
+  ObTabletID vbitmap_tablet_id_;
+  ObTabletID data_tablet_id_;
+  ObTabletID rowkey_vid_tablet_id_;
+  ObTabletID vid_rowkey_tablet_id_;
+  ObTabletID embedded_tablet_id_;
+
+  uint64_t inc_table_id_;
+  uint64_t vbitmap_table_id_;
+  uint64_t snapshot_table_id_;
+  uint64_t data_table_id_;
+  uint64_t embedded_table_id_;
+  uint64_t rowkey_vid_table_id_;
+  uint64_t vid_rowkey_table_id_;
+
+  int64_t ref_cnt_;  // object lifetime: tenant map + ls maps + external guards
+  int64_t ls_ref_;   // structural attach count: only ls adaptor maps participate
+  int64_t zero_ref_time_; // consecutive maintenance rounds with no other LS ref
+  int64_t idle_cnt_; // not merged cnt
+  int64_t mem_check_cnt_;
+  bool is_mem_limited_;
+  uint64_t *all_vsag_use_mem_;
+  // TODO check for fifoallocator
+  ObIAllocator *allocator_; // allocator for alloc adapter self
+  lib::MemoryContext &parent_mem_ctx_;
+
+  // statistics for judging whether need sync follower
+  ObVectorIndexFollowerSyncStatic follower_sync_statistics_;
+  // static for information between two dump
+  ObVectorIndexDumpInfo dump_info_;
+
+  bool is_in_opt_task_;
+  bool need_be_optimized_;
+  int64_t extra_info_column_count_;
+  ObString snapshot_key_prefix_; // name rule: TabletID_SCN
+
+  common::ObSpinLock opt_task_lock_;
+  common::ObSpinLock reload_lock_;  // lock for reload from table
+  RWLock query_lock_;// lock for async task and query
+  // Protects bounded_overlay_ and its identity fields. Last overlay handle release
+  // happens after dropping this lock; never acquire it while holding query_lock_ write.
+  mutable RWLock bounded_overlay_lock_;
+  bool reload_finish_;
+  int64_t identity_ts_;
+  int64_t last_embedding_time_;
+
+  // for vid opt
+  bool is_need_vid_;
+  ObCollectionMapType *sparse_vector_type_;
+  bool index_statistics_updated_;
+
+  /* 
+   * record scn for replace_old_adapter to deal with task conflict between memdata sync and async task.
+   * we can't get scn from snapshot_key_prefix_ because it is invaild in some cases like BQ
+   */
+  SCN replace_scn_;
+  // Earliest async-query snapshot supported by the current adaptor state. This
+  // runtime value is not serialized into snapshot metadata or migration RPCs.
+  SCN async_query_scn_;
+  SCN last_empty_scan_scn_;
+  // Base SCN boundary used only for snap_meta bounded-overlay identity checks.
+  // It does not advance snap_data_->meta_ or the adaptor query SCN.
+  int64_t bounded_read_base_scn_;
+  // Incremented on every snapshot reload, including an empty meta, to reject
+  // overlay candidates built against an earlier adaptor state.
+  int64_t bounded_overlay_generation_;
+  ObVectorBoundedReadOverlayHandle bounded_overlay_;
+  bool has_bounded_overlay_;
+  bool need_cancel_task_;
+  bool created_by_segment_merge_; // whether the adaptor is created by segment merge
+  bool created_by_tablet_rebuild_; // whether the adaptor is created by tablet rebuild
+  ObAdaptorMigState mig_state_;
+  bool skip_merge_sched_; // skip merge scheduling until adaptor replaced
+
+  constexpr static uint32_t VEC_INDEX_INCR_DATA_SYNC_THRESHOLD = 100;
+  constexpr static uint32_t VEC_INDEX_VBITMAP_SYNC_THRESHOLD = 100;
+  constexpr static uint32_t VEC_INDEX_SNAP_DATA_SYNC_THRESHOLD = 1;
+  constexpr static uint32_t VEC_INDEX_ADAPTER_MAX_IDLE_COUNT = 3;
+  constexpr static uint32_t VEC_INDEX_HNSWSQ_BUILD_COUNT_THRESHOLD = 10000;
+  constexpr static int64_t  VSAG_MAX_EF_SEARCH = 160000;
+  constexpr static int64_t MAX_ACTIVE_SEGMENT_VEC_CNT = 10000;
+  constexpr static int64_t ZERO_REF_TIME_THRESHOLD = 2;
+};
+
+class ObPluginVectorIndexAdapterGuard
+{
+public:
+  ObPluginVectorIndexAdapterGuard(ObPluginVectorIndexAdaptor *adapter = nullptr)
+    : adapter_(adapter)
+  {}
+  ~ObPluginVectorIndexAdapterGuard()
+  {
+    reset();
+  }
+
+  void reset()
+  {
+    if (is_valid()) {
+      if (adapter_->dec_ref_and_check_release()) {
+        ObIAllocator *allocator = adapter_->get_allocator();
+        if (OB_ISNULL(allocator)) {
+          const int ret = OB_ERR_UNEXPECTED;
+          OB_LOG(WARN, "null allocator", KPC(adapter_));
+        } else {
+          OB_LOG(INFO, "adatper released", KPC(adapter_), K(lbt()));
+          adapter_->~ObPluginVectorIndexAdaptor();
+          allocator->free(adapter_);
+        }
+      }
+      adapter_ = nullptr;
+    }
+  }
+
+  bool is_valid() { return adapter_ != nullptr; }
+  ObPluginVectorIndexAdaptor* get_adatper() { return adapter_; }
+  int set_adapter(ObPluginVectorIndexAdaptor *adapter)
+  { 
+    int ret = OB_SUCCESS;
+    if (is_valid()) {
+      ret = OB_ERR_UNEXPECTED;
+      OB_LOG(WARN, "vector index adapter guard can only set once", KPC(adapter_), KPC(adapter));
+    } else if (OB_ISNULL(adapter)) {
+      ret = OB_ERR_UNEXPECTED;
+      OB_LOG(WARN, "adapter is null", KR(ret));
+    } else {
+      adapter_ = adapter;
+      (void)adapter_->inc_ref();
+    }
+    return ret;
+  }
+  // Adopt a ref that was already acquired by an atomic map callback.
+  int set_adapter_with_ref_hold(ObPluginVectorIndexAdaptor *adapter)
+  {
+    int ret = OB_SUCCESS;
+    if (is_valid()) {
+      ret = OB_ERR_UNEXPECTED;
+      OB_LOG(WARN, "vector index adapter guard can only set once", KPC(adapter_), KPC(adapter));
+    } else if (OB_ISNULL(adapter)) {
+      ret = OB_ERR_UNEXPECTED;
+      OB_LOG(WARN, "adapter is null", KR(ret));
+    } else {
+      adapter_ = adapter;
+    }
+    return ret;
+  }
+  TO_STRING_KV(KPC_(adapter));
+
+private:
+  ObPluginVectorIndexAdaptor *adapter_;
+};
+
+};
+};
+#endif // OCEANBASE_SHARE_PLUGIN_VECTOR_INDEX_ADAPTOR_H_

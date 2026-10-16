@@ -1,0 +1,4 @@
+create database s4test;
+create table s4test.t1(c1 int primary key, c2 int);
+create table s4test.t4(c1 int primary key, c2 int not null, c3 int default 1, c4 int not null default 2);
+create table s4test.t_lob(c1 int primary key, c2 longtext);

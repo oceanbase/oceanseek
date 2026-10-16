@@ -1,0 +1,203 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_SQL_ENGINE_SORT_SORT_VEC_OP_STORE_ROW_FACTORY_H_
+#define OCEANBASE_SQL_ENGINE_SORT_SORT_VEC_OP_STORE_ROW_FACTORY_H_
+#include "sql/engine/ob_sql_mem_mgr_processor.h"
+#include "sql/engine/sort/ob_sort_key_vec_op.h"
+namespace oceanbase {
+namespace sql {
+template <typename Store_Row, bool has_addon>
+class ObSortVecOpStoreRowFactory {
+public:
+  ObSortVecOpStoreRowFactory(common::ObIAllocator &allocator,
+                  ObSqlMemMgrProcessor &sql_mem_processor,
+                  const RowMeta *&sk_row_meta, 
+                  const RowMeta *&addon_row_meta,
+                  int64_t &inmem_row_size,
+                  const int64_t &topn_cnt)
+      : allocator_(allocator), sql_mem_processor_(sql_mem_processor),
+        sk_row_meta_(sk_row_meta), addon_row_meta_(addon_row_meta),
+        inmem_row_size_(inmem_row_size), topn_cnt_(topn_cnt) {}
+
+  void free_row_store(const RowMeta &sk_row_meta, Store_Row *&sk_row)
+  {
+    if (OB_NOT_NULL(sk_row)) {
+      sql_mem_processor_.alloc(-1 * sk_row->get_max_size(sk_row_meta));
+      inmem_row_size_ -= sk_row->get_max_size(sk_row_meta);
+      allocator_.free(sk_row);
+      sk_row = nullptr;
+    }
+  }
+
+  void free_row_store(Store_Row *&sk_row)
+  {
+    if (OB_NOT_NULL(sk_row)) {
+      if (has_addon) {
+        Store_Row *addon_row = sk_row->get_addon_ptr(*sk_row_meta_);
+        free_row_store(*addon_row_meta_, addon_row);
+      }
+      free_row_store(*sk_row_meta_, sk_row);
+    }
+  }
+
+  // Copy src data into the dst slot. Reuses dst's buffer if large enough,
+  // otherwise allocates a new buffer and returns the old one via evicted.
+  // On success: dst holds new data; evicted points to the replaced old row (caller must free it),
+  //             or nullptr if the buffer was reused in-place.
+  // On failure: dst is unchanged; evicted = nullptr. Only internally-allocated memory is freed.
+  int assign_row(const RowMeta *row_meta, const Store_Row *src,
+                 Store_Row *&dst, Store_Row *&evicted)
+  {
+    int ret = OB_SUCCESS;
+    int64_t buf_len = 0;
+    int64_t row_size = src->get_row_size();
+    Store_Row *saved_dst = dst;
+    evicted = nullptr;
+    if (nullptr != dst && dst->get_max_size(*row_meta) >= row_size) {
+      buf_len = dst->get_max_size(*row_meta);
+    } else {
+      evicted = dst;
+      char *buf = nullptr;
+      if (topn_cnt_ < 256) {
+        buf_len = row_size > 256 ? row_size * 4 : 1024;
+      } else {
+        buf_len = row_size * 2;
+      }
+      if (OB_ISNULL(buf = reinterpret_cast<char *>(allocator_.alloc(buf_len)))) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_ENG_LOG(ERROR, "alloc buf failed", K(ret));
+      } else {
+        sql_mem_processor_.alloc(buf_len);
+        dst = new (buf) Store_Row();
+        inmem_row_size_ += buf_len;
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(dst->assign(
+            *reinterpret_cast<const ObCompactRow *>(src)))) {
+      SQL_ENG_LOG(WARN, "stored row assign failed", K(ret));
+    } else {
+      dst->set_max_size(buf_len, *row_meta);
+    }
+    if (OB_FAIL(ret)) {
+      if (dst != saved_dst) {
+        sql_mem_processor_.alloc(-1 * buf_len);
+        inmem_row_size_ -= buf_len;
+        allocator_.free(dst);
+      }
+      dst = saved_dst;
+      evicted = nullptr;
+    }
+    return ret;
+  }
+
+  // Copy a complete sort row (sort-key + optional addon) from src into dst.
+  // Handles buffer reuse/allocation for both sk and addon parts.
+  // On success: dst holds new data with addon_ptr set; old buffers are freed internally.
+  // On failure: the original dst allocations remain owned by the caller.
+  int copy_sort_row(const Store_Row *src, Store_Row *&dst)
+  {
+    int ret = OB_SUCCESS;
+    Store_Row *saved_dst = dst;
+    Store_Row *evicted_sk = nullptr;
+    Store_Row *evicted_addon = nullptr;
+    Store_Row *addon_dst = nullptr;
+    Store_Row *src_addon = nullptr;
+    if (has_addon && OB_NOT_NULL(dst)) {
+      addon_dst = dst->get_addon_ptr(*sk_row_meta_);
+    }
+    if (has_addon) {
+      src_addon = const_cast<Store_Row *>(src)->get_addon_ptr(*sk_row_meta_);
+    }
+
+    if (OB_FAIL(assign_row(sk_row_meta_, src, dst, evicted_sk))) {
+      SQL_ENG_LOG(WARN, "failed to assign sort key row", K(ret));
+    } else if (has_addon) {
+      if (OB_FAIL(assign_row(addon_row_meta_, src_addon, addon_dst, evicted_addon))) {
+        SQL_ENG_LOG(WARN, "failed to assign addon row", K(ret));
+        if (dst != saved_dst) {
+          sql_mem_processor_.alloc(-1 * dst->get_max_size(*sk_row_meta_));
+          inmem_row_size_ -= dst->get_max_size(*sk_row_meta_);
+          allocator_.free(dst);
+          dst = saved_dst;
+        } else if (OB_NOT_NULL(dst)) {
+          // In-place assignment copied src's addon pointer. Restore ownership
+          // of the original addon before the heap cleans up the failed copy.
+          dst->set_addon_ptr(addon_dst, *sk_row_meta_);
+        }
+        evicted_sk = nullptr;
+      } else {
+        dst->set_addon_ptr(addon_dst, *sk_row_meta_);
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_NOT_NULL(evicted_sk)) {
+        free_row_store(*sk_row_meta_, evicted_sk);
+      }
+      if (has_addon && OB_NOT_NULL(evicted_addon)) {
+        free_row_store(*addon_row_meta_, evicted_addon);
+      }
+    }
+    return ret;
+  }
+
+  // deep copy orign_row use the alloc
+  int deep_copy_row(const RowMeta *row_meta, const Store_Row *orign_row, Store_Row *&new_row)
+  {
+    int ret = OB_SUCCESS;
+    new_row = nullptr;
+    char *buf = nullptr;
+    if (OB_ISNULL(orign_row)) {
+      ret = OB_ERR_UNEXPECTED;
+      SQL_ENG_LOG(WARN, "unexpected null", K(ret));
+    } else if (OB_ISNULL(buf = reinterpret_cast<char *>(
+                             allocator_.alloc(orign_row->get_row_size())))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      SQL_ENG_LOG(ERROR, "alloc buf failed", K(ret));
+    } else if (OB_ISNULL(new_row = new (buf) Store_Row())) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      SQL_ENG_LOG(ERROR, "failed to new row", K(ret));
+    } else if (OB_FAIL(new_row->assign(
+                   *reinterpret_cast<const ObCompactRow *>(orign_row)))) {
+      SQL_ENG_LOG(WARN, "stored row assign failed", K(ret));
+    } else {
+      int64_t row_size = orign_row->get_row_size();
+      sql_mem_processor_.alloc(row_size);
+      inmem_row_size_ += row_size;
+    }
+    return ret;
+  }
+
+  int generate_new_row(const Store_Row *orign_row, Store_Row *&new_row)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_SUCCESS != (ret = deep_copy_row(sk_row_meta_, orign_row, new_row))) {
+      SQL_ENG_LOG(WARN, "failed to copy to row", K(ret));
+    } else if (has_addon) {
+      Store_Row *new_addon_row = nullptr;
+      Store_Row *ori_addon_row =
+          const_cast<Store_Row *>(orign_row->get_addon_ptr(*sk_row_meta_));
+      if (OB_FAIL(deep_copy_row(addon_row_meta_, ori_addon_row, new_addon_row))) {
+        free_row_store(*sk_row_meta_, new_row);
+        SQL_ENG_LOG(WARN, "failed to copy to row", K(ret));
+      } else {
+        new_row->set_addon_ptr(new_addon_row, *sk_row_meta_);
+      }
+    }
+    return ret;
+  }
+  
+private:
+  common::ObIAllocator &allocator_;
+  ObSqlMemMgrProcessor &sql_mem_processor_;
+  const RowMeta *&sk_row_meta_;
+  const RowMeta *&addon_row_meta_;
+  int64_t &inmem_row_size_;
+  const int64_t &topn_cnt_;
+};
+} // end namespace sql
+} // end namespace oceanbase
+#endif /* OCEANBASE_SQL_ENGINE_SORT_SORT_VEC_OP_STORE_ROW_FACTORY_H_ */

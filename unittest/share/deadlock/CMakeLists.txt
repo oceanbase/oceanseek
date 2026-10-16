@@ -1,0 +1,7 @@
+if(OB_BUILD_CLOSE_MODULES)
+  storage_unittest(test_deadlock)
+endif()
+storage_unittest(test_key_wrapper)
+storage_unittest(test_deadlock_utility)
+storage_unittest(test_lcl_message_drop)
+storage_unittest(test_tx_callback_hash_holder_helper)

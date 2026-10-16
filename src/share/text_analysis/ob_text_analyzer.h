@@ -1,0 +1,79 @@
+/**
+ * Copyright (c) 2023 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_SHARE_OB_TEXT_ANALYZER_H_
+#define OCEANBASE_SHARE_OB_TEXT_ANALYZER_H_
+
+#include "share/text_analysis/ob_token_stream.h"
+namespace oceanbase
+{
+namespace share
+{
+
+struct ObTextAnalysisCtx final
+{
+public:
+  ObTextAnalysisCtx()
+    : cs_(nullptr),
+      filter_stop_token_(false),
+      need_grouping_(false)
+  {}
+  ~ObTextAnalysisCtx() = default;
+  bool is_valid() const { return nullptr != cs_; }
+  void reset()
+  {
+    cs_ = nullptr;
+    filter_stop_token_ = false;
+    need_grouping_ = false;
+  }
+  TO_STRING_KV(KP_(cs), K_(filter_stop_token), K_(need_grouping));
+public:
+  const ObCharsetInfo *cs_;
+  bool filter_stop_token_;
+  bool need_grouping_;
+};
+
+class ObITextAnalyzer
+{
+public:
+  ObITextAnalyzer() : allocator_(nullptr), ctx_(nullptr), analyze_pipeline_(), is_inited_(false) {}
+  virtual ~ObITextAnalyzer() { reset(); }
+
+  virtual void reset();
+  virtual int init(const ObTextAnalysisCtx &ctx, ObIAllocator &allocator);
+  virtual int analyze(const ObDatum &document, ObIFTTokenStream *&token_stream) = 0;
+  VIRTUAL_TO_STRING_KV(KPC_(ctx), K_(analyze_pipeline), K_(is_inited));
+protected:
+  virtual int inner_init(const ObTextAnalysisCtx &ctx, ObIAllocator &allocator) = 0;
+  int add_tokenizer(const ObTextTokenizer::TokenizerType &type);
+  int add_normalizer(
+      const ObTokenNormalizer::TokenNormalizerType &type,
+      const ObTextAnalysisCtx &ctx);
+  ObIFTTokenStream *get_tail_token_stream();
+private:
+  template<typename T>
+  int add_token_stream(ObIFTTokenStream *&token_stream);
+protected:
+  ObIAllocator *allocator_;
+  const ObTextAnalysisCtx *ctx_;
+  ObSEArray<ObIFTTokenStream *, 4> analyze_pipeline_;
+  bool is_inited_;
+};
+
+class ObEnglishTextAnalyzer final : public ObITextAnalyzer
+{
+public:
+  ObEnglishTextAnalyzer() : ObITextAnalyzer() {}
+  virtual ~ObEnglishTextAnalyzer() {}
+
+  virtual int analyze(const ObDatum &document, ObIFTTokenStream *&token_stream) override;
+protected:
+  virtual int inner_init(const ObTextAnalysisCtx &ctx, ObIAllocator &allocator) override;
+};
+
+} // namespace share
+} // namespace oceanbase
+
+#endif

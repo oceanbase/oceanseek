@@ -1,0 +1,17 @@
+# 描述oceanbase与日志服务之间的兼容关系
+
+# 对于每一个正式发布的ob版本，在下面的yaml文档中由日志服务团队负责更新，包括如下属性：
+#  * version: 表示当前的 yaml 文件版本，如果后续有对应的文件结构变更，需要更新该 yaml 的文件版本，便于 管控 的升级模块识别并处理。
+#  * bundled_libpalf: 表示observer进程绑定使用的libpalf，包括如下属性：
+#    * version: 表示libpalf的版本号，使用如 1.2.0 三段式表示
+#  * logservice_dependency: 表示observer对于oblogservice的依赖，包括如下属性：
+#    * min_version: 表示observer进程依赖的日志服务的最小版本号，使用如 1.2.0 三段式表示
+
+# 管控的升级模块模块会读取本文件，结合oblogservice的相关兼容性信息，判断是否满足升级约束
+
+version: v1
+
+bundled_libpalf:
+  version: 1.2.0
+logservice_dependency:
+  min_version: 1.2.0

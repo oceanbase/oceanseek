@@ -1,0 +1,62 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_SQL_ENGINE_EXPR_LEFT_H_
+#define OCEANBASE_SQL_ENGINE_EXPR_LEFT_H_
+
+#include "sql/engine/expr/ob_expr_operator.h"
+
+namespace oceanbase
+{
+namespace sql
+{
+class ObExprLeft: public ObStringExprOperator
+{
+public:
+	explicit ObExprLeft(common::ObIAllocator &alloc);
+	virtual ~ObExprLeft();
+	virtual int calc_result_type2(ObExprResType &type,
+																ObExprResType &type1,
+																ObExprResType &type2,
+																common::ObExprTypeCtx &type_ctx) const;
+  	int cg_expr(ObExprCGCtx &expr_cg_ctx, const ObRawExpr &raw_expr,
+                            ObExpr &rt_expr) const;
+
+  static int calc_left_vector(const ObExpr &expr,
+                              ObEvalCtx &ctx,
+                              const ObBitVector &skip,
+                              const EvalBound &bound);
+
+  template <typename ArgVec, typename ResVec, bool IsAscii, bool CanDoAsciiOptimize, bool HasNull>
+  static int calc_left_vector_const_inner(const ObExpr &expr,
+                                          ObEvalCtx &ctx,
+                                          const ObBitVector &skip,
+                                          const EvalBound &bound,
+                                          int64_t const_len);
+
+  template <typename ArgVec, typename ResVec>
+  static int calc_left_vector_const(const ObExpr &expr,
+                                    ObEvalCtx &ctx,
+                                    const ObBitVector &skip,
+                                    const EvalBound &bound,
+                                    int64_t const_len);
+
+  static int calc_left_vector_non_const(const ObExpr &expr,
+                                       ObEvalCtx &ctx,
+                                       const ObBitVector &skip,
+                                       const EvalBound &bound);
+
+  	DECLARE_SET_LOCAL_SESSION_VARS;
+  
+private:
+  int cast_param_type(const ObObj& in,
+                      ObExprCtx& expr_ctx,
+                      ObObj& out) const;
+	DISALLOW_COPY_AND_ASSIGN(ObExprLeft);
+};
+} /* namespace sql */
+} /* namespace oceanbase */
+
+#endif /* OCEANBASE_SQL_ENGINE_EXPR_LEFT_H_ */

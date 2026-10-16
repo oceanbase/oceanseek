@@ -1,0 +1,2894 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include "ob_object.h"
+#include "lib/ob_errno.h"
+#include "lib/charset/ob_charset.h"
+#include "lib/utility/ob_macro_utils.h"
+#include "lib/utility/ob_print_utils.h"
+#include "lib/utility/serialization.h"
+#include <string.h>
+#define USING_LOG_PREFIX COMMON
+#include "common/object/ob_obj_compare.h"
+#include "lib/string/ob_sql_string.h"
+#include "common/object/ob_obj_funcs.h"
+#include "lib/geo/ob_s2adapter.h"
+
+using namespace oceanbase;
+using namespace oceanbase::common;
+
+namespace oceanbase
+{
+namespace common
+{
+int __attribute__((weak)) ob_obj_read_lob_data(ObIAllocator &allocator, const common::ObObj &obj, ObString &data)
+{
+  int ret = OB_NOT_SUPPORTED;
+  LOG_WARN("not support outrow lob read", K(ret), K(obj));
+  return ret;
+}
+}
+}
+
+//==================== ObLobId ====================
+ObLobId::ObLobId()
+{
+  reset();
+}
+
+ObLobId::~ObLobId()
+{
+  reset();
+}
+
+bool ObLobId::operator==(const ObLobId &other) const
+{
+  return column_idx_ == other.column_idx_ 
+         && tablet_id_ == other.tablet_id_
+         && auto_inc_id_ == other.auto_inc_id_;
+}
+
+bool ObLobId::operator!=(const ObLobId &other) const
+{
+  return !(operator==(other));
+}
+
+bool ObLobId::operator <(const ObLobId &other) const
+{
+  bool bret = false;
+
+  uint64_t column_id = ntohll(column_idx_);
+  uint64_t tablet_id = ntohll(tablet_id_);
+  uint64_t auto_inc_id = ntohll(auto_inc_id_);
+
+  uint64_t oth_column_id = ntohll(other.column_idx_);
+  uint64_t oth_tablet_id = ntohll(other.tablet_id_);
+  uint64_t oth_auto_inc_id = ntohll(other.auto_inc_id_);
+
+  if (column_id != oth_column_id) {
+    bret = column_id < oth_column_id;
+  } else if (tablet_id != oth_tablet_id) {
+    bret = tablet_id < oth_tablet_id;
+  } else {
+    bret = auto_inc_id < oth_auto_inc_id;
+  }
+
+  return bret;
+}
+
+bool ObLobId::operator >(const ObLobId &other) const
+{
+  return other < *this;
+}
+
+void ObLobId::reset()
+{
+  column_idx_ = 0;
+  tablet_id_ = 0;
+  auto_inc_id_ = 0; 
+}
+
+bool ObLobId::is_valid() const
+{
+  return get_column_idx() > 0
+         && get_tablet_id() > 0
+         && get_auto_inc_id() > 0;
+}
+
+uint64_t ObLobId::hash() const
+{
+  uint64_t hash_val = 0;
+  hash_val = murmurhash(&column_idx_, sizeof(column_idx_), hash_val);
+  hash_val = murmurhash(&tablet_id_, sizeof(tablet_id_), hash_val);
+  hash_val = murmurhash(&auto_inc_id_, sizeof(auto_inc_id_), hash_val);
+  return hash_val;
+}
+
+int ObLobId::hash(uint64_t &hash_val) const
+{
+  hash_val = hash();
+  return OB_SUCCESS;
+}
+
+ObString ObLobId::get_string() const
+{
+  return ObString(sizeof(ObLobId), reinterpret_cast<const char *>(this));
+}
+
+int ObLobId::from_string(const ObString &lob_id)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(lob_id.ptr()) || OB_UNLIKELY(lob_id.length() != sizeof(ObLobId))) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "invalid lob id string", K(ret), K(lob_id.length()));
+  } else {
+    MEMCPY(this, lob_id.ptr(), sizeof(ObLobId));
+  }
+  return ret;
+}
+
+void ObLobId::assign(const ObLobId &other)
+{
+  assign(other.get_column_idx(), other.get_tablet_id(), other.get_auto_inc_id());
+}
+
+void ObLobId::assign(const uint64_t column_id, const uint64_t tablet_id, const uint64_t auto_inc_id)
+{
+  set_column_idx(column_id); 
+  set_tablet_id(tablet_id);
+  set_auto_inc_id(auto_inc_id);
+}
+
+OB_SERIALIZE_MEMBER(ObLobId, column_idx_, tablet_id_, auto_inc_id_);
+
+// ==================== ObLobCommon ====================
+void ObLobCommon::reset()
+{
+  version_ = LOB_DATA_VERSION;
+  in_row_ = 1;
+  is_mem_loc_ = 0;
+  reserved_ = 0;
+}
+
+bool ObLobCommon::operator==(const ObLobCommon &other) const
+{
+  return version_ == other.version_ && in_row_ == other.in_row_ && reserved_ == other.reserved_;
+}
+
+bool ObLobCommon::operator!=(const ObLobCommon &other) const
+{
+  return !(operator==(other));
+}
+
+int64_t ObLobDataOutRowCtx::get_real_chunk_size() const
+{
+  // ObLobDataOutRowCtx::chunk_size_ only have 8 bit, range is 0~255
+  // and chunk size can not be zero, so if chunk size is 256KB, ObLobDataOutRowCtx::chunk_size_ is zero
+  return chunk_size_ == 0 ? OB_MAX_LOB_CHUNK_SIZE : chunk_size_ * OUTROW_LOB_CHUNK_SIZE_UNIT;
+}
+
+void ObLobData::reset()
+{
+  id_.reset();
+  byte_size_ = 0;
+}
+
+bool ObLobData::operator==(const ObLobData &other) const
+{
+  return id_ == other.id_ && byte_size_ == other.byte_size_;
+}
+
+bool ObLobData::operator!=(const ObLobData &other) const
+{
+  return !(operator==(other));
+}
+
+int ObLobLocator::init(const uint64_t table_id,
+                       const uint32_t column_id,
+                       const int64_t snapshot_version,
+                       const uint16_t flags,
+                       const ObString &rowid,
+                       const ObString &payload)
+{
+  int ret = OB_SUCCESS;
+
+  if (OB_UNLIKELY(!is_valid_id(table_id)
+              || !is_valid_id(column_id) || snapshot_version <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "Invalid argument to init ObLobLocator",
+               K(table_id), K(column_id), K(snapshot_version), K(rowid), K(payload));
+  } else {
+    magic_code_ = MAGIC_CODE;
+    version_ = LOB_LOCATOR_VERSION;
+    snapshot_version_ = snapshot_version;
+    table_id_ = table_id;
+    column_id_ = column_id;
+    option_ = 0;
+    flags_ = flags;
+    if (rowid.empty()) {
+      // for old heap table withou rowid
+      set_compat_mode();
+      payload_offset_ = 0;
+    } else {
+      set_inline_mode();
+      payload_offset_ = rowid.length();
+      MEMCPY(data_, rowid.ptr(), rowid.length());
+    }
+    if (OB_NOT_NULL(payload.ptr())) {
+      MEMCPY(data_ + payload_offset_, payload.ptr(), payload.length());
+      payload_size_ = payload.length();
+    } else {
+      payload_size_ = 0;
+    }
+  }
+
+  return ret;
+}
+
+int ObLobLocator::init(const ObString &payload)
+{
+  int ret = OB_SUCCESS;
+  magic_code_ = MAGIC_CODE;
+  version_ = LOB_LOCATOR_VERSION;
+  snapshot_version_ = 0;
+  table_id_ = 0;
+  column_id_ = 0;
+  option_ = 0;
+  flags_ = LOB_DEFAULT_FLAGS;
+  set_compat_mode();
+  payload_offset_ = 0;
+  if (OB_NOT_NULL(payload.ptr())) {
+    MEMCPY(data_ + payload_offset_, payload.ptr(), payload.length());
+    payload_size_ = payload.length();
+  } else {
+    payload_size_ = 0;
+  }
+  return ret;
+}
+
+int ObLobLocator::get_rowid(ObString &rowid) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_valid())) {
+    ret = OB_NOT_INIT;
+    COMMON_LOG(WARN, "ObLobLocator is not init", K(ret), K(*this));
+  } else if (!is_inline_mode()) {
+    ret = OB_NOT_SUPPORTED;
+    COMMON_LOG(WARN, "ObLobLocator with compat mode does not support rowid ", K(ret), K(*this));
+  } else if (payload_offset_ <= 0) {
+    ret = OB_ERR_UNEXPECTED;
+    COMMON_LOG(WARN, "Unexcepted payload offset to get rowid", K(ret), K(*this));
+  } else {
+    rowid = ObString(payload_offset_, data_);
+  }
+  return ret;
+}
+
+int ObLobLocator::get_payload(ObString &payload) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_valid())) {
+    ret = OB_NOT_INIT;
+    COMMON_LOG(WARN, "ObLobLocator is not init", K(ret), K(*this));
+  } else if(payload_size_ > 0) {
+    payload.assign_ptr(data_ + payload_offset_, payload_size_);
+  } else {
+    payload.reset();
+  }
+  return ret;
+}
+
+DEF_TO_STRING(ObLobLocator)
+{
+  int64_t pos = 0;
+  J_OBJ_START();
+  J_KV(K_(magic_code),
+       K_(version),
+       K_(snapshot_version),
+       K_(table_id),
+       K_(column_id),
+       K_(flags),
+       K_(option),
+       K_(payload_offset),
+       K_(payload_size));
+  J_COMMA();
+  if (buf_len > pos && is_valid()) {
+    int64_t max_len = buf_len - pos;
+    ObString payload(MIN(payload_size_, max_len), get_payload_ptr());
+    J_KV("data", payload);
+  } else {
+    J_KV(K_(data));
+  }
+  J_OBJ_END();
+  return pos;
+}
+
+DEF_TO_STRING(ObLobLocatorV2)
+{
+  int64_t pos = 0;
+  uint32_t offset = 0;
+  J_OBJ_START();
+  J_KV(KP_(ptr), K_(size));
+  J_COMMA();
+
+  if (OB_ISNULL(ptr_)) {
+    // do-nothing
+  } else if (is_lob_disk_locator() && size_ >= sizeof(ObLobCommon)) {
+    ObLobCommon *lob_common = reinterpret_cast<ObLobCommon *>(ptr_);
+    J_KV(K(*lob_common));
+    offset += sizeof(ObLobCommon);
+    if (!lob_common->in_row_) {
+      if (buf_len > pos && size_ >= offset + sizeof(ObLobId)) {
+        ObLobId lob_id;
+        if (OB_SUCCESS == lob_id.from_string(ObString(sizeof(ObLobId), ptr_ + offset))) {
+          J_COMMA();
+          J_KV(K(lob_id));
+        }
+        offset += sizeof(ObLobId);
+      }
+
+      if (buf_len > pos && size_ >= offset + sizeof(int64_t)) {
+        int64_t seq_no = 0;
+        MEMCPY(&seq_no, ptr_ + offset, sizeof(seq_no));
+        J_COMMA();
+        J_KV(K(seq_no));
+        offset += sizeof(int64_t);
+      }
+    }
+  } else if (size_ >= MEM_LOB_COMMON_HEADER_LEN) {
+    ObMemLobCommon *mem_lob_common = reinterpret_cast<ObMemLobCommon *>(ptr_);
+    offset += MEM_LOB_COMMON_HEADER_LEN;
+    J_KV(K(mem_lob_common));
+    if (is_valid()) {
+      if (buf_len > pos) {
+        if (mem_lob_common->has_extern() && size_ >= offset + MEM_LOB_EXTERN_HEADER_LEN) {
+          ObMemLobExternHeader *extern_header = reinterpret_cast<ObMemLobExternHeader *>(ptr_ + offset);
+          offset += MEM_LOB_EXTERN_HEADER_LEN;
+          J_COMMA();
+          J_KV(K(*extern_header));
+          if (buf_len > pos && extern_header->has_location_info_
+              && size_ >= offset + MEM_LOB_EXTERN_LOCATIONINFO_LEN) {
+            ObMemLobLocationInfo *location_info = reinterpret_cast<ObMemLobLocationInfo *>(ptr_ + offset);
+            offset += MEM_LOB_EXTERN_LOCATIONINFO_LEN;
+            J_COMMA();
+            J_KV(K(*location_info));
+          }
+          if (buf_len > pos && extern_header->has_retry_info_
+              && size_ >= offset + MEM_LOB_EXTERN_RETRYINFO_LEN) {
+            ObMemLobRetryInfo *retry_info = reinterpret_cast<ObMemLobRetryInfo *>(ptr_ + offset);
+            offset += MEM_LOB_EXTERN_RETRYINFO_LEN;
+            J_COMMA();
+            J_KV(K(*retry_info));
+          }
+          if (buf_len > pos && extern_header->has_read_snapshot_
+              && size_ >= offset + sizeof(ObMemLobReadSnapshot)) {
+            ObMemLobReadSnapshot *read_snapshot = reinterpret_cast<ObMemLobReadSnapshot *>(ptr_ + offset);
+            if (size_ >= offset + sizeof(ObMemLobReadSnapshot) + read_snapshot->size_) {
+              offset += sizeof(ObMemLobReadSnapshot) + read_snapshot->size_;
+              J_COMMA();
+              J_KV(K(*read_snapshot));
+            }
+          }
+          if (buf_len > pos && extern_header->has_row_key_) {
+            ObString rowkey_str(MIN(extern_header->rowkey_size_, buf_len - pos), ptr_ + offset);
+            offset += extern_header->rowkey_size_;
+            J_COMMA();
+            J_KV("rowkey", rowkey_str);
+          }
+        }
+
+        if (buf_len > pos && size_ >= offset + mem_lob_common->disk_locator_size_) {
+          ObString disk_locator(mem_lob_common->disk_locator_size_, ptr_ + offset);
+          offset += mem_lob_common->disk_locator_size_;
+          J_COMMA(); 
+          J_KV("disk_locator", disk_locator);
+        }
+        if (buf_len > pos && mem_lob_common->has_payload()) {
+          ObString payload_str(MIN(size_ - offset, buf_len - pos), ptr_ + offset);
+          J_COMMA();
+          J_KV("payload", payload_str);
+        }
+      }
+    }
+  }
+
+  J_OBJ_END();
+  return pos;
+}
+
+int ObLobLocatorV2::copy(const ObLobLocatorV2* src_locator) const
+{
+  return OB_NOT_IMPLEMENT;
+}
+
+int ObLobLocatorV2:: get_mem_locator(ObMemLobCommon *&mem_loc) const
+{
+  int ret = OB_SUCCESS;
+  mem_loc = get_mem_lob_common();
+  if (OB_ISNULL(mem_loc)) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "failed to get mem lob common", K(ret), KPC(this));
+  }
+  return ret;
+}
+
+int ObLobLocatorV2::get_extern_header(ObMemLobExternHeader *&extern_header) const
+{
+  int ret = OB_SUCCESS;
+  ObMemLobCommon *mem_loc = get_mem_lob_common();
+  if (OB_ISNULL(mem_loc)) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "failed to get mem lob common", K(ret), KPC(this));
+  } else if (!mem_loc->has_extern()) {
+    ret = OB_ERR_NULL_VALUE;
+    COMMON_LOG(WARN, "lob locator does not have extern header", K(ret), KPC(this));
+  } else {
+    extern_header = reinterpret_cast<ObMemLobExternHeader *>(mem_loc->buffer_);
+  }
+  return ret;
+}
+
+int ObLobLocatorV2::get_rowkey(ObString &rowkey_str) const
+{
+  int ret = OB_SUCCESS;
+  ObMemLobExternHeader *extern_header = nullptr;
+  if (OB_FAIL(get_extern_header(extern_header))) {
+    COMMON_LOG(WARN, "failed to get extern header", K(ret), KPC(this));
+  } else if (OB_UNLIKELY(!extern_header->has_row_key_)) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "lob locator does not have row key", K(ret), KPC(this), K(extern_header->has_row_key_));
+  } else {
+    int64_t rowkey_offset = extern_header->body_size_ - extern_header->rowkey_size_;
+    rowkey_str.assign(extern_header->buffer_ + rowkey_offset, extern_header->rowkey_size_);
+  }
+  return ret;
+}
+
+int ObLobLocatorV2::get_disk_locator(ObLobCommon *&disk_loc) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(size_ == 0 || OB_ISNULL(ptr_))) {
+    ret = OB_ERR_NULL_VALUE;
+    COMMON_LOG(WARN, "Lob: try to get disk locator without lob header", K(ret));
+  } else if (is_lob_disk_locator()) {
+    disk_loc = reinterpret_cast<ObLobCommon *>(ptr_);
+  } else {
+    ObMemLobCommon *mem_loc = get_mem_lob_common();
+    if (OB_ISNULL(mem_loc)) {
+      ret = OB_INVALID_ARGUMENT;
+      COMMON_LOG(WARN, "failed to get mem lob common", K(ret), KPC(this));
+    } else if (mem_loc->has_extern()) {
+      char *extern_header = mem_loc->buffer_;
+      disk_loc = reinterpret_cast<ObLobCommon *>(extern_header + sizeof(ObMemLobExternHeader) + reinterpret_cast<ObMemLobExternHeader *>(extern_header)->body_size_);
+    } else {
+      disk_loc = reinterpret_cast<ObLobCommon *>(mem_loc->buffer_);
+    }
+  }
+  return ret;
+}
+
+int ObLobLocatorV2::get_disk_locator(ObString &disc_loc_buff) const
+{
+  int ret = OB_SUCCESS;
+  ObLobCommon *disk_loc = nullptr;
+  if (is_lob_disk_locator()) {
+    disc_loc_buff.assign_ptr(ptr_, size_);
+  } else {
+    ObMemLobCommon *mem_loc = get_mem_lob_common();
+    if (OB_ISNULL(mem_loc)) {
+      ret = OB_INVALID_ARGUMENT;
+      COMMON_LOG(WARN, "failed to get mem lob common", K(ret), KPC(this));
+    } else if (OB_FAIL(get_disk_locator(disk_loc))) {
+      COMMON_LOG(WARN, "failed to get disk locator", K(ret), KPC(this));
+    } else {
+      disc_loc_buff.assign_ptr(reinterpret_cast<const char *>(disk_loc), mem_loc->disk_locator_size_);
+    }
+  }
+  return ret;
+}
+
+int ObLobLocatorV2::get_inrow_data(ObString &inrow_data) const
+{
+  int ret =  OB_SUCCESS;
+  ObString disk_loc_buff;
+  if (size_ == 0) {
+    inrow_data.assign_ptr(ptr_, size_);
+  } else if (OB_ISNULL(ptr_)) {
+    ret = OB_ERR_UNEXPECTED;
+    COMMON_LOG(WARN, "Lob: get null ptr", K(ret), K(size_), K(ptr_));
+  } else if (is_freed()) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "Lob: has been freed", K(ret), KPC(this));
+  } else if (is_append_delta_lob()) {
+    ret = OB_NOT_SUPPORTED;
+    COMMON_LOG(WARN, "APPEND_DELTA_LOB cannot be read as a LOB value",
+               K(ret), KPC(this));
+  } else if (is_lob_disk_locator()) {
+    ObLobCommon *lob_common = reinterpret_cast<ObLobCommon *>(ptr_);
+    if (OB_ISNULL(lob_common) || OB_UNLIKELY(!lob_common->in_row_)) {
+      ret = OB_ERR_UNEXPECTED;
+      COMMON_LOG(WARN, "unexpected null lob common", K(ret), KPC(this));
+    } else {
+      inrow_data.assign_ptr(lob_common->buffer_, size_ - sizeof(ObLobCommon));
+    }
+  } else {
+    ObMemLobCommon *mem_lob_common = reinterpret_cast<ObMemLobCommon *>(ptr_);
+    if (OB_ISNULL(mem_lob_common)) {
+      ret = OB_ERR_UNEXPECTED;
+      COMMON_LOG(WARN, "unexpected null mem lob common", K(ret), KPC(this));
+    } else if (mem_lob_common->lob_common_.in_row_) {
+      ObLobCommon *loc = nullptr;
+      if (OB_FAIL(get_disk_locator(loc))) {
+        COMMON_LOG(WARN, "failed to get disk locator", K(ret), KPC(this));
+      } else {
+        inrow_data.assign_ptr(loc->buffer_, mem_lob_common->disk_locator_size_ - sizeof(ObLobCommon));
+      }
+    } else if (OB_UNLIKELY(!mem_lob_common->has_payload_)) {
+      ret = OB_INVALID_ARGUMENT;
+      COMMON_LOG(WARN, "lob locator does not have payload", K(ret), KPC(this));
+    } else {
+      inrow_data.assign_ptr(ptr_ + mem_lob_common->payload_offset_, mem_lob_common->payload_size_);
+    }
+  }
+
+  return ret;
+}
+
+bool ObLobLocatorV2::is_inrow() const
+{
+  bool bret = false;
+  ObString disk_loc_buff;
+  ObMemLobCommon *loc = reinterpret_cast<ObMemLobCommon *>(ptr_);
+  if (size_ == 0 || OB_ISNULL(ptr_)) {
+    bret = true;
+  } else if (is_lob_disk_locator()) {
+    ObLobCommon *disk_loc = reinterpret_cast<ObLobCommon *>(ptr_);
+    bret = disk_loc->in_row_;
+  } else {
+    // mem locator: check lob_common_.in_row_ on the mem header, not assume inrow
+    ObMemLobCommon *mem_loc = get_mem_lob_common();
+    if (OB_ISNULL(mem_loc)) {
+      bret = false;
+    } else {
+      bret = mem_loc->lob_common_.in_row_;
+    }
+  }
+  return bret;
+}
+
+bool ObLobLocatorV2::is_empty_lob() const
+{
+  int ret =  OB_SUCCESS;
+  bool bret = false;
+  ObString disk_loc_buff;
+  ObMemLobCommon *loc = reinterpret_cast<ObMemLobCommon *>(ptr_);
+  if (size_ == 0 || OB_ISNULL(ptr_)) {
+    bret = (size_ == 0);
+  } else if (!is_lob_disk_locator()) {
+    bret = (size_ - MEM_LOB_COMMON_HEADER_LEN == 0);
+  } else if (OB_FAIL(get_disk_locator(disk_loc_buff))) {
+    COMMON_LOG(WARN, "Lob: get disk locator failed", K(ret));
+  } else {
+    ObLobCommon *disk_loc = reinterpret_cast<ObLobCommon *>(disk_loc_buff.ptr());
+    if (disk_loc->in_row_) {
+      bret = (disk_loc->get_byte_size(disk_loc_buff.length()) == 0);
+    }
+  }
+  return (ret == OB_SUCCESS ? bret : false);
+}
+
+int ObLobLocatorV2::get_append_delta(const ObMemLobExternHeader *&extern_header,
+                                     ObString &data) const
+{
+  int ret = OB_SUCCESS;
+  extern_header = nullptr;
+  data.reset();
+  const ObMemLobCommon *mem_lob = get_mem_lob_common();
+  if (OB_ISNULL(mem_lob) || !is_append_delta_lob() || !mem_lob->has_payload()) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "not an append delta lob", K(ret), KPC(this));
+  } else if (!mem_lob->has_extern()
+             || 0 != mem_lob->disk_locator_size_
+             || mem_lob->lob_common_.in_row_
+             || mem_lob->payload_offset_
+                != sizeof(ObMemLobCommon) + sizeof(ObMemLobExternHeader)
+             || mem_lob->payload_offset_ > size_
+             || mem_lob->payload_size_ != size_ - mem_lob->payload_offset_
+             || mem_lob->payload_size_ > INT32_MAX) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "invalid append delta lob layout", K(ret), KPC(this), KPC(mem_lob));
+  } else {
+    extern_header = reinterpret_cast<const ObMemLobExternHeader *>(mem_lob->buffer_);
+    if (!ObCharset::is_valid_collation(extern_header->cs_type_)
+        || 0 != extern_header->body_size_
+        || extern_header->has_location_info_
+        || extern_header->has_retry_info_
+        || extern_header->has_read_snapshot_
+        || extern_header->has_row_key_
+        || 0 != extern_header->reserved_
+        || 0 != extern_header->rowkey_size_
+        || 0 != extern_header->reserved2_) {
+      ret = OB_INVALID_ARGUMENT;
+      COMMON_LOG(WARN, "invalid append delta extern header", K(ret),
+                 KPC(this), KPC(extern_header));
+      extern_header = nullptr;
+    } else {
+      data.assign_ptr(ptr_ + mem_lob->payload_offset_,
+                      static_cast<ObString::obstr_size_t>(mem_lob->payload_size_));
+    }
+  }
+  return ret;
+}
+
+int ObLobLocatorV2::update_payload_size(ObString &dst, int64_t header_size, bool is_lob_v1)
+{
+  int ret = OB_SUCCESS;
+  if (is_lob_v1) {
+    reinterpret_cast<ObLobLocator *>(dst.ptr())->payload_size_ = dst.length() - header_size;
+  } else {
+    ObLobLocatorV2 lob(dst);
+    if (OB_UNLIKELY(!lob.is_valid())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("got invalid ps lob param", K(dst));
+    } else if (lob.has_inrow_data() && !lob.is_lob_disk_locator()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("not supported", KR(ret), K(lob), K(header_size), K(is_lob_v1));
+    }
+  }
+  return ret;
+}
+
+int ObLobLocatorV2::get_lob_inrow_data_byte_len(int64_t &len) const
+{
+  int ret =  OB_SUCCESS;
+  ObString data;
+  if (size_ == 0 || OB_ISNULL(ptr_)) {
+    len = size_;
+  } else if (OB_UNLIKELY(!has_inrow_data())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), KPC(this));
+  } else if (OB_FAIL(get_inrow_data(data))) {
+    LOG_WARN("failed to get inrow data", KR(ret), KPC(this));
+  } else {
+    len = data.length();
+  }
+  return ret;
+}
+
+int ObLobLocatorV2::get_location_info(ObMemLobLocationInfo *&location_info) const
+{
+  int ret =  OB_SUCCESS;
+  ObMemLobExternHeader *extern_header = nullptr;
+  location_info = nullptr;
+  if (OB_FAIL(get_extern_header(extern_header))) {
+    COMMON_LOG(WARN, "failed to get extern header", K(ret), KPC(this));
+  } else if (!extern_header->has_location_info_) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "lob locator does not have location info", K(ret), KPC(this));
+  } else {
+    location_info = reinterpret_cast<ObMemLobLocationInfo *>(extern_header->buffer_);
+  } 
+  return ret;
+}
+
+int ObLobLocatorV2::get_retry_info(ObMemLobRetryInfo *&retry_info) const
+{
+  int ret =  OB_SUCCESS;
+  ObMemLobExternHeader *extern_header = nullptr;
+  if (OB_FAIL(get_extern_header(extern_header))) {
+    COMMON_LOG(WARN, "failed to get extern header", K(ret), KPC(this));
+  } else if (!extern_header->has_retry_info_) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "lob locator does not have retry info", K(ret), KPC(this));
+  } else {
+    char *cur_ptr = extern_header->buffer_;
+    if (extern_header->has_location_info_) {
+      cur_ptr += sizeof(ObMemLobLocationInfo);
+    }
+    retry_info = reinterpret_cast<ObMemLobRetryInfo *>(cur_ptr);
+  }
+  return ret;
+}
+
+int ObLobLocatorV2::get_read_snapshot_data(ObString &read_snapshot_data) const
+{
+  int ret = OB_SUCCESS;
+  ObMemLobExternHeader *extern_header = nullptr;
+  read_snapshot_data.reset();
+  if (OB_FAIL(get_extern_header(extern_header))) {
+    COMMON_LOG(WARN, "failed to get extern header", K(ret), KPC(this));
+  } else if (!extern_header->has_read_snapshot_) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "lob locator does not have read snapshot", K(ret), KPC(this));
+  } else {
+    char *cur_ptr = extern_header->buffer_;
+    if (extern_header->has_location_info_) {
+      cur_ptr += sizeof(ObMemLobLocationInfo);
+    }
+    if (extern_header->has_retry_info_) {
+      cur_ptr += sizeof(ObMemLobRetryInfo);
+    }
+    ObMemLobReadSnapshot *read_snapshot = reinterpret_cast<ObMemLobReadSnapshot *>(cur_ptr);
+    if (read_snapshot->size_ > 0) {
+      read_snapshot_data.assign_ptr(read_snapshot->buffer_, read_snapshot->size_);
+    }
+  }
+  return ret;
+}
+
+int ObLobLocatorV2::get_real_locator_len(int64_t &real_len) const
+{
+  return OB_NOT_SUPPORTED;
+}
+
+int ObLobLocatorV2::get_chunk_size(int64_t &chunk_size) const
+{
+  return OB_NOT_SUPPORTED;
+}
+
+OB_DEF_SERIALIZE(ObLobLocatorV2)
+{
+  int ret = OB_SUCCESS;
+  const int64_t serialize_size = get_serialize_size_();
+  if (OB_ISNULL(buf) || OB_UNLIKELY(pos < 0 || pos > buf_len)) {
+    ret = OB_INVALID_ARGUMENT;
+    LIB_LOG(WARN, "invalid argument", KR(ret), KP(buf), K(pos), K(buf_len));
+  } else if (OB_UNLIKELY(serialize_size > buf_len - pos)) {
+    ret = OB_SIZE_OVERFLOW;
+    LIB_LOG(WARN, "size overflow", KR(ret), K(serialize_size), K(size_), "remain", buf_len - pos);
+  } else if (OB_FAIL(common::serialization::encode_i32(buf, buf_len, pos, size_))) {
+    LIB_LOG(WARN, "failed to serialize size_", KR(ret), K(size_));
+  } else {
+    MEMCPY(buf + pos, ptr_, size_);
+    pos += size_;
+  }
+  return ret;
+}
+
+OB_DEF_DESERIALIZE(ObLobLocatorV2)
+{
+  int ret = OB_SUCCESS;
+  const int64_t MINIMAL_NEEDED_SIZE = sizeof(size_);
+  int64_t tmp_pos = pos;
+  int32_t size = 0;
+  if (OB_ISNULL(buf) || OB_UNLIKELY(pos < 0 || data_len - pos < MINIMAL_NEEDED_SIZE)) {
+    ret = OB_INVALID_ARGUMENT;
+    LIB_LOG(WARN, "invalid argument", KR(ret), KP(buf), K(data_len), K(pos));
+  } else if (OB_FAIL(common::serialization::decode_i32(buf, data_len, tmp_pos, &size))) {
+    LIB_LOG(WARN, "failed to decode size", KR(ret));
+  } else if (OB_UNLIKELY(size < 0 || data_len - tmp_pos < size)) {
+    ret = OB_DESERIALIZE_ERROR;
+    LIB_LOG(WARN, "failed to decode lob locator", KR(ret), K(size), "remain", data_len - tmp_pos, K(pos));
+  } else {
+    size_ = size;
+    ptr_ = const_cast<char*>(buf + tmp_pos);
+    tmp_pos += size;
+    pos = tmp_pos;
+  }
+  return ret;
+}
+
+OB_DEF_SERIALIZE_SIZE(ObLobLocatorV2)
+{
+  return size_ + sizeof(size_);
+}
+
+ObDocId::ObDocId()
+  : tablet_id_(ObTabletID::INVALID_TABLET_ID),
+    seq_id_(0)
+{
+  static_assert(sizeof(ObDocId) == OB_DOC_ID_COLUMN_BYTE_LENGTH, "size of ObDocId isn't equal to OB_DOC_ID_COLUMN_BYTE_LENGTH");
+}
+
+ObDocId::ObDocId(const uint64_t tablet_id, const uint64_t seq_id)
+  : tablet_id_(tablet_id),
+    seq_id_(seq_id)
+{
+  static_assert(sizeof(ObDocId) == OB_DOC_ID_COLUMN_BYTE_LENGTH, "size of ObDocId isn't equal to OB_DOC_ID_COLUMN_BYTE_LENGTH");
+}
+
+bool ObDocId::operator==(const ObDocId &other) const
+{
+  return tablet_id_ == other.tablet_id_ && seq_id_ == other.seq_id_;
+}
+
+bool ObDocId::operator!=(const ObDocId &other) const
+{
+  return !(operator==(other));
+}
+
+bool ObDocId::operator <(const ObDocId &other) const
+{
+  bool bool_ret = false;
+
+  if (tablet_id_ < other.tablet_id_) {
+    bool_ret= true;
+  } else if (tablet_id_ > other.tablet_id_) {
+    bool_ret = false;
+  } else if (seq_id_ < other.seq_id_) {
+    bool_ret= true;
+  } else if (seq_id_ > other.seq_id_) {
+    bool_ret = false;
+  }
+
+  return bool_ret;
+}
+
+bool ObDocId::operator >(const ObDocId &other) const
+{
+  bool bool_ret = false;
+
+  if (tablet_id_ < other.tablet_id_) {
+    bool_ret = false;
+  } else if (tablet_id_ > other.tablet_id_) {
+    bool_ret= true;
+  } else if (seq_id_ < other.seq_id_) {
+    bool_ret = false;
+  } else if (seq_id_ > other.seq_id_) {
+    bool_ret= true;
+  }
+
+  return bool_ret;
+
+}
+
+void ObDocId::reset()
+{
+  tablet_id_ = ObTabletID::INVALID_TABLET_ID;
+  seq_id_ = 0;
+}
+
+bool ObDocId::is_valid() const
+{
+  return ObTabletID(tablet_id_).is_valid() && seq_id_ > 0;
+}
+
+int ObDocId::hash(uint64_t &hash_val) const
+{
+  hash_val = murmurhash(&tablet_id_, sizeof(seq_id_), OB_DOC_ID_HASH);
+  hash_val = murmurhash(&seq_id_, sizeof(seq_id_), hash_val);
+  return common::OB_SUCCESS;
+}
+
+ObString ObDocId::get_string() const
+{
+  return ObString(OB_DOC_ID_COLUMN_BYTE_LENGTH, reinterpret_cast<const char *>(this));
+}
+
+int ObDocId::from_string(const ObString &doc_id)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(doc_id.ptr()) || OB_UNLIKELY(doc_id.length() < OB_DOC_ID_COLUMN_BYTE_LENGTH)) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "invalid document id", K(ret));
+  } else {
+    const ObDocId *doc_id_ptr = reinterpret_cast<const ObDocId *>(doc_id.ptr());
+    tablet_id_ = doc_id_ptr->tablet_id_;
+    seq_id_ = doc_id_ptr->seq_id_;
+  }
+  return ret;
+}
+
+ObCenterId::ObCenterId()
+  : tablet_id_(ObTabletID::INVALID_TABLET_ID),
+    center_id_(-1)
+{
+  static_assert(sizeof(ObCenterId) == OB_DOC_ID_COLUMN_BYTE_LENGTH, "size of ObCenterId isn't equal to OB_DOC_ID_COLUMN_BYTE_LENGTH");
+}
+
+ObCenterId::ObCenterId(const uint64_t tablet_id, const uint64_t center_id)
+  : tablet_id_(tablet_id),
+    center_id_(center_id)
+{
+  static_assert(sizeof(ObCenterId) == OB_DOC_ID_COLUMN_BYTE_LENGTH, "size of ObCenterId isn't equal to OB_DOC_ID_COLUMN_BYTE_LENGTH");
+}
+
+bool ObCenterId::operator==(const ObCenterId &other) const
+{
+  return tablet_id_ == other.tablet_id_ && center_id_ == other.center_id_;
+}
+
+bool ObCenterId::operator!=(const ObCenterId &other) const
+{
+  return !(operator==(other));
+}
+
+bool ObCenterId::operator <(const ObCenterId &other) const
+{
+  bool bool_ret = false;
+
+  if (tablet_id_ < other.tablet_id_) {
+    bool_ret= true;
+  } else if (tablet_id_ > other.tablet_id_) {
+    bool_ret = false;
+  } else if (center_id_ < other.center_id_) {
+    bool_ret= true;
+  } else if (center_id_ > other.center_id_) {
+    bool_ret = false;
+  }
+
+  return bool_ret;
+}
+
+bool ObCenterId::operator >(const ObCenterId &other) const
+{
+  bool bool_ret = false;
+
+  if (tablet_id_ < other.tablet_id_) {
+    bool_ret = false;
+  } else if (tablet_id_ > other.tablet_id_) {
+    bool_ret= true;
+  } else if (center_id_ < other.center_id_) {
+    bool_ret = false;
+  } else if (center_id_ > other.center_id_) {
+    bool_ret= true;
+  }
+
+  return bool_ret;
+
+}
+
+void ObCenterId::reset()
+{
+  tablet_id_ = ObTabletID::INVALID_TABLET_ID;
+  center_id_ = -1;
+}
+
+bool ObCenterId::is_valid() const
+{
+  return ObTabletID(tablet_id_).is_valid() && center_id_ >= 0;
+}
+
+ObHiddenClusteringKey::ObHiddenClusteringKey()
+  : tablet_id_(ObTabletID::INVALID_TABLET_ID),
+    seq_id_(0)
+{
+  static_assert(sizeof(ObHiddenClusteringKey) == OB_CLUSTER_BY_TABLE_HIDDEN_PK_BYTE_LENGTH, 
+                "size of ObHiddenClusteringKey isn't equal to OB_CLUSTER_BY_TABLE_HIDDEN_PK_BYTE_LENGTH");
+}
+
+ObHiddenClusteringKey::ObHiddenClusteringKey(const uint64_t tablet_id, const uint64_t seq_id)
+  : tablet_id_(tablet_id),
+    seq_id_(seq_id)
+{
+  static_assert(sizeof(ObHiddenClusteringKey) == OB_CLUSTER_BY_TABLE_HIDDEN_PK_BYTE_LENGTH,
+                "size of ObHiddenClusteringKey isn't equal to OB_CLUSTER_BY_TABLE_HIDDEN_PK_BYTE_LENGTH");
+}
+
+bool ObHiddenClusteringKey::operator==(const ObHiddenClusteringKey &other) const
+{
+  return tablet_id_ == other.tablet_id_ && seq_id_ == other.seq_id_;
+}
+
+bool ObHiddenClusteringKey::operator!=(const ObHiddenClusteringKey &other) const
+{
+  return !(operator==(other));
+}
+
+bool ObHiddenClusteringKey::operator <(const ObHiddenClusteringKey &other) const
+{
+  bool bool_ret = false;
+
+  if (tablet_id_ < other.tablet_id_) {
+    bool_ret= true;
+  } else if (tablet_id_ > other.tablet_id_) {
+    bool_ret = false;
+  } else if (seq_id_ < other.seq_id_) {
+    bool_ret= true;
+  } else if (seq_id_ > other.seq_id_) {
+    bool_ret = false;
+  }
+
+  return bool_ret;
+}
+
+bool ObHiddenClusteringKey::operator >(const ObHiddenClusteringKey &other) const
+{
+  bool bool_ret = false;
+
+  if (tablet_id_ < other.tablet_id_) {
+    bool_ret = false;
+  } else if (tablet_id_ > other.tablet_id_) {
+    bool_ret= true;
+  } else if (seq_id_ < other.seq_id_) {
+    bool_ret = false;
+  } else if (seq_id_ > other.seq_id_) {
+    bool_ret= true;
+  }
+
+  return bool_ret;
+
+}
+
+void ObHiddenClusteringKey::reset()
+{
+  tablet_id_ = ObTabletID::INVALID_TABLET_ID;
+  seq_id_ = 0;
+}
+
+bool ObHiddenClusteringKey::is_valid() const
+{
+  return ObTabletID(tablet_id_).is_valid() && seq_id_ > 0;
+}
+int ObHiddenClusteringKey::set_hidden_clustering_key_to_string(const ObHiddenClusteringKey &hidden_clustering_key, 
+                                                              ObString &str)
+{
+  int ret = OB_SUCCESS;
+  if (!hidden_clustering_key.is_valid() || OB_CLUSTER_BY_TABLE_HIDDEN_PK_BYTE_LENGTH != str.size()) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "invalid hidden clustering key or string", KR(ret), K(hidden_clustering_key), K(str));
+  } else {
+    ObHiddenClusteringKey tmp;
+    tmp.tablet_id_ = hidden_clustering_key.tablet_id_;
+    tmp.seq_id_ = htonll(hidden_clustering_key.seq_id_);
+    if (OB_CLUSTER_BY_TABLE_HIDDEN_PK_BYTE_LENGTH != str.write(reinterpret_cast<const char *>(&tmp), OB_CLUSTER_BY_TABLE_HIDDEN_PK_BYTE_LENGTH)) {
+      ret = OB_ERR_UNEXPECTED;
+      COMMON_LOG(WARN, "failed write data to string", KR(ret), K(hidden_clustering_key), K(str));
+    }
+  }
+  return ret;
+}
+
+ObPqCenterId::ObPqCenterId()
+  : tablet_id_(ObTabletID::INVALID_TABLET_ID),
+    m_id_(0),
+    center_id_(-1)
+{
+  static_assert(sizeof(ObPqCenterId) == OB_DOC_ID_COLUMN_BYTE_LENGTH, "size of ObPqCenterId isn't equal to OB_DOC_ID_COLUMN_BYTE_LENGTH");
+}
+
+ObPqCenterId::ObPqCenterId(const uint64_t tablet_id, const uint32_t m_id, const uint32_t center_id)
+  : tablet_id_(tablet_id),
+    m_id_(m_id),
+    center_id_(center_id)
+{
+  static_assert(sizeof(ObPqCenterId) == OB_DOC_ID_COLUMN_BYTE_LENGTH, "size of ObPqCenterId isn't equal to OB_DOC_ID_COLUMN_BYTE_LENGTH");
+}
+
+bool ObPqCenterId::operator==(const ObPqCenterId &other) const
+{
+  return tablet_id_ == other.tablet_id_ && center_id_ == other.center_id_ && m_id_ == other.m_id_;
+}
+
+bool ObPqCenterId::operator!=(const ObPqCenterId &other) const
+{
+  return !(operator==(other));
+}
+
+bool ObPqCenterId::operator <(const ObPqCenterId &other) const
+{
+  bool bool_ret = false;
+
+  if (tablet_id_ < other.tablet_id_) {
+    bool_ret= true;
+  } else if (tablet_id_ > other.tablet_id_) {
+    bool_ret = false;
+  } else if (m_id_ < other.m_id_) {
+    bool_ret= true;
+  } else if (m_id_ > other.m_id_) {
+    bool_ret = false;
+  } else if (center_id_ < other.center_id_) {
+    bool_ret= true;
+  } else if (center_id_ > other.center_id_) {
+    bool_ret = false;
+  }
+
+  return bool_ret;
+}
+
+bool ObPqCenterId::operator >(const ObPqCenterId &other) const
+{
+  bool bool_ret = false;
+
+  if (tablet_id_ < other.tablet_id_) {
+    bool_ret = false;
+  } else if (tablet_id_ > other.tablet_id_) {
+    bool_ret= true;
+  } else if (m_id_ < other.m_id_) {
+    bool_ret = false;
+  } else if (m_id_ > other.m_id_) {
+    bool_ret= true;
+  } else if (center_id_ < other.center_id_) {
+    bool_ret = false;
+  } else if (center_id_ > other.center_id_) {
+    bool_ret= true;
+  }
+
+  return bool_ret;
+
+}
+
+void ObPqCenterId::reset()
+{
+  tablet_id_ = ObTabletID::INVALID_TABLET_ID;
+  m_id_ = 0;
+  center_id_ = -1;
+}
+
+bool ObPqCenterId::is_valid() const
+{
+  return ObTabletID(tablet_id_).is_valid() && center_id_ >= 0 && m_id_ > 0;
+}
+
+#define PRINT_META()
+//#define PRINT_META() BUF_PRINTO(obj.get_meta()); J_COLON();
+
+const char *ObObj::MIN_OBJECT_VALUE_STR       = "__OB__MIN__";
+const char *ObObj::MAX_OBJECT_VALUE_STR       = "__OB__MAX__";
+const char *ObObj::NOP_VALUE_STR = "__OB__NOP__";
+const char OB_JSON_NULL[2] = {'\0', '\0'}; // binary json null
+
+OB_SERIALIZE_MEMBER(ObDataType, meta_, accuracy_, is_zero_fill_);
+OB_SERIALIZE_MEMBER(ObEnumSetInnerValue, numberic_value_, string_value_);
+
+DEFINE_SERIALIZE(ObObjMeta)
+{
+  int ret = OB_SUCCESS;
+  OB_UNIS_ENCODE(type_);
+  OB_UNIS_ENCODE(cs_level_);
+  OB_UNIS_ENCODE(cs_type_);
+  OB_UNIS_ENCODE(scale_);
+  return ret;
+}
+
+DEFINE_DESERIALIZE(ObObjMeta)
+{
+  int ret = OB_SUCCESS;
+  OB_UNIS_DECODE(type_);
+  OB_UNIS_DECODE(cs_level_);
+  OB_UNIS_DECODE(cs_type_);
+  OB_UNIS_DECODE(scale_);
+  return ret;
+}
+
+DEFINE_GET_SERIALIZE_SIZE(ObObjMeta)
+{
+  int64_t len = 0;
+  OB_UNIS_ADD_LEN(type_);
+  OB_UNIS_ADD_LEN(cs_level_);
+  OB_UNIS_ADD_LEN(cs_type_);
+  OB_UNIS_ADD_LEN(scale_);
+  return len;
+}
+
+////////////////////////////////////////////////////////////////
+
+bool ObObj::is_zero() const
+{
+  bool ret = is_numeric_type() || is_interval_ym() || is_interval_ds();
+  if (ret) {
+    // float/double comparison using "==" or "!=" matches MySQL
+    // and Oracle doesn't support raw float/double
+    switch(meta_.get_type()) {
+      case ObTinyIntType:
+        // fall through
+      case ObSmallIntType:
+        // fall through
+      case ObMediumIntType:
+        // fall through
+      case ObInt32Type:
+        // fall through
+      case ObIntType:
+        ret = (0 == v_.int64_);
+        break;
+      case ObUTinyIntType:
+        // fall through
+      case ObUSmallIntType:
+        // fall through
+      case ObUMediumIntType:
+        // fall through
+      case ObUInt32Type:
+        // fall through
+      case ObUInt64Type:
+        ret = (0 == v_.uint64_);
+        break;
+      //Please do not bother yourself too much to take +0 and -0 into consideration
+      //According to the IEEE754 standard, +0 equals to -0
+      //https://en.wikipedia.org/wiki/Signed_zero
+      case ObFloatType:
+        ret = (0 == v_.float_);
+        break;
+      case ObDoubleType:
+        ret = (0 == v_.double_);
+        break;
+      case ObUFloatType:
+        ret = (0 == v_.float_);
+        break;
+      case ObUDoubleType:
+        ret = (0 == v_.double_);
+        break;
+      case ObNumberType:
+        // fall through
+      case ObUNumberType:
+      case ObNumberFloatType: {
+        ret = is_zero_number();
+        break;
+      }
+      case ObBitType: {
+        ret = (0 == v_.uint64_);
+        break;
+      }
+      case ObIntervalDSType : {
+        ret = (0 == v_.nsecond_ && 0 == interval_fractional_);
+        break;
+      }
+      case ObIntervalYMType : {
+        ret = (0 == v_.nmonth_);
+        break;
+      }
+      case ObDecimalIntType: {
+        ret = is_zero_decimalint();
+        break;
+      }
+      default:
+        BACKTRACE(ERROR, true, "unexpected numeric type=%u", meta_.get_type());
+        right_to_die_or_duty_to_live();
+    }
+  }
+  return ret;
+}
+
+int ObObj::build_not_strict_default_value(
+    int16_t precision,
+    const ObCollationType string_cs_type,
+    bool is_collection_vector_type)
+{
+  int ret = OB_SUCCESS;
+  const ObObjType &data_type = meta_.get_type();
+  switch(data_type) {
+    case ObTinyIntType:
+      set_tinyint(0);
+      break;
+    case ObSmallIntType:
+      set_smallint(0);
+      break;
+    case ObMediumIntType:
+      set_mediumint(0);
+      break;
+    case ObInt32Type:
+      set_int32(0);
+      break;
+    case ObIntType:
+      set_int(0);
+      break;
+    case ObUTinyIntType:
+      set_utinyint(0);
+      break;
+    case ObUSmallIntType:
+      set_usmallint(0);
+      break;
+    case ObUMediumIntType:
+      set_umediumint(0);
+      break;
+    case ObUInt32Type:
+      set_uint32(0);
+      break;
+    case ObUInt64Type:
+      set_uint64(0);
+      break;
+    case ObFloatType:
+      set_float(0);
+      break;
+    case ObDoubleType:
+      set_double(0);
+      break;
+    case ObUFloatType:
+      set_ufloat(0);
+      break;
+    case ObUDoubleType:
+      set_udouble(0);
+      break;
+    case ObNumberType: {
+      number::ObNumber zero;
+      zero.set_zero();
+      set_number(zero);
+      break;
+    }
+    case ObUNumberType: {
+      number::ObNumber zero;
+      zero.set_zero();
+      set_unumber(zero);
+      break;
+    }
+    case ObDateTimeType:
+      set_datetime(ObTimeConverter::ZERO_DATETIME);
+      break;
+    case ObTimestampType:
+      set_timestamp(ObTimeConverter::ZERO_DATETIME);
+      break;
+    case ObDateType:
+      set_date(ObTimeConverter::ZERO_DATE);
+      break;
+    case ObTimeType:
+      set_time(0);
+      break;
+    case ObYearType:
+      set_year(0);
+      break;
+    case ObVarcharType: {
+        ObString null_str;
+        set_varchar(null_str);
+      }
+      break;
+    case ObCharType: {
+        ObString null_str;
+        set_char(null_str);
+      }
+      break;
+    case ObTinyTextType:
+    case ObTextType:
+    case ObMediumTextType:
+    case ObLongTextType:
+    case ObGeometryType:{
+        ObString null_str;
+        set_string(data_type, null_str);
+      }
+      break;
+    case ObCollectionSQLType:{
+        // For array/map/sparsevector types, the raw_binary format starts with a
+        // 4-byte uint32_t length_ field. An empty string is illegal because
+        // init() requires raw_data.length() >= sizeof(length_). So we must
+        // provide at least 4 bytes of zeros ("\x00\x00\x00\x00") to represent
+        // an empty collection with length_ = 0.
+        // For vector type, the raw_binary does NOT contain a length_ prefix
+        // (data length is inferred from total bytes), so an empty string is
+        // valid and represents an empty vector.
+        if (is_collection_vector_type) {
+          ObString null_str;
+          set_string(data_type, null_str);
+        } else {
+          ObString empty_arr = ObString(4, "\x00\x00\x00\x00");
+          set_string(data_type, empty_arr);
+        }
+      }
+      break;
+    case ObRoaringBitmapType:{
+        // empty string is illegal in roaringbitmap, 0x01000 corresponding to an empty roaringbitmap
+        ObString empty_str = ObString(2, "\x01\x00");
+        set_string(data_type, empty_str);
+      }
+      break;
+    case ObJsonType: {
+        set_json_value(data_type, OB_JSON_NULL, 2);
+      }
+      break;
+    case ObBitType:
+      set_bit(0);
+      break;
+    case ObEnumType:
+      set_enum(1);
+      break;
+    case ObSetType:
+      set_set(0);
+      break;
+    case ObTimestampTZType:
+    case ObTimestampLTZType:
+    case ObTimestampNanoType: {
+      set_otimestamp_null(data_type);
+      break;
+    }
+    case ObRawType: {
+        ObString null_str;
+        set_raw(null_str);
+      break;
+    }
+    case ObIntervalYMType: {
+      const ObIntervalYMValue empty_value;
+      set_interval_ym(empty_value);
+      break;
+    }
+    case ObIntervalDSType: {
+      const ObIntervalDSValue empty_value;
+      set_interval_ds(empty_value);
+      break;
+    }
+    case ObNumberFloatType: {
+      number::ObNumber zero;
+      zero.set_zero();
+      set_number_float(zero);
+      break;
+    }
+    case ObURowIDType: {
+      ObURowIDData urowid_data;
+      set_urowid(urowid_data);
+      break;
+    }
+    case ObDecimalIntType: {
+      const ObDecimalInt *decint = nullptr;
+      int32_t int_bytes = 0;
+      if (OB_FAIL(wide::ObDecimalIntConstValue::get_zero_value_byte_precision(precision, decint,
+                                                                              int_bytes))) {
+        _OB_LOG(WARN, "get zero value failed, ret=%u", ret);
+      } else {
+        set_decimal_int(int_bytes, 0, const_cast<ObDecimalInt *>(decint));
+      }
+      break;
+    }
+    case ObMySQLDateType:
+      set_mysql_date(ObTimeConverter::MYSQL_ZERO_DATE);
+      break;
+    case ObMySQLDateTimeType:
+      set_mysql_datetime(ObTimeConverter::MYSQL_ZERO_DATETIME);
+      break;
+    default:
+      ret = OB_INVALID_ARGUMENT;
+      _OB_LOG(WARN, "unexpected data type=%u", data_type);
+  }
+  if (OB_FAIL(ret)) {
+  } else if (is_string_type()) {
+    set_collation_level(CS_LEVEL_IMPLICIT);
+    set_collation_type(string_cs_type);
+  }
+  return ret;
+}
+
+int ObObj::deep_copy(const ObObj &src, char *buf, const int64_t size, int64_t &pos)
+{
+  int ret = OB_SUCCESS;
+  if (ob_is_string_type(src.get_type()) || ob_is_json(src.get_type()) || ob_is_geometry(src.get_type()) || ob_is_roaringbitmap(src.get_type())) {
+    ObString src_str = src.get_string();
+    if (OB_UNLIKELY(size < (pos + src_str.length()))) {
+      ret = OB_BUF_NOT_ENOUGH;
+    } else {
+      MEMCPY(buf + pos, src_str.ptr(), src_str.length());
+      *this = src;
+      this->set_string(src.get_type(), buf + pos, src_str.length());
+      // set_string lose orign cs_level
+      if (CS_LEVEL_INVALID != src.get_collation_level()) {
+        this->set_collation_level(src.get_collation_level());
+      }
+      pos += src_str.length();
+    }
+  } else if (ob_is_raw(src.get_type())) {
+    const ObString &src_str = src.get_string();
+    if (OB_UNLIKELY(size < (pos + src_str.length()))) {
+      ret = OB_BUF_NOT_ENOUGH;
+    } else {
+      MEMCPY(buf + pos, src_str.ptr(), src_str.length());
+      *this = src;
+      this->set_raw(buf + pos, src_str.length());
+      pos += src_str.length();
+    }
+  } else if (ob_is_number_tc(src.get_type())) {
+    const int64_t number_size =  src.get_number_byte_length();
+    if (OB_UNLIKELY(size < (int64_t)(pos + number_size))) {
+      ret = OB_BUF_NOT_ENOUGH;
+    } else {
+      MEMCPY(buf + pos, src.get_number_digits(), number_size);
+      *this = src;
+      this->set_number(src.get_type(), src.get_number_desc(), (uint32_t *)(buf + pos));
+      pos += number_size;
+    }
+  } else if (ob_is_rowid_tc(src.get_type())) {
+    if (OB_UNLIKELY(size < (int64_t)(pos + src.get_string_len()))) {
+      ret = OB_BUF_NOT_ENOUGH;
+    } else {
+      MEMCPY(buf + pos, src.get_string_ptr(), src.get_string_len());
+      *this = src;
+      this->set_urowid(buf + pos, src.get_string_len());
+      pos += src.get_string_len();
+    }
+  } else if (ob_is_lob_locator(src.get_type())) {
+    if (OB_UNLIKELY(size < (pos + src.get_val_len()))) {
+      ret = OB_BUF_NOT_ENOUGH;
+    } else {
+      // copy all the value
+      MEMCPY(buf + pos, src.get_string_ptr(), src.get_val_len());
+      *this = src;
+      ObLobLocator *res = reinterpret_cast<ObLobLocator *>((buf + pos));
+      this->set_lob_locator(*res);
+      pos += src.get_val_len();
+    }
+  } else if (ob_is_user_defined_sql_type(src.get_type())
+             || ob_is_collection_sql_type(src.get_type())) {
+    ObString src_str = src.get_string();
+    if (OB_UNLIKELY(size < (pos + src_str.length()))) {
+      ret = OB_BUF_NOT_ENOUGH;
+    } else {
+      MEMCPY(buf + pos, src_str.ptr(), src_str.length());
+      *this = src; // meta copied
+      this->set_udt_value(buf + pos, src_str.length());
+      pos += src_str.length();
+    }
+  } else if (ob_is_decimal_int_tc(src.get_type())) {
+    if (OB_UNLIKELY(size < (pos + src.get_val_len()))) {
+      ret = OB_BUF_NOT_ENOUGH;
+    } else {
+      MEMCPY(buf + pos, src.get_decimal_int(), src.get_val_len());
+      *this = src;
+      this->set_decimal_int(src.get_val_len(), src.get_scale(),
+                            reinterpret_cast<ObDecimalInt *>(buf + pos));
+      pos += src.get_val_len();
+    }
+  } else {
+    *this = src;
+  }
+  return ret;
+}
+
+void* ObObj::get_deep_copy_obj_ptr()
+{
+  void * ptr = NULL;
+  if (ob_is_string_type(this->get_type())
+      || ob_is_json(this->get_type())
+      || ob_is_geometry(this->get_type())
+      || ob_is_roaringbitmap(this->get_type())
+      || ob_is_user_defined_sql_type(this->get_type())
+      || ob_is_collection_sql_type(this->get_type())) {
+    // val_len_ == 0 is empty string, and it may point to unexpected address
+    // Therefore, reset it to NULL
+    if (val_len_ != 0) {
+      ptr = (void *)v_.string_;
+    }
+  } else if (ob_is_raw(this->get_type())) {
+    if (val_len_ != 0) {
+      ptr = (void *)v_.string_;
+    }
+  } else if (ob_is_number_tc(this->get_type())
+            && 0 != nmb_desc_.len_
+            && NULL != v_.nmb_digits_) {
+    ptr = (void *)v_.nmb_digits_;
+  } else if (ob_is_rowid_tc(this->get_type())) {
+    if (val_len_ != 0) {
+      ptr = (void *)v_.string_;
+    }
+  } else if (ob_is_lob_locator(this->get_type())) {
+    ptr = (void *)v_.lob_locator_;
+  } else if (ob_is_decimal_int_tc(this->get_type()) && 0 != val_len_ && NULL != v_.decimal_int_) {
+    ptr =  (void *)v_.decimal_int_;
+  } else {
+    // do nothing
+  }
+  return ptr;
+}
+
+bool ObObj::can_compare(const ObObj &other) const
+{
+  obj_cmp_func cmp_func = NULL;
+  return (is_min_value()
+          || is_max_value()
+          || other.is_min_value()
+          || other.is_max_value()
+          || ObObjCmpFuncs::can_cmp_without_cast(get_meta(),
+                                                 other.get_meta(),
+                                                 CO_CMP,
+                                                 cmp_func));
+}
+
+int ObObj::check_collation_free_and_compare(const ObObj &other, int &cmp) const
+{
+  int ret = OB_SUCCESS;
+  cmp = 0;
+  if (CS_TYPE_COLLATION_FREE != get_collation_type() &&
+      CS_TYPE_COLLATION_FREE != other.get_collation_type()) {
+    ret = compare(other, CS_TYPE_INVALID, cmp);
+  } else if (is_null() || other.is_null() || is_min_value() || is_max_value() || other.is_min_value() || other.is_max_value()) {
+    ret = ObObjCmpFuncs::compare(*this, other, CS_TYPE_INVALID, cmp);
+  } else if (OB_UNLIKELY(get_collation_type() != other.get_collation_type())
+             || CS_TYPE_COLLATION_FREE != get_collation_type()
+             || get_type() != other.get_type()
+             || !is_character_type()) {
+    LOG_ERROR("unexpected error, invalid argument", K(*this), K(other));
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    // 只用于sortkey转换后的Obj比较
+    const int32_t lhs_len = get_val_len();
+    const int32_t rhs_len = other.get_val_len();
+    const int32_t cmp_len = std::min(lhs_len, rhs_len);
+    const bool is_oracle = lib::is_oracle_mode();
+    bool need_skip_tail_space = false;
+    cmp = memcmp(get_string_ptr(), other.get_string_ptr(), cmp_len);
+    if (is_oracle) {
+      if (0 == cmp) {
+        // 如果两个字符串只有尾部空格不同，在oracle varchar模式下，认为字符串是不同的
+        if (!is_varying_len_char_type()) {
+          // 如果两个字符串只有尾部空格不同，在oracle char模式下，认为字符串是相同的
+          need_skip_tail_space = true;
+        } else if (lhs_len != cmp_len || rhs_len != cmp_len) {
+          cmp = lhs_len > cmp_len ? 1 : -1;
+        }
+      }
+    } else if (0 == cmp && (lhs_len != cmp_len || rhs_len != cmp_len)) {
+      // m如果两个字符串只有尾部空格不同，在mysql模式下，认为字符串是相同的
+      need_skip_tail_space = true;
+    }
+    if (need_skip_tail_space) {
+      bool has_non_space = false;
+      const int32_t left_len = (lhs_len > cmp_len) ? lhs_len - cmp_len : rhs_len - cmp_len;
+      const char *ptr = (lhs_len > cmp_len) ? get_string_ptr() : other.get_string_ptr();
+      const unsigned char *uptr = reinterpret_cast<const unsigned char *>(ptr);
+      int32_t i = 0;
+      uptr += cmp_len;
+      // varchar或char有长度限制，不可能超过int32_t
+      for (; i < left_len; ++i) {
+        if (*(uptr + i) != ' ') {
+          has_non_space = true;
+          break;
+        }
+      }
+      if (has_non_space) {
+        // mysql特殊行为：a\1 < a，但ab > a
+        if (*(uptr + i) < ' ') {
+          cmp = lhs_len > cmp_len ? -1 : 1;
+        } else {
+          cmp = lhs_len > cmp_len ? 1 : -1;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// TODO by fengshuo.fs: remove this function
+int ObObj::check_collation_free_and_compare(const ObObj &other) const
+{
+  int cmp = 0;
+  if (CS_TYPE_COLLATION_FREE != get_collation_type() &&
+      CS_TYPE_COLLATION_FREE != other.get_collation_type()) {
+    cmp = compare(other, CS_TYPE_INVALID);
+  } else if (is_null() || other.is_null() || is_min_value() || is_max_value() || other.is_min_value() || other.is_max_value()) {
+    cmp = ObObjCmpFuncs::compare_nullsafe(*this, other, CS_TYPE_INVALID);
+  } else if (OB_UNLIKELY(get_collation_type() != other.get_collation_type())
+      || CS_TYPE_COLLATION_FREE != get_collation_type()
+      || get_type() != other.get_type()
+      || !is_character_type()) {
+    LOG_ERROR_RET(common::OB_ERR_UNEXPECTED, "unexpected error, invalid argument", K(*this), K(other));
+    right_to_die_or_duty_to_live();
+  } else {
+    // 只用于sortkey转换后的Obj比较
+    const int32_t lhs_len = get_val_len();
+    const int32_t rhs_len = other.get_val_len();
+    const int32_t cmp_len = std::min(lhs_len, rhs_len);
+    const bool is_oracle = lib::is_oracle_mode();
+    bool need_skip_tail_space = false;
+    cmp = memcmp(get_string_ptr(), other.get_string_ptr(), cmp_len);
+    if (is_oracle) {
+      if (0 == cmp) {
+        // 如果两个字符串只有尾部空格不同，在oracle varchar模式下，认为字符串是不同的
+        if (!is_varying_len_char_type()) {
+          // 如果两个字符串只有尾部空格不同，在oracle char模式下，认为字符串是相同的
+          need_skip_tail_space = true;
+        } else if (lhs_len != cmp_len || rhs_len != cmp_len) {
+          cmp = lhs_len > cmp_len ? 1 : -1;
+        }
+      }
+    } else if (0 == cmp && (lhs_len != cmp_len || rhs_len != cmp_len)) {
+      // m如果两个字符串只有尾部空格不同，在mysql模式下，认为字符串是相同的
+      need_skip_tail_space = true;
+    }
+    if (need_skip_tail_space) {
+      bool has_non_space = false;
+      const int32_t left_len = (lhs_len > cmp_len) ? lhs_len - cmp_len : rhs_len - cmp_len;
+      const char *ptr = (lhs_len > cmp_len) ? get_string_ptr() : other.get_string_ptr();
+      const unsigned char *uptr = reinterpret_cast<const unsigned char *>(ptr);
+      int32_t i = 0;
+      uptr += cmp_len;
+      // varchar或char有长度限制，不可能超过int32_t
+      for (; i < left_len; ++i) {
+        if (*(uptr + i) != ' ') {
+          has_non_space = true;
+          break;
+        }
+      }
+      if (has_non_space) {
+        // mysql特殊行为：a\1 < a，但ab > a
+        if (*(uptr + i) < ' ') {
+          cmp = lhs_len > cmp_len ? -1 : 1;
+        } else {
+          cmp = lhs_len > cmp_len ? 1 : -1;
+        }
+      }
+    }
+  }
+  return cmp;
+}
+
+/*
+ * ATTENTION:
+ *
+ * that_obj MUST have same type with this obj (*this)
+ */
+
+int ObObj::compare(const ObObj &other, int &cmp) const
+{
+  return ObObjCmpFuncs::compare(*this, other, CS_TYPE_INVALID, cmp);
+}
+
+// TODO by fengshuo.fs: remove this function
+int ObObj::compare(const ObObj &other) const
+{
+  return ObObjCmpFuncs::compare_nullsafe(*this, other, CS_TYPE_INVALID);
+}
+
+int ObObj::compare(const ObObj &other, ObCollationType cs_type, int &cmp) const
+{
+  return ObObjCmpFuncs::compare(*this, other, cs_type, cmp);
+}
+
+// TODO by fengshuo.fs: remove this function
+int ObObj::compare(const ObObj &other, ObCollationType cs_type/*COLLATION_TYPE_MAX*/) const
+{
+  return ObObjCmpFuncs::compare_nullsafe(*this, other, cs_type);
+}
+
+int ObObj::compare(const ObObj &other, ObCompareCtx &cmp_ctx, int &cmp) const
+{
+  return ObObjCmpFuncs::compare(*this, other, cmp_ctx, cmp);
+}
+
+// TODO by fengshuo.fs: remove this function
+int ObObj::compare(const ObObj &other, ObCompareCtx &cmp_ctx) const
+{
+  return ObObjCmpFuncs::compare_nullsafe(*this, other, cmp_ctx);
+}
+
+int ObObj::compare(const ObObj &other, ObCollationType cs_type, const ObCmpNullPos null_pos) const
+{
+  ObCompareCtx cmp_ctx(ObMaxType, cs_type, true, INVALID_TZ_OFF, null_pos);
+  return ObObjCmpFuncs::compare_nullsafe(*this, other, cmp_ctx);
+}
+
+int ObObj::equal(const ObObj &other, bool &is_equal) const
+{
+  return ObObjCmpFuncs::compare_oper(*this, other, CS_TYPE_INVALID, CO_EQ, is_equal);
+}
+/*
+ * ATTENTION:
+ *
+ * that_obj MUST have same type with this obj (*this)
+ */
+bool ObObj::is_equal(const ObObj &other) const
+{
+  return ObObjCmpFuncs::compare_oper_nullsafe(*this, other, CS_TYPE_INVALID, CO_EQ);
+}
+
+int ObObj::equal(const ObObj &other, ObCollationType cs_type, bool &is_equal) const
+{
+  return ObObjCmpFuncs::compare_oper(*this, other, cs_type, CO_EQ, is_equal);
+}
+/*
+ * ATTENTION:
+ *
+ * that_obj MUST have same type with this obj (*this)
+ */
+bool ObObj::is_equal(const ObObj &other, ObCollationType cs_type) const
+{
+  return ObObjCmpFuncs::compare_oper_nullsafe(*this, other, cs_type, CO_EQ);
+}
+
+/*
+ * ATTENTION:
+ *
+ * that_obj MUST have same type with this obj (*this)
+ */
+bool ObObj::operator<(const ObObj &other) const
+{
+  return ObObjCmpFuncs::compare_oper_nullsafe(*this, other, CS_TYPE_INVALID, CO_LT);
+}
+
+/*
+ * ATTENTION:
+ *
+ * that_obj MUST have same type with this obj (*this)
+ */
+bool ObObj::operator>(const ObObj &other) const
+{
+  return ObObjCmpFuncs::compare_oper_nullsafe(*this, other, CS_TYPE_INVALID, CO_GT);
+}
+
+/*
+ * ATTENTION:
+ *
+ * that_obj MUST have same type with this obj (*this)
+ */
+bool ObObj::operator>=(const ObObj &other) const
+{
+  return ObObjCmpFuncs::compare_oper_nullsafe(*this, other, CS_TYPE_INVALID, CO_GE);
+}
+
+/*
+ * ATTENTION:
+ *
+ * that_obj MUST have same type with this obj (*this)
+ */
+bool ObObj::operator<=(const ObObj &other) const
+{
+  return ObObjCmpFuncs::compare_oper_nullsafe(*this, other, CS_TYPE_INVALID, CO_LE);
+}
+
+/*
+ * ATTENTION:
+ *
+ * that_obj MUST have same type with this obj (*this)
+ */
+bool ObObj::operator==(const ObObj &other) const
+{
+  return ObObjCmpFuncs::compare_oper_nullsafe(*this, other, CS_TYPE_INVALID, CO_EQ);
+}
+
+/*
+ * ATTENTION:
+ *
+ * that_obj MUST have same type with this obj (*this)
+ */
+bool ObObj::operator!=(const ObObj &other) const
+{
+  return ObObjCmpFuncs::compare_oper_nullsafe(*this, other, CS_TYPE_INVALID, CO_NE);
+}
+
+int ObObj::apply(const ObObj &mutation)
+{
+  int ret = OB_SUCCESS;
+  int org_type = get_type();
+  int mut_type = mutation.get_type();
+  if (OB_UNLIKELY(ObMaxType <= mut_type
+                  || (ObExtendType != org_type
+                      && ObNullType != org_type
+                      && ObExtendType != mut_type
+                      && ObNullType != mut_type
+                      && org_type != mut_type
+                      && !(ObLongTextType == org_type && ObLobType == mut_type)
+                      && !(ObJsonType == org_type && ObLobType == mut_type)
+                      && !(ObGeometryType == org_type && ObLobType == mut_type)
+                      && !(ObRoaringBitmapType == org_type && ObLobType == mut_type)))) {
+    _OB_LOG(WARN, "type not coincident or invalid type[this->type:%d,mutation.type:%d]",
+              org_type, mut_type);
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    switch (mut_type) {
+      case ObNullType:
+        set_null();
+        break;
+      case ObExtendType: {
+        int64_t org_ext = get_ext();
+        switch (mutation.get_ext()) {
+          case ObActionFlag::OP_DEL_ROW:
+          case ObActionFlag::OP_DEL_TABLE:
+            /// used for join, if right row was deleted, set the cell to null
+            set_null();
+            break;
+          case ObActionFlag::OP_ROW_DOES_NOT_EXIST:
+            /// do nothing
+            break;
+          case ObActionFlag::OP_NOP:
+            if (org_ext == ObActionFlag::OP_ROW_DOES_NOT_EXIST
+                || org_ext == ObActionFlag::OP_DEL_ROW) {
+              set_null();
+            }
+            break;
+          default:
+            ret = OB_INVALID_ARGUMENT;
+            _OB_LOG(ERROR, "unsupported ext value [value:%ld]", mutation.get_ext());
+            break;
+        }  // end switch
+        break;
+      }
+      default:
+        *this = mutation;
+        break;
+    }  // end switch
+  }
+  return ret;
+}
+
+int (*oceanbase::common::serialize_composite_callback)(const ObObj&, char*, const int64_t, int64_t&) = NULL;
+int (*oceanbase::common::deserialize_composite_callback)(ObObj&, const char*, const int64_t, int64_t&) = NULL;
+int64_t (*oceanbase::common::composite_serialize_size_callback)(const ObObj&) = NULL;
+
+#define DEF_FUNC_ENTRY(OBJTYPE)                 \
+  {                                             \
+      obj_print_sql<OBJTYPE>,                   \
+      obj_print_str<OBJTYPE>,                   \
+      obj_print_plain_str<OBJTYPE>,             \
+      obj_print_json<OBJTYPE>,                  \
+      obj_crc64<OBJTYPE>,                       \
+      obj_crc64_v2<OBJTYPE>,                    \
+      obj_batch_checksum<OBJTYPE>,              \
+      obj_murmurhash<OBJTYPE>,                  \
+      ObjHashCalculator<OBJTYPE, ObDefaultHash, ObObj>::calc_hash_value,  \
+      obj_val_serialize<OBJTYPE>,               \
+      obj_val_deserialize<OBJTYPE>,             \
+      obj_val_get_serialize_size<OBJTYPE>,      \
+      ObjHashCalculator<OBJTYPE, ObWyHash, ObObj>::calc_hash_value,  \
+      obj_crc64_v3<OBJTYPE>,                    \
+      ObjHashCalculator<OBJTYPE, ObXxHash, ObObj>::calc_hash_value,  \
+      ObjHashCalculator<OBJTYPE, ObMurmurHash, ObObj>::calc_hash_value,  \
+      ObjHashCalculator<OBJTYPE, ObMurmurHash3_x86_32, ObObj>::calc_hash_value,  \
+  }
+
+ObObjTypeFuncs OBJ_FUNCS[ObMaxType] =
+{
+  DEF_FUNC_ENTRY(ObNullType),       // 0
+  DEF_FUNC_ENTRY(ObTinyIntType),    // 1
+  DEF_FUNC_ENTRY(ObSmallIntType),   // 2
+  DEF_FUNC_ENTRY(ObMediumIntType),  // 3
+  DEF_FUNC_ENTRY(ObInt32Type),      // 4
+  DEF_FUNC_ENTRY(ObIntType),        // 5
+  DEF_FUNC_ENTRY(ObUTinyIntType),   // 6
+  DEF_FUNC_ENTRY(ObUSmallIntType),  // 7
+  DEF_FUNC_ENTRY(ObUMediumIntType), // 8
+  DEF_FUNC_ENTRY(ObUInt32Type),     // 9
+  DEF_FUNC_ENTRY(ObUInt64Type),     // 10
+  DEF_FUNC_ENTRY(ObFloatType),      // 11
+  DEF_FUNC_ENTRY(ObDoubleType),     // 12
+  DEF_FUNC_ENTRY(ObUFloatType),     // 13
+  DEF_FUNC_ENTRY(ObUDoubleType),    // 14
+  DEF_FUNC_ENTRY(ObNumberType),     // 15
+  DEF_FUNC_ENTRY(ObUNumberType),    // 16: unumber is the same as number
+  DEF_FUNC_ENTRY(ObDateTimeType),   // 17
+  DEF_FUNC_ENTRY(ObTimestampType),  // 18
+  DEF_FUNC_ENTRY(ObDateType),       // 19
+  DEF_FUNC_ENTRY(ObTimeType),       // 20
+  DEF_FUNC_ENTRY(ObYearType),       // 21
+  DEF_FUNC_ENTRY(ObVarcharType),    // 22, varchar
+  DEF_FUNC_ENTRY(ObCharType),       // 23, char
+  DEF_FUNC_ENTRY(ObHexStringType),  // 24, hex_string
+  DEF_FUNC_ENTRY(ObExtendType),     // 25, ext
+  DEF_FUNC_ENTRY(ObUnknownType),    // 26, unknown
+  DEF_FUNC_ENTRY(ObTinyTextType),   // 27, tiny_text
+  DEF_FUNC_ENTRY(ObTextType),       // 28, text
+  DEF_FUNC_ENTRY(ObMediumTextType), // 29, medium_text
+  DEF_FUNC_ENTRY(ObLongTextType),   // 30, longtext
+  DEF_FUNC_ENTRY(ObBitType),        // 31, bit
+  DEF_FUNC_ENTRY(ObEnumType),       // 32, enum
+  DEF_FUNC_ENTRY(ObSetType),        // 33, set
+  DEF_FUNC_ENTRY(ObEnumInnerType),  // 34, enum
+  DEF_FUNC_ENTRY(ObSetInnerType),   // 35, set
+  DEF_FUNC_ENTRY(ObTimestampTZType), // 36, timestamp with time zone
+  DEF_FUNC_ENTRY(ObTimestampLTZType), // 37, timestamp with local time zone
+  DEF_FUNC_ENTRY(ObTimestampNanoType), // 38, timestamp (9)
+  DEF_FUNC_ENTRY(ObRawType),           // 39, timestamp (9)
+  DEF_FUNC_ENTRY(ObIntervalYMType),    // 40, interval year to month
+  DEF_FUNC_ENTRY(ObIntervalDSType),    // 41, interval day to second
+  DEF_FUNC_ENTRY(ObNumberFloatType),   // 42, number float
+  DEF_FUNC_ENTRY(ObNVarchar2Type),     // 43, nvarchar2
+  DEF_FUNC_ENTRY(ObNCharType),         // 44, nchar
+  DEF_FUNC_ENTRY(ObURowIDType),        // 45, urowid
+  DEF_FUNC_ENTRY(ObLobType),           // 46, lob
+  DEF_FUNC_ENTRY(ObJsonType),          // 47, json
+  DEF_FUNC_ENTRY(ObGeometryType),      // 48, geometry TODO!!!!!
+  DEF_FUNC_ENTRY(ObUserDefinedSQLType),// 49, udt
+  DEF_FUNC_ENTRY(ObDecimalIntType),    // 50, decimal int
+  DEF_FUNC_ENTRY(ObCollectionSQLType), // 51, collection
+  DEF_FUNC_ENTRY(ObMySQLDateType),     // 52, mysql date
+  DEF_FUNC_ENTRY(ObMySQLDateTimeType), // 53, mysql datetime
+  DEF_FUNC_ENTRY(ObRoaringBitmapType), // 54, roaringbitmap
+
+};
+
+ob_obj_hash ObObjUtil::get_murmurhash_v3(ObObjType type)
+{
+  return OBJ_FUNCS[type].murmurhash_v3;
+}
+
+ob_obj_hash ObObjUtil::get_murmurhash_v2(ObObjType type)
+{
+  return OBJ_FUNCS[type].murmurhash_v2;
+}
+
+ob_obj_hash ObObjUtil::get_wyhash(ObObjType type)
+{
+  return OBJ_FUNCS[type].wyhash;
+}
+
+ob_obj_crc64_v3 ObObjUtil::get_crc64_v3(ObObjType type)
+{
+  return ::OBJ_FUNCS[type].crc64_v3;
+}
+
+ob_obj_hash ObObjUtil::get_xxhash64(ObObjType type)
+{
+  return ::OBJ_FUNCS[type].xxhash64;
+}
+
+int ObObj::print_sql_literal(char *buffer, int64_t length, int64_t &pos, const ObObjPrintParams &params) const
+{
+  return OBJ_FUNCS[meta_.get_type()].print_sql(*this, buffer, length, pos, params);
+}
+
+int ObObj::print_sql_literal(char *&buffer, int64_t &length,
+                             int64_t &pos, ObIAllocator &alloc,
+                             const ObObjPrintParams &params) const
+{
+  int ret = OB_SUCCESS;
+  int64_t saved_pos = pos;
+  while (OB_SUCC(ret) && pos == saved_pos) {
+    if (OB_FAIL(OBJ_FUNCS[meta_.get_type()].print_sql(*this, buffer, length, pos, params))) {
+      if (OB_SIZE_OVERFLOW == ret) {
+        ret = OB_SUCCESS;
+        if (OB_FAIL(multiple_extend_buf(buffer, length, alloc))) {
+          LOG_WARN("failed to auto extend stmt buf", K(ret));
+        } else {
+          pos = saved_pos;
+        }
+      } else {
+        LOG_WARN("failed to print sql", K(ret));
+      }
+    } else {
+      break;
+    }
+  }
+  return ret;
+}
+
+//used for show create table default value
+//for example:
+// `a` int(11) NOT NULL DEFAULT '0'  (with '')
+//always with ''
+int ObObj::print_varchar_literal(char *buffer, int64_t length, int64_t &pos, const ObObjPrintParams &params) const
+{
+  return OBJ_FUNCS[meta_.get_type()].print_str(*this, buffer, length, pos, params);
+}
+
+int ObObj::print_varchar_literal(char *&buffer, int64_t &length,
+                                 int64_t &pos, ObIAllocator &alloc,
+                                 const ObObjPrintParams &params) const
+{
+  int ret = OB_SUCCESS;
+  int64_t saved_pos = pos;
+  while (OB_SUCC(ret) && pos == saved_pos) {
+    if (OB_FAIL(OBJ_FUNCS[meta_.get_type()].print_str(*this, buffer, length, pos, params))) {
+      if (OB_SIZE_OVERFLOW == ret) {
+        ret = OB_SUCCESS;
+        if (OB_FAIL(multiple_extend_buf(buffer, length, alloc))) {
+          LOG_WARN("failed to auto extend stmt buf", K(ret));
+        } else {
+          pos = saved_pos;
+        }
+      } else {
+        LOG_WARN("failed to print str", K(ret));
+      }
+    } else {
+      break;
+    }
+  }
+  return ret;
+}
+
+int ObObj::print_plain_str_literal(char *buffer, int64_t length, int64_t &pos, const ObObjPrintParams &params) const
+{
+  return OBJ_FUNCS[meta_.get_type()].print_plain_str(*this, buffer, length, pos, params);
+}
+
+void ObObj::print_str_with_repeat(char *buf, int64_t buf_len, int64_t &pos) const
+{
+  const char *str_ptr = v_.string_;
+  int32_t real_len = val_len_;
+  ObString data;
+  if (is_lob_storage()) {
+    data = get_text_print_string(buf_len - pos);
+    str_ptr = data.ptr();
+    real_len = data.length();
+  }
+  const unsigned char *uptr = reinterpret_cast<const unsigned char*>(str_ptr);
+  int32_t repeats = 0;
+  int8_t cnt_space = 0;//There is no space for whole multibyte character, then add trailing spaces.
+  if (NULL != uptr && real_len > 0) {
+    while (real_len > 0 && ' ' == uptr[real_len - 1]) {
+      --real_len;
+      ++cnt_space;
+    }
+    // for utf-8 character set, pad BFBFEF as the tailing characters in a loop
+    while (real_len - 2 > 0 && 0xBF == uptr[real_len - 1]  && 0xBF == uptr[real_len - 2]  && 0xEF == uptr[real_len - 3]) {
+      real_len -= 3;
+      ++repeats;
+    }
+  }
+  if (0 == repeats) {
+    real_len = is_lob_storage() ? data.length() : val_len_;
+  }
+  BUF_PRINTO(ObString(0, real_len, str_ptr));
+  if (repeats > 0) {
+    BUF_PRINTF(" \'<%X%X%X><repeat %d times>\' ", uptr[real_len], uptr[real_len + 1], uptr[real_len + 2], repeats);
+    //There is no space for whole multibyte character, then add trailing spaces.
+    if (1 == cnt_space) {
+      BUF_PRINTO(" ");
+    } else if (2 == cnt_space) {
+      BUF_PRINTO("  ");
+    }
+  }
+}
+
+int ObObj::print_smart(char *buf, int64_t buf_len, int64_t &pos) const
+{
+  int ret = OB_SUCCESS;
+  if (get_type() < ObMaxType && get_type() >= ObNullType) {
+    ObObjPrintParams params;
+    bool can_print = true;
+    if (OB_ISNULL(buf) || OB_UNLIKELY(buf_len <=0)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (!(meta_.is_string_or_lob_locator_type() && ObHexStringType != meta_.get_type())
+               && (!meta_.is_json()) && (!meta_.is_geometry()) && (!meta_.is_roaringbitmap())) {
+      ret = OBJ_FUNCS[meta_.get_type()].print_json(*this, buf, buf_len, pos, params);
+    } else if (OB_FAIL(is_printable(get_string_ptr(), get_string_len(), can_print))) {
+    } else if (can_print) {
+      ret = OBJ_FUNCS[meta_.get_type()].print_json(*this, buf, buf_len, pos, params);
+    } else {
+      J_OBJ_START();
+      PRINT_META();
+      BUF_PRINTO(ob_obj_type_str(get_type()));
+      J_COLON();
+      if (OB_FAIL(obj_print_sql<ObHexStringType>(*this, buf, buf_len, pos, params))) {
+      } else {
+        J_COMMA();
+        J_KV(N_COLLATION, ObCharset::collation_name(get_collation_type()));
+        J_OBJ_END();
+      }
+    }
+  }
+  return ret;
+}
+
+int ObObj::print_format(char *buf, int64_t buf_len, int64_t &pos) const
+{
+  int ret = OB_SUCCESS;
+  if (get_type() < ObMaxType && get_type() >= ObNullType) {
+    ObObjPrintParams params;
+    bool can_print = true;
+    if (OB_ISNULL(buf) || OB_UNLIKELY(buf_len <=0)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (!(meta_.is_string_type() && ObHexStringType != meta_.get_type())) {
+      ret = OBJ_FUNCS[meta_.get_type()].print_sql(*this, buf, buf_len, pos, params);
+    } else if (OB_FAIL(is_printable(get_string_ptr(), get_string_len(), can_print))) {
+    } else if (can_print) {
+      ret = OBJ_FUNCS[meta_.get_type()].print_sql(*this, buf, buf_len, pos, params);
+    } else {
+      ret = obj_print_sql<ObHexStringType>(*this, buf, buf_len, pos, params);
+    }
+  }
+  return ret;
+}
+
+void ObObj::print_range_value(char *buf, int64_t buf_len, int64_t &pos) const
+{
+  if (is_string_type()) {
+    J_OBJ_START();
+    BUF_PRINTO(ob_obj_type_str(this->get_type()));
+    J_COLON();
+    //for Unicode character set
+    print_str_with_repeat(buf, buf_len, pos);
+    J_COMMA();
+    J_KV(N_COLLATION, ObCharset::collation_name(this->get_collation_type()));
+    J_OBJ_END();
+  } else {
+    (void)databuff_print_obj(buf, buf_len, pos, *this);
+  }
+}
+
+int64_t ObObj::to_string(char *buf, const int64_t buf_len, const ObObjPrintParams &params) const
+{
+  int64_t pos = 0;
+  if (get_type() < ObMaxType && get_type() >= ObNullType) {
+    (void)OBJ_FUNCS[meta_.get_type()].print_json(*this, buf, buf_len, pos, params);
+  }
+  return pos;
+}
+
+bool ObObj::check_collation_integrity() const
+{
+  bool is_ok = true;
+#ifndef NDEBUG
+  if (ObNullType == get_type()) {
+    // ignore null
+    //is_ok = (CS_TYPE_BINARY == get_collation_type() && CS_LEVEL_IGNORABLE == get_collation_level());
+  } else if (ob_is_numeric_type(get_type()) || ob_is_temporal_type(get_type())){
+    is_ok = (CS_TYPE_BINARY == get_collation_type() && CS_LEVEL_NUMERIC == get_collation_level());
+  } else {
+    // ignore: varchar, char, binary, varbinary, unknown, ext
+  }
+  if (!is_ok) {
+    if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+      ObCStringHelper helper;
+      BACKTRACE_RET(WARN, true, common::OB_ERR_UNEXPECTED, "unexpected collation type: %s", helper.convert(get_meta()));
+    }
+  }
+#endif
+  return is_ok;
+}
+
+int ObObj::hash_v1(uint64_t &res, uint64_t seed) const
+{
+  check_collation_integrity();
+  return OBJ_FUNCS[meta_.get_type()].murmurhash(*this, seed, res);
+}
+
+int ObObj::hash(uint64_t &res) const
+{
+  return hash(res, 0);
+}
+
+int ObObj::hash(uint64_t &res, uint64_t seed) const
+{
+  check_collation_integrity();
+  return OBJ_FUNCS[meta_.get_type()].murmurhash_v2(*this, seed, res);
+}
+
+int ObObj::hash_murmur(uint64_t &res, uint64_t seed) const
+{
+  check_collation_integrity();
+  return OBJ_FUNCS[meta_.get_type()].murmurhash_v3(*this, seed, res);
+}
+
+int ObObj::hash_wy(uint64_t &res, uint64_t seed) const
+{
+  check_collation_integrity();
+  return OBJ_FUNCS[meta_.get_type()].wyhash(*this, seed, res);
+}
+
+int ObObj::hash_xx(uint64_t &res, uint64_t seed) const
+{
+  check_collation_integrity();
+  return OBJ_FUNCS[meta_.get_type()].xxhash64(*this, seed, res);
+}
+
+int ObObj::hash_murmur3_x86_32(uint64_t &res, uint64_t seed) const
+{
+  check_collation_integrity();
+  return OBJ_FUNCS[meta_.get_type()].murmurhash3_x86_32(*this, seed, res);
+}
+
+int64_t ObObj::checksum(const int64_t current) const
+{
+  check_collation_integrity();
+  return OBJ_FUNCS[meta_.get_type()].crc64(*this, current);
+}
+
+int64_t ObObj::checksum_v2(const int64_t current) const
+{
+  check_collation_integrity();
+  return OBJ_FUNCS[meta_.get_type()].crc64_v2(*this, current);
+}
+
+void ObObj::checksum(ObBatchChecksum &bc) const
+{
+  check_collation_integrity();
+  OBJ_FUNCS[meta_.get_type()].batch_checksum(*this, bc);
+}
+
+void ObObj::dump(const int32_t log_level /*= OB_LOG_LEVEL_DEBUG*/) const
+{
+  ObCStringHelper helper;
+  const char *ptr = helper.convert(*this);
+  _OB_NUM_LEVEL_LOG(log_level, 0, "%s", nullptr != ptr ? ptr : "NULL");
+}
+
+int ObObj::print_varchar_literal(const ObIArray<ObString> &type_infos, char *buffer, int64_t length, int64_t &pos) const
+{
+  int ret = OB_SUCCESS;
+  ObSqlString str_val;
+  if (OB_UNLIKELY(!meta_.is_enum_or_set())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected obj type", KPC(this), K(ret));
+  } else if (is_enum()) {
+    if (OB_FAIL(get_enum_str_val(str_val, type_infos))) {
+      LOG_WARN("fail to get enum str val", K(str_val), K(type_infos), K(ret));
+    }
+  } else {
+    if (OB_FAIL(get_set_str_val(str_val, type_infos))) {
+      LOG_WARN("fail to get set str val", K(str_val), K(type_infos), K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && databuff_printf(buffer, length, pos, "'%.*s'",
+                                      static_cast<int32_t>(str_val.length()), str_val.ptr())) {
+    LOG_WARN("fail to print string", KP(buffer), K(length), K(pos), K(str_val), K(ret));
+  }
+  return ret;
+}
+
+int ObObj::print_plain_str_literal(const ObIArray<ObString> &type_infos, char *buffer, int64_t length, int64_t &pos) const
+{
+  int ret = OB_SUCCESS;
+  ObSqlString str_val;
+  if (OB_UNLIKELY(!meta_.is_enum_or_set())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected obj type", KPC(this), K(ret));
+  } else if (is_enum()) {
+    if (OB_FAIL(get_enum_str_val(str_val, type_infos))) {
+      LOG_WARN("fail to get enum str val", K(str_val), K(type_infos), K(ret));
+    }
+  } else {
+    if (OB_FAIL(get_set_str_val(str_val, type_infos))) {
+      LOG_WARN("fail to get set str val", K(str_val), K(type_infos), K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && databuff_printf(buffer, length, pos, "%.*s",
+                                      static_cast<int32_t>(str_val.length()), str_val.ptr())) {
+    LOG_WARN("fail to print string", KP(buffer), K(length), K(pos), K(str_val), K(ret));
+  }
+  return ret;
+}
+
+int ObObj::get_enum_str_val(ObSqlString &str_val, const ObIArray<ObString> &type_infos) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!meta_.is_enum())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected type", KPC(this), K(ret));
+  } else {
+    uint64_t val = get_enum();
+    if (OB_UNLIKELY(val > type_infos.count())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected obj value", K(type_infos), KPC(this), K(ret));
+    } else if (0 == val) {
+      if (OB_FAIL(str_val.append(ObString("")))) {
+        LOG_WARN("fail to append string", K(str_val), K(ret));
+      }
+    } else {
+      const ObString &type_info = type_infos.at(val - 1);//enum value start from 1
+      if (OB_FAIL(str_val.append(type_info))) {
+        LOG_WARN("fail to append string", K(str_val), K(type_info), K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObObj::get_set_str_val(ObSqlString &str_val, const ObIArray<ObString> &type_infos) const
+{
+ int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!meta_.is_set())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected type", KPC(this), K(ret));
+  } else {
+    uint64_t val = get_set();
+    int64_t type_info_cnt = type_infos.count();
+    if (OB_UNLIKELY(type_info_cnt > 64 || type_info_cnt <= 0)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected type infos", K(type_infos), K(ret));
+    } else if (OB_UNLIKELY(type_info_cnt < 64
+                           && (val > ((1ULL << type_info_cnt) - 1)))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected obj value", K(val), K(type_infos), K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < type_info_cnt; ++i) {
+      if (val & (1ULL << i)) {
+        if (OB_FAIL(str_val.append(type_infos.at(i)))) {
+          LOG_WARN("fail to append string", K(str_val), K(type_infos.at(i)), K(ret));
+        } else if (OB_FAIL(str_val.append(","))) {
+          LOG_WARN("fail to print string", K(str_val), K(ret));
+        }
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (val != 0 && OB_FAIL(str_val.set_length(str_val.length() - 1))) {//remove last comma
+      LOG_WARN("fail to str length", K(str_val), K(ret));
+    }
+  }
+  return ret;
+}
+
+// 当租户模式为 mysql 时，返回 char 的字符长度
+// 当租户模式为 oracle 时，如果 char 的 len 类型为 char，返回 char 的字符长度
+// 当租户模式为 oracle 时，如果 char 的 len 类型为 byte，返回 char 的字节长度
+int ObObj::get_char_length(const ObAccuracy accuracy, int32_t &char_len, bool is_oracle_mode) const
+{
+  int ret = OB_SUCCESS;
+
+  if (!is_fixed_len_char_type()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("type must be char", K(get_type()));
+  } else {
+    if (is_oracle_byte_length(is_oracle_mode, accuracy.get_length_semantics())) {
+      // get byte length
+      char_len = static_cast<int32_t>(get_val_len());
+    } else {
+      // get char length
+      char_len = static_cast<int32_t>(ObCharset::strlen_char(
+                 get_collation_type(), get_string_ptr(), get_val_len()));
+    }
+  }
+
+  return ret;
+}
+
+int ObObj::convert_string_value_charset(ObCharsetType charset_type, ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  ObString str;
+  if (OB_FAIL(get_string(str))) {
+    LOG_WARN("Failed to get payload from string", K(ret), K(*this));
+  } else if (ObCharset::is_valid_charset(charset_type) && CHARSET_BINARY != charset_type) {
+    ObCollationType collation_type = ObCharset::get_default_collation(charset_type);
+    const ObCharsetInfo *from_charset_info = ObCharset::get_charset(get_collation_type());
+    const ObCharsetInfo *to_charset_info = ObCharset::get_charset(collation_type);
+    if (OB_ISNULL(from_charset_info) || OB_ISNULL(to_charset_info)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("charsetinfo is null", K(ret), K(get_collation_type()), K(collation_type));
+    } else if (CS_TYPE_INVALID == get_collation_type() || CS_TYPE_INVALID == collation_type) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid collation", K(get_collation_type()), K(collation_type), K(ret));
+    } else if (CS_TYPE_BINARY != get_collation_type() && CS_TYPE_BINARY != collation_type
+        && strcmp(from_charset_info->csname, to_charset_info->csname) != 0) {
+      char *buf = NULL;
+      int32_t buf_len = str.length() * ObCharset::CharConvertFactorNum;
+      uint32_t result_len = 0;
+      if (0 == buf_len) {
+        //do noting
+      } else if (OB_UNLIKELY(NULL == (buf = static_cast<char *>(
+                allocator.alloc(buf_len))))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("alloc memory failed", K(ret), K(buf_len));
+      } else {
+        ret = ObCharset::charset_convert(get_collation_type(), str.ptr(),
+            str.length(),collation_type, buf, buf_len, result_len);
+        if (OB_SUCCESS != ret) {
+          int32_t str_offset = 0;
+          int64_t buf_offset = 0;
+          ObString question_mark = ObCharsetUtils::get_const_str(collation_type, '?');
+          while (str_offset < str.length() && buf_offset + question_mark.length() <= buf_len) {
+            int64_t offset = ObCharset::charpos(get_collation_type(),
+                                                str.ptr() + str_offset,
+                                                str.length() - str_offset,
+                                                1);
+            ret = ObCharset::charset_convert(get_collation_type(),
+                                              str.ptr() + str_offset,
+                                              offset,
+                                              collation_type,
+                                              buf + buf_offset,
+                                              buf_len - buf_offset,
+                                              result_len);
+            str_offset += offset;
+            if (OB_SUCCESS == ret) {
+              buf_offset += result_len;
+            } else {
+              MEMCPY(buf + buf_offset, question_mark.ptr(), question_mark.length());
+              buf_offset += question_mark.length();
+            }
+          }
+          if (str_offset < str.length()) {
+            ret = OB_SIZE_OVERFLOW;
+            LOG_WARN("size overflow", K(ret), K(str), KPHEX(str.ptr(), str.length()));
+          } else {
+            result_len = buf_offset;
+            ret = OB_SUCCESS;
+            LOG_WARN("charset convert failed", K(ret),
+                K(get_collation_type()), K(collation_type));
+          }
+        }
+        if (OB_SUCC(ret)) {
+          set_string(get_type(), buf, static_cast<int32_t>(result_len));
+          set_collation_type(collation_type);
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObObj::get_real_param_count(int64_t &count) const
+{
+  int ret = OB_SUCCESS;
+  count = 1;
+  if (ObExtendType == meta_.get_type()) {
+    const ObSqlArrayObj *array_obj = NULL;
+    if (OB_ISNULL(array_obj = reinterpret_cast<const ObSqlArrayObj*>(v_.ext_))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected nullptr", K(ret), K(v_.ext_));
+    } else if (array_obj->count_ < 0) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected group_idx", K(ret), K(array_obj->count_));
+    } else {
+      count = array_obj->count_;
+    }
+  }
+  return ret;
+}
+
+int ObObj::read_lob_data(ObIAllocator &allocator, ObString &data) const
+{
+  int ret = OB_SUCCESS;
+  if (is_lob_storage() || get_type() == ObTinyTextType) {
+    ObLobLocatorV2 locator(reinterpret_cast<char *>(v_.ptr_), val_len_);
+    if(locator.has_inrow_data()) {
+      if (OB_FAIL(locator.get_inrow_data(data))) {
+        LOG_WARN("fail to get inrow data", K(ret), K(locator), KPC(this), K(lbt()));
+      }
+    } else if (OB_FAIL(ob_obj_read_lob_data(allocator, *this, data))) {
+      LOG_WARN("read data fail", K(ret), K(locator), KPC(this), K(lbt()));
+    }
+  } else {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("not lob storage type", K(ret), KPC(this), K(lbt()));
+  }
+  return ret;
+}
+
+////////////////////////////////////////////////////////////////
+DEFINE_SERIALIZE(ObObj)
+{
+  int ret = OB_SUCCESS;
+  OB_UNIS_ENCODE(meta_);
+  if (OB_SUCC(ret)) {
+    if (meta_.is_invalid()) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      ret = OBJ_FUNCS[meta_.get_type()].serialize(*this, buf, buf_len, pos);
+    }
+  }
+  return ret;
+}
+
+DEFINE_DESERIALIZE(ObObj)
+{
+  int ret = OB_SUCCESS;
+  OB_UNIS_DECODE(meta_);
+  if (OB_SUCC(ret)) {
+    if (meta_.is_invalid()) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      ret = OBJ_FUNCS[meta_.get_type()].deserialize(*this, buf, data_len, pos);
+    }
+  }
+  return ret;
+}
+
+DEFINE_GET_SERIALIZE_SIZE(ObObj)
+{
+  int64_t len = 0;
+  OB_UNIS_ADD_LEN(meta_);
+  len += OBJ_FUNCS[meta_.get_type()].get_serialize_size(*this);
+  return len;
+}
+
+DEFINE_SERIALIZE(ObObjParam)
+{
+  int ret = ObObj::serialize(buf, buf_len, pos);
+  if (OB_SUCC(ret)) {
+    OB_UNIS_ENCODE(accuracy_);
+    OB_UNIS_ENCODE(res_flags_);
+  }
+  return ret;
+}
+
+DEFINE_DESERIALIZE(ObObjParam)
+{
+  int ret = ObObj::deserialize(buf, data_len, pos);
+  if (OB_SUCC(ret)) {
+    OB_UNIS_DECODE(accuracy_);
+    OB_UNIS_DECODE(res_flags_);
+  }
+  return ret;
+}
+
+DEFINE_GET_SERIALIZE_SIZE(ObObjParam)
+{
+  int64_t len = ObObj::get_serialize_size();
+  OB_UNIS_ADD_LEN(accuracy_);
+  OB_UNIS_ADD_LEN(res_flags_);
+  return len;
+}
+
+OB_SERIALIZE_MEMBER(ParamFlag, flag_);
+
+void ObObjParam::reset()
+{
+  ObObj::reset();
+  accuracy_.reset();
+  res_flags_ = 0;
+  flag_.reset();
+  param_meta_.reset();
+}
+
+void ParamFlag::reset()
+{
+  need_to_check_type_ = true;
+  need_to_check_bool_value_ = false;
+  expected_bool_value_ = false;
+  need_to_check_extend_type_ = true;
+  is_ref_cursor_type_ = false;
+  is_pl_mock_default_param_ = false;
+  is_boolean_ = false;
+  is_batch_parameter_ = false;
+  ignore_scale_check_ = false;
+  need_strict_type_match_ = false;
+}
+
+
+DEF_TO_STRING(ObHexEscapeSqlStr)
+{
+  int64_t buf_pos = 0;
+  if (buf != NULL && buf_len > 0 && !str_.empty()) {
+    const char *end = str_.ptr() + str_.length();
+    if (do_oracle_mode_escape_) {
+      for (const char *cur = str_.ptr(); cur < end && buf_pos < buf_len; ++cur) {
+        if ('\'' == *cur) {
+          //在oracle模式中,只处理单引号转义
+          buf[buf_pos++] = '\'';
+          if (buf_pos < buf_len) {
+            buf[buf_pos++] = *cur;
+          }
+        } else {
+          buf[buf_pos++] = *cur;
+        }
+      }
+    } else if (skip_escape_) {
+      // do not escape_ while in NO_BACKSLASH_ESCAPES mode
+      for (const char *cur = str_.ptr(); cur < end && buf_pos < buf_len; ++cur) {
+        buf[buf_pos++] = *cur;
+      }
+    } else {
+      for (const char *cur = str_.ptr(); cur < end && buf_pos < buf_len; ++cur) {
+        switch (*cur) {
+          case '\\': {
+            buf[buf_pos++] = '\\';
+            if (buf_pos < buf_len) {
+              buf[buf_pos++] = '\\';
+            }
+            break;
+          }
+          case '\0': {
+            buf[buf_pos++] = '\\';
+            if (buf_pos < buf_len) {
+              buf[buf_pos++] = '0';
+            }
+            break;
+          }
+          case '\'':
+          case '\"': {
+            //字符串中出现了'或者"，需要进行转义
+            buf[buf_pos++] = '\\';
+            if (buf_pos < buf_len) {
+              buf[buf_pos++] = *cur;
+            }
+            break;
+          }
+          case '\n': {
+            buf[buf_pos++] = '\\';
+            if (buf_pos < buf_len) {
+              buf[buf_pos++] = 'n';
+            }
+            break;
+          }
+          case '\r': {
+            buf[buf_pos++] = '\\';
+            if (buf_pos < buf_len) {
+              buf[buf_pos++] = 'r';
+            }
+            break;
+          }
+          case '\t': {
+            buf[buf_pos++] = '\\';
+            if (buf_pos < buf_len) {
+              buf[buf_pos++] = 't';
+            }
+            break;
+          }
+          default: {
+            buf[buf_pos++] = *cur;
+            break;
+          }
+        }
+      }
+    }
+  }
+  return buf_pos;
+}
+
+int64_t ObHexEscapeSqlStr::get_extra_length() const
+{
+  int64_t ret_length = 0;
+  if (!str_.empty()) {
+    const char *end = str_.ptr() + str_.length();
+    if (do_oracle_mode_escape_) {
+      for (const char *cur = str_.ptr(); cur < end; ++cur) {
+        if ('\'' == *cur) {
+          ++ret_length;
+        }
+      }
+    } else {
+      for (const char *cur = str_.ptr(); cur < end; ++cur) {
+        switch (*cur) {
+          case '\\':
+          case '\0':
+          case '\'':
+          case '\"':
+          case '\n':
+          case '\r':
+          case '\t': {
+            ++ret_length;
+            break;
+          }
+          default: {
+            //do nothing
+          }
+        }
+      }
+    }
+  }
+  return ret_length;
+}
+
+int ObSqlArrayObj::do_real_deserialize(common::ObIAllocator &allocator, char *buf, int64_t data_len,
+                                       ObSqlArrayObj *&array_obj)
+{
+  int ret = OB_SUCCESS;
+  int64_t n = sizeof(ObSqlArrayObj);
+  void *array_buf = allocator.alloc(n);
+  int64_t pos = 0;
+  if (OB_ISNULL(array_buf)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("allocate memory failed", K(ret));
+  } else {
+    array_obj = new (array_buf) ObSqlArrayObj();
+    if (OB_FAIL(array_obj->deserialize(allocator, buf, data_len, pos))) {
+      LOG_WARN("failed to deserialize ObSqlArrayObj", K(ret));
+    }
+  }
+  return ret;
+}
+
+DEFINE_SERIALIZE(ObSqlArrayObj)
+{
+  int ret = OB_SUCCESS;
+  int64_t len = 0;
+  OB_UNIS_ENCODE(element_);
+  OB_UNIS_ENCODE_ARRAY(data_, count_);
+  return ret;
+}
+
+int ObSqlArrayObj::deserialize(ObIAllocator &allocator, const char* buf, const int64_t data_len,
+                               int64_t& pos)
+{
+  int ret = OB_SUCCESS;
+  OB_UNIS_DECODE(element_);
+  OB_UNIS_DECODE(count_);
+  if (OB_SUCC(ret) && count_ > 0) {
+    void *data_buf = allocator.alloc(sizeof(ObObjParam) * count_);
+    if (OB_ISNULL(data_buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("allocate memory failed", K(ret));
+    } else {
+      data_ = new (data_buf) common::ObObjParam[count_];
+      OB_UNIS_DECODE_ARRAY(data_, count_);
+    }
+  }
+  return ret;
+}
+
+DEFINE_GET_SERIALIZE_SIZE(ObSqlArrayObj)
+{
+  int64_t len = 0;
+  OB_UNIS_ADD_LEN(element_);
+  OB_UNIS_ADD_LEN_ARRAY(data_, count_);
+  return len;
+}
+int ObObjUDTUtil::ob_udt_obj_value_serialize(const ObObj &obj, char* buf, const int64_t buf_len, int64_t& pos)
+{
+  int ret = OB_SUCCESS;
+  if (obj.get_meta().is_invalid()) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ret = OBJ_FUNCS[obj.get_meta().get_type()].serialize(obj, buf, buf_len, pos);
+  }
+  return ret; 
+}
+
+int ObObjUDTUtil::ob_udt_obj_value_deserialize(ObObj &obj, const char* buf, const int64_t data_len, int64_t& pos)
+{
+  int ret = OB_SUCCESS;
+  // set meta before deserialize!
+  if (obj.get_meta().is_invalid()) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    ret = OBJ_FUNCS[obj.get_meta().get_type()].deserialize(obj, buf, data_len, pos);
+  }
+  return ret;
+}
+
+int ObObjUDTUtil::ob_udt_obj_value_get_serialize_size(const ObObj &obj, int64_t &value_len)
+{
+  int ret = OB_SUCCESS;
+  if (obj.get_meta().is_invalid()) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    value_len = OBJ_FUNCS[obj.get_meta().get_type()].get_serialize_size(obj);
+  }
+  return ret;
+}
+
+int ObObjCharacterUtil::print_safe_hex_represent_oracle(const ObObj &obj, char *buffer, int64_t length, int64_t &pos,
+    const ObAccuracy &accuracy)
+{
+  int ret = OB_SUCCESS;
+  const char *CAST_PREFIX = "CAST(UTL_RAW.CAST_TO_%s(HEXTORAW('";
+  const char *CAST_CHAR_SUFFIX = "')) AS %s(%d %s))";
+  const char *CAST_NCHAR_SUFFIX = "')) AS %s(%d))";
+  bool is_nstring_type = ob_is_nstring_type(obj.get_type());
+  const char *CAST_VARCHAR_TYPE_STR = !is_nstring_type ?  "VARCHAR2" : "NVARCHAR2";
+  const char *LENGTH_SEMANTICS_STR = !is_nstring_type ? get_length_semantics_str(accuracy.get_length_semantics()) : "";
+  const char *type_str = "";
+  switch (obj.get_type()) {
+    case ObCharType:
+      type_str = "CHAR";
+      break;
+    case ObVarcharType:
+      type_str = "VARCHAR2";
+      break;
+    case ObNCharType:
+      type_str = "NCHAR";
+      break;
+    case ObNVarchar2Type:
+      type_str = "NVARCHAR2";
+      break;
+    default:
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexcepted obj type", K(ret), K(obj.get_type()));
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(databuff_printf(buffer, length, pos, CAST_PREFIX, CAST_VARCHAR_TYPE_STR))) {
+    LOG_WARN("fail to print string", K(ret), KP(CAST_PREFIX), K(CAST_VARCHAR_TYPE_STR));
+  } else if (OB_FAIL(hex_print(obj.get_string_ptr(), obj.get_string_len(), buffer, length, pos))) {
+    LOG_WARN("fail to print hex", K(ret));
+  } else if (!is_nstring_type && OB_FAIL(databuff_printf(buffer, length, pos, CAST_CHAR_SUFFIX, type_str,
+    accuracy.get_length(), LENGTH_SEMANTICS_STR))) {
+      LOG_WARN("fail to print string", K(ret), K(CAST_CHAR_SUFFIX), K(type_str),
+        K(accuracy.get_length()), K(LENGTH_SEMANTICS_STR));
+  } else if (is_nstring_type && OB_FAIL(databuff_printf(buffer, length, pos, CAST_NCHAR_SUFFIX, type_str,
+    accuracy.get_length()))) {
+      LOG_WARN("fail to print string", K(ret), K(CAST_NCHAR_SUFFIX), K(type_str), K(accuracy.get_length()));
+  }
+  return ret;
+}
+
+int ObObjCharacterUtil::print_safe_hex_represent_mysql(const ObObj &obj, char *buffer, int64_t length, int64_t &pos)
+{
+  int ret = OB_SUCCESS;
+  const char *CAST_PREFIX = "CONVERT(x'";
+  const char *CAST_SUFFIX = "' USING %s) COLLATE %s";
+  ObCollationType collation_type = obj.get_collation_type();
+  ObCharsetType charset_type = ObCharset::charset_type_by_coll(collation_type);
+  const char *charset_name = nullptr;
+  const char *collation_name = nullptr;
+  ObString data_str;
+
+  if (!ObCharset::is_valid_collation(charset_type, collation_type)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid collation info", K(ret), K(obj.get_type()));
+  } else if (FALSE_IT(charset_name = ObCharset::charset_name(charset_type))) {
+  } else if (FALSE_IT(collation_name = ObCharset::collation_name(collation_type))) {
+  } else if (OB_UNLIKELY(!charset_name || !collation_name)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected collation name", K(ret), K(charset_type), K(collation_type));
+  } else if (obj.is_outrow_lob()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("out of row lob is unexpected", K(ret), K(obj));
+  } else {
+    data_str = obj.get_text_print_string(length - pos);
+  }
+  
+  if (FAILEDx(databuff_printf(buffer, length, pos, "%s", CAST_PREFIX))) {
+    LOG_WARN("fail to print string", K(ret), K(CAST_PREFIX));
+  } else if (OB_FAIL(hex_print(data_str.ptr(), data_str.length(), buffer, length, pos))) {
+    LOG_WARN("fail to print hex", K(ret));
+  } else if (OB_FAIL(databuff_printf(buffer, length, pos, CAST_SUFFIX, charset_name, collation_name))) {
+    LOG_WARN("fail to print string", K(ret), K(CAST_SUFFIX), K(charset_name), K(collation_name));
+  }
+
+  return ret;
+}
+
+int ObObjCharacterUtil::print_safe_hex_represent(const ObObj &obj, char* buf, const int64_t buf_len, int64_t& pos,
+  const ObAccuracy &accuracy)
+{
+  int ret = OB_SUCCESS;
+  if (!can_print_safe_hex_represent(obj)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected obj type", K(ret), K(obj.get_type()), K(obj.get_collation_type()));
+  } else {
+    ret = lib::is_oracle_mode() ? print_safe_hex_represent_oracle(obj, buf, buf_len, pos, accuracy)
+            : print_safe_hex_represent_mysql(obj, buf, buf_len, pos);
+  }
+  return ret;
+}
+
+bool ObObjCharacterUtil::can_print_safe_hex_represent(const ObObj &obj)
+{
+  bool bret = ob_is_character_type(obj.get_type(), obj.get_collation_type());
+  if (!lib::is_oracle_mode() && !bret) {
+    // string type is supported only for mysql mode
+    bret = ob_is_text_tc(obj.get_type()) && CS_TYPE_BINARY != obj.get_collation_type();
+  }
+  return bret;
+}

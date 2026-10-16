@@ -1,0 +1,39 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef PARSER_ALLOC_FUNC_H_
+#define PARSER_ALLOC_FUNC_H_
+
+#include <stdint.h>
+// ObSQLParser模块抽取了一个静态链接库给Proxy，Proxy必须要自己实现以下几个函数才能正确链接
+
+void *parser_alloc_buffer(void *malloc_pool, const int64_t alloc_size);
+void parser_free_buffer(void *malloc_pool, void *buffer);
+
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
+int get_errcode_for_allocator();
+void reset_errcode_for_allocator();
+void set_errcode_for_allocator(int errcode);
+#ifdef __cplusplus
+}
+#endif // __cplusplus
+
+#ifdef SQL_PARSER_COMPILATION
+#ifdef __cplusplus
+extern "C" {
+#endif // __cplusplus
+
+extern bool check_stack_overflow_c();
+extern int check_stack_overflow_in_c(int *check_overflow);
+extern void right_to_die_or_duty_to_live_c();
+
+#ifdef __cplusplus
+}
+#endif // __cplusplus
+#endif // SQL_PARSER_COMPILATION
+
+#endif // !PARSER_ALLOC_FUNC_H_

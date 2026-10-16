@@ -1,0 +1,118 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OBDEV_SRC_SQL_DAS_ITER_OB_DAS_VEC_SCAN_UTILS_H_
+#define OBDEV_SRC_SQL_DAS_ITER_OB_DAS_VEC_SCAN_UTILS_H_
+
+#include "sql/das/iter/ob_das_iter_define.h"
+#include "sql/das/iter/ob_das_scan_iter.h"
+#include "sql/das/ob_das_attach_define.h"
+#include "sql/das/ob_das_vec_define.h"
+#include "sql/engine/expr/ob_expr_vector.h"
+
+namespace oceanbase
+{
+namespace sql
+{
+class ObExecContext;
+struct VidDistancePair {
+  int64_t vid;
+  float distance;
+  static bool compare(const VidDistancePair &a, const VidDistancePair &b)
+  {
+    return a.distance < b.distance;
+  }
+  TO_STRING_KV(K(vid), K(distance));
+};
+
+struct VidDistancePairCompare {
+  bool is_ascending_; // true for L2 (smaller=better), false for DOT (larger=better)
+  explicit VidDistancePairCompare(ObExprVectorDistance::ObVecDisType dis_type)
+  {
+    is_ascending_ = (dis_type != ObExprVectorDistance::ObVecDisType::DOT);
+  }
+  bool operator()(const VidDistancePair &a, const VidDistancePair &b) const
+  {
+    return is_ascending_ ? (a.distance < b.distance) : (a.distance > b.distance);
+  }
+};
+
+class ObDasVecScanUtils
+{
+public:
+  static const uint64_t MAX_BRUTE_FORCE_SIZE = 1;
+  static int set_lookup_key(ObRowkey &rowkey, ObTableScanParam &scan_param, uint64_t table_id);
+  static int set_lookup_range(const ObNewRange &look_range, ObTableScanParam &scan_param, uint64_t table_id);
+  static void release_scan_param(ObTableScanParam &scan_param);
+  static void set_whole_range(ObNewRange &scan_range, common::ObTableID table_id);
+  static int get_distance_expr_type(ObExpr &expr, ObEvalCtx &ctx, ObExprVectorDistance::ObVecDisType &dis_type);
+  static int get_real_search_vec(common::ObIAllocator &allocator,
+                                 ObEvalCtx *eval_ctx,
+                                 ObExpr *origin_vec,
+                                 ObString &real_search_vec);
+  static int init_limit(const ObDASVecAuxScanCtDef *ir_ctdef,
+                        ObDASVecAuxScanRtDef *ir_rtdef,
+                        const ObDASSortCtDef *sort_ctdef,
+                        ObDASSortRtDef *sort_rtdef,
+                        common::ObLimitParam &limit_param);
+  static int init_sort(const ObDASVecAuxScanCtDef *ir_ctdef,
+                       ObDASVecAuxScanRtDef *ir_rtdef,
+                       const ObDASSortCtDef *sort_ctdef,
+                       ObDASSortRtDef *sort_rtdef,
+                       const common::ObLimitParam &limit_param,
+                       ObExpr *&search_vec,
+                       ObExpr *&distance_calc);
+  static int init_sort_of_hybrid_index(ObIAllocator &allocator,
+                                       const ObDASVecAuxScanCtDef *ir_ctdef,
+                                       const ObDASSortCtDef *sort_ctdef,
+                                       ObDASSortRtDef *sort_rtdef,
+                                       ObString &hybrid_search_vec,
+                                       ObExpr *&distance_calc);
+  static int reuse_iter(const share::ObLSID &ls_id,
+                        ObDASScanIter *iter,
+                        ObTableScanParam &scan_param,
+                        const ObTabletID tablet_id);
+  static int init_scan_param(const share::ObLSID &ls_id,
+                             const common::ObTabletID &tablet_id,
+                             const ObDASScanCtDef *ctdef,
+                             ObDASScanRtDef *rtdef,
+                             transaction::ObTxDesc *tx_desc,
+                             transaction::ObTxReadSnapshot *snapshot,
+                             ObTableScanParam &scan_param,
+                             bool is_get = true,
+                             ObIAllocator *allocator = nullptr);
+  static int init_vec_aux_scan_param(const share::ObLSID &ls_id,
+                                      const common::ObTabletID &tablet_id,
+                                      const sql::ObDASScanCtDef *ctdef,
+                                      sql::ObDASScanRtDef *rtdef,
+                                      transaction::ObTxDesc *tx_desc,
+                                      transaction::ObTxReadSnapshot *snapshot,
+                                      ObTableScanParam &scan_param,
+                                      bool is_get = false,
+                                      ObIAllocator *scan_allocator = nullptr);
+  static int get_rowkey(ObIAllocator &allocator, const ObDASScanCtDef * ctdef, ObDASScanRtDef *rtdef, ObRowkey *&rowkey);
+  
+  static int get_rowkey_pre_filter(ObIAllocator &allocator, 
+                                   bool is_vectorized, 
+                                   ObDASIter *iter, 
+                                   const ObDASScanCtDef *ctdef, 
+                                   ObDASScanRtDef *rtdef, 
+                                   ObIArray<ObRowkey *> &rowkeys);
+  static int get_distance_threshold_hnsw(ObVectorIndexDistAlgorithm dist_algorithm,
+                                         float &similarity_threshold,
+                                         float &distance_threshold);
+  static int check_ivf_support_similarity_threshold(ObExpr &expr);
+  static int64_t calc_heap_size(int64_t limit_k, double select_ratio);
+  static int get_main_rowkey(const ObDASScanCtDef *ctdef, ObEvalCtx *eval_ctx, ObRowkey &main_rowkey);
+  static int64_t calc_effective_batch(int64_t needed, double selectivity, int64_t max_batch);
+  static ObVecIdxAdaTryPath get_initial_vec_idx_path(
+      ObVecIndexType vec_index_type,
+      ObVecIdxAdaTryPath adaptive_try_path);
+
+};
+
+}  // namespace sql
+}  // namespace oceanbase
+#endif

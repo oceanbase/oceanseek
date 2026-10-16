@@ -1,0 +1,69 @@
+/**
+ * Copyright (c) 2025 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef _OB_HBASE_ADAPTER_FACTORY_H
+#define _OB_HBASE_ADAPTER_FACTORY_H
+
+#include "ob_i_adapter.h"
+#include "ob_hbase_normal_adapter.h"
+#include "ob_hbase_series_adapter.h"
+#include "observer/table/utils/ob_htable_utils.h"
+
+namespace oceanbase
+{
+namespace table
+{
+
+class ObHbaseAdapterFactory
+{
+public:
+  static int alloc_hbase_adapter(ObIAllocator &alloc, ObHbaseModeType mode_type, ObIHbaseAdapter *&adapter)
+  {
+    int ret = OB_SUCCESS;
+    if (mode_type == ObHbaseModeType::OB_INVALID_MODE_TYPE) {
+      ret = OB_SCHEMA_ERROR;
+      SERVER_LOG(WARN, "invalid hbase mode type", K(ret));
+    } else {
+      if (mode_type == ObHbaseModeType::OB_HBASE_NORMAL_TYPE) {
+        if (OB_ISNULL(adapter = OB_NEWx(ObHNormalAdapter, &alloc))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          SERVER_LOG(WARN, "fail to alloc hbase normal adapter", K(ret));
+        }
+      } else if (mode_type == ObHbaseModeType::OB_HBASE_SERIES_TYPE) {
+        if (OB_ISNULL(adapter = OB_NEWx(ObHSeriesAdapter, &alloc))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          SERVER_LOG(WARN, "fail to alloc hbase series adapter", K(ret));
+        }
+      } else {
+        ret = OB_ERR_UNEXPECTED;
+        SERVER_LOG(WARN, "unexpected hbase mode type", K(ret), K(mode_type));
+      }
+    }
+
+    return ret;
+  }
+};
+
+class ObHbaseAdapterGuard
+{
+public:
+  ObHbaseAdapterGuard(ObIAllocator &alloc) 
+    : allocator_(alloc),
+      hbase_adapter_(nullptr)
+  {}
+  ~ObHbaseAdapterGuard()
+  {
+    OB_DELETEx(ObIHbaseAdapter, &allocator_, hbase_adapter_);
+  }
+  int get_hbase_adapter(ObIHbaseAdapter *&hbase_adapter, ObHbaseModeType mode_type);
+private:
+  common::ObIAllocator &allocator_;
+  ObIHbaseAdapter *hbase_adapter_;
+};
+
+} // end of namespace table
+} // end of namespace oceanbase
+
+#endif

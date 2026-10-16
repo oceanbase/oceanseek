@@ -1,0 +1,8 @@
+ob_unittest(test_logical_table_key_prefix)
+ob_unittest(test_logical_table_key_codec)
+ob_unittest(test_logical_table_value_codec)
+ob_unittest(test_logical_table_range_builder)
+ob_unittest(test_namespace_ru_manager)
+target_link_options(test_namespace_ru_manager PRIVATE -Wl,--allow-shlib-undefined)
+ob_unittest(test_logical_table_monitor)
+target_link_options(test_logical_table_monitor PRIVATE -Wl,--allow-shlib-undefined)

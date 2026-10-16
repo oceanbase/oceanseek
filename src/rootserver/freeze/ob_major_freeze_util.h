@@ -1,0 +1,100 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_ROOTSERVER_FREEZE_OB_MAJOR_FREEZE_UTIL_H_
+#define OCEANBASE_ROOTSERVER_FREEZE_OB_MAJOR_FREEZE_UTIL_H_
+
+#include <stdint.h>
+#include "share/ob_define.h"
+#include "lib/utility/ob_unify_serialize.h"
+
+namespace oceanbase
+{
+namespace common
+{
+class ObISQLClient;
+}
+namespace rootserver
+{
+class ObPrimaryMajorFreezeService;
+class ObRestoreMajorFreezeService;
+class ObMajorFreezeService;
+
+class ObMajorFreezeUtil
+{
+public:
+  static int get_major_freeze_service(ObPrimaryMajorFreezeService *primary_major_freeze_service,
+                                      ObRestoreMajorFreezeService *restore_major_freeze_service,
+                                      ObMajorFreezeService *&major_freeze_service,
+                                      bool &is_primary_service);
+  static int check_epoch_immediately(common::ObISQLClient &sql_proxy,
+                                      const uint64_t tenant_id,
+                                      const int64_t expected_epoch);
+  static int check_epoch_periodically(common::ObISQLClient &sql_proxy,
+                                      const uint64_t tenant_id,
+                                      const int64_t expected_epoch,
+                                      int64_t &last_check_us);
+private:
+  static const int64_t CHECK_EPOCH_INTERVAL_US = 60 * 1000L * 1000L; // 60s
+};
+
+#define FREEZE_TIME_GUARD \
+  rootserver::ObFreezeTimeGuard freeze_time_guard(__FILE__, __LINE__, __FUNCTION__, "[RS_COMPACTION] ")
+
+class ObFreezeTimeGuard
+{
+public:
+  ObFreezeTimeGuard(const char *file,
+                    const int64_t line,
+                    const char *func,
+                    const char *mod);
+  virtual ~ObFreezeTimeGuard();
+
+private:
+  const int64_t FREEZE_WARN_THRESHOLD_US = 10 * 1000L * 1000L; // 10s
+
+private:
+  const int64_t warn_threshold_us_;
+  const int64_t start_time_us_;
+  const char * const file_;
+  const int64_t line_;
+  const char * const func_name_;
+  const char * const log_mod_;
+};
+
+enum ObMajorFreezeReason : uint8_t {
+  MF_DAILY_MERGE = 0,
+  MF_USER_REQUEST,
+  MF_MAJOR_COMPACT_TRIGGER,
+  MF_REASON_MAX,
+};
+
+const char *major_freeze_reason_to_str(const int64_t freeze_reason);
+bool is_valid_major_freeze_reason(const ObMajorFreezeReason &freeze_reason);
+
+struct ObWindowCompactionParam
+{
+public:
+  ObWindowCompactionParam() 
+    : with_start_ts_(false),
+      window_start_time_us_(-1)
+  {}
+  ObWindowCompactionParam(const bool with_start_ts, const int64_t window_start_time_us)
+    : with_start_ts_(with_start_ts),
+      window_start_time_us_(window_start_time_us)
+  {}
+  ~ObWindowCompactionParam() = default;
+  bool is_valid() const { return !with_start_ts_ || (with_start_ts_ && window_start_time_us_ > 0); }
+  TO_STRING_KV(K_(with_start_ts), K_(window_start_time_us));
+  OB_UNIS_VERSION(1);
+public:
+  bool with_start_ts_;
+  int64_t window_start_time_us_;
+};
+
+} // end namespace rootserver
+} // end namespace oceanbase
+
+#endif // OCEANBASE_ROOTSERVER_FREEZE_OB_MAJOR_FREEZE_UTIL_H_

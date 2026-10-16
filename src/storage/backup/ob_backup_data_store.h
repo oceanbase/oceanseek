@@ -1,0 +1,651 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_SHARE_OB_BACKUP_DATA_STORE_H_
+#define OCEANBASE_SHARE_OB_BACKUP_DATA_STORE_H_
+
+#include "share/ls/ob_ls_operator.h"
+#include "share/backup/ob_backup_path.h"
+#include "storage/backup/ob_backup_extern_info_mgr.h"
+#include "storage/ls/ob_ls_meta_package.h"
+#include "storage/tablet/ob_tablet_meta.h"
+#ifdef OB_BUILD_SHARED_STORAGE
+#include "storage/incremental/share/ob_shared_meta_common.h"
+#include "storage/incremental/share/ob_shared_ls_meta.h"
+#endif
+#include "storage/backup/ob_backup_block_file_reader_writer.h"
+
+namespace oceanbase
+{
+namespace storage
+{
+
+/*
+------------------------backup ls info-------------------------
+*/
+
+struct ObBackupDataLSAttrDesc final : public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1; 
+  OB_UNIS_VERSION(1);
+public:
+  ObBackupDataLSAttrDesc() 
+    : ObExternBackupDataDesc(share::ObBackupFileType::BACKUP_LS_INFO, FILE_VERSION),
+      backup_scn_(),
+      ls_attr_array_() {}
+  virtual ~ObBackupDataLSAttrDesc() {}
+
+  bool is_valid() const override;
+  INHERIT_TO_STRING_KV("ObExternBackupDataDesc", ObExternBackupDataDesc, K(backup_scn_), K_(ls_attr_array));
+public:
+  share::SCN backup_scn_;
+  ObSArray<share::ObLSAttr> ls_attr_array_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObBackupDataLSAttrDesc);
+};
+
+struct ObBackupDataLSIdListDesc final : public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1;
+  OB_UNIS_VERSION(1);
+public:
+  ObBackupDataLSIdListDesc()
+    : ObExternBackupDataDesc(share::ObBackupFileType::BACKUP_LS_ID_LIST_INFO, FILE_VERSION),
+      ls_id_array_() {}
+  virtual ~ObBackupDataLSIdListDesc() {}
+
+  bool is_valid() const override;
+  INHERIT_TO_STRING_KV("ObExternBackupDataDesc", ObExternBackupDataDesc, K_(ls_id_array));
+public:
+  ObSArray<share::ObLSID> ls_id_array_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObBackupDataLSIdListDesc);
+};
+
+struct ObBackupDataTabletToLSInfo 
+{
+public:
+  OB_UNIS_VERSION(1);
+public:
+  ObBackupDataTabletToLSInfo()
+    : ls_id_(0),
+      tablet_id_list_() {}
+  virtual ~ObBackupDataTabletToLSInfo() {};
+
+  bool is_valid() const;
+  int assign(const ObBackupDataTabletToLSInfo &that);
+  TO_STRING_KV(K_(ls_id), K_(tablet_id_list));
+  share::ObLSID ls_id_;
+  ObSArray<common::ObTabletID> tablet_id_list_;
+};
+
+struct ObBackupDataTabletToLSDesc final : public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1; 
+  OB_UNIS_VERSION(1);
+public:
+  ObBackupDataTabletToLSDesc()
+    : ObExternBackupDataDesc(share::ObBackupFileType::BACKUP_TABLET_TO_LS_INFO, FILE_VERSION),
+      backup_scn_(share::SCN::min_scn()),
+      tablet_to_ls_() {}
+  virtual ~ObBackupDataTabletToLSDesc() {}
+
+  bool is_valid() const override;
+  INHERIT_TO_STRING_KV("ObExternBackupDataDesc", ObExternBackupDataDesc, K_(backup_scn), K_(tablet_to_ls));
+public:
+  share::SCN backup_scn_;
+  ObSArray<ObBackupDataTabletToLSInfo> tablet_to_ls_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObBackupDataTabletToLSDesc);
+};
+
+struct ObBackupDeletedTabletToLSDesc final : public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1; 
+  OB_UNIS_VERSION(FILE_VERSION);
+public:
+  ObBackupDeletedTabletToLSDesc()
+    : ObExternBackupDataDesc(ObBackupFileType::BACKUP_DELETED_TABLET_INFO, FILE_VERSION),
+      deleted_tablet_to_ls_() {}
+  virtual ~ObBackupDeletedTabletToLSDesc() {}
+
+  bool is_valid() const override;
+  INHERIT_TO_STRING_KV("ObExternBackupDataDesc", ObExternBackupDataDesc, K_(deleted_tablet_to_ls));
+public:
+  ObSArray<ObBackupDataTabletToLSInfo> deleted_tablet_to_ls_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObBackupDeletedTabletToLSDesc);
+};
+
+struct ObExternBackupSetPlaceholderDesc final : public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1; 
+  OB_UNIS_VERSION(1);
+public:
+  ObExternBackupSetPlaceholderDesc() 
+    : ObExternBackupDataDesc(share::ObBackupFileType::BACKUP_TABLET_TO_LS_INFO, FILE_VERSION) {}
+  virtual ~ObExternBackupSetPlaceholderDesc() {}
+
+  bool is_valid() const override { return true; }
+};
+
+struct ObBackupResourcePool final
+{
+  OB_UNIS_VERSION(1);
+public:
+  ObBackupResourcePool()
+    : resource_pool_(),
+      unit_config_() {}
+  int assign(const ObBackupResourcePool &that);
+  int set(const share::ObResourcePool &resource_pool, const share::ObUnitConfig &unit_config);
+  void reset();
+  TO_STRING_KV(K_(resource_pool), K_(unit_config));
+  share::ObResourcePool resource_pool_;
+  share::ObUnitConfig unit_config_;
+};
+
+struct ObExternTenantLocalityInfoDesc final : public ObExternBackupDataDesc
+{
+public:
+  using TenantName = common::ObFixedLengthString<common::OB_MAX_TENANT_NAME_LENGTH>;
+  using ClusterName = common::ObFixedLengthString<common::OB_MAX_CLUSTER_NAME_LENGTH>;
+  using Locality = common::ObFixedLengthString<common::MAX_LOCALITY_LENGTH>;
+  using PrimaryZone = common::ObFixedLengthString<common::MAX_ZONE_LIST_LENGTH>;
+  using TimeZone = common::ObFixedLengthString<common::OB_MAX_TIMESTAMP_TZ_LENGTH>;
+  static const uint8_t FILE_VERSION = 1; 
+  OB_UNIS_VERSION(1);
+public:
+  ObExternTenantLocalityInfoDesc()
+    : ObExternBackupDataDesc(share::ObBackupFileType::BACKUP_TENANT_LOCALITY_INFO, FILE_VERSION),
+      tenant_id_(OB_INVALID_TENANT_ID),
+      backup_set_id_(0),
+      cluster_id_(OB_INVALID_CLUSTER_ID),
+      compat_mode_(lib::Worker::CompatMode::INVALID),
+      tenant_name_(),
+      cluster_name_(),
+      locality_(),
+      primary_zone_(),
+      sys_time_zone_(),
+      sys_time_zone_wrap_(),
+      resource_pool_infos_() {}
+  virtual ~ObExternTenantLocalityInfoDesc() {}
+  int assign(const ObExternTenantLocalityInfoDesc &that);
+  bool is_valid() const override;
+  INHERIT_TO_STRING_KV("ObExternBackupDataDesc", ObExternBackupDataDesc, K_(tenant_id),
+    K_(backup_set_id), K_(cluster_id), K_(compat_mode), K_(tenant_name), K_(cluster_name),
+    K_(locality), K_(primary_zone), K_(sys_time_zone), K_(sys_time_zone_wrap), K_(resource_pool_infos));
+public:
+  uint64_t tenant_id_;
+  int64_t backup_set_id_;
+  int64_t cluster_id_;
+  lib::Worker::CompatMode compat_mode_;
+  TenantName tenant_name_;
+  ClusterName cluster_name_;
+  Locality locality_;
+  PrimaryZone primary_zone_;
+  TimeZone sys_time_zone_;
+  ObTimeZoneInfoWrap sys_time_zone_wrap_;
+  common::ObSArray<ObBackupResourcePool> resource_pool_infos_;
+};
+
+struct ObBackupParam final
+{
+  typedef common::ObFixedLengthString<common::OB_MAX_CONFIG_NAME_LEN + 1> ConfigName;
+  typedef common::ObString ConfigValue;
+  OB_UNIS_VERSION(1);
+public:
+  void reset();
+  bool is_valid() const;
+  int assign(const ObBackupParam &other);
+  int deep_copy(common::ObIAllocator &allocator, ObBackupParam &target) const;
+  TO_STRING_KV(K_(name), K_(value));
+  ConfigName  name_;
+  ConfigValue value_;
+};
+
+struct ObExternParamInfoDesc final : public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1;
+  OB_UNIS_VERSION(1);
+public:
+  ObExternParamInfoDesc()
+    : ObExternBackupDataDesc(
+      share::ObBackupFileType::BACKUP_PARAMETERS_INFO, FILE_VERSION),
+      tenant_id_(OB_INVALID_TENANT_ID),
+      allocator_(),
+      param_array_() {}
+  void reset();
+  bool is_valid() const override;
+  int assign(const ObExternParamInfoDesc &other);
+  int push(const ObBackupParam &param);
+  const common::ObSArray<ObBackupParam> &param_array() const;
+  TO_STRING_KV(K_(tenant_id), K_(param_array));
+  uint64_t tenant_id_;
+private:
+  common::ObArenaAllocator allocator_;
+  common::ObSArray<ObBackupParam> param_array_;
+  DISALLOW_COPY_AND_ASSIGN(ObExternParamInfoDesc);
+};
+
+struct ObExternBackupSetInfoDesc final : public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1; 
+  OB_UNIS_VERSION(1);
+public:
+  ObExternBackupSetInfoDesc()
+    : ObExternBackupDataDesc(share::ObBackupFileType::BACKUP_SET_INFO, FILE_VERSION),
+      backup_set_file_() {}
+  virtual ~ObExternBackupSetInfoDesc() {}
+
+  bool is_valid() const override;
+  INHERIT_TO_STRING_KV("ObExternBackupDataDesc", ObExternBackupDataDesc, K_(backup_set_file));
+public:
+  share::ObBackupSetFileDesc backup_set_file_;
+};
+
+struct ObExternTenantDiagnoseInfoDesc final : public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1; 
+  OB_UNIS_VERSION(1);
+public:
+  ObExternTenantDiagnoseInfoDesc()
+    : ObExternBackupDataDesc(share::ObBackupFileType::BACKUP_TENANT_DIAGNOSE_INFO, FILE_VERSION),
+      tenant_id_(OB_INVALID_TENANT_ID), 
+      tenant_locality_info_(), 
+      backup_set_file_() {}
+  virtual ~ObExternTenantDiagnoseInfoDesc() {}
+
+  bool is_valid() const override;
+  INHERIT_TO_STRING_KV("ObExternBackupDataDesc", ObExternBackupDataDesc, K_(tenant_id), K_(tenant_locality_info), K_(backup_set_file));
+public:
+  uint64_t tenant_id_;
+  ObExternTenantLocalityInfoDesc tenant_locality_info_;
+  share::ObBackupSetFileDesc backup_set_file_;
+};
+
+struct ObTenantBackupSetInfosDesc final : public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1; 
+  OB_UNIS_VERSION(1);
+public:
+  ObTenantBackupSetInfosDesc()
+    : ObExternBackupDataDesc(share::ObBackupFileType::BACKUP_TENANT_SET_INFOS, FILE_VERSION),
+      backup_set_infos_() {}
+  virtual ~ObTenantBackupSetInfosDesc() {}
+
+  bool is_valid() const override;
+  TO_STRING_KV(K_(backup_set_infos));
+public:
+  ObSArray<share::ObBackupSetFileDesc> backup_set_infos_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObTenantBackupSetInfosDesc);
+};
+
+struct ObBackupLSMetaInfosDesc final: public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1; 
+  OB_UNIS_VERSION(1);
+public:
+  ObBackupLSMetaInfosDesc()
+    : ObExternBackupDataDesc(share::ObBackupFileType::BACKUP_LS_META_INFOS_FILE, FILE_VERSION),
+      ls_meta_packages_() {}
+  virtual ~ObBackupLSMetaInfosDesc() {}
+  bool is_valid() const override;
+  TO_STRING_KV(K_(ls_meta_packages));
+public:
+  ObSArray<storage::ObLSMetaPackage> ls_meta_packages_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObBackupLSMetaInfosDesc);
+};
+
+#ifdef OB_BUILD_SHARED_STORAGE
+struct ObBackupSSLSMetaInfo final
+{
+  OB_UNIS_VERSION(1);
+
+public:
+  ObBackupSSLSMetaInfo();
+  ~ObBackupSSLSMetaInfo();
+  int64_t get_total_serialize_buf_size() const;
+  int serialize_to(char *buf, int64_t buf_size, int64_t &pos) const;
+  int deserialize_from(char *buf, int64_t buf_size);
+  TO_STRING_KV(K_(raw_ls_meta_row));
+  storage::ObSSRawMetaRow raw_ls_meta_row_; // FARM COMPAT WHITELIST
+};
+
+struct ObBackupSSLSMetaInfosDesc final: public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1;
+  OB_UNIS_VERSION(1);
+public:
+  ObBackupSSLSMetaInfosDesc();
+  virtual ~ObBackupSSLSMetaInfosDesc();
+  bool is_valid() const override;
+  TO_STRING_KV("count", ls_metas_.count());
+public:
+  ObSArray<storage::ObBackupSSLSMetaInfo> ls_metas_;
+  // TODO(yanfeng): refactor to only maintain ls_id list, no need to merge ls metas
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObBackupSSLSMetaInfosDesc);
+};
+#endif
+
+struct ObBackupPartialTableListDesc final : public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1; 
+  OB_UNIS_VERSION(1);
+public:
+  ObBackupPartialTableListDesc()
+    : ObExternBackupDataDesc(ObBackupFileType::BACKUP_TABLE_LIST_FILE, FILE_VERSION),
+      items_() {} 
+  virtual ~ObBackupPartialTableListDesc() {}
+  bool is_valid() const override;
+  void reset();
+  int64_t count() const { return items_.count(); }
+  DECLARE_TO_STRING;
+public:
+  ObSArray<ObBackupTableListItem> items_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObBackupPartialTableListDesc);
+};
+
+struct ObBackupTableListMetaInfoDesc final : public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1; 
+  OB_UNIS_VERSION(1);
+public:
+  ObBackupTableListMetaInfoDesc()
+    : ObExternBackupDataDesc(ObBackupFileType::BACKUP_TABLE_LIST_META_FILE, FILE_VERSION),
+      scn_(share::SCN::min_scn()),
+      count_(0),
+      batch_size_(0),
+      partial_metas_() {} 
+  virtual ~ObBackupTableListMetaInfoDesc() {}
+  bool is_valid() const override;
+  TO_STRING_KV(K_(count), K_(batch_size), K_(partial_metas));
+public:
+  share::SCN scn_;
+  int64_t count_;
+  int64_t batch_size_;
+  common::ObSArray<ObBackupPartialTableListMeta>  partial_metas_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObBackupTableListMetaInfoDesc);
+};
+
+class ObBackupMajorCompactionMViewDepTabletListDesc final : public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1;
+  OB_UNIS_VERSION(1);
+public:
+  ObBackupMajorCompactionMViewDepTabletListDesc();
+  ~ObBackupMajorCompactionMViewDepTabletListDesc() {}
+  bool is_valid() const override;
+  TO_STRING_KV(K_(tablet_id_list), K_(mview_dep_scn_list));
+public:
+  ObSArray<common::ObTabletID> tablet_id_list_;
+  ObSArray<share::SCN> mview_dep_scn_list_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObBackupMajorCompactionMViewDepTabletListDesc);
+};
+
+#ifdef OB_BUILD_SHARED_STORAGE
+} // end namespace storage
+} // end namespace oceanbase
+#include "storage/backup/ob_ss_backup_tablet_pair.h"
+namespace oceanbase
+{
+namespace storage
+{
+class ObSSBackupTabletGroupCheckpointDesc final : public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1;
+  OB_UNIS_VERSION(1);
+public:
+  ObSSBackupTabletGroupCheckpointDesc();
+  ~ObSSBackupTabletGroupCheckpointDesc() override {}
+  void reset();
+  bool is_valid() const override;
+  TO_STRING_KV(K_(tablet_list));
+public:
+  common::ObSArray<backup::ObSSBackupTabletPair> tablet_list_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObSSBackupTabletGroupCheckpointDesc);
+};
+
+struct ObBackupSSTabletMetaInfo final
+{
+  OB_UNIS_VERSION(1);
+
+public:
+  ObBackupSSTabletMetaInfo();
+  ~ObBackupSSTabletMetaInfo();
+  int64_t get_total_serialize_buf_size() const;
+  int serialize_to(char *buf, int64_t buf_size, int64_t &pos) const;
+  int deserialize_from(char *buf, int64_t buf_size);
+  TO_STRING_KV(K_(raw_meta_row));
+  storage::ObSSRawMetaRow raw_meta_row_; // FARM COMPAT WHITELIST
+};
+
+class ObSSBackupTabletMetaFileInfoDesc final : public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1;
+  OB_UNIS_VERSION(1);
+public:
+  ObSSBackupTabletMetaFileInfoDesc();
+  ~ObSSBackupTabletMetaFileInfoDesc();
+  bool is_valid() const override { return true; }
+  TO_STRING_KV(K_(info));
+public:
+  ObBackupSSTabletMetaInfo info_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObSSBackupTabletMetaFileInfoDesc);
+};
+
+class ObSSBackupTabletMacroBlockFileInfoDesc final : public ObExternBackupDataDesc
+{
+public:
+  static const uint8_t FILE_VERSION = 1;
+  OB_UNIS_VERSION(1);
+public:
+  ObSSBackupTabletMacroBlockFileInfoDesc();
+  ~ObSSBackupTabletMacroBlockFileInfoDesc();
+  void reset();
+  bool is_valid() const override;
+  TO_STRING_KV(K_(macro_id_list));
+public:
+  common::ObSArray<blocksstable::MacroBlockId> macro_id_list_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObSSBackupTabletMacroBlockFileInfoDesc);
+};
+#endif
+
+class ObBackupSetFilter : public ObBaseDirEntryOperator
+{
+public:
+  static const int64_t OB_BACKUP_SET_DIR_NAME_LEN = 64;
+  using BackupSetDirName = common::ObFixedLengthString<OB_BACKUP_SET_DIR_NAME_LEN>;
+  using BackupSetMap = common::hash::ObHashMap<int64_t, share::ObBackupSetDesc, common::hash::NoPthreadDefendMode>;
+public:
+  ObBackupSetFilter()
+   : backup_set_name_array_() {}
+  ~ObBackupSetFilter() {}
+  void reset() { backup_set_name_array_.reuse(); }
+  int get_backup_set_array(ObIArray<share::ObBackupSetDesc> &backup_set_array) const;
+  int func(const dirent *entry) override;
+  TO_STRING_KV(K_(backup_set_name_array));
+private:
+  ObSArray<BackupSetDirName> backup_set_name_array_;
+};
+
+class ObBackupDataStore final : public share::ObBackupStore
+{
+public:
+  ObBackupDataStore();
+  virtual ~ObBackupDataStore();
+
+  int init(const char *backup_set_dest);
+  int init(const share::ObBackupDest &backup_set_dest);
+  int init(const share::ObBackupDest &backup_dest, const share::ObBackupSetDesc &backup_desc);
+  const share::ObBackupSetDesc &get_backup_set_desc() const { return backup_desc_; }
+  const share::ObBackupDest &get_backup_set_dest() const { return backup_set_dest_; }
+  void reset();
+
+  int write_ls_attr(const int64_t turn_id, const ObBackupDataLSAttrDesc &ls_info); 
+  int read_ls_attr_info(ObBackupDataLSAttrDesc &ls_info);
+  int read_ls_attr_info(const int64_t turn_id, ObBackupDataLSAttrDesc &ls_info);
+  int write_ls_attr_candidate(const int64_t turn_id, const share::SCN &backup_meta_scn,
+      const ObBackupDataLSAttrDesc &ls_info);
+  int read_ls_attr_candidate(const int64_t turn_id, const share::SCN &backup_meta_scn,
+      const share::SCN &read_scn, ObBackupDataLSAttrDesc &ls_info);
+  int write_ls_id_list(const ObBackupDataLSIdListDesc &ls_id_list);
+  int read_ls_id_list(ObBackupDataLSIdListDesc &ls_id_list);
+
+  int write_ls_meta_infos(const ObBackupLSMetaInfosDesc &ls_meta_infos);
+  // get the ObBackupLSMetaInfosDesc of target turn_id
+  int read_ls_meta_infos(ObBackupLSMetaInfosDesc &ls_meta_infos);
+  // get the ls_meta_infos of target turn_id and ls_id
+  int read_ls_meta_infos(const share::ObLSID &ls_id, storage::ObLSMetaPackage &ls_meta_package);
+  // write and read tablet_to_ls_info
+  int write_tablet_to_ls_info(const ObBackupDataTabletToLSDesc &tablet_to_ls_info, 
+      const int64_t turn_id, const share::ObBackupDataType &type);
+  int read_tablet_to_ls_info(const int64_t turn_id, const share::ObBackupDataType &type, 
+      ObBackupDataTabletToLSDesc &tablet_to_ls_info);
+  int read_tablet_list(const share::ObBackupDataType &type, const int64_t turn_id, const share::ObLSID &ls_id, 
+      ObIArray<common::ObTabletID> &tablet_ids);
+  int read_deleted_tablet_info(const ObLSID &ls_id, ObIArray<ObTabletID> &deleted_tablet_ids);
+  
+  // write tenant backup set infos
+  int write_tenant_backup_set_infos(const ObTenantBackupSetInfosDesc &tenant_backup_set_infos);
+
+  // write backup set place holder
+  int write_backup_set_placeholder(const bool is_inner, const bool is_start, const bool is_succeed, 
+      const share::SCN &replay_scn, const share::SCN &min_restore_scn);
+
+  // write and read tenant locality info
+  int write_tenant_locality_info(const ObExternTenantLocalityInfoDesc &locality_info);
+  int read_tenant_locality_info(ObExternTenantLocalityInfoDesc &locality_info);
+
+  // write and read tenant parameters info
+  int write_tenant_param_info(const ObExternParamInfoDesc &tenant_param_info);
+  int read_tenant_param_info(ObExternParamInfoDesc &tenant_param_info);
+
+  // write and read tenant dignose info
+  int write_tenant_diagnose_info(const ObExternTenantDiagnoseInfoDesc &diagnose_info);
+  int read_tenant_diagnose_info(ObExternTenantDiagnoseInfoDesc &diagnose_info);
+
+  // write and read backup set info
+  int write_backup_set_info(const ObExternBackupSetInfoDesc &backup_set_info);
+  int read_backup_set_info(ObExternBackupSetInfoDesc &backup_set_info);
+  int read_backup_set_info_by_desc(const share::ObBackupSetDesc &desc, ObExternBackupSetInfoDesc &backup_set_info);
+  int is_backup_set_info_file_exist(bool &is_exist) const;
+  int get_backup_set_array(const bool check_passwd, const common::ObString &passwd_array, const share::SCN &restore_scn, 
+      share::SCN &restore_start_scn, common::ObIArray<share::ObBackupSetBriefInfo> &backup_set_list);
+  int get_max_backup_set_file_info(const common::ObString &passwd_array, ObBackupSetFileDesc &output_desc);
+  int get_backup_sys_time_zone_wrap(common::ObTimeZoneInfoWrap & time_zone_wrap);
+  int get_single_backup_set_sys_time_zone_wrap(common::ObTimeZoneInfoWrap & time_zone_wrap);
+  int get_backup_set_list(ObArray<share::ObBackupSetDesc> &set_list);
+  int get_max_sys_ls_retry_id(
+      const share::ObBackupPath &backup_path, const share::ObLSID &ls_id, const int64_t turn_id, int64_t &retry_id);
+  int write_root_key_info(const uint64_t tenant_id);
+  int read_root_key_info(const uint64_t tenant_id);
+
+  int read_base_tablet_list(const share::ObLSID &ls_id, const int64_t dest_id, ObIArray<common::ObTabletID> &tablet_id_array);
+// 4.1 interface to get tablet to ls
+  int read_tablet_to_ls_info_v_4_1_x(const int64_t turn_id, const ObLSID &ls_id, ObIArray<ObTabletID> &tablet_ids);
+  int read_deleted_tablet_info_v_4_1_x(const ObLSID &ls_id, ObIArray<ObTabletID> &deleted_tablet_ids);
+  // table list
+  int write_single_table_list_part_file(const share::SCN &scn, const int64_t part_no, const ObBackupPartialTableListDesc &table_list);
+  int write_table_list_meta_info(const share::SCN &scn, const ObBackupTableListMetaInfoDesc &desc);
+  int read_table_list_file(const char* file_name, ObBackupPartialTableListDesc &desc);
+  int is_table_list_meta_exist(const share::SCN &scn, bool &is_exist);
+  // cluster parameters
+  int write_cluster_param_info(const ObExternParamInfoDesc &cluster_param_info);
+  // mview dep tablet list
+  int write_major_compaction_mview_dep_tablet_list(const ObBackupMajorCompactionMViewDepTabletListDesc &desc);
+  int read_major_compaction_mview_dep_tablet_list(ObBackupMajorCompactionMViewDepTabletListDesc &desc);
+#ifdef OB_BUILD_SHARED_STORAGE
+  // tablet group checkpoint
+  int write_tablet_group_checkpoint(const share::ObLSID &ls_id, const int64_t retry_id, const ObSSBackupTabletGroupCheckpointDesc &desc);
+  int read_tablet_group_checkpoint(const share::ObLSID &ls_id, const int64_t retry_id, ObSSBackupTabletGroupCheckpointDesc &desc);
+  // tablet meta info
+  int write_tablet_meta_file_info(const share::ObLSID &ls_id, const common::ObTabletID &tablet_id, const ObSSBackupTabletMetaFileInfoDesc &desc);
+  int read_tablet_meta_file_info(const share::ObLSID &ls_id, const common::ObTabletID &tablet_id, ObSSBackupTabletMetaFileInfoDesc &desc);
+  // tablet macro block file info
+  int write_tablet_macro_block_file_info(const share::ObLSID &ls_id, const common::ObTabletID &tablet_id, const ObSSBackupTabletMacroBlockFileInfoDesc &desc);
+  int is_tablet_macro_block_file_info_exist(const share::ObLSID &ls_id, const common::ObTabletID &tablet_id, bool &is_exist);
+  int read_tablet_macro_block_file_info(const share::ObLSID &ls_id, const common::ObTabletID &tablet_id, ObSSBackupTabletMacroBlockFileInfoDesc &desc);
+  // ss ls meta infos
+  int write_ss_ls_meta_infos(const ObBackupSSLSMetaInfosDesc &ls_meta_infos);
+  int read_ss_ls_meta_infos(common::ObIAllocator &allocator, ObBackupSSLSMetaInfosDesc &ls_meta_infos);
+#endif      
+  // write file list when path contains only one file
+  int write_backup_meta_file_list(const share::ObBackupLSTaskAttr &ls_attr);
+  int write_backup_data_file_list(const share::ObBackupLSTaskAttr &ls_attr);
+  int write_backup_fuse_meta_info_file_list(const share::ObBackupLSTaskAttr &ls_attr);
+  int list_and_generate_file_list_(
+    const ObBackupPath &path, 
+    const ObBackupFileSuffix &suffix,
+    backup::ObBackupFileListInfo &file_list_info);
+  int write_file_list(
+      const ObBackupPath &dir_path, 
+      const ObBackupPathString &file_name, 
+      const ObIBackupSerializeProvider &serializer);
+  TO_STRING_KV(K_(backup_desc));
+
+public:
+  static int parse_backup_set_name(const ObBackupSetFilter::BackupSetDirName &backup_up_set_name,
+      share::ObBackupSetDesc &backup_desc);
+  static int extract_id_from_str(const common::ObString &file_name, const common::ObString &prefix, int64_t &file_id, bool &match);
+      
+  struct ObBackupSetDescComparator
+  {
+    bool operator()(const share::ObBackupSetDesc &left, const share::ObBackupSetDesc &right) const
+    {
+      return left.backup_set_id_ < right.backup_set_id_;
+    }
+  };
+
+    struct ObBackupSetFileDescComparator
+  {
+    bool operator()(const share::ObBackupSetFileDesc &left, const share::ObBackupSetFileDesc &right) const
+    {
+      return left.backup_set_id_ < right.backup_set_id_;
+    }
+  };
+private:
+  int do_get_backup_set_array_(
+      const bool check_passwd,
+      const common::ObString &passwd_array, 
+      const share::SCN &restore_scn, 
+      const ObBackupSetFilter &op, 
+      common::ObIArray<share::ObBackupSetBriefInfo> &tmp_backup_set_list, 
+      int64_t &cur_max_backup_set_id, share::SCN &restore_start_scn);
+  int get_backup_set_placeholder_path_(const bool is_inner, const bool is_start, const bool is_succeed, 
+      const share::SCN &replay_scn, const share::SCN &min_restore_scn, share::ObBackupPath &path);
+private:
+  share::ObBackupSetDesc backup_desc_;
+  share::ObBackupDest backup_set_dest_;
+  DISALLOW_COPY_AND_ASSIGN(ObBackupDataStore);
+};
+
+}
+}
+#endif  // OCEANBASE_SHARE_OB_BACKUP_DATA_STORE_H_

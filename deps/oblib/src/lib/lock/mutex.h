@@ -1,0 +1,55 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef MUTEX_H
+#define MUTEX_H
+
+#include <pthread.h>
+#include "lib/lock/ob_lock.h"
+
+namespace obutil
+{
+
+/**
+ * A wrapper class of pthread mutex.
+ * This class is intended to be used in other low level construct only.
+ * In most situations, you should use ObLatch or ObMutex.
+ *
+ */
+class ObUtilMutex
+{
+public:
+
+  typedef ObLockT<ObUtilMutex> Lock;
+  typedef ObTryLockT<ObUtilMutex> TryLock;
+
+  ObUtilMutex(long long latch_id);
+  ~ObUtilMutex();
+
+  void lock() const;
+  bool trylock() const;
+  void unlock() const;
+  bool will_unlock() const;
+
+private:
+
+  ObUtilMutex(const ObUtilMutex&);
+  ObUtilMutex& operator=(const ObUtilMutex&);
+
+  struct LockState
+  {
+    pthread_mutex_t* mutex;
+  };
+
+  void unlock(LockState&) const;
+  void lock(LockState&) const;
+  mutable pthread_mutex_t _mutex;
+  long long latch_id_;
+
+  friend class Cond;
+};
+typedef ObUtilMutex Mutex;
+}//end namespace
+#endif

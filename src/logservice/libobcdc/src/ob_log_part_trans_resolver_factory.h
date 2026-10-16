@@ -1,0 +1,86 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_LIBOBCDC_OB_LOG_PART_TRANS_RESOLVER_FACTORY_H__
+#define OCEANBASE_LIBOBCDC_OB_LOG_PART_TRANS_RESOLVER_FACTORY_H__
+
+#include "ob_cdc_part_trans_resolver.h"           // IObLogPartTransResolver, PartTransTaskMap
+#include "lib/allocator/ob_small_allocator.h"     // ObSmallAllocator
+#include "share/ob_define.h"                       // OB_INVALID_CLUSTER_ID
+
+namespace oceanbase
+{
+namespace libobcdc
+{
+
+class IObLogPartTransResolverFactory
+{
+public:
+  virtual ~IObLogPartTransResolverFactory() {}
+
+public:
+  virtual int alloc(const char *tls_id_str, IObCDCPartTransResolver *&ptr) = 0;
+  virtual void free(IObCDCPartTransResolver *ptr) = 0;
+};
+
+/////////////////////////////////////////////////////////////////////
+
+typedef ObLogTransTaskPool<PartTransTask> TaskPool;
+class IObLogEntryTaskPool;
+class IObLogFetcherDispatcher;
+class IObLogClusterIDFilter;
+class IObLogLsnFilter;
+
+class ObLogPartTransResolverFactory : public IObLogPartTransResolverFactory
+{
+  static const int64_t DEFAULT_BLOCK_SIZE = (1L << 24);
+
+public:
+  ObLogPartTransResolverFactory();
+  virtual ~ObLogPartTransResolverFactory();
+
+public:
+  int init(TaskPool &task_pool,
+      IObLogEntryTaskPool &log_entry_task_pool,
+      IObLogFetcherDispatcher &dispatcher,
+      IObLogClusterIDFilter &cluster_id_filter,
+      IObLogLsnFilter &lsn_filter,
+      const int64_t source_cluster_id);
+  void destroy();
+
+public:
+  virtual int alloc(const char *tls_id_str, IObCDCPartTransResolver *&ptr);
+  virtual void free(IObCDCPartTransResolver *ptr);
+
+  struct TransInfoClearerByCheckpoint
+  {
+    int64_t checkpoint_;
+    int64_t purge_count_;
+
+    explicit TransInfoClearerByCheckpoint(const int64_t checkpoint) : checkpoint_(checkpoint), purge_count_(0)
+    {}
+    bool operator()(const PartTransID &part_trans_id, TransCommitInfo &trans_commit_info);
+  };
+
+private:
+  bool                      inited_;
+  TaskPool                  *task_pool_;
+  IObLogEntryTaskPool       *log_entry_task_pool_;
+  IObLogFetcherDispatcher   *dispatcher_;
+  IObLogClusterIDFilter     *cluster_id_filter_;
+  IObLogLsnFilter           *lsn_filter_;
+  int64_t                   source_cluster_id_;
+
+  common::ObSmallAllocator  allocator_;
+  PartTransTaskMap          task_map_;
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObLogPartTransResolverFactory);
+};
+
+}
+}
+
+#endif

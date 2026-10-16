@@ -1,0 +1,53 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef STORAGE_LOG_STREAM_BACKUP_FILE_WRITER_CTX_H_
+#define STORAGE_LOG_STREAM_BACKUP_FILE_WRITER_CTX_H_
+#include "common/storage/ob_io_device.h"
+#include "storage/blocksstable/ob_data_buffer.h"
+#include "lib/utility/utility.h"
+namespace oceanbase {
+
+namespace backup {
+
+struct ObBackupFileWriteCtx {
+public:
+  ObBackupFileWriteCtx();
+  virtual ~ObBackupFileWriteCtx();
+  int open(const int64_t max_file_size, const common::ObIOFd &io_fd, common::ObIODevice &device_handle,
+      common::ObInOutBandwidthThrottle &bandwidth_throttle);
+  bool is_opened() const
+  {
+    return is_inited_;
+  }
+  int append_buffer(const blocksstable::ObBufferReader &buffer, const bool is_last_part = false);
+  int64_t get_file_size() const
+  {
+    return file_size_;
+  }
+  int close();
+
+private:
+  int write_buffer_(const char *buf, const int64_t len, const bool is_last_part);
+  bool check_can_flush_(const bool is_last_part) const;
+  int flush_buffer_(const bool is_last_part);
+  int commit_file_();
+
+private:
+  bool is_inited_;
+  int64_t file_size_;
+  int64_t max_file_size_;
+  common::ObIOFd io_fd_;
+  common::ObIODevice *dev_handle_;
+  blocksstable::ObSelfBufferWriter data_buffer_;
+  common::ObInOutBandwidthThrottle *bandwidth_throttle_;
+  int64_t last_active_time_;
+  DISALLOW_COPY_AND_ASSIGN(ObBackupFileWriteCtx);
+};
+
+}  // namespace backup
+}  // namespace oceanbase
+
+#endif

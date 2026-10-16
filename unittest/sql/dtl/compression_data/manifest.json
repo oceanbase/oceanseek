@@ -1,0 +1,45 @@
+{
+  "generator": "DuckDB official tpch/tpcds extensions",
+  "duckdb_version": "1.4.4",
+  "scale": 0.01,
+  "max_rows_per_table": 256,
+  "format": "pipe-delimited CSV, no header",
+  "files": [
+    {
+      "file": "tpch_lineitem.csv",
+      "rows": 256,
+      "bytes": 30828,
+      "sha256": "7bc9ab21e724771f2edd6810cabb6aedb05f381964af9a578630dbf8dd573c76"
+    },
+    {
+      "file": "tpch_orders.csv",
+      "rows": 256,
+      "bytes": 28296,
+      "sha256": "eeb3de495a3dc0bfb1928def5bde46f613e384f088abad92a66aaa2d1ed0830a"
+    },
+    {
+      "file": "tpch_customer.csv",
+      "rows": 256,
+      "bytes": 41013,
+      "sha256": "2f855c6b179430e547aac4e96ecae0c242b0750d97ea40244de2f1f9e805318d"
+    },
+    {
+      "file": "tpcds_store_sales.csv",
+      "rows": 256,
+      "bytes": 32117,
+      "sha256": "6d7e5fc4750f6566708aaeda577981361e4459adef90edeebbccfb8fc15578be"
+    },
+    {
+      "file": "tpcds_item.csv",
+      "rows": 180,
+      "bytes": 49772,
+      "sha256": "d23c8e945458c9b3bbc1ffd965a692e2dae3941d3ed7bc608c95d976517b79a4"
+    },
+    {
+      "file": "tpcds_customer.csv",
+      "rows": 256,
+      "bytes": 32606,
+      "sha256": "ac0e40209dd1bed6f810ce6ef2df5192b27f49f6b83fbc8f78c0277a06898f4a"
+    }
+  ]
+}

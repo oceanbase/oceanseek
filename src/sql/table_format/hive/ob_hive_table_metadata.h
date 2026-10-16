@@ -1,0 +1,295 @@
+/**
+ * Copyright (c) 2023 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OB_SQL_TABLE_FORMAT_HIVE_H
+#define OB_SQL_TABLE_FORMAT_HIVE_H
+
+#include "lib/allocator/ob_allocator.h"
+#include "lib/container/ob_array_wrap.h"
+#include "lib/string/ob_string.h"
+#include "share/catalog/hive/thrift/gen_cpp/hive_metastore_types.h"
+#include "share/catalog/ob_external_catalog.h"
+#include "share/ob_define.h"
+#include "sql/engine/cmd/ob_load_data_parser.h"
+
+#include <optional>
+#include <string>
+#include <vector>
+
+namespace oceanbase
+{
+namespace sql
+{
+namespace hive
+{
+namespace ApacheHive = Apache::Hadoop::Hive;
+
+using FieldSchemas = std::vector<ApacheHive::FieldSchema>;
+using String = std::string;
+using Strings = std::vector<String>;
+using PartitionValuesRows = std::vector<ApacheHive::PartitionValuesRow>;
+
+// Hive related types.
+const char *const TINYINT = "tinyint";
+const char *const SMALLINT = "smallint";
+const char *const INT = "int";
+const char *const BIGINT = "bigint";
+const char *const BOOLEAN = "boolean";
+const char *const FLOAT = "float";
+const char *const DOUBLE = "double";
+// Note: decimal will be filled such as decimal(10, 2).
+const char *const DECIMAL = "decimal";
+const char *const STRING = "string";
+// Note: varchar will be filled such as varchar(50).
+const char *const VARCHAR = "varchar";
+// Note: char will be filled such as char(5).
+const char *const CHAR = "char";
+const char *const BINARY = "binary";
+const char *const TIMESTAMP = "timestamp";
+const char *const DATE = "date";
+// Complicated type will delay to support.
+const char *const ARRAY = "array";
+const char *const MAP = "map";
+const char *const STRUCT = "struct";
+const char *const UNIONTYPE = "uniontype";
+const char *const VECTOR = "vector";
+const char *const SPARSEVECTOR = "sparsevector";
+
+// Hive default delimiters
+// Ctrl + A
+const char *const DEFAULT_FIELD_DELIMITER = "\x01";
+// Ctrl + B
+const char *const DEFAULT_COLLECTION_ITEMS_DELIMETER = "\x02";
+// Ctrl + C
+const char *const DEFAULT_MAP_KEYS_DELIMITER = "\x03";
+const char *const DEFAULT_LINE_DELIMITER = "\n";
+
+// Hive csv output default delimiters.
+const char *const DEFAULT_SEPARTOR_CHAR = ",";
+const char *const DEFAULT_QUATA_CHAR = "\"";
+const char *const DEFAULT_ESCAPE_CHAR = "\"";
+
+// parquet format related.
+const char *const PARQUET_COMPRESSION = "parquet.compression";
+const char *const ROW_GROUP_SIZE = "parquet.block.size";
+// orc format related.
+const char *const ORC_COMPRESSION = "orc.compress";
+const char *const ORC_COMPRESSION_BLOCK_SIZE = "orc.compress.size";
+const char *const ORC_STRIPE_SIZE = "orc.stripe.size";
+const char *const ORC_ROW_INDEX_STRIDE = "orc.row.index.stride";
+const char *const ORC_BLOOM_FILTER_COLUMNS = "orc.bloom.filter.columns";
+
+// Hive paramters keys
+const char *const MAPKEY_DELIM = "mapkey.delim";
+
+// Here is for compatibility with Hive 2.x version.
+// There is a typo in Hive 2.x version, and fixed in Hive 3.x version.
+// https://issues.apache.org/jira/browse/HIVE-16922
+const char *const HIVE_2_COLLECTION_DELIM = "colelction.delim";
+const char *const COLLECTION_DELIM = "collection.delim";
+const char *const SERIALIZATION_FORMAT = "serialization.format";
+const char *const LINE_DELIM = "line.delim";
+const char *const FIELD_DELIM = "field.delim";
+
+// CSV_OUTPUT_FORMAT specify delims.
+const char *const SEPARATOR_CHAR = "separatorChar";
+const char *const QUOTA_CHAR = "quoteChar";
+const char *const ESCAPE_CHAR = "escapeChar";
+
+// Hive related output formats.
+// We will use the output format to read the file by hdfs api.
+const char *const CSV_OUTPUT_FORMAT = "org.apache.hadoop.hive.serde2.OpenCSVSerde";
+const char *const TEXTFILE_OUTPUT_FORMAT = "org.apache.hadoop.hive.ql.io.HiveIgnoreKeyTextOutputFormat";
+const char *const PARQUET_OUTPUT_FORMAT = "org.apache.hadoop.hive.ql.io.parquet.MapredParquetOutputFormat";
+const char *const ORC_OUTPUT_FORMAT = "org.apache.hadoop.hive.ql.io.orc.OrcOutputFormat";
+
+static constexpr int64_t OB_MAX_ACCESS_INFO_LENGTH = 1600;
+const char *const HMS_KEYTAB = "hms_keytab=";
+const char *const HMS_PRINCIPAL = "hms_principal=";
+const char *const HMS_KRB5CONF = "hms_krb5conf=";
+
+// Collection column type related.
+static constexpr uint8_t OB_ARRAY_MAX_NESTED_LEVEL = 6;
+
+class ObHiveTableMetadata final : public share::ObILakeTableMetadata
+{
+public:
+  explicit ObHiveTableMetadata(ObIAllocator &allocator)
+      : share::ObILakeTableMetadata(allocator), table_schema_(&allocator)
+  {
+  }
+
+  virtual ~ObHiveTableMetadata() = default;
+
+  share::ObLakeTableFormat get_format_type() const override;
+
+  int assign(const ObHiveTableMetadata &other);
+
+  int64_t get_convert_size() const override;
+
+  int setup_tbl_schema(const uint64_t tenant_id,
+                       const uint64_t database_id,
+                       const uint64_t table_id,
+                       const Apache::Hadoop::Hive::Table &table,
+                       const ObString &properties,
+                       const ObString &uri,
+                       const uint64_t location_object_id,
+                       const ObString &location_object_sub_path,
+                       const Apache::Hadoop::Hive::SQLAllTableConstraints *hms_constraints = nullptr);
+
+  template <typename PartValsArrayType>
+  static int calculate_part_val_from_string_impl(const share::schema::ObTableSchema &table_schema,
+                                                 const bool &is_part_table,
+                                                 const PartValsArrayType &one_part_vals,
+                                                 ObIAllocator &allocator,
+                                                 ObNewRow &ob_part_row);
+
+  static int calculate_part_val_from_string(const share::schema::ObTableSchema &table_schema,
+                                            const bool &is_part_table,
+                                            const ObIArray<ObString> &one_part_vals,
+                                            ObIAllocator &allocator,
+                                            ObNewRow &ob_part_row);
+  static int calculate_part_val_from_string(const share::schema::ObTableSchema &table_schema,
+                                            const bool &is_part_table,
+                                            const ObIArrayWrap<ObString> &one_part_vals,
+                                            ObIAllocator &allocator,
+                                            ObNewRow &ob_part_row);
+
+  const share::schema::ObTableSchema &get_table_schema() const
+  {
+    return table_schema_;
+  }
+
+protected:
+  // hive format does not need to build table schema again, it already set up in `setup_tbl_schema`.
+  int do_build_table_schema(std::optional<int32_t> schema_id,
+                            std::optional<int64_t> snapshot_id,
+                            share::schema::ObTableSchema *&table_schema) override;
+
+private:
+  static int setup_external_format(const Apache::Hadoop::Hive::Table &table,
+                                   const ObString &output_format,
+                                   ObIAllocator &allocator,
+                                   share::schema::ObTableSchema &table_schema,
+                                   ObExternalFileFormat &format,
+                                   bool &is_open_csv);
+  static int handle_csv_format(const Apache::Hadoop::Hive::Table &table,
+                               const bool &is_open_csv,
+                               ObIAllocator &allocator,
+                               ObExternalFileFormat &format);
+  static int handle_parquet_format(const Apache::Hadoop::Hive::Table &table,
+                                   ObIAllocator &allocator,
+                                   ObExternalFileFormat &format);
+  static int handle_orc_format(const Apache::Hadoop::Hive::Table &table,
+                               ObIAllocator &allocator,
+                               ObExternalFileFormat &format);
+  static int setup_external_location(const Apache::Hadoop::Hive::Table &table,
+                                     const ObString &location,
+                                     const ObString &uri,
+                                     const uint64_t location_object_id,
+                                     const ObString &location_object_sub_path,
+                                     ObIAllocator &allocator,
+                                     share::schema::ObTableSchema &table_schema);
+  static int extract_real_location(const ObString &uri,
+                                   const ObString &table_location,
+                                   ObIAllocator &allocator,
+                                   ObString &real_location);
+  static int extract_table_location_path(const ObString &table_location,
+                                         const int64_t path_len,
+                                         char *path);
+  static int extract_host_and_port(const ObString &uri,
+                                   char *host, 
+                                   int &port);
+  static int build_column_schemas(const FieldSchemas &normal_cols,
+                                  const FieldSchemas &part_cols,
+                                  const bool &is_open_csv,
+                                  ObExternalFileFormat &format,
+                                  share::schema::ObTableSchema &table_schema);
+  static int build_placeholder_column_schemas(
+      const FieldSchemas &normal_cols,
+      const FieldSchemas &part_cols,
+      ObExternalFileFormat &format,
+      share::schema::ObTableSchema &table_schema,
+      const ApacheHive::SQLAllTableConstraints *hms_constraints);
+  static int handle_column_types(const FieldSchemas &cols,
+                                 const bool is_part_cols,
+                                 const bool &is_open_csv,
+                                 ObExternalFileFormat &format,
+                                 share::schema::ObTableSchema &table_schema,
+                                 int64_t &col_index,
+                                 int64_t &part_index);
+  // Placeholder tables carry the OB type strings written by the sync path.
+  static int handle_ob_native_column_types(
+      const FieldSchemas &cols,
+      const bool is_part_cols,
+      ObExternalFileFormat &format,
+      share::schema::ObTableSchema &table_schema,
+      int64_t &col_index,
+      int64_t &part_index,
+      const ApacheHive::SQLAllTableConstraints *hms_constraints);
+  static int handle_column_properties(const bool &is_part_cols,
+                                      ObExternalFileFormat &format,
+                                      const bool &is_bool_tinyint,
+                                      const bool &is_binary_collation,
+                                      ObIAllocator &allocator,
+                                      share::schema::ObColumnSchemaV2 &column_schema,
+                                      int64_t &part_index);
+  static int set_partition_expr(const FieldSchemas &par_cols,
+                                share::schema::ObTableSchema &table_schema);
+
+  static int extract_decimal_precision_and_scale(ObString &decimal,
+                                                 int64_t *precision,
+                                                 int64_t *scale);
+  static int extract_varchar_char_length(ObString &char_or_varchar, 
+                                         int64_t *length);
+  static int convert_collection_type_info(const ObString &src,
+                                          ObIAllocator &allocator,
+                                          ObString &dst);
+  // Sync-only mirror converter for OB native collection strings
+  // (VECTOR/SPARSEVECTOR/ARRAY/MAP/STRUCT).
+  static int convert_ob_native_collection_type_info(const ObString &src,
+                                                    ObIAllocator &allocator,
+                                                    ObString &dst);
+  static int handle_timestamp_part_val(const ObString &part_val,
+                                       ObIAllocator &allocator,
+                                       ObString &out_part_val);
+  static int calc_num_from_str(const ObString &part_val, const bool &is_tinyint, int64_t &val);
+  static int concat_type_to_collection_type(const ObString &src,
+                                            const int32_t &start_index,
+                                            const int32_t &end_index,
+                                            const ObString &type,
+                                            ObIAllocator &allocator,
+                                            ObString &dst);
+
+  // Helpers for parsing the real OB type strings (produced by ob_sql_type_str on the sync path)
+  // when catalog sync is enabled. Used by handle_ob_native_column_types.
+  static int64_t extract_ob_paren_int(const ObString &type_str);
+  static void extract_ob_paren_two_ints(const ObString &type_str, int64_t &first, int64_t &second);
+  static ObString extract_ob_type_keyword(const ObString &type_str, char *buf, const int64_t buf_len);
+  static bool ob_type_has_unsigned(const ObString &type_str);
+  // Formatter-only spellings ob_sql_type_str emits that are not distinct name-table entries
+  // (binary variants of char/varchar/text, geometry subtypes). Sets is_binary for the binary
+  // variants; returns ObMaxType when kw is not such an alias.
+  static common::ObObjType resolve_ob_native_type_alias(const ObString &kw, bool &is_binary);
+  // Reverse of ob_sql_type_str(ObObjType): (base keyword, unsigned) -> ObObjType, driven by OB's
+  // own type-name table so plain types need no hand-maintained list. Returns ObMaxType on miss.
+  static common::ObObjType field_keyword_to_ob_type(const ObString &kw, const bool is_unsigned);
+  static int parse_ob_enum_set_values(const ObString &type_str,
+                                      ObIAllocator &alloc,
+                                      ObIArray<ObString> &values);
+  static int setup_ob_native_column_type(const ObString &field_type,
+                                         const bool is_oracle_mode,
+                                         ObIAllocator &alloc,
+                                         share::schema::ObColumnSchemaV2 &column_schema);
+
+private:
+  share::schema::ObTableSchema table_schema_;
+};
+} // namespace hive
+} // namespace sql
+
+} // namespace oceanbase
+
+#endif // OB_SQL_TABLE_FORMAT_HIVE_H

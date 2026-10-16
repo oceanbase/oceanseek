@@ -1,0 +1,59 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include "ob_remote_log_source_allocator.h"
+
+namespace oceanbase
+{
+namespace logservice
+{
+ObRemoteLogParent *ObResSrcAlloctor::alloc(const share::ObLogRestoreSourceType &type,
+    const share::ObLSID &ls_id)
+{
+  ObRemoteLogParent *source = NULL;
+  if (! is_valid_log_source_type(type)) {
+    // just skip
+  } else {
+    switch (type) {
+      case share::ObLogRestoreSourceType::SERVICE:
+        source = OB_NEW(ObRemoteSerivceParent, "SerSource", ls_id);
+        break;
+      case share::ObLogRestoreSourceType::RAWPATH:
+        source = OB_NEW(ObRemoteRawPathParent, "DestSource", ls_id);
+        break;
+      case share::ObLogRestoreSourceType::LOCATION:
+        source = OB_NEW(ObRemoteLocationParent, "LocSource", ls_id);
+        break;
+      default:
+        CLOG_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "cannot allocate ObRemoteLogParent for invalid type", K(type), K(ls_id));
+        break;
+    }
+  }
+  return source;
+}
+
+void ObResSrcAlloctor::free(ObRemoteLogParent *source)
+{
+  if (NULL != source) {
+    const share::ObLogRestoreSourceType type = source->get_source_type();
+    switch (type) {
+      case share::ObLogRestoreSourceType::SERVICE:
+        MTL_DELETE(ObRemoteLogParent, "SerSource", source);
+        break;
+      case share::ObLogRestoreSourceType::RAWPATH:
+        MTL_DELETE(ObRemoteLogParent, "DestSource", source);
+        break;
+      case share::ObLogRestoreSourceType::LOCATION:
+        MTL_DELETE(ObRemoteLogParent, "LocSource", source);
+        break;
+      default:
+        CLOG_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "cannot free ObRemoteLogParent for a invalid type", K(type), KP(source));
+        break;
+    }
+    source = NULL;
+  }
+}
+} // namespace logservice
+} // namespace oceanbase

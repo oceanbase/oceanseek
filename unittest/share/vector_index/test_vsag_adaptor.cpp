@@ -1,0 +1,1566 @@
+/**
+ * Copyright (c) 2024 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX LIB
+
+#include <gtest/gtest.h>
+#include <algorithm>
+#include <iostream>
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+#include "lib/vector/ob_vector_util.h"
+#include "lib/utility/ob_macro_utils.h"
+#include "lib/oblog/ob_log.h"
+#include "vsag/vsag.h"
+#include "vsag/errors.h"
+#include "vsag/dataset.h"
+#include "vsag/search_param.h"
+#include "vsag/index.h"
+#include "vsag/options.h"
+#include "vsag/factory.h"
+#include "roaring/roaring64.h"
+
+namespace oceanbase
+{
+namespace common
+{
+
+using namespace vsag;
+class TestVsagAdaptor : public ::testing::Test
+{
+public:
+  TestVsagAdaptor(): logger_() {}
+  ~TestVsagAdaptor() {}
+
+  virtual void SetUp();
+  virtual void TearDown() {}
+
+private:
+  obvectorutil::ObVsagLogger logger_;
+  // disallow copy
+  DISALLOW_COPY_AND_ASSIGN(TestVsagAdaptor);
+};
+
+void TestVsagAdaptor::SetUp()
+{
+  obvsag::set_logger(&logger_);
+}
+
+class DefaultVsagAllocator : public vsag::Allocator
+{
+public:
+  constexpr static int64_t MEM_PTR_HEAD_SIZE = sizeof(int64_t);
+  DefaultVsagAllocator() = default;
+  virtual ~DefaultVsagAllocator() = default;
+
+  DefaultVsagAllocator(const DefaultVsagAllocator&) = delete;
+  DefaultVsagAllocator(DefaultVsagAllocator&&) = delete;
+
+public:
+  std::string Name() override { return "DefaultVsagAllocator"; }
+
+  void* Allocate(size_t size) override;
+
+  void Deallocate(void* p) override;
+
+  void* Reallocate(void* p, size_t size) override;
+
+
+  int64_t total_{0};
+};
+
+void* DefaultVsagAllocator::Allocate(size_t size)
+{
+  void *ret_ptr = nullptr;
+  if (size != 0) {
+    int64_t actual_size = MEM_PTR_HEAD_SIZE + size;
+    void *ptr = malloc(actual_size);
+    if (nullptr != ptr) {
+      // total_ += size;
+      ATOMIC_AAF(&total_, actual_size);
+      *(int64_t*)ptr = actual_size;
+      ret_ptr = (char*)ptr + MEM_PTR_HEAD_SIZE;
+    }
+    // if (total_ < 0) abort();
+    // LOG_INFO("allocate memoery", KP(this), KP(ptr), K(size), K(total_));
+  }
+  if (size != 0 && nullptr == ret_ptr) {
+    abort();
+  }
+  return ret_ptr;
+}
+
+void DefaultVsagAllocator::Deallocate(void* p)
+{
+  if (nullptr != p) {
+    void *size_ptr = (char*)p - MEM_PTR_HEAD_SIZE;
+    int64_t size = *(int64_t *)size_ptr;
+    // total_ -= size;
+    ATOMIC_SAF(&total_, size);
+    free((char*)p - MEM_PTR_HEAD_SIZE);
+    // if (total_ < 0) abort();
+    // LOG_INFO("free memoery", KP(this), KP(p), K(size), K(total_));
+    p = nullptr;
+  }
+}
+
+void* DefaultVsagAllocator::Reallocate(void* p, size_t size)
+{
+  void *new_ptr = nullptr;
+  if (size == 0) {
+    if (nullptr != p) {
+      Deallocate(p);
+      p = nullptr;
+    }
+  } else if (nullptr == p) {
+    new_ptr = Allocate(size);
+  } else {
+    void *size_ptr = (char*)p - MEM_PTR_HEAD_SIZE;
+    int64_t old_size = *(int64_t *)size_ptr - MEM_PTR_HEAD_SIZE;
+    if (old_size >= size) {
+      new_ptr = p;
+    } else {
+      new_ptr = Allocate(size);
+      if (nullptr == new_ptr || nullptr == p) {
+      } else {
+        memcpy(new_ptr, p, old_size);
+        Deallocate(p);
+        p = nullptr;
+      }
+    }
+  }
+  return new_ptr;
+}
+
+
+class TestFilter : public obvsag::FilterInterface
+{
+public:
+  TestFilter(roaring::api::roaring64_bitmap_t *bitmap) : bitmap_(bitmap) {}
+  ~TestFilter() {}
+  bool test(int64_t id) override { return roaring::api::roaring64_bitmap_contains(bitmap_, id); }
+  bool test(const char* data) override { return true; }
+public:
+  roaring::api::roaring64_bitmap_t* bitmap_;
+};
+
+TEST_F(TestVsagAdaptor, test_obvectorutil_l1_hnsw_lifecycle)
+{
+  ASSERT_TRUE(obvsag::is_init());
+  DefaultVsagAllocator allocator;
+  obvsag::VectorIndexPtr index_handler = nullptr;
+  const int dim = 3;
+  const int ef_search = 64;
+  float vectors[] = {
+      0.0F, 0.0F, 0.0F,
+      2.0F, 2.0F, 2.0F,
+      1.0F, 3.0F, 5.0F};
+  int64_t ids[] = {10, 20, 30};
+  float query[] = {1.0F, 2.0F, 3.0F};
+
+  ASSERT_EQ(OB_SUCCESS, obvectorutil::create_index(
+      index_handler,
+      obvsag::HNSW_TYPE,
+      "float32",
+      "l1",
+      dim,
+      16,
+      200,
+      ef_search,
+      &allocator));
+  ASSERT_NE(nullptr, index_handler);
+  ASSERT_EQ(OB_SUCCESS,
+      obvectorutil::build_index(index_handler, vectors, ids, dim, 3));
+
+  const float *result_dist = nullptr;
+  const int64_t *result_ids = nullptr;
+  const char *extra_info = nullptr;
+  int64_t result_size = 0;
+  ASSERT_EQ(OB_SUCCESS, obvectorutil::knn_search(
+      index_handler,
+      query,
+      dim,
+      3,
+      result_dist,
+      result_ids,
+      extra_info,
+      result_size,
+      ef_search,
+      nullptr,
+      false,
+      false,
+      1.0F,
+      &allocator));
+
+  ASSERT_EQ(3, result_size);
+  EXPECT_EQ(20, result_ids[0]);
+  EXPECT_FLOAT_EQ(2.0F, result_dist[0]);
+  EXPECT_EQ(30, result_ids[1]);
+  EXPECT_FLOAT_EQ(3.0F, result_dist[1]);
+  EXPECT_EQ(10, result_ids[2]);
+  EXPECT_FLOAT_EQ(6.0F, result_dist[2]);
+  EXPECT_EQ(nullptr, extra_info);
+
+  allocator.Deallocate(const_cast<int64_t *>(result_ids));
+  allocator.Deallocate(const_cast<float *>(result_dist));
+  EXPECT_EQ(OB_SUCCESS, obvectorutil::delete_index(index_handler));
+  EXPECT_EQ(0, allocator.total_);
+}
+
+TEST_F(TestVsagAdaptor, test_hnsw)
+{
+  ASSERT_TRUE(obvsag::is_init());
+  obvsag::VectorIndexPtr index_handler = nullptr;
+  int dim = 1536;
+  int max_degree = 16;
+  int ef_search = 200;
+  int ef_construction = 100;
+  DefaultVsagAllocator default_allocator;
+  const char* const METRIC_L2 = "l2";
+  const char* const METRIC_IP = "ip";
+
+  const char* const DATATYPE_FLOAT32 = "float32";
+  void * test_ptr = default_allocator.Allocate(10);
+  ASSERT_EQ(0, obvsag::create_index(index_handler,
+                                                    obvsag::HNSW_TYPE,
+                                                    DATATYPE_FLOAT32,
+                                                    METRIC_L2,
+                                                    dim,
+                                                    max_degree,
+                                                    ef_construction,
+                                                    ef_search,
+                                                    &default_allocator));
+  int num_vectors = 10000;
+  auto ids = new int64_t[num_vectors];
+  auto vectors = new float[dim * num_vectors];
+  std::mt19937 rng;
+  rng.seed(47);
+  std::uniform_real_distribution<> distrib_real;
+  for (int64_t i = 0; i < num_vectors; ++i) {
+      ids[i] = i;
+  }
+  for (int64_t i = 0; i < dim * num_vectors; ++i) {
+      vectors[i] = distrib_real(rng);
+  }
+  ASSERT_EQ(0, obvsag::build_index(index_handler, vectors, ids, dim, num_vectors));
+
+  int64_t num_size = 0;
+  ASSERT_EQ(0, obvsag::get_index_number(index_handler, num_size));
+  std::cout<<"after add index, size is "<< num_size <<std::endl;
+
+  int inc_num = 10000;
+  auto inc = new float[dim * inc_num];
+  for (int64_t i = 0; i < dim * inc_num; ++i) {
+      inc[i] = distrib_real(rng);
+  }
+  auto ids2 = new int64_t[inc_num];
+  for (int64_t i = 0; i < inc_num; ++i) {
+      ids2[i] = i + num_vectors;
+  }
+
+  ASSERT_EQ(0, obvsag::add_index(index_handler, inc, ids2, dim,inc_num));
+  ASSERT_EQ(0, obvsag::get_index_number(index_handler, num_size));
+  std::cout<<"after add index, size is "<< num_size <<std::endl;
+  
+  const float* result_dist;
+  const int64_t* result_ids;
+  int64_t result_size = 0;
+
+  roaring::api::roaring64_bitmap_t* r1 = roaring::api::roaring64_bitmap_create();
+  TestFilter testfilter(r1);
+  const char *extra_info = nullptr;
+  ASSERT_EQ(0, obvsag::knn_search(index_handler, vectors+dim*(num_vectors-1), dim, 10,
+                                                result_dist,result_ids,result_size, 
+                                                100, false/*need_extra_info*/, extra_info, &testfilter, false, false, nullptr, 1));
+  default_allocator.Deallocate((void*)result_ids);
+  default_allocator.Deallocate((void*)result_dist);
+  roaring64_bitmap_add_range(r1, 0, 19800);
+
+  ASSERT_EQ(0, obvsag::knn_search(index_handler, vectors+dim*(num_vectors-1), dim, 10,
+                                                result_dist,result_ids,result_size, 
+                                                100, false/*need_extra_info*/, extra_info, &testfilter, false, false, nullptr, 0.01));
+  ASSERT_EQ(nullptr, extra_info);
+  // const float *distances;
+  // ret_knn_search = obvsag::cal_distance_by_id(index_handler, vectors+dim*(num_vectors-1), result_ids, result_size, distances);
+  for (int i = 0; i < result_size; i++) {
+      std::cout << "result: " << result_ids[i] << " " << result_dist[i] << std::endl;
+      // std::cout << "calres: " << result_ids[i] << " " << distances[i] << std::endl;
+  }
+  default_allocator.Deallocate((void*)result_ids);
+  default_allocator.Deallocate((void*)result_dist);
+  obvsag::delete_index(index_handler);
+  default_allocator.Deallocate(test_ptr);
+  ASSERT_EQ(0, default_allocator.total_);
+}
+
+TEST_F(TestVsagAdaptor, test_construct_hgraph_duplicate_create_param)
+{
+  char param[1024] = {'\0'};
+  ASSERT_EQ(OB_SUCCESS, obvsag::construct_vsag_create_param(
+      obvsag::HGRAPH_TYPE,
+      "float32",
+      "l2",
+      16,
+      16,
+      100,
+      64,
+      nullptr,
+      0,
+      0,
+      32,
+      false,
+      false,
+      false,
+      param,
+      true));
+  EXPECT_NE(nullptr, strstr(param, "\"use_old_serial_format\":true"));
+  EXPECT_NE(nullptr, strstr(param, "\"support_duplicate\":true"));
+
+  MEMSET(param, 0, sizeof(param));
+  ASSERT_EQ(OB_SUCCESS, obvsag::construct_vsag_create_param(
+      obvsag::HGRAPH_TYPE,
+      "float32",
+      "l2",
+      16,
+      16,
+      100,
+      64,
+      nullptr,
+      0,
+      0,
+      32,
+      false,
+      false,
+      false,
+      param,
+      false));
+  EXPECT_NE(nullptr, strstr(param, "\"use_old_serial_format\":true"));
+  EXPECT_EQ(nullptr, strstr(param, "support_duplicate"));
+
+  MEMSET(param, 0, sizeof(param));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, obvsag::construct_vsag_create_param(
+      obvsag::HNSW_TYPE, "float32", "l2", 16, 16, 100, 64,
+      nullptr, 0, 0, 32, false, false, false, param, true));
+}
+
+// Build with raw vsag::Factory (hard-coded hgraph JSON), serialize, then obvsag::fdeserialize and knn search.
+TEST_F(TestVsagAdaptor, test_vsag_direct_build_serialize_ob_deserialize_query)
+{
+  ASSERT_TRUE(obvsag::is_init());
+  DefaultVsagAllocator default_allocator;
+  const char *const DATATYPE_FLOAT32 = "float32";
+  const char *const METRIC_L2 = "l2";
+  const int dim = 64;
+  const int max_degree = 16;
+  const int ef_search = 200;
+  const int ef_construction = 100;
+  void *test_ptr = default_allocator.Allocate(10);
+
+  // Matches obvsag::create_index for HGRAPH_TYPE: max_degree doubled in param (16 -> 32); store_raw_vector
+  // as in construct_vsag_create_param for HGRAPH_TYPE.
+  const char *const k_hgraph_create_json =
+      "{\"dim\":64,\"dtype\":\"float32\",\"metric_type\":\"l2\",\"use_old_serial_format\":true,"
+      "\"index_param\":{\"ef_construction\":100,\"max_degree\":32,"
+      "\"base_quantization_type\":\"fp32\",\"build_thread_count\":0}}";
+
+  // Use vsag default allocator for the temporary built index so DefaultVsagAllocator accounting only
+  // tracks the ob_handler path (reset + delete_index balance Release in this unittest).
+  auto vs_idx_result = vsag::Factory::CreateIndex(
+      "hgraph", std::string(k_hgraph_create_json), nullptr);
+  ASSERT_TRUE(vs_idx_result.has_value());
+  std::shared_ptr<vsag::Index> vs_index = vs_idx_result.value();
+
+  const int num_vectors = 500;
+  auto ids = new int64_t[num_vectors];
+  auto vecs = new float[dim * num_vectors];
+  std::mt19937 rng(47);
+  std::uniform_real_distribution<> distrib_real;
+  for (int i = 0; i < num_vectors; ++i) {
+    ids[i] = i;
+  }
+  for (int i = 0; i < dim * num_vectors; ++i) {
+    vecs[i] = distrib_real(rng);
+  }
+
+  vsag::DatasetPtr dataset = vsag::Dataset::Make();
+  dataset->Dim(dim)
+      ->NumElements(num_vectors)
+      ->Ids(ids)
+      ->Float32Vectors(vecs)
+      ->Owner(false);
+  auto build_result = vs_index->Build(dataset);
+  ASSERT_TRUE(build_result.has_value());
+  ASSERT_TRUE(build_result.value().empty());
+
+  std::stringstream serialized;
+  auto ser_result = vs_index->Serialize(serialized);
+  ASSERT_TRUE(ser_result.has_value());
+  vs_index.reset();
+
+  obvsag::VectorIndexPtr ob_handler = nullptr;
+  ASSERT_EQ(0, obvsag::create_index(ob_handler,
+      obvsag::HGRAPH_TYPE,
+      DATATYPE_FLOAT32,
+      METRIC_L2,
+      dim,
+      max_degree,
+      ef_construction,
+      ef_search,
+      &default_allocator));
+  serialized.seekg(0, std::ios::beg);
+  ASSERT_EQ(0, obvsag::fdeserialize(ob_handler, serialized));
+
+  int64_t num_size = 0;
+  ASSERT_EQ(0, obvsag::get_index_number(ob_handler, num_size));
+  ASSERT_EQ(num_vectors, num_size);
+
+  const float *result_dist = nullptr;
+  const int64_t *result_ids = nullptr;
+  int64_t result_size = 0;
+  const char *extra_info = nullptr;
+  ASSERT_EQ(0, obvsag::knn_search(
+      ob_handler, vecs, dim, 10, result_dist, result_ids, result_size, ef_search,
+      false, extra_info, nullptr, false, false, static_cast<void *>(&default_allocator)));
+  ASSERT_GT(result_size, 0);
+  EXPECT_EQ(0, result_ids[0]);
+
+  default_allocator.Deallocate((void *)result_ids);
+  default_allocator.Deallocate((void *)result_dist);
+  obvsag::delete_index(ob_handler);
+  delete[] ids;
+  delete[] vecs;
+  default_allocator.Deallocate(test_ptr);
+  ASSERT_EQ(0, default_allocator.total_);
+}
+
+TEST_F(TestVsagAdaptor, test_hgraph_old_format_duplicate_mode_matrix)
+{
+  ASSERT_TRUE(obvsag::is_init());
+  constexpr int dim = 8;
+  constexpr int count = 8;
+  constexpr const char *true_param =
+      "{\"dim\":8,\"dtype\":\"float32\",\"metric_type\":\"l2\","
+      "\"use_old_serial_format\":true,\"index_param\":{"
+      "\"ef_construction\":100,\"max_degree\":16,"
+      "\"base_quantization_type\":\"fp32\",\"build_thread_count\":0,"
+      "\"support_duplicate\":true}}";
+  constexpr const char *false_param =
+      "{\"dim\":8,\"dtype\":\"float32\",\"metric_type\":\"l2\","
+      "\"use_old_serial_format\":true,\"index_param\":{"
+      "\"ef_construction\":100,\"max_degree\":16,"
+      "\"base_quantization_type\":\"fp32\",\"build_thread_count\":0}}";
+  std::vector<int64_t> ids(count);
+  std::vector<float> duplicate_vectors(count * dim, 0.0F);
+  std::vector<float> unique_vectors(count * dim, 0.0F);
+  for (int i = 0; i < count; ++i) {
+    ids[i] = i;
+    for (int d = 0; d < dim; ++d) {
+      unique_vectors[i * dim + d] = static_cast<float>(i * 10 + d);
+      if (i >= 4) {
+        duplicate_vectors[i * dim + d] = unique_vectors[i * dim + d];
+      }
+    }
+  }
+
+  const auto serialize = [&](const char *param,
+                             std::vector<float> &vectors,
+                             std::string &blob) -> bool {
+    auto index_result = vsag::Factory::CreateIndex("hgraph", param, nullptr);
+    if (!index_result.has_value()) {
+      return false;
+    }
+    auto index = index_result.value();
+    auto dataset = vsag::Dataset::Make();
+    dataset->Dim(dim)
+        ->NumElements(count)
+        ->Ids(ids.data())
+        ->Float32Vectors(vectors.data())
+        ->Owner(false);
+    auto build_result = index->Build(dataset);
+    if (!build_result.has_value() || !build_result.value().empty()) {
+      return false;
+    }
+    std::stringstream stream;
+    auto serialize_result = index->Serialize(stream);
+    if (!serialize_result.has_value()) {
+      return false;
+    }
+    blob = stream.str();
+    return !blob.empty();
+  };
+
+  std::string true_blob;
+  std::string false_blob;
+  std::string true_empty_extension_blob;
+  ASSERT_TRUE(serialize(true_param, duplicate_vectors, true_blob));
+  ASSERT_TRUE(serialize(false_param, duplicate_vectors, false_blob));
+  ASSERT_TRUE(serialize(true_param, unique_vectors, true_empty_extension_blob));
+
+  DefaultVsagAllocator allocator;
+  const auto create_handler = [&](const bool support_duplicate,
+                                  obvsag::VectorIndexPtr &handler) {
+    return obvsag::create_index(
+        handler, obvsag::HGRAPH_TYPE, "float32", "l2", dim, 16, 100, 64,
+        &allocator, 0, 0, 32, false, false, support_duplicate);
+  };
+  const auto deserialize = [&](obvsag::VectorIndexPtr &handler,
+                               const std::string &blob) {
+    std::stringstream stream(blob);
+    return obvsag::fdeserialize(handler, stream);
+  };
+
+  obvsag::VectorIndexPtr true_handler = nullptr;
+  ASSERT_EQ(OB_SUCCESS, create_handler(true, true_handler));
+  ASSERT_EQ(OB_SUCCESS, deserialize(true_handler, true_blob));
+  int64_t logical_count = 0;
+  ASSERT_EQ(OB_SUCCESS, obvsag::get_index_number(true_handler, logical_count));
+  ASSERT_EQ(count, logical_count);
+  float query[dim] = {0.0F};
+  const float *distances = nullptr;
+  const int64_t *result_ids = nullptr;
+  int64_t result_size = 0;
+  const char *extra_info = nullptr;
+  ASSERT_EQ(OB_SUCCESS, obvsag::knn_search(
+      true_handler, query, dim, 4, distances, result_ids, result_size, 64,
+      false, extra_info, nullptr, false, false, &allocator));
+  ASSERT_EQ(4, result_size);
+  std::vector<int64_t> expanded_ids(result_ids, result_ids + result_size);
+  std::sort(expanded_ids.begin(), expanded_ids.end());
+  EXPECT_EQ((std::vector<int64_t>{0, 1, 2, 3}), expanded_ids);
+  allocator.Deallocate(const_cast<float *>(distances));
+  allocator.Deallocate(const_cast<int64_t *>(result_ids));
+  obvsag::delete_index(true_handler);
+
+  // A true-mode reader requires the duplicate extension.  The generic
+  // fdeserialize contract does not own a global stream boundary and therefore
+  // does not reject bytes that follow a complete false-mode payload.
+  obvsag::VectorIndexPtr true_reads_false = nullptr;
+  ASSERT_EQ(OB_SUCCESS, create_handler(true, true_reads_false));
+  EXPECT_NE(OB_SUCCESS, deserialize(true_reads_false, false_blob));
+  obvsag::delete_index(true_reads_false);
+
+  obvsag::VectorIndexPtr false_handler = nullptr;
+  ASSERT_EQ(OB_SUCCESS, create_handler(false, false_handler));
+  EXPECT_EQ(OB_SUCCESS, deserialize(false_handler, false_blob));
+  ASSERT_EQ(OB_SUCCESS, obvsag::get_index_number(false_handler, logical_count));
+  EXPECT_EQ(count, logical_count);
+  obvsag::delete_index(false_handler);
+
+  // support_duplicate=true always has an extension, including zero groups.
+  obvsag::VectorIndexPtr true_empty_handler = nullptr;
+  ASSERT_EQ(OB_SUCCESS, create_handler(true, true_empty_handler));
+  EXPECT_EQ(OB_SUCCESS,
+            deserialize(true_empty_handler, true_empty_extension_blob));
+  obvsag::delete_index(true_empty_handler);
+
+  std::string truncated_true_blob = true_blob.substr(0, true_blob.size() - 1);
+  obvsag::VectorIndexPtr truncated_handler = nullptr;
+  ASSERT_EQ(OB_SUCCESS, create_handler(true, truncated_handler));
+  EXPECT_NE(OB_SUCCESS, deserialize(truncated_handler, truncated_true_blob));
+  obvsag::delete_index(truncated_handler);
+
+  EXPECT_EQ(0, allocator.total_);
+}
+
+// Expected JSON follows ob_vsag_adaptor.cpp construct_vsag_create_param / create_index call convention:
+// store_raw_vector defaults false from create_index; use_reorder is true (last argument).
+TEST_F(TestVsagAdaptor, test_construct_vsag_create_param_hnsw_family)
+{
+  const char *dtype = "float32";
+  const char *metric = "l2";
+  const int dim = 128;
+  const int max_degree = 32;
+  const int ef_construction = 100;
+  const int ef_search = 200;
+  char buf[1024];
+
+  memset(buf, 0, sizeof(buf));
+  ASSERT_EQ(
+      0,
+      obvsag::construct_vsag_create_param(static_cast<uint8_t>(obvsag::HNSW_TYPE),
+          dtype,
+          metric,
+          dim,
+          max_degree,
+          ef_construction,
+          ef_search,
+          nullptr,
+          0,
+          static_cast<int16_t>(0),
+          static_cast<int16_t>(32),
+          false,
+          false,
+          true,
+          buf));
+  EXPECT_STREQ(
+      "{\"dim\":128,\"dtype\":\"float32\",\"metric_type\":\"l2\",\"use_old_serial_format\":true,"
+      "\"hnsw\":{\"ef_construction\":100,\"ef_search\":200,\"max_degree\":32}}",
+      buf);
+
+  memset(buf, 0, sizeof(buf));
+  ASSERT_EQ(
+      0,
+      obvsag::construct_vsag_create_param(static_cast<uint8_t>(obvsag::HGRAPH_TYPE),
+          dtype,
+          metric,
+          dim,
+          max_degree,
+          ef_construction,
+          ef_search,
+          nullptr,
+          0,
+          static_cast<int16_t>(0),
+          static_cast<int16_t>(32),
+          false,
+          false,
+          true,
+          buf));
+  EXPECT_STREQ(
+      "{\"dim\":128,\"dtype\":\"float32\",\"metric_type\":\"l2\",\"use_old_serial_format\":true,"
+      "\"index_param\":{\"ef_construction\":100,\"max_degree\":32,"
+      "\"base_quantization_type\":\"fp32\",\"build_thread_count\":0,\"label_remap_type\":\"robin\"}}",
+      buf);
+
+  memset(buf, 0, sizeof(buf));
+  ASSERT_EQ(
+      0,
+      obvsag::construct_vsag_create_param(static_cast<uint8_t>(obvsag::HNSW_SQ_TYPE),
+          dtype,
+          metric,
+          dim,
+          max_degree,
+          ef_construction,
+          ef_search,
+          nullptr,
+          0,
+          static_cast<int16_t>(0),
+          static_cast<int16_t>(32),
+          false,
+          false,
+          true,
+          buf));
+  EXPECT_STREQ(
+      "{\"dim\":128,\"dtype\":\"float32\",\"metric_type\":\"l2\",\"use_old_serial_format\":true,"
+      "\"index_param\":{\"ef_construction\":100,\"max_degree\":32,\"base_quantization_type\":\"sq8\","
+      "\"build_thread_count\":0,\"label_remap_type\":\"robin\"}}",
+      buf);
+
+  memset(buf, 0, sizeof(buf));
+  ASSERT_EQ(
+      0,
+      obvsag::construct_vsag_create_param(static_cast<uint8_t>(obvsag::HNSW_BQ_TYPE),
+          dtype,
+          metric,
+          dim,
+          max_degree,
+          ef_construction,
+          ef_search,
+          nullptr,
+          0,
+          static_cast<int16_t>(0),
+          static_cast<int16_t>(32),
+          true,
+          false,
+          true,
+          buf));
+  EXPECT_STREQ(
+      "{\"dim\":128,\"dtype\":\"float32\",\"metric_type\":\"l2\",\"use_old_serial_format\":true,"
+      "\"index_param\":{\"ef_construction\":100,\"max_degree\":32,\"base_quantization_type\":\"rabitq\","
+      "\"build_thread_count\":0,\"label_remap_type\":\"robin\",\"use_reorder\":true,\"ignore_reorder\":true,"
+      "\"precise_quantization_type\":\"fp32\",\"precise_io_type\":\"block_memory_io\","
+      "\"rabitq_bits_per_dim_query\":32,\"rabitq_use_fht\":true}}",
+      buf);
+      ASSERT_EQ(
+        0,
+        obvsag::construct_vsag_create_param(static_cast<uint8_t>(obvsag::HNSW_BQ_TYPE),
+            dtype,
+            metric,
+            dim,
+            max_degree,
+            ef_construction,
+            ef_search,
+            nullptr,
+            0,
+            static_cast<int16_t>(0),
+            static_cast<int16_t>(32),
+            false,
+            false,
+            false ,
+            buf));
+    EXPECT_STREQ(
+        "{\"dim\":128,\"dtype\":\"float32\",\"metric_type\":\"l2\",\"use_old_serial_format\":true,"
+        "\"index_param\":{\"ef_construction\":100,\"max_degree\":32,\"base_quantization_type\":\"rabitq\","
+        "\"build_thread_count\":0,\"label_remap_type\":\"robin\","
+        "\"precise_quantization_type\":\"fp32\",\"precise_io_type\":\"block_memory_io\","
+        "\"rabitq_bits_per_dim_query\":32,\"rabitq_use_fht\":false}}",
+        buf);
+}
+
+TEST_F(TestVsagAdaptor, test_hnswsq)
+{
+  ASSERT_TRUE(obvsag::is_init());
+  obvsag::VectorIndexPtr index_handler = nullptr;
+  int dim = 128;
+  int max_degree = 16;
+  int ef_search = 200;
+  int ef_construction = 100;
+  DefaultVsagAllocator default_allocator;
+  const char* const METRIC_L2 = "l2";
+  const char* const METRIC_IP = "ip";
+
+  const char* const DATATYPE_FLOAT32 = "float32";
+  void * test_ptr = default_allocator.Allocate(10);
+  ASSERT_EQ(0, obvsag::create_index(index_handler,
+                                                    obvsag::HNSW_SQ_TYPE,
+                                                    DATATYPE_FLOAT32,
+                                                    METRIC_L2,
+                                                    dim,
+                                                    max_degree,
+                                                    ef_construction,
+                                                    ef_search,
+                                                    &default_allocator));
+  int num_vectors = 10000;
+  auto ids = new int64_t[num_vectors];
+  auto vectors = new float[dim * num_vectors];
+  std::mt19937 rng;
+  rng.seed(47);
+  std::uniform_real_distribution<> distrib_real;
+  for (int64_t i = 0; i < num_vectors; ++i) {
+      ids[i] = i + num_vectors*10;
+  }
+  for (int64_t i = 0; i < dim * num_vectors; ++i) {
+      vectors[i] = distrib_real(rng);
+  }
+  ASSERT_EQ(0, obvsag::build_index(index_handler, vectors, ids, dim, num_vectors));
+
+  int64_t num_size = 0;
+  ASSERT_EQ(0, obvsag::get_index_number(index_handler, num_size));
+  std::cout<<"after add index, size is "<< num_size <<std::endl;
+  
+  const float* result_dist;
+  const int64_t* result_ids;
+  int64_t result_size = 0;
+  auto query_vector = new float[dim];
+  for (int64_t i = 0; i < dim; ++i) {
+      query_vector[i] = distrib_real(rng);
+  }
+
+  roaring::api::roaring64_bitmap_t* r1 = roaring::api::roaring64_bitmap_create();
+
+  roaring::api::roaring64_bitmap_add(r1, 18);
+  roaring::api::roaring64_bitmap_add(r1, 1169);
+  roaring::api::roaring64_bitmap_add(r1, 1285);
+  std::cout << "before search" << std::endl;
+  TestFilter testfilter(r1);
+  const char *extra_info = nullptr;
+  ASSERT_EQ(0, obvsag::knn_search(index_handler, query_vector, dim, 10,
+                                                result_dist,result_ids,result_size, 
+                                                100, false/*need_extra_info*/, extra_info, &testfilter));
+  
+  for (int i = 0; i < result_size; i++) {
+      std::cout << "result: " << result_ids[i] << " " << result_dist[i] << std::endl;
+  }
+
+  default_allocator.Deallocate((void*)result_ids);
+  default_allocator.Deallocate((void*)result_dist);
+
+  int inc_num = 1000;
+  auto inc = new float[dim * inc_num];
+  for (int64_t i = 0; i < dim * inc_num; ++i) {
+      inc[i] = distrib_real(rng);
+  }
+  auto ids2 = new int64_t[inc_num];
+  for (int64_t i = 0; i < inc_num; ++i) {
+      ids2[i] = i + num_vectors*100;
+  }
+
+  // const std::string dir = "./";
+  // int ret_serialize_single = obvsag::serialize(index_handler,dir);
+  // int ret_deserilize_single_bin = 
+  //                 obvsag::deserialize_bin(index_handler,dir);
+  // ret_knn_search = obvsag::knn_search(index_handler, query_vector, dim, 10,
+  //                                              result_dist,result_ids,result_size, 
+  //                                              100, r1);
+  // for (int i = 0; i < result_size; i++) {
+  //     std::cout << "result: " << result_ids[i] << " " << result_dist[i] << std::endl;
+  // }
+  obvsag::delete_index(index_handler);
+  default_allocator.Deallocate(test_ptr);
+  ASSERT_EQ(0, default_allocator.total_);
+}
+
+TEST_F(TestVsagAdaptor, test_hgraph_extra_info)
+{
+  ASSERT_TRUE(obvsag::is_init());
+  obvsag::VectorIndexPtr index_handler = NULL;
+  int dim = 1536;
+  int max_degree = 16;
+  int ef_search = 200;
+  int ef_construction = 100;
+  DefaultVsagAllocator default_allocator;
+  const char* const METRIC_L2 = "l2";
+  const char* const METRIC_IP = "ip";
+
+  const char* const DATATYPE_FLOAT32 = "float32";
+  void * test_ptr = default_allocator.Allocate(10);
+  int extra_info_sz = 32;
+  std::cout<<"test create_index: "<<std::endl;
+  ASSERT_EQ(0, obvsag::create_index(index_handler,
+                                                    obvsag::HGRAPH_TYPE,
+                                                    DATATYPE_FLOAT32,
+                                                    METRIC_L2,
+                                                    dim,
+                                                    max_degree,
+                                                    ef_construction,
+                                                    ef_search,
+                                                    &default_allocator,
+                                                    extra_info_sz));
+
+  int num_vectors = 10000;
+  auto ids = new int64_t[num_vectors];
+  auto vectors = new float[dim * num_vectors];
+  std::mt19937 rng;
+  rng.seed(47);
+  std::uniform_real_distribution<> distrib_real;
+  for (int64_t i = 0; i < num_vectors; ++i) {
+      ids[i] = i;
+  }
+  for (int64_t i = 0; i < dim * num_vectors; ++i) {
+      vectors[i] = distrib_real(rng);
+  }
+  std::cout<<"test build_index: "<<std::endl;
+  char extra_infos[extra_info_sz * num_vectors];
+  for (int i = 0; i < extra_info_sz * num_vectors; i++) {
+      extra_infos[i] = rand() % 9 + '0';
+  }
+  ASSERT_EQ(0, obvsag::build_index(index_handler, vectors, ids, dim, num_vectors, extra_infos));
+
+  int64_t num_size = 0;
+  std::cout<<"test get_index_number: "<<std::endl;
+  ASSERT_EQ(0, obvsag::get_index_number(index_handler, num_size));
+  std::cout<<"after add index, size is "<< num_size <<std::endl;
+
+  int inc_num = 10000;
+  auto inc = new float[dim * inc_num];
+  for (int64_t i = 0; i < dim * inc_num; ++i) {
+      inc[i] = distrib_real(rng);
+  }
+  auto ids2 = new int64_t[inc_num];
+  for (int64_t i = 0; i < inc_num; ++i) {
+      ids2[i] = i + num_vectors;
+  }
+
+  std::cout<<"test add_index: "<<std::endl;
+  char extra_info[extra_info_sz];
+  for (int i = 0; i < extra_info_sz; i++) {
+      extra_info[i] = rand() % 9 + '0';
+  }
+  ASSERT_EQ(0, obvsag::add_index(index_handler, inc, ids2, dim,inc_num, extra_info));
+  ASSERT_EQ(0, obvsag::get_index_number(index_handler, num_size));
+  std::cout<<"after add index, size is "<< num_size <<std::endl;
+
+  const float* result_dist;
+  const int64_t* result_ids;
+  int64_t result_size = 0;
+
+  roaring::api::roaring64_bitmap_t* r1 = roaring::api::roaring64_bitmap_create();
+  const char *extra_info_search = nullptr;
+  TestFilter testfilter(r1);
+  std::cout<<"test knn_search: "<<std::endl;
+  ASSERT_EQ(0, obvsag::knn_search(index_handler, vectors+dim*(num_vectors-1), dim, 10,
+                                                result_dist,result_ids,result_size,
+                                                100, true/*need_extra_info*/, extra_info_search, &testfilter));
+  std::string s1(extra_info_search, extra_info_search + extra_info_sz);
+  std::cout << s1 << std::endl;
+  default_allocator.Deallocate((void*)result_ids);
+  default_allocator.Deallocate((void*)result_dist);
+  default_allocator.Deallocate((void*)extra_info_search);
+  roaring64_bitmap_add_range(r1, 0, 19800);
+
+  std::cout<<"test knn_search2: "<<std::endl;
+  ASSERT_EQ(0, obvsag::knn_search(index_handler, vectors+dim*(num_vectors-1), dim, 10,
+                                                result_dist,result_ids,result_size,
+                                                100, true/*need_extra_info*/, extra_info_search, &testfilter));
+  std::string s2(extra_info_search, extra_info_search + extra_info_sz);
+  std::cout << s2 << std::endl;
+  const float *distances = nullptr;
+  ASSERT_EQ(0, obvsag::cal_distance_by_id(index_handler, vectors+dim*(num_vectors-1), result_ids, result_size, distances));
+  for (int i = 0; i < result_size; i++) {
+      std::cout << "result: " << result_ids[i] << " " << result_dist[i] << std::endl;
+      std::cout << "calres: " << result_ids[i] << " " << distances[i] << std::endl;
+  }
+  default_allocator.Deallocate((void*)result_ids);
+  default_allocator.Deallocate((void*)result_dist);
+  default_allocator.Deallocate((void*)extra_info_search);
+  default_allocator.Deallocate((void*)distances);
+  obvsag::delete_index(index_handler);
+  default_allocator.Deallocate(test_ptr);
+  ASSERT_EQ(0, default_allocator.total_);
+}
+
+TEST_F(TestVsagAdaptor, test_hgraph_iter_filter)
+{
+  std::cout<<"test hgraph_iter_filter_example: "<<std::endl;
+  ASSERT_TRUE(obvsag::is_init());
+  obvsag::VectorIndexPtr index_handler = NULL;
+  int dim = 1536;
+  int max_degree = 16;
+  int ef_search = 200;
+  int ef_construction = 100;
+  DefaultVsagAllocator default_allocator;
+  const char* const METRIC_L2 = "l2";
+  const char* const METRIC_IP = "ip";
+
+  const char* const DATATYPE_FLOAT32 = "float32";
+  void * test_ptr = default_allocator.Allocate(10);
+  ASSERT_EQ(0, obvsag::create_index(index_handler,
+                                                    obvsag::HNSW_SQ_TYPE,
+                                                    DATATYPE_FLOAT32,
+                                                    METRIC_L2,
+                                                    dim,
+                                                    max_degree,
+                                                    ef_construction,
+                                                    ef_search,
+                                                    &default_allocator));
+
+  int num_vectors = 10000;
+  auto ids = new int64_t[num_vectors];
+  auto vectors = new float[dim * num_vectors];
+  std::mt19937 rng;
+  rng.seed(47);
+  std::uniform_real_distribution<> distrib_real;
+  for (int64_t i = 0; i < num_vectors; ++i) {
+      ids[i] = i;
+  }
+  for (int64_t i = 0; i < dim * num_vectors; ++i) {
+      vectors[i] = distrib_real(rng);
+  }
+
+  int inc_num = 10000;
+  auto inc = new float[dim * inc_num];
+  for (int64_t i = 0; i < dim * inc_num; ++i) {
+      inc[i] = distrib_real(rng);
+  }
+  auto ids2 = new int64_t[inc_num];
+  for (int64_t i = 0; i < inc_num; ++i) {
+      ids2[i] = i + num_vectors;
+  }
+  ASSERT_EQ(0, obvsag::build_index(index_handler, vectors, ids, dim, num_vectors));
+  ASSERT_EQ(0, obvsag::add_index(index_handler, inc, ids2, dim,inc_num));
+  
+  const float* result_dist;
+  const int64_t* result_ids;
+  int64_t result_size = 0;
+  
+  // vsag::IteratorContext *filter_ctx = nullptr;
+  void *iter_ctx = nullptr;
+
+  roaring::api::roaring64_bitmap_t* r1 = roaring::api::roaring64_bitmap_create();
+  roaring64_bitmap_add_range(r1, 0, 500);
+  TestFilter testfilter(r1);
+  const float *distances;
+  const char* extra_infos = nullptr;
+
+  ASSERT_EQ(0, obvsag::knn_search(index_handler, vectors+dim*(num_vectors-1), dim, 10,
+                                                result_dist,result_ids,result_size, 
+                                                100, false, extra_infos, &testfilter, false, false, 0.97, iter_ctx, false));
+  ASSERT_NE(nullptr, iter_ctx);
+  ASSERT_EQ(0, obvsag::cal_distance_by_id(index_handler, vectors+dim*(num_vectors-1), result_ids, result_size, distances));
+  std::cout << "-------- result1: --------" << std::endl;
+  for (int i = 0; i < result_size; i++) {
+      std::cout << "result: " << result_ids[i] << " " << result_dist[i] << std::endl;
+      std::cout << "calres: " << result_ids[i] << " " << distances[i] << std::endl;
+  }    
+  default_allocator.Deallocate((void*)result_ids);
+  default_allocator.Deallocate((void*)result_dist);  
+  default_allocator.Deallocate((void*)distances);
+
+  const float *distances2;
+  const float* result_dist2;
+  const int64_t* result_ids2;
+  int64_t result_size2 = 0;
+  std::cout << "-------- result2: --------" << std::endl;
+  ASSERT_EQ(0, obvsag::knn_search(index_handler, vectors+dim*(num_vectors-1), dim, 10,
+                                                result_dist2,result_ids2,result_size2, 
+                                                100, false, extra_infos, &testfilter, false, false, 0.97, iter_ctx, false));
+  ASSERT_EQ(0, obvsag::cal_distance_by_id(index_handler, vectors+dim*(num_vectors-1), result_ids2, result_size2, distances2));
+  for (int i = 0; i < result_size2; i++) {
+      std::cout << "result: " << result_ids2[i] << " " << result_dist2[i] << std::endl;
+      std::cout << "calres: " << result_ids2[i] << " " << distances2[i] << std::endl;
+  }
+
+  default_allocator.Deallocate((void*)result_ids2);
+  default_allocator.Deallocate((void*)result_dist2);
+  default_allocator.Deallocate((void*)distances2);
+
+  const float *distances3 = nullptr;
+  const float* result_dist3 = nullptr;
+  const int64_t* result_ids3 = nullptr;
+  int64_t result_size3 = 0;
+  std::cout << "-------- result3: --------" << std::endl;
+  ASSERT_EQ(0, obvsag::knn_search(index_handler, vectors+dim*(num_vectors-1), dim, 20,
+                                                result_dist3,result_ids3,result_size3, 
+                                                100, false, extra_infos, &testfilter, false, false, 0.97, iter_ctx, true));
+  ASSERT_EQ(0, obvsag::cal_distance_by_id(index_handler, vectors+dim*(num_vectors-1), result_ids3, result_size3, distances3));
+  for (int i = 0; i < result_size3; i++) {
+      std::cout << "result: " << result_ids3[i] << " " << result_dist3[i] << std::endl;
+      std::cout << "calres: " << result_ids3[i] << " " << distances3[i] << std::endl;
+  }
+  default_allocator.Deallocate((void*)result_ids3);
+  default_allocator.Deallocate((void*)result_dist3);
+  default_allocator.Deallocate((void*)distances3);
+  obvsag::delete_iter_ctx(iter_ctx);
+  obvsag::delete_index(index_handler);
+  default_allocator.Deallocate(test_ptr);
+  ASSERT_EQ(0, default_allocator.total_);
+}
+
+TEST_F(TestVsagAdaptor, test_hnsw_iter_filter)
+{
+  std::cout<<"test iter_filter_example: "<<std::endl;
+  ASSERT_TRUE(obvsag::is_init());
+  obvsag::VectorIndexPtr index_handler = NULL;
+  int dim = 1536;
+  int max_degree = 16;
+  int ef_search = 200;
+  int ef_construction = 100;
+  DefaultVsagAllocator default_allocator;
+  const char* const METRIC_L2 = "l2";
+  const char* const METRIC_IP = "ip";
+
+  const char* const DATATYPE_FLOAT32 = "float32";
+  void * test_ptr = default_allocator.Allocate(10);
+  ASSERT_EQ(0, obvsag::create_index(index_handler,
+                                                    obvsag::HNSW_TYPE,
+                                                    DATATYPE_FLOAT32,
+                                                    METRIC_L2,
+                                                    dim,
+                                                    max_degree,
+                                                    ef_construction,
+                                                    ef_search,
+                                                    &default_allocator));
+  int num_vectors = 10000;
+  auto ids = new int64_t[num_vectors];
+  auto vectors = new float[dim * num_vectors];
+  std::mt19937 rng;
+  rng.seed(47);
+  std::uniform_real_distribution<> distrib_real;
+  for (int64_t i = 0; i < num_vectors; ++i) {
+      ids[i] = i;
+  }
+  for (int64_t i = 0; i < dim * num_vectors; ++i) {
+      vectors[i] = distrib_real(rng);
+  }
+
+  int inc_num = 10000;
+  auto inc = new float[dim * inc_num];
+  for (int64_t i = 0; i < dim * inc_num; ++i) {
+      inc[i] = distrib_real(rng);
+  }
+  auto ids2 = new int64_t[inc_num];
+  for (int64_t i = 0; i < inc_num; ++i) {
+      ids2[i] = i + num_vectors;
+  }
+
+  ASSERT_EQ(0, obvsag::add_index(index_handler, inc, ids2, dim,inc_num));
+  
+  const float* result_dist;
+  const int64_t* result_ids;
+  int64_t result_size = 0;
+  
+  // vsag::IteratorContext *filter_ctx = nullptr;
+  void *iter_ctx = nullptr;
+
+  roaring::api::roaring64_bitmap_t* r1 = roaring::api::roaring64_bitmap_create();
+  roaring64_bitmap_add_range(r1, 0, 500);
+  TestFilter testfilter(r1);
+  const float *distances;
+  const char* extra_infos = nullptr;
+
+  ASSERT_EQ(0, obvsag::knn_search(index_handler, vectors+dim*(num_vectors-1), dim, 10,
+                                                result_dist,result_ids,result_size, 
+                                                100, false, extra_infos, &testfilter, false, false, 0.97, iter_ctx, false));
+  ASSERT_NE(nullptr, iter_ctx);
+  ASSERT_EQ(0, obvsag::cal_distance_by_id(index_handler, vectors+dim*(num_vectors-1), result_ids, result_size, distances));
+  std::cout << "-------- result1: --------" << std::endl;
+  for (int i = 0; i < result_size; i++) {
+      std::cout << "result: " << result_ids[i] << " " << result_dist[i] << std::endl;
+      std::cout << "calres: " << result_ids[i] << " " << distances[i] << std::endl;
+  }
+  default_allocator.Deallocate((void*)result_ids);
+  default_allocator.Deallocate((void*)result_dist);
+  default_allocator.Deallocate((void*)distances);
+
+  const float *distances2;
+  const float* result_dist2;
+  const int64_t* result_ids2;
+  int64_t result_size2 = 0;
+  std::cout << "-------- result2: --------" << std::endl;
+  ASSERT_EQ(0, obvsag::knn_search(index_handler, vectors+dim*(num_vectors-1), dim, 10,
+                                                result_dist2,result_ids2,result_size2, 
+                                                100, false, extra_infos, &testfilter, false, false, 0.97, iter_ctx, false));
+  ASSERT_EQ(0, obvsag::cal_distance_by_id(index_handler, vectors+dim*(num_vectors-1), result_ids2, result_size2, distances2));
+  for (int i = 0; i < result_size2; i++) {
+      std::cout << "result: " << result_ids2[i] << " " << result_dist2[i] << std::endl;
+      std::cout << "calres: " << result_ids2[i] << " " << distances2[i] << std::endl;
+  }
+  default_allocator.Deallocate((void*)result_ids2);
+  default_allocator.Deallocate((void*)result_dist2);
+  default_allocator.Deallocate((void*)distances2);
+
+  const float *distances3;
+  const float* result_dist3;
+  const int64_t* result_ids3;
+  int64_t result_size3 = 0;
+  std::cout << "-------- result3: --------" << std::endl;
+  ASSERT_EQ(0, obvsag::knn_search(index_handler, vectors+dim*(num_vectors-1), dim, 20,
+                                                result_dist3,result_ids3,result_size3, 
+                                                100, false, extra_infos, &testfilter, false, false, 0.97, iter_ctx, true));
+  ASSERT_EQ(0, obvsag::cal_distance_by_id(index_handler, vectors+dim*(num_vectors-1), result_ids3, result_size3, distances3));
+  for (int i = 0; i < result_size3; i++) {
+      std::cout << "result: " << result_ids3[i] << " " << result_dist3[i] << std::endl;
+      std::cout << "calres: " << result_ids3[i] << " " << distances3[i] << std::endl;
+  }
+  default_allocator.Deallocate((void*)result_ids3);
+  default_allocator.Deallocate((void*)result_dist3);
+  default_allocator.Deallocate((void*)distances3);
+  obvsag::delete_iter_ctx(iter_ctx);
+  obvsag::delete_index(index_handler);
+  default_allocator.Deallocate(test_ptr);
+  ASSERT_EQ(0, default_allocator.total_);
+}
+
+// Tune interface: null handler should return error
+TEST_F(TestVsagAdaptor, test_tune_null_handler)
+{
+  ASSERT_TRUE(obvsag::is_init());
+  obvsag::VectorIndexPtr index_handler = nullptr;
+  int ret = obvsag::tune_index(index_handler, obvsag::HGRAPH_TYPE);
+  ASSERT_NE(0, ret);
+}
+
+TEST_F(TestVsagAdaptor, test_check_id_exist)
+{
+  ASSERT_TRUE(obvsag::is_init());
+  obvsag::VectorIndexPtr null_handler = nullptr;
+  bool exist = true;
+  ASSERT_NE(0, obvsag::check_id_exist(null_handler, 0, exist));
+
+  DefaultVsagAllocator default_allocator;
+  void *test_ptr = default_allocator.Allocate(10);
+  obvsag::VectorIndexPtr index_handler = nullptr;
+  const char *const DATATYPE_FLOAT32 = "float32";
+  const char *const METRIC_L2 = "l2";
+  const int dim = 64;
+  const int max_degree = 16;
+  const int ef_search = 200;
+  const int ef_construction = 100;
+  ASSERT_EQ(0, obvsag::create_index(index_handler,
+      obvsag::HGRAPH_TYPE,
+      DATATYPE_FLOAT32,
+      METRIC_L2,
+      dim,
+      max_degree,
+      ef_construction,
+      ef_search,
+      &default_allocator));
+
+  const int num_vectors = 100;
+  auto ids = new int64_t[num_vectors];
+  auto vectors = new float[dim * num_vectors];
+  std::mt19937 rng(47);
+  std::uniform_real_distribution<> distrib_real;
+  for (int i = 0; i < num_vectors; ++i) {
+    ids[i] = i;
+  }
+  for (int i = 0; i < dim * num_vectors; ++i) {
+    vectors[i] = distrib_real(rng);
+  }
+  ASSERT_EQ(0, obvsag::build_index(index_handler, vectors, ids, dim, num_vectors));
+
+  int ret = obvsag::check_id_exist(index_handler, 0, exist);
+  ASSERT_EQ(0, ret);
+  EXPECT_TRUE(exist);
+  ret = obvsag::check_id_exist(index_handler, static_cast<int64_t>(num_vectors), exist);
+  ASSERT_EQ(0, ret);
+  EXPECT_FALSE(exist);
+
+  ret = obvectorutil::check_id_exist(index_handler, 0, exist);
+  ASSERT_EQ(0, ret);
+  EXPECT_TRUE(exist);
+  ret = obvectorutil::check_id_exist(index_handler, static_cast<int64_t>(num_vectors), exist);
+  ASSERT_EQ(0, ret);
+  EXPECT_FALSE(exist);
+
+  obvsag::delete_index(index_handler);
+  delete[] ids;
+  delete[] vectors;
+  default_allocator.Deallocate(test_ptr);
+  ASSERT_EQ(0, default_allocator.total_);
+}
+
+TEST_F(TestVsagAdaptor, test_check_id_exist_hnsw)
+{
+  ASSERT_TRUE(obvsag::is_init());
+  DefaultVsagAllocator default_allocator;
+  void *test_ptr = default_allocator.Allocate(10);
+  obvsag::VectorIndexPtr index_handler = nullptr;
+  const char *const DATATYPE_FLOAT32 = "float32";
+  const char *const METRIC_L2 = "l2";
+  const int dim = 64;
+  const int max_degree = 16;
+  const int ef_search = 200;
+  const int ef_construction = 100;
+  ASSERT_EQ(0, obvsag::create_index(index_handler,
+      obvsag::HNSW_TYPE,
+      DATATYPE_FLOAT32,
+      METRIC_L2,
+      dim,
+      max_degree,
+      ef_construction,
+      ef_search,
+      &default_allocator));
+
+  const int num_vectors = 100;
+  auto ids = new int64_t[num_vectors];
+  auto vectors = new float[dim * num_vectors];
+  std::mt19937 rng(47);
+  std::uniform_real_distribution<> distrib_real;
+  for (int i = 0; i < num_vectors; ++i) {
+    ids[i] = i;
+  }
+  for (int i = 0; i < dim * num_vectors; ++i) {
+    vectors[i] = distrib_real(rng);
+  }
+  ASSERT_EQ(0, obvsag::build_index(index_handler, vectors, ids, dim, num_vectors));
+
+  bool exist = false;
+  int ret = obvsag::check_id_exist(index_handler, 0, exist);
+  ASSERT_EQ(0, ret);
+  EXPECT_TRUE(exist);
+  ret = obvsag::check_id_exist(index_handler, static_cast<int64_t>(num_vectors), exist);
+  ASSERT_EQ(0, ret);
+  EXPECT_FALSE(exist);
+
+  ret = obvectorutil::check_id_exist(index_handler, 0, exist);
+  ASSERT_EQ(0, ret);
+  EXPECT_TRUE(exist);
+  ret = obvectorutil::check_id_exist(index_handler, static_cast<int64_t>(num_vectors), exist);
+  ASSERT_EQ(0, ret);
+  EXPECT_FALSE(exist);
+
+  obvsag::delete_index(index_handler);
+  delete[] ids;
+  delete[] vectors;
+  default_allocator.Deallocate(test_ptr);
+  ASSERT_EQ(0, default_allocator.total_);
+}
+
+// Tune interface: HNSW_SQ index after build, tune should succeed
+TEST_F(TestVsagAdaptor, test_tune_hnsw_sq)
+{
+  ASSERT_TRUE(obvsag::is_init());
+  obvsag::VectorIndexPtr index_handler = nullptr;
+  int dim = 128;
+  int max_degree = 16;
+  int ef_search = 200;
+  int ef_construction = 100;
+  DefaultVsagAllocator default_allocator;
+  const char* const METRIC_L2 = "l2";
+  const char* const DATATYPE_FLOAT32 = "float32";
+  void* test_ptr = default_allocator.Allocate(10);
+  ASSERT_EQ(0, obvsag::create_index(index_handler,
+      obvsag::HGRAPH_TYPE,
+      DATATYPE_FLOAT32,
+      METRIC_L2,
+      dim,
+      max_degree,
+      ef_construction,
+      ef_search,
+      &default_allocator));
+  int num_vectors = 1000;
+  auto ids = new int64_t[num_vectors];
+  auto vectors = new float[dim * num_vectors];
+  std::mt19937 rng;
+  rng.seed(47);
+  std::uniform_real_distribution<> distrib_real;
+  for (int64_t i = 0; i < num_vectors; ++i) {
+    ids[i] = i;
+  }
+  for (int64_t i = 0; i < dim * num_vectors; ++i) {
+    vectors[i] = distrib_real(rng);
+  }
+  ASSERT_EQ(0, obvsag::build_index(index_handler, vectors, ids, dim, num_vectors));
+  int64_t num_size = 0;
+  ASSERT_EQ(0, obvsag::get_index_number(index_handler, num_size));
+  ASSERT_EQ(num_vectors, num_size);
+
+  // tune_index(new_index_type): params built via construct_vsag_create_param inside obvsag
+  ASSERT_EQ(0, obvsag::tune_index(index_handler, obvsag::HNSW_SQ_TYPE));
+
+  const float* result_dist = nullptr;
+  const int64_t* result_ids = nullptr;
+  int64_t result_size = 0;
+  const char* extra_info = nullptr;
+  ASSERT_EQ(0, obvsag::knn_search(index_handler, vectors, dim, 5,
+      result_dist, result_ids, result_size, ef_search,
+      false /* need_extra_info */, extra_info));
+  ASSERT_GT(result_size, 0);
+  default_allocator.Deallocate((void*)result_ids);
+  default_allocator.Deallocate((void*)result_dist);
+
+  obvsag::delete_index(index_handler);
+  default_allocator.Deallocate(test_ptr);
+  delete[] ids;
+  delete[] vectors;
+  ASSERT_EQ(0, default_allocator.total_);
+}
+
+// Tune interface: HNSW_BQ index after build, tune should succeed
+TEST_F(TestVsagAdaptor, test_tune_hnsw_bq)
+{
+  ASSERT_TRUE(obvsag::is_init());
+  obvsag::VectorIndexPtr index_handler = nullptr;
+  int dim = 128;
+  int max_degree = 16;
+  int ef_search = 200;
+  int ef_construction = 100;
+  DefaultVsagAllocator default_allocator;
+  const char* const METRIC_L2 = "l2";
+  const char* const DATATYPE_FLOAT32 = "float32";
+  void* test_ptr = default_allocator.Allocate(10);
+  ASSERT_EQ(0, obvsag::create_index(index_handler,
+      obvsag::HGRAPH_TYPE,
+      DATATYPE_FLOAT32,
+      METRIC_L2,
+      dim,
+      max_degree,
+      ef_construction,
+      ef_search,
+      &default_allocator));
+  int num_vectors = 1000;
+  auto ids = new int64_t[num_vectors];
+  auto vectors = new float[dim * num_vectors];
+  std::mt19937 rng;
+  rng.seed(47);
+  std::uniform_real_distribution<> distrib_real;
+  for (int64_t i = 0; i < num_vectors; ++i) {
+    ids[i] = i;
+  }
+  for (int64_t i = 0; i < dim * num_vectors; ++i) {
+    vectors[i] = distrib_real(rng);
+  }
+  ASSERT_EQ(0, obvsag::build_index(index_handler, vectors, ids, dim, num_vectors));
+  int64_t num_size = 0;
+  ASSERT_EQ(0, obvsag::get_index_number(index_handler, num_size));
+  ASSERT_EQ(num_vectors, num_size);
+
+  // tune_index(new_index_type): params built via construct_vsag_create_param inside obvsag
+  ASSERT_EQ(0, obvsag::tune_index(index_handler, obvsag::HNSW_BQ_TYPE));
+
+  const float* result_dist = nullptr;
+  const int64_t* result_ids = nullptr;
+  int64_t result_size = 0;
+  const char* extra_info = nullptr;
+  ASSERT_EQ(0, obvsag::knn_search(index_handler, vectors, dim, 5,
+      result_dist, result_ids, result_size, ef_search,
+      false /* need_extra_info */, extra_info));
+  ASSERT_GT(result_size, 0);
+  default_allocator.Deallocate((void*)result_ids);
+  default_allocator.Deallocate((void*)result_dist);
+
+  obvsag::delete_index(index_handler);
+  default_allocator.Deallocate(test_ptr);
+  delete[] ids;
+  delete[] vectors;
+  ASSERT_EQ(0, default_allocator.total_);
+}
+
+// HGRAPH build -> tune to HNSW_BQ -> serialize -> new empty HNSW_BQ -> deserialize -> knn search
+TEST_F(TestVsagAdaptor, test_tune_hnsw_bq_serialize_deserialize_query)
+{
+  ASSERT_TRUE(obvsag::is_init());
+  obvsag::VectorIndexPtr index_handler = nullptr;
+  const int dim = 128;
+  const int max_degree = 16;
+  const int ef_search = 200;
+  const int ef_construction = 100;
+  DefaultVsagAllocator default_allocator;
+  const char *const METRIC_L2 = "l2";
+  const char *const DATATYPE_FLOAT32 = "float32";
+  void *test_ptr = default_allocator.Allocate(10);
+
+  ASSERT_EQ(0, obvsag::create_index(index_handler,
+      obvsag::HGRAPH_TYPE,
+      DATATYPE_FLOAT32,
+      METRIC_L2,
+      dim,
+      max_degree,
+      ef_construction,
+      ef_search,
+      &default_allocator));
+
+  const int num_vectors = 1000;
+  auto ids = new int64_t[num_vectors];
+  auto vectors = new float[dim * num_vectors];
+  std::mt19937 rng(47);
+  std::uniform_real_distribution<> distrib_real;
+  for (int64_t i = 0; i < num_vectors; ++i) {
+    ids[i] = i;
+  }
+  for (int64_t i = 0; i < dim * num_vectors; ++i) {
+    vectors[i] = distrib_real(rng);
+  }
+  ASSERT_EQ(0, obvsag::build_index(index_handler, vectors, ids, dim, num_vectors));
+  int64_t num_size = 0;
+  ASSERT_EQ(0, obvsag::get_index_number(index_handler, num_size));
+  ASSERT_EQ(num_vectors, num_size);
+
+  ASSERT_EQ(0, obvsag::tune_index(index_handler, obvsag::HNSW_BQ_TYPE));
+  ASSERT_EQ(obvsag::HNSW_BQ_TYPE, obvsag::get_index_type(index_handler));
+
+  std::stringstream serialized;
+  ASSERT_EQ(0, obvsag::fserialize(index_handler, serialized));
+  obvsag::delete_index(index_handler);
+  index_handler = nullptr;
+
+  ASSERT_EQ(0, obvsag::create_index(index_handler,
+      obvsag::HNSW_BQ_TYPE,
+      DATATYPE_FLOAT32,
+      METRIC_L2,
+      dim,
+      max_degree,
+      ef_construction,
+      ef_search,
+      &default_allocator));
+  serialized.seekg(0, std::ios::beg);
+  ASSERT_EQ(0, obvsag::fdeserialize(index_handler, serialized));
+
+  ASSERT_EQ(0, obvsag::get_index_number(index_handler, num_size));
+  ASSERT_EQ(num_vectors, num_size);
+
+  const float *result_dist = nullptr;
+  const int64_t *result_ids = nullptr;
+  int64_t result_size = 0;
+  const char *extra_info = nullptr;
+  ASSERT_EQ(0, obvsag::knn_search(index_handler,
+      vectors,
+      dim,
+      5,
+      result_dist,
+      result_ids,
+      result_size,
+      ef_search,
+      false /* need_extra_info */,
+      extra_info,
+      nullptr,
+      false,
+      false,
+      static_cast<void *>(&default_allocator)));
+  ASSERT_GT(result_size, 0);
+  default_allocator.Deallocate((void *)result_ids);
+  default_allocator.Deallocate((void *)result_dist);
+
+  obvsag::delete_index(index_handler);
+  delete[] ids;
+  delete[] vectors;
+  default_allocator.Deallocate(test_ptr);
+  ASSERT_EQ(0, default_allocator.total_);
+}
+
+TEST_F(TestVsagAdaptor, test_hgraph_bq)
+{
+  ASSERT_TRUE(obvsag::is_init());
+  obvsag::VectorIndexPtr index_handler = NULL;
+  int dim = 128;
+  int max_degree = 16;
+  int ef_search = 200;
+  int ef_construction = 100;
+  DefaultVsagAllocator default_allocator;
+  const char* const METRIC_L2 = "l2";
+
+  const char* const DATATYPE_FLOAT32 = "float32";
+  void * test_ptr = default_allocator.Allocate(10);
+  ASSERT_EQ(0, obvsag::create_index(index_handler,
+                                                    obvsag::HNSW_BQ_TYPE,
+                                                    DATATYPE_FLOAT32,
+                                                    METRIC_L2,
+                                                    dim,
+                                                    max_degree,
+                                                    ef_construction,
+                                                    ef_search,
+                                                    &default_allocator));
+
+  int num_vectors = 10000;
+  auto ids = new int64_t[num_vectors];
+  auto vectors = new float[dim * num_vectors];
+  std::mt19937 rng;
+  rng.seed(47);
+  std::uniform_real_distribution<> distrib_real;
+  for (int64_t i = 0; i < num_vectors; ++i) {
+      ids[i] = i + num_vectors*10;
+  }
+  for (int64_t i = 0; i < dim * num_vectors; ++i) {
+      vectors[i] = distrib_real(rng);
+  }
+  ASSERT_EQ(0, obvsag::build_index(index_handler, vectors, ids, dim, num_vectors));
+
+  int64_t num_size = 0;
+  ASSERT_EQ(0, obvsag::get_index_number(index_handler, num_size));
+  std::cout<<"after add index, size is "<< num_size << std::endl;
+  
+  const float* result_dist;
+  const int64_t* result_ids;
+  int64_t result_size = 0;
+  auto query_vector = new float[dim];
+  for (int64_t i = 0; i < dim; ++i) {
+      query_vector[i] = distrib_real(rng);
+  }
+
+  roaring::api::roaring64_bitmap_t* r1 = roaring::api::roaring64_bitmap_create();
+
+  roaring::api::roaring64_bitmap_add(r1, 18);
+  roaring::api::roaring64_bitmap_add(r1, 1169);
+  roaring::api::roaring64_bitmap_add(r1, 1285);
+  std::cout << "before search" << std::endl;
+  TestFilter testfilter(r1);
+  const char *extra_info = nullptr;
+  ASSERT_EQ(0, obvsag::knn_search(index_handler, query_vector, dim, 10,
+                                                result_dist,result_ids,result_size, 
+                                                100, false/*need_extra_info*/, extra_info, &testfilter));
+  
+  for (int i = 0; i < result_size; i++) {
+      std::cout << "result: " << result_ids[i] << " " << result_dist[i] << std::endl;
+  }
+  default_allocator.Deallocate((void*)result_ids);
+  default_allocator.Deallocate((void*)result_dist);
+  int inc_num = 1000;
+  auto inc = new float[dim * inc_num];
+  for (int64_t i = 0; i < dim * inc_num; ++i) {
+      inc[i] = distrib_real(rng);
+  }
+  auto ids2 = new int64_t[inc_num];
+  for (int64_t i = 0; i < inc_num; ++i) {
+      ids2[i] = i + num_vectors*100;
+  }
+  obvsag::delete_index(index_handler);
+  default_allocator.Deallocate(test_ptr);
+  ASSERT_EQ(0, default_allocator.total_);
+}
+
+}  // namespace common
+}  // namespace oceanbase
+
+
+int main(int argc, char **argv)
+{
+  ::testing::InitGoogleTest(&argc, argv);
+  // system("rm -f test_vsag_adaptor.log");
+  // OB_LOGGER.set_file_name("test_vsag_adaptor.log");
+  OB_LOGGER.set_log_level("INFO");
+  return RUN_ALL_TESTS();
+}

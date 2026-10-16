@@ -1,0 +1,1735 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX RS
+
+#include "ob_backup_task_scheduler.h"
+#include "share/backup/ob_backup_clean_operator.h"
+#include "share/backup/ob_backup_validate_table_operator.h"
+#include "share/ls/ob_ls_table_operator.h"
+#include "share/backup/ob_tenant_archive_mgr.h"
+#include "share/backup/ob_backup_connectivity.h"
+#include "share/backup/ob_backup_struct.h"
+#include "share/backup/ob_backup_helper.h"
+#include "share/ob_all_server_tracer.h"
+#ifdef OB_BUILD_SHARED_STORAGE
+#include "share/backup/ob_ss_ha_macro_block_table_operator.h"
+#endif
+namespace oceanbase 
+{
+using namespace common;
+using namespace lib;
+using namespace obrpc;
+using namespace share;
+namespace rootserver 
+{
+// ObBackupServerStatKey
+bool ObBackupServerStatKey::is_valid() const
+{
+  return type_ < BackupJobType::BACKUP_JOB_MAX 
+         && type_ >= BackupJobType::BACKUP_DATA_JOB && addr_.is_valid();
+}
+
+bool ObBackupServerStatKey::operator==(const ObBackupServerStatKey &that) const
+{
+  return type_ == that.type_ && addr_ == that.addr_;
+}
+
+ObBackupServerStatKey &ObBackupServerStatKey::operator=(const ObBackupServerStatKey &that)
+{
+  type_ = that.type_;
+  addr_ = that.addr_;
+  hash_value_ = that.hash_value_;
+  return (*this);
+}
+
+uint64_t ObBackupServerStatKey::hash() const
+{
+  return hash_value_;
+}
+
+int ObBackupServerStatKey::init(const common::ObAddr &addr, const BackupJobType type)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(type >= BackupJobType::BACKUP_JOB_MAX 
+                  || type < BackupJobType::BACKUP_DATA_JOB
+                  || !addr.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(type), K(addr));
+  } else {
+    type_ = type;
+    addr_ = addr;
+    hash_value_ = inner_hash();
+  }
+  return ret;
+}
+
+int ObBackupServerStatKey::init(const ObBackupServerStatKey &that)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!that.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret));
+  } else {
+    type_ = that.type_;
+    addr_ = that.addr_;
+    hash_value_ = inner_hash();
+  }
+  return ret;
+}
+
+uint64_t ObBackupServerStatKey::inner_hash() const
+{
+  uint64_t hash_val = 0;
+  hash_val = addr_.hash();
+  hash_val = murmurhash(&type_, sizeof(type_), hash_val);
+  return hash_val;
+}
+
+// ObBackupScheduleTaskKey
+bool ObBackupScheduleTaskKey::is_valid() const
+{
+  return type_ < BackupJobType::BACKUP_JOB_MAX 
+         && type_ >= BackupJobType::BACKUP_DATA_JOB;
+}
+
+bool ObBackupScheduleTaskKey::operator==(const ObBackupScheduleTaskKey &that) const
+{
+  return ls_id_ == that.ls_id_ 
+	       && task_id_ == that.task_id_ 
+         && tenant_id_ == that.tenant_id_ 
+         && job_id_ == that.job_id_ 
+         && type_ == that.type_;
+}
+
+ObBackupScheduleTaskKey &ObBackupScheduleTaskKey::operator=(const ObBackupScheduleTaskKey &that)
+{
+  ls_id_ = that.ls_id_;
+	task_id_ = that.task_id_;
+  tenant_id_ = that.tenant_id_;
+  job_id_ = that.job_id_;
+  type_ = that.type_;
+  hash_value_ = that.hash_value_;
+  return (*this);
+}
+
+uint64_t ObBackupScheduleTaskKey::hash() const
+{
+  return hash_value_;
+}
+
+int ObBackupScheduleTaskKey::init(
+    const uint64_t tenant_id, 
+    const uint64_t job_id, 
+    const uint64_t task_id, 
+    const uint64_t key_1,
+    const BackupJobType key_type)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(key_type >= BackupJobType::BACKUP_JOB_MAX 
+                  || key_type < BackupJobType::BACKUP_DATA_JOB)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(key_type));
+  } else {
+    tenant_id_ = tenant_id;
+    job_id_ = job_id;
+    ls_id_ = key_1;
+    task_id_ = task_id;
+    type_ = key_type;
+    hash_value_ = inner_hash();
+  }
+  return ret;
+}
+
+int ObBackupScheduleTaskKey::init(const ObBackupScheduleTaskKey &that)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!that.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret));
+  } else {
+    tenant_id_ = that.tenant_id_;
+    job_id_ = that.job_id_;
+    ls_id_ = that.ls_id_;
+    task_id_ = that.task_id_;
+    type_ = that.type_;
+    hash_value_ = inner_hash();
+  }
+  return ret;
+}
+
+uint64_t ObBackupScheduleTaskKey::inner_hash() const
+{
+  uint64_t hash_val = 0;
+  hash_val = murmurhash(&tenant_id_, sizeof(tenant_id_), hash_val);
+  hash_val = murmurhash(&job_id_, sizeof(job_id_), hash_val);
+  hash_val = murmurhash(&task_id_, sizeof(task_id_), hash_val);
+  hash_val = murmurhash(&ls_id_, sizeof(ls_id_), hash_val);
+  hash_val = murmurhash(&type_, sizeof(type_), hash_val);
+  return hash_val;
+}
+
+// ObBackupScheduleTask
+int ObBackupScheduleTask::set_schedule(const common::ObAddr &server)
+{
+  int ret = OB_SUCCESS;
+  int64_t now = ObTimeUtility::current_time();
+  if (!server.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(server));
+  } else {
+    set_dst(server);
+    set_schedule_time(now);
+  }
+  return ret;
+}
+
+void ObBackupScheduleTask::clear_schedule() 
+{
+  set_schedule_time(0);
+  dst_.reset();
+}
+
+int ObBackupScheduleTask::deep_copy(const ObBackupScheduleTask &that)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(optional_servers_.assign(that.optional_servers_))) {
+    LOG_WARN("deep copy optional servers failed", K(ret), K(optional_servers_));
+  } else {
+    task_key_ = that.task_key_;
+    trace_id_ = that.trace_id_;
+    dst_ = that.dst_;
+    status_ = that.status_;
+    dest_id_ = that.dest_id_;
+    generate_time_ = that.generate_time_;
+    schedule_time_ = that.schedule_time_;
+    executor_time_ = that.executor_time_;
+    last_check_alive_time_ = that.last_check_alive_time_;
+  }
+  return ret;
+}
+
+int ObBackupScheduleTask::set_optional_servers(const ObIArray<share::ObBackupServer> &servers)
+{
+  int ret = OB_SUCCESS;
+  if (servers.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret));
+  } else if (OB_FAIL(append(optional_servers_, servers))) {
+    LOG_WARN("failed to append optional servers", K(ret));
+  }
+#ifdef ERRSIM
+  if (OB_SUCC(ret)) {
+    const ObString &errsim_server = GCONF.backup_errsim_task_server_addr.str();
+    ObBackupServer backup_server;
+    backup_server.priority_ = 0;
+    if (!errsim_server.empty()) {
+      common::ObAddr addr;
+      if (OB_FAIL(addr.parse_from_string(errsim_server))) {
+        LOG_WARN("failed to parse from string", K(ret));
+      } else {
+        optional_servers_.reset();
+        backup_server.server_ = addr;
+        if (OB_FAIL(optional_servers_.push_back(backup_server))) {
+          LOG_WARN("failed to push back", K(ret));
+        }
+      }
+      LOG_INFO("errsim set optional server", K(errsim_server), K(addr), K(backup_server));
+    }
+  }
+#endif
+  return ret;
+}
+
+int ObBackupScheduleTask::update_dst_and_doing_status(common::ObMySQLProxy &sql_proxy)
+{
+  int ret = OB_SUCCESS;
+  ObLSID ls_id(get_ls_id());
+  ObCurTraceId::init(GCONF.self_addr_);
+  share::ObTaskId trace_id(*ObCurTraceId::get_trace_id());
+  if (OB_FAIL(do_update_dst_and_doing_status_(sql_proxy, dst_, trace_id))) {
+    LOG_WARN("fail to do update task dst and advance task status to doing", K(ret));
+  } else {
+    trace_id_ = trace_id;
+    status_.status_ = ObBackupTaskStatus::Status::DOING;
+    LOG_INFO("succeed update task dst and advance task status to doing", K(*this));
+  }
+  return ret;
+}
+
+int ObBackupScheduleTask::build(const ObBackupScheduleTaskKey & key, const share::ObTaskId &trace_id, 
+    const share::ObBackupTaskStatus &status, const common::ObAddr &dst, const int64_t dest_id)
+{
+  int ret = OB_SUCCESS;
+  if (!key.is_valid() || !status.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(key), K(status));
+  } else if (OB_FAIL(task_key_.init(key))) {
+    LOG_WARN("fail to init task key", K(ret), K(key));
+  } else {
+    trace_id_ = trace_id;
+    dst_ = dst;
+    dest_id_ = dest_id;
+    if (status.is_init() || status.is_pending()) {
+      status_.status_ = ObBackupTaskStatus::Status::PENDING;
+    } else if (status.is_doing()) {
+      status_.status_ = ObBackupTaskStatus::Status::DOING;
+    }
+    set_generate_time(ObTimeUtility::current_time());
+  }
+  return ret;
+}
+
+int ObBackupScheduleTask::build_from_res(const obrpc::ObBackupTaskRes &res, const BackupJobType &type)
+{
+  int ret = OB_SUCCESS;
+  ObBackupScheduleTaskKey key;
+  if (!res.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(res));
+  } else if (OB_FAIL(key.init(res.tenant_id_, res.job_id_, res.task_id_, res.ls_id_.id(), type))) {
+    LOG_WARN("failed to init backup schedule task key", K(ret), K(res));
+  } else if (OB_FAIL(init_task_key(key))) {
+    LOG_WARN("failed to init task key", K(key));
+  } else {
+    set_dst(res.src_server_);
+    set_trace_id(res.trace_id_);
+  }
+  return ret;
+}
+
+
+/*
+ *---------------------ObBackupDataBaseTask----------------------
+ */
+ObBackupDataBaseTask::ObBackupDataBaseTask(const ObBackupScheduleTaskType::ObBackupScheduleTaskTypeEnum type)
+  : ObBackupScheduleTask(type),
+    incarnation_id_(OB_BACKUP_INVALID_INCARNATION_ID),
+    backup_set_id_(OB_BACKUP_INVALID_BACKUP_SET_ID),
+    backup_type_(),
+    backup_date_(OB_INVALID_TIMESTAMP),
+    ls_id_(),
+    turn_id_(OB_BACKUP_INVALID_TURN_ID),
+    retry_id_(OB_BACKUP_INVALID_RETRY_ID),
+    start_scn_(),
+    backup_user_ls_scn_(),
+    end_scn_(),
+    backup_path_(),
+    backup_status_(),
+    fuse_turn_id_(),
+    is_only_calc_stat_(false)
+{
+}
+
+int ObBackupDataBaseTask::deep_copy(const ObBackupDataBaseTask &that)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(ObBackupScheduleTask::deep_copy(that))) {
+    LOG_WARN("failed to deep copy backup schedule task", K(ret));
+  } else if (OB_FAIL(backup_path_.assign(that.backup_path_))) {
+    LOG_WARN("failed to assign backup path", K(ret));
+  } else if (OB_FAIL(extra_info_.assign(that.extra_info_))) {
+    LOG_WARN("failed to assign extra_info", K(ret));
+  } else {
+    incarnation_id_ = that.incarnation_id_;
+    backup_set_id_ = that.backup_set_id_;
+    backup_type_.type_ = that.backup_type_.type_;
+    backup_date_ = that.backup_date_;
+    ls_id_ = that.ls_id_;
+    turn_id_ = that.turn_id_;
+    retry_id_ = that.retry_id_;
+    start_scn_ = that.start_scn_;
+    backup_user_ls_scn_ = that.backup_user_ls_scn_;
+    end_scn_ = that.end_scn_;
+    backup_status_.status_ = that.backup_status_.status_;
+    fuse_turn_id_ = that.fuse_turn_id_;
+    is_only_calc_stat_ = that.is_only_calc_stat_;
+  }
+  return ret;
+}
+
+int ObBackupDataBaseTask::do_update_dst_and_doing_status_(common::ObISQLClient &sql_proxy, common::ObAddr &dst, share::ObTaskId &trace_id) 
+{
+  int ret = OB_SUCCESS;
+  ObLSID ls_id(get_ls_id());
+  if (OB_FAIL(ObBackupLSTaskOperator::update_dst_and_status(
+      sql_proxy, get_task_id(), get_tenant_id(), ls_id, turn_id_, retry_id_, trace_id, dst))) {
+    LOG_WARN("failed to update task status", K(ret), K(*this), K(dst));
+  }
+  return ret;
+}
+
+int ObBackupDataBaseTask::cancel(obrpc::ObSrvRpcProxy &rpc_proxy) const
+{
+  int ret = OB_SUCCESS;
+  obrpc::ObCancelTaskArg rpc_arg;
+  rpc_arg.task_id_ = get_trace_id();
+  if (OB_FAIL(rpc_proxy.to(get_dst()).cancel_sys_task(rpc_arg))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      LOG_INFO("task may not excute on server", K(rpc_arg), "dst", get_dst());
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("failed to cancel sys task", K(ret), K(rpc_arg));
+    }
+  }
+  return ret;
+}
+
+int ObBackupDataBaseTask::build(const share::ObBackupJobAttr &job_attr, const share::ObBackupSetTaskAttr &set_task_attr, 
+    const share::ObBackupLSTaskAttr &ls_attr)
+{
+  int ret = OB_SUCCESS;
+  ObBackupScheduleTaskKey key;
+  int64_t dest_id = OB_INVALID_DEST_ID;
+  if (!job_attr.is_valid() || !ls_attr.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(job_attr), K(ls_attr));
+  } else if (OB_FAIL(key.init(ls_attr.tenant_id_, job_attr.job_id_, ls_attr.task_id_, ls_attr.ls_id_.id(), BackupJobType::BACKUP_DATA_JOB))) {
+    LOG_WARN("failed to init backup schedule task key", K(ret), K(job_attr), K(ls_attr));
+  } else if (OB_FAIL((share::ObBackupUtils::get_backup_dest_id(ls_attr.tenant_id_, dest_id)))) {
+    LOG_WARN("failed to get backup dest id", K(ret), K(ls_attr));
+  } else if (OB_FAIL(ObBackupScheduleTask::build(key, ls_attr.task_trace_id_, ls_attr.status_, ls_attr.dst_, dest_id))) {
+    LOG_WARN("fail to build backup schedule task", K(ret), "trace_id", ls_attr.task_trace_id_, "status", ls_attr.status_, "dst", ls_attr.dst_);
+  } else {
+    incarnation_id_ = job_attr.incarnation_id_;
+    backup_set_id_ = ls_attr.backup_set_id_;
+    backup_type_.type_ = ls_attr.backup_type_.type_;
+    backup_date_ = ls_attr.backup_date_;
+    ls_id_ = ls_attr.ls_id_;
+    turn_id_ = ls_attr.turn_id_;
+    retry_id_ = ls_attr.retry_id_;
+    start_scn_ = set_task_attr.start_scn_;
+    backup_user_ls_scn_ = ls_attr.ls_id_.is_sys_ls() ? set_task_attr.start_scn_ : set_task_attr.user_ls_start_scn_;
+    end_scn_ = set_task_attr.end_scn_;
+    backup_status_.status_ = set_task_attr.status_.status_;
+    if (OB_FAIL(extra_info_.assign(set_task_attr.extra_info_))) {
+      LOG_WARN("failed to assign extra_info", K(ret));
+    } else if (OB_FAIL(backup_path_.assign(job_attr.backup_path_))) {
+      LOG_WARN("failed to assign backup dest", K(ret), K(job_attr.backup_path_));
+    } else if (OB_FAIL(set_optional_servers_(ls_attr.black_servers_))) {
+      LOG_WARN("failed to set optional servers", K(ret), K(ls_attr));
+    }
+  }
+  return ret;
+}
+
+int ObBackupDataBaseTask::check_replica_status_for_backup(
+    const share::ObLSReplica &replica, 
+    char *buf, 
+    const int64_t size, 
+    int64_t &pos,
+    bool &can_do_backup)
+{
+  int ret = OB_SUCCESS;
+  ObLSRestoreStatus restore_status;
+  can_do_backup = false;
+  int tmp_ret = OB_SUCCESS;
+  if (OB_ISNULL(buf) || size <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(buf), K(size));
+  } else if (!ObReplicaTypeCheck::is_full_replica(replica.get_replica_type())) {// TODO(zeyong) 4.3 allow R replica backup later
+    // do nothing
+  } else {
+    if (OB_TMP_FAIL(replica.get_server().ip_port_to_string(buf + pos, size - pos))) {
+      LOG_WARN("failed to get string of ip and port", K(tmp_ret), K(size));
+    } 
+    pos = strlen(buf);
+    if (!replica.is_in_service()) {
+      if (OB_TMP_FAIL(databuff_printf(buf, size, pos, ": replica is not in service. "))) {
+        LOG_WARN("failed to databuff printf", K(tmp_ret), K(buf), K(size), K(pos));
+      }
+    } else if (!replica.is_valid()) {
+      if (OB_TMP_FAIL(databuff_printf(buf, size, pos, ": replica is not valid. "))) {
+        LOG_WARN("failed to databuff printf", K(tmp_ret), K(buf), K(size), K(pos));
+      }
+    } else if (!replica.get_restore_status().is_none()) {
+      if (OB_TMP_FAIL(databuff_printf(buf, size, pos, ": replica is restoring. "))) {
+        LOG_WARN("failed to databuff printf", K(tmp_ret), K(buf), K(size), K(pos));
+      }
+    } else {
+      can_do_backup = true;
+    }
+  }
+  return ret;
+}
+
+ERRSIM_POINT_DEF(EN_BACKUP_SET_OPTIONAL_SERVERS_REPLICA_STATUS_INFO_SIZE);
+
+int ObBackupDataBaseTask::set_optional_servers_(const ObIArray<common::ObAddr> &black_servers)
+{
+  int ret = OB_SUCCESS;
+  int tmp_ret = OB_SUCCESS;
+  ObLSInfo ls_info;
+  ObArray<ObBackupServer> servers;
+  uint64_t tenant_id = get_tenant_id();
+  share::ObLSTableOperator *lst_operator = GCTX.lst_operator_;
+  int64_t cluster_id = GCONF.cluster_id;
+  int64_t replica_status_info_size = OB_MAX_REPLICA_STATUS_FOR_BACKUP_INFO_LENGTH;
+  char replica_status_info[OB_MAX_REPLICA_STATUS_FOR_BACKUP_INFO_LENGTH] = {'\0'};
+  int64_t pos = 0;
+#ifdef ERRSIM
+  const int errsim_ret = OB_E(EN_BACKUP_SET_OPTIONAL_SERVERS_REPLICA_STATUS_INFO_SIZE) OB_SUCCESS;
+  if (OB_SUCCESS != errsim_ret) {
+    replica_status_info_size = 10;
+  }
+#endif
+  if (OB_FAIL(get_ls_replica_array_(ls_info))) {
+    LOG_WARN("failed to get ls replica array", K(ret));
+  } else {
+    const ObLSInfo::ReplicaArray &replica_array = ls_info.get_replicas();
+    for (int i = 0; OB_SUCC(ret) && i < replica_array.count(); ++i) {
+      const ObLSReplica &replica = replica_array.at(i);
+      bool can_do_backup = false;
+      if (replica.is_strong_leader()) {
+        //do nothing
+      } else if (OB_FAIL(check_replica_status_for_backup(replica, replica_status_info, 
+                                                            replica_status_info_size, pos, can_do_backup))) {
+        LOG_WARN("failed to check replica status for backup", K(ret), K(replica), K(replica_status_info), K(pos));
+      } else if (can_do_backup) {
+        if (check_replica_in_black_server_(replica, black_servers)) {
+          if (OB_TMP_FAIL(databuff_printf(replica_status_info, 
+                                            replica_status_info_size, pos, ": is in black server list. "))) {
+            LOG_WARN("failed to databuff printf", K(tmp_ret), K(replica_status_info), K(pos));
+          }
+        } else {
+          ObBackupServer server;
+          server.set(replica.get_server(), 0/*high priority*/);
+          if (OB_FAIL(servers.push_back(server))) {
+            LOG_WARN("failed to push server", K(ret), K(server));
+          }
+        }
+      }
+    }
+    for (int i = 0; OB_SUCC(ret) && i < replica_array.count(); ++i) {
+      const ObLSReplica &replica = replica_array.at(i);
+      bool can_do_backup = false;
+      if (replica.is_strong_leader()) {
+        if (OB_FAIL(check_replica_status_for_backup(replica, replica_status_info, 
+                        replica_status_info_size, pos, can_do_backup))) {
+          LOG_WARN("failed to check replica status for backup", K(ret), K(replica), K(replica_status_info), K(pos));
+        } else if (can_do_backup) {
+          if (replica_array.count() == 1 || !check_replica_in_black_server_(replica, black_servers)) {
+            // if only has one replica. no use black server.
+            ObBackupServer server;
+            server.set(replica.get_server(), 1/*low priority*/);
+            if (OB_FAIL(servers.push_back(server))) {
+              LOG_WARN("failed to push server", K(ret), K(server));
+            }
+          } else {
+            if (OB_TMP_FAIL(databuff_printf(replica_status_info, 
+                                                replica_status_info_size, pos, ": is in black server list. "))) {
+              LOG_WARN("failed to databuff printf", K(tmp_ret), K(replica_status_info), K(pos));
+            }
+          }
+        }
+      } 
+    }
+    if (OB_SUCC(ret) && servers.empty()) {
+      ret = OB_NO_LS_REPLICA_CAN_DO_BACKUP;
+      LOG_WARN("no optional servers, retry_later", K(ret), K(*this), K(replica_status_info));
+    }
+  }
+
+  if (OB_SUCC(ret) && OB_FAIL(set_optional_servers(servers))) {
+    LOG_WARN("failed to optional servers", K(ret));
+  } else {
+    FLOG_INFO("task optional servers are: ", K(*this), K(servers));
+  }
+  return ret;
+}
+
+int ObBackupDataBaseTask::get_ls_replica_array_(ObLSInfo &ls_info)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = get_tenant_id();
+  const int64_t cluster_id = GCONF.cluster_id;
+  share::ObLSTableOperator *lst_operator = GCTX.lst_operator_;
+  ObLSID server_ls_id = execute_on_sys_server_() ? ObLSID(ObLSID::SYS_LS_ID) : ls_id_;
+  if (nullptr == lst_operator) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("lst_operator ptr is null", K(ret));
+  } else if (OB_FAIL(lst_operator->get(cluster_id, tenant_id, server_ls_id, share::ObLSTable::DEFAULT_MODE, ls_info))) {
+    LOG_WARN("failed to get log stream info", K(ret), K(cluster_id), K(tenant_id), K(ls_id_));
+  } else if (0 != ls_info.get_replicas().count()) {
+    // do nothing
+  } else if (!server_ls_id.is_sys_ls()) {
+    // 目标 LS 已删除时，借 SYS LS 选择执行节点，任务仍处理原 ls_id_。
+    LOG_INFO("fall back to sys server", K_(ls_id), K(ls_info));
+    server_ls_id = ObLSID(ObLSID::SYS_LS_ID);
+    if (OB_FAIL(lst_operator->get(cluster_id, tenant_id, server_ls_id, share::ObLSTable::DEFAULT_MODE, ls_info))) {
+      LOG_WARN("failed to get log stream info", K(ret), K(cluster_id), K(tenant_id), K(ls_id_));
+    } 
+  }
+  return ret;
+}
+
+bool ObBackupDataBaseTask::check_replica_in_black_server_(const ObLSReplica &replica, const ObIArray<common::ObAddr> &black_servers)
+{
+  bool is_in_black_servers = false;
+  for (int i = 0; i < black_servers.count(); ++i) {
+    const ObAddr &server = black_servers.at(i);
+    if (server == replica.get_server()) {
+      is_in_black_servers = true; 
+    }
+  }
+  return is_in_black_servers;
+}
+
+/*
+ *---------------------ObBackupDataLSTask----------------------
+ */
+
+int ObBackupDataLSTask::clone(common::ObIAllocator &allocator, ObBackupScheduleTask *&out_task) const
+{
+  int ret = OB_SUCCESS;
+  void *input_ptr = NULL;
+  if (OB_ISNULL(input_ptr = allocator.alloc(get_deep_copy_size()))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(input_ptr));
+  } else {
+    ObBackupDataLSTask *my_task = new (input_ptr) ObBackupDataLSTask();
+    if (OB_ISNULL(my_task)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("taks is nullptr", K(ret));
+    } else if (OB_FAIL(my_task->ObBackupDataBaseTask::deep_copy(*this))) {
+      LOG_WARN("fail to deep copy base task", K(ret));
+    }
+    if (OB_SUCC(ret)) {
+      out_task = my_task;
+    } else if (OB_NOT_NULL(my_task)) {
+      my_task->~ObBackupDataLSTask();
+      my_task = nullptr;
+    }
+  }
+  return ret;
+}
+
+int64_t ObBackupDataLSTask::get_deep_copy_size() const
+{
+  return sizeof(ObBackupDataLSTask);
+}
+
+int ObBackupDataLSTask::execute(obrpc::ObSrvRpcProxy &rpc_proxy) const
+{
+  int ret = OB_SUCCESS;
+  obrpc::ObBackupDataArg arg;
+  arg.trace_id_ = get_trace_id();
+  arg.tenant_id_ = get_tenant_id();
+  arg.task_id_ = get_task_id();
+  arg.backup_set_id_ = backup_set_id_;
+  arg.incarnation_id_ = incarnation_id_;
+  arg.backup_type_ = backup_type_.type_;
+  arg.backup_date_ = backup_date_;
+  arg.ls_id_ = ls_id_;
+  arg.turn_id_ = turn_id_;
+  arg.retry_id_ = retry_id_;
+  arg.dst_server_ = get_dst();
+  arg.job_id_ = get_job_id();
+  arg.start_scn_ = start_scn_;
+  if (OB_FAIL(backup_status_.get_backup_data_type(arg.backup_data_type_))) {
+    LOG_WARN("failed to get backup data type", K(ret), K_(backup_status));
+  } else if (OB_FAIL(arg.backup_path_.assign(backup_path_))) {
+    LOG_WARN("failed to assign backup dest", K(ret), K(backup_path_));
+  } else if (OB_FAIL(rpc_proxy.to(get_dst()).backup_ls_data(arg))) {
+    LOG_WARN("fail to send backup ls data task", K(ret), K(arg));
+  } else {
+    LOG_INFO("start to backup ls data", K(arg));
+  }
+  return ret;
+}
+
+/*
+ *-------------------------ObBackupComplLogTask------------------------------
+ */
+
+int ObBackupComplLogTask::clone(common::ObIAllocator &allocator, ObBackupScheduleTask *&out_task) const
+{
+  int ret = OB_SUCCESS;
+  void *input_ptr = NULL;
+  if (OB_ISNULL(input_ptr = allocator.alloc(get_deep_copy_size()))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(input_ptr));
+  } else {
+    ObBackupComplLogTask *my_task = new (input_ptr) ObBackupComplLogTask();
+    if (OB_ISNULL(my_task)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("taks is nullptr", K(ret));
+    } else if (OB_FAIL(my_task->ObBackupDataBaseTask::deep_copy(*this))) {
+      LOG_WARN("fail to deep copy base task", K(ret));
+    } 
+    if (OB_SUCC(ret)) {
+      out_task = my_task;
+    } else if (OB_NOT_NULL(my_task)) {
+      my_task->~ObBackupComplLogTask();
+      my_task = nullptr;
+    }
+  }
+  return ret;
+}
+
+int64_t ObBackupComplLogTask::get_deep_copy_size() const
+{
+  return sizeof(ObBackupComplLogTask);
+}
+
+int ObBackupComplLogTask::build(const share::ObBackupJobAttr &job_attr, const share::ObBackupSetTaskAttr &set_task_attr, 
+    const share::ObBackupLSTaskAttr &ls_attr)
+{
+  int ret = OB_SUCCESS;
+  ObBackupScheduleTaskKey key;
+  share::SCN start_replay_scn;
+  int64_t dest_id = OB_INVALID_DEST_ID;
+  if (!job_attr.is_valid() || !ls_attr.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(job_attr), K(ls_attr));
+  } else if (OB_FAIL(key.init(ls_attr.tenant_id_, job_attr.job_id_, ls_attr.task_id_, ls_attr.ls_id_.id(), BackupJobType::BACKUP_DATA_JOB))) {
+    LOG_WARN("failed to init backup schedule task key", K(ret), K(job_attr), K(ls_attr));
+  } else if (OB_FAIL(share::ObBackupUtils::get_backup_dest_id(ls_attr.tenant_id_, dest_id))) {
+    LOG_WARN("failed to get backup dest id", K(ret), K(ls_attr));
+  } else if (OB_FAIL(ObBackupScheduleTask::build(key, ls_attr.task_trace_id_, ls_attr.status_, ls_attr.dst_, dest_id))) {
+    LOG_WARN("fail to build backup schedule task", K(ret), "trace_id", ls_attr.task_trace_id_, "status", 
+                  ls_attr.status_, "dst", ls_attr.dst_, "dest_id", dest_id);
+  } else if (OB_FAIL(calc_start_replay_scn_(job_attr, set_task_attr, ls_attr, start_replay_scn))) {
+    LOG_WARN("failed to calc start replay scn", K(ret), K(job_attr), K(set_task_attr), K(ls_attr));
+  } else {
+    incarnation_id_ = job_attr.incarnation_id_;
+    backup_set_id_ = ls_attr.backup_set_id_;
+    backup_type_.type_ = ls_attr.backup_type_.type_;
+    backup_date_ = ls_attr.backup_date_;
+    ls_id_ = ls_attr.ls_id_;
+    start_scn_ = start_replay_scn;
+    end_scn_ = set_task_attr.end_scn_;
+    backup_status_.status_ = set_task_attr.status_.status_;
+    turn_id_ = ls_attr.turn_id_;
+    retry_id_ = ls_attr.retry_id_;
+    is_only_calc_stat_ = ObBackupStatus::BEFORE_BACKUP_LOG == set_task_attr.status_.status_;
+    if (OB_FAIL(backup_path_.assign(job_attr.backup_path_))) {
+      LOG_WARN("failed to assign backup dest", K(ret), "backup dest", job_attr.backup_path_);
+    } else if (OB_FAIL(set_optional_servers_(ls_attr.black_servers_))) {
+      LOG_WARN("failed to set optional servers", K(ret), K(ls_attr));
+    }
+  }
+  return ret;
+}
+
+int ObBackupComplLogTask::execute(obrpc::ObSrvRpcProxy &rpc_proxy) const
+{
+  int ret = OB_SUCCESS;
+  obrpc::ObBackupComplLogArg arg;
+  arg.trace_id_ = get_trace_id();
+  arg.job_id_ = get_job_id();
+  arg.tenant_id_ = get_tenant_id();
+  arg.task_id_ = get_task_id();
+  arg.backup_set_id_ = backup_set_id_;
+  arg.incarnation_id_ = incarnation_id_;
+  arg.backup_date_ = backup_date_;
+  arg.ls_id_ = ls_id_;
+  arg.dst_server_ = get_dst();
+  arg.start_scn_ = start_scn_;
+  arg.end_scn_ = end_scn_;
+  arg.backup_type_ = backup_type_.type_;
+  arg.is_only_calc_stat_ = is_only_calc_stat_;
+  if (OB_FAIL(arg.backup_path_.assign(backup_path_))) {
+    LOG_WARN("failed to assign backup dest", K(ret), K(backup_path_));
+  } else if (OB_FAIL(rpc_proxy.to(get_dst()).backup_completing_log(arg))) {
+    LOG_WARN("fail to send backup ls data task", K(ret), K(arg));
+  } else {
+    LOG_INFO("start to backup completing log", K(arg));
+  }
+  return ret;
+}
+
+
+int ObBackupComplLogTask::calc_start_replay_scn_(const ObBackupJobAttr &job_attr,
+    const ObBackupSetTaskAttr &set_task_attr, const ObBackupLSTaskAttr &ls_attr, share::SCN &start_replay_scn)
+{
+  int ret = OB_SUCCESS;
+  storage::ObBackupLSMetaInfosDesc ls_meta_infos;
+  ObTenantArchiveRoundAttr round_attr;
+  ObBackupDataStore store;
+  ObBackupDest backup_dest;
+  share::ObBackupSetDesc desc;
+  desc.backup_set_id_ = job_attr.backup_set_id_;
+  desc.backup_type_ = job_attr.backup_type_;
+  common::ObMySQLProxy *sql_proxy = GCTX.sql_proxy_;
+  if (OB_FAIL(ObBackupStorageInfoOperator::get_backup_dest(*sql_proxy, job_attr.tenant_id_, 
+      job_attr.backup_path_, backup_dest))) {
+    LOG_WARN("fail to get backup dest", K(ret), K(job_attr));
+  } else if (OB_FAIL(store.init(backup_dest, desc))) {
+    LOG_WARN("fail to init backup data store", K(ret));
+  } else if (OB_FAIL(ObTenantArchiveMgr::get_tenant_current_round(job_attr.tenant_id_, job_attr.incarnation_id_, round_attr))) {
+    LOG_WARN("failed to get tenant current round", K(ret), K(job_attr));
+  } else if (!round_attr.state_.is_doing()) {
+    ret = OB_LOG_ARCHIVE_NOT_RUNNING;
+    LOG_WARN("backup is not supported when log archive is not doing", K(ret), K(round_attr));
+  } else if (round_attr.start_scn_ > set_task_attr.start_scn_) {
+    ret = OB_LOG_ARCHIVE_INTERRUPTED;
+    LOG_WARN("backup is not supported when archive is interrupted", K(ret), K(round_attr), K(set_task_attr));
+  } else if (OB_FAIL(store.read_ls_meta_infos(ls_meta_infos))) {
+    LOG_WARN("fail to read ls meta infos", K(ret));
+  } else if (OB_FAIL(backup::ObBackupUtils::calc_start_replay_scn(set_task_attr, ls_meta_infos, round_attr, start_replay_scn))) {
+    LOG_WARN("failed to calc start replay scn", K(ret), K(set_task_attr), K(ls_meta_infos), K(round_attr));
+  }
+  LOG_INFO("calc start replay scn", K(ret), K(job_attr), K(set_task_attr), K(ls_attr), K(start_replay_scn));
+  return ret;
+}
+
+/*
+ *------------------------ObBackupBuildIndexTask--------------------------
+ */
+
+int ObBackupBuildIndexTask::clone(common::ObIAllocator &allocator, ObBackupScheduleTask *&out_task) const
+{
+  int ret = OB_SUCCESS;
+  void *input_ptr = NULL;
+  if (OB_ISNULL(input_ptr = allocator.alloc(get_deep_copy_size()))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(input_ptr));
+  } else {
+    ObBackupBuildIndexTask *my_task = new (input_ptr) ObBackupBuildIndexTask();
+    if (OB_ISNULL(my_task)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("taks is nullptr", K(ret));
+    } else if (OB_FAIL(my_task->ObBackupDataBaseTask::deep_copy(*this))) {
+      LOG_WARN("fail to deep copy base task", K(ret));
+    } 
+    if (OB_SUCC(ret)) {
+      out_task = my_task;
+    } else if (OB_NOT_NULL(my_task)) {
+      my_task->~ObBackupBuildIndexTask();
+      my_task = nullptr;
+    }
+  }
+  return ret;
+}
+
+int64_t ObBackupBuildIndexTask::get_deep_copy_size() const
+{
+  return sizeof(ObBackupBuildIndexTask);
+}
+
+int ObBackupBuildIndexTask::execute(obrpc::ObSrvRpcProxy &rpc_proxy) const
+{
+  int ret = OB_SUCCESS;
+  obrpc::ObBackupBuildIdxArg arg;
+  arg.job_id_ = get_job_id();
+  arg.task_id_ = get_task_id();
+  arg.trace_id_ = get_trace_id();
+  arg.tenant_id_ = get_tenant_id();
+  arg.incarnation_id_ = incarnation_id_;
+  arg.backup_set_id_ = backup_set_id_;
+  arg.backup_date_ = backup_date_;
+  arg.backup_type_ = backup_type_.type_;
+  arg.turn_id_ = turn_id_;
+  arg.retry_id_ = retry_id_;
+  arg.dst_server_ = get_dst();
+  if (OB_FAIL(backup_status_.get_backup_data_type(arg.backup_data_type_))) {
+    LOG_WARN("failed to get backup data type", K(ret), K_(backup_status));
+  } else if (OB_FAIL(arg.backup_path_.assign(backup_path_))) {
+    LOG_WARN("failed to assign backup path", K(ret), K(backup_path_));
+  } else if (OB_FAIL(rpc_proxy.to(get_dst()).backup_build_index(arg))) {
+    LOG_WARN("fail to send backup ls data task", K(ret), K(arg));
+  } else {
+    FLOG_INFO("start to backup build index", K(arg));
+  }
+  return ret;
+}
+
+/*
+ *-------------------------ObBackupCleanLSTask------------------------------
+ */
+
+ObBackupCleanLSTask::ObBackupCleanLSTask()
+  : ObBackupScheduleTask(ObBackupScheduleTaskType::BACKUP_CLEAN_LS_TASK),
+    job_id_(OB_BACKUP_INVALID_JOB_ID),
+    incarnation_id_(OB_BACKUP_INVALID_INCARNATION_ID),
+    id_(OB_BACKUP_INVALID_BACKUP_SET_ID),
+    round_id_(OB_ARCHIVE_INVALID_ROUND_ID),
+    task_type_(),
+    ls_id_(),
+    backup_path_()
+{
+}
+
+ObBackupCleanLSTask::~ObBackupCleanLSTask()
+{
+}
+
+int ObBackupCleanLSTask::clone(common::ObIAllocator &allocator, ObBackupScheduleTask *&out_task) const
+{
+  int ret = OB_SUCCESS;
+  void *input_ptr = NULL;
+  if (OB_ISNULL(input_ptr = allocator.alloc(get_deep_copy_size()))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(input_ptr));
+  } else {
+    ObBackupCleanLSTask *ls_task = new (input_ptr) ObBackupCleanLSTask();
+    if (OB_ISNULL(ls_task)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("taks is nullptr", K(ret));
+    } else if (OB_FAIL(ls_task->ObBackupScheduleTask::deep_copy(*this))) {
+      LOG_WARN("fail to deep copy base task", K(ret));
+    } else if (OB_FAIL(ls_task->backup_path_.assign(backup_path_))) {
+      LOG_WARN("failed to assign backup dest", K(ret));
+    } else {
+      ls_task->job_id_ = job_id_;
+      ls_task->incarnation_id_ = incarnation_id_;
+      ls_task->id_ = id_;
+      ls_task->round_id_ = round_id_;  
+      ls_task->task_type_ = task_type_;
+      ls_task->ls_id_ = ls_id_;
+    }
+    if (OB_SUCC(ret)) {
+      out_task = ls_task;
+    } else if (OB_NOT_NULL(ls_task)) {
+      ls_task->~ObBackupCleanLSTask();
+      ls_task = nullptr;
+    }
+  }
+  return ret;
+}
+
+int64_t ObBackupCleanLSTask::get_deep_copy_size() const
+{
+  return sizeof(ObBackupCleanLSTask);
+}
+
+bool ObBackupCleanLSTask::can_execute_on_any_server() const
+{
+  return false;
+}
+
+int ObBackupCleanLSTask::do_update_dst_and_doing_status_(common::ObISQLClient &sql_proxy, common::ObAddr &dst, share::ObTaskId &trace_id) 
+{
+  int ret = OB_SUCCESS;
+  ObLSID ls_id(get_ls_id());
+  if (OB_FAIL(ObBackupCleanLSTaskOperator::update_dst_and_status(sql_proxy, get_task_id(), get_tenant_id(), ls_id, trace_id, dst))) {
+    LOG_WARN("failed to update task status", K(ret), K(*this), K(dst));
+  }
+  return ret;
+}
+
+
+int ObBackupCleanLSTask::set_optional_servers_()
+{
+  int ret = OB_SUCCESS;
+  ObArray<ObBackupServer> servers;
+  uint64_t tenant_id = get_tenant_id();
+  share::ObLocationService *location_service = GCTX.location_service_;
+  int64_t cluster_id = GCONF.cluster_id;
+  share::ObLSID ls_id(share::ObLSID::SYS_LS_ID);
+  share::ObLSLocation location;
+  bool is_cache_hit = false;
+
+  if (OB_ISNULL(location_service)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("location_service ptr is null", K(ret));
+  } else if (OB_FAIL(location_service->get(cluster_id, tenant_id, ls_id, INT64_MAX/*expire_renew_time*/,
+      is_cache_hit, location))) {
+    LOG_WARN("failed to get location", K(ret), K(cluster_id), K(tenant_id), K(ls_id));
+  } else {
+    const common::ObIArray<ObLSReplicaLocation> &replica_array = location.get_replica_locations();
+    for (int i = 0; OB_SUCC(ret) && i < replica_array.count(); ++i) {
+      const ObLSReplicaLocation &replica = replica_array.at(i);
+      if (replica.is_valid()) { 
+        ObBackupServer server;
+        if (OB_FAIL(server.set(replica.get_server(), 1/*high priority*/))) {
+          LOG_WARN("failed to set server", K(ret), K(replica));
+        } else if (OB_FAIL(servers.push_back(server))) {
+          LOG_WARN("failed to push server", K(ret), K(server));
+        }
+      }
+    }
+    if (OB_SUCC(ret) && servers.empty()) {
+      ret = OB_EAGAIN;
+      LOG_WARN("no optional servers, retry_later", K(ret), K(*this));
+    }
+  }
+
+  if (OB_SUCC(ret) && OB_FAIL(set_optional_servers(servers))) {
+    LOG_WARN("failed to optional servers", K(ret));
+  } else {
+    FLOG_INFO("task optional servers are：", K(*this), K(servers));
+  }
+  return ret;
+}
+
+int ObBackupCleanLSTask::execute(obrpc::ObSrvRpcProxy &rpc_proxy) const
+{
+  int ret = OB_SUCCESS;
+
+  obrpc::ObLSBackupCleanArg arg;
+  arg.trace_id_ = get_trace_id();
+  arg.job_id_ = job_id_;
+  arg.tenant_id_ = get_tenant_id();
+  arg.incarnation_ = incarnation_id_;
+  arg.task_id_ = get_task_id();
+  arg.id_ = id_;
+  arg.round_id_ = round_id_;
+  arg.task_type_ = task_type_;
+  arg.ls_id_ = ls_id_;
+  arg.dest_id_ = get_dest_id();
+  if (OB_FAIL(rpc_proxy.to(get_dst()).delete_backup_ls_task(arg))) {
+    LOG_WARN("fail to send backup clean ls task", K(ret), K(arg));
+  } else {
+    FLOG_INFO("start to backup clean ls task", K(arg));
+  }
+
+  return ret;
+}
+
+int ObBackupCleanLSTask::cancel(obrpc::ObSrvRpcProxy &rpc_proxy) const
+{
+  int ret = OB_SUCCESS;
+
+  obrpc::ObCancelTaskArg rpc_arg;
+  rpc_arg.task_id_ = get_trace_id();
+  if (OB_FAIL(rpc_proxy.to(get_dst()).cancel_sys_task(rpc_arg))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      LOG_INFO("task may not excute on server", K(rpc_arg), "dst", get_dst());
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("failed to cancel sys task", K(ret), K(rpc_arg));
+    }
+  }
+
+  return ret;
+}
+
+int ObBackupCleanLSTask::build(const ObBackupCleanTaskAttr &task_attr, const ObBackupCleanLSTaskAttr &ls_attr)
+{
+  int ret = OB_SUCCESS;
+  ObBackupScheduleTaskKey key;
+  if (!task_attr.is_valid() || !ls_attr.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(task_attr), K(ls_attr));
+  } else if (OB_FAIL(key.init(ls_attr.tenant_id_, ls_attr.job_id_, ls_attr.task_id_, ls_attr.ls_id_.id(), BackupJobType::BACKUP_CLEAN_JOB))) {
+    LOG_WARN("failed to init backup schedule task key", K(ret), K(task_attr), K(ls_attr));
+  } else if (OB_FAIL(ObBackupScheduleTask::build(key, ls_attr.task_trace_id_, ls_attr.status_, ls_attr.dst_, task_attr.dest_id_))) {
+    LOG_WARN("fail to build backup schedule task", K(ret), "trace_id", ls_attr.task_trace_id_, "status", 
+               ls_attr.status_, "dst", ls_attr.dst_, "dest_id", task_attr.dest_id_, 
+               "key", key, "dest_id", task_attr.dest_id_);
+  } else {
+    job_id_ = task_attr.job_id_;
+    incarnation_id_ = task_attr.incarnation_id_; 
+    round_id_ = ls_attr.round_id_;  
+    task_type_ = ls_attr.task_type_;
+    ls_id_ = ls_attr.ls_id_;
+    if (OB_FAIL(backup_path_.assign(task_attr.backup_path_))) {
+      LOG_WARN("failed to assign backup path", K(ret), K(task_attr.backup_path_));
+    } else if (OB_FAIL(task_attr.get_backup_clean_id(id_))) {
+      LOG_WARN("failed to get task id", K(ret), K(task_attr)); 
+    } else if (OB_FAIL(set_optional_servers_())) {
+      LOG_WARN("failed to set optional servers", K(ret), K(task_attr));  
+    }
+  }
+  return ret;
+}
+
+/*
+ *-------------------------------ObBackupDataLSMetaTask---------------------------------
+ */
+
+int ObBackupDataLSMetaTask::clone(common::ObIAllocator &allocator, ObBackupScheduleTask *&out_task) const 
+{
+  int ret = OB_SUCCESS;
+  void *input_ptr = NULL;
+  if (OB_ISNULL(input_ptr = allocator.alloc(get_deep_copy_size()))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(input_ptr));
+  } else {
+    ObBackupDataLSMetaTask *my_task = new (input_ptr) ObBackupDataLSMetaTask();
+    if (OB_ISNULL(my_task)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("taks is nullptr", K(ret));
+    } else if (OB_FAIL(my_task->ObBackupDataBaseTask::deep_copy(*this))) {
+      LOG_WARN("fail to deep copy base task", K(ret));
+    } 
+    if (OB_SUCC(ret)) {
+      out_task = my_task;
+    } else if (OB_NOT_NULL(my_task)) {
+      my_task->~ObBackupDataLSMetaTask();
+      my_task = nullptr;
+    }
+  }
+  return ret;
+}
+
+int64_t ObBackupDataLSMetaTask::get_deep_copy_size() const
+{
+  return sizeof(ObBackupDataLSMetaTask);
+}
+
+int ObBackupDataLSMetaTask::execute(obrpc::ObSrvRpcProxy &rpc_proxy) const
+{
+  int ret = OB_SUCCESS;
+  obrpc::ObBackupMetaArg arg;
+  arg.trace_id_ = get_trace_id();
+  arg.tenant_id_ = get_tenant_id();
+  arg.task_id_ = get_task_id();
+  arg.backup_set_id_ = backup_set_id_;
+  arg.incarnation_id_ = incarnation_id_;
+  arg.backup_type_ = backup_type_.type_;
+  arg.backup_date_ = backup_date_;
+  arg.ls_id_ = ls_id_;
+  arg.turn_id_ = turn_id_;
+  arg.retry_id_ = retry_id_;
+  arg.dst_server_ = get_dst();
+  arg.job_id_ = get_job_id();
+  arg.start_scn_ = backup_user_ls_scn_;
+  arg.backup_meta_scn_.set_min();
+
+  if (GCTX.is_shared_storage_mode()) {
+    if (!extra_info_.backup_meta_scn_.is_valid_and_not_min()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("backup meta scn is invalid, extra_info may not be initialized",
+          K(ret), K_(extra_info), K(get_task_id()), K(get_tenant_id()));
+    } else {
+      arg.backup_meta_scn_ = extra_info_.backup_meta_scn_;
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(arg.backup_path_.assign(backup_path_))) {
+    LOG_WARN("failed to assign backup path", K(ret), K(backup_path_));
+  } else if (OB_FAIL(rpc_proxy.to(get_dst()).backup_meta(arg))) {
+    LOG_WARN("fail to send backup meta task", K(ret), K(arg));
+  } else {
+    LOG_INFO("start to backup meta", K(arg));
+  }
+  return ret;
+}
+
+/*
+ *-------------------------------ObBackupDataLSMetaFinishTask---------------------------------
+ */
+
+int ObBackupDataLSMetaFinishTask::clone(common::ObIAllocator &allocator, ObBackupScheduleTask *&out_task) const 
+{
+  int ret = OB_SUCCESS;
+  void *input_ptr = NULL;
+  if (OB_ISNULL(input_ptr = allocator.alloc(get_deep_copy_size()))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(input_ptr));
+  } else {
+    ObBackupDataLSMetaFinishTask *my_task = new (input_ptr) ObBackupDataLSMetaFinishTask();
+    if (OB_ISNULL(my_task)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("taks is nullptr", K(ret));
+    } else if (OB_FAIL(my_task->ObBackupDataBaseTask::deep_copy(*this))) {
+      LOG_WARN("fail to deep copy base task", K(ret));
+    } 
+    if (OB_SUCC(ret)) {
+      out_task = my_task;
+    } else if (OB_NOT_NULL(my_task)) {
+      my_task->~ObBackupDataLSMetaFinishTask();
+      my_task = nullptr;
+    }
+  }
+  return ret;
+}
+
+int64_t ObBackupDataLSMetaFinishTask::get_deep_copy_size() const
+{
+  return sizeof(ObBackupDataLSMetaFinishTask);
+}
+
+int ObBackupDataLSMetaFinishTask::execute(obrpc::ObSrvRpcProxy &rpc_proxy) const
+{
+  int ret = OB_SUCCESS;
+  UNUSED(rpc_proxy);
+  return ret;
+}
+
+int ObBackupDataFuseTabletMetaTask::build(const share::ObBackupJobAttr &job_attr,
+    const share::ObBackupSetTaskAttr &set_task_attr, const share::ObBackupLSTaskAttr &ls_attr)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(ObBackupDataBaseTask::build(job_attr, set_task_attr, ls_attr))) {
+    LOG_WARN("failed to build task", K(ret), K(job_attr), K(set_task_attr), K(ls_attr));
+  } else {
+    fuse_turn_id_ = set_task_attr.major_turn_id_;
+  }
+  return ret;
+}
+
+int ObBackupDataFuseTabletMetaTask::clone(common::ObIAllocator &allocator, ObBackupScheduleTask *&out_task) const 
+{
+  int ret = OB_SUCCESS;
+  void *input_ptr = NULL;
+  if (OB_ISNULL(input_ptr = allocator.alloc(get_deep_copy_size()))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(input_ptr));
+  } else {
+    ObBackupDataFuseTabletMetaTask *my_task = new (input_ptr) ObBackupDataFuseTabletMetaTask();
+    if (OB_ISNULL(my_task)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("taks is nullptr", K(ret));
+    } else if (OB_FAIL(my_task->ObBackupDataBaseTask::deep_copy(*this))) {
+      LOG_WARN("fail to deep copy base task", K(ret));
+    } 
+    if (OB_SUCC(ret)) {
+      out_task = my_task;
+    } else if (OB_NOT_NULL(my_task)) {
+      my_task->~ObBackupDataFuseTabletMetaTask();
+      my_task = nullptr;
+    }
+  }
+  return ret;
+}
+
+int64_t ObBackupDataFuseTabletMetaTask::get_deep_copy_size() const
+{
+  return sizeof(ObBackupDataFuseTabletMetaTask);
+}
+
+int ObBackupDataFuseTabletMetaTask::execute(obrpc::ObSrvRpcProxy &rpc_proxy) const
+{
+  int ret = OB_SUCCESS;
+  obrpc::ObBackupFuseTabletMetaArg arg;
+  arg.tenant_id_ = get_tenant_id();
+  arg.job_id_ = get_job_id();
+  arg.task_id_ = get_task_id();
+  arg.trace_id_ = get_trace_id();
+  arg.backup_set_id_ = backup_set_id_;
+  arg.backup_type_ = backup_type_.type_;
+  arg.ls_id_ = ls_id_;
+  arg.turn_id_ = fuse_turn_id_;
+  arg.retry_id_ = retry_id_;
+  arg.dst_server_ = get_dst();
+  if (OB_FAIL(arg.backup_path_.assign(backup_path_))) {
+    LOG_WARN("failed to assign backup path", K(ret), K(backup_path_));
+  } else if (OB_UNLIKELY(!arg.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("get invalid arg", K(ret), K(arg));
+  } else if (OB_FAIL(rpc_proxy.to(get_dst()).backup_fuse_tablet_meta(arg))) {
+    LOG_WARN("fail to send backup fuse tablet meta task", K(ret), K(arg));
+  } else {
+    LOG_INFO("start to backup fuse tablet meta", K(arg));
+  }
+  return ret;
+}
+
+#ifdef OB_BUILD_SHARED_STORAGE
+/*
+ *------------------------ObSSHAMacroBlockScheduleTask--------------------------
+ */
+
+int ObSSHAMacroBlockScheduleTask::restore_doing_macro_task_trace_id_(
+    const ObSSHAMacroBlockTaskAttr &macro_task_attr,
+    ObTaskId &trace_id) const
+{
+  int ret = OB_SUCCESS;
+  if (macro_task_attr.status_.is_doing()) {
+    ObSSHAMacroBlockTaskAttr::TraceIdStr persisted_trace_id;
+    ObTaskId restored_trace_id;
+    if (macro_task_attr.trace_id_.is_empty()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("persisted trace id is empty for doing macro task", K(ret), K(macro_task_attr));
+    } else if (OB_FAIL(persisted_trace_id.assign(macro_task_attr.trace_id_))) {
+      LOG_WARN("failed to copy persisted trace id for doing macro task", K(ret), K(macro_task_attr));
+    } else if (OB_FAIL(restored_trace_id.parse_from_buf(persisted_trace_id.ptr()))) {
+      LOG_WARN("failed to parse persisted trace id for doing macro task", K(ret), K(macro_task_attr));
+    } else if (!restored_trace_id.is_valid()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("persisted trace id is invalid for doing macro task", K(ret), K(macro_task_attr));
+    } else {
+      trace_id = restored_trace_id;
+    }
+  }
+  return ret;
+}
+
+int ObSSHAMacroBlockScheduleTask::build(const share::ObBackupJobAttr &job_attr, const share::ObBackupSetTaskAttr &set_task_attr,
+    const share::ObSSHAMacroBlockTaskAttr &macro_task_attr)
+{
+  int ret = OB_SUCCESS;
+  ObBackupScheduleTaskKey key;
+  ObArray<ObAddr> addr_list;
+  ObCurTraceId::init(GCONF.self_addr_);
+  share::ObTaskId trace_id(*ObCurTraceId::get_trace_id());
+  int64_t dest_id = OB_INVALID_DEST_ID;
+  const int64_t parent_task_id = job_attr.job_id_;
+  if (!job_attr.is_valid() || !macro_task_attr.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(job_attr), K(macro_task_attr));
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("sql proxy is null", K(ret));
+  // DOING 任务的旧 DAG 仍在 Observer 上执行，切主后需沿用落表 trace
+  // 才能与存活探测和成功回调匹配。
+  } else if (OB_FAIL(restore_doing_macro_task_trace_id_(macro_task_attr, trace_id))) {
+  } else if (OB_FAIL(key.init(job_attr.tenant_id_, parent_task_id, macro_task_attr.task_id_, macro_task_attr.ls_id_.id(), BackupJobType::BACKUP_DATA_JOB))) {
+    LOG_WARN("failed to init backup schedule task key", K(ret), K(job_attr), K(macro_task_attr));
+  } else if (macro_task_attr.task_type_.is_backup()
+             && OB_FAIL(share::ObBackupUtils::get_backup_dest_id(job_attr.tenant_id_, dest_id))) {
+    LOG_WARN("failed to get backup dest id", K(ret), K(job_attr));
+  } else if (macro_task_attr.task_type_.is_restore() 
+             && OB_FAIL(ObBackupStorageInfoOperator::get_restore_dest_id(*(GCTX.sql_proxy_), job_attr.tenant_id_, ObBackupDestType::DEST_TYPE_RESTORE_DATA, dest_id))) {
+    LOG_WARN("fail to get restore dest id", K(ret), K(job_attr));
+  } else if (OB_FAIL(ObBackupScheduleTask::build(key, trace_id, macro_task_attr.status_, macro_task_attr.svr_addr_, dest_id))) {
+    LOG_WARN("fail to build backup schedule task", K(ret), "trace_id", macro_task_attr.trace_id_, "status", macro_task_attr.status_, "dst", macro_task_attr.svr_addr_);
+  } else if (OB_FAIL(addr_list.push_back(macro_task_attr.svr_addr_))) {
+    LOG_WARN("failed to push back", K(ret), K(macro_task_attr));
+  } else if (OB_FAIL(macro_task_attr_.assign(macro_task_attr))) {
+    LOG_WARN("failed to assign macro task attr", K(ret), K(macro_task_attr));
+  } else {
+    backup_set_id_ = job_attr.backup_set_id_;
+    ls_id_ = macro_task_attr.ls_id_;
+    if (OB_FAIL(backup_path_.assign(job_attr.backup_path_))) {
+      LOG_WARN("failed to assign backup dest", K(ret), K(job_attr.backup_path_));
+    } else if (macro_task_attr.task_type_.is_restore()) {
+      addr_list.reuse();
+      ObBackupDest dest;
+      ObArray<ObBackupServer> servers;      
+      bool is_self_tenant_server = false; //unused
+      if (OB_FAIL(share::ObBackupStorageInfoOperator::get_backup_dest(
+            *(GCTX.sql_proxy_), job_attr.tenant_id_, set_task_attr.backup_path_, dest))) {
+        LOG_WARN("failed to get backup dest", K(ret), K(job_attr), K(set_task_attr));
+      } else if (OB_FAIL(ObBackupUtils::get_tenant_backup_servers(
+                  dest.get_storage_info()->extension_, job_attr.tenant_id_, addr_list, is_self_tenant_server))) {
+        LOG_WARN("fail to get optional servers", K(ret), K(dest));
+      } else {
+        ARRAY_FOREACH_X(addr_list, i, cnt, OB_SUCC(ret)) {
+          ObBackupServer server;          
+          const ObAddr addr = addr_list.at(i);
+          server.set(addr, 1/*high priority*/);
+          if (OB_FAIL(servers.push_back(server))) {
+            LOG_WARN("fail to push back", K(ret), K(server));
+          }
+        }
+      } 
+      if (FAILEDx(ObBackupScheduleTask::set_optional_servers(servers))) {
+        LOG_WARN("fail to set optional servers", K(ret), K(servers));
+      }
+    }  else if (OB_FAIL(set_optional_servers_(addr_list))) {
+      LOG_WARN("failed to set optional servers", K(ret), K(macro_task_attr));
+    }
+    LOG_INFO("get optional servers", K(ret), K(addr_list));
+  }
+  return ret;
+}
+#endif // OB_BUILD_SHARED_STORAGE
+
+/*
+ *-------------------------------ObBackupValidateLSTask---------------------------------
+ */
+
+ObBackupValidateLSTask::ObBackupValidateLSTask()
+  : ObBackupScheduleTask(ObBackupScheduleTaskType::BACKUP_VALIDATE_LS_TASK),
+    job_id_(OB_BACKUP_INVALID_JOB_ID),
+    incarnation_id_(OB_BACKUP_INVALID_INCARNATION_ID),
+    validate_id_(OB_BACKUP_INVALID_BACKUP_SET_ID),
+    round_id_(OB_ARCHIVE_INVALID_ROUND_ID),
+    validate_level_(),
+    task_type_(),
+    ls_id_(),
+    validate_path_()
+{
+}
+
+ObBackupValidateLSTask::~ObBackupValidateLSTask()
+{
+}
+
+int ObBackupValidateLSTask::clone(common::ObIAllocator &allocator, ObBackupScheduleTask *&out_task) const
+{
+  int ret = OB_SUCCESS;
+  void *input_ptr = NULL;
+  if (OB_ISNULL(input_ptr = allocator.alloc(get_deep_copy_size()))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(input_ptr));
+  } else {
+    ObBackupValidateLSTask *ls_task = new (input_ptr) ObBackupValidateLSTask();
+    if (OB_ISNULL(ls_task)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("taks is nullptr", K(ret));
+    } else if (OB_FAIL(ls_task->ObBackupScheduleTask::deep_copy(*this))) {
+      LOG_WARN("fail to deep copy base task", K(ret));
+    } else if (OB_FAIL(ls_task->validate_path_.assign(validate_path_))) {
+      LOG_WARN("failed to assign validate path", K(ret));
+    } else {
+      ls_task->job_id_ = job_id_;
+      ls_task->incarnation_id_ = incarnation_id_;
+      ls_task->validate_id_ = validate_id_;
+      ls_task->round_id_ = round_id_;  
+      ls_task->validate_level_.level_ = validate_level_.level_;
+      ls_task->task_type_ = task_type_;
+      ls_task->ls_id_ = ls_id_;
+    }
+    if (OB_SUCC(ret)) {
+      out_task = ls_task;
+    } else if (OB_NOT_NULL(ls_task)) {
+      ls_task->~ObBackupValidateLSTask();
+      ls_task = nullptr;
+    }
+  }
+  return ret;
+}
+
+#ifdef OB_BUILD_SHARED_STORAGE
+int ObSSHAMacroBlockScheduleTask::build(
+    const share::ObBackupCleanJobAttr &clean_job_attr,
+    const share::ObBackupCleanTaskAttr &clean_task_attr,
+    const share::ObSSHAMacroBlockTaskAttr &macro_task_attr)
+{
+  int ret = OB_SUCCESS;
+  ObBackupScheduleTaskKey key;
+  ObCurTraceId::init(GCONF.self_addr_);
+  share::ObTaskId trace_id(*ObCurTraceId::get_trace_id());
+  int64_t dest_id = OB_INVALID_DEST_ID;
+  const int64_t parent_task_id = clean_task_attr.task_id_;
+  
+  if (!clean_job_attr.is_valid() || !clean_task_attr.is_valid() || !macro_task_attr.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(clean_job_attr), K(clean_task_attr), K(macro_task_attr));
+  } else if (OB_FAIL(restore_doing_macro_task_trace_id_(macro_task_attr, trace_id))) {
+    LOG_WARN("failed to restore trace id for doing macro task", K(ret), K(macro_task_attr));
+  } else if (OB_FAIL(key.init(clean_job_attr.tenant_id_, parent_task_id, macro_task_attr.task_id_,
+                              macro_task_attr.ls_id_.id(), BackupJobType::BACKUP_CLEAN_JOB))) {
+    LOG_WARN("failed to init backup schedule task key", K(ret), K(clean_job_attr), K(macro_task_attr));
+  } else if (OB_FALSE_IT(dest_id = clean_task_attr.dest_id_)) {  // the dest_id is from clean_task_attr instead of get_backup_dest_id of tenant
+    LOG_WARN("failed to get backup dest id", K(ret), K(clean_job_attr));
+  } else if (OB_FAIL(ObBackupScheduleTask::build(key, trace_id, macro_task_attr.status_, macro_task_attr.svr_addr_, dest_id))) {
+    LOG_WARN("failed to build backup schedule task", K(ret), K(macro_task_attr));
+  } else if (OB_FAIL(macro_task_attr_.assign(macro_task_attr))) {
+    LOG_WARN("failed to assign macro task attr", K(ret), K(macro_task_attr));
+  } else {
+    backup_set_id_ = clean_task_attr.backup_set_id_;
+    ls_id_ = macro_task_attr.ls_id_;
+    if (OB_FAIL(backup_path_.assign(clean_task_attr.backup_path_))) {
+      LOG_WARN("failed to assign backup dest", K(ret), K(clean_task_attr));
+    } else if (OB_FAIL(set_optional_servers_for_backup_clean_())) { //TODO(lyh444845): modify it to a virtual function after refactor
+      LOG_WARN("failed to set optional servers for backup clean", K(ret), K(macro_task_attr));
+    }
+  }
+  return ret;
+}
+#endif // OB_BUILD_SHARED_STORAGE
+
+int64_t ObBackupValidateLSTask::get_deep_copy_size() const
+{
+  return sizeof(ObBackupValidateLSTask);
+}
+
+bool ObBackupValidateLSTask::can_execute_on_any_server() const
+{
+  return false;
+}
+
+int ObBackupValidateLSTask::do_update_dst_and_doing_status_(common::ObISQLClient &sql_proxy, common::ObAddr &dst, share::ObTaskId &trace_id) 
+{
+  int ret = OB_SUCCESS;
+  ObLSID ls_id(get_ls_id()); 
+  if (OB_FAIL(ObBackupValidateLSTaskOperator::update_dst_and_status(sql_proxy, get_task_id(), 
+                                                                      get_tenant_id(), ls_id, trace_id, dst))) {
+    LOG_WARN("failed to update task status", K(ret), K(*this), K(dst));
+  }
+  return ret;
+}
+
+#ifdef OB_BUILD_SHARED_STORAGE
+// Get all alive servers of the tenant for backup clean
+int ObSSHAMacroBlockScheduleTask::set_optional_servers_for_backup_clean_()
+{
+  int ret = OB_SUCCESS;
+  ObArray<ObBackupServer> backup_servers;
+  ObArray<ObAddr> alive_servers;
+  uint64_t tenant_id = get_tenant_id();
+  int64_t renew_time = 0; // unused
+
+  if (OB_FAIL(SVR_TRACER.get_alive_tenant_servers(tenant_id, alive_servers, renew_time))) {
+    LOG_WARN("failed to get alive tenant servers", K(ret), K(tenant_id));
+  } else if (alive_servers.empty()) {
+    ret = OB_EAGAIN;
+    LOG_WARN("no alive servers for tenant, retry_later", K(ret), K(tenant_id), K(*this));
+  } else {
+    ObBackupServer server;
+    for (int64_t i = 0; OB_SUCC(ret) && i < alive_servers.count(); ++i) {
+      server.reset();
+      if (OB_FAIL(server.set(alive_servers.at(i), 1/*high priority*/))) {
+        LOG_WARN("failed to set server", K(ret), "server", alive_servers.at(i));
+      } else if (OB_FAIL(backup_servers.push_back(server))) {
+        LOG_WARN("failed to push server", K(ret), K(server));
+      }
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(set_optional_servers(backup_servers))) {
+    LOG_WARN("failed to set optional servers", K(ret), K(backup_servers));
+  } else {
+    FLOG_INFO("[BACKUP_CLEAN] ss macro block task optional servers are", K(backup_servers));
+  }
+  return ret;
+}
+#endif // OB_BUILD_SHARED_STORAGE
+
+// TODO(xingzhi): add change to get all alive servers after rs code merge and refresh
+int ObBackupValidateLSTask::set_optional_servers_()
+{
+  int ret = OB_SUCCESS;
+  ObArray<ObBackupServer> servers;
+  uint64_t tenant_id = get_tenant_id();
+  share::ObLocationService *location_service = GCTX.location_service_;
+  int64_t cluster_id = GCONF.cluster_id;
+  share::ObLSID ls_id(share::ObLSID::SYS_LS_ID);
+  share::ObLSLocation location;
+  bool is_cache_hit = false;
+
+  if (OB_ISNULL(location_service)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("location_service ptr is null", K(ret));
+  } else if (OB_FAIL(location_service->get(cluster_id, tenant_id, ls_id, INT64_MAX/*expire_renew_time*/,
+      is_cache_hit, location))) {
+    LOG_WARN("failed to get location", K(ret), K(cluster_id), K(tenant_id), K(ls_id));
+  } else {
+    const common::ObIArray<ObLSReplicaLocation> &replica_array = location.get_replica_locations();
+    for (int i = 0; OB_SUCC(ret) && i < replica_array.count(); ++i) {
+      const ObLSReplicaLocation &replica = replica_array.at(i);
+      if (replica.is_valid()) { 
+        ObBackupServer server;
+        server.set(replica.get_server(), 1/*high priority*/);
+        if (OB_FAIL(servers.push_back(server))) {
+          LOG_WARN("failed to push server", K(ret), K(server));
+        }
+      }
+    }
+    if (OB_SUCC(ret) && servers.empty()) {
+      ret = OB_EAGAIN;
+      LOG_WARN("no optional servers, retry_later", K(ret), K(*this));
+    }
+  }
+
+  if (OB_SUCC(ret) && OB_FAIL(set_optional_servers(servers))) {
+    LOG_WARN("failed to optional servers", K(ret));
+  } else {
+    FLOG_INFO("task optional servers are: ", K(*this), K(servers));
+  }
+  return ret;
+}
+
+#ifdef OB_BUILD_SHARED_STORAGE
+int ObSSHAMacroBlockScheduleTask::clone(common::ObIAllocator &allocator, ObBackupScheduleTask *&out_task) const
+{
+  int ret = OB_SUCCESS;
+  void *input_ptr = NULL;
+  if (OB_ISNULL(input_ptr = allocator.alloc(get_deep_copy_size()))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("invalid argument", K(ret), KP(input_ptr));
+  } else {
+    ObSSHAMacroBlockScheduleTask *my_task = new (input_ptr) ObSSHAMacroBlockScheduleTask();
+    if (OB_ISNULL(my_task)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("taks is nullptr", K(ret));
+    } else if (OB_FAIL(my_task->ObBackupDataBaseTask::deep_copy(*this))) {
+      LOG_WARN("fail to deep copy base task", K(ret));
+    } else if (OB_FAIL(my_task->macro_task_attr_.assign(this->macro_task_attr_))) {
+      LOG_WARN("failed to assign macro task attr", K(ret));
+    }
+    if (OB_SUCC(ret)) {
+      out_task = my_task;
+    } else if (OB_NOT_NULL(my_task)) {
+      my_task->~ObSSHAMacroBlockScheduleTask();
+      my_task = nullptr;
+    }
+  }
+  return ret;
+}
+#endif // OB_BUILD_SHARED_STORAGE
+
+int ObBackupValidateLSTask::execute(obrpc::ObSrvRpcProxy &rpc_proxy) const
+{
+  int ret = OB_SUCCESS;
+  obrpc::ObBackupValidateLSArg arg;
+  arg.trace_id_ = get_trace_id();
+  arg.tenant_id_ = get_tenant_id();
+  arg.job_id_ = job_id_;
+  arg.incarnation_ = incarnation_id_;
+  arg.task_id_ = get_task_id();
+  arg.ls_id_ = ls_id_;
+  arg.task_type_.type_ = task_type_.type_;
+  arg.validate_id_ = validate_id_;
+  arg.dest_id_ = get_dest_id();
+  arg.round_id_ = round_id_;
+  arg.validate_level_.level_ = validate_level_.level_;
+  if (OB_FAIL(arg.validate_path_.assign(validate_path_))) {
+    LOG_WARN("fail to assign validate path", KR(ret), K_(validate_path));
+  } else if (!arg.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(arg));
+  } else if (OB_FAIL(rpc_proxy.to(get_dst()).validate_backup_ls_task(arg))) {
+    LOG_WARN("fail to send backup validate ls task", KR(ret), K(arg), K(ls_id_));
+  } else {
+    FLOG_INFO("start to backup validate ls task", K(arg));
+  }
+  return ret;
+}
+
+#ifdef OB_BUILD_SHARED_STORAGE
+int64_t ObSSHAMacroBlockScheduleTask::get_deep_copy_size() const
+{
+  return sizeof(ObSSHAMacroBlockScheduleTask);
+}
+
+int ObSSHAMacroBlockScheduleTask::execute(obrpc::ObSrvRpcProxy &rpc_proxy) const
+{
+  int ret = OB_SUCCESS;
+  LOG_INFO("start to execute macro block backup task", 
+           "tenant_id", get_tenant_id(),
+           "job_id", get_job_id(),
+           "task_id", get_task_id(),
+           "ls_id", get_ls_id(),
+           "macro_block_count", macro_task_attr_.macro_block_cnt_,
+           "trace_id", get_trace_id(),
+           "dst_server", get_dst());
+  
+  // Macro block data handling differs by task type:
+  // - BACKUP/RESTORE: use macro_block_batch_ (ObSSHAMacroBlockBatch), contains macro block info list
+  // - BACKUP_CLEAN: use macro_list_addr_ (ObBackupBlockFileAddr), a file address pointing to block list
+  obrpc::ObSSHAMacroBlocksArg arg;
+  int64_t macro_block_cnt = 0;
+  switch (macro_task_attr_.task_type_.type_) {
+    case share::ObSSHAMacroTaskType::Type::BACKUP_CLEAN:
+      // For BACKUP_CLEAN tasks, use macro_list_addr (file_id, offset, length)
+      arg.macro_list_addr_ = macro_task_attr_.macro_id_list_.get_macro_list_addr();
+      arg.macro_block_batch_.reset();
+      break;
+    case share::ObSSHAMacroTaskType::Type::BACKUP:
+    case share::ObSSHAMacroTaskType::Type::RESTORE:
+      {
+        const share::ObSSHAMacroBlockBatch &macro_block_batch = macro_task_attr_.macro_id_list_.get_macro_block_batch();
+        if (macro_task_attr_.macro_block_cnt_ != macro_block_batch.count()) {
+          ret = OB_INVALID_DATA;
+          LOG_WARN("macro block count mismatch", K(ret), K(macro_task_attr_.macro_block_cnt_), "batch_count", macro_block_batch.count());
+        } else if (OB_FAIL(arg.macro_block_batch_.assign(macro_block_batch))) {
+          LOG_WARN("failed to assign macro block batch", K(ret));
+        } else {
+          macro_block_cnt = macro_block_batch.count();
+          arg.macro_list_addr_.reset();
+        }
+      }
+      break;
+    default:
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid task type", K(ret), K(macro_task_attr_.task_type_));
+      break;
+  }
+
+  if (OB_SUCC(ret)) {
+    LOG_DEBUG("parsed macro block items", "item_count", macro_block_cnt, "task_type", macro_task_attr_.task_type_);
+    
+    arg.tenant_id_ = get_tenant_id();
+    arg.job_id_ = get_job_id();
+    arg.task_id_ = get_task_id();
+    arg.task_type_ = static_cast<uint8_t>(macro_task_attr_.task_type_.type_);
+    arg.retry_cnt_ = macro_task_attr_.retry_cnt_;
+    arg.trace_id_ = get_trace_id();
+    arg.backup_set_id_ = get_backup_set_id();
+    arg.ls_id_ = get_ls_id();
+    arg.dst_server_ = get_dst();
+    arg.backup_path_ = backup_path_;
+    arg.macro_block_cnt_ = macro_block_cnt;
+    
+    if (!arg.is_valid()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("arg is not valid", K(ret), K(arg));
+    } else {
+      switch (macro_task_attr_.task_type_.type_) {
+        case ObSSHAMacroTaskType::Type::BACKUP_CLEAN:
+          if (OB_FAIL(rpc_proxy.to(get_dst()).ss_ha_delete_macro_blocks(arg))) {
+            LOG_WARN("fail to send backup macro block delete task", K(ret), K_(macro_task_attr), K(arg));
+          } else {
+            LOG_INFO("start to delete macro blocks", K(ret), K(arg), K(get_ls_id()));
+          }
+          break;
+        case ObSSHAMacroTaskType::Type::BACKUP:
+        case ObSSHAMacroTaskType::Type::RESTORE:
+          if (OB_FAIL(rpc_proxy.to(get_dst()).ss_ha_copy_macro_blocks(arg))) {
+            LOG_WARN("fail to send backup macro block copy task", K(ret), K_(macro_task_attr), K(arg));
+          } else {
+            LOG_INFO("start to copy macro blocks", K(ret), K(arg), K(get_ls_id()));
+          }
+          break;
+        default:
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid task type for RPC call", K(ret), K(macro_task_attr_.task_type_));
+          break;
+      }
+    }
+    ROOTSERVICE_EVENT_ADD("ss_ha", "ss_ha_macro_blocks_task",
+                     "tenant_id", arg.tenant_id_,
+                     "ls_id", arg.ls_id_,
+                     "task_id", arg.task_id_,
+                     "trace_id", arg.trace_id_,
+                     "macro_cnt", macro_block_cnt,
+                     "macro_task_attr_", macro_task_attr_);
+  }
+  
+  return ret;
+}
+
+int ObSSHAMacroBlockScheduleTask::do_update_dst_and_doing_status_(
+    common::ObISQLClient &sql_proxy, common::ObAddr &dst, share::ObTaskId &trace_id) 
+{
+  int ret = OB_SUCCESS;
+  ObLSID ls_id(get_ls_id());
+  if (OB_FAIL(ObSSHAMacroBlockTaskOperator::update_dst_and_status(
+      sql_proxy, get_tenant_id(), get_job_id(), macro_task_attr_.task_type_, get_task_id(), ls_id.id(), dst, ObBackupTaskStatus::DOING, trace_id))) {
+    LOG_WARN("failed to update task status", K(ret), K(*this), K(dst));
+  }
+  return ret;
+}
+#endif // OB_BUILD_SHARED_STORAGE
+
+int ObBackupValidateLSTask::cancel(obrpc::ObSrvRpcProxy &rpc_proxy) const
+{
+  int ret = OB_SUCCESS;
+
+  obrpc::ObCancelTaskArg rpc_arg;
+  rpc_arg.task_id_ = get_trace_id();
+  if (OB_FAIL(rpc_proxy.to(get_dst()).cancel_sys_task(rpc_arg))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      LOG_INFO("task may not excute on server", K(rpc_arg), "dst", get_dst());
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("failed to cancel sys task", K(ret), K(rpc_arg));
+    }
+  }
+
+  return ret;
+}
+
+int ObBackupValidateLSTask::build(const ObBackupValidateTaskAttr &task_attr, const ObBackupValidateLSTaskAttr &ls_attr)
+{
+  int ret = OB_SUCCESS;
+  ObBackupScheduleTaskKey key;
+  if (!task_attr.is_valid() || !ls_attr.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(task_attr), K(ls_attr));
+  } else if (OB_FAIL(key.init(ls_attr.tenant_id_, ls_attr.job_id_, ls_attr.task_id_, ls_attr.ls_id_.id(), BackupJobType::VALIDATE_JOB))) {
+    LOG_WARN("failed to init backup schedule task key", K(ret), K(task_attr), K(ls_attr));
+  } else if (OB_FAIL(ObBackupScheduleTask::build(key, ls_attr.task_trace_id_, 
+                                                    ls_attr.status_, ls_attr.dst_, ls_attr.dest_id_))) {
+    LOG_WARN("fail to build backup schedule task", K(ret), "trace_id", ls_attr.task_trace_id_, "status", 
+                ls_attr.status_, "dst", ls_attr.dst_);
+  } else {
+    job_id_ = task_attr.job_id_;
+    incarnation_id_ = task_attr.incarnation_id_; 
+    round_id_ = ls_attr.round_id_;  
+    validate_level_.level_ = ls_attr.validate_level_.level_;
+    task_type_ = ls_attr.task_type_;
+    ls_id_ = ls_attr.ls_id_;
+    validate_id_ = ls_attr.validate_id_;
+    if (OB_FAIL(validate_path_.assign(task_attr.validate_path_))) {
+      LOG_WARN("failed to assign validate path", K(ret), K(task_attr.validate_path_));
+    } else if (OB_FAIL(set_optional_servers_())) {
+      LOG_WARN("failed to set optional servers", K(ret), K(task_attr));  
+    }
+  }
+  return ret;
+}
+
+}  // namespace rootserver
+}  // namespace oceanbase

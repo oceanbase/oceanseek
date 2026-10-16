@@ -1,0 +1,289 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_SHARE_OB_BACKUP_DATA_SET_TASK_MGR_H_
+#define OCEANBASE_SHARE_OB_BACKUP_DATA_SET_TASK_MGR_H_
+
+#include "ob_backup_data_scheduler.h"
+#include "share/backup/ob_backup_tablet_reorganize_helper.h"
+#include "share/ls/ob_ls_operator.h"
+#include "share/backup/ob_archive_struct.h"
+#include "share/backup/ob_archive_store.h"
+#include "storage/backup/ob_backup_block_file_reader_writer.h"
+#include "lib/string/ob_sql_string.h"
+
+namespace oceanbase
+{
+namespace share
+{
+class ObAllTenantInfo;
+}
+namespace storage
+{
+class ObTabletMeta;
+struct ObBackupDataLSAttrDesc;
+}
+namespace rootserver
+{
+
+class ObBackupSetTaskMgr
+{
+public:
+  ObBackupSetTaskMgr();
+  ~ObBackupSetTaskMgr() {};
+public:
+  int init(const uint64_t tenant_id,  
+           share::ObBackupJobAttr &job_attr,
+           common::ObMySQLProxy &sql_proxy,
+           obrpc::ObSrvRpcProxy &rpc_proxy,
+           ObBackupTaskScheduler &task_scheduler,
+           ObMultiVersionSchemaService &schema_service,
+           ObBackupDataService &backup_service);
+  int process();
+  int do_clean_up();
+  int deal_failed_set_task(ObMySQLTransaction &trans);
+  share::ObBackupStatus::Status get_status() const { return set_task_attr_.status_.status_; }
+  TO_STRING_KV(K_(meta_tenant_id), K_(set_task_attr));
+private:
+  int persist_sys_ls_task_();
+  int do_persist_sys_ls_task_();
+  int prepare_ss_backup_snapshot_();
+  int prepare_ss_backup_snapshot_once_();
+  int persist_and_publish_backup_snapshot_(
+      const share::SCN &start_scn,
+      const share::SCN &read_scn,
+      const share::SCN &backup_meta_scn,
+      const share::ObLSAttrIArray &ls_attr_array);
+  int try_prepare_backup_meta_snapshot_(
+      share::SCN &backup_meta_scn,
+      common::ObIArray<share::ObLSID> &normal_ls_ids,
+      bool &is_ready);
+  int load_normal_ls_ids_(
+      const share::SCN &read_scn,
+      common::ObIArray<share::ObLSID> &ls_ids,
+      bool &is_normal);
+  int create_backup_meta_reservation_(
+      common::ObMySQLTransaction &trans, share::SCN &backup_meta_scn);
+  int acquire_backup_start_scn_(share::SCN &start_scn);
+  int persist_or_reuse_backup_scns_(
+      const share::SCN &start_scn,
+      const share::SCN &read_scn,
+      const share::SCN &backup_meta_scn);
+  int publish_prepared_backup_snapshot_();
+  int replace_backup_meta_reservation_(
+      common::ObMySQLTransaction &trans,
+      const share::SCN &old_backup_meta_scn,
+      share::SCN &new_backup_meta_scn);
+  int get_backup_meta_reservation_owner_(common::ObSqlString &owner) const;
+  int try_replace_backup_meta_snapshot_(const share::SCN &old_backup_meta_scn);
+  int check_ss_ls_consistency_(
+      const share::SCN &backup_meta_scn,
+      const common::ObIArray<share::ObLSID> &normal_ls_ids,
+      share::SCN &read_scn,
+      share::ObLSAttrIArray &ls_attr_array,
+      common::ObIArray<share::ObLSID> &ss_meta_ls_ids,
+      bool &is_consistent);
+  int get_all_ls_ids_(
+      const share::SCN &backup_meta_scn,
+      common::ObIArray<share::ObLSID> &ls_ids);
+  int enable_ss_gc_();
+  int do_enable_ss_gc_();
+  int deal_generate_file_list_failed_(const int err, bool &can_retry);
+  int persist_ls_attr_info_(const share::ObBackupLSTaskAttr &sys_ls_task, ObIArray<share::ObLSID> &ls_ids);
+  int persist_next_meta_turn_ls_attr_info_(
+      const ObIArray<share::ObLSID> &deleted_ls_ids,
+      ObIArray<share::ObLSID> &ls_ids);
+  int extract_user_ls_ids_(const share::ObLSAttrIArray &ls_attr_array,
+                           common::ObIArray<share::ObLSID> &ls_ids);
+  int sync_wait_backup_user_ls_scn_(const share::ObBackupLSTaskAttr &sys_ls_task, share::SCN &scn);
+  int generate_ls_tasks_(const ObIArray<share::ObLSID> &ls_ids, const share::ObBackupDataTaskType &type);
+  int calc_task_turn_(const ObBackupDataTaskType &type, int64_t &turn_id);
+  int backup_sys_meta_();
+  int do_backup_meta_(ObIArray<share::ObBackupLSTaskAttr> &ls_task, int64_t &finish_cnt);
+  int backup_user_meta_();
+  int backup_meta_finish_();
+  int inner_calculate_consistent_scn_(ObIArray<share::ObBackupLSTaskAttr> &ls_tasks, share::SCN &consistent_scn);
+  int get_deleted_ls_ids_(const ObIArray<share::ObBackupLSTaskAttr> &ls_tasks,
+      ObIArray<share::ObLSID> &deleted_ls_ids);
+  int change_meta_turn_(const ObIArray<share::ObLSID> &deleted_ls_ids);
+  int get_backup_user_meta_task_(ObIArray<share::ObBackupLSTaskAttr> &ls_task);
+  int merge_tablet_to_ls_info_(const share::SCN &consistent_scn,
+      const ObIArray<share::ObBackupLSTaskAttr> &ls_tasks,
+      common::ObIArray<share::ObLSID> &ls_ids);
+  int get_tablet_list_by_snapshot(
+      const share::SCN &consistent_scn, common::hash::ObHashMap<share::ObLSID, ObArray<ObTabletID>> &latest_ls_tablet_map);
+  int fill_map_with_sys_tablets_(common::hash::ObHashMap<share::ObLSID, ObArray<ObTabletID>> &latest_ls_tablet_map);
+  int calculate_backup_consistent_scn_(ObIArray<share::ObBackupLSTaskAttr> &ls_tasks, share::SCN &backup_scn);
+  int get_extern_tablet_info_(const share::ObLSID &ls_id, 
+      ObIArray<ObTabletID> &user_tablet_ids, share::SCN &backup_scn);
+  int merge_ls_meta_infos_(const ObIArray<share::ObBackupLSTaskAttr> &ls_tasks);
+  int remove_backup_meta_reservation_();
+#ifdef OB_BUILD_SHARED_STORAGE
+  int merge_ss_ls_meta_infos_(const ObIArray<share::ObBackupLSTaskAttr> &ls_tasks);
+  bool all_ls_are_normal_(const share::ObLSAttrIArray &ls_attr_array) const;
+  int get_active_ss_meta_ls_ids_(
+      const share::SCN &backup_meta_scn,
+      common::ObIArray<share::ObLSID> &ls_ids,
+      common::ObIArray<share::ObLSID> &offline_ls_ids);
+  int find_first_ss_ls_not_archive_covered_(
+      const share::SCN &read_snapshot_scn,
+      const share::SCN &archive_start_scn,
+      const common::ObIArray<share::ObLSID> &ls_ids,
+      share::ObLSID &uncovered_ls_id);
+  int request_ss_ls_clog_checkpoint_advance_(
+      const share::ObLSID &ls_id,
+      const share::SCN &archive_start_scn);
+  int extract_ls_ids_from_attr_array_(const share::ObLSAttrIArray &ls_attr_array,
+                                      common::ObIArray<share::ObLSID> &ls_ids);
+  bool compare_ls_id_lists_(const common::ObIArray<share::ObLSID> &list1,
+                            const common::ObIArray<share::ObLSID> &list2);
+#endif
+  int do_backup_root_key_();
+  int backup_data_();
+#ifdef OB_BUILD_SHARED_STORAGE
+  int backup_data_in_shared_storage_();
+#endif
+  int backup_data_in_shared_nothing_();
+  int get_ls_id_array_(const ObIArray<share::ObBackupLSTaskAttr> &ls_task, ObIArray<share::ObLSID> &ls_id_array);
+  int backup_fuse_tablet_meta_();
+  int do_backup_fuse_tablet_meta_(ObArray<ObBackupLSTaskAttr> &ls_task, int64_t &finish_cnt);
+  int do_backup_data_(ObArray<share::ObBackupLSTaskAttr> &ls_task, int64_t &finish_cnt, 
+      share::ObBackupLSTaskAttr *& build_index_attr);
+  int full_tablet_checksum_verification_();
+  int backup_data_finish_(const ObIArray<share::ObBackupLSTaskAttr> &ls_tasks, 
+                          const ObBackupLSTaskAttr &build_index_attr,
+                          const share::ObBackupStats *backup_stats);
+  int build_index_(share::ObBackupLSTaskAttr *build_index_attr, bool &finish_build_index);
+  int check_need_change_turn_(const ObIArray<share::ObBackupLSTaskAttr> &ls_tasks, bool &need_change_turn, 
+      ObIArray<storage::ObBackupDataTabletToLSInfo> &tablets_to_ls);
+  int change_turn_(const ObIArray<share::ObBackupLSTaskAttr> &ls_tasks, 
+                   const ObBackupLSTaskAttr &build_index_attr,
+                   ObIArray<storage::ObBackupDataTabletToLSInfo> &tablets_to_ls);
+  int change_task_turn_(const ObIArray<share::ObBackupLSTaskAttr> &ls_task, 
+      const ObIArray<storage::ObBackupDataTabletToLSInfo> &tablets_to_ls);
+  int filter_new_ls_from_tablet_info_(const ObIArray<ObBackupLSTaskAttr> &ls_task,
+                                      const ObIArray<storage::ObBackupDataTabletToLSInfo> &tablets_to_ls,
+                                      ObIArray<ObLSID> &new_ls_array);
+  int get_next_turn_id_(int64_t &next_turn_id);
+  int get_change_turn_tablets_(const ObIArray<share::ObBackupLSTaskAttr> &ls_tasks, 
+                               ObIArray<storage::ObBackupDataTabletToLSInfo> &tablet_to_ls);
+  int get_tablets_of_deleted_ls_(
+      const ObIArray<ObBackupLSTaskAttr> &ls_tasks, common::hash::ObHashSet<ObBackupSkipTabletAttr> &skip_tablets);
+  int do_get_change_turn_tablets_(const ObIArray<share::ObBackupLSTaskAttr> &ls_tasks, 
+      const common::hash::ObHashSet<ObBackupSkipTabletAttr> &skip_tablets,
+      ObIArray<storage::ObBackupDataTabletToLSInfo> &tablet_to_ls);
+  int decide_tablet_final_ls_(const share::ObBackupSkipTabletAttr &skip_tablet,
+                              common::hash::ObHashMap<share::ObLSID, common::ObArray<ObTabletReorganizeInfo>> &tablet_reorganize_ls_map,
+                              common::ObArray<common::ObTabletID> &descendent_list,
+                              share::ObLSID &final_ls_id);
+  int deduplicate_array_(const common::ObIArray<common::ObTabletID> &tablet_ids,
+      common::ObIArray<common::ObTabletID> &deduplicated_ids);
+  int construct_cur_ls_set_(const ObIArray<share::ObBackupLSTaskAttr> &ls_tasks, 
+      common::hash::ObHashSet<share::ObLSID> &ls_id_set);
+  int get_change_turn_ls_(const ObIArray<share::ObBackupLSTaskAttr> &ls_task, 
+      const ObIArray<storage::ObBackupDataTabletToLSInfo> &tablets_to_ls,
+      ObIArray<const share::ObBackupLSTaskAttr *> &need_change_turn_ls_tasks);
+  int update_inner_task_(const ObIArray<share::ObLSID> &new_ls_ids, 
+      const ObIArray<const share::ObBackupLSTaskAttr *> &need_change_turn_ls_tasks);
+  int convert_task_type_(const ObIArray<share::ObBackupLSTaskAttr> &ls_task);
+  int prepare_backup_log_();
+  int inner_prepare_backup_log_();
+  int get_active_round_dest_id_(const uint64_t tenant_id, int64_t &dest_id);
+  int get_newly_created_ls_in_piece_(const uint64_t tenant_id,
+      const share::SCN &start_scn, const share::SCN &end_scn, common::ObIArray<share::ObLSID> &ls_array);
+  int inner_get_newly_created_ls_in_piece_(const int64_t dest_id, const uint64_t tenant_id,
+      const share::SCN &start_scn, const share::SCN &end_scn, common::ObIArray<share::ObLSID> &ls_array);
+  int before_backup_log_();
+  int stat_all_ls_backup_log_(ObMySQLTransaction &trans);
+  int backup_completing_log_();
+  int do_backup_completing_log_(ObArray<share::ObBackupLSTaskAttr> &ls_task, int64_t &finish_cnt);
+  int calculate_start_replay_scn_(share::SCN &start_replay_scn);
+#ifdef OB_BUILD_SHARED_STORAGE
+  int calculate_ss_start_replay_scn_(share::SCN &start_replay_scn);
+  int calculate_ss_min_restore_scn_(share::SCN &min_restore_scn);
+#endif  
+  int do_cancel_();
+  // new function for generate file list
+  int generate_backup_set_file_list_();  
+  int generate_backup_meta_info_file_list_();
+  int generate_table_list_file_list_();
+  int generate_tenant_index_file_list_();
+  int generate_infos_file_list_();
+  int generate_log_stream_file_list_(const ObIArray<ObBackupLSTaskAttr> &ls_task);
+  int add_file_to_file_list_info_(
+      const ObBackupPath &path, 
+      const ObBackupStorageInfo *storage_info, 
+      backup::ObBackupFileListInfo &file_list_info);
+  int process_complement_log_logstream_dir_list_(
+    const ObBackupDest &complement_log_dest, 
+    const int64_t dest_id, 
+    const ObPieceKey &key,
+    backup::ObBackupFileListInfo &file_list_info);  
+  int generate_logstream_dir_list_(
+      const ObBackupDest &backup_set_dest, 
+      backup::ObBackupFileListInfo &file_list_info);  
+  int add_log_stream_meta_dirs_(
+      const ObBackupLSTaskAttr &ls_attr, 
+      const ObBackupDest &backup_set_dest, 
+      backup::ObBackupFileListInfo &file_list_info);
+  int add_log_stream_data_dirs_(
+      const ObBackupLSTaskAttr &ls_attr, 
+      const ObBackupDest &backup_set_dest, 
+      backup::ObBackupFileListInfo &file_list_info);
+  int process_complement_log_rounds_(
+      const ObBackupDest &complement_log_dest, 
+      backup::ObBackupFileListInfo &file_list_info);
+  int process_complement_log_pieces_dir_(
+      const ObBackupDest &complement_log_dest, 
+      ObIArray<ObPieceKey> &key_array,
+      backup::ObBackupFileListInfo &file_list_info);
+  int add_piece_file_list_(const ObBackupDest &complement_log_dest, const int64_t dest_id, const ObPieceKey &key);  
+  int generate_complement_log_file_list_();  
+  int add_complement_log_format_file_(const ObBackupDest &complement_log_dest, const ObBackupStore &complement_store, 
+      backup::ObBackupFileListInfo &file_list_info);
+  int do_failed_ls_task_(ObMySQLTransaction &trans, const ObIArray<share::ObBackupLSTaskAttr> &ls_task);
+  int write_backup_set_placeholder_(const bool is_start);
+  int write_table_list_(const share::SCN &end_scn);
+  int write_extern_infos_();
+  int write_extern_ls_id_info_();
+  int write_tenant_backup_set_infos_();
+  int write_extern_locality_info_(storage::ObExternTenantLocalityInfoDesc &locality_info);
+  int write_extern_tenant_param_info_();
+  int write_backup_set_info_(share::ObBackupSetTaskAttr &set_task_attr, 
+      storage::ObExternBackupSetInfoDesc &backup_set_info);
+  int write_extern_diagnose_info_(const storage::ObExternTenantLocalityInfoDesc &locality_info,
+      const storage::ObExternBackupSetInfoDesc &backup_set_info);
+  int write_log_format_file_();
+
+  int write_extern_ls_info_(const ObArray<share::ObBackupLSTaskAttr> &ls_tasks);
+  int write_or_update_tablet_to_ls_(ObIArray<storage::ObBackupDataTabletToLSInfo> &tablets_to_ls);
+  
+  int set_backup_set_files_failed_(ObMySQLTransaction &trans);
+  int advance_status_(ObMySQLTransaction &trans, const share::ObBackupStatus &next_status, const int result = OB_SUCCESS,
+      const share::SCN &scn = share::SCN::min_scn(), const int64_t end_ts = 0);
+  int get_next_status_(const share::ObBackupStatus &cur_status, share::ObBackupStatus &next_status);
+  int get_backup_end_scn_(share::SCN &end_scn) const;
+  int get_resource_pool_infos_(ObIArray<ObBackupResourcePool> &resource_pool_infos) const;
+  int check_merge_error_();
+  bool is_plus_archive_log_() const { return job_attr_->plus_archivelog_; }
+private:
+  bool is_inited_;
+  uint64_t meta_tenant_id_;
+  share::ObBackupSetTaskAttr set_task_attr_;
+  share::ObBackupJobAttr *job_attr_;
+  common::ObMySQLProxy *sql_proxy_;
+  obrpc::ObSrvRpcProxy *rpc_proxy_;
+  ObBackupTaskScheduler *task_scheduler_;
+  ObMultiVersionSchemaService *schema_service_;
+  ObBackupDataService *backup_service_;
+  storage::ObBackupDataStore store_;
+  ObMySQLTransaction trans_;
+  DISALLOW_COPY_AND_ASSIGN(ObBackupSetTaskMgr);
+};
+
+}
+}
+
+#endif  // OCEANBASE_SHARE_OB_BACKUP_DATA_SET_TASK_MGR_H_

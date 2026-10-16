@@ -1,0 +1,62 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_TX_ELR_HANDLER_
+#define OCEANBASE_TX_ELR_HANDLER_
+
+#include "ob_trans_define.h"
+
+namespace oceanbase
+{
+namespace memtable
+{
+class ObMemtableCtx;
+}
+
+namespace transaction
+{
+class ObPartTransCtx;
+
+enum TxELRState
+{
+  //初始化状态
+  ELR_INIT = 0,
+  //单分区和单机多分区事务，日志已经成功提交给clog，表示elr preparing
+  ELR_PREPARING = 1,
+  //gts的时间戳已经推过global trans version
+  ELR_PREPARED = 2
+};
+
+class ObTxELRHandler
+{
+public:
+  ObTxELRHandler() : elr_prepared_state_(ELR_INIT), commit_version_(), mt_ctx_(NULL) {}
+  void reset();
+
+  int check_and_early_lock_release(bool row_updated, ObPartTransCtx *ctx);
+  void set_memtable_ctx(memtable::ObMemtableCtx *mt_ctx) { mt_ctx_ = mt_ctx; }
+  memtable::ObMemtableCtx *get_memtable_ctx() const { return mt_ctx_; }
+  const share::SCN &get_commit_version() const { return commit_version_; }
+
+  // elr state
+  void set_elr_prepared() { ATOMIC_STORE(&elr_prepared_state_, TxELRState::ELR_PREPARED); }
+  bool is_elr_prepared() const { return TxELRState::ELR_PREPARED == ATOMIC_LOAD(&elr_prepared_state_); }
+  void reset_elr_state()
+  {
+    ATOMIC_STORE(&elr_prepared_state_, TxELRState::ELR_INIT);
+    commit_version_.reset();
+  }
+  TO_STRING_KV(K_(elr_prepared_state), K_(commit_version), KP_(mt_ctx));
+private:
+  // whether it is ready for elr
+  TxELRState elr_prepared_state_;
+  share::SCN commit_version_;
+  memtable::ObMemtableCtx *mt_ctx_;
+};
+
+} // transaction
+} // oceanbase
+
+#endif

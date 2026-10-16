@@ -1,0 +1,106 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_STORAGE_TMP_FILE_OB_TMP_FILE_WRITE_CACHE_METRICS_H_
+#define OCEANBASE_STORAGE_TMP_FILE_OB_TMP_FILE_WRITE_CACHE_METRICS_H_
+
+#include "lib/utility/utility.h"
+#include "storage/tmp_file/ob_tmp_file_global.h"
+
+namespace oceanbase
+{
+namespace tmp_file
+{
+
+struct ObTmpFileFlushMetrics
+{
+public:
+  ObTmpFileFlushMetrics()
+    : real_time_flushing_page_cnt_(0),
+      flush_range_cnt_(0),
+      total_page_cnt_(0),
+      max_page_cnt_(-1),
+      min_page_cnt_(INT64_MAX),
+      skip_incomplete_page_cnt_(0),
+      skip_special_page_hold_cnt_(0),
+      incomplete_page_flush_cnt_(0),
+      meta_page_cnt_(0),
+      iterate_build_cnt_(0),
+      iterate_build_us_sum_(0),
+      task_profile_cnt_(0),
+      task_schedule_delay_us_sum_(0),
+      task_io_wait_us_sum_(0),
+      task_queue_wait_us_sum_(0) {}
+  void reset();
+  void print_statistics();
+  void record_flush_task(const int64_t page_num);
+  void record_skip_incomplete_page(const int64_t page_num);
+  void record_skip_special_page_hold(const int64_t page_num);
+  void record_incomplete_page(const int64_t page_num);
+  void record_meta_page(const int64_t page_num);
+  void record_iterate_build_us(const int64_t us);
+  void record_task_profile(const int64_t schedule_delay_us,
+                           const int64_t io_wait_us,
+                           const int64_t queue_wait_us);
+public:
+  int64_t real_time_flushing_page_cnt_;
+  int64_t flush_range_cnt_;
+  int64_t total_page_cnt_;
+  int64_t max_page_cnt_;
+  int64_t min_page_cnt_;
+  int64_t skip_incomplete_page_cnt_;
+  int64_t skip_special_page_hold_cnt_;
+  int64_t incomplete_page_flush_cnt_;
+  int64_t meta_page_cnt_;
+  int64_t iterate_build_cnt_;
+  int64_t iterate_build_us_sum_;
+  int64_t task_profile_cnt_;
+  int64_t task_schedule_delay_us_sum_;
+  int64_t task_io_wait_us_sum_;
+  int64_t task_queue_wait_us_sum_;
+};
+
+struct ObTmpFileSwapMetrics
+{
+public:
+  ObTmpFileSwapMetrics()
+    : swap_task_cnt_(0),
+      swap_total_response_time_(0),
+      swap_max_response_time_(-1),
+      swap_min_response_time_(INT64_MAX) {}
+  void reset();
+  // reset statistical counters after reporting
+  void print_statistics();
+  void record_swap_response_time(const int64_t response_time);
+public:
+  int64_t swap_task_cnt_;
+  int64_t swap_total_response_time_;
+  int64_t swap_max_response_time_;
+  int64_t swap_min_response_time_;
+};
+
+struct ObTmpFileWriteCacheMetrics
+{
+public:
+  void print();
+  void record_flush_task(const int64_t page_num);
+  void record_swap_job(const int64_t response_time);
+  void record_flush_task_over(const int64_t page_num);
+  void record_meta_page(const int64_t page_num);
+  void record_skip_incomplete_page(const int64_t page_num);
+  void record_skip_special_page_hold(const int64_t page_num);
+  void record_incomplete_page(const int64_t page_num);
+  OB_INLINE int64_t get_flushing_data_size()
+  {
+    return flush_metrics_.real_time_flushing_page_cnt_ * ObTmpFileGlobal::PAGE_SIZE;
+  }
+public:
+  ObTmpFileFlushMetrics flush_metrics_;
+  ObTmpFileSwapMetrics swap_metrics_;
+};
+
+}  // end namespace tmp_file
+}  // end namespace oceanbase
+#endif // OCEANBASE_STORAGE_TMP_FILE_OB_TMP_FILE_THREAD_JOB_H_

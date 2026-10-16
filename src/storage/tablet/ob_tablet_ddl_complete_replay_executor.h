@@ -1,0 +1,55 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_STORAGE_OB_TABLET_DDL_COMPLETE_REPLAY_EXECUTOR
+#define OCEANBASE_STORAGE_OB_TABLET_DDL_COMPLETE_REPLAY_EXECUTOR
+
+#include "logservice/replayservice/ob_tablet_replay_executor.h"
+#include "share/scn.h"
+
+namespace oceanbase
+{
+namespace storage
+{
+namespace mds
+{
+class BufferCtx;
+}
+
+class ObTabletDDLCompleteReplayExecutor final : public logservice::ObTabletReplayExecutor
+{
+public:
+  ObTabletDDLCompleteReplayExecutor();
+
+  int init(
+      mds::BufferCtx &user_ctx,
+      const share::SCN &scn,
+      const ObTabletDDLCompleteMdsUserData &user_data);
+  static int freeze_ddl_kv(ObTablet &tablet, const ObTabletDDLCompleteMdsUserData &user_data);
+  static int update_tablet_table_store(ObTablet &tablet, const ObTabletDDLCompleteMdsUserData &user_data);
+  static int schedule_merge(ObTablet &table, const ObTabletDDLCompleteMdsUserData &user_data);
+
+protected:
+  bool is_replay_update_tablet_status_() const override
+  {
+    return true;
+  }
+
+  int do_replay_(ObTabletHandle &tablet_handle) override;
+
+  virtual bool is_replay_update_mds_table_() const override
+  {
+    return true;
+  }
+
+private:
+  mds::BufferCtx *user_ctx_;
+  share::SCN scn_;
+  const ObTabletDDLCompleteMdsUserData *user_data_;
+};
+} // namespace storage
+} // namespace oceanbase
+
+#endif // OCEANBASE_STORAGE_OB_TABLET_REPLAY_EXECUTOR

@@ -1,0 +1,462 @@
+/**
+ * Copyright (c) 2023 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX SQL
+#include "ob_iceberg_table_metadata.h"
+
+#include "lib/ob_name_def.h"
+#include "lib/timezone/ob_time_convert.h"
+#include "share/schema/ob_iceberg_table_schema.h"
+#include "sql/resolver/dml/ob_dml_resolver.h"
+#include "sql/session/ob_sql_session_info.h"
+#include "sql/table_format/iceberg/ob_iceberg_table_metadata.h"
+#include "sql/table_format/iceberg/ob_iceberg_utils.h"
+#include "sql/table_format/iceberg/scan/task.h"
+#include "sql/table_format/iceberg/spec/manifest.h"
+#include "sql/table_format/iceberg/spec/manifest_list.h"
+
+namespace oceanbase
+{
+namespace sql
+{
+namespace iceberg
+{
+
+int ObIcebergTableMetadata::check_identity_partition_field_in_all_specs(
+    const int32_t source_id,
+    bool &is_identity_in_all_specs) const
+{
+  int ret = OB_SUCCESS;
+  is_identity_in_all_specs = !table_metadata_.partition_specs.empty();
+  for (int64_t i = 0;
+       OB_SUCC(ret) && is_identity_in_all_specs && i < table_metadata_.partition_specs.count();
+       ++i) {
+    const PartitionSpec *spec = table_metadata_.partition_specs.at(i);
+    bool has_identity_field_in_spec = false;
+    if (OB_ISNULL(spec)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get null partition spec", K(ret), K(i));
+    } else {
+      for (int64_t j = 0; OB_SUCC(ret) && j < spec->fields.count(); ++j) {
+        const PartitionField *field = spec->fields.at(j);
+        if (OB_ISNULL(field)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get null partition field", K(ret), K(i), K(j));
+        } else if (TransformType::Identity == field->transform.transform_type
+                   && source_id == field->source_id) {
+          has_identity_field_in_spec = true;
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      is_identity_in_all_specs = is_identity_in_all_specs && has_identity_field_in_spec;
+    }
+  }
+  return ret;
+}
+
+share::ObLakeTableFormat ObIcebergTableMetadata::get_format_type() const
+{
+  return share::ObLakeTableFormat::ICEBERG;
+}
+
+int ObIcebergTableMetadata::assign(const ObIcebergTableMetadata &other)
+{
+  int ret = OB_SUCCESS;
+  if (this != &other) {
+    OZ(ObILakeTableMetadata::assign(other));
+    OZ(ob_write_string(allocator_, other.access_info_, access_info_));
+    OZ(table_metadata_.assign(other.table_metadata_));
+  }
+  return ret;
+}
+
+int64_t ObIcebergTableMetadata::get_convert_size() const
+{
+  return -1;
+}
+
+int ObIcebergTableMetadata::set_access_info(const ObString &access_info)
+{
+  int ret = OB_SUCCESS;
+  OZ(ob_write_string(allocator_, access_info, this->access_info_, true));
+  return ret;
+}
+
+void ObIcebergTableMetadata::set_location_object_id(int64_t location_object_id)
+{
+  location_object_id_ = location_object_id;
+}
+
+int ObIcebergTableMetadata::set_location_object_sub_path(const ObString &location_object_sub_path)
+{
+  int ret = OB_SUCCESS;
+  OZ (ob_write_string(allocator_, location_object_sub_path, location_object_sub_path_, true));
+  return ret;
+}
+
+int ObIcebergTableMetadata::get_current_version(ObIAllocator &allocator,
+                                                const ObString &table_location,
+                                                int64_t &version_number) const
+{
+  int ret = OB_SUCCESS;
+  ObSqlString temp_sql_string;
+  char *version_hint_buf = NULL;
+  int64_t version_hint_buf_len = 0;
+  version_number = -1;
+  if (OB_FAIL(temp_sql_string.append_fmt("%.*s/metadata/version-hint.text",
+                                         table_location.length(),
+                                         table_location.ptr()))) {
+    LOG_WARN("build path failed", K(ret));
+  } else if (OB_FAIL(iceberg::ObIcebergFileIOUtils::read(allocator,
+                                                         temp_sql_string.string(),
+                                                         access_info_,
+                                                         version_hint_buf,
+                                                         version_hint_buf_len,
+                                                         false))) {
+    LOG_WARN("read version-hint.text failed", K(ret), K(temp_sql_string.string()));
+  } else {
+    // 如果末尾有 \n，移除它
+    if ('\n' == version_hint_buf[version_hint_buf_len - 1]) {
+      version_hint_buf_len -= 1;
+    }
+    ObString version_number_str = ObString(version_hint_buf_len, version_hint_buf);
+    int32_t err_number = 0;
+    if (!version_number_str.is_numeric()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid version number", K(ret), K(version_number_str));
+    } else if (OB_FALSE_IT(version_number = ObCharset::strntoll(version_number_str.ptr(),
+                                                                version_number_str.length(),
+                                                                10,
+                                                                &err_number))) {
+    } else if (0 != err_number) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid version number", K(ret), K(version_number_str));
+    }
+  }
+  return ret;
+}
+
+int ObIcebergTableMetadata::load_by_table_location(const ObString &table_location)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString temp_sql_string;
+  int64_t version_number = -1;
+  bool metadata_exists = false;
+  ObString existed_metadata_path;
+
+  // try three types: v1.metadata.json / v1.metadata.json.gz / v1.gz.metadata.json
+  const char *try_metadata_paths[] = {"%.*s/metadata/v%d.metadata.json",
+                                      "%.*s/metadata/v%d.gz.metadata.json",
+                                      "%.*s/metadata/v%d.metadata.json.gz"};
+
+  if (OB_FAIL(get_current_version(allocator_, table_location, version_number))) {
+    LOG_WARN("get current version failed", K(ret), K(table_location));
+  }
+
+  for (int64_t i = 0; OB_SUCC(ret) && !metadata_exists
+                      && i < sizeof(try_metadata_paths) / sizeof(try_metadata_paths[0]);
+       i++) {
+    temp_sql_string.reuse();
+    if (OB_FAIL(temp_sql_string.append_fmt(try_metadata_paths[i],
+                                           table_location.length(),
+                                           table_location.ptr(),
+                                           version_number))) {
+      LOG_WARN("append path failed", K(ret));
+    } else if (OB_FAIL(iceberg::ObIcebergFileIOUtils::is_exist(temp_sql_string.string(),
+                                                               access_info_,
+                                                               metadata_exists))) {
+      LOG_WARN("check existed failed", K(ret));
+    } else if (!metadata_exists) {
+      LOG_DEBUG("iceberg metadata file not found", K(ret), K(temp_sql_string.string()));
+    } else {
+      existed_metadata_path = temp_sql_string.string();
+      metadata_exists = true;
+    }
+  }
+
+  if (OB_SUCC(ret) && !metadata_exists) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid iceberg table, can't find metadata.json", K(ret), K(table_location));
+  }
+
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(load_by_metadata_location(existed_metadata_path))) {
+      LOG_WARN("failed to load table metadata.json", K(ret), K(existed_metadata_path));
+    }
+  }
+  return ret;
+}
+
+int ObIcebergTableMetadata::load_by_metadata_location(const ObString &metadata_location)
+{
+  int ret = OB_SUCCESS;
+  char *buf = NULL;
+  int64_t read_size = 0;
+  ObArenaAllocator tmp_allocator;
+  ObJsonNode *json_node = NULL;
+  if (OB_FAIL(ObIcebergFileIOUtils::read_table_metadata(tmp_allocator,
+                                                        metadata_location,
+                                                        access_info_,
+                                                        buf,
+                                                        read_size))) {
+    LOG_WARN("read table metadata failed", K(ret), K(metadata_location));
+  } else if (OB_ISNULL(buf) || 0 == read_size) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("fail to read table metadata file", K(ret));
+  } else if (OB_FAIL(ObJsonParser::get_tree(&tmp_allocator, ObString(read_size, buf), json_node))) {
+    LOG_WARN("failed to parse table metadata file", K(ret));
+  } else if (OB_ISNULL(json_node) || ObJsonNodeType::J_OBJECT != json_node->json_type()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid json value", K(ret));
+  } else if (OB_FAIL(table_metadata_.init_from_json(*down_cast<ObJsonObject *>(json_node)))) {
+    LOG_WARN("failed to init TableMetadata", K(ret));
+  } else if (OB_FAIL(ob_write_string(allocator_, metadata_location, table_metadata_.metadata_file_location, true))) {
+    LOG_WARN("failed to set metadata file location", K(ret));
+  } else {
+    lake_table_metadata_version_ = table_metadata_.current_snapshot_id;
+  }
+  return ret;
+}
+
+int ObIcebergTableMetadata::do_build_table_schema(std::optional<int32_t> schema_id,
+                                                  std::optional<int64_t> snapshot_id,
+                                                  share::schema::ObTableSchema *&table_schema)
+{
+  int ret = OB_SUCCESS;
+  const Schema *current_schema = NULL;
+  schema::ObIcebergTableSchema *iceberg_table_schema = NULL;
+  int64_t lake_table_snapshot_id
+      = snapshot_id.has_value() ? snapshot_id.value() : table_metadata_.current_snapshot_id;
+  int32_t query_schema_id
+      = schema_id.has_value() ? schema_id.value() : table_metadata_.current_schema_id;
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(iceberg_table_schema
+                       = OB_NEWx(schema::ObIcebergTableSchema, &allocator_, &allocator_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("allocate memory failed", K(ret));
+  } else if (OB_FAIL(table_metadata_.get_schema(query_schema_id, current_schema))) {
+    LOG_WARN("get current schema failed", K(ret));
+  } else {
+    // 这些 id 必须要设置，不然后面的 add column 操作会失败
+    iceberg_table_schema->set_tenant_id(tenant_id_);
+    iceberg_table_schema->set_database_id(database_id_);
+    iceberg_table_schema->set_table_id(table_id_);
+    iceberg_table_schema->set_table_name(table_name_);
+    iceberg_table_schema->set_schema_version(query_schema_id);
+    iceberg_table_schema->set_lake_table_format(share::ObLakeTableFormat::ICEBERG);
+    iceberg_table_schema->set_lake_table_snapshot_id(lake_table_snapshot_id);
+
+    ObExternalFileFormat format;
+    DataFileFormat default_write_format = DataFileFormat::INVALID;
+    if (OB_FAIL(table_metadata_.get_table_default_write_format(default_write_format))) {
+      LOG_WARN("get default.write.format failed", K(ret));
+    } else {
+      switch (default_write_format) {
+        case DataFileFormat::PARQUET:
+          format.format_type_ = ObExternalFileFormat::FormatType::PARQUET_FORMAT;
+          break;
+        case DataFileFormat::ORC:
+          format.format_type_ = ObExternalFileFormat::FormatType::ORC_FORMAT;
+          break;
+        default:
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("unsupported data file type", K(ret), K(default_write_format));
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "Unsupported data file type");
+          break;
+      }
+    }
+
+    ObString format_str;
+    ObArenaAllocator tmp_allocator;
+    if (OB_FAIL(ret)) {
+      // do nothing
+    } else if (OB_FAIL(format.to_string_with_alloc(format_str, tmp_allocator))) {
+      LOG_WARN("string alloc failed", K(ret));
+    } else if (OB_FAIL(iceberg_table_schema->set_external_file_format(format_str))) {
+      LOG_WARN("failed to set external file format", K(ret));
+    } else if (OB_FAIL(
+                   iceberg_table_schema->set_external_file_location(table_metadata_.location))) {
+      LOG_WARN("failed to set external file location", K(ret));
+    }
+
+    if (OB_FAIL(ret)) {
+      // do nothing
+    } else if (location_object_id_ != OB_INVALID_ID) {
+      if (OB_FALSE_IT(iceberg_table_schema->set_external_location_id(location_object_id_))) {         // 改为location_id和sub_path
+
+      } else if (OB_FAIL(iceberg_table_schema->set_external_sub_path(location_object_sub_path_))) {
+        LOG_WARN("failed to set external sub path", K(ret));
+      }
+    } else {
+      if (OB_FAIL(iceberg_table_schema->set_external_file_location_access_info(access_info_))) {       // rest catalog支持vended credential, 此时没有location_id和sub_path
+        LOG_WARN("failed to set external file location access info", K(ret));
+      }
+    }
+
+    if (OB_FAIL(ret)) {
+      // do nothing
+    } else {
+      const PartitionSpec *spec = NULL;
+      const bool enable_manifest_partition_value
+          = ObIcebergUtils::is_manifest_partition_value_supported();
+      if (OB_FAIL(table_metadata_.get_partition_spec(table_metadata_.default_spec_id, spec))) {
+        LOG_WARN("get partition spec failed", K(ret), K(table_metadata_.default_spec_id));
+      }
+      FOREACH_CNT_X(it, current_schema->fields, OB_SUCC(ret))
+      {
+        schema::ObColumnSchemaV2 column_schema;
+        bool is_identity_in_all_specs = false;
+        const int32_t source_id = ObIcebergUtils::get_iceberg_field_id((*it)->get_column_id());
+        if (OB_FAIL(column_schema.assign(**it))) {
+          LOG_WARN("assign column schema failed", K(ret));
+        } else if (enable_manifest_partition_value
+                   && OB_FAIL(
+                       check_identity_partition_field_in_all_specs(source_id,
+                                                                   is_identity_in_all_specs))) {
+          LOG_WARN("failed to get identity partition field status", K(ret), K(source_id));
+        } else if (enable_manifest_partition_value && is_identity_in_all_specs) {
+          ObSqlString temp_str;
+          ObCharsetType charset_type = column_schema.get_charset_type();
+          ObCollationType collation_type = column_schema.get_collation_type();
+          // Scan tasks resolve this pseudo column by the Iceberg source field id, so the
+          // partition field may be reordered independently in every spec.
+          if (OB_FAIL(temp_str.assign_fmt("%s%d", N_PARTITION_LIST_COL, source_id))) {
+            LOG_WARN("failed to assign partition list column", K(ret), K(source_id));
+          } else if (OB_FAIL(ObDMLResolver::set_basic_column_properties(column_schema,
+                                                                        temp_str.string()))) {
+            LOG_WARN("failed to set partition column properties", K(ret), K(source_id));
+          } else {
+            column_schema.set_charset_type(charset_type);
+            column_schema.set_collation_type(collation_type);
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FALSE_IT(column_schema.set_table_id(table_id_))) {
+        } else if (OB_FAIL(iceberg_table_schema->add_column(column_schema))) {
+          LOG_WARN("add column failed", K(ret));
+        }
+      }
+
+      if (OB_FAIL(ret)) {
+        // do nothing
+      } else if (OB_NOT_NULL(spec)) {
+        ObSqlString part_expr;
+        for (int64_t i = 0; i < spec->fields.count() && OB_SUCC(ret); ++i) {
+          const PartitionField *field = spec->fields.at(i);
+          if (!part_expr.empty()) {
+            OZ (part_expr.append(", "));
+          }
+          ObString tmp_str;
+          const share::schema::ObColumnSchemaV2 *col_schema = NULL;
+          if (OB_FAIL(ret)) {
+            // do nothing
+          } else if (OB_FAIL(current_schema->get_column_schema_by_field_id(field->source_id, col_schema))) {
+            LOG_WARN("get col schema failed", K(ret), K(field->source_id));
+          } else if (OB_FAIL(Transform::get_part_expr(tmp_allocator,
+                                                      field->transform,
+                                                      col_schema->get_column_name_str(),
+                                                      tmp_str))) {
+            LOG_WARN("get transform str failed", K(ret));
+          } else if (OB_FAIL(part_expr.append(tmp_str))) {
+            LOG_WARN("append str failed", K(ret), K(tmp_str));
+          } else if (OB_FAIL(iceberg_table_schema->add_partition_key(
+                         col_schema->get_column_name_str()))) {
+            LOG_WARN("failed to add partition key", K(ret), K(col_schema->get_column_name_str()));
+          }
+        }
+        if (OB_SUCC(ret) && !part_expr.empty()) {
+          share::schema::ObPartitionOption &part_opt = iceberg_table_schema->get_part_option();
+          OZ (part_opt.set_part_expr(part_expr.string()));
+          part_opt.set_part_func_type(share::schema::PARTITION_FUNC_TYPE_LIST_COLUMNS);
+          iceberg_table_schema->set_part_level(share::schema::PARTITION_LEVEL_ONE);
+        }
+      }
+    }
+
+    if (OB_SUCC(ret)) {
+      table_schema = iceberg_table_schema;
+    }
+  }
+  return ret;
+}
+
+int ObIcebergTableMetadata::resolve_time_travel_info(
+    const share::ObTimeTravelInfo *time_travel_info,
+    std::optional<int32_t> &schema_id,
+    std::optional<int64_t> &snapshot_id)
+{
+  int ret = OB_SUCCESS;
+  int64_t snapshot_id_value = OB_INVALID_ID;
+  int32_t schema_id_value;
+  switch (time_travel_info->type_) {
+    case share::ObTimeTravelInfo::TimeTravelType::NONE: {
+      snapshot_id = std::nullopt;
+      schema_id = std::nullopt;
+      break;
+    }
+    case share::ObTimeTravelInfo::TimeTravelType::SNAPSHOT_ID: {
+      snapshot_id = std::make_optional(time_travel_info->snapshot_id_);
+      if (OB_FAIL(table_metadata_.get_schema_id_by_snapshot_id(time_travel_info->snapshot_id_,
+                                                               schema_id_value))) {
+        LOG_WARN("failed to get schema id by snapshot id", K(ret));
+      } else {
+        schema_id = std::make_optional(schema_id_value);
+      }
+      break;
+    }
+    case share::ObTimeTravelInfo::TimeTravelType::TIMESTAMP: {
+      if (OB_FAIL(table_metadata_.get_snapshot_id_by_timestamp(time_travel_info->timestamp_ms_,
+                                                               snapshot_id_value))) {
+        LOG_WARN("failed to get snapshot id by timestamp", K(ret));
+      } else if (OB_FAIL(table_metadata_.get_schema_id_by_snapshot_id(snapshot_id_value,
+                                                                      schema_id_value))) {
+        LOG_WARN("failed to get schema id by snapshot id", K(ret));
+      } else {
+        snapshot_id = std::make_optional(snapshot_id_value);
+        schema_id = std::make_optional(schema_id_value);
+      }
+      break;
+    }
+    case share::ObTimeTravelInfo::TimeTravelType::BRANCH_TAG: {
+      const SnapshotRef *ref = NULL;
+      if (OB_FAIL(table_metadata_.get_ref_by_name(time_travel_info->branch_or_tag_name_, ref))) {
+        LOG_WARN("failed to get ref by name", K(ret));
+      } else if (OB_ISNULL(ref)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("ref is null", K(ret));
+      }
+      
+      if (OB_FAIL(ret)) {
+      } else if (ref->type == RefType::BRANCH) {
+        schema_id = std::make_optional(table_metadata_.current_schema_id);
+        snapshot_id = std::make_optional(ref->snapshot_id);
+        // for branch, snapshot id is the same as the current snapshot id
+      } else if (ref->type == RefType::TAG) {
+        snapshot_id = std::make_optional(ref->snapshot_id);
+        if (OB_FAIL(
+                table_metadata_.get_schema_id_by_snapshot_id(ref->snapshot_id, schema_id_value))) {
+          LOG_WARN("failed to get schema id by snapshot id", K(ret));
+        } else {
+          schema_id = std::make_optional(schema_id_value);
+        }
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("unsupported ref type", K(ret), K(ref->type));
+      }
+      break;
+    }
+    default:
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("unsupported time travel query type", K(ret), K(time_travel_info->type_));
+      break;
+  }
+  return ret;
+}
+
+} // namespace iceberg
+} // namespace sql
+} // namespace oceanbase

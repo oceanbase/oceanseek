@@ -1,0 +1,3 @@
+# Trailing spaces are generated TPC field values, not source formatting errors.
+# Preserve these bytes so the corpus remains reproducible and hashes stay valid.
+*.csv whitespace=-blank-at-eol

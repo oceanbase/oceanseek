@@ -1,0 +1,126 @@
+/**
+ * Copyright (c) 2023 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_SHARE_VECTOR_INDEX_MERGE_TASK_H_
+#define OCEANBASE_SHARE_VECTOR_INDEX_MERGE_TASK_H_
+
+#include "share/vector_index/ob_vector_index_async_task.h"
+#include "share/vector_index/ob_vector_index_async_task_util.h"
+#include "share/vector_index/ob_vector_index_i_task_executor.h"
+
+namespace oceanbase 
+{
+namespace share 
+{
+
+class ObVecIdxMergeTaskExecutor : public ObVecAsyncTaskExecutor
+{
+public:
+  ObVecIdxMergeTaskExecutor()
+    : ObVecAsyncTaskExecutor(),
+    merge_base_percentage_(OB_VECTOR_INDEX_MERGE_BASE_PERCENTAGE)
+  {}
+  virtual ~ObVecIdxMergeTaskExecutor() {}
+  int load_triggered_task(const ObVecIndexTaskStatus &task_row) override;
+  int load_task(uint64_t &task_trace_base_num) override;
+  static int do_check_task_result(
+      ObVecIndexAsyncTaskCtx *task_ctx,
+      ObVecTaskResultCheckAction &action);
+private:  
+  bool check_operation_allow() override;
+
+  int64_t merge_base_percentage_;
+};
+
+class ObVecIdxMergeTask : public ObVecIndexAsyncTask
+{
+public:
+  ObVecIdxMergeTask() :
+    ObVecIndexAsyncTask(ObMemAttr(MTL_ID(), "VecMergTask")),
+    no_need_replace_adaptor_(false),
+    can_merge_from_base_(false),
+    merge_from_base_(false),
+    pre_alloc_size_(0)
+  {}
+  virtual ~ObVecIdxMergeTask() {}
+  int do_work() override;
+
+private:
+  bool is_alter_param_child() const;
+  int process_merge();
+  int prepare_alter_param_merge(
+      ObPluginVectorIndexAdaptor &current_adaptor,
+      ObVectorIndexParam &target_param,
+      bool &need_alter_param_merge);
+  int check_active_segment_param(
+      ObPluginVectorIndexAdaptor &adaptor,
+      const ObVectorIndexParam &target_param,
+      bool &equal);
+  int prepare_alter_param_full_merge(ObPluginVectorIndexAdaptor &adaptor);
+  int check_and_merge(ObPluginVectorIndexAdapterGuard &adpt_guard);
+  int execute_merge();
+  int execute_exchange();
+  int serialize_and_insert_snap_index(
+      transaction::ObTxDesc *tx_desc,
+      transaction::ObTxReadSnapshot &snapshot,
+      const uint64_t timeout_us);
+  int prepare_merge_segment(const ObVecIdxSnapshotDataHandle& old_snap_data);
+  int update_task_merge_segments_info();
+  int update_task_result_segments_info(const ObVectorIndexSegmentMeta *new_meta);
+  int calculate_max_merge_vec_cnt(int64_t &max_merge_vec_cnt, int64_t incr_count);
+  int build_filter_clause(const ObTableSchema &data_table_schema, const ObTableSchema &snapshot_table_schema);
+  int merge_bitmap(ObPluginVectorIndexAdaptor *adaptor);
+  int execute_insert(
+      const uint64_t data_schema_version,
+      const bool is_user_hidden_table,
+      const bool is_need_padding,
+      const ObString &partition_names);
+  int clean_snap_index_rows(
+      transaction::ObTxDesc *tx_desc, transaction::ObTxReadSnapshot &snapshot, const uint64_t timeout_us);
+  int rescan(
+      const ObVectorIndexSegmentMeta& seg_meta, storage::ObTableScanParam &scan_param,
+      const uint64_t timeout, ObTableScanIterator *table_scan_iter);
+  int build_rowkey_range(const ObVectorIndexSegmentMeta& seg_meta, ObNewRange &range);
+  int exchange_snap_index_rows(
+      const ObVectorIndexSegmentMeta& seg_meta,
+      const ObTableSchema &data_table_schema, 
+      const ObTableSchema &snapshot_table_schema, 
+      transaction::ObTxDesc *tx_desc, 
+      transaction::ObTxReadSnapshot &snapshot, 
+      const uint64_t timeout_us);
+  int update_meta(
+      const ObVecIdxSnapshotDataHandle& new_snap, transaction::ObTxDesc *tx_desc,
+      transaction::ObTxReadSnapshot &snapshot, const uint64_t timeout_us,
+      const ObVectorIndexSegmentMeta *bridge_meta,
+      const ObVectorIndexSegmentHandle *bridge_segment);
+  int prepare_new_meta(
+      ObVectorIndexMeta &new_meta,
+      ObVectorIndexSegmentMeta &new_seg_meta,
+      const ObVectorIndexMeta &old_meta);
+  int refresh_adaptor();
+  int check_and_wait_write();
+  int check_delta_table_empty(ObPluginVectorIndexAdaptor *adapter,
+      const share::SCN &check_scn,
+      bool &is_empty);
+
+private:
+  int64_t min_vid_ {INT64_MAX};
+  int64_t max_vid_ {0};
+  // rowkey for scan range
+  ObArray<ObObj> rowkey_objs_;
+  ObSEArray<const ObVectorIndexSegmentMeta *, 10> merge_segments_;
+  bool no_need_replace_adaptor_;
+  bool can_merge_from_base_;
+  bool merge_from_base_;
+  int64_t pre_alloc_size_;
+
+  DISALLOW_COPY_AND_ASSIGN(ObVecIdxMergeTask);
+};
+
+
+} // namespace share
+} // namespace oceanbase
+
+#endif // OCEANBASE_SHARE_VECTOR_INDEX_MERGE_TASK_H_

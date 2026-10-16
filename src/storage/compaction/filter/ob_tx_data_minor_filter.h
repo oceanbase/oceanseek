@@ -1,0 +1,56 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OB_STORAGE_COMPACTION_TX_DATA_MINOR_FILTER_H_
+#define OB_STORAGE_COMPACTION_TX_DATA_MINOR_FILTER_H_
+
+#include "storage/compaction/ob_i_compaction_filter.h"
+#include "share/scn.h"
+namespace oceanbase
+{
+namespace blocksstable
+{
+struct ObDatumRow;
+}
+namespace compaction
+{
+class ObTxDataMinorFilter : public ObICompactionFilter
+{
+public:
+  ObTxDataMinorFilter()
+    : ObICompactionFilter(),
+      is_inited_(false),
+      filter_val_(),
+      filter_col_idx_(0)
+  {
+    filter_val_.set_max();
+  }
+  ~ObTxDataMinorFilter() {}
+  int init(const share::SCN &filter_val, const int64_t filter_col_idx);
+  OB_INLINE void reset()
+  {
+    filter_val_.set_max();
+    filter_col_idx_ = 0;
+    is_inited_ = false;
+  }
+  virtual CompactionFilterType get_filter_type() const override { return TX_DATA_MINOR; }
+  virtual int filter(const blocksstable::ObDatumRow &row, ObFilterRet &filter_ret) const override;
+  virtual int64_t get_trans_version_col_idx() const override { return filter_col_idx_; }
+  INHERIT_TO_STRING_KV("ObTxDataMinorFilter", ObICompactionFilter, K_(filter_val),
+      K_(filter_col_idx));
+
+public:
+  share::SCN get_recycle_scn() { return filter_val_; }
+
+private:
+  bool is_inited_;
+  share::SCN filter_val_;
+  int64_t filter_col_idx_;
+};
+
+} // namespace compaction
+} // namespace oceanbase
+
+#endif // OB_STORAGE_COMPACTION_TX_DATA_MINOR_FILTER_H_

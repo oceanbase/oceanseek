@@ -1,0 +1,959 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX RS_COMPACTION
+
+#include "lib/oblog/ob_log_module.h"
+#include "rootserver/freeze/ob_major_freeze_helper.h"
+#include "share/ob_freeze_info_proxy.h"
+#include "share/ob_global_merge_table_operator.h"
+#include "share/ob_global_stat_proxy.h"
+#include "share/ob_zone_merge_info.h"
+#include "lib/string/ob_sql_string.h"
+#include "share/location_cache/ob_location_service.h"
+#include "share/schema/ob_multi_version_schema_service.h"
+#include "src/observer/ob_srv_network_frame.h"
+#include "share/ob_errno.h"
+
+namespace oceanbase
+{
+using namespace share;
+namespace rootserver
+{
+
+int ObMajorFreezeParam::add_freeze_info(
+    const uint64_t tenant_id)
+{
+  int ret = OB_SUCCESS;
+  obrpc::ObSimpleFreezeInfo info(tenant_id);
+  if (OB_FAIL(freeze_info_array_.push_back(info))) {
+    LOG_WARN("fail to push_back", K(info));
+  }
+
+  return ret;
+}
+
+///////////////////////////////////////////////////////////////////////////////
+
+int ObMajorFreezeHelper::major_freeze(const ObMajorFreezeParam &param)
+{
+  ObArray<int> merge_results;
+  return major_freeze(param, merge_results);
+}
+
+int ObMajorFreezeHelper::major_freeze(
+    const ObMajorFreezeParam &param,
+    ObIArray<int> &merge_results)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<obrpc::ObSimpleFreezeInfo, 32> freeze_info_array;
+  bool want_to_freeze_all = (param.freeze_all_ || param.freeze_all_user_ || param.freeze_all_meta_);
+  if (OB_UNLIKELY(!param.is_valid()
+                  || (!want_to_freeze_all && param.freeze_info_array_.empty()))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(param), KR(ret));
+  } else if (OB_FAIL(get_freeze_info(param, freeze_info_array))) {
+    LOG_WARN("fail to get tenant id", KR(ret), K(param));
+  } else if (!freeze_info_array.empty()) { // may be empty due to skipping restore and standby tenants
+    if (OB_FAIL(do_major_freeze(*param.transport_, param.freeze_reason_, freeze_info_array, merge_results))) {
+      LOG_WARN("fail to do major freeze", KR(ret), K(freeze_info_array));
+    }
+  }
+  return ret;
+}
+
+int ObMajorFreezeHelper::tablet_major_freeze(const ObTabletMajorFreezeParam &param)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!param.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(param));
+  } else if (OB_UNLIKELY(nullptr == GCTX.location_service_ || nullptr == GCTX.net_frame_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid GCTX", KR(ret));
+  } else if (!GCONF.enable_major_freeze) {
+    ret = OB_MAJOR_FREEZE_NOT_ALLOW;
+    LOG_WARN("enable_major_freeze is off, refuse to to major_freeze", K(param), KR(ret));
+  } else {
+    LOG_INFO("tablet major freeze", K(ret), K(param));
+    const int64_t start_time = ObTimeUtility::fast_current_time();
+    obrpc::ObTabletMajorFreezeRpcProxy proxy;
+    ObAddr leader;
+    uint64_t tenant_id = param.tenant_id_;
+    obrpc::ObTabletMajorFreezeRequest req;
+    req.tenant_id_ = tenant_id;
+    req.tablet_id_ = param.tablet_id_;
+    req.is_rebuild_column_group_ = param.is_rebuild_column_group_;
+    obrpc::ObMajorFreezeResponse resp;
+    bool is_cache_hit = false;
+
+    if (param.tablet_id_.is_ls_inner_tablet()) {
+      if (param.tablet_id_.can_major_merge()) {
+        if (param.ls_id_.is_valid()) {
+          req.ls_id_ = param.ls_id_;
+        } else {
+          LOG_WARN("ls_id is missing for ls inner tablet major merge", K(param));
+          LOG_USER_ERROR(OB_MISS_ARGUMENT, "ls_id");
+        }
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("can not major freeze ls inner tablet", K(ret), K(param));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "can not major freeze ls inner tablet");
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (!param.tablet_id_.is_ls_inner_tablet() && OB_FAIL(GCTX.location_service_->get(
+      tenant_id, param.tablet_id_, MAX_PROCESS_TIME_US, is_cache_hit, req.ls_id_))) {
+      LOG_WARN("failed to get ls_id", K(ret), K(tenant_id), K(param.tablet_id_));
+    } else if (OB_FAIL(proxy.init(GCTX.net_frame_->get_req_transport()))) {
+      LOG_WARN("failed to init proxy", K(ret));
+    } else {
+      const int64_t MAX_RETRY_COUNT = 5;
+      bool major_freeze_done = false;
+
+      for (int64_t i = 0; OB_SUCC(ret) && (!major_freeze_done) && (i < MAX_RETRY_COUNT); ++i) {
+        if (OB_FAIL(GCTX.location_service_->get_leader_with_retry_until_timeout(GCONF.cluster_id,
+                    tenant_id, req.ls_id_, leader))) {
+          LOG_WARN("fail to get ls locaiton leader", KR(ret), K(tenant_id));
+        } else if (OB_FAIL(proxy.to(leader)
+                                .trace_time(true)
+                                .max_process_handler_time(MAX_PROCESS_TIME_US)
+                                .by(tenant_id)
+                                .dst_cluster_id(GCONF.cluster_id)
+                                .tablet_major_freeze(req, resp))) {
+          if (OB_LEADER_NOT_EXIST == ret || OB_EAGAIN == ret) {
+            const int64_t idle_time = 200 * 1000 * (i + 1);
+            LOG_WARN("leader may switch or ddl confilict, will retry", KR(ret), K(tenant_id), K(param),
+              "ori_leader", leader, K(idle_time));
+            USLEEP(idle_time);
+            ret = OB_SUCCESS;
+          } else {
+            LOG_WARN("failed to send command", K(ret), K(req));
+          }
+        } else {
+          major_freeze_done = true;
+        }
+      } // end of for
+
+      if (OB_SUCC(ret) && !major_freeze_done) {
+        ret = OB_LEADER_NOT_EXIST;
+        LOG_WARN("fail to retry major freeze cuz switching role", KR(ret), K(MAX_RETRY_COUNT));
+      }
+    }
+    const int64_t cost_time = ObTimeUtility::current_time() - start_time;
+    LOG_INFO("do tenant major freeze", KR(ret), K(tenant_id), K(leader), K(param), K(cost_time));
+  }
+  return ret;
+}
+
+int ObMajorFreezeHelper::send_tablets_major_freeze_by_ls(
+  const obrpc::ObTableMajorFreezeRpcProxy &proxy,
+  const uint64_t tenant_id,
+  const int64_t ls_id,
+  const common::ObIArray<uint64_t> &tablet_ids,
+  const bool is_rebuild_column_group,
+  const bool is_async_index_force_merge,
+  obrpc::ObTableMajorFreezeResult &result)
+{
+  int ret = OB_SUCCESS;
+  result.reset();
+  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id) || ls_id <= 0 || tablet_ids.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument for send tablets major freeze by ls", KR(ret), K(tenant_id), K(ls_id), K(tablet_ids.count()));
+  } else if (OB_UNLIKELY(nullptr == GCTX.location_service_ )) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected error, location service or net frame is nullptr", KR(ret), KP(GCTX.location_service_));
+  } else {
+    const int64_t start_time = ObTimeUtility::fast_current_time();
+    ObAddr leader;
+    obrpc::ObTableMajorFreezeRequest req(tenant_id, ls_id, tablet_ids, is_rebuild_column_group, is_async_index_force_merge);
+    share::ObLSID ls_id_obj(ls_id);
+    for (int64_t i = 0; (OB_SUCC(ret) || OB_EAGAIN == ret || OB_LEADER_NOT_EXIST == ret || ret == OB_TIMEOUT) && (i <  MAX_RETRY_COUNT); ++i) {
+      const int64_t LEADER_WAIT_TIMEOUT = 1000 * 1000; // 1s
+      if (OB_FAIL(GCTX.location_service_->get_leader_with_retry_until_timeout(GCONF.cluster_id, tenant_id, ls_id_obj, leader, LEADER_WAIT_TIMEOUT))) {
+        LOG_WARN("fail to get ls locaiton leader", KR(ret), K(tenant_id), K(ls_id_obj));
+      } else if (OB_FAIL(proxy.to(leader)
+                              .trace_time(true)
+                              .max_process_handler_time(MAX_PROCESS_TIME_US)
+                              .by(tenant_id)
+                              .dst_cluster_id(GCONF.cluster_id)
+                              .table_major_freeze(req, result))) {
+        LOG_WARN("failed to send table major freeze command",  KR(ret), K(tenant_id), K(ls_id_obj), "ori_leader", leader, K(req), K(i), K(result));
+        if (OB_LEADER_NOT_EXIST == ret || OB_EAGAIN == ret) {
+          const int64_t idle_time = 200 * 1000 * (i + 1);
+          USLEEP(idle_time);
+        }
+      } else {
+        break;
+      }
+    } // end for
+    const int64_t cost_time = ObTimeUtility::current_time() - start_time;
+    LOG_INFO("send tablets major freeze by ls finished", KR(ret), K(tenant_id), K(ls_id), K(tablet_ids), K(is_rebuild_column_group), K(cost_time), K(result));
+  }
+  return ret;
+}
+
+int ObMajorFreezeHelper::get_next_batch_schedule_tablets(
+  common::sqlclient::ObMySQLResult &result, 
+  bool & no_need_call_next,
+  int64_t & cur_ls_id, 
+  common::ObArray<uint64_t> &batch_schedule_tablet_ids)
+{
+  int ret = OB_SUCCESS;
+  int64_t ls_id = 0;
+  int64_t tablet_id = 0;
+  batch_schedule_tablet_ids.reuse();
+  while (OB_SUCC(ret)) {
+    if (no_need_call_next) { // no need call next, skip
+    } else if (OB_SUCC(result.next())) {
+    } else if (OB_ITER_END == ret) {
+      ret = OB_SUCCESS;
+      break;
+    } else {
+      LOG_WARN("failed to get next row", KR(ret));
+    }
+    if (OB_SUCC(ret)) {
+      EXTRACT_INT_FIELD_MYSQL(result, "ls_id", ls_id, int64_t);
+      EXTRACT_INT_FIELD_MYSQL(result, "tablet_id", tablet_id, int64_t);
+      if (OB_FAIL(ret)) {
+        LOG_WARN("failed to extract field", KR(ret), K(ls_id), K(tablet_id));
+      } else {
+        if (no_need_call_next || cur_ls_id == 0) { // set cur_ls_id when no need call next or cur_ls_id is 0
+          no_need_call_next = false;
+          cur_ls_id = ls_id;
+        }
+        if (ls_id == cur_ls_id && batch_schedule_tablet_ids.count() < BATCH_SCHEDULE_TABLET_COUNT) {
+          if (OB_FAIL(batch_schedule_tablet_ids.push_back(static_cast<uint64_t>(tablet_id)))) {
+            LOG_WARN("failed to push tablet_id to batch schedule tablet ids", KR(ret), K(static_cast<uint64_t>(tablet_id)));
+          }
+        } else { // batch reach limit, no need call next when next loop, break
+          no_need_call_next = true;
+          break;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObMajorFreezeHelper::get_ls_tablets_result_by_sql(
+  const uint64_t tenant_id,
+  const uint64_t table_id,
+  ObMySQLProxy::MySQLResult &res,
+  common::sqlclient::ObMySQLResult *&result)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected error, sql proxy is nullptr", KR(ret));
+  } else if (OB_FAIL(sql.assign_fmt("SELECT distinct ls_id, tablet_id FROM oceanbase.__all_tablet_to_ls WHERE table_id = %ld order by ls_id asc;", table_id))) {
+    LOG_WARN("failed to assign sql", KR(ret), K(table_id));
+  } else if (OB_FAIL(GCTX.sql_proxy_->read(res, tenant_id, sql.ptr()))) {
+    LOG_WARN("failed to read sql", KR(ret), K(sql), K(tenant_id));
+  } else if (OB_ISNULL(result = res.get_result())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null result for table major freeze", KR(ret), K(sql), K(tenant_id));
+  }
+  return ret;
+}
+
+// Utility function to format table freeze error detail
+int ObMajorFreezeHelper::format_table_freeze_error_detail(
+  const obrpc::ObTableMajorFreezeResult &result,
+  common::ObSqlString &detail)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(detail.append_fmt("Table major freeze partially failed, total_count = %ld, success_count = %ld ", 
+          result.total_tablets_, result.success_tablets_))) {
+    LOG_WARN("failed to append basic info", K(ret), K(result));
+  }
+  bool first_err_code = false;
+  for (int64_t idx = 0; idx < obrpc::ObTableMajorFreezeResult::MAX_FAIL_CODES && OB_SUCC(ret); ++idx) {
+    if (result.fail_err_codes_[idx] == OB_SUCCESS) { // do nothing
+    } else { // append error code
+      const char *err_name = ob_error_name(result.fail_err_codes_[idx]);
+      if (!first_err_code) { // append prefix
+        if (OB_FAIL(detail.append_fmt(", fail_err_codes = %s", err_name))) {
+          LOG_WARN("failed to append fail_err_codes prefix", K(ret));
+        }
+        first_err_code = true; // set flag
+      } else if (OB_FAIL(detail.append(", "))) {
+        LOG_WARN("failed to append comma", K(ret));
+      } else if (OB_FAIL(detail.append_fmt("%s", err_name))) { // append error name
+        LOG_WARN("failed to append error name", K(ret), K(idx), K(err_name));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObMajorFreezeHelper::table_major_freeze(
+  const ObTableMajorFreezeArg &param)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!param.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument for table major freeze", KR(ret), K(param));
+  } else if (OB_ISNULL(GCTX.net_frame_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected error, net frame is nullptr", KR(ret));
+  } else {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      common::sqlclient::ObMySQLResult *result = nullptr;
+      ObTableMajorFreezeRpcProxy proxy;
+      if (OB_FAIL(proxy.init(GCTX.net_frame_->get_req_transport()))) {
+        LOG_WARN("failed to init proxy for send tablets major freeze by ls", K(ret));
+      } else if (OB_FAIL(get_ls_tablets_result_by_sql(param.tenant_id_, param.table_id_, res, result))) {
+        LOG_WARN("failed to get ls tablets result by sql", KR(ret), K(param));
+      } else {
+        int64_t cur_ls_id = 0;
+        bool no_need_call_next = false;
+        // aggregated result for all tablets of table
+        obrpc::ObTableMajorFreezeResult aggregated_result;
+        ObArray<uint64_t> batch_schedule_tablet_ids;
+        while (OB_SUCC(ret)) {
+          obrpc::ObTableMajorFreezeResult response;
+          if (OB_FAIL(get_next_batch_schedule_tablets(*result, no_need_call_next, cur_ls_id, batch_schedule_tablet_ids))) {
+            LOG_WARN("failed to get next batch schedule tablets", KR(ret), K(cur_ls_id), K(batch_schedule_tablet_ids));
+          } else if (batch_schedule_tablet_ids.empty()) {
+            break;
+          } else if (OB_FAIL(send_tablets_major_freeze_by_ls(proxy, param.tenant_id_, cur_ls_id, batch_schedule_tablet_ids,
+              param.is_rebuild_column_group_, param.is_async_index_force_merge_, response))) {
+            LOG_WARN("failed to send tablets major freeze by ls", KR(ret), K(param), K(cur_ls_id), K(batch_schedule_tablet_ids), K(batch_schedule_tablet_ids.count()), K(result));
+          }
+          aggregated_result.total_tablets_ += batch_schedule_tablet_ids.count();
+          aggregated_result.success_tablets_ += response.success_tablets_;
+          for (int64_t idx = 0; idx < ObTableMajorFreezeResult::MAX_FAIL_CODES; ++idx) {
+            aggregated_result.set_err_code(response.fail_err_codes_[idx]);
+          }
+        }
+        if (OB_SUCC(ret) && aggregated_result.success_tablets_ != aggregated_result.total_tablets_) {
+          ret = OB_PARTIAL_FAILED;
+          LOG_WARN("[TableMajorFreeze] tablets of table do major freeze partially failed", KR(ret), K(param), K(cur_ls_id), K(aggregated_result));
+          common::ObSqlString detail;
+          int tmp_ret = OB_SUCCESS;
+          if (OB_TMP_FAIL(format_table_freeze_error_detail(aggregated_result, detail))) {
+            LOG_WARN("failed to format table freeze error detail", KR(tmp_ret), K(aggregated_result));
+          } else {
+            LOG_USER_ERROR(OB_PARTIAL_FAILED, detail.ptr());
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObMajorFreezeHelper::get_freeze_info(
+    const ObMajorFreezeParam &param,
+    ObIArray<obrpc::ObSimpleFreezeInfo> &freeze_info_array)
+{
+  int ret = OB_SUCCESS;
+
+  ObArray<obrpc::ObSimpleFreezeInfo> tmp_info_array;
+  bool want_to_freeze_all = param.freeze_all_ || param.freeze_all_user_ || param.freeze_all_meta_;
+  if (want_to_freeze_all) {
+    if (OB_FAIL(get_specific_tenant_freeze_info(param.freeze_all_, param.freeze_all_user_, 
+                                                param.freeze_all_meta_, tmp_info_array))) {
+      LOG_WARN("fail to get specific tenant freeze info", KR(ret));
+    }
+  } else {
+    if (OB_FAIL(tmp_info_array.assign(param.freeze_info_array_))) {
+      LOG_WARN("fail to assign", K(param), KR(ret));
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (tmp_info_array.empty() && !want_to_freeze_all) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("freeze info array should not be empty", KR(ret), K(param));
+  } else {
+    const int64_t info_cnt = tmp_info_array.count();
+    for (int64_t i = 0; OB_SUCC(ret) && (i < info_cnt); ++i) {
+      share::ObAllTenantInfo tenant_info;
+      bool is_restore = false;
+      const uint64_t tenant_id = tmp_info_array.at(i).tenant_id_;
+      if (OB_FAIL(check_tenant_is_restore(tenant_id, is_restore))) {
+        LOG_WARN("fail to check tenant is restore", KR(ret), K(i), "freeze_info", tmp_info_array.at(i));
+      } else if (is_restore) {
+        LOG_INFO("skip restoring tenant to do major freeze", K(tenant_id));
+        const char *warn_buf = "tenant is in restore, major freeze is not allowed now";
+        int tmp_ret = OB_SUCCESS;
+        if (OB_TMP_FAIL(add_user_warning(tenant_id, warn_buf))) {
+          LOG_WARN("fail to add user warning", KR(tmp_ret), K(tenant_id));
+        }
+      } else if (OB_FAIL(share::ObAllTenantInfoProxy::load_tenant_info(tenant_id, GCTX.sql_proxy_,
+                                                                false, tenant_info))) {
+        if (OB_ITER_END == ret) {
+          ret = OB_SUCCESS; // ignore ret, so as to process the next tenant
+          LOG_WARN("tenant may be deleted, skip major freeze for this tenant", K(tenant_id));
+        } else {
+          LOG_WARN("fail to load tenant info", KR(ret), K(tenant_id));
+        }
+      }
+      // Skip major freeze for standby tenants and thus avoid OB_MAJOR_FREEZE_NOT_ALLOW incurred by
+      // standby tenants, only when launching major freeze on more than one tenant or all_user or all.
+      else if (tenant_info.is_standby() && ((info_cnt > 1) || param.freeze_all_user_ || param.freeze_all_)) {
+        LOG_INFO("skip major freeze for standby tenant", K(tenant_info));
+        const char *warn_buf = "standby tenant sync freeze info from primary tenant, not allowed to launch major freeze";
+        int tmp_ret = OB_SUCCESS;
+        if (OB_TMP_FAIL(add_user_warning(tenant_id, warn_buf))) {
+          LOG_WARN("fail to add user warning", KR(tmp_ret), K(tenant_id));
+        }
+      } else if (OB_FAIL(freeze_info_array.push_back(tmp_info_array.at(i)))) {
+        LOG_WARN("fail to push back freeze info", KR(ret), K(i), "freeze_info", tmp_info_array.at(i));
+      }
+    }
+  }
+
+  return ret;
+}
+
+int ObMajorFreezeHelper::check_tenant_is_restore(
+    const uint64_t tenant_id,
+    bool &is_restore)
+{
+  int ret = OB_SUCCESS;
+  is_restore = false;
+
+  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(ObMultiVersionSchemaService::get_instance().check_tenant_is_restore(NULL, tenant_id, is_restore))) {
+    LOG_WARN("fail to check tenant restore", KR(ret), K(tenant_id));
+  }
+  return ret;
+}
+
+int ObMajorFreezeHelper::get_all_tenant_freeze_info(
+    ObIArray<obrpc::ObSimpleFreezeInfo> &freeze_info_array)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<uint64_t, 32> tenant_ids;
+  share::schema::ObSchemaGetterGuard schema_guard;
+  if (OB_ISNULL(GCTX.schema_service_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid GCTX", KR(ret));
+  } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(OB_SYS_TENANT_ID, schema_guard))) {
+    LOG_WARN("fail to get schema guard", KR(ret));
+  } else if (OB_FAIL(schema_guard.get_tenant_ids(tenant_ids))) {
+    LOG_WARN("fail to get tenant ids", KR(ret));
+  } else {
+    for (int64_t i = 0; (i < tenant_ids.count()) && OB_SUCC(ret); ++i) {
+      // only launch major freeze for tenant whose status is normal, and skip major freeze for
+      // tenant whose status is not normal.
+      const ObSimpleTenantSchema *tenant_schema = nullptr;
+      if (OB_FAIL(schema_guard.get_tenant_info(tenant_ids[i], tenant_schema))) {
+        LOG_WARN("fail to get simple tenant schema", KR(ret), "tenant_id", tenant_ids[i]);
+      } else if (OB_ISNULL(tenant_schema)) {
+        ret = OB_INNER_STAT_ERROR;
+        LOG_WARN("tenant schema is null", KR(ret), "tenant_id", tenant_ids[i]);
+      } else if (OB_UNLIKELY(!tenant_schema->is_normal())) {
+        LOG_WARN("tenant status is not normal, skip major freeze for this tenant", "tenant_id",
+                 tenant_ids[i], "status", tenant_schema->get_status());
+      } else { // tenant_schema->is_normal()
+        obrpc::ObSimpleFreezeInfo info(tenant_ids[i]);
+        if(OB_FAIL(freeze_info_array.push_back(info))) {
+          LOG_WARN("fail to push back", KR(ret), "tenant_id", tenant_ids[i]);
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObMajorFreezeHelper::get_specific_tenant_freeze_info( 
+    bool freeze_all, 
+    bool freeze_all_user, 
+    bool freeze_all_meta, 
+    common::ObIArray<obrpc::ObSimpleFreezeInfo> &freeze_info_array)
+{
+  int ret = OB_SUCCESS;
+  // if min_cluster_version < 4.2.1.0，disable all_user/all_meta, 
+  // and make tenant=all effective for all tenants.
+  if (GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_2_1_0) {
+    if (freeze_all_user || freeze_all_meta) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("all_user/all_meta are not supported when min_cluster_version is less than 4.2.1.0",
+               KR(ret), K(freeze_all_user), K(freeze_all_meta));
+    } else if (freeze_all) {
+      freeze_info_array.reset();
+      if (OB_FAIL(get_all_tenant_freeze_info(freeze_info_array))) {
+        LOG_WARN("fail to get all tenant freeze info", KR(ret));
+      }
+    }
+  } else {
+    ObSEArray<obrpc::ObSimpleFreezeInfo, 32> tmp_freeze_info_array;
+    if (OB_FAIL(get_all_tenant_freeze_info(tmp_freeze_info_array))) {
+      LOG_WARN("fail to get all tenant freeze info", KR(ret));
+    } else {
+      using FUNC_TYPE = bool (*) (const uint64_t);
+      FUNC_TYPE func = nullptr;
+      // caller guarantees that at most one of freeze_all/freeze_all_user/freeze_all_meta is true.
+      if (freeze_all || freeze_all_user) {
+        func = is_user_tenant;
+      } else {
+        func = is_meta_tenant;
+      }
+      freeze_info_array.reset();
+      for (int64_t i = 0; OB_SUCC(ret) && (i < tmp_freeze_info_array.count()); ++i) {
+        if (func(tmp_freeze_info_array.at(i).tenant_id_)) {
+          if (OB_FAIL(freeze_info_array.push_back(tmp_freeze_info_array.at(i)))) {
+            LOG_WARN("fail to push back freeze info", 
+                     KR(ret), K(i), "freeze_info", tmp_freeze_info_array.at(i));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObMajorFreezeHelper::do_major_freeze(
+    const rpc::frame::ObReqTransport &transport,
+    const ObMajorFreezeReason freeze_reason,
+    const ObIArray<obrpc::ObSimpleFreezeInfo> &freeze_info_array,
+    ObIArray<int> &merge_results)
+{
+  int ret = OB_SUCCESS;
+  int final_ret = OB_SUCCESS;
+  if (freeze_info_array.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret));
+  } else {
+    const int64_t tenant_count = freeze_info_array.count();
+    for (int i = 0; (i < tenant_count) && OB_SUCC(ret); ++i) {
+      const uint64_t tenant_id = freeze_info_array.at(i).tenant_id_;
+      if (OB_FAIL(do_one_tenant_major_freeze(transport, freeze_reason, freeze_info_array.at(i)))) {
+        if ((OB_MAJOR_FREEZE_NOT_FINISHED != ret) && (OB_FROZEN_INFO_ALREADY_EXIST != ret)) {
+          final_ret = ret;
+          LOG_WARN("fail do tenant major freeze", KR(ret), K(tenant_count),
+            "freeze_reason", major_freeze_reason_to_str(freeze_reason),
+            "freeze_info", freeze_info_array.at(i));
+        }
+      }
+
+      // push ret of 'do_one_tenant_major_freeze' into array. if fail, finish loop.
+      if (OB_SUCCESS != (ret = merge_results.push_back(ret))) {
+        final_ret = ret;
+        LOG_WARN("fail to push back", KR(ret), K(tenant_id), K(tenant_count));
+      }
+    }
+    ret = final_ret;
+  }
+
+  return ret;
+}
+
+int ObMajorFreezeHelper::do_one_tenant_major_freeze(
+  const rpc::frame::ObReqTransport &transport,
+  const ObMajorFreezeReason freeze_reason,
+  const obrpc::ObSimpleFreezeInfo &freeze_info)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!freeze_info.is_valid() || !is_valid_major_freeze_reason(freeze_reason))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(freeze_info), K(freeze_reason));
+  } else {
+    const int64_t launch_start_time = ObTimeUtility::current_time();
+    obrpc::ObMajorFreezeRpcProxy proxy;
+    ObAddr leader;
+    obrpc::ObMajorFreezeRequest req(freeze_info, freeze_reason);
+    obrpc::ObMajorFreezeResponse resp;
+    uint64_t tenant_id = freeze_info.tenant_id_;
+
+    uint64_t min_data_version = 0;
+    if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, min_data_version))) {
+      LOG_WARN("fail to get data version", KR(ret), K(tenant_id));
+    } else if (min_data_version < DATA_VERSION_4_1_0_0) {
+      ret = OB_MAJOR_FREEZE_NOT_ALLOW;
+      LOG_WARN("major freeze is not allowed now, please upgrade observer first", KR(ret),
+               K(tenant_id), K(min_data_version));
+    } else if (OB_ISNULL(GCTX.location_service_)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid GCTX", KR(ret));
+    } else if (OB_FAIL(proxy.init(&transport))) {
+      LOG_WARN("fail to init", KR(ret));
+    } else {
+      const int64_t MAX_RETRY_COUNT = 5;
+      bool major_freeze_done = false;
+
+      for (int64_t i = 0; OB_SUCC(ret) && (!major_freeze_done) && (i < MAX_RETRY_COUNT); ++i) {
+        const int64_t timeout_us = MAX(GCONF.rpc_timeout * 5, MAX_PROCESS_TIME_US); // timeout >= 10s
+        if (OB_FAIL(GCTX.location_service_->get_leader_with_retry_until_timeout(GCONF.cluster_id,
+                    tenant_id, share::SYS_LS, leader))) {
+          LOG_WARN("fail to get ls locaiton leader", KR(ret), K(tenant_id));
+        } else if (OB_FAIL(proxy.to(leader)
+                                .trace_time(true)
+                                .timeout(timeout_us)
+                                .by(tenant_id)
+                                .dst_cluster_id(GCONF.cluster_id)
+                                .major_freeze(req, resp))) {
+          LOG_WARN("tenant_major_freeze rpc failed", KR(ret), K(tenant_id), K(leader),
+                   K(freeze_info), K(timeout_us));
+        } else if (FALSE_IT(ret = resp.err_code_)) {
+        } else if (OB_FAIL(ret)) {
+          if (OB_LEADER_NOT_EXIST == ret || OB_EAGAIN == ret) {
+            const int64_t RESERVED_TIME_US = 600 * 1000; // 600 ms
+            const int64_t timeout_remain_us = THIS_WORKER.get_timeout_remain();
+            const int64_t idle_time_us = 200 * 1000 * (i + 1);
+            if (timeout_remain_us - idle_time_us > RESERVED_TIME_US) {
+              LOG_WARN("leader may switch or ddl confilict, will retry", KR(ret), K(tenant_id), K(freeze_info),
+                "ori_leader", leader, K(timeout_remain_us), K(idle_time_us), K(RESERVED_TIME_US));
+              USLEEP(idle_time_us);
+              ret = OB_SUCCESS;
+            } else {
+              LOG_WARN("leader may switch or ddl confilict, will not retry cuz timeout_remain is "
+                "not enough", KR(ret), K(tenant_id), K(freeze_info), "ori_leader", leader,
+                K(timeout_remain_us), K(idle_time_us), K(RESERVED_TIME_US));
+            }
+          } else if ((OB_MAJOR_FREEZE_NOT_FINISHED != ret) && (OB_FROZEN_INFO_ALREADY_EXIST != ret)) {
+            LOG_WARN("fail to major_freeze", KR(ret), K(tenant_id), K(leader), K(freeze_info));
+          }
+        } else {
+          major_freeze_done = true;
+        }
+      }
+      if (OB_SUCC(ret) && !major_freeze_done) {
+        ret = OB_EAGAIN;
+        LOG_WARN("fail to retry major freeze cuz switching role", KR(ret), K(MAX_RETRY_COUNT));
+      }
+    }
+
+    const int64_t launch_cost_time = ObTimeUtility::current_time() - launch_start_time;
+    LOG_INFO("do tenant major freeze", KR(ret), K(tenant_id), K(leader), K(freeze_info), K(launch_cost_time));
+  }
+  // TODO oushen
+  // 1. parallel major_freeze
+  return ret;
+}
+
+int ObMajorFreezeHelper::suspend_merge(const ObTenantAdminMergeParam &param)
+{
+  return do_tenant_admin_merge(param, obrpc::ObTenantAdminMergeType::SUSPEND_MERGE);
+}
+
+int ObMajorFreezeHelper::resume_merge(const ObTenantAdminMergeParam &param)
+{
+  return do_tenant_admin_merge(param, obrpc::ObTenantAdminMergeType::RESUME_MERGE);
+}
+
+int ObMajorFreezeHelper::clear_merge_error(const ObTenantAdminMergeParam &param)
+{
+  return do_tenant_admin_merge(param, obrpc::ObTenantAdminMergeType::CLEAR_MERGE_ERROR);
+}
+
+int ObMajorFreezeHelper::do_tenant_admin_merge(
+    const ObTenantAdminMergeParam &param,
+    const obrpc::ObTenantAdminMergeType &admin_type)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<obrpc::ObSimpleFreezeInfo, 32> freeze_info_array;
+  bool want_to_freeze_all = false;
+  if (OB_UNLIKELY(!param.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(param), KR(ret));
+  } else {
+    want_to_freeze_all = param.need_all_ || param.need_all_user_ || param.need_all_meta_;
+    if (want_to_freeze_all) {
+      if (OB_FAIL(get_specific_tenant_freeze_info(param.need_all_, param.need_all_user_, 
+                                                  param.need_all_meta_, freeze_info_array))) {
+        LOG_WARN("fail to get specific tenant freeze info", KR(ret));
+      }
+    } else {
+      for (int64_t i = 0; (i < param.tenant_array_.count()) && OB_SUCC(ret); ++i) {
+        obrpc::ObSimpleFreezeInfo freeze_info;
+        freeze_info.tenant_id_ = param.tenant_array_.at(i);
+        if (OB_FAIL(freeze_info_array.push_back(freeze_info))) {
+          LOG_WARN("fail to push back freeze info", KR(ret), K(param));
+        }
+      }
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_UNLIKELY(freeze_info_array.empty() && !want_to_freeze_all)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("fail to get valid tenant freeze info", KR(ret), K(admin_type));
+  } else {
+    int final_ret = OB_SUCCESS;
+    for (int i = 0; (i < freeze_info_array.count()) && OB_SUCC(ret); ++i) {
+      const uint64_t tenant_id = freeze_info_array.at(i).tenant_id_;
+      if (OB_FAIL(do_one_tenant_admin_merge(*param.transport_, tenant_id, admin_type))) {
+        LOG_WARN("fail do tenant admin merge", KR(ret), K(tenant_id), K(admin_type));
+      }
+      if (OB_FAIL(ret) && (OB_SUCCESS == final_ret)) {
+        final_ret = ret;
+      }
+      // ignore ret, continue
+      ret = OB_SUCCESS;
+    }
+
+    ret = final_ret;
+  }
+
+  return ret;
+}
+
+int ObMajorFreezeHelper::do_one_tenant_admin_merge(
+    const rpc::frame::ObReqTransport &transport,
+    const uint64_t tenant_id,
+    const obrpc::ObTenantAdminMergeType &admin_type)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(tenant_id), K(admin_type));
+  } else {
+    obrpc::ObTenantAdminMergeRpcProxy proxy;
+    ObAddr leader;
+    obrpc::ObTenantAdminMergeRequest req(tenant_id, admin_type);
+    obrpc::ObTenantAdminMergeResponse resp;
+
+    if (OB_ISNULL(GCTX.location_service_)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid GCTX", KR(ret));
+    } else if (OB_FAIL(proxy.init(&transport))) {
+      LOG_WARN("fail to init", KR(ret));
+    } else {
+      const int64_t MAX_RETRY_COUNT = 5;
+      bool admin_merge_done = false;
+
+      for (int64_t i = 0; OB_SUCC(ret) && (!admin_merge_done) && (i < MAX_RETRY_COUNT); ++i) {
+        if (OB_FAIL(GCTX.location_service_->get_leader_with_retry_until_timeout(GCONF.cluster_id,
+                    tenant_id, share::SYS_LS, leader))) {
+          LOG_WARN("fail to get ls locaiton leader", KR(ret), K(tenant_id));
+        } else if (OB_FAIL(proxy.to(leader)
+                                .trace_time(true)
+                                .timeout(THIS_WORKER.get_timeout_remain())
+                                .by(tenant_id)
+                                .dst_cluster_id(GCONF.cluster_id)
+                                .tenant_admin_merge(req, resp))) {
+          LOG_WARN("tenant_admin_merge rpc failed", KR(ret), K(tenant_id), K(leader), K(admin_type));
+        } else if (FALSE_IT(ret = resp.err_code_)) {
+        } else if (OB_FAIL(ret)) {
+          if (OB_LEADER_NOT_EXIST == ret || OB_EAGAIN == ret) {
+            const int64_t RESERVED_TIME_US = 600 * 1000; // 600 ms
+            const int64_t timeout_remain_us = THIS_WORKER.get_timeout_remain();
+            const int64_t idle_time_us = 200 * 1000 * (i + 1);
+            if (timeout_remain_us - idle_time_us > RESERVED_TIME_US) {
+              LOG_WARN("leader may switch, will retry", KR(ret), K(tenant_id), K(admin_type),
+                "ori_leader", leader, K(timeout_remain_us), K(idle_time_us), K(RESERVED_TIME_US));
+              USLEEP(idle_time_us);
+              ret = OB_SUCCESS;
+            } else {
+              LOG_WARN("leader may switch, will not retry cuz timeout_remain is not enough",
+                KR(ret), K(tenant_id), K(admin_type), "ori_leader", leader, K(timeout_remain_us),
+                K(idle_time_us), K(RESERVED_TIME_US));
+            }
+          } else {
+            LOG_WARN("fail to execute tenant_admin_merge", K(tenant_id), K(leader), K(admin_type), KR(ret));
+          }
+        } else {
+          admin_merge_done = true;
+        }
+      }
+
+      if (OB_SUCC(ret) && !admin_merge_done) {
+        ret = OB_LEADER_NOT_EXIST;
+        LOG_WARN("fail to retry admin merge cuz switching role", KR(ret), K(MAX_RETRY_COUNT));
+      }
+    }
+
+    LOG_INFO("finish to do tenant admin mrege", K(tenant_id), K(leader), K(admin_type), KR(ret));
+  }
+  return ret;
+}
+
+int ObMajorFreezeHelper::get_frozen_status(
+    const int64_t tenant_id,
+    const share::SCN &frozen_scn,
+    share::ObFreezeInfo &frozen_status)
+{
+  return get_frozen_status(tenant_id, frozen_scn, frozen_status, GCTX.sql_proxy_);
+}
+
+int ObMajorFreezeHelper::get_frozen_status(
+    const int64_t tenant_id, 
+    const SCN &frozen_scn, 
+    share::ObFreezeInfo &frozen_status,
+    ObISQLClient *proxy)
+{
+  int ret = OB_SUCCESS;
+  share::ObFreezeInfoProxy freeze_info_proxy(tenant_id);
+
+  if (OB_ISNULL(proxy) || !is_valid_tenant_id(tenant_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid GCTX", KR(ret));
+  } else if (OB_FAIL(freeze_info_proxy.get_freeze_info(*proxy, frozen_scn, frozen_status))) {
+    if (OB_ITER_END != ret && OB_TABLE_NOT_EXIST != ret) {
+      LOG_WARN("fail to get freeze info", KR(ret), K(frozen_scn), K(tenant_id));
+    }
+  }
+
+  return ret;
+}
+
+int ObMajorFreezeHelper::get_frozen_scn(
+    const int64_t tenant_id,
+    SCN &frozen_scn,
+    ObISQLClient *proxy)
+{
+  int ret = OB_SUCCESS;
+  share::ObFreezeInfo frozen_status;
+
+  // use min_scn to get frozen_status, means get one with biggest frozen_scn
+  if (OB_FAIL(get_frozen_status(tenant_id, SCN::min_scn(), frozen_status, proxy))) {
+    LOG_WARN("fail to get frozen info", KR(ret));
+  } else {
+    frozen_scn = frozen_status.frozen_scn_;
+  }
+
+  return ret;
+}
+
+int ObMajorFreezeHelper::get_frozen_scn(
+    const int64_t tenant_id,
+    SCN &frozen_scn)
+{
+  int ret = OB_SUCCESS;
+  share::ObFreezeInfo frozen_status;
+
+  // use min_scn to get frozen_status, means get one with biggest frozen_scn
+  if (OB_FAIL(get_frozen_status(tenant_id, SCN::min_scn(), frozen_status))) {
+    if (OB_ITER_END != ret && OB_TABLE_NOT_EXIST != ret) {
+      LOG_WARN("fail to get frozen info", KR(ret));
+    }
+  } else {
+    frozen_scn = frozen_status.frozen_scn_;
+  }
+
+  return ret;
+}
+
+int ObMajorFreezeHelper::add_user_warning(
+    const uint64_t tenant_id,
+    const char *buf)
+{
+  int ret = OB_SUCCESS;
+  const int64_t MAX_WARNING_LEN = 1000;
+  char warn_buf[1024] = { 0 };
+  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id)) || OB_ISNULL(buf)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(tenant_id), KP(buf));
+  } else if (STRLEN(buf) > MAX_WARNING_LEN) {
+    ret = OB_SIZE_OVERFLOW;
+    LOG_WARN("buf is too long", KR(ret), "buf_len", STRLEN(buf), K(MAX_WARNING_LEN));
+  } else if (OB_FAIL(databuff_printf(warn_buf, 1024, "[T%lu]%s", tenant_id, buf))) {
+    LOG_WARN("fail to construct warn buf", KR(ret));
+  } else {
+    LOG_USER_WARN(OB_MAJOR_FREEZE_NOT_ALLOW, warn_buf);
+  }
+  return ret;
+}
+
+int ObGlobalCompactionSchemaHelper::get_global_safe_recycle_schema_version(
+    const int64_t tenant_id,
+    common::ObMySQLProxy &sql_proxy,
+    share::schema::ObMultiVersionSchemaService &schema_service,
+    int64_t &safe_recycle_schema_version)
+{
+  int ret = OB_SUCCESS;
+  safe_recycle_schema_version = OB_INVALID_VERSION;
+  ObGlobalMergeInfo global_info;
+  // system tenant's schema history recycle is handled separately
+  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id) || OB_SYS_TENANT_ID == tenant_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid tenant", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(ObGlobalMergeTableOperator::load_global_merge_info(sql_proxy, tenant_id, global_info))) {
+    LOG_WARN("fail to load global merge info", KR(ret), K(tenant_id));
+  } else if (OB_UNLIKELY(!global_info.is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid global merge info", KR(ret), K(tenant_id), K(global_info));
+  } else if (global_info.last_merged_scn() <= SCN::base_scn()) {
+    // For tenant never do major compaction, its last_merged_scn is base_scn. In this case, we should take snapshot_gc_ts as a reference.
+    LOG_INFO("[SCHEMA_RECYCLE] tenant never do major compaction, use snapshot_gc_ts as reference", KR(ret), K(tenant_id), K(global_info));
+  } else if (OB_FAIL(get_safe_recycle_schema_version_by_freeze_info(tenant_id, sql_proxy, global_info.last_merged_scn(), safe_recycle_schema_version))) {
+    LOG_WARN("fail to get safe recycle schema version by freeze info", KR(ret), K(tenant_id), K(global_info));
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_INVALID_VERSION != safe_recycle_schema_version) {
+  } else if (OB_FAIL(get_safe_recycle_schema_version_by_timestamp(tenant_id, sql_proxy, safe_recycle_schema_version))) {
+    LOG_WARN("fail to get safe recycle schema version by timestamp", KR(ret), K(tenant_id));
+  }
+  return ret;
+}
+
+int ObGlobalCompactionSchemaHelper::get_safe_recycle_schema_version_by_freeze_info(
+    const int64_t tenant_id,
+    common::ObMySQLProxy &sql_proxy,
+    const share::SCN &last_merged_scn,
+    int64_t &safe_recycle_schema_version)
+{
+  int ret = OB_SUCCESS;
+  ObFreezeInfoProxy freeze_info_proxy(tenant_id);
+  TenantIdAndSchemaVersion schema_version;
+  if (OB_FAIL(freeze_info_proxy.get_freeze_schema_info(sql_proxy, tenant_id, last_merged_scn, schema_version))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      // All freeze info is recycled and no newer major freeze is executed.
+      // We should use snapshot_gc_ts as a reference.
+      ret = OB_SUCCESS;
+      LOG_INFO("[SCHEMA_RECYCLE] all freeze info is recycled and no newer major freeze is executed", KR(ret), K(tenant_id), K(last_merged_scn));
+    } else {
+      LOG_WARN("fail to get freeze schema info", KR(ret), K(tenant_id), K(last_merged_scn));
+    }
+  } else if (OB_UNLIKELY(!schema_version.is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid schema version from freeze info", KR(ret), K(tenant_id), K(last_merged_scn), K(schema_version));
+  } else {
+    safe_recycle_schema_version = schema_version.schema_version_;
+    LOG_INFO("[SCHEMA_RECYCLE] get safe recycle schema version by last_merged_scn",
+             KR(ret), K(tenant_id), K(last_merged_scn), K(safe_recycle_schema_version));
+  }
+  return ret;
+}
+
+int ObGlobalCompactionSchemaHelper::get_safe_recycle_schema_version_by_timestamp(
+    const int64_t tenant_id,
+    common::ObMySQLProxy &sql_proxy,
+    int64_t &safe_recycle_schema_version)
+{
+  int ret = OB_SUCCESS;
+  safe_recycle_schema_version = OB_INVALID_VERSION;
+  SCN snapshot_gc_scn;
+  int64_t recycle_timestamp = 0;
+  int64_t boundary_schema_version = OB_INVALID_VERSION;
+  ObRefreshSchemaStatus schema_status;
+  schema_status.tenant_id_ = tenant_id;
+  if (OB_FAIL(ObGlobalStatProxy::get_snapshot_gc_scn(sql_proxy, tenant_id, snapshot_gc_scn))) {
+    LOG_WARN("fail to get snapshot_gc_scn", KR(ret), K(tenant_id));
+  } else if (OB_UNLIKELY(!snapshot_gc_scn.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid snapshot_gc_scn", KR(ret), K(tenant_id), K(snapshot_gc_scn));
+  } else if (snapshot_gc_scn.is_min()) { // for special cases, such as newly created tenant
+    recycle_timestamp = ObTimeUtility::current_time_us() - MAX_RESERVED_SCHEMA_VERSION_US;
+  } else {
+    recycle_timestamp = snapshot_gc_scn.convert_to_ts() - MAX_RESERVED_SCHEMA_VERSION_US;
+  }
+  
+  if (OB_FAIL(ret)) {
+  } else if (OB_UNLIKELY(recycle_timestamp < 0)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid timestamp", KR(ret), K(tenant_id), K(snapshot_gc_scn), K(recycle_timestamp));
+  } else if (OB_FAIL(GCTX.schema_service_->get_schema_version_by_timestamp(schema_status, tenant_id, recycle_timestamp, boundary_schema_version))) {
+    LOG_WARN("fail to get schema version by timestamp", KR(ret), K(tenant_id), K(schema_status), K(recycle_timestamp));
+  } else {
+    safe_recycle_schema_version = boundary_schema_version;
+    LOG_INFO("[SCHEMA_RECYCLE] get safe recycle schema version by snapshot_gc_ts",
+             KR(ret), K(tenant_id), K(schema_status), K(recycle_timestamp), K(safe_recycle_schema_version));
+  }
+  return ret;
+}
+
+
+} // namespace rootserver
+} // namespace oceanbase

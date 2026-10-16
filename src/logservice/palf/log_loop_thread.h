@@ -1,0 +1,42 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_LOGSERVICE_LOG_LOOP_THREAD_
+#define OCEANBASE_LOGSERVICE_LOG_LOOP_THREAD_
+
+#include "share/ob_thread_pool.h"
+#include "log_define.h"
+
+namespace oceanbase
+{
+namespace palf
+{
+class IPalfEnvImpl;
+class LogLoopThread : public share::ObThreadPool
+{
+public:
+  LogLoopThread();
+  virtual ~LogLoopThread();
+public:
+  int init(IPalfEnvImpl *palf_env_impl, const common::ObAddr &self);
+  void destroy();
+  void run1();
+private:
+  void log_loop_();
+private:
+  IPalfEnvImpl *palf_env_impl_;
+  int64_t run_interval_;
+  common::ObAddr self_;
+  bool any_in_period_freeze_mode_;
+  bool any_is_reconfirming_;
+  bool is_inited_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(LogLoopThread);
+};
+
+} // namespace palf
+} // namespace oceanbase
+
+#endif // OCEANBASE_LOGSERVICE_LOG_LOOP_THREAD_

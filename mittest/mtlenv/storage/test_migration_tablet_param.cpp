@@ -1,0 +1,339 @@
+// owner: jiahua.cjh
+// owner group: storage
+
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include <gtest/gtest.h>
+
+#define private public
+#define protected public
+
+#include "mtlenv/storage/medium_info_helper.h"
+#include "unittest/storage/test_tablet_helper.h"
+#include "unittest/storage/test_dml_common.h"
+
+#define USING_LOG_PREFIX STORAGE
+
+using namespace oceanbase::common;
+using namespace oceanbase::share;
+using namespace oceanbase::storage;
+
+namespace oceanbase
+{
+namespace unittest
+{
+class TestMigrationTabletParam : public ::testing::Test
+{
+public:
+  TestMigrationTabletParam() = default;
+  virtual ~TestMigrationTabletParam() = default;
+public:
+  static constexpr uint64_t TENANT_ID = 1001;
+  static const share::ObLSID LS_ID;
+public:
+  static void SetUpTestCase();
+  static void TearDownTestCase();
+public:
+  static int create_ls(const uint64_t tenant_id, const share::ObLSID &ls_id, ObLSHandle &ls_handle);
+  static int remove_ls(const share::ObLSID &ls_id);
+  int create_tablet(const common::ObTabletID &tablet_id, ObTabletHandle &tablet_handle);
+  static bool is_user_data_equal(const ObTabletCreateDeleteMdsUserData &left, const ObTabletCreateDeleteMdsUserData &right);
+public:
+  ObArenaAllocator allocator_;
+};
+
+const share::ObLSID TestMigrationTabletParam::LS_ID(1234);
+
+void TestMigrationTabletParam::SetUpTestCase()
+{
+  int ret = OB_SUCCESS;
+  ret = MockTenantModuleEnv::get_instance().init();
+  ASSERT_EQ(OB_SUCCESS, ret);
+
+  ObServerStorageMetaService::get_instance().is_started_ = true;
+
+  // create ls
+  ObLSHandle ls_handle;
+  ret = create_ls(TENANT_ID, LS_ID, ls_handle);
+  ASSERT_EQ(OB_SUCCESS, ret);
+}
+
+void TestMigrationTabletParam::TearDownTestCase()
+{
+  int ret = OB_SUCCESS;
+
+  // remove ls
+  ret = remove_ls(LS_ID);
+  ASSERT_EQ(OB_SUCCESS, ret);
+
+  MockTenantModuleEnv::get_instance().destroy();
+}
+
+int TestMigrationTabletParam::create_ls(const uint64_t tenant_id, const share::ObLSID &ls_id, ObLSHandle &ls_handle)
+{
+  int ret = OB_SUCCESS;
+  ret = TestDmlCommon::create_ls(tenant_id, ls_id, ls_handle);
+  return ret;
+}
+
+int TestMigrationTabletParam::remove_ls(const share::ObLSID &ls_id)
+{
+  int ret = OB_SUCCESS;
+  ret = MTL(ObLSService*)->remove_ls(ls_id);
+  return ret;
+}
+
+int TestMigrationTabletParam::create_tablet(const common::ObTabletID &tablet_id, ObTabletHandle &tablet_handle)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t table_id = 1234567;
+  share::schema::ObTableSchema table_schema;
+  ObLSHandle ls_handle;
+  ObLS *ls = nullptr;
+
+  if (OB_FAIL(MTL(ObLSService*)->get_ls(LS_ID, ls_handle, ObLSGetMod::STORAGE_MOD))) {
+    LOG_WARN("failed to get ls", K(ret));
+  } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ls is null", K(ret), KP(ls));
+  } else if (OB_FAIL(build_test_schema(table_schema, table_id))) {
+    LOG_WARN("failed to build table schema");
+  } else if (OB_FAIL(TestTabletHelper::create_tablet(ls_handle, tablet_id, table_schema, allocator_,
+      ObTabletStatus::MAX, share::SCN::invalid_scn(), tablet_handle))) {
+    LOG_WARN("failed to create tablet", K(ret));
+  }
+
+  return ret;
+}
+
+bool TestMigrationTabletParam::is_user_data_equal(const ObTabletCreateDeleteMdsUserData &left, const ObTabletCreateDeleteMdsUserData &right)
+{
+  const bool res = left.tablet_status_ == right.tablet_status_ && left.transfer_scn_ == right.transfer_scn_
+      && left.transfer_ls_id_ == right.transfer_ls_id_ && left.data_type_ == right.data_type_
+      && left.create_commit_scn_ == right.create_commit_scn_
+      && left.create_commit_version_ == right.create_commit_version_
+      && left.delete_commit_version_ == right.delete_commit_version_
+      && left.start_transfer_commit_version_ == right.start_transfer_commit_version_;
+  return res;
+}
+
+TEST_F(TestMigrationTabletParam, migration)
+{
+  int ret = OB_SUCCESS;
+
+  // create tablet
+  const common::ObTabletID tablet_id(ObTimeUtility::fast_current_time() % 10000000000000);
+  ObTabletHandle tablet_handle;
+  ObTabletStatus status(ObTabletStatus::MAX);
+  share::SCN create_commit_scn;
+  create_commit_scn = share::SCN::plus(share::SCN::min_scn(), 100);
+  ret = create_tablet(tablet_id, tablet_handle);
+  ASSERT_EQ(OB_SUCCESS, ret);
+  ObTablet *tablet = tablet_handle.get_obj();
+  ASSERT_NE(nullptr, tablet);
+
+  ObLSHandle ls_handle;
+  ASSERT_EQ(OB_SUCCESS, MTL(ObLSService*)->get_ls(LS_ID, ls_handle, ObLSGetMod::STORAGE_MOD));
+  ASSERT_NE(nullptr, ls_handle.get_ls());
+
+  // write data to mds table
+  {
+    ObTabletCreateDeleteMdsUserData user_data;
+    user_data.tablet_status_ = ObTabletStatus::NORMAL;
+    user_data.data_type_ = ObTabletMdsUserDataType::CREATE_TABLET;
+    user_data.create_commit_scn_ = create_commit_scn;
+    user_data.create_commit_version_ = create_commit_scn.get_val_for_tx();
+
+    share::SCN redo_scn = share::SCN::plus(share::SCN::min_scn(), 50);
+    ret = TestTabletHelper::write_tablet_status_for_test(
+        *ls_handle.get_ls(), *tablet, tablet_id, user_data, redo_scn, create_commit_scn,
+        transaction::ObTransID(123));
+    ASSERT_EQ(OB_SUCCESS, ret);
+  }
+
+  {
+    // build migration param v3
+    ObMigrationTabletParam param_v3;
+    ret = tablet->build_migration_tablet_param(param_v3);
+    ASSERT_EQ(OB_SUCCESS, ret);
+    ASSERT_EQ(true, param_v3.version_ == ObMigrationTabletParam::PARAM_VERSION_V3);
+
+    int64_t serialize_size = param_v3.get_serialize_size();
+    char *buffer = new char[serialize_size]();
+    int64_t pos = 0;
+    ret = param_v3.serialize(buffer, serialize_size, pos);
+    ASSERT_EQ(OB_SUCCESS, ret);
+    ASSERT_EQ(serialize_size, pos);
+
+    // param v3 deserialize
+    ObMigrationTabletParam param2;
+    pos = 0;
+    ret = param2.deserialize(buffer, serialize_size, pos);
+    ASSERT_EQ(OB_SUCCESS, ret);
+    ASSERT_EQ(pos, serialize_size);
+    ASSERT_TRUE(param2.is_valid());
+
+    delete [] buffer;
+  }
+}
+
+TEST_F(TestMigrationTabletParam, transfer)
+{
+  int ret = OB_SUCCESS;
+
+  // create tablet
+  const common::ObTabletID tablet_id(ObTimeUtility::fast_current_time() % 10000000000000);
+  ObTabletHandle tablet_handle;
+  ObTabletStatus status(ObTabletStatus::MAX);
+  ret = create_tablet(tablet_id, tablet_handle);
+  ASSERT_EQ(OB_SUCCESS, ret);
+  ObTablet *tablet = tablet_handle.get_obj();
+  ASSERT_NE(nullptr, tablet);
+
+  ObLSHandle ls_handle;
+  ASSERT_EQ(OB_SUCCESS, MTL(ObLSService*)->get_ls(LS_ID, ls_handle, ObLSGetMod::STORAGE_MOD));
+  ASSERT_NE(nullptr, ls_handle.get_ls());
+
+  // write data to mds table
+  {
+    ObTabletCreateDeleteMdsUserData user_data;
+    user_data.tablet_status_ = ObTabletStatus::TRANSFER_OUT;
+    user_data.data_type_ = ObTabletMdsUserDataType::START_TRANSFER_OUT;
+    user_data.transfer_scn_ = share::SCN::plus(share::SCN::min_scn(), 60);
+    share::SCN transfer_commit_scn;
+    transfer_commit_scn = share::SCN::plus(share::SCN::min_scn(), 70);
+
+    share::SCN redo_scn = user_data.transfer_scn_;
+    ret = TestTabletHelper::write_tablet_status_for_test(
+        *ls_handle.get_ls(), *tablet, tablet_id, user_data, redo_scn, transfer_commit_scn,
+        transaction::ObTransID(123));
+    ASSERT_EQ(OB_SUCCESS, ret);
+  }
+
+  // write medium info
+  {
+    compaction::ObMediumCompactionInfoKey key(100);
+    compaction::ObMediumCompactionInfo info;
+    ret = MediumInfoHelper::build_medium_compaction_info(allocator_, info, 100);
+    ASSERT_EQ(OB_SUCCESS, ret);
+
+    mds::MdsCtx ctx{mds::MdsWriter(transaction::ObTransID(777))};
+    ret = ut_prepare_mds_write(LS_ID, *tablet, tablet_id, transaction::ObTransID(777), ctx);
+    ASSERT_EQ(OB_SUCCESS, ret);
+    ret = tablet->set(key, info, ctx, 1_s/*lock_timeout_us*/);
+    ASSERT_EQ(OB_SUCCESS, ret);
+
+    const share::SCN redo_scn = share::SCN::plus(share::SCN::min_scn(), 110);
+    const share::SCN commit_scn = share::SCN::plus(share::SCN::min_scn(), 120);
+    ctx.on_redo(redo_scn);
+    ret = ut_finish_mds_tx_commit_after_redo(ctx, ut_mds_write_env().mem_ctx, commit_scn);
+    ASSERT_EQ(OB_SUCCESS, ret);
+  }
+
+  {
+    // build transfer tablet param v3
+    ObMigrationTabletParam param_v3;
+    ASSERT_EQ(false, param_v3.is_valid());
+    share::ObLSID dst_ls_id(1001);
+    const int64_t data_version = DATA_VERSION_4_3_2_0;
+    ret = tablet->build_transfer_tablet_param(data_version, dst_ls_id, param_v3);
+    ASSERT_EQ(OB_SUCCESS, ret);
+    ASSERT_EQ(true, param_v3.is_valid());
+    ASSERT_EQ(true, param_v3.version_ == ObMigrationTabletParam::PARAM_VERSION_V3);
+
+    int64_t serialize_size = param_v3.get_serialize_size();
+    char *buffer = new char[serialize_size]();
+    int64_t pos = 0;
+    ret = param_v3.serialize(buffer, serialize_size, pos);
+    ASSERT_EQ(OB_SUCCESS, ret);
+    ASSERT_EQ(serialize_size, pos);
+
+    // param v3 deserialize
+    ObMigrationTabletParam param2;
+    pos = 0;
+    ret = param2.deserialize(buffer, serialize_size, pos);
+    ASSERT_EQ(OB_SUCCESS, ret);
+    ASSERT_EQ(pos, serialize_size);
+    ASSERT_TRUE(param2.is_valid());
+
+    ObMigrationTabletParam test_param;
+    test_param.assign(param_v3);
+    delete [] buffer;
+  }
+}
+
+TEST_F(TestMigrationTabletParam, empty_shell_transfer)
+{
+  int ret = OB_SUCCESS;
+
+  // create tablet
+  const common::ObTabletID tablet_id(ObTimeUtility::fast_current_time() % 10000000000000);
+  share::schema::ObTableSchema schema;
+  ObLSHandle ls_handle;
+  ObLS *ls = nullptr;
+  ObLSTabletService *ls_tablet_service  = nullptr;
+  if (OB_FAIL(MTL(ObLSService*)->get_ls(LS_ID, ls_handle, ObLSGetMod::STORAGE_MOD))) {
+    LOG_WARN("failed to get ls", K(ret));
+  } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ls is null", K(ret), KP(ls));
+  } else {
+    ls_tablet_service = ls->get_tablet_svr();
+  }
+  ASSERT_NE(nullptr, ls_tablet_service);
+
+
+  TestSchemaUtils::prepare_data_schema(schema);
+  ret = TestTabletHelper::create_tablet(ls_handle, tablet_id, schema, allocator_, ObTabletStatus::Status::DELETED);
+  ASSERT_EQ(OB_SUCCESS, ret);
+
+  const uint64_t data_version = DATA_CURRENT_VERSION;
+  ret = ls_tablet_service->update_tablet_to_empty_shell(data_version, tablet_id);
+  ASSERT_EQ(OB_SUCCESS, ret);
+
+  ObTabletHandle empty_shell_tablet_handle;
+
+  ret = ls_tablet_service->get_tablet(tablet_id, empty_shell_tablet_handle, 0, ObMDSGetTabletMode::READ_WITHOUT_CHECK);
+  ASSERT_EQ(OB_SUCCESS, ret);
+  ObTablet *empty_shell_tablet = empty_shell_tablet_handle.get_obj();
+  ASSERT_NE(nullptr, empty_shell_tablet);
+
+
+  {
+    // build transfer tablet param v3
+    ObMigrationTabletParam param_v3;
+    ASSERT_EQ(false, param_v3.is_valid());
+    share::ObLSID dst_ls_id(1001);
+    const int64_t data_version = DATA_VERSION_4_3_2_0;
+    ret = empty_shell_tablet->build_transfer_tablet_param(data_version, dst_ls_id, param_v3);
+    ASSERT_EQ(OB_ERR_UNEXPECTED, ret);
+  }
+  {
+    // build migration tablet param v3
+    ObMigrationTabletParam param_v3;
+    ASSERT_EQ(false, param_v3.is_valid());
+    ASSERT_EQ(false, param_v3.is_valid());
+    ret = empty_shell_tablet->build_migration_tablet_param(param_v3);
+    ASSERT_EQ(OB_SUCCESS, ret);
+    ASSERT_EQ(true, param_v3.is_valid());
+    ASSERT_EQ(true, param_v3.version_ == ObMigrationTabletParam::PARAM_VERSION_V3);
+
+    ObMigrationTabletParam test_param;
+    test_param.assign(param_v3);
+  }
+}
+
+} // namespace unittest
+} // namespace oceanbase
+
+int main(int argc, char **argv)
+{
+  system("rm -rf test_migration_tablet_param.log*");
+  OB_LOGGER.set_file_name("test_migration_tablet_param.log", true);
+  OB_LOGGER.set_log_level("INFO");
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

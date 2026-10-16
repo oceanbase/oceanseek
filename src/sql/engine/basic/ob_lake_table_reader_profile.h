@@ -1,0 +1,317 @@
+/**
+ * Copyright (c) 2023 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_BASIC_OB_LAKE_TABLE_READER_PROFILE_H_
+#define OCEANBASE_BASIC_OB_LAKE_TABLE_READER_PROFILE_H_
+
+#include <optional>
+
+#include "lib/container/ob_se_array.h"
+#include "lib/stat/ob_diagnostic_info_guard.h"
+#include "lib/statistic_event/ob_stat_event.h"
+#include "share/diagnosis/ob_runtime_profile.h"
+
+namespace oceanbase 
+{
+using namespace common;
+using namespace lib;
+namespace sql 
+{
+
+static constexpr const char *READER_METRICS_LABEL = "READER_METRICS";
+static constexpr const char *IO_METRICS_LABEL = "IO_METRICS";
+static constexpr const char *EAGER_IO_METRICS_LABEL = "EAGER_IO_METRICS";
+static constexpr const char *PREBUFFER_METRICS_LABEL = "PREBUFFER_METRICS";
+static constexpr const char *EAGER_PREBUFFER_METRICS_LABEL = "EAGER_PREBUFFER_METRICS";
+static constexpr const char *PARQUET_PAGE_MGR_IO_METRICS_LABEL = "PARQUET_PAGE_MGR_IO_METRICS";
+static constexpr const char *PARQUET_PAGE_MGR_METRICS_LABEL = "PARQUET_PAGE_MGR_METRICS";
+static constexpr const char *ICEBERG_DELETE_METRICS_LABEL = "ICEBERG_DELETE_METRICS";
+static constexpr const char *ICEBERG_DELETE_IO_METRICS_LABEL = "ICEBERG_DELETE_IO_METRICS";
+static constexpr const char *ICEBERG_DELETE_PREBUFFER_METRICS_LABEL = "ICEBERG_DELETE_PREBUFFER_METRICS";
+
+struct ObLakeTableIMetrics
+{
+  ObLakeTableIMetrics() : label_()
+  {}
+  virtual int update_profile() = 0;
+  virtual void dump_metrics() = 0;
+  void set_label(const common::ObString &label);
+  VIRTUAL_TO_STRING_KV(K(this));
+
+  common::ObString label_;
+};
+
+struct ObLakeTableParquetReaderMetrics : public ObLakeTableIMetrics
+{
+public:
+  ObLakeTableParquetReaderMetrics() = default;
+  ~ObLakeTableParquetReaderMetrics() = default;
+  virtual int update_profile() override;
+  virtual void dump_metrics() override;
+  VIRTUAL_TO_STRING_KV(K_(selected_file_count),
+                       K_(skipped_file_count),
+                       K_(selected_row_group_count),
+                       K_(skipped_row_group_count),
+                       K_(selected_page_count),
+                       K_(skipped_page_count),
+                       K_(read_rows_count),
+                       K_(load_bloom_filter_count),
+                       K_(skip_load_bloom_filter_count),
+                       K_(skip_bloom_filter_count));
+
+  int64_t selected_file_count_ = 0;
+  int64_t skipped_file_count_ = 0;
+  int64_t selected_row_group_count_ = 0;
+  int64_t skipped_row_group_count_ = 0;
+  int64_t selected_page_count_ = 0;
+  int64_t skipped_page_count_ = 0;
+  int64_t read_rows_count_ = 0;
+  // --- METRICS ON BLOOM FILTER BEGIN --- 
+  // How many times the bloom filters are loaded?
+  int64_t load_bloom_filter_count_ = 0;
+  // How many bloom filters are adaptively skipped from loading?
+  int64_t skip_load_bloom_filter_count_ = 0;
+  // How many data blocks are skipped with the help of the bloom filter?
+  int64_t skip_bloom_filter_count_ = 0;
+  // --- METRICS ON BLOOM FILTER END --- 
+};
+
+struct ObLakeTableORCReaderMetrics : public ObLakeTableIMetrics
+{
+public:
+  ObLakeTableORCReaderMetrics() = default;
+  ~ObLakeTableORCReaderMetrics() = default;
+  virtual int update_profile() override;
+  virtual void dump_metrics() override;
+  VIRTUAL_TO_STRING_KV(K_(selected_file_count),
+                       K_(skipped_file_count),
+                       K_(selected_stripe_count),
+                       K_(skipped_stripe_count),
+                       K_(selected_row_group_count),
+                       K_(skipped_row_group_count),
+                       K_(read_rows_count),
+                       K_(load_bloom_filter_count),
+                       K_(skip_load_bloom_filter_count),
+                       K_(skip_bloom_filter_count),
+                       K_(load_bloom_filter_index_count),
+                       K_(use_bloom_filter_index_count));
+
+  int64_t selected_file_count_ = 0;
+  int64_t skipped_file_count_ = 0;
+  int64_t selected_stripe_count_ = 0;
+  int64_t skipped_stripe_count_ = 0;
+  int64_t selected_row_group_count_ = 0;
+  int64_t skipped_row_group_count_ = 0;
+  int64_t read_rows_count_ = 0;
+  // --- METRICS ON BLOOM FILTER BEGIN --- 
+  // How many times the bloom filters are loaded?
+  int64_t load_bloom_filter_count_ = 0;
+  // How many bloom filters are adaptively skipped from loading?
+  int64_t skip_load_bloom_filter_count_ = 0;
+  // How many data blocks are skipped with the help of the bloom filter?
+  int64_t skip_bloom_filter_count_ = 0;
+  // How many bloom filters are loaded?
+  // For the orc files, multiple bloom filters that come from different row indexes of the same strip may load each
+  // time.
+  int64_t load_bloom_filter_index_count_ = 0;
+  // How many bloom filters are used?
+  // For the orc files, after loading all the bloom filter of the same stripes at once, only some of them may be used.
+  int64_t use_bloom_filter_index_count_ = 0;
+  // --- METRICS ON BLOOM FILTER END --- 
+};
+
+struct ObLakeTableIcebergDeleteMetrics : public ObLakeTableIMetrics
+{
+public:
+  ObLakeTableIcebergDeleteMetrics() = default;
+  ~ObLakeTableIcebergDeleteMetrics() = default;
+  virtual int update_profile() override;
+  virtual void dump_metrics() override;
+
+  OB_INLINE void update_apply_metrics(const int64_t input_row_count,
+                                      const int64_t deleted_row_count,
+                                      const int64_t elapsed_time_ns)
+  {
+    apply_input_row_count_ += input_row_count;
+    apply_deleted_row_count_ += deleted_row_count;
+    apply_time_ns_ += elapsed_time_ns;
+  }
+
+  VIRTUAL_TO_STRING_KV(K_(data_file_build_count),
+                       K_(delete_file_open_count),
+                       K_(built_deleted_row_count),
+                       K_(build_time_ns),
+                       K_(apply_input_row_count),
+                       K_(apply_deleted_row_count),
+                       K_(apply_time_ns));
+
+  int64_t data_file_build_count_ = 0;
+  int64_t delete_file_open_count_ = 0;
+  int64_t built_deleted_row_count_ = 0;
+  int64_t build_time_ns_ = 0;
+  int64_t apply_input_row_count_ = 0;
+  int64_t apply_deleted_row_count_ = 0;
+  int64_t apply_time_ns_ = 0;
+};
+
+struct ObLakeTablePreBufferMetrics : public ObLakeTableIMetrics
+{
+public:
+  ObLakeTablePreBufferMetrics() :
+    prebuffer_count_(0), miss_count_(0), hit_count_(0), async_io_count_(0),
+    async_io_size_(0), total_io_wait_time_ns_(0), max_io_wait_time_ns_(0),
+    total_read_size_(0)
+  {}
+  virtual int update_profile() override;
+  virtual void dump_metrics() override;
+  VIRTUAL_TO_STRING_KV(K_(prebuffer_count), K_(miss_count), K_(hit_count),
+                       K_(async_io_count), K_(async_io_size), K_(total_io_wait_time_ns),
+                       K_(max_io_wait_time_ns), K_(total_read_size));
+
+  int64_t prebuffer_count_; // number of prebuffer calls
+  int64_t miss_count_;
+  int64_t hit_count_;
+  int64_t async_io_count_; // number of async read calls
+  int64_t async_io_size_; // total size of async read IO
+  int64_t total_io_wait_time_ns_; // total waiting time for async read IO
+  int64_t max_io_wait_time_ns_; // max waiting time for async read IO
+  int64_t total_read_size_; // total size read from the prebuffer
+
+private:
+  int update_specific_profile_(ObProfileId id);
+};
+
+struct ObLakeTableParquetPageMgrMetrics : public ObLakeTableIMetrics
+{
+public:
+  ObLakeTableParquetPageMgrMetrics()
+  {}
+  virtual int update_profile() override;
+  virtual void dump_metrics() override;
+  VIRTUAL_TO_STRING_KV(K_(cached_page_hit_count), K_(cached_page_hit_size), K_(cached_page_miss_count),
+                       K_(cached_page_miss_size), K_(async_io_count), K_(async_io_size),
+                       K_(total_io_wait_time_ns), K_(max_io_wait_time_ns));
+
+  int64_t cached_page_hit_count_ = 0;
+  int64_t cached_page_hit_size_ = 0;
+  int64_t cached_page_miss_count_ = 0;
+  int64_t cached_page_miss_size_ = 0;
+  int64_t async_io_count_ = 0; // number of async read calls
+  int64_t async_io_size_ = 0; // total size of async read IO
+  int64_t total_io_wait_time_ns_ = 0; // total waiting time for async read IO
+  int64_t max_io_wait_time_ns_ = 0; // max waiting time for async read IO
+
+private:
+  int update_specific_profile_();
+};
+
+struct ObLakeTableIOMetrics : public ObLakeTableIMetrics
+{
+public:
+  ObLakeTableIOMetrics() :
+    access_count_(0), sync_read_count_(0), async_read_count_(0), io_count_(0), access_io_size_(0),
+    mem_cache_hit_count_(0), mem_cache_hit_io_size_(0), mem_cache_miss_count_(0),
+    mem_cache_miss_io_size_(0), disk_cache_hit_count_(0), disk_cache_hit_io_size_(0),
+    disk_cache_miss_count_(0), disk_cache_miss_io_size_(0), max_io_time_us_(0), total_io_time_us_(0)
+  {}
+  virtual int update_profile() override;
+  virtual void dump_metrics() override;
+  OB_INLINE void update_disk_cache_stat(const bool is_hit, const int64_t io_size)
+  {
+    if (is_hit) {
+      ++disk_cache_hit_count_;
+      disk_cache_hit_io_size_ += io_size;
+    } else {
+      ++disk_cache_miss_count_;
+      disk_cache_miss_io_size_ += io_size;
+    }
+  }
+  OB_INLINE void update_mem_cache_stat(const bool is_hit, const int64_t io_size)
+  {
+    if (is_hit) {
+      ++mem_cache_hit_count_;
+      mem_cache_hit_io_size_ += io_size;
+      EVENT_ADD(ObStatEventIds::EXTERNAL_TABLE_MEM_CACHE_HIT_BYTES, io_size);
+    } else {
+      ++mem_cache_miss_count_;
+      mem_cache_miss_io_size_ += io_size;
+      EVENT_ADD(ObStatEventIds::EXTERNAL_TABLE_MEM_CACHE_MISS_BYTES, io_size);
+    }
+  }
+  OB_INLINE void update_io_stat(const int64_t io_time_us)
+  {
+    ++io_count_;
+    total_io_time_us_ += io_time_us;
+    max_io_time_us_ = MAX(max_io_time_us_, io_time_us);
+    EVENT_ADD(ObStatEventIds::EXTERNAL_TABLE_IO_TIME, io_time_us);
+  }
+  OB_INLINE void update_access_stat(const bool is_async, const int64_t read_size)
+  {
+    ++access_count_;
+    access_io_size_ += read_size;
+    if (is_async) {
+      ++async_read_count_;
+    } else {
+      ++sync_read_count_;
+    }
+    EVENT_INC(ObStatEventIds::EXTERNAL_TABLE_IO_CNT);
+    EVENT_ADD(ObStatEventIds::EXTERNAL_TABLE_IO_SIZE, read_size);
+  }
+  VIRTUAL_TO_STRING_KV(K_(access_count), K_(sync_read_count), K_(async_read_count), K_(io_count),
+                       K_(access_io_size), K_(mem_cache_hit_count), K_(mem_cache_hit_io_size),
+                       K_(mem_cache_miss_count), K_(mem_cache_miss_io_size),
+                       K_(disk_cache_hit_count), K_(disk_cache_hit_io_size),
+                       K_(disk_cache_miss_count), K_(disk_cache_miss_io_size), K_(max_io_time_us),
+                       "avg_io_time_us", (io_count_ > 0 ? total_io_time_us_ / io_count_ : 0),
+                       K_(total_io_time_us));
+
+  // SQL file access layer
+  int64_t access_count_; // number of read calls made by the SQL layer
+  int64_t sync_read_count_;
+  int64_t async_read_count_;
+  int64_t io_count_; // number of IOs sent to the storage layer
+  int64_t access_io_size_; // total size of read IO
+
+  // Memory Cache Layer
+  int64_t mem_cache_hit_count_;
+  int64_t mem_cache_hit_io_size_; // total IO size that hits the memory cache
+  int64_t mem_cache_miss_count_;
+  int64_t mem_cache_miss_io_size_; // total IO size that hits the memory cache
+
+  // Disk Cache Layer
+  int64_t disk_cache_hit_count_;
+  int64_t disk_cache_hit_io_size_; // total IO size that hits the disk cache
+  int64_t disk_cache_miss_count_;
+  int64_t disk_cache_miss_io_size_; // total IO size that miss the disk cache
+  int64_t max_io_time_us_; // maximum waiting time for read IO
+  int64_t total_io_time_us_; // total waiting time for read IO
+
+private:
+  int update_specific_profile_(std::optional<ObProfileId> id);
+  int update_file_reader_profile_();
+  int update_mem_cache_profile_();
+  int update_disk_cache_profile_();
+  int update_storage_io_profile_();
+};
+
+class ObLakeTableReaderProfile
+{
+public:
+  ObLakeTableReaderProfile() : metrics_list_()
+  {}
+  int update_profile();
+  int register_metrics(ObLakeTableIMetrics *metrics, const ObString &label);
+  void dump_metrics();
+
+private:
+  typedef common::ObSEArray<ObLakeTableIMetrics*, 12> MetricsList;
+  MetricsList metrics_list_;
+};
+
+
+} // end of sql namespace
+} // end of oceanbase namespace
+
+#endif // OCEANBASE_BASIC_OB_LAKE_TABLE_READER_PROFILE_H_

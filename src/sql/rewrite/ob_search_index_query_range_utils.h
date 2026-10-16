@@ -1,0 +1,66 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#ifndef OCEANBASE_SQL_REWRITE_OB_SEARCH_INDEX_QUERY_RANGE_UTILS_H_
+#define OCEANBASE_SQL_REWRITE_OB_SEARCH_INDEX_QUERY_RANGE_UTILS_H_
+
+#include "sql/rewrite/ob_query_range_define.h"
+
+namespace oceanbase
+{
+
+namespace sql
+{
+class ObSearchIndexQueryRangeUtils
+{
+public:
+  static int build_column_idx_expr(ObQueryRangeCtx &ctx,
+                                   const ObColumnRefRawExpr &column_expr,
+                                   ObRawExpr *&column_idx_expr);
+  static int build_array_or_scalar_path_expr(ObQueryRangeCtx &ctx, ObRawExpr *&path_expr);
+
+  static int build_json_single_path_expr(ObQueryRangeCtx &ctx,
+                                         const ObRawExpr &const_expr,
+                                         ObRawExpr *&path);
+
+  static int build_json_range_path_expr(ObIAllocator &allocator,
+                                        ObQueryRangeCtx &ctx,
+                                        const ObRawExpr &const_expr,
+                                        ObItemType cmp_type,
+                                        ObRawExpr *&start_path,
+                                        ObRawExpr *&end_path);
+
+  static int build_value_expr(ObQueryRangeCtx &ctx,
+                              const ObRawExpr &const_expr,
+                              const ObObjType *cmp_type,
+                              ObRawExpr *&value_expr);
+
+  static int json_value_can_extract_range(const ObRawExpr *origin_expr,
+                                          const ObRawExpr *json_expr,
+                                          bool &can_extract);
+
+  static int json_prefix_path_encode(ObIAllocator &allocator,
+                                     ObQueryRangeCtx &ctx,
+                                     const ObRawExpr &path_expr,
+                                     ObString &path,
+                                     const bool index_sub_path,
+                                     bool &can_extract_range);
+
+  static int is_json_scalar_match_index(ObExecContext &exec_ctx, const ObObj &json_value,
+                                        const uint8_t cons_encode_type, bool &is_match);
+
+  static int is_json_scalar_or_array_match_index(ObExecContext &exec_ctx, const ObObj &json_value,
+                                                 const uint8_t cons_encode_type, bool &is_match);
+
+  static int add_json_scalar_constraint(ObQueryRangeCtx &ctx, const ObRawExpr *expr);
+
+  static int add_json_scalar_or_array_constraint(ObQueryRangeCtx &ctx, const ObRawExpr *expr);
+  static int add_array_string_length_constraint(ObQueryRangeCtx &ctx, const ObRawExpr *expr);
+  static int add_string_type_length_constraint(ObQueryRangeCtx &ctx, const ObRawExpr *expr);
+  static int is_string_length_match_index(const ObObj &str_value, bool &is_match);
+};
+
+} // namespace sql
+} // namespace oceanbase
+#endif // OCEANBASE_SQL_REWRITE_OB_SEARCH_INDEX_QUERY_RANGE_UTILS_H_

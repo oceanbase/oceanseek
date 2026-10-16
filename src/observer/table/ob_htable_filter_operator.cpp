@@ -1,0 +1,2475 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX SERVER
+#include "ob_htable_filter_operator.h"
+using namespace oceanbase::common;
+using namespace oceanbase::table;
+using namespace oceanbase::table::hfilter;
+using namespace oceanbase::share::schema;
+
+int ObTableHbaseRowKeyDefaultCompare::compare(const common::ObNewRow &lhs, const common::ObNewRow &rhs, int &cmp_ret) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!lhs.is_valid() || !rhs.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid args", K(lhs), K(rhs), K(ret));
+  } else {
+    cmp_ret = 0;
+    for (int i = 0; i < ObHTableConstants::COL_IDX_T && cmp_ret == 0; ++i) {
+      cmp_ret = lhs.get_cell(i).get_string().compare(rhs.get_cell(i).get_string());
+    }
+  }
+  return ret;
+}
+
+bool ObTableHbaseRowKeyDefaultCompare::operator()(const common::ObNewRow &lhs, const common::ObNewRow &rhs)
+{
+  int cmp_ret = 0;
+  result_code_ = compare(lhs, rhs, cmp_ret);
+  return cmp_ret < 0;
+}
+
+
+int ObTableHbaseRowKeyReverseCompare::compare(const common::ObNewRow &lhs, const common::ObNewRow &rhs, int &cmp_ret) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!lhs.is_valid() || !rhs.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid args", K(lhs), K(rhs), K(ret));
+  } else {
+    cmp_ret = lhs.get_cell(ObHTableConstants::COL_IDX_K).get_string().compare(rhs.get_cell(ObHTableConstants::COL_IDX_K).get_string());
+    if (cmp_ret == 0) {
+      cmp_ret = rhs.get_cell(ObHTableConstants::COL_IDX_Q).get_string().compare(lhs.get_cell(ObHTableConstants::COL_IDX_Q).get_string());
+    }
+  }
+  return ret;
+}
+
+bool ObTableHbaseRowKeyReverseCompare::operator()(const common::ObNewRow &lhs, const common::ObNewRow &rhs)
+{
+  int cmp_ret = 0;
+  result_code_ = compare(lhs, rhs, cmp_ret);
+  return cmp_ret > 0;
+}
+
+// format: {"Hbase": {"TimeToLive": 3600, "MaxVersions": 3}}
+int ObHColumnDescriptor::from_string(const common::ObString &kv_attributes)
+{
+  reset();
+  int ret = OB_SUCCESS;
+  ObKVAttr attr;
+  if (kv_attributes.empty()) {
+    // do nothing
+  } else if (OB_FAIL(ObTTLUtil::parse_kv_attributes(kv_attributes, attr))) {
+    LOG_WARN("fail to parse kv attributes", K(ret), K(kv_attributes));
+  } else {
+    from_kv_attribute(attr);
+  }
+  return ret;
+}
+
+// format: {"Hbase": {"TimeToLive": 3600, "MaxVersions": 3}}
+void ObHColumnDescriptor::from_kv_attribute(const ObKVAttr &kv_attributes)
+{
+  reset();
+  if (kv_attributes.is_empty()) {
+    // do nothing
+  } else {
+    max_version_ = kv_attributes.max_version_;
+    time_to_live_ = kv_attributes.ttl_;
+  }
+}
+
+void ObHColumnDescriptor::reset()
+{
+  time_to_live_ = 0;   
+  max_version_ = 0;
+}
+
+////////////////////////////////////////////////////////////////
+void ObHTableColumnTracker::set_ttl(int32_t ttl_value)
+{
+  if (ttl_value > 0) {
+    int64_t now = ObTimeUtility::current_time();
+    now = now / 1000;  // us -> ms
+    oldest_stamp_ = now - (ttl_value * 1000LL);
+    LOG_DEBUG("set ttl", K(ttl_value), K(now), K_(oldest_stamp));
+    NG_TRACE_EXT(t, OB_ID(arg1), ttl_value, OB_ID(arg2), oldest_stamp_);
+  } else {
+    LOG_WARN_RET(OB_INVALID_ARGUMENT, "invalid ttl value", K(ttl_value));
+  }
+}
+
+void ObHTableColumnTracker::set_max_version(int32_t max_version)
+{
+  if (max_version > 0) {
+    max_versions_ = max_version;
+    LOG_DEBUG("set max_version", K(max_version));
+    NG_TRACE_EXT(version, OB_ID(arg1), max_version);
+  } else {
+    LOG_WARN_RET(OB_INVALID_ARGUMENT, "invalid max version value", K(max_version));
+  }
+}
+
+bool ObHTableColumnTracker::is_done(int64_t timestamp) const
+{
+  return min_versions_ <= 0 && is_expired(timestamp);
+}
+
+////////////////////////////////////////////////////////////////
+ObHTableExplicitColumnTracker::ObHTableExplicitColumnTracker()
+    :columns_(),
+     curr_column_idx_(0),
+     curr_column_(NULL)
+{}
+
+int ObHTableExplicitColumnTracker::init(const table::ObHTableFilter &htable_filter, bool qualifier_with_family)
+{
+  int ret = OB_SUCCESS;
+  max_versions_ = htable_filter.get_max_versions();
+  const ObIArray<ObString> &qualifiers = htable_filter.get_columns();
+  const int64_t N = qualifiers.count();
+  if (OB_SUCC(ret) && N <= 0) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("should not use ExplicitColumnTracker", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCCESS == ret && i < N; ++i) {
+    ObString real_qualifier = qualifier_with_family ? qualifiers.at(i).after('.') : qualifiers.at(i);
+    if (OB_FAIL(columns_.push_back(std::make_pair(real_qualifier, 0)))) {
+      LOG_WARN("failed to push back", K(ret));
+    }
+  }  // end for
+  if (OB_SUCC(ret)) {
+    // sort qualifiers
+    ColumnCount *end = &columns_.at(columns_.count() - 1);
+    ++end;
+    lib::ob_sort(&columns_.at(0), end, ColumnCountComparator());
+  }
+
+  if (OB_SUCC(ret)) {
+    // check duplicated qualifiers
+    for (int64_t i = 0; OB_SUCCESS == ret && i < N - 1; ++i) {
+      if (columns_.at(i).first == columns_.at(i + 1).first) {
+        ret = OB_ERR_PARAM_DUPLICATE;
+        LOG_WARN("duplicated qualifiers", K(ret), "cq", columns_.at(i).first, K(i));
+      }
+    }  // end for
+  }
+  return ret;
+}
+
+bool ObHTableExplicitColumnTracker::done() const
+{
+  return curr_column_idx_ >= columns_.count();
+}
+
+int ObHTableExplicitColumnTracker::check_column(const ObHTableCell &cell, ObHTableMatchCode &match_code)
+{
+  int ret = OB_SUCCESS;
+  int cmp_ret = 0;
+  do {
+    // No more columns left, we are done with this query
+    if (done()) {
+      match_code = ObHTableMatchCode::SEEK_NEXT_ROW;  // done row
+      break;
+    }
+    // No more columns to match against, done with storefile
+    // @todo here
+    // Compare specific column to current column
+    //
+    cmp_ret = ObHTableUtils::compare_qualifier(cell.get_qualifier(), curr_column_->first);
+    
+    // Column Matches. Return include code. The caller would call checkVersions
+    // to limit the number of versions.
+    if (0 == cmp_ret) {
+      match_code = ObHTableMatchCode::INCLUDE;
+      break;
+    }
+    // reset_timestamp();
+    if (cmp_ret < 0) {
+      // The current KV is smaller than the column the ExplicitColumnTracker
+      // is interested in, so seek to that column of interest.
+      match_code = ObHTableMatchCode::SEEK_NEXT_COL;
+      break;
+    }
+    // The current KV is bigger than the column the ExplicitColumnTracker
+    // is interested in. That means there is no more data for the column
+    // of interest. Advance the ExplicitColumnTracker state to next
+    // column of interest, and check again.
+    if (cmp_ret > 0) {
+      ++curr_column_idx_;
+      if (done()) {
+        match_code = ObHTableMatchCode::SEEK_NEXT_ROW;  // done row
+        break;
+      }
+      curr_column_ = &columns_.at(curr_column_idx_);
+      // continue for next column of interest
+    }
+  } while (true);
+  return ret;
+}
+
+int ObHTableExplicitColumnTracker::check_versions(const ObHTableCell &cell, ObHTableMatchCode &match_code)
+{
+  int ret = OB_SUCCESS;
+  int32_t count = ++curr_column_->second;
+  int64_t timestamp = cell.get_timestamp();
+  LOG_DEBUG("check versions", K(count), K_(max_versions), K(timestamp),
+            K_(min_versions), K_(oldest_stamp), "is_expired", is_expired(timestamp));
+  // in reverse scan, check the cell timeout condition with ttl. Kick off the timeout cell from res.
+  if (count >= max_versions_ || (is_expired(timestamp) && count >= min_versions_)) {
+        // Done with versions for this column
+    ++curr_column_idx_;
+    if (done()) {
+      match_code = ObHTableMatchCode::INCLUDE_AND_SEEK_NEXT_ROW;  // done row
+    } else {
+      // We are done with current column; advance to next column
+      // of interest.
+      curr_column_ = &columns_.at(curr_column_idx_);
+      match_code = ObHTableMatchCode::INCLUDE_AND_SEEK_NEXT_COL;
+      column_has_expired_ = true;
+    }
+  } else {
+    match_code = ObHTableMatchCode::INCLUDE;
+  }
+  return ret;
+}
+
+ObHTableMatchCode ObHTableExplicitColumnTracker::check_version(int64_t timestamp)
+{
+  ObHTableMatchCode match_code = ObHTableMatchCode::INCLUDE;
+  if (!is_expired(timestamp)) {
+    // keep the KV if required by minversions or it is not expired, yet
+    match_code = ObHTableMatchCode::INCLUDE;
+  } else {
+    match_code = ObHTableMatchCode::SEEK_NEXT_COL;
+  }
+  return match_code;
+}
+
+// Called between every row.
+void ObHTableExplicitColumnTracker::reset()
+{
+  curr_column_idx_ = 0;
+  column_has_expired_ = false;
+  curr_column_ = &columns_.at(curr_column_idx_);
+  const int64_t N = columns_.count();
+  for (int64_t i = 0; i < N; ++i) {
+    columns_.at(i).second = 0;
+  }  // end for
+}
+
+void ObHTableExplicitColumnTracker::done_with_column(const ObHTableCell &cell)
+{
+  while (NULL != curr_column_) {
+    int cmp_ret = ObHTableUtils::compare_qualifier(cell.get_qualifier(), curr_column_->first);
+    if (cmp_ret < 0) {
+      break;
+    } else {
+      ++curr_column_idx_;
+      if (done()) {
+        curr_column_ = NULL;
+      } else {
+        curr_column_ = &columns_.at(curr_column_idx_);
+      }
+      if (0 == cmp_ret) {
+        break;
+      }
+    }
+  }
+}
+
+int ObHTableExplicitColumnTracker::get_next_column_or_row(const ObHTableCell &cell, ObHTableMatchCode &match_code)
+{
+  done_with_column(cell);
+  if (NULL == curr_column_) {
+    match_code = ObHTableMatchCode::SEEK_NEXT_ROW;
+  } else {
+    match_code = ObHTableMatchCode::SEEK_NEXT_COL;
+  }
+  return OB_SUCCESS;
+}
+
+int32_t ObHTableExplicitColumnTracker::get_cur_version()
+{
+  int32_t cur_version = 0;
+  if (OB_NOT_NULL(curr_column_)) {
+    cur_version = curr_column_->second;
+  }
+  return cur_version;
+}
+
+////////////////////////////////////////////////////////////////
+ObHTableWildcardColumnTracker::ObHTableWildcardColumnTracker()
+    :allocator_(ObModIds::TABLE_PROC, OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
+     current_qualifier_(),
+     current_count_(0)
+{}
+
+int ObHTableWildcardColumnTracker::init(const table::ObHTableFilter &htable_filter, bool qualifier_with_family)
+{
+  int ret = OB_SUCCESS;
+  max_versions_ = htable_filter.get_max_versions();
+  // @todo set min_versions_ and oldest_stamp_
+  return ret;
+}
+
+int ObHTableWildcardColumnTracker::check_column(const ObHTableCell &cell, ObHTableMatchCode &match_code)
+{
+  UNUSED(cell);
+  match_code = ObHTableMatchCode::INCLUDE;
+  return OB_SUCCESS;
+}
+
+int ObHTableWildcardColumnTracker::reset_cell(const ObHTableCell &cell)
+{
+  int ret = OB_SUCCESS;
+  current_count_ = 0;
+  allocator_.reuse();
+  if (OB_FAIL(ob_write_string(allocator_, cell.get_qualifier(), current_qualifier_))) {
+    LOG_WARN("failed to copy qualifier", K(ret));
+  }
+  return ret;
+}
+
+int ObHTableWildcardColumnTracker::check_versions(const ObHTableCell &cell, ObHTableMatchCode &match_code)
+{
+  int ret = OB_SUCCESS;
+  int cmp_ret;
+  // cell.get_qualifier() may be empty, so current_qualifier_ also may be empty
+  // need to check whether current_count_ is 0 to determine whether it is the first iteration
+  if (current_qualifier_.empty() && current_count_ == 0) {
+    // first iteration
+    ret = reset_cell(cell);
+    if (OB_SUCC(ret)) {
+      match_code = check_version(cell.get_timestamp());
+    }
+  } else {
+    cmp_ret = ObHTableUtils::compare_qualifier(cell.get_qualifier(), current_qualifier_);
+    if (0 == cmp_ret) {
+      match_code = check_version(cell.get_timestamp());
+    } else if (cmp_ret > 0) {
+      // a new qualifier
+      ret = reset_cell(cell);
+      if (OB_SUCC(ret)) {
+        match_code = check_version(cell.get_timestamp());
+      }
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_ERROR("cell qualifier less than current one", K(ret), K(cell), K_(current_qualifier));
+    }
+  }
+  return ret;
+}
+
+ObHTableMatchCode ObHTableWildcardColumnTracker::check_version(int64_t timestamp)
+{
+  ObHTableMatchCode match_code = ObHTableMatchCode::INCLUDE;
+  ++current_count_;
+  if (current_count_ > max_versions_) {
+    match_code = ObHTableMatchCode::SEEK_NEXT_COL;
+    column_has_expired_ = true;
+  } else if (current_count_ <= min_versions_
+            || !is_expired(timestamp)) {
+    // keep the KV if required by minversions or it is not expired, yet
+    match_code = ObHTableMatchCode::INCLUDE;
+  } else {
+    match_code = ObHTableMatchCode::SEEK_NEXT_COL;
+    column_has_expired_ = true;
+  }
+  return match_code;
+}
+
+int ObHTableWildcardColumnTracker::get_next_column_or_row(const ObHTableCell &cell, ObHTableMatchCode &match_code)
+{
+  UNUSED(cell);
+  match_code = ObHTableMatchCode::SEEK_NEXT_COL;
+  return OB_SUCCESS;
+}
+
+void ObHTableWildcardColumnTracker::reset()
+{
+  LOG_DEBUG("reset qualifier");
+  column_has_expired_ = false;
+  current_qualifier_.reset();
+}
+
+int32_t ObHTableWildcardColumnTracker::get_cur_version()
+{
+  return current_count_;  
+}
+
+////////////////////////////////////////////////////////////////
+ObHTableScanMatcher::ObHTableScanMatcher(const table::ObHTableFilter &htable_filter,
+                                         ObHTableColumnTracker *column_tracker /*= nullptr*/)
+    :time_range_(-htable_filter.get_max_stamp(), -htable_filter.get_min_stamp()),
+     column_tracker_(column_tracker),
+     hfilter_(NULL),
+     allocator_(ObModIds::TABLE_PROC, OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
+     curr_row_(),
+     need_verify_cell_ttl_(false),
+     now_(ObHTableUtils::current_time_millis())
+{}
+
+int ObHTableScanMatcher::is_cell_ttl_expired(const ObHTableCell &cell, bool &is_expired)
+{
+  int ret = OB_SUCCESS;
+  is_expired = false;
+  int64_t ttl_time = INT64_MAX;
+  int64_t cell_ts = -cell.get_timestamp();
+  if (OB_FAIL(cell.get_ttl(ttl_time))) {
+    LOG_WARN("failed to get ttl", K(ret), K(cell));
+  } else if (now_ - cell_ts > ttl_time) {
+    is_expired = true;
+  }
+  return ret;
+}
+
+int ObHTableScanMatcher::pre_check(const ObHTableCell &cell, ObHTableMatchCode &match_code, bool &need_match_column)
+{
+  int ret = OB_SUCCESS;
+  need_match_column = false;
+  bool is_expired = false;
+  if (is_curr_row_empty()) {
+    // Since the curCell is null it means we are already sure that we have moved over to the next
+    // row
+    match_code = ObHTableMatchCode::DONE;
+  } else if (0 != ObHTableUtils::compare_rowkey(curr_row_, cell)) {
+    // if row key is changed, then we know that we have moved over to the next row
+    // WildcardColumnTracker will come to this branch
+    match_code = ObHTableMatchCode::DONE;
+    LOG_DEBUG("row changed", K(match_code), K(cell));
+  } else if (column_tracker_->done()) {
+    match_code = ObHTableMatchCode::SEEK_NEXT_ROW;
+  }
+  // check for early out based on timestamp alone
+  else if (column_tracker_->is_done(cell.get_timestamp())) {
+    if (OB_FAIL(column_tracker_->get_next_column_or_row(cell, match_code))) {
+      LOG_WARN("failed to get next column or row", K(ret), K(cell));
+    }
+  } else if (need_verify_cell_ttl_ && OB_FAIL(is_cell_ttl_expired(cell, is_expired))) {
+    LOG_WARN("failed to check cell ttl expired", K(ret), K(cell));
+  } else if (is_expired) {
+    match_code = ObHTableMatchCode::SKIP;
+  } else {
+    // continue
+    need_match_column = true;
+  }
+  LOG_DEBUG("pre_check", K(ret), K(match_code), K(need_match_column));
+  return ret;
+}
+
+int ObHTableScanMatcher::match_column(const ObHTableCell &cell, ObHTableMatchCode &match_code)
+{
+  int ret = OB_SUCCESS;
+  int64_t timestamp = cell.get_timestamp();
+  int cmp_tr = time_range_.compare(timestamp);
+  LOG_DEBUG("compare time range", K(timestamp), K(cmp_tr), K_(time_range));
+  // STEP 0: Check if the timestamp is in the range
+  // @note timestamp is negative and in the descending order!
+  if (cmp_tr > 0) {
+    match_code = ObHTableMatchCode::SKIP;
+  } else if (cmp_tr < 0) {
+    if (OB_FAIL(column_tracker_->get_next_column_or_row(cell, match_code))) {
+      LOG_WARN("failed to get next column or row", K(ret), K(cell));
+    }
+  }
+  // STEP 1: Check if the column is part of the requested columns
+  else if (OB_FAIL(column_tracker_->check_column(cell, match_code))) {
+    LOG_WARN("failed to check column", K(ret), K(cell));
+  } else if (ObHTableMatchCode::INCLUDE != match_code) {
+    // nothing
+  } else {
+    /*
+     * STEP 2: check the number of versions needed. This method call returns SKIP, SEEK_NEXT_COL,
+     * INCLUDE, INCLUDE_AND_SEEK_NEXT_COL, or INCLUDE_AND_SEEK_NEXT_ROW.
+     */
+    if (OB_FAIL(column_tracker_->check_versions(cell, match_code))) {
+    } else {
+      switch (match_code) {
+        case ObHTableMatchCode::SKIP:
+        case ObHTableMatchCode::SEEK_NEXT_COL:
+          break;
+        default: {
+          if (NULL != hfilter_) {
+            hfilter::Filter::ReturnCode filter_rc = hfilter::Filter::ReturnCode::INCLUDE;
+            if (OB_FAIL(hfilter_->filter_cell(cell, filter_rc))) {
+              LOG_WARN("failed to filter cell", K(ret));
+            } else {
+              ObHTableMatchCode orig_code = match_code;
+              match_code = merge_filter_return_code(cell, match_code, filter_rc);
+              LOG_DEBUG("filter cell", K(filter_rc), K(orig_code), K(match_code));
+            }
+          }
+          break;
+        }
+      }
+    }
+  }
+  return ret;
+}
+/*
+ * Call this when scan has filter. Decide the desired behavior by checkVersions's MatchCode and
+ * filterCell's ReturnCode. Cell may be skipped by filter, so the column versions in result may be
+ * less than user need. It need to check versions again when filter and columnTracker both include
+ * the cell.
+ */
+ObHTableMatchCode ObHTableScanMatcher::merge_filter_return_code(const ObHTableCell &cell,
+                                                                const ObHTableMatchCode match_code, hfilter::Filter::ReturnCode filter_rc)
+{
+  ObHTableMatchCode ret_code = ObHTableMatchCode::INCLUDE;
+  UNUSED(cell);
+  UNUSED(match_code);
+  UNUSED(filter_rc);
+  switch (filter_rc) {
+    case Filter::ReturnCode::INCLUDE:
+      break;
+    case Filter::ReturnCode::INCLUDE_AND_NEXT_COL:
+      if (ObHTableMatchCode::INCLUDE == match_code) {
+        ret_code = ObHTableMatchCode::INCLUDE_AND_SEEK_NEXT_COL;
+      }
+      break;
+    case Filter::ReturnCode::INCLUDE_AND_SEEK_NEXT_ROW:
+      ret_code = ObHTableMatchCode::INCLUDE_AND_SEEK_NEXT_ROW;
+      break;
+    case Filter::ReturnCode::SKIP:
+      if (match_code == ObHTableMatchCode::INCLUDE) {
+        return ObHTableMatchCode::SKIP;
+      } else if (match_code == ObHTableMatchCode::INCLUDE_AND_SEEK_NEXT_COL) {
+        return ObHTableMatchCode::SEEK_NEXT_COL;
+      } else if (match_code == ObHTableMatchCode::INCLUDE_AND_SEEK_NEXT_ROW) {
+        return ObHTableMatchCode::SEEK_NEXT_ROW;
+      }
+      break;
+    case Filter::ReturnCode::NEXT_COL:
+      if (match_code == ObHTableMatchCode::INCLUDE || match_code == ObHTableMatchCode::INCLUDE_AND_SEEK_NEXT_COL) {
+        (void)column_tracker_->get_next_column_or_row(cell, ret_code);
+        return ret_code;
+      } else if (match_code == ObHTableMatchCode::INCLUDE_AND_SEEK_NEXT_ROW) {
+        return ObHTableMatchCode::SEEK_NEXT_ROW;
+      }
+      break;
+    case Filter::ReturnCode::NEXT_ROW:
+      return ObHTableMatchCode::SEEK_NEXT_ROW;
+    case Filter::ReturnCode::SEEK_NEXT_USING_HINT:
+      return ObHTableMatchCode::SEEK_NEXT_USING_HINT;
+    default:
+      break;
+  }
+  // We need to make sure that the number of cells returned will not exceed max version in scan
+  // when the match code is INCLUDE* case.
+  // @todo FIXME
+  return ret_code;
+}
+
+int ObHTableScanMatcher::match(const ObHTableCell &cell, ObHTableMatchCode &match_code)
+{
+  int ret = OB_SUCCESS;
+  bool need_match_column = false;
+  if (NULL != hfilter_ && hfilter_->filter_all_remaining()) {
+    match_code = ObHTableMatchCode::DONE_SCAN;
+  } else if (OB_FAIL(pre_check(cell, match_code, need_match_column))) {
+  } else if (need_match_column) {
+    if (OB_FAIL(match_column(cell, match_code))) {
+      LOG_WARN("failed to match column", K(ret), K(cell), K(match_code));
+    }
+  }
+  return ret;
+}
+
+const ObHTableCell *ObHTableScanMatcher::get_curr_row() const
+{
+  const ObHTableCell *p = NULL;
+  if (NULL != curr_row_.get_ob_row()) {
+    p = &curr_row_;
+  }
+  return p;
+}
+
+int ObHTableScanMatcher::set_to_new_row(const ObHTableCell &arg_curr_row)
+{
+  int ret = OB_SUCCESS;
+  const ObHTableCellEntity &curr_row = dynamic_cast<const ObHTableCellEntity &>(arg_curr_row);
+  // deep copy curr_row
+  if (NULL != curr_row_.get_ob_row()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid state", K(ret));
+  } else if (NULL == curr_row.get_ob_row()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("obrow is null", K(ret));
+  } else {
+    curr_ob_row_.reset();
+    allocator_.reuse();
+    if (OB_FAIL(ob_write_row(allocator_, *curr_row.get_ob_row(), curr_ob_row_))) {
+      LOG_WARN("failed to copy row", K(ret));
+    } else {
+      curr_row_.set_ob_row(&curr_ob_row_);
+    }
+  }
+  // reset tracker
+  if (OB_SUCC(ret)) {
+    column_tracker_->reset();
+  }
+  return ret;
+}
+
+int ObHTableScanMatcher::get_next_cell_hint(const ObHTableCell &cell, ObHTableCell *&new_cell)
+{
+  int ret = OB_SUCCESS;
+  if (hfilter_ == NULL) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("filter is null", K(ret));
+  } else if (OB_FAIL(hfilter_->get_next_cell_hint(allocator_, cell, new_cell))) {
+    LOG_WARN("failed to get next hint cell of filter", K(ret), K(cell));
+  }
+  return ret;
+}
+
+////////////////////////////////////////////////////////////////
+ObHTableRowIterator::ObHTableRowIterator(const ObTableQuery &query)
+    : ObTableQueryResultIterator(&query),
+      allocator_("HtbRowItAloc", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
+      forward_range_alloc_("HtbForwRanAloc", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
+      child_op_(NULL),
+      curr_cell_(),
+      scan_order_(query.get_scan_order()),
+      matcher_(NULL),
+      has_more_cells_(true),
+      start_row_key_(),
+      stop_row_key_(),
+      is_inited_(false),
+      need_verify_cell_ttl_(false),
+      is_cur_row_expired_(false),
+      htable_filter_(query.get_htable_filter()),
+      hfilter_(NULL),
+      limit_per_row_per_cf_(htable_filter_.get_max_results_per_column_family()),
+      offset_per_row_per_cf_(htable_filter_.get_row_offset_per_column_family()),
+      max_result_size_(query.get_max_result_size()),
+      batch_size_(query.get_batch()),
+      time_to_live_(0),
+      max_version_(0),
+      one_hbase_row_(),
+      one_iterable_hbase_row_(),
+      column_tracker_(NULL),
+      column_tracker_wildcard_(),
+      column_tracker_explicit_(),
+      matcher_impl_(htable_filter_),
+      cell_count_(0),
+      count_per_row_(0),
+      is_first_result_(true),
+      is_table_group_inited_(false),
+      is_table_group_req_(false),
+      family_name_(),
+      allow_partial_results_(false),
+      is_cache_block_(true),
+      scanner_context_(NULL),
+      enable_get_optimization_(false),
+      is_wildcard_mode_(false),
+      current_qualifier_idx_(-1)
+{
+  if (query.get_scan_ranges().count() != 0) {
+    start_row_key_ = query.get_scan_ranges().at(0).start_key_;
+    stop_row_key_ = query.get_scan_ranges().at(0).end_key_;
+  }
+}
+
+int ObHTableRowIterator::next_cell()
+{
+  ObNewRow *ob_row = NULL;
+  int ret = child_op_->get_next_row(ob_row);
+  if (OB_SUCCESS == ret) {
+    curr_cell_.set_ob_row(ob_row);
+    if (OB_FAIL(try_record_expired_rowkey(curr_cell_))) {
+      LOG_WARN("failed to record expired rowkey", K(ret));
+    }
+    LOG_DEBUG("[yzfdebug] fetch next cell", K_(curr_cell));
+  } else if (OB_ITER_END == ret) {
+    has_more_cells_ = false;
+    curr_cell_.set_ob_row(NULL);
+    matcher_->clear_curr_row();
+    LOG_DEBUG("iterator end", K_(has_more_cells));
+  }
+  return ret;
+}
+
+int ObHTableRowIterator::get_next_cell_hint()
+{
+  int ret = OB_SUCCESS;
+  ObHTableCell *hint_cell = nullptr;
+  if (OB_FAIL(matcher_->get_next_cell_hint(curr_cell_, hint_cell))) {
+    LOG_WARN("failed to get next hint cell of filter", K(ret), K_(curr_cell));
+  } else {
+    if (hint_cell != NULL) {
+      int32_t cur_version = column_tracker_->get_cur_version();
+      bool enter_hint_key = false;
+      ObHTableCell *next_cell = nullptr;
+      ObHTableCell *tmp_cell = nullptr;
+      while (OB_SUCC(ret) && !enter_hint_key) {
+        if (ObHTableUtils::compare_cell(curr_cell_, *hint_cell, false) >= 0) {
+          enter_hint_key = true;
+          LOG_INFO("curr_cell is bigger than hint_cell", K(ret), K(curr_cell_), K(hint_cell));
+        } else if (OB_FAIL(ObHTableUtils::create_last_cell_on_row_col(allocator_, curr_cell_, next_cell))) {
+          LOG_WARN("failed to create last cell", K(ret));
+        } else {
+          int32_t skipped_count = 0;
+          if (ObHTableUtils::compare_cell(*next_cell, *hint_cell, false) >= 0) {
+            enter_hint_key = true;  // curr_cell's rowkey and qualifier is equal to hint
+            tmp_cell = hint_cell;
+          } else {
+            tmp_cell = next_cell;
+          }
+          if (OB_FAIL(seek(*tmp_cell, skipped_count))) {
+            if (OB_ITER_END != ret) {
+              LOG_WARN("fail to seek next cell", K(ret));
+            }
+          }
+
+          if ((OB_SUCCESS == ret || OB_ITER_END == ret)) {
+            // need record current rowkey and mark it recorded
+            // record using the next_cell, because the curr_cell_
+            // is not accessible when return OB_ITER_END
+            try_record_expired_rowkey(cur_version + skipped_count, tmp_cell->get_rowkey());
+          }
+          cur_version = 1;
+          next_cell = nullptr;
+          allocator_.reuse();
+        }
+      }
+      hint_cell->~ObHTableCell();
+    } else if (OB_FAIL(next_cell())) {
+      LOG_WARN("failed to get next cell", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObHTableRowIterator::get_next_result(ObTableQueryDListResult *&out_result)
+{
+  int ret = OB_SUCCESS;
+  out_result = &one_iterable_hbase_row_;
+  one_iterable_hbase_row_.reset();
+  if (OB_FAIL(get_next_result_internal(out_result))) {
+    LOG_WARN("fail to get next result", K(ret));
+  }
+  return ret;
+}
+
+int ObHTableRowIterator::get_next_result(ObTableQueryResult *&out_result)
+{
+  int ret = OB_SUCCESS;
+  out_result = &one_hbase_row_;
+  one_hbase_row_.reset();
+  if (OB_FAIL(get_next_result_internal(out_result))) {
+    LOG_WARN("fail to get next result", K(ret));
+  }
+  return ret;
+}
+
+template <typename ResultType>
+int ObHTableRowIterator::get_next_result_internal(ResultType*& result)
+{
+  int ret = OB_SUCCESS;
+  
+  // Check if we should enable Get optimization (first time only)
+  if (!enable_get_optimization_ && NULL == column_tracker_) {
+    if (should_enable_get_optimization() && OB_FAIL(check_and_apply_get_optimization())) {
+      LOG_WARN("fail to apply get optimization", K(ret));
+    }
+  }
+  
+  // Use optimization version if enabled
+  if (enable_get_optimization_) {
+    if (OB_FAIL(get_next_result_internal_with_get_optimization(result))) {
+      if (OB_ITER_END != ret) {
+        LOG_WARN("fail to get next result internal with get optimization", K(ret));
+      }
+    }
+  } else {
+    ObHTableMatchCode match_code = ObHTableMatchCode::DONE_SCAN;  // initialize
+    bool has_filter_row = (NULL != hfilter_) && (hfilter_->has_filter_row());
+    if (scanner_context_ == nullptr) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("scanner_context_ meet unexecpted nullptr", K(ret));
+    }
+    if (OB_SUCC(ret) && NULL == column_tracker_) {
+      // first iteration
+      if (htable_filter_.get_columns().count() <= 0) {
+        column_tracker_ = &column_tracker_wildcard_;
+      } else {
+        column_tracker_ = &column_tracker_explicit_;
+      }
+      if (OB_FAIL(column_tracker_->init(htable_filter_))) {
+        LOG_WARN("failed to init column tracker", K(ret));
+      } else {
+        if (time_to_live_ > 0) {
+          column_tracker_->set_ttl(time_to_live_);
+        }
+        if (max_version_ > 0 && !htable_filter_.is_keep_max_versions()) {
+          int32_t real_max_version = std::min(column_tracker_->get_max_version(), max_version_);
+          column_tracker_->set_max_version(real_max_version);
+        }
+      }
+    }
+    if (OB_SUCC(ret) && NULL == matcher_) {
+      matcher_ = &matcher_impl_;
+      matcher_->init(column_tracker_, hfilter_);
+    }
+    if (OB_SUCC(ret) && NULL == curr_cell_.get_ob_row()) {
+      ret = next_cell();
+    }
+    if (OB_SUCC(ret) && matcher_->is_curr_row_empty()) {
+      count_per_row_ = 0;
+      is_cur_row_expired_ = false;  // reset expired flag when switching to new rowkey
+      ret = matcher_->set_to_new_row(curr_cell_);
+    }
+    if (OB_SUCC(ret)) {
+      if (has_filter_row) {
+        scanner_context_->limits_.set_size_scope(LimitScope::Scope::BETWEEN_ROWS);
+        scanner_context_->limits_.set_time_scope(LimitScope::Scope::BETWEEN_ROWS);
+      } else if (allow_partial_results_) {
+        scanner_context_->limits_.set_size_scope(LimitScope::Scope::BETWEEN_CELLS);
+        scanner_context_->limits_.set_time_scope(LimitScope::Scope::BETWEEN_CELLS);
+      }
+    }
+    bool loop = true;
+    if (OB_SUCC(ret)) {
+      if (NULL == matcher_->get_curr_row()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("matcher should have valid first cell", K(ret));
+      } else if (NULL != hfilter_) {
+        const ObHTableCell &first_cell = curr_cell_;
+        bool filtered = false;
+        if (OB_FAIL(hfilter_->filter_row_key(first_cell, filtered))) {
+          LOG_WARN("failed to filter row key", K(ret), K(first_cell));
+        } else if (filtered) {
+          // filter out the current row and fetch the next row
+          hfilter_->reset();
+          LOG_DEBUG("filter_row_key skip the row", K(ret));
+          // loop = false;
+          ret = seek_or_skip_to_next_row(curr_cell_);
+        }
+      }
+    }
+    while (OB_SUCC(ret) && loop) {
+      match_code = ObHTableMatchCode::DONE_SCAN;  // initialize
+      curr_cell_.set_family(family_name_);
+      if (OB_FAIL(matcher_->match(curr_cell_, match_code))) {
+        LOG_WARN("failed to match cell", K(ret));
+      } else {
+        if (NULL == curr_cell_.get_ob_row()) {
+          LOG_DEBUG("matcher, curr_cell=NULL ", K(match_code));
+        } else {
+          LOG_DEBUG("matcher", K_(curr_cell), K(match_code));
+        }
+        switch (match_code) {
+          case ObHTableMatchCode::INCLUDE:
+          case ObHTableMatchCode::INCLUDE_AND_SEEK_NEXT_ROW:
+          case ObHTableMatchCode::INCLUDE_AND_SEEK_NEXT_COL:
+            if (NULL != hfilter_) {
+              const ObHTableCell *new_cell = nullptr;
+              if (OB_FAIL(hfilter_->transform_cell(allocator_, curr_cell_))) {
+                LOG_WARN("failed to tranform cell", K(ret));
+                break;
+              }
+            }
+            ++count_per_row_;
+            // whether reach per row limit
+            if (limit_per_row_per_cf_ > -1 /*not unlimited*/
+                && count_per_row_ > (offset_per_row_per_cf_ + limit_per_row_per_cf_)) {
+              // do what SEEK_NEXT_ROW does.
+              ret = seek_or_skip_to_next_row(curr_cell_);
+              loop = false;
+              LOG_DEBUG(
+                  "reach per row limit", K(ret), K_(offset_per_row_per_cf), K_(limit_per_row_per_cf), K_(count_per_row));
+              break;
+            }
+            // whether skip offset
+            if (count_per_row_ > offset_per_row_per_cf_) {
+              int64_t timestamp = 0;
+              if (OB_FAIL(curr_cell_.get_ob_row()->get_cell(ObHTableConstants::COL_IDX_T).get_int(timestamp))) {
+                LOG_WARN("failed to get timestamp", K(ret));
+              } else {
+                const_cast<ObNewRow*>(curr_cell_.get_ob_row())->get_cell(ObHTableConstants::COL_IDX_T).set_int(-timestamp);
+              }
+              if (OB_SUCC(ret)) {
+                if (OB_FAIL(add_new_row(*(curr_cell_.get_ob_row()), result))) {
+                  LOG_WARN("failed to add row to result", K(ret));
+                } else {
+                  scanner_context_->increment_batch_progress(1);
+                  scanner_context_->increment_size_progress(curr_cell_.get_ob_row()->get_serialize_size());
+                  ++cell_count_;
+                  LOG_DEBUG(
+                      "[yzfdebug] add cell", K_(cell_count), K_(curr_cell), K_(count_per_row), K_(offset_per_row_per_cf));
+                }
+              }
+            }
+            if (OB_SUCC(ret)) {
+              if (ObHTableMatchCode::INCLUDE_AND_SEEK_NEXT_ROW == match_code) {
+                ret = seek_or_skip_to_next_row(curr_cell_);
+              } else if (ObHTableMatchCode::INCLUDE_AND_SEEK_NEXT_COL == match_code) {
+                ret = seek_or_skip_to_next_col(curr_cell_);
+              } else {
+                ret = next_cell();
+              }
+              if (OB_SUCC(ret)) {
+                if (scanner_context_->check_any_limit(LimitScope::Scope::BETWEEN_CELLS)) {
+                  loop = false;
+                }
+              } else if (OB_ITER_END == ret) {
+                loop = false;
+              }
+            }
+            break;
+          case ObHTableMatchCode::DONE:
+            // done current row
+            matcher_->clear_curr_row();
+            is_cur_row_expired_ = false;  // reset expired flag when rowkey changes
+            loop = false;
+            break;
+          case ObHTableMatchCode::DONE_SCAN:
+            has_more_cells_ = false;
+            loop = false;
+            // need to scan the last kq for recording expired rowkey 
+            // when scan return OB_ITER_END, cur_cell_ will be empty
+            // but the ret code will be covered 
+            if (NULL != curr_cell_.get_ob_row()) {
+              ret = seek_or_skip_to_next_col(curr_cell_);
+            }
+            break;
+          case ObHTableMatchCode::SEEK_NEXT_ROW:
+            ret = seek_or_skip_to_next_row(curr_cell_);
+            break;
+          case ObHTableMatchCode::SEEK_NEXT_COL:
+            ret = seek_or_skip_to_next_col(curr_cell_);
+            break;
+          case ObHTableMatchCode::SKIP:
+            ret = next_cell();
+            break;
+          case ObHTableMatchCode::SEEK_NEXT_USING_HINT:
+            ret = get_next_cell_hint();
+            break;
+          default:
+            ret = OB_ERR_UNEXPECTED;
+            break;
+        }  // end switch
+      }
+    }  // end while
+    if (OB_ITER_END == ret) {
+      ret = OB_SUCCESS;
+    }
+  }
+  return ret;
+}
+
+void ObHTableRowIterator::init_table_group_value()
+{
+  if (is_table_group_inited_) {
+    // has inited, do nothing
+  } else {
+    is_table_group_inited_ = true;
+    is_table_group_req_ = child_op_->get_scan_executor()->get_table_ctx().is_tablegroup_req();
+    // get family name
+    ObString table_name = child_op_->get_scan_executor()->get_table_ctx().get_table_name();
+    family_name_ = table_name.after('$');
+  }
+}
+
+int ObHTableRowIterator::add_new_row(const ObNewRow &row, ObTableQueryDListResult *&out_result)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(out_result->add_row(row, family_name_))) {
+    LOG_WARN("failed to add row to result", K(ret));
+  }
+  return ret;
+}
+
+int ObHTableRowIterator::add_new_row(const ObNewRow &row, ObTableQueryResult *&out_result)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(out_result->add_row(row))) {
+    LOG_WARN("failed to add row to result", K(ret));
+  }
+  return ret;
+}
+
+/// Seek the scanner at or after the specified KeyValue.
+/// return the skipped cell count
+int ObHTableRowIterator::seek(ObHTableCell &key, int32_t &skipped_count)
+{
+  int ret = OB_SUCCESS;
+  int cmp_ret = 0;
+  if (false) {
+    // TODO When using it in the future, remember to adapt it to the TTL
+    if (OB_FAIL(seek_first_cell_on_hint(static_cast<ObHTableCellEntity *>(&key)->get_ob_row()))) {
+      if (OB_ITER_END != ret) {
+        LOG_WARN("failed to seek first cell on hint", K(ret));
+      }
+    }
+  } else {
+    skipped_count = 0;
+    while (OB_SUCC(next_cell())) {
+      cmp_ret = ObHTableUtils::compare_cell(curr_cell_, key, scan_order_);
+      if (cmp_ret >= 0) {
+        LOG_DEBUG("seek to", K(key), K_(curr_cell));
+        break;
+      }
+      ++skipped_count;
+    }
+  }
+  return ret;
+}
+int ObHTableRowIterator::rescan_and_get_next_row(table::ObTableApiScanRowIterator *tb_op, ObNewRow *&ob_next_row)
+{
+  int ret = OB_SUCCESS;
+  ObNewRow *tmp_next_row = nullptr;
+  if (OB_ISNULL(tb_op)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("tb_op is null", K(ret));
+  } else if (OB_FAIL(tb_op->get_scan_executor()->rescan())) {
+    LOG_WARN("failed to rescan executor", K(ret));
+  } else {
+    if (OB_FAIL(tb_op->get_next_row(tmp_next_row))) {
+      if (OB_ITER_END != ret) {
+        LOG_WARN("failed to get next row", K(ret));
+      }
+    } else {
+      ob_next_row = tmp_next_row;
+    }
+  }
+  return ret;
+}
+
+int ObHTableRowIterator::seek_first_cell_on_hint(const ObNewRow *ob_row)
+{
+  int ret = OB_SUCCESS;
+  ObTableApiScanRowIterator *forward_child_op = get_forward_child_op();
+  ObTableCtx &forward_tb_ctx = forward_child_op->get_scan_executor()->get_table_ctx();
+  ObNewRange &forward_range = forward_tb_ctx.get_key_ranges().at(0);
+  forward_tb_ctx.set_limit(-1);
+  forward_range_alloc_.reuse();
+  if (scan_order_ == ObQueryFlag::Forward) {
+    forward_range.end_key_ = stop_row_key_;
+  } else {
+    forward_range.end_key_.set_max_row();
+  }
+  ObObj *start_key = nullptr;
+  if (ob_row->count_ < 3) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ob_row start_key obj_cnt_ is less than 3", K(ret), K(ob_row->count_));
+  } else if (OB_ISNULL(start_key = static_cast<ObObj *>(forward_range_alloc_.alloc(sizeof(ObObj) * 3)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("allocate memory for start_obj failed", K(ret));
+  } else {
+    for (int i = 0; OB_SUCC(ret) && i < ob_row->count_ && i < 3; ++i) {
+      if (OB_FAIL(ob_write_obj(forward_range_alloc_, ob_row->cells_[i], start_key[i]))) {
+        LOG_WARN("failed to write obj", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    forward_range.start_key_.assign(start_key, 3);
+    ObNewRow *first_cell_on_row = nullptr;
+    if (OB_FAIL(rescan_and_get_next_row(forward_child_op, first_cell_on_row))) {
+      if (OB_ITER_END != ret) {
+        LOG_WARN("failed to rescan and get next row", K(ret));
+      } else {
+        has_more_cells_ = false;
+        curr_cell_.set_ob_row(NULL);
+        if (OB_NOT_NULL(matcher_)) {
+          matcher_->clear_curr_row();
+        }
+        LOG_DEBUG("iterator end", K_(has_more_cells));
+      }
+    } else {
+      curr_cell_.set_ob_row(first_cell_on_row);
+    }
+  }
+  return ret;
+}
+
+
+int ObHTableRowIterator::seek_or_skip_to_next_row(const ObHTableCell &cell)
+{
+  int ret = OB_SUCCESS;
+  int32_t cur_version = column_tracker_->get_cur_version();
+  ObHTableCell *next_cell = nullptr;
+
+  bool enter_next_key = false;
+  while (OB_SUCC(ret) && !enter_next_key) {
+    if (OB_FAIL(ObHTableUtils::create_last_cell_on_row_col(allocator_, curr_cell_, next_cell))) {
+      LOG_WARN("failed to create last cell", K(ret));
+    } else {
+      int32_t skipped_count = 0;
+      if (OB_FAIL(seek(*next_cell, skipped_count))) {
+        if (OB_ITER_END != ret) {
+          LOG_WARN("fail to seek next cell", K(ret));
+        }
+      } else if (ObHTableUtils::compare_rowkey(curr_cell_, *next_cell) != 0) {
+        enter_next_key = true;  // hbase rowkey changed
+        is_cur_row_expired_ = false;  // reset expired flag when switching to new rowkey
+      }
+
+      if ((OB_SUCCESS == ret || OB_ITER_END == ret)) {
+        // need record current rowkey and mark it recorded
+        // record using the next_cell, because the curr_cell_
+        // is not accessible when return OB_ITER_END
+        try_record_expired_rowkey(cur_version + skipped_count, next_cell->get_rowkey());
+      }
+      cur_version = 1;
+      next_cell->~ObHTableCell();
+      allocator_.reuse();
+    }
+  }
+  matcher_->clear_curr_row();
+  return ret;
+}
+
+int ObHTableRowIterator::seek_or_skip_to_next_col(const ObHTableCell &cell)
+{
+  int ret = OB_SUCCESS;
+  ObHTableCell *next_cell = NULL;
+  if (OB_FAIL(ObHTableUtils::create_last_cell_on_row_col(allocator_, cell, next_cell))) {
+    LOG_WARN("failed to create next cell", K(ret));
+  } else {
+    int32_t cur_version = column_tracker_->get_cur_version();
+    int32_t skipped_count = 0;
+    ret = seek(*next_cell, skipped_count);
+
+    if ((OB_SUCCESS == ret || OB_ITER_END == ret)) {
+      // need record current rowkey and mark it recorded
+      // record using the next_cell, because the curr_cell_
+      // is not accessible when return OB_ITER_END
+      try_record_expired_rowkey(cur_version + skipped_count, next_cell->get_rowkey());
+    }
+
+    next_cell->~ObHTableCell();
+    allocator_.reuse();
+  }
+  return ret;
+}
+
+bool ObHTableRowIterator::reach_batch_limit() const
+{
+  // @todo currently not supported
+  return false;
+}
+
+bool ObHTableRowIterator::reach_size_limit() const
+{
+  // @todo
+  return false;
+}
+
+void ObHTableRowIterator::set_hfilter(table::hfilter::Filter *hfilter)
+{
+  hfilter_ = hfilter;
+  if (nullptr != matcher_) {
+    matcher_->set_hfilter(hfilter);
+  }
+}
+
+void ObHTableRowIterator::set_need_verify_cell_ttl(bool need_verify_cell_ttl) {
+  need_verify_cell_ttl_ = need_verify_cell_ttl;
+  matcher_impl_.set_need_verify_cell_ttl(need_verify_cell_ttl);
+}
+
+int ObHTableRowIterator::try_record_expired_rowkey(const ObHTableCellEntity &cell)
+{
+  int ret = OB_SUCCESS;
+  if (!is_cur_row_expired_) {
+    if (need_verify_cell_ttl_ && OB_NOT_NULL(matcher_) && OB_FAIL(matcher_->is_cell_ttl_expired(cell, is_cur_row_expired_))) {
+      LOG_WARN("failed to is cell ttl expired", K(ret));
+    } else if (is_cur_row_expired_ || (time_to_live_ > 0 && OB_NOT_NULL(column_tracker_) &&
+                                          column_tracker_->is_expired(cell.get_timestamp()))) {
+      is_cur_row_expired_ = true;
+      if (OB_NOT_NULL(child_op_) && OB_NOT_NULL(child_op_->get_scan_executor())) {
+        ObTableCtx &tb_ctx = child_op_->get_scan_executor()->get_table_ctx();
+        if (!tb_ctx.is_index_scan()) {
+          MTL(ObHTableRowkeyMgr *)
+              ->record_htable_rowkey(
+                  tb_ctx.get_ls_id(), tb_ctx.get_table_id(), tb_ctx.get_tablet_id(), cell.get_rowkey());
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+void ObHTableRowIterator::try_record_expired_rowkey(const int32_t versions, const ObString &rowkey)
+{
+  if (max_version_ > 0 && !is_cur_row_expired_ && versions > max_version_) {
+    is_cur_row_expired_ = true;
+    if (OB_NOT_NULL(child_op_) && OB_NOT_NULL(child_op_->get_scan_executor())) {
+      ObTableCtx &tb_ctx = child_op_->get_scan_executor()->get_table_ctx();
+      if (!tb_ctx.is_index_scan()) {
+        MTL(ObHTableRowkeyMgr*)->record_htable_rowkey(tb_ctx.get_ls_id(),
+                                                      tb_ctx.get_table_id(),
+                                                      tb_ctx.get_tablet_id(),
+                                                      rowkey);
+      }
+    }
+  }
+}
+
+////////////////////////////////////////////////////////////////
+
+ObHTableReversedRowIterator::ObHTableReversedRowIterator(const ObTableQuery &query)
+    : ObHTableRowIterator(query),
+      iter_allocator_("HtbRevIterAloc", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
+      reversed_range_alloc_("HtbRevRanAloc", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
+      forward_child_op_(nullptr),
+      spec_(nullptr), 
+      forward_tb_ctx_(iter_allocator_),
+      expr_frame_info_(iter_allocator_)
+{}
+
+ObHTableReversedRowIterator::~ObHTableReversedRowIterator()
+{
+  if (OB_NOT_NULL(forward_child_op_)) {
+    forward_child_op_->close();
+  }
+  if (OB_NOT_NULL(spec_)) {
+    forward_tb_ctx_.reset_expr_frame_info();
+    if (OB_NOT_NULL(forward_child_op_)) {
+      spec_->destroy_executor(forward_child_op_->get_scan_executor());
+    }
+    if (is_query_async_) {
+      spec_->~ObTableApiSpec();
+    }
+  }
+  forward_tb_ctx_.set_sess_guard(nullptr);
+}
+
+int ObHTableReversedRowIterator::init()
+{
+  int ret = OB_SUCCESS;
+  if (is_inited()) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("reverse iter inited twice", K(ret));
+  } else if (OB_ISNULL(forward_child_op_ = OB_NEWx(ObTableApiScanRowIterator, &iter_allocator_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("forward_child_op_ alloc memory error", K(ret));
+  } else if (start_row_key_.length() == 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("start_row_key failed init", K(ret), K(start_row_key_));
+  } else if (start_row_key_.get_obj_cnt() != 3) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("start_key obj cnt less than 3", K(ret), K(start_row_key_.get_obj_cnt()));
+  } else if (stop_row_key_.length() == 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("stop_row_key_ failed init", K(ret), K(stop_row_key_));
+  } else if (stop_row_key_.get_obj_cnt() != 3) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("stop_row_key_ obj cnt less than 3", K(ret), K(stop_row_key_.get_obj_cnt()));
+  } else if (OB_ISNULL(child_op_->get_scan_executor())) {
+    ret = OB_INIT_FAIL;
+    LOG_WARN("scan_executort is NULL", K(ret));
+  } else if (OB_FAIL(create_forward_child_op())) {
+    LOG_WARN("create_reversed_child_op failed", K(ret));
+  } else {
+    // curr_cell_ needs to be initialized, and the pointer should be directed
+    // to either the last `startKey` or the first cell of the preceding row.
+    ObNewRow *tmp_next_row = nullptr;
+    ObHTableCell *new_cell = nullptr;
+    if (OB_FAIL(child_op_->get_next_row(tmp_next_row))) {
+      if (OB_ITER_END == ret) {
+        has_more_cells_ = false;
+        LOG_DEBUG("no data in table", K(ret));
+      } else {
+        LOG_WARN("failed to rescan and get next row", K(ret));
+      }
+    } else if (OB_FAIL(ObHTableUtils::create_first_cell_on_row(
+                   allocator_, tmp_next_row->get_cell(ObHTableConstants::COL_IDX_K).get_string(), new_cell))) {
+      LOG_WARN("failed to create first cell on row", K(ret));
+    } else if (OB_FAIL(seek_first_cell_on_hint(static_cast<ObHTableCellEntity *>(new_cell)->get_ob_row()))) {
+      LOG_WARN("failed to get first cell on row in init", K(ret));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    is_inited_ = true;
+  }
+  return ret;
+}
+
+int ObHTableReversedRowIterator::next_cell()
+{
+  int ret = OB_SUCCESS;
+  ObNewRow *ob_row = NULL;
+  ObHTableCellEntity cell_clone;
+  if (OB_FAIL(cell_clone.deep_copy_ob_row(curr_cell_.get_ob_row(), allocator_))) {
+    LOG_WARN("allocate memory for row_key failed", K(ret));
+  } else if (OB_FAIL(forward_child_op_->get_next_row(ob_row))) {
+    if (OB_ITER_END == ret) {
+      // cover recode when ret = OB_OB_ITER_END
+      ret = OB_SUCCESS;
+      if (OB_FAIL(seek_or_skip_to_next_row(cell_clone))) {
+        if (OB_ITER_END != ret) {
+          LOG_WARN("failed to seek to next row when get next cell", K(ret));
+        }
+      }
+    } else {
+      LOG_WARN("failed to get next row", K(ret));
+    }
+  } else if (FALSE_IT(curr_cell_.set_ob_row(ob_row))) {
+  } else if (0 == ObHTableUtils::compare_rowkey(cell_clone.get_rowkey(), curr_cell_.get_rowkey())) {
+    // same rowkey
+    if (OB_FAIL(try_record_expired_rowkey(curr_cell_))) {
+      LOG_WARN("failed to try record expired rowkey", K(ret));
+    }
+  } else {
+    // rowkey changed, reset expired flag
+    is_cur_row_expired_ = false;
+    if (OB_FAIL(seek_or_skip_to_next_row(cell_clone))) {
+      if (OB_ITER_END != ret) {
+        LOG_WARN("failed to seek to next row when get next cell", K(ret));
+      }
+    }
+  }
+  allocator_.reuse();
+  return ret;
+}
+
+/*
+ * In a reverse scan, advancing to the "next" row effectively means moving to the previous row.
+ * This process entails initially constructing the minimum possible key (min-min) for the current cell.
+ * Then, by taking a single reverse step with this min-min key, the row key of the row above (i.e., preceding) is
+ * retrieved. Subsequently, another min-min key for a hypothetical cell at the start of this newfound row is
+ * reconstructed. Finally, progressing with a forward step using this new min-min key lands you on the first cell of
+ * the row preceding the original starting point.
+ */
+int ObHTableReversedRowIterator::seek_or_skip_to_next_row(const ObHTableCell &cell)
+{
+  int ret = OB_SUCCESS;
+  ObString rowkey_clone;
+  reversed_range_alloc_.reuse();
+  if (OB_FAIL(ob_write_string(reversed_range_alloc_, cell.get_rowkey(), rowkey_clone))) {
+    LOG_WARN("allocate memory for row_key failed", K(ret));
+  } else if (OB_FAIL(seek_or_skip_to_next_row_inner(rowkey_clone))) {
+    LOG_WARN("failed to seek or skip to next row", K(ret));
+  }
+  return ret;
+}
+
+int ObHTableReversedRowIterator::seek_or_skip_to_next_row(const ObString &rowkey)
+{
+  int ret = OB_SUCCESS;
+  reversed_range_alloc_.reuse();
+  if (OB_FAIL(seek_or_skip_to_next_row_inner(rowkey))) {
+    LOG_WARN("failed to seek or skip to next row", K(ret));
+  }
+  return ret;
+}
+
+int ObHTableReversedRowIterator::seek_or_skip_to_next_row_inner(const ObString &rowkey)
+{
+  int ret = OB_SUCCESS;
+  ObTableCtx &reversed_tb_ctx = child_op_->get_scan_executor()->get_table_ctx();
+  ObNewRange &reverse_range = reversed_tb_ctx.get_key_ranges().at(0);
+  reverse_range.start_key_ = start_row_key_;
+  ObObj *end_key = nullptr;
+  if (OB_ISNULL(end_key = static_cast<ObObj *>(reversed_range_alloc_.alloc(sizeof(ObObj) * 3)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("allocate memory for end_key failed", K(ret));
+  } else {
+    end_key[ObHTableConstants::COL_IDX_K].set_varbinary(rowkey);
+    end_key[ObHTableConstants::COL_IDX_Q].set_min_value();
+    end_key[ObHTableConstants::COL_IDX_T].set_min_value();
+    reverse_range.end_key_.assign(end_key, 3);
+    ObNewRow *ob_next_row = NULL;
+    if (OB_FAIL(rescan_and_get_next_row(child_op_, ob_next_row))) {
+      if (OB_ITER_END != ret) {
+        LOG_WARN("failed to rescan and get next row", K(ret));
+      } else {
+        LOG_DEBUG("reverse scan has no more cell", K(ret), K(has_more_cells_));
+        has_more_cells_ = false;
+      }
+    } else {
+      ObObj hint_cell[3];
+      hint_cell[ObHTableConstants::COL_IDX_K].set_varbinary(
+          ob_next_row->get_cell(ObHTableConstants::COL_IDX_K).get_varchar());
+      hint_cell[ObHTableConstants::COL_IDX_Q].set_min_value();
+      hint_cell[ObHTableConstants::COL_IDX_T].set_min_value();
+      const ObNewRow first_cell_on_row(hint_cell, 3);
+      if (OB_FAIL(seek_first_cell_on_hint(&first_cell_on_row))) {
+        LOG_WARN("failed to seek first cell on row", K(ret));
+      }
+    }
+    if (OB_NOT_NULL(matcher_)) {
+      matcher_->clear_curr_row();
+    }
+    is_cur_row_expired_ = false;  // reset expired flag when switching to new rowkey
+  }
+  return ret;
+}
+
+int ObHTableReversedRowIterator::seek_or_skip_to_next_col(const ObHTableCell &cell)
+{
+  int ret = OB_SUCCESS;
+  forward_range_alloc_.reuse();
+  ObString rowkey_clone;
+  ObString qualifier_clone;
+  if (OB_FAIL(ob_write_string(forward_range_alloc_, cell.get_rowkey(), rowkey_clone))) {
+    LOG_WARN("allocate memory for row_key failed", K(ret));
+  } else if (OB_FAIL(ob_write_string(forward_range_alloc_, cell.get_qualifier(), qualifier_clone))) {
+    LOG_WARN("allocate memory for qualifier_key failed", K(ret));
+  } else if (OB_FAIL(seek_or_skip_to_next_col_inner(rowkey_clone, qualifier_clone))) {
+    LOG_WARN("failed to seek_or_skip_to_next_col", K(ret));
+  }
+  return ret;
+}
+
+int ObHTableReversedRowIterator::seek_or_skip_to_next_col(const ObString &rowkey, const ObString &qualifier)
+{
+  int ret = OB_SUCCESS;
+  forward_range_alloc_.reuse();
+  if (OB_FAIL(seek_or_skip_to_next_col_inner(rowkey, qualifier))) {
+    LOG_WARN("failed to seek_or_skip_to_next_col", K(ret));
+  }
+  return ret;
+}
+
+int ObHTableReversedRowIterator::seek_or_skip_to_next_col_inner(const ObString &rowkey, const ObString &qualifier)
+{
+  int ret = OB_SUCCESS;
+  forward_tb_ctx_.set_limit(-1);
+  ObNewRange &column_range = forward_tb_ctx_.get_key_ranges().at(0);
+  ObObj *start_key = nullptr;
+  ObObj *end_key = nullptr;
+  if (OB_ISNULL(start_key = static_cast<ObObj *>(forward_range_alloc_.alloc(sizeof(ObObj) * 3)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("allocate memory for start_key failed", K(ret));
+  } else if (OB_ISNULL(end_key = static_cast<ObObj *>(forward_range_alloc_.alloc(sizeof(ObObj) * 3)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("allocate memory for end_key failed", K(ret));
+  } else {
+    end_key[ObHTableConstants::COL_IDX_K].set_varbinary(rowkey);
+    end_key[ObHTableConstants::COL_IDX_Q].set_max_value();
+    end_key[ObHTableConstants::COL_IDX_T].set_max_value();
+    start_key[ObHTableConstants::COL_IDX_K].set_varbinary(rowkey);
+    start_key[ObHTableConstants::COL_IDX_Q].set_varbinary(qualifier);
+    start_key[ObHTableConstants::COL_IDX_T].set_max_value();
+    column_range.start_key_.assign(start_key, 3);
+    column_range.end_key_.assign(end_key, 3);
+    ObNewRow *ob_next_column_row = NULL;
+    if (OB_FAIL(rescan_and_get_next_row(forward_child_op_, ob_next_column_row))) {
+      if (OB_ITER_END != ret) {
+        LOG_WARN("failed to rescan and get next row", K(ret));
+      } else {
+        if (OB_FAIL(seek_or_skip_to_next_row(rowkey))) {
+          if (OB_ITER_END != ret) {
+            LOG_WARN("failed to get next row in seek_next_col", K(ret));
+          }
+        }
+      }
+    } else {
+      allocator_.reuse(); 
+      curr_cell_.set_ob_row(ob_next_column_row);
+    }
+  }
+  return ret;
+}
+
+int ObHTableReversedRowIterator::seek(ObHTableCell &key, int32_t &skipped_count)
+{
+  int ret = OB_SUCCESS;
+  UNUSED(skipped_count);
+  if (OB_FAIL(seek_first_cell_on_hint(static_cast<ObHTableCellEntity *>(&key)->get_ob_row()))) {
+    if (OB_ITER_END != ret) {
+      LOG_WARN("failed to seek first cell on hint", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObHTableReversedRowIterator::init_forward_tb_ctx()
+{
+  int ret = OB_SUCCESS;
+  ObExprFrameInfo *expr_frame_info = nullptr;
+  if (OB_FAIL(cache_guard_.init(&forward_tb_ctx_))) {
+    LOG_WARN("fail to init cache guard", K(ret));
+  } else if (OB_FAIL(cache_guard_.get_expr_info(&forward_tb_ctx_, expr_frame_info))) {
+    LOG_WARN("fail to get expr frame info from cache", K(ret));
+  } else if (OB_FAIL(ObTableExprCgService::alloc_exprs_memory(forward_tb_ctx_, *expr_frame_info))) {
+    LOG_WARN("fail to alloc expr memory", K(ret));
+  } else if (OB_FAIL(forward_tb_ctx_.init_exec_ctx())) {
+    LOG_WARN("fail to init exec forward_tb_ctx_", K(ret), K(forward_tb_ctx_));
+  } else {
+    forward_tb_ctx_.set_init_flag(true);
+    forward_tb_ctx_.set_expr_info(expr_frame_info);
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(cache_guard_.get_spec<TABLE_API_EXEC_SCAN>(&forward_tb_ctx_, spec_))) {
+      LOG_WARN("fail to get spec from cache", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObHTableReversedRowIterator::init_async_forward_tb_ctx()
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(forward_tb_ctx_.cons_column_items_for_cg())) {
+    LOG_WARN("fail to construct column items", K(ret));
+  } else if (OB_FAIL(forward_tb_ctx_.generate_table_schema_for_cg())) {
+    LOG_WARN("fail to generate table schema", K(ret));
+  } else if (OB_FAIL(ObTableExprCgService::generate_exprs(forward_tb_ctx_, iter_allocator_, expr_frame_info_))) {
+    LOG_WARN("fail to generate exprs", K(ret), K(forward_tb_ctx_));
+  } else if (OB_FAIL(ObTableExprCgService::alloc_exprs_memory(forward_tb_ctx_, expr_frame_info_))) {
+    LOG_WARN("fail to alloc expr memory", K(ret));
+  } else if (OB_FAIL(forward_tb_ctx_.classify_scan_exprs())) {
+    LOG_WARN("fail to classify scan exprs", K(ret));
+  } else if (OB_FAIL(forward_tb_ctx_.init_exec_ctx())) {
+    LOG_WARN("fail to init exec forward_tb_ctx_", K(ret), K(forward_tb_ctx_));
+  } else {
+    forward_tb_ctx_.set_init_flag(true);
+    forward_tb_ctx_.set_expr_info(&expr_frame_info_);
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(ObTableSpecCgService::generate<TABLE_API_EXEC_SCAN>(iter_allocator_, forward_tb_ctx_, spec_))) {
+      LOG_WARN("fail to generate scan spec", K(ret), K(forward_tb_ctx_));
+    }
+  }
+  return ret;
+}
+
+int ObHTableReversedRowIterator::create_forward_child_op()
+{
+  int ret = OB_SUCCESS;
+  table::ObTableCtx &reversed_tb_ctx = child_op_->get_scan_executor()->get_table_ctx();
+  ObTableApiExecutor *api_executor = nullptr;
+  forward_tb_ctx_.set_scan(true);
+  forward_tb_ctx_.set_entity_type(reversed_tb_ctx.get_entity_type());
+  forward_tb_ctx_.set_schema_cache_guard(reversed_tb_ctx.get_schema_cache_guard());
+  forward_tb_ctx_.set_table_schema(reversed_tb_ctx.get_table_schema());
+  forward_tb_ctx_.set_schema_guard(reversed_tb_ctx.get_schema_guard());
+  forward_tb_ctx_.set_simple_table_schema(reversed_tb_ctx.get_simple_table_schema());
+  forward_tb_ctx_.set_sess_guard(reversed_tb_ctx.get_sess_guard());
+  forward_tb_ctx_.set_is_tablegroup_req(reversed_tb_ctx.is_tablegroup_req());
+  forward_tb_ctx_.set_read_latest(reversed_tb_ctx.is_read_latest());
+
+  if (forward_tb_ctx_.is_init()) {
+    LOG_INFO("forward_tb_ctx_ has been inited", K_(forward_tb_ctx));
+  } else if (OB_FAIL(forward_tb_ctx_.init_common(*const_cast<ObTableApiCredential *>(reversed_tb_ctx.get_credential()),
+                 reversed_tb_ctx.get_tablet_id(),
+                 reversed_tb_ctx.get_timeout_ts()))) {
+    LOG_WARN("fail to init table forward_ctx common part", K(ret), K(reversed_tb_ctx.get_table_name()));
+  } else if (OB_FAIL(forward_tb_ctx_.init_scan(*query_, reversed_tb_ctx.is_weak_read(), 
+                     reversed_tb_ctx.get_table_id()))) {
+    LOG_WARN("fail to init table forward_ctx scan part", K(ret), K(forward_tb_ctx_));
+  }
+  if (OB_SUCC(ret)) {
+    if (!is_query_async_) {
+      ret = init_forward_tb_ctx();
+    } else {
+      ret = init_async_forward_tb_ctx();
+    }
+    if (OB_SUCC(ret)) {
+      forward_tb_ctx_.set_scan_order(ObQueryFlag::Forward);
+      if (OB_FAIL(forward_tb_ctx_.init_trans(reversed_tb_ctx.get_session_info().get_tx_desc(),
+              reversed_tb_ctx.get_exec_ctx().get_das_ctx().get_snapshot()))) {
+        LOG_WARN("fail to init trans", K(ret), K(forward_tb_ctx_));
+      } else if (OB_FAIL(spec_->create_executor(forward_tb_ctx_, api_executor))) {
+        LOG_WARN("fail to generate executor", K(ret), K(forward_tb_ctx_));
+      } else if (OB_FAIL(forward_child_op_->open(static_cast<ObTableApiScanExecutor *>(api_executor)))) {
+        LOG_WARN("fail to open forward child op", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+////////////////////////////////////////////////////////////////
+ObHTableFilterOperator::ObHTableFilterOperator(const ObTableQuery &query, table::ObTableQueryResult &one_result)
+    : ObTableQueryResultIterator(&query),
+      row_iterator_(NULL),
+      one_result_(&one_result),
+      batch_size_(query.get_batch()),
+      ob_kv_params_(query.get_ob_params()),
+      caching_(-1),
+      batch_(query.get_batch()),
+      max_result_size_(std::min(query.get_max_result_size(),
+                                static_cast<int64_t>(ObTableQueryResult::get_max_packet_buffer_length() - 1024))),
+      is_first_result_(true),
+      check_existence_only_(false),
+      scanner_context_(),
+      is_inited_(false),
+      row_count_(0)
+{
+}
+
+ObHTableFilterOperator::ObHTableFilterOperator(const ObTableQuery &query,
+                                               table::ObTableQueryIterableResult &one_result)
+    : ObTableQueryResultIterator(&query),
+      row_iterator_(NULL),
+      iterable_result_(&one_result),
+      batch_size_(query.get_batch()),
+      ob_kv_params_(query.get_ob_params()),
+      caching_(-1),
+      batch_(query.get_batch()),
+      max_result_size_(std::min(query.get_max_result_size(),
+          static_cast<int64_t>(ObTableQueryResult::get_max_packet_buffer_length() - 1024))),
+      is_first_result_(true),
+      check_existence_only_(false),
+      scanner_context_(),
+      is_inited_(false),
+      row_count_(0)
+{}
+
+ObHTableFilterOperator::~ObHTableFilterOperator()
+{
+  if (OB_NOT_NULL(row_iterator_)) {
+    row_iterator_->~ObHTableRowIterator();
+  }
+}
+
+bool ObHTableFilterOperator::reach_limit()
+{
+  return query_->get_limit() > 0 && row_count_ >= query_->get_limit();
+}
+
+bool ObHTableFilterOperator::reach_caching_limit(int num_of_row)
+{
+  return caching_ >= 0 && num_of_row >= caching_;
+}
+
+// @param one_result for one batch
+int ObHTableFilterOperator::get_next_result(ObTableQueryResult *&next_result)
+{
+  int ret = OB_SUCCESS;
+  one_result_->reset_except_property();
+  next_result = one_result_;
+
+  if (OB_FAIL(get_next_result_internal(one_result_))) {
+    LOG_WARN("fail to get next result", K(ret));
+  }
+  return ret;
+}
+
+int ObHTableFilterOperator::get_next_result(ObTableQueryIterableResult *&next_result)
+{
+  int ret = OB_SUCCESS;
+  next_result = iterable_result_;
+  if (OB_FAIL(get_next_result_internal(iterable_result_))) {
+    LOG_WARN("fail to get next result", K(ret));
+  }
+  return ret;
+}
+
+template <typename ResultType>
+int ObHTableFilterOperator::get_next_result_internal(ResultType *&next_result)
+{
+  int ret = OB_SUCCESS;
+  bool has_filter_row = (NULL != filter_) && (filter_->has_filter_row());
+  ObTableQueryDListResult *htable_row = nullptr;
+// ObNewRow first_entity;
+  // ObObj first_entity_cells[4];
+  // first_entity.cells_ = first_entity_cells;
+  // first_entity.count_ = 4;
+  int num_of_row = 0;
+  scanner_context_.progress_.reset();
+
+  if (!is_inited_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("obHTableFilterOperator has not init", K(ret));
+  } else if (!row_iterator_->is_inited()) {
+    if (OB_FAIL(row_iterator_->init())) {
+      LOG_WARN("hbase iterator init error", K(ret));
+    } else {
+      row_iterator_->init_table_group_value();
+      row_iterator_->is_inited() = true;
+    }
+  }
+  while (OB_SUCC(ret) && row_iterator_->has_more_result() && !reach_caching_limit(num_of_row) &&
+         OB_SUCC(row_iterator_->get_next_result(htable_row))) {
+    LOG_DEBUG("got one row", "cells_count", htable_row->get_row_count());
+    bool is_empty_row = (htable_row->get_row_count() == 0);
+    if (is_empty_row) {
+      if (nullptr != filter_) {
+        filter_->reset();
+      }
+      continue;
+    }
+    /*
+    if (NULL != filter_) {
+      // for RowFilter etc. which filter according to rowkey
+      if (OB_FAIL(htable_row->get_first_row(first_entity))) {
+        LOG_WARN("failed to get first cell", K(ret));
+      } else {
+        ObHTableCellEntity first_cell_entity(&first_entity);
+        if (filter_->filter_row_key(first_cell_entity)) {
+          // filter out the current row and fetch the next row
+          filter_->reset();
+          LOG_DEBUG("skip the row", K(ret));
+          continue;
+        }
+      }
+    }
+    */
+    bool exclude = false;
+    if (has_filter_row) {
+      // FIXME @todo allows direct modification of the final list to be submitted
+      filter_->filter_row_cells(*htable_row);
+      is_empty_row = (htable_row->get_row_count() == 0);
+      if (!is_empty_row) {
+        // last chance to drop entire row based on the sequence of filter calls
+        if (filter_->filter_row()) {
+          LOG_DEBUG("filter out the row");
+          exclude = true;
+        }
+      }
+    }
+    if (is_empty_row || exclude) {
+      if (NULL != filter_) {
+        filter_->reset();
+      }
+      // fetch next row
+      continue;
+    }
+
+    // if only check exist, add one row
+    // cannot just set row_count_ as 1 in multi-cf situation
+    if (check_existence_only_) {
+      ObHTableCellEntity *row = nullptr;
+      if (OB_FAIL(htable_row->get_row(row))) {
+        LOG_WARN("fail to get row from htable row", K(ret));
+      } else if (OB_FAIL(next_result->add_materialized_row_for_exist_only(
+          *row->get_ob_row(), row->get_family()))) {
+        LOG_WARN("failed to add one row for exist only", K(ret));
+      } else {
+        ret = OB_ITER_END;
+      }
+      break; // break out this while loops
+    }
+
+    /* @todo check batch limit and size limit */
+    // We have got one hbase row, store it to this batch
+    if (OB_FAIL(next_result->add_all_row(*htable_row))) {
+      LOG_WARN("failed to add cells to row", K(ret));
+    }
+    if (NULL != filter_) {
+      filter_->reset();
+    }
+    if (OB_SUCC(ret)) {
+      if (next_result->reach_batch_size_or_result_size(batch_size_, max_result_size_)) {
+        break;
+      }
+    }
+    num_of_row++;
+    row_count_++;
+    if (reach_limit()) {
+      row_iterator_->no_more_result();
+    }
+  }  // end while
+
+  if (OB_SUCC(ret) && !row_iterator_->has_more_result()) {
+    ret = OB_ITER_END;
+  }
+
+  if (OB_ITER_END == ret && next_result->get_row_count() > 0) {
+    ret = OB_SUCCESS;
+  }
+
+  LOG_DEBUG("get_next_result", K(ret), "row_count", next_result->get_row_count());
+  return ret;
+}
+
+void ObHTableFilterOperator::set_query_async()
+{
+  is_query_async_ = true;
+  if (OB_NOT_NULL(row_iterator_)) {
+    row_iterator_->set_query_async();
+  }
+}
+
+int ObHTableFilterOperator::init(common::ObIAllocator *allocator)
+{
+  int ret = OB_SUCCESS;
+  scanner_context_.limits_.set_batch(batch_);
+  const ObHBaseParams *hbase_params = nullptr;
+  if (OB_ISNULL(allocator)) {
+    ret = OB_INIT_FAIL;
+    LOG_WARN("allocator is nullptr", K(ret));
+  } else if (is_inited_) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("bbHTableFilterOperator inited twice", K(ret));
+  } else {
+    if (ObQueryFlag::Reverse == query_->get_scan_order()) {
+      if (OB_ISNULL(row_iterator_ = OB_NEWx(ObHTableReversedRowIterator, allocator, *query_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("row_iterator_ init nullptr", K(ret));
+      }
+    } else {
+      if (OB_ISNULL(row_iterator_ = OB_NEWx(ObHTableRowIterator, allocator, *query_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("row_iterator_ init nullptr", K(ret));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      const ObString &hfilter_string = query_->get_htable_filter().get_filter();
+      if (hfilter_string.empty()) {
+        filter_ = NULL;
+      } else if (OB_FAIL(filter_parser_.init(allocator))) {
+        LOG_WARN("failed to init filter_parser", K(ret));
+      } else if (OB_FAIL(filter_parser_.parse_filter(hfilter_string, filter_))) {
+        LOG_WARN("failed to parse filter", K(ret), K(hfilter_string));
+      } else {
+        filter_->set_reversed(ObQueryFlag::Reverse == query_->get_scan_order());
+        row_iterator_->set_hfilter(filter_);
+      }
+      if (OB_SUCC(ret) && OB_NOT_NULL(ob_kv_params_.ob_params_)) {
+        if (OB_FAIL(ob_kv_params_.get_hbase_params(hbase_params))) {
+          LOG_WARN("init ob_params fail", K(ret), K(ob_kv_params_));
+        } else {
+          caching_ = hbase_params->caching_;
+          scanner_context_.limits_.set_fields(
+              max_result_size_, hbase_params->call_timeout_, LimitScope(LimitScope::Scope::BETWEEN_ROWS));
+          check_existence_only_ = hbase_params->check_existence_only_;
+          row_iterator_->set_allow_partial_results(hbase_params->allow_partial_results_);
+          row_iterator_->set_is_cache_block(hbase_params->is_cache_block_);
+          if (NULL != filter_ && !hbase_params->hbase_version_.empty()) {
+            filter_->set_hbase_version(hbase_params->hbase_version_);
+          }
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    row_iterator_->set_scanner_context(&scanner_context_);
+    is_inited_ = true;
+    LOG_DEBUG("obHTableFilterOperator init success", K(ret));
+  }
+  return ret;
+}
+
+// ---------------------------------------- ObHTableRowIterator Get Optimization ----------------------------------------
+
+bool ObHTableRowIterator::should_enable_get_optimization()
+{
+  bool bret = true;
+  const ObTableQuery &query = *query_;
+
+  if (scan_order_ != ObQueryFlag::Forward) {
+    bret = false;
+  } else if (query.get_scan_ranges().empty()) {
+    bret = false;
+  } else if (!query.is_get_optimization()) {
+    bret = false;
+  } else {
+    const ObNewRange &range = query.get_scan_ranges().at(0);
+    if (range.start_key_.get_obj_cnt() < 3 || range.end_key_.get_obj_cnt() < 3) {
+      bret = false;
+    } else if (range.start_key_.get_obj_ptr()[ObHTableConstants::COL_IDX_K].is_min_value()
+               || range.end_key_.get_obj_ptr()[ObHTableConstants::COL_IDX_K].is_max_value()
+               || !range.start_key_.get_obj_ptr()[ObHTableConstants::COL_IDX_K].get_varbinary().
+                 compare_equal(range.end_key_.get_obj_ptr()[ObHTableConstants::COL_IDX_K].get_varbinary())) {
+      bret = false;
+    } else if (!htable_filter_.get_filter().empty()) {
+      bret = false;
+    } else {
+      // Check if limit=1 or max_version=1
+      bool has_limit_one = (query.get_limit() == 1);
+
+      // Get max_version from schema if available
+      int32_t schema_max_version = 0;
+      if (OB_NOT_NULL(child_op_)) {
+        ObTableApiScanExecutor *scan_executor = child_op_->get_scan_executor();
+        if (OB_NOT_NULL(scan_executor)) {
+          ObTableCtx &tb_ctx = scan_executor->get_table_ctx();
+          ObKvSchemaCacheGuard *schema_cache_guard = tb_ctx.get_schema_cache_guard();
+          if (OB_NOT_NULL(schema_cache_guard) && schema_cache_guard->is_inited()) {
+            ObKVAttr kv_attributes;
+            if (OB_SUCCESS == schema_cache_guard->get_kv_attributes(kv_attributes)) {
+              ObHColumnDescriptor desc;
+              desc.from_kv_attribute(kv_attributes);
+              schema_max_version = desc.get_max_version();
+            }
+          }
+        }
+      }
+
+      bool has_max_version_one = (schema_max_version == 1);
+
+      if (!has_limit_one && !has_max_version_one) {
+        bret = false;
+      }
+    }
+  }
+
+  if (bret) {
+    const ObIArray<ObString> &columns = htable_filter_.get_columns();
+    is_wildcard_mode_ = (columns.count() <= 0);
+    // batch get single cf
+    if (columns.count() == 1) {
+      ObString qualifier = columns.at(0);
+      if (OB_NOT_NULL(qualifier.find('.'))
+          && is_legal_family_name(qualifier.split_on('.'))
+          && qualifier.after('.').empty()) {
+        is_wildcard_mode_ = true;
+      }
+    }
+
+    if (is_wildcard_mode_ && !htable_filter_.with_all_time()) {
+      bret = false;
+    }
+  }
+
+  return bret;
+}
+
+int ObHTableRowIterator::check_and_apply_get_optimization()
+{
+  int ret = OB_SUCCESS;
+
+  if (OB_ISNULL(child_op_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("child_op_ is null", K(ret));
+  } else {
+    ObTableApiScanExecutor *scan_executor = child_op_->get_scan_executor();
+    if (OB_ISNULL(scan_executor)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("scan_executor is null", K(ret));
+    } else {
+      ObTableCtx &tb_ctx = scan_executor->get_table_ctx();
+      ObIArray<ObNewRange> &key_ranges = tb_ctx.get_key_ranges();
+    
+      if (key_ranges.count() == 0) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("no key ranges", K(ret));
+      } else {
+        ObNewRange &range = key_ranges.at(0);
+        const ObObj *start_key_objs = range.start_key_.get_obj_ptr();
+        const ObObj *end_key_objs = range.end_key_.get_obj_ptr();
+        
+        if (OB_ISNULL(start_key_objs) || OB_ISNULL(end_key_objs)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("null key objs", K(ret));
+        } else if (range.start_key_.get_obj_cnt() < 3 || range.end_key_.get_obj_cnt() < 3) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid key obj count", K(ret), K(range));
+        } else {
+          if (is_wildcard_mode_) {
+            // Wildcard mode: use [rowkey, min, min] to [rowkey, max, max] for first qualifier
+            // Keep the original range but set limit=1
+            tb_ctx.set_limit(1);
+          } else {
+            // Explicit qualifiers mode: [rowkey, min, min] -> [rowkey, first_qualifier, min]
+            //                         [rowkey, max, max] -> [rowkey, first_qualifier, max]
+            const ObIArray<ObString> &qualifiers = htable_filter_.get_columns();
+            ObString first_qualifier = qualifiers.at(0);
+            if (OB_FAIL(modify_scan_range_for_qualifier(forward_range_alloc_, range, range, first_qualifier))) {
+              LOG_WARN("fail to modify scan range for first qualifier", K(ret));
+            } else {
+              tb_ctx.set_limit(1);
+            }
+          }
+        }
+      }
+
+      if (OB_SUCC(ret)) {
+        enable_get_optimization_ = true;
+        current_qualifier_idx_ = is_wildcard_mode_ ? -1 : 0;  // -1 indicates wildcard mode
+      }
+    }
+  }
+
+  return ret;
+}
+
+int ObHTableRowIterator::modify_scan_range_for_qualifier(ObIAllocator &allocator, ObNewRange &target_range, 
+                                                       const ObNewRange &orig_range, const ObString &qualifier)
+{
+  int ret = OB_SUCCESS;
+  const ObObj *start_key_objs = orig_range.start_key_.get_obj_ptr();
+  const ObObj *end_key_objs = orig_range.end_key_.get_obj_ptr();
+  
+  if (OB_ISNULL(start_key_objs) || OB_ISNULL(end_key_objs)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null key objs in original range", K(ret));
+  } else if (orig_range.start_key_.get_obj_cnt() < 3) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid key obj count", K(ret), K(orig_range));
+  } else {
+    ObObj *new_start_objs = nullptr;
+    ObObj *new_end_objs = nullptr;
+    if (OB_ISNULL(new_start_objs = static_cast<ObObj *>(
+            allocator.alloc(sizeof(ObObj) * 3)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("fail to allocate start objs", K(ret));
+    } else if (OB_ISNULL(new_end_objs = static_cast<ObObj *>(
+            allocator.alloc(sizeof(ObObj) * 3)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("fail to allocate end objs", K(ret));
+    } else {
+      // Deep copy all string data to ensure memory safety when allocator is reused
+      // Rowkey (index 0): deep copy from orig_range
+      ObString start_rowkey_clone;
+      ObString end_rowkey_clone;
+      if (OB_FAIL(ob_write_string(allocator, start_key_objs[0].get_varbinary(), start_rowkey_clone))) {
+        LOG_WARN("fail to deep copy start rowkey", K(ret));
+      } else if (OB_FAIL(ob_write_string(allocator, end_key_objs[0].get_varbinary(), end_rowkey_clone))) {
+        LOG_WARN("fail to deep copy end rowkey", K(ret));
+      } else {
+        new_start_objs[0].set_varbinary(start_rowkey_clone);
+        new_start_objs[0].set_collation_type(CS_TYPE_BINARY);
+        new_end_objs[0].set_varbinary(end_rowkey_clone);
+        new_end_objs[0].set_collation_type(CS_TYPE_BINARY);
+      }
+      
+      // Qualifier (index 1): qualifier parameter is already a valid ObString, but we still deep copy
+      // to ensure it's allocated from the same allocator
+      if (OB_SUCC(ret)) {
+        ObString qualifier_clone;
+        if (OB_FAIL(ob_write_string(allocator, qualifier, qualifier_clone))) {
+          LOG_WARN("fail to deep copy qualifier", K(ret));
+        } else {
+          new_start_objs[1].set_varbinary(qualifier_clone);
+          new_start_objs[1].set_collation_type(CS_TYPE_BINARY);
+          new_end_objs[1].set_varbinary(qualifier_clone);
+          new_end_objs[1].set_collation_type(CS_TYPE_BINARY);
+        }
+      }
+      
+      // Timestamp (index 2): copy directly as it's typically max_value or min_value, no string data
+      if (OB_SUCC(ret)) {
+        new_start_objs[2] = start_key_objs[2];
+        new_end_objs[2] = end_key_objs[2];
+      }
+      
+      if (OB_SUCC(ret)) {
+        target_range.start_key_.assign(new_start_objs, 3);
+        target_range.end_key_.assign(new_end_objs, 3);
+      }
+    }
+  }
+  
+  return ret;
+}
+
+int ObHTableRowIterator::rescan_for_qualifier(const ObString &qualifier)
+{
+  int ret = OB_SUCCESS;
+  
+  if (OB_ISNULL(child_op_) || OB_ISNULL(child_op_->get_scan_executor())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("child_op_ or scan_executor is null", K(ret));
+  } else {
+    ObTableCtx &tb_ctx = child_op_->get_scan_executor()->get_table_ctx();
+    ObIArray<ObNewRange> &key_ranges = tb_ctx.get_key_ranges();
+    
+    // Build new range for this qualifier: [rowkey, qualifier, min] to [rowkey, qualifier, max]
+    if (key_ranges.count() == 0) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("no key ranges", K(ret));
+    } else {
+      const ObNewRange &orig_range = key_ranges.at(0);
+      ObNewRange &scan_range = key_ranges.at(0);
+      forward_range_alloc_.reuse();
+      
+      if (OB_FAIL(modify_scan_range_for_qualifier(forward_range_alloc_, scan_range, orig_range, qualifier))) {
+        LOG_WARN("fail to modify scan range for qualifier", K(ret));
+      } else {
+        tb_ctx.set_limit(1);
+        scan_range.border_flag_ = orig_range.border_flag_;
+        ObNewRow *first_row = nullptr;
+        if (OB_FAIL(rescan_and_get_next_row(child_op_, first_row))) {
+          if (OB_ITER_END != ret) {
+            LOG_WARN("fail to rescan for qualifier", K(ret), K(qualifier), K_(current_qualifier_idx));
+          }
+        } else {
+          curr_cell_.set_ob_row(first_row);
+        }
+      }
+    }
+  }
+
+  return ret;
+}
+
+int ObHTableRowIterator::rescan_for_next_qualifier_wildcard(const ObString &previous_qualifier_param)
+{
+  int ret = OB_SUCCESS;
+  
+  if (OB_ISNULL(child_op_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("child_op_ is null", K(ret));
+  } else {
+    ObTableApiScanExecutor *scan_executor = child_op_->get_scan_executor();
+    if (OB_ISNULL(scan_executor)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("scan_executor is null", K(ret));
+    } else {
+      ObTableCtx &tb_ctx = scan_executor->get_table_ctx();
+      ObIArray<ObNewRange> &key_ranges = tb_ctx.get_key_ranges();
+      
+      // Build range for next qualifier: [rowkey, previous_qualifier, max] to [rowkey, max, max]
+      // Left side is open interval (exclusive of previous_qualifier)
+      if (key_ranges.count() == 0) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("no key ranges", K(ret));
+      } else {
+        const ObNewRange &orig_range = key_ranges.at(0);
+        ObNewRange &scan_range = key_ranges.at(0);
+        const ObObj *start_key_objs = orig_range.start_key_.get_obj_ptr();
+        const ObObj *end_key_objs = orig_range.end_key_.get_obj_ptr();
+        
+        if (OB_ISNULL(start_key_objs) || OB_ISNULL(end_key_objs)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("null key objs in original range", K(ret));
+        } else if (orig_range.start_key_.get_obj_cnt() < 3) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid key obj count", K(ret), K(orig_range));
+        } else {
+          ObString start_rowkey_temp;
+          ObString end_rowkey_temp;
+          ObString previous_qualifier_temp;
+          
+          if (OB_FAIL(ob_write_string(allocator_, start_key_objs[0].get_varbinary(), start_rowkey_temp))) {
+            LOG_WARN("fail to deep copy start rowkey to temp", K(ret));
+          } else if (OB_FAIL(ob_write_string(allocator_, end_key_objs[0].get_varbinary(), end_rowkey_temp))) {
+            LOG_WARN("fail to deep copy end rowkey to temp", K(ret));
+          } else if (OB_FAIL(ob_write_string(allocator_, previous_qualifier_param, previous_qualifier_temp))) {
+            LOG_WARN("fail to deep copy previous qualifier to temp", K(ret));
+          } else {
+            // Now it's safe to reuse forward_range_alloc_ - we've saved all needed data
+            forward_range_alloc_.reuse();
+            
+            // Allocate new ObObj arrays from reused allocator
+            ObObj *new_start_objs = nullptr;
+            ObObj *new_end_objs = nullptr;
+            if (OB_ISNULL(new_start_objs = static_cast<ObObj *>(
+                    forward_range_alloc_.alloc(sizeof(ObObj) * 3)))) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+              LOG_WARN("fail to allocate start objs", K(ret));
+            } else if (OB_ISNULL(new_end_objs = static_cast<ObObj *>(
+                    forward_range_alloc_.alloc(sizeof(ObObj) * 3)))) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+              LOG_WARN("fail to allocate end objs", K(ret));
+            } else {
+              // Deep copy all string data from temp variables to forward_range_alloc_
+              ObString start_rowkey_clone;
+              ObString end_rowkey_clone;
+              ObString previous_qualifier_clone;
+              
+              if (OB_FAIL(ob_write_string(forward_range_alloc_, start_rowkey_temp, start_rowkey_clone))) {
+                LOG_WARN("fail to deep copy start rowkey", K(ret));
+              } else if (OB_FAIL(ob_write_string(forward_range_alloc_, end_rowkey_temp, end_rowkey_clone))) {
+                LOG_WARN("fail to deep copy end rowkey", K(ret));
+              } else if (OB_FAIL(ob_write_string(forward_range_alloc_, previous_qualifier_temp, previous_qualifier_clone))) {
+                LOG_WARN("fail to deep copy previous qualifier", K(ret));
+              } else {
+                // Start: [rowkey, previous_qualifier, max] - open interval (exclusive)
+                new_start_objs[0].set_varbinary(start_rowkey_clone);
+                new_start_objs[0].set_collation_type(CS_TYPE_BINARY);
+                new_start_objs[1].set_varbinary(previous_qualifier_clone);
+                new_start_objs[1].set_collation_type(CS_TYPE_BINARY);
+                new_start_objs[2].set_max_value();
+                
+                // End: [rowkey, max, max]
+                new_end_objs[0].set_varbinary(end_rowkey_clone);
+                new_end_objs[0].set_collation_type(CS_TYPE_BINARY);
+                new_end_objs[1].set_max_value();
+                new_end_objs[2].set_max_value();
+                
+                scan_range.start_key_.assign(new_start_objs, 3);
+                scan_range.end_key_.assign(new_end_objs, 3);
+              }
+            }
+          }
+          
+          if (OB_SUCC(ret)) {
+            // Set border flag: left side is open (exclusive), right side is inclusive
+            scan_range.border_flag_ = orig_range.border_flag_;
+            scan_range.border_flag_.unset_inclusive_start();  // Open interval on left
+            scan_range.border_flag_.set_inclusive_end();
+            // For wildcard mode with limit=1 optimization:
+            // Get the next qualifier with limit=1. If OB_ITER_END is returned, it means we've scanned 
+            // to [rowkey, max, max], no more qualifiers. The next iteration will naturally handle 
+            // the end condition when trying to rescan for the next qualifier.
+            tb_ctx.set_limit(1);
+            ObNewRow *first_row = nullptr;
+            if (OB_FAIL(rescan_and_get_next_row(child_op_, first_row))) {
+              if (OB_ITER_END != ret) {
+                LOG_WARN("fail to rescan for next qualifier wildcard", K(ret), K(previous_qualifier_temp));
+              }
+              // OB_ITER_END means we've scanned to [rowkey, max, max], no more qualifiers
+            } else {
+              curr_cell_.set_ob_row(first_row);
+            }
+          }
+        }
+      }
+    }
+  }
+  
+  return ret;
+}
+
+int ObHTableRowIterator::move_to_next_qualifier_and_rescan(bool &loop, const ObString &previous_qualifier)
+{
+  int ret = OB_SUCCESS;
+  if (is_wildcard_mode_) {
+    if (OB_FAIL(rescan_for_next_qualifier_wildcard(previous_qualifier))) {
+      if (OB_ITER_END == ret) {
+        // No more qualifiers
+        loop = false;
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("fail to rescan for next qualifier wildcard", K(ret));
+      }
+    }
+  } else {
+    // Explicit qualifiers mode
+    const ObIArray<ObString> &qualifiers = htable_filter_.get_columns();
+    current_qualifier_idx_++;
+    if (current_qualifier_idx_ < qualifiers.count()) {
+      ObString next_qualifier = qualifiers.at(current_qualifier_idx_);
+      if (OB_FAIL(rescan_for_qualifier(next_qualifier))) {
+        LOG_WARN("fail to rescan for next qualifier", K(ret), K(next_qualifier), K_(current_qualifier_idx));
+      }
+    } else {
+      // All qualifiers processed
+      loop = false;
+    }
+  }
+
+  return ret;
+}
+
+template <typename ResultType>
+int ObHTableRowIterator::get_next_result_internal_with_get_optimization(ResultType*& result)
+{
+  int ret = OB_SUCCESS;
+  bool loop = true;
+  ObHTableMatchCode match_code = ObHTableMatchCode::DONE_SCAN;
+  const ObIArray<ObString> &qualifiers = htable_filter_.get_columns();
+  int64_t qualifier_count = qualifiers.count();
+  
+  // Initialize column_tracker_ and matcher_ before using them
+  if (OB_SUCC(ret) && NULL == column_tracker_) {
+    // first iteration
+    if (htable_filter_.get_columns().count() <= 0) {
+      column_tracker_ = &column_tracker_wildcard_;
+    } else {
+      column_tracker_ = &column_tracker_explicit_;
+    }
+    if (OB_FAIL(column_tracker_->init(htable_filter_))) {
+      LOG_WARN("failed to init column tracker", K(ret));
+    } else {
+      if (time_to_live_ > 0) {
+        column_tracker_->set_ttl(time_to_live_);
+      }
+      if (max_version_ > 0 && !htable_filter_.is_keep_max_versions()) {
+        int32_t real_max_version = std::min(column_tracker_->get_max_version(), max_version_);
+        column_tracker_->set_max_version(real_max_version);
+      }
+    }
+  }
+  if (OB_SUCC(ret) && NULL == matcher_) {
+    matcher_ = &matcher_impl_;
+    matcher_->init(column_tracker_, hfilter_);
+  }
+  
+  // For wildcard_mode, current_qualifier_idx_ is -1, so we only check loop
+  // For explicit mode, check both loop and current_qualifier_idx_ < qualifier_count
+  while (OB_SUCC(ret) && loop && (is_wildcard_mode_ || current_qualifier_idx_ < qualifier_count)) {
+    // Get cell for current qualifier if not already set
+    if (NULL == curr_cell_.get_ob_row()) {
+      if (is_wildcard_mode_) {
+        // Wildcard mode: get next cell from iterator
+        if (OB_FAIL(next_cell())) {
+          if (OB_ITER_END == ret) {
+            // No more data for this rowkey
+            loop = false;
+            ret = OB_SUCCESS;
+          } else {
+            LOG_WARN("fail to get cell in wildcard mode", K(ret));
+          }
+          continue;
+        }
+      } else {
+        if (0 == current_qualifier_idx_) {
+          // For the first qualifier (idx == 0), the scan range has already been optimized
+          // in check_and_apply_get_optimization, so we can directly get cell from iterator
+          if (OB_FAIL(next_cell())) {
+            if (OB_ITER_END == ret) {
+              // No data for this qualifier, move to next
+              ObString previous_qualifier;
+              while (OB_ITER_END == ret && loop) {
+                ret = OB_SUCCESS;
+                has_more_cells_ = true;
+                if (OB_FAIL(move_to_next_qualifier_and_rescan(loop, previous_qualifier))) {
+                  if (OB_ITER_END != ret) {
+                    LOG_WARN("fail to move to next qualifier", K(ret));
+                  }
+                }
+              }
+              if (OB_SUCC(ret) && !loop) {
+                has_more_cells_ = false;
+              }
+              continue;
+            } else {
+              LOG_WARN("fail to get cell in explicit mode", K(ret));
+            }
+          }
+        } else {
+          // Explicit qualifiers mode: rescan for current qualifier
+          ObString qualifier = qualifiers.at(current_qualifier_idx_);
+          if (OB_FAIL(rescan_for_qualifier(qualifier))) {
+            if (OB_ITER_END == ret) {
+              // No data for this qualifier, move to next
+              ret = OB_SUCCESS;
+              current_qualifier_idx_++;
+              continue;
+            } else {
+              LOG_WARN("fail to rescan for qualifier", K(ret), K(qualifier), K_(current_qualifier_idx));
+            }
+          }
+        }
+      }
+    }
+    
+    // Validate cell with matcher
+    match_code = ObHTableMatchCode::DONE_SCAN;
+    curr_cell_.set_family(family_name_);
+    
+    if (OB_SUCC(ret) && matcher_->is_curr_row_empty()) {
+      count_per_row_ = 0;
+      ret = matcher_->set_to_new_row(curr_cell_);
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(matcher_->match(curr_cell_, match_code))) {
+      LOG_WARN("failed to match cell", K(ret));
+    } else {
+      if (ObHTableMatchCode::INCLUDE == match_code ||
+          ObHTableMatchCode::INCLUDE_AND_SEEK_NEXT_ROW == match_code ||
+          ObHTableMatchCode::INCLUDE_AND_SEEK_NEXT_COL == match_code) {
+        if (NULL != hfilter_) {
+          if (OB_FAIL(hfilter_->transform_cell(allocator_, curr_cell_))) {
+            LOG_WARN("failed to transform cell", K(ret));
+          }
+        }
+        
+        if (OB_SUCC(ret)) {
+          ++count_per_row_;
+          
+          if (count_per_row_ > offset_per_row_per_cf_) {
+            int64_t timestamp = 0;
+            if (OB_FAIL(curr_cell_.get_ob_row()->get_cell(ObHTableConstants::COL_IDX_T).get_int(timestamp))) {
+              LOG_WARN("failed to get timestamp", K(ret));
+            } else {
+              const_cast<ObNewRow*>(curr_cell_.get_ob_row())->get_cell(ObHTableConstants::COL_IDX_T).set_int(-timestamp);
+            }
+            if (OB_SUCC(ret)) {
+              if (OB_FAIL(add_new_row(*(curr_cell_.get_ob_row()), result))) {
+                LOG_WARN("failed to add cell to result", K(ret));
+              } else {
+                scanner_context_->increment_batch_progress(1);
+                scanner_context_->increment_size_progress(curr_cell_.get_ob_row()->get_serialize_size());
+                ++cell_count_;
+              }
+            }
+          }
+        }
+        
+        // Move to next qualifier after processing current one
+        if (OB_SUCC(ret)) {
+          // Optimization: if single qualifier hint is set and we're in wildcard mode,
+          // skip the rescan and directly return after getting the first result
+          if (is_wildcard_mode_ && OB_NOT_NULL(query_) && query_->is_query_with_single_qualifier_hint()) {
+            // Only one cell expected, so we can finish after getting the first result
+            loop = false;
+          } else {
+            ObString previous_qualifier;
+            if (is_wildcard_mode_ && NULL != curr_cell_.get_ob_row()) {
+              previous_qualifier = curr_cell_.get_ob_row()->get_cell(ObHTableConstants::COL_IDX_Q).get_varbinary();
+            }
+            curr_cell_.set_ob_row(nullptr);
+            if (OB_FAIL(move_to_next_qualifier_and_rescan(loop, previous_qualifier))) {
+              if (OB_ITER_END == ret) {
+                ret = OB_SUCCESS;
+              } else {
+                LOG_WARN("fail to move to next qualifier", K(ret));
+              }
+            }
+          }
+        }
+      } else {
+        // For Get optimization with limit=1, other match codes indicate no data for this qualifier
+        // Move to next qualifier
+        ObString previous_qualifier;
+        if (is_wildcard_mode_ && NULL != curr_cell_.get_ob_row()) {
+          previous_qualifier = curr_cell_.get_ob_row()->get_cell(ObHTableConstants::COL_IDX_Q).get_varbinary();
+        }
+        curr_cell_.set_ob_row(nullptr);
+        if (OB_FAIL(move_to_next_qualifier_and_rescan(loop, previous_qualifier))) {
+          if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
+          } else {
+            LOG_WARN("fail to move to next qualifier", K(ret));
+          }
+        }
+      }
+    }
+  }  // end while
+
+  if (OB_SUCC(ret)) {
+    if (is_wildcard_mode_) {
+      // In wildcard_mode, loop=false means no more data
+      has_more_cells_ = loop;
+      if (!loop) {
+        ret = OB_ITER_END;
+      }
+    } else {
+      // In explicit mode, check if all qualifiers are processed
+      if (current_qualifier_idx_ >= qualifier_count) {
+        has_more_cells_ = false;
+        ret = OB_ITER_END;
+      }
+    }
+  }
+
+  if (OB_ITER_END == ret) {
+    ret = OB_SUCCESS;
+  }
+  
+  return ret;
+}
+
+
+bool ObHTableRowIterator::is_legal_family_name(const ObString &family_name)
+{
+  bool is_legal = true;
+  if (family_name.empty() || family_name.ptr()[0] == '.') {
+    is_legal = false;
+  } else {
+    const char *str_ptr = family_name.ptr();
+    int64_t str_len = family_name.length();
+    bool has_illegal_char = false;
+    
+    for (int64_t i = 0; i < str_len && !has_illegal_char; i++) {
+      char c = str_ptr[i];
+      if (c >= 0 && c < 32) {  // Control character
+        has_illegal_char = true;
+      } else if (c == ':' || c == '\\' || c == '/') {
+        has_illegal_char = true;
+      }
+    }
+    
+    if (has_illegal_char) {
+      is_legal = false;
+    } else if (family_name.case_compare("recovered.edits") == 0) {
+      // Apache Hbase not allow "recovered.edits" as family name
+      // byte[] recoveredEdit = Bytes.toBytes(HConstants.RECOVERED_EDITS_DIR);
+      // if (Bytes.equals(recoveredEdit, b)) {
+      //   throw new IllegalArgumentException(
+      //     "Column Family name cannot be: " + HConstants.RECOVERED_EDITS_DIR);
+      // }
+      is_legal = false;
+    }
+  }
+  
+  return is_legal;
+}

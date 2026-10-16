@@ -1,0 +1,101 @@
+/**
+ * Copyright (c) 2022 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX STORAGE_COMPACTION
+#include "storage/compaction/ob_compaction_trans_cache.h"
+
+namespace oceanbase
+{
+using namespace storage;
+namespace compaction
+{
+/*
+ *  ---------------------------------------------ObCachedTransStateMgr----------------------------------------------
+ */
+
+int ObCachedTransStateMgr::init(int64_t max_cnt)
+{
+  int ret = OB_SUCCESS;
+  if (IS_INIT) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("ObCachedTransStateMgr has already been initiated", K(ret));
+  } else if (max_cnt <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("max count is invalid", K(ret), K(max_cnt));
+  } else {
+    void *buf = nullptr;
+    if (OB_ISNULL(buf = allocator_.alloc(max_cnt * sizeof(ObMergeCachedTransState)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate memory", K(ret), K(max_cnt),
+          "alloc_size", max_cnt * sizeof(ObMergeCachedTransState));
+    } else {
+      array_ = new(buf) ObMergeCachedTransState[max_cnt]();
+      max_cnt_ = max_cnt;
+      is_inited_ = true;
+    }
+  }
+  return ret;
+}
+
+void ObCachedTransStateMgr::destroy()
+{
+  if (OB_NOT_NULL(array_)) {
+    allocator_.free(array_);
+    array_ = nullptr;
+  }
+  is_inited_ = false;
+}
+
+int ObCachedTransStateMgr::get_trans_state(
+  const transaction::ObTransID &trans_id,
+  const transaction::ObTxSEQ &sql_seq,
+  ObMergeCachedTransState &trans_state)
+{
+  int ret = OB_SUCCESS;
+  ObMergeCachedTransKey key(trans_id, sql_seq);
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ObCachedTransStateMgr is not initialized", K(ret));
+  } else if (!key.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid key", K(ret), K(key));
+  } else {
+    uint64_t idx = cal_idx(key);
+    if (array_[idx].key_ == key && array_[idx].is_valid()) {
+      trans_state = array_[cal_idx(key)];
+      ++hit_cnt_;
+    } else {
+      ret = OB_HASH_NOT_EXIST;
+      ++miss_cnt_;
+    }
+  }
+  return ret;
+}
+
+int ObCachedTransStateMgr::add_trans_state(
+  const transaction::ObTransID &trans_id,
+  const transaction::ObTxSEQ &sql_seq,
+  const int64_t commited_trans_version,
+  const int32_t trans_state,
+  const int16_t can_read,
+  const share::SCN &end_scn)
+{
+  int ret = OB_SUCCESS;
+  ObMergeCachedTransKey key(trans_id, sql_seq);
+  ObMergeCachedTransState status(trans_id, sql_seq, commited_trans_version, trans_state, can_read, end_scn);
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ObCachedTransStateMgr is not initialized", K(ret));
+  } else if (!status.is_valid()) {
+    ret = OB_INVALID_ARGUMENT; 
+    LOG_ERROR("invalid trans state", K(ret), K(status));
+  } else {
+    array_[cal_idx(key)] = status;
+  }
+  return ret;
+}
+
+} // namespace compaction
+} // namespace oceanbase

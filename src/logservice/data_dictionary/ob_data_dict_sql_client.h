@@ -1,0 +1,70 @@
+/**
+ * Copyright (c) 2022 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_DICT_SERVICE_DATA_DICTIONARY_SQL_CLIENT_
+#define OCEANBASE_DICT_SERVICE_DATA_DICTIONARY_SQL_CLIENT_
+
+#include "lib/mysqlclient/ob_mysql_result.h"    // ObMySQLResult
+#include "logservice/palf/lsn.h"                // LSN
+#include "share/scn.h"                // SCN
+#include "share/ob_ls_id.h"                     // ObLSArray
+
+namespace oceanbase
+{
+namespace common
+{
+ class ObMySQLProxy;
+}
+namespace datadict
+{
+
+class ObDataDictSqlClient
+{
+public:
+  ObDataDictSqlClient();
+  ~ObDataDictSqlClient() { destroy(); }
+public:
+  int init(common::ObMySQLProxy *sql_client);
+  void destroy();
+public:
+  int get_ls_info(
+      const uint64_t tenant_id,
+      const share::SCN &snapshot_scn,
+      share::ObLSArray &ls_array);
+  int get_schema_version(
+      const uint64_t tenant_id,
+      const share::SCN &snapshot_scn,
+      int64_t &schema_version);
+public:
+  int report_data_dict_persist_info(
+      const uint64_t tenant_id,
+      const share::SCN &snapshot_scn,
+      const palf::LSN &start_lsn,
+      const palf::LSN &end_lsn);
+  int recycle_hisotry_dict_info(
+      const uint64_t tenant_id,
+      const share::SCN &recycle_until_scn,
+      int64_t &recycle_count);
+  int check_has_data_dict_record(
+      const uint64_t tenant_id,
+      bool &has_record);
+private:
+  static const char *query_tenant_schema_version_sql_format;
+  static const char *report_data_dict_persist_info_sql_format;
+  static const char *recycle_dict_history_sql_format;
+  static const char *check_has_data_dict_record_sql_format;
+private:
+  int parse_record_from_row_(
+      common::sqlclient::ObMySQLResult &result,
+      int64_t &record_count,
+      int64_t &schema_version);
+private:
+  bool is_inited_;
+  common::ObMySQLProxy *sql_proxy_;
+};
+
+} // namespace datadict
+} // namespace oceanbase
+#endif

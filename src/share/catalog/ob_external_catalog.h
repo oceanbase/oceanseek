@@ -1,0 +1,291 @@
+/**
+ * Copyright (c) 2023 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef __SHARE_OB_EXTERNAL_CATALOG_H__
+#define __SHARE_OB_EXTERNAL_CATALOG_H__
+#include "lib/allocator/ob_allocator.h"
+#include "lib/container/ob_iarray.h"
+#include "share/catalog/ob_catalog_properties.h"
+#include "share/catalog/ob_time_travel_info.h"
+#include "share/schema/ob_table_schema.h"
+#include "share/stat/catalog/ob_catalog_stat_define.h"
+
+#include <optional>
+
+namespace oceanbase
+{
+namespace sql
+{
+class ObSqlSchemaGuard;
+} // namespace sql
+namespace share
+{
+
+struct CatalogPartitionValues;
+class ObCatalogLocationSchemaProvider;
+class ObOptCatalogTableStat;
+class ObOptCatalogColumnStat;
+
+class ObILakeTableMetadata
+{
+public:
+  explicit ObILakeTableMetadata(ObIAllocator &allocator) : allocator_(allocator) {
+  }
+  virtual ~ObILakeTableMetadata() = default;
+  virtual ObLakeTableFormat get_format_type() const = 0;
+  virtual common::ObString get_plugin_name() const { return common::ObString(); }
+  // The plugin identity (which .so backs this table) is encoded in get_format_type()
+  // itself: a plugin-placeholder range value encodes the plugin slot. There is no
+  // separate plugin name/slot field on the metadata — the enum value is the identity.
+  virtual bool is_ext_plugin_metadata() const { return false; }
+  virtual int64_t get_convert_size() const = 0;
+  int init(const uint64_t tenant_id,
+           const uint64_t catalog_id,
+           const uint64_t database_id,
+           const uint64_t table_id,
+           const ObString &namespace_name,
+           const ObString &table_name,
+           const ObNameCaseMode case_mode);
+  int assign(const ObILakeTableMetadata &other);
+  int build_table_schema(std::optional<int32_t> schema_id,
+                         std::optional<int64_t> snapshot_id,
+                         share::schema::ObTableSchema *&table_schema);
+  static int destroy(ObIAllocator &allocator, ObILakeTableMetadata *&lake_table_metadata);
+  virtual int resolve_time_travel_info(const ObTimeTravelInfo *time_travel_info,
+                                       std::optional<int32_t> &schema_id,
+                                       std::optional<int64_t> &snapshot_id);
+  TO_STRING_KV(K_(tenant_id),
+               K_(catalog_id),
+               K_(database_id),
+               K_(table_id),
+               K_(namespace_name),
+               K_(table_name),
+               K_(case_mode));
+
+  uint64_t tenant_id_;
+  uint64_t catalog_id_;
+  uint64_t database_id_;
+  uint64_t table_id_;
+  ObString namespace_name_;
+  ObString table_name_;
+  ObNameCaseMode case_mode_;
+  int64_t lake_table_metadata_version_ = 0; // used to identify cached lake table metadata version
+protected:
+  virtual int do_build_table_schema(std::optional<int32_t> schema_id,
+                                    std::optional<int64_t> snapshot_id,
+                                    share::schema::ObTableSchema *&table_schema) = 0;
+  ObIAllocator &allocator_;
+};
+
+class ObIExternalCatalog
+{
+public:
+  virtual ~ObIExternalCatalog() = default;
+  int init(const uint64_t tenant_id,
+           const uint64_t catalog_id,
+           const common::ObString &properties,
+           const ObCatalogLocationSchemaProvider *location_schema_provider = NULL);
+  virtual ObCatalogProperties::CatalogType get_catalog_type() const = 0;
+  virtual int list_namespace_names(common::ObIArray<common::ObString> &ns_names) = 0;
+  virtual int list_table_names(const common::ObString &db_name,
+                               const ObNameCaseMode case_mode,
+                               common::ObIArray<common::ObString> &tbl_names) = 0;
+  // if namespace not found, return OB_ERR_BAD_DATABASE
+  virtual int fetch_namespace_schema(const uint64_t database_id,
+                                     const common::ObString &ns_name,
+                                     const ObNameCaseMode case_mode,
+                                     share::schema::ObDatabaseSchema *&database_schema) = 0;
+  // if table not found, return OB_TABLE_NOT_EXIST
+  // must use allocator from function's parameter to create ObILakeTableMetadata*
+  virtual int fetch_lake_table_metadata(ObIAllocator &allocator,
+                                        const uint64_t database_id,
+                                        const uint64_t table_id,
+                                        const common::ObString &ns_name,
+                                        const common::ObString &tbl_name,
+                                        const ObNameCaseMode case_mode,
+                                        ObILakeTableMetadata *&table_metadata) = 0;
+
+  // 如果 partition_values 为空，则代表获取所有分区列的统计信息
+  // 如果 column_names 为空，则代表获取所有列的统计信息
+  // 如果 partition_values 为空，则对于分区表返回所有分区粒度统计；非分区表返回整表统计。
+  // 如果 partition_values 有值，则返回这些分区粒度的 table/column 统计信息。
+  virtual int fetch_table_statistics(ObIAllocator &allocator,
+                                     sql::ObSqlSchemaGuard &sql_schema_guard,
+                                     const ObILakeTableMetadata *table_metadata,
+                                     const ObIArray<ObString> &partition_values,
+                                     const ObIArray<ObString> &column_names,
+                                     ObIArray<ObOptCatalogTableStat *> &catalog_table_stats,
+                                     ObIArray<ObOptCatalogColumnStat *> &catalog_table_column_stats);
+
+  virtual int fetch_partitions(ObIAllocator &allocator,
+                               const ObILakeTableMetadata *table_metadata,
+                               const ObIArray<ObString> &part_col_names,
+                               ObIArray<common::ObCatalogExtPartitionInfo> &partition_infos)
+  {
+    UNUSED(table_metadata);
+    UNUSED(part_col_names);
+    UNUSED(partition_infos);
+    return OB_NOT_SUPPORTED;
+  }
+
+  // if table not found, return OB_TABLE_NOT_EXIST
+  virtual int fetch_latest_table_schema_version(const common::ObString &ns_name,
+                                                const common::ObString &tbl_name,
+                                                const ObNameCaseMode case_mode,
+                                                int64_t &schema_version) = 0;
+
+  virtual int get_cache_refresh_interval_sec(int64_t &sec);
+
+  virtual int create_namespace(const common::ObString &ns_name);
+  virtual int drop_namespace(const common::ObString &ns_name, bool delete_data, bool cascade);
+  virtual int create_table(const common::ObString &db_name,
+                           const share::schema::ObTableSchema &table_schema);
+  virtual int alter_table(const common::ObString &db_name,
+                          const share::schema::ObTableSchema &table_schema);
+  virtual int rename_table(const common::ObString &origin_db_name,
+                           const common::ObString &origin_table_name,
+                           const common::ObString &new_db_name,
+                           const common::ObString &new_table_name,
+                           const share::schema::ObTableSchema &table_schema);
+  virtual int reconcile_partitions(
+      const common::ObString &db_name,
+      const share::schema::ObTableSchema &table_schema,
+      const common::ObIArray<CatalogPartitionValues> &expected_partition_values);
+  virtual int drop_table(const common::ObString &db_name, const common::ObString &table_name);
+
+protected:
+  virtual int do_init(const common::ObString &properties) = 0;
+
+protected:
+  uint64_t tenant_id_;
+  uint64_t catalog_id_;
+  const ObCatalogLocationSchemaProvider *location_schema_provider_ = NULL;
+};
+
+class ObICatalogMetaGetter
+{
+public:
+  virtual ~ObICatalogMetaGetter() = default;
+  virtual int list_namespace_names(const uint64_t tenant_id,
+                                   const uint64_t catalog_id,
+                                   common::ObIArray<common::ObString> &ns_names) = 0;
+  virtual int list_table_names(const uint64_t tenant_id,
+                               const uint64_t catalog_id,
+                               const common::ObString &ns_name,
+                               const ObNameCaseMode case_mode,
+                               common::ObIArray<common::ObString> &tbl_names) = 0;
+  virtual int fetch_namespace_schema(const uint64_t tenant_id,
+                                     const uint64_t catalog_id,
+                                     const uint64_t database_id,
+                                     const common::ObString &ns_name,
+                                     const ObNameCaseMode case_mode,
+                                     share::schema::ObDatabaseSchema *&database_schema) = 0;
+  virtual int fetch_lake_table_metadata(ObIAllocator &allocator,
+                                        const uint64_t tenant_id,
+                                        const uint64_t catalog_id,
+                                        const uint64_t database_id,
+                                        const uint64_t table_id,
+                                        const common::ObString &ns_name,
+                                        const common::ObString &tbl_name,
+                                        const ObNameCaseMode case_mode,
+                                        ObILakeTableMetadata *&table_metadata) = 0;
+
+  virtual int fetch_table_statistics(ObIAllocator &allocator,
+                                     sql::ObSqlSchemaGuard &sql_schema_guard,
+                                     const ObILakeTableMetadata *table_metadata,
+                                     const ObIArray<ObString> &partition_values,
+                                     const ObIArray<ObString> &column_names,
+                                     common::ObIArray<share::ObOptCatalogTableStat *> &catalog_table_stats,
+                                     common::ObIArray<share::ObOptCatalogColumnStat *> &catalog_table_column_stats) = 0;
+
+  virtual int fetch_partitions(ObIAllocator &allocator,
+                               const ObILakeTableMetadata *table_metadata,
+                               const ObIArray<ObString> &part_col_names,
+                               ObIArray<common::ObCatalogExtPartitionInfo> &partition_infos)
+  {
+    UNUSED(table_metadata);
+    UNUSED(part_col_names);
+    UNUSED(partition_infos);
+    return OB_NOT_SUPPORTED;
+  }
+
+  virtual int get_cache_refresh_interval_sec(const ObILakeTableMetadata *table_metadata,
+                                             int64_t &sec)
+      = 0;
+};
+
+// write-side counterpart of ObICatalogMetaGetter: DDL operations on external catalogs (HMS, etc.)
+class ObICatalogMetaWriter
+{
+public:
+  virtual ~ObICatalogMetaWriter() = default;
+  virtual int create_namespace(const uint64_t tenant_id,
+                               const uint64_t catalog_id,
+                               const common::ObString &ns_name) = 0;
+  virtual int drop_namespace(const uint64_t tenant_id,
+                             const uint64_t catalog_id,
+                             const common::ObString &ns_name,
+                             bool delete_data,
+                             bool cascade) = 0;
+  virtual int create_table(const uint64_t tenant_id,
+                           const uint64_t catalog_id,
+                           const common::ObString &db_name,
+                           const share::schema::ObTableSchema &table_schema) = 0;
+  virtual int alter_table(const uint64_t tenant_id,
+                          const uint64_t catalog_id,
+                          const common::ObString &db_name,
+                          const share::schema::ObTableSchema &table_schema) = 0;
+  virtual int rename_table(const uint64_t tenant_id,
+                           const uint64_t catalog_id,
+                           const common::ObString &origin_db_name,
+                           const common::ObString &origin_table_name,
+                           const common::ObString &new_db_name,
+                           const common::ObString &new_table_name,
+                           const share::schema::ObTableSchema &table_schema) = 0;
+  virtual int reconcile_partitions(
+      const uint64_t tenant_id,
+      const uint64_t catalog_id,
+      const common::ObString &db_name,
+      const share::schema::ObTableSchema &table_schema,
+      const common::ObIArray<CatalogPartitionValues> &expected_partition_values)
+      = 0;
+  virtual int drop_table(const uint64_t tenant_id,
+                         const uint64_t catalog_id,
+                         const common::ObString &db_name,
+                         const common::ObString &table_name) = 0;
+};
+
+// shared cache entry used by both the meta getter and the meta writer
+class CatalogEntry
+{
+public:
+  CatalogEntry()
+  {
+  }
+  CatalogEntry(const uint64_t tenant_id, const uint64_t catalog_id, ObIExternalCatalog *catalog)
+      : tenant_id_(tenant_id), catalog_id_(catalog_id), catalog_(catalog)
+  {
+  }
+  TO_STRING_EMPTY();
+  uint64_t tenant_id_ = OB_INVALID_ID;
+  uint64_t catalog_id_ = OB_INVALID_ID;
+  ObIExternalCatalog *catalog_ = NULL;
+};
+
+class ObIExternalTableMetadataOperations
+{
+  virtual int current(const ObString &ns_name,
+                      const ObString &tbl_name,
+                      ObILakeTableMetadata *&metadata) = 0;
+  virtual int commit(const ObString &ns_name,
+                     const ObString &table_name,
+                     const ObILakeTableMetadata *previous,
+                     const ObILakeTableMetadata *latest) = 0;
+};
+
+} // namespace share
+} // namespace oceanbase
+
+#endif // __SHARE_OB_EXTERNAL_CATALOG_H__

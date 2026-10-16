@@ -1,0 +1,70 @@
+/**
+ * Copyright (c) 2025 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_SRC_PL_SYS_PACKAGE_DBMS_AI_SERVICE_H_
+#define OCEANBASE_SRC_PL_SYS_PACKAGE_DBMS_AI_SERVICE_H_
+ 
+ 
+#include "sql/ob_sql_define.h"
+#include "lib/json_type/ob_json_base.h"
+#include "sql/privilege_check/ob_ai_model_priv_util.h"
+
+namespace oceanbase
+{
+
+namespace common
+{
+
+class ObObj;
+
+} // namespace common
+
+namespace pl
+{
+
+class ObPLExecCtx;
+
+class ObDBMSAiService
+{
+public:
+  static int create_ai_model(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result);
+  static int drop_ai_model(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result);
+
+  static int create_ai_model_endpoint(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result);
+  static int alter_ai_model_endpoint(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result);
+  static int drop_ai_model_endpoint(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result);
+
+  // ai provider
+  static int register_provider(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result);
+  static int unregister_provider(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result);
+  static int alter_provider(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result);
+
+  // ai gateway
+  static int create_ai_gateway(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result);
+  static int alter_ai_gateway(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result);
+  static int drop_ai_gateway(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result);
+
+  // ai model profile (upsert via ALTER only)
+  static int alter_model_profile(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result);
+  static int drop_model_profile(ObPLExecCtx &ctx, sql::ParamStore &params, common::ObObj &result);
+private:
+  static int precheck_version_and_param_count_(int expect_param_count, sql::ParamStore &params);
+  static int precheck_version_and_param_count_v2(int expect_param_count, sql::ParamStore &params);
+  static int get_json_base_(ObArenaAllocator &allocator, sql::ParamStore &params, common::ObIJsonBase *&j_base);
+  static int check_ai_model_privilege_(ObPLExecCtx &ctx, ObPrivSet required_priv);
+  static int check_ai_object_priv_(ObPLExecCtx &ctx, ObPrivSet required_priv, bool is_provider);
+  static int check_ai_provider_priv_(ObPLExecCtx &ctx, ObPrivSet required_priv);
+  static int check_ai_gateway_priv_(ObPLExecCtx &ctx, ObPrivSet required_priv);
+  static int validate_gateway_endpoint_json_(common::ObIAllocator &allocator,
+                                             common::ObIJsonBase &j_base,
+                                             common::ObString &endpoints_str,
+                                             common::ObString &circuit_breaker_str);
+};
+
+} // namespace pl
+} // namespace oceanbase
+ 
+#endif // OCEANBASE_SRC_PL_SYS_PACKAGE_DBMS_AI_SERVICE_H_
+ 

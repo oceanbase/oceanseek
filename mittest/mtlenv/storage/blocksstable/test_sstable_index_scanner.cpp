@@ -1,0 +1,681 @@
+/**
+ * Copyright (c) 2025 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX STORAGE
+
+#include "mtlenv/storage/blocksstable/ob_index_block_data_prepare.h"
+#include "storage/blocksstable/index_block/ob_index_block_row_scanner.h"
+#include "storage/blocksstable/index_block/ob_sstable_index_scanner.h"
+
+namespace oceanbase
+{
+using namespace storage;
+using namespace common;
+namespace blocksstable
+{
+
+class TestSSTableIndexScanner : public TestIndexBlockDataPrepare
+{
+public:
+  TestSSTableIndexScanner()
+    : TestIndexBlockDataPrepare("Test sstable index scanner", ObMergeType::MAJOR_MERGE, true)
+  {}
+  virtual ~TestSSTableIndexScanner() {}
+
+  virtual void SetUp();
+  // virtual void TearDown();
+
+  void prepare_scan_param(
+      const bool scan_root_level,
+      ObSSTableIndexScanParam &scan_param,
+      ObFixedArray<ObSkipIndexColMeta, ObIAllocator> &skip_index_projector);
+  void generate_range(const int64_t start_seed, const int64_t end_seed, ObDatumRange &range);
+  void generate_key(const int64_t seed, ObDatumRowkey &key);
+  void test_range_scan(const ObDatumRange &range, ObSSTableIndexScanner &index_scanner);
+private:
+  ObArenaAllocator datum_alloc_;
+  ObDatumRow start_key_buf_;
+  ObDatumRow end_key_buf_;
+  ObDatumRow rowkey_buf_;
+};
+
+void TestSSTableIndexScanner::SetUp()
+{
+  TestIndexBlockDataPrepare::SetUp();
+  ASSERT_EQ(OB_SUCCESS, start_key_buf_.init(datum_alloc_, TEST_COLUMN_CNT));
+  ASSERT_EQ(OB_SUCCESS, end_key_buf_.init(datum_alloc_, TEST_COLUMN_CNT));
+  ASSERT_EQ(OB_SUCCESS, rowkey_buf_.init(datum_alloc_, TEST_COLUMN_CNT));
+}
+
+void TestSSTableIndexScanner::generate_range(
+    const int64_t start_seed,
+    const int64_t end_seed,
+    ObDatumRange &range)
+{
+  ASSERT_EQ(OB_SUCCESS, row_generate_.get_next_row(start_seed, start_key_buf_));
+  ASSERT_EQ(OB_SUCCESS, row_generate_.get_next_row(end_seed, end_key_buf_));
+  range.start_key_.assign(start_key_buf_.storage_datums_, TEST_ROWKEY_COLUMN_CNT);
+  range.end_key_.assign(end_key_buf_.storage_datums_, TEST_ROWKEY_COLUMN_CNT);
+  range.border_flag_.set_inclusive_start();
+  range.border_flag_.set_inclusive_end();
+}
+
+void TestSSTableIndexScanner::generate_key(const int64_t seed, ObDatumRowkey &key)
+{
+  ASSERT_EQ(OB_SUCCESS, row_generate_.get_next_row(seed, rowkey_buf_));
+  key.assign(rowkey_buf_.storage_datums_, TEST_ROWKEY_COLUMN_CNT);
+}
+
+void TestSSTableIndexScanner::prepare_scan_param(
+    const bool scan_root_level,
+    ObSSTableIndexScanParam &scan_param,
+    ObFixedArray<ObSkipIndexColMeta, ObIAllocator> &skip_index_projector)
+{
+  prepare_query_param(false);
+  scan_param.query_flag_.set_use_block_cache();
+  scan_param.index_read_info_ = &read_info_;
+  skip_index_projector.init(0);
+  int64_t full_column_count = 0;
+  ASSERT_EQ(OB_SUCCESS, table_schema_.get_store_column_count(full_column_count, true));
+  const int64_t proj_cnt = 2 * full_column_count;
+  skip_index_projector.set_allocator(&allocator_);
+  ASSERT_EQ(OB_SUCCESS, skip_index_projector.init(proj_cnt));
+  for (int64_t i = 0; i < full_column_count; ++i) {
+    ObSkipIndexColMeta col_meta;
+    col_meta.col_idx_ = i;
+    col_meta.col_type_ = ObSkipIndexColType::SK_IDX_MIN;
+    ASSERT_EQ(OB_SUCCESS, skip_index_projector.push_back(col_meta));
+    col_meta.col_type_ = ObSkipIndexColType::SK_IDX_MAX;
+    ASSERT_EQ(OB_SUCCESS, skip_index_projector.push_back(col_meta));
+  }
+  scan_param.skip_index_projector_ = &skip_index_projector;
+  if (scan_root_level) {
+    scan_param.scan_level_ = ObSSTableIndexScanParam::ScanLevel::ROOT;
+  } else {
+    scan_param.scan_level_ = ObSSTableIndexScanParam::ScanLevel::LEAF;
+  }
+}
+
+void TestSSTableIndexScanner::test_range_scan(const ObDatumRange &range, ObSSTableIndexScanner &index_scanner)
+{
+  bool is_last_iter_endkey_beyond_range = false;
+  const ObSSTableIndexRow *index_row = nullptr;
+  const ObStorageDatumUtils &datum_utils = read_info_.get_datum_utils();
+  int tmp_ret = OB_SUCCESS;
+  while (OB_SUCCESS == tmp_ret) {
+    tmp_ret = index_scanner.get_next(index_row);
+    if (OB_SUCCESS == tmp_ret) {
+      int start_cmp_ret = 0;
+      int end_cmp_ret = 0;
+      ASSERT_EQ(OB_SUCCESS, index_row->endkey_->compare(range.start_key_, datum_utils, start_cmp_ret));
+      ASSERT_EQ(OB_SUCCESS, index_row->endkey_->compare(range.end_key_, datum_utils, end_cmp_ret));
+      ASSERT_TRUE(start_cmp_ret > 0);
+      if (end_cmp_ret > 0) {
+        ASSERT_FALSE(is_last_iter_endkey_beyond_range);
+        is_last_iter_endkey_beyond_range = true;
+      }
+    } else {
+      ASSERT_EQ(OB_ITER_END, tmp_ret);
+    }
+  }
+}
+
+TEST_F(TestSSTableIndexScanner, test_basic_scan_functionality)
+{
+  ObArenaAllocator tmp_arena;
+  ObDatumRange range;
+  range.set_whole_range();
+
+  ObSSTableIndexScanParam scan_param;
+  ObFixedArray<ObSkipIndexColMeta, ObIAllocator> proj;
+  prepare_scan_param(false, scan_param, proj);
+
+
+  ObSSTableIndexScanner index_scanner;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  int tmp_ret = OB_SUCCESS;
+  int iter_cnt = 0;
+  while (OB_SUCCESS == tmp_ret) {
+    const ObSSTableIndexRow *index_row = nullptr;
+    tmp_ret = index_scanner.get_next(index_row);
+    if (tmp_ret != OB_SUCCESS) {
+      ASSERT_EQ(OB_ITER_END, tmp_ret);
+    } else {
+      ASSERT_TRUE(nullptr != index_row);
+      ASSERT_EQ(index_row->skip_index_row_.get_column_count(), scan_param.skip_index_projector_->count());
+      iter_cnt++;
+      LOG_INFO("print index row", KPC(index_row->endkey_), K(index_row->skip_index_row_));
+    }
+  }
+  ASSERT_TRUE(iter_cnt > 0);
+
+  index_scanner.reset();
+  scan_param.scan_level_ = ObSSTableIndexScanParam::ScanLevel::ROOT;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  tmp_ret = OB_SUCCESS;
+  iter_cnt = 0;
+  while (OB_SUCCESS == tmp_ret) {
+    const ObSSTableIndexRow *index_row = nullptr;
+    tmp_ret = index_scanner.get_next(index_row);
+    if (tmp_ret != OB_SUCCESS) {
+      ASSERT_EQ(OB_ITER_END, tmp_ret);
+    } else {
+      ASSERT_TRUE(nullptr != index_row);
+      iter_cnt++;
+      LOG_INFO("print index row", KPC(index_row->endkey_), K(index_row->skip_index_row_));
+    }
+  }
+  ASSERT_TRUE(iter_cnt > 0);
+}
+
+TEST_F(TestSSTableIndexScanner, test_base_scanner_get_next_index_info)
+{
+  ObArenaAllocator tmp_arena;
+  ObDatumRange range;
+  range.set_whole_range();
+
+  ObSSTableIndexScanParam scan_param;
+  ObFixedArray<ObSkipIndexColMeta, ObIAllocator> proj;
+  prepare_scan_param(false, scan_param, proj);
+  scan_param.tablet_id_ = ObTabletID(1);
+
+  ObSSTableIndexBaseScanner base_scanner;
+  ASSERT_EQ(OB_SUCCESS, base_scanner.init(range, scan_param, sstable_, tmp_arena));
+
+  int tmp_ret = OB_SUCCESS;
+  int64_t iter_cnt = 0;
+  while (OB_SUCCESS == tmp_ret) {
+    ObMicroIndexInfo index_info;
+    tmp_ret = base_scanner.get_next(index_info);
+    if (OB_SUCCESS == tmp_ret) {
+      ASSERT_TRUE(index_info.is_data_block());
+      ++iter_cnt;
+    } else {
+      ASSERT_EQ(OB_ITER_END, tmp_ret);
+    }
+  }
+  ASSERT_GT(iter_cnt, 0);
+}
+
+TEST_F(TestSSTableIndexScanner, test_range_with_advance)
+{
+  ObArenaAllocator tmp_arena;
+  ObDatumRange range;
+
+  ObSSTableIndexScanParam scan_param;
+  ObFixedArray<ObSkipIndexColMeta, ObIAllocator> proj;
+  prepare_scan_param(false, scan_param, proj);
+
+  ObSSTableIndexScanner index_scanner;
+  int tmp_ret = OB_SUCCESS;
+
+  // test range scan
+  generate_range(min_row_seed_, max_row_seed_, range);
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  test_range_scan(range, index_scanner);
+
+  index_scanner.reset();
+  scan_param.scan_level_ = ObSSTableIndexScanParam::ScanLevel::ROOT;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  test_range_scan(range, index_scanner);
+
+  generate_range(max_row_seed_ / 2, max_row_seed_, range);
+  index_scanner.reset();
+  scan_param.scan_level_ = ObSSTableIndexScanParam::ScanLevel::LEAF;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  test_range_scan(range, index_scanner);
+
+  index_scanner.reset();
+  scan_param.scan_level_ = ObSSTableIndexScanParam::ScanLevel::ROOT;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  test_range_scan(range, index_scanner);
+
+  generate_range(min_row_seed_, max_row_seed_ / 2, range);
+  index_scanner.reset();
+  scan_param.scan_level_ = ObSSTableIndexScanParam::ScanLevel::LEAF;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  test_range_scan(range, index_scanner);
+
+  index_scanner.reset();
+  scan_param.scan_level_ = ObSSTableIndexScanParam::ScanLevel::ROOT;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  test_range_scan(range, index_scanner);
+
+  generate_range(max_row_seed_ / 3, (max_row_seed_ * 2)/ 3, range);
+  index_scanner.reset();
+  scan_param.scan_level_ = ObSSTableIndexScanParam::ScanLevel::LEAF;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  test_range_scan(range, index_scanner);
+
+  index_scanner.reset();
+  scan_param.scan_level_ = ObSSTableIndexScanParam::ScanLevel::ROOT;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  test_range_scan(range, index_scanner);
+
+  // test advance to interface
+  // normal advance
+  LOG_INFO("start test advance to interface");
+
+  ObDatumRowkey advance_key;
+  const ObSSTableIndexRow *index_row = nullptr;
+  int cmp_ret = 0;
+  generate_range(min_row_seed_, max_row_seed_, range);
+  index_scanner.reset();
+  generate_key(max_row_seed_ / 2, advance_key);
+  scan_param.scan_level_ = ObSSTableIndexScanParam::ScanLevel::LEAF;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  ASSERT_EQ(OB_SUCCESS, index_scanner.get_next(index_row));
+  ASSERT_EQ(OB_SUCCESS, index_scanner.advance_to(advance_key, true));
+  ASSERT_EQ(OB_SUCCESS, index_scanner.get_next(index_row));
+  ASSERT_EQ(OB_SUCCESS, index_row->endkey_->compare(advance_key, read_info_.get_datum_utils(), cmp_ret));
+  LOG_INFO("print advance key", K(advance_key), KPC(index_row->endkey_));
+  ASSERT_TRUE(cmp_ret >= 0);
+
+  generate_key(max_row_seed_, advance_key);
+  ASSERT_EQ(OB_SUCCESS, index_scanner.advance_to(advance_key, true));
+  ASSERT_EQ(OB_SUCCESS, index_scanner.get_next(index_row));
+  cmp_ret = 0;
+  ASSERT_EQ(OB_SUCCESS, index_row->endkey_->compare(advance_key, read_info_.get_datum_utils(), cmp_ret));
+  ASSERT_TRUE(cmp_ret >= 0);
+
+  generate_key(max_row_seed_ + 1, advance_key);
+  ASSERT_EQ(OB_SUCCESS, index_scanner.advance_to(advance_key, true));
+  ASSERT_EQ(OB_ITER_END, index_scanner.get_next(index_row));
+
+  index_scanner.reset();
+  scan_param.scan_level_ = ObSSTableIndexScanParam::ScanLevel::LEAF;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  generate_key(min_row_seed_, advance_key);
+  ASSERT_EQ(OB_SUCCESS, index_scanner.advance_to(advance_key, true));
+  ASSERT_EQ(OB_SUCCESS, index_scanner.get_next(index_row));
+  generate_key(max_row_seed_, advance_key);
+  ASSERT_EQ(OB_SUCCESS, index_scanner.advance_to(advance_key, true));
+  ASSERT_EQ(OB_SUCCESS, index_scanner.get_next(index_row));
+  ASSERT_EQ(OB_ITER_END, index_scanner.get_next(index_row));
+
+  index_scanner.reset();
+  generate_range(max_row_seed_ / 2, max_row_seed_, range);
+  scan_param.scan_level_ = ObSSTableIndexScanParam::ScanLevel::LEAF;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  generate_key(min_row_seed_, advance_key);
+  ASSERT_EQ(OB_SUCCESS, index_scanner.get_next(index_row));
+  ObDatumRowkey iter_endkey;
+  cmp_ret = 0;
+  ASSERT_EQ(OB_SUCCESS, index_row->endkey_->deep_copy(iter_endkey, tmp_arena));
+#ifndef OB_BUILD_PACKAGE
+  ASSERT_EQ(OB_INVALID_ARGUMENT, index_scanner.advance_to(advance_key, true));
+#endif
+
+  // advance to key beyond sstable range with query range beyond sstable range
+  index_scanner.reset();
+  generate_range(max_row_seed_ + 10, max_row_seed_ + 20, range);
+  scan_param.scan_level_ = ObSSTableIndexScanParam::ScanLevel::LEAF;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  generate_key(max_row_seed_ + 15, advance_key);
+  ASSERT_EQ(OB_SUCCESS, index_scanner.advance_to(advance_key, true));
+  ASSERT_EQ(OB_ITER_END, index_scanner.get_next(index_row));
+}
+
+// Regression test: when last_prefetch_key_ carries extra multi-version columns but
+// advance_to receives the business prefix key, the scanner should treat prefix-equal
+// keys as "not found in prefetched queue, continue on non-prefetch path" instead of
+// throwing "block contains advanced key already prefetched but not found".
+//
+// Before the fix, compare_datum_cnt=true makes the 6-col prefetched key compare greater
+// than the 2-col advance key, which enters the prefetched branch and ends with
+// OB_ERR_UNEXPECTED after the queue is exhausted. After the fix, this call should succeed.
+TEST_F(TestSSTableIndexScanner, test_advance_to_prefix_key_should_not_throw_unexpected)
+{
+  ObArenaAllocator tmp_arena;
+  ObDatumRange range;
+  generate_range(min_row_seed_, max_row_seed_, range);
+  ObSSTableIndexScanParam scan_param;
+  ObFixedArray<ObSkipIndexColMeta, ObIAllocator> proj;
+  prepare_scan_param(false, scan_param, proj);
+
+  ObSSTableIndexScanner index_scanner;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  const ObSSTableIndexRow *index_row = nullptr;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.get_next(index_row));
+  ASSERT_TRUE(nullptr != index_row);
+
+  ObSSTableIndexBlockLevelScanner *leaf =
+      index_scanner.base_scanner_.level_scanners_.at(index_scanner.base_scanner_.level_scanners_.count() - 1);
+  ASSERT_TRUE(nullptr != leaf);
+  ASSERT_FALSE(leaf->is_root_block_);
+
+  ASSERT_EQ(OB_SUCCESS, row_generate_.get_next_row(max_row_seed_, rowkey_buf_));
+  ObStorageDatum mv_datums[6];
+  for (int i = 0; i < 2; ++i) {
+    mv_datums[i] = rowkey_buf_.storage_datums_[i];
+  }
+  mv_datums[2].set_int(-100);
+  mv_datums[3].set_int(0);
+  mv_datums[4].set_int(-200);
+  mv_datums[5].set_int(0);
+  ObDatumRowkey mv_rowkey;
+  mv_rowkey.assign(mv_datums, 6);
+  leaf->last_prefetch_key_.set_compact_rowkey(&mv_rowkey);
+
+  ObDatumRowkey advance_key;
+  advance_key.assign(rowkey_buf_.storage_datums_, 2);
+
+  int ret = leaf->advance_to(advance_key, true);
+  ASSERT_EQ(OB_SUCCESS, ret);
+}
+
+TEST_F(TestSSTableIndexScanner, test_base_scanner_entered_new_leaf_flag_after_advance_to)
+{
+  ObArenaAllocator tmp_arena;
+  ObDatumRange range;
+  range.set_whole_range();
+
+  ObSSTableIndexScanParam scan_param;
+  ObFixedArray<ObSkipIndexColMeta, ObIAllocator> proj;
+  prepare_scan_param(false /*scan_root_level*/, scan_param, proj);
+  scan_param.tablet_id_ = ObTabletID(1);
+
+  // ── Phase 0: collect the endkey of the first row in leaf block 2 ───────────
+  // We scan the whole-range leaf view and watch for the second leaf-block crossing
+  // (the first crossing is always block 1 on the very first get_next()).
+  ObDatumRowkey block2_first_endkey;
+  {
+    ObSSTableIndexBaseScanner probe;
+    ASSERT_EQ(OB_SUCCESS, probe.init(range, scan_param, sstable_, tmp_arena));
+    ObMicroIndexInfo cur_info;
+    int crossings = 0;
+    int tmp_ret = OB_SUCCESS;
+    while (OB_SUCCESS == tmp_ret && crossings < 2) {
+      tmp_ret = probe.get_next(cur_info);
+      if (OB_SUCCESS == tmp_ret && probe.cur_entered_new_leaf_block()) {
+        ++crossings;
+      }
+    }
+    if (crossings < 2) {
+      LOG_INFO("sstable has only one leaf index block; skip block-crossing assertions");
+      return;
+    }
+    ASSERT_EQ(OB_SUCCESS, cur_info.endkey_.deep_copy(block2_first_endkey, tmp_arena));
+  }
+
+  // ── Scenario A: stale state cleared + same-block advance ──────────────────
+  // Advance_to() a key within the block we just entered via get_next() must
+  // flip the flag back to false (our fix: reset at entry, then override to
+  // false when read_idx_ is unchanged).
+  {
+    ObSSTableIndexBaseScanner scanner;
+    ASSERT_EQ(OB_SUCCESS, scanner.init(range, scan_param, sstable_, tmp_arena));
+    ObMicroIndexInfo cur_info;
+    int crossings = 0;
+    int tmp_ret = OB_SUCCESS;
+    while (OB_SUCCESS == tmp_ret && crossings < 2) {
+      tmp_ret = scanner.get_next(cur_info);
+      if (OB_SUCCESS == tmp_ret && scanner.cur_entered_new_leaf_block()) {
+        ++crossings;
+      }
+    }
+    ASSERT_EQ(OB_SUCCESS, tmp_ret);
+    ASSERT_TRUE(scanner.cur_entered_new_leaf_block());
+    ASSERT_EQ(OB_SUCCESS, scanner.advance_to(block2_first_endkey, true));
+    EXPECT_FALSE(scanner.cur_entered_new_leaf_block())
+        << "advance_to() within the same leaf block must clear the stale entered-new-leaf flag";
+  }
+
+  // ── Scenario B: cross-block advance_to() sets the flag ────────────────────
+  // Start in block 1. One get_next() opens block 1 and warms the prefetch
+  // queue so that block 2 is buffered. Advance_to() to block2_first_endkey
+  // then walks past block 1 into block 2 and must report the crossing.
+  {
+    ObSSTableIndexBaseScanner scanner;
+    ASSERT_EQ(OB_SUCCESS, scanner.init(range, scan_param, sstable_, tmp_arena));
+    ObMicroIndexInfo cur_info;
+    ASSERT_EQ(OB_SUCCESS, scanner.get_next(cur_info));        // enters block 1
+    ASSERT_TRUE(scanner.cur_entered_new_leaf_block());
+    ASSERT_EQ(OB_SUCCESS, scanner.advance_to(block2_first_endkey, true));
+    EXPECT_TRUE(scanner.cur_entered_new_leaf_block())
+        << "advance_to() across a leaf block boundary must set the entered-new-leaf flag";
+  }
+}
+
+// hold_cur_leaf_block() must hand out the handle of the leaf block the base scanner
+// currently sits on, and keep returning the same leaf block while iterating rows
+// inside that same leaf block (no crossing).
+TEST_F(TestSSTableIndexScanner, test_base_scanner_hold_cur_leaf_block)
+{
+  ObArenaAllocator tmp_arena;
+  ObDatumRange range;
+  range.set_whole_range();
+
+  ObSSTableIndexScanParam scan_param;
+  ObFixedArray<ObSkipIndexColMeta, ObIAllocator> proj;
+  prepare_scan_param(false, scan_param, proj);
+  scan_param.tablet_id_ = ObTabletID(1);
+
+  ObSSTableIndexBaseScanner scanner;
+  ASSERT_EQ(OB_SUCCESS, scanner.init(range, scan_param, sstable_, tmp_arena));
+
+  ObMicroIndexInfo index_info;
+  ASSERT_EQ(OB_SUCCESS, scanner.get_next(index_info));
+  ASSERT_TRUE(index_info.is_data_block());
+
+  // Right after opening the first leaf block, the held handle must materialize a valid block.
+  ObMicroBlockDataHandle handle;
+  ASSERT_EQ(OB_SUCCESS, scanner.hold_cur_leaf_block(handle));
+  ObMicroBlockData first_leaf_block;
+  ASSERT_EQ(OB_SUCCESS, handle.get_micro_block_data(nullptr, first_leaf_block, false));
+  ASSERT_TRUE(first_leaf_block.is_valid());
+
+  // Advance to the next row within the same leaf block: the held block content must not change.
+  int tmp_ret = scanner.get_next(index_info);
+  if (OB_SUCCESS == tmp_ret) {
+    ASSERT_EQ(OB_SUCCESS, scanner.hold_cur_leaf_block(handle));
+    ObMicroBlockData second_leaf_block;
+    ASSERT_EQ(OB_SUCCESS, handle.get_micro_block_data(nullptr, second_leaf_block, false));
+    ASSERT_TRUE(second_leaf_block.is_valid());
+    EXPECT_EQ(first_leaf_block.get_buf_size(), second_leaf_block.get_buf_size());
+    EXPECT_EQ(0, MEMCMP(first_leaf_block.get_buf(), second_leaf_block.get_buf(), first_leaf_block.get_buf_size()));
+  } else {
+    ASSERT_EQ(OB_ITER_END, tmp_ret);
+  }
+}
+
+// On the get_next() path, entered_new_block_ must be true right after a leaf block is
+// opened and false for subsequent rows inside the same leaf block.
+TEST_F(TestSSTableIndexScanner, test_base_scanner_entered_new_block_granularity)
+{
+  ObArenaAllocator tmp_arena;
+  ObDatumRange range;
+  range.set_whole_range();
+
+  ObSSTableIndexScanParam scan_param;
+  ObFixedArray<ObSkipIndexColMeta, ObIAllocator> proj;
+  prepare_scan_param(false, scan_param, proj);
+  scan_param.tablet_id_ = ObTabletID(1);
+
+  ObSSTableIndexBaseScanner scanner;
+  ASSERT_EQ(OB_SUCCESS, scanner.init(range, scan_param, sstable_, tmp_arena));
+
+  ObMicroIndexInfo index_info;
+  ASSERT_EQ(OB_SUCCESS, scanner.get_next(index_info));
+  EXPECT_TRUE(scanner.cur_entered_new_leaf_block())
+      << "first get_next() must open a new leaf block";
+
+  // Second row inside the same leaf block must not report a new-block crossing.
+  int tmp_ret = scanner.get_next(index_info);
+  if (OB_SUCCESS == tmp_ret) {
+    EXPECT_FALSE(scanner.cur_entered_new_leaf_block())
+        << "subsequent get_next() inside the same leaf block must clear the flag";
+  } else {
+    ASSERT_EQ(OB_ITER_END, tmp_ret);
+    LOG_INFO("sstable has only one index row; skip same-block granularity assertion");
+  }
+}
+
+// A leaf block handle obtained via hold_cur_leaf_block() (and assign()ed into a saved handle)
+// must keep the leaf block buffer valid after the base scanner advances past it and releases
+// its own read item. This is the correctness foundation for the posting scanner pinning each
+// prefetched row's leaf block independently of the base scanner's read cursor.
+TEST_F(TestSSTableIndexScanner, assigned_leaf_handle_survives_base_scanner_advance)
+{
+  ObArenaAllocator tmp_arena;
+  ObDatumRange range;
+  range.set_whole_range();
+
+  ObSSTableIndexScanParam scan_param;
+  ObFixedArray<ObSkipIndexColMeta, ObIAllocator> proj;
+  prepare_scan_param(false, scan_param, proj);
+  scan_param.tablet_id_ = ObTabletID(1);
+
+  ObSSTableIndexBaseScanner scanner;
+  ASSERT_EQ(OB_SUCCESS, scanner.init(range, scan_param, sstable_, tmp_arena));
+
+  // Fetch the first leaf row and pin its leaf block into a saved handle.
+  ObMicroIndexInfo index_info;
+  ASSERT_EQ(OB_SUCCESS, scanner.get_next(index_info));
+  ASSERT_TRUE(index_info.is_data_block());
+  ObMicroBlockDataHandle saved_handle;
+  const MacroBlockId saved_macro_id = index_info.get_macro_id();
+  ASSERT_EQ(OB_SUCCESS, scanner.hold_cur_leaf_block(saved_handle));
+
+  // Materialize the leaf block via the saved handle before advancing the base scanner.
+  ObMicroBlockData saved_block_before;
+  ASSERT_EQ(OB_SUCCESS, saved_handle.get_micro_block_data(nullptr, saved_block_before, false));
+  ASSERT_TRUE(saved_block_before.is_valid());
+
+  // Advance the base scanner past this leaf block (until a different macro id shows up, or
+  // the scan exhausts). This releases the base scanner's own read item for the saved leaf.
+  bool crossed = false;
+  for (int64_t i = 0; i < 100000 && !crossed; ++i) {
+    int tmp_ret = scanner.get_next(index_info);
+    if (OB_ITER_END == tmp_ret) {
+      break;
+    }
+    ASSERT_EQ(OB_SUCCESS, tmp_ret);
+    if (index_info.get_macro_id() != saved_macro_id) {
+      crossed = true;
+    }
+  }
+  // The saved handle is refcounted independently: it must still materialize the SAME leaf
+  // block with identical content after the base scanner moved on.
+  ObMicroBlockData saved_block_after;
+  ASSERT_EQ(OB_SUCCESS, saved_handle.get_micro_block_data(nullptr, saved_block_after, false));
+  ASSERT_TRUE(saved_block_after.is_valid());
+  ASSERT_EQ(saved_block_before.get_buf_size(), saved_block_after.get_buf_size());
+  ASSERT_EQ(0, MEMCMP(saved_block_before.get_buf(), saved_block_after.get_buf(),
+                      saved_block_before.get_buf_size()));
+  saved_handle.reset();
+}
+
+// Regression test: when advance_to enters the non-prefetched else branch (advance key is
+// beyond last_prefetch_key_), query_range_.start_key_ must be updated. Otherwise subsequent
+// open/get_next still scan from the stale range start.
+TEST_F(TestSSTableIndexScanner, test_advance_to_non_prefetched_path_should_update_query_range)
+{
+  ObArenaAllocator tmp_arena;
+  ObDatumRange range;
+  generate_range(min_row_seed_, max_row_seed_, range);
+  ObSSTableIndexScanParam scan_param;
+  ObFixedArray<ObSkipIndexColMeta, ObIAllocator> proj;
+  prepare_scan_param(false, scan_param, proj);
+
+  ObSSTableIndexScanner index_scanner;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  const ObSSTableIndexRow *index_row = nullptr;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.get_next(index_row));
+  ASSERT_TRUE(nullptr != index_row);
+
+  ObSSTableIndexBlockLevelScanner *leaf =
+      index_scanner.base_scanner_.level_scanners_.at(index_scanner.base_scanner_.level_scanners_.count() - 1);
+  ASSERT_TRUE(nullptr != leaf);
+  ASSERT_FALSE(leaf->is_root_block_);
+  
+  ObDatumRowkey small_prefetch_key;
+  ASSERT_EQ(OB_SUCCESS, row_generate_.get_next_row(min_row_seed_, start_key_buf_));
+  small_prefetch_key.assign(start_key_buf_.storage_datums_, TEST_ROWKEY_COLUMN_CNT);
+  leaf->last_prefetch_key_.set_compact_rowkey(&small_prefetch_key);
+
+  ObDatumRowkey advance_key;
+  ASSERT_EQ(OB_SUCCESS, row_generate_.get_next_row(max_row_seed_ / 2, rowkey_buf_));
+  advance_key.assign(rowkey_buf_.storage_datums_, TEST_ROWKEY_COLUMN_CNT);
+
+  int cmp_ret = 0;
+  const ObStorageDatumUtils &datum_utils = read_info_.get_datum_utils();
+  ASSERT_EQ(OB_SUCCESS, leaf->last_prefetch_key_.compare(advance_key, datum_utils, cmp_ret, false));
+  ASSERT_LT(cmp_ret, 0);
+
+  ASSERT_EQ(OB_SUCCESS, index_scanner.advance_to(advance_key, true));
+
+  cmp_ret = 0;
+  ASSERT_EQ(OB_SUCCESS, leaf->query_range_.start_key_.compare(advance_key, datum_utils, cmp_ret));
+  ASSERT_EQ(0, cmp_ret);
+  ASSERT_TRUE(leaf->query_range_.get_border_flag().inclusive_start());
+
+  ASSERT_EQ(OB_SUCCESS, index_scanner.get_next(index_row));
+  ASSERT_TRUE(nullptr != index_row);
+  cmp_ret = 0;
+  ASSERT_EQ(OB_SUCCESS, index_row->endkey_->compare(advance_key, datum_utils, cmp_ret));
+  ASSERT_TRUE(cmp_ret >= 0);
+}
+
+// Regression test: the prefetch queue may be empty while the last leaf index block is
+// still open and has unread rows.  If advance_to() then moves beyond last_prefetch_key_,
+// it must close that old row scanner even though there is no queued PrefetchItem to
+// release.  Otherwise the first get_next() after advance_to() leaks a stale endkey that
+// is smaller than the requested key.
+TEST_F(TestSSTableIndexScanner, test_advance_beyond_sstable_with_empty_queue_and_open_block)
+{
+  ObArenaAllocator tmp_arena;
+  ObDatumRange range;
+  generate_range(min_row_seed_, max_row_seed_, range);
+  ObSSTableIndexScanParam scan_param;
+  ObFixedArray<ObSkipIndexColMeta, ObIAllocator> proj;
+  prepare_scan_param(false, scan_param, proj);
+
+  ObSSTableIndexScanner index_scanner;
+  ASSERT_EQ(OB_SUCCESS, index_scanner.init(range, scan_param, sstable_, tmp_arena));
+  ASSERT_GT(index_scanner.base_scanner_.level_scanners_.count(), 1);
+  ObSSTableIndexBlockLevelScanner *root = index_scanner.base_scanner_.level_scanners_.at(0);
+  ObSSTableIndexBlockLevelScanner *leaf =
+      index_scanner.base_scanner_.level_scanners_.at(
+          index_scanner.base_scanner_.level_scanners_.count() - 1);
+  ASSERT_TRUE(nullptr != root);
+  ASSERT_TRUE(nullptr != leaf);
+
+  const ObSSTableIndexRow *index_row = nullptr;
+  bool reached_repro_state = false;
+  for (int64_t i = 0; i < 100000 && !reached_repro_state; ++i) {
+    ASSERT_EQ(OB_SUCCESS, index_scanner.get_next(index_row));
+    reached_repro_state = root->iter_end_
+        && leaf->block_opened_
+        && leaf->read_idx_ == leaf->prefetch_idx_
+        && !leaf->iter_end_;
+  }
+  ASSERT_TRUE(reached_repro_state);
+  // The old scanner must still have a row to leak after advance_to(); otherwise both the
+  // fixed and regressed implementations would return OB_ITER_END on the next get_next().
+  ASSERT_FALSE(leaf->idx_row_scanner_.end_of_block());
+
+  ObDatumRowkey advance_key;
+  generate_key(max_row_seed_ + 1, advance_key);
+  int cmp_ret = 0;
+  ASSERT_EQ(OB_SUCCESS,
+      leaf->last_prefetch_key_.compare(advance_key, read_info_.get_datum_utils(), cmp_ret, false));
+  ASSERT_LT(cmp_ret, 0);
+
+  ASSERT_EQ(OB_SUCCESS, index_scanner.advance_to(advance_key, true));
+  ASSERT_EQ(OB_ITER_END, index_scanner.get_next(index_row));
+}
+
+} // namespace blocksstable
+} // namespace oceanbase
+
+int main(int argc, char **argv)
+{
+  system("rm -f test_sstable_index_scanner.log*");
+  OB_LOGGER.set_file_name("test_sstable_index_scanner.log", true, true);
+  oceanbase::common::ObLogger::get_logger().set_log_level("INFO");
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

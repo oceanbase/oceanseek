@@ -1,0 +1,150 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_SRC_PL_EXTERNAL_ROUTINE_OB_JAVA_UDF_H_
+#define OCEANBASE_SRC_PL_EXTERNAL_ROUTINE_OB_JAVA_UDF_H_
+
+#include "sql/engine/expr/ob_expr.h"
+#include "sql/engine/expr/ob_expr_udf/ob_expr_udf.h"
+#include "pl/external_routine/ob_external_resource.h"
+
+namespace oceanbase
+{
+
+namespace pl
+{
+
+class ObJavaUDFExecutor
+{
+friend class ObJavaUDAFExecutor;
+
+public:
+  ObJavaUDFExecutor(sql::ObExecContext &exec_ctx_, const ObString &entry)
+    : exec_ctx_(exec_ctx_),
+      entry_(entry)
+  {  }
+
+  int init(int64_t udf_id,
+           ObExternalRoutineType type,
+           const ObString &url,
+           const ObString &resource);
+
+  int execute(int64_t batch_size,
+              const char *method_name,
+              const ObIArray<ObObjMeta> &arg_types,
+              const ObIArray<ObIArray<ObObj>*> &args,
+              const ObExprResType &res_type,
+              ObIAllocator &result_allocator,
+              ObIArray<ObObj> &result);
+
+  inline void set_need_infer_result_size(bool need_infer_result_size) { need_infer_result_size_ = need_infer_result_size; }
+  inline bool need_infer_result_size() const { return need_infer_result_size_; }
+
+  // Public: also reused by ObJavaUDFProxy (sandbox path) to lazily create the
+  // shared cache. Returns the per-stmt (URL) / per-session (RES) cache.
+  static int get_url_jar_cache(ObExecContext &exec_ctx, ObExternalResourceCache<ObExternalURLJar> *&cache);
+  static int get_schema_jar_cache(ObExecContext &exec_ctx, ObExternalResourceCache<ObExternalSchemaJar> *&cache);
+
+private:
+  static int get_class_loader(ObExecContext &exec_ctx,
+                              int64_t udf_id,
+                              ObExternalRoutineType type,
+                              const ObString &url,
+                              const ObString &resource,
+                              jobject &class_loader);
+
+  static int build_udf_args(const ObSQLSessionInfo &session,
+                            ObSchemaGetterGuard &schema_guard,
+                            int64_t batch_size,
+                            const ObIArray<ObObjMeta> &arg_types,
+                            const ObIArray<ObIArray<ObObj> *> &args,
+                            JNIEnv &env,
+                            ObIAllocator &arg_alloc,
+                            jclass object_clazz,
+                            jobjectArray &java_types,
+                            jobject &java_args);
+
+  static int get_ob_type_to_java_map(const ObObjMeta &obj_meta,
+                                     int64_t batch_size,
+                                     JNIEnv &env,
+                                     ObIAllocator &alloc,
+                                     ObToJavaTypeMapperBase *&functor);
+
+  static int get_java_type_to_ob_map(const ObExprResType &res_type,
+                                     JNIEnv &env,
+                                     ObIAllocator &alloc,
+                                     int64_t batch_size,
+                                     ObSQLSessionInfo &session,
+                                     ObFromJavaTypeMapperBase *&functor);
+
+private:
+  bool is_inited_ = false;
+  sql::ObExecContext &exec_ctx_;
+  ObString entry_;
+  jobject loader_ = nullptr;
+  bool need_infer_result_size_ = false;
+};
+
+class ObJavaUDFPermission
+{
+public:
+  ObJavaUDFPermission()
+    : is_grant_(false),
+      type_(),
+      name_(),
+      action_()
+  {  }
+
+  ObJavaUDFPermission(bool is_grant,
+                      const ObString &type,
+                      const ObString &name,
+                      const ObString &action)
+    : is_grant_(is_grant),
+      type_(type),
+      name_(name),
+      action_(action)
+  {  }
+
+private:
+  void to_protobuf(ObPl__JavaUdf__Permission &permission) const
+  {
+    permission.is_grant = is_grant_;
+    permission.type.len = type_.length();
+    permission.type.data = (uint8_t*)(type_.ptr());
+    permission.name.len = name_.length();
+    permission.name.data = (uint8_t*)(name_.ptr());
+    permission.action.len = action_.length();
+    permission.action.data = (uint8_t*)(action_.ptr());
+  }
+
+public:
+  TO_STRING_KV(K_(is_grant), K_(type), K_(name), K_(action));
+
+public:
+  static int collect_enabled_permissions(const ObSQLSessionInfo &session,
+                                         ObSchemaGetterGuard &schema_guard,
+                                         ObIArray<ObJavaUDFPermission> &permissions);
+
+  static int collect_enabled_permissions_of_grantee(const uint64_t tenant_id,
+                                                    const uint64_t grantee,
+                                                    ObSchemaGetterGuard &schema_guard,
+                                                    ObIArray<ObJavaUDFPermission> &permissions);
+
+  static int permissions_to_protobuf(const ObIArray<ObJavaUDFPermission> &permission_array,
+                                     ObIAllocator &alloc,
+                                     decltype(ObPl__JavaUdf__BatchedArgs::n_permissions) &n_permissions,
+                                     decltype(ObPl__JavaUdf__BatchedArgs::permissions) &permissions);
+
+private:
+  bool is_grant_;
+  ObString type_;
+  ObString name_;
+  ObString action_;
+};
+
+} // namespace pl
+} // namespace oceanbase
+
+#endif // OCEANBASE_SRC_PL_EXTERNAL_ROUTINE_OB_JAVA_UDF_H_

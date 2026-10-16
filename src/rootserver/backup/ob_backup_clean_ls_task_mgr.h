@@ -1,0 +1,61 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_SHARE_OB_BACKUP_CLEAN_LS_TASK_MGR_H_
+#define OCEANBASE_SHARE_OB_BACKUP_CLEAN_LS_TASK_MGR_H_
+#include "ob_backup_service.h"
+#include "share/backup/ob_backup_clean_struct.h"
+#include "share/backup/ob_archive_struct.h"
+
+namespace oceanbase
+{
+namespace rootserver
+{
+
+class ObBackupCleanLSTaskMgr final
+{
+public:
+  ObBackupCleanLSTaskMgr();
+  virtual ~ObBackupCleanLSTaskMgr();
+  int init(
+      share::ObBackupCleanTaskAttr &task_attr,
+      share::ObBackupCleanLSTaskAttr &ls_attr,
+      ObBackupTaskScheduler &task_scheduler,
+      common::ObISQLClient &sql_proxy,
+      ObBackupMgrService &backup_service);
+  int process(int64_t &finish_cnt);
+  int cancel(int64_t &finish_cnt);
+  static int advance_ls_task_status(
+      ObBackupMgrService &backup_service,
+      common::ObISQLClient &sql_proxy, 
+      const share::ObBackupCleanLSTaskAttr &ls_attr, 
+      const share::ObBackupTaskStatus &next_status, 
+      const int result = OB_SUCCESS, 
+      const int64_t end_ts = 0);
+  static int redo_ls_task(
+      ObBackupMgrService &backup_service,
+      common::ObISQLClient &sql_proxy, 
+      const share::ObBackupCleanLSTaskAttr &ls_attr,
+      const int64_t retry_id);
+  static int statistic_info(
+      ObBackupMgrService &backup_service,
+      common::ObISQLClient &sql_proxy, 
+      const share::ObBackupCleanLSTaskAttr &ls_attr);
+private:
+  int add_task_();
+  int finish_(int64_t &finish_cnt);
+private:
+  bool is_inited_;
+  share::ObBackupCleanTaskAttr *task_attr_;
+  share::ObBackupCleanLSTaskAttr *ls_attr_;
+  ObBackupTaskScheduler *task_scheduler_;
+  common::ObISQLClient *sql_proxy_;
+  ObBackupMgrService *backup_service_;
+  DISALLOW_COPY_AND_ASSIGN(ObBackupCleanLSTaskMgr);
+};
+
+}
+}
+#endif  // OCEANBASE_SHARE_OB_BACKUP_CLEAN_LS_TASK_MGR_H_

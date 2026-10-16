@@ -1,0 +1,66 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_SQL_OB_EXPR_NOT_BETWEEN_H_
+#define OCEANBASE_SQL_OB_EXPR_NOT_BETWEEN_H_
+
+#include "lib/ob_name_def.h"
+#include "sql/engine/expr/ob_expr_operator.h"
+
+namespace oceanbase
+{
+namespace sql
+{
+class ObExprNotBetween: public ObRelationalExprOperator
+{
+public:
+  ObExprNotBetween();
+  explicit  ObExprNotBetween(common::ObIAllocator &alloc);
+  virtual ~ObExprNotBetween() {};
+  enum EvalBetweenStage {
+    BETWEEN_LEFT,
+    BETWEEN_RIGHT,
+    BETWEEN_MAX
+  };
+  static int calc(common::ObObj &result,
+                  const common::ObObj &obj1,
+                  const common::ObObj &beg,
+                  const common::ObObj &end,
+                  common::ObObjType cmp_type,
+                  common::ObExprCtx &expr_ctx,
+                  common::ObCollationType cs_type);
+
+  virtual int cg_expr(ObExprCGCtx &expr_cg_ctx,
+                            const ObRawExpr &raw_expr,
+                            ObExpr &rt_expr) const override;
+
+  static int eval_not_between_vector(const ObExpr &expr,
+                                     ObEvalCtx &ctx,
+                                     const ObBitVector &skip,
+                                     const EvalBound &bound);
+
+  template <typename LVec, typename RVec, typename ResVec,
+            EvalBetweenStage Stage>
+  static int inner_eval_not_between_vector(const ObExpr &expr,
+                                           ObEvalCtx &ctx,
+                                           ObBitVector &skip,
+                                           const EvalBound &bound);
+private:
+  // types and constants
+private:
+  // disallow copy
+  DISALLOW_COPY_AND_ASSIGN(ObExprNotBetween);
+  // function members
+private:
+  // data members
+
+};
+
+} // end namespace sql
+} // end namespace oceanbase
+
+
+
+#endif // OCEANBASE_SQL_OB_EXPR_NOT_BETWEEN_H_

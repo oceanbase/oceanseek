@@ -1,0 +1,7 @@
+storage_unittest(test_direct_load_index_block_writer)
+storage_unittest(test_direct_load_data_block_writer)
+storage_unittest(test_direct_load_chunk_sort)
+storage_unittest(test_ddl_inc_commit_log)
+storage_unittest(test_direct_load_ss_update_inc_major_task)
+storage_unittest(test_direct_load_origin_table)
+storage_unittest(test_direct_load_dag_insert_table_row_writer)

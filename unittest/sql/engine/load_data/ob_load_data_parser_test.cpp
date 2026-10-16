@@ -1,0 +1,385 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX SQL
+
+#include <gtest/gtest.h>
+#include "sql/ob_sql_init.h"
+#include "sql/engine/cmd/ob_load_data_impl.h"
+#include "sql/engine/cmd/ob_load_data_parser.h"
+
+static char *file_path = NULL;
+
+using namespace oceanbase::sql;
+//using namespace oceanbase::sql::test;
+using namespace oceanbase::common;
+using namespace oceanbase::observer;
+using namespace oceanbase::share;
+
+
+struct FileMeta {
+  const char *file_name;
+  int64_t column_num;
+};
+
+class TestParser : public ::testing::Test
+{
+public:
+  enum tpch_table_names {
+    TPCH_LINE_ITEM = 0,
+    TPCH_TABLE_CNT
+  };
+  TestParser();
+  ~TestParser();
+  virtual void SetUp();
+  virtual void TearDown();
+  FileMeta tpch_file_metas[TPCH_TABLE_CNT];
+};
+TestParser::TestParser()
+{
+}
+
+TestParser::~TestParser()
+{
+}
+
+void TestParser::SetUp()
+{
+  tpch_file_metas[TPCH_LINE_ITEM].column_num = 16;
+  tpch_file_metas[TPCH_LINE_ITEM].file_name = "lineitem.tbl";
+
+}
+
+void TestParser::TearDown()
+{
+}
+/*
+TEST_F(TestParser, csv_parser)
+{
+  ObCSVFormats format;
+  format.field_term_char_ = '|';
+  format.line_term_char_ = '\n';
+  format.enclose_char_ = INT64_MAX;
+  format.escape_char_ = '\\';
+  format.null_column_fill_zero_string_ = true;
+  format.is_simple_format_ = true;
+  format.is_line_term_by_counting_field_ = false;
+
+
+  void *temp_buf = (ob_malloc(OB_MALLOC_BIG_BLOCK_SIZE));
+  ASSERT_TRUE(temp_buf != NULL);
+  ObLoadFileBuffer *buffer = new(temp_buf)ObLoadFileBuffer(OB_MALLOC_BIG_BLOCK_SIZE
+                                                           - sizeof(ObLoadFileBuffer));
+
+
+  for (int i = 0; i < TPCH_TABLE_CNT; i++) {
+    FileMeta &f_meta = tpch_file_metas[i];
+    ObCSVParser parser;
+    ObBitSet<> empty_set;
+    ASSERT_EQ(OB_SUCCESS, parser.init(f_meta.column_num, format, empty_set));
+
+
+    std::string file_name;
+    if (file_path != NULL) {
+      file_name.append(file_path).append("/").append(f_meta.file_name);
+    } else {
+      file_name = f_meta.file_name;
+    }
+
+    oceanbase::common::ObFileReader reader;
+    ASSERT_EQ(OB_SUCCESS, reader.open(file_name.c_str(), false));
+    int64_t file_size = get_file_size(file_name.c_str());
+    int64_t total_read_bytes = 0;
+    int64_t rows = 0;
+    int64_t temp_idx = 1;
+    fprintf(stdout, "## Start parsing table:%s\n", f_meta.file_name);
+    int64_t start_time = ObTimeUtility::current_time();
+    for (int64_t read_bytes = INT64_MAX; read_bytes != 0;) {
+      //fprintf(stdout, "==> DEBUG parsing %ld, %ld\n", buffer->get_remain_len(), total_read_bytes);
+      ASSERT_EQ(OB_SUCCESS, reader.pread(buffer->current_ptr(),
+                                         buffer->get_remain_len(),
+                                         total_read_bytes,
+                                         read_bytes));
+      buffer->update_pos(read_bytes);
+      parser.reuse();
+      parser.next_buf(buffer->begin_ptr(), buffer->get_data_len(), 0 == read_bytes);
+      for (bool has_next_line = true; has_next_line;) {
+        ASSERT_EQ(OB_SUCCESS, parser.next_line(has_next_line));
+        if (has_next_line) {
+          rows++;
+        }
+      }
+
+      int64_t unfinish_len = buffer->get_data_len() - parser.get_complete_lines_len();
+      char *unfinish_ptr = buffer->begin_ptr() + parser.get_complete_lines_len();
+      MEMMOVE(buffer->begin_ptr(), unfinish_ptr, unfinish_len);
+      buffer->reset();
+      buffer->update_pos(unfinish_len);
+      total_read_bytes += read_bytes;
+
+      if (rows > temp_idx * 100000) {
+        int64_t time_dur = ObTimeUtility::current_time() - start_time;
+        fprintf(stdout, "==> parsing progress %ld%%\t rows:%ldK\t speed:%ldM/s\n",
+                total_read_bytes * 100 /file_size, rows/1000,
+                (total_read_bytes >> 20) * USECS_PER_SEC/time_dur);
+        temp_idx++;
+      }
+    }
+
+    fprintf(stdout, "## done parsing table:%s\trows:%ld\n", f_meta.file_name, rows);
+  }
+}
+*/
+
+TEST_F(TestParser, general_parser)
+{
+
+  ObDataInFileStruct file_struct;
+  file_struct.field_term_str_ = "|";
+
+  void *temp_buf = (ob_malloc(OB_MALLOC_BIG_BLOCK_SIZE, ObNewModIds::TEST));
+  ASSERT_TRUE(temp_buf != NULL);
+  ObLoadFileBuffer *buffer = new(temp_buf)ObLoadFileBuffer(OB_MALLOC_BIG_BLOCK_SIZE
+                                                           - sizeof(ObLoadFileBuffer) - 1024);
+
+
+  for (int i = 0; i < TPCH_TABLE_CNT; i++) {
+    FileMeta &f_meta = tpch_file_metas[i];
+
+    ObCSVGeneralParser parser;
+    ASSERT_EQ(OB_SUCCESS,
+              parser.init(file_struct, f_meta.column_num, CS_TYPE_UTF8MB4_BIN));
+
+
+    std::string file_name;
+    if (file_path != NULL) {
+      file_name.append(file_path).append("/").append(f_meta.file_name);
+    } else {
+      file_name = f_meta.file_name;
+    }
+
+    oceanbase::common::ObFileReader reader;
+    ASSERT_EQ(OB_SUCCESS, reader.open(file_name.c_str(), false));
+    int64_t file_size = get_file_size(file_name.c_str());
+    int64_t total_read_bytes = 0;
+    int64_t rows = 0;
+    int64_t temp_idx = 1;
+    fprintf(stdout, "## Start parsing table:%s\n", f_meta.file_name);
+    int64_t start_time = ObTimeUtility::current_time();
+    struct Functor {
+      int operator()(ObCSVGeneralParser::HandleOneLineParam param) {
+        UNUSED(param);
+        return OB_SUCCESS;
+      }
+      int operator()(ObCSVGeneralParser::HandleBatchLinesParam param) {
+        UNUSED(param);
+        return OB_SUCCESS;
+      }
+    };
+    struct Functor counting_lines;
+    ObSEArray<ObCSVGeneralParser::LineErrRec, 256> error_msgs;
+    for (int64_t read_bytes = INT64_MAX; read_bytes != 0;) {
+      //fprintf(stdout, "==> DEBUG parsing %ld, %ld\n", buffer->get_remain_len(), total_read_bytes);
+      ASSERT_EQ(OB_SUCCESS, reader.pread(buffer->current_ptr(),
+                                         buffer->get_remain_len(),
+                                         total_read_bytes,
+                                         read_bytes));
+      buffer->update_pos(read_bytes);
+      const int64_t max_read_rows = 1;
+      int64_t cur_rows = max_read_rows;
+      const char *ptr = buffer->begin_ptr();
+      const char *end = buffer->begin_ptr() + buffer->get_data_len();
+      while (cur_rows == max_read_rows) {
+        ASSERT_EQ(OB_SUCCESS, parser.scan(ptr, end, cur_rows, NULL, NULL, counting_lines, error_msgs, false));
+        ASSERT_EQ(0, error_msgs.count());
+        ASSERT_EQ(parser.get_fields_per_line().count(), f_meta.column_num);
+        rows += cur_rows;
+      }
+
+      int64_t unfinish_len = end - ptr;
+      const char *unfinish_ptr = ptr;
+      MEMMOVE(buffer->begin_ptr(), unfinish_ptr, unfinish_len);
+      buffer->reset();
+      buffer->update_pos(unfinish_len);
+      total_read_bytes += read_bytes;
+
+      if (rows > temp_idx * 100000) {
+        int64_t time_dur = ObTimeUtility::current_time() - start_time;
+        fprintf(stdout, "==> parsing progress %ld%%\t rows:%ldK\t speed:%ldM/s\n",
+                total_read_bytes * 100 /file_size, rows/1000,
+                (total_read_bytes >> 20) * USECS_PER_SEC/time_dur);
+        temp_idx++;
+      }
+    }
+    fprintf(stdout, "## done parsing table:%s\trows:%ld\n", f_meta.file_name, rows);
+  }
+}
+
+
+TEST_F(TestParser, general_parser_escape)
+{
+  ObDataInFileStruct file_struct;
+  file_struct.field_term_str_ = ",";
+  file_struct.field_enclosed_str_ = "\"";
+  file_struct.field_enclosed_char_ = '"';
+
+  void *temp_buf =  NULL;
+  temp_buf = (ob_malloc(OB_MALLOC_BIG_BLOCK_SIZE, ObNewModIds::TEST));
+  ASSERT_TRUE(temp_buf != NULL);
+  ObLoadFileBuffer *buffer = new(temp_buf)ObLoadFileBuffer(OB_MALLOC_BIG_BLOCK_SIZE
+                                                           - sizeof(ObLoadFileBuffer) - 1024);
+  temp_buf = (ob_malloc(OB_MALLOC_BIG_BLOCK_SIZE, ObNewModIds::TEST));
+  ASSERT_TRUE(temp_buf != NULL);
+  ObLoadFileBuffer *escape = new(temp_buf)ObLoadFileBuffer(OB_MALLOC_BIG_BLOCK_SIZE
+                                                           - sizeof(ObLoadFileBuffer) - 1024);
+  FileMeta f_meta;
+  f_meta.column_num = 3;
+  f_meta.file_name = "general_parser_escape_test_file";
+
+  ObCSVGeneralParser parser;
+  ASSERT_EQ(OB_SUCCESS,
+            parser.init(file_struct, f_meta.column_num, CS_TYPE_UTF8MB4_BIN));
+
+
+  std::string file_name;
+  if (file_path != NULL) {
+    file_name.append(file_path).append("/").append(f_meta.file_name);
+  } else {
+    file_name = f_meta.file_name;
+  }
+
+  oceanbase::common::ObFileReader reader;
+  ASSERT_EQ(OB_SUCCESS, reader.open(file_name.c_str(), false));
+  int64_t file_size = get_file_size(file_name.c_str());
+  int64_t total_read_bytes = 0;
+  int64_t rows = 0;
+  int64_t temp_idx = 1;
+  fprintf(stdout, "## Start parsing table:%s\n", f_meta.file_name);
+  int64_t start_time = ObTimeUtility::current_time();
+  struct Functor {
+    int operator()(ObCSVGeneralParser::HandleOneLineParam param) {
+      UNUSED(param);
+      return OB_SUCCESS;
+    }
+    int operator()(ObCSVGeneralParser::HandleBatchLinesParam param) {
+      UNUSED(param);
+      return OB_SUCCESS;
+    }
+  };
+  struct Functor counting_lines;
+  ObSEArray<ObCSVGeneralParser::LineErrRec, 256> error_msgs;
+  for (int64_t read_bytes = INT64_MAX; read_bytes != 0;) {
+    //fprintf(stdout, "==> DEBUG parsing %ld, %ld\n", buffer->get_remain_len(), total_read_bytes);
+    ASSERT_EQ(OB_SUCCESS, reader.pread(buffer->current_ptr(),
+                                       buffer->get_remain_len(),
+                                       total_read_bytes,
+                                       read_bytes));
+    buffer->update_pos(read_bytes);
+    const int64_t max_read_rows = 1;
+    int64_t cur_rows = max_read_rows;
+    const char *ptr = buffer->begin_ptr();
+    const char *end = buffer->begin_ptr() + buffer->get_data_len();
+    while (cur_rows == max_read_rows) {
+      ASSERT_EQ(OB_SUCCESS, (parser.scan<decltype(counting_lines), true>(ptr, end, cur_rows,
+                                        escape->begin_ptr(), escape->begin_ptr() + escape->get_buffer_size(),
+                                        counting_lines, error_msgs, false)));
+      //ASSERT_EQ(0, error_msgs.count());
+      ASSERT_EQ(parser.get_fields_per_line().count(), f_meta.column_num);
+      rows += cur_rows;
+    }
+
+    int64_t unfinish_len = end - ptr;
+    const char *unfinish_ptr = ptr;
+    MEMMOVE(buffer->begin_ptr(), unfinish_ptr, unfinish_len);
+    buffer->reset();
+    buffer->update_pos(unfinish_len);
+    total_read_bytes += read_bytes;
+
+    if (rows > temp_idx * 100000) {
+      int64_t time_dur = ObTimeUtility::current_time() - start_time;
+      fprintf(stdout, "==> parsing progress %ld%%\t rows:%ldK\t speed:%ldM/s\n",
+              total_read_bytes * 100 /file_size, rows/1000,
+              (total_read_bytes >> 20) * USECS_PER_SEC/time_dur);
+      temp_idx++;
+    }
+  }
+  fprintf(stdout, "## done parsing table:%s\trows:%ld\n", f_meta.file_name, rows);
+
+}
+
+TEST_F(TestParser, cpp_plugin_format_json_round_trip)
+{
+  ObArenaAllocator allocator;
+  ObExternalFileFormat format;
+  ObString format_json;
+  format.format_type_ = ObExternalFileFormat::CPP_PLUGIN_FORMAT;
+
+  ASSERT_EQ(OB_SUCCESS, format.to_string_with_alloc(format_json, allocator));
+  ASSERT_EQ(0, format_json.case_compare("{\"TYPE\":\"CPP_PLUGIN\"}"));
+
+  ObExternalFileFormat parsed_format;
+  ASSERT_EQ(OB_SUCCESS, parsed_format.load_from_string(format_json, allocator));
+  ASSERT_EQ(ObExternalFileFormat::CPP_PLUGIN_FORMAT, parsed_format.format_type_);
+}
+
+TEST_F(TestParser, direct_load_stream_format_roundtrip)
+{
+  ObMalloc allocator(ObMemAttr(OB_SERVER_TENANT_ID, "unittest"));
+  ObExternalFileFormat format;
+  format.format_type_ = ObExternalFileFormat::DIRECT_LOAD_STREAM_FORMAT;
+  format.direct_load_stream_format_.stream_id_ = 10086;
+
+  ObString format_str;
+  ASSERT_EQ(OB_SUCCESS, format.to_string_with_alloc(format_str, allocator));
+  ASSERT_FALSE(format_str.empty());
+
+  ObExternalFileFormat parsed_format;
+  ASSERT_EQ(OB_SUCCESS, parsed_format.load_from_string(format_str, allocator));
+  ASSERT_EQ(ObExternalFileFormat::DIRECT_LOAD_STREAM_FORMAT, parsed_format.format_type_);
+  ASSERT_EQ(10086, parsed_format.direct_load_stream_format_.stream_id_);
+  ASSERT_TRUE(parsed_format.direct_load_stream_format_.is_valid());
+
+  ObExternalFileFormat zero_format;
+  zero_format.format_type_ = ObExternalFileFormat::DIRECT_LOAD_STREAM_FORMAT;
+  zero_format.direct_load_stream_format_.stream_id_ = 0;
+  ASSERT_FALSE(zero_format.direct_load_stream_format_.is_valid());
+  ObString zero_format_str;
+  ASSERT_EQ(OB_SUCCESS, zero_format.to_string_with_alloc(zero_format_str, allocator));
+
+  ObExternalFileFormat parsed_zero_format;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, parsed_zero_format.load_from_string(zero_format_str, allocator));
+
+  ObExternalFileFormat negative_format;
+  negative_format.format_type_ = ObExternalFileFormat::DIRECT_LOAD_STREAM_FORMAT;
+  negative_format.direct_load_stream_format_.stream_id_ = -1;
+  ASSERT_FALSE(negative_format.direct_load_stream_format_.is_valid());
+  ObString negative_format_str;
+  ASSERT_EQ(OB_SUCCESS, negative_format.to_string_with_alloc(negative_format_str, allocator));
+
+  ObExternalFileFormat parsed_negative_format;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, parsed_negative_format.load_from_string(negative_format_str, allocator));
+
+  ObExternalFileFormat invalid_format;
+  invalid_format.format_type_ = ObExternalFileFormat::DIRECT_LOAD_STREAM_FORMAT;
+  invalid_format.direct_load_stream_format_.stream_id_ = OB_INVALID_ID;
+  ASSERT_FALSE(invalid_format.direct_load_stream_format_.is_valid());
+  ObString invalid_format_str;
+  ASSERT_EQ(OB_SUCCESS, invalid_format.to_string_with_alloc(invalid_format_str, allocator));
+
+  ObExternalFileFormat parsed_invalid_format;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, parsed_invalid_format.load_from_string(invalid_format_str, allocator));
+}
+
+int main(int argc, char **argv)
+{
+  init_sql_factories();
+  OB_LOGGER.set_log_level("INFO");
+  if (argc > 1 && argv[1] != NULL) {
+    file_path = argv[1];
+  }
+  ::testing::InitGoogleTest(&argc, argv);
+
+  return RUN_ALL_TESTS();
+}

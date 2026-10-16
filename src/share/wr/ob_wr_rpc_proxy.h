@@ -1,0 +1,48 @@
+/**
+ * Copyright (c) 2023 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_WR_OB_WORKLOAD_REPOSITORY_RPC_PROXY_H_
+#define OCEANBASE_WR_OB_WORKLOAD_REPOSITORY_RPC_PROXY_H_
+
+#include "share/ob_define.h"
+#include "rpc/obrpc/ob_rpc_proxy.h"
+#include "observer/ob_server_struct.h"
+#include "share/rpc/ob_async_rpc_proxy.h"
+
+namespace oceanbase
+{
+
+namespace share
+{
+class ObWrCreateSnapshotArg;
+class ObWrPurgeSnapshotArg;
+class ObWrUserSubmitSnapArg;
+class ObWrUserSubmitSnapResp;
+class ObWrUserModifySettingsArg;
+class ObWrAsyncUpdateSqlStatArg;
+}  // namespace share
+
+namespace obrpc
+{
+class ObWrRpcProxy : public obrpc::ObRpcProxy
+{
+public:
+  DEFINE_TO(ObWrRpcProxy);
+  virtual ~ObWrRpcProxy() {}
+  RPC_AP(@PR5 wr_async_take_snapshot, obrpc::OB_WR_ASYNC_SNAPSHOT_TASK,
+      (share::ObWrCreateSnapshotArg));
+  RPC_AP(@PR5 wr_async_purge_snapshot, obrpc::OB_WR_ASYNC_PURGE_SNAPSHOT_TASK,
+      (share::ObWrPurgeSnapshotArg));
+  RPC_S(@PR5 wr_sync_user_submit_snapshot_task, obrpc::OB_WR_SYNC_USER_SUBMIT_SNAPSHOT_TASK,
+      (share::ObWrUserSubmitSnapArg), share::ObWrUserSubmitSnapResp);
+  RPC_S(@PR5 wr_sync_user_modify_settings_task, obrpc::OB_WR_SYNC_USER_MODIFY_SETTINGS_TASK,
+      (share::ObWrUserModifySettingsArg));
+  RPC_AP(@PR5 wr_async_update_sqlstat, obrpc::OB_WR_ASYNC_UPDATE_SQLSTAT_TASK,
+    (share::ObWrAsyncUpdateSqlStatArg));
+};
+
+}  // namespace obrpc
+}  // namespace oceanbase
+#endif  // OCEANBASE_WR_OB_WORKLOAD_REPOSITORY_RPC_PROXY_H_

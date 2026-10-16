@@ -1,0 +1,49 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OB_MERGE_STMT_PRINTER_H
+#define OB_MERGE_STMT_PRINTER_H
+
+#include "ob_dml_stmt_printer.h"
+#include "sql/resolver/dml/ob_merge_stmt.h"
+#include "sql/printer/ob_raw_expr_printer.h"
+
+namespace oceanbase
+{
+namespace sql
+{
+
+class ObMergeStmtPrinter : public ObDMLStmtPrinter
+{
+public:
+  ObMergeStmtPrinter()=delete;
+  ObMergeStmtPrinter(char *buf, int64_t buf_len, int64_t *pos, const ObMergeStmt *stmt,
+                     ObSchemaGetterGuard *schema_guard,
+                     common::ObObjPrintParams print_params,
+                     const ParamStore *param_store = NULL,
+                     const ObSQLSessionInfo *session = NULL) :
+    ObDMLStmtPrinter(buf, buf_len, pos, stmt, schema_guard, print_params, param_store, session) {}
+  virtual ~ObMergeStmtPrinter() {}
+
+  void init(char *buf, int64_t buf_len, int64_t *pos, ObMergeStmt *stmt);
+  virtual int do_print();
+private:
+  int print();
+
+  int print_conds(const ObIArray<ObRawExpr *> &conds);
+
+  int print_update_clause(const ObMergeStmt &merge_stmt);
+
+  int print_insert_clause(const ObMergeStmt &merge_stmt);
+
+private:
+  // disallow copy
+  DISALLOW_COPY_AND_ASSIGN(ObMergeStmtPrinter);
+};
+
+}
+}
+
+#endif // OB_MERGE_STMT_PRINTER_H

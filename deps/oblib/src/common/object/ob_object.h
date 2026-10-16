@@ -1,0 +1,4531 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_COMMON_OB_OBJECT_H_
+#define OCEANBASE_COMMON_OB_OBJECT_H_
+
+#include "lib/ob_define.h"
+#include "lib/string/ob_string.h"
+#include "common/ob_action_flag.h"
+#include "common/object/ob_obj_type.h"
+#include "common/ob_accuracy.h"
+#include "lib/checksum/ob_crc64.h"
+#include "lib/number/ob_number_v2.h"
+#include "lib/charset/ob_charset.h"
+#include "lib/timezone/ob_timezone_info.h"
+#include "lib/hash/ob_hashutils.h"
+#include "lib/hash_func/ob_hash_func.h"
+#include "lib/charset/ob_dtoa.h"
+#include "lib/rowid/ob_urowid.h"
+#include "lib/utility/ob_template_utils.h"
+#include "lib/wide_integer/ob_wide_integer.h"
+#include "s2/util/endian/endian.h"
+
+namespace oceanbase
+{
+namespace tests
+{
+namespace common
+{
+class ObjTest;
+class ObSqlString;
+}
+}
+namespace sql
+{
+class ObExecContext;
+}
+namespace common
+{
+
+struct ObCompareCtx;
+class ObSqlCollectionInfo;
+enum ObCmpNullPos
+{
+  NULL_LAST = 1,
+  NULL_FIRST,
+  MAX_NULL_POS
+};
+
+inline ObCmpNullPos default_null_pos()
+{
+  return lib::is_oracle_mode() ? NULL_LAST : NULL_FIRST;
+}
+
+struct ObEnumSetInnerValue
+{
+  OB_UNIS_VERSION_V(1);
+public:
+  ObEnumSetInnerValue() : numberic_value_(0), string_value_() {}
+  ObEnumSetInnerValue(uint64_t numberic_value, common::ObString &string_value)
+      : numberic_value_(numberic_value), string_value_(string_value) {}
+  virtual ~ObEnumSetInnerValue() {}
+
+  TO_STRING_KV(K_(numberic_value), K_(string_value));
+  uint64_t numberic_value_;
+  common::ObString string_value_;
+};
+
+class ObObjMeta
+{
+public:
+  ObObjMeta()
+      :type_(ObNullType),
+       cs_level_(CS_LEVEL_INVALID),
+       cs_type_(CS_TYPE_INVALID),
+       scale_(-1)
+  {}
+
+  OB_INLINE bool operator ==(const ObObjMeta &other) const
+  {
+    return (type_ == other.type_ && cs_level_ == other.cs_level_ && cs_type_ == other.cs_type_);
+  }
+  OB_INLINE bool operator !=(const ObObjMeta &other) const { return !this->operator ==(other); }
+  OB_INLINE int hash(uint64_t &res, uint64_t seed) const
+  {
+    res = murmurhash(&type_, sizeof(type_), seed);
+    res = murmurhash(&cs_level_, sizeof(cs_level_), seed);
+    res = murmurhash(&cs_type_, sizeof(cs_type_), seed);
+    return OB_SUCCESS;
+  }
+  // this method is inefficient, you'd better use set_tinyint() etc. instead
+  OB_INLINE void set_type(const ObObjType &type)
+  {
+    type_ = static_cast<uint8_t>(type);
+    if (ObNullType == type_) {
+      set_collation_level(CS_LEVEL_IGNORABLE);
+      set_collation_type(CS_TYPE_BINARY);
+    } else if (ObUnknownType == type_
+               || ObExtendType == type_) {
+      set_collation_level(CS_LEVEL_INVALID);
+      set_collation_type(CS_TYPE_INVALID);
+    } else if (ObHexStringType == type_
+               || ob_is_geometry(static_cast<ObObjType>(type_))) {
+      set_collation_type(CS_TYPE_BINARY);
+    } else if (ObJsonType == type_) {
+      set_collation_type(CS_TYPE_UTF8MB4_BIN);
+    } else if (ObUserDefinedSQLType == type_ ||
+               ObCollectionSQLType == type_) {
+      set_subschema_id(UINT_MAX16);
+    } else if (!ob_is_string_type(static_cast<ObObjType>(type_))
+               && !ob_is_lob_locator(static_cast<ObObjType>(type_))
+               && !ob_is_raw(static_cast<ObObjType>(type_))
+               && !ob_is_enum_or_set_type(static_cast<ObObjType>(type_))
+               && !ob_is_roaringbitmap(static_cast<ObObjType>(type_))) {
+      set_collation_level(CS_LEVEL_NUMERIC);
+      set_collation_type(CS_TYPE_BINARY);
+    }
+  }
+  OB_INLINE void set_type_simple(const ObObjType &type)
+  {
+    type_ = static_cast<uint8_t>(type);
+  }
+  // in greatest case need manually set numeric collation,
+  // e.g greatest(2, 'x') => type=varchar,collation=binary,cmp_collation=utf8
+  OB_INLINE void set_numeric_collation() {
+    set_collation_level(CS_LEVEL_NUMERIC);
+    set_collation_type(CS_TYPE_BINARY);
+  }
+  OB_INLINE void set_meta(const ObObjMeta &meta)
+  {
+    type_ = meta.type_;
+    cs_level_ = meta.cs_level_;
+    cs_type_ = meta.cs_type_;
+    scale_ = meta.scale_;
+  }
+  OB_INLINE void reset()
+  {
+    type_ = ObNullType;
+    cs_level_ = CS_LEVEL_INVALID;
+    cs_type_ = CS_TYPE_INVALID;
+    scale_ = -1;
+  }
+
+  OB_INLINE ObObjType get_type() const { return static_cast<ObObjType>(type_); }
+  OB_INLINE ObObjOType get_oracle_type() const { return ob_obj_type_to_oracle_type(static_cast<ObObjType>(type_)); }
+  OB_INLINE const ObObjMeta &get_obj_meta() const { return *this; }
+  OB_INLINE ObObjTypeClass get_type_class() const { return ob_obj_type_class(get_type()); }
+  OB_INLINE ObObjTypeClass get_type_class_for_oracle() const { return ob_oracle_type_class(get_type()); }
+
+  OB_INLINE void set_null() { type_ = static_cast<uint8_t>(ObNullType); set_collation_level(CS_LEVEL_IGNORABLE); set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_tinyint() { type_ = static_cast<uint8_t>(ObTinyIntType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_smallint() { type_ = static_cast<uint8_t>(ObSmallIntType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_mediumint() { type_ = static_cast<uint8_t>(ObMediumIntType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_int32() { type_ = static_cast<uint8_t>(ObInt32Type); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_int() { type_ = static_cast<uint8_t>(ObIntType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_utinyint() { type_ = static_cast<uint8_t>(ObUTinyIntType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_usmallint() { type_ = static_cast<uint8_t>(ObUSmallIntType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_umediumint() { type_ = static_cast<uint8_t>(ObUMediumIntType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_uint32() { type_ = static_cast<uint8_t>(ObUInt32Type); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_uint64() { type_ = static_cast<uint8_t>(ObUInt64Type); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_float() { type_ = static_cast<uint8_t>(ObFloatType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_double() { type_ = static_cast<uint8_t>(ObDoubleType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_ufloat() { type_ = static_cast<uint8_t>(ObUFloatType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_udouble() { type_ = static_cast<uint8_t>(ObUDoubleType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_number() { type_ = static_cast<uint8_t>(ObNumberType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_unumber() { type_ = static_cast<uint8_t>(ObUNumberType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_number_float() { type_ = static_cast<uint8_t>(ObNumberFloatType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_datetime() { type_ = static_cast<uint8_t>(ObDateTimeType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_mysql_datetime() { type_ = static_cast<uint8_t>(ObMySQLDateTimeType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_timestamp() { type_ = static_cast<uint8_t>(ObTimestampType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_year() { type_ = static_cast<uint8_t>(ObYearType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_date() { type_ = static_cast<uint8_t>(ObDateType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_mysql_date() { type_ = static_cast<uint8_t>(ObMySQLDateType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_time() { type_ = static_cast<uint8_t>(ObTimeType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_varchar() { type_ = static_cast<uint8_t>(ObVarcharType); }
+  OB_INLINE void set_char() { type_ = static_cast<uint8_t>(ObCharType); }
+  OB_INLINE void set_varbinary() { type_ = static_cast<uint8_t>(ObVarcharType); set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_binary() { type_ = static_cast<uint8_t>(ObCharType); set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_hex_string() { type_ = static_cast<uint8_t>(ObHexStringType); set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_raw() { type_ = static_cast<uint8_t>(ObRawType); set_collation_level(common::CS_LEVEL_IMPLICIT); set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_ext() { type_ = static_cast<uint8_t>(ObExtendType); set_collation_level(CS_LEVEL_INVALID); set_collation_type(CS_TYPE_INVALID); set_extend_type(0); }
+  OB_INLINE void set_unknown() { type_ = static_cast<uint8_t>(ObUnknownType); set_collation_level(CS_LEVEL_INVALID); set_collation_type(CS_TYPE_INVALID); }
+  OB_INLINE void set_bit() { type_ = static_cast<uint8_t>(ObBitType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  //TODO():collation_level, collation_type
+  OB_INLINE void set_enum() { type_ = static_cast<uint8_t>(ObEnumType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_set() { type_ = static_cast<uint8_t>(ObSetType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_enum_inner() { type_ = static_cast<uint8_t>(ObEnumInnerType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_set_inner() { type_ = static_cast<uint8_t>(ObSetInnerType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+
+  OB_INLINE void set_clob() { type_ = static_cast<uint8_t>(ObLongTextType); set_collation_level(CS_LEVEL_IMPLICIT); set_default_collation_type(); }
+  OB_INLINE void set_blob() { type_ = static_cast<uint8_t>(ObLongTextType); set_collation_level(CS_LEVEL_IMPLICIT); set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_json()
+  {
+    type_ = static_cast<uint8_t>(ObJsonType);
+    set_collation_level(CS_LEVEL_IMPLICIT);
+    set_collation_type(CS_TYPE_UTF8MB4_BIN);
+  }
+  OB_INLINE void set_geometry()
+  {
+    type_ = static_cast<uint8_t>(ObGeometryType);
+    set_collation_level(CS_LEVEL_IMPLICIT);
+    set_collation_type(CS_TYPE_BINARY);
+  }
+
+  OB_INLINE void set_roaringbitmap()
+  {
+    type_ = static_cast<uint8_t>(ObRoaringBitmapType);
+    set_collation_level(CS_LEVEL_IMPLICIT);
+    set_collation_type(CS_TYPE_BINARY);
+  }
+  OB_INLINE void set_otimestamp_type(const ObObjType type) { type_ = static_cast<uint8_t>(type); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_timestamp_tz() { set_otimestamp_type(ObTimestampTZType); }
+  OB_INLINE void set_timestamp_ltz() { set_otimestamp_type(ObTimestampLTZType); }
+  OB_INLINE void set_timestamp_nano() { set_otimestamp_type(ObTimestampNanoType); }
+  OB_INLINE void set_interval_ym() { type_ = static_cast<uint8_t>(ObIntervalYMType); set_collation_level(CS_LEVEL_NUMERIC); set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_interval_ds() { type_ = static_cast<uint8_t>(ObIntervalDSType); set_collation_level(CS_LEVEL_NUMERIC); set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_nvarchar2() { type_ = static_cast<uint8_t>(ObNVarchar2Type); }
+  OB_INLINE void set_nchar() { type_ = static_cast<uint8_t>(ObNCharType); }
+  OB_INLINE void set_urowid()
+  {
+    type_ = static_cast<uint8_t>(ObURowIDType);
+    set_collation_level(CS_LEVEL_NUMERIC);
+    set_collation_type(CS_TYPE_BINARY);
+  }
+
+  OB_INLINE void set_clob_locator() { type_ = static_cast<uint8_t>(ObLobType); set_default_collation_type(); }
+  OB_INLINE void set_blob_locator() { type_ = static_cast<uint8_t>(ObLobType); set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_decimal_int() { type_ = static_cast<uint8_t>(ObDecimalIntType); set_collation_level(CS_LEVEL_NUMERIC);set_collation_type(CS_TYPE_BINARY); }
+  OB_INLINE void set_decimal_int(ObScale scale)
+  {
+    set_decimal_int();
+    scale_ = scale;
+  }
+
+  OB_INLINE bool is_valid() const { return ob_is_valid_obj_type(static_cast<ObObjType>(type_)); }
+  OB_INLINE bool is_invalid() const { return !ob_is_valid_obj_type(static_cast<ObObjType>(type_)); }
+
+  OB_INLINE bool is_null() const { return type_ == static_cast<uint8_t>(ObNullType); }
+  OB_INLINE bool is_tinyint() const { return type_ == static_cast<uint8_t>(ObTinyIntType); }
+  OB_INLINE bool is_smallint() const { return type_ == static_cast<uint8_t>(ObSmallIntType); }
+  OB_INLINE bool is_mediumint() const { return type_ == static_cast<uint8_t>(ObMediumIntType); }
+  OB_INLINE bool is_int32() const { return type_ == static_cast<uint8_t>(ObInt32Type); }
+  OB_INLINE bool is_int() const { return type_ == static_cast<uint8_t>(ObIntType); }
+  OB_INLINE bool is_utinyint() const { return type_ == static_cast<uint8_t>(ObUTinyIntType); }
+  OB_INLINE bool is_usmallint() const { return type_ == static_cast<uint8_t>(ObUSmallIntType); }
+  OB_INLINE bool is_umediumint() const { return type_ == static_cast<uint8_t>(ObUMediumIntType); }
+  OB_INLINE bool is_uint32() const { return type_ == static_cast<uint8_t>(ObUInt32Type); }
+  OB_INLINE bool is_uint64() const { return type_ == static_cast<uint8_t>(ObUInt64Type); }
+  OB_INLINE bool is_float() const { return type_ == static_cast<uint8_t>(ObFloatType); }
+  OB_INLINE bool is_double() const { return type_ == static_cast<uint8_t>(ObDoubleType); }
+  OB_INLINE bool is_ufloat() const { return type_ == static_cast<uint8_t>(ObUFloatType); }
+  OB_INLINE bool is_udouble() const { return type_ == static_cast<uint8_t>(ObUDoubleType); }
+  OB_INLINE bool is_number() const { return type_ == static_cast<uint8_t>(ObNumberType); }
+  OB_INLINE bool is_unumber() const { return type_ == static_cast<uint8_t>(ObUNumberType); }
+  OB_INLINE bool is_number_float() const { return type_ == static_cast<uint8_t>(ObNumberFloatType); }
+  OB_INLINE bool is_datetime() const { return type_ == static_cast<uint8_t>(ObDateTimeType); }
+  OB_INLINE bool is_mysql_datetime() const { return type_ == static_cast<uint8_t>(ObMySQLDateTimeType); }
+  OB_INLINE bool is_timestamp() const { return type_ == static_cast<uint8_t>(ObTimestampType); }
+  OB_INLINE bool is_year() const { return type_ == static_cast<uint8_t>(ObYearType); }
+  OB_INLINE bool is_date() const { return type_ == static_cast<uint8_t>(ObDateType); }
+  OB_INLINE bool is_mysql_date() const { return type_ == static_cast<uint8_t>(ObMySQLDateType); }
+  OB_INLINE bool is_mysql_date_or_date() const { return is_date() || is_mysql_date(); }
+  OB_INLINE bool is_mysql_datetime_or_datetime() const { return is_datetime() || is_mysql_datetime(); }
+  OB_INLINE bool is_time() const { return type_ == static_cast<uint8_t>(ObTimeType); }
+  OB_INLINE bool is_timestamp_tz() const { return type_ == static_cast<uint8_t>(ObTimestampTZType); }
+  OB_INLINE bool is_timestamp_ltz() const { return type_ == static_cast<uint8_t>(ObTimestampLTZType); }
+  OB_INLINE bool is_timestamp_nano() const { return type_ == static_cast<uint8_t>(ObTimestampNanoType); }
+  OB_INLINE bool is_interval_ym() const {  return type_ == static_cast<uint8_t>(ObIntervalYMType); }
+  OB_INLINE bool is_interval_ds() const {  return type_ == static_cast<uint8_t>(ObIntervalDSType); }
+  OB_INLINE bool is_nvarchar2() const { return type_ == static_cast<uint8_t>(ObNVarchar2Type); }
+  OB_INLINE bool is_nchar() const { return type_ == static_cast<uint8_t>(ObNCharType); }
+  OB_INLINE bool is_decimal_int() const { return type_ == static_cast<uint8_t>(ObDecimalIntType); }
+  OB_INLINE bool is_varchar() const
+  {
+    return ((type_ == static_cast<uint8_t>(ObVarcharType)) && (CS_TYPE_BINARY != get_collation_type()));
+  }
+  OB_INLINE bool is_char() const
+  {
+    return ((type_ == static_cast<uint8_t>(ObCharType)) && (CS_TYPE_BINARY != get_collation_type()));
+  }
+  OB_INLINE bool is_varbinary() const
+  {
+    return (type_ == static_cast<uint8_t>(ObVarcharType) && CS_TYPE_BINARY == get_collation_type());
+  }
+  static bool is_binary(const ObObjType type, const ObCollationType cs_type)
+  {
+    return (ObCharType == type && CS_TYPE_BINARY == cs_type);
+  }
+  OB_INLINE bool is_binary() const
+  {
+    return is_binary(static_cast<ObObjType>(type_), get_collation_type());
+  }
+  OB_INLINE bool is_cs_collation_free() const
+  {
+    return get_collation_type() == CS_TYPE_UTF8MB4_GENERAL_CI || get_collation_type() == CS_TYPE_UTF8MB4_BIN;
+  }
+  OB_INLINE bool is_hex_string() const { return type_ == static_cast<uint8_t>(ObHexStringType); }
+  OB_INLINE bool is_raw() const { return type_ == static_cast<uint8_t>(ObRawType); }
+  OB_INLINE bool is_ext() const { return type_ == static_cast<uint8_t>(ObExtendType); }
+  OB_INLINE bool is_ext_sql_array() const { return is_ext() && get_extend_type() == T_EXT_SQL_ARRAY; }
+  OB_INLINE bool is_unknown() const { return type_ == static_cast<uint8_t>(ObUnknownType); }
+  OB_INLINE bool is_bit() const { return type_ == static_cast<uint8_t>(ObBitType); }
+  OB_INLINE bool is_enum() const { return type_ == static_cast<uint8_t>(ObEnumType); }
+  OB_INLINE bool is_set() const { return type_ == static_cast<uint8_t>(ObSetType); }
+  OB_INLINE bool is_enum_or_set() const { return type_ == static_cast<uint8_t>(ObEnumType)
+    || type_ == static_cast<uint8_t>(ObSetType); }
+  OB_INLINE bool is_text() const
+  {
+    return (ob_is_text_tc(get_type()) && CS_TYPE_BINARY != get_collation_type());
+  }
+  /*OB_INLINE bool is_oracle_clob() const
+  {
+    return (lib::is_oracle_mode() && ObLongTextType == get_type() && CS_TYPE_BINARY != get_collation_type());
+  }*/
+  OB_INLINE bool is_clob() const
+  {
+    return (lib::is_oracle_mode() && ObLongTextType == get_type() && CS_TYPE_BINARY != get_collation_type());
+  }
+  /*OB_INLINE bool is_oracle_blob() const
+  {
+    return (lib::is_oracle_mode() && ObLongTextType == get_type() && CS_TYPE_BINARY == get_collation_type());
+  }*/
+  OB_INLINE bool is_blob() const
+  {
+    return (ob_is_text_tc(get_type()) && CS_TYPE_BINARY == get_collation_type());
+  }
+  OB_INLINE bool is_lob_storage() const
+  { return ob_is_large_text(get_type())
+           || ob_is_json_tc(get_type())
+           || ob_is_geometry_tc(get_type())
+           || ob_is_roaringbitmap_tc(get_type())
+           || ob_is_collection_sql_type(get_type()); }
+  OB_INLINE bool is_lob() const { return ob_is_text_tc(get_type()); }
+
+  OB_INLINE bool is_json() const { return type_ == static_cast<uint8_t>(ObJsonType); }
+
+  OB_INLINE bool is_geometry() const { return type_ == static_cast<uint8_t>(ObGeometryType); }
+
+  OB_INLINE bool is_roaringbitmap() const { return type_ == static_cast<uint8_t>(ObRoaringBitmapType); }
+
+  // combination of above functions.
+  OB_INLINE bool is_varbinary_or_binary() const { return is_varbinary() || is_binary(); }
+  OB_INLINE bool is_varchar_or_char() const { return is_varchar() || is_char(); }
+  OB_INLINE bool is_nstring() const { return is_nvarchar2() || is_nchar(); }
+  OB_INLINE bool is_fixed_len_char_type() const { return is_char() || is_nchar(); }
+  OB_INLINE bool is_varying_len_char_type() const { return is_varchar() || is_nvarchar2(); }
+  OB_INLINE bool is_character_type() const { return is_nstring() || is_varchar_or_char(); }
+  OB_INLINE bool is_collation_free_compatible() const { return is_character_type() && is_cs_collation_free(); }
+  OB_INLINE bool is_numeric_type() const { return ob_is_numeric_type(get_type()); }
+  OB_INLINE bool is_integer_type() const { return ob_is_integer_type(get_type()); }
+  OB_INLINE bool is_string_type() const { return ob_is_string_tc(get_type()) || ob_is_text_tc(get_type()); }
+  OB_INLINE bool is_string_or_lob_locator_type() const {
+    return ob_is_string_tc(get_type()) || ob_is_text_tc(get_type()) || is_lob_locator();
+  }
+  OB_INLINE bool is_temporal_type() const { return ob_is_temporal_type(get_type()); }
+  OB_INLINE bool is_unsigned_integer() const
+  {
+    return (static_cast<uint8_t>(ObUTinyIntType) <= type_
+         && static_cast<uint8_t>(ObUInt64Type)   >= type_);
+  }
+  OB_INLINE bool is_signed_integer() const
+  {
+    return (static_cast<uint8_t>(ObTinyIntType) <= type_
+        && static_cast<uint8_t>(ObIntType)   >= type_);
+  }
+  OB_INLINE bool is_unsigned() const {
+    return (static_cast<uint8_t>(ObUTinyIntType) <= type_
+         && static_cast<uint8_t>(ObUInt64Type)   >= type_)
+        || static_cast<uint8_t>(ObUNumberType) == type_
+        || static_cast<uint8_t>(ObUDoubleType) == type_
+        || static_cast<uint8_t>(ObUFloatType) == type_;
+  }
+  OB_INLINE bool is_enumset_inner_type() const { return static_cast<uint8_t>(ObEnumInnerType) == type_
+    || static_cast<uint8_t>(ObSetInnerType) == type_;}
+  OB_INLINE bool is_otimestamp_type() const { return ObTimestampTZType <= get_type() && get_type() <= ObTimestampNanoType; }
+  OB_INLINE bool is_oracle_decimal() const { return ObNumberType == type_ || ObFloatType == type_ || ObDoubleType == type_ || ObDecimalIntType == type_; }
+
+  OB_INLINE bool is_urowid() const { return ObURowIDType == type_; }
+  OB_INLINE bool is_blob_locator() const { return (ObLobType == type_ && CS_TYPE_BINARY == get_collation_type()); }
+  OB_INLINE bool is_clob_locator() const { return (ObLobType == type_ && CS_TYPE_BINARY != get_collation_type()); }
+  OB_INLINE bool is_lob_locator() const { return ObLobType == type_; }
+
+  OB_INLINE bool is_interval_type() const { return is_interval_ds() || is_interval_ym(); }
+  OB_INLINE bool is_oracle_temporal_type() const { return is_datetime() || is_otimestamp_type() || is_interval_type(); }
+
+  OB_INLINE void set_cs_level(uint8_t cs_level) {
+    cs_level_ = cs_level;
+  }
+  OB_INLINE uint8_t get_cs_level() const {
+    return cs_level_;
+  }
+  OB_INLINE void set_cs_type(uint8_t cs_type) {
+    cs_type_ = cs_type;
+  }
+  OB_INLINE uint8_t get_cs_type() const {
+    return cs_type_;
+  }
+
+  OB_INLINE void set_collation_level(ObCollationLevel cs_level) {
+    cs_level_ = (cs_level_ & 0xF0) | (cs_level & 0xF);
+  }
+  OB_INLINE void set_collation_type(ObCollationType cs_type) {
+    cs_type_ = (cs_type & 0xFF);
+    cs_level_ = (cs_level_ & 0xF) | ((cs_type & 0xF00) >> 4);
+  }
+  OB_INLINE ObCollationType get_collation_type() {
+    return (is_user_defined_sql_type() || is_collection_sql_type() || is_decimal_int()) ? CS_TYPE_BINARY:
+              static_cast<ObCollationType>((uint16_t)cs_type_ | (((uint16_t)cs_level_ & 0xF0) << 4));
+  }
+  OB_INLINE ObCollationType get_collation_type() const {
+    // ObUserDefinedSQLType reused cs_type as part of sub schema id,
+    // ObDecimalIntType reuse cs_type as precision, therefore always return CS_TYPE_BINARY.
+    return (is_user_defined_sql_type() || is_collection_sql_type() || is_decimal_int()) ? CS_TYPE_BINARY :
+                static_cast<ObCollationType>((uint16_t)cs_type_ | (((uint16_t)cs_level_ & 0xF0) << 4) );
+  }
+  OB_INLINE void set_default_collation_type() { set_collation_type(ObCharset::get_default_collation(ObCharset::get_default_charset())); }
+  OB_INLINE ObCollationLevel get_collation_level() const {
+    // ObUserDefinedSQLType and ObCollectionSQLType reused cs_level as part of sub schema id,
+    // therefore always return CS_LEVEL_EXPLICIT.
+    return (is_user_defined_sql_type() || is_collection_sql_type()) ? CS_LEVEL_EXPLICIT:
+              static_cast<ObCollationLevel>(cs_level_ & 0x0F);
+  }
+ 
+  OB_INLINE ObCharsetType get_charset_type() const {
+    return ObCharset::charset_type_by_coll(get_collation_type());
+  }
+  OB_INLINE bool is_collation_invalid() const
+  {
+    return CS_LEVEL_INVALID == cs_level_ && CS_TYPE_INVALID == cs_type_;
+  }
+  OB_INLINE void set_collation(const ObObjMeta &other)
+  {
+    cs_level_ = other.cs_level_;
+    cs_type_ = other.cs_type_;
+  }
+  OB_INLINE void set_scale(const ObScale scale) { scale_ = static_cast<int8_t>(scale); }
+  OB_INLINE ObScale get_scale() const { return static_cast<ObScale>(scale_); }
+  OB_INLINE void set_extend_type(uint8_t type) { extend_type_ = type; }
+  OB_INLINE uint8_t get_extend_type() const { return is_ext() ? extend_type_ : -1; }
+  OB_INLINE bool is_pl_extend_type() const
+  {
+    return is_ext() && extend_type_ > 0
+                    && extend_type_ < T_EXT_SQL_ARRAY;
+  }
+
+// to_string function is used to calc the result of ObExprCmpMeta, can not be modified
+#ifdef NDEBUG
+  TO_STRING_KV(N_TYPE, inner_obj_type_str(static_cast<ObObjType>(type_)),
+               N_COLLATION, ObCharset::collation_name(get_collation_type()),
+               N_COERCIBILITY, ObCharset::collation_level(get_collation_level()));
+#else
+  DECLARE_TO_STRING
+  {
+    int64_t pos = 0;
+    J_OBJ_START();
+    J_KV(N_TYPE, inner_obj_type_str(static_cast<ObObjType>(type_)),
+         N_COLLATION, ObCharset::collation_name(get_collation_type()),
+         N_COERCIBILITY, ObCharset::collation_level(get_collation_level()));
+    if (is_enum_or_set() || is_collection_sql_type()) {
+      J_COMMA();
+      J_KV("subschema_id", get_subschema_id());
+    }
+    J_OBJ_END();
+    return pos;
+  }
+#endif
+  NEED_SERIALIZE_AND_DESERIALIZE;
+
+  static uint32_t type_offset_bits() { return offsetof(ObObjMeta, type_) * 8; }
+  static uint32_t cs_level_offset_bits() { return offsetof(ObObjMeta, cs_level_) * 8; }
+  static uint32_t cs_type_offset_bits() { return offsetof(ObObjMeta, cs_type_) * 8; }
+  static uint32_t scale_offset_bits() { return offsetof(ObObjMeta, scale_) * 8; }
+
+  OB_INLINE uint16_t get_subschema_id() const { return ((static_cast<uint16_t>(cs_type_)) << 8) | cs_level_; }
+  OB_INLINE void set_subschema_id(const uint16_t subschema_id) {
+    cs_type_ = (subschema_id >> 8) & UINT_MAX8;
+    cs_level_ = subschema_id & UINT_MAX8;
+  }
+  OB_INLINE uint8_t get_udt_flags() const { return scale_; }
+  OB_INLINE void set_udt_flags(uint8_t udt_flag) { scale_  = udt_flag; }
+  // UDTs are not lobs, but they may contain lob types
+  OB_INLINE void set_sql_udt(const uint16_t subschema_id) {
+    type_ = static_cast<uint8_t>(ObUserDefinedSQLType);
+    set_subschema_id(subschema_id);
+  }
+  OB_INLINE bool is_user_defined_sql_type() const { return ObUserDefinedSQLType == type_; }
+  OB_INLINE bool is_xml_sql_type() const { return (ObUserDefinedSQLType == type_ && get_subschema_id() == ObXMLSqlType); }
+  OB_INLINE bool is_calc_end_space() const {
+    return ((type_ == ObNVarchar2Type)
+             || (type_ == ObVarcharType && cs_type_ != CS_TYPE_BINARY))
+           && lib::is_oracle_mode();
+  }
+
+  void set_stored_precision(int16_t precision)
+  {
+    OB_ASSERT(precision <= OB_MAX_DECIMAL_PRECISION);
+    // if stored_numeric_precision < CS_LEVELINVALID, is's cs_level
+    // otherwise it's precision + cs_level_invalid
+    stored_numeric_precision_ = static_cast<uint8_t>(precision) + CS_LEVEL_INVALID;
+  }
+
+  int16_t get_stored_precision() const
+  {
+    OB_ASSERT(stored_numeric_precision_ >= CS_LEVEL_INVALID);
+    if (stored_numeric_precision_ <= CS_LEVEL_INVALID
+        || stored_numeric_precision_ > CS_LEVEL_INVALID + OB_MAX_DECIMAL_PRECISION) {
+      return PRECISION_UNKNOWN_YET;
+    } else {
+      return stored_numeric_precision_ - CS_LEVEL_INVALID;
+    }
+  }
+
+  OB_INLINE bool is_expectd_udt_type(const uint16_t subschema_id) const { return (ObUserDefinedSQLType == type_ && get_subschema_id() == subschema_id); }
+  OB_INLINE bool is_collection_sql_type() const { return ObCollectionSQLType == type_; }
+  OB_INLINE void set_collection(const uint16_t subschema_id)
+  {
+    type_ = static_cast<uint8_t>(ObCollectionSQLType);
+    set_subschema_id(subschema_id);
+  }
+protected:
+  uint8_t type_;
+  union
+  {
+    uint8_t cs_level_; // collation level, low bits of sub schema id if type_ is UDT
+    // only used in storage layer!!!
+    // numeric type's precision is stored here
+    uint8_t stored_numeric_precision_;
+  };
+  uint8_t cs_type_; // collation type, high bits of sub schema id if type_ is UDT
+  union {
+    int8_t scale_;  // scale, length of bit if type_ is ObBitType; reserved flags if type_ is UDT
+    uint8_t extend_type_; //detailed extend value(enum ObPLType), if type_ is ObExtendType
+  };
+};
+
+// @brief
+// ObLobId 是 lob 的唯一标识
+//    column_id 为所在列的 storage_column_id
+//    tablet_id_ 创建 lob 时所属主表的 tablet_id, 发生分区分裂后可能发生变化
+//    auto_inc_id_ 为自增列 id
+// 
+// ObLobId 会序列化为二进制串存储，读表时比较两个 ObLobId 的大小时会使用 memcmp, 
+// 需要将数字转换为大端存储，序列化后的字典序相对顺序才能保持一致
+struct ObLobId
+{
+  OB_UNIS_VERSION(1);
+public:
+  ObLobId();
+  ~ObLobId();
+  bool operator ==(const ObLobId &other) const;
+  bool operator !=(const ObLobId &other) const;
+  bool operator <(const ObLobId &other) const;
+  bool operator >(const ObLobId &other) const;
+  void assign(const ObLobId &other);
+  void assign(const uint64_t column_id, const uint64_t tablet_id, const uint64_t auto_inc_id);
+  void reset();
+  bool is_valid() const;
+  uint64_t hash() const;
+  int hash(uint64_t &hash_val) const;
+  ObString get_string() const;
+  int from_string(const ObString &lob_id);
+
+  uint64_t get_column_idx() const { return ntohll(column_idx_); }
+  uint64_t get_tablet_id() const { return ntohll(tablet_id_); }
+  uint64_t get_auto_inc_id() const { return ntohll(auto_inc_id_); }
+  void set_column_idx(const uint64_t column_idx) { column_idx_ = htonll(column_idx); }
+  void set_tablet_id(const uint64_t tablet_id) { tablet_id_ = htonll(tablet_id); }
+  void set_auto_inc_id(const uint64_t auto_inc_id) { auto_inc_id_ = htonll(auto_inc_id); }
+
+  static constexpr int64_t MAX_TO_STRING_BUF_SIZE = 128;
+
+  TO_STRING_KV("column_id", get_column_idx(), "tablet_id", get_tablet_id(), "auto_inc_id", get_auto_inc_id());
+private:
+  uint64_t column_idx_;
+  uint64_t tablet_id_;
+  uint64_t auto_inc_id_;
+};  
+STATIC_ASSERT(sizeof(ObLobId) == 24, "the size of ObLobId is not 24");
+
+struct ObLobDataOutRowCtx
+{
+  static const int64_t OUTROW_LOB_CHUNK_SIZE_UNIT = 1024; // 1KB
+  enum OpType
+  {
+    SQL = 0, // all sql op
+    APPEND, // dbms lob op
+    INSERT,
+    WRITE,
+    ERASE,
+    EMPTY_SQL, // lob col not change in full sql update, out row ctx is empty
+    DIFF,
+    EXT_INFO_LOG,  // only used in new row value
+    VALID_OLD_VALUE_EXT_INFO_LOG,
+    VALID_OLD_VALUE,
+    DIFF_V2, // add lob id in ext info log, so deprecated old, use new diff type
+  };
+  ObLobDataOutRowCtx()
+    : is_full_(0), op_(0), offset_(0), check_sum_(0), seq_no_st_(0), seq_no_cnt_(0),
+      del_seq_no_cnt_(0), modified_len_(0), first_meta_offset_(0), chunk_size_(0), reserved_(0)
+  {}
+  TO_STRING_KV(K_(is_full), K_(op), K_(offset), K_(check_sum), K_(seq_no_st), K_(seq_no_cnt),
+    K_(del_seq_no_cnt), K_(modified_len), K_(first_meta_offset), K_(chunk_size), K_(reserved));
+  uint64_t is_full_ : 1;
+  uint64_t op_ : 8;
+  uint64_t offset_ : 55;
+  uint64_t check_sum_;
+  int64_t seq_no_st_;
+  uint32_t seq_no_cnt_;
+  uint32_t del_seq_no_cnt_; // for sql update
+  uint64_t modified_len_;
+  uint32_t first_meta_offset_ : 24;
+  uint32_t chunk_size_ : 8;   // unit is kb
+  // this is 8 bytes aligned, so left 4 byte
+  // and this field is added later when bug is found, and may be a random value
+  uint32_t reserved_;
+
+  bool is_append() const { return OpType::APPEND == op_; }
+  bool is_insert() const { return OpType::INSERT == op_; }
+  bool is_write() const { return OpType::WRITE == op_; }
+  bool is_erase() const { return OpType::ERASE == op_; }
+  bool is_diff_v1() const { return OpType::DIFF == op_;}
+  bool is_diff() const { return OpType::DIFF == op_ || OpType::DIFF_V2 == op_; }
+  bool is_ext_info_log() const { return OpType::EXT_INFO_LOG == op_; }
+  bool is_valid_old_value() const { return OpType::VALID_OLD_VALUE == op_; }
+  bool is_valid_old_value_ext_info_log() const { return OpType::VALID_OLD_VALUE_EXT_INFO_LOG == op_; }
+  int64_t get_real_chunk_size() const;
+};
+
+struct ObLobData
+{
+  ObLobData()
+    : id_(), byte_size_(0)
+  {}
+  bool operator ==(const ObLobData &other) const;
+  bool operator !=(const ObLobData &other) const;
+  TO_STRING_KV(K_(id), K_(byte_size));
+  void reset();
+  ObLobId id_;
+  uint64_t byte_size_;
+  char buffer_[0];
+};
+
+struct ObLobCommon
+{
+  static const int64_t LOB_DATA_VERSION = 1;
+  ObLobCommon() : version_(LOB_DATA_VERSION), in_row_(1), is_mem_loc_(0), reserved_(0) {}
+  bool operator ==(const ObLobCommon &other) const;
+  bool operator !=(const ObLobCommon &other) const;
+  TO_STRING_KV(K_(version), K_(in_row), K_(is_mem_loc), K_(reserved));
+  // @breif get the entire disk lob locator size
+  // @param byte_size, only used when in_row_ is true
+  int64_t get_handle_size(int64_t byte_size) const
+  {
+    int64_t s = static_cast<int64_t>(offsetof(ObLobCommon, buffer_));
+    if (in_row_) {
+      s += byte_size;
+    } else {
+      s += sizeof(ObLobId);
+    }
+    return s;
+  }
+  // @brief get the byte size of the lob data, only used when in_row_ is true
+  // @param handle_size, the entire disk lob locator size
+  int64_t get_byte_size(int64_t handle_size) const
+  {
+    return handle_size - static_cast<int64_t>(offsetof(ObLobCommon, buffer_));
+  }
+  const char* get_inrow_data_ptr() const
+  {
+    return in_row_ ? buffer_ : nullptr; 
+  }
+  void reset();
+  OB_INLINE bool is_valid() const 
+  {
+    return (version_ == LOB_DATA_VERSION) && (reserved_ == 0);
+  }
+  uint8_t version_        : 2; 
+  uint8_t in_row_         : 1;
+  uint8_t is_mem_loc_     : 1;
+  uint8_t reserved_       : 4;
+  char buffer_[0];
+};
+
+STATIC_ASSERT(sizeof(ObLobCommon) == 1, "size of ObLobCommon isn't equal to 1");
+
+//We always get/convert/build locator from existing buffer
+#define LOB_DEFAULT_FLAGS UINT16_C(0)
+#define LOB_COMPAT_MODE_FLAG (INT64_C(1) << 0) // 1 means old heap table without rowid, fake locator
+#define LOB_OPEN_MODE_FLAG (INT64_C(1) << 1) // 0 means lob_readwrite, 1 means lob_readonly
+#define LOB_IS_OPEN_FLAG (INT64_C(1) << 2) // 0 means is close, 1 means is open
+
+struct ObLobLocator
+{
+  static const uint32_t MAGIC_CODE = 0x4C4F4221; //LOB!
+  static const uint32_t LOB_LOCATOR_VERSION = 1;
+  ObLobLocator() = delete;
+  ~ObLobLocator() = delete;
+  OB_INLINE bool is_valid() const
+  {
+    return magic_code_ == MAGIC_CODE && version_ == LOB_LOCATOR_VERSION && snapshot_version_ >= 0
+           && is_valid_id(table_id_) && is_valid_id(column_id_)
+           && option_ == 0;
+  }
+  OB_INLINE bool is_fake_locator() const { return !is_inline_mode(); }
+  int init(const uint64_t table_id,
+           const uint32_t column_id,
+           const int64_t snapshot_version,
+           const uint16_t flags,
+           const ObString &rowid,
+           const ObString &payload);
+  int init(const ObString &payload); // init a lob locator with fake rowid/table_id and etc.
+  int get_rowid(ObString &rowid) const;
+  int get_payload(ObString &payload) const;
+  OB_INLINE int64_t get_data_length() const { return (payload_offset_ + payload_size_); }
+  OB_INLINE int64_t get_total_size() const { return offsetof(ObLobLocator, data_) + get_data_length(); }
+  OB_INLINE uint32_t get_payload_length() const { return payload_size_; }
+  //TODO @shanting to be deleted
+  OB_INLINE const char *get_payload_ptr() const { return &data_[payload_offset_]; }
+  OB_INLINE void add_flag(int64_t flag) { flags_ |= flag; }
+  OB_INLINE void del_flag(int64_t flag) { flags_ &= ~flag; }
+  OB_INLINE void set_inline_mode() { del_flag(LOB_COMPAT_MODE_FLAG); }
+  OB_INLINE void set_compat_mode() { add_flag(LOB_COMPAT_MODE_FLAG); }
+  OB_INLINE bool is_inline_mode() const { return !(flags_ & LOB_COMPAT_MODE_FLAG); }
+  OB_INLINE void set_readwrite() { del_flag(LOB_OPEN_MODE_FLAG); }
+  OB_INLINE void set_readonly() { add_flag(LOB_OPEN_MODE_FLAG); }
+  OB_INLINE bool is_readwrite() const { return !(flags_ & LOB_OPEN_MODE_FLAG); }
+  OB_INLINE void set_is_close() { del_flag(LOB_IS_OPEN_FLAG); }
+  OB_INLINE void set_is_open() { add_flag(LOB_IS_OPEN_FLAG); }
+  OB_INLINE bool is_open() const { return (flags_ & LOB_IS_OPEN_FLAG); }
+
+  DECLARE_TO_STRING;
+
+  uint32_t magic_code_;
+  uint32_t version_;
+  int64_t  snapshot_version_;
+  uint64_t table_id_;
+  uint32_t column_id_;
+  uint16_t flags_;
+  uint16_t option_; // storage option: compress/ encrypt / dedup
+  uint32_t payload_offset_; //  == rowid_size; payload = data_ + payload_offset_
+  uint32_t payload_size_;
+  char data_[0]; // rowid + varchar
+};
+
+// New In-Memory LobLocator
+enum ObMemLobType
+{
+  INVALID_LOB = 0,
+  PERSISTENT_LOB = 1,
+  TEMP_FULL_LOB = 2,
+  APPEND_DELTA_LOB = 3,  // FARM COMPAT WHITELIST
+  MAX_LOB_TYPE
+};
+
+struct ObMemLobCommon
+{
+  static const uint8_t MEM_LOB_LOCATOR_VERSION = 1;
+
+  ObMemLobCommon(const ObMemLobType type)
+    : lob_common_(),
+      version_(MEM_LOB_LOCATOR_VERSION),
+      type_(type),
+      read_only_(0),
+      has_extern_(0),
+      has_payload_(0),
+      is_freed_(0),
+      reserved_(0),
+      disk_locator_size_(0),
+      payload_offset_(0),
+      payload_size_(0)
+  {
+    lob_common_.is_mem_loc_ = 1;
+  }
+
+  OB_INLINE void set_read_only(bool is_read_only) { read_only_ = is_read_only ? 1 : 0; }
+  OB_INLINE void set_has_extern(bool has_extern) { has_extern_ = has_extern ? 1 : 0; };
+  OB_INLINE void set_has_payload(bool has_payload) { has_payload_ = has_payload ? 1 : 0; }
+  OB_INLINE void set_freed(bool freed) { is_freed_ = freed ? 1 : 0; };
+
+  OB_INLINE bool is_read_only() const { return read_only_ == 1; }
+  OB_INLINE bool has_extern() const {return has_extern_ == 1; }
+  OB_INLINE bool has_payload() const { return has_payload_ == 1; }
+  OB_INLINE bool has_data() const { return lob_common_.in_row_ || has_payload_; }
+  OB_INLINE bool is_freed() const {return is_freed_ == 1; }
+  OB_INLINE bool is_persist() const { return type_ == PERSISTENT_LOB; }
+  OB_INLINE bool is_temporary_full() const { return type_ == TEMP_FULL_LOB; }
+  OB_INLINE bool is_append_delta() const { return type_ == APPEND_DELTA_LOB; }
+
+  OB_INLINE bool is_valid() const 
+  {
+    bool bret = lob_common_.is_valid()
+                && (version_ == MEM_LOB_LOCATOR_VERSION)
+                && (type_ > INVALID_LOB && type_ < MAX_LOB_TYPE);
+    if (!bret) {
+      COMMON_LOG_RET(ERROR, common::OB_INVALID_ARGUMENT, "Invalid lob locator!",
+        K(lob_common_), K(version_), K(type_), K(has_extern_));
+    }
+    return bret;
+  }
+
+  TO_STRING_KV(K_(lob_common), K_(version), K_(read_only), K_(has_extern), K_(has_payload), K_(is_freed), K_(reserved), K_(disk_locator_size), K_(payload_offset), K_(payload_size));
+
+  ObLobCommon lob_common_;
+  uint8_t version_           : 4;
+  uint8_t type_              : 4; // ObMemLobType (Persistent/TempFull/AppendDelta)
+  uint8_t read_only_         : 1;
+  uint8_t has_extern_        : 1; // Indicate whether the lob locator has extern segment
+  uint8_t has_payload_       : 1; // Indicate whether the lob locator has payload segment which contain lob disk locator
+  uint8_t is_freed_          : 1; // Indicate whether the temp lob locator has been freed
+  uint64_t reserved_         : 44;
+  uint32_t disk_locator_size_;
+  uint32_t payload_offset_;
+  uint64_t payload_size_;
+  char buffer_[0];
+};
+
+STATIC_ASSERT(sizeof(ObMemLobCommon) == 24, "size of ObMemLobCommon isn't equal to 24");
+
+struct ObMemLobLocationInfo
+{
+  ObMemLobLocationInfo()
+    : tablet_id_(OB_INVALID_ID),
+      ls_id_(-1),
+      addr_()
+  {}
+  
+  TO_STRING_KV(K_(tablet_id), K_(ls_id), K_(addr));
+
+  uint64_t tablet_id_;
+  int64_t ls_id_;
+  ObAddr addr_;
+  char buffer_[0];
+};
+
+STATIC_ASSERT(sizeof(ObMemLobLocationInfo) == 40, "sizeof ObMemLobLocationInfo isn't equal to 40");
+
+struct ObMemLobRetryInfo
+{
+  ObMemLobRetryInfo()
+    : select_leader_(0),
+      read_latest_(0),
+      reserved_(0),
+      timeout_(0)
+  {}
+  TO_STRING_KV(K_(select_leader), K_(read_latest), K_(reserved), K_(timeout));
+  uint64_t select_leader_ : 1;
+  uint64_t read_latest_ : 1;
+  uint64_t reserved_ : 62;
+  uint64_t timeout_;
+};
+
+STATIC_ASSERT(sizeof(ObMemLobRetryInfo) == 16, "sizeof ObMemLobRetryInfo isn't equal to 16");
+
+struct ObMemLobReadSnapshot
+{
+  ObMemLobReadSnapshot(): version_(0), size_(0) {}
+  
+  TO_STRING_KV(K_(version), K_(size));
+  uint32_t version_ : 4;
+  uint32_t size_ : 28;
+  char buffer_[0];
+};
+
+STATIC_ASSERT(sizeof(ObMemLobReadSnapshot) == 4, "sizeof ObMemLobReadSnapshot isn't equal to 4");
+
+// Memory Locator Extern Header
+struct ObMemLobExternHeader
+{
+  ObMemLobExternHeader()
+    : table_id_(OB_INVALID_ID),
+      column_idx_(UINT32_MAX),
+      cs_type_(CS_TYPE_INVALID),
+      body_size_(0),
+      has_location_info_(0),
+      has_retry_info_(0),
+      has_read_snapshot_(0),
+      has_row_key_(0),
+      reserved_(0),
+      rowkey_size_(0),
+      reserved2_(0)
+  {}
+
+  bool is_empty() const { return body_size_ == 0; }
+
+  TO_STRING_KV(K_(table_id), K_(column_idx), K_(cs_type), K_(body_size), K_(has_location_info),
+               K_(has_retry_info), K_(has_read_snapshot), K_(has_row_key), K_(reserved), K_(rowkey_size));
+
+  uint64_t table_id_;
+  uint32_t column_idx_;
+  ObCollationType cs_type_;
+  uint32_t body_size_           : 16;
+  uint32_t has_location_info_   : 1;
+  uint32_t has_retry_info_      : 1;
+  uint32_t has_read_snapshot_   : 1;
+  uint32_t has_row_key_         : 1;
+  uint32_t reserved_            : 12;
+  uint16_t rowkey_size_;
+  // explicit tail padding: keep offsetof(buffer_) == sizeof so that the
+  // flexible-array buffer_ matches the sizeof-based layout used by the builder.
+  uint16_t reserved2_;
+  char buffer_[0];
+};
+
+STATIC_ASSERT(sizeof(ObMemLobExternHeader) == 24, "sizeof ObMemLobExternHeader isn't equal to 24");
+STATIC_ASSERT(offsetof(ObMemLobExternHeader, buffer_) == sizeof(ObMemLobExternHeader),
+              "ObMemLobExternHeader::buffer_ must start at sizeof boundary");
+
+
+// ObLobLocator can indicate Disk Locator and In-Memory Locator.
+// In-Memory LobLocator Content:
+// ObMemLobCommon       (all lobs)   |
+// ObMemLobExternHeader (has extern) |
+// ObMemLobExternBody
+//   ObMemLobLocationInfo
+//   ObMemLobRetryInfo
+//   ObMemLobReadSnapshot
+//   row-key
+// DiskLocator
+//   ObLobCommon
+//   ObLobId           (if outrow)
+//   ObTxSEQ           (if outrow)
+//   inrow-data        (if inrow)
+// payload             (has payload) |
+struct ObLobLocatorV2
+{
+OB_UNIS_VERSION(1);
+public:
+  static const uint32_t MEM_LOB_COMMON_HEADER_LEN = sizeof(ObMemLobCommon);
+  static const uint32_t MEM_LOB_EXTERN_HEADER_LEN = sizeof(ObMemLobExternHeader);
+  static const uint32_t MEM_LOB_EXTERN_LOCATIONINFO_LEN = sizeof(ObMemLobLocationInfo);
+  static const uint32_t MEM_LOB_EXTERN_RETRYINFO_LEN = sizeof(ObMemLobRetryInfo);
+  static const uint16_t MEM_LOB_EXTERN_SIZE_LEN = sizeof(uint16_t);
+  // outrow disk locator layout: ObLobCommon + ObLobId + ObTxSEQ.
+  // oblib can not depend on the transaction layer, so use sizeof(int64_t) here
+  // (static_assert(sizeof(ObTxSEQ) == sizeof(int64_t)) guarantees they match).
+  static const int64_t DISK_LOB_OUTROW_FULL_SIZE = sizeof(ObLobCommon) + sizeof(ObLobId) + sizeof(int64_t);
+  static int64_t get_append_delta_header_len()
+  {
+    return sizeof(ObMemLobCommon) + sizeof(ObMemLobExternHeader);
+  }
+
+  ObLobLocatorV2() : ptr_(NULL), size_(0) {}
+  ObLobLocatorV2(char *loc_ptr, uint32_t loc_size) :
+    ptr_(loc_ptr), size_(loc_size)
+  {
+  }
+  ObLobLocatorV2(ObString &lob_str) :
+    ptr_(lob_str.ptr()), size_(lob_str.length())
+  {
+  }
+  ObLobLocatorV2(const ObString &lob_str) :
+    ptr_(const_cast<char *>(lob_str.ptr())), size_(lob_str.length())
+  {
+  }
+
+  ~ObLobLocatorV2() {}
+
+  DECLARE_TO_STRING;
+
+  // TODO fengyun，需要删除
+  OB_INLINE bool is_lob_locator_v1() const
+  {
+    return false;
+  }
+
+  OB_INLINE bool is_lob_disk_locator() const
+  {
+    // Notice: should be called only when ptr_ is not null
+    ObLobCommon *loc = reinterpret_cast<ObLobCommon *>(ptr_);
+    return (loc != nullptr) && (size_ >= sizeof(ObLobCommon)) &&
+           (loc->is_valid()) && (loc->is_mem_loc_ == 0);
+  }
+
+  OB_INLINE bool is_inrow_disk_lob_locator() const
+  {
+    // Notice: should be called only when ptr_ is not null
+    ObLobCommon *loc = reinterpret_cast<ObLobCommon *>(ptr_);
+    return (loc != nullptr) && (size_ >= sizeof(ObLobCommon)) &&
+           (loc->is_valid()) && (loc->is_mem_loc_ == 0) && (loc->in_row_);
+  }
+
+  OB_INLINE bool is_outrow_disk_lob_locator() const
+  {
+    ObLobCommon *loc = reinterpret_cast<ObLobCommon *>(ptr_);
+    return (loc != nullptr) && (size_ >= sizeof(ObLobCommon)) &&
+           (loc->is_valid()) && (loc->is_mem_loc_ == 0) && (!loc->in_row_);
+  }
+
+
+  OB_INLINE bool is_mem_tmp_lob_locator() const
+  {
+    return (is_valid(false)) && (!has_extern()) && (has_inrow_data());
+  }
+
+  OB_INLINE bool is_valid(bool is_assert = true) const
+  {
+    bool bret = true;
+    if (OB_UNLIKELY(size_ == 0)) {
+      // cannot validate when len is zero
+    } else if (OB_NOT_NULL(ptr_) && is_lob_disk_locator()) {
+      // cannot validate with disk
+    } else {
+      ObMemLobCommon *loc = reinterpret_cast<ObMemLobCommon *>(ptr_);
+      bret = (OB_NOT_NULL(loc) && size_ >= MEM_LOB_COMMON_HEADER_LEN) ? loc->is_valid() : false;
+      if (bret && loc->has_extern() && size_ < MEM_LOB_COMMON_HEADER_LEN + MEM_LOB_EXTERN_HEADER_LEN) {
+        bret = false;
+      }
+      if (!bret) {
+        COMMON_LOG_RET(ERROR, common::OB_INVALID_ARGUMENT, "Invalid lob locator!", KP(ptr_), K(size_), KPC(this));
+        if (OB_NOT_NULL(loc) && is_assert) {
+          OB_ASSERT(0);
+        }
+      }
+    }
+    return bret;
+  }
+  void reset()
+  {
+    ptr_ = nullptr;
+    size_ = 0;
+  }
+
+  // remove if not used
+  void assign_ptr(const ObMemLobCommon *lobv2, uint32 len)
+  {
+    ptr_ = reinterpret_cast<char *>(const_cast<ObMemLobCommon *>(lobv2));
+    size_ = len;
+  }
+
+  void assign_buffer(char *loc_buff, uint32 len)
+  {
+    ptr_ = loc_buff;
+    size_ = len;
+  }
+
+  OB_INLINE ObLobCommon *get_lob_common() const
+  {
+    ObLobCommon *lob_common = nullptr;
+    if (OB_NOT_NULL(ptr_) && size_ >= sizeof(ObLobCommon)) {
+      lob_common = reinterpret_cast<ObLobCommon *>(ptr_);
+    }
+    return lob_common;
+  }
+
+  OB_INLINE ObMemLobCommon *get_mem_lob_common() const
+  {
+    ObMemLobCommon *mem_loc = nullptr;
+    if (OB_NOT_NULL(ptr_) && !is_lob_disk_locator() && size_ >= MEM_LOB_COMMON_HEADER_LEN) {
+      mem_loc = reinterpret_cast<ObMemLobCommon *>(ptr_);
+    }
+    return mem_loc;
+  }
+
+  static int update_payload_size(ObString &dst, int64_t header_size, bool is_lob_v1);
+
+  int copy(const ObLobLocatorV2* src_locator) const;
+
+  // interfaces for read
+  // Notice: all the following functions should be called after is_valid()
+  int get_mem_locator(ObMemLobCommon *&mem_loc) const;
+  int get_extern_header(ObMemLobExternHeader *&extern_header) const;
+  int get_rowkey(ObString &rowkey_str) const;
+  int get_disk_locator(ObLobCommon *&disk_loc) const;
+  int get_disk_locator(ObString &disc_loc_buff) const;
+
+  int get_inrow_data(ObString &inrow_data) const;
+  // only supported in inrow
+  int get_lob_inrow_data_byte_len(int64_t &len) const;
+  int get_location_info(ObMemLobLocationInfo *&location_info) const;
+  int get_retry_info(ObMemLobRetryInfo *&retry_info) const;
+  int get_read_snapshot_data(ObString &data) const;
+  int get_real_locator_len(int64_t &real_len) const;
+  int get_chunk_size(int64_t &chunk_size) const;
+
+  bool is_empty_lob() const;
+  bool is_inrow() const;
+  bool is_null() const { return ptr_ == NULL || size_ == 0; }
+
+  OB_INLINE bool is_readonly() const
+  {
+    return OB_NOT_NULL(ptr_) &&
+           !is_lob_disk_locator() && size_ >= MEM_LOB_COMMON_HEADER_LEN &&
+           (reinterpret_cast<ObMemLobCommon *>(ptr_))->is_read_only();
+  }
+
+  OB_INLINE bool is_freed() const
+  {
+    return OB_NOT_NULL(ptr_) &&
+           !is_lob_disk_locator() && size_ >= MEM_LOB_COMMON_HEADER_LEN &&
+           (reinterpret_cast<ObMemLobCommon *>(ptr_))->is_freed();
+  }
+
+  OB_INLINE bool has_inrow_data() const
+  {
+    bool bret = false;
+    if (size_ == 0) {
+      bret = true;
+    } else if (is_inrow()) {
+      bret = true;
+    } else {
+      ObMemLobCommon *mem_loc = get_mem_lob_common();
+      if (mem_loc != nullptr && mem_loc->has_data()) {
+        bret = true;
+      }
+    }
+    return bret;
+  }
+
+  OB_INLINE bool is_open() const
+  {
+    OB_LOG_RET(ERROR, OB_NOT_SUPPORTED, "is_open is not supported", KPC(this));
+    return false;
+  }
+
+  OB_INLINE bool has_extern() const
+  {
+    return OB_NOT_NULL(ptr_) &&
+           !is_lob_disk_locator() && size_ >= MEM_LOB_COMMON_HEADER_LEN &&
+           (reinterpret_cast<ObMemLobCommon *>(ptr_))->has_extern();
+  }
+
+  // all lob types without header are treated as full temp lob
+  OB_INLINE bool is_persist_lob() const
+  {
+    return OB_NOT_NULL(ptr_) &&
+           !is_lob_disk_locator() && size_ >= MEM_LOB_COMMON_HEADER_LEN &&
+           (reinterpret_cast<ObMemLobCommon *>(ptr_))->is_persist();
+  }
+
+  OB_INLINE bool is_full_temp_lob() const
+  {
+    return OB_NOT_NULL(ptr_) &&
+           !is_lob_disk_locator() && size_ >= MEM_LOB_COMMON_HEADER_LEN &&
+           (reinterpret_cast<ObMemLobCommon *>(ptr_))->is_temporary_full();
+  }
+
+  OB_INLINE bool is_append_delta_lob() const
+  {
+    return OB_NOT_NULL(ptr_) &&
+           !is_lob_disk_locator() && size_ >= MEM_LOB_COMMON_HEADER_LEN &&
+           (reinterpret_cast<ObMemLobCommon *>(ptr_))->is_append_delta();
+  }
+
+  // APPEND_DELTA_LOB 由 ObDatum 承载，而 ObDatum 的长度字段只有 29 位。
+  // 因此计算 Datum 长度上限时必须包含固定的 Locator 头部。
+  static int calc_append_delta_locator_size(const int64_t payload_size,
+                                             int64_t &locator_size)
+  {
+    int ret = OB_SUCCESS;
+    locator_size = 0;
+    if (OB_UNLIKELY(payload_size < 0)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (OB_UNLIKELY(payload_size
+                           > OB_MAX_LONGTEXT_LENGTH - get_append_delta_header_len())) {
+      ret = OB_SIZE_OVERFLOW;
+    } else {
+      locator_size = get_append_delta_header_len() + payload_size;
+    }
+    return ret;
+  }
+
+  // 校验并返回追加增量的扩展头及原始追加字节。
+  int get_append_delta(const ObMemLobExternHeader *&extern_header,
+                       ObString &data) const;
+
+
+  char *ptr_; // ptr_ is ObMemLobCommon or ObLobCommon (disk locator)
+  uint32_t size_; // full MemLobLocator size;
+};
+
+enum class ObDocIDType : uint16_t
+{
+  INVALID = 0,
+  TABLET_SEQUENCE,
+  HIDDEN_INC_PK,
+};
+
+class ObDocId final
+{
+public:
+  ObDocId();
+  ObDocId(const uint64_t tablet_id, const uint64_t seq_id);
+  ~ObDocId() = default;
+
+  void reset();
+  bool is_valid() const;
+  int hash(uint64_t &hash_val) const;
+  ObString get_string() const;
+  int from_string(const ObString &doc_id);
+
+  bool operator ==(const ObDocId &other) const;
+  bool operator !=(const ObDocId &other) const;
+  bool operator <(const ObDocId &other) const;
+  bool operator >(const ObDocId &other) const;
+
+  TO_STRING_KV(K_(tablet_id), K_(seq_id));
+public:
+  static const int64_t OB_DOC_ID_HASH = 10;
+  uint64_t tablet_id_;
+  uint64_t seq_id_;
+};
+
+class ObCenterId final
+{
+public:
+  ObCenterId();
+  ObCenterId(const uint64_t tablet_id, const uint64_t center_id);
+  ~ObCenterId() = default;
+
+  void reset();
+  bool is_valid() const;
+
+  bool operator ==(const ObCenterId &other) const;
+  bool operator !=(const ObCenterId &other) const;
+  bool operator <(const ObCenterId &other) const;
+  bool operator >(const ObCenterId &other) const;
+
+  TO_STRING_KV(K_(tablet_id), K_(center_id));
+public:
+  uint64_t tablet_id_;
+  uint64_t center_id_;
+};
+
+class ObHiddenClusteringKey final
+{
+public:
+  ObHiddenClusteringKey();
+  ObHiddenClusteringKey(const uint64_t tablet_id, const uint64_t seq_id);
+  ~ObHiddenClusteringKey() = default;
+
+  void reset();
+  bool is_valid() const;
+
+  bool operator ==(const ObHiddenClusteringKey &other) const;
+  bool operator !=(const ObHiddenClusteringKey &other) const;
+  bool operator <(const ObHiddenClusteringKey &other) const;
+  bool operator >(const ObHiddenClusteringKey &other) const;
+  static int set_hidden_clustering_key_to_string(const ObHiddenClusteringKey &hidden_clustering_key, 
+                                                 ObString &str);
+
+  TO_STRING_KV(K_(tablet_id), K_(seq_id));
+public:
+  uint64_t tablet_id_;
+  uint64_t seq_id_;
+};
+
+
+class ObPqCenterId final
+{
+public:
+  ObPqCenterId();
+  ObPqCenterId(const uint64_t tablet_id, const uint32_t m_id, const uint32_t center_id);
+  ~ObPqCenterId() = default;
+
+  void reset();
+  bool is_valid() const;
+
+  bool operator ==(const ObPqCenterId &other) const;
+  bool operator !=(const ObPqCenterId &other) const;
+  bool operator <(const ObPqCenterId &other) const;
+  bool operator >(const ObPqCenterId &other) const;
+
+  TO_STRING_KV(K_(tablet_id), K_(center_id), K_(m_id));
+public:
+  uint64_t tablet_id_;
+  uint32_t m_id_;
+  uint32_t center_id_;
+};
+
+struct ObObjPrintParams
+{
+  ObObjPrintParams (const ObTimeZoneInfo *tz_info, ObCollationType cs_type):
+    tz_info_(tz_info),
+    cs_type_(cs_type),
+    accuracy_(),
+    print_flags_(0),
+    exec_ctx_(NULL),
+    ob_obj_type_(ObNullType),
+    coll_meta_(NULL)
+  {}
+  ObObjPrintParams (const ObTimeZoneInfo *tz_info):
+    tz_info_(tz_info),
+    cs_type_(CS_TYPE_UTF8MB4_GENERAL_CI),
+    accuracy_(),
+    print_flags_(0),
+    exec_ctx_(NULL),
+    ob_obj_type_(ObNullType),
+    coll_meta_(NULL)
+  {}
+  ObObjPrintParams ():
+    tz_info_(NULL),
+    cs_type_(CS_TYPE_UTF8MB4_GENERAL_CI),
+    accuracy_(),
+    print_flags_(0),
+    exec_ctx_(NULL),
+    ob_obj_type_(ObNullType),
+    coll_meta_(NULL)
+  {}
+  TO_STRING_KV(K_(tz_info), K_(cs_type), K_(accuracy), K_(print_flags), K_(ob_obj_type));
+  const ObTimeZoneInfo *tz_info_;
+  ObCollationType cs_type_;
+  ObAccuracy accuracy_;
+  union {
+    uint32_t print_flags_;
+    struct {
+      uint32_t need_cast_expr_:1;
+      uint32_t print_origin_stmt_:1;
+      uint32_t use_memcpy_:1;
+      uint32_t skip_escape_:1;
+      uint32_t beginning_space_:1;
+      uint32_t for_dblink_:1;
+      uint32_t binary_string_print_hex_:1;
+      uint32_t need_print_converter_:1;
+      uint32_t print_const_expr_type_:1;
+      uint32_t print_null_string_value_:1;
+      uint32_t refine_range_max_value_:1;
+      uint32_t character_hex_safe_represent_:1;
+      uint32_t binary_string_print_base64_:1;
+      uint32_t not_print_internal_catalog_:1;
+      uint32_t reserved_:19;
+    };
+  };
+
+  /**
+   * MySQL only
+   * The limit expr may no longer be a constant number after transformer.
+   * So, set exec_ctx_ if the stmt is rewritten. 
+   * If exec_ctx_ is not null, Printer will calculate the value of limit expr and output.
+   *  e.g. "limit (1 + 1)" will be output as "limit 2" 
+   * 
+  */
+  sql::ObExecContext *exec_ctx_;
+  ObObjType ob_obj_type_;
+  common::ObSqlCollectionInfo *coll_meta_;
+};
+
+// sizeof(ObObjValue)=8
+union ObObjValue
+{
+  int64_t int64_;
+  uint64_t uint64_;
+
+  float float_;
+  double double_;
+
+  const char *string_;
+
+  uint32_t *nmb_digits_;
+
+  int64_t datetime_;
+  int32_t date_;
+  int64_t time_;
+  uint8_t year_;
+
+  int64_t ext_;
+  int64_t unknown_;
+  const ObLobCommon *lob_;
+  const ObLobLocator *lob_locator_;
+  const ObMemLobCommon *lob_locator_v2_;
+  int64_t nmonth_; //for interval year to month
+  int64_t nsecond_; //for interval day to second
+
+  ObDecimalInt *decimal_int_;
+  void *ptr_;
+};
+
+extern int (*serialize_composite_callback)(const ObObj&, char*, const int64_t, int64_t&);
+extern int (*deserialize_composite_callback)(ObObj&, const char*, const int64_t, int64_t&);
+extern int64_t (*composite_serialize_size_callback)(const ObObj&);
+
+class ObBatchChecksum;
+class ObObj
+{
+public:
+  // min, max extend value
+  static const int64_t MIN_OBJECT_VALUE         = UINT64_MAX - 2;
+  static const int64_t MAX_OBJECT_VALUE         = UINT64_MAX - 1;
+  // WARNING: (xiaochu.yh) used only in RootTable, other user should not use this
+  // to represent a (min, max) range in Roottable impl, we need this
+  static const char *MIN_OBJECT_VALUE_STR;
+  static const char *MAX_OBJECT_VALUE_STR;
+  static const char *NOP_VALUE_STR;
+public:
+  ObObj();
+  ObObj(const ObObj &other);
+  explicit ObObj(bool val);
+  explicit ObObj(int32_t val);
+  explicit ObObj(int64_t val);
+  explicit ObObj(ObObjType type);
+  inline void reset();
+  //when in not strict sql mode, build default value refer to data type
+  // @string_cs_type: default value of string type need set collation type, since the space will be trim when compaction, see ObStorageSchema::trim
+  int build_not_strict_default_value(int16_t precision, const ObCollationType string_cs_type,
+                                     bool is_collection_vector_type = false);
+  static ObObj make_min_obj();
+  static ObObj make_max_obj();
+  static ObObj make_nop_obj();
+  static bool is_ext_val(int64_t v)
+  {
+    return (ObActionFlag::OP_MIN_OBJ <= v
+        && ObActionFlag::OP_LOCK_ROW >= v)
+        || MIN_OBJECT_VALUE == v
+        || MAX_OBJECT_VALUE == v;
+  }
+
+  OB_INLINE void copy_meta_type(const ObObjMeta &meta) {
+    meta_.set_type_simple(meta.get_type());
+    meta_.set_collation_type(meta.get_collation_type());
+    if (ObCharType == get_type() || ObVarcharType == get_type() || ob_is_text_tc(get_type())
+        || ob_is_lob_locator(get_type()) || ob_is_json(get_type()) || ob_is_geometry(get_type()) || ob_is_roaringbitmap(get_type())) {
+      meta_.set_collation_level(ObCollationLevel::CS_LEVEL_IMPLICIT);
+    } else {
+      meta_.set_collation_level(meta.get_collation_level());
+    }
+    if (meta.is_user_defined_sql_type()) { // Notice: collection type is lob storage type
+      meta_.set_udt_flags(meta.get_udt_flags());
+    }
+  }
+
+  OB_INLINE void copy_value_to(ObObj &obj, bool &has_null) const {
+    switch (get_type()) {
+      case ObNullType:
+      case ObExtendType: {
+        obj = *this;
+        has_null = true;
+        break;
+      }
+      case ObCharType:
+      case ObVarcharType:
+      case ObTinyTextType:
+      case ObTextType:
+      case ObMediumTextType:
+      case ObLongTextType:
+      case ObLobType:
+      case ObJsonType:
+      case ObGeometryType:
+      case ObRoaringBitmapType:
+      case ObRawType: {
+        obj.meta_.set_collation_level(meta_.get_collation_level());
+        obj.meta_.set_scale(meta_.get_scale());
+        obj.val_len_ = val_len_;
+        obj.v_ = v_;
+        break;
+      }
+      default: {
+        obj.meta_.set_scale(meta_.get_scale());
+        obj.val_len_ = val_len_;
+        obj.v_ = v_;
+        break;
+      }
+    }
+  }
+
+  OB_INLINE void copy_value_or_obj(ObObj &obj, bool is_copy_all) const {
+    if (is_copy_all) {
+      obj = *this;
+    } else {
+      obj.meta_.set_scale(meta_.get_scale());
+      obj.val_len_ = val_len_;
+      obj.v_ = v_;
+    }
+  }
+  //@{ setters
+  OB_INLINE void set_type(const ObObjType &type)
+  {
+    if (OB_UNLIKELY(ObNullType > type || ObMaxType < type)) {
+      COMMON_LOG_RET(ERROR, common::OB_ERR_UNEXPECTED, "invalid type", K(type));
+      meta_.set_type(ObUnknownType);
+    } else {
+      meta_.set_type(type);
+    }
+  }
+  static int64_t get_otimestamp_store_size(const bool is_timestamp_tz)
+  {
+    return static_cast<int64_t>(sizeof(int64_t)
+        + (is_timestamp_tz
+           ? sizeof(uint32_t)
+           : sizeof(uint16_t)));
+  }
+  template<typename T>
+  void set_obj_value(const T &v);
+  void set_collation_level(const ObCollationLevel &cs_level) { meta_.set_collation_level(cs_level); }
+  void set_collation_type(const ObCollationType &cs_type) { meta_.set_collation_type(cs_type); }
+  void set_default_collation_type() { meta_.set_default_collation_type(); }
+  void set_meta_type(const ObObjMeta &type) { meta_ = type; }
+  void set_collation(const ObObjMeta &type) { meta_.set_collation(type); }
+  void set_scale(ObScale scale) { meta_.set_scale(scale); }
+
+  void set_int(const ObObjType type, const int64_t value);
+  void set_tinyint(const int8_t value);
+  void set_smallint(const int16_t value);
+  void set_mediumint(const int32_t value);
+  void set_int32(const int32_t value);
+  void set_int(const int64_t value);  // aka bigint
+
+  void set_tinyint_value(const int8_t value);
+  void set_smallint_value(const int16_t value);
+  void set_mediumint_value(const int32_t value);
+  void set_int32_value(const int32_t value);
+  void set_int_value(const int64_t value);  // aka bigint
+
+  void set_uint(const ObObjType type, const uint64_t value);
+  void set_utinyint(const uint8_t value);
+  void set_utinyint_value(const uint8_t value);
+  void set_usmallint(const uint16_t value);
+  void set_usmallint_value(const uint16_t value);
+  void set_umediumint(const uint32_t value);
+  void set_umediumint_value(const uint32_t value);
+  void set_uint32(const uint32_t value);
+  void set_uint32_value(const uint32_t value);
+  void set_uint64(const uint64_t value);
+  void set_uint64_value(const uint64_t value);
+
+  void set_float(const ObObjType type, const float value);
+  void set_float(const float value);
+  void set_float_value(const float value);
+  void set_ufloat(const float value);
+  void set_ufloat_value(const float value);
+
+  void set_double(const ObObjType type, const double value);
+  void set_double(const double value);
+  void set_double_value(const double value);
+  void set_udouble(const double value);
+  void set_udouble_value(const double value);
+
+  void set_number(const ObObjType type, const number::ObNumber &num);
+  void set_number(const ObObjType type, const number::ObNumber::Desc nmb_desc, uint32_t *nmb_digits);
+  void set_number(const number::ObNumber &num);
+  void set_number_value(const number::ObNumber &num);
+  void set_number_value(const number::ObNumber::Desc nmb_desc, uint32_t *nmb_digits);
+  void set_number(const number::ObNumber::Desc nmb_desc, uint32_t *nmb_digits);
+
+  void set_unumber(const number::ObNumber &num);
+  void set_unumber(const number::ObNumber::Desc nmb_desc, uint32_t *nmb_digits);
+  void set_unumber_value(const number::ObNumber::Desc nmb_desc, uint32_t *nmb_digits);
+
+  void set_number_float(const number::ObNumber &num);
+  void set_number_float(const number::ObNumber::Desc nmb_desc, uint32_t *nmb_digits);
+  void set_number_float_value(const number::ObNumber::Desc nmb_desc, uint32_t *nmb_digits);
+
+  void set_datetime(const ObObjType type, const int64_t value);
+  void set_datetime(const int64_t value);
+  void set_mysql_datetime(const int64_t value);
+  void set_mysql_datetime(const ObMySQLDateTime value);
+  void set_timestamp(const int64_t value);
+  void set_date(const int32_t value);
+  void set_mysql_date(const int32_t value);
+  void set_mysql_date(const ObMySQLDate value);
+  void set_time(const int64_t value);
+  void set_year(const uint8_t value);
+
+  void set_datetime_value(const int64_t value);
+  void set_timestamp_value(const int64_t value);
+  void set_date_value(const int32_t value);
+  void set_time_value(const int64_t value);
+  void set_year_value(const uint8_t value);
+
+  //only set v_.string_ and length
+  void set_common_value(const ObString &value);
+
+  void set_string(const ObObjType type, const char *ptr, const ObString::obstr_size_t size);
+  void set_string(const ObObjType type, const ObString &value);
+  void set_varchar(const ObString &value);
+  void set_varchar(const char *ptr, const ObString::obstr_size_t size);
+  void set_varchar_value(const char *ptr, const ObString::obstr_size_t size);
+  void set_varchar(const char *cstr);
+  void set_char(const ObString &value);
+  void set_char_value(const char *ptr, const ObString::obstr_size_t size);
+  void set_varbinary(const ObString &value);
+  void set_binary(const ObString &value);
+  void set_raw(const ObString &value);
+  void set_raw(const char *ptr, const ObString::obstr_size_t size);
+  void set_raw_value(const char *ptr, const ObString::obstr_size_t size);
+  void set_hex_string(const ObString &value);
+  void set_hex_string_value(const ObString &value);
+  void set_hex_string_value(const char *ptr, const ObString::obstr_size_t size);
+  void set_enum(const uint64_t value);
+  void set_enum_value(const uint64_t value);
+  void set_set(const uint64_t value);
+  void set_set_value(const uint64_t value);
+  void set_enum_inner(const ObString &value);
+  void set_enum_inner(const char *ptr, const ObString::obstr_size_t size);
+  void set_set_inner(const ObString &value);
+  void set_set_inner(const char *ptr, const ObString::obstr_size_t size);
+  void set_lob_value(const ObObjType type, const ObLobCommon *value, const int32_t length);
+  void set_lob_value(const ObObjType type, const char *ptr, const int32_t length);
+  void set_json_value(const ObObjType type, const ObLobCommon *value, const int32_t length);
+  void set_json_value(const ObObjType type, const char *ptr, const int32_t length);
+  void set_geometry_value(const ObObjType type, const ObLobCommon *value, const int32_t length);
+  void set_geometry_value(const ObObjType type, const char *ptr, const int32_t length);
+  void set_roaringbitmap_value(const ObObjType type, const ObLobCommon *value, const int32_t length);
+  void set_roaringbitmap_value(const ObObjType type, const char *ptr, const int32_t length);
+
+  void set_lob_locator(const ObLobLocator &value);
+  void set_lob_locator(const ObObjType type, const ObLobLocator &value);
+
+  inline void set_subschema_id(uint16_t subschema_id) { meta_.set_subschema_id(subschema_id); }
+  void set_otimestamp_value(const ObObjType type, const ObOTimestampData &value);
+  void set_otimestamp_value(const ObObjType type, const int64_t time_us, const uint32_t time_ctx_desc);
+  void set_otimestamp_value(const ObObjType type, const int64_t time_us, const uint16_t time_desc);
+  void set_otimestamp_null(const ObObjType type);
+
+  void set_timestamp_tz(const int64_t time_us, const uint32_t time_ctx_desc) { set_otimestamp_value(ObTimestampTZType, time_us, time_ctx_desc); }
+  void set_timestamp_ltz(const int64_t time_us, const uint16_t time_desc) { set_otimestamp_value(ObTimestampLTZType, time_us, time_desc); }
+  void set_timestamp_nano(const int64_t time_us, const uint16_t time_desc) { set_otimestamp_value(ObTimestampNanoType, time_us, time_desc); }
+  void set_timestamp_tz(const ObOTimestampData &value) { set_otimestamp_value(ObTimestampTZType, value); }
+  void set_timestamp_ltz(const ObOTimestampData &value) { set_otimestamp_value(ObTimestampLTZType, value); }
+  void set_timestamp_nano(const ObOTimestampData &value) { set_otimestamp_value(ObTimestampNanoType, value); }
+
+  inline void set_bool(const bool value);
+  inline void set_ext(const int64_t value);
+  inline void set_extend(const int64_t value, uint8 extend_type, int32_t size = 0);
+  inline void set_unknown(const int64_t value);
+
+  inline void set_bit(const uint64_t value);
+  inline void set_bit_value(const uint64_t value);
+
+  inline void set_null();
+  inline void set_min_value();
+  inline void set_max_value();
+  inline void set_nop_value();
+
+  void set_val_len(const int32_t val_len);
+
+  void set_interval_ym(const ObIntervalYMValue &value);
+  void set_interval_ds(const ObIntervalDSValue &value);
+  void set_interval_ym(const int64_t value) { set_interval_ym(ObIntervalYMValue(value)); }
+  void set_nvarchar2(const ObString &value);
+  void set_nvarchar2_value(const char *ptr, const ObString::obstr_size_t size);
+  void set_nchar(const ObString &value);
+  void set_nchar_value(const char *ptr, const ObString::obstr_size_t size);
+
+  void set_urowid(const ObURowIDData &urowid)
+  {
+    meta_.set_urowid();
+    v_.string_ = (const char *)urowid.rowid_content_;
+    val_len_ = static_cast<int32_t>(urowid.rowid_len_);
+  }
+  void set_urowid(const char *ptr, const int64_t size)
+  {
+    meta_.set_urowid();
+    v_.string_ = ptr;
+    val_len_ = static_cast<int32_t>(size);
+  }
+
+  inline void set_sql_udt(const char* ptr, int32_t size, uint16_t subschema_id = 0, uint8_t udt_flags = 0);
+  inline void set_sql_collection(const char* ptr, int32_t size, uint16_t subschema_id = 0, uint8_t udt_flags = 0);
+  inline void set_udt_value(const char* ptr, int32_t size);
+  //@}
+
+  //@{ getters
+  OB_INLINE ObObjType get_type() const { return meta_.get_type(); }
+  OB_INLINE ObObjTypeClass get_type_class() const { return meta_.get_type_class(); }
+  OB_INLINE ObCollationLevel get_collation_level() const { return meta_.get_collation_level(); }
+  OB_INLINE ObCollationType get_collation_type() const { return meta_.get_collation_type(); }
+  OB_INLINE ObScale get_scale() const { return meta_.get_scale(); }
+  inline const ObObjMeta& get_meta() const { return meta_; }
+
+  inline int get_tinyint(int8_t &value) const;
+  inline int get_smallint(int16_t &value) const;
+  inline int get_mediumint(int32_t &value) const;
+  inline int get_int32(int32_t &value) const;
+  inline int get_int(int64_t &value) const;
+
+  inline int get_utinyint(uint8_t &value) const;
+  inline int get_usmallint(uint16_t &value) const;
+  inline int get_umediumint(uint32_t &value) const;
+  inline int get_uint32(uint32_t &value) const;
+  inline int get_uint64(uint64_t &value) const;
+
+  inline int get_float(float &value) const;
+  inline int get_double(double &value) const;
+  inline int get_ufloat(float &value) const;
+  inline int get_udouble(double &value) const;
+
+  inline int get_number(number::ObNumber &num) const;
+  inline int get_unumber(number::ObNumber &num) const;
+  inline int get_number_float(number::ObNumber &num) const;
+
+  inline int get_datetime(int64_t &value) const;
+  inline int get_timestamp(int64_t &value) const;
+  inline int get_date(int32_t &value) const;
+  inline int get_time(int64_t &value) const;
+  inline int get_year(uint8_t &value) const;
+
+  inline int get_string(ObString &value) const;
+  inline int get_varchar(ObString &value) const;
+  inline int get_char(ObString &value) const;
+  inline int get_nvarchar2(ObString &value) const;
+  inline int get_nchar(ObString &value) const;
+  inline int get_varbinary(ObString &value) const;
+  inline int get_raw(ObString &value) const;
+  inline int get_binary(ObString &value) const;
+  inline int get_hex_string(ObString &value) const;
+  inline int get_print_string(ObString &value) const;
+
+  inline int get_bool(bool &value) const;
+  inline int get_ext(int64_t &value) const;
+  inline int get_unknown(int64_t &value) const;
+  inline int get_bit(uint64_t &value) const;
+  inline int get_enum(uint64_t &value) const;
+  inline int get_set(uint64_t &value) const;
+  int get_enum_str_val(ObSqlString &str_val, const ObIArray<ObString> &type_infos) const;
+  int get_set_str_val(ObSqlString &str_val, const ObIArray<ObString> &type_infos) const;
+  inline int32_t get_val_len() const { return val_len_; }
+  inline int get_enumset_inner_value(ObEnumSetInnerValue &inner_value) const;
+
+  int get_interval_ym(ObIntervalYMValue &value) const;
+  int get_interval_ds(ObIntervalDSValue &value) const;
+
+  int get_urowid(ObURowIDData &urowid_data) const;
+
+  /// the follow getters do not check type, use them when you already known the type
+  OB_INLINE int8_t get_tinyint() const { return static_cast<int8_t>(v_.int64_); }
+  OB_INLINE int16_t get_smallint() const { return static_cast<int16_t>(v_.int64_); }
+  OB_INLINE int32_t get_mediumint() const { return static_cast<int32_t>(v_.int64_); }
+  OB_INLINE int32_t get_int32() const { return static_cast<int32_t>(v_.int64_); }
+  OB_INLINE int64_t get_int() const { return static_cast<int64_t>(v_.int64_); }
+
+  OB_INLINE uint8_t get_utinyint() const { return static_cast<uint8_t>(v_.uint64_); }
+  OB_INLINE uint16_t get_usmallint() const { return static_cast<uint16_t>(v_.uint64_); }
+  OB_INLINE uint32_t get_umediumint() const { return static_cast<uint32_t>(v_.uint64_); }
+  OB_INLINE uint32_t get_uint32() const { return static_cast<uint32_t>(v_.uint64_); }
+  OB_INLINE uint64_t get_uint64() const { return static_cast<uint64_t>(v_.uint64_); }
+
+  OB_INLINE float get_float() const { return v_.float_; }
+  OB_INLINE double get_double() const { return v_.double_; }
+  OB_INLINE float get_ufloat() const { return v_.float_; }
+  OB_INLINE double get_udouble() const { return v_.double_; }
+
+  OB_INLINE bool is_negative_number() const { return number::ObNumber::is_negative_number(nmb_desc_); }
+  OB_INLINE bool is_zero_number() const { return number::ObNumber::is_zero_number(nmb_desc_); }
+  OB_INLINE int64_t get_number_digit_length() const { return nmb_desc_.len_; }
+  OB_INLINE int64_t get_number_byte_length() const { return nmb_desc_.len_ * sizeof(uint32_t); }
+  OB_INLINE number::ObNumber get_number() const { return number::ObNumber(nmb_desc_.desc_, v_.nmb_digits_); }
+  OB_INLINE number::ObNumber get_unumber() const { return number::ObNumber(nmb_desc_.desc_, v_.nmb_digits_); }
+  OB_INLINE number::ObNumber get_number_float() const { return number::ObNumber(nmb_desc_.desc_, v_.nmb_digits_); }
+
+  OB_INLINE bool is_zero_decimalint() const { return val_len_ == 0; }
+
+  OB_INLINE int64_t get_datetime() const { return v_.datetime_; }
+  OB_INLINE ObMySQLDateTime get_mysql_datetime() const { return v_.datetime_; }
+  OB_INLINE int64_t get_timestamp() const { return v_.datetime_; }
+  OB_INLINE int32_t get_date() const { return v_.date_; }
+  OB_INLINE ObMySQLDate get_mysql_date() const { return v_.date_; }
+  OB_INLINE int64_t get_time() const { return v_.time_; }
+  OB_INLINE uint8_t get_year() const { return v_.year_; }
+
+  OB_INLINE ObString get_string() const {
+    return ObString(val_len_, v_.string_);
+  }
+  OB_INLINE ObString get_varchar() const { return ObString(val_len_, v_.string_); }
+  OB_INLINE ObString get_char() const { return ObString(val_len_, v_.string_); }
+  OB_INLINE ObString get_varbinary() const { return ObString(val_len_, v_.string_); }
+  OB_INLINE ObString get_raw() const { return ObString(val_len_, v_.string_); }
+  OB_INLINE ObString get_binary() const { return ObString(val_len_, v_.string_); }
+  OB_INLINE ObString get_hex_string() const { return ObString(val_len_, v_.string_); }
+  OB_INLINE ObString get_print_string(const int64_t max_len) const { return ObString(MIN(val_len_, max_len), v_.string_); }
+  OB_INLINE ObString get_lob_print_string(const int64_t max_len) const {
+    return ObString(MIN(v_.lob_locator_->payload_size_, max_len),
+                        v_.lob_locator_->get_payload_ptr());
+  }
+  OB_INLINE ObString get_text_print_string(const int64_t max_len) const {
+    int ret = OB_SUCCESS;
+    ObString inrow_data;
+    if (val_len_ == 0 || !is_lob_storage()) {
+      COMMON_LOG(DEBUG, "Lob: get string of null text obj", K(*this));
+      inrow_data.assign_ptr(v_.string_, val_len_);
+    } else {
+      ObLobLocatorV2 loc(reinterpret_cast<char *>(v_.ptr_), val_len_);
+      if (OB_UNLIKELY(!loc.is_valid(false))) {
+        inrow_data.assign_ptr(v_.string_, val_len_);
+      } else if (!loc.has_inrow_data()) {
+        inrow_data.assign_ptr("outrow", 6);
+      } else if (OB_FAIL(loc.get_inrow_data(inrow_data))) {
+        COMMON_LOG(WARN, "Lob: get inrow data failed in obobj", K(*this));
+      } else {
+        inrow_data.assign_ptr(inrow_data.ptr(), MIN(inrow_data.length(), max_len));
+      }
+    }
+    return inrow_data;
+  }
+
+  OB_INLINE int get_json_print_data(ObString &json_data, char *buf, int64_t buf_len, int64_t &pos) const {
+    int ret = OB_SUCCESS;
+    json_data = get_string();
+    if (!is_lob_storage()) {
+      COMMON_LOG(DEBUG, "Lob: invalid lob type", K(*this));
+    } else {
+      ObLobLocatorV2 loc(reinterpret_cast<char *>(v_.ptr_), val_len_);
+      if (OB_UNLIKELY(!loc.is_valid(false))) {
+        ret = OB_INVALID_ARGUMENT;
+        COMMON_LOG(ERROR, "Lob: invalid json lob", K(ret), K(json_data));
+      } else if (!loc.has_inrow_data()) {
+        if (OB_FAIL(databuff_printf(buf, buf_len, pos, "%s", "'outrow json'"))) {
+          COMMON_LOG(WARN, "Lob: fail to print \"\'outrow json\'\"", K(ret), K(buf_len), K(pos));
+        }
+      } else if (OB_FAIL(loc.get_inrow_data(json_data))) {
+        COMMON_LOG(WARN, "Lob: get inrow data failed in obobj", K(*this));
+      }
+    }
+    return ret;
+  }
+
+  OB_INLINE int get_roaringbitmap_print_data(ObString &rb_data) const {
+    int ret = OB_SUCCESS;
+    rb_data = get_string();
+    if (!is_lob_storage()) {
+      COMMON_LOG(DEBUG, "Lob: invalid lob type", K(*this));
+    } else {
+      ObLobLocatorV2 loc(reinterpret_cast<char *>(v_.ptr_), val_len_);
+      if (OB_UNLIKELY(!loc.is_valid(false))) {
+        ret = OB_INVALID_ARGUMENT;
+        COMMON_LOG(ERROR, "Lob: invalid roaringbitmap lob", K(ret), K(rb_data));
+      } else if (!loc.has_inrow_data()) {
+        ret = OB_INVALID_ARGUMENT;
+        COMMON_LOG(WARN, "Lob: outrow roaringbitmap lob", K(*this));
+      } else if (OB_FAIL(loc.get_inrow_data(rb_data))) {
+        COMMON_LOG(WARN, "Lob: get inrow data failed in obobj", K(*this));
+      }
+    }
+    return ret;
+  }
+
+  OB_INLINE int get_udt_print_data(ObString &udt_data, char *buf, int64_t buf_len, int64_t &pos, bool is_lob) const {
+    int ret = OB_SUCCESS;
+    udt_data = get_string();
+    if (is_lob) {
+      ObLobLocatorV2 loc(reinterpret_cast<char *>(v_.ptr_), val_len_);
+      if (OB_UNLIKELY(!loc.is_valid(false))) {
+        ret = OB_INVALID_ARGUMENT;
+        COMMON_LOG(ERROR, "Lob: invalid udt lob", K(ret), K(udt_data));
+      } else if (!loc.is_inrow()) {
+        if (OB_FAIL(databuff_printf(buf, buf_len, pos, "%s", "'outrow udt'"))) {
+          COMMON_LOG(WARN, "Lob: fail to print \"\'outrow json\'\"", K(ret), K(buf_len), K(pos));
+        }
+      } else if (OB_FAIL(loc.get_inrow_data(udt_data))) {
+        COMMON_LOG(WARN, "Lob: get inrow data failed in obobj", K(*this));
+      }
+    }
+    return ret;
+  }
+
+  OB_INLINE bool get_bool() const { return (0 != v_.int64_); }
+  inline int64_t get_ext() const;
+  int get_real_param_count(int64_t &count) const;
+  OB_INLINE int64_t get_unknown() const { return v_.unknown_; }
+  OB_INLINE uint64_t get_bit() const { return v_.uint64_; }
+  OB_INLINE uint64_t get_enum() const { return v_.uint64_; }
+  OB_INLINE uint64_t get_set() const { return v_.uint64_; }
+  OB_INLINE ObString get_set_inner() const { return ObString(val_len_, v_.string_); }
+  OB_INLINE ObString get_enum_inner() const { return ObString(val_len_, v_.string_); }
+
+  inline const number::ObNumber::Desc& get_number_desc() const { return nmb_desc_; }
+  inline const uint32_t *get_number_digits() const { return v_.nmb_digits_; }
+
+  inline const char* get_string_ptr() const { return v_.string_; }
+  inline int32_t get_string_len() const { return val_len_; }
+  inline const ObLobCommon *get_lob_value() const { return v_.lob_; }
+  inline int get_lob_value(const ObLobCommon *&lob) const;
+
+  inline int get_lob_locator(ObLobLocator *&lob_locator) const;
+  inline const ObLobLocator* get_lob_locator() const { return v_.lob_locator_; }
+  inline int get_lob_locatorv2(ObLobLocatorV2 &lob_locator) const;
+  inline int get_lob_locatorv2(ObString &lob_locator) const;
+  //TODO @shanting dangerous interface
+  inline uint32_t get_lob_payload_size() const { return v_.lob_locator_->payload_size_; }
+  inline const char *get_lob_payload_ptr() const
+  {
+    return v_.lob_locator_ == nullptr ? nullptr : v_.lob_locator_->get_payload_ptr();
+  }
+
+  inline ObOTimestampData::UnionTZCtx get_tz_desc() const { return time_ctx_; }
+  inline ObOTimestampData get_otimestamp_value() const { return ObOTimestampData(v_.datetime_, time_ctx_); }
+  inline int64_t get_otimestamp_store_size() const
+  {
+    return get_otimestamp_store_size(is_timestamp_tz());
+  }
+  inline int write_otimestamp(char *buf, const int64_t len, int64_t &pos) const;
+  inline int read_otimestamp(const char *buf, const int64_t len);
+
+  inline int64_t get_interval_store_size() const;
+  inline int write_interval(char *buf) const;
+  inline int read_interval(const char *buf);
+
+  inline ObIntervalYMValue get_interval_ym() const { return ObIntervalYMValue(v_.nmonth_); }
+  inline ObIntervalDSValue get_interval_ds() const { return ObIntervalDSValue(v_.nsecond_, interval_fractional_); }
+
+  inline ObString get_nvarchar2() const { return ObString(val_len_, v_.string_); }
+  inline ObString get_nchar() const { return ObString(val_len_, v_.string_); }
+
+  inline ObURowIDData get_urowid() const
+  {
+    return ObURowIDData(val_len_, (const uint8_t *)v_.string_);
+  }
+
+  inline const ObDecimalInt *get_decimal_int() const
+  {
+    return v_.decimal_int_;
+  }
+  inline void set_decimal_int(int32_t int_bytes, ObScale scale, ObDecimalInt *decimal_int)
+  {
+    meta_.set_decimal_int(scale);
+    val_len_ = int_bytes;
+    v_.decimal_int_ = decimal_int;
+  }
+
+  inline int32_t get_int_bytes() const {
+    return val_len_;
+  }
+  inline uint16_t get_udt_subschema_id() const { return meta_.get_subschema_id(); }
+  inline uint8_t get_udt_flags() const { return meta_.get_udt_flags(); }
+  inline int get_udt(ObString &udt_data) const;
+
+  //@}
+
+  //@{ test functions
+  OB_INLINE bool is_valid_type() const { return meta_.is_valid(); }
+  OB_INLINE bool is_invalid_type() const { return meta_.is_invalid(); }
+
+  OB_INLINE bool is_null() const { return meta_.is_null(); }
+  OB_INLINE bool is_null_oracle() const { return meta_.is_null()
+      || (meta_.is_character_type() && (0 == get_string_len())); }
+  OB_INLINE bool is_tinyint() const { return meta_.is_tinyint(); }
+  OB_INLINE bool is_smallint() const { return meta_.is_smallint(); }
+  OB_INLINE bool is_mediumint() const { return meta_.is_mediumint(); }
+  OB_INLINE bool is_int32() const { return meta_.is_int32(); }
+  OB_INLINE bool is_int() const { return meta_.is_int(); }
+  OB_INLINE bool is_utinyint() const { return meta_.is_utinyint(); }
+  OB_INLINE bool is_usmallint() const { return meta_.is_usmallint(); }
+  OB_INLINE bool is_umediumint() const { return meta_.is_umediumint(); }
+  OB_INLINE bool is_uint32() const { return meta_.is_uint32(); }
+  OB_INLINE bool is_uint64() const { return meta_.is_uint64(); }
+  OB_INLINE bool is_float() const { return meta_.is_float(); }
+  OB_INLINE bool is_double() const { return meta_.is_double(); }
+  OB_INLINE bool is_ufloat() const { return meta_.is_ufloat(); }
+  OB_INLINE bool is_udouble() const { return meta_.is_udouble(); }
+  OB_INLINE bool is_number() const { return meta_.is_number(); }
+  OB_INLINE bool is_unumber() const { return meta_.is_unumber(); }
+  OB_INLINE bool is_number_float() const { return meta_.is_number_float(); }
+  OB_INLINE bool is_oracle_decimal() const { return meta_.is_oracle_decimal(); }
+  OB_INLINE bool is_datetime() const { return meta_.is_datetime(); }
+  OB_INLINE bool is_mysql_datetime() const { return meta_.is_mysql_datetime(); }
+  OB_INLINE bool is_timestamp() const { return meta_.is_timestamp(); }
+  OB_INLINE bool is_otimestamp_type() const { return meta_.is_otimestamp_type(); }
+  OB_INLINE bool is_year() const { return meta_.is_year(); }
+  OB_INLINE bool is_date() const { return meta_.is_date(); }
+  OB_INLINE bool is_mysql_date() const { return meta_.is_mysql_date(); }
+  OB_INLINE bool is_time() const { return meta_.is_time(); }
+  OB_INLINE bool is_varchar() const { return meta_.is_varchar(); }
+  OB_INLINE bool is_char() const { return meta_.is_char(); }
+  OB_INLINE bool is_varbinary() const { return meta_.is_varbinary(); }
+  OB_INLINE bool is_raw() const { return meta_.is_raw(); }
+  OB_INLINE bool is_binary() const { return meta_.is_binary(); }
+  OB_INLINE bool is_hex_string() const { return meta_.is_hex_string(); }
+  OB_INLINE bool is_ext() const { return meta_.is_ext(); }
+  OB_INLINE bool is_unknown() const { return meta_.is_unknown(); }
+  OB_INLINE bool is_bit() const { return meta_.is_bit(); }
+  OB_INLINE bool is_enum() const { return meta_.is_enum(); }
+  OB_INLINE bool is_set() const { return meta_.is_set(); }
+  OB_INLINE bool is_text() const { return meta_.is_text(); }
+  OB_INLINE bool is_clob() const { return meta_.is_clob(); }
+  //OB_INLINE bool is_oracle_clob() const { return meta_.is_oracle_clob(); }
+  OB_INLINE bool is_blob() const { return meta_.is_blob(); }
+  //OB_INLINE bool is_oracle_blob() const { return meta_.is_oracle_blob(); }
+  OB_INLINE bool is_lob_storage() const { return meta_.is_lob_storage(); }
+  OB_INLINE bool is_lob() const { return meta_.is_lob(); }
+  OB_INLINE bool is_outrow_lob() const;
+  OB_INLINE bool is_append_delta_lob() const;
+  OB_INLINE bool is_persist_lob() const;
+
+  OB_INLINE bool is_json() const { return meta_.is_json(); }
+
+  OB_INLINE bool is_geometry() const { return meta_.is_geometry(); }
+  OB_INLINE bool is_roaringbitmap() const { return meta_.is_roaringbitmap(); }
+  OB_INLINE bool is_user_defined_sql_type() const { return meta_.is_user_defined_sql_type(); }
+  OB_INLINE bool is_xml_sql_type() const {
+    return meta_.is_user_defined_sql_type() && meta_.get_subschema_id() == ObXMLSqlType;
+  }
+  OB_INLINE bool is_collection_sql_type() const { return meta_.is_collection_sql_type(); }
+
+  OB_INLINE bool is_timestamp_tz() const { return meta_.is_timestamp_tz(); }
+  OB_INLINE bool is_timestamp_ltz() const { return meta_.is_timestamp_ltz(); }
+  OB_INLINE bool is_timestamp_nano() const { return meta_.is_timestamp_nano(); }
+  OB_INLINE bool is_interval_ym() const { return meta_.is_interval_ym(); }
+  OB_INLINE bool is_interval_ds() const { return meta_.is_interval_ds(); }
+
+  // including int only
+  OB_INLINE bool is_unsigned_integer() const { return meta_.is_unsigned_integer(); }
+  OB_INLINE bool is_signed_integer() const { return meta_.is_signed_integer(); }
+  // including int, number,float,double
+  OB_INLINE bool is_unsigned() const { return meta_.is_unsigned(); }
+  OB_INLINE bool is_integer_type() const { return meta_.is_integer_type(); }
+  OB_INLINE bool is_numeric_type() const { return meta_.is_numeric_type(); }
+  OB_INLINE bool is_string_type() const { return meta_.is_string_type(); }
+  OB_INLINE bool is_temporal_type() const { return meta_.is_temporal_type(); }
+  OB_INLINE bool is_varchar_or_char() const { return meta_.is_varchar_or_char(); }
+  OB_INLINE bool is_varbinary_or_binary() const { return meta_.is_varbinary_or_binary(); }
+  OB_INLINE bool is_nvarchar2() const { return meta_.is_nvarchar2(); }
+  OB_INLINE bool is_nchar() const { return meta_.is_nchar(); }
+  OB_INLINE bool is_nstring() const { return meta_.is_nstring(); }
+  OB_INLINE bool is_fixed_len_char_type() const { return meta_.is_fixed_len_char_type(); }
+  OB_INLINE bool is_varying_len_char_type() const { return meta_.is_varying_len_char_type(); }
+  OB_INLINE bool is_character_type() const { return meta_.is_character_type(); }
+  OB_INLINE bool is_collation_free_compatible() const { return meta_.is_collation_free_compatible(); }
+
+  OB_INLINE bool is_urowid() const { return meta_.is_urowid(); }
+  OB_INLINE bool is_blob_locator() const { return meta_.is_blob_locator(); }
+  OB_INLINE bool is_clob_locator() const { return meta_.is_clob_locator(); }
+  OB_INLINE bool is_lob_locator() const { return meta_.is_lob_locator(); }
+  OB_INLINE bool is_fixed_double() const { return ob_is_double_type(meta_.get_type()) &&
+    SCALE_UNKNOWN_YET < meta_.get_scale() && OB_MAX_DOUBLE_FLOAT_SCALE >= meta_.get_scale(); }
+  OB_INLINE bool is_string_or_lob_locator_type() const {
+    return meta_.is_string_or_lob_locator_type();
+  }
+  OB_INLINE bool is_pl_extend() const
+  {
+    return is_ext()
+        && !ObObj::is_ext_val(get_ext())
+        && meta_.get_extend_type() > 0
+        && meta_.get_extend_type() < T_EXT_SQL_ARRAY;
+  }
+  OB_INLINE bool is_ext_sql_array() const { return meta_.is_ext_sql_array(); }
+  OB_INLINE bool is_overflow_integer(ObObjType type) const
+  {
+#define CHECK_VAL_OVERFLOW(min, max)                            \
+    if (is_signed_integer()) {                                  \
+      bret = !(get_int() >= min && get_int() <= max);           \
+    } else if (is_unsigned_integer()) {                         \
+      bret = !(get_uint64() <= max);                            \
+    } else {                                                    \
+      bret = true;                                              \
+    }
+    bool bret = false;
+    switch (type) {
+    case ObTinyIntType: {
+      CHECK_VAL_OVERFLOW(INT8_MIN, INT8_MAX);
+      break;
+    }
+    case ObSmallIntType: {
+      CHECK_VAL_OVERFLOW(INT16_MIN, INT16_MAX);
+      break;
+    }
+    case ObMediumIntType: {
+      CHECK_VAL_OVERFLOW(-8388608, 8388607);
+      break;
+    }
+    case ObInt32Type: {
+      CHECK_VAL_OVERFLOW(INT32_MIN, INT32_MAX);
+      break;
+    }
+    case ObIntType: {
+      CHECK_VAL_OVERFLOW(INT64_MIN, INT64_MAX);
+      break;
+    }
+    case ObUTinyIntType: {
+      CHECK_VAL_OVERFLOW(0, UINT8_MAX);
+      break;
+    }
+    case ObUSmallIntType: {
+      CHECK_VAL_OVERFLOW(0, UINT16_MAX);
+      break;
+    }
+    case ObUMediumIntType: {
+      CHECK_VAL_OVERFLOW(0, 16777215);
+      break;
+    }
+    case ObUInt32Type: {
+      CHECK_VAL_OVERFLOW(0, UINT32_MAX);
+      break;
+    }
+    case ObUInt64Type: {
+      CHECK_VAL_OVERFLOW(0, UINT64_MAX);
+      break;
+    }
+    default: {
+      bret = true;
+      break;
+    }
+    }
+#undef CHECK_VAL_OVERFLOW
+    return bret;
+  }
+
+  inline bool is_decimal_int() const { return meta_.is_decimal_int(); }
+  inline bool is_min_value() const;
+  inline bool is_max_value() const;
+  inline bool is_nop_value() const;
+  inline bool is_true() const;
+  inline bool is_false() const;
+
+  bool is_zero() const;
+  //@}
+
+  /// apply mutation to this obj
+  int apply(const ObObj &mutation);
+
+  //@{ comparison
+  //
+  // ATTENTION:
+  //
+  // When < > <= >= == != compare is_equal is called,
+  // that_obj MUST have same type with this obj (*this)
+  // or can_compare.
+  // For Sql, to get diff type comparing result(varchar '123' compare with int 123),
+  // call static function ObExprEqual::calc or other ObExprXX::calc.
+  bool operator<(const ObObj &that_obj) const;
+  bool operator>(const ObObj &that_obj) const;
+  bool operator<=(const ObObj &that_obj) const;
+  bool operator>=(const ObObj &that_obj) const;
+  bool operator==(const ObObj &that_obj) const;
+  bool operator!=(const ObObj &that_obj) const;
+  bool can_compare(const ObObj &other) const;
+  inline bool strict_equal(const ObObj &other) const;
+  int check_collation_free_and_compare(const ObObj &other, int &cmp) const;
+  int check_collation_free_and_compare(const ObObj &other) const;
+  int compare(const ObObj &other, int &cmp) const;
+  int compare(const ObObj &other) const;
+  int compare(const ObObj &other, ObCollationType cs_type, int &cmp) const;
+  int compare(const ObObj &other, ObCollationType cs_type) const;
+  int compare(const ObObj &other, common::ObCompareCtx &cmp_ctx, int &cmp) const;
+  int compare(const ObObj &other, common::ObCompareCtx &cmp_ctx) const;
+  int compare(const ObObj &other, ObCollationType cs_type, const ObCmpNullPos null_pos) const;
+  int equal(const ObObj &other, bool &is_equal) const;
+  bool is_equal(const ObObj &other) const;
+  int equal(const ObObj &other, ObCollationType cs_type, bool &is_equal) const;
+  bool is_equal(const ObObj &other, ObCollationType cs_type) const;
+  //@}
+
+  //@{ print utilities
+  /// print as JSON style
+  int64_t to_string(char *buffer, const int64_t length, const ObObjPrintParams &params = ObObjPrintParams()) const;
+  /// print as SQL literal style, e.g. used to show column default value
+  int print_sql_literal(char *buffer, int64_t length, int64_t &pos, const ObObjPrintParams &params = ObObjPrintParams()) const;
+  /// print as SQL literal sytle and the length can be auto extended, e.g. used to show column default value
+  int print_sql_literal(char *&buffer, int64_t &length,
+                        int64_t &pos, ObIAllocator &alloc,
+                        const ObObjPrintParams &params = ObObjPrintParams()) const;
+  /// print as SQL VARCHAR literal
+  int print_varchar_literal(char *buffer, int64_t length, int64_t &pos, const ObObjPrintParams &params = ObObjPrintParams()) const;
+  int print_varchar_literal(char *&buffer, int64_t &length,
+                            int64_t &pos, ObIAllocator &alloc,
+                            const ObObjPrintParams &params = ObObjPrintParams()) const;
+  //used for enum and set
+  int print_varchar_literal(const ObIArray<ObString> &type_infos, char *buffer, int64_t length, int64_t &pos) const;
+  /// print as plain string
+  int print_plain_str_literal(char *buffer, int64_t length, int64_t &pos, const ObObjPrintParams &params = ObObjPrintParams()) const;
+  //used for enum and set
+  int print_plain_str_literal(const ObIArray<ObString> &type_infos, char *buffer, int64_t length, int64_t &pos) const;
+
+  void print_range_value(char *buffer, int64_t length, int64_t &pos) const;
+  void print_str_with_repeat(char *buffer, int64_t length, int64_t &pos) const;
+
+  //print_smart and print_format are for log_tool use
+  int print_smart(char *buffer, int64_t length, int64_t &pos) const;
+  int print_format(char *buffer, int64_t length, int64_t &pos) const;
+  /// dump into log
+  void dump(const int32_t log_level = OB_LOG_LEVEL_DEBUG) const;
+  //@}
+
+  //@{  deep copy
+  bool need_deep_copy()const;
+  OB_INLINE int64_t get_deep_copy_size() const;
+  int deep_copy(const ObObj &src, char *buf, const int64_t size, int64_t &pos);
+  void* get_deep_copy_obj_ptr();
+  void set_data_ptr(void *data_ptr);
+  const void *get_data_ptr() const;
+  //return byte length
+  int64_t get_data_length() const;
+
+  const void *get_tight_data_ptr() const;
+  int64_t get_tight_data_len() const;
+
+  template <typename Allocator>
+  int to_collation_free_obj(ObObj &dst, bool &is_valid_collation_free, Allocator &allocator);
+  //@}
+
+  //@{ checksum
+  // CRC64
+  int64_t checksum(const int64_t current) const;
+  int64_t checksum_v2(const int64_t current) const;
+  void checksum(ObBatchChecksum &bc) const;
+  // mysql hash for string, murmurhash for others
+  int hash(uint64_t &res) const;
+  int hash(uint64_t &res, uint64_t seed) const;
+  int hash_v1(uint64_t &res, uint64_t seed = 0) const;  // for compatible purpose, use hash() instead
+  int hash_murmur(uint64_t &res, uint64_t seed = 0) const;
+  // wyhash for all types
+  int hash_wy(uint64_t &res, uint64_t seed = 0) const;
+  // xx hash
+  int hash_xx(uint64_t &res, uint64_t seed = 0) const;
+  // murmurhash3_x86_32 hash
+  int hash_murmur3_x86_32(uint64_t &res, uint64_t seed = 0) const;
+  // mysql hash
+  uint64_t varchar_hash(ObCollationType cs_type, uint64_t seed = 0) const;
+  uint64_t varchar_murmur_hash(ObCollationType cs_type, uint64_t seed = 0) const;
+  uint64_t varchar_wy_hash(ObCollationType cs_type, uint64_t seed = 0) const;
+  uint64_t varchar_xx_hash(ObCollationType cs_type, uint64_t seed = 0) const;
+  bool check_collation_integrity() const;
+  //@}
+
+  NEED_SERIALIZE_AND_DESERIALIZE;
+
+  static uint32_t meta_offset_bits() { return offsetof(ObObj, meta_) * 8; }
+  static uint32_t val_len_offset_bits() { return offsetof(ObObj, val_len_) * 8; }
+  static uint32_t nmb_desc_offset_bits() { return offsetof(ObObj, nmb_desc_) * 8; }
+  static uint32_t v_offset_bits() { return offsetof(ObObj, v_) * 8; }
+  int get_char_length(const ObAccuracy accuracy, int32_t &char_len, bool is_oracle_mode) const;
+  int convert_string_value_charset(ObCharsetType charset_type, ObIAllocator &allocator);
+  int read_lob_data(ObIAllocator &allocator, ObString &data) const;
+private:
+  friend class tests::common::ObjTest;
+  friend class ObCompactCellWriter;
+  friend class ObCompactCellIterator;
+
+public:
+  ObObjMeta meta_;  // sizeof = 4
+  union
+  {
+    int32_t val_len_;
+    int32_t interval_fractional_; //values for intervalds type
+    number::ObNumber::Desc nmb_desc_;
+    ObOTimestampData::UnionTZCtx time_ctx_;
+  };  // sizeof = 4
+  ObObjValue v_;  // sizeof = 8
+};
+
+//为每个hash函数创建一个类，其中都包含static方法，方法名为hash，参数类型为const void*, uint64_t, uint64_t.
+//is_varchar_hash是为了兼容原来实现murmurhash处理varchar类型时，底层并不是使用murmurhash
+struct ObjHashBase
+{
+  static const bool is_varchar_hash = true;
+};
+
+// default hash method: same with ObObj::hash())
+//  murmurhash for non string types.
+//  mysql string hash for string types.
+struct ObDefaultHash : public ObjHashBase
+{
+  static const bool is_varchar_hash = false;
+  static uint64_t hash(const void *data, uint64_t len, uint64_t seed)
+  {
+    return murmurhash64A(data, static_cast<int32_t>(len), seed);
+  }
+};
+
+struct ObMurmurHash : public ObjHashBase
+{
+  OB_INLINE static uint64_t hash(const void *data, uint64_t len, uint64_t seed)
+  {
+    return murmurhash64A(data, static_cast<int32_t>(len), seed);
+  }
+};
+
+struct ObWyHash : public ObjHashBase
+{
+  static uint64_t hash(const void *data, uint64_t len, uint64_t seed)
+  {
+    return wyhash(data, len, seed);
+  }
+};
+
+struct ObXxHash : public ObjHashBase
+{
+  static uint64_t hash(const void *data, uint64_t len, uint64_t seed)
+  {
+    return XXH64(data, static_cast<size_t>(len), seed);
+  }
+};
+
+struct ObCrcHash : public ObjHashBase
+{
+  OB_INLINE static uint64_t hash(const void *data, uint64_t len, uint64_t seed)
+  {
+    return crc_hash_64(data, static_cast<int32_t>(len), seed);
+  }
+};
+
+struct ObMurmurHash3_x86_32 : public ObjHashBase
+{
+  OB_INLINE static uint64_t hash(const void *data, uint64_t len, uint64_t seed)
+  {
+    return murmurhash3_x86_32(data, static_cast<int32_t>(len), static_cast<uint32_t>(seed));
+  }
+};
+
+template <ObObjType type, typename T, typename P>
+struct ObjHashCalculator
+{
+  static int calc_hash_value(const P &param, const uint64_t hash, uint64_t &res) {
+    UNUSED(param);
+    UNUSED(hash);
+    res = 0;
+    return OB_SUCCESS;
+  }
+};
+
+inline ObObj::ObObj()
+{
+  reset();
+}
+
+inline ObObj::ObObj(bool val)
+{
+  set_bool(val);
+  val_len_ = 0;
+}
+
+inline ObObj::ObObj(int32_t val)
+{
+  set_int32(val);
+  val_len_ = 0;
+}
+
+inline ObObj::ObObj(int64_t val)
+{
+  set_int(val);
+  val_len_ = 0;
+}
+
+inline ObObj::ObObj(ObObjType type)
+{
+  meta_.set_type(type);
+  val_len_ = 0;
+}
+
+inline ObObj::ObObj(const ObObj &other)
+{
+  *this = other;
+}
+
+inline void ObObj::reset()
+{
+  meta_.reset();
+  val_len_ = 0;
+  v_.int64_ = 0;
+}
+
+inline ObObj ObObj::make_min_obj()
+{
+  ObObj obj;
+  obj.set_min_value();
+  return obj;
+}
+
+inline ObObj ObObj::make_max_obj()
+{
+  ObObj obj;
+  obj.set_max_value();
+  return obj;
+}
+
+inline ObObj ObObj::make_nop_obj()
+{
+  ObObj obj;
+  obj.set_nop_value();
+  return obj;
+}
+
+inline void ObObj::set_int(const ObObjType type, const int64_t value)
+{
+  meta_.set_type(type);
+  meta_.set_collation_level(CS_LEVEL_NUMERIC);
+  v_.int64_ = value;
+}
+
+inline void ObObj::set_tinyint(const int8_t value)
+{
+  meta_.set_tinyint();
+  v_.int64_ = static_cast<int64_t>(value);
+}
+
+inline void ObObj::set_tinyint_value(const int8_t value)
+{
+//  meta_.set_tinyint();
+  v_.int64_ = static_cast<int64_t>(value);
+}
+
+inline void ObObj::set_smallint(const int16_t value)
+{
+  meta_.set_smallint();
+  v_.int64_ = static_cast<int64_t>(value);
+}
+
+inline void ObObj::set_smallint_value(const int16_t value)
+{
+  v_.int64_ = static_cast<int64_t>(value);
+}
+
+inline void ObObj::set_mediumint(const int32_t value)
+{
+  meta_.set_mediumint();
+  v_.int64_ = static_cast<int64_t>(value);
+}
+
+inline void ObObj::set_mediumint_value(const int32_t value)
+{
+  v_.int64_ = static_cast<int64_t>(value);
+}
+
+inline void ObObj::set_int32(const int32_t value)
+{
+  meta_.set_int32();
+  v_.int64_ = static_cast<int64_t>(value);
+}
+
+inline void ObObj::set_int32_value(const int32_t value)
+{
+//  meta_.set_int32();
+  v_.int64_ = static_cast<int64_t>(value);
+}
+
+inline void ObObj::set_int(const int64_t value)
+{
+  meta_.set_int();
+  v_.int64_ = value;
+}
+
+inline void ObObj::set_int_value(const int64_t value)
+{
+  v_.int64_ = value;
+}
+
+inline void ObObj::set_uint(const ObObjType type, const uint64_t value)
+{
+  meta_.set_type(type);
+  meta_.set_collation_level(CS_LEVEL_NUMERIC);
+  v_.uint64_ = value;
+}
+
+inline void ObObj::set_utinyint(const uint8_t value)
+{
+  meta_.set_utinyint();
+  v_.uint64_ = static_cast<uint64_t>(value);
+}
+
+inline void ObObj::set_utinyint_value(const uint8_t value)
+{
+  v_.uint64_ = static_cast<uint64_t>(value);
+}
+
+inline void ObObj::set_usmallint(const uint16_t value)
+{
+  meta_.set_usmallint();
+  v_.uint64_ = static_cast<uint64_t>(value);
+}
+
+inline void ObObj::set_usmallint_value(const uint16_t value)
+{
+  v_.uint64_ = static_cast<uint64_t>(value);
+}
+
+inline void ObObj::set_umediumint(const uint32_t value)
+{
+  meta_.set_umediumint();
+  v_.uint64_ = static_cast<uint64_t>(value);
+}
+
+inline void ObObj::set_umediumint_value(const uint32_t value)
+{
+  v_.uint64_ = static_cast<uint64_t>(value);
+}
+
+inline void ObObj::set_uint32(const uint32_t value)
+{
+  meta_.set_uint32();
+  v_.uint64_ = static_cast<uint64_t>(value);
+}
+
+inline void ObObj::set_uint32_value(const uint32_t value)
+{
+  v_.uint64_ = static_cast<uint64_t>(value);
+}
+
+inline void ObObj::set_uint64(const uint64_t value)
+{
+  meta_.set_uint64();
+  v_.uint64_ = value;
+}
+
+inline void ObObj::set_uint64_value(const uint64_t value)
+{
+  v_.uint64_ = value;
+}
+
+inline void ObObj::set_float(const ObObjType type, const float value)
+{
+  meta_.set_type(type);
+  meta_.set_collation_level(CS_LEVEL_NUMERIC);
+  v_.uint64_ = 0;
+  v_.float_ = value;
+}
+
+inline void ObObj::set_float(const float value)
+{
+  meta_.set_float();
+  v_.uint64_ = 0;
+  v_.float_ = value;
+}
+
+inline void ObObj::set_float_value(const float value)
+{
+//  meta_.set_float();
+  v_.uint64_ = 0;
+  v_.float_ = value;
+}
+
+inline void ObObj::set_ufloat(const float value)
+{
+  meta_.set_ufloat();
+  v_.uint64_ = 0;
+  v_.float_ = value;
+}
+
+inline void ObObj::set_ufloat_value(const float value)
+{
+  v_.uint64_ = 0;
+  v_.float_ = value;
+}
+
+inline void ObObj::set_double(const ObObjType type, const double value)
+{
+  meta_.set_type(type);
+  meta_.set_collation_level(CS_LEVEL_NUMERIC);
+  v_.double_ = value;
+}
+
+inline void ObObj::set_double(const double value)
+{
+  meta_.set_double();
+  v_.double_ = value;
+}
+
+inline void ObObj::set_double_value(const double value)
+{
+  v_.double_ = value;
+}
+
+inline void ObObj::set_udouble(const double value)
+{
+  meta_.set_udouble();
+  v_.double_ = value;
+}
+
+inline void ObObj::set_udouble_value(const double value)
+{
+  v_.double_ = value;
+}
+
+inline void ObObj::set_number(const ObObjType type, const number::ObNumber &num)
+{
+  meta_.set_type(type);
+  meta_.set_collation_level(CS_LEVEL_NUMERIC);
+  nmb_desc_.desc_ = num.get_desc_value();
+  v_.nmb_digits_ = num.get_digits();
+}
+
+inline void ObObj::set_number(const ObObjType type, const number::ObNumber::Desc nmb_desc, uint32_t *nmb_digits)
+{
+  meta_.set_type(type);
+  meta_.set_collation_level(CS_LEVEL_NUMERIC);
+  nmb_desc_ = nmb_desc;
+  v_.nmb_digits_ = nmb_digits;
+}
+
+inline void ObObj::set_number(const number::ObNumber &num)
+{
+  meta_.set_number();
+  nmb_desc_.desc_ = num.get_desc_value();
+  v_.nmb_digits_ = num.get_digits();
+}
+
+inline void ObObj::set_number_value(const number::ObNumber &num)
+{
+  nmb_desc_.desc_ = num.get_desc_value();
+  v_.nmb_digits_ = num.get_digits();
+}
+
+inline void ObObj::set_number_value(const number::ObNumber::Desc nmb_desc, uint32_t *nmb_digits)
+{
+  nmb_desc_ = nmb_desc;
+  v_.nmb_digits_ = nmb_digits;
+}
+
+inline void ObObj::set_number(const number::ObNumber::Desc nmb_desc, uint32_t *nmb_digits)
+{
+  meta_.set_number();
+  nmb_desc_ = nmb_desc;
+  v_.nmb_digits_ = nmb_digits;
+}
+
+inline void ObObj::set_unumber(const number::ObNumber &num)
+{
+  meta_.set_unumber();
+  nmb_desc_.desc_ = num.get_desc_value();
+  v_.nmb_digits_ = num.get_digits();
+}
+
+inline void ObObj::set_unumber(const number::ObNumber::Desc nmb_desc, uint32_t *nmb_digits)
+{
+  meta_.set_unumber();
+  nmb_desc_ = nmb_desc;
+  v_.nmb_digits_ = nmb_digits;
+}
+
+inline void ObObj::set_unumber_value(const number::ObNumber::Desc nmb_desc, uint32_t *nmb_digits)
+{
+  nmb_desc_ = nmb_desc;
+  v_.nmb_digits_ = nmb_digits;
+}
+
+inline void ObObj::set_number_float(const number::ObNumber &num)
+{
+  meta_.set_number_float();
+  nmb_desc_.desc_ = num.get_desc_value();
+  v_.nmb_digits_ = num.get_digits();
+}
+
+inline void ObObj::set_number_float(const number::ObNumber::Desc nmb_desc, uint32_t *nmb_digits)
+{
+  meta_.set_number_float();
+  nmb_desc_ = nmb_desc;
+  v_.nmb_digits_ = nmb_digits;
+}
+
+inline void ObObj::set_number_float_value(const number::ObNumber::Desc nmb_desc, uint32_t *nmb_digits)
+{
+  nmb_desc_ = nmb_desc;
+  v_.nmb_digits_ = nmb_digits;
+}
+
+inline void ObObj::set_datetime(const ObObjType type, const int64_t value)
+{
+  meta_.set_type(type);
+  meta_.set_collation_level(CS_LEVEL_NUMERIC);
+  v_.datetime_ = value;
+}
+
+inline void ObObj::set_datetime(const int64_t value)
+{
+  meta_.set_datetime();
+  v_.datetime_ = value;
+}
+
+inline void ObObj::set_mysql_datetime(const int64_t value)
+{
+  meta_.set_mysql_datetime();
+  v_.datetime_ = value;
+}
+
+inline void ObObj::set_mysql_datetime(const ObMySQLDateTime value)
+{
+  meta_.set_mysql_datetime();
+  v_.datetime_ = value.datetime_;
+}
+
+inline void ObObj::set_datetime_value(const int64_t value)
+{
+
+  v_.datetime_ = value;
+}
+
+inline void ObObj::set_timestamp(const int64_t value)
+{
+  meta_.set_timestamp();
+  v_.datetime_ = value;
+}
+
+inline void ObObj::set_timestamp_value(const int64_t value)
+{
+  v_.datetime_ = value;
+}
+
+inline void ObObj::set_date(const int32_t value)
+{
+  meta_.set_date();
+  v_.uint64_ = 0;
+  v_.date_ = value;
+}
+
+inline void ObObj::set_mysql_date(const int32_t value)
+{
+  meta_.set_mysql_date();
+  v_.uint64_ = 0;
+  v_.date_ = value;
+}
+
+inline void ObObj::set_mysql_date(const ObMySQLDate value)
+{
+  meta_.set_mysql_date();
+  v_.uint64_ = 0;
+  v_.date_ = value.date_;
+}
+
+inline void ObObj::set_time(const int64_t value)
+{
+  meta_.set_time();
+  v_.time_ = value;
+}
+inline void ObObj::set_date_value(const int32_t value)
+{
+  v_.uint64_ = 0;
+  v_.date_ = value;
+}
+
+inline void ObObj::set_time_value(const int64_t value)
+{
+  v_.time_ = value;
+}
+
+inline void ObObj::set_year(const uint8_t value)
+{
+  meta_.set_year();
+  v_.uint64_ = 0;
+  v_.year_ = value;
+}
+
+inline void ObObj::set_year_value(const uint8_t value)
+{
+  v_.uint64_ = 0;
+  v_.year_ = value;
+}
+
+inline void ObObj::set_common_value(const ObString &value)
+{
+  v_.string_ = value.ptr();
+  val_len_ = value.length();
+}
+
+inline void ObObj::set_string(const ObObjType type, const char *ptr, const ObString::obstr_size_t size)
+{
+  meta_.set_type(type);
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = ptr;
+  val_len_ = size;
+}
+
+inline void ObObj::set_string(const ObObjType type, const ObString &value)
+{
+  meta_.set_type(type);
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = value.ptr();
+  val_len_ = value.length();
+}
+
+inline void ObObj::set_varchar(const ObString &value)
+{
+  meta_.set_varchar();
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = value.ptr();
+  val_len_ = value.length();
+}
+
+inline void ObObj::set_varchar(const char *ptr, const ObString::obstr_size_t size)
+{
+  meta_.set_varchar();
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = ptr;
+  val_len_ = size;
+}
+
+inline void ObObj::set_varchar_value(const char *ptr, const ObString::obstr_size_t size)
+{
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = ptr;
+  val_len_ = size;
+}
+
+inline void ObObj::set_varchar(const char *cstr)
+{
+  meta_.set_varchar();
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = cstr;
+  val_len_ = static_cast<int32_t>(strlen(cstr));
+}
+
+inline void ObObj::set_char(const ObString &value)
+{
+  meta_.set_char();
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = value.ptr();
+  val_len_ = value.length();
+}
+
+inline void ObObj::set_char_value(const char *ptr, const ObString::obstr_size_t size)
+{
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = ptr;
+  val_len_ = size;
+}
+
+inline void ObObj::set_varbinary(const ObString &value)
+{
+  meta_.set_varchar();
+  meta_.set_collation_type(CS_TYPE_BINARY);
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = value.ptr();
+  val_len_ = value.length();
+}
+
+inline void ObObj::set_binary(const ObString &value)
+{
+  meta_.set_char();
+  meta_.set_collation_type(CS_TYPE_BINARY);
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = value.ptr();
+  val_len_ = value.length();
+}
+
+inline void ObObj::set_raw(const ObString &value)
+{
+  meta_.set_raw();
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = value.ptr();
+  val_len_ = value.length();
+}
+
+inline void ObObj::set_raw(const char *ptr, const ObString::obstr_size_t size)
+{
+  meta_.set_raw();
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = ptr;
+  val_len_ = size;
+}
+
+inline void ObObj::set_raw_value(const char *ptr, const ObString::obstr_size_t size)
+{
+  meta_.set_collation_type(CS_TYPE_BINARY);
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = ptr;
+  val_len_ = size;
+}
+
+inline void ObObj::set_hex_string(const ObString &value)
+{
+  meta_.set_hex_string();
+  v_.string_ = value.ptr();
+  val_len_ = value.length();
+}
+
+inline void ObObj::set_hex_string_value(const ObString &value)
+{
+  v_.string_ = value.ptr();
+  val_len_ = value.length();
+}
+
+inline void ObObj::set_hex_string_value(const char *ptr, const ObString::obstr_size_t size)
+{
+  v_.string_ = ptr;
+  val_len_ = size;
+}
+
+inline void ObObj::set_enum(const uint64_t value)
+{
+  meta_.set_enum();
+  v_.uint64_ = value;
+}
+
+inline void ObObj::set_set(const uint64_t value)
+{
+  meta_.set_set();
+  v_.uint64_ = value;
+}
+
+inline void ObObj::set_enum_value(const uint64_t value)
+{
+  v_.uint64_ = value;
+}
+
+inline void ObObj::set_set_value(const uint64_t value)
+{
+  v_.uint64_ = value;
+}
+
+inline void ObObj::set_enum_inner(const ObString &value)
+{
+  meta_.set_enum_inner();
+  //meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = value.ptr();
+  val_len_ = value.length();
+}
+
+inline void ObObj::set_enum_inner(const char *ptr, const ObString::obstr_size_t size)
+{
+  meta_.set_enum_inner();
+  //meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = ptr;
+  val_len_ = size;
+}
+
+inline void ObObj::set_set_inner(const ObString &value)
+{
+  meta_.set_set_inner();
+  //meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = value.ptr();
+  val_len_ = value.length();
+}
+
+inline void ObObj::set_set_inner(const char *ptr, const ObString::obstr_size_t size)
+{
+  meta_.set_set_inner();
+  //meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = ptr;
+  val_len_ = size;
+}
+
+// used to set lob value without lob header
+// Notice: use set_null for null input!
+inline void ObObj::set_lob_value(const ObObjType type, const ObLobCommon *value, const int32_t length)
+{
+  meta_.set_type(type);
+  if (type != ObCollectionSQLType) {
+    meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  }
+  v_.lob_ = value;
+  val_len_ = length;
+}
+
+inline void ObObj::set_lob_value(const ObObjType type, const char *ptr, const int32_t length)
+{
+  meta_.set_type(type);
+  if (type != ObCollectionSQLType) {
+    meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  }
+  v_.string_ = ptr;
+  val_len_ = length;
+}
+
+inline void ObObj::set_json_value(const ObObjType type, const ObLobCommon *value, const int32_t length)
+{
+  set_lob_value(type, value, length);
+  meta_.set_collation_type(CS_TYPE_UTF8MB4_BIN); // for oracle it is decided by sys collation.
+}
+
+inline void ObObj::set_json_value(const ObObjType type, const char *ptr, const int32_t length)
+{
+  set_lob_value(type, ptr, length);
+  meta_.set_collation_type(CS_TYPE_UTF8MB4_BIN); // for oracle it is decided by sys collation.
+}
+
+inline void ObObj::set_geometry_value(const ObObjType type, const ObLobCommon *value, const int32_t length)
+{
+  set_lob_value(type, value, length);
+  meta_.set_collation_type(CS_TYPE_BINARY);
+}
+
+inline void ObObj::set_geometry_value(const ObObjType type, const char *ptr, const int32_t length)
+{
+  set_lob_value(type, ptr, length);
+  meta_.set_collation_type(CS_TYPE_BINARY);
+}
+inline void ObObj::set_roaringbitmap_value(const ObObjType type, const ObLobCommon *value, const int32_t length)
+{
+  set_lob_value(type, value, length);
+  meta_.set_collation_type(CS_TYPE_BINARY);
+}
+
+inline void ObObj::set_roaringbitmap_value(const ObObjType type, const char *ptr, const int32_t length)
+{
+  set_lob_value(type, ptr, length);
+  meta_.set_collation_type(CS_TYPE_BINARY);
+}
+inline void ObObj::set_lob_locator(const ObLobLocator &value)
+{
+  meta_.set_type(ObLobType);
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.lob_locator_ = &value;
+  val_len_ = static_cast<int32_t>(value.get_total_size());
+}
+
+inline void ObObj::set_lob_locator(const ObObjType type, const ObLobLocator &value)
+{
+  UNUSED(type);
+  meta_.set_type(ObLobType);
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.lob_locator_ = &value;
+  val_len_ = static_cast<int32_t>(value.get_total_size());
+}
+
+inline void ObObj::set_otimestamp_value(const ObObjType type, const ObOTimestampData &value)
+{
+  meta_.set_otimestamp_type(type);
+  time_ctx_ = value.time_ctx_;
+  v_.datetime_ = value.time_us_;
+}
+
+inline void ObObj::set_otimestamp_value(const ObObjType type, const int64_t time_us, const uint32_t time_ctx_desc)
+{
+  meta_.set_otimestamp_type(type);
+  time_ctx_.desc_ = time_ctx_desc;
+  v_.datetime_ = time_us;
+}
+
+inline void ObObj::set_otimestamp_value(const ObObjType type, const int64_t time_us, const uint16_t time_desc)
+{
+  meta_.set_otimestamp_type(type);
+  time_ctx_.tz_desc_ = 0;
+  time_ctx_.time_desc_ = time_desc;
+  v_.datetime_ = time_us;
+}
+
+inline void ObObj::set_otimestamp_null(const ObObjType type)
+{
+  meta_.set_otimestamp_type(type);
+  time_ctx_.tz_desc_ = 0;
+  time_ctx_.time_desc_ = 0;
+  time_ctx_.is_null_ = 1;
+}
+
+inline void ObObj::set_interval_ym(const ObIntervalYMValue &value)
+{
+  meta_.set_interval_ym();
+  v_.nmonth_ = value.nmonth_;
+  interval_fractional_ = 0;
+}
+
+inline void ObObj::set_interval_ds(const ObIntervalDSValue &value)
+{
+  meta_.set_interval_ds();
+  v_.nsecond_ = value.nsecond_;
+  interval_fractional_ = value.fractional_second_;
+}
+
+inline void ObObj::set_nvarchar2(const ObString &value)
+{
+  meta_.set_nvarchar2();
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = value.ptr();
+  val_len_ = value.length();
+}
+
+inline void ObObj::set_nvarchar2_value(const char *ptr, const ObString::obstr_size_t size)
+{
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = ptr;
+  val_len_ = size;
+}
+
+
+inline void ObObj::set_nchar(const ObString &value)
+{
+  meta_.set_nchar();
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = value.ptr();
+  val_len_ = value.length();
+}
+
+inline void ObObj::set_nchar_value(const char *ptr, const ObString::obstr_size_t size)
+{
+  meta_.set_collation_level(CS_LEVEL_IMPLICIT);
+  v_.string_ = ptr;
+  val_len_ = size;
+}
+
+inline void ObObj::set_null()
+{
+  meta_.set_null();
+}
+
+inline void ObObj::set_bool(const bool value)
+{
+  meta_.set_tinyint();
+  v_.int64_ = static_cast<int64_t>(value);
+}
+
+inline void ObObj::set_ext(const int64_t value)
+{
+  meta_.set_ext();
+  val_len_ = 0;
+  v_.ext_ = value;
+}
+
+inline void ObObj::set_extend(const int64_t value, uint8 extend_type, int32_t size)
+{
+  set_ext(value);
+  meta_.set_extend_type(extend_type);
+  set_val_len(size);
+}
+
+inline void ObObj::set_unknown(const int64_t value)
+{
+  meta_.set_unknown();
+  v_.unknown_ = value;
+}
+
+inline void ObObj::set_bit(const uint64_t value)
+{
+  meta_.set_bit();
+  v_.uint64_ = value;
+}
+
+inline void ObObj::set_bit_value(const uint64_t value)
+{
+  v_.uint64_ = value;
+}
+
+inline void ObObj::set_min_value()
+{
+  set_ext(MIN_OBJECT_VALUE);
+}
+
+inline void ObObj::set_max_value()
+{
+  set_ext(MAX_OBJECT_VALUE);
+}
+
+inline void ObObj::set_nop_value()
+{
+  set_ext(ObActionFlag::OP_NOP);
+}
+
+inline void ObObj::set_sql_udt(const char* ptr, int32_t size, uint16_t subschema_id, uint8_t udt_flags)
+{
+  meta_.set_sql_udt(subschema_id);
+  meta_.set_udt_flags(udt_flags);
+  v_.string_ = ptr;
+  val_len_ = size;
+}
+
+inline void ObObj::set_sql_collection(const char* ptr, int32_t size, uint16_t subschema_id, uint8_t udt_flags)
+{
+  meta_.set_collection(subschema_id);
+  // meta_.set_udt_flags(udt_flags);
+  v_.string_ = ptr;
+  val_len_ = size;
+}
+
+inline void ObObj::set_udt_value(const char* ptr, int32_t size)
+{
+  v_.string_ = ptr;
+  val_len_ = size;
+}
+
+inline bool ObObj::is_min_value() const
+{
+  return meta_.get_type() == ObExtendType && v_.ext_ == MIN_OBJECT_VALUE;
+}
+
+inline bool ObObj::is_max_value() const
+{
+  return meta_.get_type() == ObExtendType && v_.ext_ == MAX_OBJECT_VALUE;
+}
+
+inline bool ObObj::is_nop_value() const
+{
+  return meta_.get_type() == ObExtendType && v_.ext_ == ObActionFlag::OP_NOP;
+}
+
+inline bool ObObj::is_true() const
+{
+  return ob_is_int_tc(meta_.get_type()) && 0 != v_.int64_;
+}
+
+inline bool ObObj::is_false() const
+{
+  return ob_is_int_tc(meta_.get_type()) && 0 == v_.int64_;
+}
+
+inline bool ObObj::need_deep_copy()const
+{
+  return (((ob_is_string_type(meta_.get_type())
+            || ob_is_lob_locator(meta_.get_type())
+            || ob_is_json(meta_.get_type())
+            || ob_is_geometry(meta_.get_type())
+            || ob_is_roaringbitmap(meta_.get_type())
+            || ob_is_raw(meta_.get_type())
+            || ob_is_user_defined_sql_type(meta_.get_type())
+            || ob_is_collection_sql_type(meta_.get_type())
+            || ob_is_rowid_tc(meta_.get_type())) && 0 != val_len_ && NULL != get_string_ptr())
+            || (ob_is_number_tc(meta_.get_type())
+             && 0 != nmb_desc_.len_ && NULL != get_number_digits())
+            || (ob_is_decimal_int(meta_.get_type())
+             && 0 != val_len_ && NULL != get_decimal_int()));
+}
+
+inline int64_t ObObj::get_ext() const
+{
+  int64_t res = 0;
+  if (ObExtendType == meta_.get_type()) {
+    res = v_.ext_;
+  }
+  return res;
+}
+
+inline void ObObj::set_val_len(const int32_t val_len)
+{
+  val_len_ = val_len;
+}
+
+////////////////////////////////////////////////////////////////
+inline int ObObj::get_tinyint(int8_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_tinyint()) {
+    v = static_cast<int8_t>(v_.int64_);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_smallint(int16_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_smallint()) {
+    v = static_cast<int16_t>(v_.int64_);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_mediumint(int32_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_mediumint()) {
+    v = static_cast<int32_t>(v_.int64_);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_int32(int32_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_int32()) {
+    v = static_cast<int32_t>(v_.int64_);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_int(int64_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_int()) {
+    v = v_.int64_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+
+inline int ObObj::get_utinyint(uint8_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_utinyint()) {
+    v = static_cast<uint8_t>(v_.uint64_);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_usmallint(uint16_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_usmallint()) {
+    v = static_cast<uint16_t>(v_.uint64_);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_umediumint(uint32_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_umediumint()) {
+    v = static_cast<uint32_t>(v_.uint64_);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_uint32(uint32_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_uint32()) {
+    v = static_cast<uint32_t>(v_.uint64_);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_uint64(uint64_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_uint64()) {
+    v = v_.uint64_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_float(float &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_float()) {
+    v = v_.float_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_double(double &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_double()) {
+    v = v_.double_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_ufloat(float &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_ufloat()) {
+    v = v_.float_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_udouble(double &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_udouble()) {
+    v = v_.double_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+
+inline int ObObj::get_number(number::ObNumber &num) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_number()) {
+    num.assign(nmb_desc_.desc_, v_.nmb_digits_);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_unumber(number::ObNumber &num) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_unumber()) {
+    num.assign(nmb_desc_.desc_, v_.nmb_digits_);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_number_float(number::ObNumber &num) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_number_float()) {
+    num.assign(nmb_desc_.desc_, v_.nmb_digits_);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+
+inline int ObObj::get_datetime(int64_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_datetime()) {
+    v = v_.datetime_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_timestamp(int64_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_timestamp()) {
+    v = v_.datetime_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_date(int32_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_date()) {
+    v = v_.date_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_time(int64_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_time()) {
+    v = v_.time_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_year(uint8_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_year()) {
+    v = v_.year_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_string(ObString &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_string_or_lob_locator_type() || is_lob_storage()) {
+    if (ObLobType == meta_.get_type()) {
+      if (OB_ISNULL(v_.lob_locator_)) {
+        ret = OB_ERR_UNEXPECTED;
+        OB_LOG(WARN, "Unexpected null lob locator", K(*this));
+      } else if (OB_FAIL(v_.lob_locator_->get_payload(v))) {
+        OB_LOG(WARN, "Failed to get payload from lob locator", K(ret), KPC(v_.lob_locator_));
+      }
+    } else if (is_lob_storage()) {
+      if (val_len_ == 0) {
+        OB_LOG(DEBUG, "Lob: get string of null text obj", K(*this));
+        v.assign_ptr(v_.string_, val_len_);
+      } else {
+        ObLobLocatorV2 loc(reinterpret_cast<char *>(v_.ptr_), val_len_);
+        if (OB_UNLIKELY(!loc.is_valid())) {
+          ret = OB_ERR_UNEXPECTED;
+          OB_LOG(ERROR, "Unexpected invalid lob locator", K(*this), K(loc));
+        } else if (OB_FAIL(loc.get_inrow_data(v))) {
+          OB_LOG(WARN, "Lob: get inrow data failed", K(*this), K(loc));
+        }
+      }
+    } else {
+      v.assign_ptr(v_.string_, val_len_);
+    }
+    ret = OB_SUCCESS;
+  } else if (meta_.is_null()) {
+    v.assign_ptr(NULL, 0);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline bool ObObj::is_outrow_lob() const
+{
+  bool bret = false;
+  if (is_lob_storage()) {
+    if (val_len_ == 0) {
+    } else {
+      ObLobLocatorV2 loc(reinterpret_cast<char *>(v_.ptr_), val_len_);
+      if (loc.is_valid()) {
+        bret = !loc.has_inrow_data();
+      }
+    }
+  }
+  return bret;
+}
+
+inline bool ObObj::is_append_delta_lob() const
+{
+  bool bret = false;
+  if (is_lob_storage()) {
+    if (val_len_ == 0) {
+    } else {
+      ObLobLocatorV2 loc(reinterpret_cast<char *>(v_.ptr_), val_len_);
+      if (loc.is_valid()) {
+        bret = loc.is_append_delta_lob();
+      }
+    }
+  }
+  return bret;
+}
+
+inline bool ObObj::is_persist_lob() const
+{
+  bool bret = false;
+  if (ob_is_text_tc(meta_.get_type()) || ob_is_json_tc(meta_.get_type())) {
+    if (val_len_ == 0) {
+    } else {
+      ObLobLocatorV2 loc(reinterpret_cast<char *>(v_.ptr_), val_len_);
+      if (loc.is_valid()) {
+        bret = loc.is_persist_lob();
+      }
+    }
+  }
+  return bret;
+}
+
+inline int ObObj::get_print_string(ObString &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_lob()) {
+    OB_LOG(WARN, "Lob: using get_print_string for text types", K(*this), K(lbt()));
+  }
+  if (meta_.is_string_type()) {
+    v.assign_ptr(v_.string_, MIN(val_len_, OB_MAX_VARCHAR_LENGTH));
+    ret = OB_SUCCESS;
+  } else if (meta_.is_null()) {
+    v.assign_ptr(NULL, 0);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_varchar(ObString &v) const
+{
+  //int ret = OB_OBJ_TYPE_ERROR;
+  //if (meta_.is_varchar()) {
+  //  v.assign_ptr(v_.string_, val_len_);
+  //  ret = OB_SUCCESS;
+  //}
+  //return ret;
+  //
+  ////// todo  区分varchar和varbinary ;
+  return get_string(v);
+}
+
+inline int ObObj::get_char(ObString &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_char()) {
+    v.assign_ptr(v_.string_, val_len_);
+    ret = OB_SUCCESS;
+  } else if (meta_.is_null()) {
+    v.assign_ptr(NULL, 0);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_nvarchar2(ObString &v) const
+{
+  return get_string(v);
+}
+
+
+inline int ObObj::get_nchar(ObString &v) const
+{
+  return get_string(v);
+}
+
+inline int ObObj::get_varbinary(ObString &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_varbinary()) {
+    v.assign_ptr(v_.string_, val_len_);
+    ret = OB_SUCCESS;
+  } else if (meta_.is_null()) {
+    v.assign_ptr(NULL, 0);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_raw(ObString &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_raw()) {
+    v.assign_ptr(v_.string_, val_len_);
+    ret = OB_SUCCESS;
+  } else if (meta_.is_null()) {
+    v.assign_ptr(NULL, 0);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_binary(ObString &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_binary()) {
+    v.assign_ptr(v_.string_, val_len_);
+    ret = OB_SUCCESS;
+  } else if (meta_.is_null()) {
+    v.assign_ptr(NULL, 0);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_hex_string(ObString &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_hex_string()) {
+    v.assign_ptr(v_.string_, val_len_);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_lob_value(const ObLobCommon *&value) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (is_lob_storage()) {
+    value = v_.lob_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_lob_locator(ObLobLocator *&lob_locator) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (is_lob_locator()) {
+    lob_locator = const_cast<ObLobLocator *>(v_.lob_locator_);
+    if (!lob_locator->is_valid()) {
+      ret = OB_INVALID_ARGUMENT;
+      OB_LOG(WARN, "invalid lob locator", K(*this));
+    } else {
+      ret = OB_SUCCESS;
+    }
+  }
+  return ret;
+}
+
+inline int ObObj::get_lob_locatorv2(ObLobLocatorV2 &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (is_lob_storage()) {
+    v.assign_ptr(v_.lob_locator_v2_, val_len_);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_lob_locatorv2(ObString &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (is_lob_storage()) {
+    v.assign_ptr(v_.string_, val_len_);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_bool(bool &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_tinyint()) {
+    v = (0 != v_.int64_);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_ext(int64_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_ext()) {
+    v = v_.ext_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_unknown(int64_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_unknown()) {
+    v = v_.unknown_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_bit(uint64_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_bit()) {
+    v = v_.uint64_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_enum(uint64_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_enum()) {
+    v = v_.uint64_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_set(uint64_t &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_set()) {
+    v = v_.uint64_;
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_enumset_inner_value(ObEnumSetInnerValue &inner_value) const
+{
+  int ret = OB_SUCCESS;
+  if (!ob_is_enumset_inner_tc(get_type())) {
+    ret = OB_OBJ_TYPE_ERROR;
+  } else {
+    int64_t pos = 0;
+    if (OB_FAIL(inner_value.deserialize(v_.string_, val_len_, pos))) {
+    }
+  }
+  return ret;
+}
+
+inline int ObObj::get_interval_ds(ObIntervalDSValue &value) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!meta_.is_interval_ds())) {
+    ret = OB_OBJ_TYPE_ERROR;
+  } else {
+    value = get_interval_ds();
+  }
+  return ret;
+}
+
+inline int ObObj::get_interval_ym(ObIntervalYMValue &value) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!meta_.is_interval_ym())) {
+    ret = OB_OBJ_TYPE_ERROR;
+  } else {
+    value = get_interval_ym();
+  }
+  return ret;
+}
+
+inline int ObObj::get_urowid(ObURowIDData &urowid_data) const
+{
+    int ret = common::OB_SUCCESS;
+    urowid_data.rowid_content_ = (const uint8_t *)v_.string_;
+    urowid_data.rowid_len_ = val_len_;
+    return ret;
+}
+
+inline int ObObj::get_udt(ObString &udt_data) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_user_defined_sql_type()) {
+    udt_data.assign_ptr(v_.string_, val_len_);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+//Obj中所有public的varchar hash方法，以及varchar类型的obj调用hash方法时，都调用了此方法
+OB_INLINE static uint64_t varchar_hash_with_collation(const ObObj &obj,
+                                                      const ObCollationType cs_type,
+                                                      const uint64_t hash, hash_algo hash_al)
+{
+  return ObCharset::hash(cs_type, obj.get_string_ptr(), obj.get_string_len(), hash,
+           obj.is_varying_len_char_type() && lib::is_oracle_mode(), hash_al);
+}
+
+inline uint64_t ObObj::varchar_hash(ObCollationType cs_type, uint64_t seed) const
+{
+  check_collation_integrity();
+  return varchar_hash_with_collation(*this, cs_type, seed, NULL);
+}
+
+inline uint64_t ObObj::varchar_murmur_hash(ObCollationType cs_type, uint64_t seed) const
+{
+  check_collation_integrity();
+  return varchar_hash_with_collation(*this, cs_type, seed, ObMurmurHash::hash);
+}
+
+inline uint64_t ObObj::varchar_wy_hash(ObCollationType cs_type, uint64_t seed) const
+{
+  check_collation_integrity();
+  return varchar_hash_with_collation(*this, cs_type, seed, ObWyHash::hash);
+}
+
+inline uint64_t ObObj::varchar_xx_hash(ObCollationType cs_type, uint64_t seed) const
+{
+  check_collation_integrity();
+  return varchar_hash_with_collation(*this, cs_type, seed, ObXxHash::hash);
+}
+
+inline const void *ObObj::get_data_ptr() const
+{
+  const void *ret = NULL;
+  if (ob_is_string_type(get_type()) || ob_is_raw(get_type()) || ob_is_rowid_tc(get_type()) || ob_is_json(get_type())
+      || ob_is_geometry(get_type()) || ob_is_user_defined_sql_type(get_type()) || ob_is_collection_sql_type(get_type())
+      || ob_is_roaringbitmap(get_type())) {
+    ret = const_cast<char *>(v_.string_);
+  } else if (ob_is_number_tc(get_type())) {
+    ret = const_cast<uint32_t *>(v_.nmb_digits_);
+  } else if (ob_is_lob_locator(get_type())) {
+    ret = const_cast<ObLobLocator *>(v_.lob_locator_);
+  } else if (ob_is_decimal_int(get_type())) {
+    ret = const_cast<ObDecimalInt *>(v_.decimal_int_);
+  } else {
+    ret = &v_;
+  }
+  return ret;
+};
+
+inline void ObObj::set_data_ptr(void *data_ptr)
+{
+  if (ob_is_string_type(get_type()) || ob_is_raw(get_type()) || ob_is_rowid_tc(get_type()) || ob_is_json(get_type())
+      || ob_is_geometry(get_type()) || ob_is_user_defined_sql_type(get_type()) || ob_is_collection_sql_type(get_type())
+      || ob_is_roaringbitmap(get_type())) {
+    v_.string_ = static_cast<char*>(data_ptr);
+  } else if (ob_is_number_tc(get_type())) {
+    v_.nmb_digits_ = static_cast<uint32_t*>(data_ptr);
+  } else if (ob_is_lob_locator(get_type())) {
+    v_.lob_locator_ = static_cast<ObLobLocator *>(data_ptr);
+  } else if (ob_is_decimal_int(get_type())) {
+    v_.decimal_int_ = static_cast<ObDecimalInt *>(data_ptr);
+  } else {
+    //@TODO other value pointer
+  }
+};
+
+template <typename Allocator>
+int ObObj::to_collation_free_obj(ObObj &dst, bool &is_valid_collation_free, Allocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  const int32_t len = get_string_len();
+  const bool is_copy_all = true;
+  const int32_t buf_len = len * 2; // 对于变长类型的sortkey，最多会比原来的字符串占用2倍的空间
+  char *buf = NULL;
+  is_valid_collation_free = true;
+  if (!is_character_type()) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "invalid argument, only varchar or char can be transformed to collation free obj",
+        K(ret), "obj type", get_type());
+  } else { // 对于字符串类型，目前仅考虑char或varchar作为rowkey的场景
+    if (0 == len || NULL == get_string_ptr()) {
+      copy_value_or_obj(dst, is_copy_all);
+      dst.set_collation_type(CS_TYPE_COLLATION_FREE); // TODO: 等九仞把是否比较空格的collation加进来之后，还需要修改
+    } else {
+      if (OB_ISNULL(buf = static_cast<char *>(allocator.alloc(buf_len)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        COMMON_LOG(WARN, "fail to allocate memory", K(ret), K(buf_len));
+      } else {
+        size_t size = ObCharset::sortkey(get_collation_type(), get_string_ptr(),
+            static_cast<int64_t>(len), buf, static_cast<int64_t>(buf_len), is_valid_collation_free);
+        copy_value_or_obj(dst, is_copy_all);
+        if (is_varchar()) {
+          dst.set_varchar_value(buf, static_cast<int32_t>(size));
+        } else {
+          dst.set_char_value(buf, static_cast<int32_t>(size));
+        }
+        dst.set_collation_type(CS_TYPE_COLLATION_FREE);
+      }
+    }
+  }
+  return ret;
+}
+
+//return byte length
+inline int64_t ObObj::get_data_length() const
+{
+  int64_t ret = sizeof(v_);
+  if (ob_is_string_type(get_type()) ||
+      ob_is_raw(get_type()) ||
+      ob_is_rowid_tc(get_type()) ||
+      ob_is_lob_locator(get_type()) ||
+      ob_is_json(get_type()) ||
+      ob_is_geometry(get_type()) ||
+      ob_is_roaringbitmap(get_type()) ||
+      ob_is_user_defined_sql_type(get_type()) ||
+      ob_is_collection_sql_type(get_type())) {
+    ret = val_len_;
+  } else if (ob_is_number_tc(get_type())) {
+    ret = nmb_desc_.len_ * sizeof(uint32_t);
+  }
+  return ret;
+};
+
+inline int64_t ObObj::get_tight_data_len() const
+{
+  int64 len = 0;
+  const ObObjType obj_type = get_type();
+  if (ob_is_var_len_type(obj_type)) {
+    len = val_len_;
+  } else if (ob_is_number_tc(obj_type)) {
+    len = nmb_desc_.len_ * sizeof(uint32_t);
+  } else {  // fixed-length types
+    switch(obj_type) {
+      case ObNullType:
+      case ObTinyIntType:
+      case ObUTinyIntType:
+      case ObYearType:
+        len = 1;
+        break;
+      case ObSmallIntType:
+      case ObUSmallIntType:
+        len = 2;
+        break;
+      case ObMediumIntType:
+      case ObUMediumIntType:
+      case ObInt32Type:
+      case ObUInt32Type:
+      case ObFloatType:
+      case ObUFloatType:
+      case ObDateType:
+      case ObMySQLDateType:
+        len = 4;
+        break;
+      case ObIntType:
+      case ObUInt64Type:
+      case ObDoubleType:
+      case ObUDoubleType:
+      case ObDateTimeType:
+      case ObTimestampType:
+      case ObTimeType:
+      case ObBitType:
+      case ObEnumType:  // @todo according to mysql doc, enum only need 2 bytes to store
+      case ObSetType:
+      case ObIntervalYMType:
+      case ObMySQLDateTimeType:
+        len = 8;
+        break;
+      case ObTimestampLTZType:
+      case ObTimestampNanoType:
+        len = 10;
+        break;
+      case ObTimestampTZType:
+      case ObIntervalDSType:
+        len = 12;
+        break;
+      default:
+        OB_ASSERT(0);
+        break;
+    }
+  }
+  return len;
+}
+
+inline const void *ObObj::get_tight_data_ptr() const
+{
+  const void *ret = NULL;
+  const ObObjType obj_type = get_type();
+  if (ob_is_var_len_type(obj_type)
+      || ob_is_number_tc(obj_type)) {
+    ret = v_.ptr_;
+  } else {  // fixed-length types
+    switch(obj_type) {
+      case ObNullType:
+      case ObTinyIntType:
+      case ObUTinyIntType:
+      case ObYearType:
+      case ObSmallIntType:
+      case ObUSmallIntType:
+      case ObMediumIntType:
+      case ObUMediumIntType:
+      case ObInt32Type:
+      case ObUInt32Type:
+      case ObFloatType:
+      case ObUFloatType:
+      case ObDateType:
+      case ObIntType:
+      case ObUInt64Type:
+      case ObDoubleType:
+      case ObUDoubleType:
+      case ObDateTimeType:
+      case ObTimestampType:
+      case ObTimeType:
+      case ObBitType:
+      case ObEnumType:  // @todo according to mysql doc, enum only need 2 bytes to store
+      case ObSetType:
+      case ObIntervalYMType:
+      case ObMySQLDateType:
+      case ObMySQLDateTimeType:
+        ret = &v_;
+        break;
+      case ObTimestampLTZType:
+      case ObTimestampNanoType:      // @FIXME, time_desc_ is the first field of time_ctx_
+        ret = &time_ctx_.time_desc_;  // 2 + 8 continuous bytes
+        break;
+      case ObTimestampTZType:
+      case ObIntervalDSType:
+        ret = &interval_fractional_;  // 4 + 8 bytes
+        break;
+      default:
+        OB_ASSERT(0);
+    }
+  }
+  return ret;
+};
+
+template <typename AllocatorT>
+    int ob_write_obj(AllocatorT &allocator, const ObObj &src, ObObj &dst)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(src.need_deep_copy())) {
+    int64_t deep_copy_size = src.get_deep_copy_size();
+    char *buf = static_cast<char*>(allocator.alloc(deep_copy_size));
+    int64_t pos = 0;
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LIB_LOG(WARN, "allocate memory failed", K(ret), K(deep_copy_size));
+    } else if (OB_FAIL(dst.deep_copy(src, buf, deep_copy_size, pos))) {
+      LIB_LOG(WARN, "deep copy src obj failed", K(ret), K(deep_copy_size), K(pos));
+    }
+  } else {
+    dst = src;
+  }
+  return ret;
+}
+
+inline int ObObj::write_otimestamp(char *buf, const int64_t len, int64_t &pos) const
+{
+  int ret = common::OB_SUCCESS;
+  if (OB_ISNULL(buf) || OB_UNLIKELY(len < get_otimestamp_store_size())) {
+    ret= common::OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "invalid argument", KP(buf), K(len));
+  } else {
+    const ObOTimestampData &ot_data = get_otimestamp_value();
+    *reinterpret_cast<int64_t *>(buf) = ot_data.time_us_;
+    if (is_timestamp_tz()) {
+      *reinterpret_cast<uint32_t *>(buf + sizeof(int64_t)) = ot_data.time_ctx_.desc_;
+      pos += static_cast<int64_t>(sizeof(int64_t) + sizeof(uint32_t));
+    } else {
+      *reinterpret_cast<uint16_t *>(buf + sizeof(int64_t)) = ot_data.time_ctx_.time_desc_;
+      pos += static_cast<int64_t>(sizeof(int64_t) + sizeof(uint16_t));
+    }
+  }
+  return ret;
+}
+
+inline int ObObj::read_otimestamp(const char *buf, const int64_t len)
+{
+  int ret = common::OB_SUCCESS;
+  if (OB_ISNULL(buf) || OB_UNLIKELY(len < get_otimestamp_store_size())) {
+    ret= common::OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "invalid argument", KP(buf), K(len));
+  } else {
+    const int64_t time_us = *reinterpret_cast<int64_t *>(const_cast<char *>(buf));
+    if (is_timestamp_tz()) {
+      const uint32_t time_ctx_desc = *reinterpret_cast<const uint32_t *>(buf + sizeof(int64_t));
+      set_otimestamp_value(get_type(), time_us, time_ctx_desc);
+    } else {
+      const uint16_t time_desc = *reinterpret_cast<const uint16_t *>(buf + sizeof(int64_t));
+      set_otimestamp_value(get_type(), time_us, time_desc);
+    }
+  }
+  return ret;
+}
+
+int ObObj::read_interval(const char *buf)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(buf)) {
+    ret= OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "invalid argument", KP(buf));
+  } else if (is_interval_ym()) {
+    ObIntervalYMValue value;
+    if (OB_FAIL(value.decode(buf))) {
+    } else {
+      set_interval_ym(value);
+    }
+  } else {
+    ObIntervalDSValue value;
+    if (OB_FAIL(value.decode(buf))) {
+    } else {
+      set_interval_ds(value);
+    }
+  }
+  return ret;
+}
+
+int64_t ObObj::get_interval_store_size() const
+{
+  return is_interval_ym() ? ObIntervalYMValue::get_store_size() : ObIntervalDSValue::get_store_size();
+}
+
+int ObObj::write_interval(char *buf) const
+{
+  int ret = common::OB_SUCCESS;
+  if (OB_ISNULL(buf)) {
+    ret= common::OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "invalid argument", KP(buf));
+  } else {
+    ret = is_interval_ym() ? get_interval_ym().encode(buf)
+                           : get_interval_ds().encode(buf);
+  }
+  return ret;
+}
+
+inline bool ObObj::strict_equal(const ObObj &other) const
+{
+  bool bret = true;
+  if (OB_UNLIKELY(get_type() != other.get_type())) {
+    bret = false;
+  } else {
+    //here must use CS_TYPE_BINARY to compare, avoid spaces at the end of the string be ignored
+    bret = (0 == compare(other, CS_TYPE_BINARY));
+    if (bret && is_timestamp_tz()) {
+      //for the data type of timestamp with time zone,
+      //obj meaningful info includes v_.datetime_ and time_ctx_.desc_
+      //so we must compare time_ctx_.desc_ here
+      bret = (time_ctx_.desc_ == other.time_ctx_.desc_);
+    }
+  }
+  return bret;
+}
+
+#define DEFINE_SET_COMMON_OBJ_VALUE(VTYPE, OBJTYPE)             \
+template<>                                                      \
+inline void ObObj::set_obj_value<OBJTYPE>(const OBJTYPE & v)    \
+{                                                               \
+  v_.VTYPE##_ = static_cast<__typeof__(v_.VTYPE##_)>(v);            \
+}
+
+DEFINE_SET_COMMON_OBJ_VALUE(int64, int8_t);
+DEFINE_SET_COMMON_OBJ_VALUE(uint64, uint8_t);
+DEFINE_SET_COMMON_OBJ_VALUE(int64, int16_t);
+DEFINE_SET_COMMON_OBJ_VALUE(uint64, uint16_t);
+DEFINE_SET_COMMON_OBJ_VALUE(int64, int32_t);
+DEFINE_SET_COMMON_OBJ_VALUE(uint64, uint32_t);
+DEFINE_SET_COMMON_OBJ_VALUE(float, float);
+DEFINE_SET_COMMON_OBJ_VALUE(double, double);
+DEFINE_SET_COMMON_OBJ_VALUE(int64, int64_t);
+DEFINE_SET_COMMON_OBJ_VALUE(uint64, uint64_t);
+
+template<>
+inline void ObObj::set_obj_value<ObString>(const ObString &v)
+{
+  v_.string_ = v.ptr();
+  val_len_ = v.length();
+}
+
+template<>
+inline void ObObj::set_obj_value<ObIntervalYMValue>(const ObIntervalYMValue &v)
+{
+  v_.nmonth_ = v.nmonth_;
+  interval_fractional_ = 0;
+}
+
+template<>
+inline void ObObj::set_obj_value<ObIntervalDSValue>(const ObIntervalDSValue &v)
+{
+  v_.nsecond_ = v.nsecond_;
+  interval_fractional_ = v.fractional_second_;
+}
+
+template<>
+inline void ObObj::set_obj_value<ObURowIDData>(const ObURowIDData &urowid)
+{
+  v_.string_ = (const char *)urowid.rowid_content_;
+  val_len_ = static_cast<int32_t>(urowid.rowid_len_);
+}
+
+template<>
+inline void ObObj::set_obj_value<ObOTimestampData>(const ObOTimestampData &otimestamp)
+{
+  time_ctx_ = otimestamp.time_ctx_;
+  v_.datetime_ = otimestamp.time_us_;
+}
+
+struct ParamFlag
+{
+  ParamFlag() : need_to_check_type_(true),
+                need_to_check_bool_value_(false),
+                expected_bool_value_(false),
+                need_to_check_extend_type_(true),
+                is_ref_cursor_type_(false),
+                is_pl_mock_default_param_(false),
+                is_boolean_(false),
+                is_batch_parameter_(0),
+                ignore_scale_check_(false),
+                need_strict_type_match_(false),
+                reserved_(0)
+  { }
+  TO_STRING_KV(K_(need_to_check_type), K_(need_to_check_bool_value),
+               K_(expected_bool_value), K_(is_pl_mock_default_param), K_(need_to_check_extend_type), K_(is_batch_parameter),
+               K_(ignore_scale_check), K_(need_strict_type_match));
+  void reset();
+
+  static uint32_t flag_offset_bits() { return offsetof(ParamFlag, flag_) * 8; }
+
+  union
+  {
+    uint8_t flag_;
+    struct {
+      uint8_t need_to_check_type_: 1; //TRUE if the type need to be checked by plan cache, FALSE otherwise
+      uint8_t need_to_check_bool_value_ : 1;//TRUE if the bool value need to be checked by plan cache, FALSE otherwise
+      uint8_t expected_bool_value_ : 1;//bool value, effective only when need_to_check_bool_value_ is true
+      uint8_t need_to_check_extend_type_ : 1; // True if the extended type needs to be checked
+      uint8_t is_ref_cursor_type_ : 1; // in pl/sql context, this will be true if the local var is a ref cursor
+      uint8_t is_pl_mock_default_param_ : 1; // TRUE if ObObjParam is pl default param
+      uint8_t is_boolean_ : 1; // to distinguish T_BOOL and T_TINYINT
+      uint8_t is_batch_parameter_ : 1; // 表示是batch参数
+    };
+  };
+
+  union
+  {
+    uint8_t extend_flag_;
+    struct {
+      uint8_t ignore_scale_check_ : 1; //TRUE if plan cache can reuse by different scale numbers, FALSE otherwise
+      uint8_t need_strict_type_match_ : 1; //TRUE if need strict type match (for pl null param)
+      uint8_t reserved_ : 6;
+    };
+  };
+  OB_UNIS_VERSION_V(1);
+};
+
+class ObObjParam : public ObObj
+{
+public:
+  ObObjParam() : ObObj(), accuracy_(), res_flags_(0),
+                          raw_text_pos_(-1), raw_text_len_(-1)
+  {
+  }
+  ObObjParam(const ObObj &other) : ObObj(other), accuracy_(), res_flags_(0),
+                                                 raw_text_pos_(-1), raw_text_len_(-1)
+  {
+  }
+public:
+  void reset();
+  // accuracy.
+  OB_INLINE void set_accuracy(const common::ObAccuracy &accuracy) { accuracy_.set_accuracy(accuracy); }
+  OB_INLINE void set_length(common::ObLength length) { accuracy_.set_length(length); }
+  OB_INLINE void set_precision(common::ObPrecision precision) { accuracy_.set_precision(precision); }
+  OB_INLINE void set_length_semantics(common::ObLengthSemantics length_semantics) { accuracy_.set_length_semantics(length_semantics); }
+  OB_INLINE void set_scale(common::ObScale scale) {
+    ObObj::set_scale(scale);
+    accuracy_.set_scale(scale);
+  }
+  OB_INLINE void set_udt_id(uint64_t id) {
+    accuracy_.set_accuracy(id);
+  }
+  OB_INLINE const common::ObAccuracy &get_accuracy() const { return accuracy_; }
+  OB_INLINE common::ObLength get_length() const { return accuracy_.get_length(); }
+  OB_INLINE common::ObPrecision get_precision() const { return accuracy_.get_precision(); }
+  OB_INLINE common::ObScale get_scale() const { return accuracy_.get_scale(); }
+  OB_INLINE uint64_t get_udt_id() const { return is_ext() ? accuracy_.get_accuracy() : OB_INVALID_INDEX; }
+  OB_INLINE bool is_extend_xml_type() const { return get_udt_id() == T_OBJ_XML; }
+  OB_INLINE void set_result_flag(uint32_t flag) { res_flags_ |= flag; }
+  OB_INLINE void unset_result_flag(uint32_t flag) { res_flags_ &= (~flag); }
+  OB_INLINE bool has_result_flag(uint32_t flag) const { return res_flags_ & flag; }
+  OB_INLINE uint32_t get_result_flag() const { return res_flags_; }
+
+  OB_INLINE const ParamFlag &get_param_flag() const { return flag_; }
+  OB_INLINE ParamFlag &get_param_flag() { return flag_; }
+  OB_INLINE bool is_batch_parameters() const { return flag_.is_batch_parameter_; }
+  OB_INLINE void set_param_flag(const ParamFlag flag) { flag_ = flag; }
+  OB_INLINE void set_need_to_check_type(bool flag) { flag_.need_to_check_type_ = flag; }
+  OB_INLINE bool need_to_check_type() const { return flag_.need_to_check_type_; }
+  OB_INLINE void set_need_to_check_extend_type(bool flag) { flag_.need_to_check_extend_type_ = flag; }
+  OB_INLINE bool need_to_check_extend_type() const { return flag_.need_to_check_extend_type_; }
+
+  OB_INLINE void set_need_to_check_bool_value(bool flag) { flag_.need_to_check_bool_value_ = flag; }
+  OB_INLINE bool need_to_check_bool_value() const { return flag_.need_to_check_bool_value_; }
+
+  OB_INLINE void set_expected_bool_value(bool b_value) { flag_.expected_bool_value_ = b_value; }
+  OB_INLINE bool expected_bool_value() const { return flag_.expected_bool_value_; }
+
+  OB_INLINE void set_is_ref_cursor_type(bool flag) { flag_.is_ref_cursor_type_ = flag; }
+  OB_INLINE bool is_ref_cursor_type() const { return flag_.is_ref_cursor_type_; }
+  OB_INLINE void set_is_pl_mock_default_param(bool flag) { flag_.is_pl_mock_default_param_= flag; }
+  OB_INLINE bool is_pl_mock_default_param() const { return flag_.is_pl_mock_default_param_; }
+  OB_INLINE void set_is_boolean(bool flag) { flag_.is_boolean_ = flag; }
+  OB_INLINE bool is_boolean() const { return flag_.is_boolean_; }
+
+  OB_INLINE void set_ignore_scale_check(bool flag) { flag_.ignore_scale_check_ = flag; }
+  OB_INLINE bool ignore_scale_check() const { return flag_.ignore_scale_check_; }
+  OB_INLINE void set_need_strict_type_match(bool flag) { flag_.need_strict_type_match_ = flag; }
+  OB_INLINE bool need_strict_type_match() const { return flag_.need_strict_type_match_; }
+
+  OB_INLINE void set_raw_text_info(int32_t pos, int32_t len)
+  {
+    raw_text_pos_ = pos;
+    raw_text_len_ = len;
+  }
+  OB_INLINE int32_t get_raw_text_pos() const { return raw_text_pos_; }
+  OB_INLINE int32_t get_raw_text_len() const { return raw_text_len_; }
+  OB_INLINE void set_param_meta()
+  {
+    if (param_meta_.is_null() || ObNullType != get_meta().get_type()) {
+      param_meta_ = get_meta();
+    }
+    if (ob_is_numeric_type(get_type())) {
+      ObPrecision default_prec =
+        ObAccuracy::DDL_DEFAULT_ACCURACY2[lib::is_oracle_mode()][get_type()].get_precision();
+      ObScale default_scale =
+        ObAccuracy::DDL_DEFAULT_ACCURACY2[lib::is_oracle_mode()][get_type()].get_scale();
+      if (get_scale() < 0) {
+        if (meta_.get_scale() >= 0) {
+          set_scale(meta_.get_scale());
+        } else if (ob_is_integer_type(get_type())) {
+          set_scale(default_scale);
+        }
+      }
+      if (get_precision() == PRECISION_UNKNOWN_YET) { set_precision(default_prec); }
+    }
+  }
+  OB_INLINE void set_param_meta(const ObObjMeta &meta)
+  {
+    if (param_meta_.is_null() || ObNullType != meta.get_type()) {
+      param_meta_ = meta;
+    }
+  }
+  OB_INLINE const ObObjMeta &get_param_meta() const
+  {
+    return param_meta_;
+  }
+  // others.
+  INHERIT_TO_STRING_KV(N_OBJ, ObObj, N_ACCURACY, accuracy_,
+                       N_FLAG, res_flags_, K_(raw_text_pos), K_(raw_text_len), K_(param_meta));
+  NEED_SERIALIZE_AND_DESERIALIZE;
+
+  static uint32_t accuracy_offset_bits() { return offsetof(ObObjParam, accuracy_) * 8; }
+  static uint32_t res_flags_offset_bits() { return offsetof(ObObjParam, res_flags_) * 8; }
+  static uint32_t flag_offset_bits() { return offsetof(ObObjParam, flag_) * 8; }
+
+private:
+  ObAccuracy accuracy_;
+  uint32_t res_flags_;  // BINARY, NUM, NOT_NULL, TIMESTAMP, etc
+                        // reference: src/lib/regex/include/mysql_com.h
+  ParamFlag flag_;
+  int32_t raw_text_pos_;
+  int32_t raw_text_len_;
+  ObObjMeta param_meta_; //meta for objparma, to solve Oracle NULL/'' problem
+};
+
+struct ObDataType
+{
+  OB_UNIS_VERSION(1);
+public:
+  ObDataType()
+    : meta_(),
+      accuracy_(),
+      charset_(CHARSET_UTF8MB4),
+      is_binary_collation_(false),
+      is_zero_fill_(false)
+  {}
+  TO_STRING_KV(K_(meta),
+               K_(accuracy),
+               K_(charset),
+               K_(is_binary_collation),
+               K_(is_zero_fill));
+  inline void reset()
+  {
+    meta_.reset();
+    accuracy_.reset();
+    charset_ = CHARSET_UTF8MB4;
+    is_binary_collation_ = false;
+    is_zero_fill_ = false;
+  }
+  inline bool operator==(const ObDataType &other) const
+  {
+    return meta_ == other.meta_
+        && accuracy_ == other.accuracy_
+        && charset_ == other.charset_
+        && is_binary_collation_ == other.is_binary_collation_
+        && is_zero_fill_ == other.is_zero_fill_;
+  }
+  inline ObObjType get_obj_type() const { return meta_.get_type(); }
+  inline ObObjTypeClass get_type_class() const { return meta_.get_type_class(); }
+  inline ObLength get_length() const { return accuracy_.get_length(); }
+  inline ObPrecision get_precision() const { return accuracy_.get_precision(); }
+  inline ObLengthSemantics get_length_semantics() const { return accuracy_.get_length_semantics(); }
+  inline ObScale get_scale() const { return accuracy_.get_scale(); }
+  inline ObCharsetType get_charset_type() const { return charset_; }
+  inline ObCollationType get_collation_type() const { return meta_.get_collation_type(); }
+  inline ObCollationLevel get_collation_level() const { return meta_.get_collation_level(); }
+  inline uint16_t get_subschema_id() { return meta_.get_subschema_id(); }
+  inline bool is_binary_collation() const { return is_binary_collation_; }
+  inline bool is_zero_fill() const { return is_zero_fill_; }
+  inline void set_obj_type(const ObObjType &type) { return meta_.set_type(type); }
+  inline void set_length(const ObLength length) { accuracy_.set_length(length); }
+  inline void set_precision(const ObPrecision precision) { accuracy_.set_precision(precision); }
+  inline void set_length_semantics(const ObLengthSemantics length_semantics) { accuracy_.set_length_semantics(length_semantics); }
+  inline void set_scale(const ObScale scale) { accuracy_.set_scale(scale); }
+  inline void set_charset_type(const ObCharsetType charset_type) { charset_ = charset_type; }
+  inline void set_collation_type(const ObCollationType coll_type) { meta_.set_collation_type(coll_type); }
+  inline void set_collation_level(const ObCollationLevel coll_level) { meta_.set_collation_level(coll_level); }
+  inline void set_binary_collation(const bool is_binary_collation) { is_binary_collation_ = is_binary_collation; }
+  inline void set_zero_fill(const bool is_zero_fill) { is_zero_fill_ = is_zero_fill; }
+  inline const ObObjMeta &get_meta_type() const { return meta_; }
+  inline void set_meta_type(const ObObjMeta &meta_type) { meta_ = meta_type; }
+  inline const ObAccuracy &get_accuracy() const { return accuracy_; }
+  inline void set_accuracy(const ObAccuracy &accuracy) { accuracy_ = accuracy; }
+  inline int64_t get_accuracy_value() const { return accuracy_.accuracy_; }
+  inline void set_int() { meta_.set_int(); }
+  inline void set_uint64() { meta_.set_uint64(); }
+  inline uint64_t get_udt_id() const { return accuracy_.get_accuracy(); }
+  inline void set_udt_id(uint64_t udt_id) { accuracy_.set_accuracy(udt_id); }
+  inline void set_subschema_id(const uint16_t subschema_id) { meta_.set_subschema_id(subschema_id); }
+  ObObjMeta meta_;
+  ObAccuracy accuracy_;
+  ObCharsetType charset_;
+  bool is_binary_collation_;
+  bool is_zero_fill_;
+};
+
+
+struct ObSqlArrayObj
+{
+  ObSqlArrayObj()
+    : data_(nullptr),
+      count_(0),
+      element_()
+  {
+  }
+  typedef common::ObArrayWrap<common::ObObjParam> DataArray;
+  static ObSqlArrayObj *alloc(common::ObIAllocator &allocator, int64_t count);
+  static int do_real_deserialize(common::ObIAllocator &allocator, char *buf, int64_t data_len, ObSqlArrayObj *&array_obj);
+  int serialize(char* buf, const int64_t buf_len, int64_t& pos) const;
+  int deserialize(common::ObIAllocator &allocator, const char* buf, const int64_t data_len, int64_t& pos);
+  int64_t get_serialize_size(void) const;
+  TO_STRING_KV("data", DataArray(data_, count_), K_(count), K_(element));
+  common::ObObjParam *data_;
+  int64_t count_;
+  common::ObDataType element_;
+};
+
+OB_INLINE ObSqlArrayObj *ObSqlArrayObj::alloc(common::ObIAllocator &allocator, int64_t count)
+{
+  ObSqlArrayObj *array_obj = nullptr;
+  void *array_buf = nullptr;
+  void *data_buf = nullptr;
+  int64_t array_size = sizeof(ObSqlArrayObj) + sizeof(common::ObObjParam) * count;
+  if (OB_NOT_NULL(array_buf = allocator.alloc(array_size))) {
+    array_obj = new (array_buf) ObSqlArrayObj();
+    data_buf = static_cast<char*>(array_buf) + sizeof(ObSqlArrayObj);
+    array_obj->data_ = new (data_buf) common::ObObjParam[count];
+    array_obj->count_ = count;
+  }
+  return array_obj;
+}
+
+OB_INLINE int64_t ObObj::get_deep_copy_size() const
+{
+  int64_t ret = 0;
+  if (is_string_type() || is_raw() || ob_is_rowid_tc(get_type()) || is_lob_locator() || is_json()
+      || is_geometry() || is_user_defined_sql_type() || ob_is_decimal_int(get_type())|| is_collection_sql_type()
+      || is_roaringbitmap()) {
+    ret += val_len_;
+  } else if (ob_is_number_tc(get_type())) {
+    ret += (sizeof(uint32_t) * nmb_desc_.len_);
+  }
+  return ret;
+}
+
+typedef int (*ob_obj_print)(const ObObj &obj, char *buffer, int64_t length, int64_t &pos, const ObObjPrintParams &params);
+typedef int64_t (*ob_obj_crc64)(const ObObj &obj, const int64_t current);
+typedef void (*ob_obj_batch_checksum)(const ObObj &obj, ObBatchChecksum &bc);
+typedef int (*ob_obj_hash)(const ObObj &obj, const uint64_t hash, uint64_t& res);
+typedef int (*ob_obj_value_serialize)(const ObObj &obj, char* buf, const int64_t buf_len, int64_t& pos);
+typedef int (*ob_obj_value_deserialize)(ObObj &obj, const char* buf, const int64_t data_len, int64_t& pos);
+typedef int64_t (*ob_obj_value_get_serialize_size)(const ObObj &obj);
+typedef uint64_t (*ob_obj_crc64_v3)(const ObObj &obj, const uint64_t hash);
+
+class ObObjUtil
+{
+public:
+  static ob_obj_hash get_murmurhash_v3(ObObjType type);
+  static ob_obj_hash get_murmurhash_v2(ObObjType type);
+  static ob_obj_crc64_v3 get_crc64_v3(ObObjType type);
+  static ob_obj_hash get_xxhash64(ObObjType type);
+  static ob_obj_hash get_wyhash(ObObjType type);
+};
+
+class ObHexEscapeSqlStr
+{
+public:
+  ObHexEscapeSqlStr(const common::ObString &str) : str_(str),
+                                                   skip_escape_(false),
+                                                   do_oracle_mode_escape_(lib::is_oracle_mode()) { }
+  ObHexEscapeSqlStr(const common::ObString &str, const bool skip_escape) : str_(str),
+                                                                           skip_escape_(skip_escape),
+                                                                           do_oracle_mode_escape_(lib::is_oracle_mode()){ }
+  ObHexEscapeSqlStr(const common::ObString &str,
+                    const bool skip_escape,
+                    const bool do_oracle_mode_escape)
+    : str_(str), skip_escape_(skip_escape), do_oracle_mode_escape_(do_oracle_mode_escape){ }
+  ObString str() const { return str_; }
+  int64_t get_extra_length() const;
+  DECLARE_TO_STRING;
+private:
+  ObString str_;
+  bool skip_escape_;
+  bool do_oracle_mode_escape_;
+};
+
+typedef Ob2DArray<ObObjParam, OB_MALLOC_BIG_BLOCK_SIZE,
+                          ObWrapperAllocator,false,
+                          ObSEArray<ObObjParam *, 1, ObWrapperAllocator, false>
+                          > ParamStore;
+
+class ObObjUDTUtil
+{
+// Utils for convert pl udt baisc attributes(obobjs) to sql udt format
+// basically, obj meta is store in subschema map
+// only value needs serialize into a continuous sql udt buffer
+public:
+  static int ob_udt_obj_value_serialize(const ObObj &obj, char* buf, const int64_t buf_len, int64_t& pos);
+  static int ob_udt_obj_value_deserialize(ObObj &obj, const char* buf, const int64_t data_len, int64_t& pos);
+  static int ob_udt_obj_value_get_serialize_size(const ObObj &obj, int64_t &value_len);
+
+  static bool ob_is_supported_sql_udt(const uint64_t udt_id)
+  { // only oracle gis related udt is supported currently
+    return udt_id == T_OBJ_XML
+          || udt_id == T_OBJ_SDO_POINT
+          || udt_id == T_OBJ_SDO_GEOMETRY
+          || udt_id == T_OBJ_SDO_ELEMINFO_ARRAY
+          || udt_id == T_OBJ_SDO_ORDINATE_ARRAY;
+  }
+};
+
+class ObObjCharacterUtil
+{
+  // Utils for safe hex representation of character types.
+  // Only use for the character types that supported as primary key columns.
+public:
+  static bool can_print_safe_hex_represent(const ObObj &obj);
+  static int print_safe_hex_represent_oracle(const ObObj &obj, char* buf, const int64_t buf_len, int64_t& pos, const ObAccuracy &accuracy);
+  static int print_safe_hex_represent_mysql(const ObObj &obj, char *buffer, int64_t length, int64_t &pos);
+  static int print_safe_hex_represent(const ObObj &obj, char *buffer, int64_t length, int64_t &pos, const ObAccuracy &accuracy);
+};
+
+}
+}
+
+#endif //

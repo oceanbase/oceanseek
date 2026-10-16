@@ -1,0 +1,1 @@
+sql_unittest(test_rls_privilege_check)

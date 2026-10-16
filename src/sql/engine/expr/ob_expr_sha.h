@@ -1,0 +1,81 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef SRC_SQL_ENGINE_EXPR_OB_EXPR_SHA_H_
+#define SRC_SQL_ENGINE_EXPR_OB_EXPR_SHA_H_
+
+#include "sql/engine/expr/ob_expr_operator.h"
+#include "share/object/ob_obj_cast.h"
+namespace oceanbase
+{
+namespace sql
+{
+
+class ObExprSha : public ObStringExprOperator
+{
+public:
+  explicit ObExprSha(common::ObIAllocator &alloc);
+  virtual ~ObExprSha();
+  virtual int calc_result_type1(ObExprResType &type,
+                                ObExprResType &type1,
+                                common::ObExprTypeCtx &type_ctx) const;
+  virtual int cg_expr(ObExprCGCtx &op_cg_ctx,
+                      const ObRawExpr &raw_expr,
+                      ObExpr &rt_expr) const override;
+  static int eval_sha(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum);
+  static int eval_sha_vector(VECTOR_EVAL_FUNC_ARG_DECL);
+  DECLARE_SET_LOCAL_SESSION_VARS;
+
+private:
+  template <typename ArgVec, typename ResVec>
+  static int sha_string_vector(VECTOR_EVAL_FUNC_ARG_DECL);
+  DISALLOW_COPY_AND_ASSIGN(ObExprSha);
+};
+
+
+class ObExprSha2 : public ObStringExprOperator
+{
+public:
+  explicit ObExprSha2(common::ObIAllocator &alloc);
+  virtual ~ObExprSha2();
+  virtual int calc_result_type2(ObExprResType &type,
+                                ObExprResType &type1,
+                                ObExprResType &type2,
+                                common::ObExprTypeCtx &type_ctx) const;
+  virtual int cg_expr(ObExprCGCtx &op_cg_ctx,
+                      const ObRawExpr &raw_expr,
+                      ObExpr &rt_expr) const override;
+  static int eval_sha2(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum);
+  static int eval_sha2_vector(VECTOR_EVAL_FUNC_ARG_DECL);
+  DECLARE_SET_LOCAL_SESSION_VARS;
+  
+private:
+  template <typename ArgVec1, typename ArgVec2, typename ResVec>
+  static int sha2_vector(VECTOR_EVAL_FUNC_ARG_DECL);
+  template <typename ArgVec1, typename ResVec>
+  static int sha2_vector_with_hash_algo(VECTOR_EVAL_FUNC_ARG_DECL, share::ObHashAlgorithm hash_algo);
+  DISALLOW_COPY_AND_ASSIGN(ObExprSha2);
+};
+
+class ObExprSm3 : public ObStringExprOperator
+{
+public:
+  explicit ObExprSm3(common::ObIAllocator &alloc);
+  virtual ~ObExprSm3();
+  virtual int calc_result_type1(ObExprResType &type,
+                                ObExprResType &type1,
+                                common::ObExprTypeCtx &type_ctx) const;
+  virtual int cg_expr(ObExprCGCtx &op_cg_ctx,
+                      const ObRawExpr &raw_expr,
+                      ObExpr &rt_expr) const override;
+  static int eval_sm3(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum);
+  DECLARE_SET_LOCAL_SESSION_VARS;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObExprSm3);
+};
+
+}
+}
+#endif /* SRC_SQL_ENGINE_EXPR_OB_EXPR_SHA_H_ */

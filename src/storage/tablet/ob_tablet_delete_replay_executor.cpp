@@ -1,0 +1,71 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include "storage/tablet/ob_tablet_delete_replay_executor.h"
+
+#define USING_LOG_PREFIX MDS
+
+namespace oceanbase
+{
+namespace storage
+{
+
+OB_SERIALIZE_MEMBER(ObRemoveTabletArg, ls_id_, tablet_id_);
+
+
+// ObTabletDeleteReplayExecutor
+ObTabletDeleteReplayExecutor::ObTabletDeleteReplayExecutor()
+  :logservice::ObTabletReplayExecutor(), ctx_(nullptr)
+{}
+
+int ObTabletDeleteReplayExecutor::init(
+    mds::BufferCtx &ctx,
+    const share::SCN &scn)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(is_inited_)) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("tablet delete replay executor init twice", KR(ret), K_(is_inited));
+  } else if (OB_UNLIKELY(!scn.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("get invalid argument", KR(ret), K(scn));
+  } else {
+    ctx_ = &ctx;
+    scn_ = scn;
+    is_inited_ = true;
+  }
+  return ret;
+}
+
+int ObTabletDeleteReplayExecutor::do_replay_(ObTabletHandle &tablet_handle)
+{
+  MDS_TG(10_ms);
+  int ret = OB_SUCCESS;
+  ObTablet *tablet = tablet_handle.get_obj();
+  mds::MdsCtx &user_ctx = static_cast<mds::MdsCtx&>(*ctx_);
+  ObTabletCreateDeleteMdsUserData data;
+  const int64_t timeout = THIS_WORKER.get_timeout_remain();
+
+  if (OB_ISNULL(tablet)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("tablet is null", K(ret), K(tablet_handle));
+  } else if (CLICK_FAIL(tablet->get_latest_committed_tablet_status(data))) {
+    LOG_WARN("failed to get tablet status", K(ret), K(timeout));
+    if (OB_EMPTY_RESULT == ret) {
+      LOG_ERROR("[MDS_FATAL] tablet status should exist", K(ret), KPC(tablet), K(timeout));
+    }
+  } else {
+    data.tablet_status_ = ObTabletStatus::DELETED;
+    data.data_type_ = ObTabletMdsUserDataType::REMOVE_TABLET;
+    if (CLICK_FAIL(replay_to_mds_table_(tablet_handle, data, user_ctx, scn_))) {
+      LOG_WARN("failed to replay to tablet", K(ret));
+    }
+  }
+
+  return ret;
+}
+
+}
+}

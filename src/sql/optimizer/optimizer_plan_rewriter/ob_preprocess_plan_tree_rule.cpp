@@ -1,0 +1,61 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+ #define USING_LOG_PREFIX SQL_OPT
+ #include "sql/optimizer/optimizer_plan_rewriter/ob_preprocess_plan_tree_rule.h"
+ #include "sql/optimizer/ob_log_plan.h"
+ 
+ namespace oceanbase
+ {
+ namespace sql
+ {
+ 
+int PlanNodeIdAllocator::visit_node(ObLogicalOperator * plannode, RewriterContext* context, RewriterResult*& result)
+{
+ int ret = OB_SUCCESS;
+ if (OB_ISNULL(plannode) || OB_ISNULL(plannode->get_plan())) {
+   ret = OB_ERR_UNEXPECTED;
+   LOG_WARN("get unexpected null", K(ret));
+ } else if (OB_FALSE_IT(plannode->set_op_id(ctx_->get_next_op_id()))) {
+   LOG_WARN("failed to set plan id", K(ret));
+ } else if (OB_FAIL(visit_children_with(plannode, context, result))) {
+   LOG_WARN("failed to rewrite children", K(ret));
+ } else if (OB_FAIL(plannode->get_plan()->perform_adjust_onetime_expr(plannode))) {
+   LOG_WARN("failed to perform adjust onetime expr", K(ret));
+ } 
+ return ret;
+}
+    
+ PreprocessPlanTreeRule::PreprocessPlanTreeRule()
+ {
+ }    
+ 
+ PreprocessPlanTreeRule::~PreprocessPlanTreeRule()
+ {
+ }
+ 
+ // rewrite log plan
+ int PreprocessPlanTreeRule::apply_rule(ObLogPlan* root_plan, ObOptimizerContext& ctx) {
+   // all related contexed are not null
+   int ret = OB_SUCCESS;
+   ObLogicalOperator *root = NULL;
+   if (OB_ISNULL(root = root_plan->get_plan_root()) || OB_ISNULL(ctx.get_query_ctx())) {
+     ret = OB_ERR_UNEXPECTED;
+     LOG_WARN("get unexpected null", K(ret));
+   } else if (!is_enabled(ctx)) {
+     OPT_TRACE("PreprocessPlanTreeRule is disabled");
+   } else {
+    PlanNodeIdAllocator rewriter(&ctx);
+    RewriterResult *result = NULL;
+    if (OB_FAIL((rewriter.visit(root, NULL, result)))) {
+      LOG_WARN("failed to do plannode id allocate", K(ret));
+    }
+  }
+  return ret;
+}
+
+} // namespace sql
+} // namespace oceanbase
+ 

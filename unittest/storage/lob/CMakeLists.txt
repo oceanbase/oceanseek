@@ -1,0 +1,6 @@
+storage_unittest(test_lob_seq_id)
+storage_unittest(test_lob_locator_builder)
+storage_unittest(test_lob_chunk_spliter)
+storage_unittest(test_lob_util)
+storage_unittest(test_lob_ext_info)
+storage_unittest(test_lob_ext_info_mutator_row)

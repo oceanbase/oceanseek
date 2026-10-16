@@ -1,0 +1,83 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OB_ALL_VIRTUAL_TENANT_MEMSOTRE_ALLOCATOR_INFO_H_
+#define OB_ALL_VIRTUAL_TENANT_MEMSOTRE_ALLOCATOR_INFO_H_
+
+#include "share/ob_virtual_table_iterator.h"
+#include "share/ob_table_range.h"
+#include "src/storage/memtable/ob_memtable.h"
+
+namespace oceanbase
+{
+namespace observer
+{
+struct ObMemstoreAllocatorInfo
+{
+  ObMemstoreAllocatorInfo()
+      : protection_clock_(INT64_MAX),
+        is_active_(false),
+        ls_id_(OB_INVALID_ID),
+        tablet_id_(OB_INVALID_ID),
+        scn_range_(),
+        mt_addr_(NULL),
+        ref_cnt_(0),
+        retire_clock_(INT64_MAX) {}
+  ~ObMemstoreAllocatorInfo() {}
+  TO_STRING_KV(K_(protection_clock), K_(is_active), K_(ls_id),
+               K_(tablet_id), K_(scn_range), K_(mt_addr), K_(ref_cnt),
+               K_(retire_clock));
+  int64_t protection_clock_;
+  bool is_active_;
+  int64_t ls_id_;
+  uint64_t tablet_id_;
+  share::ObScnRange scn_range_;
+  memtable::ObMemtable *mt_addr_;
+  int64_t ref_cnt_;
+  // Retire clock of the arena this memtable's handle registers into. The DATA
+  // and MDS memstore arenas own independent clock domains, so protection_clock
+  // must be compared against the retire clock of its own arena.
+  int64_t retire_clock_;
+};
+class ObAllVirtualTenantMemstoreAllocatorInfo : public common::ObVirtualTableIterator
+{
+public:
+  typedef ObMemstoreAllocatorInfo MemstoreInfo;
+  ObAllVirtualTenantMemstoreAllocatorInfo();
+  virtual ~ObAllVirtualTenantMemstoreAllocatorInfo();
+  virtual int inner_open();
+  virtual void reset();
+  virtual int inner_get_next_row(common::ObNewRow *&row);
+private:
+  enum COLUMNS
+  {
+    SVR_IP = common::OB_APP_MIN_COLUMN_ID,
+    SVR_PORT,
+    TENANT_ID,
+    LS_ID,
+    TABLET_ID,
+    START_TS,
+    END_TS,
+    IS_ACTIVE,
+    RETIRE_CLOCK,
+    PROTECTION_CLOCK,
+    ADDRESS,
+    REF_COUNT
+  };
+  int fill_tenant_ids();
+  int fill_memstore_infos(const uint64_t tenant_id);
+  common::ObArray<uint64_t> tenant_ids_;
+  common::ObArray<MemstoreInfo> memstore_infos_;
+  int64_t memstore_infos_idx_;
+  int64_t tenant_ids_idx_;
+  int64_t col_count_;
+  char mt_addr_[32];
+  DISALLOW_COPY_AND_ASSIGN(ObAllVirtualTenantMemstoreAllocatorInfo);
+};
+
+}
+}
+
+#endif // OB_ALL_VIRTUAL_TENANT_MEMSOTRE_ALLOCATOR_INFO_H_

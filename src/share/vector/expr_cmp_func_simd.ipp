@@ -1,0 +1,1028 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include "expr_cmp_func.h"
+#include "share/vector/ob_fixed_length_format.h"
+#include "share/datum/ob_datum_util.h"
+#include "share/vector/ob_uniform_format.h"
+#include "share/vector/vector_basic_op.h"
+#include "common/ob_target_specific.h"
+#if OB_USE_MULTITARGET_CODE
+#include <emmintrin.h>
+#include <immintrin.h>
+#endif
+#if OB_ARM_USE_MULTITARGET_CODE
+#include <arm_neon.h>
+#endif
+
+namespace oceanbase
+{
+namespace common
+{
+using namespace sql;
+
+OB_DECLARE_AVX512_SPECIFIC_CODE(
+template <VecValueTypeClass vec_tc, int val_size, ObCmpOp cmp_op, bool left_is_const, bool right_is_const>
+static int simd_eval_vector(const ObExpr &expr, ObEvalCtx &ctx, const ObBitVector &skip,
+                            const EvalBound &bound);
+)
+
+OB_DECLARE_NEON_SPECIFIC_CODE(
+template <VecValueTypeClass vec_tc, int val_size, ObCmpOp cmp_op, bool left_is_const, bool right_is_const>
+static int simd_eval_vector(const ObExpr &expr, ObEvalCtx &ctx, const ObBitVector &skip,
+                            const EvalBound &bound);
+)
+
+template<VecValueTypeClass l_tc, VecValueTypeClass r_tc, ObCmpOp cmp_op>
+struct FixedVectorCmp
+{
+  using L_VEC_FIXED_FMT =
+    typename std::conditional<is_fixed_length_vec(l_tc), ObFixedLengthFormat<RTCType<l_tc>>,
+                              ObVectorBase>::type;
+  using R_VEC_FIXED_FMT =
+    typename std::conditional<is_fixed_length_vec(r_tc), ObFixedLengthFormat<RTCType<r_tc>>,
+                              ObVectorBase>::type;
+  using RES_VEC_FIXED_FMT = ObFixedLengthFormat<int64_t>;
+
+  using L_VEC_UNIFORM_FMT = ObUniformFormat<false>;
+  using R_VEC_UNIFORM_FMT = ObUniformFormat<false>;
+  using L_VEC_UNIFORM_CONST_FMT = ObUniformFormat<true>;
+  using R_VEC_UNIFORM_CONST_FMT = ObUniformFormat<true>;
+
+  static int eval_vector(const ObExpr &expr, ObEvalCtx &ctx, const ObBitVector &skip,
+                         const EvalBound &bound)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(eval_cmp_operands(expr, ctx, skip, bound))) {
+      LOG_WARN("eval cmp operands failed", K(ret));
+    } else {
+      const ObExpr &left = *expr.args_[0];
+      const ObExpr &right = *expr.args_[1];
+      VectorFormat left_format = left.get_format(ctx);
+      VectorFormat right_format = right.get_format(ctx);
+      VectorFormat res_format = expr.get_format(ctx);
+      LOG_DEBUG("eval vector cmp", K(expr), K(l_tc), K(r_tc), K(cmp_op), K(bound), K(left_format),
+                K(right_format), K(res_format));
+      if (is_valid_format(left_format) && is_valid_format(right_format) && is_valid_format(res_format)) {
+        switch(CALC_FORMAT(left_format, right_format, res_format)) {
+          case CALC_FORMAT(VEC_FIXED, VEC_FIXED, VEC_FIXED): {
+            bool use_simd = (l_tc == r_tc
+                             && static_cast<ObFixedLengthBase *>(expr.get_vector(ctx))->get_length() == sizeof(int64_t)
+                             && sizeof(RTCType<l_tc>) <= sizeof(int64_t)
+                             && cmp_op != CO_CMP && !left.get_vector(ctx)->has_null()
+                             && !right.get_vector(ctx)->has_null())
+                             && simd_supported(l_tc);
+            LOG_DEBUG("simd used", K(l_tc), K(r_tc), K(cmp_op), K(left.get_vector(ctx)->has_null()),
+                      K(right.get_vector(ctx)->has_null()), K(use_simd));
+#if OB_USE_MULTITARGET_CODE
+            if (use_simd && common::is_arch_supported(ObTargetArch::AVX512)) {
+              ret = common::specific::avx512::simd_eval_vector<l_tc, sizeof(RTCType<l_tc>), cmp_op, false, false>(
+                      expr, ctx, skip, bound);
+            } else {
+              DO_VECTOR_CMP(L_VEC_FIXED_FMT, R_VEC_FIXED_FMT, RES_VEC_FIXED_FMT);
+            }
+#elif OB_ARM_USE_MULTITARGET_CODE
+            if constexpr (simd_supported(l_tc)) {
+              if (use_simd) {
+                ret = common::specific::neon::simd_eval_vector<l_tc, sizeof(RTCType<l_tc>), cmp_op, false, false >(
+                  expr, ctx, skip, bound);
+              } else {
+                DO_VECTOR_CMP(L_VEC_FIXED_FMT, R_VEC_FIXED_FMT, RES_VEC_FIXED_FMT);
+              }
+            } else {
+              DO_VECTOR_CMP(L_VEC_FIXED_FMT, R_VEC_FIXED_FMT, RES_VEC_FIXED_FMT);
+            }
+#else
+              DO_VECTOR_CMP(L_VEC_FIXED_FMT, R_VEC_FIXED_FMT, RES_VEC_FIXED_FMT);
+#endif
+            break;
+          }
+          case CALC_FORMAT(VEC_FIXED, VEC_UNIFORM_CONST, VEC_FIXED): {
+#if OB_USE_MULTITARGET_CODE
+            if (use_simd(expr, ctx, left, right, bound) && common::is_arch_supported(ObTargetArch::AVX512)) {
+              ret = common::specific::avx512::simd_eval_vector<l_tc, sizeof(RTCType<l_tc>), cmp_op, false, true>(
+                      expr, ctx, skip, bound);
+            } else {
+              DO_VECTOR_CMP(L_VEC_FIXED_FMT, R_VEC_UNIFORM_CONST_FMT, RES_VEC_FIXED_FMT);
+            }
+#elif OB_ARM_USE_MULTITARGET_CODE
+            if constexpr (simd_supported(l_tc)) {
+              if (use_simd(expr, ctx, left, right, bound)) {
+                ret = common::specific::neon::simd_eval_vector<l_tc, sizeof(RTCType<l_tc>), cmp_op, false, true >(
+                        expr, ctx, skip, bound);
+              } else {
+                DO_VECTOR_CMP(L_VEC_FIXED_FMT, R_VEC_UNIFORM_CONST_FMT, RES_VEC_FIXED_FMT);
+              }
+            } else {
+              DO_VECTOR_CMP(L_VEC_FIXED_FMT, R_VEC_UNIFORM_CONST_FMT, RES_VEC_FIXED_FMT);
+            }
+#else
+              DO_VECTOR_CMP(L_VEC_FIXED_FMT, R_VEC_UNIFORM_CONST_FMT, RES_VEC_FIXED_FMT);
+#endif
+            break;
+          }
+          case CALC_FORMAT(VEC_UNIFORM_CONST, VEC_FIXED, VEC_FIXED): {
+#if OB_USE_MULTITARGET_CODE
+            if (use_simd(expr, ctx, left, right, bound) && common::is_arch_supported(ObTargetArch::AVX512)) {
+              ret = common::specific::avx512::simd_eval_vector<l_tc, sizeof(RTCType<l_tc>), cmp_op, true, false>(
+                      expr, ctx, skip, bound);
+            } else {
+              DO_VECTOR_CMP(L_VEC_UNIFORM_CONST_FMT, R_VEC_FIXED_FMT, RES_VEC_FIXED_FMT);
+            }
+#elif OB_ARM_USE_MULTITARGET_CODE
+            if constexpr (simd_supported(l_tc)) {
+              if (use_simd(expr, ctx, left, right, bound)) {
+                ret = common::specific::neon::simd_eval_vector<l_tc, sizeof(RTCType<l_tc>), cmp_op, true, false >(
+                      expr, ctx, skip, bound);
+              } else {
+                DO_VECTOR_CMP(L_VEC_UNIFORM_CONST_FMT, R_VEC_FIXED_FMT, RES_VEC_FIXED_FMT);
+              }
+            } else {
+              DO_VECTOR_CMP(L_VEC_UNIFORM_CONST_FMT, R_VEC_FIXED_FMT, RES_VEC_FIXED_FMT);
+            }
+#else
+              DO_VECTOR_CMP(L_VEC_UNIFORM_CONST_FMT, R_VEC_FIXED_FMT, RES_VEC_FIXED_FMT);
+#endif
+            break;
+          }
+          VECTOR_CMP_CASE(VEC_UNIFORM, VEC_FIXED, VEC_FIXED);
+          VECTOR_CMP_CASE(VEC_UNIFORM, VEC_UNIFORM, VEC_FIXED);
+          VECTOR_CMP_CASE(VEC_UNIFORM, VEC_UNIFORM_CONST, VEC_FIXED);
+          VECTOR_CMP_CASE(VEC_UNIFORM_CONST, VEC_UNIFORM, VEC_FIXED);
+          default: {
+            DO_VECTOR_CMP(ObVectorBase, ObVectorBase, ObVectorBase);
+            break;
+          }
+        }
+      } else {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid format", K(left_format), K(right_format), K(res_format));
+      }
+    }
+    return ret;
+  }
+private:
+  static constexpr bool simd_supported(VecValueTypeClass vec_tc)
+  {
+    return vec_tc == VEC_TC_INTEGER
+           || vec_tc == VEC_TC_UINTEGER
+           || vec_tc == VEC_TC_FLOAT
+           || vec_tc == VEC_TC_DOUBLE
+           || vec_tc == VEC_TC_DATE
+           || vec_tc == VEC_TC_DATETIME
+           || vec_tc == VEC_TC_TIME
+           || vec_tc == VEC_TC_BIT
+           || vec_tc == VEC_TC_ENUM_SET
+           || vec_tc == VEC_TC_DEC_INT32
+           || vec_tc == VEC_TC_YEAR
+           || vec_tc == VEC_TC_INTERVAL_YM
+           || vec_tc == VEC_TC_DEC_INT64
+           || vec_tc == VEC_TC_MYSQL_DATE
+           || vec_tc == VEC_TC_MYSQL_DATETIME;
+  }
+  inline static bool use_simd(const ObExpr &expr, ObEvalCtx &ctx, const ObExpr &left, const ObExpr &right, const EvalBound &bound)
+  {
+    return (l_tc == r_tc && static_cast<ObFixedLengthBase *>(expr.get_vector(ctx))->get_length() == sizeof(int64_t) &&
+               sizeof(RTCType<l_tc>) <= sizeof(int64_t) && cmp_op != CO_CMP && !left.get_vector(ctx)->has_null() &&
+               !right.get_vector(ctx)->has_null() && bound.get_all_rows_active()) &&
+           simd_supported(l_tc);
+  }
+};
+
+
+OB_DECLARE_AVX512_SPECIFIC_CODE(
+template<VecValueTypeClass vec_tc, int val_size, ObCmpOp cmp_op, bool left_is_const>
+struct __simd_cmp
+{
+  using ret_type = char;
+  OB_INLINE char operator()(const char *left, const char *right)
+  {
+    return char();
+  }
+  OB_INLINE char operator()(const char *left, __m512i right)
+  {
+    return char();
+  }
+  OB_INLINE char operator()(const char *left, __m512d right)
+  {
+    return char();
+  }
+  OB_INLINE char operator()(const char *left, __m512 right)
+  {
+    return char();
+  }
+};
+
+template<typename T>
+OB_INLINE void __store_cmp_results(char *dst, const T & res_mask)
+{
+  static const uint64_t MASK = 0xFF;
+  static const __m512i TRUE_VALUES = _mm512_set1_epi64(1);
+  uint64_t res_bits = res_mask;
+  for (int i = 0; i < sizeof(T); i++) {
+    uint8_t store_bits = static_cast<uint8_t>(MASK & res_bits);
+    res_bits >>= 8;
+    __m512i store_v = _mm512_maskz_mov_epi64(store_bits, TRUE_VALUES);
+    _mm512_storeu_epi64(dst, store_v);
+    dst += 64;
+  }
+}
+#define DEF_SIMD_INTEGER_OP(ret_size, val_size, bits, cmp_op, cmp_name)                            \
+  template <>                                                                                      \
+  struct __simd_cmp<VEC_TC_INTEGER, val_size, cmp_op, false>                                       \
+  {                                                                                                \
+    using ret_type = __mmask##ret_size;                                                            \
+    OB_INLINE ret_type operator()(const char *left, const char *right)                             \
+    {                                                                                              \
+      __m512i left_v = _mm512_loadu_epi64(left);                                                   \
+      __m512i right_v = _mm512_loadu_epi64(right);                                                 \
+      __mmask##ret_size res_mask = _mm512_cmp##cmp_name##_epi##bits##_mask(left_v, right_v);       \
+      return res_mask;                                                                             \
+    }                                                                                              \
+    OB_INLINE ret_type operator()(const char *fixed_data, __m512i const_data_v)                    \
+    {                                                                                              \
+      __m512i fixed_data_v = _mm512_loadu_epi64(fixed_data);                                       \
+      __mmask##ret_size res_mask = _mm512_cmp##cmp_name##_epi##bits##_mask(fixed_data_v, const_data_v);\
+      return res_mask;                                                                             \
+    }                                                                                              \
+  };                                                                                               \
+  template <>                                                                                      \
+  struct __simd_cmp<VEC_TC_INTEGER, val_size, cmp_op, true>                                        \
+  {                                                                                                \
+    using ret_type = __mmask##ret_size;                                                            \
+    OB_INLINE ret_type operator()(const char *fixed_data, __m512i const_data_v)                    \
+    {                                                                                              \
+      __m512i fixed_data_v = _mm512_loadu_epi64(fixed_data);                                       \
+      __mmask##ret_size res_mask = _mm512_cmp##cmp_name##_epi##bits##_mask(const_data_v, fixed_data_v);\
+      return res_mask;                                                                             \
+    }                                                                                              \
+  };                                                                                               \
+  template <>                                                                                      \
+  struct __simd_cmp<VEC_TC_UINTEGER, val_size, cmp_op, false>                                      \
+  {                                                                                                \
+    using ret_type = __mmask##ret_size;                                                            \
+    OB_INLINE ret_type operator()(const char *left, const char *right)                             \
+    {                                                                                              \
+      __m512i left_v = _mm512_loadu_epi64(left);                                                   \
+      __m512i right_v = _mm512_loadu_epi64(right);                                                 \
+      __mmask##ret_size res_mask = _mm512_cmp##cmp_name##_epu##bits##_mask(left_v, right_v);       \
+      return res_mask;                                                                             \
+    }                                                                                              \
+    OB_INLINE ret_type operator()(const char *fixed_data, __m512i const_data_v)                    \
+    {                                                                                              \
+      __m512i fixed_data_v = _mm512_loadu_epi64(fixed_data);                                       \
+      __mmask##ret_size res_mask = _mm512_cmp##cmp_name##_epu##bits##_mask(fixed_data_v, const_data_v);\
+      return res_mask;                                                                             \
+    }                                                                                              \
+  };                                                                                               \
+  template <>                                                                                      \
+  struct __simd_cmp<VEC_TC_UINTEGER, val_size, cmp_op, true>                                       \
+  {                                                                                                \
+    using ret_type = __mmask##ret_size;                                                            \
+    OB_INLINE ret_type operator()(const char *fixed_data, __m512i const_data_v)                    \
+    {                                                                                              \
+      __m512i fixed_data_v = _mm512_loadu_epi64(fixed_data);                                       \
+      __mmask##ret_size res_mask = _mm512_cmp##cmp_name##_epu##bits##_mask(const_data_v, fixed_data_v);\
+      return res_mask;                                                                             \
+    }                                                                                              \
+  };
+
+DEF_SIMD_INTEGER_OP(64, 1, 8, CO_LE, le);
+DEF_SIMD_INTEGER_OP(32, 2, 16, CO_LE, le);
+DEF_SIMD_INTEGER_OP(16, 4, 32, CO_LE, le);
+DEF_SIMD_INTEGER_OP(8, 8, 64, CO_LE, le);
+
+DEF_SIMD_INTEGER_OP(64, 1, 8, CO_LT, lt);
+DEF_SIMD_INTEGER_OP(32, 2, 16, CO_LT, lt);
+DEF_SIMD_INTEGER_OP(16, 4, 32, CO_LT, lt);
+DEF_SIMD_INTEGER_OP(8, 8, 64, CO_LT, lt);
+
+DEF_SIMD_INTEGER_OP(64, 1, 8, CO_EQ, eq);
+DEF_SIMD_INTEGER_OP(32, 2, 16, CO_EQ, eq);
+DEF_SIMD_INTEGER_OP(16, 4, 32, CO_EQ, eq);
+DEF_SIMD_INTEGER_OP(8, 8, 64, CO_EQ, eq);
+
+DEF_SIMD_INTEGER_OP(64, 1, 8, CO_NE, neq);
+DEF_SIMD_INTEGER_OP(32, 2, 16, CO_NE, neq);
+DEF_SIMD_INTEGER_OP(16, 4, 32, CO_NE, neq);
+DEF_SIMD_INTEGER_OP(8, 8, 64, CO_NE, neq);
+
+DEF_SIMD_INTEGER_OP(64, 1, 8, CO_GT, gt);
+DEF_SIMD_INTEGER_OP(32, 2, 16, CO_GT, gt);
+DEF_SIMD_INTEGER_OP(16, 4, 32, CO_GT, gt);
+DEF_SIMD_INTEGER_OP(8, 8, 64, CO_GT, gt);
+
+DEF_SIMD_INTEGER_OP(64, 1, 8, CO_GE, ge);
+DEF_SIMD_INTEGER_OP(32, 2, 16, CO_GE, ge);
+DEF_SIMD_INTEGER_OP(16, 4, 32, CO_GE, ge);
+DEF_SIMD_INTEGER_OP(8, 8, 64, CO_GE, ge);
+
+#define DEF_SIMD_FLOATING_OP(cmp_name, cmp_op)                                                     \
+  template <>                                                                                      \
+  struct __simd_cmp<VEC_TC_FLOAT, sizeof(float), cmp_op, false>                                    \
+  {                                                                                                \
+    using ret_type = __mmask16;                                                                    \
+    OB_INLINE ret_type operator()(const char *left, const char *right)                             \
+    {                                                                                              \
+      __m512 left_v = _mm512_loadu_ps(left);                                                       \
+      __m512 right_v = _mm512_loadu_ps(right);                                                     \
+      __mmask16 res_mask = _mm512_cmp##cmp_name##_ps_mask(left_v, right_v);                        \
+      if (cmp_op == CO_GE || cmp_op == CO_GT) { res_mask = ~res_mask; }                            \
+      return res_mask;                                                                             \
+    }                                                                                              \
+    OB_INLINE ret_type operator()(const char *fixed_data, __m512 const_data_v)                     \
+    {                                                                                              \
+      __m512 fixed_data_v = _mm512_loadu_ps(fixed_data);                                           \
+      __mmask16 res_mask = _mm512_cmp##cmp_name##_ps_mask(fixed_data_v, const_data_v);             \
+      if (cmp_op == CO_GE || cmp_op == CO_GT) { res_mask = ~res_mask; }                            \
+      return res_mask;                                                                             \
+    }                                                                                              \
+  };                                                                                               \
+  template <>                                                                                      \
+  struct __simd_cmp<VEC_TC_FLOAT, sizeof(float), cmp_op, true>                                     \
+  {                                                                                                \
+    using ret_type = __mmask16;                                                                    \
+    OB_INLINE ret_type operator()(const char *fixed_data, __m512 const_data_v)                     \
+    {                                                                                              \
+      __m512 fixed_data_v = _mm512_loadu_ps(fixed_data);                                           \
+      __mmask16 res_mask = _mm512_cmp##cmp_name##_ps_mask(const_data_v, fixed_data_v);             \
+      if (cmp_op == CO_GE || cmp_op == CO_GT) { res_mask = ~res_mask; }                            \
+      return res_mask;                                                                             \
+    }                                                                                              \
+  };                                                                                               \
+  template <>                                                                                      \
+  struct __simd_cmp<VEC_TC_DOUBLE, sizeof(double), cmp_op, false>                                  \
+  {                                                                                                \
+    using ret_type = __mmask8;                                                                     \
+    OB_INLINE ret_type operator()(const char *left, const char *right)                             \
+    {                                                                                              \
+      __m512d left_v = _mm512_loadu_pd(left);                                                      \
+      __m512d righ_v = _mm512_loadu_pd(right);                                                     \
+      __mmask8 res_mask = _mm512_cmp##cmp_name##_pd_mask(left_v, righ_v);                          \
+      if (cmp_op == CO_GE || cmp_op == CO_GT) { res_mask = ~res_mask; }                            \
+      return res_mask;                                                                             \
+    }                                                                                              \
+    OB_INLINE ret_type operator()(const char *fixed_data, __m512d const_data_v)                    \
+    {                                                                                              \
+      __m512d fixed_data_v = _mm512_loadu_pd(fixed_data);                                          \
+      __mmask8 res_mask = _mm512_cmp##cmp_name##_pd_mask(fixed_data_v, const_data_v);              \
+      if (cmp_op == CO_GE || cmp_op == CO_GT) { res_mask = ~res_mask; }                            \
+      return res_mask;                                                                             \
+    }                                                                                              \
+  };                                                                                               \
+  template <>                                                                                      \
+  struct __simd_cmp<VEC_TC_DOUBLE, sizeof(double), cmp_op, true>                                   \
+  {                                                                                                \
+    using ret_type = __mmask8;                                                                     \
+    OB_INLINE ret_type operator()(const char *fixed_data, __m512d const_data_v)                    \
+    {                                                                                              \
+      __m512d fixed_data_v = _mm512_loadu_pd(fixed_data);                                          \
+      __mmask8 res_mask = _mm512_cmp##cmp_name##_pd_mask(const_data_v, fixed_data_v);              \
+      if (cmp_op == CO_GE || cmp_op == CO_GT) { res_mask = ~res_mask; }                            \
+      return res_mask;                                                                             \
+    }                                                                                              \
+  };
+
+DEF_SIMD_FLOATING_OP(eq, CO_EQ);
+DEF_SIMD_FLOATING_OP(le, CO_LE);
+DEF_SIMD_FLOATING_OP(lt, CO_LT);
+DEF_SIMD_FLOATING_OP(neq , CO_NE);
+DEF_SIMD_FLOATING_OP(lt, CO_GE);
+DEF_SIMD_FLOATING_OP(le, CO_GT);
+
+template <VecValueTypeClass vec_tc, int val_size, ObCmpOp cmp_op, bool left_is_const, bool right_is_const>
+static int simd_eval_vector(const ObExpr &expr, ObEvalCtx &ctx, const ObBitVector &skip,
+                            const EvalBound &bound)
+{
+  constexpr const VecValueTypeClass calc_tc =
+    (vec_tc == VEC_TC_FLOAT || vec_tc == VEC_TC_DOUBLE) ?
+      vec_tc :
+      (std::is_signed<RTCType<vec_tc>>::value ? VEC_TC_INTEGER : VEC_TC_UINTEGER);
+  using mask_type = typename __simd_cmp<calc_tc, val_size, cmp_op, false>::ret_type;
+#define DO_SIMD_CMP_NOT_CONST(off)                                                                                     \
+  do {                                                                                                                 \
+    mask_type res_mask =                                                                                               \
+        __simd_cmp<calc_tc, val_size, cmp_op, false>()(left_data + offset + off * 64, right_data + offset + off * 64); \
+    __store_cmp_results(res_data + off * res_off_perf_unit, res_mask);                                                 \
+  } while (false)
+
+#define DO_SIMD_CMP_HAS_CONST(off)                                                                      \
+  do {                                                                                                  \
+    mask_type res_mask =                                                                                \
+        __simd_cmp<calc_tc, val_size, cmp_op, left_is_const>()(left_data + offset + off * 64, right_v); \
+    __store_cmp_results(res_data + off * res_off_perf_unit, res_mask);                                  \
+  } while (false)
+
+  using ResVec = ObFixedLengthFormat<int64_t>;
+#define DO_SIMD_EVAL_VECTOR(name)                                                                   \
+  ResVec *res_vec = static_cast<ResVec *>(expr.get_vector(ctx));                                    \
+  int64_t size = bound.range_size(), unit = 512 / CHAR_BIT;                                         \
+  int64_t chunk = size * val_size;                                                                  \
+  int64_t unit_cnt = chunk / unit, remain = chunk % unit;                                           \
+  char *res_data = res_vec->get_data() + bound.start() * sizeof(int64_t);                           \
+  int32_t res_off_perf_unit = unit / val_size * sizeof(int64_t), batch_cnt = (unit / val_size) * 8; \
+  int64_t output_idx = bound.start();                                                               \
+  int32_t offset = 0;                                                                               \
+  LOG_DEBUG("simd cmp", K(vec_tc), K(val_size), K(cmp_op), K(bound), K(unit_cnt));                  \
+  if (remain > 0) {                                                                                 \
+    int cmp_ret = 0;                                                                                \
+    ObObjMeta obj_meta = expr.args_[0]->obj_meta_;                                                  \
+    for (int i = 0; i < remain / val_size; i++) {                                                   \
+      VecTCCmpCalc<vec_tc, vec_tc>::cmp(obj_meta,                                                   \
+          obj_meta,                                                                                 \
+          left_data + offset,                                                                       \
+          val_size,                                                                                 \
+          (left_is_const || right_is_const) ? const_data_ptr : right_data + offset,                 \
+          val_size,                                                                                 \
+          cmp_ret);                                                                                 \
+      if (left_is_const) {                                                                          \
+        cmp_ret = -cmp_ret;                                                                         \
+      }                                                                                             \
+      res_vec->set_int(output_idx, get_cmp_ret<cmp_op>(cmp_ret));                                   \
+      output_idx += 1;                                                                              \
+      offset += val_size;                                                                           \
+      res_data = res_data + sizeof(int64_t);                                                        \
+    }                                                                                               \
+  }                                                                                                 \
+  for (int i = 0; i < unit_cnt / 8; i++) {                                                          \
+    LST_DO_CODE(DO_SIMD_CMP_##name, 0, 1, 2, 3, 4, 5, 6, 7);                                        \
+    output_idx += batch_cnt;                                                                        \
+    offset += unit * 8;                                                                             \
+    res_data = res_data + res_off_perf_unit * 8;                                                    \
+  }                                                                                                 \
+  switch (unit_cnt % 8) {                                                                           \
+    case 7: {                                                                                       \
+      LST_DO_CODE(DO_SIMD_CMP_##name, 0, 1, 2, 3, 4, 5, 6);                                         \
+      break;                                                                                        \
+    }                                                                                               \
+    case 6: {                                                                                       \
+      LST_DO_CODE(DO_SIMD_CMP_##name, 0, 1, 2, 3, 4, 5);                                            \
+      break;                                                                                        \
+    }                                                                                               \
+    case 5: {                                                                                       \
+      LST_DO_CODE(DO_SIMD_CMP_##name, 0, 1, 2, 3, 4);                                               \
+      break;                                                                                        \
+    }                                                                                               \
+    case 4: {                                                                                       \
+      LST_DO_CODE(DO_SIMD_CMP_##name, 0, 1, 2, 3);                                                  \
+      break;                                                                                        \
+    }                                                                                               \
+    case 3: {                                                                                       \
+      LST_DO_CODE(DO_SIMD_CMP_##name, 0, 1, 2);                                                     \
+      break;                                                                                        \
+    }                                                                                               \
+    case 2: {                                                                                       \
+      LST_DO_CODE(DO_SIMD_CMP_##name, 0, 1);                                                        \
+      break;                                                                                        \
+    }                                                                                               \
+    case 1: {                                                                                       \
+      LST_DO_CODE(DO_SIMD_CMP_##name, 0);                                                           \
+      break;                                                                                        \
+    }                                                                                               \
+    default: {                                                                                      \
+      break;                                                                                        \
+    }                                                                                               \
+  }                                                                                                 \
+  batch_cnt = (unit_cnt % 8) * (unit / val_size);                                                   \
+  output_idx += batch_cnt;                                                                          \
+  OB_ASSERT(output_idx == bound.end());
+
+  int ret = OB_SUCCESS;
+  const char *const_data_ptr = nullptr;
+  if (!left_is_const && !right_is_const) {
+    ObFixedLengthBase *left_vec = static_cast<ObFixedLengthBase *>(expr.args_[0]->get_vector(ctx));
+    ObFixedLengthBase *right_vec = static_cast<ObFixedLengthBase *>(expr.args_[1]->get_vector(ctx));
+    const char *left_data = left_vec->get_data() + bound.start() * val_size;
+    const char *right_data = right_vec->get_data() + bound.start() * val_size;
+    DO_SIMD_EVAL_VECTOR(NOT_CONST);
+  } else {
+    int fixed_col_idx = left_is_const ? 1 : 0;
+    int const_col_idx = left_is_const ? 0 : 1;
+    ObFixedLengthBase *left_vec = static_cast<ObFixedLengthBase *>(expr.args_[fixed_col_idx]->get_vector(ctx));
+    ObUniformFormat<true> *right_vec = static_cast<ObUniformFormat<true> *>(expr.args_[const_col_idx]->get_vector(ctx));
+    const_data_ptr = right_vec->get_payload(0);
+    const char *left_data = left_vec->get_data() + bound.start() * val_size;
+    const char *right_data = nullptr;
+    if (vec_tc == VEC_TC_FLOAT) {
+      const float &const_data = *(reinterpret_cast<const float *>(right_vec->get_payload(0)));
+      __m512 right_v = _mm512_set1_ps(const_data);
+      DO_SIMD_EVAL_VECTOR(HAS_CONST);
+    } else if (vec_tc == VEC_TC_DOUBLE) {
+      const double &const_data = *(reinterpret_cast<const double *>(right_vec->get_payload(0)));
+      __m512d right_v = _mm512_set1_pd(const_data);
+      DO_SIMD_EVAL_VECTOR(HAS_CONST);
+    } else {
+      __m512i right_v = _mm512_setzero_si512();
+      if (val_size == 1) {
+        right_v = _mm512_set1_epi8(*(reinterpret_cast<const int8_t *>(right_vec->get_payload(0))));
+      } else if (val_size == 2) {
+        right_v = _mm512_set1_epi16(*(reinterpret_cast<const int16_t *>(right_vec->get_payload(0))));
+      } else if (val_size == 4) {
+        right_v = _mm512_set1_epi32(*(reinterpret_cast<const int32_t *>(right_vec->get_payload(0))));
+      } else if (val_size == 8) {
+        right_v = _mm512_set1_epi64(*(reinterpret_cast<const int64_t *>(right_vec->get_payload(0))));
+      } else {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid format", K(left_is_const), K(right_is_const), K(cmp_op), K(vec_tc), K(val_size));
+      }
+      if (OB_SUCC(ret)) {
+        DO_SIMD_EVAL_VECTOR(HAS_CONST);
+      }
+    }
+  }
+  return ret;
+};
+)
+
+OB_DECLARE_NEON_SPECIFIC_CODE(
+  template<typename T>
+  struct NeonTraits;
+
+  OB_INLINE static uint64x2_t neon_not_u64(uint64x2_t val)
+  {
+    return vreinterpretq_u64_u32(vmvnq_u32(vreinterpretq_u32_u64(val)));
+  }
+
+  template<>
+  struct NeonTraits<int64_t>
+  {
+    using VecType = int64x2_t;
+    using ResType = uint64x2_t;
+    using LoadType = int64x2x4_t;
+    static const int constexpr vec_batch = 8;
+    static const int constexpr q_cnt = 4;
+    OB_INLINE static void store(char *res_data, ResType res)
+    {
+      vst1q_u64(reinterpret_cast<uint64_t *>(res_data), vshrq_n_u64(res, 63));
+    }
+    template<ObCmpOp cmp_op>
+    OB_INLINE static ResType cmp(VecType left, VecType right) {
+      ResType ret;
+      if constexpr (cmp_op == CO_EQ) {
+        ret = cmp_eq(left, right);
+      } else if constexpr (cmp_op == CO_NE) {
+        ret = cmp_neq(left, right);
+      } else if constexpr (cmp_op == CO_LT) {
+        ret = cmp_lt(left, right);
+      } else if constexpr (cmp_op == CO_LE) {
+        ret = cmp_le(left, right);
+      } else if constexpr (cmp_op == CO_GE) {
+        ret = cmp_ge(left, right);
+      } else {
+        ret = cmp_gt(left, right);
+      }
+      return ret;
+    }
+    OB_INLINE static ResType cmp_eq(VecType left, VecType right) { return vceqq_s64(left, right); }
+    OB_INLINE static ResType cmp_neq(VecType left, VecType right)
+    {
+      return neon_not_u64(vceqq_s64(left, right));
+    }
+    OB_INLINE static ResType cmp_lt(VecType left, VecType right) { return vcltq_s64(left, right); }
+    OB_INLINE static ResType cmp_le(VecType left, VecType right) { return vcleq_s64(left, right); }
+    OB_INLINE static ResType cmp_ge(VecType left, VecType right) { return vcgeq_s64(left, right); }
+    OB_INLINE static ResType cmp_gt(VecType left, VecType right) { return vcgtq_s64(left, right); }
+    OB_INLINE static LoadType load(const char *data) { return vld1q_s64_x4(reinterpret_cast<const int64_t *>(data)); }
+    OB_INLINE static VecType dup_v(const char *data) { return vdupq_n_s64(*(reinterpret_cast<const int64_t *>(data))); }
+  };
+
+  template<>
+  struct NeonTraits<uint64_t>
+  {
+    using VecType = uint64x2_t;
+    using ResType = uint64x2_t;
+    using LoadType = uint64x2x4_t;
+    static const int constexpr vec_batch = 8;
+    static const int constexpr q_cnt = 4;
+    OB_INLINE static void store(char *res_data, ResType res)
+    {
+      vst1q_u64(reinterpret_cast<uint64_t *>(res_data), vshrq_n_u64(res, 63));
+    }
+    template<ObCmpOp cmp_op>
+    OB_INLINE static ResType cmp(VecType left, VecType right) {
+      ResType ret;
+      if constexpr (cmp_op == CO_EQ) {
+        ret = cmp_eq(left, right);
+      } else if constexpr (cmp_op == CO_NE) {
+        ret = cmp_neq(left, right);
+      } else if constexpr (cmp_op == CO_LT) {
+        ret = cmp_lt(left, right);
+      } else if constexpr (cmp_op == CO_LE) {
+        ret = cmp_le(left, right);
+      } else if constexpr (cmp_op == CO_GE) {
+        ret = cmp_ge(left, right);
+      } else {
+        ret = cmp_gt(left, right);
+      }
+      return ret;
+    }
+    OB_INLINE static ResType cmp_eq(VecType left, VecType right) { return vceqq_u64(left, right); }
+    OB_INLINE static ResType cmp_neq(VecType left, VecType right)
+    {
+      return neon_not_u64(vceqq_u64(left, right));
+    }
+    OB_INLINE static ResType cmp_lt(VecType left, VecType right) { return vcltq_u64(left, right); }
+    OB_INLINE static ResType cmp_le(VecType left, VecType right) { return vcleq_u64(left, right); }
+    OB_INLINE static ResType cmp_ge(VecType left, VecType right) { return vcgeq_u64(left, right); }
+    OB_INLINE static ResType cmp_gt(VecType left, VecType right) { return vcgtq_u64(left, right); }
+    OB_INLINE static LoadType load(const char *data) { return vld1q_u64_x4(reinterpret_cast<const uint64_t *>(data)); }
+    OB_INLINE static VecType dup_v(const char *data) { return vdupq_n_u64(*(reinterpret_cast<const uint64_t *>(data))); }
+  };
+
+  template<>
+  struct NeonTraits<int32_t>
+  {
+    using VecType = int32x4_t;
+    using ResType = uint32x4_t;
+    using LoadType = int32x4x4_t;
+    static const int constexpr vec_batch = 16;
+    static const int constexpr q_cnt = 4;
+    OB_INLINE static void store(char *res_data, ResType res)
+    {
+      uint32x4_t res_v = vshrq_n_u32(res, 31);
+      vst1q_u64(reinterpret_cast<uint64_t *>(res_data), vmovl_u32(vget_low_u32(res_v)));
+      vst1q_u64(reinterpret_cast<uint64_t *>(res_data + sizeof(uint64_t) * 2), vmovl_u32(vget_high_u32(res_v)));
+    }
+    template<ObCmpOp cmp_op>
+    OB_INLINE static ResType cmp(VecType left, VecType right) {
+      ResType ret;
+      if constexpr (cmp_op == CO_EQ) {
+        ret = cmp_eq(left, right);
+      } else if constexpr (cmp_op == CO_NE) {
+        ret = cmp_neq(left, right);
+      } else if constexpr (cmp_op == CO_LT) {
+        ret = cmp_lt(left, right);
+      } else if constexpr (cmp_op == CO_LE) {
+        ret = cmp_le(left, right);
+      } else if constexpr (cmp_op == CO_GE) {
+        ret = cmp_ge(left, right);
+      } else {
+        ret = cmp_gt(left, right);
+      }
+      return ret;
+    }
+    OB_INLINE static ResType cmp_eq(VecType left, VecType right) { return vceqq_s32(left, right); }
+    OB_INLINE static ResType cmp_neq(VecType left, VecType right)
+    {
+      return vmvnq_u32(vceqq_s32(left, right));
+    }
+    OB_INLINE static ResType cmp_lt(VecType left, VecType right) { return vcltq_s32(left, right); }
+    OB_INLINE static ResType cmp_le(VecType left, VecType right) { return vcleq_s32(left, right); }
+    OB_INLINE static ResType cmp_ge(VecType left, VecType right) { return vcgeq_s32(left, right); }
+    OB_INLINE static ResType cmp_gt(VecType left, VecType right) { return vcgtq_s32(left, right); }
+    OB_INLINE static LoadType load(const char *data) { return vld1q_s32_x4(reinterpret_cast<const int32_t *>(data)); }
+    OB_INLINE static VecType dup_v(const char *data) { return vdupq_n_s32(*(reinterpret_cast<const int32_t *>(data))); }
+  };
+
+  template<>
+  struct NeonTraits<uint32_t>
+  {
+    using VecType = uint32x4_t;
+    using ResType = uint32x4_t;
+    using LoadType = uint32x4x4_t;
+    static const int constexpr vec_batch = 16;
+    static const int constexpr q_cnt = 4;
+    OB_INLINE static void store(char *res_data, ResType res)
+    {
+      uint32x4_t res_v = vshrq_n_u32(res, 31);
+      vst1q_u64(reinterpret_cast<uint64_t *>(res_data), vmovl_u32(vget_low_u32(res_v)));
+      vst1q_u64(reinterpret_cast<uint64_t *>(res_data + sizeof(uint64_t) * 2), vmovl_u32(vget_high_u32(res_v)));
+    }
+    template<ObCmpOp cmp_op>
+    OB_INLINE static ResType cmp(VecType left, VecType right) {
+      ResType ret;
+      if constexpr (cmp_op == CO_EQ) {
+        ret = cmp_eq(left, right);
+      } else if constexpr (cmp_op == CO_NE) {
+        ret = cmp_neq(left, right);
+      } else if constexpr (cmp_op == CO_LT) {
+        ret = cmp_lt(left, right);
+      } else if constexpr (cmp_op == CO_LE) {
+        ret = cmp_le(left, right);
+      } else if constexpr (cmp_op == CO_GE) {
+        ret = cmp_ge(left, right);
+      } else {
+        ret = cmp_gt(left, right);
+      }
+      return ret;
+    }
+    OB_INLINE static ResType cmp_eq(VecType left, VecType right) { return vceqq_u32(left, right); }
+    OB_INLINE static ResType cmp_neq(VecType left, VecType right)
+    {
+      return vmvnq_u32(vceqq_u32(left, right));
+    }
+    OB_INLINE static ResType cmp_lt(VecType left, VecType right) { return vcltq_u32(left, right); }
+    OB_INLINE static ResType cmp_le(VecType left, VecType right) { return vcleq_u32(left, right); }
+    OB_INLINE static ResType cmp_ge(VecType left, VecType right) { return vcgeq_u32(left, right); }
+    OB_INLINE static ResType cmp_gt(VecType left, VecType right) { return vcgtq_u32(left, right); }
+    OB_INLINE static LoadType load(const char *data) { return vld1q_u32_x4(reinterpret_cast<const uint32_t *>(data)); }
+    OB_INLINE static VecType dup_v(const char *data) { return vdupq_n_u32(*(reinterpret_cast<const uint32_t *>(data))); }
+  };
+
+  template<>
+  struct NeonTraits<uint8_t>
+  {
+    using VecType = uint8x16_t;
+    using ResType = uint8x16_t;
+    using LoadType = uint8x16_t;
+    static const int constexpr vec_batch = 16;
+    static const int constexpr q_cnt = 1;
+    OB_INLINE static void store(char *res_data, ResType res)
+    {
+      uint8x16_t res_v = vshrq_n_u8(res, 7);
+      uint64_t *out = reinterpret_cast<uint64_t *>(res_data);
+
+      uint16x8_t v16_lo = vmovl_u8(vget_low_u8(res_v));     // [0..7]
+      uint16x8_t v16_hi = vmovl_u8(vget_high_u8(res_v));    // [8..15]
+
+      uint32x4_t v32_0 = vmovl_u16(vget_low_u16(v16_lo));   // [0..3]
+      uint32x4_t v32_1 = vmovl_u16(vget_high_u16(v16_lo));  // [4..7]
+      uint32x4_t v32_2 = vmovl_u16(vget_low_u16(v16_hi));   // [8..11]
+      uint32x4_t v32_3 = vmovl_u16(vget_high_u16(v16_hi));  // [12..15]
+
+      vst1q_u64(out,      vmovl_u32(vget_low_u32(v32_0)));   // [0,1]
+      vst1q_u64(out + 2,  vmovl_u32(vget_high_u32(v32_0)));  // [2,3]
+      vst1q_u64(out + 4,  vmovl_u32(vget_low_u32(v32_1)));   // [4,5]
+      vst1q_u64(out + 6,  vmovl_u32(vget_high_u32(v32_1)));  // [6,7]
+      vst1q_u64(out + 8,  vmovl_u32(vget_low_u32(v32_2)));   // [8,9]
+      vst1q_u64(out + 10, vmovl_u32(vget_high_u32(v32_2)));  // [10,11]
+      vst1q_u64(out + 12, vmovl_u32(vget_low_u32(v32_3)));   // [12,13]
+      vst1q_u64(out + 14, vmovl_u32(vget_high_u32(v32_3)));  // [14,15]
+    }
+
+    template<ObCmpOp cmp_op>
+    OB_INLINE static ResType cmp(VecType left, VecType right) {
+      ResType ret;
+      if constexpr (cmp_op == CO_EQ) {
+        ret = cmp_eq(left, right);
+      } else if constexpr (cmp_op == CO_NE) {
+        ret = cmp_neq(left, right);
+      } else if constexpr (cmp_op == CO_LT) {
+        ret = cmp_lt(left, right);
+      } else if constexpr (cmp_op == CO_LE) {
+        ret = cmp_le(left, right);
+      } else if constexpr (cmp_op == CO_GE) {
+        ret = cmp_ge(left, right);
+      } else {
+        ret = cmp_gt(left, right);
+      }
+      return ret;
+    }
+
+    OB_INLINE static ResType cmp_eq(VecType left, VecType right) { return vceqq_u8(left, right); }
+    OB_INLINE static ResType cmp_neq(VecType left, VecType right)
+    {
+      return vmvnq_u8(vceqq_u8(left, right));
+    }
+    OB_INLINE static ResType cmp_lt(VecType left, VecType right) { return vcltq_u8(left, right); }
+    OB_INLINE static ResType cmp_le(VecType left, VecType right) { return vcleq_u8(left, right); }
+    OB_INLINE static ResType cmp_ge(VecType left, VecType right) { return vcgeq_u8(left, right); }
+    OB_INLINE static ResType cmp_gt(VecType left, VecType right) { return vcgtq_u8(left, right); }
+    OB_INLINE static LoadType load(const char *data) { return vld1q_u8(reinterpret_cast<const uint8_t *>(data)); }
+    OB_INLINE static VecType dup_v(const char *data) { return vdupq_n_u8(*(reinterpret_cast<const uint8_t *>(data))); }
+  };
+
+  template<>
+  struct NeonTraits<float>
+  {
+    using VecType = float32x4_t;
+    using ResType = uint32x4_t;
+    using LoadType = float32x4x4_t;
+    static const int constexpr vec_batch = 16;
+    static const int constexpr q_cnt = 4;
+    OB_INLINE static void store(char *res_data, ResType res)
+    {
+      uint32x4_t res_v = vshrq_n_u32(res, 31);
+      vst1q_u64(reinterpret_cast<uint64_t *>(res_data), vmovl_u32(vget_low_u32(res_v)));
+      vst1q_u64(reinterpret_cast<uint64_t *>(res_data + sizeof(uint64_t) * 2), vmovl_u32(vget_high_u32(res_v)));
+    }
+
+    template<ObCmpOp cmp_op>
+    OB_INLINE static ResType cmp(VecType left, VecType right) {
+      ResType ret;
+      if constexpr (cmp_op == CO_EQ) {
+        ret = cmp_eq(left, right);
+      } else if constexpr (cmp_op == CO_NE) {
+        ret = cmp_neq(left, right);
+      } else if constexpr (cmp_op == CO_LT) {
+        ret = cmp_lt(left, right);
+      } else if constexpr (cmp_op == CO_LE) {
+        ret = cmp_le(left, right);
+      } else if constexpr (cmp_op == CO_GE) {
+        ret = cmp_ge(left, right);
+      } else {
+        ret = cmp_gt(left, right);
+      }
+      return ret;
+    }
+
+    OB_INLINE static ResType cmp_eq(VecType left, VecType right) { return vceqq_f32(left, right); }
+    OB_INLINE static ResType cmp_neq(VecType left, VecType right)
+    {
+      return vmvnq_u32(vceqq_f32(left, right));
+    }
+    OB_INLINE static ResType cmp_lt(VecType left, VecType right) { return vcltq_f32(left, right); }
+    OB_INLINE static ResType cmp_le(VecType left, VecType right) { return vcleq_f32(left, right); }
+    OB_INLINE static ResType cmp_ge(VecType left, VecType right) { return vcgeq_f32(left, right); }
+    OB_INLINE static ResType cmp_gt(VecType left, VecType right) { return vcgtq_f32(left, right); }
+    OB_INLINE static LoadType load(const char *data)
+    {
+      return vld1q_f32_x4(reinterpret_cast<const float *>(data));
+    }
+    OB_INLINE static VecType dup_v(const char *data) { return vdupq_n_f32(*(reinterpret_cast<const float *>(data))); }
+  };
+
+  template<>
+  struct NeonTraits<double>
+  {
+    using VecType = float64x2_t;
+    using ResType = uint64x2_t;
+    using LoadType = float64x2x4_t;
+    static const int constexpr vec_batch = 8;
+    static const int constexpr q_cnt = 4;
+    OB_INLINE static void store(char *res_data, ResType res)
+    {
+      vst1q_u64(reinterpret_cast<uint64_t *>(res_data), vshrq_n_u64(res, 63));
+    }
+
+    template<ObCmpOp cmp_op>
+    OB_INLINE static ResType cmp(VecType left, VecType right) {
+      ResType ret;
+      if constexpr (cmp_op == CO_EQ) {
+        ret = cmp_eq(left, right);
+      } else if constexpr (cmp_op == CO_NE) {
+        ret = cmp_neq(left, right);
+      } else if constexpr (cmp_op == CO_LT) {
+        ret = cmp_lt(left, right);
+      } else if constexpr (cmp_op == CO_LE) {
+        ret = cmp_le(left, right);
+      } else if constexpr (cmp_op == CO_GE) {
+        ret = cmp_ge(left, right);
+      } else {
+        ret = cmp_gt(left, right);
+      }
+      return ret;
+    }
+
+    OB_INLINE static ResType cmp_eq(VecType left, VecType right) { return vceqq_f64(left, right); }
+    OB_INLINE static ResType cmp_neq(VecType left, VecType right)
+    {
+      return neon_not_u64(vceqq_f64(left, right));
+    }
+    OB_INLINE static ResType cmp_lt(VecType left, VecType right) { return vcltq_f64(left, right); }
+    OB_INLINE static ResType cmp_le(VecType left, VecType right) { return vcleq_f64(left, right); }
+    OB_INLINE static ResType cmp_ge(VecType left, VecType right) { return vcgeq_f64(left, right); }
+    OB_INLINE static ResType cmp_gt(VecType left, VecType right) { return vcgtq_f64(left, right); }
+    OB_INLINE static LoadType load(const char *data) { return vld1q_f64_x4(reinterpret_cast<const double *>(data)); }
+    OB_INLINE static VecType dup_v(const char *data) { return vdupq_n_f64(*(reinterpret_cast<const double *>(data))); }
+  };
+
+  template <VecValueTypeClass vec_tc, int val_size, ObCmpOp cmp_op, bool left_is_const, bool right_is_const>
+  static int simd_eval_vector(const ObExpr &expr, ObEvalCtx &ctx, const ObBitVector &skip,
+                              const EvalBound &bound)
+  {
+    int ret = OB_SUCCESS;
+    using Neon = NeonTraits<RTCType<vec_tc>>;
+    using CmpType = typename Neon::VecType;
+    using LoadType = typename Neon::LoadType;
+    constexpr int unit_batch = Neon::vec_batch;
+
+    char *res_data = static_cast<ObFixedLengthBase *>(expr.get_vector(ctx))->get_data() + bound.start() * sizeof(int64_t);
+    int64_t output_idx = bound.start();
+    int64_t arg_step = sizeof(RTCType<vec_tc>) * unit_batch;
+    int64_t res_step = sizeof(int64_t) * unit_batch;
+    int64_t res_cnt_perf_sq = unit_batch / Neon::q_cnt;
+    static_assert(Neon::q_cnt == 4 || Neon::q_cnt == 1, "Neon::q_cnt must be 4 or 1");
+
+    if constexpr (!left_is_const && !right_is_const) {
+      const char *left_data = expr.args_[0]->get_vector(ctx)->get_payload(bound.start());
+      const char *right_data = expr.args_[1]->get_vector(ctx)->get_payload(bound.start());
+      for (int i = 0; i < bound.range_size() / unit_batch; i++) {
+        LoadType left_v = Neon::load(left_data + i * arg_step);
+        LoadType right_v = Neon::load(right_data + i * arg_step);
+        if constexpr (Neon::q_cnt == 4) {
+          CmpType res0 = Neon::template cmp<cmp_op>(left_v.val[0], right_v.val[0]);
+          CmpType res1 = Neon::template cmp<cmp_op>(left_v.val[1], right_v.val[1]);
+          CmpType res2 = Neon::template cmp<cmp_op>(left_v.val[2], right_v.val[2]);
+          CmpType res3 = Neon::template cmp<cmp_op>(left_v.val[3], right_v.val[3]);
+          Neon::store(res_data + i * res_step, res0);
+          Neon::store(res_data + i * res_step + sizeof(int64_t) * res_cnt_perf_sq, res1);
+          Neon::store(res_data + i * res_step + sizeof(int64_t) * res_cnt_perf_sq * 2, res2);
+          Neon::store(res_data + i * res_step + sizeof(int64_t) * res_cnt_perf_sq * 3, res3);
+        } else if constexpr (Neon::q_cnt == 1) {
+          CmpType res = Neon::template cmp<cmp_op>(left_v, right_v);
+          Neon::store(res_data + i * res_step, res);
+        }
+        output_idx += unit_batch;
+      }
+    } else if constexpr (right_is_const) {
+      const char *left_data = expr.args_[0]->get_vector(ctx)->get_payload(bound.start());
+      const char *right_data = expr.args_[1]->get_vector(ctx)->get_payload(bound.start());
+      CmpType right_v = Neon::dup_v(right_data);
+      for (int i = 0; i < bound.range_size() / unit_batch; i++) {
+        LoadType left_v = Neon::load(left_data + i * arg_step);
+        if constexpr (Neon::q_cnt == 4) {
+          CmpType res0 = Neon::template cmp<cmp_op>(left_v.val[0], right_v);
+          CmpType res1 = Neon::template cmp<cmp_op>(left_v.val[1], right_v);
+          CmpType res2 = Neon::template cmp<cmp_op>(left_v.val[2], right_v);
+          CmpType res3 = Neon::template cmp<cmp_op>(left_v.val[3], right_v);
+          Neon::store(res_data + i * res_step, res0);
+          Neon::store(res_data + i * res_step + sizeof(int64_t) * res_cnt_perf_sq, res1);
+          Neon::store(res_data + i * res_step + sizeof(int64_t) * res_cnt_perf_sq * 2, res2);
+          Neon::store(res_data + i * res_step + sizeof(int64_t) * res_cnt_perf_sq * 3, res3);
+        } else if constexpr (Neon::q_cnt == 1) {
+          CmpType res = Neon::template cmp<cmp_op>(left_v, right_v);
+          Neon::store(res_data + i * res_step, res);
+        }
+        output_idx += unit_batch;
+      }
+    } else {
+      const char *left_data = expr.args_[0]->get_vector(ctx)->get_payload(bound.start());
+      const char *right_data = expr.args_[1]->get_vector(ctx)->get_payload(bound.start());
+      CmpType left_v = Neon::dup_v(left_data);
+      for (int i = 0; i < bound.range_size() / unit_batch; i++) {
+        LoadType right_v = Neon::load(right_data + i * arg_step);
+        if constexpr (Neon::q_cnt == 4) {
+          CmpType res0 = Neon::template cmp<cmp_op>(left_v, right_v.val[0]);
+          CmpType res1 = Neon::template cmp<cmp_op>(left_v, right_v.val[1]);
+          CmpType res2 = Neon::template cmp<cmp_op>(left_v, right_v.val[2]);
+          CmpType res3 = Neon::template cmp<cmp_op>(left_v, right_v.val[3]);
+          Neon::store(res_data + i * res_step, res0);
+          Neon::store(res_data + i * res_step + sizeof(int64_t) * res_cnt_perf_sq, res1);
+          Neon::store(res_data + i * res_step + sizeof(int64_t) * res_cnt_perf_sq * 2, res2);
+          Neon::store(res_data + i * res_step + sizeof(int64_t) * res_cnt_perf_sq * 3, res3);
+        } else if constexpr (Neon::q_cnt == 1) {
+          CmpType res = Neon::template cmp<cmp_op>(left_v, right_v);
+          Neon::store(res_data + i * res_step, res);
+        }
+        output_idx += unit_batch;
+      }
+    }
+
+    if (output_idx < bound.end()) {
+      ObObjMeta obj_meta = expr.args_[0]->obj_meta_;
+      const char *const_data_ptr =
+        left_is_const ?
+          expr.args_[0]->get_vector(ctx)->get_payload(0) :
+          (right_is_const ? expr.args_[1]->get_vector(ctx)->get_payload(0) : nullptr);
+      const char *left_data = expr.args_[0]->get_vector(ctx)->get_payload(0);
+      const char *right_data = expr.args_[1]->get_vector(ctx)->get_payload(0);
+      ObFixedLengthFormat<int64_t> *res_vec = static_cast<ObFixedLengthFormat<int64_t> *>(expr.get_vector(ctx));
+      for (; output_idx < bound.end(); output_idx++) {
+        int cmp_ret = 0;
+        VecTCCmpCalc<vec_tc, vec_tc>::cmp(
+          obj_meta, obj_meta,
+          left_is_const ? const_data_ptr : left_data + output_idx * val_size,
+          val_size,
+          right_is_const ? const_data_ptr : right_data + output_idx * val_size,
+          val_size,
+          cmp_ret);
+        res_vec->set_int(output_idx, get_cmp_ret<cmp_op>(cmp_ret));
+      }
+    }
+    ObBitVector &eval_flags = expr.get_evaluated_flags(ctx);
+    eval_flags.set_all(bound.start(), bound.end());
+    OB_ASSERT(output_idx == bound.end());
+    return ret;
+  }
+)
+
+template<int X, int Y, bool defined>
+struct FixedExprCmpFuncIniter
+{
+  static void init_array()
+  {
+    return;
+  }
+};
+
+template<int X, int Y>
+struct FixedExprCmpFuncIniter<X, Y, true>
+{
+  template <ObCmpOp cmp_op>
+  using EvalFunc =
+    FixedVectorCmp<static_cast<VecValueTypeClass>(X), static_cast<VecValueTypeClass>(Y), cmp_op>;
+  static void init_array()
+  {
+    auto &funcs = EVAL_VECTOR_EXPR_CMP_FUNCS;
+    funcs[X][Y][CO_LE] = &EvalFunc<CO_LE>::eval_vector;
+    funcs[X][Y][CO_LT] = &EvalFunc<CO_LT>::eval_vector;
+    funcs[X][Y][CO_GE] = &EvalFunc<CO_GE>::eval_vector;
+    funcs[X][Y][CO_GT] = &EvalFunc<CO_GT>::eval_vector;
+    funcs[X][Y][CO_NE] = &EvalFunc<CO_NE>::eval_vector;
+    funcs[X][Y][CO_EQ] = &EvalFunc<CO_EQ>::eval_vector;
+    funcs[X][Y][CO_CMP] = &EvalFunc<CO_CMP>::eval_vector;
+  }
+};
+
+template <int X, int Y>
+using fixed_cmp_initer = FixedExprCmpFuncIniter<
+  X, Y,
+  VecTCCmpCalc<static_cast<VecValueTypeClass>(X), static_cast<VecValueTypeClass>(Y)>::defined_
+  && is_fixed_length_vec(static_cast<VecValueTypeClass>(X))
+  && is_fixed_length_vec(static_cast<VecValueTypeClass>(Y))>;
+
+} // end common
+} // end oceanbase

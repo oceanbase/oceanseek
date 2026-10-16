@@ -1,0 +1,77 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_COMMON_OB_TIMER_
+#define OCEANBASE_COMMON_OB_TIMER_
+
+#include "lib/task/ob_timer_service.h"
+
+namespace oceanbase
+{
+
+namespace common
+{
+
+class ObTimer
+{
+  friend class TaskToken;
+public:
+  ObTimer()
+      : is_inited_(false),
+        is_stopped_(true),
+        is_cancelling_all_(false),
+        timer_service_(nullptr),
+        run_wrapper_(nullptr)
+  {
+    timer_name_[0] = '\0';
+    timer_service_ = &(ObTimerService::get_instance());
+  }
+  ~ObTimer();
+  int init(const char* timer_name = nullptr,
+           const ObMemAttr &attr = ObMemAttr(OB_SERVER_TENANT_ID, "timer")); // init and start
+  bool inited() const;
+  int start();  // only start
+  // wait_running=true (default): backward-compatible; stop() also waits running task to finish.
+  // wait_running=false: only signal stop and cancel pending tasks; caller is responsible
+  // for invoking wait() afterwards. This decoupled mode exists so the caller can stop multiple
+  // timers in parallel and then wait for all of them, instead of serializing wait into stop.
+  void stop(const bool wait_running = true);
+  void wait();  // wait all running task finish
+  void destroy();
+  int set_run_wrapper_with_ret(lib::IRunWrapper *run_wrapper);
+  int64_t to_string(char *buf, const int64_t buf_len) const
+  {
+    int64_t pos = 0;
+    if (NULL != buf && buf_len > 0) {
+      databuff_printf(buf, buf_len, pos, "timer_type:%s", typeid(*this).name());
+    }
+    return pos;
+  }
+public:
+  int schedule(ObTimerTask &task, const int64_t delay, bool repeate = false, bool immediate = false);
+  int schedule_repeate_task_immediately(ObTimerTask &task, const int64_t delay);
+  bool task_exist(const common::ObTimerTask &task);
+  int cancel(const ObTimerTask &task);
+  int cancel_task(const ObTimerTask &task);
+  int wait_task(const ObTimerTask &task);
+  // should_wait=true (default): backward-compatible; cancels all tasks and waits for running ones to finish.
+  // should_wait=false: only cancel pending tasks without waiting; caller takes responsibility for invoking
+  // wait() later.
+  void cancel_all(const bool should_wait = true);
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObTimer);
+private:
+  bool is_inited_;
+  bool is_stopped_;
+  bool is_cancelling_all_;
+  char timer_name_[OB_THREAD_NAME_BUF_LEN];
+  ObTimerService *timer_service_;
+  lib::IRunWrapper *run_wrapper_;
+};
+
+} /* common */
+} /* oceanbase */
+
+#endif // OCEANBASE_COMMON_OB_TIMER_

@@ -1,0 +1,249 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX STORAGE_COMPACTION
+#include "ob_schedule_dag_func.h"
+#include "storage/compaction/ob_async_index_merge_task.h"
+#include "storage/column_store/ob_co_merge_dag.h"
+#include "storage/ddl/ob_ddl_merge_task.h"
+#include "storage/ddl/ob_tablet_lob_split_task.h"
+#include "storage/ddl/ob_ddl_merge_task.h"
+#include "storage/compaction/ob_batch_freeze_tablets_dag.h"
+#include "storage/ls/ob_tablet_persist_drain_dag.h"
+#ifdef OB_BUILD_SHARED_STORAGE
+#include "storage/compaction_v2/ob_ss_link_major_dag.h"
+#endif
+
+namespace oceanbase
+{
+using namespace common;
+using namespace share;
+
+namespace compaction
+{
+
+#define CREATE_DAG(T)                                                          \
+  if (OB_FAIL(MTL(ObTenantDagScheduler *)                                      \
+                  ->create_and_add_dag<T>(&param, is_emergency))) {            \
+    if (OB_SIZE_OVERFLOW != ret && OB_EAGAIN != ret) {                         \
+      LOG_WARN("failed to create merge dag", K(ret), K(param));                \
+    } else if (OB_EAGAIN == ret) {                                             \
+      LOG_DEBUG("exists same dag, wait the dag to finish", K(ret), K(param));  \
+    }                                                                          \
+  } else {                                                                     \
+    LOG_DEBUG("success to schedule tablet merge dag", K(ret), K(param));       \
+  }
+
+#define CREATE_AND_GET_DAG(T, dag) \
+  { \
+    if (OB_FAIL(MTL(ObTenantDagScheduler*)->create_dag<T>(&param, dag))) { \
+      if (OB_SIZE_OVERFLOW != ret && OB_EAGAIN != ret) { \
+        LOG_WARN("failed to create merge dag", K(ret), K(param)); \
+      } \
+    } else { \
+      LOG_DEBUG("success to create and get dag", K(ret), K(param)); \
+    } \
+  }
+int ObScheduleDagFunc::schedule_tx_table_merge_dag(
+    ObTabletMergeDagParam &param,
+    const bool is_emergency)
+{
+  int ret = OB_SUCCESS;
+  CREATE_DAG(ObTxTableMergeDag);
+  return ret;
+}
+
+int ObScheduleDagFunc::schedule_tablet_co_merge_dag_net(
+    ObCOMergeDagParam &param)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(MTL(ObTenantDagScheduler*)->create_and_add_dag_net<ObCOMergeDagNet>(&param))) {
+    if (OB_TASK_EXIST != ret) {
+      LOG_WARN("failed to create dag_net", K(ret), K(param));
+    } else {
+      ret = OB_SUCCESS; // ignore OB_TASK_EXIST
+    }
+  } else {
+    FLOG_INFO("success to create co merge dag_net", K(ret), K(param));
+  }
+  return ret;
+}
+
+int ObScheduleDagFunc::schedule_tablet_merge_dag(
+    ObTabletMergeDagParam &param,
+    const bool is_emergency)
+{
+  int ret = OB_SUCCESS;
+  if (param.is_inv_index_) {
+    if (is_major_merge_type(param.merge_type_)) {
+      CREATE_DAG(ObAsyncIndexMajorMergeDag);
+    } else {
+      CREATE_DAG(ObAsyncIndexIncMergeDag);
+    }
+  } else if (is_major_merge_type(param.merge_type_)) {
+    CREATE_DAG(ObTabletMajorMergeDag);
+  } else if (MINI_MERGE == param.merge_type_) {
+    CREATE_DAG(ObTabletMiniMergeDag);
+  } else {
+    ret = OB_NOT_SUPPORTED;
+  }
+  return ret;
+}
+
+int ObScheduleDagFunc::schedule_ddl_table_merge_dag(
+    ObDDLTableMergeDagParam &param,
+    const bool is_emergency)
+{
+  int ret = OB_SUCCESS;
+  CREATE_DAG(ObDDLTableMergeDag);
+  return ret;
+}
+
+int ObScheduleDagFunc::schedule_tablet_split_dag(
+    ObTabletSplitParam &param,
+    const bool is_emergency)
+{
+  int ret = OB_SUCCESS;
+  CREATE_DAG(ObTabletSplitDag);
+  return ret;
+}
+int ObScheduleDagFunc::schedule_and_get_tablet_split_dag(
+    storage::ObTabletSplitParam &param,
+    storage::ObTabletSplitDag *&dag,
+    const bool is_emergency)
+{
+  int ret = OB_SUCCESS;
+  CREATE_AND_GET_DAG(ObTabletSplitDag, dag);
+  return ret;
+}
+
+int ObScheduleDagFunc::schedule_lob_tablet_split_dag(
+    ObLobSplitParam &param,
+    const bool is_emergency)
+{
+  int ret = OB_SUCCESS;
+  CREATE_DAG(ObTabletLobSplitDag);
+  return ret;
+}
+
+int ObScheduleDagFunc::schedule_and_get_lob_tablet_split_dag(
+    storage::ObLobSplitParam &param,
+    storage::ObTabletLobSplitDag *&dag,
+    const bool is_emergency)
+{
+  int ret = OB_SUCCESS;
+  CREATE_AND_GET_DAG(ObTabletLobSplitDag, dag);
+  return ret;
+}
+
+int ObScheduleDagFunc::schedule_batch_freeze_dag(
+    const ObBatchFreezeTabletsParam &param)
+{
+  int ret = OB_SUCCESS;
+  bool is_emergency = true;
+  if (param.tablet_info_array_.empty()) {
+    // do nothing
+  } else {
+    CREATE_DAG(ObBatchFreezeTabletsDag);
+  }
+  return ret;
+}
+
+int ObScheduleDagFunc::schedule_tablet_persist_drain_dag(
+    storage::ObTabletPersistDrainParam &param,
+    const bool is_emergency)
+{
+  int ret = OB_SUCCESS;
+  if (param.tablet_ids_.empty()) {
+    // do nothing
+  } else {
+    CREATE_DAG(storage::ObTabletPersistDrainDag);
+  }
+  return ret;
+}
+
+
+#ifdef OB_BUILD_SHARED_STORAGE
+int ObScheduleDagFunc::schedule_ss_link_major_dag(
+    ObTabletMergeDagParam &param)
+{
+  int ret = OB_SUCCESS;
+  bool is_emergency = false;
+  CREATE_DAG(ObLinkSSMajorSSTableDag);
+  return ret;
+}
+#endif
+
+int ObDagParamFunc::fill_param(
+    const share::ObLSID &ls_id,
+    const storage::ObTablet &tablet,
+    const ObMergeType merge_type,
+    const int64_t &merge_snapshot_version,
+    const ObExecMode exec_mode,
+    ObTabletMergeDagParam &param,
+    const int64_t merge_base_version)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!ls_id.is_valid()
+    || !is_valid_merge_type(merge_type)
+    || merge_snapshot_version < ObVersion::MIN_VERSION
+    || !is_valid_exec_mode(exec_mode))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(ls_id), K(merge_snapshot_version),
+      K(exec_mode));
+  } 
+  if (FAILEDx(tablet.get_private_transfer_epoch(param.schedule_private_transfer_epoch_))) {
+    LOG_WARN("failed to get private transfer epoch", K(ret), K(tablet));
+  } else {
+    param.ls_id_ = ls_id;
+    param.tablet_id_ = tablet.get_tablet_meta().tablet_id_;
+    param.data_tablet_id_ = tablet.get_data_tablet_id();
+    param.is_inv_index_ = tablet.is_async_inverted_storage_index();
+    param.merge_type_ = merge_type;
+    param.merge_version_ = merge_snapshot_version;
+    param.merge_base_version_ = merge_base_version;
+    param.exec_mode_ = exec_mode;
+    param.reorganization_scn_ = tablet.get_reorganization_scn();
+  }
+  return ret;
+}
+
+int ObDagParamFunc::fill_param(
+    const share::ObLSID &ls_id,
+    const storage::ObTablet &tablet,
+    const ObMergeType merge_type,
+    const int64_t &merge_snapshot_version,
+    const ObExecMode exec_mode,
+    const share::ObDagId *dag_net_id,
+    ObCOMergeDagParam &param)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!ls_id.is_valid()
+    || !is_valid_merge_type(merge_type)
+    || merge_snapshot_version < ObVersion::MIN_VERSION
+    || !is_valid_exec_mode(exec_mode))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(ls_id), K(merge_snapshot_version),
+      K(exec_mode));
+  } 
+  if (FAILEDx(tablet.get_private_transfer_epoch(param.schedule_private_transfer_epoch_))) {
+    LOG_WARN("failed to get private transfer epoch", K(ret), K(tablet));
+  } else {
+    param.ls_id_ = ls_id;
+    param.tablet_id_ = tablet.get_tablet_meta().tablet_id_;
+    param.merge_type_ = merge_type;
+    param.merge_version_ = merge_snapshot_version;
+    param.compat_mode_ = tablet.get_tablet_meta().compat_mode_;
+    param.exec_mode_ = exec_mode;
+    param.reorganization_scn_ = tablet.get_reorganization_scn();
+    if (OB_UNLIKELY(nullptr != dag_net_id)) {
+      param.dag_net_id_ = *dag_net_id;
+    }
+  }
+  return ret;
+}
+
+} // namespace compaction
+} // namespace oceanbase

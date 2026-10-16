@@ -1,0 +1,76 @@
+/**
+ * Copyright (c) 2024 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+#define USING_LOG_PREFIX SERVER
+
+#include "ob_table_group_factory.h"
+namespace oceanbase
+{
+
+namespace table
+{
+int ObTableGroupOpFactory::alloc(ObTableGroupType op_type, ObITableOp *&op)
+{
+  int ret = OB_SUCCESS;
+  if (op_type < 0 || op_type >= ObTableGroupType::TYPE_MAX) {
+    ret = OB_ERR_UNEXPECTED;
+    SERVER_LOG(WARN, "invalid op type", K(ret), K(op_type));
+  } else {
+    ObLockGuard<ObSpinLock> guard(*get_lock(op_type));
+    op = nullptr;
+    op = free_list_[op_type].remove_first();
+    if (OB_ISNULL(op)) {
+      if (OB_FAIL(GROUP_OP_ALLOC[op_type](allocator_, op))) {
+        LOG_WARN("fail to alloc op", K(ret), K(op_type));
+      }
+    }
+    used_list_[op_type].add_last(op);
+  }
+  return ret;
+}
+
+void ObTableGroupOpFactory::free(ObITableOp *op)
+{
+ if (NULL != op) {
+    ObTableGroupType op_type = op->type();
+    if (op_type > 0 && op_type < ObTableGroupType::TYPE_MAX) {
+      op->reset();
+      ObLockGuard<ObSpinLock> guard(*get_lock(op_type));
+      used_list_[op_type].remove(op);
+      free_list_[op_type].add_last(op);
+    } else {
+      LOG_DEBUG("[ObTableGroupOpFactory] invalid op type", K(op_type));
+    }
+  }
+}
+
+void ObTableGroupOpFactory::free_and_reuse(ObTableGroupType type)
+{
+  if (type > 0 && type < ObTableGroupType::TYPE_MAX) {
+    while(!used_list_[type].is_empty()) {
+      this->free(used_list_[type].get_first());
+    }
+  } else {
+    LOG_DEBUG("[ObTableGroupOpFactory] invalid op type", K(type));
+  }
+}
+
+void ObTableGroupOpFactory::free_all()
+{
+  for (int64_t i = 0; i < ObTableGroupType::TYPE_MAX; i++) {
+    ObLockGuard<ObSpinLock> guard(*get_lock(i));
+    ObITableOp *op = nullptr;
+    const ObTableGroupType type = static_cast<ObTableGroupType>(i);
+    while(nullptr != (op = used_list_[type].remove_first())) {
+      op->~ObITableOp();
+      allocator_.free(op);
+    }
+    while(nullptr != (op = free_list_[type].remove_first())) {
+      op->~ObITableOp();
+      allocator_.free(op);
+    }
+  }
+}
+} // end namespace table
+} // end namespace oceanbase

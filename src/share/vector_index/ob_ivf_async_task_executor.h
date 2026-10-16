@@ -1,0 +1,129 @@
+/**
+ * Copyright (c) 2023 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_SHARE_OB_IVF_ASYNC_TASK_EXECUTOR_H_
+#define OCEANBASE_SHARE_OB_IVF_ASYNC_TASK_EXECUTOR_H_
+
+#include "share/vector_index/ob_vector_index_i_task_executor.h"
+#include "share/vector_index/ob_vector_index_ivf_cache_mgr.h"
+
+namespace oceanbase
+{
+namespace share
+{
+// schedule ivf vector tasks for a ls
+class ObIvfAsyncTaskExecutor final : public ObVecITaskExecutor
+{
+public:
+  ObIvfAsyncTaskExecutor() : ObVecITaskExecutor(), local_schema_version_(OB_INVALID_VERSION) {}
+  virtual ~ObIvfAsyncTaskExecutor() {}
+  int load_triggered_task(const ObVecIndexTaskStatus &task_row) override;
+  int load_task(uint64_t &task_trace_base_num) override;
+  int check_and_set_thread_pool() override;
+  int check_schema_version_changed(bool &schema_changed);
+  static int do_check_task_result(
+      ObVecIndexAsyncTaskCtx *task_ctx,
+      ObVecTaskResultCheckAction &action);
+
+private:
+  static const int64_t DEFAULT_TABLE_ID_ARRAY_SIZE = 128;
+
+  struct ObIvfAuxKey final
+  {
+  public:
+    ObIvfAuxKey() : data_table_id_(OB_INVALID_ID), base_col_id_(OB_INVALID_ID), index_prefix_() {}
+    ObIvfAuxKey(const uint64_t &data_table_id, const uint64_t base_col_id, const ObString &index_prefix)
+        : data_table_id_(data_table_id), base_col_id_(base_col_id), index_prefix_(index_prefix)
+    {}
+    ~ObIvfAuxKey() = default;
+    uint64_t hash() const
+    {
+      uint64_t hash_val = murmurhash(&data_table_id_, sizeof(data_table_id_), 0)
+                          + murmurhash(&base_col_id_, sizeof(base_col_id_), 0);
+      hash_val = murmurhash(index_prefix_.ptr(), index_prefix_.length(), hash_val);
+      return hash_val;
+    }
+    int hash(uint64_t &hash_val) const
+    {
+      hash_val = hash();
+      return OB_SUCCESS;
+    }
+    bool is_valid() const
+    {
+      return data_table_id_ != OB_INVALID_ID && base_col_id_ != OB_INVALID_ID && !index_prefix_.empty();
+    }
+    bool operator==(const ObIvfAuxKey &other) const
+    {
+      return data_table_id_ == other.data_table_id_
+             && base_col_id_ == other.base_col_id_
+             && index_prefix_ == other.index_prefix_;
+    }
+    TO_STRING_KV(K_(data_table_id), K_(base_col_id), K_(index_prefix));
+
+  public:
+    uint64_t data_table_id_;
+    uint64_t base_col_id_;
+    ObString index_prefix_;
+  };
+
+  using ObIvfAuxTableInfoMap =
+      hash::ObHashMap<ObIvfAuxKey, ObIvfAuxTableInfo, hash::NoPthreadDefendMode>;
+  using ObIvfAuxTableInfoEntry = common::hash::HashMapPair<ObIvfAuxKey, ObIvfAuxTableInfo>;
+  using IvfCacheMgrEntry = common::hash::HashMapPair<ObIvfCacheMgrKey, ObIvfCacheMgr *>;
+
+  struct LoadTaskCallback final
+  {
+  public:
+    LoadTaskCallback(ObVecIndexAsyncTaskOption &task_opt, int64_t tenant_id,
+                     storage::ObLSHandle &ls_handle,
+                     ObVecIdxAsyncTaskScheduler *scheduler,
+                     ObVecIndexTaskCtxArray &task_status_array,
+                     ObSchemaGetterGuard &schema_guard, uint64_t &task_trace_base_num)
+        : task_opt_(task_opt),
+          trace_base_num_(0),
+          tenant_id_(tenant_id),
+          ls_handle_(ls_handle),
+          scheduler_(scheduler),
+          task_status_array_(task_status_array),
+          schema_guard_(schema_guard),
+          task_trace_base_num_(task_trace_base_num)
+    {}
+
+    ~LoadTaskCallback() = default;
+    int operator()(ObIvfAuxTableInfoEntry &entry);
+    int operator()(IvfCacheMgrEntry &entry);
+    int is_cache_mgr_deprecated(ObIvfCacheMgr &cache_mgr, bool &is_deprecated);
+    int is_cache_writable(const ObIvfAuxTableInfo &table_info, int64_t idx, bool &is_writable);
+    TO_STRING_KV(K(task_opt_), K(trace_base_num_), K(tenant_id_), K(ls_handle_), KP_(scheduler));
+
+  public:
+    ObVecIndexAsyncTaskOption &task_opt_;
+    uint64_t trace_base_num_;
+    int64_t tenant_id_;
+    storage::ObLSHandle ls_handle_;
+    ObVecIdxAsyncTaskScheduler *scheduler_;
+    ObVecIndexTaskCtxArray &task_status_array_;
+    ObSchemaGetterGuard &schema_guard_;
+    uint64_t &task_trace_base_num_;
+  };
+
+  bool check_operation_allow() override;
+  int generate_aux_table_info_map(ObIvfAuxTableInfoMap &aux_table_info_map);
+  int generate_aux_table_info_map(ObSchemaGetterGuard &schema_guard, const int64_t table_id,
+                                  ObIvfAuxTableInfoMap &aux_table_info_map);
+  int record_aux_table_info(ObSchemaGetterGuard &schema_guard,
+                            const ObTableSchema &index_table_schema,
+                            ObIvfAuxTableInfo &aux_table_info);
+  int get_tablet_ids_by_ls(const ObTableSchema &index_table_schema,
+                           common::ObIArray<ObTabletID> &tablet_id_array);
+
+private:
+  int64_t local_schema_version_;
+};
+
+}  // namespace share
+}  // namespace oceanbase
+
+#endif  // OCEANBASE_SHARE_OB_IVF_ASYNC_TASK_EXECUTOR_H_

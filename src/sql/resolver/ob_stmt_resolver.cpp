@@ -1,0 +1,817 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX SQL_RESV
+#include "sql/resolver/ob_stmt_resolver.h"
+
+#include "share/catalog/ob_catalog_utils.h"
+#include "sql/session/ob_sql_session_info.h"
+#include "lib/string/ob_sql_string.h"
+
+namespace oceanbase
+{
+using namespace common;
+using namespace share::schema;
+namespace sql
+{
+
+uint64_t ObStmtResolver::generate_table_id()
+{
+  if (NULL != params_.query_ctx_) {
+    return params_.query_ctx_->available_tb_id_--;
+  } else {
+    LOG_WARN_RET(OB_ERR_UNEXPECTED, "query ctx pointer is null");
+    return OB_INVALID_ID;
+  }
+}
+
+int ObStmtResolver::resolve_table_relation_node(const ParseNode *node,
+                                                ObString &table_name,
+                                                ObString &db_name,
+                                                ObString &catalog_name,
+                                                bool is_org /*false*/,
+                                                bool is_oracle_sys_view,
+                                                char **dblink_name_ptr,
+                                                int32_t *dblink_name_len,
+                                                bool *has_dblink_node)
+{
+  int ret = OB_SUCCESS;
+  bool is_db_explicit = false;
+  UNUSED(is_db_explicit);
+  if (OB_FAIL(resolve_table_relation_node_v2(node,
+                                             table_name,
+                                             db_name,
+                                             catalog_name,
+                                             is_db_explicit,
+                                             is_org,
+                                             is_oracle_sys_view,
+                                             dblink_name_ptr,
+                                             dblink_name_len,
+                                             has_dblink_node))) {
+    LOG_WARN("failed to resolve table name", K(ret));
+  } else {
+    // do nothing
+  }
+  return ret;
+}
+
+int ObStmtResolver::resolve_table_relation_node(const ParseNode *node,
+                                                ObString &table_name,
+                                                ObString &db_name,
+                                                bool is_org/*false*/,
+                                                bool is_oracle_sys_view,
+                                                char **dblink_name_ptr,
+                                                int32_t *dblink_name_len,
+                                                bool *has_dblink_node)
+{
+  int ret = OB_SUCCESS;
+  ObString catalog_name;
+  UNUSED(catalog_name);
+  if (OB_FAIL(resolve_table_relation_node(node,
+                                             table_name,
+                                             db_name,
+                                             catalog_name,
+                                             is_org,
+                                             is_oracle_sys_view,
+                                             dblink_name_ptr,
+                                             dblink_name_len,
+                                             has_dblink_node))) {
+    LOG_WARN("failed to resolve table name", K(ret));
+  } else {
+    // do nothing
+  }
+  return ret;
+}
+
+int ObStmtResolver::resolve_dblink_info(const ParseNode* node, 
+                                        char **dblink_name_ptr,
+                                        int32_t *dblink_name_len,
+                                        bool *has_dblink_node)
+{
+  int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(has_dblink_node)) {
+    *has_dblink_node = false;
+    if (node->num_child_ >= 3 && NULL != node->children_[2]) {
+      *has_dblink_node = true;
+    }
+  }
+  if (OB_NOT_NULL(dblink_name_ptr) &&
+      OB_NOT_NULL(dblink_name_len) &&
+      node->num_child_ >= 3 && 
+      OB_NOT_NULL(node->children_[2]) && 
+      T_DBLINK_NAME == node->children_[2]->type_ &&
+      OB_NOT_NULL(node->children_[2]->children_) &&
+      2 == node->children_[2]->num_child_ &&
+      OB_NOT_NULL(node->children_[2]->children_[0]) &&
+      OB_NOT_NULL(node->children_[2]->children_[1])) {
+    //Obtaining dblink_name here is not to obtain the dblink name itself, but to determine whether there is an opt_dblink node
+    ParseNode *dblink_name_node = node->children_[2];
+    if (node->children_[2]->children_[1]->value_) { // dblink name is @!
+      *dblink_name_ptr = const_cast<char*>(node->children_[2]->children_[0]->str_value_);
+      *dblink_name_len = 1;
+    } else { // dblink name is @xxxx or @, @ will be skip before here
+      *dblink_name_ptr = const_cast<char*>(node->children_[2]->children_[0]->str_value_);
+      *dblink_name_len = static_cast<int32_t>(node->children_[2]->children_[0]->str_len_);
+    }
+  }
+  return ret;
+}
+
+int ObStmtResolver::normalize_and_validate_name(common::ObString &name,
+                                                ObStmtResolver::ObNameType type,
+                                                const stmt::StmtType stmt_type,
+                                                const bool is_index_table)
+{
+  int ret = OB_SUCCESS;
+  ObNameCaseMode mode = OB_NAME_CASE_INVALID;
+  ObCollationType cs_type = CS_TYPE_INVALID;
+  if (OB_ISNULL(session_info_) || OB_ISNULL(allocator_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("session is NULL", K(ret));
+  } else if (OB_FAIL(session_info_->get_name_case_mode(mode))) {
+    SERVER_LOG(WARN, "fail to get name case mode", K(mode), K(ret));
+  } else if (OB_FAIL(session_info_->get_collation_connection(cs_type))) {
+    LOG_WARN("fail to get collation_connection", K(ret));
+  } else {
+    bool perserve_lettercase = lib::is_oracle_mode() ? true : (mode != OB_LOWERCASE_AND_INSENSITIVE);
+    switch (type) {
+      case ObNameType::NAME_TYPE_TABLE: {
+        if (OB_FAIL(ObSQLUtils::check_and_convert_table_name(cs_type, perserve_lettercase, name, stmt_type, is_index_table))) {
+          if(OB_ERR_TOO_LONG_IDENT != ret && OB_WRONG_TABLE_NAME != ret){
+            LOG_WARN("fail to check and convert table name", K(ret), K(name));
+          }
+          else {
+            LOG_INFO("table name is too long, this may cause issues in some cases.", K(ret), K(name));
+          }
+        }
+        break;
+      }
+      case ObNameType::NAME_TYPE_DATABASE: {
+        if (OB_FAIL(ObSQLUtils::check_and_convert_db_name(cs_type, perserve_lettercase, name))) {
+          LOG_WARN("fail to check and convert database name", K(ret), K(name));
+        }
+        break;
+      }
+      default: {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected name type", K(type), K(ret));
+        break;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObStmtResolver::resolve_tablename_info(const ParseNode *node,
+                                          common::ObString &table_name)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("node is NULL", K(ret));
+  } else if (OB_UNLIKELY(node->num_child_ < 2) || OB_ISNULL(node->children_[1])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpect error", K(ret), K(node));
+  } else {
+    ParseNode *relation_node = node->children_[1];
+    int32_t table_len = static_cast<int32_t>(relation_node->str_len_);
+    table_name.assign_ptr(const_cast<char*>(relation_node->str_value_), table_len);
+    ObNameType type = ObNameType::NAME_TYPE_TABLE;
+    if(OB_FAIL(normalize_and_validate_name(table_name, type))){
+      LOG_WARN("fail to normalize and validate table name", K(ret), K(table_name));
+    }
+  }
+  return ret;
+}
+
+int ObStmtResolver::resolve_db_and_catalog_info(const ParseNode *node,
+                                                common::ObString &db_name,
+                                                common::ObString &catalog_name, 
+                                                uint64_t &catalog_id, 
+                                                bool is_oracle_sys_view,
+                                                bool *has_dblink_node,
+                                                bool &is_db_explicit,
+                                                bool is_org)
+{
+  int ret = OB_SUCCESS;
+  ParseNode *db_node = NULL;
+  ParseNode *catalog_node = NULL;
+  catalog_id = OB_INTERNAL_CATALOG_ID;
+  if(node->num_child_ == 4 && OB_NOT_NULL(node->children_[3])){
+    catalog_node = node->children_[3];
+    if(OB_NOT_NULL(has_dblink_node) && *has_dblink_node){
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "dblink in catalog is");
+    } 
+  }
+  if (OB_FAIL(ret)) {
+    // do nothing
+  } else if (OB_FAIL(resolve_catalog_node(catalog_node, catalog_id, catalog_name))) {
+    LOG_WARN("fail to resolve catalog node", K(ret), K(catalog_id), K(catalog_name));
+  } else if (OB_UNLIKELY(is_external_catalog_id(catalog_id))) {
+    share::ObCatalogProperties::CatalogType catalog_type = share::ObCatalogProperties::CatalogType::INVALID_TYPE;
+    const ObCatalogSchema *catalog_schema = nullptr;
+    uint64_t tenant_id = session_info_->get_effective_tenant_id();
+    CK(OB_NOT_NULL(schema_checker_));
+    CK(OB_NOT_NULL(schema_checker_->get_schema_guard()));
+    if (OB_FAIL(schema_checker_->get_schema_guard()->get_catalog_schema_by_id(tenant_id, catalog_id, catalog_schema))) {
+      LOG_WARN("failed to get catalog schema by id", K(ret), K(tenant_id), K(catalog_id));
+    } else if (OB_ISNULL(catalog_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("catalog schema is null", K(ret), K(catalog_id));
+    } else if (OB_FAIL(share::ObCatalogProperties::parse_catalog_type(catalog_schema->get_catalog_properties_str(), catalog_type))) {
+      LOG_WARN("failed to parse catalog type", K(ret));
+    } else if (!is_catalog_supported_stmt_(catalog_type)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "this operation in catalog is");
+    }
+  }
+  if (OB_FAIL(ret)){
+    // do nothing
+  } else if (node->num_child_ >= 1 && NULL != node->children_[0]) {
+    db_node = node->children_[0];
+    is_db_explicit = true;
+    int32_t db_len = static_cast<int32_t>(db_node->str_len_);
+    db_name.assign_ptr(const_cast<char*>(db_node->str_value_), db_len);
+    ObNameType type = ObNameType::NAME_TYPE_DATABASE; 
+    if(OB_FAIL(normalize_and_validate_name(db_name, type))){
+      LOG_WARN("fail to normalize and validate database name", K(ret), K(db_name));
+    } else {
+      if (is_external_catalog_id(catalog_id)) {
+        CK(OB_NOT_NULL(schema_checker_->get_sql_schema_guard()));
+        OZ(ObSQLUtils::cvt_db_name_to_org(*schema_checker_->get_sql_schema_guard(),
+                                          session_info_,
+                                          catalog_id,
+                                          db_name,
+                                          allocator_));
+      } else {
+        CK (OB_NOT_NULL(schema_checker_->get_schema_guard()));
+        OZ (ObSQLUtils::cvt_db_name_to_org(*schema_checker_->get_schema_guard(),
+                                          session_info_,
+                                          db_name,
+                                          allocator_));
+      }
+    }
+  } else {
+    if (is_oracle_sys_view) {
+      // ObString tmp(OB_ORA_SYS_SCHEMA_NAME); // right code
+      ObString tmp("SYS");
+      if (OB_FAIL(ob_write_string(*allocator_, tmp, db_name))) {
+        LOG_WARN("fail to write db name", K(ret));
+      }
+    } else if (is_org || params_.is_resolve_fake_cte_table_) {
+      db_name = ObString::make_empty_string();
+    } else if (session_info_->get_database_name().empty()) {
+      ret = OB_ERR_NO_DB_SELECTED;
+      LOG_WARN("No database selected", K(ret));
+    } else {
+      db_name = session_info_->get_database_name();
+    }
+  }
+  return ret;
+}
+
+int ObStmtResolver::resolve_index_info_particularly(common::ObString &table_name,
+                                                    common::ObString &db_name,
+                                                    uint64_t &catalog_id)
+{
+  int ret = OB_SUCCESS;
+  stmt::StmtType stmt_type = (NULL == get_basic_stmt()) ? stmt::T_NONE : get_basic_stmt()->get_stmt_type();
+  bool is_index_table = false;
+  uint64_t tenant_id = session_info_->get_effective_tenant_id();
+  const bool is_hidden = session_info_->is_table_name_hidden();
+  const bool is_built_in_index = true;
+  ObNameType type = ObNameType::NAME_TYPE_TABLE;
+  if (OB_FAIL(schema_checker_->check_table_exists(tenant_id, db_name, table_name, true, is_hidden, is_index_table, catalog_id))) {
+    LOG_WARN("fail to check and convert table name", K(tenant_id), K(db_name), K(table_name), K(ret));
+  } else if (!is_index_table && // check again
+      OB_FAIL(schema_checker_->check_table_exists(tenant_id, db_name, table_name, true, is_hidden, is_index_table, is_built_in_index))) {
+    LOG_WARN("fail to check table exist again", K(ret), K(tenant_id), K(db_name), K(table_name));
+  } else if (OB_FAIL(normalize_and_validate_name(table_name, type, stmt_type, is_index_table))) {
+    LOG_WARN("fail to check and convert table name", K(ret), K(table_name), K(stmt_type), K(is_index_table));
+  }
+  return ret;
+}
+
+// description: 解析关联表
+//
+// @param [in] node         与关联表相关的节点
+// @param [out] table_name  向 arg 中填充的关联表名称
+// @param [out] db_name     向 arg 中填充的关联库名称
+
+// @return oceanbase error code defined in lib/ob_errno.def
+int ObStmtResolver::resolve_table_relation_node_v2(const ParseNode *node,
+                                                   ObString &table_name,
+                                                   ObString &db_name,
+                                                   ObString &catalog_name,
+                                                   bool &is_db_explicit,
+                                                   bool is_org /*false*/,
+                                                   bool is_oracle_sys_view,
+                                                   char **dblink_name_ptr,
+                                                   int32_t *dblink_name_len,
+                                                   bool *has_dblink_node)
+{
+  int ret = OB_SUCCESS;
+  is_db_explicit = false;
+  uint64_t catalog_id = OB_INTERNAL_CATALOG_ID;
+  if (OB_ISNULL(node)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected error", K(ret), K(node));
+  } else if (OB_FAIL(resolve_dblink_info(node, dblink_name_ptr, dblink_name_len, has_dblink_node))){
+    LOG_WARN("fail to resolve dblink information", K(ret));
+  } else if (OB_FAIL(resolve_db_and_catalog_info(node, db_name, catalog_name, catalog_id, is_oracle_sys_view, has_dblink_node, is_db_explicit, is_org))){
+    LOG_WARN("fail ti resolve catalog and db information", K(ret));
+  } else {
+    int tmp_ret = resolve_tablename_info(node, table_name);
+    bool can_retry_with_index = (OB_ERR_TOO_LONG_IDENT == tmp_ret || ((session_info_->get_ddl_info().is_ddl() || session_info_->get_ddl_info().is_dummy_ddl_for_inner_visibility()) 
+                                && OB_WRONG_TABLE_NAME == tmp_ret));
+    if (OB_SUCCESS == tmp_ret){
+      // do nothing
+    } else if (can_retry_with_index){
+      if(OB_FAIL((resolve_index_info_particularly(table_name, db_name, catalog_id)))){
+        LOG_WARN("fail to resolve index table", K(ret), K(tmp_ret));
+      }
+    } else {
+      ret = tmp_ret;
+      LOG_WARN("fail to resolve table name", K(ret), K(table_name));
+    }
+  }
+  return ret;
+}
+
+int ObStmtResolver::resolve_dblink_name(const ParseNode *table_node, uint64_t tenant_id, ObString &dblink_name, bool &is_reverse_link, bool &has_dblink_node)
+{
+  int ret = OB_SUCCESS;
+  dblink_name.reset();
+  if (!OB_ISNULL(table_node) && table_node->num_child_ > 2 &&
+      !OB_ISNULL(table_node->children_) && !OB_ISNULL(table_node->children_[2])) {
+    const ParseNode *dblink_node = table_node->children_[2];
+    has_dblink_node = true;
+    if (!lib::is_oracle_mode()) {
+      uint64_t compat_version = 0;
+      if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, compat_version))) {
+        LOG_WARN("fail to get data version", KR(ret), K(tenant_id));
+      } else if (compat_version < DATA_VERSION_4_2_0_0) { 
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("mysql dblink is not supported when MIN_DATA_VERSION is below DATA_VERSION_4_2_0_0", K(ret));
+      }
+    }
+    
+    if (OB_FAIL(ret)) {
+      // do nothing
+    } else if (OB_FAIL(resolve_dblink_name(dblink_node, dblink_name, is_reverse_link))) {
+        LOG_WARN("failed to resolve dblink name", K(ret));
+    }
+  }
+  return ret;
+}
+
+
+int ObStmtResolver::resolve_dblink_name(const ParseNode *dblink_node, common::ObString &dblink_name, bool &is_reverse_link)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(allocator_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("allocator is NULL", K(ret));
+  } else if (OB_ISNULL(dblink_node)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("dblink_node is NULL", K(ret));
+  } else if (dblink_node->num_child_ == 0) {  // num_child_ == 0 and num_child_ == 2 是针对 mysql 模式
+    dblink_name.assign_ptr(dblink_node->str_value_, static_cast<int32_t>(dblink_node->str_len_));
+  } else if (dblink_node->num_child_ == 2) {
+    if (!OB_ISNULL(dblink_node->children_) && !OB_ISNULL(dblink_node->children_[0])) {
+      int32_t dblink_name_len = static_cast<int32_t>(dblink_node->children_[0]->str_len_);
+      dblink_name.assign_ptr(dblink_node->children_[0]->str_value_, dblink_name_len);
+      if (!OB_ISNULL(dblink_node->children_[1])) {
+        is_reverse_link = dblink_node->children_[1]->value_;
+      }
+    }
+  } else if (dblink_node->num_child_ == 4 && !OB_ISNULL(dblink_node->children_) &&
+             !OB_ISNULL(dblink_node->children_[0])) {
+      ParseNode *database_factor = dblink_node->children_[0];
+      ParseNode *opt_domain_list = dblink_node->children_[1];
+      ParseNode *opt_connection_qualifier = dblink_node->children_[2];
+      ParseNode *opt_reverse_link_flag = dblink_node->children_[3];
+      
+    // 处理database_factor
+    ObSqlString dblink_name_str;
+    if (OB_ISNULL(database_factor->str_value_) || database_factor->str_len_ == 0) {
+      if (!opt_reverse_link_flag->value_) { // @!
+        ret = OB_ERR_DATABASE_LINK_EXPECTED;
+        SQL_RESV_LOG(WARN, "miss database link.", K(ret));
+        LOG_USER_ERROR(OB_ERR_DATABASE_LINK_EXPECTED);
+      }
+    } else if (OB_FAIL(dblink_name_str.append(ObString(database_factor->str_len_, database_factor->str_value_)))) {
+      LOG_WARN("failed to append database_factor", K(ret));
+    }
+    
+    // 处理opt_domain_list
+    if (OB_FAIL(ret)) {
+      // pass
+    } else if (OB_ISNULL(opt_domain_list)) {
+      // pass
+    } else if (OB_FAIL(resolve_domain_names_list(opt_domain_list, dblink_name_str))) {
+      LOG_WARN("failed to resolve domain names list", K(ret));
+    }
+
+    // 处理opt_connection_qualifier
+    if (OB_FAIL(ret)) {
+      // pass
+    } else if (OB_ISNULL(opt_connection_qualifier)) {
+      // pass
+    } else if (OB_FAIL(resolve_connection_qualifier(opt_connection_qualifier, dblink_name_str))) {
+      LOG_WARN("failed to resolve connection qualifier", K(ret));
+    }
+
+    if (dblink_name_str.length() > OB_MAX_DBLINK_NAME_LENGTH) {
+      ret = OB_ERR_TOO_LONG_IDENT;
+      LOG_USER_ERROR(OB_ERR_TOO_LONG_IDENT, static_cast<int32_t>(dblink_name_str.length()), dblink_name_str.ptr());
+    } else if (!check_database_name_valid(dblink_name_str.string())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_USER_ERROR(OB_ERR_UNEXPECTED, "database name is missing a component or invalid");
+    } else {
+      const int64_t name_len = dblink_name_str.length();
+      char *name_buf = static_cast<char *>(allocator_->alloc(name_len + 1));
+      if (OB_ISNULL(name_buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to alloc dblink name buffer", K(ret), K(name_len));
+      } else {
+        MEMCPY(name_buf, dblink_name_str.ptr(), name_len);
+        name_buf[name_len] = '\0';
+        dblink_name.assign_ptr(name_buf, static_cast<int32_t>(name_len));
+      }
+    }
+
+    // 处理opt_reverse_link_flag
+    if (OB_SUCC(ret)) {
+      is_reverse_link = opt_reverse_link_flag->value_;
+    }
+  }
+  return ret;
+}
+
+int ObStmtResolver::resolve_domain_names_list(const ParseNode *domain_names_list, ObSqlString &dblink_name_str)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < domain_names_list->num_child_; i++) {
+    if (OB_ISNULL(domain_names_list->children_[i])) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("domain_names_list child is null", K(ret));
+    } else if (domain_names_list->children_[i]->str_len_ > OB_MAX_DBLINK_NAME_LENGTH 
+               || domain_names_list->children_[i]->str_len_ + dblink_name_str.length() > OB_MAX_DBLINK_NAME_LENGTH) {
+      ret = OB_ERR_TOO_LONG_IDENT;
+      LOG_USER_ERROR(OB_ERR_TOO_LONG_IDENT, static_cast<int32_t>(dblink_name_str.length()), dblink_name_str.ptr());
+    } else if (OB_FAIL(dblink_name_str.append("."))) {
+        LOG_WARN("failed to append dot", K(ret));
+    } else if (OB_FAIL(dblink_name_str.append(ObString(domain_names_list->children_[i]->str_len_, 
+                                                        domain_names_list->children_[i]->str_value_)))) {
+      LOG_WARN("failed to append domain name", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObStmtResolver::resolve_connection_qualifier(const ParseNode *opt_connection_qualifier, ObSqlString &dblink_name_str)
+{
+  int ret = OB_SUCCESS;
+  if (opt_connection_qualifier->num_child_ != 2 || OB_ISNULL(opt_connection_qualifier->children_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("database link children is null", K(ret));
+  } else if (OB_ISNULL(opt_connection_qualifier->children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("database name is missing a component", K(ret));
+  } else {
+    ParseNode *part0 = opt_connection_qualifier->children_[0];
+    ParseNode *part1 = opt_connection_qualifier->children_[1];
+    if (OB_ISNULL(part1)) {
+      if (OB_ISNULL(part0->str_value_) || part0->str_len_ == 0) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("database name is missing a component", K(ret));
+        LOG_USER_ERROR(OB_ERR_UNEXPECTED, "database name is missing a component");
+      } else if (part0->str_len_ > OB_MAX_DBLINK_NAME_LENGTH 
+                 || part0->str_len_ + dblink_name_str.length() > OB_MAX_DBLINK_NAME_LENGTH) {
+        ret = OB_ERR_TOO_LONG_IDENT;
+        LOG_USER_ERROR(OB_ERR_TOO_LONG_IDENT, static_cast<int32_t>(dblink_name_str.length()), dblink_name_str.ptr());
+      } else if (OB_FAIL(dblink_name_str.append("@"))) {
+        LOG_WARN("failed to append @", K(ret));
+      } else if (OB_FAIL(dblink_name_str.append(ObString(part0->str_len_, part0->str_value_)))) {
+        LOG_WARN("failed to append connection qualifier", K(ret));
+      }
+    } else if (OB_NOT_NULL(part1->str_value_) && part1->str_len_ > 0) {
+      if (OB_NOT_NULL(part0->str_value_) && part0->str_len_ > 0) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("database name link error", K(ret));
+      } else if (part1->str_len_ > OB_MAX_DBLINK_NAME_LENGTH 
+                 || part1->str_len_ + dblink_name_str.length() > OB_MAX_DBLINK_NAME_LENGTH) {
+        ret = OB_ERR_TOO_LONG_IDENT;
+        LOG_USER_ERROR(OB_ERR_TOO_LONG_IDENT, static_cast<int32_t>(dblink_name_str.length()), dblink_name_str.ptr());
+      } else if (OB_FAIL(dblink_name_str.append("@"))) {
+        LOG_WARN("failed to append @", K(ret));
+      } else if (OB_FAIL(dblink_name_str.append(ObString(part1->str_len_, part1->str_value_)))) {
+        LOG_WARN("failed to append connection qualifier", K(ret));
+      }
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("database name link error", K(ret));
+    }
+  }
+  return ret;
+}
+
+bool ObStmtResolver::check_database_name_valid(const ObString &dblink_name_str) {
+  bool is_valid = true;
+  bool has_at = false;
+  if (dblink_name_str.length() == 0) {
+
+  } else if (dblink_name_str[0] == '.' || dblink_name_str[0] == '@') {
+    is_valid = false;
+  } else {
+    for (int64_t i = 0; is_valid && i < dblink_name_str.length(); i++) {
+      if (dblink_name_str[i] == '.' || dblink_name_str[i] == '@') {
+        if (i + 1 < dblink_name_str.length() && (dblink_name_str[i + 1] == '.' || dblink_name_str[i + 1] == '@')) {
+          is_valid = false;
+        } else if (dblink_name_str[i] == '.' && has_at == true) {
+          is_valid = false;
+        } else if (dblink_name_str[i] == '@') {
+          has_at = true;
+        }
+      }
+    }
+  }
+  return is_valid;
+}
+
+// If catalog_node is null, we will deduce catalog_id/catalog_name from session
+// If user is in internal_catalog, we will assign catalog_id = 0, catalog_name = OB_INTERNAL_CATALOG_NAME
+// If user specific ParseNode(catalog), we will parse it, and retrieve catalog_id/catalog_name from it
+int ObStmtResolver::resolve_catalog_node(const ParseNode *catalog_node, uint64_t &catalog_id, common::ObString &catalog_name)
+{
+  int ret = OB_SUCCESS;
+  // assign default catalog_id and catalog_name first
+  catalog_id = OB_INTERNAL_CATALOG_ID;
+  catalog_name = is_oracle_mode() ? OB_INTERNAL_CATALOG_NAME_UPPER : OB_INTERNAL_CATALOG_NAME;
+  uint64_t tenant_id = OB_INVALID_TENANT_ID;
+  ObNameCaseMode case_mode = OB_NAME_CASE_INVALID;
+  const ObCatalogSchema *catalog_schema = NULL;
+  if (OB_UNLIKELY(NULL == session_info_ || NULL == allocator_ || NULL == schema_checker_ || NULL == schema_checker_->get_schema_guard())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret));
+  } else if (OB_FALSE_IT(tenant_id = session_info_->get_effective_tenant_id())) {
+  } else if (OB_FALSE_IT(catalog_id = session_info_->get_current_default_catalog())) {
+  } else if (OB_FAIL(session_info_->get_name_case_mode(case_mode))) {
+    LOG_WARN("failed to get name case mode", K(ret));
+  } else if (NULL != catalog_node) {
+    // if catalog ParseNode is not null, deduce catalog from ParseNode
+    ObString catalog_node_str{static_cast<int32_t>(catalog_node->str_len_), const_cast<char *>(catalog_node->str_value_)};
+    if (share::ObCatalogUtils::is_internal_catalog_name(catalog_node_str, case_mode)) {
+      catalog_id = OB_INTERNAL_CATALOG_ID;
+      catalog_name = is_oracle_mode() ? OB_INTERNAL_CATALOG_NAME_UPPER : OB_INTERNAL_CATALOG_NAME;
+    } else {
+      if (OB_FAIL(schema_checker_->get_schema_guard()->get_catalog_schema_by_name(tenant_id, catalog_node_str, catalog_schema))) {
+        LOG_WARN("failed to get catalog schema by name", K(ret), K(tenant_id), K(catalog_node_str));
+      } else if (OB_ISNULL(catalog_schema)) {
+        ret = OB_CATALOG_NOT_EXIST;
+        LOG_USER_ERROR(OB_CATALOG_NOT_EXIST, catalog_node_str.length(), catalog_node_str.ptr());
+      } else if (OB_FAIL(ob_write_string(*allocator_, catalog_schema->get_catalog_name(), catalog_name))) {
+        // use catalog name from CatalogSchema and deep copy it
+        LOG_WARN("deep copy catalog_name failed", K(ret));
+      } else {
+        catalog_id = catalog_schema->get_catalog_id();
+      }
+    }
+  } else if (is_external_catalog_id(catalog_id)) {
+    // if catalog ParseNode is null, deduce catalog from session's catalog_id
+    // catalog is not explict specific, use catalog_id from session
+    if (OB_FAIL(schema_checker_->get_schema_guard()->get_catalog_schema_by_id(tenant_id, catalog_id, catalog_schema))) {
+      LOG_WARN("failed to get catalog schema by name", K(ret), K(tenant_id), K(catalog_id));
+    } else if (OB_ISNULL(catalog_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_USER_ERROR(OB_ERR_UNEXPECTED, "current session's catalog is not existed");
+    } else if (OB_FAIL(ob_write_string(*allocator_, catalog_schema->get_catalog_name(), catalog_name))) {
+      // use catalog name from CatalogSchema and deep copy it
+      LOG_WARN("deep copy catalog_name failed", K(ret));
+    }
+  } else {
+    // do nothing
+    // use INTERNAL_CATALOG_ID and INTERNAL_CATALOG_NAME
+  }
+  return ret;
+}
+
+bool ObStmtResolver::is_catalog_supported_stmt_(share::ObCatalogProperties::CatalogType catalog_type)
+{
+  bool is_supported = true;
+  stmt::StmtType stmt_type;
+  if (OB_ISNULL(stmt_)) {
+    // do nothing
+    // 比如 desc catalog.db.tbl，此时这里的 stmt_ 还没有被设置
+  } else if (OB_FALSE_IT(stmt_type = stmt_->get_stmt_type())) {
+  } else if (ObStmt::is_dml_stmt(stmt_type)) {
+    is_supported = ObStmt::is_catalog_supported_dml_stmt(stmt_type, catalog_type);
+  } else if (ObStmt::is_ddl_stmt(stmt_type, stmt_->has_global_variable())) {
+    is_supported = ObStmt::is_catalog_supported_ddl_stmt(stmt_type, stmt_->has_global_variable());
+  }
+  return is_supported;
+}
+
+int ObStmtResolver::resolve_ref_factor(const ParseNode *node,
+                                       ObSQLSessionInfo *session_info, 
+                                       ObString &table_name, 
+                                       ObString &db_name)
+{
+  int ret = OB_SUCCESS;
+  ObNameCaseMode mode = OB_NAME_CASE_INVALID;
+  if (OB_ISNULL(node) || OB_ISNULL(session_info)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("argument is NULL", K(node), K(session_info), K(ret));
+  } else {
+    ParseNode *db_node = node->children_[0];
+    ParseNode *relation_node = node->children_[1];
+    int32_t table_len = static_cast<int32_t>(relation_node->str_len_);
+    table_name.assign_ptr(const_cast<char*>(relation_node->str_value_), table_len);
+    ObCollationType cs_type = CS_TYPE_INVALID;
+    if (OB_FAIL(session_info->get_name_case_mode(mode))) {
+      SERVER_LOG(WARN, "fail to get name case mode", K(mode), K(ret));
+    } else if (OB_FAIL(session_info->get_collation_connection(cs_type))) {
+      LOG_WARN("fail to get collation_connection", K(ret));
+    } else {
+      bool perserve_lettercase = lib::is_oracle_mode() ?
+          true : (mode != OB_LOWERCASE_AND_INSENSITIVE);
+      if (OB_FAIL(ObSQLUtils::check_and_convert_table_name(cs_type, perserve_lettercase, table_name))) {
+        LOG_WARN("fail to check and convert relation name", K(table_name), K(ret));
+      } else {
+        if (NULL == db_node) {
+          if (session_info->get_database_name().empty()) {
+            ret = OB_ERR_NO_DB_SELECTED;
+            LOG_WARN("No database selected");
+          } else {
+            db_name = session_info->get_database_name();
+          }
+        } else {
+          int32_t db_len = static_cast<int32_t>(db_node->str_len_);
+          db_name.assign_ptr(const_cast<char*>(db_node->str_value_), db_len);
+          if (OB_FAIL(ObSQLUtils::check_and_convert_db_name(cs_type, perserve_lettercase, db_name))) {
+            LOG_WARN("fail to check and convert database name", K(db_name), K(ret));
+          }
+        }
+      }
+    }
+
+    if (OB_SUCC(ret)) {
+      bool is_internal_catalog_query = true;
+      // use catalog name from ParseNode if explict
+      // if catalog name in ParseNode is not specific, we will deduce catalog name from session's catalog id
+      // this function only support non-catalog query now, if user query catalog's resources, we will return OB_NOT_SUPPORTED
+      if (node->num_child_ >= 4) {
+        ParseNode *catalog_node = node->children_[3];
+        ObString catalog_name;
+        catalog_name.assign_ptr(catalog_node->str_value_, catalog_node->str_len_);
+        if (!share::ObCatalogUtils::is_internal_catalog_name(catalog_name, mode)) {
+          is_internal_catalog_query = false;
+        }
+      } else {
+        if (!is_internal_catalog_id(session_info->get_current_default_catalog())) {
+          is_internal_catalog_query = false;
+        }
+      }
+
+      if (OB_SUCC(ret) && !is_internal_catalog_query) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("not support in external catalog", K(ret));
+        LOG_USER_WARN(OB_NOT_SUPPORTED, "This operation is catalog is");
+      }
+    }
+  }
+  return ret;
+}
+
+int ObStmtResolver::resolve_database_factor(const ParseNode *node,
+                                            const uint64_t tenant_id,
+                                            const uint64_t catalog_id,
+                                            uint64_t &database_id,
+                                            ObString &db_name)
+{
+  int ret = OB_SUCCESS;
+  database_id = OB_INVALID_ID;
+  if (OB_ISNULL(node)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("node is NULL", K(ret));
+  } else if (OB_UNLIKELY(T_IDENT != node->type_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("node type is not T_IDENT", K(ret), K(node->type_));
+  } else if (FALSE_IT(db_name.assign_ptr(const_cast<char*>(node->str_value_),
+                                  static_cast<int32_t>(node->str_len_)))) {
+    // won't be here
+  } else if (OB_FAIL(schema_checker_->get_database_id(tenant_id, catalog_id, db_name, database_id))) {
+    LOG_USER_ERROR(OB_ERR_BAD_DATABASE, db_name.length(), db_name.ptr());
+  }
+  return ret;
+}
+
+int ObStmtResolver::normalize_table_or_database_names(ObString &name)
+{
+  int ret = OB_SUCCESS;
+  ObNameCaseMode case_mode;
+  if (name.empty() || OB_ISNULL(session_info_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid name is empty", K(name), K(ret));
+  } else if (OB_FAIL(session_info_->get_name_case_mode(case_mode))) {
+    LOG_WARN("fail to get name case mode", K(ret));
+  } else if (lib::is_oracle_mode()) {
+    /* ^-^ */
+  } else if (OB_LOWERCASE_AND_INSENSITIVE == case_mode) {
+    ObCharset::casedn(CS_TYPE_UTF8MB4_GENERAL_CI, name);
+  }
+  
+  return ret;
+}
+
+int ObSynonymChecker::add_synonym_id(uint64_t synonym_id, uint64_t database_id)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < synonym_ids_.count(); ++i) {
+    if (OB_UNLIKELY(synonym_id == synonym_ids_.at(i))) {
+      ret = OB_ERR_LOOP_OF_SYNONYM;
+      LOG_WARN("looping chain of synonyms", K(synonym_id), K(ret));
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(synonym_ids_.push_back(synonym_id))) {
+    LOG_WARN("fail to add synonym_id", K(synonym_id), K(ret));
+  } else if (OB_FAIL(database_ids_.push_back(database_id))) {
+    LOG_WARN("fail to add database id", K(database_id), K(ret));
+  }
+  return ret;
+}
+
+int ObStmtResolver::get_column_schema(const uint64_t table_id,
+    const ObString &column_name,
+    const share::schema::ObColumnSchemaV2 *&column_schema,
+    const bool get_hidden /* = false */,
+    bool is_link /* = false */)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(schema_checker_) || OB_ISNULL(session_info_)) {
+    ret = OB_NOT_INIT;
+    SQL_RESV_LOG(WARN, "not init", K(ret), KP(schema_checker_), KP(session_info_));
+  } else {
+    const bool is_rowid_col =
+      lib::is_oracle_mode()
+      && ObCharset::case_insensitive_equal(column_name, OB_HIDDEN_LOGICAL_ROWID_COLUMN_NAME);
+    const bool hidden = is_rowid_col || get_hidden || session_info_->is_inner();
+
+    // generated column added by function-based index is hidden in OB but can be selected in oracle
+    if (OB_FAIL(schema_checker_->get_column_schema(
+        session_info_->get_effective_tenant_id(), table_id, column_name, column_schema, true, is_link))) {
+      LOG_WARN("fail to get column schema", K(table_id), K(column_name), K(ret));
+    } else if (!hidden && column_schema->is_hidden() && !column_schema->is_generated_column() && !column_schema->is_udt_hidden_column()) {
+      ret = OB_ERR_BAD_FIELD_ERROR;
+      LOG_INFO("do not get hidden column", K(table_id), K(column_name), K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObStmtResolver::get_column_schema(const uint64_t table_id,
+    const uint64_t column_id,
+    const share::schema::ObColumnSchemaV2 *&column_schema,
+    const bool get_hidden /* = false */,
+    bool is_link /* = false */)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(schema_checker_) || OB_ISNULL(session_info_)) {
+    ret = OB_NOT_INIT;
+    SQL_RESV_LOG(WARN, "not init", K(ret), KP(schema_checker_), KP(session_info_));
+  } else {
+    const bool hidden = get_hidden || session_info_->is_inner();
+    if (OB_FAIL(schema_checker_->get_column_schema(session_info_->get_effective_tenant_id(), table_id, column_id, column_schema, hidden, is_link))) {
+      SQL_RESV_LOG(WARN, "get_column_schema failed", K(ret), K(session_info_->get_effective_tenant_id()), K(table_id), K(column_id), K(hidden), K(is_link));
+    }
+  }
+  return ret;
+}
+
+int ObStmtResolver::check_table_name_equal(const ObString &name1, const ObString &name2, bool &equal)
+{
+  int ret = OB_SUCCESS;
+  ObNameCaseMode case_mode = OB_NAME_CASE_INVALID;
+  equal = false;
+  if (OB_ISNULL(session_info_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected session info", K(ret));
+  } else if (OB_FAIL(session_info_->get_name_case_mode(case_mode))) {
+    LOG_WARN("fail to get name case mode", K(ret));
+  } else if (OB_NAME_CASE_INVALID == case_mode) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected name case mode", K(ret));
+  } else {
+    equal = ObCharset::case_mode_equal(case_mode, name1, name2);
+  }
+  return ret;
+}
+
+}  // namespace sql
+}  // namespace oceanbase

@@ -1,0 +1,525 @@
+/**
+ * Copyright (C) 2026 OceanBase
+ * This file contains confidential and proprietary information.
+ */
+
+#include <gtest/gtest.h>
+#include <string>
+#include "lib/alloc/ob_malloc_allocator.h"
+#include "lib/mysqlclient/ob_mysql_connection.h"
+#include "lib/mysqlclient/ob_mysql_connection_pool.h"
+#include "lib/mysqlclient/ob_mysql_result_impl.h"
+#include "lib/mysqlclient/ob_mysql_statement.h"
+#include "share/cache/ob_kv_storecache.h"
+#include "share/ob_simple_mem_limit_getter.h"
+#include "share/ob_thread_mgr.h"
+#define private public
+#define protected public
+#include "rootserver/ddl_task/ob_ddl_tablet_scheduler.h"
+#include "share/ob_get_compat_mode.h"
+#include "share/schema/ob_multi_version_schema_service.h"
+#undef protected
+#undef private
+
+namespace oceanbase
+{
+namespace rootserver
+{
+using namespace common;
+using namespace common::sqlclient;
+using namespace share;
+using namespace share::schema;
+
+static const uint64_t TEST_TENANT_ID = 1002;
+static const uint64_t DATA_TABLE_ID = 500007;
+static const uint64_t INDEX_TABLE_ID = 739754;
+static const int64_t SCHEMA_VERSION = 100;
+static const int64_t LS_COUNT = 3;
+static const uint64_t FIRST_TABLET_ID = 200001;
+
+class DDLQueryResult : public ObMySQLResultImpl
+{
+public:
+  DDLQueryResult(ObMySQLStatement &statement, const uint64_t tablet_id,
+                const ObString &running_sql)
+    : ObMySQLResultImpl(statement), tablet_id_(tablet_id), running_sql_(running_sql), pos_(-1) {}
+  using ObMySQLResultImpl::get_int;
+  using ObMySQLResultImpl::get_varchar;
+  int next() override
+  {
+    return ++pos_ == 0 && (tablet_id_ != 0 || !running_sql_.empty()) ? OB_SUCCESS : OB_ITER_END;
+  }
+  int get_int(const char *column, int64_t &value) const override
+  {
+    EXPECT_STREQ("task_id", column);
+    value = tablet_id_;
+    return OB_SUCCESS;
+  }
+  int get_varchar(const char *column, ObString &value) const override
+  {
+    EXPECT_STREQ("info", column);
+    value = running_sql_;
+    return OB_SUCCESS;
+  }
+private:
+  uint64_t tablet_id_;
+  ObString running_sql_;
+  int64_t pos_;
+};
+
+class DDLQueryResultHandler : public ObISQLResultHandler
+{
+public:
+  DDLQueryResultHandler(const uint64_t tablet_id, const ObString &running_sql)
+    : statement_(), result_(statement_, tablet_id, running_sql) {}
+  ObMySQLResult *mysql_result() override { return &result_; }
+private:
+  ObMySQLStatement statement_;
+  DDLQueryResult result_;
+};
+
+class DDLQueryConnection : public ObMySQLConnection
+{
+public:
+  DDLQueryConnection()
+    : timeout_tablet_id_(0), missing_tablet_id_(0), callback_tablet_id_(0),
+      session_ret_(OB_SUCCESS), scheduler_(nullptr) {}
+  using ObMySQLConnection::execute_read;
+  int execute_read(const uint64_t tenant_id, const ObString &sql,
+                   ObISQLClient::ReadResult &result, bool is_user_sql = false,
+                   const ObAddr *sql_exec_addr = nullptr) override
+  {
+    int ret = OB_SUCCESS;
+    uint64_t tablet_id = 0;
+    ObString running_sql;
+    const std::string sql_text(sql.ptr(), sql.length());
+    if (sql_text.find("__all_virtual_session_info") != std::string::npos) {
+      EXPECT_EQ(OB_SYS_TENANT_ID, tenant_id);
+      ret = session_ret_;
+      running_sql = running_sql_;
+    } else if (sql_text.find("__all_ddl_checksum") != std::string::npos) {
+      EXPECT_EQ(TEST_TENANT_ID, tenant_id);
+      const char *range = strstr(sql_text.c_str(), "AND task_id >= ");
+      if (range == nullptr || 1 != sscanf(range, "AND task_id >= %lu", &tablet_id)) {
+        ADD_FAILURE() << "Unexpected checksum query";
+        ret = OB_INVALID_ARGUMENT;
+      } else if (OB_FAIL(checksum_reads_.push_back(tablet_id))) {
+      } else if (tablet_id == timeout_tablet_id_) {
+        timeout_tablet_id_ = 0;
+        ret = OB_TIMEOUT;
+      } else if (tablet_id == callback_tablet_id_) {
+        ObArray<ObTabletID> tablets;
+        if (OB_FAIL(tablets.push_back(ObTabletID(tablet_id)))) {
+        } else {
+          ret = scheduler_->confirm_batch_tablets_status(
+              1, true, ObLSID(1001 + tablet_id - FIRST_TABLET_ID), tablets);
+        }
+        callback_tablet_id_ = 0;
+      }
+      if (tablet_id == missing_tablet_id_) {
+        tablet_id = 0;
+      }
+    } else {
+      ADD_FAILURE() << "Unexpected SQL: " << std::string(sql.ptr(), sql.length());
+      ret = OB_NOT_SUPPORTED;
+    }
+    if (OB_SUCC(ret)) {
+      DDLQueryResultHandler *handler = nullptr;
+      ret = result.create_handler(handler, tablet_id, running_sql);
+    }
+    return ret;
+  }
+  uint64_t timeout_tablet_id_;
+  uint64_t missing_tablet_id_;
+  uint64_t callback_tablet_id_;
+  int session_ret_;
+  ObString running_sql_;
+  ObArray<uint64_t> checksum_reads_;
+  ObDDLTabletScheduler *scheduler_;
+};
+
+class DDLQueryPool : public ObMySQLConnectionPool
+{
+public:
+  explicit DDLQueryPool(DDLQueryConnection &connection) : connection_(connection) {}
+  using ObMySQLConnectionPool::acquire;
+  using ObMySQLConnectionPool::release;
+  int acquire(const uint64_t, ObISQLConnection *&connection, ObISQLClient *, const int32_t) override
+  {
+    connection = &connection_;
+    return OB_SUCCESS;
+  }
+  int release(ObISQLConnection *connection, const bool) override
+  {
+    EXPECT_EQ(&connection_, connection);
+    return OB_SUCCESS;
+  }
+private:
+  DDLQueryConnection &connection_;
+};
+
+class TestDDLTabletScheduler : public ::testing::Test
+{
+public:
+  TestDDLTabletScheduler() : pool_(connection_), old_proxy_(nullptr) {}
+  static void init_schema_context()
+  {
+    // Populate local schema caches so the real session lookup never needs an observer.
+    old_startup_mode_ = GCTX.startup_mode_;
+    old_liboblog_mode_ = ObSchemaService::g_liboblog_mode_;
+    GCTX.startup_mode_ = ObServerMode::SHARED_STORAGE_MODE;
+    ObSchemaService::g_liboblog_mode_ = true;
+    ASSERT_TRUE(GCTX.is_shared_storage_mode());
+    ASSERT_EQ(OB_SUCCESS, ObTimerService::get_instance().start());
+    const uint64_t tenant_ids[] = {TEST_TENANT_ID, OB_SERVER_TENANT_ID};
+    for (const uint64_t tenant_id : tenant_ids) {
+      auto allocator_guard = ObMallocAllocator::get_instance()->get_tenant_ctx_allocator(
+          tenant_id, ObCtxIds::KVSTORE_CACHE_ID);
+      if (nullptr == allocator_guard.ref_allocator()) {
+        ASSERT_EQ(OB_SUCCESS,
+                  ObMallocAllocator::get_instance()->create_and_add_tenant_allocator(tenant_id));
+      }
+    }
+    ASSERT_EQ(OB_SUCCESS, mem_limit_.add_tenant(TEST_TENANT_ID, 0, 256L << 20));
+    ASSERT_EQ(OB_SUCCESS, mem_limit_.add_tenant(OB_SERVER_TENANT_ID, 0, INT64_MAX));
+    ASSERT_EQ(OB_SUCCESS, ObKVGlobalCache::get_instance().init(
+        &mem_limit_, 1024, 1L << 30, lib::ACHUNK_SIZE));
+    ASSERT_EQ(OB_SUCCESS, ObSysTableChecker::instance().init());
+    ASSERT_EQ(OB_SUCCESS, ObCompatModeGetter::instance().init(nullptr));
+    lib::Worker::CompatMode mode = lib::Worker::CompatMode::MYSQL;
+    ASSERT_EQ(OB_SUCCESS,
+              ObCompatModeGetter::instance().set_tenant_compat_mode(TEST_TENANT_ID, mode));
+    ObMultiVersionSchemaService &service = ObMultiVersionSchemaService::get_instance();
+    service.schema_mode_ = ObSimpleSchemaMode::ORIGINAL;
+    ASSERT_EQ(OB_SUCCESS, service.schema_refresh_router_.init(ObSimpleSchemaMode::ORIGINAL));
+    ASSERT_EQ(OB_SUCCESS, service.schema_cache_.init());
+    ASSERT_EQ(OB_SUCCESS, service.schema_getter_controller_.init(&service));
+    ASSERT_EQ(OB_SUCCESS, service.schema_store_map_.init(16));
+    ASSERT_NO_FATAL_FAILURE(prepare_schema_mgr(sys_mgr_, OB_SYS_TENANT_ID));
+    ASSERT_NO_FATAL_FAILURE(prepare_schema_mgr(tenant_mgr_, TEST_TENANT_ID));
+    ASSERT_NO_FATAL_FAILURE(add_table_schema(DATA_TABLE_ID, "data_table", false));
+    ASSERT_NO_FATAL_FAILURE(add_table_schema(INDEX_TABLE_ID, "__idx_500007_idx", true));
+  }
+  static void destroy_schema_context()
+  {
+    // Release cached schemas before the global KV cache; the singleton owns its schema stores.
+    ObMultiVersionSchemaService::get_instance().schema_cache_.destroy();
+    sys_mgr_.reset();
+    tenant_mgr_.reset();
+    ObCompatModeGetter::instance().destroy();
+    ObKVGlobalCache::get_instance().destroy();
+    mem_limit_.reset();
+    ObTimerService::get_instance().stop();
+    ObTimerService::get_instance().wait();
+    ObTimerService::get_instance().destroy();
+    GCTX.startup_mode_ = old_startup_mode_;
+    ObSchemaService::g_liboblog_mode_ = old_liboblog_mode_;
+  }
+  void SetUp() override
+  {
+    ASSERT_EQ(OB_SUCCESS, proxy_.init(&pool_));
+    old_proxy_ = GCTX.sql_proxy_;
+    GCTX.sql_proxy_ = &proxy_;
+    connection_.scheduler_ = &scheduler_;
+    scheduler_.tenant_id_ = TEST_TENANT_ID;
+    scheduler_.table_id_ = INDEX_TABLE_ID;
+    scheduler_.ref_data_table_id_ = DATA_TABLE_ID;
+    scheduler_.task_id_ = 12229406;
+    scheduler_.snapshot_version_ = 1000;
+    scheduler_.trace_id_.init(ObAddr(ObAddr::IPV4, "127.0.0.1", 2882));
+    ASSERT_EQ(OB_SUCCESS, scheduler_.all_ls_to_tablets_map_.create(8, "TestDDLSched"));
+    ASSERT_EQ(OB_SUCCESS, scheduler_.running_ls_to_tablets_map_.create(8, "TestDDLSched"));
+    ASSERT_EQ(OB_SUCCESS, scheduler_.running_ls_to_execution_id_.create(8, "TestDDLSched"));
+    scheduler_.is_inited_ = true;
+  }
+  void TearDown() override
+  {
+    scheduler_.destroy();
+    GCTX.sql_proxy_ = old_proxy_;
+  }
+  static void prepare_schema_mgr(ObSchemaMgr &mgr, const uint64_t tenant_id)
+  {
+    ASSERT_EQ(OB_SUCCESS, mgr.init(tenant_id));
+    mgr.set_schema_version(SCHEMA_VERSION);
+    ObSimpleTenantSchema tenant;
+    tenant.set_tenant_id(TEST_TENANT_ID);
+    tenant.set_schema_version(SCHEMA_VERSION);
+    ASSERT_EQ(OB_SUCCESS, tenant.set_tenant_name("test_tenant"));
+    ASSERT_EQ(OB_SUCCESS, mgr.add_tenant(tenant));
+    ObSimpleSysVariableSchema vars;
+    vars.set_tenant_id(TEST_TENANT_ID);
+    vars.set_schema_version(SCHEMA_VERSION);
+    vars.set_name_case_mode(OB_ORIGIN_AND_INSENSITIVE);
+    ASSERT_EQ(OB_SUCCESS, mgr.sys_variable_mgr_.add_sys_variable(vars));
+    ObMultiVersionSchemaService &service = ObMultiVersionSchemaService::get_instance();
+    ASSERT_EQ(OB_SUCCESS, service.schema_store_map_.create(tenant_id, 8, 8));
+    ObSchemaStore *store = service.schema_store_map_.get(tenant_id);
+    ObSchemaMgr *evicted = nullptr;
+    ASSERT_EQ(OB_SUCCESS, store->schema_mgr_cache_.put(&mgr, evicted));
+    ASSERT_EQ(nullptr, evicted);
+    store->update_refreshed_version(SCHEMA_VERSION);
+  }
+  static void add_table_schema(const uint64_t table_id, const char *name, const bool is_index)
+  {
+    ObTableSchema table;
+    table.set_tenant_id(TEST_TENANT_ID);
+    table.set_database_id(500000);
+    table.set_table_id(table_id);
+    table.set_schema_version(SCHEMA_VERSION);
+    table.set_table_type(is_index ? USER_INDEX : USER_TABLE);
+    table.set_name_case_mode(OB_ORIGIN_AND_INSENSITIVE);
+    ASSERT_EQ(OB_SUCCESS, table.set_table_name(name));
+    if (is_index) {
+      table.set_data_table_id(DATA_TABLE_ID);
+      table.set_index_type(INDEX_TYPE_NORMAL_LOCAL);
+    }
+    table.set_part_level(PARTITION_LEVEL_ONE);
+    table.get_part_option().set_part_num(LS_COUNT);
+    table.get_part_option().set_part_func_type(PARTITION_FUNC_TYPE_HASH);
+    for (int64_t i = 0; i < LS_COUNT; ++i) {
+      ObPartition part;
+      part.set_tenant_id(TEST_TENANT_ID);
+      part.set_table_id(table_id);
+      part.set_part_id(i);
+      part.set_schema_version(SCHEMA_VERSION);
+      part.set_tablet_id(FIRST_TABLET_ID + i + (is_index ? 0 : 100));
+      char part_name[16];
+      snprintf(part_name, sizeof(part_name), "p%ld", i);
+      ASSERT_EQ(OB_SUCCESS, part.set_part_name(part_name));
+      ASSERT_EQ(OB_SUCCESS, table.add_partition(part));
+    }
+    ObSimpleTableSchemaV2 simple;
+    ASSERT_EQ(OB_SUCCESS,
+              ObMultiVersionSchemaService::get_instance().convert_to_simple_schema(table, simple));
+    ASSERT_EQ(OB_SUCCESS, tenant_mgr_.add_table(simple));
+    ASSERT_EQ(OB_SUCCESS, ObMultiVersionSchemaService::get_instance().schema_cache_.put_schema(
+        TABLE_SCHEMA, TEST_TENANT_ID, table_id, SCHEMA_VERSION, table));
+  }
+  void add_running_ls(const int64_t index)
+  {
+    const ObLSID ls_id(1001 + index);
+    ObArray<ObTabletID> tablets;
+    ASSERT_EQ(OB_SUCCESS, tablets.push_back(ObTabletID(FIRST_TABLET_ID + index)));
+    ASSERT_EQ(OB_SUCCESS, scheduler_.running_task_ls_ids_before_.push_back(ls_id));
+    ASSERT_EQ(OB_SUCCESS, scheduler_.all_ls_to_tablets_map_.set_refactored(ls_id, tablets));
+    ASSERT_EQ(OB_SUCCESS, scheduler_.running_ls_to_tablets_map_.set_refactored(ls_id, tablets));
+    ASSERT_EQ(OB_SUCCESS, scheduler_.running_ls_to_execution_id_.set_refactored(ls_id, 1));
+  }
+  int next_batch()
+  {
+    int64_t parallelism = 0;
+    int64_t execution_id = 0;
+    ObLSID ls_id;
+    ObAddr leader;
+    ObArray<ObTabletID> tablets;
+    return scheduler_.get_next_batch_tablets(
+        true, parallelism, execution_id, ls_id, leader, tablets);
+  }
+  void expect_pending(const int64_t first, const int64_t count)
+  {
+    ASSERT_EQ(count, scheduler_.running_task_ls_ids_before_.count());
+    for (int64_t i = 0; i < count; ++i) {
+      EXPECT_EQ(ObLSID(1001 + first + i), scheduler_.running_task_ls_ids_before_.at(i));
+    }
+  }
+  void complete_callback(const int64_t index)
+  {
+    ObArray<ObTabletID> tablets;
+    ASSERT_EQ(OB_SUCCESS, tablets.push_back(ObTabletID(FIRST_TABLET_ID + index)));
+    ASSERT_EQ(OB_SUCCESS, scheduler_.confirm_batch_tablets_status(
+        1, true, ObLSID(1001 + index), tablets));
+  }
+  static ObSchemaMgr sys_mgr_;
+  static ObSchemaMgr tenant_mgr_;
+  static ObSimpleMemLimitGetter mem_limit_;
+  static decltype(GCTX.startup_mode_) old_startup_mode_;
+  static bool old_liboblog_mode_;
+  DDLQueryConnection connection_;
+  DDLQueryPool pool_;
+  ObMySQLProxy proxy_;
+  ObMySQLProxy *old_proxy_;
+  ObDDLTabletScheduler scheduler_;
+};
+
+ObSchemaMgr TestDDLTabletScheduler::sys_mgr_;
+ObSchemaMgr TestDDLTabletScheduler::tenant_mgr_;
+ObSimpleMemLimitGetter TestDDLTabletScheduler::mem_limit_;
+decltype(GCTX.startup_mode_) TestDDLTabletScheduler::old_startup_mode_;
+bool TestDDLTabletScheduler::old_liboblog_mode_ = false;
+
+// Reading candidates repeatedly must not consume any recovered LS before confirmation.
+TEST_F(TestDDLTabletScheduler, candidate_query_preserves_pending_ls)
+{
+  for (int64_t i = 0; i < LS_COUNT; ++i) {
+    ASSERT_NO_FATAL_FAILURE(add_running_ls(i));
+  }
+  ObArray<ObLSID> running_now;
+  ASSERT_EQ(OB_SUCCESS, running_now.push_back(ObLSID(1002)));
+  for (int64_t poll = 0; poll < 2; ++poll) {
+    ObArray<ObLSID> candidates;
+    ASSERT_EQ(OB_SUCCESS, scheduler_.get_potential_finished_lsid(running_now, candidates));
+    ASSERT_EQ(2, candidates.count());
+    EXPECT_EQ(ObLSID(1001), candidates.at(0));
+    EXPECT_EQ(ObLSID(1003), candidates.at(1));
+    ASSERT_NO_FATAL_FAILURE(expect_pending(0, LS_COUNT));
+  }
+}
+
+// A checksum timeout must retain the recovered LS and allow the next poll to finish it.
+TEST_F(TestDDLTabletScheduler, checksum_timeout_then_success)
+{
+  ASSERT_NO_FATAL_FAILURE(add_running_ls(0));
+  connection_.timeout_tablet_id_ = FIRST_TABLET_ID;
+  ASSERT_EQ(OB_TIMEOUT, next_batch());
+  ASSERT_NO_FATAL_FAILURE(expect_pending(0, 1));
+  EXPECT_EQ(1, scheduler_.all_ls_to_tablets_map_.size());
+  EXPECT_EQ(1, scheduler_.running_ls_to_tablets_map_.size());
+  ASSERT_EQ(OB_EAGAIN, next_batch());
+  ASSERT_NO_FATAL_FAILURE(expect_pending(0, 0));
+  EXPECT_EQ(2, connection_.checksum_reads_.count());
+  EXPECT_EQ(0, scheduler_.running_ls_to_tablets_map_.size());
+  EXPECT_EQ(OB_ITER_END, next_batch());
+}
+
+// Failure at each LS position must preserve that LS and the entire unprocessed suffix.
+TEST_F(TestDDLTabletScheduler, partial_confirmation_retains_failed_and_unprocessed_ls)
+{
+  for (int64_t failed = 0; failed < LS_COUNT; ++failed) {
+    SCOPED_TRACE(failed);
+    scheduler_.running_task_ls_ids_before_.reset();
+    connection_.checksum_reads_.reset();
+    for (int64_t i = 0; i < LS_COUNT; ++i) {
+      ASSERT_NO_FATAL_FAILURE(add_running_ls(i));
+    }
+    connection_.timeout_tablet_id_ = FIRST_TABLET_ID + failed;
+    ASSERT_EQ(OB_TIMEOUT, next_batch());
+    ASSERT_NO_FATAL_FAILURE(expect_pending(failed, LS_COUNT - failed));
+    EXPECT_EQ(failed + 1, connection_.checksum_reads_.count());
+    EXPECT_EQ(LS_COUNT - failed, scheduler_.running_ls_to_tablets_map_.size());
+    ASSERT_EQ(OB_EAGAIN, next_batch());
+    ASSERT_NO_FATAL_FAILURE(expect_pending(0, 0));
+    ASSERT_EQ(OB_ITER_END, next_batch());
+    ASSERT_EQ(OB_SUCCESS, scheduler_.running_ls_to_execution_id_.reuse());
+  }
+}
+
+// Candidate indices differ from pending indices when an earlier LS still has running SQL.
+TEST_F(TestDDLTabletScheduler, removes_ls_by_value)
+{
+  for (int64_t i = 0; i < LS_COUNT; ++i) {
+    ASSERT_NO_FATAL_FAILURE(add_running_ls(i));
+  }
+  connection_.running_sql_ = ObString::make_string("INSERT INTO t PARTITION(`p0`, `p9`) SELECT 1");
+  ASSERT_EQ(OB_EAGAIN, next_batch());
+  ASSERT_NO_FATAL_FAILURE(expect_pending(0, 1));
+  EXPECT_EQ(1, scheduler_.running_ls_to_tablets_map_.size());
+  EXPECT_EQ(2, connection_.checksum_reads_.count());
+  connection_.running_sql_.reset();
+  ASSERT_EQ(OB_EAGAIN, next_batch());
+  EXPECT_EQ(OB_ITER_END, next_batch());
+}
+
+// Missing reports release running state and remove recovery markers so work can be rescheduled.
+TEST_F(TestDDLTabletScheduler, missing_checksum_allows_rescheduling)
+{
+  ASSERT_NO_FATAL_FAILURE(add_running_ls(0));
+  connection_.missing_tablet_id_ = FIRST_TABLET_ID;
+  ASSERT_EQ(OB_EAGAIN, next_batch());
+  ASSERT_NO_FATAL_FAILURE(expect_pending(0, 0));
+  EXPECT_EQ(0, scheduler_.running_ls_to_tablets_map_.size());
+  EXPECT_EQ(1, scheduler_.all_ls_to_tablets_map_.size());
+  bool need_send = false;
+  ASSERT_EQ(OB_SUCCESS, scheduler_.determine_if_need_to_send_new_task(need_send));
+  EXPECT_TRUE(need_send);
+}
+
+// A rescheduled LS must lose its recovery marker even when a later LS fails confirmation.
+TEST_F(TestDDLTabletScheduler, partial_failure_does_not_reconfirm_new_batch)
+{
+  for (int64_t i = 0; i < LS_COUNT; ++i) {
+    ASSERT_NO_FATAL_FAILURE(add_running_ls(i));
+  }
+  connection_.missing_tablet_id_ = FIRST_TABLET_ID;
+  connection_.timeout_tablet_id_ = FIRST_TABLET_ID + 1;
+  ASSERT_EQ(OB_TIMEOUT, next_batch());
+  ASSERT_NO_FATAL_FAILURE(expect_pending(1, 2));
+  EXPECT_EQ(LS_COUNT, scheduler_.all_ls_to_tablets_map_.size());
+  EXPECT_EQ(2, scheduler_.running_ls_to_tablets_map_.size());
+  ASSERT_EQ(2, connection_.checksum_reads_.count());
+
+  // Model a newly admitted batch whose SQL has not started yet; only the old LSs need checking.
+  const ObLSID rescheduled_ls_id(1001);
+  ObArray<ObTabletID> tablets;
+  ASSERT_EQ(OB_SUCCESS, tablets.push_back(ObTabletID(FIRST_TABLET_ID)));
+  ASSERT_EQ(OB_SUCCESS,
+            scheduler_.running_ls_to_tablets_map_.set_refactored(rescheduled_ls_id, tablets));
+  ASSERT_EQ(OB_SUCCESS,
+            scheduler_.running_ls_to_execution_id_.set_refactored(rescheduled_ls_id, 2, true));
+  ASSERT_EQ(OB_EAGAIN, next_batch());
+  ASSERT_NO_FATAL_FAILURE(expect_pending(0, 0));
+  EXPECT_EQ(1, scheduler_.all_ls_to_tablets_map_.size());
+  EXPECT_EQ(1, scheduler_.running_ls_to_tablets_map_.size());
+  ASSERT_EQ(4, connection_.checksum_reads_.count());
+  EXPECT_EQ(FIRST_TABLET_ID + 1, connection_.checksum_reads_.at(2));
+  EXPECT_EQ(FIRST_TABLET_ID + 2, connection_.checksum_reads_.at(3));
+  ASSERT_EQ(OB_SUCCESS,
+            scheduler_.confirm_batch_tablets_status(2, true, rescheduled_ls_id, tablets));
+  EXPECT_EQ(OB_ITER_END, next_batch());
+}
+
+// An LS completed by the normal callback still needs its recovery marker removed.
+TEST_F(TestDDLTabletScheduler, callback_before_confirmation)
+{
+  ASSERT_NO_FATAL_FAILURE(add_running_ls(0));
+  ASSERT_NO_FATAL_FAILURE(add_running_ls(1));
+  ASSERT_NO_FATAL_FAILURE(complete_callback(0));
+  connection_.running_sql_ = ObString::make_string("INSERT INTO t PARTITION(`p1`, `p9`) SELECT 1");
+  ASSERT_EQ(OB_EAGAIN, next_batch());
+  ASSERT_NO_FATAL_FAILURE(expect_pending(1, 1));
+  EXPECT_EQ(0, connection_.checksum_reads_.count());
+}
+
+// A callback during the checksum query can make confirmation fail; the next poll must clean up.
+TEST_F(TestDDLTabletScheduler, callback_during_checksum_query)
+{
+  ASSERT_NO_FATAL_FAILURE(add_running_ls(0));
+  ASSERT_NO_FATAL_FAILURE(add_running_ls(1));
+  connection_.running_sql_ = ObString::make_string("INSERT INTO t PARTITION(`p1`, `p9`) SELECT 1");
+  connection_.callback_tablet_id_ = FIRST_TABLET_ID;
+  ASSERT_EQ(OB_HASH_NOT_EXIST, next_batch());
+  ASSERT_NO_FATAL_FAILURE(expect_pending(0, 2));
+  ASSERT_EQ(OB_EAGAIN, next_batch());
+  ASSERT_NO_FATAL_FAILURE(expect_pending(1, 1));
+  EXPECT_EQ(1, connection_.checksum_reads_.count());
+}
+
+// Failure before candidate calculation must leave recovery state unchanged and retryable.
+TEST_F(TestDDLTabletScheduler, session_query_failure_preserves_pending_ls)
+{
+  ASSERT_NO_FATAL_FAILURE(add_running_ls(0));
+  connection_.session_ret_ = OB_TIMEOUT;
+  ASSERT_EQ(OB_TIMEOUT, next_batch());
+  ASSERT_NO_FATAL_FAILURE(expect_pending(0, 1));
+  EXPECT_EQ(0, connection_.checksum_reads_.count());
+  connection_.session_ret_ = OB_SUCCESS;
+  ASSERT_EQ(OB_EAGAIN, next_batch());
+  EXPECT_EQ(OB_ITER_END, next_batch());
+}
+
+} // namespace rootserver
+} // namespace oceanbase
+
+int main(int argc, char **argv)
+{
+  testing::InitGoogleTest(&argc, argv);
+  OB_LOGGER.set_log_level("WARN");
+  OB_LOGGER.set_file_name("test_ddl_tablet_scheduler.log", true);
+  // Keep process-wide singletons alive across gtest repeat iterations.
+  oceanbase::rootserver::TestDDLTabletScheduler::init_schema_context();
+  int ret = 1;
+  if (!testing::Test::HasFatalFailure()) {
+    ret = RUN_ALL_TESTS();
+  }
+  oceanbase::rootserver::TestDDLTabletScheduler::destroy_schema_context();
+  return ret;
+}

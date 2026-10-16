@@ -1,0 +1,565 @@
+/**
+ * Copyright (c) 2024 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+
+/*
+ * Overview
+ * - Abstract compile-time/runtime definitions (CtDef/RtDef) for DAS search operators.
+ *
+ * Key Responsibilities
+ * - Record the immutable parts of each operator, such as is_scoring_, and the mutable parts, such as cost.
+ * - Define the core interface for adaptively operator generation: compute_cost() and generate_op().
+ * - Define Fusion Search CtDef/Rtdef, which bridge the search operators and vector subquery.
+ * - Define ObDASRowID for unified rowid abstraction across different index types.
+ */
+#ifndef OBDEV_SRC_SQL_DAS_SEARCH_OB_DAS_SEARCH_DEFINE_H_
+#define OBDEV_SRC_SQL_DAS_SEARCH_OB_DAS_SEARCH_DEFINE_H_
+
+#include "sql/das/ob_das_attach_define.h"
+#include "share/hybrid_search/ob_query_parse.h"
+
+namespace oceanbase
+{
+namespace sql
+{
+
+// Comparator required by ObBinaryHeap when building an int64_t max heap.
+struct ObDASInt64LessComp
+{
+public:
+  int get_error_code() const { return OB_SUCCESS; }
+  bool operator()(const int64_t lhs, const int64_t rhs) const
+  {
+    return lhs < rhs;
+  }
+};
+
+enum ObHybridSearchTopKDynamicPruningLevel {
+  HYBRID_SEARCH_TOPK_DYNAMIC_PRUNING_DISABLED = 0,
+  HYBRID_SEARCH_TOPK_DYNAMIC_PRUNING_BASIC = 1,
+  HYBRID_SEARCH_TOPK_DYNAMIC_PRUNING_WITH_MATCH_PHRASE = 2
+};
+
+enum ObDASRowIDType {
+  DAS_ROWID_TYPE_UINT64 = 0,
+  DAS_ROWID_TYPE_COMPACT,
+  DAS_ROWID_TYPE_MAX
+};
+
+enum ObDASScopeId {
+  DAS_SCOPE_BASE = 0,
+  DAS_SCOPE_NESTED = 1,
+  DAS_SCOPE_MAX
+};
+
+struct ObDASRowIDScope
+{
+  ObDASRowIDType rowid_type_;
+  const ExprFixedArray *rowid_exprs_;
+  RowMeta rowid_meta_;
+
+  ObDASRowIDScope() : rowid_type_(DAS_ROWID_TYPE_UINT64), rowid_exprs_(nullptr), rowid_meta_() {}
+  TO_STRING_KV(K(rowid_type_));
+};
+
+class ObIDASSearchOp;
+class ObDASFilterBitmapProvider;
+struct ObCompactRow;
+
+/**
+ * ObDASRowID - Unified rowid abstraction for hybrid search framework.
+ *
+ * Design:
+ * - ObDASRowID is TYPE-AGNOSTIC, similar to ObDatum. The struct itself does not know
+ *   whether it holds a uint64 or a compact row pointer; it simply stores raw bytes/pointer.
+ * - The actual type is determined externally by ObDASSearchCtx::rowid_type_.
+ *
+ * Usage:
+ * - Normally, DO NOT use set_uint64()/get_uint64()/set_compact_row()/get_compact_row() directly.
+ *   Instead, use the utility methods in ObIDASSearchOp which handle type dispatching automatically:
+ *     - compare_rowid(rowid1, rowid2, cmp)
+ *     - deep_copy_rowid(src, dst, alloc)
+ *     - create_rowid_store(capacity, store)
+ *     - ...
+ * - The four getter/setter methods should ONLY be used when you can guarantee the specific
+ *   rowid type stored in ObDASRowID.
+ */
+struct ObDASRowID
+{
+
+friend class RowIDStore;
+friend class UInt64RowIDStore;
+friend class CompactRowIDStore;
+friend class ObDASSearchCtx;
+friend class ObDASBitmapOp;
+friend class ObDASFilterBitmapProvider;
+friend class ObDASTokenOp;
+friend class ObDASAsyncTokenOp;
+friend class ObDASAsyncSegmentMergeOp;
+friend class ObDASDisjunctionFilterOp;
+friend class ObDASReqExclOp;
+friend class ObDASMatchPhraseOp;
+friend class ObDASBMMOp;
+friend class ObDAATMergeIter;
+friend class ObDASSearchDriverIter;
+friend class ObDASScalarROROp;
+friend class ObDASAsyncScalarRorOp;
+friend class ObDASAsyncScalarRorUnionOp;
+friend class ObDASScalarPrimaryROROp;
+friend class ObDASAsyncIndexDeletionOp;
+friend class ObDASScalarLogicPrimaryROROp;
+friend class ObDASNestedQueryOp;
+friend class ObIDASSearchOp;
+template <typename DrainSinkT>
+friend int drain_search_op_rowids_until(
+    ObIDASSearchOp &op,
+    ObDASRowID &curr_id,
+    bool &iter_end,
+    const ObDASRowID &boundary_id,
+    DrainSinkT &sink);
+template <typename DrainSinkT>
+friend int drain_search_op_until(
+    ObIDASSearchOp &op,
+    ObDASRowID &curr_id,
+    double &curr_score,
+    bool &iter_end,
+    const ObDASRowID &boundary_id,
+    DrainSinkT &sink);
+
+template <ObDASRowIDType, bool> friend class ObDASRowIDCmp;
+
+public:
+  ObDASRowID() : uint64_rowid_(0), flags_(0) {}
+
+  OB_INLINE void set_min()
+  {
+    flags_ |= FLAG_MIN;
+    flags_ &= ~FLAG_MAX;
+  }
+
+  OB_INLINE void set_max()
+  {
+    flags_ |= FLAG_MAX;
+    flags_ &= ~FLAG_MIN;
+  }
+
+  OB_INLINE bool is_min() const { return flags_ & FLAG_MIN; }
+  OB_INLINE bool is_max() const { return flags_ & FLAG_MAX; }
+  OB_INLINE bool is_normal() const { return !is_min() && !is_max(); }
+
+  OB_INLINE void reset()
+  {
+    uint64_rowid_ = 0;
+    flags_ = 0;
+  }
+
+  TO_STRING_KV(K_(uint64_rowid), K(is_min()), K(is_max()), K(is_normal()));
+
+private:
+  OB_INLINE void set_uint64(uint64_t value)
+  {
+    uint64_rowid_ = value;
+    clear_min_max();
+  }
+
+  OB_INLINE void set_compact_row(const ObCompactRow *row)
+  {
+    ptr_rowid_ = row;
+    clear_min_max();
+  }
+
+  OB_INLINE uint64_t get_uint64() const { return uint64_rowid_; }
+  OB_INLINE const ObCompactRow *get_compact_row() const { return ptr_rowid_; }
+
+  OB_INLINE void clear_min_max() { flags_ &= ~(FLAG_MIN | FLAG_MAX); }
+
+private:
+  static constexpr uint16_t FLAG_MIN = 1 << 0;
+  static constexpr uint16_t FLAG_MAX = 1 << 1;
+
+  union {
+    uint64_t uint64_rowid_;
+    const ObCompactRow *ptr_rowid_;
+  };
+  uint16_t flags_;
+};
+
+template <ObDASRowIDType RowIDType, bool HAS_MIN_MAX = false>
+class ObDASRowIDCmp
+{
+public:
+  ObDASRowIDCmp(const RowMeta &meta, const common::ObIArray<ObExpr *> &exprs)
+    : meta_(meta), exprs_(exprs) {}
+  ~ObDASRowIDCmp() = default;
+  int cmp(const ObDASRowID &l, const ObDASRowID &r, int &cmp_ret) const;
+private:
+  int inner_cmp(const ObDASRowID &l, const ObDASRowID &r, int &cmp_ret) const;
+private:
+  const RowMeta &meta_;
+  const common::ObIArray<ObExpr *> &exprs_;
+};
+
+template <ObDASRowIDType RowIDType, bool HAS_MIN_MAX>
+int ObDASRowIDCmp<RowIDType, HAS_MIN_MAX>::cmp(
+    const ObDASRowID &l, const ObDASRowID &r, int &cmp_ret) const
+{
+  int ret = OB_SUCCESS;
+  cmp_ret = 0;
+  if constexpr (HAS_MIN_MAX) {
+    const bool l_min = l.is_min();
+    const bool l_max = l.is_max();
+    const bool r_min = r.is_min();
+    const bool r_max = r.is_max();
+    if (l.is_normal() && r.is_normal()) {
+      ret = inner_cmp(l, r, cmp_ret);
+    } else if (l_max || r_max) {
+      cmp_ret = l_max - r_max;
+    } else if (l_min || r_min) {
+      cmp_ret = -(l_min - r_min);
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+      SQL_LOG(WARN, "unexpected min max status", K(ret), K(l), K(r));
+    }
+  } else {
+    ret = inner_cmp(l, r, cmp_ret);
+  }
+  return ret;
+}
+
+template <ObDASRowIDType RowIDType, bool HAS_MIN_MAX>
+int ObDASRowIDCmp<RowIDType, HAS_MIN_MAX>::inner_cmp(
+    const ObDASRowID &l, const ObDASRowID &r, int &cmp_ret) const
+{
+  int ret = OB_SUCCESS;
+  if constexpr (RowIDType == DAS_ROWID_TYPE_UINT64) {
+    const uint64_t l_val = l.get_uint64();
+    const uint64_t r_val = r.get_uint64();
+    cmp_ret = (l_val > r_val) ? 1 : ((l_val < r_val) ? -1 : 0);
+  } else {
+    if (OB_ISNULL(l.get_compact_row()) || OB_ISNULL(r.get_compact_row())) {
+      ret = OB_ERR_UNEXPECTED;
+      SQL_LOG(WARN, "unexpected nullptr to compact row", K(ret), K(l), K(r));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && cmp_ret == 0 && i < exprs_.count(); ++i) {
+      const ObDatum &l_datum = l.get_compact_row()->get_datum(meta_, i);
+      const ObDatum &r_datum = r.get_compact_row()->get_datum(meta_, i);
+      if (OB_FAIL(exprs_.at(i)->basic_funcs_->null_last_cmp_(l_datum, r_datum, cmp_ret))) {
+        SQL_LOG(WARN, "failed to compare datums", K(ret), K(i), K(l_datum), K(r_datum));
+      }
+    }
+  }
+  return ret;
+}
+
+struct ObDASSearchCost
+{
+public:
+  ObDASSearchCost(): cost_(OB_INVALID_SEARCH_COST) {}
+  explicit ObDASSearchCost(int64_t cost) : cost_(cost) {}
+  ~ObDASSearchCost() {}
+  bool is_valid() const { return cost_ >= 0; }
+  int64_t cost() const { return cost_; }
+  void reset() { cost_ = OB_INVALID_SEARCH_COST; }
+  OB_INLINE void operator=(const ObDASSearchCost &other) { cost_ = other.cost_; }
+
+  TO_STRING_KV(K(cost_));
+
+  static int min(const ObDASSearchCost &a, const ObDASSearchCost &b, ObDASSearchCost &result)
+  {
+    int ret = OB_SUCCESS;
+    if (!a.is_valid() || !b.is_valid()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected invalid cost", KR(ret), K(a), K(b));
+    } else {
+      result = ObDASSearchCost(std::min(a.cost(), b.cost()));
+    }
+    return ret;
+  }
+
+private:
+  static const int64_t OB_INVALID_SEARCH_COST = -1;
+  int64_t cost_;
+};
+
+class ObIDASSearchOp;
+
+// Runtime BMM construction options. They are copied by the consumer and are not
+// part of the serialized query definition or the filter operator's state.
+struct ObDASBMMBuildOptions
+{
+  enum class FilterMode {
+    ORDERED,
+    DIRECT_DRAIN,
+  };
+  ObDASBMMBuildOptions()
+    : query_optional_(false),
+      lead_cost_(),
+      filter_cost_(),
+      enable_vectorized_merge_(false),
+      filter_mode_(FilterMode::ORDERED),
+      has_explicit_vectorized_merge_(false)
+  {}
+  explicit ObDASBMMBuildOptions(const bool enable_vectorized_merge)
+    : ObDASBMMBuildOptions(enable_vectorized_merge, FilterMode::ORDERED) {}
+  ObDASBMMBuildOptions(const bool enable_vectorized_merge, const FilterMode filter_mode)
+    : ObDASBMMBuildOptions()
+  {
+    enable_vectorized_merge_ = enable_vectorized_merge;
+    filter_mode_ = filter_mode;
+    has_explicit_vectorized_merge_ = true;
+  }
+  TO_STRING_KV(K_(query_optional), K_(lead_cost), K_(filter_cost),
+      K_(enable_vectorized_merge), K_(filter_mode), K_(has_explicit_vectorized_merge));
+  bool query_optional_;
+  ObDASSearchCost lead_cost_;
+  ObDASSearchCost filter_cost_;
+  bool enable_vectorized_merge_;
+  FilterMode filter_mode_;
+  // Cost and query semantics may be supplied without overriding tenant configuration.
+  bool has_explicit_vectorized_merge_;
+};
+
+struct ObIDASSearchCtDef : ObDASAttachCtDef
+{
+  OB_UNIS_VERSION(1);
+public:
+  ObIDASSearchCtDef(common::ObIAllocator &alloc, const ObDASOpType &op_type)
+    : ObDASAttachCtDef(alloc, op_type),
+      is_scoring_(false),
+      is_top_level_scoring_(false)
+  { }
+  virtual void set_is_scoring(const bool is_scoring) { is_scoring_ = is_scoring; }
+  OB_INLINE void set_is_top_level_scoring(bool is_top_level_scoring) { is_top_level_scoring_ = is_top_level_scoring; }
+  OB_INLINE bool is_top_level_scoring() const { return is_top_level_scoring_; }
+  OB_INLINE bool is_scoring() const { return is_scoring_; }
+  virtual bool is_search_ctdef() const override { return true; }
+  // Primary-get optimization ratio for this clause; 0 means disabled. Only scalar and boolean
+  // query ctdefs override this; default 0 keeps other clauses out of the merged-probe path.
+  virtual int64_t get_primary_get_ratio() const { return 0; }
+
+private:
+  // whether the query need contribute score.
+  bool is_scoring_;
+  // whether the query is the top-level scoring query, which means the query will drive
+  // the top-k max score dynamic pruning.
+  bool is_top_level_scoring_;
+};
+
+struct ObIDASSearchRtDef : ObDASAttachRtDef
+{
+  OB_UNIS_VERSION(1);
+public:
+  ObIDASSearchRtDef(const ObDASOpType &op_type)
+    : ObDASAttachRtDef(op_type),
+      cost_(),
+      allow_probe_(false)
+  { }
+
+public:
+  int get_cost(ObDASSearchCtx &search_ctx, ObDASSearchCost &cost);
+  void reset_cost() { cost_.reset(); }
+  void reset_cost_recursive();
+  virtual int generate_op(ObDASSearchCost lead_cost, ObDASSearchCtx &search_ctx, ObIDASSearchOp *&op) = 0;
+  virtual int compute_cost(ObDASSearchCtx &search_ctx, ObDASSearchCost &cost) = 0;
+  virtual int can_pushdown_filter_to_bmm(
+      ObDASSearchCtx &search_ctx,
+      bool &can_pushdown);
+  // Return the physical BMM consumers in the current Group and complete query.
+  // The default is one for both scopes; async full-text queries override it
+  // with their Group/Segment topology and may return zero when tokenization
+  // proves the required match branch empty.
+  virtual int get_bmm_filter_consumer_counts(
+      ObDASSearchCtx &search_ctx,
+      int64_t &group_consumer_count,
+      int64_t &query_consumer_count);
+  void set_pushdown_filter(const bool query_optional, ObIDASSearchOp *filter_op);
+  virtual void set_pushdown_filter(
+      const bool query_optional,
+      ObIDASSearchOp *filter_op,
+      ObDASSearchCost filter_cost);
+  virtual int set_bmm_input(
+      const bool query_optional,
+      ObIDASSearchOp *filter_op,
+      ObDASSearchCost filter_cost,
+      const ObDASBMMBuildOptions &options);
+  // Install a non-null Provider without changing the previous filter state on
+  // failure. Carry the RtDef estimate without materializing the Provider.
+  // Runtime kinds without Provider support return OB_NOT_SUPPORTED.
+  virtual int set_pushdown_filter_provider(
+      const bool query_optional,
+      ObDASFilterBitmapProvider *provider,
+      ObDASSearchCost filter_cost);
+  // Decide whether this clause should be folded into the merged primary-probe instead of
+  // running its own scan. Default false; scalar and boolean query rtdefs override with their
+  // own ratio-based decision. lead_cost is the driver clause's cost.
+  int prefer_primary_probe(ObDASSearchCost lead_cost, ObDASSearchCtx &search_ctx, bool &prefer_primary_probe);
+
+  // Keep the generated search-op topology stable when cloning a local parallel runtime.
+  // Subclasses may extend the cached state copied with cost_. allow_probe_ is intentionally
+  // recomputed by generate_op().
+  virtual int copy_cached_runtime_state_from(const ObIDASSearchRtDef &other);
+  OB_INLINE bool get_allow_probe() const { return allow_probe_; }
+  OB_INLINE void set_allow_probe(bool allow_probe) { allow_probe_ = allow_probe; }
+
+private:
+  // the estimated cost of this query, which is, the upper bound of the number of matching docs.
+  ObDASSearchCost cost_;
+  // Runtime-only flag (not serialized): set before generating scalar child ops of conjunction.
+  bool allow_probe_;
+};
+
+/*
+ * Support multi-path vector hybrid search, where all other non-vector queries will be
+ * processed via a search operator tree. Fusion CtDef/RtDef is used to merge the results of these
+ * query paths and perform reranking.
+*/
+struct ObDASFusionCtDef : ObDASAttachCtDef
+{
+  OB_UNIS_VERSION(1);
+public:
+  ObDASFusionCtDef(common::ObIAllocator &alloc)
+    : ObDASAttachCtDef(alloc, DAS_OP_FUSION_QUERY),
+      search_index_(-1),
+      rowid_exprs_(alloc),
+      nested_rowid_exprs_(alloc),
+      score_exprs_(alloc),
+      rank_exprs_(alloc),
+      weight_exprs_(alloc),
+      path_top_k_limit_exprs_(alloc),
+      size_expr_(nullptr),
+      offset_expr_(nullptr),
+      rank_window_size_expr_(nullptr),
+      rank_constant_expr_(nullptr),
+      min_score_expr_(nullptr),
+      has_search_subquery_(false),
+      has_vector_subquery_(false),
+      is_top_k_query_(true),
+      fusion_method_(ObFusionMethod::WEIGHT_SUM),
+      has_hybrid_fusion_op_(false),
+      enable_parallel_(false),
+      query_dop_(0),
+      has_nested_paths_(false),
+      track_score_(true),
+      fusion_iter_exec_mode_(ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS),
+      is_single_partition_(false),
+      rerank_window_size_expr_(nullptr)
+  {}
+  ~ObDASFusionCtDef() {}
+  INHERIT_TO_STRING_KV("ObDASFusionCtDef", ObDASAttachCtDef, K(search_index_), K(has_search_subquery_), K(has_vector_subquery_), K(rowid_exprs_), K(score_exprs_), K(rank_exprs_), K(weight_exprs_), KPC_(size_expr), KPC_(offset_expr), KPC_(rank_window_size_expr), KPC_(rank_constant_expr), KPC_(min_score_expr), K(fusion_method_), K(is_single_partition_));
+  
+  int init(
+    int64_t search_index,
+    bool has_search_subquery,
+    bool has_vector_subquery,
+    bool is_top_k_query,
+    ObFusionMethod fusion_method,
+    bool has_hybrid_fusion_op,
+    bool is_single_partition,
+    bool enable_parallel,
+    int64_t query_dop,
+    ObExpr *size_expr,
+    ObExpr *offset_expr,
+    ObExpr *rank_window_size_expr,
+    ObExpr *rerank_window_size_expr,
+    ObExpr *rank_constant_expr,
+    ObExpr *min_score_expr,
+    const common::ObIArray<ObExpr *> &rowid_exprs,
+    const common::ObIArray<ObExpr *> &score_exprs,
+    const common::ObIArray<ObExpr *> &result_output_exprs,
+    const common::ObIArray<ObExpr *> &weight_exprs,
+    const common::ObIArray<ObExpr *> &path_top_k_limit_exprs,
+    bool track_score,
+    ObFusionIterExecMode fusion_iter_exec_mode = ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS);
+  
+  // Getter methods for backward compatibility
+  OB_INLINE ObExpr *get_search_score_expr() const 
+  { 
+    return search_index_ >= 0 && search_index_ < score_exprs_.count() ? score_exprs_.at(search_index_) : nullptr;
+  }
+  OB_INLINE ObExpr *get_fusion_score_expr() const 
+  { 
+    return (score_exprs_.count() > 0) ? score_exprs_.at(score_exprs_.count() - 1) : nullptr;
+  }
+
+  OB_INLINE const ExprFixedArray &get_score_exprs() const { return score_exprs_; }
+  
+  OB_INLINE bool need_search_score() const { return get_search_score_expr() != nullptr; }
+  OB_INLINE bool has_search_subquery() const { return has_search_subquery_; }
+  OB_INLINE bool has_vector_subquery() const { return has_vector_subquery_; }
+  OB_INLINE bool has_nested_paths() const { return has_nested_paths_; }
+  OB_INLINE void set_has_nested_paths(bool v) { has_nested_paths_ = v; }
+  OB_INLINE bool need_topk() const { return need_search_score() && nullptr != size_expr_ && nullptr != offset_expr_ && fusion_iter_exec_mode_ == ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS; }
+
+  OB_INLINE int64_t get_search_idx() const { return search_index_; }
+  OB_INLINE void set_search_index(int64_t index) { search_index_ = index; }
+
+  OB_INLINE bool is_search_index(int64_t index) const { return has_search_subquery_ && index == search_index_; }
+  OB_INLINE bool is_vector_index(int64_t index) const { return has_vector_subquery_ && index != search_index_; }
+
+  const ObIDASSearchCtDef *get_search_ctdef() const
+  {
+    const ObIDASSearchCtDef *search_ctdef = nullptr;
+    int64_t search_idx = get_search_idx();
+    if (search_idx >= 0 && search_idx < children_cnt_ && children_ != nullptr) {
+      search_ctdef = static_cast<const ObIDASSearchCtDef *>(children_[search_idx]);
+    }
+    return search_ctdef;
+  }
+
+public:
+  int64_t search_index_;
+  ExprFixedArray rowid_exprs_;
+  // [doc_id_expr, nested_key_expr]; empty when has_nested_paths_ = false.
+  ExprFixedArray nested_rowid_exprs_;
+  ExprFixedArray score_exprs_;
+  ExprFixedArray rank_exprs_;
+  ExprFixedArray weight_exprs_;
+  ExprFixedArray path_top_k_limit_exprs_;
+  ObExpr *size_expr_;
+  ObExpr *offset_expr_;
+  ObExpr *rank_window_size_expr_;
+  ObExpr *rank_constant_expr_;
+  ObExpr *min_score_expr_;
+  bool has_search_subquery_;
+  bool has_vector_subquery_;
+  bool is_top_k_query_;
+  ObFusionMethod fusion_method_;
+  bool has_hybrid_fusion_op_;
+  bool enable_parallel_;
+  int64_t query_dop_;
+  bool has_nested_paths_;
+  bool track_score_;
+  ObFusionIterExecMode fusion_iter_exec_mode_;
+  bool is_single_partition_;
+  ObExpr *rerank_window_size_expr_;
+};
+
+struct ObDASFusionRtDef : ObDASAttachRtDef
+{
+  OB_UNIS_VERSION(1);
+public:
+  ObDASFusionRtDef()
+    : ObDASAttachRtDef(DAS_OP_FUSION_QUERY)
+  {}
+  ~ObDASFusionRtDef() {}
+
+  ObIDASSearchRtDef *get_search_rtdef()
+  {
+    ObIDASSearchRtDef *search_rtdef = nullptr;
+    if (OB_NOT_NULL(ctdef_)) {
+      const ObDASFusionCtDef *ctdef = static_cast<const ObDASFusionCtDef *>(ctdef_);
+      int64_t search_idx = ctdef->get_search_idx();
+      if (search_idx >= 0 && search_idx < children_cnt_ && children_ != nullptr) {
+        search_rtdef = static_cast<ObIDASSearchRtDef *>(children_[search_idx]);
+      }
+    }
+    return search_rtdef;
+  }
+};
+
+} // namespace sql
+} // namespace oceanbase
+
+#endif // OBDEV_SRC_SQL_DAS_SEARCH_OB_DAS_SEARCH_DEFINE_H_

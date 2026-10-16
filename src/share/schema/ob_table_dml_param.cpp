@@ -1,0 +1,1410 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX SHARE_SCHEMA
+
+#include "ob_table_dml_param.h"
+
+#include "object/ob_object.h"
+#include "lib/utility/utility.h"
+#include "share/schema/ob_schema_getter_guard.h"
+#include "share/ob_fts_index_builder_util.h"
+#include "share/vector_index/ob_vector_index_util.h"
+#include "share/search_index/ob_search_index_builder_util.h"
+#include "lib/udt/ob_collection_type.h"
+
+namespace oceanbase
+{
+using namespace common;
+namespace share
+{
+namespace schema
+{
+// ------ ObTableSchemaParam ------ //
+ObTableSchemaParam::ObTableSchemaParam(ObIAllocator &allocator)
+  : allocator_(allocator),
+    table_id_(OB_INVALID_ID),
+    schema_version_(OB_INVALID_VERSION),
+    table_type_(MAX_TABLE_TYPE),
+    index_type_(INDEX_TYPE_IS_NOT),
+    index_status_(INDEX_STATUS_NOT_FOUND),
+    shadow_rowkey_column_num_(0),
+    doc_id_col_id_(OB_INVALID_ID),
+    fulltext_col_id_(OB_INVALID_ID),
+    spatial_geo_col_id_(OB_INVALID_ID),
+    spatial_cellid_col_id_(OB_INVALID_ID),
+    spatial_mbr_col_id_(OB_INVALID_ID),
+    index_name_(),
+    fts_parser_name_(),
+    fts_parser_properties_(),
+    fts_index_type_(OB_FTS_INDEX_TYPE_INVALID),
+    columns_(allocator),
+    col_map_(allocator),
+    pk_name_(),
+    read_param_version_(0),
+    read_info_(),
+    cg_read_infos_(),
+    lob_inrow_threshold_(OB_DEFAULT_LOB_INROW_THRESHOLD),
+    multivalue_col_id_(OB_INVALID_ID),
+    multivalue_arr_col_id_(OB_INVALID_ID),
+    data_table_rowkey_column_num_(0),
+    vec_id_col_id_(OB_INVALID_ID),
+    vec_index_param_(),
+    vec_dim_(0),
+    vec_vector_col_id_(OB_INVALID_ID),
+    mv_mode_(),
+    is_delete_insert_(false),
+    is_rowscn_ttl_table_(false),
+    is_table_without_pk_(false),
+    merge_engine_type_(ObMergeEngineType::OB_MERGE_ENGINE_UNKNOWN),
+    inc_pk_doc_id_col_id_(OB_INVALID_ID),
+    vec_chunk_col_id_(OB_INVALID_ID),
+    vec_embedded_col_id_(OB_INVALID_ID),
+    search_idx_included_cids_(allocator),
+    search_idx_included_cid_idxes_(allocator),
+    search_idx_arr_types_(allocator),
+    search_idx_column_comments_(allocator)
+{
+}
+
+ObTableSchemaParam::~ObTableSchemaParam()
+{
+  reset();
+}
+
+void ObTableSchemaParam::reset()
+{
+  table_id_ = OB_INVALID_ID;
+  schema_version_ = OB_INVALID_VERSION;
+  table_type_ = MAX_TABLE_TYPE;
+  index_type_ = INDEX_TYPE_IS_NOT;
+  index_status_ = INDEX_STATUS_NOT_FOUND;
+  shadow_rowkey_column_num_ = 0;
+  doc_id_col_id_ = OB_INVALID_ID;
+  fulltext_col_id_ = OB_INVALID_ID;
+  spatial_geo_col_id_ = OB_INVALID_ID;
+  spatial_cellid_col_id_ = OB_INVALID_ID;
+  spatial_mbr_col_id_ = OB_INVALID_ID;
+  index_name_.reset();
+  fts_parser_name_.reset();
+  fts_parser_properties_.reset();
+  fts_index_type_ = OB_FTS_INDEX_TYPE_MATCH;
+  columns_.reset();
+  col_map_.clear();
+  pk_name_.reset();
+  read_info_.reset();
+  cg_read_infos_.reset();
+  read_param_version_ = 0;
+  lob_inrow_threshold_ = OB_DEFAULT_LOB_INROW_THRESHOLD;
+  multivalue_col_id_ = OB_INVALID_ID;
+  multivalue_arr_col_id_ = OB_INVALID_ID;
+  data_table_rowkey_column_num_ =0 ;
+  vec_id_col_id_ = OB_INVALID_ID;
+  vec_chunk_col_id_ = OB_INVALID_ID;
+  vec_embedded_col_id_ = OB_INVALID_ID;
+  vec_index_param_.reset();
+  vec_dim_ = 0;
+  vec_vector_col_id_ = OB_INVALID_ID;
+  mv_mode_.reset();
+  is_delete_insert_ = false;
+  is_rowscn_ttl_table_ = false;
+  is_table_without_pk_ = false;
+  merge_engine_type_ = ObMergeEngineType::OB_MERGE_ENGINE_UNKNOWN;
+  inc_pk_doc_id_col_id_ = OB_INVALID_ID;
+  search_idx_included_cids_.reset();
+  search_idx_included_cid_idxes_.reset();
+  search_idx_arr_types_.reset();
+  search_idx_column_comments_.reset();
+}
+
+int ObTableSchemaParam::convert(const ObTableSchema *schema)
+{
+  int ret = OB_SUCCESS;
+  static const int64_t COMMON_COLUMN_NUM = 16;
+  ObSEArray<ObColumnParam *, COMMON_COLUMN_NUM> tmp_cols;
+  ObSEArray<ObColDesc, COMMON_COLUMN_NUM> all_column_ids;
+  ObSEArray<ObColDesc, COMMON_COLUMN_NUM> tmp_col_descs;
+  ObSEArray<int32_t, COMMON_COLUMN_NUM> tmp_cols_index;
+  ObSEArray<int32_t, COMMON_COLUMN_NUM> tmp_cg_idxs;
+  bool use_cs = false;
+  int32_t cg_idx = 0;
+
+  if (OB_ISNULL(schema)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("schema is NULL", K(ret), KP(schema));
+  } else {
+    table_id_ = schema->get_table_id();
+    schema_version_ = schema->get_schema_version();
+    table_type_ = schema->get_table_type();
+    lob_inrow_threshold_ = schema->get_lob_inrow_threshold();
+    is_delete_insert_ = schema->is_delete_insert_merge_engine();
+    is_rowscn_ttl_table_ = schema->get_ttl_flag().ttl_column_type_ == ObTTLFlag::TTLColumnType::ROWSCN;
+    is_table_without_pk_ = schema->is_table_without_pk();
+    merge_engine_type_ = schema->get_merge_engine_type();
+    if (OB_FAIL(schema->get_is_row_store(use_cs))) {
+      LOG_WARN("fail to get is row store", K(ret));
+    } else {
+      use_cs = !use_cs;
+    }
+  }
+
+  if (OB_SUCC(ret) && schema->is_user_table() && schema->is_table_with_pk()) {
+    ObString tmp_pk_name;
+    if (OB_FAIL(schema->get_pk_constraint_name(tmp_pk_name))) {
+      LOG_WARN("get pk name from schema failed", K(ret));
+    } else if (OB_FAIL(ob_write_string(allocator_, tmp_pk_name, pk_name_))) {
+      LOG_WARN("fail to copy pk name", K(ret), K(pk_name_));
+    }
+  }
+
+  if(OB_SUCC(ret) && schema->is_index_table()) {
+    index_type_ = schema->get_index_type();
+    index_status_ = schema->get_index_status();
+    shadow_rowkey_column_num_ = schema->get_shadow_rowkey_column_num();
+    ObString tmp_name;
+
+    if (schema->is_spatial_index()) {
+      if (OB_FAIL(schema->get_spatial_geo_column_id(spatial_geo_col_id_))) {
+        LOG_WARN("fail to get spatial geo column id", K(ret), K(schema->get_index_info()));
+      } else if (OB_FAIL(schema->get_index_info().get_spatial_cellid_col_id(spatial_cellid_col_id_))) {
+        LOG_WARN("fail to get spatial cellid column id", K(ret), K(schema->get_index_info()));
+      } else if (OB_FAIL(schema->get_index_info().get_spatial_mbr_col_id(spatial_mbr_col_id_))) {
+        LOG_WARN("fail to get spatial mbr column id", K(ret), K(schema->get_index_info()));
+      }
+    } else if (schema->is_fts_index_aux() || schema->is_fts_doc_word_aux()) {
+      ObDocIDType doc_id_type;
+      uint64_t docid_col_id;
+      if (OB_FAIL(schema->get_fulltext_typed_col_ids(docid_col_id, doc_id_type, fulltext_col_id_))) {
+        LOG_WARN("fail to get fulltext column ids", K(ret));
+      } else if (OB_UNLIKELY(!ObDocIDUtils::is_docid_col_id_valid(docid_col_id)
+                             || fulltext_col_id_ <= OB_APP_MIN_COLUMN_ID || OB_INVALID_ID == fulltext_col_id_)) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid doc id or fulltext column id", K(ret), K(docid_col_id), K(fulltext_col_id_));
+      } else if (doc_id_type == ObDocIDType::TABLET_SEQUENCE && FALSE_IT(doc_id_col_id_ = docid_col_id)) {
+      } else if (doc_id_type == ObDocIDType::HIDDEN_INC_PK && FALSE_IT(inc_pk_doc_id_col_id_ = docid_col_id)) {
+      } else if (OB_FAIL(ob_write_string(allocator_, schema->get_parser_name_str(), fts_parser_name_))) {
+        LOG_WARN("fail to copy fts parser name", K(ret), K(schema->get_parser_name_str()));
+      } else if (OB_FAIL(ob_write_string(allocator_, schema->get_parser_property_str(), fts_parser_properties_))) {
+        LOG_WARN("fail to copy fts parser properties", K(ret), K(schema->get_parser_property_str()));
+      }
+      if (OB_FAIL(ret)) {
+      } else if (schema->is_fts_index_aux() || schema->is_fts_doc_word_aux()) {
+        share::schema::ObFTSIndexParams fts_index_params;
+        if (OB_FAIL(schema->get_fts_params_from_index_params(fts_index_params))) {
+          LOG_WARN("fail to get fts index params from index params", K(ret), K(schema->get_index_params()));
+        } else {
+          fts_index_type_ = fts_index_params.fts_index_type_;
+        }
+      }
+    } else if (schema->is_multivalue_index_aux()) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < schema->get_column_count(); ++i) {
+        const ObColumnSchemaV2 *column_schema = schema->get_column_schema_by_idx(i);
+        if (OB_ISNULL(column_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected error, column schema is nullptr", K(ret), K(i), KPC(schema));
+        } else if (column_schema->is_doc_id_column()) {
+          doc_id_col_id_ = column_schema->get_column_id();
+        } else if (column_schema->is_multivalue_generated_column()) {
+          multivalue_col_id_ = column_schema->get_column_id();
+        } else if (column_schema->is_multivalue_generated_array_column()) {
+          multivalue_arr_col_id_ = column_schema->get_column_id();
+        }
+      }
+    } else if (schema->is_vec_delta_buffer_type()
+              || schema->is_vec_rowkey_vid_type()
+              || schema->is_vec_vid_rowkey_type()
+              || schema->is_hybrid_vec_index_log_type()
+              || schema->is_hybrid_vec_index_embedded_type()) {
+      if (schema->is_vec_delta_buffer_type() 
+        || schema->is_hybrid_vec_index_embedded_type()
+        || schema->is_hybrid_vec_index_log_type()) {
+        if (OB_FAIL(ob_write_string(allocator_, schema->get_index_params(), vec_index_param_))) {
+          LOG_WARN("fail to copy vec index param", K(ret), K(schema->get_index_params()), K(schema->get_index_type()));
+        } else if (OB_FAIL(ObVectorIndexUtil::get_vector_index_column_dim(*schema, vec_dim_))) {
+          LOG_WARN("fail to get vector col dim", K(ret), K(schema->get_index_type()));
+        } else if (vec_dim_ == 0) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("get vector dim is zero, fail to calc", K(ret), K(vec_dim_), KPC(schema), K(schema->get_index_type()));
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < schema->get_column_count(); ++i) {
+        const ObColumnSchemaV2 *column_schema = schema->get_column_schema_by_idx(i);
+        uint64_t col_id = column_schema->get_column_id();
+        if (OB_ISNULL(column_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected error, column schema is nullptr", K(ret), K(i), KPC(schema));
+        } else if (column_schema->is_vec_hnsw_vid_column()) {
+          vec_id_col_id_ = column_schema->get_column_id();
+        } else if (column_schema->is_hybrid_embedded_vec_column()) {
+          vec_embedded_col_id_ = column_schema->get_column_id();
+        } else if (schema->is_vec_delta_buffer_type()) {
+          if (column_schema->is_vec_hnsw_vector_column()) {
+            vec_vector_col_id_ = col_id;
+          }
+        } else if (schema->is_hybrid_vec_index_log_type()) {
+          if (column_schema->get_column_name_str().prefix_match(OB_HYBRID_VEC_CHUNK_VALUE_COLUMN_NAME_PREFIX)) {
+            vec_chunk_col_id_ = column_schema->get_column_id();
+          }  
+        }
+        if (OB_SUCC(ret) && (schema->is_vec_delta_buffer_type() || schema->is_hybrid_vec_index_log_type()
+                              || schema->is_hybrid_vec_index_embedded_type())) {
+          if (column_schema->is_hidden_pk_column_id(col_id)) {
+            if (vec_id_col_id_ == OB_INVALID_ID) {
+              vec_id_col_id_ = col_id;
+            } else {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("invalid vec id column id", K(ret), K(vec_id_col_id_), K(col_id));
+            }
+          }       
+        }
+      }
+    } else if (schema->is_vec_dim_docid_value_type()) {
+      if (OB_FAIL(ob_write_string(allocator_, schema->get_index_params(), vec_index_param_))) {
+        LOG_WARN("fail to copy vec index param", K(ret), K(schema->get_index_params()));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < schema->get_column_count(); ++i) {
+        const ObColumnSchemaV2 *column_schema = schema->get_column_schema_by_idx(i);
+        if (OB_ISNULL(column_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected error, column schema is nullptr", K(ret), K(i), KPC(schema));
+        } else if (column_schema->is_doc_id_column()) {
+          doc_id_col_id_ = column_schema->get_column_id();
+        }
+      }
+    }
+
+    if (OB_FAIL(ret)) {
+      // do nothing
+    } else if (OB_FAIL(schema->get_index_name(tmp_name))) {
+      LOG_WARN("fail to get index name", K(ret), K(schema->get_index_info()));
+    } else if (OB_FAIL(ob_write_string(allocator_, tmp_name, index_name_))) {
+      LOG_WARN("fail to copy index name", K(ret), K(tmp_name));
+    }
+  }
+
+  if (OB_SUCC(ret) && schema->is_mlog_table()) {
+    index_type_ = schema->get_index_type();
+    index_status_ = schema->get_index_status();
+    ObString tmp_name;
+    if (OB_FAIL(schema->get_mlog_name(tmp_name))) {
+      LOG_WARN("fail to get materialized view log name", KR(ret));
+    } else if (OB_FAIL(ob_write_string(allocator_, tmp_name, index_name_))) {
+      LOG_WARN("fail to copy materialized view log name", KR(ret), K(tmp_name));
+    }
+  }
+  if (OB_SUCC(ret) && FALSE_IT(mv_mode_.mode_ = schema->get_mv_mode())) {
+  }
+
+  bool need_truncate_filter = !use_cs && nullptr != schema && schema->is_global_index_table();
+  bool has_ttl_definition = nullptr != schema && schema->get_ttl_flag().was_compaction_ttl_;
+  if (OB_FAIL(ret)) {
+  } else if (need_truncate_filter || has_ttl_definition) {
+    if (OB_FAIL(schema->get_mulit_version_rowkey_column_ids(all_column_ids))) {
+      LOG_WARN("fail to get multi version rokwey column", K(ret));
+    } else if (OB_FAIL(schema->get_column_ids_without_rowkey(all_column_ids, false))) {
+      LOG_WARN("fail to get column without rowkey", K(ret));
+    }
+  } else if (OB_FAIL(schema->get_column_ids(all_column_ids, false))) {
+    LOG_WARN("fail to get column ids", K(ret));
+  }
+  int32_t virtual_cols_cnt = 0;
+  int64_t schema_rowkey_cnt = schema->get_rowkey_column_num();
+  for (int32_t i = 0; OB_SUCC(ret) && i < all_column_ids.count(); ++i) {
+    int32_t col_index = OB_INVALID_INDEX;
+    const uint64_t column_id = all_column_ids.at(i).col_id_;
+    const ObColumnSchemaV2 *column_schema = NULL;
+    ObColumnParam *column = NULL;
+    if (OB_FAIL(ObTableParam::alloc_column(allocator_, column))) {
+      LOG_WARN("alloc column failed", K(ret), K(i));
+    } else if (common::OB_HIDDEN_TRANS_VERSION_COLUMN_ID == column_id ||
+               common::OB_HIDDEN_SQL_SEQUENCE_COLUMN_ID == column_id) {
+        column->set_column_id(column_id);
+        column->set_meta_type(all_column_ids.at(i).col_type_);
+        col_index = -1;
+    } else if (OB_ISNULL(column_schema = schema->get_column_schema(column_id))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("The column is NULL", K(schema->get_table_id()), K(column_id), K(i));
+    } else if(OB_FAIL(ObTableParam::convert_column_schema_to_param(*column_schema, *column))) {
+      LOG_WARN("convert failed", K(*column_schema), K(ret), K(i));
+    } else if (i < schema_rowkey_cnt) {
+      col_index = i;
+    } else if (nullptr != column_schema && column_schema->is_virtual_generated_column()) {
+      col_index = -1;
+      virtual_cols_cnt++;
+    } else {
+      col_index = (need_truncate_filter || has_ttl_definition)
+                      ? i - virtual_cols_cnt
+                            - storage::ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt()
+                      : i - virtual_cols_cnt;
+    }
+
+    if (FAILEDx(tmp_cols.push_back(column))) {
+      LOG_WARN("store tmp column param failed", K(ret));
+    } else if (OB_FAIL(tmp_col_descs.push_back(all_column_ids.at(i)))) {
+      LOG_WARN("store tmp column desc failed", K(ret));
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(tmp_cols_index.push_back(col_index))) {
+        LOG_WARN("fail to push_back col_index", K(ret));
+      } else if (use_cs && OB_FAIL(schema->get_column_group_index(*column, false /*need_calculate_cg_idx*/, cg_idx))) {
+        LOG_WARN("Fail to get column group index", K(ret));
+      } else if (use_cs && OB_FAIL(tmp_cg_idxs.push_back(cg_idx))) {
+        LOG_WARN("Fail to push back cg idx", K(ret));
+      }
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(columns_.assign(tmp_cols))) {
+      LOG_WARN("fail to assign columns", K(ret));
+    } else if (OB_FAIL(read_info_.init(
+                allocator_,
+                schema->get_column_count(),
+                schema_rowkey_cnt,
+                lib::is_oracle_mode(),
+                tmp_col_descs,
+                &tmp_cols_index,
+                &tmp_cols,
+                use_cs ? &tmp_cg_idxs : nullptr,
+                nullptr/*cols_extend*/,
+                true/*has_all_column_group*/,
+                false/*is_cg_sstable*/,
+                need_truncate_filter,
+                is_delete_insert(),
+                schema->get_micro_block_format_version(),
+                has_ttl_definition))) {
+      LOG_WARN("Fail to init read info", K(ret));
+    } else if (!col_map_.is_inited()) {
+      if (OB_FAIL(col_map_.init(tmp_cols))) {
+        LOG_WARN("failed to create column map", K(ret), K_(columns));
+      }
+    }
+  }
+  LOG_DEBUG("Generated read info", K_(read_info));
+  read_param_version_ = storage::ObCGReadInfo::MIX_READ_INFO_LOCAL_CACHE;
+  if (OB_SUCC(ret) && use_cs && tmp_cg_idxs.count() <= storage::ObCGReadInfo::get_local_max_cg_cnt()) {
+    // construct cg read infos
+    void *tmp_ptr  = nullptr;
+    int64_t cg_cnt = tmp_cg_idxs.count();
+    ObArray<storage::ObTableReadInfo *> tmp_read_infos;
+    if (OB_UNLIKELY(tmp_col_descs.count() != cg_cnt)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("Unexpected not equal col count", K(ret), K(cg_cnt), K(tmp_col_descs.count()));
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < cg_cnt; i++) {
+        storage::ObTableReadInfo *cur_read_info = nullptr;
+        if (0 > tmp_cg_idxs.at(i)) {
+        } else if (OB_ISNULL(tmp_ptr = allocator_.alloc(sizeof(storage::ObTableReadInfo)))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("alloc failed", K(ret));
+        } else if (FALSE_IT(cur_read_info = new (tmp_ptr) storage::ObTableReadInfo())) {
+        } else if (OB_FAIL(storage::ObTenantCGReadInfoMgr::construct_cg_read_info(allocator_,
+                                                                                  read_info_.is_oracle_mode(),
+                                                                                  tmp_col_descs.at(i),
+                                                                                  tmp_cols.at(i),
+                                                                                  *cur_read_info))) {
+          LOG_WARN("Fail to init cg read info", K(ret));
+        }
+        if (OB_SUCC(ret) && OB_FAIL(tmp_read_infos.push_back(cur_read_info))) {
+          LOG_WARN("Fail to push back read info", K(ret));
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(cg_read_infos_.init_and_assign(tmp_read_infos, allocator_))) {
+        LOG_WARN("Fail to add read infos", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTableSchemaParam::is_rowkey_column(const uint64_t column_id, bool &is_rowkey) const
+{
+  int ret = OB_SUCCESS;
+  int32_t idx = -1;
+  if (OB_FAIL(col_map_.get(column_id, idx)) && OB_HASH_NOT_EXIST != ret) {
+    LOG_WARN("get idx from column map fail", K(ret), K(column_id));
+  } else {
+    is_rowkey = (idx >= 0 && idx < read_info_.get_schema_rowkey_count());
+  }
+  return ret;
+}
+
+int ObTableSchemaParam::is_column_nullable_for_write(const uint64_t column_id,
+                                                     bool &is_nullable_for_write) const
+{
+  int ret = OB_SUCCESS;
+  int32_t idx = -1;
+  if (OB_FAIL(col_map_.get(column_id, idx)) && OB_HASH_NOT_EXIST != ret) {
+    LOG_WARN("get idx from column map fail", K(ret), K(column_id));
+  } else if (idx < 0) {
+    ret = OB_SCHEMA_ERROR;
+    LOG_WARN("column not exist", K(ret), K(column_id));
+  } else {
+    is_nullable_for_write = columns_.at(idx)->is_nullable_for_write();
+    // Becasue of the mlog's primary key is composed of the base table's partition key, we skip the null check.
+    //
+    // The base table itself is responsible for enforcing constraints on its partition key.
+    // Trusting the upstream source (the base table) simplifies logic and prevents unnecessary failures like index.
+    if (!is_nullable_for_write && OB_UNLIKELY(get_table_type() == ObTableType::MATERIALIZED_VIEW_LOG)) {
+      bool is_hidden = false;
+      bool is_rowkey = false;
+      const ObColumnParam *col = get_column(column_id);
+      if (OB_ISNULL(col)) {
+        ret = OB_SCHEMA_ERROR;
+        LOG_WARN("column schema is null", K(ret), K(column_id));
+      } else if (OB_FAIL(is_rowkey_column(column_id, is_rowkey))) {
+        LOG_WARN("fail to get is rowkey column", K(ret));
+      } else {
+        is_hidden = col->is_hidden();
+      }
+      if (!is_hidden && is_rowkey) {
+        is_nullable_for_write = true;
+      }
+    }
+  }
+  return ret;
+}
+
+const ObColumnParam * ObTableSchemaParam::get_column(const uint64_t column_id) const
+{
+  int ret = OB_SUCCESS;
+  const ObColumnParam * ptr = NULL;
+  int32_t idx = -1;
+  if (OB_FAIL(col_map_.get(column_id, idx)) && OB_HASH_NOT_EXIST != ret) {
+    LOG_WARN("get idx from column map fail", K(ret), K(column_id));
+  } else if (idx < 0) {
+    // do nothing
+  } else {
+    ptr = get_column_by_idx(idx);
+  }
+  return ptr;
+}
+
+const ObColumnParam * ObTableSchemaParam::get_column_by_idx(const int64_t idx) const
+{
+  const ObColumnParam * ptr = NULL;
+  if (idx < 0 || idx >= columns_.count()) {
+    LOG_WARN_RET(OB_INVALID_ARGUMENT, "idx out of range", K(idx), K(columns_.count()), K(lbt()));
+  } else {
+    ptr = columns_.at(idx);
+  }
+  return ptr;
+}
+
+ObColumnParam * ObTableSchemaParam::get_column_by_idx(const int64_t idx)
+{
+  ObColumnParam * ptr = NULL;
+  if (idx < 0 || idx >= columns_.count()) {
+    LOG_WARN_RET(OB_INVALID_ARGUMENT, "idx out of range", K(idx), K(columns_.count()), K(lbt()));
+  } else {
+    ptr = columns_.at(idx);
+  }
+  return ptr;
+}
+
+const ObColumnParam * ObTableSchemaParam::get_rowkey_column_by_idx(const int64_t idx) const
+{
+  const ObColumnParam * ptr = NULL;
+  if (idx < 0 || idx >= read_info_.get_schema_rowkey_count()) {
+    LOG_WARN_RET(OB_INVALID_ARGUMENT, "idx out of range", K(idx), K(read_info_.get_schema_rowkey_count()));
+  } else {
+    ptr = columns_.at(idx);
+  }
+  return ptr;
+}
+
+int ObTableSchemaParam::get_rowkey_column_ids(ObIArray<ObColDesc> &column_ids) const
+{
+  int ret = OB_SUCCESS;
+  if (!is_valid()) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("param not inited", K(ret), K(*this));
+  } else {
+    const ObColumnParam *param = NULL;
+    ObColDesc col_desc;
+    for (int64_t i = 0; OB_SUCC(ret) && i < read_info_.get_schema_rowkey_count(); ++i) {
+      if (OB_ISNULL(param = columns_.at(i))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("column param is NULL", K(ret), K(i));
+      } else {
+        col_desc.col_id_ = static_cast<uint32_t>(param->get_column_id());
+        col_desc.col_order_ = param->get_column_order();
+        col_desc.col_type_ = param->get_meta_type();
+        col_desc.col_type_.set_scale(param->get_accuracy().get_scale());
+        if (OB_FAIL(column_ids.push_back(col_desc))) {
+          LOG_WARN("Fail to add rowkey column id to column_ids", K(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTableSchemaParam::get_rowkey_column_ids(ObIArray<uint64_t> &column_ids) const
+{
+  int ret = OB_SUCCESS;
+  if (!is_valid()) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("param not inited", K(ret), K(*this));
+  } else {
+    const ObColumnParam *param = NULL;
+    for (int64_t i = 0; OB_SUCC(ret) && i < read_info_.get_schema_rowkey_count(); ++i) {
+      if (OB_ISNULL(param = columns_.at(i))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("column param is NULL", K(ret), K(i));
+      } else if (OB_FAIL(column_ids.push_back(param->get_column_id()))) {
+        LOG_WARN("Fail to add rowkey column id to column_ids", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTableSchemaParam::get_index_name(common::ObString &index_name) const
+{
+  int ret = OB_SUCCESS;
+  if (!is_index_table()) {
+    ret = OB_SCHEMA_ERROR;
+    LOG_WARN("table is not index table", K(ret), K(table_id_), K(table_type_));
+  } else {
+    index_name.assign_ptr(index_name_.ptr(), index_name_.length());
+  }
+  return ret;
+}
+
+const ObString &ObTableSchemaParam::get_pk_name() const
+{
+  return pk_name_;
+}
+
+bool ObTableSchemaParam::is_depend_column(uint64_t column_id) const
+{
+  bool is_depend = false;
+  int32_t idx = 0;
+  if (is_materialized_view() &&
+      column_id > OB_MIN_MV_COLUMN_ID &&
+      column_id < OB_MIN_SHADOW_COLUMN_ID &&
+      OB_SUCCESS == col_map_.get(column_id, idx)) {
+    is_depend = true;
+  }
+  return is_depend;
+}
+
+int ObTableSchemaParam::get_typed_doc_id_col_id(uint64_t &doc_id_col_id, ObDocIDType &type) const
+{
+  int ret = OB_SUCCESS;
+  if ((doc_id_col_id_ != OB_INVALID_ID && inc_pk_doc_id_col_id_ != OB_INVALID_ID)
+      || (doc_id_col_id_ == OB_INVALID_ID && inc_pk_doc_id_col_id_ == OB_INVALID_ID)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("One and only one id should be valid", K(ret), K(doc_id_col_id_), K(inc_pk_doc_id_col_id_));
+  } else if (doc_id_col_id_ != OB_INVALID_ID) {
+    doc_id_col_id = doc_id_col_id_;
+    type = ObDocIDType::TABLET_SEQUENCE;
+  } else if (inc_pk_doc_id_col_id_ != OB_INVALID_ID) {
+    doc_id_col_id = inc_pk_doc_id_col_id_;
+    type = ObDocIDType::HIDDEN_INC_PK;
+  }
+  return ret;
+}
+
+ObDocIDType ObTableSchemaParam::get_multivalue_doc_id_type() const
+{
+  ObDocIDType type = ObDocIDType::INVALID;
+  if (doc_id_col_id_ != OB_INVALID_ID) {
+    type = ObDocIDType::TABLET_SEQUENCE;
+  } else {
+    type = ObDocIDType::HIDDEN_INC_PK;
+  }
+  return type;
+}
+
+int64_t ObTableSchemaParam::to_string(char *buf, const int64_t buf_len) const
+{
+  int64_t pos = 0;
+  J_OBJ_START();
+  J_KV(K_(table_id),
+       K_(schema_version),
+       K_(table_type),
+       K_(index_type),
+       K_(index_status),
+       K_(shadow_rowkey_column_num),
+       K_(doc_id_col_id),
+       K_(fulltext_col_id),
+       K_(index_name),
+       K_(fts_parser_name),
+       K_(fts_parser_properties),
+       K_(pk_name),
+       K_(columns),
+       K_(read_info),
+       K_(lob_inrow_threshold),
+       K_(inc_pk_doc_id_col_id));
+
+  J_OBJ_END();
+  return pos;
+}
+
+OB_DEF_SERIALIZE(ObTableSchemaParam)
+{
+  int ret = OB_SUCCESS;
+  LST_DO_CODE(OB_UNIS_ENCODE,
+              table_id_,
+              schema_version_,
+              table_type_,
+              index_type_,
+              index_status_,
+              shadow_rowkey_column_num_,
+              fulltext_col_id_);
+
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(index_name_.serialize(buf, buf_len, pos))) {
+      LOG_WARN("failed to serialize index name", K(ret));
+    } else if (OB_FAIL(ObTableParam::serialize_columns(columns_, buf, buf_len, pos))) {
+      LOG_WARN("failed to serialize columns", K(ret));
+    }
+  }
+  OB_UNIS_ENCODE(read_info_);
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(pk_name_.serialize(buf, buf_len, pos))) {
+      LOG_WARN("failed to serialize pk name", K(ret));
+    }
+  }
+  OB_UNIS_ENCODE(spatial_geo_col_id_);
+  OB_UNIS_ENCODE(spatial_cellid_col_id_);
+  OB_UNIS_ENCODE(spatial_mbr_col_id_);
+  OB_UNIS_ENCODE(lob_inrow_threshold_);
+  OB_UNIS_ENCODE(read_param_version_);
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(serialization::encode_vi64(buf, buf_len, pos, cg_read_infos_.count()))) {
+      LOG_WARN("Fail to encode column count", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < cg_read_infos_.count(); ++i) {
+      if (nullptr != cg_read_infos_.at(i) && OB_FAIL(cg_read_infos_.at(i)->serialize(buf, buf_len, pos))) {
+        LOG_WARN("Fail to serialize column", K(ret));
+      }
+    }
+  }
+  OB_UNIS_ENCODE(multivalue_col_id_);
+  OB_UNIS_ENCODE(multivalue_arr_col_id_);
+  OB_UNIS_ENCODE(data_table_rowkey_column_num_);
+  OB_UNIS_ENCODE(doc_id_col_id_);
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(fts_parser_name_.serialize(buf, buf_len, pos))) {
+      LOG_WARN("fail to serialize fts parser name", K(ret));
+    }
+  }
+  OB_UNIS_ENCODE(vec_id_col_id_);
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(vec_index_param_.serialize(buf, buf_len, pos))) {
+      LOG_WARN("failed to serialize vec index param", K(ret));
+    }
+  }
+  OB_UNIS_ENCODE(vec_dim_);
+  OB_UNIS_ENCODE(vec_vector_col_id_);
+  if (FAILEDx(fts_parser_properties_.serialize(buf, buf_len, pos))) {
+    LOG_WARN("fail to serialize fts parser properties", K(ret));
+  }
+  OB_UNIS_ENCODE(is_delete_insert_);
+  OB_UNIS_ENCODE(merge_engine_type_);
+  OB_UNIS_ENCODE(inc_pk_doc_id_col_id_);
+  OB_UNIS_ENCODE(vec_chunk_col_id_);
+  OB_UNIS_ENCODE(vec_embedded_col_id_);
+  OB_UNIS_ENCODE(search_idx_included_cids_);
+  OB_UNIS_ENCODE(search_idx_included_cid_idxes_);
+  // serialize search_idx_arr_types_
+  {
+    int64_t arr_types_count = search_idx_arr_types_.count();
+    OB_UNIS_ENCODE(arr_types_count);
+    for (int64_t i = 0; OB_SUCC(ret) && i < arr_types_count; ++i) {
+      bool has_type = (search_idx_arr_types_.at(i) != nullptr);
+      OB_UNIS_ENCODE(has_type);
+      if (OB_SUCC(ret) && has_type) {
+        if (OB_FAIL(search_idx_arr_types_.at(i)->serialize(buf, buf_len, pos))) {
+          LOG_WARN("failed to serialize arr type", K(ret), K(i));
+        }
+      }
+    }
+  }
+  OB_UNIS_ENCODE(fts_index_type_);
+  OB_UNIS_ENCODE(is_rowscn_ttl_table_);
+  OB_UNIS_ENCODE(is_table_without_pk_);
+  OB_UNIS_ENCODE(search_idx_column_comments_);
+  return ret;
+}
+
+OB_DEF_DESERIALIZE(ObTableSchemaParam)
+{
+  int ret = OB_SUCCESS;
+  LST_DO_CODE(OB_UNIS_DECODE,
+              table_id_,
+              schema_version_,
+              table_type_,
+              index_type_,
+              index_status_,
+              shadow_rowkey_column_num_,
+              fulltext_col_id_);
+
+  if (OB_SUCC(ret)) {
+    ObString tmp_name;
+    if (OB_FAIL(tmp_name.deserialize(buf, data_len, pos))) {
+      LOG_WARN("failed to deserialize index name", K(ret));
+    } else if (OB_FAIL(ob_write_string(allocator_, tmp_name, index_name_))) {
+      LOG_WARN("failed to copy index name", K(ret), K(tmp_name));
+    } else if (OB_FAIL(ObTableParam::deserialize_columns(buf, data_len, pos, columns_, allocator_))) {
+      LOG_WARN("failed to deserialize columns", K(ret));
+    } else if (!col_map_.is_inited()) {
+      if (OB_FAIL(col_map_.init(columns_))) {
+        LOG_WARN("failed to create column map", K(ret), K_(columns));
+      }
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(read_info_.deserialize(allocator_, buf, data_len, pos))) {
+    LOG_WARN("Fail to deserialize read_info", K(ret));
+  }
+  // for compatibility: at least need two bytes to deserialize an ObString
+  const int64_t MINIMAL_NEEDED_SIZE = 2;
+  if (OB_SUCC(ret) && (data_len - pos) > MINIMAL_NEEDED_SIZE) {
+     ObString tmp_name;
+     if (OB_FAIL(tmp_name.deserialize(buf, data_len, pos))) {
+       LOG_WARN("failed to deserialize pk name", K(ret), K(data_len), K(pos));
+     } else if (OB_FAIL(ob_write_string(allocator_, tmp_name, pk_name_))) {
+       LOG_WARN("failed to copy pk name", K(ret), K(tmp_name));
+     }
+  }
+  OB_UNIS_DECODE(spatial_geo_col_id_);
+  OB_UNIS_DECODE(spatial_cellid_col_id_);
+  OB_UNIS_DECODE(spatial_mbr_col_id_);
+  OB_UNIS_DECODE(lob_inrow_threshold_);
+  if (OB_SUCC(ret) && pos == data_len) {
+    // Here is to solve the compatibility problem and correct the `index_type_` and `index_status_`.
+    //
+    // Before version 4.3.1.0, the default value of `index_type_` and `index_sattus_` was max. In
+    // version 4.3.1.0, the full-text search and json multi-value indexes were introduced. If the
+    // RPC request from older version observer is received, the `index_type_` will be mistaken for
+    // a valid json multi-valued index.
+    //
+    // Therefore, if there are still unresolved fields here, it means that it is a new version
+    // observer. It is necessary to re-assign the initial values to the `index_type_` and
+    // `index_status_` to avoid misjudgment as a valid index.
+
+
+    // ATTENTION!!!
+    // The front-end version is currently only 4.2.x, and its value of max index type is 13.
+    if (13 == index_type_) {
+      index_type_ = INDEX_TYPE_IS_NOT;
+    }
+  }
+  OB_UNIS_DECODE(read_param_version_);
+  if (OB_SUCC(ret) && pos < data_len) {
+    int64_t cg_read_info_cnt = 0;
+    if (OB_FAIL(serialization::decode_vi64(buf, data_len, pos, &cg_read_info_cnt))) {
+      LOG_WARN("Fail to decode cg read info count", K(ret));
+    } else if (cg_read_info_cnt > 0) {
+      void *tmp_ptr  = nullptr;
+      const common::ObIArray<int32_t> *access_cgs = read_info_.get_cg_idxs();
+      if (OB_UNLIKELY(nullptr == access_cgs || access_cgs->count() != cg_read_info_cnt ||
+                      storage::ObCGReadInfo::MIX_READ_INFO_LOCAL_CACHE != read_param_version_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("Unexpected cg read count", K(ret), KPC(access_cgs), K(cg_read_info_cnt), K_(read_param_version));
+      } else {
+        ObArray<storage::ObTableReadInfo *> tmp_read_infos;
+        for (int64_t i = 0; OB_SUCC(ret) && i < cg_read_info_cnt; ++i) {
+          storage::ObTableReadInfo *cur_read_info = nullptr;
+          if (0 > access_cgs->at(i)) {
+          } else if (OB_ISNULL(tmp_ptr = allocator_.alloc(sizeof(storage::ObTableReadInfo)))) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+            LOG_WARN("alloc failed", K(ret));
+          } else if (FALSE_IT(cur_read_info = new (tmp_ptr) storage::ObTableReadInfo())) {
+          } else if (OB_FAIL(cur_read_info->deserialize(allocator_, buf, data_len, pos))) {
+            LOG_WARN("Fail to deserialize read info", K(ret));
+          }
+
+          if (OB_SUCC(ret) && OB_FAIL(tmp_read_infos.push_back(cur_read_info))) {
+            LOG_WARN("Fail to add read info", K(ret));
+          }
+        }
+        if (OB_SUCC(ret) && OB_FAIL(cg_read_infos_.init_and_assign(tmp_read_infos, allocator_))) {
+          LOG_WARN("Fail to add read infos", K(ret));
+        }
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && pos == data_len) {
+    // Here is to solve the compatibility problem and correct the `index_type_` and `index_status_`.
+    //
+    // Before version 4.3.1.0, the default value of `index_type_` and `index_sattus_` was max. In
+    // version 4.3.1.0, the full-text search and json multi-value indexes were introduced. If the
+    // RPC request from older version observer is received, the `index_type_` will be mistaken for
+    // a valid json multi-valued index.
+    //
+    // Therefore, if there are still unresolved fields here, it means that it is a new version
+    // observer. It is necessary to re-assign the initial values to the `index_type_` and
+    // `index_status_` to avoid misjudgment as a valid index.
+
+
+    // ATTENTION!!!
+    // The front-end version is currently only 4.3.0.x, and its value of max index type is 23.
+    if (23 == index_type_) {
+      index_type_ = INDEX_TYPE_IS_NOT;
+    }
+    // ATTENTION!!!
+    // The front-end version is currently only 4.3.0.x, and its value of max index status is 8.
+    if (8 == index_status_) {
+      index_status_ = INDEX_STATUS_NOT_FOUND;
+    }
+  }
+
+  OB_UNIS_DECODE(multivalue_col_id_);
+  OB_UNIS_DECODE(multivalue_arr_col_id_);
+  OB_UNIS_DECODE(data_table_rowkey_column_num_);
+  OB_UNIS_DECODE(doc_id_col_id_)
+
+  if (OB_SUCC(ret) && pos < data_len) {
+    ObString tmp_name;
+    if (OB_FAIL(tmp_name.deserialize(buf, data_len, pos))) {
+      LOG_WARN("fail to deserialize fts parser name", K(ret));
+    } else if (OB_FAIL(ob_write_string(allocator_, tmp_name, fts_parser_name_))) {
+      LOG_WARN("fail to copy fts parser name", K(ret), K(tmp_name));
+    }
+  }
+  OB_UNIS_DECODE(vec_id_col_id_);
+  if (OB_SUCC(ret) && pos < data_len) {
+    ObString tmp_vec_index_param;
+    if (OB_FAIL(tmp_vec_index_param.deserialize(buf, data_len, pos))) {
+      LOG_WARN("fail to deserialize vec index param", K(ret));
+    } else if (OB_FAIL(ob_write_string(allocator_, tmp_vec_index_param, vec_index_param_))) {
+      LOG_WARN("fail to copy vec index param", K(ret), K(tmp_vec_index_param));
+    }
+  }
+  OB_UNIS_DECODE(vec_dim_);
+  OB_UNIS_DECODE(vec_vector_col_id_);
+  if (OB_SUCC(ret) && pos < data_len) {
+    ObString tmp_properties;
+    if (OB_FAIL(tmp_properties.deserialize(buf, data_len, pos))) {
+      LOG_WARN("fail to deserialize fts parser properties", K(ret));
+    } else if (OB_FAIL(ob_write_string(allocator_, tmp_properties, fts_parser_properties_))) {
+      LOG_WARN("fail to copy fts parser properties", K(ret), K(tmp_properties));
+    }
+  }
+  OB_UNIS_DECODE(is_delete_insert_);
+  OB_UNIS_DECODE(merge_engine_type_);
+  // If the merge_engine_type is unknown, it means it's upgrade from a old version which doesn't have this field. (before 4.4.1)
+  // At this time, the valid merge_engine is only delete-insert or partial-update.
+  if (OB_SUCC(ret) && merge_engine_type_ == ObMergeEngineType::OB_MERGE_ENGINE_UNKNOWN) {
+    merge_engine_type_ = is_delete_insert_ ? ObMergeEngineType::OB_MERGE_ENGINE_DELETE_INSERT
+                                           : ObMergeEngineType::OB_MERGE_ENGINE_PARTIAL_UPDATE;
+  }
+
+  OB_UNIS_DECODE(inc_pk_doc_id_col_id_);
+  OB_UNIS_DECODE(vec_chunk_col_id_);
+  OB_UNIS_DECODE(vec_embedded_col_id_);
+  OB_UNIS_DECODE(search_idx_included_cids_);
+  OB_UNIS_DECODE(search_idx_included_cid_idxes_);
+  // deserialize search_idx_arr_types_
+  {
+    int64_t arr_types_count = 0;
+    OB_UNIS_DECODE(arr_types_count);
+    if (OB_SUCC(ret) && arr_types_count > 0) {
+      if (OB_FAIL(search_idx_arr_types_.prepare_allocate(arr_types_count))) {
+        LOG_WARN("failed to allocate arr types", K(ret), K(arr_types_count));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < arr_types_count; ++i) {
+        bool has_type = false;
+        OB_UNIS_DECODE(has_type);
+        if (OB_SUCC(ret) && has_type) {
+          ObCollectionArrayType *arr_type = OB_NEWx(ObCollectionArrayType, &allocator_, allocator_);
+          if (OB_ISNULL(arr_type)) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+            LOG_WARN("failed to allocate ObCollectionArrayType", K(ret), K(i));
+          } else if (OB_FAIL(arr_type->deserialize(buf, data_len, pos))) {
+            LOG_WARN("failed to deserialize arr type", K(ret), K(i));
+          } else {
+            search_idx_arr_types_.at(i) = arr_type;
+          }
+        } else {
+          search_idx_arr_types_.at(i) = nullptr;
+        }
+      }
+    }
+  }
+  OB_UNIS_DECODE(fts_index_type_);
+  OB_UNIS_DECODE(is_rowscn_ttl_table_);
+  OB_UNIS_DECODE(is_table_without_pk_);
+  OB_UNIS_DECODE(search_idx_column_comments_);
+  return ret;
+}
+
+OB_DEF_SERIALIZE_SIZE(ObTableSchemaParam)
+{
+  int ret = OB_SUCCESS;
+  int64_t len = 0;
+
+  LST_DO_CODE(OB_UNIS_ADD_LEN,
+              table_id_,
+              schema_version_,
+              table_type_,
+              index_type_,
+              index_status_,
+              shadow_rowkey_column_num_,
+              fulltext_col_id_);
+  len += index_name_.get_serialize_size();
+
+  if (OB_SUCC(ret)) {
+    int64_t columns_size = 0;
+    if (OB_FAIL(ObTableParam::get_columns_serialize_size(columns_, columns_size))) {
+      LOG_WARN("failed to get columns serialize size", K(ret));
+    } else {
+      len += columns_size;
+    }
+  }
+  OB_UNIS_ADD_LEN(read_info_);
+  len += pk_name_.get_serialize_size();
+  OB_UNIS_ADD_LEN(spatial_geo_col_id_);
+  OB_UNIS_ADD_LEN(spatial_cellid_col_id_);
+  OB_UNIS_ADD_LEN(spatial_mbr_col_id_);
+  OB_UNIS_ADD_LEN(lob_inrow_threshold_);
+  OB_UNIS_ADD_LEN(read_param_version_);
+  if (OB_SUCC(ret)) {
+    len += serialization::encoded_length_vi64(cg_read_infos_.count());
+    for (int64_t i = 0; OB_SUCC(ret) && i < cg_read_infos_.count(); ++i) {
+      if (nullptr != cg_read_infos_.at(i)) {
+        len += cg_read_infos_.at(i)->get_serialize_size();
+      }
+    }
+  }
+
+  OB_UNIS_ADD_LEN(multivalue_col_id_);
+  OB_UNIS_ADD_LEN(multivalue_arr_col_id_);
+  OB_UNIS_ADD_LEN(data_table_rowkey_column_num_);
+  OB_UNIS_ADD_LEN(doc_id_col_id_);
+  len += fts_parser_name_.get_serialize_size();
+  OB_UNIS_ADD_LEN(vec_id_col_id_);
+  len += vec_index_param_.get_serialize_size();
+  OB_UNIS_ADD_LEN(vec_dim_);
+  OB_UNIS_ADD_LEN(vec_vector_col_id_);
+  len += fts_parser_properties_.get_serialize_size();
+  OB_UNIS_ADD_LEN(is_delete_insert_);
+  OB_UNIS_ADD_LEN(merge_engine_type_);
+  OB_UNIS_ADD_LEN(inc_pk_doc_id_col_id_);
+  OB_UNIS_ADD_LEN(vec_chunk_col_id_);
+  OB_UNIS_ADD_LEN(vec_embedded_col_id_);
+  OB_UNIS_ADD_LEN(search_idx_included_cids_);
+  OB_UNIS_ADD_LEN(search_idx_included_cid_idxes_);
+  // search_idx_arr_types_ serialize size
+  {
+    int64_t arr_count = search_idx_arr_types_.count();
+    OB_UNIS_ADD_LEN(arr_count);
+    for (int64_t i = 0; i < arr_count; ++i) {
+      bool has_type = (search_idx_arr_types_.at(i) != nullptr);
+      OB_UNIS_ADD_LEN(has_type);
+      if (has_type) {
+        len += search_idx_arr_types_.at(i)->get_serialize_size();
+      }
+    }
+  }
+  OB_UNIS_ADD_LEN(fts_index_type_);
+  OB_UNIS_ADD_LEN(is_rowscn_ttl_table_);
+  OB_UNIS_ADD_LEN(is_table_without_pk_);
+  OB_UNIS_ADD_LEN(search_idx_column_comments_);
+  return len;
+}
+
+int ObTableSchemaParam::has_udf_column(bool &has_udf) const
+{
+  int ret = OB_SUCCESS;
+  has_udf = false;
+  const ObColumnParam *param = nullptr;
+  for (int64_t i = 0; OB_SUCC(ret) && i < columns_.count() && !has_udf; ++i) {
+    if (OB_ISNULL(param = columns_.at(i))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get column failed", K(ret), KP(param));
+    } else {
+      has_udf = param->is_gen_col_udf_expr();
+    }
+  }
+  return ret;
+}
+
+int ObTableSchemaParam::set_search_index_column_comments(const common::ObIArray<ObString> &column_comments)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(search_idx_column_comments_.assign(column_comments))) {
+    LOG_WARN("failed to assign search index column configs", K(ret));
+  }
+  return ret;
+}
+
+int ObTableSchemaParam::set_search_index_included_cids(const common::ObIArray<uint64_t> &cids)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(search_idx_included_cids_.assign(cids))) {
+    LOG_WARN("failed to assign search index included cids", K(ret));
+  }
+  return ret;
+}
+
+int ObTableSchemaParam::set_search_index_included_cid_idxes(const common::ObIArray<int32_t> &cid_idxes)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(search_idx_included_cid_idxes_.assign(cid_idxes))) {
+    LOG_WARN("failed to assign search index included cid idxes", K(ret));
+  }
+  return ret;
+}
+
+int ObTableSchemaParam::set_search_index_arr_types(const common::ObIArray<ObCollectionArrayType*> &arr_types)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(search_idx_arr_types_.prepare_allocate(arr_types.count()))) {
+    LOG_WARN("failed to allocate arr types", K(ret), K(arr_types.count()));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < arr_types.count(); ++i) {
+    if (OB_NOT_NULL(arr_types.at(i))) {
+      ObCollectionTypeBase *dst = nullptr;
+      if (OB_FAIL(arr_types.at(i)->deep_copy(allocator_, dst))) {
+        LOG_WARN("failed to deep copy arr type", K(ret), K(i));
+      } else {
+        search_idx_arr_types_.at(i) = static_cast<ObCollectionArrayType*>(dst);
+      }
+    } else {
+      search_idx_arr_types_.at(i) = nullptr;
+    }
+  }
+  return ret;
+}
+
+// ------ ObTableDMLParam ------ //
+ObTableDMLParam::ObTableDMLParam(common::ObIAllocator &allocator)
+  : allocator_(allocator),
+    tenant_schema_version_(OB_INVALID_VERSION),
+    data_table_(allocator),
+    col_descs_(allocator),
+    col_map_(allocator),
+    has_delete_old_row_log_projection_(false),
+    delete_old_row_log_column_idxs_(allocator)
+{
+}
+
+ObTableDMLParam::~ObTableDMLParam()
+{
+  reset();
+}
+
+void ObTableDMLParam::reset()
+{
+  tenant_schema_version_ = OB_INVALID_VERSION;
+  data_table_.reset();
+  col_descs_.reset();
+  col_map_.clear();
+  has_delete_old_row_log_projection_ = false;
+  delete_old_row_log_column_idxs_.reset();
+}
+
+int ObTableDMLParam::convert(const ObTableSchema *table_schema,
+                             const int64_t tenant_schema_version,
+                             const common::ObIArray<uint64_t> &column_ids)
+{
+  int ret = OB_SUCCESS;
+  const ObTableSchema *schema = NULL;
+  if (OB_ISNULL(table_schema) || OB_INVALID_VERSION == tenant_schema_version) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(tenant_schema_version), KP(table_schema));
+  } else if (OB_FAIL(data_table_.convert(table_schema))) {
+    LOG_WARN("convert data table fail", K(ret));
+  } else if (OB_FAIL(prepare_storage_param(column_ids))) {
+    LOG_WARN("prepare storage param fail", K(ret));
+  } else {
+    tenant_schema_version_ = tenant_schema_version;
+  }
+  return ret;
+}
+
+// Collect key columns required by DELETE logs, and expand generated-column dependencies.
+// Call only during preparation, using the existing schema guard.
+int ObTableDMLParam::get_delete_old_row_log_column_ids_(
+    ObSchemaGetterGuard &schema_guard,
+    const ObTableSchema &table_schema,
+    ObIArray<uint64_t> &column_ids)
+{
+  int ret = OB_SUCCESS;
+  column_ids.reuse();
+  ObSEArray<ObAuxTableMetaInfo, 16> index_infos;
+  // For tables with hidden primary-key columns, the rowkey may not cover partition or subpartition keys.
+  // Preserve the rowkey, partition keys, and subpartition keys together.
+  if (table_schema.is_table_with_hidden_pk_column()) {
+    if (OB_FAIL(table_schema.get_rowkey_partkey_column_ids(column_ids))) {
+      LOG_WARN("get delete log rowkey and partition key columns failed", KR(ret),
+          K(table_schema.get_table_id()));
+    }
+  } else if (OB_FAIL(table_schema.get_rowkey_column_ids(column_ids))) {
+    LOG_WARN("get delete log rowkey columns failed", KR(ret), K(table_schema.get_table_id()));
+  }
+
+  // Unique-key columns.
+  if (FAILEDx(table_schema.get_simple_index_infos(index_infos))) {
+    LOG_WARN("get delete log index schemas failed", KR(ret), K(table_schema.get_table_id()));
+  }
+  ObSEArray<uint64_t, 16> index_column_ids;
+  for (int64_t i = 0; OB_SUCC(ret) && (i < index_infos.count()); ++i) {
+    const ObTableSchema *index_schema = nullptr;
+    if (OB_FAIL(schema_guard.get_table_schema(
+        table_schema.get_tenant_id(), index_infos.at(i).table_id_, index_schema))) {
+      LOG_WARN("get delete log index schema failed", KR(ret), K(index_infos.at(i)));
+    } else if (OB_ISNULL(index_schema)) {
+      ret = OB_TABLE_NOT_EXIST;
+      LOG_WARN("delete log index schema does not exist", KR(ret), K(index_infos.at(i)));
+    } else if (index_schema->is_unique_index()) {
+      index_column_ids.reuse();
+      if (OB_FAIL(index_schema->get_index_info().get_column_ids(index_column_ids))) {
+        LOG_WARN("get delete log unique key columns failed", KR(ret), K(index_infos.at(i)));
+      } else if (OB_FAIL(append_array_no_dup(column_ids, index_column_ids))) {
+        LOG_WARN("append delete log unique key columns failed", KR(ret), K(index_infos.at(i)));
+      }
+    }
+  }
+
+  // Expand dependencies of generated columns among the selected primary-key and unique-key columns.
+  ObSEArray<uint64_t, 4> dependent_column_ids;
+  for (int64_t i = 0; OB_SUCC(ret) && (i < column_ids.count()); ++i) {
+    const uint64_t column_id = column_ids.at(i);
+    const ObColumnSchemaV2 *column = table_schema.get_column_schema(column_id);
+    if (OB_ISNULL(column)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("delete log key column missing from data table", KR(ret), K(column_id),
+          K(table_schema.get_table_id()));
+    } else if (column->is_generated_column()) {
+      dependent_column_ids.reuse();
+      if (OB_FAIL(column->get_cascaded_column_ids(dependent_column_ids))) {
+        LOG_WARN("get delete log generated column dependencies failed", KR(ret), K(column_id));
+      } else if (OB_FAIL(append_array_no_dup(column_ids, dependent_column_ids))) {
+        LOG_WARN("append delete log generated column dependencies failed", KR(ret), K(column_id));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTableDMLParam::prepare_delete_old_row_log_projection(
+    ObSchemaGetterGuard &schema_guard,
+    const ObTableSchema &table_schema)
+{
+  int ret = OB_SUCCESS;
+  has_delete_old_row_log_projection_ = false;
+  delete_old_row_log_column_idxs_.reset();
+  const int64_t rowkey_column_cnt = data_table_.get_rowkey_column_num();
+  ObSEArray<uint64_t, 16> key_column_ids;
+  ObSEArray<int64_t, 16> column_idxs;
+  bool has_not_null_uk = false;
+  bool has_pruned_column = false;
+  if (OB_UNLIKELY(!data_table_.is_valid()
+      || (table_schema.get_table_id() != data_table_.get_table_id())
+      || (table_schema.get_schema_version() != data_table_.get_schema_version())
+      || (table_schema.get_rowkey_column_num() != rowkey_column_cnt))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("delete log projection table layout mismatch", KR(ret), K(data_table_),
+        K(table_schema.get_table_id()), K(table_schema.get_schema_version()),
+        K(table_schema.get_rowkey_column_num()));
+  } else if (USER_TABLE != data_table_.get_table_type()) {
+    // Do not prune columns for non-USER_TABLE tables.
+  } else if (OB_UNLIKELY((rowkey_column_cnt <= 0) || (rowkey_column_cnt > col_descs_.count()))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid delete log rowkey column count", KR(ret), K(rowkey_column_cnt), K(col_descs_));
+  } else if (table_schema.is_table_with_hidden_pk_column()
+      && OB_FAIL(table_schema.has_not_null_unique_key(schema_guard, has_not_null_uk))) {
+    LOG_WARN("check delete log heap table unique keys failed", KR(ret), K(data_table_.get_table_id()));
+  } else if (table_schema.is_table_with_hidden_pk_column() && !has_not_null_uk) {
+    // Do not prune heap tables or CLUSTER BY tables without a NOT NULL unique key.
+  } else if (OB_FAIL(get_delete_old_row_log_column_ids_(schema_guard, table_schema, key_column_ids))) {
+    LOG_WARN("get delete log key columns failed", KR(ret), K(data_table_.get_table_id()));
+  } else {
+    // Use indices in the current execution column layout and pass them with col_descs_.
+    // The writer always preserves rowkey columns.
+    for (int64_t i = rowkey_column_cnt; OB_SUCC(ret) && (i < col_descs_.count()); ++i) {
+      const ObColDesc &col_desc = col_descs_.at(i);
+      if (OB_ISNULL(table_schema.get_column_schema(col_desc.col_id_))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("delete log column missing from table schema", KR(ret), K(i), K(col_desc),
+            K(data_table_.get_table_id()));
+      } else if (!has_exist_in_array(key_column_ids, static_cast<uint64_t>(col_desc.col_id_))) {
+        has_pruned_column = true;
+      } else if (OB_FAIL(column_idxs.push_back(i))) {
+        LOG_WARN("append delete old row log column index failed", KR(ret), K(i));
+      }
+    }
+    if (OB_SUCC(ret) && has_pruned_column) {
+      if (OB_FAIL(delete_old_row_log_column_idxs_.assign(column_idxs))) {
+        LOG_WARN("assign delete old row log column indices failed", KR(ret), K(column_idxs));
+      } else {
+        // Enable projection even for an empty array, which means logging only the rowkey.
+        has_delete_old_row_log_projection_ = true;
+      }
+    }
+  }
+  return ret;
+}
+
+int64_t ObTableDMLParam::to_string(char *buf, const int64_t buf_len) const
+{
+  int64_t pos = 0;
+  J_OBJ_START();
+  J_KV(K_(tenant_schema_version),
+       K_(data_table),
+       K_(col_descs),
+       K_(col_map),
+       K_(has_delete_old_row_log_projection),
+       K_(delete_old_row_log_column_idxs)
+       );
+  J_OBJ_END();
+
+  return pos;
+}
+
+OB_DEF_SERIALIZE(ObTableDMLParam)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(buf) || buf_len <= 0 || pos < 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments", K(ret), KP(buf), K(buf_len), K(pos));
+  } else {
+    LST_DO_CODE(OB_UNIS_ENCODE, tenant_schema_version_);
+  }
+
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(data_table_.serialize(buf, buf_len, pos))) {
+      LOG_WARN("fail to serialize data table", K(ret), K(data_table_));
+    }
+  }
+  OB_UNIS_ENCODE(col_descs_);
+  OB_UNIS_ENCODE(has_delete_old_row_log_projection_);
+  OB_UNIS_ENCODE(delete_old_row_log_column_idxs_);
+  return ret;
+}
+
+OB_DEF_DESERIALIZE(ObTableDMLParam)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(buf) || data_len <= 0 || pos < 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments", K(ret), KP(buf), K(data_len), K(pos));
+  } else {
+    LST_DO_CODE(OB_UNIS_DECODE, tenant_schema_version_);
+  }
+
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(data_table_.deserialize(buf, data_len, pos))) {
+      LOG_WARN("fail to deserialize data table", K(ret));
+    }
+  }
+  OB_UNIS_DECODE(col_descs_);
+  if (OB_SUCC(ret) && !col_descs_.empty()) {
+    if (OB_FAIL(col_map_.init(col_descs_))) {
+      LOG_WARN("init col map failed", K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && (pos < data_len)) {
+    // The old format has no such tail. The new format must read both the flag and the array.
+    if (OB_FAIL(serialization::decode(buf, data_len, pos, has_delete_old_row_log_projection_))) {
+      LOG_WARN("deserialize delete old row log projection flag failed", KR(ret), K(pos), K(data_len));
+    } else if (OB_FAIL(serialization::decode(buf, data_len, pos, delete_old_row_log_column_idxs_))) {
+      LOG_WARN("deserialize delete old row log column indices failed", KR(ret), K(pos), K(data_len));
+    }
+  }
+  return ret;
+}
+
+OB_DEF_SERIALIZE_SIZE(ObTableDMLParam)
+{
+  int ret = OB_SUCCESS;
+  int64_t len = 0;
+  int64_t size = 0;
+  LST_DO_CODE(OB_UNIS_ADD_LEN, tenant_schema_version_);
+  len += data_table_.get_serialize_size();
+  OB_UNIS_ADD_LEN(col_descs_);
+  OB_UNIS_ADD_LEN(has_delete_old_row_log_projection_);
+  OB_UNIS_ADD_LEN(delete_old_row_log_column_idxs_);
+  return len;
+}
+
+int ObTableDMLParam::prepare_storage_param(const ObIArray<uint64_t> &column_ids)
+{
+  int ret = OB_SUCCESS;
+  const int64_t col_cnt = column_ids.count();
+  if (col_cnt <= 0 || col_cnt > UINT32_MAX) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid column_ids", K(ret), K(col_cnt));
+  } else {
+    const ObColumnParam *col_param = nullptr;
+    uint64_t column_id = OB_INVALID_ID;
+    ObColDesc col_desc;
+    col_descs_.set_capacity(static_cast<uint32_t>(col_cnt));
+    for (int64_t i = 0; OB_SUCC(ret) && i < col_cnt; ++i) {
+      column_id = column_ids.at(i);
+      if (nullptr == (col_param = data_table_.get_column(column_id))) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("get column param fail", K(ret), K(column_id), KP(col_param));
+      } else {
+        col_desc.col_id_ = static_cast<uint32_t>(column_id);
+        col_desc.col_type_ = col_param->get_meta_type();
+        col_desc.col_type_.set_scale(col_param->get_accuracy().get_scale());
+        col_desc.col_order_ = col_param->get_column_order();
+        if (OB_FAIL(col_descs_.push_back(col_desc))) {
+          LOG_WARN("fail to push back column description", K(ret), K(col_desc));
+        }
+      }
+    }
+
+    // assign
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(col_map_.init(col_descs_))) {
+        LOG_WARN("fail to init column map", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObTableDMLParam::set_data_table_rowkey_tags(share::schema::ObSchemaGetterGuard *guard,
+                                                const ObTableSchema *index_schema,
+                                                const uint64_t tenant_id)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(nullptr == guard || nullptr == index_schema)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid guard or index schema", K(ret), KP(guard), KP(index_schema));
+  } else {
+    const ObTableSchema *data_table_schema = index_schema;
+    common::ObSEArray<uint64_t, 4> data_table_rowkey_cids;
+    const common::ObIArray<ObColumnParam *> &columns = data_table_.get_columns();
+    if (index_schema->is_index_table()) {
+      if (OB_FAIL(guard->get_table_schema(tenant_id, index_schema->get_data_table_id(), data_table_schema))) {
+        LOG_WARN("fail to get data_table_schema", K(ret), K(index_schema->get_data_table_id()));
+      } else if (OB_ISNULL(data_table_schema)) {
+        ret = OB_SCHEMA_ERROR;
+        LOG_WARN("data table schema is NULL", K(ret), KP(data_table_schema), K(index_schema->get_data_table_id()));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(data_table_schema->get_rowkey_column_ids(data_table_rowkey_cids))) {
+        LOG_WARN("fail to get rowkey cids", K(ret), KPC(data_table_schema));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < columns.count(); ++i) {
+        if (OB_ISNULL(columns.at(i))) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("column param is null", K(ret), K(i), KP(columns.at(i)));
+        } else {
+          const uint64_t col_id = is_shadow_column(columns.at(i)->get_column_id()) ?
+                                  columns.at(i)->get_column_id() - OB_MIN_SHADOW_COLUMN_ID :
+                                  columns.at(i)->get_column_id();
+          columns.at(i)->set_is_data_table_rowkey(has_exist_in_array(data_table_rowkey_cids, col_id));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+}//namespace oceanbase
+}//namespace share
+}//namespace schema

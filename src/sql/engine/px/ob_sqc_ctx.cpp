@@ -1,0 +1,178 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX SQL_ENG
+#include "sql/engine/px/ob_sqc_ctx.h"
+#include "sql/das/search/ob_das_async_index_query_ctx.h"
+#include "sql/table_format/iceberg/spec/manifest.h"
+
+using namespace oceanbase::sql;
+
+ObSqcCtx::ObSqcCtx(ObPxRpcInitSqcArgs &sqc_arg) : msg_loop_(),
+      msg_proc_(sqc_arg, *this),
+      receive_data_ch_msg_proc_(msg_proc_),
+      transmit_data_ch_msg_proc_(msg_proc_),
+      barrier_whole_msg_proc_(msg_proc_),
+      winbuf_whole_msg_proc_(msg_proc_),
+      sample_whole_msg_proc_(msg_proc_),
+      rollup_key_whole_msg_proc_(msg_proc_),
+      rd_wf_whole_msg_proc_(msg_proc_),
+      init_channel_whole_msg_proc_(msg_proc_),
+      reporting_wf_piece_msg_proc_(msg_proc_),
+      interrupt_proc_(msg_proc_),
+      sqc_proxy_(*this, sqc_arg),
+      receive_data_ch_provider_(sqc_proxy_.get_msg_ready_cond()),
+      transmit_data_ch_provider_(sqc_proxy_.get_msg_ready_cond()),
+      all_tasks_finish_(false),
+      interrupted_(false),
+      opt_stats_gather_whole_msg_proc_(msg_proc_),
+      sp_winfunc_whole_msg_proc_(msg_proc_),
+      rd_winfunc_whole_msg_proc_(msg_proc_),
+      join_filter_count_row_whole_msg_proc_(msg_proc_),
+      arena_allocator_(),
+      direct_load_mgr_handles_(nullptr),
+      lob_direct_load_mgr_handles_(nullptr),
+      iceberg_data_files_(),
+      iceberg_data_file_lock_(common::ObLatchIds::SQC_CTX_ICEBERG_DATA_FILES_LOCK),
+      async_index_query_allocator_(),
+      async_index_query_ctxs_()
+{
+  arena_allocator_.set_attr(ObMemAttr(MTL_ID(),"DDL_DLM"));
+  async_index_query_allocator_.set_attr(ObMemAttr(MTL_ID(), "DASAsyncSeg"));
+}
+
+void ObSqcCtx::reset()
+{
+  for (int64_t i = 0; i < whole_msg_provider_list_.count(); ++i) {
+    if (OB_NOT_NULL(whole_msg_provider_list_.at(i))) {
+      whole_msg_provider_list_.at(i)->reset();
+    }
+  }
+  if (OB_NOT_NULL(direct_load_mgr_handles_)) {
+    direct_load_mgr_handles_->reset();
+    direct_load_mgr_handles_ = nullptr;
+    lob_direct_load_mgr_handles_->reset();
+    lob_direct_load_mgr_handles_ = nullptr;
+  }
+  for (int64_t i = 0; i < async_index_query_ctxs_.count(); ++i) {
+    ObSqcAsyncIndexQueryCtxEntry *entry = async_index_query_ctxs_.at(i);
+    if (OB_NOT_NULL(entry)) {
+      if (OB_NOT_NULL(entry->query_ctx_)) {
+        entry->query_ctx_->~ObDASAsyncIndexQueryCtx();
+        entry->query_ctx_ = nullptr;
+      }
+      entry->~ObSqcAsyncIndexQueryCtxEntry();
+    }
+  }
+  async_index_query_ctxs_.reset();
+  async_index_query_allocator_.reset();
+  arena_allocator_.reset();
+}
+
+int ObSqcCtx::create_async_index_query_ctx(
+    const uint64_t scan_op_id,
+    ObDASAsyncIndexQueryCtx *&query_ctx)
+{
+  int ret = OB_SUCCESS;
+  void *entry_buf = nullptr;
+  void *query_ctx_buf = nullptr;
+  ObSqcAsyncIndexQueryCtxEntry *entry = nullptr;
+  query_ctx = nullptr;
+  if (OB_UNLIKELY(OB_INVALID_ID == scan_op_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid scan op id for async index query entry", K(ret), K(scan_op_id));
+  } else if (OB_SUCCESS == get_async_index_query_ctx(scan_op_id, query_ctx)) {
+    ret = OB_ENTRY_EXIST;
+    LOG_WARN("async index query ctx already exists", K(ret), K(scan_op_id));
+  } else if (OB_ISNULL(entry_buf = async_index_query_allocator_.alloc(
+                           sizeof(ObSqcAsyncIndexQueryCtxEntry)))
+             || OB_ISNULL(query_ctx_buf = async_index_query_allocator_.alloc(
+                              sizeof(ObDASAsyncIndexQueryCtx)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate async index query entry", K(ret), K(scan_op_id));
+  } else {
+    query_ctx = new (query_ctx_buf) ObDASAsyncIndexQueryCtx();
+    entry = new (entry_buf) ObSqcAsyncIndexQueryCtxEntry(scan_op_id, query_ctx);
+    if (OB_FAIL(async_index_query_ctxs_.push_back(entry))) {
+      LOG_WARN("failed to register async index query entry", K(ret), K(scan_op_id));
+    }
+    if (OB_FAIL(ret)) {
+      query_ctx->~ObDASAsyncIndexQueryCtx();
+      entry->query_ctx_ = nullptr;
+      entry->~ObSqcAsyncIndexQueryCtxEntry();
+      entry = nullptr;
+      query_ctx = nullptr;
+    }
+  }
+  return ret;
+}
+
+int ObSqcCtx::get_async_index_query_ctx(
+    const uint64_t scan_op_id,
+    ObDASAsyncIndexQueryCtx *&query_ctx) const
+{
+  int ret = OB_SUCCESS;
+  query_ctx = nullptr;
+  for (int64_t i = 0; OB_ISNULL(query_ctx) && i < async_index_query_ctxs_.count(); ++i) {
+    const ObSqcAsyncIndexQueryCtxEntry *entry = async_index_query_ctxs_.at(i);
+    if (OB_NOT_NULL(entry) && scan_op_id == entry->scan_op_id_) {
+      query_ctx = entry->query_ctx_;
+    }
+  }
+  if (OB_ISNULL(query_ctx)) {
+    ret = OB_ENTRY_NOT_EXIST;
+  }
+  return ret;
+}
+
+int ObSqcCtx::add_whole_msg_provider(uint64_t op_id, dtl::ObDtlMsgType msg_type, ObPxDatahubDataProvider &provider)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(provider.init(op_id, msg_type))) {
+    LOG_WARN("failed to init provider");
+  } else if (OB_FAIL(whole_msg_provider_list_.push_back(&provider))) {
+    LOG_WARN("failed to push_back provider");
+  }
+  return ret;
+}
+
+int ObSqcCtx::get_whole_msg_provider(uint64_t op_id, dtl::ObDtlMsgType msg_type, ObPxDatahubDataProvider *&provider)
+{
+  int ret = OB_SUCCESS;
+  provider = nullptr;
+  for (int i = 0; OB_SUCC(ret) && i < whole_msg_provider_list_.count(); ++i) {
+    if (OB_ISNULL(whole_msg_provider_list_.at(i))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("should never be nullptr, unexpected", K(ret));
+    } else if (op_id == whole_msg_provider_list_.at(i)->op_id_
+               && msg_type == whole_msg_provider_list_.at(i)->msg_type_) {
+      provider = whole_msg_provider_list_.at(i);
+      break;
+    }
+  }
+  // 预期在 sqc 启动时就要遍历算子并注册好 provider
+  if (nullptr == provider) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("should have a whole msg provider for op", K(op_id), K(ret), K(msg_type));
+  }
+  return ret;
+}
+
+int ObSqcCtx::get_init_channel_msg_cnt(uint64_t op_id, int64_t *&curr_piece_cnt)
+{
+  int ret = OB_SUCCESS;
+  curr_piece_cnt = nullptr;
+  for (int64_t i = 0; i < init_channel_msg_cnts_.count(); ++i) {
+    if (op_id == init_channel_msg_cnts_.at(i).first) {
+      curr_piece_cnt = &init_channel_msg_cnts_.at(i).second;
+      break;
+    }
+  }
+  if (nullptr == curr_piece_cnt) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("should have a init channel msg cnt for op", K(ret), K(op_id));
+  }
+  return ret;
+}

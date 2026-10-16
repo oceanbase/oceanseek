@@ -1,0 +1,608 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX STORAGE
+#include <gtest/gtest.h>
+#define protected public
+#define private public
+
+#include "src/storage/ob_i_store.h"
+#include "share/ob_tablet_replica_checksum_operator.h"
+#include "storage/compaction/ob_medium_compaction_func.h"
+#include "mtlenv/mock_tenant_module_env.h"
+namespace oceanbase
+{
+using namespace share;
+using namespace common;
+
+namespace storage
+{
+bool ObLSHandle::is_valid() const
+{
+  return true;
+}
+
+ObLSHandle& ObLSHandle::operator=(const ObLSHandle &other) {
+  return *this;
+}
+
+}
+
+namespace unittest
+{
+
+class MockObCompactionScheduleIterator : public compaction::ObCompactionScheduleIterator
+{
+public:
+  MockObCompactionScheduleIterator(const int64_t batch_tablet_cnt)
+    : ObCompactionScheduleIterator(compaction::MAJOR_MERGE/*merge_type*/),
+      mock_tablet_id_cnt_(0),
+      tablet_cnt_in_ls_array_(NULL),
+      error_tablet_id_(),
+      errno_(OB_SUCCESS),
+      missing_ls_idx_(-1)
+  {
+    max_batch_tablet_cnt_ = batch_tablet_cnt;
+  }
+  int init(
+    const int64_t ls_cnt,
+    const int64_t max_batch_tablet_cnt,
+    const int64_t tablet_cnt_per_ls,
+    const int64_t error_tablet_idx,
+    const int input_errno);
+  int init(
+    const ObIArray<int64_t> &tablet_cnt_in_ls_array,
+    const int64_t max_batch_tablet_cnt,
+    const int64_t error_tablet_idx,
+    const int input_errno);
+  int init_map();
+  virtual int get_cur_ls_handle(ObLSHandle &ls_handle) override
+  {
+    int ret = OB_SUCCESS;
+    if (ls_idx_ == missing_ls_idx_) {
+      ret = OB_LS_NOT_EXIST;
+    }
+    return ret;
+  }
+  virtual int get_tablet_ids() override
+  {
+    int ret = OB_SUCCESS;
+    int64_t touch_cnt = 0;
+    const ObLSID &ls_id = ls_ids_.at(ls_idx_);
+    int64_t tablet_cnt = 0;
+    if (OB_NOT_NULL(tablet_cnt_in_ls_array_)) {
+      tablet_cnt = tablet_cnt_in_ls_array_->at(ls_idx_);
+    } else {
+      tablet_cnt = mock_tablet_id_cnt_;
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < tablet_cnt; ++i) {
+      const ObTabletID &cur_tablet_id = ObTabletID(i + 1);
+      ObTabletLSPair pair(cur_tablet_id, ls_id);
+      if (OB_SUCC(tablet_ids_.array_.push_back(cur_tablet_id))) {
+        if (OB_SUCCESS != tablet_map_.get_refactored(pair, touch_cnt)) {
+          touch_cnt = 0;
+          if (OB_FAIL(tablet_map_.set_refactored(pair, touch_cnt))) {
+            LOG_WARN("failed to set refactor", KR(ret), K(cur_tablet_id), K(touch_cnt));
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      LOG_INFO("success to get tablet ids", KR(ret), K(tablet_cnt));
+    }
+    return ret;
+  }
+  virtual int get_tablet_handle(const ObTabletID &tablet_id, ObTabletHandle &tablet_handle) override
+  {
+    int ret = OB_SUCCESS;
+    int64_t touch_cnt = 0;
+    ObTabletLSPair pair(tablet_id, ls_ids_.at(ls_idx_));
+    if (tablet_id == error_tablet_id_) {
+      ret = errno_;
+    } else if (OB_FAIL(tablet_map_.get_refactored(pair, touch_cnt))) {
+      LOG_WARN("failed to get refactor", KR(ret), K(tablet_id), K(touch_cnt));
+    } else if (FALSE_IT(++touch_cnt)) {
+    } else if (OB_FAIL(tablet_map_.set_refactored(pair, touch_cnt, 1/*overwrite*/))) {
+      LOG_WARN("failed to set refactor", KR(ret), K(tablet_id), K(touch_cnt));
+    } else {
+      LOG_INFO("success to set refactor", KR(ret), K(tablet_id), K(pair), K(touch_cnt));
+    }
+    return ret;
+  }
+  void prepare_ls_id_array(const int64_t ls_cnt)
+  {
+    for (int64_t i = 0; i < ls_cnt; ++i) {
+      ASSERT_EQ(OB_SUCCESS, ls_ids_.push_back(ObLSID(i + 1)));
+    }
+  }
+  int check_valid(const int64_t expect_touch_cnt);
+  static const int64_t DEFAULT_BUCKET_NUM = 1024;
+  typedef hash::ObHashMap<ObTabletLSPair, int64_t> TabletID2CntMap;
+  TabletID2CntMap tablet_map_;
+  int64_t mock_tablet_id_cnt_;
+  const ObIArray<int64_t> *tablet_cnt_in_ls_array_;
+  ObTabletID error_tablet_id_;
+  int errno_;
+  int64_t missing_ls_idx_;
+};
+
+int MockObCompactionScheduleIterator::init_map()
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(tablet_map_.created())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("tablet map is created", KR(ret));
+  } else if (OB_FAIL(tablet_map_.create(DEFAULT_BUCKET_NUM, "MockMap", "MockMap"))) {
+    LOG_WARN("failed to create tablet map", KR(ret));
+  }
+  return ret;
+}
+
+int MockObCompactionScheduleIterator::init(
+    const int64_t ls_cnt,
+    const int64_t max_batch_tablet_cnt,
+    const int64_t tablet_cnt_per_ls,
+    const int64_t error_tablet_idx,
+    const int input_errno)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(init_map())) {
+    LOG_WARN("failed to create tablet map", KR(ret));
+  } else {
+    prepare_ls_id_array(ls_cnt);
+    max_batch_tablet_cnt_ = max_batch_tablet_cnt;
+    mock_tablet_id_cnt_ = tablet_cnt_per_ls;
+    error_tablet_id_ = ObTabletID(error_tablet_idx + 1);
+    errno_ = input_errno;
+  }
+  return ret;
+}
+
+int MockObCompactionScheduleIterator::init(
+  const ObIArray<int64_t> &tablet_cnt_in_ls_array,
+  const int64_t max_batch_tablet_cnt,
+  const int64_t error_tablet_idx,
+  const int input_errno)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(tablet_cnt_in_ls_array.empty() || max_batch_tablet_cnt <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(tablet_cnt_in_ls_array), K(max_batch_tablet_cnt));
+  } else if (OB_FAIL(init_map())) {
+    LOG_WARN("failed to create tablet map", KR(ret));
+  } else {
+    prepare_ls_id_array(tablet_cnt_in_ls_array.count());
+    max_batch_tablet_cnt_ = max_batch_tablet_cnt;
+    tablet_cnt_in_ls_array_ = &tablet_cnt_in_ls_array;
+    error_tablet_id_ = ObTabletID(error_tablet_idx + 1);
+    errno_ = input_errno;
+  }
+  return ret;
+}
+
+int MockObCompactionScheduleIterator::check_valid(const int64_t expect_touch_cnt)
+{
+  int ret = OB_SUCCESS;
+  int64_t touch_cnt = 0;
+  for (int64_t ls_idx = 0; ls_idx < ls_ids_.count(); ++ls_idx) {
+    const ObLSID &ls_id = ls_ids_.at(ls_idx);
+    for (int64_t i = 0; OB_SUCC(ret) && i < mock_tablet_id_cnt_; ++i) {
+      const ObTabletID &cur_tablet_id = ObTabletID(i + 1);
+      ObTabletLSPair pair(cur_tablet_id, ls_id);
+      if (!error_tablet_id_.is_valid()
+        || (cur_tablet_id < error_tablet_id_ || (OB_TABLET_NOT_EXIST == errno_ && cur_tablet_id > error_tablet_id_))) {
+        if (OB_FAIL(tablet_map_.get_refactored(pair, touch_cnt))) {
+          LOG_WARN("failed to get refactor", KR(ret), K(cur_tablet_id), K(pair), K(touch_cnt));
+        } else if (touch_cnt != expect_touch_cnt) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("tablet touch cnt is unexpected", KR(ret), K(pair), K(touch_cnt), K(expect_touch_cnt), K(error_tablet_id_));
+        }
+      }
+    } // for
+  } // for
+  return ret;
+}
+
+class TestCompactionIter : public ::testing::Test
+{
+public:
+  void test_iter(
+    const int64_t ls_cnt,
+    const int64_t max_batch_tablet_cnt,
+    const int64_t tablet_cnt_per_ls,
+    const ObIArray<int64_t> *tablet_cnt_in_ls_array = NULL,
+    const int64_t error_tablet_idx = -1,
+    const int input_errno = OB_SUCCESS);
+};
+
+void TestCompactionIter::test_iter(
+  const int64_t ls_cnt,
+  const int64_t max_batch_tablet_cnt,
+  const int64_t tablet_cnt_per_ls,
+  const ObIArray<int64_t> *tablet_cnt_in_ls_array,
+  const int64_t error_tablet_idx,
+  const int input_errno)
+{
+  LOG_INFO("test_iter", K(ls_cnt), K(max_batch_tablet_cnt), K(tablet_cnt_per_ls), K(error_tablet_idx), K(input_errno));
+  MockObCompactionScheduleIterator iter(max_batch_tablet_cnt);
+  if (OB_ISNULL(tablet_cnt_in_ls_array)) {
+    ASSERT_TRUE(ls_cnt > 0 && tablet_cnt_per_ls > 0);
+    ASSERT_EQ(OB_SUCCESS, iter.init(ls_cnt, max_batch_tablet_cnt, tablet_cnt_per_ls, error_tablet_idx, input_errno));
+  } else {
+    ASSERT_TRUE(ls_cnt == 0 && tablet_cnt_per_ls == 0);
+    ASSERT_EQ(OB_SUCCESS, iter.init(*tablet_cnt_in_ls_array, max_batch_tablet_cnt, error_tablet_idx, input_errno));
+  }
+
+  int ret = OB_SUCCESS;
+  ObLSHandle ls_handle;
+  ObTabletHandle tablet_handle;
+  int64_t iter_batch_cnt = 0;
+  int iter_cnt = 0;
+  while (OB_SUCC(ret)) {
+    while (OB_SUCC(iter.get_next_ls(ls_handle))) {
+      while (OB_SUCC(ret)) {
+        if (OB_SUCC(iter.get_next_tablet(tablet_handle))) {
+          iter_cnt++;
+        } else {
+          if (OB_ITER_END != ret) {
+            iter.skip_cur_ls();
+          }
+          ret = OB_SUCCESS;
+          break;
+        }
+      } // iter tablet
+    }   // iter ls
+    ASSERT_EQ(OB_ITER_END, ret);
+    ret = OB_SUCCESS;
+    ++iter_batch_cnt;
+    if (iter.is_valid()) {
+      ASSERT_EQ(iter.schedule_tablet_cnt_ >= max_batch_tablet_cnt, true);
+      iter.start_cur_batch();
+    } else {
+      break;
+    }
+  } // while
+  ASSERT_EQ(OB_SUCCESS, iter.check_valid(1));
+  if (OB_ISNULL(tablet_cnt_in_ls_array)) {
+    if (input_errno == OB_SUCCESS) {
+      ASSERT_EQ(iter_cnt, ls_cnt * tablet_cnt_per_ls);
+    } else if (OB_TABLET_NOT_EXIST == input_errno) {
+      // for this errno, just skip this tablet
+      ASSERT_EQ(iter_cnt, ls_cnt * (tablet_cnt_per_ls - 1));
+    } else {
+      ASSERT_EQ(iter_cnt, ls_cnt * error_tablet_idx);
+    }
+  } else {
+    int64_t expect_iter_cnt = 0;
+    for (int64_t idx = 0; idx < tablet_cnt_in_ls_array->count(); ++idx) {
+      if (input_errno == OB_SUCCESS) {
+        expect_iter_cnt += tablet_cnt_in_ls_array->at(idx);
+      } else if (OB_TABLET_NOT_EXIST == input_errno) {
+        // for this errno, just skip this tablet
+        expect_iter_cnt += (tablet_cnt_in_ls_array->at(idx) - (tablet_cnt_in_ls_array->at(idx) > error_tablet_idx ? 1 : 0));
+      } else {
+        expect_iter_cnt += MIN(tablet_cnt_in_ls_array->at(idx), error_tablet_idx);
+      }
+    } // for
+    ASSERT_EQ(iter_cnt, expect_iter_cnt);
+  }
+  ASSERT_EQ(iter_batch_cnt, MAX(1, iter_cnt / max_batch_tablet_cnt + (iter_cnt % max_batch_tablet_cnt != 0)));
+}
+
+TEST_F(TestCompactionIter, test_normal_loop)
+{
+  test_iter(
+    3,/*ls_cnt*/
+    10000,/*max_batch_tablet_cnt*/
+    10000/*tablet_cnt_per_ls*/
+  );
+  test_iter(
+    5,/*ls_cnt*/
+    1000,/*max_batch_tablet_cnt*/
+    10000/*tablet_cnt_per_ls*/
+  );
+  test_iter(
+    5,/*ls_cnt*/
+    1000,/*max_batch_tablet_cnt*/
+    100/*tablet_cnt_per_ls*/
+  );
+  test_iter(
+    5,/*ls_cnt*/
+    100,/*max_batch_tablet_cnt*/
+    100/*tablet_cnt_per_ls*/
+  );
+  test_iter(
+    5,/*ls_cnt*/
+    200,/*max_batch_tablet_cnt*/
+    100/*tablet_cnt_per_ls*/
+  );
+}
+
+TEST_F(TestCompactionIter, test_single_ls)
+{
+  test_iter(
+    1,/*ls_cnt*/
+    1000,/*max_batch_tablet_cnt*/
+    100/*tablet_cnt_per_ls*/
+  );
+  test_iter(
+    1,/*ls_cnt*/
+    1000,/*max_batch_tablet_cnt*/
+    1000/*tablet_cnt_per_ls*/
+  );
+  test_iter(
+    1,/*ls_cnt*/
+    1000,/*max_batch_tablet_cnt*/
+    10000/*tablet_cnt_per_ls*/
+  );
+}
+
+TEST_F(TestCompactionIter, resumable_scan_reaches_tail_across_batches_and_pauses)
+{
+  // Alternate early pauses and full batches. The last tablet fills a batch,
+  // so the next resume must mark scan_finish_ without visiting it again.
+  const int64_t ls_count = 2;
+  const int64_t tablets_per_ls = 10;
+  MockObCompactionScheduleIterator iter(3);
+  ASSERT_EQ(OB_SUCCESS, iter.init(ls_count, 3, tablets_per_ls, -1, OB_SUCCESS));
+  ObLSHandle ls_handle;
+  ObTabletHandle tablet_handle;
+  int64_t visited = 0;
+  for (int64_t batch = 0; !iter.is_scan_finish() && batch < 100; ++batch) {
+    ASSERT_EQ(OB_SUCCESS, iter.resume_or_build_iter(3));
+    int ret = OB_SUCCESS;
+    const int64_t pause_after = batch % 2 == 0 ? 1 : 3;
+    while (OB_SUCCESS == (ret = iter.get_next_ls(ls_handle))) {
+      while (OB_SUCCESS == (ret = iter.get_next_tablet(tablet_handle))) {
+        ++visited;
+        if (iter.schedule_tablet_cnt_ == pause_after) {
+          break;
+        }
+      }
+      if (iter.schedule_tablet_cnt_ == pause_after) {
+        break;
+      }
+      ASSERT_EQ(OB_ITER_END, ret);
+    }
+    iter.release_ls_handle();
+  }
+  ASSERT_TRUE(iter.is_scan_finish());
+  ASSERT_FALSE(iter.is_valid());
+  ASSERT_EQ(ls_count * tablets_per_ls, visited);
+  ASSERT_EQ(OB_SUCCESS, iter.check_valid(1));
+}
+
+TEST_F(TestCompactionIter, resumable_scan_refreshes_batch_and_skips_removed_ls)
+{
+  MockObCompactionScheduleIterator iter(3);
+  ASSERT_EQ(OB_SUCCESS, iter.init(2, 3, 11, -1, OB_SUCCESS));
+  ObLSHandle ls_handle;
+  ObTabletHandle tablet_handle;
+  ASSERT_EQ(OB_SUCCESS, iter.get_next_ls(ls_handle));
+  ASSERT_EQ(OB_SUCCESS, iter.get_next_tablet(tablet_handle));
+  iter.release_ls_handle();
+  ASSERT_EQ(OB_SUCCESS, iter.resume_or_build_iter(1));
+  ASSERT_EQ(OB_SUCCESS, iter.get_next_ls(ls_handle));
+  ASSERT_EQ(OB_SUCCESS, iter.get_next_tablet(tablet_handle));
+  EXPECT_EQ(2, iter.tablet_ids_.tablet_idx_);
+  ASSERT_EQ(OB_ITER_END, iter.get_next_tablet(tablet_handle));
+  iter.release_ls_handle();
+  iter.missing_ls_idx_ = 0;
+  ASSERT_EQ(OB_SUCCESS, iter.resume_or_build_iter(4));
+  ASSERT_EQ(OB_SUCCESS, iter.get_next_ls(ls_handle));
+  EXPECT_EQ(1, iter.ls_idx_);
+  ASSERT_EQ(OB_SUCCESS, iter.get_next_tablet(tablet_handle));
+  EXPECT_EQ(1, iter.tablet_ids_.tablet_idx_);
+  EXPECT_EQ(4, iter.max_batch_tablet_cnt_);
+}
+
+TEST_F(TestCompactionIter, resumable_scan_skips_deleted_tablet_without_restarting)
+{
+  MockObCompactionScheduleIterator iter(3);
+  ASSERT_EQ(OB_SUCCESS, iter.init(1, 3, 5, -1, OB_SUCCESS));
+  ObLSHandle ls_handle;
+  ObTabletHandle tablet_handle;
+  ASSERT_EQ(OB_SUCCESS, iter.get_next_ls(ls_handle));
+  ASSERT_EQ(OB_SUCCESS, iter.get_next_tablet(tablet_handle));
+  iter.release_ls_handle();
+  // Tablet 3 disappears during the pause. Keep the remaining ID snapshot and
+  // look up current tablet handles instead of restarting from tablet 1.
+  iter.error_tablet_id_ = ObTabletID(3);
+  iter.errno_ = OB_TABLET_NOT_EXIST;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, iter.resume_or_build_iter(0));
+  EXPECT_EQ(1, iter.tablet_ids_.tablet_idx_);
+  ASSERT_EQ(OB_SUCCESS, iter.resume_or_build_iter(10));
+  ASSERT_EQ(OB_SUCCESS, iter.get_next_ls(ls_handle));
+  for (int64_t i = 0; i < 3; ++i) {
+    ASSERT_EQ(OB_SUCCESS, iter.get_next_tablet(tablet_handle));
+  }
+  ASSERT_EQ(OB_ITER_END, iter.get_next_tablet(tablet_handle));
+  ASSERT_EQ(OB_ITER_END, iter.get_next_ls(ls_handle));
+  EXPECT_TRUE(iter.is_scan_finish());
+  ASSERT_EQ(OB_SUCCESS, iter.check_valid(1));
+}
+
+TEST_F(TestCompactionIter, test_loop_with_not_exist_tablet)
+{
+  test_iter(
+    2,/*ls_cnt*/
+    1000,/*max_batch_tablet_cnt*/
+    10000,/*tablet_cnt_per_ls*/
+    NULL,
+    50,/*error_tablet_idx*/
+    OB_TABLET_NOT_EXIST/*errno*/
+  );
+  test_iter(
+    2,/*ls_cnt*/
+    1000,/*max_batch_tablet_cnt*/
+    1001,/*tablet_cnt_per_ls*/
+    NULL,
+    999,/*error_tablet_idx*/
+    OB_TABLET_NOT_EXIST/*errno*/
+  );
+}
+
+TEST_F(TestCompactionIter, test_loop_with_errno)
+{
+  test_iter(
+    2,/*ls_cnt*/
+    1000,/*max_batch_tablet_cnt*/
+    10000,/*tablet_cnt_per_ls*/
+    NULL,
+    50,/*error_tablet_idx*/
+    OB_ERR_UNEXPECTED/*errno*/
+  );
+  test_iter(
+    2,/*ls_cnt*/
+    1000,/*max_batch_tablet_cnt*/
+    1000,/*tablet_cnt_per_ls*/
+    NULL,
+    999,/*error_tablet_idx*/
+    OB_ERR_UNEXPECTED/*errno*/
+  );
+  test_iter(
+    3,/*ls_cnt*/
+    1000,/*max_batch_tablet_cnt*/
+    999,/*tablet_cnt_per_ls*/
+    NULL,
+    999,/*error_tablet_idx*/
+    OB_ERR_UNEXPECTED/*errno*/
+  );
+  test_iter(
+    3,/*ls_cnt*/
+    1000,/*max_batch_tablet_cnt*/
+    999,/*tablet_cnt_per_ls*/
+    NULL,
+    0,/*error_tablet_idx*/
+    OB_ERR_UNEXPECTED/*errno*/
+  );
+  test_iter(
+    2,/*ls_cnt*/
+    1000,/*max_batch_tablet_cnt*/
+    50,/*tablet_cnt_per_ls*/
+    NULL,
+    1,/*error_tablet_idx*/
+    OB_ERR_UNEXPECTED/*errno*/
+  );
+}
+
+TEST_F(TestCompactionIter, test_iter_with_tablet_cnt_list)
+{
+  ObSEArray<int64_t, 5> tablet_cnt_in_ls;
+  tablet_cnt_in_ls.push_back(100);
+  tablet_cnt_in_ls.push_back(0);
+  tablet_cnt_in_ls.push_back(2);
+  tablet_cnt_in_ls.push_back(0);
+  tablet_cnt_in_ls.push_back(300);
+
+  test_iter(
+    0,/*ls_cnt*/
+    1000,/*max_batch_tablet_cnt*/
+    0,/*tablet_cnt_per_ls*/
+    &tablet_cnt_in_ls
+  );
+  test_iter(
+    0,/*ls_cnt*/
+    100,/*max_batch_tablet_cnt*/
+    0,/*tablet_cnt_per_ls*/
+    &tablet_cnt_in_ls,
+    50,/*error_tablet_idx*/
+    OB_TABLET_NOT_EXIST/*errno*/
+  );
+  test_iter(
+    0,/*ls_cnt*/
+    200,/*max_batch_tablet_cnt*/
+    0,/*tablet_cnt_per_ls*/
+    &tablet_cnt_in_ls,
+    50,/*error_tablet_idx*/
+    OB_TABLET_NOT_EXIST/*errno*/
+  );
+  test_iter(
+    0,/*ls_cnt*/
+    250,/*max_batch_tablet_cnt*/
+    0,/*tablet_cnt_per_ls*/
+    &tablet_cnt_in_ls,
+    50,/*error_tablet_idx*/
+    OB_ERR_UNEXPECTED/*errno*/
+  );
+}
+
+TEST_F(TestCompactionIter, test_ls_mds_is_only_ls_inner_tablet_allowed_for_major)
+{
+  ASSERT_TRUE(LS_MDS_TABLET.is_ls_inner_tablet());
+  ASSERT_TRUE(LS_MDS_TABLET.is_special_merge_tablet());
+  ASSERT_FALSE(LS_MDS_TABLET.is_mini_and_minor_merge_tablet());
+  ASSERT_TRUE(LS_MDS_TABLET.is_ls_mds_tablet());
+  ASSERT_TRUE(LS_MDS_TABLET.can_major_merge());
+  ASSERT_TRUE(LS_MDS_TABLET.is_ls_inner_tablet_can_major());
+
+  ASSERT_TRUE(LS_TX_DATA_TABLET.is_ls_inner_tablet());
+  ASSERT_TRUE(LS_TX_DATA_TABLET.is_mini_and_minor_merge_tablet());
+  ASSERT_FALSE(LS_TX_DATA_TABLET.is_ls_mds_tablet());
+  ASSERT_TRUE(LS_REORG_INFO_TABLET.is_ls_inner_tablet());
+  ASSERT_FALSE(LS_REORG_INFO_TABLET.is_ls_mds_tablet());
+  ASSERT_TRUE(LS_TX_CTX_TABLET.is_ls_inner_tablet());
+  ASSERT_FALSE(LS_TX_CTX_TABLET.is_ls_mds_tablet());
+  ASSERT_FALSE(ObTabletID(ObTabletID::MIN_USER_TABLET_ID + 1).is_ls_mds_tablet());
+  ASSERT_TRUE(ObTabletID(ObTabletID::MIN_USER_TABLET_ID + 1).can_major_merge());
+  ASSERT_FALSE(LS_TX_DATA_TABLET.can_major_merge());
+  ASSERT_FALSE(LS_TX_DATA_TABLET.is_ls_inner_tablet_can_major());
+  const ObTabletID reserved_ls_inner(ObTabletID::MIN_LS_INNER_TABLET_ID + 6);
+  ASSERT_TRUE(reserved_ls_inner.is_ls_inner_tablet());
+  ASSERT_FALSE(reserved_ls_inner.is_special_merge_tablet());
+  ASSERT_FALSE(reserved_ls_inner.can_major_merge());
+}
+
+TEST_F(TestCompactionIter, test_ls_mds_tablet_skip_replica_checksum_check)
+{
+  const uint64_t tenant_id = OB_SYS_TENANT_ID;
+  share::ObReplicaCkmArray checksum_items(false/*need_map*/);
+  share::ObTabletReplicaChecksumItem first_item;
+  share::ObTabletReplicaChecksumItem second_item;
+  ObSEArray<int64_t, 1> first_column_checksums;
+  ObSEArray<int64_t, 1> second_column_checksums;
+
+  ASSERT_EQ(OB_SUCCESS, first_column_checksums.push_back(100));
+  ASSERT_EQ(OB_SUCCESS, second_column_checksums.push_back(200));
+
+  ASSERT_EQ(OB_SUCCESS, first_item.set_tenant_id(tenant_id));
+  first_item.ls_id_ = ObLSID(ObLSID::SYS_LS_ID);
+  first_item.tablet_id_ = LS_MDS_TABLET;
+  ASSERT_TRUE(first_item.server_.set_ip_addr("127.0.0.1", 2882));
+  first_item.row_count_ = 1;
+  ASSERT_EQ(OB_SUCCESS, first_item.compaction_scn_.convert_for_tx(100));
+  first_item.data_checksum_ = 100;
+  ASSERT_EQ(OB_SUCCESS, first_item.column_meta_.init(first_column_checksums));
+  first_item.data_checksum_type_ = ObDataChecksumType::DATA_CHECKSUM_NORMAL;
+
+  ASSERT_EQ(OB_SUCCESS, second_item.set_tenant_id(tenant_id));
+  second_item.ls_id_ = ObLSID(ObLSID::SYS_LS_ID);
+  second_item.tablet_id_ = LS_MDS_TABLET;
+  ASSERT_TRUE(second_item.server_.set_ip_addr("127.0.0.2", 2882));
+  second_item.row_count_ = 2;
+  ASSERT_EQ(OB_SUCCESS, second_item.compaction_scn_.convert_for_tx(100));
+  second_item.data_checksum_ = 200;
+  ASSERT_EQ(OB_SUCCESS, second_item.column_meta_.init(second_column_checksums));
+  second_item.data_checksum_type_ = ObDataChecksumType::DATA_CHECKSUM_NORMAL;
+
+  ASSERT_EQ(OB_SUCCESS, checksum_items.init(tenant_id, 2));
+  ASSERT_EQ(OB_SUCCESS, checksum_items.push_back(first_item));
+  ASSERT_EQ(OB_SUCCESS, checksum_items.push_back(second_item));
+
+  ASSERT_EQ(OB_SUCCESS, compaction::ObMediumCompactionScheduleFunc::check_replica_checksum_items(
+      checksum_items, false/*is_medium_checker*/));
+}
+
+} // namespace unittest
+} //namespace oceanbase
+
+int main(int argc, char **argv)
+{
+  system("rm -rf test_compaction_iter.log*");
+  OB_LOGGER.set_file_name("test_compaction_iter.log");
+  oceanbase::common::ObLogger::get_logger().set_log_level("TRACE");
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

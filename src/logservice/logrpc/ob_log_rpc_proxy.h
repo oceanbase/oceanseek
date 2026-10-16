@@ -1,0 +1,55 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_LOGSERVICE_OB_LOG_RPC_PROXY_
+#define OCEANBASE_LOGSERVICE_OB_LOG_RPC_PROXY_
+
+#include "ob_log_rpc_req.h"
+#include "rpc/obrpc/ob_rpc_proxy.h"                             // ObRpcProxy
+
+namespace oceanbase
+{
+namespace obrpc
+{
+
+class ObLogServiceRpcProxy : public obrpc::ObRpcProxy
+{
+public:
+  DEFINE_TO(ObLogServiceRpcProxy);
+  RPC_S(PR3 send_log_config_change_cmd, OB_LOG_CONFIG_CHANGE_CMD,
+      (logservice::LogConfigChangeCmd), logservice::LogConfigChangeCmdResp);
+  RPC_AP(PR3 send_server_probe_req, OB_LOG_ARB_PROBE_MSG,
+      (logservice::LogServerProbeMsg));
+  RPC_AP(PR3 send_change_access_mode_cmd, OB_LOG_CHANGE_ACCESS_MODE_CMD,
+      (logservice::LogChangeAccessModeCmd));
+  RPC_AP(PR3 send_log_flashback_msg, OB_LOG_FLASHBACK_CMD,
+      (logservice::LogFlashbackMsg));
+#ifdef OB_BUILD_ARBITRATION
+  RPC_S(PR5 create_arb, OB_CREATE_ARB, (obrpc::ObCreateArbArg), obrpc::ObCreateArbResult);
+  RPC_S(PR5 delete_arb, OB_DELETE_ARB, (obrpc::ObDeleteArbArg), obrpc::ObDeleteArbResult);
+#endif
+  RPC_S(PR3 get_palf_stat, OB_LOG_GET_PALF_STAT,
+      (logservice::LogGetPalfStatReq), logservice::LogGetPalfStatResp);
+#ifdef OB_BUILD_ARBITRATION
+  RPC_S(PR5 log_probe_rs, OB_LOG_PROBE_RS, (logservice::LogProbeRsReq), logservice::LogProbeRsResp);
+#endif       
+  RPC_S(PR3 get_ls_ckpt, OB_LOG_GET_LS_CKPT,
+      (logservice::LogGetCkptReq), logservice::LogGetCkptResp);
+  RPC_AP(PR3 sync_base_lsn, OB_LOG_SYNC_BASE_LSN_REQ,
+         (logservice::LogSyncBaseLSNReq));
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+  RPC_AP(PR3 report_replay_reaching_machine, OB_LOG_REPORT_REPLAY_REACHING_MACHINE_REQ,
+         (logservice::LogFollowerReportReplayReachingMachineReq));
+  RPC_AP(PR3 notify_follower_move_out_from_rto_group, OB_LOG_NOTIFY_FOLLOWER_MOVE_OUT_FROM_RTO_GROUP_RESP,
+         (logservice::LogNotifyFollowerMoveOutFromRTOGroupResp));
+#endif // OB_BUILD_SHARED_LOG_SERVICE
+};
+
+} // end namespace obrpc
+} // end namespace oceanbase
+
+#endif
+
+

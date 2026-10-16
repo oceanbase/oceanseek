@@ -1,0 +1,101 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX SHARE
+
+#include "ob_shared_memory_allocator_mgr.h"
+
+namespace oceanbase {
+namespace share {
+
+#define THROTTLE_CONFIG_LOG(ALLOCATOR, LIMIT, TRIGGER_PERCENTAGE, MAX_DURATION) \
+          "Unit Name",                                                          \
+          ALLOCATOR::throttle_unit_name(),                                      \
+          "Memory Limit(MB)",                                                   \
+          LIMIT / 1024 / 1024,                                                  \
+          "Throttle Trigger(MB)",                                               \
+          LIMIT * trigger_percentage / 100 / 1024 / 1024,                       \
+          "Trigger Percentage",                                                 \
+          TRIGGER_PERCENTAGE,                                                   \
+          "Max Alloc Duration",                                                 \
+          MAX_DURATION
+
+void ObSharedMemAllocMgr::update_throttle_config()
+{
+  if (MTL_ID() != tenant_id_) {
+    SHARE_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "update throttle config in an invalid tenant", K(MTL_ID()), K(tenant_id_));
+    return;
+  }
+
+  int64_t total_memory = lib::get_tenant_memory_limit(tenant_id_);
+  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
+  if (tenant_config.is_valid()) {
+    int64_t share_mem_limit_percentage = tenant_config->_tx_share_memory_limit_percentage;
+    int64_t tenant_memstore_limit_percentage = MTL(ObTenantFreezer*)->get_memstore_limit_percentage();
+    int64_t tx_data_limit_percentage = tenant_config->_tx_data_memory_limit_percentage;
+    int64_t mds_limit_percentage = tenant_config->_mds_memory_limit_percentage;
+    int64_t trigger_percentage = tenant_config->writing_throttling_trigger_percentage;
+    int64_t max_duration = tenant_config->writing_throttling_maximum_duration;
+    int64_t tenant_vector_limit_percentage = ObTenantVectorAllocator::get_vector_mem_limit_percentage(tenant_config);
+    if (0 == share_mem_limit_percentage) {
+      // 0 means use (max(memstore_limit, vector_limit + 5) + 10)
+      share_mem_limit_percentage = MAX(tenant_memstore_limit_percentage, tenant_vector_limit_percentage + 5) + 10;
+    }
+
+    int64_t share_mem_limit = total_memory / 100 * share_mem_limit_percentage;
+    int64_t memstore_limit = total_memory / 100 * tenant_memstore_limit_percentage;
+    int64_t tx_data_limit = total_memory / 100 * tx_data_limit_percentage;
+    int64_t mds_limit = total_memory / 100 * mds_limit_percentage;
+    int64_t vector_limit = total_memory / 100 * tenant_vector_limit_percentage;
+
+    bool share_config_changed = false;
+    (void)share_resource_throttle_tool_.update_throttle_config<FakeAllocatorForTxShare>(
+        share_mem_limit, trigger_percentage, max_duration, share_config_changed);
+
+    bool memstore_config_changed = false;
+    (void)share_resource_throttle_tool_.update_throttle_config<ObDataMemstoreAllocator>(
+        memstore_limit, trigger_percentage, max_duration, memstore_config_changed);
+
+    bool tx_data_config_changed = false;
+    (void)share_resource_throttle_tool_.update_throttle_config<ObTenantTxDataAllocator>(
+        tx_data_limit, trigger_percentage, max_duration, tx_data_config_changed);
+
+    // The dedicated LS_MDS_TABLET memstore arena is throttled on its own bucket
+    // with the mds memory limit percentage.
+    bool mds_memstore_config_changed = false;
+    (void)share_resource_throttle_tool_.update_throttle_config<ObMdsMemstoreAllocator>(
+        mds_limit, trigger_percentage, max_duration, mds_memstore_config_changed);
+
+    bool vector_config_changed = false;
+    (void)share_resource_throttle_tool_.update_throttle_config<ObTenantVectorAllocator>(
+        vector_limit, trigger_percentage, max_duration, vector_config_changed);
+
+    if (share_config_changed || memstore_config_changed || tx_data_config_changed || mds_memstore_config_changed ||
+        vector_config_changed) {
+      SHARE_LOG(INFO,
+                "[Throttle] Update Config",
+                K(tenant_id_),
+                K(total_memory),
+                K(share_mem_limit_percentage),
+                K(share_mem_limit),
+                K(tenant_memstore_limit_percentage),
+                K(memstore_limit),
+                K(tx_data_limit_percentage),
+                K(tx_data_limit),
+                K(mds_limit_percentage),
+                K(mds_limit),
+                K(trigger_percentage),
+                K(max_duration),
+                K(tenant_vector_limit_percentage),
+                K(vector_limit));
+
+    }
+  } else {
+    SHARE_LOG_RET(WARN, OB_INVALID_CONFIG, "invalid tenant config", K(tenant_id_), K(total_memory));
+  }
+}
+
+}  // namespace share
+}  // namespace oceanbase

@@ -1,0 +1,77 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_SQL_OB_EXPR_STR_TO_DATE_H_
+#define OCEANBASE_SQL_OB_EXPR_STR_TO_DATE_H_
+
+#include "sql/engine/expr/ob_expr_operator.h"
+#include "sql/engine/expr/ob_expr_to_temporal_base.h"
+
+namespace oceanbase
+{
+namespace sql
+{
+class ObExprStrToDate : public ObFuncExprOperator
+{
+public:
+  explicit  ObExprStrToDate(common::ObIAllocator &alloc);
+  virtual ~ObExprStrToDate();
+  virtual int calc_result_type2(ObExprResType &type,
+                                ObExprResType &date,
+                                ObExprResType &format,
+                                common::ObExprTypeCtx &type_ctx) const;
+  virtual int cg_expr(ObExprCGCtx &expr_cg_ctx, const ObRawExpr &raw_expr,
+                      ObExpr &rt_expr) const override;
+  DECLARE_SET_LOCAL_SESSION_VARS;
+private:
+  // disallow copy
+  DISALLOW_COPY_AND_ASSIGN(ObExprStrToDate);
+};
+
+// ObExprToDate is for mysql compatible to_date function
+class ObExprToDate : public ObFuncExprOperator
+{
+public:
+  explicit ObExprToDate(common::ObIAllocator &alloc);
+  virtual ~ObExprToDate() {};
+  virtual int calc_result_typeN(ObExprResType &type,
+                                ObExprResType *types_array,
+                                int64_t param_num,
+                                common::ObExprTypeCtx &type_ctx) const;
+  virtual int cg_expr(ObExprCGCtx &expr_cg_ctx, const ObRawExpr &raw_expr,
+                      ObExpr &rt_expr) const override;
+  virtual bool need_rt_ctx() const override { return true; }
+  static int calc_to_date_with_format(const ObExpr &expr, ObEvalCtx &ctx,
+    ObDatum &res_datum);
+  static int calc_to_date_with_format_vector(const ObExpr &expr, ObEvalCtx &ctx,
+    const ObBitVector &skip, const EvalBound &bound);
+  DECLARE_SET_LOCAL_SESSION_VARS;
+private:
+  // disallow copy
+  DISALLOW_COPY_AND_ASSIGN(ObExprToDate);
+};
+
+class ObExprOracleToDate : public ObExprToTemporalBase
+{
+public:
+  explicit ObExprOracleToDate(common::ObIAllocator &alloc) :
+    ObExprToTemporalBase(alloc, T_FUN_SYS_TO_DATE, N_TO_DATE)
+  {
+  }
+  virtual ~ObExprOracleToDate() {}
+
+  int set_my_result_from_ob_time(common::ObExprCtx &expr_ctx,
+                                 common::ObTime &ob_time,
+                                 common::ObObj &result) const;
+  common::ObObjType get_my_target_obj_type() const
+  {
+    return common::ObDateTimeType;
+  }
+
+};
+
+} //sql
+} //oceanbase
+#endif //OCEANBASE_SQL_OB_EXPR_STR_TO_DATE_H_

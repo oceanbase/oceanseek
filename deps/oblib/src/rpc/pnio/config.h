@@ -1,0 +1,28 @@
+/**
+ * Copyright (c) 2023 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+ 
+#define PNIO_ENABLE_CRC 0
+#define PNIO_ENABLE_DELAY_WARN 1
+
+#if PNIO_ENABLE_CRC
+#define PNIO_CRC(...) __VA_ARGS__
+#else
+#define PNIO_CRC(...)
+#endif
+
+#if PNIO_ENABLE_DELAY_WARN
+#define PNIO_DELAY_WARN(...) __VA_ARGS__
+#else
+#define PNIO_DELAY_WARN(...)
+#endif
+
+
+#define FLUSH_DELAY_WARN_US 100000
+#define HANDLE_DELAY_WARN_US 100000
+#define ELOOP_WARN_US 100000
+#define EPOLL_HANDLE_TIME_LIMIT 100000
+#define MAX_REQ_QUEUE_COUNT   4096
+#define MAX_WRITE_QUEUE_COUNT 8192
+#define MAX_CATEG_COUNT 4096

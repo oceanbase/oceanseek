@@ -1,0 +1,79 @@
+# owner: wx372254
+# owner group: transaction
+# description: this case is used for testing basic transactional deadlock detector case
+
+set GLOBAL ob_query_timeout = 1000000000000;
+set GLOBAL ob_trx_timeout = 10000000000000;
+set GLOBAL ob_trx_idle_timeout = 10000000000;
+
+connect (conn1,$OBMYSQL_MS0,$OBMYSQL_USR,$OBMYSQL_PWD,test,$OBMYSQL_PORT);
+connect (conn2,$OBMYSQL_MS0,$OBMYSQL_USR,$OBMYSQL_PWD,test,$OBMYSQL_PORT);
+connect (conn3,$OBMYSQL_MS0,$OBMYSQL_USR,$OBMYSQL_PWD,test,$OBMYSQL_PORT);
+connect (conn0,$OBMYSQL_MS0,admin,$OBMYSQL_PWD,oceanbase,$OBMYSQL_PORT);
+
+connection conn0;
+alter system set _lcl_op_interval = '10ms';
+set global ob_sql_audit_percentage = 50;
+commit;
+
+connection conn1;
+--disable_warnings
+drop table if exists deadlock_test;
+--enable_warnings
+
+create table deadlock_test(a int primary key, b int);
+commit;
+
+# ================= CASE 1: local/remote execution deadlock =================
+connection conn1;
+begin;
+insert into deadlock_test values(1, 1); # hold sql
+insert into deadlock_test values(1000, 1); # unrelated sql
+insert into deadlock_test values(1001, 1); # unrelated sql
+update deadlock_test set b = 2 where a = 1;
+
+connection conn2;
+sleep 1; # used for priority reason
+begin;
+insert into deadlock_test values(1002, 1); # unrelated sql
+insert into deadlock_test values(2, 1); # hold sql
+insert into deadlock_test values(1003, 1); # unrelated sql
+
+connection conn3;
+sleep 1; # used for priority reason
+begin;
+insert into deadlock_test values(1004, 1); # unrelated sql
+insert into deadlock_test values(1005, 1); # unrelated sql
+insert into deadlock_test values(3, 1); # hold sql
+send insert into deadlock_test values(1, 1);# wait sql
+
+connection conn1;
+send insert into deadlock_test values(2, 1);# wait sql
+
+connection conn2;
+send insert into deadlock_test values(3, 1);# wait sql
+
+connection conn3;
+--error 1213
+reap;
+rollback;
+
+connection conn2;
+reap;
+rollback;
+
+connection conn1;
+reap;
+rollback;
+
+--disable_warnings
+--error 0,942
+drop table deadlock_test;
+commit;
+--enable_warnings
+
+select EXTRA_NAME1,EXTRA_VALUE1,EXTRA_NAME3,EXTRA_VALUE3 from oceanbase.DBA_OB_DEADLOCK_EVENT_HISTORY order by REPORT_TIME desc, EXTRA_VALUE1 desc limit 3;
+
+connection conn0;
+alter system flush sql audit global;
+set global ob_sql_audit_percentage = 3;

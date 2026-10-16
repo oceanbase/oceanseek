@@ -1,0 +1,371 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX STORAGE
+
+#include "storage/ddl/ob_ddl_inc_clog.h"
+#include "storage/ob_storage_schema.h"
+#include "storage/ddl/ob_inc_ddl_merge_task_utils.h"
+#include "storage/lob/common/ob_lob_util.h"
+
+namespace oceanbase
+{
+namespace storage
+{
+using namespace common;
+using namespace transaction;
+
+ObDDLIncLogBasic::ObDDLIncLogBasic()
+  : tablet_id_(),
+    lob_meta_tablet_id_(),
+    lob_piece_tablet_id_(),
+    direct_load_type_(ObDirectLoadType::DIRECT_LOAD_INVALID),
+    trans_id_(),
+    seq_no_(),
+    snapshot_version_(0),
+    data_format_version_(0)
+{
+}
+
+int ObDDLIncLogBasic::init(
+    const ObTabletID &tablet_id,
+    const ObTabletID &lob_meta_tablet_id,
+    const ObTabletID &lob_piece_tablet_id,
+    const ObDirectLoadType direct_load_type,
+    const ObTransID &trans_id,
+    const ObTxSEQ &seq_no,
+    const int64_t snapshot_version,
+    const uint64_t data_format_version)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!tablet_id.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(tablet_id));
+  } else if (OB_UNLIKELY(!is_incremental_direct_load(direct_load_type))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("only support incremental direct load type", KR(ret), K(direct_load_type));
+  } else if (OB_UNLIKELY(is_data_version_support_lob_direct_load(data_format_version)
+                         && lob_meta_tablet_id.is_valid() != lob_piece_tablet_id.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("lob auxiliary tablet ids are not paired", KR(ret),
+        K(lob_meta_tablet_id), K(lob_piece_tablet_id), K(data_format_version));
+  } else if (OB_UNLIKELY(lob_piece_tablet_id.is_valid()
+                         && !is_data_version_support_lob_direct_load(data_format_version))) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("data version does not support lob direct load", KR(ret),
+        K(lob_piece_tablet_id), K(data_format_version));
+  } else if (is_incremental_major_direct_load(direct_load_type)
+          && OB_UNLIKELY(!trans_id.is_valid()
+                      || !seq_no.is_valid()
+                      || (snapshot_version <= 0)
+                      || !is_data_version_support_inc_major_direct_load(data_format_version))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments for incremental major direct load", KR(ret),
+        K(direct_load_type), K(trans_id), K(seq_no), K(snapshot_version), K(data_format_version));
+  } else {
+    tablet_id_ = tablet_id;
+    lob_meta_tablet_id_ = lob_meta_tablet_id;
+    lob_piece_tablet_id_ = lob_piece_tablet_id;
+    direct_load_type_ = direct_load_type;
+    trans_id_ = trans_id;
+    seq_no_ = seq_no;
+    snapshot_version_ = snapshot_version;
+    data_format_version_ = data_format_version;
+  }
+
+  return ret;
+}
+
+uint64_t ObDDLIncLogBasic::hash() const 
+{ 
+  uint64_t hash_val = 0;
+  hash_val = common::murmurhash(&tablet_id_, sizeof(tablet_id_), hash_val);
+  hash_val = common::murmurhash(&lob_meta_tablet_id_, sizeof(lob_meta_tablet_id_), hash_val);
+  hash_val = common::murmurhash(&lob_piece_tablet_id_, sizeof(lob_piece_tablet_id_), hash_val);
+  hash_val = common::murmurhash(&direct_load_type_, sizeof(direct_load_type_), hash_val);
+  hash_val = common::murmurhash(&trans_id_, sizeof(trans_id_), hash_val);
+  hash_val = common::murmurhash(&seq_no_, sizeof(seq_no_), hash_val);
+  return hash_val;
+}
+
+int ObDDLIncLogBasic::hash(uint64_t &hash_val) const 
+{
+  hash_val = hash();
+  return OB_SUCCESS;
+}
+
+OB_SERIALIZE_MEMBER(ObDDLIncLogBasic, tablet_id_, lob_meta_tablet_id_, direct_load_type_,
+                    trans_id_, seq_no_, snapshot_version_, data_format_version_, 
+                    lob_piece_tablet_id_ // FARM COMPAT WHITELIST
+                  );
+
+/**
+ * ObDDLIncStartLog
+ */
+
+ObDDLIncStartLog::ObDDLIncStartLog()
+  : log_basic_(),
+    has_cs_replica_(false),
+    storage_schema_(nullptr),
+    allocator_("IncStartLog")
+{
+  allocator_.set_tenant_id(MTL_ID());
+}
+
+ObDDLIncStartLog::~ObDDLIncStartLog()
+{
+  reset();
+}
+
+int ObDDLIncStartLog::init(
+    const ObDDLIncLogBasic &log_basic,
+    const bool has_cs_replica,
+    const ObStorageSchema *storage_schema)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!log_basic.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(log_basic));
+  } else if (is_incremental_major_direct_load(log_basic.get_direct_load_type())
+          && (OB_ISNULL(storage_schema) || !storage_schema->is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments for incremental major direct load", KR(ret),
+        K(log_basic), KPC(storage_schema));
+  } else if (OB_FAIL(set_storage_schema(*storage_schema))) {
+    LOG_WARN("failed to set storage schema", KR(ret), KPC(storage_schema));
+  } else {
+    log_basic_ = log_basic;
+    has_cs_replica_ = has_cs_replica;
+  }
+  return ret;
+}
+
+bool ObDDLIncStartLog::is_valid() const
+{
+  return log_basic_.is_valid()
+      && (is_incremental_minor_direct_load(log_basic_.get_direct_load_type())
+          || (is_incremental_major_direct_load(log_basic_.get_direct_load_type())
+              && OB_NOT_NULL(storage_schema_)
+              && storage_schema_->is_valid()));
+}
+
+void ObDDLIncStartLog::reset()
+{
+  log_basic_.reset();
+  has_cs_replica_ = false;
+  if (OB_NOT_NULL(storage_schema_)) {
+    storage_schema_->~ObStorageSchema();
+    storage_schema_ = nullptr;
+  }
+  allocator_.reset();
+}
+
+int ObDDLIncStartLog::set_storage_schema(const ObStorageSchema &other)
+{
+  int ret = OB_SUCCESS;
+  char *buf = nullptr;
+  if (OB_UNLIKELY(!other.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid storage schema", KR(ret), K(other));
+  } else if (OB_NOT_NULL(storage_schema_)) {
+  } else if (OB_ISNULL(buf = static_cast<char*>(allocator_.alloc(sizeof(ObStorageSchema))))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate buf", KR(ret), KP(buf));
+  } else {
+    storage_schema_ = new (buf) ObStorageSchema();
+  }
+  
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(storage_schema_->assign(allocator_, other))) {
+    LOG_WARN("failed to assign storage schema", KR(ret), K(other));
+  }
+  return ret;
+}
+
+OB_DEF_SERIALIZE_SIZE(ObDDLIncStartLog)
+{
+  int64_t len = 0;
+  LST_DO_CODE(OB_UNIS_ADD_LEN, log_basic_, has_cs_replica_);
+  if (is_incremental_major_direct_load(log_basic_.get_direct_load_type())) {
+    if (OB_NOT_NULL(storage_schema_)) {
+      len += storage_schema_->get_serialize_size();
+    }
+  }
+  return len;
+}
+
+OB_DEF_SERIALIZE(ObDDLIncStartLog)
+{
+  int ret = OB_SUCCESS;
+  LST_DO_CODE(OB_UNIS_ENCODE, log_basic_, has_cs_replica_);
+  if (OB_FAIL(ret)) {
+  } else if (is_incremental_major_direct_load(log_basic_.get_direct_load_type())) {
+    if (OB_ISNULL(storage_schema_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("storage schema should not be null", KR(ret), K_(log_basic));
+    } else if (OB_FAIL(storage_schema_->serialize(buf, buf_len, pos))) {
+      LOG_WARN("failed to serialize storage schema", KR(ret), K_(log_basic));
+    }
+  }
+  return ret;
+}
+
+OB_DEF_DESERIALIZE(ObDDLIncStartLog)
+{
+  int ret = OB_SUCCESS;
+  reset();
+  LST_DO_CODE(OB_UNIS_DECODE, log_basic_, has_cs_replica_);
+  if (OB_FAIL(ret)) {
+  } else if (is_incremental_major_direct_load(log_basic_.get_direct_load_type())) {
+    if (OB_ISNULL(storage_schema_)) {
+      char *buf = nullptr;
+      if (OB_ISNULL(buf = static_cast<char*>(allocator_.alloc(sizeof(ObStorageSchema))))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate memory", KR(ret), K_(log_basic));
+      } else {
+        storage_schema_ = new (buf) ObStorageSchema();
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(storage_schema_->deserialize(allocator_, buf, data_len, pos))) {
+      LOG_WARN("failed to deserialize storage schema", K(ret), KPC(this));
+    }
+  }
+  return ret;
+}
+
+/**
+ * ObDDLIncCommitLog
+ */
+
+ObDDLIncCommitLog::ObDDLIncCommitLog()
+  : allocator_(ObMemAttr(MTL_ID(), "INC_COMMIT_LOG")),
+    log_basic_(),
+    is_rollback_(false),
+    is_co_sstable_(false),
+    start_scn_()
+{
+}
+
+ObDDLIncCommitLog::~ObDDLIncCommitLog()
+{
+  if (!lob_piece_inc_major_buffer_.empty()) {
+    allocator_.free(lob_piece_inc_major_buffer_.ptr());
+    lob_piece_inc_major_buffer_.reset();
+  }
+  if (!lob_meta_inc_major_buffer_.empty()) {
+    allocator_.free(lob_meta_inc_major_buffer_.ptr());
+    lob_meta_inc_major_buffer_.reset();
+  }
+  if (!data_inc_major_buffer_.empty()) {
+    allocator_.free(data_inc_major_buffer_.ptr());
+    data_inc_major_buffer_.reset();
+  }
+  allocator_.reset();
+}
+
+int ObDDLIncCommitLog::init(const ObDDLIncLogBasic &log_basic, const bool is_rollback, const share::SCN start_scn)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!log_basic.is_valid()) || !start_scn.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(log_basic), K(start_scn));
+  } else {
+    log_basic_ = log_basic;
+    is_rollback_ = is_rollback;
+    start_scn_ = start_scn;
+  }
+  return ret;
+}
+
+#ifdef OB_BUILD_SHARED_STORAGE
+int ObDDLIncCommitLog::set_ss_inc_major(
+    const ObSSTable *data_inc_major,
+    const ObSSTable *lob_meta_inc_major,
+    const ObSSTable *lob_piece_inc_major)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(ObIncDDLMergeTaskUtils::serialize_inc_major_to_string(allocator_,
+                                                                    data_inc_major,
+                                                                    log_basic_.get_data_format_version(),
+                                                                    data_inc_major_buffer_))) {
+    LOG_WARN("fail to serialize inc major", KR(ret));
+  } else if (log_basic_.get_lob_meta_tablet_id().is_valid()
+             && OB_FAIL(ObIncDDLMergeTaskUtils::serialize_inc_major_to_string(allocator_,
+                                                                              lob_meta_inc_major,
+                                                                              log_basic_.get_data_format_version(),
+                                                                              lob_meta_inc_major_buffer_))) {
+    LOG_WARN("fail to serialize lob meta inc major", KR(ret));
+  } else if (log_basic_.get_lob_piece_tablet_id().is_valid()
+             && OB_FAIL(ObIncDDLMergeTaskUtils::serialize_inc_major_to_string(allocator_,
+                                                                              lob_piece_inc_major,
+                                                                              log_basic_.get_data_format_version(),
+                                                                              lob_piece_inc_major_buffer_))) {
+    LOG_WARN("fail to serialize lob piece inc major", KR(ret));
+  } else {
+    is_co_sstable_ = data_inc_major->is_co_sstable();
+  }
+  return ret;
+}
+#endif
+
+OB_DEF_SERIALIZE_SIZE(ObDDLIncCommitLog)
+{
+  int64_t len = 0;
+  LST_DO_CODE(OB_UNIS_ADD_LEN,
+              log_basic_,
+              is_rollback_,
+              is_co_sstable_,
+              data_inc_major_buffer_,
+              lob_meta_inc_major_buffer_,
+              start_scn_,
+              lob_piece_inc_major_buffer_);
+  return len;
+}
+
+OB_DEF_SERIALIZE(ObDDLIncCommitLog)
+{
+  int ret = OB_SUCCESS;
+  LST_DO_CODE(OB_UNIS_ENCODE,
+              log_basic_,
+              is_rollback_,
+              is_co_sstable_,
+              data_inc_major_buffer_,
+              lob_meta_inc_major_buffer_,
+              start_scn_,
+              lob_piece_inc_major_buffer_);
+  return ret;
+}
+
+OB_DEF_DESERIALIZE(ObDDLIncCommitLog)
+{
+  int ret = OB_SUCCESS;
+  LST_DO_CODE(OB_UNIS_DECODE,
+              log_basic_,
+              is_rollback_,
+              is_co_sstable_,
+              data_inc_major_buffer_,
+              lob_meta_inc_major_buffer_,
+              start_scn_,
+              lob_piece_inc_major_buffer_);
+
+#ifdef OB_BUILD_SHARED_STORAGE
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(ObIncDDLMergeTaskUtils::deep_copy_string_buffer(allocator_, data_inc_major_buffer_))) {
+      LOG_WARN("fail to deep copy string buffer", KR(ret));
+    } else if (OB_FAIL(ObIncDDLMergeTaskUtils::deep_copy_string_buffer(
+        allocator_, lob_meta_inc_major_buffer_))) {
+      LOG_WARN("fail to deep copy string buffer", KR(ret));
+    } else if (OB_FAIL(ObIncDDLMergeTaskUtils::deep_copy_string_buffer(
+        allocator_, lob_piece_inc_major_buffer_))) {
+      LOG_WARN("fail to deep copy string buffer", KR(ret));
+    }
+  }
+#endif
+  return ret;
+}
+
+} // namespace storage
+} // namespace oceanbase

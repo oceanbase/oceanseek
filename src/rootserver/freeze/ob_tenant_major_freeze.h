@@ -1,0 +1,105 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_ROOTSERVER_FREEZE_OB_TENANT_MAJOR_FREEZE_
+#define OCEANBASE_ROOTSERVER_FREEZE_OB_TENANT_MAJOR_FREEZE_
+
+#include "rootserver/freeze/ob_major_merge_scheduler.h"
+#include "share/ob_freeze_info_manager.h"
+#include "rootserver/freeze/ob_major_merge_progress_checker.h"
+#include "rootserver/freeze/ob_zone_merge_manager.h"
+#include "rootserver/freeze/ob_major_merge_info_manager.h"
+#include "rootserver/freeze/ob_freeze_info_detector.h"
+#include "rootserver/freeze/ob_daily_major_freeze_launcher.h"
+
+namespace oceanbase
+{
+namespace share
+{
+class ObIServerTrace;
+namespace schema
+{
+class ObMultiVersionSchemaService;
+}
+}
+namespace rootserver
+{
+
+// major freeze for tenant level merge
+// 1. generate freeze info
+// 2. schedule major merge
+// 3. check major merge whether finish
+// 4. do checksum check
+class ObTenantMajorFreeze
+{
+public:
+  ObTenantMajorFreeze(const uint64_t tenant_id);
+  virtual ~ObTenantMajorFreeze();
+  int init(const bool is_primary_service,
+           common::ObMySQLProxy &sql_proxy,
+           common::ObServerConfig &config,
+           share::schema::ObMultiVersionSchemaService &schema_service,
+           share::ObIServerTrace &server_trace);
+
+  int start();
+  void stop();
+  int wait();
+  int destroy();
+
+  // for switch_role fastly
+  void pause();
+  void resume();
+
+  bool is_paused() const;
+
+  uint64_t get_tenant_id() const { return tenant_id_; }
+  int launch_major_freeze(const ObMajorFreezeReason freeze_reason);
+  int launch_window_compaction(const ObWindowCompactionParam &param);
+  int finish_window_compaction();
+
+  int suspend_merge();
+
+  int resume_merge();
+
+  int clear_merge_error();
+
+  int get_uncompacted_tablets(
+    common::ObArray<share::ObTabletReplica> &uncompacted_tablets,
+    common::ObArray<uint64_t> &uncompacted_table_ids) const;
+
+private:
+  // major merge one by one
+  static const int64_t UNMERGED_VERSION_LIMIT = 1;
+
+  int check_before_freeze(bool is_window_compaction);
+  int check_freeze_info_and_merge_mode(bool is_window_compaction);
+  int check_tenant_status() const;
+
+  int set_freeze_info(const ObMajorFreezeReason freeze_reason);
+  int set_window_compaction_info(const ObWindowCompactionParam &param);
+  int try_continue_window_compaction_task(const ObWindowCompactionParam &param, bool &need_create_new_task);
+
+  bool is_primary_service() const { return is_primary_service_; }
+  int try_schedule_minor_before_major_(const bool is_window_compaction);
+
+private:
+  bool is_inited_;
+  uint64_t tenant_id_;
+  bool is_primary_service_;  // identify ObMajorFreezeServiceType::SERVICE_TYPE_PRIMARY
+
+  ObMajorMergeInfoManager major_merge_info_mgr_;
+  ObMajorMergeInfoDetector major_merge_info_detector_;
+  ObMajorMergeScheduler merge_scheduler_;
+  ObDailyMajorFreezeLauncher daily_launcher_;
+
+  share::schema::ObMultiVersionSchemaService *schema_service_;
+
+  DISALLOW_COPY_AND_ASSIGN(ObTenantMajorFreeze);
+};
+
+} // end namespace rootserver
+} // end namespace oceanbase
+
+#endif // OCEANBASE_FREEZE_ROOTSERVER_OB_TENANT_MAJOR_FREEZE_

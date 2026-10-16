@@ -1,0 +1,164 @@
+/**
+ * Copyright (c) 2023 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#include "storage/fts/utils/ob_ft_ngram_impl.h"
+#define USING_LOG_PREFIX STORAGE_FTS
+
+#include "ob_ngram_ft_parser.h"
+#include "storage/fts/ob_fts_struct.h"
+
+using namespace oceanbase::common;
+using namespace oceanbase::plugin;
+
+namespace oceanbase
+{
+namespace storage
+{
+
+ObNgramFTParser::ObNgramFTParser() : ngram_impl_(), is_inited_(false) {}
+
+ObNgramFTParser::~ObNgramFTParser()
+{
+  reset();
+}
+
+void ObNgramFTParser::reset()
+{
+  ngram_impl_.reset();
+  is_inited_ = false;
+}
+
+int ObNgramFTParser::init(ObFTParserParam *param)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(is_inited_)) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("init twice", K(ret), KPC(param), KPC(this));
+  } else if (OB_ISNULL(param)
+      || OB_ISNULL(param->cs_)
+      || OB_ISNULL(param->fulltext_)
+      || OB_UNLIKELY(0 >= param->ft_length_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments", K(ret), KPC(param));
+  } else if (OB_FAIL(ngram_impl_.init(param->cs_,
+                                      param->fulltext_,
+                                      param->ft_length_,
+                                      param->ngram_token_size_,
+                                      param->ngram_token_size_))) {
+    LOG_WARN("fail to init ngram impl", K(ret), KPC(param));
+  } else {
+    is_inited_ = true;
+  }
+  if (OB_FAIL(ret) && OB_UNLIKELY(!is_inited_)) {
+    reset();
+  }
+  return ret;
+}
+
+int ObNgramFTParser::reuse_parser(const char *fulltext, const int64_t fulltext_len)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("Ngram ft parser has not been inited", K(ret));
+  } else if (OB_UNLIKELY(nullptr == fulltext || 0 >= fulltext_len)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("There are invalid fulltext", K(ret), KP(fulltext), K(fulltext_len));
+  } else if (OB_FAIL(ngram_impl_.reuse_parser(fulltext, fulltext_len))) {
+    LOG_WARN("fail to reuse ngram impl", K(ret));
+  }
+  return ret;
+}
+
+int ObNgramFTParser::get_next_token(
+    const char *&word,
+    int64_t &word_len,
+    int64_t &char_len,
+    int64_t &word_freq)
+{
+  int ret = OB_SUCCESS;
+  word = nullptr;
+  word_len = 0;
+  char_len = 0;
+  word_freq = 0;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ngram ft parser isn't initialized", K(ret), K(is_inited_));
+  } else if (OB_FAIL(ngram_impl_.get_next_token(word, word_len, char_len, word_freq))) {
+    if (OB_ITER_END == ret) {
+    } else {
+      LOG_WARN("fail to get next token", K(ret));
+    }
+  }
+  return ret;
+}
+
+ObNgramFTParserDesc::ObNgramFTParserDesc()
+  : is_inited_(false)
+{
+}
+
+int ObNgramFTParserDesc::init(ObPluginParam *param)
+{
+  is_inited_ = true;
+  return OB_SUCCESS;
+}
+
+int ObNgramFTParserDesc::deinit(ObPluginParam *param)
+{
+  reset();
+  return OB_SUCCESS;
+}
+
+int ObNgramFTParserDesc::segment(
+    ObFTParserParam *param,
+    ObITokenIterator *&iter) const
+{
+  int ret = OB_SUCCESS;
+  ObNgramFTParser *parser = nullptr;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ngram ft parser desc hasn't be initialized", K(ret), K(is_inited_));
+  } else if (OB_ISNULL(param) || OB_ISNULL(param->metadata_alloc_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("there are invalid arguments", K(ret), KPC(param));
+  } else if (OB_ISNULL(parser = OB_NEWx(ObNgramFTParser, param->metadata_alloc_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("fail to allocate ngram ft parser", K(ret));
+  } else {
+    if (OB_FAIL(parser->init(param))) {
+      LOG_WARN("fail to init ngram fulltext parser", K(ret), KPC(param));
+    } else {
+      iter = parser;
+    }
+  }
+  if (OB_FAIL(ret) && OB_NOT_NULL(param) && OB_NOT_NULL(param->metadata_alloc_)) {
+    OB_DELETEx(ObNgramFTParser, param->metadata_alloc_, parser);
+  }
+  return ret;
+}
+
+void ObNgramFTParserDesc::free_token_iter(
+    ObFTParserParam *param,
+    ObITokenIterator *&iter) const
+{
+  if (OB_NOT_NULL(iter)) {
+    abort_unless(nullptr != param);
+    abort_unless(nullptr != param->metadata_alloc_);
+    iter->~ObITokenIterator();
+    param->metadata_alloc_->free(iter);
+  }
+}
+
+int ObNgramFTParserDesc::get_add_word_flag(ObProcessTokenFlag &flag) const
+{
+  int ret = OB_SUCCESS;
+  flag.set_casedown_token();
+  flag.set_groupby_token();
+  return ret;
+}
+
+} // end namespace storage
+} // end namespace oceanbase

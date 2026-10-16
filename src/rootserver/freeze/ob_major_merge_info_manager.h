@@ -1,0 +1,136 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_ROOTSERVER_FREEZE_OB_MAJOR_MERGE_INFO_MANAGER_H_
+#define OCEANBASE_ROOTSERVER_FREEZE_OB_MAJOR_MERGE_INFO_MANAGER_H_
+
+#include "lib/lock/ob_recursive_mutex.h"
+#include "share/ob_freeze_info_manager.h"
+#include "rootserver/freeze/ob_zone_merge_manager.h"
+#include "share/ob_freeze_info_proxy.h"
+#include "common/storage/ob_freeze_define.h"
+#include "share/ob_rpc_struct.h"
+#include "share/scn.h"
+#include "rootserver/freeze/ob_major_freeze_util.h"
+
+namespace oceanbase
+{
+namespace obrpc
+{
+class ObCommonRpcProxy;
+}
+namespace common
+{
+class ObAddr;
+class ObMySQLProxy;
+}
+namespace share
+{
+class ObFreezeInfoManager;
+}
+namespace rootserver
+{
+class ObZoneMergeManager;
+struct ObWindowParameters;
+
+
+// ObMajorMergeInfoManager (tenant level)
+class ObMajorMergeInfoManager
+{
+public:
+  ObMajorMergeInfoManager()
+    : is_inited_(false),
+      tenant_id_(common::OB_INVALID_ID),
+      zone_merge_mgr_(),
+      freeze_info_mgr_(),
+      lock_(common::ObLatchIds::OB_MAJOR_MERGE_INFO_MANAGER_LOCK)
+  {}
+  virtual ~ObMajorMergeInfoManager() {}
+  ObZoneMergeManager &get_zone_merge_mgr() { return zone_merge_mgr_; }
+  share::ObFreezeInfoManager &get_freeze_info_mgr() { return freeze_info_mgr_; }
+  int init(uint64_t tenant_id,
+           common::ObMySQLProxy &sql_proxy);
+  int try_reload();
+  int reload(const bool reload_zone_merge_info = false);
+  void reset_info()
+  {
+    zone_merge_mgr_.reset_merge_info();
+    freeze_info_mgr_.reset_freeze_info();
+  };
+
+  int set_freeze_info(const ObMajorFreezeReason freeze_reason);
+  int set_window_compaction_info(
+      const ObWindowCompactionParam &param,
+      const int64_t expected_epoch);
+  int set_ss_window_freeze_info(const ObWindowCompactionParam &param);
+  // 返回成功时：true 表示需要创建新任务；false 表示已更新窗口起点，继续原 target_scn 的任务。
+  int try_continue_window_compaction_task(const ObWindowCompactionParam &param, bool &need_create_new_task);
+  int finish_window_compaction(
+      const int64_t expected_epoch);
+  int finish_ss_window_compaction(
+      const int64_t expected_epoch,
+      const share::SCN &target_scn);
+  int get_freeze_info(const share::SCN &frozen_scn,
+                      share::ObFreezeInfo &frozen_status);
+
+  int renew_snapshot_gc_scn();
+  int try_gc_freeze_info();
+  int try_update_zone_info(const int64_t expected_epoch);
+
+  int check_snapshot_gc_scn();
+  int check_need_broadcast(bool &need_broadcast);
+  int broadcast_freeze_info(const int64_t expected_epoch);
+  int sync_window_compaction_start_time(const int64_t expected_epoch, bool &updated);
+  int get_local_latest_freeze_info(share::ObFreezeInfo &freeze_info);
+  int adjust_global_merge_info(const int64_t expected_epoch);
+  int get_gts(share::SCN &gts_scn) const;
+
+private:
+  // used for set freeze info
+  int generate_frozen_scn(
+      const share::SCN &snapshot_gc_scn,
+      share::SCN &new_frozen_scn);
+  int get_schema_version(
+      const share::SCN &frozen_scn,
+      int64_t &schema_version) const;
+  int check_can_set_ss_window_freeze_info_(const share::ObGlobalMergeInfo &global_merge_info) const;
+  int inner_set_ss_window_freeze_info_(
+      const int64_t window_start_time_us,
+      const int64_t window_duration_us,
+      const share::ObGlobalMergeInfo &global_merge_info,
+      share::ObFreezeInfo &freeze_info);
+  int check_window_compaction_task(
+      const share::SCN &target_scn,
+      const int64_t task_start_time_us,
+      const int64_t request_start_time_us,
+      const ObWindowParameters &window_params,
+      const share::ObGlobalMergeInfo &global_info,
+      bool &need_update_window_start_time) const;
+  int get_pending_window_task_(
+      const share::ObFreezeInfo &freeze_info,
+      const share::ObGlobalMergeInfo &global_merge_info,
+      bool &is_ss_window_task,
+      int64_t &window_start_time_us) const;
+
+  int inner_get_min_freeze_info(share::ObFreezeInfo &frozen_status);
+
+public:
+  static const int64_t SNAPSHOT_GC_TS_WARN = 30LL * 60LL * 1000LL * 1000LL;
+  static const int64_t SNAPSHOT_GC_TS_ERROR = 2LL * 60LL * 60LL * 1000LL * 1000LL;
+
+private:
+  bool is_inited_;
+  int64_t tenant_id_;
+  ObZoneMergeManager zone_merge_mgr_;
+  share::ObFreezeInfoManager freeze_info_mgr_;
+  mutable common::ObRecursiveMutex lock_;
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObMajorMergeInfoManager);
+};
+
+} // rootserver
+} // oceanbase
+#endif // OCEANBASE_ROOTSERVER_FREEZE_OB_MAJOR_MERGE_INFO_MANAGER_H_

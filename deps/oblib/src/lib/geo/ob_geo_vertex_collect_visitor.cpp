@@ -1,0 +1,69 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX LIB
+#include "ob_geo_vertex_collect_visitor.h"
+
+namespace oceanbase {
+namespace common {
+
+bool ObGeoVertexCollectVisitor::prepare(ObGeometry *geo)
+{
+  bool bret = true;
+  if (OB_ISNULL(geo)) {
+    bret = false;
+  }
+  return bret;
+}
+
+int ObGeoVertexCollectVisitor::visit(ObIWkbPoint *geo)
+{
+  int ret = OB_SUCCESS;
+  ObPoint2d vertex;
+  vertex.x = geo->x();
+  vertex.y = geo->y();
+  if (OB_FAIL(vertexes_.push_back(vertex))) {
+    LOG_WARN("failed to add vertex to cached geo", K(ret));
+  } else {
+    if (std::isnan(x_min_)) {
+      x_min_ = vertex.x;
+    } else {
+      x_min_ = std::min(x_min_, vertex.x);
+    }
+    if (std::isnan(x_max_)) {
+      x_max_ = vertex.x;
+    } else {
+      x_max_ = std::max(x_max_, vertex.x);
+    }
+    if (std::isnan(y_min_)) {
+      y_min_ = vertex.y;
+    } else {
+      y_min_ = std::min(y_min_, vertex.y);
+    }
+    if (std::isnan(y_max_)) {
+      y_max_ = vertex.y;
+    } else {
+      y_max_ = std::max(y_max_, vertex.y);
+    }
+  }
+  return ret;
+}
+
+int ObGeo3DVertexCollectVisitor::visit_pointz_inner(double x, double y, double z)
+{
+  int ret = OB_SUCCESS;
+  ObPoint3dVertex vertex;
+  vertex.x = x;
+  vertex.y = y;
+  vertex.z = z;
+  
+  if (OB_FAIL(vertexes_.push_back(vertex))) {
+    LOG_WARN("failed to add 3D vertex to collection", K(ret), K(x), K(y), K(z));
+  }
+  return ret;
+}
+
+} // namespace common
+} // namespace oceanbase

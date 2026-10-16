@@ -1,0 +1,234 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef DEV_SRC_SQL_DAS_OB_DAS_DEF_REG_H_
+#define DEV_SRC_SQL_DAS_OB_DAS_DEF_REG_H_
+#include <type_traits>
+#include "sql/das/ob_das_define.h"
+
+namespace oceanbase
+{
+namespace sql
+{
+namespace das_reg
+{
+template <int>
+struct ObDASOpTypeTraits
+{
+
+  constexpr static bool registered_ = false;
+  //attached_=false means this computation is bound to other operations for execution
+  //and does not have its own operator.
+  constexpr static bool attached_ = false;
+  typedef char DASOp;
+  typedef char DASOpResult;
+  typedef char DASCtDef;
+  typedef char DASRtDef;
+};
+
+template <typename T>
+struct ObDASOpTraits
+{
+  constexpr static int type_ = 0;
+};
+}  // namespace das_reg
+
+#define REGISTER_DAS_OP(type, op, op_result, ctdef, rtdef)                                      \
+  namespace das_reg {                                                                           \
+  template<>                                                                                    \
+  struct ObDASOpTypeTraits<type>                                                                \
+  {                                                                                             \
+    constexpr static bool registered_ = true;                                                   \
+    constexpr static bool attached_ = false;                                                    \
+    typedef op DASOp;                                                                           \
+    typedef op_result DASOpResult;                                                              \
+    typedef ctdef DASCtDef;                                                                     \
+    typedef rtdef DASRtDef;                                                                     \
+  };                                                                                            \
+  template <> struct ObDASOpTraits<op> { constexpr static int type_ = type; };                  \
+  }
+
+class ObDASScanOp;
+class ObDASScanResult;
+struct ObDASScanCtDef;
+struct ObDASScanRtDef;
+REGISTER_DAS_OP(DAS_OP_TABLE_SCAN, ObDASScanOp, ObDASScanResult, ObDASScanCtDef, ObDASScanRtDef);
+
+class ObDASInsertOp;
+class ObDASInsertResult;
+struct ObDASInsCtDef;
+struct ObDASInsRtDef;
+REGISTER_DAS_OP(DAS_OP_TABLE_INSERT, ObDASInsertOp, ObDASInsertResult, ObDASInsCtDef, ObDASInsRtDef);
+
+class ObDASDeleteOp;
+class ObDASDeleteResult;
+struct ObDASDelCtDef;
+struct ObDASDelRtDef;
+REGISTER_DAS_OP(DAS_OP_TABLE_DELETE, ObDASDeleteOp, ObDASDeleteResult, ObDASDelCtDef, ObDASDelRtDef);
+
+class ObDASUpdateOp;
+class ObDASUpdateResult;
+struct ObDASUpdCtDef;
+struct ObDASUpdRtDef;
+REGISTER_DAS_OP(DAS_OP_TABLE_UPDATE, ObDASUpdateOp, ObDASUpdateResult, ObDASUpdCtDef, ObDASUpdRtDef);
+
+class ObDASLockOp;
+class ObDASLockResult;
+struct ObDASLockCtDef;
+struct ObDASLockRtDef;
+REGISTER_DAS_OP(DAS_OP_TABLE_LOCK, ObDASLockOp, ObDASLockResult, ObDASLockCtDef, ObDASLockRtDef);
+
+class ObDASGroupScanOp;
+class ObDASScanResult;
+struct ObDASScanCtDef;
+struct ObDASScanRtDef;
+REGISTER_DAS_OP(DAS_OP_TABLE_BATCH_SCAN, ObDASGroupScanOp, ObDASScanResult, ObDASScanCtDef, ObDASScanRtDef);
+
+class ObDASSplitRangesOp;
+class ObDASSplitRangesResult;
+class ObDASEmptyCtDef;
+class ObDASEmptyRtDef;
+REGISTER_DAS_OP(DAS_OP_SPLIT_MULTI_RANGES, ObDASSplitRangesOp, ObDASSplitRangesResult, ObDASEmptyCtDef, ObDASEmptyRtDef);
+
+class ObDASRangesCostOp;
+class ObDASRangesCostResult;
+REGISTER_DAS_OP(DAS_OP_GET_RANGES_COST, ObDASRangesCostOp, ObDASRangesCostResult, ObDASEmptyCtDef, ObDASEmptyRtDef);
+
+#undef REGISTER_DAS_OP
+
+class ObDASEmptyOp;
+class ObDASEmptyResult;
+#define REGISTER_DAS_ATTACH_OP(type, ctdef, rtdef)                                              \
+  namespace das_reg {                                                                           \
+  template<>                                                                                    \
+  struct ObDASOpTypeTraits<type>                                                                \
+  {                                                                                             \
+    constexpr static bool registered_ = true;                                                   \
+    constexpr static bool attached_ = true;                                                     \
+    typedef ObDASEmptyOp DASOp;                                                                 \
+    typedef ObDASEmptyResult DASOpResult;                                                       \
+    typedef ctdef DASCtDef;                                                                     \
+    typedef rtdef DASRtDef;                                                                     \
+  };                                                                                            \
+  template <> struct ObDASOpTraits<ctdef> { constexpr static int type_ = type; };               \
+  }
+
+struct ObDASTableLookupCtDef;
+struct ObDASTableLookupRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_TABLE_LOOKUP, ObDASTableLookupCtDef, ObDASTableLookupRtDef);
+
+struct ObDASIRScanCtDef;
+struct ObDASIRScanRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_IR_SCAN, ObDASIRScanCtDef, ObDASIRScanRtDef);
+
+struct ObDASVecAuxScanCtDef;
+struct ObDASVecAuxScanRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_VEC_SCAN, ObDASVecAuxScanCtDef, ObDASVecAuxScanRtDef);
+
+struct ObDASIRAuxLookupCtDef;
+struct ObDASIRAuxLookupRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_IR_AUX_LOOKUP, ObDASIRAuxLookupCtDef, ObDASIRAuxLookupRtDef);
+
+struct ObDASSortCtDef;
+struct ObDASSortRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_SORT, ObDASSortCtDef, ObDASSortRtDef);
+
+struct ObDASDocIdMergeCtDef;
+struct ObDASDocIdMergeRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_DOC_ID_MERGE, ObDASDocIdMergeCtDef, ObDASDocIdMergeRtDef);
+
+struct ObDASVIdMergeCtDef;
+struct ObDASVIdMergeRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_VID_MERGE, ObDASVIdMergeCtDef, ObDASVIdMergeRtDef);
+
+struct ObDASFuncLookupCtDef;
+struct ObDASFuncLookupRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_FUNC_LOOKUP, ObDASFuncLookupCtDef, ObDASFuncLookupRtDef);
+
+struct ObDASIndexMergeCtDef;
+struct ObDASIndexMergeRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_INDEX_MERGE, ObDASIndexMergeCtDef, ObDASIndexMergeRtDef);
+
+struct ObDASIndexProjLookupCtDef;
+struct ObDASIndexProjLookupRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_INDEX_PROJ_LOOKUP, ObDASIndexProjLookupCtDef, ObDASIndexProjLookupRtDef);
+
+struct ObDASDomainIdMergeCtDef;
+struct ObDASDomainIdMergeRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_DOMAIN_ID_MERGE, ObDASDomainIdMergeCtDef, ObDASDomainIdMergeRtDef);
+
+struct ObDASIREsMatchCtDef;
+struct ObDASIREsMatchRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_IR_ES_MATCH, ObDASIREsMatchCtDef, ObDASIREsMatchRtDef);
+
+struct ObDASIREsScoreCtDef;
+struct ObDASIREsScoreRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_IR_ES_SCORE, ObDASIREsScoreCtDef, ObDASIREsScoreRtDef);
+
+struct ObDASScalarCtDef;
+struct ObDASScalarRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_SCALAR_QUERY, ObDASScalarCtDef, ObDASScalarRtDef);
+
+struct ObDASScalarScanCtDef;
+struct ObDASScalarScanRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_SCALAR_SCAN_QUERY, ObDASScalarScanCtDef, ObDASScalarScanRtDef);
+
+struct ObDASFusionCtDef;
+struct ObDASFusionRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_FUSION_QUERY, ObDASFusionCtDef, ObDASFusionRtDef);
+
+struct ObDASBooleanQueryCtDef;
+struct ObDASBooleanQueryRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_BOOLEAN_QUERY, ObDASBooleanQueryCtDef, ObDASBooleanQueryRtDef);
+
+struct ObDASMatchCtDef;
+struct ObDASMatchRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_MATCH_QUERY, ObDASMatchCtDef, ObDASMatchRtDef);
+
+struct ObDASMatchPhraseCtDef;
+struct ObDASMatchPhraseRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_MATCH_PHRASE_QUERY, ObDASMatchPhraseCtDef, ObDASMatchPhraseRtDef);
+
+struct ObDASMultiMatchCtDef;
+struct ObDASMultiMatchRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_MULTI_MATCH_QUERY, ObDASMultiMatchCtDef, ObDASMultiMatchRtDef);
+
+struct ObDASQueryStringCtDef;
+struct ObDASQueryStringRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_QUERY_STRING_QUERY, ObDASQueryStringCtDef, ObDASQueryStringRtDef);
+
+struct ObDASVecIndexScanCtDef;
+struct ObDASVecIndexScanRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_VEC_INDEX_SCAN, ObDASVecIndexScanCtDef, ObDASVecIndexScanRtDef);
+
+struct ObDASVecIndexHNSWScanCtDef;
+struct ObDASVecIndexHNSWScanRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_VEC_INDEX_HNSW_SCAN, ObDASVecIndexHNSWScanCtDef, ObDASVecIndexHNSWScanRtDef);
+
+struct ObDASVecIndexIVFScanCtDef;
+struct ObDASVecIndexIVFScanRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_VEC_INDEX_IVF_SCAN, ObDASVecIndexIVFScanCtDef, ObDASVecIndexIVFScanRtDef);
+
+struct ObDASVecIndexDriverCtDef;
+struct ObDASVecIndexDriverRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_VEC_INDEX_DRIVER, ObDASVecIndexDriverCtDef, ObDASVecIndexDriverRtDef);
+
+struct ObDASTopKCollectCtDef;
+struct ObDASTopKCollectRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_TOPK_COLLECT, ObDASTopKCollectCtDef, ObDASTopKCollectRtDef);
+
+struct ObDASNestedQueryCtDef;
+struct ObDASNestedQueryRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_NESTED_QUERY, ObDASNestedQueryCtDef, ObDASNestedQueryRtDef);
+
+struct ObDASVecIndexBruteScanCtDef;
+struct ObDASVecIndexBruteScanRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_VEC_INDEX_BRUTE_SCAN, ObDASVecIndexBruteScanCtDef, ObDASVecIndexBruteScanRtDef);
+
+#undef REGISTER_DAS_ATTACH_OP
+}  // namespace sql
+}  // namespace oceanbase
+
+#endif /* DEV_SRC_SQL_DAS_OB_DAS_DEF_REG_H_ */

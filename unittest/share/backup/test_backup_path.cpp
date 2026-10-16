@@ -1,0 +1,145 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#define USING_LOG_PREFIX SHARE
+
+#include "share/backup/ob_backup_path.h"
+#include <gtest/gtest.h>
+
+using namespace oceanbase;
+using namespace common;
+using namespace share;
+
+TEST(ObBackupPathUtil, trim_right_backslash)
+{
+  ObBackupPath path;
+  const char *backup_root_path = "oss://root_backup_dir//";
+  const char *expect_path = "oss://root_backup_dir";
+  ASSERT_EQ(OB_SUCCESS, path.init(backup_root_path));
+  LOG_INFO("dump path", K(path), K(expect_path));
+  ASSERT_EQ(0, path.get_obstr().compare(expect_path));
+
+  path.reset();
+  backup_root_path = "oss://root_backup_dir//affea1/";
+  expect_path = "oss://root_backup_dir//affea1";
+  ASSERT_EQ(OB_SUCCESS, path.init(backup_root_path));
+  LOG_INFO("dump path", K(path), K(expect_path));
+  ASSERT_EQ(0, path.get_obstr().compare(expect_path));
+}
+
+TEST(ObBackupPathUtil, base_data_path)
+{
+  ObBackupPath path;
+  const char *backup_root_path = "oss://root_backup_dir?host=xxx&access_id=xxx&access_key=xxx";
+  const char *cluster_name = "cluster_name";
+  const uint64_t cluster_id = 1;
+  const uint64_t incarnation = 1;
+  const uint64_t tenant_id = 1002;
+  const uint64_t full_backup_set_id = 8;
+  const uint64_t inc_backup_set_id = 9;
+  const uint64_t table_id = 1100611139453888LL;
+  const uint64_t part_id = 1152921509170249728LL;
+  const uint64_t task_id = 12345;
+  const uint64_t sub_task_id = 33;
+  const uint64_t retry_cnt0 = 0;
+  const uint64_t retry_cnt1 = 1;
+  const char *full_backup_set_path = "oss://root_backup_dir/cluster_name/1/incarnation_1/1002/data/backup_set_8";
+  const char *inc_backup_set_path  = "oss://root_backup_dir/cluster_name/1/incarnation_1/1002/data/backup_set_8/"
+      "backup_9";
+
+  const char *meta_index_path  = "oss://root_backup_dir/cluster_name/1/incarnation_1/1002/data/backup_set_8/"
+      "backup_9/meta_index_file_12345";
+  const char *meta_file_path  = "oss://root_backup_dir/cluster_name/1/incarnation_1/1002/data/backup_set_8/"
+      "backup_9/meta_file_12345";
+
+  const char *pg_data_path  = "oss://root_backup_dir/cluster_name/1/incarnation_1/1002/data/backup_set_8/"
+      "data/1100611139453888/1152921509170249728";
+  const char *sstable_macro_index_path0  = "oss://root_backup_dir/cluster_name/1/incarnation_1/1002/data/backup_set_8/"
+      "data/1100611139453888/1152921509170249728/sstable_macro_index_9";
+  const char *sstable_macro_index_path1  = "oss://root_backup_dir/cluster_name/1/incarnation_1/1002/data/backup_set_8/"
+      "data/1100611139453888/1152921509170249728/sstable_macro_index_9.1";
+  const char *macro_block_index_path0  = "oss://root_backup_dir/cluster_name/1/incarnation_1/1002/data/backup_set_8/"
+      "data/1100611139453888/1152921509170249728/macro_block_index_9";
+  const char *macro_block_index_path1  = "oss://root_backup_dir/cluster_name/1/incarnation_1/1002/data/backup_set_8/"
+      "data/1100611139453888/1152921509170249728/macro_block_index_9.1";
+  const char *macro_block_path = "oss://root_backup_dir/cluster_name/1/incarnation_1/1002/data/backup_set_8/"
+      "data/1100611139453888/1152921509170249728/macro_block_9.33";
+}
+
+TEST(ObBackupPathUtil, get_basename)
+{
+  ObBackupPath path;
+  ObBackupPathString basename;
+
+  ASSERT_EQ(OB_NOT_INIT, path.get_basename(basename));
+
+  const char *p1 = "oss://root_backup_dir/cluster_name/file";
+  ASSERT_EQ(OB_SUCCESS, path.init(p1));
+  ASSERT_EQ(OB_SUCCESS, path.get_basename(basename));
+  ASSERT_STREQ("file", basename.ptr());
+
+  path.reset();
+  basename.reset();
+  const char *p2 = "oss://root_backup_dir//affea1";
+  ASSERT_EQ(OB_SUCCESS, path.init(p2));
+  ASSERT_EQ(OB_SUCCESS, path.get_basename(basename));
+  ASSERT_STREQ("affea1", basename.ptr());
+
+  path.reset();
+  basename.reset();
+  const char *p3 = "oss://root_backup_dir/cluster_name/1/incarnation_1/1002/data/backup_set_8/";
+  ASSERT_EQ(OB_SUCCESS, path.init(p3));
+  ASSERT_EQ(OB_SUCCESS, path.get_basename(basename));
+  ASSERT_STREQ("backup_set_8", basename.ptr());
+  
+}
+
+TEST(ObBackupPathUtil, ls_attr_candidate_snapshot_identity)
+{
+  ObBackupDest dest;
+  ASSERT_EQ(OB_SUCCESS, dest.set("file:///backup/backup_set_1_full"));
+  SCN meta_scn;
+  SCN read_scn;
+  ASSERT_EQ(OB_SUCCESS, meta_scn.convert_for_inner_table_field(100));
+  ASSERT_EQ(OB_SUCCESS, read_scn.convert_for_inner_table_field(200));
+  ObBackupPath candidate;
+  ASSERT_EQ(OB_SUCCESS, ObBackupPathUtil::get_backup_ls_attr_candidate_path(
+      dest, 1, meta_scn, read_scn, candidate));
+  ASSERT_STREQ("file:///backup/backup_set_1_full/infos/meta_info/ls_attr_candidate.1.100.200.obbak",
+      candidate.get_ptr());
+
+  ObBackupPath other;
+  ASSERT_EQ(OB_SUCCESS, read_scn.convert_for_inner_table_field(201));
+  ASSERT_EQ(OB_SUCCESS, ObBackupPathUtil::get_backup_ls_attr_candidate_path(
+      dest, 1, meta_scn, read_scn, other));
+  ASSERT_NE(0, candidate.get_obstr().compare(other.get_obstr()));
+  ASSERT_EQ(OB_SUCCESS, read_scn.convert_for_inner_table_field(200));
+  ASSERT_EQ(OB_SUCCESS, meta_scn.convert_for_inner_table_field(101));
+  ASSERT_EQ(OB_SUCCESS, ObBackupPathUtil::get_backup_ls_attr_candidate_path(
+      dest, 1, meta_scn, read_scn, other));
+  ASSERT_NE(0, candidate.get_obstr().compare(other.get_obstr()));
+  ASSERT_EQ(OB_SUCCESS, meta_scn.convert_for_inner_table_field(100));
+  ASSERT_EQ(OB_SUCCESS, ObBackupPathUtil::get_backup_ls_attr_candidate_path(
+      dest, 2, meta_scn, read_scn, other));
+  ASSERT_NE(0, candidate.get_obstr().compare(other.get_obstr()));
+
+  ObBackupPath published;
+  ASSERT_EQ(OB_SUCCESS, ObBackupPathUtil::get_backup_ls_attr_info_path(dest, 1, published));
+  ASSERT_STREQ("file:///backup/backup_set_1_full/infos/meta_info/ls_attr_info.1.obbak",
+      published.get_ptr());
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ObBackupPathUtil::get_backup_ls_attr_candidate_path(
+      dest, 0, meta_scn, read_scn, other));
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ObBackupPathUtil::get_backup_ls_attr_candidate_path(
+      dest, 1, SCN::min_scn(), read_scn, other));
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ObBackupPathUtil::get_backup_ls_attr_candidate_path(
+      dest, 1, meta_scn, SCN::min_scn(), other));
+}
+
+int main(int argc, char **argv)
+{
+  OB_LOGGER.set_log_level("INFO");
+  testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
+}

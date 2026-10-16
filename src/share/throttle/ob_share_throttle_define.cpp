@@ -1,0 +1,246 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+
+#include "ob_share_throttle_define.h"
+#include "share/throttle/ob_throttle_info.h"
+#include "share/allocator/ob_tenant_vector_allocator.h"
+#include "share/allocator/ob_shared_memory_allocator_mgr.h"
+#include "storage/tx_storage/ob_tenant_freezer.h"
+
+
+namespace oceanbase {
+
+namespace share {
+
+namespace {
+
+// When vector memory usage exceeds 60% of vector config limit, optionally raise tx share
+// effective limit toward total_memory * percent, where percent is 70% if tenant total <= 8G
+// else 80% (same 8G small-tenant boundary as ObTenantVectorAllocator::get_vector_mem_limit_percentage).
+// Gate uses holding_plus_usable_remain (TxShare holding + usable remain from adaptive logic), not
+// raw get_tenant_memory_remain(): it must exceed config_specify_resource_limit to allow upgrade.
+// Effective cap is min(upgrade_limit, holding_plus_usable_remain). Otherwise return config_specify_resource_limit.
+int64_t calc_effective_config_limit(const int64_t tenant_id,
+                                    const int64_t prev_tx_share_limit,
+                                    const int64_t holding_plus_usable_remain,
+                                    const int64_t config_specify_resource_limit)
+{
+  static const int64_t VECTOR_HIGH_USAGE_THRESHOLD_PERCENTAGE = 60;
+  static const int64_t SMALL_TX_SHARE_UPGRADE_LIMIT_PERCENTAGE = 70;
+  static const int64_t LARGE_TX_SHARE_UPGRADE_LIMIT_PERCENTAGE = 80;
+  // Log when |effective - prev_tx_share| exceeds this (diagnostic only; avoids std::abs on int64 diff).
+  static const int64_t TX_SHARE_ADAPTIVE_VECTOR_LOG_DELTA_BYTES = 200LL * 1024 * 1024;
+  // Minimum vector memory usage to emit the above diagnostic (reduce noise when vector is idle).
+  static const int64_t TX_SHARE_ADAPTIVE_VECTOR_LOG_MIN_VECTOR_USAGE_BYTES = 2LL * 1024 * 1024;
+
+  int64_t effective_config_limit = config_specify_resource_limit;
+  int64_t vector_mem_usage = 0;
+  bool is_triggered = false;
+  ObSharedMemAllocMgr *shared_mem_mgr = MTL(ObSharedMemAllocMgr *);
+  if (OB_NOT_NULL(shared_mem_mgr) && MTL_ID() == tenant_id &&
+      holding_plus_usable_remain > config_specify_resource_limit) {
+    int64_t total_memory = lib::get_tenant_memory_limit(tenant_id);
+    vector_mem_usage = shared_mem_mgr->vector_allocator().hold();
+    omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
+    if (tenant_config.is_valid()) {
+      int64_t percent = 0;
+      if (total_memory <= ObTenantVectorAllocator::SMALL_TENANT_MEMORY_LIMIT_BYTES) {
+        percent = SMALL_TX_SHARE_UPGRADE_LIMIT_PERCENTAGE;
+      } else {
+        percent = LARGE_TX_SHARE_UPGRADE_LIMIT_PERCENTAGE;
+      }
+      int64_t vector_limit_pct = ObTenantVectorAllocator::get_vector_mem_limit_percentage(tenant_config, tenant_id);
+      int64_t vector_config_limit = total_memory * vector_limit_pct / 100LL;
+      int64_t tx_share_upgrade_limit = total_memory * percent / 100LL;
+      if (vector_config_limit > 0 &&
+          vector_mem_usage > vector_config_limit * VECTOR_HIGH_USAGE_THRESHOLD_PERCENTAGE / 100LL &&
+          tx_share_upgrade_limit > config_specify_resource_limit) {
+        effective_config_limit = std::min(tx_share_upgrade_limit, holding_plus_usable_remain);
+        is_triggered = true;
+      }
+    }
+  }
+
+  int64_t diff = effective_config_limit >  prev_tx_share_limit ? 
+    (effective_config_limit - prev_tx_share_limit) : (prev_tx_share_limit - effective_config_limit);
+  if (diff > TX_SHARE_ADAPTIVE_VECTOR_LOG_DELTA_BYTES && vector_mem_usage > TX_SHARE_ADAPTIVE_VECTOR_LOG_MIN_VECTOR_USAGE_BYTES) {
+    SHARE_LOG(INFO,
+              "tx share adaptive update happens due to vector memory usage change",
+              "Tenant ID",
+              tenant_id,
+              "Vector Memory Usage(MB)",
+              vector_mem_usage / 1024 / 1024,
+              "Config Specify Resource Limit(MB)",
+              config_specify_resource_limit / 1024 / 1024,
+              "Adaptive Config Limit(MB)",
+              effective_config_limit / 1024 / 1024,
+              "Usable Remain Memory(MB)",
+              holding_plus_usable_remain / 1024 / 1024,
+              "TxShare Last Memory Limit(MB)",
+              prev_tx_share_limit / 1024 / 1024,
+              "Is Triggered", is_triggered);
+  }
+  return effective_config_limit;
+}
+
+}  // namespace
+
+int64_t FakeAllocatorForTxShare::resource_unit_size()
+{
+  static const int64_t SHARE_RESOURCE_UNIT_SIZE = 2L * 1024L * 1024L; /* 2MB */
+  return SHARE_RESOURCE_UNIT_SIZE;
+}
+
+void FakeAllocatorForTxShare::init_throttle_config(int64_t &resource_limit,
+                                                   int64_t &trigger_percentage,
+                                                   int64_t &max_duration)
+{
+  // define some default value
+  const int64_t SR_LIMIT_PERCENTAGE = 60;
+  const int64_t SR_THROTTLE_TRIGGER_PERCENTAGE = 60;
+  const int64_t SR_THROTTLE_MAX_DURATION = 2LL * 60LL * 60LL * 1000LL * 1000LL;  // 2 hours
+
+  int64_t total_memory = lib::get_tenant_memory_limit(MTL_ID());
+
+  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
+  if (tenant_config.is_valid()) {
+    int64_t share_mem_limit = tenant_config->_tx_share_memory_limit_percentage;
+    // if _tx_share_memory_limit_percentage equals 0, use (MAX(memstore_limit_percentage, vector_mem_limit_percentage + 5) + 10) as default value
+    if (0 == share_mem_limit) {
+      int64_t memstore_limit = MTL(ObTenantFreezer*)->get_memstore_limit_percentage();
+      int64_t vector_limit = ObTenantVectorAllocator::get_vector_mem_limit_percentage(tenant_config);
+      share_mem_limit = MAX(memstore_limit, vector_limit + 5) + 10;
+    }
+    resource_limit = total_memory * share_mem_limit / 100LL;
+    trigger_percentage = tenant_config->writing_throttling_trigger_percentage;
+    max_duration = tenant_config->writing_throttling_maximum_duration;
+  } else {
+    resource_limit = total_memory * SR_LIMIT_PERCENTAGE / 100;
+    trigger_percentage = SR_THROTTLE_TRIGGER_PERCENTAGE;
+    max_duration = SR_THROTTLE_MAX_DURATION;
+  }
+}
+
+/**
+ * @brief Because the TxShare may can not use enough memory as the config specified, it need dynamic modify
+ * resource_limit according to the memory remained of the tenant.
+ *
+ * @param[in] holding_size this allocator current holding memory size
+ * @param[in] config_specify_resource_limit the memory limit which _tx_share_memory_limit_percentage specified
+ * @param[out] resource_limit the real limit now
+ * @param[out] last_update_limit_ts last update ts (for performance optimization)
+ * @param[out] is_updated to decide if update_decay_factor() is needed
+ */
+void FakeAllocatorForTxShare::adaptive_update_limit(const int64_t tenant_id,
+                                                    const int64_t holding_size,
+                                                    const int64_t config_specify_resource_limit,
+                                                    int64_t &resource_limit,
+                                                    int64_t &last_update_limit_ts,
+                                                    bool &is_updated)
+{
+  static const int64_t UPDATE_LIMIT_INTERVAL = 100LL * 1000LL; // 100 ms
+  static const int64_t USABLE_REMAIN_MEMORY_PERCETAGE = 60;
+  static const int64_t MAX_UNUSABLE_MEMORY = 2LL * 1024LL * 1024LL * 1024LL; // 2 GB
+
+  int64_t cur_ts = ObClockGenerator::getClock();
+  int64_t old_ts = last_update_limit_ts;
+  if (OB_UNLIKELY(old_ts - cur_ts > (1LL * 1000LL * 1000LL /* 1 second */))) {
+    SHARE_LOG_RET(WARN, OB_ERR_UNEXPECTED, "invalid timestamp", K(cur_ts), K(old_ts));
+  } else if ((cur_ts - old_ts > UPDATE_LIMIT_INTERVAL) && ATOMIC_BCAS(&last_update_limit_ts, old_ts, cur_ts)) {
+    int64_t remain_memory = lib::get_tenant_memory_remain(tenant_id);
+    int64_t usable_remain_memory = remain_memory / 100 * USABLE_REMAIN_MEMORY_PERCETAGE;
+    if (remain_memory > MAX_UNUSABLE_MEMORY) {
+      usable_remain_memory = std::max(usable_remain_memory, remain_memory - MAX_UNUSABLE_MEMORY);
+    }
+
+    int64_t effective_config_limit = calc_effective_config_limit(
+        tenant_id, resource_limit, holding_size + usable_remain_memory, config_specify_resource_limit);
+    bool vector_adjust_flag = false;
+    is_updated = false;
+    if (holding_size + usable_remain_memory < config_specify_resource_limit) {
+      resource_limit = holding_size + usable_remain_memory;
+      is_updated = true;
+    } else if (resource_limit != effective_config_limit) {
+      resource_limit = effective_config_limit;
+      vector_adjust_flag = (effective_config_limit > config_specify_resource_limit);
+      is_updated = true;
+    } else {
+      // do nothing
+    }
+
+    if (is_updated && REACH_TIME_INTERVAL(10LL * 1000LL * 1000LL)) {
+      SHARE_LOG(INFO,
+                "adaptive update",
+                "Tenant ID", tenant_id,
+                "Config Specify Resource Limit(MB)", config_specify_resource_limit / 1024 / 1024,
+                "Adaptive Config Limit(MB)", effective_config_limit / 1024 / 1024,
+                "TxShare Current Memory Limit(MB)", resource_limit / 1024 / 1024,
+                "Holding Memory(MB)", holding_size / 1024 / 1024,
+                "Tenant Remain Memory(MB)", remain_memory / 1024 / 1024,
+                "Usable Remain Memory(MB)", usable_remain_memory / 1024 /1024,
+                "Last Update Limit Timestamp", last_update_limit_ts,
+                "Is Updated", is_updated,
+                "Vector Adjust Flag", vector_adjust_flag);
+    }
+  }
+}
+
+void PrintThrottleUtil::pirnt_throttle_info(const int err_code,
+                                            const char *throttle_unit_name,
+                                            const int64_t sleep_time,
+                                            const int64_t left_interval,
+                                            const int64_t expected_wait_time,
+                                            const int64_t abs_expire_time,
+                                            const ObThrottleInfoGuard &share_ti_guard,
+                                            const ObThrottleInfoGuard &module_ti_guard,
+                                            bool &has_printed_lbt)
+{
+  int ret = err_code;
+  const int64_t WARN_LOG_INTERVAL = 1LL * 60L * 1000L * 1000L /* one minute */;
+  if (sleep_time > (WARN_LOG_INTERVAL) && TC_REACH_TIME_INTERVAL(WARN_LOG_INTERVAL)) {
+    SHARE_LOG(WARN,
+              "[Throttling] Attention!! Sleep More Than One Minute!!",
+              "Throttle Unit Name",
+              throttle_unit_name,
+              K(sleep_time),
+              K(left_interval),
+              K(expected_wait_time),
+              K(abs_expire_time),
+              KPC(share_ti_guard.throttle_info()),
+              KPC(module_ti_guard.throttle_info()));
+    if (!has_printed_lbt) {
+      has_printed_lbt = true;
+      oceanbase::share::ObTaskController::get().allow_next_syslog();
+      SHARE_LOG(INFO,
+                "[Throttling] (report write throttle info) LBT Info",
+                "Throttle Unit Name",
+                throttle_unit_name,
+                K(lbt()));
+    }
+  }
+}
+
+void PrintThrottleUtil::print_throttle_statistic(const int err_code,
+                                                 const char *throttle_unit_name,
+                                                 const int64_t sleep_time,
+                                                 const int64_t throttle_memory_size)
+{
+  int ret = err_code;
+  const int64_t THROTTLE_LOG_INTERVAL = 1L * 1000L * 1000L; /*one seconds*/
+  if (sleep_time > 0 && REACH_TIME_INTERVAL(THROTTLE_LOG_INTERVAL)) {
+    SHARE_LOG(INFO,
+              "[Throttling] (report write throttle info) Time Info",
+              "Throttle Unit Name",
+              throttle_unit_name,
+              "Throttle Sleep Time(us)",
+              sleep_time,
+              "Throttle Memory Size",
+              throttle_memory_size);
+  }
+}
+
+}  // namespace share
+}  // namespace oceanbase

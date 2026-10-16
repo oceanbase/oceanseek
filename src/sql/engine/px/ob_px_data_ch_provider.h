@@ -1,0 +1,108 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef __OB_SQL_ENGINE_PX_DATA_CH_PROVIDER_H__
+#define __OB_SQL_ENGINE_PX_DATA_CH_PROVIDER_H__
+
+#include "lib/lock/ob_spin_rwlock.h"
+#include "lib/lock/ob_thread_cond.h"
+#include "sql/engine/px/ob_dfo.h"
+#include "sql/engine/px/ob_px_dtl_msg.h"
+#include "sql/dtl/ob_dtl_task.h"
+
+namespace oceanbase
+{
+namespace sql
+{
+
+class ObPxChProviderUtil
+{
+public:
+  static int inner_get_data_ch(
+        ObPxTaskChSets &ch_sets,
+        dtl::ObDtlChTotalInfo &ch_total_info,
+        const int64_t sqc_id,
+        const int64_t task_id,
+        ObPxTaskChSet &ch_set,
+        bool is_transmit);
+  static int check_status(int64_t timeout_ts,
+                          const common::ObAddr &qc_addr,
+                          int64_t query_start_time);
+};
+
+class ObPxTransmitChProvider
+{
+public:
+  ObPxTransmitChProvider(ObThreadCond &msg_ready_cond) : msg_set_(false), msg_ready_cond_(msg_ready_cond) {}
+  virtual ~ObPxTransmitChProvider() = default;
+  int init();
+  int get_data_ch(const int64_t sqc_id, const int64_t task_id, int64_t timeout_ts, ObPxTaskChSet &ch_set,
+                  dtl::ObDtlChTotalInfo **ch_info);
+  int get_data_ch_nonblock(const int64_t sqc_id, const int64_t task_id, int64_t timeout_ts,
+            ObPxTaskChSet &ch_set, dtl::ObDtlChTotalInfo **ch_info, const common::ObAddr &qc_addr,
+            int64_t query_start_time);
+  int get_part_ch_map(ObPxPartChInfo &map, int64_t timeout_ts);
+  int get_part_ch_map_nonblock(ObPxPartChInfo &map, int64_t timeout_ts,
+                               const common::ObAddr &qc_addr, int64_t query_start_time);
+  int add_msg(const ObPxTransmitDataChannelMsg &msg);
+private:
+  int wait_msg(int64_t timeout_ts);
+  int inner_get_part_ch_map(ObPxPartChInfo &map);
+private:
+  bool msg_set_;
+  ObPxTransmitDataChannelMsg msg_;
+  common::ObThreadCond &msg_ready_cond_;
+};
+
+class ObPxReceiveChProvider
+{
+public:
+  ObPxReceiveChProvider(ObThreadCond &msg_ready_cond)
+  : msg_ready_cond_(msg_ready_cond),
+    lock_(common::ObLatchIds::DTL_RECV_CHANNEL_PROVIDER_LOCK)
+  {
+  }
+  virtual ~ObPxReceiveChProvider() = default;
+  int init();
+  // 如果 child_dfo_id 的 ch sets 不存在，则等待，由 add_msg 唤醒。
+  int get_data_ch(const int64_t child_dfo_id,
+                  const int64_t sqc_id,
+                  const int64_t task_id,
+                  int64_t timeout_ts,
+                  ObPxTaskChSet &ch_set,
+                  dtl::ObDtlChTotalInfo *ch_info);
+  int get_data_ch_nonblock(const int64_t child_dfo_id,
+                          const int64_t sqc_id,
+                          const int64_t task_id,
+                          int64_t timeout_ts,
+                          ObPxTaskChSet &ch_set,
+                          dtl::ObDtlChTotalInfo *ch_info,
+                          const common::ObAddr &qc_addr,
+                          int64_t query_start_time);
+  int add_msg(const ObPxReceiveDataChannelMsg &msg);
+private:
+  /* functions */
+  int wait_msg(int64_t child_dfo_id, int64_t timeout_ts);
+  int reserve_msg_set_array_size(int64_t size);
+  bool is_msg_set(int64_t child_dfo_id)
+  {
+    SpinRLockGuard lock_guard(lock_);
+    return msg_set_[child_dfo_id];
+  }
+private:
+  static const int64_t MSG_SET_DEFAULT_SIZE = 16;
+private:
+  /* variables */
+  common::ObSEArray<ObPxReceiveDataChannelMsg, 2> msgs_;
+  common::ObThreadCond &msg_ready_cond_;
+  common::ObArray<bool> msg_set_;
+  common::SpinRWLock lock_;
+  DISALLOW_COPY_AND_ASSIGN(ObPxReceiveChProvider);
+};
+
+}
+}
+#endif /* __OB_SQL_ENGINE_PX_DATA_CH_PROVIDER_H__ */
+//// end of header file

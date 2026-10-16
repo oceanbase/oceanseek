@@ -1,0 +1,60 @@
+// owner: muwei.ym
+// owner group: storage_ha
+
+/**
+ * Copyright (c) 2023 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+ 
+#pragma once
+
+#include "simple_server/env/ob_simple_cluster_test_base.h"
+
+namespace oceanbase
+{
+namespace unittest
+{
+
+#define WRITE_SQL_BY_CONN(conn, sql_str)            \
+  ASSERT_EQ(OB_SUCCESS, sql.assign(sql_str)); \
+  ASSERT_EQ(OB_SUCCESS, conn->execute_write(OB_SYS_TENANT_ID, sql.ptr(), affected_rows));
+
+#define WRITE_SQL_FMT_BY_CONN(conn, ...)                                \
+  ASSERT_EQ(OB_SUCCESS, sql.assign_fmt(__VA_ARGS__));                   \
+  ASSERT_EQ(OB_SUCCESS, conn->execute_write(OB_SYS_TENANT_ID, sql.ptr(), affected_rows));
+
+class TestVectorIndexBase : public ObSimpleClusterTestBase {
+
+protected:
+  const static int kDim = 18;
+  const static int kFreezeRowsPerWorker = 1000;
+  const static int kFreezeSearchIters = 1000;
+public:
+  TestVectorIndexBase()
+      : ObSimpleClusterTestBase("test_vector_index", "20G", "20G")
+  {
+  }
+  virtual ~TestVectorIndexBase() = default;
+  void SetUp() override
+  {
+    ObSimpleClusterTestBase::SetUp();
+  }
+
+  int get_current_scn(share::SCN &current_scn); 
+  void insert_data(const int64_t idx, const int64_t insert_cnt);
+  void search_data(const int64_t idx, const int64_t select_cnt);
+  int get_snapshot_metadata(ObPluginVectorIndexAdaptor* adaptor, const ObLSID &ls_id, ObVectorIndexMeta &meta);
+  int check_segment_meta_row(ObPluginVectorIndexAdaptor *adaptor, const ObLSID& ls_id, ObVectorIndexSegmentMeta &seg_meta);
+  int check_vector_index_task_finished(
+      const int64_t max_wait_us = 180LL * 1000 * 1000,
+      const int64_t poll_interval_us = 200LL * 1000);
+  int check_vector_index_task_success();
+  int check_vector_index_task_count(const int64_t expected_cnt);
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(TestVectorIndexBase);
+};
+
+}
+}
+  

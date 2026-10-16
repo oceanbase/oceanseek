@@ -1,0 +1,90 @@
+/**
+ * Copyright (c) 2023 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef __SHARE_OB_CATALOG_META_GETTER_H__
+#define __SHARE_OB_CATALOG_META_GETTER_H__
+
+#include "share/catalog/ob_catalog_location_schema_provider.h"
+#include "share/catalog/ob_external_catalog.h"
+#include "share/schema/ob_schema_getter_guard.h"
+
+namespace oceanbase
+{
+namespace share
+{
+
+class ObCatalogMetaGetter final : public ObICatalogMetaGetter
+{
+public:
+  ObCatalogMetaGetter(schema::ObSchemaGetterGuard &schema_getter_guard, ObIAllocator &allocator)
+      : schema_getter_guard_(schema_getter_guard), location_schema_provider_(schema_getter_guard_),
+        allocator_(allocator)
+  {
+  }
+
+  ~ObCatalogMetaGetter() override;
+
+  int list_namespace_names(const uint64_t tenant_id,
+                           const uint64_t catalog_id,
+                           common::ObIArray<common::ObString> &ns_names) override;
+  int list_table_names(const uint64_t tenant_id,
+                       const uint64_t catalog_id,
+                       const common::ObString &ns_name,
+                       const ObNameCaseMode case_mode,
+                       common::ObIArray<common::ObString> &tbl_names) override;
+  int fetch_namespace_schema(const uint64_t tenant_id,
+                             const uint64_t catalog_id,
+                             const uint64_t database_id,
+                             const common::ObString &ns_name,
+                             const ObNameCaseMode case_mode,
+                             share::schema::ObDatabaseSchema *&database_schema) override;
+
+  // table_schema's table_id/database_id should assign correct before call this function
+  int fetch_lake_table_metadata(ObIAllocator &allocator,
+                                const uint64_t tenant_id,
+                                const uint64_t catalog_id,
+                                const uint64_t database_id,
+                                const uint64_t table_id,
+                                const common::ObString &ns_name,
+                                const common::ObString &tbl_name,
+                                const ObNameCaseMode case_mode,
+                                ObILakeTableMetadata *&table_metadata) override;
+
+  int fetch_latest_table_schema_version(const uint64_t tenant_id,
+                                        const uint64_t catalog_id,
+                                        const common::ObString &ns_name,
+                                        const common::ObString &tbl_name,
+                                        const ObNameCaseMode case_mode,
+                                        int64_t &schema_version);
+
+  int fetch_table_statistics(ObIAllocator &allocator,
+                             sql::ObSqlSchemaGuard &sql_schema_guard,
+                             const ObILakeTableMetadata *table_metadata,
+                             const ObIArray<ObString> &partition_values,
+                             const ObIArray<ObString> &column_names,
+                             common::ObIArray<share::ObOptCatalogTableStat *> &catalog_table_stats,
+                             common::ObIArray<share::ObOptCatalogColumnStat *> &catalog_table_column_stats) override;
+
+  int fetch_partitions(ObIAllocator &allocator,
+                       const ObILakeTableMetadata *table_metadata,
+                       const ObIArray<ObString> &part_col_names,
+                       ObIArray<common::ObCatalogExtPartitionInfo> &partition_infos) override;
+
+  int get_cache_refresh_interval_sec(const ObILakeTableMetadata *table_metadata,
+                                     int64_t &sec) override;
+
+  int get_catalog(const uint64_t tenant_id, const uint64_t catalog_id, ObIExternalCatalog *&catalog);
+
+private:
+  schema::ObSchemaGetterGuard &schema_getter_guard_;
+  ObCatalogLocationSchemaProvider location_schema_provider_;
+  ObArray<CatalogEntry> created_catalog_;
+  ObIAllocator &allocator_;
+};
+
+} // namespace share
+} // namespace oceanbase
+
+#endif // __SHARE_OB_CATALOG_META_GETTER_H__

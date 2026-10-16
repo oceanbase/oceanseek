@@ -1,0 +1,235 @@
+/**
+ * Copyright (c) 2021 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+#ifndef OCEANBASE_ROOTSERVER_FREEZE_OB_MAJOR_FREEZE_HELPER_H_
+#define OCEANBASE_ROOTSERVER_FREEZE_OB_MAJOR_FREEZE_HELPER_H_
+#include "rpc/frame/ob_req_transport.h"
+#include "rootserver/freeze/ob_major_freeze_rpc_define.h"
+#include "share/scn.h"
+#include "rootserver/freeze/ob_major_freeze_util.h"
+
+namespace oceanbase
+{
+namespace share
+{
+class SCN;
+class ObFreezeInfo;
+}
+namespace rootserver
+{
+struct ObMajorFreezeParam
+{
+public:
+  ObMajorFreezeParam()
+    : freeze_info_array_(), freeze_all_(false), 
+      freeze_all_user_(false), freeze_all_meta_(false),
+      freeze_reason_(MF_REASON_MAX), transport_(nullptr)
+  {}
+
+  void reset()
+  {
+    freeze_info_array_.reset();
+    freeze_all_ = false;
+    freeze_all_user_ = false;
+    freeze_all_meta_ = false;
+    freeze_reason_ = MF_REASON_MAX;
+    transport_ = nullptr;
+  }
+
+  bool is_valid() const
+  {
+    return (nullptr != transport_);
+  }
+
+  int add_freeze_info(const uint64_t tenant_id);
+
+  TO_STRING_KV(K_(freeze_info_array), K_(freeze_all), 
+               K_(freeze_all_user), K_(freeze_all_meta),
+               "freeze_reason", major_freeze_reason_to_str(freeze_reason_), KP_(transport));
+
+  common::ObArray<obrpc::ObSimpleFreezeInfo> freeze_info_array_;
+  bool freeze_all_;
+  bool freeze_all_user_;
+  bool freeze_all_meta_;
+  ObMajorFreezeReason freeze_reason_;
+  rpc::frame::ObReqTransport *transport_;
+};
+
+struct ObTenantAdminMergeParam
+{
+public:
+  ObTenantAdminMergeParam()
+    : tenant_array_(), need_all_(false), 
+      need_all_user_(false), need_all_meta_(false), transport_(nullptr)
+  {}
+
+  void reset()
+  {
+    tenant_array_.reset();
+    need_all_ = false;
+    need_all_user_ = false;
+    need_all_meta_ = false;
+    transport_ = nullptr;
+  }
+
+  bool is_valid() const
+  {
+    return (nullptr != transport_) && (!tenant_array_.empty() || 
+                                       (need_all_ || need_all_user_ || need_all_meta_));
+  }
+
+  TO_STRING_KV(K_(tenant_array), K_(need_all), K_(need_all_user), K_(need_all_meta), KP_(transport));
+
+  common::ObArray<uint64_t> tenant_array_;
+  bool need_all_;
+  bool need_all_user_;
+  bool need_all_meta_;
+  rpc::frame::ObReqTransport *transport_;
+};
+
+struct ObTabletMajorFreezeParam
+{
+public:
+  ObTabletMajorFreezeParam()
+    : tenant_id_(0),
+      tablet_id_(),
+      ls_id_(share::ObLSID::INVALID_LS_ID),
+      is_rebuild_column_group_(false)
+    {}
+  ~ObTabletMajorFreezeParam() = default;
+  bool is_valid() const
+  {
+    return is_valid_tenant_id(tenant_id_) && tablet_id_.is_valid();
+  }
+  TO_STRING_KV(K_(tenant_id), K_(tablet_id), K_(ls_id), K_(is_rebuild_column_group));
+  uint64_t tenant_id_;
+  common::ObTabletID tablet_id_;
+  share::ObLSID ls_id_;
+  bool is_rebuild_column_group_;
+};
+
+class ObMajorFreezeHelper
+{
+public:
+  ObMajorFreezeHelper() {}
+  ~ObMajorFreezeHelper() {}
+
+  // @param, contains some tenant_ids which need to launch major freeze
+  // @merge_results, save each tenant's major_freeze result
+  static int major_freeze(const ObMajorFreezeParam &param,
+                          common::ObIArray<int> &merge_results);
+
+  static int major_freeze(const ObMajorFreezeParam &param);
+
+  static int tablet_major_freeze(const ObTabletMajorFreezeParam &param);
+
+  static int table_major_freeze(const obrpc::ObTableMajorFreezeArg &param);
+
+  static int suspend_merge(const ObTenantAdminMergeParam &param);
+
+  static int resume_merge(const ObTenantAdminMergeParam &param);
+
+  static int clear_merge_error(const ObTenantAdminMergeParam &param);
+
+  static int get_frozen_status(const int64_t tenant_id, 
+                               const share::SCN &frozen_scn, 
+                               share::ObFreezeInfo &frozen_status);
+  static int get_frozen_status(const int64_t tenant_id, 
+                               const share::SCN &frozen_scn, 
+                               share::ObFreezeInfo &frozen_status,
+                               ObISQLClient *proxy);
+  static int get_frozen_scn(const int64_t tenant_id, share::SCN &frozen_scn);
+  static int get_frozen_scn(const int64_t tenant_id, share::SCN &frozen_scn, ObISQLClient *proxy);
+
+private:
+  static int get_freeze_info(
+      const ObMajorFreezeParam &param,
+      common::ObIArray<obrpc::ObSimpleFreezeInfo> &freeze_info_array);
+  static int get_all_tenant_freeze_info(
+      common::ObIArray<obrpc::ObSimpleFreezeInfo> &freeze_info_array);
+  static int get_specific_tenant_freeze_info( 
+      bool freeze_all, 
+      bool freeze_all_user, 
+      bool freeze_all_meta, 
+      common::ObIArray<obrpc::ObSimpleFreezeInfo> &freeze_info_array);
+  static int check_tenant_is_restore(const uint64_t tenant_id, bool &is_restore);
+
+  static int do_major_freeze(
+      const rpc::frame::ObReqTransport &transport,
+      const ObMajorFreezeReason freeze_reason,
+      const common::ObIArray<obrpc::ObSimpleFreezeInfo> &freeze_info_array,
+      common::ObIArray<int> &merge_results);
+  static int do_one_tenant_major_freeze(
+      const rpc::frame::ObReqTransport &transport,
+      const ObMajorFreezeReason freeze_reason,
+      const obrpc::ObSimpleFreezeInfo &freeze_info);
+
+  static int do_tenant_admin_merge(
+      const ObTenantAdminMergeParam &param,
+      const obrpc::ObTenantAdminMergeType &admin_type);
+  static int do_one_tenant_admin_merge(
+      const rpc::frame::ObReqTransport &transport,
+      const uint64_t tenant_id,
+      const obrpc::ObTenantAdminMergeType &admin_type);
+  static int add_user_warning(
+      const uint64_t tenant_id,
+      const char *buf);
+
+private:
+  static int get_ls_tablets_result_by_sql(
+      const uint64_t tenant_id,
+      const uint64_t table_id,
+      ObMySQLProxy::MySQLResult &res,
+      common::sqlclient::ObMySQLResult *&result);
+  static int get_next_batch_schedule_tablets(
+      common::sqlclient::ObMySQLResult &result, 
+      bool & need_call_next,
+      int64_t & cur_ls_id,
+      common::ObArray<uint64_t> &batch_schedule_tablet_ids);
+  static int send_tablets_major_freeze_by_ls(
+      const obrpc::ObTableMajorFreezeRpcProxy &proxy,
+      const uint64_t tenant_id,
+      const int64_t ls_id,
+      const common::ObIArray<uint64_t> &tablet_ids,
+      const bool is_rebuild_column_group,
+      const bool is_async_index_force_merge,
+      obrpc::ObTableMajorFreezeResult &result);
+  static int format_table_freeze_error_detail(
+      const obrpc::ObTableMajorFreezeResult &result,
+      common::ObSqlString &detail);
+  static const int64_t MAX_PROCESS_TIME_US = 10 * 1000 * 1000L;
+  static const int64_t BATCH_SCHEDULE_TABLET_COUNT = 100;
+  static const int64_t MAX_RETRY_COUNT = 5;
+};
+
+class ObGlobalCompactionSchemaHelper final
+{
+public:
+  ObGlobalCompactionSchemaHelper() = default;
+  ~ObGlobalCompactionSchemaHelper() = default;
+  static int get_global_safe_recycle_schema_version(
+      const int64_t tenant_id,
+      common::ObMySQLProxy &sql_proxy,
+      share::schema::ObMultiVersionSchemaService &schema_service,
+      int64_t &safe_recycle_schema_version);
+private:
+  static const int64_t MAX_RESERVED_SCHEMA_VERSION_US = 3L * 24L * 3600L * 1000L * 1000L; // 3 days
+private:
+  static int get_safe_recycle_schema_version_by_freeze_info(
+      const int64_t tenant_id,
+      common::ObMySQLProxy &sql_proxy,
+      const share::SCN &last_merged_scn,
+      int64_t &safe_recycle_schema_version);
+  static int get_safe_recycle_schema_version_by_timestamp(
+      const int64_t tenant_id,
+      common::ObMySQLProxy &sql_proxy,
+      int64_t &safe_recycle_schema_version);
+  DISALLOW_COPY_AND_ASSIGN(ObGlobalCompactionSchemaHelper);
+};
+
+} // namespace rootserver
+} // namespace oceanbase
+
+#endif // OCEANBASE_ROOTSERVER_FREEZE_OB_MAJOR_FREEZE_HELPER_H_

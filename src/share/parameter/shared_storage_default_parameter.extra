@@ -1,0 +1,332 @@
+[
+  {
+    "scenario": "express_oltp",
+    "comment" : "for workloads like trade, payment core system, internet high throughput application, etc. no restrictions like foreign key, no stored procedure, no long transaction, no large transaction, no complex join, no complex subquery",
+    "parameters": {
+      "cluster": [
+      ],
+      "tenant": [
+        {
+          "name": "enable_rebalance",
+          "value": "False",
+          "comment": "specifies whether the tenant load-balancing is turned on."
+        },
+        {
+          "name": "_tempstore_read_alignment_size",
+          "value": "1MB",
+          "comment": "The size of data read by tempstore each time is 1MB in shared storage mode."
+        },
+        {
+          "name": "inc_sstable_upload_thread_score",
+          "value": 30,
+          "comment": "The number of upload threads needs to be increased. This value needs to be explored and is tentatively set at 30"
+        },
+        {
+          "name": "_io_read_redundant_limit_percentage",
+          "value": 50,
+          "comment": "Maximum percentage of redundant size in one read io request, redundant data means blocks in the middle of the batch that hit in cache or filtered by skipping index but must be read"
+        },
+        {
+          "name": "_io_read_batch_size",
+          "value": "128KB",
+          "comment": "Maximum batch size in one read io request"
+        },
+        {
+          "name": "_object_storage_io_timeout",
+          "value": "300s",
+          "comment": "default value of object storage io timeout"
+        }
+      ]
+    }
+  },
+  {
+    "scenario": "complex_oltp",
+    "comment" : "for workloads like bank, insurance system. they often have complex join, complex correlated subquery, batch jobs written in PL, have both long and large transactions. Sometimes use parallel execution for short running queries",
+    "parameters": {
+      "cluster": [
+      ],
+      "tenant": [
+        {
+          "name": "enable_rebalance",
+          "value": "False",
+          "comment": "specifies whether the tenant load-balancing is turned on."
+        },
+        {
+          "name": "_tempstore_read_alignment_size",
+          "value": "1MB",
+          "comment": "The size of data read by tempstore each time is 1MB in shared storage mode."
+        },
+        {
+          "name": "inc_sstable_upload_thread_score",
+          "value": 30,
+          "comment": "The number of upload threads needs to be increased. This value needs to be explored and is tentatively set at 30"
+        },
+        {
+          "name": "_io_read_redundant_limit_percentage",
+          "value": 50,
+          "comment": "Maximum percentage of redundant size in one read io request, redundant data means blocks in the middle of the batch that hit in cache or filtered by skipping index but must be read"
+        },
+        {
+          "name": "_io_read_batch_size",
+          "value": "128KB",
+          "comment": "Maximum batch size in one read io request"
+        },
+        {
+          "name": "_object_storage_io_timeout",
+          "value": "300s",
+          "comment": "default value of object storage io timeout"
+        }
+      ]
+    }
+  },
+  {
+    "scenario": "olap",
+    "comment": "for real-time data warehouse analytics scenarios.",
+    "parameters": {
+      "cluster": [
+      ],
+      "tenant": [
+        {
+          "name": "enable_rebalance",
+          "value": "False",
+          "comment": "specifies whether the tenant load-balancing is turned on."
+        },
+        {
+          "name": "_tempstore_read_alignment_size",
+          "value": "1MB",
+          "comment": "The size of data read by tempstore each time is 1MB in shared storage mode."
+        },
+        {
+          "name": "_io_read_batch_size",
+          "value": "512KB",
+          "comment": "Maximum batch size in one read io request"
+        },
+        {
+          "name": "inc_sstable_upload_thread_score",
+          "value": 30,
+          "comment": "The number of upload threads needs to be increased. This value needs to be explored and is tentatively set at 30"
+        },
+        {
+          "name": "_io_read_redundant_limit_percentage",
+          "value": 50,
+          "comment": "Maximum percentage of redundant size in one read io request, redundant data means blocks in the middle of the batch that hit in cache or filtered by skipping index but must be read"
+        },
+        {
+          "name": "_object_storage_io_timeout",
+          "value": "300s",
+          "comment": "default value of object storage io timeout"
+        },
+        {
+          "name": "ha_high_thread_score",
+          "value": 20,
+          "comment":"ha high thread number"
+        },
+        {
+          "name": "_shared_gc_task_scan_batch_size",
+          "value": 100,
+          "comment": "The shared gc executor max rows fetched per scan round."
+        },
+        {
+          "name": "ha_vector_index_thread_score",
+          "value": 0,
+          "comment":"vector index migration serialize thread number, 0 means use default"
+        }
+      ]
+    }
+  },
+  {
+    "scenario": "kv",
+    "comment": "for key-value workloads and hbase-like wide-column workloads, which commonly experience very high throughput and are sensitive to latency",
+    "parameters": {
+      "cluster": [
+      ],
+      "tenant": [
+        {
+          "name": "enable_rebalance",
+          "value": "False",
+          "comment": "specifies whether the tenant load-balancing is turned on."
+        },
+        {
+          "name": "_tempstore_read_alignment_size",
+          "value": "1MB",
+          "comment": "The size of data read by tempstore each time is 1MB in shared storage mode."
+        },
+        {
+          "name": "inc_sstable_upload_thread_score",
+          "value": 30,
+          "comment": "The number of upload threads needs to be increased. This value needs to be explored and is tentatively set at 30"
+        },
+        {
+          "name": "_io_read_redundant_limit_percentage",
+          "value": 50,
+          "comment": "Maximum percentage of redundant size in one read io request, redundant data means blocks in the middle of the batch that hit in cache or filtered by skipping index but must be read"
+        },
+        {
+          "name": "_io_read_batch_size",
+          "value": "128KB",
+          "comment": "Maximum batch size in one read io request"
+        },
+        {
+          "name": "_object_storage_io_timeout",
+          "value": "300s",
+          "comment": "default value of object storage io timeout"
+        },
+        {
+          "name": "_local_cache_evict_old_sstable_policy",
+          "value": "MAJOR_SSTABLE",
+          "comment": "The policy of local cache eviction of old sstable data in shared storage mode."
+        }
+      ]
+    }
+  },
+  {
+    "scenario": "htap",
+    "comment": "for mixed OLAP and OLTP workload. Typically utilized for obtaining instant insights from active operational data, fraud detection, and personalized recommendations",
+    "parameters": {
+      "cluster": [
+      ],
+      "tenant": [
+        {
+          "name": "enable_rebalance",
+          "value": "False",
+          "comment": "specifies whether the tenant load-balancing is turned on."
+        },
+        {
+          "name": "_tempstore_read_alignment_size",
+          "value": "1MB",
+          "comment": "The size of data read by tempstore each time is 1MB in shared storage mode."
+        },
+        {
+          "name": "inc_sstable_upload_thread_score",
+          "value": 30,
+          "comment": "The number of upload threads needs to be increased. This value needs to be explored and is tentatively set at 30"
+        },
+        {
+          "name": "_io_read_redundant_limit_percentage",
+          "value": 50,
+          "comment": "Maximum percentage of redundant size in one read io request, redundant data means blocks in the middle of the batch that hit in cache or filtered by skipping index but must be read"
+        },
+        {
+          "name": "_io_read_batch_size",
+          "value": "128KB",
+          "comment": "Maximum batch size in one read io request"
+        },
+        {
+          "name": "_object_storage_io_timeout",
+          "value": "300s",
+          "comment": "default value of object storage io timeout"
+        }
+      ]
+    }
+  },
+  {
+    "scenario": "express_oltp_perf",
+    "comment" : "for high performance workloads like trade, payment core system, internet high throughput application, etc. no restrictions like foreign key, no stored procedure, no long transaction, no large transaction, no complex join, no complex subquery",
+    "parameters": {
+      "cluster": [
+      ],
+      "tenant": [
+        {
+          "name": "_tempstore_read_alignment_size",
+          "value": "1MB",
+          "comment": "The size of data read by tempstore each time is 1MB in shared storage mode."
+        },
+        {
+          "name": "inc_sstable_upload_thread_score",
+          "value": 30,
+          "comment": "The number of upload threads needs to be increased. This value needs to be explored and is tentatively set at 30"
+        },
+        {
+          "name": "_io_read_redundant_limit_percentage",
+          "value": 50,
+          "comment": "Maximum percentage of redundant size in one read io request, redundant data means blocks in the middle of the batch that hit in cache or filtered by skipping index but must be read"
+        },
+        {
+          "name": "_io_read_batch_size",
+          "value": "128KB",
+          "comment": "Maximum batch size in one read io request"
+        },
+        {
+          "name": "_object_storage_io_timeout",
+          "value": "300s",
+          "comment": "default value of object storage io timeout"
+        }
+      ]
+    }
+  },
+  {
+    "scenario": "ai",
+    "comment": "Supports AI Agents in scenarios such as data storage, memory management, and hybrid search.",
+    "variables": {
+      "cluster": [
+      ],
+      "tenant": [
+        {
+          "name": "enable_rebalance",
+          "value": "False",
+          "comment": "specifies whether the tenant load-balancing is turned on."
+        },
+        {
+          "name": "_tempstore_read_alignment_size",
+          "value": "1MB",
+          "comment": "The size of data read by tempstore each time is 1MB in shared storage mode."
+        },
+        {
+          "name": "inc_sstable_upload_thread_score",
+          "value": 30,
+          "comment": "The number of upload threads needs to be increased. This value needs to be explored and is tentatively set at 30"
+        },
+        {
+          "name": "_io_read_redundant_limit_percentage",
+          "value": 50,
+          "comment": "Maximum percentage of redundant size in one read io request, redundant data means blocks in the middle of the batch that hit in cache or filtered by skipping index but must be read"
+        },
+        {
+          "name": "_io_read_batch_size",
+          "value": "128KB",
+          "comment": "Maximum batch size in one read io request"
+        },
+        {
+          "name": "_object_storage_io_timeout",
+          "value": "300s",
+          "comment": "default value of object storage io timeout"
+        }
+      ]
+    }
+  },
+  {
+    "scenario": "history_oltp",
+    "comment": "Suitable for businesses with large data volumes, hot and cold storage characteristics, tolerance for minor performance fluctuations, and a preference for low storage costs.",
+    "variables": {
+      "cluster": [
+      ],
+      "tenant": [
+        {
+          "name": "_tempstore_read_alignment_size",
+          "value": "1MB",
+          "comment": "The size of data read by tempstore each time is 1MB in shared storage mode."
+        },
+        {
+          "name": "inc_sstable_upload_thread_score",
+          "value": 30,
+          "comment": "The number of upload threads needs to be increased. This value needs to be explored and is tentatively set at 30"
+        },
+        {
+          "name": "_io_read_redundant_limit_percentage",
+          "value": 50,
+          "comment": "Maximum percentage of redundant size in one read io request, redundant data means blocks in the middle of the batch that hit in cache or filtered by skipping index but must be read"
+        },
+        {
+          "name": "_io_read_batch_size",
+          "value": "128KB",
+          "comment": "Maximum batch size in one read io request"
+        },
+        {
+          "name": "_object_storage_io_timeout",
+          "value": "300s",
+          "comment": "default value of object storage io timeout"
+        }
+      ]
+    }
+  }
+]
