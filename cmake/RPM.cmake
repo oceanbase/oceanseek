@@ -58,7 +58,7 @@ set(CPACK_RPM_SPEC_MORE_DEFINE
 %undefine __brp_mangle_shebangs
 %global __requires_exclude ^\(/bin/bash\|/usr/bin/\.*\)$
 %define __debug_install_post ${DEBUG_INSTALL_POST}
-%if \\\"%name\\\" != \\\"oceanbase-ce-sql-parser\\\" && \\\"%name\\\" != \\\"oceanbase.ai-sql-parser\\\"
+%if \\\"%name\\\" != \\\"oceanbase-ce-sql-parser\\\" && \\\"%name\\\" != \\\"oceanbase.ai-ce-sql-parser\\\"
 %debug_package
 %endif
 ")
