@@ -6,7 +6,7 @@ repo=http://mirrors.aliyun.com/oceanbase/development-kit/el/7/aarch64/
 [target-community]
 os=7
 arch=aarch64
-repo=http://mirrors.aliyun.com/oceanbase/community/stable/el/7/aarch64/
+repo=https://mirrors.oceanbase.com/oceanbase/community/stable/el/7/aarch64/
 
 
 [target-libpalf]
