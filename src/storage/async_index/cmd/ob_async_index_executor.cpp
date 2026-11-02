@@ -14,6 +14,7 @@
 #include "storage/async_index/ob_async_index_define.h"
 #include "storage/tx/ob_ts_mgr.h"
 #include "rootserver/freeze/ob_major_freeze_helper.h"
+#include "rootserver/ob_ddl_service.h"
 
 namespace oceanbase
 {
@@ -32,14 +33,11 @@ int ObAsyncIndexExecutor::execute_forcemerge(pl::ObPLExecCtx &pl_ctx, const ObAs
   OZ(resolve_table_name(arg.table_name_));
   if (OB_SUCC(ret)) {
     share::schema::ObSchemaGetterGuard schema_guard;
-    sql::ObSchemaChecker schema_checker;
     const share::schema::ObTableSchema *table_schema = nullptr;
-    OZ(GCTX.schema_service_->get_tenant_schema_guard(tenant_id_, schema_guard));
-    OZ(schema_checker.init(schema_guard, session_info_->get_server_sid()));
-    OZ(schema_checker.get_table_schema(tenant_id_, db_name_, table_name_, false, table_schema));
-    OV(OB_NOT_NULL(table_schema), OB_TABLE_NOT_EXIST, db_name_, table_name_);
-    OV(table_schema->is_heap_organized_table(), OB_NOT_SUPPORTED, db_name_, table_name_);
-    if (OB_SUCC(ret)) {
+    common::ObSEArray<uint64_t, 4> target_ids;
+    bool has_user_index = false;
+    OZ(check_has_available_async_index(schema_guard, table_schema, has_user_index, target_ids));
+    if (OB_SUCC(ret) && has_user_index) {
       obrpc::ObTableMajorFreezeArg freeze_arg;
       freeze_arg.tenant_id_ = tenant_id_;
       freeze_arg.table_id_ = table_schema->get_table_id();
@@ -66,40 +64,76 @@ int ObAsyncIndexExecutor::execute_refresh(pl::ObPLExecCtx &pl_ctx, const ObAsync
   OZ(resolve_table_name(arg.table_name_));
   if (OB_SUCC(ret)) {
     share::schema::ObSchemaGetterGuard schema_guard;
-    sql::ObSchemaChecker schema_checker;
     const share::schema::ObTableSchema *table_schema = nullptr;
-    OZ(GCTX.schema_service_->get_tenant_schema_guard(tenant_id_, schema_guard));
-    OZ(schema_checker.init(schema_guard, session_info_->get_server_sid()));
-    OZ(schema_checker.get_table_schema(tenant_id_, db_name_, table_name_, false, table_schema));
-    OV(OB_NOT_NULL(table_schema), OB_TABLE_NOT_EXIST, db_name_, table_name_);
-    OV(table_schema->is_heap_organized_table(), OB_NOT_SUPPORTED, db_name_, table_name_);
-    if (OB_SUCC(ret)) {
-      common::ObSEArray<uint64_t, 4> async_index_table_ids;
-      OZ(share::ObAsyncIndexRefreshUtil::collect_async_index_table_ids(
-          tenant_id_, table_schema->get_table_id(), async_index_table_ids,
-          true /* retry_on_missing_search_schema */));
-      if (OB_FAIL(ret)) {
-      } else if (async_index_table_ids.empty()) {
-        LOG_INFO("[ASYNC_INDEX] no async index found on table, skip refresh", K_(db_name), K_(table_name));
+    common::ObSEArray<uint64_t, 4> async_index_table_ids;
+    bool has_user_index = false;
+    OZ(check_has_available_async_index(schema_guard, table_schema, has_user_index, async_index_table_ids));
+    if (OB_SUCC(ret) && has_user_index) {
+      share::SCN cur_scn;
+      const transaction::MonotonicTs stc = transaction::MonotonicTs::current_time();
+      transaction::MonotonicTs receive_gts_ts(0);
+      constexpr int64_t GET_GTS_TIMEOUT_US = 10 * 1000 * 1000; // 10s
+      if (OB_FAIL(OB_TS_MGR.get_gts_sync(tenant_id_, stc, GET_GTS_TIMEOUT_US, cur_scn, receive_gts_ts))) {
+        LOG_WARN("[ASYNC_INDEX] fail to get gts", KR(ret), K_(tenant_id));
+      } else if (OB_UNLIKELY(!cur_scn.is_valid_and_not_min())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("[ASYNC_INDEX] invalid gts", KR(ret), K_(tenant_id), K(cur_scn));
       } else {
-        share::SCN cur_scn;
-        const transaction::MonotonicTs stc = transaction::MonotonicTs::current_time();
-        transaction::MonotonicTs receive_gts_ts(0);
-        constexpr int64_t GET_GTS_TIMEOUT_US = 10 * 1000 * 1000; // 10s
-        if (OB_FAIL(OB_TS_MGR.get_gts_sync(tenant_id_, stc, GET_GTS_TIMEOUT_US, cur_scn, receive_gts_ts))) {
-          LOG_WARN("[ASYNC_INDEX] fail to get gts", KR(ret), K_(tenant_id));
-        } else if (OB_UNLIKELY(!cur_scn.is_valid_and_not_min())) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("[ASYNC_INDEX] invalid gts", KR(ret), K_(tenant_id), K(cur_scn));
+        const int64_t target_scn = cur_scn.get_val_for_tx();
+        if (OB_FAIL(share::ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
+                    tenant_id_, table_schema->get_table_id(), target_scn, async_index_table_ids,
+                    static_cast<int8_t>(ASYNC_REFRESH_TYPE_MANUAL)))) {
+          LOG_WARN("[ASYNC_INDEX] fail to manually trigger refresh for table",
+                   KR(ret), K_(tenant_id), K_(db_name), K_(table_name), K(target_scn));
         } else {
-          const int64_t target_scn = cur_scn.get_val_for_tx();
-          if (OB_FAIL(share::ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
-                      tenant_id_, table_schema->get_table_id(), target_scn, async_index_table_ids,
-                      static_cast<int8_t>(ASYNC_REFRESH_TYPE_MANUAL)))) {
-            LOG_WARN("[ASYNC_INDEX] fail to manually trigger refresh for table",
-                     KR(ret), K_(tenant_id), K_(db_name), K_(table_name), K(target_scn));
-          } else {
-            LOG_INFO("[ASYNC_INDEX] manually triggered refresh for existing async indexes", K_(db_name), K_(table_name));
+          LOG_INFO("[ASYNC_INDEX] manually triggered refresh for existing async indexes", K_(db_name), K_(table_name));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObAsyncIndexExecutor::check_has_available_async_index(
+    share::schema::ObSchemaGetterGuard &schema_guard,
+    const share::schema::ObTableSchema *&table_schema,
+    bool &has_user_index,
+    common::ObIArray<uint64_t> &target_ids)
+{
+  int ret = OB_SUCCESS;
+  has_user_index = false;
+  target_ids.reuse();
+  table_schema = nullptr;
+  sql::ObSchemaChecker schema_checker;
+  OZ(rootserver::ObDDLService::get_tenant_schema_guard_with_version_in_inner_table(tenant_id_, schema_guard));
+  OZ(schema_checker.init(schema_guard, session_info_->get_server_sid()));
+  OZ(schema_checker.get_table_schema(tenant_id_, db_name_, table_name_, false, table_schema));
+  OV(OB_NOT_NULL(table_schema), OB_TABLE_NOT_EXIST, db_name_, table_name_);
+  OV(table_schema->is_heap_organized_table(), OB_NOT_SUPPORTED, db_name_, table_name_);
+  if (OB_SUCC(ret)) {
+    const auto &index_infos = table_schema->get_simple_index_infos();
+    // Inspect every relevant async index, including DELETE: missing
+    // schemas must not turn an incomplete snapshot into a successful no-op.
+    for (int64_t i = 0; OB_SUCC(ret) && i < index_infos.count(); ++i) {
+      const auto &info = index_infos.at(i);
+      const bool is_search = share::schema::is_async_search_def_index(info.index_type_);
+      const bool is_delete = share::schema::is_async_delete_index(info.index_type_);
+      if (share::schema::is_async_fts_index(info.index_type_) || is_search || is_delete) {
+        const share::schema::ObTableSchema *index_schema = nullptr;
+        OZ(schema_guard.get_table_schema(tenant_id_, info.table_id_, index_schema));
+        OV(OB_NOT_NULL(index_schema), OB_SCHEMA_EAGAIN, info);
+        if (OB_SUCC(ret)) {
+          bool available = share::schema::INDEX_STATUS_AVAILABLE == index_schema->get_index_status();
+          if (available && is_search) {
+            uint64_t data_index_id = OB_INVALID_ID;
+            OZ(index_schema->get_search_data_index_tid(data_index_id));
+            OZ(schema_guard.get_table_schema(tenant_id_, data_index_id, index_schema));
+            OV(OB_NOT_NULL(index_schema), OB_SCHEMA_EAGAIN, data_index_id);
+            OX(available = available && share::schema::INDEX_STATUS_AVAILABLE == index_schema->get_index_status());
+          }
+          if (OB_SUCC(ret) && available) {
+            OZ(target_ids.push_back(index_schema->get_table_id()));
+            OX(has_user_index = has_user_index || !is_delete);
           }
         }
       }
