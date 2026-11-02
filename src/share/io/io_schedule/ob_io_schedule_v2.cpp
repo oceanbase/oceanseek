@@ -99,7 +99,9 @@ int ObIOManagerV2::init()
 int ObIOManagerV2::start()
 {
   int ret = OB_SUCCESS;
-  if (0 != qsched_start(root_qid_, GCONF.io_scheduler_thread_count)) {
+  const int64_t thread_count = GCONF.io_scheduler_thread_count
+      + GCONF.remote_io_scheduler_thread_count;
+  if (0 != qsched_start(root_qid_, thread_count)) {
     ret = OB_ERR_SYS;
   } else if (OB_FAIL(io_submitter_.start())) {
   }
@@ -314,10 +316,22 @@ int ObTenantIOSchedulerV2::get_qid(int64_t index, ObIORequest& req, bool& is_def
   }
   return qid;
 }
-static uint32_t g_io_chan_id = 0;
-static uint32_t assign_chan_id()
+static uint32_t g_local_io_chan_id = 0;
+static uint32_t g_remote_io_chan_id = 0;
+static uint32_t assign_chan_id(bool is_remote)
 {
-  return ATOMIC_FAA(&g_io_chan_id, 1);
+  uint32_t chan_id = 0;
+  // 两个线程数参数均为 STATIC_EFFECTIVE，运行中修改不会改变 GCONF 中的生效值。
+  const uint32_t local_thread_count = GCONF.io_scheduler_thread_count;
+  // 下层按全部 channel 取余；这里先在各自线程组内轮转，避免两类 IO 共用线程。
+  if (is_remote) {
+    const uint32_t remote_thread_count = GCONF.remote_io_scheduler_thread_count;
+    chan_id = ATOMIC_FAA(&g_remote_io_chan_id, 1) % remote_thread_count;
+    chan_id += local_thread_count;
+  } else {
+    chan_id = ATOMIC_FAA(&g_local_io_chan_id, 1) % local_thread_count;
+  }
+  return chan_id;
 }
 
 int ObTenantIOSchedulerV2::schedule_request(ObIORequest &req)
@@ -334,14 +348,14 @@ int ObTenantIOSchedulerV2::schedule_request(ObIORequest &req)
     LOG_WARN("io result is null", K(ret), K(req));
   } else if (OB_UNLIKELY(is_default_q)) {
     if (FALSE_IT(req.io_result_->time_log_.enqueue_ts_ = ObTimeUtility::fast_current_time())) {
-    } else if (0 != qsched_submit(root, &req.qsched_req_, assign_chan_id())) {
+    } else if (0 != qsched_submit(root, &req.qsched_req_, assign_chan_id(req.is_remote_io()))) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("qsched_submit fail", K(ret), K(req));
     }
   } else if (OB_FAIL(OB_IO_MANAGER.get_tc().register_bucket(req, qid))) {
     LOG_WARN("register bucket fail", K(ret), K(req));
   } else if (FALSE_IT(req.io_result_->time_log_.enqueue_ts_ = ObTimeUtility::fast_current_time())) {
-  } else if (0 != qsched_submit(root, &req.qsched_req_, assign_chan_id())) {
+  } else if (0 != qsched_submit(root, &req.qsched_req_, assign_chan_id(req.is_remote_io()))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("qsched_submit fail", K(ret), K(req));
   }

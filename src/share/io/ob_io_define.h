@@ -694,6 +694,7 @@ public:
   bool is_local_clog_io() const;
   bool is_local_clog_not_isolated();
   bool is_limit_net_bandwidth_req() const;
+  bool is_remote_io() const;
   char *calc_io_buf();  // calc the aligned io_buf of raw_buf_, which interact with the operating system
   const ObIOFlag &get_flag() const;
   ObIOMode get_mode() const; // 2 mode

@@ -350,6 +350,12 @@ bool ObIORequest::is_limit_net_bandwidth_req() const
   return ret;
 }
 
+bool ObIORequest::is_remote_io() const
+{
+  const ObIOGroupMode mode = get_group_mode();
+  return ObIOGroupMode::REMOTEREAD == mode || ObIOGroupMode::REMOTEWRITE == mode;
+}
+
 int64_t ObIOFlag::get_wait_event() const
 {
   return wait_event_id_;

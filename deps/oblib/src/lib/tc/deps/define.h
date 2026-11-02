@@ -22,7 +22,8 @@
 #define MAX_CPU_NUM 128
 #endif
 
-#define MAX_N_CHAN 16
+// 支持 local IO 和 remote IO 各自使用最多 16 个调度线程。
+#define MAX_N_CHAN 32
 #ifndef tc_itid
 int next_itid_ = 0;
 __thread int itid_ = -1;
