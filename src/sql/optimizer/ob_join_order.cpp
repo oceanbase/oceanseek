@@ -24153,8 +24153,8 @@ int ObJoinOrder::get_valid_hint_index_list(const ObDMLStmt &stmt,
       } else if (OB_FAIL(valid_hint_index_ids.push_back(tid))) {
         LOG_WARN("failed to append valid hint index list", K(ret), K(tid));
       }
-    } else if (index_hint_table_schema->is_search_index() && helper.filters_.empty()) {
-      // search index can not be used without filters, ignore the index hint
+    } else if (index_hint_table_schema->is_search_index()) {
+      // Search indexes require hybrid search paths; ignore ordinary index hints.
     } else if (OB_FAIL(valid_hint_index_ids.push_back(tid))) {
       LOG_WARN("failed to append valid hint index list", K(ret), K(tid));
     }
