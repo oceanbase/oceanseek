@@ -95,11 +95,13 @@ int ObDASAsyncIndexDeletionOp::load_bitmap()
         K(ret), KP(partition), K(tablet_id_));
   } else {
     const int64_t async_snapshot = partition->get_read_snapshot().get_val_for_tx();
+    // The provider derives a physical deletion snapshot after this logical watermark was published.
+    // It only updates our private scan parameter; the SQL lookup snapshot stays unchanged.
     if (OB_FAIL(storage::ObDeletionBitmapProvider::get_or_build_bitmap(
         tablet_id_, async_snapshot, ctx_allocator(),
         scan_param_, *scalar_ctdef_, *scalar_rtdef_, bitmap_handle_))) {
       LOG_WARN("failed to get or build bitmap", K(ret), K(tablet_id_),
-          K(async_snapshot), "sql_snapshot", scan_param_.snapshot_);
+          K(async_snapshot), "physical_snapshot", scan_param_.snapshot_);
     }
   }
   if (OB_SUCC(ret) && bitmap_handle_.is_empty()) {

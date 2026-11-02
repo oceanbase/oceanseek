@@ -54,7 +54,6 @@ public:
       } else if (OB_FAIL(partition_.storage_group_ctx_.groups_.push_back(group))) {
       } else {
         group_added = true;
-        partition_.storage_group_ctx_.is_strict_aligned_ = true;
         search_ctx.set_current_async_partition(&partition_);
       }
     }

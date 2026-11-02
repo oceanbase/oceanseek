@@ -408,7 +408,7 @@ int ObDASMultiMatchRtDef::can_pushdown_filter_to_bmm(
                        *ir_ctdef, search_ctx, index_table_id, max_segment_cnt))) {
           LOG_WARN("failed to resolve async multi-match filter pushdown domain", K(ret), K(i));
         } else {
-          can_pushdown = 1 == max_segment_cnt;
+          can_pushdown = 1 >= max_segment_cnt;
         }
       }
     }
@@ -678,7 +678,7 @@ int ObDASMultiMatchRtDef::generate_op_impl(
           LOG_WARN("failed to resolve async multi-match segment domain", K(ret), K(i));
         }
       }
-      for (int64_t s = 0; OB_SUCC(ret) && s < segment_op_cnt; ++s) {
+      for (int64_t s = 0; OB_SUCC(ret) && s < MAX(1L, segment_op_cnt); ++s) {
         ObIDASSearchOp *segment_op = nullptr;
         if (OB_FAIL(generate_field_op(
                 i, query_tokens_,

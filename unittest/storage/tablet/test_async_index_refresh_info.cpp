@@ -665,6 +665,11 @@ TEST_F(TestAsyncIndexRefreshInfo, assign_deep_copy)
 TEST_F(TestAsyncIndexRefreshInfo, membership_cache_value_lifecycle)
 {
   ObAsyncIndexMembershipCache cache;
+  ASSERT_EQ(0, cache.get_invalidation_count());
+  cache.reset();
+  const int64_t before_read = cache.get_invalidation_count();
+  cache.reset(); // A second notification must invalidate an already pending refill.
+  ASSERT_NE(before_read, cache.get_invalidation_count());
   ASSERT_FALSE(cache.is_valid());
   ASSERT_FALSE(cache.has_async_index());
   ASSERT_FALSE(cache.has_published_version());
@@ -690,10 +695,13 @@ TEST_F(TestAsyncIndexRefreshInfo, membership_cache_copy_preserves_value)
 {
   ObAsyncIndexMembershipCache source;
   ObAsyncIndexMembershipCache destination;
+  source.reset();
   source.set_value(true, 200);
   destination = source;
+  ASSERT_EQ(source.get_invalidation_count(), destination.get_invalidation_count());
 
   source.reset();
+  ASSERT_NE(source.get_invalidation_count(), destination.get_invalidation_count());
   ASSERT_FALSE(source.is_valid());
   ASSERT_TRUE(destination.is_valid());
   ASSERT_TRUE(destination.has_async_index());

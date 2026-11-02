@@ -1647,7 +1647,7 @@ TEST_F(TestCompactionPolicy, check_ss_backfill_rec_scn_from_all_sstables)
   ASSERT_EQ(expected_rec_scn, rec_scn);
 }
 
-TEST_F(TestCompactionPolicy, check_inc_major_rec_scn_from_all_sstables)
+TEST_F(TestCompactionPolicy, check_sparse_inc_major_rec_scn_from_all_sstables)
 {
   const char *key_data =
       "table_type    start_scn    end_scn    max_ver    upper_ver\n"
@@ -1671,8 +1671,8 @@ TEST_F(TestCompactionPolicy, check_inc_major_rec_scn_from_all_sstables)
     const SCN rec_scn = 0 == i ? SCN::max_scn() : sstable->get_start_scn();
     sstable->meta_->basic_meta_.rec_scn_ = rec_scn;
     sstable->meta_cache_.rec_scn_ = rec_scn;
-    const int64_t logical_base = 100 * (i + 1);
-    const int64_t logical_snapshot = 100 * (i + 2);
+    const int64_t logical_base = 200 * (i + 1);
+    const int64_t logical_snapshot = logical_base + 100;
     sstable->meta_->basic_meta_.min_merged_trans_version_ = logical_base;
     sstable->meta_->basic_meta_.max_merged_trans_version_ = logical_snapshot;
     sstable->meta_cache_.min_merged_trans_version_ = logical_base;
@@ -1690,9 +1690,21 @@ TEST_F(TestCompactionPolicy, check_inc_major_rec_scn_from_all_sstables)
   result.reset();
   ASSERT_EQ(OB_SUCCESS,
       ObAsyncIndexMergePolicyHelper::get_inc_major_sstables(
-          ls, *tablet_handle_.get_obj(), 600, 0, result));
+          ls, *tablet_handle_.get_obj(), 1000, 0, result));
   ASSERT_EQ(4, result.handle_.get_count());
   ASSERT_EQ(expected_rec_scn, result.rec_scn_);
+  // The checker permits sparse inputs and rejects overlapping ranges.
+  EXPECT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicyHelper::check_inc_major_sstables_(
+      result.handle_, 0, 0));
+  EXPECT_EQ(OB_NO_NEED_MERGE, ObAsyncIndexMergePolicyHelper::check_inc_major_sstables_(
+      result.handle_, 0, 250));
+  // The selector rejects a crossing range without complete historical coverage.
+  ObGetMergeTablesResult bounded_result;
+  EXPECT_EQ(OB_NO_NEED_MERGE, ObAsyncIndexMergePolicyHelper::get_inc_major_sstables(
+      ls, *tablet_handle_.get_obj(), 850, 0, bounded_result));
+  ObTablesHandleArray empty_inputs;
+  EXPECT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicyHelper::check_inc_major_sstables_(
+      empty_inputs, 0, 0));
 }
 
 TEST_F(TestCompactionPolicy, check_mini_minor_merge_output_rec_scn)

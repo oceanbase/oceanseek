@@ -240,6 +240,8 @@ public:
           }
         }
         if (OB_FAIL(ret)) {
+        } else if (0 == count) {
+          // Empty domains have no physical tables to pin.
         } else if (nullptr == (buf = allocator_.alloc(sizeof(PinnedSegmentTables)))) {
           ret = OB_ALLOCATE_MEMORY_FAILED;
         } else {
@@ -1113,6 +1115,7 @@ public:
   }
 
   void check_async_terms_bmm_direct_selection(const bool new_false_range);
+  void check_async_empty_filter_bmm();
   void check_bmm_input_after_config_change(
       ObIDASSearchOp *filter_op, const ObDASBMMBuildOptions &options);
   void check_async_terms_ordered_direct(
@@ -1183,9 +1186,6 @@ public:
     }
     for (int64_t t = 0; OB_SUCC(ret)
          && t < static_cast<int64_t>(tablet_ranges.size()); ++t) {
-      if (tablet_ranges.at(t).empty()) {
-        ret = OB_INVALID_ARGUMENT;
-      }
       for (int64_t r = 0; OB_SUCC(ret)
            && r < static_cast<int64_t>(tablet_ranges.at(t).size()); ++r) {
         if (OB_FAIL(group->add_version_range(t, tablet_ranges.at(t).at(r)))) {
@@ -1240,8 +1240,11 @@ public:
               10000 + self->fetch_cursor_))) {
       } else if (OB_FAIL(add_mock_storage_tablets(partition, index_tablet_ids.count()))) {
       }
-      partition.storage_group_ctx_.is_strict_aligned_ = true;
       const int64_t segment_cnt = self->segment_counts_.at(self->fetch_cursor_++);
+      if (OB_SUCC(ret) && 0 == segment_cnt) {
+        std::vector<std::vector<ObNewVersionRange> > tablet_ranges(1);
+        ret = add_mock_storage_group(partition, tablet_ranges);
+      }
       for (int64_t i = 0; OB_SUCC(ret) && i < segment_cnt; ++i) {
         ObNewVersionRange range;
         std::vector<std::vector<ObNewVersionRange> > tablet_ranges(1);
@@ -1282,9 +1285,7 @@ public:
               10000 + partition_idx))) {
       } else if (OB_FAIL(add_mock_storage_tablets(partition, index_tablet_ids.count()))) {
       }
-      partition.storage_group_ctx_.is_strict_aligned_ =
-          self->partition_aligned_.at(partition_idx);
-      if (OB_SUCC(ret) && partition.storage_group_ctx_.is_strict_aligned_) {
+      if (OB_SUCC(ret) && self->partition_aligned_.at(partition_idx)) {
         const int64_t aligned_segment_cnt = self->multi_segment_counts_.at(partition_idx).at(0);
         for (int64_t t = 1; OB_SUCC(ret) && t < index_table_ids.count(); ++t) {
           if (aligned_segment_cnt != self->multi_segment_counts_.at(partition_idx).at(t)) {
@@ -1730,6 +1731,264 @@ TEST_F(TestDASAsyncSegmentMerge, segment_domain_loads_only_selected_group)
   ASSERT_EQ(OB_SUCCESS, merge->open());
   EXPECT_EQ(1, child->bind_count());
   EXPECT_EQ(100, child->last_range_base());
+}
+
+TEST_F(TestDASAsyncSegmentMerge, empty_segment_domain_keeps_children_unopened)
+{
+  ObDASAsyncIndexQueryCtx catalog;
+  build_multi_index_catalog(catalog, {{0, 1}}, {false});
+  EXPECT_EQ(0, catalog.get_max_segment_cnt(0, TEST_INDEX_TABLE_ID));
+  search_ctx_.set_async_binding(common::OB_INVALID_ID, 0, false);
+  MockSegmentOp *child = create_child({99}, {1.0});
+  ObArray<ObIDASSearchOp *> children;
+  ASSERT_EQ(OB_SUCCESS, children.push_back(child));
+  ObIDASSearchOp *root = nullptr;
+  ASSERT_EQ(OB_SUCCESS, ObDASSearchUtils::create_async_segment_merge_op(
+      children, TEST_INDEX_TABLE_ID, true, search_ctx_, root, true));
+  ASSERT_EQ(DAS_SEARCH_OP_ASYNC_SEGMENT_MERGE, root->get_op_type());
+  ASSERT_EQ(OB_SUCCESS, root->open());
+  EXPECT_EQ(0, child->open_count());
+  EXPECT_EQ(0, child->bind_count());
+  ObDASRowID rowid;
+  ObDASRowID target;
+  double score = 0.0;
+  target.set_uint64(1);
+  const MaxScoreTuple *tuple = nullptr;
+  EXPECT_EQ(OB_ITER_END, root->next_rowid(rowid, score));
+  EXPECT_EQ(OB_ITER_END, root->advance_to(target, rowid, score));
+  EXPECT_EQ(OB_ITER_END, root->advance_shallow(target, true, tuple));
+  EXPECT_EQ(nullptr, tuple);
+  EXPECT_EQ(OB_SUCCESS, root->rescan());
+  EXPECT_EQ(OB_ITER_END, root->next_rowid(rowid, score));
+  EXPECT_EQ(0, child->open_count());
+  EXPECT_EQ(0, child->rescan_count());
+}
+
+TEST_F(TestDASAsyncSegmentMerge, sparse_single_segment_uses_direct_binding)
+{
+  ObDASAsyncIndexQueryCtx catalog;
+  build_catalog(catalog, {1, 0, 1});
+  search_ctx_.set_async_binding(common::OB_INVALID_ID, 0, false);
+  ObArray<ObIDASSearchOp *> children;
+  MockSegmentOp *child = create_child({11}, {1.0});
+  ASSERT_EQ(OB_SUCCESS, children.push_back(child));
+  ObIDASSearchOp *root = nullptr;
+  ASSERT_EQ(OB_SUCCESS, ObDASSearchUtils::create_async_segment_merge_op(
+      children, TEST_INDEX_TABLE_ID, true, search_ctx_, root));
+  EXPECT_EQ(child, root);
+  for (int64_t partition = 1; partition <= 3; ++partition) {
+    select_partition(catalog, partition);
+    const auto *part = search_ctx_.get_current_async_partition();
+    search_ctx_.set_ls_id(part->ls_id_);
+    ObNewVersionRange range;
+    bool is_empty = false;
+    ASSERT_EQ(OB_SUCCESS, search_ctx_.resolve_direct_async_index_segment(
+        TEST_INDEX_TABLE_ID, part->index_tablet_ids_.at(0), 0, range, is_empty));
+    EXPECT_EQ(2 == partition, is_empty);
+    if (!is_empty) {
+      EXPECT_EQ(0, range.base_version_);
+      EXPECT_EQ(100, range.snapshot_version_);
+    }
+  }
+}
+
+TEST_F(TestDASAsyncSegmentMerge, sparse_multiple_segments_keep_merge)
+{
+  ObDASAsyncIndexQueryCtx catalog;
+  build_multi_index_catalog(catalog, {{2, 1}, {0, 1}}, {false, false});
+  PinnedOverlappingCatalog pinned(allocator_);
+  ASSERT_EQ(OB_SUCCESS, pinned.init(catalog));
+  search_ctx_.set_ls_id(ObLSID(1001));
+  search_ctx_.set_async_binding(common::OB_INVALID_ID, 0, false);
+  EXPECT_EQ(2, catalog.get_max_segment_cnt(0, TEST_INDEX_TABLE_ID));
+  ObArray<ObIDASSearchOp *> children;
+  ASSERT_EQ(OB_SUCCESS, children.push_back(create_child({11}, {1.0})));
+  ASSERT_EQ(OB_SUCCESS, children.push_back(create_child({23}, {2.0})));
+  ObIDASSearchOp *root = nullptr;
+  ASSERT_EQ(OB_SUCCESS, ObDASSearchUtils::create_async_segment_merge_op(
+      children, TEST_INDEX_TABLE_ID, true, search_ctx_, root));
+  ASSERT_EQ(DAS_SEARCH_OP_ASYNC_SEGMENT_MERGE, root->get_op_type());
+  ASSERT_EQ(OB_SUCCESS, root->open());
+  ObDASRowID rowid;
+  double score = 0.0;
+  ASSERT_EQ(OB_SUCCESS, root->next_rowid(rowid, score));
+  EXPECT_EQ(11, rowid.get_uint64());
+  ASSERT_EQ(OB_SUCCESS, root->next_rowid(rowid, score));
+  EXPECT_EQ(23, rowid.get_uint64());
+  EXPECT_EQ(OB_ITER_END, root->next_rowid(rowid, score));
+  select_partition(catalog, 2);
+  ASSERT_EQ(OB_SUCCESS, root->rescan());
+  EXPECT_EQ(OB_ITER_END, root->next_rowid(rowid, score));
+}
+
+TEST_F(TestDASAsyncSegmentMerge, direct_range_rescans_nonempty_empty_nonempty)
+{
+  ObDASAsyncIndexQueryCtx catalog;
+  build_catalog(catalog, {1, 0, 1});
+  search_ctx_.set_ls_id(ObLSID(1001));
+  ObDASScalarScanCtDef ctdef(allocator_);
+  ObDASScalarScanRtDef rtdef;
+  ObExpr rowid_expr;
+  ASSERT_EQ(OB_SUCCESS, init_async_scalar_scan(ctdef, rtdef, rowid_expr));
+  ASSERT_EQ(OB_SUCCESS, scan_op_.related_ctdefs_.init(1));
+  ASSERT_EQ(OB_SUCCESS, scan_op_.related_tablet_ids_.init(1));
+  ASSERT_EQ(OB_SUCCESS, scan_op_.related_ctdefs_.push_back(&ctdef));
+  ASSERT_EQ(OB_SUCCESS, scan_op_.related_tablet_ids_.push_back(ObTabletID(10001)));
+  ObObj start_objs[SEARCH_INDEX_KEY_CNT];
+  ObObj end_objs[SEARCH_INDEX_KEY_CNT];
+  ObNewRange range;
+  ASSERT_EQ(OB_SUCCESS,
+      append_async_scalar_range(rtdef, range, start_objs, end_objs, 3, 4));
+  ObDASAsyncScalarRangeOpParam param(&ctdef, &rtdef, TEST_INDEX_TABLE_ID, 0, true);
+  ObDASAsyncScalarRangeOp leaf(search_ctx_);
+  ASSERT_EQ(OB_SUCCESS, leaf.init(param));
+  MockRangeAccessService access_service;
+  access_service.open_count_ = 1; // Return a prepared batch on the first physical scan.
+  leaf.tsc_service_ = &access_service;
+  leaf.inv_idx_scan_param_inited_ = true;
+  for (int64_t partition = 1; partition <= 3; ++partition) {
+    select_partition(catalog, partition);
+    ASSERT_EQ(OB_SUCCESS, 1 == partition ? leaf.open() : leaf.rescan());
+    const uint64_t *ids = nullptr;
+    int64_t count = -1;
+    if (2 == partition) {
+      EXPECT_EQ(nullptr, leaf.range_iter_);
+      EXPECT_EQ(OB_ITER_END, leaf.get_next_doc_ids(8, ids, count));
+      EXPECT_EQ(0, count);
+      EXPECT_EQ(2, access_service.open_count_);
+    } else {
+      ASSERT_EQ(OB_SUCCESS, leaf.get_next_doc_ids(8, ids, count));
+      ASSERT_EQ(2, count);
+      EXPECT_EQ(101, ids[0]);
+      EXPECT_EQ(102, ids[1]);
+    }
+  }
+  EXPECT_EQ(3, access_service.open_count_);
+  EXPECT_EQ(OB_SUCCESS, leaf.close());
+}
+
+TEST_F(TestDASAsyncSegmentMerge, empty_direct_token_interfaces_end_without_storage)
+{
+  ObDASAsyncTokenOp token(search_ctx_);
+  token.is_empty_segment_ = true;
+  ObDASRowID rowid;
+  ObDASRowID target;
+  target.set_uint64(1);
+  double score = 0.0;
+  const MaxScoreTuple *tuple = nullptr;
+  EXPECT_EQ(OB_ITER_END, token.next_rowid(rowid, score));
+  EXPECT_EQ(OB_ITER_END, token.advance_to(target, rowid, score));
+  EXPECT_EQ(OB_ITER_END, token.advance_to_id(target, rowid));
+  EXPECT_EQ(OB_ITER_END, token.advance_shallow(target, true, tuple));
+  EXPECT_EQ(OB_SUCCESS, token.calc_max_score(score));
+  EXPECT_DOUBLE_EQ(0.0, score);
+  bool can_calc = false;
+  EXPECT_EQ(OB_SUCCESS, token.calc_range_max_score(target, true, target, score, can_calc));
+  EXPECT_TRUE(can_calc);
+  EXPECT_DOUBLE_EQ(0.0, score);
+  uint64_t ids[2];
+  int64_t count = -1;
+  EXPECT_EQ(OB_SUCCESS, token.drain_until(target, 2, ids, nullptr, count, rowid, score));
+  EXPECT_EQ(0, count);
+  EXPECT_TRUE(rowid.is_max());
+  ObDASAsyncTokenHelper helper(search_ctx_);
+  helper.is_empty_segment_ = true;
+  uint64_t id_value = 1;
+  ObDatum id(reinterpret_cast<const char *>(&id_value), sizeof(id_value), false);
+  EXPECT_EQ(OB_ITER_END, helper.get_next_row());
+  EXPECT_EQ(OB_ITER_END, helper.advance_to(id));
+  EXPECT_EQ(OB_ITER_END, helper.advance_shallow(id, true));
+  score = 1.0;
+  EXPECT_EQ(OB_SUCCESS, helper.get_max_token_relevance(score));
+  EXPECT_DOUBLE_EQ(0.0, score);
+}
+
+TEST_F(TestDASAsyncSegmentMerge, direct_merge_rescans_nonempty_empty_nonempty)
+{
+  ObDASAsyncIndexQueryCtx catalog;
+  build_catalog(catalog, {1, 0, 1});
+  uint64_t frame[2] = {0, 0};
+  ScriptedBatchSegmentOp child(search_ctx_, frame, ARRAYSIZEOF(frame));
+  child.append_step(ScriptedBatchStep(OB_SUCCESS, 1, {101}));
+  child.append_step(ScriptedBatchStep(OB_ITER_END, 0, {}));
+  MockSegmentOpParam child_param;
+  ASSERT_EQ(OB_SUCCESS, child.init(child_param));
+  ObArray<ObIDASSearchOp *> children;
+  ASSERT_EQ(OB_SUCCESS, children.push_back(&child));
+  ObDASAsyncSegmentMergeOpParam param(children,
+      ObDASAsyncSegmentDomain(TEST_INDEX_TABLE_ID, 0), true,
+      ObDASAsyncSegmentMergeMode::DIRECT_MERGE);
+  ObDASAsyncSegmentMergeOp merge(search_ctx_);
+  ASSERT_EQ(OB_SUCCESS, merge.init(param));
+  ASSERT_EQ(OB_SUCCESS, merge.open());
+  for (int64_t partition = 1; partition <= 3; ++partition) {
+    if (partition > 1) {
+      select_partition(catalog, partition);
+      ASSERT_EQ(OB_SUCCESS, merge.rescan());
+    }
+    int64_t count = -1;
+    if (2 != partition) {
+      ASSERT_EQ(OB_SUCCESS, merge.next_rowids(2, count));
+      EXPECT_EQ(1, count);
+      EXPECT_EQ(101, frame[0]);
+    }
+    EXPECT_EQ(OB_ITER_END, merge.next_rowids(2, count));
+    EXPECT_EQ(0, count);
+  }
+  EXPECT_EQ(1, child.open_count());
+  EXPECT_EQ(1, child.rescan_count());
+  EXPECT_EQ(2, child.bind_count());
+  EXPECT_EQ(4, child.batch_call_count());
+  EXPECT_EQ(OB_SUCCESS, merge.close());
+}
+
+TEST_F(TestDASAsyncSegmentMerge, all_empty_scalar_domain_uses_regular_leaf)
+{
+  ObDASAsyncIndexQueryCtx catalog;
+  build_catalog(catalog, {0, 0, 0});
+  search_ctx_.set_async_binding(common::OB_INVALID_ID, 0, false);
+  search_ctx_.set_ls_id(ObLSID(1001));
+  search_ctx_.table_row_count_ = ObDASSearchCost(100);
+  EXPECT_EQ(0, catalog.get_max_segment_cnt(0, TEST_INDEX_TABLE_ID));
+  share::SCN snapshot_scn;
+  transaction::ObTxReadSnapshot snapshot;
+  ASSERT_EQ(OB_SUCCESS, snapshot_scn.convert_for_tx(100));
+  snapshot.init_special_read(snapshot_scn);
+  search_ctx_.snapshot_ = &snapshot;
+  ObDASScalarScanCtDef ctdef(allocator_);
+  ObDASScalarScanRtDef rtdef;
+  ObPushdownOperator pd_op(eval_ctx_, ctdef.pd_expr_spec_);
+  ObExpr rowid_expr;
+  ASSERT_EQ(OB_SUCCESS, init_async_scalar_scan(ctdef, rtdef, rowid_expr));
+  rtdef.p_pd_expr_op_ = &pd_op;
+  ASSERT_EQ(OB_SUCCESS, scan_op_.reserve_related_buffer(1));
+  ASSERT_EQ(OB_SUCCESS, scan_op_.set_related_task_info(
+      &ctdef, &rtdef, ObTabletID(10001)));
+  ObObj start_objs[SEARCH_INDEX_KEY_CNT];
+  ObObj end_objs[SEARCH_INDEX_KEY_CNT];
+  ObNewRange range;
+  ASSERT_EQ(OB_SUCCESS,
+      append_async_scalar_range(rtdef, range, start_objs, end_objs, 3, 3));
+  for (int64_t use_ror = 0; use_ror <= 1; ++use_ror) {
+    ctdef.is_index_term_point_scan_ = use_ror;
+    ObIDASSearchOp *root = nullptr;
+    ASSERT_EQ(OB_SUCCESS, rtdef.generate_op(ObDASSearchCost(1), search_ctx_, root));
+    ASSERT_NE(nullptr, root);
+    EXPECT_EQ(use_ror ? DAS_SEARCH_OP_ASYNC_SCALAR_ROR : DAS_SEARCH_OP_BITMAP,
+        root->get_op_type());
+    EXPECT_EQ(nullptr, find_search_op(root, DAS_SEARCH_OP_ASYNC_SEGMENT_MERGE));
+    EXPECT_EQ(nullptr, find_search_op(root, DAS_SEARCH_OP_DUMMY));
+    // No SSTable handles are populated: physical scans would fail.
+    for (int64_t partition = 1; partition <= 3; ++partition) {
+      select_partition(catalog, partition);
+      ASSERT_EQ(OB_SUCCESS, 1 == partition ? root->open() : root->rescan());
+      ObDASRowID rowid;
+      double score = 0.0;
+      EXPECT_EQ(OB_ITER_END, root->next_rowid(rowid, score));
+    }
+    ASSERT_EQ(OB_SUCCESS, root->close());
+  }
+  search_ctx_.snapshot_ = nullptr;
 }
 
 TEST_F(TestDASAsyncSegmentMerge, group_merge_activates_partition_specific_children)
@@ -2288,6 +2547,42 @@ TEST_F(TestDASAsyncSegmentMerge, match_filter_pushdown_tracks_catalog_and_query_
     EXPECT_EQ(TEST_INDEX_TABLE_ID, index_table_id);
     EXPECT_EQ(1, segment_op_cnt);
     EXPECT_EQ(0, search_ctx_.get_async_group_slot());
+    EXPECT_TRUE(search_ctx_.get_async_direct_bind());
+  }
+
+  ObDASAsyncIndexQueryCtx empty_partition_catalog;
+  build_catalog(empty_partition_catalog, {1, 0});
+  search_ctx_.set_async_binding(common::OB_INVALID_ID, 0, false);
+  ASSERT_EQ(OB_SUCCESS,
+      match_rtdef.can_pushdown_filter_to_bmm(search_ctx_, can_pushdown));
+  EXPECT_TRUE(can_pushdown);
+  ASSERT_EQ(OB_SUCCESS,
+      multi_rtdef.can_pushdown_filter_to_bmm(search_ctx_, can_pushdown));
+  EXPECT_TRUE(can_pushdown);
+  ASSERT_EQ(OB_SUCCESS,
+      query_string_rtdef.can_pushdown_filter_to_bmm(search_ctx_, can_pushdown));
+  EXPECT_TRUE(can_pushdown);
+  {
+    ObDASAsyncBindingGuard binding_guard(search_ctx_);
+    ASSERT_EQ(OB_SUCCESS, ObDASSearchUtils::resolve_async_field_segment_domain(
+        ir_ctdef, search_ctx_, binding_guard, index_table_id, segment_op_cnt));
+    EXPECT_EQ(1, segment_op_cnt);
+    EXPECT_TRUE(search_ctx_.get_async_direct_bind());
+  }
+  ObDASAsyncIndexQueryCtx empty_catalog;
+  build_catalog(empty_catalog, {0});
+  search_ctx_.set_async_binding(common::OB_INVALID_ID, 0, false);
+  ASSERT_EQ(OB_SUCCESS, ObDASSearchUtils::resolve_async_segment_domain(
+      ir_ctdef, search_ctx_, index_table_id, segment_op_cnt));
+  EXPECT_EQ(0, segment_op_cnt);
+  ASSERT_EQ(OB_SUCCESS,
+      match_rtdef.can_pushdown_filter_to_bmm(search_ctx_, can_pushdown));
+  EXPECT_TRUE(can_pushdown);
+  {
+    ObDASAsyncBindingGuard binding_guard(search_ctx_);
+    ASSERT_EQ(OB_SUCCESS, ObDASSearchUtils::resolve_async_field_segment_domain(
+        ir_ctdef, search_ctx_, binding_guard, index_table_id, segment_op_cnt));
+    EXPECT_EQ(0, segment_op_cnt);
     EXPECT_TRUE(search_ctx_.get_async_direct_bind());
   }
 }
@@ -3401,6 +3696,126 @@ TEST_F(TestDASAsyncSegmentMerge, async_terms_bmm_cost_selects_direct_in_single_s
 TEST_F(TestDASAsyncSegmentMerge, async_terms_new_query_range_selects_direct)
 {
   check_async_terms_bmm_direct_selection(true);
+}
+
+void TestDASAsyncSegmentMerge::check_async_empty_filter_bmm()
+{
+  const int add_ret = omt::ObTenantConfigMgr::get_instance().add_tenant_config(
+      OB_SYS_TENANT_ID);
+  ASSERT_TRUE(OB_SUCCESS == add_ret || OB_ENTRY_EXIST == add_ret);
+  AsyncTermsDirectDrainConfigGuard config_guard;
+  ASSERT_TRUE(config_guard.is_valid());
+
+  ObDASAsyncIndexQueryCtx catalog;
+  build_multi_index_catalog(catalog, {{0, 1}, {0, 1}}, {false, false});
+  ASSERT_EQ(1, catalog.get_max_group_cnt());
+  ASSERT_EQ(0, catalog.get_max_segment_cnt(0, TEST_INDEX_TABLE_ID));
+  ASSERT_EQ(1, catalog.get_max_segment_cnt(0, TEST_INDEX_TABLE_ID_2));
+  search_ctx_.set_async_binding(common::OB_INVALID_ID, 0, false);
+  share::SCN snapshot_scn;
+  transaction::ObTxReadSnapshot snapshot;
+  ASSERT_EQ(OB_SUCCESS, snapshot_scn.convert_for_tx(100));
+  snapshot.init_special_read(snapshot_scn);
+  search_ctx_.snapshot_ = &snapshot;
+  search_ctx_.set_ls_id(ObLSID(1001));
+  ASSERT_EQ(DAS_SCOPE_BASE, search_ctx_.get_op_creating_scope());
+  ASSERT_EQ(DAS_ROWID_TYPE_UINT64, search_ctx_.get_rowid_type());
+  ASSERT_FALSE(search_ctx_.is_logical_table());
+
+  ObDASScalarCtDef scalar_ctdef(allocator_);
+  ObDASScalarRtDef scalar_rtdef;
+  ObDASScalarScanCtDef ctdef(allocator_);
+  ObDASScalarScanRtDef rtdef;
+  ObPushdownOperator pd_op(eval_ctx_, ctdef.pd_expr_spec_);
+  ObExpr rowid_expr;
+  ObObj start_objs[SEARCH_INDEX_KEY_CNT];
+  ObObj end_objs[SEARCH_INDEX_KEY_CNT];
+  ObNewRange range;
+  ObDASBaseCtDef *ctdef_children[] = {&ctdef};
+  ObDASBaseRtDef *rtdef_children[] = {&rtdef};
+  ASSERT_EQ(OB_SUCCESS, init_async_scalar_scan(ctdef, rtdef, rowid_expr));
+  rtdef.p_pd_expr_op_ = &pd_op;
+  ASSERT_EQ(OB_SUCCESS, scan_op_.reserve_related_buffer(1));
+  ASSERT_EQ(OB_SUCCESS, scan_op_.set_related_task_info(
+      &ctdef, &rtdef, ObTabletID(10001)));
+  ctdef.is_index_term_point_scan_ = true;
+  ctdef.enable_new_false_range_ = false;
+  ASSERT_FALSE(ctdef.is_scoring());
+  ASSERT_EQ(OB_SUCCESS,
+      append_async_scalar_range(rtdef, range, start_objs, end_objs, 3, 3));
+  ASSERT_EQ(1, rtdef.key_ranges_.count());
+  scalar_ctdef.children_ = ctdef_children;
+  scalar_ctdef.children_cnt_ = ARRAYSIZEOF(ctdef_children);
+  scalar_ctdef.set_has_index_scan(true);
+  scalar_rtdef.ctdef_ = &scalar_ctdef;
+  scalar_rtdef.children_ = rtdef_children;
+  scalar_rtdef.children_cnt_ = ARRAYSIZEOF(rtdef_children);
+  rtdef.cost_ = ObDASSearchCost(1);
+  search_ctx_.table_row_count_ = ObDASSearchCost(1000);
+  const ObDASSearchCost lead_cost(11);
+  ASSERT_TRUE(scalar_rtdef.can_build_direct_rowid_drain(search_ctx_));
+  ObDASBMMBuildOptions options(false);
+  ObDASBMMOp::select_filter_build_options(search_ctx_, lead_cost, rtdef.cost_,
+      false /* query_optional */, true /* supports_direct_drain */, options);
+  ASSERT_TRUE(options.enable_vectorized_merge_);
+  ASSERT_EQ(ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN, options.filter_mode_);
+
+  ObDASBooleanQueryRtDef filter_builder;
+  ObIDASSearchRtDef *clauses[] = {&scalar_rtdef};
+  ObBooleanSubClause<ObIDASSearchRtDef> filter_clauses(clauses, ARRAYSIZEOF(clauses));
+  ObIDASSearchOp *filter_op = nullptr;
+  ObDASSearchCost filter_cost;
+  bool has_options = false;
+  const int64_t op_count = search_ctx_.op_store_.count();
+  ASSERT_EQ(OB_SUCCESS, filter_builder.prepare_bmm_input(filter_clauses, lead_cost,
+      search_ctx_, filter_op, filter_cost, false /* query_optional */, options, has_options));
+  ASSERT_TRUE(has_options);
+  ASSERT_TRUE(options.enable_vectorized_merge_);
+  EXPECT_EQ(ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN, options.filter_mode_);
+  ASSERT_EQ(1, filter_cost.cost());
+  ASSERT_NE(nullptr, filter_op);
+  ASSERT_EQ(DAS_SEARCH_OP_ASYNC_SCALAR_ROR, filter_op->get_op_type());
+  ASSERT_EQ(0, filter_op->get_children_cnt());
+  EXPECT_EQ(op_count + 1, search_ctx_.op_store_.count());
+  EXPECT_TRUE(filter_op->can_enumerate_rowids());
+  EXPECT_TRUE(filter_op->supports_direct_rowid_drain());
+
+  MockSegmentOp scoring_op(search_ctx_, {10}, {2.0});
+  MockSegmentOpParam scoring_param;
+  scoring_param.set_is_scoring(true);
+  ASSERT_EQ(OB_SUCCESS, scoring_op.init(scoring_param));
+  ObSEArray<ObIDASSearchOp *, 1> score_ops;
+  ObSEArray<ObDASSearchCost, 1> score_costs;
+  ASSERT_EQ(OB_SUCCESS, score_ops.push_back(&scoring_op));
+  ASSERT_EQ(OB_SUCCESS, score_costs.push_back(lead_cost));
+  ObDASBMMBuildOptions bmm_param_options = options;
+  bmm_param_options.query_optional_ = false;
+  bmm_param_options.lead_cost_ = lead_cost;
+  bmm_param_options.filter_cost_ = filter_cost;
+  ObDASBMMOpParam bmm_param(
+      score_ops, filter_op, allocator_, bmm_param_options, &score_costs);
+  ObDASBMMOp bmm(search_ctx_);
+  ASSERT_EQ(OB_SUCCESS, bmm.init(bmm_param));
+  EXPECT_TRUE(bmm.enable_vec_merge_);
+  EXPECT_EQ(ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN, bmm.filter_mode_);
+  EXPECT_EQ(filter_op, bmm.get_filter_op());
+  // No SSTable handles are populated: physical scans would fail.
+  ASSERT_EQ(OB_SUCCESS, bmm.open());
+  EXPECT_EQ(1, scoring_op.open_count());
+  ObDASRowID rowid;
+  double score = 0.0;
+  EXPECT_EQ(OB_ITER_END, bmm.next_rowid(rowid, score));
+  select_partition(catalog, 2);
+  ASSERT_EQ(OB_SUCCESS, bmm.rescan());
+  EXPECT_EQ(1, scoring_op.rescan_count());
+  EXPECT_EQ(OB_ITER_END, bmm.next_rowid(rowid, score));
+  ASSERT_EQ(OB_SUCCESS, bmm.close());
+  search_ctx_.snapshot_ = nullptr;
+}
+
+TEST_F(TestDASAsyncSegmentMerge, async_empty_scalar_filter_bmm_keeps_direct_drain)
+{
+  check_async_empty_filter_bmm();
 }
 
 TEST_F(TestDASAsyncSegmentMerge, async_bmm_direct_selection_preserves_candidate_filter_cost_strategy)

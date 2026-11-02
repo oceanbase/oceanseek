@@ -145,7 +145,7 @@ public:
     return ret;
   }
 
-  int get_publish_scns(const uint64_t, ObLS *,
+  int get_publish_scns(ObLS *,
       const ObIArray<ObTabletID> &index_tablet_ids,
       ObIArray<SCN> &scns) override
   {

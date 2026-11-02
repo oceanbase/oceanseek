@@ -26,7 +26,7 @@ class TaskTestProvider : public ObIAsyncIndexDepProvider
 {
 public:
   TaskTestProvider() {}
-  int get_publish_scns(const uint64_t, ObLS *,
+  int get_publish_scns(ObLS *,
       const ObIArray<ObTabletID> &, ObIArray<SCN> &scns) override
   { scns.reset(); return OB_SUCCESS; }
   int get_async_index_refresh_info(const uint64_t, ObLS *, const ObTabletID &,

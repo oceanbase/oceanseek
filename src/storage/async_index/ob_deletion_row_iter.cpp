@@ -7,8 +7,10 @@
 
 #include "storage/async_index/ob_deletion_row_iter.h"
 #include "storage/access/ob_table_scan_iterator.h"
+#include "storage/meta_mem/ob_tablet_handle.h"
 #include "storage/tx_storage/ob_access_service.h"
 #include "storage/tx_storage/ob_ls_service.h"
+#include "storage/tablet/ob_tablet_table_store.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 
 namespace oceanbase
@@ -47,7 +49,7 @@ int ObDeletionRowIter::init(
     ret = OB_INIT_TWICE;
     LOG_WARN("ObDeletionRowIter init twice", K(ret));
   } else if (OB_UNLIKELY(!ls_id.is_valid() || !delete_log_tablet_id.is_valid()
-      || OB_INVALID_ID == table_id || async_snapshot <= 0)) {
+      || OB_INVALID_ID == table_id || async_snapshot <= 0 || INT64_MAX == async_snapshot)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(ls_id), K(delete_log_tablet_id), K(table_id), K(async_snapshot));
   } else {
@@ -116,7 +118,8 @@ int ObDeletionRowIter::next()
         LOG_WARN("unexpected trans column index", K(ret), K_(trans_col_idx), KPC(datum_row));
       } else {
         const int64_t stored_row_scn = datum_row->storage_datums_[trans_col_idx_].get_int();
-        const int64_t row_scn = stored_row_scn < 0 ? -stored_row_scn : stored_row_scn;
+        const int64_t row_scn = INT64_MIN == stored_row_scn ? 0
+            : (stored_row_scn < 0 ? -stored_row_scn : stored_row_scn);
         if (OB_UNLIKELY(row_scn <= 0)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("invalid deletion row scn", K(ret), K(stored_row_scn), K(row_scn),
@@ -190,6 +193,54 @@ int ObDeletionRowIter::build_table_param(const uint64_t table_id)
   return ret;
 }
 
+int ObDeletionRowIter::prepare_read_snapshot(
+    const share::ObLSID &ls_id,
+    const common::ObTabletID &tablet_id,
+    const int64_t expire_ts,
+    transaction::ObTxReadSnapshot &snapshot,
+    const int64_t minimum_snapshot)
+{
+  int ret = OB_SUCCESS;
+  ObLSService *ls_service = MTL(ObLSService *);
+  ObLSHandle ls_handle;
+  ObTabletHandle tablet_handle;
+  ObDeletionReadPreparation preparation(expire_ts);
+  int64_t physical_version = 0;
+  share::SCN read_snapshot;
+  snapshot.reset();
+  if (!ls_id.is_valid() || !tablet_id.is_valid()
+      || minimum_snapshot < 0 || INT64_MAX == minimum_snapshot) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid deletion preparation arguments", K(ret), K(ls_id), K(tablet_id));
+  } else if (OB_FAIL(preparation.check_status())) {
+    LOG_WARN("deletion preparation interrupted", K(ret));
+  } else if (OB_ISNULL(ls_service)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ls service is null", K(ret));
+  } else if (OB_FAIL(ls_service->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD))) {
+    LOG_WARN("failed to get deletion ls", K(ret));
+  } else if (OB_FAIL(ls_handle.get_ls()->get_tablet_svr()->check_allow_to_read())) {
+    LOG_WARN("deletion ls is not readable", K(ret));
+  } else if (OB_FAIL(ls_handle.get_ls()->get_tablet(
+      tablet_id, tablet_handle, preparation.remaining_time()))) {
+    LOG_WARN("failed to get deletion tablet", K(ret));
+  } else if (OB_FAIL(tablet_handle.get_obj()->get_deletion_physical_snapshot(
+      expire_ts, physical_version, minimum_snapshot))) {
+    LOG_WARN("failed to get deletion physical snapshot", K(ret));
+  } else if (OB_FAIL(read_snapshot.convert_for_tx(physical_version))) {
+    LOG_WARN("invalid deletion physical version", K(ret), K(physical_version));
+  } else {
+    snapshot.init_special_read(read_snapshot);
+    if (OB_FAIL(preparation.check_status())) {
+      LOG_WARN("deletion preparation expired after snapshot calculation", K(ret));
+    }
+  }
+  if (OB_FAIL(ret)) {
+    snapshot.reset();
+  }
+  return ret;
+}
+
 int ObDeletionRowIter::build_scan_param(
     const share::ObLSID &ls_id,
     const common::ObTabletID &tablet_id,
@@ -246,46 +297,11 @@ int ObDeletionRowIter::build_scan_param(
     scan_param_.scan_tasks_.set_attr(ObMemAttr(tenant_id, "ScanParamET"));
     scan_param_.tx_id_.reset();
 
-    // M (async_snapshot_) is a logical version, not an MVCC read snapshot.
-    // Use the target LS weak-read timestamp as the finite physical snapshot S;
-    // this avoids requesting GTS, but readability at S does not imply coverage
-    // of M. Check publication at the SAME S: an INC contributes its logical
-    // version only if its publishing transaction committed at C <= S. The
-    // query-publication check also handles the initial, proven-empty prefix.
-    // Require query_published_version(S) >= M, not simply S >= M. Otherwise
-    // retry initialization to acquire a new S, without caching a partial bitmap.
-    // Scan at this S and keep filtering by logical M in next(). Never use MAX
-    // for this ordinary scan: it would pollute the transaction read watermark.
-    ObLSService *ls_service = MTL(ObLSService *);
-    ObLSHandle ls_handle;
-    ObTabletHandle tablet_handle;
-    share::SCN read_snapshot;
-    int64_t physical_published_version = 0;
-    int64_t query_published_version = 0;
-    if (OB_ISNULL(ls_service)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("ls service is null", K(ret));
-    } else if (OB_FAIL(ls_service->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD))) {
-      LOG_WARN("failed to get deletion ls", K(ret), K(ls_id));
-    } else if (OB_FALSE_IT(read_snapshot = ls_handle.get_ls()->get_ls_wrs_handler()->get_ls_weak_read_ts())) {
-    } else if (OB_UNLIKELY(read_snapshot <= share::SCN::base_scn())) {
-      // The LS weak-read timestamp is MIN during initialization and BASE while offline.
-      ret = OB_NEED_RETRY;
-      LOG_WARN("ls weak read snapshot is not ready for deletion scan", K(ret), K(ls_id), K(read_snapshot));
-    } else if (OB_FAIL(ls_handle.get_ls()->get_tablet(tablet_id, tablet_handle))) {
-      LOG_WARN("failed to get deletion tablet", K(ret), K(tablet_id));
-    } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_max_published_version(
-        read_snapshot, physical_published_version))) {
-      LOG_WARN("failed to get deletion publication at read snapshot", K(ret), K(read_snapshot));
-    } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_query_published_version(
-        read_snapshot, physical_published_version, query_published_version))) {
-      LOG_WARN("failed to get deletion query publication at read snapshot", K(ret), K(read_snapshot));
-    } else if (query_published_version < async_snapshot_) {
-      ret = OB_NEED_RETRY;
-      LOG_INFO("deletion input is not ready at finite read snapshot", K(ret), K(read_snapshot),
-               K_(async_snapshot), K(physical_published_version), K(query_published_version));
-    } else {
-      scan_param_.snapshot_.init_weak_read(read_snapshot);
+    // Derive the physical snapshot independently of the logical deletion watermark.
+    if (OB_FAIL(prepare_read_snapshot(
+        ls_id, tablet_id, scan_param_.timeout_, scan_param_.snapshot_))) {
+      LOG_WARN("failed to initialize deletion physical read snapshot", K(ret), K(ls_id),
+               K(tablet_id), K_(async_snapshot));
     }
 
     if (OB_SUCC(ret)) {

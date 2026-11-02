@@ -6,7 +6,7 @@
 #define USING_LOG_PREFIX MDS
 #include "storage/tablet/ob_async_index_refresh_info_mds_helper.h"
 #include "storage/tablet/ob_async_index_refresh_info_replay_executor.h"
-#include "storage/multi_data_source/mds_ctx.h"
+#include "storage/multi_data_source/ob_tablet_mds_info_cache_ctx.h"
 #include "storage/tablet/ob_tablet_binding_helper.h"
 #include "storage/tablelock/ob_lock_inner_connection_util.h"
 #include "storage/tx/ob_multi_data_source.h"
@@ -563,7 +563,9 @@ int ObTabletAsyncIndexRefreshInfoMdsHelper::process(const char *buf, const int64
     ObLS *ls = nullptr;
     ObLSHandle ls_handle;
     ObLSService *ls_service = MTL(ObLSService *);
-    MdsCtx &user_ctx = static_cast<MdsCtx &>(ctx);
+    ObTabletMdsInfoCacheCtx &user_ctx = static_cast<ObTabletMdsInfoCacheCtx &>(ctx);
+    user_ctx.set_target(ObMdsInfoCacheTarget::ASYNC_INDEX_MEMBERSHIP);
+    user_ctx.set_ls_id(arg.ls_id_);
     if (OB_ISNULL(ls_service)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("ls service is nullptr", K(ret));

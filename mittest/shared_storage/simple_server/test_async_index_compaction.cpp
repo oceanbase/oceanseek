@@ -1967,6 +1967,8 @@ TEST_F(ObAsyncIndexCompactionTest, collect_merge_infos_multi_major_only_latest_b
   ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(ls_handle, fts_tablet_id, mock_second_major_snapshot));
   assert_major_sstable_cnt_at_least(ctx.ls_id_, fts_tablet_id, 2);
 
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(ls_handle, fts_tablet_id, mock_second_major_snapshot));
+
   ObTabletHandle data_handle;
   ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, ctx.data_tablet_id_, data_handle));
   ObSEArray<ObTabletID, 4> index_tablet_ids;
@@ -1985,6 +1987,8 @@ TEST_F(ObAsyncIndexCompactionTest, collect_merge_infos_multi_major_only_latest_b
   };
   verify_collect_merge_infos(
       ls_handle, fts_tablet_id, schedule_snapshot_version, 1, expected_tiers, 1);
+  // This tablet has already merged beyond the limit and needs no scheduling input.
+  verify_collect_merge_infos(ls_handle, fts_tablet_id, mock_major_snapshot, 0);
 }
 
 TEST_F(ObAsyncIndexCompactionTest, collect_merge_infos_stale_narrow_inc_skipped)
@@ -2009,6 +2013,7 @@ TEST_F(ObAsyncIndexCompactionTest, collect_merge_infos_stale_narrow_inc_skipped)
   ASSERT_EQ(OB_SUCCESS, fill_inc_major_segments(
       ls_handle, fts_tablet_id, mock_major_snapshot,
       narrow_inc_cnt, DEFAULT_INC_MAJOR_STEP, DEFAULT_SEG_SIZE));
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(ls_handle, fts_tablet_id, wide_snap));
   verify_inc_major_cnt(ctx.ls_id_, fts_tablet_id, narrow_inc_cnt);
 
   ObTabletHandle data_handle;
@@ -2045,6 +2050,11 @@ TEST_F(ObAsyncIndexCompactionTest, collect_merge_infos_stale_narrow_inc_skipped)
   };
   verify_collect_merge_infos(
       ls_handle, fts_tablet_id, schedule_snapshot_version, 2, expected_tiers, 2);
+
+  // The wide IncMajor must constrain alignment even when it crosses the scheduling limit.
+  verify_collect_merge_infos(
+      ls_handle, fts_tablet_id, mock_major_snapshot + DEFAULT_INC_MAJOR_STEP,
+      2, expected_tiers, 2);
 
   ObNewVersionRange merge_version_range;
   const int ret = ObAsyncIndexMergePolicy::choose_async_index_merge_range(
@@ -2438,11 +2448,9 @@ TEST_F(ObAsyncIndexCompactionTest, lookup_base_zero_falls_back_to_inc_inv)
 
   ObStorageMetaHandle table_store_handle;
   ObTableHandleV2 selected_handle;
-  SCN visible_snapshot;
-  ASSERT_EQ(OB_SUCCESS, visible_snapshot.convert_for_tx(300));
   ASSERT_EQ(OB_SUCCESS, inc_only_store.get_async_index_sstable(
       table_store_handle, *tablet_handle.get_obj(), ObITable::INV_INDEX_SSTABLE,
-      logical_range, visible_snapshot, selected_handle));
+      logical_range, selected_handle));
   // ObSSTableArray::init() deep-copies each table, so the handle returned by the
   // lookup points at the store's own copy, not at the object built here. Compare
   // the table identity instead of the pointer.
@@ -2450,13 +2458,6 @@ TEST_F(ObAsyncIndexCompactionTest, lookup_base_zero_falls_back_to_inc_inv)
   ASSERT_EQ(inc_sstable->get_key(), selected_handle.get_table()->get_key());
   ASSERT_EQ(inc_sstable->get_key(), inc_only_store.inc_major_tables_.at(0)->get_key());
   selected_handle.reset();
-
-  SCN invisible_snapshot;
-  ASSERT_EQ(OB_SUCCESS, invisible_snapshot.convert_for_tx(commit_version - 1));
-  ASSERT_EQ(OB_ENTRY_NOT_EXIST, inc_only_store.get_async_index_sstable(
-      table_store_handle, *tablet_handle.get_obj(), ObITable::INV_INDEX_SSTABLE,
-      logical_range, invisible_snapshot, selected_handle));
-  ASSERT_EQ(nullptr, selected_handle.get_table());
 
   ObInvSSTable *major_sstable = nullptr;
   ASSERT_EQ(OB_SUCCESS,
@@ -2472,7 +2473,7 @@ TEST_F(ObAsyncIndexCompactionTest, lookup_base_zero_falls_back_to_inc_inv)
 
   ASSERT_EQ(OB_SUCCESS, major_and_inc_store.get_async_index_sstable(
       table_store_handle, *tablet_handle.get_obj(), ObITable::INV_INDEX_SSTABLE,
-      logical_range, visible_snapshot, selected_handle));
+      logical_range, selected_handle));
   // Same deep-copy caveat as above: once a Major is present at the same logical
   // range it must win over the IncMajor, so assert on the selected table type and
   // key rather than on the pointer identity of the locally built object.

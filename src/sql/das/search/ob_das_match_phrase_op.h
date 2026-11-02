@@ -118,6 +118,7 @@ private:
   int select_lead_idx();
   int calculate_total_token_weight_on_demand();
   int estimate_bm25_param();
+  int prepare_token_stats();
   int init_block_max_iters_on_demand();
   int resolve_bm25_write_exprs(ObExpr *&total_doc_cnt_expr, ObExpr *&avg_doc_token_cnt_expr);
   int write_bm25_params_to_exprs(

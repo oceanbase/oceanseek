@@ -382,7 +382,7 @@ int ObDASMatchRtDef::can_pushdown_filter_to_bmm(
       uint64_t index_table_id = OB_INVALID_ID;
       int64_t max_segment_cnt = 0;
       // A Group-scoped MATCH may use one bitmap provider across the Segment
-      // BMMs in that Group. Legacy execution still requires one Segment.
+      // BMMs in that Group. Legacy execution allows at most one Segment.
       can_pushdown = false;
       if (OB_ISNULL(inv_ctdef) || OB_INVALID_ID == inv_ctdef->ref_table_id_) {
         ret = OB_ERR_UNEXPECTED;
@@ -391,7 +391,7 @@ int ObDASMatchRtDef::can_pushdown_filter_to_bmm(
                      *ir_ctdef, search_ctx, index_table_id, max_segment_cnt))) {
         LOG_WARN("failed to resolve async match filter pushdown domain", K(ret));
       } else {
-        can_pushdown = 1 == max_segment_cnt
+        can_pushdown = 1 >= max_segment_cnt
             || (search_ctx.get_async_group_slot() >= 0
                 && DAS_ROWID_TYPE_UINT64 == search_ctx.get_rowid_type());
       }
@@ -507,17 +507,17 @@ int ObDASMatchRtDef::generate_op(
         LOG_WARN("failed to generate bound async match subtree", K(ret), K(index_table_id));
       }
     } else {
-      if (OB_NOT_NULL(pushdown_filter_op_) && 1 != max_segment_cnt) {
+      const int64_t group_slot = search_ctx.get_async_group_slot();
+      if (OB_NOT_NULL(pushdown_filter_op_) && 1 < max_segment_cnt) {
         ret = OB_STATE_NOT_MATCH;
         LOG_WARN("async match filter pushdown crosses SegmentMerge",
                  K(ret), K(index_table_id), K(max_segment_cnt));
+      } else {
+        // An async Token captures its logical index, Group, and direct-binding attributes,
+        // so later partition switches do not depend on shared construction context.
+        binding_guard.set(index_table_id, group_slot, group_slot >= 0 && 1 >= max_segment_cnt);
       }
-      // An async Token captures its logical index, Group, and direct-binding attributes,
-      // so later partition switches do not depend on shared construction context.
-      binding_guard.set(index_table_id, search_ctx.get_async_group_slot(),
-                        search_ctx.get_async_group_slot() >= 0
-                        && 1 == max_segment_cnt);
-      for (int64_t i = 0; OB_SUCC(ret) && i < max_segment_cnt; ++i) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < MAX(1L, max_segment_cnt); ++i) {
         ObIDASSearchOp *segment_op = nullptr;
         if (OB_NOT_NULL(streaming_group_filter_)) {
           pushdown_filter_op_ = nullptr;

@@ -239,7 +239,7 @@ int ObDASSearchUtils::resolve_async_segment_domain(
     max_segment_cnt = group_slot >= 0
         ? query_ctx->get_max_segment_cnt(group_slot, index_table_id)
         : query_ctx->get_max_segment_cnt(index_table_id);
-    if (OB_UNLIKELY(common::OB_INVALID_ID == index_table_id || max_segment_cnt <= 0)) {
+    if (OB_UNLIKELY(common::OB_INVALID_ID == index_table_id)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid async segment domain", K(ret), K(index_table_id), K(max_segment_cnt));
     }
@@ -269,8 +269,7 @@ int ObDASSearchUtils::resolve_async_field_segment_domain(
     }
   } else {
     const int64_t group_slot = search_ctx.get_async_group_slot();
-    binding_guard.set(index_table_id, group_slot,
-                      group_slot >= 0 && 1 == segment_op_cnt);
+    binding_guard.set(index_table_id, group_slot, group_slot >= 0 && 1 >= segment_op_cnt);
   }
   return ret;
 }
@@ -333,19 +332,15 @@ int ObDASSearchUtils::generate_async_compound_query_op(
       } else if (FALSE_IT(max_segment_cnt = group_slot >= 0
                      ? query_ctx->get_max_segment_cnt(group_slot, analysis.index_table_id_)
                      : query_ctx->get_max_segment_cnt(analysis.index_table_id_))) {
-      } else if (OB_UNLIKELY(max_segment_cnt <= 0)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("compound query single-index claim has no segment",
-                 K(ret), K(group_slot), K(analysis));
-      } else if (OB_NOT_NULL(pushdown_filter_op) && 1 != max_segment_cnt) {
+      } else if (OB_NOT_NULL(pushdown_filter_op) && 1 < max_segment_cnt) {
         ret = OB_STATE_NOT_MATCH;
         LOG_WARN("async filter pushdown crosses SegmentMerge", K(ret),
                  K(group_slot), K(max_segment_cnt), K(analysis));
       } else {
         binding_guard.set(analysis.index_table_id_, group_slot,
-                          group_slot >= 0 && 1 == max_segment_cnt);
+                          group_slot >= 0 && 1 >= max_segment_cnt);
       }
-      for (int64_t i = 0; OB_SUCC(ret) && i < max_segment_cnt; ++i) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < MAX(1L, max_segment_cnt); ++i) {
         ObIDASSearchOp *segment_op = nullptr;
         if (OB_FAIL(generator(rtdef, ctdef, lead_cost, search_ctx, segment_op))) {
           LOG_WARN("failed to generate compound query segment subtree",
@@ -363,7 +358,7 @@ int ObDASSearchUtils::generate_async_compound_query_op(
       }
     } else if (ASYNC_INDEX_DOMAIN_MULTI == analysis.type_) {
       // A multi-field compound query owns its native Group-local BMM. Its capability
-      // check guarantees that every scoring field has exactly one Segment in this
+      // check guarantees that every scoring field has at most one Segment in this
       // Group before the filter is attached to that BMM.
       if (OB_FAIL(generator(rtdef, ctdef, lead_cost, search_ctx, op))) {
         LOG_WARN("failed to generate cross-index compound query", K(ret));

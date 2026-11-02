@@ -7,6 +7,7 @@
 #define PRINT_TS(x) (ObPrintTableStore(x))
 
 #include "ob_tablet_table_store.h"
+#include "lib/time/ob_time_utility.h"
 #include "observer/ob_server_event_history_table_operator.h"
 #include "storage/async_index/ob_async_index_define.h"
 #include "storage/ddl/ob_tablet_ddl_kv.h"
@@ -1072,6 +1073,136 @@ int ObTabletTableStore::calculate_inc_major_read_tables_for_ss(
 }
 #endif
 
+int ObDeletionReadPreparation::check_status() const
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(THIS_WORKER.check_status())) {
+    LOG_WARN("deletion preparation interrupted", K(ret));
+  } else if (remaining_time() <= 0) {
+    ret = OB_TIMEOUT;
+    LOG_WARN("deletion preparation timed out", K(ret), K_(expire_ts));
+  }
+  return ret;
+}
+
+int64_t ObDeletionReadPreparation::remaining_time() const
+{
+  const int64_t now = ObTimeUtility::current_time();
+  return expire_ts_ <= now ? 0 : MAX(0L, MIN(
+      MIN(expire_ts_ - now, THIS_WORKER.get_timeout_remain()),
+      ObTabletCommon::DEFAULT_GET_TABLET_DURATION_10_S));
+}
+
+int ObDeletionReadPreparation::finish(int64_t &snapshot) const
+{
+  int ret = OB_SUCCESS;
+  snapshot = 0;
+  if (OB_FAIL(check_status())) {
+    LOG_WARN("deletion preparation interrupted", K(ret));
+  } else if (visibility_version_ <= 0 || INT64_MAX == visibility_version_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid finite deletion snapshot", K(ret), K_(visibility_version));
+  } else {
+    snapshot = visibility_version_;
+  }
+  return ret;
+}
+
+int ObTabletTableStore::calculate_deletion_inc_tables(
+    const ObTablet &tablet, const ObSSTable *base_table,
+    ObDeletionReadPreparation &preparation) const
+{
+  int ret = OB_SUCCESS;
+  ObNewVersionRange base_range;
+  ObLSHandle ls_handle;
+  if (OB_NOT_NULL(base_table)
+      && OB_FAIL(base_table->get_async_index_version_range(base_range))) {
+    LOG_WARN("failed to read deletion baseline logical range", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < inc_major_tables_.count(); ++i) {
+    ObSSTable *table = inc_major_tables_.at(i);
+    ObNewVersionRange range;
+    int64_t state = ObTxData::UNKOWN;
+    int64_t commit = OB_INVALID_VERSION;
+    if (OB_FAIL(preparation.check_status())) {
+      LOG_WARN("deletion selection interrupted", K(ret));
+    } else if (OB_ISNULL(table)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("null deletion increment", K(ret), K(i));
+    } else if (OB_FAIL(table->get_async_index_version_range(range))) {
+      LOG_WARN("failed to read deletion increment logical range", K(ret), KPC(table));
+    } else if (nullptr != base_table && range.snapshot_version_ <= base_range.snapshot_version_) {
+      // Logical coverage, not the physical CLOG range or refresh commit version.
+    } else if (!ls_handle.is_valid()
+        && OB_FAIL(ObIncMajorTxHelper::get_ls(tablet.get_ls_id(), ls_handle))) {
+      LOG_WARN("failed to get deletion ls", K(ret));
+    } else if (OB_FAIL(ObIncMajorTxHelper::get_inc_major_commit_version(
+        *ls_handle.get_ls(), *table, SCN::max_scn(), state, commit))) {
+      LOG_WARN("failed to resolve deletion increment commit", K(ret), KPC(table));
+    } else if (OB_FAIL(preparation.check_status())) {
+      LOG_WARN("deletion transaction lookup interrupted", K(ret));
+    } else if (ObTxData::COMMIT != state) {
+      // RUNNING and ABORT do not contribute to the read snapshot.
+    } else if (commit <= 0 || INT64_MAX == commit) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid deletion commit version", K(ret), K(commit), KPC(table));
+    } else {
+      preparation.visibility_version_ = MAX(preparation.visibility_version_, commit);
+    }
+  }
+  return ret;
+}
+
+int ObTabletTableStore::collect_deletion_snapshot(
+    const ObTablet &tablet, ObDeletionReadPreparation &preparation) const
+{
+  int ret = OB_SUCCESS;
+  ObTabletCreateDeleteMdsUserData status;
+  const ObSSTable *base_table = nullptr;
+  int64_t base_snapshot = 0;
+  const int64_t multi_version_start = tablet.get_multi_version_start();
+  if (OB_FAIL(preparation.check_status())) {
+    LOG_WARN("deletion snapshot collection interrupted", K(ret));
+  } else if (!is_valid()) {
+    ret = OB_ERR_SYS;
+    LOG_WARN("invalid deletion table store", K(ret), KPC(this));
+  } else if (multi_version_start < 0 || INT64_MAX == multi_version_start) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid deletion multi version start", K(ret), K(multi_version_start));
+  } else if (!major_tables_.empty()) {
+    base_table = static_cast<const ObSSTable *>(major_tables_.get_boundary_table(true /*last*/));
+    if (OB_ISNULL(base_table)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("null deletion major table", K(ret));
+    } else {
+      base_snapshot = base_table->get_snapshot_version();
+      if (base_snapshot <= 0 || INT64_MAX == base_snapshot) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid deletion baseline snapshot", K(ret), K(base_snapshot));
+      }
+    }
+  }
+  // Refresh writes INC_MAJOR directly. The subsequent ordinary scan checks readability.
+  // A transfer destination may have no MAJOR; its source is collected by the caller.
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(calculate_deletion_inc_tables(tablet, base_table, preparation))) {
+    LOG_WARN("failed to collect deletion increments", K(ret));
+  } else if (OB_FAIL(tablet.get_latest_committed_tablet_status(status))) {
+    LOG_WARN("failed to get committed deletion tablet creation", K(ret));
+  } else if (OB_FAIL(preparation.check_status())) {
+    LOG_WARN("deletion creation lookup interrupted", K(ret));
+  } else if (status.create_commit_version_ <= 0
+      || INT64_MAX == status.create_commit_version_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid committed deletion tablet creation", K(ret), K(status));
+  } else {
+    // GC can advance MVS without producing a new MAJOR. Respect every contributing Tablet.
+    preparation.visibility_version_ = MAX(preparation.visibility_version_,
+        MAX(MAX(base_snapshot, status.create_commit_version_), multi_version_start));
+  }
+  return ret;
+}
+
 int ObTabletTableStore::calculate_read_tables(const int64_t snapshot_version, const ObTablet &tablet,
     ObTableStoreIterator &iterator, const bool allow_no_ready_read, const bool skip_major) const
 {
@@ -1242,7 +1373,6 @@ int ObTabletTableStore::get_async_index_sstable(
     const ObTablet &tablet,
     const ObITable::TableType table_type,
     const common::ObNewVersionRange &version_range,
-    const share::SCN &read_snapshot,
     ObTableHandleV2 &handle) const
 {
   int ret = OB_SUCCESS;
@@ -1257,11 +1387,10 @@ int ObTabletTableStore::get_async_index_sstable(
       || !is_valid_async_index_version_range(
           is_inc_major_sstable,
           version_range.base_version_,
-          version_range.snapshot_version_)
-      || !read_snapshot.is_valid())) {
+          version_range.snapshot_version_))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid async index sstable lookup arguments", K(ret), K(table_type),
-        K(version_range), K(read_snapshot), KPC(this));
+        K(version_range), KPC(this));
   } else if (FALSE_IT(sstable_array = ObITable::is_inc_major_type_sstable(table_type)
                                           ? &inc_major_tables_
                                           : &major_tables_)) {
@@ -1296,14 +1425,15 @@ int ObTabletTableStore::get_async_index_sstable(
             LOG_WARN("failed to get async index IncMajor transaction state", K(ret),
                 K(i), K(version_range), KPC(sstable));
           } else {
-            is_visible = ObTxData::COMMIT == tx_state
-                && commit_version <= read_snapshot.get_val_for_tx();
+            // SQL visibility is bounded by the logical refresh range; the
+            // transaction that materialized it may have committed later.
+            is_visible = ObTxData::COMMIT == tx_state;
           }
         }
         if (OB_FAIL(ret)) {
         } else if (!is_visible) {
-          LOG_TRACE("skip async index sstable invisible to read snapshot",
-              K(i), K(version_range), K(read_snapshot), K(tx_state), K(commit_version), KPC(sstable));
+          LOG_TRACE("skip uncommitted async index sstable",
+              K(i), K(version_range), K(tx_state), K(commit_version), KPC(sstable));
         } else if (OB_ISNULL(matched_sstable)
             || sstable->get_end_scn() > matched_sstable->get_end_scn()) {
           matched_sstable = sstable;
@@ -1317,12 +1447,12 @@ int ObTabletTableStore::get_async_index_sstable(
       // 首次 COMPLETE 刷新可能生成逻辑 base 为 INITIAL_VERSION 的
       // INC_INV；首选 Major 未命中时继续按相同逻辑范围查找 IncMajor。
       ret = get_async_index_sstable(table_store_handle, tablet,
-          ObITable::INC_INV_INDEX_SSTABLE, version_range, read_snapshot, handle);
+          ObITable::INC_INV_INDEX_SSTABLE, version_range, handle);
     } else if (OB_FAIL(ret)) {
     } else if (OB_ISNULL(matched_sstable)) {
       ret = OB_ENTRY_NOT_EXIST;
       LOG_WARN("async index sstable not found", K(ret), K(table_type), K(version_range),
-          K(read_snapshot), "major_count", major_tables_.count(),
+          "major_count", major_tables_.count(),
           "inc_major_count", inc_major_tables_.count());
     } else if (OB_FAIL(get_table(table_store_handle, matched_sstable->get_key(), handle))) {
       LOG_WARN("failed to materialize async index sstable handle", K(ret),
@@ -4921,25 +5051,23 @@ int ObTabletTableStore::get_async_index_sstable_version_ranges(
     const ObTablet &tablet,
     common::ObIArray<common::ObNewVersionRange> &table_version_ranges) const
 {
-  return get_async_index_sstable_version_ranges(
-      tablet, SCN::max_scn(), table_version_ranges);
-}
-
-int ObTabletTableStore::get_async_index_sstable_version_ranges(
-    const ObTablet &tablet,
-    const share::SCN &read_snapshot,
-    common::ObIArray<common::ObNewVersionRange> &table_version_ranges) const
-{
   int ret = OB_SUCCESS;
+  int64_t major_version = 0;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
-  } else if (OB_UNLIKELY(!read_snapshot.is_valid())) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid read snapshot", K(ret), K(read_snapshot));
-  } else if (OB_FAIL(append_sstable_version_ranges(major_tables_, table_version_ranges))) {
-    LOG_WARN("failed to append major sstable version ranges", K(ret), K_(major_tables));
-  } else if (inc_major_tables_.count() > 0) {
+  } else if (!major_tables_.empty()) {
+    const ObITable *major = major_tables_.get_boundary_table(true /*last*/);
+    if (OB_ISNULL(major)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("latest async index major is null", K(ret));
+    } else if (OB_FAIL(table_version_ranges.push_back(major->get_version_range()))) {
+      LOG_WARN("failed to append latest major range", K(ret), KPC(major));
+    } else {
+      major_version = major->get_snapshot_version();
+    }
+  }
+  if (OB_SUCC(ret) && inc_major_tables_.count() > 0) {
     ObLSHandle ls_handle;
     if (OB_FAIL(ObIncMajorTxHelper::get_ls(tablet.get_ls_id(), ls_handle))) {
       LOG_WARN("fail to get ls", KR(ret), K(tablet.get_ls_id()));
@@ -4963,13 +5091,12 @@ int ObTabletTableStore::get_async_index_sstable_version_ranges(
         LOG_WARN("fail to get inc major commit version", KR(ret), K(i), KPC(sstable));
       } else if (ObTxData::COMMIT != tx_state) {
         LOG_INFO("skip uncommitted async index inc major sstable", K(i), K(tx_state), KPC(sstable));
-      } else if (commit_version > read_snapshot.get_val_for_tx()) {
-        LOG_TRACE("skip async index inc major sstable invisible to read snapshot",
-            K(i), K(commit_version), K(read_snapshot), KPC(sstable));
       } else {
         ObNewVersionRange version_range;
         if (OB_FAIL(sstable->get_async_index_version_range(version_range))) {
           LOG_WARN("failed to get async index sstable version range", KR(ret), K(i), KPC(sstable));
+        } else if (version_range.snapshot_version_ <= major_version) {
+          // Already included in the latest MAJOR.
         } else if (OB_FAIL(table_version_ranges.push_back(version_range))) {
           LOG_WARN("failed to push sstable version range", KR(ret), K(i), K(version_range));
         }
@@ -4979,34 +5106,8 @@ int ObTabletTableStore::get_async_index_sstable_version_ranges(
   return ret;
 }
 
-int ObTabletTableStore::append_sstable_version_ranges(
-    const ObSSTableArray &sstable_array,
-    common::ObIArray<common::ObNewVersionRange> &table_version_ranges) const
-{
-  int ret = OB_SUCCESS;
-  for (int64_t i = 0; OB_SUCC(ret) && i < sstable_array.count(); ++i) {
-    ObITable *table = sstable_array.at(i);
-    if (OB_ISNULL(table)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected null sstable pointer", K(ret), K(i));
-    } else if (OB_FAIL(table_version_ranges.push_back(table->get_version_range()))) {
-      LOG_WARN("failed to push sstable version range", K(ret), K(i), K(table->get_version_range()));
-    }
-  }
-  return ret;
-}
-
 int ObTabletTableStore::get_async_index_max_published_version(
     const ObTablet &tablet,
-    int64_t &published_version) const
-{
-  return get_async_index_max_published_version(
-      tablet, SCN::max_scn(), published_version);
-}
-
-int ObTabletTableStore::get_async_index_max_published_version(
-    const ObTablet &tablet,
-    const share::SCN &read_snapshot,
     int64_t &published_version) const
 {
   int ret = OB_SUCCESS;
@@ -5014,9 +5115,6 @@ int ObTabletTableStore::get_async_index_max_published_version(
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
-  } else if (OB_UNLIKELY(!read_snapshot.is_valid())) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid read snapshot", K(ret), K(read_snapshot));
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < major_tables_.count(); ++i) {
       ObITable *table = major_tables_.at(i);
@@ -5052,9 +5150,6 @@ int ObTabletTableStore::get_async_index_max_published_version(
         LOG_WARN("fail to get inc major commit version", KR(ret), K(i), KPC(sstable));
       } else if (ObTxData::COMMIT != tx_state) {
         LOG_INFO("skip uncommitted async index inc major sstable", K(i), K(tx_state), KPC(sstable));
-      } else if (commit_version > read_snapshot.get_val_for_tx()) {
-        LOG_TRACE("skip async index inc major sstable invisible to read snapshot",
-            K(i), K(commit_version), K(read_snapshot), KPC(sstable));
       } else {
         published_version = MAX(published_version, sstable->get_async_index_snapshot_version());
       }

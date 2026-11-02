@@ -256,9 +256,9 @@ _GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION_(HELPER_CLASS, BUFFER_CTX_TYPE, ID, ENU
                                        48,\
                                        SYNC_STANDBY_STATUS)
   GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObTabletAsyncIndexRefreshInfoMdsHelper,\
-                                          ::oceanbase::storage::mds::MdsCtx,\
+                                          ::oceanbase::storage::mds::ObTabletMdsInfoCacheCtx,\
                                           49,\
-                                          ASYNC_INDEX_REFRESH_INFO)
+                                          ASYNC_INDEX_REFRESH_INFO) // FARM COMPAT WHITELIST
   GENERATE_MDS_FRAME_CODE_FOR_TRANSACTION(::oceanbase::storage::ObLsMdsTabletRelocMdsHelper,\
                                           ::oceanbase::storage::mds::MdsCtx,\
                                           50,\

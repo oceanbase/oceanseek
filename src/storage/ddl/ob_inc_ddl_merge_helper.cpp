@@ -1912,13 +1912,9 @@ int ObSSIncMajorDDLMergeHelper::prepare_cg_table_key(
       // scn_range_.end_scn_. Only async-index fills the physical CLOG end here.
       if (dag_merge_param.ddl_task_param_.is_async_index_refresh_) {
         cur_cg_table_key.scn_range_.end_scn_ = end_scn_;
-        // TODO(yilan.zyn): temporary patch to avoid -4016 (OB_LOG_ID_RANGE_NOT_CONTINUOUS)
-        // before the new empty-refresh implementation lands. An empty async-index
-        // refresh has no data macro CLOG from which to derive end_scn_, so fall back
-        // to [start_scn, start_scn] to keep the physical TableKey valid without
-        // mixing the logical refresh snapshot into it; the logical [base, snapshot]
-        // range is stored separately in min/max_merged_trans_version.
-        // Remove this once empty refresh produces a proper physical end_scn_.
+        // Empty refreshes retain only in-memory metadata for commit-log/RPC
+        // compatibility. Give this metadata a valid physical key; it is never
+        // installed in the shared or local TableStore, including on replay.
         const bool is_empty_async_index_refresh = end_scn_.is_min();
         if (is_empty_async_index_refresh) {
           cur_cg_table_key.scn_range_.end_scn_ = user_data.start_scn_;
@@ -2419,9 +2415,10 @@ int ObSSIncMajorDDLMergeHelper::update_tablet_table_store_for_inc_major(
   }
 
   if (OB_FAIL(ret)) {
-  } else if (!dag_merge_param.ddl_task_param_.is_async_index_refresh_
-             && inc_major_sstable->is_empty()) {
-    LOG_INFO("inc major sstable is empty", K(dag_merge_param), KPC(inc_major_sstable));
+  } else if (inc_major_sstable->is_empty()) {
+    // Keep the in-memory metadata for the existing commit-log/RPC format, but
+    // publish only the transactional MDS watermark for an empty refresh.
+    LOG_INFO("skip installing empty inc major sstable", K(dag_merge_param), KPC(inc_major_sstable));
   } else if (OB_FAIL(ObSSDDLUtil::update_shared_tablet_table_store(ls_handle,
                                                               *inc_major_sstable,
                                                               *tablet_param->storage_schema_,

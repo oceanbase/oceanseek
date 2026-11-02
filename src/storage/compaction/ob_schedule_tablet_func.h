@@ -43,9 +43,14 @@ struct ObScheduleTabletFunc : public ObBasicScheduleTabletFunc
   int diagnose_switch_tablet(storage::ObLS &ls, storage::ObTablet &tablet);
   OB_INLINE bool is_window_compaction_func() const { return schedule_mode_ == COMPACTION_WINDOW_MODE; }
   OB_INLINE bool is_window_compaction_active() const { return is_window_compaction_active_; }
-  OB_INLINE void destroy_tablet_status() { tablet_status_.destroy(); }
+  OB_INLINE void destroy_tablet_status()
+  {
+    tablet_status_.destroy();
+    async_delete_published_version_ = -1;
+  }
   INHERIT_TO_STRING_KV("ObScheduleTabletFunc", ObBasicScheduleTabletFunc,
-    K_(merge_reason), K_(schedule_mode), K_(is_window_compaction_active), K_(tablet_status), K_(time_guard));
+    K_(merge_reason), K_(schedule_mode), K_(is_window_compaction_active), K_(tablet_status),
+    K_(async_delete_published_version), K_(time_guard));
 protected:
   virtual int check_with_schedule_scn(
     const storage::ObTablet &tablet,
@@ -69,6 +74,7 @@ protected:
   int set_merge_reason(const ObAdaptiveMergePolicy::AdaptiveMergeReason merge_reason);
 private:
   virtual void schedule_freeze_dag(const bool force) override;
+  int prepare_async_delete_index_tablet_(storage::ObTabletHandle &tablet_handle);
   int check_async_index_tablet_status_for_schedule_(
       const storage::ObTablet &tablet,
       bool &skip_schedule);
@@ -88,6 +94,7 @@ private:
   ObSEArray<ObTabletID, 64> clear_stat_tablets_;
   ObAdaptiveMergePolicy::AdaptiveMergeReason merge_reason_;
   ObCompactionScheduleMode schedule_mode_;
+  int64_t async_delete_published_version_; // Fixed before acquiring the tablet used to schedule.
 };
 
 } // namespace compaction

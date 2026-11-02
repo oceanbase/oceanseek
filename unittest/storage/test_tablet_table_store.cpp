@@ -1445,8 +1445,7 @@ TEST_F(TestTableStore, test_async_delete_major_uses_table_key_range)
       ASYNC_INDEX_INITIAL_VERSION;
   ASSERT_EQ(OB_SUCCESS, stored_major->get_async_index_version_range(range));
   ASSERT_EQ(OB_SUCCESS, table_store.get_async_index_sstable(
-      ObStorageMetaHandle(), tablet, ObITable::MAJOR_SSTABLE, range,
-      SCN::max_scn(), handle));
+      ObStorageMetaHandle(), tablet, ObITable::MAJOR_SSTABLE, range, handle));
   ASSERT_NE(nullptr, handle.get_table());
   EXPECT_EQ(ASYNC_INDEX_INITIAL_VERSION,
       handle.get_table()->get_snapshot_version());
@@ -1454,8 +1453,7 @@ TEST_F(TestTableStore, test_async_delete_major_uses_table_key_range)
   stored_major->key_.version_range_.snapshot_version_ = 150;
   ASSERT_EQ(OB_SUCCESS, stored_major->get_async_index_version_range(range));
   ASSERT_EQ(OB_SUCCESS, table_store.get_async_index_sstable(
-      ObStorageMetaHandle(), tablet, ObITable::MAJOR_SSTABLE, range,
-      SCN::max_scn(), handle));
+      ObStorageMetaHandle(), tablet, ObITable::MAJOR_SSTABLE, range, handle));
   ASSERT_NE(nullptr, handle.get_table());
   EXPECT_EQ(major_key, handle.get_table()->get_key());
   handle.reset();

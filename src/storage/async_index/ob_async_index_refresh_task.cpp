@@ -259,8 +259,8 @@ int ObAsyncIndexRefreshTask::recheck_publish_scn_after_lock_(const ObRefreshTask
   } else if (OB_ISNULL(tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet handle is null", K(ret), K(stat.tablet_id_));
-  } else if (OB_FAIL(tablet_handle.get_obj()->get_latest_async_index_published_version(
-                 published_version))) {
+  } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_refresh_start_version(
+                 published_version, false /*use_cache*/))) {
     LOG_WARN("failed to get max published version", K(ret), K(stat.tablet_id_));
   } else {
     share::SCN current_publish_scn = async_index_snapshot_to_scn(published_version);

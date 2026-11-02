@@ -1060,9 +1060,13 @@ int ObDASScanOp::build_async_index_query_ctx(ObDASAsyncIndexQueryCtx &query_ctx)
   ObSEArray<ObTabletID, 2> index_tablet_ids;
   ObTabletID delete_tablet_id;
   share::SCN sql_read_snapshot;
-  if (OB_ISNULL(snapshot_) || OB_ISNULL(scan_rtdef_) || OB_ISNULL(scan_ctdef_)) {
+  if (OB_ISNULL(snapshot_) || OB_ISNULL(scan_rtdef_) || OB_ISNULL(scan_ctdef_)
+      || OB_ISNULL(scan_rtdef_->eval_ctx_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("null definition or runtime state for async index query", K(ret));
+  } else if (OB_FAIL(ObDASAsyncIndexQueryCtx::check_tx_isolation(
+                 scan_rtdef_->eval_ctx_->exec_ctx_.get_my_session()))) {
+    LOG_WARN("failed to check async index query isolation", K(ret));
   } else if (FALSE_IT(sql_read_snapshot = snapshot_->version())) {
   } else if (OB_FAIL(ObDASAsyncIndexQueryCtx::collect_async_index_table_ids(
                  attach_ctdef_, index_table_ids))) {

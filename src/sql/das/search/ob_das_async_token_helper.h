@@ -86,6 +86,7 @@ public:
   int get_bm25_param(uint64_t &total_doc_cnt, double &avg_doc_length) const;
 
   const common::ObTabletID &get_inv_idx_tablet_id() const { return inv_idx_tablet_id_; }
+  bool is_empty_segment() const { return is_empty_segment_; }
   storage::ObAsyncBM25ParamEstimator &get_param_estimator() { return param_estimator_; }
 
   // For tests: inject access service / tablet id without full DAS scalar scan defs.
@@ -113,6 +114,7 @@ private:
   uint64_t index_table_id_;
   int64_t group_slot_;
   bool direct_bind_;
+  bool is_empty_segment_;
   storage::ObAccessService *tsc_service_;
   common::ObQueryFlag query_flag_;
   blocksstable::ObInvSSTablePostingIter *posting_iter_;

@@ -325,10 +325,9 @@ int ObDASMatchPhraseRtDef::generate_op(
         LOG_WARN("failed to generate bound async match phrase op", K(ret), K(index_table_id));
       }
     } else {
-      binding_guard.set(index_table_id, search_ctx.get_async_group_slot(),
-                        search_ctx.get_async_group_slot() >= 0
-                        && 1 == max_segment_cnt);
-      for (int64_t s = 0; OB_SUCC(ret) && s < max_segment_cnt; ++s) {
+      const int64_t group_slot = search_ctx.get_async_group_slot();
+      binding_guard.set(index_table_id, group_slot, group_slot >= 0 && 1 >= max_segment_cnt);
+      for (int64_t s = 0; OB_SUCC(ret) && s < MAX(1L, max_segment_cnt); ++s) {
         ObIDASSearchOp *segment_op = nullptr;
         if (OB_FAIL(generate_single_segment_op(
                 *ctdef, param, use_single_token, param.boost_, search_ctx, segment_op))) {

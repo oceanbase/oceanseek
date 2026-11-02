@@ -10549,7 +10549,6 @@ int ObLSTabletService::get_async_index_segment_group_ctx(
       ObTabletHandle tablet_handle;
       common::ObSEArray<common::ObNewVersionRange, 64> tablet_version_ranges;
       ObTabletMemberWrapper<ObTabletTableStore> tablet_table_store_wrapper;
-      int64_t physical_published_version = 0;
       int64_t query_published_version = 0;
       if (OB_FAIL(get_tablet(tablet_id, tablet_handle))) {
         LOG_WARN("failed to get tablet", K(ret), K(tablet_id));
@@ -10559,6 +10558,16 @@ int ObLSTabletService::get_async_index_segment_group_ctx(
       } else if (OB_UNLIKELY(!tablet_handle.get_obj()->is_async_inverted_storage_index())) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("tablet is not async index tablet", K(ret), K(tablet_id), K(tablet_handle));
+      } else if (OB_FAIL(tablet_handle.get_obj()->get_latest_async_index_published_version(
+          query_published_version))) {
+        LOG_WARN("failed to get async-index logical publication", K(ret), K(tablet_id));
+      // Publication follows installation. An old handle may still reference
+      // the Tablet from before that installation, so acquire the current one.
+      } else if (OB_FAIL(get_tablet(tablet_id, tablet_handle))) {
+        LOG_WARN("failed to reacquire published async-index tablet", K(ret), K(tablet_id));
+      } else if (OB_UNLIKELY(!tablet_handle.is_valid())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid published async-index tablet", K(ret), K(tablet_id));
       } else if (OB_FAIL(tablet_handle.get_obj()->fetch_table_store(tablet_table_store_wrapper))) {
         LOG_WARN("failed to fetch tablet table store", K(ret), K(tablet_id));
       } else if (OB_UNLIKELY(!tablet_table_store_wrapper.is_valid())) {
@@ -10566,38 +10575,21 @@ int ObLSTabletService::get_async_index_segment_group_ctx(
         LOG_WARN("unexpected invalid tablet table store wrapper", K(ret), K(tablet_id), K(tablet_table_store_wrapper));
       } else if (OB_FAIL(tablet_table_store_wrapper.get_member()->
           get_async_index_sstable_version_ranges(
-              *tablet_handle.get_obj(), sql_read_snapshot, tablet_version_ranges))) {
+              *tablet_handle.get_obj(), tablet_version_ranges))) {
         LOG_WARN("failed to get all major sstable version ranges", K(ret), K(tablet_id));
-      } else {
-        for (int64_t j = 0; j < tablet_version_ranges.count(); ++j) {
-          physical_published_version = OB_MAX(
-              physical_published_version,
-              tablet_version_ranges.at(j).snapshot_version_);
-        }
-      }
-      if (OB_FAIL(ret)) {
-      // 物理 ranges 仍是实际扫描输入；仅随表创建已证明为空的尾区间可以由
-      // query_published_version 参与 Group 覆盖判断，不能伪造 SSTable range。
-      } else if (OB_FAIL(tablet_handle.get_obj()->
-          get_async_index_query_published_version(
-              sql_read_snapshot, physical_published_version,
-              query_published_version))) {
-        LOG_WARN("failed to get async-index query published version", K(ret),
-                 K(tablet_id), K(physical_published_version));
       } else if (OB_FAIL(ctx.add_index_tablet_version_ranges(
           tablet_handle, tablet_version_ranges, query_published_version))) {
         LOG_WARN("failed to add index tablet version ranges", K(ret), K(tablet_id));
       } else {
         LOG_TRACE("succeeded to add index tablet version ranges", K(ret), K(i),
                   K(tablet_id), K(tablet_version_ranges),
-                  K(physical_published_version), K(query_published_version));
+                  K(query_published_version));
       }
     }
-    // 共享 async-delete Tablet 只限制最终读快照，不参与 segment range 对齐；
-    // 随表创建时同样允许其使用已证明为空的初始逻辑水位。
+    // The delete Tablet contributes the same logical publication bound, but
+    // does not participate in segment grouping.
     if (OB_SUCC(ret)) {
       ObTabletHandle tablet_handle;
-      int64_t physical_published_version = 0;
       int64_t query_published_version = 0;
       if (OB_FAIL(get_tablet(delete_tablet_id, tablet_handle))) {
         LOG_WARN("failed to get async delete tablet", K(ret), K(delete_tablet_id));
@@ -10608,16 +10600,9 @@ int ObLSTabletService::get_async_index_segment_group_ctx(
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("async delete tablet is not async delete index tablet",
             K(ret), K(delete_tablet_id), K(tablet_handle));
-      } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_max_published_version(
-          sql_read_snapshot, physical_published_version))) {
-        LOG_WARN("failed to get async delete published version",
-            K(ret), K(delete_tablet_id));
-      } else if (OB_FAIL(tablet_handle.get_obj()->
-          get_async_index_query_published_version(
-              sql_read_snapshot, physical_published_version,
-              query_published_version))) {
-        LOG_WARN("failed to get async delete query published version", K(ret),
-                 K(delete_tablet_id), K(physical_published_version));
+      } else if (OB_FAIL(tablet_handle.get_obj()->get_latest_async_index_published_version(
+          query_published_version))) {
+        LOG_WARN("failed to get async delete logical publication", K(ret), K(delete_tablet_id));
       } else if (OB_FAIL(ctx.set_delete_table_published_version(query_published_version))) {
         LOG_WARN("failed to set async delete published version",
             K(ret), K(delete_tablet_id), K(query_published_version));
@@ -10703,7 +10688,7 @@ int ObLSTabletService::async_index_posting_scan(
         "tablet_handle_id", tablet_handle.is_valid() ? tablet_handle.get_obj()->get_tablet_id() : ObTabletID(),
         K(posting_param));
   } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_sstable(
-      preferred_table_type, version_range, scan_param.snapshot_.version(), table_handle))) {
+      preferred_table_type, version_range, table_handle))) {
     LOG_WARN("failed to get inv table", K(ret), K(preferred_table_type), K(version_range));
   } else if (OB_FAIL(table_handle.get_sstable(sstable))) {
     LOG_WARN("failed to get sstable from table handle", K(ret), K(table_handle));
@@ -10758,7 +10743,7 @@ int ObLSTabletService::async_index_range_scan(
         "tablet_handle_id", tablet_handle.is_valid() ? tablet_handle.get_obj()->get_tablet_id() : ObTabletID(),
         K(range_param));
   } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_sstable(
-      preferred_table_type, version_range, scan_param.snapshot_.version(), table_handle))) {
+      preferred_table_type, version_range, table_handle))) {
     LOG_WARN("failed to get inv table", K(ret), K(preferred_table_type), K(version_range));
   } else if (OB_FAIL(table_handle.get_sstable(sstable))) {
     LOG_WARN("failed to get sstable from table handle", K(ret), K(table_handle));

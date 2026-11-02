@@ -140,6 +140,7 @@ private:
   uint64_t index_table_id_;
   int64_t group_slot_;
   bool direct_bind_;
+  bool is_empty_segment_;
   storage::ObAccessService *tsc_service_;
   common::ObQueryFlag query_flag_;
   blocksstable::ObInvSSTablePostingIter *posting_iter_;

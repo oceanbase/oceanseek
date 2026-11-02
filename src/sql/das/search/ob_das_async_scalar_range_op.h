@@ -73,6 +73,7 @@ public:
       index_table_id_(common::OB_INVALID_ID),
       group_slot_(-1),
       direct_bind_(false),
+      is_empty_segment_(false),
       tsc_service_(nullptr),
       query_flag_(),
       range_iter_(nullptr),
@@ -150,6 +151,7 @@ private:
   uint64_t index_table_id_;
   int64_t group_slot_;
   bool direct_bind_;
+  bool is_empty_segment_;
   storage::ObAccessService *tsc_service_;
   common::ObQueryFlag query_flag_;
   blocksstable::ObInvSSTableRangeIter *range_iter_;

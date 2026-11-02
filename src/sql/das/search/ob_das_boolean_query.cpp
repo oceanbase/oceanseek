@@ -400,15 +400,11 @@ int ObDASBooleanQueryRtDef::generate_single_async_index_op(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid single-index boolean claim", K(ret), KP(query_ctx), KP(ctdef),
              K(index_table_id), K(group_slot));
-  } else if (OB_UNLIKELY((max_segment_cnt = query_ctx->get_max_segment_cnt(
-                              group_slot, index_table_id)) <= 0)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("single-index boolean claim has no segment", K(ret),
-             K(index_table_id), K(group_slot), K(max_segment_cnt));
   } else {
-    binding_guard.set(index_table_id, group_slot, 1 == max_segment_cnt);
+    max_segment_cnt = query_ctx->get_max_segment_cnt(group_slot, index_table_id);
+    binding_guard.set(index_table_id, group_slot, 1 >= max_segment_cnt);
   }
-  for (int64_t i = 0; OB_SUCC(ret) && i < max_segment_cnt; ++i) {
+  for (int64_t i = 0; OB_SUCC(ret) && i < MAX(1L, max_segment_cnt); ++i) {
     ObIDASSearchOp *segment_op = nullptr;
     if (OB_FAIL(generate_op_impl(lead_cost, search_ctx, segment_op))) {
       LOG_WARN("failed to generate single-index boolean segment subtree",

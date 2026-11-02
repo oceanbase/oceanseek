@@ -27,6 +27,7 @@ ObDASAsyncTokenHelper::ObDASAsyncTokenHelper(ObDASSearchCtx &search_ctx)
     index_table_id_(common::OB_INVALID_ID),
     group_slot_(-1),
     direct_bind_(false),
+    is_empty_segment_(false),
     tsc_service_(nullptr),
     query_flag_(),
     posting_iter_(nullptr),
@@ -245,6 +246,14 @@ int ObDASAsyncTokenHelper::open()
     LOG_WARN("not initialized", K(ret));
   } else if (OB_FAIL(init_inv_idx_scan_param())) {
     LOG_WARN("failed to init inv idx scan param", K(ret));
+  } else if (direct_bind_ && OB_FAIL(search_ctx_.resolve_direct_async_index_segment(
+                 index_table_id_, inv_idx_tablet_id_, group_slot_,
+                 version_range_, is_empty_segment_))) {
+    LOG_WARN("failed to resolve direct async token helper segment", K(ret),
+             K_(index_table_id), K_(group_slot));
+  } else if (is_empty_segment_) {
+    // No physical input in this partition and Group.
+    dim_max_score_ = 0.0;
   } else if (OB_FAIL(init_posting_scan_param())) {
     LOG_WARN("failed to init posting scan param", K(ret));
   } else if (OB_FAIL(init_bm25_param_estimator())) {
@@ -254,10 +263,6 @@ int ObDASAsyncTokenHelper::open()
              posting_scan_param_.avg_doc_length_,
              posting_scan_param_.doc_freq_))) {
     LOG_WARN("failed to get bm25 params", K(ret));
-  } else if (direct_bind_ && OB_FAIL(search_ctx_.resolve_direct_async_index_segment(
-                 index_table_id_, inv_idx_tablet_id_, group_slot_, version_range_))) {
-    LOG_WARN("failed to resolve direct async token helper segment", K(ret),
-             K_(index_table_id), K_(group_slot));
   } else if (!direct_bind_) {
     version_range_.reset();
     // The owning SegmentMerge calls rescan_segment() to bind a physical Segment for a
@@ -288,6 +293,14 @@ int ObDASAsyncTokenHelper::rescan()
     param_estimator_.reset();
     if (OB_FAIL(init_inv_idx_scan_param())) {
       LOG_WARN("failed to init inv idx scan param on rescan", K(ret));
+    } else if (direct_bind_ && OB_FAIL(search_ctx_.resolve_direct_async_index_segment(
+                   index_table_id_, inv_idx_tablet_id_, group_slot_,
+                   version_range_, is_empty_segment_))) {
+      LOG_WARN("failed to resolve direct async token helper segment on rescan", K(ret),
+               K_(index_table_id), K_(group_slot));
+    } else if (is_empty_segment_) {
+      // No physical input in this partition and Group.
+      dim_max_score_ = 0.0;
     } else if (OB_FAIL(init_posting_scan_param())) {
       LOG_WARN("failed to init posting scan param on rescan", K(ret));
     } else if (OB_FAIL(init_bm25_param_estimator())) {
@@ -297,10 +310,6 @@ int ObDASAsyncTokenHelper::rescan()
                posting_scan_param_.avg_doc_length_,
                posting_scan_param_.doc_freq_))) {
       LOG_WARN("failed to get bm25 params on rescan", K(ret));
-    } else if (direct_bind_ && OB_FAIL(search_ctx_.resolve_direct_async_index_segment(
-                   index_table_id_, inv_idx_tablet_id_, group_slot_, version_range_))) {
-      LOG_WARN("failed to resolve direct async token helper segment on rescan", K(ret),
-               K_(index_table_id), K_(group_slot));
     } else if (!direct_bind_) {
       LOG_INFO("[ASYNC_INDEX_QUERY] token_helper rescan(lazy)", K_(inv_idx_tablet_id));
     } else if (OB_FAIL(open_posting_iter_from_tablet())) {
@@ -364,6 +373,7 @@ int ObDASAsyncTokenHelper::close()
   index_table_id_ = common::OB_INVALID_ID;
   group_slot_ = -1;
   direct_bind_ = false;
+  is_empty_segment_ = false;
   term_key_.reset();
   term_datums_ = nullptr;
   query_token_.reset();
@@ -380,7 +390,9 @@ void ObDASAsyncTokenHelper::reuse()
 int ObDASAsyncTokenHelper::get_next_row()
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    ret = OB_ITER_END;
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_UNLIKELY(posting_iter_->in_shallow_status())) {
@@ -397,7 +409,9 @@ int ObDASAsyncTokenHelper::get_next_row()
 int ObDASAsyncTokenHelper::advance_to(const common::ObDatum &id_datum)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    ret = OB_ITER_END;
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_FAIL(posting_iter_->advance_to(id_datum))) {
@@ -411,7 +425,9 @@ int ObDASAsyncTokenHelper::advance_to(const common::ObDatum &id_datum)
 int ObDASAsyncTokenHelper::advance_shallow(const common::ObDatum &id_datum, const bool inclusive)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    ret = OB_ITER_END;
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_FAIL(posting_iter_->advance_shallow(id_datum, inclusive))) {
@@ -428,7 +444,9 @@ int ObDASAsyncTokenHelper::get_curr_phrase_block_max_info(
   int ret = OB_SUCCESS;
   tuple = nullptr;
   double max_ranking = 0.0;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    ret = OB_ITER_END;
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_FAIL(posting_iter_->get_curr_phrase_block_max_ranking(max_ranking))) {
@@ -450,7 +468,9 @@ int ObDASAsyncTokenHelper::get_block_id_range(uint64_t &min_id, uint64_t &max_id
   double max_score = 0.0;
   min_id = 0;
   max_id = 0;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    ret = OB_ITER_END;
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_FAIL(posting_iter_->get_block_max_tuple(min_id, max_id, max_score))) {
@@ -469,7 +489,9 @@ int ObDASAsyncTokenHelper::get_curr_bm25_param(
     int64_t &doc_length) const
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    ret = OB_ITER_END;
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_FAIL(posting_iter_->get_curr_bm25_param(token_freq, doc_length))) {
@@ -481,7 +503,9 @@ int ObDASAsyncTokenHelper::get_curr_bm25_param(
 int ObDASAsyncTokenHelper::get_curr_id(const common::ObDatum *&id_datum) const
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    ret = OB_ITER_END;
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_FAIL(posting_iter_->get_cur_id(id_datum))) {
@@ -494,7 +518,9 @@ int ObDASAsyncTokenHelper::get_curr_pos_list(common::ObString &pos_list) const
 {
   int ret = OB_SUCCESS;
   const common::ObDatum *value_datum = nullptr;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    ret = OB_ITER_END;
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_FAIL(posting_iter_->get_cur_pos_list(value_datum))) {
@@ -510,7 +536,9 @@ int ObDASAsyncTokenHelper::get_curr_pos_list(common::ObString &pos_list) const
 int ObDASAsyncTokenHelper::get_max_token_relevance(double &max_token_relevance) const
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    max_token_relevance = 0.0;
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else {

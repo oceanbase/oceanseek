@@ -80,6 +80,7 @@ void ObDDLInfoCache::reset()
 
 ObAsyncIndexMembershipCache::ObAsyncIndexMembershipCache()
   : published_version_(ObTabletAsyncIndexRefreshInfo::INVALID_PUBLISHED_VERSION),
+    invalidation_count_(0),
     is_valid_(false),
     has_async_index_(false)
 {
@@ -96,6 +97,8 @@ void ObAsyncIndexMembershipCache::set_value(
 
 void ObAsyncIndexMembershipCache::reset()
 {
+  // Even an invalid cache may have a reader preparing to populate it.
+  ++invalidation_count_;
   published_version_ = ObTabletAsyncIndexRefreshInfo::INVALID_PUBLISHED_VERSION;
   is_valid_ = false;
   has_async_index_ = false;

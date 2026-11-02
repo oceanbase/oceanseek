@@ -183,7 +183,6 @@ int ObAsyncIndexMergeCtx::check_deletion_bitmap_ready(
     const int64_t async_snapshot)
 {
   int ret = OB_SUCCESS;
-  int64_t physical_published_version = 0;
   int64_t query_published_version = 0;
   storage::ObTabletHandle tablet_handle;
 
@@ -200,25 +199,18 @@ int ObAsyncIndexMergeCtx::check_deletion_bitmap_ready(
   } else if (OB_UNLIKELY(!tablet_handle.get_obj()->is_async_delete_index())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("tablet is not async deletion index", KR(ret), K(delete_index_tablet_id));
-  } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_max_published_version(
-      share::SCN::max_scn(), physical_published_version))) {
-    LOG_WARN("failed to get physical deletion published version", KR(ret),
-        K(delete_index_tablet_id), K(async_snapshot));
-  } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_query_published_version(
-      share::SCN::max_scn(), physical_published_version,
+  } else if (OB_FAIL(tablet_handle.get_obj()->get_latest_async_index_published_version(
       query_published_version))) {
-    LOG_WARN("failed to get deletion query published version", KR(ret),
-        K(delete_index_tablet_id), K(async_snapshot),
-        K(physical_published_version));
+    LOG_WARN("failed to get committed deletion published version", KR(ret),
+        K(delete_index_tablet_id), K(async_snapshot));
   } else if (query_published_version < async_snapshot) {
     ret = OB_NEED_RETRY;
     LOG_INFO("deletion tablet has not reached the fulltext merge snapshot",
         KR(ret), K(delete_index_tablet_id), K(async_snapshot),
-        K(physical_published_version), K(query_published_version));
+        K(query_published_version));
   } else {
     LOG_INFO("deletion bitmap input is ready", K(delete_index_tablet_id),
-        K(async_snapshot), K(physical_published_version),
-        K(query_published_version));
+        K(async_snapshot), K(query_published_version));
   }
   return ret;
 }

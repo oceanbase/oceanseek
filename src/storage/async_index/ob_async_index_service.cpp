@@ -238,7 +238,7 @@ int ObAsyncIndexService::prepare_tenant_major_refresh(
                          || tenant_major_snapshot <= 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(data_tablet_id), K(index_tablet_ids), K(tenant_major_snapshot));
-  } else if (OB_FAIL(dep_provider.get_publish_scns(tenant_id_, &ls, index_tablet_ids, publish_scns))) {
+  } else if (OB_FAIL(dep_provider.get_publish_scns(&ls, index_tablet_ids, publish_scns))) {
     LOG_WARN("failed to get async index published versions", K(ret),
         K(data_tablet_id), K(index_tablet_ids), K(tenant_major_snapshot));
   } else if (OB_UNLIKELY(publish_scns.count() != index_tablet_ids.count())) {
@@ -618,7 +618,7 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
         } else if (OB_ISNULL(tablet_handle.get_obj())) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("index tablet handle is null", K(ret), K(param.index_tablet_id_));
-        } else if (OB_FAIL(tablet_handle.get_obj()->get_latest_async_index_published_version(published_version))) {
+        } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_refresh_start_version(published_version))) {
           LOG_WARN("failed to get max published version from index tablet",
                    K(ret), K(param.index_tablet_id_));
         } else {

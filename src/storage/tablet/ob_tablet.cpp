@@ -576,7 +576,7 @@ ObTablet::ObTablet(const bool is_external_tablet)
     is_external_tablet_(is_external_tablet)
 {
 #if defined(__x86_64__) && !defined(ENABLE_OBJ_LEAK_CHECK)
-  check_size<ObTablet, ObRowkeyReadInfo, 1712>();
+  check_size<ObTablet, ObRowkeyReadInfo, 1720>();
 #endif
   MEMSET(memtables_, 0x0, sizeof(memtables_));
 }
@@ -1901,6 +1901,10 @@ int ObTablet::copy_mds_info_cache_from(ObTablet &other)
       truncate_info_cache_ = other.truncate_info_cache_;
       ttl_filter_info_cache_ = other.ttl_filter_info_cache_;
       async_index_membership_cache_ = other.async_index_membership_cache_;
+      if (other.tablet_meta_.has_transfer_table() && !tablet_meta_.has_transfer_table()) {
+        // Discard values read before MDS relocation when publishing the completed transfer.
+        async_index_membership_cache_.reset();
+      }
 
       other.mds_cache_lock_.unlock();
     } else {
@@ -4430,6 +4434,122 @@ int ObTablet::check_row_locked_by_myself(
 }
 
 
+int ObTablet::get_deletion_physical_snapshot(
+    const int64_t expire_ts, int64_t &snapshot, const int64_t minimum_snapshot)
+{
+  int ret = OB_SUCCESS;
+  ObDeletionReadPreparation preparation(expire_ts, minimum_snapshot);
+  ObTabletMemberWrapper<ObTabletTableStore> local_store_wrapper;
+  const ObTabletTableStore *local_store = nullptr;
+  const bool has_transfer_source = tablet_meta_.has_transfer_table();
+  snapshot = 0;
+
+  if (minimum_snapshot < 0 || INT64_MAX == minimum_snapshot) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid minimum deletion snapshot", K(ret), K(minimum_snapshot));
+  } else if (OB_FAIL(preparation.check_status())) {
+    LOG_WARN("deletion snapshot preparation interrupted", K(ret));
+  } else if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("tablet is not initialized", K(ret));
+  } else if (OB_FAIL(allow_to_read_())) {
+    LOG_WARN("deletion tablet is not readable", K(ret), K(tablet_meta_));
+  } else if (has_transfer_source
+      && OB_FAIL(collect_transfer_source_deletion_snapshot_(preparation))) {
+    LOG_WARN("failed to collect transfer source deletion snapshot", K(ret), K(tablet_meta_));
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(fetch_table_store(local_store_wrapper))) {
+    LOG_WARN("failed to fetch deletion TableStore", K(ret));
+  } else if (OB_FAIL(local_store_wrapper.get_member(local_store))) {
+    LOG_WARN("failed to get deletion TableStore", K(ret));
+  } else if (OB_FAIL(local_store->collect_deletion_snapshot(*this, preparation))) {
+    LOG_WARN("failed to collect local deletion snapshot", K(ret));
+  } else if (OB_FAIL(preparation.finish(snapshot))) {
+    LOG_WARN("failed to calculate deletion physical snapshot", K(ret));
+  }
+  if (OB_FAIL(ret)) {
+    snapshot = 0;
+  }
+  return ret;
+}
+
+int ObTablet::collect_transfer_source_deletion_snapshot_(ObDeletionReadPreparation &preparation)
+{
+  int ret = OB_SUCCESS;
+  ObTabletHandle source_tablet_handle;
+  ObLSHandle source_ls_handle;
+  ObTabletMemberWrapper<ObTabletTableStore> source_store_wrapper;
+  const ObTabletTableStore *source_store = nullptr;
+  ObTablet *source_tablet = nullptr;
+  ObLSService *ls_service = MTL(ObLSService *);
+  ObLS *source_ls = nullptr;
+  ObLSTabletService *source_tablet_service = nullptr;
+  ObTabletCreateDeleteMdsUserData transfer_status;
+  mds::MdsWriter unused_writer;
+  mds::TwoPhaseCommitState unused_trans_state;
+  SCN unused_trans_version;
+  SCN max_decided_scn;
+  ObLSID source_ls_id;
+  ObTabletID source_tablet_id;
+
+  if (OB_FAIL(ObITabletMdsInterface::get_latest_tablet_status(
+          transfer_status, unused_writer, unused_trans_state, unused_trans_version))) {
+    LOG_WARN("failed to get transfer status for deletion snapshot", K(ret));
+  } else if (ObTabletStatus::TRANSFER_IN != transfer_status.tablet_status_) {
+    ret = OB_SNAPSHOT_DISCARDED;
+    LOG_WARN("transfer status does not match deletion snapshot", K(ret), K(transfer_status));
+  } else if (!transfer_status.transfer_ls_id_.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid transfer source LS", K(ret), K(transfer_status));
+  } else {
+    source_ls_id = transfer_status.transfer_ls_id_;
+    source_tablet_id = tablet_meta_.tablet_id_;
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(ls_service)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("LS service is null", K(ret));
+  } else if (OB_FAIL(preparation.check_status())) {
+    LOG_WARN("deletion source lookup interrupted", K(ret));
+  } else if (OB_FAIL(ls_service->get_ls(source_ls_id, source_ls_handle, ObLSGetMod::HA_MOD))) {
+    LOG_WARN("failed to get deletion source LS", K(ret), K(source_ls_id));
+  } else if (OB_ISNULL(source_ls = source_ls_handle.get_ls())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("deletion source LS is null", K(ret), K(source_ls_id));
+  } else if (OB_ISNULL(source_tablet_service = source_ls->get_tablet_svr())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("transfer source tablet service is null", K(ret), K(source_ls_id));
+  } else if (OB_FAIL(source_tablet_service->check_allow_to_read())) {
+    LOG_WARN("transfer source LS is not readable", K(ret), K(source_ls_id));
+  } else if (OB_FAIL(source_ls->get_max_decided_scn(max_decided_scn))) {
+    LOG_WARN("failed to get transfer source decided SCN", K(ret), K(source_ls_id));
+  } else if (max_decided_scn < transfer_status.transfer_scn_) {
+    ret = OB_REPLICA_NOT_READABLE;
+    LOG_WARN("transfer source has not replayed the transfer point",
+        K(ret), K(max_decided_scn), K(transfer_status));
+  } else if (OB_FAIL(source_ls->get_tablet(
+          source_tablet_id, source_tablet_handle, preparation.remaining_time(),
+          ObMDSGetTabletMode::READ_WITHOUT_CHECK))) {
+    LOG_WARN("failed to get deletion source tablet", K(ret), K(source_tablet_id));
+  } else if (OB_ISNULL(source_tablet = source_tablet_handle.get_obj())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("deletion source tablet is null", K(ret));
+  } else if (source_tablet->is_empty_shell()) {
+    ret = OB_TABLET_NOT_EXIST;
+    LOG_WARN("deletion source tablet became empty shell", K(ret), K(source_tablet_id));
+  } else if (OB_FAIL(source_tablet->fetch_table_store(source_store_wrapper))) {
+    LOG_WARN("failed to fetch deletion source TableStore", K(ret));
+  } else if (OB_FAIL(source_store_wrapper.get_member(source_store))) {
+    LOG_WARN("failed to get deletion source TableStore", K(ret));
+  } else if (OB_FAIL(source_store->collect_deletion_snapshot(*source_tablet, preparation))) {
+    LOG_WARN("failed to collect deletion source snapshot", K(ret));
+  }
+  return ret;
+}
+
 int ObTablet::get_read_tables(
     const int64_t snapshot_version,
     ObTabletTableIterator &iter,
@@ -6775,59 +6895,82 @@ int ObTablet::get_kept_snapshot_for_async_index(int64_t &min_async_index_snapsho
 int ObTablet::get_has_async_index(bool &has_async_index) const
 {
   int ret = OB_SUCCESS;
-  bool cache_valid = false;
+  ObAsyncIndexMembershipCache membership;
   has_async_index = false;
+  if (OB_FAIL(get_async_index_membership_(membership, true /*use_cache*/))) {
+    LOG_WARN("failed to get async index membership", K(ret), K_(tablet_meta));
+  } else {
+    has_async_index = membership.has_async_index();
+  }
+  return ret;
+}
+
+// use_cache: true enables cache lookup/refill; false reads latest committed MDS without caching.
+// Refresh-start rechecks use false to read committed progress after acquiring the refresh lock.
+int ObTablet::get_async_index_membership_(
+    ObAsyncIndexMembershipCache &membership, const bool use_cache) const
+{
+  int ret = OB_SUCCESS;
+  membership.reset();
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not inited", K(ret), K_(is_inited));
-  } else {
-    {
-      SpinRLockGuard guard(mds_cache_lock_);
-      if (async_index_membership_cache_.is_valid()) {
-        cache_valid = true;
-        has_async_index = async_index_membership_cache_.has_async_index();
+  } else if (use_cache) {
+    SpinRLockGuard guard(mds_cache_lock_);
+    membership = async_index_membership_cache_;
+  }
+  if (OB_SUCC(ret) && !membership.is_valid()) {
+    const int64_t invalidation_count = membership.get_invalidation_count();
+    ObTabletAsyncIndexRefreshInfo refresh_info;
+    mds::MdsWriter unused_writer;
+    mds::TwoPhaseCommitState trans_stat;
+    share::SCN unused_trans_version;
+    bool can_cache = false;
+    // Never hold the cache lock while reading MDS: a decided transaction may
+    // still need the commit notification to finish before its MDS row is readable.
+    if (!use_cache) {
+      if (OB_FAIL(get_latest_committed_async_index_refresh_info(refresh_info))) {
+        if (OB_EMPTY_RESULT == ret) {
+          refresh_info.reset();
+          ret = OB_SUCCESS;
+        } else {
+          LOG_WARN("failed to read committed async index membership", K(ret), K_(tablet_meta));
+        }
+      }
+    } else if (OB_FAIL(get_latest_async_index_refresh_info(
+        refresh_info, unused_writer, trans_stat, unused_trans_version))) {
+      if (OB_EMPTY_RESULT == ret) {
+        refresh_info.reset();
+        can_cache = true;
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("failed to read latest async index membership", K(ret), K_(tablet_meta));
+      }
+    } else if (mds::TwoPhaseCommitState::ON_COMMIT == trans_stat) {
+      can_cache = true;
+    } else if (OB_FAIL(get_latest_committed_async_index_refresh_info(refresh_info))) {
+      if (OB_EMPTY_RESULT == ret) {
+        refresh_info.reset();
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("failed to read committed async index membership", K(ret), K_(tablet_meta));
       }
     }
-
-    if (!cache_valid) {
-      SpinWLockGuard guard(mds_cache_lock_);
-      if (async_index_membership_cache_.is_valid()) {
-        has_async_index = async_index_membership_cache_.has_async_index();
+    if (OB_SUCC(ret)) {
+      if (OB_UNLIKELY(!refresh_info.is_valid())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid committed async index membership", K(ret), K(refresh_info));
       } else {
-        ObTabletAsyncIndexRefreshInfo refresh_info;
-        mds::MdsWriter unused_writer;
-        mds::TwoPhaseCommitState trans_stat;
-        share::SCN unused_trans_version;
-        if (OB_FAIL(get_latest_async_index_refresh_info(
-                refresh_info, unused_writer, trans_stat, unused_trans_version))) {
-          if (OB_EMPTY_RESULT == ret) {
-            refresh_info.reset();
-            trans_stat = mds::TwoPhaseCommitState::ON_COMMIT;
-            ret = OB_SUCCESS;
-          } else {
-            LOG_WARN("failed to get latest async index membership", K(ret),
-                     K_(tablet_meta_.ls_id), K_(tablet_meta_.tablet_id));
-          }
-        }
-
-        if (OB_FAIL(ret)) {
-        } else if (mds::TwoPhaseCommitState::ON_COMMIT == trans_stat) {
-          // The latest value is committed and can populate the shared cache.
-        } else if (OB_FAIL(get_latest_committed_async_index_refresh_info(refresh_info))) {
-          if (OB_EMPTY_RESULT == ret) {
-            refresh_info.reset();
-            ret = OB_SUCCESS;
-          } else {
-            LOG_WARN("failed to get committed async index membership", K(ret),
-                     K_(tablet_meta_.ls_id), K_(tablet_meta_.tablet_id));
-          }
-        }
-
-        if (OB_SUCC(ret)) {
-          has_async_index = refresh_info.has_async_index();
-          if (mds::TwoPhaseCommitState::ON_COMMIT == trans_stat) {
+        membership.set_value(refresh_info.has_async_index(), refresh_info.get_published_version());
+        DEBUG_SYNC(AFTER_ASYNC_INDEX_MEMBERSHIP_MDS_READ);
+        if (use_cache) {
+          SpinWLockGuard guard(mds_cache_lock_);
+          if (async_index_membership_cache_.is_valid()) {
+            membership = async_index_membership_cache_;
+          } else if (can_cache
+              && invalidation_count == async_index_membership_cache_.get_invalidation_count()) {
             async_index_membership_cache_.set_value(
-                has_async_index, refresh_info.get_published_version());
+                refresh_info.has_async_index(), refresh_info.get_published_version());
           }
         }
       }
@@ -7662,7 +7805,6 @@ int ObTablet::get_table(const ObITable::TableKey &table_key, ObTableHandleV2 &ha
 int ObTablet::get_async_index_sstable(
     const ObITable::TableType table_type,
     const common::ObNewVersionRange &version_range,
-    const share::SCN &read_snapshot,
     ObTableHandleV2 &handle) const
 {
   int ret = OB_SUCCESS;
@@ -7673,10 +7815,9 @@ int ObTablet::get_async_index_sstable(
   } else if (OB_FAIL(fetch_table_store(table_store_wrapper))) {
     LOG_WARN("fail to fetch table store", K(ret));
   } else if (OB_FAIL(table_store_wrapper.get_member()->get_async_index_sstable(
-      table_store_wrapper.get_meta_handle(), *this, table_type, version_range,
-      read_snapshot, handle))) {
+      table_store_wrapper.get_meta_handle(), *this, table_type, version_range, handle))) {
     LOG_WARN("failed to get async index sstable", K(ret), K(table_type),
-        K(version_range), K(read_snapshot));
+        K(version_range));
   }
   return ret;
 }
@@ -9655,20 +9796,16 @@ int ObTablet::set_async_index_refresh_info(
     const int64_t lock_timeout_us)
 {
   int ret = OB_SUCCESS;
+  mds::ObTabletMdsInfoCacheCtx &cache_ctx = static_cast<mds::ObTabletMdsInfoCacheCtx &>(ctx);
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", KR(ret));
   } else {
     SpinWLockGuard guard(mds_cache_lock_);
-    if (OB_FAIL(set(info, ctx, lock_timeout_us))) {
+    if (OB_FAIL(cache_ctx.add_tablet_id(tablet_meta_.tablet_id_))) {
+      LOG_WARN("failed to track async index cache notification", K(ret), K_(tablet_meta));
+    } else if (OB_FAIL(set(info, ctx, lock_timeout_us))) {
       LOG_WARN("fail to set async index refresh info", KR(ret), K(info), K(lock_timeout_us));
-    } else if (!async_index_membership_cache_.is_valid()
-               || async_index_membership_cache_.has_async_index() != info.has_async_index()
-               || async_index_membership_cache_.get_published_version()
-                  != info.get_published_version()) {
-      // A set happens before transaction commit. Invalidate immediately so
-      // readers observe the previous committed row instead of a stale cache.
-      async_index_membership_cache_.reset();
     }
   }
   return ret;
@@ -9680,18 +9817,16 @@ int ObTablet::replay_async_index_refresh_info(
     mds::MdsCtx &ctx)
 {
   int ret = OB_SUCCESS;
+  mds::ObTabletMdsInfoCacheCtx &cache_ctx = static_cast<mds::ObTabletMdsInfoCacheCtx &>(ctx);
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", KR(ret));
   } else {
     SpinWLockGuard guard(mds_cache_lock_);
-    if (OB_FAIL(ObITabletMdsInterface::replay(info, ctx, scn))) {
+    if (OB_FAIL(cache_ctx.add_tablet_id(tablet_meta_.tablet_id_))) {
+      LOG_WARN("failed to track async index cache notification", K(ret), K_(tablet_meta));
+    } else if (OB_FAIL(ObITabletMdsInterface::replay(info, ctx, scn))) {
       LOG_WARN("fail to replay set async index refresh info", KR(ret), K(scn));
-    } else if (!async_index_membership_cache_.is_valid()
-               || async_index_membership_cache_.has_async_index() != info.has_async_index()
-               || async_index_membership_cache_.get_published_version()
-                  != info.get_published_version()) {
-      async_index_membership_cache_.reset();
     }
   }
   return ret;
@@ -10624,13 +10759,7 @@ int ObTablet::check_tablet_need_rewrite_meta(
 }
 #endif
 
-int ObTablet::get_async_index_max_published_version(int64_t &published_version) const
-{
-  return get_async_index_max_published_version(SCN::max_scn(), published_version);
-}
-
 int ObTablet::get_async_index_max_published_version(
-    const share::SCN &read_snapshot,
     int64_t &published_version) const
 {
   int ret = OB_SUCCESS;
@@ -10648,20 +10777,16 @@ int ObTablet::get_async_index_max_published_version(
   } else if (OB_FAIL(wrapper.get_member(table_store))) {
     LOG_WARN("failed to get table store", K(ret));
   } else if (OB_FAIL(table_store->get_async_index_max_published_version(
-      *this, read_snapshot, published_version))) {
+      *this, published_version))) {
     LOG_WARN("failed to get max published version", K(ret));
   }
   return ret;
 }
 
-int ObTablet::get_latest_async_index_published_version(
-    int64_t &published_version) const
+int ObTablet::get_latest_async_index_published_version(int64_t &published_version) const
 {
   int ret = OB_SUCCESS;
-  bool resolved = false;
-  bool is_initial_create_publication = false;
-  int64_t physical_published_version = 0;
-  int64_t query_published_version = 0;
+  ObAsyncIndexMembershipCache membership;
   published_version = 0;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
@@ -10669,125 +10794,38 @@ int ObTablet::get_latest_async_index_published_version(
   } else if (!is_async_index_refresh_target()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("tablet is not async index tablet", K(ret), KPC(this));
+  } else if (OB_FAIL(get_async_index_membership_(membership, true /*use_cache*/))) {
+    LOG_WARN("failed to get async index publication", K(ret), K_(tablet_meta));
+  } else if (membership.has_published_version()) {
+    published_version = membership.get_published_version();
+  }
+  return ret;
+}
+
+int ObTablet::get_async_index_refresh_start_version(
+    int64_t &published_version, const bool use_cache) const
+{
+  int ret = OB_SUCCESS;
+  ObAsyncIndexMembershipCache membership;
+  published_version = 0;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not inited", K(ret), K_(is_inited));
+  } else if (!is_async_index_refresh_target()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("tablet is not async index tablet", K(ret), KPC(this));
+  } else if (OB_FAIL(get_async_index_membership_(membership, use_cache))) {
+    LOG_WARN("failed to get logical async index refresh start", K(ret), K(use_cache));
   } else {
-    {
-      SpinRLockGuard guard(mds_cache_lock_);
-      if (async_index_membership_cache_.is_valid()) {
-        resolved = true;
-        if (async_index_membership_cache_.has_published_version()) {
-          published_version =
-              async_index_membership_cache_.get_published_version();
-        }
-      }
+    if (membership.has_published_version()) {
+      published_version = membership.get_published_version();
     }
-
-    if (!resolved) {
-      SpinWLockGuard guard(mds_cache_lock_);
-      if (async_index_membership_cache_.is_valid()) {
-        if (async_index_membership_cache_.has_published_version()) {
-          published_version =
-              async_index_membership_cache_.get_published_version();
-        }
-      } else {
-        ObTabletAsyncIndexRefreshInfo refresh_info;
-        mds::MdsWriter unused_writer;
-        mds::TwoPhaseCommitState trans_stat;
-        share::SCN unused_trans_version;
-        bool can_cache = false;
-        if (OB_FAIL(get_latest_async_index_refresh_info(
-                refresh_info, unused_writer, trans_stat,
-                unused_trans_version))) {
-          if (OB_EMPTY_RESULT == ret) {
-            refresh_info.reset();
-            can_cache = true;
-            ret = OB_SUCCESS;
-          } else {
-            LOG_WARN("failed to get latest async index published version",
-                     K(ret), K_(tablet_meta_.ls_id),
-                     K_(tablet_meta_.tablet_id));
-          }
-        } else if (mds::TwoPhaseCommitState::ON_COMMIT == trans_stat) {
-          can_cache = true;
-        } else if (OB_FAIL(
-                       get_latest_committed_async_index_refresh_info(
-                           refresh_info))) {
-          if (OB_EMPTY_RESULT == ret) {
-            refresh_info.reset();
-            ret = OB_SUCCESS;
-          } else {
-            LOG_WARN("failed to get committed async index published version",
-                     K(ret), K_(tablet_meta_.ls_id),
-                     K_(tablet_meta_.tablet_id));
-          }
-        }
-
-        if (OB_SUCC(ret)) {
-          if (OB_UNLIKELY(!refresh_info.is_valid())) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("invalid committed async index refresh info", K(ret),
-                     K(refresh_info));
-          } else {
-            if (refresh_info.has_published_version()) {
-              published_version = refresh_info.get_published_version();
-            }
-            if (can_cache) {
-              async_index_membership_cache_.set_value(
-                  refresh_info.has_async_index(),
-                  refresh_info.get_published_version());
-            }
-          }
-        }
+    if (ASYNC_INDEX_INITIAL_VERSION == published_version) {
+      // Before the first MDS publication, DDL refresh starts from the committed
+      // baseline. Query readers must continue to use the logical publication only.
+      if (OB_FAIL(get_async_index_max_published_version(published_version))) {
+        LOG_WARN("failed to get initial async index refresh start", K(ret), K_(tablet_meta));
       }
-    }
-  }
-
-  // 当前方案仍会发布物理 INC，唯一允许只存在逻辑水位的是随表创建初始值。
-  // 在这段已证明为空的前缀被首次 refresh 物化前，refresh 写侧必须继续使用
-  // 物理水位，否则首个 INC 会越过 TableStore 末尾并形成物理区间空洞。
-  // 普通 refresh 的 MDS 仍是权威水位，用于覆盖提交后 TableStore 暂不可见窗口。
-  if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(get_async_index_max_published_version(
-                 physical_published_version))) {
-    LOG_WARN("failed to get physical async index published version",
-             K(ret), K_(tablet_meta_.ls_id), K_(tablet_meta_.tablet_id));
-  } else if (published_version > physical_published_version) {
-    if (OB_FAIL(get_async_index_query_published_version(
-            SCN::max_scn(), physical_published_version,
-            query_published_version))) {
-      LOG_WARN("failed to identify async index bootstrap version", K(ret),
-               K(published_version), K(physical_published_version),
-               K_(tablet_meta_.ls_id), K_(tablet_meta_.tablet_id));
-    } else if (query_published_version == published_version
-               && query_published_version > physical_published_version) {
-      ObTabletAsyncIndexRefreshInfo latest_refresh_info;
-      mds::MdsWriter unused_writer;
-      mds::TwoPhaseCommitState trans_stat;
-      share::SCN trans_version;
-      if (OB_FAIL(get_latest_async_index_refresh_info(
-              latest_refresh_info, unused_writer, trans_stat,
-              trans_version))) {
-        LOG_WARN("failed to get latest async index bootstrap MDS meta", K(ret),
-                 K(published_version), K(physical_published_version),
-                 K_(tablet_meta_.ls_id), K_(tablet_meta_.tablet_id));
-      } else {
-        // 后续 refresh 可能在物理 INC 可见前再次发布同一个 C。只有原始建表
-        // MDS 行满足 commit_version == C；若把后续行误判成建表初始行，会
-        // 反复执行同一个 (P, C]。
-        is_initial_create_publication =
-            mds::TwoPhaseCommitState::ON_COMMIT == trans_stat
-            && trans_version.is_valid()
-            && latest_refresh_info.has_published_version()
-            && latest_refresh_info.get_published_version() == published_version
-            && trans_version.get_val_for_tx() == published_version;
-      }
-    }
-  }
-  if (OB_SUCC(ret)) {
-    if (is_initial_create_publication) {
-      published_version = physical_published_version;
-    } else {
-      published_version = std::max(
-          published_version, physical_published_version);
     }
   }
   return ret;
@@ -10795,72 +10833,20 @@ int ObTablet::get_latest_async_index_published_version(
 
 int ObTablet::get_async_index_query_published_version(
     const share::SCN &read_snapshot,
-    const int64_t physical_published_version,
     int64_t &query_published_version) const
 {
   int ret = OB_SUCCESS;
-  bool create_commit_version_resolved = false;
-  int64_t create_commit_version =
-      transaction::ObTransVersion::INVALID_TRANS_VERSION;
-  ObTabletCreateDeleteMdsUserData tablet_status;
-  ObTabletAsyncIndexRefreshInfo refresh_info;
-  query_published_version = physical_published_version;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("not inited", K(ret), K_(is_inited));
-  } else if (OB_UNLIKELY(!read_snapshot.is_valid()
-                         || physical_published_version < 0)) {
+  query_published_version = 0;
+  if (OB_UNLIKELY(!read_snapshot.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid async-index query publication arguments", K(ret),
-             K(read_snapshot), K(physical_published_version));
-  } else if (!is_async_index_refresh_target()) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("tablet is not async index tablet", K(ret), KPC(this));
+             K(read_snapshot));
+  } else if (OB_FAIL(get_latest_async_index_published_version(query_published_version))) {
+    LOG_WARN("failed to get committed async-index publication", K(ret));
   } else {
-    SpinRLockGuard guard(mds_cache_lock_);
-    if (tablet_status_cache_.is_valid()) {
-      create_commit_version =
-          tablet_status_cache_.get_create_commit_version();
-      create_commit_version_resolved = true;
-    }
-  }
-  if (OB_FAIL(ret)) {
-  } else if (!create_commit_version_resolved) {
-    if (OB_FAIL(get_tablet_status(SCN::max_scn(), tablet_status))) {
-      LOG_WARN("failed to get async-index tablet status", K(ret),
-               K(read_snapshot), K_(tablet_meta_.ls_id),
-               K_(tablet_meta_.tablet_id));
-    } else {
-      create_commit_version = tablet_status.create_commit_version_;
-    }
-  }
-  if (OB_FAIL(ret)) {
-  } else if (OB_UNLIKELY(create_commit_version <= 0)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("invalid async-index Tablet create commit version", K(ret),
-             K(read_snapshot), K(create_commit_version));
-  } else if (create_commit_version <= read_snapshot.get_val_for_tx()
-             && create_commit_version > physical_published_version) {
-    if (OB_FAIL(get_async_index_refresh_info(read_snapshot, refresh_info))) {
-      if (OB_EMPTY_RESULT == ret) {
-        ret = OB_SUCCESS;
-      } else {
-        LOG_WARN("failed to get async-index refresh info for query", K(ret),
-                 K(read_snapshot), K_(tablet_meta_.ls_id),
-                 K_(tablet_meta_.tablet_id));
-      }
-    } else if (OB_UNLIKELY(!refresh_info.is_valid()
-                           || refresh_info.need_fill_commit_version())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("invalid committed async-index refresh info", K(ret),
-               K(read_snapshot), K(refresh_info));
-    } else if (refresh_info.get_published_version()
-               == create_commit_version) {
-      // 建表事务在任何用户 DML 发生前发布该值，因此只有
-      // (physical_published_version, create_commit_version] 可在没有 INC 时
-      // 被证明为逻辑空区间；普通 refresh 的 MDS 不能走该特殊分支。
-      query_published_version = create_commit_version;
-    }
+    // Refresh commit time does not constrain SQL visibility. Its logical data
+    // snapshot does; the transaction must nevertheless already be committed.
+    query_published_version = MIN(query_published_version, read_snapshot.get_val_for_tx());
   }
   return ret;
 }
@@ -10886,6 +10872,13 @@ int ObTablet::on_mds_info_cache_user_finish(
       ttl_filter_info_cache_.on_user_commit(commit_version);
     } else {
       ttl_filter_info_cache_.on_user_abort();
+    }
+  } else if (ObMdsInfoCacheTarget::ASYNC_INDEX_MEMBERSHIP == target) {
+    if (commit) {
+      SpinWLockGuard guard(mds_cache_lock_);
+      // Bump the invalidation count even on a miss to reject in-flight refills.
+      // A pending MDS fallback remains non-cacheable after this early notification.
+      async_index_membership_cache_.reset();
     }
   } else {
     ret = OB_ERR_UNEXPECTED;

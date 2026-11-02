@@ -34,6 +34,23 @@ enum class ObGetReadTablesMode : uint8_t
 };
 
 
+// Stack-only state for deriving a deletion table's physical read snapshot.
+class ObDeletionReadPreparation final
+{
+public:
+  explicit ObDeletionReadPreparation(
+      const int64_t expire_ts, const int64_t minimum_snapshot = 0)
+      : expire_ts_(expire_ts), visibility_version_(minimum_snapshot) {}
+  int check_status() const;
+  // Relative budget for one acquisition, capped even for unlimited worker deadlines.
+  int64_t remaining_time() const;
+  int finish(int64_t &snapshot) const;
+  int64_t expire_ts_;
+  int64_t visibility_version_;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObDeletionReadPreparation);
+};
+
 class ObTabletTableStore : public ObIStorageMetaObj
 {
 public:
@@ -129,7 +146,6 @@ public:
       const ObTablet &tablet,
       const ObITable::TableType table_type,
       const common::ObNewVersionRange &version_range,
-      const share::SCN &read_snapshot,
       ObTableHandleV2 &handle) const;
   int get_sstable(const ObITable::TableKey &table_key, ObSSTableWrapper &wrapper) const;
   int get_memtable(const ObITable::TableKey &table_key, ObITable *&table) const;
@@ -138,6 +154,8 @@ public:
       const ObTablet &tablet,
       ObTableStoreIterator &iter,
       const ObGetReadTablesMode mode = ObGetReadTablesMode::NORMAL);
+  int collect_deletion_snapshot(
+      const ObTablet &tablet, ObDeletionReadPreparation &preparation) const;
   int get_all_sstable(ObTableStoreIterator &iter, const bool unpack_co_table = false) const;
   int get_major_sstables(ObTableStoreIterator &iter, const bool unpack_co_table = false) const;
   int get_read_major_sstable(const int64_t snapshot_version, ObTableStoreIterator &iter) const;
@@ -180,15 +198,7 @@ public:
   int get_async_index_sstable_version_ranges(
       const ObTablet &tablet,
       common::ObIArray<common::ObNewVersionRange> &table_version_ranges) const;
-  int get_async_index_sstable_version_ranges(
-      const ObTablet &tablet,
-      const share::SCN &read_snapshot,
-      common::ObIArray<common::ObNewVersionRange> &table_version_ranges) const;
   int get_async_index_max_published_version(const ObTablet &tablet, int64_t &published_version) const;
-  int get_async_index_max_published_version(
-      const ObTablet &tablet,
-      const share::SCN &read_snapshot,
-      int64_t &published_version) const;
 
 private:
   int64_t get_compat_serialize_version(const uint64_t data_version) const {
@@ -203,6 +213,9 @@ private:
   void try_cache_local_sstables(common::ObArenaAllocator &allocator);
   int calculate_read_tables(const int64_t snapshot_version, const ObTablet &tablet, ObTableStoreIterator &iterator,
       const bool allow_no_ready_read, const bool skip_major) const;
+  int calculate_deletion_inc_tables(
+      const ObTablet &tablet, const blocksstable::ObSSTable *base_table,
+      ObDeletionReadPreparation &preparation) const;
   int calculate_ddl_read_tables(
       const int64_t snapshot_version,
       const ObTablet &tablet,
@@ -523,9 +536,6 @@ private:
       const ObBatchUpdateTableStoreParam &param,
       const ObTabletTableStore &old_store,
       const int64_t inc_base_snapshot_version);
-  int append_sstable_version_ranges(
-      const ObSSTableArray &sstable_array,
-      common::ObIArray<common::ObNewVersionRange> &table_version_ranges) const;
 
 public:
   static const int64_t TABLE_STORE_VERSION_V1 = 0x0100;

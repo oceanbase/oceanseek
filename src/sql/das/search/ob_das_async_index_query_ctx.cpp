@@ -10,6 +10,7 @@
 #include "sql/das/ob_das_utils.h"
 #include "sql/das/search/ob_das_boolean_query.h"
 #include "sql/das/search/ob_das_scalar_define.h"
+#include "sql/session/ob_sql_session_info.h"
 #include "storage/async_index/ob_async_index_segment_group.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
 #include "storage/tablet/ob_tablet.h"
@@ -625,6 +626,26 @@ static bool contains_async_index_query_impl(const ObDASBaseCtDef *ctdef)
     }
   }
   return found;
+}
+
+int ObDASAsyncIndexQueryCtx::check_tx_isolation(const ObSQLSessionInfo *session)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(session)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null session for async index query", K(ret));
+  } else {
+    // Session settings can change while an existing transaction keeps its isolation level.
+    const transaction::ObTxIsolationLevel isolation = session->is_in_transaction()
+        ? session->get_tx_desc()->get_isolation_level() : session->get_tx_isolation();
+    if (transaction::is_RR_or_SERIAL_isolevel(isolation)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED,
+          "Async index queries under REPEATABLE READ or SERIALIZABLE isolation");
+      LOG_WARN("unsupported isolation level for async index query", K(ret), K(isolation));
+    }
+  }
+  return ret;
 }
 
 bool ObDASAsyncIndexQueryCtx::contains_async_index_query(const ObDASBaseCtDef *ctdef)
@@ -1324,7 +1345,12 @@ int ObAsyncIndexPartitionSegCtx::get_index_segment_cnt(
   }
   for (int64_t g = 0; OB_SUCC(ret) && g < storage_group_ctx_.get_group_count(); ++g) {
     const storage::ObAsyncIndexSegmentGroup *group = storage_group_ctx_.get_group(g);
-    segment_cnt += group->get_tablet_version_ranges(tablet_idx).count();
+    if (OB_ISNULL(group) || OB_UNLIKELY(tablet_idx >= group->get_tablet_cnt())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid async index group for segment count", K(ret), K(g), K(tablet_idx), KP(group));
+    } else {
+      segment_cnt += group->get_tablet_version_ranges(tablet_idx).count();
+    }
   }
   return ret;
 }
@@ -1382,7 +1408,7 @@ int ObAsyncIndexPartitionSegCtx::get_segment_rowid_range(
     table_type = 0 == version_range.base_version_
         ? storage::ObITable::INV_INDEX_SSTABLE : storage::ObITable::INC_INV_INDEX_SSTABLE;
     if (OB_FAIL(tablet_handle->get_obj()->get_async_index_sstable(
-        table_type, version_range, sql_read_snapshot_, table_handle))) {
+        table_type, version_range, table_handle))) {
       LOG_WARN("failed to get async segment range table", K(ret), K(table_type),
           K(version_range), K_(sql_read_snapshot));
     } else if (OB_FAIL(table_handle.get_sstable(sstable))) {

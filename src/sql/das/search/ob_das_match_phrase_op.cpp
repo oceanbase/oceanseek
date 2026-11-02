@@ -165,11 +165,6 @@ int ObDASMatchPhraseOp::do_open()
     ret = OB_NOT_INIT;
     LOG_WARN("not initialized", K(ret));
   } else if (use_async_index_) {
-    if (!async_helpers_.empty()) {
-      if (OB_FAIL(async_helpers_[0]->init_bm25_param_estimator(async_estimator_))) {
-        LOG_WARN("failed to init async bm25 param estimator", K(ret));
-      }
-    }
     for (int64_t i = 0; OB_SUCC(ret) && i < async_helpers_.count(); ++i) {
       if (OB_FAIL(async_helpers_[i]->open())) {
         LOG_WARN("failed to open async token helper", K(ret), K(i));
@@ -185,10 +180,8 @@ int ObDASMatchPhraseOp::do_open()
       }
     }
   }
-  if (FAILEDx(estimate_bm25_param())) {
-    LOG_WARN("failed to estimate bm25 param on demand", K(ret));
-  } else if (OB_FAIL(select_lead_idx())) {
-    LOG_WARN("failed to select lead idx", K(ret));
+  if (OB_SUCC(ret) && OB_FAIL(prepare_token_stats())) {
+    LOG_WARN("failed to prepare phrase token stats", K(ret));
   }
   return ret;
 }
@@ -205,12 +198,6 @@ int ObDASMatchPhraseOp::do_rescan()
         LOG_WARN("failed to rescan async token helper", K(ret), K(i));
       }
     }
-    if (OB_SUCC(ret) && !async_helpers_.empty()) {
-      async_estimator_.reset();
-      if (OB_FAIL(async_helpers_[0]->init_bm25_param_estimator(async_estimator_))) {
-        LOG_WARN("failed to re-init async bm25 param estimator", K(ret));
-      }
-    }
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < token_helpers_.count(); ++i) {
       if (OB_FAIL(token_helpers_[i]->reuse())) {
@@ -224,12 +211,8 @@ int ObDASMatchPhraseOp::do_rescan()
       estimator_.switch_tablet_id(token_helpers_[0]->get_inv_idx_tablet_id());
     }
   }
-  block_max_inited_ = false;
-  total_token_weight_ = -1.0;
-  if (FAILEDx(estimate_bm25_param())) {
-    LOG_WARN("failed to estimate bm25 param on demand", K(ret));
-  } else if (OB_FAIL(select_lead_idx())) {
-    LOG_WARN("failed to select lead idx", K(ret));
+  if (OB_SUCC(ret) && OB_FAIL(prepare_token_stats())) {
+    LOG_WARN("failed to prepare phrase token stats on rescan", K(ret));
   }
   return ret;
 }
@@ -248,17 +231,38 @@ int ObDASMatchPhraseOp::do_rescan_segment(const common::ObNewVersionRange &range
         LOG_WARN("failed to rescan_segment async token helper", K(ret), K(i));
       }
     }
-    if (OB_SUCC(ret) && !async_helpers_.empty()) {
-      async_estimator_.reset();
-      if (OB_FAIL(async_helpers_[0]->init_bm25_param_estimator(async_estimator_))) {
-        LOG_WARN("failed to re-init async bm25 param estimator on segment switch", K(ret));
-      }
+    if (OB_SUCC(ret) && OB_FAIL(prepare_token_stats())) {
+      LOG_WARN("failed to prepare phrase token stats on segment switch", K(ret));
     }
-    total_token_weight_ = -1.0;
-    if (FAILEDx(estimate_bm25_param())) {
-      LOG_WARN("failed to estimate bm25 param on segment switch", K(ret));
+  }
+  return ret;
+}
+
+int ObDASMatchPhraseOp::prepare_token_stats()
+{
+  int ret = OB_SUCCESS;
+  bool is_empty_segment = false;
+  block_max_inited_ = false;
+  total_token_weight_ = -1.0;
+  avg_doc_token_cnt_ = 0.0;
+  lead_idx_ = 0;
+  if (use_async_index_) {
+    async_estimator_.reset();
+    if (OB_UNLIKELY(async_helpers_.empty()) || OB_ISNULL(async_helpers_[0])) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("missing async phrase token helper", K(ret));
+    } else if ((is_empty_segment = async_helpers_[0]->is_empty_segment())) {
+      // All phrase tokens share this Segment; empty inputs need no statistics.
+      total_token_weight_ = 0.0;
+    } else if (OB_FAIL(async_helpers_[0]->init_bm25_param_estimator(async_estimator_))) {
+      LOG_WARN("failed to init async bm25 param estimator", K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && !is_empty_segment) {
+    if (OB_FAIL(estimate_bm25_param())) {
+      LOG_WARN("failed to estimate bm25 param", K(ret));
     } else if (OB_FAIL(select_lead_idx())) {
-      LOG_WARN("failed to select lead idx on segment switch", K(ret));
+      LOG_WARN("failed to select lead idx", K(ret));
     }
   }
   return ret;

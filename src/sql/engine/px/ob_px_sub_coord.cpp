@@ -159,6 +159,8 @@ int ObPxSubCoord::prepare_async_index_query_ctxs()
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("null table scan spec while preparing async index query contexts", K(ret), K(i));
       } else if (!scan_spec->tsc_ctdef_.is_async_index_query_) {
+      } else if (OB_FAIL(ObDASAsyncIndexQueryCtx::check_tx_isolation(exec_ctx->get_my_session()))) {
+        LOG_WARN("failed to check async index query isolation", K(ret));
       } else if (OB_FAIL(collect_async_index_gi_tablet_locs(
                      scan_spec->get_id(), tablet_locs))) {
         LOG_WARN("failed to collect async index GI tablet locations", K(ret),

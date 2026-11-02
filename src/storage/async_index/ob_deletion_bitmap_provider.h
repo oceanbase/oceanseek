@@ -63,11 +63,11 @@ private:
 class ObDeletionBitmapProvider
 {
 public:
-  // Compaction path. async_snapshot defines bitmap contents and the
-  // cache key. ObDeletionRowIter scans at the target LS weak-read snapshot only
-  // after checking that publication visible there covers async_snapshot, then
-  // filters each row by this logical version. If not ready, return OB_NEED_RETRY;
-  // the next build attempt acquires a new weak-read snapshot.
+  // Compaction path. async_snapshot (logical R) defines bitmap contents and the cache key.
+  // Both entry points require the caller to observe deletion publication >= R on this replica.
+  // Cache misses acquire the current Tablet and scan at a finite physical D
+  // derived from MAJOR/committed INC, Tablet creation and MVS; SQL scans also use S as a floor.
+  // A failed preparation/scan propagates to the caller and never populates the cache.
   static int get_or_build_bitmap(
       const share::ObLSID &ls_id,
       const common::ObTabletID &delete_log_tablet_id,

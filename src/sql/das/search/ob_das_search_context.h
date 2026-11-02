@@ -255,7 +255,8 @@ public:
       const uint64_t index_table_id,
       const common::ObTabletID &index_tablet_id,
       const int64_t group_slot,
-      common::ObNewVersionRange &version_range) const;
+      common::ObNewVersionRange &version_range,
+      bool &is_empty) const;
   OB_INLINE bool has_nested_scope() const
   { return nullptr != scopes_[DAS_SCOPE_NESTED].rowid_exprs_; }
   OB_INLINE void set_async_index_table_id(const uint64_t index_table_id)

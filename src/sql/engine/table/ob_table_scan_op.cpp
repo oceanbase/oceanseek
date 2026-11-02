@@ -1238,6 +1238,8 @@ int ObTableScanOp::prepare_async_index_query_ctx()
     ret = OB_INIT_TWICE;
     LOG_WARN("local async index query catalog prepared twice", K(ret),
              "scan_op_id", MY_SPEC.get_id());
+  } else if (OB_FAIL(ObDASAsyncIndexQueryCtx::check_tx_isolation(ctx_.get_my_session()))) {
+    LOG_WARN("failed to check async index query isolation", K(ret));
   } else if (OB_ISNULL(scan_iter_) || OB_ISNULL(tsc_rtdef_.scan_rtdef_.table_loc_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid local async index query state", K(ret), KP(scan_iter_),

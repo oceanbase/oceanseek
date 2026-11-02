@@ -382,22 +382,16 @@ int ObAllVirtualAsyncIndexRefreshProgress::aggregate_one_index_table_(
                        KR(ret), K(index_tablet_id), K(loc));
           } else {
             ObTablet *tablet = handle.get_obj();
-            int64_t physical_index_snapshot = 0;
             int64_t index_snapshot = 0;
             ProgressRow *row = nullptr;
-            // 仅随表创建时已证明为空的初始区间可以按查询逻辑水位展示；普通
-            // refresh 的 MDS 暂时领先 TableStore 时，不能误报物理进度已追平。
+            // Empty refreshes advance logical publication without installing an SSTable.
             if (OB_ISNULL(tablet)) {
               ret = OB_ERR_UNEXPECTED;
               SERVER_LOG(WARN, "index tablet is null", K(ret), K(index_tablet_id), "ls_id", loc.ls_id_);
-            } else if (OB_FAIL(tablet->get_async_index_max_published_version(
-                           physical_index_snapshot))) {
-              SERVER_LOG(WARN, "get async index max published version failed", K(ret), K(index_tablet_id), "ls_id", loc.ls_id_);
             } else if (OB_FAIL(tablet->get_async_index_query_published_version(
-                           SCN::max_scn(), physical_index_snapshot,
-                           index_snapshot))) {
+                           SCN::max_scn(), index_snapshot))) {
               SERVER_LOG(WARN, "get async index query published version failed",
-                         K(ret), K(index_tablet_id), K(physical_index_snapshot),
+                         K(ret), K(index_tablet_id),
                          "ls_id", loc.ls_id_);
             } else if (OB_FAIL(get_or_create_row_(data_table_id, index_table_id, row))) {
               SERVER_LOG(WARN, "get or create row failed", K(ret), K(data_table_id), K(index_table_id));

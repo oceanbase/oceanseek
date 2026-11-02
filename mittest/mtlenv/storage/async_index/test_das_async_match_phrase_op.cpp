@@ -81,6 +81,7 @@ public:
   {
     int ret = OB_SUCCESS;
     iter = nullptr;
+    ++posting_scan_count_;
     if (OB_ISNULL(inv_sstable_) || OB_ISNULL(read_info_)) {
       ret = OB_ERR_UNEXPECTED;
     } else {
@@ -90,6 +91,7 @@ public:
   }
   ObInvSSTable *inv_sstable_ = nullptr;
   const storage::ObITableReadInfo *read_info_ = nullptr;
+  int64_t posting_scan_count_ = 0;
 };
 
 struct PhraseOpCtx
@@ -166,6 +168,7 @@ struct PhraseOpCtx
 
   void bind_ir_defs(sql::ObDASIRScanCtDef &ctdef, sql::ObDASIRScanRtDef &rtdef)
   {
+    ctdef.use_scalar_scan_def_ = true;
     ctdef.relevance_expr_ = &relevance_expr_;
     ctdef.avg_doc_token_cnt_expr_ = &avg_doc_expr_;
     rtdef.eval_ctx_ = &eval_ctx_;
@@ -682,6 +685,93 @@ TEST_F(TestDASAsyncMatchPhraseOp, phrase_match_next_rowid)
 
   int ret = op->next_rowid(rid, score);
   ASSERT_EQ(OB_ITER_END, ret);
+  OK(op->close());
+}
+
+TEST_F(TestDASAsyncMatchPhraseOp, direct_phrase_rescans_empty_nonempty_empty_nonempty)
+{
+  ObInvSSTable inv_sstable;
+  build_two_term_phrase_sstable(inv_sstable);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  ObArenaAllocator ctx_alloc("PhraseOpCtx");
+  PhraseOpCtx ctx(ctx_alloc);
+  sql::ObDASIRScanCtDef ctdef(ctx_alloc);
+  sql::ObDASIRScanRtDef rtdef;
+  ctdef.is_async_index_ = true;
+  ctx.bind_ir_defs(ctdef, rtdef);
+
+  storage::ObPhraseMatchCounter *counter = nullptr;
+  common::ObSEArray<int64_t, 4> ids;
+  common::ObSEArray<int64_t, 4> offsets;
+  OK(ids.push_back(0));
+  OK(ids.push_back(1));
+  OK(offsets.push_back(0));
+  OK(offsets.push_back(1));
+  OK(storage::ObPhraseMatchCounter::create(allocator_, ids, offsets, 0 /*slop*/,
+      false /*has_duplicate_tokens*/, counter));
+
+  const common::ObString alpha = common::ObString::make_string("alpha");
+  const common::ObString beta = common::ObString::make_string("beta");
+  sql::ObDASMatchPhraseOpParam param;
+  param.ir_ctdef_ = &ctdef;
+  param.ir_rtdef_ = &rtdef;
+  param.block_max_param_ = nullptr;
+  param.counter_ = counter;
+  param.index_table_id_ = ASYNC_INDEX_TABLE_ID;
+  param.group_slot_ = 0;
+  param.direct_bind_ = true;
+  param.boost_ = 1.0;
+  param.use_rich_format_ = false;
+  OK(param.token_ids_.push_back(0));
+  OK(param.token_ids_.push_back(1));
+  OK(param.query_tokens_.push_back(alpha));
+  OK(param.query_tokens_.push_back(beta));
+
+  sql::ObDASMatchPhraseOp *op = nullptr;
+  OK(ctx.search_ctx_.create_op(param, op));
+  ASSERT_NE(nullptr, op);
+  ASSERT_EQ(2, op->async_helpers_.count());
+  inject_async_helpers(op, read_info, inv_sstable);
+  storage::ObAsyncIndexSegmentGroup *group =
+      ctx.binding_.partition_.storage_group_ctx_.groups_.at(0);
+  ASSERT_NE(nullptr, group);
+  sql::ObDASRowID rid;
+  sql::ObDASRowID target;
+  target.set_uint64(1);
+  double score = 0.0;
+  const sql::MaxScoreTuple *tuple = nullptr;
+
+  for (int64_t phase = 0; phase < 4; ++phase) {
+    SCOPED_TRACE(phase);
+    // Keep a valid Group/tablet binding while changing its physical Segment count.
+    OK(group->init(1));
+    if (1 == phase) {
+      // The first empty open must work without any cached BM25 statistics.
+      prefill_bm25_cache_base(ctx.search_ctx_, 2 /*total_doc_cnt*/);
+      prefill_token_doc_cnt(ctx.search_ctx_, alpha, 2 /*doc_freq*/);
+      prefill_token_doc_cnt(ctx.search_ctx_, beta, 1 /*doc_freq*/);
+    }
+    if (1 == phase % 2) {
+      OK(group->add_version_range(0, ctx.binding_.get_version_range()));
+    }
+    OK(0 == phase ? op->open() : op->rescan());
+    OK(op->calc_max_score(score));
+    if (0 == phase % 2) {
+      ASSERT_DOUBLE_EQ(0.0, score);
+      ASSERT_EQ(OB_ITER_END, op->next_rowid(rid, score));
+      ASSERT_EQ(OB_ITER_END, op->advance_to(target, rid, score));
+      ASSERT_EQ(OB_ITER_END, op->advance_shallow(target, true, tuple));
+      ASSERT_EQ(nullptr, tuple);
+    } else {
+      ASSERT_GT(score, 0.0);
+      OK(op->next_rowid(rid, score));
+      ASSERT_EQ(1u, rid.get_uint64());
+      ASSERT_GT(score, 0.0);
+      ASSERT_EQ(OB_ITER_END, op->next_rowid(rid, score));
+    }
+    ASSERT_EQ(2 * ((phase + 1) / 2), mock_access_.posting_scan_count_);
+  }
   OK(op->close());
 }
 

@@ -64,6 +64,7 @@
 #include "share/schema/ob_tenant_schema_service.h"
 #include "lib/time/ob_time_utility.h"
 #include "storage/async_index/ob_async_index_define.h"
+#include "storage/async_index/ob_async_index_segment_group.h"
 #include "rootserver/freeze/ob_major_freeze_helper.h"
 #include "storage/async_index/ob_async_index_service.h"
 #include "storage/blocksstable/ob_macro_block_writer.h"
@@ -1445,6 +1446,14 @@ public:
   void remove_async_index_refresh_produced_sstables(MultiAsyncIndexTabletCtx &ctx);
   void remove_async_index_refresh_produced_sstables(AsyncIndexTabletCtx &ctx);
   void disable_and_drain_async_index_refresh();
+  void prepare_read_boundary_refresh(
+      const char *table_name, MultiAsyncIndexTabletCtx &ctx,
+      ObIArray<uint64_t> &deleted_doc_ids);
+  void observe_read_boundary_publication(
+      const MultiAsyncIndexTabletCtx &ctx, SCN &commit_scn,
+      ObAsyncIndexSegmentGroupCtx &groups);
+  void verify_read_boundary_bitmap(
+      const ObDeletionBitmapHandle &bitmap, const ObIArray<uint64_t> &expected);
   void check_multi_async_fts_table_ddl(const char *table_name, const int64_t fts_index_cnt);
   void check_partition_async_fts_table_ddl(const char *table_name, const PartitionTableType part_type);
   void run_async_index_compaction_schedule(MultiAsyncIndexTabletCtx &ctx);
@@ -1572,6 +1581,10 @@ public:
       const int64_t row_count = 100,
       const ObIndexType index_type = INDEX_TYPE_ASYNC_FTS_INDEX_LOCAL,
       const int64_t occupy_size = 1000);
+  int publish_async_index_version(
+      ObLSHandle &ls_handle,
+      const ObTabletID &tablet_id,
+      const int64_t published_version);
   int add_major_to_tablet(
       ObLSHandle &ls_handle,
       const ObTabletID &tablet_id,
@@ -2602,6 +2615,28 @@ int ObAsyncIndexCompactionTest::mock_major_sstable(
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else if (OB_FAIL(sstable->init(param, &allocator_))) {
     LOG_WARN("failed to init major sstable", KR(ret));
+  }
+  return ret;
+}
+
+int ObAsyncIndexCompactionTest::publish_async_index_version(
+    ObLSHandle &ls_handle,
+    const ObTabletID &tablet_id,
+    const int64_t published_version)
+{
+  int ret = OB_SUCCESS;
+  ObAsyncIndexDepProvider provider;
+  ObTabletAsyncIndexRefreshInfo info;
+  if (OB_FAIL(provider.get_async_index_refresh_info(
+          MTL_ID(), ls_handle.get_ls(), tablet_id, info))) {
+    LOG_WARN("failed to read test refresh info", KR(ret), K(tablet_id));
+  } else {
+    // Installing mock SSTables alone does not publish the refresh.
+    info.set_published_version(published_version);
+    if (OB_FAIL(provider.set_async_index_refresh_info(
+            MTL_ID(), ls_handle.get_ls(), tablet_id, info))) {
+      LOG_WARN("failed to publish test refresh", KR(ret), K(tablet_id), K(published_version));
+    }
   }
   return ret;
 }

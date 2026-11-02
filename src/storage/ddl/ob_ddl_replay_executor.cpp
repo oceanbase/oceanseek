@@ -1958,9 +1958,11 @@ int ObDDLIncMajorCommitReplayExecutor::deserialize_and_update_ss_inc_major(
                                                                           inc_major_buffer_,
                                                                           inc_major_ptr))) {
       LOG_WARN("fail to deserialize inc major from string", KR(ret), K(is_co_sstable_));
-    } else if (inc_major_ptr->is_empty() && inc_major_ptr->get_end_scn().is_min()) {
+    } else if (inc_major_ptr->is_empty()
+               && (tablet_handle.get_obj()->is_async_index_refresh_target()
+                   || inc_major_ptr->get_end_scn().is_min())) {
       need_publish = false;
-      LOG_INFO("skip publishing empty inc major sstable without end scn in replay",
+      LOG_INFO("skip publishing empty inc major sstable in replay",
                KPC(inc_major_ptr));
     } else if (OB_FAIL(OB_E(EN_REPLAY_INC_MAJOR_CHECK_EXIST)
                        ObIncDDLMergeTaskUtils::check_ss_inc_major_exist(allocator,

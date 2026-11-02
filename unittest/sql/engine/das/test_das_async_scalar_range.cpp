@@ -466,8 +466,9 @@ TEST_F(TestDASAsyncScalarRangeRuntime,
   search_ctx_.set_current_async_partition(&valid_partition_a);
 
   ObNewVersionRange output;
+  bool is_empty = false;
   ASSERT_EQ(OB_SUCCESS, search_ctx_.resolve_direct_async_index_segment(
-      RUNTIME_INDEX_TABLE_ID, RUNTIME_INDEX_TABLET_ID, 0, output));
+      RUNTIME_INDEX_TABLE_ID, RUNTIME_INDEX_TABLET_ID, 0, output, is_empty));
   EXPECT_EQ(valid_a.base_version_, output.base_version_);
   EXPECT_EQ(valid_a.snapshot_version_, output.snapshot_version_);
 
@@ -477,7 +478,7 @@ TEST_F(TestDASAsyncScalarRangeRuntime,
       RUNTIME_INDEX_TABLET_ID, valid_b));
   search_ctx_.set_current_async_partition(&valid_partition_b);
   ASSERT_EQ(OB_SUCCESS, search_ctx_.resolve_direct_async_index_segment(
-      RUNTIME_INDEX_TABLE_ID, RUNTIME_INDEX_TABLET_ID, 0, output));
+      RUNTIME_INDEX_TABLE_ID, RUNTIME_INDEX_TABLET_ID, 0, output, is_empty));
   EXPECT_EQ(valid_b.base_version_, output.base_version_);
   EXPECT_EQ(valid_b.snapshot_version_, output.snapshot_version_);
 
