@@ -571,6 +571,15 @@ int ObInnerSQLConnection::process_retry(ObInnerSQLResult &res,
                                         last_ret, client_ret,
                                         force_local_retry, is_inner_sql);
   need_retry = (ObQueryRetryType::RETRY_TYPE_LOCAL == retry_ctrl_.get_retry_type());
+  const uint64_t tenant_id = get_session().get_effective_tenant_id();
+  if (need_retry && OB_TENANT_NOT_IN_SERVER == last_ret && !GCTX.omt_->is_available_tenant(tenant_id)) {
+    // local tenant has already left this server, local retry would always hit the same stale
+    // execution context. Stop local retry and let OB_TENANT_NOT_IN_SERVER propagate to the outer
+    // layer, which is able to re-select a server.
+    need_retry = false;
+    client_ret = last_ret;
+    LOG_INFO("tenant not in server, stop local retry", K(last_ret), K(tenant_id));
+  }
   return client_ret;
 }
 

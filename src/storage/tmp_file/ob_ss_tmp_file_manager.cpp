@@ -10,6 +10,8 @@
 #include "storage/shared_storage/ob_file_manager.h"
 #include "storage/tmp_file/ob_ss_tmp_file_manager.h"
 #include "storage/tmp_file/ob_tmp_file_manager.h"
+#include "observer/omt/ob_multi_tenant.h"
+#include "share/ob_server_struct.h"
 
 namespace oceanbase
 {
@@ -160,8 +162,15 @@ int ObSSTenantTmpFileManager::alloc_dir(int64_t &dir_id)
     ret = OB_NOT_INIT;
     LOG_WARN("ObSSTenantTmpFileManager has not been inited", KR(ret), K(tenant_id_));
   } else if (OB_UNLIKELY(!is_running())) {
-    ret = OB_NOT_RUNNING;
-    LOG_WARN("fail to alloc dir, not running", KR(ret), K(is_running_));
+    if (!GCTX.omt_->is_available_tenant(tenant_id_)) {
+      // tenant has been unit-migrated out of this server (e.g. UnitGC stopped it),
+      // report OB_TENANT_NOT_IN_SERVER so that the outer caller can re-select a server
+      ret = OB_TENANT_NOT_IN_SERVER;
+      LOG_WARN("fail to alloc dir, tenant not in server", KR(ret), K(tenant_id_), K(is_running_));
+    } else {
+      ret = OB_NOT_RUNNING;
+      LOG_WARN("fail to alloc dir, not running", KR(ret), K(is_running_));
+    }
   } else {
     dir_id = ObTmpFileGlobal::SHARE_STORAGE_DIR_ID;
   }
