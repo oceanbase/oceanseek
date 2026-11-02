@@ -43,6 +43,40 @@ using namespace common;
 using namespace share;
 using namespace share::schema;
 
+int get_async_index_refresh_tablet(
+    ObLS &ls, const ObTabletID &tablet_id, ObTabletHandle &handle,
+    const int64_t transfer_seq)
+{
+  int ret = OB_SUCCESS;
+  ObTabletCreateDeleteMdsUserData data;
+  mds::MdsWriter writer;
+  mds::TwoPhaseCommitState trans_state;
+  SCN trans_version;
+  if (OB_FAIL(ls.get_tablet(tablet_id, handle, 0, ObMDSGetTabletMode::READ_WITHOUT_CHECK))) {
+    LOG_WARN("failed to get tablet for async index refresh", K(ret), K(tablet_id));
+  } else if (OB_ISNULL(handle.get_obj())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (handle.get_obj()->is_empty_shell()) {
+    ret = OB_TABLET_NOT_EXIST;
+  } else if (handle.get_obj()->get_tablet_meta().ls_id_ != ls.get_ls_id()
+      || (transfer_seq >= 0 && handle.get_obj()->get_transfer_seq() != transfer_seq)) {
+    ret = OB_TABLET_TRANSFER_SEQ_NOT_MATCH;
+    LOG_INFO("async index refresh tablet location changed", K(ret), K(tablet_id),
+             "ls_id", ls.get_ls_id(), K(transfer_seq), "tablet_meta", handle.get_obj()->get_tablet_meta());
+  } else if (OB_FAIL(handle.get_obj()->get_latest_tablet_status(data, writer, trans_state, trans_version))) {
+    LOG_WARN("failed to get tablet status for async index refresh", K(ret), K(tablet_id));
+  } else if (mds::TwoPhaseCommitState::ON_COMMIT != trans_state
+      || (ObTabletStatus::NORMAL != data.tablet_status_
+          && ObTabletStatus::SPLIT_DST != data.tablet_status_
+          && ObTabletStatus::FORK_DST != data.tablet_status_)) {
+    // A source tablet may remain locally accessible after transfer out.
+    ret = OB_EAGAIN;
+    LOG_INFO("tablet is not ready for async index refresh", K(ret), K(tablet_id),
+             "ls_id", ls.get_ls_id(), K(data), K(trans_state));
+  }
+  return ret;
+}
+
 // Acquire an exclusive async-refresh fence for every index tablet involved in
 // DROP, preventing new refresh tasks from entering the normal table-lock path.
 int lock_async_index_refresh_for_drop(
@@ -440,9 +474,8 @@ int ObAsyncIndexDepProvider::get_publish_scns(
       const ObTabletID &index_tablet_id = index_tablet_ids.at(i);
       ObTabletHandle tablet_handle;
       int64_t published_version = 0;
-      if (OB_FAIL(ls->get_tablet(index_tablet_id, tablet_handle,
-                                 0 /*timeout_us*/,
-                                 ObMDSGetTabletMode::READ_WITHOUT_CHECK))) {
+      if (OB_FAIL(get_async_index_refresh_tablet(
+              *ls, index_tablet_id, tablet_handle))) {
         LOG_WARN("failed to get index tablet", K(ret), K(index_tablet_id));
       } else if (OB_ISNULL(tablet_handle.get_obj())) {
         ret = OB_ERR_UNEXPECTED;

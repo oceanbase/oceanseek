@@ -48,6 +48,8 @@ struct ObRetryTaskNode : public common::ObDLinkBase<ObRetryTaskNode>
     param.ls_id_ = stat_.ls_id_;
     param.data_tablet_id_ = stat_.data_tablet_id_;
     param.index_tablet_id_ = stat_.tablet_id_;
+    param.data_transfer_seq_ = stat_.data_transfer_seq_;
+    param.index_transfer_seq_ = stat_.index_transfer_seq_;
     param.start_refresh_scn_ = stat_.start_refresh_scn_;
     param.target_refresh_scn_ = stat_.target_refresh_scn_;
     param.refresh_id_ = stat_.refresh_id_;

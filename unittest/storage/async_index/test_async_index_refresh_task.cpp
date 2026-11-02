@@ -104,11 +104,15 @@ TEST_F(TestAsyncIndexRefreshTask, test_set_task)
       start_scn, target_scn, 42,
       ASYNC_REFRESH_TYPE_PERIOD, 2, sql, 7777, nullptr, 987654);
   param.is_search_index_ = true;
+  param.data_transfer_seq_ = 3;
+  param.index_transfer_seq_ = 2;
   ASSERT_EQ(OB_SUCCESS, task.set_task(param));
 
   ASSERT_EQ(1001, task.stat_.tenant_id_);
   ASSERT_EQ(ObTabletID(200001), task.stat_.data_tablet_id_);
   ASSERT_EQ(ObTabletID(200002), task.stat_.tablet_id_);
+  ASSERT_EQ(3, task.stat_.data_transfer_seq_);
+  ASSERT_EQ(2, task.stat_.index_transfer_seq_);
   ASSERT_EQ(start_scn, task.stat_.start_refresh_scn_);
   ASSERT_EQ(target_scn, task.stat_.target_refresh_scn_);
   ASSERT_EQ(42, task.stat_.refresh_id_);
@@ -140,7 +144,28 @@ TEST_F(TestAsyncIndexRefreshTask, test_reset)
   ASSERT_EQ(OB_INVALID_TENANT_ID, task.stat_.tenant_id_);
   ASSERT_EQ(0, task.stat_.queue_time_);
   ASSERT_EQ(0, task.stat_.schema_version_);
+  ASSERT_EQ(-1, task.stat_.data_transfer_seq_);
+  ASSERT_EQ(-1, task.stat_.index_transfer_seq_);
   ASSERT_EQ(0, task.sql_.length());  // sql buffer released
+}
+
+TEST_F(TestAsyncIndexRefreshTask, retry_keeps_scheduled_tablet_generation)
+{
+  ObRetryTaskNode retry;
+  retry.stat_.ls_id_ = ObLSID(1001);
+  retry.stat_.data_transfer_seq_ = 3;
+  retry.stat_.index_transfer_seq_ = 2;
+  ASSERT_EQ(OB_SUCCESS, retry.sql_.assign("SELECT 1"));
+  ObAsyncIndexRefreshTaskParam param;
+  retry.build_task_param(nullptr, param);
+  ObAsyncIndexRefreshTask task;
+  ASSERT_EQ(OB_SUCCESS, task.set_task(param));
+  EXPECT_EQ(ObLSID(1001), task.stat_.ls_id_);
+  EXPECT_EQ(3, task.stat_.data_transfer_seq_);
+  EXPECT_EQ(2, task.stat_.index_transfer_seq_);
+  // A generation mismatch needs a newly scheduled window, not the old SQL.
+  task.stat_.result_ = OB_TABLET_TRANSFER_SEQ_NOT_MATCH;
+  EXPECT_FALSE(task.need_retry());
 }
 
 TEST_F(TestAsyncIndexRefreshTask, test_handle_success)

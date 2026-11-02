@@ -417,6 +417,8 @@ struct ObRefreshTaskStat
     ls_id_.reset();
     data_tablet_id_.reset();
     tablet_id_.reset();
+    data_transfer_seq_ = -1;
+    index_transfer_seq_ = -1;
     refresh_id_ = 0;
     refresh_task_id_ = 0;
     retry_cnt_ = 0;
@@ -457,6 +459,8 @@ struct ObRefreshTaskStat
                K_(ls_id),
                K_(data_tablet_id),
                K_(tablet_id),
+               K_(data_transfer_seq),
+               K_(index_transfer_seq),
                K_(refresh_id),
                K_(refresh_task_id),
                K_(retry_cnt),
@@ -481,6 +485,8 @@ struct ObRefreshTaskStat
   share::ObLSID ls_id_;                   // LS that owns this tablet
   common::ObTabletID data_tablet_id_;  // data table tablet id
   common::ObTabletID tablet_id_;       // index table tablet id
+  int64_t data_transfer_seq_;          // generation observed during scheduling
+  int64_t index_transfer_seq_;
   int64_t refresh_id_;                 // monotonically increasing refresh batch id
   int64_t refresh_task_id_;            // synthetic unique id baked into the SQL's opt_param('ddl_task_id');
                                        // used as the key to register/lookup snapshot & schema version
@@ -543,6 +549,8 @@ struct ObAsyncIndexRefreshTaskParam
       ls_id_(),
       data_tablet_id_(),
       index_tablet_id_(),
+      data_transfer_seq_(-1),
+      index_transfer_seq_(-1),
       start_refresh_scn_(),
       target_refresh_scn_(),
       refresh_id_(0),
@@ -579,6 +587,8 @@ struct ObAsyncIndexRefreshTaskParam
                K_(ls_id),
                K_(data_tablet_id),
                K_(index_tablet_id),
+               K_(data_transfer_seq),
+               K_(index_transfer_seq),
                K_(start_refresh_scn),
                K_(target_refresh_scn),
                K_(refresh_id),
@@ -599,6 +609,8 @@ struct ObAsyncIndexRefreshTaskParam
   share::ObLSID ls_id_;                 // LS that owns the target tablet
   common::ObTabletID data_tablet_id_;   // data table tablet id (refresh source)
   common::ObTabletID index_tablet_id_;  // index table tablet id (refresh target)
+  int64_t data_transfer_seq_;
+  int64_t index_transfer_seq_;
   share::SCN start_refresh_scn_;        // begin SCN for this refresh
   share::SCN target_refresh_scn_;       // target SCN for this refresh
   int64_t refresh_id_;                  // monotonically increasing refresh batch id

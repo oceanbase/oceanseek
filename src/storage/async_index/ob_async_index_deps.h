@@ -25,6 +25,13 @@ namespace storage
 {
 
 class ObLS;  // forward declaration; callers pass ObLS* without needing the full definition
+class ObTabletHandle;
+
+// Reject a migrated/deleted tablet, and optionally verify the generation saved
+// by the scheduler. The returned handle is also used to read its watermark.
+int get_async_index_refresh_tablet(
+    ObLS &ls, const common::ObTabletID &tablet_id, ObTabletHandle &handle,
+    const int64_t transfer_seq = -1);
 
 // Injectable abstraction over the external modules the trigger / scheduler depend on.
 //

@@ -129,6 +129,8 @@ int ObAsyncIndexRefreshTask::set_task(const ObAsyncIndexRefreshTaskParam &param)
     stat.ls_id_ = param.ls_id_;
     stat.data_tablet_id_ = param.data_tablet_id_;
     stat.tablet_id_ = param.index_tablet_id_;
+    stat.data_transfer_seq_ = param.data_transfer_seq_;
+    stat.index_transfer_seq_ = param.index_transfer_seq_;
     stat.start_refresh_scn_ = param.start_refresh_scn_;
     stat.target_refresh_scn_ = param.target_refresh_scn_;
     stat.refresh_id_ = param.refresh_id_;
@@ -229,19 +231,30 @@ int ObAsyncIndexRefreshTask::recheck_publish_scn_after_lock_(const ObRefreshTask
   ObLSService *ls_service = MTL(ObLSService *);
   ObLSHandle ls_handle;
   ObTabletHandle tablet_handle;
+  ObTabletHandle data_tablet_handle;
   int64_t published_version = 0;
-  if (OB_ISNULL(ls_service)) {
+  // The OnlineDDL tablet ROW_EXCLUSIVE lock conflicts with transfer's
+  // EXCLUSIVE lock and is held through trans.end(). Validate the scheduled
+  // generation now, before reading its watermark or executing refresh SQL.
+  if (stat.data_transfer_seq_ < 0 || stat.index_transfer_seq_ < 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("missing async index refresh tablet generation", K(ret), K(stat));
+  } else if (OB_ISNULL(ls_service)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ls service is null", K(ret));
   } else if (OB_FAIL(ls_service->get_ls(stat.ls_id_, ls_handle, ObLSGetMod::STORAGE_MOD))) {
-    LOG_WARN("failed to get ls for publish_scn recheck", K(ret), K(stat.ls_id_));
+    LOG_WARN("failed to get ls for refresh tablet check", K(ret), K(stat.ls_id_));
   } else if (OB_ISNULL(ls_handle.get_ls())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ls is null", K(ret), K(stat.ls_id_));
-  } else if (OB_FAIL(ls_handle.get_ls()->get_tablet(
-                 stat.tablet_id_, tablet_handle, 0 /*timeout_us*/,
-                 ObMDSGetTabletMode::READ_WITHOUT_CHECK))) {
-    LOG_WARN("failed to get index tablet for publish_scn recheck",
+  } else if (OB_FAIL(get_async_index_refresh_tablet(
+                 *ls_handle.get_ls(), stat.data_tablet_id_, data_tablet_handle,
+                 stat.data_transfer_seq_))) {
+    LOG_WARN("data tablet location changed", K(ret), K(stat));
+  } else if (OB_FAIL(get_async_index_refresh_tablet(
+                 *ls_handle.get_ls(), stat.tablet_id_, tablet_handle,
+                 stat.index_transfer_seq_))) {
+    LOG_WARN("failed to get index tablet at scheduled location",
              K(ret), K(stat.tablet_id_));
   } else if (OB_ISNULL(tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
