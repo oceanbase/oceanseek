@@ -2593,15 +2593,20 @@ int ObFtsIndexBuilderUtil::mark_data_table_async_index_flag(ObTableSchema &table
   if (table_schema.has_async_index()) {
     // already marked
   } else {
-    char default_params_buf[OB_MAX_INDEX_PARAMS_LENGTH] = {0};
-    int64_t default_params_pos = 0;
-    if (OB_FAIL(ObAsyncIndexParams::get_default_params_str(default_params_buf, OB_MAX_INDEX_PARAMS_LENGTH, default_params_pos))) {
-      LOG_WARN("fail to get default async index params str", K(ret));
-    } else {
-      table_schema.add_table_flag(HAS_ASYNC_INDEX_FLAG);
-      if (OB_FAIL(table_schema.set_async_index_params(ObString(default_params_pos, default_params_buf)))) {
+    // CREATE TABLE may save user parameters before the first async index exists.
+    if (table_schema.get_async_index_params().empty()) {
+      char default_params_buf[OB_MAX_INDEX_PARAMS_LENGTH] = {0};
+      int64_t default_params_pos = 0;
+      if (OB_FAIL(ObAsyncIndexParams::get_default_params_str(
+          default_params_buf, OB_MAX_INDEX_PARAMS_LENGTH, default_params_pos))) {
+        LOG_WARN("fail to get default async index params str", K(ret));
+      } else if (OB_FAIL(table_schema.set_async_index_params(
+          ObString(default_params_pos, default_params_buf)))) {
         LOG_WARN("fail to set async index params", K(ret));
       }
+    }
+    if (OB_SUCC(ret)) {
+      table_schema.add_table_flag(HAS_ASYNC_INDEX_FLAG);
     }
   }
   return ret;

@@ -2023,18 +2023,10 @@ int ObIndexBuilder::do_create_local_index(
       const bool need_update_async_index_options =
           is_async_index_ddl && !new_table_schema.has_async_index();
       if (OB_SUCC(ret) && need_update_async_index_options) {
-        char default_params_buf[OB_MAX_INDEX_PARAMS_LENGTH] = {0};
-        int64_t default_params_pos = 0;
-        if (OB_FAIL(ObAsyncIndexParams::get_default_params_str(
-            default_params_buf, OB_MAX_INDEX_PARAMS_LENGTH, default_params_pos))) {
-          LOG_WARN("fail to get default async index params str", K(ret));
+        if (OB_FAIL(ObFtsIndexBuilderUtil::mark_data_table_async_index_flag(new_table_schema))) {
+          LOG_WARN("fail to initialize async index table options", K(ret));
         } else {
-          new_table_schema.add_table_flag(HAS_ASYNC_INDEX_FLAG);
           need_init_async_index_membership = true;
-          if (OB_FAIL(new_table_schema.set_async_index_params(
-              ObString(default_params_pos, default_params_buf)))) {
-            LOG_WARN("fail to set async index params", K(ret));
-          }
         }
       }
       if (OB_FAIL(ret)) {
