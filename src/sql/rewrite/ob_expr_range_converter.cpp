@@ -51,6 +51,7 @@ int ObExprRangeConverter::convert_expr_to_range_node(const ObRawExpr *expr,
 {
   int ret = OB_SUCCESS;
   range_node = nullptr;
+  const ObRawExpr *json_path_expr = nullptr;
   if (OB_ISNULL(expr)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get null expr");
@@ -104,6 +105,12 @@ int ObExprRangeConverter::convert_expr_to_range_node(const ObRawExpr *expr,
   } else if (ctx_.is_search_index() && T_FUN_SYS_DSL_MULTI_VALUE_RANGE == expr->get_expr_type()) {
     if (OB_FAIL(convert_dsl_multi_value_range(*expr, range_node))) {
       LOG_WARN("failed to convert DSL multi-value range on search index", K(ret));
+    }
+  } else if (ctx_.is_search_index() &&
+             OB_NOT_NULL(json_path_expr = ObRawExprUtils::skip_inner_added_expr(expr)) &&
+             T_FUN_SYS_JSON_CONTAINS_PATH == json_path_expr->get_expr_type()) {
+    if (OB_FAIL(convert_json_contains_path(*json_path_expr, range_node))) {
+      LOG_WARN("failed to convert JSON path existence on search index", K(ret));
     }
   } else if (ctx_.is_search_index() && domain_expr_can_use_search_index(expr)) {
     if (OB_FAIL(convert_domain_expr_on_search_index(expr, expr_depth, range_node))) {
@@ -4874,6 +4881,118 @@ int ObExprRangeConverter::fill_json_search_index_range_node(const ObColumnRefRaw
         range_node->end_keys_[SEARCH_INDEX_NESTED_KEY] = is_oracle_mode ? OB_RANGE_MIN_VALUE : OB_RANGE_MAX_VALUE;
       }
     }
+  }
+  return ret;
+}
+
+int ObExprRangeConverter::convert_json_contains_path(const ObRawExpr &expr,
+                                                     ObRangeNode *&range_node)
+{
+  int ret = OB_SUCCESS;
+  bool can_extract = lib::is_mysql_mode() && expr.get_param_count() == 3;
+  const ObColumnRefRawExpr *column_expr = nullptr;
+  ObString path_prefix;
+  ObSearchIndexRangeCtx &search_ctx = *ctx_.search_index_range_ctx_;
+  const ObItemType saved_pick = search_ctx.pick_type_;
+  search_ctx.pick_type_ = T_NULL;
+  ctx_.cur_is_precise_ = false;
+  range_node = nullptr;
+  if (can_extract) {
+    const ObRawExpr *target = expr.get_param_expr(0);
+    const ObRawExpr *mode_expr = expr.get_param_expr(1);
+    const ObRawExpr *path_expr = expr.get_param_expr(2);
+    const ObRawExpr *mode_literal = ObRawExprUtils::skip_inner_added_expr(mode_expr);
+    const ObRawExpr *path_literal = ObRawExprUtils::skip_inner_added_expr(path_expr);
+    int64_t key_idx = -1;
+    ObObj mode;
+    if (OB_ISNULL(target) || OB_ISNULL(mode_literal) || OB_ISNULL(path_literal)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null JSON path existence argument", K(ret), K(expr));
+    } else if (!target->is_column_ref_expr() || !target->get_result_type().is_json()) {
+      can_extract = false;
+    } else if (OB_FALSE_IT(column_expr = static_cast<const ObColumnRefRawExpr *>(target))) {
+    } else if (!is_range_key(column_expr->get_column_id(), key_idx)) {
+      can_extract = false;
+    } else if (OB_NOT_NULL(search_ctx.get_json_filter())) {
+      // Path/type restrictions can omit the only entry proving that a parent
+      // exists. Conservatively require an unfiltered JSON column index.
+      can_extract = false;
+    } else if (!mode_literal->is_immutable_const_expr() || !path_literal->is_immutable_const_expr()) {
+      // Do not freeze mutable paths or modes into a cached range. SQL literals
+      // are kept unparameterized, as with JSON_CONTAINS's path argument.
+      can_extract = false;
+    } else if (OB_FAIL(get_calculable_expr_val(mode_expr, mode, can_extract))) {
+      LOG_WARN("failed to evaluate JSON path existence mode", K(ret));
+    } else if (!can_extract) {
+    } else if (!mode.is_string_type() ||
+               (mode.get_string().case_compare("one") != 0 && mode.get_string().case_compare("all") != 0)) {
+      can_extract = false;
+    } else if (OB_FAIL(ObSearchIndexQueryRangeUtils::json_prefix_path_encode(allocator_, ctx_,
+                         *path_expr, path_prefix, true /* index_sub_path */, can_extract))) {
+      LOG_WARN("failed to encode JSON path existence prefix", K(ret));
+    } else if (can_extract && path_prefix.length() + 2 > SEARCH_INDEX_PATH_LENGTH) {
+      can_extract = false;
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (can_extract) {
+    if (OB_FAIL(fill_json_contains_path_node(*column_expr, path_prefix, range_node))) {
+      LOG_WARN("failed to build JSON path existence range", K(ret));
+    } else {
+      ctx_.cur_is_precise_ = true;
+    }
+  } else if (OB_FAIL(generate_always_true_or_false_node(true, range_node))) {
+    LOG_WARN("failed to generate JSON path existence fallback range", K(ret));
+  }
+  search_ctx.pick_type_ = saved_pick;
+  return ret;
+}
+
+int ObExprRangeConverter::fill_json_contains_path_node(const ObColumnRefRawExpr &column_expr,
+                                                       const ObString &path_prefix,
+                                                       ObRangeNode *&range_node)
+{
+  int ret = OB_SUCCESS;
+  ObRawExpr *column_idx_expr = nullptr;
+  int64_t column_idx = -1;
+  ObString paths[2];
+  int64_t path_idxs[2] = {-1, -1};
+  if (OB_FAIL(ObSearchIndexQueryRangeUtils::build_column_idx_expr(ctx_, column_expr, column_idx_expr))) {
+    LOG_WARN("failed to build column index expr", K(ret));
+  } else if (OB_FAIL(get_final_expr_idx(column_idx_expr, get_column_meta(SEARCH_INDEX_COL_IDX), column_idx))) {
+    LOG_WARN("failed to get column index value", K(ret));
+  } else if (OB_FAIL(ObSearchIndexPathEncoder::generate_lower_path(allocator_, path_prefix, paths[0]))) {
+    LOG_WARN("failed to generate lower existence path", K(ret));
+  } else if (OB_FAIL(ObSearchIndexPathEncoder::generate_upper_path(allocator_, path_prefix, paths[1]))) {
+    LOG_WARN("failed to generate upper existence path", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < 2; ++i) {
+    ObConstRawExpr *path_expr = nullptr;
+    if (OB_FAIL(ObRawExprUtils::build_const_string_expr(*ctx_.expr_factory_, ObVarcharType,
+                                                        paths[i], CS_TYPE_BINARY, path_expr))) {
+      LOG_WARN("failed to build existence path bound", K(ret));
+    } else if (OB_FAIL(get_final_expr_idx(path_expr, get_column_meta(SEARCH_INDEX_PATH), path_idxs[i]))) {
+      LOG_WARN("failed to get existence path bound", K(ret));
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(alloc_range_node(range_node))) {
+    LOG_WARN("failed to allocate JSON path existence range", K(ret));
+  } else {
+    // Structural path bounds include the node's type and every descendant,
+    // including JSON null and empty containers, but exclude sibling names.
+    range_node->min_offset_ = SEARCH_INDEX_COL_IDX;
+    range_node->max_offset_ = SEARCH_INDEX_PATH;
+    range_node->is_search_node_ = 1;
+    range_node->start_keys_[SEARCH_INDEX_COL_IDX] = range_node->end_keys_[SEARCH_INDEX_COL_IDX] = column_idx;
+    range_node->start_keys_[SEARCH_INDEX_PATH] = path_idxs[0];
+    range_node->end_keys_[SEARCH_INDEX_PATH] = path_idxs[1];
+    range_node->start_keys_[SEARCH_INDEX_VALUE] = OB_RANGE_MIN_VALUE;
+    range_node->end_keys_[SEARCH_INDEX_VALUE] = OB_RANGE_MAX_VALUE;
+    range_node->start_keys_[SEARCH_INDEX_DOC_ID] = OB_RANGE_MIN_VALUE;
+    range_node->end_keys_[SEARCH_INDEX_DOC_ID] = OB_RANGE_MAX_VALUE;
+    range_node->include_start_ = false;
+    range_node->include_end_ = false;
   }
   return ret;
 }

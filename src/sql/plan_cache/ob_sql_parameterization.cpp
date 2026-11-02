@@ -2379,6 +2379,15 @@ int ObSqlParameterization::mark_tree(TransformTreeCtx &ctx, ParseNode *tree ,Sql
             SQL_PC_LOG(WARN, "fail to mark arg", K(ret));
           }
         }
+      } else if (0 == func_name.case_compare("json_contains_path") && 3 == node[1]->num_child_) {
+        // A search index range encodes a fixed member path. Keep the mode and
+        // path literals in the cache key; explicit bind parameters fall back.
+        sql_info.ps_need_parameterized_ = false;
+        const int64_t ARGS_NUMBER_THREE = 3;
+        bool mark_arr[ARGS_NUMBER_THREE] = {0, 1, 1};
+        if (OB_FAIL(mark_args(node[1], mark_arr, ARGS_NUMBER_THREE, sql_info))) {
+          SQL_PC_LOG(WARN, "fail to mark json_contains_path args", K(ret));
+        }
       } else if ((0 == func_name.case_compare("json_schema_valid"))
                 || (0 == func_name.case_compare("json_schema_validation_report"))) {
         const int64_t ARGS_NUMBER_TWO = 2;

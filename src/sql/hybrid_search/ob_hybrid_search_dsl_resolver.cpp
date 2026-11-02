@@ -4392,6 +4392,10 @@ int ObDSLResolver::dispatch_query_type(const ObString &key, ObIJsonBase &sub_nod
     if (OB_FAIL(resolve_wildcard(sub_node, query, parent_query, outer_query_type))) {
       LOG_WARN("fail to resolve wildcard", K(ret));
     }
+  } else if (key.case_compare("exists") == 0) {
+    if (OB_FAIL(resolve_exists(sub_node, query, parent_query, outer_query_type))) {
+      LOG_WARN("fail to resolve exists", K(ret));
+    }
   } else if (key.case_compare("terms") == 0) {
     if (OB_FAIL(resolve_terms(sub_node, query, parent_query, outer_query_type))) {
       LOG_WARN("fail to resolve terms", K(ret));
@@ -5816,6 +5820,87 @@ int ObDSLResolver::resolve_wildcard(ObIJsonBase &req_node, ObDSLQuery *&query, O
     wildcard_query->scalar_expr_ = like_expr;
     wildcard_query->boost_ = setup_boost(boost_expr);
     query = wildcard_query;
+  }
+  return ret;
+}
+
+int ObDSLResolver::resolve_exists(ObIJsonBase &req_node, ObDSLQuery *&query, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type)
+{
+  int ret = OB_SUCCESS;
+  ObString field_name;
+  ObString path_str;
+  ObColumnRefRawExpr *col_expr = nullptr;
+  ObRawExpr *one_expr = nullptr;
+  ObRawExpr *path_expr = nullptr;
+  ObSysFunRawExpr *exists_expr = nullptr;
+  ObConstRawExpr *boost_expr = nullptr;
+  ObDSLScalarQuery *exists_query = nullptr;
+  if (!enclosing_nested_paths_.empty()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "exists query inside nested");
+    LOG_WARN("exists query inside nested is not supported", K(ret));
+  } else if (ObDSLQuery::check_need_cal_score_in_bool(outer_query_type, parent_query)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "exists query in must/should clause");
+    LOG_WARN("exists query cannot be scored in must/should clause", K(ret), K(outer_query_type));
+  } else if (req_node.json_type() != ObJsonNodeType::J_OBJECT || req_node.element_count() == 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "exists query, should be a non-empty object");
+    LOG_WARN("exists query should be a non-empty object", K(ret));
+  }
+  for (uint64_t i = 0; OB_SUCC(ret) && i < req_node.element_count(); ++i) {
+    ObString key;
+    ObIJsonBase *sub_node = nullptr;
+    if (OB_FAIL(req_node.get_object_value(i, key, sub_node))) {
+      LOG_WARN("failed to get exists parameter", K(ret), K(i));
+    } else if (key.case_compare("field") == 0) {
+      if (sub_node->json_type() != ObJsonNodeType::J_STRING || sub_node->get_data_length() == 0) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "exists query, field should be a non-empty string");
+        LOG_WARN("exists field should be a non-empty string", K(ret));
+      } else {
+        field_name.assign_ptr(sub_node->get_data(), sub_node->get_data_length());
+      }
+    } else if (key.case_compare("boost") == 0) {
+      if (OB_FAIL(resolve_boost(*sub_node, boost_expr, QUERY_ITEM_EXISTS, outer_query_type))) {
+        LOG_WARN("failed to resolve exists boost", K(ret));
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "keys other than \"field\" and \"boost\" in exists query");
+      LOG_WARN("unsupported key in exists query", K(ret), K(key));
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (field_name.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "exists query, field is required");
+    LOG_WARN("exists field is missing", K(ret));
+  } else if (OB_FAIL(get_field_expr_and_path(field_name, col_expr, path_str))) {
+    LOG_WARN("failed to get exists field and path", K(ret), K(field_name));
+  } else if (!col_expr->get_result_type().is_json()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "exists query, field must reference a JSON column");
+    LOG_WARN("exists field is not a JSON column", K(ret), K(field_name));
+  } else if (OB_FAIL(dsl_query_info_->dsl_cols.push_back(col_expr))) {
+    LOG_WARN("failed to add exists column", K(ret));
+  } else if (OB_FAIL(construct_string_expr(ObString::make_string("one"), one_expr, CS_TYPE_UTF8MB4_BIN))) {
+    LOG_WARN("failed to build exists mode", K(ret));
+  } else if (OB_FAIL(construct_string_expr(path_str.empty() ? ObString::make_string("$") : path_str,
+                                         path_expr, CS_TYPE_UTF8MB4_BIN))) {
+    LOG_WARN("failed to build exists path", K(ret));
+  } else if (OB_FAIL(params_.expr_factory_->create_raw_expr(T_FUN_SYS_JSON_CONTAINS_PATH, exists_expr))) {
+    LOG_WARN("failed to create json_contains_path expr", K(ret));
+  } else if (OB_FALSE_IT(exists_expr->set_func_name(N_JSON_CONTAINS_PATH))) {
+  } else if (OB_FAIL(exists_expr->set_param_exprs(col_expr, one_expr, path_expr))) {
+    LOG_WARN("failed to set json_contains_path params", K(ret));
+  } else if (OB_FAIL(ObDSLScalarQuery::create(*allocator_, exists_query, QUERY_ITEM_EXISTS, outer_query_type, parent_query))) {
+    LOG_WARN("failed to create exists query", K(ret));
+  } else {
+    exists_query->field_ = col_expr;
+    exists_query->scalar_expr_ = exists_expr;
+    exists_query->boost_ = setup_boost(boost_expr);
+    query = exists_query;
   }
   return ret;
 }

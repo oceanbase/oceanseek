@@ -641,6 +641,7 @@ int ObHybridSearchGenerator::generate_node(const ObDSLQuery *query,
       break;
     }
     case ObEsQueryItem::QUERY_ITEM_WILDCARD :
+    case ObEsQueryItem::QUERY_ITEM_EXISTS :
     case ObEsQueryItem::QUERY_ITEM_RANGE :
     case ObEsQueryItem::QUERY_ITEM_TERM :
     case ObEsQueryItem::QUERY_ITEM_TERMS :

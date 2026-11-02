@@ -294,6 +294,10 @@ private:
                                           bool with_path,
                                           ObRangeNode *&range_node);
   int convert_dsl_multi_value_range(const ObRawExpr &expr, ObRangeNode *&range_node);
+  int convert_json_contains_path(const ObRawExpr &expr, ObRangeNode *&range_node);
+  int fill_json_contains_path_node(const ObColumnRefRawExpr &column_expr,
+                                   const ObString &path_prefix,
+                                   ObRangeNode *&range_node);
   int fill_dsl_multi_value_range_node(const ObColumnRefRawExpr &column_expr,
                                       const ObRawExpr &expr,
                                       const bool *has_bound,

@@ -48,11 +48,12 @@ enum ObEsQueryItem : int8_t {
   QUERY_ITEM_ARRAY_OVERLAPS,
   QUERY_ITEM_WILDCARD, // FARM COMPAT WHITELIST
   QUERY_ITEM_NESTED,
+  QUERY_ITEM_EXISTS,
 };
 
 #define IS_QUERY_ITEM_BOOL(query_item) (query_item == QUERY_ITEM_BOOL)
 #define IS_QUERY_ITEM_KNN(query_item) (query_item == QUERY_ITEM_KNN)
-#define IS_QUERY_ITEM_SCALAR(query_item) (query_item == QUERY_ITEM_TERM || query_item == QUERY_ITEM_TERMS || query_item == QUERY_ITEM_RANGE || query_item == QUERY_ITEM_WILDCARD)
+#define IS_QUERY_ITEM_SCALAR(query_item) (query_item == QUERY_ITEM_TERM || query_item == QUERY_ITEM_TERMS || query_item == QUERY_ITEM_RANGE || query_item == QUERY_ITEM_WILDCARD || query_item == QUERY_ITEM_EXISTS)
 #define IS_QUERY_ITEM_FULLTEXT(query_item) (query_item == QUERY_ITEM_MATCH || query_item == QUERY_ITEM_MULTI_MATCH || query_item == QUERY_ITEM_QUERY_STRING || query_item == QUERY_ITEM_MATCH_PHRASE)
 #define IS_QUERY_ITEM_JSON(query_item) (query_item == QUERY_ITEM_JSON_CONTAINS || query_item == QUERY_ITEM_JSON_OVERLAPS || query_item == QUERY_ITEM_JSON_MEMBER_OF)
 #define IS_QUERY_ITEM_ARRAY(query_item) (query_item == QUERY_ITEM_ARRAY_CONTAINS || query_item == QUERY_ITEM_ARRAY_CONTAINS_ALL || query_item == QUERY_ITEM_ARRAY_OVERLAPS)
