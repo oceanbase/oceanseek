@@ -54,6 +54,7 @@
 #include "observer/virtual_table/ob_all_virtual_tablet_info.h"
 #include "observer/virtual_table/ob_all_virtual_shared_gc_control.h"
 #include "observer/virtual_table/ob_all_virtual_shared_gc_task.h"
+#include "observer/virtual_table/ob_all_virtual_key_column_usage.h"
 #include "observer/virtual_table/ob_all_virtual_server_blacklist.h"
 #include "observer/virtual_table/ob_all_virtual_sys_parameter_stat.h"
 #include "observer/virtual_table/ob_all_virtual_tenant_parameter_stat.h"
@@ -877,6 +878,13 @@ int ObVTIterCreator::create_vt_iter(ObVTableScanParam &params,
               SERVER_LOG(WARN, "ObAllVirtualSharedGCControl init failed", KR(ret));
             } else {
               vt_iter = static_cast<ObVirtualTableIterator *>(all_virtual_shared_gc_control);
+            }
+            break;
+          }
+          case OB_ALL_VIRTUAL_KEY_COLUMN_USAGE_TID: {
+            ObAllVirtualKeyColumnUsage *iter = nullptr;
+            if (OB_FAIL(NEW_VIRTUAL_TABLE(ObAllVirtualKeyColumnUsage, iter))) {
+              SERVER_LOG(WARN, "create key column usage iterator failed", KR(ret));
             }
             break;
           }

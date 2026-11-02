@@ -992,6 +992,7 @@ select 0xffffffffff & table_id, table_name, table_type, database_id, part_num fr
 12627	__all_virtual_ai_gateway_history	2	201001	1
 12628	__all_virtual_ai_gateway_endpoint_stat	2	201001	1
 12629	__all_virtual_tablet_macro_cache_stat	2	201001	1
+12631	__all_virtual_key_column_usage	2	201001	1
 20001	GV$OB_PLAN_CACHE_STAT	1	201001	1
 20002	GV$OB_PLAN_CACHE_PLAN_STAT	1	201001	1
 20003	SCHEMATA	1	201002	1
@@ -1625,6 +1626,7 @@ select 0xffffffffff & table_id, table_name, table_type, database_id, part_num fr
 21751	GV$OB_TABLET_MACRO_CACHE_STAT	1	201001	1
 21752	V$OB_TABLET_MACRO_CACHE_STAT	1	201001	1
 21753	DBA_OB_DIRECT_LOAD_STREAMS	1	201001	1
+21754	CDB_OB_KEY_COLUMN_USAGE	1	201001	1
 check sys table count and table_id range success
 check count and table_id range for virtual table success
 select * from  information_schema.CHARACTER_SETS limit 1;

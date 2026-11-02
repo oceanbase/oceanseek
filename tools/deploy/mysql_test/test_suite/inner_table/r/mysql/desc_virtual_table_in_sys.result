@@ -13246,3 +13246,22 @@ cached_macro_block_count	bigint(20)	NO		NULL
 macro_block_required_size	bigint(20)	NO		NULL	
 cached_macro_block_required_size	bigint(20)	NO		NULL	
 info	varchar(1024)	NO		NULL	
+desc oceanbase.__all_virtual_key_column_usage;
+Field	Type	Null	Key	Default	Extra
+TENANT_ID	bigint(20)	NO		NULL	
+CONSTRAINT_CATALOG	varchar(3)	NO		NULL	
+CONSTRAINT_SCHEMA	varchar(128)	NO		NULL	
+CONSTRAINT_NAME	varchar(256)	NO		NULL	
+TABLE_CATALOG	varchar(3)	NO		NULL	
+TABLE_SCHEMA	varchar(128)	NO		NULL	
+TABLE_NAME	varchar(256)	NO		NULL	
+COLUMN_NAME	varchar(128)	NO		NULL	
+ORDINAL_POSITION	bigint(20)	NO		NULL	
+POSITION_IN_UNIQUE_CONSTRAINT	bigint(20) unsigned	YES		NULL	
+REFERENCED_TABLE_SCHEMA	varchar(128)	YES		NULL	
+REFERENCED_TABLE_NAME	varchar(256)	YES		NULL	
+REFERENCED_COLUMN_NAME	varchar(128)	YES		NULL	
+select /*+QUERY_TIMEOUT(60000000)*/ IF(count(*) >= 0, 1, 0) from oceanbase.__all_virtual_key_column_usage;
+IF(count(*) >= 0, 1, 0)
+1
+select /*+QUERY_TIMEOUT(60000000)*/ * from oceanbase.__all_virtual_key_column_usage limit 1;

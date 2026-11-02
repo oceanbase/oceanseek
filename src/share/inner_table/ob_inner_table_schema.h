@@ -1345,6 +1345,7 @@ public:
   static int all_virtual_ai_gateway_history_schema(share::schema::ObTableSchema &table_schema);
   static int all_virtual_ai_gateway_endpoint_stat_schema(share::schema::ObTableSchema &table_schema);
   static int all_virtual_tablet_macro_cache_stat_schema(share::schema::ObTableSchema &table_schema);
+  static int all_virtual_key_column_usage_schema(share::schema::ObTableSchema &table_schema);
   static int all_virtual_sql_audit_ora_schema(share::schema::ObTableSchema &table_schema);
   static int all_virtual_plan_stat_ora_schema(share::schema::ObTableSchema &table_schema);
   static int all_virtual_plan_cache_plan_explain_ora_schema(share::schema::ObTableSchema &table_schema);
@@ -2328,6 +2329,7 @@ public:
   static int gv_ob_tablet_macro_cache_stat_schema(share::schema::ObTableSchema &table_schema);
   static int v_ob_tablet_macro_cache_stat_schema(share::schema::ObTableSchema &table_schema);
   static int dba_ob_direct_load_streams_schema(share::schema::ObTableSchema &table_schema);
+  static int cdb_ob_key_column_usage_schema(share::schema::ObTableSchema &table_schema);
   static int dba_synonyms_schema(share::schema::ObTableSchema &table_schema);
   static int dba_objects_ora_schema(share::schema::ObTableSchema &table_schema);
   static int all_objects_schema(share::schema::ObTableSchema &table_schema);
@@ -4922,6 +4924,7 @@ const schema_create_func virtual_table_schema_creators [] = {
   ObInnerTableSchema::all_virtual_ai_gateway_history_schema,
   ObInnerTableSchema::all_virtual_ai_gateway_endpoint_stat_schema,
   ObInnerTableSchema::all_virtual_tablet_macro_cache_stat_schema,
+  ObInnerTableSchema::all_virtual_key_column_usage_schema,
   ObInnerTableSchema::all_virtual_sql_audit_ora_schema,
   ObInnerTableSchema::all_virtual_plan_stat_ora_schema,
   ObInnerTableSchema::all_virtual_plan_cache_plan_explain_ora_schema,
@@ -6022,6 +6025,7 @@ const schema_create_func sys_view_schema_creators [] = {
   ObInnerTableSchema::gv_ob_tablet_macro_cache_stat_schema,
   ObInnerTableSchema::v_ob_tablet_macro_cache_stat_schema,
   ObInnerTableSchema::dba_ob_direct_load_streams_schema,
+  ObInnerTableSchema::cdb_ob_key_column_usage_schema,
   ObInnerTableSchema::dba_synonyms_schema,
   ObInnerTableSchema::dba_objects_ora_schema,
   ObInnerTableSchema::all_objects_schema,

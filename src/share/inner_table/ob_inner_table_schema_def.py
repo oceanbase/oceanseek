@@ -19217,6 +19217,33 @@ def_table_schema(
 
 # 12630: __all_virtual_private_gc_diagnose
 
+# Stream each target tenant's original KEY_COLUMN_USAGE. There is deliberately
+# no unique rowkey: constraint-column rows, including duplicates, must survive.
+def_table_schema(
+  owner           = 'fyy280124',
+  table_name      = '__all_virtual_key_column_usage',
+  table_id        = '12631',
+  table_type      = 'VIRTUAL_TABLE',
+  in_tenant_space = False,
+  gm_columns      = [],
+  rowkey_columns  = [],
+  normal_columns = [
+    ('TENANT_ID', 'int'),
+    ('CONSTRAINT_CATALOG', 'varchar:3'),
+    ('CONSTRAINT_SCHEMA', 'varchar:128'),
+    ('CONSTRAINT_NAME', 'varchar:256'),
+    ('TABLE_CATALOG', 'varchar:3'),
+    ('TABLE_SCHEMA', 'varchar:128'),
+    ('TABLE_NAME', 'varchar:256'),
+    ('COLUMN_NAME', 'varchar:128'),
+    ('ORDINAL_POSITION', 'int'),
+    ('POSITION_IN_UNIQUE_CONSTRAINT', 'uint', 'true'),
+    ('REFERENCED_TABLE_SCHEMA', 'varchar:128', 'true'),
+    ('REFERENCED_TABLE_NAME', 'varchar:256', 'true'),
+    ('REFERENCED_COLUMN_NAME', 'varchar:128', 'true'),
+  ],
+)
+
 # 余留位置（此行之前占位）
 # 本区域占位建议：采用真实表名进行占位
 ################################################################################
@@ -48958,6 +48985,29 @@ def_table_schema(
     LEFT JOIN oceanbase.__all_database D
       ON T.tenant_id = D.tenant_id AND T.database_id = D.database_id
   """.replace("\n", " ")
+)
+
+# The iterator executes the original tenant view with predicate pushdown.
+# CDB SELECT privileges are checked in SYS; inner queries use root privileges.
+def_table_schema(
+  owner           = 'fyy280124',
+  table_name      = 'CDB_OB_KEY_COLUMN_USAGE',
+  table_id        = '21754',
+  table_type      = 'SYSTEM_VIEW',
+  gm_columns      = [],
+  rowkey_columns  = [],
+  normal_columns = [],
+  in_tenant_space = False,
+  view_definition = """
+    SELECT TENANT_ID, CONSTRAINT_CATALOG,
+           CONSTRAINT_SCHEMA COLLATE utf8mb4_name_case AS CONSTRAINT_SCHEMA,
+           CONSTRAINT_NAME, TABLE_CATALOG,
+           TABLE_SCHEMA COLLATE utf8mb4_name_case AS TABLE_SCHEMA,
+           TABLE_NAME COLLATE utf8mb4_name_case AS TABLE_NAME,
+           COLUMN_NAME, ORDINAL_POSITION, POSITION_IN_UNIQUE_CONSTRAINT,
+           REFERENCED_TABLE_SCHEMA, REFERENCED_TABLE_NAME, REFERENCED_COLUMN_NAME
+    FROM oceanbase.__all_virtual_key_column_usage
+  """.replace("\n", " "),
 )
 
 # 余留位置（此行之前占位）

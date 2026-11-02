@@ -17668,6 +17668,31 @@ end a);
 select /*+QUERY_TIMEOUT(60000000)*/ count(*) as cnt from (select * from oceanbase.DBA_OB_DIRECT_LOAD_STREAMS limit 1);
 cnt
 1
+desc oceanbase.CDB_OB_KEY_COLUMN_USAGE;
+Field	Type	Null	Key	Default	Extra
+TENANT_ID	bigint(20)	NO		NULL	
+CONSTRAINT_CATALOG	varchar(3)	NO		NULL	
+CONSTRAINT_SCHEMA	varchar(128)	NO		NULL	
+CONSTRAINT_NAME	varchar(256)	NO		NULL	
+TABLE_CATALOG	varchar(3)	NO		NULL	
+TABLE_SCHEMA	varchar(128)	NO		NULL	
+TABLE_NAME	varchar(256)	NO		NULL	
+COLUMN_NAME	varchar(128)	NO		NULL	
+ORDINAL_POSITION	bigint(20)	NO		NULL	
+POSITION_IN_UNIQUE_CONSTRAINT	bigint(20) unsigned	YES		NULL	
+REFERENCED_TABLE_SCHEMA	varchar(128)	YES		NULL	
+REFERENCED_TABLE_NAME	varchar(256)	YES		NULL	
+REFERENCED_COLUMN_NAME	varchar(128)	YES		NULL	
+set @query_type = (select 
+case 
+when ('|CDB_IND_COLUMNS|CDB_PART_KEY_COLUMNS|CDB_SUBPART_KEY_COLUMNS|CDB_TAB_COL_STATISTICS|CDB_TAB_COLS|CDB_TAB_COLS_V$|KEY_COLUMN_USAGE|DBA_TAB_COL_STATISTICS|' like '%|CDB_OB_KEY_COLUMN_USAGE|%') then 2
+when ('|CDB_OB_SERVER_SPACE_USAGE|' like '%|CDB_OB_KEY_COLUMN_USAGE|%') then 3
+when ('|V$OB_SHARED_SSTABLES|' like '%|CDB_OB_KEY_COLUMN_USAGE|%') then 4
+else 1
+end a);
+select /*+QUERY_TIMEOUT(60000000)*/ count(*) as cnt from (select * from oceanbase.CDB_OB_KEY_COLUMN_USAGE limit 1);
+cnt
+1
 select case cnt when 0 then NULL else 'UNEXPECTED ERROR: It is expected to be an empty set, which means that all GV$ and V$ view column names are defined consistently' end ERROR_INFO from (select /*+no_rewrite*/ count(*) cnt from
 (SELECT t.table_name,
 group_concat(c.column_name) as column_name_list

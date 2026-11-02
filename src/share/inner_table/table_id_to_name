@@ -1474,6 +1474,7 @@
 # 12627: __all_ai_gateway_history  # BASE_TABLE_NAME1
 # 12628: __all_virtual_ai_gateway_endpoint_stat
 # 12629: __all_virtual_tablet_macro_cache_stat
+# 12631: __all_virtual_key_column_usage
 # 15009: ALL_VIRTUAL_SQL_AUDIT
 # 15009: __all_virtual_sql_audit  # BASE_TABLE_NAME
 # 15010: ALL_VIRTUAL_PLAN_STAT
@@ -2890,6 +2891,7 @@
 # 21751: GV$OB_TABLET_MACRO_CACHE_STAT
 # 21752: V$OB_TABLET_MACRO_CACHE_STAT
 # 21753: DBA_OB_DIRECT_LOAD_STREAMS
+# 21754: CDB_OB_KEY_COLUMN_USAGE
 # 25001: DBA_SYNONYMS
 # 25002: DBA_OBJECTS
 # 25003: ALL_OBJECTS
