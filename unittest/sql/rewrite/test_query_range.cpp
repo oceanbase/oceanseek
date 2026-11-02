@@ -1311,6 +1311,52 @@ TEST_F(ObQueryRangeTest, serialize_geo_keypart)
   EXPECT_EQ(dec_key_part.domain_keypart_->domain_op_, pre_key_part.domain_keypart_->domain_op_);
 }
 
+TEST_F(ObQueryRangeTest, no_pad_char_range_fallback)
+{
+  set_compat_mode(lib::Worker::CompatMode::MYSQL);
+  ObRawExprResType col_type;
+  col_type.set_type(ObCharType);
+  col_type.set_collation_type(CS_TYPE_UTF8MB4_0900_BIN);
+  ObObjMeta calc_type;
+  calc_type.set_type(ObVarcharType);
+  calc_type.set_collation_type(CS_TYPE_UTF8MB4_0900_BIN);
+  bool always_true = false;
+  const ObItemType comparisons[] = {T_OP_EQ, T_OP_NSEQ, T_OP_LT, T_OP_LE, T_OP_GT, T_OP_GE};
+  for (const auto cmp : comparisons) {
+    always_true = false;
+    ASSERT_FALSE(ObQueryRange::can_be_extract_range(
+        cmp, col_type, calc_type, ObVarcharType, always_true, true));
+    ASSERT_TRUE(always_true);
+    // The restriction only applies to search indexes.
+    ASSERT_TRUE(ObQueryRange::can_be_extract_range(
+        cmp, col_type, calc_type, ObVarcharType, always_true, false));
+  }
+  ASSERT_TRUE(ObQueryRange::can_be_extract_range(
+      T_OP_NSEQ, col_type, calc_type, ObNullType, always_true, true));
+  ASSERT_FALSE(ObQueryRange::can_be_extract_range(
+      T_OP_EQ, col_type, calc_type, ObCharType, always_true, true));
+
+  // PAD SPACE comparisons ignore the spaces removed or added on CHAR reads.
+  for (const auto cs : {CS_TYPE_UTF8MB4_BIN, CS_TYPE_UTF8MB4_GENERAL_CI}) {
+    col_type.set_collation_type(cs);
+    calc_type.set_collation_type(cs);
+    ASSERT_TRUE(ObQueryRange::can_be_extract_range(
+        T_OP_EQ, col_type, calc_type, ObVarcharType, always_true, true));
+  }
+
+  // VARCHAR and BINARY do not use MySQL CHAR space trimming/padding.
+  col_type.set_type(ObVarcharType);
+  col_type.set_collation_type(CS_TYPE_UTF8MB4_0900_BIN);
+  calc_type.set_collation_type(CS_TYPE_UTF8MB4_0900_BIN);
+  ASSERT_TRUE(ObQueryRange::can_be_extract_range(
+      T_OP_EQ, col_type, calc_type, ObVarcharType, always_true, true));
+  col_type.set_type(ObCharType);
+  col_type.set_collation_type(CS_TYPE_BINARY);
+  calc_type.set_collation_type(CS_TYPE_BINARY);
+  ASSERT_TRUE(ObQueryRange::can_be_extract_range(
+      T_OP_EQ, col_type, calc_type, ObVarcharType, always_true, true));
+}
+
 int main(int argc, char **argv)
 {
   init_sql_factories();

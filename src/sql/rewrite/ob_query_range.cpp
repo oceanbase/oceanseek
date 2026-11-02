@@ -1467,6 +1467,17 @@ bool ObQueryRange::can_be_extract_range(ObItemType cmp_type,
       bret = false;
       always_true = true;
     }
+    if (bret && lib::is_mysql_mode() && col_type.is_char() && ObNullType != data_type) {
+      bool is_pad = false;
+      const int ret = ObCharset::is_pad_charset(col_type.get_collation_type(), is_pad);
+      // CHAR search keys can retain input spaces that base-table reads trim.
+      // PAD_CHAR_TO_FULL_LENGTH can also add spaces on reads. With NO PAD,
+      // neither read value is guaranteed to match the key, in either SQL mode.
+      if (OB_SUCCESS != ret || !is_pad) {
+        bret = false;
+        always_true = true;
+      }
+    }
   }
   return bret;
 }
