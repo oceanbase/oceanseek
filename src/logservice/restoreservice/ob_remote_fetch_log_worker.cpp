@@ -148,7 +148,7 @@ void ObRemoteFetchWorker::signal()
   cond_.signal();
 }
 
-int ObRemoteFetchWorker::submit_fetch_log_task(ObFetchLogTask *task)
+int ObRemoteFetchWorker::submit_fetch_log_task(ObFetchLogTask *task, const bool need_signal)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(! inited_)) {
@@ -164,7 +164,9 @@ int ObRemoteFetchWorker::submit_fetch_log_task(ObFetchLogTask *task)
     if (OB_FAIL(task_queue_.push(task))) {
       LOG_WARN("push task failed", K(ret), KPC(task));
     } else {
-      signal();
+      if (need_signal) {
+        signal();
+      }
       LOG_TRACE("submit_fetch_log_task succ", KP(task));
     }
   }
@@ -289,6 +291,7 @@ int ObRemoteFetchWorker::handle_fetch_log_task_(ObFetchLogTask *task)
 {
   int ret = OB_SUCCESS;
   bool empty = true;
+  bool need_signal = true;
   const int64_t DEFAULT_BUF_SIZE = 64 * 1024 * 1024L;
   task->task_stat_.start_fetch_ts_ = ObTimeUtility::current_time();
   const uint64_t io_tenant_id = MTL_ID();
@@ -298,14 +301,17 @@ int ObRemoteFetchWorker::handle_fetch_log_task_(ObFetchLogTask *task)
   if (OB_UNLIKELY(! task->is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_ERROR("invalid argument", K(ret), K(task));
+  } else if (!need_fetch_log_(task->id_)) {
+    // Keep the unconsumed range for a later recovery target, but do not
+    // initialize its iterator or wake the worker again while restore is suspended.
+    need_signal = false;
+    LOG_TRACE("no need fetch log", KPC(task));
   } else if (OB_FAIL(task->iter_.init(tenant_id_, task->id_, task->pre_scn_,
           task->cur_lsn_, task->end_lsn_, allocator_->get_buferr_pool(),
           &log_ext_handler_, DEFAULT_BUF_SIZE, enable_logservice))) {
     LOG_WARN("ObRemoteLogIterator init failed", K(ret), K_(tenant_id), KPC(task));
   } else if (OB_FAIL(task->iter_.set_io_context(palf::LogIOContext(tenant_id_, task->id_.id(), palf::LogIOUser::RESTORE)))) {
     LOG_WARN("set_io_context failed", K(ret), K_(tenant_id), KPC(task));
-  } else if (!need_fetch_log_(task->id_)) {
-    LOG_TRACE("no need fetch log", KPC(task));
   } else if (OB_FAIL(task->iter_.pre_read(empty, task->task_stat_.fetch_log_size_))) {
     LOG_WARN("pre_read failed", K(ret), KPC(task));
   } else if (FALSE_IT(task->task_stat_.finish_fetch_ts_ = ObTimeUtility::current_time())) {
@@ -344,7 +350,7 @@ int ObRemoteFetchWorker::handle_fetch_log_task_(ObFetchLogTask *task)
     }
     // not encounter fatal error or push submit array succ, just try retire task
     int tmp_ret = OB_SUCCESS;
-    if (OB_SUCCESS != (tmp_ret = try_retire_(task))) {
+    if (OB_SUCCESS != (tmp_ret = try_retire_(task, need_signal))) {
       LOG_WARN("retire task failed", K(tmp_ret), KP(task));
     }
   }
@@ -391,7 +397,7 @@ bool ObRemoteFetchWorker::is_fatal_error_(const int ret_code) const
     || OB_INVALID_BACKUP_DEST == ret_code;
 }
 
-int ObRemoteFetchWorker::try_retire_(ObFetchLogTask *&task)
+int ObRemoteFetchWorker::try_retire_(ObFetchLogTask *&task, const bool need_signal)
 {
   int ret = OB_SUCCESS;
   bool done = false;
@@ -402,7 +408,7 @@ int ObRemoteFetchWorker::try_retire_(ObFetchLogTask *&task)
       inner_free_task_(*task);
       task = NULL;
     } else {
-      if (OB_FAIL(submit_fetch_log_task(task))) {
+      if (OB_FAIL(submit_fetch_log_task(task, need_signal))) {
         LOG_ERROR("submit fetch log task failed", K(ret), KPC(task));
         inner_free_task_(*task);
         task = NULL;

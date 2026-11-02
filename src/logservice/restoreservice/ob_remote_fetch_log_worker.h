@@ -60,10 +60,11 @@ public:
   void signal();
 public:
   // submit fetch log task
+  // Suspended retries leave need_signal false and wait for the next worker poll.
   //
   // @retval OB_SIZE_OVERFLOW    task num more than queue limit
   // @retval other code          unexpected error
-  int submit_fetch_log_task(ObFetchLogTask *task);
+  int submit_fetch_log_task(ObFetchLogTask *task, const bool need_signal = true);
 
   int modify_thread_count(const int64_t log_restore_concurrency);
   int get_thread_count(int64_t &thread_count) const;
@@ -80,7 +81,7 @@ private:
   int record_fetch_stat_(const ObFetchLogTask &task);
   int push_submit_array_(ObFetchLogTask &task);
 
-  int try_retire_(ObFetchLogTask *&task);
+  int try_retire_(ObFetchLogTask *&task, const bool need_signal);
   void inner_free_task_(ObFetchLogTask &task);
   bool is_fatal_error_(const int ret_code) const;
   void report_error_(const ObLSID &id,

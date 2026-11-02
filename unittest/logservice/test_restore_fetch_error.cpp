@@ -7,6 +7,8 @@
 #define private public
 #define protected public
 #include "logservice/restoreservice/ob_log_restore_handler.h"
+#include "logservice/restoreservice/ob_remote_fetch_log_worker.h"
+#include "logservice/restoreservice/ob_fetch_log_task.h"
 #undef protected
 #undef private
 
@@ -310,11 +312,109 @@ TEST_F(TestRestoreFetchError, restore_already_reached_target)
   EXPECT_EQ(OB_SUCCESS, handler_.context_.error_context_.ret_code_);
 }
 
+TEST_F(TestRestoreFetchError, target_reached_after_fetch_check_blocks_write)
+{
+  ASSERT_FALSE(handler_.restore_to_end());
+
+  // Another task may reach the recovery target while this task initializes or
+  // prefetches. The writer must reject the prefetched log before calling PALF.
+  SCN end_scn;
+  end_scn.convert_for_logservice(200);
+  palf_.set_end_scn(end_scn);
+  SCN entry_scn;
+  entry_scn.convert_for_logservice(300);
+  const char buf[] = "log";
+  ObRestoreWriteRetryReason retry_reason = ObRestoreWriteRetryReason::NONE;
+  EXPECT_EQ(OB_RESTORE_LOG_TO_END,
+      handler_.raw_write(2, LSN(1000), entry_scn, buf, sizeof(buf),
+          ObRestoreWriteMode::YIELD_WHEN_RATE_LIMITED, retry_reason));
+  EXPECT_EQ(ObRestoreWriteRetryReason::NONE, retry_reason);
+  EXPECT_EQ(OB_SUCCESS, handler_.context_.error_context_.ret_code_);
+}
+
 TEST_F(TestRestoreFetchError, source_already_reached_target)
 {
   source_.to_end_ = true;
   report();
   EXPECT_EQ(OB_SUCCESS, handler_.context_.error_context_.ret_code_);
+}
+
+TEST_F(TestRestoreFetchError, suspended_task_keeps_its_range_for_resume)
+{
+  ObFetchLogTask task(ObLSID(1003), SCN::min_scn(), LSN(1000), 1000, 2, 10);
+  handler_.context_.issue_task_num_ = 1;
+  handler_.context_.max_submit_lsn_ = task.end_lsn_;
+  handler_.context_.max_fetch_lsn_ = task.cur_lsn_;
+  SCN end_scn;
+  end_scn.convert_for_logservice(200);
+  palf_.set_end_scn(end_scn);
+  ASSERT_TRUE(handler_.restore_to_end());
+
+  bool done = true;
+  ASSERT_EQ(OB_SUCCESS, handler_.try_retire_task(task, done));
+  EXPECT_FALSE(done);
+  EXPECT_EQ(1, handler_.context_.issue_task_num_);
+  EXPECT_EQ(LSN(1000), task.cur_lsn_);
+
+  // Advancing the recovery target must resume this range, not schedule past it.
+  source_.upper_limit_scn_.convert_for_logservice(300);
+  EXPECT_FALSE(handler_.restore_to_end());
+  ASSERT_EQ(OB_SUCCESS, handler_.try_retire_task(task, done));
+  EXPECT_FALSE(done);
+  EXPECT_EQ(task.end_lsn_, handler_.context_.max_submit_lsn_);
+  EXPECT_EQ(LSN(1000), task.cur_lsn_);
+
+  handler_.context_.max_fetch_lsn_ = task.end_lsn_;
+  ASSERT_EQ(OB_SUCCESS, handler_.try_retire_task(task, done));
+  EXPECT_TRUE(done);
+  EXPECT_EQ(0, handler_.context_.issue_task_num_);
+}
+
+class TestRestoreFetchWorker : public ::testing::Test
+{
+public:
+  void SetUp() override
+  {
+    ASSERT_EQ(OB_SUCCESS, worker_.task_queue_.init(4, "RFLTaskQueue", OB_SYS_TENANT_ID));
+    worker_.inited_ = true;
+  }
+
+  void TearDown() override
+  {
+    // Tasks in this test are owned by the test rather than the worker allocator.
+    worker_.inited_ = false;
+    worker_.task_queue_.reset();
+    worker_.task_queue_.destroy();
+  }
+
+  ObRemoteFetchWorker worker_;
+};
+
+TEST_F(TestRestoreFetchWorker, suspended_retry_does_not_wake_worker)
+{
+  ObRemoteFetchWorker &worker = worker_;
+  ObFetchLogTask task(ObLSID(1003), SCN::min_scn(), LSN(1000), 1000, 2, 10);
+  ASSERT_EQ(OB_SUCCESS, worker.submit_fetch_log_task(&task));
+  EXPECT_EQ(OB_SUCCESS, worker.cond_.timedwait(1000));
+
+  // Repeated suspended retries must leave the worker asleep and retain the LSN.
+  for (int64_t i = 0; i < 3; ++i) {
+    void *data = nullptr;
+    ASSERT_EQ(OB_SUCCESS, worker.task_queue_.pop(data));
+    ASSERT_EQ(&task, data);
+    ASSERT_EQ(OB_SUCCESS, worker.submit_fetch_log_task(&task, false));
+    EXPECT_EQ(OB_TIMEOUT, worker.cond_.timedwait(1000));
+    EXPECT_EQ(LSN(1000), task.cur_lsn_);
+    EXPECT_EQ(LSN(2000), task.end_lsn_);
+  }
+
+  void *data = nullptr;
+  ASSERT_EQ(OB_SUCCESS, worker.task_queue_.pop(data));
+  // A normal producer still wakes the worker after restore resumes.
+  ASSERT_EQ(OB_SUCCESS, worker.submit_fetch_log_task(&task));
+  EXPECT_EQ(OB_SUCCESS, worker.cond_.timedwait(1000));
+  ASSERT_EQ(OB_SUCCESS, worker.task_queue_.pop(data));
+  EXPECT_EQ(&task, data);
 }
 
 TEST_F(TestRestoreFetchError, valid_gap_is_reported)
