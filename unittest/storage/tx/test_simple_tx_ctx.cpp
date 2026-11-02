@@ -4,12 +4,14 @@
  */
 
 #include <gtest/gtest.h>
+#include "lib/utility/ob_defer.h"
 #define private public
 #define protected public
 #define UNITTEST
 
 #include "storage/tx/ob_mock_tx_ctx.h"
 #include "lib/alloc/ob_malloc_allocator.h"
+#include "share/ob_cluster_version.h"
 
 namespace oceanbase
 {
@@ -80,6 +82,274 @@ public:
   int64_t scheduler_addr_ = 0;
   ObMailBox<ObTxMsg> scheduler_mailbox_;
 };
+
+TEST_F(TestMockObTxCtx, clear_watermark_after_commit_or_abort)
+{
+  const uint64_t saved_version = GET_MIN_CLUSTER_VERSION();
+  DEFER(common::ObClusterVersion::get_instance().update_cluster_version(saved_version));
+  common::ObClusterVersion::get_instance().update_cluster_version(CLUSTER_VERSION_4_1_0_0);
+
+  struct ClearCase {
+    ObTxState state;
+    int64_t end_scn;
+    int64_t max_commit_scn;
+    int64_t request_scn;
+    int expected_ret;
+  };
+  const ClearCase cases[] = {
+    // ABORT keeps the same strict CLEAR watermark checks as COMMIT.
+    {ObTxState::ABORT, 1791448444374752001, 0, 1791448444341769000, OB_ERR_UNEXPECTED},
+    {ObTxState::ABORT, 1791448444374752001, 0, 1791448444374752001, OB_SUCCESS},
+    {ObTxState::ABORT, 100, 200, 150, OB_ERR_UNEXPECTED},
+    {ObTxState::ABORT, 100, 200, 200, OB_SUCCESS},
+    {ObTxState::COMMIT, 200, 100, 150, OB_ERR_UNEXPECTED},
+    {ObTxState::COMMIT, 100, 200, 150, OB_ERR_UNEXPECTED},
+    {ObTxState::COMMIT, 200, 200, 200, OB_SUCCESS},
+    {ObTxState::COMMIT, 200, 200, 201, OB_SUCCESS},
+  };
+  for (const auto &test_case : cases) {
+    SCOPED_TRACE(static_cast<int>(test_case.state));
+    SCOPED_TRACE(test_case.request_scn);
+    ObTxData data;
+    MockObTxCtx ctx;
+    ctx.change_to_leader();
+    ASSERT_EQ(OB_SUCCESS, ctx.init(ObLSID(1), ObTransID(1), nullptr, &data, &mailbox_mgr_));
+    ASSERT_EQ(OB_SUCCESS, ctx.set_downstream_state(test_case.state));
+    SCN end_scn;
+    end_scn.convert_for_tx(test_case.end_scn);
+    ASSERT_EQ(OB_SUCCESS, ctx.ctx_tx_data_.set_end_log_ts(end_scn));
+    ctx.max_2pc_commit_scn_.convert_for_tx(test_case.max_commit_scn);
+    const SCN original_max_scn = ctx.max_2pc_commit_scn_;
+    Ob2pcClearReqMsg msg;
+    msg.sender_ = ObLSID(1001);
+    msg.max_commit_log_scn_.convert_for_tx(test_case.request_scn);
+    ctx.msg_2pc_cache_ = &msg;
+    EXPECT_EQ(test_case.expected_ret,
+              ctx.apply_2pc_msg_(ObTwoPhaseCommitMsgType::OB_MSG_TX_CLEAR_REQ));
+    ctx.msg_2pc_cache_ = nullptr;
+    EXPECT_EQ(end_scn, ctx.ctx_tx_data_.get_end_log_ts());
+    if (OB_SUCCESS == test_case.expected_ret) {
+      EXPECT_EQ(msg.sender_, ctx.exec_info_.upstream_);
+      EXPECT_EQ(SCN::max(original_max_scn, msg.max_commit_log_scn_), ctx.max_2pc_commit_scn_);
+    } else {
+      EXPECT_EQ(original_max_scn, ctx.max_2pc_commit_scn_);
+      EXPECT_FALSE(ctx.exec_info_.upstream_.is_valid());
+    }
+  }
+}
+
+// The boxed payload used by AbortResp before max_abort_log_scn_ was appended.
+struct LegacyAbortPayload
+{
+  OB_UNIS_VERSION(1);
+};
+OB_SERIALIZE_MEMBER(LegacyAbortPayload);
+
+TEST_F(TestMockObTxCtx, abort_watermark_serialization_compatibility)
+{
+  char buf[4096];
+  Ob2pcAbortRespMsg msg;
+  EXPECT_FALSE(msg.max_abort_log_scn_.is_valid());
+  msg.cluster_version_ = CLUSTER_VERSION_4_1_0_1 + 1; // boxed wire format
+  ASSERT_EQ(OB_SUCCESS, msg.max_abort_log_scn_.convert_for_tx(200));
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, msg.serialize(buf, sizeof(buf), pos));
+  EXPECT_EQ(msg.get_serialize_size(), pos);
+  const int64_t len = pos;
+  Ob2pcAbortRespMsg decoded;
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buf, len, pos));
+  EXPECT_EQ(len, pos);
+  EXPECT_EQ(msg.max_abort_log_scn_, decoded.max_abort_log_scn_);
+
+  // An old boxed reader skips the appended field using the payload length.
+  ObTxMsg old_header;
+  LegacyAbortPayload old_payload;
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, old_header.deserialize(buf, len, pos));
+  ASSERT_EQ(OB_SUCCESS, old_payload.deserialize(buf, len, pos));
+  EXPECT_EQ(len, pos);
+
+  // A new reader accepts the old empty payload with an invalid watermark.
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, msg.ObTxMsg::serialize(buf, sizeof(buf), pos));
+  ASSERT_EQ(OB_SUCCESS, old_payload.serialize(buf, sizeof(buf), pos));
+  const int64_t old_len = pos;
+  Ob2pcAbortRespMsg old_decoded;
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, old_decoded.deserialize(buf, old_len, pos));
+  EXPECT_EQ(old_len, pos);
+  EXPECT_FALSE(old_decoded.max_abort_log_scn_.is_valid());
+
+  // Preserve the pre-box wire layout as well.
+  msg.cluster_version_ = CLUSTER_VERSION_4_1_0_1;
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, msg.serialize(buf, sizeof(buf), pos));
+  const int64_t v1_len = pos;
+  EXPECT_EQ(msg.ObTxMsg::get_serialize_size(), v1_len);
+  Ob2pcAbortRespMsg v1_decoded;
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, v1_decoded.deserialize(buf, v1_len, pos));
+  EXPECT_EQ(v1_len, pos);
+  EXPECT_FALSE(v1_decoded.max_abort_log_scn_.is_valid());
+}
+
+class WatermarkTxCtx : public MockObTxCtx
+{
+public:
+  SCN sent_scn_;
+  int64_t sent_type_ = TX_UNKNOWN;
+  int64_t clear_count_ = 0;
+  int64_t abort_count_ = 0;
+  int post_msg_(const ObLSID &, ObTxMsg &msg) override
+  {
+    sent_type_ = msg.get_msg_type();
+    if (TX_2PC_ABORT_RESP == sent_type_) {
+      sent_scn_ = static_cast<const Ob2pcAbortRespMsg &>(msg).max_abort_log_scn_;
+    } else if (TX_2PC_CLEAR_REQ == sent_type_) {
+      sent_scn_ = static_cast<const Ob2pcClearReqMsg &>(msg).max_commit_log_scn_;
+      ++clear_count_;
+    } else if (TX_2PC_ABORT_REQ == sent_type_) {
+      ++abort_count_;
+    } else {
+      return OB_ERR_UNEXPECTED;
+    }
+    return OB_SUCCESS;
+  }
+};
+
+TEST_F(TestMockObTxCtx, abort_watermark_aggregation_and_orphan_clear)
+{
+  const uint64_t saved_version = GET_MIN_CLUSTER_VERSION();
+  DEFER(common::ObClusterVersion::get_instance().update_cluster_version(saved_version));
+  common::ObClusterVersion::get_instance().update_cluster_version(CLUSTER_VERSION_4_1_0_0);
+  ObTxData leaf_data;
+  ObTxData parent_data;
+  WatermarkTxCtx leaf;
+  WatermarkTxCtx parent;
+  leaf.change_to_leader();
+  parent.change_to_leader();
+  ASSERT_EQ(OB_SUCCESS, leaf.init(ObLSID(1), ObTransID(1), nullptr, &leaf_data, &mailbox_mgr_));
+  ASSERT_EQ(OB_SUCCESS, parent.init(ObLSID(1001), ObTransID(1), nullptr, &parent_data, &mailbox_mgr_));
+  ASSERT_EQ(OB_SUCCESS, leaf.set_downstream_state(ObTxState::ABORT));
+  ASSERT_EQ(OB_SUCCESS, parent.set_downstream_state(ObTxState::ABORT));
+  SCN abort_scn;
+  SCN local_scn;
+  ASSERT_EQ(OB_SUCCESS, abort_scn.convert_for_tx(1791448444374752001));
+  ASSERT_EQ(OB_SUCCESS, local_scn.convert_for_tx(1791448444341769000));
+  ASSERT_EQ(OB_SUCCESS, leaf.ctx_tx_data_.set_end_log_ts(abort_scn));
+  ASSERT_EQ(OB_SUCCESS, parent.ctx_tx_data_.set_end_log_ts(local_scn));
+  const SCN commit_version = parent.ctx_tx_data_.get_commit_version();
+
+  // Leaf sends its own ABORT SCN even though its aggregated watermark is invalid.
+  ASSERT_FALSE(leaf.max_2pc_commit_scn_.is_valid());
+  ASSERT_EQ(OB_SUCCESS, leaf.ObPartTransCtx::post_msg_(
+      ObTwoPhaseCommitMsgType::OB_MSG_TX_ABORT_RESP, ObLSID(1001)));
+  ASSERT_EQ(TX_2PC_ABORT_RESP, leaf.sent_type_);
+  EXPECT_EQ(abort_scn, leaf.sent_scn_);
+  Ob2pcAbortRespMsg resp;
+  resp.max_abort_log_scn_ = leaf.sent_scn_;
+  parent.msg_2pc_cache_ = &resp;
+  ASSERT_EQ(OB_SUCCESS, parent.apply_2pc_msg_(ObTwoPhaseCommitMsgType::OB_MSG_TX_ABORT_RESP));
+  parent.msg_2pc_cache_ = nullptr;
+  EXPECT_EQ(abort_scn, parent.max_2pc_commit_scn_);
+
+  // Retries, smaller responses, and old/orphan responses cannot lower the maximum.
+  for (const SCN &scn : {abort_scn, local_scn, SCN::invalid_scn()}) {
+    resp.max_abort_log_scn_ = scn;
+    parent.msg_2pc_cache_ = &resp;
+    ASSERT_EQ(OB_SUCCESS, parent.apply_2pc_msg_(ObTwoPhaseCommitMsgType::OB_MSG_TX_ABORT_RESP));
+    parent.msg_2pc_cache_ = nullptr;
+    EXPECT_EQ(abort_scn, parent.max_2pc_commit_scn_);
+  }
+  EXPECT_EQ(commit_version, parent.ctx_tx_data_.get_commit_version());
+  EXPECT_EQ(local_scn, parent.ctx_tx_data_.get_end_log_ts());
+  EXPECT_EQ(ObTxState::ABORT, parent.get_downstream_state());
+
+  // An internal node forwards the subtree maximum; a root uses it for CLEAR.
+  ASSERT_EQ(OB_SUCCESS, parent.ObPartTransCtx::post_msg_(
+      ObTwoPhaseCommitMsgType::OB_MSG_TX_ABORT_RESP, ObLSID(1002)));
+  EXPECT_EQ(abort_scn, parent.sent_scn_);
+  ASSERT_EQ(OB_SUCCESS, parent.ObPartTransCtx::post_msg_(
+      ObTwoPhaseCommitMsgType::OB_MSG_TX_CLEAR_REQ, ObLSID(1)));
+  EXPECT_EQ(abort_scn, parent.sent_scn_);
+
+  // With no coordinator context, the response still raises the local LS watermark.
+  resp.max_abort_log_scn_ = abort_scn;
+  Ob2pcClearReqMsg clear;
+  clear.sender_ = ObLSID(1001);
+  clear.max_commit_log_scn_ = ObPartTransCtx::get_orphan_clear_scn_(resp, local_scn);
+  EXPECT_EQ(abort_scn, clear.max_commit_log_scn_);
+  leaf.msg_2pc_cache_ = &clear;
+  ASSERT_EQ(OB_SUCCESS, leaf.apply_2pc_msg_(ObTwoPhaseCommitMsgType::OB_MSG_TX_CLEAR_REQ));
+  leaf.msg_2pc_cache_ = nullptr;
+  EXPECT_EQ(abort_scn, leaf.ctx_tx_data_.get_end_log_ts());
+
+  SCN larger_scn;
+  ASSERT_EQ(OB_SUCCESS, larger_scn.convert_for_tx(1791448444374752002));
+  EXPECT_EQ(larger_scn, ObPartTransCtx::get_orphan_clear_scn_(resp, larger_scn));
+  resp.max_abort_log_scn_.reset();
+  EXPECT_EQ(local_scn, ObPartTransCtx::get_orphan_clear_scn_(resp, local_scn));
+  Ob2pcCommitRespMsg commit_resp;
+  commit_resp.commit_log_scn_ = larger_scn;
+  EXPECT_EQ(local_scn, ObPartTransCtx::get_orphan_clear_scn_(commit_resp, local_scn));
+}
+
+class AbortProtocolCtx : public WatermarkTxCtx
+{
+public:
+  // Keep the production 2PC state machine while mocking data/scheduler effects.
+  int do_abort() override { return OB_SUCCESS; }
+  int on_abort() override { return OB_SUCCESS; }
+  int do_clear() override { return OB_SUCCESS; }
+};
+
+TEST_F(TestMockObTxCtx, abort_collects_all_responses_before_clear)
+{
+  ObTxData data;
+  AbortProtocolCtx ctx;
+  ctx.change_to_leader();
+  ASSERT_EQ(OB_SUCCESS, ctx.init(ObLSID(1), ObTransID(1), nullptr, &data, &mailbox_mgr_));
+  ctx.set_trans_type_(TransType::DIST_TRANS);
+  ctx.exec_info_.upstream_ = ObLSID(1);
+  for (int64_t id : {1, 2, 3}) {
+    ASSERT_EQ(OB_SUCCESS, ctx.exec_info_.participants_.push_back(ObLSID(id)));
+  }
+  ctx.upstream_state_ = ObTxState::PREPARE;
+  ASSERT_EQ(OB_SUCCESS, ctx.set_downstream_state(ObTxState::PREPARE));
+  ASSERT_EQ(OB_SUCCESS, ctx.collected_.add_member(2)); // B previously replied PREPARE.
+  SCN local_scn;
+  ASSERT_EQ(OB_SUCCESS, local_scn.convert_for_tx(100));
+  ASSERT_EQ(OB_SUCCESS, ctx.ctx_tx_data_.set_end_log_ts(local_scn));
+
+  Ob2pcAbortRespMsg resp;
+  ASSERT_EQ(OB_SUCCESS, resp.max_abort_log_scn_.convert_for_tx(200));
+  ctx.msg_2pc_cache_ = &resp;
+  ASSERT_EQ(OB_SUCCESS, ctx.handle_2pc_abort_response(1)); // A aborts first.
+  ctx.msg_2pc_cache_ = nullptr;
+  EXPECT_EQ(ObTxState::ABORT, ctx.get_upstream_state());
+  EXPECT_EQ(0, ctx.clear_count_);
+  EXPECT_EQ(2, ctx.abort_count_);
+  EXPECT_TRUE(ctx.collected_.has_member(1));
+  EXPECT_FALSE(ctx.collected_.has_member(2));
+
+  // Completing the local ABORT alone does not allow CLEAR.
+  ASSERT_EQ(OB_SUCCESS, ctx.apply_abort_log());
+  EXPECT_EQ(0, ctx.clear_count_);
+  ASSERT_EQ(OB_SUCCESS, ctx.handle_2pc_prepare_response(2));
+  EXPECT_FALSE(ctx.collected_.has_member(2));
+  EXPECT_EQ(0, ctx.clear_count_);
+
+  // The last AbortResp must be aggregated before CLEAR is generated.
+  ASSERT_EQ(OB_SUCCESS, resp.max_abort_log_scn_.convert_for_tx(300));
+  ctx.msg_2pc_cache_ = &resp;
+  ASSERT_EQ(OB_SUCCESS, ctx.handle_2pc_abort_response(2));
+  ctx.msg_2pc_cache_ = nullptr;
+  EXPECT_EQ(ObTxState::CLEAR, ctx.get_upstream_state());
+  EXPECT_EQ(2, ctx.clear_count_);
+  EXPECT_EQ(resp.max_abort_log_scn_, ctx.max_2pc_commit_scn_);
+  EXPECT_EQ(resp.max_abort_log_scn_, ctx.sent_scn_);
+}
 
 TEST_F(TestMockObTxCtx, test_simple_tx_ctx1)
 {

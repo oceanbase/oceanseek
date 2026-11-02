@@ -431,10 +431,14 @@ namespace transaction
     {
     public:
       Ob2pcAbortRespMsg() :
-          ObTxMsg(TX_2PC_ABORT_RESP)
+          ObTxMsg(TX_2PC_ABORT_RESP), max_abort_log_scn_(share::SCN::invalid_scn())
       {}
     public:
       bool is_valid() const;
+      // Covers this participant's ABORT log and all collected descendants.
+      // Invalid for old messages or orphan responses without a transaction context.
+      share::SCN max_abort_log_scn_;
+      INHERIT_TO_STRING_KV("txMsg", ObTxMsg, K_(max_abort_log_scn));
       OB_UNIS_VERSION(1);
     };
 

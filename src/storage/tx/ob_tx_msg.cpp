@@ -109,7 +109,7 @@ OB_TX_MSG_SERDE(Ob2pcPreCommitRespMsg, ObTxMsg, commit_version_);
 OB_TX_MSG_SERDE(Ob2pcCommitReqMsg, ObTxMsg, commit_version_, prepare_info_array_);
 OB_TX_MSG_SERDE(Ob2pcCommitRespMsg, ObTxMsg, commit_version_, commit_log_scn_);
 OB_TX_MSG_SERDE(Ob2pcAbortReqMsg, ObTxMsg, upstream_);
-OB_TX_MSG_SERDE(Ob2pcAbortRespMsg, ObTxMsg);
+OB_TX_MSG_SERDE(Ob2pcAbortRespMsg, ObTxMsg, max_abort_log_scn_);
 OB_TX_MSG_SERDE(Ob2pcClearReqMsg, ObTxMsg, max_commit_log_scn_);
 OB_TX_MSG_SERDE(Ob2pcClearRespMsg, ObTxMsg);
 OB_TX_MSG_SERDE(Ob2pcPrepareRedoReqMsg, ObTxMsg, xid_, upstream_, app_trace_info_, app_trace_id_);

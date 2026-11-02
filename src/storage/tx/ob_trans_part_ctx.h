@@ -868,6 +868,7 @@ protected:
                        const int64_t participant_id) override;
 private:
   int apply_2pc_msg_(const ObTwoPhaseCommitMsgType msg_type);
+  static share::SCN get_orphan_clear_scn_(const ObTxMsg &recv_msg, const share::SCN &local_scn);
   int set_2pc_upstream_(const share::ObLSID&upstream);
   int set_2pc_participants_(const ObTxCommitParts &participants);
   int set_2pc_incremental_participants_(const share::ObLSArray &participants);
@@ -1218,6 +1219,7 @@ private:
 
   ObTxState upstream_state_;
   const ObTxMsg * msg_2pc_cache_;
+  // Aggregated terminal log SCN (COMMIT or ABORT), also used as the CLEAR log lower bound.
   share::SCN max_2pc_commit_scn_;
   ObLSLogInfoArray coord_prepare_info_arr_;
   // tmp scheduler addr is used to post response for the second phase of xa commit/rollback

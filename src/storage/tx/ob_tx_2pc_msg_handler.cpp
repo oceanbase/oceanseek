@@ -165,6 +165,8 @@ int ObPartTransCtx::post_msg_(const ObTwoPhaseCommitMsgType& msg_type,
   case ObTwoPhaseCommitMsgType::OB_MSG_TX_ABORT_RESP: {
     Ob2pcAbortRespMsg abort_resp;
     build_tx_common_msg_(receiver, abort_resp);
+    abort_resp.max_abort_log_scn_ =
+        share::SCN::max(max_2pc_commit_scn_, ctx_tx_data_.get_end_log_ts());
     if (OB_FAIL(post_msg_(receiver, abort_resp))) {
       TRANS_LOG(WARN, "rpc post msg failed", K(ret), K(*this), K(receiver), K(msg_type));
     }
@@ -261,6 +263,20 @@ void ObPartTransCtx::build_tx_common_msg_(const ObLSID &receiver,
   msg.cluster_id_ = cluster_id;
 }
 
+share::SCN ObPartTransCtx::get_orphan_clear_scn_(const ObTxMsg &recv_msg, const share::SCN &local_scn)
+{
+  SCN clear_scn = local_scn;
+  if (TX_2PC_ABORT_RESP == recv_msg.get_msg_type()) {
+    const Ob2pcAbortRespMsg &abort_resp = static_cast<const Ob2pcAbortRespMsg &>(recv_msg);
+    // Keep the original local watermark for old/orphan responses without a SCN.
+    // The receiver's existing validation and retry behavior remain unchanged.
+    if (abort_resp.max_abort_log_scn_.is_valid()) {
+      clear_scn = SCN::max(clear_scn, abort_resp.max_abort_log_scn_);
+    }
+  }
+  return clear_scn;
+}
+
 int ObPartTransCtx::post_orphan_msg_(const ObTwoPhaseCommitMsgType &msg_type,
                                      const ObTxMsg &recv_msg,
                                      const common::ObAddr &self_addr,
@@ -316,6 +332,7 @@ int ObPartTransCtx::post_orphan_msg_(const ObTwoPhaseCommitMsgType &msg_type,
       }
     }
     if (OB_SUCC(ret)) {
+      clear_req.max_commit_log_scn_ = get_orphan_clear_scn_(recv_msg, clear_req.max_commit_log_scn_);
       ret = rpc->post_msg(recv_msg.get_sender_addr(), clear_req);
     }
     break;
@@ -630,7 +647,10 @@ int ObPartTransCtx::apply_2pc_msg_(const ObTwoPhaseCommitMsgType msg_type)
     }
     case ObTwoPhaseCommitMsgType::OB_MSG_TX_ABORT_RESP: {
       const Ob2pcAbortRespMsg &msg = *(static_cast<const Ob2pcAbortRespMsg *>(msg_2pc_cache_));
-
+      // Old/orphan responses carry no watermark and must not change the aggregate.
+      if (msg.max_abort_log_scn_.is_valid()) {
+        max_2pc_commit_scn_ = share::SCN::max(msg.max_abort_log_scn_, max_2pc_commit_scn_);
+      }
       break;
     }
     case ObTwoPhaseCommitMsgType::OB_MSG_TX_CLEAR_REQ: {
