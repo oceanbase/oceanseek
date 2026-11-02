@@ -3495,6 +3495,7 @@ int ObLobQueryP::process()
 {
   int ret = OB_SUCCESS;
   MTL_SWITCH(arg_.tenant_id_) {
+    last_send_time_ = this->get_receive_timestamp();
     ObLobManager *lob_mngr = MTL(ObLobManager*);
     // init result_
     char *buf = nullptr;
