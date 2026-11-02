@@ -20,6 +20,7 @@
 #include "storage/ddl/ob_ddl_merge_helper.h"
 #include "storage/ddl/ob_inc_ddl_merge_task_utils.h"
 #include "storage/high_availability/ob_storage_ha_tablet_builder.h"
+#include "storage/high_availability/ob_ss_transfer_backfill_dag_net.h"
 #include "storage/high_availability/ob_ss_transfer_tablet_backfill_tx.h"
 #include "storage/incremental/ob_inc_replace_upload_task.h"
 #include "storage/incremental/ob_inc_ss_dag_util.h"
@@ -678,6 +679,22 @@ int TestCompactionPolicy::mock_tablet(
     tablet->table_store_cache_.is_tablet_referenced_by_collect_mv_ = is_tablet_referenced_by_collect_mv;
   }
   return ret;
+}
+
+TEST_F(TestCompactionPolicy, test_failed_upload_round_does_not_enter_completion)
+{
+  ObSSTransferBackfillTXCtx ctx;
+  ctx.backfill_type_ = ObSSTransferBackfillType::BACKFILL_UPLOAD;
+  ASSERT_EQ(OB_SUCCESS, ctx.result_mgr_.set_result(OB_EAGAIN, true /*need_retry*/));
+  ObSSFinishTransferBackfillTask finish_task;
+  finish_task.is_inited_ = true;
+  finish_task.ha_dag_net_ctx_ = &ctx;
+  // There is no source LS handle: an attempt to publish completion would fail.
+  ASSERT_EQ(OB_SUCCESS, finish_task.process());
+  ASSERT_TRUE(ctx.is_failed());
+  int32_t result = OB_SUCCESS;
+  ASSERT_EQ(OB_SUCCESS, ctx.result_mgr_.get_result(result));
+  EXPECT_EQ(OB_EAGAIN, result);
 }
 
 int TestCompactionPolicy::construct_array(

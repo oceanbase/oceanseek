@@ -152,6 +152,7 @@ int ObTabletMeta::init_for_shared_storage_first_creation(const ObTabletMeta &old
       LOG_WARN("failed to init ha status", K(ret));
     } else {
       transfer_info_ = old_tablet_meta.transfer_info_;
+      transfer_info_.set_transfer_upload_completed(false);
     }
     min_ss_tablet_scn_ = INIT_MIN_SS_TABLET_SCN;
     min_minor_meta_scn_.set_max();
@@ -198,6 +199,18 @@ int ObTabletMeta::update_for_share_storage(const ObTabletMeta &new_tablet_meta)
             "new_fork_info", new_tablet_meta.fork_info_);
       } else if (!fork_info_.is_all_replicas_land_complete()) {
         fork_info_.set_all_replicas_land_complete(true);
+      }
+    }
+    if (OB_SUCC(ret) && new_tablet_meta.transfer_info_.is_transfer_upload_completed()) {
+      if (ls_id_ != new_tablet_meta.ls_id_ || tablet_id_ != new_tablet_meta.tablet_id_
+          || create_scn_ != new_tablet_meta.create_scn_
+          || transfer_info_.transfer_seq_ != new_tablet_meta.transfer_info_.transfer_seq_
+          || transfer_info_.transfer_start_scn_ != new_tablet_meta.transfer_info_.transfer_start_scn_) {
+        ret = OB_STATE_NOT_MATCH;
+        LOG_WARN("refuse to complete upload for another tablet generation", K(ret), K(*this), K(new_tablet_meta));
+      } else {
+        // Completion is monotonic for a source generation. Transfer destinations clear it separately.
+        transfer_info_.set_transfer_upload_completed(true);
       }
     }
   }

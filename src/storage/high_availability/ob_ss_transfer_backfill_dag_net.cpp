@@ -766,8 +766,10 @@ int ObSSFinishTransferBackfillTask::process()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ha dag net ctx type is unexpected", K(ret), KPC(ha_dag_net_ctx_));
   } else if (FALSE_IT(ctx = static_cast<ObSSTransferBackfillTXCtx *>(ha_dag_net_ctx_))) {
-  } else if (FALSE_IT(ctx->finish_time_ = ObTimeUtil::current_time())) {
+  } else if (OB_FAIL(finish_upload_(*ctx))) {
+    LOG_WARN("failed to finish upload", K(ret), KPC(ctx));
   } else {
+    ctx->finish_time_ = ObTimeUtil::current_time();
     LOG_INFO("[SS_TRANSFER_BACKFILL]ss transfer backfill task finish", KPC(ctx), "cost", ctx->finish_time_ - ctx->start_time_,
         "tablet infos", ctx->tablet_infos_);
   }
@@ -783,6 +785,29 @@ int ObSSFinishTransferBackfillTask::process()
     }
   }
 
+  return ret;
+}
+
+int ObSSFinishTransferBackfillTask::finish_upload_(ObSSTransferBackfillTXCtx &ctx)
+{
+  int ret = OB_SUCCESS;
+  if (ObSSTransferBackfillType::BACKFILL_UPLOAD == ctx.backfill_type_
+      && !ctx.is_failed() && !get_dag()->is_dag_net_canceled()) {
+    ObLS *src_ls = nullptr;
+    if (OB_FAIL(ctx.get_src_ls(src_ls))) {
+      LOG_WARN("failed to get source ls for upload completion", K(ret), K(ctx));
+    } else if (OB_ISNULL(src_ls)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < ctx.tablet_infos_.count(); ++i) {
+        if (ctx.is_failed() || get_dag()->is_dag_net_canceled()) {
+          break;
+        } else if (OB_FAIL(ObSSTransferBackfillUtils::finish_tablet_upload(*src_ls, ctx.tablet_infos_.at(i)))) {
+          LOG_WARN("failed to finish tablet upload", K(ret), K(i), K(ctx));
+        }
+      }
+    }
+  }
   return ret;
 }
 

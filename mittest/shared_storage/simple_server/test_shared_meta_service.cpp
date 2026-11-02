@@ -17,6 +17,10 @@
 #include "storage/shared_storage/ob_file_manager.h"
 #include "storage/shared_storage/ob_ss_object_access_util.h"
 #include "storage/shared_storage/ob_ss_reader_writer.h"
+#define private public
+#define protected public
+#include "storage/high_availability/ob_ss_transfer_backfill_dag_net.h"
+#include "storage/high_availability/ob_ss_transfer_backfill_utils.h"
 #undef private
 #undef protected
 
@@ -1678,6 +1682,153 @@ TEST_F(TestSharedMetaService, create_and_get_tablet)
   ASSERT_TRUE(meta_scn.is_valid());
   LOG_INFO("get_tablet_latest_version succeed", K(meta_scn));
   LOG_INFO("[TEST CASE END] create_and_get_tablet");
+}
+
+TEST_F(TestSharedMetaService, transfer_upload_completion_retries_and_checks_lease)
+{
+  DDLFinishLeaseGuard lease_guard;
+  share::ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(run_ctx_.tenant_id_));
+  ObSSMetaService *meta_svr = MTL(ObSSMetaService *);
+  ASSERT_NE(nullptr, meta_svr);
+  ObTabletID unused_tablet_id;
+  ObLSID ls_id;
+  ASSERT_EQ(OB_SUCCESS, get_tablet_and_ls_id("test_svc2_table", unused_tablet_id, ls_id));
+  ObLSHandle ls_handle;
+  ASSERT_EQ(OB_SUCCESS, MTL(ObLSService *)->get_ls(ls_id, ls_handle, ObLSGetMod::HA_MOD));
+  ObLS &ls = *ls_handle.get_ls();
+  ObLSTabletService &tablet_svr = *ls.get_tablet_svr();
+  ObArenaAllocator allocator("TransferUpload", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+  uint64_t data_version = 0;
+  ASSERT_EQ(OB_SUCCESS, GET_MIN_DATA_VERSION(MTL_ID(), data_version));
+  share::schema::ObTableSchema table_schema;
+  TestSchemaUtils::prepare_data_schema(table_schema);
+  table_schema.set_tenant_id(MTL_ID());
+  ObCreateTabletSchema create_schema;
+  ASSERT_EQ(OB_SUCCESS, create_schema.init(allocator, table_schema,
+      lib::Worker::CompatMode::MYSQL, false /*skip_column_info*/, data_version));
+  const SCN create_scn = SCN::base_scn();
+  const SCN backfill_scn = SCN::plus(create_scn, 300);
+
+  ObSEArray<ObTabletID, 2> tablet_ids;
+  ObTabletHandle local_tablets[2];
+  ObTabletBackfillInfo tablet_infos[2];
+  DDLFinishTabletGuard tablet_guard(tablet_svr, tablet_ids);
+  auto shared_meta_guard = MAKE_SCOPE(tablet_ids, [&](const ObIArray<ObTabletID> &ids) {
+    for (int64_t i = 0; i < ids.count(); ++i) {
+      ObSSMetaDeleteParamV2 param;
+      param.set_tablet_level_param(ObSSMetaReadParamType::TABLET_PREFIX,
+          ObSSMetaReadResultType::READ_WHOLE_ROW, ObAtomicProtocolTypeEnum::TABLET_META,
+          ls_id, ids.at(i), SCN::min_scn(), tablet_infos[i].reorganization_scn_, true /*is_in_table*/);
+      const int ret = meta_svr->delete_meta_row(param);
+      EXPECT_TRUE(OB_SUCCESS == ret || OB_ENTRY_NOT_EXIST == ret);
+    }
+  });
+  auto commit_status = [&](const ObTabletID &tablet_id,
+                           const ObTabletCreateDeleteMdsUserData &status, const SCN &scn) {
+    mds::SingleLogMdsCtx ctx{mds::MdsWriter(ObTransID(tablet_id.id()))};
+    ASSERT_EQ(OB_SUCCESS, ctx.init(ls_id, ObTimeUtility::current_time() + 10_s, false /*is_replay*/));
+    bool committed = false;
+    auto status_guard = MAKE_SCOPE(committed, [&](const bool &done) {
+      if (!done) {
+        EXPECT_EQ(OB_SUCCESS, ctx.get_mds_single_row_mvcc_ctx().trans_end(
+            false, SCN::max_scn(), SCN::max_scn()));
+        ctx.on_abort(SCN::max_scn());
+      }
+    });
+    ASSERT_EQ(OB_SUCCESS, tablet_svr.set_tablet_status(tablet_id, status, ctx));
+    ctx.single_log_commit(scn, scn);
+    committed = true;
+  };
+  const int64_t first_tablet_id = ObTimeUtility::current_time();
+  for (int64_t i = 0; i < 2; ++i) {
+    const ObTabletID tablet_id(first_tablet_id + i);
+    ASSERT_EQ(OB_SUCCESS, tablet_svr.create_tablet(ls_id, tablet_id, tablet_id, create_scn,
+        1 /*snapshot_version*/, create_schema, lib::Worker::CompatMode::MYSQL,
+        false /*need_create_empty_major_sstable*/, SCN::invalid_scn(),
+        false /*micro_index_clustered*/, false /*has_cs_replica*/,
+        ObSplitTabletInfo(), ObForkTabletInfo(), data_version, local_tablets[i]));
+    ASSERT_EQ(OB_SUCCESS, tablet_ids.push_back(tablet_id));
+    ObTablet &local_tablet = *local_tablets[i].get_obj();
+    ObTabletCreateDeleteMdsUserData status(
+        ObTabletStatus::NORMAL, ObTabletMdsUserDataType::CREATE_TABLET, create_scn.get_val_for_tx());
+    status.create_commit_scn_ = create_scn;
+    ASSERT_NO_FATAL_FAILURE(commit_status(tablet_id, status, create_scn));
+    const SCN reorgan_scn = local_tablet.get_reorganization_scn();
+    ASSERT_EQ(OB_SUCCESS, meta_svr->create_tablet(ls_id, tablet_id, reorgan_scn, true /*check_lease*/));
+
+    local_tablet.table_store_cache_.is_async_index_refresh_target_ = true;
+
+    status.tablet_status_ = ObTabletStatus::TRANSFER_OUT;
+    status.data_type_ = ObTabletMdsUserDataType::START_TRANSFER_OUT;
+    status.transfer_scn_ = backfill_scn;
+    status.start_transfer_commit_scn_ = backfill_scn;
+    status.start_transfer_commit_version_ = backfill_scn.get_val_for_tx();
+    ASSERT_NO_FATAL_FAILURE(commit_status(tablet_id, status, backfill_scn));
+    ObTabletBackfillInfo &info = tablet_infos[i];
+    info.tablet_id_ = tablet_id;
+    info.is_committed_ = true;
+    info.is_shared_storage_ = true;
+    info.relative_ls_id_ = ls_id;
+    info.reorganization_scn_ = reorgan_scn;
+    info.backfill_scn_ = backfill_scn;
+    info.backfill_type_ = ObTabletBackfillType::BACKFILL_TRANSFER_OUT;
+    info.tablet_status_ = ObTabletStatus::TRANSFER_OUT;
+    info.transfer_seq_ = local_tablet.get_tablet_meta().transfer_info_.transfer_seq_;
+    ASSERT_TRUE(info.is_valid());
+    ObTabletHandle checked_tablet;
+    ASSERT_EQ(OB_SUCCESS, ObSSTransferBackfillUtils::get_and_check_source_tablet(ls, info, checked_tablet));
+    ASSERT_TRUE(checked_tablet.get_obj()->is_async_index_refresh_target());
+  }
+  auto check_marker = [&](const int64_t i, const bool expected) {
+    ObTabletHandle shared_tablet;
+    ASSERT_EQ(OB_SUCCESS, meta_svr->get_tablet(ls_id, tablet_ids.at(i),
+        tablet_infos[i].reorganization_scn_, allocator, shared_tablet));
+    EXPECT_EQ(expected, shared_tablet.get_obj()->get_tablet_meta().transfer_info_.is_transfer_upload_completed());
+  };
+  ASSERT_NO_FATAL_FAILURE(check_marker(0, false));
+  ASSERT_NO_FATAL_FAILURE(check_marker(1, false));
+  ObSSTransferBackfillTXCtx ctx;
+  ctx.backfill_type_ = ObSSTransferBackfillType::BACKFILL_UPLOAD;
+  ctx.src_ls_handle_ = ls_handle;
+  ASSERT_EQ(OB_SUCCESS, ctx.tablet_infos_.push_back(tablet_infos[0]));
+  ASSERT_EQ(OB_SUCCESS, ctx.tablet_infos_.push_back(tablet_infos[1]));
+  // A missing second source generation must not undo completion already persisted for the first one.
+  ctx.tablet_infos_.at(1).reorganization_scn_ = SCN::plus(tablet_infos[1].reorganization_scn_, 1);
+  ObSSFinishTransferBackfillDag dag;
+  ObSSFinishTransferBackfillTask task;
+  task.set_dag(dag);
+  ASSERT_EQ(OB_TABLET_NOT_EXIST, task.finish_upload_(ctx));
+  ASSERT_NO_FATAL_FAILURE(check_marker(0, true));
+  ASSERT_NO_FATAL_FAILURE(check_marker(1, false));
+  ctx.tablet_infos_.at(1).reorganization_scn_ = tablet_infos[1].reorganization_scn_;
+
+  // Keep ctx successful: cancellation itself must prevent a new persisted marker.
+  class CanceledUploadDagNet : public ObSSTransferBackfillDagNet
+  {
+  public:
+    int deal_with_cancel() override { return OB_SUCCESS; }
+  } canceled_net;
+  ASSERT_EQ(OB_SUCCESS, canceled_net.set_cancel());
+  dag.set_dag_net(canceled_net);
+  ASSERT_FALSE(ctx.is_failed());
+  ASSERT_EQ(OB_SUCCESS, task.finish_upload_(ctx));
+  ASSERT_NO_FATAL_FAILURE(check_marker(0, true));
+  ASSERT_NO_FATAL_FAILURE(check_marker(1, false));
+  dag.clear_dag_net();
+
+  // Pass the outer FREEZE check, then reject the lease inside update_tablet_meta.
+  check_lease_call_count = 0;
+  ddl_lease_reject_at = 2;
+  ASSERT_EQ(OB_NOT_MASTER, task.finish_upload_(ctx));
+  ASSERT_GE(check_lease_call_count, 2);
+  ASSERT_NO_FATAL_FAILURE(check_marker(0, true));
+  ASSERT_NO_FATAL_FAILURE(check_marker(1, false));
+  ddl_lease_reject_at = 0;
+  ASSERT_EQ(OB_SUCCESS, task.finish_upload_(ctx));
+  ASSERT_NO_FATAL_FAILURE(check_marker(0, true));
+  ASSERT_NO_FATAL_FAILURE(check_marker(1, true));
+  ASSERT_EQ(OB_SUCCESS, task.finish_upload_(ctx));
 }
 
 TEST_F(TestSharedMetaService, atomic_protocol_writer_qualification_follows_tenant_role)

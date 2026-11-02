@@ -33,7 +33,6 @@ public:
 private:
   int check_self_is_valid_sswriter_(bool &is_valid);
   int check_need_upload_(bool &need_upload);
-  int check_tablet_without_memtable_();
   int create_empty_mini_sstable_();
   int generate_inc_upload_task_();
   int schedule_replace_upload_();

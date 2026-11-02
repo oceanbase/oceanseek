@@ -228,6 +228,8 @@ public:
   virtual int process() override;
   VIRTUAL_TO_STRING_KV(K("ObSSFinishTransferBackfillTask"), KP(this));
 private:
+  int finish_upload_(ObSSTransferBackfillTXCtx &ctx);
+private:
   bool is_inited_;
   ObTransferBackfillTXBaseCtx *ha_dag_net_ctx_;
 private:

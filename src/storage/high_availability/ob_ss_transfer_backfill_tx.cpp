@@ -1059,7 +1059,7 @@ int ObSSTransferUploadMgr::get_need_upload_tablet_info_(
       } else if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("tablet should not be NULL", K(ret), K(tablet_handle), K(tablet_info));
-      } else if (tablet->get_tablet_meta().clog_checkpoint_scn_ >= tablet_info.backfill_scn_) {
+      } else if (tablet->get_tablet_meta().transfer_info_.is_transfer_upload_completed()) {
         need_upload = false;
       }
       if (OB_FAIL(ret)) {
