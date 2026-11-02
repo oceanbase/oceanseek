@@ -251,7 +251,8 @@ struct BoolClauseEffCounts
 
 static void populate_boolean_query_ctdef_layout_(ObDASBooleanQueryCtDef *ctdef,
                                                  int64_t &min_should_match,
-                                                 const BoolClauseEffCounts &eff)
+                                                 const BoolClauseEffCounts &eff,
+                                                 const bool has_merged_probe)
 {
   int64_t current_offset = 0;
   if (min_should_match > eff.should_) {
@@ -272,6 +273,10 @@ static void populate_boolean_query_ctdef_layout_(ObDASBooleanQueryCtDef *ctdef,
   }
   if (eff.must_not_ > 0) {
     ctdef->set_must_not(current_offset, eff.must_not_);
+    current_offset += eff.must_not_;
+  }
+  if (has_merged_probe) {
+    ctdef->set_merged_probe(current_offset);
   }
 }
 
@@ -354,7 +359,8 @@ static int setup_lt_boolean_query_ctdef_layout_(const ObLogTableScan &op,
       LOG_WARN("bool query has no positive clause after LT PK skip", KR(ret), K(eff));
     }
   } else {
-    populate_boolean_query_ctdef_layout_(ctdef, min_should_match, eff);
+    populate_boolean_query_ctdef_layout_(
+        ctdef, min_should_match, eff, OB_NOT_NULL(bn->merged_probe_scalar_node_));
   }
   return ret;
 }
@@ -1633,7 +1639,8 @@ int ObHybridSearchCgService::generate_ctdef(ObLogTableScan &op, const ObBooleanQ
       eff.should_ = boolean_query_node->should_nodes_.count();
       eff.filter_ = boolean_query_node->filter_nodes_.count();
       eff.must_not_ = boolean_query_node->must_not_nodes_.count();
-      populate_boolean_query_ctdef_layout_(new_boolean_query_ctdef, min_should_match, eff);
+      populate_boolean_query_ctdef_layout_(new_boolean_query_ctdef, min_should_match, eff,
+                                          OB_NOT_NULL(boolean_query_node->merged_probe_scalar_node_));
     }
   }
   if (OB_FAIL(ret)) {
