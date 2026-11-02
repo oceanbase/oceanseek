@@ -337,6 +337,16 @@ int ObDASScalarPrimaryROROp::fetch_probe_row(bool &found)
   if (OB_ISNULL(get_result_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected nullptr get result", K(ret));
+  } else if (get_pd_expr_op_.is_vectorized()) {
+    int64_t count = 0;
+    // The T_SINGLE_GET batch path resets shared vectors to uniform before projecting the probe row.
+    ret = get_result_->get_next_rows(count, 1 /* capacity */);
+    if (OB_SUCCESS == ret || OB_ITER_END == ret) {
+      ret = OB_SUCCESS;
+      found = count > 0;
+    } else {
+      LOG_WARN("failed to get next rows from point get result", K(ret));
+    }
   } else if (OB_FAIL(get_result_->get_next_row())) {
     if (OB_ITER_END == ret) {
       ret = OB_SUCCESS;
