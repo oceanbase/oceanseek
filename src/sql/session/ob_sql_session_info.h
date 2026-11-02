@@ -1309,9 +1309,11 @@ public:
     if (!need_retry) {
       audit_record_.reset();
     } else {
-      // memset without try_cnt_ and exec_timestamp_
+      // Preserve retry count and accumulated stage times.
       int64_t try_cnt = audit_record_.try_cnt_;
       ObExecTimestamp exec_timestamp = audit_record_.exec_timestamp_;
+      // The next attempt must record its own executor end timestamp.
+      exec_timestamp.executor_end_ts_ = 0;
       audit_record_.reset();
       audit_record_.try_cnt_ = try_cnt;
       audit_record_.exec_timestamp_ = exec_timestamp;

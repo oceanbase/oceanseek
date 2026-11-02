@@ -10,6 +10,7 @@
 #include "observer/ob_server.h"
 #include "sql/session/ob_basic_session_info.h"
 #include "sql/session/ob_sql_session_info.h"
+#include "sql/monitor/ob_exec_stat_collector.h"
 #include "share/system_variable/ob_system_variable_alias.h"
 #include "share/system_variable/ob_system_variable.h"
 #include "share/ob_errno.h"
@@ -25,6 +26,90 @@ namespace oceanbase
 {
 namespace sql
 {
+
+struct MockExecTimestampProcess : ObExecTimestamp
+{
+  int64_t get_send_timestamp() const { return rpc_send_ts_; }
+  int64_t get_receive_timestamp() const { return receive_ts_; }
+  int64_t get_enqueue_timestamp() const { return enter_queue_ts_; }
+  int64_t get_run_timestamp() const { return run_ts_; }
+  int64_t get_process_timestamp() const { return before_process_ts_; }
+  int64_t get_single_process_timestamp() const { return single_process_ts_; }
+  int64_t get_exec_start_timestamp() const { return process_executor_ts_; }
+  int64_t get_exec_end_timestamp() const { return executor_end_ts_; }
+};
+
+TEST(test_basic_session_info, retry_audit_exec_timestamp)
+{
+  int ret = OB_SUCCESS;
+  SMART_VAR(sql::ObSQLSessionInfo, session_info) {
+    ObAuditRecordData &audit_record = session_info.get_raw_audit_record();
+    MockExecTimestampProcess process;
+    process.rpc_send_ts_ = 10;
+    process.receive_ts_ = 20;
+    process.enter_queue_ts_ = 30;
+    process.run_ts_ = 40;
+    process.before_process_ts_ = 50;
+    process.single_process_ts_ = 60;
+    process.process_executor_ts_ = 1000;
+    process.executor_end_ts_ = 1100;
+    audit_record.try_cnt_ = 1;
+    ObExecStatUtils::record_exec_timestamp(process, true, audit_record.exec_timestamp_);
+    audit_record.exec_timestamp_.update_stage_time();
+    ASSERT_EQ(100, audit_record.exec_timestamp_.executor_t_);
+
+    session_info.reset_audit_record(true);
+    ASSERT_EQ(1, audit_record.try_cnt_);
+    ASSERT_EQ(100, audit_record.exec_timestamp_.executor_t_);
+    ASSERT_EQ(940, audit_record.exec_timestamp_.get_plan_t_);
+    ASSERT_EQ(0, audit_record.exec_timestamp_.executor_end_ts_);
+
+    ++audit_record.try_cnt_;
+    process.enter_queue_ts_ = 1130;
+    process.run_ts_ = 1140;
+    process.before_process_ts_ = 1150;
+    process.single_process_ts_ = 1160;
+    process.process_executor_ts_ = 2038;
+    process.executor_end_ts_ = 2138;
+    // Async response without a commit timestamp must use this attempt's end.
+    // Keeping the old end (1100) would produce accumulated EXECUTE_TIME = -838.
+    ObExecStatUtils::record_exec_timestamp(process, false, audit_record.exec_timestamp_, true);
+    audit_record.exec_timestamp_.update_stage_time();
+    ASSERT_EQ(2138, audit_record.exec_timestamp_.executor_end_ts_);
+    ASSERT_EQ(200, audit_record.exec_timestamp_.executor_t_);
+    ASSERT_EQ(1818, audit_record.exec_timestamp_.get_plan_t_);
+    ASSERT_EQ(2118, audit_record.exec_timestamp_.elapsed_t_);
+    ASSERT_EQ(20, audit_record.exec_timestamp_.queue_t_);
+    ASSERT_EQ(20, audit_record.exec_timestamp_.decode_t_);
+    ASSERT_EQ(10, audit_record.exec_timestamp_.net_t_);
+    ASSERT_EQ(10, audit_record.exec_timestamp_.net_wait_t_);
+
+    session_info.reset_audit_record(true);
+    ASSERT_EQ(2, audit_record.try_cnt_);
+    ASSERT_EQ(200, audit_record.exec_timestamp_.executor_t_);
+    ASSERT_EQ(0, audit_record.exec_timestamp_.executor_end_ts_);
+
+    ++audit_record.try_cnt_;
+    process.enter_queue_ts_ = 2170;
+    process.run_ts_ = 2180;
+    process.before_process_ts_ = 2190;
+    process.single_process_ts_ = 2200;
+    process.process_executor_ts_ = 2300;
+    process.executor_end_ts_ = 2500;
+    // Preserve the current attempt's end timestamp supplied by async commit.
+    audit_record.exec_timestamp_.executor_end_ts_ = 2400;
+    ObExecStatUtils::record_exec_timestamp(process, false, audit_record.exec_timestamp_, true);
+    audit_record.exec_timestamp_.update_stage_time();
+    ASSERT_EQ(2400, audit_record.exec_timestamp_.executor_end_ts_);
+    ASSERT_EQ(300, audit_record.exec_timestamp_.executor_t_);
+
+    session_info.reset_audit_record();
+    ASSERT_EQ(0, audit_record.try_cnt_);
+    ASSERT_EQ(0, audit_record.exec_timestamp_.executor_t_);
+    ASSERT_EQ(0, audit_record.exec_timestamp_.get_plan_t_);
+    ASSERT_EQ(0, audit_record.exec_timestamp_.executor_end_ts_);
+  }
+}
 
 TEST(test_basic_session_info, init_set_get)
 {
