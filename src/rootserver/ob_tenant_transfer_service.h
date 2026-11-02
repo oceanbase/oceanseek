@@ -117,10 +117,12 @@ private:
 
   int process_task_(
       const share::ObTransferTask::TaskStatus &task_stat,
-      bool &need_backoff);
+      bool &need_backoff,
+      int64_t &wait_remaining_us);
   int process_init_task_(
       const share::ObTransferTaskID task_id,
-      bool &need_backoff);
+      bool &need_backoff,
+      int64_t &wait_remaining_us);
   int check_ls_member_list_and_learner_list_(
       common::ObISQLClient &sql_proxy,
       const share::ObLSID &src_ls,
@@ -265,7 +267,8 @@ private:
   int check_if_need_wait_due_to_last_failure_(
       common::ObISQLClient &sql_proxy,
       const share::ObTransferTask &task,
-      bool &need_wait);
+      bool &need_wait,
+      int64_t &wait_remaining_us);
 #ifdef OB_BUILD_SHARED_STORAGE
   int lock_and_check_tenant_merge_status_(ObMySQLTransaction &trans, bool &need_wait);
 #endif

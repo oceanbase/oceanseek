@@ -90,6 +90,7 @@ void ObTenantTransferService::do_work()
         idle_time_us = IDLE_TIME_US;
         ObTransferTaskID current_failed_task_id;
         bool last_need_backoff = false;
+        int64_t last_wait_remaining_us = 0;
         ObCurTraceId::init(GCONF.self_addr_);
         ObArray<ObTransferTask::TaskStatus> task_status;
         if (OB_FAIL(check_tenant_schema_is_ready_(tenant_schema_is_ready))) {
@@ -117,11 +118,13 @@ void ObTenantTransferService::do_work()
             if (thread_idx == task_stat.get_task_id().id() % thread_count) {
               ++thread_task_count;
               bool need_backoff = false;
-              if (OB_FAIL(process_task_(task_stat, need_backoff))) {
+              int64_t wait_remaining_us = 0;
+              if (OB_FAIL(process_task_(task_stat, need_backoff, wait_remaining_us))) {
                 LOG_WARN("process task failed", KR(ret), K(task_stat), K(thread_idx));
                 current_failed_task_id = task_stat.get_task_id();
                 ret_fail = ret;
                 last_need_backoff = need_backoff;
+                last_wait_remaining_us = wait_remaining_us;
                 ret = OB_SUCCESS;
               }
             } else {
@@ -151,9 +154,15 @@ void ObTenantTransferService::do_work()
                 K(current_failed_task_id), K(last_failed_task_id), K(thread_idx), K(idle_time_us));
           }
         }
+        // WAIT_DUE_TO_LAST_FAILURE has a definite deadline (the remaining cooldown): the
+        // backoff may still grow exponentially, but it must not sleep past that deadline,
+        // otherwise the thread overshoots the cooldown and the self-healing wait is delayed.
+        if (last_wait_remaining_us > 0 && idle_time_us > last_wait_remaining_us) {
+          idle_time_us = last_wait_remaining_us;
+        }
         TTS_INFO("finish one round", KR(ret), K(all_tasks_count), K(thread_task_count), K(thread_idx),
             K(idle_time_us), K(current_failed_task_id), K(last_failed_task_id), K(retry_count),
-            K(last_need_backoff));
+            K(last_need_backoff), K(last_wait_remaining_us));
         idle(idle_time_us);
       }// end while
     }
@@ -195,13 +204,15 @@ int64_t ObTenantTransferService::get_transfer_config_retry_interval_()
 
 int ObTenantTransferService::process_task_(
     const ObTransferTask::TaskStatus &task_stat,
-    bool &need_backoff)
+    bool &need_backoff,
+    int64_t &wait_remaining_us)
 {
   int ret = OB_SUCCESS;
   ObTransferStatus status;
   ObTransferPartList all_part_list;
   ObTransferPartList finished_part_list;
   need_backoff = false;
+  wait_remaining_us = 0;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", KR(ret));
@@ -209,7 +220,7 @@ int ObTenantTransferService::process_task_(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid task_stat", KR(ret), K(task_stat));
   } else if (task_stat.get_status().is_init_status()) {
-    if (OB_FAIL(process_init_task_(task_stat.get_task_id(), need_backoff))) {
+    if (OB_FAIL(process_init_task_(task_stat.get_task_id(), need_backoff, wait_remaining_us))) {
       LOG_WARN("fail to process init task", KR(ret), K(task_stat));
     }
   } else if (task_stat.get_status().is_finish_status()) {
@@ -228,7 +239,8 @@ int ObTenantTransferService::process_task_(
 
 int ObTenantTransferService::process_init_task_(
     const ObTransferTaskID task_id,
-    bool &need_backoff)
+    bool &need_backoff,
+    int64_t &wait_remaining_us)
 {
   int ret = OB_SUCCESS;
   int tmp_ret = OB_SUCCESS;
@@ -244,6 +256,7 @@ int ObTenantTransferService::process_init_task_(
   bool need_wait = false;
   bool comment_not_updated = false;
   need_backoff = false;
+  wait_remaining_us = 0;
 
   const int64_t start_time = ObTimeUtil::current_time();
   TTS_INFO("start to process init task", K(task_id), K(start_time));
@@ -272,7 +285,7 @@ int ObTenantTransferService::process_init_task_(
     ret = OB_STATE_NOT_MATCH;
     LOG_WARN("task status is not init", KR(ret), K(task));
   } else if (FALSE_IT(ObCurTraceId::set(task.get_trace_id()))) {
-  } else if (OB_FAIL(check_if_need_wait_due_to_last_failure_(*sql_proxy_, task, need_wait))) {
+  } else if (OB_FAIL(check_if_need_wait_due_to_last_failure_(*sql_proxy_, task, need_wait, wait_remaining_us))) {
     LOG_WARN("check if need wait due to last failure failed", KR(ret), K(task), K(need_wait));
   } else if (need_wait) {
     result_comment = WAIT_DUE_TO_LAST_FAILURE;
@@ -399,10 +412,12 @@ int ObTenantTransferService::process_init_task_(
 int ObTenantTransferService::check_if_need_wait_due_to_last_failure_(
     common::ObISQLClient &sql_proxy,
     const ObTransferTask &task,
-    bool &need_wait)
+    bool &need_wait,
+    int64_t &wait_remaining_us)
 {
   int ret = OB_SUCCESS;
   need_wait = false;
+  wait_remaining_us = 0;
   ObTransferTask last_task;
   int64_t finish_time = OB_INVALID_TIMESTAMP;
   if (IS_NOT_INIT) {
@@ -435,6 +450,7 @@ int ObTenantTransferService::check_if_need_wait_due_to_last_failure_(
     } else if (ObTimeUtil::current_time() - finish_time < wait_interval) {
       if (last_task.get_status().is_failed_status()) { // last failed
         need_wait = true;
+        wait_remaining_us = wait_interval - (ObTimeUtil::current_time() - finish_time);
       }
     }
     if (need_wait) {

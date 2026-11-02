@@ -266,14 +266,15 @@ TEST_F(TestTenantTransferService, test_service)
   ASSERT_EQ(OB_SUCCESS, gen_mock_data(retry_task_id, ObTransferStatus(ObTransferStatus::INIT), retry_task));
   ASSERT_EQ(OB_SUCCESS, ObTransferTaskOperator::insert(inner_sql_proxy, g_tenant_id, retry_task));
   bool need_backoff = true;
-  ASSERT_EQ(OB_NEED_RETRY, tenant_transfer->process_init_task_(retry_task_id, need_backoff));
+  int64_t wait_remaining_us = 0;
+  ASSERT_EQ(OB_NEED_RETRY, tenant_transfer->process_init_task_(retry_task_id, need_backoff, wait_remaining_us));
   ASSERT_FALSE(need_backoff);
   ObTransferTask retry_task_after_process;
   ASSERT_EQ(OB_SUCCESS, ObTransferTaskOperator::get(inner_sql_proxy, g_tenant_id, retry_task_id, false, retry_task_after_process, 0/*group_id*/));
   ASSERT_TRUE(WAIT_DUE_TO_LAST_FAILURE == retry_task_after_process.get_comment() && retry_task_after_process.get_status().is_init_status());
   sleep(10); // 20s
   need_backoff = false;
-  ASSERT_EQ(OB_NEED_RETRY, tenant_transfer->process_init_task_(retry_task_id, need_backoff)); // _transfer_task_retry_interval effect
+  ASSERT_EQ(OB_NEED_RETRY, tenant_transfer->process_init_task_(retry_task_id, need_backoff, wait_remaining_us)); // _transfer_task_retry_interval effect
   ASSERT_TRUE(need_backoff);
   retry_task_after_process.reset();
   ASSERT_EQ(OB_SUCCESS, ObTransferTaskOperator::get(inner_sql_proxy, g_tenant_id, retry_task_id, false, retry_task_after_process, 0/*group_id*/));
@@ -281,11 +282,11 @@ TEST_F(TestTenantTransferService, test_service)
   sql.reset();
   ASSERT_EQ(OB_SUCCESS, sql.assign_fmt("alter system set _transfer_task_retry_interval = '0'"));
   ASSERT_EQ(OB_SUCCESS, inner_sql_proxy.write(g_tenant_id, sql.ptr(), affected_rows));
-  ASSERT_EQ(OB_SUCCESS, tenant_transfer->process_init_task_(retry_task_id, need_backoff));
+  ASSERT_EQ(OB_SUCCESS, tenant_transfer->process_init_task_(retry_task_id, need_backoff, wait_remaining_us));
   INNER_EXE_SQL(g_tenant_id, "update __all_transfer_task set status = 'FAILED' where task_id = 444");
   ObTransferTask::TaskStatus task_stat;
   ASSERT_EQ(OB_SUCCESS, task_stat.init(retry_task_id, ObTransferStatus(ObTransferStatus::FAILED)));
-  ASSERT_EQ(OB_SUCCESS, tenant_transfer->process_task_(task_stat, need_backoff));
+  ASSERT_EQ(OB_SUCCESS, tenant_transfer->process_task_(task_stat, need_backoff, wait_remaining_us));
 
   // test wait tenant major compaction
 #ifdef OB_BUILD_SHARED_STORAGE
@@ -296,7 +297,7 @@ TEST_F(TestTenantTransferService, test_service)
   ObTransferTaskID conflict_task_id(4444);
   ASSERT_EQ(OB_SUCCESS, gen_mock_data(conflict_task_id, ObTransferStatus(ObTransferStatus::INIT), conflict_compaction_task));
   ASSERT_EQ(OB_SUCCESS, ObTransferTaskOperator::insert(inner_sql_proxy, g_tenant_id, conflict_compaction_task));
-  ASSERT_EQ(OB_NEED_WAIT, tenant_transfer->process_init_task_(conflict_task_id, need_backoff));
+  ASSERT_EQ(OB_NEED_WAIT, tenant_transfer->process_init_task_(conflict_task_id, need_backoff, wait_remaining_us));
   ObTransferTask conflict_task_after_process;
   ASSERT_EQ(OB_SUCCESS, ObTransferTaskOperator::get(inner_sql_proxy, g_tenant_id, conflict_task_id, false, conflict_task_after_process, 0/*group_id*/));
   ASSERT_TRUE(WAIT_FOR_MAJOR_COMPACTION == conflict_task_after_process.get_comment() && conflict_task_after_process.get_status().is_init_status());
@@ -369,7 +370,8 @@ TEST_F(TestTenantTransferService, test_empty_list)
     }
   }
   bool need_backoff = false;
-  ASSERT_EQ(OB_ERR_UNEXPECTED, tenant_transfer->process_init_task_(task_id, need_backoff));
+  int64_t wait_remaining_us = 0;
+  ASSERT_EQ(OB_ERR_UNEXPECTED, tenant_transfer->process_init_task_(task_id, need_backoff, wait_remaining_us));
 }
 
 void TestTenantTransferService::create_hidden_table()
