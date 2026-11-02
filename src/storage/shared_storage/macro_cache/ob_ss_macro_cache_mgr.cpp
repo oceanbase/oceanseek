@@ -347,22 +347,29 @@ void ObSSMacroCacheModifyCacheTypeCallback::operator()(const SSMacroCacheMetaMap
     // do nothing
   } else if (ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK == new_cache_type_ && meta_ptr->get_macro_id().is_shared_tablet_sub_meta()) {
     // do nothing, shared sub meta is always treated as ObSSMacroCacheType::MACRO_BLOCK
-  } else if (OB_FAIL(macro_cache_mgr_.shift_lru_list(ori_cache_type_, new_cache_type_, *meta_ptr))) {
-    LOG_WARN("fail to shift lru list", KR(ret), KPC(meta_ptr),
-             K_SS_MACRO_CACHE_TYPE(ori_cache_type_), K_SS_MACRO_CACHE_TYPE(new_cache_type_));
-  } else if (OB_FAIL(tnt_disk_space_mgr->shift_file_size(ori_cache_type_, new_cache_type_, meta_ptr->get_size()))) {
-    LOG_WARN("fail to shift file size", KR(ret), KPC(meta_ptr),
-             K_SS_MACRO_CACHE_TYPE(ori_cache_type_), K_SS_MACRO_CACHE_TYPE(new_cache_type_));
   } else {
-    // 只有真实完成 AUTO->HOT 转换时，才将 cache owner 更新为触发本次预热的 HOT tablet。
-    // 已经是 HOT 的并发或重复任务不会进入该分支，避免 effective_tablet_id 无意义抖动。
-    if (modify_param_.update_effective_tablet_id_
-        && ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK == new_cache_type_) {
-      meta_ptr->set_effective_tablet_id(modify_param_.effective_tablet_id_);
+    // Publish before changing meta: scanning uses its type before accounting is updated.
+    macro_cache_mgr_.begin_cache_type_change_();
+    if (OB_FAIL(macro_cache_mgr_.shift_lru_list(ori_cache_type_, new_cache_type_, *meta_ptr))) {
+      LOG_WARN("fail to shift lru list", KR(ret), KPC(meta_ptr),
+          K_SS_MACRO_CACHE_TYPE(ori_cache_type_), K_SS_MACRO_CACHE_TYPE(new_cache_type_));
+    } else if (OB_FAIL(tnt_disk_space_mgr->shift_file_size(
+        ori_cache_type_, new_cache_type_, meta_ptr->get_size()))) {
+      LOG_WARN("fail to shift file size", KR(ret), KPC(meta_ptr),
+          K_SS_MACRO_CACHE_TYPE(ori_cache_type_), K_SS_MACRO_CACHE_TYPE(new_cache_type_));
+    } else {
+      // Only a real AUTO-to-HOT conversion transfers cache ownership to the requesting tablet.
+      if (modify_param_.update_effective_tablet_id_
+          && ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK == new_cache_type_) {
+        meta_ptr->set_effective_tablet_id(modify_param_.effective_tablet_id_);
+      }
+      if (modify_param_.touch_cache_) {
+        meta_ptr->set_last_access_time_us(ObTimeUtility::current_time_us());
+      }
     }
-    if (modify_param_.touch_cache_) {
-      meta_ptr->set_last_access_time_us(ObTimeUtility::current_time_us());
-    }
+    // Also invalidate scans on failure, since the preceding operation may have
+    // partially changed meta.
+    macro_cache_mgr_.end_cache_type_change_();
   }
   ret_ = ret;
 }
@@ -493,7 +500,9 @@ void ObSSMacroCacheTabletStat::merge_cached_space(const ObSSMacroCacheQueueSpace
 ObSSMacroCacheMgr::ObSSMacroCacheMgr()
   : is_inited_(false), is_stopped_(false), is_ckpt_replayed_(false), clear_flag_(), fg_evict_trigger_(false),
     tenant_id_(OB_INVALID_TENANT_ID), high_tg_id_(INVALID_TG_ID), low_tg_id_(INVALID_TG_ID),
-    write_cache_size_(0), flying_req_cnt_(0), macro_meta_cnt_(0), macro_meta_allocator_(), meta_map_(),
+    write_cache_size_(0), flying_req_cnt_(0),
+    cache_type_change_epoch_(0), cache_type_change_inflight_(0),
+    macro_meta_cnt_(0), macro_meta_allocator_(), meta_map_(),
     macro_cache_lock_(), flush_map_(false/*use_promise*/), flush_task_(*this, is_stopped_),
     write_cache_flush_map_(true/*use_promise*/), write_cache_flush_task_(*this, is_stopped_),
     evict_task_(is_stopped_), expire_task_(is_stopped_), hot_tablet_macro_cache_gc_task_(is_stopped_),
@@ -733,6 +742,8 @@ void ObSSMacroCacheMgr::destroy()
   external_table_cache_stat_.reset();
   macro_meta_cnt_ = 0;
   flying_req_cnt_ = 0;
+  ATOMIC_STORE(&cache_type_change_epoch_, 0);
+  ATOMIC_STORE(&cache_type_change_inflight_, 0);
   write_cache_size_ = 0;
   tenant_id_ = OB_INVALID_TENANT_ID;
   fg_evict_trigger_ = false;

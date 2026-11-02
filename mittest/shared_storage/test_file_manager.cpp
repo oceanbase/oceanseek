@@ -10,6 +10,8 @@
 #define protected public
 #define private public
 #include "lib/utility/ob_test_util.h"
+#include "lib/literals/ob_literals.h"
+#include "lib/utility/utility.h"
 #include "mittest/mtlenv/mock_tenant_module_env.h"
 #include "share/ob_ss_file_util.h"
 #include "storage/shared_storage/ob_ss_format_util.h"
@@ -166,6 +168,7 @@ public:
   void get_ls_id_dir_size(const int64_t ls_id,
                           const int64_t ls_epoch_id,
                           int64_t &dir_size);
+  int prepare_calibration_macro(const uint64_t tablet_id, MacroBlockId &macro_id);
   int write_fail_and_clean_tmp_seq_file(
       const uint64_t tablet_id,
       const ObSSMacroCacheType expected_cache_type,
@@ -4752,6 +4755,625 @@ TEST_F(TestFileManager, test_dir_create_time_and_meta_write_impact)
       MTL_ID(), MTL_EPOCH_ID(), ls_id, ls_epoch_id, tablet_id, reorganization_scn));
   ASSERT_EQ(OB_SUCCESS, OB_DIR_MGR.delete_tablet_meta_tablet_id_dir(
       MTL_ID(), MTL_EPOCH_ID(), ls_id, ls_epoch_id, tablet_id));
+}
+
+// ============================================================================
+// 宏块分类迁移校准回归（7 个用例）
+// A. 快照与提交：旧快照、扫描后迁移；
+// B. 扫描并发：双向迁移、持续迁移及扫描中取消；
+// C. 重试与退出：在途耗尽、跨秒重试、取消/未初始化；
+// D. 转换回调：失败计数归零。
+// ============================================================================
+
+int TestFileManager::prepare_calibration_macro(const uint64_t tablet_id, MacroBlockId &macro_id)
+{
+  int ret = OB_SUCCESS;
+  macro_id.reset();
+  constexpr int64_t WRITE_SIZE = 8_KB;
+  char buffer[WRITE_SIZE] = {0};
+  MEMSET(buffer, 'c', WRITE_SIZE);
+  ObStorageCachePolicyService *policy = MTL(ObStorageCachePolicyService *);
+  ObSSMacroCacheMgr *mgr = MTL(ObSSMacroCacheMgr *);
+  char scatter_dir[common::MAX_PATH_SIZE] = {0};
+  ObStorageObjectHandle handle;
+  ObStorageObjectWriteInfo info;
+  if (OB_ISNULL(policy) || OB_ISNULL(mgr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("fail to get calibration test modules", KR(ret), KP(policy), KP(mgr));
+  } else if (OB_FAIL(OB_DIR_MGR.get_local_tablet_data_scatter_dir(
+      scatter_dir, sizeof(scatter_dir), MTL_ID(), MTL_EPOCH_ID(), tablet_id))) {
+    LOG_WARN("fail to get calibration test directory", KR(ret), K(tablet_id));
+  } else if (OB_FAIL(ObDirManager::create_dir(scatter_dir, ObStorageObjectType::PRIVATE_DATA_MACRO))
+      && OB_FILE_OR_DIRECTORY_EXIST != ret) {
+    LOG_WARN("fail to create calibration test directory", KR(ret), K(scatter_dir));
+  } else {
+    ret = OB_SUCCESS;
+    macro_id.set_storage_object_type(
+        static_cast<uint64_t>(ObStorageObjectType::PRIVATE_DATA_MACRO));
+    macro_id.set_second_id(tablet_id);
+    macro_id.set_reorganization_scn(0 /*reorganization_scn*/);
+    macro_id.set_tenant_seq(71001 /*tenant_seq*/);
+    info.buffer_ = buffer;
+    info.size_ = WRITE_SIZE;
+    info.offset_ = 0;
+    info.io_desc_.set_wait_event(ObWaitEventIds::DB_FILE_COMPACT_WRITE);
+    info.io_timeout_ms_ = DEFAULT_IO_WAIT_TIME_MS;
+    info.mtl_tenant_id_ = MTL_ID();
+    info.write_strategy_ = ObStorageObjectWriteStrategy::WRITE_BACK;
+    if (OB_FAIL(policy->update_tablet_status(tablet_id, PolicyStatus::HOT, 200001 /*table_id*/))) {
+      LOG_WARN("fail to set calibration test policy", KR(ret), K(tablet_id));
+    } else if (OB_FAIL(handle.set_macro_block_id(macro_id))) {
+      LOG_WARN("fail to set calibration test macro id", KR(ret), K(macro_id));
+    } else if (OB_FAIL(ObSSObjectAccessUtil::write_file(info, handle))) {
+      LOG_WARN("fail to write calibration test macro", KR(ret), K(macro_id));
+    }
+  }
+  LOG_INFO("prepared calibration test macro", KR(ret), K(macro_id), K(WRITE_SIZE));
+  return ret;
+}
+
+// 普通/强制校准均刷新 META 阶段以前的旧快照，
+// 不重复叠加已完成的 HOT->AUTO 迁移。
+// 场景：先取 HOT 初始用量，再转 AUTO；
+// 操作：携带旧快照调用完整宏块校准。
+// 校验：结果等于当前稳定目录扫描值，limiter 与分类统计一致；
+// 无效转换不推进 epoch。
+TEST_F(TestFileManager, test_macro_calibration_refreshes_stale_snapshot)
+{
+  LOG_INFO("========== macro calibration stale snapshot begin ==========");
+  ObTenantFileManager *files = MTL(ObTenantFileManager *);
+  ObSSMacroCacheMgr *mgr = MTL(ObSSMacroCacheMgr *);
+  ObTenantDiskSpaceManager *disk = MTL(ObTenantDiskSpaceManager *);
+  ASSERT_NE(nullptr, files);
+  ASSERT_NE(nullptr, mgr);
+  ASSERT_NE(nullptr, disk);
+  ObCalibrateDiskSpaceTask &task = files->calibrate_disk_space_task_;
+  task.stop();
+  task.wait();
+  task.is_stop_ = false;
+  const uint64_t saved_run_cnt = task.run_cnt_;
+  const bool saved_mandatory = task.is_mandatory_calibrate_;
+  for (int mode = 0; mode < 2; ++mode) {
+    // 构造已记账的 HOT 文件，并保留迁移前的初始快照。
+    MacroBlockId macro_id;
+    OK(prepare_calibration_macro(204001 + mode /*tablet_id*/, macro_id));
+    ObFileStatInfo meta, tmp, stale_macro, stale_hot;
+    OK(task.get_macro_cache_used_size(meta, tmp, stale_macro, stale_hot));
+    const int64_t epoch = mgr->get_cache_type_change_epoch();
+    OK(mgr->modify_macro_cache_type(
+        macro_id, ObSSMacroCacheType::MACRO_BLOCK, ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK));
+    ASSERT_EQ(epoch, mgr->get_cache_type_change_epoch());
+    OK(mgr->modify_macro_cache_type(
+        macro_id, ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, ObSSMacroCacheType::MACRO_BLOCK));
+    ASSERT_EQ(epoch + 1, mgr->get_cache_type_change_epoch());
+    ASSERT_EQ(0, mgr->get_cache_type_change_inflight());
+
+    // 当前稳定扫描作为基准；
+    // 旧实现会在此基础上再次给普通块加上迁移量。
+    files->set_pause_gc();
+    ObFileStatInfo initial;
+    int64_t hot_initial = 0;
+    ObCalibrateDiskSpaceResult scan;
+    const int scan_ret = task.calc_macro_block_disk_space_with_retry_(initial, hot_initial, scan);
+    int64_t dir_correction = 0;
+    const int dir_ret = scan.get_dir_calibrate_size(initial.dir_num_, dir_correction);
+    const int64_t expected_macro = ((0 == mode)
+        ? scan.total_file_size_ + dir_correction
+        : scan.total_file_size_ - scan.total_dir_size_
+            + scan.total_dir_num_ * ObDirManager::DEFAULT_DIR_SIZE);
+    const int64_t expected_hot = scan.hot_tablet_total_used_size_;
+    task.run_cnt_ = ((0 == mode) ? 2 : 1);
+    task.is_mandatory_calibrate_ = false;
+    const int cal_ret = task.calibrate_macro_cache_used_size(ObSSMacroCacheType::MACRO_BLOCK,
+        ObTimeUtility::current_time_s() + 1 /*start_calc_size_time_s*/,
+        stale_macro, stale_hot.total_size_);
+    task.run_cnt_ = saved_run_cnt;
+    task.is_mandatory_calibrate_ = saved_mandatory;
+    ObSSMacroCacheStat macro_stat, hot_stat;
+    const int macro_ret = disk->get_macro_cache_stat(ObSSMacroCacheType::MACRO_BLOCK, macro_stat);
+    const int hot_ret = disk->get_macro_cache_stat(
+        ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, hot_stat);
+    const int64_t used_delta = disk->get_used_size_delta_nolock_();
+    files->set_allow_gc();
+    const int delete_ret = ObSSObjectAccessUtil::delete_local_file(macro_id);
+    LOG_INFO("verify stale snapshot calibration", K(mode), K(stale_macro), K(stale_hot),
+        K(expected_macro), K(expected_hot), K(macro_stat), K(hot_stat), KR(scan_ret), KR(cal_ret));
+    OK(scan_ret);
+    OK(dir_ret);
+    OK(cal_ret);
+    OK(macro_ret);
+    OK(hot_ret);
+    ASSERT_EQ(expected_macro, macro_stat.used_);
+    ASSERT_EQ(expected_hot, hot_stat.used_);
+    ASSERT_EQ(0, used_delta);
+    OK(delete_ret);
+  }
+  files->set_allow_gc();
+  task.run_cnt_ = saved_run_cnt;
+  task.is_mandatory_calibrate_ = saved_mandatory;
+  LOG_INFO("========== macro calibration stale snapshot end ==========");
+}
+
+// 扫描前后发生双向迁移会重扫；持续迁移耗尽或扫描中取消时清空结果。
+// 操作：四种方向/时机组合首轮转换、次轮放行；
+// 再分别注入三轮转换和扫描后的停止请求。
+// 校验：成功场景与独立稳定扫描一致；
+// 耗尽/取消场景无残留结果，epoch/inflight 正常。
+TEST_F(TestFileManager, test_macro_calibration_retry_on_cache_type_change)
+{
+  LOG_INFO("========== macro calibration concurrent conversion begin ==========");
+  ObTenantFileManager *files = MTL(ObTenantFileManager *);
+  ObSSMacroCacheMgr *mgr = MTL(ObSSMacroCacheMgr *);
+  ASSERT_NE(nullptr, files);
+  ASSERT_NE(nullptr, mgr);
+  ObCalibrateDiskSpaceTask &task = files->calibrate_disk_space_task_;
+  task.stop();
+  task.wait();
+  task.is_stop_ = false;
+  const uint64_t tenant_id = MTL_ID();
+  const char *points[] = {"BEFORE_MACRO_BLOCK_CALIBRATE_SCAN", "AFTER_MACRO_BLOCK_CALIBRATE_SCAN"};
+  for (int scenario = 0; scenario < 6; ++scenario) {
+    const bool exhaust_retries = (4 == scenario);
+    const bool cancel_scan = (5 == scenario);
+    const int stage = ((exhaust_retries || cancel_scan) ? 1 : scenario / 2);
+    const bool starts_hot = (0 == scenario % 2);
+    const int attempt_count = ((cancel_scan) ? 1 : ((exhaust_retries) ? 3 : 2));
+    MacroBlockId macro_id;
+    OK(prepare_calibration_macro(204011 + scenario /*tablet_id*/, macro_id));
+    const ObSSMacroCacheType original_type = ((starts_hot)
+        ? ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK : ObSSMacroCacheType::MACRO_BLOCK);
+    const ObSSMacroCacheType target_type = ((starts_hot)
+        ? ObSSMacroCacheType::MACRO_BLOCK : ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK);
+    if (!starts_hot) {
+      OK(mgr->modify_macro_cache_type(macro_id,
+          ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, ObSSMacroCacheType::MACRO_BLOCK));
+    }
+    common::ObMalloc allocator;
+    common::ObDSSessionActions point_actions, control_actions;
+    OK(point_actions.init(1024 /*page_size*/, allocator));
+    OK(control_actions.init(1024 /*page_size*/, allocator));
+    OK(GDS.add_debug_sync("reset", false /*is_global*/, control_actions));
+    char action[256] = {0};
+    OK(databuff_printf(action, sizeof(action),
+        "%s signal macro_scan_ready wait_for macro_scan_continue timeout 10000000 execute %d",
+        points[stage], attempt_count));
+    OK(GDS.add_debug_sync(action, false /*is_global*/, point_actions));
+    OK(GDS.set_thread_local_actions(point_actions));
+    const int64_t saved_timeout = GCONF.debug_sync_timeout;
+    GCONF.debug_sync_timeout = 10_s;
+    files->set_pause_gc();
+    const int64_t epoch_before = mgr->get_cache_type_change_epoch();
+    std::atomic<int> worker_ret(OB_SUCCESS);
+    std::thread converter([&]() {
+      int ret = OB_SUCCESS;
+      share::ObTenantSwitchGuard tenant_guard;
+      if (OB_FAIL(tenant_guard.switch_to(tenant_id))) {
+        LOG_WARN("fail to switch calibration test tenant", KR(ret), K(tenant_id));
+      }
+      for (int attempt = 0; OB_SUCC(ret) && attempt < attempt_count; ++attempt) {
+        ObTimePiece wait_piece;
+        if (OB_FAIL(GDS.add_debug_sync("now wait_for macro_scan_ready timeout 10000000",
+            false /*is_global*/, control_actions))) {
+          LOG_WARN("fail to wait for macro calibration scan", KR(ret), K(stage), K(attempt));
+        } else if (wait_piece.fly_us() >= 9_s) {
+          // DEBUG_SYNC 等待超时也返回成功；
+          // 必须排除等满超时后才执行转换的情况。
+          ret = OB_TIMEOUT;
+          LOG_WARN("macro calibration test did not receive scan signal in time",
+              KR(ret), K(scenario), K(attempt), K(wait_piece));
+        } else if (cancel_scan) {
+          task.stop();
+        } else if (0 == attempt || exhaust_retries) {
+          const bool reverse = (exhaust_retries && 1 == attempt % 2);
+          const ObSSMacroCacheType source = ((reverse) ? target_type : original_type);
+          const ObSSMacroCacheType target = ((reverse) ? original_type : target_type);
+          if (OB_FAIL(mgr->modify_macro_cache_type(macro_id, source, target))) {
+            LOG_WARN("fail to convert calibration test macro", KR(ret), K(macro_id), K(attempt));
+          }
+        }
+        int tmp_ret = OB_SUCCESS;
+        if (OB_TMP_FAIL(GDS.add_debug_sync(
+            "now signal macro_scan_continue", false /*is_global*/, control_actions))) {
+          LOG_WARN("fail to resume macro calibration scan", KR(tmp_ret), KR(ret));
+          ret = ((OB_SUCCESS == ret) ? tmp_ret : ret);
+        }
+      }
+      worker_ret.store(ret);
+    });
+    ObFileStatInfo initial;
+    initial.total_size_ = 1;
+    int64_t hot_initial = 1;
+    ObCalibrateDiskSpaceResult scan;
+    scan.total_file_size_ = scan.hot_tablet_total_used_size_ = 1;
+    const int scan_ret = task.calc_macro_block_disk_space_with_retry_(initial, hot_initial, scan);
+    converter.join();
+    const common::ObDSActionArray *actions = GDS.thread_local_actions();
+    const bool consumed = OB_NOT_NULL(actions) && !actions->is_active(
+        ((0 == stage) ? BEFORE_MACRO_BLOCK_CALIBRATE_SCAN : AFTER_MACRO_BLOCK_CALIBRATE_SCAN));
+    point_actions.reset();
+    const int clear_ret = GDS.set_thread_local_actions(point_actions);
+    const int reset_ret = GDS.add_debug_sync("reset", false /*is_global*/, control_actions);
+    GCONF.debug_sync_timeout = saved_timeout;
+    task.is_stop_ = false;
+    ObFileStatInfo stable_initial;
+    int64_t stable_hot_initial = 0;
+    ObCalibrateDiskSpaceResult stable_scan;
+    const int stable_ret = task.calc_macro_block_disk_space_with_retry_(
+        stable_initial, stable_hot_initial, stable_scan);
+    files->set_allow_gc();
+    const int delete_ret = ObSSObjectAccessUtil::delete_local_file(macro_id);
+    const int worker_result = worker_ret.load();
+    LOG_INFO("verify conversion scan retry", KR(scan_ret), K(scenario), K(stage), K(consumed),
+        KR(worker_result), KR(clear_ret), KR(reset_ret), KR(delete_ret), KR(stable_ret),
+        K(initial), K(hot_initial), K(scan), K(stable_scan));
+    if (exhaust_retries || cancel_scan) {
+      ASSERT_EQ(((cancel_scan) ? OB_CANCELED : OB_EAGAIN), scan_ret);
+      ASSERT_EQ(0, initial.total_size_);
+      ASSERT_EQ(0, hot_initial);
+      ASSERT_EQ(0, scan.total_file_size_);
+      ASSERT_EQ(0, scan.hot_tablet_total_used_size_);
+    } else {
+      OK(scan_ret);
+      ASSERT_EQ(stable_scan.total_file_size_, scan.total_file_size_);
+      ASSERT_EQ(stable_scan.hot_tablet_total_used_size_, scan.hot_tablet_total_used_size_);
+      ASSERT_EQ(stable_scan.total_dir_size_, scan.total_dir_size_);
+      ASSERT_EQ(stable_scan.total_dir_num_, scan.total_dir_num_);
+    }
+    OK(worker_result);
+    OK(clear_ret);
+    OK(reset_ret);
+    OK(stable_ret);
+    OK(delete_ret);
+    ASSERT_TRUE(consumed);
+    const int64_t epoch_delta = ((cancel_scan) ? 0 : ((exhaust_retries) ? 3 : 1));
+    ASSERT_EQ(epoch_before + epoch_delta, mgr->get_cache_type_change_epoch());
+    ASSERT_EQ(0, mgr->get_cache_type_change_inflight());
+    ASSERT_EQ(scan.hot_tablet_total_used_size_, hot_initial);
+  }
+  LOG_INFO("========== macro calibration concurrent conversion end ==========");
+}
+
+// 在途迁移使三次尝试均失败时，不提交任何分类用量，
+// 也不返回上一轮残留结果。
+// 操作：模拟持续在途转换，调用宏块校准；解除在途状态后重新扫描。
+// 校验：先返回 OB_EAGAIN、用量不变；后续稳定扫描可成功。
+TEST_F(TestFileManager, test_macro_calibration_retry_exhausted_by_inflight)
+{
+  LOG_INFO("========== macro calibration inflight retry begin ==========");
+  ObTenantFileManager *files = MTL(ObTenantFileManager *);
+  ObSSMacroCacheMgr *mgr = MTL(ObSSMacroCacheMgr *);
+  ObTenantDiskSpaceManager *disk = MTL(ObTenantDiskSpaceManager *);
+  ASSERT_NE(nullptr, files);
+  ASSERT_NE(nullptr, mgr);
+  ASSERT_NE(nullptr, disk);
+  ObCalibrateDiskSpaceTask &task = files->calibrate_disk_space_task_;
+  task.stop();
+  task.wait();
+  task.is_stop_ = false;
+  ObFileStatInfo meta, tmp, macro, hot;
+  OK(task.get_macro_cache_used_size(meta, tmp, macro, hot));
+  const int64_t epoch = mgr->get_cache_type_change_epoch();
+  ATOMIC_INC(&mgr->cache_type_change_inflight_);
+  // 预置旧结果，直接验证在途重试耗尽会清空全部出参。
+  ObFileStatInfo rejected_initial;
+  rejected_initial.total_size_ = 1;
+  rejected_initial.dir_size_ = 1;
+  rejected_initial.dir_num_ = 1;
+  int64_t rejected_hot_initial = 1;
+  ObCalibrateDiskSpaceResult rejected_scan;
+  rejected_scan.total_file_size_ = 1;
+  rejected_scan.hot_tablet_total_used_size_ = 1;
+  const int rejected_ret = task.calc_macro_block_disk_space_with_retry_(
+      rejected_initial, rejected_hot_initial, rejected_scan);
+  const int cal_ret = task.calibrate_macro_cache_used_size(ObSSMacroCacheType::MACRO_BLOCK,
+      ObTimeUtility::current_time_s() + 1 /*start_calc_size_time_s*/, macro, hot.total_size_);
+  ATOMIC_DEC(&mgr->cache_type_change_inflight_);
+  ObSSMacroCacheStat macro_after, hot_after;
+  OK(disk->get_macro_cache_stat(ObSSMacroCacheType::MACRO_BLOCK, macro_after));
+  OK(disk->get_macro_cache_stat(ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, hot_after));
+  LOG_INFO("verify inflight calibration did not commit", KR(cal_ret), K(macro), K(hot),
+      K(macro_after), K(hot_after));
+  ASSERT_EQ(OB_EAGAIN, cal_ret);
+  ASSERT_EQ(OB_EAGAIN, rejected_ret);
+  ASSERT_EQ(0, rejected_initial.total_size_);
+  ASSERT_EQ(0, rejected_initial.dir_size_);
+  ASSERT_EQ(0, rejected_initial.dir_num_);
+  ASSERT_EQ(0, rejected_hot_initial);
+  ASSERT_EQ(0, rejected_scan.total_file_size_);
+  ASSERT_EQ(0, rejected_scan.hot_tablet_total_used_size_);
+  ASSERT_EQ(macro.total_size_, macro_after.used_);
+  ASSERT_EQ(hot.total_size_, hot_after.used_);
+  ASSERT_EQ(epoch, mgr->get_cache_type_change_epoch());
+  ObFileStatInfo initial;
+  int64_t hot_initial = 0;
+  ObCalibrateDiskSpaceResult scan;
+  OK(task.calc_macro_block_disk_space_with_retry_(initial, hot_initial, scan));
+  ASSERT_EQ(0, mgr->get_cache_type_change_inflight());
+  LOG_INFO("========== macro calibration inflight retry end ==========", K(initial), K(scan));
+}
+
+// 稳定扫描结束后的双向转换只由增量补偿一次，
+// 普通/强制提交均保持分类及 limiter 一致。
+// 场景：扫描一个真实宏块后再转换类型；
+// 操作：直接使用已验证的快照和扫描值提交校准。
+// 校验：四种方向/提交组合均与迁移后的稳定扫描一致，
+// 校准不引入 used_size_delta。
+TEST_F(TestFileManager, test_macro_calibration_conversion_after_stable_scan)
+{
+  LOG_INFO("========== macro calibration post-scan conversion begin ==========");
+  ObTenantFileManager *files = MTL(ObTenantFileManager *);
+  ObSSMacroCacheMgr *mgr = MTL(ObSSMacroCacheMgr *);
+  ObTenantDiskSpaceManager *disk = MTL(ObTenantDiskSpaceManager *);
+  ASSERT_NE(nullptr, files);
+  ASSERT_NE(nullptr, mgr);
+  ASSERT_NE(nullptr, disk);
+  ObCalibrateDiskSpaceTask &task = files->calibrate_disk_space_task_;
+  task.stop();
+  task.wait();
+  task.is_stop_ = false;
+  for (int scenario = 0; scenario < 4; ++scenario) {
+    // 构造真实文件，并在扫描完成以后才执行转换，
+    // 验证已有增量补偿的适用边界。
+    MacroBlockId macro_id;
+    OK(prepare_calibration_macro(204021 + scenario /*tablet_id*/, macro_id));
+    const bool starts_hot = (0 == scenario % 2);
+    const bool force = (scenario >= 2);
+    if (!starts_hot) {
+      OK(mgr->modify_macro_cache_type(macro_id,
+          ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, ObSSMacroCacheType::MACRO_BLOCK));
+    }
+    files->set_pause_gc();
+    const int64_t delta_before = disk->get_used_size_delta_nolock_();
+    ObFileStatInfo initial;
+    int64_t initial_hot = 0;
+    ObCalibrateDiskSpaceResult scan;
+    const int scan_ret = task.calc_macro_block_disk_space_with_retry_(initial, initial_hot, scan);
+    const ObSSMacroCacheType source = ((starts_hot)
+        ? ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK : ObSSMacroCacheType::MACRO_BLOCK);
+    const ObSSMacroCacheType target = ((starts_hot)
+        ? ObSSMacroCacheType::MACRO_BLOCK : ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK);
+    const int64_t epoch_before = mgr->get_cache_type_change_epoch();
+    const int convert_ret = mgr->modify_macro_cache_type(macro_id, source, target);
+    int cal_ret = scan_ret;
+    if (OB_SUCCESS == scan_ret && OB_SUCCESS == convert_ret) {
+      cal_ret = ((force)
+          ? task.calibrate_macro_cache_used_size_forcely(
+              ObSSMacroCacheType::MACRO_BLOCK, initial, initial_hot, scan)
+          : task.calibrate_macro_cache_used_size_normally(
+              ObSSMacroCacheType::MACRO_BLOCK, initial, initial_hot, scan));
+    }
+
+    // 提交后重新扫描作独立基准；先恢复 GC、清理文件，再统一断言。
+    ObFileStatInfo stable_initial;
+    int64_t stable_hot = 0;
+    ObCalibrateDiskSpaceResult stable_scan;
+    const int stable_ret = task.calc_macro_block_disk_space_with_retry_(
+        stable_initial, stable_hot, stable_scan);
+    int64_t dir_correction = 0;
+    const int dir_ret = stable_scan.get_dir_calibrate_size(initial.dir_num_, dir_correction);
+    const int64_t expected_macro = ((force)
+        ? stable_scan.total_file_size_ - stable_scan.total_dir_size_
+            + stable_scan.total_dir_num_ * ObDirManager::DEFAULT_DIR_SIZE
+        : stable_scan.total_file_size_ + dir_correction);
+    ObSSMacroCacheStat macro_stat, hot_stat;
+    const int macro_ret = disk->get_macro_cache_stat(ObSSMacroCacheType::MACRO_BLOCK, macro_stat);
+    const int hot_ret = disk->get_macro_cache_stat(
+        ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, hot_stat);
+    const int64_t delta_after = disk->get_used_size_delta_nolock_();
+    files->set_allow_gc();
+    const int delete_ret = ObSSObjectAccessUtil::delete_local_file(macro_id);
+    LOG_INFO("verify post-scan conversion calibration", K(scenario), K(force),
+        KR(scan_ret), KR(convert_ret), KR(cal_ret), KR(stable_ret), KR(dir_ret),
+        K(expected_macro), K(macro_stat), K(hot_stat), K(stable_scan),
+        K(delta_before), K(delta_after));
+    OK(scan_ret);
+    OK(convert_ret);
+    OK(cal_ret);
+    OK(stable_ret);
+    OK(dir_ret);
+    OK(macro_ret);
+    OK(hot_ret);
+    OK(delete_ret);
+    ASSERT_EQ(expected_macro, macro_stat.used_);
+    ASSERT_EQ(stable_scan.hot_tablet_total_used_size_, hot_stat.used_);
+    ASSERT_EQ(delta_before, delta_after);
+    ASSERT_EQ(epoch_before + 1, mgr->get_cache_type_change_epoch());
+  }
+  LOG_INFO("========== macro calibration post-scan conversion end ==========");
+}
+
+// 时间准备跨秒时可重试；耗尽后不提交分类记账。
+// 场景：在初值读取后等待跨秒，消耗时间准备尝试。
+// 操作：先仅延迟前三次检查，再持续延迟所有检查。
+// 校验：恢复场景成功；耗尽返回 EAGAIN，记账不变。
+// 时间选择可能提前失败，因此不要求同步点固定命中次数。
+TEST_F(TestFileManager, test_macro_calibration_time_snapshot_retry)
+{
+  LOG_INFO("========== macro calibration time retry begin ==========");
+  ObTenantFileManager *files = MTL(ObTenantFileManager *);
+  ObTenantDiskSpaceManager *disk = MTL(ObTenantDiskSpaceManager *);
+  ASSERT_NE(nullptr, files);
+  ASSERT_NE(nullptr, disk);
+  ObCalibrateDiskSpaceTask &task = files->calibrate_disk_space_task_;
+  task.stop();
+  task.wait();
+  task.is_stop_ = false;
+  const uint64_t saved_run_cnt = task.run_cnt_;
+  const bool saved_mandatory = task.is_mandatory_calibrate_;
+  for (int mode = 0; mode < 2; ++mode) {
+    MacroBlockId macro_id;
+    OK(prepare_calibration_macro(204031 + mode /*tablet_id*/, macro_id));
+    ObFileStatInfo meta, tmp, macro_before, hot_before;
+    OK(task.get_macro_cache_used_size(meta, tmp, macro_before, hot_before));
+    // 时间选择只在下一秒前 3ms 内成功，等待 10ms 可跨秒。
+    constexpr int64_t CROSS_SECOND_DELAY_US = 10_ms;
+    const int64_t delay_count = ((0 == mode) ? 3 : INT64_MAX);
+    common::ObMalloc allocator;
+    common::ObDSSessionActions point_actions, control_actions;
+    OK(point_actions.init(1024 /*page_size*/, allocator));
+    OK(control_actions.init(1024 /*page_size*/, allocator));
+    OK(GDS.add_debug_sync("reset", false /*is_global*/, control_actions));
+    char action[256] = {0};
+    OK(databuff_printf(action, sizeof(action),
+        "BEFORE_MACRO_BLOCK_CALIBRATE_TIME_CHECK "
+        "wait_for macro_time_cross_boundary timeout %ld execute %ld",
+        CROSS_SECOND_DELAY_US, delay_count));
+    OK(GDS.add_debug_sync(action, false /*is_global*/, point_actions));
+    OK(GDS.set_thread_local_actions(point_actions));
+    const int64_t saved_timeout = GCONF.debug_sync_timeout;
+    GCONF.debug_sync_timeout = 10_s;
+    const bool debug_sync_enabled = GCONF.is_debug_sync_enabled();
+    files->set_pause_gc();
+    const int64_t delta_before = disk->get_used_size_delta_nolock_();
+
+    // 不发送该事件，让到达同步点的检查自身等待跨秒。
+    // 未到达同步点的合法失败不需要控制线程额外处理。
+    // 调用完整校准，验证准备耗尽后的外层重试及失败时不提交。
+    task.run_cnt_ = 2;
+    task.is_mandatory_calibrate_ = false;
+    const int cal_ret = task.calibrate_macro_cache_used_size(ObSSMacroCacheType::MACRO_BLOCK,
+        ObTimeUtility::current_time_s() + 1 /*start_calc_size_time_s*/,
+        macro_before, hot_before.total_size_);
+    task.run_cnt_ = saved_run_cnt;
+    task.is_mandatory_calibrate_ = saved_mandatory;
+    point_actions.reset();
+    const int clear_ret = GDS.set_thread_local_actions(point_actions);
+    const int reset_ret = GDS.add_debug_sync("reset", false /*is_global*/, control_actions);
+    GCONF.debug_sync_timeout = saved_timeout;
+    ObSSMacroCacheStat macro_after, hot_after;
+    const int macro_ret = disk->get_macro_cache_stat(
+        ObSSMacroCacheType::MACRO_BLOCK, macro_after);
+    const int hot_ret = disk->get_macro_cache_stat(
+        ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, hot_after);
+    const int64_t delta_after = disk->get_used_size_delta_nolock_();
+
+    // 清除注入后恢复扫描，并对照恢复场景的提交结果。
+    ObFileStatInfo stable_initial;
+    int64_t stable_hot = 0;
+    ObCalibrateDiskSpaceResult stable_scan;
+    const int stable_ret = task.calc_macro_block_disk_space_with_retry_(
+        stable_initial, stable_hot, stable_scan);
+    int64_t dir_correction = 0;
+    const int dir_ret = stable_scan.get_dir_calibrate_size(macro_before.dir_num_, dir_correction);
+    files->set_allow_gc();
+    const int delete_ret = ObSSObjectAccessUtil::delete_local_file(macro_id);
+    LOG_INFO("verify calibration time retries", K(mode), KR(cal_ret), K(debug_sync_enabled),
+        KR(stable_ret), K(macro_before), K(hot_before),
+        K(macro_after), K(hot_after), K(stable_scan), K(delta_before), K(delta_after));
+    OK(clear_ret);
+    OK(reset_ret);
+    OK(macro_ret);
+    OK(hot_ret);
+    OK(stable_ret);
+    OK(dir_ret);
+    OK(delete_ret);
+    ASSERT_TRUE(debug_sync_enabled);
+    ASSERT_EQ(delta_before, delta_after);
+    if (0 == mode) {
+      OK(cal_ret);
+      ASSERT_EQ(stable_scan.total_file_size_ + dir_correction, macro_after.used_);
+      ASSERT_EQ(stable_scan.hot_tablet_total_used_size_, hot_after.used_);
+    } else {
+      ASSERT_EQ(OB_EAGAIN, cal_ret);
+      ASSERT_EQ(macro_before.total_size_, macro_after.used_);
+      ASSERT_EQ(hot_before.total_size_, hot_after.used_);
+    }
+  }
+  task.run_cnt_ = saved_run_cnt;
+  task.is_mandatory_calibrate_ = saved_mandatory;
+  LOG_INFO("========== macro calibration time retry end ==========");
+}
+
+// 任务停止或未初始化时，时间准备和扫描均返回明确错误，
+// 并清空调用方预置的旧结果。
+// 操作：分别设置停止/未初始化状态，
+// 携带非零出参调用 helper 和扫描入口。
+// 校验：返回 CANCELED/NOT_INIT，所有初值和扫描大小归零，
+// 不进入目录扫描或提交。
+TEST_F(TestFileManager, test_macro_calibration_canceled_outputs)
+{
+  LOG_INFO("========== macro calibration canceled outputs begin ==========");
+  ObTenantFileManager *files = MTL(ObTenantFileManager *);
+  ASSERT_NE(nullptr, files);
+  ObCalibrateDiskSpaceTask &task = files->calibrate_disk_space_task_;
+  task.stop();
+  task.wait();
+  const bool saved_initialized = task.is_inited_;
+  for (int mode = 0; mode < 2; ++mode) {
+    // 停止状态覆盖正常初始化的取消分支；未初始化分支优先于停止检查。
+    task.is_inited_ = (0 == mode && saved_initialized);
+    int64_t start_time_s = 1;
+    ObFileStatInfo macro, hot;
+    macro.total_size_ = macro.dir_size_ = macro.dir_num_ = 1;
+    hot.total_size_ = hot.dir_size_ = hot.dir_num_ = 1;
+    const int prepare_ret = task.prepare_macro_calibration_snapshot_(start_time_s, macro, hot);
+    ObFileStatInfo initial;
+    initial.total_size_ = initial.dir_size_ = initial.dir_num_ = 1;
+    int64_t hot_initial = 1;
+    ObCalibrateDiskSpaceResult scan;
+    scan.total_file_size_ = scan.hot_tablet_total_used_size_ =
+        scan.total_dir_size_ = scan.total_dir_num_ = 1;
+    scan.del_tmp_seq_file_size_ = scan.tmp_seq_file_size_ = scan.tmp_seq_file_cnt_ = 1;
+    const int scan_ret = task.calc_macro_block_disk_space_with_retry_(initial, hot_initial, scan);
+    task.is_inited_ = saved_initialized;
+    LOG_INFO("verify canceled calibration outputs", K(mode), KR(prepare_ret), KR(scan_ret),
+        K(start_time_s), K(macro), K(hot), K(initial), K(hot_initial), K(scan));
+    const int expected_ret = ((0 == mode) ? OB_CANCELED : OB_NOT_INIT);
+    ASSERT_EQ(expected_ret, prepare_ret);
+    ASSERT_EQ(expected_ret, scan_ret);
+    ASSERT_EQ(0, start_time_s);
+    ASSERT_EQ(0, macro.total_size_ + macro.dir_size_ + macro.dir_num_);
+    ASSERT_EQ(0, hot.total_size_ + hot.dir_size_ + hot.dir_num_);
+    ASSERT_EQ(0, initial.total_size_ + initial.dir_size_ + initial.dir_num_);
+    ASSERT_EQ(0, hot_initial);
+    ASSERT_EQ(0, scan.total_file_size_ + scan.hot_tablet_total_used_size_
+        + scan.total_dir_size_ + scan.total_dir_num_ + scan.del_tmp_seq_file_size_
+        + scan.tmp_seq_file_size_ + scan.tmp_seq_file_cnt_);
+  }
+  task.is_stop_ = false;
+  LOG_INFO("========== macro calibration canceled outputs end ==========");
+}
+
+// 转换回调在进入计数后失败，也必须推进 epoch 并归还 inflight，
+// 不能永久阻塞后续校准。
+// 场景：真实 meta 由已初始化的 manager 持有，
+// 回调使用一个未初始化的独立 manager。
+// 操作：通过原 meta map 的原子接口执行回调，使 shift_lru_list 返回 NOT_INIT。
+// 校验：失败 manager 的 epoch 加一、inflight 为零；
+// 原 meta 类型和原 manager 计数不变。
+TEST_F(TestFileManager, test_macro_calibration_conversion_failure_balances_inflight)
+{
+  LOG_INFO("========== macro calibration conversion failure begin ==========");
+  ObTenantFileManager *files = MTL(ObTenantFileManager *);
+  ObSSMacroCacheMgr *mgr = MTL(ObSSMacroCacheMgr *);
+  ASSERT_NE(nullptr, files);
+  ASSERT_NE(nullptr, mgr);
+  MacroBlockId macro_id;
+  OK(prepare_calibration_macro(204041 /*tablet_id*/, macro_id));
+  ObSSMacroCacheMgr uninitialized_mgr;
+  const ObSSMacroCacheModifyCacheTypeParam param(
+      false /*touch_cache*/, false /*update_effective_tablet_id*/, ObTabletID::INVALID_TABLET_ID);
+  ObSSMacroCacheModifyCacheTypeCallback callback(ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK,
+      ObSSMacroCacheType::MACRO_BLOCK, param, uninitialized_mgr);
+  files->set_pause_gc();
+  const int64_t epoch = mgr->get_cache_type_change_epoch();
+  const int map_ret = mgr->meta_map_.atomic_refactored(macro_id, callback);
+  const int callback_ret = callback.get_ret();
+  ObSSMacroCacheType actual_type = ObSSMacroCacheType::MAX_TYPE;
+  const int type_ret = mgr->get_macro_cache_type(macro_id, actual_type);
+  files->set_allow_gc();
+  const int delete_ret = ObSSObjectAccessUtil::delete_local_file(macro_id);
+  LOG_INFO("verify failed conversion counter balance", KR(map_ret), KR(callback_ret),
+      KR(type_ret), K(actual_type), K(epoch));
+  OK(map_ret);
+  ASSERT_EQ(OB_NOT_INIT, callback_ret);
+  OK(type_ret);
+  OK(delete_ret);
+  ASSERT_EQ(ObSSMacroCacheType::HOT_TABLET_MACRO_BLOCK, actual_type);
+  ASSERT_EQ(1, uninitialized_mgr.get_cache_type_change_epoch());
+  ASSERT_EQ(0, uninitialized_mgr.get_cache_type_change_inflight());
+  ASSERT_EQ(epoch, mgr->get_cache_type_change_epoch());
+  LOG_INFO("========== macro calibration conversion failure end ==========");
 }
 
 // When free_size > macro_cache_stats_[idx].used_, free_file_size() sets used_ to 0.

@@ -5,6 +5,9 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_calibrate_disk_space_task.h"
+#include "lib/literals/ob_literals.h"
+#include "lib/utility/utility.h"
+#include "share/ob_debug_sync.h"
 #include "storage/shared_storage/ob_dir_manager.h"
 #include "storage/meta_store/ob_tenant_storage_meta_service.h"
 #include "storage/shared_storage/ob_disk_space_manager.h"
@@ -460,6 +463,8 @@ int ObCalibrateDiskSpaceTask::calibrate_macro_cache_used_size(
   int ret = OB_SUCCESS;
   ObTenantFileManager *file_mgr = nullptr;
   ObCalibrateDiskSpaceResult calibrate_res;
+  ObFileStatInfo scan_initial_stat_info = initial_stat_info;
+  int64_t scan_initial_hot_tablet_used_size = initial_hot_tablet_used_size;
   const int64_t initial_used_size = initial_stat_info.total_size_;
   const bool is_forcely = (1 == run_cnt_ || is_mandatory_calibrate_);
 
@@ -475,23 +480,178 @@ int ObCalibrateDiskSpaceTask::calibrate_macro_cache_used_size(
   } else if (OB_ISNULL(file_mgr = MTL(ObTenantFileManager *))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tenant file manager is null", KR(ret), KP(file_mgr), K_(tenant_id));
+  } else if (ObSSMacroCacheType::MACRO_BLOCK == cache_type) {
+    if (OB_FAIL(calc_macro_block_disk_space_with_retry_(
+        scan_initial_stat_info, scan_initial_hot_tablet_used_size, calibrate_res))) {
+      LOG_WARN("fail to get stable macro block disk space scan", KR(ret), K(tenant_id_));
+    }
   } else if (OB_FAIL(file_mgr->calc_macro_cache_disk_space(cache_type, start_calc_size_time_s, calibrate_res))) {
     LOG_WARN("fail to calc macro cache disk space", KR(ret), K_(tenant_id), K_SS_MACRO_CACHE_TYPE(cache_type));
+  }
+
+  if (OB_FAIL(ret)) {
+    // An unstable scan must not update either category.
   } else if (is_forcely) {
     // Force calibrate on first-run / restart / mandatory: rebuilds dir info from disk and
     // applies alloc_size atomically via calibrate_*_with_initial, same as the normal path.
     FLOG_INFO("begin to calibrate macro cache used size forcely", K_(run_cnt), K_(is_mandatory_calibrate));
-    if (OB_FAIL(calibrate_macro_cache_used_size_forcely(cache_type, initial_stat_info,
-                                                         initial_hot_tablet_used_size, calibrate_res))) {
+    if (OB_FAIL(calibrate_macro_cache_used_size_forcely(cache_type, scan_initial_stat_info,
+        scan_initial_hot_tablet_used_size, calibrate_res))) {
       LOG_WARN("fail to calibrate macro cache used size forcely", KR(ret), K_(tenant_id), K(calibrate_res));
     }
     FLOG_INFO("finish to calibrate macro cache used size forcely", KR(ret), K_(tenant_id),
-        K_SS_MACRO_CACHE_TYPE(cache_type), K(calibrate_res), K(initial_stat_info),
-        K(initial_hot_tablet_used_size));
-  } else if (OB_FAIL(calibrate_macro_cache_used_size_normally(cache_type, initial_stat_info,
-                                                              initial_hot_tablet_used_size, calibrate_res))) {
+        K_SS_MACRO_CACHE_TYPE(cache_type), K(calibrate_res), K(scan_initial_stat_info),
+        K(scan_initial_hot_tablet_used_size));
+  } else if (OB_FAIL(calibrate_macro_cache_used_size_normally(cache_type, scan_initial_stat_info,
+      scan_initial_hot_tablet_used_size, calibrate_res))) {
     LOG_WARN("fail to calibrate macro cache used size normally", KR(ret), K_(tenant_id), K(calibrate_res));
   }
+  return ret;
+}
+
+// Returns matching initial accounting and a stable macro-block disk scan.
+//
+// Retries OB_EAGAIN from snapshot preparation, traversal, or cache-type conflicts.
+// The caller keeps macro-cache GC paused; no lock is held while waiting or traversing files.
+// Outputs remain empty on failure; only a validated scan publishes its accounting and result.
+int ObCalibrateDiskSpaceTask::calc_macro_block_disk_space_with_retry_(
+    ObFileStatInfo &initial_stat_info,
+    int64_t &initial_hot_tablet_used_size,
+    ObCalibrateDiskSpaceResult &calibrate_res)
+{
+  int ret = OB_SUCCESS;
+  initial_stat_info = ObFileStatInfo();
+  initial_hot_tablet_used_size = 0;
+  calibrate_res.reset();
+  constexpr int64_t MAX_SCAN_ATTEMPT_COUNT = 3;
+  constexpr int64_t SCAN_RETRY_INTERVAL_US = 100_ms;
+  ObTimePiece time_piece;
+  ObTenantFileManager *file_mgr = MTL(ObTenantFileManager *);
+  ObSSMacroCacheMgr *macro_cache_mgr = MTL(ObSSMacroCacheMgr *);
+  bool is_scan_stable = false;
+  int64_t scan_attempt = 0;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("calibrate disk space task is not init", KR(ret));
+  } else if (OB_ISNULL(file_mgr) || OB_ISNULL(macro_cache_mgr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("file manager or macro cache manager is null",
+        KR(ret), KP(file_mgr), KP(macro_cache_mgr));
+  } else {
+    while (OB_SUCC(ret) && !is_stop_ && !is_scan_stable && scan_attempt < MAX_SCAN_ATTEMPT_COUNT) {
+      ++scan_attempt;
+      ObCalibrateDiskSpaceResult scan_result;
+      ObFileStatInfo macro_stat, hot_stat;
+      int64_t start_calc_time_s = 0;
+      const int64_t epoch_before = macro_cache_mgr->get_cache_type_change_epoch();
+      const int64_t inflight_before = macro_cache_mgr->get_cache_type_change_inflight();
+      if (inflight_before > 0) {
+        ret = OB_EAGAIN;
+        LOG_WARN("cache type change is in flight, retry macro calibration",
+            KR(ret), K(tenant_id_), K(scan_attempt), K(inflight_before));
+      } else if (OB_FAIL(prepare_macro_calibration_snapshot_(
+          start_calc_time_s, macro_stat, hot_stat))) {
+        LOG_WARN("fail to prepare macro calibration snapshot", KR(ret), K(scan_attempt));
+      } else if (!is_stop_) {
+        DEBUG_SYNC(BEFORE_MACRO_BLOCK_CALIBRATE_SCAN);
+        if (OB_FAIL(file_mgr->calc_macro_cache_disk_space(
+            ObSSMacroCacheType::MACRO_BLOCK, start_calc_time_s, scan_result))) {
+          LOG_WARN("fail to scan macro block disk space", KR(ret), K(scan_attempt));
+        } else {
+          DEBUG_SYNC(AFTER_MACRO_BLOCK_CALIBRATE_SCAN);
+          const int64_t inflight_after = macro_cache_mgr->get_cache_type_change_inflight();
+          const int64_t epoch_after = macro_cache_mgr->get_cache_type_change_epoch();
+          if (is_stop_) {
+            ret = OB_CANCELED;
+            LOG_WARN("macro calibration scan stopped after traversal", KR(ret), K(scan_attempt));
+          } else if (0 < inflight_after || epoch_before != epoch_after) {
+            ret = OB_EAGAIN;
+            LOG_WARN("cache type changed during macro calibration scan, retry",
+                KR(ret), K(scan_attempt), K(epoch_before), K(epoch_after),
+                K(inflight_before), K(inflight_after), K(macro_stat), K(hot_stat), K(scan_result));
+          } else {
+            initial_stat_info = macro_stat;
+            initial_hot_tablet_used_size = hot_stat.total_size_;
+            calibrate_res = scan_result;
+            is_scan_stable = true;
+          }
+        }
+      }
+      if (OB_EAGAIN == ret && !is_stop_ && scan_attempt < MAX_SCAN_ATTEMPT_COUNT) {
+        ret = OB_SUCCESS;
+        ob_usleep(SCAN_RETRY_INTERVAL_US);
+      }
+    }
+    if (OB_SUCC(ret) && !is_scan_stable) {
+      ret = OB_CANCELED;
+      LOG_WARN("macro calibration scan canceled", KR(ret), K(scan_attempt));
+    }
+  }
+  LOG_INFO("finish stable macro block calibration scan", KR(ret), K(scan_attempt),
+      K(initial_stat_info), K(initial_hot_tablet_used_size), K(calibrate_res), K(time_piece));
+  return ret;
+}
+
+// Prepares macro/HOT accounting before the mtime cutoff, retrying time preparation up to ten times.
+//
+// The caller keeps macro-cache GC paused and brackets this function and its subsequent scan
+// with cache-type epoch/inflight checks. This function does not validate cache-type stability.
+// Outputs are reset on entry and published together only after a valid time-boundary check.
+// Exhaustion returns OB_EAGAIN; stopping returns OB_CANCELED, with outputs left empty.
+int ObCalibrateDiskSpaceTask::prepare_macro_calibration_snapshot_(
+    int64_t &start_calc_time_s,
+    ObFileStatInfo &macro_stat,
+    ObFileStatInfo &hot_stat)
+{
+  int ret = OB_SUCCESS;
+  start_calc_time_s = 0;
+  macro_stat = ObFileStatInfo();
+  hot_stat = ObFileStatInfo();
+  constexpr int64_t MAX_TIME_ATTEMPT_COUNT = 10;
+  constexpr int64_t TIME_RETRY_INTERVAL_US = 10_ms;
+  ObTimePiece time_piece;
+  int64_t time_attempt = 0;
+  bool is_snapshot_ready = false;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("calibrate disk space task is not init", KR(ret), K(tenant_id_));
+  } else {
+    while (OB_SUCC(ret) && !is_stop_ && !is_snapshot_ready &&
+        time_attempt < MAX_TIME_ATTEMPT_COUNT) {
+      ++time_attempt;
+      int64_t candidate_time_s = 0;
+      ObFileStatInfo meta_stat, tmp_stat, candidate_macro_stat, candidate_hot_stat;
+      if (OB_FAIL(choose_start_calc_size_time_s(candidate_time_s))) {
+        LOG_WARN("fail to choose macro calibration time", KR(ret), K(time_attempt));
+      } else if (OB_FAIL(get_macro_cache_used_size(
+          meta_stat, tmp_stat, candidate_macro_stat, candidate_hot_stat))) {
+        LOG_WARN("fail to get macro calibration initial size", KR(ret), K(time_attempt));
+      } else {
+        DEBUG_SYNC(BEFORE_MACRO_BLOCK_CALIBRATE_TIME_CHECK);
+        if (ObTimeUtility::current_time_us() >= candidate_time_s * 1000000L) {
+          // The initial accounting must precede the mtime cutoff used to exclude new files.
+          ret = OB_EAGAIN;
+          LOG_WARN("macro calibration initial snapshot missed time boundary, retry",
+              KR(ret), K(time_attempt), K(candidate_time_s));
+        } else {
+          start_calc_time_s = candidate_time_s;
+          macro_stat = candidate_macro_stat;
+          hot_stat = candidate_hot_stat;
+          is_snapshot_ready = true;
+        }
+      }
+      if (OB_EAGAIN == ret && !is_stop_ && time_attempt < MAX_TIME_ATTEMPT_COUNT) {
+        ret = OB_SUCCESS;
+        ob_usleep(TIME_RETRY_INTERVAL_US);
+      }
+    }
+    if (OB_SUCC(ret) && !is_snapshot_ready) {
+      ret = OB_CANCELED;
+      LOG_WARN("macro calibration snapshot preparation canceled", KR(ret), K(time_attempt));
+    }
+  }
+  LOG_INFO("finish to prepare macro calibration snapshot", KR(ret),
+      K(time_attempt), K(start_calc_time_s), K(macro_stat), K(hot_stat), K(time_piece));
   return ret;
 }
 

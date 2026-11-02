@@ -356,6 +356,7 @@ class ObSSMacroCacheMgr
   friend class ObSSMacroCacheTabletStatTask;
   friend class ObSSMacroCacheRestoreInsertCallback;
   friend class ObSSMacroCacheRestoreUpdateCallback;
+  friend class ObSSMacroCacheModifyCacheTypeCallback;
 public:
   ObSSMacroCacheMgr();
   virtual ~ObSSMacroCacheMgr();
@@ -366,6 +367,15 @@ public:
   int wait();
   void destroy();
   bool is_valid() const;
+  // A stable calibration scan must not overlap a real cache-type change.
+  int64_t get_cache_type_change_epoch() const
+  {
+    return ATOMIC_LOAD(&cache_type_change_epoch_);
+  }
+  int64_t get_cache_type_change_inflight() const
+  {
+    return ATOMIC_LOAD(&cache_type_change_inflight_);
+  }
   int put(const blocksstable::MacroBlockId &macro_id,
           const ObSSMacroCacheInfo &cache_info);
   int get(const blocksstable::MacroBlockId &macro_id,
@@ -534,6 +544,12 @@ private:
   int process_hot_macro_cache_candidates_(
       const common::ObIArray<blocksstable::MacroBlockId> &macro_ids,
       const bool convert_to_auto);
+  void begin_cache_type_change_() { ATOMIC_INC(&cache_type_change_inflight_); }
+  void end_cache_type_change_()
+  {
+    ATOMIC_INC(&cache_type_change_epoch_);
+    ATOMIC_DEC(&cache_type_change_inflight_);
+  }
   int modify_macro_cache_type_(
       const blocksstable::MacroBlockId &macro_id,
       const ObSSMacroCacheType ori_cache_type,
@@ -685,6 +701,9 @@ private:
   // put, put_or_update, erase, modify_from_write_cache_to_read_cache, restore_cache_entries
   int64_t write_cache_size_;
   int64_t flying_req_cnt_;
+  // Cover both the meta/LRU change and its disk-space accounting, including failed attempts.
+  int64_t cache_type_change_epoch_;
+  int64_t cache_type_change_inflight_;
   int64_t macro_meta_cnt_;
   common::ObSmallAllocator macro_meta_allocator_;
   SSMacroCacheMetaMap meta_map_;

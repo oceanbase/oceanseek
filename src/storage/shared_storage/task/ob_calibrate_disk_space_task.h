@@ -61,6 +61,12 @@ public:
 private:
   int check_if_need_calibration(const bool is_mandatory_calibrate, bool &is_need_exec);
   int calibrate_disk_space();
+  // Refresh the time boundary and initial accounting on every unstable macro-block scan.
+  int calc_macro_block_disk_space_with_retry_(ObFileStatInfo &initial_stat_info,
+      int64_t &initial_hot_tablet_used_size, ObCalibrateDiskSpaceResult &calibrate_res);
+  // Prepare the macro/HOT accounting snapshot before its mtime cutoff, with bounded time retries.
+  int prepare_macro_calibration_snapshot_(int64_t &start_calc_time_s,
+      ObFileStatInfo &macro_stat, ObFileStatInfo &hot_stat);
   int calibrate_macro_cache_used_size(const ObSSMacroCacheType cache_type,
                                       const int64_t start_calc_size_time_s,
                                       const ObFileStatInfo &initial_stat_info,
