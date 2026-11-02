@@ -4,12 +4,14 @@
  */
 
 #define USING_LOG_PREFIX STORAGE
+#include <cstdint>
 #include <gtest/gtest.h>
 #include "lib/oblog/ob_warning_buffer.h"
 #include "lib/time/ob_time_utility.h"
 #define protected public
 #define private public
 
+#include "rootserver/ob_ddl_service.h"
 #include "storage/async_index/ob_async_index_trigger.h"
 #include "storage/async_index/ob_async_index_ddl_refresh.h"
 #include "share/ob_async_index_refresh_util.h"
@@ -661,6 +663,103 @@ TEST_F(TestAsyncIndexTrigger, test_create_index_path_anchors_s0_via_min_publish_
   ASSERT_EQ(2, snaps.count());
   ASSERT_EQ(async_index_scn_to_snapshot(make_scn(1000)), snaps.at(0));
   ASSERT_EQ(async_index_scn_to_snapshot(make_scn(2000)), snaps.at(1));
+}
+
+static void build_async_index_partition_schema(
+    share::schema::AlterTableSchema &schema,
+    const uint64_t table_id,
+    const share::schema::ObPartitionLevel part_level,
+    const uint64_t first_tablet_id)
+{
+  using namespace share::schema;
+  schema.set_table_id(table_id);
+  schema.set_part_level(part_level);
+  const int64_t part_count = PARTITION_LEVEL_ONE == part_level ? 2 : 1;
+  schema.get_part_option().set_part_num(part_count);
+  for (int64_t i = 0; i < part_count; ++i) {
+    ObPartition part;
+    part.set_table_id(table_id);
+    part.set_part_id(i);
+    if (PARTITION_LEVEL_ONE == part_level) {
+      part.set_tablet_id(first_tablet_id + i);
+    } else {
+      part.set_sub_part_num(2);
+      for (int64_t j = 0; j < 2; ++j) {
+        ObSubPartition subpart;
+        subpart.set_table_id(table_id);
+        subpart.set_part_id(i);
+        subpart.set_sub_part_id(j);
+        subpart.set_tablet_id(first_tablet_id + j);
+        ASSERT_EQ(OB_SUCCESS, part.add_partition(subpart));
+      }
+    }
+    ASSERT_EQ(OB_SUCCESS, schema.add_partition(part));
+  }
+}
+
+TEST_F(TestAsyncIndexTrigger, ddl_collect_partition_tablets_with_uint64_table_id)
+{
+  using namespace share::schema;
+  const uint64_t data_table_id = 200001;
+  const uint64_t first_index_tablet_id = 500001;
+  const uint64_t table_ids[] = {
+    INT32_MAX,
+    static_cast<uint64_t>(INT32_MAX) + 1,
+    UINT32_MAX,
+    static_cast<uint64_t>(UINT32_MAX) + 1 + data_table_id
+  };
+  const ObIndexType index_types[] = {
+    INDEX_TYPE_ASYNC_FTS_INDEX_LOCAL,
+    INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL,
+    INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL
+  };
+  const ObPartitionLevel part_levels[] = {PARTITION_LEVEL_ONE, PARTITION_LEVEL_TWO};
+  rootserver::ObDDLService ddl_service;
+  for (const uint64_t table_id : table_ids) {
+    for (const ObIndexType index_type : index_types) {
+      for (const ObPartitionLevel part_level : part_levels) {
+        SCOPED_TRACE(testing::Message() << "table_id=" << table_id
+            << ", index_type=" << index_type << ", part_level=" << part_level);
+        AlterTableSchema data_schema;
+        AlterTableSchema index_schema;
+        ObTableSchema normal_index_schema;
+        ObTableSchema search_def_schema;
+        data_schema.set_table_type(USER_TABLE);
+        index_schema.set_table_type(USER_INDEX);
+        index_schema.set_index_type(index_type);
+        ASSERT_NO_FATAL_FAILURE(
+            build_async_index_partition_schema(data_schema, data_table_id, part_level, 400001));
+        ASSERT_NO_FATAL_FAILURE(
+            build_async_index_partition_schema(index_schema, table_id, part_level, first_index_tablet_id));
+        normal_index_schema.set_table_type(USER_INDEX);
+        normal_index_schema.set_index_type(INDEX_TYPE_NORMAL_LOCAL);
+        search_def_schema.set_table_type(USER_INDEX);
+        search_def_schema.set_index_type(INDEX_TYPE_ASYNC_SEARCH_DEF_INDEX_LOCAL);
+
+        ObArray<ObTableSchema *> new_table_schemas;
+        ObArray<AlterTableSchema *> inc_table_schemas;
+        ObArray<ObLSID> ls_ids;
+        ObArray<obrpc::ObLSTabletPair> ls_tablet_pairs;
+        ASSERT_EQ(OB_SUCCESS, new_table_schemas.push_back(&data_schema));
+        ASSERT_EQ(OB_SUCCESS, new_table_schemas.push_back(&normal_index_schema));
+        ASSERT_EQ(OB_SUCCESS, new_table_schemas.push_back(&search_def_schema));
+        ASSERT_EQ(OB_SUCCESS, new_table_schemas.push_back(&index_schema));
+        // The high 32-bit ID aliases this data table if the lookup argument is narrowed.
+        ASSERT_EQ(OB_SUCCESS, inc_table_schemas.push_back(&data_schema));
+        ASSERT_EQ(OB_SUCCESS, inc_table_schemas.push_back(&index_schema));
+        ASSERT_EQ(OB_SUCCESS, ls_ids.push_back(ObLSID(1001)));
+        ASSERT_EQ(OB_SUCCESS, ls_ids.push_back(ObLSID(1002)));
+
+        ASSERT_EQ(OB_SUCCESS, ddl_service.collect_async_index_partition_ls_tablets_(
+            new_table_schemas, inc_table_schemas, ls_ids, ls_tablet_pairs));
+        ASSERT_EQ(2, ls_tablet_pairs.count());
+        for (int64_t i = 0; i < ls_tablet_pairs.count(); ++i) {
+          EXPECT_EQ(ls_ids.at(i), ls_tablet_pairs.at(i).ls_id_);
+          EXPECT_EQ(ObTabletID(first_index_tablet_id + i), ls_tablet_pairs.at(i).tablet_id_);
+        }
+      }
+    }
+  }
 }
 
 // Exercise the real refresh-info maintenance together with the DDL driver.

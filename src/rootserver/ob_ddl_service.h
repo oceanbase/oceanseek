@@ -2675,7 +2675,7 @@ private:
                                ObIArray<ObDDLTaskRecord> &ddl_tasks);
   template <class TTableSchema>
   int get_tablets_with_table_id_(const ObArray<TTableSchema *> &table_schemas,
-                                 const int table_id,
+                                 const uint64_t table_id,
                                  ObArray<ObTabletID> &tablet_ids);
   int collect_async_index_partition_ls_tablets_(
       const ObIArray<schema::ObTableSchema *> &new_table_schemas,

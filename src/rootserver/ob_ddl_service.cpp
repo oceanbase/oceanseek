@@ -16857,7 +16857,7 @@ int ObDDLService::alter_table_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
           ObIndexBuilder index_builder(*this);
           const ObSArray<ObIndexArg *> &index_arg_list = alter_table_arg.index_arg_list_;
           int tmp_ret = OB_SUCCESS;
-          const int64_t new_table_id = new_table_schema.get_table_id();
+          const uint64_t new_table_id = new_table_schema.get_table_id();
           ObArray<ObTabletID> inc_tablet_ids;
           ObArray<ObTabletID> del_tablet_ids;
           if (index_arg_list.count() > 0) {
@@ -41701,7 +41701,7 @@ int ObDDLService::drop_index_to_scheduler_(ObMySQLTransaction &trans,
 
 template <class TTableSchema>
 int ObDDLService:: get_tablets_with_table_id_(const ObArray<TTableSchema *> &table_schemas,
-                                              const int table_id,
+                                              const uint64_t table_id,
                                               ObArray<ObTabletID> &tablet_ids)
 {
   int ret = OB_SUCCESS;
