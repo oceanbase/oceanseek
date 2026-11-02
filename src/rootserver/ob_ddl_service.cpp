@@ -16232,6 +16232,33 @@ int ObDDLService::alter_table_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
         if (0 == new_table_schema.get_autoinc_column_id()) {
           new_table_schema.set_auto_increment(1);
         }
+        // Name-only changes keep async snapshots readable while fencing old writers.
+        // Combined DDL operations retain the existing read/write defense.
+        const bool is_async_metadata_change =
+            tenant_data_version >= DATA_VERSION_4_6_3_0
+            && orig_table_schema->has_async_index()
+            && new_table_schema.has_async_index()
+            && !new_table_schema.is_tmp_table()
+            && !alter_table_arg.is_alter_columns_
+            && !alter_table_arg.is_alter_indexs_
+            && !alter_table_arg.is_alter_partitions_
+            && ObAlterTableArg::CONSTRAINT_NO_OPERATION == alter_table_arg.alter_constraint_type_
+            && 0 == alter_table_arg.foreign_key_arg_list_.count()
+            && 0 == alter_table_arg.index_arg_list_.count();
+        const bool is_async_ctas_publish = is_async_metadata_change
+            && orig_table_schema->is_ctas_tmp_table()
+            && orig_table_schema->get_session_id() > 0
+            && 0 == alter_table_schema.get_session_id()
+            && 2 == alter_table_schema.alter_option_bitset_.num_members()
+            && alter_table_schema.alter_option_bitset_.has_member(ObAlterTableArg::TABLE_NAME)
+            && alter_table_schema.alter_option_bitset_.has_member(ObAlterTableArg::SESSION_ID);
+        const bool is_async_table_rename = is_async_metadata_change
+            && !orig_table_schema->is_tmp_table()
+            && !orig_table_schema->is_ctas_tmp_table()
+            && 0 == orig_table_schema->get_session_id()
+            && 0 == new_table_schema.get_session_id()
+            && 1 == alter_table_schema.alter_option_bitset_.num_members()
+            && alter_table_schema.alter_option_bitset_.has_member(ObAlterTableArg::TABLE_NAME);
         ObSArray<std::pair<uint64_t, int64_t>> idx_schema_versions;
         if (OB_FAIL(ret)) {
           // error occur
@@ -16245,14 +16272,22 @@ int ObDDLService::alter_table_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
                 &idx_schema_versions))) {
           ObString origin_table_name = alter_table_schema.get_origin_table_name();
           LOG_WARN("failed to alter table options,", K(origin_table_name), K(new_table_schema), K(ret));
-        } else if (need_table_lock &&
-            OB_FAIL(build_rw_defense_for_table_(
-                tenant_data_version,
-                new_table_schema, 
-                new_table_schema.get_schema_version(),
-                idx_schema_versions,
-                trans))) {
-          LOG_WARN("failed to add rw defense for table", K(ret), K(new_table_schema));
+        } else if (need_table_lock) {
+          if (is_async_ctas_publish || is_async_table_rename) {
+            if (OB_FAIL(build_write_defense_for_table_(new_table_schema,
+                                                      new_table_schema.get_schema_version(),
+                                                      idx_schema_versions,
+                                                      schema_guard,
+                                                      trans))) {
+              LOG_WARN("failed to add write defense for async table rename", K(ret), K(new_table_schema));
+            }
+          } else if (OB_FAIL(build_rw_defense_for_table_(tenant_data_version,
+                                                       new_table_schema,
+                                                       new_table_schema.get_schema_version(),
+                                                       idx_schema_versions,
+                                                       trans))) {
+            LOG_WARN("failed to add rw defense for table", K(ret), K(new_table_schema));
+          }
         }
         if (OB_SUCC(ret)
             && !alter_table_schema.alter_option_bitset_.is_empty()
@@ -20980,12 +21015,18 @@ int ObDDLService::rename_table(const obrpc::ObRenameTableArg &rename_table_arg)
                   LOG_WARN("failed to rename table!", K(rename_item), K(table_id), K(ret));
                 } else if (need_table_lock_and_defense &&
                            !in_new_table_set && // to avoid defense twice on the same table
-                           OB_FAIL(build_rw_defense_for_table_(
-                              tenant_data_version,
-                              *from_table_schema, 
-                              new_table_schema_version, 
-                              idx_schema_versions,
-                              trans))) {
+                           OB_FAIL((tenant_data_version >= DATA_VERSION_4_6_3_0
+                              && from_table_schema->has_async_index())
+                              ? build_write_defense_for_table_(*from_table_schema,
+                                                               new_table_schema_version,
+                                                               idx_schema_versions,
+                                                               schema_guard,
+                                                               trans)
+                              : build_rw_defense_for_table_(tenant_data_version,
+                                                            *from_table_schema,
+                                                            new_table_schema_version,
+                                                            idx_schema_versions,
+                                                            trans))) {
                   LOG_WARN("fail to build rw defense for table", K(ret), K(new_table_schema_version), KPC(from_table_schema), KPC(database_schema));
                 } else if (OB_FAIL(ObPLDDLService::rebuild_trigger_on_rename(schema_guard,
                                                                              tenant_id,
@@ -21033,12 +21074,18 @@ int ObDDLService::rename_table(const obrpc::ObRenameTableArg &rename_table_arg)
                                                           idx_schema_versions))) {
                       LOG_WARN("failed to rename table!", K(ret), K(rename_item), K(table_id));
                     } else if (need_table_lock_and_defense &&
-                              OB_FAIL(build_rw_defense_for_table_(
-                                  tenant_data_version,
-                                  *from_table_schema, 
-                                  new_table_schema_version, 
-                                  idx_schema_versions,
-                                  trans))) {
+                              OB_FAIL((tenant_data_version >= DATA_VERSION_4_6_3_0
+                                  && from_table_schema->has_async_index())
+                                  ? build_write_defense_for_table_(*from_table_schema,
+                                                                   new_table_schema_version,
+                                                                   idx_schema_versions,
+                                                                   schema_guard,
+                                                                   trans)
+                                  : build_rw_defense_for_table_(tenant_data_version,
+                                                                *from_table_schema,
+                                                                new_table_schema_version,
+                                                                idx_schema_versions,
+                                                                trans))) {
                       LOG_WARN("fail to build rw defense for table", K(ret), K(new_table_schema_version), KPC(from_table_schema), KPC(database_schema));
                     } else if (OB_FAIL(ObPLDDLService::rebuild_trigger_on_rename(schema_guard,
                                                                               tenant_id,
@@ -21307,6 +21354,45 @@ int ObDDLService::build_single_table_rw_defensive_(
       } else if (OB_FAIL(trans.register_tx_data(args[i].tenant_id_, args[i].ls_id_, transaction::ObTxDataSourceType::UNBIND_TABLET_NEW_MDS, buf, pos))) {
         LOG_WARN("failed to register tx data", K(ret));
       }
+    }
+  }
+  return ret;
+}
+
+// Pure metadata renames preserve tablet layouts and published async snapshots.
+// Use the caller's guard for the same auxiliary cohort already locked by the DDL.
+int ObDDLService::build_write_defense_for_table_(
+    const ObTableSchema &table_schema,
+    const int64_t new_data_table_schema_version,
+    const ObIArray<std::pair<uint64_t, int64_t>> &aux_schema_versions,
+    ObSchemaGetterGuard &schema_guard,
+    ObDDLSQLTransaction &trans)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = table_schema.get_tenant_id();
+  if (!table_schema.is_valid() || !table_schema.is_user_table()
+      || new_data_table_schema_version <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid write defense argument", K(ret), K(table_schema), K(new_data_table_schema_version));
+  } else if (OB_FAIL(ObTabletBindingHelper::build_single_table_write_defensive(
+                 table_schema, new_data_table_schema_version, trans))) {
+    LOG_WARN("failed to add base table write defense", K(ret), K(table_schema));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < aux_schema_versions.count(); ++i) {
+    const uint64_t table_id = aux_schema_versions.at(i).first;
+    const int64_t schema_version = aux_schema_versions.at(i).second;
+    const ObTableSchema *aux_table_schema = nullptr;
+    if (OB_INVALID_ID == table_id || schema_version <= 0) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid auxiliary write defense argument", K(ret), K(table_id), K(schema_version));
+    } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, table_id, aux_table_schema))) {
+      LOG_WARN("failed to get auxiliary table schema", K(ret), K(tenant_id), K(table_id));
+    } else if (OB_ISNULL(aux_table_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("auxiliary table schema is null", K(ret), K(tenant_id), K(table_id));
+    } else if (OB_FAIL(ObTabletBindingHelper::build_single_table_write_defensive(
+                   *aux_table_schema, schema_version, trans))) {
+      LOG_WARN("failed to add auxiliary table write defense", K(ret), K(table_id), K(schema_version));
     }
   }
   return ret;
