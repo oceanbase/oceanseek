@@ -56,6 +56,9 @@ public:
   }
   void TearDown() override
   {
+    // Some tests exercise the public API without starting RPC/worker threads.
+    mgr_->is_running_ = false;
+    mgr_->is_inited_ = false;
     // Tests do not start the RPC service. Release their source explicitly.
     if (source_ != nullptr) {
       EXPECT_EQ(OB_SUCCESS, mgr_->delete_tenant_(GetParam()));
@@ -65,6 +68,19 @@ public:
   void make_obsolete()
   {
     source_->last_access_ts_ = ObClockGenerator::getClock() - ObTsMgr::TS_SOURCE_INFO_OBSOLETE_TIME - 1;
+  }
+  void prepare_sync_request()
+  {
+    auto &pool = ObTsSyncGetTsCbTaskPool::get_instance();
+    if (!pool.is_inited_) {
+      ASSERT_EQ(OB_SUCCESS, pool.init());
+    }
+    // An uninitialized location adapter returns an error, leaving the request
+    // queued until the test supplies a GTS response. No RPC service is needed.
+    source_->gts_source_.tenant_id_ = GetParam();
+    source_->gts_source_.location_adapter_ = &mgr_->location_adapter_def_;
+    mgr_->is_inited_ = true;
+    mgr_->is_running_ = true;
   }
   std::unique_ptr<ObTsMgr> mgr_;
   ObTsSourceInfo *source_ = nullptr;
@@ -291,6 +307,261 @@ TEST_P(TestGtsSourceLifecycle, popped_task_protects_source_until_callback_return
 
 // Cover both the cached path and the previously unprotected hashmap-only path.
 INSTANTIATE_TEST_CASE_P(CachedAndUncached, TestGtsSourceLifecycle, ::testing::Values(1001UL, 5001UL));
+
+TEST_P(TestGtsSourceLifecycle, sync_request_for_nonlocal_tenant_completes)
+{
+  prepare_sync_request();
+  const uint64_t caller_tenant_id = 1004;
+  share::ObTenantBase caller_tenant(caller_tenant_id);
+  MAKE_TENANT_SWITCH_SCOPE_GUARD(caller_guard);
+  ASSERT_EQ(OB_SUCCESS, caller_guard.switch_to(&caller_tenant));
+  share::SCN result;
+  auto waiter = std::async(std::launch::async, [&] {
+    MAKE_TENANT_SWITCH_SCOPE_GUARD(waiter_guard);
+    const int ret = waiter_guard.switch_to(&caller_tenant);
+    if (OB_SUCCESS != ret) {
+      return ret;
+    }
+    MonotonicTs received;
+    return mgr_->get_gts_sync(GetParam(), MonotonicTs(100), 5 * 1000 * 1000, result, received);
+  });
+  auto &queue = source_->gts_source_.queue_[0];
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+  while (queue.get_task_count() == 0 && std::chrono::steady_clock::now() < deadline
+      && waiter.wait_for(std::chrono::milliseconds(0)) != std::future_status::ready) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  EXPECT_EQ(1, queue.get_task_count());
+  // Only the caller's tenant is available in this test. Both the requested
+  // tenant and sys must be rejected as callback contexts.
+  ObLink *link = nullptr;
+  (void)queue.queue_.pop(link);
+  EXPECT_NE(nullptr, link);
+  if (link != nullptr) {
+    auto *task = static_cast<ObTsCbTask *>(link);
+    EXPECT_EQ(caller_tenant_id, task->get_tenant_id());
+    EXPECT_EQ(OB_SUCCESS, queue.push(task));
+  }
+  EXPECT_EQ(GetParam(), source_->get_tenant_id());
+  EXPECT_EQ(OB_SUCCESS, queue.foreach_task(MonotonicTs(100), 12345, MonotonicTs(100)));
+  EXPECT_EQ(OB_SUCCESS, waiter.get());
+  EXPECT_EQ(12345, result.get_val_for_tx());
+  EXPECT_EQ(0, queue.get_task_count());
+  // Also clean up on the unfixed code, where the task stays queued until timeout.
+  link = nullptr;
+  (void)queue.queue_.pop(link);
+  if (link != nullptr) {
+    static_cast<ObTsCbTask *>(link)->get_gts_callback(MonotonicTs(100), result, MonotonicTs(100));
+  }
+}
+
+TEST_P(TestGtsSourceLifecycle, nonlocal_sync_timeout_is_recycled_by_late_response)
+{
+  prepare_sync_request();
+  const uint64_t caller_tenant_id = 1004;
+  share::ObTenantBase caller_tenant(caller_tenant_id);
+  MAKE_TENANT_SWITCH_SCOPE_GUARD(caller_guard);
+  ASSERT_EQ(OB_SUCCESS, caller_guard.switch_to(&caller_tenant));
+  share::SCN result;
+  MonotonicTs received;
+  EXPECT_EQ(OB_TIMEOUT, mgr_->get_gts_sync(GetParam(), MonotonicTs(100), 1000, result, received));
+  auto &queue = source_->gts_source_.queue_[0];
+  ObLink *link = nullptr;
+  ASSERT_EQ(OB_SUCCESS, queue.queue_.pop(link));
+  ASSERT_NE(nullptr, link);
+  auto *task = static_cast<ObTsSyncGetTsCbTask *>(link);
+  EXPECT_EQ(caller_tenant_id, task->get_tenant_id());
+  EXPECT_EQ(GetParam(), source_->get_tenant_id());
+  EXPECT_TRUE(task->is_occupied_);
+  EXPECT_TRUE(task->is_early_exit_);
+  ASSERT_EQ(OB_SUCCESS, queue.push(task));
+  EXPECT_EQ(OB_SUCCESS, queue.foreach_task(MonotonicTs(100), 12345, MonotonicTs(100)));
+  EXPECT_FALSE(task->is_occupied_);
+  EXPECT_EQ(0, queue.get_task_count());
+  // Keep a failing run from contaminating the pool or fixture teardown.
+  link = nullptr;
+  (void)queue.queue_.pop(link);
+  if (link != nullptr) {
+    static_cast<ObTsCbTask *>(link)->get_gts_callback(MonotonicTs(100), result, MonotonicTs(100));
+  }
+  make_obsolete();
+  EXPECT_EQ(OB_SUCCESS, mgr_->delete_tenant_(GetParam(), true));
+  source_ = nullptr;
+}
+
+TEST_P(TestGtsSourceLifecycle, exited_caller_is_recycled_by_stale_response_or_ls_offline)
+{
+  prepare_sync_request();
+  share::ObTenantBase caller_tenant(1004);
+  MAKE_TENANT_SWITCH_SCOPE_GUARD(caller_guard);
+  ASSERT_EQ(OB_SUCCESS, caller_guard.switch_to(&caller_tenant));
+  auto &queue = source_->gts_source_.queue_[0];
+  for (bool interrupt : {false, true}) {
+    SCOPED_TRACE(interrupt);
+    share::SCN result;
+    MonotonicTs received;
+    EXPECT_EQ(OB_TIMEOUT, mgr_->get_gts_sync(GetParam(), MonotonicTs(100), 1000, result, received));
+    ObLink *link = nullptr;
+    ASSERT_EQ(OB_SUCCESS, queue.queue_.pop(link));
+    ASSERT_NE(nullptr, link);
+    auto *task = static_cast<ObTsSyncGetTsCbTask *>(link);
+    EXPECT_EQ(1004, task->get_tenant_id());
+    EXPECT_TRUE(task->is_early_exit_);
+    EXPECT_TRUE(task->is_occupied_);
+    ASSERT_EQ(OB_SUCCESS, queue.push(task));
+
+    // The caller tenant remains available, so cleanup must happen inside the
+    // normal callback even if the response is stale or the event is LS offline.
+    const int ret = interrupt
+        ? queue.gts_callback_interrupted(OB_LS_OFFLINE, share::ObLSID(1001))
+        : queue.foreach_task(MonotonicTs(99), 12345, MonotonicTs(100));
+    EXPECT_EQ(OB_SUCCESS, ret);
+    EXPECT_EQ(0, queue.get_task_count());
+    EXPECT_FALSE(task->is_occupied_);
+
+    // Clean up on the unfixed code too, without contaminating the next case.
+    link = nullptr;
+    (void)queue.queue_.pop(link);
+    if (link != nullptr) {
+      result.convert_for_gts(12345);
+      static_cast<ObTsCbTask *>(link)->get_gts_callback(MonotonicTs(100), result, MonotonicTs(100));
+    }
+  }
+  make_obsolete();
+  EXPECT_EQ(OB_SUCCESS, mgr_->delete_tenant_(GetParam(), true));
+  source_ = nullptr;
+}
+
+TEST_P(TestGtsSourceLifecycle, departed_caller_timeout_is_recycled_without_tenant)
+{
+  prepare_sync_request();
+  auto &pool = ObTsSyncGetTsCbTaskPool::get_instance();
+  auto &queue = source_->gts_source_.queue_[0];
+  // A current response, an older response, tenant stop and LS offline must all
+  // be able to discard a request whose waiter has already exited.
+  for (int event = 0; event < 4; ++event) {
+    ObTsSyncGetTsCbTask *task = nullptr;
+    {
+      share::ObTenantBase caller_tenant(1004);
+      MAKE_TENANT_SWITCH_SCOPE_GUARD(caller_guard);
+      ASSERT_EQ(OB_SUCCESS, caller_guard.switch_to(&caller_tenant));
+      share::SCN result;
+      MonotonicTs received;
+      EXPECT_EQ(OB_TIMEOUT, mgr_->get_gts_sync(GetParam(), MonotonicTs(100), 1000, result, received));
+      ObLink *link = nullptr;
+      ASSERT_EQ(OB_SUCCESS, queue.queue_.pop(link));
+      ASSERT_NE(nullptr, link);
+      task = static_cast<ObTsSyncGetTsCbTask *>(link);
+      EXPECT_EQ(1004, task->get_tenant_id());
+      EXPECT_TRUE(task->is_early_exit_);
+      EXPECT_TRUE(task->is_occupied_);
+      ASSERT_EQ(OB_SUCCESS, queue.push(task));
+    } // Destroy the caller's local context before processing its queued task.
+    {
+      MAKE_TENANT_SWITCH_SCOPE_GUARD(absent_guard);
+      ASSERT_NE(OB_SUCCESS, absent_guard.switch_to(1004));
+    }
+    auto process = [&] {
+      return event < 2
+          ? queue.foreach_task(MonotonicTs(event == 0 ? 100 : 99), 12345, MonotonicTs(100))
+          : queue.gts_callback_interrupted(event == 2 ? OB_TENANT_NOT_EXIST : OB_LS_OFFLINE,
+                                          share::ObLSID(1001));
+    };
+    EXPECT_EQ(OB_SUCCESS, process()) << "event=" << event;
+    EXPECT_EQ(0, queue.get_task_count());
+    EXPECT_FALSE(task->is_occupied_);
+    // Clean up on the unfixed code too, so one failure does not contaminate later cases.
+    ObLink *link = nullptr;
+    (void)queue.queue_.pop(link);
+    if (link != nullptr) {
+      share::SCN result;
+      result.convert_for_gts(12345);
+      static_cast<ObTsCbTask *>(link)->get_gts_callback(MonotonicTs(100), result, MonotonicTs(100));
+    }
+    // Reuse the same pool slot. A repeated event must not recycle this new request.
+    ObTsSyncGetTsCbTask *reused = nullptr;
+    ASSERT_EQ(OB_SUCCESS, pool.get_task(MonotonicTs(200), 1004, reused));
+    EXPECT_EQ(task, reused);
+    EXPECT_EQ(OB_SUCCESS, process());
+    EXPECT_TRUE(reused->is_occupied_);
+    EXPECT_EQ(OB_SUCCESS, pool.recycle_task(reused));
+  }
+  make_obsolete();
+  EXPECT_EQ(OB_SUCCESS, mgr_->delete_tenant_(GetParam(), true));
+  source_ = nullptr;
+}
+
+TEST(TestGtsTaskQueue, timeout_during_queue_processing_is_recycled_after_switch_failure)
+{
+  auto &pool = ObTsSyncGetTsCbTaskPool::get_instance();
+  if (!pool.is_inited_) {
+    ASSERT_EQ(OB_SUCCESS, pool.init());
+  }
+  class TimeoutOnTenantLookupTask : public ObTsSyncGetTsCbTask
+  {
+  public:
+    uint64_t get_tenant_id() const override
+    {
+      // Force wait() to exit after the task is dequeued, but before switching
+      // to the now-unavailable caller. Exercise both queue entrances.
+      share::SCN result;
+      bool recycle = true;
+      EXPECT_EQ(OB_TIMEOUT, const_cast<TimeoutOnTenantLookupTask *>(this)->wait(1, result, recycle));
+      EXPECT_FALSE(recycle);
+      return ObTsSyncGetTsCbTask::get_tenant_id();
+    }
+  };
+  for (bool interrupt : {false, true}) {
+    TimeoutOnTenantLookupTask task;
+    ASSERT_EQ(OB_SUCCESS, task.init(0));
+    ASSERT_EQ(OB_SUCCESS, task.config(MonotonicTs(100), 1004));
+    task.is_occupied_ = true;
+    ObGTSTaskQueue queue;
+    ASSERT_EQ(OB_SUCCESS, queue.init(GET_GTS));
+    ASSERT_EQ(OB_SUCCESS, queue.push(&task));
+    const int ret = interrupt
+        ? queue.gts_callback_interrupted(OB_TENANT_NOT_EXIST, share::ObLSID(1001))
+        : queue.foreach_task(MonotonicTs(100), 12345, MonotonicTs(100));
+    EXPECT_EQ(OB_SUCCESS, ret);
+    EXPECT_TRUE(task.is_early_exit_);
+    EXPECT_FALSE(task.is_occupied_);
+    EXPECT_EQ(0, queue.get_task_count());
+    ObLink *link = nullptr;
+    (void)queue.queue_.pop(link);
+  }
+}
+
+TEST(TestGtsTaskQueue, waiting_sync_task_still_requires_caller_and_fresh_response)
+{
+  auto &pool = ObTsSyncGetTsCbTaskPool::get_instance();
+  if (!pool.is_inited_) {
+    ASSERT_EQ(OB_SUCCESS, pool.init());
+  }
+  ObTsSyncGetTsCbTask *task = nullptr;
+  ASSERT_EQ(OB_SUCCESS, pool.get_task(MonotonicTs(100), 1004, task));
+  ObGTSTaskQueue queue;
+  ASSERT_EQ(OB_SUCCESS, queue.init(GET_GTS));
+  ASSERT_EQ(OB_SUCCESS, queue.push(task));
+  EXPECT_NE(OB_SUCCESS, queue.foreach_task(MonotonicTs(100), 12345, MonotonicTs(100)));
+  EXPECT_EQ(1, queue.get_task_count());
+  EXPECT_TRUE(task->is_occupied_);
+  EXPECT_FALSE(task->is_finished_);
+  share::ObTenantBase caller_tenant(1004);
+  MAKE_TENANT_SWITCH_SCOPE_GUARD(caller_guard);
+  ASSERT_EQ(OB_SUCCESS, caller_guard.switch_to(&caller_tenant));
+  EXPECT_EQ(OB_EAGAIN, queue.foreach_task(MonotonicTs(99), 12345, MonotonicTs(100)));
+  EXPECT_EQ(OB_SUCCESS, queue.gts_callback_interrupted(OB_LS_OFFLINE, share::ObLSID(1001)));
+  EXPECT_EQ(1, queue.get_task_count());
+  EXPECT_FALSE(task->is_finished_);
+  EXPECT_EQ(OB_SUCCESS, queue.foreach_task(MonotonicTs(100), 12345, MonotonicTs(100)));
+  EXPECT_EQ(0, queue.get_task_count());
+  share::SCN result;
+  bool recycle = false;
+  EXPECT_EQ(OB_SUCCESS, task->wait(1000, result, recycle));
+  EXPECT_TRUE(recycle);
+  EXPECT_EQ(12345, result.get_val_for_tx());
+  EXPECT_EQ(OB_SUCCESS, pool.recycle_task(task));
+}
 
 TEST(TestGtsTaskQueue, tenant_switch_failure_preserves_task_for_retry)
 {

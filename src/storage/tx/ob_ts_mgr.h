@@ -68,6 +68,9 @@ public:
   virtual MonotonicTs get_stc() const = 0;
   virtual uint64_t hash() const = 0;
   virtual uint64_t get_tenant_id() const = 0;
+  // Called only after removing the task from its queue, without a tenant context.
+  // A true result releases ownership: the caller must not access this task again.
+  virtual bool try_recycle_on_early_exit() { return false; }
   VIRTUAL_TO_STRING_KV("", "");
 };
 
@@ -304,6 +307,7 @@ public:
   MonotonicTs get_stc() const override;
   uint64_t hash() const override;
   uint64_t get_tenant_id() const override;
+  bool try_recycle_on_early_exit() override;
   int wait(const int64_t timeout_us, share::SCN &scn, bool &need_recycle_task);
 private:
   bool is_inited_;

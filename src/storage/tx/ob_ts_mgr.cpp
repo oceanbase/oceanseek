@@ -107,24 +107,46 @@ int ObTsSyncGetTsCbTask::init(uint64_t task_id)
   return ret;
 }
 
+bool ObTsSyncGetTsCbTask::try_recycle_on_early_exit()
+{
+  bool early_exit = false;
+  if (is_inited_) {
+    {
+      ObThreadCondGuard cond_guard(cond_);
+      early_exit = is_early_exit_;
+    }
+    // wait() has handed ownership to the queue. Release the condition lock
+    // before publishing the slot, since another caller can reuse it immediately.
+    if (early_exit) {
+      ObTsSyncGetTsCbTaskPool::get_instance().recycle_task(this);
+    }
+  }
+  return early_exit;
+}
+
 int ObTsSyncGetTsCbTask::gts_callback_interrupted(const int errcode, const share::ObLSID ls_id)
 {
   int ret = OB_SUCCESS;
+  bool need_recycle = false;
 
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     TRANS_LOG(WARN, "not init", K(ret));
-  } else if (OB_LS_OFFLINE == errcode) {
-    ret = OB_EAGAIN;
   } else {
     ObThreadCondGuard cond_guard(cond_);
     if (is_early_exit_) {
-      ObTsSyncGetTsCbTaskPool::get_instance().recycle_task(this);
+      need_recycle = true;
+    } else if (OB_LS_OFFLINE == errcode) {
+      ret = OB_EAGAIN;
     } else {
       errcode_ = errcode;
       is_finished_ = true;
       cond_.signal();
     }
+  }
+  // Release the condition lock before another caller can reuse this slot.
+  if (need_recycle) {
+    ObTsSyncGetTsCbTaskPool::get_instance().recycle_task(this);
   }
 
   return ret;
@@ -134,21 +156,26 @@ int ObTsSyncGetTsCbTask::get_gts_callback(const MonotonicTs srr, const share::SC
     const MonotonicTs receive_gts_ts)
 {
   int ret = OB_SUCCESS;
+  bool need_recycle = false;
 
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     TRANS_LOG(WARN, "not init", K(ret));
-  } else if (srr < get_stc()) {
-    ret = OB_EAGAIN;
   } else {
     ObThreadCondGuard cond_guard(cond_);
     if (is_early_exit_) {
-      ObTsSyncGetTsCbTaskPool::get_instance().recycle_task(this);
+      need_recycle = true;
+    } else if (srr < get_stc()) {
+      ret = OB_EAGAIN;
     } else {
       gts_result_ = gts;
       is_finished_ = true;
       cond_.signal();
     }
+  }
+  // An exited waiter no longer needs a fresh timestamp, only safe recycling.
+  if (need_recycle) {
+    ObTsSyncGetTsCbTaskPool::get_instance().recycle_task(this);
   }
 
   return ret;
@@ -968,6 +995,8 @@ int ObTsMgr::get_gts_sync(const uint64_t tenant_id,
     ObTsSyncGetTsCbTask *task = NULL;
     int64_t gts_result = 0;
     bool fall_back_to_sleep = false;
+    // Bind callback execution and accounting to the caller's tenant, which may
+    // differ from the tenant whose GTS is requested. Keep the source lookup unchanged.
     if (OB_FAIL(get_ts_source_info_opt_(tenant_id, info_guard, true, true))) {
       TRANS_LOG(WARN, "get ts source info failed", K(ret), K(tenant_id));
     } else if (OB_ISNULL(ts_source_info = info_guard.get_ts_source_info())) {
@@ -976,7 +1005,7 @@ int ObTsMgr::get_gts_sync(const uint64_t tenant_id,
     } else if (OB_ISNULL(ts_source = ts_source_info->get_gts_source())) {
       ret = OB_ERR_UNEXPECTED;
       TRANS_LOG(WARN, "ts source is NULL", K(ret));
-    } else if (OB_SUCC(ObTsSyncGetTsCbTaskPool::get_instance().get_task(stc, tenant_id, task))) {
+    } else if (OB_SUCC(ObTsSyncGetTsCbTaskPool::get_instance().get_task(stc, MTL_ID(), task))) {
       bool need_recycle_task = true;
       if (OB_FAIL(ts_source->get_gts(stc, task, gts_result, receive_gts_ts))) {
         if (OB_EAGAIN != ret) {

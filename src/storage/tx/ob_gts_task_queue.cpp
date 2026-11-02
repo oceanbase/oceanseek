@@ -75,15 +75,23 @@ int ObGTSTaskQueue::foreach_task(const MonotonicTs srr,
         const int64_t request_ts = 0/*task->get_request_ts()*/;
         if (tenant_id != last_tenant_id) {
           if (OB_FAIL(ts_guard.switch_to(tenant_id))) {
-            TRANS_LOG(ERROR, "switch tenant failed", K(ret), K(tenant_id));
-            // No callback took ownership. Keep the task and its ctx reference
-            // for retry. Pushing a non-null intrusive task cannot fail.
-            (void)queue_.push(task);
+            // A timed-out caller may have left this server before its callback.
+            if (task->try_recycle_on_early_exit()) {
+              task = NULL;
+              ts_guard.release();
+              last_tenant_id = OB_INVALID_TENANT_ID;
+              ret = OB_SUCCESS;
+            } else {
+              TRANS_LOG(ERROR, "switch tenant failed", K(ret), K(tenant_id));
+              // No callback took ownership. Keep the task and its ctx reference
+              // for retry. Pushing a non-null intrusive task cannot fail.
+              (void)queue_.push(task);
+            }
           } else {
             last_tenant_id = tenant_id;
           }
         }
-        if (OB_SUCC(ret)) {
+        if (OB_SUCC(ret) && NULL != task) {
           SCN scn;
           scn.convert_for_gts(gts);
           if (GET_GTS == task_type_) {
@@ -192,6 +200,8 @@ int ObGTSTaskQueue::gts_callback_interrupted(const int errcode, const share::ObL
           } else {
             TRANS_LOG(DEBUG, "gts callback interrupted success", KP(task));
           }
+        } else if (task->try_recycle_on_early_exit()) {
+          ret = OB_SUCCESS;
         } else {
           error_count++;
           TRANS_LOG(ERROR, "switch tenant failed", KR(ret), K(errcode), K(ls_id));
