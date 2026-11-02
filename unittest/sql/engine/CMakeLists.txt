@@ -3,6 +3,7 @@ sql_unittest(test_physical_plan)
 sql_unittest(test_sql_fixed_array)
 sql_unittest(test_bit_vector)
 sql_unittest(test_physical_plan_ctx_serialize_compat)
+sql_unittest(test_sstable_insert_doc_id)
 
 add_subdirectory(aggregate)
 add_subdirectory(dml)
