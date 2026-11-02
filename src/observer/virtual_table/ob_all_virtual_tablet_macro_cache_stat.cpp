@@ -9,6 +9,7 @@
 #include "lib/charset/ob_charset.h"
 #include "lib/thread/thread.h"
 #include "observer/ob_server_struct.h"
+#include "share/ob_debug_sync.h"
 #include "share/ob_i_tablet_scan.h"
 #include "share/ob_share_util.h"
 #include "share/schema/ob_multi_version_schema_service.h"
@@ -632,6 +633,7 @@ int ObAllVirtualTabletMacroCacheStat::collect_tablet_stat_(
   ObArenaAllocator macro_allocator(ObMemAttr(MTL_ID(), "VTTabCacheMac"));
   ObMacroInfoIterator macro_iter;
   ObTabletBlockInfo block_info;
+  int64_t scanned_macro_block_count = 0;
 
   if (OB_UNLIKELY(OB_INVALID_ID == table_id || !ls_id.is_valid() || !tablet_id.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
@@ -673,6 +675,9 @@ int ObAllVirtualTabletMacroCacheStat::collect_tablet_stat_(
   } else if (OB_FAIL(scp_service->get_tablet_policy_status(tablet_id.id(), stat.policy_status_))) {
     SERVER_LOG(WARN, "fail to get tablet storage cache policy",
         KR(ret), K(ls_id), K(tablet_id));
+  } else if (OB_FAIL(THIS_WORKER.check_status())) {
+    SERVER_LOG(WARN, "tablet macro cache scan is interrupted before loading macro info",
+        KR(ret), K(table_id), K(ls_id), K(tablet_id));
   } else if (OB_FAIL(tablet->load_macro_info(ls->get_ls_epoch(), macro_allocator, macro_info))) {
     SERVER_LOG(WARN, "fail to load tablet macro info", KR(ret), K(ls_id), K(tablet_id));
   } else if (OB_ISNULL(macro_info)) {
@@ -685,6 +690,10 @@ int ObAllVirtualTabletMacroCacheStat::collect_tablet_stat_(
     stat.ls_id_ = ls_id;
     stat.tablet_id_ = tablet_id;
     stat.transfer_scn_ = tablet->get_reorganization_scn();
+    if (OB_FAIL(THIS_WORKER.check_status())) {
+      SERVER_LOG(WARN, "tablet macro cache scan is interrupted before iteration",
+          KR(ret), K(table_id), K(ls_id), K(tablet_id));
+    }
     while (OB_SUCC(ret)) {
       block_info.reset();
       if (OB_FAIL(macro_iter.get_next(block_info))) {
@@ -692,6 +701,21 @@ int ObAllVirtualTabletMacroCacheStat::collect_tablet_stat_(
           SERVER_LOG(WARN, "fail to get next tablet macro block",
               KR(ret), K(ls_id), K(tablet_id), K(block_info));
         }
+      } else {
+        ++scanned_macro_block_count;
+        if (1 == scanned_macro_block_count) {
+          // Pause after traversal starts so timeout tests exercise single-tablet cancellation.
+          DEBUG_SYNC(TABLET_MACRO_CACHE_STAT_AFTER_FIRST_MACRO_BLOCK);
+        }
+        if (0 == (scanned_macro_block_count % MACRO_BLOCK_STATUS_CHECK_INTERVAL)) {
+          DEBUG_SYNC(TABLET_MACRO_CACHE_STAT_BEFORE_STATUS_CHECK);
+          if (OB_FAIL(THIS_WORKER.check_status())) {
+            SERVER_LOG(WARN, "tablet macro cache scan is interrupted",
+                KR(ret), K(table_id), K(ls_id), K(tablet_id), K(scanned_macro_block_count));
+          }
+        }
+      }
+      if (OB_FAIL(ret)) {
       } else if (SSObjUtil::is_macro_data(block_info.macro_id())
           || SSObjUtil::is_macro_meta(block_info.macro_id())) {
         bool is_exist = false;
@@ -715,7 +739,10 @@ int ObAllVirtualTabletMacroCacheStat::collect_tablet_stat_(
     if (OB_ITER_END == ret) {
       ret = OB_SUCCESS;
     }
-    if (OB_SUCC(ret)) {
+    if (FAILEDx(THIS_WORKER.check_status())) {
+      SERVER_LOG(WARN, "tablet macro cache scan is interrupted after iteration",
+          KR(ret), K(table_id), K(ls_id), K(tablet_id), K(scanned_macro_block_count));
+    } else {
       has_row = true;
     }
   }

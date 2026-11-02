@@ -154,6 +154,8 @@ private:
   // 10/20/40/80/160 ms backoff, for at most 310 ms of total waiting.
   static constexpr int64_t INITIAL_PREPARE_RETRY_INTERVAL_US = 10_ms;
   static constexpr int64_t MAX_PREPARE_RETRY_COUNT = 5;
+  // Bound cancellation latency without checking worker status for every macro block.
+  static constexpr int64_t MACRO_BLOCK_STATUS_CHECK_INTERVAL = 1024;
   static constexpr int64_t INDEX_TARGET_KEY_IDX = 0;
   static constexpr int64_t MIN_INDEX_ROWKEY_COL_CNT = 1;
 
