@@ -2,6 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 #define USING_LOG_PREFIX STORAGE_COMPACTION
 #include "ob_ss_link_major_task.h"
+#ifdef ERRSIM
+#include "storage/ss_garbage_collector/ob_ss_gc_util.h"
+#endif
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/ob_storage_schema_util.h"
 #include "storage/shared_storage/prewarm/ob_mc_prewarm_struct.h"
@@ -263,7 +266,8 @@ int ObTabletSSLinkMajorTask::do_link_(ObLSHandle &ls_handle,
       }
     }
 #ifdef ERRSIM
-    if (SS_EN_COMPACTION_REFRESH_MULTI_VERSION_START) {
+    if (storage::ObSSGCUtil::is_errsim_target(MTL_ID(), tablet_id_.id())
+        && SS_EN_COMPACTION_REFRESH_MULTI_VERSION_START) {
       param.multi_version_start_ = sstable.get_snapshot_version();
       FLOG_INFO("ERRSIM SS_EN_COMPACTION_REFRESH_MULTI_VERSION_START", KR(ret), K(param.multi_version_start_));
     }

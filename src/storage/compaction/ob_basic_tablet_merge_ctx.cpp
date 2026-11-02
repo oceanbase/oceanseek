@@ -3,6 +3,9 @@
 #include "lib/ob_errno.h"
 #define USING_LOG_PREFIX STORAGE_COMPACTION
 #include "ob_basic_tablet_merge_ctx.h"
+#ifdef ERRSIM
+#include "storage/ss_garbage_collector/ob_ss_gc_util.h"
+#endif
 #include "storage/compaction/ob_medium_compaction_func.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/tablet/ob_tablet_medium_info_reader.h"
@@ -1354,7 +1357,8 @@ int ObBasicTabletMergeCtx::build_update_table_store_param(
     param.snapshot_version_ = static_param_.version_range_.snapshot_version_;
     param.multi_version_start_ = get_tablet_id().can_major_merge() ? static_param_.version_range_.multi_version_start_ : 1;
 #ifdef ERRSIM
-    if (EN_COMPACTION_REFRESH_MULTI_VERSION_START && is_major_merge_type(merge_type)) {
+    if (storage::ObSSGCUtil::is_errsim_target(MTL_ID(), get_tablet_id().id())
+        && is_major_merge_type(merge_type) && EN_COMPACTION_REFRESH_MULTI_VERSION_START) {
       param.multi_version_start_ = static_param_.version_range_.snapshot_version_;
       FLOG_INFO("ERRSIM EN_COMPACTION_REFRESH_MULTI_VERSION_START", KR(ret), K(static_param_), K(param.multi_version_start_));
     }

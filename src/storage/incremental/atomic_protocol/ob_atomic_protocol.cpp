@@ -627,8 +627,24 @@ int ObAtomicProtocol::abort_(
     LOG_WARN("failed to check can do abort", K(ret));
   }
 #ifdef ERRSIM
-  if (OB_SUCC(ret)) {
-    INJECT_SS_GC_ERRSIM(EN_SS_ATOMIC_PROTOCOL_ABORT_FAIL);
+  if (OB_SUCC(ret) && ObSSGCUtil::is_errsim_target(tenant_id)) {
+    bool should_inject = ObSSGCUtil::is_errsim_target(
+        tenant_id, ObTabletID::INVALID_TABLET_ID);
+    uint64_t key_tablet_id = ObTabletID::INVALID_TABLET_ID;
+    if (!should_inject) {
+      ObSSMetaCtrlKey ctrl_key;
+      if (OB_SUCCESS == prepare_ss_meta_ctrl_key_(ctrl_key)) {
+        if (type_.is_sstable_level()) {
+          key_tablet_id = ctrl_key.sstable_key_.tablet_id_.id();
+        } else if (type_.is_tablet_level()) {
+          key_tablet_id = ctrl_key.tablet_key_.tablet_id_.id();
+        }
+        should_inject = ObSSGCUtil::is_errsim_target(tenant_id, key_tablet_id);
+      }
+    }
+    if (should_inject) {
+      INJECT_SS_GC_ERRSIM(EN_SS_ATOMIC_PROTOCOL_ABORT_FAIL, tenant_id);
+    }
   }
 #endif
   if (OB_FAIL(ret)) {
@@ -707,6 +723,9 @@ int ObAtomicProtocol::finish_(
   int tmp_ret = OB_SUCCESS;
   ObTimeoutCtx timeout_ctx;
   const int64_t stmt_timeout = sql_timeout_us_;
+#ifdef ERRSIM
+  bool should_inject = false;
+#endif
 
   if (OB_INVALID_ID == tenant_id || !ls_id.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
@@ -718,10 +737,9 @@ int ObAtomicProtocol::finish_(
     LOG_WARN("failed to on finish", K(ret), K(tenant_id), K(ls_id), K(tablet_id));
   }
 #ifdef ERRSIM
-  if (OB_SUCC(ret)) {
-    const int64_t filter_tablet_id = GCONF.errsim_atomic_protocol_finish_fail_tablet_id;
-    bool should_inject = (0 == filter_tablet_id);
-    int64_t key_tablet_id = ObTabletID::INVALID_TABLET_ID;
+  if (OB_SUCC(ret) && ObSSGCUtil::is_errsim_target(tenant_id)) {
+    should_inject = ObSSGCUtil::is_errsim_target(tenant_id, ObTabletID::INVALID_TABLET_ID);
+    uint64_t key_tablet_id = ObTabletID::INVALID_TABLET_ID;
     if (!should_inject) {
       ObSSMetaCtrlKey ctrl_key;
       if (OB_SUCCESS == prepare_ss_meta_ctrl_key_(ctrl_key)) {
@@ -730,7 +748,7 @@ int ObAtomicProtocol::finish_(
         } else if (type_.is_tablet_level()) {
           key_tablet_id = ctrl_key.tablet_key_.tablet_id_.id();
         }
-        should_inject = (filter_tablet_id == key_tablet_id);
+        should_inject = ObSSGCUtil::is_errsim_target(tenant_id, key_tablet_id);
       }
     }
     if (should_inject) {
@@ -738,12 +756,12 @@ int ObAtomicProtocol::finish_(
         ObSSMetaCtrlType ctrl_type;
         int tmp_ret = type_.get_ss_meta_ctrl_type(ctrl_type);
         if (OB_SUCCESS == tmp_ret && ctrl_type.is_major_sstable_type()) {
-          INJECT_SS_GC_ERRSIM(EN_SS_ATOMIC_PROTOCOL_FINISH_FAIL_MAJOR_SSTABLE);
+          INJECT_SS_GC_ERRSIM(EN_SS_ATOMIC_PROTOCOL_FINISH_FAIL_MAJOR_SSTABLE, tenant_id);
         } else {
-          INJECT_SS_GC_ERRSIM(EN_SS_ATOMIC_PROTOCOL_FINISH_FAIL_NONE_MAJOR_SSTABLE);
+          INJECT_SS_GC_ERRSIM(EN_SS_ATOMIC_PROTOCOL_FINISH_FAIL_NONE_MAJOR_SSTABLE, tenant_id);
         }
       } else if (type_.is_tablet_level()) {
-        INJECT_SS_GC_ERRSIM(EN_SS_ATOMIC_PROTOCOL_FINISH_FAIL_TABLET_META);
+        INJECT_SS_GC_ERRSIM(EN_SS_ATOMIC_PROTOCOL_FINISH_FAIL_TABLET_META, tenant_id);
       }
       // LS-level intentionally has no errsim hook -- fail-gc never generates
       // tasks for ls-type ctrl rows, so injecting here would only cause noise.
@@ -796,7 +814,7 @@ int ObAtomicProtocol::finish_(
         }
 
 #ifdef ERRSIM
-        if (OB_SUCC(ret)) {
+        if (OB_SUCC(ret) && should_inject) {
           ret = EN_ATOMIC_PROTOCOL_FINISH_FAIL ? : OB_SUCCESS;
           if (OB_FAIL(ret)) {
             STORAGE_LOG(ERROR, "fake EN_ATOMIC_PROTOCOL_FINISH_FAIL", K(ret));
@@ -805,7 +823,7 @@ int ObAtomicProtocol::finish_(
 #endif
 
 #ifdef ERRSIM
-        if (OB_SUCC(ret) && type_.is_tablet_level()) {
+        if (OB_SUCC(ret) && should_inject && type_.is_tablet_level()) {
           ret = EN_ATOMIC_PROTOCOL_TABLET_FINISH_FAIL ? : OB_SUCCESS;
           if (OB_FAIL(ret)) {
             STORAGE_LOG(ERROR, "fake EN_ATOMIC_PROTOCOL_TABLET_FINISH_FAIL", K(ret));

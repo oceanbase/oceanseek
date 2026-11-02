@@ -476,7 +476,7 @@ int ObExecuteBaseTask::process_slice_()
 
 #ifdef ERRSIM
   if (OB_SUCC(ret) && ObSharedGCTaskType::FAIL_GC == get_gc_type_()) {
-    INJECT_SS_GC_ERRSIM(EN_SS_FAIL_GC_EXEC_PROCESS_SLICE_ERROR);
+    INJECT_SS_GC_ERRSIM(EN_SS_FAIL_GC_EXEC_PROCESS_SLICE_ERROR, tenant_id_);
   }
 #endif
 
@@ -938,7 +938,9 @@ int ObFailGCExecuteTask::process_row_(
   }
 
 #ifdef ERRSIM
-  INJECT_SS_GC_ERRSIM(EN_SS_FAIL_GC_EXEC_PROCESS_ROW_ERROR);
+  if (OB_SUCC(ret) && ObSSGCUtil::is_errsim_target(row.key_.tenant_id_, info.tablet_id_.id())) {
+    INJECT_SS_GC_ERRSIM(EN_SS_FAIL_GC_EXEC_PROCESS_ROW_ERROR, row.key_.tenant_id_);
+  }
 #endif
 
   if (OB_FAIL(ret)) {

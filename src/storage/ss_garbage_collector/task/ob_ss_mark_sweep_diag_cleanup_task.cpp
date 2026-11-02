@@ -248,7 +248,7 @@ void ObSSMarkSweepDiagCleanupTask::get_gc_exec_interval_us_(int64_t &exec_interv
 {
 #ifdef ERRSIM
   int ret = OB_SUCCESS;
-  INJECT_SS_GC_ERRSIM(EN_SS_MARK_SWEEP_DIAG_CLEANUP_INTERVAL);
+  INJECT_SS_GC_ERRSIM(EN_SS_MARK_SWEEP_DIAG_CLEANUP_INTERVAL, tenant_id_);
   exec_interval_us = OB_SUCC(ret) ? SCHEDULE_INTERVAL_US : ERRSIM_INTERVAL_US;
 #else
   exec_interval_us = SCHEDULE_INTERVAL_US;

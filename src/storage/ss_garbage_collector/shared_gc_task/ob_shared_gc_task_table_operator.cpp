@@ -15,6 +15,9 @@
 #include "lib/mysqlclient/ob_mysql_transaction.h"
 #include "lib/utility/ob_tracepoint.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
+#ifdef ERRSIM
+#include "storage/ss_garbage_collector/ob_ss_gc_util.h"
+#endif
 #include "share/ob_cluster_version.h"
 #include "share/ob_dml_sql_splicer.h"
 #include "share/inner_table/ob_inner_table_schema_constants.h"
@@ -1409,6 +1412,9 @@ int ObSharedGCTaskTableOperator::batch_delete_tasks_and_insert_histories(
         if (OB_FAIL(trans.write(real_tenant_id, del_sql.ptr(), group_id, del_affected))) {
           LOG_WARN("fail to batch delete task rows", KR(ret), K(tenant_id), K(del_sql));
         } else if (has_mark_sweep_gc_task
+#ifdef ERRSIM
+            && ObSSGCUtil::is_errsim_target(tenant_id)
+#endif
             && OB_FAIL(OB_E(EN_SS_MARK_SWEEP_GC_HISTORY_INSERT_ERROR, GETTID()) OB_SUCCESS)) {
           LOG_WARN("inject mark sweep gc history insert error", KR(ret), K(tenant_id));
         } else if (OB_FAIL(batch_insert_histories_(

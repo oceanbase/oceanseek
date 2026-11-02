@@ -15,6 +15,9 @@
 #include "observer/omt/ob_tenant_config_mgr.h"
 #include "share/backup/ob_backup_io_adapter.h"
 #include "share/config/ob_server_config.h"
+#ifdef ERRSIM
+#include "storage/ss_garbage_collector/ob_ss_gc_util.h"
+#endif
 #include "share/ob_cluster_version.h"
 #include "share/ob_debug_sync.h"
 #include "share/io/ob_io_define.h"
@@ -1036,8 +1039,14 @@ int ObSSMarkSweepDiagMgr::write_study_diag_(
         bucket, buffer.buf_, buffer.len_, buffer.record_lens_))) {
       LOG_WARN("fail to write study diagnose batch", KR(ret), K(round_id));
     } else if (buffer.len_ > 0) {
+      bool should_debug_sync = true;
       stat.append_record_count_ += buffer.record_lens_.count();
-      DEBUG_SYNC(AFTER_SS_MARK_SWEEP_STUDY_DIAG_BATCH);
+#ifdef ERRSIM
+      should_debug_sync = ObSSGCUtil::is_errsim_target(tenant_id);
+#endif
+      if (OB_SUCC(ret) && should_debug_sync) {
+        DEBUG_SYNC(AFTER_SS_MARK_SWEEP_STUDY_DIAG_BATCH);
+      }
     }
     stat.record_failure(ret, "write");
   }

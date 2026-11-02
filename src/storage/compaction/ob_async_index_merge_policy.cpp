@@ -6,6 +6,9 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/compaction/ob_async_index_merge_policy.h"
+#ifdef ERRSIM
+#include "storage/ss_garbage_collector/ob_ss_gc_util.h"
+#endif
 #include "share/schema/ob_async_index_params.h"
 #include "storage/tablet/ob_tablet.h"
 #include "storage/tablet/ob_table_store_util.h"
@@ -741,7 +744,12 @@ int ObAsyncIndexMergePolicy::choose_async_index_merge_range(
       }
     }
     if (OB_FAIL(ret)) {
-    } else if (ERRSIM_FORCE_ASYNC_INDEX_INC_MERGE != OB_SUCCESS && final_merge_info_cnt > 2) {
+    } else if (final_merge_info_cnt > 2
+#ifdef ERRSIM
+        && storage::ObSSGCUtil::is_errsim_target(
+            ls.get_tenant_id(), data_tablet.get_tablet_meta().tablet_id_.id())
+#endif
+        && ERRSIM_FORCE_ASYNC_INDEX_INC_MERGE != OB_SUCCESS) {
       if (final_merge_infos.at(0).start_snapshot_version_ == 0) {
         merge_version_range.base_version_ = final_merge_infos.at(1).start_snapshot_version_;
       } else {

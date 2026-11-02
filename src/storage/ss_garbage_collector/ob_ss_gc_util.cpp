@@ -46,6 +46,24 @@ using namespace oceanbase::share;
 using namespace oceanbase::blocksstable;
 
 #ifdef ERRSIM
+bool ObSSGCUtil::is_errsim_target(const uint64_t tenant_id)
+{
+  const int64_t filter_tenant_id = GCONF.errsim_shared_gc_tenant_id;
+  const bool bool_ret = (0 == filter_tenant_id
+      || static_cast<uint64_t>(filter_tenant_id) == tenant_id);
+  return bool_ret;
+}
+
+bool ObSSGCUtil::is_errsim_target(
+    const uint64_t tenant_id,
+    const uint64_t tablet_id)
+{
+  const int64_t filter_tablet_id = GCONF.errsim_shared_gc_tablet_id;
+  const bool bool_ret = is_errsim_target(tenant_id)
+      && (0 == filter_tablet_id || static_cast<uint64_t>(filter_tablet_id) == tablet_id);
+  return bool_ret;
+}
+
 ERRSIM_POINT_DEF(EN_SS_GC_READ_LS_CKPT_META_ERROR);
 #endif
 
@@ -119,6 +137,7 @@ int ObSSGCUtil::get_ls_ckpt_meta_scn_from_palf_kv(
 #ifdef ERRSIM
     } else if (GCONF.enable_logservice && is_sys_tenant(tenant_id)
         && is_sys_tenant(MTL_ID()) && ls_id.is_sys_ls()
+        && is_errsim_target(tenant_id)
         && OB_FAIL(OB_E(EN_SS_GC_READ_LS_CKPT_META_ERROR, GETTID()) OB_SUCCESS)) {
       // 仅模拟 GC 读取 PALF 的错误，不改变实际 key 的存在状态。
       LOG_INFO("inject ls checkpoint meta read error", KR(ret), K(tenant_id), K(ls_id));

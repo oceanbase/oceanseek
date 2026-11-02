@@ -1990,7 +1990,9 @@ int ObSSMarkSweepSortTask::ProcessOneTabletFn::operator()()
 {
   int ret = OB_SUCCESS;
 #ifdef ERRSIM
-  DEBUG_SYNC(BEFORE_SS_MARK_SWEEP_SORT);
+  if (ObSSGCUtil::is_errsim_target(ctx_.tenant_id_, tablet_.gc_tablet_.tablet_id_.id())) {
+    DEBUG_SYNC(BEFORE_SS_MARK_SWEEP_SORT);
+  }
 #endif
   persist_item_.reset();
   if (OB_FAIL(task_.process_one_tablet_(
@@ -1998,7 +2000,9 @@ int ObSSMarkSweepSortTask::ProcessOneTabletFn::operator()()
     LOG_WARN("fail to process one tablet", KR(ret), K_(tablet));
   }
 #ifdef ERRSIM
-  INJECT_SS_GC_ERRSIM(EN_SS_MARK_SWEEP_SORT_ERROR);
+  if (ObSSGCUtil::is_errsim_target(ctx_.tenant_id_, tablet_.gc_tablet_.tablet_id_.id())) {
+    INJECT_SS_GC_ERRSIM(EN_SS_MARK_SWEEP_SORT_ERROR, ctx_.tenant_id_);
+  }
 #endif
   if (OB_FAIL(ret) && OB_NOT_NULL(task_.get_dag())) {
     SERVER_EVENT_ADD("SHARED_GC", "MARK_SWEEP_SORT_FAIL",
@@ -2396,7 +2400,7 @@ int ObSSMarkSweepMergeBatchTask::MergeBatchFn::operator()()
     ctx_.progress_.inc_cur_pass_merged_files(group_, end - start);
   }
 #ifdef ERRSIM
-  INJECT_SS_GC_ERRSIM(EN_SS_MARK_SWEEP_MERGE_BATCH_ERROR);
+  INJECT_SS_GC_ERRSIM(EN_SS_MARK_SWEEP_MERGE_BATCH_ERROR, ctx_.tenant_id_);
 #endif
   if (OB_FAIL(ret) && OB_NOT_NULL(task_.get_dag())) {
     SERVER_EVENT_ADD("SHARED_GC", "MARK_SWEEP_MERGE_BATCH_FAIL",
@@ -2497,7 +2501,7 @@ int ObSSMarkSweepMergeCompleteTask::CompleteMergeFn::operator()()
     ctx_.cost_stat_.set_merged_file_size(merged_del_size, merged_kept_size);
   }
 #ifdef ERRSIM
-  INJECT_SS_GC_ERRSIM(EN_SS_MARK_SWEEP_MERGE_COMPLETE_ERROR);
+  INJECT_SS_GC_ERRSIM(EN_SS_MARK_SWEEP_MERGE_COMPLETE_ERROR, ctx_.tenant_id_);
 #endif
   if (OB_FAIL(ret) && OB_NOT_NULL(task_.get_dag())) {
     SERVER_EVENT_ADD("SHARED_GC", "MARK_SWEEP_MERGE_COMPLETE_FAIL",
@@ -2654,14 +2658,14 @@ int ObSSMarkSweepDiffTask::DiffFn::operator()()
     }
   }
 #ifdef ERRSIM
-  INJECT_SS_GC_ERRSIM(EN_SS_MARK_SWEEP_DIFF_ERROR_BEFORE_DEL_META);
+  INJECT_SS_GC_ERRSIM(EN_SS_MARK_SWEEP_DIFF_ERROR_BEFORE_DEL_META, ctx_.tenant_id_);
 #endif
   int64_t affected_rows = 0;
   if (FAILEDx(delete_meta_scns_())) {
     LOG_WARN("fail to delete meta scns", KR(ret));
   }
 #ifdef ERRSIM
-  INJECT_SS_GC_ERRSIM(EN_SS_MARK_SWEEP_DIFF_ERROR_BEFORE_UP_ROUND_ID);
+  INJECT_SS_GC_ERRSIM(EN_SS_MARK_SWEEP_DIFF_ERROR_BEFORE_UP_ROUND_ID, ctx_.tenant_id_);
 #endif
   if (OB_FAIL(ret)) {
   } else if (OB_ISNULL(GCTX.sql_proxy_)) {

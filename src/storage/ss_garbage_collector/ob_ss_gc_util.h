@@ -26,6 +26,16 @@ public:
   // Fallback batch size used when the tenant config is unavailable or invalid.
   static constexpr int64_t DEFAULT_SS_GC_TASK_SCAN_BATCH_SIZE = 100;
 
+#ifdef ERRSIM
+  // Match only the tenant filter; a configured zero matches every tenant.
+  static bool is_errsim_target(const uint64_t tenant_id);
+
+  // Match tenant and tablet filters; each configured zero is unrestricted.
+  static bool is_errsim_target(
+      const uint64_t tenant_id,
+      const uint64_t tablet_id);
+#endif
+
   // Helper for Exec Timer Tasks to create and add per-task DAGs to ObTenantDagScheduler.
   static int create_and_add_dag(const ObSSGCExecDagInitParam &param);
 
@@ -192,14 +202,14 @@ private:
   static int get_tenant_create_us(const uint64_t tenant_id, int64_t &tenant_create_us);
 };
 
-// Errsim helper: when `ret == OB_SUCCESS`, fires the named tracepoint and
-// assigns its return value to the caller's `ret`. Requires `int ret` in scope.
-#define INJECT_SS_GC_ERRSIM(errsim_point)                                        \
+// Errsim helper: filter the business tenant before consuming the named tracepoint.
+// Assigns a triggered error to the caller's successful `ret`. Requires `int ret` in scope.
+#define INJECT_SS_GC_ERRSIM(errsim_point, tenant_id)                              \
   do {                                                                            \
-    if (OB_SUCC(ret)) {                                                           \
+    if (OB_SUCC(ret) && ObSSGCUtil::is_errsim_target((tenant_id))) {              \
       ret = OB_E(errsim_point) OB_SUCCESS;                                        \
       if (OB_FAIL(ret)) {                                                         \
-        FLOG_INFO("[ERRSIM] fake ss gc failure at " #errsim_point, KR(ret));     \
+        FLOG_INFO("[ERRSIM] fake ss gc failure at " #errsim_point, KR(ret));      \
       }                                                                           \
     }                                                                             \
   } while (0)

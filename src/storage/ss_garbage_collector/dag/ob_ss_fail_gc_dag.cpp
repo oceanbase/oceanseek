@@ -1187,7 +1187,17 @@ int ObSSFailGCExecutorTask::do_ctrl_row_failed_gc_(
     }
   }
 #ifdef ERRSIM
-  INJECT_SS_GC_ERRSIM(EN_SS_FAIL_GC_DO_CTRL_ROW_FAIL);
+  if (OB_SUCC(ret)) {
+    uint64_t errsim_tablet_id = ObTabletID::INVALID_TABLET_ID;
+    if (ctrl_row.ctrl_key_.is_sstable_type()) {
+      errsim_tablet_id = ctrl_row.ctrl_key_.sstable_key_.tablet_id_.id();
+    } else if (ctrl_row.ctrl_key_.is_tablet_type()) {
+      errsim_tablet_id = ctrl_row.ctrl_key_.tablet_key_.tablet_id_.id();
+    }
+    if (ObSSGCUtil::is_errsim_target(ctx.tenant_id_, errsim_tablet_id)) {
+      INJECT_SS_GC_ERRSIM(EN_SS_FAIL_GC_DO_CTRL_ROW_FAIL, ctx.tenant_id_);
+    }
+  }
 #endif
   if (OB_FAIL(ret)) {
     SERVER_EVENT_ADD("SHARED_GC", "FAIL_GC_DO_CTRL_ROW_FAIL",
@@ -1588,7 +1598,7 @@ int ObSSFailGCExecutorTask::generate_fail_gc_task_(
     }
 
 #ifdef ERRSIM
-    INJECT_SS_GC_ERRSIM(EN_SS_FAIL_GC_GENERATE_TASK_FAIL);
+    INJECT_SS_GC_ERRSIM(EN_SS_FAIL_GC_GENERATE_TASK_FAIL, ctx.tenant_id_);
 #endif
     if (OB_FAIL(ret)) {
       SERVER_EVENT_ADD("SHARED_GC", "FAIL_GC_GENERATE_TASK_TRANS_FAIL",

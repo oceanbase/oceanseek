@@ -2133,10 +2133,13 @@ ERRSIM_DEF_INT(errsim_migration_tablet_id, OB_CLUSTER_PARAMETER, "0", "[0,)",
         "the tablet id that migration want to insert error"
         "Range: [0,) in integer",
         ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
-ERRSIM_DEF_INT(errsim_atomic_protocol_finish_fail_tablet_id, OB_CLUSTER_PARAMETER, "0", "[0,)",
-        "the tablet id that EN_SS_ATOMIC_PROTOCOL_FINISH_FAIL_* errsim should fire on; "
-        "when 0 the errsim points fall back to firing on every tablet."
-        "Range: [0,) in integer",
+ERRSIM_DEF_INT(errsim_shared_gc_tenant_id, OB_CLUSTER_PARAMETER, "0", "[0,)",
+        "Target tenant for shared GC errsim and debug sync points; "
+        "0 disables tenant filtering. Range: [0,) in integer",
+        ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+ERRSIM_DEF_INT(errsim_shared_gc_tablet_id, OB_CLUSTER_PARAMETER, "0", "[0,)",
+        "Target tablet for tablet-scoped shared GC errsim and debug sync points; "
+        "0 disables tablet filtering. Range: [0,) in integer",
         ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 ERRSIM_DEF_INT(errsim_max_ddl_sstable_count, OB_CLUSTER_PARAMETER, "0", "[0,)",
         "max ddl sstable count in errsim mode"
