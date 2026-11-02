@@ -342,7 +342,9 @@ public:
       children_cnt_(0),
       min_competitive_score_(0.0),
       is_scoring_(true),
-      profile_(nullptr)
+      profile_(nullptr),
+      last_profile_output_rowid_(0),
+      has_last_profile_output_rowid_(false)
   { }
   virtual ~ObIDASSearchOp() {}
   VIRTUAL_TO_STRING_KV(K_(op_id), K_(search_ctx));
@@ -701,6 +703,23 @@ private:
   int init_children_ops_array(const ObIArray<ObIDASSearchOp *> &children);
 
 protected:
+  // Count each UINT64 Token/Async Token RowID once per scan.
+  //
+  // Vectorized BMM: next_rowid() -> compute_vec_boundary()
+  //   -> rebuild_vec_essential_merger() -> advance_to(min_id).
+  // The advance may return the same cached row with OB_SUCCESS; counting every
+  // successful call would turn one hit into two profile output rows.
+  //
+  // Remember the last counted ID across scalar/batch paths (IDs are monotonic).
+  // Reset on open/rescan/rescan_segment and profile cleanup; scoring is unchanged.
+  OB_INLINE bool is_new_profile_output_row(const uint64_t rowid);
+  OB_INLINE bool is_new_profile_output_row(const ObDASRowID &rowid);
+  OB_INLINE void reset_profile_output_row()
+  {
+    last_profile_output_rowid_ = 0;
+    has_last_profile_output_rowid_ = false;
+  }
+
   ObDASSearchCtx &search_ctx_;
   ObDASSearchOpType op_type_;
   int64_t op_id_;
@@ -711,6 +730,8 @@ protected:
   double min_competitive_score_;
   bool is_scoring_;
   common::ObOpProfile<common::ObMetric> *profile_;
+  uint64_t last_profile_output_rowid_;
+  bool has_last_profile_output_rowid_;
 };
 
 OB_INLINE int ObIDASSearchOp::init(const ObIDASSearchOpParam &op_param)
@@ -733,6 +754,7 @@ OB_INLINE int ObIDASSearchOp::init(const ObIDASSearchOpParam &op_param)
 OB_INLINE int ObIDASSearchOp::open()
 {
   int ret = OB_SUCCESS;
+  reset_profile_output_row();
   if (OB_FAIL(open_profile())) {
     LOG_WARN("failed to open profile", KR(ret));
   } else {
@@ -766,6 +788,7 @@ OB_INLINE int ObIDASSearchOp::close()
 OB_INLINE int ObIDASSearchOp::rescan()
 {
   int ret = OB_SUCCESS;
+  reset_profile_output_row();
   // for vector index search, in post-iterative filter mode, we can reuse the old profile in the same tablet execution
   // otherwise, every iteration will create a new profile, which will overwhelm the profile output
   bool is_vec_index_search = search_ctx_.is_vec_index_search();
@@ -788,6 +811,7 @@ OB_INLINE int ObIDASSearchOp::rescan()
 OB_INLINE int ObIDASSearchOp::rescan_segment(const common::ObNewVersionRange &range)
 {
   int ret = OB_SUCCESS;
+  reset_profile_output_row();
   common::ObProfileSwitcher switcher(profile_);
   min_competitive_score_ = 0.0;
   if (OB_FAIL(do_rescan_segment(range))) {
@@ -809,7 +833,9 @@ OB_INLINE int ObIDASSearchOp::advance_to(const ObDASRowID &target, ObDASRowID &c
     common::ScopedTimer timer(common::ObMetricId::HS_ADVANCE_TIME);
     INC_METRIC_VAL(common::ObMetricId::HS_ADVANCE_COUNT, 1);
     ret = do_advance_to(target, curr_id, score);
-    INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, 1);
+    if (OB_SUCC(ret) && is_new_profile_output_row(curr_id)) {
+      INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, 1);
+    }
   }
   if (OB_FAIL(ret)) {
     LOG_WARN_IGNORE_ITER_END(ret, "failed to advance to impl", KR(ret));
@@ -834,7 +860,9 @@ OB_INLINE int ObIDASSearchOp::advance_to_id(const ObDASRowID &target, ObDASRowID
       common::ScopedTimer timer(common::ObMetricId::HS_ADVANCE_TIME);
       INC_METRIC_VAL(common::ObMetricId::HS_ADVANCE_COUNT, 1);
       ret = do_advance_to_id(target, curr_id);
-      INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, 1);
+      if (OB_SUCC(ret) && is_new_profile_output_row(curr_id)) {
+        INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, 1);
+      }
     }
     if (OB_FAIL(ret)) {
       LOG_WARN_IGNORE_ITER_END(ret, "failed to advance to id impl", KR(ret), K(target));
@@ -879,7 +907,9 @@ OB_INLINE int ObIDASSearchOp::next_rowid(ObDASRowID &next_id, double &score)
     common::ScopedTimer timer(common::ObMetricId::HS_NEXT_ROWID_TIME);
     INC_METRIC_VAL(common::ObMetricId::HS_NEXT_ROWID_COUNT, 1);
     ret = do_next_rowid(next_id, score);
-    INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, 1);
+    if (OB_SUCC(ret) && is_new_profile_output_row(next_id)) {
+      INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, 1);
+    }
   }
   if (OB_FAIL(ret)) {
     LOG_WARN_IGNORE_ITER_END(ret, "failed to next rowid impl", KR(ret));
@@ -1047,7 +1077,19 @@ OB_INLINE int ObIDASSearchOp::drain_until_impl(
     LOG_WARN("unexpected drain_until output count", K(ret), K(count), K(capacity));
   } else {
     if (OB_NOT_NULL(profile_)) {
-      const int64_t output_count = count + (count < capacity && !next_id_after.is_max() ? 1 : 0);
+      const bool has_next = count < capacity && !next_id_after.is_max();
+      int64_t output_count = count + (has_next ? 1 : 0);
+      if (DAS_SEARCH_OP_TOKEN == op_type_ || DAS_SEARCH_OP_ASYNC_TOKEN == op_type_) {
+        const bool has_prefetched_row = has_next && next_id_after.is_normal();
+        output_count = count + (has_prefetched_row ? 1 : 0);
+        // Drain starts from the next row, so all outputs are new. Remember only the
+        // last counted row to avoid recounting it on a later cached positioning.
+        if (output_count > 0) {
+          last_profile_output_rowid_ = has_prefetched_row
+              ? next_id_after.get_uint64() : out_ids[count - 1];
+          has_last_profile_output_rowid_ = true;
+        }
+      }
       INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, output_count);
     }
     if (!is_scoring_) {
@@ -1058,6 +1100,24 @@ OB_INLINE int ObIDASSearchOp::drain_until_impl(
     }
   }
   return ret;
+}
+
+OB_INLINE bool ObIDASSearchOp::is_new_profile_output_row(const uint64_t rowid)
+{
+  bool is_new = true;
+  if (DAS_ROWID_TYPE_UINT64 == get_rowid_type()
+      && (DAS_SEARCH_OP_TOKEN == op_type_ || DAS_SEARCH_OP_ASYNC_TOKEN == op_type_)) {
+    is_new = !has_last_profile_output_rowid_ || last_profile_output_rowid_ != rowid;
+    last_profile_output_rowid_ = rowid;
+    has_last_profile_output_rowid_ = true;
+  }
+  return is_new;
+}
+
+OB_INLINE bool ObIDASSearchOp::is_new_profile_output_row(const ObDASRowID &rowid)
+{
+  return DAS_ROWID_TYPE_UINT64 != get_rowid_type() || !rowid.is_normal()
+      || is_new_profile_output_row(rowid.get_uint64());
 }
 
 OB_INLINE int ObIDASSearchOp::probe(const ObDASRowID &target, bool &hit)

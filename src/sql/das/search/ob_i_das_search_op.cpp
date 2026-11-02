@@ -633,7 +633,7 @@ int ObIDASSearchOp::do_drain_until_active(
         if (0 != (active_words[offset >> 6] & (1ULL << (offset & 63)))) {
           if (OB_FAIL(accumulator.add_existing_dim(doc_id, curr_score))) {
             LOG_WARN("failed to add active score", K(ret), K(doc_id));
-          } else {
+          } else if (OB_LIKELY(nullptr == profile_) || is_new_profile_output_row(curr_id)) {
             ++count;
           }
         }
@@ -791,11 +791,13 @@ int ObIDASSearchOp::open_profile()
 void ObIDASSearchOp::close_profile()
 {
   profile_ = nullptr;
+  reset_profile_output_row();
 }
 
 void ObIDASSearchOp::reset_profile()
 {
   profile_ = nullptr;
+  reset_profile_output_row();
   for (int64_t i = 0; i < children_cnt_; ++i) {
     if (nullptr != children_[i]) {
       children_[i]->reset_profile();

@@ -588,8 +588,11 @@ int ObDASAsyncTokenOp::drain_until_accumulated(
         boundary, accumulator, count, next_id_after, next_score_after))) {
       LOG_WARN("failed to accumulate drained rows", KR(ret));
     } else {
-      INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT,
-          count + (next_id_after.is_max() ? 0 : 1));
+      int64_t output_count = count;
+      if (next_id_after.is_normal()) {
+        output_count += is_new_profile_output_row(next_id_after) ? 1 : 0;
+      }
+      INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, output_count);
     }
   }
   return ret;
@@ -730,7 +733,7 @@ int ObDASAsyncTokenOp::do_drain_until_active(
                   token_freqs[i], doc_lengths[i], bm25_calc_params_);
               if (OB_FAIL(accumulator.add_existing_dim(doc_id, score))) {
                 LOG_WARN("failed to add active token score", K(ret), K(doc_id));
-              } else {
+              } else if (OB_LIKELY(nullptr == profile_) || is_new_profile_output_row(doc_id)) {
                 ++count;
               }
             }

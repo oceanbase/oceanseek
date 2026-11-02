@@ -119,6 +119,17 @@ struct RealBMMPostingRow
 inline uint64_t expect_doc(const uint64_t start, const int64_t i)
 { return start + static_cast<uint64_t>(i) * OP_STRIDE; }
 
+uint64_t get_profile_metric(
+    const common::ObOpProfile<common::ObMetric> &profile,
+    const common::ObMetricId metric_id)
+{
+  bool exists = false;
+  uint64_t value = 0;
+  profile.get_metric_value(metric_id, exists, value);
+  EXPECT_TRUE(exists);
+  return value;
+}
+
 // Reference score via the exact single-division kernel the op / storage now use. This is
 // the bit-for-bit oracle for op fast-path outputs (ASSERT_DOUBLE_EQ against it is exact).
 inline double fast_ref_score(
@@ -2302,6 +2313,83 @@ TEST_F(TestDASAsyncTokenOp, active_drain_matches_fallback_without_reviving_prune
   }
   ASSERT_EQ(fallback_next_id, batch_next_id);
   ASSERT_EQ(expect_doc(OP_START, boundary_index + 1), batch_next_id);
+}
+
+TEST_F(TestDASAsyncTokenOp, profiled_active_drain_counts_each_row_once)
+{
+  ObInvSSTable inv_sstable;
+  build_single_term_sstable(OP_START, OP_DOC_CNT, OP_TERM_SEQ, inv_sstable);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  char term_buf[32] = {0};
+  format_term(OP_TERM_SEQ, term_buf, sizeof(term_buf));
+  const common::ObString query_token(static_cast<int32_t>(strlen(term_buf)), term_buf);
+
+  ObArenaAllocator ctx_alloc("ProfActive");
+  AsyncTokCtx ctx(ctx_alloc);
+  ctx.search_ctx_.scopes_[DAS_SCOPE_BASE].rowid_type_ = DAS_ROWID_TYPE_UINT64;
+  sql::ObDASIRScanCtDef ctdef(ctx_alloc);
+  sql::ObDASIRScanRtDef rtdef;
+  sql::ObDASAsyncTokenOp *op = nullptr;
+  create_and_inject_single(ctx, ctdef, rtdef, query_token, 1.7, OP_DOC_CNT,
+      OP_DOC_CNT, read_info, inv_sstable, op);
+  OK(op->open());
+
+  common::ObOpProfile<common::ObMetric> profile(
+      common::ObProfileId::HYBRID_SEARCH_ASYNC_TOKEN, &ctx_alloc);
+  common::ObProfileSwitcher no_parent_profile(nullptr);
+  op->profile_ = &profile;
+
+  const uint64_t first_id = expect_doc(OP_START, 0);
+  const uint64_t second_id = expect_doc(OP_START, 1);
+  const uint64_t third_id = expect_doc(OP_START, 2);
+  ObDASRowID target;
+  ObDASRowID rowid;
+  double score = 0.0;
+  target.set_uint64(first_id);
+  OK(op->advance_to(target, rowid, score));
+  ASSERT_EQ(first_id, rowid.get_uint64());
+  ASSERT_EQ(1, get_profile_metric(profile, common::ObMetricId::HS_OUTPUT_ROW_COUNT));
+
+  sql::DocScoreAccumulator accumulator;
+  uint64_t max_id = 0;
+  OK(accumulator.init(static_cast<int64_t>(third_id - first_id + 1), ctx_alloc));
+  OK(accumulator.reuse_with_start_id(first_id, max_id));
+  ASSERT_EQ(third_id, max_id);
+  OK(accumulator.add_dim(first_id, 1.0));
+  OK(accumulator.add_dim(second_id, 1.0));
+
+  ObDASRowID boundary;
+  boundary.set_uint64(second_id);
+  OK(op->drain_until_active(boundary, accumulator));
+  EXPECT_EQ(2, get_profile_metric(profile, common::ObMetricId::HS_OUTPUT_ROW_COUNT));
+  EXPECT_TRUE(op->has_last_profile_output_rowid_);
+  EXPECT_EQ(second_id, op->last_profile_output_rowid_);
+
+  // The posting batch leaves its boundary lookahead cached. It is a new output,
+  // while positioning to that same cached row again must not increment the metric.
+  target.set_uint64(third_id);
+  OK(op->advance_to(target, rowid, score));
+  EXPECT_EQ(third_id, rowid.get_uint64());
+  EXPECT_EQ(3, get_profile_metric(profile, common::ObMetricId::HS_OUTPUT_ROW_COUNT));
+  OK(op->advance_to(target, rowid, score));
+  EXPECT_EQ(3, get_profile_metric(profile, common::ObMetricId::HS_OUTPUT_ROW_COUNT));
+  // Accumulated drain counts new rows and its lookahead; ID-only reposition
+  // must share that state with the active and scalar paths above.
+  const uint64_t fourth_id = expect_doc(OP_START, 3);
+  const uint64_t fifth_id = expect_doc(OP_START, 4);
+  sql::DocScoreAccumulator accumulated;
+  OK(accumulated.init(static_cast<int64_t>(fifth_id - third_id + 1), ctx_alloc));
+  OK(accumulated.reuse_with_start_id(third_id, max_id));
+  boundary.set_uint64(fourth_id);
+  OK(op->drain_until_accumulated(boundary, accumulated, rowid, score));
+  EXPECT_EQ(fifth_id, rowid.get_uint64());
+  EXPECT_EQ(5, get_profile_metric(profile, common::ObMetricId::HS_OUTPUT_ROW_COUNT));
+  target.set_uint64(fifth_id);
+  OK(op->advance_to_id(target, rowid));
+  EXPECT_EQ(fifth_id, rowid.get_uint64());
+  EXPECT_EQ(5, get_profile_metric(profile, common::ObMetricId::HS_OUTPUT_ROW_COUNT));
+  OK(op->close());
 }
 
 // Batch drain scores match the canonical ObExprBM25::eval() formula exactly (independent
