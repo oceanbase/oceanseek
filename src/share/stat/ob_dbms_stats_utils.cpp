@@ -337,7 +337,10 @@ bool ObDbmsStatsUtils::is_no_stat_virtual_table(const int64_t table_id)
          table_id == share::OB_ALL_VIRTUAL_SHARED_EXISTING_TABLET_META_TID ||
          table_id == share::OB_ALL_VIRTUAL_SHARED_EXISTING_TABLET_META_ORA_TID ||
          table_id == share::OB_ALL_VIRTUAL_SHARED_EXISTING_SSTABLE_MGR_TID ||
-         table_id == share::OB_ALL_VIRTUAL_SHARED_EXISTING_SSTABLE_MGR_ORA_TID;
+         table_id == share::OB_ALL_VIRTUAL_SHARED_EXISTING_SSTABLE_MGR_ORA_TID ||
+         table_id == share::OB_ALL_VIRTUAL_SHARED_TABLET_META_INFO_TID ||
+         table_id == share::OB_ALL_VIRTUAL_SHARED_GC_DIAGNOSE_TID ||
+         table_id == share::OB_ALL_VIRTUAL_TABLET_MACRO_CACHE_STAT_TID;
 }
 
 bool ObDbmsStatsUtils::is_virtual_index_table(const int64_t table_id)
@@ -363,7 +366,9 @@ bool ObDbmsStatsUtils::is_virtual_index_table(const int64_t table_id)
          table_id == share::OB_ALL_VIRTUAL_ASH_ORA_ALL_VIRTUAL_ASH_I1_TID ||
          table_id == share::OB_ALL_VIRTUAL_TABLE_MGR_ALL_VIRTUAL_TABLE_MGR_I1_TID ||
          table_id == share::OB_ALL_VIRTUAL_TABLE_MGR_ORA_ALL_VIRTUAL_TABLE_MGR_I1_TID ||
-         table_id == share::OB_ALL_VIRTUAL_TABLET_SSTABLE_MACRO_INFO_ALL_VIRTUAL_TABLET_SSTABLE_MACRO_INFO_I1_TID;
+         table_id == share::OB_ALL_VIRTUAL_TABLET_SSTABLE_MACRO_INFO_ALL_VIRTUAL_TABLET_SSTABLE_MACRO_INFO_I1_TID ||
+         table_id == share::OB_ALL_VIRTUAL_TABLET_MACRO_CACHE_STAT_ALL_VIRTUAL_TABLET_MACRO_CACHE_STAT_I1_TID ||
+         table_id == share::OB_ALL_VIRTUAL_TABLET_MACRO_CACHE_STAT_ALL_VIRTUAL_TABLET_MACRO_CACHE_STAT_I2_TID;
 }
 
 int ObDbmsStatsUtils::parse_granularity(const ObString &granularity, ObGranularityType &granu_type)
