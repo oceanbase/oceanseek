@@ -897,8 +897,10 @@ public:
   void wait();
   void destroy();
 
+  // allocator must outlive all accesses to string fields returned in task_info.
   int query_task_status(const common::ObString &task_id,
-                        share::ObAiTaskInfo &task_info);
+                        share::ObAiTaskInfo &task_info,
+                        common::ObIAllocator &allocator);
 
   /**
    * @brief Release a FINISHED task after DDL has consumed all results.

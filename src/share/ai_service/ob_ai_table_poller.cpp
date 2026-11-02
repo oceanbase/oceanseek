@@ -610,8 +610,12 @@ int ObSystemTablePoller::recover_running_tasks_after_restart_()
             }
           }
 
+          common::ObArenaAllocator task_status_allocator("AiRecoverTask",
+                                                          OB_MALLOC_NORMAL_BLOCK_SIZE,
+                                                          tenant_id);
           ObAiTaskInfo task_info;
-          int tmp_ret = table_manager_->query_task_status(task_id, task_info, *sql_proxy_);
+          int tmp_ret = table_manager_->query_task_status(
+              task_id, task_info, task_status_allocator, *sql_proxy_);
           if (OB_SUCCESS != tmp_ret) {
             LOG_WARN("failed to load task info for restart reconciliation", K(tmp_ret), K(task_id));
           } else {
@@ -768,8 +772,12 @@ int ObSystemTablePoller::recover_running_tasks_after_restart_()
               }
             }
 
+            common::ObArenaAllocator task_status_allocator("AiOrphanTask",
+                                                            OB_MALLOC_NORMAL_BLOCK_SIZE,
+                                                            tenant_id);
             ObAiTaskInfo task_info;
-            int tmp_ret = table_manager_->query_task_status(task_id, task_info, *sql_proxy_);
+            int tmp_ret = table_manager_->query_task_status(
+                task_id, task_info, task_status_allocator, *sql_proxy_);
             if (OB_SUCCESS != tmp_ret) {
               LOG_WARN("[BATCH-FILE] C3 recovery: failed to load task info, skipping",
                        K(tmp_ret), K(task_id));

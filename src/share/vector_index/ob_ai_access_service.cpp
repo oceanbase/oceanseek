@@ -2620,7 +2620,8 @@ bool ObAiAccessService::is_table_poller_running() const
 }
 
 int ObAiAccessService::query_task_status(const ObString &task_id,
-                                            ObAiTaskInfo &task_info)
+                                         ObAiTaskInfo &task_info,
+                                         common::ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
 
@@ -2638,7 +2639,7 @@ int ObAiAccessService::query_task_status(const ObString &task_id,
       task_info.reset();
       task_info.task_id_ = task_id;
       task_info.tenant_id_ = tenant_id_;
-      if (OB_FAIL(table_manager_.query_task_status(task_id, task_info, *sql_client_))) {
+      if (OB_FAIL(table_manager_.query_task_status(task_id, task_info, allocator, *sql_client_))) {
         if (ret == OB_ENTRY_NOT_EXIST) {
           LOG_WARN("task not found in system table", K(ret), K(task_id));
         } else {
@@ -2982,9 +2983,10 @@ int ObAiAccessService::get_next_results(const common::ObString &task_id,
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("task_id is empty", K(ret));
   } else {
-    // First check task status
+    // First check task status. Keep query strings alive until the status is consumed.
+    common::ObArenaAllocator query_allocator("AiTaskQuery", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id_);
     share::ObAiTaskInfo task_info;
-    if (OB_FAIL(query_task_status(task_id, task_info))) {
+    if (OB_FAIL(query_task_status(task_id, task_info, query_allocator))) {
       LOG_WARN("failed to query task status", K(ret), K(task_id));
     } else if (task_info.status_ != OB_AI_TASK_STATUS_FINISHED) {
       ret = OB_ENTRY_NOT_EXIST;  // Results not ready yet

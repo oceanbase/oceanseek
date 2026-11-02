@@ -3285,6 +3285,9 @@ int ObBatchFileEmbeddingOperator::poll_submitted_slots_()
     // Iterate over all slots from head to next, check SUBMITTED ones
     const int64_t head = slot_ring_.get_head_idx();
     const int64_t next = slot_ring_.get_next_idx();
+    common::ObArenaAllocator task_status_allocator("BFTaskStatus",
+                                                    OB_MALLOC_NORMAL_BLOCK_SIZE,
+                                                    MTL_ID());
 
     for (int64_t idx = head; OB_SUCC(ret) && idx < next; ++idx) {
       if (need_stop_()) {
@@ -3302,8 +3305,9 @@ int ObBatchFileEmbeddingOperator::poll_submitted_slots_()
         if (OB_FAIL(slot_ring_.get_slot_task_id(idx, task_id))) {
           LOG_WARN("get_slot_task_id failed", K(ret), K(idx));
         } else {
+          task_status_allocator.reuse();
           share::ObAiTaskInfo task_info;
-          if (OB_FAIL(service_->query_task_status(task_id, task_info))) {
+          if (OB_FAIL(service_->query_task_status(task_id, task_info, task_status_allocator))) {
             const int query_ret = ret;
             if (is_query_task_status_retryable_(query_ret)) {
               LOG_WARN("[BATCH-FILE] query_task_status failed, will retry",

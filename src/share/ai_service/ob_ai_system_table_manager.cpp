@@ -201,6 +201,7 @@ int ObAiSystemTableManager::update_task_status(const ObString &task_id,
 
 int ObAiSystemTableManager::query_task_status(const ObString &task_id,
                                               ObAiTaskInfo &task_info,
+                                              common::ObIAllocator &allocator,
                                               common::ObISQLClient &sql_client)
 {
   int ret = OB_SUCCESS;
@@ -252,7 +253,7 @@ int ObAiSystemTableManager::query_task_status(const ObString &task_id,
         if (OB_SUCC(ret)) {
           common::ObString model_name;
           EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(*result, "model_name", model_name, true, true, "");
-          if (OB_SUCC(ret) && OB_FAIL(copy_string_field_(model_name, task_info.model_name_))) {
+          if (OB_SUCC(ret) && OB_FAIL(copy_string_field_(model_name, task_info.model_name_, allocator))) {
             LOG_WARN("failed to copy model_name", K(ret), K(model_name));
           }
         }
@@ -292,7 +293,7 @@ int ObAiSystemTableManager::query_task_status(const ObString &task_id,
         if (OB_SUCC(ret)) {
           common::ObString batch_id;
           EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(*result, "batch_id", batch_id, true, true, "");
-          if (OB_SUCC(ret) && OB_FAIL(copy_string_field_(batch_id, task_info.batch_id_))) {
+          if (OB_SUCC(ret) && OB_FAIL(copy_string_field_(batch_id, task_info.batch_id_, allocator))) {
             LOG_WARN("failed to copy batch_id", K(ret), K(batch_id));
           }
         }
@@ -300,7 +301,7 @@ int ObAiSystemTableManager::query_task_status(const ObString &task_id,
         if (OB_SUCC(ret)) {
           common::ObString remote_file_ids;
           EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(*result, "remote_file_ids", remote_file_ids, true, true, "");
-          if (OB_SUCC(ret) && OB_FAIL(copy_string_field_(remote_file_ids, task_info.remote_file_ids_))) {
+          if (OB_SUCC(ret) && OB_FAIL(copy_string_field_(remote_file_ids, task_info.remote_file_ids_, allocator))) {
             LOG_WARN("failed to copy remote_file_ids", K(ret), K(remote_file_ids));
           }
         }
@@ -309,7 +310,7 @@ int ObAiSystemTableManager::query_task_status(const ObString &task_id,
           common::ObString local_file_metadata;
           EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(*result, "local_file_metadata", local_file_metadata, true, true, "");
           if (OB_SUCC(ret) && !local_file_metadata.empty()) {
-            if (OB_FAIL(copy_string_field_(local_file_metadata, task_info.local_file_metadata_))) {
+            if (OB_FAIL(copy_string_field_(local_file_metadata, task_info.local_file_metadata_, allocator))) {
               LOG_WARN("failed to copy local_file_metadata", K(ret), K(local_file_metadata));
             }
             if (OB_SUCC(ret)) {
@@ -321,7 +322,7 @@ int ObAiSystemTableManager::query_task_status(const ObString &task_id,
         if (OB_SUCC(ret)) {
           common::ObString error_detail;
           EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(*result, "error_detail", error_detail, true, true, "");
-          if (OB_SUCC(ret) && OB_FAIL(copy_string_field_(error_detail, task_info.error_detail_))) {
+          if (OB_SUCC(ret) && OB_FAIL(copy_string_field_(error_detail, task_info.error_detail_, allocator))) {
             LOG_WARN("failed to copy error_detail", K(ret), K(error_detail));
           }
         }
@@ -335,16 +336,14 @@ int ObAiSystemTableManager::query_task_status(const ObString &task_id,
 }
 
 int ObAiSystemTableManager::copy_string_field_(const common::ObString &src,
-                                               common::ObString &dest)
+                                               common::ObString &dest,
+                                               common::ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
   dest.reset();
   if (src.empty()) {
-  } else if (OB_ISNULL(allocator_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("allocator_ is null", K(ret));
   } else {
-    char *buf = static_cast<char *>(allocator_->alloc(src.length() + 1));
+    char *buf = static_cast<char *>(allocator.alloc(src.length() + 1));
     if (OB_ISNULL(buf)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("failed to allocate memory for string field", K(ret), K(src.length()));
@@ -442,8 +441,9 @@ int ObAiSystemTableManager::archive_task_to_history(const ObString &task_id,
       LOG_WARN("failed to start transaction for archive", K(ret), K(task_id));
     } else {
       // Step 1: Read the task from main table (within transaction for consistency)
+      common::ObArenaAllocator query_allocator("AiArchiveTask", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id_);
       ObAiTaskInfo task_info;
-      if (OB_FAIL(query_task_status(task_id, task_info, trans))) {
+      if (OB_FAIL(query_task_status(task_id, task_info, query_allocator, trans))) {
         LOG_WARN("failed to query task for archiving", K(ret), K(task_id));
       } else {
         // Step 2: Insert into history table

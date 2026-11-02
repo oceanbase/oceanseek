@@ -123,11 +123,13 @@ public:
    * @brief Query task status
    * @param task_id Task ID to query
    * @param task_info Output parameter for task info
+   * @param allocator Allocator that owns string fields in task_info
    * @param sql_client SQL client for database operations
    * @return OB_SUCCESS on success, OB_ENTRY_NOT_EXIST if not found
    */
   int query_task_status(const ObString &task_id,
                         ObAiTaskInfo &task_info,
+                        common::ObIAllocator &allocator,
                         common::ObISQLClient &sql_client);
 
   /**
@@ -174,7 +176,9 @@ public:
   uint64_t get_tenant_id() const { return tenant_id_; }
 
 private:
-  int copy_string_field_(const common::ObString &src, common::ObString &dest);
+  int copy_string_field_(const common::ObString &src,
+                         common::ObString &dest,
+                         common::ObIAllocator &allocator);
   // Get current timestamp in microseconds
   int64_t get_current_time_us_() const;
 
