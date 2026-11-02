@@ -28,6 +28,7 @@
 #include "share/vector_index/ob_vector_index_aux_table_handler.h"
 #include "observer/ob_server.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
+#include "sql/session/ob_sql_session_mgr.h"
 #include "storage/lob/common/ob_lob_util.h"
 #include "storage/lob/common/ob_lob_context.h"
 #include "share/schema/ob_multi_version_schema_service.h"
@@ -61,6 +62,86 @@ ERRSIM_POINT_DEF(ERRSIM_VEC_ASYNC_TASK_SKIP_STATUS_UPDATE,
     "Skip vector async task status persistence and return success for orphan-task tests.");
 ERRSIM_POINT_DEF(ERRSIM_ALTER_INDEX_PARAMS_AFTER_PARENT_DELETE);
 ERRSIM_POINT_DEF(ERRSIM_ALTER_INDEX_PARAMS_AFTER_PARENT_INSERT);
+ERRSIM_POINT_DEF(ERRSIM_VEC_INNER_SQL_CANCEL_PAUSE,
+    "Defer vector inner SQL cancellation until DROP TENANT metadata is gone.");
+
+namespace
+{
+// execute_inner_sql() runs on the local LS leader with an external session.
+// Pin that session through for_each_session(), and validate/cancel under its
+// data lock so neither session-id reuse nor a new query can change the target.
+class ObVecInnerSQLCancel
+{
+public:
+  ObVecInnerSQLCancel(ObSQLSessionMgr &session_mgr, const uint64_t tenant_id,
+                     const TraceId &trace_id, const ObString &task_hint,
+                     const ObString &snapshot_hint, const ObString &scn_hint)
+      : session_mgr_(session_mgr), tenant_id_(tenant_id), trace_id_(trace_id),
+        task_hint_(task_hint), snapshot_hint_(snapshot_hint), scn_hint_(scn_hint),
+        ret_(OB_SUCCESS), matched_count_(0), killed_count_(0)
+  {}
+
+  bool operator()(ObSQLSessionMgr::Key, ObSQLSessionInfo *session)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_ISNULL(session)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("null session while canceling vector inner sql", K(ret), K(tenant_id_), K(trace_id_));
+    } else {
+      ObSQLSessionInfo::LockGuard guard(session->get_thread_data_lock());
+      const TraceId &session_trace = session->get_current_trace_id();
+      const ObString query = session->get_current_query_string();
+      // Inner SQL changes the flags in the first trace word; the remaining
+      // words identify the same task, as in the DDL helper's trace predicate.
+      if (session->get_effective_tenant_id() == tenant_id_
+          && session->is_inner() && !session->is_real_inner_session()
+          && !session->get_is_deserialized()
+          && session->get_ddl_info().is_vec_tablet_rebuild()
+          && session_trace.get()[1] == trace_id_.get()[1]
+          && session_trace.get()[2] == trace_id_.get()[2]
+          && session_trace.get()[3] == trace_id_.get()[3]
+          && query.prefix_match("INSERT ")
+          && contains(query, task_hint_)
+          && (contains(query, snapshot_hint_) || contains(query, scn_hint_))) {
+        ++matched_count_;
+        if (session->is_query_killed() || session->is_zombie()) {
+          // Cancellation has already been delivered; wait for normal SQL/PX
+          // and DDL cleanup instead of repeatedly interrupting the transaction.
+        } else if (OB_FAIL(session_mgr_.kill_query(*session))) {
+          LOG_WARN("fail to cancel vector inner sql query", K(ret), K(tenant_id_),
+                   K(trace_id_), "session_id", session->get_server_sid());
+        } else {
+          ++killed_count_;
+          LOG_INFO("canceled vector inner sql query", K(tenant_id_), K(trace_id_),
+                   "session_id", session->get_server_sid());
+        }
+      }
+    }
+    ret_ = ret;
+    return OB_SUCCESS == ret;
+  }
+
+  int get_ret() const { return ret_; }
+  int64_t get_matched_count() const { return matched_count_; }
+  int64_t get_killed_count() const { return killed_count_; }
+
+private:
+  static bool contains(const ObString &query, const ObString &part)
+  {
+    return !query.empty() && !part.empty()
+        && nullptr != memmem(query.ptr(), query.length(), part.ptr(), part.length());
+  }
+  ObSQLSessionMgr &session_mgr_;
+  uint64_t tenant_id_;
+  TraceId trace_id_;
+  ObString task_hint_;
+  ObString snapshot_hint_;
+  ObString scn_hint_;
+  int ret_;
+  int64_t matched_count_;
+  int64_t killed_count_;
+};
+} // namespace
 
 ObVecIndexAsyncTaskCtx::~ObVecIndexAsyncTaskCtx()
 {
@@ -132,7 +213,9 @@ int ObVecIndexAsyncTaskCtx::cancel_task()
   if (need_sync_db) {
     LOG_INFO("[VEC_ASYNC_TASK] task canceled", KR(ret), KPC(this));
     common::ObSpinLockGuard guard(lock_);
-    cancel_post_work_pending_ = need_retry_cancel_post_work;
+    // Keep cancellation pending until write() returns, including the window
+    // where run_inner_sql_ is published but its session is not registered yet.
+    cancel_post_work_pending_ = need_retry_cancel_post_work || run_inner_sql_;
     in_cancel_ = false;
   }
   return ret;
@@ -149,8 +232,10 @@ int ObVecIndexAsyncTaskCtx::cancel_task_for_ls_destroy(bool &can_cleanup)
       if (OB_TENANT_NOT_EXIST == ret) {
         common::ObSpinLockGuard guard(lock_);
         // ignore tenant not exist error in ls destroy
-        cancel_post_work_pending_ = false;
-        LOG_INFO("tenant not exist, skip drain cancel post work for ls destroy", KR(ret), KPC(this));
+        // The task table is gone, but a running inner SQL still needs cancel
+        // retries until its execution thread has unwound.
+        cancel_post_work_pending_ = run_inner_sql_;
+        LOG_INFO("tenant not exist, skip cancel status persistence for ls destroy", KR(ret), KPC(this));
         ret = OB_SUCCESS;
       } else {
         LOG_WARN("fail to drain cancel post work for ls destroy", K(ret), KPC(this));
@@ -236,7 +321,7 @@ int ObVecIndexAsyncTaskCtx::drain_cancel_post_work_if_pending()
     // kill_inner_sql failure would silently strand the DB row in its pre-cancel
     // status while handle_cancelled_task_ races to FINISH in memory.
     if (OB_SUCCESS == first_tmp_ret) {
-      cancel_post_work_pending_ = false;
+      cancel_post_work_pending_ = run_inner_sql_;
     }
     in_cancel_ = false;
     LOG_INFO("[VEC_ASYNC_TASK] deferred cancel post-work drained",
@@ -282,6 +367,7 @@ void ObVecIndexAsyncTaskCtx::clear_inner_sql_running()
 int ObVecIndexAsyncTaskCtx::kill_inner_sql_if_needed()
 {
   int ret = OB_SUCCESS;
+  bool running = false;
   TraceId trace_id;
   uint64_t tenant_id = OB_INVALID_TENANT_ID;
   int64_t task_id = OB_INVALID_ID;
@@ -289,11 +375,8 @@ int ObVecIndexAsyncTaskCtx::kill_inner_sql_if_needed()
   common::ObAddr exec_addr;
   {
     common::ObSpinLockGuard guard(lock_);
-    if (!run_inner_sql_) {
-    } else if (OB_ISNULL(GCTX.sql_proxy_)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("sql proxy is null", K(ret), KPC(this));
-    } else {
+    if (run_inner_sql_) {
+      running = true;
       trace_id = sys_task_id_.is_valid() ? sys_task_id_ : task_status_.trace_id_;
       tenant_id = tenant_id_;
       task_id = task_status_.task_id_;
@@ -301,28 +384,50 @@ int ObVecIndexAsyncTaskCtx::kill_inner_sql_if_needed()
       exec_addr = inner_sql_exec_addr_;
     }
   }
-  if (OB_FAIL(ret) || snapshot_version <= 0 || task_id <= 0 || OB_INVALID_TENANT_ID == tenant_id
-      || trace_id.is_invalid()) {
-    if (OB_SUCC(ret) && snapshot_version <= 0) {
-      ret = OB_INVALID_ARGUMENT;
-      LOG_WARN("invalid inner sql runtime state", K(ret), K(snapshot_version), K(task_id), K(tenant_id), K(trace_id));
-    }
+  ObSqlString task_hint;
+  ObSqlString snapshot_hint;
+  ObSqlString scn_hint;
+  if (!running) {
+    // The execution thread may have returned since cancellation was requested.
+  } else if (OB_UNLIKELY(snapshot_version <= 0 || task_id <= 0
+                        || OB_INVALID_TENANT_ID == tenant_id || trace_id.is_invalid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid inner sql runtime state", K(ret), K(snapshot_version),
+             K(task_id), K(tenant_id), K(trace_id));
+  } else if (OB_UNLIKELY(exec_addr != MYADDR)) {
+    // execute_inner_sql() enforces this invariant before publishing run_inner_sql_.
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("vector inner sql execution is not local", K(ret), K(exec_addr),
+             K(MYADDR), K(tenant_id), K(task_id));
+  } else if (OB_UNLIKELY(ERRSIM_VEC_INNER_SQL_CANCEL_PAUSE)) {
+    LOG_INFO("vector inner sql cancellation paused for test", K(tenant_id), K(task_id), K(trace_id));
+  } else if (OB_ISNULL(GCTX.session_mgr_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("session mgr is null", K(ret), K(tenant_id), K(task_id));
+  } else if (OB_FAIL(task_hint.assign_fmt("('ddl_task_id', %ld)", task_id))
+             || OB_FAIL(snapshot_hint.assign_fmt("as of snapshot %ld ", snapshot_version))
+             || OB_FAIL(scn_hint.assign_fmt("as of scn %ld ", snapshot_version))) {
+    LOG_WARN("fail to build vector inner sql identity", K(ret), K(tenant_id),
+             K(task_id), K(snapshot_version));
   } else {
-    common::ObSEArray<common::ObAddr, 1> exec_addrs;
-    if (exec_addr.is_valid() && OB_FAIL(exec_addrs.push_back(exec_addr))) {
-      LOG_WARN("fail to push exec addr", K(ret), K(exec_addr), KPC(this));
-    } else if (OB_FAIL(rootserver::ObDDLTaskRecordOperator::kill_task_inner_sql(
-                   *GCTX.sql_proxy_,
-                   trace_id,
-                   tenant_id,
-                   task_id,
-                   snapshot_version,
-                   exec_addrs))) {
-      LOG_WARN("fail to kill task inner sql", K(ret), K(trace_id), K(tenant_id),
+    ObVecInnerSQLCancel cancel(*GCTX.session_mgr_, tenant_id, trace_id,
+                              task_hint.string(), snapshot_hint.string(), scn_hint.string());
+    MAKE_TENANT_SWITCH_SCOPE_GUARD(tenant_guard);
+    if (OB_FAIL(tenant_guard.switch_to(tenant_id))) {
+      LOG_WARN("fail to switch tenant for vector inner sql cancellation", K(ret), K(tenant_id), K(task_id));
+    } else if (OB_FAIL(GCTX.session_mgr_->for_each_session(cancel))) {
+      ret = OB_SUCCESS != cancel.get_ret() ? cancel.get_ret() : ret;
+      LOG_WARN("fail to cancel task inner sql", K(ret), K(trace_id), K(tenant_id),
                K(task_id), K(snapshot_version), K(exec_addr));
-    } else {
+    } else if (cancel.get_killed_count() > 0) {
       LOG_INFO("succ to kill task inner sql", K(ret), K(trace_id), K(tenant_id),
-               K(task_id), K(snapshot_version), K(exec_addr));
+               K(task_id), K(snapshot_version), K(exec_addr),
+               "matched_count", cancel.get_matched_count(), "killed_count", cancel.get_killed_count());
+    } else {
+      // A missing session can mean startup or teardown. The caller keeps cancel
+      // pending while run_inner_sql_ is set; zero matches are not proof of exit.
+      LOG_TRACE("vector inner sql cancellation pending execution return", K(trace_id),
+                K(tenant_id), K(task_id), "matched_count", cancel.get_matched_count());
     }
   }
   return ret;
@@ -5158,7 +5263,6 @@ int ObVecIndexAsyncTask::execute_inner_sql(
   ObSqlString sql_string;
   common::ObAddr ls_leader_addr;
   int ret_code = -1;
-  DEBUG_SYNC(ASYNC_VEC_TASK_BEFORE_EXECUTE_INSERT);
   if (data_table_id == OB_INVALID_ID || dest_table_id == OB_INVALID_ID || parallelism < 1 || !current_scn.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(data_table_id), K(dest_table_id), K(parallelism), K(current_scn));
@@ -5235,13 +5339,18 @@ int ObVecIndexAsyncTask::execute_inner_sql(
       LOG_WARN("task ctx is null", K(ret), K(task_id));
     } else if (OB_FAIL(ctx_->set_inner_sql_running(current_scn.get_val_for_sql(), ls_leader_addr))) {
       LOG_WARN("fail to set inner sql running", K(ret), K(task_id), K(current_scn), K(ls_leader_addr));
-    } else if (OB_FAIL(user_sql_proxy->write(tenant_id_, sql_string.ptr(), affected_rows, ObCompatibilityMode::MYSQL_MODE, &session_param, &ls_leader_addr))) {
-      LOG_WARN("fail to execute build replica sql", K(ret), K(tenant_id_));
-    } else if (OB_FAIL(ObVecIndexAsyncTaskUtil::get_inner_sql_ret_code(task_id, ret_code))) {
-      LOG_WARN("inner sql execute fail", K(ret), K(ctx_));
     } else {
-      ret = ret_code;
-      LOG_INFO("execute inner sql ret code", K(ret), K(task_id), KPC(ctx_));
+      // Exercise cancellation after publishing running, before session creation.
+      DEBUG_SYNC(ASYNC_VEC_TASK_BEFORE_EXECUTE_INSERT);
+      if (OB_FAIL(user_sql_proxy->write(tenant_id_, sql_string.ptr(), affected_rows,
+                                       ObCompatibilityMode::MYSQL_MODE, &session_param, &ls_leader_addr))) {
+        LOG_WARN("fail to execute build replica sql", K(ret), K(tenant_id_));
+      } else if (OB_FAIL(ObVecIndexAsyncTaskUtil::get_inner_sql_ret_code(task_id, ret_code))) {
+        LOG_WARN("inner sql execute fail", K(ret), K(ctx_));
+      } else {
+        ret = ret_code;
+        LOG_INFO("execute inner sql ret code", K(ret), K(task_id), KPC(ctx_));
+      }
     }
     if (longops_registered && OB_NOT_NULL(longops_stat)) {
       int tmp_ret = OB_SUCCESS;
@@ -5262,6 +5371,7 @@ int ObVecIndexAsyncTask::execute_inner_sql(
       LOG_WARN("fail to recheck task cancel state after inner sql returns", K(tmp_ret), KPC(ctx_));
     } else if (is_cancel) {
       if (OB_ERR_SESSION_INTERRUPTED == ret
+          || OB_ERR_QUERY_INTERRUPTED == ret
           || OB_CANCELED == ret) {
         ret = OB_CANCELED;
       } else {
