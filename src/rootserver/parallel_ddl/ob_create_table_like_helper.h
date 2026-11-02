@@ -46,7 +46,12 @@ public:
   virtual int generate_sequence_object_() override { return OB_SUCCESS; };
 
 private:
-  int append_search_data_index_infos_(ObIArray<share::schema::ObAuxTableMetaInfo> &simple_index_infos);
+  int append_search_data_index_infos_(const ObIArray<uint64_t> &search_def_index_ids,
+                                      ObIArray<share::schema::ObAuxTableMetaInfo> &simple_index_infos);
+  int collect_available_index_info_(const ObIArray<share::schema::ObAuxTableMetaInfo> &simple_index_infos,
+                                    ObIArray<uint64_t> &search_def_index_ids,
+                                    bool &has_async_logical_index);
+  int reconcile_async_index_attributes_();
 
 private:
   const obrpc::ObCreateTableLikeArg &arg_;
