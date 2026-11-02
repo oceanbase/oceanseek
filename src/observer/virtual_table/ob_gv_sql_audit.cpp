@@ -17,7 +17,7 @@ namespace oceanbase {
 namespace observer {
 
 ObGvSqlAudit::ObGvSqlAudit() :
-    ObVirtualTableScannerIterator(),
+    ObVirtualTableScannerIterator("VTI_SQL_AUDIT"),
     cur_mysql_req_mgr_(nullptr),
     start_id_(INT64_MAX),
     end_id_(INT64_MIN),

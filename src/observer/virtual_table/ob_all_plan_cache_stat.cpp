@@ -19,12 +19,17 @@ namespace oceanbase
 {
 namespace observer
 {
-ObAllPlanCacheBase::ObAllPlanCacheBase()
-    : ObVirtualTableIterator(),
+ObAllPlanCacheBase::ObAllPlanCacheBase(const char *mod_name)
+    : ObVirtualTableIterator(mod_name),
       tenant_id_array_(),
       tenant_id_array_idx_(0)
 {
 
+}
+
+ObAllPlanCacheBase::ObAllPlanCacheBase()
+    : ObAllPlanCacheBase("VTI_PLAN_CACHE")
+{
 }
 
 ObAllPlanCacheBase::~ObAllPlanCacheBase()

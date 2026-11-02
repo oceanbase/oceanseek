@@ -41,6 +41,7 @@ class ObAllVirtualSqlStat : public common::ObVirtualTableScannerIterator,
 {
 public:
   ObAllVirtualSqlStat() :
+      common::ObVirtualTableScannerIterator("VTI_SQL_STAT"),
       ipstr_(), port_(0), last_sql_stat_record_(nullptr),
       sql_stat_manager_key_set_(),
       first_enter_(true) {}

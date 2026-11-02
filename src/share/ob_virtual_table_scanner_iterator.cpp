@@ -10,11 +10,16 @@ namespace oceanbase
 namespace common
 {
 
-ObVirtualTableScannerIterator::ObVirtualTableScannerIterator()
-    : ObVirtualTableIterator(),
+ObVirtualTableScannerIterator::ObVirtualTableScannerIterator(const char *mod_name)
+    : ObVirtualTableIterator(mod_name),
       scanner_(),
       scanner_it_(),
       start_to_read_(false)
+{
+}
+
+ObVirtualTableScannerIterator::ObVirtualTableScannerIterator()
+    : ObVirtualTableScannerIterator("VTITER_CALC_BUF")
 {
 }
 

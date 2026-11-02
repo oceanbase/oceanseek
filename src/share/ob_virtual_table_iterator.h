@@ -38,7 +38,10 @@ class ObVirtualTableIterator : public ObNewRowIterator
   static const int64_t VT_COLUMN_COUNT = 64;
   static const uint64_t CHECK_STATUS_TRY_TIMES = 1024;
 public:
-  ObVirtualTableIterator()
+  // mod_name is the memory label of row_calc_buf_. It is stored by pointer and must be
+  // a string literal or other static storage. Labels longer than AOBJECT_LABEL_SIZE (15)
+  // characters are truncated at allocation time.
+  explicit ObVirtualTableIterator(const char *mod_name = "VTITER_CALC_BUF")
     : allocator_(NULL),
       output_column_ids_(),
       reserved_column_cnt_(0),
@@ -47,7 +50,7 @@ public:
       index_schema_(NULL),
       cur_row_(),
       session_(NULL),
-      row_calc_buf_("VTITER_CALC_BUF"),
+      row_calc_buf_(mod_name),
       effective_tenant_id_(common::OB_INVALID_TENANT_ID),
       fill_column_ids_(&output_column_ids_),
       convert_alloc_(),

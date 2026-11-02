@@ -20,7 +20,8 @@ using namespace common;
 using namespace pl;
 
 ObGVSql::ObGVSql()
-    :plan_id_array_(),
+    : ObAllPlanCacheBase("VTI_GV_SQL"),
+      plan_id_array_(),
      plan_id_array_idx_(OB_INVALID_ID),
      plan_cache_(NULL),
      tmp_buff_()

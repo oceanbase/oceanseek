@@ -18,6 +18,7 @@ namespace common
 class ObVirtualTableScannerIterator : public common::ObVirtualTableIterator
 {
 public:
+  explicit ObVirtualTableScannerIterator(const char *mod_name);
   ObVirtualTableScannerIterator();
   virtual ~ObVirtualTableScannerIterator();
   virtual void reset();

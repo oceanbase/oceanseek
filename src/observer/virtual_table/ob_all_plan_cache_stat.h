@@ -38,6 +38,7 @@ enum ObPlanCacheStatType
 class ObAllPlanCacheBase : public common::ObVirtualTableIterator
 {
 public:
+  explicit ObAllPlanCacheBase(const char *mod_name);
   ObAllPlanCacheBase();
   virtual ~ObAllPlanCacheBase();
   int inner_get_next_row(common::ObNewRow *&row);
