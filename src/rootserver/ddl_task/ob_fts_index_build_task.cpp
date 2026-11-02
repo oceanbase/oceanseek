@@ -802,7 +802,7 @@ int ObFtsIndexBuildTask::prepare_aux_table(
   } else {
     // Rebuilt on every retry. Keep the copy out of the task-lifetime allocator_.
     common::ObArenaAllocator attempt_allocator(
-        "FtsAuxArg", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id_);
+        "FtsAuxArg", OB_MALLOC_NORMAL_BLOCK_SIZE);
     SMART_VARS_3((obrpc::ObCreateIndexArg, index_arg),
                  (obrpc::ObCreateAuxIndexArg, arg),
                  (obrpc::ObCreateAuxIndexRes, res)) {
