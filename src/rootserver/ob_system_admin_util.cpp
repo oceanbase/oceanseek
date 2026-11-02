@@ -597,8 +597,8 @@ int ObAdminSetConfig::verify_config(obrpc::ObAdminSetConfigArg &arg)
                     if (OB_FAIL(schema_guard.get_tenant_info(tenant_id, tenant_schema))) {
                       LOG_WARN("fail to get tenant info", KR(ret), K(tenant_id));
                     } else if (OB_ISNULL(tenant_schema)) {
-                      ret = OB_ERR_UNEXPECTED;
-                      LOG_WARN("tenant_schema is null", KR(ret), K(tenant_id));
+                      ret = OB_TENANT_NOT_EXIST;
+                      LOG_WARN("tenant not exist", KR(ret), K(tenant_id), "config_name", item->name_.str());
                     } else if (condition_func(tenant_id) &&
                               (is_default_table_organization_config ? !tenant_schema->is_oracle_tenant() : true) &&
                               OB_FAIL(item->tenant_ids_.push_back(tenant_id))) {
@@ -632,8 +632,8 @@ int ObAdminSetConfig::verify_config(obrpc::ObAdminSetConfigArg &arg)
               } else if (OB_FAIL(schema_guard.get_tenant_info(tenant_id, tenant_schema))) {
                 LOG_WARN("fail to get tenant info", KR(ret), K(tenant_id));
               } else if (OB_ISNULL(tenant_schema)) {
-                ret = OB_ERR_UNEXPECTED;
-                LOG_WARN("tenant_schema is null", KR(ret), K(tenant_id));
+                ret = OB_TENANT_NOT_EXIST;
+                LOG_WARN("tenant not exist", KR(ret), K(tenant_id), "config_name", item->name_.str());
               } else if ((is_default_table_organization_config ? 
                           !tenant_schema->is_oracle_tenant() && OB_SYS_TENANT_ID != tenant_id
                           : true) && OB_FAIL(item->tenant_ids_.push_back(tenant_id))) {
