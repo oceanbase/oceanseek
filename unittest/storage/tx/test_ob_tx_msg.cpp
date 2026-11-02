@@ -39,7 +39,9 @@ class MockObTxDesc
 public:
   MockObTxDesc()
   {
-    cluster_version_ = oceanbase::common::cal_version(4, 0, 0, 0);
+    // The 4.6.1 baseline guarantees every peer exchanges the current RPC
+    // layout; the cluster version no longer switches serialization layouts.
+    cluster_version_ = oceanbase::common::cal_version(4, 6, 1, 0);
     tenant_id_ = 1001;
     tx_id_ = 1;
     receiver_ = TestObTxMsg::VALID_LS_ID;

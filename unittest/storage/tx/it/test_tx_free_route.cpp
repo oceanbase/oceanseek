@@ -663,7 +663,7 @@ public:
     GCONF._ob_trans_rpc_timeout = 500;
     ObClockGenerator::init();
     omt::the_ctrl_of_enable_transaction_free_route = true;
-    common::ObClusterVersion::get_instance().update_cluster_version(CLUSTER_VERSION_4_1_0_0);
+    common::ObClusterVersion::get_instance().update_cluster_version(CLUSTER_VERSION_4_6_1_0);
     const testing::TestInfo* const test_info =
       testing::UnitTest::GetInstance()->current_test_info();
     MTL_MEM_ALLOC_MGR.init();
@@ -872,6 +872,27 @@ TEST_F(ObTestTxFreeRoute, savepoint)
   EX_WRITE(101, 1);
   EX_COMMIT_TX();
 }
+// The pre-4.6.1 versionless TxStateHeader layout (flag without the version
+// bit) must be rejected instead of decoded through the legacy path.
+TEST_F(ObTestTxFreeRoute, versionless_state_header_rejected)
+{
+  TXFR_TEST_SETUP("127.0.0.1", "127.0.0.2");
+  char buf[64];
+  int64_t len = 0;
+  ASSERT_EQ(OB_SUCCESS, serialization::encode_i64(buf, sizeof(buf), len, 1 /*tx_id*/));
+  ASSERT_EQ(OB_SUCCESS, serialization::encode_i64(buf, sizeof(buf), len, 1 /*global_version*/));
+  ASSERT_EQ(OB_SUCCESS, serialization::encode_i8(buf, sizeof(buf), len, 0 /*flag: without version bit*/));
+
+  ObTxnFreeRouteCtx ctx;
+  ObTxDesc *tx = NULL;
+  int64_t pos = 0;
+  EXPECT_EQ(OB_VERSION_NOT_MATCH,
+            server1.tx_node_.txs_.txn_free_route__update_static_state(0 /*session_id*/,
+                                                                      0 /*client_sid*/,
+                                                                      tx, ctx,
+                                                                      buf, len, pos,
+                                                                      DATA_CURRENT_VERSION));
+}
 TEST_F(ObTestTxFreeRoute, serializalbe_read)
 {
 }
@@ -939,18 +960,6 @@ TEST_F(ObTestTxFreeRoute, keep_alive)
     usleep(1000);
   }
   A_NULL(server1.session_.tx_desc_);
-}
-
-TEST_F(ObTestTxFreeRoute, upgrade_to_4_1)
-{
-  TXFR_TEST_SETUP("127.0.0.1", "127.0.0.2", "127.0.0.3");
-  common::ObClusterVersion::get_instance().update_cluster_version(CLUSTER_VERSION_4_0_0_0);
-  EX_START_TX(1);
-  A_T(proxy.in_txn_);
-  A_F(proxy.can_free_route_);
-  EX_WRITE(100,1);
-  EX_WRITE(101,2);
-  EX_COMMIT_TX();
 }
 
 // TEST_F(ObTestTxFreeRoute, twiddle_knob_on_the_fly)

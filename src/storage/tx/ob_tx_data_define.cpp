@@ -293,21 +293,7 @@ int ObTxData::serialize_(char *buf, const int64_t buf_len, int64_t &pos) const
   } else if (OB_FAIL(end_scn_.serialize(buf, buf_len, pos))) {
     STORAGE_LOG(WARN, "serialize end_scn fail.", KR(ret), K(pos), K(buf_len));
   }
-  uint64_t data_version = 0;
-  if (FAILEDx(GET_MIN_DATA_VERSION(MTL_ID(), data_version))) {
-    STORAGE_LOG(WARN, "fail to get data version", KR(ret));
-  } else if (data_version < DATA_VERSION_4_3_2_0) {
-    if (op_guard_.is_valid()) {
-      if (OB_FAIL(op_guard_->get_undo_status_list().serialize(buf, buf_len, pos))) {
-        STORAGE_LOG(WARN, "serialize undo_status_list fail.", KR(ret), K(pos), K(buf_len));
-      }
-    } else {
-      ObUndoStatusList dummy_undo;
-      if (OB_FAIL(dummy_undo.serialize(buf, buf_len, pos))) {
-        STORAGE_LOG(WARN, "serialize undo_status_list fail.", KR(ret), K(pos), K(buf_len));
-      }
-    }
-  } else if (op_guard_.is_valid()) {
+  if (OB_SUCC(ret) && op_guard_.is_valid()) {
     if (OB_FAIL(op_guard_->get_undo_status_list().serialize(buf, buf_len, pos))) {
       STORAGE_LOG(WARN, "serialize undo_status_list fail.", KR(ret), K(pos), K(buf_len));
     } else if (OB_FAIL(op_guard_->get_tx_op_list().serialize(buf, buf_len, pos))) {
@@ -336,19 +322,7 @@ int64_t ObTxData::get_serialize_size_() const
   len += commit_version_.get_serialize_size();
   len += start_scn_.get_serialize_size();
   len += end_scn_.get_serialize_size();
-  int ret = OB_SUCCESS;
-  uint64_t data_version = 0;
-  if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), data_version))) {
-    STORAGE_LOG(ERROR, "get data_version failed", KR(ret));
-  }
-  if (data_version < DATA_VERSION_4_3_2_0) {
-    if (op_guard_.is_valid()) {
-      len += op_guard_->get_undo_status_list().get_serialize_size();
-    } else {
-      ObUndoStatusList dummy_undo;
-      len += dummy_undo.get_serialize_size();
-    }
-  } else if (op_guard_.is_valid()) {
+  if (op_guard_.is_valid()) {
     len += op_guard_->get_undo_status_list().get_serialize_size();
     len += op_guard_->get_tx_op_list().get_serialize_size();
   }
@@ -415,11 +389,18 @@ int ObTxData::deserialize_(const char *buf,
     STORAGE_LOG(WARN, "deserialize end_scn fail.", KR(ret), K(pos), K(data_len));
   }
   if (OB_SUCC(ret) && pos < data_len) {
+    // The payload is fixed to the current format: when the undo status list is
+    // present, the tx-op list must follow. Payloads without a tx-op list were
+    // only written before the 4.6.1 baseline and are rejected here.
     if (OB_FAIL(init_tx_op())) {
       STORAGE_LOG(WARN, "init tx op fail", KR(ret));
     } else if (OB_FAIL(op_guard_->get_undo_status_list().deserialize(buf, data_len, pos, tx_data_allocator))) {
       STORAGE_LOG(WARN, "deserialize undo_status_list fail.", KR(ret), K(pos), K(data_len));
-    } else if (pos < data_len && OB_FAIL(op_guard_->get_tx_op_list().deserialize(buf, data_len, pos,
+    } else if (pos >= data_len) {
+      ret = OB_VERSION_NOT_MATCH;
+      STORAGE_LOG(WARN, "tx data payload without tx_op_list is below the 4.6.1 baseline.",
+                  KR(ret), K(pos), K(data_len));
+    } else if (OB_FAIL(op_guard_->get_tx_op_list().deserialize(buf, data_len, pos,
             MTL(ObSharedMemAllocMgr*)->tx_data_op_allocator()))) {
       STORAGE_LOG(WARN, "deserialize tx_op_list fail.", KR(ret), K(pos), K(data_len));
     }

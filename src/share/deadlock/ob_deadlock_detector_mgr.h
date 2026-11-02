@@ -76,9 +76,6 @@ class ObDeadLockDetectorMgr
   friend class ObLCLBatchSenderThread;
 public:
   static bool is_deadlock_enabled() { return ObServerConfig::get_instance()._lcl_op_interval != 0; }
-  static bool is_new_deadlock_logic() {
-    return is_need_wait_remote_lock();
-  }
 public:
   ObDeadLockDetectorMgr();
   // all inner object centralized initialization interface,

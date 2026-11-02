@@ -69,15 +69,6 @@ inline int ObTransService::init_tx_(ObTxDesc &tx,
   // cluster_version is invalid, need to get it
   if (0 == cluster_version && OB_FAIL(GET_MIN_DATA_VERSION(tenant_id_, tx.cluster_version_))) {
     TRANS_LOG(WARN, "get min data version fail", K(ret), K(tx));
-  } else if (tx.cluster_version_ < MOCK_DATA_VERSION_4_2_4_0) {
-    if (tx.cluster_version_ == DATA_VERSION_4_2_1_0) {
-      // FIXME: remove this branch
-      tx.cluster_version_ = MOCK_DATA_VERSION_4_2_4_0;
-      TRANS_LOG(WARN, "NEED_REMOVE_NOTICE:4_2_1_0 data version forced to 4_2_4_0");
-    } else {
-      ret = OB_ERR_UNEXPECTED;
-      TRANS_LOG(WARN, "data version should >= 4_2_4_0", K(ret), K(tx));
-    }
   }
   tx.seq_base_ = common::ObSequence::get_max_seq_no() - 1;
   return ret;
@@ -834,9 +825,7 @@ int ObTransService::get_weak_read_snapshot_version(const int64_t max_read_stale_
     // do nothing
   }
   if (OB_SUCC(ret)) {
-    if (monotinic_read
-        || max_read_stale_us_for_user < 0
-        || GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_2_0_0) {
+    if (monotinic_read || max_read_stale_us_for_user < 0) {
       // no need to check barrier version
       snapshot = wrs_scn;
     } else {
@@ -967,7 +956,7 @@ int ObTransService::create_branch_savepoint(ObTxDesc &tx,
   int ret = OB_SUCCESS;
   ObSpinLockGuard guard(tx.lock_);
   if (OB_SUCC(tx_sanity_check_(tx))) {
-    savepoint = tx.inc_and_get_tx_seq(branch);
+    ret = tx.inc_and_get_tx_seq(branch, 1, savepoint);
     TRANS_LOG(TRACE, "create branch savepoint", K(ret), K(branch), K(savepoint), K(tx));
     ObTransTraceLog &tlog = tx.get_tlog();
     REC_TRANS_TRACE_EXT(&tlog, create_branch_savepoint,
@@ -1009,7 +998,7 @@ int ObTransService::create_local_implicit_savepoint_(ObTxDesc &tx,
                                                      ObTxSEQ &savepoint)
 {
   int ret = OB_SUCCESS;
-  savepoint = tx.inc_and_get_tx_seq(0);
+  ret = tx.inc_and_get_tx_seq(0, 1, savepoint);
   TRANS_LOG(TRACE, "create local implicit savepoint", K(ret), K(savepoint), K(tx));
   ObTransTraceLog &tlog = tx.get_tlog();
   REC_TRANS_TRACE_EXT(&tlog, create_local_implicit_savepoint,
@@ -1041,8 +1030,8 @@ int ObTransService::create_global_implicit_savepoint_(ObTxDesc &tx,
     // NOTE: the lock_timeout_us_ can be changed even tx active
     tx.lock_timeout_us_ = tx_param.lock_timeout_us_;
     tx.inc_op_sn();
-    savepoint = tx.inc_and_get_tx_seq(0);
-    if (tx.state_ == ObTxDesc::State::IDLE && !tx.tx_id_.is_valid()) {
+    ret = tx.inc_and_get_tx_seq(0, 1, savepoint);
+    if (OB_SUCC(ret) && tx.state_ == ObTxDesc::State::IDLE && !tx.tx_id_.is_valid()) {
       if (tx.has_implicit_savepoint()) {
         ret = OB_TRANS_INVALID_STATE;
         TRANS_LOG(WARN, "has implicit savepoint, but tx_id is invalid", K(ret), K(tx));
@@ -1142,8 +1131,10 @@ int ObTransService::rollback_to_local_implicit_savepoint_(ObTxDesc &tx,
   int64_t start_ts = ObTimeUtility::current_time();
   ObTxRollbackParts rollback_parts;
   // when rollback local we use this from_scn to all downstream participants
-  ObTxSEQ from_scn = savepoint.clone_with_seq(ObSequence::inc_and_get_max_seq_no(), tx.seq_base_);
-  if (OB_FAIL(find_parts_after_sp_(tx, parts, savepoint))) {
+  ObTxSEQ from_scn;
+  if (OB_FAIL(savepoint.clone_with_seq(ObSequence::inc_and_get_max_seq_no(), tx.seq_base_, from_scn))) {
+    TRANS_LOG(WARN, "invalid rollback sequence", K(ret), K(savepoint), K(tx));
+  } else if (OB_FAIL(find_parts_after_sp_(tx, parts, savepoint))) {
     TRANS_LOG(WARN, "find rollback parts fail", K(ret), K(savepoint), K(tx));
   } else {
     ARRAY_FOREACH(parts, i) {
@@ -1383,9 +1374,11 @@ int ObTransService::create_explicit_savepoint(ObTxDesc &tx,
   int ret = OB_SUCCESS;
   ObSpinLockGuard guard(tx.lock_);
   tx.inc_op_sn();
-  const ObTxSEQ scn = tx.inc_and_get_tx_seq(0);
+  ObTxSEQ scn;
   ObTxSavePoint sp;
-  if (OB_SUCC(sp.init(scn, savepoint, session_id, user_create))) {
+  if (OB_FAIL(tx.inc_and_get_tx_seq(0, 1, scn))) {
+    TRANS_LOG(WARN, "allocate savepoint sequence failed", K(ret), K(tx));
+  } else if (OB_SUCC(sp.init(scn, savepoint, session_id, user_create))) {
     if (OB_FAIL(tx.savepoints_.push_back(sp))) {
       TRANS_LOG(WARN, "push savepoint failed", K(ret));
     } else if (!tx.tx_id_.is_valid() && OB_FAIL(tx_desc_mgr_.add(tx))) {
@@ -1538,9 +1531,11 @@ int ObTransService::create_stash_savepoint(ObTxDesc &tx, const ObString &name)
   int ret = OB_SUCCESS;
   ObSpinLockGuard guard(tx.lock_);
   tx.inc_op_sn();
-  const ObTxSEQ seq_no = tx.inc_and_get_tx_seq(0);
+  ObTxSEQ seq_no;
   ObTxSavePoint sp;
-  if (OB_SUCC(sp.init(seq_no, name, 0, false, true))) {
+  if (OB_FAIL(tx.inc_and_get_tx_seq(0, 1, seq_no))) {
+    TRANS_LOG(WARN, "allocate stash savepoint sequence failed", K(ret), K(tx));
+  } else if (OB_SUCC(sp.init(seq_no, name, 0, false, true))) {
     if (OB_FAIL(tx.savepoints_.push_back(sp))) {
       TRANS_LOG(WARN, "push savepoint failed", K(ret));
     }

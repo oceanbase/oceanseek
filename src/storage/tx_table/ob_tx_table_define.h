@@ -67,9 +67,6 @@ public:
                   ObTxDataTable &tx_data_table);
   int64_t get_serialize_size() const;
 
-  void set_compatible_version(const int32_t version) {
-    compatible_version_ = version;
-  }
 private:
   int serialize_(char *buf, const int64_t buf_len, int64_t &pos) const;
   int deserialize_(const char *buf,
@@ -91,7 +88,6 @@ public:
     tx_data_guard_.reset();
     exec_info_.reset();
     table_lock_info_.reset();
-    compatible_version_ = -1;
   }
   void destroy() { reset(); }
   TO_STRING_KV(K_(tx_id), K_(ls_id), K_(cluster_id), K_(tx_data_guard),
@@ -103,9 +99,6 @@ public:
   ObTxDataGuard tx_data_guard_;
   transaction::ObTxExecInfo exec_info_;
   transaction::tablelock::ObTableLockInfo table_lock_info_;
-  // used to handle compatible issue when deserialize,
-  // not serialized, set from ObTxCtxTableMeta
-  int32_t compatible_version_;
 };
 
 struct ObTxCtxTableMeta

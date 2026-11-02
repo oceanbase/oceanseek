@@ -575,7 +575,7 @@ int ObTxCallbackList::remove_callbacks_for_rollback_to(const transaction::ObTxSE
     TRANS_LOG(ERROR, "remove callback by rollback wont report error", K(ret), K(functor));
   } else {
     int64_t removed = functor.get_remove_cnt();
-    if (to_seq.support_branch() && to_seq.get_branch()) {
+    if (to_seq.get_branch()) {
       branch_removed_ += removed;
     }
     callback_mgr_.add_rollback_to_callback_remove_cnt(removed);

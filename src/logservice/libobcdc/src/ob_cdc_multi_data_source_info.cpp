@@ -41,7 +41,7 @@ int MultiDataSourceNode::init(
     common::ObString data;
     data.assign_ptr(reinterpret_cast<const char *>(buf), buf_size);
 
-    if (OB_FAIL(tx_buf_node_.init(type, data, share::SCN(), transaction::ObTxSEQ::mk_v0(1), nullptr))) {
+    if (OB_FAIL(tx_buf_node_.init(type, data, share::SCN(), transaction::ObTxSEQ::MIN_VAL(), nullptr))) {
       LOG_ERROR("init tx_buf_node failed", KR(ret), K(lsn), K(type), K(data), K(buf_size));
     }
   }

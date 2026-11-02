@@ -3351,15 +3351,20 @@ TEST_P(TestMultiVersionMerge, test_running_trans_cross_macro_with_abort_sql_seq)
   ObPartitionMinorMerger merger(local_arena_, merge_context.static_param_);
 
   ObTableHandleV2 handle1;
-  const char *micro_data[2];
-  micro_data[0] =
+  const int64_t seq10 = stored_tx_seq(10);
+  const int64_t seq8 = stored_tx_seq(8);
+  char micro0[512];
+  char micro1[512];
+  ASSERT_GT(snprintf(micro0, sizeof(micro0),
       "bigint   var   bigint   bigint   bigint bigint flag    multi_version_row_flag trans_id\n"
-      "1        var1  MIN     -10       8       NOP    EXIST    FU                trans_id_1\n";
-
-  micro_data[1] =
+      "1        var1  MIN     %ld       8       NOP    EXIST    FU                trans_id_1\n",
+      seq10), 0);
+  ASSERT_GT(snprintf(micro1, sizeof(micro1),
       "bigint   var   bigint   bigint   bigint  bigint flag    multi_version_row_flag trans_id\n"
-      "1        var1  MIN     -8       8       NOP    EXIST    LU                trans_id_1\n"
-      "3        var3  -16     0        18      NOP    EXIST    LF                trans_id_0\n";
+      "1        var1  MIN     %ld       8       NOP    EXIST    LU                trans_id_1\n"
+      "3        var3  -16     0        18      NOP    EXIST    LF                trans_id_0\n",
+      seq8), 0);
+  const char *micro_data[2] = {micro0, micro1};
 
   int schema_rowkey_cnt = 2;
 
@@ -3424,13 +3429,15 @@ TEST_P(TestMultiVersionMerge, test_running_trans_cross_macro_with_abort_sql_seq)
   ASSERT_EQ(OB_SUCCESS, merger.merge_partition(merge_context, 0));
   build_sstable(merge_context, merged_sstable);
 
-  const char *result1 =
+  char result1[1024];
+  ASSERT_GT(snprintf(result1, sizeof(result1),
     "bigint   var   bigint   bigint   bigint  bigint  flag    multi_version_row_flag trans_id\n"
       "0        var0   -26    0         7       NOP    EXIST    LF                trans_id_0\n"
-      "1        var1  MIN     -10       8       NOP    EXIST    FU                trans_id_1\n"
+      "1        var1  MIN     %ld       8       NOP    EXIST    FU                trans_id_1\n"
       "1        var1  MAX     MAX       NOP     NOP    EXIST    LG                trans_id_1\n"
       "2        var2  -26     0         7       NOP    EXIST    LF                trans_id_0\n"
-      "3        var3  -16     0         18      NOP    EXIST    LF                trans_id_0\n";
+      "3        var3  -16     0         18      NOP    EXIST    LF                trans_id_0\n",
+      seq10), 0);
 
   ObMockIterator res_iter;
   ObStoreRowIterator *scanner = NULL;

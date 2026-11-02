@@ -440,7 +440,7 @@ int TestDirectLoadSSUpdateIncMajorTask::mock_co_inc_major_sstable(
 TEST_F(TestDirectLoadSSUpdateIncMajorTask, test_replay_deserialize_classifies_empty_inc_major)
 {
   const transaction::ObTransID trans_id(1001);
-  const transaction::ObTxSEQ seq_no = transaction::ObTxSEQ::mk_v0(1);
+  const transaction::ObTxSEQ seq_no = transaction::ObTxSEQ(1, 0);
   const int64_t snapshot_version = 200;
   const uint64_t data_format_version = DATA_CURRENT_VERSION;
   ObSSTable *empty_without_progress = nullptr;
@@ -494,9 +494,9 @@ TEST_F(TestDirectLoadSSUpdateIncMajorTask, test_replay_deserialize_classifies_em
 TEST_F(TestDirectLoadSSUpdateIncMajorTask, test_replay_publish_gate)
 {
   const transaction::ObTransID trans_id(1002);
-  const transaction::ObTxSEQ seq_no = transaction::ObTxSEQ::mk_v0(2);
+  const transaction::ObTxSEQ seq_no = transaction::ObTxSEQ(2, 0);
   const transaction::ObTransID finite_trans_id(1003);
-  const transaction::ObTxSEQ finite_seq_no = transaction::ObTxSEQ::mk_v0(3);
+  const transaction::ObTxSEQ finite_seq_no = transaction::ObTxSEQ(3, 0);
   const int64_t snapshot_version = 200;
   const uint64_t data_format_version = DATA_CURRENT_VERSION;
   ObSSTable *empty_without_progress = nullptr;

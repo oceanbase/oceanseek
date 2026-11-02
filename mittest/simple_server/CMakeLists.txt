@@ -101,6 +101,12 @@ ob_unittest_observer(test_tx_data_minor test_tx_data_minor.cpp)
 ob_unittest_observer(test_tx_ctx_table_mit test_tx_ctx_table_mit.cpp)
 ob_unittest_observer(test_lock_table_persistence test_lock_table_persistence.cpp)
 ob_unittest_observer(test_tx_recover test_tx_recovery.cpp)
+# Include the verified restart scenario in farm's default selection, which
+# excludes the general simpleserver label. Keep server restarts serial.
+set_tests_properties(test_tx_recover PROPERTIES LABELS "transaction_recovery" RUN_SERIAL TRUE)
+ob_unittest(test_simple_server_restart_helper test_simple_server_restart_helper.cpp)
+target_link_libraries(test_simple_server_restart_helper PRIVATE observer_test)
+set_tests_properties(test_simple_server_restart_helper PROPERTIES LABELS "transaction_recovery" RUN_SERIAL TRUE TIMEOUT 30)
 ob_unittest_observer(test_tx_recover2 test_tx_recovery2.cpp)
 ob_unittest_observer(test_tx_recover3 test_tx_recovery3.cpp)
 ob_unittest_observer(test_ls_recovery_stat_handler test_ls_recovery_stat_handler.cpp)

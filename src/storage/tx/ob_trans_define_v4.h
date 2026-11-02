@@ -33,8 +33,7 @@ namespace transaction
 class ObTxSchedulerStat;
 
 
-struct ObTransIDAndAddr { // deadlock needed in some old version
-                          // but for compat reason, cannot be moved, (use ObRowConflictInfo instead)
+struct ObTransIDAndAddr { // Wire-only element type for the reserved execution-result array.
   OB_UNIS_VERSION(1);
 public:
   ObTransIDAndAddr() = default;
@@ -467,20 +466,18 @@ class ObTxExecResult
   bool incomplete_;
   share::ObLSArray touched_ls_list_;
   ObTxPartList parts_;
-  ObSArray<ObTransIDAndAddr> conflict_txs_; // FARM COMPAT WHITELIST for cflict_txs_
+  ObSArray<ObTransIDAndAddr> legacy_conflict_txs_; // Positional wire stub; never populated by execution.
   ObSArray<storage::ObRowConflictInfo> conflict_info_array_;
 public:
   ObTxExecResult();
   ~ObTxExecResult();
   void reset();
-  TO_STRING_KV(K_(incomplete), K_(parts), K_(touched_ls_list), K_(conflict_txs), K_(conflict_info_array));
+  TO_STRING_KV(K_(incomplete), K_(parts), K_(touched_ls_list), K_(conflict_info_array));
   void set_incomplete() {
     TRANS_LOG(TRACE, "tx result incomplete:", KP(this));
     incomplete_ = true;
   }
-  void merge_conflict_info_array(const common::ObIArray<storage::ObRowConflictInfo> &array,
-                                 const common::ObIArray<ObTransIDAndAddr> &array_old);
-  void conver_conflict_info_to_old_version_if_need();
+  void merge_conflict_info_array(const common::ObIArray<storage::ObRowConflictInfo> &array);
   bool is_incomplete() const { return incomplete_; }
   int add_touched_ls(const share::ObLSID ls);
   int add_touched_ls(const ObIArray<share::ObLSID> &ls_list);
@@ -676,12 +673,7 @@ protected:
   int16_t last_branch_id_;           // branch_id allocator, reset when stmt start
   ObTxPartList parts_;               // participant list
   ObTxSavePointList savepoints_;     // savepoints established
-  // conflict_txs_ is used to store conflict trans id when try acquire row lock failed(meet lock conflict)
-  // this information will used to detect deadlock
-  // conflict_txs_ is valid when transaction is not executed on local
-  // on scheduler, conflict_txs_ merges all participants executed results on remote
-  // on participant, conflict_txs_ temporary stores conflict information, and will be read by upper layers, bring back to scheduler
-  ObSArray<ObTransIDAndAddr> conflict_txs_; // FARM COMPAT WHITELIST for cflict_txs_
+  // Participant conflict information returned to the scheduler for deadlock detection.
   ObSArray<storage::ObRowConflictInfo> conflict_info_array_;
 
   // used during commit
@@ -761,11 +753,10 @@ private:
 private:
   int update_part_(ObTxPart &p, const bool append = true, const bool check_only_if_exist = false);
   int add_conflict_info_(const storage::ObRowConflictInfo &conflict_info);
-  int merge_conflict_info_array_(const ObIArray<storage::ObRowConflictInfo> &conflict_info_array,
-                                 const ObIArray<ObTransIDAndAddr> &conflict_info_array_old);
+  int merge_conflict_info_array_(const ObIArray<storage::ObRowConflictInfo> &conflict_info_array);
   int update_parts_(const ObTxPartList &list);
   void post_rb_savepoint_(ObTxPartRefList &parts, const ObTxSEQ &savepoint);
-  void implicit_start_tx_();
+  int implicit_start_tx_();
   bool acq_commit_cb_lock_if_need_();
   bool has_extra_state_() const;
   bool in_tx_or_has_extra_state_() const;
@@ -812,7 +803,6 @@ public:
                K_(flags_.INTERRUPTED),
                K_(flags_.BLOCK),
                K_(flags_.REPLICA),
-               K_(conflict_txs),
                K_(conflict_info_array),
                K_(abort_cause),
                K_(commit_expire_ts),
@@ -820,7 +810,6 @@ public:
                K_(modified_tables),
                K_(last_rc_snapshot_version),
                K_(ref));
-  bool support_branch() const { return seq_base_ > 0; }
   // used by SQL alloc branch_id refer the min branch_id allowed
   // because branch_id bellow this is reserved for internal use
   static int branch_id_offset() { return MAX_CALLBACK_LIST_COUNT; }
@@ -828,12 +817,9 @@ public:
   int alloc_branch_id(const int64_t count, int16_t &branch_id);
   void reset_conflict_info_array() { conflict_info_array_.reset(); }
   int fetch_conflict_info_array(ObIArray<storage::ObRowConflictInfo> &array);
-  int fetch_conflict_txs_array(ObIArray<ObTransIDAndAddr> &array);
   ObSArray<storage::ObRowConflictInfo> &get_conflict_info_array() { return conflict_info_array_; }
   int add_conflict_info(const storage::ObRowConflictInfo &conflict_info);
-  int add_conflict_info_(const ObTransIDAndAddr &conflict_tx);// this is for compat reason
-  int merge_conflict_info_array(const ObIArray<storage::ObRowConflictInfo> &array_new,
-                                const ObIArray<ObTransIDAndAddr> &array_old/*compat reason*/);
+  int merge_conflict_info_array(const ObIArray<storage::ObRowConflictInfo> &array);
   bool has_conflict_infos() const { return conflict_info_array_.count() > 0; }
   bool contain(const ObTransID &trans_id) const { return tx_id_ == trans_id; } /*used by TransHashMap*/
   uint64_t get_tenant_id() const { return tenant_id_; }
@@ -978,6 +964,7 @@ LST_DO(DEF_FREE_ROUTE_DECODE, (;), static, dynamic, parts, extra);
   void mark_part_abort(const ObTransID tx_id, const int abort_cause);
   int64_t get_coord_epoch() const;
   int get_and_inc_tx_seq(const int16_t branch, const int N, ObTxSEQ &tx_seq) const;
+  // Logs an error and returns INVL on failure; use the int overload to propagate errors.
   ObTxSEQ inc_and_get_tx_seq(int16_t branch) const;
   int inc_and_get_tx_seq(const int16_t branch, const int N, ObTxSEQ &tx_seq) const;
   ObTxSEQ get_tx_seq(int64_t seq_abs = 0) const;
@@ -1248,25 +1235,23 @@ typedef lib::ObLockGuardWithTimeout<ObSpinLock> ObSpinLockGuardWithTimeout;
 
 inline ObTxSEQ ObTxDesc::get_tx_seq(int64_t seq_abs) const
 {
-  int64_t seq = seq_abs > 0 ? seq_abs : ObSequence::get_max_seq_no();
-  if (OB_LIKELY(support_branch())) {
-    if (seq < seq_base_) {
-      TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "seq_abs is less seq_base_", K(seq_abs), K(tx_id_), K(seq_base_));
-      return ObTxSEQ::INVL();
-    }
-    return ObTxSEQ(seq - seq_base_, 0);
-  } else {
-    return ObTxSEQ::mk_v0(seq);
+  const int64_t seq = seq_abs > 0 ? seq_abs : ObSequence::get_max_seq_no();
+  if (OB_UNLIKELY(seq_base_ <= 0 || seq <= seq_base_
+                  || !ObTxSEQ::is_valid_seq(seq - seq_base_))) {
+    TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "invalid transaction sequence offset",
+                  K(seq), K(tx_id_), K(seq_base_));
+    return ObTxSEQ::INVL();
   }
+  return ObTxSEQ(seq - seq_base_, 0);
 }
 
 inline ObTxSEQ ObTxDesc::get_min_tx_seq() const
 {
-  if (OB_LIKELY(support_branch())) {
-    return ObTxSEQ(1, 0);
-  } else {
-    return ObTxSEQ::mk_v0(1);
+  if (OB_UNLIKELY(seq_base_ <= 0)) {
+    TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED, "invalid transaction sequence base", K(tx_id_), K(seq_base_));
+    return ObTxSEQ::INVL();
   }
+  return ObTxSEQ::MIN_VAL();
 }
 
 inline int ObTxDesc::get_and_inc_tx_seq(const int16_t branch,
@@ -1275,24 +1260,28 @@ inline int ObTxDesc::get_and_inc_tx_seq(const int16_t branch,
 {
   int ret = OB_SUCCESS;
   int64_t seq = 0;
-  if (OB_FAIL(ObSequence::get_and_inc_max_seq_no(N, seq))) {
+  if (OB_UNLIKELY(seq_base_ <= 0 || branch < 0)) {
+    ret = OB_ERR_UNEXPECTED;
+    TRANS_LOG(ERROR, "invalid transaction sequence base or branch", K(ret), K(seq_base_), K(branch));
+  } else if (OB_FAIL(ObSequence::get_and_inc_max_seq_no(N, seq))) {
     TRANS_LOG(ERROR, "inc max seq no failed", K(ret), K(N));
-  } else if (OB_LIKELY(support_branch())) {
-    tx_seq = ObTxSEQ(seq - seq_base_, branch);
+  } else if (FALSE_IT(tx_seq = get_tx_seq(seq))) {
+  } else if (OB_UNLIKELY(!tx_seq.is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
   } else {
-    tx_seq = ObTxSEQ::mk_v0(seq);
+    tx_seq.set_branch(branch);
   }
   return ret;
 }
 
 inline ObTxSEQ ObTxDesc::inc_and_get_tx_seq(int16_t branch) const
 {
-  int64_t seq = ObSequence::inc_and_get_max_seq_no();
-  if (OB_LIKELY(support_branch())) {
-    return ObTxSEQ(seq - seq_base_, branch);
-  } else {
-    return ObTxSEQ::mk_v0(seq);
+  int ret = OB_SUCCESS;
+  ObTxSEQ seq;
+  if (OB_FAIL(inc_and_get_tx_seq(branch, 1, seq))) {
+    TRANS_LOG(ERROR, "failed to allocate transaction sequence", K(ret), K(tx_id_), K(seq_base_), K(branch));
   }
+  return seq;
 }
 
 inline int ObTxDesc::inc_and_get_tx_seq(const int16_t branch,
@@ -1301,12 +1290,16 @@ inline int ObTxDesc::inc_and_get_tx_seq(const int16_t branch,
 {
   int ret = OB_SUCCESS;
   int64_t seq = 0;
-  if (OB_FAIL(ObSequence::inc_and_get_max_seq_no(N, seq))) {
+  if (OB_UNLIKELY(seq_base_ <= 0 || branch < 0)) {
+    ret = OB_ERR_UNEXPECTED;
+    TRANS_LOG(ERROR, "invalid transaction sequence base or branch", K(ret), K(seq_base_), K(branch));
+  } else if (OB_FAIL(ObSequence::inc_and_get_max_seq_no(N, seq))) {
     TRANS_LOG(ERROR, "inc max seq no failed", K(ret), K(N));
-  } else if (OB_LIKELY(support_branch())) {
-    tx_seq = ObTxSEQ(seq - seq_base_, branch);
+  } else if (FALSE_IT(tx_seq = get_tx_seq(seq))) {
+  } else if (OB_UNLIKELY(!tx_seq.is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
   } else {
-    tx_seq = ObTxSEQ::mk_v0(seq);
+    tx_seq.set_branch(branch);
   }
   return ret;
 }

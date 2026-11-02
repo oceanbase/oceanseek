@@ -149,7 +149,7 @@ public:
     ObTabletID lob_tablet(lob_tablet_id);
     ObTabletID lob_piece_tablet(lob_piece_tablet_id);
     ObTransID trans_id(1001);
-    ObTxSEQ seq_no(2001);
+    ObTxSEQ seq_no(2001, 0);
     int64_t snapshot_version = 1000000;
     uint64_t data_format_version = DATA_VERSION_4_5_0_0;
 
@@ -500,7 +500,7 @@ TEST_F(TestDDLIncCommitLog, test_log_basic_init_valid)
   ObTabletID lob_tablet_id(100002);
   ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   ObTransID trans_id(1001);
-  ObTxSEQ seq_no(2001);
+  ObTxSEQ seq_no(2001, 0);
   int64_t snapshot_version = 1000000;
   uint64_t data_format_version = DATA_VERSION_4_5_0_0;
 
@@ -524,7 +524,7 @@ TEST_F(TestDDLIncCommitLog, test_log_basic_lob_data_version_gate)
   const ObTabletID lob_piece_tablet_id(100003);
   const ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   const ObTransID trans_id(1001);
-  const ObTxSEQ seq_no(2001);
+  const ObTxSEQ seq_no(2001, 0);
   const int64_t snapshot_version = 1000000;
 
   ASSERT_EQ(OB_NOT_SUPPORTED,
@@ -551,7 +551,7 @@ TEST_F(TestDDLIncCommitLog, test_log_basic_lob_aux_tablet_ids_must_be_paired)
   const ObTabletID lob_piece_tablet_id(100003);
   const ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   const ObTransID trans_id(1001);
-  const ObTxSEQ seq_no(2001);
+  const ObTxSEQ seq_no(2001, 0);
   const int64_t snapshot_version = 1000000;
 
   // 旧日志只有 LOB meta tablet，仍需允许新版本回放。
@@ -574,7 +574,7 @@ TEST_F(TestDDLIncCommitLog, test_log_basic_init_invalid_tablet)
   ObTabletID lob_tablet_id(100002);
   ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   ObTransID trans_id(1001);
-  ObTxSEQ seq_no(2001);
+  ObTxSEQ seq_no(2001, 0);
   int64_t snapshot_version = 1000000;
   uint64_t data_format_version = DATA_VERSION_4_5_0_0;
 
@@ -590,7 +590,7 @@ TEST_F(TestDDLIncCommitLog, test_log_basic_init_invalid_direct_load_type)
   ObTabletID lob_tablet_id(100002);
   ObDirectLoadType invalid_type = ObDirectLoadType::DIRECT_LOAD_INVALID;
   ObTransID trans_id(1001);
-  ObTxSEQ seq_no(2001);
+  ObTxSEQ seq_no(2001, 0);
   int64_t snapshot_version = 1000000;
   uint64_t data_format_version = DATA_VERSION_4_5_0_0;
 
@@ -605,7 +605,7 @@ TEST_F(TestDDLIncCommitLog, test_log_basic_init_invalid_trans_id)
   ObTabletID lob_tablet_id(100002);
   ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   ObTransID invalid_trans_id; // invalid trans id
-  ObTxSEQ seq_no(2001);
+  ObTxSEQ seq_no(2001, 0);
   int64_t snapshot_version = 1000000;
   uint64_t data_format_version = DATA_VERSION_4_5_0_0;
 
@@ -620,7 +620,7 @@ TEST_F(TestDDLIncCommitLog, test_log_basic_init_invalid_snapshot_version)
   ObTabletID lob_tablet_id(100002);
   ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   ObTransID trans_id(1001);
-  ObTxSEQ seq_no(2001);
+  ObTxSEQ seq_no(2001, 0);
   int64_t invalid_snapshot_version = 0; // invalid
   uint64_t data_format_version = DATA_VERSION_4_5_0_0;
 
@@ -1205,7 +1205,7 @@ TEST_F(TestDDLIncCommitLog, test_rpc_arg_serialize_deserialize_basic)
   ObTabletID lob_tablet_id(100002);
   ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   ObTransID trans_id(2001);
-  ObTxSEQ seq_no(3001);
+  ObTxSEQ seq_no(3001, 0);
   int64_t snapshot_version = 1000000;
   uint64_t data_format_version = DATA_VERSION_4_5_0_0;
   bool is_co_sstable = true;
@@ -1295,7 +1295,7 @@ TEST_F(TestDDLIncCommitLog, test_rpc_arg_with_empty_buffers)
   ObTabletID lob_tablet_id(100002);
   ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   ObTransID trans_id(2001);
-  ObTxSEQ seq_no(3001);
+  ObTxSEQ seq_no(3001, 0);
   int64_t snapshot_version = 1000000;
   uint64_t data_format_version = DATA_VERSION_4_5_0_0;
   bool is_co_sstable = false;
@@ -1364,7 +1364,7 @@ TEST_F(TestDDLIncCommitLog, test_rpc_arg_with_large_buffers)
   ObTabletID lob_tablet_id(100002);
   ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   ObTransID trans_id(2001);
-  ObTxSEQ seq_no(3001);
+  ObTxSEQ seq_no(3001, 0);
   int64_t snapshot_version = 1000000;
   uint64_t data_format_version = DATA_VERSION_4_5_0_0;
   bool is_co_sstable = false;
@@ -1447,7 +1447,7 @@ TEST_F(TestDDLIncCommitLog, test_rpc_arg_serialize_size_consistency)
   ObTabletID lob_tablet_id(100002);
   ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   ObTransID trans_id(2001);
-  ObTxSEQ seq_no(3001);
+  ObTxSEQ seq_no(3001, 0);
   int64_t snapshot_version = 1000000;
   uint64_t data_format_version = DATA_VERSION_4_5_0_0;
   bool is_co_sstable = false;
@@ -1587,7 +1587,7 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_set_ss_inc_major_with_lob_validation
   ObTabletID lob_meta_tablet_id(100002);  // 有效的 lob_meta_tablet_id
   ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   ObTransID trans_id(1001);
-  ObTxSEQ seq_no(2001);
+  ObTxSEQ seq_no(2001, 0);
   int64_t snapshot_version = 1000000;
   uint64_t data_format_version = DATA_VERSION_4_5_0_0;
   
@@ -1760,7 +1760,7 @@ TEST_F(TestDDLIncCommitLog, test_rpc_arg_with_inv_sstable)
   ObRpcRemoteWriteDDLIncCommitLogArg arg;
   ASSERT_SUCC(arg.init(tenant_id, ObLSID(1), ObTabletID(100001), ObTabletID(), ObTabletID(),
                        &tx_desc, ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR,
-                       trans_id, ObTxSEQ(3001), 1000000, DATA_VERSION_4_5_0_0,
+                       trans_id, ObTxSEQ(3001, 0), 1000000, DATA_VERSION_4_5_0_0,
                        share::SCN::base_scn()));
   ASSERT_SUCC(arg.set_ss_inc_major(sstable, nullptr, nullptr));
   ASSERT_FALSE(arg.is_co_sstable_);
@@ -1855,7 +1855,7 @@ TEST_F(TestDDLIncCommitLog, test_log_basic_init_with_invalid_lob_tablet)
   ObTabletID invalid_lob_tablet; // invalid
   ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   ObTransID trans_id(1001);
-  ObTxSEQ seq_no(2001);
+  ObTxSEQ seq_no(2001, 0);
   int64_t snapshot_version = 1000000;
   uint64_t data_format_version = DATA_VERSION_4_5_0_0;
 
@@ -1872,7 +1872,7 @@ TEST_F(TestDDLIncCommitLog, test_log_basic_init_with_zero_snapshot_version)
   ObTabletID lob_tablet_id(100002);
   ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   ObTransID trans_id(1001);
-  ObTxSEQ seq_no(2001);
+  ObTxSEQ seq_no(2001, 0);
   int64_t snapshot_version = 0; // invalid
   uint64_t data_format_version = DATA_VERSION_4_5_0_0;
 
@@ -1887,7 +1887,7 @@ TEST_F(TestDDLIncCommitLog, test_log_basic_init_with_negative_snapshot_version)
   ObTabletID lob_tablet_id(100002);
   ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   ObTransID trans_id(1001);
-  ObTxSEQ seq_no(2001);
+  ObTxSEQ seq_no(2001, 0);
   int64_t snapshot_version = -1; // invalid
   uint64_t data_format_version = DATA_VERSION_4_5_0_0;
 
@@ -1902,7 +1902,7 @@ TEST_F(TestDDLIncCommitLog, test_log_basic_init_with_invalid_data_format_version
   ObTabletID lob_tablet_id(100002);
   ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   ObTransID trans_id(1001);
-  ObTxSEQ seq_no(2001);
+  ObTxSEQ seq_no(2001, 0);
   int64_t snapshot_version = 1000000;
   uint64_t data_format_version = DATA_VERSION_4_3_0_0; // 不支持 inc major
 
@@ -2012,7 +2012,7 @@ TEST_F(TestDDLIncCommitLog, test_log_basic_backward_compatibility)
   legacy_src.lob_meta_tablet_id_ = ObTabletID(100002);
   legacy_src.direct_load_type_ = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   legacy_src.trans_id_ = ObTransID(1001);
-  legacy_src.seq_no_ = ObTxSEQ(2001);
+  legacy_src.seq_no_ = ObTxSEQ(2001, 0);
   legacy_src.snapshot_version_ = 1000000;
   legacy_src.data_format_version_ = DATA_VERSION_4_6_2_0;
 
@@ -2067,7 +2067,7 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_backward_compatibility)
   legacy_src.log_basic_.lob_meta_tablet_id_ = ObTabletID(100002);
   legacy_src.log_basic_.direct_load_type_ = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   legacy_src.log_basic_.trans_id_ = ObTransID(1001);
-  legacy_src.log_basic_.seq_no_ = ObTxSEQ(2001);
+  legacy_src.log_basic_.seq_no_ = ObTxSEQ(2001, 0);
   legacy_src.log_basic_.snapshot_version_ = 1000000;
   legacy_src.log_basic_.data_format_version_ = DATA_VERSION_4_6_2_0;
   legacy_src.is_rollback_ = true;
@@ -2093,7 +2093,7 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_backward_compatibility)
   ObDDLIncLogBasic current_log_basic;
   ASSERT_SUCC(current_log_basic.init(ObTabletID(100001), ObTabletID(100002), ObTabletID(100003),
                                      ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR,
-                                     ObTransID(1001), ObTxSEQ(2001), 1000000,
+                                     ObTransID(1001), ObTxSEQ(2001, 0), 1000000,
                                      DATA_VERSION_4_6_2_1));
   ObDDLIncCommitLog current_src;
   ASSERT_SUCC(current_src.init(current_log_basic, false, share::SCN::base_scn()));
@@ -2127,7 +2127,7 @@ TEST_F(TestDDLIncCommitLog, test_rpc_arg_backward_compatibility)
   const ObTabletID lob_piece_tablet_id(100003);
   const ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   const ObTransID trans_id(2001);
-  const ObTxSEQ seq_no(3001);
+  const ObTxSEQ seq_no(3001, 0);
   const int64_t snapshot_version = 1000000;
   const share::SCN start_scn = share::SCN::base_scn();
 
@@ -2205,7 +2205,7 @@ TEST_F(TestDDLIncCommitLog, test_rpc_arg_full_serialize)
   ObTabletID lob_tablet_id(100002);
   ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   ObTransID trans_id(2001);
-  ObTxSEQ seq_no(3001);
+  ObTxSEQ seq_no(3001, 0);
   int64_t snapshot_version = 1000000;
   uint64_t data_format_version = DATA_VERSION_4_5_0_0;
   share::SCN start_scn = share::SCN::base_scn();
@@ -2280,7 +2280,7 @@ TEST_F(TestDDLIncCommitLog, test_rpc_arg_serialize_with_empty_buffers)
   ObTabletID lob_tablet_id;  // 无效的 lob tablet
   ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL;  // 非 major
   ObTransID trans_id(2001);
-  ObTxSEQ seq_no(3001);
+  ObTxSEQ seq_no(3001, 0);
   int64_t snapshot_version = 0;  // 非 major 场景，snapshot_version 可以为 0
   uint64_t data_format_version = 0;
   share::SCN start_scn = share::SCN::base_scn();
@@ -2330,7 +2330,7 @@ TEST_F(TestDDLIncCommitLog, test_rpc_arg_init_validation)
   ObTabletID lob_tablet_id(100002);
   ObDirectLoadType direct_load_type = ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR;
   ObTransID trans_id(2001);
-  ObTxSEQ seq_no(3001);
+  ObTxSEQ seq_no(3001, 0);
   int64_t snapshot_version = 1000000;
   uint64_t data_format_version = DATA_VERSION_4_5_0_0;
   share::SCN start_scn = share::SCN::base_scn();

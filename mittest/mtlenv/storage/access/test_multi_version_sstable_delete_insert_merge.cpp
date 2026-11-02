@@ -3358,19 +3358,26 @@ TEST_P(TestMultiVersionDIMerge, test_running_trans_cross_macro_with_abort_sql_se
   ObPartitionMinorMerger merger(local_arena_, merge_context.static_param_);
 
   ObTableHandleV2 handle1;
-  const char *micro_data[2];
-  micro_data[0] =
+  const int64_t seq12 = stored_tx_seq(12);
+  const int64_t seq11 = stored_tx_seq(11);
+  const int64_t seq8 = stored_tx_seq(8);
+  const int64_t seq7 = stored_tx_seq(7);
+  char micro0[768];
+  char micro1[1024];
+  ASSERT_GT(snprintf(micro0, sizeof(micro0),
       "bigint   var   bigint   bigint     bigint bigint   flag    flag_type  multi_version_row_flag trans_id\n"
-      "1        var1  MIN     -12               8      -1       INSERT    NORMAL   UCF trans_id_1\n"
-      "1        var1  MIN     -11              -1      -1       DELETE    NORMAL   UC trans_id_1\n";
-
-  micro_data[1] =
+      "1        var1  MIN     %ld               8      -1       INSERT    NORMAL   UCF trans_id_1\n"
+      "1        var1  MIN     %ld              -1      -1       DELETE    NORMAL   UC trans_id_1\n",
+      seq12, seq11), 0);
+  ASSERT_GT(snprintf(micro1, sizeof(micro1),
       "bigint   var   bigint   bigint     bigint bigint   flag    flag_type  multi_version_row_flag trans_id\n"
-      "1        var1  MIN     -8                8      -1       INSERT    NORMAL   UC trans_id_1\n"
-      "1        var1  MIN     -7               -1      -1       DELETE    NORMAL   UCL trans_id_1\n"
+      "1        var1  MIN     %ld                8      -1       INSERT    NORMAL   UC trans_id_1\n"
+      "1        var1  MIN     %ld               -1      -1       DELETE    NORMAL   UCL trans_id_1\n"
       "3        var3  -16      MIN             18      -1       INSERT    INSERT_DELETE   SCF trans_id_0\n"
       "3        var3  -16      DI_VERSION      18      -1       INSERT    NORMAL   C  trans_id_0\n"
-      "3        var3  -16      0               -1      -1       DELETE    NORMAL   CL  trans_id_0\n";
+      "3        var3  -16      0               -1      -1       DELETE    NORMAL   CL  trans_id_0\n",
+      seq8, seq7), 0);
+  const char *micro_data[2] = {micro0, micro1};
 
   int schema_rowkey_cnt = 2;
 
@@ -3439,18 +3446,20 @@ TEST_P(TestMultiVersionDIMerge, test_running_trans_cross_macro_with_abort_sql_se
   ASSERT_EQ(OB_SUCCESS, merger.merge_partition(merge_context, 0));
   build_sstable(merge_context, merged_sstable);
 
-  const char *result1 =
+  char result1[2048];
+  ASSERT_GT(snprintf(result1, sizeof(result1),
       "bigint   var   bigint   bigint     bigint bigint   flag    flag_type  multi_version_row_flag trans_id\n"
       "0        var0   -26      MIN              7      -1       INSERT    INSERT_DELETE   SCF trans_id_0\n"
       "0        var0   -26      DI_VERSION       7      -1       INSERT    NORMAL   C   trans_id_0\n"
       "0        var0   -26      0               -1      -1       DELETE    NORMAL   CL  trans_id_0\n"
-      "1        var1  MIN     -12                8      -1       INSERT    NORMAL   UCF trans_id_1\n"
-      "1        var1  MIN     -11               -1      -1       DELETE    NORMAL   UC  trans_id_1\n"
+      "1        var1  MIN     %ld                8      -1       INSERT    NORMAL   UCF trans_id_1\n"
+      "1        var1  MIN     %ld               -1      -1       DELETE    NORMAL   UC  trans_id_1\n"
       "1        var1   MAGIC   MAGIC            NOP     NOP      EXIST     NORMAL   LG  trans_id_0\n"
       "2        var2  -26      MIN               7      -1       INSERT    INSERT_DELETE   SCF trans_id_0\n"
       "2        var2  -26      DI_VERSION        7      -1       INSERT    NORMAL   C   trans_id_0\n"
       "2        var2  -26      0                -1      -1       DELETE    NORMAL   CL  trans_id_0\n"
-      "3        var3  -16      DI_VERSION      18      -1       INSERT    NORMAL   CLF  trans_id_0\n";
+      "3        var3  -16      DI_VERSION      18      -1       INSERT    NORMAL   CLF  trans_id_0\n",
+      seq12, seq11), 0);
 
   ObMockIterator res_iter;
   ObStoreRowIterator *scanner = NULL;

@@ -166,6 +166,8 @@ public:
 
   void do_tx_data_serialize_test();
 
+  void test_serialize_without_tx_op_list_rejected_();
+
   void do_repeat_insert_test();
 
   void do_print_leak_slice_test();
@@ -563,6 +565,61 @@ void TestTxDataTable::do_tx_data_serialize_test()
   memtable_mgr->offline();
 }
 
+void TestTxDataTable::test_serialize_without_tx_op_list_rejected_()
+{
+  ASSERT_EQ(OB_SUCCESS, tx_data_table_.init(ls_));
+  ObTxDataMemtableMgr *memtable_mgr = tx_data_table_.get_memtable_mgr_();
+  set_freezer_();
+  init_memtable_mgr_(memtable_mgr);
+
+  ObTxData *tx_data = nullptr;
+  ObTxDataGuard tx_data_guard;
+  ASSERT_EQ(OB_SUCCESS, tx_data_table_.alloc_tx_data(tx_data_guard, false));
+  ASSERT_NE(nullptr, tx_data = tx_data_guard.tx_data());
+  ASSERT_EQ(OB_SUCCESS, tx_data->init_tx_op());
+  tx_data->tx_id_ = transaction::ObTransID(269381);
+  tx_data->commit_version_.convert_for_logservice(ObTimeUtil::current_time_ns());
+  tx_data->end_scn_.convert_for_logservice(ObTimeUtil::current_time_ns());
+  tx_data->start_scn_.convert_for_logservice(tx_data->end_scn_.get_val_for_logservice() - 10000);
+  tx_data->state_ = ObTxData::COMMIT;
+  transaction::ObUndoAction undo_action(ObTxSEQ(20, 0), ObTxSEQ(10, 0));
+  ASSERT_EQ(OB_SUCCESS, tx_data->add_undo_action(&tx_table_, undo_action));
+
+  ObArenaAllocator allocator;
+  const int64_t serialize_size = tx_data->get_serialize_size();
+  char *buf = nullptr;
+  ASSERT_NE(nullptr, buf = static_cast<char *>(allocator.alloc(serialize_size)));
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, tx_data->serialize(buf, serialize_size, pos));
+  ASSERT_EQ(serialize_size, pos);
+
+  // Re-encode the frame without the trailing tx-op list: same UNIS_VERSION,
+  // shortened length prefix, base fields + undo status list only.
+  const int64_t tx_op_size = tx_data->op_guard_->get_tx_op_list().get_serialize_size();
+  const int64_t full_payload_len = tx_data->get_serialize_size_();
+  const int64_t old_payload_len = full_payload_len - tx_op_size;
+  const int64_t full_header_len = serialization::encoded_length_vi64(ObTxData::UNIS_VERSION)
+                                + serialization::encoded_length_vi64(full_payload_len);
+  char *old_buf = nullptr;
+  ASSERT_NE(nullptr, old_buf = static_cast<char *>(allocator.alloc(serialize_size)));
+  int64_t old_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, serialization::encode_vi64(old_buf, serialize_size, old_pos, ObTxData::UNIS_VERSION));
+  ASSERT_EQ(OB_SUCCESS, serialization::encode_vi64(old_buf, serialize_size, old_pos, old_payload_len));
+  MEMCPY(old_buf + old_pos, buf + full_header_len, old_payload_len);
+  old_pos += old_payload_len;
+
+  ObTxData *new_tx_data = nullptr;
+  ObTxDataGuard new_tx_data_guard;
+  ASSERT_EQ(OB_SUCCESS, tx_data_table_.alloc_tx_data(new_tx_data_guard, false));
+  ASSERT_NE(nullptr, new_tx_data = new_tx_data_guard.tx_data());
+  int64_t decode_pos = 0;
+  EXPECT_EQ(OB_VERSION_NOT_MATCH, new_tx_data->deserialize(old_buf, old_pos, decode_pos,
+                                                           *tx_data_table_.get_tx_data_allocator()));
+  tx_data->dec_ref();
+  new_tx_data->dec_ref();
+  memtable_mgr->offline();
+}
+
 void TestTxDataTable::test_commit_versions_serialize_()
 {
   ObCommitVersionsArray cur_array;
@@ -763,6 +820,13 @@ TEST_F(TestTxDataTable, repeat_insert_test) { do_repeat_insert_test(); }
 TEST_F(TestTxDataTable, undo_status_test) { do_undo_status_test(); }
 
 TEST_F(TestTxDataTable, serialize_test) { do_tx_data_serialize_test(); }
+
+// A tx data payload that carries an undo status list but no trailing tx-op
+// list was only written before the 4.6.1 baseline and must be rejected.
+TEST_F(TestTxDataTable, serialize_without_tx_op_list_rejected)
+{
+  test_serialize_without_tx_op_list_rejected_();
+}
 
 TEST_F(TestTxDataTable, split_range_test) { do_tx_data_serialize_test(); }
 

@@ -179,10 +179,6 @@ int ObTransDeadlockDetectorAdapter::gen_dependency_resource_array_(const ObIArra
   for (int64_t idx = 0; idx < block_conflict_info_array.count() && OB_SUCC(ret); idx++) {
     if (!block_conflict_info_array.at(idx).is_valid()) {
       DETECT_LOG(WARN, "invalid conflict info", K(block_conflict_info_array.at(idx)));
-    } else if (!is_need_wait_remote_lock()) {
-      if (OB_FAIL(binary_key.set_user_key(block_conflict_info_array.at(idx).conflict_tx_id_))) {
-        DETECT_LOG(ERROR, "fail to create key");
-      } 
     } else {
       ObTransDeadlockDetectorKey detector_key(detector_key_type, block_conflict_info_array.at(idx).conflict_tx_id_);
       if (OB_FAIL(binary_key.set_user_key(detector_key))) {
@@ -346,7 +342,7 @@ int ObTransDeadlockDetectorAdapter::lock_wait_mgr_reconstruct_detector_waiting_r
                     SessionIDPair(remote_node.sessid_, remote_node.assoc_sess_id_),
                     remote_node.exec_addr_, // conflict tx scheduler addr
                     remote_node.tx_id_, // conflict tx id
-                    ObTxSEQ::cast_from_int(remote_node.holder_tx_hold_seq_value_),
+                    ObTxSEQ::from_seq(remote_node.holder_tx_hold_seq_value_),
                     remote_node.hash_,
                     remote_node.lock_seq_,
                     remote_node.lock_wait_expire_ts_,
@@ -655,53 +651,7 @@ void ObTransDeadlockDetectorAdapter::check_if_needed_register_detector_when_end_
 int ObTransDeadlockDetectorAdapter::fetch_conflict_info_array(transaction::ObTxDesc &desc,
                                                               ObArray<storage::ObRowConflictInfo> &array)
 {
-  int ret = OB_SUCCESS;
-  ObArray<ObTransIDAndAddr> temp_conflict_txs_array;// for compat reason
-  ObArray<storage::ObRowConflictInfo> temp_conflict_info_array;
-  (void) desc.fetch_conflict_info_array(temp_conflict_info_array);
-  (void) desc.fetch_conflict_txs_array(temp_conflict_txs_array);
-  if (detector::ObDeadLockDetectorMgr::is_new_deadlock_logic()) {
-    for (int64_t idx = 0; idx < temp_conflict_info_array.count() && OB_SUCC(ret); ++idx) {
-      if (OB_FAIL(array.push_back(ObRowConflictInfo()))) {
-        DETECT_LOG(WARN, "fail to push back", KR(ret), K(idx));
-      } else if (OB_FAIL(array.at(array.count() - 1).assign(meta::ObMover<ObRowConflictInfo>(temp_conflict_info_array[idx])))) {
-        DETECT_LOG(WARN, "move operation failed, should not happen", KR(ret), K(idx));
-      }
-    }
-  } else {
-    // if deadlock module run in upgrade scenario, some process use old logic, just has conflict_txs_ structure
-    ObStringHolder row_key_str;
-    if (OB_FAIL(row_key_str.assign("fake row"))) {
-      DETECT_LOG(WARN, "failed to generate fake row", KR(ret));
-    } else {
-      for (int64_t idx = 0; idx < temp_conflict_txs_array.count() && OB_SUCC(ret); ++idx) {
-        if (OB_FAIL(array.push_back(ObRowConflictInfo()))) {
-          DETECT_LOG(WARN, "fail to push back", KR(ret), K(idx));
-        } else if (OB_FAIL(array.at(array.count() - 1).init(ObAddr(ObAddr::VER::IPV4, "127.0.0.1", 8888),
-                                                            ObLSID(8888),
-                                                            ObTabletID(8888),
-                                                            meta::ObMover<ObStringHolder>(row_key_str),
-                                                            transaction::SessionIDPair(888, 888),
-                                                            temp_conflict_txs_array[idx].scheduler_addr_,
-                                                            temp_conflict_txs_array[idx].tx_id_,
-                                                            transaction::ObTxSEQ::mk_v0(8888888888),
-                                                            array.at(array.count() - 1).conflict_hash_,
-                                                            array.at(array.count() - 1).lock_seq_,
-                                                            array.at(array.count() - 1).abs_timeout_,
-                                                            array.at(array.count() - 1).self_tx_id_,
-                                                            array.at(array.count() - 1).lock_mode_,
-                                                            array.at(array.count() - 1).last_compact_cnt_,
-                                                            array.at(array.count() - 1).total_update_cnt_,
-                                                            array.at(array.count() - 1).assoc_sess_id_,
-                                                            array.at(array.count() - 1).holder_sess_id_,
-                                                            array.at(array.count() - 1).holder_tx_start_time_,
-                                                            array.at(array.count() - 1).client_session_id_))) {
-          DETECT_LOG(WARN, "move operation failed, should not happen", KR(ret), K(idx));
-        }
-      }
-    }
-  }
-  return ret;
+  return desc.fetch_conflict_info_array(array);
 }
 
 /******************************BELOW INTERFACE CALL FROM OTHER FILES******************************/
@@ -883,25 +833,6 @@ int ObTransDeadlockDetectorAdapter::lock_wait_mgr_reconstruct_detector_waiting_f
   if (nullptr == (MTL(ObDeadLockDetectorMgr*))) {
     ret = OB_ERR_UNEXPECTED;
     DETECT_LOG(WARN, "fail to get ObDeadLockDetectorMgr", PRINT_WRAPPER);
-  } else if (!is_need_wait_remote_lock()) {
-    if (OB_FAIL(MTL(ObDeadLockDetectorMgr*)->check_detector_exist(self_trans_id, exist))) {
-      DETECT_LOG(WARN, "fail to check detector exist", PRINT_WRAPPER);
-    } else if (exist) {
-      int tmp_ret = OB_SUCCESS;
-      if (OB_TMP_FAIL(MTL(ObDeadLockDetectorMgr*)->unregister_key(self_trans_id))) {
-        DETECT_LOG(WARN, "fail to unregister key", K(tmp_ret), PRINT_WRAPPER);
-      }
-    }
-    if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(create_detector_node_without_session_and_block_row_(on_collect_op,
-                                                                on_fill_op,
-                                                                self_trans_id,
-                                                                sess_id,
-                                                                trans_begin_ts,
-                                                                query_timeout_us,
-                                                                func))) {
-      DETECT_LOG(WARN, "fail to create detector node and block row", PRINT_WRAPPER);
-    }
   } else {
     ObTransDeadlockDetectorKey detector_key(ObDeadlockKeyType::REMOTE_EXEC_SIDE, self_trans_id);
     if (OB_FAIL(MTL(ObDeadLockDetectorMgr*)->check_detector_exist(detector_key, exist))) {
@@ -949,26 +880,6 @@ int ObTransDeadlockDetectorAdapter::lock_wait_mgr_reconstruct_detector_waiting_f
     DETECT_LOG(WARN, "fail to get ObDeadLockDetectorMgr", PRINT_WRAPPER);
   } else if (OB_FAIL(get_conflict_trans_scheduler(conflict_trans_id, scheduler_addr))) {
     DETECT_LOG(WARN, "fail to get conflict trans scheduler addr", PRINT_WRAPPER);
-  } else if (!is_need_wait_remote_lock()) {
-    if (OB_FAIL(MTL(ObDeadLockDetectorMgr*)->check_detector_exist(self_trans_id, exist))) {
-      DETECT_LOG(WARN, "fail to check detector exist", PRINT_WRAPPER);
-    } else if (exist) {
-      int tmp_ret = OB_SUCCESS;
-      if (OB_TMP_FAIL(MTL(ObDeadLockDetectorMgr*)->unregister_key(self_trans_id))) {
-        DETECT_LOG(WARN, "fail to unregister key", K(tmp_ret), PRINT_WRAPPER);
-      }
-    }
-    if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(create_detector_node_without_session_and_block_trans_(on_collect_op,
-                                                                      on_fill_op,
-                                                                      self_trans_id,
-                                                                      conflict_trans_id,
-                                                                      sess_id,
-                                                                      trans_begin_ts,
-                                                                      query_timeout_us,
-                                                                      scheduler_addr))) {
-      DETECT_LOG(WARN, "fail to create detector node and block trans", PRINT_WRAPPER);
-    }
   } else {
     ObTransDeadlockDetectorKey self_detector_key(ObDeadlockKeyType::REMOTE_EXEC_SIDE, self_trans_id);
     ObTransDeadlockDetectorKey conflict_detector_key(ObDeadlockKeyType::DEFAULT, conflict_trans_id);

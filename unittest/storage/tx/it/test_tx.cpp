@@ -817,7 +817,7 @@ private:
 TEST_F(ObTestTx, replay_basic)
 {
   ObTxNode::reset_localtion_adapter();
-  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_0_0_0);
+  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_6_1_0);
   auto n1 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.1", 8888), bus_);
   auto n2 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.2", 8888), bus_);
 
@@ -912,7 +912,7 @@ TEST_F(ObTestTx, replay_then_commit)
 {
   int ret = OB_SUCCESS;
   ObTxNode::reset_localtion_adapter();
-  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_0_0_0);
+  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_6_1_0);
   auto n1 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.1", 8888), bus_);
   auto n2 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.2", 8888), bus_);
 
@@ -1008,7 +1008,7 @@ TEST_F(ObTestTx, wait_commit_version_elapse_block)
 {
   int ret = OB_SUCCESS;
   ObTxNode::reset_localtion_adapter();
-  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_0_0_0);
+  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_6_1_0);
 
   auto n1 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.1", 8888), bus_);
   auto n2 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.2", 8888), bus_);
@@ -1110,7 +1110,7 @@ TEST_F(ObTestTx, wait_commit_version_elapse_block_and_switch_to_follower_forcedl
 {
   int ret = OB_SUCCESS;
   ObTxNode::reset_localtion_adapter();
-  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_0_0_0);
+  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_6_1_0);
 
   auto n1 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.1", 8888), bus_);
   auto n2 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.2", 8888), bus_);
@@ -1212,7 +1212,7 @@ TEST_F(ObTestTx, get_gts_block_and_switch_to_follower_gracefully)
 {
   int ret = OB_SUCCESS;
   ObTxNode::reset_localtion_adapter();
-  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_0_0_0);
+  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_6_1_0);
 
   auto n1 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.1", 8888), bus_);
   auto n2 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.2", 8888), bus_);
@@ -1281,7 +1281,7 @@ TEST_F(ObTestTx, get_gts_block_and_switch_to_follower_forcedly)
 {
   int ret = OB_SUCCESS;
   ObTxNode::reset_localtion_adapter();
-  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_0_0_0);
+  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_6_1_0);
 
   auto n1 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.1", 8888), bus_);
   auto n2 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.2", 8888), bus_);
@@ -1342,7 +1342,7 @@ TEST_F(ObTestTx, switch_to_follower_gracefully_in_stmt_rollback_to_last_savepoin
   int ret = OB_SUCCESS;
   ObTxNode::reset_localtion_adapter();
 
-  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_0_0_0);
+  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_6_1_0);
   auto n1 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.1", 8888), bus_);
   LOG_INFO("n1 tx_ctx_mgr", K(&n1->txs_.tx_ctx_mgr_));
 
@@ -1439,7 +1439,7 @@ TEST_F(ObTestTx, switch_to_follower_gracefully_in_stmt_then_commit)
   int ret = OB_SUCCESS;
   ObTxNode::reset_localtion_adapter();
 
-  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_0_0_0);
+  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_6_1_0);
   auto n1 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.1", 8888), bus_);
   LOG_INFO("n1 tx_ctx_mgr", K(&n1->txs_.tx_ctx_mgr_));
 
@@ -1551,7 +1551,7 @@ TEST_F(ObTestTx, distributed_tx_participant_switch_to_follower_gracefully_in_stm
   GCONF._ob_trans_rpc_timeout = 5000 * 1000;
   ObTxNode::reset_localtion_adapter();
 
-  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_0_0_0);
+  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_6_1_0);
   auto n1 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.1", 8888), bus_);
   LOG_INFO("n1 tx_ctx_mgr", K(&n1->txs_.tx_ctx_mgr_));
 
@@ -1684,7 +1684,7 @@ TEST_F(ObTestTx, distributed_tx_coordinator_switch_to_follower_gracefully_in_stm
   GCONF._ob_trans_rpc_timeout = 5000 * 1000;
   ObTxNode::reset_localtion_adapter();
 
-  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_0_0_0);
+  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_6_1_0);
   auto n1 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.1", 8888), bus_);
   LOG_INFO("n1 tx_ctx_mgr", K(&n1->txs_.tx_ctx_mgr_));
 
@@ -1805,7 +1805,7 @@ TEST_F(ObTestTx, distributed_tx_switch_to_follower_forcedly_in_prepare_state)
 {
   int ret = OB_SUCCESS;
   ObTxNode::reset_localtion_adapter();
-  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_0_0_0);
+  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_6_1_0);
 
   auto n1 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.1", 8888), bus_);
   auto n2 = new ObTxNode(2, ObAddr(ObAddr::VER::IPV4, "127.0.0.2", 8888), bus_);
@@ -1903,7 +1903,7 @@ TEST_F(ObTestTx, distributed_tx_coordinator_switch_to_follower_forcedly_in_prepa
 {
   int ret = OB_SUCCESS;
   ObTxNode::reset_localtion_adapter();
-  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_0_0_0);
+  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_6_1_0);
 
   auto n1 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.1", 8888), bus_);
   auto n2 = new ObTxNode(2, ObAddr(ObAddr::VER::IPV4, "127.0.0.2", 8888), bus_);
@@ -1995,7 +1995,7 @@ TEST_F(ObTestTx, distributed_tx_participant_switch_to_follower_forcedly_in_pre_c
 {
   int ret = OB_SUCCESS;
   ObTxNode::reset_localtion_adapter();
-  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_0_0_0);
+  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_6_1_0);
 
   auto n1 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.1", 8888), bus_);
   auto n2 = new ObTxNode(2, ObAddr(ObAddr::VER::IPV4, "127.0.0.2", 8888), bus_);
@@ -2126,7 +2126,7 @@ TEST_F(ObTestTx, distributed_tx_coordinator_switch_to_follower_forcedly_in_pre_c
 {
   int ret = OB_SUCCESS;
   ObTxNode::reset_localtion_adapter();
-  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_0_0_0);
+  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_6_1_0);
 
   auto n1 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.1", 8888), bus_);
   auto n2 = new ObTxNode(2, ObAddr(ObAddr::VER::IPV4, "127.0.0.2", 8888), bus_);
@@ -2255,7 +2255,7 @@ TEST_F(ObTestTx, distributed_tx_coordinator_switch_to_follower_forcedly_in_parti
 {
   int ret = OB_SUCCESS;
   ObTxNode::reset_localtion_adapter();
-  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_0_0_0);
+  oceanbase::common::ObClusterVersion::get_instance().init(CLUSTER_VERSION_4_6_1_0);
 
   auto n1 = new ObTxNode(1, ObAddr(ObAddr::VER::IPV4, "127.0.0.1", 8888), bus_);
   auto n2 = new ObTxNode(2, ObAddr(ObAddr::VER::IPV4, "127.0.0.2", 8888), bus_);

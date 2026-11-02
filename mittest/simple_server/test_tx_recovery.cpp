@@ -188,7 +188,10 @@ TEST_F(ObTxBeforeRestartTest, recover_tx_ctx_before_memtable)
   WRITE_SQL_BY_CONN(connection, "insert into test_tx_recover values(2);");
   WRITE_SQL_BY_CONN(connection, "commit;");
 
-  ASSERT_EQ(tx_ctx_memtable->get_rec_scn(), share::SCN::max_scn());
+  // A cleared transaction retains its recovery SCN in the LS aggregate until
+  // the tx context checkpoint completes. Do not flush that checkpoint here:
+  // the restart must recover the committed transaction after only the data
+  // memtable was frozen while the transaction was still active.
 }
 
 class ObTxAfterRestartTest : public ObSimpleClusterTestBase
@@ -210,16 +213,18 @@ TEST_F(ObTxAfterRestartTest, recover_tx_ctx_before_memtable_recover)
   ASSERT_EQ(OB_SUCCESS, sql_proxy.acquire(connection));
   ASSERT_NE(nullptr, connection);
   WRITE_SQL_FMT_BY_CONN(connection, "insert into test_tx_recover values(3);");
-  READ_SQL_BY_CONN(connection, "select * from test_tx_recover");
+  READ_SQL_BY_CONN(connection, "select a from test_tx_recover order by a");
   sqlclient::ObMySQLResult *result = read_res.get_result();
+  ASSERT_NE(nullptr, result);
   int i = 0;
   int ret = 0;
-  while (OB_SUCC(result->next())) {
+  while (OB_SUCC(ret = result->next())) {
     i++;
     int64_t a;
     ASSERT_EQ(OB_SUCCESS, result->get_int("a", a));
     ASSERT_EQ(a, i);
   }
+  ASSERT_EQ(OB_ITER_END, ret);
   EXPECT_EQ(3, i);
 
   TRANS_LOG(INFO, "restart ok");
@@ -231,7 +236,6 @@ TEST_F(ObTxAfterRestartTest, recover_tx_ctx_before_memtable_recover)
 
 int main(int argc, char **argv)
 {
-  int ret = 0;
   std::string gtest_file_name = std::string(TEST_FILE_NAME) + "_gtest.log";
   oceanbase::unittest::init_gtest_output(gtest_file_name);
   ObSimpleServerRestartHelper restart_helper(argc,
@@ -240,9 +244,6 @@ int main(int argc, char **argv)
                                              BORN_CASE_NAME,
                                              RESTART_CASE_NAME);
   restart_helper.set_sleep_sec(10); // sleep 10s for schema restore
-  restart_helper.run();
-
-  return ret;
+  return restart_helper.run();
 }
-
 

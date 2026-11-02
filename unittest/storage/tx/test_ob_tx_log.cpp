@@ -81,7 +81,7 @@ private:
 
 //const TEST
 TxID TEST_TX_ID = 1024;
-int64_t TEST_CLUSTER_VERSION = DATA_VERSION_4_3_0_0;
+int64_t TEST_CLUSTER_VERSION = DATA_VERSION_4_6_1_0;
 ObAddr TEST_ADDR(ObAddr::VER::IPV4,"1.0.0.1",606);
 int TEST_TRANS_TYPE = 1;
 int TEST_SESSION_ID = 56831;
@@ -276,8 +276,9 @@ TEST_F(TestObTxLog, tx_exec_info_applied_entry_no)
             old_replay_exec_info.deserialize_(buf, old_payload_size, pos));
   ASSERT_EQ(old_payload_size, pos);
   // The trailing field is absent from the old payload, so deserialize_ must not
-  // touch it: it keeps the pre-deserialize value (-1). The INT64_MIN sentinel is
-  // applied by ObTxCtxTableInfo::deserialize_ when compatible_version_ < VERSION_2.
+  // touch it: it keeps the pre-deserialize value (-1). The enclosing
+  // ObTxCtxTableInfo decoder sets INT64_MIN before decoding an accepted
+  // checkpoint, so its absent cursor has the correct sentinel (see TestTxCtxTable).
   EXPECT_EQ(-1, old_replay_exec_info.max_applied_entry_no_);
   ob_free(buf);
 }
@@ -299,7 +300,7 @@ TEST_F(TestObTxLog, tx_log_body_except_redo)
   ObTxBufferNodeArray TEST_TX_BUFFER_NODE_ARRAY;
   ObString str("TEST CASE");
   ObTxBufferNode node;
-  node.init(ObTxDataSourceType::LS_TABLE, str, share::SCN(), transaction::ObTxSEQ::mk_v0(100), nullptr);
+  node.init(ObTxDataSourceType::LS_TABLE, str, share::SCN(), transaction::ObTxSEQ(100, 0), nullptr);
   TEST_TX_BUFFER_NODE_ARRAY.push_back(node);
 
   ObTxCommitInfoLog fill_commit_state(TEST_LS_ARRAY,
@@ -446,7 +447,7 @@ TEST_F(TestObTxLog, tx_log_body_redo)
   ObTxBufferNodeArray TEST_TX_BUFFER_NODE_ARRAY;
   ObString str("TEST CASE");
   ObTxBufferNode node;
-  node.init(ObTxDataSourceType::LS_TABLE, str, share::SCN(), transaction::ObTxSEQ::mk_v0(100), nullptr);
+  node.init(ObTxDataSourceType::LS_TABLE, str, share::SCN(), transaction::ObTxSEQ(100, 0), nullptr);
   TEST_TX_BUFFER_NODE_ARRAY.push_back(node);
 
   ObTxCommitInfoLog fill_commit_state(TEST_LS_ARRAY,
@@ -567,7 +568,7 @@ TEST_F(TestObTxLog, test_compat_bytes)
   ObTxBufferNodeArray TEST_TX_BUFFER_NODE_ARRAY;
   ObString str("TEST CASE");
   ObTxBufferNode node;
-  node.init(ObTxDataSourceType::LS_TABLE, str, share::SCN(), transaction::ObTxSEQ::mk_v0(100), nullptr);
+  node.init(ObTxDataSourceType::LS_TABLE, str, share::SCN(), transaction::ObTxSEQ(100, 0), nullptr);
   TEST_TX_BUFFER_NODE_ARRAY.push_back(node);
 
   ObTxCommitInfoLog fill_commit_info(TEST_LS_ARRAY,
@@ -983,7 +984,7 @@ TEST_F(TestObTxLog, test_commit_log_with_checksum_signature)
   ObTxBufferNodeArray tx_buffer_node_array;
   ObTxBufferNode node;
   ObString str("hello,world");
-  node.init(ObTxDataSourceType::LS_TABLE, str, share::SCN(), transaction::ObTxSEQ::mk_v0(100), nullptr);
+  node.init(ObTxDataSourceType::LS_TABLE, str, share::SCN(), transaction::ObTxSEQ(100, 0), nullptr);
   tx_buffer_node_array.push_back(node);
   ObLSLogInfoArray ls_info_array;
   ls_info_array.push_back(ObLSLogInfo());

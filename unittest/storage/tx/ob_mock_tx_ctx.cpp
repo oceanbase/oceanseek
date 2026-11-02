@@ -70,7 +70,7 @@ int MockObTxCtx::init(const ObLSID &ls_id,
     trans_expired_time_ = UINT64_MAX;
     tenant_id_ = mock_tenant_id;
     // mock trans ctx end
-    cluster_version_ = CLUSTER_VERSION_4_0_0_0;
+    cluster_version_ = CLUSTER_VERSION_4_6_1_0;
 
     // TODO(handora.qc): add timer
     timer_ = NULL;
@@ -79,7 +79,7 @@ int MockObTxCtx::init(const ObLSID &ls_id,
     ObAddr scheduler;
     scheduler.parse_from_cstring("127.0.0.1:3001");
     exec_info_.scheduler_ = scheduler;
-    if (OB_FAIL(mt_ctx_.init(mock_tenant_id, CLUSTER_VERSION_4_0_0_0, trans_id, ls_id, scheduler))) {
+    if (OB_FAIL(mt_ctx_.init(mock_tenant_id, CLUSTER_VERSION_4_6_1_0, trans_id, ls_id, scheduler))) {
       TRANS_LOG(WARN, "memtable context init failed", KR(ret));
     } else if (OB_FAIL(mt_ctx_.trans_begin())) {
       TRANS_LOG(WARN, "memtable trans begin failed", KR(ret));

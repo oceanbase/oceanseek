@@ -656,17 +656,7 @@ bool ObLockWaitMgr::post_process(bool need_retry, bool& need_wait)
       omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
 
       if (OB_LIKELY(tenant_config.is_valid())) {
-        if (tenant_config->_enable_wait_remote_lock) {
-          if (!is_need_wait_remote_lock()) {
-            if (REACH_TIME_INTERVAL(1 * 1000 * 1000)) {
-              TRANS_LOG(TRACE, "observer not upgrade to 4_4_2_0");
-            }
-          } else {
-            support_remote_wait = true;
-          }
-        } else {
-          support_remote_wait = false;
-        }
+        support_remote_wait = tenant_config->_enable_wait_remote_lock;
       }
       if (node->get_node_type() == Node::LOCAL) {
         // local lock conflict
@@ -990,12 +980,13 @@ int ObLockWaitMgr::register_local_node_to_deadlock_(const transaction::ObTransID
                                                     const Node * const node)
 {
   int ret = OB_SUCCESS;
+  const ObTxSEQ holder_seq = ObTxSEQ::from_seq(node->get_holder_tx_hold_seq_value());
   CollectCallBack on_collect_callback((LocalDeadLockCollectCallBack(self_tx_id,
                                                                     node->key_,
                                                                     SessionIDPair(node->sessid_, node->assoc_sess_id_),
                                                                     node->get_ls_id(),
                                                                     node->tablet_id_,
-                                                                    transaction::ObTxSEQ::cast_from_int(node->get_holder_tx_hold_seq_value()))));
+                                                                    holder_seq)));
   if (LockHashHelper::is_rowkey_hash(node->hash())) {// waiting for row
     DeadLockBlockCallBack deadlock_block_callback(row_holder_mapper_, node->hash());
     LocalExecutionWaitingForRowFillVirtualInfoOperation fill_virtual_info_callback(row_holder_mapper_,
@@ -1012,9 +1003,9 @@ int ObLockWaitMgr::register_local_node_to_deadlock_(const transaction::ObTransID
       TRANS_LOG(TRACE, "wait for row", K(*node));
     }
   } else {// waiting for other trans
-    LocalExecutionWaitingForTransFillVirtualInfoOperation fill_virtual_info_callback(ObLSID(node->ls_id_),
-                                                                                     blocked_tx_id,
-                                                                                     ObTxSEQ::mk_v0(node->holder_tx_hold_seq_value_ == 0 ? 1 : node->holder_tx_hold_seq_value_));
+    LocalExecutionWaitingForTransFillVirtualInfoOperation fill_virtual_info_callback(
+        ObLSID(node->ls_id_), blocked_tx_id,
+        (holder_seq.is_valid() ? holder_seq : ObTxSEQ::MIN_VAL()));
     if (OB_FAIL(ObTransDeadlockDetectorAdapter::lock_wait_mgr_reconstruct_detector_waiting_for_trans(on_collect_callback,
                                                                                                      fill_virtual_info_callback,
                                                                                                      blocked_tx_id,
@@ -1081,13 +1072,14 @@ int ObLockWaitMgr::register_remote_exec_side_node_to_deadlock_(const transaction
                                                    const int64_t query_timeout_us)
 {
   int ret = OB_SUCCESS;
+  const ObTxSEQ holder_seq = ObTxSEQ::from_seq(node->get_holder_tx_hold_seq_value());
   CollectCallBack on_collect_callback((RemoteExecutionSideNodeDeadLockCollectCallBack(self_tx_id,
                                                                     "remote execution side node row key",
                                                                     query_sql,
                                                                     SessionIDPair(node->sessid_, node->assoc_sess_id_),
                                                                     node->get_ls_id(),
                                                                     node->tablet_id_,
-                                                                    transaction::ObTxSEQ::cast_from_int(node->get_holder_tx_hold_seq_value()))));
+                                                                    holder_seq)));
   if (LockHashHelper::is_rowkey_hash(node->hash())) {// waiting for row
     LocalExecutionWaitingForRowFillVirtualInfoOperation fill_virtual_info_callback(row_holder_mapper_,
                                                                                    ObLSID(node->ls_id_),
@@ -1105,9 +1097,9 @@ int ObLockWaitMgr::register_remote_exec_side_node_to_deadlock_(const transaction
       TRANS_LOG(TRACE, "regester remote execution side node wait row to deadlock detector", K(ret), KPC(node));
     }
   } else {// waiting for other trans
-    LocalExecutionWaitingForTransFillVirtualInfoOperation fill_virtual_info_callback(ObLSID(node->ls_id_),
-                                                                                     blocked_tx_id,
-                                                                                     ObTxSEQ::mk_v0(node->holder_tx_hold_seq_value_ == 0 ? 1 : node->holder_tx_hold_seq_value_));
+    LocalExecutionWaitingForTransFillVirtualInfoOperation fill_virtual_info_callback(
+        ObLSID(node->ls_id_), blocked_tx_id,
+        (holder_seq.is_valid() ? holder_seq : ObTxSEQ::MIN_VAL()));
     if (OB_FAIL(ObTransDeadlockDetectorAdapter::lock_wait_mgr_reconstruct_detector_waiting_for_trans_without_session(on_collect_callback,
                                                                                                                      fill_virtual_info_callback,
                                                                                                                      blocked_tx_id,
@@ -1962,7 +1954,7 @@ bool ObLockWaitMgr::is_killed_session_(KilledSessionArray *sessions,
 
 int64_t ObLockWaitMgr::calc_holder_tx_lock_timestamp(const int64_t holder_tx_start_time, const int64_t holder_data_seq_num)
 {
-  return holder_tx_start_time + ObTxSEQ::cast_from_int(holder_data_seq_num).get_seq();
+  return holder_tx_start_time + holder_data_seq_num;
 }
 
 void ObLockWaitMgr::begin_row_lock_wait_event(const Node * const node)

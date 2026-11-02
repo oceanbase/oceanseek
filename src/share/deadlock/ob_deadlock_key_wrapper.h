@@ -57,8 +57,6 @@ public:\
 
 class ObDetectorLabelRequest;
 
-bool is_need_wait_remote_lock();
-
 class UserBinaryKey
 {
   // for serialization
@@ -97,21 +95,12 @@ inline int UserBinaryKey::set_user_key(const transaction::ObTransID &tx_id)
   int ret = common::OB_SUCCESS;
   int64_t length = 0;
 
-  if (!is_need_wait_remote_lock()) {
-    if (OB_FAIL(serialize_user_key(tx_id))) {
-      DETECT_LOG(WARN, "tx id serialization failed", PRINT_WRAPPER);
-    } else {
-      key_type_id_ = GET_ID(transaction::ObTransID);
-      key_binary_code_buffer_length_ = tx_id.get_serialize_size();
-    }
+  transaction::ObTransDeadlockDetectorKey detector_key(transaction::ObDeadlockKeyType::DEFAULT, tx_id);
+  if (OB_FAIL(serialize_user_key(detector_key))) {
+    DETECT_LOG(WARN, "tx id detector key serialization failed", PRINT_WRAPPER);
   } else {
-    transaction::ObTransDeadlockDetectorKey detector_key(transaction::ObDeadlockKeyType::DEFAULT, tx_id);
-    if (OB_FAIL(serialize_user_key(detector_key))) {
-      DETECT_LOG(WARN, "tx id detector key serialization failed", PRINT_WRAPPER);
-    } else {
-      key_type_id_ = GET_ID(transaction::ObTransDeadlockDetectorKey);
-      key_binary_code_buffer_length_ = detector_key.get_serialize_size();
-    }
+    key_type_id_ = GET_ID(transaction::ObTransDeadlockDetectorKey);
+    key_binary_code_buffer_length_ = detector_key.get_serialize_size();
   }
 
   if (OB_FAIL(ret)) {

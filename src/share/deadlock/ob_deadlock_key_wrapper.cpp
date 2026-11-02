@@ -243,11 +243,6 @@ uint64_t UserBinaryKey::hash() const
   return hash_val;
 }
 
-bool is_need_wait_remote_lock()
-{
-  return lockwaitmgr::ObLockWaitMgr::is_need_wait_remote_lock();
-}
-
 }// namespace detector
 }// namespace share
 }// namespace oceanbase

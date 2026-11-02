@@ -293,7 +293,7 @@ int TestCompactionPolicy::mock_sstable(
     param.rec_scn_ = table_key.get_start_scn();
 
     if (ObITable::is_inc_major_type_sstable(type)) {
-      ObUncommitTxDesc tx_seq_key(666, 111);
+      ObUncommitTxDesc tx_seq_key(666, transaction::ObTxSEQ(111, 0).cast_to_int());
       param.uncommit_tx_info_.reuse();
       if (OB_FAIL(param.uncommit_tx_info_.tx_infos_.push_back(tx_seq_key))) {
         LOG_WARN("failed to add tx info", K(ret));
@@ -1004,7 +1004,7 @@ TEST_F(TestCompactionPolicy, check_inc_major_can_access_for_update)
   EXPECT_EQ(commit_version_value, commit_version.get_val_for_tx());
 
   const int64_t abort_tx_id = 666;
-  const int64_t sql_seq = 111;
+  const int64_t sql_seq = transaction::ObTxSEQ(111, 0).cast_to_int();
   ObTableHandleV2 abort_table_handle;
   ASSERT_EQ(OB_SUCCESS,
             mock_sstable(allocator_,

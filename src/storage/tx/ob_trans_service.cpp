@@ -997,7 +997,7 @@ int ObTransService::register_mds_into_tx(ObTxDesc &tx_desc,
   } else if (OB_FAIL(create_implicit_savepoint(tx_desc, tx_param, savepoint))) {
     TRANS_LOG(WARN, "create implicit savepoint failed", K(ret), K(tx_desc));
   } else if (!seq_no.is_valid()) {
-    seq_no = tx_desc.inc_and_get_tx_seq(0);
+    ret = tx_desc.inc_and_get_tx_seq(0, 1, seq_no);
   }
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(arg.init(tx_desc.tenant_id_,

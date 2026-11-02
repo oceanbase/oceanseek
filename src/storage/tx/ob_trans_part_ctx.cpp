@@ -9032,7 +9032,7 @@ int ObPartTransCtx::start_access(const ObTxDesc &tx_desc,
         pending_write = ATOMIC_AAF(&pending_write_, 1);
         // others must wait the first thread of parallel open the write epoch
         // hence this must be done in lock
-        if (data_scn.support_branch() && pending_write == 1) {
+        if (pending_write == 1) {
           callback_list_idx = mt_ctx_.acquire_callback_list(true);
         }
       }
@@ -9041,21 +9041,17 @@ int ObPartTransCtx::start_access(const ObTxDesc &tx_desc,
   // other operations are allowed to out of lock
   if (OB_SUCC(ret)) {
     mt_ctx_.inc_ref();
-    if (data_scn.support_branch()) {
-      if (pending_write != 1) {
-        callback_list_idx = mt_ctx_.acquire_callback_list(false);
-      }
-      // remember selected callback_list idx into seq_no
-      if (data_scn.get_branch() == 0 && alloc && callback_list_idx != 0) {
-        data_scn.set_branch(callback_list_idx);
-      }
-    } else { // OLD version < 4.2.4
-      ret = OB_ERR_UNEXPECTED;
+    if (pending_write != 1) {
+      callback_list_idx = mt_ctx_.acquire_callback_list(false);
+    }
+    // remember selected callback_list idx into seq_no
+    if (data_scn.get_branch() == 0 && alloc && callback_list_idx != 0) {
+      data_scn.set_branch(callback_list_idx);
     }
   }
 
   last_request_ts_ = ObClockGenerator::getClock();
-  TRANS_LOG(TRACE, "start_access", K(ret), K(data_scn.support_branch()), K(data_scn), KPC(this));
+  TRANS_LOG(TRACE, "start_access", K(ret), K(data_scn), KPC(this));
   common::ObTraceIdAdaptor trace_id;
   trace_id.set(ObCurTraceId::get());
   REC_TRANS_TRACE_EXT(tlog_, start_access,
@@ -9242,7 +9238,8 @@ int ObPartTransCtx::rollback_to_savepoint(const int64_t op_sn,
     TRANS_LOG(INFO, "rollback succeed trivially", K_(trans_id), K_(ls_id), K(op_sn), K(to_scn), K_(last_scn));
   } else if (!from_scn.is_valid() &&
              // generate from if not specified
-             FALSE_IT(from_scn = to_scn.clone_with_seq(ObSequence::inc_and_get_max_seq_no(), seq_base))) {
+             OB_FAIL(to_scn.clone_with_seq(ObSequence::inc_and_get_max_seq_no(), seq_base, from_scn))) {
+    TRANS_LOG(WARN, "invalid rollback sequence", K(ret), K(to_scn), K(seq_base));
   } else if (OB_FAIL(rollback_to_savepoint_(from_scn, to_scn, share::SCN::invalid_scn()))) {
     TRANS_LOG(WARN, "rollback_to_savepoint fail", K(ret), K(from_scn), K(to_scn), K(op_sn), KPC(this));
   } else if (to_scn.get_branch() == 0) {
@@ -9378,7 +9375,7 @@ int ObPartTransCtx::submit_rollback_to_log_(const ObTxSEQ from_scn,
   ObTxLogCb *log_cb = NULL;
   int64_t replay_hint = trans_id_.get_id();
   logservice::ObReplayBarrierType barrier = logservice::ObReplayBarrierType::NO_NEED_BARRIER;
-  if (to_scn.support_branch() && is_parallel_logging()) {
+  if (is_parallel_logging()) {
     const int16_t branch_id = to_scn.get_branch();
     if (branch_id != 0 && to_scn.get_seq() > exec_info_.serial_final_seq_no_.get_seq()) {
       replay_hint += mt_ctx_.get_tx_seq_replay_idx(to_scn);

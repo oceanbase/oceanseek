@@ -216,7 +216,7 @@ int TestTableStore::mock_sstable(
   }
 
   if (ObITable::is_inc_major_type_sstable(key.table_type_) || ObITable::is_inc_major_ddl_sstable(key.table_type_)) {
-    compaction::ObUncommitTxDesc tx_desc(tx_id, seq_no);
+    compaction::ObUncommitTxDesc tx_desc(tx_id, ObTxSEQ(seq_no, 0).cast_to_int());
     param.uncommit_tx_info_.push_back(tx_desc);
     param.uncommit_tx_info_.set_info_status_record_seq();
     param.ddl_scn_.set_base();
@@ -1135,7 +1135,7 @@ TEST_F(TestTableStore, test_reject_different_tx_same_key_inc_major_for_ss)
   ASSERT_EQ(OB_SUCCESS, ObIncMajorTxHelper::get_trans_id_and_seq_no_from_sstable(
       old_inc_major, old_trans_id, old_seq_no));
   EXPECT_EQ(ObTransID(100), old_trans_id);
-  EXPECT_EQ(ObTxSEQ::cast_from_int(200), old_seq_no);
+  EXPECT_EQ(ObTxSEQ(200, 0), old_seq_no);
   EXPECT_EQ(INT64_MAX, old_inc_major->get_upper_trans_version());
 }
 

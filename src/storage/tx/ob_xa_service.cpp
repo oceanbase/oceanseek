@@ -1679,25 +1679,7 @@ int ObXAService::xa_rollback(const ObXATransID &xid,
                                           tx_id,
                                           end_flag))) {
     if (OB_ITER_END == ret) {
-      uint64_t data_version = 0;
-      if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), data_version))) {
-        TRANS_LOG(WARN, "fail to get min data version", KR(ret), K(tenant_id));
-      } else if (data_version < DATA_VERSION_4_2_0_0) {
-        if (OB_FAIL(query_xa_coordinator_with_xid(tenant_id, xid, tx_id, coordinator))) {
-          if (OB_ITER_END == ret) {
-            ret = OB_SUCCESS;
-          } else {
-            TRANS_LOG(WARN, "fail to query xa coordinator from pending transaction", K(ret), K(xid), K(tenant_id));
-          }
-        } else if (OB_FAIL(xa_rollback_for_pending_trans_(xid, tx_id, timeout_us, tenant_id, request_id,
-                                                          !ObXAFlag::contain_loosely(end_flag), coordinator))) {
-          TRANS_LOG(WARN, "fail to rollback xa trans for pending transaction", K(ret), K(xid), K(tenant_id));
-        } else {
-          TRANS_LOG(INFO, "rollback xa trans for pending transaction success", K(ret), K(xid), K(tenant_id));
-        }
-      } else {
-        ret = OB_SUCCESS;
-      }
+      ret = OB_SUCCESS;
     } else {
       TRANS_LOG(WARN, "fail to query xa scheduler and trans id from global transaction", K(ret), K(xid), K(tenant_id));
     }
@@ -2860,7 +2842,6 @@ int ObXAService::two_phase_xa_commit_(const ObXATransID &xid,
   ObXACtx *xa_ctx = NULL;
   bool alloc = true;
   share::ObLSID coordinator;
-  bool record_in_tableone = true;
   int64_t end_flag = 0;
   // only used for constructor
   bool is_tightly_coupled = true;
@@ -2868,31 +2849,13 @@ int ObXAService::two_phase_xa_commit_(const ObXATransID &xid,
   if (OB_FAIL(query_xa_coord_from_tableone(tenant_id, xid, coordinator, tx_id, end_flag))) {
     if (OB_ITER_END == ret) {
       TRANS_LOG(INFO, "record not exist in global transaction", K(ret), K(xid));
-      uint64_t data_version = 0;
-      if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), data_version))) {
-        TRANS_LOG(WARN, "fail to get min data version", KR(ret), K(tenant_id));
-      } else if (data_version < DATA_VERSION_4_2_0_0) {
-        ret = OB_SUCCESS;
-        record_in_tableone = false;
-      } else {
-        ret = OB_TRANS_XA_NOTA;
-      }
+      ret = OB_TRANS_XA_NOTA;
     } else {
       TRANS_LOG(WARN, "fail to qeery record from global transaction", K(ret), K(xid));
     }
   }
   if (OB_FAIL(ret)) {
     // do nothing
-  } else if (!record_in_tableone && OB_FAIL(query_xa_coordinator_with_xid(tenant_id, xid,
-        tx_id, coordinator))) {
-    if (OB_ITER_END == ret) {
-      ret = OB_TRANS_XA_NOTA;
-      TRANS_LOG(WARN, "xa is not valid", K(ret), K(xid), K(tx_id), K(coordinator));
-    } else {
-      TRANS_LOG(WARN, "fail to query trans id and coordinator", K(ret), K(xid),
-          K(tx_id), K(coordinator));
-      ret = OB_TRANS_XA_RETRY;
-    }
   } else if (OB_UNLIKELY(!coordinator.is_valid())) {
     ret = OB_TRANS_XA_PROTO;
     TRANS_LOG(WARN, "invalid coordinator when xa two phase commit/rollback", K(ret), K(xid), K(coordinator), K(tx_id));
@@ -2927,14 +2890,6 @@ int ObXAService::two_phase_xa_commit_(const ObXATransID &xid,
       } else {
         if (OB_SUCCESS != (tmp_ret = delete_xa_branch(tenant_id, xid, is_tightly_coupled))) {
           TRANS_LOG(WARN, "delete xa branch failed", K(tmp_ret), K(xid), K(tenant_id), K(tx_id));
-        }
-        uint64_t data_version = 0;
-        if (OB_SUCCESS != (tmp_ret = GET_MIN_DATA_VERSION(MTL_ID(), data_version))) {
-          TRANS_LOG(WARN, "fail to get min data version", KR(ret), K(tenant_id));
-        } else if (data_version < DATA_VERSION_4_2_0_0) {
-          if (OB_SUCCESS != (tmp_ret = delete_xa_pending_record(tenant_id, tx_id))) {
-            TRANS_LOG(WARN, "fail to delete xa record from pending trans", K(ret), K(xid), K(tx_id));
-          }
         }
       }
     }

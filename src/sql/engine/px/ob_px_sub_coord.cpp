@@ -1119,7 +1119,7 @@ int ObPxSubCoord::start_ddl()
       } else if (is_async_index_refresh) {
         ddl_dag_param.tx_info_.tx_desc_ = my_session->get_tx_desc();
         ddl_dag_param.tx_info_.trans_id_ = my_session->get_tx_desc()->get_tx_id();
-        ddl_dag_param.tx_info_.seq_no_ = my_session->get_tx_desc()->get_tx_seq().get_seq();
+        ddl_dag_param.tx_info_.seq_no_ = my_session->get_tx_desc()->get_tx_seq().cast_to_int();
         FLOG_INFO("async index refresh physical build", K(ddl_task_id), K(ddl_build_id),
                   K(snapshot_version), "trans_id", ddl_dag_param.tx_info_.trans_id_);
       }

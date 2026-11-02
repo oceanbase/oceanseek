@@ -15,7 +15,7 @@ DEF_TO_STRING(ObTxSEQ)
   int64_t pos = 0;
   if (raw_val_ == INT64_MAX) {
     BUF_PRINTF("MAX");
-  } else if (_sign_ == 0 && n_format_) {
+  } else if (is_valid()) {
     J_OBJ_START();
     J_KV(K_(branch), "seq", seq_);
     J_OBJ_END();

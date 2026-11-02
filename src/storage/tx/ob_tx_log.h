@@ -1419,16 +1419,8 @@ public:
         buf_ = ptr;
         len_ = NORMAL_LOG_BUF_SIZE;
       }
-    // it will be enabled after clog support big clog
     } else if (NORMAL_LOG_BUF_SIZE == len_) {
-      uint64_t data_version = 0;
-      if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), data_version))) {
-        TRANS_LOG(WARN, "get data version failed", K(ret));
-      } else if ((data_version < DATA_VERSION_4_2_2_0)
-          || (data_version >= DATA_VERSION_4_3_0_0 && data_version < DATA_VERSION_4_3_1_0)) {
-        ret = OB_NOT_SUPPORTED;
-        TRANS_LOG(WARN, "big log is not supported", K(ret));
-      } else if (OB_ISNULL(ptr = alloc_big_buf_())) {
+      if (OB_ISNULL(ptr = alloc_big_buf_())) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
       } else {
         if (pos > 0) {
@@ -1683,5 +1675,4 @@ int ObTxLogBlock::add_new_log(T &tx_log_body, ObTxBigSegmentBuf *big_segment_buf
 } // namespace transaction
 } // namespace oceanbase
 #endif
-
 

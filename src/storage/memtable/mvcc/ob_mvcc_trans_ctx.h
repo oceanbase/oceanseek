@@ -335,8 +335,6 @@ public:
   { return callback_remove_for_rollback_to_count_; }
   int64_t get_callback_ext_info_log_count() const
   { return callback_ext_info_log_count_; }
-  void add_main_list_append_cnt(int64_t cnt = 1)
-  { ATOMIC_AAF(&callback_main_list_append_count_, cnt); }
   void add_tx_end_callback_remove_cnt(int64_t cnt = 1)
   { ATOMIC_AAF(&callback_remove_for_trans_end_count_, cnt); }
   void add_release_memtable_callback_remove_cnt(int64_t cnt = 1)
@@ -632,4 +630,3 @@ private:
 }; // end namespace oceanbase
 
 #endif /* OCEANBASE_MVCC_OB_MVCC_TRANS_CTX_ */
-

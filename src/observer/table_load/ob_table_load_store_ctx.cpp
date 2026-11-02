@@ -457,8 +457,12 @@ int ObTableLoadStoreCtx::init_trans_param(storage::ObDirectLoadTransParam &trans
   } else {
     trans_param.tx_desc_ = tx_desc;
     trans_param.tx_id_ = tx_desc->get_tx_id();
-    trans_param.tx_seq_ = tx_desc->inc_and_get_tx_seq(0);
-    LOG_INFO("init trans param", K(trans_param));
+    if (OB_FAIL(tx_desc->inc_and_get_tx_seq(0, 1, trans_param.tx_seq_))) {
+      trans_param.reset();
+      LOG_WARN("allocate table load transaction sequence failed", KR(ret));
+    } else {
+      LOG_INFO("init trans param", K(trans_param));
+    }
   }
   return ret;
 }

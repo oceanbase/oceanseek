@@ -18,6 +18,7 @@
 #include "storage/column_store/ob_co_merge_ctx.h"
 #include "storage/column_store/ob_column_oriented_merger.h"
 #include "storage/column_store/ob_co_merge_dag.h"
+#include "storage/tx/ob_tx_seq.h"
 
 namespace oceanbase
 {
@@ -109,6 +110,11 @@ public:
     const bool need_prepare_two_stage_ctx = true,
     const bool onle_use_row_store = false);
   
+  // Multi-version rows store -ObTxSEQ(seq, 0).cast_to_int(); scanners negate then cast_from_int().
+  static int64_t stored_tx_seq(const int64_t seq)
+  {
+    return -static_cast<int64_t>(transaction::ObTxSEQ(seq, 0).cast_to_int());
+  }
   static int create_cg_sstables(ObCOTabletMergeCtx &ctx, const int64_t start_cg_idx, const int64_t end_cg_idx)
   {
     int ret = OB_SUCCESS;

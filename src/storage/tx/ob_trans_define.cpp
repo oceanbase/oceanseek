@@ -766,32 +766,29 @@ int ObTxExecInfo::generate_mds_buffer_ctx_array()
   return ret;
 }
 
-void ObTxExecInfo::mrege_buffer_ctx_array_to_multi_data_source() const
+int ObTxExecInfo::merge_buffer_ctx_array_to_multi_data_source()
 {
-  ObTxBufferNodeArray &multi_data_source = const_cast<ObTxBufferNodeArray &>(multi_data_source_);
-  ObTxBufferCtxArray &mds_buffer_ctx_array = const_cast<ObTxBufferCtxArray &>(mds_buffer_ctx_array_);
-  TRANS_LOG_RET(INFO, OB_SUCCESS, "merge deserialized buffer ctx to multi_data_source", K(mds_buffer_ctx_array), K(multi_data_source));
-  if (mds_buffer_ctx_array.count() != multi_data_source.count()) {
-    if (mds_buffer_ctx_array.count() == 0) {// 4.1 -> 4.2 compat case
-      TRANS_LOG_RET(WARN, OB_ERR_UNEXPECTED,
-                    "mds buffer ctx array size not equal to multi data source array size"
-                    ", destroy deserialized mds_buffer_ctx_array directly",
-                    K(multi_data_source), K(mds_buffer_ctx_array), K(*this));
-    } else {
-      TRANS_LOG_RET(ERROR, OB_ERR_UNEXPECTED,
-                    "mds buffer ctx array size not equal to multi data source array size"
-                    ", destroy deserialized mds_buffer_ctx_array directly",
-                    K(multi_data_source), K(mds_buffer_ctx_array), K(*this));
+  int ret = OB_SUCCESS;
+  TRANS_LOG_RET(INFO, OB_SUCCESS, "merge deserialized buffer ctx to multi_data_source",
+               K(mds_buffer_ctx_array_), K(multi_data_source_));
+  if (mds_buffer_ctx_array_.count() != multi_data_source_.count()) {
+    // Since the 4.6.1 baseline the serialized buffer ctx array always matches
+    // the multi data source array one-to-one; a mismatch means the checkpoint
+    // payload was written by a lower version or is corrupted.
+    for (int64_t idx = 0; idx < mds_buffer_ctx_array_.count(); ++idx) {
+      mds_buffer_ctx_array_[idx].destroy_ctx();
     }
-    for (int64_t idx = 0; idx < mds_buffer_ctx_array.count(); ++idx) {
-      mds_buffer_ctx_array[idx].destroy_ctx();
-    }
+    mds_buffer_ctx_array_.reset();
+    ret = OB_DESERIALIZE_ERROR;
+    TRANS_LOG(ERROR, "mds buffer ctx array size not equal to multi data source array size",
+              KR(ret), K(multi_data_source_), K(mds_buffer_ctx_array_), K(*this));
   } else {
-    for (int64_t idx = 0; idx < multi_data_source.count(); ++idx) {
-      multi_data_source[idx].buffer_ctx_node_ = mds_buffer_ctx_array[idx];
+    for (int64_t idx = 0; idx < multi_data_source_.count(); ++idx) {
+      multi_data_source_[idx].buffer_ctx_node_ = mds_buffer_ctx_array_[idx];
     }
+    mds_buffer_ctx_array_.reset();
   }
-  mds_buffer_ctx_array.reset();
+  return ret;
 }
 
 void ObTxExecInfo::clear_buffer_ctx_in_multi_data_source()
@@ -908,8 +905,8 @@ OB_SERIALIZE_MEMBER(ObTxExecInfo,
                     max_applied_log_ts_,
                     max_applying_part_log_no_,
                     max_submitted_seq_no_,
-                    checksum_[0],       // FARM COMPAT WHITELIST
-                    checksum_scn_[0],   // FARM COMPAT WHITELIST
+                    checksum_[0],       // FARM COMPAT WHITELIST: preserve the current wire slot.
+                    checksum_scn_[0],   // FARM COMPAT WHITELIST: preserve the current wire slot.
                     max_durable_lsn_,
                     data_complete_,
                     is_dup_tx_,

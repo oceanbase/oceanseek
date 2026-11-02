@@ -89,11 +89,6 @@ public:
   virtual ~ObLockWaitMgr();
 
   static int mtl_init(ObLockWaitMgr *&lock_wait_mgr) { return lock_wait_mgr->init(); }
-  static bool is_need_wait_remote_lock()
-  {
-    static const int64_t min_cluster_version = GET_MIN_CLUSTER_VERSION();
-    return min_cluster_version >= CLUSTER_VERSION_4_5_1_0;
-  }
   int init(bool for_unit_test = false);
   bool is_inited() { return is_inited_; };
   int start();

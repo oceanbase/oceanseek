@@ -193,15 +193,16 @@ struct TxStateHeader {
   static const uint8_t VER_0 = 0;
   static const uint8_t VER_1 = 1;
   static const uint8_t VERSION = VER_1;
-private:
-  static bool with_version_() { return GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_1_0_1; }
 public:
-  TxStateHeader(): tx_id_(), global_version_(0), flag_(), backend_sess_id_(0) {}
+  TxStateHeader(): compat_ver_(VERSION), tx_id_(), global_version_(0), flag_(), backend_sess_id_(0) {}
   TO_STRING_KV(K_(compat_ver), K_(tx_id), K_(global_version), K_(flag), K_(backend_sess_id));
   int encode(char* buf, const int64_t len, int64_t &pos);
   static int64_t encode_length();
   int decode(const char* buf, const int64_t len, int64_t &pos);
 };
+
+// Logging binds VERSION by reference, so it needs an out-of-class definition.
+const uint8_t TxStateHeader::VERSION;
 
 int64_t TxStateHeader::encode_length()
 {
@@ -222,11 +223,10 @@ int TxStateHeader::encode(char* buf, const int64_t len, int64_t &pos)
   } else if (OB_FAIL(encode_i64(buf, len, pos, global_version_))) {
     TRANS_LOG(WARN, "encode global_version fail", K(ret));
   } else {
-    const bool with_version = with_version_();
-    flag_.set_with_version(with_version);
+    flag_.set_with_version(true);
     if (OB_FAIL(encode_i8(buf, len, pos, flag_.v_))) {
       TRANS_LOG(WARN, "encode flag fail", K(ret));
-    } else if (with_version) {
+    } else {
       if (OB_FAIL(encode_i16(buf, len, pos, encode_length()))) {
         TRANS_LOG(WARN, "encode header len fail", K(ret));
       } else if (OB_FAIL(encode_i8(buf, len, pos, (int)VERSION))) {
@@ -251,18 +251,28 @@ int TxStateHeader::decode(const char* buf, const int64_t len, int64_t &pos)
   } else if (OB_FAIL(decode_i8(buf, len, pos, &flag_.v_))) {
     TRANS_LOG(ERROR, "decode flag fail", K(ret));
   }
-  if (OB_SUCC(ret) && flag_.is_with_version()) {
-    int16_t header_len = 0;
-    if (OB_FAIL(decode_i16(buf, len, pos, &header_len))) {
-      TRANS_LOG(ERROR, "decode header len fail", K(ret));
-    } else if (OB_FAIL(decode_i8(buf, pos0 + header_len, pos, (int8_t*)&compat_ver_))) {
-      TRANS_LOG(ERROR, "decode version fail", K(ret));
+  if (OB_SUCC(ret)) {
+    if (!flag_.is_with_version()) {
+      // The versionless layout was only written before the 4.6.1 baseline and
+      // is no longer accepted; versioned layouts keep their forward extension
+      // point via compat_ver_.
+      ret = OB_VERSION_NOT_MATCH;
+      TRANS_LOG(ERROR, "tx free route state header without version is below the 4.6.1 baseline", K(ret));
     } else {
-      if (compat_ver_ >= VER_1 && OB_FAIL(decode_i32(buf, pos0 + header_len , pos, (int32_t*)&backend_sess_id_))) {
-        TRANS_LOG(ERROR, "decode backend_sess_id fail", K(ret));
-      }
-      if (OB_SUCC(ret)) {
-        pos = pos0 + header_len;
+      int16_t header_len = 0;
+      if (OB_FAIL(decode_i16(buf, len, pos, &header_len))) {
+        TRANS_LOG(ERROR, "decode header len fail", K(ret));
+      } else if (OB_FAIL(decode_i8(buf, pos0 + header_len, pos, (int8_t*)&compat_ver_))) {
+        TRANS_LOG(ERROR, "decode version fail", K(ret));
+      } else {
+        if (compat_ver_ >= VER_1 && OB_FAIL(decode_i32(buf, pos0 + header_len , pos, (int32_t*)&backend_sess_id_))) {
+          TRANS_LOG(ERROR, "decode backend_sess_id fail", K(ret));
+        }
+        if (OB_SUCC(ret)) {
+          // Preserve the VER_1 prefix, including backend identity, and skip
+          // only unknown trailing extension fields in future versions.
+          pos = pos0 + header_len;
+        }
       }
     }
   }
@@ -937,9 +947,7 @@ int ObTransService::calc_txn_free_route(ObTxDesc *tx, ObTxnFreeRouteCtx &ctx)
         if (OB_LIKELY(tenant_config.is_valid())) {
           if (tenant_config->_enable_transaction_internal_routing) {
             audit_record.svr_flag_ = true;
-            if (GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_1_0_0) {
-              TRANS_LOG(DEBUG, "observer not upgrade to 4_1_0_0");
-            } else  if (!need_fallback_(*tx, state_size)) {
+            if (!need_fallback_(*tx, state_size)) {
               support_free_route = true;
             } else {
               fallback_happened = true;

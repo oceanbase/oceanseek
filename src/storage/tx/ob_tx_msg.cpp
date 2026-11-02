@@ -22,37 +22,9 @@ OB_SERIALIZE_MEMBER(ObTxMsg,
                     epoch_,
                     cluster_id_,
                     transfer_epoch_);
-// NOTICE: DO NOT MODIFY FOLLOING MACRO DEFINES, IT IS RESERVED FOR COMPATIBLE WITH OLD <= 4.1.2
-#define ObTxSubPrepareMsg_V1_MEMBERS expire_ts_, xid_, parts_, app_trace_info_
-#define ObTxSubPrepareRespMsg_V1_MEMBERS ret_
-#define ObTxSubCommitMsg_V1_MEMBERS xid_
-#define ObTxSubCommitRespMsg_V1_MEMBERS ret_
-#define ObTxSubRollbackMsg_V1_MEMBERS xid_
-#define ObTxSubRollbackRespMsg_V1_MEMBERS ret_
-#define ObTxCommitMsg_V1_MEMBERS expire_ts_, parts_, app_trace_info_
-#define ObTxCommitRespMsg_V1_MEMBERS ret_, commit_version_
-#define ObTxAbortMsg_V1_MEMBERS reason_
-#define ObTxKeepaliveMsg_V1_MEMBERS status_
-#define ObTxKeepaliveRespMsg_V1_MEMBERS status_
-#define Ob2pcPrepareReqMsg_V1_MEMBERS upstream_, app_trace_info_
-#define Ob2pcPrepareRespMsg_V1_MEMBERS prepare_version_, prepare_info_array_
-#define Ob2pcPreCommitReqMsg_V1_MEMBERS commit_version_
-#define Ob2pcPreCommitRespMsg_V1_MEMBERS commit_version_
-#define Ob2pcCommitReqMsg_V1_MEMBERS commit_version_, prepare_info_array_
-#define Ob2pcCommitRespMsg_V1_MEMBERS commit_version_, commit_log_scn_
-#define Ob2pcAbortReqMsg_V1_MEMBERS upstream_
-#define Ob2pcAbortRespMsg_V1_MEMBERS
-#define Ob2pcClearReqMsg_V1_MEMBERS max_commit_log_scn_
-#define Ob2pcClearRespMsg_V1_MEMBERS
-#define Ob2pcPrepareRedoReqMsg_V1_MEMBERS xid_, upstream_, app_trace_info_
-#define Ob2pcPrepareRedoRespMsg_V1_MEMBERS
-#define Ob2pcPrepareVersionReqMsg_V1_MEMBERS
-#define Ob2pcPrepareVersionRespMsg_V1_MEMBERS prepare_version_, prepare_info_array_
-#define ObAskStateMsg_V1_MEMBERS snapshot_
-#define ObAskStateRespMsg_V1_MEMBERS state_info_array_
-#define ObCollectStateMsg_V1_MEMBERS snapshot_
-#define ObCollectStateRespMsg_V1_MEMBERS state_info_
-
+// The <= 4.1.x RPC layout (V1_MEMBERS selected by cluster_version_) has been
+// removed: the 4.6.1 baseline gate guarantees every peer runs the current
+// layout. Keep the message enum values and wire IDs unchanged.
 #define CONCAT_REF(b) it_.b
 #define APPLY_FUNC_(f, ...) f(__VA_ARGS__)
 #define OB_TX_MSG_SERDE(CLZ, P_CLZ, ...)                                \
@@ -61,9 +33,7 @@ OB_SERIALIZE_MEMBER(ObTxMsg,
   int CLZ::serialize(SERIAL_PARAMS) const                               \
   {                                                                     \
     int ret = P_CLZ::serialize(buf, buf_len, pos);                      \
-    if (OB_SUCC(ret) && cluster_version_ <= CLUSTER_VERSION_4_1_0_1) {  \
-      LST_DO_CODE(OB_UNIS_ENCODE, CLZ ## _V1_MEMBERS);                  \
-    } else if (OB_SUCC(ret)) {                                          \
+    if (OB_SUCC(ret)) {                                                 \
       CLZ##_box x(const_cast<CLZ&>(*this));                             \
       ret = x.serialize(buf, buf_len, pos);                             \
     }                                                                   \
@@ -72,9 +42,7 @@ OB_SERIALIZE_MEMBER(ObTxMsg,
   int CLZ::deserialize(DESERIAL_PARAMS) {                               \
     int ret = OB_SUCCESS;                                               \
     ret = P_CLZ::deserialize(buf, data_len, pos);                       \
-    if (OB_SUCC(ret) && cluster_version_ <= CLUSTER_VERSION_4_1_0_1) {  \
-      LST_DO_CODE(OB_UNIS_DECODE, CLZ ## _V1_MEMBERS);                  \
-    } else if (OB_SUCC(ret)) {                                          \
+    if (OB_SUCC(ret)) {                                                 \
       CLZ##_box x(*this);                                               \
       ret = x.deserialize(buf, data_len, pos);                          \
     }                                                                   \
@@ -82,12 +50,8 @@ OB_SERIALIZE_MEMBER(ObTxMsg,
   }                                                                     \
   int64_t CLZ::get_serialize_size() const {                             \
     int64_t len = P_CLZ::get_serialize_size();                          \
-    if (cluster_version_ <= CLUSTER_VERSION_4_1_0_1) {                  \
-      LST_DO_CODE(OB_UNIS_ADD_LEN, CLZ ## _V1_MEMBERS);                 \
-    } else {                                                            \
-      CLZ##_box x(const_cast<CLZ&>(*this));                             \
-      len += x.get_serialize_size();                                    \
-    }                                                                   \
+    CLZ##_box x(const_cast<CLZ&>(*this));                               \
+    len += x.get_serialize_size();                                      \
     return len;                                                         \
   }
 
@@ -365,8 +329,7 @@ bool Ob2pcCommitRespMsg::is_valid() const {
       commit_version_.is_valid()) {
     ret = true;
   }
-  if (GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_1_0_0 &&
-      !commit_log_scn_.is_valid()) {
+  if (!commit_log_scn_.is_valid()) {
     ret = false;
   }
   return ret;
@@ -395,8 +358,7 @@ bool Ob2pcClearReqMsg::is_valid() const {
   if (ObTxMsg::is_valid() && type_ == TX_2PC_CLEAR_REQ) {
     ret = true;
   }
-  if (GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_1_0_0 &&
-      !max_commit_log_scn_.is_valid()) {
+  if (!max_commit_log_scn_.is_valid()) {
     ret = false;
   }
   return ret;

@@ -1348,13 +1348,12 @@ void ObTransService::fetch_conflict_info_from_mem_ctx_to_desc_(ObMvccAccessCtx &
   // merge all ctx(in every logstream)'s conflict trans ids to trans_desc
   int ret = OB_SUCCESS;
   common::ObSEArray<ObRowConflictInfo, 5> array;
-  common::ObArray<ObTransIDAndAddr> array_old;
   if (OB_ISNULL(acc_ctx.mem_ctx_)) {
     ret = OB_BAD_NULL_ERROR;
     DETECT_LOG(ERROR, "mem_ctx_ on acc_ctx is null", KR(ret), K(array));
   } else if (OB_FAIL(acc_ctx.mem_ctx_->fetch_conflict_info_array(array))) {
     DETECT_LOG(WARN, "get conflict ids from mem_ctx failed", KR(ret), K(acc_ctx));
-  } else if (OB_FAIL(acc_ctx.tx_desc_->merge_conflict_info_array(array, array_old))) {
+  } else if (OB_FAIL(acc_ctx.tx_desc_->merge_conflict_info_array(array))) {
     DETECT_LOG(WARN, "fail to merge ctx conflict trans array", KR(ret), K(acc_ctx));
   } else {
     DETECT_LOG(TRACE, "fetch conflict ids from mem_ctx to desc", KR(ret), K(array));
@@ -3710,77 +3709,67 @@ int ObTransService::check_for_standby(const share::ObLSID &ls_id,
   int ret = OB_SUCCESS;
   ObPartTransCtx *ctx = NULL;
   if (OB_SUCC(get_tx_ctx_for_standby_(ls_id, tx_id, ctx))) {
-
-    if ((GET_MIN_CLUSTER_VERSION() >= MOCK_CLUSTER_VERSION_4_2_5_6
-         && GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_3_0_0)
-        || (GET_MIN_CLUSTER_VERSION() > CLUSTER_VERSION_4_4_1_0
-            && GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_5_0_0)
-        || (GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_5_1_0)) {
-      ObTxCommitData::TxDataState tx_data_state;
-      share::SCN commit_version;
-      ret = ctx->infer_standby_trx_state_v2(snapshot, 20_ms /*wait_participant_timeout_us*/,
-                                            true /*filter_unreadable_prepare_trx*/, tx_data_state,
-                                            commit_version);
-      if (OB_SUCC(ret)) {
-        switch (tx_data_state) {
-          case ObTxCommitData::TxDataState::COMMIT: {
-            if (!is_effective_trans_version(commit_version)) {
-              // COMMIT must carry a real commit version. max/min/invalid SCN
-              // here is a logic error, not a retryable lock conflict.
-              ret = OB_ERR_UNEXPECTED;
-              TRANS_LOG(ERROR, "committed standby trx with invalid commit version",
-                        K(ret), K(ls_id), K(tx_id), K(snapshot), K(commit_version));
-            } else if (snapshot >= commit_version) {
-              can_read = true;
-              trans_version = commit_version;
-            } else {
-              can_read = false;
-              trans_version = commit_version;
-            }
-            break;
+    ObTxCommitData::TxDataState tx_data_state;
+    share::SCN commit_version;
+    ret = ctx->infer_standby_trx_state_v2(snapshot, 20_ms /*wait_participant_timeout_us*/,
+                                          true /*filter_unreadable_prepare_trx*/, tx_data_state,
+                                          commit_version);
+    if (OB_SUCC(ret)) {
+      switch (tx_data_state) {
+        case ObTxCommitData::TxDataState::COMMIT: {
+          if (!is_effective_trans_version(commit_version)) {
+            // COMMIT must carry a real commit version. max/min/invalid SCN
+            // here is a logic error, not a retryable lock conflict.
+            ret = OB_ERR_UNEXPECTED;
+            TRANS_LOG(ERROR, "committed standby trx with invalid commit version",
+                      K(ret), K(ls_id), K(tx_id), K(snapshot), K(commit_version));
+          } else if (snapshot >= commit_version) {
+            can_read = true;
+            trans_version = commit_version;
+          } else {
+            can_read = false;
+            trans_version = commit_version;
           }
-          case ObTxCommitData::TxDataState::ABORT: {
-            // ABORT has no effective trans version. infer_standby_trx_state_v2
-            // leaves commit_version invalid, so keep trans_version min as
-            // inner_lock_for_read and ObPartTransCtx::check_for_standby do.
+          break;
+        }
+        case ObTxCommitData::TxDataState::ABORT: {
+          // ABORT has no effective trans version. infer_standby_trx_state_v2
+          // leaves commit_version invalid, so keep trans_version min as
+          // inner_lock_for_read and ObPartTransCtx::check_for_standby do.
+          can_read = false;
+          trans_version.set_min();
+          break;
+        }
+        case ObTxCommitData::TxDataState::RUNNING: {
+          // RUNNING is undecided. infer_by_userful_info() encodes it with
+          // commit_version = max_scn, which is not an effective trans version.
+          // min/invalid here is a logic error, not a retryable lock conflict.
+          if (!commit_version.is_valid() || commit_version.is_min()) {
+            ret = OB_ERR_UNEXPECTED;
+            TRANS_LOG(ERROR, "running standby trx with invalid commit version",
+                      K(ret), K(ls_id), K(tx_id), K(snapshot), K(commit_version));
+          } else if (snapshot < commit_version) {
             can_read = false;
             trans_version.set_min();
-            break;
-          }
-          case ObTxCommitData::TxDataState::RUNNING: {
-            // RUNNING is undecided. infer_by_userful_info() encodes it with
-            // commit_version = max_scn, which is not an effective trans version.
-            // min/invalid here is a logic error, not a retryable lock conflict.
-            if (!commit_version.is_valid() || commit_version.is_min()) {
-              ret = OB_ERR_UNEXPECTED;
-              TRANS_LOG(ERROR, "running standby trx with invalid commit version",
-                        K(ret), K(ls_id), K(tx_id), K(snapshot), K(commit_version));
-            } else if (snapshot < commit_version) {
-              can_read = false;
-              trans_version.set_min();
-            } else {
-              ret = OB_ERR_SHARED_LOCK_CONFLICT;
-            }
-            break;
-          }
-          default: {
+          } else {
             ret = OB_ERR_SHARED_LOCK_CONFLICT;
-            break;
           }
+          break;
         }
-        if (OB_ERR_SHARED_LOCK_CONFLICT == ret) {
-          TRANS_LOG(INFO, "Unknown standby trx state or commit_version", K(ret), K(ls_id), K(tx_id),
-                    K(snapshot), K(can_read), K(tx_data_state), K(commit_version), K(trans_version));
+        default: {
+          ret = OB_ERR_SHARED_LOCK_CONFLICT;
+          break;
         }
-      } else {
-        TRANS_LOG(INFO, "infer standby read failed, set as OB_ERR_SHARED_LOCK_CONFLICT", K(ret), K(ls_id),
-                  K(tx_id), K(snapshot), K(can_read), K(tx_data_state), K(commit_version),
-                  K(trans_version));
-        ret = OB_ERR_SHARED_LOCK_CONFLICT;
       }
-
+      if (OB_ERR_SHARED_LOCK_CONFLICT == ret) {
+        TRANS_LOG(INFO, "Unknown standby trx state or commit_version", K(ret), K(ls_id), K(tx_id),
+                  K(snapshot), K(can_read), K(tx_data_state), K(commit_version), K(trans_version));
+      }
     } else {
-      ret = ctx->check_for_standby(snapshot, can_read, trans_version);
+      TRANS_LOG(INFO, "infer standby read failed, set as OB_ERR_SHARED_LOCK_CONFLICT", K(ret), K(ls_id),
+                K(tx_id), K(snapshot), K(can_read), K(tx_data_state), K(commit_version),
+                K(trans_version));
+      ret = OB_ERR_SHARED_LOCK_CONFLICT;
     }
     revert_tx_ctx_(ctx);
   } else {
@@ -3828,24 +3817,11 @@ int ObTransService::mds_infer_standby_trx_state(const ObLS *ls_ptr,
       ret = OB_STATE_NOT_MATCH;
       TRANS_LOG(WARN, "logonly replica has no trans service", KR(ret), KPC(tmp_ls_ptr));
     } else if (OB_SUCC(tmp_ls_ptr->get_tx_ctx(tx_id, true, ctx))) {
-    if ((GET_MIN_CLUSTER_VERSION() >= MOCK_CLUSTER_VERSION_4_2_5_6
-         && GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_3_0_0)
-        || (GET_MIN_CLUSTER_VERSION() > CLUSTER_VERSION_4_4_1_0
-            && GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_5_0_0)
-        || (GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_5_1_0)) {
-        if (OB_FAIL(ctx->infer_standby_trx_state_v2(snapshot, 150_ms /*wait_participant_timeout_us*/,
-                                                    false /*filter_unreadable_prepare_trx*/,
-                                                    tx_data_state, commit_version))) {
-          TRANS_LOG(WARN, "infer standby trx state for mds failed", K(ret), K(ls_id), K(tx_id),
-                    K(snapshot), K(tx_data_state), K(commit_version));
-        }
-      } else {
-        if (OB_FAIL(ctx->infer_standby_trx_state(snapshot, 150_ms /*wait_participant_timeout_us*/,
-                                                 false /*filter_unreadable_prepare_trx*/, tx_data_state,
-                                                 commit_version))) {
-          TRANS_LOG(WARN, "infer standby trx state for mds failed", K(ret), K(ls_id), K(tx_id),
-                    K(snapshot), K(tx_data_state), K(commit_version));
-        }
+      if (OB_FAIL(ctx->infer_standby_trx_state_v2(snapshot, 150_ms /*wait_participant_timeout_us*/,
+                                                  false /*filter_unreadable_prepare_trx*/,
+                                                  tx_data_state, commit_version))) {
+        TRANS_LOG(WARN, "infer standby trx state for mds failed", K(ret), K(ls_id), K(tx_id),
+                  K(snapshot), K(tx_data_state), K(commit_version));
       }
 
       tmp_ls_ptr->revert_tx_ctx(ctx);

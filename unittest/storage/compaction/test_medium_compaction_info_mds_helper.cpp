@@ -447,7 +447,7 @@ public:
       LOG_WARN("failed to prepare replay test context", KR(ret));
     } else {
       ctx->set_for_replay(true);
-      static_cast<mds::MdsCtx&>(*ctx).set_seq_no(transaction::ObTxSEQ::mk_v0(1));
+      static_cast<mds::MdsCtx&>(*ctx).set_seq_no(transaction::ObTxSEQ(1, 0));
       ret = ObTabletMediumCompactionInfoMdsHelper::on_replay(buf, buf_len, redo_scn, *ctx);
       if (OB_SUCC(ret)) {
         ctx->on_redo(redo_scn);

@@ -12,6 +12,7 @@
 #include "storage/tx/ob_tx_version_mgr.h"
 #include "storage/tx/ob_trans_service.h"
 #include "storage/ls/ob_ls.h"
+#include "storage/lock_wait_mgr/ob_lock_wait_mgr_msg.h"
 
 namespace oceanbase
 {
@@ -287,6 +288,89 @@ TEST_F(TestObTxMisc, TxDesc_add_mofied_tables)
       EXPECT_EQ(txdesc.modified_tables_[i], i+1);
     }
   }
+}
+
+// Freeze the existing positional layout independently of ObTxExecResult's members.
+struct TxExecResultWireLayout
+{
+  OB_UNIS_VERSION(1);
+public:
+  bool incomplete_ = false;
+  ObTxPartList parts_;
+  ObSArray<ObTransIDAndAddr> reserved_conflicts_;
+  ObSArray<storage::ObRowConflictInfo> conflicts_;
+  share::ObLSArray touched_ls_;
+};
+OB_SERIALIZE_MEMBER(TxExecResultWireLayout, incomplete_, parts_, reserved_conflicts_,
+                    conflicts_, touched_ls_);
+
+TEST_F(TestObTxMisc, execution_result_preserves_reserved_wire_slot)
+{
+  ObTxExecResult result;
+  ObArray<storage::ObRowConflictInfo> conflicts;
+  ASSERT_EQ(OB_SUCCESS, conflicts.push_back(storage::ObRowConflictInfo()));
+  conflicts.at(0).conflict_hash_ = 123;
+  conflicts.at(0).conflict_tx_id_ = ObTransID(456);
+  result.merge_conflict_info_array(conflicts);
+  ASSERT_EQ(OB_SUCCESS, result.add_touched_ls(share::ObLSID(789)));
+  char buffer[16384];
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, result.serialize(buffer, sizeof(buffer), pos));
+  TxExecResultWireLayout wire;
+  int64_t read_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, wire.deserialize(buffer, pos, read_pos));
+  EXPECT_EQ(pos, read_pos);
+  EXPECT_EQ(0, wire.reserved_conflicts_.count());
+  ASSERT_EQ(1, wire.conflicts_.count());
+  EXPECT_EQ(123, wire.conflicts_.at(0).conflict_hash_);
+  EXPECT_EQ(ObTransID(456), wire.conflicts_.at(0).conflict_tx_id_);
+  ASSERT_EQ(1, wire.touched_ls_.count());
+  EXPECT_EQ(share::ObLSID(789), wire.touched_ls_.at(0));
+
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, wire.serialize(buffer, sizeof(buffer), pos));
+  ObTxExecResult decoded;
+  read_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buffer, pos, read_pos));
+  EXPECT_EQ(pos, read_pos);
+  ObTxDesc tx;
+  ASSERT_EQ(OB_SUCCESS, tx.add_exec_info(decoded));
+  ASSERT_EQ(1, tx.get_conflict_info_array().count());
+  EXPECT_EQ(123, tx.get_conflict_info_array().at(0).conflict_hash_);
+}
+
+TEST_F(TestObTxMisc, failed_sequence_does_not_update_participant)
+{
+  ObTxDesc tx;
+  tx.seq_base_ = 0;
+  ObAddr addr;
+  ASSERT_TRUE(addr.set_ip_addr("127.0.0.1", 2882));
+  EXPECT_EQ(OB_ERR_UNEXPECTED, tx.update_clean_part(share::ObLSID(1), 1, addr));
+  EXPECT_EQ(OB_ERR_UNEXPECTED, tx.add_clean_part_if_absent(share::ObLSID(1), 1, addr, false));
+  EXPECT_EQ(0, tx.parts_.count());
+}
+
+TEST_F(TestObTxMisc, sequence_generation_requires_current_base)
+{
+  ObTxDesc tx;
+  ObTxSEQ seq;
+  EXPECT_FALSE(tx.get_tx_seq().is_valid());
+  EXPECT_FALSE(tx.get_min_tx_seq().is_valid());
+  EXPECT_EQ(OB_ERR_UNEXPECTED, tx.get_and_inc_tx_seq(0, 1, seq));
+  EXPECT_EQ(OB_ERR_UNEXPECTED, tx.inc_and_get_tx_seq(0, 1, seq));
+  EXPECT_FALSE(tx.inc_and_get_tx_seq(0).is_valid());
+
+  const int64_t now = ObSequence::get_max_seq_no();
+  tx.seq_base_ = now - 100;
+  EXPECT_EQ(ObTxSEQ::MIN_VAL(), tx.get_min_tx_seq());
+  EXPECT_EQ(ObTxSEQ(100, 0), tx.get_tx_seq(now));
+  EXPECT_FALSE(tx.get_tx_seq(tx.seq_base_).is_valid());
+  EXPECT_FALSE(tx.get_tx_seq(tx.seq_base_ + ObTxSEQ::MAX_SEQ + 1).is_valid());
+  EXPECT_EQ(OB_SUCCESS, tx.get_and_inc_tx_seq(7, 2, seq));
+  EXPECT_EQ(ObTxSEQ(100, 7), seq);
+  EXPECT_EQ(OB_SUCCESS, tx.inc_and_get_tx_seq(8, 3, seq));
+  EXPECT_EQ(ObTxSEQ(105, 8), seq);
+  EXPECT_EQ(OB_ERR_UNEXPECTED, tx.inc_and_get_tx_seq(-1, 1, seq));
 }
 
 }//end of unittest

@@ -32,13 +32,13 @@ TEST(TestCompactionTransCache, cache_trans_state_with_end_scn)
 
   ASSERT_EQ(OB_SUCCESS, mgr.init(16));
   ASSERT_EQ(OB_SUCCESS, mgr.add_trans_state(ObTransID(1),
-                                            ObTxSEQ::cast_from_int(1),
+                                            ObTxSEQ(1, 0),
                                             trans_version.get_val_for_tx(),
                                             storage::ObTxData::COMMIT,
                                             true,
                                             end_scn));
   ASSERT_EQ(OB_SUCCESS, mgr.get_trans_state(ObTransID(1),
-                                            ObTxSEQ::cast_from_int(1),
+                                            ObTxSEQ(1, 0),
                                             trans_state));
   EXPECT_EQ(storage::ObTxData::COMMIT, trans_state.trans_state_);
   EXPECT_EQ(trans_version.get_val_for_tx(), trans_state.trans_version_);

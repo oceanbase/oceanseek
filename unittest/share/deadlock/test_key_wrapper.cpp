@@ -24,6 +24,30 @@ public:
   virtual void TearDown() {}
 };
 
+TEST_F(TestUserBinaryKey, transaction_key_uses_typed_detector_key)
+{
+  using namespace transaction;
+  const ObTransID tx_id(123);
+  UserBinaryKey implicit_key;
+  UserBinaryKey default_key;
+  UserBinaryKey remote_key;
+  ASSERT_EQ(OB_SUCCESS, implicit_key.set_user_key(tx_id));
+  ASSERT_EQ(OB_SUCCESS, default_key.set_user_key(
+      ObTransDeadlockDetectorKey(ObDeadlockKeyType::DEFAULT, tx_id)));
+  ASSERT_EQ(OB_SUCCESS, remote_key.set_user_key(
+      ObTransDeadlockDetectorKey(ObDeadlockKeyType::REMOTE_EXEC_SIDE, tx_id)));
+  EXPECT_TRUE(implicit_key == default_key);
+  EXPECT_FALSE(implicit_key == remote_key);
+  char buffer[1024];
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, implicit_key.serialize(buffer, sizeof(buffer), pos));
+  UserBinaryKey decoded;
+  int64_t read_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buffer, pos, read_pos));
+  EXPECT_EQ(pos, read_pos);
+  EXPECT_TRUE(decoded == default_key);
+}
+
 // 序列化和反序列化的功能
 TEST_F(TestUserBinaryKey, serialization) {
   UserBinaryKey key1;

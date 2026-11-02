@@ -8,6 +8,7 @@
 
 #include "share/ob_define.h"
 #include "share/rpc/ob_batch_proxy.h"
+#include "storage/tx/ob_tx_seq.h"
 namespace oceanbase {
 
 namespace lockwaitmgr {
@@ -146,7 +147,8 @@ public:
         && tablet_id_ > 0
         // Table-lock priority waits block on the priority-queue head trans, which has
         // no row-lock hold seq, so holder_tx_hold_seq_value_ is legitimately 0 here.
-        && (holder_tx_hold_seq_value_ > 0 || is_table_lock_priority_wait_)
+        && (transaction::ObTxSEQ::is_valid_seq(holder_tx_hold_seq_value_)
+            || (holder_tx_hold_seq_value_ == 0 && is_table_lock_priority_wait_))
         && abs_timeout_ts_ > 0
         && !query_sql_.empty();
   }

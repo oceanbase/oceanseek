@@ -376,7 +376,7 @@ TEST_F(TestTxCtxTable, parallel_dli_replay_without_serial_submitted)
 
   ObDDLIncLogBasic batch_key;
   ObTransID tx_id(1001);
-  ObTxSEQ seq_no(2001);
+  ObTxSEQ seq_no(2001, 0);
   ASSERT_EQ(OB_SUCCESS,
             batch_key.init(ObTabletID(100001), ObTabletID(100002), ObTabletID(), 
                            ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR,
@@ -631,10 +631,11 @@ TEST_F(TestTxCtxTable, old_checkpoint_replay_from_middle_uses_next_entry_no)
   ctx.ctx_tx_data_.test_tx_data_reset();
 }
 
-// Verify the compatible-version gate in ObTxCtxTableInfo::deserialize_: VERSION_1
-// forces the absent-cursor sentinel, while VERSION_2 preserves the decoded cursor.
-// Missing trailing-field behavior is covered separately by TestObTxLog.
-TEST_F(TestTxCtxTable, tx_ctx_info_compatible_version_controls_cursor)
+// Since the 4.6.1 baseline, ObTxCtxTableInfo no longer consults a compatible
+// version: the current checkpoint layout round-trips the applied entry cursor
+// as-is. Missing trailing-field tolerance inside ObTxExecInfo is covered
+// separately by TestObTxLog.
+TEST_F(TestTxCtxTable, tx_ctx_info_roundtrip_preserves_cursor)
 {
   ObTxDataTable tx_data_table;
   tx_data_allocator_.init("test", (TxShareThrottleTool*)0x1);
@@ -644,6 +645,7 @@ TEST_F(TestTxCtxTable, tx_ctx_info_compatible_version_controls_cursor)
   ctx_info.tx_id_ = ObTransID(1);
   ctx_info.ls_id_ = ObLSID(1);
   ctx_info.cluster_id_ = 1;
+  ctx_info.cluster_version_ = CLUSTER_VERSION_4_6_1_0;
   ASSERT_EQ(OB_SUCCESS, tx_data_table.alloc_tx_data(ctx_info.tx_data_guard_, false));
   ctx_info.exec_info_.max_applied_entry_no_ = 10;
 
@@ -655,18 +657,119 @@ TEST_F(TestTxCtxTable, tx_ctx_info_compatible_version_controls_cursor)
   ASSERT_EQ(size, pos);
 
   ObTxCtxTableInfo replay_info;
+  replay_info.reset();
   ASSERT_EQ(OB_SUCCESS, tx_data_table.alloc_tx_data(replay_info.tx_data_guard_, false));
-  replay_info.set_compatible_version(ObTxCtxTableMeta::VERSION_1);
   pos = 0;
   ASSERT_EQ(OB_SUCCESS, replay_info.deserialize_(buf, size, pos, tx_data_table));
-  EXPECT_EQ(INT64_MIN, replay_info.exec_info_.max_applied_entry_no_);
+  EXPECT_EQ(size, pos);
+  EXPECT_EQ(10, replay_info.exec_info_.max_applied_entry_no_);
+  EXPECT_EQ(CLUSTER_VERSION_4_6_1_0, replay_info.cluster_version_);
 
-  ObTxCtxTableInfo replay_info2;
-  ASSERT_EQ(OB_SUCCESS, tx_data_table.alloc_tx_data(replay_info2.tx_data_guard_, false));
-  replay_info2.set_compatible_version(ObTxCtxTableMeta::VERSION_2);
+  ob_free(buf);
+}
+
+TEST_F(TestTxCtxTable, tx_ctx_info_missing_cursor_after_reset)
+{
+  ObTxDataTable tx_data_table;
+  tx_data_allocator_.init("test", (TxShareThrottleTool*)0x1);
+  tx_data_table.tx_data_allocator_ = &tx_data_allocator_;
+
+  ObTxCtxTableInfo ctx_info;
+  ctx_info.tx_id_ = ObTransID(1);
+  ctx_info.ls_id_ = ObLSID(1);
+  ctx_info.cluster_id_ = 1;
+  ctx_info.cluster_version_ = CLUSTER_VERSION_4_6_1_0;
+  ASSERT_EQ(OB_SUCCESS, tx_data_table.alloc_tx_data(ctx_info.tx_data_guard_, false));
+  ctx_info.exec_info_.max_applied_entry_no_ = 10;
+
+  const int64_t size = ctx_info.get_serialize_size_();
+  char *buf = static_cast<char *>(ob_malloc(size, "TxCtxCursorTest"));
+  ASSERT_NE(nullptr, buf);
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, ctx_info.serialize_(buf, size, pos));
+  ASSERT_EQ(size, pos);
+
+  // Build a VERSION_1 payload by removing the appended cursor from the
+  // length-delimited ObTxExecInfo, preserving all following context fields.
+  const int64_t exec_start = ctx_info.tx_id_.get_serialize_size()
+      + ctx_info.ls_id_.get_serialize_size()
+      + serialization::encoded_length_vi64(ctx_info.cluster_id_)
+      + ctx_info.tx_data_guard_.tx_data()->get_serialize_size();
+  const int64_t exec_end = exec_start + ctx_info.exec_info_.get_serialize_size();
+  const int64_t cursor_size = serialization::encoded_length(ctx_info.exec_info_.max_applied_entry_no_);
+  int64_t version = 0;
+  int64_t payload_size = 0;
+  pos = exec_start;
+  ASSERT_EQ(OB_SUCCESS, serialization::decode_vi64(buf, size, pos, &version));
+  ASSERT_EQ(1, version);
+  const int64_t length_pos = pos;
+  ASSERT_EQ(OB_SUCCESS, serialization::decode_vi64(buf, size, pos, &payload_size));
+  ASSERT_EQ(exec_end, pos + payload_size);
+  pos = length_pos;
+  ASSERT_EQ(OB_SUCCESS, serialization::encode_fixed_bytes_i64(
+      buf, size, pos, payload_size - cursor_size));
+  MEMMOVE(buf + exec_end - cursor_size, buf + exec_end, size - exec_end);
+  const int64_t old_size = size - cursor_size;
+
+  ObTxCtxTableInfo replay_info;
+  for (int64_t stale_cursor : {-1L, 99L}) {
+    replay_info.reset(); // Production recovery resets and reuses ctx_info_.
+    EXPECT_EQ(-1, replay_info.exec_info_.max_applied_entry_no_);
+    replay_info.exec_info_.max_applied_entry_no_ = stale_cursor;
+    ASSERT_EQ(OB_SUCCESS, tx_data_table.alloc_tx_data(replay_info.tx_data_guard_, false));
+    pos = 0;
+    ASSERT_EQ(OB_SUCCESS, replay_info.deserialize_(buf, old_size, pos, tx_data_table));
+    EXPECT_EQ(old_size, pos);
+    EXPECT_EQ(INT64_MIN, replay_info.exec_info_.max_applied_entry_no_);
+    EXPECT_EQ(CLUSTER_VERSION_4_6_1_0, replay_info.cluster_version_);
+  }
+  ob_free(buf);
+}
+
+// VERSION_1 remains valid; VERSION_0 and unversioned metas are rejected.
+TEST_F(TestTxCtxTable, tx_ctx_meta_below_baseline_rejected)
+{
+  ObTxCtxTableMeta meta;
+  meta.init(ObTransID(1), ObLSID(1), 128 /*row_value_serialize_size*/, 1 /*row_num*/, 0 /*row_idx*/);
+
+  const int64_t size = meta.get_serialize_size();
+  char *buf = static_cast<char *>(ob_malloc(size, "TxCtxMetaTest"));
+  ASSERT_NE(nullptr, buf);
+
+  // current VERSION_2 meta round-trips
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, meta.serialize(buf, size, pos));
+  ASSERT_EQ(size, pos);
+  ObTxCtxTableMeta cur_meta;
   pos = 0;
-  ASSERT_EQ(OB_SUCCESS, replay_info2.deserialize_(buf, size, pos, tx_data_table));
-  EXPECT_EQ(10, replay_info2.exec_info_.max_applied_entry_no_);
+  ASSERT_EQ(OB_SUCCESS, cur_meta.deserialize(buf, size, pos));
+  EXPECT_EQ(ObTxCtxTableMeta::VERSION_2, cur_meta.get_version());
+  EXPECT_EQ(ObTransID(1), cur_meta.tx_id_);
+
+  // VERSION_1 meta is accepted. The context decoder sets the missing cursor
+  // sentinel explicitly, as covered by tx_ctx_info_missing_cursor_after_reset.
+  meta.version_ = ObTxCtxTableMeta::VERSION_1;
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, meta.serialize(buf, size, pos));
+  ObTxCtxTableMeta old_meta;
+  pos = 0;
+  EXPECT_EQ(OB_SUCCESS, old_meta.deserialize(buf, size, pos));
+  EXPECT_EQ(ObTxCtxTableMeta::VERSION_1, old_meta.get_version());
+
+  // VERSION_0 layout (no trailing version field) is rejected
+  char raw[256];
+  pos = 0;
+  ObTxCtxTableCommonHeader header(ObTxCtxTableMeta::MAGIC_VERSION, 0);
+  ASSERT_EQ(OB_SUCCESS, header.serialize(raw, sizeof(raw), pos));
+  ASSERT_EQ(OB_SUCCESS, meta.tx_id_.serialize(raw, sizeof(raw), pos));
+  ASSERT_EQ(OB_SUCCESS, meta.ls_id_.serialize(raw, sizeof(raw), pos));
+  ASSERT_EQ(OB_SUCCESS, serialization::encode_vi64(raw, sizeof(raw), pos, meta.tx_ctx_serialize_size_));
+  ASSERT_EQ(OB_SUCCESS, serialization::encode_vi32(raw, sizeof(raw), pos, meta.row_num_));
+  ASSERT_EQ(OB_SUCCESS, serialization::encode_vi32(raw, sizeof(raw), pos, meta.row_idx_));
+  const int64_t raw_len = pos;
+  ObTxCtxTableMeta v0_meta;
+  pos = 0;
+  EXPECT_EQ(OB_VERSION_NOT_MATCH, v0_meta.deserialize(raw, raw_len, pos));
 
   ob_free(buf);
 }

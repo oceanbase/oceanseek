@@ -444,87 +444,74 @@ int ObTransCallbackMgr::append(ObITransCallback *head,
     // Step2: find the slot for register or replay
     // Batch append is data-row only; MDS always uses single append(node).
     const transaction::ObTxSEQ seq_no = head->get_seq_no();
-    if (OB_LIKELY(seq_no.support_branch())) {
-      // NEW since version 4.2.4, select by branch
-      int slot = seq_no.get_branch() % MAX_CALLBACK_LIST_COUNT;
-      if (OB_UNLIKELY(slot > 0
-                      && for_replay_
-                      && is_serial_final_()
-                      && head->get_scn() <= serial_final_scn_)) {
-        // _NOTE_
-        // for log with scn before serial final and replayed after txn recovery from point after serial final
-        // it's replayed into first callback-list to keep the scn is in asc order for all callback list
-        // for example:
-        // serial final log scn = 100
-        // recovery point scn = 200
-        // log replaying with scn = 80
-        //
-        // Checksum calculation:
-        // this log has been accumulated, it will not be required in all calback-list
-        if (parallel_replay_) {
+    if (OB_UNLIKELY(!seq_no.is_valid())) {
+      ret = OB_ERR_UNEXPECTED;
+      TRANS_LOG(ERROR, "invalid callback sequence", K(ret), K(seq_no));
+    }
+    // Select the callback list by branch.
+    int slot = seq_no.get_branch() % MAX_CALLBACK_LIST_COUNT;
+    if (OB_SUCC(ret) && OB_UNLIKELY(slot > 0
+                    && for_replay_
+                    && is_serial_final_()
+                    && head->get_scn() <= serial_final_scn_)) {
+      // _NOTE_
+      // for log with scn before serial final and replayed after txn recovery from point after serial final
+      // it's replayed into first callback-list to keep the scn is in asc order for all callback list
+      // for example:
+      // serial final log scn = 100
+      // recovery point scn = 200
+      // log replaying with scn = 80
+      //
+      // Checksum calculation:
+      // this log has been accumulated, it will not be required in all calback-list
+      if (parallel_replay_) {
+        ret = OB_ERR_UNEXPECTED;
+        TRANS_LOG(ERROR, "parallel replay an serial log", KR(ret), KPC(this));
+#ifdef ENABLE_DEBUG_LOG
+        ob_abort();
+#endif
+      }
+      if (OB_SUCC(ret) && OB_UNLIKELY(!has_branch_replayed_into_first_list_)) {
+        // sanity check: the serial_final_seq_no must be set
+        // which will be used in replay `rollback branch savepoint` log
+        if (OB_UNLIKELY(!serial_final_seq_no_.is_valid())) {
           ret = OB_ERR_UNEXPECTED;
-          TRANS_LOG(ERROR, "parallel replay an serial log", KR(ret), KPC(this));
+          TRANS_LOG(ERROR, "serial_final_seq_no is invalid", KR(ret), KPC(this));
 #ifdef ENABLE_DEBUG_LOG
           ob_abort();
 #endif
+        } else {
+          // need to push up the callback_list.0's checksum_scn
+          // to avoid it calculate checksum includes those callbacks
+          callback_list_.inc_update_checksum_scn(SCN::scn_inc(serial_final_scn_));
+          ATOMIC_STORE(&has_branch_replayed_into_first_list_, true);
+          TRANS_LOG(INFO, "replay log before serial final when reach serial final",
+                    KPC(this), KPC(head));
         }
-        if (OB_SUCC(ret) && OB_UNLIKELY(!has_branch_replayed_into_first_list_)) {
-          // sanity check: the serial_final_seq_no must be set
-          // which will be used in replay `rollback branch savepoint` log
-          if (OB_UNLIKELY(!serial_final_seq_no_.is_valid())) {
-            ret = OB_ERR_UNEXPECTED;
-            TRANS_LOG(ERROR, "serial_final_seq_no is invalid", KR(ret), KPC(this));
-#ifdef ENABLE_DEBUG_LOG
-            ob_abort();
-#endif
-          } else {
-            // need to push up the callback_list.0's checksum_scn
-            // to avoid it calculate checksum includes those callbacks
-            callback_list_.inc_update_checksum_scn(SCN::scn_inc(serial_final_scn_));
-            ATOMIC_STORE(&has_branch_replayed_into_first_list_, true);
-            TRANS_LOG(INFO, "replay log before serial final when reach serial final",
-                      KPC(this), KPC(head));
-          }
-        }
-        slot = 0;
       }
+      slot = 0;
+    }
 
-      // Step2: register or replay
-      if (OB_FAIL(ret)) {
-      } else if (OB_LIKELY(slot == 0)) {
-        // no parallel and no branch requirement
-        ret = callback_list_.append_callback(head,
-                                             tail,
-                                             length,
-                                             for_replay_,
-                                             parallel_replay_,
-                                             is_serial_final_());
-        // try to extend callback_lists_ if required
-      } else if (!callback_lists_ && OB_FAIL(extend_callback_lists_(MAX_CALLBACK_LIST_COUNT - 1))) {
-        TRANS_LOG(WARN, "extend callback lists failed", K(ret));
-      } else {
-        ret = callback_lists_[slot - 1].append_callback(head,
-                                                        tail,
-                                                        length,
-                                                        for_replay_,
-                                                        parallel_replay_,
-                                                        is_serial_final_());
-      }
-    } else if (!for_replay_) {
-      ret = OB_ERR_UNEXPECTED;
-      TRANS_LOG(ERROR, "write by older version", K(ret), K(seq_no), KPC(this));
-#ifdef ENABLE_DEBUG_LOG
-      ob_abort();
-#endif
-    } else {
-      // for replay, before version 4.2.4
+    // Step2: register or replay
+    if (OB_FAIL(ret)) {
+    } else if (OB_LIKELY(slot == 0)) {
+      // no parallel and no branch requirement
       ret = callback_list_.append_callback(head,
                                            tail,
                                            length,
                                            for_replay_,
                                            parallel_replay_,
-                                           true /*is_serial_final*/);
-      add_main_list_append_cnt();
+                                           is_serial_final_());
+      // try to extend callback_lists_ if required
+    } else if (!callback_lists_ && OB_FAIL(extend_callback_lists_(MAX_CALLBACK_LIST_COUNT - 1))) {
+      TRANS_LOG(WARN, "extend callback lists failed", K(ret));
+    } else {
+      ret = callback_lists_[slot - 1].append_callback(head,
+                                                      tail,
+                                                      length,
+                                                      for_replay_,
+                                                      parallel_replay_,
+                                                      is_serial_final_());
     }
 
     // Step3: revert the side effect if the append failed
@@ -572,43 +559,35 @@ int ObTransCallbackMgr::rollback_to(const ObTxSEQ to_seq_no,
   int ret = OB_SUCCESS;
   int slot = -1;
   remove_cnt = callback_remove_for_rollback_to_count_;
-  if (OB_LIKELY(to_seq_no.support_branch())) { // since 4.2.4
-    // it is a global savepoint, rollback on all list
-    if (to_seq_no.get_branch() == 0) {
-      CALLBACK_LISTS_FOREACH(idx, list) {
-        slot = idx;
-        ret = list->remove_callbacks_for_rollback_to(to_seq_no, from_seq_no, replay_scn);
-      }
-    } else {
-      // it is a branch level savepoint, rollback on list contains the branch
-      slot = to_seq_no.get_branch() % MAX_CALLBACK_LIST_COUNT;
-      if (slot == 0) {
-        ret = callback_list_.remove_callbacks_for_rollback_to(to_seq_no, from_seq_no, replay_scn);
-      } else if (callback_lists_) {
-        ret = callback_lists_[slot - 1].remove_callbacks_for_rollback_to(to_seq_no, from_seq_no, replay_scn);
-      } else { /*callback_lists_ is empty, no need do rollback */ }
-      // _NOTE_
-      // if branch level savepoint with `to_seq_no` before serial_final log, the branch maybe replayed
-      // into first callback-list when recovery with scn after serial final log (see ObTransCallbackMgr::append)
-      // hence, we need try rollback on it
-      if (OB_SUCC(ret)
-          && for_replay_
-          && slot > 0
-          && OB_UNLIKELY(has_branch_replayed_into_first_list_)
-          && to_seq_no.get_seq() <= serial_final_seq_no_.get_seq()) {
-        ret = callback_list_.remove_callbacks_for_rollback_to(to_seq_no, from_seq_no, replay_scn);
-        TRANS_LOG(INFO, "replay branch savepoint cross serial final",
-                  KPC(this), K(replay_scn), K(to_seq_no), K(from_seq_no));
-      }
-    }
-  } else if (!for_replay_) {
+  // it is a global savepoint, rollback on all list
+  if (OB_UNLIKELY(!to_seq_no.is_valid())) {
     ret = OB_ERR_UNEXPECTED;
-    TRANS_LOG(ERROR, "leader rollback to with old version", K(ret), K(to_seq_no), KPC(this));
-#ifdef ENABLE_DEBUG_LOG
-    ob_abort();
-#endif
-  } else { // for replay, before 4.2.4
-    ret = callback_list_.remove_callbacks_for_rollback_to(to_seq_no, from_seq_no, replay_scn);
+  } else if (to_seq_no.get_branch() == 0) {
+    CALLBACK_LISTS_FOREACH(idx, list) {
+      slot = idx;
+      ret = list->remove_callbacks_for_rollback_to(to_seq_no, from_seq_no, replay_scn);
+    }
+  } else {
+    // it is a branch level savepoint, rollback on list contains the branch
+    slot = to_seq_no.get_branch() % MAX_CALLBACK_LIST_COUNT;
+    if (slot == 0) {
+      ret = callback_list_.remove_callbacks_for_rollback_to(to_seq_no, from_seq_no, replay_scn);
+    } else if (callback_lists_) {
+      ret = callback_lists_[slot - 1].remove_callbacks_for_rollback_to(to_seq_no, from_seq_no, replay_scn);
+    } else { /*callback_lists_ is empty, no need do rollback */ }
+    // _NOTE_
+    // if branch level savepoint with `to_seq_no` before serial_final log, the branch maybe replayed
+    // into first callback-list when recovery with scn after serial final log (see ObTransCallbackMgr::append)
+    // hence, we need try rollback on it
+    if (OB_SUCC(ret)
+        && for_replay_
+        && slot > 0
+        && OB_UNLIKELY(has_branch_replayed_into_first_list_)
+        && to_seq_no.get_seq() <= serial_final_seq_no_.get_seq()) {
+      ret = callback_list_.remove_callbacks_for_rollback_to(to_seq_no, from_seq_no, replay_scn);
+      TRANS_LOG(INFO, "replay branch savepoint cross serial final",
+                KPC(this), K(replay_scn), K(to_seq_no), K(from_seq_no));
+    }
   }
   if (OB_FAIL(ret)) {
     TRANS_LOG(WARN, "rollback to fail", K(ret), K(slot), K(from_seq_no), K(to_seq_no));

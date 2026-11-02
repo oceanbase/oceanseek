@@ -137,6 +137,11 @@ int ObTxCtxTableInfo::deserialize_(const char *buf,
 {
   int ret = OB_SUCCESS;
 
+  // Recovery reuses this object after reset(), which sets the cursor to -1.
+  // Missing trailing fields must instead mean "no applied entry cursor";
+  // a present field will overwrite this sentinel during deserialization.
+  exec_info_.max_applied_entry_no_ = INT64_MIN;
+
   if (OB_FAIL(tx_id_.deserialize(buf, buf_len, pos))) {
     TRANS_LOG(WARN, "deserialize tx_id fail.", KR(ret), K(pos), K(buf_len));
   } else if (OB_FAIL(ls_id_.deserialize(buf, buf_len, pos))) {
@@ -149,29 +154,17 @@ int ObTxCtxTableInfo::deserialize_(const char *buf,
     TRANS_LOG(WARN, "deserialize exec_info fail.", KR(ret), K(pos), K(buf_len));
   } else if (OB_FAIL(table_lock_info_.deserialize(buf, buf_len, pos))) {
     TRANS_LOG(WARN, "deserialize exec_info fail.", KR(ret), K(pos), K(buf_len));
-  }
-  if (OB_SUCC(ret) && compatible_version_ < ObTxCtxTableMeta::VERSION_2) {
-    // ObTxExecInfo uses trailing-member compatibility, so explicitly preserve
-    // whether the applied entry cursor was absent from an old checkpoint.
-    exec_info_.max_applied_entry_no_ = INT64_MIN;
-  }
-  // _NOTE_
-  // before 4.2.1.1, the serialize size of table_lock_info_
-  // is not accurate(which larger than real serialize size),
-  // this caused the size of ObTxCtxTableInfo is also inaccurate
-  //
-  // when deserialize use `compatible_version_` to decide whether
-  // guess extra members by examine remain buf size
-  if (OB_SUCC(ret) && compatible_version_ >= ObTxCtxTableMeta::VERSION_1 && buf_len > pos) {
-    // has remains, continue to deserialize new members
-    if (OB_FAIL(serialization::decode_vi64(buf, buf_len, pos, (int64_t*)&cluster_version_))) {
-      TRANS_LOG(WARN, "dencode cluster_version fail", K(buf_len), K(pos), K(ret));
-    } else if (cluster_version_ && cluster_version_ < CLUSTER_VERSION_4_0_0_0) {
-      // sanity-check: the decoded version is valid, since v_4_x will not replay
-      // redo of less than or equals to v_3_x, the cluster version must be v_4_x
-      ret = OB_ERR_UNEXPECTED;
-      TRANS_LOG(ERROR, "cluster version malformed", K(cluster_version_), KPC(this));
-    }
+  } else if (OB_FAIL(serialization::decode_vi64(buf, buf_len, pos, (int64_t*)&cluster_version_))) {
+    // Writers within the 4.6.1 baseline always serialize cluster_version_,
+    // including VERSION_1 writers before the applied-entry cursor was added.
+    // The meta format version alone does not identify the product version;
+    // a payload missing this member is outside the supported baseline.
+    TRANS_LOG(WARN, "decode cluster_version fail", K(buf_len), K(pos), K(ret));
+  } else if (cluster_version_ && cluster_version_ < CLUSTER_VERSION_4_0_0_0) {
+    // sanity-check: the decoded version is valid, since v_4_x will not replay
+    // redo of less than or equals to v_3_x, the cluster version must be v_4_x
+    ret = OB_ERR_UNEXPECTED;
+    TRANS_LOG(ERROR, "cluster version malformed", K(cluster_version_), KPC(this));
   }
   return ret;
 }
@@ -287,8 +280,22 @@ int ObTxCtxTableMeta::deserialize_(const char* buf, const int64_t buf_len, int64
       TRANS_LOG(WARN, "deserialize version fail.", KR(ret), K(pos), K(buf_len));
     }
   } else {
-    version_ = VERSION_0; // VERSION_0 without version field serialized
+    // VERSION_0 metas carry no version field and were only written before the
+    // 4.6.1 baseline; reject them instead of guessing a version.
+    ret = OB_VERSION_NOT_MATCH;
+    TRANS_LOG(WARN, "tx ctx table meta without version field is below the 4.6.1 baseline",
+              KR(ret), K(pos), K(buf_len));
   }
+  if (OB_SUCC(ret) && version_ < VERSION_1) {
+    // VERSION_0 layouts are below the 4.6.1 baseline; reject them.
+    ret = OB_VERSION_NOT_MATCH;
+    TRANS_LOG(WARN, "tx ctx table meta version is below the 4.6.1 baseline",
+              KR(ret), K_(version), K(pos), K(buf_len));
+  }
+  // VERSION_1 was also written within the 4.6.1 baseline, before
+  // max_applied_entry_no_ was appended to ObTxExecInfo. This does not admit
+  // every historical VERSION_1 payload. ObTxCtxTableInfo::deserialize_ sets
+  // the missing-field sentinel before decoding, including after reset().
   return ret;
 }
 

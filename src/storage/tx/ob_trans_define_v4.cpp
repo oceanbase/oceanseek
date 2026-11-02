@@ -164,7 +164,7 @@ DEF_TO_STRING(ObTxSavePoint)
   return pos;
 }
 OB_SERIALIZE_MEMBER(ObTxExecResult, incomplete_, parts_,
-                    conflict_txs_,// FARM COMPAT WHITELIST for cflict_txs_
+                    legacy_conflict_txs_, // FARM COMPAT WHITELIST: original conflict_txs_ wire slot.
                     conflict_info_array_,
                     touched_ls_list_);
 OB_SERIALIZE_MEMBER(ObTxSnapshot, tx_id_, version_, scn_, elr_, force_strongly_read_);
@@ -252,7 +252,7 @@ int ObTxReadSnapshot::refresh_seq_no(const int64_t tx_seq_base)
     ret = OB_INVALID_ARGUMENT;
     TRANS_LOG(WARN, "tx_seq_base invalid", K(ret), K(tx_seq_base));
   } else {
-    core_.scn_ = core_.scn_.clone_with_seq(ObSequence::get_max_seq_no(), tx_seq_base);
+    ret = core_.scn_.clone_with_seq(ObSequence::get_max_seq_no(), tx_seq_base, core_.scn_);
   }
   return ret;
 }
@@ -442,7 +442,6 @@ ObTxDesc::ObTxDesc()
     last_branch_id_(0),
     parts_(),
     savepoints_(),
-    conflict_txs_(),
     conflict_info_array_(),
     coord_id_(),
     commit_expire_ts_(0),
@@ -492,7 +491,6 @@ int ObTxDesc::switch_to_idle()
   finish_ts_ = 0;
   active_scn_.reset();
   parts_.reset();
-  conflict_txs_.reset();
   coord_id_.reset();
   commit_parts_.reset();
   commit_version_.reset();
@@ -598,7 +596,6 @@ void ObTxDesc::reset()
   last_branch_id_ = 0;
   parts_.reset();
   savepoints_.reset();
-  conflict_txs_.reset();
   conflict_info_array_.reset();
 
   coord_id_.reset();
@@ -785,16 +782,21 @@ int ObTxDesc::update_part_(ObTxPart &a, const bool append, const bool check_only
      * to enable recognizing it is first stmt
      */
     active_scn_ = get_tx_seq();
+    if (!active_scn_.is_valid()) {
+      ret = OB_ERR_UNEXPECTED;
+    }
   }
 
-  if (!hit) {
+  if (OB_SUCC(ret) && !hit) {
     if (append) {
       a.last_touch_ts_ = exec_info_reap_ts_ + 1;
       if (OB_FAIL(parts_.push_back(a))) {
         flags_.PARTS_INCOMPLETE_ = true;
         TRANS_LOG(WARN, "push fail, set incomplete", K(ret), K_(parts), K(a));
       } else {
-        implicit_start_tx_();
+        if (OB_FAIL(implicit_start_tx_())) {
+          parts_.pop_back();
+        }
       }
     } else {
       ret = OB_ENTRY_NOT_EXIST;
@@ -822,7 +824,7 @@ int ObTxDesc::update_clean_part(const share::ObLSID &id,
   p.addr_ = addr;
   p.first_scn_ = ObTxSEQ::MAX_VAL();
   p.last_scn_ = get_tx_seq();
-  return update_part_(p, false);
+  return p.last_scn_.is_valid() ? update_part_(p, false) : OB_ERR_UNEXPECTED;
 }
 
 int ObTxDesc::add_clean_part_if_absent(const share::ObLSID &id,
@@ -842,7 +844,7 @@ int ObTxDesc::add_clean_part_if_absent(const share::ObLSID &id,
   if (is_dup) {
     p.flag_.set_dup_ls();
   }
-  return update_part_(p, true, true);
+  return cur_seq.is_valid() ? update_part_(p, true, true) : OB_ERR_UNEXPECTED;
 }
 
 /*
@@ -878,16 +880,23 @@ int ObTxDesc::update_parts(const share::ObLSArray &list)
   return ret;
 }
 
-void ObTxDesc::implicit_start_tx_()
+int ObTxDesc::implicit_start_tx_()
 {
+  int ret = OB_SUCCESS;
   if (parts_.count() > 0 && state_ == ObTxDesc::State::IDLE) {
-    state_ = ObTxDesc::State::IMPLICIT_ACTIVE;
-    active_ts_ = ObClockGenerator::getClock();
-    expire_ts_ = get_expire_ts();
-    active_scn_ = get_tx_seq();
-    state_change_flags_.mark_all();
-    TX_STAT_START_INC;
+    const ObTxSEQ seq = get_tx_seq();
+    if (!seq.is_valid()) {
+      ret = OB_ERR_UNEXPECTED;
+    } else {
+      state_ = ObTxDesc::State::IMPLICIT_ACTIVE;
+      active_ts_ = ObClockGenerator::getClock();
+      expire_ts_ = get_expire_ts();
+      active_scn_ = seq;
+      state_change_flags_.mark_all();
+      TX_STAT_START_INC;
+    }
   }
+  return ret;
 }
 
 int64_t ObTxDesc::get_expire_ts() const
@@ -950,7 +959,7 @@ int ObTxDesc::merge_exec_info_with(const ObTxDesc &src)
     flags_.PARTS_INCOMPLETE_ = true;
     TRANS_LOG(WARN, "src is incomplete, set dest incomplete also", K(ret), K(src));
   }
-  (void) merge_conflict_info_array_(src.conflict_info_array_, src.conflict_txs_);
+  (void) merge_conflict_info_array_(src.conflict_info_array_);
 
   return ret;
 }
@@ -973,11 +982,9 @@ int ObTxDesc::get_inc_exec_info(ObTxExecResult &exec_info)
     }
     exec_info_reap_ts_ += 1;
   }
-  (void) exec_info.merge_conflict_info_array(conflict_info_array_, conflict_txs_);
-  (void) exec_info.conver_conflict_info_to_old_version_if_need();
-  DETECT_LOG(TRACE, "merge conflict txs to exec result", K_(conflict_info_array), K_(conflict_txs), K(exec_info));
+  (void) exec_info.merge_conflict_info_array(conflict_info_array_);
+  DETECT_LOG(TRACE, "merge conflict txs to exec result", K_(conflict_info_array), K(exec_info));
   conflict_info_array_.reset();
-  conflict_txs_.reset();
   return ret;
 }
 
@@ -992,7 +999,7 @@ int ObTxDesc::add_exec_info(const ObTxExecResult &exec_info)
     flags_.PARTS_INCOMPLETE_ = true;
     TRANS_LOG(WARN, "exec_info is incomplete set incomplete also", K(ret), K(exec_info));
   }
-  (void) merge_conflict_info_array_(exec_info.conflict_info_array_, exec_info.conflict_txs_);
+  (void) merge_conflict_info_array_(exec_info.conflict_info_array_);
   DETECT_LOG(TRACE, "add exec result conflict txs to desc", K(conflict_info_array_), K(exec_info));
   return ret;
 }
@@ -1155,16 +1162,6 @@ void ObTxDesc::release_implicit_savepoint(const ObTxSEQ savepoint)
   }
 }
 
-int ObTxDesc::fetch_conflict_txs_array(ObIArray<ObTransIDAndAddr> &array) {
-  int ret = OB_SUCCESS;
-  ObSpinLockGuard guard(lock_);
-  if (OB_FAIL(array.assign(conflict_txs_))) {
-    DETECT_LOG(WARN, "fail to assign conflict_txs_", KR(ret), KPC(this));
-  }
-  conflict_txs_.reset();
-  return ret;
-}
-
 int ObTxDesc::fetch_conflict_info_array(ObIArray<storage::ObRowConflictInfo> &array) {
   int ret = OB_SUCCESS;
   ObSpinLockGuard guard(lock_);
@@ -1211,39 +1208,13 @@ int ObTxDesc::add_conflict_info_(const storage::ObRowConflictInfo &conflict_info
   return ret;
 }
 
-int ObTxDesc::add_conflict_info_(const ObTransIDAndAddr &conflict_tx) {
-  int ret = OB_SUCCESS;
-  if (conflict_txs_.count() >= MAX_RESERVED_CONFLICT_TX_NUM) {
-    ret = OB_SIZE_OVERFLOW;
-    int64_t max_reserved_conflict_tx_num = MAX_RESERVED_CONFLICT_TX_NUM;
-    DETECT_LOG(WARN, "too many conflict tx", K(max_reserved_conflict_tx_num), K(conflict_info_array_), K(conflict_tx));
-  } else {
-    int64_t idx = 0;
-    for (; idx < conflict_txs_.count(); ++idx) {
-      if (conflict_txs_[idx].scheduler_addr_ == conflict_tx.scheduler_addr_ &&
-          conflict_txs_[idx].tx_id_ == conflict_tx.tx_id_) {
-        DETECT_LOG(INFO, "drop repeated conflict tx", K(conflict_txs_[idx]), K(conflict_tx));
-        break;
-      }
-    }
-    if (idx == conflict_txs_.count() && OB_FAIL(conflict_txs_.push_back(conflict_tx))) {
-      DETECT_LOG(WARN, "fail to push conflict info to conflict_txs_", K(ret), K(conflict_txs_), K(conflict_tx));
-    } else {
-      DETECT_LOG(TRACE, "push conflict info to conflict_txs_", K(ret), K(conflict_txs_), K(conflict_tx));
-    }
-  }
-  return ret;
-}
-
-int ObTxDesc::merge_conflict_info_array(const ObIArray<storage::ObRowConflictInfo> &array,
-                                        const ObIArray<ObTransIDAndAddr> &array_old)
+int ObTxDesc::merge_conflict_info_array(const ObIArray<storage::ObRowConflictInfo> &array)
 {
   ObSpinLockGuard guard(lock_);
-  return merge_conflict_info_array_(array, array_old);
+  return merge_conflict_info_array_(array);
 }
 
-int ObTxDesc::merge_conflict_info_array_(const ObIArray<storage::ObRowConflictInfo> &array,
-                                         const ObIArray<ObTransIDAndAddr> &array_old)
+int ObTxDesc::merge_conflict_info_array_(const ObIArray<storage::ObRowConflictInfo> &array)
 {
   int ret = OB_SUCCESS;
   int tmp_ret = OB_SUCCESS;
@@ -1253,14 +1224,6 @@ int ObTxDesc::merge_conflict_info_array_(const ObIArray<storage::ObRowConflictIn
                        K(tmp_ret), K(conflict_info_array_), K(array.at(idx)));
     } else {
       DETECT_LOG(TRACE, "merge conflict info", K(conflict_info_array_), K((array.at(idx))));
-    }
-  }
-  for (int64_t idx = 0; idx < array_old.count() && OB_SUCC(tmp_ret); ++idx) {
-    if (OB_TMP_FAIL(add_conflict_info_(array_old.at(idx)))) {
-      DETECT_LOG(WARN, "fail to add conflict tx to conflict_info_array",
-                       K(tmp_ret), K(conflict_txs_), K(array_old.at(idx)));
-    } else {
-      DETECT_LOG(TRACE, "merge conflict info", K(conflict_txs_), K((array_old.at(idx))));
     }
   }
   return ret;
@@ -1577,7 +1540,7 @@ ObTxExecResult::ObTxExecResult()
     incomplete_(false),
     touched_ls_list_(OB_MALLOC_NORMAL_BLOCK_SIZE, allocator_),
     parts_(OB_MALLOC_NORMAL_BLOCK_SIZE, allocator_),
-    conflict_txs_(OB_MALLOC_NORMAL_BLOCK_SIZE, allocator_),
+    legacy_conflict_txs_(OB_MALLOC_NORMAL_BLOCK_SIZE, allocator_),
     conflict_info_array_(OB_MALLOC_NORMAL_BLOCK_SIZE, allocator_)
 {}
 
@@ -1591,7 +1554,7 @@ void ObTxExecResult::reset()
   incomplete_ = false;
   touched_ls_list_.reset();
   parts_.reset();
-  conflict_txs_.reset();
+  legacy_conflict_txs_.reset();
   conflict_info_array_.reset();
   allocator_.reset();
 }
@@ -1645,7 +1608,7 @@ int ObTxExecResult::merge_result(const ObTxExecResult &r)
     incomplete_ = true;
     TRANS_LOG(WARN, "merge touched_ls_list fail, set incomplete", K(ret), KPC(this));
   }
-  (void) merge_conflict_info_array(r.conflict_info_array_, r.conflict_txs_);
+  (void) merge_conflict_info_array(r.conflict_info_array_);
   if (incomplete_) {
     TRANS_LOG(TRACE, "tx result incomplete:", KP(this));
   }
@@ -1654,8 +1617,7 @@ int ObTxExecResult::merge_result(const ObTxExecResult &r)
   return ret;
 }
 
-void ObTxExecResult::merge_conflict_info_array(const common::ObIArray<storage::ObRowConflictInfo> &array,
-                                               const ObIArray<ObTransIDAndAddr> &array_old)
+void ObTxExecResult::merge_conflict_info_array(const common::ObIArray<storage::ObRowConflictInfo> &array)
 {
   int ret = OB_SUCCESS;
   // merge new array
@@ -1678,39 +1640,6 @@ void ObTxExecResult::merge_conflict_info_array(const common::ObIArray<storage::O
       DETECT_LOG(TRACE, "merge conflict info result", KPC(this), K(array));
     }
   }
-  // merge old array
-  for (int64_t idx1 = 0; idx1 < array_old.count() && OB_SUCC(ret); ++idx1) {
-    int64_t idx2 = 0;
-    for (; idx2 < conflict_txs_.count(); ++idx2) {// check if tx is already exist
-      if (conflict_txs_[idx2].scheduler_addr_ == array_old.at(idx1).scheduler_addr_ &&
-          conflict_txs_[idx2].tx_id_ == array_old.at(idx1).tx_id_) {
-        break;
-      }
-    }
-    if (idx2 == conflict_txs_.count()) {
-      if (OB_FAIL(conflict_txs_.push_back(ObTransIDAndAddr(array_old.at(idx1).tx_id_,
-                                          array_old.at(idx1).scheduler_addr_)))) {
-        DETECT_LOG(WARN, "push fail", KR(ret), KPC(this), K(array_old));
-      }
-    }
-  }
-  if (OB_SUCC(ret)) {
-    if (!array_old.empty()) {
-      DETECT_LOG(TRACE, "merge old conflict info result", KP(this), K(array_old));
-    }
-  }
-}
-
-void ObTxExecResult::conver_conflict_info_to_old_version_if_need()
-{
-  int ret = OB_SUCCESS;
-  if (!share::detector::ObDeadLockDetectorMgr::is_new_deadlock_logic()) {
-    for (int64_t idx = 0; idx < conflict_info_array_.count() && OB_SUCC(ret); ++idx) {
-      ret = conflict_txs_.push_back(ObTransIDAndAddr(conflict_info_array_.at(idx).conflict_tx_id_,
-                                                     conflict_info_array_.at(idx).conflict_tx_scheduler_));
-    }
-    conflict_info_array_.reset();
-  }
 }
 
 int ObTxExecResult::assign(const ObTxExecResult &r)
@@ -1724,7 +1653,7 @@ int ObTxExecResult::assign(const ObTxExecResult &r)
     incomplete_ = true;
     TRANS_LOG(WARN, "assign touched_ls_list fail, set incomplete", K(ret), KPC(this));
   }
-  conflict_txs_.assign(r.conflict_txs_);
+  legacy_conflict_txs_.reset();
   conflict_info_array_.assign(r.conflict_info_array_);
   return ret;
 }

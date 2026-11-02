@@ -4,6 +4,9 @@
  */
 
 #include <gtest/gtest.h>
+#include <cerrno>
+#include <cstdlib>
+#include <sys/wait.h>
 
 #define protected public
 #define private public
@@ -77,10 +80,19 @@ int ObSimpleServerRestartHelper::run()
   } else {
     // parent process
     int status = 0;
-    wait(&status);
-    if (0 != status) {
-      fprintf(stdout, "Child process exit with error code : %d\n", status);
-      ret = status;
+    pid_t waited_pid;
+    do {
+      waited_pid = waitpid(child_pid, &status, 0);
+    } while (waited_pid == -1 && errno == EINTR);
+    if (waited_pid == -1) {
+      perror("waitpid");
+      return EXIT_FAILURE;
+    } else if (!WIFEXITED(status)) {
+      fprintf(stdout, "Child process terminated abnormally, wait status : %d\n", status);
+      return EXIT_FAILURE;
+    } else if (0 != WEXITSTATUS(status)) {
+      ret = WEXITSTATUS(status);
+      fprintf(stdout, "Child process exit with error code : %d\n", ret);
       return ret;
     } else {
       fprintf(stdout, "Child process run all test cases done. child ret = %d \n", status);

@@ -37,6 +37,7 @@ tx_unittest(test_ob_trans_hashmap)
 
 storage_unittest(test_ob_black_list)
 storage_unittest(test_ob_tx_log)
+storage_unittest(test_ob_tx_seq)
 storage_unittest(test_ob_timestamp_service)
 storage_unittest(test_ob_trans_rpc)
 storage_unittest(test_ob_tx_msg)

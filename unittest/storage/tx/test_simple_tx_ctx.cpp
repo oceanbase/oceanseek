@@ -150,7 +150,8 @@ TEST_F(TestMockObTxCtx, abort_watermark_serialization_compatibility)
   char buf[4096];
   Ob2pcAbortRespMsg msg;
   EXPECT_FALSE(msg.max_abort_log_scn_.is_valid());
-  msg.cluster_version_ = CLUSTER_VERSION_4_1_0_1 + 1; // boxed wire format
+  // The 4.6.1 baseline uses the boxed format; pre-box compatibility was removed.
+  msg.cluster_version_ = CLUSTER_VERSION_4_6_1_0;
   ASSERT_EQ(OB_SUCCESS, msg.max_abort_log_scn_.convert_for_tx(200));
   int64_t pos = 0;
   ASSERT_EQ(OB_SUCCESS, msg.serialize(buf, sizeof(buf), pos));
@@ -180,18 +181,6 @@ TEST_F(TestMockObTxCtx, abort_watermark_serialization_compatibility)
   ASSERT_EQ(OB_SUCCESS, old_decoded.deserialize(buf, old_len, pos));
   EXPECT_EQ(old_len, pos);
   EXPECT_FALSE(old_decoded.max_abort_log_scn_.is_valid());
-
-  // Preserve the pre-box wire layout as well.
-  msg.cluster_version_ = CLUSTER_VERSION_4_1_0_1;
-  pos = 0;
-  ASSERT_EQ(OB_SUCCESS, msg.serialize(buf, sizeof(buf), pos));
-  const int64_t v1_len = pos;
-  EXPECT_EQ(msg.ObTxMsg::get_serialize_size(), v1_len);
-  Ob2pcAbortRespMsg v1_decoded;
-  pos = 0;
-  ASSERT_EQ(OB_SUCCESS, v1_decoded.deserialize(buf, v1_len, pos));
-  EXPECT_EQ(v1_len, pos);
-  EXPECT_FALSE(v1_decoded.max_abort_log_scn_.is_valid());
 }
 
 class WatermarkTxCtx : public MockObTxCtx

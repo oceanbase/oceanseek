@@ -51,15 +51,15 @@ struct TestCallback : public memtable::ObITransCallback {
 inline share::SCN mock_scn(int64_t val) { share::SCN scn; scn.convert_for_gts(val); return scn; }
 
 TEST_F(TestTxCallbackHashHolderHelper, insert) {
-  TestCallback head(RowHolderInfo(ObTransID(1), ObTxSEQ::mk_v0(1), mock_scn(5)));
+  TestCallback head(RowHolderInfo(ObTransID(1), ObTxSEQ(1, 0), mock_scn(5)));
   ObTxCallbackHashHolderList list;
   ASSERT_EQ(list.insert_callback(&head.get_hash_holder_linker(), false), OB_SUCCESS);
   ASSERT_EQ(list.size(), 1);
-  TestCallback callback1(RowHolderInfo(ObTransID(1), ObTxSEQ::mk_v0(1), mock_scn(4)));
+  TestCallback callback1(RowHolderInfo(ObTransID(1), ObTxSEQ(1, 0), mock_scn(4)));
   ASSERT_EQ(list.insert_callback(&callback1.get_hash_holder_linker(), false), OB_SUCCESS);
-  TestCallback callback2(RowHolderInfo(ObTransID(1), ObTxSEQ::mk_v0(1), mock_scn(7)));
+  TestCallback callback2(RowHolderInfo(ObTransID(1), ObTxSEQ(1, 0), mock_scn(7)));
   ASSERT_EQ(list.insert_callback(&callback2.get_hash_holder_linker(), false), OB_SUCCESS);
-  TestCallback callback3(RowHolderInfo(ObTransID(1), ObTxSEQ::mk_v0(1), mock_scn(5)));
+  TestCallback callback3(RowHolderInfo(ObTransID(1), ObTxSEQ(1, 0), mock_scn(5)));
   ASSERT_EQ(list.insert_callback(&callback3.get_hash_holder_linker(), false), OB_SUCCESS);
   ASSERT_EQ(list.head(), &callback2.get_hash_holder_linker());
   ASSERT_EQ(list.head()->older_node_, &callback3.get_hash_holder_linker());
@@ -68,15 +68,15 @@ TEST_F(TestTxCallbackHashHolderHelper, insert) {
 }
 
 TEST_F(TestTxCallbackHashHolderHelper, reverse_insert) {
-  TestCallback head(RowHolderInfo(ObTransID(1), ObTxSEQ::mk_v0(1), mock_scn(5)));
+  TestCallback head(RowHolderInfo(ObTransID(1), ObTxSEQ(1, 0), mock_scn(5)));
   ObTxCallbackHashHolderList list;
   ASSERT_EQ(list.insert_callback(&head.get_hash_holder_linker(), false), OB_SUCCESS);
   ASSERT_EQ(list.size(), 1);
-  TestCallback callback1(RowHolderInfo(ObTransID(1), ObTxSEQ::mk_v0(1), mock_scn(4)));
+  TestCallback callback1(RowHolderInfo(ObTransID(1), ObTxSEQ(1, 0), mock_scn(4)));
   ASSERT_EQ(list.insert_callback(&callback1.get_hash_holder_linker(), true), OB_SUCCESS);
-  TestCallback callback2(RowHolderInfo(ObTransID(1), ObTxSEQ::mk_v0(1), mock_scn(7)));
+  TestCallback callback2(RowHolderInfo(ObTransID(1), ObTxSEQ(1, 0), mock_scn(7)));
   ASSERT_EQ(list.insert_callback(&callback2.get_hash_holder_linker(), true), OB_SUCCESS);
-  TestCallback callback3(RowHolderInfo(ObTransID(1), ObTxSEQ::mk_v0(1), mock_scn(5)));
+  TestCallback callback3(RowHolderInfo(ObTransID(1), ObTxSEQ(1, 0), mock_scn(5)));
   ASSERT_EQ(list.insert_callback(&callback3.get_hash_holder_linker(), true), OB_SUCCESS);
   ASSERT_EQ(list.head(), &callback2.get_hash_holder_linker());
   ASSERT_EQ(list.head()->older_node_, &callback3.get_hash_holder_linker());
@@ -89,7 +89,7 @@ TEST_F(TestTxCallbackHashHolderHelper, random_insert_and_erase) {
   ASSERT_EQ(OB_SUCCESS, mapper.init());
   vector<TestCallback> callback_vec;
   for (int64_t idx = 0; idx < 100; ++idx) {
-    callback_vec.emplace_back(RowHolderInfo{ObTransID(idx), ObTxSEQ::mk_v0(idx + 1), mock_scn(idx)});
+    callback_vec.emplace_back(RowHolderInfo{ObTransID(idx), ObTxSEQ(idx + 1, 0), mock_scn(idx)});
   }
   vector<int> idx_vec;
   for (int64_t idx = 0; idx < 100; ++idx) {

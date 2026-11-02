@@ -223,7 +223,7 @@ TEST_F(TestMdsTableUnit, build_mds_tx_node_returns_copy_error)
               nullptr /*mds_meta*/,
               blocksstable::ObDmlFlag::DF_INSERT,
               /*memstore_version*/ 0,
-              ObTxSEQ::mk_v0(1),
+              ObTxSEQ(1, 0),
               /*write_epoch*/ 0,
               /*column_cnt*/ 1);
 
@@ -432,7 +432,7 @@ TEST_F(TestMdsTableUnit, tx_node_arg_mds_value)
               nullptr /*mds_meta*/,
               blocksstable::ObDmlFlag::DF_INSERT,
               /*memstore_version*/ 0,
-              ObTxSEQ::mk_v0(1),
+              ObTxSEQ(1, 0),
               /*write_epoch*/ 0,
               /*column_cnt*/ 1);
 
@@ -456,7 +456,7 @@ TEST_F(TestMdsTableUnit, tx_node_arg_no_mds_value)
               nullptr /*mds_meta*/,
               blocksstable::ObDmlFlag::DF_INSERT,
               0,
-              ObTxSEQ::mk_v0(1),
+              ObTxSEQ(1, 0),
               0,
               1);
   EXPECT_TRUE(arg.is_mds_write_);

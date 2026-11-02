@@ -1728,7 +1728,9 @@ public:
   }
 public:
   int generate_mds_buffer_ctx_array();
-  void mrege_buffer_ctx_array_to_multi_data_source() const;
+  // Moves BufferCtx ownership from mds_buffer_ctx_array_ into multi_data_source_.
+  // Requires array sizes to match; clears mds_buffer_ctx_array_ on success or failure.
+  int merge_buffer_ctx_array_to_multi_data_source();
   void clear_buffer_ctx_in_multi_data_source();
   void reset();
   // can not destroy in tx_ctx_table
@@ -1802,8 +1804,9 @@ public:
   int64_t trans_type_;
   int64_t next_log_entry_no_;
   // The greatest logical entry number whose log callback or replay has completed.
-  // -1 is a new-format checkpoint without an applied entry; INT64_MIN means
-  // that an old checkpoint did not contain this trailing field.
+  // -1 means no entry has been applied. INT64_MIN is the in-memory default
+  // and the sentinel for accepted VERSION_1 checkpoints missing this field.
+  // Versionless and VERSION_0 metadata are rejected by the checkpoint gate.
   int64_t max_applied_entry_no_;
   share::SCN max_applied_log_ts_;
   share::SCN max_applying_log_ts_;
