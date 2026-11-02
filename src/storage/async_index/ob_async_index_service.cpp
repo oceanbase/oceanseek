@@ -749,6 +749,7 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
         // Delete-old carries every partition routing column, so keep the normal
         // PARTITION_RANGE/RANGE/SORT DDL path enabled.
         task_param.is_partition_local_  = false;
+        task_param.is_delete_index_     = index_info->is_delete_index_;
         task_param.is_complete_refresh_ = (DIRECT_REFRESH_OP_COMPLETE == effective_op);
         task_param.is_refresh_on_error_skip_ = index_info->is_refresh_on_error_skip_;
         task_param.is_search_index_     =

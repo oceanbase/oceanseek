@@ -58,6 +58,7 @@ struct ObRetryTaskNode : public common::ObDLinkBase<ObRetryTaskNode>
     param.retry_cnt_ = stat_.retry_cnt_;
     param.leader_epoch_ = stat_.leader_epoch_;
     param.is_partition_local_ = stat_.is_partition_local_;
+    param.is_delete_index_ = stat_.is_delete_index_;
     param.is_complete_refresh_ = stat_.is_complete_refresh_;
     param.is_refresh_on_error_skip_ = stat_.is_refresh_on_error_skip_;
     param.is_search_index_ = stat_.is_search_index_;

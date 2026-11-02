@@ -709,6 +709,7 @@ int ObTenantAsyncIndexRefresher::refresh_one_data_table_(
       // Delete-old carries every partition routing column, so keep the normal
       // PARTITION_RANGE/RANGE/SORT DDL path enabled.
       base_param.is_partition_local_ = false;
+      base_param.is_delete_index_ = index_info.is_delete_index_;
       base_param.is_complete_refresh_ = decision.is_complete_refresh_;
       base_param.is_refresh_on_error_skip_ = index_info.is_refresh_on_error_skip_;
       base_param.is_search_index_ =

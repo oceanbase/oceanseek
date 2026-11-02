@@ -137,6 +137,7 @@ int ObAsyncIndexRefreshTask::set_task(const ObAsyncIndexRefreshTaskParam &param)
     stat.refresh_parallelism_ = param.parallelism_;
     stat.schema_version_ = param.schema_version_;
     stat.is_partition_local_ = param.is_partition_local_;
+    stat.is_delete_index_ = param.is_delete_index_;
     stat.is_complete_refresh_ = param.is_complete_refresh_;
     stat.is_refresh_on_error_skip_ = param.is_refresh_on_error_skip_;
     stat.is_search_index_ = param.is_search_index_;
@@ -189,7 +190,7 @@ int ObAsyncIndexRefreshTask::lock_index_tablet_for_refresh_in_trans_(
           (ASYNC_REFRESH_TYPE_PERIOD == stat.refresh_type_)
               ? 0
               : OB_ASYNC_INDEX_DDL_LOCK_TIMEOUT_US;
-      if (stat.is_partition_local_) {
+      if (stat.is_delete_index_) {
         // Pause only delete-index refreshes before they request the refresh fence.
         DEBUG_SYNC(BEFORE_ASYNC_INDEX_DELETE_REFRESH_LOCK);
       }
@@ -215,7 +216,7 @@ int ObAsyncIndexRefreshTask::lock_index_tablet_for_refresh_in_trans_(
       }
     }
   }
-  if (OB_SUCC(ret) && stat.is_partition_local_) {
+  if (OB_SUCC(ret) && stat.is_delete_index_) {
     // Test hook after the delete-index refresh fence is held and before data-table locks.
     DEBUG_SYNC(AFTER_ASYNC_INDEX_DELETE_REFRESH_LOCK);
   }

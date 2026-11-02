@@ -432,6 +432,7 @@ struct ObRefreshTaskStat
     schema_version_ = 0;
     leader_epoch_ = 0;
     is_partition_local_ = false;
+    is_delete_index_ = false;
     is_complete_refresh_ = false;
     is_refresh_on_error_skip_ = false;
     skipped_rows_ = 0;
@@ -471,6 +472,7 @@ struct ObRefreshTaskStat
                K_(schema_version),
                K_(leader_epoch),
                K_(is_partition_local),
+               K_(is_delete_index),
                K_(is_complete_refresh),
                K_(is_search_index));
 
@@ -498,6 +500,7 @@ struct ObRefreshTaskStat
                                        // re-validated before handle() executes so residual tasks
                                        // from a previous leader term on this LS are dropped
   bool is_partition_local_;            // true when the refresh target uses partition-local DDL
+  bool is_delete_index_;               // true when the refresh target is the shared delete index
   bool is_complete_refresh_;           // true => COMPLETE (full snapshot) refresh; executor must
                                        // run it as a plain (non-mview) snapshot scan
   bool is_refresh_on_error_skip_;      // REFRESH_ON_ERROR=SKIP
@@ -550,6 +553,7 @@ struct ObAsyncIndexRefreshTaskParam
       retry_cnt_(0),
       leader_epoch_(-1),
       is_partition_local_(false),
+      is_delete_index_(false),
       is_complete_refresh_(false),
       is_refresh_on_error_skip_(false),
       is_search_index_(false),
@@ -584,6 +588,7 @@ struct ObAsyncIndexRefreshTaskParam
                K_(schema_version),
                K_(retry_cnt),
                K_(is_partition_local),
+               K_(is_delete_index),
                K_(is_complete_refresh),
                K_(is_search_index),
                "sql_len", (nullptr == sql_ ? 0 : sql_->length()),
@@ -604,6 +609,7 @@ struct ObAsyncIndexRefreshTaskParam
   int64_t retry_cnt_;
   int64_t leader_epoch_;                // -1 for new tasks; retries retain their original epoch
   bool is_partition_local_;             // whether this task uses partition-local DDL execution
+  bool is_delete_index_;                // whether this task targets the shared delete index
   // true => COMPLETE (full snapshot) refresh. The executor MUST run this SQL as
   // a plain snapshot scan, i.e. WITHOUT setting the session's refreshing_mview
   // flag; otherwise the base table scan is forced into mview incremental mode
