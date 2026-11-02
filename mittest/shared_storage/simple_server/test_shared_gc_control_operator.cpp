@@ -74,7 +74,12 @@ TEST_F(TestSharedGCControlInfoOperator, crud_round_trip)
   ASSERT_EQ(1, affected);
 
   ObSharedGCControlInfo read_back;
-  ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::read_row(sql_proxy(), tenant_id, read_back));
+  int64_t gmt_create = 0;
+  int64_t gmt_modified = 0;
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::read_row(
+      sql_proxy(), tenant_id, read_back, gmt_create, gmt_modified));
+  ASSERT_GT(gmt_create, 0);
+  ASSERT_GT(gmt_modified, 0);
   ASSERT_EQ(tenant_id, read_back.tenant_id_);
   ASSERT_EQ(cur_server_id(), read_back.executor_server_id_);
   ASSERT_TRUE(ObSharedGCControlStatus::IDLE == read_back.status_);
@@ -82,6 +87,7 @@ TEST_F(TestSharedGCControlInfoOperator, crud_round_trip)
   ASSERT_EQ(0, read_back.allow_gc_round_id_);
   ASSERT_TRUE(read_back.gc_meta_scn_.is_min());
   ASSERT_TRUE(read_back.last_succ_gc_meta_scn_.is_min());
+  ASSERT_EQ(0, read_back.start_time_);
 
   ObSharedGCControlInfo updated;
   fill_info(updated, tenant_id, cur_server_id(),
@@ -95,6 +101,7 @@ TEST_F(TestSharedGCControlInfoOperator, crud_round_trip)
   ASSERT_TRUE(ObSharedGCControlStatus::DOING == after_update.status_);
   ASSERT_EQ(100, after_update.allow_gc_round_id_);
   ASSERT_EQ(cur_server_id(), after_update.executor_server_id_);
+  ASSERT_GT(after_update.start_time_, 0);
   // update_row's SET clause does not touch gc_round_id, so it stays at 5.
   ASSERT_EQ(5, after_update.gc_round_id_);
 
@@ -187,6 +194,68 @@ TEST_F(TestSharedGCControlInfoOperator, update_status_server_condition_filter)
   // Cleanup
   ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::delete_row(sql_proxy(), tenant_a, affected));
   ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::delete_row(sql_proxy(), tenant_b, affected));
+}
+
+// start_time records when an IDLE row enters DOING. Refreshing a running executor
+// must keep the original value, and releasing it back to IDLE must clear the value.
+TEST_F(TestSharedGCControlInfoOperator, start_time_follows_status_transitions)
+{
+  const uint64_t tenant_id = 1013; // meta tenant -> SYS
+  int64_t affected = 0;
+  ObSharedGCControlInfo info;
+
+  ASSERT_EQ(OB_SUCCESS,
+            ObSharedGCControlOperator::insert_default_row(sql_proxy(), tenant_id, affected));
+  ASSERT_EQ(1, affected);
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::read_row(sql_proxy(), tenant_id, info));
+  ASSERT_TRUE(ObSharedGCControlStatus::IDLE == info.status_);
+  ASSERT_EQ(0, info.start_time_);
+
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::update_executor_state(
+      sql_proxy(), tenant_id, cur_server_id(), ObSharedGCControlStatus::DOING,
+      1 /*gc_round_id*/, affected));
+  ASSERT_EQ(1, affected);
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::read_row(sql_proxy(), tenant_id, info));
+  ASSERT_TRUE(ObSharedGCControlStatus::DOING == info.status_);
+  ASSERT_GT(info.start_time_, 0);
+  const int64_t first_start_time = info.start_time_;
+
+  // DOING -> DOING only refreshes the round id; the original start_time is retained.
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::update_executor_state(
+      sql_proxy(), tenant_id, cur_server_id(), ObSharedGCControlStatus::DOING,
+      2 /*gc_round_id*/, affected));
+  ASSERT_EQ(1, affected);
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::read_row(sql_proxy(), tenant_id, info));
+  ASSERT_EQ(first_start_time, info.start_time_);
+
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::update_status(
+      sql_proxy(), tenant_id, ObSharedGCControlStatus::IDLE, affected));
+  ASSERT_EQ(1, affected);
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::read_row(sql_proxy(), tenant_id, info));
+  ASSERT_TRUE(ObSharedGCControlStatus::IDLE == info.status_);
+  ASSERT_EQ(0, info.start_time_);
+
+  // The status-only entry point follows the same transition rules.
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::update_status(
+      sql_proxy(), tenant_id, ObSharedGCControlStatus::DOING, affected));
+  ASSERT_EQ(1, affected);
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::read_row(sql_proxy(), tenant_id, info));
+  ASSERT_GT(info.start_time_, 0);
+  const int64_t second_start_time = info.start_time_;
+
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::update_status(
+      sql_proxy(), tenant_id, ObSharedGCControlStatus::DOING, affected));
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::read_row(sql_proxy(), tenant_id, info));
+  ASSERT_EQ(second_start_time, info.start_time_);
+
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::update_status(
+      sql_proxy(), tenant_id, ObSharedGCControlStatus::IDLE, affected));
+  ASSERT_EQ(1, affected);
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::read_row(sql_proxy(), tenant_id, info));
+  ASSERT_EQ(0, info.start_time_);
+
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCControlOperator::delete_row(sql_proxy(), tenant_id, affected));
+  ASSERT_EQ(1, affected);
 }
 
 // update_allow_gc_round_id new semantics: under a self-managed select-for-update trans, the

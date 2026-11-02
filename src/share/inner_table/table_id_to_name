@@ -1443,7 +1443,6 @@
 # 12611: __all_virtual_shared_meta_reserved_scn
 # 12611: __all_shared_meta_reserved_scn  # BASE_TABLE_NAME
 # 12612: __all_virtual_shared_gc_control
-# 12612: __all_shared_gc_control  # BASE_TABLE_NAME
 # 12613: __all_virtual_agent_db_background_task
 # 12613: __all_agent_db_background_task  # BASE_TABLE_NAME
 # 12614: __all_virtual_agent_db_background_task_history

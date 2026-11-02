@@ -38,14 +38,15 @@ public:
                         const int64_t gc_round_id,
                         const int64_t allow_gc_round_id,
                         const share::SCN gc_meta_scn,
-                        const share::SCN last_succ_gc_meta_scn);
+                        const share::SCN last_succ_gc_meta_scn,
+                        const int64_t start_time = 0);
   ~ObSharedGCControlInfo() = default;
   void reset();
   bool is_valid() const;
   int  assign(const ObSharedGCControlInfo &other);
   TO_STRING_KV(K_(tenant_id), K_(executor_server_id), "status",
       shared_gc_control_status_to_str(status_), K_(gc_round_id), K_(allow_gc_round_id),
-      K_(gc_meta_scn), K_(last_succ_gc_meta_scn));
+      K_(gc_meta_scn), K_(last_succ_gc_meta_scn), K_(start_time));
 
 public:
   uint64_t tenant_id_;
@@ -55,6 +56,7 @@ public:
   int64_t allow_gc_round_id_;
   share::SCN gc_meta_scn_;
   share::SCN last_succ_gc_meta_scn_;
+  int64_t start_time_;
   DISALLOW_COPY_AND_ASSIGN(ObSharedGCControlInfo);
 };
 

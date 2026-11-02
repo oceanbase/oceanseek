@@ -20,6 +20,7 @@ class ObAtomicProtocolUtil
 {
 public:
   static int get_gts(const uint64_t tenant_id, share::SCN &gts);
+  static int get_gts(const uint64_t tenant_id, const int64_t timeout_us, share::SCN &gts);
   static int get_gts_sync(const uint64_t tenant_id, share::SCN &gts);
   static int get_gts_sync(const uint64_t tenant_id, const int64_t timeout_us, share::SCN &gts);
   static int get_real_tenant_id(const uint64_t tenant_id, uint64_t &real_tenant_id);

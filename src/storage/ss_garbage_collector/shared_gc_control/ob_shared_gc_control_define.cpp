@@ -60,7 +60,8 @@ ObSharedGCControlInfo::ObSharedGCControlInfo()
     gc_round_id_(0),
     allow_gc_round_id_(0),
     gc_meta_scn_(),
-    last_succ_gc_meta_scn_()
+    last_succ_gc_meta_scn_(),
+    start_time_(0)
 {
 }
 
@@ -71,12 +72,14 @@ ObSharedGCControlInfo::ObSharedGCControlInfo(
     const int64_t gc_round_id,
     const int64_t allow_gc_round_id,
     const share::SCN gc_meta_scn,
-    const share::SCN last_succ_gc_meta_scn)
+    const share::SCN last_succ_gc_meta_scn,
+    const int64_t start_time)
   : tenant_id_(tenant_id), executor_server_id_(executor_server_id), status_(status),
     gc_round_id_(gc_round_id),
     allow_gc_round_id_(allow_gc_round_id),
     gc_meta_scn_(gc_meta_scn),
-    last_succ_gc_meta_scn_(last_succ_gc_meta_scn)
+    last_succ_gc_meta_scn_(last_succ_gc_meta_scn),
+    start_time_(start_time)
 {
 }
 
@@ -89,6 +92,7 @@ void ObSharedGCControlInfo::reset()
   allow_gc_round_id_ = 0;
   gc_meta_scn_.reset();
   last_succ_gc_meta_scn_.reset();
+  start_time_ = 0;
 }
 
 bool ObSharedGCControlInfo::is_valid() const
@@ -97,7 +101,8 @@ bool ObSharedGCControlInfo::is_valid() const
       && is_valid_server_id(static_cast<uint64_t>(executor_server_id_))
       && is_valid_shared_gc_control_status(status_)
       && (gc_round_id_ >= 0)
-      && (allow_gc_round_id_ >= 0);
+      && (allow_gc_round_id_ >= 0)
+      && (start_time_ >= 0);
 }
 
 int ObSharedGCControlInfo::assign(const ObSharedGCControlInfo &other)
@@ -114,6 +119,7 @@ int ObSharedGCControlInfo::assign(const ObSharedGCControlInfo &other)
     allow_gc_round_id_ = other.allow_gc_round_id_;
     gc_meta_scn_ = other.gc_meta_scn_;
     last_succ_gc_meta_scn_ = other.last_succ_gc_meta_scn_;
+    start_time_ = other.start_time_;
   }
   return ret;
 }

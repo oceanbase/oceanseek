@@ -629,7 +629,6 @@ case OB_ALL_VIRTUAL_RESTORE_JOB_TID:
 case OB_ALL_VIRTUAL_RESTORE_JOB_HISTORY_TID:
 case OB_ALL_VIRTUAL_RESTORE_PROGRESS_TID:
 case OB_ALL_VIRTUAL_SERVICE_TID:
-case OB_ALL_VIRTUAL_SHARED_GC_CONTROL_TID:
 case OB_ALL_VIRTUAL_SHARED_META_TID:
 case OB_ALL_VIRTUAL_SHARED_META_RESERVED_SCN_TID:
 case OB_ALL_VIRTUAL_SHARED_TIERED_META_TID:
@@ -1895,22 +1894,6 @@ case OB_ALL_VIRTUAL_ZONE_MERGE_INFO_TID:
       break;
     }
 
-    case OB_ALL_VIRTUAL_SHARED_GC_CONTROL_TID: {
-      ObIteratePrivateVirtualTable *iter = NULL;
-      const bool meta_record_in_sys = true;
-      if (OB_FAIL(NEW_VIRTUAL_TABLE(ObIteratePrivateVirtualTable, iter))) {
-        SERVER_LOG(WARN, "create iterate private virtual table iterator failed", KR(ret));
-      } else if (OB_FAIL(iter->init(OB_ALL_SHARED_GC_CONTROL_TID, meta_record_in_sys, index_schema, params))) {
-        SERVER_LOG(WARN, "iterate private virtual table iter init failed", KR(ret));
-        iter->~ObIteratePrivateVirtualTable();
-        allocator.free(iter);
-        iter = NULL;
-      } else {
-       vt_iter = iter;
-      }
-      break;
-    }
-
     case OB_ALL_VIRTUAL_SHARED_META_TID: {
       ObIteratePrivateVirtualTable *iter = NULL;
       const bool meta_record_in_sys = false;
@@ -1958,9 +1941,7 @@ case OB_ALL_VIRTUAL_ZONE_MERGE_INFO_TID:
       }
       break;
     }
-  END_CREATE_VT_ITER_SWITCH_LAMBDA
 
-  BEGIN_CREATE_VT_ITER_SWITCH_LAMBDA
     case OB_ALL_VIRTUAL_SPM_EVO_RESULT_TID: {
       ObIteratePrivateVirtualTable *iter = NULL;
       const bool meta_record_in_sys = false;
@@ -1976,7 +1957,9 @@ case OB_ALL_VIRTUAL_ZONE_MERGE_INFO_TID:
       }
       break;
     }
+  END_CREATE_VT_ITER_SWITCH_LAMBDA
 
+  BEGIN_CREATE_VT_ITER_SWITCH_LAMBDA
     case OB_ALL_VIRTUAL_STORAGE_IO_USAGE_TID: {
       ObIteratePrivateVirtualTable *iter = NULL;
       const bool meta_record_in_sys = false;
@@ -2280,9 +2263,7 @@ case OB_ALL_VIRTUAL_ZONE_MERGE_INFO_TID:
       }
       break;
     }
-  END_CREATE_VT_ITER_SWITCH_LAMBDA
 
-  BEGIN_CREATE_VT_ITER_SWITCH_LAMBDA
     case OB_ALL_VIRTUAL_WR_CONTROL_TID: {
       ObIteratePrivateVirtualTable *iter = NULL;
       const bool meta_record_in_sys = false;
@@ -2298,7 +2279,9 @@ case OB_ALL_VIRTUAL_ZONE_MERGE_INFO_TID:
       }
       break;
     }
+  END_CREATE_VT_ITER_SWITCH_LAMBDA
 
+  BEGIN_CREATE_VT_ITER_SWITCH_LAMBDA
     case OB_ALL_VIRTUAL_WR_EVENT_NAME_TID: {
       ObIteratePrivateVirtualTable *iter = NULL;
       const bool meta_record_in_sys = false;

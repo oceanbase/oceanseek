@@ -52,6 +52,7 @@
 #include "observer/virtual_table/ob_all_data_type_table.h"
 #include "observer/virtual_table/ob_all_virtual_tenant_memstore_info.h"
 #include "observer/virtual_table/ob_all_virtual_tablet_info.h"
+#include "observer/virtual_table/ob_all_virtual_shared_gc_control.h"
 #include "observer/virtual_table/ob_all_virtual_shared_gc_task.h"
 #include "observer/virtual_table/ob_all_virtual_server_blacklist.h"
 #include "observer/virtual_table/ob_all_virtual_sys_parameter_stat.h"
@@ -864,6 +865,18 @@ int ObVTIterCreator::create_vt_iter(ObVTableScanParam &params,
             } else {
               all_virtual_tablet_info->set_addr(addr_);
               vt_iter = static_cast<ObVirtualTableIterator *>(all_virtual_tablet_info);
+            }
+            break;
+          }
+          case OB_ALL_VIRTUAL_SHARED_GC_CONTROL_TID: {
+            ObAllVirtualSharedGCControl *all_virtual_shared_gc_control = NULL;
+            if (OB_FAIL(NEW_VIRTUAL_TABLE(
+                    ObAllVirtualSharedGCControl, all_virtual_shared_gc_control))) {
+              SERVER_LOG(ERROR, "ObAllVirtualSharedGCControl construct failed", K(ret));
+            } else if (OB_FAIL(all_virtual_shared_gc_control->init(GCTX.schema_service_))) {
+              SERVER_LOG(WARN, "ObAllVirtualSharedGCControl init failed", KR(ret));
+            } else {
+              vt_iter = static_cast<ObVirtualTableIterator *>(all_virtual_shared_gc_control);
             }
             break;
           }

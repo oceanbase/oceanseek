@@ -8,6 +8,7 @@
 
 #include "lib/worker.h"
 #include "lib/mysqlclient/ob_mysql_transaction.h"
+#include "lib/time/ob_time_utility.h"
 #include "common/ob_timeout_ctx.h"
 #include "observer/ob_server_struct.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
@@ -43,8 +44,9 @@ int ObSharedGCControlOperator::insert_row(
     LOG_WARN("fail to get sql timeout", KR(ret));
   } else if (OB_FAIL(sql.assign_fmt(
       "INSERT /*+ QUERY_TIMEOUT(%ld) */ INTO %s "
-      "(tenant_id, executor_server_id, status, gc_round_id, allow_gc_round_id, gc_meta_scn, last_succ_gc_meta_scn) "
-      "VALUES (%lu, %ld, '%s', %ld, %ld, %lu, %lu)",
+      "(tenant_id, executor_server_id, status, gc_round_id, allow_gc_round_id, "
+      "gc_meta_scn, last_succ_gc_meta_scn, start_time) "
+      "VALUES (%lu, %ld, '%s', %ld, %ld, %lu, %lu, %ld)",
       timeout_us,
       OB_ALL_SHARED_GC_CONTROL_TNAME,
       info.tenant_id_,
@@ -53,7 +55,8 @@ int ObSharedGCControlOperator::insert_row(
       info.gc_round_id_,
       info.allow_gc_round_id_,
       info.gc_meta_scn_.get_val_for_inner_table_field(),
-      info.last_succ_gc_meta_scn_.get_val_for_inner_table_field()))) {
+      info.last_succ_gc_meta_scn_.get_val_for_inner_table_field(),
+      info.start_time_))) {
     LOG_WARN("fail to assign fmt", KR(ret), K(info));
   } else if (OB_FAIL(do_sql_write_(sql_client, real_tenant_id, sql.ptr(), affected_rows))) {
     LOG_WARN("fail to do sql write", KR(ret), K(sql));
@@ -62,7 +65,8 @@ int ObSharedGCControlOperator::insert_row(
 }
 
 // Insert a default row (executor_server_id=0, status='IDLE', gc_round_id=0,
-// allow_gc_round_id=0, gc_meta_scn=0, last_succ_gc_meta_scn=0) for the given business tenant_id.
+// allow_gc_round_id=0, gc_meta_scn=0, last_succ_gc_meta_scn=0, start_time=0) for the given
+// business tenant_id.
 // Used by the tenant-create flow to initialize the row alongside tenant creation.
 // executor_server_id=0 is meaningless when status=IDLE; it is overwritten by
 // update_executor_state when a server takes over and flips status to DOING.
@@ -150,18 +154,36 @@ int ObSharedGCControlOperator::update_row(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("update_row's executor_server_id must equal cur_server_id",
         KR(ret), K(info), K(cur_server_id));
-  } else if (OB_FAIL(set_clause.assign_fmt(
-      "executor_server_id = %ld, status = '%s', allow_gc_round_id = %ld, "
-      "gc_meta_scn = %lu, last_succ_gc_meta_scn = %lu",
-      info.executor_server_id_,
-      shared_gc_control_status_to_str(info.status_),
-      info.allow_gc_round_id_,
-      info.gc_meta_scn_.get_val_for_inner_table_field(),
-      info.last_succ_gc_meta_scn_.get_val_for_inner_table_field()))) {
-    LOG_WARN("fail to build set clause", KR(ret), K(info));
-  } else if (OB_FAIL(do_update_set_clause_(sql_client, info.tenant_id_, set_clause,
-                                           true /* with_server_condition */,
-                                           affected_rows))) {
+  } else {
+    const int64_t start_time = ObTimeUtility::current_time_us();
+    if (ObSharedGCControlStatus::DOING == info.status_) {
+      ret = set_clause.assign_fmt(
+          "executor_server_id = %ld, "
+          "start_time = CASE WHEN status = '%s' OR start_time <= 0 THEN %ld ELSE start_time END, "
+          "status = '%s', allow_gc_round_id = %ld, gc_meta_scn = %lu, last_succ_gc_meta_scn = %lu",
+          info.executor_server_id_,
+          shared_gc_control_status_to_str(ObSharedGCControlStatus::IDLE),
+          start_time,
+          shared_gc_control_status_to_str(info.status_),
+          info.allow_gc_round_id_,
+          info.gc_meta_scn_.get_val_for_inner_table_field(),
+          info.last_succ_gc_meta_scn_.get_val_for_inner_table_field());
+    } else {
+      ret = set_clause.assign_fmt(
+          "executor_server_id = %ld, start_time = 0, status = '%s', "
+          "allow_gc_round_id = %ld, gc_meta_scn = %lu, last_succ_gc_meta_scn = %lu",
+          info.executor_server_id_,
+          shared_gc_control_status_to_str(info.status_),
+          info.allow_gc_round_id_,
+          info.gc_meta_scn_.get_val_for_inner_table_field(),
+          info.last_succ_gc_meta_scn_.get_val_for_inner_table_field());
+    }
+    if (OB_SUCCESS != ret) {
+      LOG_WARN("fail to build set clause", KR(ret), K(info));
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(do_update_set_clause_(
+          sql_client, info.tenant_id_, set_clause, true /* with_server_condition */, affected_rows))) {
     LOG_WARN("fail to update row", KR(ret), K(info));
   }
   return ret;
@@ -275,13 +297,25 @@ int ObSharedGCControlOperator::update_status(
                 || !is_valid_shared_gc_control_status(status))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("update_status get invalid argument", KR(ret), K(tenant_id), K(status));
-  } else if (OB_FAIL(set_clause.assign_fmt(
-      "status = '%s'", shared_gc_control_status_to_str(status)))) {
-    LOG_WARN("fail to build set clause", KR(ret), K(status));
-  } else if (OB_FAIL(do_update_set_clause_(sql_client, tenant_id, set_clause,
-                                           true /* with_server_condition */,
-                                           affected_rows))) {
-    LOG_WARN("fail to update status", KR(ret), K(tenant_id), K(status));
+  } else {
+    if (ObSharedGCControlStatus::DOING == status) {
+      const int64_t start_time = ObTimeUtility::current_time_us();
+      if (OB_FAIL(set_clause.assign_fmt(
+          "start_time = CASE WHEN status = '%s' OR start_time <= 0 THEN %ld ELSE start_time END, "
+          "status = '%s'",
+          shared_gc_control_status_to_str(ObSharedGCControlStatus::IDLE),
+          start_time,
+          shared_gc_control_status_to_str(status)))) {
+        LOG_WARN("fail to build doing set clause", KR(ret), K(status), K(start_time));
+      }
+    } else if (OB_FAIL(set_clause.assign_fmt(
+        "start_time = 0, status = '%s'", shared_gc_control_status_to_str(status)))) {
+      LOG_WARN("fail to build idle set clause", KR(ret), K(status));
+    }
+    if (OB_SUCC(ret) && OB_FAIL(do_update_set_clause_(
+            sql_client, tenant_id, set_clause, true /* with_server_condition */, affected_rows))) {
+      LOG_WARN("fail to update status", KR(ret), K(tenant_id), K(status));
+    }
   }
   return ret;
 }
@@ -356,17 +390,33 @@ int ObSharedGCControlOperator::update_executor_state(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("update_executor_state get invalid argument", KR(ret),
         K(tenant_id), K(executor_server_id), K(status), K(gc_round_id));
-  } else if (OB_FAIL(set_clause.assign_fmt(
-      "executor_server_id = %ld, status = '%s', gc_round_id = %ld",
-      executor_server_id,
-      shared_gc_control_status_to_str(status),
-      gc_round_id))) {
-    LOG_WARN("fail to build set clause", KR(ret), K(executor_server_id), K(status), K(gc_round_id));
-  } else if (OB_FAIL(do_update_set_clause_(sql_client, tenant_id, set_clause,
-                                           false /* with_server_condition */,
-                                           affected_rows))) {
-    LOG_WARN("fail to update executor state", KR(ret),
-        K(tenant_id), K(executor_server_id), K(status), K(gc_round_id));
+  } else {
+    if (ObSharedGCControlStatus::DOING == status) {
+      const int64_t start_time = ObTimeUtility::current_time_us();
+      if (OB_FAIL(set_clause.assign_fmt(
+          "executor_server_id = %ld, "
+          "start_time = CASE WHEN status = '%s' OR start_time <= 0 THEN %ld ELSE start_time END, "
+          "status = '%s', gc_round_id = %ld",
+          executor_server_id,
+          shared_gc_control_status_to_str(ObSharedGCControlStatus::IDLE),
+          start_time,
+          shared_gc_control_status_to_str(status),
+          gc_round_id))) {
+        LOG_WARN("fail to build doing set clause", KR(ret), K(executor_server_id), K(status),
+            K(gc_round_id), K(start_time));
+      }
+    } else if (OB_FAIL(set_clause.assign_fmt(
+        "executor_server_id = %ld, start_time = 0, status = '%s', gc_round_id = %ld",
+        executor_server_id,
+        shared_gc_control_status_to_str(status),
+        gc_round_id))) {
+      LOG_WARN("fail to build idle set clause", KR(ret), K(executor_server_id), K(status), K(gc_round_id));
+    }
+    if (OB_SUCC(ret) && OB_FAIL(do_update_set_clause_(
+            sql_client, tenant_id, set_clause, false /* with_server_condition */, affected_rows))) {
+      LOG_WARN("fail to update executor state", KR(ret),
+          K(tenant_id), K(executor_server_id), K(status), K(gc_round_id));
+    }
   }
   LOG_TRACE("update shared gc control info executor state",
       KR(ret), K(tenant_id), K(executor_server_id), K(status), K(gc_round_id), K(affected_rows));
@@ -551,8 +601,22 @@ int ObSharedGCControlOperator::read_row(
     const uint64_t tenant_id,
     ObSharedGCControlInfo &info)
 {
+  int64_t gmt_create = 0;
+  int64_t gmt_modified = 0;
+  return read_row(sql_client, tenant_id, info, gmt_create, gmt_modified);
+}
+
+int ObSharedGCControlOperator::read_row(
+    ObISQLClient &sql_client,
+    const uint64_t tenant_id,
+    ObSharedGCControlInfo &info,
+    int64_t &gmt_create,
+    int64_t &gmt_modified)
+{
   int ret = OB_SUCCESS;
   info.reset();
+  gmt_create = 0;
+  gmt_modified = 0;
   uint64_t real_tenant_id = OB_INVALID_TENANT_ID;
   ObSqlString sql;
   int64_t timeout_us = 0;
@@ -567,8 +631,8 @@ int ObSharedGCControlOperator::read_row(
   } else {
     HEAP_VAR(ObMySQLProxy::ReadResult, result) {
       if (OB_FAIL(sql.assign_fmt(
-          "SELECT /*+ QUERY_TIMEOUT(%ld) */ tenant_id, executor_server_id, "
-          "status, gc_round_id, allow_gc_round_id, gc_meta_scn, last_succ_gc_meta_scn "
+          "SELECT /*+ QUERY_TIMEOUT(%ld) */ gmt_create, gmt_modified, tenant_id, executor_server_id, "
+          "status, gc_round_id, allow_gc_round_id, gc_meta_scn, last_succ_gc_meta_scn, start_time "
           "FROM %s WHERE tenant_id = %lu",
           timeout_us,
           OB_ALL_SHARED_GC_CONTROL_TNAME,
@@ -576,7 +640,7 @@ int ObSharedGCControlOperator::read_row(
         LOG_WARN("fail to assign fmt", KR(ret), K(tenant_id));
       } else if (OB_FAIL(do_sql_read_(sql_client, real_tenant_id, sql.ptr(), result))) {
         LOG_WARN("fail to do sql read", KR(ret), K(sql));
-      } else if (OB_FAIL(parse_result_row_(result, info))) {
+      } else if (OB_FAIL(parse_result_row_(result, info, gmt_create, gmt_modified))) {
         if (OB_ENTRY_NOT_EXIST != ret) {
           LOG_WARN("fail to parse result row", KR(ret), K(tenant_id), K(sql));
         }
@@ -603,6 +667,8 @@ int ObSharedGCControlOperator::select_tenant_id_for_update(
   uint64_t real_tenant_id = OB_INVALID_TENANT_ID;
   ObSqlString sql;
   int64_t timeout_us = 0;
+  int64_t gmt_create = 0;
+  int64_t gmt_modified = 0;
 
   if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id))) {
     ret = OB_INVALID_ARGUMENT;
@@ -614,8 +680,8 @@ int ObSharedGCControlOperator::select_tenant_id_for_update(
   } else {
     HEAP_VAR(ObMySQLProxy::ReadResult, result) {
       if (OB_FAIL(sql.assign_fmt(
-          "SELECT /*+ QUERY_TIMEOUT(%ld) */ tenant_id, executor_server_id, "
-          "status, gc_round_id, allow_gc_round_id, gc_meta_scn, last_succ_gc_meta_scn "
+          "SELECT /*+ QUERY_TIMEOUT(%ld) */ gmt_create, gmt_modified, tenant_id, executor_server_id, "
+          "status, gc_round_id, allow_gc_round_id, gc_meta_scn, last_succ_gc_meta_scn, start_time "
           "FROM %s WHERE tenant_id = %lu FOR UPDATE",
           timeout_us,
           OB_ALL_SHARED_GC_CONTROL_TNAME,
@@ -623,7 +689,7 @@ int ObSharedGCControlOperator::select_tenant_id_for_update(
         LOG_WARN("fail to assign fmt", KR(ret), K(tenant_id));
       } else if (OB_FAIL(do_sql_read_(sql_client, real_tenant_id, sql.ptr(), result))) {
         LOG_WARN("fail to do sql read", KR(ret), K(sql));
-      } else if (OB_FAIL(parse_result_row_(result, info))) {
+      } else if (OB_FAIL(parse_result_row_(result, info, gmt_create, gmt_modified))) {
         if (OB_ENTRY_NOT_EXIST != ret) {
           LOG_WARN("fail to parse result row", KR(ret), K(tenant_id), K(sql));
         }
@@ -683,14 +749,19 @@ int ObSharedGCControlOperator::do_update_set_clause_(
 
 int ObSharedGCControlOperator::parse_result_row_(
     ObMySQLProxy::MySQLResult &result,
-    ObSharedGCControlInfo &info)
+    ObSharedGCControlInfo &info,
+    int64_t &gmt_create,
+    int64_t &gmt_modified)
 {
   int ret = OB_SUCCESS;
   info.reset();
+  gmt_create = 0;
+  gmt_modified = 0;
   int64_t tenant_id = 0;
   int64_t executor_server_id = 0;
   int64_t gc_round_id = 0;
   int64_t allow_gc_round_id = 0;
+  int64_t start_time = 0;
   uint64_t gc_meta_scn_val = 0;
   uint64_t last_succ_gc_meta_scn_val = 0;
   ObString status_str;
@@ -704,6 +775,10 @@ int ObSharedGCControlOperator::parse_result_row_(
     } else {
       LOG_WARN("fail to get next result", KR(ret));
     }
+  } else if (OB_FAIL(result.get_result()->get_timestamp("gmt_create", NULL, gmt_create))) {
+    LOG_WARN("fail to get gmt_create", KR(ret));
+  } else if (OB_FAIL(result.get_result()->get_timestamp("gmt_modified", NULL, gmt_modified))) {
+    LOG_WARN("fail to get gmt_modified", KR(ret));
   } else if (OB_FAIL(result.get_result()->get_int("tenant_id", tenant_id))) {
     LOG_WARN("fail to get tenant_id", KR(ret));
   } else if (OB_FAIL(result.get_result()->get_int("executor_server_id", executor_server_id))) {
@@ -720,6 +795,8 @@ int ObSharedGCControlOperator::parse_result_row_(
     LOG_WARN("fail to get gc_meta_scn", KR(ret));
   } else if (OB_FAIL(result.get_result()->get_uint("last_succ_gc_meta_scn", last_succ_gc_meta_scn_val))) {
     LOG_WARN("fail to get last_succ_gc_meta_scn", KR(ret));
+  } else if (OB_FAIL(result.get_result()->get_int("start_time", start_time))) {
+    LOG_WARN("fail to get start_time", KR(ret));
   } else if (OB_FAIL(info.gc_meta_scn_.convert_for_inner_table_field(gc_meta_scn_val))) {
     LOG_WARN("fail to convert gc_meta_scn", KR(ret), K(gc_meta_scn_val));
   } else if (OB_FAIL(info.last_succ_gc_meta_scn_.convert_for_inner_table_field(last_succ_gc_meta_scn_val))) {
@@ -729,6 +806,7 @@ int ObSharedGCControlOperator::parse_result_row_(
     info.executor_server_id_ = executor_server_id;
     info.gc_round_id_ = gc_round_id;
     info.allow_gc_round_id_ = allow_gc_round_id;
+    info.start_time_ = start_time;
   }
   return ret;
 }

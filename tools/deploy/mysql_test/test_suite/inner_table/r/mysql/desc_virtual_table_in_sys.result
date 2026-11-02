@@ -12937,14 +12937,16 @@ select /*+QUERY_TIMEOUT(60000000)*/ * from oceanbase.__all_virtual_shared_meta_r
 desc oceanbase.__all_virtual_shared_gc_control;
 Field	Type	Null	Key	Default	Extra
 tenant_id	bigint(20)	NO	PRI	NULL	
-gmt_create	timestamp(6)	NO		NULL	
-gmt_modified	timestamp(6)	NO		NULL	
+gmt_create	timestamp(6)	NO		CURRENT_TIMESTAMP(6)	
+gmt_modified	timestamp(6)	NO		CURRENT_TIMESTAMP(6)	
 executor_server_id	bigint(20)	NO		0	
 status	varchar(128)	NO		IDLE	
 gc_round_id	bigint(20)	NO		0	
 allow_gc_round_id	bigint(20)	NO		0	
 gc_meta_scn	bigint(20) unsigned	NO		0	
 last_succ_gc_meta_scn	bigint(20) unsigned	NO		0	
+start_time	timestamp(6)	YES		CURRENT_TIMESTAMP(6)	
+safe_meta_scn	bigint(20) unsigned	NO		0	
 select /*+QUERY_TIMEOUT(60000000)*/ IF(count(*) >= 0, 1, 0) from oceanbase.__all_virtual_shared_gc_control;
 IF(count(*) >= 0, 1, 0)
 1

@@ -709,6 +709,7 @@ ob_set_subtarget(ob_server virtual_table
   virtual_table/ob_all_virtual_ss_tablet_meta.cpp
   virtual_table/ob_all_virtual_shared_tablet_meta_info.cpp
   virtual_table/ob_all_virtual_ss_ls_meta.cpp
+  virtual_table/ob_all_virtual_shared_gc_control.cpp
   virtual_table/ob_all_virtual_shared_gc_task.cpp
   virtual_table/ob_all_virtual_shared_gc_diagnose.cpp
   virtual_table/ob_all_virtual_ss_meta_ctrl.cpp

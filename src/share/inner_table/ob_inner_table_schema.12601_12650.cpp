@@ -2059,35 +2059,49 @@ int ObInnerTableSchema::all_virtual_shared_gc_control_schema(ObTableSchema &tabl
   }
 
   if (OB_SUCC(ret)) {
-    ADD_COLUMN_SCHEMA_TS("gmt_create", //column_name
+    ObObj gmt_default;
+    ObObj gmt_default_null;
+
+    gmt_default.set_ext(ObActionFlag::OP_DEFAULT_NOW_FLAG);
+    gmt_default_null.set_null();
+    ADD_COLUMN_SCHEMA_TS_T("gmt_create", //column_name
       ++column_id, //column_id
       0, //rowkey_id
       0, //index_id
       0, //part_key_pos
       ObTimestampType, //column_type
       CS_TYPE_INVALID, //column_collation_type
-      sizeof(ObPreciseDateTime), //column_length
+      0, //column_length
       -1, //column_precision
-      -1, //column_scale
+      6, //column_scale
       false, //is_nullable
       false, //is_autoincrement
-      false); //is_on_update_for_timestamp
+      false, //is_on_update_for_timestamp
+      gmt_default_null,
+      gmt_default)
   }
 
   if (OB_SUCC(ret)) {
-    ADD_COLUMN_SCHEMA_TS("gmt_modified", //column_name
+    ObObj gmt_default;
+    ObObj gmt_default_null;
+
+    gmt_default.set_ext(ObActionFlag::OP_DEFAULT_NOW_FLAG);
+    gmt_default_null.set_null();
+    ADD_COLUMN_SCHEMA_TS_T("gmt_modified", //column_name
       ++column_id, //column_id
       0, //rowkey_id
       0, //index_id
       0, //part_key_pos
       ObTimestampType, //column_type
       CS_TYPE_INVALID, //column_collation_type
-      sizeof(ObPreciseDateTime), //column_length
+      0, //column_length
       -1, //column_precision
-      -1, //column_scale
+      6, //column_scale
       false, //is_nullable
       false, //is_autoincrement
-      false); //is_on_update_for_timestamp
+      false, //is_on_update_for_timestamp
+      gmt_default_null,
+      gmt_default)
   }
 
   if (OB_SUCC(ret)) {
@@ -2203,7 +2217,49 @@ int ObInnerTableSchema::all_virtual_shared_gc_control_schema(ObTableSchema &tabl
       last_succ_gc_meta_scn_default,
       last_succ_gc_meta_scn_default); //default_value
   }
-  table_schema.set_index_using_type(USING_BTREE);
+
+  if (OB_SUCC(ret)) {
+    ObObj gmt_default;
+    ObObj gmt_default_null;
+
+    gmt_default.set_ext(ObActionFlag::OP_DEFAULT_NOW_FLAG);
+    gmt_default_null.set_null();
+    ADD_COLUMN_SCHEMA_TS_T("start_time", //column_name
+      ++column_id, //column_id
+      0, //rowkey_id
+      0, //index_id
+      0, //part_key_pos
+      ObTimestampType, //column_type
+      CS_TYPE_INVALID, //column_collation_type
+      0, //column_length
+      -1, //column_precision
+      6, //column_scale
+      true, //is_nullable
+      false, //is_autoincrement
+      false, //is_on_update_for_timestamp
+      gmt_default_null,
+      gmt_default)
+  }
+
+  if (OB_SUCC(ret)) {
+    ObObj safe_meta_scn_default;
+    safe_meta_scn_default.set_uint64(0);
+    ADD_COLUMN_SCHEMA_T("safe_meta_scn", //column_name
+      ++column_id, //column_id
+      0, //rowkey_id
+      0, //index_id
+      0, //part_key_pos
+      ObUInt64Type, //column_type
+      CS_TYPE_INVALID, //column_collation_type
+      sizeof(uint64_t), //column_length
+      -1, //column_precision
+      -1, //column_scale
+      false, //is_nullable
+      false, //is_autoincrement
+      safe_meta_scn_default,
+      safe_meta_scn_default); //default_value
+  }
+  table_schema.set_index_using_type(USING_HASH);
   table_schema.set_row_store_type(ENCODING_ROW_STORE);
   table_schema.set_store_format(OB_STORE_FORMAT_DYNAMIC_MYSQL);
   table_schema.set_progressive_merge_round(1);

@@ -9372,6 +9372,7 @@ def_table_schema(
     ('allow_gc_round_id', 'int', 'false', '0'),
     ('gc_meta_scn', 'uint', 'false', '0'),
     ('last_succ_gc_meta_scn', 'uint', 'false', '0'),
+    ('start_time', 'int', 'false', '0'),
   ],
   is_cluster_private = True,
   in_tenant_space = True,
@@ -18972,11 +18973,30 @@ def_table_schema(**gen_iterate_private_virtual_table_def(
   base_table_lookup_by_name = True,
   keywords = all_def_keywords['__all_shared_meta_reserved_scn']))
 # 12612: __all_virtual_shared_gc_control
-def_table_schema(**gen_iterate_private_virtual_table_def(
-  table_id = '12612',
+def_table_schema(
+  owner = 'muwei.ym',
   table_name = '__all_virtual_shared_gc_control',
+  table_id = '12612',
+  table_type = 'VIRTUAL_TABLE',
   in_tenant_space = True,
-  keywords = all_def_keywords['__all_shared_gc_control']))
+  gm_columns = [],
+  rowkey_columns = [
+    ('tenant_id', 'int'),
+  ],
+  normal_columns = [
+    ('gmt_create', 'timestamp:6'),
+    ('gmt_modified', 'timestamp:6'),
+    ('executor_server_id', 'int', 'false', '0'),
+    ('status', 'varchar:128', 'false', 'IDLE'),
+    ('gc_round_id', 'int', 'false', '0'),
+    ('allow_gc_round_id', 'int', 'false', '0'),
+    ('gc_meta_scn', 'uint', 'false', '0'),
+    ('last_succ_gc_meta_scn', 'uint', 'false', '0'),
+    ('start_time', 'timestamp:6', 'true'),
+    ('safe_meta_scn', 'uint', 'false', '0'),
+  ],
+  vtable_route_policy = 'local',
+)
 # 12613: __all_virtual_agent_db_background_task
 # 12614: __all_virtual_agent_db_background_task_history
 

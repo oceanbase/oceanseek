@@ -21,7 +21,12 @@ namespace storage
 
 int ObAtomicProtocolUtil::get_gts(const uint64_t tenant_id, share::SCN &gts)
 {
-  return get_gts_(tenant_id, DEFAULT_GET_GTS_TIMEOUT_US, false/*use_sync_get*/, gts);
+  return get_gts(tenant_id, DEFAULT_GET_GTS_TIMEOUT_US, gts);
+}
+
+int ObAtomicProtocolUtil::get_gts(const uint64_t tenant_id, const int64_t timeout_us, share::SCN &gts)
+{
+  return get_gts_(tenant_id, timeout_us, false/*use_sync_get*/, gts);
 }
 
 int ObAtomicProtocolUtil::get_gts_sync(const uint64_t tenant_id, share::SCN &gts)

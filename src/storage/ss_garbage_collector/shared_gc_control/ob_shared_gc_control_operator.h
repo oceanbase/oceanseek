@@ -51,6 +51,11 @@ public:
   static int read_row(common::ObISQLClient &sql_client,
                       const uint64_t tenant_id,
                       ObSharedGCControlInfo &info);
+  static int read_row(common::ObISQLClient &sql_client,
+                      const uint64_t tenant_id,
+                      ObSharedGCControlInfo &info,
+                      int64_t &gmt_create,
+                      int64_t &gmt_modified);
 
   // Server-Condition update: WHERE tenant_id = ? AND executor_server_id = cur_server_id
   static int update_row(common::ObISQLClient &sql_client,
@@ -172,7 +177,9 @@ private:
                                    const bool with_server_condition,
                                    int64_t &affected_rows);
   static int parse_result_row_(common::ObMySQLProxy::MySQLResult &result,
-                               ObSharedGCControlInfo &info);
+                               ObSharedGCControlInfo &info,
+                               int64_t &gmt_create,
+                               int64_t &gmt_modified);
 
   ObSharedGCControlOperator() = delete;
   ~ObSharedGCControlOperator() = delete;
