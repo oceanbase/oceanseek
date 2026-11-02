@@ -53,6 +53,8 @@ int drop_external_resource(const ObSimpleExternalResourceSchema &schema,
                            common::ObISQLClient &sql_client);
 
 private:
+  static ObString truncate_name_for_ddl_operation(const ObString &name);
+
   DISALLOW_COPY_AND_ASSIGN(ObExternalResourceSqlService);
 };
 
