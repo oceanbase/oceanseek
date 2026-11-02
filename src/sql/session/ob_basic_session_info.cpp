@@ -5866,15 +5866,16 @@ int ObBasicSessionInfo::deserialize(const char *buf, const int64_t data_len, int
                                                 &thread_data_.user_at_client_ip_))) {
         LOG_WARN("fail to write user_at_client_ip to string_buf_",
                   K(thread_data_.user_at_client_ip_), K(ret));
-      } else if (OB_FAIL(sess_level_name_pool_.write_string(sys_var_in_pc_str_, &sys_var_in_pc_str_))) {
+      } else if (OB_FAIL(ob_write_string(sess_level_name_pool_, sys_var_in_pc_str_,
+                                        sys_var_in_pc_str_, true /* c_style */))) {
         LOG_WARN("fail to write sys_var_in_pc_str to string_buf_", K(sys_var_in_pc_str_), K(ret));
       } else if (OB_FAIL(sess_level_name_pool_.write_string(config_in_pc_str_, &config_in_pc_str_))) {
         LOG_WARN("fail to write config_in_pc_str_ to string_buf_", K(config_in_pc_str_), K(ret));
       } else {
-        set_sys_vars_encode_max_size(sys_var_in_pc_str_.length());
+        set_sys_vars_encode_max_size(sys_var_in_pc_str_.empty() ? 0 : sys_var_in_pc_str_.length() + 1);
       }
-      // above write_string for sys_var_in_pc_str_ and config_in_pc_str_ will deep copy the string with
-      // a buffer whose size equals data_length (not MAX_SYS_VARS_STR_SIZE/MAX_CONFIG_STR_SIZE).
+      // sys_var_in_pc_str_ reserves one extra byte for formatted output's trailing NUL.
+      // config_in_pc_str_ is copied into a buffer whose size equals data_length.
       // We must mark is_first_gen_config_ = true so that the next
       // gen_configs_in_pc_str() allocate fresh buffers instead of reusing the undersized write_string buffers.
       // for gen_sys_var_in_pc_str(), it will expand the buffer if needed,
