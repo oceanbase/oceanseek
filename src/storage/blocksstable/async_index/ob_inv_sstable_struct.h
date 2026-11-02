@@ -14,12 +14,31 @@ namespace oceanbase
 namespace blocksstable
 {
 
+// Persisted in ObInvIdxStatsMeta; append new types only.
 enum ObInvIdxType
 {
-  INV_IDX_TYPE_INVALID = 0,   // uninitialized / unknown kind
-  INV_IDX_TYPE_FTS,           // full-text index; carries relevance params
-  INV_IDX_TYPE_SEARCH,        // search index; multi-col term, no relevance params, carries nested_key_list
-  INV_IDX_TYPE_MAX,
+  INV_IDX_TYPE_INVALID = 0,     // uninitialized / unknown kind
+  INV_IDX_TYPE_FTS = 1,         // full-text index; carries relevance params
+  INV_IDX_TYPE_SEARCH = 2,      // search data index; multi-col term, no relevance params, carries nested_key_list
+  INV_IDX_TYPE_SEARCH_TEXT = 3, // search text index; multi-col term (COL_IDX, PATH, TOKEN)
+  INV_IDX_TYPE_MAX = 4,
+};
+
+// Logical column layout of the async search text index:
+//   rowkey (COL_IDX, PATH, TOKEN, DOC_ID), values (TOKEN_FREQ, DOC_LENGTH[, POSITION_LIST]).
+// MATCH tables omit POSITION_LIST, PHRASE tables carry it.
+enum ObInvIdxSearchTextLayout
+{
+  SEARCH_TEXT_COL_IDX = 0,
+  SEARCH_TEXT_PATH = 1,
+  SEARCH_TEXT_TOKEN = 2,
+  SEARCH_TEXT_DOC_ID = 3,
+  SEARCH_TEXT_TOKEN_FREQ = 4,
+  SEARCH_TEXT_DOC_LENGTH = 5,
+  SEARCH_TEXT_POSITION_LIST = 6,
+  SEARCH_TEXT_ROWKEY_CNT = 4,
+  SEARCH_TEXT_COL_CNT_WITHOUT_POS = 6,
+  SEARCH_TEXT_COL_CNT_WITH_POS = 7,
 };
 
 // =============================================================================

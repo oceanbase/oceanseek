@@ -468,12 +468,14 @@ enum ObIndexType
   // async search index
   INDEX_TYPE_ASYNC_SEARCH_DEF_INDEX_LOCAL = 49,
   INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL = 50,
+  INDEX_TYPE_ASYNC_SEARCH_TEXT_MATCH_INDEX_LOCAL = 51,
+  INDEX_TYPE_ASYNC_SEARCH_TEXT_PHRASE_INDEX_LOCAL = 52,
 
   /*
   * Attention!!! when add new index type,
   * need update func ObSimpleTableSchemaV2::should_not_validate_data_index_ckm()
   */
-  INDEX_TYPE_MAX = 51,
+  INDEX_TYPE_MAX = 53,
 };
 
 bool is_support_split_index_type(const ObIndexType index_type);
