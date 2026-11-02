@@ -218,7 +218,7 @@ int ObBlockGCHandler::gc_tablet(
 int ObBlockGCHandler::delete_macro_blocks(
     ObIArray<blocksstable::MacroBlockId> &block_ids)
 {
-  LOG_INFO("prepare delete macro blocks", KPC(this), K(block_ids));
+  LOG_TRACE("prepare delete macro blocks", KPC(this), K(block_ids));
   return storage::delete_macro_blocks(block_ids);
 }
 
@@ -368,7 +368,7 @@ int ObBlockGCHandler::gc_blocks_(
         if (OB_FAIL(delete_macro_cache_(gc_block_ids))) {
           LOG_WARN("failed to delete macro cache", KR(ret), K(gc_block_ids), KPC(this));
         } else {
-          LOG_INFO("macro cache gc success", K(tablet_version), K(gc_block_ids.count()), K(gc_block_ids), KPC(this));
+          LOG_TRACE("macro cache gc success", K(tablet_version), K(gc_block_ids.count()), K(gc_block_ids), KPC(this));
         }
       } else { // !is_shared
         // todo  split  skip this step
@@ -376,7 +376,7 @@ int ObBlockGCHandler::gc_blocks_(
           LOG_WARN("failed to delete_macro_blocks", KR(ret), K(gc_block_ids), KPC(this));
         } else {
           gc_macro_block_cnt_ += gc_block_ids.count();
-          LOG_INFO("block gc success", KR(ret), K(tablet_version), K(gc_block_ids.count()), K(gc_block_ids), KPC(this));
+          LOG_TRACE("block gc success", KR(ret), K(tablet_version), K(gc_block_ids.count()), K(gc_block_ids), KPC(this));
         }
       }
     }

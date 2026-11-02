@@ -118,8 +118,8 @@ int ObStorageMetaIOUtil::check_meta_existence(
     }
   }
   int64_t cost_time_us = ObTimeUtility::current_time() - start_ts;
-  LOG_INFO("collect tablet meta version finished", KR(ret), K(cost_time_us), K(use_list),
-           K(start_version), K(end_version), K(allow_stale_versions), "gc_versions", tablet_versions);
+  LOG_TRACE("collect tablet meta version finished", KR(ret), K(cost_time_us), K(use_list),
+            K(start_version), K(end_version), K(allow_stale_versions), "gc_versions", tablet_versions);
 #endif
   return ret;
 }

@@ -66,7 +66,7 @@ public:
   {
     get_gc_task_ctx()->get_allocator().free(task);
     ATOMIC_DEC(&unfinished_task_cnt_); 
-    STORAGE_LOG(INFO, "tablet_gc_task end", KP(task), KPC(this));
+    STORAGE_LOG(TRACE, "tablet_gc_task end", KP(task), KPC(this));
   }
 
   template<class T>
@@ -132,7 +132,7 @@ int ObBlockGCThread<CTX>::add_gc_task(T &task)
     }
     if (OB_SUCC(ret)) {
       ATOMIC_INC(&unfinished_task_cnt_);
-      STORAGE_LOG(INFO, "tablet_gc_task add", K(ret), KP(handler), K(task), KPC(this));
+      STORAGE_LOG(TRACE, "tablet_gc_task add", K(ret), KP(handler), K(task), KPC(this));
     }
   }
   return ret;

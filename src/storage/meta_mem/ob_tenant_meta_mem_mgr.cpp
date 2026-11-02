@@ -2007,8 +2007,8 @@ int ObTenantMetaMemMgr::get_current_version_for_tablet(
               tablet_handle.get_obj()->get_empty_shell_tablet_status() == ObTabletStatus::TRANSFER_OUT_DELETED) {
             is_transfer_out_deleted = true;
           }
-          FLOG_INFO("PRINT TABLET ADDRESS", K(ret), K(tablet_ptr->get_addr()), K(tablet_handle.get_obj()->get_tablet_addr()),
-            K(tablet_version), K(last_gc_version), K(tablet_fingerprint), K(is_transfer_out_deleted));
+          LOG_TRACE("PRINT TABLET ADDRESS", K(ret), K(tablet_ptr->get_addr()), K(tablet_handle.get_obj()->get_tablet_addr()),
+                    K(tablet_version), K(last_gc_version), K(tablet_fingerprint), K(is_transfer_out_deleted));
         }
       }
     }
