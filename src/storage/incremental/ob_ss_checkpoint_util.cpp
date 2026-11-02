@@ -4,6 +4,7 @@
 #include "lib/string/ob_sql_string.h" // for ObSqlString::assign_fmt()
 #include "observer/omt/ob_tenant_config_mgr.h"
 #include "ob_ss_checkpoint_util.h"
+#include "rootserver/ob_tenant_info_loader.h"
 #include "storage/tx_storage/ob_checkpoint_service.h"
 
 namespace oceanbase {
@@ -30,6 +31,9 @@ void ObCkptUtil::check_ckpt_changed(const bool is_ss_ckpt,
   } else if (ckpt_record.last_checkpoint_scn_ < cur_ckpt_scn) {
     ckpt_record.last_checkpoint_scn_ = cur_ckpt_scn;
     ckpt_record.changed_ts_ = current_ts;
+  } else if (is_standby_ckpt_at_recovery_end_(cur_ckpt_scn)) {
+    // Do not count time spent at the standby recovery limit as a checkpoint stall.
+    ckpt_record.changed_ts_ = current_ts;
   } else {
     const int64_t DEFAULT_ADVANCE_INTERVAL = 10LL * 60LL * 1000LL * 1000LL;
     int64_t advance_checkpoint_interval = DEFAULT_ADVANCE_INTERVAL;
@@ -51,6 +55,25 @@ void ObCkptUtil::check_ckpt_changed(const bool is_ss_ckpt,
   }
 }
 #undef CKPT_LOG_WRAPPER
+
+bool ObCkptUtil::is_standby_ckpt_at_recovery_end_(const share::SCN &cur_ckpt_scn)
+{
+  int ret = OB_SUCCESS;
+  bool at_recovery_end = false;
+  if (share::is_standby_tenant(MTL_GET_TENANT_ROLE_CACHE())) {
+    rootserver::ObTenantInfoLoader *tenant_info_loader = MTL(rootserver::ObTenantInfoLoader *);
+    share::SCN recovery_until_scn;
+    if (OB_ISNULL(tenant_info_loader)) {
+      ret = OB_ERR_UNEXPECTED;
+      STORAGE_LOG(WARN, "tenant info loader is null", K(ret));
+    } else if (OB_FAIL(tenant_info_loader->get_recovery_until_scn(recovery_until_scn))) {
+      STORAGE_LOG(WARN, "failed to get recovery until scn", K(ret));
+    } else {
+      at_recovery_end = cur_ckpt_scn == recovery_until_scn;
+    }
+  }
+  return at_recovery_end;
+}
 
 }  // namespace storage
 

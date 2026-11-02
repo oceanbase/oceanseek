@@ -34,6 +34,9 @@ public:
                                  const share::ObLSID ls_id,
                                  const share::SCN cur_ckpt_scn,
                                  CkptChangeRecord &ckpt_record);
+
+private:
+  static bool is_standby_ckpt_at_recovery_end_(const share::SCN &cur_ckpt_scn);
 };
 
 }  // namespace storage
