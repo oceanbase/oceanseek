@@ -1104,7 +1104,7 @@ int LibPalfHandle::set_monitor_cb(palf::PalfMonitorCb *monitor_cb)
   } else if (OB_FAIL(plugins_.add_plugin(monitor_cb))) {
     PALF_LOG(WARN, "add_plugin failed", KR(ret), KPC(this), KP(monitor_cb), K_(plugins));
   } else {
-    PALF_LOG(INFO, "LibPalfHandle set_monitor_cb success", KPC(this), K_(plugins), KP(monitor_cb));
+    PALF_LOG(TRACE, "LibPalfHandle set_monitor_cb success", KPC(this), K_(plugins), KP(monitor_cb));
   }
   return ret;
 }

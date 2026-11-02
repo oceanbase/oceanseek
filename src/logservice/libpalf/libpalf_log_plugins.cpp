@@ -48,7 +48,7 @@ int LogPlugins::add_plugin(palf::PalfMonitorCb *plugin)
     PALF_LOG(INFO, "Palf plugin is not NULL", KP(plugin), KP_(palf_monitor));
   } else {
     palf_monitor_ = plugin;
-    PALF_LOG(INFO, "add_plugin success", KP(plugin));
+    PALF_LOG(TRACE, "add_plugin success", KP(plugin));
   }
   return ret;
 }
