@@ -12,6 +12,8 @@ storage_dml_unittest(test_tablet_member_load_and_free test_tablet_member_load_an
 storage_dml_unittest(test_ls_migration_param test_ls_migration_param.cpp)
 storage_dml_unittest(test_ls_tablet_service test_ls_tablet_service.cpp)
 storage_dml_unittest(test_tenant_slog_ckpt test_tenant_slog_ckpt.cpp)
+# 12 个串行 checkpoint 场景在 FARM 上仅 gtest 阶段就接近 300 秒，另留初始化及退出清理预算。
+set_tests_properties(test_tenant_slog_ckpt PROPERTIES TIMEOUT 600)
 if(OB_BUILD_CLOSE_MODULES)
   storage_unittest(test_memtable test_memtable_v2.cpp)
   target_compile_definitions(test_memtable PUBLIC MEMTABLE_USE_HASH_INDEX_FLAG=1)

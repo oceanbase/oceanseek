@@ -8175,7 +8175,11 @@ int ObDMLResolver::resolve_hybrid_search_item(const ParseNode &parse_tree, Table
   if ((OB_ISNULL(stmt))) {
     ret = OB_NOT_INIT;
     LOG_WARN("resolver isn't init", K(ret), KP(stmt));
-  } else if (OB_FALSE_IT(stmt->set_hybrid_search())) {  
+  } else if (!stmt->is_select_stmt()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "hybrid_search in DML statements");
+    LOG_WARN("hybrid_search in DML statements is not supported", K(ret), K(stmt->get_stmt_type()));
+  } else if (OB_FALSE_IT(stmt->set_hybrid_search())) {
   } else if (T_HYBRID_SEARCH != parse_tree.type_ || 2 != parse_tree.num_child_) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("parse_tree type or num child is not correct", K(ret), K(parse_tree.type_), K(parse_tree.num_child_));

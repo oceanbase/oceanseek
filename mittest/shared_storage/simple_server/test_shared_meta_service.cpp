@@ -13,6 +13,10 @@
 #include "unittest/storage/init_basic_struct.h"
 #include "src/logservice/libpalf/libpalf_kv_instance.h"
 #include "storage/schema_utils.h"
+#include "share/io/ob_io_manager.h"
+#include "storage/shared_storage/ob_file_manager.h"
+#include "storage/shared_storage/ob_ss_object_access_util.h"
+#include "storage/shared_storage/ob_ss_reader_writer.h"
 #undef private
 #undef protected
 
@@ -3518,9 +3522,15 @@ TEST_F(TestSharedMetaService, sys_ls_ckpt_rejects_conflicting_oss_object)
   };
   auto assert_object_content = [&](const blocksstable::MacroBlockId &object_id,
                                    const ObString &expected_content) -> void {
-    ASSERT_EQ(OB_SUCCESS, OB_STORAGE_OBJECT_MGR.get_object_size(
+    // 本用例故意覆写同一对象 ID；sub-meta 缓存仍可能保留旧内容。
+    // 校验远端对象未被覆盖或已恢复，必须和 writer 一样绕过缓存读取。
+    ObBaseFileManager *file_manager = nullptr;
+    ASSERT_EQ(OB_SUCCESS, ObSSObjectAccessUtil::get_file_manager(MTL_ID(), file_manager));
+    ASSERT_NE(nullptr, file_manager);
+    ASSERT_EQ(OB_SUCCESS, file_manager->get_remote_file_length(
         object_id, 0 /*ls_epoch*/, object_size));
     ASSERT_EQ(expected_content.length(), object_size);
+    ASSERT_GT(object_size, 0);
     ObArenaAllocator read_allocator("CkptConflictRd");
     char *read_buf = static_cast<char *>(read_allocator.alloc(object_size));
     ASSERT_NE(nullptr, read_buf);
@@ -3537,10 +3547,9 @@ TEST_F(TestSharedMetaService, sys_ls_ckpt_rejects_conflicting_oss_object)
     read_info.io_timeout_ms_ = OB_IO_MANAGER.get_object_storage_io_timeout_ms(MTL_ID());
     read_info.set_ls_epoch_id(0 /*ls_epoch_id*/);
     read_info.mtl_tenant_id_ = MTL_ID();
-    // This test deliberately changes OSS content behind the same macro_id. Read OSS directly
-    // because the generic object reader may return the old payload from local cache.
-    OK(object_storage_reader.aio_read(read_info, read_handle));
-    OK(read_handle.wait());
+    ASSERT_EQ(OB_SUCCESS, object_storage_reader.aio_read(read_info, read_handle));
+    ASSERT_EQ(OB_SUCCESS, read_handle.wait());
+    ASSERT_NE(nullptr, read_handle.get_buffer());
     ASSERT_EQ(expected_content.length(), read_handle.get_data_size());
     ASSERT_EQ(0, MEMCMP(
         expected_content.ptr(), read_buf, expected_content.length()));
