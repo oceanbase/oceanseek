@@ -12,6 +12,7 @@
 #include "sql/engine/basic/arrow_converter/ob_arrow_utils.h"
 #include "plugin/legacy/external_table/ob_external_arrow_status.h"
 #include <arrow/flight/types.h>
+#include "sql/ob_sql_context.h"
 #include "sql/executor/ob_execute_result.h"
 #include "sql/ob_result_set.h"
 #include "sql/session/ob_sql_session_info.h"
@@ -78,7 +79,7 @@ void ObFlightBatchReader::mark_session_active()
   if (OB_ISNULL(ctx_.session) || OB_ISNULL(ctx_.session->ob_session)) {
     return;
   }
-  flight_session_tag_ = "/* flight:" + ctx_.session->session_id + " */";
+  flight_session_tag_ = "/* flightsql */";
   ctx_.session->ob_session->set_mysql_cmd(obmysql::COM_QUERY);
   (void)ctx_.session->ob_session->set_session_state(sql::QUERY_ACTIVE);
   (void)ctx_.session->ob_session->store_query_string(
@@ -110,6 +111,9 @@ void ObFlightBatchReader::write_sql_audit()
   rec.execute_time  = rec.elapsed_time;
   rec.return_rows   = total_rows_;
   rec.affected_rows = OB_NOT_NULL(result_set_) ? result_set_->get_affected_rows() : 0;
+  rec.is_hit_plan_cache = OB_NOT_NULL(result_set_) && OB_NOT_NULL(sql_ctx_)
+                          && result_set_->get_is_from_plan_cache()
+                          && !sql_ctx_->self_add_plan_;
   rec.ret_code      = last_ret_;
   rec.peer_port     = ctx_.session->peer_port;
   rec.plan_type     = static_cast<sql::ObPhyPlanType>(ctx_.plan_type);
@@ -120,7 +124,6 @@ void ObFlightBatchReader::write_sql_audit()
   FBR_SAFE_COPY(rec.user_name, ctx_.session->user_name);
   FBR_SAFE_COPY(rec.schema_name, ctx_.session->current_schema);
   FBR_SAFE_COPY(rec.catalog_name, ctx_.session->current_catalog);
-  FBR_SAFE_COPY(rec.session_uuid, ctx_.session->session_id);
   FBR_SAFE_COPY(rec.peer_ip, ctx_.session->peer_ip);
   FBR_SAFE_COPY(rec.sql_id, ctx_.sql_id);
   FBR_SAFE_COPY(rec.trace_id, ctx_.trace_id);
@@ -137,21 +140,28 @@ ObFlightBatchReader::~ObFlightBatchReader()
     LOG_WARN("[FlightSQL] BatchReader dtor: tenant switch failed", K(ret), K(tenant_id_));
   }
 
-  write_sql_audit();
-  mark_session_sleep();
-
   if (OB_NOT_NULL(result_set_)) {
     // cur_exec_ctx 在析构时释放，必须在 result_set close 前清理
     if (OB_NOT_NULL(ctx_.session) && OB_NOT_NULL(ctx_.session->ob_session)
         && ctx_.session->ob_session->get_cur_exec_ctx() == &result_set_->get_exec_context()) {
       ctx_.session->ob_session->set_cur_exec_ctx(nullptr);
     }
-    result_set_->close();
+    const int close_ret = result_set_->close();
+    if (OB_SUCCESS != close_ret && OB_SUCCESS == last_ret_) {
+      last_ret_ = close_ret;
+      LOG_WARN("[FlightSQL] BatchReader close failed",
+               K(close_ret), "ob_trace_id", ctx_.trace_id.c_str(),
+               "sql_id", ctx_.sql_id.c_str(), "plan_id", ctx_.plan_id);
+    }
+    write_sql_audit();
     result_set_.reset();
     sql_ctx_.reset();
     schema_guard_.reset();
     arena_alloc_.reset();
+  } else {
+    write_sql_audit();
   }
+  mark_session_sleep();
   // query_lock 的持有期覆盖整个流式读取过程，因此在 reader 析构时释放。
   if (query_locked_ && OB_NOT_NULL(ctx_.session) && OB_NOT_NULL(ctx_.session->ob_session)) {
     (void)ctx_.session->ob_session->unlock_query();
@@ -163,6 +173,12 @@ ObFlightBatchReader::~ObFlightBatchReader()
 
 arrow::Status ObFlightBatchReader::ReadNext(std::shared_ptr<arrow::RecordBatch> *out)
 {
+  if (OB_SUCCESS != last_ret_) {
+    if (OB_NOT_NULL(out)) {
+      *out = nullptr;
+    }
+    return sql::ob_ret_to_arrow_status(last_ret_, ctx_.trace_id.c_str(), ctx_.sql_text);
+  }
   int ret = OB_SUCCESS;
   OB_TRY_BEGIN;
     MAKE_TENANT_SWITCH_SCOPE_GUARD(guard);
@@ -179,7 +195,16 @@ arrow::Status ObFlightBatchReader::ReadNext(std::shared_ptr<arrow::RecordBatch> 
   if (OB_SUCC(ret) && OB_NOT_NULL(out) && OB_NOT_NULL(*out)) {
     total_rows_ += (*out)->num_rows();
   }
-  last_ret_ = ret;
+  if (OB_FAIL(ret)) {
+    last_ret_ = ret;
+    if (OB_NOT_NULL(result_set_)) {
+      result_set_->set_errcode(ret);
+    }
+    LOG_WARN("[FlightSQL] ReadNext failed", K(ret),
+             "ob_trace_id", ctx_.trace_id.c_str(),
+             "sql_id", ctx_.sql_id.c_str(), "plan_id", ctx_.plan_id,
+             K_(total_rows));
+  }
   return sql::ob_ret_to_arrow_status(ret, ctx_.trace_id.c_str(), ctx_.sql_text);
 }
 
@@ -285,7 +310,8 @@ int ObFlightBatchReader::read_next_rows(std::shared_ptr<arrow::RecordBatch> *out
       if (OB_FAIL(output_exprs.at(col)->eval(eval_ctx, datum))) {
         LOG_WARN("[FlightSQL] expr eval failed", K(ret), K(col));
       } else if (OB_FAIL(sql::ObArrowBatchConverter::append_datum_to_builder(
-                     *output_exprs.at(col), *datum, *builders[col], lob_arena_))) {
+                     *output_exprs.at(col), *datum, *builders[col], lob_arena_,
+                     &eval_ctx))) {
         LOG_WARN("[FlightSQL] append_datum_to_builder failed", K(ret), K(col));
       }
     }

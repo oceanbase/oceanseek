@@ -25,7 +25,7 @@ namespace oceanbase
 namespace observer
 {
 
-static bool token_printable_no_comment_end(const char *const s, const size_t len)
+static bool audit_tag_printable_no_comment_end(const char *const s, const size_t len)
 {
   if (nullptr == s || 0 == len) {
     return false;
@@ -82,33 +82,18 @@ void mirror_flight_sql_audit_record_to_gv_sql_audit(sql::ObSQLSessionInfo &sessi
     }
   }
 
-  // QUERY_SQL: optional `-- flightsql: …` line comment, newline, then statement (copy-paste friendly).
+  // QUERY_SQL may include the catalog, but never the Flight session UUID: the
+  // UUID is also the bearer token.
   std::string sql_full;
   {
-    const size_t uuid_len =
-        strnlen(rec.session_uuid, sizeof(rec.session_uuid));
-    const bool uuid_ok = uuid_len > 0 && uuid_len < sizeof(rec.session_uuid)
-                         && token_printable_no_comment_end(rec.session_uuid, uuid_len);
-
     const size_t cat_len =
         strnlen(rec.catalog_name, sizeof(rec.catalog_name));
     const bool cat_ok = cat_len > 0 && cat_len < sizeof(rec.catalog_name)
-                        && token_printable_no_comment_end(rec.catalog_name, cat_len);
+                        && audit_tag_printable_no_comment_end(rec.catalog_name, cat_len);
 
-    if (uuid_ok || cat_ok) {
-      sql_full.append("-- flightsql:");
-      if (uuid_ok && cat_ok) {
-        sql_full.append(" bearer=");
-        sql_full.append(rec.session_uuid, uuid_len);
-        sql_full.append(" catalog=");
-        sql_full.append(rec.catalog_name, cat_len);
-      } else if (uuid_ok) {
-        sql_full.append(" bearer=");
-        sql_full.append(rec.session_uuid, uuid_len);
-      } else {
-        sql_full.append(" catalog=");
-        sql_full.append(rec.catalog_name, cat_len);
-      }
+    if (cat_ok) {
+      sql_full.append("-- flightsql: catalog=");
+      sql_full.append(rec.catalog_name, cat_len);
       sql_full.append("\n");
     }
     if (!rec.sql_text.empty()) {
@@ -206,7 +191,6 @@ void mirror_flight_sql_audit_record_to_gv_sql_audit(sql::ObSQLSessionInfo &sessi
     int ret = OB_SUCCESS;
     LOG_WARN("[FlightSQL] audit record: unexpected exception, audit row dropped",
              "what", e.what(),
-             "session_uuid", rec.session_uuid,
              "ob_session_id", rec.ob_session_id,
              "tenant_id", rec.tenant_id,
              "sql_id", rec.sql_id,
@@ -214,7 +198,6 @@ void mirror_flight_sql_audit_record_to_gv_sql_audit(sql::ObSQLSessionInfo &sessi
   } catch (...) {
     int ret = OB_SUCCESS;
     LOG_WARN("[FlightSQL] audit record: unknown exception, audit row dropped",
-             "session_uuid", rec.session_uuid,
              "ob_session_id", rec.ob_session_id,
              "tenant_id", rec.tenant_id,
              "sql_id", rec.sql_id,

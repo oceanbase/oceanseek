@@ -71,6 +71,10 @@ DEF_INT(mysql_port, OB_CLUSTER_PARAMETER, "2881", "(1024,65536)",
 DEF_INT(flight_sql_port, OB_CLUSTER_PARAMETER, "0", "[0,65536)",
         "port number for Arrow Flight SQL connection. [0, 1024] disables the service. Range: [0, 65536) in integer",
         ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::STATIC_EFFECTIVE));
+DEF_BOOL(flight_sql_tls_enabled, OB_CLUSTER_PARAMETER, "False",
+         "whether the Arrow Flight SQL listener uses TLS. Uses the existing server SSL wallet or external KMS credentials. "
+         "When disabled, credentials and bearer tokens are not transport-encrypted; restrict the listener to a trusted network or TLS-terminating gateway",
+         ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::STATIC_EFFECTIVE));
 DEF_TIME(_flight_sql_session_timeout, OB_CLUSTER_PARAMETER, "30m", "[1m, 24h]",
          "idle timeout for Arrow Flight SQL sessions. Range: [1m, 24h]",
          ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));

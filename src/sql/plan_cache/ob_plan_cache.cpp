@@ -725,7 +725,8 @@ int ObPlanCache::construct_fast_parser_result(common::ObIAllocator &allocator,
     if (OB_FAIL(construct_plan_cache_key(*pc_ctx.sql_ctx_.session_info_,
                                          ObLibCacheNameSpace::NS_CRSR,
                                          fp_result.pc_key_,
-                                         pc_ctx.sql_ctx_.is_protocol_weak_read_))) {
+                                         pc_ctx.sql_ctx_.is_protocol_weak_read_,
+                                         pc_ctx.sql_ctx_.is_flight_sql_))) {
       LOG_WARN("failed to construct plan cache key", K(ret));
     } else if (enable_exact_mode) {
       (void)fp_result.pc_key_.name_.assign_ptr(raw_sql.ptr(), raw_sql.length());
@@ -2309,7 +2310,8 @@ int ObPlanCache::construct_plan_cache_key(ObPlanCacheCtx &plan_ctx, ObLibCacheNa
   } else if (OB_FAIL(construct_plan_cache_key(*session,
                                               ns,
                                               plan_ctx.fp_result_.pc_key_,
-                                              plan_ctx.sql_ctx_.is_protocol_weak_read_))) {
+                                              plan_ctx.sql_ctx_.is_protocol_weak_read_,
+                                              plan_ctx.sql_ctx_.is_flight_sql_))) {
     LOG_WARN("failed to construct plan cache key", K(ret));
   } else {
     plan_ctx.key_ = &(plan_ctx.fp_result_.pc_key_);
@@ -2320,7 +2322,8 @@ int ObPlanCache::construct_plan_cache_key(ObPlanCacheCtx &plan_ctx, ObLibCacheNa
 OB_INLINE int ObPlanCache::construct_plan_cache_key(ObSQLSessionInfo &session,
                                                     ObLibCacheNameSpace ns,
                                                     ObPlanCacheKey &pc_key,
-                                                    bool is_weak)
+                                                    bool is_weak,
+                                                    bool is_flight_sql)
 {
   int ret = OB_SUCCESS;
   uint64_t database_id = OB_INVALID_ID;
@@ -2343,6 +2346,7 @@ OB_INLINE int ObPlanCache::construct_plan_cache_key(ObSQLSessionInfo &session,
   pc_key.config_use_rich_format_ = session.config_use_rich_format();
   OZ (session.get_sys_var_config_hash_val(pc_key.sys_var_config_hash_val_));
   pc_key.is_weak_read_ = is_weak;
+  pc_key.is_flight_sql_ = is_flight_sql;
   pc_key.enable_mysql_compatible_dates_ = session.enable_mysql_compatible_dates();
   OZ (session.get_collation_connection(pc_key.collation_connection_));
   return ret;
@@ -2792,4 +2796,3 @@ void ObPlanCacheEliminationTask::run_free_cache_obj_task()
 
 } // end of namespace sql
 } // end of namespace oceanbase
-

@@ -75,6 +75,8 @@ inline arrow::Status ob_ret_to_arrow_status(int ret,
           arrow::flight::FlightStatusCode::Unavailable, msg);
     case common::OB_EAGAIN:
       return arrow::Status::Invalid("concurrent queries on the same session are not supported");
+    case common::OB_NOT_SUPPORTED:
+      return arrow::Status::NotImplemented(std::move(msg));
     default:
       return arrow::Status::Invalid(std::move(msg));
   }

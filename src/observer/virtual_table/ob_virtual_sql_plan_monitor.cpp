@@ -944,9 +944,13 @@ int ObVirtualSqlPlanMonitor::convert_node_to_row(ObMonitorNode &node, ObNewRow *
           cells[cell_idx].set_null();
         } else if (raw_profile_as_lob_) {
           const ObString raw_profile(node.raw_profile_len_, node.raw_profile_);
-          if (OB_FAIL(ObTextStringHelper::pack_to_disk_inrow_lob(
-                  row_calc_buf_, raw_profile, ObLongTextType, cells[cell_idx]))) {
-            SERVER_LOG(WARN, "failed to pack raw profile as lob", K(ret), K(node.raw_profile_len_));
+          const int pack_ret = sql::ObTextStringHelper::pack_to_disk_inrow_lob(
+              row_calc_buf_, raw_profile, ObLongTextType, cells[cell_idx]);
+          if (OB_SUCCESS != pack_ret) {
+            cells[cell_idx].set_null();
+            const int64_t thread_id = node.get_thread_id();
+            SERVER_LOG_RET(WARN, pack_ret, "failed to pack raw profile lob, return NULL profile",
+                           K(addr_), K(thread_id), K(node.raw_profile_len_));
           } else {
             cells[cell_idx].set_collation_type(CS_TYPE_BINARY);
           }

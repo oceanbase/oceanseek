@@ -10,14 +10,16 @@
 
 #include <functional>
 #include "lib/ob_define.h"
+#include "lib/encrypt/ob_encrypted_helper.h"
+#include "lib/net/ob_net_util.h"
 #include "lib/oblog/ob_log.h"
+#include "lib/random/ob_random.h"
 #include "lib/trace/ob_trace.h"
 #include "lib/time/ob_time_utility.h"
 #include "share/config/ob_server_config.h"
 #include "share/ob_server_struct.h"
 #include "share/schema/ob_schema_getter_guard.h"
 #include "share/schema/ob_multi_version_schema_service.h"
-#include "observer/ob_inner_sql_connection.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
 #include "lib/alloc/alloc_func.h"
 #include "lib/alloc/alloc_struct.h"
@@ -62,6 +64,86 @@ int flight_snapshot_fill_catalog_from_ob_session(const ObFlightSqlSession &ses, 
         if (!nm.empty()) {
           cat.assign(nm.ptr(), nm.length());
         }
+      }
+    }
+  }
+  return ret;
+}
+
+// Flight SQL Basic authentication supplies a plaintext password, while the
+// shared access check expects a MySQL challenge response for native-password
+// accounts.  Adapt only the Flight-local login data so the shared/MySQL login
+// paths remain unchanged.  caching_sha2_password already has a plaintext
+// full-authentication branch and must not be sent through its trusted
+// fast-authentication branch.
+int flight_sql_prepare_auth_data(
+    ObSchemaGetterGuard &schema_guard,
+    const uint64_t tenant_id,
+    ObUserLoginInfo &login_info,
+    char (&native_scramble)[SCRAMBLE_LENGTH],
+    char (&native_response)[SHA1_HASH_SIZE + 1],
+    uint64_t &expected_user_id)
+{
+  int ret = OB_SUCCESS;
+  expected_user_id = OB_INVALID_ID;
+  const ObUserInfo *matched_user_info = nullptr;
+  ObSEArray<const ObUserInfo *, 4> users_info;
+
+  if (OB_FAIL(schema_guard.get_user_info(tenant_id, login_info.user_name_, users_info))) {
+    LOG_WARN("[FlightSQL] get user info for authentication failed", K(ret), K(tenant_id),
+             K(login_info.user_name_));
+  } else {
+    for (int64_t i = 0;
+         i < users_info.count() && OB_ISNULL(matched_user_info) && OB_SUCC(ret);
+         ++i) {
+      const ObUserInfo *candidate = users_info.at(i);
+      if (OB_ISNULL(candidate)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("[FlightSQL] null user info during authentication", K(ret), K(i));
+      } else if (obsys::ObNetUtil::is_match(
+                     login_info.client_ip_, candidate->get_host_name_str())) {
+        matched_user_info = candidate;
+      }
+    }
+
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(matched_user_info)) {
+      ret = OB_PASSWORD_WRONG;
+      LOG_WARN("[FlightSQL] no host-matched account", K(ret), K(tenant_id),
+               K(login_info.user_name_), K(login_info.client_ip_));
+    } else {
+      expected_user_id = matched_user_info->get_user_id();
+      const ObString plugin = matched_user_info->get_plugin_str();
+
+      // The shared check handles both-empty and one-empty cases before plugin
+      // dispatch, so no wire-format adaptation is needed for either case.
+      if (login_info.passwd_.empty() || matched_user_info->get_passwd_str().empty()) {
+      } else if (ObEncryptedHelper::is_native_password_plugin(plugin)) {
+        for (int64_t i = 0; i < SCRAMBLE_LENGTH; ++i) {
+          native_scramble[i] = static_cast<char>(ObRandom::rand('!', '~'));
+        }
+        const ObString scramble(SCRAMBLE_LENGTH, native_scramble);
+        int64_t response_len = 0;
+        if (OB_FAIL(ObEncryptedHelper::encrypt_password(
+                login_info.passwd_, scramble, native_response,
+                sizeof(native_response), response_len))) {
+          LOG_WARN("[FlightSQL] failed to prepare native password response", K(ret));
+        } else if (SHA1_HASH_SIZE != response_len) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("[FlightSQL] unexpected native password response length",
+                   K(ret), K(response_len));
+        } else {
+          login_info.scramble_str_.assign_ptr(native_scramble, SCRAMBLE_LENGTH);
+          login_info.passwd_.assign_ptr(native_response, response_len);
+          login_info.is_passwd_plaintext_ = false;
+        }
+      } else if (ObEncryptedHelper::is_caching_sha2_password_plugin(plugin)) {
+        // Keep plaintext=true: the pre-existing full-authentication branch in
+        // check_user_access() performs the password verification.
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("[FlightSQL] unsupported authentication plugin", K(ret), K(plugin),
+                 K(login_info.user_name_));
       }
     }
   }
@@ -170,6 +252,7 @@ std::shared_ptr<ObFlightSqlSession> ObFlightSqlSessionManager::create(
     const uint64_t tenant_id,
     const std::string &tenant_name,
     const std::string &user_name,
+    const std::string &password,
     const bool is_oracle_mode,
     const std::string &peer_ip,
     const int32_t peer_port,
@@ -346,17 +429,16 @@ std::shared_ptr<ObFlightSqlSession> ObFlightSqlSessionManager::create(
     session->free_ctx.tenant_id_          = tenant_id;
     session->free_ctx.has_inc_active_num_ = false;
     session->session_id = generate_session_token(tenant_id, sid);
+    session->ob_session->set_user_session();
+    session->ob_session->gen_gtt_session_scope_unique_id();
+    session->ob_session->gen_gtt_trans_scope_unique_id();
 
-    // Init sys vars, compat mode, NLS formats (extern=true: leaves user/tenant to us)
-    const bool is_extern = true;
     if (OB_ISNULL(GCTX.schema_service_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_ERROR("[FlightSQL] schema_service_ is null during session create", K(ret));
-    } else if (OB_FAIL(ObInnerSQLConnection::init_session_info(
-            session->ob_session, is_extern, is_oracle_mode, false /*is_ddl*/))) {
-      LOG_WARN("[FlightSQL] init_session_info failed", K(ret));
     } else {
-      // Switch to the real tenant
+      // Match the native MySQL user-session order: install the authenticated
+      // tenant before generating tenant sysvars and plan-cache configuration.
       ObSchemaGetterGuard schema_guard;
       const ObSimpleTenantSchema *tenant_schema = nullptr;
       if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(tenant_id, schema_guard))) {
@@ -369,33 +451,63 @@ std::shared_ptr<ObFlightSqlSession> ObFlightSqlSessionManager::create(
       } else if (OB_FAIL(session->ob_session->init_tenant(
                      tenant_schema->get_tenant_name_str(), tenant_id))) {
         LOG_WARN("[FlightSQL] init_tenant failed", K(ret), K(tenant_id));
+      } else if (OB_FAIL(session->ob_session->load_all_sys_vars(schema_guard))) {
+        LOG_WARN("[FlightSQL] load tenant system variables failed", K(ret), K(tenant_id));
+      } else if (OB_FAIL(session->ob_session->update_max_packet_size())) {
+        LOG_WARN("[FlightSQL] update max packet size failed", K(ret), K(tenant_id));
       } else {
-        // Look up the user and set it on the session
-        const ObString user_str(user_name.size(), user_name.c_str());
-        const ObString host_str("%");
+        // Authenticate through the same schema access-check path as MySQL login.
+        ObUserLoginInfo login_info;
+        login_info.tenant_name_ = ObString(tenant_name.size(), tenant_name.c_str());
+        login_info.user_name_ = ObString(user_name.size(), user_name.c_str());
+        login_info.client_ip_ = ObString(peer_ip.size(), peer_ip.c_str());
+        login_info.passwd_ = ObString(password.size(), password.c_str());
+        login_info.is_passwd_plaintext_ = true;
+        ObSessionPrivInfo session_priv;
+        ObSEArray<uint64_t, 8> enable_role_id_array;
         const ObUserInfo *user_info = nullptr;
-        if (OB_FAIL(schema_guard.get_user_info(tenant_id, user_str, host_str, user_info))) {
-          LOG_WARN("[FlightSQL] get_user_info failed", K(ret), "user", user_str, K(tenant_id));
+        char native_scramble[SCRAMBLE_LENGTH] = {0};
+        char native_response[SHA1_HASH_SIZE + 1] = {0};
+        uint64_t expected_user_id = OB_INVALID_ID;
+        if (OB_FAIL(flight_sql_prepare_auth_data(
+                schema_guard, tenant_id, login_info,
+                native_scramble, native_response, expected_user_id))) {
+          LOG_WARN("[FlightSQL] failed to prepare authentication data", K(ret), K(tenant_id),
+                   "user", user_name.c_str(), "client_ip", peer_ip.c_str());
+        } else if (OB_FAIL(schema_guard.check_user_access(
+                login_info, session_priv, enable_role_id_array, nullptr, user_info))) {
+          LOG_WARN("[FlightSQL] user authentication failed", K(ret), K(tenant_id),
+                   "user", user_name.c_str(), "client_ip", peer_ip.c_str());
         } else if (OB_ISNULL(user_info)) {
-          ret = OB_ERR_USER_NOT_EXIST;
-          LOG_WARN("[FlightSQL] user not found", K(ret), "user", user_str, K(tenant_id));
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("[FlightSQL] check_user_access returned null user", K(ret), K(tenant_id),
+                   "user", user_name.c_str());
+        } else if (expected_user_id != user_info->get_user_id()) {
+          // Fail closed if overlapping host entries use different plugins and
+          // the shared checker selects a different account than the one whose
+          // wire-format authentication data Flight SQL prepared.
+          ret = OB_PASSWORD_WRONG;
+          LOG_WARN("[FlightSQL] authenticated account differs from plugin-selected account",
+                   K(ret), K(tenant_id), K(expected_user_id),
+                   "authenticated_user_id", user_info->get_user_id());
         } else if (OB_FAIL(session->ob_session->set_user(
-                       user_info->get_user_name(),
-                       user_info->get_host_name_str(),
-                       user_info->get_user_id()))) {
+                       session_priv.user_name_,
+                       session_priv.host_name_,
+                       session_priv.user_id_))) {
           LOG_WARN("[FlightSQL] set_user failed", K(ret));
+        } else if (OB_FAIL(session->ob_session->set_enable_role_array(enable_role_id_array))) {
+          LOG_WARN("[FlightSQL] set_enable_role_array failed", K(ret));
         } else {
-          // Flight SQL is an authenticated external protocol.  The shared
-          // initializer starts from an inner-session template, so restore
-          // user-session semantics after binding the client identity.
-          session->ob_session->set_user_session();
-          session->ob_session->set_user_priv_set(user_info->get_priv_set());
-          session->ob_session->set_priv_user_id(user_info->get_user_id());
+          session->ob_session->set_user_priv_set(session_priv.user_priv_set_);
+          session->ob_session->set_db_priv_set(session_priv.db_priv_set_);
+          session->ob_session->set_priv_user_id(session_priv.user_id_);
           session->ob_session->set_current_trace_id(ObCurTraceId::get_trace_id());
           LOG_TRACE("[FlightSQL] Session created",
                    "session_id", session->session_id.c_str(),
                    K(tenant_id), "user", user_name.c_str());
         }
+        MEMSET(native_response, 0, sizeof(native_response));
+        MEMSET(native_scramble, 0, sizeof(native_scramble));
       }
     }
   }
@@ -417,10 +529,9 @@ std::shared_ptr<ObFlightSqlSession> ObFlightSqlSessionManager::create(
     session->ob_session->set_shadow(false);
 
     // Transition SESSION_INIT → SESSION_SLEEP so State column shows "SLEEP".
-    // Tag Info with the flight session UUID so the OB session can be associated
-    // with the right FlightSQL client when using KILL <sessid>.
+    // Mark the idle query text without exposing the Flight bearer token.
     session->ob_session->set_session_sleep();
-    const std::string init_tag = "/* flight:" + session->session_id + " */";
+    const std::string init_tag = "/* flightsql */";
     (void)session->ob_session->store_query_string(
         common::ObString(static_cast<int32_t>(init_tag.size()), init_tag.c_str()));
   }

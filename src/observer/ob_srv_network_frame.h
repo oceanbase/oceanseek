@@ -16,6 +16,8 @@
 #include "observer/net/ob_ingress_bw_alloc_service.h"
 #include "observer/ob_srv_rpc_handler.h"
 #include "observer/net/ob_shared_storage_net_throt_service.h"
+#include "lib/allocator/page_arena.h"
+#include "lib/string/ob_string.h"
 
 namespace oceanbase {
 namespace rpc {
@@ -52,6 +54,9 @@ public:
 
   int reload_config();
   int reload_ssl_config();
+  static int load_flight_tls_credentials(common::ObArenaAllocator &allocator,
+                                         common::ObString &public_cert,
+                                         common::ObString &private_key);
   static int extract_expired_time(const char *const cert_file, int64_t &expired_time);
   static uint64_t get_ssl_file_hash(const char *intl_file[3], const char *sm_file[5], bool &file_exist);
   ObSMHandler &get_mysql_handler() { return mysql_handler_; }

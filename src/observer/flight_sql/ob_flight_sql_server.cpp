@@ -7,6 +7,7 @@
 
 #include "observer/flight_sql/ob_flight_sql_server.h"
 #include "observer/flight_sql/ob_flightsql_session.h"
+#include "observer/ob_srv_network_frame.h"
 
 // OceanBase headers
 #include "lib/utility/ob_defer.h"
@@ -14,9 +15,15 @@
 #include "lib/utility/utility.h"
 #include "lib/ob_define.h"
 #include "lib/alloc/alloc_struct.h"
+#include "lib/container/ob_se_array.h"
+#include "lib/json_type/ob_json_parse.h"
+#include "lib/string/ob_sql_string.h"
+#include "lib/worker.h"
 #include "lib/oblog/ob_log.h"
 #include "lib/mysqlclient/ob_mysql_proxy.h"
 #include "lib/time/ob_time_utility.h"
+#include "lib/trace/ob_trace.h"
+#include "lib/worker.h"
 #include "share/ob_errno.h"
 #include "share/ob_server_struct.h"
 #include "share/ob_cluster_version.h"
@@ -39,12 +46,14 @@
 #include "arrow/util/key_value_metadata.h"
 #include "observer/flight_sql/ob_flightsql_query_processor.h"
 #include "observer/flight_sql/ob_flightsql_arrow_converter.h"
+#include "observer/flight_sql/ob_flightsql_param_converter.h"
 #include "lib/profile/ob_trace_id.h"
 #include "observer/flight_sql/ob_flight_batch_reader.h"
 #include "sql/ob_sql_context.h"
 #include "sql/ob_result_set.h"
 
 #include "share/config/ob_server_config.h"
+#include "share/rc/ob_tenant_base.h"
 #include "share/schema/ob_schema_getter_guard.h"
 #include "share/schema/ob_table_schema.h"
 #include "share/schema/ob_column_schema.h"
@@ -52,11 +61,14 @@
 #include "share/system_variable/ob_system_variable_factory.h"
 #include "observer/flight_sql/ob_flight_sql_audit.h"
 #include "observer/flight_sql/ob_flightsql_ingest_registry.h"
+#include "sql/parser/ob_parser.h"
 #include "observer/omt/ob_multi_tenant.h"
 #include <grpcpp/resource_quota.h>
 #include <grpcpp/server_builder.h>
+#include <openssl/crypto.h>
 
 #include <atomic>
+#include <limits>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -83,7 +95,33 @@ static constexpr int32_t  kObClusterVersion = 10000;
 static constexpr int32_t  kObSqlInfoOptFeatureVersion      = 10001;
 // Value for standard key 1 (FLIGHT_SQL_SERVER_VERSION): Flight SQL protocol version implemented
 // by this server.  Bump when new RPCs or option keys are added.
-static constexpr const char *kObFlightSqlImplVersion       = "1.1.0";
+static constexpr const char *kObFlightSqlImplVersion       = "1.2.1";
+
+static void flight_sql_cleanse_string(std::string &value)
+{
+  if (!value.empty()) {
+    OPENSSL_cleanse(&value[0], value.size());
+    value.clear();
+  }
+}
+
+static void flight_sql_cleanse_ob_string(common::ObString &value)
+{
+  if (!value.empty()) {
+    OPENSSL_cleanse(value.ptr(), static_cast<size_t>(value.length()));
+    value.reset();
+  }
+}
+
+static std::string flight_sql_make_prepared_handle(const uint64_t generation)
+{
+  const uint64_t nonce = ::oceanbase::trace::UUID::gen_rand();
+  char handle[64];
+  snprintf(handle, sizeof(handle), "ps-%016llx-%016llx",
+           static_cast<unsigned long long>(generation),
+           static_cast<unsigned long long>(nonce));
+  return std::string(handle);
+}
 
 // ============================================================
 // SetSessionOptions / GetSessionOptions key names
@@ -135,9 +173,10 @@ static bool is_valid_var_name(const std::string &name)
   return true;
 }
 
-// Identifiers are inserted into generated SQL inside backticks.  Reject the
-// quote character and controls instead of accepting text that can terminate an
-// identifier or make audit/log output ambiguous.
+// MySQL-mode identifiers are inserted into generated SQL inside backticks.
+// Reject the quote character and controls instead of accepting text that can
+// terminate an identifier or make audit/log output ambiguous.  Oracle mode
+// applies the stricter regular-identifier check below.
 static bool flight_sql_is_safe_identifier(const std::string &name)
 {
   if (name.empty()) { return false; }
@@ -145,6 +184,43 @@ static bool flight_sql_is_safe_identifier(const std::string &name)
     if ('`' == c || '\0' == c || c < 0x20 || 0x7f == c) { return false; }
   }
   return true;
+}
+
+// Oracle folds regular, unquoted identifiers to upper case.  Flight clients
+// commonly pass the lower-case spelling used in unquoted CREATE TABLE SQL, so
+// double-quoting that spelling would address a different, case-sensitive
+// object.  Keep Oracle identifiers unquoted and restrict them to the regular
+// identifier grammar before inserting them into generated SQL.
+static bool flight_sql_is_safe_oracle_identifier(const std::string &name)
+{
+  if (name.empty()
+      || !(('a' <= name[0] && name[0] <= 'z')
+           || ('A' <= name[0] && name[0] <= 'Z'))) {
+    return false;
+  }
+  for (size_t i = 1; i < name.size(); ++i) {
+    const char c = name[i];
+    if (!(('a' <= c && c <= 'z')
+          || ('A' <= c && c <= 'Z')
+          || ('0' <= c && c <= '9')
+          || '_' == c || '$' == c || '#' == c)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static void flight_sql_append_identifier(std::string &sql,
+                                         const std::string &name,
+                                         const bool is_oracle_mode)
+{
+  if (is_oracle_mode) {
+    sql.append(name);
+  } else {
+    sql.push_back('`');
+    sql.append(name);
+    sql.push_back('`');
+  }
 }
 
 static bool flight_sql_is_safe_hint(const std::string &hint)
@@ -193,7 +269,6 @@ static void mirror_flightsql_session_kv_to_sql_audit(ObFlightSqlSession &session
   SAFE_COPY(rec.user_name, session.user_name);
   SAFE_COPY(rec.schema_name, session.current_schema);
   SAFE_COPY(rec.catalog_name, session.current_catalog);
-  SAFE_COPY(rec.session_uuid, session.session_id);
   SAFE_COPY(rec.peer_ip, session.peer_ip);
 #undef SAFE_COPY
   rec.ob_session_id = OB_NOT_NULL(session.ob_session) ? session.ob_session->get_server_sid() : 0;
@@ -299,9 +374,11 @@ static constexpr const char *FLIGHT_SQL_HEADER_WRITE_MODE        = "ob_write_mod
 static constexpr const char *FLIGHT_SQL_HEADER_DIRECT_LOAD       = "ob_direct_load";
 static constexpr const char *FLIGHT_SQL_HEADER_WRITE_HINT        = "ob_write_hint";
 static constexpr const char *FLIGHT_SQL_HEADER_WRITE_KEY_COLUMNS = "ob_write_key_columns";
+static constexpr const char *FLIGHT_SQL_HEADER_MERGE_OPTIONS     = "ob_merge_options";
 static constexpr const char *FLIGHT_SQL_WRITE_MODE_INSERT        = "insert";
 static constexpr const char *FLIGHT_SQL_WRITE_MODE_UPSERT        = "upsert";
 static constexpr const char *FLIGHT_SQL_WRITE_MODE_UPDATE        = "update";
+static constexpr const char *FLIGHT_SQL_WRITE_MODE_MERGE         = "merge";
 
 static int flight_sql_set_write_parallel_(const std::string &value,
                                           int &write_parallel)
@@ -321,19 +398,23 @@ static int flight_sql_set_write_parallel_(const std::string &value,
   return ret;
 }
 
-static int flight_sql_set_write_mode_(const std::string &value,
+static int flight_sql_set_write_mode_(const common::ObString &value,
                                       bool &is_upsert,
-                                      bool &is_update)
+                                      bool &is_update,
+                                      bool &is_merge)
 {
   int ret = OB_SUCCESS;
   is_upsert = false;
   is_update = false;
+  is_merge = false;
   if (value.empty() || value == FLIGHT_SQL_WRITE_MODE_INSERT) {
     // INSERT is the default append behavior.
   } else if (value == FLIGHT_SQL_WRITE_MODE_UPSERT) {
     is_upsert = true;
   } else if (value == FLIGHT_SQL_WRITE_MODE_UPDATE) {
     is_update = true;
+  } else if (value == FLIGHT_SQL_WRITE_MODE_MERGE) {
+    is_merge = true;
   } else {
     ret = OB_INVALID_ARGUMENT;
   }
@@ -423,6 +504,395 @@ static arrow::Status flight_sql_validate_update_key_columns_(
   }
   return arrow::Status::OK();
 }
+
+// V1 MERGE options borrow strings from a JSON tree owned by the DoPut arena.
+// Each branch maps to one native clause; DELETE WHERE belongs to UPDATE.
+class ObFlightSqlMergeOptions
+{
+public:
+  ObFlightSqlMergeOptions(common::ObIAllocator &allocator, uint64_t tenant_id)
+      : allocator_(allocator), tenant_id_(tenant_id),
+        target_alias_(common::ObString::make_string("t")),
+        source_alias_(common::ObString::make_string("s")),
+        update_assignments_(common::OB_MALLOC_NORMAL_BLOCK_SIZE,
+                            common::ModulePageAllocator(allocator, "FlightSQLMerge")),
+        insert_values_(common::OB_MALLOC_NORMAL_BLOCK_SIZE,
+                       common::ModulePageAllocator(allocator, "FlightSQLMerge"))
+  {}
+
+  int parse(const common::ObString &json, common::ObString &error);
+  int validate_expressions(ObSQLMode sql_mode, const sql::ObCharsets4Parser &charsets,
+                           common::ObString &error) const;
+  int build_sql(const common::ObString &db, const common::ObString &table,
+                uint64_t stream_id, bool has_parallel, int parallel,
+                const common::ObString &extra_hint, bool oracle_mode,
+                common::ObSqlString &sql) const;
+
+private:
+  struct Assignment
+  {
+    common::ObString column_;
+    common::ObString value_;
+    TO_STRING_KV(K_(column), K_(value));
+  };
+  typedef common::ObSEArray<Assignment, 8> Assignments;
+
+  static int invalid_(const char *message, common::ObString &error)
+  {
+    error = common::ObString::make_string(message);
+    return OB_INVALID_ARGUMENT;
+  }
+  static bool is_identifier_(const common::ObString &name)
+  {
+    bool valid = !name.empty();
+    for (int64_t i = 0; valid && i < name.length(); ++i) {
+      const unsigned char c = name[i];
+      valid = c >= 0x20 && c != 0x7f && c != '`' && c != '"';
+    }
+    return valid;
+  }
+  static bool is_alias_(const common::ObString &name)
+  {
+    bool valid = !name.empty();
+    for (int64_t i = 0; valid && i < name.length(); ++i) {
+      const unsigned char c = name[i];
+      valid = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+          || c == '_' || (i > 0 && c >= '0' && c <= '9');
+    }
+    return valid;
+  }
+  static int validate_object_(const common::ObIJsonBase &object,
+                              const char *const *allowed, int64_t allowed_count,
+                              common::ObString &error);
+  static int read_string_(const common::ObIJsonBase &object, const char *key,
+                          bool required, common::ObString &value, common::ObString &error);
+  static int read_assignments_(const common::ObIJsonBase &object, const char *key,
+                               Assignments &values, common::ObString &error);
+  int validate_expression_(const common::ObString &expression, bool predicate,
+                            ObSQLMode sql_mode, const sql::ObCharsets4Parser &charsets,
+                            common::ObString &error) const;
+  static int append_predicate_(const char *clause, const common::ObString &predicate,
+                               common::ObSqlString &sql);
+  static int append_value_(const common::ObString &value, common::ObSqlString &sql);
+
+  common::ObIAllocator &allocator_;
+  uint64_t tenant_id_;
+  common::ObString condition_;
+  common::ObString target_alias_;
+  common::ObString source_alias_;
+  Assignments update_assignments_;
+  common::ObString update_condition_;
+  common::ObString delete_condition_;
+  Assignments insert_values_;
+  common::ObString insert_condition_;
+  DISALLOW_COPY_AND_ASSIGN(ObFlightSqlMergeOptions);
+};
+
+int ObFlightSqlMergeOptions::validate_object_(const common::ObIJsonBase &object,
+    const char *const *allowed, int64_t allowed_count, common::ObString &error)
+{
+  int ret = OB_SUCCESS;
+  if (object.json_type() != common::ObJsonNodeType::J_OBJECT) {
+    ret = invalid_("merge options and clauses must be JSON objects", error);
+  } else {
+    for (uint64_t i = 0; OB_SUCC(ret) && i < object.element_count(); ++i) {
+      common::ObString key;
+      bool found = false;
+      if (OB_FAIL(object.get_key(i, key))) {
+        LOG_WARN("[FlightSQL] failed to read merge option name", K(ret));
+      } else {
+        for (int64_t j = 0; !found && j < allowed_count; ++j) {
+          found = key == allowed[j];
+        }
+        if (!found) {
+          ret = invalid_("unknown merge option or clause member", error);
+          LOG_WARN("[FlightSQL] unknown merge option", K(ret), K(key));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObFlightSqlMergeOptions::read_string_(const common::ObIJsonBase &object,
+    const char *key, bool required, common::ObString &value, common::ObString &error)
+{
+  int ret = OB_SUCCESS;
+  common::ObIJsonBase *node = nullptr;
+  const int lookup_ret = object.get_object_value(common::ObString::make_string(key), node);
+  if (lookup_ret == OB_SEARCH_NOT_FOUND && !required) {
+    // Keep defaults for omitted optional strings.
+  } else if (lookup_ret != OB_SUCCESS || OB_ISNULL(node)
+             || node->json_type() != common::ObJsonNodeType::J_STRING) {
+    ret = invalid_("merge expressions and aliases must be strings", error);
+  } else {
+    value = common::ObString(static_cast<int32_t>(node->get_data_length()), node->get_data());
+    if (value.trim().empty() || OB_NOT_NULL(value.find('\0'))) {
+      ret = invalid_("merge strings must not be empty or contain NUL", error);
+    }
+  }
+  return ret;
+}
+
+int ObFlightSqlMergeOptions::read_assignments_(const common::ObIJsonBase &object,
+    const char *key, Assignments &values, common::ObString &error)
+{
+  int ret = OB_SUCCESS;
+  common::ObIJsonBase *node = nullptr;
+  if (OB_FAIL(object.get_object_value(common::ObString::make_string(key), node))) {
+    if (ret == OB_SEARCH_NOT_FOUND) {
+      ret = invalid_("merge assignments or values are required", error);
+    } else {
+      LOG_WARN("[FlightSQL] failed to read merge assignments", K(ret));
+    }
+  } else if (OB_ISNULL(node) || node->json_type() != common::ObJsonNodeType::J_OBJECT
+             || node->element_count() == 0) {
+    ret = invalid_("merge assignments and values must be nonempty JSON objects", error);
+  } else {
+    for (uint64_t i = 0; OB_SUCC(ret) && i < node->element_count(); ++i) {
+      Assignment assignment;
+      common::ObIJsonBase *value = nullptr;
+      bool duplicate = false;
+      if (OB_FAIL(node->get_object_value(i, assignment.column_, value))) {
+        LOG_WARN("[FlightSQL] failed to read merge assignment", K(ret));
+      } else {
+        for (int64_t j = 0; !duplicate && j < values.count(); ++j) {
+          duplicate = 0 == assignment.column_.case_compare(values.at(j).column_);
+        }
+        if (!is_identifier_(assignment.column_) || duplicate) {
+          ret = invalid_("invalid or duplicate merge target column", error);
+        } else if (OB_ISNULL(value) || value->json_type() != common::ObJsonNodeType::J_STRING) {
+          ret = invalid_("merge assignment values must be SQL expression strings", error);
+        } else {
+          assignment.value_ = common::ObString(
+              static_cast<int32_t>(value->get_data_length()), value->get_data());
+          if (assignment.value_.trim().empty() || OB_NOT_NULL(assignment.value_.find('\0'))) {
+            ret = invalid_("merge assignment expressions must not be empty or contain NUL", error);
+          } else if (OB_FAIL(values.push_back(assignment))) {
+            LOG_WARN("[FlightSQL] failed to store merge assignment", K(ret));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObFlightSqlMergeOptions::parse(const common::ObString &json, common::ObString &error)
+{
+  int ret = OB_SUCCESS;
+  error = common::ObString::make_string("invalid merge options");
+  common::ObJsonNode *root = nullptr;
+  const char *const root_keys[] = {
+    "condition", "target_alias", "source_alias", "matched_update", "not_matched_insert"};
+  const char *const update_keys[] = {"assignments", "condition", "delete_condition"};
+  const char *const insert_keys[] = {"values", "condition"};
+  if (json.empty() || json.length() > 64 * 1024 || OB_NOT_NULL(json.find('\0'))) {
+    ret = invalid_("ob_merge_options must contain JSON of at most 64 KiB", error);
+  } else if (OB_FAIL(common::ObJsonParser::get_tree(&allocator_, json, root,
+      common::ObJsonParser::JSN_STRICT_FLAG | common::ObJsonParser::JSN_UNIQUE_FLAG))) {
+    error = common::ObString::make_string("ob_merge_options must be valid JSON with unique keys");
+  } else if (OB_ISNULL(root)) {
+    ret = invalid_("ob_merge_options must be a JSON object", error);
+  } else if (OB_FAIL(validate_object_(*root, root_keys, ARRAYSIZEOF(root_keys), error))) {
+  } else if (OB_FAIL(read_string_(*root, "condition", true, condition_, error))) {
+  } else if (OB_FAIL(read_string_(*root, "target_alias", false, target_alias_, error))) {
+  } else if (OB_FAIL(read_string_(*root, "source_alias", false, source_alias_, error))) {
+  } else if (!is_alias_(target_alias_) || !is_alias_(source_alias_)
+             || 0 == target_alias_.case_compare(source_alias_)) {
+    ret = invalid_("merge aliases must be distinct simple SQL identifiers", error);
+  } else {
+    common::ObIJsonBase *update = nullptr;
+    common::ObIJsonBase *insert = nullptr;
+    const int update_ret = root->get_object_value(common::ObString::make_string("matched_update"), update);
+    const int insert_ret = root->get_object_value(common::ObString::make_string("not_matched_insert"), insert);
+    if (update_ret == OB_SUCCESS && OB_NOT_NULL(update)) {
+      if (OB_FAIL(validate_object_(*update, update_keys, ARRAYSIZEOF(update_keys), error))) {
+      } else if (OB_FAIL(read_assignments_(*update, "assignments", update_assignments_, error))) {
+      } else if (OB_FAIL(read_string_(*update, "condition", false, update_condition_, error))) {
+      } else if (OB_FAIL(read_string_(*update, "delete_condition", false, delete_condition_, error))) {
+      }
+    } else if (update_ret != OB_SEARCH_NOT_FOUND) {
+      ret = invalid_("invalid matched_update clause", error);
+    }
+    if (OB_SUCC(ret)) {
+      if (insert_ret == OB_SUCCESS && OB_NOT_NULL(insert)) {
+        if (OB_FAIL(validate_object_(*insert, insert_keys, ARRAYSIZEOF(insert_keys), error))) {
+        } else if (OB_FAIL(read_assignments_(*insert, "values", insert_values_, error))) {
+        } else if (OB_FAIL(read_string_(*insert, "condition", false, insert_condition_, error))) {
+        }
+      } else if (insert_ret != OB_SEARCH_NOT_FOUND) {
+        ret = invalid_("invalid not_matched_insert clause", error);
+      }
+    }
+    if (OB_SUCC(ret) && update_assignments_.empty() && insert_values_.empty()) {
+      ret = invalid_("merge requires matched_update or not_matched_insert", error);
+    }
+  }
+  return ret;
+}
+
+int ObFlightSqlMergeOptions::validate_expression_(const common::ObString &expression,
+    bool predicate, ObSQLMode sql_mode, const sql::ObCharsets4Parser &charsets,
+    common::ObString &error) const
+{
+  int ret = OB_SUCCESS;
+  if (!predicate && 0 == expression.trim().case_compare("DEFAULT")) {
+    // DEFAULT is a native assignment value, rather than a SELECT expression.
+  } else {
+    common::ObSqlString query;
+    query.set_attr(common::ObMemAttr(tenant_id_, "FlightSQLMerge"));
+    ParseResult result{};
+    sql::ObParser parser(allocator_, sql_mode, charsets);
+    if (OB_FAIL(query.assign_fmt(predicate ? "SELECT 1 FROM DUAL WHERE (\n%.*s\n)"
+                                           : "SELECT (\n%.*s\n) FROM DUAL",
+                                 expression.length(), expression.ptr()))) {
+      LOG_WARN("[FlightSQL] failed to build merge expression query", K(ret));
+    } else if (OB_FAIL(parser.parse(query.string(), result, STD_MODE, false, true))) {
+      error = common::ObString::make_string("invalid merge SQL expression");
+    } else {
+      const ParseNode *root = result.result_tree_;
+      const ParseNode *select = OB_NOT_NULL(root) && root->type_ == T_STMT_LIST
+          && root->num_child_ == 1 && OB_NOT_NULL(root->children_)
+          ? root->children_[0] : nullptr;
+      const ParseNode *projects = OB_NOT_NULL(select) && select->type_ == T_SELECT
+          && select->num_child_ == PARSE_SELECT_MAX_IDX && OB_NOT_NULL(select->children_)
+          ? select->children_[PARSE_SELECT_SELECT] : nullptr;
+      const ParseNode *project = OB_NOT_NULL(projects) && projects->num_child_ == 1
+          && OB_NOT_NULL(projects->children_) ? projects->children_[0] : nullptr;
+      if (OB_ISNULL(project) || project->type_ != T_PROJECT_STRING
+          || project->num_child_ != 1 || OB_ISNULL(project->children_)
+          || OB_ISNULL(project->children_[0]) || project->children_[0]->type_ == T_ALIAS
+          || result.question_mark_ctx_.count_ != 0) {
+        ret = invalid_("merge options require individual SQL expressions without parameters", error);
+      } else {
+        // Both native parsers omit the generated, unaliased FROM DUAL node.
+        for (int64_t i = 0; OB_SUCC(ret) && i < select->num_child_; ++i) {
+          if (i != PARSE_SELECT_SELECT && !(predicate && i == PARSE_SELECT_WHERE)
+              && OB_NOT_NULL(select->children_[i])) {
+            ret = invalid_("merge expressions must not add SQL clauses or statements", error);
+          }
+        }
+      }
+    }
+    parser.free_result(result);
+  }
+  return ret;
+}
+
+int ObFlightSqlMergeOptions::validate_expressions(ObSQLMode sql_mode,
+    const sql::ObCharsets4Parser &charsets, common::ObString &error) const
+{
+  int ret = OB_SUCCESS;
+  const common::ObString *predicates[] = {
+    &condition_, &update_condition_, &delete_condition_, &insert_condition_};
+  const Assignments *assignments[] = {&update_assignments_, &insert_values_};
+  for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(predicates); ++i) {
+    if (!predicates[i]->empty()
+        && OB_FAIL(validate_expression_(*predicates[i], true, sql_mode, charsets, error))) {
+      LOG_WARN("[FlightSQL] invalid merge predicate", K(ret));
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(assignments); ++i) {
+    for (int64_t j = 0; OB_SUCC(ret) && j < assignments[i]->count(); ++j) {
+      if (OB_FAIL(validate_expression_(assignments[i]->at(j).value_, false,
+                                       sql_mode, charsets, error))) {
+        LOG_WARN("[FlightSQL] invalid merge assignment", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObFlightSqlMergeOptions::append_predicate_(const char *clause,
+    const common::ObString &predicate, common::ObSqlString &sql)
+{
+  int ret = OB_SUCCESS;
+  if (!predicate.empty()
+      && OB_FAIL(sql.append_fmt("%s(\n%.*s\n)", clause, predicate.length(), predicate.ptr()))) {
+    LOG_WARN("[FlightSQL] failed to append merge predicate", K(ret));
+  }
+  return ret;
+}
+
+int ObFlightSqlMergeOptions::append_value_(const common::ObString &value,
+    common::ObSqlString &sql)
+{
+  int ret = OB_SUCCESS;
+  if (0 == value.trim().case_compare("DEFAULT")) {
+    ret = sql.append("DEFAULT");
+  } else {
+    ret = sql.append_fmt("(\n%.*s\n)", value.length(), value.ptr());
+  }
+  return ret;
+}
+
+int ObFlightSqlMergeOptions::build_sql(const common::ObString &db,
+    const common::ObString &table, uint64_t stream_id, bool has_parallel, int parallel,
+    const common::ObString &extra_hint, bool oracle_mode, common::ObSqlString &sql) const
+{
+  int ret = OB_SUCCESS;
+  const char quote = oracle_mode ? '"' : '`';
+  if (OB_FAIL(sql.assign("MERGE /*+"))) {
+  } else if ((!has_parallel || parallel != 1) && OB_FAIL(sql.append(" ENABLE_PARALLEL_DML"))) {
+  } else if (!oracle_mode && OB_FAIL(sql.append(" OPT_PARAM('ENABLE_MERGE_INTO', 'true')"))) {
+  } else if (has_parallel && OB_FAIL(sql.append_fmt(" PARALLEL(%d)", parallel))) {
+  } else if (!extra_hint.empty() && OB_FAIL(sql.append_fmt(" %.*s", extra_hint.length(), extra_hint.ptr()))) {
+  } else if (OB_FAIL(sql.append_fmt(
+      " */ INTO %c%.*s%c.%c%.*s%c %.*s"
+      " USING (SELECT * FROM TABLE(arrow_stream(%lu))) %.*s",
+      quote, db.length(), db.ptr(), quote, quote, table.length(), table.ptr(), quote,
+      target_alias_.length(), target_alias_.ptr(), stream_id,
+      source_alias_.length(), source_alias_.ptr()))) {
+  } else if (OB_FAIL(append_predicate_(" ON ", condition_, sql))) {
+  }
+  if (OB_SUCC(ret) && !update_assignments_.empty()) {
+    if (OB_FAIL(sql.append(" WHEN MATCHED THEN UPDATE SET "))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < update_assignments_.count(); ++i) {
+        const Assignment &assignment = update_assignments_.at(i);
+        if (OB_FAIL(sql.append_fmt("%s%.*s.%c%.*s%c = ", i > 0 ? ", " : "",
+            target_alias_.length(), target_alias_.ptr(), quote,
+            assignment.column_.length(), assignment.column_.ptr(), quote))) {
+        } else if (OB_FAIL(append_value_(assignment.value_, sql))) {
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(append_predicate_(" WHERE ", update_condition_, sql))) {
+      } else if (OB_FAIL(append_predicate_(" DELETE WHERE ", delete_condition_, sql))) {
+      }
+    }
+  }
+  if (OB_SUCC(ret) && !insert_values_.empty()) {
+    if (OB_FAIL(sql.append(" WHEN NOT MATCHED THEN INSERT ("))) {
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < insert_values_.count(); ++i) {
+        const common::ObString &column = insert_values_.at(i).column_;
+        if (OB_FAIL(sql.append_fmt("%s%c%.*s%c", i > 0 ? ", " : "",
+                                   quote, column.length(), column.ptr(), quote))) {
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(sql.append(") VALUES ("))) {
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < insert_values_.count(); ++i) {
+        if (i > 0 && OB_FAIL(sql.append(", "))) {
+        } else if (OB_FAIL(append_value_(insert_values_.at(i).value_, sql))) {
+        }
+      }
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(sql.append(")"))) {
+        } else if (OB_FAIL(append_predicate_(" WHERE ", insert_condition_, sql))) {
+        }
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN("[FlightSQL] failed to build merge SQL", K(ret));
+  }
+  return ret;
+}
+
 // Multi-stream ingest gRPC headers (set by client on DoPut):
 //   ob_ingest_id               — ingest UUID from BeginIngest
 //   ob_ingest_streams_per_node — streams per observer (default 1)
@@ -447,7 +917,6 @@ static constexpr const char *FLIGHT_SQL_HEADER_SESSION_ID    = "x-ob-session-id"
 
 static arrow::Status ob_ret_to_flight_status(int ret,
                                              const std::string &tenant_name,
-                                             const std::string &user_name,
                                              const char *trace_id = nullptr)
 {
   const std::string tid = (trace_id && *trace_id) ? std::string(" trace_id=") + trace_id : "";
@@ -460,10 +929,12 @@ static arrow::Status ob_ret_to_flight_status(int ret,
       return arrow::flight::MakeFlightError(
           arrow::flight::FlightStatusCode::Unavailable,
           "connection limit reached");
+    case OB_PASSWORD_WRONG:
     case OB_ERR_USER_NOT_EXIST:
+    case OB_ERR_USER_IS_LOCKED:
       return arrow::flight::MakeFlightError(
           arrow::flight::FlightStatusCode::Unauthenticated,
-          "unknown user: " + user_name + "@" + tenant_name);
+          "invalid username or password");
     case OB_TIMEOUT:
       return arrow::flight::MakeFlightError(
           arrow::flight::FlightStatusCode::TimedOut,
@@ -500,9 +971,11 @@ static std::string ob_sql_exec_err_msg_(const int ret,
 
 static arrow::Status ob_sql_exec_ret_to_arrow_status(const int ret,
                                                     const char *trace_id,
-                                                    const std::string &sql_preview)
+                                                    const std::string &sql_preview,
+                                                    const std::string *detail_msg = nullptr)
 {
-  const std::string msg = ob_sql_exec_err_msg_(ret, trace_id, sql_preview);
+  const std::string msg = (OB_NOT_NULL(detail_msg) && !detail_msg->empty())
+      ? *detail_msg : ob_sql_exec_err_msg_(ret, trace_id, sql_preview);
   switch (ret) {
     case OB_TIMEOUT:
     case OB_TRANS_STMT_TIMEOUT:
@@ -516,9 +989,105 @@ static arrow::Status ob_sql_exec_ret_to_arrow_status(const int ret,
       return arrow::flight::MakeFlightError(arrow::flight::FlightStatusCode::Unavailable, msg);
     case OB_EAGAIN:
       return arrow::Status::Invalid("concurrent queries on the same session are not supported");
+    case OB_NOT_SUPPORTED:
+      return arrow::Status::NotImplemented(std::move(msg));
     default:
       return arrow::Status::Invalid(std::move(msg));
   }
+}
+
+// A failed DoGet open has no RecordBatchReader to write the final audit row.
+// Record it here with the same trace ID returned to the Flight client.
+static void flight_sql_audit_failed_query(
+    ObFlightSqlSession &session,
+    const ObFlightSqlQueryProcessor &proc,
+    const std::string &sql_text,
+    const int64_t request_time,
+    const int query_ret)
+{
+  if (OB_ISNULL(session.ob_session) || proc.trace_id().empty()) {
+    return;
+  }
+  MAKE_TENANT_SWITCH_SCOPE_GUARD(tenant_guard);
+  const int tenant_ret = tenant_guard.switch_to(session.tenant_id);
+  if (OB_SUCCESS != tenant_ret) {
+    LOG_WARN_RET(tenant_ret, "[FlightSQL] failed query audit: tenant switch failed",
+                 K(tenant_ret), K(session.tenant_id));
+    return;
+  }
+  try {
+    ObFlightSqlAuditRecord rec;
+    const int64_t now = common::ObTimeUtility::current_time();
+    rec.tenant_id = session.tenant_id;
+    rec.plan_id = static_cast<int64_t>(proc.plan_id());
+    rec.plan_type = proc.plan_type();
+    rec.stmt_type = proc.stmt_type();
+    rec.is_hit_plan_cache = proc.is_hit_plan_cache();
+    rec.request_time = request_time;
+    rec.elapsed_time = now > request_time ? now - request_time : 0;
+    rec.execute_time = rec.elapsed_time;
+    rec.ret_code = query_ret;
+    rec.peer_port = session.peer_port;
+    rec.ob_session_id = session.ob_session->get_server_sid();
+#define FSQL_SAFE_COPY(dst, src) \
+  do { strncpy((dst), (src).c_str(), sizeof(dst) - 1); (dst)[sizeof(dst) - 1] = '\0'; } while (0)
+    FSQL_SAFE_COPY(rec.user_name, session.user_name);
+    FSQL_SAFE_COPY(rec.peer_ip, session.peer_ip);
+    FSQL_SAFE_COPY(rec.trace_id, proc.trace_id());
+    FSQL_SAFE_COPY(rec.sql_id, proc.sql_id());
+    {
+      std::lock_guard<std::mutex> guard(session.mutex);
+      FSQL_SAFE_COPY(rec.schema_name, session.current_schema);
+      FSQL_SAFE_COPY(rec.catalog_name, session.current_catalog);
+    }
+#undef FSQL_SAFE_COPY
+    rec.sql_text = sql_text;
+    mirror_flight_sql_audit_record_to_gv_sql_audit(*session.ob_session, rec);
+  } catch (const std::bad_alloc &) {
+    // Preserve the original query error if audit allocation fails.
+  } catch (const std::exception &e) {
+    LOG_WARN_RET(query_ret, "[FlightSQL] failed query audit: unexpected exception",
+                 "what", e.what());
+  }
+}
+
+static bool flight_sql_schema_has_timestamp_ns(
+    const std::shared_ptr<arrow::Schema> &arrow_schema)
+{
+  bool found = false;
+  if (arrow_schema) {
+    for (int i = 0; !found && i < arrow_schema->num_fields(); ++i) {
+      const std::shared_ptr<arrow::Field> field = arrow_schema->field(i);
+      if (field && field->type() && field->type()->id() == arrow::Type::TIMESTAMP) {
+        const arrow::TimestampType &timestamp_type =
+            static_cast<const arrow::TimestampType &>(*field->type());
+        found = timestamp_type.unit() == arrow::TimeUnit::NANO;
+      }
+    }
+  }
+  return found;
+}
+
+static std::string flight_sql_ingest_error_message(
+    const int ret, const std::shared_ptr<arrow::Schema> &arrow_schema)
+{
+  if (OB_NOT_SUPPORTED == ret && flight_sql_schema_has_timestamp_ns(arrow_schema)) {
+    return
+        "Flight SQL ingest does not support Arrow timestamp[ns]; "
+        "cast it explicitly to timestamp[us], timestamp[ms], or timestamp[s]";
+  }
+  return std::string();
+}
+
+static std::string flight_sql_prepared_parameter_error_message(
+    const int ret, const std::shared_ptr<arrow::Schema> &arrow_schema)
+{
+  if (OB_NOT_SUPPORTED == ret && flight_sql_schema_has_timestamp_ns(arrow_schema)) {
+    return
+        "Flight SQL prepared parameters do not support Arrow timestamp[ns]; "
+        "cast it explicitly to timestamp[us], timestamp[ms], or timestamp[s]";
+  }
+  return std::string();
 }
 
 // ============================================================
@@ -572,13 +1141,57 @@ static int apply_catalog_to_session(ObFlightSqlSession &session, const std::stri
 // Apply schema to session. Updates session.current_schema on success.
 static int apply_schema_to_session(ObFlightSqlSession &session, const std::string &db)
 {
+  int ret = OB_SUCCESS;
   lib::ObMallocHookAttrGuard malloc_guard(
       common::ObMemAttr(session.tenant_id, "FlightSQLSess"),
       false /* use_500 */);
-  if (OB_ISNULL(session.ob_session)) { return OB_ERR_UNEXPECTED; }
+  share::schema::ObSchemaGetterGuard schema_guard;
+  ObSessionPrivInfo session_priv;
   const common::ObString db_str(db.size(), db.c_str());
-  const int ret = session.ob_session->set_default_database(db_str);
-  if (OB_SUCCESS == ret) { session.current_schema = db; }
+  uint64_t catalog_id = OB_INVALID_ID;
+  uint64_t db_id = OB_INVALID_ID;
+
+  if (OB_ISNULL(session.ob_session) || OB_ISNULL(GCTX.schema_service_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[FlightSQL] apply_schema_to_session: session or schema service is null",
+             K(ret));
+  } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(
+                 session.ob_session->get_effective_tenant_id(), schema_guard))) {
+    LOG_WARN("[FlightSQL] apply_schema_to_session: get schema guard failed",
+             K(ret), "schema", db.c_str());
+  } else if (OB_FAIL(session.ob_session->get_session_priv_info(session_priv))) {
+    LOG_WARN("[FlightSQL] apply_schema_to_session: get session privilege failed",
+             K(ret), "schema", db.c_str());
+  } else if (OB_FALSE_IT(catalog_id = session.ob_session->get_current_default_catalog())) {
+  } else if (OB_FAIL(schema_guard.check_db_access(
+                 session_priv,
+                 session.ob_session->get_enable_role_array(),
+                 catalog_id,
+                 db_str))) {
+    if (OB_ERR_NO_DB_SELECTED == ret) {
+      ret = OB_ERR_BAD_DATABASE;
+    }
+    LOG_WARN("[FlightSQL] apply_schema_to_session: check database access failed",
+             K(ret), K(catalog_id), "schema", db.c_str());
+  } else if (OB_FALSE_IT(db_id = is_internal_catalog_id(catalog_id)
+                                    ? OB_INVALID_ID
+                                    : OB_MIN_EXTERNAL_OBJECT_ID + 1)) {
+  } else if (is_internal_catalog_id(catalog_id)
+             && OB_FAIL(schema_guard.get_database_id(
+                    session.ob_session->get_effective_tenant_id(), db_str, db_id))) {
+    LOG_WARN("[FlightSQL] apply_schema_to_session: get database id failed",
+             K(ret), K(catalog_id), "schema", db.c_str());
+  } else if (OB_FAIL(session.ob_session->set_default_catalog_db(
+                 catalog_id, db_id, db_str, nullptr))) {
+    LOG_WARN("[FlightSQL] apply_schema_to_session: set catalog database failed",
+             K(ret), K(catalog_id), K(db_id), "schema", db.c_str());
+  } else if (OB_FAIL(session.ob_session->update_database_variables(&schema_guard))) {
+    LOG_WARN("[FlightSQL] apply_schema_to_session: update database variables failed",
+             K(ret), K(catalog_id), K(db_id), "schema", db.c_str());
+  } else {
+    session.ob_session->set_db_priv_set(session_priv.db_priv_set_);
+    session.current_schema = db;
+  }
   return ret;
 }
 
@@ -641,6 +1254,18 @@ static int apply_schema_to_session(ObFlightSqlSession &session, const std::strin
     return arrow::flight::sql::CancelResult::kUnspecified; \
   }
 
+// Listener initialization crosses STL and Arrow allocation boundaries.  Do not
+// log from these catch blocks: the caller logs the returned OceanBase error,
+// and avoiding logging here keeps OOM handling allocation-free and secret-free.
+#define OB_FLIGHT_SQL_CATCH_INIT_LISTENER \
+  catch (const std::bad_alloc &) { \
+    return OB_ALLOCATE_MEMORY_FAILED; \
+  } catch (const std::exception &) { \
+    return OB_ERR_UNEXPECTED; \
+  } catch (...) { \
+    return OB_ERR_UNEXPECTED; \
+  }
+
 // ============================================================
 // Auth handler
 // ============================================================
@@ -663,7 +1288,9 @@ public:
     // way ObMPBase does for MySQL connections.
     common::ObCurTraceId::init(GCTX.self_addr());
     std::string raw;
-    std::string user_name, tenant_name;
+    std::string user_name, tenant_name, password;
+    DEFER(flight_sql_cleanse_string(raw));
+    DEFER(flight_sql_cleanse_string(password));
     const char *cred_source = "none";
     int ret = OB_SUCCESS;
     // Path 1: Handshake stream payload (BasicAuth proto or raw "user@tenant:pass")
@@ -672,13 +1299,16 @@ public:
              "ok", read_st.ok(), "payload_bytes", (int64_t)raw.size());
     if (read_st.ok() && !raw.empty()) {
       arrow::flight::BasicAuth auth;
+      DEFER(flight_sql_cleanse_string(auth.password));
       const arrow::Status parse_st = arrow::flight::BasicAuth::Deserialize(raw, &auth);
       if (parse_st.ok() && !auth.username.empty()) {
         parse_user_tenant_(auth.username, user_name, tenant_name);
+        password = auth.password;
         cred_source = "BasicAuth-proto";
       } else {
-        const size_t colon = raw.rfind(':');
+        const size_t colon = raw.find(':');
         const std::string at_user = (colon != std::string::npos) ? raw.substr(0, colon) : raw;
+        password = (colon != std::string::npos) ? raw.substr(colon + 1) : "";
         parse_user_tenant_(at_user, user_name, tenant_name);
         cred_source = "raw-string";
       }
@@ -687,10 +1317,11 @@ public:
     // Path 2: ADBC C++ driver sends "Authorization: Basic base64(user:pass)" as
     // gRPC call metadata instead of using the Handshake stream payload.
     if (user_name.empty()) {
-      const std::string basic_user = extract_basic_user_(context.incoming_headers());
+      std::string basic_user;
+      const bool found = extract_basic_credentials_(context.incoming_headers(), basic_user, password);
       LOG_TRACE("[FlightSQL] Authenticate: Basic header extraction", K(ret),
-               "found", !basic_user.empty(), "raw_user", basic_user.c_str());
-      if (!basic_user.empty()) {
+               K(found), "raw_user", basic_user.c_str());
+      if (found) {
         parse_user_tenant_(basic_user, user_name, tenant_name);
         cred_source = "Basic-header";
       }
@@ -750,10 +1381,13 @@ public:
     // Create session
     int session_ret = OB_SUCCESS;
     const char *create_trace_id = common::ObCurTraceId::get_trace_id_str();
-    std::shared_ptr<ObFlightSqlSession> session = session_mgr_->create(tenant_id, tenant_name, user_name, is_oracle_mode,
-                                        peer_ip, peer_port, &session_ret);
+    std::shared_ptr<ObFlightSqlSession> session = session_mgr_->create(
+        tenant_id, tenant_name, user_name, password, is_oracle_mode,
+        peer_ip, peer_port, &session_ret);
+    flight_sql_cleanse_string(password);
+    flight_sql_cleanse_string(raw);
     if (!session) {
-      return ob_ret_to_flight_status(session_ret, tenant_name, user_name, create_trace_id);
+      return ob_ret_to_flight_status(session_ret, tenant_name, create_trace_id);
     }
 
     LOG_TRACE("[FlightSQL] Authenticate: session created",
@@ -876,18 +1510,28 @@ private:
     return {};
   }
 
-  // Extract the username part from "Authorization: Basic base64(user:pass)".
-  static std::string extract_basic_user_(const arrow::flight::CallHeaders &hdrs)
+  // Extract username and password from "Authorization: Basic base64(user:pass)".
+  static bool extract_basic_credentials_(const arrow::flight::CallHeaders &hdrs,
+                                         std::string &user_out,
+                                         std::string &password_out)
   {
+    bool found = false;
+    user_out.clear();
+    password_out.clear();
     arrow::flight::CallHeaders::const_iterator it = hdrs.find(FLIGHT_SQL_HEADER_AUTHORIZATION);
-    if (it == hdrs.end()) { return {}; }
-    const std::string_view val = it->second;
-    static constexpr std::string_view kBasic = "Basic ";
-    if (val.size() <= kBasic.size() || val.substr(0, kBasic.size()) != kBasic) { return {}; }
-    const std::string decoded = arrow::util::base64_decode(val.substr(kBasic.size()));
-    // decoded is "user:pass" — return everything before the first ':'
-    const size_t colon = decoded.find(':');
-    return (colon != std::string::npos) ? decoded.substr(0, colon) : decoded;
+    if (it != hdrs.end()) {
+      const std::string_view val = it->second;
+      static constexpr std::string_view kBasic = "Basic ";
+      if (val.size() > kBasic.size() && val.substr(0, kBasic.size()) == kBasic) {
+        std::string decoded = arrow::util::base64_decode(val.substr(kBasic.size()));
+        DEFER(flight_sql_cleanse_string(decoded));
+        const size_t colon = decoded.find(':');
+        user_out = (colon != std::string::npos) ? decoded.substr(0, colon) : decoded;
+        password_out = (colon != std::string::npos) ? decoded.substr(colon + 1) : "";
+        found = !user_out.empty();
+      }
+    }
+    return found;
   }
 
   static void parse_user_tenant_(const std::string &at_user,
@@ -950,7 +1594,7 @@ private:
                "tenant", tenant_name.c_str());
       return arrow::flight::MakeFlightError(
           arrow::flight::FlightStatusCode::Unauthenticated,
-          std::string("unknown tenant: ") + tenant_name);
+          "invalid username or password");
     }
     tenant_id_out = tid;
 
@@ -1289,9 +1933,13 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
     const common::ObString sql_str(command.query.size(), command.query.c_str());
     int ret = proc.prepare(*session, sql_str);
     if (ret != OB_SUCCESS) {
+      LOG_WARN("[FlightSQL] GetFlightInfoStatement: prepare failed",
+               K(ret), "ob_trace_id", proc.trace_id().c_str(),
+               "sql_id", proc.sql_id().c_str(), "plan_id", proc.plan_id());
       const std::string sql_preview =
           command.query.substr(0, std::min(size_t(200), command.query.size()));
-      return ob_sql_exec_ret_to_arrow_status(ret, proc.trace_id().c_str(), sql_preview);
+      return ob_sql_exec_ret_to_arrow_status(
+          ret, proc.trace_id().c_str(), sql_preview, &proc.error_detail());
     }
 
     const std::string query_id = next_query_id();
@@ -1441,21 +2089,17 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
 
     if (exec_ret != OB_SUCCESS) {
       // open_query failed → unlock here (reader won't be constructed to do it).
+      LOG_WARN_RET(exec_ret, "[FlightSQL] DoGetStatement: query open failed",
+                   K(exec_ret), "ob_trace_id", proc.trace_id().c_str(),
+                   "sql_id", proc.sql_id().c_str(), "plan_id", proc.plan_id(),
+                   K(elapsed_time), "cancelled", context.is_cancelled());
+      flight_sql_audit_failed_query(*session, proc, sql, request_time, exec_ret);
       if (query_locked && OB_NOT_NULL(session->ob_session)) {
         (void)session->ob_session->unlock_query();
       }
-      if (context.is_cancelled()) {
-        LOG_TRACE("[FlightSQL] DoGetStatement: RPC cancelled after failed execute",
-                 K(exec_ret),
-                 "session_id", session_id.c_str(),
-                 "query_id", query_id.c_str(),
-                 "elapsed_us", elapsed_time,
-                 "peer", context.peer().c_str());
-        return arrow::flight::MakeFlightError(arrow::flight::FlightStatusCode::Cancelled,
-                                              "request cancelled during execution");
-      }
       const std::string sql_preview = sql.substr(0, std::min(size_t(200), sql.size()));
-      return ob_sql_exec_ret_to_arrow_status(exec_ret, proc.trace_id().c_str(), sql_preview);
+      return ob_sql_exec_ret_to_arrow_status(
+          exec_ret, proc.trace_id().c_str(), sql_preview, &proc.error_detail());
     }
 
     // After a successful open_query(), context.is_cancelled() is often true without a real
@@ -1796,7 +2440,7 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
   }
 
   // ============================================================
-  // Prepared statements — not implemented this release
+  // Prepared DML
   // ============================================================
 
   arrow::Result<std::unique_ptr<arrow::flight::FlightInfo>> GetFlightInfoPreparedStatement(
@@ -1818,20 +2462,334 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
   { return arrow::Status::NotImplemented("PreparedStatement not implemented"); }
 
   arrow::Result<int64_t> DoPutPreparedStatementUpdate(
-      const arrow::flight::ServerCallContext &,
-      const arrow::flight::sql::PreparedStatementUpdate &,
-      arrow::flight::FlightMessageReader *) override
-  { return arrow::Status::NotImplemented("PreparedStatement not implemented"); }
+      const arrow::flight::ServerCallContext &context,
+      const arrow::flight::sql::PreparedStatementUpdate &command,
+      arrow::flight::FlightMessageReader *reader) override
+  {
+    try {
+    int ret = OB_SUCCESS;
+    common::ObCurTraceId::init(GCTX.self_addr());
+    const std::string session_id = context.peer_identity();
+    std::shared_ptr<ObFlightSqlSession> session = session_mgr_.get_live(session_id);
+    if (!session) {
+      return arrow::flight::MakeFlightError(
+          arrow::flight::FlightStatusCode::Unauthenticated,
+          std::string("session not found: ") + session_id);
+    } else if (OB_ISNULL(reader)) {
+      return arrow::Status::Invalid("[FlightSQL] prepared update reader is null");
+    }
+
+    ObSessionDoPutGuard doput_guard(*session);
+    if (!doput_guard.acquired()) {
+      return arrow::Status::Invalid(
+          "[FlightSQL] concurrent DoPut on the same session is not supported; "
+          "use a separate Flight SQL session");
+    }
+    std::unique_lock<std::mutex> prepared_lock(session->prepared_mutex);
+    ObSessionQueryGuard query_guard(*session);
+    if (!query_guard.acquired()) {
+      return arrow::Status::Invalid(
+          "concurrent queries on the same session are not supported");
+    }
+    if (!session->prepared.active) {
+      return arrow::Status::Invalid("[FlightSQL] no active prepared statement");
+    } else if (command.prepared_statement_handle != session->prepared.opaque_handle) {
+      return arrow::Status::Invalid("[FlightSQL] stale prepared statement handle");
+    }
+
+    const int64_t request_timeout_ts =
+        ObFlightSqlQueryProcessor::start_request_timeout(*session);
+    lib::WorkerTimeoutGuard request_timeout_guard(request_timeout_ts);
+    ARROW_ASSIGN_OR_RAISE(std::shared_ptr<arrow::Schema> stream_schema,
+                          reader->GetSchema());
+    if (!stream_schema) {
+      return arrow::Status::Invalid("[FlightSQL] prepared parameter schema is null");
+    } else if (stream_schema->num_fields() != session->prepared.parameter_count) {
+      std::ostringstream msg;
+      msg << "[FlightSQL] prepared parameter count mismatch: expected "
+          << session->prepared.parameter_count << ", got "
+          << stream_schema->num_fields();
+      return arrow::Status::Invalid(msg.str());
+    } else if (OB_FAIL(ObFlightSqlParamConverter::validate_schema(
+                   *stream_schema, *session))) {
+      const std::string detail_msg =
+          flight_sql_prepared_parameter_error_message(ret, stream_schema);
+      return ob_sql_exec_ret_to_arrow_status(
+          ret, nullptr, "prepared parameter schema", &detail_msg);
+    }
+
+    common::ObArenaAllocator row_allocator(
+        "FlightSQLPSPar", OB_MALLOC_NORMAL_BLOCK_SIZE,
+        static_cast<int64_t>(session->tenant_id));
+    ObFlightSqlQueryProcessor proc;
+    int64_t total_affected_rows = 0;
+    int64_t parameter_row_idx = 0;
+    while (true) {
+      if (context.is_cancelled()) {
+        return arrow::flight::MakeFlightError(
+            arrow::flight::FlightStatusCode::Cancelled,
+            "[FlightSQL] prepared update was cancelled");
+      }
+      ARROW_ASSIGN_OR_RAISE(arrow::flight::FlightStreamChunk chunk, reader->Next());
+      if (!chunk.data && !chunk.app_metadata) {
+        break;
+      } else if (!chunk.data) {
+        continue;
+      }
+      const std::shared_ptr<arrow::RecordBatch> &batch = chunk.data;
+      if (batch->num_columns() != session->prepared.parameter_count) {
+        std::ostringstream msg;
+        msg << "[FlightSQL] prepared parameter count mismatch in RecordBatch: expected "
+            << session->prepared.parameter_count << ", got " << batch->num_columns();
+        return arrow::Status::Invalid(msg.str());
+      }
+
+      for (int64_t batch_row_idx = 0; batch_row_idx < batch->num_rows(); ++batch_row_idx) {
+        if (context.is_cancelled()) {
+          return arrow::flight::MakeFlightError(
+              arrow::flight::FlightStatusCode::Cancelled,
+              "[FlightSQL] prepared update was cancelled before parameter row "
+                  + std::to_string(parameter_row_idx));
+        }
+
+        int64_t row_affected_rows = 0;
+        {
+          int64_t failed_column = -1;
+          const common::ObString sql_text(
+              static_cast<int32_t>(session->prepared.sql_text.size()),
+              session->prepared.sql_text.c_str());
+          if (OB_FAIL(proc.execute_prepared_update(
+                  *session, session->prepared.native_client_stmt_id,
+                  session->prepared.statement_type, *batch, batch_row_idx,
+                  row_allocator, sql_text, session->prepared.sensitive_sql,
+                  failed_column))) {
+            std::string preview = "prepared parameter row "
+                + std::to_string(parameter_row_idx) + "; sql: ";
+            if (session->prepared.sensitive_sql) {
+              preview.append(OB_MASKED_STR);
+            } else {
+              preview.append(session->prepared.sql_text.substr(
+                  0, std::min(size_t(200), session->prepared.sql_text.size())));
+            }
+            if (failed_column >= 0) {
+              std::string detail_msg =
+                  flight_sql_prepared_parameter_error_message(ret, stream_schema);
+              if (detail_msg.empty()) {
+                std::ostringstream msg;
+                msg << "[FlightSQL] failed to bind prepared parameter row "
+                    << parameter_row_idx << ", column " << failed_column
+                    << ": " << ob_strerror(ret) << " (" << ob_error_name(ret) << ")";
+                detail_msg = msg.str();
+              } else {
+                detail_msg.append(" at prepared parameter row ");
+                detail_msg.append(std::to_string(parameter_row_idx));
+                detail_msg.append(", column ");
+                detail_msg.append(std::to_string(failed_column));
+              }
+              return ob_sql_exec_ret_to_arrow_status(
+                  ret, proc.trace_id().c_str(), preview, &detail_msg);
+            }
+            return ob_sql_exec_ret_to_arrow_status(
+                ret, proc.trace_id().c_str(), preview);
+          }
+          row_affected_rows = proc.affected_rows();
+        }
+        row_allocator.reset();
+
+        if (row_affected_rows < 0
+            || row_affected_rows > std::numeric_limits<int64_t>::max()
+                                      - total_affected_rows) {
+          return arrow::Status::Invalid(
+              "[FlightSQL] prepared update affected-row total overflow at parameter row "
+              + std::to_string(parameter_row_idx));
+        }
+        total_affected_rows += row_affected_rows;
+        if (parameter_row_idx == std::numeric_limits<int64_t>::max()) {
+          return arrow::Status::Invalid(
+              "[FlightSQL] prepared parameter row index overflow");
+        }
+        ++parameter_row_idx;
+      }
+    }
+
+    LOG_TRACE("[FlightSQL] DoPutPreparedStatementUpdate: OK",
+              "session_id", session_id.c_str(),
+              "parameter_rows", parameter_row_idx,
+              "affected_rows", total_affected_rows,
+              "trace_id", common::ObCurTraceId::get_trace_id_str());
+    return total_affected_rows;
+    } OB_FLIGHT_SQL_CATCH_AND_REMOVE_SESSION
+  }
 
   arrow::Result<arrow::flight::sql::ActionCreatePreparedStatementResult> CreatePreparedStatement(
-      const arrow::flight::ServerCallContext &,
-      const arrow::flight::sql::ActionCreatePreparedStatementRequest &) override
-  { return arrow::Status::NotImplemented("PreparedStatement not implemented"); }
+      const arrow::flight::ServerCallContext &context,
+      const arrow::flight::sql::ActionCreatePreparedStatementRequest &request) override
+  {
+    try {
+    int ret = OB_SUCCESS;
+    common::ObCurTraceId::init(GCTX.self_addr());
+    const std::string session_id = context.peer_identity();
+    std::shared_ptr<ObFlightSqlSession> session = session_mgr_.get_live(session_id);
+    if (!session) {
+      return arrow::flight::MakeFlightError(
+          arrow::flight::FlightStatusCode::Unauthenticated,
+          std::string("session not found: ") + session_id);
+    } else if (!request.transaction_id.empty()) {
+      return arrow::Status::NotImplemented(
+          "[FlightSQL] prepared statements inside protocol transactions are not supported");
+    } else if (!request.query.empty() && request.query[0] == '{'
+               && !ob_json_str(request.query, "ob_action").empty()) {
+      // Ingest control actions are handled by GetFlightInfoStatement and
+      // DoGetStatement.  They are not SQL and must not reach stmt_prepare().
+      return arrow::Status::NotImplemented(
+          "[FlightSQL] ingest control actions are not prepared statements");
+    }
+
+    std::unique_lock<std::mutex> prepared_lock(session->prepared_mutex);
+    ObSessionQueryGuard query_guard(*session);
+    if (!query_guard.acquired()) {
+      return arrow::Status::Invalid(
+          "concurrent queries on the same session are not supported");
+    }
+    const int64_t request_timeout_ts =
+        ObFlightSqlQueryProcessor::start_request_timeout(*session);
+    lib::WorkerTimeoutGuard request_timeout_guard(request_timeout_ts);
+
+    const bool had_active_statement = session->prepared.active;
+    const common::ObPsStmtId old_client_stmt_id =
+        session->prepared.native_client_stmt_id;
+    {
+      lib::ObMallocHookAttrGuard malloc_guard(
+          common::ObMemAttr(session->tenant_id, "FlightSQLSess"), false /* use_500 */);
+      session->prepared.reset();
+    }
+    if (had_active_statement) {
+      if (common::OB_INVALID_ID == old_client_stmt_id) {
+        ret = OB_ERR_UNEXPECTED;
+        return ob_sql_exec_ret_to_arrow_status(
+            ret, common::ObCurTraceId::get_trace_id_str(),
+            "replace prepared statement");
+      } else if (OB_FAIL(ObFlightSqlQueryProcessor::close_prepared_statement(
+                     *session, old_client_stmt_id))) {
+        return ob_sql_exec_ret_to_arrow_status(
+            ret, common::ObCurTraceId::get_trace_id_str(),
+            "replace prepared statement");
+      }
+    }
+
+    if (session->prepared_generation_ == std::numeric_limits<uint64_t>::max()) {
+      return arrow::Status::CapacityError(
+          "[FlightSQL] prepared statement generation exhausted");
+    }
+    const uint64_t generation = ++session->prepared_generation_;
+    if (request.query.empty()) {
+      return arrow::Status::Invalid("[FlightSQL] prepared statement query is empty");
+    }
+
+    const common::ObString sql_text(
+        static_cast<int32_t>(request.query.size()), request.query.c_str());
+    ObFlightSqlQueryProcessor proc;
+    common::ObPsStmtId client_stmt_id = common::OB_INVALID_ID;
+    sql::stmt::StmtType stmt_type = sql::stmt::T_NONE;
+    int64_t parameter_count = 0;
+    bool sensitive_sql = false;
+    if (OB_FAIL(proc.prepare_prepared_update(
+            *session, sql_text, client_stmt_id, stmt_type,
+            parameter_count, sensitive_sql))) {
+      if (common::OB_INVALID_ID != client_stmt_id) {
+        const int close_ret = ObFlightSqlQueryProcessor::close_prepared_statement(
+            *session, client_stmt_id);
+        if (OB_SUCCESS != close_ret) {
+          LOG_WARN("[FlightSQL] failed to close rejected prepared statement",
+                   K(close_ret), K(client_stmt_id));
+        }
+      }
+      const std::string preview = sensitive_sql
+          ? std::string(OB_MASKED_STR)
+          : request.query.substr(0, std::min(size_t(200), request.query.size()));
+      return ob_sql_exec_ret_to_arrow_status(
+          ret, proc.trace_id().c_str(), preview);
+    }
+
+    arrow::flight::sql::ActionCreatePreparedStatementResult result;
+    result.dataset_schema = arrow::schema({});
+    result.parameter_schema = proc.arrow_schema()
+        ? proc.arrow_schema() : arrow::schema({});
+    result.prepared_statement_handle =
+        flight_sql_make_prepared_handle(generation);
+
+    {
+      lib::ObMallocHookAttrGuard malloc_guard(
+          common::ObMemAttr(session->tenant_id, "FlightSQLSess"), false /* use_500 */);
+      session->prepared.active = true;
+      session->prepared.generation = generation;
+      session->prepared.opaque_handle = result.prepared_statement_handle;
+      session->prepared.native_client_stmt_id = client_stmt_id;
+      session->prepared.statement_type = stmt_type;
+      session->prepared.parameter_count = parameter_count;
+      session->prepared.sql_text = request.query;
+      session->prepared.sensitive_sql = sensitive_sql;
+    }
+
+    LOG_TRACE("[FlightSQL] CreatePreparedStatement: OK",
+              "session_id", session_id.c_str(),
+              "generation", generation,
+              "native_client_stmt_id", client_stmt_id,
+              "stmt_type", stmt_type,
+              "parameter_count", parameter_count,
+              "trace_id", proc.trace_id().c_str());
+    return result;
+    } OB_FLIGHT_SQL_CATCH_AND_REMOVE_SESSION
+  }
 
   arrow::Status ClosePreparedStatement(
-      const arrow::flight::ServerCallContext &,
-      const arrow::flight::sql::ActionClosePreparedStatementRequest &) override
-  { return arrow::Status::NotImplemented("PreparedStatement not implemented"); }
+      const arrow::flight::ServerCallContext &context,
+      const arrow::flight::sql::ActionClosePreparedStatementRequest &request) override
+  {
+    try {
+    int ret = OB_SUCCESS;
+    common::ObCurTraceId::init(GCTX.self_addr());
+    const std::string session_id = context.peer_identity();
+    std::shared_ptr<ObFlightSqlSession> session = session_mgr_.get_live(session_id);
+    if (!session) {
+      return arrow::flight::MakeFlightError(
+          arrow::flight::FlightStatusCode::Unauthenticated,
+          std::string("session not found: ") + session_id);
+    }
+
+    std::unique_lock<std::mutex> prepared_lock(session->prepared_mutex);
+    ObSessionQueryGuard query_guard(*session);
+    if (!query_guard.acquired()) {
+      return arrow::Status::Invalid(
+          "concurrent queries on the same session are not supported");
+    }
+    if (!session->prepared.active
+        || request.prepared_statement_handle != session->prepared.opaque_handle) {
+      return arrow::Status::OK();
+    }
+
+    const int64_t request_timeout_ts =
+        ObFlightSqlQueryProcessor::start_request_timeout(*session);
+    lib::WorkerTimeoutGuard request_timeout_guard(request_timeout_ts);
+    const common::ObPsStmtId client_stmt_id =
+        session->prepared.native_client_stmt_id;
+    {
+      lib::ObMallocHookAttrGuard malloc_guard(
+          common::ObMemAttr(session->tenant_id, "FlightSQLSess"), false /* use_500 */);
+      session->prepared.reset();
+    }
+    if (OB_FAIL(ObFlightSqlQueryProcessor::close_prepared_statement(
+            *session, client_stmt_id))) {
+      return ob_sql_exec_ret_to_arrow_status(
+          ret, common::ObCurTraceId::get_trace_id_str(),
+          "close prepared statement");
+    }
+    LOG_TRACE("[FlightSQL] ClosePreparedStatement: OK",
+              "session_id", session_id.c_str(),
+              "native_client_stmt_id", client_stmt_id);
+    return arrow::Status::OK();
+    } OB_FLIGHT_SQL_CATCH_AND_REMOVE_SESSION
+  }
 
   // ============================================================
   // Bulk ingest: DoPutCommandStatementIngest
@@ -1896,6 +2854,8 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
     const std::string catalog_name = command.catalog.value_or(session_catalog);
     const std::string db_name = command.schema.value_or(session_schema);
     const std::string &table_name = command.table;
+    const bool is_oracle_mode = OB_NOT_NULL(session->ob_session)
+        && session->ob_session->is_oracle_compatible();
     if (db_name.empty()) {
       return arrow::Status::Invalid(
           "[FlightSQL] No database specified: set 'schema' in StatementIngest "
@@ -1908,6 +2868,12 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
         || !flight_sql_is_safe_identifier(table_name)) {
       return arrow::Status::Invalid(
           "[FlightSQL] database and table names must not contain SQL quote or control characters");
+    }
+    if (is_oracle_mode
+        && (!flight_sql_is_safe_oracle_identifier(db_name)
+            || !flight_sql_is_safe_oracle_identifier(table_name))) {
+      return arrow::Status::Invalid(
+          "[FlightSQL] Oracle-mode ingest requires regular unquoted database and table identifiers");
     }
 
     // External catalogs not supported in V1.
@@ -1939,6 +2905,32 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
         if (it_schema != hdrs.end() && !it_schema->second.empty()) {
           ingest_arrow_schema_hdr = std::string(it_schema->second);
         }
+      }
+    }
+    if (!ingest_id_hdr.empty()) {
+      // MERGE is a V1 single-stream extension. Do not silently ignore its
+      // options while registering a V2/V3 worker slot.
+      const auto mode_it = command.options.find(FLIGHT_SQL_HEADER_WRITE_MODE);
+      common::ObString slot_mode;
+      if (mode_it != command.options.end()) {
+        slot_mode.assign_ptr(mode_it->second.data(), mode_it->second.size());
+      }
+      const auto &hdrs = context.incoming_headers();
+      const auto header_it = hdrs.find(FLIGHT_SQL_HEADER_WRITE_MODE);
+      if (header_it != hdrs.end()) {
+        slot_mode.assign_ptr(header_it->second.data(), header_it->second.size());
+      }
+      const auto merge_it = command.options.find(FLIGHT_SQL_HEADER_MERGE_OPTIONS);
+      common::ObString slot_merge;
+      if (merge_it != command.options.end()) {
+        slot_merge.assign_ptr(merge_it->second.data(), merge_it->second.size());
+      }
+      const auto merge_header_it = hdrs.find(FLIGHT_SQL_HEADER_MERGE_OPTIONS);
+      if (merge_header_it != hdrs.end()) {
+        slot_merge.assign_ptr(merge_header_it->second.data(), merge_header_it->second.size());
+      }
+      if (slot_mode == FLIGHT_SQL_WRITE_MODE_MERGE || !slot_merge.empty()) {
+        return arrow::Status::NotImplemented("[FlightSQL] merge ingest supports V1 single-stream only");
       }
     }
     std::shared_ptr<arrow::Schema> advertised_ingest_schema;
@@ -1974,6 +2966,10 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
       if (!flight_sql_is_safe_identifier(col_name)) {
         return arrow::Status::Invalid(
             "[FlightSQL] Arrow field names must not contain SQL quote or control characters");
+      }
+      if (is_oracle_mode && !flight_sql_is_safe_oracle_identifier(col_name)) {
+        return arrow::Status::Invalid(
+            "[FlightSQL] Oracle-mode ingest requires regular unquoted Arrow field names");
       }
       col_names.push_back(col_name);
     }
@@ -2171,6 +3167,11 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
     bool direct_load = false;
     bool is_upsert = false;
     bool is_update = false;
+    bool is_merge = false;
+    common::ObArenaAllocator merge_allocator(
+        common::ObMemAttr(session->tenant_id, "FlightSQLMerge"));
+    common::ObString merge_options_json;
+    ObFlightSqlMergeOptions merge_options(merge_allocator, session->tenant_id);
     std::string extra_hint;
     std::vector<std::string> key_cols;   // populated when is_update == true
     std::unordered_set<std::string> update_key_set;
@@ -2190,9 +3191,21 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
       }
       option_it = command.options.find(FLIGHT_SQL_HEADER_WRITE_MODE);
       if (option_it != command.options.end()) {
-        if (OB_FAIL(flight_sql_set_write_mode_(option_it->second, is_upsert, is_update))) {
+        const common::ObString mode_value(
+            static_cast<int32_t>(option_it->second.size()), option_it->second.data());
+        if (OB_FAIL(flight_sql_set_write_mode_(mode_value, is_upsert, is_update, is_merge))) {
           return arrow::Status::Invalid(
-              "[FlightSQL] ob_write_mode must be insert, upsert, or update");
+              "[FlightSQL] ob_write_mode must be insert, upsert, update, or merge");
+        }
+      }
+      option_it = command.options.find(FLIGHT_SQL_HEADER_MERGE_OPTIONS);
+      if (option_it != command.options.end()) {
+        const auto header_it = context.incoming_headers().find(FLIGHT_SQL_HEADER_MERGE_OPTIONS);
+        if (header_it == context.incoming_headers().end()) {
+          if (option_it->second.size() > 64 * 1024) {
+            return arrow::Status::Invalid("[FlightSQL] ob_merge_options must not exceed 64 KiB");
+          }
+          merge_options_json.assign_ptr(option_it->second.data(), option_it->second.size());
         }
       }
       option_it = command.options.find(FLIGHT_SQL_HEADER_DIRECT_LOAD);
@@ -2231,11 +3244,20 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
       arrow::flight::CallHeaders::const_iterator it2 =
           hdrs.find(FLIGHT_SQL_HEADER_WRITE_MODE);
       if (it2 != hdrs.end()) {
-        if (OB_FAIL(flight_sql_set_write_mode_(
-                std::string(it2->second), is_upsert, is_update))) {
+        const common::ObString mode_value(
+            static_cast<int32_t>(it2->second.size()), it2->second.data());
+        if (OB_FAIL(flight_sql_set_write_mode_(mode_value, is_upsert, is_update, is_merge))) {
           return arrow::Status::Invalid(
-              "[FlightSQL] ob_write_mode must be insert, upsert, or update");
+              "[FlightSQL] ob_write_mode must be insert, upsert, update, or merge");
         }
+      }
+      const arrow::flight::CallHeaders::const_iterator merge_it =
+          hdrs.find(FLIGHT_SQL_HEADER_MERGE_OPTIONS);
+      if (merge_it != hdrs.end()) {
+        if (merge_it->second.size() > 64 * 1024) {
+          return arrow::Status::Invalid("[FlightSQL] ob_merge_options must not exceed 64 KiB");
+        }
+        merge_options_json.assign_ptr(merge_it->second.data(), merge_it->second.size());
       }
       arrow::flight::CallHeaders::const_iterator direct_load_it =
           hdrs.find(FLIGHT_SQL_HEADER_DIRECT_LOAD);
@@ -2263,6 +3285,36 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
         }
       }
     }
+    if (is_merge) {
+      if (direct_load || !key_cols.empty()) {
+        return arrow::Status::Invalid(
+            "[FlightSQL] merge mode cannot use direct_load or ob_write_key_columns");
+      }
+      if (OB_ISNULL(session->ob_session)) {
+        return arrow::Status::Invalid("[FlightSQL] merge mode requires an SQL session");
+      }
+      common::ObString error;
+      if (OB_FAIL(merge_options.parse(merge_options_json, error))) {
+        return arrow::Status::Invalid("[FlightSQL] ", std::string(error.ptr(), error.length()));
+      }
+      // The DoPut thread has not entered the SQL engine's tenant scope yet.
+      // Expression parsing must use the authenticated session's dialect.
+      lib::CompatModeGuard compat_guard(session->ob_session->is_oracle_compatible()
+          ? lib::Worker::CompatMode::ORACLE : lib::Worker::CompatMode::MYSQL);
+      if (OB_FAIL(merge_options.validate_expressions(
+                       session->ob_session->get_sql_mode(),
+                       session->ob_session->get_charsets4parser(), error))) {
+        return arrow::Status::Invalid("[FlightSQL] ", std::string(error.ptr(), error.length()));
+      }
+      ObArrowStreamEntryPtr stream_entry = session->stream_registry.get(stream_id);
+      if (OB_ISNULL(stream_entry)) {
+        return arrow::Status::Invalid("[FlightSQL] merge source stream was not found");
+      }
+      stream_entry->is_merge_source = true;
+    } else if (!merge_options_json.empty()) {
+      return arrow::Status::Invalid(
+          "[FlightSQL] ob_merge_options is only valid with ob_write_mode=merge");
+    }
     if (direct_load && is_upsert) {
       return arrow::Status::Invalid(
           "[FlightSQL] direct_load mode does not support upsert "
@@ -2287,9 +3339,22 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
 
     // ── Build SQL ──────────────────────────────────────────────────────────
     std::string sql;
-    sql.reserve(512 + col_names.size() * 64);
+    common::ObSqlString merge_sql;
+    merge_sql.set_attr(common::ObMemAttr(session->tenant_id, "FlightSQLMerge"));
 
-    if (is_update) {
+    if (is_merge) {
+      const common::ObString merge_db(db_name.size(), db_name.data());
+      const common::ObString merge_table(table_name.size(), table_name.data());
+      const common::ObString merge_hint(extra_hint.size(), extra_hint.data());
+      if (OB_NOT_NULL(merge_db.find('"')) || OB_NOT_NULL(merge_table.find('"'))) {
+        return arrow::Status::Invalid("[FlightSQL] merge target names must not contain SQL quotes");
+      } else if (OB_FAIL(merge_options.build_sql(merge_db, merge_table, stream_id,
+          has_write_parallel, write_parallel, merge_hint,
+          session->ob_session->is_oracle_compatible(), merge_sql))) {
+        return arrow::Status::OutOfMemory("[FlightSQL] failed to build merge SQL");
+      }
+    } else if (is_update) {
+      sql.reserve(512 + col_names.size() * 64);
       // UPDATE `db`.`table` t, TABLE(arrow_stream(X)) s
       // SET t.`c1` = s.`c1`, ...
       // WHERE t.`k` = s.`k` AND ...
@@ -2308,22 +3373,20 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
         }
         sql.append(" */ ");
       }
-      sql.push_back('`');
-      sql.append(db_name);
-      sql.append("`.`");
-      sql.append(table_name);
-      sql.append("` t, TABLE(arrow_stream(");
+      flight_sql_append_identifier(sql, db_name, is_oracle_mode);
+      sql.push_back('.');
+      flight_sql_append_identifier(sql, table_name, is_oracle_mode);
+      sql.append(" t, TABLE(arrow_stream(");
       sql.append(std::to_string(stream_id));
       sql.append(")) s SET ");
       bool first_set = true;
       for (const std::string &col : col_names) {
         if (update_key_set.count(col)) continue;   // skip key columns in SET
         if (!first_set) { sql.append(", "); }
-        sql.append("t.`");
-        sql.append(col);
-        sql.append("` = s.`");
-        sql.append(col);
-        sql.push_back('`');
+        sql.append("t.");
+        flight_sql_append_identifier(sql, col, is_oracle_mode);
+        sql.append(" = s.");
+        flight_sql_append_identifier(sql, col, is_oracle_mode);
         first_set = false;
       }
       if (first_set) {
@@ -2335,14 +3398,14 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
       bool first_key = true;
       for (const std::string &kc : key_cols) {
         if (!first_key) { sql.append(" AND "); }
-        sql.append("t.`");
-        sql.append(kc);
-        sql.append("` = s.`");
-        sql.append(kc);
-        sql.push_back('`');
+        sql.append("t.");
+        flight_sql_append_identifier(sql, kc, is_oracle_mode);
+        sql.append(" = s.");
+        flight_sql_append_identifier(sql, kc, is_oracle_mode);
         first_key = false;
       }
     } else {
+      sql.reserve(512 + col_names.size() * 64);
       sql.append("INSERT ");
       sql.append("/*+");
       if (direct_load) {
@@ -2362,27 +3425,22 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
       sql.append("INTO ");
     if (!catalog_name.empty()
         && 0 != strcasecmp(catalog_name.c_str(), OB_INTERNAL_CATALOG_NAME)) {
-      sql.push_back('`');
-      sql.append(catalog_name);
-      sql.append("`.");
+      flight_sql_append_identifier(sql, catalog_name, is_oracle_mode);
+      sql.push_back('.');
     }
-    sql.push_back('`');
-    sql.append(db_name);
-    sql.append("`.`");
-    sql.append(table_name);
-    sql.append("`(");
+    flight_sql_append_identifier(sql, db_name, is_oracle_mode);
+    sql.push_back('.');
+    flight_sql_append_identifier(sql, table_name, is_oracle_mode);
+    sql.push_back('(');
     for (size_t i = 0; i < col_names.size(); ++i) {
       if (i > 0) { sql.append(", "); }
-      sql.push_back('`');
-      sql.append(col_names[i]);
-      sql.push_back('`');
+      flight_sql_append_identifier(sql, col_names[i], is_oracle_mode);
     }
     sql.append(") SELECT ");
     for (size_t i = 0; i < col_names.size(); ++i) {
       if (i > 0) { sql.append(", "); }
-      sql.append("s.`");
-      sql.append(col_names[i]);
-      sql.push_back('`');
+      sql.append("s.");
+      flight_sql_append_identifier(sql, col_names[i], is_oracle_mode);
     }
     sql.append(" FROM TABLE(arrow_stream(");
     sql.append(std::to_string(stream_id));
@@ -2392,32 +3450,33 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
       sql.append(" ON DUPLICATE KEY UPDATE ");
       for (size_t i = 0; i < col_names.size(); ++i) {
         if (i > 0) { sql.append(", "); }
-        sql.push_back('`');
-        sql.append(col_names[i]);
-        sql.append("`=VALUES(`");
-        sql.append(col_names[i]);
-        sql.append("`)");
+        flight_sql_append_identifier(sql, col_names[i], is_oracle_mode);
+        sql.append("=VALUES(");
+        flight_sql_append_identifier(sql, col_names[i], is_oracle_mode);
+        sql.push_back(')');
       }
     }   // end if (is_upsert)
     }   // end INSERT else-branch (closes } else { at is_update)
 
+    const common::ObString ob_sql = is_merge ? merge_sql.string()
+        : common::ObString(static_cast<int32_t>(sql.size()), sql.data());
     LOG_TRACE("[FlightSQL] DoPutCommandStatementIngest: executing SQL",
               "stream_id", static_cast<int64_t>(stream_id),
-              "mode", is_update ? "update" : (is_upsert ? "upsert" : "append"),
+              "mode", is_merge ? "merge" : (is_update ? "update" : (is_upsert ? "upsert" : "append")),
               "tls_registry", (void*)&session->stream_registry,
-              "sql", sql.c_str());
+              K(ob_sql));
 
-    // ── 8. Execute INSERT via SQL engine ────────────────────────
+    // ── 8. Execute generated DML via SQL engine ─────────────────
     ObFlightSqlQueryProcessor proc;
-    const common::ObString ob_sql(
-        static_cast<int32_t>(sql.size()), sql.c_str());
     const int exec_ret = proc.execute(*session, ob_sql);
 
     if (OB_SUCCESS != exec_ret) {
-      const std::string sql_preview =
-          sql.substr(0, std::min(size_t(200), sql.size()));
+      const std::string sql_preview(
+          ob_sql.ptr(), std::min(int32_t(200), ob_sql.length()));
+      const std::string detail_msg =
+          flight_sql_ingest_error_message(exec_ret, arrow_schema);
       return ob_sql_exec_ret_to_arrow_status(
-          exec_ret, proc.trace_id().c_str(), sql_preview);
+          exec_ret, proc.trace_id().c_str(), sql_preview, &detail_msg);
     }
 
     const int64_t affected = proc.affected_rows();
@@ -2629,6 +3688,8 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
   {
     LOG_TRACE("[FlightSQL] dispatch_ingest_action",
               "action", action.c_str());
+    const bool is_oracle_mode = OB_NOT_NULL(session.ob_session)
+        && session.ob_session->is_oracle_compatible();
 
     if (action == "prepare_ingest") {
       const std::string db       = ob_json_str(body_json, "db");
@@ -2641,6 +3702,12 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
       if (!flight_sql_is_safe_identifier(db) || !flight_sql_is_safe_identifier(table)) {
         return arrow::Status::Invalid(
             "[FlightSQL] prepare_ingest: db and table must not contain SQL quote or control characters");
+      }
+      if (is_oracle_mode
+          && (!flight_sql_is_safe_oracle_identifier(db)
+              || !flight_sql_is_safe_oracle_identifier(table))) {
+        return arrow::Status::Invalid(
+            "[FlightSQL] prepare_ingest: Oracle mode requires regular unquoted db and table identifiers");
       }
       std::string ingest_id;
       const int ret = ObFlightSqlIngestRegistry::instance().prepare_ingest(
@@ -2666,7 +3733,9 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
           {
             common::ObMySQLProxy::MySQLResult map_result;
             common::sqlclient::ObMySQLResult *result = nullptr;
-            ObFlightSqlQueryProcessor::setup_worker_timeout(session);
+            const int64_t request_timeout_ts =
+                ObFlightSqlQueryProcessor::start_request_timeout(session);
+            lib::WorkerTimeoutGuard request_timeout_guard(request_timeout_ts);
             if (OB_ISNULL(GCTX.sql_proxy_)) {
               map_ret = OB_NOT_INIT;
               LOG_WARN("[FlightSQL] prepare_ingest: sql proxy is null", K(map_ret));
@@ -2808,6 +3877,11 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
           return arrow::Status::Invalid(
               "[FlightSQL] execute_ingest: Arrow field names must be safe identifiers");
         }
+        if (is_oracle_mode
+            && !flight_sql_is_safe_oracle_identifier(field->name())) {
+          return arrow::Status::Invalid(
+              "[FlightSQL] execute_ingest: Oracle mode requires regular unquoted Arrow field names");
+        }
         advertised_col_names.push_back(field->name());
       }
       if (advertised_arrow_schema->num_fields() <= 0) {
@@ -2903,20 +3977,29 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
         }
         if (!extra_hint.empty()) { sql += " " + extra_hint; }
         if (has_parallel || !extra_hint.empty()) { sql += " */ "; }
-        sql += "`" + db + "`.`" + table + "` t, TABLE(arrow_streams('" + ingest_id + "')) s SET ";
+        flight_sql_append_identifier(sql, db, is_oracle_mode);
+        sql += ".";
+        flight_sql_append_identifier(sql, table, is_oracle_mode);
+        sql += " t, TABLE(arrow_streams('" + ingest_id + "')) s SET ";
         bool first = true;
         for (int i = 0; i < advertised_arrow_schema->num_fields(); ++i) {
           const std::string &c = advertised_arrow_schema->field(i)->name();
           if (update_key_set.count(c)) { continue; }
           if (!first) { sql += ", "; }
-          sql += "t.`" + c + "` = s.`" + c + "`";
+          sql += "t.";
+          flight_sql_append_identifier(sql, c, is_oracle_mode);
+          sql += " = s.";
+          flight_sql_append_identifier(sql, c, is_oracle_mode);
           first = false;
         }
         sql += " WHERE ";
         bool first_key = true;
         for (const std::string &kc : key_cols) {
           if (!first_key) { sql += " AND "; }
-          sql += "t.`" + kc + "` = s.`" + kc + "`";
+          sql += "t.";
+          flight_sql_append_identifier(sql, kc, is_oracle_mode);
+          sql += " = s.";
+          flight_sql_append_identifier(sql, kc, is_oracle_mode);
           first_key = false;
         }
       } else {
@@ -2927,15 +4010,22 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
         if (has_parallel) { sql += " PARALLEL(" + std::to_string(parallel) + ")"; }
         if (!extra_hint.empty()) { sql += " " + extra_hint; }
         sql += " */ ";
-        sql += "INTO `" + db + "`.`" + table + "`(";
+        sql += "INTO ";
+        flight_sql_append_identifier(sql, db, is_oracle_mode);
+        sql += ".";
+        flight_sql_append_identifier(sql, table, is_oracle_mode);
+        sql += "(";
         for (int i = 0; i < advertised_arrow_schema->num_fields(); ++i) {
           if (i) { sql += ", "; }
-          sql += "`" + advertised_arrow_schema->field(i)->name() + "`";
+          flight_sql_append_identifier(
+              sql, advertised_arrow_schema->field(i)->name(), is_oracle_mode);
         }
         sql += ") SELECT ";
         for (int i = 0; i < advertised_arrow_schema->num_fields(); ++i) {
           if (i) { sql += ", "; }
-          sql += "s.`" + advertised_arrow_schema->field(i)->name() + "`";
+          sql += "s.";
+          flight_sql_append_identifier(
+              sql, advertised_arrow_schema->field(i)->name(), is_oracle_mode);
         }
         sql += " FROM TABLE(arrow_streams('" + ingest_id + "')) s";
         if (is_upsert) {
@@ -2943,7 +4033,10 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
           for (int i = 0; i < advertised_arrow_schema->num_fields(); ++i) {
             if (i) { sql += ", "; }
             const std::string &field_name = advertised_arrow_schema->field(i)->name();
-            sql += "`" + field_name + "`=VALUES(`" + field_name + "`)";
+            flight_sql_append_identifier(sql, field_name, is_oracle_mode);
+            sql += "=VALUES(";
+            flight_sql_append_identifier(sql, field_name, is_oracle_mode);
+            sql += ")";
           }
         }
       }
@@ -2986,9 +4079,11 @@ struct ObOceanBaseFlightSqlServerImpl : public arrow::flight::sql::FlightSqlServ
       ObFlightSqlIngestRegistry::instance().remove(ingest_id);
 
       if (OB_SUCCESS != ret) {
+        const std::string detail_msg =
+            flight_sql_ingest_error_message(ret, advertised_arrow_schema);
         return ob_sql_exec_ret_to_arrow_status(
             ret, proc.trace_id().c_str(),
-            sql.substr(0, std::min(size_t(200), sql.size())));
+            sql.substr(0, std::min(size_t(200), sql.size())), &detail_msg);
       }
       const std::string result = "{\"rows\":" + std::to_string(affected) + "}";
       return ob_make_ingest_result_stream("execute_ingest", result);
@@ -3048,32 +4143,66 @@ ObOceanBaseFlightSqlServer::~ObOceanBaseFlightSqlServer()
 int ObOceanBaseFlightSqlServer::init_listener(const int32_t port)
 {
   int ret = OB_SUCCESS;
-  LOG_TRACE("[FlightSQL] init_listener", K(port));
-
-  arrow::Result<arrow::flight::Location> loc_res =
-      arrow::flight::Location::ForGrpcTcp("0.0.0.0", port);
-  if (!loc_res.ok()) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_ERROR("[FlightSQL] Location::ForGrpcTcp failed", K(ret),
-              "arrow_st", loc_res.status().ToString().c_str());
-    return ret;
-  }
-
-  arrow::flight::FlightServerOptions options(loc_res.ValueOrDie());
-  options.auth_handler = std::make_shared<ObFlightSqlAuthHandler>(&impl_->session_mgr_);
+  try {
+  const bool tls_enabled = GCONF.flight_sql_tls_enabled;
+  LOG_TRACE("[FlightSQL] init_listener", K(port), K(tls_enabled));
 
   const int max_threads = static_cast<int>(GCONF._flight_sql_worker_threads);
   const int min_pollers = static_cast<int>(GCONF._flight_sql_min_pollers);
   const int max_pollers = static_cast<int>(GCONF._flight_sql_max_pollers);
 
   LOG_TRACE("[FlightSQL] gRPC server options",
-            K(max_threads), K(min_pollers), K(max_pollers));
+            K(max_threads), K(min_pollers), K(max_pollers), K(tls_enabled));
 
   if (min_pollers > max_pollers) {
     ret = OB_INVALID_ARGUMENT;
     LOG_ERROR("[FlightSQL] _flight_sql_min_pollers must not exceed _flight_sql_max_pollers",
               K(ret), K(min_pollers), K(max_pollers));
     return ret;
+  }
+
+  if (!tls_enabled) {
+    LOG_WARN("[FlightSQL] TLS is disabled; Basic credentials and bearer tokens are not "
+             "transport-encrypted. Restrict the listener to a trusted network or "
+             "TLS-terminating gateway",
+             K(port));
+  }
+
+  common::ObArenaAllocator tls_allocator("FlightTLS");
+  common::ObString tls_public_cert;
+  common::ObString tls_private_key;
+  DEFER(flight_sql_cleanse_ob_string(tls_private_key));
+  if (tls_enabled
+      && OB_FAIL(ObSrvNetworkFrame::load_flight_tls_credentials(tls_allocator,
+                                                                tls_public_cert,
+                                                                tls_private_key))) {
+    LOG_ERROR("[FlightSQL] failed to load TLS credentials", K(ret));
+    return ret;
+  }
+
+  arrow::Result<arrow::flight::Location> loc_res =
+      tls_enabled
+          ? arrow::flight::Location::ForGrpcTls("0.0.0.0", port)
+          : arrow::flight::Location::ForGrpcTcp("0.0.0.0", port);
+  if (!loc_res.ok()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("[FlightSQL] failed to create listener location", K(ret), K(tls_enabled),
+              "arrow_st", loc_res.status().ToString().c_str());
+    return ret;
+  }
+
+  arrow::flight::FlightServerOptions options(loc_res.ValueOrDie());
+  options.auth_handler = std::make_shared<ObFlightSqlAuthHandler>(&impl_->session_mgr_);
+  DEFER(if (!options.tls_certificates.empty()) {
+    flight_sql_cleanse_string(options.tls_certificates[0].pem_key);
+  });
+  if (tls_enabled) {
+    options.tls_certificates.emplace_back();
+    options.tls_certificates.back().pem_cert.assign(
+        tls_public_cert.ptr(), static_cast<size_t>(tls_public_cert.length()));
+    options.tls_certificates.back().pem_key.assign(
+        tls_private_key.ptr(), static_cast<size_t>(tls_private_key.length()));
+    options.verify_client = false;
   }
   // ResourceQuota::SetMaxThreads() is applied only when _flight_sql_worker_threads > 0.
   // 0 (default) means unlimited: gRPC manages threads freely up to MAX_POLLERS.
@@ -3087,9 +4216,10 @@ int ObOceanBaseFlightSqlServer::init_listener(const int32_t port)
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("[FlightSQL] Flight server Init failed", K(ret), "arrow_st", st.ToString().c_str());
   } else {
-    LOG_TRACE("[FlightSQL] Flight server initialized", K(port));
+    LOG_TRACE("[FlightSQL] Flight server initialized", K(port), K(tls_enabled));
   }
   return ret;
+  } OB_FLIGHT_SQL_CATCH_INIT_LISTENER
 }
 
 int ObOceanBaseFlightSqlServer::run_serve()

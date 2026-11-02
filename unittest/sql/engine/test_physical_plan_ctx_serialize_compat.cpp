@@ -12,6 +12,8 @@
 #include "lib/oblog/ob_log.h"
 #include "lib/oblog/ob_log_module.h"
 #include "sql/engine/ob_exec_context.h"
+#include "sql/engine/ob_physical_plan.h"
+#include "sql/executor/ob_task.h"
 
 namespace oceanbase
 {
@@ -585,6 +587,300 @@ TEST_F(TestPhysicalPlanCtxSerializeCompat, materialize_sql_array_without_array_g
   ASSERT_EQ(1001, namespace_id);
 }
 
+static int append_remote_collection_param(
+    ObPhysicalPlanCtx &ctx, ObSubSchemaCtx &source_subschemas, const char *type_def,
+    ObIArray<ObRemoteCollectionParamSubschema> &param_subschemas)
+{
+  int ret = OB_SUCCESS;
+  uint16_t source_id = UINT_MAX16;
+  ObRemoteCollectionParamSubschema param_subschema;
+  ParamStore &params = ctx.get_param_store_for_update();
+  param_subschema.param_idx_ = params.count();
+  if (OB_FAIL(source_subschemas.get_subschema_id_by_typedef(
+          ObString::make_string(type_def), source_id))) {
+  } else if (OB_FAIL(source_subschemas.get_subschema(source_id, param_subschema.subschema_))) {
+  } else {
+    const ObSqlCollectionInfo *collection_info =
+        static_cast<const ObSqlCollectionInfo *>(param_subschema.subschema_.value_);
+    ObObjParam param;
+    // Subschema transport must preserve the opaque collection bytes unchanged.
+    param.set_sql_collection("collection-bytes", 16, source_id);
+    param.set_udt_id(collection_info->get_signature());
+    param.set_param_meta();
+    param.set_need_to_check_type(true);
+    if (OB_FAIL(params.push_back(param))) {
+    } else if (OB_FAIL(param_subschemas.push_back(param_subschema))) {
+    }
+  }
+  return ret;
+}
+
+TEST_F(TestPhysicalPlanCtxSerializeCompat, remote_collection_subschemas_are_parameter_local)
+{
+  ObArenaAllocator allocator;
+  ObSubSchemaCtx source_subschemas(allocator);
+  ObPhysicalPlanCtx ctx(allocator);
+  ObSEArray<ObRemoteCollectionParamSubschema, 4> param_subschemas;
+  ASSERT_EQ(OB_SUCCESS, source_subschemas.init());
+  uint16_t unrelated_id = UINT_MAX16;
+  ASSERT_EQ(OB_SUCCESS, source_subschemas.get_subschema_id_by_typedef(
+      ObString::make_string("ARRAY(DOUBLE)"), unrelated_id));
+  ObObjParam scalar;
+  scalar.set_int(7);
+  scalar.set_param_meta();
+  ASSERT_EQ(OB_SUCCESS, ctx.param_store_.push_back(scalar));
+  ASSERT_EQ(OB_SUCCESS, append_remote_collection_param(
+      ctx, source_subschemas, "ARRAY(INT)", param_subschemas));
+  ObObjParam null_param;
+  null_param.set_null();
+  null_param.set_param_meta();
+  ASSERT_EQ(OB_SUCCESS, ctx.param_store_.push_back(null_param));
+  ASSERT_EQ(OB_SUCCESS, append_remote_collection_param(
+      ctx, source_subschemas, "ARRAY(INT)", param_subschemas));
+  ASSERT_EQ(OB_SUCCESS, append_remote_collection_param(
+      ctx, source_subschemas, "ARRAY(BIGINT)", param_subschemas));
+  const uint16_t source_id = ctx.param_store_.at(1).get_udt_subschema_id();
+  const ObAccuracy signature = ctx.param_store_.at(1).get_accuracy();
+  ctx.remote_sql_info_.collection_param_subschemas_ = &param_subschemas;
+
+  ASSERT_EQ(OB_SUCCESS, ctx.restore_remote_collection_param_subschemas());
+  const uint16_t local_id = ctx.param_store_.at(1).get_udt_subschema_id();
+  ASSERT_NE(source_id, local_id);
+  ASSERT_EQ(local_id, ctx.param_store_.at(3).get_udt_subschema_id());
+  ASSERT_NE(local_id, ctx.param_store_.at(4).get_udt_subschema_id());
+  ASSERT_EQ(signature.get_accuracy(), ctx.param_store_.at(1).get_accuracy().get_accuracy());
+  ASSERT_TRUE(ctx.param_store_.at(1).need_to_check_type());
+  ASSERT_EQ(local_id, ctx.param_store_.at(1).get_param_meta().get_subschema_id());
+  ASSERT_EQ(ObString::make_string("collection-bytes"),
+            ObString(ctx.param_store_.at(1).get_val_len(), ctx.param_store_.at(1).get_string_ptr()));
+  ASSERT_EQ(7, ctx.param_store_.at(0).get_int());
+  ASSERT_TRUE(ctx.param_store_.at(2).is_null());
+  // Only the two distinct bound types are installed, not ARRAY(DOUBLE).
+  ASSERT_EQ(local_id + 2, ctx.get_subschema_ctx().get_subschema_count());
+  ASSERT_EQ(OB_SUCCESS, ctx.build_subschema_ctx_by_param_store(nullptr));
+  uint16_t reverse_id = UINT_MAX16;
+  ASSERT_EQ(OB_SUCCESS, ctx.get_subschema_ctx().get_subschema_id_by_typedef(
+      ObString::make_string("ARRAY(INT)"), reverse_id));
+  ASSERT_EQ(local_id, reverse_id);
+}
+
+TEST_F(TestPhysicalPlanCtxSerializeCompat, remote_collection_type_metadata_round_trip)
+{
+  ObArenaAllocator source_allocator;
+  ObArenaAllocator receiver_allocator;
+  ObSubSchemaCtx source_subschemas(source_allocator);
+  ObPhysicalPlanCtx ctx(receiver_allocator);
+  ObSEArray<ObRemoteCollectionParamSubschema, 4> source_metadata;
+  ObSEArray<ObRemoteCollectionParamSubschema, 4> received_metadata;
+  ASSERT_EQ(OB_SUCCESS, source_subschemas.init());
+  uint16_t unrelated_id = UINT_MAX16;
+  ASSERT_EQ(OB_SUCCESS, source_subschemas.get_subschema_id_by_typedef(
+      ObString::make_string("ARRAY(DOUBLE)"), unrelated_id));
+  const char *type_defs[] = {"ARRAY(INT)", "VECTOR(3)", "MAP(INT,INT)", "ARRAY(ARRAY(INT))"};
+  for (int64_t i = 0; i < ARRAYSIZEOF(type_defs); ++i) {
+    ASSERT_EQ(OB_SUCCESS, append_remote_collection_param(
+        ctx, source_subschemas, type_defs[i], source_metadata));
+    char buf[16384];
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, source_metadata.at(i).subschema_.serialize(buf, sizeof(buf), pos));
+    ASSERT_EQ(pos, source_metadata.at(i).subschema_.get_serialize_size());
+    ObRemoteCollectionParamSubschema decoded;
+    decoded.param_idx_ = i;
+    int64_t decoded_pos = 0;
+    ASSERT_EQ(OB_SUCCESS, decoded.deserialize_subschema(buf, pos, decoded_pos, receiver_allocator));
+    ASSERT_EQ(pos, decoded_pos);
+    ASSERT_NE(source_metadata.at(i).subschema_.value_, decoded.subschema_.value_);
+    // The received definition must not borrow the RPC buffer.
+    MEMSET(buf, 0, pos);
+    ASSERT_EQ(ObString::make_string(type_defs[i]),
+              static_cast<ObSqlCollectionInfo *>(decoded.subschema_.value_)->get_def_string());
+    ASSERT_EQ(OB_SUCCESS, received_metadata.push_back(decoded));
+  }
+  ctx.remote_sql_info_.collection_param_subschemas_ = &received_metadata;
+  ASSERT_EQ(OB_SUCCESS, ctx.restore_remote_collection_param_subschemas());
+  ASSERT_EQ(OB_SUCCESS, ctx.build_subschema_ctx_by_param_store(nullptr));
+}
+
+TEST_F(TestPhysicalPlanCtxSerializeCompat, remote_collection_parameters_remap_to_cached_plan)
+{
+  ObArenaAllocator allocator;
+  ObSubSchemaCtx source_subschemas(allocator);
+  ObPhysicalPlanCtx ctx(allocator);
+  ObPhysicalPlan cached_plan;
+  ObSEArray<ObRemoteCollectionParamSubschema, 4> param_subschemas;
+  ASSERT_EQ(OB_SUCCESS, source_subschemas.init());
+  ASSERT_EQ(OB_SUCCESS, append_remote_collection_param(
+      ctx, source_subschemas, "ARRAY(INT)", param_subschemas));
+  ctx.remote_sql_info_.collection_param_subschemas_ = &param_subschemas;
+  ASSERT_EQ(OB_SUCCESS, ctx.restore_remote_collection_param_subschemas());
+  const uint16_t local_id = ctx.param_store_.at(0).get_udt_subschema_id();
+  ObDatumObjParam materialized_param;
+  ASSERT_EQ(OB_SUCCESS, materialized_param.from_objparam(ctx.param_store_.at(0), &allocator));
+  ASSERT_EQ(CS_TYPE_BINARY, materialized_param.meta_.cs_type_);
+  ASSERT_EQ(OB_SUCCESS, ctx.get_datum_param_store().push_back(materialized_param));
+  ObSubSchemaCtx &cached_subschemas = cached_plan.get_subschema_ctx_for_update();
+  ASSERT_EQ(OB_SUCCESS, cached_subschemas.init());
+  uint16_t cached_id = UINT_MAX16;
+  ASSERT_EQ(OB_SUCCESS, cached_subschemas.get_subschema_id_by_typedef(
+      ObString::make_string("ARRAY(FLOAT)"), cached_id));
+  ASSERT_EQ(OB_SUCCESS, cached_subschemas.get_subschema_id_by_typedef(
+      ObString::make_string("ARRAY(INT)"), cached_id));
+  ASSERT_NE(local_id, cached_id);
+
+  ASSERT_EQ(OB_SUCCESS, ctx.remap_remote_collection_param_subschemas(cached_plan));
+  ASSERT_EQ(cached_id, ctx.param_store_.at(0).get_udt_subschema_id());
+  ASSERT_EQ(cached_id, ctx.param_store_.at(0).get_param_meta().get_subschema_id());
+  // Native datum parameters carry collection bytes/signatures, not local ids.
+  ASSERT_EQ(CS_TYPE_BINARY, ctx.get_datum_param_store().at(0).meta_.cs_type_);
+  ASSERT_EQ(ctx.param_store_.at(0).get_accuracy().get_accuracy(),
+            ctx.get_datum_param_store().at(0).accuracy_.get_accuracy());
+  ASSERT_EQ(OB_SUCCESS, ctx.remap_remote_collection_param_subschemas(cached_plan));
+  ASSERT_EQ(cached_id, ctx.param_store_.at(0).get_udt_subschema_id());
+}
+
+TEST_F(TestPhysicalPlanCtxSerializeCompat, remote_collection_metadata_rejects_noncollection_type)
+{
+  ObArenaAllocator allocator;
+  ObSubSchemaValue invalid_subschema;
+  char buf[128];
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, invalid_subschema.serialize(buf, sizeof(buf), pos));
+  ObRemoteCollectionParamSubschema decoded;
+  int64_t decoded_pos = 0;
+  ASSERT_EQ(OB_DESERIALIZE_ERROR,
+            decoded.deserialize_subschema(buf, pos, decoded_pos, allocator));
+}
+
+TEST_F(TestPhysicalPlanCtxSerializeCompat, remote_collection_parameters_reject_missing_plan_type)
+{
+  ObArenaAllocator allocator;
+  ObSubSchemaCtx source_subschemas(allocator);
+  ObPhysicalPlanCtx ctx(allocator);
+  ObPhysicalPlan plan;
+  ObSEArray<ObRemoteCollectionParamSubschema, 4> param_subschemas;
+  ASSERT_EQ(OB_SUCCESS, source_subschemas.init());
+  ASSERT_EQ(OB_SUCCESS, append_remote_collection_param(
+      ctx, source_subschemas, "ARRAY(INT)", param_subschemas));
+  ctx.remote_sql_info_.collection_param_subschemas_ = &param_subschemas;
+  ASSERT_EQ(OB_SUCCESS, ctx.restore_remote_collection_param_subschemas());
+  ASSERT_EQ(OB_SUCCESS, plan.get_subschema_ctx_for_update().init());
+  ASSERT_EQ(OB_HASH_NOT_EXIST, ctx.remap_remote_collection_param_subschemas(plan));
+}
+
+TEST_F(TestPhysicalPlanCtxSerializeCompat, remote_collection_parameters_reject_mismatched_signature)
+{
+  ObArenaAllocator allocator;
+  ObSubSchemaCtx source_subschemas(allocator);
+  ObPhysicalPlanCtx ctx(allocator);
+  ObSEArray<ObRemoteCollectionParamSubschema, 4> param_subschemas;
+  ASSERT_EQ(OB_SUCCESS, source_subschemas.init());
+  ASSERT_EQ(OB_SUCCESS, append_remote_collection_param(
+      ctx, source_subschemas, "ARRAY(INT)", param_subschemas));
+  ctx.param_store_.at(0).set_udt_id(0);
+  ctx.remote_sql_info_.collection_param_subschemas_ = &param_subschemas;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ctx.restore_remote_collection_param_subschemas());
+}
+
+TEST_F(TestPhysicalPlanCtxSerializeCompat, remote_collection_parameters_reject_invalid_position)
+{
+  ObArenaAllocator allocator;
+  ObSubSchemaCtx source_subschemas(allocator);
+  ObPhysicalPlanCtx ctx(allocator);
+  ObSEArray<ObRemoteCollectionParamSubschema, 4> param_subschemas;
+  ASSERT_EQ(OB_SUCCESS, source_subschemas.init());
+  ASSERT_EQ(OB_SUCCESS, append_remote_collection_param(
+      ctx, source_subschemas, "ARRAY(INT)", param_subschemas));
+  param_subschemas.at(0).param_idx_ = ctx.param_store_.count();
+  ctx.remote_sql_info_.collection_param_subschemas_ = &param_subschemas;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ctx.restore_remote_collection_param_subschemas());
+}
+
+TEST_F(TestPhysicalPlanCtxSerializeCompat, remote_collection_parameters_reject_duplicate_position)
+{
+  ObArenaAllocator allocator;
+  ObSubSchemaCtx source_subschemas(allocator);
+  ObPhysicalPlanCtx ctx(allocator);
+  ObSEArray<ObRemoteCollectionParamSubschema, 4> param_subschemas;
+  ASSERT_EQ(OB_SUCCESS, source_subschemas.init());
+  ASSERT_EQ(OB_SUCCESS, append_remote_collection_param(
+      ctx, source_subschemas, "ARRAY(INT)", param_subschemas));
+  ASSERT_EQ(OB_SUCCESS, append_remote_collection_param(
+      ctx, source_subschemas, "ARRAY(INT)", param_subschemas));
+  param_subschemas.at(1).param_idx_ = 0;
+  ctx.remote_sql_info_.collection_param_subschemas_ = &param_subschemas;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ctx.restore_remote_collection_param_subschemas());
+}
+
+TEST_F(TestPhysicalPlanCtxSerializeCompat, remote_collection_parameters_reject_incomplete_metadata)
+{
+  ObArenaAllocator allocator;
+  ObSubSchemaCtx source_subschemas(allocator);
+  ObPhysicalPlanCtx ctx(allocator);
+  ObSEArray<ObRemoteCollectionParamSubschema, 4> param_subschemas;
+  ASSERT_EQ(OB_SUCCESS, source_subschemas.init());
+  ASSERT_EQ(OB_SUCCESS, append_remote_collection_param(
+      ctx, source_subschemas, "ARRAY(INT)", param_subschemas));
+  ASSERT_EQ(OB_SUCCESS, ctx.param_store_.push_back(ctx.param_store_.at(0)));
+  ctx.remote_sql_info_.collection_param_subschemas_ = &param_subschemas;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ctx.restore_remote_collection_param_subschemas());
+}
+
+TEST_F(TestPhysicalPlanCtxSerializeCompat, remote_scalar_and_null_parameters_need_no_subschemas)
+{
+  ObArenaAllocator allocator;
+  ObPhysicalPlanCtx ctx(allocator);
+  ObPhysicalPlan plan;
+  ObObjParam param;
+  param.set_int(1);
+  param.set_param_meta();
+  ASSERT_EQ(OB_SUCCESS, ctx.param_store_.push_back(param));
+  param.reset();
+  param.set_null();
+  param.set_param_meta();
+  ASSERT_EQ(OB_SUCCESS, ctx.param_store_.push_back(param));
+  // Legacy requests have no metadata tail; new scalar requests have an empty tail.
+  ASSERT_EQ(OB_SUCCESS, ctx.restore_remote_collection_param_subschemas());
+  ASSERT_EQ(OB_SUCCESS, ctx.remap_remote_collection_param_subschemas(plan));
+  ObSEArray<ObRemoteCollectionParamSubschema, 4> param_subschemas;
+  ctx.remote_sql_info_.collection_param_subschemas_ = &param_subschemas;
+  ASSERT_EQ(OB_SUCCESS, ctx.restore_remote_collection_param_subschemas());
+  ASSERT_EQ(OB_SUCCESS, ctx.remap_remote_collection_param_subschemas(plan));
+  ASSERT_FALSE(ctx.get_subschema_ctx().is_inited());
+}
+
+TEST_F(TestPhysicalPlanCtxSerializeCompat, remote_task_collects_only_nonnull_bound_collections)
+{
+  ObArenaAllocator allocator;
+  ObExecContext exec_ctx(allocator);
+  ASSERT_EQ(OB_SUCCESS, exec_ctx.create_physical_plan_ctx());
+  ObPhysicalPlanCtx &ctx = *exec_ctx.get_physical_plan_ctx();
+  ASSERT_EQ(OB_SUCCESS, ctx.get_subschema_ctx().init());
+  uint16_t unrelated_id = UINT_MAX16;
+  ASSERT_EQ(OB_SUCCESS, ctx.get_subschema_ctx().get_subschema_id_by_typedef(
+      ObString::make_string("ARRAY(DOUBLE)"), unrelated_id));
+  ObSEArray<ObRemoteCollectionParamSubschema, 4> metadata;
+  ASSERT_EQ(OB_SUCCESS, append_remote_collection_param(
+      ctx, ctx.get_subschema_ctx(), "ARRAY(INT)", metadata));
+  ObObjParam param;
+  param.set_null();
+  param.set_param_meta();
+  ASSERT_EQ(OB_SUCCESS, ctx.param_store_.push_back(param));
+  param.reset();
+  param.set_int(3);
+  param.set_param_meta();
+  ASSERT_EQ(OB_SUCCESS, ctx.param_store_.push_back(param));
+  ctx.remote_sql_info_.use_ps_ = true;
+  ctx.remote_sql_info_.ps_params_ = &ctx.param_store_;
+  ObRemoteTask task;
+  task.set_remote_sql_info(&ctx.remote_sql_info_);
+  ASSERT_EQ(OB_SUCCESS, task.init_collection_param_subschemas(exec_ctx));
+  ASSERT_EQ(1, task.collection_param_subschemas_.count());
+  ASSERT_EQ(0, task.collection_param_subschemas_.at(0).param_idx_);
+  ASSERT_EQ(metadata.at(0).subschema_.value_, task.collection_param_subschemas_.at(0).subschema_.value_);
+  ctx.param_store_.at(0).set_udt_id(0);
+  ASSERT_EQ(OB_ERR_UNEXPECTED, task.init_collection_param_subschemas(exec_ctx));
+}
+
 } // namespace sql
 } // namespace oceanbase
 
@@ -593,4 +889,4 @@ int main(int argc, char **argv)
   oceanbase::common::ObLogger::get_logger().set_log_level("INFO");
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
-} 
+}

@@ -71,24 +71,32 @@ int ObExprFormatProfile::format_profile(const ObExpr &expr, ObEvalCtx &ctx, ObDa
     ObProfile *real_time_profile = nullptr;
     const char *json = nullptr;
     ObString payload;
-    if (OB_FAIL(ObTextStringHelper::read_real_string_data(allocator, *raw_profile,
-                expr.args_[0]->datum_meta_, payload))) {
-      LOG_WARN("fail to read raw profile payload", K(ret));
-    }
-    char *persist_profile = const_cast<char *>(payload.ptr());
-    const int64_t persist_len = payload.length();
-    metric::Level display_level = metric::Level::STANDARD;
-    if (nullptr != metric_level && !metric_level->is_null()) {
-      int64_t int_val = metric_level->get_int();
-      if (int_val >= 0 && int_val <= 2) {
-        display_level = static_cast<metric::Level>(metric_level->get_int());
+    int profile_ret = ObTextStringHelper::read_real_string_data(
+        allocator, *raw_profile, expr.args_[0]->datum_meta_, payload);
+    if (OB_SUCCESS != profile_ret) {
+      LOG_WARN_RET(profile_ret, "failed to read raw profile payload, return NULL profile");
+      expr_datum.set_null();
+    } else {
+      char *persist_profile = const_cast<char *>(payload.ptr());
+      const int64_t persist_len = payload.length();
+      metric::Level display_level = metric::Level::STANDARD;
+      if (nullptr != metric_level && !metric_level->is_null()) {
+        int64_t int_val = metric_level->get_int();
+        if (int_val >= 0 && int_val <= 2) {
+          display_level = static_cast<metric::Level>(metric_level->get_int());
+        }
       }
-    }
-    OZ(convert_persist_profile_to_realtime(
-        persist_profile, persist_len, real_time_profile, &ctx.exec_ctx_.get_allocator()));
-    OZ(real_time_profile->to_format_json(&ctx.exec_ctx_.get_allocator(), json, false, display_level));
-    if (OB_SUCC(ret)) {
-      expr_datum.set_string(json, strlen(json));
+      profile_ret = convert_persist_profile_to_realtime(
+          persist_profile, persist_len, real_time_profile, &ctx.exec_ctx_.get_allocator());
+      if (OB_SUCCESS != profile_ret) {
+        LOG_WARN_RET(profile_ret, "failed to convert raw profile, return NULL profile", K(persist_len));
+        expr_datum.set_null();
+      } else if (OB_FAIL(real_time_profile->to_format_json(
+                     &ctx.exec_ctx_.get_allocator(), json, false, display_level))) {
+        LOG_WARN("failed to format raw profile", K(ret));
+      } else {
+        expr_datum.set_string(json, strlen(json));
+      }
     }
   }
   return ret;

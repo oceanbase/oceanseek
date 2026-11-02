@@ -21,6 +21,10 @@ namespace sql
 class ObArrowBatchConverter
 {
 public:
+  // Type-level preflight for Flight SQL result columns.  Values and collection
+  // payloads can still fail conversion while rows are fetched.
+  static bool supports_output_type(common::ObObjType type);
+
   // 向量化路径：优先按 (OB type, arrow type) 到二维表中查找静态转换函数，
   // 未注册时回退到逐行 datum 路径。lob_arena 供 LOB/Json 临时解码复用。
   static int append_brs_to_builders(
@@ -35,7 +39,8 @@ public:
   static int append_datum_to_builder(const ObExpr &expr,
                                      const ObDatum &datum,
                                      arrow::ArrayBuilder &builder,
-                                     common::ObIAllocator &lob_arena);
+                                     common::ObIAllocator &lob_arena,
+                                     ObEvalCtx *eval_ctx = nullptr);
 };
 
 } // namespace sql

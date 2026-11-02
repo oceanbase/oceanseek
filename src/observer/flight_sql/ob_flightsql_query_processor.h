@@ -72,6 +72,38 @@ public:
               const common::ObString &sql,
               const PrepareMode mode = PrepareMode::STATEMENT_QUERY);
 
+  // Create a native external prepared statement for Flight SQL prepared DML.
+  // The caller must hold both session.prepared_mutex and ObSessionQueryGuard.
+  // On failure, client_stmt_id may still identify a native statement that the
+  // caller must close before returning to the client.
+  int prepare_prepared_update(ObFlightSqlSession &session,
+                              const common::ObString &sql,
+                              common::ObPsStmtId &client_stmt_id,
+                              sql::stmt::StmtType &stmt_type,
+                              int64_t &parameter_count,
+                              bool &sensitive_sql);
+
+  // Bind and execute one Arrow parameter row through the native prepared
+  // statement path. Binding happens after ObResultSet has created its
+  // execution context, so collection subschemas and ParamStore metadata are
+  // owned by the same native execution. The caller owns the request-level
+  // query guard and timeout and keeps the per-row allocator alive through
+  // this call.
+  int execute_prepared_update(ObFlightSqlSession &session,
+                              common::ObPsStmtId client_stmt_id,
+                              sql::stmt::StmtType stmt_type,
+                              const arrow::RecordBatch &parameter_batch,
+                              int64_t parameter_row_idx,
+                              common::ObIAllocator &parameter_allocator,
+                              const common::ObString &sql,
+                              bool sensitive_sql,
+                              int64_t &failed_column);
+
+  // Close a native client statement ID.  The caller must hold the prepared
+  // mutex and query guard and must clear the visible Flight context first.
+  static int close_prepared_statement(ObFlightSqlSession &session,
+                                      common::ObPsStmtId client_stmt_id);
+
   // Execute SQL via stmt_query + open() + close().
   // Schema is derived from the prepared columns before open() is called.
   // If open() fails the error is logged but OB_SUCCESS is returned so the
@@ -96,9 +128,11 @@ public:
   // so that OB privilege checking applies. No result set is returned.
   static int execute_sql(ObFlightSqlSession &session, const common::ObString &sql);
 
-  // Set session.query_start_time and THIS_WORKER.timeout_ts before a Flight SQL
-  // operation issues internal SQL. Mirrors ObInnerSQLConnection's pattern.
-  static void setup_worker_timeout(ObFlightSqlSession &session);
+  // Start one Flight SQL request and return its absolute timeout.  Callers must
+  // install the returned value with lib::WorkerTimeoutGuard so the gRPC worker's
+  // previous timeout is restored.  A prepared DoPut calls this only once; every
+  // parameter row therefore consumes the same request-level timeout budget.
+  static int64_t start_request_timeout(ObFlightSqlSession &session);
 
   // Arrow schema built from OB column metadata after prepare() or execute().
   // Empty schema if no columns were resolved.
@@ -111,6 +145,9 @@ public:
   // OceanBase trace ID string (e.g. "Y287B060D99C2-...") for the last prepare/execute call.
   // Empty if none was generated.  Clients use this to query GV$OB_SQL_AUDIT or EXPLAIN.
   const std::string &trace_id() const { return trace_id_str_; }
+
+  // Actionable detail for a rejected Arrow result type, including its column.
+  const std::string &error_detail() const { return error_detail_; }
 
   // Plan ID from the physical plan after execute().  0 if not available.
   // Use with GV$OB_PLAN_CACHE_PLAN_EXPLAIN: WHERE plan_id = <plan_id()>.
@@ -147,11 +184,14 @@ private:
       const sql::ObExecContext *exec_ctx = nullptr,
       share::schema::ObSchemaGetterGuard *schema_guard = nullptr,
       uint64_t tenant_id = common::OB_INVALID_TENANT_ID);
+  static std::shared_ptr<arrow::Schema> build_parameter_schema(
+      const common::ParamsFieldIArray *fields);
 
   // --- State ------------------------------------------------------------
 
   std::shared_ptr<arrow::Schema> arrow_schema_;
   std::string trace_id_str_;
+  std::string error_detail_;
   uint64_t    plan_id_  = 0;
   std::string sql_id_str_;
   // Must be declared before batches_: Arrow buffers refer to their pool by

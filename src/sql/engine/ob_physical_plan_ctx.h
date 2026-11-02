@@ -561,6 +561,8 @@ public:
   int build_subschema_by_fields(const ColumnsFieldIArray *fields,
                                 share::schema::ObSchemaGetterGuard *schema_guard);
   int build_subschema_ctx_by_param_store(share::schema::ObSchemaGetterGuard *schema_guard);
+  int restore_remote_collection_param_subschemas();
+  int remap_remote_collection_param_subschemas(const ObPhysicalPlan &plan);
   ObSubSchemaCtx &get_subschema_ctx() { return subschema_ctx_; }
   inline int set_subschema_ctx(ObSubSchemaCtx &subschema_ctx) {
     return subschema_ctx_.assgin(subschema_ctx);

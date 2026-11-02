@@ -38,12 +38,12 @@ static void init_arrow_conv_table()
   REG_CONV(ObUFloatType,    FLOAT,  NumericGroup);
   REG_CONV(ObDoubleType,    DOUBLE, NumericGroup);
   REG_CONV(ObUDoubleType,   DOUBLE, NumericGroup);
-  REG_CONV(ObBitType,       INT64,  NumericGroup);
+  REG_CONV(ObBitType,       UINT64, NumericGroup);
 
   REG_CONV(ObDateTimeType,      TIMESTAMP, DateGroup);
   REG_CONV(ObTimestampType,     TIMESTAMP, DateGroup);
   REG_CONV(ObDateType,          DATE32,    DateGroup);
-  REG_CONV(ObTimeType,          TIME64,    DateGroup);
+  REG_CONV(ObTimeType,          DURATION,  DateGroup);
   REG_CONV(ObYearType,          INT16,     DateGroup);
   REG_CONV(ObMySQLDateType,     DATE32,    DateGroup);
   REG_CONV(ObMySQLDateTimeType, TIMESTAMP, DateGroup);

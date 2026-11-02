@@ -233,6 +233,7 @@ public:
   const ObRemoteSqlInfo *get_remote_sql_info() const { return remote_sql_info_; }
   void set_exec_ctx(ObDesExecContext *exec_ctx) { exec_ctx_ = exec_ctx; }
   int assign_dependency_tables(const DependenyTableStore &dependency_tables);
+  int init_collection_param_subschemas(ObExecContext &exec_ctx);
   const DependenyTableStore &get_dependency_tables() const {
     return dependency_tables_;
   }

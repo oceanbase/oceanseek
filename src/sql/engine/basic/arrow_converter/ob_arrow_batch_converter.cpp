@@ -6,9 +6,12 @@
 #define USING_LOG_PREFIX SQL_ENG
 #include "sql/engine/basic/arrow_converter/ob_arrow_batch_converter.h"
 
+#include "lib/allocator/page_arena.h"
 #include "lib/json_type/ob_json_bin.h"
 #include "lib/json_type/ob_json_common.h"
 #include "lib/timezone/ob_time_convert.h"
+#include "lib/udt/ob_array_nested.h"
+#include "lib/udt/ob_map_type.h"
 #include "share/rc/ob_tenant_base.h"
 #include "share/vector/ob_continuous_format.h"
 #include "share/vector/ob_discrete_format.h"
@@ -17,6 +20,7 @@
 #include "share/vector/ob_uniform_format.h"
 #include "lib/wide_integer/ob_wide_integer.h"
 #include "sql/engine/expr/ob_datum_cast.h"
+#include "sql/engine/expr/ob_array_expr_utils.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 
 // 分派表：命中时走向量化转换，miss 时回退到逐行 datum 路径。
@@ -27,6 +31,54 @@ namespace oceanbase
 {
 namespace sql
 {
+
+bool ObArrowBatchConverter::supports_output_type(const common::ObObjType type)
+{
+  using namespace common;
+  switch (type) {
+    case ObNullType:
+    case ObTinyIntType:
+    case ObSmallIntType:
+    case ObInt32Type:
+    case ObIntType:
+    case ObUTinyIntType:
+    case ObUSmallIntType:
+    case ObUInt32Type:
+    case ObUInt64Type:
+    case ObFloatType:
+    case ObUFloatType:
+    case ObDoubleType:
+    case ObUDoubleType:
+    case ObDateTimeType:
+    case ObTimestampType:
+    case ObDateType:
+    case ObTimeType:
+    case ObYearType:
+    case ObNumberType:
+    case ObUNumberType:
+    case ObDecimalIntType:
+    case ObBitType:
+    case ObMySQLDateType:
+    case ObMySQLDateTimeType:
+    case ObVarcharType:
+    case ObCharType:
+    case ObNVarchar2Type:
+    case ObNCharType:
+    case ObTinyTextType:
+    case ObTextType:
+    case ObMediumTextType:
+    case ObLongTextType:
+    case ObEnumType:
+    case ObSetType:
+    case ObURowIDType:
+    case ObJsonType:
+    case ObLobType:
+    case ObCollectionSQLType:
+      return true;
+    default:
+      return false;
+  }
+}
 
 template <typename CppType, typename Bld>
 static int append_fixed_list_elems(arrow::FixedSizeListBuilder *list_bld,
@@ -189,6 +241,330 @@ static int dispatch_var_list_elem(arrow::Type::type elem_tid,
   return ret;
 }
 
+template <typename ArrowBuilder, typename Value>
+static int append_native_value_to_builder(arrow::ArrayBuilder &builder,
+                                          const arrow::Type::type expected_type,
+                                          const Value value)
+{
+  int ret = OB_SUCCESS;
+  arrow::Status status;
+  if (OB_UNLIKELY(builder.type()->id() != expected_type)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("collection metadata and Arrow builder type differ", K(ret),
+             "expected_arrow_type", static_cast<int>(expected_type),
+             "actual_arrow_type", static_cast<int>(builder.type()->id()));
+  } else if (OB_ARROW_FAIL(static_cast<ArrowBuilder &>(builder).Append(value))) {
+    ret = arrow_status_to_ob_ret(status);
+    LOG_WARN("append native collection value failed", K(ret),
+             "st", status.ToString().c_str());
+  }
+  return ret;
+}
+
+static int append_native_basic_value_to_builder(
+    const common::ObObj &value,
+    const common::ObCollectionBasicType &basic_type,
+    arrow::ArrayBuilder &builder)
+{
+  int ret = OB_SUCCESS;
+  arrow::Status status;
+  using namespace common;
+  if (value.is_null()) {
+    if (OB_ARROW_FAIL(builder.AppendNull())) {
+      ret = arrow_status_to_ob_ret(status);
+      LOG_WARN("append null collection element failed", K(ret),
+               "st", status.ToString().c_str());
+    }
+  } else {
+    switch (basic_type.basic_meta_.get_obj_type()) {
+      case ObTinyIntType:
+        ret = append_native_value_to_builder<arrow::Int8Builder>(
+            builder, arrow::Type::INT8, value.get_tinyint());
+        break;
+      case ObSmallIntType:
+        ret = append_native_value_to_builder<arrow::Int16Builder>(
+            builder, arrow::Type::INT16, value.get_smallint());
+        break;
+      case ObInt32Type:
+        ret = append_native_value_to_builder<arrow::Int32Builder>(
+            builder, arrow::Type::INT32, value.get_int32());
+        break;
+      case ObIntType:
+        ret = append_native_value_to_builder<arrow::Int64Builder>(
+            builder, arrow::Type::INT64, value.get_int());
+        break;
+      case ObUTinyIntType:
+        ret = append_native_value_to_builder<arrow::UInt8Builder>(
+            builder, arrow::Type::UINT8, value.get_utinyint());
+        break;
+      case ObUSmallIntType:
+        ret = append_native_value_to_builder<arrow::UInt16Builder>(
+            builder, arrow::Type::UINT16, value.get_usmallint());
+        break;
+      case ObUInt32Type:
+        ret = append_native_value_to_builder<arrow::UInt32Builder>(
+            builder, arrow::Type::UINT32, value.get_uint32());
+        break;
+      case ObUInt64Type:
+        ret = append_native_value_to_builder<arrow::UInt64Builder>(
+            builder, arrow::Type::UINT64, value.get_uint64());
+        break;
+      case ObFloatType:
+      case ObUFloatType:
+        ret = append_native_value_to_builder<arrow::FloatBuilder>(
+            builder, arrow::Type::FLOAT, value.get_float());
+        break;
+      case ObDoubleType:
+      case ObUDoubleType:
+        ret = append_native_value_to_builder<arrow::DoubleBuilder>(
+            builder, arrow::Type::DOUBLE, value.get_double());
+        break;
+      default:
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("unsupported native nested ARRAY leaf type", K(ret),
+                 "element_type", basic_type.basic_meta_.get_obj_type());
+        break;
+    }
+  }
+  return ret;
+}
+
+static int append_native_basic_array_to_builder(
+    const common::ObIArrayType &array,
+    const common::ObCollectionBasicType &basic_type,
+    arrow::ArrayBuilder &builder)
+{
+  int ret = OB_SUCCESS;
+  arrow::Status status;
+  for (uint32_t idx = 0; OB_SUCC(ret) && idx < array.size(); ++idx) {
+    if (array.is_null(idx)) {
+      if (OB_ARROW_FAIL(builder.AppendNull())) {
+        ret = arrow_status_to_ob_ret(status);
+        LOG_WARN("append null native ARRAY element failed", K(ret),
+                 "st", status.ToString().c_str(), K(idx));
+      }
+    } else {
+      common::ObObj value;
+      if (OB_FAIL(array.elem_at(idx, value))) {
+        LOG_WARN("read native ARRAY element failed", K(ret), K(idx));
+      } else if (OB_FAIL(append_native_basic_value_to_builder(value, basic_type, builder))) {
+        LOG_WARN("append native ARRAY element failed", K(ret), K(idx));
+      }
+    }
+  }
+  return ret;
+}
+
+static bool is_nested_array_type(const common::ObCollectionTypeBase *collection_type)
+{
+  bool is_nested = false;
+  if (OB_NOT_NULL(collection_type)
+      && collection_type->type_id_ == common::OB_ARRAY_TYPE) {
+    const common::ObCollectionArrayType *array_type =
+        static_cast<const common::ObCollectionArrayType *>(collection_type);
+    is_nested = OB_NOT_NULL(array_type->element_type_)
+                && array_type->element_type_->type_id_ == common::OB_ARRAY_TYPE;
+  }
+  return is_nested;
+}
+
+static const common::ObCollectionBasicType *get_map_basic_element_type(
+    const common::ObCollectionTypeBase *map_child_type)
+{
+  const common::ObCollectionBasicType *basic_type = nullptr;
+  if (OB_NOT_NULL(map_child_type)
+      && map_child_type->type_id_ == common::OB_ARRAY_TYPE) {
+    const common::ObCollectionArrayType *array_type =
+        static_cast<const common::ObCollectionArrayType *>(map_child_type);
+    if (OB_NOT_NULL(array_type->element_type_)
+        && array_type->element_type_->type_id_ == common::OB_BASIC_TYPE) {
+      basic_type = static_cast<const common::ObCollectionBasicType *>(
+          array_type->element_type_);
+    }
+  }
+  return basic_type;
+}
+
+static int append_native_map_to_builder(
+    const common::ObMapType &map,
+    const common::ObCollectionMapType &map_type,
+    arrow::ArrayBuilder &builder)
+{
+  int ret = OB_SUCCESS;
+  arrow::Status status;
+  using namespace common;
+  const ObIArrayType *keys = map.get_key_array();
+  const ObIArrayType *values = map.get_value_array();
+  const ObCollectionBasicType *key_type =
+      get_map_basic_element_type(map_type.key_type_);
+  const ObCollectionBasicType *value_type =
+      get_map_basic_element_type(map_type.value_type_);
+  if (builder.type()->id() != arrow::Type::MAP) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("native MAP does not match Arrow builder", K(ret),
+             "arrow_type", static_cast<int>(builder.type()->id()));
+  } else if (OB_ISNULL(keys) || OB_ISNULL(values)
+             || OB_ISNULL(key_type) || OB_ISNULL(value_type)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("native MAP has invalid key/value metadata", K(ret),
+             KP(keys), KP(values), KP(key_type), KP(value_type));
+  } else if (map.size() != keys->size() || map.size() != values->size()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("native MAP key/value lengths differ", K(ret),
+             "map_size", map.size(), "key_size", keys->size(),
+             "value_size", values->size());
+  } else {
+    // Arrow's MapType specifies non-null keys.  Do this scan before appending
+    // the map slot so an invalid native map never leaves a partial Arrow value
+    // in the builder.  Null values are legal and are appended below.
+    for (uint32_t idx = 0; OB_SUCC(ret) && idx < map.size(); ++idx) {
+      if (keys->is_null(idx)) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("cannot encode native MAP with a null Arrow key", K(ret), K(idx));
+      }
+    }
+
+    arrow::MapBuilder &map_builder = static_cast<arrow::MapBuilder &>(builder);
+    arrow::ArrayBuilder *key_builder = map_builder.key_builder();
+    arrow::ArrayBuilder *value_builder = map_builder.item_builder();
+    if (OB_SUCC(ret) && (OB_ISNULL(key_builder) || OB_ISNULL(value_builder))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("Arrow MAP has null child builder", K(ret), KP(key_builder),
+               KP(value_builder));
+    } else if (OB_SUCC(ret) && OB_ARROW_FAIL(map_builder.Append())) {
+      ret = arrow_status_to_ob_ret(status);
+      LOG_WARN("append Arrow MAP slot failed", K(ret), "st", status.ToString().c_str());
+    }
+
+    for (uint32_t idx = 0; OB_SUCC(ret) && idx < map.size(); ++idx) {
+      ObObj key;
+      if (OB_FAIL(keys->elem_at(idx, key))) {
+        LOG_WARN("read native MAP key failed", K(ret), K(idx));
+      } else if (OB_FAIL(append_native_basic_value_to_builder(
+                         key, *key_type, *key_builder))) {
+        LOG_WARN("append native MAP key failed", K(ret), K(idx));
+      } else if (values->is_null(idx)) {
+        if (OB_ARROW_FAIL(value_builder->AppendNull())) {
+          ret = arrow_status_to_ob_ret(status);
+          LOG_WARN("append null native MAP value failed", K(ret),
+                   "st", status.ToString().c_str(), K(idx));
+        }
+      } else {
+        ObObj value;
+        if (OB_FAIL(values->elem_at(idx, value))) {
+          LOG_WARN("read native MAP value failed", K(ret), K(idx));
+        } else if (OB_FAIL(append_native_basic_value_to_builder(
+                               value, *value_type, *value_builder))) {
+          LOG_WARN("append native MAP value failed", K(ret), K(idx));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+static int append_native_collection_to_builder(
+    const common::ObIArrayType &array,
+    const common::ObCollectionTypeBase &collection_type,
+    arrow::ArrayBuilder &builder,
+    common::ObIAllocator &scratch_allocator)
+{
+  int ret = OB_SUCCESS;
+  arrow::Status status;
+  using namespace common;
+  if (collection_type.type_id_ == OB_MAP_TYPE) {
+    const ObMapType *map = dynamic_cast<const ObMapType *>(&array);
+    if (OB_ISNULL(map)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("native MAP payload has an unexpected object type", K(ret));
+    } else {
+      ret = append_native_map_to_builder(
+          *map, static_cast<const ObCollectionMapType &>(collection_type), builder);
+    }
+  } else if (collection_type.type_id_ != OB_ARRAY_TYPE
+             || builder.type()->id() != arrow::Type::LIST) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("unsupported native collection to Arrow shape", K(ret),
+             "collection_type", collection_type.type_id_,
+             "arrow_type", static_cast<int>(builder.type()->id()));
+  } else {
+    const ObCollectionArrayType &array_type =
+        static_cast<const ObCollectionArrayType &>(collection_type);
+    const ObCollectionTypeBase *element_type = array_type.element_type_;
+    arrow::ListBuilder &list_builder = static_cast<arrow::ListBuilder &>(builder);
+    if (OB_ISNULL(element_type)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("native ARRAY has null element metadata", K(ret));
+    } else if (OB_ARROW_FAIL(list_builder.Append())) {
+      ret = arrow_status_to_ob_ret(status);
+      LOG_WARN("append Arrow LIST slot failed", K(ret),
+               "st", status.ToString().c_str());
+    } else if (element_type->type_id_ == OB_BASIC_TYPE) {
+      ret = append_native_basic_array_to_builder(
+          array, static_cast<const ObCollectionBasicType &>(*element_type),
+          *list_builder.value_builder());
+    } else if (element_type->type_id_ == OB_ARRAY_TYPE) {
+      const ObArrayNested *nested_array = dynamic_cast<const ObArrayNested *>(&array);
+      arrow::ArrayBuilder *child_builder = list_builder.value_builder();
+      if (OB_ISNULL(nested_array) || OB_ISNULL(child_builder)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("native nested ARRAY and Arrow builder differ", K(ret),
+                 KP(nested_array), KP(child_builder));
+      } else {
+        for (uint32_t idx = 0; OB_SUCC(ret) && idx < nested_array->size(); ++idx) {
+          if (nested_array->is_null(idx)) {
+            if (OB_ARROW_FAIL(child_builder->AppendNull())) {
+              ret = arrow_status_to_ob_ret(status);
+              LOG_WARN("append null nested ARRAY element failed", K(ret),
+                       "st", status.ToString().c_str(), K(idx));
+            }
+          } else {
+            ObIArrayType *child_array = nullptr;
+            if (OB_FAIL(ObArrayTypeObjFactory::construct(
+                    scratch_allocator, *element_type, child_array, false))) {
+              LOG_WARN("construct nested ARRAY child failed", K(ret), K(idx));
+            } else if (OB_FAIL(nested_array->at(idx, *child_array))) {
+              LOG_WARN("read nested ARRAY child failed", K(ret), K(idx));
+            } else if (OB_FAIL(append_native_collection_to_builder(
+                           *child_array, *element_type, *child_builder,
+                           scratch_allocator))) {
+              LOG_WARN("append nested ARRAY child failed", K(ret), K(idx));
+            }
+          }
+        }
+      }
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("unsupported native ARRAY element metadata", K(ret),
+               "element_type", element_type->type_id_);
+    }
+  }
+  return ret;
+}
+
+static int resolve_collection_meta(const ObExpr &expr,
+                                   ObEvalCtx &eval_ctx,
+                                   const common::ObCollectionTypeBase *&collection_type)
+{
+  int ret = OB_SUCCESS;
+  collection_type = nullptr;
+  const uint16_t subschema_id = expr.obj_meta_.get_subschema_id();
+  common::ObCollectionTypeBase *resolved_type = nullptr;
+  if (UINT_MAX16 == subschema_id) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("collection expression has no subschema id", K(ret), K(expr.obj_meta_));
+  } else if (OB_FAIL(ObArrayExprUtils::get_coll_type_by_subschema_id(
+                 &eval_ctx.exec_ctx_, subschema_id, resolved_type))) {
+    LOG_WARN("resolve collection subschema failed", K(ret), K(subschema_id));
+  } else if (OB_ISNULL(resolved_type)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("collection subschema has null metadata", K(ret), K(subschema_id));
+  } else {
+    collection_type = resolved_type;
+  }
+  return ret;
+}
+
 static int append_collection_raw_to_builder(const common::ObString &raw,
                                             arrow::ArrayBuilder &builder)
 {
@@ -238,15 +614,49 @@ static int append_collection_raw_to_builder(const common::ObString &raw,
 static int append_collection_datum_to_builder(const ObExpr &expr,
                                               const common::ObDatum &datum,
                                               arrow::ArrayBuilder &builder,
-                                              common::ObIAllocator &arena)
+                                              common::ObIAllocator &arena,
+                                              ObEvalCtx *eval_ctx)
 {
   int ret = OB_SUCCESS;
-  common::ObString raw;
-  if (OB_FAIL(ObTextStringHelper::read_real_string_data(
-          arena, datum, expr.datum_meta_, raw))) {
-    LOG_WARN("read collection payload failed", K(ret), K(expr.datum_meta_.type_));
+  const common::ObCollectionTypeBase *collection_type = nullptr;
+  if (OB_NOT_NULL(eval_ctx)
+      && (builder.type()->id() == arrow::Type::LIST
+          || builder.type()->id() == arrow::Type::MAP)
+      && OB_FAIL(resolve_collection_meta(expr, *eval_ctx, collection_type))) {
+    LOG_WARN("resolve collection metadata failed", K(ret), K(expr.obj_meta_));
+  } else if (OB_NOT_NULL(collection_type)
+             && ((builder.type()->id() == arrow::Type::LIST
+                  && is_nested_array_type(collection_type))
+                 || (builder.type()->id() == arrow::Type::MAP
+                     && collection_type->type_id_ == common::OB_MAP_TYPE))) {
+    common::ObIArrayType *array = nullptr;
+    const uint16_t subschema_id = expr.obj_meta_.get_subschema_id();
+    // Arrow builders copy the values below, so parsing and walking one native
+    // nested collection needs only a short-lived workspace.  Keeping it out of
+    // lob_arena avoids retaining a full native object tree for every row in a
+    // Flight record batch.
+    common::ObArenaAllocator collection_arena(
+        "FlSqlCollRead", common::OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+    if (OB_FAIL(ObArrayExprUtils::get_array_obj(
+            collection_arena, *eval_ctx, subschema_id, datum.get_string(), array))) {
+      LOG_WARN("construct native collection from collection payload failed", K(ret),
+               K(subschema_id));
+    } else if (OB_FAIL(append_native_collection_to_builder(
+                   *array, *collection_type, builder, collection_arena))) {
+      LOG_WARN("append native collection to Arrow builder failed", K(ret));
+    }
   } else {
-    ret = append_collection_raw_to_builder(raw, builder);
+    // Keep the existing one-level raw fast path for legacy direct callers and
+    // for non-nested ARRAY/VECTOR results.  Nested values must use the native
+    // parser above; their payload has offsets and child serialization, not the
+    // flat [count][null bitmap][primitive values] layout.
+    common::ObString raw;
+    if (OB_FAIL(ObTextStringHelper::read_real_string_data(
+            arena, datum, expr.datum_meta_, raw))) {
+      LOG_WARN("read collection payload failed", K(ret), K(expr.datum_meta_.type_));
+    } else {
+      ret = append_collection_raw_to_builder(raw, builder);
+    }
   }
   return ret;
 }
@@ -277,6 +687,36 @@ static int append_string_datum_to_builder(const ObExpr &expr,
                  s.ptr(), static_cast<int32_t>(s.length())))) {
     ret = arrow_status_to_ob_ret(status);
     LOG_WARN("append string failed", K(ret), "st", status.ToString().c_str());
+  }
+  return ret;
+}
+
+static int append_urowid_datum_to_builder(const common::ObDatum &datum,
+                                          arrow::ArrayBuilder &builder,
+                                          common::ObIAllocator &arena)
+{
+  int ret = OB_SUCCESS;
+  arrow::Status status;
+  const common::ObURowIDData rowid = datum.get_urowid();
+  const int64_t buf_size = rowid.needed_base64_buffer_size();
+  char *buf = nullptr;
+  int64_t pos = 0;
+  if (OB_UNLIKELY(builder.type()->id() != arrow::Type::STRING)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("urowid requires Arrow string builder", K(ret),
+             "arrow_type", static_cast<int>(builder.type()->id()));
+  } else if (OB_UNLIKELY(buf_size <= 0)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid urowid base64 buffer size", K(ret), K(buf_size));
+  } else if (OB_ISNULL(buf = static_cast<char *>(arena.alloc(buf_size)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("allocate urowid base64 buffer failed", K(ret), K(buf_size));
+  } else if (OB_FAIL(rowid.get_base64_str(buf, buf_size, pos))) {
+    LOG_WARN("encode urowid as base64 failed", K(ret), K(buf_size));
+  } else if (OB_ARROW_FAIL(static_cast<arrow::StringBuilder &>(builder).Append(
+                 buf, static_cast<int32_t>(pos)))) {
+    ret = arrow_status_to_ob_ret(status);
+    LOG_WARN("append urowid string failed", K(ret), "st", status.ToString().c_str());
   }
   return ret;
 }
@@ -459,6 +899,7 @@ static int append_decimal_datum_to_builder(const ObExpr &expr,
 template <typename VecRef>
 static int append_vec_by_datum(const ObExpr &expr, VecRef &vec,
                                const ObBitVector &skip, const int64_t size,
+                               ObEvalCtx &eval_ctx,
                                arrow::ArrayBuilder &builder,
                                common::ObIAllocator &arena)
 {
@@ -479,7 +920,8 @@ static int append_vec_by_datum(const ObExpr &expr, VecRef &vec,
       }
     } else {
       const common::ObDatum datum(payload, static_cast<uint32_t>(length), false);
-      if (OB_FAIL(ObArrowBatchConverter::append_datum_to_builder(expr, datum, builder, arena))) {
+      if (OB_FAIL(ObArrowBatchConverter::append_datum_to_builder(
+              expr, datum, builder, arena, &eval_ctx))) {
         LOG_WARN("append datum to builder failed", K(ret), K(i));
       }
     }
@@ -491,7 +933,8 @@ static int append_vec_by_datum(const ObExpr &expr, VecRef &vec,
 int ObArrowBatchConverter::append_datum_to_builder(const ObExpr &expr,
                                                    const ObDatum &datum,
                                                    arrow::ArrayBuilder &builder,
-                                                   common::ObIAllocator &lob_arena)
+                                                   common::ObIAllocator &lob_arena,
+                                                   ObEvalCtx *eval_ctx)
 {
   int ret = OB_SUCCESS;
   arrow::Status status;
@@ -558,7 +1001,7 @@ int ObArrowBatchConverter::append_datum_to_builder(const ObExpr &expr,
             datum.get_date()));
         break;
       case ObTimeType:
-        ret = arrow_status_to_ob_ret(static_cast<arrow::Time64Builder&>(builder).Append(
+        ret = arrow_status_to_ob_ret(static_cast<arrow::DurationBuilder&>(builder).Append(
             datum.get_time()));
         break;
       case ObYearType: {
@@ -573,8 +1016,8 @@ int ObArrowBatchConverter::append_datum_to_builder(const ObExpr &expr,
         ret = append_decimal_datum_to_builder(expr, datum, builder);
         break;
       case ObBitType:
-        ret = arrow_status_to_ob_ret(static_cast<arrow::Int64Builder&>(builder).Append(
-            static_cast<int64_t>(datum.get_bit())));
+        ret = arrow_status_to_ob_ret(static_cast<arrow::UInt64Builder&>(builder).Append(
+            datum.get_bit()));
         break;
       case ObMySQLDateType: {
         const ObMySQLDate md = datum.get_mysql_date();
@@ -611,6 +1054,9 @@ int ObArrowBatchConverter::append_datum_to_builder(const ObExpr &expr,
       case ObSetType:
         ret = append_string_datum_to_builder(expr, datum, builder, lob_arena);
         break;
+      case ObURowIDType:
+        ret = append_urowid_datum_to_builder(datum, builder, lob_arena);
+        break;
       case ObJsonType:
         ret = append_json_datum_to_builder(expr, datum, builder, lob_arena);
         break;
@@ -628,11 +1074,13 @@ int ObArrowBatchConverter::append_datum_to_builder(const ObExpr &expr,
         break;
       }
       case ObCollectionSQLType:
-        ret = append_collection_datum_to_builder(expr, datum, builder, lob_arena);
+        ret = append_collection_datum_to_builder(
+            expr, datum, builder, lob_arena, eval_ctx);
         break;
       default:
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unsupported ob type for arrow conversion", K(ret), K(expr.datum_meta_.type_));
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("unsupported ob type for arrow conversion", K(ret),
+                 "ob_type", common::ob_obj_type_str(expr.datum_meta_.type_));
         break;
     }
   }
@@ -684,7 +1132,7 @@ int ObArrowBatchConverter::append_brs_to_builders(
         } else {
           // 当前 (ob_t, ar_t) 未注册时回退到 datum 路径。
           if (OB_FAIL(append_vec_by_datum(*expr, *vec, *brs.skip_, nrows,
-                                          *builders[col], lob_arena))) {
+                                          eval_ctx, *builders[col], lob_arena))) {
             LOG_WARN("datum fallback failed", K(ret), K(col));
           }
         }
