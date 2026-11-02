@@ -7,11 +7,26 @@
 #include "src/rootserver/ob_load_sys_package_task.h"
 #include "src/rootserver/ob_root_service.h"
 #include "src/pl/ob_pl_package_manager.h"
+#include "lib/worker.h"
+#include "sql/session/ob_sql_session_info.h"
 
 namespace oceanbase
 {
 namespace rootserver
 {
+
+bool is_user_session_terminated(int &ret)
+{
+  ret = OB_SUCCESS;
+  bool is_terminated = false;
+  sql::ObSQLSessionInfo *session = THIS_WORKER.get_session();
+  if (OB_NOT_NULL(session) && session->is_terminate(ret)) {
+    is_terminated = true;
+    LOG_WARN("user session is terminated, interrupt current operation",
+        KR(ret), "session_id", session->get_server_sid());
+  }
+  return is_terminated;
+}
 
 ObLoadSysPackageTask::ObLoadSysPackageTask(
     ObRootService &root_service,
@@ -34,6 +49,7 @@ ObAsyncTask *ObLoadSysPackageTask::deep_copy(char *buf, const int64_t buf_size) 
   return task;
 }
 ERRSIM_POINT_DEF(ERRSIM_LOAD_PACKAGE_ERROR);
+ERRSIM_POINT_DEF(ERRSIM_WAIT_SYS_PACKAGE_FIND_ERROR);
 int ObLoadSysPackageTask::load_package(const ObCompatibilityMode &compat_mode)
 {
   int ret = OB_SUCCESS;
@@ -103,29 +119,55 @@ int ObLoadSysPackageTask::wait_sys_package_ready(
   const int64_t retry_interval_us = 500l * 1000l; // 500ms
   int64_t job_id = OB_INVALID_ID;
   bool finish = false;
-  int64_t inprogress_job_count = 0;
   if (mode == ObCompatibilityMode::ORACLE_MODE) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("not support oracle mode", KR(ret), K(mode));
   }
   while (OB_SUCC(ret) && !finish) {
-    int tmp_ret = OB_SUCCESS;
     if (ctx.is_timeouted()) {
       ret = OB_TIMEOUT;
       LOG_WARN("wait sys package ready failed", KR(ret), K(mode));
+    } else if (is_user_session_terminated(ret)) {
+      // The user session of CREATE TENANT is killed; fail fast and let the
+      // caller roll back instead of waiting until the DDL timeout.
+      LOG_WARN("user session is terminated while waiting sys package ready, stop waiting",
+          KR(ret), K(mode));
     } else {
-      inprogress_job_count = 0;
-      if (OB_ENTRY_NOT_EXIST != (tmp_ret = RS_JOB_FIND(LOAD_MYSQL_SYS_PACKAGE, job_id, sql_proxy,
-            "tenant_id", OB_SYS_TENANT_ID))) {
-          inprogress_job_count++;
-          LOG_WARN("mysql job is not ready", K(tmp_ret), K(mode));
+      // RS_JOB_FIND will only find INPROGRESS job:
+      // - OB_SUCCESS        : an in-progress sys package job exists, keep waiting;
+      // - OB_ENTRY_NOT_EXIST: no in-flight job, sys package is ready;
+      // - OB_ERR_SESSION_INTERRUPTED / OB_ERR_QUERY_INTERRUPTED: the user session
+      //   of CREATE TENANT is killed; inner SQL keeps failing with the interrupt
+      //   error and will never succeed again, fail fast so that the interrupt
+      //   cause is not masked by the final OB_TIMEOUT;
+      // - other errors      : transient errors (e.g. RS leader switching, sys LS
+      //   leader switching, timeout, ...) — keep waiting as before (the job may
+      //   still be in flight), but log each error explicitly instead of silently
+      //   counting it as an in-flight job.
+      int tmp_ret = OB_SUCCESS;
+      if (OB_FAIL(ERRSIM_WAIT_SYS_PACKAGE_FIND_ERROR)) {
+        // errsim: simulate a RS_JOB_FIND failure to verify the wait loop
+        // keeps retrying on transient errors.
+        tmp_ret = ret;
+        ret = OB_SUCCESS;
+      } else {
+        tmp_ret = RS_JOB_FIND(LOAD_MYSQL_SYS_PACKAGE, job_id, sql_proxy,
+            "tenant_id", OB_SYS_TENANT_ID);
       }
-      if (inprogress_job_count == 0) {
+      if (OB_SUCCESS == tmp_ret) {
+        LOG_WARN("sys_package is not ready", KR(tmp_ret), K(mode));
+        ob_usleep(retry_interval_us);
+      } else if (OB_ENTRY_NOT_EXIST == tmp_ret) {
         // RS_JOB_FIND will only find INPROGRESS job
         finish = true;
         LOG_INFO("sys_package is ready", KR(ret), K(mode));
+      } else if (OB_ERR_SESSION_INTERRUPTED == tmp_ret || OB_ERR_QUERY_INTERRUPTED == tmp_ret) {
+        ret = tmp_ret;
+        LOG_WARN("user session is terminated while waiting sys package ready, stop waiting",
+            KR(ret), K(mode));
       } else {
-        LOG_WARN("sys_package is not ready", KR(ret), KR(tmp_ret), K(mode));
+        // transient error: keep waiting (original behavior), but log it
+        LOG_WARN("failed to find sys package rs job, keep waiting", KR(tmp_ret), K(mode));
         ob_usleep(retry_interval_us);
       }
     }

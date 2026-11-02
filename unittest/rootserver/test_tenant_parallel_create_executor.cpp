@@ -15,6 +15,7 @@
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/config/ob_server_config.h"
 #include "lib/worker.h"
+#include "sql/session/ob_sql_session_info.h"
 
 namespace oceanbase
 {
@@ -26,6 +27,24 @@ using namespace testing;
 
 namespace rootserver
 {
+
+namespace
+{
+// RAII guard: THIS_WORKER must never keep a dangling pointer to the stack
+// session object when a test exits early on a failed assertion.
+class WorkerSessionGuard
+{
+public:
+  explicit WorkerSessionGuard(sql::ObSQLSessionInfo *session)
+  {
+    THIS_WORKER.set_session(session);
+  }
+  ~WorkerSessionGuard()
+  {
+    THIS_WORKER.set_session(nullptr);
+  }
+};
+} // namespace
 
 class MockCreateTenantRpcProxy : public ObCommonRpcProxy
 {
@@ -256,6 +275,49 @@ TEST_F(TestTenantParallelCreateExecutor, cleanup_failure_preserves_original_crea
 {
   expect_drop(true, OB_TIMEOUT);
   EXPECT_EQ(OB_TENANT_NOT_IN_SERVER, executor_.finish_create_tenant_(OB_TENANT_NOT_IN_SERVER));
+}
+
+TEST_F(TestTenantParallelCreateExecutor, no_user_session_skips_interrupt_check)
+{
+  // Background callers (restore/clone scheduler threads) have no user session
+  // attached to the worker; the interrupt check must be skipped for them.
+  WorkerSessionGuard guard(nullptr);
+  EXPECT_EQ(OB_SUCCESS, executor_.check_user_session_interrupted_());
+}
+
+TEST_F(TestTenantParallelCreateExecutor, killed_user_session_interrupts_create)
+{
+  sql::ObSQLSessionInfo session;
+  WorkerSessionGuard guard(&session);
+  ASSERT_EQ(OB_SUCCESS, session.set_session_state(sql::SESSION_KILLED));
+  EXPECT_EQ(OB_ERR_SESSION_INTERRUPTED, executor_.check_user_session_interrupted_());
+}
+
+TEST_F(TestTenantParallelCreateExecutor, killed_user_session_interrupts_wait_ls_leader)
+{
+  // A killed user session must break wait_ls_leader_ immediately instead of
+  // polling the location cache until the DDL timeout.
+  sql::ObSQLSessionInfo session;
+  WorkerSessionGuard guard(&session);
+  ASSERT_EQ(OB_SUCCESS, session.set_session_state(sql::SESSION_KILLED));
+  const int64_t start_ts = ObTimeUtility::current_time();
+  EXPECT_EQ(OB_ERR_SESSION_INTERRUPTED, executor_.wait_ls_leader_(USER_TENANT_ID, SYS_LS));
+  EXPECT_LT(ObTimeUtility::current_time() - start_ts, 5 * 1000L * 1000L);
+}
+
+TEST_F(TestTenantParallelCreateExecutor, active_user_session_does_not_interrupt_wait_ls_leader)
+{
+  // A live user session must NOT take the interrupt branch: with a fresh short
+  // ctx deadline the wait loop keeps polling (the uninitialized location
+  // service of this fixture fails every lookup with OB_NOT_INIT) until the
+  // ctx timeout, returning OB_TIMEOUT rather than an interrupt error.
+  // The session check is exercised on every loop iteration before the timeout
+  // fires, so a false "terminated" detection would surface as -5066/-5065.
+  sql::ObSQLSessionInfo session;
+  WorkerSessionGuard guard(&session);
+  ASSERT_EQ(OB_SUCCESS, session.set_session_state(sql::QUERY_ACTIVE));
+  ASSERT_EQ(OB_SUCCESS, executor_.ctx_.set_timeout(1 * 1000L * 1000L)); // 1s
+  EXPECT_EQ(OB_TIMEOUT, executor_.wait_ls_leader_(USER_TENANT_ID, SYS_LS));
 }
 
 } // namespace rootserver

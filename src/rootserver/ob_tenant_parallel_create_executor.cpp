@@ -36,6 +36,7 @@
 #include "share/ob_define.h"
 #include "lib/profile/ob_trace_id.h"
 #include "lib/worker.h"
+#include "sql/session/ob_sql_session_info.h"
 #include "observer/ob_server.h"
 
 namespace oceanbase
@@ -57,6 +58,13 @@ bool is_balance_user_ls_for_tablet_alloc(
       && !ls_attr.get_ls_flag().is_duplicate_ls();
 }
 
+// is_user_session_terminated() (declared in ob_load_sys_package_task.h) checks
+// the original user session state so that the wait loops in this file fail
+// fast once the client disconnects, instead of polling until the whole DDL
+// budget is exhausted. For callers without any user session (e.g.
+// restore/clone scheduler threads), THIS_WORKER.get_session() is NULL and the
+// check is skipped.
+
 template <typename Executor>
 int retry_operation(const common::ObTimeoutCtx &ctx, const char *operation_name, Executor *executor,
     int (Executor::*operation)())
@@ -70,12 +78,24 @@ int retry_operation(const common::ObTimeoutCtx &ctx, const char *operation_name,
     if (ctx.is_timeouted()) {
       ret = OB_TIMEOUT;
       LOG_WARN("retry operation timeout", KR(ret), KR(last_ret), K(operation_name), K(retry_count), K(ctx));
+    } else if (is_user_session_terminated(ret)) {
+      // is_user_session_terminated has logged the interrupt reason; stop retrying.
+      LOG_WARN("user session is terminated, stop operation retry",
+          KR(ret), K(operation_name), K(retry_count));
     } else if (OB_TMP_FAIL((executor->*operation)())) {
-      last_ret = tmp_ret;
-      ++retry_count;
-      LOG_WARN("failed to execute operation, retry",
-          KR(tmp_ret), K(operation_name), K(retry_count), K(ctx));
-      ob_usleep(retry_interval_us);
+      if (OB_ERR_SESSION_INTERRUPTED == tmp_ret || OB_ERR_QUERY_INTERRUPTED == tmp_ret) {
+        // A terminated user session never recovers; stop retrying immediately
+        // instead of masking the interrupt cause until the ctx timeout.
+        ret = tmp_ret;
+        LOG_WARN("user session is terminated, stop operation retry",
+            KR(ret), K(operation_name), K(retry_count));
+      } else {
+        last_ret = tmp_ret;
+        ++retry_count;
+        LOG_WARN("failed to execute operation, retry",
+            KR(tmp_ret), K(operation_name), K(retry_count), K(ctx));
+        ob_usleep(retry_interval_us);
+      }
     } else {
       break;
     }
@@ -108,6 +128,8 @@ int ObParallelCreateTenantExecutor::execute(obrpc::UInt64 &tenant_id)
   FLOG_INFO("[CREATE_TENANT] STEP 1. start create tenant", K(create_tenant_arg_));
   if (OB_FAIL(check_inner_stat_())) {
     LOG_WARN("failed to check_inner_stat", KR(ret));
+  } else if (OB_FAIL(check_user_session_interrupted_())) {
+    LOG_WARN("failed to check user session interrupted", KR(ret));
   } else if (GCONF.in_upgrade_mode()) {
     ret = OB_OP_NOT_ALLOW;
     LOG_WARN("create tenant is not allowed in upgrade mode", KR(ret), K(GCONF.in_upgrade_mode()));
@@ -342,6 +364,18 @@ int ObParallelCreateTenantExecutor::wait_all_(
   ObArray<int> return_ret_array;
   const uint64_t user_tenant_id = user_tenant_schema_.get_tenant_id();
   DEBUG_SYNC(BEFORE_CHECK_CREATE_NORMAL_TENANT_RESULT);
+  // NOTE: never skip proxy.wait_all() on user-session interruption here:
+  // outstanding async RPC callbacks must be reaped before the proxy is
+  // destroyed, otherwise in-flight responses would touch freed memory.
+  // Session interruption is detected after wait_all via wait_ls_leader_() /
+  // wait_sys_package_ready().
+  // Residual window: if the remote create_normal_tenant RPCs are still in
+  // flight when the client disconnects, wait_all() blocks until they return,
+  // bounded by the RPC timeout (the create-tenant DDL budget passed to
+  // proxy.call()). ObAsyncRpcProxy::wait_all() only terminates outstanding
+  // RPCs early for proxies with detect_session_killed enabled (DAS / table
+  // lock), which does not cover this proxy, so the residual window equals the
+  // remaining RPC timeout; the interruption is still perceived afterwards.
   if (OB_FAIL(proxy.wait_all(return_ret_array))) {
     LOG_WARN("failed to wait all create normal tenant rpc", KR(ret), K(user_tenant_id));
   } else if (OB_FAIL(proxy.check_return_cnt(return_ret_array.count()))) {
@@ -844,6 +878,9 @@ int ObParallelCreateTenantExecutor::notify_create_tenant_user_ls_rpc_(
       if (ctx_.is_timeouted()) {
         ret = OB_TIMEOUT;
         LOG_WARN("create tenant user ls timeout", KR(ret), K(tenant_id));
+      } else if (is_user_session_terminated(ret)) {
+        LOG_WARN("create tenant user ls interrupted by terminated user session",
+            KR(ret), K(tenant_id));
       } else if (OB_TMP_FAIL(GCTX.location_service_->get_leader(GCONF.cluster_id, tenant_id,
               SYS_LS, FALSE, leader))) {
         LOG_WARN("failed to get tenant sys ls leader", KR(ret), KR(tmp_ret), K(tenant_id), K(leader));
@@ -1020,6 +1057,9 @@ int ObParallelCreateTenantExecutor::wait_ls_leader_(const uint64_t tenant_id, co
       if (ctx_.is_timeouted()) {
         ret = OB_TIMEOUT;
         LOG_WARN("wait ls leader elect timeout", KR(ret), K(tenant_id), K(ctx_));
+      } else if (is_user_session_terminated(ret)) {
+        LOG_WARN("wait ls leader interrupted by terminated user session",
+            KR(ret), K(tenant_id), K(ls_id));
       } else if (!first_round && OB_TMP_FAIL(location_service_->renew_all_ls_locations_by_rpc())) {
         LOG_WARN("failed to renew all ls locations by rpc", KR(tmp_ret));
       } else if (OB_TMP_FAIL(location_service_->get(GCONF.cluster_id, tenant_id,
@@ -1131,6 +1171,9 @@ int ObParallelCreateTenantExecutor::check_can_create_user_ls_(
       if (ctx_.is_timeouted()) {
         ret = OB_TIMEOUT;
         LOG_WARN("wait tenant __all_ls writable failed", KR(ret), K(tenant_id));
+      } else if (is_user_session_terminated(ret)) {
+        LOG_WARN("check can create user ls interrupted by terminated user session",
+            KR(ret), K(tenant_id));
       } else if (OB_TMP_FAIL(do_check_can_create_user_ls_(tenant_id, can_create))) {
         LOG_WARN("failed to check can create user ls", KR(tmp_ret), K(tenant_id));
       } else if (can_create) {
@@ -1361,6 +1404,9 @@ int ObParallelCreateTenantExecutor::wait_meta_tenant_user_ls_leader_(const uint6
       if (ctx_.is_timeouted()) {
         ret = OB_TIMEOUT;
         LOG_WARN("wait meta user ls leader timeout", KR(ret), K(meta_tenant_id));
+      } else if (is_user_session_terminated(ret)) {
+        LOG_WARN("wait meta user ls leader interrupted by terminated user session",
+            KR(ret), K(meta_tenant_id));
       } else {
         bool ready = false;
         if (OB_FAIL(check_has_available_ls_for_tablet_alloc_(meta_tenant_id, ready))) {
@@ -1546,6 +1592,15 @@ int ObParallelCreateTenantExecutor::check_inner_stat_()
     LOG_WARN("null pointer", KR(ret), K(rpc_proxy_), K(common_rpc_), K(sql_proxy_), K(schema_service_),
         K(lst_operator_), K(location_service_), K(rs_mgr_));
   }
+  return ret;
+}
+
+int ObParallelCreateTenantExecutor::check_user_session_interrupted_()
+{
+  int ret = OB_SUCCESS;
+  // no extra log here: is_user_session_terminated has logged the interrupt
+  // reason (including session id) when it detects a terminated session.
+  is_user_session_terminated(ret);
   return ret;
 }
 

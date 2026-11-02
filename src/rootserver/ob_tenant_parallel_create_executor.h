@@ -82,6 +82,11 @@ private:
       common::ObMySQLProxy &sql_proxy,
       const common::ObTimeoutCtx &timeout_ctx);
   int check_inner_stat_();
+  // CREATE TENANT runs in the user session's worker thread; this checks the
+  // original user session state (skipped when no user session is attached,
+  // e.g. restore/clone scheduler threads) so that a disconnected client leads
+  // to a fast rollback instead of waiting until the DDL timeout.
+  int check_user_session_interrupted_();
   int get_tenant_schema_from_inner_table_();
 
   int create_tenant_sys_ls_();
