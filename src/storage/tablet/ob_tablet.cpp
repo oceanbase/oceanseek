@@ -37,6 +37,7 @@
 #include "storage/tablet/ob_tablet_common.h"
 #include "storage/tablet/ob_tablet_macro_info_iterator.h"
 #include "storage/blocksstable/ob_shared_macro_block_manager.h"
+#include "storage/blocksstable/async_index/ob_inv_sstable.h"
 #include "storage/ob_direct_load_table_guard.h"
 #include "share/ob_tablet_replica_checksum_operator.h"
 #include "observer/ob_server_event_history_table_operator.h"
@@ -7820,6 +7821,93 @@ int ObTablet::get_async_index_sstable(
       table_store_wrapper.get_meta_handle(), *this, table_type, version_range, handle))) {
     LOG_WARN("failed to get async index sstable", K(ret), K(table_type),
         K(version_range));
+  }
+  return ret;
+}
+
+int ObTablet::get_async_inv_bm25_stats(
+    const share::SCN &read_snapshot,
+    blocksstable::ObAsyncInvBM25Stats &stats) const
+{
+  int ret = OB_SUCCESS;
+  stats.reset();
+  ObTabletMemberWrapper<ObTabletTableStore> table_store_wrapper;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not inited", K(ret), K_(is_inited));
+  } else if (OB_UNLIKELY(!read_snapshot.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(read_snapshot));
+  } else if (OB_UNLIKELY(!is_async_inverted_storage_index())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("tablet is not async index tablet", K(ret), K(get_tablet_id()));
+  } else if (OB_FAIL(fetch_table_store(table_store_wrapper))) {
+    LOG_WARN("failed to fetch async index table store", K(ret), K(get_tablet_id()));
+  } else if (OB_UNLIKELY(!table_store_wrapper.is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async index table store", K(ret), K(get_tablet_id()));
+  } else if (OB_FAIL(aggregate_async_inv_bm25_stats_(
+      *table_store_wrapper.get_member(), table_store_wrapper.get_meta_handle(),
+      read_snapshot, stats))) {
+    LOG_WARN("failed to aggregate async inv bm25 stats", K(ret), K(get_tablet_id()));
+  }
+  return ret;
+}
+
+int ObTablet::aggregate_async_inv_bm25_stats_(
+    const ObTabletTableStore &table_store,
+    const ObStorageMetaHandle &table_store_handle,
+    const share::SCN &read_snapshot,
+    blocksstable::ObAsyncInvBM25Stats &stats) const
+{
+  int ret = OB_SUCCESS;
+  stats.reset();
+  common::ObSEArray<common::ObNewVersionRange, 64> version_ranges;
+  if (OB_UNLIKELY(!read_snapshot.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async index read snapshot", K(ret), K(read_snapshot));
+  } else if (OB_FAIL(table_store.get_async_index_sstable_version_ranges(*this, version_ranges))) {
+    // The async selector excludes uncommitted IncMajors and increments covered by the Major.
+    LOG_WARN("failed to get async index version ranges", K(ret), K(get_tablet_id()));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < version_ranges.count(); ++i) {
+    const common::ObNewVersionRange &range = version_ranges.at(i);
+    bool duplicate = false;
+    // Several physical retries can describe the same range; select and count it only once.
+    for (int64_t j = 0; !duplicate && j < i; ++j) {
+      duplicate = version_ranges.at(j) == range;
+    }
+    ObTableHandleV2 table_handle;
+    blocksstable::ObSSTable *sstable = nullptr;
+    const ObITable::TableType table_type = ASYNC_INDEX_INITIAL_VERSION == range.base_version_
+        ? ObITable::INV_INDEX_SSTABLE : ObITable::INC_INV_INDEX_SSTABLE;
+    if (duplicate || range.snapshot_version_ > read_snapshot.get_val_for_tx()) {
+      // Whole-SSTable statistics cannot be clipped to a snapshot inside its logical range.
+    } else if (OB_FAIL(table_store.get_async_index_sstable(
+        table_store_handle, *this, table_type, range, table_handle))) {
+      LOG_WARN("failed to get async index sstable for bm25 stats", K(ret), K(range));
+    } else if (OB_FAIL(table_handle.get_sstable(sstable))) {
+      LOG_WARN("failed to get sstable from table handle", K(ret), K(range));
+    } else if (OB_ISNULL(sstable) || OB_UNLIKELY(!sstable->is_inv_sstable())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected non-inv sstable for bm25 stats", K(ret), KP(sstable), K(range));
+    } else {
+      const blocksstable::ObInvSSTable *inv_sstable =
+          static_cast<const blocksstable::ObInvSSTable *>(sstable);
+      const blocksstable::ObInvIdxStatsMeta &inv_meta = inv_sstable->get_inv_meta();
+      if (OB_UNLIKELY(!inv_meta.is_valid())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid inv meta", K(ret), K(inv_meta), KPC(inv_sstable));
+      } else if (UINT64_MAX - stats.total_doc_length_ < inv_meta.total_doc_length_) {
+        ret = OB_SIZE_OVERFLOW;
+        LOG_WARN("total doc length overflow", K(ret), K(stats), K(inv_meta));
+      } else {
+        stats.total_doc_length_ += inv_meta.total_doc_length_;
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    stats.reset();
   }
   return ret;
 }

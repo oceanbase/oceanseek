@@ -59,6 +59,7 @@ namespace blocksstable
 {
 class ObSSTable;
 struct ObSSTableMergeRes;
+struct ObAsyncInvBM25Stats;
 }
 
 namespace compaction
@@ -674,6 +675,9 @@ public:
       const ObITable::TableType table_type,
       const common::ObNewVersionRange &version_range,
       ObTableHandleV2 &handle) const;
+  int get_async_inv_bm25_stats(
+      const share::SCN &read_snapshot,
+      blocksstable::ObAsyncInvBM25Stats &stats) const;
   int get_recycle_version(const int64_t multi_version_start, int64_t &recycle_version) const;
   int get_migration_sstable_size(int64_t &data_size);
   int get_async_index_max_published_version(int64_t &published_version) const;
@@ -711,6 +715,11 @@ public:
       bool &need_update); 
 
 private:
+  int aggregate_async_inv_bm25_stats_(
+      const ObTabletTableStore &table_store,
+      const ObStorageMetaHandle &table_store_handle,
+      const share::SCN &read_snapshot,
+      blocksstable::ObAsyncInvBM25Stats &stats) const;
   int inner_pre_process_cs_replica(
       const ObDirectLoadType direct_load_type,
       ObITable::TableKey &table_key,

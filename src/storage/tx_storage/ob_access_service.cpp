@@ -1946,30 +1946,23 @@ int ObAccessService::async_index_range_scan(
 int ObAccessService::get_async_inv_bm25_stats(
     const share::ObLSID &ls_id,
     const common::ObTabletID &tablet_id,
-    const share::SCN &sql_read_snapshot,
+    const ObTabletHandle &tablet_handle,
+    const share::SCN &read_snapshot,
     blocksstable::ObAsyncInvBM25Stats &stats)
 {
   int ret = OB_SUCCESS;
   stats.reset();
-  ObLSHandle ls_handle;
-  ObLS *ls = nullptr;
-  ObLSTabletService *tablet_service = nullptr;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("ob access service is not running.", K(ret));
-  } else if (OB_UNLIKELY(!ls_id.is_valid() || !tablet_id.is_valid() || !sql_read_snapshot.is_valid())) {
+  } else if (OB_UNLIKELY(!ls_id.is_valid() || !tablet_id.is_valid()
+      || !tablet_handle.is_valid() || tablet_handle.get_obj()->get_tablet_id() != tablet_id)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), K(ls_id), K(tablet_id), K(sql_read_snapshot));
-  } else if (OB_FAIL(ls_svr_->get_ls(ls_id, ls_handle, ObLSGetMod::DAS_MOD))) {
-    LOG_WARN("failed to get log stream", K(ret), K(ls_id));
-  } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("ls is unexpected null", K(ret), K(ls_id));
-  } else if (OB_ISNULL(tablet_service = ls->get_tablet_svr())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("tablet service is unexpected null", K(ret), K(ls_id));
-  } else if (OB_FAIL(tablet_service->get_async_inv_bm25_stats(tablet_id, sql_read_snapshot, stats))) {
-    LOG_WARN("failed to get async inv bm25 stats", K(ret), K(ls_id), K(tablet_id), K(sql_read_snapshot));
+    LOG_WARN("invalid pinned async index tablet argument", K(ret), K(ls_id), K(tablet_id),
+        K(tablet_handle));
+  } else if (OB_FAIL(tablet_handle.get_obj()->get_async_inv_bm25_stats(read_snapshot, stats))) {
+    LOG_WARN("failed to get async inv bm25 stats", K(ret), K(ls_id),
+        K(tablet_id), K(read_snapshot));
   }
   return ret;
 }

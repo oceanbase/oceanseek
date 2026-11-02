@@ -69,7 +69,6 @@ struct ObInvPostingScanParam;
 class ObInvSSTablePostingIter;
 struct ObInvRangeScanParam;
 class ObInvSSTableRangeIter;
-struct ObAsyncInvBM25Stats;
 }
 
 namespace compaction
@@ -350,10 +349,6 @@ public:
       const bool allow_no_ready_read,
       const bool need_split_src_table,
       const bool need_split_dst_table);
-  int get_async_inv_bm25_stats(
-      const common::ObTabletID &tablet_id,
-      const share::SCN &sql_read_snapshot,
-      blocksstable::ObAsyncInvBM25Stats &stats);
   int check_allow_to_read();
   int set_tablet_status(
       const common::ObTabletID &tablet_id,
@@ -951,9 +946,6 @@ private:
       const int64_t snapshot_version,
       ObTabletTableIterator &iter,
       const bool allow_no_ready_read);
-  int aggregate_async_inv_bm25_stats_from_read_tables_(
-      ObTabletTableIterator &iter,
-      blocksstable::ObAsyncInvBM25Stats &stats);
 
   int mock_duplicated_rows_(blocksstable::ObDatumRowIterator *&duplicated_rows);
 

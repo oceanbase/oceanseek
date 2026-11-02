@@ -285,7 +285,8 @@ public:
   virtual int get_async_inv_bm25_stats(
       const share::ObLSID &ls_id,
       const common::ObTabletID &tablet_id,
-      const share::SCN &sql_read_snapshot,
+      const ObTabletHandle &tablet_handle,
+      const share::SCN &read_snapshot,
       blocksstable::ObAsyncInvBM25Stats &stats);
 
 protected:

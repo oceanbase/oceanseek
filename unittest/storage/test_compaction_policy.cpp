@@ -1290,13 +1290,96 @@ TEST_F(TestCompactionPolicy, calculate_inc_major_read_tables_filters_abort_from_
     ASSERT_NE(nullptr, read_table);
     EXPECT_EQ(committed_retry->get_key(), read_table->get_key());
 
-    ObLSTabletService tablet_service;
     ObAsyncInvBM25Stats stats;
+    ObStorageMetaHandle table_store_handle;
+    SCN read_snapshot;
+    ASSERT_EQ(OB_SUCCESS, read_snapshot.convert_for_tx(150));
+    table_store.is_inited_ = true;
     ASSERT_EQ(OB_SUCCESS,
-        tablet_service.aggregate_async_inv_bm25_stats_from_read_tables_(
-            tablet_iter, stats));
+        tablet_handle.get_obj()->aggregate_async_inv_bm25_stats_(
+            table_store, table_store_handle, read_snapshot, stats));
     EXPECT_EQ(200, stats.total_doc_length_);
   }
+}
+
+TEST_F(TestCompactionPolicy, async_bm25_filters_uncommitted_and_future_logical_ranges)
+{
+  ObTabletHandle tablet_handle;
+  ASSERT_EQ(OB_SUCCESS, mock_tablet(allocator_, 100, 100, false, tablet_handle));
+  // Two committed retries cover (0, 100]; only the one with the largest end SCN counts.
+  // Their physical commit versions exceed the query's logical read version.
+  const int64_t logical_ends[] = {100, 100, 100, 200, 100};
+  const int64_t commit_versions[] = {MAX_UPPER_TRANS, 300, 350, 400, MAX_UPPER_TRANS};
+  const uint64_t doc_lengths[] = {1000, 99, 200, 300, 2000};
+  const int64_t abort_tx_id = 677;
+  ASSERT_EQ(OB_SUCCESS, mock_tx_data(abort_tx_id, 500, transaction::ObTxData::ABORT));
+  ObTableHandleV2 handles[5];
+  ObSEArray<ObITable *, 5> increments;
+  for (int64_t i = 0; i < 5; ++i) {
+    ASSERT_EQ(OB_SUCCESS, mock_sstable(allocator_, ObITable::INC_INV_INDEX_SSTABLE,
+        100 * (i + 1), 100 * (i + 2), logical_ends[i], commit_versions[i], handles[i]));
+    ObSSTable *sstable = nullptr;
+    ASSERT_EQ(OB_SUCCESS, handles[i].get_sstable(sstable));
+    sstable->meta_->basic_meta_.min_merged_trans_version_ = 3 == i ? 100 : 0;
+    sstable->meta_cache_.min_merged_trans_version_ = 3 == i ? 100 : 0;
+    if (0 == i || 4 == i) {
+      sstable->meta_->basic_meta_.upper_trans_version_ = INT64_MAX;
+      sstable->meta_cache_.upper_trans_version_ = INT64_MAX;
+      sstable->meta_->uncommit_tx_info_.tx_infos_[0].tx_id_ = 0 == i
+          ? transaction::ObTransID::OB_MIN_TRANS_ID - 1 : abort_tx_id;
+    }
+    ObInvSSTable *inv_sstable = static_cast<ObInvSSTable *>(sstable);
+    ObInvIdxStatsMeta meta = inv_sstable->get_inv_meta();
+    meta.total_doc_length_ = doc_lengths[i];
+    ASSERT_EQ(OB_SUCCESS, inv_sstable->set_inv_meta(allocator_, meta));
+    ASSERT_EQ(OB_SUCCESS, increments.push_back(sstable));
+  }
+  ObTabletTableStore table_store;
+  ASSERT_EQ(OB_SUCCESS, table_store.inc_major_tables_.init(allocator_, increments));
+  table_store.is_inited_ = true;
+  ObStorageMetaHandle table_store_handle;
+  ObAsyncInvBM25Stats stats;
+  const int64_t snapshots[] = {99, 100, 150, 200};
+  const uint64_t expected_lengths[] = {0, 200, 200, 500};
+  for (int64_t i = 0; i < ARRAYSIZEOF(snapshots); ++i) {
+    SCN read_snapshot;
+    ASSERT_EQ(OB_SUCCESS, read_snapshot.convert_for_tx(snapshots[i]));
+    ASSERT_EQ(OB_SUCCESS, tablet_handle.get_obj()->aggregate_async_inv_bm25_stats_(
+        table_store, table_store_handle, read_snapshot, stats));
+    EXPECT_EQ(expected_lengths[i], stats.total_doc_length_);
+  }
+
+  // A Major replaces increments it already covers rather than adding to their statistics.
+  ObTableHandleV2 major_handle;
+  ASSERT_EQ(OB_SUCCESS, mock_sstable(allocator_, ObITable::INV_INDEX_SSTABLE,
+      0, 100, 100, 100, major_handle));
+  ObSSTable *major = nullptr;
+  ASSERT_EQ(OB_SUCCESS, major_handle.get_sstable(major));
+  ObInvSSTable *inv_major = static_cast<ObInvSSTable *>(major);
+  ObInvIdxStatsMeta major_meta = inv_major->get_inv_meta();
+  major_meta.total_doc_length_ = 50;
+  ASSERT_EQ(OB_SUCCESS, inv_major->set_inv_meta(allocator_, major_meta));
+  ObSEArray<ObITable *, 1> majors;
+  ASSERT_EQ(OB_SUCCESS, majors.push_back(major));
+  ASSERT_EQ(OB_SUCCESS, table_store.major_tables_.init(allocator_, majors));
+  SCN read_snapshot;
+  ASSERT_EQ(OB_SUCCESS, read_snapshot.convert_for_tx(200));
+  ASSERT_EQ(OB_SUCCESS, tablet_handle.get_obj()->aggregate_async_inv_bm25_stats_(
+      table_store, table_store_handle, read_snapshot, stats));
+  EXPECT_EQ(350, stats.total_doc_length_);
+
+  // A physically empty baseline with empty statistics contributes zero, while reset metadata is rejected.
+  inv_major = static_cast<ObInvSSTable *>(table_store.major_tables_.at(0));
+  ASSERT_TRUE(inv_major->is_empty());
+  inv_major->inv_meta_.reuse();
+  ASSERT_EQ(OB_SUCCESS, read_snapshot.convert_for_tx(100));
+  ASSERT_EQ(OB_SUCCESS, tablet_handle.get_obj()->aggregate_async_inv_bm25_stats_(
+      table_store, table_store_handle, read_snapshot, stats));
+  EXPECT_EQ(0, stats.total_doc_length_);
+
+  inv_major->inv_meta_.reset();
+  ASSERT_EQ(OB_ERR_UNEXPECTED, tablet_handle.get_obj()->aggregate_async_inv_bm25_stats_(
+      table_store, table_store_handle, read_snapshot, stats));
 }
 #endif
 
