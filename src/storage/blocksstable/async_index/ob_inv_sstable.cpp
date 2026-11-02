@@ -41,12 +41,12 @@ int ObInvSSTable::init(
     // INV_INDEX_SSTABLE only when its inv_meta is valid, an inv key paired with
     // an invalid meta is an upstream inconsistency, so fail fast. (An empty
     // inverted segment is still expected to produce a valid meta with
-    // min/max doc id == 0, not a missing one.)
+    // the empty doc-id range sentinel, not a missing one.)
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument for inv sstable", K(ret), K(param), KP(allocator));
   } else if (OB_FAIL(ObSSTable::init(param, allocator))) {
     LOG_WARN("failed to init base sstable", K(ret), K(param));
-  } else if (OB_FAIL(set_inv_meta(*allocator, param.inv_meta_))) {
+  } else if (OB_FAIL(set_inv_meta(param.inv_meta_))) {
     LOG_WARN("failed to set inv meta from param", K(ret), K(param.inv_meta_));
   }
 
@@ -189,15 +189,14 @@ int ObInvSSTable::multi_get(
   return ret;
 }
 
-int ObInvSSTable::set_inv_meta(ObArenaAllocator &allocator, const ObInvIdxStatsMeta &inv_meta)
+int ObInvSSTable::set_inv_meta(const ObInvSSTableMeta &inv_meta)
 {
   int ret = OB_SUCCESS;
-  UNUSED(allocator);
   if (OB_UNLIKELY(!inv_meta.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid inv meta", K(ret), K(inv_meta));
-  } else {
-    inv_meta_ = inv_meta;
+  } else if (OB_FAIL(inv_meta_.assign(inv_meta))) {
+    LOG_WARN("failed to assign inverted sstable meta", K(ret));
   }
   return ret;
 }
@@ -229,9 +228,9 @@ int ObInvSSTable::deep_copy(char *buf, const int64_t buf_len, ObIStorageMetaObj 
     new_inv_table->valid_for_reading_ = valid_for_reading_;
     if (is_loaded() && OB_FAIL(meta_->deep_copy(buf, buf_len, pos, new_inv_table->meta_))) {
       LOG_WARN("failed to deep copy sstable meta", K(ret), KP(buf), K(buf_len), K(pos), KPC(meta_));
+    } else if (OB_FAIL(new_inv_table->inv_meta_.assign(inv_meta_))) {
+      LOG_WARN("failed to assign inverted meta", K(ret));
     } else {
-      UNUSED(pos);
-      new_inv_table->inv_meta_ = inv_meta_;
       value = new_inv_table;
     }
   }

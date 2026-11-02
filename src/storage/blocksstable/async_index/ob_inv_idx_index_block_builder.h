@@ -142,6 +142,17 @@ struct ObInvIdxMacroBlockStats
       inv_meta_()
   {}
 
+  int assign(const ObInvIdxMacroBlockStats &other)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(inv_meta_.assign(other.inv_meta_))) {
+      STORAGE_LOG(WARN, "failed to assign inverted macro metadata", K(ret), K(other));
+    } else {
+      endkey_ = other.endkey_;
+      doc_count_ = other.doc_count_;
+    }
+    return ret;
+  }
   void reset()
   {
     endkey_.reset();
@@ -157,13 +168,14 @@ struct ObInvIdxMacroBlockStats
   OB_INLINE bool is_valid() const
   {
     return endkey_.is_valid()
-        && doc_count_ > 0;
+        && doc_count_ > 0
+        && inv_meta_.is_valid();
   }
   TO_STRING_KV(K_(endkey), K_(doc_count), K_(inv_meta));
 
   ObDatumRowkey endkey_;
   int64_t doc_count_;
-  ObInvIdxStatsMeta inv_meta_;
+  ObInvMacroMeta inv_meta_;
 };
 
 class ObInvIdxIndexBlockBuilder final

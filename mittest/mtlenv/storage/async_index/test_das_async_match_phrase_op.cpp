@@ -293,10 +293,12 @@ public:
     ASSERT_TRUE(res.root_desc_.is_valid());
     ASSERT_EQ(row_count, res.row_count_);
 
-    fill_inv_meta_from_schema(table_schema_, inv_idx_row_desc_, res.inv_meta_);
-    res.inv_meta_.min_doc_id_ = min_doc_id;
-    res.inv_meta_.max_doc_id_ = max_doc_id;
-    res.inv_meta_.total_doc_length_ = row_count;
+    ObInvIdxStatsMeta inv_meta_stats;
+    fill_inv_meta_from_schema(table_schema_, inv_idx_row_desc_, inv_meta_stats);
+    inv_meta_stats.min_doc_id_ = min_doc_id;
+    inv_meta_stats.max_doc_id_ = max_doc_id;
+    inv_meta_stats.total_doc_length_ = row_count;
+    ASSERT_EQ(OB_SUCCESS, res.inv_meta_.init(inv_meta_stats));
     ASSERT_TRUE(res.inv_meta_.is_valid());
 
     finalize_inv_sstable_from_res(res, inv_sstable);

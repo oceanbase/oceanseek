@@ -117,25 +117,27 @@ public:
     ASSERT_TRUE(res.root_desc_.is_valid());
     ASSERT_EQ(row_cnt, res.row_count_);
 
-    fill_inv_meta_from_schema(table_schema_, inv_idx_row_desc_, res.inv_meta_);
-    res.inv_meta_.index_type_ = INV_IDX_TYPE_SEARCH;
-    res.inv_meta_.has_nested_key_ = has_nested_key;
-    res.inv_meta_.min_doc_id_ = min_doc_id;
-    res.inv_meta_.max_doc_id_ = max_doc_id;
-    res.inv_meta_.total_doc_length_ = 0;
+    ObInvIdxStatsMeta inv_meta_stats;
+    fill_inv_meta_from_schema(table_schema_, inv_idx_row_desc_, inv_meta_stats);
+    inv_meta_stats.index_type_ = INV_IDX_TYPE_SEARCH;
+    inv_meta_stats.has_nested_key_ = has_nested_key;
+    inv_meta_stats.min_doc_id_ = min_doc_id;
+    inv_meta_stats.max_doc_id_ = max_doc_id;
+    inv_meta_stats.total_doc_length_ = 0;
+    ASSERT_EQ(OB_SUCCESS, res.inv_meta_.init(inv_meta_stats));
     ASSERT_TRUE(res.inv_meta_.is_valid());
-    ASSERT_FALSE(res.inv_meta_.has_relevance_params_);
-    ASSERT_FALSE(res.inv_meta_.is_fts_index());
-    ASSERT_EQ(has_nested_key, res.inv_meta_.has_nested_key_);
+    ASSERT_FALSE(res.inv_meta_.get_stats().has_relevance_params_);
+    ASSERT_FALSE(res.inv_meta_.get_stats().is_fts_index());
+    ASSERT_EQ(has_nested_key, res.inv_meta_.get_stats().has_nested_key_);
 
     finalize_inv_sstable_from_res(res, inv_sstable);
     ASSERT_TRUE(inv_sstable.is_inv_sstable());
     ASSERT_TRUE(inv_sstable.is_valid());
-    ASSERT_FALSE(inv_sstable.get_inv_meta().has_relevance_params_);
-    ASSERT_FALSE(inv_sstable.get_inv_meta().is_fts_index());
-    ASSERT_EQ(has_nested_key, inv_sstable.get_inv_meta().has_nested_key_);
-    ASSERT_EQ(min_doc_id, inv_sstable.get_inv_meta().min_doc_id_);
-    ASSERT_EQ(max_doc_id, inv_sstable.get_inv_meta().max_doc_id_);
+    ASSERT_FALSE(inv_sstable.get_inv_meta().get_stats().has_relevance_params_);
+    ASSERT_FALSE(inv_sstable.get_inv_meta().get_stats().is_fts_index());
+    ASSERT_EQ(has_nested_key, inv_sstable.get_inv_meta().get_stats().has_nested_key_);
+    ASSERT_EQ(min_doc_id, inv_sstable.get_inv_meta().get_stats().min_doc_id_);
+    ASSERT_EQ(max_doc_id, inv_sstable.get_inv_meta().get_stats().max_doc_id_);
   }
 
   // Build a single-term SEARCH sstable: term "term%010ld" % term_seq with posting
@@ -1554,7 +1556,7 @@ TEST_F(TestInvSSTableRangeIter, pv8_nested_key_capability_not_supported)
   ObInvSSTable inv_sstable;
   build_single_term_search_sstable(16, 1, 1, 1, inv_sstable, false /*has_nested_key*/);
   ASSERT_TRUE(inv_sstable.is_valid());
-  ASSERT_FALSE(inv_sstable.get_inv_meta().has_nested_key_);
+  ASSERT_FALSE(inv_sstable.get_inv_meta().get_stats().has_nested_key_);
 
   ObTableReadInfo read_info;
   build_rowkey_read_info(table_schema_, allocator_, read_info);

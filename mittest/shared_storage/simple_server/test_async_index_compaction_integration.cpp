@@ -540,7 +540,7 @@ void ObAsyncIndexCompactionTest::verify_empty_fts_inv_major_on_tablet(
   ASSERT_EQ(0, major_sstable->get_data_macro_block_count());
 
   const ObInvSSTable *inv_sstable = static_cast<const ObInvSSTable *>(major_sstable);
-  const ObInvIdxStatsMeta &inv_meta = inv_sstable->get_inv_meta();
+  const ObInvIdxStatsMeta &inv_meta = inv_sstable->get_inv_meta().get_stats();
   ObObjMeta expected_doc_meta;
   expected_doc_meta.set_uint64();
   ASSERT_TRUE(inv_meta.is_valid());
@@ -571,7 +571,7 @@ void ObAsyncIndexCompactionTest::verify_empty_search_inv_major_on_tablet(
   ASSERT_EQ(0, major_sstable->get_data_macro_block_count());
 
   const ObInvSSTable *inv_sstable = static_cast<const ObInvSSTable *>(major_sstable);
-  const ObInvIdxStatsMeta &inv_meta = inv_sstable->get_inv_meta();
+  const ObInvIdxStatsMeta &inv_meta = inv_sstable->get_inv_meta().get_stats();
   ObObjMeta expected_doc_meta;
   expected_doc_meta.set_uint64();
   ASSERT_TRUE(inv_meta.is_valid());
@@ -678,7 +678,7 @@ int ObAsyncIndexCompactionTest::find_inv_inc_major_meta(
     const ObLSID &ls_id,
     const ObTabletID &tablet_id,
     const bool expect_empty,
-    ObInvIdxStatsMeta &inv_meta,
+    ObInvSSTableMeta &inv_meta,
     SCN &end_scn,
     bool &found)
 {
@@ -691,7 +691,7 @@ int ObAsyncIndexCompactionTest::find_inv_inc_major_meta_since_min_start(
     const ObTabletID &tablet_id,
     const bool expect_empty,
     const SCN &min_start_scn,
-    ObInvIdxStatsMeta &inv_meta,
+    ObInvSSTableMeta &inv_meta,
     SCN &end_scn,
     bool &found)
 {
@@ -704,7 +704,7 @@ int ObAsyncIndexCompactionTest::find_inv_inc_major_meta_impl(
     const ObTabletID &tablet_id,
     const bool expect_empty,
     const SCN *min_start_scn,
-    ObInvIdxStatsMeta &inv_meta,
+    ObInvSSTableMeta &inv_meta,
     SCN &end_scn,
     bool &found)
 {
@@ -758,7 +758,7 @@ int ObAsyncIndexCompactionTest::wait_inv_inc_major_meta(
     const ObLSID &ls_id,
     const ObTabletID &tablet_id,
     const bool expect_empty,
-    ObInvIdxStatsMeta &inv_meta,
+    ObInvSSTableMeta &inv_meta,
     SCN &end_scn)
 {
   int ret = OB_SUCCESS;
@@ -787,7 +787,7 @@ int ObAsyncIndexCompactionTest::wait_inv_inc_major_meta_since_min_start(
     const ObTabletID &tablet_id,
     const bool expect_empty,
     const SCN &min_start_scn,
-    ObInvIdxStatsMeta &inv_meta,
+    ObInvSSTableMeta &inv_meta,
     SCN &end_scn)
 {
   int ret = OB_SUCCESS;
@@ -817,8 +817,8 @@ void ObAsyncIndexCompactionTest::verify_empty_fts_inc_copies_inv_meta(
   MultiAsyncIndexTabletCtx ctx;
   ObSqlString insert_sql;
   ObSqlString refresh_sql;
-  ObInvIdxStatsMeta nonempty_inv_meta;
-  ObInvIdxStatsMeta empty_inv_meta;
+  ObInvSSTableMeta nonempty_inv_meta;
+  ObInvSSTableMeta empty_inv_meta;
   SCN nonempty_end_scn;
   SCN empty_end_scn;
   ObObjMeta expected_doc_meta;
@@ -833,7 +833,7 @@ void ObAsyncIndexCompactionTest::verify_empty_fts_inc_copies_inv_meta(
   OK(wait_inv_inc_major_meta(
       ctx.ls_id_, ctx.fts_index_tablet_ids_.at(0), false/*expect_empty*/,
       nonempty_inv_meta, nonempty_end_scn));
-  ASSERT_GT(nonempty_inv_meta.total_doc_length_, 0);
+  ASSERT_GT(nonempty_inv_meta.get_stats().total_doc_length_, 0);
 
   OK(exe_sql(refresh_sql.ptr()));
   OK(wait_inv_inc_major_meta_since_min_start(
@@ -841,20 +841,20 @@ void ObAsyncIndexCompactionTest::verify_empty_fts_inc_copies_inv_meta(
       nonempty_end_scn, empty_inv_meta, empty_end_scn));
   ASSERT_TRUE(empty_end_scn > nonempty_end_scn);
   ASSERT_TRUE(empty_inv_meta.is_valid());
-  ASSERT_EQ(INV_IDX_TYPE_FTS, empty_inv_meta.index_type_);
-  ASSERT_TRUE(empty_inv_meta.has_relevance_params_);
-  ASSERT_EQ(has_position_list, empty_inv_meta.has_position_list_);
-  ASSERT_FALSE(empty_inv_meta.has_nested_key_);
-  ASSERT_EQ(expected_doc_meta, empty_inv_meta.doc_id_obj_meta_);
-  ASSERT_EQ(nonempty_inv_meta.index_type_, empty_inv_meta.index_type_);
-  ASSERT_EQ(nonempty_inv_meta.has_relevance_params_, empty_inv_meta.has_relevance_params_);
-  ASSERT_EQ(nonempty_inv_meta.has_position_list_, empty_inv_meta.has_position_list_);
-  ASSERT_EQ(nonempty_inv_meta.has_nested_key_, empty_inv_meta.has_nested_key_);
-  ASSERT_EQ(nonempty_inv_meta.doc_id_obj_meta_, empty_inv_meta.doc_id_obj_meta_);
-  ASSERT_TRUE(empty_inv_meta.is_empty_range());
-  ASSERT_EQ(UINT64_MAX, empty_inv_meta.min_doc_id_);
-  ASSERT_EQ(0, empty_inv_meta.max_doc_id_);
-  ASSERT_EQ(0, empty_inv_meta.total_doc_length_);
+  ASSERT_EQ(INV_IDX_TYPE_FTS, empty_inv_meta.get_stats().index_type_);
+  ASSERT_TRUE(empty_inv_meta.get_stats().has_relevance_params_);
+  ASSERT_EQ(has_position_list, empty_inv_meta.get_stats().has_position_list_);
+  ASSERT_FALSE(empty_inv_meta.get_stats().has_nested_key_);
+  ASSERT_EQ(expected_doc_meta, empty_inv_meta.get_stats().doc_id_obj_meta_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().index_type_, empty_inv_meta.get_stats().index_type_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().has_relevance_params_, empty_inv_meta.get_stats().has_relevance_params_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().has_position_list_, empty_inv_meta.get_stats().has_position_list_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().has_nested_key_, empty_inv_meta.get_stats().has_nested_key_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().doc_id_obj_meta_, empty_inv_meta.get_stats().doc_id_obj_meta_);
+  ASSERT_TRUE(empty_inv_meta.get_stats().is_empty_range());
+  ASSERT_EQ(UINT64_MAX, empty_inv_meta.get_stats().min_doc_id_);
+  ASSERT_EQ(0, empty_inv_meta.get_stats().max_doc_id_);
+  ASSERT_EQ(0, empty_inv_meta.get_stats().total_doc_length_);
 }
 
 void ObAsyncIndexCompactionTest::verify_empty_search_inc_copies_inv_meta(
@@ -864,8 +864,8 @@ void ObAsyncIndexCompactionTest::verify_empty_search_inc_copies_inv_meta(
   ObTabletID tablet_id;
   ObSqlString insert_sql;
   ObSqlString refresh_sql;
-  ObInvIdxStatsMeta nonempty_inv_meta;
-  ObInvIdxStatsMeta empty_inv_meta;
+  ObInvSSTableMeta nonempty_inv_meta;
+  ObInvSSTableMeta empty_inv_meta;
   SCN nonempty_end_scn;
   SCN empty_end_scn;
   ObObjMeta expected_doc_meta;
@@ -891,20 +891,20 @@ void ObAsyncIndexCompactionTest::verify_empty_search_inc_copies_inv_meta(
       empty_inv_meta, empty_end_scn));
   ASSERT_TRUE(empty_end_scn > nonempty_end_scn);
   ASSERT_TRUE(empty_inv_meta.is_valid());
-  ASSERT_EQ(INV_IDX_TYPE_SEARCH, empty_inv_meta.index_type_);
-  ASSERT_FALSE(empty_inv_meta.has_relevance_params_);
-  ASSERT_FALSE(empty_inv_meta.has_position_list_);
-  ASSERT_EQ(has_nested_key, empty_inv_meta.has_nested_key_);
-  ASSERT_EQ(expected_doc_meta, empty_inv_meta.doc_id_obj_meta_);
-  ASSERT_EQ(nonempty_inv_meta.index_type_, empty_inv_meta.index_type_);
-  ASSERT_EQ(nonempty_inv_meta.has_relevance_params_, empty_inv_meta.has_relevance_params_);
-  ASSERT_EQ(nonempty_inv_meta.has_position_list_, empty_inv_meta.has_position_list_);
-  ASSERT_EQ(nonempty_inv_meta.has_nested_key_, empty_inv_meta.has_nested_key_);
-  ASSERT_EQ(nonempty_inv_meta.doc_id_obj_meta_, empty_inv_meta.doc_id_obj_meta_);
-  ASSERT_TRUE(empty_inv_meta.is_empty_range());
-  ASSERT_EQ(UINT64_MAX, empty_inv_meta.min_doc_id_);
-  ASSERT_EQ(0, empty_inv_meta.max_doc_id_);
-  ASSERT_EQ(0, empty_inv_meta.total_doc_length_);
+  ASSERT_EQ(INV_IDX_TYPE_SEARCH, empty_inv_meta.get_stats().index_type_);
+  ASSERT_FALSE(empty_inv_meta.get_stats().has_relevance_params_);
+  ASSERT_FALSE(empty_inv_meta.get_stats().has_position_list_);
+  ASSERT_EQ(has_nested_key, empty_inv_meta.get_stats().has_nested_key_);
+  ASSERT_EQ(expected_doc_meta, empty_inv_meta.get_stats().doc_id_obj_meta_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().index_type_, empty_inv_meta.get_stats().index_type_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().has_relevance_params_, empty_inv_meta.get_stats().has_relevance_params_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().has_position_list_, empty_inv_meta.get_stats().has_position_list_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().has_nested_key_, empty_inv_meta.get_stats().has_nested_key_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().doc_id_obj_meta_, empty_inv_meta.get_stats().doc_id_obj_meta_);
+  ASSERT_TRUE(empty_inv_meta.get_stats().is_empty_range());
+  ASSERT_EQ(UINT64_MAX, empty_inv_meta.get_stats().min_doc_id_);
+  ASSERT_EQ(0, empty_inv_meta.get_stats().max_doc_id_);
+  ASSERT_EQ(0, empty_inv_meta.get_stats().total_doc_length_);
 }
 
 int ObAsyncIndexCompactionTest::wait_ls_weak_read_ts(ObLS &ls, const int64_t target_ts_ns)
@@ -1246,16 +1246,17 @@ void ObAsyncIndexCompactionTest::run_build_async_index_medium_info_with_merge_ta
       << "missing async index medium merge history, iter_ret=" << iter_ret;
 }
 
-void ObAsyncIndexCompactionTest::fill_inv_meta_for_test(ObInvIdxStatsMeta &meta)
+void ObAsyncIndexCompactionTest::fill_inv_meta_for_test(ObInvSSTableMeta &meta)
 {
-  meta.reset();
-  meta.min_doc_id_ = 0;
-  meta.max_doc_id_ = 0;
-  meta.doc_id_obj_meta_.set_uint64();
-  meta.index_type_ = INV_IDX_TYPE_FTS;
-  meta.has_relevance_params_ = true;
-  meta.has_position_list_ = true;
-  meta.total_doc_length_ = 4096;
+  ObInvIdxStatsMeta stats;
+  stats.min_doc_id_ = 0;
+  stats.max_doc_id_ = 0;
+  stats.doc_id_obj_meta_.set_uint64();
+  stats.index_type_ = INV_IDX_TYPE_FTS;
+  stats.has_relevance_params_ = true;
+  stats.has_position_list_ = true;
+  stats.total_doc_length_ = 4096;
+  EXPECT_EQ(OB_SUCCESS, meta.init(stats));
 }
 
 int ObAsyncIndexCompactionTest::build_empty_inv_merge_res(
@@ -1263,7 +1264,7 @@ int ObAsyncIndexCompactionTest::build_empty_inv_merge_res(
     const int64_t row_count,
     const int64_t occupy_size,
     const int64_t snapshot_version,
-    ObInvIdxStatsMeta &inv_meta,
+    ObInvSSTableMeta &inv_meta,
     ObSSTableMergeRes &res)
 {
   int ret = OB_SUCCESS;
@@ -1286,8 +1287,9 @@ int ObAsyncIndexCompactionTest::build_empty_inv_merge_res(
         : storage_schema.get_row_store_type());
     res.compressor_type_ = ObCompressorType::NONE_COMPRESSOR;
     res.table_backup_flag_.reset();
-    res.inv_meta_ = inv_meta;
-    if (OB_FAIL(ObSSTableMergeRes::fill_column_checksum_for_empty_major(column_cnt, res.data_column_checksums_))) {
+    if (OB_FAIL(res.inv_meta_.assign(inv_meta))) {
+      LOG_WARN("failed to copy inverted sstable metadata", K(ret));
+    } else if (OB_FAIL(ObSSTableMergeRes::fill_column_checksum_for_empty_major(column_cnt, res.data_column_checksums_))) {
       LOG_WARN("failed to fill column checksums", KR(ret), K(column_cnt));
     }
   }
@@ -1354,7 +1356,7 @@ int ObAsyncIndexCompactionTest::build_inv_sstable_param_for_merge(
     const int64_t base_version,
     const int64_t row_count,
     const int64_t occupy_size,
-    ObInvIdxStatsMeta &inv_meta,
+    ObInvSSTableMeta &inv_meta,
     ObTabletMergeCtx &merge_context,
     ObTabletCreateSSTableParam &param)
 {
@@ -1368,9 +1370,10 @@ int ObAsyncIndexCompactionTest::build_inv_sstable_param_for_merge(
     LOG_WARN("failed to prepare inv merge context", KR(ret), K(tablet_id), K(merge_type));
   } else if (OB_FAIL(param.init_for_merge(merge_context, res, nullptr /*cg_schema*/, 0 /*cg_idx*/))) {
     LOG_WARN("failed to init inv sstable param for merge", KR(ret), K(tablet_id), K(merge_type));
+  } else if (OB_FAIL(param.inv_meta_.assign(inv_meta))) {
+    LOG_WARN("failed to copy inverted sstable metadata", K(ret));
   } else {
     param.row_count_ = row_count;
-    param.inv_meta_ = inv_meta;
     param.upper_trans_version_ = snapshot_version;
     if (is_inc_major_merge(merge_type)) {
       param.occupy_size_ = MAX(occupy_size, 1L);
@@ -1428,7 +1431,7 @@ int ObAsyncIndexCompactionTest::add_empty_inv_inc_major_to_tablet(
   ObTabletMergeDagParam dag_param;
   ObTabletMergeCtx merge_context(dag_param, allocator_);
   ObTabletCreateSSTableParam create_param;
-  ObInvIdxStatsMeta inv_meta;
+  ObInvSSTableMeta inv_meta;
   ObStorageSchema *schema_on_tablet = nullptr;
   ObLS *ls = ls_handle.get_ls();
   UNUSED(storage_schema);
@@ -1513,7 +1516,7 @@ int ObAsyncIndexCompactionTest::build_non_empty_inv_sstable_param_for_merge(
 {
   int ret = OB_SUCCESS;
   ObSSTableMergeRes res;
-  ObInvIdxStatsMeta inv_meta;
+  ObInvSSTableMeta inv_meta;
   if (OB_FAIL(build_non_empty_inv_merge_res(
           ls_handle, tablet_id, storage_schema, merge_type, snapshot_version,
           row_cnt, start_doc_id, micro_index_clustered, inv_meta, allocator_, res, doc_id_step))) {
@@ -1523,9 +1526,10 @@ int ObAsyncIndexCompactionTest::build_non_empty_inv_sstable_param_for_merge(
     LOG_WARN("failed to prepare inv merge context", KR(ret), K(tablet_id), K(merge_type));
   } else if (OB_FAIL(param.init_for_merge(merge_context, res, nullptr /*cg_schema*/, 0 /*cg_idx*/))) {
     LOG_WARN("failed to init non-empty inv sstable param for merge", KR(ret), K(tablet_id), K(merge_type));
+  } else if (OB_FAIL(param.inv_meta_.assign(inv_meta))) {
+    LOG_WARN("failed to copy inverted sstable metadata", K(ret));
   } else {
     param.row_count_ = res.row_count_;
-    param.inv_meta_ = inv_meta;
     param.upper_trans_version_ = snapshot_version;
     if (is_inc_major_merge(merge_type)) {
       param.occupy_size_ = MAX(res.occupy_size_, 1L);
@@ -1893,7 +1897,7 @@ void ObAsyncIndexCompactionTest::verify_merged_inv_inc_major_on_tablet(
   ASSERT_EQ(OB_SUCCESS, inv_idx_row_desc.init(*index_schema, *data_table_schema));
   const bool has_pos_list = inv_idx_row_desc.pos_list_col_idx_ >= 0;
 
-  const ObInvIdxStatsMeta &inv_meta = merged->get_inv_meta();
+  const ObInvIdxStatsMeta &inv_meta = merged->get_inv_meta().get_stats();
   ASSERT_TRUE(inv_meta.is_valid());
   ASSERT_TRUE(inv_meta.is_fts_index());
   ASSERT_EQ(has_pos_list, inv_meta.has_position_list_);
@@ -1957,7 +1961,7 @@ void ObAsyncIndexCompactionTest::verify_merged_empty_inv_major_on_tablet(
   ASSERT_EQ(OB_SUCCESS, inv_idx_row_desc.init(*index_schema, *data_table_schema));
   const bool has_pos_list = inv_idx_row_desc.pos_list_col_idx_ >= 0;
 
-  const ObInvIdxStatsMeta &inv_meta = merged->get_inv_meta();
+  const ObInvIdxStatsMeta &inv_meta = merged->get_inv_meta().get_stats();
   ASSERT_TRUE(inv_meta.is_valid());
   ASSERT_TRUE(inv_meta.is_fts_index());
   ASSERT_EQ(has_pos_list, inv_meta.has_position_list_);
@@ -5732,20 +5736,20 @@ TEST_F(ObAsyncIndexCompactionTest, zero_postings_async_fts_inc_major_keeps_inv_m
   OK(sql.assign_fmt("call dbms_async_index.refresh('%s')", table_name));
   OK(exe_sql(sql.ptr()));
 
-  ObInvIdxStatsMeta inv_meta;
+  ObInvSSTableMeta inv_meta;
   SCN inc_end_scn;
   OK(wait_inv_inc_major_meta(
       ctx.ls_id_, ctx.fts_index_tablet_ids_.at(0), true/*expect_empty*/,
       inv_meta, inc_end_scn));
   ASSERT_TRUE(inv_meta.is_valid());
-  ASSERT_EQ(INV_IDX_TYPE_FTS, inv_meta.index_type_);
-  ASSERT_TRUE(inv_meta.has_relevance_params_);
-  ASSERT_TRUE(inv_meta.has_position_list_);
-  ASSERT_FALSE(inv_meta.has_nested_key_);
-  ASSERT_EQ(ObUInt64Type, inv_meta.doc_id_obj_meta_.get_type());
-  ASSERT_EQ(UINT64_MAX, inv_meta.min_doc_id_);
-  ASSERT_EQ(0, inv_meta.max_doc_id_);
-  ASSERT_EQ(0, inv_meta.total_doc_length_);
+  ASSERT_EQ(INV_IDX_TYPE_FTS, inv_meta.get_stats().index_type_);
+  ASSERT_TRUE(inv_meta.get_stats().has_relevance_params_);
+  ASSERT_TRUE(inv_meta.get_stats().has_position_list_);
+  ASSERT_FALSE(inv_meta.get_stats().has_nested_key_);
+  ASSERT_EQ(ObUInt64Type, inv_meta.get_stats().doc_id_obj_meta_.get_type());
+  ASSERT_EQ(UINT64_MAX, inv_meta.get_stats().min_doc_id_);
+  ASSERT_EQ(0, inv_meta.get_stats().max_doc_id_);
+  ASSERT_EQ(0, inv_meta.get_stats().total_doc_length_);
 
   OK(exe_sql("drop table if exists t_async_fts_zero_postings_inc"));
 }

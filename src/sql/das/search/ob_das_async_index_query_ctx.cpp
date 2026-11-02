@@ -1428,7 +1428,7 @@ int ObAsyncIndexPartitionSegCtx::get_segment_rowid_range(
           K(actual_version_range), "table_key", sstable->get_key());
     } else {
       const blocksstable::ObInvIdxStatsMeta &meta =
-          static_cast<const blocksstable::ObInvSSTable *>(sstable)->get_inv_meta();
+          static_cast<const blocksstable::ObInvSSTable *>(sstable)->get_inv_meta().get_stats();
       // Validate structural metadata separately from DocID layout support so valid
       // unsupported layouts can keep the heap-merge fallback.
       if (blocksstable::INV_IDX_TYPE_INVALID == meta.index_type_

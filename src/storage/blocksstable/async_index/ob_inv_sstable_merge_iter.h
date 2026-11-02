@@ -142,7 +142,7 @@ public:
   // 整宏块复用借用视图：仅在 MACRO 边界读取当前宏块描述、聚合统计及（需要时）
   // clustered index micro block；调用方必须在 next_macro_block() 前消费。
   int get_macro_block_desc(ObMacroBlockDesc &desc) const;
-  int get_curr_macro_inv_stats(ObInvIdxMacroBlockInvStats &stats) const;
+  int get_curr_macro_inv_meta(ObInvMacroMeta &meta) const;
   int get_curr_clustered_index_info(const ObMicroBlockData *&clustered_micro_block_data);
 
   int get_micro_block(ObMicroBlock &micro_block) const;

@@ -1190,7 +1190,7 @@ int ObSSDDLMergeHelper::merge_cg_sstable(ObIDag *dag,
                 (storage::ObDDLRedoLogWriterCallback, clustered_index_flush_callback)) {
     SMART_VARS_3((ObSSTableMergeRes, res), (ObTabletCreateSSTableParam, param), (ObWholeDataStoreDesc, data_desc)) {
       ObMacroSeqParam macro_seq_param;
-      ObInvIdxStatsMeta empty_inv_meta;
+      ObInvSSTableMeta empty_inv_meta;
       bool has_macro_row = false;
       macro_seq_param.seq_type_ = ObMacroSeqParam::SEQ_TYPE_INC;
       macro_seq_param.start_ = 0;

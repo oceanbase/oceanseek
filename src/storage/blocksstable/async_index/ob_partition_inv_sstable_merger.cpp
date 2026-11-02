@@ -210,12 +210,12 @@ int ObPartitionInvSSTableMerger::try_process_(
     // 整块零拷贝登记复用宏块：直接从 macro meta 读取 doc 统计（min/max/
     // total_doc_length），供 writer 累加进 sstable 级 inv_meta。缺失或解码失败则优雅
     // 降级为 OP_OPEN 逐行重写，不因取不到统计而中止本轮 merge。
-    ObInvIdxMacroBlockInvStats stats;
+    ObInvMacroMeta inv_macro_meta;
     const ObMicroBlockData *micro_block_data = nullptr;
-    int tmp_ret = iter.get_curr_macro_inv_stats(stats);
+    int tmp_ret = iter.get_curr_macro_inv_meta(inv_macro_meta);
     if (OB_SUCCESS == tmp_ret && macro_desc.is_clustered_index_tree_) {
       // 聚集索引树模式的整块复用还需取回该宏块的聚集索引微块，供 writer 回放给
-      // clustered index writer；取不到与 stats 汇总失败同样降级为逐行重写。
+      // clustered index writer；取不到与 inv_macro_meta 汇总失败同样降级为逐行重写。
       tmp_ret = iter.get_curr_clustered_index_info(micro_block_data);
     }
     if (OB_SUCCESS != tmp_ret) {
@@ -225,18 +225,19 @@ int ObPartitionInvSSTableMerger::try_process_(
       if (OB_FAIL(iter.open_curr_range(false /*for_rewrite*/))) {
         LOG_WARN("failed to open macro range after reuse prepare failure", K(ret), K(macro_desc));
       }
-    } else if (merge_helper_->has_deletion_in_range(stats.min_doc_id_, stats.max_doc_id_)) {
+    } else if (merge_helper_->has_deletion_in_range(
+        inv_macro_meta.get_stats().min_doc_id_, inv_macro_meta.get_stats().max_doc_id_)) {
       // min/max 来自 macro meta 预聚合统计，不依赖 (term, doc_id) 的字典序端点。
       // 命中仅表示可能有删除；为保证正确性退化到行级过滤。
       ++macro_reuse_stats_.fallback_deletion_count_;
       if (OB_FAIL(iter.open_curr_range(false /*for_rewrite*/))) {
         LOG_WARN("failed to open macro range with deleted doc id", K(ret),
-            K(macro_desc), K(stats));
+            K(macro_desc), K(inv_macro_meta));
       }
     } else if (OB_FAIL(macro_writer_->append_macro_block(
-        macro_desc, stats, micro_block_data))) {
+        macro_desc, inv_macro_meta, micro_block_data))) {
       LOG_WARN("failed to append reused macro block", K(ret), K(macro_desc),
-          K(stats));
+          K(inv_macro_meta));
     } else if (OB_FAIL(iter.advance_reused_rows(macro_desc.row_count_))) {
       LOG_WARN("failed to account reused macro rows", K(ret), K(macro_desc));
     } else if (OB_FAIL(iter.next_macro_block())) {
@@ -419,7 +420,6 @@ int ObPartitionInvSSTableMerger::merge_row_(ObInvSSTableMergeIter &iter)
 int ObPartitionInvSSTableMerger::close_()
 {
   int ret = OB_SUCCESS;
-  ObInvIdxStatsMeta partial;
   ObSSTableIndexBuilder *index_builder = nullptr;
   if (OB_ISNULL(macro_writer_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -429,12 +429,12 @@ int ObPartitionInvSSTableMerger::close_()
     LOG_WARN("async merge ctx is null on close", K(ret), KP_(macro_writer), KP_(async_ctx));
   } else if (OB_FAIL(macro_writer_->close())) {
     LOG_WARN("failed to close macro writer", K(ret));
-  } else if (FALSE_IT(partial = macro_writer_->get_seg_inv_meta())) {
   } else if (OB_ISNULL(index_builder = async_ctx_->get_merge_info().get_index_builder())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("index builder is null on async index close", K(ret), KP(index_builder), KP_(async_ctx));
-  } else if (OB_FAIL(index_builder->merge_inv_meta(partial))) {
-    LOG_WARN("failed to merge segment inv meta into index builder", K(ret), K(partial), KP(index_builder));
+  } else if (OB_FAIL(index_builder->merge_inv_meta(macro_writer_->get_seg_inv_meta()))) {
+    LOG_WARN("failed to merge segment inv meta into index builder", K(ret),
+        "seg_inv_meta", macro_writer_->get_seg_inv_meta(), KP(index_builder));
   } else {
     LOG_INFO("inv sstable merge logical block reuse stats", K_(task_idx),
         K_(logical_reuse_stats));
@@ -454,7 +454,8 @@ int ObPartitionInvSSTableMerger::close_()
     LOG_INFO("finish async index merge partition", K_(task_idx), K_(term_range),
         "dag_param", async_ctx_->get_dag_param(),
         "input_table_count", async_ctx_->get_tables_handle().get_count(),
-        K(scan_units), K(accounted_row_count), K(block_info), K(partial),
+        K(scan_units), K(accounted_row_count), K(block_info),
+        "seg_inv_meta", macro_writer_->get_seg_inv_meta(),
         K_(macro_reuse_stats), K_(logical_reuse_stats), K(cost_time));
   }
   return ret;

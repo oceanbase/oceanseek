@@ -224,7 +224,6 @@ void fill_inv_meta_from_row_desc(
   inv_meta.doc_id_obj_meta_.set_uint64();
   inv_meta.min_doc_id_ = common::OB_INVALID_ID;
   inv_meta.max_doc_id_ = 0;
-  inv_meta.total_doc_length_ = 0;
   inv_meta.index_type_ = INV_IDX_TYPE_FTS;
   inv_meta.has_relevance_params_ = true;
   inv_meta.has_position_list_ = true;
@@ -710,7 +709,7 @@ void print_inv_sstable_meta(
   //           << " row_count=" << sstable->get_row_count()
   //           << " macro_block_cnt=" << sstable->get_data_macro_block_count();
   // if (OB_NOT_NULL(inv_sstable)) {
-  //   const ObInvIdxStatsMeta &meta = inv_sstable->get_inv_meta();
+  //   const ObInvIdxStatsMeta &meta = inv_sstable->get_inv_meta().get_stats();
   //   std::cout << " min_doc_id=" << meta.min_doc_id_
   //             << " max_doc_id=" << meta.max_doc_id_
   //             << " total_doc_length=" << meta.total_doc_length_;
@@ -829,7 +828,7 @@ int build_non_empty_inv_merge_res(
     const int64_t row_cnt,
     const uint64_t start_doc_id,
     const bool micro_index_clustered,
-    ObInvIdxStatsMeta &inv_meta,
+    ObInvSSTableMeta &inv_meta,
     ObArenaAllocator &allocator,
     ObSSTableMergeRes &res,
     const uint64_t doc_id_step = 1)
@@ -962,8 +961,13 @@ int build_non_empty_inv_merge_res(
       } else if (OB_FAIL(deep_copy_index_tree_root_block(allocator, res.data_root_desc_))) {
         LOG_WARN("failed to deep copy inv merge res data root block buf", KR(ret), K(tablet_id));
       } else {
-        fill_inv_meta_from_row_desc(inv_idx_row_desc, min_doc_id, max_doc_id, total_token_freq, inv_meta);
-        res.inv_meta_ = inv_meta;
+        ObInvIdxStatsMeta stats;
+        fill_inv_meta_from_row_desc(inv_idx_row_desc, min_doc_id, max_doc_id, total_token_freq, stats);
+        if (OB_FAIL(inv_meta.init(stats))) {
+          LOG_WARN("failed to initialize inverted sstable metadata", K(ret));
+        } else if (OB_FAIL(res.inv_meta_.assign(inv_meta))) {
+          LOG_WARN("failed to copy inverted sstable metadata", K(ret));
+        }
       }
     }
   }
@@ -1526,7 +1530,7 @@ public:
       const ObLSID &ls_id,
       const ObTabletID &tablet_id,
       const bool expect_empty,
-      ObInvIdxStatsMeta &inv_meta,
+      ObInvSSTableMeta &inv_meta,
       SCN &end_scn,
       bool &found);
   int find_inv_inc_major_meta_since_min_start(
@@ -1534,7 +1538,7 @@ public:
       const ObTabletID &tablet_id,
       const bool expect_empty,
       const SCN &min_start_scn,
-      ObInvIdxStatsMeta &inv_meta,
+      ObInvSSTableMeta &inv_meta,
       SCN &end_scn,
       bool &found);
   int find_inv_inc_major_meta_impl(
@@ -1542,21 +1546,21 @@ public:
       const ObTabletID &tablet_id,
       const bool expect_empty,
       const SCN *min_start_scn,
-      ObInvIdxStatsMeta &inv_meta,
+      ObInvSSTableMeta &inv_meta,
       SCN &end_scn,
       bool &found);
   int wait_inv_inc_major_meta(
       const ObLSID &ls_id,
       const ObTabletID &tablet_id,
       const bool expect_empty,
-      ObInvIdxStatsMeta &inv_meta,
+      ObInvSSTableMeta &inv_meta,
       SCN &end_scn);
   int wait_inv_inc_major_meta_since_min_start(
       const ObLSID &ls_id,
       const ObTabletID &tablet_id,
       const bool expect_empty,
       const SCN &min_start_scn,
-      ObInvIdxStatsMeta &inv_meta,
+      ObInvSSTableMeta &inv_meta,
       SCN &end_scn);
   int get_tablet_handle(const ObLSID &ls_id, const ObTabletID &tablet_id, ObTabletHandle &tablet_handle);
   void check_storage_schema_async_index_flags(
@@ -1679,13 +1683,13 @@ public:
   void run_choose_merge_range_multi_index_varying_cnts(const int64_t fts_index_cnt);
   void run_choose_merge_range_multi_index_min_snapshot(const int64_t fts_index_cnt);
   void run_build_async_index_medium_info_with_merge_tables(MultiAsyncIndexTabletCtx &ctx);
-  void fill_inv_meta_for_test(ObInvIdxStatsMeta &meta);
+  void fill_inv_meta_for_test(ObInvSSTableMeta &meta);
   int build_empty_inv_merge_res(
       ObStorageSchema &storage_schema,
       const int64_t row_count,
       const int64_t occupy_size,
       const int64_t snapshot_version,
-      ObInvIdxStatsMeta &inv_meta,
+      ObInvSSTableMeta &inv_meta,
       ObSSTableMergeRes &res);
   int prepare_inv_merge_context(
       ObLSHandle &ls_handle,
@@ -1704,7 +1708,7 @@ public:
       const int64_t base_version,
       const int64_t row_count,
       const int64_t occupy_size,
-      ObInvIdxStatsMeta &inv_meta,
+      ObInvSSTableMeta &inv_meta,
       ObTabletMergeCtx &merge_context,
       ObTabletCreateSSTableParam &param);
   int create_inv_sstable_from_param(
@@ -2515,16 +2519,19 @@ int ObAsyncIndexCompactionTest::mock_inc_major_sstable(
   param.uncommit_tx_info_.push_back(tx_desc);
   param.uncommit_tx_info_.set_info_status_record_seq();
   ObSSTableMergeRes::fill_column_checksum_for_empty_major(param.column_cnt_, param.column_checksums_);
-  param.inv_meta_.reset();
-  param.inv_meta_.index_type_ = INV_IDX_TYPE_FTS;
-  param.inv_meta_.has_relevance_params_ = true;
-  param.inv_meta_.has_position_list_ = false;
-  param.inv_meta_.has_nested_key_ = false;
-  param.inv_meta_.doc_id_obj_meta_.set_uint64();
-  param.inv_meta_.min_doc_id_ = common::OB_INVALID_ID;
-  param.inv_meta_.max_doc_id_ = 0;
-  if (OB_ISNULL(buf = allocator_.alloc(is_delete_index ? sizeof(ObSSTable) : sizeof(ObInvSSTable)))) {
+  ObInvIdxStatsMeta inv_stats;
+  inv_stats.index_type_ = INV_IDX_TYPE_FTS;
+  inv_stats.has_relevance_params_ = true;
+  inv_stats.has_position_list_ = false;
+  inv_stats.has_nested_key_ = false;
+  inv_stats.doc_id_obj_meta_.set_uint64();
+  inv_stats.min_doc_id_ = common::OB_INVALID_ID;
+  inv_stats.max_doc_id_ = 0;
+  if (OB_FAIL(param.inv_meta_.init(inv_stats))) {
+    LOG_WARN("failed to initialize inverted sstable metadata", K(ret));
+  } else if (OB_ISNULL(buf = allocator_.alloc(is_delete_index ? sizeof(ObSSTable) : sizeof(ObInvSSTable)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate sstable", K(ret));
   } else if (OB_ISNULL(sstable = is_delete_index
       ? new (buf) ObSSTable() : new (buf) ObInvSSTable())) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -2602,17 +2609,22 @@ int ObAsyncIndexCompactionTest::mock_major_sstable(
   param.is_co_table_without_cgs_ = false;
   param.co_base_snapshot_version_ = 0;
   param.column_cnt_ = param.rowkey_column_cnt_;
-  param.inv_meta_.reset();
-  param.inv_meta_.index_type_ = INV_IDX_TYPE_FTS;
-  param.inv_meta_.has_relevance_params_ = true;
-  param.inv_meta_.has_position_list_ = false;
-  param.inv_meta_.has_nested_key_ = false;
-  param.inv_meta_.doc_id_obj_meta_.set_uint64();
-  param.inv_meta_.min_doc_id_ = common::OB_INVALID_ID;
-  param.inv_meta_.max_doc_id_ = 0;
-  ObSSTableMergeRes::fill_column_checksum_for_empty_major(param.column_cnt_, param.column_checksums_);
-  if (OB_ISNULL(buf = allocator_.alloc(sizeof(ObInvSSTable)))) {
+  ObInvIdxStatsMeta inv_stats;
+  inv_stats.index_type_ = INV_IDX_TYPE_FTS;
+  inv_stats.has_relevance_params_ = true;
+  inv_stats.has_position_list_ = false;
+  inv_stats.has_nested_key_ = false;
+  inv_stats.doc_id_obj_meta_.set_uint64();
+  inv_stats.min_doc_id_ = common::OB_INVALID_ID;
+  inv_stats.max_doc_id_ = 0;
+  if (OB_FAIL(param.inv_meta_.init(inv_stats))) {
+    LOG_WARN("failed to initialize inverted sstable metadata", K(ret));
+  } else if (OB_FAIL(ObSSTableMergeRes::fill_column_checksum_for_empty_major(
+      param.column_cnt_, param.column_checksums_))) {
+    LOG_WARN("failed to fill column checksum", K(ret));
+  } else if (OB_ISNULL(buf = allocator_.alloc(sizeof(ObInvSSTable)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate sstable", K(ret));
   } else if (OB_ISNULL(sstable = new (buf) ObInvSSTable())) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else if (OB_FAIL(sstable->init(param, &allocator_))) {

@@ -243,6 +243,8 @@ public:
   bool is_valid() const;
   void reset();
   int assign(const ObSSTableMergeRes &src);
+  int assign_inv_meta(const ObInvSSTableMeta &meta)
+  { return inv_meta_.assign(meta); }
   int prepare_column_checksum_array(const int64_t data_column_cnt);
   bool is_valid_small_sstable_params() const;
   static int fill_column_checksum_for_empty_major(
@@ -295,7 +297,7 @@ public:
   ObRowStoreType root_row_store_type_;
   bool is_small_sstable_;
   char encrypt_key_[share::OB_MAX_TABLESPACE_ENCRYPT_KEY_LENGTH];
-  ObInvIdxStatsMeta inv_meta_;
+  ObInvSSTableMeta inv_meta_;
   DISALLOW_COPY_AND_ASSIGN(ObSSTableMergeRes);
 };
 
@@ -687,8 +689,9 @@ public:
   bool micro_index_clustered() const;
   int32_t get_private_transfer_epoch() const;
   void set_is_async_index(const bool is_async_index) { is_async_index_ = is_async_index; }
-  int merge_inv_meta(const ObInvIdxStatsMeta &partial);
-  OB_INLINE const ObInvIdxStatsMeta &get_inv_meta() const { return inv_meta_; }
+  int merge_inv_meta(const ObInvSSTableMeta &partial);
+  int merge_macro_inv_meta(const ObInvMacroMeta &macro_meta);
+  OB_INLINE const ObInvSSTableMeta &get_inv_meta() const { return inv_meta_; }
   const ObDataStoreDesc &get_data_store_desc() const { return data_store_desc_.get_desc(); }
   OB_INLINE ObSpaceOptimizationMode get_optimization_mode() const { return optimization_mode_; }
   const compaction::ObMergeBlockInfo &get_merge_block_info() const { return macro_writer_.get_merge_block_info(); }
@@ -791,7 +794,7 @@ private:
   ObIODevice *device_handle_;
   IndexTreeRootCtxList roots_;
   ObSSTableMergeRes res_;
-  ObInvIdxStatsMeta inv_meta_;
+  ObInvSSTableMeta inv_meta_;
   ObISSTableObjectCleaner *object_cleaner_;
   ObSpaceOptimizationMode optimization_mode_;
   bool enable_dump_disk_;

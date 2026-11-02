@@ -169,11 +169,14 @@ public:
           table.meta_ = &meta_;
           table.meta_cache_.data_macro_block_count_ = min_ids[table_idx] <= max_ids[table_idx]
               ? 1 : 0;
-          table.inv_meta_.index_type_ = blocksstable::INV_IDX_TYPE_SEARCH;
-          table.inv_meta_.doc_id_obj_meta_.set_uint64();
-          table.inv_meta_.min_doc_id_ = min_ids[table_idx];
-          table.inv_meta_.max_doc_id_ = max_ids[table_idx];
-          if (0 == ranges.at(range_idx).base_version_) {
+          blocksstable::ObInvIdxStatsMeta inv_stats;
+          inv_stats.index_type_ = blocksstable::INV_IDX_TYPE_SEARCH;
+          inv_stats.doc_id_obj_meta_.set_uint64();
+          inv_stats.min_doc_id_ = min_ids[table_idx];
+          inv_stats.max_doc_id_ = max_ids[table_idx];
+          if (OB_FAIL(table.inv_meta_.init(inv_stats))) {
+            LOG_WARN("failed to initialize inverted sstable metadata", K(ret));
+          } else if (0 == ranges.at(range_idx).base_version_) {
             major_tables_[store_.major_tables_.cnt_++] = &table;
           } else {
             inc_tables_[store_.inc_major_tables_.cnt_++] = &table;
@@ -398,7 +401,7 @@ public:
   MockRangeAccessService()
     : open_count_(0), doc_ids_{101, 102}, sstable_()
   {
-    sstable_.inv_meta_.index_type_ = blocksstable::INV_IDX_TYPE_SEARCH;
+    sstable_.inv_meta_.stats_.index_type_ = blocksstable::INV_IDX_TYPE_SEARCH;
   }
 
   int async_index_range_scan(
@@ -7512,7 +7515,7 @@ TEST_F(TestDASAsyncSegmentMerge, segment_rowid_metadata_uses_logical_version_ran
       TEST_INDEX_TABLE_ID, wrong_range, available, min_id, max_id));
   EXPECT_FALSE(available);
 
-  blocksstable::ObInvIdxStatsMeta &meta = storage.tables_[1].inv_meta_;
+  blocksstable::ObInvIdxStatsMeta &meta = storage.tables_[1].inv_meta_.stats_;
   meta.doc_id_obj_meta_.set_int();
   ASSERT_EQ(OB_SUCCESS, partition.get_segment_rowid_range(
       TEST_INDEX_TABLE_ID, range, available, min_id, max_id));
@@ -7614,26 +7617,26 @@ TEST_F(TestDASAsyncSegmentMerge, segment_rowid_ranges_detect_disjoint_and_overla
   for (int64_t phase = 0; phase < 10; ++phase) {
     if (phase > 0) {
       // Touching, overlapping and containing envelopes must all keep the heap.
-      storage.tables_[0].inv_meta_.min_doc_id_ = phase <= 3
+      storage.tables_[0].inv_meta_.stats_.min_doc_id_ = phase <= 3
           ? fallback_min_ids[phase - 1] : min_ids[0];
       if (5 == phase) {
         merge->use_batch_merge_ = false;
       }
       if (6 == phase) {
         // Nested DocID layouts cannot use ordered concatenation and must keep the heap.
-        storage.tables_[0].inv_meta_.has_nested_key_ = true;
+        storage.tables_[0].inv_meta_.stats_.has_nested_key_ = true;
       } else {
-        storage.tables_[0].inv_meta_.has_nested_key_ = false;
+        storage.tables_[0].inv_meta_.stats_.has_nested_key_ = false;
       }
       if (8 == phase) {
         // Nonempty physical storage with an empty statistics sentinel must not lose rows.
-        storage.tables_[0].inv_meta_.min_doc_id_ = UINT64_MAX;
-        storage.tables_[0].inv_meta_.max_doc_id_ = 0;
+        storage.tables_[0].inv_meta_.stats_.min_doc_id_ = UINT64_MAX;
+        storage.tables_[0].inv_meta_.stats_.max_doc_id_ = 0;
         ASSERT_FALSE(storage.tables_[0].is_empty());
       }
       if (9 == phase) {
-        storage.tables_[0].inv_meta_.max_doc_id_ = max_ids[0];
-        storage.tables_[0].inv_meta_.doc_id_obj_meta_.set_int();
+        storage.tables_[0].inv_meta_.stats_.max_doc_id_ = max_ids[0];
+        storage.tables_[0].inv_meta_.stats_.doc_id_obj_meta_.set_int();
       }
       ASSERT_EQ(OB_SUCCESS, merge->rescan());
     }
@@ -7966,8 +7969,8 @@ TEST_F(TestDASAsyncSegmentMerge, ordered_concat_partition_rescan_rebuilds_order)
   EXPECT_EQ(1, rowid.get_uint64());
   // An overlapping partition must discard the previous concat cursor.
   for (int64_t i = 0; i < 3; ++i) {
-    last_storage.tables_[i].inv_meta_.min_doc_id_ = 0;
-    last_storage.tables_[i].inv_meta_.max_doc_id_ = UINT64_MAX;
+    last_storage.tables_[i].inv_meta_.stats_.min_doc_id_ = 0;
+    last_storage.tables_[i].inv_meta_.stats_.max_doc_id_ = UINT64_MAX;
   }
   ASSERT_EQ(OB_SUCCESS, merge->rescan());
   EXPECT_FALSE(merge->use_ordered_concat_);

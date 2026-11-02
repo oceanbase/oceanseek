@@ -186,15 +186,15 @@ int ObSSTablePostingScanner::open(
     LOG_WARN("failed to init scan param", K(ret));
   } else if (OB_FAIL(sstable.get_meta(meta_handle))) {
     LOG_WARN("failed to get sstable meta", K(ret));
-  } else if (OB_UNLIKELY(sstable.get_inv_meta().index_type_ <= INV_IDX_TYPE_INVALID
-             || sstable.get_inv_meta().index_type_ >= INV_IDX_TYPE_MAX)) {
+  } else if (OB_UNLIKELY(sstable.get_inv_meta().get_stats().index_type_ <= INV_IDX_TYPE_INVALID
+             || sstable.get_inv_meta().get_stats().index_type_ >= INV_IDX_TYPE_MAX)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid inverted index type", K(ret), K(sstable.get_inv_meta()));
   } else {
     scan_allocator_ = &scan_allocator;
     need_posting_value_ = need_posting_value;
-    index_type_ = sstable.get_inv_meta().index_type_;
-    const bool has_max_score = sstable.get_inv_meta().has_relevance_params_;
+    index_type_ = sstable.get_inv_meta().get_stats().index_type_;
+    const bool has_max_score = sstable.get_inv_meta().get_stats().has_relevance_params_;
     const int64_t rowkey_column_cnt =
         meta_handle.get_sstable_meta().get_schema_rowkey_column_count();
     if (OB_FAIL(init_scan_keys(query_key, rowkey_column_cnt, scan_allocator))) {

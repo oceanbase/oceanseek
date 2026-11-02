@@ -49,7 +49,7 @@ TEST_F(TestInvIdxSSTablePrepare, build_inv_sstable_with_position_list)
   ObInvSSTable inv_sstable;
   build_inv_sstable(has_pos_list, row_cnt, inv_sstable);
   ASSERT_TRUE(inv_sstable.is_valid());
-  ASSERT_TRUE(inv_sstable.get_inv_meta().has_position_list_);
+  ASSERT_TRUE(inv_sstable.get_inv_meta().get_stats().has_position_list_);
 }
 
 // Build an inverted-index sstable without a position list (phrase queries disabled).
@@ -61,7 +61,7 @@ TEST_F(TestInvIdxSSTablePrepare, build_inv_sstable_without_position_list)
   ObInvSSTable inv_sstable;
   build_inv_sstable(has_pos_list, row_cnt, inv_sstable);
   ASSERT_TRUE(inv_sstable.is_valid());
-  ASSERT_FALSE(inv_sstable.get_inv_meta().has_position_list_);
+  ASSERT_FALSE(inv_sstable.get_inv_meta().get_stats().has_position_list_);
 }
 
 // Row count is configurable: a smaller sstable still builds and validates.
@@ -72,7 +72,7 @@ TEST_F(TestInvIdxSSTablePrepare, build_inv_sstable_with_configurable_row_count)
   ObInvSSTable inv_sstable;
   build_inv_sstable(has_pos_list, row_cnt, inv_sstable);
   ASSERT_TRUE(inv_sstable.is_valid());
-  ASSERT_TRUE(inv_sstable.get_inv_meta().has_position_list_);
+  ASSERT_TRUE(inv_sstable.get_inv_meta().get_stats().has_position_list_);
 }
 
 // After building an inverted-index sstable, use the secondary meta iterator to scan
@@ -303,16 +303,17 @@ TEST_F(TestInvIdxSSTablePrepare, rebuild_inv_sstable_with_index_block_rebuilder)
   ASSERT_EQ(row_cnt, rebuild_res.row_count_);
 
   // ---- 7. verify the rebuilder aggregated inverted metadata, then build the new sstable ----
-  const ObInvIdxStatsMeta &src_inv_meta = src_sstable.get_inv_meta();
+  const ObInvIdxStatsMeta &src_inv_meta = src_sstable.get_inv_meta().get_stats();
   ASSERT_TRUE(rebuild_res.inv_meta_.is_valid());
-  ASSERT_EQ(src_inv_meta.index_type_, rebuild_res.inv_meta_.index_type_);
-  ASSERT_EQ(src_inv_meta.has_relevance_params_, rebuild_res.inv_meta_.has_relevance_params_);
-  ASSERT_EQ(src_inv_meta.has_position_list_, rebuild_res.inv_meta_.has_position_list_);
-  ASSERT_EQ(src_inv_meta.has_nested_key_, rebuild_res.inv_meta_.has_nested_key_);
-  ASSERT_EQ(src_inv_meta.doc_id_obj_meta_, rebuild_res.inv_meta_.doc_id_obj_meta_);
-  ASSERT_EQ(src_inv_meta.min_doc_id_, rebuild_res.inv_meta_.min_doc_id_);
-  ASSERT_EQ(src_inv_meta.max_doc_id_, rebuild_res.inv_meta_.max_doc_id_);
-  ASSERT_EQ(src_inv_meta.total_doc_length_, rebuild_res.inv_meta_.total_doc_length_);
+  ASSERT_EQ(src_inv_meta.index_type_, rebuild_res.inv_meta_.get_stats().index_type_);
+  ASSERT_EQ(src_inv_meta.has_relevance_params_, rebuild_res.inv_meta_.get_stats().has_relevance_params_);
+  ASSERT_EQ(src_inv_meta.has_position_list_, rebuild_res.inv_meta_.get_stats().has_position_list_);
+  ASSERT_EQ(src_inv_meta.has_nested_key_, rebuild_res.inv_meta_.get_stats().has_nested_key_);
+  ASSERT_EQ(src_inv_meta.doc_id_obj_meta_, rebuild_res.inv_meta_.get_stats().doc_id_obj_meta_);
+  ASSERT_EQ(src_inv_meta.min_doc_id_, rebuild_res.inv_meta_.get_stats().min_doc_id_);
+  ASSERT_EQ(src_inv_meta.max_doc_id_, rebuild_res.inv_meta_.get_stats().max_doc_id_);
+  ASSERT_EQ(src_inv_meta.total_doc_length_,
+      rebuild_res.inv_meta_.get_stats().total_doc_length_);
   ObInvSSTable rebuilt_sstable;
   finalize_inv_sstable_from_res(rebuild_res, rebuilt_sstable);
 
@@ -320,11 +321,11 @@ TEST_F(TestInvIdxSSTablePrepare, rebuild_inv_sstable_with_index_block_rebuilder)
   ASSERT_TRUE(rebuilt_sstable.is_inv_sstable());
   ASSERT_TRUE(rebuilt_sstable.is_valid());
   ASSERT_EQ(src_macro_cnt, rebuilt_sstable.get_data_macro_block_count());
-  ASSERT_TRUE(rebuilt_sstable.get_inv_meta().is_valid());
-  ASSERT_TRUE(rebuilt_sstable.get_inv_meta().is_fts_index());
-  ASSERT_EQ(has_pos_list, rebuilt_sstable.get_inv_meta().has_position_list_);
-  ASSERT_EQ(src_sstable.get_inv_meta().min_doc_id_, rebuilt_sstable.get_inv_meta().min_doc_id_);
-  ASSERT_EQ(src_sstable.get_inv_meta().max_doc_id_, rebuilt_sstable.get_inv_meta().max_doc_id_);
+  ASSERT_TRUE(rebuilt_sstable.get_inv_meta().get_stats().is_valid());
+  ASSERT_TRUE(rebuilt_sstable.get_inv_meta().get_stats().is_fts_index());
+  ASSERT_EQ(has_pos_list, rebuilt_sstable.get_inv_meta().get_stats().has_position_list_);
+  ASSERT_EQ(src_sstable.get_inv_meta().get_stats().min_doc_id_, rebuilt_sstable.get_inv_meta().get_stats().min_doc_id_);
+  ASSERT_EQ(src_sstable.get_inv_meta().get_stats().max_doc_id_, rebuilt_sstable.get_inv_meta().get_stats().max_doc_id_);
   STORAGE_LOG(INFO, "rebuilt inv sstable via index block rebuilder",
       K(src_macro_cnt), K(appended_cnt), K(row_cnt),
       "rebuilt_macro_cnt", rebuilt_sstable.get_data_macro_block_count());
@@ -560,9 +561,9 @@ TEST_F(TestInvIdxSSTablePrepare, scan_inv_sstable_leaf_rows_with_tree_cursor)
   // agg-entry doc counts equals the input row count.
   ASSERT_EQ(row_cnt, total_entry_doc_count);
   // The leaf-layer doc-id extremes match the sstable's inv extended meta.
-  ASSERT_EQ(inv_sstable.get_inv_meta().min_doc_id_, global_min_doc_id);
-  ASSERT_EQ(inv_sstable.get_inv_meta().max_doc_id_, global_max_doc_id);
-  ASSERT_EQ(inv_sstable.get_inv_meta().total_doc_length_, total_entry_doc_length);
+  ASSERT_EQ(inv_sstable.get_inv_meta().get_stats().min_doc_id_, global_min_doc_id);
+  ASSERT_EQ(inv_sstable.get_inv_meta().get_stats().max_doc_id_, global_max_doc_id);
+  ASSERT_EQ(inv_sstable.get_inv_meta().get_stats().total_doc_length_, total_entry_doc_length);
   // A multi-macro sstable must carry strictly more leaf rows than macro blocks (each macro
   // block contributes its own inverted-index micro block holding >=1 leaf row).
   ASSERT_GT(leaf_row_cnt, inv_sstable.get_data_macro_block_count());

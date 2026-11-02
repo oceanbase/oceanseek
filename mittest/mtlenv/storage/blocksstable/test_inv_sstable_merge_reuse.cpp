@@ -380,7 +380,10 @@ inline void run_inv_merge_close(TestInvIdxSSTablePrepare &fixture,
     writer.inc_filter_row_count();
   }
   if (invalidate_partial_meta) {
-    writer.seg_inv_meta_.doc_id_obj_meta_.set_type_simple(ObMaxType);
+    ObInvIdxStatsMeta invalid_stats = writer.seg_inv_meta_.get_stats();
+    invalid_stats.doc_id_obj_meta_.set_type_simple(ObMaxType);
+    // Inject malformed metadata to exercise the close-path validation.
+    OK(writer.seg_inv_meta_.stats_.assign(invalid_stats));
   }
 
   storage::ObRowkeyReadInfo read_info;
@@ -552,8 +555,8 @@ inline void build_reused_sstable(TestInvIdxSSTablePrepare &fixture,
     OK(iter.get_macro_block_desc(desc));
     ASSERT_NE(nullptr, desc.macro_meta_);
     ASSERT_TRUE(desc.macro_meta_->is_valid());
-    ObInvIdxMacroBlockInvStats stats;
-    OK(iter.get_curr_macro_inv_stats(stats));
+    ObInvMacroMeta stats;
+    OK(iter.get_curr_macro_inv_meta(stats));
     const ObMicroBlockData *micro_block_data = nullptr;
     if (desc.is_clustered_index_tree_) {
       // 与生产 merger 一致：聚集索引树模式整块复用必须同时取回聚集索引微块供回放。
@@ -1012,12 +1015,14 @@ inline void assert_macro_reuse_output_matches_row_rewrite(
   ASSERT_EQ(rewritten_digest.total_token_freq_, reused_digest.total_token_freq_);
   ASSERT_EQ(rewritten_digest.total_doc_length_, reused_digest.total_doc_length_);
   ASSERT_EQ(rewritten_digest.position_list_bytes_, reused_digest.position_list_bytes_);
-  ASSERT_EQ(input.get_inv_meta().min_doc_id_, reused_output.get_inv_meta().min_doc_id_);
-  ASSERT_EQ(input.get_inv_meta().max_doc_id_, reused_output.get_inv_meta().max_doc_id_);
-  ASSERT_EQ(input.get_inv_meta().total_doc_length_, reused_output.get_inv_meta().total_doc_length_);
-  ASSERT_EQ(input.get_inv_meta().min_doc_id_, rewritten_output.get_inv_meta().min_doc_id_);
-  ASSERT_EQ(input.get_inv_meta().max_doc_id_, rewritten_output.get_inv_meta().max_doc_id_);
-  ASSERT_EQ(input.get_inv_meta().total_doc_length_, rewritten_output.get_inv_meta().total_doc_length_);
+  ASSERT_EQ(input.get_inv_meta().get_stats().min_doc_id_, reused_output.get_inv_meta().get_stats().min_doc_id_);
+  ASSERT_EQ(input.get_inv_meta().get_stats().max_doc_id_, reused_output.get_inv_meta().get_stats().max_doc_id_);
+  ASSERT_EQ(input.get_inv_meta().get_stats().total_doc_length_,
+      reused_output.get_inv_meta().get_stats().total_doc_length_);
+  ASSERT_EQ(input.get_inv_meta().get_stats().min_doc_id_, rewritten_output.get_inv_meta().get_stats().min_doc_id_);
+  ASSERT_EQ(input.get_inv_meta().get_stats().max_doc_id_, rewritten_output.get_inv_meta().get_stats().max_doc_id_);
+  ASSERT_EQ(input.get_inv_meta().get_stats().total_doc_length_,
+      rewritten_output.get_inv_meta().get_stats().total_doc_length_);
 }
 
 inline void assert_logical_block_reuse_output_matches_row_rewrite(
@@ -1068,13 +1073,14 @@ inline void assert_logical_block_reuse_output_matches_row_rewrite(
   ASSERT_EQ(rewritten_digest.total_token_freq_, reused_digest.total_token_freq_);
   ASSERT_EQ(rewritten_digest.total_doc_length_, reused_digest.total_doc_length_);
   ASSERT_EQ(rewritten_digest.position_list_bytes_, reused_digest.position_list_bytes_);
-  ASSERT_EQ(input.get_inv_meta().min_doc_id_, reused_output.get_inv_meta().min_doc_id_);
-  ASSERT_EQ(input.get_inv_meta().max_doc_id_, reused_output.get_inv_meta().max_doc_id_);
-  ASSERT_EQ(input.get_inv_meta().total_doc_length_, reused_output.get_inv_meta().total_doc_length_);
-  ASSERT_EQ(rewritten_output.get_inv_meta().min_doc_id_, reused_output.get_inv_meta().min_doc_id_);
-  ASSERT_EQ(rewritten_output.get_inv_meta().max_doc_id_, reused_output.get_inv_meta().max_doc_id_);
-  ASSERT_EQ(rewritten_output.get_inv_meta().total_doc_length_,
-      reused_output.get_inv_meta().total_doc_length_);
+  ASSERT_EQ(input.get_inv_meta().get_stats().min_doc_id_, reused_output.get_inv_meta().get_stats().min_doc_id_);
+  ASSERT_EQ(input.get_inv_meta().get_stats().max_doc_id_, reused_output.get_inv_meta().get_stats().max_doc_id_);
+  ASSERT_EQ(input.get_inv_meta().get_stats().total_doc_length_,
+      reused_output.get_inv_meta().get_stats().total_doc_length_);
+  ASSERT_EQ(rewritten_output.get_inv_meta().get_stats().min_doc_id_, reused_output.get_inv_meta().get_stats().min_doc_id_);
+  ASSERT_EQ(rewritten_output.get_inv_meta().get_stats().max_doc_id_, reused_output.get_inv_meta().get_stats().max_doc_id_);
+  ASSERT_EQ(rewritten_output.get_inv_meta().get_stats().total_doc_length_,
+      reused_output.get_inv_meta().get_stats().total_doc_length_);
 }
 } // namespace
 
@@ -1116,11 +1122,11 @@ TEST_F(TestInvIdxSSTablePrepare, macro_boundary_state_and_desc)
   ASSERT_TRUE(desc.is_valid_with_macro_meta());
   // 宏块级 doc 统计直接从 macro meta 的预聚合 payload 读取
   // （min/max/total_doc_length），无需读取宏块内容。
-  ObInvIdxMacroBlockInvStats stats;
-  OK(iter.get_curr_macro_inv_stats(stats));
-  ASSERT_GT(stats.total_doc_length_, 0);
-  ASSERT_LE(stats.min_doc_id_, stats.max_doc_id_);
-  ASSERT_GT(stats.min_doc_id_, 0);
+  ObInvMacroMeta stats;
+  OK(iter.get_curr_macro_inv_meta(stats));
+  ASSERT_GT(stats.get_stats().total_doc_length_, 0);
+  ASSERT_LE(stats.get_stats().min_doc_id_, stats.get_stats().max_doc_id_);
+  ASSERT_GT(stats.get_stats().min_doc_id_, 0);
 
   // 下钻一层后不再是可复用的宏块边界：is_macro_block_opened() 翻真，
   // get_macro_block_desc() 报错。
@@ -1995,11 +2001,11 @@ TEST_F(TestInvIdxSSTablePrepare, logical_block_range_fallback_reuses_middle_bloc
   ASSERT_EQ(rewritten_digest.total_token_freq_, output_digest.total_token_freq_);
   ASSERT_EQ(rewritten_digest.total_doc_length_, output_digest.total_doc_length_);
   ASSERT_EQ(rewritten_digest.position_list_bytes_, output_digest.position_list_bytes_);
-  ASSERT_EQ(rewritten_output.get_inv_meta().min_doc_id_, output.get_inv_meta().min_doc_id_);
-  ASSERT_EQ(rewritten_output.get_inv_meta().max_doc_id_, output.get_inv_meta().max_doc_id_);
+  ASSERT_EQ(rewritten_output.get_inv_meta().get_stats().min_doc_id_, output.get_inv_meta().get_stats().min_doc_id_);
+  ASSERT_EQ(rewritten_output.get_inv_meta().get_stats().max_doc_id_, output.get_inv_meta().get_stats().max_doc_id_);
   ASSERT_EQ(
-      rewritten_output.get_inv_meta().total_doc_length_,
-      output.get_inv_meta().total_doc_length_);
+      rewritten_output.get_inv_meta().get_stats().total_doc_length_,
+      output.get_inv_meta().get_stats().total_doc_length_);
 }
 
 // A deletion id between two generated even doc ids hits both the macro and first logical-block
@@ -2068,9 +2074,10 @@ TEST_F(TestInvIdxSSTablePrepare, logical_block_sparse_deletion_envelope_hit_fall
   ASSERT_EQ(input_digest.total_token_freq_, output_digest.total_token_freq_);
   ASSERT_EQ(input_digest.total_doc_length_, output_digest.total_doc_length_);
   ASSERT_EQ(input_digest.position_list_bytes_, output_digest.position_list_bytes_);
-  ASSERT_EQ(input.get_inv_meta().min_doc_id_, output.get_inv_meta().min_doc_id_);
-  ASSERT_EQ(input.get_inv_meta().max_doc_id_, output.get_inv_meta().max_doc_id_);
-  ASSERT_EQ(input.get_inv_meta().total_doc_length_, output.get_inv_meta().total_doc_length_);
+  ASSERT_EQ(input.get_inv_meta().get_stats().min_doc_id_, output.get_inv_meta().get_stats().min_doc_id_);
+  ASSERT_EQ(input.get_inv_meta().get_stats().max_doc_id_, output.get_inv_meta().get_stats().max_doc_id_);
+  ASSERT_EQ(input.get_inv_meta().get_stats().total_doc_length_,
+      output.get_inv_meta().get_stats().total_doc_length_);
 }
 
 // Exercise the two failure classes with a real encoded source block:
@@ -2308,10 +2315,10 @@ TEST_F(TestInvIdxSSTablePrepare, relevance_format_fallback_runs_through_merger)
   OK(stats_iter.init(input, read_info, source_row_desc, whole, allocator_));
   int ret = stats_iter.next_macro_block();
   while (OB_SUCC(ret)) {
-    ObInvIdxMacroBlockInvStats macro_stats;
-    OK(stats_iter.get_curr_macro_inv_stats(macro_stats));
-    ASSERT_LT(macro_stats.min_doc_id_ + 1, macro_stats.max_doc_id_);
-    OK(absent_doc_ids.push_back(macro_stats.min_doc_id_ + 1));
+    ObInvMacroMeta macro_stats;
+    OK(stats_iter.get_curr_macro_inv_meta(macro_stats));
+    ASSERT_LT(macro_stats.get_stats().min_doc_id_ + 1, macro_stats.get_stats().max_doc_id_);
+    OK(absent_doc_ids.push_back(macro_stats.get_stats().min_doc_id_ + 1));
     ret = stats_iter.next_macro_block();
   }
   ASSERT_EQ(OB_ITER_END, ret);
@@ -2339,7 +2346,7 @@ TEST_F(TestInvIdxSSTablePrepare, relevance_format_fallback_runs_through_merger)
       stats.fallback_format_count_ + stats.fallback_deletion_count_);
   ASSERT_EQ(0, stats.fallback_range_count_);
   ASSERT_EQ(row_cnt, stats.iter_row_count_);
-  ASSERT_FALSE(output.get_inv_meta().has_relevance_params_);
+  ASSERT_FALSE(output.get_inv_meta().get_stats().has_relevance_params_);
 
   InvSSTableKeyDigest input_digest;
   InvSSTableKeyDigest output_digest;
@@ -2361,7 +2368,7 @@ TEST_F(TestInvIdxSSTablePrepare, macro_format_mismatch_falls_back_without_deleti
   ObInvSSTable input;
   build_inv_sstable(
       true /*has_pos_list*/, row_cnt, input, true /*vary_posting_payload*/);
-  ASSERT_TRUE(input.get_inv_meta().has_relevance_params_);
+  ASSERT_TRUE(input.get_inv_meta().get_stats().has_relevance_params_);
   const ObInvIdxRowDesc source_row_desc = inv_idx_row_desc_;
 
   storage::ObRowkeyReadInfo read_info;
@@ -2388,7 +2395,7 @@ TEST_F(TestInvIdxSSTablePrepare, macro_format_mismatch_falls_back_without_deleti
   EXPECT_GT(stats.fallback_format_count_, 0);
   EXPECT_EQ(stats.logical_check_count_, stats.fallback_format_count_);
   EXPECT_EQ(row_cnt, stats.iter_row_count_);
-  EXPECT_FALSE(output.get_inv_meta().has_relevance_params_);
+  EXPECT_FALSE(output.get_inv_meta().get_stats().has_relevance_params_);
 
   InvSSTableKeyDigest input_digest;
   InvSSTableKeyDigest output_digest;
@@ -2400,8 +2407,8 @@ TEST_F(TestInvIdxSSTablePrepare, macro_format_mismatch_falls_back_without_deleti
   EXPECT_EQ(input_digest.rowkey_checksum_, output_digest.rowkey_checksum_);
 }
 
-// Only mutate a copied macro meta. The real source and target remain compatible, so each
-// physical mismatch must independently turn OP_NONE into FORMAT/OPEN before any writer mutation.
+// Inject metadata differences independently: each mismatch must turn OP_NONE into FORMAT/OPEN
+// before any writer mutation, and restoring the metadata must allow reuse again.
 TEST_F(TestInvIdxSSTablePrepare, macro_physical_format_mismatch_falls_back_with_output_desc)
 {
   ObInvSSTable input;
@@ -2434,6 +2441,36 @@ TEST_F(TestInvIdxSSTablePrepare, macro_physical_format_mismatch_falls_back_with_
   helper.is_inited_ = true;
   OK(helper.check_macro_block_op(iter, desc, block_op));
   ASSERT_TRUE(block_op.is_none());
+
+  const ObInvSSTableMeta original_inv_meta = input.get_inv_meta();
+  for (int64_t mismatch = 0; mismatch < 2; ++mismatch) {
+    SCOPED_TRACE(mismatch);
+    ObInvIdxStatsMeta changed_stats = original_inv_meta.get_stats();
+    if (0 == mismatch) {
+      changed_stats.doc_id_obj_meta_.set_collation_level(
+          CS_LEVEL_EXPLICIT == changed_stats.doc_id_obj_meta_.get_collation_level()
+              ? CS_LEVEL_NUMERIC : CS_LEVEL_EXPLICIT);
+    } else {
+      changed_stats.doc_id_obj_meta_.set_collation_type(
+          CS_TYPE_BINARY == changed_stats.doc_id_obj_meta_.get_collation_type()
+              ? CS_TYPE_UTF8MB4_BIN : CS_TYPE_BINARY);
+    }
+    ASSERT_TRUE(changed_stats.is_valid());
+    ASSERT_FALSE(changed_stats.has_same_layout(original_inv_meta.get_stats()));
+    ObInvSSTableMeta changed_inv_meta;
+    OK(changed_inv_meta.init(changed_stats));
+    OK(input.set_inv_meta(changed_inv_meta));
+    OK(helper.check_macro_block_op(iter, desc, block_op));
+    EXPECT_TRUE(block_op.is_open());
+    EXPECT_EQ(ObInvSSTableMergeHelper::MacroBlockFallback::FORMAT,
+        helper.get_last_macro_block_fallback());
+    EXPECT_EQ(Level::MACRO, iter.get_curr_level());
+    OK(input.set_inv_meta(original_inv_meta));
+    OK(helper.check_macro_block_op(iter, desc, block_op));
+    EXPECT_TRUE(block_op.is_none());
+    EXPECT_EQ(ObInvSSTableMergeHelper::MacroBlockFallback::NONE,
+        helper.get_last_macro_block_fallback());
+  }
 
   ObDataMacroBlockMeta changed_compressor_meta;
   OK(changed_compressor_meta.assign(*desc.macro_meta_));
@@ -2535,17 +2572,17 @@ TEST_F(TestInvIdxSSTablePrepare, deletion_rewrites_dirty_macro_and_reuses_clean_
   ObInvSSTableMergeIter stats_iter;
   OK(stats_iter.init(input, read_info, inv_idx_row_desc_, whole, allocator_));
   OK(stats_iter.next_macro_block());
-  ObInvIdxMacroBlockInvStats dirty_stats;
-  OK(stats_iter.get_curr_macro_inv_stats(dirty_stats));
-  ASSERT_LT(dirty_stats.min_doc_id_, dirty_stats.max_doc_id_);
+  ObInvMacroMeta dirty_stats;
+  OK(stats_iter.get_curr_macro_inv_meta(dirty_stats));
+  ASSERT_LT(dirty_stats.get_stats().min_doc_id_, dirty_stats.get_stats().max_doc_id_);
   OK(stats_iter.next_macro_block());
-  ObInvIdxMacroBlockInvStats clean_stats;
-  OK(stats_iter.get_curr_macro_inv_stats(clean_stats));
-  ASSERT_GT(clean_stats.min_doc_id_, dirty_stats.max_doc_id_);
+  ObInvMacroMeta clean_stats;
+  OK(stats_iter.get_curr_macro_inv_meta(clean_stats));
+  ASSERT_GT(clean_stats.get_stats().min_doc_id_, dirty_stats.get_stats().max_doc_id_);
 
   const uint64_t deleted_doc_ids[] = {
-      dirty_stats.min_doc_id_,
-      dirty_stats.max_doc_id_
+      dirty_stats.get_stats().min_doc_id_,
+      dirty_stats.get_stats().max_doc_id_
   };
   storage::ObDeletionBitmapHandle deletion_bitmap_handle;
   OK(init_deletion_bitmap(
@@ -2556,13 +2593,13 @@ TEST_F(TestInvIdxSSTablePrepare, deletion_rewrites_dirty_macro_and_reuses_clean_
       read_info, inv_idx_row_desc_, allocator_, deletion_bitmap_handle);
   helper.is_inited_ = true;
   ASSERT_TRUE(helper.has_deletion_in_range(
-      dirty_stats.min_doc_id_, dirty_stats.max_doc_id_));
+      dirty_stats.get_stats().min_doc_id_, dirty_stats.get_stats().max_doc_id_));
   ASSERT_FALSE(helper.has_deletion_in_range(
-      clean_stats.min_doc_id_, clean_stats.max_doc_id_));
+      clean_stats.get_stats().min_doc_id_, clean_stats.get_stats().max_doc_id_));
   ASSERT_TRUE(helper.has_deletion_in_range(
-      dirty_stats.min_doc_id_, dirty_stats.min_doc_id_));
+      dirty_stats.get_stats().min_doc_id_, dirty_stats.get_stats().min_doc_id_));
   ASSERT_TRUE(helper.has_deletion_in_range(
-      dirty_stats.max_doc_id_, dirty_stats.max_doc_id_));
+      dirty_stats.get_stats().max_doc_id_, dirty_stats.get_stats().max_doc_id_));
 
   // Exercise the production merger path instead of reproducing its deletion policy in the test.
   ObInvIdxMacroBlockWriter writer;
@@ -2660,10 +2697,10 @@ TEST_F(TestInvIdxSSTablePrepare, deletion_rewrites_dirty_macro_and_reuses_clean_
   ASSERT_EQ(rewritten_digest.total_token_freq_, mixed_digest.total_token_freq_);
   ASSERT_EQ(rewritten_digest.total_doc_length_, mixed_digest.total_doc_length_);
   ASSERT_EQ(rewritten_digest.position_list_bytes_, mixed_digest.position_list_bytes_);
-  ASSERT_EQ(rewritten_output.get_inv_meta().min_doc_id_, mixed_output.get_inv_meta().min_doc_id_);
-  ASSERT_EQ(rewritten_output.get_inv_meta().max_doc_id_, mixed_output.get_inv_meta().max_doc_id_);
-  ASSERT_EQ(rewritten_output.get_inv_meta().total_doc_length_,
-      mixed_output.get_inv_meta().total_doc_length_);
+  ASSERT_EQ(rewritten_output.get_inv_meta().get_stats().min_doc_id_, mixed_output.get_inv_meta().get_stats().min_doc_id_);
+  ASSERT_EQ(rewritten_output.get_inv_meta().get_stats().max_doc_id_, mixed_output.get_inv_meta().get_stats().max_doc_id_);
+  ASSERT_EQ(rewritten_output.get_inv_meta().get_stats().total_doc_length_,
+      mixed_output.get_inv_meta().get_stats().total_doc_length_);
 }
 
 TEST_F(TestInvIdxSSTablePrepare, incremental_row_count_for_inc_inv_sstable)
@@ -2726,17 +2763,17 @@ TEST_F(TestInvIdxSSTablePrepare, clustered_deletion_rewrites_dirty_macro_and_reu
   ObInvSSTableMergeIter stats_iter;
   OK(stats_iter.init(input, read_info, inv_idx_row_desc_, whole, allocator_));
   OK(stats_iter.next_macro_block());
-  ObInvIdxMacroBlockInvStats dirty_stats;
-  OK(stats_iter.get_curr_macro_inv_stats(dirty_stats));
-  ASSERT_LT(dirty_stats.min_doc_id_, dirty_stats.max_doc_id_);
+  ObInvMacroMeta dirty_stats;
+  OK(stats_iter.get_curr_macro_inv_meta(dirty_stats));
+  ASSERT_LT(dirty_stats.get_stats().min_doc_id_, dirty_stats.get_stats().max_doc_id_);
   OK(stats_iter.next_macro_block());
-  ObInvIdxMacroBlockInvStats clean_stats;
-  OK(stats_iter.get_curr_macro_inv_stats(clean_stats));
-  ASSERT_GT(clean_stats.min_doc_id_, dirty_stats.max_doc_id_);
+  ObInvMacroMeta clean_stats;
+  OK(stats_iter.get_curr_macro_inv_meta(clean_stats));
+  ASSERT_GT(clean_stats.get_stats().min_doc_id_, dirty_stats.get_stats().max_doc_id_);
 
   const uint64_t deleted_doc_ids[] = {
-      dirty_stats.min_doc_id_,
-      dirty_stats.max_doc_id_
+      dirty_stats.get_stats().min_doc_id_,
+      dirty_stats.get_stats().max_doc_id_
   };
   storage::ObDeletionBitmapHandle deletion_bitmap_handle;
   OK(init_deletion_bitmap(
@@ -2822,10 +2859,10 @@ TEST_F(TestInvIdxSSTablePrepare, clustered_deletion_rewrites_dirty_macro_and_reu
   ASSERT_EQ(rewritten_digest.total_token_freq_, mixed_digest.total_token_freq_);
   ASSERT_EQ(rewritten_digest.total_doc_length_, mixed_digest.total_doc_length_);
   ASSERT_EQ(rewritten_digest.position_list_bytes_, mixed_digest.position_list_bytes_);
-  ASSERT_EQ(rewritten_output.get_inv_meta().min_doc_id_, mixed_output.get_inv_meta().min_doc_id_);
-  ASSERT_EQ(rewritten_output.get_inv_meta().max_doc_id_, mixed_output.get_inv_meta().max_doc_id_);
-  ASSERT_EQ(rewritten_output.get_inv_meta().total_doc_length_,
-      mixed_output.get_inv_meta().total_doc_length_);
+  ASSERT_EQ(rewritten_output.get_inv_meta().get_stats().min_doc_id_, mixed_output.get_inv_meta().get_stats().min_doc_id_);
+  ASSERT_EQ(rewritten_output.get_inv_meta().get_stats().max_doc_id_, mixed_output.get_inv_meta().get_stats().max_doc_id_);
+  ASSERT_EQ(rewritten_output.get_inv_meta().get_stats().total_doc_length_,
+      mixed_output.get_inv_meta().get_stats().total_doc_length_);
 }
 
 // Drive the production do_merge_/try_process_ loop with two real source iterators. Their first
@@ -2990,15 +3027,15 @@ TEST_F(TestInvIdxSSTablePrepare, multi_source_same_terms_reuse_logical_blocks)
   ASSERT_EQ(expected_digest.total_doc_length_, output_digest.total_doc_length_);
   ASSERT_EQ(expected_digest.position_list_bytes_, output_digest.position_list_bytes_);
   ASSERT_EQ(
-      MIN(input_a.get_inv_meta().min_doc_id_, input_b.get_inv_meta().min_doc_id_),
-      output.get_inv_meta().min_doc_id_);
+      MIN(input_a.get_inv_meta().get_stats().min_doc_id_, input_b.get_inv_meta().get_stats().min_doc_id_),
+      output.get_inv_meta().get_stats().min_doc_id_);
   ASSERT_EQ(
-      MAX(input_a.get_inv_meta().max_doc_id_, input_b.get_inv_meta().max_doc_id_),
-      output.get_inv_meta().max_doc_id_);
+      MAX(input_a.get_inv_meta().get_stats().max_doc_id_, input_b.get_inv_meta().get_stats().max_doc_id_),
+      output.get_inv_meta().get_stats().max_doc_id_);
   ASSERT_EQ(
-      input_a.get_inv_meta().total_doc_length_
-          + input_b.get_inv_meta().total_doc_length_,
-      output.get_inv_meta().total_doc_length_);
+      input_a.get_inv_meta().get_stats().total_doc_length_
+          + input_b.get_inv_meta().get_stats().total_doc_length_,
+      output.get_inv_meta().get_stats().total_doc_length_);
 }
 
 TEST_F(TestInvIdxSSTablePrepare, multi_source_overlapping_logical_ranges_open_to_rows)
@@ -3347,45 +3384,49 @@ TEST_F(TestInvIdxSSTablePrepare, index_builder_inv_meta_merge_aggregates)
 {
   ObSSTableIndexBuilder builder(false /*use_double_write_buffer*/);
   builder.set_is_async_index(true);
-  blocksstable::ObInvIdxStatsMeta seg1;
-  seg1.doc_id_obj_meta_.set_uint64();
-  seg1.index_type_ = blocksstable::INV_IDX_TYPE_FTS;
-  seg1.has_relevance_params_ = true;
-  seg1.min_doc_id_ = 10;
-  seg1.max_doc_id_ = 20;
-  seg1.total_doc_length_ = 100;
+  blocksstable::ObInvSSTableMeta seg1;
+  blocksstable::ObInvIdxStatsMeta seg1_stats;
+  seg1_stats.doc_id_obj_meta_.set_uint64();
+  seg1_stats.index_type_ = blocksstable::INV_IDX_TYPE_FTS;
+  seg1_stats.has_relevance_params_ = true;
+  seg1_stats.min_doc_id_ = 10;
+  seg1_stats.max_doc_id_ = 20;
+  seg1_stats.total_doc_length_ = 100;
+  ASSERT_EQ(OB_SUCCESS, seg1.init(seg1_stats));
 
-  blocksstable::ObInvIdxStatsMeta seg2 = seg1;
-  seg2.min_doc_id_ = 5;
-  seg2.max_doc_id_ = 15;
-  seg2.total_doc_length_ = 50;
+  blocksstable::ObInvSSTableMeta seg2;
+  blocksstable::ObInvIdxStatsMeta seg2_stats = seg1.get_stats();
+  seg2_stats.min_doc_id_ = 5;
+  seg2_stats.max_doc_id_ = 15;
+  seg2_stats.total_doc_length_ = 50;
+  ASSERT_EQ(OB_SUCCESS, seg2.init(seg2_stats));
 
   OK(builder.merge_inv_meta(seg1));
   OK(builder.merge_inv_meta(seg2));
-  const blocksstable::ObInvIdxStatsMeta &agg = builder.get_inv_meta();
+  const blocksstable::ObInvIdxStatsMeta &agg = builder.get_inv_meta().get_stats();
   ASSERT_EQ(5, agg.min_doc_id_);          // min 取全局小
   ASSERT_EQ(20, agg.max_doc_id_);         // max 取全局大
   ASSERT_EQ(150, agg.total_doc_length_);  // total 求和
   ASSERT_TRUE(agg.is_fts_index());        // format 字段保持
 
   // 空段统一使用 is_empty_range() 的 min > max 语义，不污染已聚合结果。
-  blocksstable::ObInvIdxStatsMeta empty = seg1;
-  empty.min_doc_id_ = UINT64_MAX;
-  empty.max_doc_id_ = 0;
-  empty.total_doc_length_ = 0;
-  ASSERT_EQ(UINT64_MAX, empty.min_doc_id_);
-  ASSERT_EQ(0, empty.max_doc_id_);
-  ASSERT_TRUE(empty.is_empty_range());
+  blocksstable::ObInvSSTableMeta empty = seg1;
+  empty.reuse();
+  ASSERT_EQ(UINT64_MAX, empty.get_stats().min_doc_id_);
+  ASSERT_EQ(0, empty.get_stats().max_doc_id_);
+  ASSERT_TRUE(empty.get_stats().is_empty_range());
   OK(builder.merge_inv_meta(empty));
   ASSERT_EQ(5, agg.min_doc_id_);
   ASSERT_EQ(20, agg.max_doc_id_);
   ASSERT_EQ(150, agg.total_doc_length_);
 
   // 溢出饱和为 UINT64_MAX，不能阻断 compaction，min/max 仍须正确聚合。
-  blocksstable::ObInvIdxStatsMeta overflow = seg1;
-  overflow.min_doc_id_ = 1;
-  overflow.max_doc_id_ = 30;
-  overflow.total_doc_length_ = UINT64_MAX;
+  blocksstable::ObInvSSTableMeta overflow;
+  blocksstable::ObInvIdxStatsMeta overflow_stats = seg1.get_stats();
+  overflow_stats.min_doc_id_ = 1;
+  overflow_stats.max_doc_id_ = 30;
+  overflow_stats.total_doc_length_ = UINT64_MAX;
+  OK(overflow.init(overflow_stats));
   ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(overflow));
   ASSERT_EQ(1, agg.min_doc_id_);
   ASSERT_EQ(30, agg.max_doc_id_);
@@ -3413,10 +3454,14 @@ TEST_F(TestInvIdxSSTablePrepare, index_builder_rejects_inconsistent_meta_after_e
   ASSERT_TRUE(empty_fts.is_valid());
   ASSERT_TRUE(empty_fts.is_empty_range());
   ASSERT_TRUE(nested_search.is_valid());
-  OK(builder.merge_inv_meta(empty_fts));
-  ASSERT_EQ(OB_ERR_UNEXPECTED, builder.merge_inv_meta(nested_search));
-  ASSERT_EQ(blocksstable::INV_IDX_TYPE_FTS, builder.get_inv_meta().index_type_);
-  ASSERT_TRUE(builder.get_inv_meta().is_empty_range());
+  blocksstable::ObInvSSTableMeta empty_fts_meta;
+  blocksstable::ObInvSSTableMeta nested_search_meta;
+  OK(empty_fts_meta.init(empty_fts));
+  OK(nested_search_meta.init(nested_search));
+  OK(builder.merge_inv_meta(empty_fts_meta));
+  ASSERT_EQ(OB_ERR_UNEXPECTED, builder.merge_inv_meta(nested_search_meta));
+  ASSERT_EQ(blocksstable::INV_IDX_TYPE_FTS, builder.get_inv_meta().get_stats().index_type_);
+  ASSERT_TRUE(builder.get_inv_meta().get_stats().is_empty_range());
 }
 
 // append_macro_block（整宏复用）后应把 macro_stats_.endkey_ 更新为被复用宏块的
@@ -3446,9 +3491,9 @@ TEST_F(TestInvIdxSSTablePrepare, append_macro_block_updates_reused_macro_endkey)
   // advancing the iterator again.
   OK(iter.next_macro_block());
   ObMacroBlockDesc first_desc;
-  ObInvIdxMacroBlockInvStats first_stats;
+  ObInvMacroMeta first_stats;
   OK(iter.get_macro_block_desc(first_desc));
-  OK(iter.get_curr_macro_inv_stats(first_stats));
+  OK(iter.get_curr_macro_inv_meta(first_stats));
   ObDatumRowkey first_endkey;
   OK(first_desc.macro_meta_->end_key_.deep_copy(first_endkey, allocator_));
 
@@ -3458,9 +3503,9 @@ TEST_F(TestInvIdxSSTablePrepare, append_macro_block_updates_reused_macro_endkey)
 
   OK(iter.next_macro_block());
   ObMacroBlockDesc second_desc;
-  ObInvIdxMacroBlockInvStats second_stats;
+  ObInvMacroMeta second_stats;
   OK(iter.get_macro_block_desc(second_desc));
-  OK(iter.get_curr_macro_inv_stats(second_stats));
+  OK(iter.get_curr_macro_inv_meta(second_stats));
   ASSERT_NE(first_desc.macro_block_id_, second_desc.macro_block_id_);
   ObDatumRowkey second_endkey;
   OK(second_desc.macro_meta_->end_key_.deep_copy(second_endkey, allocator_));
@@ -3486,9 +3531,9 @@ TEST_F(TestInvIdxSSTablePrepare, append_macro_block_rejects_invalid_row_count_be
   OK(iter.next_macro_block());
 
   ObMacroBlockDesc desc;
-  ObInvIdxMacroBlockInvStats stats;
+  ObInvMacroMeta stats;
   OK(iter.get_macro_block_desc(desc));
-  OK(iter.get_curr_macro_inv_stats(stats));
+  OK(iter.get_curr_macro_inv_meta(stats));
   ASSERT_GT(desc.row_count_, 0);
 
   ObInvIdxMacroBlockWriter writer;
@@ -3527,9 +3572,9 @@ TEST_F(TestInvIdxSSTablePrepare, append_macro_block_rejects_extra_endkey_column_
   OK(iter.next_macro_block());
 
   ObMacroBlockDesc desc;
-  ObInvIdxMacroBlockInvStats stats;
+  ObInvMacroMeta stats;
   OK(iter.get_macro_block_desc(desc));
-  OK(iter.get_curr_macro_inv_stats(stats));
+  OK(iter.get_curr_macro_inv_meta(stats));
   ASSERT_NE(nullptr, desc.macro_meta_);
   const int64_t expected_endkey_datum_cnt =
       whole_desc_.get_desc().get_rowkey_column_count();
@@ -3720,7 +3765,7 @@ TEST_F(TestInvIdxSSTablePrepare, reuse_inv_meta_aggregates_across_segments)
   ASSERT_GT(half, 0);
 
   // 段1：前 half 个宏块 → writer_a（模拟 task idx=0）。
-  blocksstable::ObInvIdxStatsMeta meta_a;
+  blocksstable::ObInvSSTableMeta meta_a;
   {
     ObInvIdxMacroBlockWriter writer;
     ObSSTablePrivateObjectCleaner cleaner;
@@ -3735,8 +3780,8 @@ TEST_F(TestInvIdxSSTablePrepare, reuse_inv_meta_aggregates_across_segments)
     while (OB_SUCC(ret) && !iter.is_end() && n < half) {
       ObMacroBlockDesc desc;
       OK(iter.get_macro_block_desc(desc));
-      ObInvIdxMacroBlockInvStats stats;
-      OK(iter.get_curr_macro_inv_stats(stats));
+      ObInvMacroMeta stats;
+      OK(iter.get_curr_macro_inv_meta(stats));
       OK(writer.append_macro_block(desc, stats));
       ++n;
       ret = iter.next_macro_block();
@@ -3749,7 +3794,7 @@ TEST_F(TestInvIdxSSTablePrepare, reuse_inv_meta_aggregates_across_segments)
   ASSERT_TRUE(meta_a.is_valid());
 
   // 段2：剩余宏块 → writer_b（模拟 task idx=1）。
-  blocksstable::ObInvIdxStatsMeta meta_b;
+  blocksstable::ObInvSSTableMeta meta_b;
   {
     ObInvIdxMacroBlockWriter writer;
     ObSSTablePrivateObjectCleaner cleaner;
@@ -3765,8 +3810,8 @@ TEST_F(TestInvIdxSSTablePrepare, reuse_inv_meta_aggregates_across_segments)
       if (n >= half) {
         ObMacroBlockDesc desc;
         OK(iter.get_macro_block_desc(desc));
-        ObInvIdxMacroBlockInvStats stats;
-        OK(iter.get_curr_macro_inv_stats(stats));
+        ObInvMacroMeta stats;
+        OK(iter.get_curr_macro_inv_meta(stats));
         OK(writer.append_macro_block(desc, stats));
       }
       ++n;
@@ -3780,20 +3825,20 @@ TEST_F(TestInvIdxSSTablePrepare, reuse_inv_meta_aggregates_across_segments)
   ASSERT_TRUE(meta_b.is_valid());
 
   // 各段局部统计都严格小于全量 → 直接覆盖（旧行为）必然丢信息。
-  ASSERT_LT(meta_a.total_doc_length_, input.get_inv_meta().total_doc_length_);
-  ASSERT_LT(meta_b.total_doc_length_, input.get_inv_meta().total_doc_length_);
-  ASSERT_EQ(input.get_inv_meta().total_doc_length_,
-      meta_a.total_doc_length_ + meta_b.total_doc_length_);
+  ASSERT_LT(meta_a.get_stats().total_doc_length_, input.get_inv_meta().get_stats().total_doc_length_);
+  ASSERT_LT(meta_b.get_stats().total_doc_length_, input.get_inv_meta().get_stats().total_doc_length_);
+  ASSERT_EQ(input.get_inv_meta().get_stats().total_doc_length_,
+      meta_a.get_stats().total_doc_length_ + meta_b.get_stats().total_doc_length_);
 
   // 生产 close_ 把每个 task 的 partial 交给同一个 index builder，由它作为唯一权威源聚合。
   ObSSTableIndexBuilder agg_builder(false /*use_double_write_buffer*/);
   agg_builder.set_is_async_index(true);
   OK(agg_builder.merge_inv_meta(meta_a));
   OK(agg_builder.merge_inv_meta(meta_b));
-  const blocksstable::ObInvIdxStatsMeta &agg = agg_builder.get_inv_meta();
-  ASSERT_EQ(input.get_inv_meta().min_doc_id_, agg.min_doc_id_);
-  ASSERT_EQ(input.get_inv_meta().max_doc_id_, agg.max_doc_id_);
-  ASSERT_EQ(input.get_inv_meta().total_doc_length_, agg.total_doc_length_);
+  const blocksstable::ObInvIdxStatsMeta &agg = agg_builder.get_inv_meta().get_stats();
+  ASSERT_EQ(input.get_inv_meta().get_stats().min_doc_id_, agg.min_doc_id_);
+  ASSERT_EQ(input.get_inv_meta().get_stats().max_doc_id_, agg.max_doc_id_);
+  ASSERT_EQ(input.get_inv_meta().get_stats().total_doc_length_, agg.total_doc_length_);
 }
 
 } // namespace unittest

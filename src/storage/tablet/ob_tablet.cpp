@@ -7894,7 +7894,7 @@ int ObTablet::aggregate_async_inv_bm25_stats_(
     } else {
       const blocksstable::ObInvSSTable *inv_sstable =
           static_cast<const blocksstable::ObInvSSTable *>(sstable);
-      const blocksstable::ObInvIdxStatsMeta &inv_meta = inv_sstable->get_inv_meta();
+      const blocksstable::ObInvIdxStatsMeta &inv_meta = inv_sstable->get_inv_meta().get_stats();
       if (OB_UNLIKELY(!inv_meta.is_valid())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("invalid inv meta", K(ret), K(inv_meta), KPC(inv_sstable));

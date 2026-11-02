@@ -38,7 +38,7 @@ struct ObInvRangeScanParam;
 //   2. Exposes inverted-index query interfaces (scan_posting, scan_range)
 //   3. Data is single-version (no MVCC), with deletions via external deletion bitmap
 //   4. Macro blocks use AsyncContainerMacroBlock format with typed micro-blocks
-//   5. Carries extended metadata (ObInvIdxStatsMeta) in addition to ObSSTableMeta
+//   5. Carries extended metadata (ObInvSSTableMeta) in addition to ObSSTableMeta
 // =============================================================================
 class ObInvSSTable : public ObSSTable
 {
@@ -116,9 +116,9 @@ public:
   // ---------------- Extended metadata ----------------
   /// Get the inverted-index-specific extended metadata. Returns a reference;
   /// callers check inv_meta.is_valid() to tell whether it has been populated.
-  const ObInvIdxStatsMeta &get_inv_meta() const { return inv_meta_; }
+  const ObInvSSTableMeta &get_inv_meta() const { return inv_meta_; }
   /// Set extended metadata.
-  int set_inv_meta(common::ObArenaAllocator &allocator, const ObInvIdxStatsMeta &inv_meta);
+  int set_inv_meta(const ObInvSSTableMeta &inv_meta);
 
   // ---------------- Serialization / deep copy ----------------
   virtual int64_t get_deep_copy_size() const override;
@@ -140,7 +140,7 @@ public:
   INHERIT_TO_STRING_KV("ObSSTable", ObSSTable, "type", "inv_sstable",
                         K_(inv_meta));
 protected:
-  ObInvIdxStatsMeta inv_meta_; // NOTE: load from disk
+  ObInvSSTableMeta inv_meta_; // NOTE: load from disk
 };
 
 } // namespace blocksstable

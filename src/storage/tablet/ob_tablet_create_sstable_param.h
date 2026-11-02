@@ -63,7 +63,7 @@ public:
                                    const bool is_shared);
 
   static int init_empty_inv_meta(const ObStorageSchema &storage_schema,
-                                 blocksstable::ObInvIdxStatsMeta &inv_meta);
+                                 blocksstable::ObInvSSTableMeta &inv_meta);
 
   // Without checking the validity of the input parameters, necessary to ensure the correctness of the method call.
   int init_for_small_sstable(const blocksstable::ObSSTableMergeRes &res,
@@ -320,7 +320,7 @@ public:
   share::SCN rec_scn_;
   int64_t upper_trans_version_;
   int64_t min_merged_trans_version_;
-  blocksstable::ObInvIdxStatsMeta inv_meta_; // used for inv sstable
+  blocksstable::ObInvSSTableMeta inv_meta_; // used for inv sstable
   share::SCN shared_tablet_meta_scn_;
 };
 

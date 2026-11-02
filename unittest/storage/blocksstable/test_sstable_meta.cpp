@@ -1112,11 +1112,13 @@ TEST_F(TestSSTableMeta, deserialize_rejects_mismatched_sstable_object_type)
       param.is_co_table_without_cgs_ = true;
       table = &co;
     } else if (ObITable::is_inv_sstable(table_type)) {
-      param.inv_meta_.min_doc_id_ = 7;
-      param.inv_meta_.max_doc_id_ = 100;
-      param.inv_meta_.doc_id_obj_meta_.set_uint64();
-      param.inv_meta_.index_type_ = INV_IDX_TYPE_FTS;
-      param.inv_meta_.has_relevance_params_ = true;
+      ObInvIdxStatsMeta stats;
+      stats.min_doc_id_ = 7;
+      stats.max_doc_id_ = 100;
+      stats.doc_id_obj_meta_.set_uint64();
+      stats.index_type_ = INV_IDX_TYPE_FTS;
+      stats.has_relevance_params_ = true;
+      ASSERT_EQ(OB_SUCCESS, param.inv_meta_.init(stats));
       table = &inv;
     }
     ASSERT_EQ(OB_SUCCESS, table->init(param, &allocator_));
@@ -1218,14 +1220,19 @@ TEST_F(TestSSTableMeta, deserialize_rejects_mismatched_sstable_object_type)
         ASSERT_FALSE(decoded_array.at(0)->is_loaded());
         if (table->is_inv_sstable()) {
           const ObInvSSTable *array_inv = static_cast<const ObInvSSTable *>(decoded_array.at(0));
-          ASSERT_EQ(inv.get_inv_meta().min_doc_id_, array_inv->get_inv_meta().min_doc_id_);
-          ASSERT_EQ(inv.get_inv_meta().max_doc_id_, array_inv->get_inv_meta().max_doc_id_);
+          ASSERT_EQ(inv.get_inv_meta().get_stats().min_doc_id_,
+              array_inv->get_inv_meta().get_stats().min_doc_id_);
+          ASSERT_EQ(inv.get_inv_meta().get_stats().max_doc_id_,
+              array_inv->get_inv_meta().get_stats().max_doc_id_);
         }
       }
       if (table->is_inv_sstable()) {
-        ASSERT_EQ(inv.get_inv_meta().min_doc_id_, decoded_inv.get_inv_meta().min_doc_id_);
-        ASSERT_EQ(inv.get_inv_meta().max_doc_id_, decoded_inv.get_inv_meta().max_doc_id_);
-        ASSERT_EQ(inv.get_inv_meta().index_type_, decoded_inv.get_inv_meta().index_type_);
+        ASSERT_EQ(inv.get_inv_meta().get_stats().min_doc_id_,
+            decoded_inv.get_inv_meta().get_stats().min_doc_id_);
+        ASSERT_EQ(inv.get_inv_meta().get_stats().max_doc_id_,
+            decoded_inv.get_inv_meta().get_stats().max_doc_id_);
+        ASSERT_EQ(inv.get_inv_meta().get_stats().index_type_,
+            decoded_inv.get_inv_meta().get_stats().index_type_);
       } else if (table->is_co_sstable()) {
         ASSERT_EQ(co.get_cs_meta().column_group_cnt_, decoded_co.get_cs_meta().column_group_cnt_);
       }

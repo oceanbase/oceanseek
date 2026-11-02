@@ -777,16 +777,19 @@ int ObAsyncIndexCompactionTest::mock_inc_major_sstable_with_meta(
   param.uncommit_tx_info_.push_back(tx_desc);
   param.uncommit_tx_info_.set_info_status_record_seq();
   ObSSTableMergeRes::fill_column_checksum_for_empty_major(param.column_cnt_, param.column_checksums_);
-  param.inv_meta_.reset();
-  param.inv_meta_.index_type_ = INV_IDX_TYPE_FTS;
-  param.inv_meta_.has_relevance_params_ = true;
-  param.inv_meta_.has_position_list_ = false;
-  param.inv_meta_.has_nested_key_ = false;
-  param.inv_meta_.doc_id_obj_meta_.set_uint64();
-  param.inv_meta_.min_doc_id_ = common::OB_INVALID_ID;
-  param.inv_meta_.max_doc_id_ = 0;
-  if (OB_ISNULL(buf = allocator_.alloc(sizeof(ObInvSSTable)))) {
+  ObInvIdxStatsMeta inv_stats;
+  inv_stats.index_type_ = INV_IDX_TYPE_FTS;
+  inv_stats.has_relevance_params_ = true;
+  inv_stats.has_position_list_ = false;
+  inv_stats.has_nested_key_ = false;
+  inv_stats.doc_id_obj_meta_.set_uint64();
+  inv_stats.min_doc_id_ = common::OB_INVALID_ID;
+  inv_stats.max_doc_id_ = 0;
+  if (OB_FAIL(param.inv_meta_.init(inv_stats))) {
+    LOG_WARN("failed to initialize inverted sstable metadata", K(ret));
+  } else if (OB_ISNULL(buf = allocator_.alloc(sizeof(ObInvSSTable)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate sstable", K(ret));
   } else if (OB_ISNULL(sstable = new (buf) ObInvSSTable())) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else if (OB_FAIL(sstable->init(param, &allocator_))) {
