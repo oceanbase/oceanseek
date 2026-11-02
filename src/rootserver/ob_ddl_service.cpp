@@ -8403,6 +8403,7 @@ int ObDDLService::alter_table_index(obrpc::ObAlterTableArg &alter_table_arg,
                                                                       trans))) {
                   LOG_WARN("fail to persist async index table options", K(ret), K(new_table_schema));
                 } else if (OB_FAIL(ddl_operator.alter_table_create_index(new_table_schema,
+                                                                        origin_table_schema,
                                                                         gen_columns,
                                                                         index_schema,
                                                                         trans,
@@ -23163,14 +23164,40 @@ int ObDDLService::add_new_index_schema(obrpc::ObAlterTableArg &alter_table_arg,
                     LOG_WARN("failed to add new index id!", K(ret));
                   } else {
                     // add new function index should add additional SYS_NC column into data table.
+                    // Generated columns and the hidden table's history row share one schema version,
+                    // so unique check at the later index version can see the columns.
                     new_table_schema.set_in_offline_ddl_white_list(true);
-                    for (int64_t i = 0; OB_SUCC(ret) && i < gen_columns.count(); ++i) {
-                      ObColumnSchemaV2 *new_column_schema = gen_columns.at(i);
-                      if (OB_ISNULL(new_column_schema)) {
-                        ret = OB_ERR_UNEXPECTED;
-                        LOG_WARN("new column schema is null");
-                      } else if (OB_FAIL(ddl_operator.insert_single_column(trans, new_table_schema, *new_column_schema))) {
-                        LOG_WARN("failed to create table schema, ", K(ret));
+                    if (!gen_columns.empty()) {
+                      int64_t gen_column_schema_version = OB_INVALID_VERSION;
+                      if (OB_FAIL(schema_service_->gen_new_schema_version(
+                              new_table_schema.get_tenant_id(), gen_column_schema_version))) {
+                        LOG_WARN("fail to gen new schema_version for generated columns", K(ret),
+                                 K(new_table_schema.get_tenant_id()));
+                      } else {
+                        for (int64_t j = 0; OB_SUCC(ret) && j < gen_columns.count(); ++j) {
+                          ObColumnSchemaV2 *new_column_schema = gen_columns.at(j);
+                          if (OB_ISNULL(new_column_schema)) {
+                            ret = OB_ERR_UNEXPECTED;
+                            LOG_WARN("new column schema is null", K(ret));
+                          } else if (FALSE_IT(new_column_schema->set_schema_version(gen_column_schema_version))) {
+                          } else if (OB_FAIL(schema_service->get_table_sql_service().insert_single_column(
+                                     trans, new_table_schema, *new_column_schema, false/*record_ddl_operation*/))) {
+                            LOG_WARN("failed to insert generated column", K(ret));
+                          }
+                        }
+                        if (OB_SUCC(ret)) {
+                          HEAP_VAR(ObTableSchema, base_table_schema) {
+                            if (OB_FAIL(base_table_schema.assign(new_table_schema))) {
+                              LOG_WARN("fail to assign base table schema", K(ret));
+                            } else if (FALSE_IT(base_table_schema.set_schema_version(gen_column_schema_version))) {
+                            } else if (OB_FAIL(schema_service->get_table_sql_service().update_table_options(
+                                       trans, new_table_schema, base_table_schema, OB_DDL_ALTER_TABLE))) {
+                              LOG_WARN("fail to update hidden table options with generated columns", K(ret));
+                            } else {
+                              new_table_schema.set_schema_version(gen_column_schema_version);
+                            }
+                          }
+                        }
                       }
                     }
                   }

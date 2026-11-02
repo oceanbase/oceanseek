@@ -3420,6 +3420,7 @@ int ObDDLOperator::delete_single_column(ObMySQLTransaction &trans,
 }
 
 int ObDDLOperator::alter_table_create_index(const share::schema::ObTableSchema &new_table_schema,
+                                            const share::schema::ObTableSchema &orig_table_schema,
                                             common::ObIArray<share::schema::ObColumnSchemaV2*> &gen_columns,
                                             share::schema::ObTableSchema &index_schema,
                                             common::ObMySQLTransaction &trans,
@@ -3457,14 +3458,35 @@ int ObDDLOperator::alter_table_create_index(const share::schema::ObTableSchema &
           }
         }
       } else {
-        // First increase internal generated column, and then create an index on the column
-        for (int64_t i = 0; OB_SUCC(ret) && i < gen_columns.count(); ++i) {
-          ObColumnSchemaV2 *new_column_schema = gen_columns.at(i);
-          if (OB_ISNULL(new_column_schema)) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("new column schema is null");
-          } else if (OB_FAIL(insert_single_column(trans, new_table_schema, *new_column_schema))) {
-            LOG_WARN("failed to create table schema, ", K(ret));
+        // First increase internal generated column, and then create an index on the column.
+        // All generated columns and the base table's history row share one schema version (V1),
+        // so that the base table has a __all_table_history record at V1 which covers the generated
+        // columns. Otherwise the on-demand schema resolver at the index task version cannot see them.
+        int64_t gen_column_schema_version = OB_INVALID_VERSION;
+        if (OB_FAIL(schema_service_.gen_new_schema_version(tenant_id, gen_column_schema_version))) {
+          LOG_WARN("fail to gen new schema_version for generated columns", K(ret), K(tenant_id));
+        } else {
+          for (int64_t i = 0; OB_SUCC(ret) && i < gen_columns.count(); ++i) {
+            ObColumnSchemaV2 *new_column_schema = gen_columns.at(i);
+            if (OB_ISNULL(new_column_schema)) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("new column schema is null", K(ret));
+            } else if (FALSE_IT(new_column_schema->set_schema_version(gen_column_schema_version))) {
+            } else if (OB_FAIL(schema_service->get_table_sql_service().insert_single_column(
+                       trans, new_table_schema, *new_column_schema, false/*record_ddl_operation*/))) {
+              LOG_WARN("failed to insert generated column", K(ret));
+            }
+          }
+          if (OB_SUCC(ret)) {
+            HEAP_VAR(ObTableSchema, base_table_schema) {
+              if (OB_FAIL(base_table_schema.assign(new_table_schema))) {
+                LOG_WARN("fail to assign base table schema", K(ret));
+              } else if (FALSE_IT(base_table_schema.set_schema_version(gen_column_schema_version))) {
+              } else if (OB_FAIL(schema_service->get_table_sql_service().update_table_options(
+                         trans, orig_table_schema, base_table_schema, OB_DDL_ALTER_TABLE))) {
+                LOG_WARN("fail to update base table options with generated columns", K(ret));
+              }
+            }
           }
         }
         if (OB_SUCC(ret)) {
