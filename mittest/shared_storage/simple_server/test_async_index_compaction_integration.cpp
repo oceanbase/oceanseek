@@ -6,7 +6,6 @@
 /**
  * 集成组用例目录（按源码定义顺序；搜索完整用例名可定位实现）
  * 范围：DAG 提交与完成状态校验、真实合并执行、refresh、删除过滤、LOB、回收站及 GC。
- * 共 45 个测试定义，展开后仍为 45 个 case：44 个启用，1 个原有 DISABLED。
  * 前 4 项属于 AsyncIndexMergeWaitTest，模拟提交/完成结果，不提交真实 DAG。
  * 其余默认 fixture 为 ObAsyncIndexCompactionTest。最后一项属于
  * ObAsyncIndexDestructiveGCTest，参数 Values(true) 只展开为 /0；它推进租户 GC
@@ -100,7 +99,12 @@
  *     回收站表仍可枚举刷新依赖，保留禁用定时刷新的间隔参数。
  * 44. recycled_async_indexes_refresh_and_flashback
  *     回收站内完成后台增量刷新，验证 FLASHBACK 后索引结果以及 PURGE 后不再枚举。
- * 45. scalar_tablets_keep_async_published_snapshot
+ * 45. async_index_refresh_build_id_context_changes_on_retry
+ *     同一 refresh task ID 的临时上下文释放并重新注册后，可查询到不同 build ID；拒绝无效 build ID。
+ * 46. async_index_refresh_build_id_namespaces_macro_blocks
+ *     相同 task ID 和 snapshot 下用不同 build ID 隔离数据、元数据及 linked-block 对象 ID；
+ *     校验删除索引 writer 参数及非异步路径的回退行为。
+ * 47. scalar_tablets_keep_async_published_snapshot
  *     [破坏性 GC 参数化] 检查主表、本地索引、GLOBAL LOCAL STORAGE 索引（含普通/唯一）、堆表主键、search data 和 LOB meta/piece tablet 在 GC 后仍保留异步查询发布快照。
  */
 #include <atomic>
@@ -111,6 +115,14 @@
 #include "rootserver/freeze/ob_major_merge_info_manager.h"
 #include "share/ob_all_server_tracer.h"
 #include "storage/blocksstable/async_index/ob_inv_idx_macro_block_iterator.h"
+#include "storage/ddl/ob_async_index_macro_writer.h"
+#include "storage/ddl/ob_ddl_independent_dag.h"
+#include "storage/ddl/ob_writer_args_struct.h"
+#include "storage/ob_common_id_utils.h"
+#include "storage/slog_ckpt/ob_linked_macro_block_struct.h"
+#include "storage/tablet/ob_tablet_persist_common.h"
+#include "storage/tx/ob_trans_define_v4.h"
+#include "share/ob_ddl_common.h"
 
 const char *get_per_file_test_name()
 {
@@ -6130,6 +6142,579 @@ TEST_F(ObAsyncIndexCompactionTest, recycled_async_indexes_refresh_and_flashback)
   for (int64_t i = 0; i < data_table_ids.count(); ++i) {
     ASSERT_NE(data_table_id, data_table_ids.at(i));
   }
+}
+
+namespace
+{
+class TestAsyncIndexRefreshDag final : public ObDDLIndependentDag
+{
+public:
+  TestAsyncIndexRefreshDag() : ObDDLIndependentDag() {}
+  virtual ~TestAsyncIndexRefreshDag() {}
+
+  void prepare(const int64_t ddl_task_id,
+               const int64_t ddl_build_id,
+               const bool is_async_index_refresh)
+  {
+    is_inc_major_log_ = true;
+    ddl_task_param_.ddl_task_id_ = ddl_task_id;
+    ddl_task_param_.ddl_build_id_ = ddl_build_id;
+    ddl_task_param_.is_async_index_refresh_ = is_async_index_refresh;
+  }
+
+  bool is_scan_finished() override { return true; }
+};
+
+int build_refresh_macro_blocks(
+    const ObLSID &ls_id,
+    const ObTabletID &tablet_id,
+    ObStorageSchema &storage_schema,
+    const ObInvIdxRowDesc &row_desc,
+    const int64_t snapshot_version,
+    const int64_t ddl_task_id,
+    const int64_t ddl_build_id,
+    const bool is_async_index_refresh,
+    const uint64_t start_doc_id,
+    ObAsyncIndexMacroWriterAdapter &adapter,
+    ObIArray<MacroBlockId> &data_macro_ids,
+    ObIArray<MacroBlockId> &meta_macro_ids,
+    int64_t &desc_op_id)
+{
+  int ret = OB_SUCCESS;
+  const int64_t row_cnt = 2000;
+  TestAsyncIndexRefreshDag dag;
+  ObWriteMacroParam param;
+  ObMacroSeqParam macro_seq_param;
+  ObPreWarmerParam pre_warm_param(PRE_WARM_TYPE_NONE);
+  ObDatumRow row;
+  ObISSTableObjectCleaner *object_cleaner = nullptr;
+  char pos_list_buf[8];
+  desc_op_id = 0;
+  dag.prepare(ddl_task_id, ddl_build_id, is_async_index_refresh);
+  param.ls_id_ = ls_id;
+  param.tablet_id_ = tablet_id;
+  param.tenant_data_version_ = DATA_CURRENT_VERSION;
+  param.schema_version_ = storage_schema.get_schema_version();
+  param.snapshot_version_ = snapshot_version;
+  param.task_id_ = ddl_task_id;
+  param.tablet_param_.storage_schema_ = &storage_schema;
+  param.tablet_param_.is_micro_index_clustered_ = true;
+  param.tablet_param_.reorganization_scn_ = SCN::min_scn();
+  param.ddl_dag_ = &dag;
+  adapter.tablet_id_ = tablet_id;
+  adapter.cg_idx_ = 0;
+  adapter.parallel_idx_ = 0;
+  if (OB_FAIL(adapter.prepare_data_store_desc(param, row_desc))) {
+    LOG_WARN("failed to prepare async index data store desc", KR(ret), K(param));
+  } else if (FALSE_IT(desc_op_id = adapter.data_desc_.get_desc().get_op_id())) {
+  } else if (OB_FAIL(ObISSTableObjectCleaner::get_cleaner_from_data_store_desc(
+                 adapter.data_desc_.get_desc(), object_cleaner))) {
+    LOG_WARN("failed to get async index object cleaner", KR(ret));
+  } else if (OB_ISNULL(object_cleaner)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("async index object cleaner is null", KR(ret));
+  } else {
+    adapter.object_cleaner_ = object_cleaner;
+    macro_seq_param.seq_type_ = ObMacroSeqParam::SEQ_TYPE_INC;
+    macro_seq_param.start_ = 0;
+    macro_seq_param.interval_ = 1;
+    macro_seq_param.step_ = 1;
+    if (OB_FAIL(adapter.inv_writer_.open(
+            row_desc,
+            adapter.data_desc_.get_desc(),
+            0 /*parallel_idx*/,
+            macro_seq_param,
+            pre_warm_param,
+            *object_cleaner,
+            nullptr /*callback*/))) {
+      LOG_WARN("failed to open async index macro writer", KR(ret), K(tablet_id));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    const int64_t mv_col_cnt = adapter.data_desc_.get_desc().get_row_column_count();
+    MEMSET(pos_list_buf, 'p', sizeof(pos_list_buf));
+    const ObString pos_list(static_cast<int32_t>(sizeof(pos_list_buf)), pos_list_buf);
+    if (OB_FAIL(row.init(mv_col_cnt))) {
+      LOG_WARN("failed to init async index test row", KR(ret), K(mv_col_cnt));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < row_cnt; ++i) {
+      const uint64_t doc_id = start_doc_id + static_cast<uint64_t>(i);
+      char term_buf[32];
+      const int term_len = snprintf(term_buf, sizeof(term_buf), "term%010lu", doc_id);
+      const ObString term(term_len, term_buf);
+      if (OB_FAIL(make_single_inv_idx_row(
+              row, row_desc, mv_col_cnt, term, doc_id,
+              1 /*token_freq*/, 100 /*doc_length*/, pos_list))) {
+        LOG_WARN("failed to build async index test row", KR(ret), K(i), K(doc_id));
+      } else if (OB_FAIL(adapter.inv_writer_.append_row(row))) {
+        LOG_WARN("failed to append async index test row", KR(ret), K(i), K(doc_id));
+      }
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(adapter.inv_writer_.close())) {
+    LOG_WARN("failed to close async index macro writer", KR(ret), K(tablet_id));
+  }
+  if (OB_SUCC(ret)) {
+    // Read the IDs before closing the outer SSTable builder so its cleaner
+    // reclaims these unlinked test objects when the adapter is destroyed.
+    ObInvIdxIndexBlockBuilder &index_builder = adapter.inv_writer_.index_block_builder_;
+    ObIndexTreeRootCtx *root_ctx = index_builder.index_tree_root_ctx_;
+    if (OB_ISNULL(root_ctx)
+        || OB_ISNULL(root_ctx->data_write_ctx_)
+        || OB_ISNULL(root_ctx->clustered_index_write_ctx_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("async index write context is null", KR(ret), KP(root_ctx));
+    } else if (OB_FAIL(root_ctx->data_write_ctx_->get_macro_id_array(data_macro_ids))) {
+      LOG_WARN("failed to get async index data macro ids", KR(ret));
+    } else if (OB_FAIL(root_ctx->clustered_index_write_ctx_->get_macro_id_array(meta_macro_ids))) {
+      LOG_WARN("failed to get async index meta macro ids", KR(ret));
+    }
+  }
+  return ret;
+}
+
+void assert_refresh_macro_ids(
+    const ObIArray<MacroBlockId> &data_macro_ids,
+    const ObIArray<MacroBlockId> &meta_macro_ids,
+    const int64_t expected_fourth_id)
+{
+  ASSERT_GT(data_macro_ids.count(), 0);
+  ASSERT_GT(meta_macro_ids.count(), 0);
+  for (int64_t i = 0; i < data_macro_ids.count(); ++i) {
+    const MacroBlockId &macro_id = data_macro_ids.at(i);
+    EXPECT_EQ(ObStorageObjectType::SHARED_INC_MAJOR_DATA_MACRO,
+              macro_id.storage_object_type());
+    EXPECT_EQ(expected_fourth_id, macro_id.fourth_id());
+  }
+  for (int64_t i = 0; i < meta_macro_ids.count(); ++i) {
+    const MacroBlockId &macro_id = meta_macro_ids.at(i);
+    EXPECT_EQ(ObStorageObjectType::SHARED_INC_MAJOR_META_MACRO,
+              macro_id.storage_object_type());
+    EXPECT_EQ(expected_fourth_id, macro_id.fourth_id());
+  }
+}
+
+void assert_macro_id_sets_disjoint(
+    const ObIArray<MacroBlockId> &first,
+    const ObIArray<MacroBlockId> &second)
+{
+  for (int64_t i = 0; i < first.count(); ++i) {
+    for (int64_t j = 0; j < second.count(); ++j) {
+      EXPECT_NE(first.at(i), second.at(j));
+    }
+  }
+}
+
+#ifdef ERRSIM
+int build_linked_block_test_sstable(
+    const ObTabletID &tablet_id,
+    const ObTableSchema &table_schema,
+    const int64_t snapshot_version,
+    ObArenaAllocator &allocator,
+    ObSSTable &sstable)
+{
+  int ret = OB_SUCCESS;
+  ObTabletCreateSSTableParam param;
+  MacroBlockId data_block_id(MacroBlockId::DEFAULT_FIRST_ID, 10000, 0, 0, 0);
+  TestTabletHelper::prepare_sstable_param(tablet_id, table_schema, param);
+  param.table_key_.version_range_.snapshot_version_ = snapshot_version;
+  param.max_merged_trans_version_ = snapshot_version;
+  param.data_blocks_cnt_ = 1;
+  param.micro_block_cnt_ = 1;
+  param.row_count_ = 1;
+  param.occupy_size_ = OB_DEFAULT_MACRO_BLOCK_SIZE;
+  param.original_size_ = OB_DEFAULT_MACRO_BLOCK_SIZE;
+  if (OB_FAIL(param.data_block_ids_.push_back(data_block_id))) {
+    LOG_WARN("failed to add linked-block test data macro id", KR(ret), K(data_block_id));
+  } else if (OB_FAIL(sstable.init(param, &allocator))) {
+    LOG_WARN("failed to initialize linked-block test sstable", KR(ret), K(param));
+  }
+  return ret;
+}
+#endif
+} // namespace
+
+TEST_F(ObAsyncIndexCompactionTest, async_index_refresh_build_id_context_changes_on_retry)
+{
+  share::ObTenantSwitchGuard tguard;
+  OK(tguard.switch_to(run_ctx_.tenant_id_));
+  ObAsyncIndexService *service = MTL(ObAsyncIndexService *);
+  ASSERT_NE(nullptr, service);
+
+  share::ObCommonID task_common_id;
+  share::ObCommonID first_build_common_id;
+  share::ObCommonID second_build_common_id;
+  ASSERT_EQ(OB_SUCCESS, ObCommonIDUtils::gen_unique_id(MTL_ID(), task_common_id));
+  ASSERT_EQ(OB_SUCCESS, ObCommonIDUtils::gen_unique_id(MTL_ID(), first_build_common_id));
+  ASSERT_EQ(OB_SUCCESS, ObCommonIDUtils::gen_unique_id(MTL_ID(), second_build_common_id));
+  const int64_t task_id = task_common_id.id();
+  const int64_t first_build_id = first_build_common_id.id();
+  const int64_t second_build_id = second_build_common_id.id();
+  const SCN start_scn = SCN::min_scn();
+  const int64_t snapshot_version = 1000000;
+  const int64_t schema_version = 1;
+  int64_t observed_build_id = 0;
+  ASSERT_GT(task_id, 0);
+  ASSERT_GT(first_build_id, 0);
+  ASSERT_GT(second_build_id, 0);
+  ASSERT_NE(first_build_id, second_build_id);
+  ASSERT_NE(task_id, first_build_id);
+  ASSERT_NE(task_id, second_build_id);
+
+  EXPECT_EQ(OB_INVALID_ARGUMENT, service->register_refresh_versions(
+      task_id, start_scn, snapshot_version, schema_version, 0 /*ddl_build_id*/));
+  ASSERT_EQ(OB_SUCCESS, service->register_refresh_versions(
+      task_id, start_scn, snapshot_version, schema_version, first_build_id));
+  DEFER(service->release_refresh_versions(task_id));
+  ASSERT_EQ(OB_SUCCESS, service->get_inner_sql_ddl_build_id(task_id, observed_build_id));
+  EXPECT_EQ(first_build_id, observed_build_id);
+
+  ASSERT_EQ(OB_SUCCESS, service->release_refresh_versions(task_id));
+  ASSERT_EQ(OB_SUCCESS, service->register_refresh_versions(
+      task_id, start_scn, snapshot_version, schema_version, second_build_id));
+  observed_build_id = 0;
+  ASSERT_EQ(OB_SUCCESS, service->get_inner_sql_ddl_build_id(task_id, observed_build_id));
+  EXPECT_EQ(second_build_id, observed_build_id);
+}
+
+TEST_F(ObAsyncIndexCompactionTest, async_index_refresh_build_id_namespaces_macro_blocks)
+{
+  share::ObTenantSwitchGuard tguard;
+  OK(tguard.switch_to(run_ctx_.tenant_id_));
+  exe_prepare_sql();
+
+  const char *table_name = "t_async_refresh_macro_id";
+  create_async_fts_table(table_name);
+  MultiAsyncIndexTabletCtx ctx;
+  resolve_multi_async_index_tablet_ctx_for_refresh(table_name, ctx);
+  ASSERT_EQ(1, ctx.fts_index_tablet_ids_.count());
+  ASSERT_NO_FATAL_FAILURE(disable_and_drain_async_index_refresh());
+
+  ObLSHandle ls_handle;
+  ObTabletHandle tablet_handle;
+  ObTabletHandle delete_tablet_handle;
+  ObStorageSchema *storage_schema = nullptr;
+  ObStorageSchema *delete_storage_schema = nullptr;
+  ObSchemaGetterGuard schema_guard;
+  const ObTableSchema *index_schema = nullptr;
+  const ObTableSchema *data_table_schema = nullptr;
+  ObInvIdxRowDesc row_desc;
+  ASSERT_EQ(OB_SUCCESS, get_ls_handle(ctx.ls_id_, ls_handle));
+  ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(
+      ctx.fts_index_tablet_ids_.at(0), tablet_handle));
+  ASSERT_EQ(OB_SUCCESS, tablet_handle.get_obj()->load_storage_schema(
+      allocator_, storage_schema));
+  ASSERT_NE(nullptr, storage_schema);
+  ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(
+      ctx.delete_index_tablet_id_, delete_tablet_handle));
+  ASSERT_EQ(OB_SUCCESS, delete_tablet_handle.get_obj()->load_storage_schema(
+      allocator_, delete_storage_schema));
+  ASSERT_NE(nullptr, delete_storage_schema);
+  ASSERT_EQ(INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL, delete_storage_schema->get_index_type());
+  ASSERT_EQ(OB_SUCCESS, get_inv_idx_and_data_table_schema(
+      ctx.fts_index_tablet_ids_.at(0),
+      tablet_handle.get_obj()->get_data_tablet_id(),
+      storage_schema->get_schema_version(),
+      schema_guard,
+      index_schema,
+      data_table_schema));
+  ASSERT_NE(nullptr, index_schema);
+  ASSERT_NE(nullptr, data_table_schema);
+  ASSERT_EQ(OB_SUCCESS, row_desc.init(*index_schema, *data_table_schema));
+
+  share::ObCommonID first_common_id;
+  share::ObCommonID second_common_id;
+  share::ObCommonID first_build_common_id;
+  share::ObCommonID second_build_common_id;
+  ASSERT_EQ(OB_SUCCESS, ObCommonIDUtils::gen_unique_id(MTL_ID(), first_common_id));
+  ASSERT_EQ(OB_SUCCESS, ObCommonIDUtils::gen_unique_id(MTL_ID(), second_common_id));
+  ASSERT_EQ(OB_SUCCESS, ObCommonIDUtils::gen_unique_id(MTL_ID(), first_build_common_id));
+  ASSERT_EQ(OB_SUCCESS, ObCommonIDUtils::gen_unique_id(MTL_ID(), second_build_common_id));
+  const int64_t first_task_id = first_common_id.id();
+  const int64_t second_task_id = second_common_id.id();
+  const int64_t first_build_id = first_build_common_id.id();
+  const int64_t second_build_id = second_build_common_id.id();
+  const int64_t snapshot_version = 1000000;
+  ASSERT_GT(first_task_id, 0);
+  ASSERT_GT(second_task_id, 0);
+  ASSERT_GT(first_build_id, 0);
+  ASSERT_GT(second_build_id, 0);
+  ASSERT_NE(first_task_id, second_task_id);
+  ASSERT_NE(first_build_id, second_build_id);
+  ASSERT_NE(first_task_id, first_build_id);
+  ASSERT_NE(first_task_id, second_build_id);
+  ASSERT_NE(snapshot_version, first_build_id);
+  ASSERT_NE(snapshot_version, second_build_id);
+
+  ObAsyncIndexMacroWriterAdapter first_adapter;
+  ObAsyncIndexMacroWriterAdapter second_adapter;
+  ObAsyncIndexMacroWriterAdapter fallback_adapter;
+  ObSEArray<MacroBlockId, 8> first_data_ids;
+  ObSEArray<MacroBlockId, 8> first_meta_ids;
+  ObSEArray<MacroBlockId, 8> second_data_ids;
+  ObSEArray<MacroBlockId, 8> second_meta_ids;
+  ObSEArray<MacroBlockId, 8> fallback_data_ids;
+  ObSEArray<MacroBlockId, 8> fallback_meta_ids;
+  int64_t first_desc_op_id = 0;
+  int64_t second_desc_op_id = 0;
+  int64_t fallback_desc_op_id = -1;
+  ASSERT_EQ(OB_SUCCESS, build_refresh_macro_blocks(
+      ctx.ls_id_, ctx.fts_index_tablet_ids_.at(0), *storage_schema, row_desc,
+      snapshot_version, first_task_id, first_build_id, true /*is_async_index_refresh*/,
+      1 /*start_doc_id*/, first_adapter, first_data_ids, first_meta_ids,
+      first_desc_op_id));
+  ASSERT_EQ(OB_SUCCESS, build_refresh_macro_blocks(
+      ctx.ls_id_, ctx.fts_index_tablet_ids_.at(0), *storage_schema, row_desc,
+      snapshot_version, first_task_id, second_build_id, true /*is_async_index_refresh*/,
+      1000001 /*start_doc_id*/, second_adapter, second_data_ids, second_meta_ids,
+      second_desc_op_id));
+  ASSERT_EQ(OB_SUCCESS, build_refresh_macro_blocks(
+      ctx.ls_id_, ctx.fts_index_tablet_ids_.at(0), *storage_schema, row_desc,
+      snapshot_version, first_task_id, 0 /*ddl_build_id*/, false /*is_async_index_refresh*/,
+      2000001 /*start_doc_id*/, fallback_adapter, fallback_data_ids,
+      fallback_meta_ids, fallback_desc_op_id));
+
+  EXPECT_EQ(first_build_id, first_desc_op_id);
+  EXPECT_EQ(second_build_id, second_desc_op_id);
+  EXPECT_EQ(0, fallback_desc_op_id);
+  ASSERT_NO_FATAL_FAILURE(assert_refresh_macro_ids(
+      first_data_ids, first_meta_ids, first_build_id));
+  ASSERT_NO_FATAL_FAILURE(assert_refresh_macro_ids(
+      second_data_ids, second_meta_ids, second_build_id));
+  ASSERT_NO_FATAL_FAILURE(assert_refresh_macro_ids(
+      fallback_data_ids, fallback_meta_ids, snapshot_version));
+  ASSERT_NO_FATAL_FAILURE(assert_macro_id_sets_disjoint(first_data_ids, second_data_ids));
+  ASSERT_NO_FATAL_FAILURE(assert_macro_id_sets_disjoint(first_meta_ids, second_meta_ids));
+
+  const SCN reorganization_scn = SCN::min_scn();
+  ObTabletPersisterParam refresh_persist_param(
+      DATA_CURRENT_VERSION,
+      ctx.ls_id_,
+      ctx.fts_index_tablet_ids_.at(0),
+      0 /*private_transfer_epoch*/,
+      snapshot_version,
+      0 /*start_macro_seq*/,
+      nullptr /*ddl_redo_callback*/,
+      nullptr /*ddl_finish_callback*/,
+      true /*is_inc_major_shared_object*/,
+      reorganization_scn,
+      first_build_id);
+  ObStorageObjectOpt refresh_start_opt;
+  ASSERT_TRUE(refresh_persist_param.is_valid());
+  EXPECT_EQ(first_build_id, refresh_persist_param.inc_major_ddl_block_op_id_);
+  EXPECT_EQ(first_build_id, refresh_persist_param.get_inc_major_ddl_block_op_id());
+  ASSERT_EQ(OB_SUCCESS, ObTabletPersistCommon::build_async_write_start_opt(
+      refresh_persist_param, 0 /*cur_macro_seq*/, refresh_start_opt));
+  EXPECT_EQ(ObStorageObjectType::SHARED_INC_MAJOR_META_MACRO,
+            refresh_start_opt.object_type_);
+  EXPECT_EQ(first_build_id, refresh_start_opt.ss_share_opt_.fourth_id_);
+
+  ObTabletPersisterParam fallback_persist_param(
+      DATA_CURRENT_VERSION,
+      ctx.ls_id_,
+      ctx.fts_index_tablet_ids_.at(0),
+      0 /*private_transfer_epoch*/,
+      snapshot_version,
+      0 /*start_macro_seq*/,
+      nullptr /*ddl_redo_callback*/,
+      nullptr /*ddl_finish_callback*/,
+      true /*is_inc_major_shared_object*/,
+      reorganization_scn);
+  ObStorageObjectOpt fallback_start_opt;
+  ASSERT_TRUE(fallback_persist_param.is_valid());
+  EXPECT_EQ(0, fallback_persist_param.inc_major_ddl_block_op_id_);
+  EXPECT_EQ(snapshot_version, fallback_persist_param.get_inc_major_ddl_block_op_id());
+  ASSERT_EQ(OB_SUCCESS, ObTabletPersistCommon::build_async_write_start_opt(
+      fallback_persist_param, 0 /*cur_macro_seq*/, fallback_start_opt));
+  EXPECT_EQ(ObStorageObjectType::SHARED_INC_MAJOR_META_MACRO,
+            fallback_start_opt.object_type_);
+  EXPECT_EQ(snapshot_version, fallback_start_opt.ss_share_opt_.fourth_id_);
+
+  ObLinkedMacroInfoWriteParam first_linked_param;
+  ObLinkedMacroInfoWriteParam second_linked_param;
+  ObLinkedMacroInfoWriteParam fallback_linked_param;
+  ASSERT_EQ(OB_SUCCESS, first_linked_param.build_linked_marco_info_param(
+      refresh_persist_param, 0 /*cur_macro_seq*/));
+  EXPECT_EQ(ObLinkedMacroBlockWriteType::SHARED_INC_MAJOR_MACRO_INFO,
+            first_linked_param.type_);
+  EXPECT_EQ(first_build_id, first_linked_param.fourth_id_);
+  ObTabletPersisterParam second_refresh_persist_param(
+      DATA_CURRENT_VERSION,
+      ctx.ls_id_,
+      ctx.fts_index_tablet_ids_.at(0),
+      0 /*private_transfer_epoch*/,
+      snapshot_version,
+      0 /*start_macro_seq*/,
+      nullptr /*ddl_redo_callback*/,
+      nullptr /*ddl_finish_callback*/,
+      true /*is_inc_major_shared_object*/,
+      reorganization_scn,
+      second_build_id);
+  ASSERT_EQ(OB_SUCCESS, second_linked_param.build_linked_marco_info_param(
+      second_refresh_persist_param, 0 /*cur_macro_seq*/));
+  EXPECT_EQ(second_build_id, second_linked_param.fourth_id_);
+  EXPECT_NE(first_linked_param.fourth_id_, second_linked_param.fourth_id_);
+  ASSERT_EQ(OB_SUCCESS, fallback_linked_param.build_linked_marco_info_param(
+      fallback_persist_param, 0 /*cur_macro_seq*/));
+  EXPECT_EQ(snapshot_version, fallback_linked_param.fourth_id_);
+
+#ifdef ERRSIM
+  const int64_t saved_macro_ids_threshold = GCONF.errsim_storage_meta_macro_ids_threshold;
+  DEFER(GCONF.errsim_storage_meta_macro_ids_threshold = saved_macro_ids_threshold);
+  GCONF.errsim_storage_meta_macro_ids_threshold = 1;
+  ObSSTable first_linked_sstable;
+  ObSSTable second_linked_sstable;
+  ASSERT_EQ(OB_SUCCESS, build_linked_block_test_sstable(
+      ctx.data_tablet_id_, *data_table_schema, snapshot_version,
+      allocator_, first_linked_sstable));
+  ASSERT_EQ(OB_SUCCESS, build_linked_block_test_sstable(
+      ctx.data_tablet_id_, *data_table_schema, snapshot_version,
+      allocator_, second_linked_sstable));
+  ObTabletPersisterParam first_linked_persist_param(
+      DATA_CURRENT_VERSION,
+      ctx.ls_id_,
+      ctx.data_tablet_id_,
+      0 /*private_transfer_epoch*/,
+      snapshot_version,
+      0 /*start_macro_seq*/,
+      nullptr /*ddl_redo_callback*/,
+      nullptr /*ddl_finish_callback*/,
+      true /*is_inc_major_shared_object*/,
+      reorganization_scn,
+      first_build_id);
+  ObTabletPersisterParam second_linked_persist_param(
+      DATA_CURRENT_VERSION,
+      ctx.ls_id_,
+      ctx.data_tablet_id_,
+      0 /*private_transfer_epoch*/,
+      snapshot_version,
+      0 /*start_macro_seq*/,
+      nullptr /*ddl_redo_callback*/,
+      nullptr /*ddl_finish_callback*/,
+      true /*is_inc_major_shared_object*/,
+      reorganization_scn,
+      second_build_id);
+  ObLinkedMacroInfoWriteParam first_threshold_linked_param;
+  ObLinkedMacroInfoWriteParam second_threshold_linked_param;
+  ASSERT_EQ(OB_SUCCESS, first_threshold_linked_param.build_linked_marco_info_param(
+      first_linked_persist_param, 0 /*cur_macro_seq*/));
+  ASSERT_EQ(OB_SUCCESS, second_threshold_linked_param.build_linked_marco_info_param(
+      second_linked_persist_param, 0 /*cur_macro_seq*/));
+  ObSharedObjectsWriteCtx first_linked_write_ctx;
+  ObSharedObjectsWriteCtx second_linked_write_ctx;
+  int64_t first_linked_macro_seq = 0;
+  int64_t second_linked_macro_seq = 0;
+  ASSERT_EQ(OB_SUCCESS, first_linked_sstable.persist_linked_block_if_need(
+      allocator_, first_threshold_linked_param,
+      first_linked_macro_seq, first_linked_write_ctx));
+  ASSERT_EQ(OB_SUCCESS, second_linked_sstable.persist_linked_block_if_need(
+      allocator_, second_threshold_linked_param,
+      second_linked_macro_seq, second_linked_write_ctx));
+  ASSERT_GT(first_linked_write_ctx.block_ids_.count(), 0);
+  ASSERT_GT(second_linked_write_ctx.block_ids_.count(), 0);
+  for (int64_t i = 0; i < first_linked_write_ctx.block_ids_.count(); ++i) {
+    EXPECT_EQ(first_build_id, first_linked_write_ctx.block_ids_.at(i).fourth_id());
+  }
+  for (int64_t i = 0; i < second_linked_write_ctx.block_ids_.count(); ++i) {
+    EXPECT_EQ(second_build_id, second_linked_write_ctx.block_ids_.at(i).fourth_id());
+  }
+  ASSERT_NO_FATAL_FAILURE(assert_macro_id_sets_disjoint(
+      first_linked_write_ctx.block_ids_, second_linked_write_ctx.block_ids_));
+#endif
+
+  TestAsyncIndexRefreshDag delete_dag;
+  transaction::ObTxDesc tx_desc;
+  ObWriteMacroParam delete_param;
+  delete_dag.prepare(first_task_id, first_build_id, true /*is_async_index_refresh*/);
+  delete_param.ls_id_ = ctx.ls_id_;
+  delete_param.tablet_id_ = ctx.delete_index_tablet_id_;
+  delete_param.tenant_data_version_ = DATA_CURRENT_VERSION;
+  delete_param.schema_version_ = delete_storage_schema->get_schema_version();
+  delete_param.slice_idx_ = 0;
+  delete_param.snapshot_version_ = snapshot_version;
+  delete_param.direct_load_type_ = DIRECT_LOAD_INCREMENTAL_MAJOR;
+  delete_param.task_id_ = first_task_id;
+  delete_param.tx_info_.tx_desc_ = &tx_desc;
+  delete_param.tx_info_.trans_id_ = transaction::ObTransID(1);
+  delete_param.tx_info_.seq_no_ = 1;
+  delete_param.ddl_table_schema_.table_item_.index_type_ = INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL;
+  delete_param.tablet_param_.storage_schema_ = delete_storage_schema;
+  delete_param.tablet_param_.reorganization_scn_ = SCN::min_scn();
+  delete_param.cg_idx_ = 0;
+  delete_param.ddl_dag_ = &delete_dag;
+  ASSERT_EQ(OB_SUCCESS, delete_param.start_scn_.convert_for_tx(1));
+  ASSERT_TRUE(delete_param.is_valid());
+
+  ObWriterArgs first_delete_writer_args;
+  ASSERT_EQ(OB_SUCCESS, first_delete_writer_args.init(
+      delete_param, ObWriterType::CG_MICRO_BLOCK_WRITER_TYPE));
+  EXPECT_EQ(first_build_id, first_delete_writer_args.data_desc_.get_desc().get_op_id());
+
+  delete_dag.prepare(first_task_id, second_build_id, true /*is_async_index_refresh*/);
+  ObWriterArgs second_delete_writer_args;
+  ASSERT_EQ(OB_SUCCESS, second_delete_writer_args.init(
+      delete_param, ObWriterType::CG_MICRO_BLOCK_WRITER_TYPE));
+  EXPECT_EQ(second_build_id, second_delete_writer_args.data_desc_.get_desc().get_op_id());
+
+  delete_dag.prepare(first_task_id, 0 /*ddl_build_id*/, true /*is_async_index_refresh*/);
+  ObWriterArgs missing_build_id_writer_args;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, missing_build_id_writer_args.init(
+      delete_param, ObWriterType::CG_MICRO_BLOCK_WRITER_TYPE));
+
+  delete_dag.prepare(first_task_id, first_build_id, true /*is_async_index_refresh*/);
+  delete_param.task_id_ = second_task_id;
+  ObWriterArgs mismatched_delete_writer_args;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, mismatched_delete_writer_args.init(
+      delete_param, ObWriterType::CG_MICRO_BLOCK_WRITER_TYPE));
+
+  delete_dag.prepare(first_task_id, 0 /*ddl_build_id*/, false /*is_async_index_refresh*/);
+  delete_param.task_id_ = first_task_id;
+  ObWriterArgs fallback_delete_writer_args;
+  ASSERT_EQ(OB_SUCCESS, fallback_delete_writer_args.init(
+      delete_param, ObWriterType::CG_MICRO_BLOCK_WRITER_TYPE));
+  EXPECT_EQ(0, fallback_delete_writer_args.data_desc_.get_desc().get_op_id());
+  EXPECT_EQ(snapshot_version,
+      fallback_delete_writer_args.data_desc_.get_desc().get_inc_major_ddl_block_op_id());
+
+  ObDDLTaskParam boundary_task_param;
+  int64_t boundary_op_id = -1;
+  boundary_task_param.is_async_index_refresh_ = true;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, boundary_task_param.get_macro_block_op_id(
+      true /*is_inc_major*/, boundary_op_id));
+  EXPECT_EQ(0, boundary_op_id);
+  boundary_task_param.ddl_task_id_ = -1;
+  boundary_task_param.ddl_build_id_ = first_build_id;
+  boundary_op_id = -1;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, boundary_task_param.get_macro_block_op_id(
+      true /*is_inc_major*/, boundary_op_id));
+  EXPECT_EQ(0, boundary_op_id);
+
+  boundary_task_param.ddl_task_id_ = first_task_id;
+  boundary_task_param.ddl_build_id_ = 0;
+  boundary_op_id = -1;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, boundary_task_param.get_macro_block_op_id(
+      true /*is_inc_major*/, boundary_op_id));
+  EXPECT_EQ(0, boundary_op_id);
+  boundary_task_param.ddl_build_id_ = -1;
+  boundary_op_id = -1;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, boundary_task_param.get_macro_block_op_id(
+      true /*is_inc_major*/, boundary_op_id));
+  EXPECT_EQ(0, boundary_op_id);
+
+  boundary_task_param.ddl_build_id_ = first_build_id;
+  ASSERT_EQ(OB_SUCCESS, boundary_task_param.get_macro_block_op_id(
+      true /*is_inc_major*/, boundary_op_id));
+  EXPECT_EQ(first_build_id, boundary_op_id);
+  boundary_task_param.ddl_task_id_ = 0;
+  boundary_op_id = -1;
+  ASSERT_EQ(OB_SUCCESS, boundary_task_param.get_macro_block_op_id(
+      false /*is_inc_major*/, boundary_op_id));
+  EXPECT_EQ(0, boundary_op_id);
+  boundary_task_param.is_async_index_refresh_ = false;
+  boundary_op_id = -1;
+  ASSERT_EQ(OB_SUCCESS, boundary_task_param.get_macro_block_op_id(
+      true /*is_inc_major*/, boundary_op_id));
+  EXPECT_EQ(0, boundary_op_id);
 }
 
 TEST_P(ObAsyncIndexDestructiveGCTest, scalar_tablets_keep_async_published_snapshot)

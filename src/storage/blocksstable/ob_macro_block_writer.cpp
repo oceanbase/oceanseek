@@ -2658,8 +2658,9 @@ int ObMacroBlockWriter::alloc_block()
       int64_t fourth_id = OB_INVALID_ID;
       if (is_inc_major_compaction) {
         fourth_id = data_store_desc_->get_op_id();
-      } else if (is_inc_major_ddl
-          || compaction::is_major_merge(merge_type)
+      } else if (is_inc_major_ddl) {
+        fourth_id = data_store_desc_->get_inc_major_ddl_block_op_id();
+      } else if (compaction::is_major_merge(merge_type)
           || compaction::is_medium_merge(merge_type)) {
         fourth_id = data_store_desc_->get_snapshot_version();
       } else {

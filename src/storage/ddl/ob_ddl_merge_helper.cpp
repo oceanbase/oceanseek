@@ -1569,9 +1569,13 @@ int ObSSDDLMergeHelper::write_partial_sstable(ObDDLTabletMergeDagParamV2 &dag_me
   }
 
   int32_t private_transfer_epoch = -1;
+  int64_t macro_block_op_id = 0;
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(tablet_handle.get_obj()->get_private_transfer_epoch(private_transfer_epoch))) {
     LOG_WARN("fail to get private transfer epoch", K(ret), "tablet_meta", tablet_handle.get_obj()->get_tablet_meta());
+  } else if (OB_FAIL(dag_merge_param.ddl_task_param_.get_macro_block_op_id(
+      is_inc, macro_block_op_id))) {
+    LOG_WARN("failed to get macro block op id", KR(ret), K(is_inc), K(dag_merge_param));
   } else {
     ObTabletPersisterParam param(dag_merge_param.ddl_task_param_.tenant_data_version_,
                                  target_ls_id,
@@ -1584,7 +1588,8 @@ int ObSSDDLMergeHelper::write_partial_sstable(ObDDLTabletMergeDagParamV2 &dag_me
                                         : static_cast<ObIMacroBlockFlushCallback *>(&full_callback),
                                  nullptr/*ddl finish callback*/,
                                  is_inc,
-                                 tablet_param->reorganization_scn_);
+                                 tablet_param->reorganization_scn_,
+                                 macro_block_op_id);
     ObCOSSTableV2 *out_co_sstable = NULL;
     if (FAILEDx(ObTabletPersister::persist_major_sstable_linked_block_if_large(*allocator,
                                                                              param,

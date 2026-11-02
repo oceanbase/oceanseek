@@ -10,6 +10,7 @@
 #include "storage/async_index/ob_async_index_deps.h"
 #include "storage/async_index/ob_ls_async_index_scheduler.h"
 #include "storage/async_index/ob_async_index_service.h"  // ObAsyncIndexService
+#include "storage/ob_common_id_utils.h"
 #include "storage/ddl/ob_ddl_lock.h"                    // ObOnlineDDLLock
 #include "storage/tablelock/ob_lock_inner_connection_util.h"
 #include "lib/oblog/ob_log_module.h"
@@ -320,25 +321,36 @@ int ObAsyncIndexRefreshTask::handle()
       // execution time ObPxSubCoord::start_ddl needs snapshot_version &
       // schema_version, which it normally reads from __all_ddl_task_status by
       // task id -- but refresh_task_id is synthetic and has no such record. So we
-      // (1) register the versions in the node-local ObAsyncIndexService map keyed
-      // by refresh_task_id, and (2) flag the inner connection's session with
+      // (1) register the execution context in the node-local
+      // ObAsyncIndexService map keyed by refresh_task_id, and (2) flag the session with
       // is_async_index_refresh so start_ddl takes the map-lookup branch instead.
       // start_ddl runs synchronously inside trans.write below (same node, the LS
       // leader), so the registration is visible there; we release it afterwards.
       ObAsyncIndexService *svc = MTL(ObAsyncIndexService *);
       bool registered = false;
       bool refresh_dop_acquired = false;
+      share::ObCommonID unique_build_id;
+      int64_t ddl_build_id = 0;
+      if (OB_FAIL(ObCommonIDUtils::gen_unique_id(stat.tenant_id_, unique_build_id))) {
+        LOG_WARN("failed to generate async index ddl build id", K(ret), K(stat.tenant_id_), K(stat.refresh_task_id_));
+      } else if (OB_UNLIKELY(unique_build_id.id() <= 0)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid async index ddl build id", K(ret), K(unique_build_id), K(stat.refresh_task_id_));
+      } else {
+        ddl_build_id = unique_build_id.id();
+      }
       // Key debug point #3: the actual refresh SQL about to execute, together
       // with its identifying context (tablet / refresh ids / scn window / dop).
       LOG_INFO("[ASYNC_INDEX_REFRESH] execute refresh sql", K(stat.tenant_id_),
                K(stat.data_table_id_),
                K(stat.ls_id_), K(stat.data_tablet_id_), K(stat.tablet_id_),
-               K(stat.refresh_id_), K(stat.refresh_task_id_),
+               K(stat.refresh_id_), K(stat.refresh_task_id_), K(ddl_build_id),
                K(stat.start_refresh_scn_), K(stat.target_refresh_scn_),
                K(stat.is_complete_refresh_), K(stat.is_partition_local_),
                K(stat.refresh_parallelism_),
                K(stat.schema_version_), "sql", sql_.ptr());
-      if (OB_FAIL(share::ObShareUtil::set_default_timeout_ctx(timeout_ctx, timeout_us))) {
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(share::ObShareUtil::set_default_timeout_ctx(timeout_ctx, timeout_us))) {
         LOG_WARN("failed to set timeout ctx for refresh sql", K(ret), K(timeout_us));
       } else if (OB_ISNULL(svc)) {
         ret = OB_ERR_UNEXPECTED;
@@ -346,10 +358,11 @@ int ObAsyncIndexRefreshTask::handle()
       } else if (OB_FAIL(svc->register_refresh_versions(stat_.refresh_task_id_,
                      stat_.start_refresh_scn_,
                      stat_.target_refresh_scn_.get_val_for_sql(),
-                     stat_.schema_version_))) {
-        LOG_WARN("failed to register refresh versions", K(ret), K(stat_.refresh_task_id_),
+                     stat_.schema_version_,
+                     ddl_build_id))) {
+        LOG_WARN("failed to register refresh context", K(ret), K(stat_.refresh_task_id_),
                  K(stat_.start_refresh_scn_), K(stat_.target_refresh_scn_),
-                 K(stat_.schema_version_));
+                 K(stat_.schema_version_), K(ddl_build_id));
       } else if (FALSE_IT(registered = true)) {
       } else if (OB_FAIL(trans.start(
                      GCTX.ddl_sql_proxy_, stat.tenant_id_, false /* with_snapshot */,

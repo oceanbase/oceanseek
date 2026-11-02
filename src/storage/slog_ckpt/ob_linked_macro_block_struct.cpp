@@ -188,7 +188,7 @@ int ObLinkedMacroInfoWriteParam::build_linked_marco_info_param(
     ls_id_              = persist_param.ls_id_;
     tablet_id_          = persist_param.tablet_id_;
     start_macro_seq_    = cur_macro_seq;
-    fourth_id_          = persist_param.snapshot_version_;
+    fourth_id_          = persist_param.get_inc_major_ddl_block_op_id();
     reorganization_scn_ = persist_param.reorganization_scn_.get_val_for_tx();
     write_callback_     = persist_param.ddl_redo_callback_;
   } else if (persist_param.is_inc_shared_object()) {

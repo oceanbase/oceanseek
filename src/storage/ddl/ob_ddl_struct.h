@@ -404,7 +404,7 @@ public:
 struct ObDDLTaskParam
 {
 public:
-  ObDDLTaskParam() : tenant_data_version_(0), snapshot_version_(0), schema_version_(0), ddl_task_id_(0), execution_id_(0),
+  ObDDLTaskParam() : tenant_data_version_(0), snapshot_version_(0), schema_version_(0), ddl_task_id_(0), ddl_build_id_(0), execution_id_(0),
     target_table_id_(0),  is_no_logging_(false), max_batch_size_(0), is_offline_index_rebuild_(false), is_partition_local_(false), is_vec_tablet_rebuild_(false), is_async_index_refresh_(false),
     async_index_start_refresh_version_(0) {}
   void reset()
@@ -413,6 +413,7 @@ public:
     snapshot_version_ = 0;
     schema_version_ = 0;
     ddl_task_id_ = 0;
+    ddl_build_id_ = 0;
     execution_id_ = 0;
     target_table_id_ = 0;
     is_no_logging_ = false;
@@ -424,7 +425,12 @@ public:
     async_index_start_refresh_version_ = 0;
   }
   bool is_valid() const { return ddl_task_id_ > 0 && execution_id_ >= 0 && tenant_data_version_ > 0 && snapshot_version_ >= 0 && target_table_id_ > 0 && schema_version_ > 0; }
-  TO_STRING_KV(K_(ddl_task_id), K_(execution_id), K_(tenant_data_version), K_(snapshot_version), K_(target_table_id), K_(schema_version), K_(is_no_logging), K_(max_batch_size), K_(is_offline_index_rebuild), K_(is_partition_local), K_(is_vec_tablet_rebuild), K_(is_async_index_refresh), K_(async_index_start_refresh_version));
+  // 本次 DDL 写共享宏块使用的命名空间 id（最终写入 MacroBlockId 第四段）。
+  // 仅 inc-major DDL 有意义：async index refresh 返回每次物理执行唯一的 ddl_build_id_
+  // （避免同 snapshot_version 下多次物理执行的宏块 ID 之前冲突）；
+  // 其他场景返回 0，由 writer 层 fallback 到 snapshot_version。
+  int get_macro_block_op_id(const bool is_inc_major, int64_t &op_id) const;
+  TO_STRING_KV(K_(ddl_task_id), K_(ddl_build_id), K_(execution_id), K_(tenant_data_version), K_(snapshot_version), K_(target_table_id), K_(schema_version), K_(is_no_logging), K_(max_batch_size), K_(is_offline_index_rebuild), K_(is_partition_local), K_(is_vec_tablet_rebuild), K_(is_async_index_refresh), K_(async_index_start_refresh_version));
 public:
   /* necessary param */
   uint64_t tenant_data_version_;
@@ -433,6 +439,7 @@ public:
   /* optional param only used for leader major merge */
   int64_t schema_version_;
   int64_t ddl_task_id_;
+  int64_t ddl_build_id_; // 每次物理执行唯一
   int64_t execution_id_;
   int64_t target_table_id_;
   bool is_no_logging_;
@@ -673,6 +680,7 @@ public:
         && (!is_incremental_major_direct_load(direct_load_type_)
             || (is_incremental_major_direct_load(direct_load_type_) && tx_info_.is_valid() && start_scn_.is_valid_and_not_min()));
   }
+  int get_macro_block_op_id(const bool is_inc_major, int64_t &op_id) const;
   int64_t get_logic_parallel_count() const { return slice_count_ > 0 ? slice_count_ : ddl_thread_count_; }
   int get_target_tablet_info(
       const ObDirectLoadTabletTarget target,

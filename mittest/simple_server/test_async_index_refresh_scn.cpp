@@ -196,6 +196,12 @@ TEST_F(ObAsyncIndexRefreshScnTest, refresh_ddl_physical_scn_and_macro_snapshot)
   ASSERT_NO_FATAL_FAILURE(disable_and_drain_async_index_refresh());
   ASSERT_EQ(OB_SUCCESS, exe_sql("alter system set _enable_async_index_refresh = true"));
 
+#ifdef ERRSIM
+  const int64_t saved_macro_ids_threshold = GCONF.errsim_storage_meta_macro_ids_threshold;
+  DEFER(GCONF.errsim_storage_meta_macro_ids_threshold = saved_macro_ids_threshold);
+  GCONF.errsim_storage_meta_macro_ids_threshold = 1;
+#endif
+
   common::ObMySQLProxy &sql_proxy = get_curr_simple_server().get_sql_proxy2();
   sqlclient::ObISQLConnection *conn = nullptr;
   ASSERT_EQ(OB_SUCCESS, sql_proxy.acquire(conn));
@@ -282,6 +288,19 @@ TEST_F(ObAsyncIndexRefreshScnTest, refresh_ddl_physical_scn_and_macro_snapshot)
         }
       }
       ASSERT_NE(nullptr, output) << "refresh did not publish the requested snapshot";
+      ObSqlString task_sql;
+      ASSERT_EQ(OB_SUCCESS, task_sql.assign_fmt(
+          "select task_id as val from oceanbase.__all_virtual_async_index_task_info "
+          "where tenant_id = %lu and tablet_id = %ld and trigger_type = %d "
+          "and target_refresh_snapshot = %lu and ret_code = 0 and end_time is not null "
+          "order by end_time desc limit 1",
+          tenant_id_, tablet_id.id(), static_cast<int>(ASYNC_REFRESH_TYPE_MANUAL),
+          target.get_val_for_inner_table_field()));
+      int64_t refresh_task_id = 0;
+      ASSERT_EQ(OB_SUCCESS, SimpleServerHelper::select_int64(
+          conn, task_sql.ptr(), refresh_task_id));
+      ASSERT_GT(refresh_task_id, 0);
+      ASSERT_NE(target_snapshot, refresh_task_id);
       const bool is_delete = tablet_handle.get_obj()->is_async_delete_index();
       if (is_delete) {
         ++delete_count;
@@ -316,12 +335,20 @@ TEST_F(ObAsyncIndexRefreshScnTest, refresh_ddl_physical_scn_and_macro_snapshot)
       EXPECT_GT(meta.get_sstable_meta().get_row_count(), 0);
       EXPECT_GT(meta.get_sstable_meta().get_data_macro_block_count(), 0);
       EXPECT_GT(output->get_end_scn(), output->get_start_scn());
-      // Check persisted IDs from BOTH data writing and index rebuilding.
-      // A MAJOR/INC_MAJOR_COMPACTION descriptor substitution or physical SCN
-      // used as data_snapshot_version must not silently change this namespace.
+      const ObSSTableMacroInfo &macros = meta.get_sstable_meta().get_macro_info();
+      ObMacroIdIterator first_data_ids;
+      ASSERT_EQ(OB_SUCCESS, macros.get_data_block_iter(first_data_ids));
+      MacroBlockId first_data_id;
+      ASSERT_EQ(OB_SUCCESS, first_data_ids.get_next_macro_id(first_data_id));
+      ASSERT_EQ(ObStorageObjectType::SHARED_INC_MAJOR_DATA_MACRO,
+          first_data_id.storage_object_type());
+      const int64_t observed_fourth_id = first_data_id.fourth_id();
+      ASSERT_GT(observed_fourth_id, 0);
+      EXPECT_NE(refresh_task_id, observed_fourth_id);
+      EXPECT_NE(target_snapshot, observed_fourth_id);
+      // Check persisted IDs from both data writing and final index rebuilding.
       for (int kind = 0; kind < 2; ++kind) {
         ObMacroIdIterator ids;
-        const ObSSTableMacroInfo &macros = meta.get_sstable_meta().get_macro_info();
         ASSERT_EQ(OB_SUCCESS, 0 == kind ? macros.get_data_block_iter(ids)
                                      : macros.get_other_block_iter(ids));
         MacroBlockId id;
@@ -329,7 +356,7 @@ TEST_F(ObAsyncIndexRefreshScnTest, refresh_ddl_physical_scn_and_macro_snapshot)
         int64_t count = 0;
         while (OB_SUCCESS == (iter_ret = ids.get_next_macro_id(id))) {
           ++count;
-          EXPECT_EQ(target_snapshot, id.fourth_id());
+          EXPECT_EQ(observed_fourth_id, id.fourth_id());
           EXPECT_EQ(0 == kind ? ObStorageObjectType::SHARED_INC_MAJOR_DATA_MACRO
                               : ObStorageObjectType::SHARED_INC_MAJOR_META_MACRO,
               id.storage_object_type());
@@ -340,6 +367,21 @@ TEST_F(ObAsyncIndexRefreshScnTest, refresh_ddl_physical_scn_and_macro_snapshot)
               << "coverage prerequisite: data blocks on both targets and external inverted index blocks";
         }
       }
+#ifdef ERRSIM
+      ASSERT_FALSE(output->is_small_sstable());
+      ObMacroIdIterator linked_ids;
+      ASSERT_EQ(OB_SUCCESS, macros.get_linked_block_iter(linked_ids));
+      MacroBlockId linked_id;
+      int linked_iter_ret = OB_SUCCESS;
+      int64_t linked_count = 0;
+      while (OB_SUCCESS == (linked_iter_ret = linked_ids.get_next_macro_id(linked_id))) {
+        ++linked_count;
+        EXPECT_EQ(observed_fourth_id, linked_id.fourth_id());
+      }
+      ASSERT_EQ(OB_ITER_END, linked_iter_ret);
+      EXPECT_GT(linked_count, 0)
+          << "coverage prerequisite: write_partial_sstable persisted the macro-ID list";
+#endif
     }
     ASSERT_EQ(1, inverted_count);
     ASSERT_EQ(1, delete_count);

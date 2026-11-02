@@ -42,6 +42,7 @@ int ObWriterArgs::init(const ObWriteMacroParam &param,
       } else {
         const bool is_inc_major = is_incremental_major_direct_load(param.direct_load_type_);
         const bool is_inc_minor = is_incremental_minor_direct_load(param.direct_load_type_);
+        int64_t macro_block_op_id = 0;
         const ObLSID ls_id = param.ls_id_;
         const uint64_t tenant_data_version = param.tenant_data_version_;
         const bool need_submit_io = !with_cs_replica;
@@ -98,6 +99,8 @@ int ObWriterArgs::init(const ObWriteMacroParam &param,
           }
         }
         if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(param.get_macro_block_op_id(is_inc_major, macro_block_op_id))) {
+          LOG_WARN("failed to get macro block op id", KR(ret), K(is_inc_major), K(param));
         } else if (OB_FAIL(data_desc_.init(true/*is ddl*/,
                                           *storage_schema,
                                           ls_id,
@@ -114,7 +117,9 @@ int ObWriterArgs::init(const ObWriteMacroParam &param,
                                           param.cg_idx_,
                                           exec_mode,
                                           need_submit_io,
-                                          is_inc_major))) {
+                                          is_inc_major,
+                                          common::ObStorageObjectWriteStrategy::INVALID_WRITE_STRATEGY,
+                                          macro_block_op_id))) {
           LOG_WARN("fail to initialize data store desc", K(ret), K(is_inc_major));
         } else if (OB_FAIL(index_builder_.init(data_desc_.get_desc(),
                                               space_opt_mode/*small sstable op*/))) {

@@ -1025,6 +1025,7 @@ int ObPxSubCoord::start_ddl()
     uint64_t tenant_data_version = 0;
     int64_t snapshot_version = 0;
     int64_t schema_version = 0;
+    int64_t ddl_build_id = 0;
     int64_t async_index_start_refresh_version = 0;
     bool is_no_logging = false;
     share::ObDDLTaskStatus unused_task_status = share::ObDDLTaskStatus::PREPARE;
@@ -1063,6 +1064,8 @@ int ObPxSubCoord::start_ddl()
         LOG_WARN("fail to get async index snapshot version", K(ret), K(ddl_task_id));
       } else if (OB_FAIL(async_index_svc->get_inner_sql_schema_version(ddl_task_id, schema_version))) {
         LOG_WARN("fail to get async index schema version", K(ret), K(ddl_task_id));
+      } else if (OB_FAIL(async_index_svc->get_inner_sql_ddl_build_id(ddl_task_id, ddl_build_id))) {
+        LOG_WARN("fail to get async index ddl build id", K(ret), K(ddl_task_id));
       } else if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), tenant_data_version))) {
         LOG_WARN("fail to get min data version", K(ret), K(ddl_task_id));
       }
@@ -1095,6 +1098,7 @@ int ObPxSubCoord::start_ddl()
       ddl_dag_param.ddl_thread_count_ = px_thread_count;
       ddl_dag_param.px_thread_count_ = px_thread_count;
       ddl_dag_param.ddl_task_param_.ddl_task_id_ = ddl_task_id;
+      ddl_dag_param.ddl_task_param_.ddl_build_id_ = ddl_build_id;
       ddl_dag_param.ddl_task_param_.execution_id_ = ddl_execution_id;
       ddl_dag_param.ddl_task_param_.tenant_data_version_ = tenant_data_version;
       ddl_dag_param.ddl_task_param_.snapshot_version_ = snapshot_version;
@@ -1114,6 +1118,8 @@ int ObPxSubCoord::start_ddl()
         ddl_dag_param.tx_info_.tx_desc_ = my_session->get_tx_desc();
         ddl_dag_param.tx_info_.trans_id_ = my_session->get_tx_desc()->get_tx_id();
         ddl_dag_param.tx_info_.seq_no_ = my_session->get_tx_desc()->get_tx_seq().get_seq();
+        FLOG_INFO("async index refresh physical build", K(ddl_task_id), K(ddl_build_id),
+                  K(snapshot_version), "trans_id", ddl_dag_param.tx_info_.trans_id_);
       }
       if (OB_FAIL(ret)) {
       } else if (OB_FAIL(get_participants(sqc_arg_.sqc_, ddl_table_id, ddl_dag_param.ls_tablet_ids_))) {

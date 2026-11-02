@@ -1669,9 +1669,13 @@ int ObSSIncMajorDDLMergeHelper::merge_cg_sstable(ObIDag* dag,
     // which retains the physical range for redo and SSTable creation.
     ObWholeDataStoreDesc data_desc;
     ObSSTableIndexBuilder sstable_index_builder(true);
+    int64_t macro_block_op_id = 0;
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(clustered_index_flush_callback.init(init_param))) {
       LOG_WARN("fail to init sstable index builder", KR(ret), K(init_param));
+    } else if (OB_FAIL(dag_merge_param.ddl_task_param_.get_macro_block_op_id(
+        true, macro_block_op_id))) {
+      LOG_WARN("failed to get macro block op id", KR(ret), K(dag_merge_param));
     } else if (OB_FAIL(data_desc.init(true/*is_ddl*/,
                                       *storage_schema,
                                       ls_id,
@@ -1688,7 +1692,9 @@ int ObSSIncMajorDDLMergeHelper::merge_cg_sstable(ObIDag* dag,
                                       cg_idx,
                                       compaction::ObExecMode::EXEC_MODE_OUTPUT,
                                       true/*need_submit_io*/,
-                                      true/*is_inc_major*/))) {
+                                      true/*is_inc_major*/,
+                                      ObStorageObjectWriteStrategy::INVALID_WRITE_STRATEGY,
+                                      macro_block_op_id))) {
       LOG_WARN("fail to init data desc", KR(ret));
     } else if (FALSE_IT(data_desc.get_static_desc().schema_version_ = storage_schema->get_schema_version())) {
     } else if (OB_FAIL(sstable_index_builder.init(data_desc.get_desc(),

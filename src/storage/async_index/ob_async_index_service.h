@@ -114,20 +114,22 @@ public:
   // Expose the refresher for LS scheduler registration/unregistration.
   ObTenantAsyncIndexRefresher &get_refresher() { return refresher_; }
 
-  // --- refresh window/schema version registry for the inner refresh SQL ---
-  // Register (before executing the inner SQL) the refresh window & schema version
-  // keyed by the synthetic refresh_task_id; ObPxSubCoord::start_ddl reads them back
+  // --- execution context registry for the inner refresh SQL ---
+  // Register (before executing the inner SQL) the refresh window, schema version,
+  // and build ID keyed by the synthetic refresh_task_id; ObPxSubCoord::start_ddl reads them back
   // via the getters during execution (the task_id has no __all_ddl_task_status record).
   // Creates the entry on first use. Always pair register with release.
   int register_refresh_versions(const int64_t refresh_task_id,
                                 const share::SCN &start_refresh_scn,
                                 const int64_t snapshot_version,
-                                const int64_t schema_version);
-  // Read a registered version. Returns OB_EAGAIN if the entry is absent (retryable).
+                                const int64_t schema_version,
+                                const int64_t ddl_build_id);
+  // Read a registered value. Returns OB_EAGAIN if the entry is absent (retryable).
   int get_inner_sql_start_refresh_scn(const int64_t refresh_task_id,
                                       share::SCN &start_refresh_scn);
   int get_inner_sql_snapshot_version(const int64_t refresh_task_id, int64_t &snapshot_version);
   int get_inner_sql_schema_version(const int64_t refresh_task_id, int64_t &schema_version);
+  int get_inner_sql_ddl_build_id(const int64_t refresh_task_id, int64_t &ddl_build_id);
   // Erase the entry. OB_HASH_NOT_EXIST is treated as success (idempotent).
   int release_refresh_versions(const int64_t refresh_task_id);
 

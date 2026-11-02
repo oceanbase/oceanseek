@@ -146,13 +146,13 @@ ObTabletPersisterParam::ObTabletPersisterParam(
     tablet_id_(tablet_id),
     private_transfer_epoch_(private_transfer_epoch),
     snapshot_version_(0),
+    inc_major_ddl_block_op_id_(0),
     start_macro_seq_(0),
     is_inc_major_shared_object_(false),
     ddl_redo_callback_(nullptr),
     ddl_finish_callback_(nullptr)
 #ifdef OB_BUILD_SHARED_STORAGE
     , update_reason_(ObMetaUpdateReason::INVALID_META_UPDATE_REASON),
-    sstable_op_id_(0),
     reorganization_scn_(reorganization_scn),
     meta_version_(meta_version),
     src_tablet_block_info_(nullptr),
@@ -177,20 +177,21 @@ ObTabletPersisterParam::ObTabletPersisterParam(
   blocksstable::ObIMacroBlockFlushCallback *ddl_redo_callback,
   blocksstable::ObIMacroBlockFlushCallback *ddl_finish_callback,
   const bool is_inc_major_shared_object,
-  const share::SCN &reorganization_scn)
+  const share::SCN &reorganization_scn,
+  const int64_t inc_major_ddl_block_op_id)
   : data_version_(data_version),
     ls_id_(ls_id),
     ls_epoch_(0),
     tablet_id_(tablet_id),
     private_transfer_epoch_(private_transfer_epoch),
     snapshot_version_(snapshot_version),
+    inc_major_ddl_block_op_id_(inc_major_ddl_block_op_id),
     start_macro_seq_(start_macro_seq),
     is_inc_major_shared_object_(is_inc_major_shared_object),
     ddl_redo_callback_(ddl_redo_callback),
     ddl_finish_callback_(ddl_finish_callback)
 #ifdef OB_BUILD_SHARED_STORAGE
     , update_reason_(ObMetaUpdateReason::INVALID_META_UPDATE_REASON),
-    sstable_op_id_(0),
     reorganization_scn_(reorganization_scn),
     meta_version_(0),
     src_tablet_block_info_(nullptr),
@@ -222,12 +223,12 @@ ObTabletPersisterParam::ObTabletPersisterParam(
     tablet_id_(tablet_id),
     private_transfer_epoch_(OB_INVALID_TRANSFER_SEQ),
     snapshot_version_(0),
+    inc_major_ddl_block_op_id_(0),
     start_macro_seq_(start_macro_seq),
     is_inc_major_shared_object_(false),
     ddl_redo_callback_(ddl_redo_callback),
     ddl_finish_callback_(ddl_finish_callback),
     update_reason_(update_reason),
-    sstable_op_id_(-1),
     reorganization_scn_(reorganization_scn),
     meta_version_(0),
     src_tablet_block_info_(src_tablet_block_info),
@@ -250,7 +251,7 @@ bool ObTabletPersisterParam::is_valid() const
   #ifdef OB_BUILD_SHARED_STORAGE
   } else if (is_inc_major_shared_object()) { // shared_inc_major
     valid = ls_id_.is_valid() && 0 == ls_epoch_ && start_macro_seq_ >= 0
-        && reorganization_scn_.is_valid();
+        && get_inc_major_ddl_block_op_id() > 0 && reorganization_scn_.is_valid();
   } else if (is_inc_shared_object()) { // inc_shared
     const bool has_tablet_op = OB_NOT_NULL(tablet_op_);
     valid = has_tablet_op && is_valid_update_reason(update_reason_);
@@ -1179,7 +1180,7 @@ int ObTabletPersistCommon::build_async_write_start_opt(
   else if (param.is_inc_major_shared_object()) {
     start_opt.set_ss_inc_major_meta_macro_object_opt(
       param.tablet_id_.is_ls_inner_tablet(), param.ls_id_.id(), param.tablet_id_.id(),
-      param.snapshot_version_, cur_macro_seq, 0/*cg_id*/,
+      param.get_inc_major_ddl_block_op_id(), cur_macro_seq, 0/*cg_id*/,
       param.reorganization_scn_.get_val_for_tx());
   } else if (param.is_major_shared_object()) {
     start_opt.set_ss_major_meta_macro_object_opt(

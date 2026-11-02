@@ -63,7 +63,8 @@ int ObAsyncIndexService::init(const uint64_t tenant_id)
 int ObAsyncIndexService::register_refresh_versions(const int64_t refresh_task_id,
                                                    const share::SCN &start_refresh_scn,
                                                    const int64_t snapshot_version,
-                                                   const int64_t schema_version)
+                                                   const int64_t schema_version,
+                                                   const int64_t ddl_build_id)
 {
   int ret = OB_SUCCESS;
   ObAsyncIndexRefreshTmpInfo *tmp_info = nullptr;
@@ -73,10 +74,11 @@ int ObAsyncIndexService::register_refresh_versions(const int64_t refresh_task_id
   } else if (OB_UNLIKELY(refresh_task_id <= 0
                          || !start_refresh_scn.is_valid()
                          || snapshot_version <= 0
-                         || schema_version <= 0)) {
+                         || schema_version <= 0
+                         || ddl_build_id <= 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(refresh_task_id), K(start_refresh_scn),
-        K(snapshot_version), K(schema_version));
+        K(snapshot_version), K(schema_version), K(ddl_build_id));
   } else if (OB_FAIL(tmp_info_map_.get_refactored(refresh_task_id, tmp_info))) {
     if (OB_HASH_NOT_EXIST != ret) {
       LOG_WARN("failed to get tmp info", K(ret), K(refresh_task_id));
@@ -108,8 +110,9 @@ int ObAsyncIndexService::register_refresh_versions(const int64_t refresh_task_id
       tmp_info->start_refresh_scn_ = start_refresh_scn;
       tmp_info->snapshot_version_ = snapshot_version;
       tmp_info->schema_version_ = schema_version;
+      tmp_info->ddl_build_id_ = ddl_build_id;
       LOG_INFO("register async index refresh versions", K(refresh_task_id),
-               K(start_refresh_scn), K(snapshot_version), K(schema_version));
+               K(start_refresh_scn), K(snapshot_version), K(schema_version), K(ddl_build_id));
     }
   }
   return ret;
@@ -186,6 +189,32 @@ int ObAsyncIndexService::get_inner_sql_schema_version(const int64_t refresh_task
     LOG_WARN("unexpected null tmp info", K(ret), K(refresh_task_id));
   } else {
     schema_version = tmp_info->schema_version_;
+  }
+  return ret;
+}
+
+int ObAsyncIndexService::get_inner_sql_ddl_build_id(const int64_t refresh_task_id,
+                                                    int64_t &ddl_build_id)
+{
+  int ret = OB_SUCCESS;
+  ObAsyncIndexRefreshTmpInfo *tmp_info = nullptr;
+  ddl_build_id = 0;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not inited", K(ret));
+  } else if (OB_UNLIKELY(refresh_task_id <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(refresh_task_id));
+  } else if (OB_FAIL(tmp_info_map_.get_refactored(refresh_task_id, tmp_info))) {
+    if (OB_HASH_NOT_EXIST == ret) {
+      ret = OB_EAGAIN;
+    }
+    LOG_WARN("failed to get async index refresh build id", K(ret), K(refresh_task_id));
+  } else if (OB_ISNULL(tmp_info)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null tmp info", K(ret), K(refresh_task_id));
+  } else {
+    ddl_build_id = tmp_info->ddl_build_id_;
   }
   return ret;
 }
