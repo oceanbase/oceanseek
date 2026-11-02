@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "lib/timezone/ob_time_convert.h"
+#include "sql/engine/ob_exec_context.h"
 #include "sql/hybrid_search/ob_hybrid_search_dsl_resolver.h"
 #include "sql/hybrid_search/ob_fulltext_search_query.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
@@ -13,6 +14,7 @@
 #include "lib/utility/ob_fast_convert.h"
 #include "sql/rewrite/ob_expand_aggregate_utils.h"
 #include "share/vector_index/ob_vector_index_util.h"
+#include "share/search_index/ob_search_index_encoder.h"
 
 namespace oceanbase
 {
@@ -884,7 +886,10 @@ int ObDSLResolver::build_field_expr_with_path(ObColumnRefRawExpr *col_expr, cons
     // use column expr without json_extract if any of the following conditions is met:
     // (1) no path
     // (2) json member of with root array path
-    if (!col_expr->get_result_type().is_json() && OB_FAIL(dsl_query_info_->dsl_cols.push_back(col_expr))) {
+    // Direct JSON range comparisons need the column item for selectivity even
+    // when the column is neither projected nor backed by a search index.
+    if ((!col_expr->get_result_type().is_json() || query_type == QUERY_ITEM_RANGE)
+        && OB_FAIL(dsl_query_info_->dsl_cols.push_back(col_expr))) {
       LOG_WARN("failed to push back scalar query column expr", K(ret));
     } else {
       field_expr = col_expr;
@@ -5162,6 +5167,11 @@ int ObDSLResolver::resolve_range(ObIJsonBase &req_node, ObDSLQuery *&query, ObDS
   ObColumnRefRawExpr *col_expr = nullptr;
   ObRawExpr *field_expr = nullptr;
   ObRawExpr *scalar_expr = nullptr;
+  bool use_dsl_multi_value_range = false;
+  ObRawExpr *bounds[2] = {nullptr, nullptr}; // lower, upper
+  bool inclusive[2] = {false, false};
+  uint8_t bound_encode_type = 0;
+  bool has_bound_type = false;
   ObSEArray<ObRawExpr*, 4, ModulePageAllocator, true> condition_exprs;
   ObConstRawExpr *boost_expr = nullptr;
   ObDSLScalarQuery *range_query = nullptr;
@@ -5184,6 +5194,13 @@ int ObDSLResolver::resolve_range(ObIJsonBase &req_node, ObDSLQuery *&query, ObDS
     LOG_WARN("fail to get field expr and path", K(ret), K(col_name));
   } else if (OB_FAIL(build_field_expr_with_path(col_expr, path_str, QUERY_ITEM_RANGE, field_expr))) {
     LOG_WARN("fail to build field expr with path for range", K(ret));
+  } else {
+    const ObExecContext *exec_ctx = session_info_->get_cur_exec_ctx();
+    const uint64_t cluster_version = OB_NOT_NULL(exec_ctx)
+                                     ? exec_ctx->get_min_cluster_version() : GET_MIN_CLUSTER_VERSION();
+    use_dsl_multi_value_range = cluster_version >= CLUSTER_VERSION_4_6_3_1
+                               && col_expr->get_result_type().is_json()
+                               && get_multi_value(parent_query);
   }
   if (OB_SUCC(ret) && OB_FAIL(validate_nested_field_path(path_str, col_expr->get_column_name()))) {
     LOG_WARN("nested field path validation failed", K(ret), K(path_str));
@@ -5227,6 +5244,25 @@ int ObDSLResolver::resolve_range(ObIJsonBase &req_node, ObDSLQuery *&query, ObDS
     } else if (OB_FALSE_IT(value_type = resolve_type_mapping(var_node->json_type(), col_expr))) {
     } else if (OB_FAIL(resolve_const(*var_node, var_expr, value_type))) {
       LOG_WARN("fail to resolve const value", K(ret), K(i));
+    } else if (use_dsl_multi_value_range) {
+      const int64_t bound_idx = (type == T_OP_GT || type == T_OP_GE) ? 0 : 1;
+      uint8_t encode_type = 0;
+      if (OB_NOT_NULL(bounds[bound_idx])) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "multi-value range, only one lower and one upper bound are allowed");
+        LOG_WARN("duplicate range bound", K(ret), K(key));
+      } else if (OB_FAIL(share::ObSearchIndexPathEncoder::encode_type(var_node->json_type(), encode_type))) {
+        LOG_WARN("fail to get range bound encoding type", K(ret));
+      } else if (has_bound_type && encode_type != bound_encode_type) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "multi-value range bounds must have the same encoding type");
+        LOG_WARN("range bound encoding types differ", K(ret), K(encode_type), K(bound_encode_type));
+      } else {
+        bounds[bound_idx] = var_expr;
+        inclusive[bound_idx] = (type == T_OP_GE || type == T_OP_LE);
+        bound_encode_type = encode_type;
+        has_bound_type = true;
+      }
     } else if (OB_FAIL(expr_factory->create_raw_expr(type, cmp_expr))) {
       LOG_WARN("fail to create cmp expr", K(ret), K(type));
     } else if (OB_FAIL(cmp_expr->set_param_exprs(field_expr, var_expr))) {
@@ -5236,14 +5272,42 @@ int ObDSLResolver::resolve_range(ObIJsonBase &req_node, ObDSLQuery *&query, ObDS
     }
   }
   if (OB_FAIL(ret)) {
-  } else if (condition_exprs.empty()) {
+  } else if (use_dsl_multi_value_range ? !has_bound_type : condition_exprs.empty()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "range query, should contain at least one of \"gt\", \"gte\", \"lt\", \"lte\"");
     LOG_WARN("range query has no comparison condition", K(ret));
-  } else if (OB_FAIL(ObDSLScalarQuery::create(*allocator_, range_query, QUERY_ITEM_RANGE, outer_query_type, parent_query))) {
-    LOG_WARN("fail to create range query", K(ret));
+  } else if (use_dsl_multi_value_range) {
+    ObRawExpr *include_exprs[2] = {nullptr, nullptr};
+    ObSysFunRawExpr *range_expr = nullptr;
+    for (int64_t i = 0; OB_SUCC(ret) && i < 2; ++i) {
+      if (OB_ISNULL(bounds[i]) && OB_FAIL(ObRawExprUtils::build_null_expr(*expr_factory, bounds[i]))) {
+        LOG_WARN("fail to build unbounded range endpoint", K(ret));
+      } else if (OB_FAIL(ObRawExprUtils::build_const_bool_expr(expr_factory, include_exprs[i], inclusive[i]))) {
+        LOG_WARN("fail to build range inclusion flag", K(ret));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(expr_factory->create_raw_expr(T_FUN_SYS_DSL_MULTI_VALUE_RANGE, range_expr))) {
+      LOG_WARN("fail to create DSL multi-value range expr", K(ret));
+    } else if (OB_FALSE_IT(range_expr->set_func_name(N_DSL_MULTI_VALUE_RANGE))) {
+    } else if (OB_FAIL(range_expr->init_param_exprs(5))) {
+      LOG_WARN("fail to init DSL multi-value range params", K(ret));
+    } else {
+      ObRawExpr *args[] = {field_expr, bounds[0], bounds[1], include_exprs[0], include_exprs[1]};
+      for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(args); ++i) {
+        if (OB_FAIL(range_expr->add_param_expr(args[i]))) {
+          LOG_WARN("fail to add DSL multi-value range param", K(ret), K(i));
+        }
+      }
+      // Keep both endpoints in one predicate: the same array element must match.
+      scalar_expr = range_expr;
+    }
   } else if (OB_FAIL(ObRawExprUtils::build_and_expr(*expr_factory, condition_exprs, scalar_expr))) {
     LOG_WARN("fail to build and expr", K(ret));
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(ObDSLScalarQuery::create(*allocator_, range_query, QUERY_ITEM_RANGE, outer_query_type, parent_query))) {
+    LOG_WARN("fail to create range query", K(ret));
   } else {
     range_query->field_ = field_expr;
     range_query->scalar_expr_ = scalar_expr;

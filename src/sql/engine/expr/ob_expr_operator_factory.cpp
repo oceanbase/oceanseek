@@ -542,6 +542,7 @@
 #include "sql/engine/expr/ob_expr_format_profile.h"
 #include "sql/engine/expr/ob_expr_max_pt.h"
 #include "sql/engine/expr/ob_expr_date_trunc.h"
+#include "sql/engine/expr/ob_expr_dsl_multi_value_range.h"
 
 using namespace oceanbase::common;
 namespace oceanbase
@@ -1387,6 +1388,7 @@ void ObExprOperatorFactory::register_expr_operators()
     REG_OP(ObExprSearchIndexInnerValue, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprLobIdToString, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprLobSeqIdToString, SHORT_CIRCUIT_EVALUATION);
+    REG_OP(ObExprDslMultiValueRange, SHORT_CIRCUIT_EVALUATION);
   }();
 // 注册oracle系统函数
   REG_OP_ORCL(ObExprSysConnectByPath, EAGER_EVALUATION);

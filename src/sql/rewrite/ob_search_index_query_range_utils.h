@@ -45,7 +45,8 @@ public:
                                      const ObRawExpr &path_expr,
                                      ObString &path,
                                      const bool index_sub_path,
-                                     bool &can_extract_range);
+                                     bool &can_extract_range,
+                                     const bool recursive_arrays = false);
 
   static int is_json_scalar_match_index(ObExecContext &exec_ctx, const ObObj &json_value,
                                         const uint8_t cons_encode_type, bool &is_match);

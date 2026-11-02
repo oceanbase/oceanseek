@@ -101,6 +101,10 @@ int ObExprRangeConverter::convert_expr_to_range_node(const ObRawExpr *expr,
     if (OB_FAIL(convert_geo_expr(expr, expr_depth, range_node))) {
       LOG_WARN("failed to convert geo expr");
     }
+  } else if (ctx_.is_search_index() && T_FUN_SYS_DSL_MULTI_VALUE_RANGE == expr->get_expr_type()) {
+    if (OB_FAIL(convert_dsl_multi_value_range(*expr, range_node))) {
+      LOG_WARN("failed to convert DSL multi-value range on search index", K(ret));
+    }
   } else if (ctx_.is_search_index() && domain_expr_can_use_search_index(expr)) {
     if (OB_FAIL(convert_domain_expr_on_search_index(expr, expr_depth, range_node))) {
       LOG_WARN("failed to convert domain expr on search index");
@@ -4489,7 +4493,7 @@ int ObExprRangeConverter::preprocess_json_access_expr(const ObRawExpr *json_expr
     } else if (!is_valid) {
       // do nothing
     } else if (OB_FAIL(ObSearchIndexQueryRangeUtils::json_prefix_path_encode(allocator_, ctx_,
-        *path_expr, encoded_path, index_sub_path, is_valid))) {
+        *path_expr, encoded_path, index_sub_path, is_valid, op_type == T_FUN_SYS_DSL_MULTI_VALUE_RANGE))) {
       LOG_WARN("failed to check json path can extract range", K(ret));
     } else if (!is_valid) {
       // path is not a single member path, no need to extract range.
@@ -4870,6 +4874,197 @@ int ObExprRangeConverter::fill_json_search_index_range_node(const ObColumnRefRaw
         range_node->end_keys_[SEARCH_INDEX_NESTED_KEY] = is_oracle_mode ? OB_RANGE_MIN_VALUE : OB_RANGE_MAX_VALUE;
       }
     }
+  }
+  return ret;
+}
+
+int ObExprRangeConverter::convert_dsl_multi_value_range(const ObRawExpr &expr,
+                                                        ObRangeNode *&range_node)
+{
+  int ret = OB_SUCCESS;
+  bool can_extract = lib::is_mysql_mode();
+  bool has_bound[2] = {false, false};
+  bool inclusive[2] = {false, false};
+  uint8_t range_type = 0;
+  int64_t key_idx = -1;
+  const ObRawExpr *target = expr.get_param_expr(0);
+  const ObColumnRefRawExpr *column_expr = nullptr;
+  ObSearchIndexRangeCtx &search_ctx = *ctx_.search_index_range_ctx_;
+  const ObString saved_prefix = search_ctx.path_prefix_;
+  const ObItemType saved_pick = search_ctx.pick_type_;
+  search_ctx.path_prefix_.reset();
+  search_ctx.pick_type_ = T_NULL;
+  range_node = nullptr;
+  if (OB_UNLIKELY(expr.get_param_count() != 5) || OB_ISNULL(target)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid DSL multi-value range params", K(ret), K(expr));
+  } else if (can_extract && is_json_access_expr(*target)) {
+    if (OB_FAIL(preprocess_json_access_expr(target, expr.get_expr_type(), target, can_extract))) {
+      LOG_WARN("failed to preprocess multi-value range target", K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && can_extract) {
+    if (!target->is_column_ref_expr() || !target->get_result_type().is_json()) {
+      can_extract = false;
+    } else if (OB_FALSE_IT(column_expr = static_cast<const ObColumnRefRawExpr *>(target))) {
+    } else if (!is_range_key(column_expr->get_column_id(), key_idx)) {
+      can_extract = false;
+    } else if (target == expr.get_param_expr(0)) {
+      // A root JSON column needs the same path coverage check as JSON_EXTRACT.
+      ObConstRawExpr *root_path = nullptr;
+      if (OB_FAIL(ObRawExprUtils::build_const_string_expr(*ctx_.expr_factory_, ObVarcharType,
+          ObString::make_string("$"), CS_TYPE_UTF8MB4_BIN, root_path))) {
+        LOG_WARN("failed to build root JSON path", K(ret));
+      } else if (OB_FAIL(root_path->formalize(ctx_.session_info_))) {
+        LOG_WARN("failed to formalize root JSON path", K(ret));
+      } else if (OB_FAIL(ObSearchIndexQueryRangeUtils::json_prefix_path_encode(allocator_, ctx_,
+          *root_path, search_ctx.path_prefix_, false, can_extract, true))) {
+        LOG_WARN("failed to check root JSON path coverage", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret) && can_extract && search_ctx.path_prefix_.length() + 6 > SEARCH_INDEX_PATH_LENGTH) {
+    // Reserve two array markers and the scalar type; do not truncate path keys.
+    can_extract = false;
+  }
+  for (int64_t i = 1; OB_SUCC(ret) && can_extract && i < 5; ++i) {
+    const ObRawExpr *arg = expr.get_param_expr(i);
+    const ObRawExpr *literal = ObRawExprUtils::skip_inner_added_expr(arg);
+    ObObj value;
+    if (OB_ISNULL(arg) || OB_ISNULL(literal)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null range argument", K(ret), K(i));
+    } else if (!literal->is_immutable_const_expr()) {
+      // DSL endpoints/flags are literals. Keep mutable internal arguments as filters:
+      // nullness, inclusion and type must not be frozen into a cached range.
+      can_extract = false;
+    } else if (OB_FAIL(get_calculable_expr_val(arg, value, can_extract))) {
+      LOG_WARN("failed to evaluate range argument", K(ret), K(i));
+    } else if (!can_extract) {
+    } else if (i >= 3) {
+      if (value.is_null() || !value.is_integer_type() || value.get_int() < 0 || value.get_int() > 1) {
+        can_extract = false;
+      } else {
+        inclusive[i - 3] = value.get_int() != 0;
+      }
+    } else if (!value.is_null()) {
+      ObIJsonBase *bound = nullptr;
+      uint8_t encode_type = 0;
+      has_bound[i - 1] = true;
+      if (!arg->is_bool_expr() && ObJsonExprHelper::is_convertible_to_json(value.get_type())) {
+        // Match expression evaluation: SQL strings are scalar JSON strings.
+        if (OB_FAIL(ObJsonExprHelper::transform_convertible_2jsonBase(value, value.get_type(),
+                      &allocator_, value.get_collation_type(), bound, ObConv2JsonParam(false)))) {
+          LOG_WARN("failed to convert JSON range bound", K(ret));
+        }
+      } else if (OB_FAIL(ObJsonExprHelper::get_json_val(value, ctx_.exec_ctx_, arg->is_bool_expr(),
+                                                        &allocator_, bound))) {
+        LOG_WARN("failed to get JSON range bound", K(ret));
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_ISNULL(bound)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null JSON range bound", K(ret));
+      } else if (!bound->is_json_scalar(bound->json_type())
+                 || bound->json_type() == ObJsonNodeType::J_NULL
+                 || bound->json_type() == ObJsonNodeType::J_ERROR) {
+        can_extract = false;
+      } else if (bound->json_type() == ObJsonNodeType::J_OPAQUE) {
+        // JSON opaque comparison includes field_type(), which is absent from
+        // the index value encoding. Keep the original predicate as a filter.
+        can_extract = false;
+      } else if (OB_FAIL(ObSearchIndexPathEncoder::encode_type(bound->json_type(), encode_type))) {
+        LOG_WARN("failed to encode range bound type", K(ret));
+      } else if (range_type != 0 && range_type != encode_type) {
+        can_extract = false;
+      } else if (OB_FAIL(ObSearchIndexConstraint::is_json_scalar_match(bound,
+                         search_ctx.get_cons_encode_type(), can_extract))) {
+        LOG_WARN("failed to check range bound against index", K(ret));
+      } else {
+        range_type = encode_type;
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (can_extract && (has_bound[0] || has_bound[1])) {
+    if (OB_FAIL(fill_dsl_multi_value_range_node(*column_expr, expr, has_bound, inclusive,
+                                                range_type, range_node))) {
+      LOG_WARN("failed to build DSL multi-value range node", K(ret));
+    } else {
+      ctx_.cur_is_precise_ = true;
+    }
+  } else if (OB_FAIL(generate_always_true_or_false_node(true, range_node))) {
+    LOG_WARN("failed to generate fallback range", K(ret));
+  }
+  search_ctx.path_prefix_ = saved_prefix;
+  search_ctx.pick_type_ = saved_pick;
+  return ret;
+}
+
+int ObExprRangeConverter::fill_dsl_multi_value_range_node(const ObColumnRefRawExpr &column_expr,
+                                                          const ObRawExpr &expr,
+                                                          const bool *has_bound,
+                                                          const bool *inclusive,
+                                                          uint8_t encode_type,
+                                                          ObRangeNode *&range_node)
+{
+  int ret = OB_SUCCESS;
+  ObRawExpr *column_idx_expr = nullptr;
+  int64_t column_idx = -1;
+  int64_t bounds[2] = {OB_RANGE_MIN_VALUE, OB_RANGE_MAX_VALUE};
+  const ObObjType json_type = ObJsonType;
+  ObString prefix = ctx_.search_index_range_ctx_->path_prefix_;
+  ObSEArray<ObRangeNode *, 3> nodes;
+  if (OB_FAIL(ObSearchIndexQueryRangeUtils::build_column_idx_expr(ctx_, column_expr, column_idx_expr))) {
+    LOG_WARN("failed to build column index expr", K(ret));
+  } else if (OB_FAIL(get_final_expr_idx(column_idx_expr, get_column_meta(SEARCH_INDEX_COL_IDX), column_idx))) {
+    LOG_WARN("failed to get column index value", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < 2; ++i) {
+    if (has_bound[i] && OB_FAIL(get_final_search_index_value_param_idx(*expr.get_param_expr(i + 1),
+                                                                       &json_type, bounds[i]))) {
+      LOG_WARN("failed to encode range endpoint", K(ret), K(i));
+    }
+  }
+  for (int64_t depth = 0; OB_SUCC(ret) && depth < 3; ++depth) {
+    ObString path;
+    ObConstRawExpr *path_expr = nullptr;
+    int64_t path_idx = -1;
+    ObRangeNode *node = nullptr;
+    if (depth > 0 && OB_FAIL(ObSearchIndexPathEncoder::generate_array_path(allocator_, prefix, prefix))) {
+      LOG_WARN("failed to append array marker", K(ret));
+    } else if (OB_FAIL(ObSearchIndexPathEncoder::generate_enc_path(allocator_, prefix, encode_type, path))) {
+      LOG_WARN("failed to encode typed JSON path", K(ret));
+    } else if (OB_FAIL(ObRawExprUtils::build_const_string_expr(*ctx_.expr_factory_, ObVarcharType,
+                                                              path, CS_TYPE_BINARY, path_expr))) {
+      LOG_WARN("failed to build typed path expr", K(ret));
+    } else if (OB_FAIL(get_final_expr_idx(path_expr, get_column_meta(SEARCH_INDEX_PATH), path_idx))) {
+      LOG_WARN("failed to get typed path value", K(ret));
+    } else if (OB_FAIL(alloc_range_node(node))) {
+      LOG_WARN("failed to allocate multi-value range node", K(ret));
+    } else {
+      node->min_offset_ = SEARCH_INDEX_COL_IDX;
+      node->max_offset_ = SEARCH_INDEX_VALUE;
+      node->is_search_node_ = 1;
+      node->start_keys_[SEARCH_INDEX_COL_IDX] = node->end_keys_[SEARCH_INDEX_COL_IDX] = column_idx;
+      node->start_keys_[SEARCH_INDEX_PATH] = node->end_keys_[SEARCH_INDEX_PATH] = path_idx;
+      // Each physical interval contains both endpoints, on the same value key.
+      node->start_keys_[SEARCH_INDEX_VALUE] = bounds[0];
+      node->end_keys_[SEARCH_INDEX_VALUE] = bounds[1];
+      node->start_keys_[SEARCH_INDEX_DOC_ID] = !has_bound[0] || inclusive[0]
+                                              ? OB_RANGE_MIN_VALUE : OB_RANGE_MAX_VALUE;
+      node->end_keys_[SEARCH_INDEX_DOC_ID] = !has_bound[1] || inclusive[1]
+                                            ? OB_RANGE_MAX_VALUE : OB_RANGE_MIN_VALUE;
+      node->include_start_ = false;
+      node->include_end_ = false;
+      if (OB_FAIL(nodes.push_back(node))) {
+        LOG_WARN("failed to append multi-value range node", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(ObRangeGraphGenerator::or_range_nodes(*this, nodes,
+                                                                  ctx_.column_cnt_, range_node))) {
+    LOG_WARN("failed to combine multi-value range paths", K(ret));
   }
   return ret;
 }

@@ -293,6 +293,13 @@ private:
                                           common::ObDomainOpType op_type,
                                           bool with_path,
                                           ObRangeNode *&range_node);
+  int convert_dsl_multi_value_range(const ObRawExpr &expr, ObRangeNode *&range_node);
+  int fill_dsl_multi_value_range_node(const ObColumnRefRawExpr &column_expr,
+                                      const ObRawExpr &expr,
+                                      const bool *has_bound,
+                                      const bool *inclusive,
+                                      uint8_t encode_type,
+                                      ObRangeNode *&range_node);
 
 private:
   ObIAllocator &allocator_;

@@ -381,7 +381,8 @@ int ObSearchIndexQueryRangeUtils::json_prefix_path_encode(ObIAllocator &allocato
                                                           const ObRawExpr &path_expr,
                                                           ObString &path_prefix,
                                                           const bool index_sub_path,
-                                                          bool &can_extract_range)
+                                                          bool &can_extract_range,
+                                                          const bool recursive_arrays)
 {
   int ret = OB_SUCCESS;
   can_extract_range = false;
@@ -493,6 +494,19 @@ int ObSearchIndexQueryRangeUtils::json_prefix_path_encode(ObIAllocator &allocato
         if (OB_SUCC(ret) && only_member_nodes && !nested_index_ineligible && OB_NOT_NULL(json_filter)) {
           if (OB_FAIL(json_filter->is_indexed(path_items, pick_type, filter_passed, index_sub_path))) {
             LOG_WARN("failed to check path filter", K(ret));
+          }
+          const int64_t prefix_count = path_items.count();
+          // A multivalue range visits scalars and consecutive arrays, but not
+          // object descendants. Check the same paths as index row generation.
+          for (int64_t depth = 0; OB_SUCC(ret) && filter_passed && recursive_arrays && depth < 2; ++depth) {
+            if (OB_FAIL(path_items.push_back(ObSearchIndexPathEncoder::make_array_path()))) {
+              LOG_WARN("failed to append array path", K(ret));
+            } else if (OB_FAIL(json_filter->is_indexed(path_items, pick_type, filter_passed, false))) {
+              LOG_WARN("failed to check array path filter", K(ret));
+            }
+          }
+          while (path_items.count() > prefix_count) {
+            path_items.pop_back();
           }
         }
         can_extract_range = only_member_nodes && filter_passed && !nested_index_ineligible;

@@ -1033,6 +1033,7 @@ ob_set_subtarget(ob_sql engine_expr
   engine/expr/ob_expr_image_type.cpp
   engine/expr/ob_expr_ai/ob_expr_load_file.cpp
   engine/expr/ob_expr_rand_canonical.cpp
+  engine/expr/ob_expr_dsl_multi_value_range.cpp
 )
 
 ob_set_subtarget(ob_sql_extra ALONE

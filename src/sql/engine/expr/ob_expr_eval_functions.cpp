@@ -494,6 +494,7 @@
 #include "ob_expr_collation.h"
 #include "ob_expr_get_routine_param_type_str.h"
 #include "ob_expr_image_type.h"
+#include "ob_expr_dsl_multi_value_range.h"
 
 namespace oceanbase
 {
@@ -1521,6 +1522,7 @@ ObExprRandCanonical::calc_random_expr_canonical,                    /* 890 */
   NULL, // ObExprVecIVFBase::eval_vec_ivf_type,                       /* 923 */
   NULL, // ObExprVecIVFBase::eval_vec_ivf_cid,                        /* 924 */
   NULL, // ObExprVecIVFBase::eval_vec_ivf_data,                       /* 925 */
+  ObExprDslMultiValueRange::eval_dsl_multi_value_range,               /* 926 */
 };
 
 static ObExpr::EvalBatchFunc g_expr_eval_batch_functions[] = {

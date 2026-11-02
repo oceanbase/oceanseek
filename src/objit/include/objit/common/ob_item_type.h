@@ -1004,6 +1004,7 @@ T_FUN_SYS_SEARCH_INDEX_INNER_PATH = 1943,
   T_FUN_SYS_VEC_IVF_TYPE = 1958,
   T_FUN_SYS_VEC_IVF_CID = 1959,
   T_FUN_SYS_VEC_IVF_DATA = 1960,
+  T_FUN_SYS_DSL_MULTI_VALUE_RANGE = 1961,
 
   ///< @note add new sys function type before this line
   T_FUN_SYS_END = 2000,

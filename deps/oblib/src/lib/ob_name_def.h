@@ -1318,4 +1318,7 @@
 // Inner functions for search index
 #define N_SEARCH_INDEX_INNER_PATH           "search_index_inner_path"
 #define N_SEARCH_INDEX_INNER_VALUE          "search_index_inner_value"
+
+// Internal DSL expressions
+#define N_DSL_MULTI_VALUE_RANGE             "dsl_multi_value_range"
 #endif //OCEANBASE_LIB_OB_NAME_DEF_H_
