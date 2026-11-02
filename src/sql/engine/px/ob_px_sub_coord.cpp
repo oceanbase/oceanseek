@@ -142,6 +142,67 @@ int ObPxSubCoord::collect_async_index_gi_tablet_locs(
   return ret;
 }
 
+// Collect tablets for an async index scan that runs in this DFO without a granule
+// iterator above it (no task array map entry for its op id). Workers execute such a scan
+// through the DAS table loc resolved from the SQC das_ctx, so the catalog must be prepared
+// from that same table loc before workers start.
+int ObPxSubCoord::collect_async_index_tablet_locs_from_das_ctx(
+    const ObTableScanSpec *scan_spec,
+    common::ObIArray<const ObDASTabletLoc *> &tablet_locs) const
+{
+  int ret = OB_SUCCESS;
+  tablet_locs.reset();
+  if (OB_ISNULL(scan_spec)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null table scan spec while collecting async index tablet locations",
+             K(ret), KP(scan_spec));
+  } else {
+    // Resolve the table loc with the same key as the worker-side no-GI table scan in
+    // ObTableScanOp::init_das_scan_rtdef, so the collected tablets cover what the
+    // workers of this DFO scan (worker das_ctx is deserialized from the SQC das_ctx).
+    const uint64_t table_loc_id = scan_spec->get_table_loc_id();
+    const uint64_t ref_table_id = scan_spec->tsc_ctdef_.scan_ctdef_.ref_table_id_;
+    ObDASTableLoc *table_loc =
+        DAS_CTX(*sqc_arg_.exec_ctx_).get_table_loc_by_id(table_loc_id, ref_table_id);
+    if (OB_ISNULL(table_loc)) {
+      // A scan without GI is always executed by workers, so a missing table loc is an
+      // invalid source: silently skipping the catalog here would only defer the
+      // failure to the worker-side catalog lookup.
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("table loc not found for async index scan without GI", K(ret),
+               K(table_loc_id), K(ref_table_id), "scan_op_id", scan_spec->get_id());
+    } else {
+      // The SQC das_ctx carries ALL tablet locations of the query, not only the ones
+      // assigned to this SQC (see the ObDASCtx comment in ob_exec_context.h), so this
+      // table loc may cover tablets routed to other observers. Only tablets routed to
+      // this observer are executed by local DAS scan tasks of this DFO and read the SQC
+      // catalog: a tablet routed elsewhere runs as a remote DAS task on its owning
+      // server, which builds its own async index catalog there
+      // (ObDASScanOp::build_async_index_query_ctx). Preparing a remote tablet here
+      // would fail anyway, because the catalog fetch goes through the local
+      // ObAccessService::get_async_index_segment_group_ctx, which only resolves log
+      // streams owned by this observer. This keeps the same local-tablet scope as the
+      // GI path (its tablets come from the QC-side per-SQC location assignment) and as
+      // ObTableScanOp::prepare_async_index_query_ctx on the local execution path.
+      for (DASTabletLocListIter iter = table_loc->tablet_locs_begin();
+           OB_SUCC(ret) && iter != table_loc->tablet_locs_end(); ++iter) {
+        const ObDASTabletLoc *tablet_loc = *iter;
+        if (OB_ISNULL(tablet_loc)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("null tablet location in async index table loc", K(ret),
+                   K(table_loc_id), K(ref_table_id), "scan_op_id", scan_spec->get_id());
+        } else if (tablet_loc->server_ != GCTX.self_addr()) {
+          // A valid scan may simply have no tablet routed to this observer; such
+          // tablets are covered by the remote DAS task catalog on their owning server.
+        } else if (OB_FAIL(tablet_locs.push_back(tablet_loc))) {
+          LOG_WARN("failed to push back async index tablet location", K(ret), KPC(tablet_loc));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObPxSubCoord::prepare_async_index_query_ctxs()
 {
   int ret = OB_SUCCESS;
@@ -161,29 +222,48 @@ int ObPxSubCoord::prepare_async_index_query_ctxs()
       } else if (!scan_spec->tsc_ctdef_.is_async_index_query_) {
       } else if (OB_FAIL(ObDASAsyncIndexQueryCtx::check_tx_isolation(exec_ctx->get_my_session()))) {
         LOG_WARN("failed to check async index query isolation", K(ret));
-      } else if (OB_FAIL(collect_async_index_gi_tablet_locs(
-                     scan_spec->get_id(), tablet_locs))) {
-        LOG_WARN("failed to collect async index GI tablet locations", K(ret),
-                 "scan_op_id", scan_spec->get_id());
-      } else if (tablet_locs.empty()) {
-        // No GI task can open this scan. If that invariant changes, the worker lookup fails loudly.
-        LOG_INFO("skip async index query catalog without GI tasks",
-                 "scan_op_id", scan_spec->get_id());
-      } else if (OB_UNLIKELY(!exec_ctx->get_das_ctx().get_snapshot().is_valid())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("invalid SQL snapshot while preparing async index query context", K(ret),
-                 "scan_op_id", scan_spec->get_id());
-      } else if (OB_FAIL(sqc_ctx_.create_async_index_query_ctx(
-                     scan_spec->get_id(), query_ctx))) {
-        LOG_WARN("failed to create SQC async index query context", K(ret),
-                 "scan_op_id", scan_spec->get_id());
-      } else if (OB_FAIL(query_ctx->prepare(
-                     scan_spec->tsc_ctdef_.attach_spec_.attach_ctdef_, tablet_locs,
-                     sql_read_snapshot,
-                     scan_spec->tsc_ctdef_.scan_ctdef_.use_async_index_group_alignment_
-                         ? ASYNC_INDEX_EXEC_GROUP : ASYNC_INDEX_EXEC_LEGACY))) {
-        LOG_WARN("failed to prepare SQC async index query context", K(ret),
-                 "scan_op_id", scan_spec->get_id());
+      } else {
+        // The GI task array map only holds entries for scans actually scheduled by a
+        // granule iterator in this DFO (a structural GI operator above the scan does not
+        // imply an entry here); such an entry may carry zero tasks after partition
+        // pruning. A scan without GI in this DFO has no entry but is still executed by
+        // its workers through the DAS table loc, so its tablets are collected from the
+        // SQC das_ctx instead of being treated as "no scan task" and skipped.
+        const GITaskArrayMap &task_array_map = sqc_ctx_.gi_pump_.get_task_array_map();
+        bool gi_scheduled = false;
+        for (int64_t j = 0; !gi_scheduled && j < task_array_map.count(); ++j) {
+          gi_scheduled = (task_array_map.at(j).tsc_op_id_ == scan_spec->get_id());
+        }
+        if (OB_FAIL(gi_scheduled
+                        ? collect_async_index_gi_tablet_locs(scan_spec->get_id(), tablet_locs)
+                        : collect_async_index_tablet_locs_from_das_ctx(scan_spec, tablet_locs))) {
+          LOG_WARN("failed to collect async index tablet locations", K(ret),
+                   "scan_op_id", scan_spec->get_id(), K(gi_scheduled));
+        } else if (tablet_locs.empty()) {
+          // Either the GI tasks of this scan were pruned to zero, or the no-GI scan has
+          // no tablet routed to this observer (a valid scan with no local candidates:
+          // its remote tablets are covered by the remote DAS task catalogs on their
+          // owning servers), or the table loc carries no tablet at all (abnormal
+          // boundary). No catalog is created for this SQC; if that invariant changes,
+          // the worker lookup fails loudly instead of returning wrong results.
+          LOG_INFO("skip async index query catalog without local scan tablets",
+                   "scan_op_id", scan_spec->get_id(), K(gi_scheduled));
+        } else if (OB_UNLIKELY(!exec_ctx->get_das_ctx().get_snapshot().is_valid())) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid SQL snapshot while preparing async index query context", K(ret),
+                   "scan_op_id", scan_spec->get_id());
+        } else if (OB_FAIL(sqc_ctx_.create_async_index_query_ctx(
+                       scan_spec->get_id(), query_ctx))) {
+          LOG_WARN("failed to create SQC async index query context", K(ret),
+                   "scan_op_id", scan_spec->get_id());
+        } else if (OB_FAIL(query_ctx->prepare(
+                       scan_spec->tsc_ctdef_.attach_spec_.attach_ctdef_, tablet_locs,
+                       sql_read_snapshot,
+                       scan_spec->tsc_ctdef_.scan_ctdef_.use_async_index_group_alignment_
+                           ? ASYNC_INDEX_EXEC_GROUP : ASYNC_INDEX_EXEC_LEGACY))) {
+          LOG_WARN("failed to prepare SQC async index query context", K(ret),
+                   "scan_op_id", scan_spec->get_id());
+        }
       }
     }
   }

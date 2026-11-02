@@ -101,6 +101,9 @@ private:
   int collect_async_index_gi_tablet_locs(
       const uint64_t scan_op_id,
       common::ObIArray<const ObDASTabletLoc *> &tablet_locs) const;
+  int collect_async_index_tablet_locs_from_das_ctx(
+      const ObTableScanSpec *scan_spec,
+      common::ObIArray<const ObDASTabletLoc *> &tablet_locs) const;
   int get_tsc_or_dml_op_tablets(ObOpSpec &root,
                                 const DASTabletLocIArray &tsc_locations,
                                 const common::ObIArray<ObSqcTableLocationKey> &tsc_location_keys,
