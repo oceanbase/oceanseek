@@ -164,6 +164,7 @@ int ObSqlTransControl::explicit_start_trans(ObSQLSessionInfo *session,
   }
 
   OZ (build_tx_param_(session, tx_param, &read_only));
+  OX (tx_param.allow_standby_read_only_ = session->is_real_inner_session());
   OZ (txs->acquire_tx(session->get_tx_desc(), session->get_server_sid(), session->get_sid(), session->get_data_version()));
   OZ (txs->start_tx(*session->get_tx_desc(), tx_param), tx_param);
   OX (tx_id = session->get_tx_desc()->get_tx_id());

@@ -94,7 +94,7 @@ enum ObSchemaScanSelectFlag
       | OB_SCHEMA_SCAN_SELECT_HAS_DYNAMIC_PARTITION_POLICY,
 };
 
-// Wide lite row for STRONG Guard lite snapshot (project all full-scan kinds).
+// Lite table fields read from inner-table metadata.
 // String fields are deep-copied into caller-provided allocator when the
 // corresponding select flags are set; otherwise empty.
 struct ObSchemaTableLiteRow
@@ -222,7 +222,7 @@ public:
   static int fill_async_index_types(common::ObIArray<int64_t> &index_types);
 
   static const char *scan_kind_to_str(const ObSchemaScanKind kind);
-  // Used by STRONG encrypted projection (tablespace_id filter on lite_snapshot_).
+  // Shared by encrypted tablespace enumeration and lite scans.
   static int scan_encrypted_tablespace_ids(common::ObISQLClient &sql_client,
                                            const uint64_t tenant_id,
                                            common::ObIArray<uint64_t> &tablespace_ids);

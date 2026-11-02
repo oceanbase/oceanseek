@@ -31,6 +31,7 @@
 #include "share/ob_server_struct.h"
 #include "share/ob_schema_status_proxy.h"
 #include "lib/mysqlclient/ob_mysql_transaction.h"
+#include "observer/ob_inner_sql_connection.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "sql/privilege_check/ob_ora_priv_check.h"
 #include "share/catalog/ob_catalog_utils.h"
@@ -55,11 +56,8 @@ ObSchemaGetterGuard::ObSchemaGetterGuard()
     table_impl_(&ObOriginalSchemaGetterGuard::instance()),
     is_latest_guard_(false),
     schema_scan_consistency_mode_(ObSchemaScanConsistencyMode::RELAXED),
-    has_lite_snapshot_(false),
-    lite_snapshot_tenant_id_(OB_INVALID_TENANT_ID),
-    lite_snapshot_(),
-    lite_scan_trans_(NULL),
-    lite_scan_trans_tenant_id_(OB_INVALID_TENANT_ID)
+    schema_scan_trans_(NULL),
+    schema_scan_trans_tenant_id_(OB_INVALID_TENANT_ID)
 {
 }
 
@@ -68,17 +66,14 @@ ObSchemaGetterGuard::ObSchemaGetterGuard(const ObSchemaMgrItem::Mod mod)
     table_impl_(&ObOriginalSchemaGetterGuard::instance()),
     is_latest_guard_(false),
     schema_scan_consistency_mode_(ObSchemaScanConsistencyMode::RELAXED),
-    has_lite_snapshot_(false),
-    lite_snapshot_tenant_id_(OB_INVALID_TENANT_ID),
-    lite_snapshot_(),
-    lite_scan_trans_(NULL),
-    lite_scan_trans_tenant_id_(OB_INVALID_TENANT_ID)
+    schema_scan_trans_(NULL),
+    schema_scan_trans_tenant_id_(OB_INVALID_TENANT_ID)
 {
 }
 
 ObSchemaGetterGuard::~ObSchemaGetterGuard()
 {
-  reset_lite_scan_transaction_();
+  release_schema_scan_trans_early();
   // Destruct handles_ will reduce reference count automatically.
   if (pin_cache_size_ >= FULL_SCHEMA_MEM_THREHOLD) {
     int ret = OB_SUCCESS;
@@ -168,8 +163,7 @@ int ObSchemaGetterGuard::init_from_snapshot(
 
 int ObSchemaGetterGuard::reset()
 {
-  int ret = OB_SUCCESS;
-  reset_lite_scan_transaction_();
+  int ret = release_schema_scan_trans_early();
   schema_service_ = NULL;
   schema_objs_.reset();
 
@@ -191,38 +185,46 @@ int ObSchemaGetterGuard::reset()
   is_inited_ = false;
   is_latest_guard_ = false;
   schema_scan_consistency_mode_ = ObSchemaScanConsistencyMode::RELAXED;
-  has_lite_snapshot_ = false;
-  lite_snapshot_tenant_id_ = OB_INVALID_TENANT_ID;
-  lite_snapshot_.reset();
   return ret;
 }
 
-void ObSchemaGetterGuard::reset_lite_scan_transaction_()
-{
-  const int ret = finish_lite_scan();
-  if (OB_SUCCESS != ret) {
-    LOG_WARN("fail to finish lite scan while resetting guard", KR(ret));
-  }
-}
-
-int ObSchemaGetterGuard::finish_lite_scan()
+int ObSchemaGetterGuard::release_schema_scan_trans_early()
 {
   int ret = OB_SUCCESS;
-  if (OB_NOT_NULL(lite_scan_trans_)) {
-    if (lite_scan_trans_->is_started()) {
-      if (OB_FAIL(lite_scan_trans_->end(false /*commit*/))) {
-        LOG_WARN("fail to end lite scan snapshot transaction", KR(ret),
-                 K_(lite_scan_trans_tenant_id));
+  if (OB_NOT_NULL(schema_scan_trans_)) {
+    if (schema_scan_trans_->is_started()) {
+      if (OB_FAIL(schema_scan_trans_->end(false /*commit*/))) {
+        LOG_WARN("fail to end schema scan transaction", KR(ret),
+                 K_(schema_scan_trans_tenant_id));
       }
     }
-    OB_DELETE(ObMySQLTransaction, "SchemaLiteTxn", lite_scan_trans_);
-    lite_scan_trans_ = NULL;
+    OB_DELETE(ObMySQLTransaction, "SchemaScanTxn", schema_scan_trans_);
+    schema_scan_trans_ = NULL;
   }
-  lite_scan_trans_tenant_id_ = OB_INVALID_TENANT_ID;
+  schema_scan_trans_tenant_id_ = OB_INVALID_TENANT_ID;
   return ret;
 }
 
-int ObSchemaGetterGuard::get_lite_scan_sql_client(
+static int init_schema_scan_connection(sqlclient::ObISQLConnection *connection, const uint64_t tenant_id)
+{
+  int ret = OB_SUCCESS;
+  ObInnerSQLConnection *inner_conn = dynamic_cast<ObInnerSQLConnection *>(connection);
+  // An owned inner session with a non-default ID was created by the session manager.
+  if (OB_ISNULL(inner_conn) || inner_conn->is_extern_session() || inner_conn->is_resource_conn()
+      || MTL_ID() != tenant_id || !inner_conn->get_session().is_real_inner_session()
+      || ObInnerSQLConnection::INNER_SQL_SESS_ID == inner_conn->get_session().get_server_sid()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("strong schema scan requires a managed inner session in the target tenant",
+             KR(ret), K(tenant_id), "mtl_tenant_id", MTL_ID());
+  } else {
+    sql::ObSQLSessionInfo &session = inner_conn->get_session();
+    session.set_tx_isolation(transaction::ObTxIsolationLevel::RR);
+    session.set_tx_read_only(session.get_tx_read_only(), true);
+  }
+  return ret;
+}
+
+int ObSchemaGetterGuard::prepare_schema_scan_sql_client_(
     const uint64_t tenant_id,
     ObISQLClient *&sql_client)
 {
@@ -237,37 +239,45 @@ int ObSchemaGetterGuard::get_lite_scan_sql_client(
     LOG_WARN("sql proxy is null", KR(ret), K(tenant_id));
   } else if (ObSchemaScanConsistencyMode::STRONG != schema_scan_consistency_mode_) {
     sql_client = sql_proxy;
-  } else if (OB_NOT_NULL(lite_scan_trans_)
-             && lite_scan_trans_tenant_id_ != tenant_id) {
+  } else if (OB_NOT_NULL(schema_scan_trans_)
+             && schema_scan_trans_tenant_id_ != tenant_id) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("one strong lite scan guard cannot span tenants", KR(ret), K(tenant_id),
-             K_(lite_scan_trans_tenant_id));
+    LOG_WARN("one strong schema scan guard cannot span tenants", KR(ret), K(tenant_id),
+             K_(schema_scan_trans_tenant_id));
   } else {
-    if (OB_ISNULL(lite_scan_trans_)) {
-      // The caller may scan a tenant without a local unit.
+    if (OB_ISNULL(schema_scan_trans_)) {
       const uint64_t mem_tenant_id = MTL_CTX() ? MTL_ID() : OB_SERVER_TENANT_ID;
-      ObMemAttr attr(mem_tenant_id, "SchemaLiteTxn");
+      ObMemAttr attr(mem_tenant_id, "SchemaScanTxn");
       if (OB_SERVER_TENANT_ID == mem_tenant_id) {
         SET_USE_500(attr);
       }
-      lite_scan_trans_ = OB_NEW(ObMySQLTransaction, attr);
-      if (OB_ISNULL(lite_scan_trans_)) {
+      schema_scan_trans_ = OB_NEW(ObMySQLTransaction, attr);
+      if (OB_ISNULL(schema_scan_trans_)) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("fail to allocate lite scan transaction", KR(ret), K(tenant_id));
+        LOG_WARN("fail to allocate schema scan transaction", KR(ret), K(tenant_id));
       }
     }
-    if (OB_SUCC(ret) && !lite_scan_trans_->is_started()) {
-      if (OB_FAIL(lite_scan_trans_->start(sql_proxy, tenant_id,
-                                           true /*with_snapshot*/))) {
-        LOG_WARN("fail to start lite scan snapshot transaction", KR(ret), K(tenant_id));
-        OB_DELETE(ObMySQLTransaction, "SchemaLiteTxn", lite_scan_trans_);
-        lite_scan_trans_ = NULL;
+    if (OB_SUCC(ret) && !schema_scan_trans_->is_started()) {
+      if (OB_FAIL(schema_scan_trans_->start_with_connection_init(
+              sql_proxy, tenant_id, true /*with_snapshot*/, 0 /*group_id*/, init_schema_scan_connection))) {
+        LOG_WARN("fail to start schema scan snapshot transaction", KR(ret), K(tenant_id));
       } else {
-        lite_scan_trans_tenant_id_ = tenant_id;
+        ObInnerSQLConnection *inner_conn = static_cast<ObInnerSQLConnection *>(schema_scan_trans_->get_connection());
+        // BEGIN fixes the route for all subsequent statements in this transaction.
+        if (OB_INVALID_ID != inner_conn->get_resource_conn_id()
+            || tenant_id != inner_conn->get_session().get_effective_tenant_id()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("strong schema scan requires local execution in the target tenant", KR(ret), K(tenant_id));
+        } else {
+          schema_scan_trans_tenant_id_ = tenant_id;
+        }
+      }
+      if (OB_FAIL(ret)) {
+        release_schema_scan_trans_early();
       }
     }
     if (OB_SUCC(ret)) {
-      sql_client = lite_scan_trans_;
+      sql_client = schema_scan_trans_;
     }
   }
   return ret;

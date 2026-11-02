@@ -270,6 +270,7 @@ int ObTransService::stop_tx(ObTxDesc &tx)
 int ObTransService::start_tx(ObTxDesc &tx, const ObTxParam &tx_param, const ObTransID &tx_id)
 {
   int ret = OB_SUCCESS;
+  bool standby_read_only = false;
   if (!tx_param.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     TRANS_LOG(WARN, "invalid tx param", K(ret), KR(ret), K(tx_param));
@@ -279,6 +280,13 @@ int ObTransService::start_tx(ObTxDesc &tx, const ObTxParam &tx_param, const ObTr
     tx.inc_op_sn();
     if (!tx_id.is_valid()) {
       ret = tx_desc_mgr_.add(tx);
+      // Standby read-only inner transactions keep a descriptor and snapshot without a txid.
+      if (OB_STANDBY_READ_ONLY == ret && tx_param.allow_standby_read_only_
+          && tx_param.access_mode_ == ObTxAccessMode::RD_ONLY
+          && !tx.is_xa_trans() && tx.is_clean()) {
+        standby_read_only = true;
+        ret = OB_SUCCESS;
+      }
     } else {
       ret = tx_desc_mgr_.add_with_txid(tx_id, tx);
     }
@@ -286,7 +294,7 @@ int ObTransService::start_tx(ObTxDesc &tx, const ObTxParam &tx_param, const ObTr
       TRANS_LOG(WARN, "add tx to txMgr fail", K(ret), K(tx));
     } else {
       tx.cluster_id_      = tx_param.cluster_id_;
-      tx.access_mode_     = tx_param.access_mode_;
+      tx.access_mode_     = standby_read_only ? ObTxAccessMode::STANDBY_RD_ONLY : tx_param.access_mode_;
       tx.isolation_       = tx_param.isolation_;
       tx.active_ts_       = ObClockGenerator::getClock();
       tx.timeout_us_      = tx_param.timeout_us_;

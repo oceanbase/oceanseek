@@ -638,14 +638,6 @@ int ObStorageCacheCleanTask::collect_exist_policy_ids_(ObScpCleanScanCtx &ctx)
             schema_guard, schema::ObSchemaLiteJoinSide::SUBPART, ctx))) {
       LOG_WARN("fail to collect existing subpart ids", KR(ret), K_(tenant_id));
     }
-
-    const int finish_ret = schema_guard.finish_lite_scan();
-    if (OB_SUCCESS != finish_ret) {
-      LOG_WARN("fail to finish storage cache policy lite scan", KR(finish_ret), K_(tenant_id));
-      if (OB_SUCC(ret)) {
-        ret = finish_ret;
-      }
-    }
   }
   return ret;
 }

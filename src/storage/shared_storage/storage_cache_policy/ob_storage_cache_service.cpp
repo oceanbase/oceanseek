@@ -2496,13 +2496,6 @@ int ObStorageCachePolicyService::check_and_generate_tablet_tasks(
     }
   }
 
-  const int finish_ret = schema_guard.finish_lite_scan();
-  if (OB_SUCCESS != finish_ret) {
-    LOG_WARN("fail to finish scp lite scan", KR(finish_ret), K_(tenant_id));
-    if (OB_SUCC(ret)) {
-      ret = finish_ret;
-    }
-  }
   if (OB_SUCC(ret)) {
     if (!first_loop_run_competed_ && 0 == ctx.failed_table_count_) {
       first_loop_run_competed_ = true;

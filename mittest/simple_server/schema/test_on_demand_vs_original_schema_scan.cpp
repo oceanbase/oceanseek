@@ -1137,6 +1137,9 @@ TEST_F(TestOnDemandVsOriginalSchemaScan, cmp_T2_table_ids_in_database)
 
 TEST_F(TestOnDemandVsOriginalSchemaScan, cmp_T3_table_ids_in_tablegroup_strong)
 {
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(R.tenant_id_));
+
   ObSchemaGetterGuard guard;
   ObArray<uint64_t> od_ids;
   ObArray<uint64_t> orig_ids;
@@ -1154,6 +1157,9 @@ TEST_F(TestOnDemandVsOriginalSchemaScan, cmp_T3_table_ids_in_tablegroup_strong)
 
 TEST_F(TestOnDemandVsOriginalSchemaScan, cmp_T3b_tablegroup_strong_repeatable)
 {
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(R.tenant_id_));
+
   ObSchemaGetterGuard guard;
   ObArray<uint64_t> od1;
   ObArray<uint64_t> od2;
@@ -1429,9 +1435,9 @@ TEST_F(TestOnDemandVsOriginalSchemaScan, cmp_lite_strong_table_part_subpart_snap
   if (on_demand) {
     ASSERT_EQ(0, count_table_keys_(part_keys, concurrent_table_id));
     ASSERT_EQ(0, count_table_keys_(subpart_keys, concurrent_table_id));
-    ASSERT_NE(nullptr, guard.lite_scan_trans_);
-    ASSERT_EQ(OB_SUCCESS, guard.finish_lite_scan());
-    ASSERT_EQ(nullptr, guard.lite_scan_trans_);
+    ASSERT_NE(nullptr, guard.schema_scan_trans_);
+    ASSERT_EQ(OB_SUCCESS, guard.reset());
+    ASSERT_EQ(nullptr, guard.schema_scan_trans_);
     ASSERT_EQ(OB_SUCCESS,
               exec_sql(tenant_proxy, "drop table od_strong_after_snapshot"));
   }
@@ -1707,7 +1713,7 @@ TEST_F(TestOnDemandVsOriginalSchemaScan, cmp_lite_table_mode_helpers)
   ASSERT_EQ(R.lob_id_, lob_meta->data_table_id_);
 }
 
-TEST_F(TestOnDemandVsOriginalSchemaScan, cmp_lite_strong_scan_no_all_lite)
+TEST_F(TestOnDemandVsOriginalSchemaScan, cmp_lite_strong_scan_releases_transaction_on_reset)
 {
   ObSchemaGetterGuard guard;
   ObSchemaLiteScanSpec spec;
@@ -1722,14 +1728,13 @@ TEST_F(TestOnDemandVsOriginalSchemaScan, cmp_lite_strong_scan_no_all_lite)
                        spec, "mittest_lite_strong_db");
   ASSERT_EQ(OB_SUCCESS, guard.scan_lite_tables(spec, table_iter));
   ASSERT_EQ(OB_SUCCESS, drain_lite_iter_(table_iter, table_ids, table_keys));
-  ASSERT_FALSE(guard.has_lite_snapshot());
   if (on_demand) {
-    ASSERT_NE(nullptr, guard.lite_scan_trans_);
-    ASSERT_EQ(OB_SUCCESS, guard.finish_lite_scan());
-    ASSERT_EQ(nullptr, guard.lite_scan_trans_);
+    ASSERT_NE(nullptr, guard.schema_scan_trans_);
   } else {
-    ASSERT_EQ(OB_SUCCESS, guard.finish_lite_scan());
+    ASSERT_EQ(nullptr, guard.schema_scan_trans_);
   }
+  ASSERT_EQ(OB_SUCCESS, guard.reset());
+  ASSERT_EQ(nullptr, guard.schema_scan_trans_);
 }
 
 TEST_F(TestOnDemandVsOriginalSchemaScan, cmp_lite_scan_invalid_spec)
@@ -1824,6 +1829,9 @@ TEST_F(TestOnDemandVsOriginalSchemaScan, cmp_V1_view_ids)
 
 TEST_F(TestOnDemandVsOriginalSchemaScan, cmp_C2_strong_tenant_ids)
 {
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(R.tenant_id_));
+
   ObSchemaGetterGuard guard;
   ObArray<uint64_t> od_ids;
   ObArray<uint64_t> orig_ids;
@@ -1837,6 +1845,9 @@ TEST_F(TestOnDemandVsOriginalSchemaScan, cmp_C2_strong_tenant_ids)
 
 TEST_F(TestOnDemandVsOriginalSchemaScan, cmp_C2b_strong_database_and_external)
 {
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(R.tenant_id_));
+
   ObSchemaGetterGuard guard;
   ObArray<uint64_t> od_ids;
   ObArray<uint64_t> orig_ids;
@@ -1844,11 +1855,9 @@ TEST_F(TestOnDemandVsOriginalSchemaScan, cmp_C2b_strong_database_and_external)
   guard.set_schema_scan_consistency_mode(ObSchemaScanConsistencyMode::STRONG);
 
   ASSERT_EQ(OB_SUCCESS, od().get_table_ids_in_database(guard, R.tenant_id_, R.db_a_id_, od_ids));
+  const auto *snapshot_trans = guard.schema_scan_trans_;
   if (guard.is_on_demand_schema_mode()) {
-    ASSERT_TRUE(guard.has_lite_snapshot());
-    ASSERT_NE(nullptr, guard.lite_scan_trans_);
-    ASSERT_EQ(OB_SUCCESS, guard.finish_lite_scan());
-    ASSERT_EQ(nullptr, guard.lite_scan_trans_);
+    ASSERT_NE(nullptr, snapshot_trans);
   }
   ASSERT_EQ(OB_SUCCESS, orig().get_table_ids_in_database(guard, R.tenant_id_, R.db_a_id_, orig_ids));
   ASSERT_TRUE(same_id_set(od_ids, orig_ids));
@@ -1857,8 +1866,8 @@ TEST_F(TestOnDemandVsOriginalSchemaScan, cmp_C2b_strong_database_and_external)
   orig_ids.reset();
   ASSERT_EQ(OB_SUCCESS, od().get_external_table_ids_in_tenant(guard, R.tenant_id_, od_ids));
   if (guard.is_on_demand_schema_mode()) {
-    // Projection from the materialized STRONG snapshot must not reacquire a connection.
-    ASSERT_EQ(nullptr, guard.lite_scan_trans_);
+    // Both enumerations use the same STRONG transaction until guard cleanup.
+    ASSERT_EQ(snapshot_trans, guard.schema_scan_trans_);
   }
   ASSERT_EQ(OB_SUCCESS, orig().get_external_table_ids_in_tenant(guard, R.tenant_id_, orig_ids));
   ASSERT_TRUE(same_id_set(od_ids, orig_ids));

@@ -310,69 +310,6 @@ int ObOnDemandSchemaGetterGuard::fetch_table_ids_uncached_(ObSchemaGetterGuard &
   return ret;
 }
 
-bool ObOnDemandSchemaGetterGuard::row_matches_lite_snapshot_spec_(
-    const ObSchemaTableLiteRow &row,
-    const ObSchemaScanSpec &spec,
-    const ObIArray<uint64_t> *encrypted_ts_ids)
-{
-  bool match = false;
-  switch (spec.kind_) {
-    case ObSchemaScanKind::BY_TENANT:
-      match = true;
-      break;
-    case ObSchemaScanKind::BY_TABLEGROUP:
-      match = (row.tablegroup_id_ == spec.filter_id_)
-          && is_tablegroup_listed_table_type(row.table_type_);
-      break;
-    case ObSchemaScanKind::BY_TABLESPACE:
-      match = (row.tablespace_id_ == spec.filter_id_);
-      break;
-    case ObSchemaScanKind::BY_DATABASE:
-      match = (row.database_id_ == spec.filter_id_);
-      break;
-    case ObSchemaScanKind::BY_DUPLICATE_SCOPE:
-      match = (0 != row.duplicate_scope_);
-      break;
-    case ObSchemaScanKind::BY_DYNAMIC_PARTITION:
-      match = row.has_dynamic_partition_policy_;
-      break;
-    case ObSchemaScanKind::BY_TABLE_TYPE: {
-      if (OB_NOT_NULL(spec.enum_values_)) {
-        for (int64_t i = 0; !match && i < spec.enum_values_->count(); ++i) {
-          if (static_cast<int64_t>(row.table_type_) == spec.enum_values_->at(i)) {
-            match = true;
-          }
-        }
-      }
-      break;
-    }
-    case ObSchemaScanKind::BY_INDEX_TYPE: {
-      if (OB_NOT_NULL(spec.enum_values_)) {
-        for (int64_t i = 0; !match && i < spec.enum_values_->count(); ++i) {
-          if (static_cast<int64_t>(row.index_type_) == spec.enum_values_->at(i)) {
-            match = true;
-          }
-        }
-      }
-      break;
-    }
-    case ObSchemaScanKind::BY_ENCRYPTED_TABLESPACE: {
-      if (OB_NOT_NULL(encrypted_ts_ids)) {
-        for (int64_t i = 0; !match && i < encrypted_ts_ids->count(); ++i) {
-          if (row.tablespace_id_ == encrypted_ts_ids->at(i)) {
-            match = true;
-          }
-        }
-      }
-      break;
-    }
-    default:
-      match = false;
-      break;
-  }
-  return match;
-}
-
 bool ObOnDemandSchemaGetterGuard::simple_matches_scan_spec_(
     const ObSimpleTableSchemaV2 &schema,
     const ObSchemaScanSpec &spec,
@@ -476,7 +413,7 @@ int ObOnDemandSchemaGetterGuard::append_core_table_ids_from_mgr_(
 
   if (OB_SUCC(ret) && ObSchemaScanKind::BY_ENCRYPTED_TABLESPACE == spec.kind_) {
     ObISQLClient *sql_client = NULL;
-    if (OB_FAIL(guard.get_lite_scan_sql_client(spec.tenant_id_, sql_client))) {
+    if (OB_FAIL(guard.prepare_schema_scan_sql_client_(spec.tenant_id_, sql_client))) {
       LOG_WARN("fail to get encrypted tablespace scan client", KR(ret), K(spec));
     } else if (OB_ISNULL(sql_client)) {
       ret = OB_ERR_UNEXPECTED;
@@ -524,93 +461,6 @@ int ObOnDemandSchemaGetterGuard::append_core_table_ids_from_mgr_(
   return ret;
 }
 
-int ObOnDemandSchemaGetterGuard::ensure_lite_snapshot_(ObSchemaGetterGuard &guard,
-                                                       const uint64_t tenant_id) const
-{
-  int ret = OB_SUCCESS;
-  ObISQLClient *sql_client = NULL;
-  if (!guard.check_inner_stat()) {
-    ret = OB_INNER_STAT_ERROR;
-    LOG_WARN("inner stat error", KR(ret));
-  } else if (OB_FAIL(guard.check_can_full_scan(tenant_id))) {
-    LOG_WARN("full scan not allowed", KR(ret), K(tenant_id));
-  } else if (guard.has_lite_snapshot()
-             && guard.get_lite_snapshot_tenant_id() != tenant_id) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("one strong lite snapshot cannot span tenants", KR(ret), K(tenant_id),
-             "snapshot_tenant_id", guard.get_lite_snapshot_tenant_id());
-  } else if (guard.has_lite_snapshot()) {
-    // The rows are already materialized; no connection is needed to project them.
-  } else if (OB_FAIL(guard.get_lite_scan_sql_client(tenant_id, sql_client))) {
-    // Besides returning the shared snapshot client, this rejects accidentally
-    // reusing one STRONG Guard across tenants.
-    LOG_WARN("fail to get lite snapshot sql client", KR(ret), K(tenant_id));
-  } else if (OB_ISNULL(sql_client)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("lite snapshot sql client is null", KR(ret), K(tenant_id));
-  } else {
-    ObSchemaScanSpec spec;
-    spec.tenant_id_ = tenant_id;
-    spec.kind_ = ObSchemaScanKind::BY_TENANT;
-    spec.select_flags_ = OB_SCHEMA_SCAN_SELECT_ALL_LITE;
-    spec.caller_tag_ = "ensure_lite_snapshot_";
-    ObArray<ObSchemaTableLiteRow> lite_rows;
-    if (OB_FAIL(ObSchemaScanOperator::scan_table_rows(*sql_client, spec, lite_rows))) {
-      LOG_WARN("fail to scan table rows for lite snapshot", KR(ret), K(tenant_id));
-    } else if (OB_FAIL(guard.get_lite_snapshot().assign(lite_rows))) {
-      LOG_WARN("fail to assign lite snapshot", KR(ret), K(tenant_id),
-               "cnt", lite_rows.count());
-    } else {
-      guard.set_has_lite_snapshot(true);
-      guard.set_lite_snapshot_tenant_id(tenant_id);
-      LOG_TRACE("guard lite snapshot built", K(tenant_id), "cnt", guard.get_lite_snapshot().count());
-    }
-  }
-  return ret;
-}
-
-int ObOnDemandSchemaGetterGuard::project_table_ids_from_lite_snapshot_(
-    ObSchemaGetterGuard &guard,
-    const ObSchemaScanSpec &spec,
-    ObIArray<uint64_t> &table_ids) const
-{
-  int ret = OB_SUCCESS;
-  ObArray<uint64_t> encrypted_ts_ids;
-  const ObIArray<uint64_t> *encrypted_ptr = NULL;
-  table_ids.reset();
-  if (OB_UNLIKELY(!guard.has_lite_snapshot())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("lite snapshot missing", KR(ret), K(spec));
-  } else if (ObSchemaScanKind::BY_ENCRYPTED_TABLESPACE == spec.kind_) {
-    ObISQLClient *sql_client = NULL;
-    if (OB_FAIL(guard.get_lite_scan_sql_client(spec.tenant_id_, sql_client))) {
-      LOG_WARN("fail to get encrypted tablespace snapshot client", KR(ret), K(spec));
-    } else if (OB_ISNULL(sql_client)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("encrypted tablespace snapshot client is null", KR(ret), K(spec));
-    } else if (OB_FAIL(ObSchemaScanOperator::scan_encrypted_tablespace_ids(
-                   *sql_client, spec.tenant_id_, encrypted_ts_ids))) {
-      LOG_WARN("fail to scan encrypted tablespace ids", KR(ret), K(spec));
-    } else {
-      encrypted_ptr = &encrypted_ts_ids;
-    }
-  }
-  if (OB_SUCC(ret)) {
-    for (int64_t i = 0; OB_SUCC(ret) && i < guard.get_lite_snapshot().count(); ++i) {
-      const ObSchemaTableLiteRow &row = guard.get_lite_snapshot().at(i);
-      if (row_matches_lite_snapshot_spec_(row, spec, encrypted_ptr)) {
-        if (OB_FAIL(table_ids.push_back(row.table_id_))) {
-          LOG_WARN("fail to push table id from lite snapshot", KR(ret), K(row), K(spec));
-        }
-      }
-    }
-    if (OB_SUCC(ret)) {
-      LOG_TRACE("project table ids from lite snapshot", K(spec), "cnt", table_ids.count());
-    }
-  }
-  return ret;
-}
-
 int ObOnDemandSchemaGetterGuard::get_table_ids_by_inner_table(ObSchemaGetterGuard &guard,
                                                              const ObSchemaScanSpec &spec,
                                                              ObIArray<uint64_t> &table_ids) const
@@ -621,13 +471,19 @@ int ObOnDemandSchemaGetterGuard::get_table_ids_by_inner_table(ObSchemaGetterGuar
     ret = OB_INNER_STAT_ERROR;
     LOG_WARN("inner stat error", KR(ret));
   } else if (ObSchemaScanConsistencyMode::STRONG == guard.get_schema_scan_consistency_mode()) {
-    if (OB_FAIL(ensure_lite_snapshot_(guard, spec.tenant_id_))) {
-      LOG_WARN("fail to ensure lite snapshot", KR(ret), K(spec));
-    } else if (OB_FAIL(project_table_ids_from_lite_snapshot_(guard, spec, table_ids))) {
-      LOG_WARN("fail to project table ids from lite snapshot", KR(ret), K(spec));
+    ObISQLClient *sql_client = NULL;
+    if (OB_FAIL(guard.check_can_full_scan(spec.tenant_id_))) {
+      LOG_WARN("full scan not allowed", KR(ret), K(spec));
+    } else if (OB_FAIL(guard.prepare_schema_scan_sql_client_(spec.tenant_id_, sql_client))) {
+      LOG_WARN("fail to get schema scan sql client", KR(ret), K(spec));
+    } else if (OB_ISNULL(sql_client)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("schema scan sql client is null", KR(ret), K(spec));
+    } else if (OB_FAIL(ObSchemaScanOperator::scan_table_ids(*sql_client, spec, table_ids))) {
+      LOG_WARN("fail to scan table ids in snapshot transaction", KR(ret), K(spec));
     }
   } else if (OB_FAIL(fetch_table_ids_uncached_(guard, spec, table_ids))) {
-    // RELAXED: no lite_snapshot_; TG may use process kvcache.
+    // RELAXED tablegroup enumeration may use process kvcache.
     LOG_WARN("fail to fetch table ids uncached", KR(ret), K(spec));
   }
   // Physical __all_table omits is_core_table rows; union matching core ids from resident mgr.
@@ -880,7 +736,7 @@ int ObOnDemandSchemaGetterGuard::get_vector_info_index_ids_in_tenant(
   } else if (OB_FAIL(ObSchemaScanOperator::fill_vec_ivf_index_types(ivf_index_types))) {
     LOG_WARN("fail to fill vec ivf index types", KR(ret), K(tenant_id));
   } else if (OB_FAIL(get_table_ids_by_inner_table(guard, ivf_spec, ivf_table_ids))) {
-    // STRONG: projects from the same Guard lite_snapshot_ (no second wide scan).
+    // STRONG: both queries use the same Guard transaction snapshot.
     LOG_WARN("fail to get vector ivf index ids", KR(ret), K(tenant_id));
   } else {
     has_ivf_index = !ivf_table_ids.empty();

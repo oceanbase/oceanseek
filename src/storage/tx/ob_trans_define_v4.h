@@ -204,11 +204,14 @@ struct ObTxParam
   ObTxAccessMode access_mode_;
   ObTxIsolationLevel isolation_;
   int64_t cluster_id_;
+  // Local start_tx admission flag; not serialized.
+  bool allow_standby_read_only_;
   TO_STRING_KV(K_(cluster_id),
                K_(timeout_us),
                K_(lock_timeout_us),
                K_(access_mode),
-               K_(isolation));
+               K_(isolation),
+               K_(allow_standby_read_only));
   OB_UNIS_VERSION(1);
 };
 
@@ -842,7 +845,11 @@ public:
     return is_RR_or_SERIAL_isolevel() && snapshot_version_.is_valid();
   }
   const ObTransID &tid() const { return tx_id_; }
-  bool is_valid() const { return !is_in_tx() || tx_id_.is_valid(); }
+  bool is_valid() const
+  {
+    return !is_in_tx() || tx_id_.is_valid()
+        || (access_mode_ == ObTxAccessMode::STANDBY_RD_ONLY && is_clean());
+  }
   ObTxAccessMode get_tx_access_mode() const { return access_mode_; }
   bool is_rdonly() const { return access_mode_ == ObTxAccessMode::RD_ONLY || access_mode_ == ObTxAccessMode::STANDBY_RD_ONLY; }
   bool is_clean() const { return parts_.empty(); }

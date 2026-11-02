@@ -1281,7 +1281,8 @@ ObTxParam::ObTxParam()
     lock_timeout_us_(-1),
     access_mode_(ObTxAccessMode::RW),
     isolation_(ObTxIsolationLevel::RC),
-    cluster_id_(0)
+    cluster_id_(0),
+    allow_standby_read_only_(false)
 {}
 bool ObTxParam::is_valid() const
 {
@@ -1298,6 +1299,7 @@ ObTxParam::~ObTxParam()
   access_mode_ = ObTxAccessMode::INVL;
   isolation_ = ObTxIsolationLevel::INVALID;
   cluster_id_ = -1;
+  allow_standby_read_only_ = false;
 }
 
 ObTxSnapshot::ObTxSnapshot()

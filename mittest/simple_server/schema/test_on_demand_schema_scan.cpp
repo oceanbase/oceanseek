@@ -700,6 +700,9 @@ TEST_F(TestOnDemandSchemaScan, T3f_tablegroup_excludes_aux_after_alter)
 
 TEST_F(TestOnDemandSchemaScan, strong_get_table_ids_in_tenant_ignores_later_create)
 {
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(R.tenant_id_));
+
   ObSchemaGetterGuard guard;
   ObArray<uint64_t> before_ids;
   ObArray<uint64_t> after_ids;

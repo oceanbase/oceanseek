@@ -428,12 +428,12 @@ int ObSchemaLiteTableIterator::init(ObSchemaGetterGuard &guard, const ObSchemaLi
     ObISQLClient *sql_client = NULL;
     if (OB_FAIL(guard.check_can_full_scan(spec.table_spec_.tenant_id_))) {
       LOG_WARN("full scan not allowed", KR(ret), K(spec));
-    } else if (OB_FAIL(guard.get_lite_scan_sql_client(
+    } else if (OB_FAIL(guard.prepare_schema_scan_sql_client_(
                    spec.table_spec_.tenant_id_, sql_client))) {
-      LOG_WARN("fail to get lite scan sql client", KR(ret), K(spec));
+      LOG_WARN("fail to get schema scan sql client", KR(ret), K(spec));
     } else if (OB_ISNULL(sql_client)) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("lite scan sql client is null", KR(ret), K(spec));
+      LOG_WARN("schema scan sql client is null", KR(ret), K(spec));
     } else {
       reset();
       spec_ = spec;
@@ -782,7 +782,7 @@ int ObSchemaLiteTableIterator::count(ObSchemaGetterGuard &guard,
   } else {
     if (OB_FAIL(guard.check_can_full_scan(spec.table_spec_.tenant_id_))) {
       LOG_WARN("full scan not allowed", KR(ret), K(spec));
-    } else if (OB_FAIL(guard.get_lite_scan_sql_client(
+    } else if (OB_FAIL(guard.prepare_schema_scan_sql_client_(
                    spec.table_spec_.tenant_id_, sql_client_))) {
       LOG_WARN("fail to get lite count sql client", KR(ret), K(spec));
     } else if (OB_ISNULL(sql_client_)) {
@@ -1418,7 +1418,7 @@ int ObSchemaLitePartJoinIterator::init(ObSchemaGetterGuard &guard,
   } else if (guard.is_on_demand_schema_mode()) {
     if (OB_FAIL(guard.check_can_full_scan(spec.table_spec_.tenant_id_))) {
       LOG_WARN("full scan not allowed", KR(ret), K(spec));
-    } else if (OB_FAIL(guard.get_lite_scan_sql_client(
+    } else if (OB_FAIL(guard.prepare_schema_scan_sql_client_(
                    spec.table_spec_.tenant_id_, sql_client_))) {
       LOG_WARN("fail to get lite part scan sql client", KR(ret), K(spec));
     } else if (OB_ISNULL(sql_client_)) {

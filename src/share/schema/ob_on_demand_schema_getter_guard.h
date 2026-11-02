@@ -23,7 +23,7 @@ class ObMultiVersionSchemaService;
  * Stateless OnDemand table strategy. Point lookups use the two-level KVCache;
  * set-oriented lookups scan current inner-table metadata and then load objects.
  *
- * Full-scan consistency follows Guard::schema_scan_consistency_mode_ / lite_snapshot_.
+ * STRONG full scans share the Guard's transaction snapshot until reset/destruction.
  */
 class ObOnDemandSchemaGetterGuard final : public ObISchemaGetterGuardTableImpl
 {
@@ -197,17 +197,10 @@ private:
                                            const uint64_t tenant_id,
                                            const uint64_t tablegroup_id,
                                            common::ObIArray<uint64_t> &table_ids) const;
-  int ensure_lite_snapshot_(ObSchemaGetterGuard &guard, const uint64_t tenant_id) const;
-  int project_table_ids_from_lite_snapshot_(ObSchemaGetterGuard &guard,
-                                            const ObSchemaScanSpec &spec,
-                                            common::ObIArray<uint64_t> &table_ids) const;
   // __all_table 不含 is_core_table；枚举侧从常驻 mgr 按同一 spec 谓词补齐 table_id。
   int append_core_table_ids_from_mgr_(ObSchemaGetterGuard &guard,
                                       const ObSchemaScanSpec &spec,
                                       common::ObIArray<uint64_t> &table_ids) const;
-  static bool row_matches_lite_snapshot_spec_(const ObSchemaTableLiteRow &row,
-                                              const ObSchemaScanSpec &spec,
-                                              const common::ObIArray<uint64_t> *encrypted_ts_ids);
   static bool simple_matches_scan_spec_(const ObSimpleTableSchemaV2 &schema,
                                         const ObSchemaScanSpec &spec,
                                         const common::ObIArray<uint64_t> *encrypted_ts_ids);

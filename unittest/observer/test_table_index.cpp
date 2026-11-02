@@ -446,8 +446,7 @@ TEST_F(TestTableIndex, snapshot_inheritance_is_independent_and_point_lookup_only
   ASSERT_EQ(OB_SUCCESS, child.init_from_snapshot(scan_guard_, TENANT_ID));
   EXPECT_TRUE(child.is_on_demand_schema_mode());
   EXPECT_EQ(0, full_pins(child));
-  EXPECT_EQ(nullptr, child.lite_scan_trans_);
-  EXPECT_FALSE(child.has_lite_snapshot());
+  EXPECT_EQ(nullptr, child.schema_scan_trans_);
 }
 
 TEST_F(TestTableIndex, invalid_snapshot_does_not_damage_source_or_destination)

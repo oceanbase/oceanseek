@@ -254,6 +254,16 @@ int ObAllBalanceGroupBuilder::build()
     LOG_WARN("do build balance group info fail", KR(ret));
   }
 
+  // All SQL iterators are destroyed. Release the scan transaction before
+  // subsequent balance computation and task persistence.
+  const int end_ret = schema_guard_.release_schema_scan_trans_early();
+  if (OB_SUCCESS != end_ret) {
+    LOG_WARN("fail to end balance group scan transaction early", KR(end_ret), K_(tenant_id));
+    if (OB_SUCC(ret)) {
+      ret = end_ret;
+    }
+  }
+
   ISTAT("finish build balance group", KR(ret),
       "cost", ObTimeUtility::current_time() - start_time);
 
@@ -690,13 +700,6 @@ int ObAllBalanceGroupBuilder::build_balance_group_for_tables_not_in_tablegroup_(
     }
   }
 
-  const int finish_ret = schema_guard_.finish_lite_scan();
-  if (OB_SUCCESS != finish_ret) {
-    LOG_WARN("fail to finish not-in-tablegroup lite scan", KR(finish_ret), K_(tenant_id));
-    if (OB_SUCC(ret)) {
-      ret = finish_ret;
-    }
-  }
   return ret;
 }
 

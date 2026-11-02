@@ -59,6 +59,16 @@ int ObMySQLTransaction::start(
     bool with_snapshot/* = false*/,
     const int32_t group_id /* = 0*/)
 {
+  return start_with_connection_init(sql_client, tenant_id, with_snapshot, group_id, nullptr);
+}
+
+int ObMySQLTransaction::start_with_connection_init(
+    ObISQLClient *sql_client,
+    const uint64_t tenant_id,
+    bool with_snapshot,
+    const int32_t group_id,
+    ConnectionInitCallback init_connection)
+{
   int ret = OB_SUCCESS;
   start_time_ = ::oceanbase::common::ObTimeUtility::current_time();
   if (OB_FAIL(connect(tenant_id, group_id, sql_client))) {
@@ -66,13 +76,17 @@ int ObMySQLTransaction::start(
   } else if (enable_query_stash_ && OB_FAIL(query_stash_desc_.create(1024, "BucketQueryS", "NodeQueryS"))) {
     LOG_WARN("failed to init map", K(ret), K(tenant_id));
   } else {
-    if (OB_FAIL(start_transaction(tenant_id, with_snapshot))) {
-      set_errno(ret);
-      close();
+    if (nullptr != init_connection && OB_FAIL(init_connection(get_connection(), tenant_id))) {
+      LOG_WARN("failed to initialize transaction connection", K(ret), K(tenant_id));
+    } else if (OB_FAIL(start_transaction(tenant_id, with_snapshot))) {
       LOG_WARN("failed to start transaction", K(ret), K(tenant_id), K(with_snapshot));
     } else {
       in_trans_ = true;
       LOG_DEBUG("start transaction success", K(tenant_id), K(with_snapshot));
+    }
+    if (OB_FAIL(ret)) {
+      set_errno(ret);
+      close();
     }
   }
   return ret;

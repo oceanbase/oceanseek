@@ -643,8 +643,8 @@ int ObTabletAutoincCacheCleaner::add_database(const schema::ObDatabaseSchema &da
   } else if (OB_FAIL(schema_service.get_tenant_schema_guard(tenant_id, schema_guard))) {
     LOG_WARN("fail to get schema guard", KR(ret), K(tenant_id));
   } else {
-    // table + part + subpart scans stitch one tablet set; pin one inner-SQL snapshot.
-    schema_guard.set_schema_scan_consistency_mode(schema::ObSchemaScanConsistencyMode::STRONG);
+    // The outer DROP DATABASE transaction holds the tenant's exclusive DDL lock across all scans.
+    schema_guard.set_schema_scan_consistency_mode(schema::ObSchemaScanConsistencyMode::RELAXED);
     schema::ObSchemaLiteTableIterator table_iter;
     const schema::ObSchemaLiteTableResult *table_row = NULL;
     if (OB_FAIL(schema_guard.scan_lite_tables(spec, table_iter))) {
@@ -706,14 +706,6 @@ int ObTabletAutoincCacheCleaner::add_database(const schema::ObDatabaseSchema &da
               schema_guard, spec, schema::ObSchemaLiteJoinSide::SUBPART,
               wanted_level_two, schema::PARTITION_LEVEL_TWO, tablet_ids_))) {
         LOG_WARN("fail to collect level-two tablets", KR(ret), K(tenant_id), K(database_id));
-      }
-    }
-
-    const int finish_ret = schema_guard.finish_lite_scan();
-    if (OB_SUCCESS != finish_ret) {
-      LOG_WARN("fail to finish autoinc add_database lite scan", KR(finish_ret), K(tenant_id), K(database_id));
-      if (OB_SUCC(ret)) {
-        ret = finish_ret;
       }
     }
   }

@@ -113,6 +113,8 @@ friend class MockSchemaService;
 friend class ObOriginalSchemaGetterGuard;
 friend class ObOnDemandSchemaGetterGuard;
 friend class ObSimpleSchemaOnDemandCoordinator;
+friend class ObSchemaLiteTableIterator;
+friend class ObSchemaLitePartJoinIterator;
 
 public:
 
@@ -302,14 +304,15 @@ public:
   int scan_lite_part_rows(const ObSchemaLiteScanSpec &spec,
                           const ObSchemaLiteJoinSide join_side,
                           ObSchemaLitePartJoinIterator &iter);
-  // Internal client for OnDemand full scans. RELAXED uses the shared proxy;
-  // STRONG pins one transaction snapshot for all lite scans on this Guard.
-  int get_lite_scan_sql_client(const uint64_t tenant_id,
-                               common::ObISQLClient *&sql_client);
-  // End the STRONG lite-scan snapshot transaction and return its connection.
-  // Materialized lite_snapshot_ remains available for later projections.
-  // Call only after all active lite SQL iterators have been drained/reset.
-  int finish_lite_scan();
+  // Optional early cleanup. Without this call, guard reset/destruction
+  // automatically ends the transaction and releases its connection.
+  // Keeps the guard initialized and preserves pinned schema objects.
+  // SQL cursors using this transaction must first reach OB_ITER_END, or their
+  // iterators must be reset/destroyed.
+  // Subsequent STRONG scans/enumerations start a new transaction and snapshot;
+  // consistency across this call is not guaranteed.
+  // A no-op if no transaction exists; repeated calls are safe.
+  int release_schema_scan_trans_early();
   bool is_on_demand_schema_mode() const
   { return ObSimpleSchemaMode::ON_DEMAND == schema_mode_; }
 
@@ -1303,6 +1306,17 @@ public:
   uint64_t get_tenant_id() const { return tenant_id_; }
 
   // OnDemand full-scan only; old mgr Array path ignores. Default RELAXED.
+  // Setting the mode does not start a transaction. The first SQL-backed STRONG
+  // scan/enumeration lazily starts an RR + READ ONLY transaction, reused by
+  // subsequent scans/enumerations on this guard.
+  // The guard holds the transaction and connection until optional
+  // release_schema_scan_trans_early(), reset(), or destruction. Transaction timeout
+  // does not release the connection; GC snapshot protection follows transaction
+  // timeout rules.
+  // Before ending the transaction or resetting/destroying the guard, drain its
+  // SQL cursors to OB_ITER_END, or reset/destroy the associated iterators.
+  // Early end preserves the guard and pinned schemas. Later STRONG scans start
+  // a new transaction/snapshot; consistency across early end is not guaranteed.
   void set_schema_scan_consistency_mode(const ObSchemaScanConsistencyMode mode)
   { schema_scan_consistency_mode_ = mode; }
   ObSchemaScanConsistencyMode get_schema_scan_consistency_mode() const
@@ -1316,13 +1330,6 @@ public:
   int get_table_ids_in_tenant_for_cdc(const uint64_t tenant_id,
                                       common::ObIArray<uint64_t> &table_ids);
   bool is_latest_guard() const { return is_latest_guard_; }
-  bool has_lite_snapshot() const { return has_lite_snapshot_; }
-  uint64_t get_lite_snapshot_tenant_id() const { return lite_snapshot_tenant_id_; }
-  common::ObIArray<ObSchemaTableLiteRow> &get_lite_snapshot() { return lite_snapshot_; }
-  const common::ObIArray<ObSchemaTableLiteRow> &get_lite_snapshot() const { return lite_snapshot_; }
-  void set_has_lite_snapshot(const bool v) { has_lite_snapshot_ = v; }
-  void set_lite_snapshot_tenant_id(const uint64_t tenant_id)
-  { lite_snapshot_tenant_id_ = tenant_id; }
 
   SchemaGuardType get_schema_guard_type() const
   { return static_cast<SchemaGuardType>(schema_guard_type_); }
@@ -1431,6 +1438,12 @@ public:
   int get_ccl_rule_count(const uint64_t tenant_id, uint64_t & count);
 
 private:
+  // Framework-only client preparation. RELAXED returns the shared SQL proxy;
+  // STRONG may allocate a transaction, acquire a connection and execute BEGIN,
+  // or reuse the existing RR + READ ONLY transaction. The client is borrowed
+  // and must not outlive its owning transaction/proxy.
+  int prepare_schema_scan_sql_client_(const uint64_t tenant_id,
+                                      common::ObISQLClient *&sql_client);
   int check_ssl_access(const ObUserInfo &user_info,
                        SSL *ssl_st);
   int check_catalog_priv(const ObSessionPrivInfo &session_priv,
@@ -1572,7 +1585,6 @@ private:
   int get_table_schemas_in_tenant_(const uint64_t tenant_id,
                                    const bool only_view_schema,
                                    common::ObIArray<const ObTableSchema *> &table_schemas);
-  void reset_lite_scan_transaction_();
   int check_single_table_priv_for_update_(const ObSessionPrivInfo &session_priv,
                                           const common::ObIArray<uint64_t> &enable_role_id_array,
                                           const ObNeedPriv &table_need_priv,
@@ -1586,13 +1598,10 @@ private:
   bool is_latest_guard_;
   // Meaningful for OnDemand full-scan; unused by old Array get path.
   ObSchemaScanConsistencyMode schema_scan_consistency_mode_;
-  // STRONG only: one wide lite snapshot for this Guard. Empty under RELAXED-only use.
-  bool has_lite_snapshot_;
-  uint64_t lite_snapshot_tenant_id_;
-  common::ObArray<ObSchemaTableLiteRow> lite_snapshot_;
-  // STRONG OnDemand lite scans share this transaction's consistent snapshot.
-  common::ObMySQLTransaction *lite_scan_trans_;
-  uint64_t lite_scan_trans_tenant_id_;
+  // STRONG OnDemand enumeration and lite scans share this transaction's snapshot.
+  // Released automatically on reset/destruction, or optionally via release_schema_scan_trans_early().
+  common::ObMySQLTransaction *schema_scan_trans_;
+  uint64_t schema_scan_trans_tenant_id_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObSchemaGetterGuard);
 };

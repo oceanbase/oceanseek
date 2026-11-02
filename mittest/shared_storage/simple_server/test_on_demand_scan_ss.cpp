@@ -256,6 +256,9 @@ TEST_F(TestOnDemandScanSS, scan_async_index_data_tables)
   ASSERT_NE(OB_INVALID_ID, R.async_fts_id_);
   ASSERT_NE(OB_INVALID_ID, R.async_rb_id_);
 
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(R.tenant_id_));
+
   ObSchemaGetterGuard guard;
   ObArray<const ObSimpleTableSchemaV2 *> od_schemas;
   ObArray<uint64_t> od_ids;

@@ -363,8 +363,8 @@ int ObTableGroupHelp::check_all_partition_option_for_subpart_sharding(
   const uint64_t tablegroup_id = tablegroup_schema.get_tablegroup_id();
   ObSimpleTableSchemaIterator table_iter;
   const ObSimpleTableSchemaV2 *table_schema = nullptr;
-  // Same Guard will call get_table_schemas_in_tablegroup again in check_all_table_partition_option.
-  schema_guard.set_schema_scan_consistency_mode(ObSchemaScanConsistencyMode::STRONG);
+  // The outer ALTER TABLEGROUP transaction holds the tenant's exclusive DDL lock across both enumerations.
+  schema_guard.set_schema_scan_consistency_mode(ObSchemaScanConsistencyMode::RELAXED);
   if (OB_FAIL(schema_guard.get_table_schemas_in_tablegroup(tenant_id, tablegroup_id, table_iter))) {
     LOG_WARN("fail get table schemas from tablegroup", KR(ret), K(tenant_id), K(tablegroup_id));
   } else {
@@ -402,14 +402,6 @@ int ObTableGroupHelp::check_all_partition_option_for_subpart_sharding(
       if (OB_FAIL(check_all_table_partition_option(tablegroup_schema, schema_guard, true/*check_subpart*/, is_matched, user_error))) {
         LOG_WARN("fail to check table partition option for SUBPARTITION sharding", KR(ret), K(tablegroup_schema));
       }
-    }
-  }
-  const int finish_ret = schema_guard.finish_lite_scan();
-  if (OB_SUCCESS != finish_ret) {
-    LOG_WARN("fail to finish tablegroup snapshot scan", KR(finish_ret),
-             K(tenant_id), K(tablegroup_id));
-    if (OB_SUCC(ret)) {
-      ret = finish_ret;
     }
   }
   return ret;

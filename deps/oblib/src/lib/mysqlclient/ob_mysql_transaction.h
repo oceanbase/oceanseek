@@ -58,6 +58,13 @@ public:
                     const uint64_t tenant_id,
                     bool with_snapshot = false,
                     const int32_t group_id = 0);
+  // Initialize the acquired connection before BEGIN; callback failures release it.
+  typedef int (*ConnectionInitCallback)(sqlclient::ObISQLConnection *, const uint64_t);
+  int start_with_connection_init(ObISQLClient *proxy,
+                                 const uint64_t tenant_id,
+                                 bool with_snapshot,
+                                 const int32_t group_id,
+                                 ConnectionInitCallback init_connection);
   virtual int start(ObISQLClient *proxy,
                     const uint64_t &tenant_id,
                     const int64_t &refreshed_schema_version,

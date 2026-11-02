@@ -868,11 +868,13 @@ int ObAllVirtualTabletReplicaInfo::prepare_tablet_to_table_map_()
       }
     }
   }
-  const int finish_ret = schema_guard_.finish_lite_scan();
-  if (OB_SUCCESS != finish_ret) {
-    SERVER_LOG(WARN, "fail to finish tablet-table lite scan", KR(finish_ret), K(tenant_id));
+  // All SQL iterators are destroyed. Release the scan transaction while keeping
+  // the guard and pinned schemas for subsequent schema lookups.
+  const int end_ret = schema_guard_.release_schema_scan_trans_early();
+  if (OB_SUCCESS != end_ret) {
+    SERVER_LOG(WARN, "fail to end tablet-table scan transaction early", KR(end_ret), K(tenant_id));
     if (OB_SUCC(ret)) {
-      ret = finish_ret;
+      ret = end_ret;
     }
   }
   return ret;
