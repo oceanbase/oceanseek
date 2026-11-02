@@ -76,7 +76,9 @@ private:
   int create_data_memtable_for_replay_(const share::ObLSID &ls_id,
                                        const common::ObTabletID &tablet_id,
                                        bool &no_need_create);
-  bool need_to_refresh_table(ObTableStoreIterator &iter, bool &frozen_memtable_pinned);
+  int need_to_refresh_table(ObTableStoreIterator &iter,
+                            bool &need_refresh,
+                            bool &frozen_memtable_pinned);
   void check_if_need_log_(bool &need_log, bool &need_log_error);
   void throttle_if_needed_();
   int double_check_get_memtable_for_replay_(const share::SCN replay_scn,

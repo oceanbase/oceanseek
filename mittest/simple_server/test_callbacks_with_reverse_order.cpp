@@ -112,8 +112,13 @@ int ObStorageTableGuard::refresh_and_protect_memtable_for_write(ObRelativeTable 
     }
   }
   bool frozen_memtable_pinned = false;
-  while (OB_SUCC(ret) && need_to_refresh_table(*iter.table_iter(), frozen_memtable_pinned)) {
-    if (frozen_memtable_pinned) {
+  bool need_refresh = true;
+  while (OB_SUCC(ret) && need_refresh) {
+    if (OB_FAIL(need_to_refresh_table(*iter.table_iter(), need_refresh, frozen_memtable_pinned))) {
+      TRANS_LOG(WARN, "fail to check whether table needs refresh", K(ret), K(ls_id), K(tablet_id));
+    } else if (!need_refresh) {
+      // The current memtable is ready; the loop condition ends the refresh.
+    } else if (frozen_memtable_pinned) {
       ret = OB_EAGAIN;
       TRANS_LOG(WARN, "frozen memtable is pinned", K(ret), K(ls_id), K(tablet_id));
     } else if (OB_FAIL(store_ctx_.ls_->get_tablet_svr()->get_read_tables(

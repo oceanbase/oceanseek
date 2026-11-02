@@ -107,9 +107,14 @@ int ObStorageTableGuard::refresh_and_protect_memtable_for_write(ObRelativeTable 
   }
   int64_t start_time = ObClockGenerator::getClock();
   bool frozen_memtable_pinned = false;
-  while (OB_SUCC(ret) && need_to_refresh_table(*iter.table_iter(), frozen_memtable_pinned)) {
-    const int64_t remain_timeout = THIS_WORKER.get_timeout_remain();
-    if (OB_UNLIKELY(remain_timeout <= 0)) {
+  bool need_refresh = true;
+  while (OB_SUCC(ret) && need_refresh) {
+    int64_t remain_timeout = 0;
+    if (OB_FAIL(need_to_refresh_table(*iter.table_iter(), need_refresh, frozen_memtable_pinned))) {
+      LOG_WARN("fail to check whether table needs refresh", K(ret), K(ls_id), K(tablet_id));
+    } else if (!need_refresh) {
+      // The current memtable is ready; the loop condition ends the refresh.
+    } else if (OB_UNLIKELY((remain_timeout = THIS_WORKER.get_timeout_remain()) <= 0)) {
       ret = OB_TIMEOUT;
       int64_t cost_time = ObClockGenerator::getClock() - start_time;
       LOG_WARN("refresh table timeout", K(ret), K(ls_id), K(tablet_id), K(cost_time));
@@ -442,10 +447,13 @@ int ObStorageTableGuard::check_freeze_to_inc_write_ref(ObMemtable *memtable,
   return ret;
 }
 
-bool ObStorageTableGuard::need_to_refresh_table(ObTableStoreIterator &iter, bool &frozen_memtable_pinned)
+int ObStorageTableGuard::need_to_refresh_table(ObTableStoreIterator &iter,
+                                             bool &need_refresh,
+                                             bool &frozen_memtable_pinned)
 {
   int ret = OB_SUCCESS;
-  bool bool_ret = false;
+  need_refresh = false;
+  frozen_memtable_pinned = false;
   int exit_flag = -1;
   ObITable *table = iter.get_last_memtable();
   ObMemtable *memtable = static_cast<ObMemtable *>(table);
@@ -488,7 +496,7 @@ bool ObStorageTableGuard::need_to_refresh_table(ObTableStoreIterator &iter, bool
         && OB_NOT_NULL(store_ctx_.mvcc_acc_ctx_.get_pinned_mds_memtable())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_ERROR("mds has pinned memtable, write is not allowed to create memtable", K(ret), K(tablet_id), KP(table));
-      bool_ret = false;
+      need_refresh = false;
       exit_flag = 4;
     } else {
       CreateMemtableArg arg;
@@ -496,16 +504,16 @@ bool ObStorageTableGuard::need_to_refresh_table(ObTableStoreIterator &iter, bool
       if (OB_FAIL(store_ctx_.ls_->get_tablet_svr()->create_memtable(tablet_id, arg))) {
         LOG_WARN("fail to create a boundary memtable", K(ret), K(tablet_id), "last_memtable", OB_P(table));
       }
-      bool_ret = true;
+      need_refresh = true;
       exit_flag = 0;
     }
   } else if (!table->is_data_memtable()) {
-    bool_ret = false;
+    need_refresh = false;
   } else if (iter.check_store_expire()) {
-    bool_ret = true;
+    need_refresh = true;
     exit_flag = 1;
-  } else if (OB_FAIL(check_freeze_to_inc_write_ref(memtable, bool_ret, frozen_memtable_pinned))) {
-    bool_ret = true;
+  } else if (OB_FAIL(check_freeze_to_inc_write_ref(memtable, need_refresh, frozen_memtable_pinned))) {
+    need_refresh = true;
     exit_flag = 2;
     if (OB_MINOR_FREEZE_NOT_ALLOW != ret) {
       LOG_WARN("fail to inc write ref", K(ret));
@@ -514,7 +522,14 @@ bool ObStorageTableGuard::need_to_refresh_table(ObTableStoreIterator &iter, bool
     exit_flag = 3;
   }
 
-  if (bool_ret) {
+  // Preserve the existing refresh decision for errors other than LS offline.
+  // An offline LS cannot satisfy this write: propagate the error so the caller
+  // can release its transaction references instead of spinning until timeout.
+  if (OB_LS_OFFLINE == ret) {
+    need_refresh = false;
+  }
+
+  if (need_refresh) {
     bool need_log = false;
     bool need_log_error = false;
     check_if_need_log_(need_log, need_log_error);
@@ -554,7 +569,8 @@ bool ObStorageTableGuard::need_to_refresh_table(ObTableStoreIterator &iter, bool
       }
     }
   }
-  return bool_ret;
+  // Keep the original error in the retry diagnostics above.
+  return OB_LS_OFFLINE == ret ? ret : OB_SUCCESS;
 }
 
 void ObStorageTableGuard::check_if_need_log_(bool &need_log,
