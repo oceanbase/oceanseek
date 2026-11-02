@@ -147,9 +147,9 @@ TEST_F(TestFreezeMdsSubmit, blocked_active_does_not_hide_old_memtable_work)
   ObTxBufferNode active_node;
   const ObString data = ObString::make_string("mds");
   ASSERT_EQ(OB_SUCCESS, old_node.init(ObTxDataSourceType::CREATE_TABLET_NEW_MDS,
-      data, share::SCN::min_scn(), ObTxSEQ::mk_v0(1), &old_mds));
+      data, share::SCN::min_scn(), ObTxSEQ(1, 0), &old_mds));
   ASSERT_EQ(OB_SUCCESS, active_node.init(ObTxDataSourceType::CREATE_TABLET_NEW_MDS,
-      data, share::SCN::min_scn(), ObTxSEQ::mk_v0(2), &active_mds));
+      data, share::SCN::min_scn(), ObTxSEQ(2, 0), &active_mds));
   // Nodes borrow their data and BufferCtx from this test, not the MDS allocator.
   ASSERT_EQ(OB_SUCCESS, ctx_->mds_cache_.insert_mds_node(old_node));
   ASSERT_EQ(OB_SUCCESS, ctx_->mds_cache_.insert_mds_node(active_node));
@@ -166,7 +166,7 @@ TEST_F(TestFreezeMdsSubmit, blocked_active_does_not_hide_old_memtable_work)
   ASSERT_EQ(OB_SUCCESS, ctx_->mds_cache_.fill_mds_log(
       ctx_.get(), mds_log, mds_range, barrier, base_scn));
   ASSERT_EQ(1, mds_log.count());
-  EXPECT_EQ(ObTxSEQ::mk_v0(1), mds_log.get_data().at(0).get_seq_no());
+  EXPECT_EQ(ObTxSEQ(1, 0), mds_log.get_data().at(0).get_seq_no());
 
   // After the old node is submitted, only the blocked active node remains.
   ctx_->mds_cache_.mds_list_.begin()->set_submitted();
