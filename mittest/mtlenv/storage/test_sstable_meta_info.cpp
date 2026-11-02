@@ -16,6 +16,7 @@
 
 namespace oceanbase
 {
+using namespace std;
 using namespace common;
 using namespace share;
 using namespace storage;

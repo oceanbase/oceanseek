@@ -1022,14 +1022,4 @@ private:
 
 } // namespace oceanbase
 
-#include "unittest/storage/sslog/test_mock_palf_kv.h"
-
-namespace oceanbase
-{
-namespace sslog
-{
-// unittest::ObMockPalfKV PALF_KV;
-}
-} // namespace oceanbase
-
 #endif

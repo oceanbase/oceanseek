@@ -27,6 +27,7 @@
 #include "share/schema/ob_async_index_params.h"
 #include "storage/ob_storage_schema.h"
 #include "storage/tx_storage/ob_ls_service.h"
+#include "unittest/storage/sslog/test_mock_palf_kv.h"
 #define protected public
 #define private public
 #include "lib/mysqlclient/ob_mysql_transaction.h"
