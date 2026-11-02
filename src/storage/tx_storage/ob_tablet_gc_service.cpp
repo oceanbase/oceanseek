@@ -815,62 +815,84 @@ int ObTabletGCHandler::gc_tablets(
     const bool is_immediate_gc)
 {
   int ret = OB_SUCCESS;
-  const ObLSID &ls_id = ls_->get_ls_id();
+  int first_error = OB_SUCCESS;
+  ObLSID ls_id;
   const int64_t start_ts = ObTimeUtility::fast_current_time();
   int64_t gc_success_count = 0;
-  int64_t gc_retry_count = 0;
   int64_t gc_failure_count = 0;
 
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     STORAGE_LOG(WARN, "tablet gc handler is not inited", KR(ret));
   } else {
+    ls_id = ls_->get_ls_id();
     DEBUG_SYNC(BEFORE_TABLET_GC);
 
-    bool need_retry = false;
-    for (int64_t i = 0; OB_SUCC(ret) && i < deleted_tablets.count(); ++i) {
-      const ObTabletHandle &tablet_handle = deleted_tablets.at(i);
-      const ObTabletID tablet_id = tablet_handle.get_obj()->get_tablet_meta().tablet_id_;
+    // Continue with the remaining tablets when one tablet fails.
+    // Return the first error after the batch.
+    // Exit immediately if the handler or a shared service stops, returning the stop error.
+    for (int64_t i = 0; i < deleted_tablets.count(); ++i) {
       if (check_stop()) {
         ret = OB_EAGAIN;
-        ++gc_retry_count;
         STORAGE_LOG(INFO, "tablet gc handler stop", KR(ret), KPC(this), KPC(ls_), K(ls_->get_ls_meta()));
-#ifdef OB_BUILD_SHARED_STORAGE
-      } else if (GCTX.is_shared_storage_mode()) {
-        ObTablet *tablet = tablet_handle.get_obj();
-        if (tablet->is_empty_shell()) {
-          const share::SCN transfer_scn = tablet->get_reorganization_scn();
-          const share::SCN deleted_scn = tablet->get_tablet_meta().empty_shell_tablet_status_.delete_commit_scn_;
-          if (OB_FAIL(MTL(ObSSMetaService *)->mark_tablet_deleted(ls_id, tablet_id, transfer_scn, deleted_scn))) {
-            if (OB_OBJECT_NOT_EXIST == ret || OB_ENTRY_NOT_EXIST == ret) {
-              ret = OB_SUCCESS;
-              STORAGE_LOG(INFO, "tablet_meta has been gc, or create tablet abort", KR(ret), KPC(this), KPC(ls_),
-                          K(tablet_id), K(transfer_scn));
+        break;
+      }
+
+      int tablet_ret = OB_SUCCESS;
+      const ObTabletHandle &tablet_handle = deleted_tablets.at(i);
+      ObTabletID tablet_id;
+      if (!tablet_handle.is_valid()) {
+        tablet_ret = OB_INVALID_ARGUMENT;
+        STORAGE_LOG(WARN, "invalid gc tablet handle", KR(tablet_ret), K(ls_id), K(i));
+      } else {
+        tablet_id = tablet_handle.get_obj()->get_tablet_meta().tablet_id_;
+        if (GCTX.is_shared_storage_mode()) {
+          ObTablet *tablet = tablet_handle.get_obj();
+          if (tablet->is_empty_shell()) {
+            const share::SCN transfer_scn = tablet->get_reorganization_scn();
+            const share::SCN deleted_scn =
+                tablet->get_tablet_meta().empty_shell_tablet_status_.delete_commit_scn_;
+            tablet_ret = MTL(ObSSMetaService *)->mark_tablet_deleted(
+                ls_id, tablet_id, transfer_scn, deleted_scn);
+            if (OB_OBJECT_NOT_EXIST == tablet_ret || OB_ENTRY_NOT_EXIST == tablet_ret) {
+              tablet_ret = OB_SUCCESS;
+              STORAGE_LOG(INFO, "tablet_meta has been gc, or create tablet abort",
+                          KR(tablet_ret), KPC(this), KPC(ls_), K(tablet_id), K(transfer_scn));
 #ifdef ERRSIM
               SERVER_EVENT_SYNC_ADD("tablet_gc", "create_tablet_abort",
                                     "tenant_id", MTL_ID(),
                                     "ls_id", ls_id.id(),
                                     "tablet_id", tablet_id.id());
 #endif
-            } else {
-              ++gc_failure_count;
-              STORAGE_LOG(WARN, "failed to mark_tablet_deleted", KR(ret), KPC(this), KPC(ls_), K(tablet_id), K(transfer_scn));
+            } else if (OB_SUCCESS != tablet_ret) {
+              STORAGE_LOG(WARN, "failed to mark_tablet_deleted", KR(tablet_ret),
+                          KPC(this), KPC(ls_), K(tablet_id), K(transfer_scn), K(deleted_scn));
             }
+          } else {
+            STORAGE_LOG(INFO, "tablet is not empty shell, skip SS mark delete",
+                        KR(tablet_ret), K(ls_id), K(tablet_id), KPC(tablet));
           }
-        } else {
-          STORAGE_LOG(INFO, "tablet is not empty shell, skip SS mark delete", KR(ret), K(ls_id), K(tablet_id), KPC(tablet));
+        }
+
+        if (OB_SUCCESS == tablet_ret) {
+          tablet_ret = ls_->get_tablet_svr()->remove_tablet(tablet_handle);
+          if (OB_SUCCESS != tablet_ret) {
+            STORAGE_LOG(WARN, "failed to remove tablet",
+                        KR(tablet_ret), K(ls_id), K(tablet_id), K(tablet_handle));
+          }
         }
       }
-      if (OB_FAIL(ret)) {
-#endif
-      } else if (OB_FAIL(ls_->get_tablet_svr()->remove_tablet(tablet_handle))) {
-        if (OB_EAGAIN == ret) {
-          need_retry = true;
-          ++gc_retry_count;
-          ret = OB_SUCCESS;
-        } else {
-          ++gc_failure_count;
-          STORAGE_LOG(WARN, "failed to remove tablet", K(ret), K(tablet_handle));
+
+      if (OB_SUCCESS != tablet_ret) {
+        ++gc_failure_count;
+        if (OB_SUCCESS == first_error) {
+          first_error = tablet_ret;
+        }
+        if (OB_SERVER_IS_STOPPING == tablet_ret || OB_NOT_RUNNING == tablet_ret) {
+          ret = tablet_ret;
+          STORAGE_LOG(INFO, "shared service stopped, end tablet gc batch", KR(ret), K(first_error),
+                      K(ls_id), K(tablet_id));
+          break;
         }
       } else {
         ++gc_success_count;
@@ -884,17 +906,16 @@ int ObTabletGCHandler::gc_tablets(
       }
     }
 
-    if (OB_FAIL(ret)) {
-    } else if (need_retry) {
-      ret = OB_EAGAIN;
+    if (OB_SUCCESS == ret) {
+      ret = first_error;
     }
   }
   const int64_t gc_cost_us = ObTimeUtility::fast_current_time() - start_ts;
   const int64_t unprocessed_tablet_count = deleted_tablets.count()
-      - gc_success_count - gc_retry_count - gc_failure_count;
-  STORAGE_LOG(INFO, "[tabletgc] gc tablets finished", KR(ret), K(ls_id), K(is_immediate_gc),
-      "input_tablet_count", deleted_tablets.count(), K(gc_success_count), K(gc_retry_count),
-      K(gc_failure_count), K(unprocessed_tablet_count), K(gc_cost_us));
+      - gc_success_count - gc_failure_count;
+  STORAGE_LOG(INFO, "[tabletgc] gc tablets finished", KR(ret), K(first_error),
+      K(ls_id), K(is_immediate_gc), "input_tablet_count", deleted_tablets.count(),
+      K(gc_success_count), K(gc_failure_count), K(unprocessed_tablet_count), K(gc_cost_us));
   return ret;
 }
 
