@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX SHARE
 
 #include "share/ob_async_index_refresh_util.h"
+#include "share/ob_debug_sync.h"
 #include "share/schema/ob_schema_struct.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/time/ob_time_utility.h"
@@ -167,6 +168,7 @@ int ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
   const int64_t leader_lookup_timeout = ObDDLUtil::get_default_ddl_rpc_timeout();
   const int64_t refresh_rpc_timeout = GCONF._ob_ddl_timeout;
   const int64_t retry_interval_us = 200 * 1000; // 200ms
+  const bool is_manual = storage::ASYNC_REFRESH_TYPE_MANUAL == refresh_type;
 
   if (OB_UNLIKELY(OB_INVALID_ID == tenant_id || OB_INVALID_ID == data_table_id
       || target_scn <= 0 || async_index_table_ids.empty())) {
@@ -192,6 +194,10 @@ int ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
   } else if (OB_FAIL(ObTabletToLSTableOperator::batch_get_ls(
       *GCTX.sql_proxy_, tenant_id, data_tablet_ids, ls_ids))) {
     LOG_WARN("fail to batch get ls for data tablets", K(ret), K(tenant_id));
+    if (is_manual && OB_ITEM_NOT_MATCH == ret) {
+      // DDL can remove tablets between schema enumeration and the mapping lookup.
+      ret = OB_MAPPING_BETWEEN_TABLET_AND_LS_NOT_EXIST;
+    }
   } else if (data_tablet_ids.count() != ls_ids.count()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("data tablet count not equal ls count", K(ret),
@@ -225,7 +231,8 @@ int ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
       } else if (OB_FAIL(ObDDLUtil::get_tablets(tenant_id, index_table_id, index_tablets))) {
         LOG_WARN("fail to get index table tablets", K(ret), K(index_table_id));
       } else if (index_tablets.count() != data_tablet_ids.count()) {
-        ret = OB_ERR_UNEXPECTED;
+        // The two tablet arrays may come from opposite sides of a partition DDL.
+        ret = is_manual ? OB_SCHEMA_EAGAIN : OB_ERR_UNEXPECTED;
         LOG_WARN("index tablet count mismatch data tablet count", K(ret),
             K(index_table_id), K(index_tablets.count()), K(data_tablet_ids.count()));
       } else if (OB_FAIL(valid_index_table_ids.push_back(index_table_id))) {
@@ -272,6 +279,9 @@ int ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("[ASYNC_INDEX] invalid refresh arg", K(ret), K(arg));
         } else {
+          if (is_manual) {
+            DEBUG_SYNC(BEFORE_MANUAL_ASYNC_INDEX_REFRESH_RPC);
+          }
           obrpc::ObAsyncIndexRefreshRes res;
           if (OB_FAIL(srv_rpc_proxy->to(leader_addr)
                       .timeout(refresh_rpc_timeout)
@@ -289,6 +299,16 @@ int ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
             DEBUG_SYNC(AFTER_OFFLINE_ASYNC_INDEX_PARTITION_REFRESH);
           }
 #endif
+          if (is_manual && is_master_changed_error(ret)) {
+            int tmp_ret = OB_SUCCESS;
+            ObAddr new_leader;
+            if (OB_SUCCESS != (tmp_ret = location_service->get_leader(
+                GCONF.cluster_id, tenant_id, ls_id, true /*force_renew*/, new_leader))) {
+              LOG_WARN("failed to renew leader after manual refresh error",
+                       K(tmp_ret), K(ret), K(tenant_id), K(ls_id));
+            }
+            // Preserve the original error so the caller retries the whole table.
+          }
         }
       }
     }
