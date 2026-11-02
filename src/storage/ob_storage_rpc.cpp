@@ -5123,7 +5123,7 @@ int ObFetchVectorIndexSegmentMetasP::process()
       if (OB_ISNULL(vecidx_service)) {
         ret = OB_NOT_SUPPORTED;
         LOG_WARN("vector index service is null", K(ret), K(arg));
-      } else if (OB_FAIL(vecidx_service->get_adapter_inst_guard(
+      } else if (OB_FAIL(vecidx_service->get_ls_local_adapter_inst_guard(
                      arg.ls_id_, arg.inc_tablet_id_, adaptor_guard))) {
         if (OB_HASH_NOT_EXIST == ret) {
           // adaptor was cleaned up (e.g. index dropped between list-fetch and this RPC).

@@ -46,6 +46,60 @@ private:
   ObPluginVectorIndexAdaptor *adapter_;
 };
 
+class ObInsertTenantAdaptorCallback
+{
+public:
+  int operator()(
+      const hash::HashMapPair<common::ObTabletID, ObPluginVectorIndexAdaptor *> &entry)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_ISNULL(entry.second)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("tenant adaptor is null on insert", KR(ret), K(entry.first));
+    } else {
+      entry.second->inc_ref();
+    }
+    return ret;
+  }
+};
+
+class ObReplaceTenantAdaptorCallback
+{
+public:
+  explicit ObReplaceTenantAdaptorCallback(ObPluginVectorIndexAdaptor *new_adapter)
+    : new_adapter_(new_adapter), replaced_old_(nullptr)
+  {}
+  void operator()(
+      hash::HashMapPair<common::ObTabletID, ObPluginVectorIndexAdaptor *> &entry)
+  {
+    if (entry.second != new_adapter_) {
+      new_adapter_->inc_ref();
+      DEBUG_SYNC(TENANT_ADAPTOR_REPLACE_IN_BUCKET);
+      replaced_old_ = entry.second;
+      entry.second = new_adapter_;
+    }
+  }
+  ObPluginVectorIndexAdaptor *replaced_old() const { return replaced_old_; }
+private:
+  ObPluginVectorIndexAdaptor *new_adapter_;
+  ObPluginVectorIndexAdaptor *replaced_old_;
+};
+
+class ObEraseTenantAdaptorIfSamePredicate
+{
+public:
+  explicit ObEraseTenantAdaptorIfSamePredicate(ObPluginVectorIndexAdaptor *expected_adapter)
+    : expected_adapter_(expected_adapter)
+  {}
+  bool operator()(
+      hash::HashMapPair<common::ObTabletID, ObPluginVectorIndexAdaptor *> &entry)
+  {
+    return entry.second == expected_adapter_;
+  }
+private:
+  ObPluginVectorIndexAdaptor *expected_adapter_;
+};
+
 class ObCollectAdaptorTabletIdCallback
 {
 public:
@@ -309,11 +363,9 @@ int ObPluginVectorIndexMgr::try_reuse_adaptor_from_tenant_map(
         if (OB_ISNULL(ls_adaptor)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("ls adaptor is null", KR(ret), K(inc_tablet_id));
-        } else if (OB_FAIL(vector_index_service_->erase_tenant_vec_adaptor(inc_tablet_id))) {
-          LOG_WARN("failed to erase old tenant adaptor", KR(ret), K(inc_tablet_id));
-        } else if (OB_FAIL(vector_index_service_->set_tenant_vec_adaptor(
-            inc_tablet_id, ls_adaptor))) {
-          LOG_WARN("failed to set ls adaptor to tenant map", KR(ret), K(inc_tablet_id));
+        } else if (OB_FAIL(vector_index_service_->replace_tenant_vec_adaptor(
+                       inc_tablet_id, ls_adaptor))) {
+          LOG_WARN("failed to replace migrating tenant adaptor", KR(ret), K(inc_tablet_id));
         } else {
           LOG_INFO("replaced MIG_INVALID tenant adaptor with ls shell",
               K(inc_tablet_id), KPC(ls_adaptor));
@@ -325,11 +377,10 @@ int ObPluginVectorIndexMgr::try_reuse_adaptor_from_tenant_map(
 }
 
 int ObPluginVectorIndexMgr::set_vec_adaptor_(ObTabletID tablet_id,
-                                             ObPluginVectorIndexAdaptor *adapter_inst,
-                                             int overwrite)
+                                             ObPluginVectorIndexAdaptor *adapter_inst)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(vec_adaptor_map_.set_refactored(tablet_id, adapter_inst, overwrite))) {
+  if (OB_FAIL(vec_adaptor_map_.set_refactored(tablet_id, adapter_inst))) {
     LOG_WARN("failed to set vector index adaptor", K(tablet_id), KR(ret));
   } else {
     adapter_inst->inc_ref();
@@ -338,8 +389,7 @@ int ObPluginVectorIndexMgr::set_vec_adaptor_(ObTabletID tablet_id,
 }
 
 int ObPluginVectorIndexMgr::attach_adapter(ObPluginVectorIndexAdaptor *adapter_inst,
-                                           bool &attached,
-                                           int overwrite)
+                                           bool &attached)
 {
   int ret = OB_SUCCESS;
   attached = false;
@@ -348,18 +398,17 @@ int ObPluginVectorIndexMgr::attach_adapter(ObPluginVectorIndexAdaptor *adapter_i
     LOG_WARN("adapter is null", KR(ret));
   } else {
     WLockGuard lock_guard(adapter_map_rwlock_);
-    ret = attach_adapter_in_lock_(adapter_inst, attached, overwrite);
+    ret = attach_adapter_in_lock_(adapter_inst, attached);
   }
   return ret;
 }
 
 int ObPluginVectorIndexMgr::attach_adapter_in_lock_(ObPluginVectorIndexAdaptor *adapter_inst,
-                                                    bool &attached,
-                                                    int overwrite)
+                                                    bool &attached)
 {
   int ret = OB_SUCCESS;
   attached = false;
-  if (OB_FAIL(set_vec_adaptor_(adapter_inst->get_inc_tablet_id(), adapter_inst, overwrite))) {
+  if (OB_FAIL(set_vec_adaptor_(adapter_inst->get_inc_tablet_id(), adapter_inst))) {
     if (OB_HASH_EXIST == ret) {
       ret = OB_SUCCESS;
     } else {
@@ -762,17 +811,40 @@ int ObPluginVectorIndexService::get_tenant_adapter_inst_guard(
 }
 
 int ObPluginVectorIndexService::set_tenant_vec_adaptor(ObTabletID tablet_id,
-                                                       ObPluginVectorIndexAdaptor *adapter_inst,
-                                                       int overwrite)
+                                                       ObPluginVectorIndexAdaptor *adapter_inst)
 {
   int ret = OB_SUCCESS;
+  ObInsertTenantAdaptorCallback callback;
   if (OB_ISNULL(adapter_inst) || OB_UNLIKELY(!tablet_id.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid tenant adaptor set arguments", KR(ret), K(tablet_id), KP(adapter_inst));
-  } else if (OB_FAIL(tenant_adaptor_map_.set_refactored(tablet_id, adapter_inst, overwrite))) {
+  } else if (OB_FAIL(tenant_adaptor_map_.set_refactored(
+                 tablet_id, adapter_inst, 0, 0, 0, &callback))) {
     LOG_WARN("failed to set tenant adaptor", KR(ret), K(tablet_id));
-  } else {
-    adapter_inst->inc_ref();
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexService::replace_tenant_vec_adaptor(
+    ObTabletID tablet_id,
+    ObPluginVectorIndexAdaptor *adapter_inst)
+{
+  int ret = OB_SUCCESS;
+  ObInsertTenantAdaptorCallback insert_callback;
+  ObReplaceTenantAdaptorCallback replace_callback(adapter_inst);
+  if (OB_ISNULL(adapter_inst) || OB_UNLIKELY(!tablet_id.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid tenant adaptor replace arguments", KR(ret), K(tablet_id), KP(adapter_inst));
+  } else if (OB_FAIL(tenant_adaptor_map_.set_or_update(
+                 tablet_id, adapter_inst, insert_callback, replace_callback))) {
+    LOG_WARN("failed to replace tenant adaptor", KR(ret), K(tablet_id), KP(adapter_inst));
+  } else if (OB_NOT_NULL(replace_callback.replaced_old())) {
+    ObPluginVectorIndexAdaptor *replaced_old = replace_callback.replaced_old();
+    const int tmp_ret = ObPluginVectorIndexUtils::release_vector_index_adapter(replaced_old);
+    if (OB_SUCCESS != tmp_ret) {
+      LOG_WARN("failed to release replaced tenant adaptor",
+               K(tmp_ret), K(tablet_id), KP(adapter_inst));
+    }
   }
   return ret;
 }
@@ -790,6 +862,38 @@ int ObPluginVectorIndexService::erase_tenant_vec_adaptor(ObTabletID tablet_id)
     LOG_WARN("tenant adaptor is null", KR(ret), K(tablet_id));
   } else if (OB_FAIL(ObPluginVectorIndexUtils::release_vector_index_adapter(adapter_inst))) {
     LOG_WARN("failed to release tenant adaptor", KR(ret), K(tablet_id));
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexService::erase_tenant_adapter_if_same(
+    ObTabletID tablet_id,
+    ObPluginVectorIndexAdaptor *expected_adapter,
+    bool &erased)
+{
+  int ret = OB_SUCCESS;
+  erased = false;
+  ObPluginVectorIndexAdaptor *erased_adapter = nullptr;
+  ObEraseTenantAdaptorIfSamePredicate predicate(expected_adapter);
+  if (OB_UNLIKELY(!tablet_id.is_valid()) || OB_ISNULL(expected_adapter)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid conditional tenant adaptor erase arguments", KR(ret),
+             K(tablet_id), KP(expected_adapter));
+  } else if (OB_FAIL(tenant_adaptor_map_.erase_if(
+                 tablet_id, predicate, erased, &erased_adapter))) {
+    if (OB_HASH_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("failed to erase tenant adaptor conditionally", KR(ret),
+               K(tablet_id), KP(expected_adapter));
+    }
+  } else if (erased && OB_ISNULL(erased_adapter)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("erased tenant adaptor is null", KR(ret), K(tablet_id), KP(expected_adapter));
+  } else if (erased
+             && OB_FAIL(ObPluginVectorIndexUtils::release_vector_index_adapter(erased_adapter))) {
+    LOG_WARN("failed to release conditionally erased tenant adaptor", KR(ret),
+             K(tablet_id), KP(expected_adapter));
   }
   return ret;
 }
@@ -868,10 +972,11 @@ int ObPluginVectorIndexService::acquire_adapter_guard(ObLSID ls_id,
             LOG_WARN("failed to set tenant adaptor", KR(ret), K(ctx.inc_tablet_id_));
           }
         } else if (OB_FAIL(adapter_guard.set_adapter(new_adapter))) {
-          int tmp_ret = erase_tenant_vec_adaptor(ctx.inc_tablet_id_);
+          bool erased = false;
+          int tmp_ret = erase_tenant_adapter_if_same(ctx.inc_tablet_id_, new_adapter, erased);
           new_adapter = nullptr;
           adpt_buff = nullptr;
-          if (OB_SUCCESS != tmp_ret && OB_HASH_NOT_EXIST != tmp_ret) {
+          if (OB_SUCCESS != tmp_ret) {
             LOG_WARN("failed to rollback tenant adaptor after guard set failed", KR(tmp_ret), K(ctx.inc_tablet_id_));
           }
           LOG_WARN("failed to set adapter guard", KR(ret), K(ctx));
@@ -888,6 +993,7 @@ int ObPluginVectorIndexService::acquire_adapter_guard(ObLSID ls_id,
       }
     }
   } else {
+    DEBUG_SYNC(VECTOR_INDEX_QUERY_AFTER_GET_TENANT_ADAPTOR);
     if (OB_FAIL(adapter_guard.get_adatper()->try_fill_tablet_info(ctx, became_complete))) {
       LOG_WARN("failed to fill tenant adaptor info", K(ls_id), K(ctx), KR(ret));
     }
@@ -900,7 +1006,7 @@ int ObPluginVectorIndexService::acquire_adapter_guard(ObLSID ls_id,
       if (ret == OB_HASH_NOT_EXIST) {
         ret = OB_SUCCESS;
         if (OB_FAIL(ls_index_mgr->attach_adapter(adapter_guard.get_adatper(), attached))) {
-          ls_index_mgr->set_last_transfer_scn(share::SCN::invalid_scn());
+          ls_index_mgr->mark_ls_adapter_binding_stale();
           LOG_WARN("failed to attach adaptor into ls map", KR(ret), K(ls_id), K(ctx.inc_tablet_id_));
         } else {
           adapter_attached_to_ls = attached;
@@ -909,7 +1015,7 @@ int ObPluginVectorIndexService::acquire_adapter_guard(ObLSID ls_id,
         LOG_WARN("failed to check local adaptor", KR(ret), K(ls_id), K(ctx.inc_tablet_id_));
       }
     } else if (local_guard.get_adatper() != adapter_guard.get_adatper()) {
-      ls_index_mgr->set_last_transfer_scn(share::SCN::invalid_scn());
+      ls_index_mgr->mark_ls_adapter_binding_stale();
     } else {
       adapter_attached_to_ls = true;
     }
@@ -999,9 +1105,9 @@ int ObPluginVectorIndexService::acquire_adapter_guard(ObLSID ls_id,
   return ret;
 }
 
-int ObPluginVectorIndexService::get_adapter_inst_guard(ObLSID ls_id,
-                                                       ObTabletID tablet_id,
-                                                       ObPluginVectorIndexAdapterGuard &adpt_guard)
+int ObPluginVectorIndexService::get_ls_local_adapter_inst_guard(ObLSID ls_id,
+                                                                ObTabletID tablet_id,
+                                                                ObPluginVectorIndexAdapterGuard &adpt_guard)
 {
   int ret = OB_SUCCESS;
   ObPluginVectorIndexMgr *ls_index_mgr = nullptr;
@@ -1011,11 +1117,8 @@ int ObPluginVectorIndexService::get_adapter_inst_guard(ObLSID ls_id,
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get null vector index mgr for ls", KR(ret), K(ls_id));
   } else if (OB_FAIL(ls_index_mgr->get_adapter_inst_guard(tablet_id, adpt_guard))) {
-    if (ret == OB_HASH_NOT_EXIST) {
-      ret = get_tenant_adapter_inst_guard(tablet_id, adpt_guard);
-    }
-    if (ret != OB_SUCCESS && ret != OB_HASH_NOT_EXIST) {
-      LOG_WARN("failed to get vector index adapter", K(ls_id), K(tablet_id), KR(ret));
+    if (OB_HASH_NOT_EXIST != ret) {
+      LOG_WARN("failed to get ls-local vector index adapter", K(ls_id), K(tablet_id), KR(ret));
     }
   }
   return ret;
@@ -1944,25 +2047,24 @@ int ObPluginVectorIndexMgr::replace_old_adapter(ObPluginVectorIndexAdaptor *new_
                K(new_adapter->get_inc_tablet_id()), "last_empty_scan_scn", old_adapter->get_last_empty_scan_scn());
     }
 
-    bool detached = false;
-    if (OB_FAIL(vector_index_service_->erase_tenant_vec_adaptor(new_adapter->get_inc_tablet_id()))) {
-      if (ret != OB_HASH_NOT_EXIST) {
-        LOG_WARN("failed to erase old tenant adapter", K(new_adapter->get_inc_tablet_id()), KR(ret));
-      } else {
-        ret = OB_SUCCESS;
-      }
-    }
-    if (OB_SUCC(ret) && OB_FAIL(vector_index_service_->set_tenant_vec_adaptor(new_adapter->get_inc_tablet_id(), new_adapter))) {
-      LOG_WARN("failed to set new tenant adapter", K(new_adapter->get_inc_tablet_id()), KR(ret));
-    }
-    if (OB_SUCC(ret) && OB_FAIL(detach_adapter_in_lock_(new_adapter->get_inc_tablet_id(), detached))) {
-      LOG_WARN("failed to detach old ls adapter", K(new_adapter->get_inc_tablet_id()), KR(ret));
-    }
-    if (OB_SUCC(ret)) {
+    if (OB_FAIL(vector_index_service_->replace_tenant_vec_adaptor(
+            new_adapter->get_inc_tablet_id(), new_adapter))) {
+      LOG_WARN("failed to replace tenant adapter", K(new_adapter->get_inc_tablet_id()), KR(ret));
+    } else {
+      bool detached = false;
       bool attached = false;
-      if (OB_FAIL(attach_adapter_in_lock_(new_adapter, attached))) {
-        set_last_transfer_scn(share::SCN::invalid_scn());
-        LOG_WARN("failed to attach new adapter into ls map", K(new_adapter->get_inc_tablet_id()), KR(ret));
+      // Tenant map owns new_adapter after replacement. Keep the replacement
+      // successful and let maintenance repair a failed local-map update.
+      int tmp_ret = detach_adapter_in_lock_(
+          new_adapter->get_inc_tablet_id(), detached);
+      if (OB_SUCCESS != tmp_ret) {
+        mark_ls_adapter_binding_stale();
+        LOG_WARN("failed to detach old ls adapter after tenant adaptor replacement",
+                 K(tmp_ret), K(new_adapter->get_inc_tablet_id()));
+      } else if (OB_SUCCESS != (tmp_ret = attach_adapter_in_lock_(new_adapter, attached))) {
+        mark_ls_adapter_binding_stale();
+        LOG_WARN("failed to attach new adapter into ls map after tenant adaptor replacement",
+                 K(tmp_ret), K(new_adapter->get_inc_tablet_id()));
       }
     }
   }

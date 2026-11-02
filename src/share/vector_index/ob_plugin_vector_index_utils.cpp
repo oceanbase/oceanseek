@@ -3670,8 +3670,12 @@ int ObPluginVectorIndexUtils::fill_mem_context_detail_info(ObPluginVectorIndexSe
     ObLSID ls_id = tablet_ids.at(i).ls_id_;
     ObTabletID tablet_id = tablet_ids.at(i).tablet_id_;
     ObPluginVectorIndexAdapterGuard adapter_guard;
-    if (OB_FAIL(service->get_adapter_inst_guard(ls_id, tablet_id, adapter_guard))) {
-      if (OB_HASH_NOT_EXIST != ret) {
+    if (OB_FAIL(service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adapter_guard))) {
+      if (OB_HASH_NOT_EXIST == ret) {
+        // The adaptor may have been detached after collecting tablet IDs.
+        ret = OB_SUCCESS;
+        continue;
+      } else {
         LOG_WARN("failed to get adapter inst guard", K(ls_id), K(tablet_id), KR(ret));
       }
     } else {
@@ -4089,13 +4093,14 @@ static int erase_tenant_adaptor_shell_if_same_as_ls_shell_(
                               && OB_NOT_NULL(tenant_adaptor)
                               && local_adaptor == tenant_adaptor;
     if (same_adaptor) {
-      if (OB_FAIL(vi_service->erase_tenant_vec_adaptor(inc_tablet_id))) {
-        if (OB_HASH_NOT_EXIST == ret) {
-          ret = OB_SUCCESS; // concurrent erase is fine
-        } else {
-          LOG_WARN("[MIG VEC] erase_tenant_adaptor_shell_if_same_as_ls_shell_: failed to erase from tenant_map",
-              K(ret), K(inc_tablet_id));
-        }
+      bool erased = false;
+      if (OB_FAIL(vi_service->erase_tenant_adapter_if_same(
+              inc_tablet_id, tenant_adaptor, erased))) {
+        LOG_WARN("[MIG VEC] erase_tenant_adaptor_shell_if_same_as_ls_shell_: failed to erase from tenant_map",
+            K(ret), K(inc_tablet_id), KP(tenant_adaptor));
+      } else if (!erased) {
+        LOG_INFO("[MIG VEC] tenant adaptor changed before migration shell erase",
+            K(inc_tablet_id), KP(tenant_adaptor));
       }
     } else {
       LOG_INFO("[MIG VEC] ls_map and tenant_map adaptor shell differ",
@@ -4154,7 +4159,7 @@ int ObPluginVectorIndexUtils::cleanup_adaptor_shells(
       ObPluginVectorIndexAdapterGuard local_guard;
       ObPluginVectorIndexAdapterGuard tenant_guard;
       // Fetch both pointers before any mutation so we can compare them later.
-      if (OB_FAIL(vi_service->get_adapter_inst_guard(ls_id, inc_tablet_id, local_guard))) {
+      if (OB_FAIL(vi_service->get_ls_local_adapter_inst_guard(ls_id, inc_tablet_id, local_guard))) {
         if (OB_HASH_NOT_EXIST == ret) {
           ret = OB_SUCCESS;
         } else {
@@ -4205,7 +4210,7 @@ int ObPluginVectorIndexUtils::cleanup_tenant_adaptor_shell_for_retry(
     // Inner retry must only clean tenant_map for the current adaptor, but still
     // needs the same pointer check to avoid erasing a replacement installed by
     // the scheduler.
-    if (OB_FAIL(vi_service->get_adapter_inst_guard(ls_id, inc_tablet_id, local_guard))) {
+    if (OB_FAIL(vi_service->get_ls_local_adapter_inst_guard(ls_id, inc_tablet_id, local_guard))) {
       if (OB_HASH_NOT_EXIST == ret) {
         ret = OB_SUCCESS;
       } else {

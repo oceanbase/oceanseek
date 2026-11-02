@@ -1477,7 +1477,7 @@ int ObVectorIndexAdaptorMigrationDag::clear_migrated_segments_from_dest_adaptor_
   } else if (OB_ISNULL(vi_service = MTL(share::ObPluginVectorIndexService *))) {
     LOG_INFO("[MIG VEC] vector index service not available, skip clear",
         "ls_id", ctx->arg_.ls_id_);
-  } else if (OB_FAIL(vi_service->get_adapter_inst_guard(
+  } else if (OB_FAIL(vi_service->get_ls_local_adapter_inst_guard(
                 ctx->arg_.ls_id_, adaptor_meta_.inc_tablet_id_, adaptor_guard))) {
     if (OB_HASH_NOT_EXIST == ret) {
       LOG_INFO("[MIG VEC] adaptor not available on dest, skip clear",
@@ -2058,7 +2058,7 @@ int ObVecIndexSegmentCopyTask::get_dest_adaptor_guard_(
   if (OB_ISNULL(vi_service)) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("[MIG VEC] vector index service not available on dest", K(ret));
-  } else if (OB_FAIL(vi_service->get_adapter_inst_guard(
+  } else if (OB_FAIL(vi_service->get_ls_local_adapter_inst_guard(
                  ctx_->arg_.ls_id_, adaptor_meta.inc_tablet_id_, adaptor_guard))) {
     if (OB_HASH_NOT_EXIST == ret) {
       ret = OB_SUCCESS;

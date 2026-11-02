@@ -192,7 +192,7 @@ TEST_F(TestVectorIndexFreeze, simple_test)
         ObTabletID tablet_id(inc_tablet_id);
         ObLSID ls_id(table_ls_id);
         ObPluginVectorIndexAdapterGuard adaptor_guard;
-        if (OB_SUCC(vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard))) {   
+        if (OB_SUCC(vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard))) {
           ObPluginVectorIndexAdaptor* adaptor = adaptor_guard.get_adatper();
           if (OB_NOT_NULL(adaptor) && adaptor->is_ready_complete()) {
             break;
@@ -253,7 +253,7 @@ TEST_F(TestVectorIndexFreeze, simple_test)
     ObTabletID tablet_id(inc_tablet_id);
     ObLSID ls_id(table_ls_id);
     ObPluginVectorIndexAdapterGuard adaptor_guard;
-    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
+    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
     ObPluginVectorIndexAdaptor* adaptor = adaptor_guard.get_adatper();
     ASSERT_NE(nullptr, adaptor);
     LOG_INFO("test adaptor info", KPC(adaptor));
@@ -322,7 +322,7 @@ TEST_F(TestVectorIndexFreeze, simple_test)
     ObTabletID tablet_id(inc_tablet_id);
     ObLSID ls_id(table_ls_id);
     ObPluginVectorIndexAdapterGuard adaptor_guard;
-    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
+    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
     ObPluginVectorIndexAdaptor* adaptor = adaptor_guard.get_adatper();
     ASSERT_NE(nullptr, adaptor);
     ASSERT_TRUE(adaptor->is_complete());
@@ -371,13 +371,13 @@ TEST_F(TestVectorIndexFreeze, simple_test)
     ObTabletID tablet_id(inc_tablet_id);
     ObLSID ls_id(table_ls_id);
     ObPluginVectorIndexAdapterGuard adaptor_guard;
-    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
+    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
     ObPluginVectorIndexAdaptor* adaptor = adaptor_guard.get_adatper();
     ASSERT_NE(nullptr, adaptor);
     ASSERT_TRUE(adaptor->is_complete());
 
     adaptor_guard.~ObPluginVectorIndexAdapterGuard();
-    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
+    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
     adaptor = adaptor_guard.get_adatper();
     ASSERT_NE(nullptr, adaptor);
 
@@ -443,7 +443,7 @@ TEST_F(TestVectorIndexFreeze, heap_table)
         ObTabletID tablet_id(inc_tablet_id);
         ObLSID ls_id(table_ls_id);
         ObPluginVectorIndexAdapterGuard adaptor_guard;
-        if (OB_SUCC(vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard))) {
+        if (OB_SUCC(vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard))) {
           ObPluginVectorIndexAdaptor* adaptor = adaptor_guard.get_adatper();
           if (OB_NOT_NULL(adaptor) && adaptor->is_ready_complete()) {
             break;
@@ -496,7 +496,7 @@ TEST_F(TestVectorIndexFreeze, heap_table)
     ObTabletID tablet_id(inc_tablet_id);
     ObLSID ls_id(table_ls_id);
     ObPluginVectorIndexAdapterGuard adaptor_guard;
-    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
+    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
     ObPluginVectorIndexAdaptor* adaptor = adaptor_guard.get_adatper();
     ASSERT_NE(nullptr, adaptor);
     LOG_INFO("test adaptor info", KPC(adaptor));
@@ -553,7 +553,7 @@ TEST_F(TestVectorIndexFreeze, heap_table)
     ObTabletID tablet_id(inc_tablet_id);
     ObLSID ls_id(table_ls_id);
     ObPluginVectorIndexAdapterGuard adaptor_guard;
-    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
+    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
     ObPluginVectorIndexAdaptor* adaptor = adaptor_guard.get_adatper();
     ASSERT_NE(nullptr, adaptor);
     ASSERT_TRUE(adaptor->is_complete());
@@ -602,13 +602,13 @@ TEST_F(TestVectorIndexFreeze, heap_table)
     ObTabletID tablet_id(inc_tablet_id);
     ObLSID ls_id(table_ls_id);
     ObPluginVectorIndexAdapterGuard adaptor_guard;
-    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
+    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
     ObPluginVectorIndexAdaptor* adaptor = adaptor_guard.get_adatper();
     ASSERT_NE(nullptr, adaptor);
     ASSERT_TRUE(adaptor->is_complete());
 
     adaptor_guard.~ObPluginVectorIndexAdapterGuard();
-    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
+    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
     adaptor = adaptor_guard.get_adatper();
     ASSERT_NE(nullptr, adaptor);
 
@@ -684,7 +684,7 @@ TEST_F(TestVectorIndexFreeze, partition_table)
         ObTabletID tablet_id(inc_tablet_id);
         ObLSID ls_id(table_ls_id);
         ObPluginVectorIndexAdapterGuard adaptor_guard;
-        if (OB_SUCC(vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard))) {
+        if (OB_SUCC(vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard))) {
           ObPluginVectorIndexAdaptor* adaptor = adaptor_guard.get_adatper();
           if (OB_NOT_NULL(adaptor) && adaptor->is_ready_complete()) {
             break;
@@ -737,7 +737,7 @@ TEST_F(TestVectorIndexFreeze, partition_table)
     ObTabletID tablet_id(inc_tablet_id);
     ObLSID ls_id(table_ls_id);
     ObPluginVectorIndexAdapterGuard adaptor_guard;
-    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
+    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
     ObPluginVectorIndexAdaptor* adaptor = adaptor_guard.get_adatper();
     ASSERT_NE(nullptr, adaptor);
     LOG_INFO("test adaptor info", KPC(adaptor));
@@ -794,7 +794,7 @@ TEST_F(TestVectorIndexFreeze, partition_table)
     ObTabletID tablet_id(inc_tablet_id);
     ObLSID ls_id(table_ls_id);
     ObPluginVectorIndexAdapterGuard adaptor_guard;
-    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
+    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
     ObPluginVectorIndexAdaptor* adaptor = adaptor_guard.get_adatper();
     ASSERT_NE(nullptr, adaptor);
     ASSERT_TRUE(adaptor->is_complete());
@@ -843,13 +843,13 @@ TEST_F(TestVectorIndexFreeze, partition_table)
     ObTabletID tablet_id(inc_tablet_id);
     ObLSID ls_id(table_ls_id);
     ObPluginVectorIndexAdapterGuard adaptor_guard;
-    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
+    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
     ObPluginVectorIndexAdaptor* adaptor = adaptor_guard.get_adatper();
     ASSERT_NE(nullptr, adaptor);
     ASSERT_TRUE(adaptor->is_complete());
 
     adaptor_guard.~ObPluginVectorIndexAdapterGuard();
-    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
+    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
     adaptor = adaptor_guard.get_adatper();
     ASSERT_NE(nullptr, adaptor);
 
@@ -935,7 +935,7 @@ TEST_F(TestVectorIndexFreeze, with_base)
         ObTabletID tablet_id(inc_tablet_id);
         ObLSID ls_id(table_ls_id);
         ObPluginVectorIndexAdapterGuard adaptor_guard;
-        if (OB_SUCC(vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard))) {
+        if (OB_SUCC(vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard))) {
           ObPluginVectorIndexAdaptor* adaptor = adaptor_guard.get_adatper();
           if (OB_NOT_NULL(adaptor) && adaptor->is_ready_complete()) {
             break;
@@ -984,7 +984,7 @@ TEST_F(TestVectorIndexFreeze, with_base)
     ObTabletID tablet_id(inc_tablet_id);
     ObLSID ls_id(table_ls_id);
     ObPluginVectorIndexAdapterGuard adaptor_guard;
-    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
+    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
     ObPluginVectorIndexAdaptor* adaptor = adaptor_guard.get_adatper();
     ASSERT_NE(nullptr, adaptor);
     LOG_INFO("test adaptor info", KPC(adaptor));
@@ -1039,7 +1039,7 @@ TEST_F(TestVectorIndexFreeze, with_base)
     ObTabletID tablet_id(inc_tablet_id);
     ObLSID ls_id(table_ls_id);
     ObPluginVectorIndexAdapterGuard adaptor_guard;
-    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
+    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
     ObPluginVectorIndexAdaptor* adaptor = adaptor_guard.get_adatper();
     ASSERT_NE(nullptr, adaptor);
     ASSERT_TRUE(adaptor->is_complete());
@@ -1089,13 +1089,13 @@ TEST_F(TestVectorIndexFreeze, with_base)
     ObTabletID tablet_id(inc_tablet_id);
     ObLSID ls_id(table_ls_id);
     ObPluginVectorIndexAdapterGuard adaptor_guard;
-    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
+    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
     ObPluginVectorIndexAdaptor* adaptor = adaptor_guard.get_adatper();
     ASSERT_NE(nullptr, adaptor);
     ASSERT_TRUE(adaptor->is_complete());
 
     adaptor_guard.~ObPluginVectorIndexAdapterGuard();
-    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
+    ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adaptor_guard));
     adaptor = adaptor_guard.get_adatper();
     ASSERT_NE(nullptr, adaptor);
     ASSERT_EQ(adaptor->get_incr_index_type(), ObVectorIndexAlgorithmType::VIAT_HGRAPH);
@@ -1185,7 +1185,7 @@ TEST_F(TestVectorIndexFreeze, DISABLED_concurrent_add_snap_and_serialize_snapsho
     const ObLSID ls_id(table_ls_id);
     {
       ObPluginVectorIndexAdapterGuard adaptor_guard;
-      ASSERT_EQ(OB_SUCCESS, vec_index_service->get_adapter_inst_guard(ls_id, inc_tid, adaptor_guard));
+      ASSERT_EQ(OB_SUCCESS, vec_index_service->get_ls_local_adapter_inst_guard(ls_id, inc_tid, adaptor_guard));
       ObPluginVectorIndexAdaptor *adaptor = adaptor_guard.get_adatper();
       ASSERT_NE(nullptr, adaptor);
       ASSERT_TRUE(adaptor->is_complete());
@@ -1206,7 +1206,7 @@ TEST_F(TestVectorIndexFreeze, DISABLED_concurrent_add_snap_and_serialize_snapsho
         MTL_SWITCH(R.tenant_id_) {
           ObPluginVectorIndexService *svc = MTL(ObPluginVectorIndexService *);
           ObPluginVectorIndexAdapterGuard guard;
-          int ret = svc->get_adapter_inst_guard(ls_id, inc_tid, guard);
+          int ret = svc->get_ls_local_adapter_inst_guard(ls_id, inc_tid, guard);
           if (OB_SUCCESS != ret) {
             local_fail++;
           } else {
@@ -1234,7 +1234,7 @@ TEST_F(TestVectorIndexFreeze, DISABLED_concurrent_add_snap_and_serialize_snapsho
         MTL_SWITCH(R.tenant_id_) {
           ObPluginVectorIndexService *svc = MTL(ObPluginVectorIndexService *);
           ObPluginVectorIndexAdapterGuard guard;
-          int ret = svc->get_adapter_inst_guard(ls_id, inc_tid, guard);
+          int ret = svc->get_ls_local_adapter_inst_guard(ls_id, inc_tid, guard);
           if (OB_SUCCESS != ret) {
             infra_fail++;
           } else {

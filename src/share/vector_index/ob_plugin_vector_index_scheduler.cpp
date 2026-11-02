@@ -442,8 +442,8 @@ int ObPluginVectorIndexLoadScheduler::check_transfer_scn(
     // skip
   } else if (OB_FAIL(ls_->get_transfer_scn(current_transfer_scn))) {
     LOG_WARN("failed to get ls transfer scn", KR(ret), K(ls_->get_ls_id()));
-  } else if (!mgr->get_last_transfer_scn().is_valid()
-             || mgr->get_last_transfer_scn() != current_transfer_scn) {
+  } else if (current_transfer_scn.is_valid()
+             && mgr->get_last_transfer_scn() != current_transfer_scn) {
     mark_tenant_need_check();
     need_update_transfer_scn = current_transfer_scn.is_valid();
     LOG_INFO("finish check transfer scn", KR(ret), K(current_transfer_scn), K(mgr->get_last_transfer_scn()), K(ls_->get_ls_id()));
@@ -1701,10 +1701,10 @@ void ObPluginVectorIndexLoadScheduler::inner_switch_to_follower_()
   FLOG_INFO("vector index scheduler: finish to switch_to_follower", K_(tenant_id), KPC_(ls), K(cost_us));
 }
 
-int ObPluginVectorIndexLoadScheduler::check_other_ls_transfer_maintenance_finished(bool &is_finished)
+int ObPluginVectorIndexLoadScheduler::check_other_ls_adapter_binding_consistent(bool &is_consistent)
 {
   int ret = OB_SUCCESS;
-  is_finished = true;
+  is_consistent = true;
   bool is_oracle_mode = false;
   bool is_restore = false;
   storage::ObLSService *ls_service = MTL(storage::ObLSService *);
@@ -1743,7 +1743,7 @@ int ObPluginVectorIndexLoadScheduler::check_other_ls_transfer_maintenance_finish
     // tasks. Wait for other LS schedulers to finish their transfer maintenance
     // before removing tenant-level adaptors that they may still need to attach.
     TCRWLock::RLockGuard lock_guard(vector_index_service_->get_ls_mgr_map_lock());
-    FOREACH_X(iter, vector_index_service_->get_ls_index_mgr_map(), OB_SUCC(ret) && is_finished) {
+    FOREACH_X(iter, vector_index_service_->get_ls_index_mgr_map(), OB_SUCC(ret) && is_consistent) {
       const ObLSID &other_ls_id = iter->first;
       ObPluginVectorIndexMgr *other_mgr = iter->second;
       if (other_ls_id == ls_->get_ls_id()) {
@@ -1775,10 +1775,13 @@ int ObPluginVectorIndexLoadScheduler::check_other_ls_transfer_maintenance_finish
               K(other_ls_id), K(ls_->get_ls_id()));
         } else if (OB_FAIL(other_ls->get_transfer_scn(other_transfer_scn))) {
           LOG_WARN("failed to get other ls transfer scn", KR(ret), K(other_ls_id), K(ls_->get_ls_id()));
-        } else if (other_mgr->get_last_transfer_scn() != other_transfer_scn) {
-          is_finished = false;
-          LOG_INFO("other vector index ls maintenance is not finished",
-              K(other_ls_id), K(other_transfer_scn), K(other_mgr->get_last_transfer_scn()), K(ls_->get_ls_id()));
+        } else if (other_mgr->get_last_transfer_scn() != other_transfer_scn
+                   || other_mgr->is_ls_adapter_binding_stale()) {
+          is_consistent = false;
+          LOG_INFO("other vector index ls adaptor binding is not consistent",
+              K(other_ls_id), K(other_transfer_scn), K(other_mgr->get_last_transfer_scn()),
+              "binding_stale", other_mgr->is_ls_adapter_binding_stale(),
+              K(ls_->get_ls_id()));
         }
       }
     }
@@ -1805,37 +1808,42 @@ int ObPluginVectorIndexLoadScheduler::detach_and_clean_adaptors_for_destroy(ObPl
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < local_tablet_id_array.count(); i++) {
       const ObTabletID tablet_id = local_tablet_id_array.at(i);
-      ObPluginVectorIndexAdapterGuard tenant_guard;
+      ObPluginVectorIndexAdapterGuard local_guard;
       bool detached = false;
-      if (OB_FAIL(index_ls_mgr->detach_adapter(tablet_id, detached))) {
-        LOG_WARN("failed to detach adaptor on safe destroy", KR(ret), K(tablet_id), K(ls_->get_ls_id()));
-      // tenant-only adaptors are attached to ls_map before tablet deletion, so
-      // local_tablet_id_array is the single source for destroy cleanup here.
-      } else if (OB_FAIL(vector_index_service_->get_tenant_adapter_inst_guard(tablet_id, tenant_guard))) {
+      if (OB_FAIL(index_ls_mgr->get_adapter_inst_guard(tablet_id, local_guard))) {
         if (ret == OB_HASH_NOT_EXIST) {
           ret = OB_SUCCESS;
         } else {
-          LOG_WARN("[VEC_INDEX][LS_DESTROY] failed to recheck tenant adaptor after ls destroy cleanup",
+          LOG_WARN("failed to get local adaptor before safe destroy detach",
               KR(ret), K(tablet_id), K(ls_->get_ls_id()));
         }
-      } else if (OB_ISNULL(tenant_guard.get_adatper())) {
+      } else if (OB_ISNULL(local_guard.get_adatper())) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("[VEC_INDEX][LS_DESTROY] tenant adaptor is null after ls destroy cleanup",
+        LOG_WARN("local adaptor is null before safe destroy detach",
             KR(ret), K(tablet_id), K(ls_->get_ls_id()));
-      } else if (0 == tenant_guard.get_adatper()->get_ls_ref()) {
-        int tmp_ret = vector_index_service_->erase_tenant_vec_adaptor(tablet_id);
-        if (tmp_ret != OB_SUCCESS && tmp_ret != OB_HASH_NOT_EXIST) {
+      } else if (OB_FAIL(index_ls_mgr->detach_adapter(tablet_id, detached))) {
+        LOG_WARN("failed to detach adaptor on safe destroy", KR(ret), K(tablet_id), K(ls_->get_ls_id()));
+      // tenant-only adaptors are attached to ls_map before tablet deletion, so
+      // local_tablet_id_array is the single source for destroy cleanup here.
+      } else if (0 == local_guard.get_adatper()->get_ls_ref()) {
+        bool erased = false;
+        int tmp_ret = vector_index_service_->erase_tenant_adapter_if_same(
+            tablet_id, local_guard.get_adatper(), erased);
+        if (tmp_ret != OB_SUCCESS) {
           ret = tmp_ret;
           LOG_WARN("[VEC_INDEX][LS_DESTROY] failed to erase tenant adaptor by local ls map on ls destroy",
               KR(ret), K(tablet_id), K(ls_->get_ls_id()));
-        } else {
+        } else if (erased) {
           LOG_INFO("[VEC_INDEX][LS_DESTROY] erased tenant adaptor by local ls map on ls destroy",
-              K(tablet_id), K(ls_->get_ls_id()), KPC(tenant_guard.get_adatper()));
+              K(tablet_id), K(ls_->get_ls_id()), KPC(local_guard.get_adatper()));
+        } else {
+          LOG_INFO("[VEC_INDEX][LS_DESTROY] tenant adaptor changed before conditional erase",
+              K(tablet_id), K(ls_->get_ls_id()), KPC(local_guard.get_adatper()));
         }
       } else {
         LOG_INFO("[VEC_INDEX][LS_DESTROY] tenant adaptor remains after ls destroy cleanup",
-            K(tablet_id), K(ls_->get_ls_id()), KPC(tenant_guard.get_adatper()),
-            "ls_ref", tenant_guard.get_adatper()->get_ls_ref());
+            K(tablet_id), K(ls_->get_ls_id()), KPC(local_guard.get_adatper()),
+            "ls_ref", local_guard.get_adatper()->get_ls_ref());
       }
     }
   }
@@ -1944,10 +1952,10 @@ int ObPluginVectorIndexLoadScheduler::safe_to_destroy(bool &is_safe)
   }
 
   if (is_safe && OB_NOT_NULL(index_ls_mgr)) {
-    bool other_ls_maintenance_finished = true;
-    if (OB_FAIL(check_other_ls_transfer_maintenance_finished(other_ls_maintenance_finished))) {
-      LOG_WARN("failed to check other ls transfer maintenance", KR(ret), K(ls_->get_ls_id()));
-    } else if (!other_ls_maintenance_finished) {
+    bool other_ls_binding_consistent = true;
+    if (OB_FAIL(check_other_ls_adapter_binding_consistent(other_ls_binding_consistent))) {
+      LOG_WARN("failed to check other ls adaptor binding", KR(ret), K(ls_->get_ls_id()));
+    } else if (!other_ls_binding_consistent) {
       is_safe = false;
     }
   }

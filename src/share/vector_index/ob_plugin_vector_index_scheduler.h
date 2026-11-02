@@ -310,7 +310,7 @@ public:
   int execute_all_memdata_sync_task(ObPluginVectorIndexMgr *mgr);
   int execute_one_memdata_sync_task(ObPluginVectorIndexMgr *mgr, ObPluginVectorIndexTaskCtx *ctx);
   int check_ls_task_state(ObPluginVectorIndexMgr *mgr);
-  int check_other_ls_transfer_maintenance_finished(bool &is_finished);
+  int check_other_ls_adapter_binding_consistent(bool &is_consistent);
   int detach_and_clean_adaptors_for_destroy(ObPluginVectorIndexMgr *index_ls_mgr);
   int check_has_vector_index(ObIArray<uint64_t> &vec_table_id_array);
 

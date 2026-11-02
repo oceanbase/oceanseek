@@ -267,6 +267,7 @@ private:
   int check_schema_version(bool &schema_version_changed);
   int check_index_adapter_exist(ObPluginVectorIndexMgr *mgr);
   int check_need_maintenance_ls_follower(ObPluginVectorIndexMgr *mgr);
+  int check_need_maintenance_ls_adapter_binding(ObPluginVectorIndexMgr *mgr);
   int check_transfer_scn(ObPluginVectorIndexMgr *mgr);
   int check_ls_in_vector_migration(storage::ObLS *ls, bool &is_in_migration);
   int check_need_maintenance(ObPluginVectorIndexMgr *mgr);
@@ -290,7 +291,7 @@ private:
   int remove_zero_ls_ref_tenant_adaptors();
   int check_is_vector_index_table(
       const ObSimpleTableSchemaV2 &table_schema, bool &is_vector_index_table, bool &is_shared_index_table);
-  void clean_deprecated_adapters(
+  int clean_deprecated_adapters(
       storage::ObLS *ls,
       ObPluginVectorIndexMgr *mgr,
       const bool is_ls_leader);

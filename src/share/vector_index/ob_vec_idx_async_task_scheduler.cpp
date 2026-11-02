@@ -963,6 +963,19 @@ int ObVecIdxAsyncTaskScheduler::check_need_maintenance_ls_follower(ObPluginVecto
   return ret;
 }
 
+int ObVecIdxAsyncTaskScheduler::check_need_maintenance_ls_adapter_binding(
+    ObPluginVectorIndexMgr *mgr)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(mgr)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(mgr));
+  } else if (mgr->is_ls_adapter_binding_stale()) {
+    set_need_maintenance(mgr);
+  }
+  return ret;
+}
+
 int ObVecIdxAsyncTaskScheduler::check_transfer_scn(ObPluginVectorIndexMgr *mgr)
 {
   int ret = OB_SUCCESS;
@@ -978,8 +991,8 @@ int ObVecIdxAsyncTaskScheduler::check_transfer_scn(ObPluginVectorIndexMgr *mgr)
     LOG_WARN("ls is null", KR(ret), K(mgr->get_ls_id()));
   } else if (OB_FAIL(ls_handle.get_ls()->get_transfer_scn(current_transfer_scn))) {
     LOG_WARN("failed to get ls transfer scn", KR(ret), K(mgr->get_ls_id()));
-  } else if (!mgr->get_last_transfer_scn().is_valid()
-             || mgr->get_last_transfer_scn() != current_transfer_scn) {
+  } else if (current_transfer_scn.is_valid()
+             && mgr->get_last_transfer_scn() != current_transfer_scn) {
     set_need_maintenance(mgr);
     LOG_INFO("finish check transfer scn", KR(ret), K(current_transfer_scn),
              K(mgr->get_last_transfer_scn()), K(mgr->get_ls_id()));
@@ -1015,7 +1028,9 @@ int ObVecIdxAsyncTaskScheduler::check_ls_in_vector_migration(storage::ObLS *ls, 
 int ObVecIdxAsyncTaskScheduler::check_need_maintenance(ObPluginVectorIndexMgr *mgr)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(check_index_adapter_exist(mgr))) {
+  if (OB_FAIL(check_need_maintenance_ls_adapter_binding(mgr))) {
+    LOG_WARN("fail to check ls adapter binding", KR(ret));
+  } else if (OB_FAIL(check_index_adapter_exist(mgr))) {
     LOG_WARN("fail to check exist vector index adapter", KR(ret));
   } else if (OB_FAIL(check_need_maintenance_ls_follower(mgr))) {
     LOG_WARN("fail to check need maintenance ls follower", KR(ret));
@@ -1056,7 +1071,7 @@ int ObVecIdxAsyncTaskScheduler::check_is_vector_index_table(const ObSimpleTableS
   return ret;
 }
 
-void ObVecIdxAsyncTaskScheduler::clean_deprecated_adapters(
+int ObVecIdxAsyncTaskScheduler::clean_deprecated_adapters(
     storage::ObLS *ls,
     ObPluginVectorIndexMgr *mgr,
     const bool is_ls_leader)
@@ -1232,6 +1247,7 @@ void ObVecIdxAsyncTaskScheduler::clean_deprecated_adapters(
       }
     }
   }
+  return ret;
 }
 
 int ObVecIdxAsyncTaskScheduler::record_alter_param_parent_cleanup_(
@@ -1500,6 +1516,7 @@ int ObVecIdxAsyncTaskScheduler::execute_adapter_maintenance_for_ls(
   } else if (OB_ISNULL(ls) || OB_ISNULL(mgr)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), KP(ls), KP(mgr));
+  } else if (FALSE_IT(mgr->begin_ls_adapter_binding_check())) {
   } else if (mgr->is_ls_destroying()) {
     LOG_INFO("ls is destroying, skip clean deprecated adapters", K(ls->get_ls_id()));
   } else {
@@ -1507,8 +1524,8 @@ int ObVecIdxAsyncTaskScheduler::execute_adapter_maintenance_for_ls(
     lib::ObMutexGuard maintenance_guard(mgr->get_maintenance_lock());
     if (mgr->is_ls_destroying()) {
       LOG_INFO("ls is destroying, skip clean deprecated adapters", K(ls_id));
-    } else {
-      clean_deprecated_adapters(ls, mgr, is_ls_leader);
+    } else if (OB_FAIL(clean_deprecated_adapters(ls, mgr, is_ls_leader))) {
+      LOG_WARN("failed to clean deprecated adapters", KR(ret), K(ls_id));
     }
   }
 
@@ -1610,6 +1627,9 @@ int ObVecIdxAsyncTaskScheduler::execute_adapter_maintenance_for_ls(
     }
   }
 
+  if (OB_SUCC(ret) && OB_NOT_NULL(mgr)) {
+    mgr->finish_ls_adapter_binding_check();
+  }
   LOG_INFO("finish generate tenant tablet tasks", KR(ret), K_(tenant_id), K(ls_id));
   return ret;
 }

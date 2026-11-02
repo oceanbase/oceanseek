@@ -68,7 +68,7 @@ int ObVectorIndexInfoIterator::get_next_info(ObVectorIndexInfo &info)
       tablet_id = partial_tablet_ids_.at(index_idx_ - complete_tablet_ids_.count()).tablet_id_;
     }
     ObPluginVectorIndexAdapterGuard adapter_guard;
-    if (OB_FAIL(MTL(ObPluginVectorIndexService*)->get_adapter_inst_guard(ls_id, tablet_id, adapter_guard))) {
+    if (OB_FAIL(MTL(ObPluginVectorIndexService*)->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adapter_guard))) {
       if (OB_HASH_NOT_EXIST != ret) {
         SERVER_LOG(WARN, "failed to get adapter inst guard", K(ls_id), K(tablet_id), KR(ret));
       }
@@ -104,7 +104,7 @@ int ObVectorIndexInfoIterator::get_next_index_all_segments(ObLSID &ls_id, ObTabl
       tablet_id = partial_tablet_ids_.at(index_idx_ - complete_tablet_ids_.count()).tablet_id_;
     }
     ObPluginVectorIndexAdapterGuard adapter_guard;
-    if (OB_FAIL(MTL(ObPluginVectorIndexService*)->get_adapter_inst_guard(ls_id, tablet_id, adapter_guard))) {
+    if (OB_FAIL(MTL(ObPluginVectorIndexService*)->get_ls_local_adapter_inst_guard(ls_id, tablet_id, adapter_guard))) {
       if (OB_HASH_NOT_EXIST != ret) {
         SERVER_LOG(WARN, "failed to get adapter inst guard", K(ls_id), K(tablet_id), KR(ret));
       }
