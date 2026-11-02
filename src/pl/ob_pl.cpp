@@ -53,6 +53,29 @@ static void* DW_REF_ObPLEH_eh_personality = (void*)(&ObPLEH::eh_personality);
 ERRSIM_POINT_DEF(OBPLCONTEXT_INIT);
 #endif // ERRSIM
 
+// Restore session stmt type when the outermost PL execution finishes, so that
+// nested statements of PL do not leak their stmt type to the outer statement.
+class ObPLStmtTypeGuard
+{
+public:
+  explicit ObPLStmtTypeGuard(ObSQLSessionInfo *session)
+    : session_(session), saved_stmt_type_(stmt::T_NONE)
+  {
+    if (OB_NOT_NULL(session_)) {
+      saved_stmt_type_ = session_->get_stmt_type();
+    }
+  }
+  ~ObPLStmtTypeGuard()
+  {
+    if (OB_NOT_NULL(session_)) {
+      session_->set_stmt_type(saved_stmt_type_);
+    }
+  }
+private:
+  ObSQLSessionInfo *session_;
+  stmt::StmtType saved_stmt_type_;
+};
+
 template <typename T, T *p>
 struct ObPLSPIWrapper;
 
@@ -2497,6 +2520,7 @@ bool ObPL::parameter_ps_anonymous_block(ObExecContext &ctx,
 int ObPL::execute(ObExecContext &ctx, ParamStore &params, const ObStmtNodeTree *block)
 {
   int ret = OB_SUCCESS;
+  ObPLStmtTypeGuard stmt_type_guard(ctx.get_my_session());
   CK (OB_NOT_NULL(block));
   lib::MemoryContext mem_context = NULL;
   lib::ContextParam param;
@@ -2665,6 +2689,7 @@ int ObPL::execute(ObExecContext &ctx,
                   ObBitSet<OB_DEFAULT_BITSET_SIZE> &out_args)
 {
   int ret = OB_SUCCESS;
+  ObPLStmtTypeGuard stmt_type_guard(ctx.get_my_session());
   ObPLFunction *routine = NULL;
   ObCacheObjGuard cacheobj_guard(PL_ANON_HANDLE);
   int64_t old_worker_timeout_ts = 0;
@@ -2760,6 +2785,7 @@ int ObPLExecuteArg::obtain_routine(ObExecContext &ctx,
                                     const ObIArray<int64_t> &subprogram_path)
 {
   int ret = OB_SUCCESS;
+  ObPLStmtTypeGuard stmt_type_guard(ctx.get_my_session());
   ObPLFunction *local_routine = NULL;
   ObPLExecInfo *inner_exec_info = nullptr;
   ObCacheObjGuard* func_guard = nullptr;
@@ -2860,6 +2886,7 @@ int ObPL::execute(ObExecContext &ctx,
   ObPLFunction *routine = NULL;
   int64_t old_worker_timeout_ts = 0;
   ObCurTraceId::TraceId parent_trace_id;
+  ObPLStmtTypeGuard stmt_type_guard(ctx.get_my_session());
   ObPLASHGuard guard(package_id, routine_id);
 
   /* !!!
