@@ -26,5 +26,6 @@ ob_unittest(test_direct_load_stream_dbms table_load/test_direct_load_stream_dbms
 ob_unittest(test_direct_load_stream_chunk table_load/test_direct_load_stream_chunk.cpp)
 ob_unittest(test_ob_sandbox test_ob_sandbox.cpp)
 ob_unittest(test_resource_inner_sql_connection_pool)
+ob_unittest(test_all_virtual_dynamic_partition_table virtual_table/test_all_virtual_dynamic_partition_table.cpp)
 
 add_subdirectory(rpc EXCLUDE_FROM_ALL)
