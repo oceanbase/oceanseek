@@ -63,6 +63,31 @@ TEST(StreamingRorCost, invalid_or_unbounded_work_retains_bitmap)
   EXPECT_TRUE(ObDASBooleanQueryRtDef::prefer_streaming_ror_filter(1, 2113, 10000, 2, 1));
 }
 
+TEST(StreamingRorCost, mysqltest_selective_and_broad_candidates)
+{
+  // Fixed estimates for the two SQL correctness datasets. Unlike mysqltest,
+  // these inputs cannot change with refresh/compaction or statistics timing.
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::prefer_streaming_ror_filter(
+      1024, 261888, 262144, 2, 1000));
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::prefer_streaming_ror_filter(
+      2, 7935, 8193, 2, 100));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::prefer_streaming_ror_filter(
+      8193, 7935, 8193, 2, 100));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::prefer_streaming_ror_filter(
+      8193, 7935, 8193, 2, 10000));
+}
+
+TEST(StreamingRorCost, topology_and_topk_change_the_decision)
+{
+  // One consumer does not need independent Group cursors.
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::prefer_streaming_ror_filter(2, 7935, 8193, 1, 100));
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::prefer_streaming_ror_filter(2, 7935, 8193, 2, 100));
+  // Cursor setup alone becomes more expensive than materialization.
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::prefer_streaming_ror_filter(2, 7935, 8193, 8, 100));
+  EXPECT_TRUE(ObDASBooleanQueryRtDef::prefer_streaming_ror_filter(2, 7935, 8193, 2, 1000));
+  EXPECT_FALSE(ObDASBooleanQueryRtDef::prefer_streaming_ror_filter(2, 7935, 8193, 2, 1001));
+}
+
 namespace
 {
 
@@ -951,6 +976,83 @@ protected:
   std::vector<ObIDASSearchRtDef*> should_clauses_;
   std::vector<ObIDASSearchRtDef*> must_not_clauses_;
 };
+
+TEST_F(ObDASBooleanQueryTest, streaming_ror_requires_single_search_segment_and_serial_plan)
+{
+  ObDASAsyncIndexQueryCtx query_ctx;
+  auto *partition = OB_NEWx(ObAsyncIndexPartitionSegCtx, &query_ctx.allocator_);
+  ASSERT_NE(nullptr, partition);
+  ASSERT_EQ(OB_SUCCESS, query_ctx.partitions_.push_back(partition));
+  ASSERT_EQ(OB_SUCCESS, partition->index_table_ids_.push_back(9001)); // FTS
+  ASSERT_EQ(OB_SUCCESS, partition->index_table_ids_.push_back(9002)); // SEARCH
+  ASSERT_EQ(OB_SUCCESS, partition->index_tablet_ids_.push_back(ObTabletID(19001)));
+  ASSERT_EQ(OB_SUCCESS, partition->index_tablet_ids_.push_back(ObTabletID(19002)));
+  auto *group = OB_NEWx(storage::ObAsyncIndexSegmentGroup,
+                       &partition->storage_group_ctx_.allocator_);
+  ASSERT_NE(nullptr, group);
+  ASSERT_EQ(OB_SUCCESS, partition->storage_group_ctx_.groups_.push_back(group));
+  ASSERT_EQ(OB_SUCCESS, group->init(2));
+  ObNewVersionRange first;
+  first.base_version_ = 0;
+  first.snapshot_version_ = 100;
+  ObNewVersionRange second;
+  second.base_version_ = 100;
+  second.snapshot_version_ = 200;
+  ObNewVersionRange covering;
+  covering.base_version_ = 0;
+  covering.snapshot_version_ = 200;
+  ASSERT_EQ(OB_SUCCESS, group->add_version_range(0, first));
+  ASSERT_EQ(OB_SUCCESS, group->add_version_range(0, second));
+  ASSERT_EQ(OB_SUCCESS, group->add_version_range(1, covering));
+  query_ctx.is_inited_ = true;
+
+  ObDASFusionCtDef fusion_ctdef(allocator_);
+  SearchCtxSetup setup(allocator_);
+  setup.mock_scan_op_.set_attach_ctdef(&fusion_ctdef);
+  setup.search_ctx_.set_async_query_ctx(&query_ctx);
+  setup.search_ctx_.set_async_binding(OB_INVALID_ID, 0, false);
+  ObDASScalarScanCtDef scan_ctdef(allocator_);
+  scan_ctdef.ref_table_id_ = 9002;
+  scan_ctdef.is_async_index_ = true;
+  scan_ctdef.is_search_index_ = true;
+  scan_ctdef.is_index_term_point_scan_ = true;
+  scan_ctdef.enable_new_false_range_ = true;
+  ObDASScalarScanRtDef scan_rtdef;
+  scan_rtdef.ctdef_ = &scan_ctdef;
+  ObNewRange key_range;
+  ASSERT_EQ(OB_SUCCESS, scan_rtdef.key_ranges_.push_back(key_range));
+
+  // Fixed catalog: two FTS consumers share one covering SEARCH segment.
+  ASSERT_EQ(2, query_ctx.get_max_segment_cnt(0, 9001));
+  ASSERT_EQ(1, query_ctx.get_max_segment_cnt(0, 9002));
+  ASSERT_TRUE(scan_rtdef.can_build_streaming_group_filter(setup.search_ctx_));
+  fusion_ctdef.enable_parallel_ = true;
+  EXPECT_FALSE(scan_rtdef.can_build_streaming_group_filter(setup.search_ctx_));
+  fusion_ctdef.enable_parallel_ = false;
+  scan_ctdef.is_index_term_point_scan_ = false;
+  EXPECT_FALSE(scan_rtdef.can_build_streaming_group_filter(setup.search_ctx_));
+  scan_ctdef.is_index_term_point_scan_ = true;
+  ASSERT_EQ(OB_SUCCESS, scan_rtdef.key_ranges_.push_back(key_range));
+  EXPECT_FALSE(scan_rtdef.can_build_streaming_group_filter(setup.search_ctx_));
+  scan_rtdef.key_ranges_.pop_back();
+  setup.search_ctx_.set_async_binding(OB_INVALID_ID, -1, false);
+  EXPECT_FALSE(scan_rtdef.can_build_streaming_group_filter(setup.search_ctx_));
+  setup.search_ctx_.set_async_binding(OB_INVALID_ID, 0, false);
+  query_ctx.is_inited_ = false;
+  EXPECT_FALSE(scan_rtdef.can_build_streaming_group_filter(setup.search_ctx_));
+  query_ctx.is_inited_ = true;
+  ASSERT_TRUE(scan_rtdef.can_build_streaming_group_filter(setup.search_ctx_));
+
+  // A split SEARCH range is not eligible, even with the same FTS consumers.
+  group->reset();
+  ASSERT_EQ(OB_SUCCESS, group->init(2));
+  ASSERT_EQ(OB_SUCCESS, group->add_version_range(0, first));
+  ASSERT_EQ(OB_SUCCESS, group->add_version_range(0, second));
+  ASSERT_EQ(OB_SUCCESS, group->add_version_range(1, first));
+  ASSERT_EQ(OB_SUCCESS, group->add_version_range(1, second));
+  ASSERT_EQ(2, query_ctx.get_max_segment_cnt(0, 9002));
+  EXPECT_FALSE(scan_rtdef.can_build_streaming_group_filter(setup.search_ctx_));
+}
 
 template <typename Consumer>
 void check_bmm_input_options(Consumer &consumer, ObIDASSearchOp &filter)

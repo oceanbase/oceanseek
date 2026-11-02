@@ -23,6 +23,7 @@
 #include "sql/das/iter/ob_das_vec_index_ivf_scan_iter.h"
 #include "sql/das/search/ob_das_async_index_query_ctx.h"
 #include "sql/das/search/ob_das_async_segment_merge_op.h"
+#include "sql/das/search/ob_das_async_segment_group_merge_op.h"
 #include "sql/das/search/ob_das_dummy_op.h"
 #include "sql/das/search/ob_das_match_query.h"
 #include "sql/das/search/ob_das_search_define.h"
@@ -3125,6 +3126,140 @@ TEST_F(ObDASFusionParallelCtxTest,
 }
 
 // ============================================================================
+// The former compaction mysqltests tried to produce these asymmetric catalogs
+// with background merge timing. Keep discovery/PREPARE contracts deterministic.
+TEST_F(ObDASFusionParallelCtxTest, ordinary_bitmap_prepare_uses_only_current_partition_groups)
+{
+  // Empty scan isolates whether PREPARE opens an inactive source. Bitmap values
+  // and batching are independently checked by ObDASBitmapOpBuildTest.
+  class CountingEmptySource : public TestEnumerableSearchOp
+  {
+  public:
+    explicit CountingEmptySource(ObDASSearchCtx &ctx)
+      : TestEnumerableSearchOp(ctx, {}), open_count_(0) {}
+    int64_t open_count_;
+  protected:
+    int do_open() override { ++open_count_; return OB_SUCCESS; }
+    int do_next_rowids(const int64_t, int64_t &count) override
+    { count = 0; return OB_ITER_END; }
+  };
+  ObDASAsyncIndexQueryCtx catalog;
+  ASSERT_EQ(OB_SUCCESS, build_filter_provider_test_catalog(catalog));
+  const int64_t partition_ids[] = {1, 2, 1};
+  for (int64_t partition_id : partition_ids) {
+    SCOPED_TRACE(partition_id);
+    const ObAsyncIndexPartitionSegCtx *partition = nullptr;
+    ASSERT_EQ(OB_SUCCESS, catalog.find_partition(ObTabletID(partition_id), partition));
+    const int64_t active_count = 2 == partition_id ? 2 : 1;
+    ASSERT_EQ(active_count, partition->get_storage_group_ctx().get_group_count());
+    ObDASScanOp scan_op(alloc_);
+    ObExecContext exec_ctx(alloc_);
+    ObEvalCtx eval_ctx(exec_ctx);
+    eval_ctx.max_batch_size_ = 8;
+    ObDASSearchCtx ctx(alloc_, scan_op);
+    ctx.eval_ctx_ = &eval_ctx;
+    ctx.table_row_count_ = ObDASSearchCost(0);
+    ctx.set_async_query_ctx(&catalog);
+    ctx.set_current_async_partition(partition);
+    CountingEmptySource first_source(ctx), second_source(ctx);
+    ObDASBitmapOp first(ctx), second(ctx);
+    first.op_type_ = second.op_type_ = DAS_SEARCH_OP_BITMAP;
+    first.input_op_ = &first_source;
+    second.input_op_ = &second_source;
+    ObArray<ObIDASSearchOp *> children;
+    ASSERT_EQ(OB_SUCCESS, children.push_back(&first));
+    ASSERT_EQ(OB_SUCCESS, children.push_back(&second));
+    ObDASAsyncSegmentGroupMergeOpParam param(children);
+    ObDASAsyncSegmentGroupMergeOp root(ctx);
+    ASSERT_EQ(OB_SUCCESS, root.init(param));
+    ObDASSearchDriverIter driver;
+    driver.set_root_op(&root);
+    driver.set_search_ctx(&ctx);
+    ObDASFusionParallelCtx parallel;
+    ASSERT_EQ(OB_SUCCESS, parallel.discover_shared_bitmaps(alloc_, &driver, 4));
+    ASSERT_EQ(active_count, parallel.get_shared_bitmap_count());
+    ObDASFusionBitmapPrepareWork work;
+    work.parallel_ctx_ = &parallel;
+    ASSERT_EQ(OB_SUCCESS, work.child_bitmap_ops_.push_back(&first));
+    ASSERT_EQ(OB_SUCCESS, work.child_bitmap_ops_.push_back(&second));
+    ObDASFusionParallelCoordinator coordinator;
+    ASSERT_EQ(OB_SUCCESS, coordinator.init(1));
+    ASSERT_EQ(OB_SUCCESS, work.build_shared_bitmaps(INT64_MAX, coordinator));
+    EXPECT_EQ(1, first_source.open_count_);
+    EXPECT_EQ(active_count - 1, second_source.open_count_);
+    for (int64_t i = 0; i < active_count; ++i) {
+      const ObSharedBitmapSlot *slot = parallel.get_shared_bitmap_slot(i);
+      EXPECT_EQ(i, slot->bitmap_occurrence_idx_);
+      EXPECT_TRUE(slot->is_built_);
+      EXPECT_EQ(OB_SUCCESS, slot->build_ret_);
+      ASSERT_NE(nullptr, slot->bitmap_);
+      EXPECT_EQ(0, slot->bitmap_->cardinality());
+    }
+    parallel.release();
+  }
+}
+
+TEST_F(ObDASFusionParallelCtxTest, provider_only_in_high_group_needs_no_prepare_in_short_partition)
+{
+  ObDASAsyncIndexQueryCtx catalog;
+  ASSERT_EQ(OB_SUCCESS, build_filter_provider_test_catalog(catalog));
+  const int64_t partition_ids[] = {1, 2, 1};
+  for (int64_t partition_id : partition_ids) {
+    SCOPED_TRACE(partition_id);
+    const bool active = 2 == partition_id;
+    const ObAsyncIndexPartitionSegCtx *partition = nullptr;
+    ASSERT_EQ(OB_SUCCESS, catalog.find_partition(ObTabletID(partition_id), partition));
+    ObDASScanOp scan_op(alloc_);
+    ObExecContext exec_ctx(alloc_);
+    ObEvalCtx eval_ctx(exec_ctx);
+    eval_ctx.max_batch_size_ = 8;
+    ObDASSearchCtx ctx(alloc_, scan_op);
+    ctx.eval_ctx_ = &eval_ctx;
+    ctx.set_async_query_ctx(&catalog);
+    ctx.set_current_async_partition(partition);
+    TestEnumerableSearchOp leaf(ctx, {11});
+    ObArray<ObIDASSearchOp *> children;
+    ASSERT_EQ(OB_SUCCESS, children.push_back(&leaf));
+    ObDASAsyncSegmentMergeOpParam param(children, ObDASAsyncSegmentDomain(9002, 1));
+    ObDASAsyncSegmentMergeOp *source = nullptr;
+    ASSERT_EQ(OB_SUCCESS, ctx.create_op(param, source));
+    ObDASFilterBitmapProvider *provider = nullptr;
+    ASSERT_EQ(OB_SUCCESS, ctx.create_filter_bitmap_provider(
+        reinterpret_cast<const ObIDASSearchRtDef *>(0x1234),
+        DAS_FILTER_BITMAP_GROUP_SCOPE, 1, source, provider));
+    TestEnumerableSearchOp root(ctx, {});
+    ObDASSearchDriverIter driver;
+    driver.set_root_op(&root);
+    driver.set_search_ctx(&ctx);
+    ObDASFusionParallelCtx parallel;
+    ASSERT_EQ(OB_SUCCESS, parallel.discover_shared_bitmaps(alloc_, &driver, 4));
+    ASSERT_EQ(active ? 1 : 0, parallel.get_shared_bitmap_count());
+    EXPECT_EQ(active, parallel.has_shared_bitmaps());
+    EXPECT_EQ(1, ctx.get_filter_bitmap_provider_count());
+    ObDASFusionBitmapPrepareWork work;
+    work.parallel_ctx_ = &parallel;
+    work.exec_env_.child_search_ctx_ = &ctx;
+    ObDASFusionParallelCoordinator coordinator;
+    ASSERT_EQ(OB_SUCCESS, coordinator.init(1));
+    ASSERT_EQ(OB_SUCCESS, work.build_shared_bitmaps(INT64_MAX, coordinator));
+    EXPECT_EQ(active, provider->is_prepared());
+    if (active) {
+      const ObSharedBitmapSlot *slot = parallel.get_shared_bitmap_slot(0);
+      EXPECT_EQ(0, slot->filter_provider_idx_);
+      ASSERT_NE(nullptr, slot->bitmap_);
+      EXPECT_EQ(1, slot->bitmap_->cardinality());
+      ObFastBitmap::Iterator iter;
+      ASSERT_EQ(OB_SUCCESS, iter.init(slot->bitmap_));
+      uint64_t id = 0;
+      ASSERT_EQ(OB_SUCCESS, iter.next_id(id));
+      EXPECT_EQ(11, id);
+      EXPECT_EQ(OB_ITER_END, iter.next_id(id));
+    }
+    parallel.release();
+    ctx.reset();
+  }
+}
+
 // Section 18: FusionCtDef parallel config tests
 // ============================================================================
 
