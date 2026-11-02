@@ -3032,6 +3032,158 @@ TEST_F(TestTieredMetadataStoreV2, test_double_delete_order_and_retry)
 }
 
 // ============================================================================
+// Test: TABLE single-delete preserves the remote copy and skips remote deletion
+// ============================================================================
+
+TEST_F(TestTieredMetadataStoreV2, test_batch_delete_single_route)
+{
+  share::ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(tenant_id_));
+  ObObjectStorageTenantGuard object_storage_guard(
+      tenant_id_, ObSSGCUtil::TIERED_METADATA_IO_TIMEOUT_US);
+  ObTieredMetadataStore store;
+  const MacroBlockId table_id = build_sub_meta_in_table_id(300306, 6);
+  const MacroBlockId remote_id = to_remote_id(table_id);
+  const ObString value = ObString::make_string("single_delete_location");
+  ObArray<MacroBlockId> ids;
+  bool is_exist = false;
+  ASSERT_EQ(OB_SUCCESS, store.init(tenant_id_, &get_sql_client()));
+  ASSERT_EQ(OB_SUCCESS, store.write_meta(table_id, kDefaultMetaType, value));
+  ASSERT_NO_FATAL_FAILURE(write_remote_object(remote_id));
+  ASSERT_EQ(OB_SUCCESS, ids.push_back(table_id));
+  {
+    ScopedNamedEvent remote_delete_error;
+    ASSERT_EQ(OB_SUCCESS, remote_delete_error.init(
+        "EN_SS_TIERED_META_REMOTE_DELETE_ERROR", OB_IO_ERROR, 1));
+    ASSERT_EQ(OB_SUCCESS, ObTieredMetadataObjectManager::batch_del_tiered_metadata(ids));
+    ASSERT_EQ(OB_SUCCESS, store.is_meta_exist(table_id, is_exist));
+    ASSERT_FALSE(is_exist);
+    ASSERT_NO_FATAL_FAILURE(assert_remote_object_exist(remote_id, true));
+    ids.reuse();
+    ASSERT_EQ(OB_SUCCESS, ids.push_back(remote_id));
+    ASSERT_EQ(OB_IO_ERROR, ObTieredMetadataObjectManager::batch_del_tiered_metadata(ids));
+  }
+  ASSERT_EQ(OB_SUCCESS, ObTieredMetadataObjectManager::batch_del_tiered_metadata(ids));
+  ASSERT_NO_FATAL_FAILURE(assert_remote_object_exist(remote_id, false));
+}
+
+// ============================================================================
+// Test: an OSS-only batch skips TABLE deletion even for the double-route tenant
+// ============================================================================
+
+TEST_F(TestTieredMetadataStoreV2, test_batch_delete_object_storage_only)
+{
+  share::ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(OB_SYS_TENANT_ID));
+  ObObjectStorageTenantGuard object_storage_guard(
+      OB_SYS_TENANT_ID, ObSSGCUtil::TIERED_METADATA_IO_TIMEOUT_US);
+  ObTieredMetadataStore store;
+  const MacroBlockId table_id = build_sub_meta_in_table_id(300307, 7);
+  const MacroBlockId remote_id = to_remote_id(table_id);
+  const ObString value = ObString::make_string("object_storage_location");
+  ObArray<MacroBlockId> ids;
+  bool is_exist = false;
+  ASSERT_EQ(OB_SUCCESS, store.init(OB_SYS_TENANT_ID, &get_sql_client()));
+  ASSERT_EQ(OB_SUCCESS, store.write_meta(table_id, kDefaultMetaType, value));
+  ASSERT_NO_FATAL_FAILURE(write_remote_object(remote_id));
+  ASSERT_EQ(OB_SUCCESS, ids.push_back(remote_id));
+  {
+    ScopedNamedEvent table_delete_error;
+    ASSERT_EQ(OB_SUCCESS, table_delete_error.init(
+        "EN_SS_TIERED_META_TABLE_DELETE_ERROR", OB_IO_ERROR, 1));
+    ASSERT_EQ(OB_SUCCESS, ObTieredMetadataObjectManager::batch_del_tiered_metadata(ids));
+    ASSERT_NO_FATAL_FAILURE(assert_remote_object_exist(remote_id, false));
+    ASSERT_EQ(OB_SUCCESS, store.is_meta_exist(table_id, is_exist));
+    ASSERT_TRUE(is_exist);
+    ids.reuse();
+    ASSERT_EQ(OB_SUCCESS, ids.push_back(table_id));
+    ASSERT_EQ(OB_IO_ERROR, ObTieredMetadataObjectManager::batch_del_tiered_metadata(ids));
+  }
+  ASSERT_EQ(OB_SUCCESS, ObTieredMetadataObjectManager::batch_del_tiered_metadata(ids));
+  ASSERT_EQ(OB_SUCCESS, store.is_meta_exist(table_id, is_exist));
+  ASSERT_FALSE(is_exist);
+}
+
+// ============================================================================
+// Test: mixed locations and failures remain retryable
+// ============================================================================
+
+TEST_F(TestTieredMetadataStoreV2, test_batch_delete_mixed_locations_and_retry)
+{
+  share::ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(OB_SYS_TENANT_ID));
+  ObObjectStorageTenantGuard object_storage_guard(
+      OB_SYS_TENANT_ID, ObSSGCUtil::TIERED_METADATA_IO_TIMEOUT_US);
+  ObTieredMetadataStore store;
+  const MacroBlockId table_id = build_sub_meta_in_table_id(300308, 8);
+  const MacroBlockId remote_id = to_remote_id(table_id);
+  const MacroBlockId direct_remote_id = to_remote_id(inc_seq(table_id));
+  const ObString value = ObString::make_string("mixed_delete_locations");
+  ObArray<MacroBlockId> ids;
+  bool is_exist = false;
+  ASSERT_EQ(OB_SUCCESS, store.init(OB_SYS_TENANT_ID, &get_sql_client()));
+  ASSERT_EQ(OB_SUCCESS, store.write_meta(table_id, kDefaultMetaType, value));
+  ASSERT_NO_FATAL_FAILURE(write_remote_object(remote_id));
+  ASSERT_NO_FATAL_FAILURE(write_remote_object(direct_remote_id));
+  ASSERT_EQ(OB_SUCCESS, ids.push_back(direct_remote_id));
+  ASSERT_EQ(OB_SUCCESS, ids.push_back(table_id));
+  {
+    ScopedNamedEvent remote_delete_error;
+    ASSERT_EQ(OB_SUCCESS, remote_delete_error.init(
+        "EN_SS_TIERED_META_REMOTE_DELETE_ERROR", OB_IO_ERROR, 1));
+    ASSERT_EQ(OB_IO_ERROR, ObTieredMetadataObjectManager::batch_del_tiered_metadata(ids));
+  }
+  ASSERT_EQ(OB_SUCCESS, store.is_meta_exist(table_id, is_exist));
+  ASSERT_TRUE(is_exist);
+  ASSERT_NO_FATAL_FAILURE(assert_remote_object_exist(remote_id, true));
+  ASSERT_NO_FATAL_FAILURE(assert_remote_object_exist(direct_remote_id, true));
+  {
+    ScopedNamedEvent table_delete_error;
+    ASSERT_EQ(OB_SUCCESS, table_delete_error.init(
+        "EN_SS_TIERED_META_TABLE_DELETE_ERROR", OB_IO_ERROR, 1));
+    ASSERT_EQ(OB_IO_ERROR, ObTieredMetadataObjectManager::batch_del_tiered_metadata(ids));
+  }
+  ASSERT_EQ(OB_SUCCESS, store.is_meta_exist(table_id, is_exist));
+  ASSERT_TRUE(is_exist);
+  ASSERT_NO_FATAL_FAILURE(assert_remote_object_exist(remote_id, false));
+  ASSERT_NO_FATAL_FAILURE(assert_remote_object_exist(direct_remote_id, false));
+  ASSERT_EQ(OB_SUCCESS, ObTieredMetadataObjectManager::batch_del_tiered_metadata(ids));
+  ASSERT_EQ(OB_SUCCESS, store.is_meta_exist(table_id, is_exist));
+  ASSERT_FALSE(is_exist);
+  ASSERT_EQ(OB_SUCCESS, ObTieredMetadataObjectManager::batch_del_tiered_metadata(ids));
+}
+
+// ============================================================================
+// Test: validate every input before deleting any object
+// ============================================================================
+
+TEST_F(TestTieredMetadataStoreV2, test_batch_delete_invalid_location_and_type)
+{
+  share::ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(tenant_id_));
+  ObObjectStorageTenantGuard object_storage_guard(
+      tenant_id_, ObSSGCUtil::TIERED_METADATA_IO_TIMEOUT_US);
+  const MacroBlockId remote_id = to_remote_id(build_sub_meta_in_table_id(300309, 9));
+  MacroBlockId invalid_id = remote_id;
+  ObArray<MacroBlockId> ids;
+  ASSERT_NO_FATAL_FAILURE(write_remote_object(remote_id));
+  ASSERT_EQ(OB_SUCCESS, ids.push_back(remote_id));
+  invalid_id.set_location(ObMacroBlockIdLocation::CONTROL);
+  ASSERT_EQ(OB_SUCCESS, ids.push_back(invalid_id));
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ObTieredMetadataObjectManager::batch_del_tiered_metadata(ids));
+  ASSERT_NO_FATAL_FAILURE(assert_remote_object_exist(remote_id, true));
+  invalid_id = remote_id;
+  invalid_id.set_storage_object_type(
+      static_cast<uint64_t>(ObStorageObjectType::SHARED_MINI_DATA_MACRO));
+  ids.at(1) = invalid_id;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ObTieredMetadataObjectManager::batch_del_tiered_metadata(ids));
+  ASSERT_NO_FATAL_FAILURE(assert_remote_object_exist(remote_id, true));
+  ids.pop_back();
+  ASSERT_EQ(OB_SUCCESS, ObTieredMetadataObjectManager::batch_del_tiered_metadata(ids));
+  ASSERT_NO_FATAL_FAILURE(assert_remote_object_exist(remote_id, false));
+}
+
+// ============================================================================
 // Test: sys tenant existence falls back to object storage only in double mode
 // ============================================================================
 

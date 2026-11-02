@@ -516,50 +516,76 @@ int ObTieredMetadataObjectManager::batch_del_tiered_metadata(
     MTL_SWITCH(cur_tenant_id) {
       bool need_double_delete = false;
       ObTimeoutCtx timeout_ctx;
+      ObArray<MacroBlockId> table_macro_ids;
+      ObArray<MacroBlockId> obj_macro_ids;
+      MacroBlockId obj_macro_id;
+      table_macro_ids.set_attr(ObMemAttr(cur_tenant_id, "TMDelTable"));
+      obj_macro_ids.set_attr(ObMemAttr(cur_tenant_id, "TMDelObj"));
       WORKER_GROUP_ID_GUARD(ObObjectStorageTenantGuard::get_io_group_id());
-      SMART_VAR(ObTieredMetadataStore, tm_store) {
+      if (OB_FAIL(timeout_ctx.set_timeout(ObObjectStorageTenantGuard::get_timeout_us()))) {
+        LOG_WARN("failed to set timeout", K(ret));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < macro_block_ids.count(); ++i) {
+        const MacroBlockId &macro_id = macro_block_ids.at(i);
+        // is_shared_tablet_sub_meta_in_table() matches TABLE.
+        // is_shared_tablet_sub_meta() matches OBJECT_STORAGE.
+        if (OB_UNLIKELY(!macro_id.is_valid()
+            || (!macro_id.is_shared_tablet_sub_meta_in_table()
+                && !macro_id.is_shared_tablet_sub_meta()))) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("invalid tablet sub meta macro id", K(ret), K(i), K(macro_id));
+        } else if (macro_id.is_in_table()) {
+          if (OB_FAIL(table_macro_ids.push_back(macro_id))) {
+            LOG_WARN("failed to push back table macro id", K(ret), K(macro_id));
+          }
+        } else if (OB_FAIL(obj_macro_ids.push_back(macro_id))) {
+          LOG_WARN("failed to push back object storage macro id", K(ret), K(macro_id));
+        }
+      }
+
+      if (OB_SUCC(ret) && !table_macro_ids.empty()) {
         if (OB_FAIL(check_double_route_ss_meta(cur_tenant_id, need_double_delete))) {
           LOG_WARN("failed to check tiered metadata needs double delete", K(ret), K(cur_tenant_id));
-        } else if (OB_FAIL(timeout_ctx.set_timeout(ObObjectStorageTenantGuard::get_timeout_us()))) {
-          LOG_WARN("failed to set timeout", K(ret));
-        } else {
-          // 双写模式先删对象存储，再删内部表。若删表失败，重试时对象不存在会按成功处理。
-          if (need_double_delete) {
-            ObArray<MacroBlockId> obj_macro_ids;
-            obj_macro_ids.set_attr(ObMemAttr(cur_tenant_id, "TMDelObj"));
-            MacroBlockId obj_macro_id;
-            for (int64_t i = 0; OB_SUCC(ret) && i < macro_block_ids.count(); ++i) {
-              obj_macro_id.reset();
-              if (OB_FAIL(convert_in_table_to_obj_macro_id_(macro_block_ids.at(i), obj_macro_id))) {
-                LOG_WARN("failed to convert to object storage macro id", K(ret), K(macro_block_ids.at(i)));
-              } else if (OB_FAIL(obj_macro_ids.push_back(obj_macro_id))) {
-                LOG_WARN("failed to push back object storage macro id", K(ret), K(obj_macro_id));
-              }
-            }
-            ObTenantFileManager *file_mgr = MTL(ObTenantFileManager *);
-            if (OB_FAIL(ret)) {
-            } else if (OB_ISNULL(file_mgr)) {
-              ret = OB_ERR_UNEXPECTED;
-              LOG_WARN("file manager is null", K(ret), K(cur_tenant_id));
-            } else if (OB_FAIL(OB_E(EN_SS_TIERED_META_REMOTE_DELETE_ERROR, GETTID())
-                                        file_mgr->delete_remote_files(obj_macro_ids))) {
-              if (OB_OBJECT_NOT_EXIST == ret) {
-                ret = OB_SUCCESS;
-                LOG_INFO("some tiered metas do not exist on object storage, skip",
-                         K(cur_tenant_id), "count", obj_macro_ids.count());
-              } else {
-                LOG_WARN("failed to batch del tiered meta on object storage", K(ret),
-                         K(cur_tenant_id), "count", obj_macro_ids.count());
-              }
-            }
+        }
+      }
+      if (OB_SUCC(ret) && need_double_delete) {
+        for (int64_t i = 0; OB_SUCC(ret) && i < table_macro_ids.count(); ++i) {
+          obj_macro_id.reset();
+          if (OB_FAIL(convert_in_table_to_obj_macro_id_(table_macro_ids.at(i), obj_macro_id))) {
+            LOG_WARN("failed to convert to object storage macro id",
+                K(ret), K(table_macro_ids.at(i)));
+          } else if (OB_FAIL(obj_macro_ids.push_back(obj_macro_id))) {
+            LOG_WARN("failed to push back object storage macro id", K(ret), K(obj_macro_id));
           }
+        }
+      }
 
-          if (OB_FAIL(ret)) {
-          } else if (OB_FAIL(tm_store.init(cur_tenant_id, GCTX.sql_proxy_))) {
+      // Delete remote objects first so a remote failure leaves the table rows available for retry.
+      if (OB_SUCC(ret) && !obj_macro_ids.empty()) {
+        ObTenantFileManager *file_mgr = MTL(ObTenantFileManager *);
+        if (OB_ISNULL(file_mgr)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("file manager is null", K(ret), K(cur_tenant_id));
+        } else if (OB_FAIL(OB_E(EN_SS_TIERED_META_REMOTE_DELETE_ERROR, GETTID())
+                                    file_mgr->delete_remote_files(obj_macro_ids))) {
+          if (OB_OBJECT_NOT_EXIST == ret) {
+            ret = OB_SUCCESS;
+            LOG_INFO("some tiered metas do not exist on object storage, skip",
+                K(cur_tenant_id), "count", obj_macro_ids.count());
+          } else {
+            LOG_WARN("failed to batch del tiered meta on object storage",
+                K(ret), K(cur_tenant_id), "count", obj_macro_ids.count());
+          }
+        }
+      }
+
+      if (OB_SUCC(ret) && !table_macro_ids.empty()) {
+        SMART_VAR(ObTieredMetadataStore, tm_store) {
+          if (OB_FAIL(tm_store.init(cur_tenant_id, GCTX.sql_proxy_))) {
             LOG_WARN("failed to init tm_store", K(ret), K(cur_tenant_id));
           } else if (OB_FAIL(OB_E(EN_SS_TIERED_META_TABLE_DELETE_ERROR, GETTID())
-                                      tm_store.batch_del_meta(macro_block_ids))) {
-            LOG_WARN("failed to batch del meta v2", K(ret), K(macro_block_ids), K(timeout_ctx));
+                                      tm_store.batch_del_meta(table_macro_ids))) {
+            LOG_WARN("failed to batch del meta v2", K(ret), K(table_macro_ids), K(timeout_ctx));
           }
         }
       }
