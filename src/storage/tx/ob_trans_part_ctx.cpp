@@ -2040,7 +2040,9 @@ bool ObPartTransCtx::fast_check_need_submit_redo_for_freeze_()
 {
   bool has_pending_log = true;
   bool blocked = false;
-  bool need_submit = false;
+  // A busy lock means the pending work is unknown, not empty. Fall back to the
+  // ctx-locked submit path so freeze cannot miss work being registered/written.
+  bool need_submit = true;
   if (OB_SUCCESS == lock_.try_wrlock_flush_redo()) {
     blocked = mt_ctx_.is_logging_blocked(has_pending_log);
     lock_.unlock_flush_redo();
@@ -2049,16 +2051,20 @@ bool ObPartTransCtx::fast_check_need_submit_redo_for_freeze_()
   // MDS is not included in redo pending / CALLBACK_LISTS_FOREACH; still must enter
   // submit_redo_log_for_freeze_ so submit_log_impl_(TX_MULTI_DATA_SOURCE_LOG) runs.
   // Release flush_redo lock before ctx lock (submit_redo_log_for_freeze holds ctx first).
-  if (!need_submit && OB_SUCCESS == lock_.try_lock()) {
-    const bool has_pending_mds = exec_info_.multi_data_source_.count() > 0
-                                   || mds_cache_.count() > 0
-                                   || mds_cache_.need_retry_submit_mds();
-    // If the next unsubmitted MDS node targets a logging_blocked memtable, wait.
-    // This preserves submit order: frozen-memtable MDS redos first, new-active second.
-    if (has_pending_mds && !mds_cache_.next_mds_is_logging_blocked()) {
+  if (!need_submit) {
+    if (OB_SUCCESS != lock_.try_lock()) {
       need_submit = true;
+    } else {
+      const bool has_pending_mds = exec_info_.multi_data_source_.count() > 0
+                                     || mds_cache_.count() > 0
+                                     || mds_cache_.need_retry_submit_mds();
+      // If the next unsubmitted MDS node targets a logging_blocked memtable, wait.
+      // This preserves submit order: frozen-memtable MDS redos first, new-active second.
+      if (has_pending_mds && !mds_cache_.next_mds_is_logging_blocked()) {
+        need_submit = true;
+      }
+      lock_.unlock();
     }
-    lock_.unlock();
   }
   return need_submit;
 }

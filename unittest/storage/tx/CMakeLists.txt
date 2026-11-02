@@ -50,5 +50,6 @@ add_subdirectory(it)
 storage_unittest(test_dup_table_lease)
 
 storage_unittest(test_redo_submitter)
+storage_unittest(test_freeze_mds_submit)
 storage_unittest(test_trans_callback_mgr_fill_redo)
 storage_unittest(test_misc)
