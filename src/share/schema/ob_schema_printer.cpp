@@ -859,6 +859,9 @@ int ObSchemaPrinter::print_table_definition_indexes(const ObTableSchema &table_s
       // Do not print global index.
     } else if (index_schema->is_built_in_index()) {
       // For full-text or vector index search index, only inverted table can be printed, and others table will not be printed.
+    } else if ((index_schema->is_async_fts_index() || index_schema->is_async_search_def_index())
+               && !index_schema->can_read_index()) {
+      // Publish the initial async index before exposing its definition to users.
     } else if (index_schema->is_vec_index() && !ObVectorIndexUtil::check_index_is_all_ready(schema_guard_, table_schema, *index_schema)) {
       // Not show vec index which in unavaliable status
     } else if (OB_FAIL(print_single_index_definition(index_schema, table_schema, arena_allocator,
