@@ -2193,6 +2193,7 @@ bool ObSSTableIndexBuilder::is_retriable_error(const int ret_code) const
 int ObSSTableIndexBuilder::merge_inv_meta(const ObInvSSTableMeta &partial)
 {
   int ret = OB_SUCCESS;
+  lib::ObMutexGuard mutex_guard(mutex_);
   ObBlockWriterConcurrentGuard guard(concurrent_lock_);
   if (OB_UNLIKELY(!is_async_index_)) {
     ret = OB_ERR_UNEXPECTED;
