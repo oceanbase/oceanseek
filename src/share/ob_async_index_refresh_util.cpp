@@ -283,6 +283,12 @@ int ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
             LOG_WARN("[ASYNC_INDEX] refresh returned error", K(ret),
                 K(data_tablet_id), K(target_scn), K(res.already_refreshed_));
           }
+#ifdef ERRSIM
+          if (OB_SUCC(ret) && 0 == i
+              && static_cast<int8_t>(storage::ASYNC_REFRESH_TYPE_OFFLINE_DDL) == refresh_type) {
+            DEBUG_SYNC(AFTER_OFFLINE_ASYNC_INDEX_PARTITION_REFRESH);
+          }
+#endif
         }
       }
     }

@@ -219,6 +219,83 @@ TEST_F(TestAsyncIndexRefreshInfo, initial_commit_pin_matches_index_publication)
   EXPECT_EQ(500, data_info.get_refresh_snapshots().at(0));
 }
 
+TEST_F(TestAsyncIndexRefreshInfo, offline_publication_commits_pin_and_target_atomically)
+{
+  ObTabletAsyncIndexRefreshInfo data_info;
+  ObTabletAsyncIndexRefreshInfo index_info;
+  share::SCN commit_version;
+  ASSERT_EQ(OB_SUCCESS, commit_version.convert_for_tx(300));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, data_info.init_offline_refresh_snapshots(0));
+  ASSERT_EQ(OB_SUCCESS, data_info.init_offline_refresh_snapshots(100));
+  index_info.set_published_version(ObTabletAsyncIndexRefreshInfo::USE_COMMIT_VERSION);
+  EXPECT_TRUE(data_info.is_valid());
+  EXPECT_TRUE(index_info.is_valid());
+  EXPECT_FALSE(data_info.is_valid_for_refresh());
+  EXPECT_TRUE(index_info.is_valid_for_refresh()); // No data checkpoints to consume.
+
+  data_info.on_commit(commit_version, commit_version);
+  index_info.on_commit(commit_version, commit_version);
+  EXPECT_TRUE(data_info.is_valid());
+  EXPECT_TRUE(data_info.is_valid_for_refresh());
+  EXPECT_EQ(100, data_info.get_refresh_snapshots().at(0));
+  EXPECT_EQ(300, data_info.get_refresh_snapshots().at(1));
+  EXPECT_EQ(300, index_info.get_published_version());
+  int64_t target = 0;
+  ASSERT_EQ(OB_SUCCESS, data_info.get_next_refresh_snapshot(100, target));
+  EXPECT_EQ(300, target);
+  ASSERT_EQ(OB_SUCCESS, data_info.cleanup_retired_snapshots(100));
+  EXPECT_EQ(100, data_info.get_refresh_snapshots().at(0));
+  ASSERT_EQ(OB_SUCCESS, data_info.cleanup_retired_snapshots(300));
+  EXPECT_EQ(300, data_info.get_refresh_snapshots().at(0));
+}
+
+TEST_F(TestAsyncIndexRefreshInfo, offline_publication_survives_serialization_and_refresh)
+{
+  ObTabletAsyncIndexRefreshInfo original;
+  ObTabletAsyncIndexRefreshInfo decoded;
+  ObTabletAsyncIndexRefreshInfo next;
+  share::SCN commit_version;
+  ASSERT_EQ(OB_SUCCESS, commit_version.convert_for_tx(300));
+  for (int64_t is_data = 0; is_data < 2; ++is_data) {
+    original.reset();
+    if (is_data) {
+      ASSERT_EQ(OB_SUCCESS, original.init_offline_refresh_snapshots(100));
+    } else {
+      original.set_published_version(ObTabletAsyncIndexRefreshInfo::USE_COMMIT_VERSION);
+    }
+    char buf[1024];
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, original.serialize(buf, sizeof(buf), pos));
+    int64_t read_pos = 0;
+    ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buf, pos, read_pos));
+    EXPECT_TRUE(decoded.is_valid());
+    EXPECT_EQ(0 == is_data, decoded.is_valid_for_refresh());
+    decoded.on_commit(commit_version, commit_version);
+    EXPECT_TRUE(decoded.is_valid_for_refresh());
+    if (is_data) {
+      ASSERT_EQ(2, decoded.get_refresh_snapshots().count());
+      EXPECT_EQ(100, decoded.get_refresh_snapshots().at(0));
+      EXPECT_EQ(300, decoded.get_refresh_snapshots().at(1));
+    } else {
+      EXPECT_EQ(300, decoded.get_published_version());
+    }
+    ASSERT_EQ(OB_SUCCESS, next.assign(decoded));
+    next.set_published_version(500);
+    pos = 0;
+    ASSERT_EQ(OB_SUCCESS, next.serialize(buf, sizeof(buf), pos));
+    read_pos = 0;
+    ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buf, pos, read_pos));
+    if (is_data) {
+      ASSERT_EQ(2, decoded.get_refresh_snapshots().count());
+      EXPECT_EQ(100, decoded.get_refresh_snapshots().at(0));
+      EXPECT_EQ(300, decoded.get_refresh_snapshots().at(1));
+    }
+    EXPECT_EQ(500, decoded.get_published_version());
+    decoded.on_commit(commit_version, commit_version);
+    EXPECT_EQ(500, decoded.get_published_version());
+  }
+}
+
 TEST_F(TestAsyncIndexRefreshInfo, create_bootstrap_uses_commit_version)
 {
   ObTabletAsyncIndexRefreshInfo info;

@@ -20,6 +20,7 @@
 #include "lib/mysqlclient/ob_mysql_proxy.h"              // ObSessionDDLInfo
 #include "share/ob_server_struct.h"                    // GCTX
 #include "share/ob_debug_sync.h"                       // DEBUG_SYNC
+#include "share/schema/ob_multi_version_schema_service.h"
 #include "observer/ob_server.h"                        // observer::ObServer::get_instance()
 #include "share/ob_share_util.h"                       // ObShareUtil::set_default_timeout_ctx
 #include "share/ob_ddl_common.h"                       // ObDDLUtil::calc_inner_sql_execute_timeout
@@ -91,9 +92,22 @@ int ObAsyncIndexRefreshTask::set_inner_conn_ddl_info_(common::ObMySQLTransaction
 {
   int ret = OB_SUCCESS;
   sqlclient::ObISQLConnection *conn = trans.get_connection();
+  share::schema::ObSchemaGetterGuard schema_guard;
+  const share::schema::ObTableSchema *data_schema = nullptr;
   if (OB_ISNULL(conn)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("null inner sql connection", K(ret));
+  } else if (OB_FAIL(GSCHEMASERVICE.get_tenant_schema_guard(stat_.tenant_id_, schema_guard))) {
+    LOG_WARN("failed to get refresh schema guard", K(ret));
+  } else if (OB_FAIL(schema_guard.get_table_schema(stat_.tenant_id_, stat_.data_table_id_, data_schema))) {
+    LOG_WARN("failed to get refresh data schema", K(ret));
+  } else if (OB_ISNULL(data_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+  } else if (data_schema->get_schema_version() != stat_.schema_version_) {
+    ret = OB_DDL_SCHEMA_VERSION_NOT_MATCH;
+  } else if (data_schema->is_user_hidden_table() && ASYNC_REFRESH_TYPE_OFFLINE_DDL != stat_.refresh_type_) {
+    // Periodic work sampled before the DDL must not race offline preparation.
+    ret = OB_NEED_RETRY;
   } else {
     // is_ddl is already true on the ddl_sql_proxy connection's session; we set it
     // again for clarity and add the async-index-refresh flag, which makes
@@ -103,6 +117,8 @@ int ObAsyncIndexRefreshTask::set_inner_conn_ddl_info_(common::ObMySQLTransaction
     common::ObSessionDDLInfo ddl_info;
     ddl_info.set_is_ddl(true);
     ddl_info.set_is_async_index_refresh(true);
+    ddl_info.set_source_table_hidden(data_schema->is_user_hidden_table());
+    ddl_info.set_dest_table_hidden(data_schema->is_user_hidden_table());
     ddl_info.set_search_index_ddl(stat_.is_search_index_);
     ddl_info.set_partition_local_ddl(stat_.is_partition_local_);
     ddl_info.set_is_refresh_on_error_skip(stat_.is_refresh_on_error_skip_);

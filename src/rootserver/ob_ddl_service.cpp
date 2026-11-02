@@ -17786,33 +17786,6 @@ static int check_column_store_for_standalone(const ObTableSchema &orig_table_sch
   return ret;
 }
 
-// Check support for DDLs already routed to the offline path on tables with async indexes.
-// In shared-storage mode, DDL_COLUMN_REDEFINITION is converted to DDL_TABLE_REDEFINITION.
-static int check_support_async_index_offline_ddl(const ObDDLType ddl_type)
-{
-  int ret = OB_SUCCESS;
-  switch (ddl_type) {
-    case DDL_MODIFY_COLUMN:
-    case DDL_ADD_PRIMARY_KEY:
-    case DDL_ALTER_PRIMARY_KEY:
-    case DDL_ALTER_PARTITION_BY:
-    case DDL_CONVERT_TO_CHARACTER:
-    case DDL_TABLE_REDEFINITION:
-    case DDL_ALTER_COLUMN_GROUP:
-    case DDL_MODIFY_AUTO_INCREMENT_WITH_REDEFINITION:
-    case DDL_DROP_COLUMN:
-    case DDL_ADD_COLUMN_OFFLINE:
-    case DDL_COLUMN_REDEFINITION:
-      ret = OB_NOT_SUPPORTED;
-      LOG_WARN("offline table redefinition with async indexes is not supported", KR(ret), K(ddl_type));
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "offline table redefinition on tables with async indexes");
-      break;
-    default:
-      break;
-  }
-  return ret;
-}
-
 int ObDDLService::do_offline_ddl_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
                                           const uint64_t tenant_data_version,
                                           obrpc::ObAlterTableRes &res)
@@ -17848,10 +17821,7 @@ int ObDDLService::do_offline_ddl_in_trans(obrpc::ObAlterTableArg &alter_table_ar
       LOG_WARN("fail to get and check table schema", K(ret));
     } else if (orig_table_schema->has_async_index()) {
       uint64_t min_data_version = 0;
-      if (OB_FAIL(check_support_async_index_offline_ddl(ddl_type))) {
-        LOG_WARN("offline table redefinition with async indexes is not supported",
-                 KR(ret), K(tenant_id), K(ddl_type), "table_id", orig_table_schema->get_table_id());
-      } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, min_data_version))) {
+      if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, min_data_version))) {
         LOG_WARN("failed to get min data version", KR(ret), K(tenant_id));
       } else if (min_data_version < DATA_VERSION_4_6_2_1) {
         ret = OB_NOT_SUPPORTED;
@@ -25080,6 +25050,7 @@ int ObDDLService::swap_orig_and_hidden_table_state(obrpc::ObAlterTableArg &alter
       schema_guard.set_session_id(alter_table_arg.session_id_);
       ObTableLockOwnerID owner_id;
       int64_t refreshed_schema_version = 0;
+      const int64_t async_publish_snapshot = alter_table_arg.async_index_offline_refresh_snapshot_;
       if (OB_FAIL(get_tenant_schema_guard_with_version_in_inner_table(tenant_id, schema_guard))) {
         LOG_WARN("fail to get schema guard with version in inner table", K(ret), K(tenant_id));
       } else if (OB_FAIL(schema_guard.get_schema_version(tenant_id, refreshed_schema_version))) {
@@ -25228,6 +25199,10 @@ int ObDDLService::swap_orig_and_hidden_table_state(obrpc::ObAlterTableArg &alter
         if (OB_SUCC(ret)) {
           if (hidden_table_schema->is_oracle_tmp_table_v2() || hidden_table_schema->is_oracle_tmp_table_v2_index_table()) {
             LOG_INFO("oracle temporary table v2 has no tablet, skip write ddl barrier", KPC(hidden_table_schema));
+          } else if (async_publish_snapshot > 0
+                     && OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_offline_publication(
+                         *hidden_table_schema, table_schemas, async_publish_snapshot, trans))) {
+            LOG_WARN("failed to register atomic offline publication", K(ret), K(async_publish_snapshot));
           } else if (OB_FAIL(write_ddl_barrier(*hidden_table_schema, trans))) {
             LOG_WARN("failed to write ddl barrier", K(ret));
           }

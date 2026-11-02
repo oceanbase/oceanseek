@@ -932,6 +932,9 @@ int ObAsyncIndexDepProvider::get_async_table_refresh_intervals(
       } else if (OB_ISNULL(data_table_schema)) {
         LOG_WARN("data table schema is null, skip", K(tenant_id), K(data_table_id));
         continue;
+      } else if (data_table_schema->is_user_hidden_table()) {
+        // Only the owning offline DDL may prepare this table before swap.
+        continue;
       } else if (data_table_schema->is_ctas_tmp_table()) {
         // A target sampled before the final CTAS DDL can fall below its read
         // lower bound. Only admit periodic refresh after the table is formal.

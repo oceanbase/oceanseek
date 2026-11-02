@@ -26,10 +26,13 @@ namespace storage
 
 bool ObTabletAsyncIndexRefreshInfoArg::is_valid() const
 {
-  return ls_id_.is_valid() && tablet_id_.is_valid() && info_.is_valid();
+  return ls_id_.is_valid() && tablet_id_.is_valid() && info_.is_valid()
+      && expected_published_version_ >= 0
+      && (0 == expected_published_version_
+          || (!floor_pin_only_ && !info_.has_async_index() && info_.need_fill_commit_version()));
 }
 
-OB_SERIALIZE_MEMBER(ObTabletAsyncIndexRefreshInfoArg, ls_id_, tablet_id_, info_, floor_pin_only_);
+OB_SERIALIZE_MEMBER(ObTabletAsyncIndexRefreshInfoArg, ls_id_, tablet_id_, info_, floor_pin_only_, expected_published_version_);
 
 int ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(
     const share::schema::ObTableSchema &data_table_schema,
@@ -127,6 +130,46 @@ int ObTabletAsyncIndexRefreshInfoMdsHelper::register_initial_published_versions(
       LOG_WARN("failed to register initial async-index published versions",
                K(ret), K(tenant_id), K(snapshot_version), K(tablet_ids));
     }
+  }
+  return ret;
+}
+
+int ObTabletAsyncIndexRefreshInfoMdsHelper::register_offline_publication(
+    const share::schema::ObTableSchema &data_table_schema,
+    const common::ObIArray<share::schema::ObTableSchema> &table_schemas,
+    const int64_t base_snapshot,
+    common::ObMySQLTransaction &trans)
+{
+  int ret = OB_SUCCESS;
+  ObArray<ObTabletID> index_tablets;
+  ObArray<ObTabletID> data_tablets;
+  ObArray<ObTabletID> tablets;
+  ObTabletAsyncIndexRefreshInfo info;
+  info.set_published_version(ObTabletAsyncIndexRefreshInfo::USE_COMMIT_VERSION);
+  const uint64_t tenant_id = data_table_schema.get_tenant_id();
+  for (int64_t i = 0; OB_SUCC(ret) && i < table_schemas.count(); ++i) {
+    const share::schema::ObTableSchema &schema = table_schemas.at(i);
+    if (share::schema::TABLE_STATE_NORMAL == schema.get_table_state_flag()
+        && share::schema::is_async_index_refresh_target(schema.get_index_type())) {
+      tablets.reuse();
+      if (OB_FAIL(schema.get_tablet_ids(tablets))) {
+        LOG_WARN("failed to collect offline index tablets", K(ret));
+      } else if (OB_FAIL(append(index_tablets, tablets))) {
+        LOG_WARN("failed to append offline index tablets", K(ret));
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (index_tablets.empty() || base_snapshot <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(register_tablets_refresh_info_(tenant_id, index_tablets, info, trans, base_snapshot))) {
+    LOG_WARN("failed to register offline index publication", K(ret));
+  } else if (OB_FAIL(data_table_schema.get_tablet_ids(data_tablets))) {
+    LOG_WARN("failed to collect offline data tablets", K(ret));
+  } else if (OB_FAIL(info.init_offline_refresh_snapshots(base_snapshot))) {
+    LOG_WARN("failed to initialize offline checkpoints", K(ret));
+  } else if (OB_FAIL(register_tablets_refresh_info_(tenant_id, data_tablets, info, trans))) {
+    LOG_WARN("failed to register offline checkpoints", K(ret));
   }
   return ret;
 }
@@ -249,7 +292,8 @@ int ObTabletAsyncIndexRefreshInfoMdsHelper::register_refresh_info_(
     common::ObMySQLTransaction &trans,
     common::ObIAllocator &allocator,
     const bool need_flush_redo_instantly,
-    const bool floor_pin_only)
+    const bool floor_pin_only,
+    const int64_t expected_published_version)
 {
   int ret = OB_SUCCESS;
   ObTabletAsyncIndexRefreshInfoArg arg;
@@ -262,6 +306,7 @@ int ObTabletAsyncIndexRefreshInfoMdsHelper::register_refresh_info_(
   arg.ls_id_ = ls_id;
   arg.tablet_id_ = tablet_id;
   arg.floor_pin_only_ = floor_pin_only;
+  arg.expected_published_version_ = expected_published_version;
   if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id
                   || !arg.ls_id_.is_valid()
                   || !arg.tablet_id_.is_valid()
@@ -351,7 +396,8 @@ int ObTabletAsyncIndexRefreshInfoMdsHelper::register_tablets_refresh_info_(
     const uint64_t tenant_id,
     const common::ObIArray<common::ObTabletID> &tablet_ids,
     const ObTabletAsyncIndexRefreshInfo &refresh_info,
-    common::ObMySQLTransaction &trans)
+    common::ObMySQLTransaction &trans,
+    const int64_t expected_published_version)
 {
   int ret = OB_SUCCESS;
   common::ObArray<std::pair<share::ObLSID, common::ObTabletID>> ls_tablets;
@@ -393,7 +439,7 @@ int ObTabletAsyncIndexRefreshInfoMdsHelper::register_tablets_refresh_info_(
       if (OB_FAIL(register_refresh_info_(
               tenant_id, ls_tablets.at(i).first, ls_tablets.at(i).second,
               refresh_info, trans, allocator,
-              false /*need_flush_redo_instantly*/))) {
+              false /*need_flush_redo_instantly*/, false /*floor_pin_only*/, expected_published_version))) {
         LOG_WARN("failed to register async-index refresh info", K(ret),
                  K(tenant_id), K(i), K(ls_tablets), K(refresh_info));
       }
@@ -577,7 +623,26 @@ int ObTabletAsyncIndexRefreshInfoMdsHelper::process(const char *buf, const int64
       LOG_WARN("ls is nullptr", K(ret));
     } else if (!for_replay) {
       bool should_write = true;
-      if (arg.floor_pin_only_) {
+      if (arg.expected_published_version_ > 0) {
+        ObTabletHandle handle;
+        ObTabletAsyncIndexRefreshInfo committed_info;
+        if (OB_FAIL(ls->get_tablet(arg.tablet_id_, handle))) {
+          LOG_WARN("failed to get offline publication target", K(ret), K(arg.tablet_id_));
+        } else if (OB_FAIL(handle.get_obj()->get_latest_committed_async_index_refresh_info(committed_info))) {
+          if (OB_EMPTY_RESULT == ret) {
+            ret = OB_EAGAIN;
+          }
+          LOG_WARN("failed to verify offline logical publication", K(ret), K(arg.tablet_id_));
+        } else if (!committed_info.has_published_version()
+                   || committed_info.get_published_version() != arg.expected_published_version_) {
+          // Refresh commits its data and logical watermark atomically. Empty
+          // refreshes advance this watermark without installing a physical INC.
+          ret = OB_EAGAIN;
+          LOG_WARN("offline index has not reached the common logical boundary", K(ret),
+                   K(committed_info), K(arg.info_));
+        }
+      }
+      if (OB_SUCC(ret) && arg.floor_pin_only_) {
         ObTabletHandle tablet_handle;
         ObTablet *tablet = nullptr;
         ObTabletAsyncIndexRefreshInfo current_info;

@@ -368,9 +368,8 @@ TEST_F(TestAsyncIndexRefreshInfoMds, commit_version_placeholder_is_resolved)
     }
   }
 
-  // A later refresh may publish the same numeric value C while its physical
-  // INC is not visible yet. Its MDS row commits at D, so D != C prevents it
-  // from being mistaken for the original CREATE bootstrap row.
+  // A later refresh may publish the same logical value C without a physical
+  // INC. Its MDS row commits at D > C, while the logical watermark remains C.
   ObTabletAsyncIndexRefreshInfo same_value_refresh_info;
   same_value_refresh_info.set_published_version(create_published_version);
   ObMySQLTransaction same_value_trans;
@@ -403,7 +402,7 @@ TEST_F(TestAsyncIndexRefreshInfoMds, commit_version_placeholder_is_resolved)
     ASSERT_EQ(mds::TwoPhaseCommitState::ON_COMMIT, trans_stat);
     ASSERT_EQ(create_published_version, latest_info.get_published_version());
     ASSERT_GT(trans_version.get_val_for_tx(), create_published_version);
-
+    // Publishing the same logical value must not rewind progress to the physical watermark.
     int64_t physical_published_version = 0;
     int64_t latest_published_version = 0;
     EQ(OB_SUCCESS, tablet_handle.get_obj()->get_async_index_max_published_version(

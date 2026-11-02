@@ -7,6 +7,8 @@
 // No synthetic TableStore or compaction-suite hooks.
 #define USING_LOG_PREFIX STORAGETEST
 #include <cstdlib>
+#include <atomic>
+#include <thread>
 #include <gtest/gtest.h>
 #define protected public
 #define private public
@@ -19,14 +21,20 @@
 #include "storage/shared_storage/ob_disk_space_manager.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/tx/ob_ts_mgr.h"
+#include "storage/tx/ob_multi_data_source.h"
+#include "observer/ob_inner_sql_connection.h"
 #include "storage/async_index/ob_async_index_service.h"
 #include "storage/async_index/ob_async_index_define.h"
 #include "storage/compaction/ob_partition_merge_policy.h"
 #include "storage/tablet/ob_tablet.h"
+#include "storage/tablet/ob_async_index_refresh_info_mds_helper.h"
 #include "storage/tablet/ob_tablet_table_store.h"
 #include "storage/tablet/ob_tablet_ddl_complete_mds_data.h"
 #include "storage/blocksstable/ob_sstable.h"
 #include "share/ob_async_index_refresh_util.h"
+#include "share/ob_ddl_sim_point.h"
+#include "share/tablet/ob_tablet_to_ls_operator.h"
+#include "rootserver/ddl_task/ob_table_redefinition_task.h"
 
 namespace oceanbase
 {
@@ -53,10 +61,13 @@ public:
   {
     ObSimpleClusterTestBase::SetUp();
     ASSERT_FALSE(HasFatalFailure());
-    ASSERT_EQ(OB_SUCCESS, create_tenant_with_retry("tt1", "5G", "10G", false, 4));
+    // 同一测试套件共用 server；后续用例复用租户和连接池，避免重复创建及初始化。
+    if (!get_curr_simple_server().get_sql_proxy2().is_inited()) {
+      ASSERT_EQ(OB_SUCCESS, create_tenant_with_retry("tt1", "5G", "10G", false, 4));
+      ASSERT_EQ(OB_SUCCESS, get_curr_simple_server().init_sql_proxy2());
+    }
     ASSERT_EQ(OB_SUCCESS, get_tenant_id(tenant_id_));
     ASSERT_NE(OB_INVALID_TENANT_ID, tenant_id_);
-    ASSERT_EQ(OB_SUCCESS, get_curr_simple_server().init_sql_proxy2());
     ObTenantSwitchGuard guard;
     ASSERT_EQ(OB_SUCCESS, guard.switch_to(tenant_id_));
     // Match shared-storage test tenant disk provisioning, without cache/GC tuning.
@@ -92,6 +103,13 @@ public:
   int get_tablet_and_ls_id_by_table_id(
       ObMySQLProxy &proxy, const int64_t table_id, ObTabletID &tablet_id, ObLSID &ls_id);
   int get_tablet_handle(const ObLSID &ls_id, const ObTabletID &tablet_id, ObTabletHandle &tablet_handle);
+
+#ifdef ERRSIM
+  void check_offline_refresh_recovery(const int phase);
+  void check_offline_refresh_route(const uint64_t version, const bool with_async_index);
+  void read_offline_versions(const uint64_t table_id, ObIArray<int64_t> &physical,
+                            ObIArray<int64_t> &logical, ObIArray<int64_t> &commit_versions);
+#endif
 
   uint64_t tenant_id_;
 };
@@ -388,6 +406,774 @@ TEST_F(ObAsyncIndexRefreshScnTest, refresh_ddl_physical_scn_and_macro_snapshot)
     previous_target = target_snapshot;
   }
 }
+
+// 真实 offline DDL 刷新到逻辑 R 并提交 D；空刷允许物理水位落后于 R。
+TEST_F(ObAsyncIndexRefreshScnTest, real_offline_publication_refresh_start_under_pending_mds)
+{
+  common::ObMySQLProxy &sql_proxy = get_curr_simple_server().get_sql_proxy2();
+  int64_t affected_rows = 0;
+  const char *drop_sql = "drop table if exists t_real_offline_refresh_start";
+  ASSERT_EQ(OB_SUCCESS, sql_proxy.write(drop_sql, affected_rows));
+  ASSERT_EQ(OB_SUCCESS, sql_proxy.write(
+      "create table t_real_offline_refresh_start ("
+      "id int primary key, body varchar(256), async fulltext index idx_ft(body)) "
+      "organization heap default charset=utf8mb4 collate=utf8mb4_general_ci "
+      "async_index_params='ASYNC_REFRESH_INTERVAL=-1'", affected_rows));
+  DEFER(EXPECT_EQ(OB_SUCCESS, sql_proxy.write(drop_sql, affected_rows)));
+  ASSERT_EQ(OB_SUCCESS, sql_proxy.write(
+      "insert into t_real_offline_refresh_start values (1, 'offline seed')", affected_rows));
+  ASSERT_EQ(OB_SUCCESS, sql_proxy.write(
+      "alter table t_real_offline_refresh_start "
+      "convert to character set utf8mb4 collate utf8mb4_bin", affected_rows));
+
+  // 交换后重新定位真实倒排索引 tablet；不用旧表 ID，也不修改 tablet cache。
+  ObSqlString sql;
+  int64_t tablet_id_value = 0;
+  int64_t ls_id_value = 0;
+  ASSERT_EQ(OB_SUCCESS, sql.assign_fmt(
+      "select i.tablet_id as val from oceanbase.__all_virtual_table i "
+      "join oceanbase.__all_virtual_table d "
+      "on i.tenant_id = d.tenant_id and i.data_table_id = d.table_id "
+      "where d.tenant_id = %lu and d.table_name = 't_real_offline_refresh_start' "
+      "and i.index_type = 47", tenant_id_));
+  ASSERT_EQ(OB_SUCCESS, SimpleServerHelper::select_int64(sql_proxy, sql.ptr(), tablet_id_value));
+  ASSERT_GT(tablet_id_value, 0);
+  ASSERT_EQ(OB_SUCCESS, sql.assign_fmt(
+      "select ls_id as val from oceanbase.__all_tablet_to_ls where tablet_id = %ld",
+      tablet_id_value));
+  ASSERT_EQ(OB_SUCCESS, SimpleServerHelper::select_int64(sql_proxy, sql.ptr(), ls_id_value));
+  const ObTabletID tablet_id(tablet_id_value);
+  const ObLSID ls_id(ls_id_value);
+
+  int ret = OB_SUCCESS;
+  MTL_SWITCH(tenant_id_) {
+    ObLSHandle ls_handle;
+    ASSERT_EQ(OB_SUCCESS, MTL(ObLSService *)->get_ls(ls_id, ls_handle, ObLSGetMod::TRANS_MOD));
+    ObTabletHandle tablet_handle;
+    ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(tablet_id, tablet_handle));
+    ObTablet *tablet = tablet_handle.get_obj();
+    ASSERT_NE(nullptr, tablet);
+    ASSERT_TRUE(tablet->is_async_index_refresh_target());
+
+    ObTabletAsyncIndexRefreshInfo publication;
+    mds::MdsWriter writer;
+    mds::TwoPhaseCommitState state;
+    SCN commit_version;
+    ASSERT_EQ(OB_SUCCESS, tablet->mds_get_row_(
+        mds::DummyKey(), SCN::max_scn(), 1_s, false /* read_uncommitted */,
+        publication, nullptr, writer, state, commit_version));
+    ASSERT_EQ(mds::TwoPhaseCommitState::ON_COMMIT, state);
+    ASSERT_TRUE(publication.is_valid());
+    ASSERT_TRUE(commit_version.is_valid());
+    int64_t physical_version = 0;
+    ASSERT_EQ(OB_SUCCESS, tablet->get_async_index_max_published_version(physical_version));
+    const int64_t publish_version = publication.get_published_version();
+    ASSERT_GT(physical_version, 0);
+    ASSERT_LT(physical_version, publish_version);
+    ASSERT_EQ(publish_version, commit_version.get_val_for_tx());
+
+    const auto check_versions = [&]() {
+      ObTabletAsyncIndexRefreshInfo committed_info;
+      mds::MdsWriter committed_writer;
+      mds::TwoPhaseCommitState committed_state;
+      SCN committed_version;
+      ASSERT_EQ(OB_SUCCESS, tablet->mds_get_row_(
+          mds::DummyKey(), SCN::max_scn(), 1_s, false /* read_uncommitted */,
+          committed_info, nullptr, committed_writer, committed_state, committed_version));
+      ASSERT_EQ(mds::TwoPhaseCommitState::ON_COMMIT, committed_state);
+      ASSERT_EQ(publish_version, committed_info.get_published_version());
+      ASSERT_EQ(publish_version, committed_version.get_val_for_tx());
+      int64_t current_physical = 0;
+      int64_t refresh_start = 0;
+      int64_t query_version = 0;
+      ASSERT_EQ(OB_SUCCESS, tablet->get_async_index_max_published_version(current_physical));
+      ASSERT_EQ(physical_version, current_physical);
+      ASSERT_EQ(OB_SUCCESS, tablet->get_async_index_refresh_start_version(refresh_start, false /* use_cache */));
+      ASSERT_EQ(publish_version, refresh_start);
+      ASSERT_EQ(OB_SUCCESS, tablet->get_async_index_query_published_version(
+          SCN::max_scn(), query_version));
+      ASSERT_EQ(publish_version, query_version);
+    };
+    ASSERT_NO_FATAL_FAILURE(check_versions());
+    // The swap precondition travels in the registration argument, not in the MDS value.
+    {
+      ObTabletAsyncIndexRefreshInfoArg arg;
+      arg.ls_id_ = ls_id;
+      arg.tablet_id_ = tablet_id;
+      arg.expected_published_version_ = publish_version;
+      arg.info_.set_published_version(ObTabletAsyncIndexRefreshInfo::USE_COMMIT_VERSION);
+      ASSERT_TRUE(arg.is_valid());
+      char buf[512];
+      int64_t pos = 0;
+      ASSERT_EQ(OB_SUCCESS, arg.serialize(buf, sizeof(buf), pos));
+      ObTabletAsyncIndexRefreshInfoArg decoded;
+      int64_t read_pos = 0;
+      ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buf, pos, read_pos));
+      ASSERT_EQ(pos, read_pos);
+      ASSERT_TRUE(decoded.is_valid());
+      ASSERT_EQ(publish_version, decoded.expected_published_version_);
+      ASSERT_TRUE(decoded.info_.need_fill_commit_version());
+    }
+    for (int64_t offset = 0; offset < 2; ++offset) {
+      SCOPED_TRACE(offset);
+      ObTabletAsyncIndexRefreshInfo pending_info;
+      pending_info.set_published_version(publish_version + offset);
+      ObMySQLTransaction pending_trans;
+      ASSERT_EQ(OB_SUCCESS, pending_trans.start(GCTX.sql_proxy_, tenant_id_));
+      DEFER(if (pending_trans.is_started()) {
+        EXPECT_EQ(OB_SUCCESS, pending_trans.end(false /* commit */));
+      });
+      ObTabletAsyncIndexRefreshInfoArg arg;
+      arg.ls_id_ = ls_id;
+      arg.tablet_id_ = tablet_id;
+      ASSERT_EQ(OB_SUCCESS, arg.info_.assign(pending_info));
+      char buf[512];
+      int64_t pos = 0;
+      ASSERT_EQ(OB_SUCCESS, arg.serialize(buf, sizeof(buf), pos));
+      auto *conn = static_cast<observer::ObInnerSQLConnection *>(pending_trans.get_connection());
+      ASSERT_NE(nullptr, conn);
+      transaction::ObRegisterMdsFlag flag;
+      ASSERT_EQ(OB_SUCCESS, conn->register_multi_data_source(
+          tenant_id_, ls_id, transaction::ObTxDataSourceType::ASYNC_INDEX_REFRESH_INFO,
+          buf, pos, flag));
+
+      // 确认覆盖层确实存在且尚未提交，避免未制造并发窗口却假通过。
+      ObTabletAsyncIndexRefreshInfo latest_info;
+      ASSERT_EQ(OB_SUCCESS, tablet->get_latest_async_index_refresh_info(
+          latest_info, writer, state, commit_version));
+      ASSERT_NE(mds::TwoPhaseCommitState::ON_COMMIT, state);
+      ASSERT_EQ(publish_version + offset, latest_info.get_published_version());
+      ASSERT_NO_FATAL_FAILURE(check_versions());
+      ASSERT_EQ(OB_SUCCESS, pending_trans.end(false /* commit */));
+      ASSERT_NO_FATAL_FAILURE(check_versions());
+    }
+  }
+  ASSERT_EQ(OB_SUCCESS, ret);
+}
+
+
+// Exercise the LS offline/online replay path with a real committed table swap.
+// This is LS recovery coverage, not an observer crash or RS failover test.
+TEST_F(ObAsyncIndexRefreshScnTest, offline_publication_survives_ls_reboot_and_refresh)
+{
+  auto &proxy = get_curr_simple_server().get_sql_proxy2();
+  const char *drop_sql = "drop table if exists t_offline_reboot";
+  ASSERT_EQ(OB_SUCCESS, exe_sql(drop_sql));
+  ASSERT_EQ(OB_SUCCESS, exe_sql(
+      "create table t_offline_reboot (id int primary key, body varchar(256), "
+      "async fulltext index ft(body)) organization heap "
+      "default charset=utf8mb4 collate=utf8mb4_general_ci "
+      "async_index_params='ASYNC_REFRESH_INTERVAL=-1'"));
+  DEFER(EXPECT_EQ(OB_SUCCESS, exe_sql(drop_sql)));
+  ASSERT_EQ(OB_SUCCESS, exe_sql("insert into t_offline_reboot values (1, 'reboot seed')"));
+  ASSERT_EQ(OB_SUCCESS, exe_sql(
+      "alter table t_offline_reboot convert to character set utf8mb4 collate utf8mb4_bin"));
+
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(tenant_id_));
+  DEFER(EXPECT_EQ(OB_SUCCESS, exe_sql("alter system set _enable_async_index_refresh = true")));
+  ASSERT_NO_FATAL_FAILURE(disable_and_drain_async_index_refresh());
+  int64_t data_table_id = 0;
+  ObSqlString sql;
+  ASSERT_EQ(OB_SUCCESS, sql.assign_fmt(
+      "select table_id as val from oceanbase.__all_virtual_table "
+      "where tenant_id=%lu and table_name='t_offline_reboot' and data_table_id=0", tenant_id_));
+  ASSERT_EQ(OB_SUCCESS, SimpleServerHelper::select_int64(proxy, sql.ptr(), data_table_id));
+  ASSERT_GT(data_table_id, 0);
+  ObSEArray<uint64_t, 4> index_ids;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexRefreshUtil::collect_async_index_table_ids(
+      tenant_id_, data_table_id, index_ids, true, true));
+  ASSERT_EQ(2, index_ids.count()); // FTS and shared delete index.
+  ObTabletID tablets[3];
+  ObLSID ls_ids[3];
+  ObTabletAsyncIndexRefreshInfo before[3];
+  for (int64_t i = 0; i < 3; ++i) {
+    ASSERT_EQ(OB_SUCCESS, get_tablet_and_ls_id_by_table_id(
+        proxy, 0 == i ? data_table_id : index_ids.at(i - 1), tablets[i], ls_ids[i]));
+    ASSERT_EQ(ls_ids[0], ls_ids[i]);
+    ObTabletHandle handle;
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ls_ids[i], tablets[i], handle));
+    mds::MdsWriter writer;
+    mds::TwoPhaseCommitState state;
+    SCN commit_version;
+    ASSERT_EQ(OB_SUCCESS, handle.get_obj()->mds_get_row_(
+        mds::DummyKey(), SCN::max_scn(), 1_s, false /* read_uncommitted */,
+        before[i], nullptr, writer, state, commit_version));
+    ASSERT_EQ(mds::TwoPhaseCommitState::ON_COMMIT, state);
+    ASSERT_TRUE(before[i].is_valid());
+    if (i > 0) {
+      int64_t physical = 0;
+      ASSERT_EQ(OB_SUCCESS, handle.get_obj()->get_async_index_max_published_version(physical));
+      ASSERT_LT(physical, before[i].get_published_version());
+      ASSERT_EQ(before[1].get_published_version(), before[i].get_published_version());
+      ASSERT_EQ(commit_version.get_val_for_tx(), before[i].get_published_version());
+    } else {
+      ASSERT_TRUE(before[i].has_async_index());
+      ASSERT_FALSE(before[i].get_refresh_snapshots().empty());
+    }
+  } // Release every tablet/LS handle before reboot.
+
+  ASSERT_EQ(OB_SUCCESS, SimpleServerHelper::freeze_tx_ctx(tenant_id_, ls_ids[0]));
+  ASSERT_EQ(OB_SUCCESS, SimpleServerHelper::ls_reboot(tenant_id_, ls_ids[0]));
+  for (int64_t i = 0; i < 3; ++i) {
+    SCOPED_TRACE(i);
+    ObTabletHandle handle;
+    ObTabletAsyncIndexRefreshInfo after;
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ls_ids[i], tablets[i], handle));
+    ASSERT_EQ(OB_SUCCESS, handle.get_obj()->get_latest_committed_async_index_refresh_info(after));
+    ASSERT_TRUE(after.is_valid());
+    ASSERT_EQ(before[i].has_async_index(), after.has_async_index());
+    ASSERT_EQ(before[i].get_published_version(), after.get_published_version());
+    ASSERT_EQ(before[i].get_refresh_snapshots().count(), after.get_refresh_snapshots().count());
+    for (int64_t j = 0; j < before[i].get_refresh_snapshots().count(); ++j) {
+      ASSERT_EQ(before[i].get_refresh_snapshots().at(j), after.get_refresh_snapshots().at(j));
+    }
+    if (i > 0) {
+      int64_t start = 0;
+      int64_t query = 0;
+      ASSERT_EQ(OB_SUCCESS, handle.get_obj()->get_async_index_refresh_start_version(start, false));
+      ASSERT_EQ(after.get_published_version(), start);
+      ASSERT_EQ(OB_SUCCESS, handle.get_obj()->get_async_index_query_published_version(SCN::max_scn(), query));
+      ASSERT_EQ(start, query);
+    }
+  }
+  const char *query_sql = "select count(*) as val from hybrid_search(TABLE t_offline_reboot, "
+      "'{\"query\":{\"match\":{\"body\":\"reboot\"}}}')";
+  int64_t count = 0;
+  ASSERT_EQ(OB_SUCCESS, SimpleServerHelper::select_int64(proxy, query_sql, count));
+  ASSERT_EQ(1, count); // Query before any post-reboot refresh.
+  ASSERT_EQ(OB_SUCCESS, exe_sql("alter system set _enable_async_index_refresh = true"));
+  ASSERT_EQ(OB_SUCCESS, exe_sql("delete from t_offline_reboot where id=1"));
+  ASSERT_EQ(OB_SUCCESS, exe_sql("insert into t_offline_reboot values (2, 'reboot next')"));
+  ASSERT_EQ(OB_SUCCESS, exe_sql("call dbms_async_index.refresh('t_offline_reboot')"));
+  ASSERT_EQ(OB_SUCCESS, SimpleServerHelper::select_int64(proxy, query_sql, count));
+  ASSERT_EQ(1, count);
+  ASSERT_EQ(OB_SUCCESS, SimpleServerHelper::select_int64(proxy,
+      "select id as val from hybrid_search(TABLE t_offline_reboot, "
+      "'{\"query\":{\"match\":{\"body\":\"reboot\"}}}')", count));
+  ASSERT_EQ(2, count); // Old deletion and new insertion both took effect.
+  for (int64_t i = 1; i < 3; ++i) {
+    ObTabletHandle handle;
+    ObTabletAsyncIndexRefreshInfo after;
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ls_ids[i], tablets[i], handle));
+    ASSERT_EQ(OB_SUCCESS, handle.get_obj()->get_latest_committed_async_index_refresh_info(after));
+    ASSERT_GT(after.get_published_version(), before[i].get_published_version());
+  }
+}
+
+
+#ifdef ERRSIM
+// 读取全部索引分区，不以第一个 tablet 的结果代表整表完成。
+void ObAsyncIndexRefreshScnTest::read_offline_versions(
+    const uint64_t table_id, ObIArray<int64_t> &physical,
+    ObIArray<int64_t> &logical, ObIArray<int64_t> &commit_versions)
+{
+  ObSEArray<uint64_t, 4> index_ids;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexRefreshUtil::collect_async_index_table_ids(
+      tenant_id_, table_id, index_ids, true, true));
+  ASSERT_FALSE(index_ids.empty());
+  physical.reset();
+  logical.reset();
+  commit_versions.reset();
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(tenant_id_));
+  for (int64_t i = 0; i < index_ids.count(); ++i) {
+    ObSEArray<ObTabletID, 4> tablets;
+    ObSEArray<ObLSID, 4> ls_ids;
+    ASSERT_EQ(OB_SUCCESS, ObDDLUtil::get_tablets(tenant_id_, index_ids.at(i), tablets));
+    ASSERT_EQ(2, tablets.count());
+    ASSERT_EQ(OB_SUCCESS, ObTabletToLSTableOperator::batch_get_ls(
+        *GCTX.sql_proxy_, tenant_id_, tablets, ls_ids));
+    ASSERT_EQ(tablets.count(), ls_ids.count());
+    for (int64_t j = 0; j < tablets.count(); ++j) {
+      ObTabletHandle handle;
+      ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ls_ids.at(j), tablets.at(j), handle));
+      int64_t pv = 0;
+      ASSERT_EQ(OB_SUCCESS, handle.get_obj()->get_async_index_max_published_version(pv));
+      ASSERT_EQ(OB_SUCCESS, physical.push_back(pv));
+      ObTabletAsyncIndexRefreshInfo info;
+      mds::MdsWriter writer;
+      mds::TwoPhaseCommitState state;
+      SCN commit_scn;
+      const int mds_ret = handle.get_obj()->mds_get_row_(
+          mds::DummyKey(), SCN::max_scn(), 1_s, false, info, nullptr, writer, state, commit_scn);
+      // 尚未刷新过的隐藏索引可以没有 MDS 行；发布后调用方必须断言 D > R。
+      ASSERT_TRUE(OB_SUCCESS == mds_ret || OB_EMPTY_RESULT == mds_ret) << mds_ret;
+      if (OB_SUCCESS == mds_ret) {
+        ASSERT_EQ(mds::TwoPhaseCommitState::ON_COMMIT, state);
+        ASSERT_TRUE(info.is_valid());
+      }
+      ASSERT_EQ(OB_SUCCESS, logical.push_back(
+          info.has_published_version() ? info.get_published_version() : 0));
+      ASSERT_EQ(OB_SUCCESS, commit_versions.push_back(
+          OB_SUCCESS == mds_ret ? commit_scn.get_val_for_tx() : 0));
+    }
+  }
+}
+
+// phase 0: R 已落盘但未刷新；1: 首分区完成；2: swap 已提交但任务尚未转 SUCCESS；3: 消息保存持续失败。
+// 暂停原任务后从任务表重建对象调用真实状态实现，覆盖任务恢复而非冒充真实 RS 切主。
+void ObAsyncIndexRefreshScnTest::check_offline_refresh_recovery(const int phase)
+{
+  using namespace rootserver;
+  auto &proxy = get_curr_simple_server().get_sql_proxy2();
+  const auto sys_sql = [&](const char *sql) {
+    int64_t affected = 0;
+    return exec_write_sql_sys(sql, affected);
+  };
+  uint64_t data_version = 0;
+  ASSERT_EQ(OB_SUCCESS, GET_MIN_DATA_VERSION(tenant_id_, data_version));
+  ASSERT_GE(data_version, DATA_VERSION_4_6_3_0);
+  ASSERT_EQ(OB_SUCCESS, exe_sql("drop table if exists t_offline_stage_recovery"));
+  if (0 == phase) {
+    ASSERT_EQ(OB_SUCCESS, exe_sql("drop table if exists t_offline_stage_unrelated"));
+  }
+  ASSERT_EQ(OB_SUCCESS, exe_sql(
+      "create table t_offline_stage_recovery (id int primary key, body varchar(256), "
+      "async fulltext index ft(body)) organization heap partition by hash(id) partitions 2"));
+  ASSERT_EQ(OB_SUCCESS, exe_sql(
+      "alter table t_offline_stage_recovery async_index_params='ASYNC_REFRESH_INTERVAL=-1'"));
+  ASSERT_EQ(OB_SUCCESS, exe_sql(
+      "insert into t_offline_stage_recovery values (1, 'recovery first'), (2, 'recovery second')"));
+  if (0 == phase) {
+    ASSERT_EQ(OB_SUCCESS, exe_sql("create table t_offline_stage_unrelated (id int primary key)"));
+  }
+  int64_t original_id = 0;
+  ObSqlString sql;
+  ASSERT_EQ(OB_SUCCESS, sql.assign_fmt(
+      "select table_id as val from oceanbase.__all_virtual_table where tenant_id=%lu "
+      "and table_name='t_offline_stage_recovery' and data_table_id=0", tenant_id_));
+  ASSERT_EQ(OB_SUCCESS, SimpleServerHelper::select_int64(proxy, sql.ptr(), original_id));
+  ASSERT_GT(original_id, 0);
+
+  const char *points[] = {"BEFORE_OFFLINE_ASYNC_INDEX_REFRESH",
+                        "AFTER_OFFLINE_ASYNC_INDEX_PARTITION_REFRESH",
+                        "TABLE_REDEFINITION_TAKE_EFFECT"};
+  const int64_t previous_sync_timeout = static_cast<int64_t>(GCONF.debug_sync_timeout);
+  DEFER({
+    ObSqlString restore_sql;
+    if (OB_SUCCESS == restore_sql.assign_fmt(
+        "alter system set debug_sync_timeout='%ldus'", previous_sync_timeout)) {
+      EXPECT_EQ(OB_SUCCESS, sys_sql(restore_sql.ptr()));
+    }
+  });
+  ASSERT_EQ(OB_SUCCESS, sys_sql("alter system set debug_sync_timeout='120s'"));
+  const int64_t config_deadline = ObTimeUtility::current_time() + 10_s;
+  while (120_s != static_cast<int64_t>(GCONF.debug_sync_timeout)
+         && ObTimeUtility::current_time() < config_deadline) {
+    ob_usleep(10 * 1000);
+  }
+  ASSERT_EQ(120_s, static_cast<int64_t>(GCONF.debug_sync_timeout));
+  ASSERT_EQ(OB_SUCCESS, sys_sql("set ob_global_debug_sync='reset'"));
+  std::thread ddl_thread;
+  std::thread unrelated_thread;
+  std::atomic<int> ddl_ret(OB_EAGAIN);
+  std::atomic<bool> ddl_done(false);
+  std::atomic<int> unrelated_ret(OB_EAGAIN);
+  std::atomic<bool> unrelated_done(false);
+  // 断言失败也必须先解除同步点，再 join，避免遗留后台 SQL 或挂住测试进程。
+  DEFER({
+    EXPECT_EQ(OB_SUCCESS, sys_sql("set ob_global_debug_sync='now signal offline_stage_resume'"));
+    EXPECT_EQ(OB_SUCCESS, sys_sql("set ob_global_debug_sync='reset'"));
+    if (ddl_thread.joinable()) { ddl_thread.join(); }
+    if (unrelated_thread.joinable()) { unrelated_thread.join(); }
+    EXPECT_EQ(OB_SUCCESS, exe_sql("drop table if exists t_offline_stage_recovery"));
+    if (0 == phase) {
+      EXPECT_EQ(OB_SUCCESS, exe_sql("drop table if exists t_offline_stage_unrelated"));
+    }
+  });
+  ASSERT_EQ(OB_SUCCESS, sql.assign_fmt(
+      "set ob_global_debug_sync='%s signal offline_stage_paused "
+      "wait_for offline_stage_resume execute 1'", points[3 == phase ? 0 : phase]));
+  ASSERT_EQ(OB_SUCCESS, sys_sql(sql.ptr()));
+  ddl_thread = std::thread([&]() {
+    ddl_ret.store(exe_sql("alter table t_offline_stage_recovery "
+                         "convert to character set utf8mb4 collate utf8mb4_bin"));
+    ddl_done.store(true);
+  });
+  const int64_t wait_start = ObTimeUtility::current_time();
+  // 直接在测试线程等待，避免 sys 租户 SQL 的短超时先于同步点超时生效。
+  ObMalloc sync_allocator;
+  ObDSSessionActions control_actions;
+  ASSERT_EQ(OB_SUCCESS, control_actions.init(1024, sync_allocator));
+  ASSERT_EQ(OB_SUCCESS, GDS.add_debug_sync(
+      "now wait_for offline_stage_paused timeout 120000000 execute 1",
+      false /* is_global */, control_actions));
+  // debug sync 超时也可能返回成功，不能仅检查接口返回码。
+  ASSERT_LT(ObTimeUtility::current_time() - wait_start, 110_s);
+  ASSERT_FALSE(ddl_done.load());
+
+  ObArenaAllocator allocator;
+  ObSEArray<ObDDLTaskRecord, 4> records;
+  ASSERT_EQ(OB_SUCCESS, ObDDLTaskRecordOperator::get_ddl_task_record_by_table_id(
+      tenant_id_, original_id, *GCTX.sql_proxy_, allocator, records));
+  ASSERT_EQ(1, records.count());
+  class MessageFailingTask final : public ObTableRedefinitionTask
+  {
+  public:
+    int serialize_params_to_message(char *buf, const int64_t buf_len, int64_t &pos) const override
+    {
+      if (fail_next_message_) {
+        fail_next_message_ = false;
+        return OB_ALLOCATE_MEMORY_FAILED;
+      }
+      return ObTableRedefinitionTask::serialize_params_to_message(buf, buf_len, pos);
+    }
+    mutable bool fail_next_message_ = false;
+  } recovered;
+  ASSERT_EQ(OB_SUCCESS, recovered.init(records.at(0)));
+  const int64_t refresh_snapshot = recovered.alter_table_arg_.async_index_offline_refresh_snapshot_;
+  ASSERT_GT(refresh_snapshot, 0);
+  ASSERT_EQ(2 == phase ? ObDDLTaskStatus::TAKE_EFFECT : ObDDLTaskStatus::TRIGGER_ASYNC_INDEX_REFRESH,
+            recovered.get_task_status());
+  if (3 == phase) {
+    ASSERT_EQ(OB_SUCCESS, recovered.switch_status(ObDDLTaskStatus::MODIFY_AUTOINC, true, OB_SUCCESS));
+    ASSERT_EQ(0, recovered.err_code_occurence_cnt_);
+    // Only message preparation fails; state SQL and FAIL-message serialization remain available.
+    for (int64_t i = 1; i <= 3; ++i) {
+      recovered.fail_next_message_ = true;
+      ASSERT_EQ(OB_SUCCESS, recovered.modify_autoinc(ObDDLTaskStatus::TAKE_EFFECT));
+      ASSERT_FALSE(recovered.fail_next_message_);
+      ASSERT_EQ(i, recovered.err_code_occurence_cnt_);
+      ASSERT_EQ(i < 3 ? ObDDLTaskStatus::MODIFY_AUTOINC : ObDDLTaskStatus::FAIL,
+                recovered.get_task_status());
+      ASSERT_EQ(refresh_snapshot, recovered.alter_table_arg_.async_index_offline_refresh_snapshot_);
+      ObDDLTaskRecord failed_record;
+      ASSERT_EQ(OB_SUCCESS, ObDDLTaskRecordOperator::get_ddl_task_record(
+          tenant_id_, recovered.task_id_, *GCTX.sql_proxy_, allocator, failed_record));
+      ObTableRedefinitionTask reread;
+      ASSERT_EQ(OB_SUCCESS, reread.init(failed_record));
+      ASSERT_EQ(recovered.get_task_status(), reread.get_task_status());
+      ASSERT_EQ(i < 3 ? OB_SUCCESS : OB_ALLOCATE_MEMORY_FAILED, reread.ret_code_);
+    }
+    ASSERT_EQ(OB_SUCCESS, sys_sql("set ob_global_debug_sync='now signal offline_stage_resume'"));
+    ddl_thread.join();
+    // The original executor may report cancellation after observing the persisted FAIL.
+    ASSERT_NE(OB_SUCCESS, ddl_ret.load());
+    return;
+  }
+  ObSEArray<int64_t, 8> physical_before;
+  ObSEArray<int64_t, 8> logical_before;
+  ObSEArray<int64_t, 8> commit_before;
+  ASSERT_NO_FATAL_FAILURE(read_offline_versions(
+      recovered.target_object_id_, physical_before, logical_before, commit_before));
+  ASSERT_GE(physical_before.count(), 2);
+  int64_t finished = 0;
+  for (int64_t i = 0; i < physical_before.count(); ++i) {
+    ASSERT_LE(physical_before.at(i), refresh_snapshot);
+    // Empty refreshes advance logical progress without installing an SSTable.
+    finished += logical_before.at(i) >= refresh_snapshot ? 1 : 0;
+    if (2 == phase) {
+      ASSERT_GT(commit_before.at(i), refresh_snapshot);
+      ASSERT_EQ(commit_before.at(i), logical_before.at(i));
+    } else {
+      ASSERT_LE(logical_before.at(i), refresh_snapshot);
+    }
+  }
+  if (0 == phase) {
+    ASSERT_EQ(0, finished);
+    // 模拟快照已落盘但状态推进未完成；原执行者停在 RPC 前，不会并发推进任务。
+    ASSERT_EQ(OB_SUCCESS, recovered.switch_status(ObDDLTaskStatus::MODIFY_AUTOINC, true, OB_SUCCESS));
+    ASSERT_EQ(ObDDLTaskStatus::MODIFY_AUTOINC, recovered.get_task_status());
+    // 消息持久化已移至 MODIFY_AUTOINC，失败后必须保留状态和已有快照。
+    {
+      class TestIntListItem final : public ObConfigIntListItem
+      {
+      public:
+        explicit TestIntListItem(const char *name)
+            : ObConfigIntListItem(nullptr, Scope::TENANT, name, "", "") {}
+        const char *value_default_ptr() const override { return ""; }
+      };
+      TestIntListItem random("offline_test_random");
+      TestIntListItem fixed("offline_test_fixed");
+      TestIntListItem empty("offline_test_empty");
+      ObSqlString point;
+      ASSERT_EQ(OB_SUCCESS, point.assign_fmt("%ld",
+          static_cast<int64_t>(UPDATE_TASK_RECORD_ON_MESSAGE_FAILED)));
+      ASSERT_TRUE(fixed.set_value(point.ptr()));
+      auto &sim_mgr = ObDDLSimPointMgr::get_instance();
+      const ObDDLSimPointMgr::TaskSimPoint sim_key(
+          tenant_id_, recovered.task_id_, UPDATE_TASK_RECORD_ON_MESSAGE_FAILED);
+      DEFER({
+        EXPECT_EQ(OB_SUCCESS, sim_mgr.set_tenant_param(tenant_id_, empty, empty));
+        // 清空 fixed list 不会撤销已经生成的任务注入记录，必须精确删除该记录。
+        const int erase_ret = sim_mgr.task_sim_map_.erase_refactored(sim_key);
+        EXPECT_TRUE(OB_SUCCESS == erase_ret || OB_HASH_NOT_EXIST == erase_ret) << erase_ret;
+      });
+      ASSERT_EQ(OB_SUCCESS, sim_mgr.set_tenant_param(tenant_id_, random, fixed));
+      // Retryable persistence errors are consumed by switch_status without advancing the task.
+      ASSERT_EQ(OB_SUCCESS, recovered.modify_autoinc(ObDDLTaskStatus::TAKE_EFFECT));
+      ASSERT_EQ(0, recovered.err_code_occurence_cnt_);
+      ASSERT_EQ(ObDDLTaskStatus::MODIFY_AUTOINC, recovered.get_task_status());
+      ASSERT_EQ(refresh_snapshot, recovered.alter_table_arg_.async_index_offline_refresh_snapshot_);
+      ObDDLTaskRecord failed_record;
+      ASSERT_EQ(OB_SUCCESS, ObDDLTaskRecordOperator::get_ddl_task_record(
+          tenant_id_, recovered.task_id_, *GCTX.sql_proxy_, allocator, failed_record));
+      ObTableRedefinitionTask failed_recovery;
+      ASSERT_EQ(OB_SUCCESS, failed_recovery.init(failed_record));
+      ASSERT_EQ(ObDDLTaskStatus::MODIFY_AUTOINC, failed_recovery.get_task_status());
+      ASSERT_EQ(refresh_snapshot, failed_recovery.alter_table_arg_.async_index_offline_refresh_snapshot_);
+    }
+    ASSERT_EQ(OB_SUCCESS, DDL_SIM(
+        tenant_id_, recovered.task_id_, UPDATE_TASK_RECORD_ON_MESSAGE_FAILED));
+    ASSERT_EQ(OB_SUCCESS, recovered.modify_autoinc(ObDDLTaskStatus::TAKE_EFFECT));
+    ASSERT_EQ(ObDDLTaskStatus::TRIGGER_ASYNC_INDEX_REFRESH, recovered.get_task_status());
+    ASSERT_EQ(refresh_snapshot, recovered.alter_table_arg_.async_index_offline_refresh_snapshot_);
+    ObDDLTaskRecord retry_record;
+    ASSERT_EQ(OB_SUCCESS, ObDDLTaskRecordOperator::get_ddl_task_record(
+        tenant_id_, recovered.task_id_, *GCTX.sql_proxy_, allocator, retry_record));
+    ObTableRedefinitionTask retry_recovery;
+    ASSERT_EQ(OB_SUCCESS, retry_recovery.init(retry_record));
+    ASSERT_EQ(ObDDLTaskStatus::TRIGGER_ASYNC_INDEX_REFRESH, retry_recovery.get_task_status());
+    ASSERT_EQ(refresh_snapshot, retry_recovery.alter_table_arg_.async_index_offline_refresh_snapshot_);
+  } else if (1 == phase) {
+    ASSERT_GT(finished, 0);
+    ASSERT_LT(finished, physical_before.count());
+  } else {
+    ASSERT_EQ(physical_before.count(), finished);
+  }
+
+  if (phase < 2) {
+    if (0 == phase) {
+      // 刷新暂停期间，另表 DDL 应能完成；设有界等待，失败时由 DEFER 解锁并回收线程。
+      unrelated_thread = std::thread([&]() {
+        unrelated_ret.store(exe_sql("alter table t_offline_stage_unrelated add column extra int"));
+        unrelated_done.store(true);
+      });
+      const int64_t deadline = ObTimeUtility::current_time() + 10_s;
+      while (!unrelated_done.load() && ObTimeUtility::current_time() < deadline) {
+        ob_usleep(10 * 1000);
+      }
+      ASSERT_TRUE(unrelated_done.load()) << "unrelated DDL blocked by offline preparation";
+      unrelated_thread.join();
+      ASSERT_EQ(OB_SUCCESS, unrelated_ret.load());
+      ObSEArray<int64_t, 8> unchanged;
+      ObSEArray<int64_t, 8> unchanged_logical;
+      ObSEArray<int64_t, 8> unchanged_commit;
+      ASSERT_NO_FATAL_FAILURE(read_offline_versions(
+          recovered.target_object_id_, unchanged, unchanged_logical, unchanged_commit));
+      ASSERT_EQ(physical_before.count(), unchanged.count());
+      for (int64_t i = 0; i < unchanged.count(); ++i) {
+        ASSERT_EQ(physical_before.at(i), unchanged.at(i));
+        ASSERT_EQ(logical_before.at(i), unchanged_logical.at(i));
+        ASSERT_EQ(commit_before.at(i), unchanged_commit.at(i));
+      }
+    }
+    ASSERT_EQ(OB_SUCCESS, recovered.trigger_async_index_refresh());
+    ASSERT_EQ(ObDDLTaskStatus::TAKE_EFFECT, recovered.get_task_status());
+  } else {
+    // 模拟恢复时只看到已提交 swap，不依赖原执行者内存中的成功返回值。
+    ASSERT_EQ(OB_SUCCESS, recovered.take_effect(ObDDLTaskStatus::SUCCESS));
+    ASSERT_EQ(ObDDLTaskStatus::SUCCESS, recovered.get_task_status());
+  }
+  ASSERT_EQ(refresh_snapshot, recovered.alter_table_arg_.async_index_offline_refresh_snapshot_);
+  ObSEArray<int64_t, 8> physical_after;
+  ObSEArray<int64_t, 8> logical_after;
+  ObSEArray<int64_t, 8> commit_after;
+  ASSERT_NO_FATAL_FAILURE(read_offline_versions(
+      recovered.target_object_id_, physical_after, logical_after, commit_after));
+  ASSERT_EQ(physical_before.count(), physical_after.count());
+  for (int64_t i = 0; i < physical_after.count(); ++i) {
+    ASSERT_GE(physical_after.at(i), physical_before.at(i));
+    ASSERT_LE(physical_after.at(i), refresh_snapshot);
+    ASSERT_EQ(phase < 2 ? refresh_snapshot : commit_before.at(i), logical_after.at(i));
+    if (2 == phase) {
+      ASSERT_EQ(commit_before.at(i), commit_after.at(i));
+    }
+  }
+  if (2 == phase) {
+    // Verify the real swap registered every data partition in the same transaction as the indexes.
+    const int64_t publish_version = logical_after.at(0);
+    ASSERT_GT(publish_version, refresh_snapshot);
+    for (int64_t i = 0; i < logical_after.count(); ++i) {
+      ASSERT_EQ(publish_version, logical_after.at(i));
+      ASSERT_EQ(publish_version, commit_after.at(i));
+    }
+    ObTenantSwitchGuard tenant_guard;
+    ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(tenant_id_));
+    ObSEArray<ObTabletID, 4> data_tablets;
+    ObSEArray<ObLSID, 4> data_ls_ids;
+    ASSERT_EQ(OB_SUCCESS, ObDDLUtil::get_tablets(
+        tenant_id_, recovered.target_object_id_, data_tablets));
+    ASSERT_EQ(2, data_tablets.count());
+    ASSERT_EQ(OB_SUCCESS, ObTabletToLSTableOperator::batch_get_ls(
+        *GCTX.sql_proxy_, tenant_id_, data_tablets, data_ls_ids));
+    ASSERT_EQ(data_tablets.count(), data_ls_ids.count());
+    for (int64_t i = 0; i < data_tablets.count(); ++i) {
+      SCOPED_TRACE(data_tablets.at(i).id());
+      ObTabletHandle handle;
+      ASSERT_EQ(OB_SUCCESS, get_tablet_handle(data_ls_ids.at(i), data_tablets.at(i), handle));
+      ObTabletAsyncIndexRefreshInfo info;
+      mds::MdsWriter writer;
+      mds::TwoPhaseCommitState state;
+      SCN commit_version;
+      ASSERT_EQ(OB_SUCCESS, handle.get_obj()->mds_get_row_(
+          mds::DummyKey(), SCN::max_scn(), 1_s, false /* read_uncommitted */,
+          info, nullptr, writer, state, commit_version));
+      ASSERT_EQ(mds::TwoPhaseCommitState::ON_COMMIT, state);
+      ASSERT_TRUE(info.is_valid());
+      ASSERT_TRUE(info.has_async_index());
+      ASSERT_EQ(2, info.get_refresh_snapshots().count());
+      ASSERT_EQ(refresh_snapshot, info.get_refresh_snapshots().at(0));
+      ASSERT_EQ(publish_version, info.get_refresh_snapshots().at(1));
+      ASSERT_EQ(publish_version, commit_version.get_val_for_tx());
+    }
+  }
+  // 再读落盘记录，不能仅以 recovered 内存中的状态判断恢复成功。
+  ObDDLTaskRecord persisted;
+  ASSERT_EQ(OB_SUCCESS, ObDDLTaskRecordOperator::get_ddl_task_record(
+      tenant_id_, recovered.task_id_, *GCTX.sql_proxy_, allocator, persisted));
+  ObTableRedefinitionTask reread;
+  ASSERT_EQ(OB_SUCCESS, reread.init(persisted));
+  ASSERT_EQ(recovered.get_task_status(), reread.get_task_status());
+  ASSERT_EQ(refresh_snapshot, reread.alter_table_arg_.async_index_offline_refresh_snapshot_);
+
+  ASSERT_EQ(OB_SUCCESS, sys_sql("set ob_global_debug_sync='now signal offline_stage_resume'"));
+  ddl_thread.join();
+  ASSERT_EQ(OB_SUCCESS, ddl_ret.load());
+  ASSERT_EQ(OB_SUCCESS, SimpleServerHelper::select_int64(proxy,
+      "select count(*) as val from hybrid_search(TABLE t_offline_stage_recovery, "
+      "'{\"query\":{\"match\":{\"body\":\"recovery\"}}}')", original_id));
+  ASSERT_EQ(2, original_id);
+}
+
+TEST_F(ObAsyncIndexRefreshScnTest, offline_refresh_recovers_persisted_snapshot_before_rpc)
+{
+  ASSERT_NO_FATAL_FAILURE(check_offline_refresh_recovery(0));
+}
+
+TEST_F(ObAsyncIndexRefreshScnTest, offline_refresh_message_failure_reaches_fail)
+{
+  ASSERT_NO_FATAL_FAILURE(check_offline_refresh_recovery(3));
+}
+
+TEST_F(ObAsyncIndexRefreshScnTest, offline_refresh_recovers_after_first_partition)
+{
+  ASSERT_NO_FATAL_FAILURE(check_offline_refresh_recovery(1));
+}
+
+TEST_F(ObAsyncIndexRefreshScnTest, offline_refresh_recovers_committed_swap)
+{
+  ASSERT_NO_FATAL_FAILURE(check_offline_refresh_recovery(2));
+}
+
+// 使用已有测试专用 mock version 接口；不改持久化版本文件，结束前恢复。
+// 暂停在 TAKE_EFFECT 入口，从任务表检查是否已执行前置刷新。
+void ObAsyncIndexRefreshScnTest::check_offline_refresh_route(
+    const uint64_t version, const bool with_async_index)
+{
+  using namespace rootserver;
+  auto &proxy = get_curr_simple_server().get_sql_proxy2();
+  const auto sys_sql = [&](const char *sql) {
+    int64_t affected = 0;
+    return exec_write_sql_sys(sql, affected);
+  };
+  ASSERT_EQ(OB_SUCCESS, exe_sql("drop table if exists t_offline_version_route"));
+  ASSERT_EQ(OB_SUCCESS, exe_sql(with_async_index
+      ? "create table t_offline_version_route (id int primary key, body varchar(256), "
+        "async fulltext index ft(body)) organization heap"
+      : "create table t_offline_version_route (id int primary key, body varchar(256)) organization heap"));
+  if (with_async_index) {
+    ASSERT_EQ(OB_SUCCESS, exe_sql(
+        "alter table t_offline_version_route async_index_params='ASYNC_REFRESH_INTERVAL=-1'"));
+  }
+  ASSERT_EQ(OB_SUCCESS, exe_sql("insert into t_offline_version_route values (1, 'route token')"));
+  ObSqlString sql;
+  int64_t table_id = 0;
+  ASSERT_EQ(OB_SUCCESS, sql.assign_fmt(
+      "select table_id as val from oceanbase.__all_virtual_table where tenant_id=%lu "
+      "and table_name='t_offline_version_route' and data_table_id=0", tenant_id_));
+  ASSERT_EQ(OB_SUCCESS, SimpleServerHelper::select_int64(proxy, sql.ptr(), table_id));
+  const uint64_t previous_mock_version = ATOMIC_LOAD(&ODV_MGR.mock_data_version_);
+  auto &cluster_version = ObClusterVersion::get_instance();
+  const uint64_t previous_data_version = ATOMIC_LOAD(&cluster_version.data_version_);
+  const int64_t previous_sync_timeout = static_cast<int64_t>(GCONF.debug_sync_timeout);
+  std::thread ddl_thread;
+  std::atomic<int> ddl_ret(OB_EAGAIN);
+  std::atomic<bool> ddl_done(false);
+  DEFER({
+    EXPECT_EQ(OB_SUCCESS, sys_sql("set ob_global_debug_sync='now signal offline_route_resume'"));
+    EXPECT_EQ(OB_SUCCESS, sys_sql("set ob_global_debug_sync='reset'"));
+    if (ddl_thread.joinable()) { ddl_thread.join(); }
+    ODV_MGR.set_mock_data_version(previous_mock_version);
+    ATOMIC_STORE(&cluster_version.data_version_, previous_data_version);
+    ObSqlString restore_sql;
+    if (OB_SUCCESS == restore_sql.assign_fmt(
+        "alter system set debug_sync_timeout='%ldus'", previous_sync_timeout)) {
+      EXPECT_EQ(OB_SUCCESS, sys_sql(restore_sql.ptr()));
+    }
+    EXPECT_EQ(OB_SUCCESS, exe_sql("drop table if exists t_offline_version_route"));
+  });
+  ASSERT_EQ(OB_SUCCESS, sys_sql("alter system set debug_sync_timeout='120s'"));
+  const int64_t config_deadline = ObTimeUtility::current_time() + 10_s;
+  while (120_s != static_cast<int64_t>(GCONF.debug_sync_timeout)
+         && ObTimeUtility::current_time() < config_deadline) {
+    ob_usleep(10 * 1000);
+  }
+  ASSERT_EQ(120_s, static_cast<int64_t>(GCONF.debug_sync_timeout));
+  ASSERT_EQ(OB_SUCCESS, sys_sql("set ob_global_debug_sync='reset'"));
+  ASSERT_EQ(OB_SUCCESS, sys_sql("set ob_global_debug_sync="
+      "'BEFORE_TABLE_REDEFINITION_TASK_EFFECT signal offline_route_paused "
+      "wait_for offline_route_resume execute 1'"));
+  // simple_server 的非零 data_version_ 会让 getter 返回 cluster_version_，
+  // 临时改走 ODV_MGR 的测试接口，不改真实 cluster version 或版本文件。
+  ATOMIC_STORE(&cluster_version.data_version_, 0);
+  ODV_MGR.set_mock_data_version(version);
+  uint64_t effective_version = 0;
+  ASSERT_EQ(OB_SUCCESS, GET_MIN_DATA_VERSION(tenant_id_, effective_version));
+  ASSERT_EQ(version, effective_version);
+  ddl_thread = std::thread([&]() {
+    ddl_ret.store(exe_sql("alter table t_offline_version_route "
+                         "convert to character set utf8mb4 collate utf8mb4_bin"));
+    ddl_done.store(true);
+  });
+  const int64_t start = ObTimeUtility::current_time();
+  // 直接在测试线程等待，避免 sys 租户 SQL 的短超时先于同步点超时生效。
+  ObMalloc sync_allocator;
+  ObDSSessionActions control_actions;
+  ASSERT_EQ(OB_SUCCESS, control_actions.init(1024, sync_allocator));
+  ASSERT_EQ(OB_SUCCESS, GDS.add_debug_sync(
+      "now wait_for offline_route_paused timeout 120000000 execute 1",
+      false /* is_global */, control_actions));
+  ASSERT_LT(ObTimeUtility::current_time() - start, 110_s);
+  ASSERT_FALSE(ddl_done.load());
+  ObArenaAllocator allocator;
+  ObSEArray<ObDDLTaskRecord, 4> records;
+  ASSERT_EQ(OB_SUCCESS, ObDDLTaskRecordOperator::get_ddl_task_record_by_table_id(
+      tenant_id_, table_id, *GCTX.sql_proxy_, allocator, records));
+  ASSERT_EQ(1, records.count());
+  ASSERT_EQ(ObDDLTaskStatus::TAKE_EFFECT, records.at(0).task_status_);
+  ObTableRedefinitionTask task;
+  ASSERT_EQ(OB_SUCCESS, task.init(records.at(0)));
+  if (version >= DATA_VERSION_4_6_3_0 && with_async_index) {
+    ASSERT_GT(task.alter_table_arg_.async_index_offline_refresh_snapshot_, 0);
+  } else {
+    ASSERT_EQ(0, task.alter_table_arg_.async_index_offline_refresh_snapshot_);
+  }
+  ASSERT_EQ(OB_SUCCESS, sys_sql("set ob_global_debug_sync='now signal offline_route_resume'"));
+  ddl_thread.join();
+  ASSERT_EQ(OB_SUCCESS, ddl_ret.load());
+  if (with_async_index && version >= DATA_VERSION_4_6_3_0) {
+    int64_t count = 0;
+    ASSERT_EQ(OB_SUCCESS, SimpleServerHelper::select_int64(proxy,
+        "select count(*) as val from hybrid_search(TABLE t_offline_version_route, "
+        "'{\"query\":{\"match\":{\"body\":\"route\"}}}')", count));
+    ASSERT_EQ(1, count);
+  }
+}
+
+TEST_F(ObAsyncIndexRefreshScnTest, offline_refresh_version_and_membership_routes)
+{
+  const uint64_t versions[] = {DATA_VERSION_4_6_2_1, DATA_VERSION_4_6_3_0};
+  for (const uint64_t version : versions) {
+    SCOPED_TRACE(version);
+    if (version >= DATA_VERSION_4_6_3_0) {
+      ASSERT_NO_FATAL_FAILURE(check_offline_refresh_route(version, false));
+    }
+    ASSERT_NO_FATAL_FAILURE(check_offline_refresh_route(version, true));
+  }
+}
+#endif // ERRSIM
 
 } // namespace unittest
 } // namespace oceanbase
