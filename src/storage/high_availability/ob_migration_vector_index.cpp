@@ -2414,41 +2414,6 @@ int ObVecIndexFinishTask::enqueue_mem_sync_task_(
   return ret;
 }
 
-/**
- * Refresh the migrated adaptor's runtime async-query barrier after all segments are installed.
- * ObPluginVectorIndexUtils::refresh_async_query_scn() checks whether the data table has async indexes
- * synchronous indexes do not advance this barrier.
- *
- * @param adaptor_meta Metadata used to locate the migrated adaptor.
- * @return OB_SUCCESS on success; otherwise an error code.
- */
-int ObVecIndexFinishTask::refresh_async_query_scn_(
-    const ObMigrationVectorIndexAdaptorMeta &adaptor_meta)
-{
-  int ret = OB_SUCCESS;
-  share::ObPluginVectorIndexService *vector_index_service =
-      MTL(share::ObPluginVectorIndexService *);
-  share::ObPluginVectorIndexAdapterGuard adaptor_guard;
-  share::ObPluginVectorIndexAdaptor *adaptor = nullptr;
-  if (OB_ISNULL(ctx_) || OB_ISNULL(vector_index_service)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("[VEC MIG] invalid state when refreshing async query scn",
-             K(ret), KP(ctx_), KP(vector_index_service), K(adaptor_meta));
-  } else if (OB_FAIL(vector_index_service->get_adapter_inst_guard(
-                 ctx_->arg_.ls_id_, adaptor_meta.inc_tablet_id_, adaptor_guard))) {
-    LOG_WARN("[VEC MIG] failed to get migrated adaptor",
-             K(ret), K(adaptor_meta), "ls_id", ctx_->arg_.ls_id_);
-  } else if (OB_ISNULL(adaptor = adaptor_guard.get_adatper())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("[VEC MIG] migrated adaptor is null", K(ret), K(adaptor_meta));
-  } else if (OB_FAIL(share::ObPluginVectorIndexUtils::refresh_async_query_scn(
-                 ctx_->arg_.ls_id_, adaptor))) {
-    LOG_WARN("[VEC MIG] failed to refresh async query scn",
-             K(ret), K(adaptor_meta), KPC(adaptor));
-  }
-  return ret;
-}
-
 ERRSIM_POINT_DEF(EN_VEC_INDEX_MIGRATION_FINISH_TASK_FAILED);
 int ObVecIndexFinishTask::process()
 {
@@ -2490,10 +2455,7 @@ int ObVecIndexFinishTask::process()
     }
 #endif
     if (OB_SUCC(ret)) {
-      if (OB_FAIL(refresh_async_query_scn_(adaptor_meta))) {
-        LOG_WARN("[VEC MIG] failed to refresh migrated adaptor query barrier",
-                 K(ret), K(adaptor_meta));
-      } else if (OB_FAIL(enqueue_mem_sync_task_(adaptor_meta))) {
+      if (OB_FAIL(enqueue_mem_sync_task_(adaptor_meta))) {
         LOG_WARN("[MIG VEC] failed to enqueue mem sync task", K(ret));
       } else if (OB_TMP_FAIL(record_server_event_())) {
         LOG_WARN("[MIG VEC] failed to record server event", K(tmp_ret), K(ret));

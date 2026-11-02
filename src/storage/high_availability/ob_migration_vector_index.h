@@ -361,8 +361,6 @@ public:
   VIRTUAL_TO_STRING_KV(K("ObVecIndexFinishTask"), KP(this));
 
 private:
-  // Refresh the runtime async-query barrier after all migrated segments are installed.
-  int refresh_async_query_scn_(const ObMigrationVectorIndexAdaptorMeta &adaptor_meta);
   int enqueue_mem_sync_task_(const ObMigrationVectorIndexAdaptorMeta &adaptor_meta);
   int record_server_event_();
   ObVectorIndexAdaptorMigrationDag *get_adaptor_dag_() const {
