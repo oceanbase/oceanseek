@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL_DAS
 #include "ob_das_bitmap_op.h"
+#include "lib/utility/ob_tracepoint.h"
 #include "sql/das/search/ob_das_async_segment_merge_op.h"
 #include "sql/das/search/ob_das_async_scalar_range_op.h"
 
@@ -12,6 +13,41 @@ namespace oceanbase
 {
 namespace sql
 {
+ERRSIM_POINT_DEF(ERRSIM_DISABLE_FLAT_FILTER_BITMAP, "Keep filter bitmaps in the chunked layout");
+
+int ObFastBitmap::init_from_source(ObIDASSearchOp &source, int64_t fallback_estimate)
+{
+  int ret = OB_SUCCESS;
+  bool available = false;
+  uint64_t lo = UINT64_MAX;
+  uint64_t hi = 0;
+  int64_t estimated_count = 0;
+  if (0 == ERRSIM_DISABLE_FLAT_FILTER_BITMAP
+      && OB_FAIL(source.get_bitmap_input_range(available, lo, hi, estimated_count))) {
+    LOG_WARN("failed to get source bounds for bitmap", K(ret));
+  } else if (!available && !is_flat() && nullptr != chunk_buf_) {
+    // Preserve chunk storage on rescan when the source has no new range proof.
+    reuse();
+  } else if (OB_FAIL(init_with_range(available ? estimated_count : std::max<int64_t>(0, fallback_estimate),
+                                   available, lo, hi, std::max<int64_t>(0, fallback_estimate)))) {
+    LOG_WARN("failed to initialize bitmap layout", K(ret), K(available), K(lo), K(hi));
+  }
+  return ret;
+}
+
+int ObDASBitmapOp::get_bitmap_input_range(
+    bool &available, uint64_t &lo, uint64_t &hi, int64_t &estimated_count)
+{
+  int ret = OB_SUCCESS;
+  available = false;
+  lo = UINT64_MAX;
+  hi = 0;
+  estimated_count = 0;
+  if (OB_ISNULL(provider_) && OB_NOT_NULL(input_op_)) {
+    ret = input_op_->get_bitmap_input_range(available, lo, hi, estimated_count);
+  }
+  return ret;
+}
 
 int ObDASBitmapOpParam::get_children_ops(ObIArray<ObIDASSearchOp *> &children) const
 {
@@ -35,6 +71,15 @@ ObFastBitmap::~ObFastBitmap()
 
 void ObFastBitmap::reset()
 {
+  if (nullptr != flat_words_) {
+    flat_words_ = nullptr;
+  }
+  flat_allocator_.reset();
+  flat_capacity_ = 0;
+  flat_base_word_ = 0;
+  flat_word_count_ = 0;
+  flat_lo_ = 0;
+  flat_hi_ = 0;
   chunks_.reset();
   cardinality_ = 0;
   stats_dirty_ = false;
@@ -49,6 +94,9 @@ void ObFastBitmap::reset()
 
 void ObFastBitmap::reuse()
 {
+  if (is_flat()) {
+    MEMSET(flat_words_, 0, flat_word_count_ * sizeof(uint64_t));
+  }
   chunks_.reuse();
   cardinality_ = 0;
   stats_dirty_ = false;
@@ -61,7 +109,6 @@ void ObFastBitmap::reuse()
 int ObFastBitmap::init(int64_t max_value_count)
 {
   int ret = common::OB_SUCCESS;
-  chunks_.set_attr(common::ObMemAttr(MTL_ID(), "FBitmapChunks"));
   if (max_value_count < 0) {
     ret = common::OB_INVALID_ARGUMENT;
     LOG_WARN("max_value_count is less than 0", K(ret), K(max_value_count));
@@ -81,6 +128,128 @@ int ObFastBitmap::init(int64_t max_value_count)
         chunk_buf_count_ = alloc_chunks;
       }
     }
+  }
+  return ret;
+}
+
+int ObFastBitmap::init_with_range(
+    int64_t estimated_count, bool available, uint64_t lo, uint64_t hi,
+    int64_t chunk_reserve_estimate)
+{
+  int ret = OB_SUCCESS;
+  // Exclude the iterator sentinel; calculate in words to avoid hi + 1 overflow.
+  const bool valid_range = available && lo <= hi && hi != UINT64_MAX;
+  const uint64_t words = valid_range ? (hi >> WORD_SHIFT) - (lo >> WORD_SHIFT) + 1 : 0;
+  if (estimated_count < 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    // Keep the chunk pool across rescans and layout switches. Its parent
+    // allocator may be an arena whose free() is a no-op.
+    reuse();
+    if (!valid_range || words > MAX_FLAT_BYTES / sizeof(uint64_t)
+        || static_cast<uint64_t>(estimated_count) < (hi - lo) / 16 + 1) {
+      flat_allocator_.reset();
+      flat_words_ = nullptr;
+      flat_capacity_ = 0;
+      flat_word_count_ = 0;
+      flat_base_word_ = 0;
+      flat_lo_ = 0;
+      flat_hi_ = 0;
+      if (nullptr == chunk_buf_) {
+        // Sparse matches can still span many chunks. Retain the original
+        // reservation instead of sizing the chunk pool by filter cardinality.
+        ret = init(chunk_reserve_estimate >= 0 ? chunk_reserve_estimate : estimated_count);
+      }
+    } else {
+      if (words > flat_capacity_) {
+        flat_allocator_.reset();
+        flat_words_ = nullptr;
+        flat_capacity_ = 0;
+        flat_word_count_ = 0;
+        if (OB_ISNULL(flat_words_ = static_cast<uint64_t*>(
+                         flat_allocator_.alloc(words * sizeof(uint64_t))))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("failed to allocate flat bitmap", K(ret), K(words));
+        } else {
+          flat_capacity_ = words;
+        }
+      }
+      if (OB_SUCC(ret)) {
+        flat_base_word_ = lo >> WORD_SHIFT;
+        flat_word_count_ = words;
+        flat_lo_ = lo;
+        flat_hi_ = hi;
+        MEMSET(flat_words_, 0, words * sizeof(uint64_t));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObFastBitmap::fallback_to_chunks()
+{
+  int ret = OB_SUCCESS;
+  // Keep the flat array authoritative until all populated words are copied.
+  for (uint64_t i = 0; OB_SUCC(ret) && i < flat_word_count_; ++i) {
+    if (0 != flat_words_[i]) {
+      const uint64_t global_word = flat_base_word_ + i;
+      ChunkInfo *chunk = nullptr;
+      if (OB_FAIL(alloc_chunk(global_word >> (CHUNK_SHIFT - WORD_SHIFT), chunk))) {
+        LOG_WARN("failed to migrate flat bitmap", K(ret), K(global_word));
+      } else {
+        chunk->chunk_[global_word & (WORDS_PER_CHUNK - 1)] = flat_words_[i];
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    chunks_.reuse();
+    info_allocator_.reset();
+    chunk_buf_idx_ = 0;
+  } else {
+    flat_allocator_.reset();
+    flat_words_ = nullptr;
+    flat_capacity_ = 0;
+    flat_word_count_ = 0;
+    flat_base_word_ = 0;
+    stats_dirty_ = true;
+    finalize();
+  }
+  return ret;
+}
+
+int ObFastBitmap::add_flat_batch(const uint64_t *vals, int64_t count)
+{
+  int ret = OB_SUCCESS;
+  uint64_t min_val = vals[0];
+  uint64_t max_val = vals[0];
+  int64_t same_word_count = 0;
+  for (int64_t i = 1; i < count; ++i) {
+    min_val = std::min(min_val, vals[i]);
+    max_val = std::max(max_val, vals[i]);
+    same_word_count += (vals[i - 1] >> WORD_SHIFT) == (vals[i] >> WORD_SHIFT);
+  }
+  if (min_val < flat_lo_ || max_val > flat_hi_) {
+    if (OB_FAIL(fallback_to_chunks())) {
+      LOG_WARN("failed to fall back to chunked bitmap", K(ret));
+    } else if (OB_FAIL(add_batch(vals, count))) {
+      LOG_WARN("failed to insert batch after bitmap migration", K(ret));
+    }
+  } else if (count >= 32 && same_word_count < count / 2) {
+    for (int64_t i = 0; i < count; ++i) {
+      flat_words_[(vals[i] >> WORD_SHIFT) - flat_base_word_] |= 1ULL << (vals[i] & (WORD_BITS - 1));
+    }
+    stats_dirty_ = true;
+  } else {
+    int64_t i = 0;
+    while (i < count) {
+      const uint64_t word_idx = vals[i] >> WORD_SHIFT;
+      uint64_t mask = 0;
+      do {
+        mask |= 1ULL << (vals[i++] & (WORD_BITS - 1));
+      } while (i < count && (vals[i] >> WORD_SHIFT) == word_idx);
+      flat_words_[word_idx - flat_base_word_] |= mask;
+    }
+    stats_dirty_ = true;
   }
   return ret;
 }
@@ -120,6 +289,27 @@ int ObFastBitmap::alloc_chunk(uint64_t chunk_idx, ChunkInfo *&chunk_info)
 int ObFastBitmap::add(uint64_t val)
 {
   int ret = OB_SUCCESS;
+  if (is_flat() && (val < flat_lo_ || val > flat_hi_)) {
+    ret = fallback_to_chunks();
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to migrate bitmap before insertion", K(ret));
+  } else if (is_flat()) {
+    uint64_t &word = flat_words_[(val >> WORD_SHIFT) - flat_base_word_];
+    const uint64_t mask = 1ULL << (val & (WORD_BITS - 1));
+    if (0 == (word & mask)) {
+      word |= mask;
+      ++cardinality_;
+    }
+  } else {
+    ret = add_chunked(val);
+  }
+  return ret;
+}
+
+int ObFastBitmap::add_chunked(uint64_t val)
+{
+  int ret = OB_SUCCESS;
   const uint64_t chunk_idx = val >> CHUNK_SHIFT;
   const uint16_t chunk_offset = val & CHUNK_MASK;
   ChunkInfo *chunk_info = nullptr;
@@ -154,6 +344,8 @@ int ObFastBitmap::add_batch(const uint64_t *vals, const int64_t count)
   if (OB_UNLIKELY(count < 0 || OB_ISNULL(vals))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid batch values", K(ret), KP(vals), K(count));
+  } else if (count > 0 && is_flat()) {
+    ret = add_flat_batch(vals, count);
   } else if (count > 0) {
     uint64_t max_val = vals[0];
     int64_t same_word_count = 0;
@@ -222,7 +414,13 @@ int ObFastBitmap::add_batch(const uint64_t *vals, const int64_t count)
 
 void ObFastBitmap::finalize()
 {
-  if (stats_dirty_) {
+  if (stats_dirty_ && is_flat()) {
+    cardinality_ = 0;
+    for (uint64_t i = 0; i < flat_word_count_; ++i) {
+      cardinality_ += __builtin_popcountll(flat_words_[i]);
+    }
+    stats_dirty_ = false;
+  } else if (stats_dirty_) {
     int64_t new_cardinality = 0;
     for (int64_t chunk_idx = 0; chunk_idx < chunks_.count(); ++chunk_idx) {
       ChunkInfo *chunk_info = chunks_.at(chunk_idx);
@@ -259,12 +457,20 @@ void ObFastBitmap::finalize()
 
 uint64_t ObFastBitmap::get_word(const uint64_t global_word_idx) const
 {
-  const uint64_t chunk_idx = global_word_idx >> (CHUNK_SHIFT - WORD_SHIFT);
-  const uint64_t word_idx = global_word_idx & (WORDS_PER_CHUNK - 1);
-  const ChunkInfo *chunk_info = chunk_idx < static_cast<uint64_t>(chunks_.count())
-      ? chunks_.at(static_cast<int64_t>(chunk_idx))
-      : nullptr;
-  return OB_NOT_NULL(chunk_info) ? chunk_info->chunk_[word_idx] : 0;
+  uint64_t word = 0;
+  if (is_flat()) {
+    if (global_word_idx >= flat_base_word_ && global_word_idx - flat_base_word_ < flat_word_count_) {
+      word = flat_words_[global_word_idx - flat_base_word_];
+    }
+  } else {
+    const uint64_t chunk_idx = global_word_idx >> (CHUNK_SHIFT - WORD_SHIFT);
+    const uint64_t word_idx = global_word_idx & (WORDS_PER_CHUNK - 1);
+    const ChunkInfo *chunk_info = chunk_idx < static_cast<uint64_t>(chunks_.count())
+        ? chunks_.at(static_cast<int64_t>(chunk_idx))
+        : nullptr;
+    word = OB_NOT_NULL(chunk_info) ? chunk_info->chunk_[word_idx] : 0;
+  }
+  return word;
 }
 
 int ObFastBitmap::copy_range_to_words(
@@ -359,6 +565,27 @@ int ObFastBitmap::Iterator::advance_to(const uint64_t target, uint64_t &val)
   if (OB_UNLIKELY(!is_valid())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid bitmap", K(ret), KP(bm_));
+  } else if (bm_->is_flat()) {
+    if (cur_val_ != UINT64_MAX && target <= cur_val_) {
+      val = cur_val_;
+    } else {
+      const uint64_t first_word = std::max(target >> WORD_SHIFT, bm_->flat_base_word_);
+      bool found = false;
+      for (uint64_t i = first_word; !found && i - bm_->flat_base_word_ < bm_->flat_word_count_; ++i) {
+        uint64_t word = bm_->flat_words_[i - bm_->flat_base_word_];
+        if (i == (target >> WORD_SHIFT)) {
+          word &= ~0ULL << (target & (WORD_BITS - 1));
+        }
+        if (0 != word) {
+          val = (i << WORD_SHIFT) + __builtin_ctzll(word);
+          cur_val_ = val;
+          found = true;
+        }
+      }
+      if (!found) {
+        ret = OB_ITER_END;
+      }
+    }
   } else {
     int64_t start_chunk = target >> ObFastBitmap::CHUNK_SHIFT;
     uint16_t target_chunk_offset = target & ObFastBitmap::CHUNK_MASK;
@@ -454,6 +681,32 @@ int ObFastBitmap::Iterator::drain_until(
   } else if (OB_UNLIKELY(capacity <= 0 || OB_ISNULL(out_ids))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid bitmap drain arguments", K(ret), K(capacity), KP(out_ids));
+  } else if (bm_->is_flat()) {
+    const uint64_t start_val = cur_val_ + 1;
+    const uint64_t first_word = std::max(start_val >> WORD_SHIFT, bm_->flat_base_word_);
+    bool finished = false;
+    for (uint64_t i = first_word; !finished && i - bm_->flat_base_word_ < bm_->flat_word_count_; ++i) {
+      uint64_t word = bm_->flat_words_[i - bm_->flat_base_word_];
+      if (i == (start_val >> WORD_SHIFT)) {
+        word &= ~0ULL << (start_val & (WORD_BITS - 1));
+      }
+      while (!finished && 0 != word) {
+        const uint64_t val = (i << WORD_SHIFT) + __builtin_ctzll(word);
+        cur_val_ = val;
+        if (val > boundary) {
+          next_id_after = val;
+          state = DRAIN_BOUNDARY_REACHED;
+          finished = true;
+        } else {
+          out_ids[drained_count++] = val;
+          word &= word - 1;
+          if (drained_count == capacity) {
+            state = DRAIN_BATCH_FULL;
+            finished = true;
+          }
+        }
+      }
+    }
   } else {
     const uint64_t start_val = cur_val_ + 1;
     const uint64_t start_chunk_idx = start_val >> ObFastBitmap::CHUNK_SHIFT;
@@ -606,7 +859,7 @@ int ObDASBitmapOp::do_open()
   } else if (OB_ISNULL(bitmap_ = OB_NEWx(ObFastBitmap, &ctx_allocator(), ctx_allocator()))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate fast bitmap", K(ret));
-  } else if (OB_FAIL(bitmap_->init(search_ctx_.get_row_count().cost()))) {
+  } else if (OB_FAIL(bitmap_->init_from_source(*input_op_, search_ctx_.get_row_count().cost()))) {
     LOG_WARN("failed to init bitmap", K(ret));
   } else if (OB_FAIL(bitmap_iter_.init(bitmap_))) {
     LOG_WARN("failed to init bitmap iterator", K(ret));
@@ -647,7 +900,7 @@ int ObDASBitmapOp::do_rescan()
     LOG_WARN("failed to rescan bitmap input op", K(ret));
   } else {
     if (OB_NOT_NULL(bitmap_)) {
-      bitmap_->reuse();
+      ret = bitmap_->init_from_source(*input_op_, search_ctx_.get_row_count().cost());
       bitmap_iter_.reuse();
     }
     exhausted_ = true;
@@ -674,7 +927,7 @@ int ObDASBitmapOp::do_rescan_segment(const common::ObNewVersionRange &range)
     LOG_WARN("failed to rescan bitmap child segment", K(ret), K(range));
   } else {
     if (OB_NOT_NULL(bitmap_)) {
-      bitmap_->reuse();
+      ret = bitmap_->init_from_source(*input_op_, search_ctx_.get_row_count().cost());
       bitmap_iter_.reuse();
     }
     exhausted_ = true;
@@ -1245,7 +1498,7 @@ int ObDASBitmapOp::build_shared_bitmap(common::ObIAllocator &bitmap_alloc, ObFas
     if (OB_ISNULL(bm)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("failed to allocate shared bitmap", K(ret));
-    } else if (OB_FAIL(bm->init(search_ctx_.get_row_count().cost()))) {
+    } else if (OB_FAIL(bm->init_from_source(*input_op_, search_ctx_.get_row_count().cost()))) {
       LOG_WARN("failed to init shared bitmap", K(ret));
     } else if (OB_FAIL(fill_bitmap_from_scan(*bm))) {
       LOG_WARN("failed to fill shared bitmap from scan", K(ret));

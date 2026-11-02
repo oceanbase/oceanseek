@@ -101,6 +101,8 @@ public:
     op_type_ = DAS_SEARCH_OP_ASYNC_SCALAR_ROR;
   }
   virtual ~ObDASAsyncScalarRorOp() {}
+  int get_bitmap_input_range(bool &available, uint64_t &lo, uint64_t &hi,
+                             int64_t &estimated_count) override;
 
   bool supports_direct_rowid_drain() const override
   {
@@ -248,6 +250,11 @@ public:
       direct_single_cursor_()
   {}
   ~ObDASAsyncScalarRorUnionOp() override {}
+  int get_bitmap_input_range(bool &available, uint64_t &lo, uint64_t &hi,
+                             int64_t &estimated_count) override
+  {
+    return collect_bitmap_input_range(children_cnt_, available, lo, hi, estimated_count);
+  }
 
   bool supports_direct_rowid_drain() const override
   { return direct_drain_enabled_; }

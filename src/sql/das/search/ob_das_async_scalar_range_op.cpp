@@ -287,6 +287,33 @@ void ObDASAsyncScalarRangeOp::close_range_iter()
   range_iter_allocator_.reuse();
 }
 
+int ObDASAsyncScalarRangeOp::get_bitmap_input_range(
+    bool &available, uint64_t &lo, uint64_t &hi, int64_t &estimated_count)
+{
+  int ret = OB_SUCCESS;
+  available = false;
+  lo = UINT64_MAX;
+  hi = 0;
+  estimated_count = 0;
+  const ObAsyncIndexPartitionSegCtx *partition = search_ctx_.get_current_async_partition();
+  if (DAS_SCOPE_BASE != scope_ || DAS_ROWID_TYPE_UINT64 != get_rowid_type()
+      || search_ctx_.is_logical_table() || !version_range_.is_valid()
+      || OB_ISNULL(partition)) {
+    // No proven physical input domain: keep the existing chunked layout.
+  } else if (OB_FAIL(partition->get_segment_rowid_range(
+                 index_table_id_, version_range_, available, lo, hi))) {
+    LOG_WARN("failed to get bitmap input domain", K(ret), K_(index_table_id));
+  } else if (available && OB_NOT_NULL(scalar_rtdef_)) {
+    ObDASSearchCost cost;
+    if (OB_FAIL(scalar_rtdef_->get_cost(search_ctx_, cost))) {
+      LOG_WARN("failed to estimate bitmap density", K(ret));
+    } else if (cost.is_valid()) {
+      estimated_count = cost.cost();
+    }
+  }
+  return ret;
+}
+
 int ObDASAsyncScalarRangeOp::do_open()
 {
   int ret = OB_SUCCESS;

@@ -15,6 +15,43 @@ namespace oceanbase
 {
 namespace sql
 {
+int ObIDASSearchOp::collect_bitmap_input_range(
+    int64_t child_count, bool &available, uint64_t &lo, uint64_t &hi, int64_t &estimated_count)
+{
+  int ret = OB_SUCCESS;
+  available = false;
+  lo = UINT64_MAX;
+  hi = 0;
+  estimated_count = 0;
+  if (child_count < 0 || child_count > children_cnt_) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (DAS_SCOPE_BASE == scope_ && DAS_ROWID_TYPE_UINT64 == get_rowid_type()
+             && !search_ctx_.is_logical_table() && child_count > 0) {
+    available = true;
+    for (int64_t i = 0; OB_SUCC(ret) && available && i < child_count; ++i) {
+      bool child_available = false;
+      uint64_t child_lo = UINT64_MAX;
+      uint64_t child_hi = 0;
+      int64_t child_estimate = 0;
+      if (OB_ISNULL(children_[i])) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(children_[i]->get_bitmap_input_range(
+                     child_available, child_lo, child_hi, child_estimate))) {
+        LOG_WARN("failed to collect bitmap input range", K(ret), K(i));
+      } else if (!child_available) {
+        available = false;
+      } else if (child_lo <= child_hi) {
+        lo = std::min(lo, child_lo);
+        hi = std::max(hi, child_hi);
+        // Cloned Segment/term leaves may share one scalar RtDef estimate.
+        // Do not multiply that estimate by the number of consumers.
+        estimated_count = std::max(estimated_count, child_estimate);
+      }
+    }
+  }
+  return ret;
+}
+
 int UInt64RowIDStore::init(int64_t capacity)
 {
   int ret = OB_SUCCESS;

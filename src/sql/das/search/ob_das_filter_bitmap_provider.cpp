@@ -45,7 +45,7 @@ int ObDASFilterBitmapProvider::allocate_bitmap(
   if (OB_ISNULL(bitmap)) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate filter provider bitmap", K(ret), K_(provider_id));
-  } else if (OB_FAIL(bitmap->init(estimated_row_count))) {
+  } else if (OB_FAIL(bitmap->init_from_source(*source_op_, estimated_row_count))) {
     LOG_WARN("failed to initialize filter provider bitmap", K(ret), K_(provider_id));
     bitmap->~ObFastBitmap();
     allocator.free(bitmap);
@@ -197,12 +197,12 @@ int ObDASFilterBitmapProvider::prepare(const bool is_rescan)
     } else {
       owns_bitmap_ = true;
       if (is_rescan) {
-        bitmap_->reuse();
+        ret = bitmap_->init_from_source(*source_op_, search_ctx_.get_row_count().cost());
       }
-      if (OB_FAIL(fill_bitmap(*source_op_, *bitmap_))) {
+      if (OB_SUCC(ret) && OB_FAIL(fill_bitmap(*source_op_, *bitmap_))) {
         LOG_WARN("failed to materialize query filter provider", K(ret),
                  K_(provider_id), K(is_rescan));
-      } else {
+      } else if (OB_SUCC(ret)) {
         prepared_ = true;
         rescan_pending_ = false;
       }

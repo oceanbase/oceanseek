@@ -26,6 +26,7 @@ class ObFastBitmap
   static const uint64_t WORD_BITS = 64;
   static const uint64_t WORDS_PER_CHUNK = CHUNK_SIZE / WORD_BITS;
   static const int64_t MAX_BITMAP_RESERVED_MEM_SIZE = 10 * 1024 * 1024; // 10MB
+  static const uint64_t MAX_FLAT_BYTES = 16 * 1024 * 1024;
 
   class ChunkInfo
   {
@@ -85,12 +86,20 @@ class ObFastBitmap
   ObFastBitmap(common::ObIAllocator &allocator)
     : cardinality_(0),
       stats_dirty_(false),
-      chunks_(),
+      chunks_(common::OB_MALLOC_NORMAL_BLOCK_SIZE,
+              common::ModulePageAllocator(common::ObMemAttr(MTL_ID(), "FBitmapChunks"))),
       allocator_(allocator),
       info_allocator_(common::ObMemAttr(MTL_ID(), "DASFastBitmap")),
+      flat_allocator_(common::ObMemAttr(MTL_ID(), "DASFlatBitmap")),
       chunk_buf_(nullptr),
       chunk_buf_count_(0),
-      chunk_buf_idx_(0)
+      chunk_buf_idx_(0),
+      flat_words_(nullptr),
+      flat_capacity_(0),
+      flat_base_word_(0),
+      flat_word_count_(0),
+      flat_lo_(0),
+      flat_hi_(0)
   { }
 
   ~ObFastBitmap();
@@ -103,6 +112,13 @@ class ObFastBitmap
     return cardinality_;
   }
   int init(int64_t max_value_count);
+  // Bounds describe the complete input domain, not an estimated row count.
+  // Keep the chunk reservation estimate separate from flat density estimation.
+  // A negative reservation estimate preserves the four-argument initialization policy.
+  int init_with_range(int64_t estimated_count, bool available, uint64_t lo, uint64_t hi,
+                      int64_t chunk_reserve_estimate = -1);
+  bool is_flat() const { return nullptr != flat_words_; }
+  int init_from_source(ObIDASSearchOp &source, int64_t fallback_estimate);
   int add(uint64_t val);
   // add_batch() only ensures chunks and sets bits. Call finalize() before
   // reading statistics or iterating over the bitmap.
@@ -122,6 +138,9 @@ class ObFastBitmap
  private:
   int alloc_chunk(uint64_t chunk_idx, ChunkInfo *&chunk_info);
   uint64_t get_word(const uint64_t global_word_idx) const;
+  int fallback_to_chunks();
+  int add_flat_batch(const uint64_t *vals, int64_t count);
+  int add_chunked(uint64_t val);
 
  private:
   int64_t cardinality_;
@@ -129,9 +148,17 @@ class ObFastBitmap
   ObSEArray<ChunkInfo*, 32> chunks_;
   common::ObIAllocator &allocator_;
   common::ObArenaAllocator info_allocator_;
+  // Own the flat allocation: the caller's arena may not reclaim individual frees.
+  common::ObArenaAllocator flat_allocator_;
   ChunkInfo *chunk_buf_;
   int64_t chunk_buf_count_;
   int64_t chunk_buf_idx_;
+  uint64_t *flat_words_;
+  uint64_t flat_capacity_;
+  uint64_t flat_base_word_;
+  uint64_t flat_word_count_;
+  uint64_t flat_lo_;
+  uint64_t flat_hi_;
 };
 
 // Synchronously transfers producer-owned RowID views into an idempotent bitmap.
@@ -215,6 +242,8 @@ public:
     boost_weight_(0.0)
   { }
   virtual ~ObDASBitmapOp() {}
+  int get_bitmap_input_range(bool &available, uint64_t &lo, uint64_t &hi,
+                             int64_t &estimated_count) override;
 
   // Must be called before do_open(). Caller retains ownership of bm.
   int set_external_bitmap(ObFastBitmap *bm);

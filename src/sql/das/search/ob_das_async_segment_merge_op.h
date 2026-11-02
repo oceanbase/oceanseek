@@ -161,6 +161,11 @@ public:
     op_type_ = DAS_SEARCH_OP_ASYNC_SEGMENT_MERGE;
   }
   virtual ~ObDASAsyncSegmentMergeOp() {}
+  int get_bitmap_input_range(bool &available, uint64_t &lo, uint64_t &hi,
+                             int64_t &estimated_count) override
+  {
+    return collect_bitmap_input_range(active_segment_cnt_, available, lo, hi, estimated_count);
+  }
 
   const common::ObIArray<ObExpr *> *get_rowid_output_exprs() const override
   {

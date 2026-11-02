@@ -351,6 +351,19 @@ public:
 
   OB_INLINE void set_op_id(const int64_t id) { op_id_ = id; }
   OB_INLINE int64_t get_op_id() const { return op_id_; }
+  // Optional conservative bounds for bitmap allocation only. Never clips rows.
+  virtual int get_bitmap_input_range(bool &available, uint64_t &lo, uint64_t &hi,
+                                     int64_t &estimated_count)
+  {
+    available = false;
+    lo = UINT64_MAX;
+    hi = 0;
+    estimated_count = 0;
+    return OB_SUCCESS;
+  }
+  // Only used by operators whose output IDs are drawn from these children.
+  int collect_bitmap_input_range(int64_t child_count, bool &available,
+                                uint64_t &lo, uint64_t &hi, int64_t &estimated_count);
   OB_INLINE ObIDASSearchOp **get_children() { return children_; }
   OB_INLINE int64_t get_children_cnt() const { return children_cnt_; }
   OB_INLINE ObDASScopeId get_scope() const { return scope_; }

@@ -6487,6 +6487,373 @@ TEST(ObFastBitmapAdaptiveTest, nonuniform_word_locality)
   }
 }
 
+TEST(ObFastBitmapFlatTest, source_fallback_preserves_chunk_reservation)
+{
+  share::ObTenantEnv::get_tenant_local()->id_ = OB_SERVER_TENANT_ID;
+  ObArenaAllocator alloc("FlatReserveTest");
+  ObDASScanOp scan_op(alloc);
+  ObDASSearchCtx search_ctx(alloc, scan_op);
+  class InputRangeOp : public TestEstimatedWorkSearchOp
+  {
+  public:
+    explicit InputRangeOp(ObDASSearchCtx &ctx)
+      : TestEstimatedWorkSearchOp(ctx, 0), count_(8843), hi_(36113228), available_(true) {}
+    int get_bitmap_input_range(bool &available, uint64_t &lo,
+                               uint64_t &hi, int64_t &estimated_count) override
+    {
+      available = available_;
+      lo = 1;
+      hi = hi_;
+      estimated_count = count_;
+      return OB_SUCCESS;
+    }
+    int64_t count_;
+    uint64_t hi_;
+    bool available_;
+  } source(search_ctx);
+  const int64_t fallback_estimate = 8841823;
+  for (int64_t scenario = 0; scenario < 3; ++scenario) {
+    // Sparse input, unknown domain, and an oversized flat array all use chunks.
+    source.available_ = scenario != 1;
+    source.hi_ = scenario == 2 ? ObFastBitmap::MAX_FLAT_BYTES * 8 + 65536 : 36113228;
+    source.count_ = scenario == 2 ? source.hi_ : 8843;
+    ObFastBitmap bitmap(alloc);
+    ASSERT_EQ(OB_SUCCESS, bitmap.init_from_source(source, fallback_estimate));
+    ASSERT_FALSE(bitmap.is_flat());
+    ASSERT_EQ(135, bitmap.chunk_buf_count_);
+    std::vector<uint64_t> values;
+    for (uint64_t i = 0; i < 142; ++i) {
+      values.push_back((i + 1) * ObFastBitmap::CHUNK_SIZE);
+    }
+    ASSERT_EQ(OB_SUCCESS, bitmap.add_batch(values.data(), values.size()));
+    bitmap.finalize();
+    ASSERT_EQ(142, bitmap.cardinality());
+    ASSERT_EQ(135, bitmap.chunk_buf_idx_);
+  }
+  // Preserving chunk reservation must not force sparse input into the flat layout
+  // or prevent dense input from using it.
+  source.available_ = true;
+  source.hi_ = 36113228;
+  source.count_ = fallback_estimate;
+  ObFastBitmap dense_bitmap(alloc);
+  ASSERT_EQ(OB_SUCCESS, dense_bitmap.init_from_source(source, fallback_estimate));
+  ASSERT_TRUE(dense_bitmap.is_flat());
+}
+
+TEST(ObFastBitmapFlatTest, source_range_changes_preserve_results_and_reservation)
+{
+  share::ObTenantEnv::get_tenant_local()->id_ = OB_SERVER_TENANT_ID;
+  ObArenaAllocator alloc("FlatRescanTest");
+  ObDASScanOp scan_op(alloc);
+  ObDASSearchCtx search_ctx(alloc, scan_op);
+  class ChangingRangeOp : public TestEstimatedWorkSearchOp
+  {
+  public:
+    explicit ChangingRangeOp(ObDASSearchCtx &ctx)
+      : TestEstimatedWorkSearchOp(ctx, 0), available_(true), lo_(0), hi_(0), estimate_(0) {}
+    int get_bitmap_input_range(bool &available, uint64_t &lo,
+                               uint64_t &hi, int64_t &estimate) override
+    {
+      available = available_;
+      lo = lo_;
+      hi = hi_;
+      estimate = estimate_;
+      return OB_SUCCESS;
+    }
+    bool available_;
+    uint64_t lo_;
+    uint64_t hi_;
+    int64_t estimate_;
+  } source(search_ctx);
+  ObFastBitmap bitmap(alloc);
+  const int64_t table_estimate = 8841823;
+  for (int round = 0; round < 3; ++round) {
+    for (int scenario = 0; scenario < 5; ++scenario) {
+      // Dense low/high domains, sparse domain, unknown domain, known empty.
+      source.available_ = scenario != 3;
+      source.lo_ = scenario == 1 ? (1ULL << 24) : 0;
+      source.hi_ = source.lo_ + (scenario == 2 ? 4000000 : 127);
+      source.estimate_ = scenario == 2 ? 2 : 128;
+      if (scenario == 4) {
+        source.lo_ = UINT64_MAX;
+        source.hi_ = 0;
+        source.estimate_ = 0;
+      }
+      ASSERT_EQ(OB_SUCCESS, bitmap.init_from_source(source, table_estimate));
+      ASSERT_EQ(scenario < 2, bitmap.is_flat());
+      ASSERT_EQ(0, bitmap.cardinality());
+      ObFastBitmap::Iterator iter;
+      ASSERT_EQ(OB_SUCCESS, iter.init(&bitmap));
+      uint64_t id = 0;
+      ASSERT_EQ(OB_ITER_END, iter.next_id(id));
+      if (scenario >= 2) {
+        ASSERT_EQ(135, bitmap.chunk_buf_count_);
+      }
+      if (scenario != 4) {
+        const uint64_t ids[] = {source.lo_ + 1, source.hi_, source.lo_ + 1};
+        ASSERT_EQ(OB_SUCCESS, bitmap.add_batch(ids, 3));
+        bitmap.finalize();
+        ASSERT_EQ(2, bitmap.cardinality());
+        ASSERT_EQ(OB_SUCCESS, iter.init(&bitmap));
+        ASSERT_EQ(OB_SUCCESS, iter.next_id(id));
+        ASSERT_EQ(ids[0], id);
+        ASSERT_EQ(OB_SUCCESS, iter.next_id(id));
+        ASSERT_EQ(ids[1], id);
+        ASSERT_EQ(OB_ITER_END, iter.next_id(id));
+      }
+    }
+  }
+}
+
+TEST(ObFastBitmapFlatTest, failed_chunk_migration_retains_complete_flat_bitmap)
+{
+  share::ObTenantEnv::get_tenant_local()->id_ = OB_SERVER_TENANT_ID;
+  class FailingChunkArrayAllocator : public ObMalloc
+  {
+  public:
+    FailingChunkArrayAllocator()
+      : ObMalloc(ObMemAttr(MTL_ID(), "FlatFailureTest")), fail_(true), attempts_(0) {}
+    void *alloc(const int64_t size, const ObMemAttr &attr) override
+    {
+      ++attempts_;
+      return fail_ ? nullptr : ObMalloc::alloc(size, attr);
+    }
+    bool fail_;
+    int64_t attempts_;
+  } chunk_allocator;
+  ObArenaAllocator alloc("FlatFailureTest");
+  ObFastBitmap bitmap(alloc);
+  const uint64_t hi = 64 * ObFastBitmap::CHUNK_SIZE;
+  ASSERT_EQ(OB_SUCCESS, bitmap.init_with_range(hi, true, 0, hi));
+  const uint64_t ids[] = {1, hi};
+  ASSERT_EQ(OB_SUCCESS, bitmap.add_batch(ids, 2));
+  // Copy chunk 0 successfully, then fail expansion beyond the 32 inline slots.
+  bitmap.chunks_.block_allocator_.allocator_ = &chunk_allocator;
+  ASSERT_EQ(OB_ALLOCATE_MEMORY_FAILED, bitmap.add(hi + 1));
+  ASSERT_EQ(1, chunk_allocator.attempts_);
+  ASSERT_TRUE(bitmap.is_flat());
+  ASSERT_EQ(0, bitmap.chunks_.count());
+  bitmap.finalize();
+  ASSERT_EQ(2, bitmap.cardinality());
+  ObFastBitmap::Iterator iter;
+  ASSERT_EQ(OB_SUCCESS, iter.init(&bitmap));
+  uint64_t id = 0;
+  ASSERT_EQ(OB_SUCCESS, iter.next_id(id));
+  ASSERT_EQ(ids[0], id);
+  ASSERT_EQ(OB_SUCCESS, iter.next_id(id));
+  ASSERT_EQ(ids[1], id);
+  ASSERT_EQ(OB_ITER_END, iter.next_id(id));
+  chunk_allocator.fail_ = false;
+  ASSERT_EQ(OB_SUCCESS, bitmap.add(hi + 1));
+  ASSERT_FALSE(bitmap.is_flat());
+  ASSERT_EQ(3, bitmap.cardinality());
+  ASSERT_EQ(OB_SUCCESS, iter.init(&bitmap));
+  for (const uint64_t expected : {uint64_t(1), hi, hi + 1}) {
+    ASSERT_EQ(OB_SUCCESS, iter.next_id(id));
+    ASSERT_EQ(expected, id);
+  }
+  ASSERT_EQ(OB_ITER_END, iter.next_id(id));
+}
+
+TEST(ObFastBitmapFlatTest, admission_and_reinitialization)
+{
+  share::ObTenantEnv::get_tenant_local()->id_ = OB_SERVER_TENANT_ID;
+  ObArenaAllocator alloc("FlatBitmapTest");
+  ObFastBitmap bitmap(alloc);
+  ASSERT_EQ(OB_INVALID_ARGUMENT, bitmap.init_with_range(-1, true, 0, 100));
+  ASSERT_EQ(OB_SUCCESS, bitmap.init_with_range(100, false, 0, 100));
+  ASSERT_FALSE(bitmap.is_flat());
+  ASSERT_EQ(OB_SUCCESS, bitmap.init_with_range(1, true, 0, 10000));
+  ASSERT_FALSE(bitmap.is_flat());
+  ASSERT_EQ(OB_SUCCESS, bitmap.init_with_range(100, true, 0, UINT64_MAX));
+  ASSERT_FALSE(bitmap.is_flat());
+  ASSERT_EQ(OB_SUCCESS, bitmap.init_with_range(100, true, UINT64_MAX, 0));
+  ASSERT_FALSE(bitmap.is_flat());
+  ASSERT_EQ(OB_SUCCESS, bitmap.init_with_range(100, true, 100, 200));
+  ASSERT_TRUE(bitmap.is_flat());
+  ASSERT_EQ(OB_SUCCESS, bitmap.add(123));
+  ASSERT_EQ(1, bitmap.cardinality());
+  bitmap.reuse();
+  ASSERT_EQ(0, bitmap.cardinality());
+  ASSERT_EQ(OB_SUCCESS, bitmap.init_with_range(100, true, 10000, 10100));
+  ObFastBitmap::Iterator iter;
+  ASSERT_EQ(OB_SUCCESS, iter.init(&bitmap));
+  uint64_t value = 0;
+  ASSERT_EQ(OB_ITER_END, iter.next_id(value));
+  ASSERT_EQ(OB_SUCCESS, bitmap.add(10001));
+  ASSERT_EQ(OB_SUCCESS, iter.next_id(value));
+  ASSERT_EQ(10001, value);
+}
+
+TEST(ObFastBitmapFlatTest, rescan_reuses_storage_with_arena_parent)
+{
+  share::ObTenantEnv::get_tenant_local()->id_ = OB_SERVER_TENANT_ID;
+  ObArenaAllocator alloc("FlatBitmapTest");
+  ObFastBitmap bitmap(alloc);
+  ASSERT_EQ(OB_SUCCESS, bitmap.init_with_range(65536, false, 0, 0));
+  auto *chunk_pool = bitmap.chunk_buf_;
+  const int64_t parent_used = alloc.used();
+  for (int round = 0; round < 100; ++round) {
+    const uint64_t base = round * 65536ULL;
+    ASSERT_EQ(OB_SUCCESS, bitmap.init_with_range(65536, true, base, base + 65535));
+    auto *flat_words = bitmap.flat_words_;
+    ASSERT_NE(nullptr, flat_words);
+    ASSERT_EQ(OB_SUCCESS, bitmap.add(base + 65535));
+    // Rebase a smaller range, then expand within the retained capacity.
+    ASSERT_EQ(OB_SUCCESS, bitmap.init_with_range(64, true, base + 64, base + 127));
+    ASSERT_EQ(flat_words, bitmap.flat_words_);
+    ASSERT_EQ(OB_SUCCESS, bitmap.add(base + 64));
+    ASSERT_EQ(OB_SUCCESS, bitmap.init_with_range(65536, true, base, base + 65535));
+    ASSERT_EQ(flat_words, bitmap.flat_words_);
+    ASSERT_EQ(0, bitmap.cardinality());
+    ObFastBitmap::Iterator iter;
+    ASSERT_EQ(OB_SUCCESS, iter.init(&bitmap));
+    uint64_t id = 0;
+    ASSERT_EQ(OB_ITER_END, iter.next_id(id));
+    // Growth must replace owned storage, not accumulate in the parent arena.
+    ASSERT_EQ(OB_SUCCESS, bitmap.init_with_range(131072, true, base, base + 131071));
+    ASSERT_EQ(OB_SUCCESS, bitmap.add(base + 131071));
+    ASSERT_EQ(OB_SUCCESS, bitmap.init_with_range(1, true, 0, 1000000));
+    ASSERT_FALSE(bitmap.is_flat());
+    ASSERT_EQ(0, bitmap.flat_allocator_.used());
+    ASSERT_EQ(chunk_pool, bitmap.chunk_buf_);
+    ASSERT_EQ(parent_used, alloc.used());
+    ASSERT_EQ(OB_SUCCESS, bitmap.add(100));
+    ASSERT_EQ(1, bitmap.cardinality());
+  }
+}
+
+TEST(ObFastBitmapFlatTest, flat_fallback_preserves_chunk_allocator_tenant)
+{
+  struct TenantIdGuard
+  {
+    TenantIdGuard() : saved_id_(MTL_ID())
+    { share::ObTenantEnv::get_tenant_local()->id_ = OB_SYS_TENANT_ID; }
+    ~TenantIdGuard()
+    { share::ObTenantEnv::get_tenant_local()->id_ = saved_id_; }
+    uint64_t saved_id_;
+  } tenant_guard;
+  ASSERT_NE(OB_SERVER_TENANT_ID, MTL_ID());
+  ObArenaAllocator alloc("FlatBitmapTest");
+  ObFastBitmap bitmap(alloc);
+  // Do not call init(): the first layout is Flat, with no chunk pool.
+  const uint64_t base = 64 * ObFastBitmap::CHUNK_SIZE;
+  ASSERT_EQ(OB_SUCCESS, bitmap.init_with_range(64, true, base, base + 63));
+  ASSERT_TRUE(bitmap.is_flat());
+  ASSERT_EQ(nullptr, bitmap.chunk_buf_);
+  EXPECT_EQ(MTL_ID(), bitmap.chunks_.block_allocator_.get_attr().tenant_id_);
+  EXPECT_TRUE(bitmap.chunks_.block_allocator_.get_label() == "FBitmapChunks");
+  ASSERT_EQ(OB_SUCCESS, bitmap.add(base + 1));
+  ASSERT_EQ(OB_SUCCESS, bitmap.add(base + 63));
+  ASSERT_EQ(OB_SUCCESS, bitmap.add(base + 64));
+  ASSERT_FALSE(bitmap.is_flat());
+  ASSERT_GT(bitmap.chunks_.count(), 32);
+  EXPECT_EQ(MTL_ID(), bitmap.chunks_.block_allocator_.get_attr().tenant_id_);
+  EXPECT_TRUE(bitmap.chunks_.block_allocator_.get_label() == "FBitmapChunks");
+  ASSERT_EQ(3, bitmap.cardinality());
+  ObFastBitmap::Iterator iter;
+  ASSERT_EQ(OB_SUCCESS, iter.init(&bitmap));
+  uint64_t id = 0;
+  for (const uint64_t expected : {base + 1, base + 63, base + 64}) {
+    ASSERT_EQ(OB_SUCCESS, iter.next_id(id));
+    ASSERT_EQ(expected, id);
+  }
+  ASSERT_EQ(OB_ITER_END, iter.next_id(id));
+}
+
+TEST(ObFastBitmapFlatTest, unordered_batches_and_window_oracle)
+{
+  share::ObTenantEnv::get_tenant_local()->id_ = OB_SERVER_TENANT_ID;
+  ObArenaAllocator alloc("FlatBitmapTest");
+  ObFastBitmap flat(alloc);
+  ObFastBitmap chunked(alloc);
+  ASSERT_EQ(OB_SUCCESS, flat.init_with_range(20000, true, 63, 131100));
+  ASSERT_TRUE(flat.is_flat());
+  ASSERT_EQ(OB_SUCCESS, chunked.init(20000));
+  std::vector<uint64_t> values;
+  for (uint64_t i = 0; i < 4096; ++i) {
+    values.push_back(63 + ((i * 31337) % 131038));
+  }
+  for (const uint64_t id : {63ULL, 64ULL, 65535ULL, 65536ULL, 131100ULL, 64ULL}) {
+    values.push_back(id);
+  }
+  for (size_t i = 0; i < values.size(); i += 256) {
+    const int64_t count = std::min<size_t>(256, values.size() - i);
+    ASSERT_EQ(OB_SUCCESS, flat.add_batch(values.data() + i, count));
+    ASSERT_EQ(OB_SUCCESS, chunked.add_batch(values.data() + i, count));
+  }
+  flat.finalize();
+  chunked.finalize();
+  std::sort(values.begin(), values.end());
+  values.erase(std::unique(values.begin(), values.end()), values.end());
+  ASSERT_EQ(values.size(), flat.cardinality());
+  ASSERT_EQ(chunked.cardinality(), flat.cardinality());
+  ObFastBitmap::Iterator iter;
+  ASSERT_EQ(OB_SUCCESS, iter.init(&flat));
+  uint64_t actual = 0;
+  for (const uint64_t expected : values) {
+    ASSERT_EQ(OB_SUCCESS, iter.next_id(actual));
+    ASSERT_EQ(expected, actual);
+  }
+  ASSERT_EQ(OB_ITER_END, iter.next_id(actual));
+  for (uint64_t start = 65500; start < 65564; ++start) {
+    uint64_t a[5] = {};
+    uint64_t b[5] = {};
+    int64_t ac = 0;
+    int64_t bc = 0;
+    ASSERT_EQ(OB_SUCCESS, flat.copy_range_to_words(start, start + 256, start, 257, a, ac));
+    ASSERT_EQ(OB_SUCCESS, chunked.copy_range_to_words(start, start + 256, start, 257, b, bc));
+    ASSERT_EQ(ac, bc);
+    for (int i = 0; i < 5; ++i) { ASSERT_EQ(a[i], b[i]); }
+  }
+}
+
+TEST(ObFastBitmapFlatTest, high_base_drain_and_fallback)
+{
+  share::ObTenantEnv::get_tenant_local()->id_ = OB_SERVER_TENANT_ID;
+  ObArenaAllocator alloc("FlatBitmapTest");
+  ObFastBitmap bitmap(alloc);
+  const uint64_t base = 1ULL << 50;
+  ASSERT_EQ(OB_SUCCESS, bitmap.init_with_range(64, true, base + 1, base + 100));
+  ASSERT_TRUE(bitmap.is_flat());
+  const uint64_t ids[] = {base + 1, base + 63, base + 64, base + 100};
+  ASSERT_EQ(OB_SUCCESS, bitmap.add_batch(ids, 4));
+  bitmap.finalize();
+  ObFastBitmap::Iterator iter;
+  ASSERT_EQ(OB_SUCCESS, iter.init(&bitmap));
+  uint64_t out[8] = {};
+  int64_t count = 0;
+  uint64_t after = 0;
+  ObFastBitmap::Iterator::DrainState state;
+  ASSERT_EQ(OB_SUCCESS, iter.drain_until(base + 63, 8, out, count, after, state));
+  ASSERT_EQ(2, count);
+  ASSERT_EQ(ids[0], out[0]);
+  ASSERT_EQ(ids[1], out[1]);
+  ASSERT_EQ(ids[2], after);
+  ASSERT_EQ(ObFastBitmap::Iterator::DRAIN_BOUNDARY_REACHED, state);
+  ASSERT_EQ(OB_SUCCESS, iter.drain_until(UINT64_MAX, 1, out, count, after, state));
+  ASSERT_EQ(ids[3], out[0]);
+  ASSERT_EQ(ObFastBitmap::Iterator::DRAIN_BATCH_FULL, state);
+  ASSERT_EQ(OB_SUCCESS, iter.drain_until(UINT64_MAX, 1, out, count, after, state));
+  ASSERT_EQ(0, count);
+  ASSERT_EQ(ObFastBitmap::Iterator::DRAIN_ITER_END, state);
+  // Exercise migration at a practical chunk-array address, including dirty data.
+  ASSERT_EQ(OB_SUCCESS, bitmap.init_with_range(64, true, 63, 100));
+  const uint64_t initial[] = {63, 64, 100, 64};
+  ASSERT_EQ(OB_SUCCESS, bitmap.add_batch(initial, 4));
+  const uint64_t outside[] = {0, 65536, 64};
+  ASSERT_EQ(OB_SUCCESS, bitmap.add_batch(outside, 3));
+  ASSERT_FALSE(bitmap.is_flat());
+  bitmap.finalize();
+  ASSERT_EQ(5, bitmap.cardinality());
+  ASSERT_EQ(OB_SUCCESS, iter.init(&bitmap));
+  for (uint64_t expected : {0ULL, 63ULL, 64ULL, 100ULL, 65536ULL}) {
+    ASSERT_EQ(OB_SUCCESS, iter.next_id(after));
+    ASSERT_EQ(expected, after);
+  }
+  ASSERT_EQ(OB_ITER_END, iter.next_id(after));
+}
+
 } // anonymous namespace
 
 int main(int argc, char **argv)

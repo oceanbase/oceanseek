@@ -61,6 +61,8 @@ private:
 class ObDASAsyncScalarRangeOp : public ObDASScalarScanOp
 {
 public:
+  int get_bitmap_input_range(bool &available, uint64_t &lo, uint64_t &hi,
+                             int64_t &estimated_count) override;
   explicit ObDASAsyncScalarRangeOp(ObDASSearchCtx &search_ctx)
     : ObDASScalarScanOp(search_ctx),
       range_allocator_(common::ObMemAttr(MTL_ID(), "DASAScaRange")),
