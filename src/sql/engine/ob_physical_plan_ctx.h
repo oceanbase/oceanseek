@@ -61,6 +61,18 @@ struct PartParamIdxArray
 typedef common::ObFixedArray<PartParamIdxArray, common::ObIAllocator> BatchParamIdxArray;
 typedef common::ObFixedArray<ObImplicitCursorInfo, common::ObIAllocator> ImplicitCursorInfoArray;
 
+// A collection parameter carries a statement-local subschema id. Remote SQL
+// compilation needs its definition and parameter position, rather than that id.
+struct ObRemoteCollectionParamSubschema
+{
+  ObRemoteCollectionParamSubschema() : param_idx_(-1), subschema_() {}
+  int deserialize_subschema(const char *buf, const int64_t data_len, int64_t &pos,
+                            common::ObIAllocator &allocator);
+  TO_STRING_KV(K_(param_idx), K_(subschema));
+  int64_t param_idx_;
+  ObSubSchemaValue subschema_;
+};
+
 struct ObRemoteSqlInfo
 {
   ObRemoteSqlInfo() :
@@ -70,7 +82,8 @@ struct ObRemoteSqlInfo
     ps_param_cnt_(0),
     remote_sql_(),
     ps_params_(nullptr),
-    sql_from_pl_(false)
+    sql_from_pl_(false),
+    collection_param_subschemas_(nullptr)
   {
   }
 
@@ -83,6 +96,7 @@ struct ObRemoteSqlInfo
   common::ObString remote_sql_;
   ParamStore *ps_params_;
   bool sql_from_pl_;
+  const common::ObIArray<ObRemoteCollectionParamSubschema> *collection_param_subschemas_;
 };
 
 /* refer to a group of array params

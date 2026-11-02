@@ -340,6 +340,13 @@ OB_DEF_SERIALIZE(ObRemoteTask)
   OB_UNIS_ENCODE(remote_sql_info_->sql_from_pl_);
   OB_UNIS_ENCODE(ls_list_);
   OB_UNIS_ENCODE(detectable_id_);
+  // Append-only extension: older readers skip this tail, and newer readers
+  // accept an older request without it.
+  OB_UNIS_ENCODE(collection_param_subschemas_.count());
+  for (int64_t i = 0; OB_SUCC(ret) && i < collection_param_subschemas_.count(); ++i) {
+    OB_UNIS_ENCODE(collection_param_subschemas_.at(i).param_idx_);
+    OB_UNIS_ENCODE(collection_param_subschemas_.at(i).subschema_);
+  }
   return ret;
 }
 
@@ -386,6 +393,11 @@ OB_DEF_SERIALIZE_SIZE(ObRemoteTask)
     OB_UNIS_ADD_LEN(remote_sql_info_->sql_from_pl_);
     OB_UNIS_ADD_LEN(ls_list_);
     OB_UNIS_ADD_LEN(detectable_id_);
+    OB_UNIS_ADD_LEN(collection_param_subschemas_.count());
+    for (int64_t i = 0; i < collection_param_subschemas_.count(); ++i) {
+      OB_UNIS_ADD_LEN(collection_param_subschemas_.at(i).param_idx_);
+      OB_UNIS_ADD_LEN(collection_param_subschemas_.at(i).subschema_);
+    }
   }
   return len;
 }
@@ -402,6 +414,9 @@ OB_DEF_DESERIALIZE(ObRemoteTask)
       || OB_ISNULL(ps_params = remote_sql_info_->ps_params_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("remote task not init", K(ret), K_(remote_sql_info), K(ps_params));
+  } else {
+    collection_param_subschemas_.reuse();
+    remote_sql_info_->collection_param_subschemas_ = nullptr;
   }
   LST_DO_CODE(OB_UNIS_DECODE,
               tenant_schema_version_,
@@ -472,6 +487,35 @@ OB_DEF_DESERIALIZE(ObRemoteTask)
       OB_UNIS_DECODE(remote_sql_info_->sql_from_pl_);
       OB_UNIS_DECODE(ls_list_);
       OB_UNIS_DECODE(detectable_id_);
+      int64_t collection_param_count = 0;
+      OB_UNIS_DECODE(collection_param_count);
+      if (OB_SUCC(ret)
+          && (collection_param_count < 0 || collection_param_count > ps_params->count())) {
+        ret = OB_DESERIALIZE_ERROR;
+        LOG_WARN("invalid remote collection parameter count", K(ret), K(collection_param_count));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < collection_param_count; ++i) {
+        ObRemoteCollectionParamSubschema param_subschema;
+        if (pos >= data_len) {
+          ret = OB_DESERIALIZE_ERROR;
+          LOG_WARN("truncated remote collection parameter subschema", K(ret), K(i));
+        } else {
+          OB_UNIS_DECODE(param_subschema.param_idx_);
+          if (OB_SUCC(ret) && pos >= data_len) {
+            ret = OB_DESERIALIZE_ERROR;
+          }
+          if (OB_FAIL(ret)) {
+          } else if (OB_FAIL(param_subschema.deserialize_subschema(
+                  buf, data_len, pos, exec_ctx_->get_allocator()))) {
+            LOG_WARN("decode remote collection parameter subschema failed", K(ret), K(i));
+          } else if (OB_FAIL(collection_param_subschemas_.push_back(param_subschema))) {
+            LOG_WARN("store remote collection parameter subschema failed", K(ret), K(i));
+          }
+        }
+      }
+      if (OB_SUCC(ret) && !collection_param_subschemas_.empty()) {
+        remote_sql_info_->collection_param_subschemas_ = &collection_param_subschemas_;
+      }
     }
   }
   return ret;

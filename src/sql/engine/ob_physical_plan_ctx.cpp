@@ -1491,6 +1491,30 @@ int ObPhysicalPlanCtx::build_subschema_ctx_by_param_store(share::schema::ObSchem
   return ret;
 }
 
+int ObRemoteCollectionParamSubschema::deserialize_subschema(
+    const char *buf, const int64_t data_len, int64_t &pos, ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  subschema_.allocator_ = &allocator;
+  if (OB_FAIL(subschema_.deserialize(buf, data_len, pos))) {
+    LOG_WARN("deserialize remote collection parameter subschema failed", K(ret), K_(param_idx));
+  } else if (subschema_.type_ != OB_SUBSCHEMA_COLLECTION_TYPE || OB_ISNULL(subschema_.value_)) {
+    ret = OB_DESERIALIZE_ERROR;
+    LOG_WARN("invalid remote collection parameter subschema type", K(ret), K_(param_idx));
+  } else {
+    ObSqlCollectionInfo *collection_info = static_cast<ObSqlCollectionInfo *>(subschema_.value_);
+    ObString type_def;
+    // Native collection decoding owns the parsed metadata, but borrows the
+    // definition string from the RPC buffer. Reverse lookup needs an owned key.
+    if (OB_FAIL(ob_write_string(allocator, collection_info->get_def_string(), type_def))) {
+      LOG_WARN("copy remote collection parameter definition failed", K(ret), K_(param_idx));
+    } else {
+      collection_info->set_name(type_def);
+    }
+  }
+  return ret;
+}
+
 int ObPhysicalPlanCtx::get_local_session_vars(int64_t local_var_array_id, const ObSolidifiedVarsContext *&local_vars)
 {
   int ret = OB_SUCCESS;
