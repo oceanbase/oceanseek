@@ -29443,7 +29443,8 @@ def_table_schema(
                WHEN 0 THEN "FULL"
                WHEN 5 THEN "LOGONLY"
                ELSE NULL
-           END AS REPLICA_TYPE
+           END AS REPLICA_TYPE,
+           DATA_DISK_ALLOCATED
     FROM oceanbase.__all_virtual_unit
 """.replace("\n", " ")
 )
@@ -29483,7 +29484,8 @@ def_table_schema(
                WHEN 0 THEN "FULL"
                WHEN 5 THEN "LOGONLY"
                ELSE NULL
-           END AS REPLICA_TYPE
+           END AS REPLICA_TYPE,
+           DATA_DISK_ALLOCATED
     FROM oceanbase.GV$OB_UNITS
     WHERE SVR_IP = host_ip() AND SVR_PORT = rpc_port()
 """.replace("\n", " ")
@@ -76565,7 +76567,8 @@ def_table_schema(
                WHEN 0 THEN 'FULL'
                WHEN 5 THEN 'LOGONLY'
                ELSE NULL
-           END AS REPLICA_TYPE
+           END AS REPLICA_TYPE,
+           DATA_DISK_ALLOCATED
     FROM SYS.ALL_VIRTUAL_UNIT
 """.replace("\n", " ")
 )
@@ -76603,7 +76606,8 @@ def_table_schema(
            DATA_DISK_IN_USE,
            STATUS,
            CREATE_TIME,
-           REPLICA_TYPE
+           REPLICA_TYPE,
+           DATA_DISK_ALLOCATED
     FROM SYS.GV$OB_UNITS
     WHERE SVR_IP = HOST_IP() AND SVR_PORT = RPC_PORT()
 """.replace("\n", " ")
