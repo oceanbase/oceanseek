@@ -33,7 +33,9 @@ inline int ObReloadConfig::operator()()
 {
   int ret = OB_SUCCESS;
   if (OB_LIKELY(NULL != conf_)) {
-    reload_ob_logger_set();
+    ret = reload_ob_logger_set();
+  } else {
+    ret = OB_NOT_INIT;
   }
   return ret;
 }

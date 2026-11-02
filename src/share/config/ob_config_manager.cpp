@@ -10,6 +10,7 @@
 #include "observer/ob_sql_client_decorator.h"
 #include "observer/ob_server.h"
 #include "lib/oblog/ob_log_compressor.h"
+#include "lib/compress/ob_compressor_pool.h"
 #ifdef OB_BUILD_SHARED_LOG_SERVICE
 #include "logservice/libpalf/libpalf_logger.h"
 #endif
@@ -64,68 +65,113 @@ int ObConfigManager::init(ObMySQLProxy &sql_proxy, const ObAddr &server)
 
 int ObConfigManager::ob_logger_config_update(const ObServerConfig& config)
 {
+  obutil::Mutex::Lock config_guard(OB_LOG_COMPRESSOR.get_config_update_mutex());
   int ret = OB_SUCCESS;
-  int64_t max_log_cnt = 0;
-  const bool record_old_log_file = config.enable_syslog_recycle;
-  int64_t max_disk_size = 0;
+  ObSyslogConfig target;
+  target.max_file_count_ = config.max_syslog_file_count;
+  target.max_disk_size_ = config.syslog_disk_size;
+  target.record_old_log_file_ = config.enable_syslog_recycle;
+  target.min_uncompressed_count_ = config.syslog_file_uncompressed_count;
   const char *compress_func_ptr = config.syslog_compress_func.str();
-  const int64_t min_uncompressed_count = config.syslog_file_uncompressed_count;
-  const bool log_warn = config.enable_syslog_wf;
-  const bool enable_async_syslog = config.enable_async_syslog;
-
-  LOG_INFO("Whether record old log file", K(record_old_log_file));
-  LOG_INFO("Whether log warn", K(log_warn));
-  LOG_INFO("Whether compress syslog file", K(compress_func_ptr));
-
+  const char *phase = "validate";
+  int64_t original_libpalf_count = 0;
+  int64_t actual_libpalf_count = 0;
+  int64_t old_libpalf_count = 0;
+  bool rust_changed = false;
+  if (OB_FAIL(ObCompressorPool::get_instance().get_compressor_type(compress_func_ptr, target.compress_func_))) {
+  } else if (!target.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+  }
 #ifdef OB_BUILD_SHARED_LOG_SERVICE
-  int64_t libpalf_max_log_cnt = 0;
-  if (GCONF.enable_logservice) {
+  const bool use_libpalf = config.enable_logservice;
+  if (OB_SUCC(ret) && use_libpalf) {
+    target.max_file_count_ = 0;
+    target.max_disk_size_ = 0;
     if (OB_FAIL(libpalf::LibPalfLogger::cal_libpalf_shared_syslog_capacity(
-      config.max_syslog_file_count,
-      config.syslog_disk_size,
-      libpalf::LibPalfLogger::LIBPALF_SHARED_MAX_SYSLOG_CAPACITY_PERCENTAGE,
-      OB_LOGGER.DEFAULT_MAX_FILE_SIZE,
-      libpalf_max_log_cnt,
-      max_log_cnt,
-      max_disk_size))) {
-      LOG_WARN("cal libpalf shared syslog capacity failed", KR(ret));
-    } else if (OB_FAIL(libpalf::LibPalfLogger::set_max_syslog_file_count(libpalf_max_log_cnt))) {
-      LOG_WARN("set libpalf shared syslog capacity failed", KR(ret));
+        config.max_syslog_file_count, config.syslog_disk_size,
+        libpalf::LibPalfLogger::LIBPALF_SHARED_MAX_SYSLOG_CAPACITY_PERCENTAGE,
+        OB_LOGGER.DEFAULT_MAX_FILE_SIZE, original_libpalf_count,
+        target.max_file_count_, target.max_disk_size_))) {
     } else {
-      LOG_INFO("libpalf shared syslog capacity set success", K(libpalf_max_log_cnt), K(max_log_cnt), K(max_disk_size));
+      target.enable_libpalf_ = target.compress_func_ != NONE_COMPRESSOR;
+      // Bound Rust's archive index even when observer compresses and removes the source files.
+      constexpr int64_t compressed_libpalf_file_count_limit = 10000;
+      actual_libpalf_count = target.enable_libpalf_ ? compressed_libpalf_file_count_limit : original_libpalf_count;
+      if (target.enable_libpalf_) { target.max_disk_size_ = config.syslog_disk_size; }
+      phase = "read Rust quota";
+      if (OB_FAIL(libpalf::LibPalfLogger::get_max_syslog_file_count(old_libpalf_count))) {
+      } else {
+        rust_changed = old_libpalf_count != actual_libpalf_count;
+      }
     }
-  } else {
-    max_log_cnt = config.max_syslog_file_count;
-    max_disk_size = config.syslog_disk_size;
   }
-#else
-  max_log_cnt = config.max_syslog_file_count;
-  max_disk_size = config.syslog_disk_size;
 #endif
-
-  if (OB_FAIL(ret)) { // do nothing
-  } else if (OB_FAIL(OB_LOGGER.set_max_file_index(max_log_cnt))) {
-    OB_LOG(ERROR, "fail to set_max_file_index", K(max_log_cnt), K(ret));
-  } else if (OB_FAIL(OB_LOGGER.set_record_old_log_file(record_old_log_file))) {
-    OB_LOG(ERROR, "fail to set_record_old_log_file", K(record_old_log_file), K(ret));
-  } else if (OB_FAIL(OB_LOG_COMPRESSOR.set_max_disk_size(max_disk_size))) {
-    OB_LOG(ERROR, "fail to set_max_disk_size", K(max_disk_size), KR(ret));
-  } else if (OB_FAIL(OB_LOG_COMPRESSOR.set_compress_func(compress_func_ptr))) {
-    OB_LOG(ERROR, "fail to set_compress_func", K(compress_func_ptr), KR(ret));
-  } else if (OB_FAIL(OB_LOG_COMPRESSOR.set_min_uncompressed_count(min_uncompressed_count))) {
-    OB_LOG(ERROR, "fail to set_min_uncompressed_count", K(min_uncompressed_count), KR(ret));
-  } else {
-    OB_LOGGER.set_log_warn(log_warn);
-    OB_LOGGER.set_enable_async_log(enable_async_syslog);
-
-    LOG_INFO("init log config", K(record_old_log_file), K(log_warn), K(enable_async_syslog),
-              K(max_disk_size), K(compress_func_ptr), K(min_uncompressed_count));
-    if (0 == max_log_cnt) {
-      LOG_INFO("won't recycle log file");
+  target.normalize();
+  const bool cpp_changed = !OB_LOG_COMPRESSOR.is_config_applied(OB_LOGGER, target);
+  bool paused = false;
+  bool rust_updated = false;
+  int rust_rollback_ret = OB_SUCCESS;
+  if (OB_SUCC(ret) && (cpp_changed || rust_changed)) {
+    phase = "drain background";
+    if (OB_FAIL(OB_LOG_COMPRESSOR.pause_for_config_update())) {
     } else {
-      LOG_INFO("recycle log file", "count", max_log_cnt);
+      paused = true;
     }
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+    if (OB_SUCC(ret) && use_libpalf && rust_changed) {
+      phase = "set Rust quota";
+      if (OB_FAIL(libpalf::LibPalfLogger::set_max_syslog_file_count(actual_libpalf_count))) {
+      } else {
+        rust_updated = true;
+      }
+    }
+#endif
+    if (OB_SUCC(ret) && cpp_changed) {
+      phase = "apply C++ policy";
+      ret = OB_LOG_COMPRESSOR.apply_config(OB_LOGGER, target);
+    }
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+    if (OB_FAIL(ret) && paused && rust_updated) {
+      // apply_config() leaves C++ state unchanged on failure; only Rust needs compensation.
+      rust_rollback_ret = libpalf::LibPalfLogger::set_max_syslog_file_count(old_libpalf_count);
+      if (rust_rollback_ret != OB_SUCCESS) {
+        OB_LOG_COMPRESSOR.set_libpalf_compression_enabled(false);
+      }
+    }
+#endif
   }
+  if (OB_SUCC(ret)) {
+    OB_LOGGER.set_log_warn(config.enable_syslog_wf);
+    OB_LOGGER.set_enable_async_log(config.enable_async_syslog);
+    if (cpp_changed || rust_changed) {
+      const int64_t applied_cpp_file_count = OB_LOGGER.get_max_file_index();
+      const int64_t applied_disk_size = OB_LOG_COMPRESSOR.get_max_disk_size();
+      const bool record_old_log_file = OB_LOGGER.get_record_old_log_file();
+      const int64_t min_uncompressed_count = OB_LOG_COMPRESSOR.get_min_uncompressed_count();
+      const bool enable_libpalf_compression = OB_LOG_COMPRESSOR.is_libpalf_compression_enabled();
+      LOG_INFO("syslog configuration applied", K(compress_func_ptr), K(original_libpalf_count),
+               K(actual_libpalf_count), K(applied_cpp_file_count), K(applied_disk_size),
+               "configured_max_syslog_file_count", static_cast<int64_t>(config.max_syslog_file_count),
+               "configured_syslog_disk_size", static_cast<int64_t>(config.syslog_disk_size),
+               K(record_old_log_file), K(min_uncompressed_count), K(enable_libpalf_compression));
+    }
+  } else {
+    int64_t effective_libpalf_count = 0;
+    int effective_libpalf_ret = OB_NOT_SUPPORTED;
+#ifdef OB_BUILD_SHARED_LOG_SERVICE
+    if (use_libpalf && 0 != strcmp(phase, "validate")) {
+      effective_libpalf_ret = libpalf::LibPalfLogger::get_max_syslog_file_count(effective_libpalf_count);
+    }
+#endif
+    LOG_WARN("syslog configuration failed", KR(ret), KCSTRING(phase), K(rust_rollback_ret),
+             "target_libpalf_count", actual_libpalf_count, K(old_libpalf_count), K(rust_updated),
+             K(effective_libpalf_ret), K(effective_libpalf_count),
+             "actual_cpp_count", OB_LOGGER.get_max_file_index(),
+             "actual_disk_size", OB_LOG_COMPRESSOR.get_max_disk_size(),
+             "actual_compress_func", OB_LOG_COMPRESSOR.get_compress_func(),
+             "actual_libpalf_compression", OB_LOG_COMPRESSOR.is_libpalf_compression_enabled());
+  }
+  if (paused) { OB_LOG_COMPRESSOR.resume_after_config_update(); }
   return ret;
 }
 

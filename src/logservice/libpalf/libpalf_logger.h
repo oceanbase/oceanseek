@@ -28,7 +28,7 @@ public:
   // 
   // libpalf_syslog_max_file_count is the min value of division result from libpalf_syslog_max_file_count and syslog_disk_size.
   // for example, if the max_syslog_file_count is 1024, syslog_disk_size is 50G and default_max_syslog_file_size is 256MB,
-  // then libpalf_syslog_max_file_count will be min(1024 / 5, 50G / 256MB / 5) = 200.
+  // then libpalf_syslog_max_file_count will be min(1024 / 5, 50G / 256MB / 5) = 40.
   static int cal_libpalf_shared_syslog_capacity(
     const int64_t max_syslog_file_count,
     const int64_t syslog_disk_size,
@@ -38,12 +38,12 @@ public:
     int64_t &observer_syslog_max_file_count,
     int64_t &observer_syslog_disk_size);
 
-  // max archived syslog file count, the current working file without suffix is not counted.
-  // the default value of max archived syslog file count is 0, means no limitation.
+  // Total syslog file count, including the current working file; 0 means unlimited.
+  // A value of 0 disables quantity recycling.
   static int get_max_syslog_file_count(int64_t &max_syslog_file_count);
 
-  // max archived syslog file count, the current working file without suffix is not counted.
-  // the default value of max archived syslog file count is 0, means no limitation.
+  // Total syslog file count, including the current working file; 0 means unlimited.
+  // A value of 0 disables quantity recycling.
   static int set_max_syslog_file_count(const int64_t max_syslog_file_count);
 };
 
