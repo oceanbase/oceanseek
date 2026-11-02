@@ -129,6 +129,11 @@ int ObGtsSource::init(const uint64_t tenant_id, const ObAddr &server,
 
 void ObGtsSource::destroy()
 {
+  const int64_t task_count = get_task_count();
+  if (0 != task_count) {
+    const int ret = OB_ERR_UNEXPECTED;
+    TRANS_LOG(ERROR, "unexpected pending tasks when destroying gts source", KR(ret), K_(tenant_id), K(task_count), KP(this));
+  }
   if (is_inited_) {
     for (int64_t i = 0; i < TOTAL_GTS_QUEUE_COUNT; i++) {
       queue_[i].destroy();

@@ -35,6 +35,11 @@ int ObGTSTaskQueue::init(const ObGTSCacheTaskType &type)
 
 void ObGTSTaskQueue::destroy()
 {
+  const int64_t task_count = get_task_count();
+  if (0 != task_count) {
+    const int ret = OB_ERR_UNEXPECTED;
+    TRANS_LOG(ERROR, "unexpected pending tasks when destroying gts queue", KR(ret), K_(task_type), K(task_count), KP(this));
+  }
   if (is_inited_) {
     is_inited_ = false;
   }
@@ -71,6 +76,9 @@ int ObGTSTaskQueue::foreach_task(const MonotonicTs srr,
         if (tenant_id != last_tenant_id) {
           if (OB_FAIL(ts_guard.switch_to(tenant_id))) {
             TRANS_LOG(ERROR, "switch tenant failed", K(ret), K(tenant_id));
+            // No callback took ownership. Keep the task and its ctx reference
+            // for retry. Pushing a non-null intrusive task cannot fail.
+            (void)queue_.push(task);
           } else {
             last_tenant_id = tenant_id;
           }
@@ -187,6 +195,7 @@ int ObGTSTaskQueue::gts_callback_interrupted(const int errcode, const share::ObL
         } else {
           error_count++;
           TRANS_LOG(ERROR, "switch tenant failed", KR(ret), K(errcode), K(ls_id));
+          (void)queue_.push(task); // No callback ran; keep ownership for retry.
         }
       }
     }

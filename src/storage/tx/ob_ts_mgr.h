@@ -9,7 +9,8 @@
 #include <stdint.h>
 #include "lib/utility/ob_print_utils.h"
 #include "lib/lock/ob_drw_lock.h"
-#include "lib/hash/ob_link_hashmap.h"
+#include "lib/lock/ob_spin_rwlock.h"
+#include "share/ob_light_hashmap.h"
 #include "lib/atomic/atomic128.h"
 #include "lib/net/ob_addr.h"
 #include "lib/queue/ob_link_queue.h"
@@ -99,9 +100,14 @@ public:
   VIRTUAL_TO_STRING_KV("", "");
 };
 
-typedef common::LinkHashNode<ObTsTenantInfo> ObTsTenantInfoNode;
-typedef common::LinkHashValue<ObTsTenantInfo> ObTsTenantInfoValue;
-class ObTsSourceInfo : public ObTsTenantInfoValue
+class ObTsSourceInfoKey : public ObTsTenantInfo
+{
+public:
+  explicit ObTsSourceInfoKey(const uint64_t tenant_id) : ObTsTenantInfo(tenant_id) {}
+  bool is_valid() const { return common::is_valid_tenant_id(get_value()); }
+};
+
+class ObTsSourceInfo : public share::ObLightHashLink<ObTsSourceInfo>
 {
 public:
   ObTsSourceInfo();
@@ -115,6 +121,8 @@ public:
   int64_t get_last_access_ts() const { return last_access_ts_; }
   int check_if_tenant_has_been_dropped(const uint64_t tenant_id, bool &has_dropped);
   int gts_callback_interrupted(const int errcode, const share::ObLSID ls_id);
+  bool contain(const ObTsSourceInfoKey &key) const { return tenant_id_ == key.get_value(); }
+  TO_STRING_KV(K_(tenant_id), K_(is_inited), "ref", get_ref());
 private:
   bool is_inited_;
   uint64_t tenant_id_;
@@ -134,18 +142,6 @@ public:
       info = NULL;
     }
   }
-  static ObTsTenantInfoNode *alloc_node(ObTsSourceInfo *p)
-  {
-    UNUSED(p);
-    return op_alloc(ObTsTenantInfoNode);
-  }
-  static void free_node(ObTsTenantInfoNode *node)
-  {
-    if (NULL != node) {
-      op_free(node);
-      node = NULL;
-    }
-  }
 };
 
 class ObGtsRefreshFunctor
@@ -153,7 +149,7 @@ class ObGtsRefreshFunctor
 public:
   ObGtsRefreshFunctor() {}
   ~ObGtsRefreshFunctor() {}
-  bool operator()(const ObTsTenantInfo &gts_tenant_info, ObTsSourceInfo *ts_source_info)
+  bool operator()(ObTsSourceInfo *ts_source_info)
   {
     int ret = common::OB_SUCCESS;
     ObGtsSource *gts_source = NULL;
@@ -162,15 +158,15 @@ public:
       TRANS_LOG(ERROR, "ts source info is null", KR(ret));
     } else if (NULL == (gts_source = (ts_source_info->get_gts_source()))) {
       ret = common::OB_ERR_UNEXPECTED;
-      TRANS_LOG(ERROR, "gts cache queue is null", KR(ret), K(gts_tenant_info));
+      TRANS_LOG(ERROR, "gts cache queue is null", KR(ret), KPC(ts_source_info));
     } else {
       if (OB_FAIL(gts_source->refresh_gts(false))) {
         if (EXECUTE_COUNT_PER_SEC(1)) {
-          TRANS_LOG(WARN, "refresh gts failed", KR(ret), K(gts_tenant_info));
+          TRANS_LOG(WARN, "refresh gts failed", KR(ret), KPC(ts_source_info));
         }
       }
       if (EXECUTE_COUNT_PER_SEC(1)) {
-        TRANS_LOG(INFO, "refresh gts functor", KR(ret), K(gts_tenant_info));
+        TRANS_LOG(INFO, "refresh gts functor", KR(ret), KPC(ts_source_info));
       }
       // rewrite ret
       ret = common::OB_SUCCESS;
@@ -188,7 +184,7 @@ public:
     array_.reset();
   }
   ~GetObsoleteTenantFunctor() {}
-  bool operator()(const ObTsTenantInfo &gts_tenant_info, ObTsSourceInfo *ts_source_info)
+  bool operator()(ObTsSourceInfo *ts_source_info)
   {
     int ret = common::OB_SUCCESS;
     const int64_t now = common::ObClockGenerator::getClock();
@@ -197,13 +193,12 @@ public:
       TRANS_LOG(ERROR, "ts source info is null", KR(ret));
     } else if (now - ts_source_info->get_last_access_ts() < obsolete_time_) {
       // do nothing
-    } else if (OB_FAIL(array_.push_back(gts_tenant_info.get_value()))) {
-      TRANS_LOG(WARN, "push back tenant failed", K(ret), K(gts_tenant_info));
+    } else if (OB_FAIL(array_.push_back(ts_source_info->get_tenant_id()))) {
+      TRANS_LOG(WARN, "push back tenant failed", K(ret), KPC(ts_source_info));
     } else {
       // do nothing
     }
-    //外面需要遍历所有的租户，此处不能返回false
-    return true;
+    return common::OB_SUCCESS == ret;
   }
 private:
   const int64_t obsolete_time_;
@@ -219,7 +214,7 @@ public:
     array_.reset();
   }
   ~CheckTenantFunctor() {}
-  bool operator()(const ObTsTenantInfo &gts_tenant_info, ObTsSourceInfo *ts_source_info)
+  bool operator()(ObTsSourceInfo *ts_source_info)
   {
     int ret = common::OB_SUCCESS;
     ObGtsSource *gts_source = NULL;
@@ -227,11 +222,11 @@ public:
     if (OB_ISNULL(ts_source_info)) {
       ret = common::OB_ERR_UNEXPECTED;
       TRANS_LOG(ERROR, "ts source info is null", KR(ret));
-    } else if (OB_FAIL(ts_source_info->check_if_tenant_has_been_dropped(gts_tenant_info.get_value(), has_dropped))) {
-      TRANS_LOG(WARN, "check and switch ts source failed", KR(ret), K(gts_tenant_info));
+    } else if (OB_FAIL(ts_source_info->check_if_tenant_has_been_dropped(ts_source_info->get_tenant_id(), has_dropped))) {
+      TRANS_LOG(WARN, "check and switch ts source failed", KR(ret), KPC(ts_source_info));
     } else if (has_dropped) {
-      if (OB_FAIL(array_.push_back(gts_tenant_info.get_value()))) {
-        TRANS_LOG(WARN, "push back tenant failed", K(ret), K(gts_tenant_info));
+      if (OB_FAIL(array_.push_back(ts_source_info->get_tenant_id()))) {
+        TRANS_LOG(WARN, "push back tenant failed", K(ret), KPC(ts_source_info));
       }
     }
     return true;
@@ -249,15 +244,18 @@ public:
     array_.reset();
   }
   ~GetALLTenantFunctor() {}
-  bool operator()(const ObTsTenantInfo &gts_tenant_info, ObTsSourceInfo *ts_source_info)
+  bool operator()(ObTsSourceInfo *ts_source_info)
   {
     int ret = common::OB_SUCCESS;
-    if (OB_FAIL(array_.push_back(gts_tenant_info.get_value()))) {
-      TRANS_LOG(WARN, "push back tenant failed", K(ret), K(gts_tenant_info));
+    if (OB_ISNULL(ts_source_info)) {
+      ret = common::OB_ERR_UNEXPECTED;
+      TRANS_LOG(ERROR, "ts source info is null", KR(ret));
+    } else if (OB_FAIL(array_.push_back(ts_source_info->get_tenant_id()))) {
+      TRANS_LOG(WARN, "push back tenant failed", K(ret), KPC(ts_source_info));
     } else {
       // do nothing
     }
-    return true;
+    return common::OB_SUCCESS == ret;
   }
 private:
   common::ObIArray<uint64_t> &array_;
@@ -347,7 +345,8 @@ private:
   ObTsSyncGetTsCbTask tasks_[POOL_SIZE];
 };
 
-typedef common::ObLinkHashMap<ObTsTenantInfo, ObTsSourceInfo, ObTsSourceInfoAlloc> ObTsSourceInfoMap;
+typedef share::ObLightHashMap<ObTsSourceInfoKey, ObTsSourceInfo, ObTsSourceInfoAlloc,
+                             common::SpinRWLock, 1024> ObTsSourceInfoMap;
 class ObTsMgr : public share::ObThreadPool, public ObITsMgr
 {
   friend class ObTsSourceInfoGuard;
@@ -368,6 +367,7 @@ public:
   int handle_gts_err_response(const ObGtsErrResponse &msg);
   int handle_gts_result(const uint64_t tenant_id, const int64_t queue_index, const int ts_type);
   int update_gts(const uint64_t tenant_id, const MonotonicTs srr, const int64_t gts, const int ts_type, bool &update);
+  // OB_EAGAIN leaves the source intact; retry after its users/tasks drain.
   int delete_tenant(const uint64_t tenant_id);
   int interrupt_gts_callback_for_ls_offline(const uint64_t tenant_id, const share::ObLSID ls_id);
 public:
@@ -419,7 +419,9 @@ private:
       const bool need_create_tenant, const bool need_update_access_ts);
   void revert_ts_source_info_(ObTsSourceInfoGuard &guard);
   int add_tenant_(const uint64_t tenant_id);
-  int delete_tenant_(const uint64_t tenant_id);
+  // Expiration rechecks last_access_ts under the write lock because a tenant may
+  // return after the scan. Explicit deletion/shutdown skip only this age check.
+  int delete_tenant_(const uint64_t tenant_id, const bool check_obsolete = false);
   static ObTsMgr* &get_instance_inner();
 private:
   bool is_inited_;

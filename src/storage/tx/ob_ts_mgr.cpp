@@ -38,6 +38,11 @@ int ObTsSourceInfo::init(const uint64_t tenant_id)
 
 void ObTsSourceInfo::destroy()
 {
+  const int64_t task_count = gts_source_.get_task_count();
+  if (0 != task_count) {
+    const int ret = OB_ERR_UNEXPECTED;
+    TRANS_LOG(ERROR, "unexpected pending tasks when destroying ts source", KR(ret), K_(tenant_id), K(task_count), KP(this));
+  }
   if (is_inited_) {
     const uint64_t tenant_id = tenant_id_;
     gts_source_.destroy();
@@ -310,7 +315,7 @@ int ObTsMgr::init(const ObAddr &server,
   } else if (!server.is_valid() || OB_ISNULL(req_transport)) {
     ret = OB_INVALID_ARGUMENT;
     TRANS_LOG(WARN, "invalid argument", KR(ret), K(server), KP(req_transport));
-  } else if (OB_FAIL(ts_source_info_map_.init("TsSourceInfoMap"))) {
+  } else if (OB_FAIL(ts_source_info_map_.init(lib::ObMemAttr(OB_SERVER_TENANT_ID, "TsSourceInfoMap")))) {
     TRANS_LOG(WARN, "ts_source_info_map_ init failed", KR(ret));
   } else if (OB_FAIL(location_adapter_def_.init(&schema_service, &location_service))) {
     TRANS_LOG(ERROR, "location adapter init error", KR(ret));
@@ -435,12 +440,24 @@ void ObTsMgr::destroy()
 
     ObSEArray<uint64_t, 1> ids;
     GetALLTenantFunctor get_all_tenant_functor(ids);
-    ts_source_info_map_.for_each(get_all_tenant_functor);
+    {
+      ObQSyncLockReadGuard guard(lock_);
+      const int ret = ts_source_info_map_.for_each(get_all_tenant_functor);
+      if (OB_SUCCESS != ret) {
+        TRANS_LOG(ERROR, "enumerate ts sources before destruction failed", KR(ret));
+      }
+    }
     for (int64_t i = 0; i < ids.count(); i++) {
       const uint64_t tenant_id = ids.at(i);
-      delete_tenant_(tenant_id);
+      (void)delete_tenant_(tenant_id, false /* check_obsolete */);
     }
     ids.reset();
+    // Sources should already be gone. Diagnose violations without skipping cleanup.
+    if (0 != ts_source_info_map_.count()) {
+      const int ret = OB_ERR_UNEXPECTED;
+      TRANS_LOG(ERROR, "unexpected remaining sources when destroying ts manager", KR(ret),
+                "source_count", ts_source_info_map_.count());
+    }
     ts_source_info_map_.destroy();
 
     location_adapter_def_.destroy();
@@ -476,16 +493,29 @@ void ObTsMgr::run1()
     const int64_t IDLE_US = tenant_config.is_valid() ?
         tenant_config->_keepalive_interval : REFRESH_GTS_INTERVEL_US;
     ob_usleep(IDLE_US, true/*is_idle_sleep*/);
-    ts_source_info_map_.for_each(gts_refresh_funtor);
-    ts_source_info_map_.for_each(get_obsolete_tenant_functor);
+    {
+      // Snapshot traversal holds references outside bucket locks. Exclude
+      // source deletion until both the callbacks and their references finish.
+      ObQSyncLockReadGuard guard(lock_);
+      if (OB_FAIL(ts_source_info_map_.for_each(gts_refresh_funtor))) {
+        TRANS_LOG(WARN, "traverse ts sources for refresh failed", KR(ret));
+      }
+      if (OB_FAIL(ts_source_info_map_.for_each(get_obsolete_tenant_functor))) {
+        TRANS_LOG(WARN, "collect obsolete ts sources failed", KR(ret));
+        ids.reset();
+      }
+      ret = OB_SUCCESS;
+    }
     for (int64_t i = 0; i < ids.count(); i++) {
       const uint64_t tenant_id = ids.at(i);
       MTL_SWITCH(tenant_id) {
         TRANS_LOG(WARN, "gts is not used for a long time", K(tenant_id));
       } else {
         if (OB_TENANT_NOT_IN_SERVER == ret) {
-          if (OB_FAIL(delete_tenant_(tenant_id))) {
-            TRANS_LOG(WARN, "delete tenant failed", K(ret), K(tenant_id));
+          if (OB_FAIL(delete_tenant_(tenant_id, true /* check_obsolete */))) {
+            if (OB_EAGAIN != ret) {
+              TRANS_LOG(WARN, "delete tenant failed", K(ret), K(tenant_id));
+            }
             // ignore ret
             ret = OB_SUCCESS;
           } else {
@@ -684,43 +714,64 @@ int ObTsMgr::delete_tenant(const uint64_t tenant_id)
   return ret;
 }
 
-int ObTsMgr::delete_tenant_(const uint64_t tenant_id)
+int ObTsMgr::delete_tenant_(const uint64_t tenant_id, const bool check_obsolete)
 {
   int ret = OB_SUCCESS;
-  ObTsTenantInfo tenant_info(tenant_id);
-  do {
-    ObTsSourceInfo *ts_source_info = NULL;
-    ObTsSourceInfoGuard info_guard;
-    if (OB_FAIL(get_ts_source_info_opt_(tenant_id, info_guard, false, false))) {
+  ObTsSourceInfoKey tenant_info(tenant_id);
+  ObTsSourceInfo *ts_source_info = NULL;
+  ObTsSourceInfo *cached = NULL;
+  bool cache_removed = false;
+  // Expiration must not stall refresh behind a reader waiting for GTS.
+  if (OB_FAIL(lock_.try_wrlock())) {
+    if (REACH_TIME_INTERVAL(1000 * 1000)) {
+      TRANS_LOG(WARN, "defer deleting ts source because try_wrlock failed", K(ret), K(tenant_id));
+    }
+  } else {
+    if (tenant_id < TS_SOURCE_INFO_CACHE_NUM) {
+      cached = ATOMIC_LOAD(&ts_source_infos_[tenant_id]);
+    }
+    if (OB_FAIL(ts_source_info_map_.get(tenant_info, ts_source_info))) {
       TRANS_LOG(WARN, "get ts source info failed", K(ret), K(tenant_id));
-    } else if (OB_ISNULL(ts_source_info = info_guard.get_ts_source_info())) {
+    } else if (OB_ISNULL(ts_source_info) || (NULL != cached && cached != ts_source_info)) {
       ret = OB_ERR_UNEXPECTED;
-      TRANS_LOG(WARN, "ts source info is NULL", KR(ret), K(tenant_id));
-    } else {
-      TRANS_LOG(INFO, "set tenant gts invalid success", K(tenant_id));
-    }
-  } while (0);
-  if (OB_SUCCESS == ret) {
-    if (OB_FAIL(ts_source_info_map_.del(tenant_info))) {
-      TRANS_LOG(WARN, "delete tenant from hashmap failed", K(ret), K(tenant_id));
-    }
-    // ignore ret
-    if (OB_LIKELY(tenant_id < TS_SOURCE_INFO_CACHE_NUM)) {
-      lock_.wrlock();
-      ObTsSourceInfo *ts_source_info = NULL;
-      ObTsSourceInfo **ptr = &(ts_source_infos_[tenant_id]);
-      ts_source_info = ATOMIC_LOAD(ptr);
-      ATOMIC_STORE(ptr, NULL);
-      if (NULL != ts_source_info) {
-        (void)ts_source_info_map_.revert(ts_source_info);
-        ts_source_info = NULL;
+      TRANS_LOG(ERROR, "ts source map and cache mismatch", KR(ret), K(tenant_id), KP(ts_source_info), KP(cached));
+    } else if (0 != ts_source_info->get_gts_source()->get_task_count()) {
+      ret = OB_EAGAIN;
+      if (REACH_TIME_INTERVAL(1000 * 1000)) {
+        TRANS_LOG(WARN, "skip deleting ts source with pending tasks", K(ret), K(tenant_id),
+                  "task_count", ts_source_info->get_gts_source()->get_task_count(), KP(ts_source_info));
       }
-      lock_.wrunlock();
+    } else if (ATOMIC_LOAD(&ts_source_info->ref_) != 2 + (NULL != cached ? 1 : 0)) {
+      // Only map ownership, our get() and the optional cache may remain.
+      ret = OB_EAGAIN;
+      if (REACH_TIME_INTERVAL(1000 * 1000)) {
+        TRANS_LOG(WARN, "skip deleting ts source with outstanding references", K(ret), K(tenant_id),
+                  "ref", ATOMIC_LOAD(&ts_source_info->ref_));
+      }
+    } else if (check_obsolete &&
+               ObClockGenerator::getClock() - ts_source_info->get_last_access_ts()
+                   < TS_SOURCE_INFO_OBSOLETE_TIME) {
+      // A returning tenant may have accessed the source after the scan.
+      ret = OB_EAGAIN;
+    } else if (OB_FAIL(ts_source_info_map_.del(tenant_info, ts_source_info))) {
+      TRANS_LOG(WARN, "delete tenant from hashmap failed", K(ret), K(tenant_id));
+    } else if (NULL != cached) {
+      ATOMIC_STORE(&ts_source_infos_[tenant_id], NULL);
+      cache_removed = true;
     }
+    lock_.wrunlock();
+  }
+  // ObLightHashMap::del only unlinks and drops map ownership. Our get()
+  // pins this exact source so its final destruction occurs outside lock_.
+  if (cache_removed) {
+    ts_source_info_map_.revert(cached);
+  }
+  if (NULL != ts_source_info) {
+    ts_source_info_map_.revert(ts_source_info);
   }
   if (OB_SUCCESS == ret) {
     TRANS_LOG(INFO, "delete tenant success", K(tenant_id));
-  } else {
+  } else if (OB_EAGAIN != ret) {
     TRANS_LOG(WARN, "delete tenant failed", KR(ret), K(tenant_id));
   }
   return ret;
@@ -738,7 +789,7 @@ int ObTsMgr::remove_dropped_tenant(const uint64_t tenant_id)
     TRANS_LOG(WARN, "invalid argument", KR(ret), K(tenant_id));
   } else {
     ObTsSourceInfo *ts_source_info = NULL;
-    ObTsTenantInfo tenant_info(tenant_id);
+    ObTsSourceInfoKey tenant_info(tenant_id);
     ObTsSourceInfoGuard info_guard;
     if (OB_FAIL(get_ts_source_info_opt_(tenant_id, info_guard, false, false))) {
       if (OB_ENTRY_NOT_EXIST == ret) {
@@ -1121,8 +1172,8 @@ int ObTsMgr::get_ts_source_info_opt_(const uint64_t tenant_id, ObTsSourceInfoGua
 {
   int ret = OB_SUCCESS;
   ObTsSourceInfo *ts_source_info = NULL;
+  lock_.rdlock();
   if (OB_LIKELY(tenant_id < TS_SOURCE_INFO_CACHE_NUM)) {
-    lock_.rdlock();
     ObTsSourceInfo **ptr = &(ts_source_infos_[tenant_id]);
     ts_source_info = ATOMIC_LOAD(ptr);
     if (OB_ISNULL(ts_source_info)) {
@@ -1139,13 +1190,13 @@ int ObTsMgr::get_ts_source_info_opt_(const uint64_t tenant_id, ObTsSourceInfoGua
       }
       guard.set(ts_source_info, this, false, tenant_id);
     }
-    if (OB_FAIL(ret)) {
-      lock_.rdunlock();
-    }
   } else {
     if (OB_FAIL(get_ts_source_info_(tenant_id, guard, need_create_tenant, need_update_access_ts))) {
       TRANS_LOG(WARN, "get ts source info failed", K(ret), K(tenant_id));
     }
+  }
+  if (OB_FAIL(ret)) {
+    lock_.rdunlock();
   }
   return ret;
 }
@@ -1154,7 +1205,7 @@ int ObTsMgr::get_ts_source_info_(const uint64_t tenant_id, ObTsSourceInfoGuard &
     const bool need_create_tenant, const bool need_update_access_ts)
 {
   int ret = OB_SUCCESS;
-  ObTsTenantInfo tenant_info(tenant_id);
+  ObTsSourceInfoKey tenant_info(tenant_id);
   ObTsSourceInfo *ts_source_info = NULL;
   if (OB_FAIL(ts_source_info_map_.get(tenant_info, ts_source_info))) {
     if (OB_ENTRY_NOT_EXIST == ret) {
@@ -1189,9 +1240,7 @@ int ObTsMgr::get_ts_source_info_(const uint64_t tenant_id, ObTsSourceInfoGuard &
 
 void ObTsMgr::revert_ts_source_info_(ObTsSourceInfoGuard &guard)
 {
-  if (OB_LIKELY(guard.get_tenant_id() < TS_SOURCE_INFO_CACHE_NUM)) {
-    lock_.rdunlock();
-  }
+  lock_.rdunlock();
   if (guard.need_revert()) {
     (void)ts_source_info_map_.revert(guard.get_ts_source_info());
   }
@@ -1204,7 +1253,7 @@ int ObTsMgr::add_tenant_(const uint64_t tenant_id)
   ObTimeGuard timeguard("add ts tenant");
   ObMemAttr memattr(OB_SERVER_TENANT_ID, ObModIds::OB_GTS_TASK_QUEUE);
   SET_USE_500(memattr);
-  ObTsTenantInfo tenant_info(tenant_id);
+  ObTsSourceInfoKey tenant_info(tenant_id);
   ObTsSourceInfo *ts_source_info = NULL;
 
   if (OB_ISNULL(ptr = ob_malloc(sizeof(ObTsSourceInfo), memattr))) {
@@ -1220,7 +1269,9 @@ int ObTsMgr::add_tenant_(const uint64_t tenant_id)
         TRANS_LOG(WARN, "gts_source init error", KR(ret));
       } else if (OB_FAIL(ts_source_info->init(tenant_id))) {
         TRANS_LOG(WARN, "ts source init failed", KR(ret));
-      } else if (OB_FAIL(ts_source_info_map_.insert_and_get(tenant_info, ts_source_info))) {
+      } else if (OB_FAIL(ts_source_info_map_.insert_and_get(tenant_info, ts_source_info, nullptr /* old_value */))) {
+        // A concurrent creator may have won. No reference to that source is
+        // needed here: discard our candidate and let the caller retry lookup.
         if (OB_ENTRY_EXIST != ret) {
           TRANS_LOG(WARN, "wait queue hashmap insert error", KR(ret), KP(ts_source_info));
         }
@@ -1263,7 +1314,7 @@ int ObTsMgr::interrupt_gts_callback_for_ls_offline(const uint64_t tenant_id,
     TRANS_LOG(WARN, "invalid argument", KR(ret), K(tenant_id));
   } else {
     ObTsSourceInfo *ts_source_info = NULL;
-    ObTsTenantInfo tenant_info(tenant_id);
+    ObTsSourceInfoKey tenant_info(tenant_id);
     ObTsSourceInfoGuard info_guard;
     if (OB_FAIL(get_ts_source_info_opt_(tenant_id, info_guard, false, false))) {
       if (OB_ENTRY_NOT_EXIST == ret) {
