@@ -1421,7 +1421,7 @@ int ObCreateTableHelper::operation_before_commit_() {
   // on_commit() 将 pin[0] 设为 T_create，与 index published 对齐并防 GC。
   } else if (!new_tables_.empty() && new_tables_.at(0).has_async_index()
              && OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(
-                    new_tables_.at(0), true, get_trans_()))) {
+                    new_tables_.at(0), get_trans_()))) {
     LOG_WARN("failed to register initial async-index membership",
              K(ret), K_(tenant_id), "table_id", new_tables_.at(0).get_table_id());
   } else if (!new_tables_.empty() && new_tables_.at(0).has_async_index()

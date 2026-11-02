@@ -72,6 +72,34 @@ TEST_F(TestAsyncIndexRefreshInfo, merge_floor_pin_preserves_checkpoints_and_meta
   EXPECT_EQ(250, next);
 }
 
+TEST_F(TestAsyncIndexRefreshInfo, initial_build_pin_survives_commit_and_full_checkpoints)
+{
+  ObTabletAsyncIndexRefreshInfo info;
+  ObTabletAsyncIndexRefreshInfo pin;
+  share::SCN commit_version;
+  share::SCN commit_scn;
+  ASSERT_EQ(OB_SUCCESS, commit_version.convert_for_tx(200));
+  ASSERT_EQ(OB_SUCCESS, commit_scn.convert_for_tx(201));
+  info.set_has_async_index(true);
+  ASSERT_EQ(OB_SUCCESS, info.append_refresh_snapshot(100));
+  ASSERT_EQ(OB_SUCCESS, info.init_pending_refresh_snapshot());
+  info.on_commit(commit_version, commit_scn);
+  ASSERT_EQ(100, info.get_refresh_snapshots().at(0));
+  for (int64_t i = 1; i < MAX_INC_MAJOR_SSTABLE_CNT; ++i) {
+    ASSERT_EQ(OB_SUCCESS, info.append_refresh_snapshot(200 + i));
+  }
+  ASSERT_EQ(OB_SUCCESS, pin.append_refresh_snapshot(100));
+  EXPECT_FALSE(info.need_apply_floor_pin(pin));
+  ASSERT_EQ(OB_SUCCESS, info.merge_floor_pin(pin));
+  ASSERT_EQ(MAX_INC_MAJOR_SSTABLE_CNT, info.get_refresh_snapshots().count());
+  EXPECT_EQ(100, info.get_refresh_snapshots().at(0));
+  for (int64_t i = 1; i < MAX_INC_MAJOR_SSTABLE_CNT; ++i) {
+    EXPECT_EQ(200 + i, info.get_refresh_snapshots().at(i));
+  }
+  EXPECT_TRUE(info.has_async_index());
+  EXPECT_FALSE(info.has_published_version());
+}
+
 TEST_F(TestAsyncIndexRefreshInfo, merge_floor_pin_empty_and_capacity)
 {
   ObTabletAsyncIndexRefreshInfo info;
@@ -155,6 +183,40 @@ TEST_F(TestAsyncIndexRefreshInfo, published_version_value_semantics)
   ASSERT_TRUE(info.is_valid());
   ASSERT_TRUE(info.need_fill_commit_version());
   ASSERT_FALSE(info.has_published_version());
+}
+
+TEST_F(TestAsyncIndexRefreshInfo, initial_commit_pin_matches_index_publication)
+{
+  ObTabletAsyncIndexRefreshInfo data_info;
+  ObTabletAsyncIndexRefreshInfo index_info;
+  share::SCN commit_version;
+  share::SCN commit_scn;
+  ASSERT_EQ(OB_SUCCESS, commit_version.convert_for_tx(300));
+  ASSERT_EQ(OB_SUCCESS, commit_scn.convert_for_tx(400));
+  data_info.set_has_async_index(true);
+  data_info.set_published_version(ObTabletAsyncIndexRefreshInfo::USE_COMMIT_REFRESH_SNAPSHOT);
+  ASSERT_EQ(OB_SUCCESS, data_info.init_pending_refresh_snapshot());
+  index_info.set_published_version(ObTabletAsyncIndexRefreshInfo::USE_COMMIT_VERSION);
+
+  data_info.on_commit(commit_version, commit_scn);
+  index_info.on_commit(commit_version, commit_scn);
+  ASSERT_TRUE(data_info.is_valid_for_refresh());
+  ASSERT_TRUE(data_info.has_async_index());
+  ASSERT_FALSE(data_info.has_published_version());
+  ASSERT_EQ(1, data_info.get_refresh_snapshots().count());
+  EXPECT_EQ(300, data_info.get_refresh_snapshots().at(0));
+  EXPECT_EQ(300, index_info.get_published_version());
+
+  // The data retention point and index publication resolve to the same C, not commit SCN.
+  // Later DML advances the refresh checkpoint from C to T.
+  int64_t next = 0;
+  EXPECT_EQ(OB_ITER_END, data_info.get_next_refresh_snapshot(300, next));
+  ASSERT_EQ(OB_SUCCESS, data_info.append_refresh_snapshot(500));
+  ASSERT_EQ(OB_SUCCESS, data_info.get_next_refresh_snapshot(300, next));
+  EXPECT_EQ(500, next);
+  ASSERT_EQ(OB_SUCCESS, data_info.cleanup_retired_snapshots(500));
+  ASSERT_EQ(1, data_info.get_refresh_snapshots().count());
+  EXPECT_EQ(500, data_info.get_refresh_snapshots().at(0));
 }
 
 TEST_F(TestAsyncIndexRefreshInfo, create_bootstrap_uses_commit_version)

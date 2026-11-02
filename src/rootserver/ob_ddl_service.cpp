@@ -8434,8 +8434,13 @@ int ObDDLService::alter_table_index(obrpc::ObAlterTableArg &alter_table_arg,
                 }
 
                 if (OB_SUCC(ret) && need_init_async_index_membership) {
-                  if (OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(
-                          new_table_schema, true, trans))) {
+                  int64_t initial_snapshot = 0;
+                  if (!create_index_arg->is_offline_or_restore() && !new_table_schema.is_user_hidden_table()) {
+                    initial_snapshot = new_fetched_snapshot;
+                  }
+                  // Pin before background maintenance can fill the checkpoint array.
+                  // Later indexes in this ALTER inherit this protection without resetting it.
+                  if (OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(new_table_schema, trans, initial_snapshot))) {
                     LOG_WARN("failed to register async index membership",
                         K(ret), K(new_table_schema.get_table_id()));
                   }
@@ -14669,6 +14674,13 @@ int ObDDLService::update_global_index(ObAlterTableArg &arg,
         } else if (OB_UNLIKELY(op_type >= MAX_OP_TYPE || op_type < USE_OLD_UPDATE_FUNC)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("unexpected op type", KR(ret), K(op_type), K(data_table_id), K(index_table_id));
+        } else if (orig_table_schema.has_async_index() && arg.is_update_global_indexes_
+                   && (USE_OLD_UPDATE_FUNC == op_type || DROP_AND_CREATE_INDEX == op_type)
+                   && !share::ObAsyncIndexRefreshUtil::is_async_index_refresh_enabled(tenant_id)) {
+          ret = OB_OP_NOT_ALLOW;
+          LOG_WARN("rebuild global index on async-index table requires refresh", KR(ret),
+                   K(tenant_id), K(data_table_id), K(index_table_id), K(op_type));
+          LOG_USER_ERROR(OB_OP_NOT_ALLOW, "rebuild global index on async-index table while _enable_async_index_refresh is false");
         } else if (WRITE_TRUNCATE_INFO == op_type) {
           // truncate_service will be inited in func decide_global_index_suggest_op_type_()
           if (OB_FAIL(truncate_service.execute(trans, ddl_operator, new_index_table_schema))) {
@@ -16341,8 +16353,13 @@ int ObDDLService::alter_table_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
         ObArray<AlterTableSchema*> inc_table_schemas;
         ObArray<AlterTableSchema*> del_table_schemas;
         ObArray<ObTableSchema*> upd_table_schemas;
-        ObArray<obrpc::ObLSTabletPair> truncate_membership_tablets;
-        ObArray<obrpc::ObLSTabletPair> truncate_index_published_tablets;
+        const bool creates_partition_tablets =
+            obrpc::ObAlterTableArg::ADD_PARTITION == alter_table_arg.alter_part_type_
+            || obrpc::ObAlterTableArg::ADD_SUB_PARTITION == alter_table_arg.alter_part_type_
+            || obrpc::ObAlterTableArg::TRUNCATE_PARTITION == alter_table_arg.alter_part_type_
+            || obrpc::ObAlterTableArg::TRUNCATE_SUB_PARTITION == alter_table_arg.alter_part_type_;
+        ObArray<obrpc::ObLSTabletPair> partition_membership_tablets;
+        ObArray<obrpc::ObLSTabletPair> partition_index_published_tablets;
         ObArenaAllocator allocator("ModifyPart");
         //table partitions
         ObArray<int64_t> new_partition_ids;
@@ -16649,10 +16666,7 @@ int ObDDLService::alter_table_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
           }
 
           if (OB_FAIL(ret)) {
-          } else if (obrpc::ObAlterTableArg::ADD_PARTITION == alter_table_arg.alter_part_type_
-                     || obrpc::ObAlterTableArg::ADD_SUB_PARTITION == alter_table_arg.alter_part_type_
-                     || obrpc::ObAlterTableArg::TRUNCATE_PARTITION == alter_table_arg.alter_part_type_
-                     || obrpc::ObAlterTableArg::TRUNCATE_SUB_PARTITION == alter_table_arg.alter_part_type_) {
+          } else if (creates_partition_tablets) {
             SCN frozen_scn;
             const bool need_check_tablet_cnt = obrpc::ObAlterTableArg::ADD_PARTITION == alter_table_arg.alter_part_type_
                      || obrpc::ObAlterTableArg::ADD_SUB_PARTITION == alter_table_arg.alter_part_type_;
@@ -16709,26 +16723,27 @@ int ObDDLService::alter_table_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
 
           if (OB_FAIL(ret)) {
           } else if (new_table_schema.has_async_index()) {
-            if (obrpc::ObAlterTableArg::TRUNCATE_PARTITION == alter_table_arg.alter_part_type_
-             || obrpc::ObAlterTableArg::TRUNCATE_SUB_PARTITION == alter_table_arg.alter_part_type_) {
+            // Initialize only the new tablets at this DDL's commit version.
+            // Existing partitions must retain their current refresh progress.
+            if (creates_partition_tablets) {
               ObArray<ObTabletID> inc_data_tablet_ids;
               if (OB_FAIL(get_tablets_with_table_id_(inc_table_schemas, new_table_schema.get_table_id(), inc_data_tablet_ids))) {
-                LOG_WARN("fail to get inc data tablet ids for truncate async membership", KR(ret), K(new_table_schema.get_table_id()));
+                LOG_WARN("fail to get inc data tablet ids for partition async membership", KR(ret), K(new_table_schema.get_table_id()));
               } else if (OB_UNLIKELY(inc_data_tablet_ids.count() != ls_id_array.count())) {
                 ret = OB_ERR_UNEXPECTED;
-                LOG_WARN("inc data tablet count and ls count mismatch for truncate async membership", KR(ret), K(inc_data_tablet_ids.count()), K(ls_id_array.count()));
+                LOG_WARN("inc data tablet count and ls count mismatch for partition async membership", KR(ret), K(inc_data_tablet_ids.count()), K(ls_id_array.count()));
               } else {
                 for (int64_t i = 0; OB_SUCC(ret) && i < inc_data_tablet_ids.count(); i++) {
                   obrpc::ObLSTabletPair ls_tablet_pair;
                   ls_tablet_pair.ls_id_ = ls_id_array.at(i);
                   ls_tablet_pair.tablet_id_ = inc_data_tablet_ids.at(i);
-                  if (OB_FAIL(truncate_membership_tablets.push_back(ls_tablet_pair))) {
-                    LOG_WARN("fail to push back truncate async membership tablet", KR(ret), K(ls_tablet_pair));
+                  if (OB_FAIL(partition_membership_tablets.push_back(ls_tablet_pair))) {
+                    LOG_WARN("fail to push back partition async membership tablet", KR(ret), K(ls_tablet_pair));
                   }
                 }
                 if (FAILEDx(collect_async_index_partition_ls_tablets_(
-                            new_table_schemas, inc_table_schemas, ls_id_array, truncate_index_published_tablets))) {
-                  LOG_WARN("fail to collect async index partition ls tablets for truncate published version", KR(ret));
+                            new_table_schemas, inc_table_schemas, ls_id_array, partition_index_published_tablets))) {
+                  LOG_WARN("fail to collect async index partition ls tablets for partition published version", KR(ret));
                 }
               }
             }
@@ -17032,18 +17047,17 @@ int ObDDLService::alter_table_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
         }
         if (FAILEDx(storage::ObSessionTabletGCHelper::is_table_has_active_session(orig_table_schema, &alter_table_arg))) {
           LOG_WARN("table has active session or error checking", KR(ret), K(alter_table_arg), KPC(orig_table_schema));
-        } else if (new_table_schema.has_async_index()
-                   && (obrpc::ObAlterTableArg::TRUNCATE_PARTITION == alter_table_arg.alter_part_type_
-                    || obrpc::ObAlterTableArg::TRUNCATE_SUB_PARTITION == alter_table_arg.alter_part_type_)) {
-          if (OB_UNLIKELY(truncate_membership_tablets.empty())) {
+        } else if (new_table_schema.has_async_index() && creates_partition_tablets) {
+          if (OB_UNLIKELY(partition_membership_tablets.empty())) {
             ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("truncate async membership tablets empty", KR(ret), K(tenant_id), K(new_table_schema.get_table_id()));
-          } else if (OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_ls_tablets_membership(tenant_id, truncate_membership_tablets, true, trans))) {
-            LOG_WARN("failed to register async-index membership after truncate partition ddl", KR(ret), K(truncate_membership_tablets));
-          } else if (!truncate_index_published_tablets.empty()
+            LOG_WARN("partition async membership tablets empty", KR(ret), K(tenant_id), K(new_table_schema.get_table_id()));
+          } else if (OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_ls_tablets_membership(
+                         tenant_id, partition_membership_tablets, trans))) {
+            LOG_WARN("failed to register async-index membership after add/truncate partition ddl", KR(ret), K(partition_membership_tablets));
+          } else if (!partition_index_published_tablets.empty()
                      && OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::
-                                register_ls_tablets_initial_published_versions(tenant_id, truncate_index_published_tablets, trans))) {
-            LOG_WARN("failed to register async-index initial published versions for truncate partition",
+                                register_ls_tablets_initial_published_versions(tenant_id, partition_index_published_tablets, trans))) {
+            LOG_WARN("failed to register async-index initial published versions for add/truncate partition",
                      KR(ret), K(tenant_id), "table_id", new_table_schema.get_table_id());
           }
         }
@@ -21760,7 +21774,7 @@ int ObDDLService::truncate_table_in_trans(const obrpc::ObTruncateTableArg &arg,
       LOG_WARN("update ddl task status failed", K(ret));
     } else if (table_schemas.at(0).has_async_index()
                && OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(
-                      table_schemas.at(0), true, trans))) {
+                      table_schemas.at(0), trans))) {
       LOG_WARN("failed to register async-index membership for truncated table",
                KR(ret), K(tenant_id),
                "table_id", table_schemas.at(0).get_table_id());
@@ -22578,7 +22592,7 @@ int ObDDLService::create_user_hidden_table(const ObTableSchema &orig_table_schem
       } else if (OB_FAIL(table_creator.execute())) {
         LOG_WARN("fail to execute create tablet", KR(ret));
       } else if (hidden_table_schema.has_async_index()
-                 && OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(hidden_table_schema, true, trans))) {
+                 && OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(hidden_table_schema, trans))) {
         LOG_WARN("failed to register async-index membership for hidden table",KR(ret), K(tenant_id),
                  "table_id", hidden_table_schema.get_table_id());
       }
@@ -27066,7 +27080,7 @@ int ObDDLService::new_truncate_table_in_trans(const ObIArray<const ObTableSchema
     // flag alone does not initialize tablet MDS state.
     if (OB_SUCC(ret) && new_table_schemas.at(0)->has_async_index()
         && OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(
-               *new_table_schemas.at(0), true, trans))) {
+               *new_table_schemas.at(0), trans))) {
       LOG_WARN("failed to register async-index membership for truncated table",
                KR(ret), K(tenant_id),
                "table_id", new_table_schemas.at(0)->get_table_id());

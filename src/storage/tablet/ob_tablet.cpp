@@ -6769,8 +6769,7 @@ int ObTablet::get_min_async_index_snapshot(int64_t &min_async_index_snapshot) co
   } else if (refresh_info.has_async_index()) {
     const ObIArray<int64_t> &snapshots = refresh_info.get_refresh_snapshots();
     if (!refresh_info.is_valid_for_refresh()) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("async index refresh snapshots not ready", K(ret), K(ls_id), K(tablet_id), K(refresh_info));
+      // no need to keep any snapshot for async index
     } else if (!snapshots.empty()) {
       // The cleanup protocol retains the checkpoint equal to the minimum
       // published snapshot, so the ordered array head is the persisted GC boundary.

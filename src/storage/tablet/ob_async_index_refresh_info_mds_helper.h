@@ -61,15 +61,17 @@ public:
   // Register an explicit membership value for every data tablet in the same
   // SQL transaction that changes the table schema flag. This method also
   // serializes membership changes with background refresh-info maintenance.
+  // Pass the build snapshot for the first online async index to pin it atomically.
+  // Zero protects the commit version for new empty tablets; hidden tables only
+  // initialize membership.
   static int register_membership(
       const share::schema::ObTableSchema &data_table_schema,
-      const bool has_async_index,
-      common::ObMySQLTransaction &trans);
+      common::ObMySQLTransaction &trans,
+      const int64_t initial_snapshot = 0);
   // Register membership for tablets whose LS mapping is already known.
   static int register_ls_tablets_membership(
       const uint64_t tenant_id,
       const common::ObIArray<obrpc::ObLSTabletPair> &ls_tablets,
-      const bool has_async_index,
       common::ObMySQLTransaction &trans);
   // Register published_version for async-index TARGET tablets whose LS mapping is already known.
   static int register_ls_tablets_initial_published_versions(
@@ -114,8 +116,8 @@ private:
       common::ObMySQLTransaction &trans);
   static int register_membership_(
       const share::schema::ObTableSchema &data_table_schema,
-      const bool has_async_index,
-      common::ObMySQLTransaction &trans);
+      common::ObMySQLTransaction &trans,
+      const int64_t initial_snapshot);
   static int register_refresh_info_(
       const uint64_t tenant_id,
       const share::ObLSID &ls_id,
@@ -133,7 +135,6 @@ private:
   static int register_ls_tablets_membership_(
       const uint64_t tenant_id,
       const common::ObIArray<obrpc::ObLSTabletPair> &ls_tablets,
-      const bool has_async_index,
       common::ObMySQLTransaction &trans);
   static int register_ls_tablets_refresh_info_(
       const uint64_t tenant_id,

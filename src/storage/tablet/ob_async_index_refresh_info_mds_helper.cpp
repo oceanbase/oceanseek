@@ -33,29 +33,32 @@ OB_SERIALIZE_MEMBER(ObTabletAsyncIndexRefreshInfoArg, ls_id_, tablet_id_, info_,
 
 int ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(
     const share::schema::ObTableSchema &data_table_schema,
-    const bool has_async_index,
-    common::ObMySQLTransaction &trans)
+    common::ObMySQLTransaction &trans,
+    const int64_t initial_snapshot)
 {
-  return register_membership_(
-      data_table_schema, has_async_index, trans);
+  return register_membership_(data_table_schema, trans, initial_snapshot);
 }
 
 int ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership_(
     const share::schema::ObTableSchema &data_table_schema,
-    const bool has_async_index,
-    common::ObMySQLTransaction &trans)
+    common::ObMySQLTransaction &trans,
+    const int64_t initial_snapshot)
 {
   int ret = OB_SUCCESS;
   common::ObArray<common::ObTabletID> tablet_ids;
   ObTabletAsyncIndexRefreshInfo refresh_info;
+  const bool has_async_index = data_table_schema.has_async_index();
   refresh_info.set_has_async_index(has_async_index);
-  if (has_async_index && !data_table_schema.is_user_hidden_table()) {
+  if (has_async_index && 0 == initial_snapshot && !data_table_schema.is_user_hidden_table()) {
     refresh_info.set_published_version(ObTabletAsyncIndexRefreshInfo::USE_COMMIT_REFRESH_SNAPSHOT);
   }
-  if (OB_UNLIKELY(!data_table_schema.is_valid())) {
+  if (OB_UNLIKELY(!data_table_schema.is_valid() || initial_snapshot < 0
+                  || (initial_snapshot > 0 && !has_async_index))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid data table schema for async-index membership", K(ret),
              K(data_table_schema));
+  } else if (initial_snapshot > 0 && OB_FAIL(refresh_info.append_refresh_snapshot(initial_snapshot))) {
+    LOG_WARN("failed to pin initial build snapshot", K(ret), K(initial_snapshot));
   } else if (OB_FAIL(refresh_info.init_pending_refresh_snapshot())) {
     LOG_WARN("failed to init pending refresh snapshot for async-index membership",
              K(ret), "table_id", data_table_schema.get_table_id());
@@ -402,7 +405,6 @@ int ObTabletAsyncIndexRefreshInfoMdsHelper::register_tablets_refresh_info_(
 int ObTabletAsyncIndexRefreshInfoMdsHelper::register_ls_tablets_membership_(
     const uint64_t tenant_id,
     const common::ObIArray<obrpc::ObLSTabletPair> &ls_tablets,
-    const bool has_async_index,
     common::ObMySQLTransaction &trans)
 {
   int ret = OB_SUCCESS;
@@ -410,16 +412,13 @@ int ObTabletAsyncIndexRefreshInfoMdsHelper::register_ls_tablets_membership_(
   if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id || ls_tablets.empty())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid async-index membership arguments", K(ret), K(tenant_id),
-             K(ls_tablets), K(has_async_index));
+             K(ls_tablets));
   } else {
-    refresh_info.set_has_async_index(has_async_index);
-    if (has_async_index) {
-      refresh_info.set_published_version(ObTabletAsyncIndexRefreshInfo::USE_COMMIT_REFRESH_SNAPSHOT);
-      if (OB_FAIL(refresh_info.init_pending_refresh_snapshot())) {
-        LOG_WARN("failed to init pending refresh snapshot for async-index membership", K(ret), K(refresh_info));
-      }
-    }
-    if (OB_SUCC(ret) && OB_FAIL(register_ls_tablets_refresh_info_(tenant_id, ls_tablets, refresh_info, trans, "AsyncIdxMship"))) {
+    refresh_info.set_has_async_index(true);
+    refresh_info.set_published_version(ObTabletAsyncIndexRefreshInfo::USE_COMMIT_REFRESH_SNAPSHOT);
+    if (OB_FAIL(refresh_info.init_pending_refresh_snapshot())) {
+      LOG_WARN("failed to init pending refresh snapshot for async-index membership", K(ret), K(refresh_info));
+    } else if (OB_FAIL(register_ls_tablets_refresh_info_(tenant_id, ls_tablets, refresh_info, trans, "AsyncIdxMship"))) {
       LOG_WARN("failed to register async-index membership", K(ret), K(tenant_id), K(ls_tablets), K(refresh_info));
     }
   }
@@ -477,20 +476,19 @@ int ObTabletAsyncIndexRefreshInfoMdsHelper::register_ls_tablets_refresh_info_(
 int ObTabletAsyncIndexRefreshInfoMdsHelper::register_ls_tablets_membership(
     const uint64_t tenant_id,
     const common::ObIArray<obrpc::ObLSTabletPair> &ls_tablets,
-    const bool has_async_index,
     common::ObMySQLTransaction &trans)
 {
   int ret = OB_SUCCESS;
   common::ObArray<obrpc::ObLSTabletPair> sorted_ls_tablets;
   if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id || ls_tablets.empty())) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid async-index membership arguments", K(ret), K(tenant_id), K(ls_tablets), K(has_async_index));
+    LOG_WARN("invalid async-index membership arguments", K(ret), K(tenant_id), K(ls_tablets));
   } else if (OB_FAIL(sorted_ls_tablets.assign(ls_tablets))) {
     LOG_WARN("failed to assign async-index membership ls tablets", K(ret), K(tenant_id), K(ls_tablets));
   } else {
     lib::ob_sort(sorted_ls_tablets.begin(), sorted_ls_tablets.end());
-    if (OB_FAIL(register_ls_tablets_membership_(tenant_id, sorted_ls_tablets, has_async_index, trans))) {
-      LOG_WARN("failed to register async-index membership for ls tablets", K(ret), K(tenant_id), K(sorted_ls_tablets), K(has_async_index));
+    if (OB_FAIL(register_ls_tablets_membership_(tenant_id, sorted_ls_tablets, trans))) {
+      LOG_WARN("failed to register async-index membership for ls tablets", K(ret), K(tenant_id), K(sorted_ls_tablets));
     }
   }
   return ret;

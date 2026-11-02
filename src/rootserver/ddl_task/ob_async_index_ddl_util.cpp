@@ -140,7 +140,7 @@ int ObAsyncIndexDDLUtil::clear_async_index_table_options(
                                                                &ddl_stmt_str))) {
           LOG_WARN("failed to update data table schema attribute", K(ret), K(new_table_schema));
         } else if (OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(
-                       new_table_schema, false, trans))) {
+                       new_table_schema, trans))) {
           LOG_WARN("failed to register async-index DROP membership in schema transaction",
                    K(ret), K(tenant_id), "table_id", new_table_schema.get_table_id());
         }

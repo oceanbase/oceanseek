@@ -337,6 +337,37 @@ TEST_F(TestAsyncIndexRefreshInfoMds, commit_version_placeholder_is_resolved)
     ASSERT_EQ(create_published_version, trans_version.get_val_for_tx());
   }
 
+  // 未提交的同值或更高水位刷新不能覆盖已提交 CREATE 的逻辑水位 C。
+  // 本测试只注册 MDS 来构造并发窗口，不执行刷新 SQL；回滚后仍应返回 C。
+  for (int64_t offset = 0; offset < 2; ++offset) {
+    ObTabletAsyncIndexRefreshInfo pending_info;
+    pending_info.set_published_version(create_published_version + offset);
+    ObMySQLTransaction pending_trans;
+    EQ(OB_SUCCESS, pending_trans.start(GCTX.sql_proxy_, R.tenant_id_));
+    EQ(OB_SUCCESS, register_refresh_info_in_trans(tablet_id, ls_id, pending_info, pending_trans));
+    MTL_SWITCH(R.tenant_id_) {
+      ObLSHandle ls_handle;
+      EQ(OB_SUCCESS, MTL(ObLSService *)->get_ls(ls_id, ls_handle, ObLSGetMod::TRANS_MOD));
+      ObTabletHandle tablet_handle;
+      EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(tablet_id, tablet_handle));
+      ObTablet *tablet = tablet_handle.get_obj();
+      tablet->table_store_cache_.is_async_index_refresh_target_ = true;
+      tablet->tablet_status_cache_.set_value(
+          tablet->tablet_status_cache_.get_tablet_status(), create_published_version,
+          tablet->tablet_status_cache_.get_delete_commit_version());
+      int64_t published_version = 0;
+      // 此处覆盖尚未 prepare 的记录：已提交读可跳过它，不额外返回重试。
+      tablet->async_index_membership_cache_.reset();
+      EQ(OB_SUCCESS, tablet->get_latest_async_index_published_version(published_version));
+      ASSERT_EQ(create_published_version, published_version);
+      EQ(OB_SUCCESS, pending_trans.end(false /* commit */));
+      // 回滚后重新读取 MDS，逻辑水位仍为已提交的 C。
+      tablet->async_index_membership_cache_.reset();
+      EQ(OB_SUCCESS, tablet->get_latest_async_index_published_version(published_version));
+      ASSERT_EQ(create_published_version, published_version);
+    }
+  }
+
   // A later refresh may publish the same numeric value C while its physical
   // INC is not visible yet. Its MDS row commits at D, so D != C prevents it
   // from being mistaken for the original CREATE bootstrap row.
