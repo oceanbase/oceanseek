@@ -166,12 +166,12 @@ TEST_F(TestVectorIndexFreeze, simple_test)
   ASSERT_EQ(OB_SUCCESS, sql_proxy.write("alter system set ob_vector_index_active_segment_max_size='100GB'", affected_rows));
   ASSERT_EQ(OB_SUCCESS, get_curr_simple_server().get_sql_proxy().write("alter system set_tp tp_name = ERRSIM_VEC_DISABLE_MERGE, error_code = 1, occur = 1, frequency = 1", affected_rows));
   const bool support_duplicate = ObVectorIndexUtil::is_hgraph_duplicate_capability_ready();
-  // Older clusters reject an explicit SUPPORT_DUPLICATE parameter, even when false.
+  // Older clusters reject an explicit DUPLICATE_GROUP parameter, even when false.
   ObSqlString create_table_sql;
   ASSERT_EQ(OB_SUCCESS, create_table_sql.assign_fmt(
       "create table t1 (c1 int auto_increment, embedding vector(18), primary key(c1), "
       "vector index vec_idx1(embedding) with (distance=cosine,type=hnsw_bq,lib=vsag%s))",
-      support_duplicate ? ",support_duplicate=true" : ""));
+      support_duplicate ? ",duplicate_group=true" : ""));
   ASSERT_EQ(OB_SUCCESS, sql_proxy.write(create_table_sql.ptr(), affected_rows));
   int64_t inc_tablet_id = 0;
   ASSERT_EQ(OB_SUCCESS, SSH::select_int64(
@@ -658,12 +658,12 @@ TEST_F(TestVectorIndexFreeze, partition_table)
   const bool support_duplicate = ObVectorIndexUtil::is_hgraph_duplicate_capability_ready();
   const ObVectorIndexAlgorithmType expected_index_type = support_duplicate
       ? ObVectorIndexAlgorithmType::VIAT_HGRAPH : ObVectorIndexAlgorithmType::VIAT_HNSW;
-  // Older clusters reject an explicit SUPPORT_DUPLICATE parameter, even when false.
+  // Older clusters reject an explicit DUPLICATE_GROUP parameter, even when false.
   ObSqlString create_table_sql;
   ASSERT_EQ(OB_SUCCESS, create_table_sql.assign_fmt(
       "create table t1 (c1 int auto_increment, embedding vector(18), primary key(c1), "
       "vector index vec_idx1(embedding) with (distance=cosine,type=hnsw,lib=vsag%s)) partition by key(c1) partitions 2",
-      support_duplicate ? ",support_duplicate=true" : ""));
+      support_duplicate ? ",duplicate_group=true" : ""));
   ASSERT_EQ(OB_SUCCESS, sql_proxy.write(create_table_sql.ptr(), affected_rows));
   int64_t inc_tablet_id = 0;
   ASSERT_EQ(OB_SUCCESS, SSH::select_int64(

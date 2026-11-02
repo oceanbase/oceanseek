@@ -460,35 +460,61 @@ TEST_F(TestVectorIndexSerialize, duplicate_mode_internal_parser)
   ASSERT_FALSE(param.support_duplicate_);
 
   param.reset();
-  ASSERT_EQ(OB_SUCCESS, share::ObVectorIndexUtil::parser_params_from_string(
+  ASSERT_EQ(OB_INVALID_ARGUMENT, share::ObVectorIndexUtil::parser_params_from_string(
       ObString::make_string("TYPE=HNSW, DISTANCE=COSINE, SUPPORT_DUPLICATE=TRUE"),
+      share::ObVectorIndexType::VIT_HNSW_INDEX, param));
+
+  param.reset();
+  ASSERT_EQ(OB_SUCCESS, share::ObVectorIndexUtil::parser_params_from_string(
+      ObString::make_string("TYPE=HNSW, DISTANCE=COSINE, DUPLICATE_GROUP=TRUE"),
       share::ObVectorIndexType::VIT_HNSW_INDEX, param));
   ASSERT_TRUE(param.support_duplicate_);
 
   param.reset();
   ASSERT_EQ(OB_SUCCESS, share::ObVectorIndexUtil::parser_params_from_string(
-      ObString::make_string("TYPE=HNSW, DISTANCE=COSINE, SUPPORT_DUPLICATE=FALSE"),
+      ObString::make_string("TYPE=HNSW, DISTANCE=COSINE, DUPLICATE_GROUP=FALSE"),
       share::ObVectorIndexType::VIT_HNSW_INDEX, param));
   ASSERT_FALSE(param.support_duplicate_);
 
   param.reset();
   ASSERT_EQ(OB_NOT_SUPPORTED, share::ObVectorIndexUtil::parser_params_from_string(
-      ObString::make_string("TYPE=HNSW, DISTANCE=COSINE, SUPPORT_DUPLICATE=MAYBE"),
+      ObString::make_string("TYPE=HNSW, DISTANCE=COSINE, DUPLICATE_GROUP=MAYBE"),
       share::ObVectorIndexType::VIT_HNSW_INDEX, param));
 
   // DDL compatibility checks may parse serialized HNSW parameters through a
   // generic/IVF category.  The persisted TYPE, rather than that call-site
-  // category, determines whether SUPPORT_DUPLICATE is valid.
+  // category, determines whether DUPLICATE_GROUP is valid.
   param.reset();
   ASSERT_EQ(OB_SUCCESS, share::ObVectorIndexUtil::parser_params_from_string(
-      ObString::make_string("TYPE=HNSW, DISTANCE=COSINE, SUPPORT_DUPLICATE=TRUE"),
+      ObString::make_string("TYPE=HNSW, DISTANCE=COSINE, DUPLICATE_GROUP=TRUE"),
       share::ObVectorIndexType::VIT_IVF_INDEX, param, false));
   ASSERT_TRUE(param.support_duplicate_);
 
   param.reset();
   ASSERT_EQ(OB_NOT_SUPPORTED, share::ObVectorIndexUtil::parser_params_from_string(
-      ObString::make_string("TYPE=IVF_FLAT, DISTANCE=COSINE, SUPPORT_DUPLICATE=TRUE"),
+      ObString::make_string("TYPE=IVF_FLAT, DISTANCE=COSINE, DUPLICATE_GROUP=TRUE"),
       share::ObVectorIndexType::VIT_IVF_INDEX, param, false));
+}
+
+TEST_F(TestVectorIndexSerialize, duplicate_mode_log_name)
+{
+  share::ObVectorIndexParam param;
+  param.type_ = share::VIAT_HNSW;
+  param.support_duplicate_ = true;
+  char log_buf[2048] = {0};
+  const int64_t log_len = param.to_string(log_buf, sizeof(log_buf));
+  ASSERT_GT(ObCharset::locate(
+      CS_TYPE_UTF8MB4_GENERAL_CI, log_buf, log_len,
+      "DUPLICATE_GROUP", sizeof("DUPLICATE_GROUP") - 1, 1), 0U);
+  ASSERT_EQ(0U, ObCharset::locate(
+      CS_TYPE_UTF8MB4_GENERAL_CI, log_buf, log_len,
+      "SUPPORT_DUPLICATE", sizeof("SUPPORT_DUPLICATE") - 1, 1));
+
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, param.print_to_string(log_buf, sizeof(log_buf), pos));
+  ASSERT_GT(ObCharset::locate(
+      CS_TYPE_UTF8MB4_GENERAL_CI, log_buf, pos,
+      "DUPLICATE_GROUP=true", sizeof("DUPLICATE_GROUP=true") - 1, 1), 0U);
 }
 
 TEST_F(TestVectorIndexSerialize, duplicate_mode_physical_build_type)
@@ -507,7 +533,7 @@ TEST_F(TestVectorIndexSerialize, duplicate_mode_visible_in_public_ddl)
 {
   share::schema::ObTableSchema index_schema;
   ASSERT_EQ(OB_SUCCESS, index_schema.set_index_params(ObString::make_string(
-      "TYPE=HNSW, DISTANCE=COSINE, SUPPORT_DUPLICATE=TRUE, EXTRA_INFO_ACTUAL_SIZE=8")));
+      "TYPE=HNSW, DISTANCE=COSINE, DUPLICATE_GROUP=TRUE, EXTRA_INFO_ACTUAL_SIZE=8")));
   index_schema.set_index_type(share::schema::INDEX_TYPE_VEC_INDEX_SNAPSHOT_DATA_LOCAL);
   char ddl_buf[1024] = {0};
   int64_t pos = 0;
@@ -516,13 +542,14 @@ TEST_F(TestVectorIndexSerialize, duplicate_mode_visible_in_public_ddl)
   const ObString public_params(static_cast<int32_t>(pos), ddl_buf);
   ASSERT_GT(ObCharset::locate(
       CS_TYPE_UTF8MB4_GENERAL_CI, public_params.ptr(), public_params.length(),
-      "SUPPORT_DUPLICATE=TRUE", 22, 1), 0U);
+      "DUPLICATE_GROUP=TRUE", sizeof("DUPLICATE_GROUP=TRUE") - 1, 1), 0U);
   ASSERT_EQ(0U, ObCharset::locate(
       CS_TYPE_UTF8MB4_GENERAL_CI, public_params.ptr(), public_params.length(),
       "EXTRA_INFO_ACTUAL_SIZE", 22, 1));
   ASSERT_GT(ObCharset::locate(
       CS_TYPE_UTF8MB4_GENERAL_CI, public_params.ptr(), public_params.length(),
       "TYPE=HNSW", 9, 1), 0U);
+
 }
 
 TEST_F(TestVectorIndexSerialize, duplicate_mode_change_is_never_search_only)
@@ -530,7 +557,7 @@ TEST_F(TestVectorIndexSerialize, duplicate_mode_change_is_never_search_only)
   static const char *BASE =
       "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=64";
   static const char *BASE_TRUE =
-      "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=64, SUPPORT_DUPLICATE=TRUE";
+      "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=64, DUPLICATE_GROUP=TRUE";
   static const char *SEARCH_ONLY =
       "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=128";
   share::schema::ObTableSchema index_schema;
@@ -565,7 +592,7 @@ TEST_F(TestVectorIndexSerialize, duplicate_mode_change_is_not_embedding_related)
       "M=16, EF_CONSTRUCTION=200, EF_SEARCH=500, SYNC_INTERVAL=10s";
   static const char *BASE_TRUE =
       "DISTANCE=L2, TYPE=HNSW, LIB=VSAG, MODEL=QA_M, DIM=64, SYNC_MODE=IMMEDIATE, "
-      "M=16, EF_CONSTRUCTION=200, EF_SEARCH=500, SYNC_INTERVAL=10s, SUPPORT_DUPLICATE=TRUE";
+      "M=16, EF_CONSTRUCTION=200, EF_SEARCH=500, SYNC_INTERVAL=10s, DUPLICATE_GROUP=TRUE";
   static const char *SEARCH_ONLY =
       "DISTANCE=L2, TYPE=HNSW, LIB=VSAG, MODEL=QA_M, DIM=64, SYNC_MODE=IMMEDIATE, "
       "M=16, EF_CONSTRUCTION=200, EF_SEARCH=64, SYNC_INTERVAL=10s";
@@ -630,11 +657,11 @@ TEST_F(TestVectorIndexSerialize, duplicate_mode_rebuild_matrix)
   static const char *BASE =
       "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=64";
   static const char *BASE_TRUE =
-      "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=64, SUPPORT_DUPLICATE=TRUE";
+      "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=64, DUPLICATE_GROUP=TRUE";
   static const char *EXPLICIT_FALSE =
-      "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=64, SUPPORT_DUPLICATE=FALSE";
+      "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=64, DUPLICATE_GROUP=FALSE";
   static const char *EXPLICIT_TRUE =
-      "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=64, SUPPORT_DUPLICATE=TRUE";
+      "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=64, DUPLICATE_GROUP=TRUE";
   struct RebuildCase {
     const char *old_params_;
     const char *new_params_;
@@ -671,8 +698,8 @@ TEST_F(TestVectorIndexSerialize, duplicate_mode_rebuild_matrix)
         CS_TYPE_UTF8MB4_GENERAL_CI,
         new_params.ptr(),
         new_params.length(),
-        "SUPPORT_DUPLICATE",
-        17,
+        "DUPLICATE_GROUP",
+        sizeof("DUPLICATE_GROUP") - 1,
         1);
     ASSERT_EQ(cases[i].expected_support_duplicate_, marker_pos > 0);
     if (cases[i].expected_support_duplicate_) {
@@ -680,8 +707,8 @@ TEST_F(TestVectorIndexSerialize, duplicate_mode_rebuild_matrix)
           CS_TYPE_UTF8MB4_GENERAL_CI,
           new_params.ptr(),
           new_params.length(),
-          "SUPPORT_DUPLICATE",
-          17,
+          "DUPLICATE_GROUP",
+          sizeof("DUPLICATE_GROUP") - 1,
           marker_pos + 1);
       ASSERT_EQ(0U, second_marker_pos);
     }
@@ -696,21 +723,28 @@ TEST_F(TestVectorIndexSerialize, duplicate_mode_rebuild_param_validation)
   share::schema::ObTableSchema data_schema;
   ObArenaAllocator allocator("DupRbInvalid");
   ObString invalid = ObString::make_string(
-      "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=64, SUPPORT_DUPLICATE=MAYBE");
+      "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=64, DUPLICATE_GROUP=MAYBE");
   ASSERT_EQ(OB_NOT_SUPPORTED,
             share::ObVectorIndexUtil::construct_rebuild_index_param(
                 data_schema, ObString::make_string(BASE), invalid,
                 share::ObVectorIndexType::VIT_HNSW_INDEX, &allocator));
 
   ObString duplicate = ObString::make_string(
-      "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=64, SUPPORT_DUPLICATE=TRUE, SUPPORT_DUPLICATE=FALSE");
+      "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=64, DUPLICATE_GROUP=TRUE, DUPLICATE_GROUP=FALSE");
   ASSERT_EQ(OB_ERR_PARAM_DUPLICATE,
             share::ObVectorIndexUtil::construct_rebuild_index_param(
                 data_schema, ObString::make_string(BASE), duplicate,
                 share::ObVectorIndexType::VIT_HNSW_INDEX, &allocator));
 
+  ObString legacy_request = ObString::make_string(
+      "TYPE=HNSW, DISTANCE=COSINE, SUPPORT_DUPLICATE=TRUE");
+  ASSERT_EQ(OB_INVALID_ARGUMENT,
+            share::ObVectorIndexUtil::construct_rebuild_index_param(
+                data_schema, ObString::make_string(BASE), legacy_request,
+                share::ObVectorIndexType::VIT_HNSW_INDEX, &allocator));
+
   ObString value_only = ObString::make_string(
-      "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=64, MODEL=SUPPORT_DUPLICATE");
+      "TYPE=HNSW, DISTANCE=COSINE, LIB=VSAG, M=16, EF_CONSTRUCTION=200, EF_SEARCH=64, MODEL=DUPLICATE_GROUP");
   bool support_duplicate_changed = true;
   ASSERT_EQ(OB_NOT_SUPPORTED,
             share::ObVectorIndexUtil::construct_rebuild_index_param(
