@@ -23,6 +23,10 @@ class ObSSGCTablet;
 class ObSSGCUtil
 {
 public:
+  static int check_enable_gc_service(
+      const uint64_t tenant_id,
+      bool &enable_gc_service);
+
   // Fallback batch size used when the tenant config is unavailable or invalid.
   static constexpr int64_t DEFAULT_SS_GC_TASK_SCAN_BATCH_SIZE = 100;
 

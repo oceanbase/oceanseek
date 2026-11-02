@@ -23,6 +23,7 @@
 #include "share/scheduler/ob_tenant_dag_scheduler.h"
 #include "storage/ss_garbage_collector/dag/ob_ss_mark_sweep_dag.h"
 #include "storage/ss_garbage_collector/ob_ss_gc_service.h"
+#include "storage/ss_garbage_collector/ob_ss_gc_id_util.h"
 #include "storage/ss_garbage_collector/ob_ss_gc_util.h"
 #include "storage/ss_garbage_collector/ob_ss_mark_sweep_gc_rpc.h"
 #include "storage/ss_garbage_collector/ob_ss_mark_sweep_diag_mgr.h"
@@ -47,6 +48,7 @@ using namespace oceanbase::common::hash;
 
 ObSSMarkSweepGCGenTask::ObSSMarkSweepGCGenTask(volatile bool &is_stopped)
   : ObSSGCTaskBase(is_stopped),
+    gc_disabled_release_checked_(false),
     need_retry_mark_sweep_dag_(false),
     last_check_executor_time_us_(0),
     round_id_(0)
@@ -85,6 +87,7 @@ int ObSSMarkSweepGCGenTask::start(const int tg_id)
 
 void ObSSMarkSweepGCGenTask::destroy()
 {
+  gc_disabled_release_checked_ = false;
   last_check_executor_time_us_ = 0;
   round_id_ = 0;
   ATOMIC_STORE(&need_retry_mark_sweep_dag_, false);
@@ -314,6 +317,10 @@ int ObSSMarkSweepGCGenTask::try_release_executor_()
       if (OB_FAIL(ObSharedGCControlOperator::update_status(
                       trans, tenant_id_, ObSharedGCControlStatus::IDLE, affected_rows))) {
         LOG_WARN("fail to update status to IDLE", KR(ret), K_(tenant_id));
+      } else if (OB_UNLIKELY(1 != affected_rows)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("unexpected affected rows when releasing executor",
+            KR(ret), K_(tenant_id), K(affected_rows), K(info));
       } else {
         LOG_INFO("succ to release executor (status DOING -> IDLE)",
             K_(tenant_id), K(cur_server_id), K(affected_rows), K(info));
@@ -332,22 +339,16 @@ int ObSSMarkSweepGCGenTask::try_release_executor_()
   return ret;
 }
 
-int ObSSMarkSweepGCGenTask::fetch_new_round_id_(int64_t &round_id)
+int ObSSMarkSweepGCGenTask::fetch_new_round_id_(
+    ObMySQLTransaction &trans,
+    int64_t &round_id)
 {
   int ret = OB_SUCCESS;
   round_id = 0;
-  uint64_t new_id = OB_INVALID_ID;
-  if (OB_ISNULL(GCTX.sql_proxy_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("sql_proxy_ is null", KR(ret), K_(tenant_id));
-  } else {
-    ObMaxIdFetcher id_fetcher(*GCTX.sql_proxy_);
-    if (OB_FAIL(id_fetcher.fetch_new_max_id(tenant_id_,
-            OB_MAX_USED_SHARED_MARK_SWEEP_GC_ROUND_ID_TYPE, new_id, 1/*initial*/))) {
-      LOG_WARN("fail to fetch mark sweep gc round id", KR(ret), K_(tenant_id));
-    } else {
-      round_id = static_cast<int64_t>(new_id);
-    }
+  // USER allocations reuse the transaction holding the control lock.
+  if (OB_FAIL(ObSSGCIdUtil::fetch_gc_id(
+      trans, tenant_id_, OB_MAX_USED_SHARED_MARK_SWEEP_GC_ROUND_ID_TYPE, round_id))) {
+    LOG_WARN("fail to fetch mark sweep gc round id", KR(ret), K_(tenant_id));
   }
   return ret;
 }
@@ -468,8 +469,13 @@ int ObSSMarkSweepGCGenTask::try_acquire_executor_(
   } else if (ObSharedGCControlStatus::IDLE == info.status_) {
     // take ownership (set executor=self, status=DOING, gc_round_id=new round_id).
     int64_t round_id = 0;
-    if (OB_FAIL(fetch_new_round_id_(round_id))) {
+    if (OB_FAIL(fetch_new_round_id_(trans, round_id))) {
       LOG_WARN("fail to fetch new round id", KR(ret), K_(tenant_id), K(cur_server_id));
+    } else if (OB_UNLIKELY(round_id <= MAX(info.gc_round_id_, info.allow_gc_round_id_))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_ERROR("new gc round does not exceed persisted watermark; "
+          "disable shared gc and verify gc id upgrade watermarks",
+          KR(ret), K_(tenant_id), K(round_id), K(info));
     } else if (OB_FAIL(ObSharedGCControlOperator::update_executor_state(
                     trans, tenant_id_, static_cast<int64_t>(cur_server_id),
                     ObSharedGCControlStatus::DOING, round_id, affected_rows))) {
@@ -490,8 +496,13 @@ int ObSSMarkSweepGCGenTask::try_acquire_executor_(
       // self executor retry: refresh gc_round_id with a new round_id so this retry round
       // is distinguishable from the previous one.
       int64_t round_id = 0;
-      if (OB_FAIL(fetch_new_round_id_(round_id))) {
+      if (OB_FAIL(fetch_new_round_id_(trans, round_id))) {
         LOG_WARN("fail to fetch new round id", KR(ret), K_(tenant_id), K(cur_server_id));
+      } else if (OB_UNLIKELY(round_id <= MAX(info.gc_round_id_, info.allow_gc_round_id_))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("new gc round does not exceed persisted watermark; "
+            "disable shared gc and verify gc id upgrade watermarks",
+            KR(ret), K_(tenant_id), K(round_id), K(info));
       } else if (OB_FAIL(ObSharedGCControlOperator::update_executor_state(
                       trans, tenant_id_, static_cast<int64_t>(cur_server_id),
                       ObSharedGCControlStatus::DOING, round_id, affected_rows))) {
@@ -553,9 +564,14 @@ int ObSSMarkSweepGCGenTask::try_takeover_executor_(
   } else if ((info.status_ == ObSharedGCControlStatus::DOING)
              && (info.executor_server_id_ == old_executor_server_id)) {
     int64_t round_id = 0;
-    if (OB_FAIL(fetch_new_round_id_(round_id))) {
+    if (OB_FAIL(fetch_new_round_id_(trans, round_id))) {
       LOG_WARN("fail to fetch new round id", KR(ret), K_(tenant_id), K(cur_server_id),
           K(old_executor_server_id));
+    } else if (OB_UNLIKELY(round_id <= MAX(info.gc_round_id_, info.allow_gc_round_id_))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_ERROR("new gc round does not exceed persisted watermark; "
+          "disable shared gc and verify gc id upgrade watermarks",
+          KR(ret), K_(tenant_id), K(round_id), K(info));
     } else if (OB_FAIL(ObSharedGCControlOperator::update_executor_state(
                     trans, tenant_id_,
                     static_cast<int64_t>(cur_server_id),
@@ -689,7 +705,7 @@ int ObSSMarkSweepGCGenTask::check_if_need_do_gc_work(bool &is_need)
   bool is_gc_sswriter = false;
   if (OB_FAIL(check_init_and_stop_())) {
     LOG_WARN("fail to check init and stop", KR(ret), K_(tenant_id));
-  } else if (OB_FAIL(check_enable_gc_service_(enable_gc_service))) {
+  } else if (OB_FAIL(ObSSGCUtil::check_enable_gc_service(tenant_id_, enable_gc_service))) {
     LOG_WARN("fail to check enable gc service", KR(ret), K_(tenant_id));
   } else if (!enable_gc_service) {
     // gc service disabled: cancel the running dag if any; otherwise release leftover
@@ -699,14 +715,19 @@ int ObSSMarkSweepGCGenTask::check_if_need_do_gc_work(bool &is_need)
     if (OB_TMP_FAIL(check_dag_exist_(is_dag_exist))) {
       LOG_WARN("fail to check mark sweep dag exist", KR(tmp_ret), K_(tenant_id));
     } else if (is_dag_exist) {
+      // Recheck ownership after the DAG has exited, even if cancellation fails.
+      gc_disabled_release_checked_ = false;
       if (OB_TMP_FAIL(cancel_dag_())) {
         LOG_WARN("fail to cancel mark sweep dag when gc service disabled", KR(tmp_ret), K_(tenant_id));
       }
-    } else { // !is_dag_exist
-      if (TC_REACH_TIME_INTERVAL(3600L * 1000L * 1000L)) { // 1 hour
-        if (OB_TMP_FAIL(try_release_executor_())) {
-          LOG_WARN("fail to release executor when gc service disabled", KR(tmp_ret), K_(tenant_id));
-        }
+    } else if (!gc_disabled_release_checked_) {
+      // A failed release does not consume the check: the next scheduled round retries
+      // immediately, without sleeping on the timer thread.
+      if (OB_TMP_FAIL(try_release_executor_())) {
+        LOG_WARN("fail to release executor when gc service disabled, will retry",
+            KR(tmp_ret), K_(tenant_id));
+      } else {
+        gc_disabled_release_checked_ = true;
       }
     }
   } else if (OB_FAIL(check_dag_exist_(is_dag_exist))) {
@@ -751,6 +772,10 @@ int ObSSMarkSweepGCGenTask::check_if_need_do_gc_work(bool &is_need)
         set_need_retry_mark_sweep_dag(true/*need_retry*/);
       }
     }
+  }
+  if (enable_gc_service) {
+    // A subsequent disabled interval must check any newly acquired ownership.
+    gc_disabled_release_checked_ = false;
   }
   return ret;
 }

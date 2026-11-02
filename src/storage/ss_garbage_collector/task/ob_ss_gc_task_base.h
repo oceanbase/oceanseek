@@ -33,7 +33,6 @@ protected:
                      const int64_t interval_us,
                      const bool repeat);
   void reset_task_state_();
-  int check_enable_gc_service_(bool &enable_gc_service) const;
   int check_is_gc_sswriter_(bool &is_gc_sswriter) const;
   virtual int check_if_need_do_gc_work(bool &is_need);
   virtual void get_gc_exec_interval_us_(int64_t &exec_interval_us) const;

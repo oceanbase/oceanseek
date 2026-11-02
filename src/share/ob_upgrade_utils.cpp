@@ -22,6 +22,7 @@
 #include "storage/shared_storage/ob_ss_format_util.h"
 #include "storage/shared_storage/ob_ss_cluster_info.h"
 #include "storage/shared_storage/ob_file_manager.h"
+#include "storage/ss_garbage_collector/ob_ss_gc_id_util.h"
 #endif
 #include "share/ncomp_dll/ob_flush_ncomp_dll_task.h"
 #include "share/logical_table/ob_logical_table_monitor_job_scheduler.h"
@@ -2775,6 +2776,74 @@ int ObUpgradeFor4510Processor::grant_priv(const ObPrivSet user_priv_set,
 }
 
 /* =========== 4510 upgrade processor end ============= */
+
+/* =========== 4631 upgrade processor start ============= */
+int ObUpgradeFor4631Processor::post_upgrade()
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(check_inner_stat())) {
+    LOG_WARN("fail to check inner stat", KR(ret));
+  } else if (OB_FAIL(post_upgrade_for_user_gc_ids_())) {
+    LOG_WARN("fail to post upgrade user gc ids", KR(ret), K_(tenant_id));
+  }
+  return ret;
+}
+
+int ObUpgradeFor4631Processor::post_upgrade_for_user_gc_ids_()
+{
+  int ret = OB_SUCCESS;
+#ifdef OB_BUILD_SHARED_STORAGE
+  const uint64_t user_tenant_id = gen_user_tenant_id(tenant_id_);
+  ObSqlString sql;
+  ObMySQLProxy::MySQLResult res;
+  ObMySQLResult *result = nullptr;
+  int64_t instance_count = 0;
+  int64_t disabled_count = 0;
+  if (OB_ISNULL(sql_proxy_) || !is_valid_tenant_id(tenant_id_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid user gc upgrade argument", KR(ret), KP_(sql_proxy), K_(tenant_id));
+  } else if (!GCTX.is_shared_storage_mode() || !is_meta_tenant(tenant_id_)
+      || UPGRADE_MODE_OB != mode_) {
+    // Only META upgrades calibrate GC fetchers for their primary or standby USER tenants.
+  } else if (!GCONF.enable_upgrade_mode
+      || obrpc::OB_UPGRADE_STAGE_POSTUPGRADE != GCTX.get_upgrade_stage()) {
+    ret = OB_OP_NOT_ALLOW;
+    LOG_WARN("user gc id upgrade requires POSTUPGRADE with upgrade mode enabled",
+        KR(ret), K_(tenant_id), "upgrade_stage", GCTX.get_upgrade_stage());
+  } else if (OB_FAIL(sql.assign_fmt(
+      "SELECT COUNT(*) AS instance_count, "
+      "COUNT(CASE WHEN p.value IN ('false', '0') THEN 1 END) AS disabled_count "
+      "FROM oceanbase.__all_virtual_dump_tenant_info t "
+      "LEFT JOIN oceanbase.__all_virtual_tenant_parameter_info p "
+      "ON p.tenant_id = t.tenant_id AND p.svr_ip = t.svr_ip AND p.svr_port = t.svr_port "
+      "AND p.name = '_enable_shared_gc_service' "
+      "WHERE t.tenant_id = %lu AND t.stopped = 0", user_tenant_id))) {
+    LOG_WARN("fail to build user gc configuration query", KR(ret), K(user_tenant_id));
+  } else if (OB_FAIL(sql_proxy_->read(res, OB_SYS_TENANT_ID, sql.ptr()))) {
+    LOG_WARN("fail to read user gc configuration", KR(ret), K(user_tenant_id));
+  } else if (OB_ISNULL(result = res.get_result())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("user gc configuration result is null", KR(ret), K(user_tenant_id));
+  } else if (OB_FAIL(result->next())) {
+    LOG_WARN("fail to get user gc configuration result", KR(ret), K(user_tenant_id));
+  } else if (OB_FAIL(result->get_int("instance_count", instance_count))) {
+    LOG_WARN("fail to read tenant instance count", KR(ret), K(user_tenant_id));
+  } else if (OB_FAIL(result->get_int("disabled_count", disabled_count))) {
+    LOG_WARN("fail to read disabled gc instance count", KR(ret), K(user_tenant_id));
+  } else if (instance_count <= 0 || disabled_count != instance_count) {
+    ret = OB_OP_NOT_ALLOW;
+    LOG_WARN("user gc id upgrade requires disabled gc on every tenant instance",
+        KR(ret), K(user_tenant_id), K(instance_count), K(disabled_count));
+  } else if (OB_FAIL(storage::ObSSGCIdUtil::upgrade_user_gc_ids(*sql_proxy_, user_tenant_id))) {
+    LOG_WARN("fail to upgrade user gc ids", KR(ret), K_(tenant_id), K(user_tenant_id));
+  } else {
+    // The executor advances this META's data version only after post_upgrade succeeds.
+    LOG_INFO("[UPGRADE] user gc fetchers are ready", K_(tenant_id), K(user_tenant_id));
+  }
+#endif
+  return ret;
+}
+/* =========== 4631 upgrade processor end ============= */
 
 } // end share
 } // end oceanbase

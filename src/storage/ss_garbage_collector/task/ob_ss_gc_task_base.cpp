@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/ss_garbage_collector/task/ob_ss_gc_task_base.h"
+#include "storage/ss_garbage_collector/ob_ss_gc_util.h"
 #include "lib/atomic/ob_atomic.h"
 #include "lib/profile/ob_trace_id.h"
 #include "lib/thread/thread_mgr.h"
@@ -91,7 +92,7 @@ int ObSSGCTaskBase::check_if_need_do_gc_work(bool &is_need)
   bool is_gc_sswriter = false;
   if (OB_FAIL(check_init_and_stop_())) {
     LOG_WARN("fail to check init and stop", KR(ret), K_(tenant_id));
-  } else if (OB_FAIL(check_enable_gc_service_(enable_gc_service))) {
+  } else if (OB_FAIL(ObSSGCUtil::check_enable_gc_service(tenant_id_, enable_gc_service))) {
     LOG_WARN("fail to check enable gc service", KR(ret), K_(tenant_id));
   } else if (!enable_gc_service) {
     // do nothing. is_need = false.
@@ -107,20 +108,6 @@ int ObSSGCTaskBase::check_if_need_do_gc_work(bool &is_need)
       is_need = true;
       last_exec_time_us_ = current_time_us;
     }
-  }
-  return ret;
-}
-
-int ObSSGCTaskBase::check_enable_gc_service_(bool &enable_gc_service) const
-{
-  int ret = OB_SUCCESS;
-  enable_gc_service = false;
-  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id_));
-  if (OB_UNLIKELY(!tenant_config.is_valid())) {
-    ret = OB_INVALID_CONFIG;
-    LOG_WARN("tenant config is invalid", KR(ret), K_(tenant_id));
-  } else {
-    enable_gc_service = tenant_config->_enable_shared_gc_service;
   }
   return ret;
 }

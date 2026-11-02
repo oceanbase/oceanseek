@@ -58,7 +58,9 @@ private:
                             int64_t &old_executor_server_id);
   int try_takeover_executor_(const int64_t old_executor_server_id, bool &is_takeovered);
   int try_acquire_or_takeover_executor_(bool &is_acquired_or_takeovered);
-  int fetch_new_round_id_(int64_t &round_id);
+  int fetch_new_round_id_(
+      common::ObMySQLTransaction &trans,
+      int64_t &round_id);
   int update_gc_meta_scn_(const int64_t round_id, const share::SCN &safe_meta_scn);
   int check_executor_and_cancel_dag_if_not_self_();
   int check_executor_and_round_id_(const int64_t round_id, bool &is_match);
@@ -148,6 +150,8 @@ private:
   static const int64_t CHECK_EXECUTOR_INTERVAL_US = 5LL * 60LL * 1000LL * 1000LL; // 5min
   static const int64_t DEFAULT_STUDY_TIMEOUT_US = 5LL * 60LL * 1000LL * 1000LL; // 5min
   static const int64_t DEFAULT_LS_META_MAX_SCN_MAP_BUCKET_NUM = 1024; // ls count per tenant is small
+  // Tracks a completed ownership check for the current disabled interval.
+  bool gc_disabled_release_checked_;
   bool need_retry_mark_sweep_dag_;
   int64_t last_check_executor_time_us_;
   // round_id fetched at the moment this server acquires/takes-over the executor role; carried

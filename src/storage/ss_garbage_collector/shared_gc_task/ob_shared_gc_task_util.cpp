@@ -8,6 +8,7 @@
 #include "lib/oblog/ob_log.h"
 #include "share/ob_server_struct.h"
 #include "share/ob_max_id_fetcher.h"
+#include "storage/ss_garbage_collector/ob_ss_gc_id_util.h"
 #include "storage/ss_garbage_collector/shared_gc_task/ob_shared_gc_task_table_operator.h"
 
 namespace oceanbase
@@ -341,9 +342,7 @@ int ObSharedGCTaskUtil::fetch_task_id_(
     int64_t &task_id)
 {
   int ret = OB_SUCCESS;
-  uint64_t new_id = OB_INVALID_ID;
   ObMaxIdType id_type = OB_MAX_USED_SHARED_MARK_SWEEP_GC_TASK_ID_TYPE;
-  ObMySQLProxy *sql_proxy = nullptr;
   task_id = 0;
   if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id)
       || (!is_shared_data_gc_task_type(type)
@@ -351,9 +350,6 @@ int ObSharedGCTaskUtil::fetch_task_id_(
           && !is_ls_ckpt_gc_type(type)))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), K(tenant_id), K(type));
-  } else if (OB_ISNULL(sql_proxy = GCTX.sql_proxy_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("sql_proxy is null", KR(ret), K(tenant_id), K(type));
   } else {
     if (is_mark_sweep_gc_type(type)) {
       id_type = OB_MAX_USED_SHARED_MARK_SWEEP_GC_TASK_ID_TYPE;
@@ -369,13 +365,9 @@ int ObSharedGCTaskUtil::fetch_task_id_(
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected gc task type", KR(ret), K(type));
     }
-    if (OB_SUCC(ret)) {
-      ObMaxIdFetcher id_fetcher(*sql_proxy);
-      if (OB_FAIL(id_fetcher.fetch_new_max_id(tenant_id, id_type, new_id, 1 /*initial*/))) {
-        LOG_WARN("fail to fetch new max id", KR(ret), K(tenant_id), K(type), K(id_type));
-      } else {
-        task_id = static_cast<int64_t>(new_id);
-      }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(ObSSGCIdUtil::fetch_gc_id(tenant_id, id_type, task_id))) {
+      LOG_WARN("fail to fetch gc task id", KR(ret), K(tenant_id), K(type), K(id_type));
     }
   }
   return ret;

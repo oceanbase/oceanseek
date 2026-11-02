@@ -15,6 +15,7 @@ import actions
 import upgrade_health_checker
 import tenant_upgrade_action
 import upgrade_post_checker
+import shared_gc_upgrade
 import re
 
 # 由于用了/*+read_consistency(WEAK) */来查询，因此升级期间不能允许创建或删除租户
@@ -65,12 +66,16 @@ def do_upgrade(my_host, my_port, my_user, my_passwd, timeout, my_module_set, upg
                                    database = 'oceanbase',
                                    raise_on_warnings = True)
     cur = conn.cursor(buffered=True)
+    gc_upgrade = None
     try:
       query_cur = actions.QueryCursor(cur)
+      gc_upgrade = shared_gc_upgrade.create_upgrade(
+          conn, cur, my_host, my_port, my_user, my_passwd, timeout, my_module_set, False)
       if timeout != 0:
         set_session_timeout_for_upgrade(cur, timeout)
       actions.check_server_version_by_cluster(cur)
       conn.commit()
+      my_module_set = shared_gc_upgrade.resume_upgrade(gc_upgrade, my_module_set)
 
       if run_modules.MODULE_HEALTH_CHECK in my_module_set:
         logging.info('================begin to run health check action ===============')
@@ -80,6 +85,7 @@ def do_upgrade(my_host, my_port, my_user, my_passwd, timeout, my_module_set, upg
       if run_modules.MODULE_END_ROLLING_UPGRADE in my_module_set:
         logging.info('================begin to run end rolling upgrade action ===============')
         conn.autocommit = True
+        gc_upgrade.check_gc_drain_before_upgrade()
         actions.do_end_rolling_upgrade(cur, timeout)
         conn.autocommit = False
         actions.refresh_commit_sql_list()
@@ -88,6 +94,7 @@ def do_upgrade(my_host, my_port, my_user, my_passwd, timeout, my_module_set, upg
       if run_modules.MODULE_TENANT_UPRADE in my_module_set:
         logging.info('================begin to run tenant upgrade action ===============')
         conn.autocommit = True
+        gc_upgrade.check_gc_upgrade_prerequisites()
         tenant_upgrade_action.do_upgrade(conn, cur, timeout, my_user, my_passwd)
         conn.autocommit = False
         actions.refresh_commit_sql_list()
@@ -96,6 +103,7 @@ def do_upgrade(my_host, my_port, my_user, my_passwd, timeout, my_module_set, upg
       if run_modules.MODULE_END_UPRADE in my_module_set:
         logging.info('================begin to run end upgrade action ===============')
         conn.autocommit = True
+        gc_upgrade.check_gc_id_upgrade_complete()
         actions.do_end_upgrade(cur, timeout)
         conn.autocommit = False
         actions.refresh_commit_sql_list()
@@ -104,7 +112,9 @@ def do_upgrade(my_host, my_port, my_user, my_passwd, timeout, my_module_set, upg
       if run_modules.MODULE_POST_CHECK in my_module_set:
         logging.info('================begin to run post check action ===============')
         conn.autocommit = True
+        gc_upgrade.check_gc_restore_prerequisites()
         upgrade_post_checker.do_check(conn, cur, query_cur, timeout)
+        gc_upgrade.restore_gc_service_config()
         conn.autocommit = False
         actions.refresh_commit_sql_list()
         logging.info('================succeed to run post check action ===============')
@@ -113,6 +123,7 @@ def do_upgrade(my_host, my_port, my_user, my_passwd, timeout, my_module_set, upg
       logging.exception('run error')
       raise
     finally:
+      shared_gc_upgrade.close_upgrade(gc_upgrade)
       # 打印统计信息
       print_stats()
       # 将回滚sql写到文件中

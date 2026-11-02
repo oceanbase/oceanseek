@@ -87,7 +87,14 @@ const char *ObMaxIdFetcher::max_id_name_info_[OB_MAX_ID_TYPE][2] = {
   { "ob_max_used_ai_model_provider_id", "max used ai model provider id"},
   { "ob_max_used_ai_gateway_id", "max used ai gateway id"},
   { "ob_max_used_ai_model_profile_id", "max used ai model profile id"},
-  { "ob_max_used_shared_ls_ckpt_gc_task_id", "max used shared ls checkpoint gc task id"}};
+  { "ob_max_used_shared_ls_ckpt_gc_task_id", "max used shared ls checkpoint gc task id"},
+  { "ob_max_used_shared_user_mark_sweep_gc_round_id",
+    "max used shared user mark sweep gc round id"},
+  { "ob_max_used_shared_user_mark_sweep_gc_task_id", "max used shared user mark sweep gc task id"},
+  { "ob_max_used_shared_user_fail_gc_task_id", "max used shared user fail gc task id"},
+  { "ob_max_used_shared_user_fail_gc_macro_id_task_id",
+    "max used shared user fail gc macro id task id"},
+  { "ob_max_used_shared_user_ls_meta_gc_task_id", "max used shared user ls meta gc task id"}};
 
 ObMaxIdFetcher::ObMaxIdFetcherMutexWrapper ObMaxIdFetcher::mutex_bucket_[MAX_TENANT_MUTEX_BUCKET_CNT];
 
@@ -138,7 +145,12 @@ int ObMaxIdFetcher::convert_id_type(
     case OB_MAX_USED_SHARED_FAIL_GC_TASK_ID_TYPE:
     case OB_MAX_USED_SHARED_FAIL_GC_MACRO_ID_TASK_ID_TYPE: 
     case OB_MAX_USED_SHARED_LS_META_GC_TASK_ID_TYPE:
-    case OB_MAX_USED_SHARED_LS_CKPT_GC_TASK_ID_TYPE: {
+    case OB_MAX_USED_SHARED_LS_CKPT_GC_TASK_ID_TYPE:
+    case OB_MAX_USED_SHARED_USER_MARK_SWEEP_GC_ROUND_ID_TYPE:
+    case OB_MAX_USED_SHARED_USER_MARK_SWEEP_GC_TASK_ID_TYPE:
+    case OB_MAX_USED_SHARED_USER_FAIL_GC_TASK_ID_TYPE:
+    case OB_MAX_USED_SHARED_USER_FAIL_GC_MACRO_ID_TASK_ID_TYPE:
+    case OB_MAX_USED_SHARED_USER_LS_META_GC_TASK_ID_TYPE: {
       dst = src;
       break;
     }
@@ -632,7 +644,12 @@ int ObMaxIdFetcher::check_id_valid(const ObMaxIdType &max_id_type, const uint64_
       case OB_MAX_USED_AI_PROVIDER_ID_TYPE:
       case OB_MAX_USED_AI_GATEWAY_ID_TYPE:
       case OB_MAX_USED_AI_MODEL_PROFILE_ID_TYPE:
-      case OB_MAX_USED_SHARED_LS_CKPT_GC_TASK_ID_TYPE: {
+      case OB_MAX_USED_SHARED_LS_CKPT_GC_TASK_ID_TYPE:
+      case OB_MAX_USED_SHARED_USER_MARK_SWEEP_GC_ROUND_ID_TYPE:
+      case OB_MAX_USED_SHARED_USER_MARK_SWEEP_GC_TASK_ID_TYPE:
+      case OB_MAX_USED_SHARED_USER_FAIL_GC_TASK_ID_TYPE:
+      case OB_MAX_USED_SHARED_USER_FAIL_GC_MACRO_ID_TASK_ID_TYPE:
+      case OB_MAX_USED_SHARED_USER_LS_META_GC_TASK_ID_TYPE: {
         // won't check other id
         break;
       }

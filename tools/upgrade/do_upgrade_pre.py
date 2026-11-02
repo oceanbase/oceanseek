@@ -14,6 +14,7 @@ import run_modules
 import actions
 import special_upgrade_action_pre
 import upgrade_health_checker
+import shared_gc_upgrade
 
 # 由于用了/*+read_consistency(WEAK) */来查询，因此升级期间不能允许创建或删除租户
 
@@ -63,8 +64,11 @@ def do_upgrade(my_host, my_port, my_user, my_passwd, timeout, my_module_set, upg
                                    database = 'oceanbase',
                                    raise_on_warnings = True)
     cur = conn.cursor(buffered=True)
+    gc_upgrade = None
     try:
       query_cur = actions.QueryCursor(cur)
+      gc_upgrade = shared_gc_upgrade.create_upgrade(
+          conn, cur, my_host, my_port, my_user, my_passwd, timeout, my_module_set, True)
       if timeout != 0:
         set_session_timeout_for_upgrade(cur, timeout)
       actions.check_server_version_by_cluster(cur)
@@ -76,6 +80,8 @@ def do_upgrade(my_host, my_port, my_user, my_passwd, timeout, my_module_set, upg
         conn.autocommit = False
         actions.refresh_commit_sql_list()
         logging.info('================succeed to run begin upgrade action===============')
+
+      shared_gc_upgrade.prepare_upgrade(gc_upgrade)
 
       if run_modules.MODULE_BEGIN_ROLLING_UPGRADE in my_module_set:
         logging.info('================begin to run begin rolling upgrade action===============')
@@ -102,6 +108,7 @@ def do_upgrade(my_host, my_port, my_user, my_passwd, timeout, my_module_set, upg
       logging.exception('run error')
       raise
     finally:
+      shared_gc_upgrade.close_upgrade(gc_upgrade)
       # 打印统计信息
       print_stats()
       # 将回滚sql写到文件中

@@ -1352,6 +1352,7 @@ if(OB_BUILD_SHARED_STORAGE)
     ss_garbage_collector/ob_ss_gc_service.cpp
     ss_garbage_collector/ob_ss_gc_task_runner.cpp
     ss_garbage_collector/ob_ss_gc_util.cpp
+    ss_garbage_collector/ob_ss_gc_id_util.cpp
     ss_garbage_collector/ob_ss_fail_gc_util.cpp
     ss_garbage_collector/ob_ss_mark_sweep_gc_rpc.cpp
     ss_garbage_collector/ob_ss_gc_rpc.cpp

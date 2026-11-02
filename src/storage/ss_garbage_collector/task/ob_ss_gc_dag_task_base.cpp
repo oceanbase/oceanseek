@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/ss_garbage_collector/task/ob_ss_gc_dag_task_base.h"
+#include "storage/ss_garbage_collector/ob_ss_gc_util.h"
 #include "lib/profile/ob_trace_id.h"
 #include "lib/time/ob_time_utility.h"
 #include "observer/ob_server_event_history_table_operator.h"
@@ -207,7 +208,7 @@ int ObSSGCDagTaskBase::check_can_schedule_gc_dag_common_(bool &can_schedule) con
   can_schedule = false;
   bool enable_gc_service = false;
   bool is_gc_sswriter = false;
-  if (OB_FAIL(check_enable_gc_service_(enable_gc_service))) {
+  if (OB_FAIL(ObSSGCUtil::check_enable_gc_service(tenant_id_, enable_gc_service))) {
     LOG_WARN("fail to check enable gc service", KR(ret),
         K_(tenant_id), K_(dag_type));
   } else if (!enable_gc_service) {

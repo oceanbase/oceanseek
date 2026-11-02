@@ -8,6 +8,8 @@
 #include "storage/ss_garbage_collector/ob_ss_gc_util.h"
 #include "storage/ss_garbage_collector/ob_ss_gc_define.h"
 #include "common/ob_smart_var.h"
+#include "lib/mysqlclient/ob_mysql_proxy.h"
+#include "lib/string/ob_sql_string.h"
 #include "lib/utility/ob_sort.h"
 #include "lib/utility/ob_tracepoint.h"
 #include "lib/restore/ob_object_storage_base.h"
@@ -66,6 +68,22 @@ bool ObSSGCUtil::is_errsim_target(
 
 ERRSIM_POINT_DEF(EN_SS_GC_READ_LS_CKPT_META_ERROR);
 #endif
+
+int ObSSGCUtil::check_enable_gc_service(
+    const uint64_t tenant_id,
+    bool &enable_gc_service)
+{
+  int ret = OB_SUCCESS;
+  enable_gc_service = false;
+  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
+  if (OB_UNLIKELY(!tenant_config.is_valid())) {
+    ret = OB_INVALID_CONFIG;
+    LOG_WARN("tenant config is invalid", KR(ret), K(tenant_id));
+  } else {
+    enable_gc_service = tenant_config->_enable_shared_gc_service;
+  }
+  return ret;
+}
 
 int ObSSGCUtil::create_and_add_dag(const ObSSGCExecDagInitParam &param)
 {
