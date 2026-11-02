@@ -569,22 +569,50 @@ int ObVecIdxMergeTask::build_filter_clause(const ObTableSchema &data_table_schem
   ObString vid_col_name;
   int64_t pos = 0;
   ObSEArray<uint64_t, 4> all_column_ids;
+  bool all_segments_empty = true;
+  min_vid_ = INT64_MAX;
+  max_vid_ = 0;
   if (merge_segments_.count() <= 0) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("merge_segments is empty", K(ret));
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < merge_segments_.count(); ++i) {
     const ObVectorIndexSegmentMeta *seg_meta = merge_segments_.at(i);
+    int64_t vector_cnt = 0;
     int64_t seg_min_vid = INT64_MAX;
     int64_t seg_max_vid = 0;
-    if (OB_FAIL(seg_meta->segment_handle_->get_vid_bound(seg_min_vid, seg_max_vid))) {
+    if (OB_ISNULL(seg_meta) || ! seg_meta->segment_handle_.is_valid()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("merge segment is invalid", K(ret), K(i), KP(seg_meta));
+    } else if (OB_FAIL(seg_meta->segment_handle_->get_index_number(vector_cnt))) {
+      LOG_WARN("get index number fail", K(ret), K(i), KPC(seg_meta));
+    } else if (OB_UNLIKELY(vector_cnt < 0)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("vector count is invalid", K(ret), K(i), K(vector_cnt), KPC(seg_meta));
+    } else if (0 == vector_cnt) {
+      LOG_INFO("skip empty merge segment when building filter clause", K(i), KPC(seg_meta));
+    } else if (OB_FAIL(seg_meta->segment_handle_->get_vid_bound(seg_min_vid, seg_max_vid))) {
       LOG_WARN("get_vid_bound fail", K(ret), K(i), K(seg_meta));
+    } else if (OB_UNLIKELY(seg_min_vid > seg_max_vid)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("non-empty segment vid bound is invalid", K(ret), K(i), K(vector_cnt),
+               K(seg_min_vid), K(seg_max_vid), KPC(seg_meta));
     } else {
+      all_segments_empty = false;
       min_vid_ = OB_MIN(min_vid_, seg_min_vid);
       max_vid_ = OB_MAX(max_vid_, seg_max_vid);
     }
   }
-  if (min_vid_ > max_vid_) {
+  if (OB_FAIL(ret)) {
+  } else if (all_segments_empty) {
+    min_vid_ = 0;
+    max_vid_ = 0;
+    if (OB_FAIL(filter_sql_str_.assign_fmt("where 1 = 0 "))) {
+      LOG_WARN("assign empty merge filter fail", K(ret));
+    } else {
+      LOG_INFO("build empty merge filter success", K(min_vid_), K(max_vid_), K(filter_sql_str_));
+    }
+  } else if (min_vid_ > max_vid_) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("vid bound is invalid", K(ret), K(min_vid_), K(max_vid_));
   } else if (OB_FAIL(snapshot_table_schema.get_all_column_ids(all_column_ids))) {
@@ -606,6 +634,7 @@ int ObVecIdxMergeTask::build_filter_clause(const ObTableSchema &data_table_schem
     }
   }
   if (OB_FAIL(ret)) {
+  } else if (all_segments_empty) {
   } else if (merge_from_base_) {
     int64_t real_min_vid = min_vid_;
     min_vid_ = 0;
@@ -623,7 +652,7 @@ int ObVecIdxMergeTask::build_filter_clause(const ObTableSchema &data_table_schem
     LOG_INFO("build_filter_clause success", K(vid_col_name), K(min_vid_), K(max_vid_), K(filter_sql_str_));
   }
   
-  if (OB_SUCC(ret) && ! data_table_schema.is_heap_organized_table()) {
+  if (OB_SUCC(ret) && ! all_segments_empty && ! data_table_schema.is_heap_organized_table()) {
     filter_sql_str_.reset();
     LOG_INFO("table is not heap_organized_table, so reset filter", K(data_table_schema));
   }
