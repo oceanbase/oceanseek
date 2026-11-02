@@ -6860,8 +6860,11 @@ int ObTablet::get_kept_snapshot_for_async_index(int64_t &min_async_index_snapsho
   int ret = OB_SUCCESS;
   min_async_index_snapshot = INT64_MAX;
   if (is_async_delete_index()) {
-    // Deletion reads use the SQL snapshot or latest committed visibility and
-    // filter by logical row SCN. Normal MVCC retention protects these reads.
+    // A deleting index still compacts toward publication, which can lag normal
+    // MVCC GC; hold the installed major (or MVS if none) until a newer major.
+    const int64_t installed_major = get_last_major_snapshot_version();
+    min_async_index_snapshot = installed_major > 0
+        ? installed_major : get_multi_version_start();
   } else if (!is_ls_inner_tablet()) {
     ObTabletHandle source_tablet_handle;
     int64_t retention_snapshot = INT64_MAX;
