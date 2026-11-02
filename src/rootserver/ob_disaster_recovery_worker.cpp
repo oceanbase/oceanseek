@@ -2580,16 +2580,19 @@ ERRSIM_POINT_DEF(ERRSIM_SKIP_GEN_SPECIFIED_SINGLE_REPLACE_REPLICA_TASK)
 ERRSIM_POINT_DEF(ERRSIM_SKIP_PERSIST_REPLACE_REPLICA_TASK_INTO_INNER_TABLE)
 int ObDRWorker::check_tenant_in_replace_locality_(
     const uint64_t tenant_id,
-    bool &is_replace_locality)
+    bool &is_replace_locality,
+    common::ObIArray<common::ObZone> &target_zones)
 {
   int ret = OB_SUCCESS;
   const uint64_t pool_tenant_id = gen_user_tenant_id(tenant_id);
   is_replace_locality = false;
+  target_zones.reset();
   ObSchemaGetterGuard schema_guard;
   const ObTenantSchema *tenant_schema = nullptr;
   ObArray<common::ObZone> zones_in_pool;
   share::ObUnitTableOperator unit_operator;
   ObArray<share::ObResourcePool> pools;
+  ObArray<share::ObZoneReplicaAttrSet> cur_zone_locality;
   if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), K(tenant_id));
@@ -2615,10 +2618,69 @@ int ObDRWorker::check_tenant_in_replace_locality_(
       }
     }
   }
+  if (OB_SUCC(ret) && OB_FAIL(tenant_schema->get_zone_replica_attr_array(cur_zone_locality))) {
+    LOG_WARN("fail to get zone replica attr array", KR(ret), K(tenant_id), KPC(tenant_schema));
+  }
   if (OB_SUCC(ret)) {
     if (OB_FAIL(ObLocalityCheckHelp::check_tenant_replace_locality(
             *tenant_schema, zones_in_pool, is_replace_locality))) {
       LOG_WARN("fail to check tenant replace locality", KR(ret), K(tenant_id), K(zones_in_pool));
+    } else if (is_replace_locality) {
+      // The current locality is the target of the in-progress replace, collect its zones so
+      // that the caller can tell a log stream created for the target zones (a normal balancing
+      // one) from a residue of the replaced locality.
+      for (int64_t i = 0; OB_SUCC(ret) && i < cur_zone_locality.count(); ++i) {
+        const share::ObZoneReplicaAttrSet &zone_attr_set = cur_zone_locality.at(i);
+        // zone_ is a copy of zone_set_[0], so the zone set is the complete list.
+        for (int64_t j = 0; OB_SUCC(ret) && j < zone_attr_set.get_zone_set().count(); ++j) {
+          if (OB_FAIL(add_var_to_array_no_dup(target_zones, zone_attr_set.get_zone_set().at(j)))) {
+            LOG_WARN("fail to add target locality zone", KR(ret), K(zone_attr_set));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// Check whether the log stream has a unit located in one of the given zones.
+// To be conservative, an empty unit id list, an empty zone array or a unit query failure is
+// reported as "in zones" so that the caller keeps the creating log stream instead of aborting
+// a log stream that may still be needed.
+int ObDRWorker::check_ls_unit_list_in_zones_(
+    const share::ObLSStatusInfo &ls_status_info,
+    const common::ObIArray<common::ObZone> &zones,
+    bool &in_zones)
+{
+  int ret = OB_SUCCESS;
+  in_zones = true;
+  share::ObUnitTableOperator unit_operator;
+  ObArray<uint64_t> unit_ids;
+  common::ObArray<share::ObUnit> units;
+  if (OB_UNLIKELY(zones.empty())) {
+    LOG_WARN("target locality zones is empty, keep the creating ls", K(ls_status_info));
+  } else if (OB_UNLIKELY(ls_status_info.unit_id_list_.empty())) {
+    LOG_WARN("unit id list of creating ls is empty, keep the creating ls", K(ls_status_info));
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+    LOG_WARN("sql_proxy_ is null, keep the creating ls", K(ls_status_info));
+  } else if (OB_FAIL(ls_status_info.get_unit_list(unit_ids))) {
+    LOG_WARN("fail to get unit id list, keep the creating ls", KR(ret), K(ls_status_info));
+    ret = OB_SUCCESS;
+  } else if (OB_FAIL(unit_operator.init(*GCTX.sql_proxy_))) {
+    LOG_WARN("fail to init unit table operator, keep the creating ls", KR(ret), K(ls_status_info));
+    ret = OB_SUCCESS;
+  } else if (OB_FAIL(unit_operator.get_units_by_unit_ids(unit_ids, units))) {
+    LOG_WARN("fail to get units by unit ids, keep the creating ls", KR(ret),
+             K(ls_status_info), K(unit_ids));
+    ret = OB_SUCCESS;
+  } else {
+    in_zones = false;
+    for (int64_t i = 0; !in_zones && i < units.count(); ++i) {
+      for (int64_t j = 0; !in_zones && j < zones.count(); ++j) {
+        if (units.at(i).zone_ == zones.at(j)) {
+          in_zones = true;
+        }
+      }
     }
   }
   return ret;
@@ -2634,8 +2696,9 @@ int ObDRWorker::try_create_abort_creating_ls_for_replace_locality_(
   bool is_replace_locality = false;
   ls_status_refreshed = false;
   share::ObLSStatusOperator ls_status_operator;
+  ObArray<common::ObZone> target_zones;
   const share::ObTenantSwitchoverStatus working_sw_status = share::NORMAL_SWITCHOVER_STATUS;
-  if (OB_FAIL(check_tenant_in_replace_locality_(tenant_id, is_replace_locality))) {
+  if (OB_FAIL(check_tenant_in_replace_locality_(tenant_id, is_replace_locality, target_zones))) {
     LOG_WARN("fail to check tenant in replace locality", KR(ret), K(tenant_id));
   } else if (!is_replace_locality) {
     LOG_TRACE("tenant is not in replace locality", K(tenant_id));
@@ -2645,10 +2708,22 @@ int ObDRWorker::try_create_abort_creating_ls_for_replace_locality_(
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < ls_status_info_array.count(); ++i) {
       const share::ObLSStatusInfo &ls_status_info = ls_status_info_array.at(i);
+      bool unit_in_target_zones = false;
       if (!ls_status_info.ls_is_creating()) {
         // only CREATING ls needs to be aborted; other statuses are handled elsewhere, skip
       } else if (ls_status_info.ls_id_.is_sys_ls()) {
         LOG_WARN("sys ls should not be creating in replace locality", K(ls_status_info));
+      } else if (OB_FAIL(check_ls_unit_list_in_zones_(
+                     ls_status_info, target_zones, unit_in_target_zones))) {
+        LOG_WARN("fail to check whether ls units are in target locality zones", KR(ret),
+                 K(ls_status_info), K(target_zones));
+      } else if (unit_in_target_zones) {
+        // The creating ls locates in the target locality zones, so it is not a residue of the
+        // replaced locality: it is created by a normal ls balancing task (e.g. partition
+        // balance) for the new zones. Keep it, otherwise the balance task waits for a log
+        // stream that will never become NORMAL and the locality job can never finish.
+        LOG_INFO("keep creating ls in target locality zones for replace locality",
+                 K(ls_status_info), K(target_zones), K(tenant_id));
       } else if (OB_TMP_FAIL(ls_status_operator.update_ls_status(
                      ls_status_info.tenant_id_, ls_status_info.ls_id_,
                      share::OB_LS_CREATING, share::OB_LS_CREATE_ABORT,

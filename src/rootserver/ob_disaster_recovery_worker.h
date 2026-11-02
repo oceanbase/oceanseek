@@ -857,7 +857,13 @@ private:
 
   int check_tenant_in_replace_locality_(
       const uint64_t tenant_id,
-      bool &is_replace_locality);
+      bool &is_replace_locality,
+      common::ObIArray<common::ObZone> &target_zones);
+
+  int check_ls_unit_list_in_zones_(
+      const share::ObLSStatusInfo &ls_status_info,
+      const common::ObIArray<common::ObZone> &zones,
+      bool &in_zones);
 
   int try_create_abort_creating_ls_for_replace_locality_(
       const uint64_t tenant_id,
