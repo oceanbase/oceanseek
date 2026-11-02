@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/garbage_collector/ob_mark_sweep_pipeline.h"
+#include "lib/time/ob_time_utility.h"
 
 namespace oceanbase
 {
@@ -149,7 +150,7 @@ ObSortedRunWriter::ObSortedRunWriter()
     compare_(nullptr), tmp_file_mgr_(nullptr), dir_id_(-1),
     mem_allocator_(ObNewModIds::OB_ASYNC_EXTERNAL_SORTER, OB_MALLOC_NORMAL_BLOCK_SIZE),
     item_list_(nullptr, ObNewModIds::OB_ASYNC_EXTERNAL_SORTER),
-    has_data_(false)
+    has_data_(false), flush_sorted_run_cost_us_(0)
 {
 }
 
@@ -205,6 +206,7 @@ int ObSortedRunWriter::add_item(const ObGCMacroBlockItem &item)
     ret = OB_NOT_INIT;
     LOG_WARN("ObSortedRunWriter not init", KR(ret));
   } else if (((mem_allocator_.used() + item_size) > memory_limit_) && (item_list_.size() > 0)) {
+    ObCostTimer cost_timer(flush_sorted_run_cost_us_);
     if (OB_FAIL(flush_run_())) {
       LOG_WARN("fail to flush run", KR(ret));
     }
@@ -330,6 +332,7 @@ void ObSortedRunWriter::reset()
   mem_allocator_.reuse();
   runs_.reset();
   has_data_ = false;
+  flush_sorted_run_cost_us_ = 0;
   is_inited_ = false;
   tmp_file_mgr_ = nullptr;
 }

@@ -9,10 +9,8 @@
 #include "storage/incremental/ssmeta/ob_ss_meta_info_util.h"
 #include "lib/utility/utility.h"
 #include "storage/blocksstable/ob_macro_block_id.h"
-#include "storage/blocksstable/ob_object_manager.h"
 #include "storage/blocksstable/ob_sstable.h"
 #include "storage/blocksstable/ob_storage_object_type.h"
-#include "storage/shared_storage/ob_file_helper.h"
 #include "storage/blocksstable/index_block/ob_sstable_meta_info.h"
 #include "storage/incremental/ssmeta/ob_ss_tablet_meta_define.h"
 #include "storage/meta_mem/ob_meta_obj_struct.h"
@@ -1287,7 +1285,6 @@ int ObSSMetaTabletLockRowHelper::get_lock_row_info(
 //           获取 tablet 级别管理块（sstable 地址、table_store 地址等）
 //        b. sstable 遍历路径（best-effort）：反序列化完整 tablet，遍历其所有
 //           sstable，从每个 sstable 的 ObSSTableMacroInfo 中收集数据/元数据宏块
-//        c. prewarm 文件路径：对 major sstable 按 snapshot/reorg_scn 生成预热文件对象 ID
 //     3. 将收集到的所有 block_info 暂存到 cur_block_infos_ 数组
 //     4. get_next() 从该数组逐条输出，通过 dedup_set_ 跨版本去重
 //
@@ -1377,9 +1374,7 @@ int ObSSMetaTabletMacroIDIterator::init(
 // 需要有效的 MTL 租户上下文（sstable->get_meta() 可能触发共享存储 IO）。
 int ObSSMetaTabletMacroIDIterator::collect_blocks_from_sstables_(
     const ObTabletID &tablet_id,
-    const SCN &reorganize_scn,
     const bool fill_occupy_size,
-    const bool include_prewarm,
     ObTablet &tablet,
     ObIArray<ObTabletBlockInfo> &out_blocks)
 {
@@ -1405,10 +1400,7 @@ int ObSSMetaTabletMacroIDIterator::collect_blocks_from_sstables_(
       } else {
         blocksstable::ObSSTable *sstable = static_cast<blocksstable::ObSSTable *>(table);
         ObSSTableMetaHandle meta_handle;
-        if (include_prewarm
-            && OB_FAIL(collect_prewarm_blocks_from_sstable_(tablet_id, reorganize_scn, *sstable, out_blocks))) {
-          LOG_WARN("failed to collect prewarm block ids from sstable", K(ret), KPC(sstable));
-        } else if (OB_FAIL(sstable->get_meta(meta_handle))) {
+        if (OB_FAIL(sstable->get_meta(meta_handle))) {
           LOG_WARN("failed to get sstable meta", K(ret), KPC(sstable));
         } else if (sstable->is_small_sstable()) {
           // small_sstable 的数据宏块是嵌套在共享宏块中的，需要按 SHARED_DATA_BLOCK 类型收集，
@@ -1516,77 +1508,6 @@ int ObSSMetaTabletMacroIDIterator::collect_blocks_from_sstables_(
   return ret;
 }
 
-int ObSSMetaTabletMacroIDIterator::collect_prewarm_blocks_from_sstable_(
-    const ObTabletID &tablet_id,
-    const SCN &reorganize_scn,
-    const blocksstable::ObSSTable &sstable,
-    ObIArray<ObTabletBlockInfo> &out_blocks)
-{
-  int ret = OB_SUCCESS;
-  if (!sstable.is_major_sstable()) {
-    // Major compaction prewarm files are organized by major snapshot version.
-  } else {
-    const int64_t major_snapshot_version = sstable.get_snapshot_version();
-    if (OB_UNLIKELY(major_snapshot_version < 0 || !reorganize_scn.is_valid())) {
-      ret = OB_INVALID_ARGUMENT;
-      LOG_WARN("invalid prewarm object key", K(ret), K(major_snapshot_version), K(reorganize_scn));
-    } else if (OB_FAIL(push_prewarm_block_info_(tablet_id, reorganize_scn,
-                   blocksstable::ObStorageObjectType::MAJOR_PREWARM_DATA,
-                   ObTabletMacroType::DATA_BLOCK,
-                   major_snapshot_version, out_blocks))) {
-      LOG_WARN("failed to push major prewarm data block id", K(ret), K(major_snapshot_version));
-    } else if (OB_FAIL(push_prewarm_block_info_(tablet_id, reorganize_scn,
-                   blocksstable::ObStorageObjectType::MAJOR_PREWARM_DATA_INDEX,
-                   ObTabletMacroType::DATA_BLOCK,
-                   major_snapshot_version, out_blocks))) {
-      LOG_WARN("failed to push major prewarm data index block id", K(ret), K(major_snapshot_version));
-    } else if (OB_FAIL(push_prewarm_block_info_(tablet_id, reorganize_scn,
-                   blocksstable::ObStorageObjectType::MAJOR_PREWARM_META,
-                   ObTabletMacroType::META_BLOCK,
-                   major_snapshot_version, out_blocks))) {
-      LOG_WARN("failed to push major prewarm meta block id", K(ret), K(major_snapshot_version));
-    } else if (OB_FAIL(push_prewarm_block_info_(tablet_id, reorganize_scn,
-                   blocksstable::ObStorageObjectType::MAJOR_PREWARM_META_INDEX,
-                   ObTabletMacroType::META_BLOCK,
-                   major_snapshot_version, out_blocks))) {
-      LOG_WARN("failed to push major prewarm meta index block id", K(ret), K(major_snapshot_version));
-    }
-  }
-  return ret;
-}
-
-int ObSSMetaTabletMacroIDIterator::push_prewarm_block_info_(
-    const ObTabletID &tablet_id,
-    const SCN &reorganize_scn,
-    const blocksstable::ObStorageObjectType object_type,
-    const ObTabletMacroType block_type,
-    const int64_t major_snapshot_version,
-    ObIArray<ObTabletBlockInfo> &out_blocks)
-{
-  int ret = OB_SUCCESS;
-  blocksstable::MacroBlockId prewarm_block_id;
-  blocksstable::ObStorageObjectOpt storage_opt;
-  if (OB_UNLIKELY(major_snapshot_version < 0 || block_type <= ObTabletMacroType::INVALID_TYPE
-      || block_type >= ObTabletMacroType::MAX)) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), K(object_type), K(block_type), K(major_snapshot_version));
-  } else {
-    storage_opt.set_ss_major_prewarm_opt(object_type,
-                                         tablet_id.id(),
-                                         major_snapshot_version,
-                                         reorganize_scn.get_val_for_sql());
-    if (OB_FAIL(OB_STORAGE_OBJECT_MGR.ss_get_object_id(storage_opt, prewarm_block_id))) {
-      LOG_WARN("failed to get prewarm object id", K(ret), K(storage_opt), K(object_type));
-    } else if (prewarm_block_id.is_valid()) {
-      ObTabletBlockInfo info(prewarm_block_id, block_type, 0);
-      if (OB_FAIL(out_blocks.push_back(info))) {
-        LOG_WARN("failed to push prewarm block info", K(ret), K(info));
-      }
-    }
-  }
-  return ret;
-}
-
 // 路径 a：直接从 __all_shared_meta 的 meta_value 中解析内联的 ObTabletMacroInfo。
 // 在 v2 持久化路径下，该 macro_info 仅包含 shared_meta 管理块
 // （sstable meta 对象地址、table_store 地址、storage_schema 地址等），
@@ -1664,10 +1585,10 @@ int ObSSMetaTabletMacroIDIterator::collect_blocks_from_tablet_(const ObString &m
 {
   cur_block_infos_.reuse();
   cur_block_idx_ = 0;
-  // GC 依赖该迭代器生成完整的 KEPT 集合。预热文件不再生成，不加入 KEPT 集合。
+  // GC 依赖该迭代器生成完整的 KEPT 集合。
   // sstable 路径失败必须上抛，避免漏标活块。
   return collect_blocks_from_tablet_meta_value(tablet_alloc_, ls_id_, tablet_id_,
-      reorganize_scn_, meta_value, false /*fill_occupy_size*/, false /*include_prewarm*/, cur_block_infos_);
+      reorganize_scn_, meta_value, false /*fill_occupy_size*/, cur_block_infos_);
 }
 
 int ObSSMetaTabletMacroIDIterator::collect_blocks_from_tablet_meta_value(
@@ -1677,7 +1598,6 @@ int ObSSMetaTabletMacroIDIterator::collect_blocks_from_tablet_meta_value(
     const SCN &reorganize_scn,
     const ObString &meta_value,
     const bool fill_occupy_size,
-    const bool include_prewarm,
     ObIArray<ObTabletBlockInfo> &out_blocks)
 {
   int ret = OB_SUCCESS;
@@ -1697,8 +1617,8 @@ int ObSSMetaTabletMacroIDIterator::collect_blocks_from_tablet_meta_value(
     } else if (!tablet_handle.is_valid() || OB_ISNULL(tablet_handle.get_obj())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid tablet handle after deserialize", K(ret), K(ls_id), K(tablet_id));
-    } else if (OB_FAIL(collect_blocks_from_sstables_(tablet_id, reorganize_scn,
-                   fill_occupy_size, include_prewarm, *tablet_handle.get_obj(), out_blocks))) {
+    } else if (OB_FAIL(collect_blocks_from_sstables_(tablet_id, fill_occupy_size,
+                   *tablet_handle.get_obj(), out_blocks))) {
       LOG_WARN("failed to collect blocks from sstables", K(ret), K(ls_id), K(tablet_id));
     }
   }

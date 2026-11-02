@@ -2753,19 +2753,6 @@ inline int push_unique(ObIArray<MacroBlockId> &arr, const MacroBlockId &id)
   return ret;
 }
 
-inline int make_prewarm_macro_id(const blocksstable::ObStorageObjectType object_type,
-                                 const uint64_t tablet_id,
-                                 const int64_t major_snapshot_version,
-                                 const share::SCN &reorganization_scn,
-                                 MacroBlockId &macro_id)
-{
-  blocksstable::ObStorageObjectOpt storage_opt;
-  storage_opt.set_ss_major_prewarm_opt(object_type,
-                                       tablet_id,
-                                       major_snapshot_version,
-                                       reorganization_scn.get_val_for_sql());
-  return OB_STORAGE_OBJECT_MGR.ss_get_object_id(storage_opt, macro_id);
-}
 } // namespace tablet_macro_id_iter_helper
 
 TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
@@ -2943,62 +2930,6 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           cur_tablet_id, table_store_macro_id, minor_op_id, inc_major_op_id));
   ASSERT_EQ(-1, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
-}
-
-TEST_F(TestSSMetaIterWrapper, wrapper_tablet_macro_id_iter_prewarm_object_id)
-{
-  using namespace tablet_macro_id_iter_helper;
-  auto &proxy = get_sql_client();
-  const uint64_t tenant_id = 1;
-  const ObLSID ls_id(1710);
-  const ObTabletID tablet_id(200301);
-  const share::SCN reorganization_scn = make_scn(1234);
-  const int64_t major_snapshot_version = 5678;
-  ObSEArray<share::SCN, 1> scn_arr;
-  ASSERT_EQ(OB_SUCCESS, scn_arr.push_back(make_scn(100)));
-
-  storage::ObSSMetaTabletMacroIDIterator iter;
-  ASSERT_EQ(OB_SUCCESS, iter.init(proxy, tenant_id, ls_id,
-      tablet_id, reorganization_scn, scn_arr));
-  ASSERT_EQ(OB_SUCCESS, iter.push_prewarm_block_info_(tablet_id, reorganization_scn,
-      blocksstable::ObStorageObjectType::MAJOR_PREWARM_DATA,
-      storage::ObTabletMacroType::DATA_BLOCK,
-      major_snapshot_version, iter.cur_block_infos_));
-  ASSERT_EQ(OB_SUCCESS, iter.push_prewarm_block_info_(tablet_id, reorganization_scn,
-      blocksstable::ObStorageObjectType::MAJOR_PREWARM_DATA_INDEX,
-      storage::ObTabletMacroType::DATA_BLOCK,
-      major_snapshot_version, iter.cur_block_infos_));
-  ASSERT_EQ(OB_SUCCESS, iter.push_prewarm_block_info_(tablet_id, reorganization_scn,
-      blocksstable::ObStorageObjectType::MAJOR_PREWARM_META,
-      storage::ObTabletMacroType::META_BLOCK,
-      major_snapshot_version, iter.cur_block_infos_));
-  ASSERT_EQ(OB_SUCCESS, iter.push_prewarm_block_info_(tablet_id, reorganization_scn,
-      blocksstable::ObStorageObjectType::MAJOR_PREWARM_META_INDEX,
-      storage::ObTabletMacroType::META_BLOCK,
-      major_snapshot_version, iter.cur_block_infos_));
-  ASSERT_EQ(4, iter.cur_block_infos_.count());
-
-  blocksstable::ObStorageObjectType object_types[4] = {
-      blocksstable::ObStorageObjectType::MAJOR_PREWARM_DATA,
-      blocksstable::ObStorageObjectType::MAJOR_PREWARM_DATA_INDEX,
-      blocksstable::ObStorageObjectType::MAJOR_PREWARM_META,
-      blocksstable::ObStorageObjectType::MAJOR_PREWARM_META_INDEX};
-  storage::ObTabletMacroType block_types[4] = {
-      storage::ObTabletMacroType::DATA_BLOCK,
-      storage::ObTabletMacroType::DATA_BLOCK,
-      storage::ObTabletMacroType::META_BLOCK,
-      storage::ObTabletMacroType::META_BLOCK};
-  for (int64_t i = 0; i < 4; ++i) {
-    MacroBlockId expected_id;
-    ASSERT_EQ(OB_SUCCESS, make_prewarm_macro_id(object_types[i],
-        tablet_id.id(), major_snapshot_version, reorganization_scn, expected_id));
-    ASSERT_EQ(expected_id, iter.cur_block_infos_.at(i).macro_id());
-    ASSERT_EQ(block_types[i], iter.cur_block_infos_.at(i).block_type());
-    ASSERT_EQ(tablet_id.id(), iter.cur_block_infos_.at(i).macro_id().second_id());
-    ASSERT_EQ(reorganization_scn.get_val_for_sql(),
-              iter.cur_block_infos_.at(i).macro_id().reorganization_scn());
-    ASSERT_EQ(major_snapshot_version, iter.cur_block_infos_.at(i).macro_id().fourth_id());
-  }
 }
 
 TEST_F(TestSSMetaIterWrapper, wrapper_tablet_iter_real_tablet_roundtrip_with_inline_macro_info)

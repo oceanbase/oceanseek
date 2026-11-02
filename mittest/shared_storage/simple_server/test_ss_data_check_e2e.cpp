@@ -513,8 +513,7 @@ int TestSSDataCheckE2E::inspect_expected_snapshot_(
       } else if (OB_FAIL(
           ObSSMetaTabletMacroIDIterator::collect_blocks_from_tablet_meta_value(
               tablet_allocator, row.ls_id_, tablet_id, reorganize_scn,
-              row.meta_value_, false /*fill_occupy_size*/,
-              false /*include_prewarm*/, block_infos))) {
+              row.meta_value_, false /*fill_occupy_size*/, block_infos))) {
         LOG_WARN("failed to expand shared meta tablet value", KR(ret), K(row));
       } else if (tablet_id == target_tablet_id) {
         ++stat.target_version_count_;
@@ -701,8 +700,7 @@ int TestSSDataCheckE2E::get_tablet_expand_ret_(
     expand_ret =
         ObSSMetaTabletMacroIDIterator::collect_blocks_from_tablet_meta_value(
             allocator, row.ls_id_, tablet_id, reorganize_scn,
-            row.meta_value_, false /*fill_occupy_size*/,
-            false /*include_prewarm*/, block_infos);
+            row.meta_value_, false /*fill_occupy_size*/, block_infos);
   }
   return ret;
 }

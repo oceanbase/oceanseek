@@ -1027,6 +1027,25 @@ private:
   int64_t last_click_us_;
 };
 
+// Accumulate elapsed microseconds on scope exit. The counter must outlive the timer.
+// Updates are not atomic; construct before other locals to include their cleanup time.
+class ObCostTimer final
+{
+public:
+  explicit ObCostTimer(int64_t &cost_us)
+    : cost_us_(cost_us), start_us_(common::ObTimeUtility::current_time_us())
+  {}
+  ~ObCostTimer()
+  {
+    const int64_t elapsed_us = common::ObTimeUtility::current_time_us() - start_us_;
+    cost_us_ += MAX(elapsed_us, 0L);
+  }
+private:
+  int64_t &cost_us_;
+  const int64_t start_us_;
+  DISALLOW_COPY_AND_ASSIGN(ObCostTimer);
+};
+
 class ObTimeInterval
 {
 public:

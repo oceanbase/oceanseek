@@ -14,7 +14,6 @@
 #include "storage/incremental/ssmeta/ob_ss_meta_define.h"
 #include "storage/incremental/ssmeta/ob_ss_meta_table_iterator.h"
 #include "storage/meta_mem/ob_tablet_handle.h"
-#include "storage/blocksstable/ob_storage_object_type.h"
 #include "storage/tablet/ob_tablet_block_aggregated_info.h"
 #include "storage/tablet/ob_tablet_macro_info_iterator.h"
 
@@ -22,7 +21,6 @@ namespace oceanbase
 {
 namespace blocksstable
 {
-class ObSSTable;
 class ObMacroIdIterator;
 class ObSSTableMacroInfo;
 }
@@ -471,8 +469,6 @@ public:
   // 收集 inline shared_meta 管理块 + 反序列化 tablet 后逐 sstable 的数据/元数据宏块。
   // 收集全量（不按 type 过滤、不跨版本去重），调用方自行过滤/去重。
   // fill_occupy_size=true 时从 sstable meta 按 data macro 数分摊补 DATA 块 occupy_size。
-  // include_prewarm=true 时收集 major sstable 的预热文件对象 ID；当前 GC 和 backup 均传 false，
-  //   因为预热文件不再生成
   // 路径 b 失败必须上抛，避免生成"成功但缺块"的不完整结果。
   // 需在有效的 MTL 租户上下文中调用（sstable->get_meta() 可能触发共享存储 IO）。
   static int collect_blocks_from_tablet_meta_value(
@@ -482,7 +478,6 @@ public:
       const share::SCN &reorganize_scn,
       const common::ObString &meta_value,
       const bool fill_occupy_size,
-      const bool include_prewarm,
       common::ObIArray<ObTabletBlockInfo> &out_blocks);
   INHERIT_TO_STRING_KV("ObSSMetaIterator", ObSSMetaIterator,
                        K_(is_inited), K_(target_type), K_(iter_end), K_(cur_version_idx));
@@ -490,21 +485,9 @@ private:
   int load_next_version_blocks_();
   int collect_blocks_from_tablet_(const common::ObString &meta_value);
   static int collect_blocks_from_sstables_(const common::ObTabletID &tablet_id,
-                                           const share::SCN &reorganize_scn,
                                            const bool fill_occupy_size,
-                                           const bool include_prewarm,
                                            ObTablet &tablet,
                                            common::ObIArray<ObTabletBlockInfo> &out_blocks);
-  static int collect_prewarm_blocks_from_sstable_(const common::ObTabletID &tablet_id,
-                                                  const share::SCN &reorganize_scn,
-                                                  const blocksstable::ObSSTable &sstable,
-                                                  common::ObIArray<ObTabletBlockInfo> &out_blocks);
-  static int push_prewarm_block_info_(const common::ObTabletID &tablet_id,
-                                      const share::SCN &reorganize_scn,
-                                      const blocksstable::ObStorageObjectType object_type,
-                                      const ObTabletMacroType block_type,
-                                      const int64_t major_snapshot_version,
-                                      common::ObIArray<ObTabletBlockInfo> &out_blocks);
   static int collect_inline_shared_meta_blocks_(common::ObArenaAllocator &allocator,
                                                 const common::ObString &meta_value,
                                                 common::ObIArray<ObTabletBlockInfo> &out_blocks);

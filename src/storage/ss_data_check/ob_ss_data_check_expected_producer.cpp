@@ -441,7 +441,7 @@ int ObSSDataCheckExpectedCollectTask::collect_tablet_row_(
   } else if (OB_SUCCESS != (expand_ret =
       ObSSMetaTabletMacroIDIterator::collect_blocks_from_tablet_meta_value(
           tablet_allocator, row.ls_id_, tablet_id, reorganize_scn,
-          row.meta_value_, false /*fill_occupy_size*/, false /*include_prewarm*/, block_infos))
+          row.meta_value_, false /*fill_occupy_size*/, block_infos))
       && OB_OBJECT_NOT_EXIST != expand_ret) {
     ret = expand_ret;
     LOG_WARN("failed to expand expected tablet batch row", KR(ret), K(row));

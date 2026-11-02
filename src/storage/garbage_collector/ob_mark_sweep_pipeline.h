@@ -152,6 +152,8 @@ public:
            ObGCMacroBlockCompare *compare,
            ObMarkSweepTmpFileMgr *tmp_file_mgr);
   int add_item(const ObGCMacroBlockItem &item);
+  // Accumulated add-triggered flush cost; excludes finish and is cleared by reset.
+  int64_t get_flush_sorted_run_cost_us() const { return flush_sorted_run_cost_us_; }
   // 将剩余的内存数据刷出后，把所有有序 run 作为独立文件返回（不做最终归并）。
   // 小输入对应 1 个 run、1 个文件；大输入对应 N 个 run、N 个文件。
   // 跨 run 的去重延迟到全局流水线归并中处理。
@@ -176,6 +178,7 @@ private:
 
   common::ObSEArray<ObSortedFileInfo, 16> runs_;
   bool has_data_;
+  int64_t flush_sorted_run_cost_us_;
   DISALLOW_COPY_AND_ASSIGN(ObSortedRunWriter);
 };
 
@@ -423,6 +426,7 @@ public:
 
   int init(ObMarkSweepPipeline *pipeline);
   int add_item(const ObGCMacroBlockItem &item);
+  int64_t get_flush_sorted_run_cost_us() const { return writer_.get_flush_sorted_run_cost_us(); }
   // Finish and hand out all sorted runs as separate files (see ObSortedRunWriter::finish).
   int finish(common::ObIArray<ObSortedFileInfo> &results);
 

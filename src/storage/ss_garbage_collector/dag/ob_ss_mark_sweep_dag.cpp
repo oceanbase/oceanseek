@@ -33,6 +33,7 @@
 #include "lib/hash/ob_hashset.h"
 #include "lib/time/ob_time_utility.h"
 #include "lib/utility/ob_tracepoint.h"
+#include "lib/utility/utility.h"
 #include "observer/ob_server_struct.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
 
@@ -66,11 +67,14 @@ void ObSSMarkSweepCostStat::reset()
   total_end_us_ = 0;
   sort_start_us_ = INT64_MAX;
   sort_end_us_ = 0;
-  kept_meta_scn_persist_total_cost_us_ = 0;
-  kept_meta_scn_persist_parallelism_ = 1;
+  meta_scn_scan_cost_us_ = 0;
+  replayed_scn_check_cost_us_ = 0;
+  macro_iter_and_sorter_cost_us_ = 0;
+  sorter_cost_us_ = 0;
+  kept_meta_scn_persist_cost_us_ = 0;
+  task_parallelism_ = 1;
   kept_meta_scn_persist_plan_count_ = 0;
   kept_meta_scn_persist_candidate_count_ = 0;
-  kept_meta_scn_persist_trans_attempt_count_ = 0;
   for (int64_t g = 0; g < GROUP_CNT; ++g) {
     for (int64_t p = 0; p < MAX_MERGE_PASS; ++p) {
       merge_pass_start_us_[g][p] = INT64_MAX;
@@ -90,6 +94,18 @@ void ObSSMarkSweepCostStat::record_sort_cost(const int64_t start_us, const int64
   inc_update(&sort_end_us_, end_us);
 }
 
+void ObSSMarkSweepCostStat::record_sort_detail_cost(
+    const int64_t meta_scn_scan_cost_us,
+    const int64_t replayed_scn_check_cost_us,
+    const int64_t macro_iter_and_sorter_cost_us,
+    const int64_t sorter_cost_us)
+{
+  (void)ATOMIC_AAF(&meta_scn_scan_cost_us_, meta_scn_scan_cost_us);
+  (void)ATOMIC_AAF(&replayed_scn_check_cost_us_, replayed_scn_check_cost_us);
+  (void)ATOMIC_AAF(&macro_iter_and_sorter_cost_us_, macro_iter_and_sorter_cost_us);
+  (void)ATOMIC_AAF(&sorter_cost_us_, sorter_cost_us);
+}
+
 void ObSSMarkSweepCostStat::record_kept_meta_scn_persist_cost(
     const int64_t start_us,
     const int64_t end_us,
@@ -97,7 +113,7 @@ void ObSSMarkSweepCostStat::record_kept_meta_scn_persist_cost(
     const int64_t candidate_count)
 {
   const int64_t cost_us = MAX(end_us - start_us, 0L);
-  (void)ATOMIC_AAF(&kept_meta_scn_persist_total_cost_us_, cost_us);
+  (void)ATOMIC_AAF(&kept_meta_scn_persist_cost_us_, cost_us);
   (void)ATOMIC_AAF(&kept_meta_scn_persist_plan_count_, plan_count);
   (void)ATOMIC_AAF(&kept_meta_scn_persist_candidate_count_, candidate_count);
 }
@@ -124,48 +140,90 @@ void ObSSMarkSweepCostStat::record_merge_pass_input_count(const ObMarkSweepGroup
   }
 }
 
-// Example:
-// {total_cost_us=100,sort_cost_us=20,del_passes=2[p0=(cost_us=15,files=8),p1=(cost_us=10,files=2)],
-//  kept_passes=2[p0=(cost_us=15,files=6),p1=(cost_us=10,files=2)],diff_cost_us=30,
-//  merged_del_size=131072,merged_kept_size=294912}
 int64_t ObSSMarkSweepCostStat::to_string(char *buf, const int64_t buf_len) const
 {
   int64_t pos = 0;
   const int64_t total_cost_us = (total_end_us_ > 0) ? (total_end_us_ - total_start_us_) : 0;
   const int64_t sort_cost_us = (sort_end_us_ > 0) ? (sort_end_us_ - sort_start_us_) : 0;
-  const int64_t kept_persist_total_cost_us = ATOMIC_LOAD(&kept_meta_scn_persist_total_cost_us_);
-  const int64_t kept_persist_parallelism = MAX(kept_meta_scn_persist_parallelism_, 1L);
-  const int64_t kept_persist_cost_us = kept_persist_total_cost_us / kept_persist_parallelism;
+  const int64_t parallelism = MAX(task_parallelism_, 1L);
+  const int64_t meta_scn_scan_cost_us = ATOMIC_LOAD(&meta_scn_scan_cost_us_) / parallelism;
+  const int64_t replayed_scn_check_cost_us = ATOMIC_LOAD(&replayed_scn_check_cost_us_) / parallelism;
+  const int64_t macro_iter_and_sorter_cost_us = ATOMIC_LOAD(&macro_iter_and_sorter_cost_us_) / parallelism;
+  const int64_t sorter_cost_us = ATOMIC_LOAD(&sorter_cost_us_) / parallelism;
+  const int64_t kept_persist_cost_us = ATOMIC_LOAD(&kept_meta_scn_persist_cost_us_) / parallelism;
+  int64_t merge_start_us = INT64_MAX;
+  int64_t merge_end_us = 0;
+  for (int64_t g = 0; g < GROUP_CNT; ++g) {
+    for (int64_t p = 0; p < MAX_MERGE_PASS; ++p) {
+      if (is_valid_merge_pass_(g, p)) {
+        merge_start_us = MIN(merge_start_us, merge_pass_start_us_[g][p]);
+        merge_end_us = MAX(merge_end_us, merge_pass_end_us_[g][p]);
+      }
+    }
+  }
+  const int64_t merge_cost_us = ((INT64_MAX != merge_start_us) ? (merge_end_us - merge_start_us) : 0);
   const int64_t diff_cost_us = (diff_end_us_ > 0) ? (diff_end_us_ - diff_start_us_) : 0;
-  (void)databuff_printf(buf, buf_len, pos, "{total_cost_us=%ld,sort_cost_us=%ld",
-      total_cost_us, sort_cost_us);
   (void)databuff_printf(buf, buf_len, pos,
-      ",kept_persist_cost_us=%ld,kept_persist_plan_cnt=%ld,"
-      "kept_persist_candidate_cnt=%ld,kept_persist_trans_attempt_cnt=%ld",
-      kept_persist_cost_us,
-      ATOMIC_LOAD(&kept_meta_scn_persist_plan_count_),
+      "{total_cost_us=%ld,sort_cost_us=%ld(meta_scn_scan_cost_us=%ld,"
+      "replayed_scn_check_cost_us=%ld,macro_iter_and_sorter_cost_us=%ld,sorter_cost_us=%ld,"
+      "kept_persist_cost_us=%ld,kept_persist_cnt=%ld/%ld),merge_cost_us=%ld,diff_cost_us=%ld}",
+      total_cost_us, sort_cost_us, meta_scn_scan_cost_us, replayed_scn_check_cost_us,
+      macro_iter_and_sorter_cost_us, sorter_cost_us, kept_persist_cost_us,
       ATOMIC_LOAD(&kept_meta_scn_persist_candidate_count_),
-      ATOMIC_LOAD(&kept_meta_scn_persist_trans_attempt_count_));
-  // per-group passes: only passes whose batch tasks actually ran (end_us > 0) are counted,
-  // which naturally excludes the terminal pass ctrl (no batch).
+      ATOMIC_LOAD(&kept_meta_scn_persist_plan_count_), merge_cost_us, diff_cost_us);
+  return pos;
+}
+
+int64_t ObSSMarkSweepCostStat::to_merge_string(char *buf, const int64_t buf_len) const
+{
+  // Footer text (36) + two int64 values (2 * 20) + opening brace/NUL (2) = 78 bytes.
+  // Reserve additional margin for the footer and string boundaries.
+  // ",merged_del_size=xxx,merged_kept_size=xxx}"
+  static const int64_t MERGE_FOOTER_RESERVED_LEN = 128;
+  // With MAX_MERGE_PASS = 32, ",omitted_passes=32]" needs 19 bytes; reserve additional margin.
+  static const int64_t MERGE_GROUP_SUFFIX_RESERVED_LEN = 32;
+  // Share the remaining capacity between both groups.
+  const int64_t group_budget = MAX(buf_len - MERGE_FOOTER_RESERVED_LEN, 0L) / GROUP_CNT;
+  int64_t pos = 0;
   const char *group_names[GROUP_CNT] = {"del_passes", "kept_passes"};
+  (void)databuff_printf(buf, buf_len, pos, "{");
   for (int64_t g = 0; g < GROUP_CNT; ++g) {
     int64_t pass_cnt = 0;
-    while ((pass_cnt < MAX_MERGE_PASS) && (merge_pass_end_us_[g][pass_cnt] > 0)) {
-      ++pass_cnt;
+    int64_t printed_cnt = 0;
+    for (int64_t p = 0; p < MAX_MERGE_PASS; ++p) {
+      if (is_valid_merge_pass_(g, p)) {
+        ++pass_cnt;
+      }
     }
-    (void)databuff_printf(buf, buf_len, pos, ",%s=%ld[", group_names[g], pass_cnt);
-    for (int64_t p = 0; p < pass_cnt; ++p) {
-      const int64_t pass_cost = merge_pass_end_us_[g][p] - merge_pass_start_us_[g][p];
-      (void)databuff_printf(buf, buf_len, pos, "%sp%ld=(cost_us=%ld,files=%ld)",
-          (0 == p) ? "" : ",", p, pass_cost, merge_pass_input_cnt_[g][p]);
+    const int64_t group_end = pos + group_budget;
+    (void)databuff_printf(buf, buf_len, pos, "%s%s=%ld[", (0 == g) ? "" : ",",
+        group_names[g], pass_cnt);
+    bool can_append_pass = true;
+    for (int64_t p = 0; can_append_pass && (p < MAX_MERGE_PASS); ++p) {
+      if (is_valid_merge_pass_(g, p)) {
+        char pass_buf[128] = {0};
+        int64_t pass_pos = 0;
+        const int64_t pass_cost = merge_pass_end_us_[g][p] - merge_pass_start_us_[g][p];
+        (void)databuff_printf(pass_buf, sizeof(pass_buf), pass_pos,
+            "%sp%ld=(cost_us=%ld,files=%ld)", (0 == printed_cnt) ? "" : ",",
+            p, pass_cost, merge_pass_input_cnt_[g][p]);
+        // Keep entries whole and reserve space for the omitted count and closing bracket.
+        if ((pos + pass_pos) > (group_end - MERGE_GROUP_SUFFIX_RESERVED_LEN)) {
+          can_append_pass = false;
+        } else {
+          (void)databuff_printf(buf, buf_len, pos, "%s", pass_buf);
+          ++printed_cnt;
+        }
+      }
+    }
+    if (printed_cnt < pass_cnt) {
+      (void)databuff_printf(buf, buf_len, pos, "%somitted_passes=%ld",
+          (0 == printed_cnt) ? "" : ",", pass_cnt - printed_cnt);
     }
     (void)databuff_printf(buf, buf_len, pos, "]");
   }
-  (void)databuff_printf(buf, buf_len, pos, ",diff_cost_us=%ld", diff_cost_us);
-  (void)databuff_printf(buf, buf_len, pos, ",merged_del_size=%ld,merged_kept_size=%ld",
+  (void)databuff_printf(buf, buf_len, pos, ",merged_del_size=%ld,merged_kept_size=%ld}",
       merged_del_size_, merged_kept_size_);
-  (void)databuff_printf(buf, buf_len, pos, "}");
   return pos;
 }
 
@@ -748,6 +806,16 @@ int ObSSMarkSweepDag::update_gc_control_status_()
         "dag_id", get_dag_id(),
         "tablet_cnt", ctx_->progress_.get_total_tablet_count(),
         cost_stat_buf /*extra_info*/);
+    char merge_stat_buf[MAX_ROOTSERVICE_EVENT_EXTRA_INFO_LENGTH] = {0};
+    (void)ctx_->cost_stat_.to_merge_string(merge_stat_buf, sizeof(merge_stat_buf));
+    SERVER_EVENT_ADD("SHARED_GC", "MARK_SWEEP_MERGE_STAT",
+        "tenant_id", tenant_id_,
+        "round_id", ctx_->round_id_,
+        "gc_meta_scn", ctx_->safe_meta_scn_,
+        "dag_ret", dag_ret,
+        "dag_id", get_dag_id(),
+        "tablet_cnt", ctx_->progress_.get_total_tablet_count(),
+        merge_stat_buf /*extra_info*/);
   }
   return ret;
 }
@@ -919,7 +987,7 @@ int ObSSMarkSweepPrepareTask::process()
                    ObDagPrio::DAG_PRIO_MARK_SWEEP, parallelism))) {
       LOG_WARN("fail to get mark sweep parallelism", KR(ret), "tenant_id", ctx->tenant_id_);
     } else {
-      ctx->cost_stat_.set_kept_meta_scn_persist_parallelism(parallelism);
+      ctx->cost_stat_.set_task_parallelism(parallelism);
       if (OB_FAIL(ctx->pipeline_.init(ctx->tenant_id_,
                                      ctx->memory_limit_,
                                      ctx->file_buf_size_,
@@ -1096,7 +1164,8 @@ void ObSSMarkSweepPrepareTask::try_init_diag_mgr_(ObSSMarkSweepCtx &ctx)
 // ============================ ObSSMarkSweepSortTask ============================
 ObSSMarkSweepSortTask::ObSSMarkSweepSortTask()
   : ObSSMarkSweepBaseTask(TASK_TYPE_MARK_SWEEP_SORT), is_inited_(false), start_tablet_idx_(0),
-    end_tablet_idx_(0), kept_meta_scn_persist_items_()
+    end_tablet_idx_(0), kept_meta_scn_persist_items_(), meta_scn_scan_cost_us_(0),
+    replayed_scn_check_cost_us_(0), macro_iter_and_sorter_cost_us_(0), sorter_cost_us_(0)
 {
   kept_meta_scn_persist_items_.set_attr(ObMemAttr(MTL_ID(), "SSGCKeptItem"));
 }
@@ -1164,6 +1233,7 @@ int ObSSMarkSweepSortTask::get_all_meta_scns_(
     const SCN &snapshot_meta_scn,
     ObIArray<SCN> &all_meta_scns)
 {
+  ObCostTimer cost_timer(meta_scn_scan_cost_us_);
   int ret = OB_SUCCESS;
   ObSSMetaService *meta_srv = nullptr;
   if (OB_ISNULL(meta_srv = MTL(ObSSMetaService *))) {
@@ -1575,7 +1645,6 @@ int ObSSMarkSweepSortTask::persist_kept_meta_scn_with_trans_(
                  share::OBCG_SHARED_META, timeout_ctx, trans))) {
     LOG_WARN("fail to start kept meta scn transaction", KR(ret), K(item));
   } else {
-    ctx.cost_stat_.inc_kept_meta_scn_persist_trans_attempt_count();
     if (OB_FAIL(persist_kept_meta_scn_(item, trans))) {
       LOG_WARN("fail to persist kept meta scn", KR(ret), K(item));
     }
@@ -1638,6 +1707,7 @@ int ObSSMarkSweepSortTask::check_if_replayed_scn_exceed_checkpoint_scn_(
     const ObHashMap<ObLSID, SCN> &ls_ss_checkpoint_scn_map,
     bool &is_exceed)
 {
+  ObCostTimer cost_timer(replayed_scn_check_cost_us_);
   int ret = OB_SUCCESS;
   is_exceed = false;
   ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "SSGCTbltHdl"));
@@ -1808,6 +1878,7 @@ int ObSSMarkSweepSortTask::process_one_group_(
     ObMarkSweepSorter &sorter,
     ObIArray<MacroBlockId> &diag_macro_ids)
 {
+  ObCostTimer cost_timer(macro_iter_and_sorter_cost_us_);
   int ret = OB_SUCCESS;
   ObSSMetaTabletMacroIDIterator macro_id_iter;
   if (group_meta_scns.empty()) {
@@ -1943,6 +2014,10 @@ int ObSSMarkSweepSortTask::ProcessOneTabletFn::operator()()
 
 int ObSSMarkSweepSortTask::process()
 {
+  meta_scn_scan_cost_us_ = 0;
+  replayed_scn_check_cost_us_ = 0;
+  macro_iter_and_sorter_cost_us_ = 0;
+  sorter_cost_us_ = 0;
   int ret = OB_SUCCESS;
   ObTimePiece time_piece;
   ObSSMarkSweepCtx *ctx = nullptr;
@@ -1999,10 +2074,18 @@ int ObSSMarkSweepSortTask::process()
         }
       }
     }
-    if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(sorter_pair.finish_and_add_file())) {
-      LOG_WARN("fail to finish sorter pair and add file", KR(ret), K_(start_tablet_idx), K_(end_tablet_idx));
-    } else if (OB_FAIL(persist_kept_meta_scns_(kept_meta_scn_persist_items_, *ctx))) {
+    // Capture add-triggered flushes once on both success and failure, before finish resets writers.
+    sorter_cost_us_ += sorter_pair.get_flush_sorted_run_cost_us();
+    if (OB_SUCC(ret)) {
+      const int64_t finish_start_us = ObTimeUtility::current_time_us();
+      if (OB_FAIL(sorter_pair.finish_and_add_file())) {
+        LOG_WARN("fail to finish sorter pair and add file", KR(ret), K_(start_tablet_idx), K_(end_tablet_idx));
+      }
+      const int64_t finish_cost_us = MAX(ObTimeUtility::current_time_us() - finish_start_us, 0L);
+      macro_iter_and_sorter_cost_us_ += finish_cost_us;
+      sorter_cost_us_ += finish_cost_us;
+    }
+    if (FAILEDx(persist_kept_meta_scns_(kept_meta_scn_persist_items_, *ctx))) {
       LOG_WARN("fail to persist kept meta scn items", KR(ret),
           K_(start_tablet_idx), K_(end_tablet_idx),
           "item_count", kept_meta_scn_persist_items_.count());
@@ -2016,6 +2099,8 @@ int ObSSMarkSweepSortTask::process()
   const int64_t tablet_total = (nullptr != ctx) ? ctx->progress_.get_total_tablet_count() : 0;
   if (OB_NOT_NULL(ctx)) {
     ctx->cost_stat_.record_sort_cost(time_piece.start_us(), ObTimeUtility::current_time_us());
+    ctx->cost_stat_.record_sort_detail_cost(meta_scn_scan_cost_us_, replayed_scn_check_cost_us_,
+        macro_iter_and_sorter_cost_us_, sorter_cost_us_);
   }
   LOG_INFO("finish to process ObSSMarkSweepSortTask", KR(ret), "cost_us",
       time_piece.fly_us(), K_(start_tablet_idx), K_(end_tablet_idx),
