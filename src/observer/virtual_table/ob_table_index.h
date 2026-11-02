@@ -8,6 +8,7 @@
 
 #include "lib/container/ob_se_array.h"
 #include "share/ob_virtual_table_scanner_iterator.h"
+#include "share/schema/ob_schema_getter_guard.h"
 #include "common/ob_range.h"
 namespace oceanbase
 {
@@ -32,11 +33,19 @@ public:
   ObTableIndex();
   virtual ~ObTableIndex();
   virtual int inner_open();
+  virtual int inner_close();
   virtual int inner_get_next_row(common::ObNewRow *&row);
   virtual void reset();
   int init(uint64_t tenant_id);
 private:
-
+  void reset_table_state_();
+  int get_current_table_schema_(const uint64_t table_id,
+                                const share::schema::ObTableSchema *&table_schema);
+  int get_current_index_schema_(const uint64_t tenant_id,
+                                const uint64_t index_id,
+                                const share::schema::ObTableSchema *&index_schema);
+  int get_container_table_schema_(const share::schema::ObTableSchema &table_schema,
+                                  const share::schema::ObTableSchema *&container_schema);
   int add_table_indexes(const share::schema::ObTableSchema &table_schema,
                         const common::ObString &database_name,
                         common::ObObj *cells,
@@ -110,6 +119,13 @@ private:
   int64_t async_dep_col_idx_; // for async index, async fts / async search index etc.
   uint64_t min_data_version_;
   int64_t vec_dep_col_idx_;
+  // The scan guard owns enumeration/database/virtual-table metadata. Only this
+  // guard pins the current table and its index/container/auxiliary schemas.
+  share::schema::ObSchemaGetterGuard table_guard_;
+  const share::schema::ObTableSchema *current_table_schema_;
+  const share::schema::ObTableSchema *current_index_schema_;
+  const share::schema::ObTableSchema *container_table_schema_;
+  bool is_iter_end_;
   DISALLOW_COPY_AND_ASSIGN(ObTableIndex);
 };
 }

@@ -123,6 +123,49 @@ int ObSchemaGetterGuard::init(const ObSimpleSchemaMode schema_mode)
   return ret;
 }
 
+int ObSchemaGetterGuard::init_from_snapshot(
+    const ObSchemaGetterGuard &source, const uint64_t tenant_id)
+{
+  int ret = OB_SUCCESS;
+  if (this == &source || OB_INVALID_TENANT_ID == tenant_id || OB_INVALID_ID == tenant_id) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (is_inited_) {
+    ret = OB_INIT_TWICE;
+  } else if (!source.check_inner_stat()) {
+    ret = OB_NOT_INIT;
+  } else if (OB_FAIL(source.check_tenant_schema_guard(tenant_id))) {
+    LOG_WARN("cannot inherit another tenant's schema snapshot", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(init(source.schema_mode_))) {
+    LOG_WARN("failed to initialize snapshot guard", KR(ret), K(tenant_id));
+  } else {
+    const uint64_t tenant_ids[] = {OB_SYS_TENANT_ID, tenant_id};
+    const int64_t tenant_count = OB_SYS_TENANT_ID == tenant_id ? 1 : 2;
+    for (int64_t i = 0; OB_SUCC(ret) && i < tenant_count; ++i) {
+      const ObSchemaMgrInfo *info = NULL;
+      if (OB_FAIL(source.get_schema_mgr_info(tenant_ids[i], info))) {
+        LOG_WARN("failed to get source schema snapshot", KR(ret), "tenant_id", tenant_ids[i]);
+      } else if (OB_ISNULL(info)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (OB_FAIL(schema_mgr_infos_.push_back(*info))) {
+        LOG_WARN("failed to retain source schema snapshot", KR(ret), KPC(info));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      schema_service_ = source.schema_service_;
+      session_id_ = source.session_id_;
+      tenant_id_ = tenant_id;
+      schema_guard_type_ = TENANT_SCHEMA_GUARD;
+      restore_tenant_exist_ = source.restore_tenant_exist_;
+      // This is a fixed snapshot for point lookups. Full scans and their SQL
+      // snapshot transactions remain owned by the source guard.
+      is_latest_guard_ = false;
+    } else {
+      reset();
+    }
+  }
+  return ret;
+}
+
 int ObSchemaGetterGuard::reset()
 {
   int ret = OB_SUCCESS;

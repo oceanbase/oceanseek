@@ -136,6 +136,10 @@ public:
   explicit ObSchemaGetterGuard(const ObSchemaMgrItem::Mod mod);
 	virtual ~ObSchemaGetterGuard();
   int reset();
+  // Create a point-lookup guard with the same sys/tenant snapshots as source.
+  // Object pins, local allocations and lite-scan transactions are not shared.
+  // The caller may reset this guard after consuming one table and its dependents.
+  int init_from_snapshot(const ObSchemaGetterGuard &source, const uint64_t tenant_id);
 	void dump();
 	OB_INLINE bool is_inited() const { return is_inited_; }
 

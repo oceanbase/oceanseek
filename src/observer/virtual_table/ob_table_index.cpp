@@ -33,7 +33,12 @@ ObTableIndex::ObTableIndex()
       ft_dep_col_idx_(OB_INVALID_ID),
       async_dep_col_idx_(OB_INVALID_ID),
       min_data_version_(OB_INVALID_VERSION),
-      vec_dep_col_idx_(OB_INVALID_ID)
+      vec_dep_col_idx_(OB_INVALID_ID),
+      table_guard_(ObSchemaMgrItem::MOD_VTABLE_SCAN_PARAM),
+      current_table_schema_(NULL),
+      current_index_schema_(NULL),
+      container_table_schema_(NULL),
+      is_iter_end_(false)
 {
 }
 
@@ -44,6 +49,9 @@ ObTableIndex::~ObTableIndex()
 int ObTableIndex::inner_open()
 {
   int ret = OB_SUCCESS;
+  inner_close();
+  is_iter_end_ = false;
+  show_table_id_ = OB_INVALID_ID;
   for (int64_t i = 0;
        OB_SUCC(ret) && OB_INVALID_ID == show_table_id_ && i < key_ranges_.count(); ++i) {
     const ObRowkey &start_key = key_ranges_.at(i).start_key_;
@@ -62,26 +70,103 @@ int ObTableIndex::inner_open()
   }
   return ret;
 }
+
+void ObTableIndex::reset_table_state_()
+{
+  current_table_schema_ = NULL;
+  current_index_schema_ = NULL;
+  container_table_schema_ = NULL;
+  simple_index_infos_.reuse();
+  rowkey_info_idx_ = OB_INVALID_ID;
+  index_tid_array_idx_ = OB_INVALID_ID;
+  index_column_idx_ = OB_INVALID_ID;
+  ft_dep_col_idx_ = OB_INVALID_ID;
+  async_dep_col_idx_ = OB_INVALID_ID;
+  vec_dep_col_idx_ = OB_INVALID_ID;
+  is_rowkey_end_ = false;
+  is_normal_end_ = false;
+  table_guard_.reset();
+}
+
+int ObTableIndex::inner_close()
+{
+  reset_table_state_();
+  database_schemas_.reset();
+  table_ids_.reset();
+  database_schema_idx_ = OB_INVALID_ID;
+  table_schema_idx_ = OB_INVALID_ID;
+  is_iter_end_ = true;
+  return OB_SUCCESS;
+}
+
+int ObTableIndex::get_current_table_schema_(const uint64_t table_id,
+                                           const ObTableSchema *&table_schema)
+{
+  int ret = OB_SUCCESS;
+  table_schema = NULL;
+  if (OB_ISNULL(schema_guard_)) {
+    ret = OB_NOT_INIT;
+  } else if (OB_NOT_NULL(current_table_schema_)) {
+    if (current_table_schema_->get_table_id() != table_id) {
+      ret = OB_ERR_UNEXPECTED;
+      SERVER_LOG(WARN, "previous table has not been consumed", KR(ret), K(table_id));
+    }
+  } else if (OB_FAIL(table_guard_.init_from_snapshot(*schema_guard_, tenant_id_))) {
+    SERVER_LOG(WARN, "failed to inherit scan schema snapshot", KR(ret), K_(tenant_id));
+  } else if (OB_FAIL(table_guard_.get_table_schema(tenant_id_, table_id, current_table_schema_))) {
+    SERVER_LOG(WARN, "failed to get current table schema", KR(ret), K_(tenant_id), K(table_id));
+  }
+  if (OB_SUCC(ret)) {
+    table_schema = current_table_schema_;
+  }
+  return ret;
+}
+
+int ObTableIndex::get_current_index_schema_(const uint64_t tenant_id,
+                                           const uint64_t index_id,
+                                           const ObTableSchema *&index_schema)
+{
+  int ret = OB_SUCCESS;
+  index_schema = NULL;
+  if (OB_ISNULL(current_index_schema_) || current_index_schema_->get_table_id() != index_id) {
+    current_index_schema_ = NULL;
+    if (OB_FAIL(table_guard_.get_table_schema(tenant_id, index_id, current_index_schema_))) {
+      SERVER_LOG(WARN, "failed to get current index schema", KR(ret), K(tenant_id), K(index_id));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    index_schema = current_index_schema_;
+  }
+  return ret;
+}
+
+int ObTableIndex::get_container_table_schema_(const ObTableSchema &table_schema,
+                                             const ObTableSchema *&container_schema)
+{
+  int ret = OB_SUCCESS;
+  container_schema = NULL;
+  if (OB_ISNULL(container_table_schema_)
+      && OB_FAIL(table_guard_.get_table_schema(table_schema.get_tenant_id(),
+                                              table_schema.get_data_table_id(),
+                                              container_table_schema_))) {
+    SERVER_LOG(WARN, "failed to get materialized view container schema", KR(ret), K(table_schema));
+  }
+  if (OB_SUCC(ret)) {
+    container_schema = container_table_schema_;
+  }
+  return ret;
+}
+
 void ObTableIndex::reset()
 {
+  inner_close();
   ObVirtualTableScannerIterator::reset();
   key_ranges_.reset();
   tenant_id_ = OB_INVALID_ID;
   show_table_id_ = OB_INVALID_ID;
-  database_schemas_.reset();
-  database_schema_idx_ = OB_INVALID_ID;
-  table_ids_.reset();
-  table_schema_idx_ = OB_INVALID_ID;
-  rowkey_info_idx_ = OB_INVALID_ID;
-  index_tid_array_idx_ = OB_INVALID_ID;
-  index_column_idx_ = OB_INVALID_ID;
-  is_normal_end_ = false;
-  is_rowkey_end_ = false;
   simple_index_infos_.reset();
-  ft_dep_col_idx_ = OB_INVALID_ID;
-  async_dep_col_idx_ = OB_INVALID_ID;
   min_data_version_ = OB_INVALID_VERSION;
-  vec_dep_col_idx_ = OB_INVALID_ID;
+  is_iter_end_ = false;
 }
 
 int ObTableIndex::init(uint64_t tenant_id) {
@@ -96,7 +181,10 @@ int ObTableIndex::init(uint64_t tenant_id) {
 int ObTableIndex::inner_get_next_row(common::ObNewRow *&row)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(allocator_) || OB_ISNULL(schema_guard_) || OB_ISNULL(cur_row_.cells_)) {
+  row = NULL;
+  if (is_iter_end_) {
+    ret = OB_ITER_END;
+  } else if (OB_ISNULL(allocator_) || OB_ISNULL(schema_guard_) || OB_ISNULL(cur_row_.cells_)) {
     ret = OB_NOT_INIT;
     SERVER_LOG(
         WARN, "data member is not init", K(ret), K(allocator_), K(schema_guard_), K(cur_row_.cells_));
@@ -155,7 +243,7 @@ int ObTableIndex::inner_get_next_row(common::ObNewRow *&row)
     } else {
       const ObTableSchema *table_schema = NULL;
       const ObDatabaseSchema *database_schema = NULL;
-      if (OB_FAIL(schema_guard_->get_table_schema(tenant_id_, show_table_id_, table_schema))) {
+      if (OB_FAIL(get_current_table_schema_(show_table_id_, table_schema))) {
         SERVER_LOG(WARN, "fail to get table schema", K(ret), K(tenant_id_));
       } else if (OB_UNLIKELY(NULL == table_schema)) {
               ret = OB_TABLE_NOT_EXIST;
@@ -183,6 +271,12 @@ int ObTableIndex::inner_get_next_row(common::ObNewRow *&row)
     if (OB_SUCC(ret)) {
       row = &cur_row_;
     }
+  }
+  if (OB_FAIL(ret)) {
+    // No row is returned on EOF/error. The preceding row has already been
+    // consumed, so its schema-backed strings no longer need protection.
+    reset_table_state_();
+    is_iter_end_ = true;
   }
   return ret;
 }
@@ -219,7 +313,7 @@ int ObTableIndex::add_database_indexes(const ObDatabaseSchema &database_schema,
       } else {
         is_end = false;
         const ObTableSchema *table_schema = NULL;
-        if (OB_FAIL(schema_guard_->get_table_schema(tenant_id_, table_ids_.at(table_schema_idx_), table_schema))) {
+        if (OB_FAIL(get_current_table_schema_(table_ids_.at(table_schema_idx_), table_schema))) {
           SERVER_LOG(WARN, "fail to get table schema", K(ret), "table_id", table_ids_.at(table_schema_idx_));
         } else if (OB_UNLIKELY(NULL == table_schema)) {
           ret = OB_TABLE_NOT_EXIST;
@@ -237,9 +331,10 @@ int ObTableIndex::add_database_indexes(const ObDatabaseSchema &database_schema,
                      "table_schema", *table_schema, K(ret));
         } else {/*do nothing*/}
         if (OB_LIKELY(OB_SUCC(ret) && is_sub_end)) {
+            // is_sub_end is reported only after all rows of this table were
+            // consumed. Keep the scan guard and database pointers untouched.
+            reset_table_state_();
             ++table_schema_idx_;
-            is_rowkey_end_ = false;
-            is_normal_end_ = false;
         }
       }
     } while(OB_SUCC(ret) && is_sub_end);
@@ -371,8 +466,7 @@ int ObTableIndex::add_rowkey_indexes(const ObTableSchema &table_schema,
     if (table_schema.is_materialized_view()) {
       // a mview's indexes are built upon its container table
       const ObTableSchema *container_table_schema = nullptr;
-      if (OB_FAIL(schema_guard_->get_table_schema(table_schema.get_tenant_id(),
-          table_schema.get_data_table_id(), container_table_schema))) {
+      if (OB_FAIL(get_container_table_schema_(table_schema, container_table_schema))) {
         SERVER_LOG(WARN, "failed to get table schema", KR(ret), K(table_schema));
       } else if (OB_ISNULL(container_table_schema)) {
         ret = OB_ERR_UNEXPECTED;
@@ -553,8 +647,7 @@ int ObTableIndex::add_normal_indexes(const ObTableSchema &table_schema,
     } else if (table_schema.is_materialized_view()) {
       // a mview's indexes are built upon its container table
       const ObTableSchema *container_table_schema = nullptr;
-      if (OB_FAIL(schema_guard_->get_table_schema(table_schema.get_tenant_id(),
-          table_schema.get_data_table_id(), container_table_schema))) {
+      if (OB_FAIL(get_container_table_schema_(table_schema, container_table_schema))) {
         SERVER_LOG(WARN, "failed to get table schema", KR(ret), K(table_schema));
       } else if (OB_ISNULL(container_table_schema)) {
         ret = OB_ERR_UNEXPECTED;
@@ -584,7 +677,7 @@ int ObTableIndex::add_normal_indexes(const ObTableSchema &table_schema,
       } else {
         is_end = false;
         const ObTableSchema *index_schema = NULL;
-        if (OB_FAIL(schema_guard_->get_table_schema(
+        if (OB_FAIL(get_current_index_schema_(
                   table_schema.get_tenant_id(),
                   simple_index_infos_.at(index_tid_array_idx_).table_id_,
                   index_schema))) {
@@ -842,8 +935,7 @@ int ObTableIndex::add_normal_index_column(const ObString &database_name,
     if (table_schema.is_materialized_view()) {
       // a mview's indexes are built upon its container table
       const ObTableSchema *container_table_schema = nullptr;
-      if (OB_FAIL(schema_guard_->get_table_schema(table_schema.get_tenant_id(),
-          table_schema.get_data_table_id(), container_table_schema))) {
+      if (OB_FAIL(get_container_table_schema_(table_schema, container_table_schema))) {
         SERVER_LOG(WARN, "failed to get table schema", KR(ret), K(table_schema));
       } else if (OB_ISNULL(container_table_schema)) {
         ret = OB_ERR_UNEXPECTED;
@@ -1595,8 +1687,7 @@ int ObTableIndex::add_vec_index_column(const ObString &database_name,
           }
           // comment
           case OB_APP_MIN_COLUMN_ID + 14: {
-            if (OB_NOT_NULL(schema_guard_)
-                && ObVectorIndexUtil::check_index_is_all_ready(*schema_guard_, table_schema, *index_schema)) {
+            if (ObVectorIndexUtil::check_index_is_all_ready(table_guard_, table_schema, *index_schema)) {
               cells[cell_idx].set_varchar(ObString(ob_index_status_str(INDEX_STATUS_AVAILABLE)));
             } else {
               cells[cell_idx].set_varchar(ObString(ob_index_status_str(INDEX_STATUS_UNAVAILABLE)));
