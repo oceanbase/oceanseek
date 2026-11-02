@@ -16,6 +16,7 @@ namespace oceanbase
 namespace storage
 {
 class ObLS;
+class ObPrivateBlockGCHandler;
 namespace checkpoint
 {
 class ObTabletGCService;
@@ -152,6 +153,7 @@ public:
   int reload_config();
   virtual ~ObPrivateBlockGCThread() {}
   void handle(void *task);
+  void handle_drop(void *task) override;
   static constexpr int64_t DEFAULT_THREAD_NUM = 4;
   static constexpr int64_t MINI_MODE_DEFAULT_THREAD_NUM = 1;
   static constexpr int64_t MAX_BLOCK_GC_TASK_NUM = 1000 * 1000;
@@ -165,16 +167,20 @@ public:
   ObPrivateBlockGCThreadGuard(
       ObPrivateBlockGCThread &gc_thread,
       ProcessType process_type,
-      common::ObArenaAllocator &allocator)
+      common::ObArenaAllocator &allocator,
+      ObPrivateGCBatcher *batcher)
     : ObBlockGCThreadGuard(gc_thread, *this),
       process_type_(process_type),
       allocator_(allocator),
+      batcher_(batcher),
       gc_macro_block_cnt_(0),
       lock_(common::ObLatchIds::OB_PRIVATE_BLOCK_GC_THREAD_GUARD_LOCK)
   {}
   ~ObPrivateBlockGCThreadGuard() {}
+  // Only batched tablet-meta GC retains caller-owned handlers after task completion.
+  int add_gc_task_ptr(ObPrivateBlockGCHandler *handler);
   bool is_valid() 
-  { return true; }
+  { return (ProcessType::GCTabletMetaVersion != process_type_) || (nullptr != batcher_); }
   common::ObArenaAllocator &get_allocator()
   { return allocator_; }
   void update_gc_macro_block_cnt(const int64_t gc_cnt)
@@ -195,6 +201,7 @@ public:
   // true: tablet_meta_gc; false: tablet gc
   ProcessType process_type_;
   common::ObArenaAllocator &allocator_;
+  ObPrivateGCBatcher *batcher_;
   int64_t gc_macro_block_cnt_;
   ObArray<ObPendingFreeTabletItem> succ_gc_items_;
   SpinRWLock lock_;
@@ -267,10 +274,21 @@ private:
     return macro_block_check_tablet_info_queue_.drain();
   }
 
-  int gc_tablet_meta_versions_(
+  void requeue_tablet_infos_(const ObIArray<ObTabletGCInfo> &tablet_infos);
+  int create_private_block_gc_handler_(
       const ObTabletID &tablet_id,
-      ObPrivateBlockGCThreadGuard &gc_thread_guard);
-
+      common::ObArenaAllocator &allocator,
+      ObPrivateBlockGCHandler *&handler,
+      bool &is_tablet_exist);
+  int process_pending_handlers_(
+      ObPrivateBlockGCThreadGuard &gc_thread_guard,
+      ObPrivateGCBatcher &batcher,
+      ObIArray<ObPrivateBlockGCHandler *> &pending_handlers,
+      common::ObArenaAllocator &allocator,
+      const bool can_delete_tablet_meta_versions);
+  void gc_tablets_meta_versions_in_batch_(
+      const ObIArray<ObTabletID> &tablet_ids,
+      int64_t &gc_macro_block_cnt);
   int macro_block_check_(
       const ObTabletID &tablet_id,
       const uint64_t min_macro_block_id,
@@ -380,7 +398,9 @@ public:
       ls_max_block_id_(ls_max_block_id),
       extra_info_(&extra_info),
       tablet_fingerprint_(0),
-      is_transfer_out_deleted_(false)
+      is_transfer_out_deleted_(false),
+      tablet_meta_versions_(),
+      gc_end_version_(0)
   {}
 
   // for gc tablet meta version
@@ -405,7 +425,9 @@ public:
       ls_max_block_id_(UINT64_MAX),
       extra_info_(NULL),
       tablet_fingerprint_(tablet_fingerprint),
-      is_transfer_out_deleted_(is_transfer_out_deleted)
+      is_transfer_out_deleted_(is_transfer_out_deleted),
+      tablet_meta_versions_(),
+      gc_end_version_(0)
   {}
 
   // for macro check
@@ -431,11 +453,16 @@ public:
       ls_max_block_id_(ls_max_block_id),
       extra_info_(NULL),
       tablet_fingerprint_(tablet_fingerprint),
-      is_transfer_out_deleted_(false)
+      is_transfer_out_deleted_(false),
+      tablet_meta_versions_(),
+      gc_end_version_(0)
   {}
 
   int gc_tablet();
-  int gc_tablet_meta_versions();
+  int gc_blocks_for_tablet_meta_versions(ObPrivateGCBatcher &batcher);
+  int delete_tablet_meta_versions();
+  bool need_gc_tablet_meta_versions() const { return tablet_meta_versions_.count() > 1; }
+  const ObTabletID &get_tablet_id() const { return tablet_id_; }
   int macro_block_check();
 
   /// @brief: for macro check && old tablet version gc
@@ -495,6 +522,8 @@ private:
   const ObPendingFreeTabletItem *extra_info_;
   const uintptr_t tablet_fingerprint_; // for update tablet last gc version
   const bool is_transfer_out_deleted_;
+  ObSEArray<int64_t, 4> tablet_meta_versions_;
+  int64_t gc_end_version_;
 };
 
 } /* namespace storage */

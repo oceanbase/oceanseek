@@ -27,6 +27,18 @@ const int64_t ObPrivateBlockGCTask::GLOBAL_PRIVATE_BLOCK_GC_INTERVAL = 1 * 24 * 
 // The time interval for tablet gc is 0 (safe time discard temporarily)
 const int64_t ObLSPrivateBlockGCHandler::DEFAULT_PRIVATE_TABLET_GC_SAFE_TIME = 0;
 
+int ObPrivateBlockGCThreadGuard::add_gc_task_ptr(ObPrivateBlockGCHandler *handler)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(ProcessType::GCTabletMetaVersion != process_type_) || OB_ISNULL(batcher_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("direct handler submission requires batched tablet meta gc", KR(ret), KPC(this));
+  } else if (OB_FAIL(ObBlockGCThreadGuard<ObPrivateBlockGCThreadGuard>::add_gc_task(handler))) {
+    LOG_WARN("failed to submit private gc handler pointer", KR(ret), KP(handler));
+  }
+  return ret;
+}
+
 int ObPrivateBlockGCThread::start()
 {
   int ret = OB_SUCCESS;
@@ -167,7 +179,8 @@ int ObPrivateBlockGCTask::ls_gc(
     LOG_WARN("failed to get wait gc tablet items", K(ret), K(ls_id), K(ls_epoch));
   } else if (gc_items.count() > 0) {
     ObArenaAllocator allocator(common::ObMemAttr(MTL_ID(), "PriBlkGCThrd"));
-    ObPrivateBlockGCThreadGuard gc_thread_guard(*gc_thread, ProcessType::GCTablet, allocator);
+    ObPrivateBlockGCThreadGuard gc_thread_guard(
+        *gc_thread, ProcessType::GCTablet, allocator, nullptr /* batcher */);
     for (int64_t i = 0; !is_stopped() && i < gc_items.count(); i++) {
       int tmp_ret = OB_SUCCESS;
       const ObPendingFreeTabletItem &gc_item = gc_items.at(i);
@@ -441,11 +454,15 @@ int ObLSPrivateBlockGCHandler::get_ls_min_macro_block_id_(
   return ret;
 }
 
-int ObLSPrivateBlockGCHandler::gc_tablet_meta_versions_(
+int ObLSPrivateBlockGCHandler::create_private_block_gc_handler_(
     const ObTabletID &tablet_id,
-    ObPrivateBlockGCThreadGuard &gc_thread_guard)
+    common::ObArenaAllocator &allocator,
+    ObPrivateBlockGCHandler *&handler,
+    bool &is_tablet_exist)
 {
   int ret = OB_SUCCESS;
+  handler = nullptr;
+  is_tablet_exist = true;
   const share::ObLSID ls_id = ls_.get_ls_id();
   const int64_t ls_epoch = ls_.get_ls_epoch();
   int64_t current_tablet_version = -1;
@@ -456,10 +473,7 @@ int ObLSPrivateBlockGCHandler::gc_tablet_meta_versions_(
   bool allow_tablet_version_gc = false;
   bool is_transfer_out_deleted = false;
   ObTenantMetaMemMgr *t3m = MTL(ObTenantMetaMemMgr*);
-  if (!gc_thread_guard.is_valid()) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("gc_thread_guard is invalid", K(ret), K(gc_thread_guard));
-  } else if (OB_ISNULL(t3m)) {
+  if (OB_ISNULL(t3m)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ObTenantMetaMemMgr is NULL", K(ret));
   } else if (OB_FAIL(t3m->get_current_version_for_tablet(ls_id, tablet_id, current_tablet_version, tablet_last_gc_version,
@@ -468,6 +482,7 @@ int ObLSPrivateBlockGCHandler::gc_tablet_meta_versions_(
                                                          reorganization_scn))) {
     if (OB_ENTRY_NOT_EXIST == ret) {
       ret = OB_SUCCESS;
+      is_tablet_exist = false;
       LOG_INFO("tablet is not exist", KR(ret), K(ls_id), K(tablet_id));
     } else {
       LOG_WARN("failed to get_current_version_for_tablet", KR(ret), K(ls_id), K(tablet_id));
@@ -479,15 +494,162 @@ int ObLSPrivateBlockGCHandler::gc_tablet_meta_versions_(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("current_tablet_version is invalid", KR(ret), K(ls_id), K(tablet_id));
   } else {
-    ObPrivateBlockGCHandler handler(ls_id, ls_epoch, tablet_id, current_tablet_version,
-        tablet_last_gc_version, reorganization_scn, tablet_fingerprint,
-        is_set_stop_, is_transfer_out_deleted);
-    if (OB_FAIL(gc_thread_guard.add_gc_task(handler))) {
-      LOG_WARN("failed to add_gc_task", K(handler), K(gc_thread_guard));
+    void *buf = allocator.alloc(sizeof(ObPrivateBlockGCHandler));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate private gc handler", KR(ret), K(ls_id), K(tablet_id));
+    } else {
+      handler = new (buf) ObPrivateBlockGCHandler(ls_id, ls_epoch, tablet_id,
+          current_tablet_version, tablet_last_gc_version, reorganization_scn, tablet_fingerprint,
+          is_set_stop_, is_transfer_out_deleted);
+    }
+  }
+  return ret;
+}
+
+int ObLSPrivateBlockGCHandler::process_pending_handlers_(
+    ObPrivateBlockGCThreadGuard &gc_thread_guard,
+    ObPrivateGCBatcher &batcher,
+    ObIArray<ObPrivateBlockGCHandler *> &pending_handlers,
+    common::ObArenaAllocator &allocator,
+    const bool can_delete_tablet_meta_versions)
+{
+  int ret = OB_SUCCESS;
+  int tmp_ret = OB_SUCCESS;
+  gc_thread_guard.wait_gc_task_finished();
+  ret = batcher.get_error();
+  bool blocks_deleted = false;
+  if (!can_delete_tablet_meta_versions || OB_FAIL(ret)) {
+    // do nothing
+  } else if (OB_FAIL(batcher.batch_delete_remaining_macro_blocks())) {
+    LOG_WARN("failed to batch delete private gc tail macro blocks", K(ret), K(ls_.get_ls_id()));
+  } else {
+    blocks_deleted = true;
+  }
+
+  // delete tablet meta versions and free memory for pending_handlers
+  for (int64_t i = 0; i < pending_handlers.count(); ++i) {
+    ObPrivateBlockGCHandler *handler = pending_handlers.at(i);
+    tmp_ret = OB_SUCCESS;
+    if (OB_ISNULL(handler)) {
+      tmp_ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("pending private gc handler is NULL", KR(tmp_ret), K(i));
+    } else {
+      if (!blocks_deleted) {
+        // do nothing
+      } else if (check_stop()) {
+        tmp_ret = OB_SERVICE_STOPPED;
+        LOG_INFO("private block gc handler is in stop status", KPC(this));
+      } else if (OB_TMP_FAIL(handler->delete_tablet_meta_versions())) {
+        LOG_WARN("failed to delete tablet meta versions", KR(tmp_ret), KPC(handler));
+      }
+      if (!blocks_deleted || (OB_SUCCESS != tmp_ret)) {
+        const int handler_ret = tmp_ret;
+        const ObTabletGCInfo tablet_info(handler->get_tablet_id());
+        if (OB_TMP_FAIL(report_tablet_id_for_gc_service(tablet_info))) {
+          LOG_WARN("failed to requeue pending private gc handler", KR(tmp_ret), K(tablet_info));
+        }
+        tmp_ret = ((OB_SUCCESS == handler_ret) ? tmp_ret : handler_ret);
+      }
+      OB_DELETEx(ObPrivateBlockGCHandler, &allocator, handler);
+    }
+    ret = (OB_SUCC(ret) ? tmp_ret : ret);
+  }
+  pending_handlers.reuse();
+  batcher.reuse_block_ids();
+  allocator.reuse();
+  return ret;
+}
+
+void ObLSPrivateBlockGCHandler::gc_tablets_meta_versions_in_batch_(
+    const ObIArray<ObTabletID> &tablet_ids,
+    int64_t &gc_macro_block_cnt)
+{
+  int ret = OB_SUCCESS;
+  int tmp_ret = OB_SUCCESS;
+  const int64_t MAX_PENDING_HANDLERS = 100;
+  const common::ObMemAttr mem_attr(MTL_ID(), "PriBlkGCBatch");
+  ObArenaAllocator allocator(mem_attr);
+  ObArray<ObPrivateBlockGCHandler *> pending_handlers;
+  pending_handlers.set_attr(mem_attr);
+  int64_t tablet_idx = 0;
+  int64_t deleted_batch_count = 0;
+  gc_macro_block_cnt = 0;
+  checkpoint::ObTabletGCService *gc_service = MTL(checkpoint::ObTabletGCService*);
+  ObPrivateBlockGCThread *gc_thread = nullptr;
+
+  if (OB_ISNULL(gc_service)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("ObTabletGCService is NULL", KR(ret), K(ls_));
+  } else if (OB_ISNULL(gc_thread = gc_service->get_private_block_gc_thread())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("private block gc thread is NULL", KR(ret), K(ls_));
+  } else {
+    // A failed group is retried independently; later groups use a fresh batcher.
+    while (!check_stop() && (tablet_idx < tablet_ids.count())) {
+      ret = OB_SUCCESS;
+      ObPrivateGCBatcher batcher(is_set_stop_);
+      ObPrivateBlockGCThreadGuard gc_thread_guard(
+          *gc_thread, ProcessType::GCTabletMetaVersion, allocator, &batcher);
+      const int64_t group_end_idx = MIN(tablet_idx + MAX_PENDING_HANDLERS, tablet_ids.count());
+      while (OB_SUCC(ret) && (tablet_idx < group_end_idx)) {
+        const ObTabletID &tablet_id = tablet_ids.at(tablet_idx);
+        if (OB_FAIL(batcher.get_error())) {
+          LOG_WARN("private gc worker failed", KR(ret), K(tablet_id));
+        } else if (check_stop()) {
+          ret = OB_SERVICE_STOPPED;
+          LOG_INFO("private block gc handler is in stop status", KPC(this));
+        } else {
+          ObPrivateBlockGCHandler *handler = nullptr;
+          bool is_tablet_exist = true;
+          tmp_ret = OB_SUCCESS;
+          if (OB_TMP_FAIL(create_private_block_gc_handler_(
+              tablet_id, allocator, handler, is_tablet_exist))) {
+            if (OB_EAGAIN != tmp_ret) {
+              LOG_WARN("failed to create private gc handler", KR(tmp_ret), K(tablet_id));
+            }
+          } else if (!is_tablet_exist) {
+            // do nothing
+          } else if (OB_ISNULL(handler)) {
+            tmp_ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("private gc handler is NULL for existing tablet", KR(tmp_ret), K(tablet_id));
+          } else if (OB_TMP_FAIL(pending_handlers.push_back(handler))) {
+            LOG_WARN("failed to save pending private gc handler", KR(tmp_ret), KPC(handler));
+          } else {
+            // The pending list owns the handler even when add_gc_task_ptr fails.
+            // Such a failure prevents finalization of this group.
+            if (OB_FAIL(gc_thread_guard.add_gc_task_ptr(handler))) {
+              LOG_WARN("failed to submit private gc handler", KR(ret), K(tablet_id));
+            }
+            handler = nullptr;
+          }
+          OB_DELETEx(ObPrivateBlockGCHandler, &allocator, handler);
+          if (OB_SUCCESS != tmp_ret) {
+            // This tablet has not joined the group; its error must not poison the batcher.
+            const ObTabletGCInfo tablet_info(tablet_id);
+            if (OB_TMP_FAIL(report_tablet_id_for_gc_service(tablet_info))) {
+              LOG_WARN("failed to requeue private gc tablet", KR(tmp_ret), K(tablet_info));
+            }
+          }
+          ++tablet_idx;
+        }
+      }
+
+      if (OB_SUCCESS != ret) {
+        batcher.set_error(ret);
+      }
+      // Wait for all workers before freeing handlers or replacing the group context.
+      if (OB_TMP_FAIL(process_pending_handlers_(gc_thread_guard, batcher, pending_handlers,
+            allocator, OB_SUCCESS == ret /* can_delete_tablet_meta_versions */))) {
+        LOG_WARN("failed to process pending private gc handlers", KR(tmp_ret));
+      }
+      gc_macro_block_cnt += batcher.get_gc_macro_block_cnt();
+      deleted_batch_count += batcher.get_batch_count();
     }
   }
 
-  return ret;
+  LOG_INFO("finish batched private tablet meta gc", KR(ret), K(ls_.get_ls_id()),
+      "tablet_count", tablet_ids.count(), K(gc_macro_block_cnt), K(deleted_batch_count));
 }
 
 int ObLSPrivateBlockGCHandler::macro_block_check_(
@@ -549,34 +711,14 @@ void ObLSPrivateBlockGCHandler::gc_tablets_meta_versions()
   int ret = OB_SUCCESS;
   common::ObTabletIDArray tablet_ids;
   int64_t gc_macro_block_cnt = 0;
-  checkpoint::ObTabletGCService *gc_service = MTL(checkpoint::ObTabletGCService*);
-  ObPrivateBlockGCThread *gc_thread = NULL;
-  if (OB_ISNULL(gc_service)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("ObTabletGCService is NULL", K(ret), K(ls_));
-  } else if (FALSE_IT(gc_thread = gc_service->get_private_block_gc_thread())) {
-  } else if (OB_FAIL(ls_.get_tablet_svr()->get_all_tablet_ids(true, tablet_ids))) { 
+  if (OB_FAIL(ls_.get_tablet_svr()->get_all_tablet_ids(true, tablet_ids))) {
     LOG_WARN("failed to get_all_tablet_ids", KR(ret), K(ls_));
   } else {
-    ObArenaAllocator allocator(common::ObMemAttr(MTL_ID(), "PriBlkGCThrd"));
-    ObPrivateBlockGCThreadGuard gc_thread_guard(*gc_thread, ProcessType::GCTabletMetaVersion, allocator);
-    for (int i = 0; !check_stop() && i < tablet_ids.count(); i++) {
-      if (OB_FAIL(gc_tablet_meta_versions_(tablet_ids.at(i), gc_thread_guard))) {
-        if (OB_EAGAIN != ret) {
-          LOG_WARN("failed to gc_tablet_meta_versions", KR(ret), K(ls_), K(tablet_ids.at(i)));
-        }
-        const ObTabletGCInfo tablet_info(tablet_ids.at(i));
-        if (OB_FAIL(report_tablet_id_for_gc_service(tablet_info))) {
-          LOG_WARN("failed to report tablet id for gc", K(ret), K(tablet_info));
-        }
-      }
-    }
-    gc_thread_guard.wait_gc_task_finished();
-    gc_macro_block_cnt = gc_thread_guard.get_gc_macro_block_cnt();
-
+    gc_tablets_meta_versions_in_batch_(tablet_ids, gc_macro_block_cnt);
     if (gc_macro_block_cnt > 0) {
-      SERVER_EVENT_ADD("ss_macro_block_gc", "private_dir_loop_check_tablet_meta_gc", "tenant_id", MTL_ID(), 
-          "ls_id", ls_.get_ls_id().id(), "gc_macro_block_cnt", gc_macro_block_cnt);
+      SERVER_EVENT_ADD("ss_macro_block_gc", "private_dir_loop_check_tablet_meta_gc",
+          "tenant_id", MTL_ID(), "ls_id", ls_.get_ls_id().id(),
+          "gc_macro_block_cnt", gc_macro_block_cnt);
     }
   }
   LOG_INFO("finish loop check gc_tablets_meta_versions", K(ret), KPC(this), K(gc_macro_block_cnt));
@@ -609,7 +751,8 @@ void ObLSPrivateBlockGCHandler::ls_macro_block_check()
   } else {
     ObPrivateBlockGCThread *gc_thread = gc_service->get_private_block_gc_thread();
     ObArenaAllocator allocator(common::ObMemAttr(MTL_ID(), "PriBlkGCThrd"));
-    ObPrivateBlockGCThreadGuard gc_thread_guard(*gc_thread, ProcessType::MacroCheck, allocator);
+    ObPrivateBlockGCThreadGuard gc_thread_guard(
+        *gc_thread, ProcessType::MacroCheck, allocator, nullptr /* batcher */);
     for (int i = 0; !check_stop() && i < tablet_ids.count(); i++) {
       if (OB_FAIL(macro_block_check_(tablet_ids.at(i), min_macro_block_id, max_macro_block_id, gc_thread_guard))) {
         LOG_WARN("failed to macro_block_check_", KR(ret), K(ls_), K(tablet_ids.at(i)));
@@ -658,7 +801,8 @@ void ObLSPrivateBlockGCHandler::process_tablet_infos_for_macro_block_check()
       LOG_INFO("process_tablet_infos_for_macro_block_check start", K(count), KPC(this));
       int64_t gc_macro_block_cnt = 0;
       ObArenaAllocator allocator(common::ObMemAttr(MTL_ID(), "PriBlkGCThrd"));
-      ObPrivateBlockGCThreadGuard gc_thread_guard(*gc_thread, ProcessType::MacroCheck, allocator);
+      ObPrivateBlockGCThreadGuard gc_thread_guard(
+          *gc_thread, ProcessType::MacroCheck, allocator, nullptr /* batcher */);
       for (int i = 0; !check_stop() && i < tablet_infos.count(); i++) {
         const ObTabletGCInfo &tablet_info = tablet_infos.at(i);
         if (ProcessType::MacroCheck != tablet_info.gc_type_) {
@@ -701,52 +845,70 @@ int ObLSPrivateBlockGCHandler::deduplicate_tablet_info(
   return ret;
 }
 
+void ObLSPrivateBlockGCHandler::requeue_tablet_infos_(
+    const ObIArray<ObTabletGCInfo> &tablet_infos)
+{
+  int ret = OB_SUCCESS;
+  int tmp_ret = OB_SUCCESS;
+  for (int64_t i = 0; i < tablet_infos.count(); ++i) {
+    if (OB_TMP_FAIL(report_tablet_id_for_gc_service(tablet_infos.at(i)))) {
+      LOG_WARN("failed to requeue tablet info after collection error", KR(tmp_ret),
+          "tablet_info", tablet_infos.at(i));
+    }
+  }
+}
+
 void ObLSPrivateBlockGCHandler::process_tablet_infos_for_tablet_meta_gc()
 {
   int ret = OB_SUCCESS;
   checkpoint::ObTabletGCService *gc_service = MTL(checkpoint::ObTabletGCService*);
   if (OB_ISNULL(gc_service)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("ObTabletGCService is NULL", K(ret), K(ls_));
+    LOG_WARN("ObTabletGCService is NULL", KR(ret), K(ls_));
+  } else if (OB_ISNULL(gc_service->get_private_block_gc_thread())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("private block gc thread is NULL", KR(ret), K(ls_));
   } else {
-    ObPrivateBlockGCThread *gc_thread = gc_service->get_private_block_gc_thread();
     const ObIArray<ObTabletGCInfo> &tablet_infos = drain_tablet_infos_for_gc_();
     const int64_t count = tablet_infos.count();
     TabletInfoSet tablet_info_set;
     if (count > 0) {
       int64_t gc_macro_block_cnt = 0;
-      ObArenaAllocator allocator(common::ObMemAttr(MTL_ID(), "PriBlkGCThrd"));
-      ObPrivateBlockGCThreadGuard gc_thread_guard(*gc_thread, ProcessType::GCTabletMetaVersion, allocator);
       if (OB_FAIL(tablet_info_set.create(tablet_infos.count(), "TblIfoSetBkt", "TblIfoSetNode",
-                 OB_SERVER_TENANT_ID))) {
-        LOG_WARN("failed to create tablet info set", K(ret), KPC(this));
-      } else if (OB_FAIL(deduplicate_tablet_info(tablet_infos,tablet_info_set))) {
-        LOG_WARN("failed to deduplicate_tablet_info", K(ret), KPC(this), K(tablet_infos), K(tablet_info_set));
+                  MTL_ID()))) {
+        LOG_WARN("failed to create tablet info set", KR(ret), KPC(this));
+        requeue_tablet_infos_(tablet_infos);
+      } else if (OB_FAIL(deduplicate_tablet_info(tablet_infos, tablet_info_set))) {
+        LOG_WARN("failed to deduplicate_tablet_info", KR(ret), KPC(this),
+            K(tablet_infos), K(tablet_info_set));
+        requeue_tablet_infos_(tablet_infos);
       } else {
-        LOG_INFO("process_tablet_infos_for_tablet_meta_gc start", K(tablet_infos.count()), K(tablet_info_set.size()), KPC(this), K(tablet_info_set), K(tablet_infos));
-        for (typename TabletInfoSet::const_iterator iter = tablet_info_set.begin(); 
-            !check_stop() && iter != tablet_info_set.end(); ++iter) {
-          const ObTabletGCInfo tablet_info = iter->first;
+        LOG_INFO("process_tablet_infos_for_tablet_meta_gc start", K(tablet_infos.count()),
+            K(tablet_info_set.size()), KPC(this), K(tablet_info_set), K(tablet_infos));
+        common::ObTabletIDArray tablet_ids;
+        for (TabletInfoSet::const_iterator iter = tablet_info_set.begin();
+             iter != tablet_info_set.end(); ++iter) {
+          const ObTabletGCInfo &tablet_info = iter->first;
           if (ProcessType::GCTabletMetaVersion != tablet_info.gc_type_) {
             ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("tablet_info.type and process_type is invalid", K(ret), K(tablet_info), K(ls_));
-          } else if (OB_FAIL(gc_tablet_meta_versions_(tablet_info.tablet_id_, gc_thread_guard))) {
-            if (OB_EAGAIN != ret) {
-              LOG_WARN("failed to gc_tablet_meta_versions", KR(ret), K(ls_), K(tablet_info));
-            }
-            if (OB_FAIL(report_tablet_id_for_gc_service(tablet_info))) {
-              LOG_WARN("failed to report_tablet_id_for_gc_service", K(ret), K(tablet_info));
+            LOG_WARN("unexpected tablet gc process type", KR(ret), K(tablet_info));
+          } else if (OB_FAIL(tablet_ids.push_back(tablet_info.tablet_id_))) {
+            LOG_WARN("failed to collect tablet ids for batch gc", KR(ret), K(tablet_info));
+            int tmp_ret = OB_SUCCESS;
+            if (OB_TMP_FAIL(report_tablet_id_for_gc_service(tablet_info))) {
+              LOG_WARN("failed to requeue uncollected private gc tablet",
+                  KR(tmp_ret), K(tablet_info));
             }
           }
         }
-        gc_thread_guard.wait_gc_task_finished();
-        gc_macro_block_cnt = gc_thread_guard.get_gc_macro_block_cnt();
-
+        gc_tablets_meta_versions_in_batch_(tablet_ids, gc_macro_block_cnt);
         if (gc_macro_block_cnt > 0) {
-          SERVER_EVENT_ADD("ss_macro_block_gc", "private_dir_tablet_meta_gc", 
-              "tenant_id", MTL_ID(), "ls_id", ls_.get_ls_id().id(), "gc_macro_block_cnt", gc_macro_block_cnt);
+          SERVER_EVENT_ADD("ss_macro_block_gc", "private_dir_tablet_meta_gc",
+              "tenant_id", MTL_ID(), "ls_id", ls_.get_ls_id().id(),
+              "gc_macro_block_cnt", gc_macro_block_cnt);
         }
-        LOG_INFO("finish process_tablet_infos_for_tablet_meta_gc", K(ret), KPC(this), K(gc_macro_block_cnt));
+        LOG_INFO("finish process_tablet_infos_for_tablet_meta_gc",
+            KR(ret), KPC(this), K(gc_macro_block_cnt));
       }
     }
     tablet_info_set.destroy();
@@ -780,7 +942,8 @@ void ObLSPrivateBlockGCHandler::gc_tablets()
     /// NOTE: this log is required for obtest@transfer_retry_err_gc.
     LOG_INFO("tablet gc start", K(ret), K(gc_items.count()), K(ls_), K(gc_items));
     ObArenaAllocator allocator(common::ObMemAttr(MTL_ID(), "PriBlkGCThrd"));
-    ObPrivateBlockGCThreadGuard gc_thread_guard(*gc_thread, ProcessType::GCTablet, allocator);
+    ObPrivateBlockGCThreadGuard gc_thread_guard(
+        *gc_thread, ProcessType::GCTablet, allocator, nullptr /* batcher */);
     for (int64_t i = 0; !check_stop() && i < gc_items.count(); i++) {
       const ObPendingFreeTabletItem &gc_item = gc_items.at(i);
       int64_t safe_ts = gc_item.free_time_ + gc_service->get_private_tablet_gc_safe_time();
@@ -1072,7 +1235,7 @@ int ObPrivateBlockGCHandler::gc_tablet()
   } else if (tablet_versions.count() == 0) {
     LOG_INFO("there is not tablet_versions, maybe have been gc", KR(ret), KPC(this));
   } else if (OB_FAIL(ObBlockGCHandler::gc_tablet(tablet_versions, gc_type_, ls_min_block_id_, ls_max_block_id_))) {
-    LOG_WARN("failed to gc_tablet_meta_versions", KR(ret), KPC(this), K(tablet_versions.count()),
+    LOG_WARN("failed to gc_tablet", KR(ret), KPC(this), K(tablet_versions.count()),
              K(tablet_versions), K_(gc_type), K_(ls_min_block_id), K_(ls_max_block_id));
   }
   /// NOTE: this log is required for obtest@transfer_retry_err_gc / ss_gc (ret=0 path must keep INFO).
@@ -1083,26 +1246,37 @@ int ObPrivateBlockGCHandler::gc_tablet()
   return ret;
 }
 
-int ObPrivateBlockGCHandler::gc_tablet_meta_versions()
+int ObPrivateBlockGCHandler::gc_blocks_for_tablet_meta_versions(ObPrivateGCBatcher &batcher)
 {
   int ret = OB_SUCCESS;
-  ObSEArray<int64_t, 4> tablet_versions;
-  int64_t gc_end_version = 0;
-  if (GCTabletType::InvalidType != gc_type_) {
+  tablet_meta_versions_.reuse();
+  gc_end_version_ = 0;
+  if (OB_UNLIKELY(GCTabletType::InvalidType != gc_type_)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("tablet meta gc, gc_type is valid", K(ret), KPC(this));
-  } else if (OB_FAIL(list_tablet_meta_version(tablet_versions, /*is_macro_check*/false, gc_end_version))) {
-    LOG_WARN("failed to list_tablet_meta_version", K(ret), KPC(this));
-  } else if (tablet_versions.count() == 0) {
-    LOG_INFO("there is not tablet_versions, maybe have been gc", KR(ret), KPC(this));
-  } else if (tablet_versions.count() == 1) {
-    // only one version not be gc
-  } else if (OB_FAIL(ObBlockGCHandler::gc_tablet_meta_versions(tablet_versions,
-                     max_tablet_meta_version_, is_transfer_out_deleted_))) {
-    LOG_WARN("failed to gc_tablet_meta_versions", KR(ret), KPC(this), K(tablet_versions.count()),
-             K(tablet_versions), K_(max_tablet_meta_version), K_(is_transfer_out_deleted));
-  } else if (OB_FAIL(update_tablet_last_gc_version_(gc_end_version))) {
-    LOG_WARN("failed to update tablet last gc version", K(ret), K(gc_end_version));
+    LOG_WARN("invalid gc type for batched tablet meta gc", KR(ret), KPC(this));
+  } else if (check_stop()) {
+    ret = OB_SERVICE_STOPPED;
+    LOG_INFO("private block gc handler is in stop status", KPC(this));
+  } else if (OB_FAIL(list_tablet_meta_version(
+      tablet_meta_versions_, false /* is_macro_check */, gc_end_version_))) {
+    LOG_WARN("failed to list tablet versions for batch gc", KR(ret), KPC(this));
+  } else if (!need_gc_tablet_meta_versions()) {
+    // do nothing
+  } else if (OB_FAIL(ObBlockGCHandler::gc_blocks_for_tablet_meta_versions(
+      tablet_meta_versions_, max_tablet_meta_version_, is_transfer_out_deleted_, batcher))) {
+    LOG_WARN("failed to process tablet versions for batch gc", KR(ret), KPC(this));
+  }
+  return ret;
+}
+
+int ObPrivateBlockGCHandler::delete_tablet_meta_versions()
+{
+  int ret = OB_SUCCESS;
+  if (!need_gc_tablet_meta_versions()) {
+  } else if (OB_FAIL(delete_tablet_meta_versions_(tablet_meta_versions_, gc_end_version_))) {
+    LOG_WARN("failed to delete tablet meta versions after batch gc", KR(ret), KPC(this));
+  } else if (OB_FAIL(update_tablet_last_gc_version_(gc_end_version_))) {
+    LOG_WARN("failed to update tablet gc watermark after batch gc", KR(ret), KPC(this));
   }
   return ret;
 }
@@ -1236,8 +1410,11 @@ int ObPrivateBlockGCHandler::safe_delete_blocks_for_macro_check_(
 void ObPrivateBlockGCThread::handle(void *task)
 {
   int ret = OB_SUCCESS;
-  ObPrivateBlockGCHandler *handler = NULL;
-  const ObPendingFreeTabletItem *extra_info = NULL;
+  ObPrivateBlockGCHandler *handler = nullptr;
+  const ObPendingFreeTabletItem *extra_info = nullptr;
+  ObPrivateBlockGCThreadGuard *ctx = get_gc_task_ctx();
+  const bool is_tablet_meta_version_gc = ((nullptr != ctx)
+      && (ProcessType::GCTabletMetaVersion == ctx->process_type_));
 
   if (OB_ISNULL(task)) {
     ret = OB_INVALID_ARGUMENT;
@@ -1247,12 +1424,18 @@ void ObPrivateBlockGCThread::handle(void *task)
     LOG_WARN("ctx is invalid", KR(ret), KPC(this));
   } else if (FALSE_IT(handler = static_cast<ObPrivateBlockGCHandler*>(task))) {
   } else if (handler->check_stop()) {
-    LOG_INFO("private block gc handler is in stop status, skip gc", KPC(handler));
+    ret = OB_SERVICE_STOPPED;
+    LOG_INFO("private block gc handler is in stop status, skip gc", KR(ret), KPC(handler));
   } else {
-    switch (get_gc_task_ctx()->process_type_) {
+    switch (ctx->process_type_) {
     case ProcessType::GCTabletMetaVersion:
-      if(OB_FAIL(handler->gc_tablet_meta_versions())) {
-        LOG_WARN("failed to gc_tablet_meta_versions", KR(ret), KPC(this), KPC(handler));
+      if (OB_ISNULL(ctx->batcher_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("private gc batcher is NULL", KR(ret), KPC(handler));
+      } else if (OB_FAIL(ctx->batcher_->get_error())) {
+        LOG_WARN("skip private gc task after batch failure", KR(ret), KPC(handler));
+      } else if (OB_FAIL(handler->gc_blocks_for_tablet_meta_versions(*ctx->batcher_))) {
+        LOG_WARN("failed to process private gc versions", KR(ret), KPC(handler));
       }
       break;
     case ProcessType::GCTablet:
@@ -1261,12 +1444,12 @@ void ObPrivateBlockGCThread::handle(void *task)
       } else if (OB_ISNULL(extra_info = handler->get_extra_info())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("extra_info is NULL", KR(ret), KPC(this), KPC(handler));
-      } else if (OB_FAIL(get_gc_task_ctx()->update_succ_gc_items(*extra_info))) {
+      } else if (OB_FAIL(ctx->update_succ_gc_items(*extra_info))) {
         LOG_WARN("failed to update_succ_gc_items", KR(ret), KPC(this), KPC(handler));
       }
       break;
     case ProcessType::MacroCheck:
-      if(OB_FAIL(handler->macro_block_check())) {
+      if (OB_FAIL(handler->macro_block_check())) {
         LOG_WARN("failed to macro_block_check", KR(ret), KPC(this), KPC(handler));
       }
       break;
@@ -1275,11 +1458,34 @@ void ObPrivateBlockGCThread::handle(void *task)
       LOG_WARN("process type is invalid", KR(ret), KPC(this), KPC(handler));
     }
   }
-  if (OB_FAIL(ret)) {
-  } else if (handler->gc_macro_block_cnt_ > 0) {
-    get_gc_task_ctx()->update_gc_macro_block_cnt(handler->gc_macro_block_cnt_);
+  if (is_tablet_meta_version_gc) {
+    // GCTabletMetaVersion counts successful deletions in the shared batcher.
+    // The dispatcher reads its total after waiting for tasks and handling the tail,
+    // so handler counts are not accumulated into the thread context here.
+    // see ObLSPrivateBlockGCHandler::gc_tablets_meta_versions_in_batch_
+    if (OB_NOT_NULL(ctx->batcher_)) {
+      ctx->batcher_->set_error(ret);
+    }
+  } else if (OB_SUCC(ret) && (nullptr != ctx) && (nullptr != handler)
+      && (handler->gc_macro_block_cnt_ > 0)) {
+    ctx->update_gc_macro_block_cnt(handler->gc_macro_block_cnt_);
   }
-  handle_end(task);
+  // Only copied tasks are freed here; batched handlers remain owned by the dispatcher.
+  handle_end(task, !is_tablet_meta_version_gc /*need_free*/);
+}
+
+void ObPrivateBlockGCThread::handle_drop(void *task)
+{
+  ObPrivateBlockGCThreadGuard *ctx = get_gc_task_ctx();
+  if ((nullptr != ctx) && (ProcessType::GCTabletMetaVersion == ctx->process_type_)) {
+    if (nullptr != ctx->batcher_) {
+      ctx->batcher_->set_error(OB_SERVICE_STOPPED);
+    }
+    handle_end(task, false /* need_free */);
+    LOG_TRACE("gc thread pool is stop", KP(task), KPC(this));
+  } else {
+    ObBlockGCThread<ObPrivateBlockGCThreadGuard>::handle_drop(task);
+  }
 }
 
 } /* namespace storage */

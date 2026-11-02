@@ -8,7 +8,9 @@
 
 #include "storage/blocksstable/ob_macro_block_id.h"
 #include "deps/oblib/src/common/ob_tablet_id.h"
+#include "lib/container/ob_se_array.h"
 #include "lib/hash/ob_hashset.h"
+#include "lib/lock/ob_mutex.h"
 #include "storage/ob_super_block_struct.h"
 
 namespace oceanbase
@@ -146,6 +148,55 @@ private:
 int delete_macro_blocks(
     ObIArray<blocksstable::MacroBlockId> &block_ids);
 
+class ObPrivateGCBatcher
+{
+public:
+  explicit ObPrivateGCBatcher(const bool &is_set_stop)
+    : is_set_stop_(is_set_stop),
+      lock_(common::ObLatchIds::OB_PRIVATE_BLOCK_GC_THREAD_GUARD_LOCK),
+      first_error_(OB_SUCCESS), gc_macro_block_cnt_(0), batch_count_(0)
+  {}
+  virtual ~ObPrivateGCBatcher() {}
+  int append(const ObIArray<blocksstable::MacroBlockId> &block_ids);
+  // The caller must wait for all producer tasks and verify get_error() == OB_SUCCESS
+  // before deleting the remaining tail.
+  // No append() or reuse_block_ids() may run concurrently with this call.
+  int batch_delete_remaining_macro_blocks();
+  void reuse_block_ids();
+  void set_error(const int error);
+  int get_error() const;
+  int64_t get_gc_macro_block_cnt() const
+  { lib::ObMutexGuard guard(lock_); return gc_macro_block_cnt_; }
+  int64_t get_batch_count() const
+  { lib::ObMutexGuard guard(lock_); return batch_count_; }
+
+  TO_STRING_KV(K_(first_error), "block_id_cnt", block_ids_.count(),
+      K_(gc_macro_block_cnt), K_(batch_count));
+
+protected:
+  virtual int delete_macro_blocks_(ObIArray<blocksstable::MacroBlockId> &block_ids);
+
+private:
+  int batch_delete_macro_blocks_(ObIArray<blocksstable::MacroBlockId> &block_ids);
+  int get_error_no_lock_() const { return first_error_; }
+  void set_error_no_lock_(const int error)
+  {
+    if (OB_SUCCESS == first_error_) {
+      first_error_ = error;
+    }
+  }
+
+private:
+  static const int64_t BATCH_SIZE = 1000;
+
+  const bool &is_set_stop_;
+  mutable lib::ObMutex lock_;
+  int first_error_;
+  ObSEArray<blocksstable::MacroBlockId, 32> block_ids_;
+  int64_t gc_macro_block_cnt_;
+  int64_t batch_count_;
+};
+
 class ObBlockGCHandler
 {
 public:
@@ -161,10 +212,12 @@ public:
   { return tablet_id_.is_valid(); }
 
   // gc tablet operation
-  int gc_tablet_meta_versions(
+  // Submit private blocks without deleting tablet metadata or flushing the tail.
+  int gc_blocks_for_tablet_meta_versions(
       const ObIArray<int64_t> &tablet_versions,
       const int64_t min_retain_tablet_meta_version,
-      const bool is_transfer_out_deleted);
+      const bool is_transfer_out_deleted,
+      ObPrivateGCBatcher &batcher);
   int gc_tablet(
       const ObIArray<int64_t> &tablet_versions,
       const GCTabletType gc_type,
@@ -207,20 +260,22 @@ public:
 protected:
   virtual int safe_delete_blocks_for_macro_check_(
       ObIArray<blocksstable::MacroBlockId> &block_ids);
+  int delete_tablet_meta_versions_(
+      const ObIArray<int64_t> &tablet_versions,
+      int64_t gc_tablet_meta_ts);
     
 private:
   int gc_blocks_for_tablet_meta_versions_(
       const ObIArray<int64_t> &tablet_versions,
       const int64_t min_retain_tablet_meta_version,
-      const bool is_shared);
-  int delete_tablet_meta_versions_(
-      const ObIArray<int64_t> &tablet_versions,
-      int64_t gc_tablet_meta_ts);
+      const bool is_shared,
+      ObPrivateGCBatcher *batcher);
   int gc_blocks_(
     const ObIArray<int64_t> &tablet_versions,
     const int64_t gc_tablet_meta_ts,
     const bool is_shared,
-    GCBaseOP &op);
+    GCBaseOP &op,
+    ObPrivateGCBatcher *batcher);
 
   virtual int delete_macro_cache_(const ObIArray<blocksstable::MacroBlockId> &block_ids);
 

@@ -17,6 +17,127 @@ namespace oceanbase
 namespace storage
 {
 
+int ObPrivateGCBatcher::append(const ObIArray<blocksstable::MacroBlockId> &block_ids)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<blocksstable::MacroBlockId, 32> local_batch;
+  if (OB_FAIL(get_error())) {
+    LOG_WARN("private gc batcher has error", KR(ret));
+  } else if (ATOMIC_LOAD(&is_set_stop_)) {
+    ret = OB_SERVICE_STOPPED;
+    LOG_WARN("private gc batcher is stopped", KR(ret));
+  } else if (!block_ids.empty() && OB_FAIL(local_batch.reserve(BATCH_SIZE))) {
+    LOG_WARN("failed to reserve private gc local batch", KR(ret));
+  }
+
+  int64_t i = 0;
+  while (OB_SUCC(ret) && (i < block_ids.count())) {
+    local_batch.reuse();
+    { // lock start
+      lib::ObMutexGuard guard(lock_);
+      if (OB_FAIL(get_error_no_lock_())) {
+        LOG_WARN("private gc batcher has error", KR(ret));
+      } else if (OB_UNLIKELY(block_ids_.count() >= BATCH_SIZE)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("private gc batch has not been cleared after failure", KR(ret),
+            K(block_ids_.count()));
+      }
+      while (OB_SUCC(ret) && (i < block_ids.count()) && (block_ids_.count() < BATCH_SIZE)) {
+        const blocksstable::MacroBlockId &block_id = block_ids.at(i);
+        if (ATOMIC_LOAD(&is_set_stop_)) {
+          ret = OB_SERVICE_STOPPED;
+          LOG_WARN("private gc batcher is stopped", KR(ret));
+        } else if (OB_UNLIKELY(!block_id.is_private_data_or_meta())) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("block id is not private", KR(ret), K(block_id));
+        } else if (OB_FAIL(block_ids_.push_back(block_id))) {
+          LOG_WARN("failed to append private gc block", KR(ret), K(block_id));
+        } else {
+          ++i;
+        }
+      }
+      // Copy the full batch while holding lock_ so deletion can run after releasing lock_.
+      // Other workers can then refill block_ids_ without modifying this batch during I/O.
+      if (OB_SUCC(ret) && BATCH_SIZE == block_ids_.count()) {
+        if (OB_FAIL(local_batch.assign(block_ids_))) {
+          LOG_WARN("failed to copy private gc batch", KR(ret), K(block_ids_.count()));
+        } else {
+          block_ids_.reuse();
+        }
+      }
+    } // lock end
+    if (OB_SUCC(ret) && !local_batch.empty()) {
+      if (OB_FAIL(batch_delete_macro_blocks_(local_batch))) {
+        LOG_WARN("failed to batch delete private macro blocks", KR(ret), K(local_batch.count()));
+      }
+    }
+  }
+  set_error(ret);
+  return ret;
+}
+
+int ObPrivateGCBatcher::batch_delete_remaining_macro_blocks()
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(batch_delete_macro_blocks_(block_ids_))) {
+    LOG_WARN("failed to delete private gc tail batch", KR(ret), K(block_ids_.count()));
+  } else {
+    reuse_block_ids();
+  }
+  return ret;
+}
+
+int ObPrivateGCBatcher::batch_delete_macro_blocks_(
+    ObIArray<blocksstable::MacroBlockId> &block_ids)
+{
+  int ret = OB_SUCCESS;
+  const int64_t block_count = block_ids.count();
+  if (OB_UNLIKELY(block_count > BATCH_SIZE)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("private gc batch is too large", KR(ret), K(block_count));
+  } else if (block_count > 0) {
+    // Delete the batch without holding the shared state lock.
+    if (OB_FAIL(delete_macro_blocks_(block_ids))) {
+      LOG_WARN("failed to delete private gc batch", KR(ret), K(block_count));
+    }
+  }
+
+  {
+    lib::ObMutexGuard guard(lock_);
+    if (OB_SUCC(ret) && block_count > 0) {
+      ++batch_count_;
+      gc_macro_block_cnt_ += block_count;
+      LOG_TRACE("private gc batch deleted", K(block_count), K_(batch_count),
+          K_(gc_macro_block_cnt));
+    }
+    set_error_no_lock_(ret);
+  }
+  return ret;
+}
+
+void ObPrivateGCBatcher::reuse_block_ids()
+{
+  lib::ObMutexGuard guard(lock_);
+  block_ids_.reuse();
+}
+
+void ObPrivateGCBatcher::set_error(const int error)
+{
+  lib::ObMutexGuard guard(lock_);
+  set_error_no_lock_(error);
+}
+
+int ObPrivateGCBatcher::get_error() const
+{
+  lib::ObMutexGuard guard(lock_);
+  return get_error_no_lock_();
+}
+
+int ObPrivateGCBatcher::delete_macro_blocks_(ObIArray<blocksstable::MacroBlockId> &block_ids)
+{
+  return storage::delete_macro_blocks(block_ids);
+}
+
 int GCBaseOP::operator()(
     const ObIArray<blocksstable::MacroBlockId> &block_ids,
     ObIArray<blocksstable::MacroBlockId> *result_block_ids)
@@ -178,12 +299,12 @@ int ObBlockGCHandler::gc_tablet(
     // prewarmed through stream-rpc from src-observer to dest-observer during migration.
   } else { // !GCTabletType::TransferOut
     if (OB_FAIL(gc_blocks_(tablet_versions, INT64_MAX /* all tablet_versions will be deleted */,
-                           true/*is_shared*/, shared_op))) {
+                           true/*is_shared*/, shared_op, nullptr/*batcher*/))) {
       LOG_WARN("failed to gc_blocks", K(ret), KPC(this));
     }
   }
   if (FAILEDx(gc_blocks_(tablet_versions, INT64_MAX /* all tablet_versions will be deleted */,
-                         false/*is_shared*/, private_op))) {
+                         false/*is_shared*/, private_op, nullptr/*batcher*/))) {
     LOG_WARN("failed to gc_blocks", K(ret), KPC(this));
   } 
 
@@ -275,7 +396,8 @@ int ObBlockGCHandler::delete_tablet_meta_versions_(
 int ObBlockGCHandler::gc_blocks_for_tablet_meta_versions_(
     const ObIArray<int64_t> &tablet_versions,
     const int64_t min_retain_tablet_meta_version,
-    const bool is_shared)
+    const bool is_shared,
+    ObPrivateGCBatcher *batcher)
 {
   int ret = OB_SUCCESS;
   ObArray<MacroBlockId> block_ids;
@@ -304,7 +426,8 @@ int ObBlockGCHandler::gc_blocks_for_tablet_meta_versions_(
     GCTabletMetaVersionOP op(exist_block_set, collect_check_error_block_op.get_result_block_id_set());
     // delete tablet meta versions
     if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(gc_blocks_(tablet_versions, min_retain_tablet_meta_version - 1, is_shared, op))) {
+    } else if (OB_FAIL(gc_blocks_(tablet_versions, min_retain_tablet_meta_version - 1,
+                                  is_shared, op, batcher))) {
       LOG_WARN("failed to gc_blocks", KR(ret), KPC(this), K(tablet_versions.count()),
                K(min_retain_tablet_meta_version), K(is_shared));
     }
@@ -313,10 +436,11 @@ int ObBlockGCHandler::gc_blocks_for_tablet_meta_versions_(
   return ret;
 }
 
-int ObBlockGCHandler::gc_tablet_meta_versions(
+int ObBlockGCHandler::gc_blocks_for_tablet_meta_versions(
     const ObIArray<int64_t> &tablet_versions,
     const int64_t min_retain_tablet_meta_version,
-    const bool is_transfer_out_deleted)
+    const bool is_transfer_out_deleted,
+    ObPrivateGCBatcher &batcher)
 {
   int ret = OB_SUCCESS;
   // must gc shared macro cache before gc private macro. otherwise, private macro_info will be
@@ -325,20 +449,17 @@ int ObBlockGCHandler::gc_tablet_meta_versions(
     // if TRANSFER_OUT_DELETED, then skip gc shared macro cache. because shared macro cache will be
     // prewarmed through stream-rpc from src-observer to dest-observer during migration.
   } else { // !is_transfer_out_deleted
-    if (OB_FAIL(gc_blocks_for_tablet_meta_versions_(tablet_versions, min_retain_tablet_meta_version, true/*is_shared*/))) {
-      LOG_WARN("failed to gc_blocks_for_tablet_meta_versions_", KR(ret), KPC(this), K(tablet_versions.count()),
-               K(min_retain_tablet_meta_version));
+    if (OB_FAIL(gc_blocks_for_tablet_meta_versions_(tablet_versions,
+            min_retain_tablet_meta_version, true/*is_shared*/, nullptr/*batcher*/))) {
+      LOG_WARN("failed to gc shared blocks for tablet meta versions", KR(ret), KPC(this),
+          K(tablet_versions.count()), K(min_retain_tablet_meta_version));
     }
   }
-  if (FAILEDx(gc_blocks_for_tablet_meta_versions_(tablet_versions, min_retain_tablet_meta_version, false/*is_shared*/))) {
-    LOG_WARN("failed to gc_blocks_for_tablet_meta_versions_", KR(ret), KPC(this), K(tablet_versions.count()),
-             K(min_retain_tablet_meta_version));
-  } else if (OB_FAIL(delete_tablet_meta_versions_(tablet_versions, min_retain_tablet_meta_version - 1))) {
-    LOG_WARN("failed to delete_tablet_meta_version", KR(ret), KPC(this), K(tablet_versions.count()),
-             K(min_retain_tablet_meta_version));
+  if (FAILEDx(gc_blocks_for_tablet_meta_versions_(tablet_versions,
+      min_retain_tablet_meta_version, false/*is_shared*/, &batcher))) {
+    LOG_WARN("failed to batch private blocks for tablet meta versions", KR(ret), KPC(this),
+        K(tablet_versions.count()), K(min_retain_tablet_meta_version));
   }
-  LOG_INFO("finish tablet meta gc", KR(ret), KPC(this), K(tablet_versions.count()),
-           K(min_retain_tablet_meta_version), K(is_transfer_out_deleted));
   return ret;
 }
 
@@ -346,7 +467,8 @@ int ObBlockGCHandler::gc_blocks_(
     const ObIArray<int64_t> &tablet_versions,
     const int64_t gc_tablet_meta_ts,
     const bool is_shared,
-    GCBaseOP &get_gc_blocks_op)
+    GCBaseOP &get_gc_blocks_op,
+    ObPrivateGCBatcher *batcher)
 {
   int ret = OB_SUCCESS;
 
@@ -371,12 +493,20 @@ int ObBlockGCHandler::gc_blocks_(
           LOG_TRACE("macro cache gc success", K(tablet_version), K(gc_block_ids.count()), K(gc_block_ids), KPC(this));
         }
       } else { // !is_shared
-        // todo  split  skip this step
-        if (OB_FAIL(delete_macro_blocks(gc_block_ids))) {
-          LOG_WARN("failed to delete_macro_blocks", KR(ret), K(gc_block_ids), KPC(this));
+        if (OB_NOT_NULL(batcher)) {
+          if (OB_FAIL(batcher->append(gc_block_ids))) {
+            LOG_WARN("failed to append private gc blocks", KR(ret), K(tablet_version),
+                K(gc_block_ids.count()), KPC(this));
+          }
         } else {
-          gc_macro_block_cnt_ += gc_block_ids.count();
-          LOG_TRACE("block gc success", KR(ret), K(tablet_version), K(gc_block_ids.count()), K(gc_block_ids), KPC(this));
+          // todo  split  skip this step
+          if (OB_FAIL(delete_macro_blocks(gc_block_ids))) {
+            LOG_WARN("failed to delete_macro_blocks", KR(ret), K(gc_block_ids), KPC(this));
+          } else {
+            gc_macro_block_cnt_ += gc_block_ids.count();
+            LOG_TRACE("block gc success", KR(ret), K(tablet_version),
+                K(gc_block_ids.count()), K(gc_block_ids), KPC(this));
+          }
         }
       }
     }

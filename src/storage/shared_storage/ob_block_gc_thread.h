@@ -59,18 +59,29 @@ public:
   virtual void handle_drop(void *task) 
   {
     int ret = OB_SUCCESS;
-    handle_end(task);
+    handle_end(task, true /* need_free */);
     STORAGE_LOG(INFO, "gc thread pool is stop", K(ret), KP(task), KPC(this));
   }
-  void handle_end(void *task)
+  void handle_end(void *task, const bool need_free)
   {
-    get_gc_task_ctx()->get_allocator().free(task);
+    if (need_free) {
+      CTX *ctx = get_gc_task_ctx();
+      if (OB_ISNULL(ctx)) {
+        STORAGE_LOG_RET(WARN, OB_ERR_UNEXPECTED, "gc task ctx is NULL", KP(task), KPC(this));
+      } else {
+        ctx->get_allocator().free(task);
+      }
+    }
     ATOMIC_DEC(&unfinished_task_cnt_); 
     STORAGE_LOG(TRACE, "tablet_gc_task end", KP(task), KPC(this));
   }
 
   template<class T>
   int add_gc_task(T &task);
+  // Enqueue the original object. Its owner keeps it alive until all tasks finish;
+  // the worker completes it with handle_end(task, false).
+  template<class T>
+  int add_gc_task(T *task);
 public:
   VIRTUAL_TO_STRING_KV(K_(tg_id), K_(is_inited), K_(unfinished_task_cnt));
 private:
@@ -133,6 +144,49 @@ int ObBlockGCThread<CTX>::add_gc_task(T &task)
     if (OB_SUCC(ret)) {
       ATOMIC_INC(&unfinished_task_cnt_);
       STORAGE_LOG(TRACE, "tablet_gc_task add", K(ret), KP(handler), K(task), KPC(this));
+    }
+  }
+  return ret;
+}
+
+template<class CTX>
+template<class T>
+int ObBlockGCThread<CTX>::add_gc_task(T *task)
+{
+  int ret = OB_SUCCESS;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    STORAGE_LOG(WARN, "gc thread is not initialized", KR(ret), KPC(this));
+  } else if (!is_valid_ctx()) {
+    ret = OB_ERR_UNEXPECTED;
+    STORAGE_LOG(WARN, "gc ctx is invalid", KR(ret), KP(task), KPC(this));
+  } else if (OB_ISNULL(task) || !task->is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "task is invalid", KR(ret), KP(task), KPC(this));
+  } else {
+    // The task may finish immediately after being published to the queue.
+    ATOMIC_INC(&unfinished_task_cnt_);
+    int64_t last_time_us = 0;
+    int64_t retry_times = 10;
+    bool need_retry = true;
+    while (need_retry && OB_FAIL(TG_PUSH_TASK(tg_id_, task))) {
+      if (OB_EAGAIN != ret) {
+        STORAGE_LOG(WARN, "push gc task failed, stop retrying", KR(ret), KP(task), KPC(this));
+        need_retry = false;
+      } else if (retry_times-- > 0) {
+        if (reach_time_interval(60 * 1000 * 1000, last_time_us)) {
+          STORAGE_LOG(WARN, "push gc task error", KR(ret), KP(task), KPC(this));
+        }
+        ob_usleep(1000 * 1000);
+      } else {
+        need_retry = false;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      STORAGE_LOG(INFO, "tablet_gc_task add by pointer", KR(ret), KP(task), KPC(this));
+    } else {
+      // Failed submission does not transfer ownership or leave an unfinished task.
+      ATOMIC_DEC(&unfinished_task_cnt_);
     }
   }
   return ret;
@@ -263,6 +317,10 @@ public:
   template<class T>
   int add_gc_task(T &task)
   { return gc_thread_.template add_gc_task(task); }
+
+  template<class T>
+  int add_gc_task(T *task)
+  { return gc_thread_.template add_gc_task<T>(task); }
 
   TO_STRING_KV(K_(gc_thread));
 private:
