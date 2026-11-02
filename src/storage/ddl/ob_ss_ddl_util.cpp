@@ -7,6 +7,7 @@
 #include "ob_ss_ddl_util.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/column_store/ob_column_oriented_sstable.h"
+#include "storage/blocksstable/async_index/ob_inv_sstable.h"
 #include "storage/incremental/ob_shared_meta_service.h"
 #include "storage/incremental/ob_sswriter_service.h"
 #include "storage/compaction_v2/ob_ss_compact_helper.h"
@@ -79,12 +80,16 @@ int ObSSDDLUtil::update_shared_tablet_table_store_if_absent(
     ObStorageSchema *storage_schema = NULL;
     blocksstable::ObSSTable sstable;
     storage::ObCOSSTableV2 co_sstable;
-    const bool is_co_sstable = table_key.is_co_sstable();
+    blocksstable::ObInvSSTable inv_sstable;
+    blocksstable::ObSSTable *sstable_ptr = &sstable;
+    if (table_key.is_co_sstable()) {
+      sstable_ptr = &co_sstable;
+    } else if (table_key.is_inv_sstable()) {
+      sstable_ptr = &inv_sstable;
+    }
     int64_t pos = 0;
-    if (is_co_sstable && OB_FAIL(co_sstable.deserialize(allocator, sstable_buf.ptr(), sstable_buf.length(), pos))) {
-      LOG_WARN("deserialize co sstable fail", K(ret), K(sstable_buf.length()));
-    } else if (!is_co_sstable && OB_FAIL(sstable.deserialize(allocator, sstable_buf.ptr(), sstable_buf.length(), pos))) {
-      LOG_WARN("deserialize sstable fail", K(ret), K(sstable_buf.length()));
+    if (OB_FAIL(sstable_ptr->deserialize(allocator, sstable_buf.ptr(), sstable_buf.length(), pos))) {
+      LOG_WARN("deserialize sstable fail", K(ret), K(table_key), K(sstable_buf.length()));
     } else if (OB_FAIL(MTL(ObLSService *)->get_ls(ls_id, ls_handle, ObLSGetMod::DDL_MOD))) {
       LOG_WARN("failed to get log stream", K(ret), K(ls_id));
     } else if (OB_FAIL(tablet_handle.get_obj()->load_storage_schema(allocator, storage_schema))) {
@@ -93,7 +98,7 @@ int ObSSDDLUtil::update_shared_tablet_table_store_if_absent(
       ret = OB_ERR_UNEXPECTED;
       LOG_ERROR("storage schema is null", K(ret));
     } else if (OB_FAIL(update_shared_tablet_table_store(ls_handle,
-        is_co_sstable ? co_sstable : sstable, *storage_schema, data_format_version,
+        *sstable_ptr, *storage_schema, data_format_version,
         transfer_scn, check_lease))) {
       LOG_WARN("update shared tablet table store fail", K(ret));
     } else {
