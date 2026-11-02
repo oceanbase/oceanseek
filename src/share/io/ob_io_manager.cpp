@@ -186,10 +186,9 @@ void ObTrafficControl::ObSharedDeviceControlV2::destroy()
     LOG_WARN("clear map failed", K(ret));
   } else {
     for (int i = 0; i < static_cast<int>(obrpc::ResourceType::ResourceTypeCnt); i++) {
-      if (limit_ids_[i] < 0) {
-        LOG_WARN("invalid limit id failed", K(ret), K(limit_ids_[i]), K(i));
-      } else {
+      if (limit_ids_[i] >= 0) {
         tclimit_destroy(limit_ids_[i]);
+        limit_ids_[i] = -1;
       }
     }
   }
@@ -222,17 +221,24 @@ int ObTrafficControl::ObSharedDeviceControlV2::add_shared_device_limits(uint64_t
   return ret;
 }
 
-int ObTrafficControl::ObSharedDeviceControlV2::fill_qsched_req_storage_key(ObIORequest& req) 
-{
-  int ret = OB_SUCCESS;
-  req.qsched_req_.storage_key_ = this->storage_key_.hash();
-  return ret;
-}
-
 int ObTrafficControl::ObSharedDeviceControlV2::add_group(const ObIOSSGrpKey &grp_key, const int qid) {
   return transform_ret(group_list_.add_group(grp_key, qid, limit_ids_, ResourceType::ResourceTypeCnt));
 }
 
+int ObTrafficControl::ObSharedDeviceControlV2::remove_tenant_group(const uint64_t tenant_id) {
+  return group_list_.remove_tenant_group(tenant_id);
+}
+
+// rollback a limit that has already been mounted on the queue, used when
+// mounting a following limit of the same group fails and the group must not
+// be registered in grp_list_.
+static void rollback_group_limit(const int qid, const int limiter_id, const ObIOSSGrpKey &grp_key)
+{
+  int ret = qdisc_del_limit(qid, limiter_id);
+  if (OB_SUCCESS != ret) {
+    LOG_WARN("qdisc del limit fail on rollback", K(ret), K(qid), K(limiter_id), K(grp_key));
+  }
+}
 
 int ObTrafficControl::ObSharedDeviceControlV2::ObSDGroupList::add_group(const ObIOSSGrpKey &grp_key, const int qid, int* limit_ids, int l_size)
 {
@@ -242,19 +248,35 @@ int ObTrafficControl::ObSharedDeviceControlV2::ObSDGroupList::add_group(const Ob
     LOG_ERROR("l_size is bigger than ResourceTypeCnt", K(l_size), K(ResourceType::ResourceTypeCnt), K(grp_key), K(ret));
   } else if (OB_UNLIKELY(OB_HASH_NOT_EXIST != is_group_key_exist(grp_key))) {
     LOG_WARN("repeat add the group limit ", K(ret), K(grp_key));
-  } else if (OB_FAIL(grp_list_.push_back(grp_key))) {
-    LOG_WARN("grp list push back failed", K(ret), K(grp_key));
+  } else if (OB_FAIL(grp_list_.reserve(grp_list_.count() + 1))) {
+    // reserve the registration slot before mounting any limit, so that a
+    // later grp_list_ push_back cannot fail after the limits are mounted;
+    // translate the OceanBase error code into errno for transform_ret.
+    LOG_WARN("reserve grp list capacity failed", K(ret), K(grp_key));
+    ret = ENOMEM;
   } else if (ObIOMode::READ == grp_key.get_mode()) {
-    if (OB_FAIL(qdisc_add_limit(qid, limit_ids[static_cast<int>(ResourceType::ips)]))) {
+    if (OB_SUCCESS != (ret = qdisc_add_limit(qid, limit_ids[static_cast<int>(ResourceType::ips)]))) {
       LOG_ERROR("qdisc add limit fail" , K(ret), K(grp_key), K(qid), K(ResourceType::ips), K(limit_ids[static_cast<int>(ResourceType::ips)]));
-    } else if (OB_FAIL(qdisc_add_limit(qid, limit_ids[static_cast<int>(ResourceType::ibw)]))) {
+    } else if (OB_SUCCESS != (ret = qdisc_add_limit(qid, limit_ids[static_cast<int>(ResourceType::ibw)]))) {
       LOG_ERROR("qdisc add limit fail" , K(ret), K(grp_key), K(qid), K(ResourceType::ibw), K(limit_ids[static_cast<int>(ResourceType::ibw)]));
+      rollback_group_limit(qid, limit_ids[static_cast<int>(ResourceType::ips)], grp_key);
+    } else if (OB_FAIL(grp_list_.push_back(grp_key))) {
+      LOG_WARN("grp list push back failed", K(ret), K(grp_key));
+      ret = ENOMEM;
+      rollback_group_limit(qid, limit_ids[static_cast<int>(ResourceType::ibw)], grp_key);
+      rollback_group_limit(qid, limit_ids[static_cast<int>(ResourceType::ips)], grp_key);
     }
   } else if (ObIOMode::WRITE == grp_key.get_mode()) {
-    if (OB_FAIL(qdisc_add_limit(qid, limit_ids[static_cast<int>(ResourceType::ops)]))) {
+    if (OB_SUCCESS != (ret = qdisc_add_limit(qid, limit_ids[static_cast<int>(ResourceType::ops)]))) {
       LOG_ERROR("qdisc add limit fail" , K(ret), K(grp_key), K(qid), K(ResourceType::ops), K(limit_ids[static_cast<int>(ResourceType::ops)]));
-    } else if (OB_FAIL(qdisc_add_limit(qid, limit_ids[static_cast<int>(ResourceType::obw)]))) {
+    } else if (OB_SUCCESS != (ret = qdisc_add_limit(qid, limit_ids[static_cast<int>(ResourceType::obw)]))) {
       LOG_ERROR("qdisc add limit fail" , K(ret),K(grp_key), K(qid), K(ResourceType::obw), K(limit_ids[static_cast<int>(ResourceType::obw)]));
+      rollback_group_limit(qid, limit_ids[static_cast<int>(ResourceType::ops)], grp_key);
+    } else if (OB_FAIL(grp_list_.push_back(grp_key))) {
+      LOG_WARN("grp list push back failed", K(ret), K(grp_key));
+      ret = ENOMEM;
+      rollback_group_limit(qid, limit_ids[static_cast<int>(ResourceType::obw)], grp_key);
+      rollback_group_limit(qid, limit_ids[static_cast<int>(ResourceType::ops)], grp_key);
     }
   }
   LOG_INFO("add group limit of shared device success", K(grp_key), K(qid), K(limit_ids[static_cast<int>(ResourceType::ips)]), K(limit_ids[static_cast<int>(ResourceType::ibw)]), K(limit_ids[static_cast<int>(ResourceType::ops)]), K(limit_ids[static_cast<int>(ResourceType::obw)]), K(ret));
@@ -596,6 +618,12 @@ void ObTrafficControl::inner_calc_()
   }
 }
 
+// Register the shared storage bucket of a request on its target queue:
+// create the per-storage-key control object on first sight and mount the
+// per-(tenant, group) qdisc limiters. Success contract: OB_SUCCESS only
+// means this call observed no registration error; it does NOT guarantee
+// that the group limiters are already mounted for the requesting group,
+// see the sampling gate contract below.
 int ObTrafficControl::register_bucket(ObIORequest &req, const int qid) {
   int ret = OB_SUCCESS;
   if (req.is_limit_net_bandwidth_req()) {
@@ -608,7 +636,6 @@ int ObTrafficControl::register_bucket(ObIORequest &req, const int qid) {
     if (OB_SUCCESS == shared_device_map_v2_.get_refactored(key, tc)) {
     } else {
       DRWLock::WRLockGuard guard(rw_lock_);
-      int tmp_ret = OB_SUCCESS;
       if (OB_UNLIKELY(OB_SUCCESS == shared_device_map_v2_.get_refactored(key, tc))) {
       } else if (OB_ISNULL(tc = OB_NEW(ObSharedDeviceControlV2, SET_IGNORE_MEM_VERSION("SDCtrlV2")))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -625,24 +652,72 @@ int ObTrafficControl::register_bucket(ObIORequest &req, const int qid) {
     }
 
     // register bucket for group
+    //
+    // Contract of the group limiter registration (deliberately fail-open):
+    // - The registration attempt runs behind a 100ms sampling gate.
+    //   REACH_TIME_INTERVAL is a process-level static per call site, so at
+    //   most one group registration is attempted per 100ms across all
+    //   tenants and groups; the window is not per group.
+    // - Requests that do not hit the gate skip the registration and are
+    //   still submitted: before the group limiters are mounted (or after a
+    //   failed attempt), such requests run without the storage-key/group
+    //   limits and are only bounded by the root/sub-root device bandwidth.
+    //   This is the pre-existing baseline behavior.
+    // - A failure observed by the sampled attempt fails only that request
+    //   via ret; convergence relies on the next sampled retry (>= 100ms
+    //   later), which is best effort, not a per-group guarantee.
+    // - Per-request mount-status validation is rejected on purpose:
+    //   is_group_key_exist scans grp_list_ linearly and the registration
+    //   runs under the traffic-control write lock, too costly for the IO
+    //   submission hot path.
+    // - Observation points for convergence: the QSched limiter config of
+    //   the queue and the "add group limit of shared device success"
+    //   LOG_INFO in ObSDGroupList::add_group.
     if (REACH_TIME_INTERVAL(100 * 1000)) {
       if (OB_FAIL(ret)) {
-      } else if (OB_ISNULL(tc)) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("tc is not exist", K(ret), K(tc), K(qid), K(req));
-      } else if (OB_SUCCESS == tc->is_group_key_exist(grp_key)) {
       } else {
         DRWLock::WRLockGuard guard(rw_lock_);
-        if (OB_SUCCESS == tc->is_group_key_exist(grp_key)) {
-        } else if (OB_FAIL(tc->add_group(grp_key, qid))) {
-          LOG_WARN("add shared device limits failed", K(ret), K(grp_key), K(qid));
+        ObSharedDeviceControlV2 *group_tc = nullptr;
+        if (OB_FAIL(shared_device_map_v2_.get_refactored(key, group_tc))) {
+          LOG_WARN("get shared device control failed", K(ret), K(key), K(grp_key), K(qid));
+        } else if (OB_ISNULL(group_tc)) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("shared device control is null", K(ret), K(key), K(qid), K(req));
+        } else if (OB_SUCCESS == group_tc->is_group_key_exist(grp_key)) {
+        } else if (OB_FAIL(group_tc->add_group(grp_key, qid))) {
+          LOG_WARN("add shared device group limit failed", K(ret), K(grp_key), K(qid));
         }
       }
     }
 
-    if (OB_NOT_NULL(tc)) {
-      (void)tc->fill_qsched_req_storage_key(req);
+    req.qsched_req_.storage_key_ = key.hash();
+  }
+  return ret;
+}
+
+int ObTrafficControl::unregister_tenant_group(const uint64_t tenant_id)
+{
+  int ret = OB_SUCCESS;
+  struct RemoveTenantGroupFn
+  {
+    explicit RemoveTenantGroupFn(const uint64_t tenant_id) : tenant_id_(tenant_id) {}
+    int operator()(hash::HashMapPair<ObStorageKey, ObSharedDeviceControlV2 *> &pair)
+    {
+      int ret = OB_SUCCESS;
+      if (OB_ISNULL(pair.second)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("shared device control is null", K(ret), K(pair.first));
+      } else if (OB_FAIL(pair.second->remove_tenant_group(tenant_id_))) {
+        LOG_WARN("remove tenant group failed", K(ret), K(tenant_id_), K(pair.first));
+      }
+      return ret;
     }
+    const uint64_t tenant_id_;
+  };
+  DRWLock::WRLockGuard guard(rw_lock_);
+  RemoveTenantGroupFn fn(tenant_id);
+  if (OB_FAIL(shared_device_map_v2_.foreach_refactored(fn))) {
+    LOG_WARN("unregister tenant group from shared device map v2 failed", K(ret), K(tenant_id));
   }
   return ret;
 }
@@ -688,6 +763,19 @@ int ObTrafficControl::ObSharedDeviceControlV2::ObSDGroupList::is_group_key_exist
   }
   if (is_found == false) {
     ret = OB_HASH_NOT_EXIST;
+  }
+  return ret;
+}
+
+int ObTrafficControl::ObSharedDeviceControlV2::ObSDGroupList::remove_tenant_group(const uint64_t tenant_id)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = grp_list_.count() - 1; OB_SUCC(ret) && i >= 0; --i) {
+    if (tenant_id == static_cast<uint64_t>(grp_list_.at(i).tenant_id_)) {
+      if (OB_FAIL(grp_list_.remove(i))) {
+        LOG_WARN("remove tenant group from grp list failed", K(ret), K(tenant_id), K(i));
+      }
+    }
   }
   return ret;
 }
@@ -1909,6 +1997,17 @@ void ObTenantIOManager::destroy()
   int ret = OB_SUCCESS;
   if (OB_NOT_NULL(io_scheduler_) && OB_FAIL(io_scheduler_->remove_phyqueues(tenant_id_))) {
     LOG_WARN("remove phy_queues from map failed", K(ret), K(tenant_id_));
+  }
+
+  // The tenant queues have been destroyed, so remove the tenant registrations
+  // left in the global shared device traffic control (e.g. the tenant 0 global
+  // storage key), otherwise a later register_bucket would find the stale group
+  // key and skip mounting the limiters on the newly created queues.
+  if (0 != tenant_id_) {
+    int tmp_ret = OB_IO_MANAGER.get_tc().unregister_tenant_group(tenant_id_);
+    if (OB_SUCCESS != tmp_ret) {
+      LOG_WARN("unregister tenant group from traffic control failed", K(tmp_ret), K(tenant_id_));
+    }
   }
 
   io_clock_.destroy();

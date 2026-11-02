@@ -200,7 +200,10 @@ int qdisc_add_limit(int qid, int limiter_id)
     err = -ENOENT;
     TC_INFO("qdisc add limit fail, get limiter fail: qid: %d, limiter_id: %d, q: %p, L: %p", qid, limiter_id, q, L);
   } else {
-    q->add_limit(L);
+    err = q->add_limit(L);
+    if (0 != err) {
+      TC_INFO("qdisc add limit fail, limiter list is full: qid: %d, limiter_id: %d, q: %p, L: %p", qid, limiter_id, q, L);
+    }
   }
   return err;
 }
@@ -236,7 +239,10 @@ int qdisc_add_reserve(int qid, int limiter_id)
     err = -ENOENT;
     TC_INFO("qdisc add reserve fail, get limiter fail: qid: %d, limiter_id: %d, q: %p, L: %p", qid, limiter_id, q, L);
   } else {
-    q->add_reserve(L);
+    err = q->add_reserve(L);
+    if (0 != err) {
+      TC_INFO("qdisc add reserve fail, limiter list is full: qid: %d, limiter_id: %d, q: %p, L: %p", qid, limiter_id, q, L);
+    }
   }
   return err;
 }

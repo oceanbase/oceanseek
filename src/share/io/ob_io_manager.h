@@ -247,6 +247,7 @@ public:
       int clear();
       int assign(const ObSDGroupList &other);
       int add_group(const ObIOSSGrpKey &grp_key, int qid, int* limit_ids, int l_size);
+      int remove_tenant_group(const uint64_t tenant_id);
       int is_group_key_exist(const ObIOSSGrpKey &grp_key);
       common::ObSEArray<ObIOSSGrpKey, 7> grp_list_;
       TO_STRING_KV(K(grp_list_));
@@ -258,8 +259,8 @@ public:
     void destroy();
     int set_storage_key(const ObTrafficControl::ObStorageKey &key);
     int add_shared_device_limits(uint64_t storage_key);
-    int fill_qsched_req_storage_key(ObIORequest& req);
     int add_group(const ObIOSSGrpKey &grp_key, const int qid);
+    int remove_tenant_group(const uint64_t tenant_id);
     int is_group_key_exist(const ObIOSSGrpKey &grp_key);
     int64_t get_limit(const obrpc::ResourceType type) const;
     int update_limit(const obrpc::ObSharedDeviceResource &limit);
@@ -282,6 +283,7 @@ public:
   int set_limit_v2(const obrpc::ObSharedDeviceResourceArray &limit);
   int get_storage_count() const { return shared_device_map_.size(); };
   int register_bucket(ObIORequest &req, const int qid);
+  int unregister_tenant_group(const uint64_t tenant_id);
   int add_shared_device_limits(const ObStorageKey &key, const int qid);
   template<class _cb>
   int foreach_limit(_cb &cb) const { return shared_device_map_.foreach_refactored(cb); }

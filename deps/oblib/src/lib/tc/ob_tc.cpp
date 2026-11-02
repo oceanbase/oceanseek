@@ -102,18 +102,22 @@ public:
       f.append(" %llu,%s:%s", limiter_[i]->get_storage_key(), limiter_[i]->get_name(), format_bytes(b, sizeof(b), limiter_[i]->get_limit_per_sec()));
     }
   }
-  void add_limit(Limiter* limiter) {
+  int add_limit(Limiter* limiter) {
+    int err = -ENOMEM;
     for(int i = 0; i < MAX_LIMITER_COUNT; i++) {
       if (NULL == limiter_[i]) {
         limiter_[i] = limiter;
+        err = 0;
         break;
       }
     }
+    return err;
   }
   void del_limit(Limiter* limiter) {
     for(int i = 0; i < MAX_LIMITER_COUNT; i++) {
       if (limiter == limiter_[i]) {
         memmove(limiter_ + i, limiter_ + i + 1, (MAX_LIMITER_COUNT - i - 1) * sizeof(limiter_[0]));
+        limiter_[MAX_LIMITER_COUNT - 1] = NULL;
         break;
       }
     }
@@ -195,9 +199,9 @@ public:
   int64_t get_limit() { return limiter_.get_limit_per_sec(); }
   void set_reserve(int64_t limit) {  reserver_.set_limit_per_sec(limit); }
   int64_t get_reserve() { return reserver_.get_limit_per_sec(); }
-  void add_limit(Limiter* limiter) { limiter_.add_limit(limiter); }
+  int add_limit(Limiter* limiter) { return limiter_.add_limit(limiter); }
   void del_limit(Limiter* limiter) { limiter_.del_limit(limiter); }
-  void add_reserve(Limiter* limiter) { reserver_.add_limit(limiter); }
+  int add_reserve(Limiter* limiter) { return reserver_.add_limit(limiter); }
   void del_reserve(Limiter* limiter) { reserver_.del_limit(limiter); }
   void print_limiters_per_sec(StrFormat& f) { limiter_.print_limiters_per_sec(f); }
 };
