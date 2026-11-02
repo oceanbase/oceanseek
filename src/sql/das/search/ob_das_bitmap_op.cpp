@@ -175,17 +175,22 @@ int ObFastBitmap::add_batch(const uint64_t *vals, const int64_t count)
     const bool aggregate_words = count < 32 || same_word_count >= count / 2;
     if (OB_SUCC(ret)) {
       if (!aggregate_words) {
-        int64_t i = 0;
-        while (OB_SUCC(ret) && i < count) {
-          const uint64_t chunk_idx = vals[i] >> CHUNK_SHIFT;
+        const uint64_t *cur = vals;
+        const uint64_t *const end = vals + count;
+        while (OB_SUCC(ret) && cur < end) {
+          const uint64_t chunk_idx = *cur >> CHUNK_SHIFT;
           ChunkInfo *chunk_info = chunks_.at(static_cast<int64_t>(chunk_idx));
           if (OB_ISNULL(chunk_info) && OB_FAIL(alloc_chunk(chunk_idx, chunk_info))) {
+            const int64_t i = cur - vals;
             LOG_WARN("failed to allocate chunk for sparse batch", K(ret), K(i), K(chunk_idx));
           } else {
-            while (i < count && (vals[i] >> CHUNK_SHIFT) == chunk_idx) {
-              chunk_info->chunk_[(vals[i] >> WORD_SHIFT) & (WORDS_PER_CHUNK - 1)]
-                  |= 1ULL << (vals[i] & (WORD_BITS - 1));
-              ++i;
+            uint64_t *const words = chunk_info->chunk_;
+            // Keep the hot cursor separate from the failure-path log arguments.
+            while (cur < end && (*cur >> CHUNK_SHIFT) == chunk_idx) {
+              const uint64_t val = *cur;
+              words[(val >> WORD_SHIFT) & (WORDS_PER_CHUNK - 1)]
+                  |= 1ULL << (val & (WORD_BITS - 1));
+              ++cur;
             }
           }
         }
