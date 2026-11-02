@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 #include <string>
 #include "lib/alloc/ob_malloc_allocator.h"
+#include "lib/mysqlclient/ob_isql_result_handler.h"
 #include "lib/mysqlclient/ob_mysql_connection.h"
 #include "lib/mysqlclient/ob_mysql_connection_pool.h"
 #include "lib/mysqlclient/ob_mysql_result_impl.h"
