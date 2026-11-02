@@ -63,9 +63,11 @@ public:
   //   (2) MySQLConnectionPoll refresh server_list with lock
   // process flow:
   // 1. lock refresh_server_lock_ to refresh server_list
-  // 2. clear server_list_ and tenant_server_map_
-  // 3. query all_server_info and add into server_list
-  // 4. query tenant_server_list and add into tenant_server_map_
+  // 2. query all_server_info and replace server_list_ if succ and not empty
+  // 3. query tenant_id list and replace tenant_list_ if succ and not empty
+  // 4. query tenant_server_list and replace the server list in tenant_server_map_ if succ and not empty
+  // NOTICE: cached info is kept if query failed or got empty result, to avoid the connection
+  // pool finding an empty server list when sys tenant is temporarily unavailable.
   virtual int prepare_refresh() override;
   // release refresh_server_lock_
   virtual int end_refresh() override;
@@ -80,6 +82,7 @@ private:
   int query_all_tenant_();
   int query_all_server_();
   int query_tenant_server_();
+  int refresh_tenant_server_list_(const uint64_t tenant_id);
 private:
   bool                  is_inited_;
   IObLogSysTableHelper  *systable_helper_;

@@ -23,4 +23,4 @@ echo "[BUILD] make rpms..."
 rpmbuild --define "src_dir ${TOP_DIR}" --define "VERSION ${VERSION}" --define "RELEASE ${RELEASE}" --define "lto_jobs ${LTO_JOBS}" -ba oceanbase-ce.spec
 echo "[BUILD] make rpms done"
 
-mv ~/rpmbuild/RPMS/x86_64/oceanbase.ai-ce*.rpm .
+mv ~/rpmbuild/RPMS/x86_64/oceanbase-ce*.rpm .

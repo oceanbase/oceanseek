@@ -1,0 +1,5 @@
+config:
+  enable_cluster_checkout: false
+  skip_proxy_sys_private_check: true
+  syslog_level: 'DEBUG'
+  enable_metadb_used: 'false'

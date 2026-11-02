@@ -3,13 +3,19 @@
 PROJECT_DIR=$1
 PROJECT_NAME=$2
 VERSION=$3
-# CPack appends the distribution suffix for CE packages.
 RELEASE=$4
 
 export BUILD_NUMBER=${4}
 
 CURDIR=$PWD
 TOP_DIR=`pwd`/../
+OS_RELEASE_VERSION_ID=$(grep -Po '(?<=release )\d' /etc/redhat-release)
+ID=$(grep -Po '(?<=^ID=).*' /etc/os-release | tr -d '"')
+if [[ "${ID}"x == "alinux"x ]]; then
+    RELEASE=${RELEASE}.al8
+else
+    RELEASE=${RELEASE}.el${OS_RELEASE_VERSION_ID}
+fi
 
 OB_DISABLE_LSE_OPTION=""
 [[ $OB_DISABLE_LSE == "1" ]] && OB_DISABLE_LSE_OPTION="-DOB_DISABLE_LSE=ON"

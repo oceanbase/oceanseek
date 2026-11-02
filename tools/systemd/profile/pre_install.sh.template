@@ -1,6 +1,6 @@
 #!/bin/bash
 echo "execute pre install script"
-version=@OceanBase_AI_CE_VERSION@
+version=@OceanBase_CE_VERSION@
 
 if [ "$1" -gt 1 ]; then
     parent_name=$(cat /proc/$PPID/comm)

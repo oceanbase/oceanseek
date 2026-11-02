@@ -194,10 +194,13 @@ int ObCDCTenantSQLServerProvider::refresh_server_list(void)
   return OB_SUCCESS;
 }
 
+// NOTICE: query into a temporary list and only replace tenant_list_ on success, so that a
+// transient query failure (e.g. sys tenant busy) won't drop the tenant list cached by the last
+// successful refresh.
 int ObCDCTenantSQLServerProvider::query_all_tenant_()
 {
   int ret = OB_SUCCESS;
-  tenant_list_.reset();
+  TenantList tenant_list(ObModIds::OB_LOG_SERVER_PROVIDER, OB_MALLOC_NORMAL_BLOCK_SIZE);
 
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
@@ -205,8 +208,15 @@ int ObCDCTenantSQLServerProvider::query_all_tenant_()
   } else if (OB_ISNULL(systable_helper_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("systable_helper_ should not be null", KR(ret));
-  } else if (OB_FAIL(systable_helper_->query_tenant_id_list(tenant_list_))) {
-    LOG_ERROR("get tenant_id_list by systable_helper_ failed", KR(ret));
+  } else if (OB_FAIL(systable_helper_->query_tenant_id_list(tenant_list))) {
+    LOG_WARN("get tenant_id_list by systable_helper_ failed, keep the cached tenant_list",
+        KR(ret), K_(tenant_list));
+  } else if (OB_UNLIKELY(0 == tenant_list.count())) {
+    ret = OB_NEED_RETRY;
+    LOG_WARN("tenant_id_list query from cluster is empty, keep the cached tenant_list",
+        KR(ret), K_(tenant_list));
+  } else if (OB_FAIL(tenant_list_.assign(tenant_list))) {
+    LOG_ERROR("assign tenant_list failed", KR(ret), K(tenant_list));
   } else {
     // success
   }
@@ -214,9 +224,11 @@ int ObCDCTenantSQLServerProvider::query_all_tenant_()
   return ret;
 }
 
+// NOTICE: same as query_all_tenant_, keep the cached server_list_ if query failed or got empty.
 int ObCDCTenantSQLServerProvider::query_all_server_()
 {
   int ret = OB_SUCCESS;
+  ServerList server_list(ObModIds::OB_LOG_SERVER_PROVIDER, OB_MALLOC_NORMAL_BLOCK_SIZE);
 
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
@@ -224,20 +236,33 @@ int ObCDCTenantSQLServerProvider::query_all_server_()
   } else if (OB_ISNULL(systable_helper_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("systable_helper_ should not be null", KR(ret));
+  } else if (OB_FAIL(systable_helper_->query_sql_server_list(server_blacklist_, server_list))) {
+    LOG_WARN("query_server_list failed, keep the cached server_list", KR(ret), K_(server_list));
+  } else if (OB_UNLIKELY(0 == server_list.count())) {
+    ret = OB_NEED_RETRY;
+    LOG_WARN("server_list query from cluster is empty, keep the cached server_list",
+        KR(ret), K_(server_list));
+  } else if (OB_FAIL(server_list_.assign(server_list))) {
+    LOG_ERROR("assign server_list failed", KR(ret), K(server_list));
   } else {
-    server_list_.reset();
-
-    if (OB_FAIL(systable_helper_->query_sql_server_list(server_blacklist_, server_list_))) {
-      LOG_ERROR("query_server_list failed", KR(ret));
-    } else if (OB_UNLIKELY(0 == server_list_.count())) {
-      ret = OB_NEED_RETRY;
-      LOG_WARN("server_list query from cluster is empty", KR(ret));
-    }
+    // success
   }
 
   return ret;
 }
 
+// Refresh tenant_server_map_ for each tenant in tenant_list_:
+// 1. query succ and server list is not empty: replace the cached server list of the tenant.
+// 2. query succ but server list is empty:
+//    (1) tenant is dropped: remove the tenant from tenant_server_map_, then the connection pool
+//        will skip the tenant(get_tenant_servers returns OB_ENTRY_NOT_EXIST).
+//    (2) otherwise(e.g. unit migrating, server lease expired or not start service yet): keep
+//        the cached server list.
+// 3. query failed(e.g. sys tenant busy): keep the cached server list.
+// The cached server list of a tenant is never cleared before a new valid server list is fetched,
+// otherwise the connection pool will find an empty server list and fail to renew the
+// tenant connection pool with OB_ERR_UNEXPECTED.
+// Failure of one tenant won't affect others, the first error is returned.
 int ObCDCTenantSQLServerProvider::query_tenant_server_()
 {
   int ret = OB_SUCCESS;
@@ -250,53 +275,80 @@ int ObCDCTenantSQLServerProvider::query_tenant_server_()
     LOG_ERROR("systable_helper_ should not be null", KR(ret));
   } else if (OB_UNLIKELY(0 == server_list_.count() || 0 == tenant_list_.count())) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("expect valid server_list and tenant_list");
+    LOG_WARN("expect valid server_list and tenant_list", KR(ret), K_(server_list), K_(tenant_list));
   } else {
-    for (int tenant_idx = 0; tenant_idx < tenant_list_.count(); tenant_idx++) {
-      uint64_t tenant_id = OB_INVALID_TENANT_ID;
-      TenantServerList *tenant_server_list = NULL;
+    for (int64_t tenant_idx = 0; tenant_idx < tenant_list_.count(); tenant_idx++) {
+      int tmp_ret = OB_SUCCESS;
+      const uint64_t tenant_id = tenant_list_.at(tenant_idx);
 
-      if (OB_FAIL(tenant_list_.at(tenant_idx, tenant_id))) {
-        LOG_WARN("get_tenant_id failed", KR(ret), K_(tenant_list), K(tenant_idx));
-      } else if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_ERROR("expect valid tenant_id", KR(ret), K_(tenant_list), K(tenant_idx), K(tenant_id));
-      } else if (OB_FAIL(tenant_server_map_.get(tenant_id, tenant_server_list))) {
+      if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id)) {
+        tmp_ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("expect valid tenant_id", KR(tmp_ret), K_(tenant_list), K(tenant_idx), K(tenant_id));
+      } else if (OB_TMP_FAIL(refresh_tenant_server_list_(tenant_id))) {
+        LOG_WARN("refresh tenant_server_list failed", KR(tmp_ret), K(tenant_id));
+      }
+
+      if (OB_SUCCESS != tmp_ret && OB_SUCCESS == ret) {
+        ret = tmp_ret;
+      }
+    }
+  }
+
+  return ret;
+}
+
+int ObCDCTenantSQLServerProvider::refresh_tenant_server_list_(const uint64_t tenant_id)
+{
+  int ret = OB_SUCCESS;
+  ServerList tenant_servers(ObModIds::OB_LOG_SERVER_PROVIDER, OB_MALLOC_NORMAL_BLOCK_SIZE);
+
+  if (OB_FAIL(systable_helper_->query_tenant_sql_server_list(tenant_id, tenant_servers))) {
+    LOG_WARN("query_tenant_sql_server_list by systable_helper failed, keep the cached tenant_server_list",
+        KR(ret), K(tenant_id));
+  } else if (OB_UNLIKELY(0 == tenant_servers.count())) {
+    share::schema::TenantStatus tenant_status = share::schema::TenantStatus::TENANT_STATUS_INVALID;
+
+    if (OB_FAIL(systable_helper_->query_tenant_status(tenant_id, tenant_status))) {
+      LOG_WARN("query_tenant_status failed, keep the cached tenant_server_list", KR(ret), K(tenant_id));
+    } else if (share::schema::TenantStatus::TENANT_DELETED == tenant_status) {
+      if (OB_FAIL(tenant_server_map_.del(tenant_id))) {
         if (OB_ENTRY_NOT_EXIST == ret) {
-          if (OB_FAIL(tenant_server_map_.create(tenant_id, tenant_server_list))) {
-            LOG_ERROR("create tenant_server_list failed");
-          }
+          ret = OB_SUCCESS;
         } else {
-          LOG_ERROR("get tenant_server_list from tenant_server_map_ failed", KR(ret), K(tenant_id));
+          LOG_ERROR("del tenant_server_list from tenant_server_map_ failed", KR(ret), K(tenant_id));
         }
       }
+      LOG_INFO("tenant already dropped, remove tenant_server_list", KR(ret), K(tenant_id), K(tenant_status));
+    } else {
+      LOG_WARN("tenant_server_list is empty but tenant is not dropped, keep the cached tenant_server_list",
+          K(tenant_id), K(tenant_status));
+    }
+  } else {
+    TenantServerList *tenant_server_list = NULL;
 
-      if (OB_SUCC(ret)) {
-        if (OB_ISNULL(tenant_server_list)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_ERROR("tenant_server_list get/created from tenant_server_map_ should not be null", KR(ret), K(tenant_id));
-        } else if (OB_FAIL(systable_helper_->query_tenant_sql_server_list(tenant_id, tenant_server_list->get_server_list()))) {
-          LOG_ERROR("query_tenant_sql_server_list by systable_helper failed", KR(ret), K(tenant_id));
-        } else if (OB_UNLIKELY(0 == tenant_server_list->get_server_count())) {
-          share::schema::TenantStatus tenant_status = share::schema::TenantStatus::TENANT_STATUS_INVALID;
-
-          if (OB_FAIL(systable_helper_->query_tenant_status(tenant_id, tenant_status))) {
-            LOG_ERROR("query_tenant_status failed", KR(ret), K(tenant_id));
-          } else if (share::schema::TenantStatus::TENANT_DELETED == tenant_status) {
-            LOG_INFO("tenant_already dropped", K(tenant_id), K(tenant_status));
-            ret = OB_ENTRY_NOT_EXIST;
-          } else {
-            LOG_WARN("tenant_server_list is empty but tenant is not dropped", K(tenant_id), K(tenant_server_list));
-          }
-        } else {
-          LOG_INFO("find tenant servers", K(tenant_id), K(tenant_server_list));
+    if (OB_FAIL(tenant_server_map_.get(tenant_id, tenant_server_list))) {
+      if (OB_ENTRY_NOT_EXIST == ret) {
+        if (OB_FAIL(tenant_server_map_.create(tenant_id, tenant_server_list))) {
+          LOG_ERROR("create tenant_server_list failed", KR(ret), K(tenant_id));
         }
-
-        if (OB_NOT_NULL(tenant_server_list)) {
-          // revertt tenant_server_list anyway cause already get from tenant_server_map_ succ.
-          tenant_server_map_.revert(tenant_server_list);
-        }
+      } else {
+        LOG_ERROR("get tenant_server_list from tenant_server_map_ failed", KR(ret), K(tenant_id));
       }
+    }
+
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(tenant_server_list)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_ERROR("tenant_server_list get/created from tenant_server_map_ should not be null", KR(ret), K(tenant_id));
+    } else if (OB_FAIL(tenant_server_list->get_server_list().assign(tenant_servers))) {
+      LOG_ERROR("assign tenant_server_list failed", KR(ret), K(tenant_id), K(tenant_servers));
+    } else {
+      LOG_INFO("find tenant servers", K(tenant_id), KPC(tenant_server_list));
+    }
+
+    if (OB_NOT_NULL(tenant_server_list)) {
+      // revert tenant_server_list anyway cause already get from tenant_server_map_ succ.
+      tenant_server_map_.revert(tenant_server_list);
     }
   }
 
