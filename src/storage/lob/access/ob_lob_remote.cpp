@@ -69,7 +69,9 @@ int ObLobRemoteQueryHandler::init(const ObLobReadContext &read_ctx, const ObLobQ
 
 void ObLobRemoteQueryHandler::reset()
 {
-  handle_.abort();
+  if (handle_.has_more()) {
+    handle_.abort();
+  }
   if (rpc_buffer_.get_data() != nullptr) {
     allocator_->free(rpc_buffer_.get_data());
   }
