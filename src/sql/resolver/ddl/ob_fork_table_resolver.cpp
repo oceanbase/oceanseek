@@ -153,7 +153,7 @@ int ObForkDatabaseResolver::resolve(const ParseNode &parse_tree)
   ObForkDatabaseStmt *fork_database_stmt = NULL;
 
   if (OB_ISNULL(session_info_) || OB_ISNULL(allocator_) || T_FORK_DATABASE != parse_tree.type_
-      || MAX_NODE != parse_tree.num_child_ || OB_ISNULL(parse_tree.children_)) {
+      || OB_ISNULL(parse_tree.children_)) {
     ret = OB_ERR_UNEXPECTED;
     SQL_RESV_LOG(WARN, "invalid parse tree!", K(ret));
   } else if (OB_SYS_TENANT_ID == session_info_->get_effective_tenant_id()) {
@@ -164,6 +164,10 @@ int ObForkDatabaseResolver::resolve(const ParseNode &parse_tree)
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "fork database in Oracle mode is");
     SQL_RESV_LOG(WARN, "fork database not supported in oracle mode", K(ret));
+  } else if (MAX_NODE != parse_tree.num_child_) {
+    // Oracle still produces the two-child tree without COPY GRANTS; reject its mode first.
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "invalid fork database child count", K(ret), K(parse_tree.num_child_));
   } else if (OB_FAIL(check_fork_min_data_version(session_info_->get_effective_tenant_id()))) {
     SQL_RESV_LOG(WARN, "tenant data version does not support fork", KR(ret),
                  K(session_info_->get_effective_tenant_id()));
