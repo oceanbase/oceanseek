@@ -340,6 +340,7 @@ all_table_def = dict(
       ('skip_index_level', 'int', 'false', '0'),
       ('external_file_pattern_type', 'int', 'false', '0'),
       ('async_index_params', 'varchar:OB_MAX_INDEX_PARAMS_LENGTH', 'false', ''),
+      ('lob_intable_threshold', 'int', 'false', 'OB_DEFAULT_LOB_INTABLE_THRESHOLD'),
     ],
 )
 

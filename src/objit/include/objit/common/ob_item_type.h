@@ -76,6 +76,7 @@ typedef enum ObItemType
   T_UDT_SQL     = 49,
   T_COLLECTION  = 51,
   T_ROARINGBITMAP = 54,
+  T_EXTBLOB = 55, // Reserved for External LOB.
 
   T_IEEE754_NAN = 61,
   T_IEEE754_INFINITE = 62,
@@ -1005,6 +1006,8 @@ T_FUN_SYS_SEARCH_INDEX_INNER_PATH = 1943,
   T_FUN_SYS_VEC_IVF_CID = 1959,
   T_FUN_SYS_VEC_IVF_DATA = 1960,
   T_FUN_SYS_DSL_MULTI_VALUE_RANGE = 1961,
+  T_FUN_SYS_EXTERNAL_LOB = 1962,
+  T_FUN_SYS_LOB_META = 1963,
 
   ///< @note add new sys function type before this line
   T_FUN_SYS_END = 2000,
@@ -3106,6 +3109,7 @@ T_FUN_SYS_SEARCH_INDEX_INNER_PATH = 1943,
   // SUBMIT JOB WITH (...) options
   T_SUBMIT_JOB_OPTION = 5005,
   T_SUBMIT_JOB_OPTION_LIST = 5006,
+  T_LOB_INTABLE_THRESHOLD = 5007,
 
   T_MAX //Attention: add a new type before T_MAX
 } ObItemType;

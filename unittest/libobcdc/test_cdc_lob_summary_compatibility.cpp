@@ -358,15 +358,13 @@ TEST_F(TestCDCLobSummaryCompatibility, merger_accepts_invalid_type_and_in_table_
       run_merger_with_summary("IN_TABLE", 8/*byte_len*/, 1/*chunk_count*/, "lob-data"));
 }
 
-// 通过真实 ObCDCLobDataMerger 校验分支验证尚未支持的 OUT_TABLE 和 OUT_LINK Summary
+// 通过真实 ObCDCLobDataMerger 校验分支验证尚未支持的 OUT_TABLE Summary
 // 都会返回 OB_NOT_SUPPORTED，不会进入 Piece 获取与 LOB 拼接阶段。
 TEST_F(TestCDCLobSummaryCompatibility, merger_rejects_unsupported_valid_chunk_types)
 {
   ASSERT_EQ(OB_SUCCESS, init_merger_environment());
   EXPECT_EQ(OB_NOT_SUPPORTED,
       run_merger_with_summary("OUT_TABLE", 8/*byte_len*/, 1/*chunk_count*/, nullptr));
-  EXPECT_EQ(OB_NOT_SUPPORTED,
-      run_merger_with_summary("OUT_LINK", 8/*byte_len*/, 1/*chunk_count*/, nullptr));
 }
 
 // 通过真实 ObCDCLobDataMerger 校验分支验证 INVALID_TYPE 只获得类型兼容，

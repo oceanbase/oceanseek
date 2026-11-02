@@ -11995,5 +11995,21 @@
     "info_cn": "是否开启合并 SHOW DATABASES/SHOW TABLES 功能",
     "background_cn": "",
     "ref_url": ""
+  },
+  "ob_default_lob_intable_threshold": {
+    "id": 10767,
+    "name": "ob_default_lob_intable_threshold",
+    "default_value": "2097152",
+    "base_value": "2097152",
+    "data_type": "int",
+    "info": "Default lob_intable_threshold in newly created tables, in bytes.",
+    "flags": "GLOBAL | SESSION | MYSQL_ONLY",
+    "min_val": "0",
+    "max_val": "9223372036854775807",
+    "publish_version": "4.6.3.1",
+    "info_cn": "新建表默认使用的 lob_intable_threshold 存储格式阈值，单位为 Byte。",
+    "background_cn": "",
+    "ref_url": "",
+    "placeholder": true
   }
 }

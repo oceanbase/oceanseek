@@ -1926,7 +1926,8 @@ ObTableSchema::ObTableSchema(ObIAllocator *allocator)
     dynamic_partition_policy_(),
     semistruct_properties_(),
     ttl_flag_(),
-    async_index_params_()
+    async_index_params_(),
+    lob_intable_threshold_(OB_DEFAULT_LOB_INTABLE_THRESHOLD)
 {
   reset();
 }
@@ -2001,6 +2002,7 @@ int ObTableSchema::assign(const ObTableSchema &src_schema)
       table_flags_ = src_schema.table_flags_;
       name_generated_type_ = src_schema.name_generated_type_;
       lob_inrow_threshold_ = src_schema.lob_inrow_threshold_;
+      lob_intable_threshold_ = src_schema.lob_intable_threshold_;
       auto_increment_cache_size_ = src_schema.auto_increment_cache_size_;
       is_column_store_supported_ = src_schema.is_column_store_supported_;
       max_used_column_group_id_ = src_schema.max_used_column_group_id_;
@@ -4194,6 +4196,7 @@ void ObTableSchema::reset()
   exec_env_.reset();
   name_generated_type_ = GENERATED_TYPE_UNKNOWN;
   lob_inrow_threshold_ = OB_DEFAULT_LOB_INROW_THRESHOLD;
+  lob_intable_threshold_ = OB_DEFAULT_LOB_INTABLE_THRESHOLD;
   auto_increment_cache_size_ = 0;
 
   is_column_store_supported_ = false;
@@ -7953,6 +7956,7 @@ OB_DEF_SERIALIZE(ObTableSchema)
   OB_UNIS_ENCODE(skip_index_level_);
   OB_UNIS_ENCODE(external_file_pattern_type_);
   OB_UNIS_ENCODE(async_index_params_);
+  OB_UNIS_ENCODE(lob_intable_threshold_);
   // !!! end static check
   /*
    * 在此end static check注释前新增反序列化的成员
@@ -8215,6 +8219,8 @@ OB_DEF_DESERIALIZE(ObTableSchema)
   OB_UNIS_DECODE(skip_index_level_);
   OB_UNIS_DECODE(external_file_pattern_type_);
   OB_UNIS_DECODE_AND_FUNC(async_index_params_, deep_copy_str);
+  lob_intable_threshold_ = OB_DEFAULT_LOB_INTABLE_THRESHOLD;
+  OB_UNIS_DECODE(lob_intable_threshold_);
   // !!! FOR STATIC CHECKER BEGIN
   // THE FOLLOWING CODE CANNOT BE DESCRIBED USING SERIALIZE MACROS. THEY ARE EQUIVALENT TO THESE CODES:
   // has_async_index_ is derived from table_flags_, no separate serialization needed
@@ -8378,6 +8384,7 @@ OB_DEF_SERIALIZE_SIZE(ObTableSchema)
   OB_UNIS_ADD_LEN(skip_index_level_);
   OB_UNIS_ADD_LEN(external_file_pattern_type_);
   OB_UNIS_ADD_LEN(async_index_params_);
+  OB_UNIS_ADD_LEN(lob_intable_threshold_);
   // !!! end static check
   /*
    * 在此end static check注释前新增反序列化的成员

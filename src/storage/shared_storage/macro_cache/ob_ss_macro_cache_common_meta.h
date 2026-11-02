@@ -68,6 +68,7 @@ enum class ObSSMacroBlockType : uint8_t
   PRIVATE_MACRO    = 0,
   SHARED_MACRO     = 1,
   EXTERNAL_TABLE   = 2,
+  EXTERNAL_LOB     = 3, // Reserved for External LOB.
   MAX_TYPE
 };
 

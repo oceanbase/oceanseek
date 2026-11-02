@@ -154,9 +154,17 @@ public:
 struct ObSSGCTabletStudyInfo final
 {
 public:
-  ObSSGCTabletStudyInfo() : min_dep_meta_scn_(), min_major_snapshot_(0) {}
+  ObSSGCTabletStudyInfo()
+    : min_dep_meta_scn_(),
+      min_major_snapshot_(0),
+      clog_checkpoint_scn_(share::SCN::max_scn()),
+      multi_version_start_(INT64_MAX)
+  {}
   ObSSGCTabletStudyInfo(const share::SCN &min_dep_meta_scn, const int64_t min_major_snapshot)
-    : min_dep_meta_scn_(min_dep_meta_scn), min_major_snapshot_(min_major_snapshot)
+    : min_dep_meta_scn_(min_dep_meta_scn),
+      min_major_snapshot_(min_major_snapshot),
+      clog_checkpoint_scn_(share::SCN::max_scn()),
+      multi_version_start_(INT64_MAX)
   {}
   ~ObSSGCTabletStudyInfo() {}
   bool has_finite_rely() const
@@ -175,16 +183,22 @@ public:
   {
     min_dep_meta_scn_.set_max();
     min_major_snapshot_ = INT64_MAX;
+    clog_checkpoint_scn_.set_max();
+    multi_version_start_ = INT64_MAX;
   }
   void set_to_min()
   {
     min_dep_meta_scn_.set_min();
     min_major_snapshot_ = 0;
+    clog_checkpoint_scn_.set_min();
+    multi_version_start_ = 0;
   }
 
 public:
   share::SCN min_dep_meta_scn_;
   int64_t min_major_snapshot_;
+  share::SCN clog_checkpoint_scn_; // Reserved for OutTable LOB GC.
+  int64_t multi_version_start_; // Reserved for OutTable LOB GC.
   TO_STRING_KV(K_(min_dep_meta_scn), K_(min_major_snapshot));
 };
 

@@ -283,7 +283,8 @@ enum class ObIOCallbackType : uint8_t {
   EX_CACHED_READ_CALLBACK = 17,
   SS_TMP_FILE_READ_CALLBACK = 18,
   SS_MACRO_BLOCK_PREWARM_CALLBACK = 19,
-  MAX_CALLBACK_TYPE = 20
+  EXTERNAL_LOB_READ_CALLBACK = 20,
+  MAX_CALLBACK_TYPE = 21
 };
 
 bool is_atomic_write_callback(const ObIOCallbackType type);

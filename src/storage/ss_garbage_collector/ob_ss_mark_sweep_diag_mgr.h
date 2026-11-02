@@ -89,6 +89,9 @@ enum class ObSSMarkSweepDiagFileType : uint8_t
   MACROS = 0,
   TABLET_META_SCNS = 1,
   STUDY_RESULTS = 2,
+  LOB_META_KEPT = 3,
+  LOB_CTRL_CANDIDATE = 4,
+  LOB_CTRL_DIFF = 5,
   MAX
 };
 

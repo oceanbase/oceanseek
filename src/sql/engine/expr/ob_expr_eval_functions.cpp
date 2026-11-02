@@ -1523,6 +1523,8 @@ ObExprRandCanonical::calc_random_expr_canonical,                    /* 890 */
   NULL, // ObExprVecIVFBase::eval_vec_ivf_cid,                        /* 924 */
   NULL, // ObExprVecIVFBase::eval_vec_ivf_data,                       /* 925 */
   ObExprDslMultiValueRange::eval_dsl_multi_value_range,               /* 926 */
+  NULL, // ObExprExternalLob::eval_external_lob,                       /* 927 */
+  NULL, // ObExprLobMeta::eval_lob_meta,                               /* 928 */
 };
 
 static ObExpr::EvalBatchFunc g_expr_eval_batch_functions[] = {

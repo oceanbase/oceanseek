@@ -751,6 +751,7 @@ enum ObMemLobType
   PERSISTENT_LOB = 1,
   TEMP_FULL_LOB = 2,
   APPEND_DELTA_LOB = 3,  // FARM COMPAT WHITELIST
+  EXTERNAL_TEMP_LOB = 4, // Reserved for External LOB.
   MAX_LOB_TYPE
 };
 

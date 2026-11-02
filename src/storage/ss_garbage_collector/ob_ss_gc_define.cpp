@@ -105,7 +105,8 @@ bool ObSSGCTabletWithMetaScn::is_valid() const
 
 /****************************** ObSSGCTabletStudyResult ********************************/
 OB_SERIALIZE_MEMBER(ObSSGCTabletStudyResult, gc_tablet_, study_info_.min_dep_meta_scn_,
-                    study_info_.min_major_snapshot_);
+                    study_info_.min_major_snapshot_, study_info_.clog_checkpoint_scn_,
+                    study_info_.multi_version_start_);
 
 bool ObSSGCTabletStudyResult::is_valid() const
 {

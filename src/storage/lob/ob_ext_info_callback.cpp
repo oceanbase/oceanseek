@@ -70,7 +70,8 @@ OB_SERIALIZE_MEMBER(ObLobDataExtInfoLog,
                     lob_aux_table_id_,
                     lob_operation_seq_no_,
                     seq_id_,
-                    lob_data_);
+                    lob_data_,
+                    is_logging_);
 
 void ObLobDataExtInfoLog::reset()
 {
@@ -78,6 +79,7 @@ void ObLobDataExtInfoLog::reset()
   lob_operation_seq_no_.reset();
   seq_id_.reset();
   lob_data_.reset();
+  is_logging_ = true;
 }
 
 bool ObLobDataExtInfoLog::is_valid() const

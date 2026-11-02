@@ -1166,6 +1166,19 @@ STAT_EVENT_SET_DEF(MEM_MACRO_CACHE_EVICT_BLK_CNT, "ss_mem_macro_cache evict bloc
 STAT_EVENT_SET_DEF(MEM_MACRO_CACHE_EXPIRE_BLK_CNT, "ss_mem_macro_cache expire block count", ObStatClassIds::CACHE, 245083, false, true, true, "Number of memory blocks expired from the in-memory macro block cache in shared storage mode.")
 STAT_EVENT_SET_DEF(MEM_MACRO_CACHE_EXTRA_EVICT_BLK_CNT, "ss_mem_macro_cache extra evict block count", ObStatClassIds::CACHE, 245084, false, true, true, "Number of memory blocks additionally evicted from the in-memory macro block cache because tenant memory usage is too high in shared storage mode.")
 
+STAT_EVENT_SET_DEF(EXTERNAL_LOB_DISK_CACHE_HIT_CNT, "external lob cache hit count", ObStatClassIds::CACHE, 245085,
+    false, true, true,
+    "Number of external LOB macro block disk cache hits in shared storage mode.")
+STAT_EVENT_SET_DEF(EXTERNAL_LOB_DISK_CACHE_MISS_CNT, "external lob cache miss count", ObStatClassIds::CACHE, 245086,
+    false, true, true,
+    "Number of external LOB macro block disk cache misses in shared storage mode.")
+STAT_EVENT_SET_DEF(EXTERNAL_LOB_DISK_CACHE_HIT_BYTES, "external lob cache hit bytes", ObStatClassIds::CACHE, 245087,
+    false, true, true,
+    "Total size (in bytes) of external LOB macro block disk cache hits in shared storage mode.")
+STAT_EVENT_SET_DEF(EXTERNAL_LOB_DISK_CACHE_MISS_BYTES, "external lob cache miss bytes", ObStatClassIds::CACHE, 245088,
+    false, true, true,
+    "Total size (in bytes) of external LOB macro block disk cache misses in shared storage mode.")
+
 // END
 STAT_EVENT_SET_DEF(STAT_EVENT_SET_END, "event set end", ObStatClassIds::DEBUG, 300000, false, false, true, "")
 

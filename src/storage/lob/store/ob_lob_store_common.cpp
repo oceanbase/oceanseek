@@ -58,8 +58,6 @@ const char *ObLobChunkType::to_string() const
     str = "IN_TABLE";
   } else if (type_ == OUT_TABLE) {
     str = "OUT_TABLE";
-  } else if (type_ == OUT_LINK) {
-    str = "OUT_LINK";
   } else {
     str = "UNEXPECT_TYPE";
   }
@@ -88,8 +86,6 @@ int ObLobChunkType::from_string(const char *str)
     type_ = ObLobChunkType::IN_TABLE;
   } else if (STRCMP(str, "OUT_TABLE") == 0) {
     type_ = ObLobChunkType::OUT_TABLE;
-  } else if (STRCMP(str, "OUT_LINK") == 0) {
-    type_ = ObLobChunkType::OUT_LINK;
   } else {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected lob chunk type str", KR(ret), K(str));

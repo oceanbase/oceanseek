@@ -10507,6 +10507,10 @@ const char *ob_table_type_str(ObTableType type)
       type_ptr = "AUX LOB META";
       break;
     }
+  case AUX_OUTTABLE_LOB_CONTROL: {
+      type_ptr = "AUX OUTTABLE LOB CONTROL";
+      break;
+    }
   case EXTERNAL_TABLE: {
       type_ptr = "EXTERNAL TABLE";
       break;

@@ -40,6 +40,7 @@ const char *get_ss_macro_block_type_str(const ObSSMacroBlockType type)
       "PRIVATE_MACRO",
       "SHARED_MACRO",
       "EXTERNAL_TABLE",
+      "EXTERNAL_LOB",
       "MAX_TYPE"
   };
   static_assert(

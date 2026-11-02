@@ -2640,6 +2640,7 @@ protected:
   int64_t external_file_pattern_type_;
   // async index
   common::ObString async_index_params_;
+  int64_t lob_intable_threshold_; // Reserved for LOB InTable threshold.
 };
 
 class ObPrintableTableSchema final : public ObTableSchema

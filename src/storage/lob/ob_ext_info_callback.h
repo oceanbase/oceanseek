@@ -84,6 +84,7 @@ public:
   transaction::ObTxSEQ lob_operation_seq_no_;
   ObString seq_id_;
   ObString lob_data_;
+  bool is_logging_; // Reserved for LOB logging metadata.
 };
 
 class ObExtInfoCallback : public memtable::ObITransCallback

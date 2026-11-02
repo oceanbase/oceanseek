@@ -154,7 +154,7 @@ static int set_ss_macro_cache_block_stats(const int64_t tenant_id, common::ObDia
     COL_MISS_BYTES = 3,
     COLUMN_COUNT
   };
-  static uint32_t MACRO_CACHE_BLOCK_TYPE_TO_STAT_ID_MAP[SS_MACRO_BLOCK_MAX_TYPE_VAL][COLUMN_COUNT] = {
+  static uint32_t MACRO_CACHE_BLOCK_TYPE_TO_STAT_ID_MAP[][COLUMN_COUNT] = {
     {
       ObStatEventIds::MACRO_CACHE_PRIVATE_MACRO_HIT_CNT,
       ObStatEventIds::MACRO_CACHE_PRIVATE_MACRO_MISS_CNT,
@@ -172,6 +172,12 @@ static int set_ss_macro_cache_block_stats(const int64_t tenant_id, common::ObDia
       ObStatEventIds::EXTERNAL_TABLE_DISK_CACHE_MISS_CNT,
       ObStatEventIds::EXTERNAL_TABLE_DISK_CACHE_HIT_BYTES,
       ObStatEventIds::EXTERNAL_TABLE_DISK_CACHE_MISS_BYTES,
+    },
+    {
+      ObStatEventIds::EXTERNAL_LOB_DISK_CACHE_HIT_CNT,
+      ObStatEventIds::EXTERNAL_LOB_DISK_CACHE_MISS_CNT,
+      ObStatEventIds::EXTERNAL_LOB_DISK_CACHE_HIT_BYTES,
+      ObStatEventIds::EXTERNAL_LOB_DISK_CACHE_MISS_BYTES,
     },
   };
   static_assert(
