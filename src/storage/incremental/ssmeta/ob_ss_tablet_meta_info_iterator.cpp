@@ -317,65 +317,28 @@ static int64_t format_tablet_meta_summary_(const ObTablet &tablet,
   if (OB_ISNULL(buf) || cap <= 0) {
     // leave pos = 0
   } else {
-    const ObTabletMeta &m = tablet.get_tablet_meta();
-    if (OB_FAIL(databuff_printf(buf, cap, pos, "{"))) {
-      STORAGE_LOG(WARN, "databuff_printf open brace failed", KR(ret));
-    } else if (OB_FAIL(databuff_printf(buf, cap, pos,
-        "ls_id=%ld,tablet_id=%lu,data_tablet_id=%lu,is_empty_shell=%d,",
-        static_cast<int64_t>(tablet.get_ls_id().id()),
-        static_cast<uint64_t>(tablet.get_tablet_id().id()),
-        static_cast<uint64_t>(tablet.get_data_tablet_id().id()),
-        m.is_empty_shell_ ? 1 : 0))) {
-      STORAGE_LOG(WARN, "databuff_printf tablet idents failed", KR(ret));
-    } else if (OB_FAIL(databuff_printf(buf, cap, pos,
-        "snapshot_version=%ld,multi_version_start=%ld,",
-        m.snapshot_version_, m.multi_version_start_))) {
-      STORAGE_LOG(WARN, "databuff_printf snapshot versions failed", KR(ret));
-    } else if (OB_FAIL(databuff_printf(buf, cap, pos,
-        "clog_checkpoint_scn=%ld,ddl_checkpoint_scn=%ld,",
-        m.clog_checkpoint_scn_.get_val_for_inner_table_field(),
-        m.ddl_checkpoint_scn_.get_val_for_inner_table_field()))) {
-      STORAGE_LOG(WARN, "databuff_printf checkpoint scns failed", KR(ret));
-    } else if (OB_FAIL(databuff_printf(buf, cap, pos, "ha_status="))) {
-      STORAGE_LOG(WARN, "databuff_printf ha_status failed", KR(ret));
-    } else if (OB_SUCC(ret)) {
-      append_obj_to_string_(buf, cap, pos, m.ha_status_);
-    }
-    if (OB_SUCC(ret) && OB_FAIL(databuff_printf(buf, cap, pos, ",transfer_info="))) {
-      STORAGE_LOG(WARN, "databuff_printf transfer_info failed", KR(ret));
-    } else if (OB_SUCC(ret)) {
-      append_obj_to_string_(buf, cap, pos, m.transfer_info_);
-    }
-    if (OB_SUCC(ret) && OB_FAIL(databuff_printf(buf, cap, pos, ",ddl_replay_status=%d",
-        static_cast<int>(m.ddl_replay_status_)))) {
-      STORAGE_LOG(WARN, "databuff_printf ddl_replay_status failed", KR(ret));
-    }
-    if (OB_SUCC(ret) && OB_FAIL(databuff_printf(buf, cap, pos, ",table_store_flag="))) {
-      STORAGE_LOG(WARN, "databuff_printf table_store_flag failed", KR(ret));
-    } else if (OB_SUCC(ret)) {
-      append_obj_to_string_(buf, cap, pos, m.table_store_flag_);
-    }
-    if (OB_SUCC(ret) && OB_FAIL(databuff_printf(buf, cap, pos, ",space_usage="))) {
-      STORAGE_LOG(WARN, "databuff_printf space_usage failed", KR(ret));
-    } else if (OB_SUCC(ret)) {
-      append_obj_to_string_(buf, cap, pos, m.space_usage_);
-    }
-    if (OB_SUCC(ret) && OB_FAIL(databuff_printf(buf, cap, pos,
-        ",min_ss_tablet_scn=%ld,",
-        m.min_ss_tablet_scn_.get_val_for_inner_table_field()))) {
-      STORAGE_LOG(WARN, "databuff_printf min_ss_tablet_scn failed", KR(ret));
-    }
-    if (OB_SUCC(ret) && OB_FAIL(databuff_printf(buf, cap, pos,
-        "data_version=%lu,head_info=", data_version))) {
-      STORAGE_LOG(WARN, "databuff_printf data_version head_info failed", KR(ret));
-    } else if (OB_SUCC(ret)) {
-      append_obj_to_string_(buf, cap, pos, head_info);
-    }
-    if (OB_SUCC(ret) && OB_FAIL(databuff_printf(buf, cap, pos, ",is_mark_deleted=%d",
-        head_info.is_mark_deleted() ? 1 : 0))) {
-      STORAGE_LOG(WARN, "databuff_printf is_mark_deleted failed", KR(ret));
-    } else if (OB_SUCC(ret) && OB_FAIL(databuff_printf(buf, cap, pos, "}"))) {
-      STORAGE_LOG(WARN, "databuff_printf close brace failed", KR(ret));
+    const ObTabletMeta &meta = tablet.get_tablet_meta();
+    if (OB_FAIL(databuff_print_multi_objs(buf, cap, pos,
+        "{ls_id=", static_cast<int64_t>(tablet.get_ls_id().id()),
+        ",tablet_id=", static_cast<uint64_t>(tablet.get_tablet_id().id()),
+        ",data_tablet_id=", static_cast<uint64_t>(tablet.get_data_tablet_id().id()),
+        ",is_empty_shell=", meta.is_empty_shell_ ? 1 : 0,
+        ",snapshot_version=", meta.snapshot_version_,
+        ",multi_version_start=", meta.multi_version_start_,
+        ",clog_checkpoint_scn=", static_cast<int64_t>(meta.clog_checkpoint_scn_.get_val_for_inner_table_field()),
+        ",ddl_checkpoint_scn=", static_cast<int64_t>(meta.ddl_checkpoint_scn_.get_val_for_inner_table_field()),
+        ",mds_start_scn=", static_cast<int64_t>(meta.mds_start_scn_.get_val_for_inner_table_field()),
+        ",ha_status=", meta.ha_status_,
+        ",transfer_info=", meta.transfer_info_,
+        ",ddl_replay_status=", static_cast<int>(meta.ddl_replay_status_),
+        ",table_store_flag=", meta.table_store_flag_,
+        ",space_usage=", meta.space_usage_,
+        ",min_ss_tablet_scn=", static_cast<int64_t>(meta.min_ss_tablet_scn_.get_val_for_inner_table_field()),
+        ",data_version=", data_version,
+        ",head_info=", head_info,
+        ",is_mark_deleted=", head_info.is_mark_deleted() ? 1 : 0,
+        "}"))) {
+      STORAGE_LOG(WARN, "format tablet meta summary failed", KR(ret));
     }
     if (pos >= cap) {
       pos = cap - 1;

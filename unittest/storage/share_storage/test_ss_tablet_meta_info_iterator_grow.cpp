@@ -5,13 +5,17 @@
 
 #define USING_LOG_PREFIX STORAGE
 #include "gtest/gtest.h"
+#include <string>
 #define private public
 #define protected public
 
 #include "lib/ob_errno.h"
 #include "lib/allocator/page_arena.h"
 #include "share/ob_rpc_struct.h"
+#include "storage/incremental/share/ob_shared_tablet_extra_info.h"
+#include "storage/incremental/ssmeta/ob_ss_meta_define.h"
 #include "storage/incremental/ssmeta/ob_ss_tablet_meta_info_iterator.h"
+#include "storage/tablet/ob_tablet.h"
 
 namespace oceanbase
 {
@@ -21,8 +25,8 @@ using namespace oceanbase::common;
 
 // Scope: this unit test covers the private grow-buffer primitives of
 // ObSSTabletMetaInfoIterator (append_cstr_grow_ / append_obj_to_string_grow_ /
-// obj_to_string_grow_) and the FULL-mode row compose shape, plus the get_next
-// not-init contract. The full init() -> get_next() integration flow (real
+// obj_to_string_grow_), SIMPLE tablet-meta SCN output, the FULL-mode row compose
+// shape, and the get_next not-init contract. The full init() -> get_next() integration flow (real
 // __all_shared_meta read, OB_ITER_END on missing tablet, tiered sub-meta read)
 // needs an observer/MTL environment and is covered by the obtest cases
 // tools/obtest/basic/1003_c1_dump_ss_tablet_meta_info.* and 1005_*.
@@ -416,6 +420,34 @@ TEST_F(TestSSTabletMetaInfoIteratorGrow, get_next_not_init)
   ObSSTabletMetaInfoIterator iter;
   ObSSTabletMetaInfoRow row;
   ASSERT_EQ(OB_NOT_INIT, iter.get_next(row));
+}
+
+TEST_F(TestSSTabletMetaInfoIteratorGrow, simple_tablet_meta_contains_mds_start_scn)
+{
+  ObTablet tablet;
+  ObTabletMeta &meta = tablet.tablet_meta_;
+  // Distinct values above 32 bits detect a wrong SCN source or integer truncation.
+  ASSERT_EQ(OB_SUCCESS, meta.clog_checkpoint_scn_.convert_for_tx(1000000000001));
+  ASSERT_EQ(OB_SUCCESS, meta.ddl_checkpoint_scn_.convert_for_tx(1000000000002));
+  ASSERT_EQ(OB_SUCCESS, meta.mds_start_scn_.convert_for_tx(1000000000003));
+
+  ObSSTabletMetaInfoIterator iter;
+  iter.mode_ = obrpc::ObDumpSSTabletMetaInfoMode::SIMPLE;
+  iter.meta_value_buf_ = static_cast<char *>(iter.allocator_.alloc(ObSSTabletMetaInfoIterator::META_VALUE_BUF_LEN));
+  ASSERT_NE(nullptr, iter.meta_value_buf_);
+  ObSSMetaHeadValueInfo head_info;
+  ObSSUpdateTabletLog update_log;
+  ASSERT_EQ(OB_SUCCESS, iter.emit_tablet_meta_row_(tablet, head_info, 0 /*data_version*/, update_log));
+
+  ASSERT_EQ(1, iter.rows_.count());
+  const ObSSTabletMetaInfoRow &row = iter.rows_.at(0);
+  ASSERT_EQ(1, row.level_);
+  ASSERT_EQ(0, row.type_.case_compare("tablet meta"));
+  ASSERT_FALSE(row.meta_value_.empty());
+  const std::string summary(row.meta_value_.ptr(), row.meta_value_.length());
+  EXPECT_NE(std::string::npos, summary.find(",clog_checkpoint_scn=1000000000001,")) << summary;
+  EXPECT_NE(std::string::npos, summary.find(",ddl_checkpoint_scn=1000000000002,")) << summary;
+  EXPECT_NE(std::string::npos, summary.find(",mds_start_scn=1000000000003,")) << summary;
 }
 
 // ----------------------- combined weave (the real FULL-mode shape) -----------------------
