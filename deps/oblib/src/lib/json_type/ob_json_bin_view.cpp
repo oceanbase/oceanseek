@@ -836,7 +836,7 @@ bool ObJsonBinView::is_same_view(const ObJsonBinView &other) const
   bool is_same = false;
   if (json_type() != other.json_type() || length() != other.length()) {
   } else {
-    is_same = (data() != nullptr && data() == other.data());
+    is_same = (node_identity() != nullptr && node_identity() == other.node_identity());
   }
   return is_same;
 }

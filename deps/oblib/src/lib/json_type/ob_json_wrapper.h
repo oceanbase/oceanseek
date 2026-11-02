@@ -9,6 +9,7 @@
 #include "ob_json_bin_view.h"
 #include "ob_json_base.h"
 #include "ob_json_tree.h"
+#include "lib/hash/ob_hashset.h"
 
 namespace oceanbase {
 namespace common {
@@ -151,6 +152,21 @@ public:
   }
   OB_INLINE ObIJsonBase* get_dom() const { return is_bin_ ? nullptr : dom_; }
 
+  // Stable identity within one unchanged document and representation.
+  // Binary nodes use their document position; tree nodes use their object address.
+  OB_INLINE uint64_t node_identity() const
+  {
+    uint64_t identity = 0;
+    if (is_bin_) {
+      identity = reinterpret_cast<uint64_t>(bin_.node_identity());
+    } else if (dom_->is_bin()) {
+      identity = static_cast<const ObJsonBin *>(dom_)->node_identity();
+    } else {
+      identity = reinterpret_cast<uint64_t>(dom_);
+    }
+    return identity;
+  }
+
   // Required by ObSEArray/ObIArray for printing
   int64_t to_string(char *buf, const int64_t buf_len) const
   {
@@ -166,6 +182,51 @@ private:
     ObJsonBinView bin_;
     ObIJsonBase *dom_;
   };
+};
+
+// Resumable, strict JSON path traversal for JSON_SEARCH (no array auto-wrap).
+// The document and parsed path must outlive the iterator and remain unchanged.
+// next() lends its path buffer until the next call; it never collects future matches.
+// Callers may append a suffix, but must preserve the yielded path prefix.
+class ObJsonSeekIterator
+{
+public:
+  explicit ObJsonSeekIterator(ObIAllocator &allocator);
+  int init(const ObJsonWrapper &root, const ObJsonPath &path);
+  int next(ObJsonWrapper &node, ObJsonBuffer *&path);
+
+private:
+  enum Phase { INITIAL, CHILDREN, DONE };
+  struct Frame
+  {
+    Frame() : path_node_idx_(0), next_child_(0), end_child_(0), path_length_(0), phase_(INITIAL) {}
+    Frame(const ObJsonWrapper &node, int64_t path_node_idx, uint64_t path_length)
+        : node_(node), path_node_idx_(path_node_idx), next_child_(0), end_child_(0),
+          path_length_(path_length), phase_(INITIAL) {}
+    TO_STRING_KV(K_(node), K_(path_node_idx), K_(next_child), K_(end_child), K_(phase));
+    ObJsonWrapper node_;
+    int64_t path_node_idx_;
+    uint64_t next_child_;
+    uint64_t end_child_;
+    uint64_t path_length_;
+    Phase phase_;
+  };
+
+  int push_frame(const ObJsonWrapper &node, int64_t path_node_idx);
+  int enter_frame(Frame &frame);
+  int next_child(Frame &frame);
+
+  // Grow with the number of hits; ordinary wildcards/ranges need no set.
+  typedef hash::ObHashSet<uint64_t, hash::NoPthreadDefendMode,
+      hash::hash_func<uint64_t>, hash::equal_to<uint64_t>,
+      hash::SimpleAllocer<hash::HashSetTypes<uint64_t>::AllocType>,
+      hash::NormalPointer, ObMalloc, 2> SeenNodes;
+  const ObJsonPath *path_;
+  ObSEArray<Frame, 8> stack_;
+  ObJsonBuffer current_path_;
+  bool need_dedup_;
+  SeenNodes seen_;
+  DISALLOW_COPY_AND_ASSIGN(ObJsonSeekIterator);
 };
 
 // Total order over ObJsonWrapper for ob_sort / binary_search.

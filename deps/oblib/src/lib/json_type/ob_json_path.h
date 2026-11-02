@@ -491,6 +491,12 @@ public:
   static void skip_whitespace(const ObString& path, uint64_t& idx);
   static int append_array_index(uint64_t index, bool from_end, ObJsonBuffer& str);
   static int get_index_num(const ObString& expression, uint64_t& idx, uint64_t& array_idx);
+  // Append the complete "[index]" segment to path (brackets included), unlike
+  // append_array_index above which writes the bare index text only.
+  static int append_bracketed_index(ObJsonBuffer &path, uint64_t index);
+  // Append ".<key>" to path, double-quoting key when it is not a bare ECMAScript
+  // identifier, so keys with special chars (dots/spaces/quotes) produce unambiguous paths.
+  static int append_member_key(ObJsonBuffer &path, const ObString &key);
   static int string_cmp_skip_charactor(ObString& lhs, ObString& rhs, char ch);
   static char priority(char top, char in);
   static int pop_char_stack(ObCharArrayPointers& char_stack);

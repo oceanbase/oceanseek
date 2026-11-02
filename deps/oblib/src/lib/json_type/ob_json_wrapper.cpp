@@ -9,10 +9,220 @@
 #include "ob_json_path.h"
 #include "ob_json_base.h"
 #include "ob_json_compare.h"
-#include "ob_json_tree.h"
+#include "ob_json_tree.h"            // for ObJsonBaseFactory (DOM seek fallback)
 
 namespace oceanbase {
 namespace common {
+
+ObJsonSeekIterator::ObJsonSeekIterator(ObIAllocator &allocator)
+    : path_(NULL),
+      stack_(OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator(allocator)),
+      current_path_(&allocator, 256), need_dedup_(false)
+{
+}
+
+int ObJsonSeekIterator::init(const ObJsonWrapper &root, const ObJsonPath &path)
+{
+  int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(path_)) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("json seek iterator is initialized twice", K(ret));
+  } else if (!root.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("json seek iterator root is invalid", K(ret));
+  } else if (!root.is_bin() && root.get_dom()->is_bin()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("json seek iterator requires legacy binary to be converted to tree", K(ret));
+  } else {
+
+    path_ = &path;
+    need_dedup_ = ObJsonPathUtil::path_gives_duplicates(path.begin(), path.end(), false);
+    if (OB_FAIL(current_path_.append("$"))) {
+      LOG_WARN("append root path failed", K(ret));
+    } else if (OB_FAIL(push_frame(root, 0))) {
+      LOG_WARN("push root frame failed", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObJsonSeekIterator::push_frame(const ObJsonWrapper &node, int64_t path_node_idx)
+{
+  int ret = OB_SUCCESS;
+  // Copy before growing stack_: node may refer to a frame in that stack.
+  Frame frame(node, path_node_idx, current_path_.length());
+  if (OB_FAIL(stack_.push_back(frame))) {
+    LOG_WARN("push iterator frame failed", K(ret), K(path_node_idx));
+  }
+  return ret;
+}
+
+int ObJsonSeekIterator::enter_frame(Frame &frame)
+{
+  int ret = OB_SUCCESS;
+  const ObJsonPathNode *path_node = *(path_->begin() + frame.path_node_idx_);
+  const ObJsonPathNodeType type = path_node->get_node_type();
+  const ObJsonNodeType json_type = frame.node_.json_type();
+  const bool is_array = json_type == ObJsonNodeType::J_ARRAY
+      || json_type == ObJsonNodeType::J_SEMI_HETE_COL;
+  frame.phase_ = DONE;
+  switch (type) {
+    case JPN_MEMBER: {
+      if (json_type == ObJsonNodeType::J_OBJECT) {
+        const ObJsonPathBasicNode *member = static_cast<const ObJsonPathBasicNode *>(path_node);
+        ObString key(member->get_object().len_, member->get_object().object_name_);
+        ObJsonWrapper child;
+        if (OB_SEARCH_NOT_FOUND == (ret = frame.node_.lookup(key, child))) {
+          ret = OB_SUCCESS;
+        } else if (OB_FAIL(ret)) {
+          LOG_WARN("lookup member failed", K(ret));
+        } else if (OB_FAIL(ObJsonPathUtil::append_member_key(current_path_, key))) {
+          LOG_WARN("append member path failed", K(ret));
+        } else if (OB_FAIL(push_frame(child, frame.path_node_idx_ + 1))) {
+          LOG_WARN("push member frame failed", K(ret));
+        }
+      }
+      break;
+    }
+    case JPN_ARRAY_CELL: {
+      if (is_array) {
+        const ObJsonPathBasicNode *cell = static_cast<const ObJsonPathBasicNode *>(path_node);
+        ObJsonArrayIndex index;
+        if (OB_FAIL(cell->get_first_array_index(frame.node_.element_count(), index))) {
+          LOG_WARN("get array index failed", K(ret));
+        } else if (index.is_within_bounds()) {
+          ObJsonWrapper child;
+          if (OB_FAIL(frame.node_.element(index.get_array_index(), child))) {
+            LOG_WARN("get array cell failed", K(ret));
+          } else if (OB_FAIL(ObJsonPathUtil::append_bracketed_index(current_path_, index.get_array_index()))) {
+            LOG_WARN("append array index failed", K(ret));
+          } else if (OB_FAIL(push_frame(child, frame.path_node_idx_ + 1))) {
+            LOG_WARN("push array cell frame failed", K(ret));
+          }
+        }
+      }
+      break;
+    }
+    case JPN_MEMBER_WILDCARD: {
+      if (json_type == ObJsonNodeType::J_OBJECT) {
+        frame.phase_ = CHILDREN;
+        frame.end_child_ = frame.node_.element_count();
+      }
+      break;
+    }
+    case JPN_ARRAY_RANGE:
+    case JPN_ARRAY_CELL_WILDCARD: {
+      if (is_array) {
+        const ObJsonPathBasicNode *range_node = static_cast<const ObJsonPathBasicNode *>(path_node);
+        ObArrayRange range;
+        if (OB_FAIL(range_node->get_array_range(frame.node_.element_count(), range))) {
+          LOG_WARN("get array range failed", K(ret));
+        } else {
+          frame.phase_ = CHILDREN;
+          frame.next_child_ = range.array_begin_;
+          frame.end_child_ = min(range.array_end_, static_cast<uint64_t>(frame.node_.element_count()));
+        }
+      }
+      break;
+    }
+    case JPN_WILDCARD_ELLIPSIS: {
+      frame.phase_ = CHILDREN;
+      frame.end_child_ = (is_array || json_type == ObJsonNodeType::J_OBJECT)
+          ? frame.node_.element_count() : 0;
+      // Match zero levels first. On resumption, descend one child at a time
+      // with the same ** leg, preserving the recursive seek's DFS order.
+      if (OB_FAIL(push_frame(frame.node_, frame.path_node_idx_ + 1))) {
+        LOG_WARN("push ellipsis continuation failed", K(ret));
+      }
+      break;
+    }
+    default: {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("unsupported iterator path node", K(ret), K(type));
+      break;
+    }
+  }
+  return ret;
+}
+
+int ObJsonSeekIterator::next_child(Frame &frame)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t index = frame.next_child_++;
+  const bool ellipsis = (*(path_->begin() + frame.path_node_idx_))->get_node_type()
+      == JPN_WILDCARD_ELLIPSIS;
+  ObJsonWrapper child;
+  if (frame.node_.json_type() == ObJsonNodeType::J_OBJECT) {
+    ObString key;
+    if (OB_FAIL(frame.node_.get_key_value(index, key, child))) {
+      LOG_WARN("get object child failed", K(ret));
+    } else if (OB_FAIL(ObJsonPathUtil::append_member_key(current_path_, key))) {
+      LOG_WARN("append member path failed", K(ret));
+    }
+  } else {
+    if (OB_FAIL(frame.node_.element(index, child))) {
+      LOG_WARN("get array child failed", K(ret));
+    } else if (OB_FAIL(ObJsonPathUtil::append_bracketed_index(current_path_, index))) {
+      LOG_WARN("append array index failed", K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(push_frame(child, frame.path_node_idx_ + (ellipsis ? 0 : 1)))) {
+    LOG_WARN("push child frame failed", K(ret));
+  }
+  return ret;
+}
+
+int ObJsonSeekIterator::next(ObJsonWrapper &node, ObJsonBuffer *&path)
+{
+  int ret = OB_SUCCESS;
+  bool found = false;
+  if (OB_ISNULL(path_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("json seek iterator is not initialized", K(ret));
+  }
+  while (OB_SUCC(ret) && !found && !stack_.empty()) {
+    Frame &frame = stack_.at(stack_.count() - 1);
+    if (OB_FAIL(current_path_.set_length(frame.path_length_))) {
+      LOG_WARN("restore iterator path failed", K(ret));
+    } else if (frame.path_node_idx_ == path_->path_node_cnt()) {
+      bool duplicate = false;
+      if (need_dedup_) {
+        const uint64_t identity = frame.node_.node_identity();
+        if (!seen_.created() && OB_FAIL(seen_.create(32, "JsonSeek", "JsonSeek"))) {
+          LOG_WARN("create iterator dedup set failed", K(ret));
+        } else if (OB_HASH_EXIST == (ret = seen_.set_refactored(identity, 0))) {
+          ret = OB_SUCCESS;
+          duplicate = true;
+        } else if (OB_FAIL(ret)) {
+          LOG_WARN("remember iterator hit failed", K(ret));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        if (!duplicate) {
+          node = frame.node_;
+          path = &current_path_;
+          found = true;
+        }
+        // Keep the yielded path intact until next() is called again.
+        stack_.pop_back();
+      }
+    } else if (frame.phase_ == INITIAL) {
+      if (OB_FAIL(enter_frame(frame))) {
+        LOG_WARN("enter iterator frame failed", K(ret));
+      }
+    } else if (frame.phase_ == CHILDREN && frame.next_child_ < frame.end_child_) {
+      if (OB_FAIL(next_child(frame))) {
+        LOG_WARN("advance iterator child failed", K(ret));
+      }
+    } else {
+      stack_.pop_back();
+    }
+  }
+  if (OB_SUCC(ret) && !found) {
+    ret = OB_ITER_END;
+  }
+  return ret;
+}
 
 int ObJsonWrapper::seek(const ObJsonPath &path,
                         ObIAllocator &alloc,
@@ -21,7 +231,10 @@ int ObJsonWrapper::seek(const ObJsonPath &path,
                         bool only_need_one) const
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(0 == path.path_node_cnt())) {
+  if (OB_UNLIKELY(!is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("json wrapper is invalid", K(ret));
+  } else if (OB_UNLIKELY(0 == path.path_node_cnt())) {
     // Empty path ($): push self to preserve doc context for zero-copy get_raw_binary
     ret = hits.push_back(*this);
   } else if (is_bin_) {

@@ -243,6 +243,13 @@ sql_unittest(test_expr_like_op
   ob_op_test_data_source.cpp
 )
 
+# JSON_SEARCH expression tests (mysqltest-ported, eval-stage).
+sql_unittest(test_json_search_expr
+  test_json_search_expr.cpp
+  ob_op_test_engine.cpp
+  ob_op_test_data_source.cpp
+)
+
 # JSON expression tests — one cpp per JSON function (mysqltest-ported, eval-stage).
 sql_unittest(test_json_extract_expr
   test_json_extract_expr.cpp

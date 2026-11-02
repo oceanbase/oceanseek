@@ -8,6 +8,7 @@
 #include "share/ob_json_access_utils.h"
 #include "ob_expr_json_func_helper.h"
 #include "sql/engine/ob_exec_context.h"
+#include "lib/json_type/ob_json_wrapper.h"
 using namespace oceanbase::common;
 using namespace oceanbase::sql;
 
@@ -21,6 +22,79 @@ struct ObJsonBufferPathCmp {
   bool operator()(const ObJsonBuffer* a, const ObJsonBuffer* b) {
     return (a->string().compare(b->string()) < 0);
   }
+};
+
+// Keep wildcard patterns intact. Otherwise prepare the literal for direct comparison.
+static int prepare_search_pattern(ObIAllocator &allocator, int32_t escape_wc,
+                                 ObString &target, bool &need_wildcmp)
+{
+  int ret = OB_SUCCESS;
+  need_wildcmp = false;
+  const ObCharsetInfo *cs = ObCharset::get_charset(CS_TYPE_UTF8MB4_BIN);
+  const char *data = target.ptr();
+  const int64_t length = target.length();
+  int64_t first_escape = -1;
+  for (int64_t pos = 0; !need_wildcmp && pos < length;) {
+    // Match ob_wildcmp_mb_bin: check the escape byte before wildcard handling,
+    // then consume a complete character. A trailing escape is a literal itself.
+    if (data[pos] == escape_wc) {
+      if (pos + 1 < length) {
+        if (first_escape < 0) {
+          first_escape = pos;
+        }
+        ++pos;
+      }
+    } else if (data[pos] == '%' || data[pos] == '_') {
+      need_wildcmp = true;
+    }
+    pos += static_cast<unsigned char>(data[pos]) < 0x80
+        ? 1 : max(1U, ob_ismbchar(cs, data + pos, data + length));
+  }
+  if (!need_wildcmp && first_escape >= 0) {
+    char *literal = static_cast<char *>(allocator.alloc(length));
+    if (OB_ISNULL(literal)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("allocate literal search pattern failed", K(ret), K(length));
+    } else {
+      MEMCPY(literal, data, first_escape);
+      int64_t literal_length = first_escape;
+      for (int64_t pos = first_escape; pos < length;) {
+        if (data[pos] == escape_wc && pos + 1 < length) {
+          ++pos;
+        }
+        const int64_t char_length = static_cast<unsigned char>(data[pos]) < 0x80
+            ? 1 : max(1U, ob_ismbchar(cs, data + pos, data + length));
+        MEMCPY(literal + literal_length, data + pos, char_length);
+        literal_length += char_length;
+        pos += char_length;
+      }
+      target.assign_ptr(literal, literal_length);
+    }
+  }
+  return ret;
+}
+
+struct CacheSearchArgs
+{
+  CacheSearchArgs(int32_t escape_wc, const ObString &target, bool need_wildcmp, bool one_flag)
+      : escape_wc_(escape_wc), target_(target), need_wildcmp_(need_wildcmp), one_flag_(one_flag)
+  {}
+
+  const int32_t escape_wc_;
+  const ObString target_;
+  const bool need_wildcmp_;
+  const bool one_flag_;
+};
+
+class ObJsonSearchCtx : public ObExprOperatorCtx
+{
+public:
+  explicit ObJsonSearchCtx(ObIAllocator &allocator)
+      : search_args_(NULL), path_cache_(&allocator)
+  {}
+
+  CacheSearchArgs *search_args_;
+  ObJsonPathCache path_cache_;
 };
 
 // cmp for ObJsonBaseSortedVector
@@ -50,32 +124,15 @@ int ObExprJsonSearch::add_path_unique(const ObJsonBuffer* path,
   return ret;
 }
 
-int ObExprJsonSearch::ObExprJsonSearch::path_add_key(ObJsonBuffer &path, ObString key)
-{
-  INIT_SUCC(ret);
-  bool is_ecmas = ObJsonPathUtil::is_ecmascript_identifier(key.ptr(), key.length());
-
-  if (!is_ecmas) {
-    if (OB_FAIL(ObJsonPathUtil::double_quote(key, &path))) {
-      LOG_WARN("failed to add quote.", K(ret), K(key));
-    }
-  } else {
-    if (OB_FAIL(path.append(key))) {
-      LOG_WARN("failed to append key to path.", K(ret), K(key));
-    }
-  }
-
-  return ret;
-}
-
 int ObExprJsonSearch::find_matches(common::ObIAllocator *allocator,
-                                   const ObIJsonBase *j_base,
+                                   const ObJsonWrapper &wrapper,
                                    ObJsonBuffer &path,
                                    ObJsonBufferVector &hits,
                                    ObJsonBufferSortedVector &duplicates,
                                    const ObString &target,
                                    bool one_match,
-                                   const int32_t &escape_wc)
+                                   const int32_t &escape_wc,
+                                   bool need_wildcmp)
 {
   INIT_SUCC(ret);
 
@@ -85,13 +142,16 @@ int ObExprJsonSearch::find_matches(common::ObIAllocator *allocator,
   } else if (one_match && hits.size() > 0) {
     // do nothing
   } else {
-    switch (j_base->json_type()) {
+    switch (wrapper.json_type()) {
       case ObJsonNodeType::J_STRING: {
-        const char *data = j_base->get_data();
-        uint64_t length = j_base->get_data_length();
-        ObString curr_str(length, data);
-        bool b = ObCharset::wildcmp(CS_TYPE_UTF8MB4_BIN, curr_str, target, escape_wc,
-                                    static_cast<int32_t>('_'), static_cast<int32_t>('%'));
+        ObString curr_str = wrapper.get_string();
+        bool b = false;
+        if (need_wildcmp) {
+          b = ObCharset::wildcmp(CS_TYPE_UTF8MB4_BIN, curr_str, target, escape_wc,
+                                static_cast<int32_t>('_'), static_cast<int32_t>('%'));
+        } else {
+          b = curr_str == target;
+        }
         if (b) {
           void *buf = allocator->alloc(sizeof(ObJsonBuffer));
           if (OB_ISNULL(buf)){
@@ -111,29 +171,21 @@ int ObExprJsonSearch::find_matches(common::ObIAllocator *allocator,
 
       case ObJsonNodeType::J_OBJECT: {
         uint64_t pos = path.length();
-        uint64_t count = j_base->element_count();
+        uint64_t count = wrapper.element_count();
         bool is_finish = false;
         for (uint64_t i = 0; OB_SUCC(ret) && i < count && !is_finish; i++) {
           if (one_match && hits.size() > 0) {
             is_finish = true;
           } else {
-            ObIJsonBase *child = NULL;
-            ret = j_base->get_object_value(i, child);
-            if (OB_ISNULL(child)) {
-              ret = OB_ERR_NULL_VALUE;
-              LOG_WARN("fail to get child_dom",K(ret), K(i));
-            } else {
-              ObString key;
-              if (OB_FAIL(j_base->get_key(i, key))) {
-                LOG_WARN("fail to get key by index.",K(ret), K(i));
-              } else if (OB_FAIL(path.append("."))) {
-                LOG_WARN("fail to append key to path",K(ret), K(i));
-              } else if (OB_FAIL(path_add_key(path, key))) {
-                LOG_WARN("fail to append key to path",K(ret), K(i));
-              } else if (OB_FAIL(find_matches(allocator, child, path, hits, duplicates,
-                  target, one_match, escape_wc))) {
-                LOG_WARN("fail to seek recursively",K(ret), K(i));
-              }
+            ObString key;
+            ObJsonWrapper child;
+            if (OB_FAIL(wrapper.get_key_value(i, key, child))) {
+              LOG_WARN("fail to get key_value", K(ret), K(i));
+            } else if (OB_FAIL(ObJsonPathUtil::append_member_key(path, key))) {
+              LOG_WARN("fail to append key to path",K(ret), K(i));
+            } else if (OB_FAIL(find_matches(allocator, child, path, hits, duplicates,
+                                            target, one_match, escape_wc, need_wildcmp))) {
+              LOG_WARN("fail to seek recursively",K(ret), K(i));
             }
             if (OB_SUCC(ret) && OB_FAIL(path.set_length(pos))) { // reset path pos
               LOG_WARN("failed to reset path length.", K(ret), K(path.capacity()), K(pos));
@@ -145,29 +197,20 @@ int ObExprJsonSearch::find_matches(common::ObIAllocator *allocator,
 
       case ObJsonNodeType::J_ARRAY: {
         uint64_t pos = path.length();
-        uint64_t size = j_base->element_count();
+        uint64_t size = wrapper.element_count();
         bool is_finish = false;
         for (uint64_t i = 0; OB_SUCC(ret) && i < size && !is_finish; i++) {
           if (one_match && hits.size() > 0) {
             is_finish = true;
           } else {
-            ObIJsonBase *child = NULL;
-            ret = j_base->get_array_element(i, child);
-            if (OB_ISNULL(child)) {
-              ret = OB_ERR_NULL_VALUE;
-              LOG_WARN("fail to get child_dom",K(ret), K(i));
-            } else {
-              uint64_t reserve_len = i == 0 ? 3 : static_cast<uint64_t>(std::log10(i)) + 3;
-              char temp_buf[reserve_len + 1];
-              int64_t count = lnprintf(temp_buf, reserve_len + 1, "[%lu]", i);
-              if (count < 0) {
-                LOG_WARN("fail to snprintf", K(i), K(count));
-              } else if (OB_FAIL(path.append(temp_buf, count))) {
-                LOG_WARN("fail to append key to path",K(ret), K(i));
-              } else if (OB_FAIL(find_matches(allocator, child, path, hits, duplicates,
-                  target, one_match, escape_wc))) {
-                LOG_WARN("fail to seek recursively",K(ret), K(i));
-              }
+            ObJsonWrapper child;
+            if (OB_FAIL(wrapper.element(i, child))) {
+              LOG_WARN("fail to get element", K(ret), K(i));
+            } else if (OB_FAIL(ObJsonPathUtil::append_bracketed_index(path, i))) {
+              LOG_WARN("fail to append array index to path", K(ret), K(i));
+            } else if (OB_FAIL(find_matches(allocator, child, path, hits, duplicates,
+                target, one_match, escape_wc, need_wildcmp))) {
+              LOG_WARN("fail to seek recursively",K(ret), K(i));
             }
             if (OB_SUCC(ret) && OB_FAIL(path.set_length(pos))) { // reset path pos
               LOG_WARN("failed to reset path length.", K(ret), K(path.capacity()), K(pos));
@@ -237,23 +280,53 @@ int ObExprJsonSearch::eval_json_search(const ObExpr &expr, ObEvalCtx &ctx, ObDat
   ObDatum *json_datum = NULL;
   ObExpr *json_arg = expr.args_[0];
   ObObjType val_type = json_arg->datum_meta_.type_;
-  ObIJsonBase *j_base = NULL;
+  ObJsonWrapper wrapper;
   bool is_null = false;
 
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
-  uint64_t tenant_id = ObMultiModeExprHelper::get_tenant_id(ctx.exec_ctx_.get_my_session());
-  MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator(), expr.type_, tenant_id, ret);
+  MultimodeAlloctor temp_allocator(tmp_alloc_g.get_allocator(), expr.type_, ret, ctx, "json_search");
   if (expr.datum_meta_.cs_type_ != CS_TYPE_UTF8MB4_BIN) {
     ret = OB_ERR_INVALID_JSON_CHARSET;
     LOG_WARN("invalid out put charset", K(ret), K(expr.datum_meta_.cs_type_));
-  } else if (OB_FAIL(ObJsonExprHelper::get_json_doc(expr, ctx, temp_allocator, 0,
-      j_base, is_null, false))) {
-    LOG_WARN("failed to get json doc.", K(ret));
+  } else if (OB_FAIL(ObJsonExprHelper::get_json_doc_wrapper(expr, ctx, temp_allocator,
+                                                            0, wrapper, is_null, false, false))) {
+    LOG_WARN("failed to get json doc wrapper.", K(ret));
+  }
+
+  // Only static constants are stable across rescans; dynamic parameters may change.
+  bool can_cache_search_args = expr.args_[1]->is_static_const_expr()
+      && expr.args_[2]->is_static_const_expr()
+      && (expr.arg_cnt_ < 4 || expr.args_[3]->is_static_const_expr());
+  const CacheSearchArgs *search_args = NULL;
+  bool one_flag = false;
+  int32_t escape_wc = static_cast<int32_t>('\\');
+  ObString target;
+  bool need_wildcmp = true;
+  ObJsonSearchCtx *search_ctx = NULL;
+  if (OB_SUCC(ret) && !is_null && expr.expr_ctx_id_ != ObExpr::INVALID_EXP_CTX_ID) {
+    search_ctx = static_cast<ObJsonSearchCtx *>(ctx.exec_ctx_.get_expr_op_ctx(expr.expr_ctx_id_));
+    if (can_cache_search_args || expr.arg_cnt_ > 4) {
+      if (OB_ISNULL(search_ctx)) {
+        void *buf = NULL;
+        if (OB_FAIL(ctx.exec_ctx_.create_expr_op_ctx(expr.expr_ctx_id_, sizeof(ObJsonSearchCtx), buf))) {
+          LOG_WARN("create json search context failed", K(ret));
+        } else {
+          search_ctx = new (buf) ObJsonSearchCtx(ctx.exec_ctx_.get_allocator());
+        }
+      } else {
+        search_args = search_ctx->search_args_;
+        if (OB_NOT_NULL(search_args)) {
+          one_flag = search_args != NULL ? search_args->one_flag_ : false;
+          escape_wc = search_args != NULL ? search_args->escape_wc_ : static_cast<int32_t>('\\');
+          target = search_args != NULL ? search_args->target_ : ObString();
+          need_wildcmp = search_args != NULL ? search_args->need_wildcmp_ : true;
+        }
+      }
+    }
   }
 
   // check one_or_all flag
-  bool one_flag = false;
-  if (OB_SUCC(ret) && !is_null) {
+  if (OB_SUCC(ret) && !is_null && OB_ISNULL(search_args)) {
     json_arg = expr.args_[1];
     val_type = json_arg->datum_meta_.type_;
     if (OB_FAIL(temp_allocator.eval_arg(json_arg, ctx, json_datum))) {
@@ -286,14 +359,13 @@ int ObExprJsonSearch::eval_json_search(const ObExpr &expr, ObEvalCtx &ctx, ObDat
   }
 
   // check escape if exist
-  int32_t escape_wc = static_cast<int32_t>('\\'); // use \ for default escape
-  if (OB_SUCC(ret) && expr.arg_cnt_ >= 4 && !is_null) {
+  if (OB_SUCC(ret) && expr.arg_cnt_ >= 4 && !is_null && OB_ISNULL(search_args)) {
     json_arg = expr.args_[3];
     val_type = json_arg->datum_meta_.type_;
     if (OB_FAIL(temp_allocator.eval_arg(json_arg, ctx, json_datum))) {
       LOG_WARN("eval json arg failed", K(ret));
     } else if (val_type == ObNullType || json_datum->is_null()) {
-      // do nothing, null type use default escape
+      // NULL uses the default escape.
     } else if (!ob_is_string_type(val_type)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("input type error", K(val_type));
@@ -325,8 +397,7 @@ int ObExprJsonSearch::eval_json_search(const ObExpr &expr, ObEvalCtx &ctx, ObDat
   }
 
   // get target string
-  ObString target;
-  if (OB_SUCC(ret) && !is_null) {
+  if (OB_SUCC(ret) && !is_null && OB_ISNULL(search_args)) {
     json_arg = expr.args_[2];
     val_type = json_arg->datum_meta_.type_;
     if (OB_FAIL(temp_allocator.eval_arg(json_arg, ctx, json_datum))) {
@@ -348,24 +419,52 @@ int ObExprJsonSearch::eval_json_search(const ObExpr &expr, ObEvalCtx &ctx, ObDat
     }
   }
 
-  ObJsonBuffer path_str(&temp_allocator);
+  if (OB_SUCC(ret) && !is_null && OB_ISNULL(search_args) && can_cache_search_args) {
+    if (OB_FAIL(prepare_search_pattern(temp_allocator, escape_wc, target, need_wildcmp))) {
+      LOG_WARN("prepare search pattern failed", K(ret));
+    } else if (OB_NOT_NULL(search_ctx)) {
+      ObIAllocator &allocator = ctx.exec_ctx_.get_allocator();
+      void *buf = allocator.alloc(sizeof(CacheSearchArgs));
+      ObString cached_target;
+      if (OB_ISNULL(buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("allocate cached search arguments failed", K(ret));
+      } else if (OB_FAIL(ob_write_string(allocator, target, cached_target))) {
+        LOG_WARN("copy constant search target failed", K(ret));
+      } else {
+        // Publish only after every argument is ready and target has execution-owned storage.
+        search_ctx->search_args_ = new (buf) CacheSearchArgs(escape_wc, cached_target, need_wildcmp, one_flag);
+      }
+    }
+  }
+
+  // Materialize the legacy binary once so every search path shares the same DOM.
+  if (OB_SUCC(ret) && !is_null && !wrapper.is_bin() && wrapper.get_dom()->is_bin()) {
+    ObIJsonBase *json_tree = NULL;
+    if (OB_FAIL(ObJsonBaseFactory::transform(&temp_allocator, wrapper.get_dom(),
+                                            ObJsonInType::JSON_TREE, json_tree))) {
+      LOG_WARN("convert legacy binary to tree failed", K(ret));
+    } else {
+      wrapper = ObJsonWrapper(json_tree);
+    }
+  }
+
+  ObJsonBuffer path_str(&temp_allocator, 128);
   ObJsonBufferVector hits;
   ObJsonBufferSortedVector duplicates;
   if (OB_SUCC(ret) && !is_null) {
     if (expr.arg_cnt_ < 5) {
       if (OB_FAIL(path_str.append("$"))) {
         LOG_WARN("faild to append '$' to path str.", K(ret));
-      } else if (OB_FAIL(find_matches(&temp_allocator, j_base, path_str, hits, duplicates,
-          target, one_flag, escape_wc))) {
+      } else if (OB_FAIL(find_matches(&temp_allocator, wrapper, path_str, hits, duplicates,
+          target, one_flag, escape_wc, need_wildcmp))) {
         LOG_WARN("failed to find matches for path.", K(ret), K(one_flag), K(escape_wc));
       }
     } else {
       // read all JsonPath from arg
       ObVector<ObJsonPath*> json_paths;
       ObJsonPathCache ctx_cache(&temp_allocator);
-      ObJsonPathCache *path_cache = ObJsonExprHelper::get_path_cache_ctx(expr.expr_ctx_id_,
-          &ctx.exec_ctx_);
-      path_cache = ((path_cache != NULL) ? path_cache : &ctx_cache);
+      ObJsonPathCache *path_cache = search_ctx != NULL ? &search_ctx->path_cache_ : &ctx_cache;
 
       for (uint64_t i = 4; OB_SUCC(ret) && !is_null && i < expr.arg_cnt_; i++) {        
         json_arg = expr.args_[i];
@@ -380,7 +479,7 @@ int ObExprJsonSearch::eval_json_search(const ObExpr &expr, ObEvalCtx &ctx, ObDat
           LOG_WARN("input type error", K(val_type));
         } else {
           ObString j_path_text = json_datum->get_string();
-          ObJsonPath *j_path;
+          ObJsonPath *j_path = NULL;
           if (OB_FAIL(ObJsonExprHelper::get_json_or_str_data(json_arg, ctx, temp_allocator, j_path_text, is_null))) {
             LOG_WARN("fail to get real data.", K(ret), K(j_path_text));
           } else if (j_path_text.length() == 0) {
@@ -404,44 +503,35 @@ int ObExprJsonSearch::eval_json_search(const ObExpr &expr, ObEvalCtx &ctx, ObDat
       bool is_finish = false;
       for (uint64_t i = 4; OB_SUCC(ret) && !is_null && i < expr.arg_cnt_ && !is_finish; i++) {
         ObJsonPath *j_path = json_paths[i - 4];
-        ObJsonSeekResult hit;
+        const bool can_match_many = j_path->can_match_many();
         if (one_flag && hits.size() > 0) {
           is_finish = true;
-        } else if (j_path->can_match_many()) {
-          ObIJsonBase *j_temp = NULL;
-          if (OB_FAIL(ObJsonBaseFactory::transform(&temp_allocator, j_base, ObJsonInType::JSON_TREE,
-              j_temp))) {
-            LOG_WARN("failed to transform to tree", K(ret), K(*j_base));
-          } else {
-            j_base = j_temp;
+        }
+        if (OB_SUCC(ret) && !is_finish) {
+          ObJsonSeekIterator iter(temp_allocator);
+          if (OB_FAIL(iter.init(wrapper, *j_path))) {
+            LOG_WARN("initialize path iterator failed", K(ret), K(i));
           }
-        } 
-        
-        if (OB_SUCC(ret)) {
-          if (OB_FAIL(j_base->seek(*j_path, j_path->path_node_cnt(), false, false, hit))) {
-            LOG_WARN("failed to seek path", K(ret), K(i));
-          } else {
-            bool is_finish_inner = false;
-            for (uint64_t j = 0; OB_SUCC(ret) && !is_null && j < hit.size()
-                && !is_finish_inner; j++) {
-              if (one_flag && hits.size() > 0) {
-                is_finish_inner = true;
-              } else {
-                path_str.reuse();
-                if (j_path->can_match_many()) {
-                  if (OB_FAIL(hit[j]->get_location(path_str))) {
-                    LOG_WARN("falied to get loaction.", K(ret));
-                  }
-                } else if (OB_FAIL(j_path->to_string(path_str))) {
-                  LOG_WARN("falied to get string for path.", K(ret));
-                }
-
-                if (OB_SUCC(ret)) {
-                  if (OB_FAIL(find_matches(&temp_allocator, hit[j], path_str, hits, duplicates,
-                      target, one_flag, escape_wc))) {
-                    LOG_WARN("failed to find matches.", K(ret), K(j), K(one_flag), K(escape_wc));
-                  }
-                }
+          while (OB_SUCC(ret) && !(one_flag && hits.size() > 0)) {
+            ObJsonWrapper candidate;
+            ObJsonBuffer *candidate_path = NULL;
+            path_str.reuse();
+            if (OB_ITER_END == (ret = iter.next(candidate, candidate_path))) {
+              ret = OB_SUCCESS;
+              break;
+            } else if (OB_FAIL(ret)) {
+              LOG_WARN("get next path candidate failed", K(ret), K(i));
+            } else if (can_match_many) {
+              if (OB_FAIL(find_matches(&temp_allocator, candidate, *candidate_path,
+                                       hits, duplicates, target, one_flag, escape_wc, need_wildcmp))) {
+                LOG_WARN("failed to find matches", K(ret), K(i), K(one_flag), K(escape_wc));
+              }
+            } else {
+              if (OB_FAIL(j_path->to_string(path_str))) {
+                LOG_WARN("serialize search path failed", K(ret));
+              } else if (OB_FAIL(find_matches(&temp_allocator, candidate, path_str,
+                                              hits, duplicates, target, one_flag, escape_wc, need_wildcmp))) {
+                LOG_WARN("failed to find matches", K(ret), K(i), K(one_flag), K(escape_wc));
               }
             }
           }

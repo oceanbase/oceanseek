@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "ob_json_path.h"
 #include "ob_json_parse.h"
+#include "lib/utility/ob_fast_convert.h"
 
 namespace oceanbase {
 namespace common {
@@ -1203,6 +1204,50 @@ int ObJsonPathUtil::append_array_index(uint64_t index, bool from_end, ObJsonBuff
     }// from_end && index==0
   }
 
+  return ret;
+}
+
+int ObJsonPathUtil::append_bracketed_index(ObJsonBuffer &path, uint64_t index)
+{
+  int ret = OB_SUCCESS;
+  // uint64_t max is 20 digits; "[", "]" => 22 bytes total. Build the whole
+  // "[index]" into one stack buffer and append once, instead of 3 separate
+  // append() calls that each re-check reserve()/MEMCPY.
+  // format_unsigned writes the digits plus a trailing '\0' and returns the digit
+  // count (excluding '\0'), matching the original lltostr memory layout.
+  char buf[24];
+  buf[0] = '[';
+  int64_t len = ObFastFormatInt::format_unsigned(index, buf + 1);
+  char *end = buf + 1 + len;
+  *end++ = ']';
+  if (OB_FAIL(path.append(buf, static_cast<int32_t>(end - buf)))) {
+    LOG_WARN("append array index failed", K(ret), K(index));
+  }
+  return ret;
+}
+
+int ObJsonPathUtil::append_member_key(ObJsonBuffer &path, const ObString &key)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(path.append("."))) {
+    LOG_WARN("append . failed", K(ret));
+  } else if (key.length() == 0) {
+    if (OB_FAIL(path.append("\"\""))) {
+      LOG_WARN("append empty member name failed", K(ret));
+    }
+  } else if (ObJsonPathUtil::is_ecmascript_identifier(key.ptr(), key.length())) {
+    if (OB_FAIL(path.append(key))) {
+      LOG_WARN("append key failed", K(ret));
+    }
+  } else {
+    // Non-identifier key: double-quote so special chars (dots/spaces/quotes) stay unambiguous.
+    // double_quote takes a non-const reference (pre-existing signature); ObString is a
+    // shallow ptr+len pair, so the local copy is free.
+    ObString key_copy = key;
+    if (OB_FAIL(ObJsonPathUtil::double_quote(key_copy, &path))) {
+      LOG_WARN("double_quote key failed", K(ret), K(key));
+    }
+  }
   return ret;
 }
 

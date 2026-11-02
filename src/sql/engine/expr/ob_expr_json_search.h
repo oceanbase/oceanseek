@@ -14,6 +14,10 @@ using namespace oceanbase::common;
 
 namespace oceanbase
 {
+namespace common
+{
+class ObJsonWrapper;
+} // common
 namespace sql
 {
 
@@ -36,15 +40,15 @@ public:
   virtual bool need_rt_ctx() const override { return true; }
 private:
   static int add_path_unique(const ObJsonBuffer* path, ObJsonBufferSortedVector &duplicates, ObJsonBufferVector &hits);
-  static int path_add_key(ObJsonBuffer &path, ObString key);
   static int find_matches(common::ObIAllocator *allocator,
-                          const ObIJsonBase *j_base,
+                          const common::ObJsonWrapper &wrapper,
                           ObJsonBuffer &path,
                           ObJsonBufferVector &hits,
                           ObJsonBufferSortedVector &duplicates,
                           const ObString &target,
                           bool one_match,
-                          const int32_t &escape_wc);
+                          const int32_t &escape_wc,
+                          bool need_wildcmp);
   DISALLOW_COPY_AND_ASSIGN(ObExprJsonSearch);
 };
 

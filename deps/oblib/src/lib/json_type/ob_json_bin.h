@@ -884,6 +884,8 @@ public:
   void set_is_schema(bool is_schema) {is_schema_ = is_schema;}
   OB_INLINE uint32_t depth() const override;
   virtual int reset();
+  // Stable position within the backing document; inline scalars use their value entry offset.
+  OB_INLINE int64_t node_identity() const { return pos_; }
   OB_INLINE const ObILobCursor* get_cursor() const { return cursor_; }
   OB_INLINE ObILobCursor* get_cursor() { return cursor_; }
   OB_INLINE void set_cursor(ObILobCursor *cursor) { cursor_ = cursor; }

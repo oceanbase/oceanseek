@@ -181,6 +181,9 @@ public:
   // Object: get key and value at given index in one call
   int get_key_value(uint64_t index, ObString &key, ObJsonBinView &value) const;
 
+  // Stable node identity within the backing document, including inline scalars.
+  OB_INLINE const void *node_identity() const { return data_; }
+
 private:
   OB_INLINE bool is_inline() const
   {
@@ -188,10 +191,6 @@ private:
   }
 
   OB_INLINE uint32_t length() const { return length_; }
-
-  // Get the binary location identifying this node. For non-inline scalar nodes this is the
-  // payload start; for inline scalar nodes this is the containing value entry address.
-  OB_INLINE const char *data() const { return data_; }
 
   // Parse node at given offset within the buffer.
   // Container offset points to the type byte; scalar/string/opaque offsets point to the payload after it.
