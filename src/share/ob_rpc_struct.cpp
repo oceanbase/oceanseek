@@ -2046,6 +2046,7 @@ int ObForkTableArg::assign(const ObForkTableArg &other)
     dst_table_name_ = other.dst_table_name_;
     session_id_ = other.session_id_;
     need_lock_src_table_ = other.need_lock_src_table_;
+    copy_grants_ = other.copy_grants_;
   }
   return ret;
 }
@@ -2069,7 +2070,8 @@ DEF_TO_STRING(ObForkTableArg)
        K_(dst_database_name),
        K_(dst_table_name),
        K_(session_id),
-       K_(need_lock_src_table));
+       K_(need_lock_src_table),
+       K_(copy_grants));
   J_OBJ_END();
   return pos;
 }
@@ -2081,7 +2083,8 @@ OB_SERIALIZE_MEMBER((ObForkTableArg, ObDDLArg),
                     dst_database_name_,
                     dst_table_name_,
                     session_id_,
-                    need_lock_src_table_);
+                    need_lock_src_table_,
+                    copy_grants_);
 
 int ObForkDatabaseArg::assign(const ObForkDatabaseArg &other)
 {
@@ -2093,6 +2096,7 @@ int ObForkDatabaseArg::assign(const ObForkDatabaseArg &other)
     src_database_name_ = other.src_database_name_;
     dst_database_name_ = other.dst_database_name_;
     session_id_ = other.session_id_;
+    copy_grants_ = other.copy_grants_;
   }
   return ret;
 }
@@ -2111,7 +2115,8 @@ DEF_TO_STRING(ObForkDatabaseArg)
   J_KV(K_(tenant_id),
        K_(src_database_name),
        K_(dst_database_name),
-       K_(session_id));
+       K_(session_id),
+       K_(copy_grants));
   J_OBJ_END();
   return pos;
 }
@@ -2120,7 +2125,8 @@ OB_SERIALIZE_MEMBER((ObForkDatabaseArg, ObDDLArg),
                     tenant_id_,
                     src_database_name_,
                     dst_database_name_,
-                    session_id_);
+                    session_id_,
+                    copy_grants_);
 
 int ObSetCommentArg::assign(const ObSetCommentArg &other)
 {

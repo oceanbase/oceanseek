@@ -8,6 +8,7 @@
 #include "sql/resolver/ob_resolver_utils.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "share/ob_rpc_struct.h"
+#include "share/ob_cluster_version.h"
 #include "sql/parser/parse_node.h"
 #include "sql/ob_sql_utils.h"
 
@@ -89,6 +90,7 @@ int ObForkTableResolver::resolve(const ParseNode &parse_tree)
     ParseNode *dst_table_node = parse_tree.children_[DST_TABLE_NODE];
     ParseNode *src_table_node = parse_tree.children_[SRC_TABLE_NODE];
     ParseNode *read_lock_node = parse_tree.children_[READ_LOCK_NODE];
+    ParseNode *copy_grants_node = parse_tree.children_[COPY_GRANTS_NODE];
     ObString dst_database_name;
     ObString dst_table_name;
     ObString src_database_name;
@@ -128,6 +130,7 @@ int ObForkTableResolver::resolve(const ParseNode &parse_tree)
         SQL_RESV_LOG(WARN, "failed to deep copy src table name", K(ret));
       } else {
         fork_table_arg.need_lock_src_table_ = OB_NOT_NULL(read_lock_node);
+        fork_table_arg.copy_grants_ = OB_NOT_NULL(copy_grants_node);
       }
     }
   }
@@ -177,6 +180,7 @@ int ObForkDatabaseResolver::resolve(const ParseNode &parse_tree)
     obrpc::ObForkDatabaseArg &fork_database_arg = fork_database_stmt->get_fork_database_arg();
     ParseNode *dst_database_node = parse_tree.children_[DST_DATABASE_NODE];
     ParseNode *src_database_node = parse_tree.children_[SRC_DATABASE_NODE];
+    ParseNode *copy_grants_node = parse_tree.children_[COPY_GRANTS_NODE];
     ObString dst_database_name;
     ObString src_database_name;
 
@@ -219,6 +223,8 @@ int ObForkDatabaseResolver::resolve(const ParseNode &parse_tree)
             SQL_RESV_LOG(WARN, "failed to deep copy dst database name", K(ret));
           } else if (OB_FAIL(deep_copy_str(src_database_name, fork_database_arg.src_database_name_))) {
             SQL_RESV_LOG(WARN, "failed to deep copy src database name", K(ret));
+          } else {
+            fork_database_arg.copy_grants_ = OB_NOT_NULL(copy_grants_node);
           }
         }
       }

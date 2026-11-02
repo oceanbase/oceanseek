@@ -9,6 +9,7 @@
 #include "common/ob_tablet_id.h"
 #include "lib/container/ob_iarray.h"
 #include "lib/hash/ob_hashmap.h"
+#include "lib/hash/ob_hashset.h"
 #include "share/ob_ddl_common.h"
 #include "share/ob_ls_id.h"
 #include "share/ob_rpc_struct.h"
@@ -68,6 +69,72 @@ public:
       common::ObMySQLTransaction &trans,
       common::hash::ObHashMap<share::ObLSID, obrpc::ObBatchSetTabletAutoincSeqArg> &autoinc_seq_args);
 
+};
+
+// Fork 权限复制的名称处理：库级 ACL 需要模式转义，表级 ACL 的库名、表名仍按字面量处理。
+class ObForkPrivilegeUtils
+{
+public:
+  // get_sort() 对非空、非通配库级 ACL 返回的分类值。
+  static const uint64_t NON_WILDCARD_PATTERN_SORT = 128;
+
+  static int encode_database_pattern(const common::ObString &name, common::ObSqlString &pattern);
+  // 输入为租户 ACL 列表（同一用户的记录连续）；检查重复及目标大小写歧义，不推导或合并权限。
+  static int check_database_privileges(
+      const common::ObIArray<const share::schema::ObDBPriv *> &privileges,
+      const common::ObNameCaseMode name_case_mode,
+      const common::ObString &src_database_name, const common::ObString &dst_database_name);
+  static int check_table_privileges(
+      const common::ObIArray<const share::schema::ObTablePriv *> &privileges,
+      const common::ObNameCaseMode name_case_mode,
+      const common::ObString &src_database_name, const common::ObString &src_table_name,
+      const common::ObString &dst_database_name, const common::ObString &dst_table_name);
+};
+
+// Fork 在指定 copy grants 的场景，会复制源对象的显式权限
+class ObForkPrivilegeCopier final
+{
+public:
+  ObForkPrivilegeCopier(
+      const uint64_t tenant_id,
+      share::schema::ObMultiVersionSchemaService &schema_service,
+      share::schema::ObSchemaGetterGuard &schema_guard,
+      common::ObMySQLTransaction &trans,
+      const common::ObString *ddl_stmt_str);
+
+  int copy_database_privileges(
+      const common::ObString &fork_src_database_name,
+      const common::ObString &fork_dst_database_name);
+
+  int copy_table_privileges(
+      const common::ObString &src_database_name,
+      const common::ObString &src_table_name,
+      const common::ObString &dst_database_name,
+      const common::ObString &dst_table_name);
+
+private:
+  int get_db_priv_user_ids_(common::hash::ObHashSet<uint64_t> &db_priv_user_ids,
+                            const common::ObString &src_database_name,
+                            const common::ObString &dst_database_name);
+  int grant_database_privilege_(
+      const uint64_t user_id,
+      const common::ObString &dst_database_name,
+      const ObPrivSet src_priv_set,
+      const ObPrivSet dst_priv_set);
+  int grant_table_privilege_(
+      const uint64_t user_id,
+      const common::ObString &dst_database_name,
+      const common::ObString &dst_table_name,
+      const ObPrivSet src_priv_set);
+
+  const uint64_t tenant_id_;
+  share::schema::ObMultiVersionSchemaService &schema_service_;
+  share::schema::ObSchemaGetterGuard &schema_guard_;
+  common::ObMySQLTransaction &trans_;
+  const common::ObString *ddl_stmt_str_;
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObForkPrivilegeCopier);
 };
 
 // 封装 fork 表级 global status 拷贝：__all_auto_increment / __all_*_stat（普通 SQL）。

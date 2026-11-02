@@ -715,6 +715,10 @@ public:
   int get_obj_privs_in_grantor_obj_id(const uint64_t tenant_id,
                                          const ObObjPrivSortKey &obj_key,
                                          common::ObIArray<const ObObjPriv *> &obj_privs);
+
+  // 以真实库名查询鉴权选中的库级 ACL，匹配方式与 get_db_priv_set 的普通重载一致。
+  int get_db_priv(const ObOriginalDBKey &db_priv_key,
+                  const ObDBPriv *&db_priv);
   int get_db_priv_set(const uint64_t tenant_id,
                       const uint64_t user_id,
                       const common::ObString &db,

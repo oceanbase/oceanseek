@@ -3100,6 +3100,7 @@ private:
                                int64_t &refreshed_schema_version);
   int fork_db_commit_parent_(const obrpc::ObForkDatabaseArg &arg,
                              const int64_t refreshed_schema_version,
+                             share::schema::ObSchemaGetterGuard &schema_guard,
                              const share::schema::ObDatabaseSchema &src_db_schema,
                              const common::ObIArray<uint64_t> &src_table_ids,
                              common::ObIAllocator &allocator,

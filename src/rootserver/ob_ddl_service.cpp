@@ -41837,6 +41837,10 @@ bool ObDDLService::check_change_to_compaction_scn_ttl_table(
          && orig_table_schema.get_ttl_flag().ttl_column_type_ != ObTTLFlag::TTLColumnType::ROWSCN;
 }
 
+#ifdef ERRSIM
+ERRSIM_POINT_DEF(ERRSIM_FORK_TABLE_COPY_GRANTS_BEFORE_COMMIT);
+#endif
+
 int ObDDLService::fork_table(const obrpc::ObForkTableArg &arg, obrpc::ObDDLRes &res)
 {
   int ret = OB_SUCCESS;
@@ -41881,6 +41885,7 @@ int ObDDLService::fork_table(const obrpc::ObForkTableArg &arg, obrpc::ObDDLRes &
       // 否则 fork 出的目标表可能丢失尚未被异步维护的索引数据。参考 SeekDB
       // ob_fork_table_service.cpp 的 check_has_async_vector_index + ObChangeStreamMgr::wait_refresh_scn。
       ObDDLSQLTransaction trans(schema_service_);
+      ObForkPrivilegeCopier privilege_copier(arg.tenant_id_, *schema_service_, schema_guard, trans, &arg.ddl_stmt_str_);
       int64_t fork_snapshot_version = 0;
       if (OB_FAIL(trans.start(&get_sql_proxy(), arg.tenant_id_, refreshed_schema_version))) {
         LOG_WARN("start trans failed", KR(ret), "tenant_id", arg.tenant_id_, K(refreshed_schema_version));
@@ -41898,9 +41903,19 @@ int ObDDLService::fork_table(const obrpc::ObForkTableArg &arg, obrpc::ObDDLRes &
         } else if (OB_FAIL(fork_table_cal_snapshot_(trans, arg.tenant_id_, snapshot_gc_scn, fork_snapshot_version))) {
           LOG_WARN("[ForkTable] failed to cal fork snapshot", KR(ret), "tenant_id", arg.tenant_id_, K(snapshot_gc_scn));
         } else if (FALSE_IT(DEBUG_SYNC(AFTER_FORK_TABLE_CAL_SNAPSHOT_BEFORE_LOCK))) {
+        } else if (arg.copy_grants_ && OB_FAIL(privilege_copier.copy_table_privileges(
+                                                arg.src_database_name_, arg.src_table_name_,
+                                                arg.dst_database_name_, arg.dst_table_name_))) {
+          LOG_WARN("[ForkTable] failed to copy explicit table privileges", KR(ret), K(arg));
         } else if (OB_FAIL(fork_table_(arg, *src_table_schema, fork_snapshot_version, *dst_db_schema, schema_guard,
                                       trans, allocator, 0 /* parent_task_id */, task_record))) {
           LOG_WARN("[ForkTable] failed to fork table", KR(ret), K(arg), K(fork_snapshot_version));
+#ifdef ERRSIM
+        } else if (arg.copy_grants_ && ERRSIM_FORK_TABLE_COPY_GRANTS_BEFORE_COMMIT) {
+          // 权限、目标表和任务都已写入但尚未提交；注错验证新增 ACL 和扩权 ACL 能随事务一起还原。
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("[ForkTable] errsim COPY GRANTS transaction failure before commit", KR(ret), K(arg));
+#endif
         } else {
           LOG_INFO("[ForkTable] fork table in-trans steps done", "tenant_id", arg.tenant_id_, K(snapshot_gc_scn),
                    K(fork_snapshot_version), "task_id", task_record.task_id_);
@@ -44006,7 +44021,7 @@ int ObDDLService::fork_database(const obrpc::ObForkDatabaseArg &arg, obrpc::ObDD
   } else {
     has_source_tables = !src_table_ids.empty();
     // Coordinator 创建目标库；非空源库还会原子提交 PREPARE 父任务和 prepare fence。
-    if (OB_FAIL(fork_db_commit_parent_(arg, refreshed_schema_version, *src_db_schema, src_table_ids, allocator,
+    if (OB_FAIL(fork_db_commit_parent_(arg, refreshed_schema_version, schema_guard, *src_db_schema, src_table_ids, allocator,
                                        dst_db_schema, fork_snapshot_version, db_task_record,
                                        prepare_registered, parent_committed))) {
       LOG_WARN("[ForkTable] commit fork database parent failed", KR(ret));
@@ -44588,6 +44603,7 @@ int ObDDLService::fork_db_prepare_context_(
 int ObDDLService::fork_db_commit_parent_(
     const obrpc::ObForkDatabaseArg &arg,
     const int64_t refreshed_schema_version,
+    ObSchemaGetterGuard &schema_guard,
     const ObDatabaseSchema &src_db_schema,
     const ObIArray<uint64_t> &src_table_ids,
     ObIAllocator &allocator,
@@ -44602,6 +44618,8 @@ int ObDDLService::fork_db_commit_parent_(
   const bool has_source_tables = !src_table_ids.empty();
   share::SCN snapshot_gc_scn;
   ObDDLSQLTransaction parent_trans(schema_service_);
+  ObForkPrivilegeCopier privilege_copier(arg.tenant_id_, *schema_service_, schema_guard,
+                                         parent_trans, &arg.ddl_stmt_str_);
   if (OB_FAIL(parent_trans.start(&get_sql_proxy(), arg.tenant_id_, refreshed_schema_version))) {
     LOG_WARN("[ForkTable] start parent transaction failed", KR(ret), K(arg), K(refreshed_schema_version));
   } else if (OB_FAIL(fork_db_check_fork_conflict_(parent_trans, arg.tenant_id_, src_database_id, src_table_ids))) {
@@ -44611,6 +44629,11 @@ int ObDDLService::fork_db_commit_parent_(
                                                    has_source_tables /*是否创建隐藏库*/))) {
     LOG_WARN("[ForkTable] create destination database failed", KR(ret), K(arg), K(src_database_id),
              K(has_source_tables));
+  } else if (!has_source_tables && arg.copy_grants_) {
+    // 空库不经过 finalizer，库级权限与可见目标库在 parent 事务中一起提交或回滚。
+    if (OB_FAIL(privilege_copier.copy_database_privileges(arg.src_database_name_, arg.dst_database_name_))) {
+      LOG_WARN("[ForkTable] copy empty database privileges failed", KR(ret), K(arg));
+    }
   } else if (has_source_tables) {
     // parent_trans 在生成 S 前锁住 snapshot_gc_scn，并在同一事务写入持久化 acquired snapshot。
     // 提交前由行锁保护，提交后由 acquired snapshot 保护，避免长事务 guard 的超时空窗。
@@ -44710,8 +44733,8 @@ int ObDDLService::fork_db_release_snapshot_(
   return ret;
 }
 
-// Prepare DAG 全部成功后的原子发布点：发布隐藏目标库、把 parent 推进到
-// WAIT_CHILD_TASK_FINISH，并释放 prepare fence。三项修改同事务提交，
+// Prepare DAG 全部成功后的原子发布点：发布隐藏目标库、按需复制库级权限、把 parent 推进到
+// WAIT_CHILD_TASK_FINISH，并释放 prepare fence。这些修改同事务提交，
 // 避免数据库可见性、父任务阶段和隔离栅栏不一致。commit 结果不确定时不在前台回读，
 // 而是保留全部持久态并移交恢复扫描；后台会在加锁确认 finalizer 终态后继续调度或补偿。
 int ObDDLService::fork_db_commit_finalizer_(
@@ -44735,12 +44758,14 @@ int ObDDLService::fork_db_commit_finalizer_(
     LOG_WARN("[ForkTable] start finalizer failed", KR(ret));
   } else {
     ObDDLOperator ddl_operator(*schema_service_, *sql_proxy_);
+    ObForkPrivilegeCopier privilege_copier(arg.tenant_id_, *schema_service_, schema_guard,
+                                           final_trans, &arg.ddl_stmt_str_);
     int64_t parent_task_status = 0;
     int64_t execution_id = -1;
     int64_t parent_ret_code = OB_SUCCESS;
     int64_t parent_snapshot_version = OB_INVALID_VERSION;
-    // 目标库发布、parent 状态推进和 fence 释放必须保持原子；
-    // 任一步失败则整笔 finalizer 回滚。
+    // 非空库的权限只在这里复制，与目标库发布一起回滚；不消耗 worker 预留的 schema version。
+    // 目标库发布、权限写入、parent 状态推进和 fence 释放必须保持原子。
     dst_db_schema.set_in_recyclebin(false);
     if (OB_FAIL(ddl_operator.alter_database(dst_db_schema, final_trans, OB_DDL_ALTER_DATABASE, &arg.ddl_stmt_str_))) {
       LOG_WARN("[ForkTable] publish ready database failed", KR(ret));
@@ -44757,6 +44782,9 @@ int ObDDLService::fork_db_commit_finalizer_(
                K(parent_ret_code), K(parent_snapshot_version),
                "expected_snapshot_version", db_task_record.snapshot_version_,
                "parent_task_id", db_task_record.task_id_);
+    } else if (arg.copy_grants_
+               && OB_FAIL(privilege_copier.copy_database_privileges(arg.src_database_name_, arg.dst_database_name_))) {
+      LOG_WARN("[ForkTable] copy database privileges in finalizer failed", KR(ret), K(arg));
     } else if (OB_FAIL(ObDDLTaskRecordOperator::update_task_status(
                    final_trans, arg.tenant_id_, db_task_record.task_id_,
                    static_cast<int64_t>(ObDDLTaskStatus::WAIT_CHILD_TASK_FINISH)))) {

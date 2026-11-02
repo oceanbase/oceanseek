@@ -405,7 +405,7 @@ END_P SET_VAR DELIMITER
 %type <node> sql_stmt stmt_list stmt opt_end_p
 %type <node> select_stmt update_stmt delete_stmt merge_stmt
 %type <node> insert_stmt single_table_insert values_clause dml_table_name
-%type <node> create_table_stmt create_table_like_stmt fork_table_stmt fork_database_stmt opt_fork_read_lock opt_table_option_list table_option_list table_option table_option_list_space_seperated create_function_stmt drop_function_stmt parallel_option lob_storage_clause lob_storage_parameter lob_storage_parameters lob_chunk_size
+%type <node> create_table_stmt create_table_like_stmt fork_table_stmt fork_database_stmt opt_fork_read_lock opt_copy_grants opt_table_option_list table_option_list table_option table_option_list_space_seperated create_function_stmt drop_function_stmt parallel_option lob_storage_clause lob_storage_parameter lob_storage_parameters lob_chunk_size
 %type <node> opt_force
 %type <node> index_or_heap
 %type <node> create_sequence_stmt alter_sequence_stmt drop_sequence_stmt opt_sequence_option_list sequence_option_list sequence_option simple_num
@@ -6045,9 +6045,9 @@ create_with_opt_hint special_table_type TABLE opt_if_not_exists relation_factor 
  *****************************************************************************/
 
 fork_table_stmt:
-FORK TABLE relation_factor TO relation_factor opt_fork_read_lock
+FORK TABLE relation_factor TO relation_factor opt_fork_read_lock opt_copy_grants
 {
-  malloc_non_terminal_node($$, result->malloc_pool_, T_FORK_TABLE, 3, $5, $3, $6);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FORK_TABLE, 4, $5, $3, $6, $7);
 }
 ;
 
@@ -6063,10 +6063,22 @@ opt_fork_read_lock:
 }
 ;
 
-fork_database_stmt:
-FORK DATABASE database_factor TO database_factor
+opt_copy_grants:
+/* 空产生式 */
 {
-  malloc_non_terminal_node($$, result->malloc_pool_, T_FORK_DATABASE, 2, $5, $3);
+  $$ = NULL;
+}
+| COPY GRANTS
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_BOOL);
+  $$->value_ = 1;
+}
+;
+
+fork_database_stmt:
+FORK DATABASE database_factor TO database_factor opt_copy_grants
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_FORK_DATABASE, 3, $5, $3, $6);
 }
 ;
 

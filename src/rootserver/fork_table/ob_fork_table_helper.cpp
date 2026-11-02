@@ -8,6 +8,7 @@
 #include "rootserver/fork_table/ob_fork_table_helper.h"
 
 #include "lib/mysqlclient/ob_mysql_transaction.h"
+#include "lib/string/ob_sql_string.h"
 #include "lib/utility/ob_sort.h"
 #include "observer/ob_inner_sql_connection.h"
 #include "rootserver/ob_ddl_operator.h"
@@ -18,6 +19,8 @@
 #include "share/ob_rpc_struct.h"
 #include "share/ob_server_struct.h"
 #include "share/schema/ob_multi_version_schema_service.h"
+#include "share/schema/ob_priv_sql_service.h"
+#include "share/schema/ob_schema_service.h"
 #include "share/schema/ob_schema_struct.h"
 #include "share/schema/ob_schema_utils.h"
 #include "share/tablet/ob_tablet_to_ls_operator.h"
@@ -32,6 +35,393 @@ using namespace common;
 using namespace share;
 using namespace share::schema;
 using namespace transaction;
+
+// 把真实库名编码为只匹配该库的 ACL 模式，例如 a_b -> a\_b、% -> \%。
+// SQL 字符串转义和 ACL 模式转义是两层不同的事，SQL Service 只负责前者。
+int ObForkPrivilegeUtils::encode_database_pattern(const ObString &name, ObSqlString &pattern)
+{
+  int ret = OB_SUCCESS;
+  pattern.reset();
+  for (int64_t i = 0; OB_SUCC(ret) && i < name.length(); ++i) {
+    const char ch = name.ptr()[i];
+    if (('%' == ch || '_' == ch || '\\' == ch) && OB_FAIL(pattern.append("\\"))) {
+      LOG_WARN("[ForkTable] append escape character failed", KR(ret), K(ch));
+    } else if (OB_FAIL(pattern.append(name.ptr() + i, 1))) {
+      LOG_WARN("[ForkTable] append character failed", KR(ret), K(ch));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    LOG_INFO("[ForkTable] encoded database pattern", K(name), K(pattern));
+  }
+  return ret;
+}
+
+// 只统计非通配 ACL；目标库按租户规则等价、但现有权限查询无法匹配的 ACL 也必须拒绝。
+// get_db_privs_in_tenant 按 tenant_id、user_id 排序；同一用户分别计数源、目标，任一侧超过一条就拒绝。
+int ObForkPrivilegeUtils::check_database_privileges(const ObIArray<const ObDBPriv *> &privileges,
+                                                    const ObNameCaseMode name_case_mode,
+                                                    const ObString &src_database_name,
+                                                    const ObString &dst_database_name)
+{
+  int ret = OB_SUCCESS;
+  uint64_t user_id = OB_INVALID_ID;
+  int64_t src_match_count = 0;
+  int64_t dst_match_count = 0;
+  ObCollationType name_collation = CS_TYPE_INVALID;
+  if (src_database_name.empty() || dst_database_name.empty()
+      || (OB_ORIGIN_AND_SENSITIVE != name_case_mode && OB_LOWERCASE_AND_INSENSITIVE != name_case_mode
+          && OB_ORIGIN_AND_INSENSITIVE != name_case_mode)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[ForkTable] invalid arguments", KR(ret), K(src_database_name), K(dst_database_name));
+  } else {
+    name_collation = ObSchema::get_cs_type_with_cmp_mode(name_case_mode);
+    for (int64_t i = 0; OB_SUCC(ret) && i < privileges.count(); ++i) {
+      const ObDBPriv *priv = privileges.at(i);
+      if (OB_ISNULL(priv)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("[ForkTable] database privilege schema is null", KR(ret), K(i));
+      } else {
+        if (user_id != priv->get_user_id()) {
+          user_id = priv->get_user_id();
+          src_match_count = 0;
+          dst_match_count = 0;
+        }
+        if (NON_WILDCARD_PATTERN_SORT == priv->get_sort()) {
+          src_match_count += (0 == wild_compare(src_database_name, priv->get_database_name_str(), false));
+          dst_match_count += (0 == wild_compare(dst_database_name, priv->get_database_name_str(), false));
+          // mode 2 的 DstDb/dstdb 在名称层等价，但 wild_compare 区分大小写，可能漏读原 INSERT。
+          // 内表主键不区分大小写，漏读后 REPLACE 会覆盖旧行；先用现有字符集模式匹配识别并拒绝。
+          // sort 已排除通配 ACL；同拼写的冗余转义仍可由 wild_compare 命中，不应误拒绝。
+          if (0 != wild_compare(dst_database_name, priv->get_database_name_str(), false)
+              && ObCharset::wildcmp(name_collation, dst_database_name, priv->get_database_name_str(), '\\', '_', '%')) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY GRANTS with a differently cased destination database ACL is");
+            LOG_WARN("[ForkTable] destination database ACL spelling differs from fork target", KR(ret), KPC(priv),
+                     K(dst_database_name), K(name_case_mode));
+          } else if (src_match_count > 1 || dst_match_count > 1) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY GRANTS with multiple exact ACLs for the same grantee/object is");
+            LOG_WARN("[ForkTable] ambiguous database ACL", KR(ret), KPC(priv),
+                     K(src_database_name), K(dst_database_name), K(src_match_count), K(dst_match_count));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// get_table_privs_in_tenant 按 tenant_id、user_id 排序；每个用户的源、目标匹配记录分别计数，超过一条就拒绝。
+// 表级名称按租户规则比较；即使目标只有一条等价 ACL，拼写不同也拒绝，不沿用或改写旧 key。
+int ObForkPrivilegeUtils::check_table_privileges(const ObIArray<const ObTablePriv *> &privileges,
+                                                 const ObNameCaseMode name_case_mode,
+                                                 const ObString &src_database_name, const ObString &src_table_name,
+                                                 const ObString &dst_database_name, const ObString &dst_table_name)
+{
+  int ret = OB_SUCCESS;
+  uint64_t user_id = OB_INVALID_ID;
+  int64_t src_match_count = 0;
+  int64_t dst_match_count = 0;
+  ObCollationType name_collation = CS_TYPE_INVALID;
+  if (src_database_name.empty() || src_table_name.empty() || dst_database_name.empty() || dst_table_name.empty()
+      || (OB_ORIGIN_AND_SENSITIVE != name_case_mode && OB_LOWERCASE_AND_INSENSITIVE != name_case_mode
+          && OB_ORIGIN_AND_INSENSITIVE != name_case_mode)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[ForkTable] invalid arguments", KR(ret), K(src_database_name), K(src_table_name), K(dst_database_name), K(dst_table_name), K(name_case_mode));
+  } else {
+    name_collation = ObSchema::get_cs_type_with_cmp_mode(name_case_mode);
+    for (int64_t i = 0; OB_SUCC(ret) && i < privileges.count(); ++i) {
+      const ObTablePriv *priv = privileges.at(i);
+      if (OB_ISNULL(priv)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("[ForkTable] table privilege schema is null", KR(ret), K(i));
+      } else {
+        if (user_id != priv->get_user_id()) {
+          user_id = priv->get_user_id();
+          src_match_count = 0;
+          dst_match_count = 0;
+        }
+        // 当前 ACL 属于源表：只增加当前用户的源记录数。
+        if (0 == ObCharset::strcmp(name_collation, src_database_name, priv->get_database_name_str())
+            && 0 == ObCharset::strcmp(name_collation, src_table_name, priv->get_table_name_str())) {
+          ++src_match_count;
+        }
+        // 当前 ACL 属于目标表：目标单独计数，不与源记录数混在一起。
+        if (0 == ObCharset::strcmp(name_collation, dst_database_name, priv->get_database_name_str())
+            && 0 == ObCharset::strcmp(name_collation, dst_table_name, priv->get_table_name_str())) {
+          ++dst_match_count;
+          // 防御 mode 2 已知权限 bug：缓存 key 区分大小写，内部权限表的名称主键却不区分。
+          // 将 Copy 改写为 copy 可能覆盖旧权限并形成缓存别名；沿用 Copy 又可能使按 copy 访问时鉴权失败。
+          // 因此目标已有等价 ACL 但拼写不同时直接拒绝
+          if (dst_database_name != priv->get_database_name_str() || dst_table_name != priv->get_table_name_str()) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY GRANTS with a differently cased destination ACL is");
+            LOG_WARN("[ForkTable] destination ACL spelling differs from fork target", KR(ret), KPC(priv),
+                     K(dst_database_name), K(dst_table_name));
+          }
+        }
+        if (OB_SUCC(ret) && (src_match_count > 1 || dst_match_count > 1)) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "COPY GRANTS with multiple exact ACLs for the same grantee/object is");
+          LOG_WARN("[ForkTable] ambiguous table ACL", KR(ret), KPC(priv), K(src_database_name),
+                   K(src_table_name), K(dst_database_name), K(dst_table_name), K(src_match_count), K(dst_match_count));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// 初始化权限复制上下文，复用 Fork 的 schema guard 和事务完成权限读写。
+ObForkPrivilegeCopier::ObForkPrivilegeCopier(
+    const uint64_t tenant_id,
+    ObMultiVersionSchemaService &schema_service,
+    ObSchemaGetterGuard &schema_guard,
+    ObMySQLTransaction &trans,
+    const ObString *ddl_stmt_str)
+  : tenant_id_(tenant_id),
+    schema_service_(schema_service),
+    schema_guard_(schema_guard),
+    trans_(trans),
+    ddl_stmt_str_(ddl_stmt_str)
+{
+}
+
+// 将源库权限与目标库已有权限按位取并集，仅在目标权限发生变化时写入。
+// 写入复用现有权限 SQL Service，并使用 Fork 当前事务和新的 schema version。
+// 注意：此处 dst_database_name 已是转义后的精确 ACL 模式
+int ObForkPrivilegeCopier::grant_database_privilege_(
+    const uint64_t user_id,
+    const ObString &dst_database_name,
+    const ObPrivSet src_priv_set,
+    const ObPrivSet dst_priv_set)
+{
+  int ret = OB_SUCCESS;
+  ObSchemaService *schema_sql_service = schema_service_.get_schema_service();
+  const ObOriginalDBKey dst_priv_key(tenant_id_, user_id, dst_database_name);
+  if (OB_ISNULL(schema_sql_service)) {
+    ret = OB_ERR_SYS;
+    LOG_WARN("[ForkTable] schema sql service is null while copying database privilege", KR(ret), K(tenant_id_));
+  } else if (OB_INVALID_ID == user_id || dst_database_name.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[ForkTable] invalid destination database privilege key", KR(ret), K(tenant_id_), K(user_id),
+             K(dst_database_name));
+  } else if (OB_PRIV_SET_EMPTY == src_priv_set) {
+  } else {
+    const ObPrivSet merged_priv_set = src_priv_set | dst_priv_set;
+    if (merged_priv_set != dst_priv_set) {
+      int64_t new_schema_version = OB_INVALID_VERSION;
+      if (OB_FAIL(schema_service_.gen_new_schema_version(tenant_id_, new_schema_version))) {
+        LOG_WARN("[ForkTable] generate database privilege schema version failed", KR(ret), K(tenant_id_),
+                 K(dst_priv_key));
+      } else if (OB_FAIL(schema_sql_service->get_priv_sql_service().grant_database(
+                     dst_priv_key, merged_priv_set, new_schema_version, ddl_stmt_str_, trans_))) {
+        LOG_WARN("[ForkTable] write copied database privilege failed", KR(ret), K(dst_priv_key),
+                 K(src_priv_set), K(dst_priv_set), K(merged_priv_set));
+      }
+    }
+  }
+  return ret;
+}
+
+// 将源表权限与目标表已有权限取并集：Fork 本次新增、扩权记录的 grantor/grantor_host 统一留空。
+// 仅在权限变化时写入；现有 SQL Service 同时写 current/history，Oracle 对象权限参数保持为空。
+int ObForkPrivilegeCopier::grant_table_privilege_(const uint64_t user_id,
+    const ObString &dst_database_name,
+    const ObString &dst_table_name,
+    const ObPrivSet src_priv_set)
+{
+  int ret = OB_SUCCESS;
+  ObSchemaService *schema_sql_service = schema_service_.get_schema_service();
+  const ObTablePrivSortKey dst_priv_key(tenant_id_, user_id, dst_database_name, dst_table_name);
+  ObPrivSet dst_priv_set = OB_PRIV_SET_EMPTY;
+  if (OB_ISNULL(schema_sql_service)) {
+    ret = OB_ERR_SYS;
+    LOG_WARN("[ForkTable] schema sql service is null while copying table privilege", KR(ret), K(tenant_id_));
+  } else if (OB_INVALID_ID == user_id || dst_database_name.empty() || dst_table_name.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[ForkTable] invalid destination table privilege key", KR(ret), K(tenant_id_), K(user_id),
+             K(dst_database_name), K(dst_table_name));
+  } else if (OB_PRIV_SET_EMPTY == src_priv_set) {
+  } else if (OB_FAIL(schema_guard_.get_table_priv_set(dst_priv_key, dst_priv_set))) {
+    LOG_WARN("[ForkTable] get exact destination table privilege failed", KR(ret), K(dst_priv_key));
+  } else {
+    const ObPrivSet merged_priv_set = src_priv_set | dst_priv_set;
+    if (merged_priv_set != dst_priv_set) {
+      int64_t new_schema_version = OB_INVALID_VERSION;
+      ObRawObjPrivArray empty_obj_privs;
+      ObObjPrivSortKey empty_obj_priv_key;
+      if (OB_FAIL(schema_service_.gen_new_schema_version(tenant_id_, new_schema_version))) {
+        LOG_WARN("[ForkTable] generate table privilege schema version failed", KR(ret), K(tenant_id_),
+                 K(dst_priv_key));
+      } else if (OB_FAIL(schema_sql_service->get_priv_sql_service().grant_table(
+                     dst_priv_key, merged_priv_set, new_schema_version, ddl_stmt_str_, trans_,
+                     empty_obj_privs, 0 /* 授权选项 */, empty_obj_priv_key, OB_INVALID_VERSION,
+                     true /* 执行授权 */, false /* 非 Oracle 全量撤权 */,
+                     ObString() /* 授予者留空 */, ObString() /* 授予者 host 留空 */))) {
+        LOG_WARN("[ForkTable] write copied table privilege failed", KR(ret), K(dst_priv_key),
+                 K(src_priv_set), K(dst_priv_set), K(merged_priv_set));
+      }
+    }
+  }
+  return ret;
+}
+
+// 先拒绝重复精确 ACL，再收集去重 user_id，包含角色和匿名用户；不展开继承权限。
+int ObForkPrivilegeCopier::get_db_priv_user_ids_(hash::ObHashSet<uint64_t> &db_priv_user_ids,
+                                                 const ObString &src_database_name,
+                                                 const ObString &dst_database_name)
+{
+  int ret = OB_SUCCESS;
+  ObArray<const ObDBPriv *> tenant_db_privs;
+  ObNameCaseMode name_case_mode = OB_NAME_CASE_INVALID;
+  if (OB_FAIL(schema_guard_.get_db_priv_with_tenant_id(tenant_id_, tenant_db_privs))) {
+    LOG_WARN("[ForkTable] get tenant database privileges failed", KR(ret), K(tenant_id_));
+  } else if (OB_FAIL(schema_guard_.get_tenant_name_case_mode(tenant_id_, name_case_mode))) {
+    LOG_WARN("[ForkTable] get tenant name case mode failed", KR(ret), K(tenant_id_));
+  } else if (OB_FAIL(ObForkPrivilegeUtils::check_database_privileges(
+                 tenant_db_privs, name_case_mode, src_database_name, dst_database_name))) {
+    LOG_WARN("[ForkTable] ambiguous database privileges", KR(ret), K(tenant_id_),
+             K(src_database_name), K(dst_database_name));
+  } else if (OB_FAIL(db_priv_user_ids.create(
+                 hash::cal_next_prime(tenant_db_privs.count() + 1), "ForkDbPriv", "ForkDbPriv", OB_SERVER_TENANT_ID))) {
+    LOG_WARN("[ForkTable] create database privilege user set failed", KR(ret), K(tenant_id_));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < tenant_db_privs.count(); ++i) {
+      const ObDBPriv *db_priv = tenant_db_privs.at(i);
+      if (OB_ISNULL(db_priv)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("[ForkTable] database privilege schema is null", KR(ret), K(tenant_id_), K(i));
+      } else if (OB_FAIL(db_priv_user_ids.set_refactored(db_priv->get_user_id()))) {
+        LOG_WARN("[ForkTable] save database privilege user failed", KR(ret), KPC(db_priv));
+      }
+    }
+  }
+  return ret;
+}
+
+// 租户库级 ACL 扫描用于拒绝重复精确授权并枚举 user_id，不累加源端权限。
+// 源端复用鉴权接口选中一条 ACL，仅复制属于该用户的非通配授权；匿名兜底不转授给普通用户。
+// 同一用户对源库或目标库有多条精确匹配 ACL 时直接报错，不依赖不稳定的首条匹配顺序。
+// 目标只有一条精确授权时沿用原始 key 追加；所有歧义检查都在写权限前完成。
+// 目标没有精确授权时，以真实库名生成标准精确 key，不修改通配或匿名兜底记录。
+int ObForkPrivilegeCopier::copy_database_privileges(
+    const ObString &fork_src_database_name,
+    const ObString &fork_dst_database_name)
+{
+  int ret = OB_SUCCESS;
+  int64_t copied_count = 0;
+  hash::ObHashSet<uint64_t> db_priv_user_ids;
+  ObSqlString fork_dst_database_acl_pattern;
+  if (OB_INVALID_TENANT_ID == tenant_id_ || fork_src_database_name.empty() || fork_dst_database_name.empty()
+      || !trans_.is_started()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[ForkTable] invalid argument for copying database privileges", KR(ret), K(tenant_id_),
+             K(fork_src_database_name), K(fork_dst_database_name), "trans_started", trans_.is_started());
+  } else if (OB_FAIL(ObForkPrivilegeUtils::encode_database_pattern(
+                 fork_dst_database_name, fork_dst_database_acl_pattern))) {
+    LOG_WARN("[ForkTable] escape destination database privilege pattern failed", KR(ret), K(fork_dst_database_name));
+  } else if (OB_FAIL(get_db_priv_user_ids_(db_priv_user_ids, fork_src_database_name, fork_dst_database_name))) {
+    LOG_WARN("[ForkTable] get database privilege user ids failed", KR(ret), K(tenant_id_));
+  } else {
+    ObOriginalDBKey src_key(tenant_id_, OB_INVALID_ID, fork_src_database_name);
+    ObOriginalDBKey dst_key(tenant_id_, OB_INVALID_ID, fork_dst_database_name);
+    ObString dst_acl_pattern;
+    hash::ObHashSet<uint64_t>::iterator it = db_priv_user_ids.begin();
+    // 对每个候选用户，按真实库名查询鉴权选中的一条 ACL，不合并其他匹配记录。
+    // src_key/dst_key 使用真实库名，接口内部按真实库名查询；缓存中的 ACL 仍按模式匹配。
+    // 源 ACL 只复制当前用户的非通配授权，普通用户命中的匿名兜底记录会被跳过。
+    // 目标有当前用户的非通配授权时，沿用选中记录的原始 key 并合并权限；否则使用编码后的目标精确 key。
+    for (; OB_SUCC(ret) && it != db_priv_user_ids.end(); ++it) {
+      const uint64_t user_id = it->first;
+      src_key.user_id_ = user_id;
+      dst_key.user_id_ = user_id;
+      dst_acl_pattern.reset();
+      const ObDBPriv *src_priv = nullptr;
+      const ObDBPriv *dst_priv = nullptr;
+      if (OB_FAIL(schema_guard_.get_db_priv(src_key, src_priv))) {
+        LOG_WARN("[ForkTable] get matched source database privilege failed", KR(ret), K(src_key));
+      } else if (nullptr == src_priv || user_id != src_priv->get_user_id()
+              || ObForkPrivilegeUtils::NON_WILDCARD_PATTERN_SORT != src_priv->get_sort()
+              || OB_PRIV_SET_EMPTY == src_priv->get_priv_set()) {
+        // 源端仅复制选中的直接、非通配授权，不把其他匹配记录或匿名兜底权限合入。
+      } else if (OB_FAIL(schema_guard_.get_db_priv(dst_key, dst_priv))) {
+        LOG_WARN("[ForkTable] get matched destination database privilege failed", KR(ret), K(dst_key));
+      } else {
+        dst_acl_pattern = fork_dst_database_acl_pattern.string();
+        ObPrivSet dst_priv_set = OB_PRIV_SET_EMPTY;
+        if (nullptr != dst_priv && user_id == dst_priv->get_user_id()
+            && ObForkPrivilegeUtils::NON_WILDCARD_PATTERN_SORT == dst_priv->get_sort()) {
+          dst_acl_pattern = dst_priv->get_database_name_str();
+          dst_priv_set = dst_priv->get_priv_set();
+        }
+        if (OB_FAIL(grant_database_privilege_(user_id, dst_acl_pattern, src_priv->get_priv_set(), dst_priv_set))) {
+          LOG_WARN("[ForkTable] copy database privilege failed", KR(ret), K(user_id),
+                   K(fork_dst_database_name), K(dst_acl_pattern));
+        } else {
+          ++copied_count;
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    LOG_INFO("[ForkTable] copied explicit database privileges", K(tenant_id_), K(fork_src_database_name),
+             K(fork_dst_database_name), K(copied_count));
+  }
+  return ret;
+}
+
+// 一次获取租户内全部表级 ACL，只复制库名、表名与源表精确相等的记录。
+// 扫描直接覆盖普通用户、角色和匿名用户，不展开它们的有效权限。
+int ObForkPrivilegeCopier::copy_table_privileges(
+    const ObString &src_database_name,
+    const ObString &src_table_name,
+    const ObString &dst_database_name,
+    const ObString &dst_table_name)
+{
+  int ret = OB_SUCCESS;
+  int64_t copied_count = 0;
+  ObArray<const ObTablePriv *> tenant_table_privs;
+  ObNameCaseMode name_case_mode = OB_NAME_CASE_INVALID;
+  ObCollationType name_collation = CS_TYPE_INVALID;
+  if (OB_INVALID_TENANT_ID == tenant_id_ || src_database_name.empty() || src_table_name.empty()
+      || dst_database_name.empty() || dst_table_name.empty() || !trans_.is_started()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[ForkTable] invalid argument for copying table privileges", KR(ret), K(tenant_id_),
+             K(src_database_name), K(src_table_name), K(dst_database_name), K(dst_table_name),
+             "trans_started", trans_.is_started());
+  } else if (OB_FAIL(schema_guard_.get_table_priv_with_tenant_id(tenant_id_, tenant_table_privs))) {
+    LOG_WARN("[ForkTable] get tenant table privileges failed", KR(ret), K(tenant_id_));
+  } else if (OB_FAIL(schema_guard_.get_tenant_name_case_mode(tenant_id_, name_case_mode))) {
+    LOG_WARN("[ForkTable] get tenant name case mode failed", KR(ret), K(tenant_id_));
+  } else if (OB_FAIL(ObForkPrivilegeUtils::check_table_privileges(tenant_table_privs, name_case_mode, src_database_name,
+                                                                 src_table_name, dst_database_name, dst_table_name))) {
+    LOG_WARN("[ForkTable] ambiguous table privileges", KR(ret), K(tenant_id_));
+  } else {
+    name_collation = ObSchema::get_cs_type_with_cmp_mode(name_case_mode);
+    // 源端与预检使用同一比较规则，避免 mode 2 下单条 ACL 因拼写不同漏复制。
+    for (int64_t i = 0; OB_SUCC(ret) && i < tenant_table_privs.count(); ++i) {
+      const ObTablePriv *table_priv = tenant_table_privs.at(i);
+      if (OB_ISNULL(table_priv)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("[ForkTable] table privilege schema is null", KR(ret), K(tenant_id_), K(i));
+      } else if (0 != ObCharset::strcmp(name_collation, src_database_name, table_priv->get_database_name_str())
+              || 0 != ObCharset::strcmp(name_collation, src_table_name, table_priv->get_table_name_str())) {
+      } else if (OB_FAIL(grant_table_privilege_(table_priv->get_user_id(), dst_database_name,
+                     dst_table_name, table_priv->get_priv_set()))) {
+        LOG_WARN("[ForkTable] copy table privilege failed", KR(ret), KPC(table_priv),
+                 K(src_database_name), K(src_table_name), K(dst_database_name), K(dst_table_name));
+      } else {
+        ++copied_count;
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    LOG_INFO("[ForkTable] copied explicit table privileges", K(tenant_id_), K(src_database_name),
+             K(src_table_name), K(dst_database_name), K(dst_table_name), K(copied_count));
+  }
+  return ret;
+}
 
 int ObForkTableGlobalStatusCopier::build_stat_table_column_list_(
     const char *table_name,

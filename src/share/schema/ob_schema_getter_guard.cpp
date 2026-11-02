@@ -2654,6 +2654,23 @@ int ObSchemaGetterGuard::check_db_access(
   return ret;
 }
 
+int ObSchemaGetterGuard::get_db_priv(const ObOriginalDBKey &db_priv_key,
+                                     const ObDBPriv *&db_priv)
+{
+  int ret = OB_SUCCESS;
+  const ObSchemaMgr *mgr = NULL;
+  const uint64_t tenant_id = db_priv_key.tenant_id_;
+  db_priv = NULL;
+  if (OB_FAIL(check_tenant_schema_guard(tenant_id))) {
+    LOG_WARN("fail to check tenant schema guard", KR(ret), K(tenant_id), K_(tenant_id));
+  } else if (OB_FAIL(check_lazy_guard(tenant_id, mgr))) {
+    LOG_WARN("fail to check lazy guard", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(mgr->priv_mgr_.get_db_priv(db_priv_key, db_priv, false /* db_is_pattern */))) {
+    LOG_WARN("fail to get matched db privilege", KR(ret), K(db_priv_key));
+  }
+  return ret;
+}
+
 int ObSchemaGetterGuard::get_db_priv_set(const uint64_t tenant_id,
                                          const uint64_t user_id,
                                          const ObString &db,

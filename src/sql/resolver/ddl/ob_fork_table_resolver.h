@@ -20,6 +20,7 @@ public:
     DST_TABLE_NODE = 0,
     SRC_TABLE_NODE,
     READ_LOCK_NODE,
+    COPY_GRANTS_NODE,
     MAX_NODE
   };
 public:
@@ -37,6 +38,7 @@ public:
   enum node_type {
     DST_DATABASE_NODE = 0,
     SRC_DATABASE_NODE,
+    COPY_GRANTS_NODE,
     MAX_NODE
   };
 public:

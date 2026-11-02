@@ -1418,7 +1418,8 @@ public:
       dst_database_name_(),
       dst_table_name_(),
       session_id_(0),
-      need_lock_src_table_(false)
+      need_lock_src_table_(false),
+      copy_grants_(false)
   {}
   bool is_valid() const;
   virtual bool is_allow_when_upgrade() const { return true; }
@@ -1432,6 +1433,7 @@ public:
   common::ObString dst_table_name_;
   int64_t session_id_;
   bool need_lock_src_table_;
+  bool copy_grants_;
 };
 
 struct ObForkDatabaseArg : public ObDDLArg
@@ -1443,7 +1445,8 @@ public:
       tenant_id_(common::OB_INVALID_ID),
       src_database_name_(),
       dst_database_name_(),
-      session_id_(0)
+      session_id_(0),
+      copy_grants_(false)
   {}
   bool is_valid() const;
   virtual bool is_allow_when_upgrade() const { return true; }
@@ -1454,6 +1457,7 @@ public:
   common::ObString src_database_name_;
   common::ObString dst_database_name_;
   int64_t session_id_;
+  bool copy_grants_;
 };
 
 struct ObCreateSynonymArg : ObDDLArg
