@@ -20,6 +20,7 @@
 #include "sensitive_test/object_storage/object_storage_authorization_info.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/tablet/ob_async_index_refresh_info_mds_helper.h"
+#include "storage/tablet/ob_async_index_refresh_info_replay_executor.h"
 
 namespace oceanbase
 {
@@ -1562,6 +1563,106 @@ TEST_F(TestAsyncIndexRefreshInfoMds, gc_snapshot_single_entry)
     EQ(OB_SUCCESS, tablet_handle.get_obj()->get_kept_snapshot_for_async_index(min_snapshot));
     ASSERT_EQ(5000, min_snapshot);
     LOGI("gc_snapshot_single_entry ok", K(min_snapshot));
+  }
+}
+
+// Call do_replay_ directly: the generic tablet-change checkpoint filter must
+// not hide a missing MDS checkpoint check before the floor-pin merge.
+TEST_F(TestAsyncIndexRefreshInfoMds, durable_floor_pin_skips_full_checkpoint_array)
+{
+  common::ObMySQLProxy &sql_proxy = get_curr_simple_server().get_sql_proxy2();
+  int64_t affected_rows = 0;
+  EQ(0, sql_proxy.write("drop table if exists t_async_pin_replay", affected_rows));
+  EQ(0, sql_proxy.write("create table t_async_pin_replay(c1 int)", affected_rows));
+  ObTabletID tablet_id;
+  ObLSID ls_id;
+  EQ(OB_SUCCESS, get_tablet_and_ls("t_async_pin_replay", tablet_id, ls_id));
+
+  ObTabletAsyncIndexRefreshInfo full_info;
+  full_info.set_has_async_index(true);
+  full_info.set_published_version(100);
+  for (int64_t i = 0; i < MAX_INC_MAJOR_SSTABLE_CNT; ++i) {
+    EQ(OB_SUCCESS, full_info.append_refresh_snapshot(200 + i));
+  }
+  ObMySQLTransaction trans;
+  EQ(OB_SUCCESS, trans.start(GCTX.sql_proxy_, R.tenant_id_));
+  const int register_ret = register_refresh_info_in_trans(tablet_id, ls_id, full_info, trans);
+  const int end_ret = trans.end(OB_SUCCESS == register_ret);
+  EQ(OB_SUCCESS, register_ret);
+  EQ(OB_SUCCESS, end_ret);
+
+  int ret = OB_SUCCESS;
+  MTL_SWITCH(R.tenant_id_) {
+    ObLSHandle ls_handle;
+    EQ(OB_SUCCESS, MTL(ObLSService *)->get_ls(ls_id, ls_handle, ObLSGetMod::TRANS_MOD));
+    ObTabletHandle tablet_handle;
+    EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(tablet_id, tablet_handle));
+    SCN checkpoint;
+    EQ(OB_SUCCESS, ls_handle.get_ls()->get_mds_table()->get_mds_checkpoint_scn(checkpoint));
+    // Obtain a real persisted boundary without changing tablet metadata by hand.
+    const SCN old_checkpoint = checkpoint;
+    EQ(OB_SUCCESS, ls_handle.get_ls()->flush_mds_table());
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(60);
+    while (checkpoint <= old_checkpoint && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(100));
+      EQ(OB_SUCCESS, ls_handle.get_ls()->get_mds_table()->get_mds_checkpoint_scn(checkpoint));
+    }
+    ASSERT_GT(checkpoint, old_checkpoint);
+    ASSERT_GT(checkpoint.get_val_for_tx(), 1);
+
+    ObTabletAsyncIndexRefreshInfo pin;
+    EQ(OB_SUCCESS, pin.append_refresh_snapshot(150));
+    ASSERT_TRUE(full_info.need_apply_floor_pin(pin));
+    SCN before_checkpoint;
+    EQ(OB_SUCCESS, before_checkpoint.convert_for_tx(checkpoint.get_val_for_tx() - 1));
+    // max_scn stays uncovered even if the checkpoint advances during the test.
+    const SCN replay_scns[] = {before_checkpoint, checkpoint, SCN::max_scn()};
+    for (int64_t i = 0; i < 3; ++i) {
+      SCOPED_TRACE(i);
+      if (1 == i) {
+        // The durable checkpoint is monotonic within this LS lifetime. Accept
+        // equality assertions only when it stays unchanged across both replays;
+        // otherwise retry with the newer boundary instead of testing '<' twice.
+        const auto equality_deadline =
+            std::chrono::steady_clock::now() + std::chrono::seconds(60);
+        bool checked_equality = false;
+        while (!checked_equality && std::chrono::steady_clock::now() < equality_deadline) {
+          SCN checkpoint_before;
+          SCN checkpoint_after;
+          EQ(OB_SUCCESS, ls_handle.get_ls()->get_mds_table()->get_mds_checkpoint_scn(checkpoint_before));
+          int replay_results[2] = {OB_SUCCESS, OB_SUCCESS};
+          for (int64_t repeat = 0; repeat < 2; ++repeat) {
+            mds::MdsCtx ctx;
+            ObTabletAsyncIndexRefreshInfoReplayExecutor executor;
+            EQ(OB_SUCCESS, executor.init(ctx, checkpoint_before, pin, true /*floor_pin_only*/));
+            replay_results[repeat] = executor.do_replay_(tablet_handle);
+          }
+          EQ(OB_SUCCESS, ls_handle.get_ls()->get_mds_table()->get_mds_checkpoint_scn(checkpoint_after));
+          if (checkpoint_before == checkpoint_after) {
+            EQ(OB_NO_NEED_UPDATE, replay_results[0]);
+            EQ(OB_NO_NEED_UPDATE, replay_results[1]);
+            checked_equality = true;
+          } else {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+          }
+        }
+        ASSERT_TRUE(checked_equality) << "MDS checkpoint did not stabilize for equality replay";
+      } else {
+        mds::MdsCtx ctx;
+        ObTabletAsyncIndexRefreshInfoReplayExecutor executor;
+        EQ(OB_SUCCESS, executor.init(ctx, replay_scns[i], pin, true /*floor_pin_only*/));
+        EQ(0 == i ? OB_NO_NEED_UPDATE : OB_SIZE_OVERFLOW, executor.do_replay_(tablet_handle));
+      }
+
+      ObTabletAsyncIndexRefreshInfo actual;
+      EQ(OB_SUCCESS, tablet_handle.get_obj()->get_async_index_refresh_info(SCN::max_scn(), actual));
+      ASSERT_EQ(full_info.has_async_index(), actual.has_async_index());
+      ASSERT_EQ(full_info.get_published_version(), actual.get_published_version());
+      ASSERT_EQ(MAX_INC_MAJOR_SSTABLE_CNT, actual.get_refresh_snapshots().count());
+      for (int64_t j = 0; j < MAX_INC_MAJOR_SSTABLE_CNT; ++j) {
+        ASSERT_EQ(full_info.get_refresh_snapshots().at(j), actual.get_refresh_snapshots().at(j));
+      }
+    }
   }
 }
 

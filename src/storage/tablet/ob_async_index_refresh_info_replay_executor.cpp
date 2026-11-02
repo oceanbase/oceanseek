@@ -4,6 +4,7 @@
  */
 
 #include "storage/tablet/ob_async_index_refresh_info_replay_executor.h"
+#include "storage/tx_storage/ob_ls_service.h"
 #define USING_LOG_PREFIX STORAGE
 
 using namespace oceanbase::storage::mds;
@@ -107,9 +108,33 @@ int ObTabletAsyncIndexRefreshInfoReplayExecutor::do_replay_(ObTabletHandle &tabl
       trans_state,
       user_ctx->get_writer()))) {
   } else if (floor_pin_only_) {
+    ObLSHandle ls_handle;
+    ObLSService *ls_service = MTL(ObLSService *);
+    share::SCN mds_checkpoint_scn;
+    // A durable floor-pin must be skipped before merging it with newer state.
+    // Otherwise an obsolete pin can overflow the current checkpoint array before
+    // replay_mds_node_ gets a chance to perform the same durability check.
+    if (OB_ISNULL(ls_service)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ls service is null", KR(ret));
+    } else if (OB_FAIL(ls_service->get_ls(
+        tablet->get_tablet_meta().ls_id_, ls_handle, ObLSGetMod::MDS_TABLE_MOD))) {
+      LOG_WARN("failed to get ls for floor-pin replay", KR(ret), K_(scn));
+    } else if (OB_ISNULL(ls_handle.get_ls())
+        || OB_ISNULL(ls_handle.get_ls()->get_mds_table())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ls or mds table is null", KR(ret));
+    } else if (OB_FAIL(ls_handle.get_ls()->get_mds_table()->get_mds_checkpoint_scn(
+        mds_checkpoint_scn))) {
+      LOG_WARN("failed to get mds checkpoint for floor-pin replay", KR(ret), K_(scn));
+    } else if (scn_ <= mds_checkpoint_scn) {
+      ret = OB_NO_NEED_UPDATE;
+    }
     ObTabletAsyncIndexRefreshInfo current_info;
     int tmp_ret = OB_SUCCESS;
-    if (OB_TMP_SUCC(tablet->get_async_index_refresh_info(share::SCN::max_scn(), current_info))) {
+    if (OB_FAIL(ret)) {
+      // Keep checkpoint lookup errors and the durable-log skip result.
+    } else if (OB_TMP_SUCC(tablet->get_async_index_refresh_info(share::SCN::max_scn(), current_info))) {
       if (!current_info.need_apply_floor_pin(*info_)) {
         const common::ObIArray<int64_t> &snapshots = current_info.get_refresh_snapshots();
         const common::ObIArray<int64_t> &new_snapshots = info_->get_refresh_snapshots();
