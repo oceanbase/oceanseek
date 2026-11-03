@@ -404,7 +404,8 @@ OB_SERIALIZE_MEMBER((ObPluginScanTask, ObFileScanTask),
                     part_id_,
                     plugin_task_json_,
                     record_count_,
-                    reader_type_);
+                    reader_type_,
+                    assigned_file_bytes_);
 
 int ObPluginScanTask::init_with_opt_lake_table_file(ObIAllocator &allocator,
                                                     const ObIOptLakeTableFile &opt_table_file)

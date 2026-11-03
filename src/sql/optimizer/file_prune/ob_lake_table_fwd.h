@@ -442,6 +442,7 @@ public:
 
   ObString plugin_task_json_;  // Empty for OB file tasks
   ObPluginReaderType reader_type_;
+  int64_t assigned_file_bytes_ = -1;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObPluginScanTask);
   int assign(const ObPluginScanTask &other);
