@@ -173,35 +173,27 @@ private:
 // entries. Both buffers must stay valid for the duration of the call (they do:
 // they live in the fs arena).
 int collect_entries_(const common::ObString &dir, bool with_directories,
-                     int64_t &entry_count, uint64_t tenant_id,
-                     const common::ObString &access_info)
+                     int64_t &entry_count, const common::ObString &access_info)
 {
   int ret = OB_SUCCESS;
   entry_count = 0;
   StorageInfoHolder storage_holder;
+  ObExtCountingCollector file_collector;
   if (OB_FAIL(storage_holder.init(dir, access_info))) {
     LOG_WARN("ext collect_entries init storage failed", K(ret), K(dir));
+  } else if (OB_FAIL(common::ObExternalIoAdapter::list_files(
+      dir, storage_holder.storage_info_, file_collector))) {
+    LOG_WARN("ext collect_entries list_files failed", K(ret), K(dir));
   } else {
-    ExtStorageTenantGuard storage_tenant_guard(tenant_id);
-    common::ObStorageUtil util;
-    ObExtCountingCollector file_collector;
-    if (OB_FAIL(util.open(storage_holder.storage_info_))) {
-      LOG_WARN("ext collect_entries open storage util failed", K(ret), K(dir));
-    } else if (OB_FAIL(util.list_files(dir, file_collector))) {
-      util.close();
-      LOG_WARN("ext collect_entries list_files failed", K(ret), K(dir));
-    } else {
-      entry_count += file_collector.count();
-      if (with_directories && 0 == entry_count) {
-        ObExtCountingCollector dir_collector;
-        dir_collector.set_dir_flag();
-        if (OB_FAIL(util.list_directories(dir, dir_collector))) {
-          LOG_WARN("ext collect_entries list_directories failed", K(ret), K(dir));
-        } else {
-          entry_count += dir_collector.count();
-        }
+    entry_count += file_collector.count();
+    if (with_directories && 0 == entry_count) {
+      ObExtCountingCollector dir_collector;
+      if (OB_FAIL(common::ObExternalIoAdapter::list_directories(
+          dir, storage_holder.storage_info_, dir_collector))) {
+        LOG_WARN("ext collect_entries list_directories failed", K(ret), K(dir));
+      } else {
+        entry_count += dir_collector.count();
       }
-      util.close();
     }
   }
   return ret;
@@ -491,50 +483,41 @@ int ObExtDefaultFileSystem::get_file_status_(const common::ObString &path, int64
   size = -1;
   mtime_ms = -1;
   is_dir = false;
+  ExtStorageTenantGuard storage_tenant_guard(tenant_id_);
   StorageInfoHolder storage_holder;
   if (OB_FAIL(storage_holder.init(path, access_info_))) {
     LOG_WARN("ext get_file_status init storage failed", K(ret), K(path));
   } else {
-    ExtStorageTenantGuard storage_tenant_guard(tenant_id_);
     common::ObIODFileStat statbuf;
     const int stat_ret =
         common::ObExternalIoAdapter::get_file_stat(path, storage_holder.storage_info_, statbuf);
-    if (OB_SUCC(stat_ret)) {
+    if (OB_SUCCESS == stat_ret) {
       size = static_cast<int64_t>(statbuf.size_);
       mtime_ms = statbuf.mtime_s_ * 1000;
       is_dir = S_ISDIR(statbuf.mode_);
     } else {
-      // The adapter's is_directory only supports HDFS. Preserve the local
-      // directory and object-store prefix fallback through ObStorageUtil.
-      common::ObStorageUtil util;
-      if (OB_FAIL(util.open(storage_holder.storage_info_))) {
-        LOG_WARN("ext get_file_status open storage util failed", K(ret), K(path));
-      } else {
-        // Preserve directory/error fallback when ordinary file stat fails.
-        // Local directories have length -1; object-store prefixes may have
-        // no object metadata and require a non-empty listing.
-        bool is_directory = false;
-        const int dir_ret = util.is_directory(path, false, is_directory);
-        util.close();
-        bool treat_as_dir = (OB_SUCCESS == dir_ret) && is_directory;
-        if (!treat_as_dir) {
-          int64_t entry_count = 0;
-          const int list_ret = collect_entries_(path, true, entry_count, tenant_id_, access_info_);
-          if (OB_SUCCESS == list_ret) {
-            treat_as_dir = entry_count > 0;
-          } else {
-            ret = list_ret;
-            LOG_WARN("ext get_file_status collect_entries failed", K(ret), K(path));
-          }
+      // 目录可能没有可用的文件 stat，继续通过目录元数据和非空列表判断。
+      bool is_directory = false;
+      const int dir_ret = common::ObExternalIoAdapter::is_directory_by_meta(
+          path, storage_holder.storage_info_, is_directory);
+      bool treat_as_dir = (OB_SUCCESS == dir_ret) && is_directory;
+      if (!treat_as_dir) {
+        int64_t entry_count = 0;
+        const int list_ret = collect_entries_(path, true, entry_count, access_info_);
+        if (OB_SUCCESS == list_ret) {
+          treat_as_dir = entry_count > 0;
+        } else {
+          ret = list_ret;
+          LOG_WARN("ext get_file_status collect_entries failed", K(ret), K(path));
         }
-        if (OB_SUCC(ret) && treat_as_dir) {
-          is_dir = true;
-          size = 0;
-          mtime_ms = 0;
-        } else if (OB_SUCC(ret)) {
-          ret = stat_ret;
-          LOG_WARN("ext get_file_status get_file_stat failed", K(ret), K(path));
-        }
+      }
+      if (OB_SUCC(ret) && treat_as_dir) {
+        is_dir = true;
+        size = 0;
+        mtime_ms = 0;
+      } else if (OB_SUCC(ret)) {
+        ret = stat_ret;
+        LOG_WARN("ext get_file_status get_file_stat failed", K(ret), K(path));
       }
     }
   }
@@ -636,39 +619,32 @@ int32_t ObExtDefaultFileSystem::exists(const char *path)
     }
   }
   if (-1 == result && OB_SUCC(ret)) {
+    ExtStorageTenantGuard storage_tenant_guard(tenant_id_);
     StorageInfoHolder storage_holder;
     bool is_exist = false;
     if (OB_FAIL(storage_holder.init(resolved, access_info_))) {
       LOG_WARN("ext exists init storage failed", K(ret), K(resolved));
+    } else if (OB_FAIL(common::ObExternalIoAdapter::is_exist(
+        resolved, storage_holder.storage_info_, is_exist))) {
+      LOG_WARN("ext exists is_exist failed", K(ret), K(resolved));
     } else {
-      ExtStorageTenantGuard storage_tenant_guard(tenant_id_);
-      common::ObStorageUtil util;
-      if (OB_FAIL(util.open(storage_holder.storage_info_))) {
-        LOG_WARN("ext exists open storage util failed", K(ret), K(resolved));
-      } else if (OB_FAIL(util.is_exist(resolved, false, is_exist))) {
-        util.close();
-        LOG_WARN("ext exists is_exist failed", K(ret), K(resolved));
-      } else {
-        util.close();
-        if (!is_exist) {
-          int64_t entry_count = 0;
-          const int list_ret = collect_entries_(resolved, true, entry_count, tenant_id_,
-                                                access_info_);
-          if (OB_SUCCESS == list_ret) {
-            result = entry_count > 0 ? 1 : 0;
-          } else if (OB_HDFS_PATH_NOT_FOUND == list_ret) {
+      if (!is_exist) {
+        int64_t entry_count = 0;
+        const int list_ret = collect_entries_(resolved, true, entry_count, access_info_);
+        if (OB_SUCCESS == list_ret) {
+          result = (entry_count > 0) ? 1 : 0;
+        } else if (OB_HDFS_PATH_NOT_FOUND == list_ret) {
             // HDFS reports a missing path as OB_HDFS_PATH_NOT_FOUND when
             // listing it; combined with is_exist=false above this is a
             // definitive "does not exist" answer, not an error. (Local/OSS
             // backends return SUCCESS with an empty listing instead.)
-            result = 0;
-            LOG_TRACE("ext exists path not found on hdfs", K(list_ret), K(resolved));
-          } else {
-            LOG_WARN("ext exists collect_entries failed", K(list_ret), K(resolved));
-          }
+          result = 0;
+          LOG_TRACE("ext exists path not found on hdfs", K(list_ret), K(resolved));
         } else {
-          result = 1;
+          LOG_WARN("ext exists collect_entries failed", K(list_ret), K(resolved));
         }
+      } else {
+        result = 1;
       }
     }
     // Record definite answers; errors are not cached. size/mtime stay -1: a
@@ -792,26 +768,20 @@ int32_t ObExtDefaultFileSystem::list_dir(const char *dir,
       // on the dirent. Each entry is streamed straight to `cb` via
       // ObExtListDirCbCollector (no cross-boundary container). An empty /
       // non-existent dir yields OB_SUCCESS with zero callbacks.
+      ExtStorageTenantGuard storage_tenant_guard(tenant_id_);
       StorageInfoHolder storage_holder;
       if (OB_FAIL(storage_holder.init(resolved, access_info_))) {
         LOG_WARN("ext list_dir init storage failed", K(ret), K(resolved));
       } else {
-        ExtStorageTenantGuard storage_tenant_guard(tenant_id_);
-        common::ObStorageUtil util;
-        if (OB_FAIL(util.open(storage_holder.storage_info_))) {
-          LOG_WARN("ext list_dir open storage util failed", K(ret), K(resolved));
+        ObExtListDirCbCollector file_collector(cb, cb_ctx, /*is_dir=*/0);
+        if (OB_FAIL(common::ObExternalIoAdapter::list_files(
+            resolved, storage_holder.storage_info_, file_collector))) {
+          LOG_WARN("ext list_dir list_files failed", K(ret), K(resolved));
         } else {
-          ObExtListDirCbCollector file_collector(cb, cb_ctx, /*is_dir=*/0);
-          if (OB_FAIL(util.list_files(resolved, file_collector))) {
-            util.close();
-            LOG_WARN("ext list_dir list_files failed", K(ret), K(resolved));
-          } else {
-            ObExtListDirCbCollector dir_collector(cb, cb_ctx, /*is_dir=*/1);
-            dir_collector.set_dir_flag();
-            if (OB_FAIL(util.list_directories(resolved, dir_collector))) {
-              LOG_WARN("ext list_dir list_directories failed", K(ret), K(resolved));
-            }
-            util.close();
+          ObExtListDirCbCollector dir_collector(cb, cb_ctx, /*is_dir=*/1);
+          if (OB_FAIL(common::ObExternalIoAdapter::list_directories(
+              resolved, storage_holder.storage_info_, dir_collector))) {
+            LOG_WARN("ext list_dir list_directories failed", K(ret), K(resolved));
           }
         }
       }

@@ -130,6 +130,10 @@ public:
   static int is_directory(const common::ObString &uri,
                           const common::ObObjectStorageInfo *storage_info,
                           bool &is_directory);
+  // 按存储元数据判断目录类型，空文件不视为目录。
+  static int is_directory_by_meta(const common::ObString &uri,
+                                  const common::ObObjectStorageInfo *storage_info,
+                                  bool &is_directory);
   static int list_files(const common::ObString &dir_path,
                         const common::ObObjectStorageInfo *storage_info,
                         common::ObBaseDirEntryOperator &op);
@@ -346,7 +350,6 @@ public:
   explicit ObExternalIoAdapter() {}
   virtual ~ObExternalIoAdapter() {}
 
-
   static int open_with_access_type(ObIODevice *&device_handle, ObIOFd &fd, 
                                    const common::ObObjectStorageInfo *storage_info,
                                    const common::ObString &uri,
@@ -405,8 +408,8 @@ public:
                                                         char *, digest_buf,
                                                         const int64_t, digest_buf_len)
 
-  EXTERNAL_IO_ADAPTER_FUNCTION(del_file, const common::ObString &, uri, 
-                                         const common::ObObjectStorageInfo *, storage_info) 
+  EXTERNAL_IO_ADAPTER_FUNCTION(del_file, const common::ObString &, uri,
+                                         const common::ObObjectStorageInfo *, storage_info)
   EXTERNAL_IO_ADAPTER_FUNCTION(adaptively_del_file, const common::ObString &, uri, 
                                                     const common::ObObjectStorageInfo *, storage_info)
   static int batch_del_files(const common::ObObjectStorageInfo *storage_info, const ObIArray<ObString> &files_to_delete, ObIArray<int64_t> &failed_files_idx)
@@ -424,6 +427,9 @@ public:
   EXTERNAL_IO_ADAPTER_FUNCTION(is_directory, const common::ObString &, uri, 
                                              const common::ObObjectStorageInfo *, storage_info, 
                                              bool &, is_directory) 
+  EXTERNAL_IO_ADAPTER_FUNCTION(is_directory_by_meta, const common::ObString &, uri,
+                                                     const common::ObObjectStorageInfo *, storage_info,
+                                                     bool &, is_directory)
   EXTERNAL_IO_ADAPTER_FUNCTION(list_files, const common::ObString &, dir_path, 
                                             const common::ObObjectStorageInfo *, storage_info, 
                                             common::ObBaseDirEntryOperator &, op) 
@@ -440,7 +446,7 @@ public:
     ObString new_uri;
     if (OB_FAIL(switch_s3_compatible_to_s3(allocator, uri, new_uri))) {
       OB_LOG(WARN, "fail to switch S3 alias to s3", K(ret));
-    } else if (OB_FAIL(ObBackupIoAdapter::del_dir(uri, storage_info, recursive))) {
+    } else if (OB_FAIL(ObBackupIoAdapter::del_dir(new_uri, storage_info, recursive))) {
       OB_LOG(WARN, "fail to get and init device", K(ret), KPC(storage_info), K(recursive));
     }
     return ret;

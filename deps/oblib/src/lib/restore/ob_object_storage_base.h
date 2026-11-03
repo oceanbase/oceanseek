@@ -186,6 +186,22 @@ private:
   uint64_t old_io_group_id_;
 };
 
+// 显式指定一次存储访问的租户，供 Adapter 使用，不切换当前线程的 MTL。
+class ObStorageAccessTenantGuard : public ObObjectStorageTenantGuard
+{
+public:
+  ObStorageAccessTenantGuard(const uint64_t tenant_id, const int64_t timeout_us);
+  virtual ~ObStorageAccessTenantGuard() override;
+
+  // 未指定目标时返回 OB_INVALID_TENANT_ID，由调用方沿用 MTL；租户 500 也可以被显式指定。
+  static uint64_t get_target_tenant_id() { return tl_target_tenant_id_; }
+
+private:
+  static thread_local uint64_t tl_target_tenant_id_;
+  uint64_t old_target_tenant_id_;
+  DISALLOW_COPY_AND_ASSIGN(ObStorageAccessTenantGuard);
+};
+
 } // common
 } // oceanbase
 

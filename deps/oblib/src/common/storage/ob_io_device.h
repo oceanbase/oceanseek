@@ -392,6 +392,8 @@ public:
   virtual int truncate(const char *pathname, const int64_t len) = 0;
   virtual int exist(const char *pathname, bool &is_exist) = 0;
   virtual int stat(const char *pathname, ObIODFileStat &statbuf) = 0;
+  // 查询路径是否为目录；默认实现返回 OB_NOT_SUPPORTED，由具体设备按需实现。
+  virtual int is_directory(const char *pathname, bool &is_directory);
   virtual int fstat(const ObIOFd &fd, ObIODFileStat &statbuf) = 0;
   virtual int del_unmerged_parts(const char *pathname) = 0;
   virtual int adaptive_exist(const char *pathname, bool &is_exist) = 0;

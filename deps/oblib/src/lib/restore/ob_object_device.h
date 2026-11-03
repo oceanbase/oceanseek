@@ -164,6 +164,7 @@ public:
   virtual int scan_dir(const char *dir_name, ObBaseDirEntryOperator &op) override;
   virtual int is_tagging(const char *pathname, bool &is_tagging) override;
   virtual int stat(const char *pathname, ObIODFileStat &statbuf) override;
+  virtual int is_directory(const char *pathname, bool &is_directory) override;
   //add new
   virtual int get_config(ObIODOpts &opts) override;
 

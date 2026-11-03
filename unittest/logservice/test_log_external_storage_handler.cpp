@@ -59,6 +59,30 @@ int generate_oss_data(const common::ObString &uri,
   return ret;
 }
 
+// 打开设备前拒绝缺失凭据、无效并发度和不支持的打开方式。
+TEST(TestLogExternalStorageCtx, rejects_invalid_inputs)
+{
+  ObLogExternalStorageCtx ctx;
+  const ObString storage_info;
+  const uint64_t storage_id = 2;
+  const ObString uri("file:///unused_log_ctx_path");
+  EXPECT_EQ(OB_INVALID_ARGUMENT, ctx.init("s3://bucket/object", storage_info, storage_id,
+      1, OPEN_FLAG::READ_FLAG));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, ctx.init(ObString(), storage_info, storage_id,
+      1, OPEN_FLAG::READ_FLAG));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, ctx.init(uri, storage_info, storage_id,
+      0, OPEN_FLAG::READ_FLAG));
+  EXPECT_EQ(OB_NOT_SUPPORTED, ctx.init(uri, storage_info, storage_id,
+      1, OPEN_FLAG::INVALID_FLAG));
+  EXPECT_EQ(OB_NOT_SUPPORTED, ctx.init(uri, storage_info, storage_id,
+      1, OPEN_FLAG::APPEND_FLAG));
+  EXPECT_EQ(OB_NOT_SUPPORTED, ctx.init(uri, storage_info, storage_id,
+      1, static_cast<OPEN_FLAG>(-1)));
+  EXPECT_EQ(OB_NOT_SUPPORTED, ctx.init(uri, storage_info, storage_id,
+      1, OPEN_FLAG::MAX_FLAG));
+  EXPECT_FALSE(ctx.is_valid());
+}
+
 TEST(TestLogExternalStorageHandler, test_log_external_storage_handler)
 {
   ObLogExternalStorageHandler handler;
@@ -108,7 +132,15 @@ TEST(TestLogExternalStorageHandler, test_log_external_storage_handler)
     EXPECT_EQ(OB_INVALID_ARGUMENT, handler.pread(empty_uri, storage_info, storage_id, offset, read_buf, read_buf_size, real_read_size, io_ctx));
     // NFS的storage info为empty
     ObString empty_storage_info;
-    EXPECT_EQ(OB_SUCCESS, handler.pread(uri, storage_info, storage_id, offset, read_buf, read_buf_size, real_read_size, io_ctx));
+    ObLogExternalStorageHandleAdapter adapter;
+    bool exists = false;
+    int64_t file_size = 0;
+    ASSERT_EQ(OB_SUCCESS, adapter.exist(uri, empty_storage_info, exists));
+    EXPECT_TRUE(exists);
+    ASSERT_EQ(OB_SUCCESS, adapter.get_file_size(uri, empty_storage_info, file_size));
+    EXPECT_EQ(palf::PALF_PHY_BLOCK_SIZE, file_size);
+    EXPECT_EQ(OB_SUCCESS, handler.pread(uri, empty_storage_info, storage_id, offset, read_buf, read_buf_size, real_read_size, io_ctx));
+    EXPECT_EQ(read_buf_size, real_read_size);
     int64_t invalid_offset = -1;
     EXPECT_EQ(OB_INVALID_ARGUMENT, handler.pread(uri, storage_info, storage_id, invalid_offset, read_buf, read_buf_size, real_read_size, io_ctx));
     // 读偏移等于文件长度，返回成功，real_read_size=0

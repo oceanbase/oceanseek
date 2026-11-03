@@ -4,3 +4,4 @@ ob_unittest(test_plugin_load_param sys/test_plugin_load_param.cpp)
 ob_unittest(test_properties share/test_properties.cpp)
 
 ob_unittest(test_external_format external_table/test_external_format.cpp)
+ob_unittest(test_ext_file_system external_table/test_ext_file_system.cpp)

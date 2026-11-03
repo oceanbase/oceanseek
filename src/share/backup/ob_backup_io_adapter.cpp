@@ -347,16 +347,14 @@ int ObBackupIoAdapter::adaptively_is_exist(const common::ObString &uri, const co
   return ret;
 }
 
-int ObBackupIoAdapter::get_file_length(const common::ObString &uri, const common::ObObjectStorageInfo *storage_info, int64_t &file_length)
+int ObBackupIoAdapter::get_file_length(const common::ObString &uri,
+    const common::ObObjectStorageInfo *storage_info, int64_t &file_length)
 {
   int ret = OB_SUCCESS;
   ObIODFileStat statbuf;
   file_length = -1;
-  DeviceGuard device_guard;
-  if (OB_FAIL(device_guard.init(uri, storage_info, ObStorageIdMod::get_default_id_mod()))) {
-    OB_LOG(WARN, "fail to init device guard", KR(ret), K(uri), KPC(storage_info));
-  } else if (OB_FAIL(OB_IO_MANAGER.stat(get_tenant_id(), device_guard.fd_, device_guard.uri_cstr_, statbuf))) {
-    OB_LOG(WARN, "fail to get file length!", KR(ret), K(uri), KPC(storage_info), K(device_guard));
+  if (OB_FAIL(get_file_stat(uri, storage_info, statbuf))) {
+    OB_LOG(WARN, "fail to get file length", KR(ret), K(uri), KPC(storage_info));
   } else {
     file_length = statbuf.size_;
   }
@@ -399,11 +397,8 @@ int ObBackupIoAdapter::get_file_modify_time(const common::ObString &uri,
   int ret = OB_SUCCESS;
   ObIODFileStat statbuf;
   modify_time_s = -1;
-  DeviceGuard device_guard;
-  if (OB_FAIL(device_guard.init(uri, storage_info, ObStorageIdMod::get_default_id_mod()))) {
-    OB_LOG(WARN, "fail to init device guard", KR(ret), K(uri), KPC(storage_info));
-  } else if (OB_FAIL(OB_IO_MANAGER.stat(get_tenant_id(), device_guard.fd_, device_guard.uri_cstr_, statbuf))) {
-    OB_LOG(WARN, "fail to get file stat!", KR(ret), K(uri), KPC(storage_info), K(device_guard));
+  if (OB_FAIL(get_file_stat(uri, storage_info, statbuf))) {
+    OB_LOG(WARN, "fail to get file stat", KR(ret), K(uri), KPC(storage_info));
   } else {
     modify_time_s = statbuf.mtime_s_;
     if (OB_UNLIKELY(modify_time_s <= 0)) {
@@ -1557,6 +1552,23 @@ int ObBackupIoAdapter::is_directory(
   return ret;
 }
 
+int ObBackupIoAdapter::is_directory_by_meta(
+    const common::ObString &uri, const common::ObObjectStorageInfo *storage_info,
+    bool &is_directory)
+{
+  int ret = OB_SUCCESS;
+  is_directory = false;
+  DeviceGuard device_guard;
+  if (OB_FAIL(device_guard.init(uri, storage_info, ObStorageIdMod::get_default_id_mod()))) {
+    OB_LOG(WARN, "fail to init device guard", KR(ret), K(uri), KPC(storage_info));
+  } else if (OB_FAIL(device_guard.device_handle_->is_directory(
+      device_guard.uri_cstr_, is_directory))) {
+    OB_LOG(WARN, "fail to check directory type",
+        KR(ret), K(uri), KPC(storage_info), K(device_guard));
+  }
+  return ret;
+}
+
 int ObBackupIoAdapter::set_access_type(ObIODOpts* opts, bool is_appender, int max_opt_num)
 {
   int ret = OB_SUCCESS;
@@ -1816,7 +1828,11 @@ int ObBackupIoAdapter::async_io_manager_upload(
 
 uint64_t ObBackupIoAdapter::get_tenant_id()
 {
-  uint64_t tenant_id = MTL_ID();
+  // 仅显式指定的访问目标优先；普通存储 guard 不改变原有的 MTL 选择规则。
+  uint64_t tenant_id = ObStorageAccessTenantGuard::get_target_tenant_id();
+  if (OB_INVALID_TENANT_ID == tenant_id) {
+    tenant_id = MTL_ID();
+  }
   if (is_virtual_tenant_id(tenant_id) || (0 == tenant_id)) {
     tenant_id = OB_SERVER_TENANT_ID; // use 500 tenant in io manager
   }

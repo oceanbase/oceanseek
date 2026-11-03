@@ -67,5 +67,20 @@ int64_t ObObjectStorageTenantGuard::get_timeout_ms()
   return tl_timeout_us_ / 1000;
 }
 
+thread_local uint64_t ObStorageAccessTenantGuard::tl_target_tenant_id_ = OB_INVALID_TENANT_ID;
+
+ObStorageAccessTenantGuard::ObStorageAccessTenantGuard(
+    const uint64_t tenant_id, const int64_t timeout_us)
+    : ObObjectStorageTenantGuard(tenant_id, timeout_us),
+      old_target_tenant_id_(tl_target_tenant_id_)
+{
+  tl_target_tenant_id_ = tenant_id;
+}
+
+ObStorageAccessTenantGuard::~ObStorageAccessTenantGuard()
+{
+  tl_target_tenant_id_ = old_target_tenant_id_;
+}
+
 } // common
 } // oceanbase

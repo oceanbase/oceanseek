@@ -159,6 +159,14 @@ int ObDirRegularEntryNameFilter::func(const dirent *entry)
 /**
  * -------------------------------------ObIODevice--------------------------------------------
  */
+int ObIODevice::is_directory(const char *pathname, bool &is_directory)
+{
+  int ret = OB_NOT_SUPPORTED;
+  is_directory = false;
+  LOG_WARN("device does not support directory type query", KR(ret), KCSTRING(pathname));
+  return ret;
+}
+
 int ObIODevice::scan_dir_with_prefix(
     const char *dir_name,
     const char *file_prefix,

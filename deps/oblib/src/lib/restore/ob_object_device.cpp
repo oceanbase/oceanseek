@@ -990,6 +990,16 @@ int ObObjectDevice::inner_stat_(const char *pathname,
   return ret;
 }
 
+int ObObjectDevice::is_directory(const char *pathname, bool &is_directory)
+{
+  int ret = OB_SUCCESS;
+  const ObString uri(pathname);
+  if (OB_FAIL(util_.is_directory(uri, false/*is_adaptive*/, is_directory))) {
+    OB_LOG(WARN, "fail to check directory type", KR(ret), K(uri));
+  }
+  return ret;
+}
+
 int ObObjectDevice::get_file_content_digest(
     const char *pathname, char *digest_buf, const int64_t digest_buf_len)
 {

@@ -6,7 +6,6 @@
 #define OCEABASE_LOGSERVICE_OB_LOG_EXTERNAL_STORAGE_UTILS_H_
 #include "lib/utility/ob_print_utils.h"                       // TO_STRING_KV
 #include "lib/container/ob_fixed_array.h"                     // ObFixedArray
-#include "common/storage/ob_device_common.h"                  // ObStorageAccessType
 #include "common/storage/ob_io_device.h"                      // ObIODevice
 #include "share/io/ob_io_define.h"                            // ObIOHandle
 namespace oceanbase
@@ -17,13 +16,6 @@ class ObString;
 }
 namespace logservice
 {
-int get_and_init_io_device(const common::ObString &uri,
-                           const common::ObString &storage_info,
-                           const uint64_t storage_id,
-                           common::ObIODevice *&io_device);
-
-void release_io_device(common::ObIODevice *&io_device);
-
 enum class OPEN_FLAG{
   INVALID_FLAG = 0,
   READ_FLAG = 1,
@@ -31,17 +23,6 @@ enum class OPEN_FLAG{
   MULTI_UPLOAD_FLAG = 3,
   MAX_FLAG = 4
 };
-
-int convert_to_storage_access_type(const OPEN_FLAG &open_flag,
-                                   common::ObStorageAccessType &storage_access_type);
-
-int open_io_fd(const common::ObString &uri,
-               const OPEN_FLAG open_flag,
-               common::ObIODevice *io_device,
-               common::ObIOFd &io_fd);
-
-int close_io_fd(common::ObIODevice *io_device,
-                const common::ObIOFd &io_fd);
 
 class ObLogExternalStorageCtxItem {
 public:

@@ -25,7 +25,7 @@
 #define OB_EXT_FILE_SYSTEM_COMMON_H
 
 #include "lib/restore/ob_storage.h"  // ObStorageUtil, ObStorageType, get_storage_type_from_path_for_external_table
-#include "lib/restore/ob_object_storage_base.h"  // ObObjectStorageTenantGuard
+#include "lib/restore/ob_object_storage_base.h"  // ObStorageAccessTenantGuard
 #include "share/backup/ob_backup_struct.h"  // ObExternalTableStorageInfo
 #include "share/external_table/ob_hdfs_storage_info.h"  // ObHDFSStorageInfo
 #include "share/external_table/ob_external_table_path_util.h"  // share::make_ob_stringview
@@ -83,13 +83,12 @@ struct StorageInfoHolder
   DISALLOW_COPY_AND_ASSIGN(StorageInfoHolder);
 };
 
-/// RAII tenant scope for an external-storage metadata op. Pairs with
-/// `StorageInfoHolder` + `ObStorageUtil` for its metadata calls.
-class ExtStorageTenantGuard final : public common::ObObjectStorageTenantGuard
+// 元数据操作使用文件系统所属租户的 IO 上下文和超时，不切换调用线程的 MTL。
+class ExtStorageTenantGuard final : public common::ObStorageAccessTenantGuard
 {
 public:
   explicit ExtStorageTenantGuard(const uint64_t tenant_id)
-      : common::ObObjectStorageTenantGuard(
+      : common::ObStorageAccessTenantGuard(
             tenant_id, OB_IO_MANAGER.get_object_storage_io_timeout_ms(tenant_id) * 1000LL)
   {
   }
