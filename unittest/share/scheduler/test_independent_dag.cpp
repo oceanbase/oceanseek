@@ -1275,6 +1275,66 @@ public:
   int ret_;
 };
 
+TEST_F(TestIndependentDag, monitor_registration_replaces_finished_node)
+{
+  omt::ObMultiTenant omt;
+  auto *saved_omt = GCTX.omt_;
+  GCTX.omt_ = &omt;
+  DEFER(GCTX.omt_ = saved_omt);
+  for (int drain_history = 0; drain_history < 2; ++drain_history) {
+    storage::ObDDLDagMonitorMgr mgr;
+    ASSERT_EQ(OB_SUCCESS, mgr.allocator_.init(&mgr, OB_MALLOC_NORMAL_BLOCK_SIZE,
+        ObMemAttr(MTL_ID(), "TestDagMonitor"), 1024 * 1024));
+    ASSERT_EQ(OB_SUCCESS, mgr.node_map_.create(16, "TestDagMonitor"));
+    mgr.is_inited_ = true;
+    ObDagId id;
+    ASSERT_EQ(OB_SUCCESS, ObSysTaskStatMgr::get_instance().generate_task_id(id));
+    int dag_identity = 0;
+    storage::ObDDLDagMonitorNode *history_node = nullptr;
+    ASSERT_EQ(OB_SUCCESS, mgr.register_node(&dag_identity, id, history_node));
+    storage::ObDDLDagMonitorInfo *history_info = nullptr;
+    ASSERT_EQ(OB_SUCCESS, history_node->alloc_monitor_info(nullptr, history_info));
+    history_info->mark_finished();
+    history_node->mark_finished();
+    if (drain_history) {
+      ASSERT_EQ(OB_SUCCESS, mgr.clean_nodes(storage::ObDDLDagMonitorMgr::CLEAN_FINISHED_INFO));
+    }
+    // A reader keeps the old object observable after it leaves the map.
+    ObSEArray<storage::ObDDLDagMonitorNode *, 1> readers;
+    DEFER(for (int64_t i = 0; i < readers.count(); ++i) { readers.at(i)->dec_ref(); });
+    ASSERT_EQ(OB_SUCCESS, mgr.get_all_nodes(readers));
+    storage::ObDDLDagMonitorNode *node = nullptr;
+    ASSERT_EQ(OB_SUCCESS, mgr.register_node(&dag_identity, id, node));
+    ASSERT_NE(history_node, node);
+    ASSERT_TRUE(history_node->is_finished());
+    ASSERT_EQ(drain_history ? 0 : 1, history_node->info_list_.get_size());
+    ASSERT_FALSE(node->is_finished());
+    ASSERT_TRUE(node->is_info_list_empty());
+
+    // Cleanup between register_node returning and root-info insertion must preserve it.
+    ASSERT_EQ(OB_SUCCESS, mgr.clean_nodes(storage::ObDDLDagMonitorMgr::CLEAN_EXPIRED_NODE));
+    ASSERT_EQ(1, mgr.get_node_count());
+    ASSERT_EQ(OB_SUCCESS, mgr.clean_nodes(storage::ObDDLDagMonitorMgr::CLEAN_FINISHED_INFO));
+    ASSERT_EQ(1, mgr.get_node_count());
+    storage::ObDDLDagMonitorNode *same_node = nullptr;
+    ASSERT_EQ(OB_SUCCESS, mgr.register_node(&dag_identity, id, same_node));
+    ASSERT_EQ(node, same_node);
+
+    storage::ObDDLDagMonitorInfo *root_info = nullptr;
+    ASSERT_EQ(OB_SUCCESS, node->alloc_monitor_info(nullptr, root_info));
+    root_info->mark_finished();
+    ASSERT_EQ(OB_SUCCESS, mgr.clean_nodes(storage::ObDDLDagMonitorMgr::CLEAN_FINISHED_INFO));
+    ASSERT_EQ(OB_SUCCESS, mgr.clean_nodes(storage::ObDDLDagMonitorMgr::CLEAN_EXPIRED_NODE));
+    ASSERT_EQ(1, mgr.get_node_count()); // Still unfinished even though infos are empty.
+    node->mark_finished();
+    ASSERT_EQ(OB_SUCCESS, mgr.clean_nodes(storage::ObDDLDagMonitorMgr::CLEAN_EXPIRED_NODE));
+    ASSERT_EQ(0, mgr.get_node_count());
+    readers.at(0)->dec_ref();
+    readers.reset();
+    ASSERT_EQ(0, mgr.allocator_.used());
+  }
+}
+
 TEST_F(TestIndependentDag, table_load_monitor_initialization)
 {
   for (int fail = 0; fail < 2; ++fail) {
