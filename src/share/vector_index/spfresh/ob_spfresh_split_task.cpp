@@ -123,6 +123,7 @@ int ObSpfreshSplitTask::execute(const common::ObTabletID &physical_tablet_id)
   int64_t start_time = ObTimeUtility::current_time();
   ObArray<float *> new_centroids;
   bool lock_acquired = false;
+  bool compensation_failed = false;
 
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
@@ -130,10 +131,12 @@ int ObSpfreshSplitTask::execute(const common::ObTabletID &physical_tablet_id)
   } else if (!physical_tablet_id.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid physical split tablet", K(ret), K(physical_tablet_id));
-  } else if (OB_FAIL(acquire_lock_(lock_scn_, lock_acquired))) {
+  } else if (OB_FAIL(acquire_lock_(lock_scn_, lock_acquired, compensation_failed))) {
     // A state mismatch means the centroid already advanced or another worker
     // won the CAS, so this attempt is an idempotent skip rather than a failure.
-    if (OB_STATE_NOT_MATCH == ret || OB_ENTRY_NOT_EXIST == ret) {
+    // A compensation failure can carry the same error code and must propagate.
+    if (!compensation_failed
+        && (OB_STATE_NOT_MATCH == ret || OB_ENTRY_NOT_EXIST == ret)) {
       LOG_TRACE("[SPFRESH_TRACE] centroid state not ready, benign skip split",
                 KR(ret), K_(center_id));
       ret = OB_SUCCESS;
@@ -287,11 +290,13 @@ int ObSpfreshSplitTask::finish_split_(
   return ret;
 }
 
-int ObSpfreshSplitTask::acquire_lock_(SCN &cur_scn, bool &lock_success)
+int ObSpfreshSplitTask::acquire_lock_(
+    SCN &cur_scn, bool &lock_success, bool &compensation_failed)
 {
   int ret = OB_SUCCESS;
   cur_scn = SCN::min_scn();
   lock_success = false;
+  compensation_failed = false;
   const char *lock_source = "none";
 
   if (OB_ISNULL(cache_)) {
@@ -308,6 +313,10 @@ int ObSpfreshSplitTask::acquire_lock_(SCN &cur_scn, bool &lock_success)
       }
       ret = OB_STATE_NOT_MATCH;
       LOG_TRACE("[SPFRESH_TRACE] centroid already SPLIT_DONE, skip split", KR(ret), K_(center_id));
+    } else if (ObIvfCentroidState::NORMAL != centroid_info.state_) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_TRACE("[SPFRESH_TRACE] centroid is not NORMAL, skip split", K(ret),
+                K_(center_id), "state", static_cast<int>(centroid_info.state_));
     } else {
       if (0 == center_id_) {
         // Bootstrap centroid (center_id=0): cache-only CAS.
@@ -352,9 +361,11 @@ int ObSpfreshSplitTask::acquire_lock_(SCN &cur_scn, bool &lock_success)
             lock_success = false;
             SCN rollback_scn;
             int kv_ret = OB_SUCCESS;
-            if (OB_SUCCESS != (kv_ret = table_helper_.update_centroid_state(
-                center_id_, ObIvfCentroidState::NORMAL, ObIvfCentroidState::SPLITTING,
+            if (OB_SUCCESS != (kv_ret = table_helper_.rollback_centroid_state(
+                center_id_, ObIvfCentroidState::SPLITTING, ObIvfCentroidState::NORMAL,
                 rollback_scn))) {
+              compensation_failed = true;
+              ret = kv_ret;
               LOG_ERROR("failed to rollback KV after cache sync failure, KV/cache inconsistent",
                         K(kv_ret), K_(center_id));
             }
@@ -363,9 +374,11 @@ int ObSpfreshSplitTask::acquire_lock_(SCN &cur_scn, bool &lock_success)
             LOG_TRACE("[SPFRESH_TRACE] cache CAS not ok, another worker won", KR(ret), K_(center_id));
             SCN rollback_scn;
             int kv_ret = OB_SUCCESS;
-            if (OB_SUCCESS != (kv_ret = table_helper_.update_centroid_state(
-                center_id_, ObIvfCentroidState::NORMAL, ObIvfCentroidState::SPLITTING,
+            if (OB_SUCCESS != (kv_ret = table_helper_.rollback_centroid_state(
+                center_id_, ObIvfCentroidState::SPLITTING, ObIvfCentroidState::NORMAL,
                 rollback_scn))) {
+              compensation_failed = true;
+              ret = kv_ret;
               LOG_ERROR("failed to rollback KV after cache CAS miss, KV/cache inconsistent",
                         K(kv_ret), K_(center_id));
             }
@@ -1404,19 +1417,29 @@ int ObSpfreshSplitTask::rollback_lock_()
   if (0 != center_id_) {
     SCN rollback_scn;
     int kv_ret = OB_SUCCESS;
-    if (OB_SUCCESS != (kv_ret = table_helper_.update_centroid_state(
-        center_id_, ObIvfCentroidState::NORMAL, ObIvfCentroidState::SPLITTING,
+    if (OB_SUCCESS != (kv_ret = table_helper_.rollback_centroid_state(
+        center_id_, ObIvfCentroidState::SPLITTING, ObIvfCentroidState::NORMAL,
         rollback_scn))) {
-      LOG_WARN("failed to rollback KV centroid state", K(kv_ret), K_(center_id));
+      ret = kv_ret;
+      LOG_WARN("failed to rollback KV centroid state", K(ret), K_(center_id));
     }
   }
 
-  // Reset cache state
-  if (OB_NOT_NULL(cache_)) {
-    int cache_ret = OB_SUCCESS;
-    if (OB_SUCCESS != (cache_ret = cache_->update_centroid_state(
-        center_id_, ObIvfCentroidState::NORMAL))) {
-      LOG_WARN("failed to rollback cache centroid state", K(cache_ret), K_(center_id));
+  // Never move cache when persistent rollback was not confirmed.
+  if (OB_SUCC(ret) && OB_NOT_NULL(cache_)) {
+    bool cas_ok = false;
+    if (OB_FAIL(cache_->update_centroid_state_cas(center_id_,
+        ObIvfCentroidState::SPLITTING, ObIvfCentroidState::NORMAL, cas_ok))) {
+      LOG_WARN("failed to rollback cache centroid state", K(ret), K_(center_id));
+    } else if (!cas_ok) {
+      ObCentroidInfo info;
+      if (OB_FAIL(cache_->get_center_info(center_id_, SCN::max_scn(), info))) {
+        LOG_WARN("failed to confirm cache rollback target", K(ret), K_(center_id));
+      } else if (ObIvfCentroidState::NORMAL != info.state_) {
+        ret = OB_STATE_NOT_MATCH;
+        LOG_WARN("cache changed to a third state during rollback", K(ret), K_(center_id),
+                 "state", static_cast<int>(info.state_));
+      }
     }
   }
 

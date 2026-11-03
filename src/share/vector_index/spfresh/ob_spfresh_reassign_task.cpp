@@ -129,6 +129,7 @@ int ObSpfreshReassignTask::execute()
 {
   int ret = OB_SUCCESS;
   bool lock_acquired = false;
+  bool compensation_failed = false;
   int64_t start_time = ObTimeUtility::current_time();
 
   if (IS_NOT_INIT) {
@@ -136,12 +137,13 @@ int ObSpfreshReassignTask::execute()
     LOG_WARN("ObSpfreshReassignTask not init", K(ret));
   } else {
     // Phase 1: Acquire lock (cache filter → KV CAS → cache CAS)
-    if (OB_FAIL(acquire_lock_(lock_scn_, lock_acquired))) {
+    if (OB_FAIL(acquire_lock_(lock_scn_, lock_acquired, compensation_failed))) {
       // OB_STATE_NOT_MATCH / OB_ENTRY_NOT_EXIST from acquire_lock_ are benign
       // skips: the centroid's state is not ready for reassign (e.g. still
       // NORMAL, or removed by a concurrent worker). They are NOT real failures
       // and must not be recorded as RET_CODE!=0 in task history.
-      if (OB_STATE_NOT_MATCH == ret || OB_ENTRY_NOT_EXIST == ret) {
+      if (!compensation_failed
+          && (OB_STATE_NOT_MATCH == ret || OB_ENTRY_NOT_EXIST == ret)) {
         LOG_TRACE("[SPFRESH_TRACE] centroid state not ready, benign skip reassign",
                  KR(ret), K_(center_id));
         ret = OB_SUCCESS;
@@ -239,11 +241,13 @@ int ObSpfreshReassignTask::wait_pre_cutover_writers_ended_()
   return ret;
 }
 
-int ObSpfreshReassignTask::acquire_lock_(SCN &cur_scn, bool &lock_success)
+int ObSpfreshReassignTask::acquire_lock_(
+    SCN &cur_scn, bool &lock_success, bool &compensation_failed)
 {
   int ret = OB_SUCCESS;
   cur_scn = SCN::min_scn();
   lock_success = false;
+  compensation_failed = false;
   int old_state_for_trace = -1;
 
   if (OB_ISNULL(cache_)) {
@@ -306,9 +310,11 @@ int ObSpfreshReassignTask::acquire_lock_(SCN &cur_scn, bool &lock_success)
             // Rollback KV state
             SCN rollback_scn;
             int kv_ret = OB_SUCCESS;
-            if (OB_SUCCESS != (kv_ret = table_helper_.update_centroid_state(
-                center_id_, expected_old_state, ObIvfCentroidState::REASSIGNING,
+            if (OB_SUCCESS != (kv_ret = table_helper_.rollback_centroid_state(
+                center_id_, ObIvfCentroidState::REASSIGNING, expected_old_state,
                 rollback_scn))) {
+              compensation_failed = true;
+              ret = kv_ret;
               LOG_ERROR("rollback KV after cache CAS failure, KV/cache inconsistent",
                         K(kv_ret), K_(center_id));
             }
@@ -318,9 +324,11 @@ int ObSpfreshReassignTask::acquire_lock_(SCN &cur_scn, bool &lock_success)
             // Rollback KV state
             SCN rollback_scn;
             int kv_ret = OB_SUCCESS;
-            if (OB_SUCCESS != (kv_ret = table_helper_.update_centroid_state(
-                center_id_, expected_old_state, ObIvfCentroidState::REASSIGNING,
+            if (OB_SUCCESS != (kv_ret = table_helper_.rollback_centroid_state(
+                center_id_, ObIvfCentroidState::REASSIGNING, expected_old_state,
                 rollback_scn))) {
+              compensation_failed = true;
+              ret = kv_ret;
               LOG_ERROR("rollback KV after cache CAS miss failed, KV/cache inconsistent",
                         K(kv_ret), K_(center_id));
             }
@@ -722,18 +730,28 @@ int ObSpfreshReassignTask::rollback_lock_()
   if (0 != center_id_) {
     SCN rollback_scn;
     int kv_ret = OB_SUCCESS;
-    if (OB_SUCCESS != (kv_ret = table_helper_.update_centroid_state(
-        center_id_, lock_old_state_,
-        ObIvfCentroidState::REASSIGNING, rollback_scn))) {
-      LOG_WARN("failed to rollback KV centroid state", K(kv_ret), K_(center_id));
+    if (OB_SUCCESS != (kv_ret = table_helper_.rollback_centroid_state(
+        center_id_, ObIvfCentroidState::REASSIGNING,
+        lock_old_state_, rollback_scn))) {
+      ret = kv_ret;
+      LOG_WARN("failed to rollback KV centroid state", K(ret), K_(center_id));
     }
   }
 
-  if (OB_NOT_NULL(cache_)) {
-    int cache_ret = OB_SUCCESS;
-    if (OB_SUCCESS != (cache_ret = cache_->update_centroid_state(
-        center_id_, lock_old_state_))) {
-      LOG_WARN("failed to rollback cache centroid state", K(cache_ret), K_(center_id));
+  if (OB_SUCC(ret) && OB_NOT_NULL(cache_)) {
+    bool cas_ok = false;
+    if (OB_FAIL(cache_->update_centroid_state_cas(center_id_,
+        ObIvfCentroidState::REASSIGNING, lock_old_state_, cas_ok))) {
+      LOG_WARN("failed to rollback cache centroid state", K(ret), K_(center_id));
+    } else if (!cas_ok) {
+      ObCentroidInfo info;
+      if (OB_FAIL(cache_->get_center_info(center_id_, SCN::max_scn(), info))) {
+        LOG_WARN("failed to confirm cache rollback target", K(ret), K_(center_id));
+      } else if (lock_old_state_ != info.state_) {
+        ret = OB_STATE_NOT_MATCH;
+        LOG_WARN("cache changed to a third state during rollback", K(ret), K_(center_id),
+                 "state", static_cast<int>(info.state_));
+      }
     }
   }
 

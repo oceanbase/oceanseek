@@ -80,7 +80,7 @@ private:
 
   // Phase 1: Acquire lock with small transaction
   // lock_success=true → lock acquired, proceed; false → state changed, skip
-  int acquire_lock_(SCN &cur_scn, bool &lock_success);
+  int acquire_lock_(SCN &cur_scn, bool &lock_success, bool &compensation_failed);
   int execute_locked_(const common::ObTabletID &physical_tablet_id,
                       ObArray<float *> &new_centroids,
                       bool &lock_acquired);

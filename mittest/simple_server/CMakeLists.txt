@@ -234,4 +234,5 @@ set(VECTOR_INDEX_TEST_SHARE
         )
 ob_farm_observer(test_vector_index_freeze vector_index/test_vector_index_freeze.cpp ${VECTOR_INDEX_TEST_SHARE})
 set_tests_properties(test_vector_index_freeze PROPERTIES TIMEOUT 600)
+ob_unittest_observer(test_spfresh_centroid_cas vector_index/test_spfresh_centroid_cas.cpp)
 ####### vector index case #########

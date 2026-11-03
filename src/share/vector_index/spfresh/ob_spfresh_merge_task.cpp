@@ -120,6 +120,7 @@ int ObSpfreshMergeTask::execute(const common::ObTabletID &physical_tablet_id)
   int64_t source_count = 0;
   int64_t merge_capacity = 0;
   bool lock_acquired = false;
+  bool compensation_failed = false;
   ObArenaAllocator vec_allocator("SpfreshMgV", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id_);
 
   if (IS_NOT_INIT) {
@@ -130,12 +131,13 @@ int ObSpfreshMergeTask::execute(const common::ObTabletID &physical_tablet_id)
     LOG_WARN("invalid physical merge tablet", K(ret), K(physical_tablet_id));
   } else {
     // Phase 1: Acquire lock
-    if (OB_FAIL(acquire_lock_(lock_scn_, lock_acquired))) {
+    if (OB_FAIL(acquire_lock_(lock_scn_, lock_acquired, compensation_failed))) {
       // OB_STATE_NOT_MATCH / OB_ENTRY_NOT_EXIST from acquire_lock_ are benign
       // skips (centroid state not ready for merge, or removed by a concurrent
       // worker). Clear ret so execute() returns success for skips and they are
       // not recorded as RET_CODE!=0 in task history.
-      if (OB_STATE_NOT_MATCH == ret || OB_ENTRY_NOT_EXIST == ret) {
+      if (!compensation_failed
+          && (OB_STATE_NOT_MATCH == ret || OB_ENTRY_NOT_EXIST == ret)) {
         LOG_TRACE("[SPFRESH_TRACE] centroid state not ready, benign skip merge",
                  KR(ret), K_(source_center_id));
         ret = OB_SUCCESS;
@@ -145,6 +147,10 @@ int ObSpfreshMergeTask::execute(const common::ObTabletID &physical_tablet_id)
     } else if (!lock_acquired) {
       LOG_TRACE("[SPFRESH_TRACE] centroid state changed, skip merge", K_(source_center_id));
     } else {
+
+    // Test-only synchronization point: hold a real MERGING lock while a
+    // concurrently dispatched Split observes the non-NORMAL cache state.
+    DEBUG_SYNC(SPFRESH_MERGE_AFTER_ACQUIRE_LOCK);
 
     // Revalidate the policy before choosing a target with enough capacity.
     if (OB_FAIL(ret)) {
@@ -191,6 +197,11 @@ int ObSpfreshMergeTask::execute(const common::ObTabletID &physical_tablet_id)
       // We must NOT push a retry task in the skip path or the queue will hot-spin
       // on a centroid that has no merge partner.
       const bool is_skip = (OB_ENTRY_NOT_EXIST == ret);
+      if (is_skip) {
+        // Let regression tests observe a genuine policy/target skip while the
+        // MERGING lock is still held, immediately before compensation.
+        DEBUG_SYNC(SPFRESH_MERGE_NO_TARGET_BEFORE_ROLLBACK);
+      }
       int rollback_ret = rollback_lock_();
       if (OB_SUCCESS != rollback_ret) {
         LOG_ERROR("failed to rollback lock after merge failure, KV/cache may be inconsistent",
@@ -217,11 +228,13 @@ int ObSpfreshMergeTask::execute(const common::ObTabletID &physical_tablet_id)
   return ret;
 }
 
-int ObSpfreshMergeTask::acquire_lock_(SCN &cur_scn, bool &lock_success)
+int ObSpfreshMergeTask::acquire_lock_(
+    SCN &cur_scn, bool &lock_success, bool &compensation_failed)
 {
   int ret = OB_SUCCESS;
   cur_scn = SCN::min_scn();
   lock_success = false;
+  compensation_failed = false;
   const char *lock_source = "none";
 
   if (OB_ISNULL(cache_)) {
@@ -293,9 +306,11 @@ int ObSpfreshMergeTask::acquire_lock_(SCN &cur_scn, bool &lock_success)
           if (0 != source_center_id_) {
             SCN rollback_scn;
             int kv_ret = OB_SUCCESS;
-            if (OB_SUCCESS != (kv_ret = table_helper_.update_centroid_state(
-                source_center_id_, ObIvfCentroidState::NORMAL,
-                ObIvfCentroidState::MERGING, rollback_scn))) {
+            if (OB_SUCCESS != (kv_ret = table_helper_.rollback_centroid_state(
+                source_center_id_, ObIvfCentroidState::MERGING,
+                ObIvfCentroidState::NORMAL, rollback_scn))) {
+              compensation_failed = true;
+              ret = kv_ret;
               LOG_ERROR("failed to rollback KV after cache CAS failure, KV/cache inconsistent",
                         K(kv_ret), K_(source_center_id));
             }
@@ -306,9 +321,11 @@ int ObSpfreshMergeTask::acquire_lock_(SCN &cur_scn, bool &lock_success)
           if (0 != source_center_id_) {
             SCN rollback_scn;
             int kv_ret = OB_SUCCESS;
-            if (OB_SUCCESS != (kv_ret = table_helper_.update_centroid_state(
-                source_center_id_, ObIvfCentroidState::NORMAL,
-                ObIvfCentroidState::MERGING, rollback_scn))) {
+            if (OB_SUCCESS != (kv_ret = table_helper_.rollback_centroid_state(
+                source_center_id_, ObIvfCentroidState::MERGING,
+                ObIvfCentroidState::NORMAL, rollback_scn))) {
+              compensation_failed = true;
+              ret = kv_ret;
               LOG_ERROR("failed to rollback KV after cache CAS miss, KV/cache inconsistent",
                         K(kv_ret), K_(source_center_id));
             }
@@ -819,19 +836,28 @@ int ObSpfreshMergeTask::rollback_lock_()
   if (0 != source_center_id_) {
     SCN rollback_scn;
     int kv_ret = OB_SUCCESS;
-    if (OB_SUCCESS != (kv_ret = table_helper_.update_centroid_state(
-        source_center_id_, ObIvfCentroidState::NORMAL,
-        ObIvfCentroidState::MERGING, rollback_scn))) {
-      LOG_WARN("failed to rollback KV centroid state", K(kv_ret), K_(source_center_id));
+    if (OB_SUCCESS != (kv_ret = table_helper_.rollback_centroid_state(
+        source_center_id_, ObIvfCentroidState::MERGING,
+        ObIvfCentroidState::NORMAL, rollback_scn))) {
+      ret = kv_ret;
+      LOG_WARN("failed to rollback KV centroid state", K(ret), K_(source_center_id));
     }
   }
 
-  // Reset cache state
-  if (OB_NOT_NULL(cache_)) {
-    int cache_ret = OB_SUCCESS;
-    if (OB_SUCCESS != (cache_ret = cache_->update_centroid_state(
-        source_center_id_, ObIvfCentroidState::NORMAL))) {
-      LOG_WARN("failed to rollback cache centroid state", K(cache_ret), K_(source_center_id));
+  if (OB_SUCC(ret) && OB_NOT_NULL(cache_)) {
+    bool cas_ok = false;
+    if (OB_FAIL(cache_->update_centroid_state_cas(source_center_id_,
+        ObIvfCentroidState::MERGING, ObIvfCentroidState::NORMAL, cas_ok))) {
+      LOG_WARN("failed to rollback cache centroid state", K(ret), K_(source_center_id));
+    } else if (!cas_ok) {
+      ObCentroidInfo info;
+      if (OB_FAIL(cache_->get_center_info(source_center_id_, SCN::max_scn(), info))) {
+        LOG_WARN("failed to confirm cache rollback target", K(ret), K_(source_center_id));
+      } else if (ObIvfCentroidState::NORMAL != info.state_) {
+        ret = OB_STATE_NOT_MATCH;
+        LOG_WARN("cache changed to a third state during rollback", K(ret), K_(source_center_id),
+                 "state", static_cast<int>(info.state_));
+      }
     }
   }
 

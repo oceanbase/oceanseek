@@ -261,11 +261,20 @@ public:
 
   // CAS update centroid state within an active batch transaction.
   // SELECT kv_value → decode check state → re-encode → UPDATE WHERE kv_value=old.
-  // Returns affected_rows: 1=success, 0=state mismatch.
+  // Same-state requests use SELECT FOR UPDATE to confirm the row until transaction end.
+  // Returns affected_rows: 1=updated or locked match, 0=state/value mismatch.
   int update_centroid_value_cas(uint64_t center_id,
                                  ObIvfCentroidState expected_state,
                                  ObIvfCentroidState new_state,
                                  int64_t &affected_rows);
+
+  // Restore a lock state without overwriting a concurrently changed value.
+  // A zero-row CAS is successful only when a read in the same transaction
+  // confirms that the persisted state is already the rollback target.
+  int rollback_centroid_state(uint64_t center_id,
+                              ObIvfCentroidState locked_state,
+                              ObIvfCentroidState target_state,
+                              SCN &commit_scn);
 
   // Register a physical-tablet modification inside an active batch transaction
   // by touching an existing aux_type=05 row. Unlike centroid CAS, this also
@@ -382,6 +391,9 @@ private:
                                      common::ObIAllocator &allocator,
                                      ObIArray<ObSpfreshVectorRow> &vectors);
   int execute_sql_no_tx_(const char *sql);
+  int execute_sql_no_tx_(const char *sql, int64_t &affected_rows);
+  int read_centroid_state_in_tx_(uint64_t center_id,
+                                 ObIvfCentroidState &state);
   uint64_t get_index_seq_(ObLogicalTableAuxType aux_type) const;
   int64_t get_scan_parallelism_() const;
 

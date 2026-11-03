@@ -662,6 +662,39 @@ TEST_F(TestIvfMapCentCacheRefCnt, case_j_release_all_idempotent)
   // batch_guard2 dtor releases all refs.
 }
 
+TEST_F(TestIvfMapCentCacheRefCnt, spfresh_compensation_cas_does_not_overwrite_third_state)
+{
+  insert_centroid(1);
+  bool cas_ok = false;
+  ASSERT_EQ(common::OB_SUCCESS,
+            cache_->update_centroid_state_cas(1, ObIvfCentroidState::NORMAL,
+                                              ObIvfCentroidState::MERGING, cas_ok));
+  ASSERT_TRUE(cas_ok);
+
+  // Simulate a newer task advancing the cache before the old Merge compensates.
+  set_state(1, ObIvfCentroidState::REASSIGNING);
+  ASSERT_EQ(common::OB_SUCCESS,
+            cache_->update_centroid_state_cas(1, ObIvfCentroidState::MERGING,
+                                              ObIvfCentroidState::NORMAL, cas_ok));
+  EXPECT_FALSE(cas_ok);
+  ObCentroidInfo info;
+  ASSERT_EQ(common::OB_SUCCESS, cache_->get_center_info(1, SCN::max_scn(), info));
+  EXPECT_EQ(ObIvfCentroidState::REASSIGNING, info.state_);
+}
+
+TEST_F(TestIvfMapCentCacheRefCnt, spfresh_compensation_target_state_is_idempotent)
+{
+  insert_centroid(1);
+  bool cas_ok = true;
+  ASSERT_EQ(common::OB_SUCCESS,
+            cache_->update_centroid_state_cas(1, ObIvfCentroidState::MERGING,
+                                              ObIvfCentroidState::NORMAL, cas_ok));
+  EXPECT_FALSE(cas_ok);
+  ObCentroidInfo info;
+  ASSERT_EQ(common::OB_SUCCESS, cache_->get_center_info(1, SCN::max_scn(), info));
+  EXPECT_EQ(ObIvfCentroidState::NORMAL, info.state_);
+}
+
 TEST_F(TestIvfMapCentCacheRefCnt, reconcile_count_preserves_new_lifecycle_state)
 {
   insert_centroid(1);

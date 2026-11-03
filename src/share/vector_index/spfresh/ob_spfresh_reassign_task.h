@@ -81,7 +81,7 @@ private:
 
   // Phase 1: Acquire lock with CAS (cache filter → KV CAS → cache CAS)
   // lock_success=true → lock acquired, proceed; false → state changed, skip
-  int acquire_lock_(SCN &cur_scn, bool &lock_success);
+  int acquire_lock_(SCN &cur_scn, bool &lock_success, bool &compensation_failed);
 
   // Wait until every transaction that could have observed the old centroid
   // layout before it was made non-writable has finished.

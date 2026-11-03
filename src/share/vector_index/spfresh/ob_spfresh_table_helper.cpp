@@ -1276,8 +1276,14 @@ int ObSpfreshTableHelper::execute_inner_sql_(const char *sql, SCN &commit_scn)
 
 int ObSpfreshTableHelper::execute_sql_no_tx_(const char *sql)
 {
-  int ret = OB_SUCCESS;
   int64_t affected_rows = 0;
+  return execute_sql_no_tx_(sql, affected_rows);
+}
+
+int ObSpfreshTableHelper::execute_sql_no_tx_(const char *sql, int64_t &affected_rows)
+{
+  int ret = OB_SUCCESS;
+  affected_rows = 0;
   ObTimeoutCtx timeout_ctx;
   if (OB_ISNULL(batch_conn_)) {
     ret = OB_NOT_INIT;
@@ -2669,11 +2675,13 @@ int ObSpfreshTableHelper::update_centroid_value_cas(uint64_t center_id,
           int64_t old_vec_len = 0;
           common::ObString old_kv_value_raw;
           common::ObString old_kv_value_owned;
+          bool state_matched = false;
           ObSqlString select_sql;
           if (OB_FAIL(select_sql.assign_fmt(
                   "SELECT kv_value FROM `%s`.`%s` "
-                  "WHERE namespace_id = %lu AND kv_key = X'%s'",
-                  db_name_, kv_data_table_, key_prefix_.namespace_id_, key_hex))) {
+                  "WHERE namespace_id = %lu AND kv_key = X'%s'%s",
+                  db_name_, kv_data_table_, key_prefix_.namespace_id_, key_hex,
+                  expected_state == new_state ? " FOR UPDATE" : ""))) {
             LOG_WARN("assign select sql failed", K(ret));
           } else {
             SMART_VAR(ObISQLClient::ReadResult, result) {
@@ -2726,15 +2734,21 @@ int ObSpfreshTableHelper::update_centroid_value_cas(uint64_t center_id,
                   } else {
                     old_vec_data = vec_node->get_data();
                     old_vec_len = static_cast<int64_t>(vec_node->get_data_length());
-                    affected_rows = 1;
+                    state_matched = true;
                   }
                 }
               }
             }
           }
 
-          // Step 3: UPDATE WHERE kv_value = old_value (within batch tx)
-          if (OB_SUCC(ret) && 1 == affected_rows) {
+          // A resumed REASSIGN may already have its target state. The locking
+          // read above confirms that state until this transaction ends; a
+          // same-value UPDATE would instead report zero changed rows.
+          if (OB_SUCC(ret) && state_matched && expected_state == new_state) {
+            affected_rows = 1;
+          }
+          // State transitions still require the conditional UPDATE's real row count.
+          if (OB_SUCC(ret) && state_matched && expected_state != new_state) {
             // Build new kv_value with new state, old vector
             common::ObString col_names_arr[2];
             col_names_arr[0] = common::ObString::make_string(centroid_vector_col_name_);
@@ -2794,8 +2808,11 @@ int ObSpfreshTableHelper::update_centroid_value_cas(uint64_t center_id,
                           db_name_, kv_data_table_, new_hex,
                           key_prefix_.namespace_id_, key_hex, old_hex))) {
                     LOG_WARN("assign update sql failed", K(ret));
-                  } else if (OB_FAIL(execute_sql_no_tx_(update_sql.ptr()))) {
+                  } else if (OB_FAIL(execute_sql_no_tx_(update_sql.ptr(), affected_rows))) {
                     LOG_WARN("execute update failed", K(ret), K(update_sql));
+                  } else if (affected_rows > 1) {
+                    ret = OB_ERR_UNEXPECTED;
+                    LOG_WARN("centroid CAS updated unexpected rows", K(ret), K(affected_rows), K(center_id));
                   }
                 }
                 if (OB_NOT_NULL(old_hex)) {
@@ -2813,6 +2830,112 @@ int ObSpfreshTableHelper::update_centroid_value_cas(uint64_t center_id,
     }
   }
 
+  return ret;
+}
+
+int ObSpfreshTableHelper::read_centroid_state_in_tx_(uint64_t center_id,
+                                                       ObIvfCentroidState &state)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator("SpfreshCR", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id_);
+  common::ObDatum center_id_datum;
+  ObSEArray<common::ObDatum, 1> key_datums;
+  common::ObString kv_key;
+  if (IS_NOT_INIT || OB_ISNULL(batch_conn_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("batch transaction is not ready", K(ret), K(center_id));
+  } else if (OB_FAIL(build_center_id_datum_(center_id, allocator, center_id_datum))) {
+    LOG_WARN("build center id datum failed", K(ret), K(center_id));
+  } else if (OB_FAIL(key_datums.push_back(center_id_datum))) {
+    LOG_WARN("push center id datum failed", K(ret), K(center_id));
+  } else if (OB_FAIL(build_kv_key_(LT_AUX_IVF_CID_VECTOR, key_datums, allocator, kv_key))) {
+    LOG_WARN("build centroid key failed", K(ret), K(center_id));
+  } else if (OB_UNLIKELY(identifier_has_backtick_(db_name_)
+                         || identifier_has_backtick_(kv_data_table_))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("db_name or kv_data_table contains backtick, reject",
+             K(ret), KCSTRING(db_name_), KCSTRING(kv_data_table_));
+  } else {
+    char *key_hex = static_cast<char *>(allocator.alloc(kv_key.length() * 2 + 1));
+    if (OB_ISNULL(key_hex)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("allocate centroid key hex failed", K(ret), K(center_id));
+    } else {
+      bin_to_hex_(kv_key.ptr(), kv_key.length(), key_hex);
+      ObSqlString sql;
+      if (OB_FAIL(sql.assign_fmt(
+              "SELECT kv_value FROM `%s`.`%s` WHERE namespace_id = %lu AND kv_key = X'%s'",
+              db_name_, kv_data_table_, key_prefix_.namespace_id_, key_hex))) {
+        LOG_WARN("assign centroid state query failed", K(ret), K(center_id));
+      } else {
+        SMART_VAR(ObISQLClient::ReadResult, result) {
+          common::sqlclient::ObMySQLResult *mysql_res = nullptr;
+          ObString sql_str(sql.length(), sql.ptr());
+          ObString kv_value;
+          const char *vector_data = nullptr;
+          int64_t vector_len = 0;
+          if (OB_FAIL(batch_conn_->execute_read(tenant_id_, sql_str, result))) {
+            LOG_WARN("read centroid state failed", K(ret), K(center_id));
+          } else if (OB_ISNULL(mysql_res = result.get_result())) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("centroid state result is null", K(ret), K(center_id));
+          } else if (OB_FAIL(mysql_res->next())) {
+            if (OB_ITER_END == ret) {
+              ret = OB_ENTRY_NOT_EXIST;
+            }
+            LOG_WARN("centroid state row not found", K(ret), K(center_id));
+          } else if (OB_FAIL(mysql_res->get_varchar("kv_value", kv_value))) {
+            LOG_WARN("get centroid value failed", K(ret), K(center_id));
+          } else if (OB_FAIL(decode_centroid_value_(allocator, kv_value.ptr(), kv_value.length(),
+                                                    vector_data, vector_len, state))) {
+            LOG_WARN("decode centroid state failed", K(ret), K(center_id));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSpfreshTableHelper::rollback_centroid_state(uint64_t center_id,
+                                                   ObIvfCentroidState locked_state,
+                                                   ObIvfCentroidState target_state,
+                                                   SCN &commit_scn)
+{
+  int ret = OB_SUCCESS;
+  int64_t affected_rows = 0;
+  bool target_confirmed = false;
+  commit_scn = SCN::min_scn();
+  if (OB_FAIL(start_batch_transaction())) {
+    LOG_WARN("start rollback transaction failed", K(ret), K(center_id));
+  } else {
+    if (OB_FAIL(update_centroid_value_cas(center_id, locked_state,
+                                          target_state, affected_rows))) {
+      LOG_WARN("conditional centroid rollback failed", K(ret), K(center_id));
+    } else if (1 == affected_rows) {
+      target_confirmed = true;
+    } else {
+      ObIvfCentroidState current_state = ObIvfCentroidState::MAX_TYPE;
+      if (OB_FAIL(read_centroid_state_in_tx_(center_id, current_state))) {
+        LOG_WARN("confirm centroid rollback target failed", K(ret), K(center_id));
+      } else if (target_state == current_state) {
+        target_confirmed = true;
+      } else {
+        ret = OB_STATE_NOT_MATCH;
+        LOG_WARN("centroid changed to a third state during rollback", K(ret), K(center_id),
+                 K(locked_state), K(target_state), K(current_state));
+      }
+    }
+
+    int end_ret = OB_SUCCESS;
+    if (OB_SUCCESS != (end_ret = end_batch_transaction(OB_SUCC(ret) && target_confirmed,
+                                                        commit_scn))) {
+      LOG_WARN("end rollback transaction failed", K(end_ret), K(center_id));
+      if (OB_SUCC(ret)) {
+        ret = end_ret;
+      }
+    }
+  }
   return ret;
 }
 

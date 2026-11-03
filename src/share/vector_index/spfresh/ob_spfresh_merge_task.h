@@ -76,7 +76,7 @@ private:
 
   // Phase 1: Acquire lock with small transaction
   // lock_success=true → lock acquired, proceed; false → state changed, skip
-  int acquire_lock_(SCN &cur_scn, bool &lock_success);
+  int acquire_lock_(SCN &cur_scn, bool &lock_success, bool &compensation_failed);
 
   // Revalidate the source size and center floor after locking the source.
   int validate_merge_(int64_t &source_count, int64_t &merge_capacity);
