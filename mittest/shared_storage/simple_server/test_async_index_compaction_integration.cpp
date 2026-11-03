@@ -6784,7 +6784,7 @@ TEST_F(ObAsyncIndexCompactionTest, recycled_table_refresh_deps_preserve_disabled
   ASSERT_TRUE(found);
   data_table_ids.reuse();
   ASSERT_EQ(OB_SUCCESS, data_table_ids.push_back(ctx.data_table_id_));
-  ObAsyncIndexRefreshDeps deps;
+  ObAsyncIndexRefreshDeps deps(run_ctx_.tenant_id_);
   ASSERT_EQ(OB_SUCCESS, provider.get_async_index_refresh_deps(run_ctx_.tenant_id_, data_table_ids, deps));
   ASSERT_EQ(1, deps.data_table_infos_.count());
   ASSERT_EQ(ctx.data_table_id_, deps.data_table_infos_.at(0).data_table_id_);
