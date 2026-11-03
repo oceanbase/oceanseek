@@ -158,6 +158,85 @@ void TestLSServiceSS::TearDownTestCase()
   MockTenantModuleEnv::get_instance().destroy();
 }
 
+TEST_F(TestLSServiceSS, test_tablet_create_register_failure_keeps_holder)
+{
+  ObLS ls;
+  ObLSIncSSTableUploader &uploader = ls.get_inc_sstable_uploader();
+  const ObTabletID tablet_id(203802);
+  const SCN mds_start_scn = SCN::max_scn();
+  const SCN transfer_scn = SCN::min_scn();
+  ASSERT_EQ(OB_SUCCESS, uploader.init());
+  ATOMIC_STORE(&uploader.is_online_, true);
+  {
+    ObTabletCreateRegHandle handle;
+    ASSERT_EQ(OB_SUCCESS, uploader.prepare_register_tablet_create(handle));
+    ASSERT_NE(nullptr, handle.create_info_holder_);
+    TabletCreateInfo &info = handle.create_info_holder_->info_;
+    info.tablet_id_ = tablet_id;
+    info.mds_start_scn_ = mds_start_scn;
+    info.transfer_scn_ = transfer_scn;
+    ASSERT_EQ(OB_SUCCESS, uploader.offline());
+    ASSERT_EQ(OB_LS_OFFLINE, uploader.register_tablet_create_info(*handle.create_info_holder_));
+    EXPECT_TRUE(uploader.pending_create_list_.is_empty());
+    // Failure must leave the holder alive for the caller to inspect and release.
+    EXPECT_EQ(tablet_id, info.tablet_id_);
+    EXPECT_EQ(mds_start_scn, info.mds_start_scn_);
+    EXPECT_EQ(transfer_scn, info.transfer_scn_);
+  } // The caller still owns the holder; the handle destructor releases it.
+  ASSERT_EQ(OB_SUCCESS, uploader.offline());
+}
+
+TEST_F(TestLSServiceSS, test_tablet_create_register_after_offline)
+{
+  ObLS ls;
+  ObLSIncSSTableUploader &uploader = ls.get_inc_sstable_uploader();
+  const ObTabletID tablet_id(203802);
+  const SCN mds_start_scn = SCN::max_scn();
+  const SCN transfer_scn = SCN::min_scn();
+  ASSERT_EQ(OB_SUCCESS, uploader.init());
+  ATOMIC_STORE(&uploader.is_online_, true);
+  {
+    ObTabletCreateRegHandle handle;
+    ASSERT_EQ(OB_SUCCESS, uploader.prepare_register_tablet_create(handle));
+    ASSERT_NE(nullptr, handle.create_info_holder_);
+    // Match the race where LS goes offline after prepare but before registration.
+    ASSERT_EQ(OB_SUCCESS, uploader.offline());
+    // The handle must log the failure before releasing the holder itself.
+    handle.do_register(tablet_id, mds_start_scn, transfer_scn);
+    EXPECT_EQ(nullptr, handle.create_info_holder_);
+    EXPECT_EQ(nullptr, handle.uploader_);
+    EXPECT_TRUE(uploader.pending_create_list_.is_empty());
+  } // The consumed handle must not free the holder again.
+  ASSERT_EQ(OB_SUCCESS, uploader.offline());
+}
+
+TEST_F(TestLSServiceSS, test_tablet_create_register_then_offline)
+{
+  ObLS ls;
+  ObLSIncSSTableUploader &uploader = ls.get_inc_sstable_uploader();
+  const ObTabletID tablet_id(203802);
+  const SCN mds_start_scn = SCN::max_scn();
+  const SCN transfer_scn = SCN::min_scn();
+  ASSERT_EQ(OB_SUCCESS, uploader.init());
+  ATOMIC_STORE(&uploader.is_online_, true);
+  {
+    ObTabletCreateRegHandle handle;
+    ASSERT_EQ(OB_SUCCESS, uploader.prepare_register_tablet_create(handle));
+    handle.do_register(tablet_id, mds_start_scn, transfer_scn);
+    EXPECT_EQ(nullptr, handle.create_info_holder_);
+    EXPECT_EQ(nullptr, handle.uploader_);
+    ASSERT_EQ(1, uploader.pending_create_list_.get_size());
+    const TabletCreateInfo &info = uploader.pending_create_list_.get_first()->info_;
+    EXPECT_EQ(tablet_id, info.tablet_id_);
+    EXPECT_EQ(mds_start_scn, info.mds_start_scn_);
+    EXPECT_EQ(transfer_scn, info.transfer_scn_);
+    // The uploader can release the registered holder before the handle is destroyed.
+    ASSERT_EQ(OB_SUCCESS, uploader.offline());
+    EXPECT_TRUE(uploader.pending_create_list_.is_empty());
+  }
+  ASSERT_EQ(OB_SUCCESS, uploader.offline());
+}
+
 TEST_F(TestLSServiceSS, test_failed_ls_create_keeps_existing_tx_mgr)
 {
   const ObLSID ls_id(270);

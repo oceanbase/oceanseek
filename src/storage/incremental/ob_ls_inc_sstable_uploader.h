@@ -286,6 +286,8 @@ public:
 
   // Shared tablet create
   int prepare_register_tablet_create(ObTabletCreateRegHandle &handle);
+  // Takes ownership on success; the caller must not access holder afterwards.
+  // On failure, holder remains owned by the caller and must be released by it.
   int register_tablet_create_info(TabletCreateInfoHolder &holder);
 
 public:

@@ -92,6 +92,8 @@ void ObTabletCreateRegHandle::do_register(const ObTabletID &tablet_id,
     create_info.transfer_scn_ = transfer_scn;
     if (OB_FAIL(uploader_->register_tablet_create_info(*create_info_holder_))) {
       LOG_ERROR("failed to register tablet create info", KR(ret), K(create_info));
+      // Registration failed without transferring ownership; release after logging.
+      MTL_DELETE(TabletCreateInfoHolder, "TabletCreateRef", create_info_holder_);
     }
     uploader_ = nullptr;
     create_info_holder_ = nullptr;
@@ -140,10 +142,7 @@ int ObLSIncSSTableUploader::register_tablet_create_info(TabletCreateInfoHolder &
     TABLET_CREATE_UPLOADER_LOG(INFO, "skip register tablet create because logstream offlined", K(holder));
   }
 
-  if (OB_FAIL(ret)) {
-    TabletCreateInfoHolder *ref_ptr = &holder;
-    MTL_DELETE(TabletCreateInfoHolder, "TabletCreateRef", ref_ptr);
-  } else {
+  if (OB_SUCC(ret)) {
     FLOG_INFO("[IncSSTUploader]finish register tablet create", K(holder.info_));
   }
   return ret;
