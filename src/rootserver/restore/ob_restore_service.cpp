@@ -7,6 +7,7 @@
 
 #include "ob_restore_service.h"
 #include "rootserver/backup/ob_backup_task_scheduler.h"
+#include "rootserver/ob_root_service.h"
 #include "logservice/ob_log_service.h"
 
 using namespace oceanbase;
@@ -155,6 +156,8 @@ void ObRestoreService::wakeup()
 void ObRestoreService::do_work()
 {
   LOG_INFO("[RESTORE] restore service start");
+  // Poll interval while RS is not full service.
+  const int64_t NOT_FULL_SERVICE_IDLE_US = 100 * 1000L;
   int ret = OB_SUCCESS;
   if (!inited_) {
     ret = OB_NOT_INIT;
@@ -165,7 +168,14 @@ void ObRestoreService::do_work()
     idle_time_us_ = GCONF._restore_idle_time;
     const uint64_t tenant_id = MTL_ID();
     while (!has_set_stop()) {
-      {
+      // Sys tenant only: a user tenant's restore service may run on a
+      // non-RS-leader server. RS rejects RPCs with OB_SERVER_IS_INIT until
+      // it is full service, so skip this round.
+      if (OB_SYS_TENANT_ID == tenant_id
+          && OB_NOT_NULL(GCTX.root_service_)
+          && !GCTX.root_service_->is_full_service()) {
+        idle_time_us_ = NOT_FULL_SERVICE_IDLE_US;
+      } else {
         ObCurTraceId::init(GCTX.self_addr());
         ObArray<ObPhysicalRestoreJob> job_infos;
         share::schema::ObSchemaGetterGuard schema_guard;
