@@ -560,6 +560,10 @@ int ObTxNode::handle_msg_(MsgPack *pkt)
           OZ(txs_.handle_sp_rollback_request(msg, rslt), msg);
           break;
         }
+      case TX_2PC_PREPARE_REDO_REQ:
+      case TX_2PC_PREPARE_REDO_RESP:
+      case TX_2PC_PREPARE_VERSION_REQ:
+      case TX_2PC_PREPARE_VERSION_RESP:
       case TX_2PC_PREPARE_REQ:
       case TX_2PC_PREPARE_RESP:
       case TX_2PC_PRE_COMMIT_REQ:

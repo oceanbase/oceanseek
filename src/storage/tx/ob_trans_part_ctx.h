@@ -664,6 +664,7 @@ private:
                       const bool serial_final = false);
   int reuse_log_block_(ObTxLogBlock &log_block);
   int compensate_abort_log_();
+  void notify_force_abort_downstreams_(const ObTxCommitParts *request_parts = nullptr);
   int validate_commit_info_log_(const ObTxCommitInfoLog &commit_info_log);
 
   int switch_log_type_(const ObTwoPhaseCommitLogType &log_type,

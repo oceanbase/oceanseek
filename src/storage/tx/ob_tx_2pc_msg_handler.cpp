@@ -779,6 +779,7 @@ int ObPartTransCtx::handle_tx_2pc_prepare_redo_req(const Ob2pcPrepareRedoReqMsg 
         TRANS_LOG(WARN, "compensate abort log failed", K(ret), K(ls_id_), K(trans_id_),
                   K(get_downstream_state()), K(get_upstream_state()), K(sub_state_));
       } else {
+        notify_force_abort_downstreams_();
         ret = OB_TRANS_KILLED;
       }
     } else if (OB_FAIL(handle_2pc_req(msg_type))) {

@@ -2107,6 +2107,39 @@ int ObPartTransCtx::compensate_abort_log_()
   return ret;
 }
 
+void ObPartTransCtx::notify_force_abort_downstreams_(const ObTxCommitParts *request_parts)
+{
+  // Only called after an existing force-abort prepare path has successfully
+  // submitted/started compensating ABORT. It does not make a rollback decision
+  // or replace the local log callback. Notification failure is best effort.
+  auto notify_parts = [this](const ObTxCommitParts &parts) {
+    for (int64_t i = 0; i < parts.count(); ++i) {
+      const ObTxExecPart &part = parts.at(i);
+      if (part.ls_id_ != ls_id_) {
+        Ob2pcAbortReqMsg msg;
+        build_tx_common_msg_(part.ls_id_, msg);
+        msg.upstream_ = ls_id_;
+        msg.epoch_ = part.exec_epoch_;
+        msg.transfer_epoch_ = part.transfer_epoch_;
+        int tmp_ret = OB_SUCCESS;
+        if (OB_TMP_FAIL(post_msg_(part.ls_id_, msg))) {
+          TRANS_LOG_RET(WARN, tmp_ret, "notify downstream of force abort failed", K(tmp_ret), K(part), KPC(this));
+        }
+      }
+    }
+  };
+  notify_parts(exec_info_.commit_parts_);
+  // compensate_abort_log_() may find an ABORT already in flight and skip the
+  // log-submission path that normally merges intermediate participants.
+  notify_parts(exec_info_.intermediate_participants_);
+  if (nullptr != request_parts) {
+    // sub_prepare rejects force-aborted transactions before installing the
+    // request's participant list. Use its epochs directly, without changing
+    // the 2PC role/state just to send notifications. Duplicate ABORT is safe.
+    notify_parts(*request_parts);
+  }
+}
+
 int ObPartTransCtx::abort_(int reason)
 {
   int ret = OB_SUCCESS;
@@ -8736,6 +8769,7 @@ int ObPartTransCtx::sub_prepare(const ObTxCommitParts &parts,
     if (OB_FAIL(compensate_abort_log_())) {
       TRANS_LOG(WARN, "compensate abort log failed", K(ret), KPC(this));
     } else {
+      notify_force_abort_downstreams_(&parts);
       ret = OB_TRANS_KILLED;
     }
   } else if (OB_FAIL(set_2pc_participants_(parts))) {

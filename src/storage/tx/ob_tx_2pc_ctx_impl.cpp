@@ -86,6 +86,7 @@ int ObPartTransCtx::do_prepare(bool &no_need_submit_log)
         TRANS_LOG(WARN, "compensate abort log failed", K(ret), K(ls_id_), K(trans_id_),
                   K(get_downstream_state()), K(get_upstream_state()), K(sub_state_));
       } else {
+        notify_force_abort_downstreams_();
         ret = OB_TRANS_KILLED;
       }
     }
