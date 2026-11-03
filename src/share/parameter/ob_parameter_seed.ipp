@@ -3639,8 +3639,10 @@ DEF_BOOL(_enable_async_index_refresh, OB_TENANT_PARAMETER, "True",
 DEF_BOOL(_enable_async_index_adaptive_parallelism, OB_TENANT_PARAMETER, "True",
         "Controls whether adaptive parallelism is enabled for asynchronous index refresh in the current tenant.",
         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
-DEF_INT(_async_index_refresh_dop_limit, OB_TENANT_PARAMETER, "0", "[0,)",
-        "Limits the requested DOP of one asynchronous index refresh task. Zero uses 25 percent of tenant max CPU.",
+DEF_INT(_async_index_refresh_dop_limit, OB_TENANT_PARAMETER, "0", "[0,256]",
+        "Limits the requested DOP of one asynchronous index refresh task and the total requested DOP of concurrent "
+        "refresh SQL on the same observer within a tenant. Range: [0, 256]. Zero uses 25 percent of tenant max CPU, "
+        "rounded down with a minimum of 1.",
         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 
 DEF_BOOL(enable_agent_db_background_task, OB_TENANT_PARAMETER, "True",
