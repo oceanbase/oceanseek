@@ -48,6 +48,29 @@ int get_async_index_refresh_tablet(
     ObLS &ls, const common::ObTabletID &tablet_id, ObTabletHandle &handle,
     const int64_t transfer_seq = -1, const bool is_probe = false);
 
+// RPC-local schema metadata. Each entry contains one index and one partition.
+// Returned pointers/strings remain valid until the next get() or reset().
+class ObAsyncIndexRefreshMetadataCache
+{
+public:
+  ObAsyncIndexRefreshMetadataCache()
+      : allocator_("AsyncIdxMeta"), tenant_id_(OB_INVALID_TENANT_ID),
+        data_table_id_(OB_INVALID_ID), schema_version_(0) {}
+  ~ObAsyncIndexRefreshMetadataCache() { reset(); }
+  void reset();
+  int get(const uint64_t tenant_id, const uint64_t data_table_id,
+      const common::ObTabletID &data_tablet_id, const uint64_t index_table_id,
+      const common::ObTabletID &index_tablet_id, const ObAsyncIndexDataTableInfo *&info);
+private:
+  common::ObArenaAllocator allocator_;
+  common::ObSEArray<ObAsyncIndexDataTableInfo *, 4> entries_;
+  uint64_t tenant_id_;
+  uint64_t data_table_id_;
+  common::ObTabletID data_tablet_id_;
+  int64_t schema_version_;
+  DISALLOW_COPY_AND_ASSIGN(ObAsyncIndexRefreshMetadataCache);
+};
+
 // Injectable abstraction over the external modules the trigger / scheduler depend on.
 //
 // These are owned by other developers in the async-index project (schema, MDS,
@@ -301,7 +324,7 @@ public:
   // Build the refresh dependency info for a single data table by table_id.
   // Equivalent to one iteration of get_async_index_refresh_deps's selected table
   // loop. Useful when the caller already knows which data_table_id it targets
-  // (e.g. direct-trigger path) and does not need to enumerate all tenant tables.
+  // and does not need to enumerate all tenant tables.
   // All string members are deep-copied into the supplied allocator.
   int get_single_table_refresh_info(
       const uint64_t tenant_id,

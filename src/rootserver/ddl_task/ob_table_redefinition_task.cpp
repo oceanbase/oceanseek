@@ -1074,7 +1074,7 @@ int ObTableRedefinitionTask::trigger_async_index_refresh()
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(share::ObAsyncIndexRefreshUtil::collect_async_index_table_ids(
       dst_tenant_id_, target_object_id_, async_index_table_ids,
-      true /*retry_on_missing_search_schema*/, (pre_swap_refresh || async_index_publish_refresh_target_.is_prepared()) /*allow_unavailable*/))) {
+      true /*retry_on_missing_search_schema*/, true /*allow_unavailable*/))) {
     LOG_WARN("[ASYNC_INDEX] fail to collect async index table ids", K(ret), K_(task_id),
         K_(dst_tenant_id), K_(target_object_id), K(pre_swap_refresh), K(refresh_snapshot),
         K_(async_index_publish_refresh_target));
@@ -1088,17 +1088,14 @@ int ObTableRedefinitionTask::trigger_async_index_refresh()
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[ASYNC_INDEX] invalid offline DDL refresh snapshot", K(ret), K_(task_id),
         K_(dst_tenant_id), K_(target_object_id), K(pre_swap_refresh), K(refresh_snapshot));
-  } else if (pre_swap_refresh) {
-    if (OB_FAIL(share::ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
-        dst_tenant_id_, target_object_id_, refresh_snapshot, async_index_table_ids, refresh_type))) {
-      LOG_WARN("failed to refresh async indexes before swap", K(ret), K(refresh_snapshot));
-    }
   } else {
-    share::ObAsyncIndexDDLPublishOp publish_op(
-        dst_tenant_id_, target_object_id_, snapshot_version_, async_index_table_ids, refresh_type);
-    if (OB_FAIL(async_index_publish_refresh_target_.refresh(publish_op))) {
-      LOG_WARN("[ASYNC_INDEX] failed to refresh after table redefinition", K(ret),
-          K_(task_id), K_(dst_tenant_id), K_(target_object_id), K_(snapshot_version),
+    share::SCN specified_scn;
+    share::ObAsyncIndexDDLPublishOp publish_op(dst_tenant_id_, target_object_id_, async_index_table_ids, refresh_type);
+    if (pre_swap_refresh && OB_FAIL(specified_scn.convert_for_tx(refresh_snapshot))) {
+      LOG_WARN("failed to convert offline refresh snapshot", K(ret), K(refresh_snapshot));
+    } else if (OB_FAIL(async_index_publish_refresh_target_.refresh(publish_op, specified_scn))) {
+      LOG_WARN("[ASYNC_INDEX] failed to refresh async indexes for table redefinition", K(ret),
+          K_(task_id), K_(dst_tenant_id), K_(target_object_id), K(pre_swap_refresh), K(refresh_snapshot),
           K_(async_index_publish_refresh_target), K(publish_op));
     }
   }

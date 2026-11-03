@@ -171,7 +171,9 @@ public:
   //
   // The caller must guarantee leadership on param.ls_.
   // Returns OB_SUCCESS on success.
-  int trigger_incr_refresh(const ObAsyncIndexDirectRefreshParam &param);
+  // A caller-owned cache reuses schema metadata across checkpoints of one RPC.
+  int trigger_incr_refresh(const ObAsyncIndexDirectRefreshParam &param,
+                           ObAsyncIndexRefreshMetadataCache *metadata_cache = nullptr);
 
   // 为租户 major 合并准备异步索引刷新检查点。若存在尚未发布到 tenant_major_snapshot 的索引，
   // 则将该目标写入主表 Tablet 的 refresh_info。返回值仅表示检查点准备是否成功，

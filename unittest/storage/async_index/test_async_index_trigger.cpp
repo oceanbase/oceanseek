@@ -4,7 +4,13 @@
  */
 
 #define USING_LOG_PREFIX STORAGE
+#include <cstdint>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
 #include <gtest/gtest.h>
+#include "lib/alloc/ob_malloc_allocator.h"
 #include "lib/oblog/ob_warning_buffer.h"
 #include "lib/time/ob_time_utility.h"
 #define protected public
@@ -12,7 +18,12 @@
 
 #include "storage/async_index/ob_async_index_trigger.h"
 #include "storage/async_index/ob_async_index_ddl_refresh.h"
-#include "share/ob_async_index_refresh_util.h"
+// As in the expression/profile unit tests, include the implementation
+// to exercise the private callback lifecycle and file-local helpers.
+#undef USING_LOG_PREFIX
+#include "share/ob_async_index_refresh_util.cpp"
+#undef USING_LOG_PREFIX
+#define USING_LOG_PREFIX STORAGE
 
 namespace oceanbase
 {
@@ -166,6 +177,17 @@ class TestAsyncIndexTrigger : public ::testing::Test
 public:
   TestAsyncIndexTrigger() {}
   virtual ~TestAsyncIndexTrigger() {}
+
+  static void SetUpTestCase()
+  {
+    // Standalone tests do not have an observer to register the tenant allocator.
+    lib::ObMallocAllocator *allocator = lib::ObMallocAllocator::get_instance();
+    ASSERT_NE(nullptr, allocator);
+    if (nullptr == allocator->get_tenant_ctx_allocator(1001, ObCtxIds::DEFAULT_CTX_ID)) {
+      ASSERT_EQ(OB_SUCCESS, allocator->create_and_add_tenant_allocator(1001));
+    }
+    ASSERT_EQ(OB_SUCCESS, allocator->set_tenant_limit(1001, 1LL << 30));
+  }
 
   void add_index(FakeDepProvider &p, const ObTabletID &id, const SCN &publish)
   {
@@ -1059,10 +1081,11 @@ TEST_F(TestAsyncIndexTrigger, ddl_single_index_sender_does_not_complete_without_
     ASSERT_NE(OB_SUCCESS, ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
         1001, 100001, 2000, index_ids, ddl_types[i]));
   }
-  ObAsyncIndexDDLRefreshTarget context;
-  ObAsyncIndexDDLPublishOp publish_op(1001, 100001, 2000, index_ids, ASYNC_REFRESH_TYPE_CREATE_INDEX);
-  ASSERT_NE(OB_SUCCESS, context.refresh(publish_op));
-  ASSERT_FALSE(context.is_prepared()); // 构建快照刷新失败，尚不能进入发布阶段。
+  ObAsyncIndexDDLPublishOp publish_op(1001, 100001, index_ids, ASYNC_REFRESH_TYPE_CREATE_INDEX);
+  bool need_publish = false;
+  ASSERT_EQ(OB_SUCCESS, publish_op.prepare(need_publish)); // 准备阶段不再发送构建快照刷新。
+  ASSERT_TRUE(need_publish);
+  ASSERT_NE(OB_SUCCESS, publish_op.publish(make_scn(2000)));
 }
 
 TEST_F(TestAsyncIndexTrigger, manual_refresh_checkpoint_throttle_boundary)
@@ -1326,7 +1349,7 @@ TEST_F(TestAsyncIndexTrigger, single_index_ddl_reuses_gts_across_refresh_retries
   const int refresh_results[] = {OB_EAGAIN, OB_TIMEOUT, OB_EAGAIN, OB_SUCCESS, OB_SUCCESS};
   for (int64_t i = 0; i < ARRAYSIZEOF(refresh_results); ++i) {
     publish_op.publish_ret_ = refresh_results[i];
-    ASSERT_EQ(refresh_results[i], context.refresh(publish_op));
+    ASSERT_EQ(refresh_results[i], context.refresh(publish_op, share::SCN::invalid_scn()));
     ASSERT_TRUE(context.is_prepared());
     ASSERT_EQ(1, publish_op.gts_calls_);
     ASSERT_EQ(i + 1, publish_op.publish_calls_);
@@ -1383,20 +1406,21 @@ TEST_F(TestAsyncIndexTrigger, ddl_publish_target_survives_partition_and_status_r
 {
   ObAsyncIndexDDLRefreshTarget context;
   FakeDDLPublishOp publish_op;
-  ASSERT_EQ(OB_EAGAIN, context.refresh(publish_op));
-  ASSERT_EQ(OB_TIMEOUT, context.refresh(publish_op));
-  // A normal in-memory task copy must keep the target too.
-  ObAsyncIndexDDLRefreshTarget copied = context;
-  ASSERT_EQ(OB_TIMEOUT, copied.refresh(publish_op));
-  ASSERT_EQ(OB_SUCCESS, copied.refresh(publish_op));
+  ASSERT_EQ(OB_EAGAIN, context.refresh(publish_op, share::SCN::invalid_scn()));
+  ASSERT_EQ(OB_TIMEOUT, context.refresh(publish_op, share::SCN::invalid_scn()));
+  // Task assignment must retain the publish barrier.
+  ObAsyncIndexDDLRefreshTarget copied;
+  copied = context;
+  ASSERT_EQ(OB_TIMEOUT, copied.refresh(publish_op, share::SCN::invalid_scn()));
+  ASSERT_EQ(OB_SUCCESS, copied.refresh(publish_op, share::SCN::invalid_scn()));
   // Publishing succeeded but persisting the next DDL status can fail.
-  ASSERT_EQ(OB_SUCCESS, copied.refresh(publish_op));
+  ASSERT_EQ(OB_SUCCESS, copied.refresh(publish_op, share::SCN::invalid_scn()));
   ASSERT_EQ(1, publish_op.prepare_calls_);
   ASSERT_EQ(1, publish_op.gts_calls_);
   ASSERT_EQ(publish_op.partition_versions_[0], publish_op.partition_versions_[1]);
   copied.reset(); // task recovery/state exit may discard the in-memory barrier
   publish_op.expected_target_ = 1002;
-  ASSERT_EQ(OB_SUCCESS, copied.refresh(publish_op));
+  ASSERT_EQ(OB_SUCCESS, copied.refresh(publish_op, share::SCN::invalid_scn()));
   ASSERT_EQ(2, publish_op.prepare_calls_);
   ASSERT_EQ(2, publish_op.gts_calls_);
 }
@@ -1409,17 +1433,17 @@ TEST_F(TestAsyncIndexTrigger, ddl_publish_target_is_not_cached_before_valid_gts)
   publish_op.gts_ret_ = OB_TIMEOUT;
   publish_op.valid_gts_ = false;
   publish_op.fail_publish_calls_ = 0;
-  ASSERT_EQ(OB_EAGAIN, context.refresh(publish_op));
+  ASSERT_EQ(OB_EAGAIN, context.refresh(publish_op, share::SCN::invalid_scn()));
   ASSERT_EQ(0, publish_op.gts_calls_);
   publish_op.prepare_ret_ = OB_SUCCESS;
-  ASSERT_EQ(OB_TIMEOUT, context.refresh(publish_op));
+  ASSERT_EQ(OB_TIMEOUT, context.refresh(publish_op, share::SCN::invalid_scn()));
   ASSERT_FALSE(context.is_prepared());
   publish_op.gts_ret_ = OB_SUCCESS; // an invalid GTS must not be cached either
-  ASSERT_EQ(OB_ERR_UNEXPECTED, context.refresh(publish_op));
+  ASSERT_EQ(OB_ERR_UNEXPECTED, context.refresh(publish_op, share::SCN::invalid_scn()));
   ASSERT_FALSE(context.is_prepared());
   ASSERT_EQ(0, publish_op.publish_calls_);
   publish_op.valid_gts_ = true;
-  ASSERT_EQ(OB_SUCCESS, context.refresh(publish_op));
+  ASSERT_EQ(OB_SUCCESS, context.refresh(publish_op, share::SCN::invalid_scn()));
   ASSERT_EQ(1, publish_op.publish_calls_);
 }
 
@@ -1429,14 +1453,14 @@ TEST_F(TestAsyncIndexTrigger, ddl_publish_rechecks_skipped_alignment_before_gts)
   FakeDDLPublishOp publish_op;
   publish_op.need_publish_ = false;
   publish_op.fail_publish_calls_ = 0;
-  ASSERT_EQ(OB_SUCCESS, context.refresh(publish_op));
+  ASSERT_EQ(OB_SUCCESS, context.refresh(publish_op, share::SCN::invalid_scn()));
   ASSERT_EQ(0, publish_op.gts_calls_);
   ASSERT_EQ(0, publish_op.publish_calls_);
   ASSERT_FALSE(context.is_prepared());
 
   // If persisting the next DDL status failed, a later round may see more targets.
   publish_op.need_publish_ = true;
-  ASSERT_EQ(OB_SUCCESS, context.refresh(publish_op));
+  ASSERT_EQ(OB_SUCCESS, context.refresh(publish_op, share::SCN::invalid_scn()));
   ASSERT_EQ(2, publish_op.prepare_calls_);
   ASSERT_EQ(1, publish_op.gts_calls_);
   ASSERT_EQ(1, publish_op.publish_calls_);
@@ -1638,6 +1662,459 @@ TEST_F(TestAsyncIndexTrigger, timer_capacity_reread_cannot_bypass_original_propo
     ASSERT_EQ(MAX_INC_MAJOR_SSTABLE_CNT, h.provider_.refresh_info_.get_refresh_snapshots().count());
     EXPECT_EQ(6400,
         h.provider_.refresh_info_.get_refresh_snapshots().at(MAX_INC_MAJOR_SSTABLE_CNT - 1));
+  }
+}
+
+// Existing mysqltests post_build_async_index_{refresh,partition}_align and
+// post_build_async_search_index cover data correctness. The tests below target
+// caller-side success identity and asynchronous transport failures; fixed-GTS
+// and checkpoint idempotency are already covered above.
+static void make_refresh_targets(ObArray<obrpc::ObAsyncIndexRefreshArg> &args,
+    const int64_t count = 3)
+{
+  ASSERT_EQ(OB_SUCCESS, args.prepare_allocate(count));
+  for (int64_t i = 0; i < args.count(); ++i) {
+    auto &arg = args.at(i);
+    arg.tenant_id_ = 1001;
+    arg.data_table_id_ = 100001;
+    arg.tablet_id_ = ObTabletID(200001 + i);
+    arg.ls_id_ = ObLSID(1001);
+    arg.target_refresh_scn_ = 5000;
+    arg.refresh_type_ = ASYNC_REFRESH_TYPE_CREATE_INDEX;
+    ASSERT_EQ(OB_SUCCESS, arg.index_table_ids_.push_back(300001));
+    ASSERT_EQ(OB_SUCCESS, arg.index_tablet_ids_.push_back(ObTabletID(400001 + i)));
+    ASSERT_EQ(OB_SUCCESS, arg.is_delete_flags_.push_back(false));
+  }
+}
+
+TEST_F(TestAsyncIndexTrigger, ddl_fixed_snapshot_reuses_progress_without_getting_gts)
+{
+  ObAsyncIndexDDLRefreshTarget context;
+  FakeDDLPublishOp publish_op;
+  publish_op.expected_target_ = 5000;
+  publish_op.gts_ret_ = OB_ERR_UNEXPECTED; // A fixed target must not request a GTS.
+  ASSERT_EQ(OB_EAGAIN, context.refresh(publish_op, make_scn(5000)));
+  ObArray<obrpc::ObAsyncIndexRefreshArg> args;
+  ASSERT_NO_FATAL_FAILURE(make_refresh_targets(args));
+  ASSERT_EQ(OB_SUCCESS, context.progress_.prepare(args, 1001));
+  ASSERT_EQ(OB_SUCCESS, context.progress_.mark_success(0));
+  ASSERT_EQ(OB_TIMEOUT, context.refresh(publish_op, make_scn(5000)));
+  EXPECT_TRUE(context.progress_.is_success(0));
+  EXPECT_EQ(1, publish_op.prepare_calls_);
+  EXPECT_EQ(0, publish_op.gts_calls_);
+
+  ASSERT_EQ(OB_INVALID_ARGUMENT, context.refresh(publish_op, SCN::min_scn()));
+  EXPECT_EQ(2, publish_op.publish_calls_);
+  EXPECT_TRUE(context.progress_.is_success(0));
+
+  publish_op.expected_target_ = 6000;
+  ASSERT_EQ(OB_TIMEOUT, context.refresh(publish_op, make_scn(6000)));
+  EXPECT_FALSE(context.progress_.is_success(0));
+  EXPECT_EQ(2, publish_op.prepare_calls_);
+  EXPECT_EQ(0, publish_op.gts_calls_);
+  ASSERT_EQ(OB_SUCCESS, context.refresh(publish_op, SCN::invalid_scn()));
+  EXPECT_EQ(0, publish_op.gts_calls_); // The cached fixed target remains reusable.
+}
+
+TEST_F(TestAsyncIndexTrigger, refresh_retry_policy_preserves_manual_and_ddl_boundaries)
+{
+  EXPECT_FALSE(ObAsyncIndexRefreshUtil::is_refresh_retry_error(OB_TIMEOUT, ASYNC_REFRESH_TYPE_MANUAL));
+  EXPECT_TRUE(ObAsyncIndexRefreshUtil::is_refresh_retry_error(
+      OB_INVALID_QUERY_TIMESTAMP, ASYNC_REFRESH_TYPE_MANUAL));
+  for (const auto type : {ASYNC_REFRESH_TYPE_CREATE_INDEX, ASYNC_REFRESH_TYPE_OFFLINE_DDL}) {
+    EXPECT_TRUE(ObAsyncIndexRefreshUtil::is_refresh_retry_error(OB_TIMEOUT, type));
+    EXPECT_FALSE(ObAsyncIndexRefreshUtil::is_refresh_retry_error(OB_INVALID_QUERY_TIMESTAMP, type));
+    EXPECT_TRUE(ObAsyncIndexRefreshUtil::is_refresh_retry_error(OB_NOT_MASTER, type));
+  }
+  EXPECT_TRUE(ObAsyncIndexRefreshUtil::is_refresh_retry_error(OB_NOT_MASTER, ASYNC_REFRESH_TYPE_MANUAL));
+}
+
+TEST_F(TestAsyncIndexTrigger, refresh_partition_progress_survives_transfer_but_not_target_changes)
+{
+  ObArray<obrpc::ObAsyncIndexRefreshArg> args;
+  ASSERT_NO_FATAL_FAILURE(make_refresh_targets(args, 65));
+  ObAsyncIndexRefreshProgress progress;
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
+  // Exercise both sides of bitmap word boundaries.
+  const int64_t completed[] = {0, 31, 32, 63, 64};
+  for (const int64_t i : completed) {
+    ASSERT_EQ(OB_SUCCESS, progress.mark_success(i));
+  }
+  args.at(0).ls_id_ = ObLSID(2001);
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
+  for (int64_t i = 0; i < args.count(); ++i) {
+    EXPECT_EQ(i == 0 || i == 31 || i == 32 || i == 63 || i == 64, progress.is_success(i));
+  }
+
+  // A new physical tablet for an existing index invalidates the old success.
+  args.at(0).index_tablet_ids_.at(0) = ObTabletID(500001);
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
+  for (const int64_t i : completed) {
+    EXPECT_FALSE(progress.is_success(i));
+  }
+  ASSERT_EQ(OB_SUCCESS, progress.mark_success(0));
+  args.at(0).target_refresh_scn_++;
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
+  EXPECT_FALSE(progress.is_success(0));
+  ASSERT_EQ(OB_SUCCESS, progress.mark_success(0));
+  args.at(0).is_delete_flags_.at(0) = true;
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
+  EXPECT_FALSE(progress.is_success(0));
+  ASSERT_EQ(OB_SUCCESS, progress.mark_success(0));
+  // Manual refresh uses the same progress format; changing refresh type invalidates it.
+  for (int64_t i = 0; i < args.count(); ++i) {
+    args.at(i).refresh_type_ = ASYNC_REFRESH_TYPE_MANUAL;
+  }
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
+  EXPECT_FALSE(progress.is_success(0));
+  ASSERT_EQ(OB_SUCCESS, progress.mark_success(64));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
+  EXPECT_TRUE(progress.is_success(64));
+  // Shrinking the target set must also clear success bits from the old set.
+  args.reset();
+  ASSERT_NO_FATAL_FAILURE(make_refresh_targets(args, 2));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
+  EXPECT_FALSE(progress.is_success(0));
+  ASSERT_EQ(OB_SUCCESS, progress.mark_success(1));
+  args.reset();
+  ASSERT_NO_FATAL_FAILURE(make_refresh_targets(args, 65));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
+  for (int64_t i = 0; i < args.count(); ++i) {
+    EXPECT_FALSE(progress.is_success(i));
+  }
+  ASSERT_EQ(OB_SUCCESS, progress.mark_success(0));
+  progress.reset();
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
+  EXPECT_FALSE(progress.is_success(0));
+}
+
+
+// Replace the transport only; exercise the refresh-specific callback and batch.
+// Posting failures return immediately, and collect_results() owns cancellation/draining.
+struct RefreshRpcTestWorker : public lib::Worker
+{
+  RefreshRpcTestWorker() : status_checks_(0), interrupted_(false) {}
+  int check_status() override
+  {
+    ++status_checks_;
+    return interrupted_ ? OB_ERR_QUERY_INTERRUPTED : OB_SUCCESS;
+  }
+  int64_t status_checks_;
+  bool interrupted_;
+};
+
+struct RefreshRpcWorkerGuard
+{
+  explicit RefreshRpcWorkerGuard(lib::Worker &worker) : saved_(&THIS_WORKER)
+  {
+    lib::Worker::set_worker_to_thread_local(&worker);
+  }
+  ~RefreshRpcWorkerGuard() { lib::Worker::set_worker_to_thread_local(saved_); }
+  lib::Worker *saved_;
+};
+
+struct RefreshTestDispatcher : public ObAsyncIndexRefreshUtil::RefreshDispatcher
+{
+  RefreshTestDispatcher(obrpc::ObSrvRpcProxy &transport, ObLocationService &location,
+      ObAsyncIndexRefreshProgress &progress, const uint64_t tenant_id = 1001,
+      const int8_t refresh_type = ASYNC_REFRESH_TYPE_MANUAL)
+    : RefreshDispatcher(tenant_id, 100001, 5000, refresh_type, location, transport, progress), callback_(nullptr), worker_(nullptr), fail_post_(false),
+      terminate_count_(0), terminated_gtid_(0), terminated_pkt_id_(0) {}
+  int post_rpc(const ObAddr &, const int64_t,
+      const obrpc::ObAsyncIndexRefreshArg &, Callback &cb) override
+  {
+    int ret = OB_SUCCESS;
+    if (fail_post_) {
+      worker_->interrupted_ = true;
+      ret = OB_RPC_SEND_ERROR;
+    } else {
+      cb.gtid_ = 123;
+      cb.pkt_id_ = 456;
+      callback_ = &cb;
+    }
+    return ret;
+  }
+  int terminate_rpc(const uint64_t gtid, const uint32_t pkt_id) override
+  {
+    std::lock_guard<std::mutex> guard(mutex_);
+    ++terminate_count_;
+    terminated_gtid_ = gtid;
+    terminated_pkt_id_ = pkt_id;
+    cv_.notify_one();
+    return OB_SUCCESS;
+  }
+  Callback *callback_;
+  RefreshRpcTestWorker *worker_;
+  bool fail_post_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  int terminate_count_;
+  uint64_t terminated_gtid_;
+  uint32_t terminated_pkt_id_;
+};
+
+static void init_refresh_test_dispatcher(RefreshTestDispatcher &proxy, const int64_t count,
+    const int64_t index_count = 1)
+{
+  ObArray<obrpc::ObAsyncIndexRefreshArg> args;
+  ASSERT_NO_FATAL_FAILURE(make_refresh_targets(args, count));
+  ObSEArray<ObTabletID, 2> data_tablets;
+  ObSEArray<ObLSID, 2> ls_ids;
+  ObSEArray<ObTabletID, 16> index_tablets;
+  for (int64_t i = 0; i < args.count(); ++i) {
+    ASSERT_EQ(OB_SUCCESS, data_tablets.push_back(args.at(i).tablet_id_));
+    ASSERT_EQ(OB_SUCCESS, ls_ids.push_back(args.at(i).ls_id_));
+    ASSERT_EQ(OB_SUCCESS, index_tablets.push_back(args.at(i).index_tablet_ids_.at(0)));
+  }
+  ObSEArray<ObSEArray<ObTabletID, 16>, 1> index_arrays;
+  ObSEArray<uint64_t, 4> index_ids;
+  ObSEArray<bool, 4> delete_flags;
+  ASSERT_EQ(OB_SUCCESS, index_arrays.prepare_allocate(index_count));
+  for (int64_t j = 0; j < index_count; ++j) {
+    ASSERT_EQ(OB_SUCCESS, index_arrays.at(j).assign(index_tablets));
+    ASSERT_EQ(OB_SUCCESS, index_ids.push_back(300001 + j));
+    ASSERT_EQ(OB_SUCCESS, delete_flags.push_back(false));
+  }
+  ASSERT_EQ(OB_SUCCESS, proxy.init(data_tablets, ls_ids, index_ids, index_arrays, delete_flags));
+}
+
+// The coordinator has no allocator for the RPC tenant. Exceed the inline
+// capacities of the RPC arrays, progress indexes and success bitmap.
+TEST_F(TestAsyncIndexTrigger, ddl_refresh_allocates_on_coordinator_without_business_tenant)
+{
+  constexpr uint64_t absent_tenant_id = 987654;
+  constexpr int64_t partition_count = 2049;
+  auto *allocator = lib::ObMallocAllocator::get_instance();
+  ASSERT_EQ(nullptr, allocator->get_tenant_ctx_allocator(absent_tenant_id, ObCtxIds::DEFAULT_CTX_ID));
+  ObTenantBase coordinator(OB_SYS_TENANT_ID);
+  ObTenantSwitchGuard tenant_guard(&coordinator);
+  ObAddr server;
+  ASSERT_TRUE(server.set_ip_addr("127.0.0.1", 2882));
+  for (const auto type : {ASYNC_REFRESH_TYPE_CREATE_INDEX, ASYNC_REFRESH_TYPE_OFFLINE_DDL}) {
+    SCOPED_TRACE(type);
+    obrpc::ObSrvRpcProxy transport;
+    ObLocationService location;
+    ObAsyncIndexRefreshProgress progress;
+    {
+      RefreshTestDispatcher proxy(transport, location, progress, absent_tenant_id, type);
+      ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, partition_count, 5));
+      EXPECT_EQ(OB_SYS_TENANT_ID, proxy.args_.get_block_allocator().get_attr().tenant_id_);
+      EXPECT_EQ(OB_SYS_TENANT_ID, proxy.retry_states_.get_block_allocator().get_attr().tenant_id_);
+      EXPECT_EQ(OB_SYS_TENANT_ID, proxy.callbacks_.get_block_allocator().get_attr().tenant_id_);
+      EXPECT_EQ(absent_tenant_id, proxy.args_.at(0).tenant_id_);
+      EXPECT_EQ(type, proxy.args_.at(0).refresh_type_);
+      // Allocate callbacks and exercise retry reuse without real network traffic.
+      for (int round = 0; round < 2; ++round) {
+        ASSERT_EQ(OB_SUCCESS, proxy.post_partition(server, 1000000, partition_count - 1));
+        ASSERT_EQ(OB_SUCCESS, proxy.callback_->process());
+        ASSERT_EQ(OB_SUCCESS, proxy.collect_results());
+        EXPECT_TRUE(progress.is_success(partition_count - 1));
+        proxy.reuse_callbacks();
+      }
+      ASSERT_EQ(OB_SUCCESS, progress.prepare(proxy.args_, OB_SYS_TENANT_ID));
+      EXPECT_TRUE(progress.is_success(partition_count - 1));
+      // Copying a nested target must retain its memory owner, not the RPC tenant.
+      ObAsyncIndexRefreshProgress::PartitionTarget copied;
+      ASSERT_EQ(OB_SUCCESS, copied.assign(progress.targets_.at(0)));
+      EXPECT_TRUE(copied.matches(proxy.args_.at(0)));
+      EXPECT_EQ(OB_SYS_TENANT_ID, copied.memory_tenant_id_);
+    }
+    // Progress outlives the dispatcher and remains safe to clear afterwards.
+    EXPECT_TRUE(progress.is_success(partition_count - 1));
+    progress.reset();
+    EXPECT_EQ(0, progress.targets_.count());
+    EXPECT_FALSE(progress.is_success(partition_count - 1));
+    EXPECT_EQ(nullptr, allocator->get_tenant_ctx_allocator(absent_tenant_id, ObCtxIds::DEFAULT_CTX_ID));
+  }
+}
+
+TEST_F(TestAsyncIndexTrigger, manual_refresh_charges_local_tenant_and_rebinds_progress)
+{
+  ObTenantBase tenant(1001);
+  ObTenantSwitchGuard tenant_guard(&tenant);
+  obrpc::ObSrvRpcProxy transport;
+  ObLocationService location;
+  ObAsyncIndexRefreshProgress progress;
+  RefreshTestDispatcher proxy(transport, location, progress);
+  ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, 65, 5));
+  EXPECT_EQ(1001, proxy.args_.get_block_allocator().get_attr().tenant_id_);
+  EXPECT_EQ(1001, proxy.retry_states_.get_block_allocator().get_attr().tenant_id_);
+  EXPECT_EQ(1001, proxy.callbacks_.get_block_allocator().get_attr().tenant_id_);
+  EXPECT_EQ(1001, progress.targets_.get_block_allocator().get_attr().tenant_id_);
+  ASSERT_EQ(OB_SUCCESS, progress.mark_success(64));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(proxy.args_, 1001));
+  EXPECT_TRUE(progress.is_success(64));
+  // A different local owner must not reuse buffers charged to the old owner.
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(proxy.args_, OB_SYS_TENANT_ID));
+  EXPECT_FALSE(progress.is_success(64));
+  EXPECT_EQ(OB_SYS_TENANT_ID, progress.targets_.get_block_allocator().get_attr().tenant_id_);
+  EXPECT_EQ(1001, progress.targets_.at(0).tenant_id_);
+  ObAsyncIndexRefreshProgress::PartitionTarget copied;
+  ASSERT_EQ(OB_SUCCESS, copied.assign(progress.targets_.at(0)));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(proxy.args_, 1001));
+  ASSERT_EQ(OB_SUCCESS, copied.assign(progress.targets_.at(0)));
+  EXPECT_EQ(1001, copied.memory_tenant_id_);
+  EXPECT_TRUE(copied.matches(proxy.args_.at(0)));
+}
+
+TEST_F(TestAsyncIndexTrigger, async_refresh_transport_errors_preserve_retry_classification)
+{
+  obrpc::ObSrvRpcProxy transport;
+  ObLocationService location;
+  ObAsyncIndexRefreshProgress progress;
+  RefreshTestDispatcher proxy(transport, location, progress);
+  ObAddr server;
+  ASSERT_TRUE(server.set_ip_addr("127.0.0.1", 2882));
+  ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, 1));
+  const int errors[] = {PNIO_CONNECT_FAIL, PNIO_TIMEOUT_NOT_SENT_OUT,
+      PNIO_DISCONNECT_NOT_SENT_OUT, PNIO_TIMEOUT, PNIO_DISCONNECT, PNIO_PKT_TERMINATE};
+  for (const int error : errors) {
+    SCOPED_TRACE(error);
+    proxy.retry_states_.at(0).result_ = OB_SUCCESS;
+    ASSERT_EQ(OB_SUCCESS, proxy.post_partition(server, 1000000, 0));
+    ASSERT_NE(nullptr, proxy.callback_);
+    // Mirror ObAsyncRespCallback::handle_resp: a non-success return falls back
+    // to on_timeout. This catches both classification loss and double completion.
+    proxy.callback_->set_error(error);
+    const int callback_ret = proxy.callback_->on_error(error);
+    if (OB_SUCCESS != callback_ret) {
+      proxy.callback_->on_timeout();
+    }
+    EXPECT_EQ(OB_SUCCESS, callback_ret);
+    ASSERT_EQ(OB_SUCCESS, proxy.collect_results());
+    const bool unsent = PNIO_CONNECT_FAIL == error || PNIO_TIMEOUT_NOT_SENT_OUT == error
+        || PNIO_DISCONNECT_NOT_SENT_OUT == error;
+    EXPECT_EQ(unsent ? OB_RPC_SEND_ERROR : OB_TIMEOUT, proxy.retry_states_.at(0).result_);
+    EXPECT_EQ(unsent, is_server_down_error(proxy.retry_states_.at(0).result_));
+    EXPECT_EQ(0, proxy.pending_count_);
+    ASSERT_EQ(1, proxy.callbacks_.count());
+    proxy.reuse_callbacks();
+    if (unsent) {
+      // Reposting the same target after a confirmed send failure can succeed.
+      proxy.retry_states_.at(0).result_ = OB_SUCCESS;
+      ASSERT_EQ(OB_SUCCESS, proxy.post_partition(server, 1000000, 0));
+      ASSERT_EQ(OB_SUCCESS, proxy.callback_->process());
+      ASSERT_EQ(OB_SUCCESS, proxy.collect_results());
+      EXPECT_TRUE(progress.is_success(0));
+      EXPECT_EQ(OB_SUCCESS, proxy.retry_states_.at(0).result_);
+      proxy.reuse_callbacks();
+    }
+  }
+}
+
+TEST_F(TestAsyncIndexTrigger, async_refresh_failed_post_returns_then_drains_slow_rpc_with_cancellation)
+{
+  RefreshRpcTestWorker worker;
+  RefreshRpcWorkerGuard worker_guard(worker);
+  obrpc::ObSrvRpcProxy transport;
+  ObLocationService location;
+  ObAsyncIndexRefreshProgress progress;
+  RefreshTestDispatcher proxy(transport, location, progress);
+  proxy.worker_ = &worker;
+  ObAddr server;
+  ASSERT_TRUE(server.set_ip_addr("127.0.0.1", 2882));
+  ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, 2));
+  ASSERT_EQ(OB_SUCCESS, proxy.post_partition(server, 60 * 1000 * 1000, 0));
+  auto *slow_callback = proxy.callback_;
+  ASSERT_NE(nullptr, slow_callback);
+  bool terminated = false;
+  int callback_ret = OB_ERROR;
+  // A bounded fallback completes A even with the old buggy implementation, so
+  // the regression fails assertions rather than hanging the entire UT process.
+  std::thread network([&]() {
+    {
+      std::unique_lock<std::mutex> lock(proxy.mutex_);
+      terminated = proxy.cv_.wait_for(lock, std::chrono::seconds(5),
+          [&]() { return proxy.terminate_count_ > 0; });
+    }
+    if (terminated) {
+      callback_ret = slow_callback->on_error(PNIO_PKT_TERMINATE);
+      if (OB_SUCCESS != callback_ret) {
+        slow_callback->on_timeout();
+      }
+    } else {
+      slow_callback->on_timeout();
+    }
+  });
+  proxy.fail_post_ = true;
+  const int post_ret = proxy.post_partition(server, 60 * 1000 * 1000, 1);
+  int64_t pending_after_post = 0;
+  {
+    ObThreadCondGuard guard(proxy.cond_);
+    pending_after_post = proxy.pending_count_;
+  }
+  proxy.retry_states_.at(1).result_ = post_ret;
+  const int wait_ret = proxy.collect_results();
+  network.join();
+  EXPECT_EQ(OB_RPC_SEND_ERROR, post_ret); // Cleanup must not overwrite the posting error.
+  EXPECT_TRUE(terminated);
+  EXPECT_EQ(OB_SUCCESS, callback_ret);
+  EXPECT_EQ(1, proxy.terminate_count_); // B was never posted and must not be terminated.
+  EXPECT_EQ(123, proxy.terminated_gtid_);
+  EXPECT_EQ(456, proxy.terminated_pkt_id_);
+  EXPECT_EQ(1, pending_after_post); // B failed without blocking on A.
+  EXPECT_EQ(0, proxy.pending_count_); // collect_results drained A before returning.
+  ASSERT_EQ(OB_SUCCESS, wait_ret);
+  EXPECT_EQ(2, proxy.callbacks_.count());
+  EXPECT_EQ(OB_TIMEOUT, proxy.retry_states_.at(0).result_);
+  EXPECT_EQ(OB_RPC_SEND_ERROR, proxy.retry_states_.at(1).result_); // Preserve the synchronous posting failure too.
+  proxy.reuse_callbacks();
+  EXPECT_EQ(0, proxy.pending_count_);
+}
+
+TEST_F(TestAsyncIndexTrigger, async_refresh_no_callback_failure_preserves_partition_mapping)
+{
+  ObNullAllocator failing_allocator;
+  ModulePageAllocator failing_pages(failing_allocator);
+  ModulePageAllocator normal_pages(ObMemAttr(1001, "AsyncIdxRpc"));
+  obrpc::ObSrvRpcProxy transport;
+  ObLocationService location;
+  ObAsyncIndexRefreshProgress progress;
+  RefreshTestDispatcher proxy(transport, location, progress);
+  ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, 2));
+  ObAddr server;
+  ASSERT_TRUE(server.set_ip_addr("127.0.0.1", 2882));
+  ASSERT_EQ(OB_SUCCESS, proxy.allocator_.get_arena().init(OB_MALLOC_NORMAL_BLOCK_SIZE, failing_pages));
+  proxy.retry_states_.at(0).result_ = proxy.post_partition(server, 1000000, 0);
+  EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED, proxy.retry_states_.at(0).result_);
+  EXPECT_EQ(0, proxy.callbacks_.count());
+  ASSERT_EQ(OB_SUCCESS, proxy.allocator_.get_arena().init(OB_MALLOC_NORMAL_BLOCK_SIZE, normal_pages));
+  ASSERT_EQ(OB_SUCCESS, proxy.post_partition(server, 1000000, 1));
+  ASSERT_EQ(OB_SUCCESS, proxy.callback_->process());
+  ASSERT_EQ(OB_SUCCESS, proxy.collect_results());
+  EXPECT_FALSE(progress.is_success(0));
+  EXPECT_TRUE(progress.is_success(1));
+  EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED, proxy.retry_states_.at(0).result_);
+  bool has_pending = true;
+  int64_t sleep_us = 0;
+  int result = proxy.prepare_retry(0, OB_SUCCESS, has_pending, sleep_us);
+  for (int64_t i = 0; i < proxy.retry_states_.count(); ++i) {
+    if (!progress.is_success(i)) {
+      result = record_refresh_error(proxy.retry_states_.at(i).result_, ASYNC_REFRESH_TYPE_MANUAL, result);
+    }
+  }
+  EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED, result);
+  EXPECT_FALSE(has_pending);
+}
+
+TEST_F(TestAsyncIndexTrigger, async_refresh_cancel_stops_remaining_partition_dispatch)
+{
+  RefreshRpcTestWorker worker;
+  RefreshRpcWorkerGuard worker_guard(worker);
+  obrpc::ObSrvRpcProxy transport;
+  ObLocationService location;
+  ObAsyncIndexRefreshProgress progress;
+  RefreshTestDispatcher proxy(transport, location, progress);
+  ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, 128));
+  worker.interrupted_ = true;
+  EXPECT_EQ(OB_ERR_QUERY_INTERRUPTED, proxy.execute());
+  EXPECT_EQ(1, worker.status_checks_);
+  EXPECT_EQ(0, proxy.rpc_count_);
+  EXPECT_EQ(0, proxy.callbacks_.count());
+  EXPECT_EQ(0, proxy.pending_count_);
+  for (int64_t i = 0; i < proxy.retry_states_.count(); ++i) {
+    EXPECT_EQ(OB_SUCCESS, proxy.retry_states_.at(i).result_);
+    EXPECT_FALSE(progress.is_success(i));
   }
 }
 

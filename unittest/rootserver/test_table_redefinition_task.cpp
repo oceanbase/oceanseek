@@ -209,7 +209,7 @@ static void check_index_refresh_target_lifecycle(Task &task, const ObDDLTaskStat
   ASSERT_SUCC(task.serialize_params_to_message(before, size, before_pos));
 
   FakeTableDDLPublishOp publish_op;
-  ASSERT_EQ(OB_EAGAIN, task.async_index_publish_refresh_target_.refresh(publish_op));
+  ASSERT_EQ(OB_EAGAIN, task.async_index_publish_refresh_target_.refresh(publish_op, share::SCN::invalid_scn()));
   ASSERT_TRUE(task.async_index_publish_refresh_target_.is_prepared());
   ASSERT_EQ(size, task.get_serialize_param_size());
   int64_t after_pos = 0;
@@ -223,13 +223,21 @@ static void check_index_refresh_target_lifecycle(Task &task, const ObDDLTaskStat
   publish_op.prepare_ret_ = OB_ERR_UNEXPECTED;
   publish_op.gts_ret_ = OB_ERR_UNEXPECTED;
   publish_op.publish_ret_ = OB_SUCCESS;
-  ASSERT_SUCC(task.async_index_publish_refresh_target_.refresh(publish_op)); // reuse after status persistence failure
+  ASSERT_SUCC(task.async_index_publish_refresh_target_.refresh(publish_op, share::SCN::invalid_scn())); // reuse after status persistence failure
 
   ObDDLTask &base = task;
   base.clear_old_status_context(); // exercise the virtual hook used after a successful state transition
   ASSERT_FALSE(task.async_index_publish_refresh_target_.is_prepared());
   Task recovered;
   ASSERT_FALSE(recovered.async_index_publish_refresh_target_.is_prepared());
+}
+
+TEST_F(TestTableRedefinitionTask, offline_refresh_target_lifecycle)
+{
+  ObTableRedefinitionTask task;
+  prepare_task(task);
+  check_index_refresh_target_lifecycle(task, ObDDLTaskStatus::SUCCESS);
+  check_index_refresh_target_lifecycle(task, ObDDLTaskStatus::TAKE_EFFECT);
 }
 
 TEST_F(TestTableRedefinitionTask, ordinary_index_refresh_target_lifecycle)
@@ -257,7 +265,7 @@ TEST_F(TestTableRedefinitionTask, publish_target_is_copied_but_not_serialized)
   prepare_task(task);
   const int64_t original_size = task.get_serialize_param_size();
   FakeTableDDLPublishOp publish_op;
-  ASSERT_EQ(OB_EAGAIN, task.async_index_publish_refresh_target_.refresh(publish_op));
+  ASSERT_EQ(OB_EAGAIN, task.async_index_publish_refresh_target_.refresh(publish_op, share::SCN::invalid_scn()));
   ASSERT_TRUE(task.async_index_publish_refresh_target_.is_prepared());
   ASSERT_EQ(original_size, task.get_serialize_param_size());
 
@@ -267,7 +275,7 @@ TEST_F(TestTableRedefinitionTask, publish_target_is_copied_but_not_serialized)
   publish_op.prepare_ret_ = OB_ERR_UNEXPECTED;
   publish_op.gts_ret_ = OB_ERR_UNEXPECTED;
   publish_op.publish_ret_ = OB_SUCCESS;
-  ASSERT_SUCC(copied.async_index_publish_refresh_target_.refresh(publish_op));
+  ASSERT_SUCC(copied.async_index_publish_refresh_target_.refresh(publish_op, share::SCN::invalid_scn()));
   copied.clear_old_status_context();
   ASSERT_FALSE(copied.async_index_publish_refresh_target_.is_prepared());
 

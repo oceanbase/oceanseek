@@ -543,7 +543,8 @@ bool ObAsyncIndexService::is_tablet_rpc_refreshing(const common::ObTabletID &dat
   return OB_HASH_EXIST == rpc_refreshing_tablets_.exist_refactored(data_tablet_id);
 }
 
-int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshParam &param)
+int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshParam &param,
+                                              ObAsyncIndexRefreshMetadataCache *metadata_cache)
 {
   int ret = OB_SUCCESS;
 
@@ -555,46 +556,15 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
     LOG_WARN("[ASYNC_INDEX_REFRESH] trigger_incr_refresh: invalid param", K(ret), K(param));
   }
 
-  // ── Steps 1-3: resolve table schema, columns, tablet-to-partition mapping ────
-  // Delegate to get_single_table_refresh_info, which reuses the same
-  // build_data_table_info_from_schema_ helper as the timer-driven deps path.
-  common::ObArenaAllocator allocator(lib::ObMemAttr(param.tenant_id_, "AsyncIdxTrigger"));
-  ObAsyncIndexDataTableInfo data_table_info;
+  ObAsyncIndexRefreshMetadataCache local_cache;
+  const ObAsyncIndexDataTableInfo *metadata = nullptr;
   if (OB_SUCC(ret)) {
-    if (OB_FAIL(refresher_.get_dep_provider().get_single_table_refresh_info(
-                    param.tenant_id_, param.data_table_id_, allocator, data_table_info))) {
-      LOG_WARN("failed to get single table refresh info", K(ret),
-               K(param.tenant_id_), K(param.data_table_id_));
+    if (nullptr == metadata_cache) {
+      metadata_cache = &local_cache;
     }
-  }
-
-  // Find data_tablet_pos and the matching ObAsyncIndexInfo
-  int64_t data_tablet_pos = -1;
-  const ObAsyncIndexInfo *index_info = nullptr;
-  if (OB_SUCC(ret)) {
-    for (int64_t i = 0; i < data_table_info.data_tablet_infos_.count(); ++i) {
-      if (data_table_info.data_tablet_infos_.at(i).data_tablet_id_ == param.data_tablet_id_) {
-        data_tablet_pos = i;
-        break;
-      }
-    }
-    if (data_tablet_pos < 0) {
-      ret = OB_TABLET_NOT_EXIST;
-      LOG_WARN("data_tablet_id not found in schema tablet list",
-               K(ret), K(param.data_tablet_id_), K(param.data_table_id_));
-    }
-  }
-  if (OB_SUCC(ret)) {
-    for (int64_t j = 0; j < data_table_info.index_infos_.count(); ++j) {
-      if (data_table_info.index_infos_.at(j).index_table_id_ == param.index_table_id_) {
-        index_info = &data_table_info.index_infos_.at(j);
-        break;
-      }
-    }
-    if (OB_ISNULL(index_info)) {
-      ret = OB_TABLE_NOT_EXIST;
-      LOG_WARN("index table not found in data table's async index list",
-               K(ret), K(param.index_table_id_), K(param.data_table_id_));
+    if (OB_FAIL(metadata_cache->get(param.tenant_id_, param.data_table_id_,
+        param.data_tablet_id_, param.index_table_id_, param.index_tablet_id_, metadata))) {
+      LOG_WARN("failed to get targeted refresh metadata", K(ret), K(param));
     }
   }
 
@@ -607,6 +577,9 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
   int64_t retry_cnt = 0;
 
   if (OB_SUCC(ret)) {
+    const ObAsyncIndexDataTableInfo &data_table_info = *metadata;
+    const ObAsyncIndexInfo *index_info = &data_table_info.index_infos_.at(0);
+    const int64_t data_tablet_pos = 0;
     do {
       ret = OB_SUCCESS;
       // ── Step 4: read publish_scn from index tablet (start_refresh_scn) ────
@@ -691,7 +664,6 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
       // RPC direct-trigger path uses parallelism=1 and skips DOP quota admission
       // to avoid lock contention with periodic timer tasks during step-by-step refresh.
       // No adaptive parallelism selection needed.
-      (void)refresh_parallelism;
 
       // ── Step 6: fill ObAsyncIndexSqlParam and generate the SQL ──────────────
       const ObAsyncIndexDirectRefreshOp effective_op =

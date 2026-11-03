@@ -1695,7 +1695,7 @@ int ObIndexBuildTask::trigger_async_index_refresh()
   } else {
     share::ObAsyncIndexDDLPublishOp publish_op(tenant_id_, object_id_, async_index_table_ids,
         static_cast<int8_t>(storage::ASYNC_REFRESH_TYPE_CREATE_INDEX));
-    if (OB_FAIL(async_index_publish_refresh_target_.refresh(publish_op))) {
+    if (OB_FAIL(async_index_publish_refresh_target_.refresh(publish_op, share::SCN::invalid_scn()))) {
       LOG_WARN("[ASYNC_INDEX] failed to refresh after index build", K(ret),
           K_(tenant_id), K_(task_id), K_(object_id), K_(snapshot_version),
           K_(async_index_publish_refresh_target), K(publish_op));

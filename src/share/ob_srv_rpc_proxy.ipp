@@ -322,4 +322,4 @@
   RPC_S(PR5 report_backup_validate_over, OB_VALIDATE_BACKUP_LS_TASK_RES, (ObBackupTaskRes));
   RPC_S(PR5 admin_clear_transfer_meta_info_op, OB_HA_CLEAR_TRANSFER_META_INFO, (obrpc::ObAdminClearTransferMetaInfoOpArg));
   RPC_AP(PR5 get_tenant_memory_info, OB_GET_TENANT_MEMORY_INFO, (obrpc::ObGetTenantMemoryInfoArg), obrpc::ObGetTenantMemoryInfoResult);
-  RPC_S(PR5 async_index_refresh, OB_ASYNC_INDEX_REFRESH, (obrpc::ObAsyncIndexRefreshArg), obrpc::ObAsyncIndexRefreshRes);
+  RPC_AP(PR5 async_index_refresh, OB_ASYNC_INDEX_REFRESH, (obrpc::ObAsyncIndexRefreshArg), obrpc::ObAsyncIndexRefreshRes);

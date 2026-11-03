@@ -6,8 +6,7 @@
 #ifndef OCEANBASE_STORAGE_ASYNC_INDEX_OB_ASYNC_INDEX_DDL_REFRESH_H_
 #define OCEANBASE_STORAGE_ASYNC_INDEX_OB_ASYNC_INDEX_DDL_REFRESH_H_
 
-#include "share/scn.h"
-#include "lib/utility/ob_print_utils.h"
+#include "storage/async_index/ob_async_index_deps.h"
 
 namespace oceanbase
 {
@@ -19,7 +18,6 @@ namespace storage
 {
 class ObLS;
 class ObAsyncIndexService;
-class ObIAsyncIndexDepProvider;
 class ObTabletAsyncIndexRefreshInfo;
 
 // Storage operations used by one DDL refresh attempt. Implementations release
@@ -60,6 +58,7 @@ private:
   ObIAsyncIndexDepProvider &dep_provider_;
   const obrpc::ObAsyncIndexRefreshArg &arg_;
   const share::SCN target_scn_;
+  ObAsyncIndexRefreshMetadataCache metadata_cache_;
 };
 
 // 容量不足时最多消费两个已提交 checkpoint，再尝试维护并登记目标。

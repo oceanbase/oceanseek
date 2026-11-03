@@ -2183,7 +2183,7 @@ int ObVecIndexBuildTask::trigger_async_index_refresh()
              K(object_id_), K(async_index_table_ids));
   } else {
     ObAsyncIndexDDLPublishOp publish_op(tenant_id_, object_id_, async_index_table_ids, refresh_type);
-    if (OB_FAIL(async_index_publish_refresh_target_.refresh(publish_op))) {
+    if (OB_FAIL(async_index_publish_refresh_target_.refresh(publish_op, share::SCN::invalid_scn()))) {
       LOG_WARN("failed to refresh async indexes after vector build", K(ret), K_(tenant_id), K_(task_id),
           K(object_id_), K_(async_index_publish_refresh_target), K(async_index_table_ids), K(refresh_type));
     } else {

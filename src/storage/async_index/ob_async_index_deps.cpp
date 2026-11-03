@@ -1066,19 +1066,91 @@ int ObAsyncIndexDepProvider::get_async_table_refresh_intervals(
   return ret;
 }
 
+// Resolve only the requested tablet. No full-table tablet/name arrays are built.
+static int get_refresh_partition_(const ObTableSchema &schema,
+                                  const ObTabletID &tablet_id,
+                                  ObIAllocator &allocator,
+                                  int64_t &part_idx,
+                                  int64_t &subpart_idx,
+                                  ObString &name)
+{
+  int ret = OB_SUCCESS;
+  part_idx = subpart_idx = OB_INVALID_INDEX;
+  name.reset();
+  if (!schema.is_partitioned_table()) {
+    if (schema.get_tablet_id() != tablet_id) {
+      ret = OB_TABLET_NOT_EXIST;
+      LOG_WARN("refresh tablet does not match nonpartitioned table", K(ret), K(tablet_id),
+          "table_id", schema.get_table_id(), "schema_tablet_id", schema.get_tablet_id());
+    }
+  } else if (OB_FAIL(schema.get_part_idx_by_tablet(tablet_id, part_idx, subpart_idx))) {
+    LOG_WARN("failed to locate refresh partition", K(ret), K(tablet_id));
+  } else {
+    const ObPartition *part = schema.get_part_array()[part_idx];
+    const ObString &part_name = PARTITION_LEVEL_TWO == schema.get_part_level()
+        ? part->get_subpart_array()[subpart_idx]->get_part_name() : part->get_part_name();
+    if (OB_FAIL(ob_write_string(allocator, part_name, name))) {
+      LOG_WARN("failed to copy refresh partition name", K(ret), K(tablet_id), K(part_name));
+    }
+  }
+  return ret;
+}
+
+static int build_refresh_partition_(const ObTableSchema &data_schema,
+                                    const ObTableSchema &index_schema,
+                                    const ObTabletID &data_tablet_id,
+                                    const ObTabletID &index_tablet_id,
+                                    ObIAllocator &allocator,
+                                    ObAsyncIndexDataTableInfo &info)
+{
+  int ret = OB_SUCCESS;
+  int64_t data_part = -1, data_subpart = -1, index_part = -1, index_subpart = -1;
+  ObAsyncIndexDataTabletInfo tablet_info;
+  tablet_info.data_tablet_id_ = data_tablet_id;
+  ObString index_name;
+  if (OB_FAIL(get_refresh_partition_(data_schema, data_tablet_id, allocator,
+      data_part, data_subpart, tablet_info.partition_name_))) {
+    LOG_WARN("failed to resolve data refresh partition", K(ret), K(data_tablet_id),
+        "data_table_id", data_schema.get_table_id());
+  } else if (OB_FAIL(get_refresh_partition_(index_schema, index_tablet_id, allocator,
+      index_part, index_subpart, index_name))) {
+    LOG_WARN("failed to resolve index refresh partition",
+      K(ret), K(index_tablet_id),
+        "index_table_id", index_schema.get_table_id());
+  } else if (data_schema.get_part_level() != index_schema.get_part_level()
+             || data_part != index_part || data_subpart != index_subpart) {
+    ret = OB_SCHEMA_EAGAIN;
+    LOG_WARN("refresh tablets no longer map to the same partition",
+        K(ret), K(data_tablet_id), K(index_tablet_id), K(data_part), K(index_part), K(data_subpart), K(index_subpart));
+  } else if (OB_FAIL(info.data_tablet_infos_.push_back(tablet_info))) {
+    LOG_WARN("failed to append data refresh partition", K(ret), K(data_tablet_id));
+  } else if (OB_FAIL(info.index_infos_.at(0).tablet_ids_.push_back(index_tablet_id))) {
+    LOG_WARN("failed to append index refresh tablet", K(ret), K(index_tablet_id));
+  } else if (OB_FAIL(info.index_infos_.at(0).partition_names_.push_back(index_name))) {
+    LOG_WARN("failed to append index refresh partition name", K(ret), K(index_tablet_id), K(index_name));
+  }
+  return ret;
+}
+
 // Build one ObAsyncIndexDataTableInfo from an already-resolved data table schema.
 // Called from both get_async_index_refresh_deps (selected table loop) and
 // get_single_table_refresh_info (targeted single-table lookup) to avoid
 // duplicating the schema-to-info conversion logic.
-// All string members are deep-copied into the supplied allocator.
+// A target index/tablet pair selects the direct-refresh path; the default
+// builds all indexes and partitions for background scheduling. Both paths
+// share column conversion and deep-copy strings into the supplied allocator.
 static int build_data_table_info_from_schema_(
     const uint64_t tenant_id,
     const ObTableSchema *data_table_schema,
     ObSchemaGetterGuard &schema_guard,
     ObIAllocator &allocator,
-    ObAsyncIndexDataTableInfo &data_table_info)
+    ObAsyncIndexDataTableInfo &data_table_info,
+    const uint64_t target_index_id = OB_INVALID_ID,
+    const ObTabletID &target_data_tablet = ObTabletID(),
+    const ObTabletID &target_index_tablet = ObTabletID())
 {
   int ret = OB_SUCCESS;
+  bool target_index_found = false;
   data_table_info.reset(tenant_id);
   const ObMemAttr attr(tenant_id, "AsyncIdxDeps");
   const uint64_t data_table_id = data_table_schema->get_table_id();
@@ -1122,10 +1194,14 @@ static int build_data_table_info_from_schema_(
   // columns; filtering is_hidden() would drop them, so we skip shadow columns only.
   // rowkey_columns: same rationale -- skip shadow columns only.
   const ObIArray<ObAuxTableMetaInfo> &aux_infos = data_table_schema->get_simple_index_infos();
-  for (int64_t j = 0; OB_SUCC(ret) && j < aux_infos.count(); ++j) {
+  for (int64_t j = 0; OB_SUCC(ret) && !target_index_found && j < aux_infos.count(); ++j) {
     const ObAuxTableMetaInfo &aux_info = aux_infos.at(j);
     const bool is_async_search = is_async_search_def_index(aux_info.index_type_);
     if (!is_async_index(aux_info.index_type_)) {
+      continue;
+    }
+    if (OB_INVALID_ID != target_index_id && !is_async_search
+        && target_index_id != aux_info.table_id_) {
       continue;
     }
     uint64_t index_table_id = aux_info.table_id_;
@@ -1143,6 +1219,8 @@ static int build_data_table_info_from_schema_(
                && OB_FAIL(search_def_schema->get_search_data_index_tid(index_table_id))) {
       LOG_WARN("failed to resolve async search data table", K(ret), K(aux_info.table_id_));
       break;
+    } else if (OB_INVALID_ID != target_index_id && target_index_id != index_table_id) {
+      continue;
     } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, index_table_id, index_schema))) {
       LOG_WARN("failed to get index table schema", K(ret), K(tenant_id), K(index_table_id));
       break;
@@ -1351,151 +1429,251 @@ static int build_data_table_info_from_schema_(
     if (OB_SUCC(ret)) {
       if (OB_FAIL(data_table_info.index_infos_.push_back(index_info))) {
         LOG_WARN("failed to push index info", K(ret));
+      } else if (OB_INVALID_ID != target_index_id) {
+        target_index_found = true;
+        if (OB_FAIL(build_refresh_partition_(*data_table_schema, *index_schema,
+            target_data_tablet, target_index_tablet, allocator, data_table_info))) {
+          LOG_WARN("failed to build targeted refresh partition", K(ret), K(target_index_id),
+              K(target_data_tablet), K(target_index_tablet));
+        }
       }
     }
   } // end for each aux index
 
-  if (OB_FAIL(ret)) { return ret; }
-
-  // Build per-data-tablet info and fill index tablet mappings
-  ObSEArray<ObTabletID, 16> data_tablet_ids;
-  data_tablet_ids.set_attr(attr);
-  if (OB_FAIL(data_table_schema->get_tablet_ids(data_tablet_ids))) {
-    LOG_WARN("failed to get data tablet ids", K(ret), K(data_table_id));
-    return ret;
+  if (OB_SUCC(ret) && OB_INVALID_ID != target_index_id && !target_index_found) {
+    // Keep the direct-refresh dropped-index error semantics.
+    ret = OB_TABLE_NOT_EXIST;
+    LOG_WARN("refresh index is absent from current async index targets", K(ret),
+        K(tenant_id), K(data_table_id), K(target_index_id));
   }
 
-  const int64_t index_cnt = data_table_info.index_infos_.count();
-  ObSEArray<ObSEArray<ObTabletID, 16>, 4> index_tablet_bufs;
-  ObSEArray<const ObTableSchema *, 4> index_schemas;
-  index_tablet_bufs.set_attr(attr);
-  index_schemas.set_attr(attr);
-  // Construct the empty buffers together: growing this outer array after
-  // filling its elements would copy their arrays with default allocators.
-  if (OB_FAIL(index_tablet_bufs.prepare_allocate(index_cnt))) {
-    LOG_WARN("failed to init index tablet buffers", K(ret), K(index_cnt));
-  }
-  for (int64_t j = 0; OB_SUCC(ret) && j < index_cnt; ++j) {
-    index_tablet_bufs.at(j).set_attr(attr);
-    const uint64_t idx_table_id = data_table_info.index_infos_.at(j).index_table_id_;
-    const ObTableSchema *idx_schema = nullptr;
-    if (OB_FAIL(schema_guard.get_table_schema(tenant_id, idx_table_id, idx_schema))) {
-      LOG_WARN("failed to get index schema for tablets", K(ret), K(idx_table_id)); break;
-    } else if (OB_ISNULL(idx_schema)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("index schema null for tablet fetch", K(ret), K(idx_table_id)); break;
-    } else if (OB_FAIL(idx_schema->get_tablet_ids(index_tablet_bufs.at(j)))) {
-      LOG_WARN("failed to get index tablet ids", K(ret), K(idx_table_id)); break;
-    } else if (OB_FAIL(index_schemas.push_back(idx_schema))) {
-      LOG_WARN("failed to push index schema", K(ret), K(idx_table_id)); break;
+  if (OB_SUCC(ret) && OB_INVALID_ID == target_index_id) {
+    // Build per-data-tablet info and fill index tablet mappings
+    ObSEArray<ObTabletID, 16> data_tablet_ids;
+    data_tablet_ids.set_attr(attr);
+    if (OB_FAIL(data_table_schema->get_tablet_ids(data_tablet_ids))) {
+      LOG_WARN("failed to get data tablet ids", K(ret), K(data_table_id));
     }
-  }
 
-  const bool is_partitioned = data_table_schema->is_partitioned_table();
-  const ObPartitionLevel part_level = data_table_schema->get_part_level();
-  for (int64_t t = 0; OB_SUCC(ret) && t < data_tablet_ids.count(); ++t) {
-    ObAsyncIndexDataTabletInfo data_tablet_info;
-    data_tablet_info.data_tablet_id_ = data_tablet_ids.at(t);
-    if (is_partitioned) {
-      ObPartition **part_array = data_table_schema->get_part_array();
-      if (PARTITION_LEVEL_ONE == part_level) {
-        const int64_t part_num = data_table_schema->get_partition_num();
-        if (OB_NOT_NULL(part_array) && t < part_num && OB_NOT_NULL(part_array[t])) {
-          ObString part_name;
-          if (OB_FAIL(ob_write_string(allocator, part_array[t]->get_part_name(), part_name))) {
-            LOG_WARN("failed to copy partition name", K(ret)); break;
-          }
-          data_tablet_info.partition_name_ = part_name;
-        }
-      } else if (PARTITION_LEVEL_TWO == part_level) {
-        int64_t part_idx = -1;
-        int64_t subpart_idx = -1;
-        if (OB_FAIL(data_table_schema->get_part_idx_by_tablet(
-                data_tablet_ids.at(t), part_idx, subpart_idx))) {
-          LOG_WARN("failed to get part idx by tablet for subpartition", K(ret),
-                   K(data_tablet_ids.at(t))); break;
-        } else if (OB_ISNULL(part_array) || OB_ISNULL(part_array[part_idx])) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("part array or partition is null", K(ret), K(part_idx)); break;
-        } else {
-          ObSubPartition **subpart_array = part_array[part_idx]->get_subpart_array();
-          if (OB_ISNULL(subpart_array) || OB_ISNULL(subpart_array[subpart_idx])) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("subpart array or subpartition is null", K(ret),
-                     K(part_idx), K(subpart_idx)); break;
-          } else {
+    const int64_t index_cnt = data_table_info.index_infos_.count();
+    ObSEArray<ObSEArray<ObTabletID, 16>, 4> index_tablet_bufs;
+    ObSEArray<const ObTableSchema *, 4> index_schemas;
+    index_tablet_bufs.set_attr(attr);
+    index_schemas.set_attr(attr);
+    // Construct the empty buffers together: growing this outer array after
+    // filling its elements would copy their arrays with default allocators.
+    if (OB_SUCC(ret) && OB_FAIL(index_tablet_bufs.prepare_allocate(index_cnt))) {
+      LOG_WARN("failed to init index tablet buffers", K(ret), K(index_cnt));
+    }
+    for (int64_t j = 0; OB_SUCC(ret) && j < index_cnt; ++j) {
+      index_tablet_bufs.at(j).set_attr(attr);
+      const uint64_t idx_table_id = data_table_info.index_infos_.at(j).index_table_id_;
+      const ObTableSchema *idx_schema = nullptr;
+      if (OB_FAIL(schema_guard.get_table_schema(tenant_id, idx_table_id, idx_schema))) {
+        LOG_WARN("failed to get index schema for tablets", K(ret), K(idx_table_id)); break;
+      } else if (OB_ISNULL(idx_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("index schema null for tablet fetch", K(ret), K(idx_table_id)); break;
+      } else if (OB_FAIL(idx_schema->get_tablet_ids(index_tablet_bufs.at(j)))) {
+        LOG_WARN("failed to get index tablet ids", K(ret), K(idx_table_id)); break;
+      } else if (OB_FAIL(index_schemas.push_back(idx_schema))) {
+        LOG_WARN("failed to push index schema", K(ret), K(idx_table_id)); break;
+      }
+    }
+
+    const bool is_partitioned = data_table_schema->is_partitioned_table();
+    const ObPartitionLevel part_level = data_table_schema->get_part_level();
+    for (int64_t t = 0; OB_SUCC(ret) && t < data_tablet_ids.count(); ++t) {
+      ObAsyncIndexDataTabletInfo data_tablet_info;
+      data_tablet_info.data_tablet_id_ = data_tablet_ids.at(t);
+      if (is_partitioned) {
+        ObPartition **part_array = data_table_schema->get_part_array();
+        if (PARTITION_LEVEL_ONE == part_level) {
+          const int64_t part_num = data_table_schema->get_partition_num();
+          if (OB_NOT_NULL(part_array) && t < part_num && OB_NOT_NULL(part_array[t])) {
             ObString part_name;
-            if (OB_FAIL(ob_write_string(allocator,
-                    subpart_array[subpart_idx]->get_part_name(), part_name))) {
-              LOG_WARN("failed to copy subpartition name", K(ret)); break;
+            if (OB_FAIL(ob_write_string(allocator, part_array[t]->get_part_name(), part_name))) {
+              LOG_WARN("failed to copy partition name", K(ret)); break;
             }
             data_tablet_info.partition_name_ = part_name;
           }
-        }
-      }
-    }
-    if (OB_FAIL(ret)) { break; }
-    else if (OB_FAIL(data_table_info.data_tablet_infos_.push_back(data_tablet_info))) {
-      LOG_WARN("failed to push data tablet info", K(ret)); break;
-    }
-    for (int64_t j = 0; OB_SUCC(ret) && j < index_tablet_bufs.count(); ++j) {
-      const ObSEArray<ObTabletID, 16> &idx_tablets = index_tablet_bufs.at(j);
-      if (t >= idx_tablets.count()) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("index tablet array size mismatch", K(ret), K(t),
-                 "idx_count", idx_tablets.count());
-        break;
-      }
-      ObAsyncIndexInfo &idx_info = data_table_info.index_infos_.at(j);
-      if (OB_FAIL(idx_info.tablet_ids_.push_back(idx_tablets.at(t)))) {
-        LOG_WARN("failed to push index tablet id", K(ret)); break;
-      }
-      // For the index partition name, locate the subpartition name from the
-      // index schema itself (local indexes mirror the data table's partition
-      // structure but have their own partition names).
-      ObString idx_part_name;
-      if (is_partitioned) {
-        const ObTableSchema *idx_schema = index_schemas.at(j);
-        if (PARTITION_LEVEL_ONE == part_level) {
-          ObPartition **idx_part_array = idx_schema->get_part_array();
-          const int64_t idx_part_num = idx_schema->get_partition_num();
-          if (OB_NOT_NULL(idx_part_array) && t < idx_part_num && OB_NOT_NULL(idx_part_array[t])) {
-            if (OB_FAIL(ob_write_string(allocator, idx_part_array[t]->get_part_name(), idx_part_name))) {
-              LOG_WARN("failed to copy index partition name", K(ret)); break;
-            }
-          }
         } else if (PARTITION_LEVEL_TWO == part_level) {
-          int64_t idx_part_idx = -1;
-          int64_t idx_subpart_idx = -1;
-          if (OB_FAIL(idx_schema->get_part_idx_by_tablet(
-                  idx_tablets.at(t), idx_part_idx, idx_subpart_idx))) {
-            LOG_WARN("failed to get index part idx by tablet", K(ret),
-                     K(idx_tablets.at(t))); break;
+          int64_t part_idx = -1;
+          int64_t subpart_idx = -1;
+          if (OB_FAIL(data_table_schema->get_part_idx_by_tablet(
+                  data_tablet_ids.at(t), part_idx, subpart_idx))) {
+            LOG_WARN("failed to get part idx by tablet for subpartition", K(ret),
+                     K(data_tablet_ids.at(t))); break;
+          } else if (OB_ISNULL(part_array) || OB_ISNULL(part_array[part_idx])) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("part array or partition is null", K(ret), K(part_idx)); break;
           } else {
-            ObPartition **idx_part_array = idx_schema->get_part_array();
-            if (OB_ISNULL(idx_part_array) || OB_ISNULL(idx_part_array[idx_part_idx])) {
+            ObSubPartition **subpart_array = part_array[part_idx]->get_subpart_array();
+            if (OB_ISNULL(subpart_array) || OB_ISNULL(subpart_array[subpart_idx])) {
               ret = OB_ERR_UNEXPECTED;
-              LOG_WARN("index part array or partition is null", K(ret),
-                       K(idx_part_idx), K(idx_tablets.at(t))); break;
+              LOG_WARN("subpart array or subpartition is null", K(ret),
+                       K(part_idx), K(subpart_idx)); break;
             } else {
-              ObSubPartition **idx_subpart_array = idx_part_array[idx_part_idx]->get_subpart_array();
-              if (OB_ISNULL(idx_subpart_array) || OB_ISNULL(idx_subpart_array[idx_subpart_idx])) {
-                ret = OB_ERR_UNEXPECTED;
-                LOG_WARN("index subpart array or subpartition is null", K(ret),
-                         K(idx_part_idx), K(idx_subpart_idx), K(idx_tablets.at(t))); break;
-              } else if (OB_FAIL(ob_write_string(allocator,
-                      idx_subpart_array[idx_subpart_idx]->get_part_name(), idx_part_name))) {
-                LOG_WARN("failed to copy index subpartition name", K(ret)); break;
+              ObString part_name;
+              if (OB_FAIL(ob_write_string(allocator,
+                      subpart_array[subpart_idx]->get_part_name(), part_name))) {
+                LOG_WARN("failed to copy subpartition name", K(ret)); break;
               }
+              data_tablet_info.partition_name_ = part_name;
             }
           }
         }
       }
       if (OB_FAIL(ret)) { break; }
-      if (OB_FAIL(idx_info.partition_names_.push_back(idx_part_name))) {
-        LOG_WARN("failed to push index partition name", K(ret)); break;
+      else if (OB_FAIL(data_table_info.data_tablet_infos_.push_back(data_tablet_info))) {
+        LOG_WARN("failed to push data tablet info", K(ret)); break;
+      }
+      for (int64_t j = 0; OB_SUCC(ret) && j < index_tablet_bufs.count(); ++j) {
+        const ObSEArray<ObTabletID, 16> &idx_tablets = index_tablet_bufs.at(j);
+        if (t >= idx_tablets.count()) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("index tablet array size mismatch", K(ret), K(t),
+                   "idx_count", idx_tablets.count());
+          break;
+        }
+        ObAsyncIndexInfo &idx_info = data_table_info.index_infos_.at(j);
+        if (OB_FAIL(idx_info.tablet_ids_.push_back(idx_tablets.at(t)))) {
+          LOG_WARN("failed to push index tablet id", K(ret)); break;
+        }
+        // For the index partition name, locate the subpartition name from the
+        // index schema itself (local indexes mirror the data table's partition
+        // structure but have their own partition names).
+        ObString idx_part_name;
+        if (is_partitioned) {
+          const ObTableSchema *idx_schema = index_schemas.at(j);
+          if (PARTITION_LEVEL_ONE == part_level) {
+            ObPartition **idx_part_array = idx_schema->get_part_array();
+            const int64_t idx_part_num = idx_schema->get_partition_num();
+            if (OB_NOT_NULL(idx_part_array) && t < idx_part_num && OB_NOT_NULL(idx_part_array[t])) {
+              if (OB_FAIL(ob_write_string(allocator, idx_part_array[t]->get_part_name(), idx_part_name))) {
+                LOG_WARN("failed to copy index partition name", K(ret)); break;
+              }
+            }
+          } else if (PARTITION_LEVEL_TWO == part_level) {
+            int64_t idx_part_idx = -1;
+            int64_t idx_subpart_idx = -1;
+            if (OB_FAIL(idx_schema->get_part_idx_by_tablet(
+                    idx_tablets.at(t), idx_part_idx, idx_subpart_idx))) {
+              LOG_WARN("failed to get index part idx by tablet", K(ret),
+                       K(idx_tablets.at(t))); break;
+            } else {
+              ObPartition **idx_part_array = idx_schema->get_part_array();
+              if (OB_ISNULL(idx_part_array) || OB_ISNULL(idx_part_array[idx_part_idx])) {
+                ret = OB_ERR_UNEXPECTED;
+                LOG_WARN("index part array or partition is null", K(ret),
+                         K(idx_part_idx), K(idx_tablets.at(t))); break;
+              } else {
+                ObSubPartition **idx_subpart_array = idx_part_array[idx_part_idx]->get_subpart_array();
+                if (OB_ISNULL(idx_subpart_array) || OB_ISNULL(idx_subpart_array[idx_subpart_idx])) {
+                  ret = OB_ERR_UNEXPECTED;
+                  LOG_WARN("index subpart array or subpartition is null", K(ret),
+                           K(idx_part_idx), K(idx_subpart_idx), K(idx_tablets.at(t))); break;
+                } else if (OB_FAIL(ob_write_string(allocator,
+                        idx_subpart_array[idx_subpart_idx]->get_part_name(), idx_part_name))) {
+                  LOG_WARN("failed to copy index subpartition name", K(ret)); break;
+                }
+              }
+            }
+          }
+        }
+        if (OB_FAIL(ret)) { break; }
+        if (OB_FAIL(idx_info.partition_names_.push_back(idx_part_name))) {
+          LOG_WARN("failed to push index partition name", K(ret)); break;
+        }
       }
     }
+  }
+  return ret;
+}
+
+void ObAsyncIndexRefreshMetadataCache::reset()
+{
+  for (int64_t i = 0; i < entries_.count(); ++i) {
+    entries_.at(i)->~ObAsyncIndexDataTableInfo();
+  }
+  entries_.reset();
+  allocator_.reset();
+  tenant_id_ = OB_INVALID_TENANT_ID;
+  data_table_id_ = OB_INVALID_ID;
+  data_tablet_id_.reset();
+  schema_version_ = 0;
+}
+
+int ObAsyncIndexRefreshMetadataCache::get(const uint64_t tenant_id,
+    const uint64_t data_table_id, const ObTabletID &data_tablet_id,
+    const uint64_t index_table_id, const ObTabletID &index_tablet_id,
+    const ObAsyncIndexDataTableInfo *&info)
+{
+  int ret = OB_SUCCESS;
+  info = nullptr;
+  ObSchemaGetterGuard guard;
+  int64_t version = 0;
+  if (OB_INVALID_TENANT_ID == tenant_id || OB_INVALID_ID == data_table_id
+      || OB_INVALID_ID == index_table_id || !data_tablet_id.is_valid() || !index_tablet_id.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid refresh metadata arguments", K(ret), K(tenant_id), K(data_table_id),
+        K(data_tablet_id), K(index_table_id), K(index_tablet_id));
+  } else if (OB_FAIL(GSCHEMASERVICE.get_tenant_schema_guard(tenant_id, guard))) {
+    LOG_WARN("failed to get refresh metadata schema guard", K(ret), K(tenant_id));
+  } else if (OB_FAIL(guard.get_schema_version(tenant_id, version))) {
+    LOG_WARN("failed to get refresh metadata snapshot version", K(ret), K(tenant_id));
+  } else if (version <= 0) {
+    ret = OB_SCHEMA_EAGAIN;
+    LOG_WARN("invalid refresh metadata snapshot version", K(ret), K(tenant_id), K(version));
+  } else {
+    // Use this same guard to build misses. A new guard is required on every call.
+    // Tenant snapshot invalidation also covers database and Search Def changes.
+    if (tenant_id_ != tenant_id || data_table_id_ != data_table_id
+        || data_tablet_id_ != data_tablet_id || schema_version_ != version) {
+      reset();
+      allocator_.set_attr(ObMemAttr(tenant_id, "AsyncIdxMeta"));
+      entries_.set_attr(ObMemAttr(tenant_id, "AsyncIdxMeta"));
+      tenant_id_ = tenant_id;
+      data_table_id_ = data_table_id;
+      data_tablet_id_ = data_tablet_id;
+      schema_version_ = version;
+    }
+    for (int64_t i = 0; nullptr == info && i < entries_.count(); ++i) {
+      const ObAsyncIndexInfo &index = entries_.at(i)->index_infos_.at(0);
+      if (index.index_table_id_ == index_table_id && index.tablet_ids_.at(0) == index_tablet_id) {
+        info = entries_.at(i);
+      }
+    }
+    if (nullptr == info) {
+      const ObTableSchema *data_schema = nullptr;
+      ObAsyncIndexDataTableInfo *entry = nullptr;
+      void *buf = nullptr;
+      if (OB_FAIL(guard.get_table_schema(tenant_id, data_table_id, data_schema))) {
+        LOG_WARN("failed to get refresh data schema", K(ret), K(data_table_id));
+      } else if (OB_ISNULL(data_schema)) {
+        ret = OB_TABLE_NOT_EXIST;
+        LOG_WARN("refresh data schema does not exist", K(ret), K(tenant_id), K(data_table_id));
+      } else if (OB_ISNULL(buf = allocator_.alloc(sizeof(ObAsyncIndexDataTableInfo)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate refresh metadata", K(ret), K(tenant_id), K(data_table_id), K(index_table_id));
+      } else {
+        entry = new (buf) ObAsyncIndexDataTableInfo();
+        if (OB_FAIL(build_data_table_info_from_schema_(tenant_id, data_schema, guard,
+            allocator_, *entry, index_table_id, data_tablet_id, index_tablet_id))) {
+          LOG_WARN("failed to build targeted refresh metadata", K(ret), K(data_table_id), K(index_table_id));
+        } else if (OB_FAIL(entries_.push_back(entry))) {
+          LOG_WARN("failed to cache refresh metadata", K(ret));
+        } else {
+          info = entry;
+        }
+        if (OB_FAIL(ret)) {
+          entry->~ObAsyncIndexDataTableInfo();
+        }
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    reset();
   }
   return ret;
 }
