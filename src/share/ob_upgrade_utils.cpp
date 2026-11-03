@@ -790,8 +790,15 @@ int ObUpgradeProcesserSet::init(
       int64_t data_version = cal_version(MAJOR, MINOR, MAJOR_PATCH, MINOR_PATCH); \
       INIT_PROCESSOR_BY_NAME_AND_VERSION(ObUpgradeFor##MAJOR##MINOR##MAJOR_PATCH##MINOR_PATCH##Processor,  \
           data_version, processor); \
-      if (FAILEDx(processor_list_.push_back(processor))) { \
-        LOG_WARN("fail to push back processor", KR(ret), KDV(data_version)); \
+      if (OB_SUCC(ret)) { \
+        if (OB_FAIL(processor_list_.push_back(processor))) { \
+          LOG_WARN("fail to push back processor", KR(ret), KDV(data_version)); \
+          if (OB_NOT_NULL(processor)) { \
+            processor->~ObBaseUpgradeProcessor(); \
+            allocator_.free(processor); \
+            processor = NULL; \
+          } \
+        } \
       } \
     }
 

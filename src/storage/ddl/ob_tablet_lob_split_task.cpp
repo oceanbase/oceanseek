@@ -8,10 +8,11 @@
 #include "storage/compaction/ob_schedule_dag_func.h"
 #include "share/scheduler/ob_dag_warning_history_mgr.h"
 #include "storage/ddl/ob_tablet_split_task.h"
-#include "storage/mds_table/ob_ls_mds_tablet_logical_reloc.h"
+#include "storage/mds_table/ob_tablet_mds_logical_reloc.h"
 #include "observer/ob_server_event_history_table_operator.h"
 #ifdef OB_BUILD_SHARED_STORAGE
 #include "storage/incremental/ss_meta_ctrl/ob_ss_meta_ctrl_define.h"
+#include "storage/high_availability/ob_ss_transfer_backfill_utils.h"
 #endif
 
 namespace oceanbase
@@ -626,6 +627,7 @@ bool ObTabletLobSplitDag::ignore_warning()
 int ObTabletLobSplitDag::report_replica_build_status() const
 {
   int ret = OB_SUCCESS;
+  int report_ret = context_.data_ret_;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("ObTabletLobSplitDag has not been inited", K(ret));
@@ -633,6 +635,17 @@ int ObTabletLobSplitDag::report_replica_build_status() const
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid param", K(ret), K(param_));
   } else {
+    // A LOB SPLIT_MAJOR-only split never runs create_mds (see the
+    // is_major_merge_type guard in ObTabletLobWriteDataTask::create_sstables),
+    // so no dest LOB tablet can ever grow a committed reloc marker to wait for.
+    const bool is_mds_reloc_submitted =
+        share::ObSplitSSTableType::SPLIT_MAJOR != param_.split_sstable_type_;
+    ObTabletMdsRelocHelper::defer_report_until_mds_reloc_persisted(context_.ls_handle_.get_ls(),
+                                            context_.new_lob_tablet_ids_,
+                                            param_.data_format_version_,
+                                            is_mds_reloc_submitted,
+                                            context_.data_ret_,
+                                            report_ret);
     obrpc::ObDDLBuildSingleReplicaResponseArg arg;
     ObAddr rs_addr;
     arg.tenant_id_ = param_.tenant_id_;
@@ -645,7 +658,7 @@ int ObTabletLobSplitDag::report_replica_build_status() const
     arg.snapshot_version_ = 1L; // to avoid invalid only.
     arg.schema_version_ = param_.schema_version_;
     arg.dest_schema_version_ = param_.schema_version_;
-    arg.ret_code_ = context_.data_ret_;
+    arg.ret_code_ = report_ret;
     arg.task_id_ = param_.task_id_;
     arg.execution_id_ = 1L;
     arg.server_addr_ = GCTX.self_addr();
@@ -664,9 +677,9 @@ int ObTabletLobSplitDag::report_replica_build_status() const
     char split_event_info[common::MAX_ROOTSERVICE_EVENT_VALUE_LENGTH/*512*/];
     snprintf(split_event_info, sizeof(split_event_info),
       "physical_rows_cnt: %ld, split_rows_cnt: %ld", context_.physical_row_count_, context_.row_inserted_);
-    report_build_stat("replica_split_resp", context_.data_ret_, split_event_info);
+    report_build_stat("replica_split_resp", report_ret, split_event_info);
   }
-  FLOG_INFO("lob tablet split finished", K(ret), K(context_.data_ret_));
+  FLOG_INFO("lob tablet split finished", K(ret), K(context_.data_ret_), K(report_ret));
   return ret;
 }
 
@@ -1131,7 +1144,18 @@ int ObTabletLobWriteDataTask::process()
       is_data_split_finished))) {
     LOG_WARN("check all major exist failed", K(ret));
   } else if (is_data_split_finished) {
-    LOG_INFO("split task has alreay finished", KPC(param_));
+    // Dest LOB data already exists. Do not infer that the V2 reloc marker was
+    // committed: a retry after dest data completed used to skip create_mds()
+    // entirely (create_mds() only ran at the end of create_sstables()).
+    // create_mds() is idempotent (duplicate marker -> OB_ALREADY_DONE
+    // normalized to success). SPLIT_MAJOR-only never submits a marker (see
+    // the is_major_merge_type guard in create_sstables).
+    LOG_INFO("split task has already finished, compensate mds reloc if needed", KPC(param_));
+    if (share::ObSplitSSTableType::SPLIT_MAJOR != param_->split_sstable_type_
+        && OB_FAIL(create_mds())) {
+      LOG_WARN("compensate lob split mds reloc after dest data completed failed",
+          K(ret), KPC(param_));
+    }
   } else if (OB_FAIL(ObTabletSplitUtil::get_storage_schema_from_mds(ctx_->lob_meta_tablet_handle_, param_->data_format_version_, lob_meta_storage_schema, tmp_arena))) {
     LOG_WARN("failed to get storage schema from mds", K(ret));
   } else if (OB_FAIL(ObTabletLobSplitUtil::generate_col_param(lob_meta_storage_schema, rk_cnt_))) {
@@ -1922,13 +1946,17 @@ int ObTabletLobWriteDataTask::create_mds()
   } else if (OB_UNLIKELY(ctx_->new_lob_tablet_ids_.empty())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("dest lob tablets empty for split mds reloc", KR(ret));
-  } else if (OB_FAIL(ObLsMdsTabletSplitReloc::submit_split_multikey_mds_reloc(
+  } else if (OB_FAIL(ObTabletSplitMdsReloc::submit_split_multikey_mds_reloc(
                  *ctx_->lob_meta_tablet_handle_.get_obj(),
                  ctx_->new_lob_tablet_ids_,
                  snapshot_scn,
                  tenant_id,
-                 dest_ls_id))) {
+                 dest_ls_id,
+                 param_->data_format_version_))) {
     LOG_WARN("submit lob split logical reloc failed", KR(ret), K(dest_ls_id), K(snapshot_scn), K(ctx_->new_lob_tablet_ids_));
+  } else {
+    ObTabletSplitMdsReloc::try_flush_mds_table_(
+        ctx_->ls_handle_.get_ls(), snapshot_scn, ctx_->new_lob_tablet_ids_);
   }
   return ret;
 }

@@ -4,13 +4,14 @@
  */
 
 #define USING_LOG_PREFIX STORAGE
+#include "storage/mds_table/ob_tablet_mds_reloc_helper.h"
 #include "ob_tablet_split_task.h"
 #include "logservice/ob_log_service.h"
 #include "lib/ob_define.h"
 #include "share/ob_ddl_sim_point.h"
 #include "share/scheduler/ob_dag_warning_history_mgr.h"
 #include "storage/access/ob_multiple_scan_merge.h"
-#include "storage/mds_table/ob_ls_mds_tablet_logical_reloc.h"
+#include "storage/mds_table/ob_tablet_mds_logical_reloc.h"
 
 #ifdef OB_BUILD_SHARED_STORAGE
 #include "storage/compaction_v2/ob_ss_compact_helper.h"
@@ -20,6 +21,7 @@
 #include "storage/incremental/share/ob_shared_meta_iter_guard.h"
 #include "storage/incremental/ob_shared_meta_service.h"
 #include "storage/incremental/ss_meta_ctrl/ob_ss_meta_ctrl_define.h"
+#include "storage/high_availability/ob_ss_transfer_backfill_utils.h"
 #endif
 
 namespace oceanbase
@@ -926,6 +928,8 @@ int ObTabletSplitDag::fill_dag_key(char *buf, const int64_t buf_len) const
 int ObTabletSplitDag::report_replica_build_status() const
 {
   int ret = OB_SUCCESS;
+  const int data_ret = context_.get_complement_data_ret();
+  int report_ret = data_ret;
   DEBUG_SYNC(AFTER_TABLET_SPLIT_MERGE_TASK);
   obrpc::ObDDLBuildSingleReplicaResponseArg arg;
   if (OB_UNLIKELY(!is_inited_)) {
@@ -935,6 +939,18 @@ int ObTabletSplitDag::report_replica_build_status() const
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid param", K(ret), K(param_));
   } else {
+    // Ordinary tablet split always submits V2 markers: merge runs
+    // collect_and_create_mds() before writing dest majors, and the
+    // already-finished retry path compensates with the same call (idempotent
+    // via the V2 marker lock). Unlike the LOB split DAG there is no
+    // SPLIT_MAJOR-only path that skips marker submission (see
+    // ObTabletLobSplitDag::report_replica_build_status for that case).
+    ObTabletMdsRelocHelper::defer_report_until_mds_reloc_persisted(context_.ls_handle_.get_ls(),
+                                            param_.dest_tablets_id_,
+                                            param_.data_format_version_,
+                                            true/*is_mds_reloc_submitted*/,
+                                            data_ret,
+                                            report_ret);
 #ifdef ERRSIM
     if (OB_SUCC(ret)) {
       ret = OB_E(EventTable::EN_DDL_REPORT_REPLICA_BUILD_STATUS_FAIL) OB_SUCCESS;
@@ -949,7 +965,7 @@ int ObTabletSplitDag::report_replica_build_status() const
     arg.tablet_id_        = param_.source_tablet_id_;
     arg.source_table_id_  = param_.table_id_;
     arg.dest_schema_id_   = context_.tablet_handle_.get_obj()->get_tablet_meta().data_tablet_id_.id(); // to fetch DDL Task.
-    arg.ret_code_         = context_.complement_data_ret_;
+    arg.ret_code_         = report_ret;
     arg.snapshot_version_ = 1L;
     arg.schema_version_   = param_.schema_version_;
     arg.dest_schema_version_ = param_.schema_version_;
@@ -970,7 +986,7 @@ int ObTabletSplitDag::report_replica_build_status() const
     char split_event_info[common::MAX_ROOTSERVICE_EVENT_VALUE_LENGTH/*512*/];
     snprintf(split_event_info, sizeof(split_event_info),
       "physical_rows_cnt: %ld, split_rows_cnt: %ld", context_.physical_row_count_, context_.row_inserted_);
-    report_build_stat("replica_split_resp", context_.complement_data_ret_, split_event_info);
+    report_build_stat("replica_split_resp", report_ret, split_event_info);
   }
   FLOG_INFO("send tablet split response to RS", K(ret), K(context_), K(arg));
   return ret;
@@ -1513,7 +1529,14 @@ int ObTabletSplitMergeTask::process()
       is_data_split_finished))) {
     LOG_WARN("check all major exist failed", K(ret));
   } else if (is_data_split_finished) {
-    LOG_INFO("split task has alreay finished", KPC(param_));
+    // Dest majors already exist. Do not infer that the V2 reloc marker was
+    // committed: a retry after dest data completed used to skip submit entirely.
+    // collect_and_create_mds() is idempotent (duplicate marker -> OB_ALREADY_DONE
+    // normalized to success), so this is a no-op when the marker is already in.
+    LOG_INFO("split task has already finished, compensate mds reloc if needed", KPC(param_));
+    if (OB_FAIL(collect_and_create_mds())) {
+      LOG_WARN("compensate split mds reloc after dest data completed failed", K(ret), KPC(param_));
+    }
   } else if (OB_FAIL(create_empty_minor_sstable_if_needed())) {
     LOG_WARN("create empty minor sstable failed", K(ret));
   } else if (OB_FAIL(collect_and_update_sstable(share::ObSplitSSTableType::SPLIT_MINOR))) {
@@ -1837,13 +1860,17 @@ int ObTabletSplitMergeTask::collect_and_create_mds()
     LOG_WARN("dest tablets empty for split mds reloc", KR(ret));
   } else {
     // Split reloc reads source MDS at split_scn; target reloc rows are keyed with min_scn in reloc module.
-    if (OB_FAIL(ObLsMdsTabletSplitReloc::submit_split_multikey_mds_reloc(
+    if (OB_FAIL(ObTabletSplitMdsReloc::submit_split_multikey_mds_reloc(
                    *context_->tablet_handle_.get_obj(),
                    param_->dest_tablets_id_,
                    snapshot_scn,
                    tenant_id,
-                   dest_ls_id))) {
+                   dest_ls_id,
+                   param_->data_format_version_))) {
       LOG_WARN("submit split ls mds reloc failed", KR(ret), K(dest_ls_id), K(snapshot_scn));
+    } else {
+      ObTabletSplitMdsReloc::try_flush_mds_table_(
+          context_->ls_handle_.get_ls(), snapshot_scn, param_->dest_tablets_id_);
     }
   }
   return ret;
@@ -2693,6 +2720,7 @@ int ObSplitFinishTask::process()
   ret = OB_SUCCESS;
   return ret;
 }
+
 
 } //end namespace stroage
 } //end namespace oceanbase

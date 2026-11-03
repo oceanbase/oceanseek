@@ -4,6 +4,7 @@
  */
 
 #define USING_LOG_PREFIX STORAGE
+#include "storage/mds_table/ob_tablet_mds_reloc_helper.h"
 #include "ob_tablet_fork_task.h"
 #include "lib/utility/ob_tracepoint.h"
 #include "logservice/ob_log_service.h"
@@ -15,7 +16,8 @@
 #include "storage/ddl/ob_ddl_merge_task.h"
 #include "storage/ddl/ob_tablet_fork_util.h"
 #include "storage/ddl/ob_tablet_split_util.h"
-#include "storage/mds_table/ob_ls_mds_tablet_logical_reloc.h"
+#include "storage/ddl/ob_tablet_split_task.h"
+#include "storage/mds_table/ob_tablet_mds_logical_reloc.h"
 #include "storage/mds_table/ob_mds_table.h"
 #include "storage/compaction/ob_tablet_merge_ctx.h"
 #include "storage/compaction/ob_partition_merge_policy.h"
@@ -90,7 +92,8 @@ static int check_fork_mds_reloc_done_(const ObLSHandle &dest_ls_handle, const Ob
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[FORKTABLE] dest mds table is null when checking reloc marker", K(ret), K(tablet_id), K(reorg_scn),
         "dest_ls_id", dest_ls->get_ls_id());
-  } else if (OB_FAIL(mds_table->get_latest_committed(tablet_id, reorg_scn, 5_s, reloc_status))) {
+  } else if (OB_FAIL(ObTabletMdsRelocHelper::get_latest_committed_reloc_status(
+      *mds_table, tablet_id, reorg_scn, 5_s, reloc_status))) {
     if (OB_EMPTY_RESULT == ret || OB_ITER_END == ret || OB_SNAPSHOT_DISCARDED == ret) {
       ret = OB_SUCCESS;
     } else {
@@ -98,7 +101,7 @@ static int check_fork_mds_reloc_done_(const ObLSHandle &dest_ls_handle, const Ob
           "dest_ls_id", dest_ls->get_ls_id());
     }
   } else {
-    is_done = reloc_status.reloc_done_;
+    is_done = reloc_status.is_reloc_done();
   }
   return ret;
 }
@@ -1692,9 +1695,8 @@ int ObForkTablePublishTask::process()
     LOG_WARN("[FORKTABLE] failed to finish fork minor add op", K(ret), K(ctx_->param_));
   } else {
     DEBUG_SYNC(BEFORE_FORK_PUBLISH_REPLACE);
-    if (OB_FAIL(meta_service->build_tablet_with_batch_tables(dst_ls->get_ls_id(),
-            ctx_->param_.dest_tablet_id_, ctx_->dst_reorg_scn_,
-            ObMetaUpdateReason::TABLET_FORK_REPLACE_SSTABLES, meta_ctrl_keys, batch_param))) {
+    if (OB_FAIL(ObForkTableDataDag::publish_fork_tables_to_shared_(*dst_ls,
+            ctx_->param_.dest_tablet_id_, ctx_->dst_reorg_scn_, meta_ctrl_keys, batch_param))) {
       LOG_WARN("[FORKTABLE] failed to replace fork tables in shared meta", K(ret), K(ctx_->param_));
     }
   }
@@ -1711,6 +1713,45 @@ int ObForkTablePublishTask::process()
     }
     LOG_INFO("[FORKTABLE] fork data atomically published to SS (await per-replica local land)", K(ctx_->param_),
         "minor_cnt", ctx_->minor_entries_.count());
+  }
+  return ret;
+}
+
+int ObForkTableDataDag::publish_fork_tables_to_shared_(
+    ObLS &dest_ls,
+    const ObTabletID &dest_tablet_id,
+    const share::SCN &dest_reorg_scn,
+    const ObArray<ObSSMetaCtrlKeyInfo> &meta_ctrl_keys,
+    const ObBatchUpdateTableStoreParam &param)
+{
+  int ret = OB_SUCCESS;
+  bool is_mds_reloc_persisted = false;
+  ObSSMetaService *meta_service = MTL(ObSSMetaService *);
+  // Shared data_complete must be published after the final MDS redo is durable.
+  // HA reads LS_MDS_TABLET and user tablets at one snapshot, so importing this
+  // completion bit also imports a checkpoint that can skip relocation replay.
+  // Existing replicas still need the separate local-land checkpoint gate.
+  if (OB_UNLIKELY(!dest_tablet_id.is_valid() || !dest_reorg_scn.is_valid()
+      || dest_reorg_scn != param.reorg_scn_ || !param.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[FORKTABLE] invalid shared fork publish argument", K(ret),
+        K(dest_tablet_id), K(dest_reorg_scn), K(param));
+  } else if (OB_ISNULL(meta_service)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[FORKTABLE] shared meta service is null before fork publish", K(ret));
+  } else if (OB_FAIL(ObTabletMdsRelocHelper::check_tablet_mds_reloc_persisted(
+                 &dest_ls, dest_tablet_id, dest_reorg_scn, is_mds_reloc_persisted))) {
+    LOG_WARN("[FORKTABLE] failed to check shared mds checkpoint before fork publish",
+        K(ret), K(dest_tablet_id), K(dest_reorg_scn));
+  } else if (!is_mds_reloc_persisted) {
+    ret = OB_EAGAIN;
+    LOG_INFO("[FORKTABLE] wait for shared mds checkpoint before fork publish",
+        K(ret), K(dest_tablet_id), K(dest_reorg_scn));
+  } else if (OB_FAIL(meta_service->build_tablet_with_batch_tables(dest_ls.get_ls_id(),
+                 dest_tablet_id, dest_reorg_scn, ObMetaUpdateReason::TABLET_FORK_REPLACE_SSTABLES,
+                 meta_ctrl_keys, param))) {
+    LOG_WARN("[FORKTABLE] failed to publish fork tables after shared mds persistence",
+        K(ret), K(dest_tablet_id), K(dest_reorg_scn));
   }
   return ret;
 }
@@ -1978,11 +2019,13 @@ int ObForkTableDataDag::submit_fork_ttl_mds_reloc_if_needed_(const share::SCN &f
   } else if (OB_ISNULL(src_tablet = src_tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("source tablet is null", K(ret), K(param_));
-  } else if (OB_FAIL(ObLsMdsTabletForkReloc::submit_fork_ttl_mds_reloc(
+  } else if (OB_FAIL(ObTabletForkMdsReloc::submit_fork_ttl_mds_reloc(
                  *src_tablet, param_.dest_tablet_id_, fork_snapshot_scn,
-                 dst_reorg_scn, param_.dest_tenant_id_, param_.dest_ls_id_))) {
+                 dst_reorg_scn, param_.dest_tenant_id_, param_.dest_ls_id_,
+                 param_.data_format_version_))) {
     LOG_WARN("[FORKTABLE] failed to relocate fork ttl mds", K(ret), K(param_), K(fork_snapshot_scn), K(dst_reorg_scn));
   } else {
+    try_flush_mds_table_(dst_ls_handle.get_ls(), dst_reorg_scn);
     LOG_INFO("[FORKTABLE] fork ttl mds relocation submitted before data publish",
         K(param_), K(fork_snapshot_scn), K(dst_reorg_scn));
   }
@@ -2061,7 +2104,8 @@ int ObForkTableDataDag::process_fork_local_land()
   ObTablet *dst_tablet = nullptr;
   ObTabletCreateDeleteMdsUserData user_data;
   share::SCN dst_reorg_scn;
-  bool is_mds_reloc_done = false;
+  bool is_mds_reloc_persisted = false;
+  bool is_local_mds_checkpoint_reached = false;
   if (OB_UNLIKELY(!is_inited_
       || !param_.is_valid()
       || ObForkDataPhase::FORK_LOCAL_LAND != fork_phase_)) {
@@ -2083,6 +2127,23 @@ int ObForkTableDataDag::process_fork_local_land()
   } else if (OB_ISNULL(dst_tablet = dst_tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[FORKTABLE] fork dst tablet is null before local land", K(ret), K(param_));
+  } else if (FALSE_IT(dst_reorg_scn = dst_tablet->get_reorganization_scn())) {
+  } else if (OB_FAIL(ObTabletMdsRelocHelper::check_local_checkpoint_reached(
+                 ls_handle.get_ls(), param_.dest_tablet_id_, dst_reorg_scn, is_local_mds_checkpoint_reached))) {
+    LOG_WARN("[FORKTABLE] failed to check local fork ttl mds checkpoint",
+        K(ret), K(param_), K(dst_reorg_scn));
+  } else if (!is_local_mds_checkpoint_reached) {
+    ret = OB_EAGAIN;
+    LOG_INFO("[FORKTABLE] wait for local mds checkpoint before local land",
+        K(ret), K(param_), K(dst_reorg_scn));
+  } else if (OB_FAIL(ObTabletMdsRelocHelper::check_tablet_mds_reloc_persisted(
+             ls_handle.get_ls(), param_.dest_tablet_id_, dst_reorg_scn, is_mds_reloc_persisted))) {
+    LOG_WARN("[FORKTABLE] failed to check fork ttl mds reloc persistence before local land",
+        K(ret), K(param_), K(dst_reorg_scn));
+  } else if (!is_mds_reloc_persisted) {
+    ret = OB_EAGAIN;
+    LOG_INFO("[FORKTABLE] wait for shared mds checkpoint before local land",
+        K(ret), K(param_), K(dst_reorg_scn));
   } else if (dst_tablet->get_tablet_meta().fork_info_.is_data_complete()) {
     LOG_INFO("[FORKTABLE] local fork data already landed, skip download", K(param_));
   } else if (OB_FAIL(dst_tablet->get_latest_committed_tablet_status(user_data))) {
@@ -2090,14 +2151,6 @@ int ObForkTableDataDag::process_fork_local_land()
   } else if (ObTabletStatus::FORK_DST != user_data.tablet_status_) {
     ret = OB_EAGAIN;
     LOG_INFO("[FORKTABLE] wait fork dst status before local land", K(ret), K(param_), K(user_data));
-  } else if (FALSE_IT(dst_reorg_scn = dst_tablet->get_reorganization_scn())) {
-  } else if (OB_FAIL(check_fork_mds_reloc_done_(ls_handle, param_.dest_tablet_id_, dst_reorg_scn, is_mds_reloc_done))) {
-    LOG_WARN("[FORKTABLE] failed to check fork ttl mds reloc marker before local land", K(ret), K(param_),
-        K(dst_reorg_scn));
-  } else if (!is_mds_reloc_done) {
-    ret = OB_EAGAIN;
-    LOG_INFO("[FORKTABLE] wait fork ttl mds reloc marker before local land",
-        K(ret), K(param_), K(dst_reorg_scn));
   } else if (OB_FAIL(land_fork_tables_to_local_(param_, ls_handle, dst_reorg_scn))) {
     LOG_WARN("[FORKTABLE] failed to replace fork tables to local", K(ret), K(param_), K(dst_reorg_scn));
   }
@@ -2141,6 +2194,21 @@ int ObForkDownloadSSTableTask::process()
   return ret;
 }
 
+// Flush only accelerates persistence; the local-land gate retries on failure.
+void ObForkTableDataDag::try_flush_mds_table_(
+    ObLS *dest_ls,
+    const share::SCN &dst_reorg_scn)
+{
+  int tmp_ret = OB_SUCCESS;
+  if (OB_ISNULL(dest_ls)) {
+    tmp_ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[FORKTABLE] dest ls is null when triggering mds table flush",
+        K(tmp_ret), K(param_), K(dst_reorg_scn));
+  } else if (OB_TMP_FAIL(dest_ls->flush_mds_table())) {
+    LOG_WARN("[FORKTABLE] failed to trigger mds table flush", K(tmp_ret),
+        K(param_), K(dst_reorg_scn));
+  }
+}
 
 } // namespace storage
 } // namespace oceanbase

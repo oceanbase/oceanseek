@@ -83,22 +83,6 @@ public:
       bool &is_tablet_exist,
       bool &is_data_uploaded,
       bool &is_data_backfilled);
-  // 直读 LS mds_table 上 (tablet_id, transfer_scn) 的 ObTabletMdsRelocStatus marker。
-  // 行存在且 reloc_done_ 为 true 则 is_done = true；行不存在视为未完成。
-  // 严格版本：由调用方传入 dest ls，读失败向上返回。
-  static int check_tablet_mds_reloc_done(
-      ObLS *ls,
-      const ObTabletID &tablet_id,
-      const share::SCN &transfer_scn,
-      bool &is_done);
-  // 尽力而为版本：按 dest_ls_id 查找本地副本。
-  // 本地无副本或读失败时降级为 is_done = false 且返回 OB_SUCCESS
-  // （假阴性可接受：调用方会重做 reloc，dest 侧可吸收重复）。
-  static int check_tablet_mds_reloc_done(
-      const share::ObLSID &dest_ls_id,
-      const ObTabletID &tablet_id,
-      const share::SCN &transfer_scn,
-      bool &is_done);
 
 };
 

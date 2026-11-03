@@ -162,6 +162,32 @@ ob_ha_unittest_observer(test_transfer_doing_stage_restart_with_mds_flush storage
 ob_ha_unittest_observer(test_transfer_complete_restart_with_mds_flush storage_ha/test_transfer_complete_restart_with_mds_flush.cpp)
 #ob_ha_unittest_observer(test_transfer_with_empty_shell storage_ha/test_transfer_with_empty_shell.cpp)
 ob_ha_unittest_observer(test_mds_transaction test_mds_transaction.cpp)
+# These SS-only cases require the S3 fixture configured by the shared
+# authorization header or OB_MDS_TEST_STORAGE_INFO. Missing fixtures fail -s
+# explicitly; the ordinary non-SS entry must not report them as passing.
+string(CONCAT MDS_SS_CASES
+  "TestMdsTransaction.reloc_v2_data_version_boundary:"
+  "TestMdsTransaction.transfer_submit_uses_persisted_task_version:"
+  "TestMdsTransaction.reloc_v2_multibatch_medium_redo_fence:"
+  "TestMdsTransaction.reloc_v2_submit_already_done_end_result:"
+  "TestMdsTransaction.reloc_v2_duplicate_op_row_checks_value_and_meta:"
+  "TestMdsTransaction.tablet_reloc_persisted_uses_marker_redo_scn:"
+  "TestMdsTransaction.tablet_reloc_final_replay_skips_persisted_redo_without_source:"
+  "TestMdsTransaction.fork_local_land_retry_requires_local_checkpoint:"
+  "TestMdsTransaction.fork_publish_requires_shared_mds_checkpoint:"
+  "TestMdsTransaction.transfer_managers_propagate_checkpoint_prefetch_errors:"
+  "TestMdsTransaction.split_report_requires_local_mds_checkpoint:"
+  "TestMdsTransaction.reloc_absent_source_cancels_only_current_migration")
+set_tests_properties(test_mds_transaction PROPERTIES
+  ENVIRONMENT "GTEST_FILTER=-${MDS_SS_CASES}"
+  RESOURCE_LOCK mds_transaction_fixture)
+# Keep the executable relative, as in ob_unittest: Farm relocates the build
+# artifacts from the compile job into a separate test job workspace.
+add_test(test_mds_transaction_ss test_mds_transaction -s)
+set_tests_properties(test_mds_transaction_ss PROPERTIES
+  ENVIRONMENT "GTEST_FILTER=${MDS_SS_CASES}"
+  RESOURCE_LOCK mds_transaction_fixture
+  TIMEOUT 600)
 ob_ha_unittest_observer(test_reorg_info_table_basic storage_ha/test_reorg_info_table_basic.cpp)
 ob_ha_unittest_observer(test_reorg_info_table_mini_and_minor storage_ha/test_reorg_info_table_mini_and_minor.cpp)
 errsim_ha_unittest_observer(errsim_test_transfer_handler errsim/storage_ha/errsim_test_transfer_handler.cpp)

@@ -208,6 +208,9 @@ private:
   int check_transfer_out_deleted_tablet_need_backfill_(
       const ObTabletBackfillInfo &tablet_info,
       bool &need_backfill);
+  // Keep the historical "done" name.  This prefilter only checks that the
+  // final reloc marker is committed; the shared/local checkpoint persistence
+  // gates are applied later by the replace and refresh stages respectively.
   int filter_mds_reloc_done_tablets_(
       const common::ObIArray<ObTabletBackfillInfo> &tablet_info_array,
       common::ObIArray<ObTabletBackfillInfo> &ready_tablet_info_array);

@@ -641,9 +641,9 @@ ob_set_subtarget(ob_storage tx_storage
 )
 
 ob_set_subtarget(ob_storage mds_table
-  mds_table/ob_ls_mds_tablet_reloc_batch_arg.cpp
-  mds_table/ob_ls_mds_tablet_reloc_mds_helper.cpp
-  mds_table/ob_ls_mds_tablet_logical_reloc.cpp
+  mds_table/ob_tablet_mds_reloc_batch_arg.cpp
+  mds_table/ob_tablet_mds_reloc_helper.cpp
+  mds_table/ob_tablet_mds_logical_reloc.cpp
   mds_table/ob_mds_multikey_reader.cpp
   mds_table/ob_mds_table.cpp
   mds_table/ob_mds_table_datum_row_converter.cpp

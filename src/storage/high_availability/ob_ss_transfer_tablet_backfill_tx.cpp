@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #define USING_LOG_PREFIX STORAGE
+#include "storage/mds_table/ob_tablet_mds_reloc_helper.h"
 #include "storage/high_availability/ob_storage_ha_dag.h"
 #include "ob_ss_transfer_tablet_backfill_tx.h"
 #include "storage/compaction/ob_partition_merge_policy.h"
@@ -11,7 +12,7 @@
 #include "storage/incremental/ob_shared_meta_service.h"
 #include "share/scheduler/ob_dag_scheduler_config.h"
 #include "storage/ls/ob_ls.h"
-#include "storage/mds_table/ob_ls_mds_tablet_logical_reloc.h"
+#include "storage/mds_table/ob_tablet_mds_logical_reloc.h"
 #include "storage/tablet/ob_tablet_create_delete_mds_user_data.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "ob_ss_transfer_backfill_utils.h"
@@ -1536,7 +1537,7 @@ int ObSSTabletMdsRelocTask::process()
   } else if (!is_primary_tenant) {
     LOG_INFO("standby tenant skips tablet mds relocation", K(ls_id_), K(tablet_info_),
         "tenant_id", ha_dag_net_ctx_->tenant_id_);
-  } else if (OB_FAIL(ObSSTransferBackfillUtils::check_tablet_mds_reloc_done(
+  } else if (OB_FAIL(ObTabletMdsRelocHelper::check_tablet_mds_reloc_done(
       ha_dag_net_ctx_->dest_ls_id_, tablet_info_.tablet_id_, tablet_info_.backfill_scn_, is_done))) {
     LOG_WARN("failed to check tablet mds reloc done", K(ret), K(tablet_info_),
         "dest_ls_id", ha_dag_net_ctx_->dest_ls_id_);
@@ -1547,7 +1548,7 @@ int ObSSTabletMdsRelocTask::process()
   } else if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("source tablet should not be NULL", K(ret), K(tablet_handle), K(tablet_info_));
-  } else if (OB_FAIL(ObLsMdsTabletTransferReloc::submit_transfer_mds_reloc(
+  } else if (OB_FAIL(ObTabletTransferMdsReloc::submit_transfer_mds_reloc(
       *tablet,
       tablet_info_.backfill_scn_,
       ha_dag_net_ctx_->tenant_id_,
@@ -1555,6 +1556,7 @@ int ObSSTabletMdsRelocTask::process()
     LOG_WARN("submit transfer logical reloc failed", K(ret), K(ls_id_), K(tablet_info_),
         "dest_ls_id", ha_dag_net_ctx_->dest_ls_id_);
   } else {
+    try_flush_dest_ls_mds_table_();
     LOG_INFO("transfer ls mds logical reloc submitted", K(ls_id_), K(tablet_info_),
         "dest_ls_id", ha_dag_net_ctx_->dest_ls_id_);
   }
@@ -1608,6 +1610,37 @@ int ObSSTabletMdsRelocTask::get_and_check_src_tablet_(ObTabletHandle &tablet_han
         K(user_data), K(tablet_info_), KPC(tablet));
   }
   return ret;
+}
+
+void ObSSTabletMdsRelocTask::try_flush_dest_ls_mds_table_()
+{
+  int tmp_ret = OB_SUCCESS;
+  ObLSService *ls_service = nullptr;
+  ObLSHandle dest_ls_handle;
+  ObLS *dest_ls = nullptr;
+  // BACKFILL_TX ctx only holds src_ls_handle_; get_dest_ls() is reserved for
+  // replace/refresh. Look the dest LS up locally when this observer has that
+  // replica. If dest is not colocated, skip with INFO: dest-side replace/
+  // refresh gates still flush while waiting on the persistence fence.
+  if (OB_ISNULL(ha_dag_net_ctx_)) {
+    tmp_ret = OB_ERR_UNEXPECTED;
+    LOG_WARN_RET(tmp_ret, "ha dag net ctx should not be NULL for mds reloc flush",
+        K(ls_id_), K(tablet_info_));
+  } else if (OB_ISNULL(ls_service = MTL(ObLSService *))) {
+    tmp_ret = OB_ERR_UNEXPECTED;
+    LOG_WARN_RET(tmp_ret, "ls service should not be NULL for mds reloc flush",
+        K(ls_id_), K(tablet_info_), "dest_ls_id", ha_dag_net_ctx_->dest_ls_id_);
+  } else if (OB_SUCCESS != (tmp_ret = ls_service->get_ls(
+      ha_dag_net_ctx_->dest_ls_id_, dest_ls_handle, ObLSGetMod::HA_MOD))) {
+    LOG_INFO("local dest ls is unavailable for mds reloc flush",
+        K(tmp_ret), K(ls_id_), K(tablet_info_), "dest_ls_id", ha_dag_net_ctx_->dest_ls_id_);
+  } else if (OB_ISNULL(dest_ls = dest_ls_handle.get_ls())) {
+    tmp_ret = OB_ERR_UNEXPECTED;
+    LOG_WARN_RET(tmp_ret, "dest ls should not be NULL for mds reloc flush",
+        K(ls_id_), K(tablet_info_), "dest_ls_id", ha_dag_net_ctx_->dest_ls_id_);
+  } else {
+    ObTabletMdsRelocHelper::try_flush_mds_table(dest_ls);
+  }
 }
 
 } //storage

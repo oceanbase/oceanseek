@@ -17,6 +17,7 @@ namespace storage
 {
 
 struct ObForkPublishCtx;
+struct ObSSMetaCtrlKeyInfo;
 class ObForkMinorRewriteTask;
 
 enum class ObForkDataPhase : int64_t
@@ -115,6 +116,12 @@ private:
       common::ObArenaAllocator &allocator, ObForkPublishCtx &ctx);
   int collect_fork_publish_tables_(common::ObArenaAllocator &allocator, ObForkPublishCtx &ctx);
   int generate_fork_publish_tasks_(common::ObArenaAllocator &allocator, share::ObITask &prepare_task);
+  static int publish_fork_tables_to_shared_(
+      ObLS &dest_ls,
+      const common::ObTabletID &dest_tablet_id,
+      const share::SCN &dest_reorg_scn,
+      const common::ObArray<ObSSMetaCtrlKeyInfo> &meta_ctrl_keys,
+      const ObBatchUpdateTableStoreParam &param);
   static int normalize_fork_minor_snapshot_row_(
       const int64_t schema_rowkey_count,
       blocksstable::ObDatumRow &row);
@@ -122,7 +129,11 @@ private:
       ObTableStoreIterator &table_store_iter, ObTablesHandleArray &local_sstables_handle);
   int land_fork_tables_to_local_(const ObForkTableDataParam &param, ObLSHandle &ls_handle, const share::SCN &reorg_scn);
   int submit_fork_ttl_mds_reloc_if_needed_(const share::SCN &fork_snapshot_scn);
+  // Best-effort flush: failures are logged; local land retries until both the
+  // local MDS checkpoint and the shared persistence gate cover the marker.
+  void try_flush_mds_table_(ObLS *dest_ls, const share::SCN &dst_reorg_scn);
   friend class ObForkMinorRewriteTask;
+  friend class ObForkTablePublishTask;
 private:
   bool is_inited_;
   ObForkTableDataParam param_;

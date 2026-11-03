@@ -96,6 +96,7 @@ public:
   bool is_dag_net_cleared() const;
   void set_dag_net_cleared();
   int set_result(const int32_t result);
+  int set_result_for_task(const int32_t result, const share::ObTaskId &task_id);
   int set_src_ls_rebuild_seq(const int64_t seq);
   int get_migration_task_and_handler_status(
       ObLSMigrationTask &task, 
@@ -111,6 +112,7 @@ public:
       int64_t &leader_proposal_id);
 #endif
 private:
+  int set_result_(const int32_t result, const share::ObTaskId *expected_task_id);
   void reuse_();
   void wakeup_();
   int get_ls_migration_handler_status_(ObLSMigrationHandlerStatus &status);

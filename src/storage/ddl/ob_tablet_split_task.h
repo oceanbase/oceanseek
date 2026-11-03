@@ -162,6 +162,7 @@ public:
     const char *event_name,
     const int result,
     const char *event_info = nullptr) const = 0;
+
 protected:
   int alloc_and_add_common_task(
     ObITask *last_task,
@@ -172,6 +173,7 @@ protected:
     const bool can_reuse_macro_block,
     const share::SCN &dest_reorg_scn,
     const share::SCN &split_start_scn);
+
 };
 
 class ObTabletSplitDag final: public ObIDataSplitDag

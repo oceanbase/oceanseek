@@ -4,6 +4,7 @@
  */
 
 #define USING_LOG_PREFIX STORAGE
+#include "storage/mds_table/ob_tablet_mds_reloc_helper.h"
 #include "ob_ss_transfer_backfill_tx.h"
 #include "share/scheduler/ob_dag_scheduler_config.h"
 #include "storage/ls/ob_ls.h"
@@ -742,36 +743,6 @@ int ObSSTransferWorkerMgr::check_transfer_out_deleted_tablet_need_backfill_(
   return ret;
 }
 
-int ObSSTransferWorkerMgr::filter_mds_reloc_done_tablets_(
-    const common::ObIArray<ObTabletBackfillInfo> &tablet_info_array,
-    common::ObIArray<ObTabletBackfillInfo> &ready_tablet_info_array)
-{
-  int ret = OB_SUCCESS;
-  ready_tablet_info_array.reset();
-
-  if (!is_inited_) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("ss transfer worker mgr do not init", K(ret));
-  } else {
-    for (int64_t i = 0; OB_SUCC(ret) && i < tablet_info_array.count(); ++i) {
-      const ObTabletBackfillInfo &tablet_info = tablet_info_array.at(i);
-      bool is_done = false;
-      if (ObTabletBackfillType::BACKFILL_TRANSFER_IN != tablet_info.backfill_type_) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("tablet should be transfer in", K(ret), K(tablet_info));
-      } else if (OB_FAIL(ObSSTransferBackfillUtils::check_tablet_mds_reloc_done(
-          ls_, tablet_info.tablet_id_, tablet_info.backfill_scn_, is_done))) {
-        LOG_WARN("failed to check tablet mds reloc done", K(ret), K(ls_id_), K(tablet_info));
-      } else if (!is_done) {
-        LOG_INFO("skip transfer in tablet before mds relocation is done", K(ls_id_), K(tablet_info));
-      } else if (OB_FAIL(ready_tablet_info_array.push_back(tablet_info))) {
-        LOG_WARN("failed to push ready tablet info", K(ret), K(tablet_info));
-      }
-    }
-  }
-  return ret;
-}
-
 ObSSTransferBasicMgr::ObSSTransferBasicMgr()
   : is_inited_(false),
     tenant_id_(OB_INVALID_ID),
@@ -1181,7 +1152,7 @@ int ObSSTransferBackfillTXMgr::check_tablet_need_backfill_(
     need_backfill = false;
   } else if (!is_data_backfilled) {
     need_backfill = true;
-  } else if (OB_FAIL(ObSSTransferBackfillUtils::check_tablet_mds_reloc_done(
+  } else if (OB_FAIL(ObTabletMdsRelocHelper::check_tablet_mds_reloc_done(
       tablet_info.relative_ls_id_, tablet_info.tablet_id_, tablet_info.backfill_scn_, is_mds_reloc_done))) {
     LOG_WARN("failed to check tablet mds reloc done", K(ret), K(tablet_info));
   } else {
@@ -1243,7 +1214,13 @@ int ObSSTransferReplaceMgr::get_need_replace_tablet_info_(
   ObLSService *ls_service = nullptr;
   ObLSHandle ls_handle;
   ObLS *ls = nullptr;
+  share::SCN ss_mds_clog_checkpoint_scn;
+  bool mds_flush_requested = false;
 
+  // The authoritative SS LS_MDS_TABLET clog checkpoint is LS-wide.  Read it
+  // once before the loop and reuse it for every tablet marker in this round;
+  // an older snapshot can only delay scheduling and cannot admit an unsafe
+  // tablet.
   if (!is_inited_) {
     ret = OB_NOT_INIT;
     LOG_WARN("ss transfer replace mgr do not init", K(ret));
@@ -1255,6 +1232,12 @@ int ObSSTransferReplaceMgr::get_need_replace_tablet_info_(
   } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ls should not be NULL", K(ret), K(ls_id_));
+  } else if (tablet_info_array.empty()) {
+    // do nothing
+  } else if (OB_FAIL(ObTabletMdsRelocHelper::get_ss_mds_clog_checkpoint_scn(
+      ls_id_, ss_mds_clog_checkpoint_scn))) {
+    LOG_WARN("failed to read shared mds checkpoint before checking replace tablets",
+        K(ret), K(ls_id_));
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < tablet_info_array.count(); ++i) {
       const ObTabletBackfillInfo &tablet_info = tablet_info_array.at(i);
@@ -1264,19 +1247,21 @@ int ObSSTransferReplaceMgr::get_need_replace_tablet_info_(
       bool is_ss_src_tablet_exist = false;
       bool is_ss_src_data_uploaded = false;
       bool is_ss_src_data_backfilled = false;
-      bool is_mds_reloc_done = false;
+      bool is_mds_reloc_persisted = false;
       bool need_replace = false;
 
       if (OB_FAIL(check_local_tablet_match_(tablet_info, is_match))) {
         LOG_WARN("failed to check local tablet match", K(ret), K(tablet_info));
       } else if (!is_match) {
         // do nothing
-      } else if (OB_FAIL(ObSSTransferBackfillUtils::check_tablet_mds_reloc_done(
-          ls, tablet_info.tablet_id_, tablet_info.backfill_scn_, is_mds_reloc_done))) {
-        LOG_WARN("failed to check tablet mds reloc done", K(ret), K(tablet_info), KPC(ls));
-      } else if (!is_mds_reloc_done) {
-        // mds reloc 未完成时本轮不调度 replace，避免建 DAG 后再 EAGAIN。
-        LOG_INFO("skip replace before mds relocation is done", K(tablet_info));
+      } else if (OB_FAIL(ObTabletMdsRelocHelper::check_tablet_mds_reloc_persisted(
+          ls, tablet_info.tablet_id_, tablet_info.backfill_scn_,
+          ss_mds_clog_checkpoint_scn, is_mds_reloc_persisted, &mds_flush_requested))) {
+        LOG_WARN("failed to check tablet mds reloc persisted", K(ret), K(tablet_info), KPC(ls));
+      } else if (!is_mds_reloc_persisted) {
+        // Replace mutates shared state, so only the authoritative SS checkpoint
+        // is the relevant persistence fence at this stage.
+        LOG_INFO("skip replace before mds relocation is persisted", K(tablet_info));
       } else if (OB_FAIL(check_local_tablet_ready_(tablet_info, ls, is_local_tablet_ready))) {
         LOG_WARN("failed to check local tablet ready", K(ret), K(tablet_info));
       } else if (is_local_tablet_ready) {
@@ -1297,7 +1282,7 @@ int ObSSTransferReplaceMgr::get_need_replace_tablet_info_(
       if (OB_FAIL(ret)) {
       } else if (!need_replace) {
         //skip this tablet
-        LOG_INFO("tablet does not need replace", K(ret), K(is_mds_reloc_done), K(is_local_tablet_ready),
+        LOG_INFO("tablet does not need replace", K(ret), K(is_mds_reloc_persisted), K(is_local_tablet_ready),
             K(is_ss_dest_tablet_ready), K(is_ss_src_tablet_exist), K(is_ss_src_data_uploaded),
             K(is_ss_src_data_backfilled), K(tablet_info));
       } else if (OB_FAIL(need_replace_tablet_infos.push_back(tablet_info))) {
@@ -1449,6 +1434,8 @@ int ObSSTransferRefreshMgr::get_need_refresh_transfer_in_tablet_info_(
   ObLSService *ls_service = nullptr;
   ObLSHandle ls_handle;
   ObLS *ls = nullptr;
+  share::SCN local_mds_checkpoint_scn;
+  bool mds_flush_requested = false;
   if (!is_inited_) {
     ret = OB_NOT_INIT;
     LOG_WARN("ss transfer refresh tx mgr do not init", K(ret));
@@ -1460,11 +1447,20 @@ int ObSSTransferRefreshMgr::get_need_refresh_transfer_in_tablet_info_(
   } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ls should not be NULL", K(ret), K(ls_id_));
+  } else if (tablet_info_array.empty()) {
+    // do nothing
+  } else if (OB_FAIL(ObTabletMdsRelocHelper::get_local_mds_checkpoint_scn(
+      ls, local_mds_checkpoint_scn))) {
+    LOG_WARN("failed to read local mds checkpoint before checking refresh tablets",
+        K(ret), K(ls_id_), KPC(ls));
   } else {
+    // Like replace, fail this scheduling round if the LS-wide checkpoint read
+    // fails. Only a successful read may be reused by the per-tablet checks.
     for (int64_t i = 0; OB_SUCC(ret) && i < tablet_info_array.count(); ++i) {
       const ObTabletBackfillInfo &tablet_info = tablet_info_array.at(i);
       bool need_refresh = false;
       bool is_match = false;
+      bool is_local_mds_checkpoint_reached = false;
       if (ObTabletBackfillType::BACKFILL_TRANSFER_IN != tablet_info.backfill_type_) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("tablet info backfill type is not TRANSFER_IN, unexpected", K(ret), K(tablet_info));
@@ -1472,6 +1468,13 @@ int ObSSTransferRefreshMgr::get_need_refresh_transfer_in_tablet_info_(
         LOG_WARN("failed to check local tablet match", K(ret), K(tablet_info));
       } else if (!is_match) {
         //do nothing
+      } else if (OB_FAIL(ObTabletMdsRelocHelper::check_local_checkpoint_reached(
+          ls, tablet_info.tablet_id_, tablet_info.backfill_scn_,
+          local_mds_checkpoint_scn, is_local_mds_checkpoint_reached, &mds_flush_requested))) {
+        LOG_WARN("failed to check tablet mds reloc local checkpoint",
+            K(ret), K(tablet_info), KPC(ls));
+      } else if (!is_local_mds_checkpoint_reached) {
+        LOG_INFO("skip refresh before local mds checkpoint covers relocation", K(tablet_info));
       } else if (OB_FAIL(check_transfer_in_tablet_need_refresh_(tablet_info, ls, need_refresh))) {
         LOG_WARN("failed to check transfer in tablet need refresh", K(ret), K(tablet_info));
       } else if (!need_refresh) {
@@ -1492,12 +1495,15 @@ int ObSSTransferRefreshMgr::check_transfer_in_tablet_need_refresh_(
 {
   int ret = OB_SUCCESS;
   need_refresh = false;
-  bool is_mds_reloc_done = false;
   ObTabletHandle local_tablet_handle;
   ObTablet *local_tablet = nullptr;
   ObArenaAllocator allocator;
   ObTabletHandle ss_tablet_handle;
   ObTablet *ss_tablet = nullptr;
+  // No reloc-done marker check here: the caller already gated this tablet on
+  // check_local_checkpoint_reached, which requires the
+  // committed done-marker (and, for V2, the local checkpoint fence), so a
+  // second marker read would be redundant.
 
   if (!is_inited_) {
     ret = OB_NOT_INIT;
@@ -1512,13 +1518,6 @@ int ObSSTransferRefreshMgr::check_transfer_in_tablet_need_refresh_(
     LOG_WARN("tablet should not be NULL", K(ret), K(tablet_info), K(local_tablet_handle));
   } else if (!local_tablet->get_tablet_meta().has_transfer_table()) {
     need_refresh = false;
-  } else if (OB_FAIL(ObSSTransferBackfillUtils::check_tablet_mds_reloc_done(
-      ls, tablet_info.tablet_id_, tablet_info.backfill_scn_, is_mds_reloc_done))) {
-    LOG_WARN("failed to check tablet mds reloc done", K(ret), K(tablet_info), KPC(ls));
-  } else if (!is_mds_reloc_done) {
-    // mds reloc 未完成时本轮不调度 refresh，避免建 DAG 后再 EAGAIN。
-    need_refresh = false;
-    LOG_INFO("skip refresh before mds relocation is done", K(tablet_info));
   } else if (OB_FAIL(ObSSTransferBackfillUtils::get_ss_tablet(ls_id_, tablet_info.tablet_id_,
       tablet_info.reorganization_scn_, allocator, ss_tablet_handle, true /*read_mark_delete*/))) {
     if (OB_TABLET_NOT_EXIST == ret) {
@@ -1535,6 +1534,41 @@ int ObSSTransferRefreshMgr::check_transfer_in_tablet_need_refresh_(
     need_refresh = true;
   } else {
     need_refresh = false;
+  }
+  return ret;
+}
+
+int ObSSTransferWorkerMgr::filter_mds_reloc_done_tablets_(
+    const common::ObIArray<ObTabletBackfillInfo> &tablet_info_array,
+    common::ObIArray<ObTabletBackfillInfo> &ready_tablet_info_array)
+{
+  int ret = OB_SUCCESS;
+  ready_tablet_info_array.reset();
+
+  // This common prefilter feeds both replace and refresh.  It only checks that
+  // the final marker committed; each stage applies its own SS or local
+  // checkpoint fence later.
+  if (!is_inited_) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ss transfer worker mgr do not init", K(ret));
+  } else if (tablet_info_array.empty()) {
+    // do nothing
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < tablet_info_array.count(); ++i) {
+      const ObTabletBackfillInfo &tablet_info = tablet_info_array.at(i);
+      bool is_done = false;
+      if (ObTabletBackfillType::BACKFILL_TRANSFER_IN != tablet_info.backfill_type_) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("tablet should be transfer in", K(ret), K(tablet_info));
+      } else if (OB_FAIL(ObTabletMdsRelocHelper::check_tablet_mds_reloc_done(
+          ls_, tablet_info.tablet_id_, tablet_info.backfill_scn_, is_done))) {
+        LOG_WARN("failed to check tablet mds reloc done", K(ret), K(ls_id_), K(tablet_info));
+      } else if (!is_done) {
+        LOG_INFO("skip transfer in tablet before mds relocation is done", K(ls_id_), K(tablet_info));
+      } else if (OB_FAIL(ready_tablet_info_array.push_back(tablet_info))) {
+        LOG_WARN("failed to push ready tablet info", K(ret), K(tablet_info));
+      }
+    }
   }
   return ret;
 }

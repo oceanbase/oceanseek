@@ -4,6 +4,7 @@
  */
 
 #define USING_LOG_PREFIX STORAGE
+#include "storage/mds_table/ob_tablet_mds_reloc_helper.h"
 #include "ob_ss_transfer_tablet_refresh.h"
 #include "storage/incremental/ob_ss_minor_compaction.h"
 #include "share/scheduler/ob_dag_scheduler_config.h"
@@ -362,7 +363,7 @@ int ObSSTabletRefreshTableTask::check_transfer_in_tablet_refresh_(bool &need_ref
 {
   int ret = OB_SUCCESS;
   need_refresh = false;
-  bool is_mds_reloc_done = false;
+  bool is_local_mds_checkpoint_reached = false;
   ObLS *ls = nullptr;
   ObTabletHandle local_tablet_handle;
   ObTablet *local_tablet = nullptr;
@@ -382,13 +383,15 @@ int ObSSTabletRefreshTableTask::check_transfer_in_tablet_refresh_(bool &need_ref
     LOG_WARN("tablet should not be NULL", K(ret), K(ls_id_), K(tablet_info_));
   } else if (!local_tablet->get_tablet_meta().has_transfer_table()) {
     need_refresh = false;
-  } else if (OB_FAIL(ObSSTransferBackfillUtils::check_tablet_mds_reloc_done(
-      ls, tablet_info_.tablet_id_, tablet_info_.backfill_scn_, is_mds_reloc_done))) {
-    LOG_WARN("failed to check tablet mds reloc done", K(ret), K(ls_id_), K(tablet_info_));
-  } else if (!is_mds_reloc_done) {
-    // 调度门禁已过滤；此处仅作兜底，未完成则跳过，不再 EAGAIN。
-    need_refresh = false;
-    LOG_INFO("skip refresh because mds relocation is not done", K(ls_id_), K(tablet_info_));
+  } else if (OB_FAIL(ObTabletMdsRelocHelper::check_local_checkpoint_reached(
+      ls, tablet_info_.tablet_id_, tablet_info_.backfill_scn_, is_local_mds_checkpoint_reached))) {
+    LOG_WARN("failed to check tablet mds reloc local checkpoint", K(ret), K(ls_id_), K(tablet_info_));
+  } else if (!is_local_mds_checkpoint_reached) {
+    ret = OB_EAGAIN;
+    // Refresh installs the local tablet.  Wait for the local checkpoint so a
+    // restart can skip replay without accessing a source that replace may GC.
+    LOG_INFO("wait for local mds checkpoint before refresh",
+        K(ret), K(ls_id_), K(tablet_info_));
   } else {
     need_refresh = true;
   }
@@ -608,6 +611,7 @@ int ObSSTabletRefreshTableTask::build_transfer_backfill_tablet_param_(
   }
   return ret;
 }
+
 
 } //storage
 } //oceanbase

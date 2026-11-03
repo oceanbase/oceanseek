@@ -231,6 +231,18 @@ int ObLSMigrationHandler::check_task_list_empty_(bool &is_empty)
 
 int ObLSMigrationHandler::set_result(const int32_t result)
 {
+  return set_result_(result, nullptr);
+}
+
+int ObLSMigrationHandler::set_result_for_task(
+    const int32_t result, const share::ObTaskId &task_id)
+{
+  return task_id.is_invalid() ? OB_INVALID_ARGUMENT : set_result_(result, &task_id);
+}
+
+int ObLSMigrationHandler::set_result_(
+    const int32_t result, const share::ObTaskId *expected_task_id)
+{
   int ret = OB_SUCCESS;
   if (!is_inited_) {
     ret = OB_NOT_INIT;
@@ -245,6 +257,8 @@ int ObLSMigrationHandler::set_result(const int32_t result)
       } else {
         LOG_WARN("failed to get ls migration task", K(ret), KPC(ls_));
       }
+    } else if (nullptr != expected_task_id && task.task_id_ != *expected_task_id) {
+      // The probed task finished; a delayed failure must not poison its successor.
     } else if (OB_SUCCESS == result_ && OB_SUCCESS != result) {
       FLOG_INFO("set first error result", K(result));
       result_ = result;

@@ -360,7 +360,9 @@ int ObSimpleServer::bootstrap()
   } else if (OB_FAIL(client.get_proxy(srv_proxy))) {
     SERVER_LOG(WARN, "get_proxy failed", K(ret));
   } else {
-    const int64_t timeout = 180 * 1000 * 1000; //180s
+    // SS debug bootstrap creates thousands of system tablet metadata entries
+    // serially; allow it the same five-minute budget as the startup retry loop.
+    const int64_t timeout = GCTX.is_shared_storage_mode() ? 300_s : 180_s;
     common::ObAddr dst_server(common::ObAddr::IPV4, local_ip_.c_str(), rpc_port_);
     srv_proxy.set_server(dst_server);
     srv_proxy.set_timeout(timeout);

@@ -267,6 +267,7 @@ public:
   VIRTUAL_TO_STRING_KV(K("ObSSTabletMdsRelocTask"), KP(this), KPC(ha_dag_net_ctx_));
 private:
   int get_and_check_src_tablet_(ObTabletHandle &tablet_handle);
+  void try_flush_dest_ls_mds_table_();
 private:
   bool is_inited_;
   ObBackfillTXCtx *backfill_tx_ctx_;

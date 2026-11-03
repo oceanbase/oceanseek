@@ -105,7 +105,8 @@ public:
   // 本地 meta 上表示本副本已完成 FORK_LOCAL_LAND，读链路仅在 fork info 有效
   // 且该标记为 false 时执行 overlay。
   // 本地落盘替换在表存储与元数据的同一次 CAS 中设置本地完成位；
-  // HA 新建副本会同时复制共享表存储，可直接继承共享完成位。
+  // V2 共享发布必须先等待 LS_MDS_TABLET checkpoint 覆盖 final reloc redo；
+  // HA 按同一快照导入内表和用户 tablet，继承完成位时也具备本地 MDS 持久化条件。
   void set_data_complete(const bool complete) { data_complete_ = complete; }
   bool is_data_complete() const { return data_complete_; }
   void set_all_replicas_land_complete(const bool complete) { all_replicas_land_complete_ = complete; }

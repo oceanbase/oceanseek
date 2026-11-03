@@ -10,9 +10,10 @@
 
 #include "storage/mds_table/ob_mds_type_registry.h"
 #include "storage/mds_table/ob_mds_table.h"
+#include "storage/mds_table/ob_mds_type_id_map.h"
 #include "storage/mds_table/ob_mds_trans_node_value.h"
 #include "storage/mds_table/ob_mds_single_row_mvcc_ctx.h"
-#include "storage/mds_table/ob_ls_mds_tablet_reloc_batch_arg.h"
+#include "storage/mds_table/ob_tablet_mds_reloc_batch_arg.h"
 #include "storage/multi_data_source/compile_utility/mds_dummy_key.h"
 #include "storage/memtable/ob_memtable.h"
 #include "storage/memtable/mvcc/ob_mvcc_engine.h"
@@ -57,6 +58,8 @@ struct TestMdsVal
 
 static constexpr uint16_t TEST_MDS_TYPE = 200; // outside real ObTxDataSourceType range
 static constexpr uint16_t TEST_FAILING_MDS_TYPE = 201;
+static constexpr uint16_t RELOC_MDS_TYPE = static_cast<uint16_t>(
+    mds_type_id_detail::TypeIdOf<mds::DummyKey, ObTabletMdsRelocStatus>::value);
 
 struct FailingAssignMdsVal : public TestMdsVal
 {
@@ -83,6 +86,9 @@ public:
     ASSERT_EQ(OB_SUCCESS,
               (ObMdsTypeRegistry::get_instance().register_type<DummyKey, FailingAssignMdsVal>(
                   TEST_FAILING_MDS_TYPE)));
+    ASSERT_EQ(OB_SUCCESS,
+              (ObMdsTypeRegistry::get_instance().register_type<DummyKey, ObTabletMdsRelocStatus>(
+                  RELOC_MDS_TYPE)));
   }
   virtual void SetUp() {}
   virtual void TearDown() {}
@@ -234,7 +240,7 @@ TEST_F(TestMdsTableUnit, build_mds_tx_node_returns_copy_error)
 
 TEST_F(TestMdsTableUnit, reloc_skip_bitmap_rejects_wrong_word_count)
 {
-  ObRelocSkipBitmap bitmap;
+  ObTabletMdsRelocSkipBitmap bitmap;
   ASSERT_EQ(OB_SUCCESS, bitmap.init(2, 65));
   bitmap.set_skip(1, 64);
   EXPECT_TRUE(bitmap.is_skipped(1, 64));
@@ -243,18 +249,18 @@ TEST_F(TestMdsTableUnit, reloc_skip_bitmap_rejects_wrong_word_count)
   int64_t pos = 0;
   ASSERT_EQ(OB_SUCCESS, bitmap.serialize(buf, sizeof(buf), pos));
 
-  ObRelocSkipBitmap decoded;
+  ObTabletMdsRelocSkipBitmap decoded;
   int64_t decode_pos = 0;
   ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buf, pos, decode_pos, 2, 65));
   EXPECT_TRUE(decoded.is_skipped(1, 64));
 
-  ObRelocSkipBitmap small_bitmap;
+  ObTabletMdsRelocSkipBitmap small_bitmap;
   ASSERT_EQ(OB_SUCCESS, small_bitmap.init(1, 1));
   char small_buf[32] = {};
   int64_t small_pos = 0;
   ASSERT_EQ(OB_SUCCESS, small_bitmap.serialize(small_buf, sizeof(small_buf), small_pos));
 
-  ObRelocSkipBitmap malformed;
+  ObTabletMdsRelocSkipBitmap malformed;
   int64_t malformed_pos = 0;
   EXPECT_EQ(OB_INVALID_ARGUMENT, malformed.deserialize(small_buf, small_pos, malformed_pos, 2, 65));
   EXPECT_FALSE(malformed.is_inited());
@@ -262,9 +268,9 @@ TEST_F(TestMdsTableUnit, reloc_skip_bitmap_rejects_wrong_word_count)
 
 TEST_F(TestMdsTableUnit, reloc_batch_empty_final_roundtrip)
 {
-  ObLsMdsTabletRelocBatchArg batch;
+  ObTabletMdsRelocBatchArg batch;
   batch.ls_id_ = share::ObLSID(1);
-  ObLsMdsTabletRelocTarget target;
+  ObTabletMdsRelocTarget target;
   target.tablet_id_ = ObTabletID(1001);
   target.transfer_scn_.convert_for_tx(100);
   ASSERT_EQ(OB_SUCCESS, batch.targets_.push_back(target));
@@ -272,9 +278,9 @@ TEST_F(TestMdsTableUnit, reloc_batch_empty_final_roundtrip)
   EXPECT_FALSE(batch.is_valid());
   batch.is_final_ = true;
   EXPECT_FALSE(batch.is_valid());
-  batch.reloc_type_ = ObLsMdsTabletRelocType::SPLIT;
+  batch.reloc_type_ = ObTabletMdsRelocType::SPLIT;
   EXPECT_TRUE(batch.is_valid());
-  batch.reloc_type_ = ObLsMdsTabletRelocType::FORK;
+  batch.reloc_type_ = ObTabletMdsRelocType::FORK;
   EXPECT_TRUE(batch.is_valid());
 
   char buf[1024] = {};
@@ -283,35 +289,79 @@ TEST_F(TestMdsTableUnit, reloc_batch_empty_final_roundtrip)
   ASSERT_EQ(OB_SUCCESS, batch.serialize(buf, sizeof(buf), pos));
   EXPECT_EQ(batch.get_serialize_size(), pos);
 
-  ObLsMdsTabletRelocBatchArg decoded;
+  ObTabletMdsRelocBatchArg decoded;
   int64_t decode_pos = 0;
   ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buf, pos, decode_pos));
   EXPECT_EQ(pos, decode_pos);
   EXPECT_TRUE(decoded.is_valid());
   EXPECT_TRUE(decoded.is_final_);
-  EXPECT_EQ(ObLsMdsTabletRelocType::FORK, decoded.reloc_type_);
+  EXPECT_EQ(ObTabletMdsRelocType::FORK, decoded.reloc_type_);
   EXPECT_EQ(0, decoded.rows_.count());
   EXPECT_FALSE(decoded.skip_bitmap_.has_any_skip());
 
   decoded.reset_rows();
   EXPECT_FALSE(decoded.is_final_);
-  EXPECT_EQ(ObLsMdsTabletRelocType::FORK, decoded.reloc_type_);
+  EXPECT_EQ(ObTabletMdsRelocType::FORK, decoded.reloc_type_);
   decoded.reset();
-  EXPECT_EQ(ObLsMdsTabletRelocType::INVALID, decoded.reloc_type_);
+  EXPECT_EQ(ObTabletMdsRelocType::INVALID, decoded.reloc_type_);
+}
+
+TEST_F(TestMdsTableUnit, reloc_batch_rejects_unknown_version)
+{
+  for (const int64_t version : {int64_t(0), int64_t(3), INT64_MAX}) {
+    ObTabletMdsRelocBatchArg batch;
+    batch.version_ = version;
+    EXPECT_FALSE(batch.is_v2());
+    EXPECT_FALSE(batch.is_valid());
+    char buf[1024] = {};
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, batch.serialize(buf, sizeof(buf), pos));
+    ObTabletMdsRelocBatchArg decoded;
+    int64_t decode_pos = 0;
+    EXPECT_EQ(OB_NOT_SUPPORTED, decoded.deserialize(buf, pos, decode_pos));
+  }
+}
+
+TEST_F(TestMdsTableUnit, reloc_marker_rejects_invalid_redo_fence)
+{
+  ObTabletMdsRelocStatus marker;
+  marker.set_reloc_done();
+  EXPECT_TRUE(marker.is_v1_marker());
+  EXPECT_FALSE(marker.is_v2_marker_pending_fence());
+  share::SCN invalid;
+  share::SCN redo;
+  ASSERT_EQ(OB_SUCCESS, redo.convert_for_tx(123));
+  marker.on_redo(redo);
+  EXPECT_FALSE(marker.get_redo_scn().is_valid());
+  marker.enable_redo_fence();
+  EXPECT_TRUE(marker.is_v2_marker_pending_fence());
+  EXPECT_FALSE(marker.is_v1_marker());
+  marker.on_redo(invalid);
+  EXPECT_TRUE(marker.get_redo_scn().is_min());
+  EXPECT_FALSE(marker.has_captured_redo_fence());
+  marker.on_redo(redo);
+  EXPECT_TRUE(marker.has_captured_redo_fence());
+  EXPECT_FALSE(marker.is_v1_marker());
+  EXPECT_FALSE(marker.is_v2_marker_pending_fence());
+  for (const share::SCN &bad : {invalid, share::SCN::min_scn(), share::SCN::max_scn()}) {
+    marker.on_redo(bad);
+    EXPECT_EQ(redo, marker.get_redo_scn());
+    EXPECT_TRUE(marker.has_captured_redo_fence());
+  }
 }
 
 TEST_F(TestMdsTableUnit, reloc_batch_final_coexists_with_skip_bitmap)
 {
-  ObLsMdsTabletRelocBatchArg batch;
+  ObTabletMdsRelocBatchArg batch;
   batch.ls_id_ = share::ObLSID(1);
-  batch.reloc_type_ = ObLsMdsTabletRelocType::TRANSFER;
-  ObLsMdsTabletRelocTarget target;
+  batch.reloc_type_ = ObTabletMdsRelocType::TRANSFER;
+  ObTabletMdsRelocTarget target;
   target.tablet_id_ = ObTabletID(1001);
   target.transfer_scn_.convert_for_tx(100);
   ASSERT_EQ(OB_SUCCESS, batch.targets_.push_back(target));
 
   char payload = 'x';
-  ObLsMdsTabletRelocRowStorage row;
+  ObTabletMdsRelocRowStorage row;
   row.reset();
   row.mds_unit_id_ = 1;
   row.ser_payload_.assign_ptr(&payload, sizeof(payload));
@@ -327,32 +377,182 @@ TEST_F(TestMdsTableUnit, reloc_batch_final_coexists_with_skip_bitmap)
   ASSERT_LE(batch.get_serialize_size(), static_cast<int64_t>(sizeof(buf)));
   ASSERT_EQ(OB_SUCCESS, batch.serialize(buf, sizeof(buf), pos));
 
-  ObLsMdsTabletRelocBatchArg decoded;
+  ObTabletMdsRelocBatchArg decoded;
   int64_t decode_pos = 0;
   ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buf, pos, decode_pos));
   EXPECT_EQ(pos, decode_pos);
   EXPECT_TRUE(decoded.is_final_);
-  EXPECT_EQ(ObLsMdsTabletRelocType::TRANSFER, decoded.reloc_type_);
+  EXPECT_EQ(ObTabletMdsRelocType::TRANSFER, decoded.reloc_type_);
   EXPECT_FALSE(decoded.skip_bitmap_.is_skipped(0, 0));
 
   decoded.skip_bitmap_.set_skip(0, 0);
   ASSERT_EQ(OB_SUCCESS, decoded.skip_bitmap_.rewrite_inplace());
-  ObLsMdsTabletRelocBatchArg decoded_after_rewrite;
+  ObTabletMdsRelocBatchArg decoded_after_rewrite;
   int64_t rewrite_decode_pos = 0;
   ASSERT_EQ(OB_SUCCESS, decoded_after_rewrite.deserialize(buf, pos, rewrite_decode_pos));
   EXPECT_EQ(pos, rewrite_decode_pos);
   EXPECT_TRUE(decoded_after_rewrite.is_final_);
-  EXPECT_EQ(ObLsMdsTabletRelocType::TRANSFER, decoded_after_rewrite.reloc_type_);
+  EXPECT_EQ(ObTabletMdsRelocType::TRANSFER, decoded_after_rewrite.reloc_type_);
   EXPECT_TRUE(decoded_after_rewrite.skip_bitmap_.is_skipped(0, 0));
+}
+
+// Legacy V1 wire shapes (before the tail fields were appended) reproduced
+// with the same UNIS macro machinery an old binary used.  These let the tests
+// below exercise both upgrade directions of the same-version tail-append
+// compatibility relied on by ObTabletMdsRelocStatus / ObTabletMdsRelocTarget.
+namespace legacy_v1
+{
+struct LegacyRelocStatusV1
+{
+  OB_UNIS_VERSION(1);
+  LegacyRelocStatusV1() : reloc_done_(false) {}
+  TO_STRING_KV(K_(reloc_done));
+  bool reloc_done_;
+};
+OB_SERIALIZE_MEMBER(LegacyRelocStatusV1, reloc_done_);
+
+struct LegacyRelocTargetV1
+{
+  OB_UNIS_VERSION(1);
+  LegacyRelocTargetV1() : tablet_id_(), transfer_scn_() {}
+  TO_STRING_KV(K_(tablet_id), K_(transfer_scn));
+  common::ObTabletID tablet_id_;
+  share::SCN transfer_scn_;
+};
+OB_SERIALIZE_MEMBER(LegacyRelocTargetV1, tablet_id_, transfer_scn_);
+} // namespace legacy_v1
+
+// Legacy V1 wire compatibility for the reloc marker: a V1-encoded payload
+// (reloc_done_ only, no appended redo_scn_) must deserialize successfully
+// under the new binary with redo_scn_ left at its default (invalid) value,
+// and a legacy reader must still decode the new-format payload.  OB_UNIS_DECODE
+// stops at the object length header; this test pins that behavior for the
+// marker type whose layout gained a tail field without bumping UNIS_VERSION.
+TEST_F(TestMdsTableUnit, mds_reloc_status_legacy_v1_payload_compat)
+{
+  // Old-binary bytes for {reloc_done_ = true}.
+  legacy_v1::LegacyRelocStatusV1 legacy;
+  legacy.reloc_done_ = true;
+  char legacy_buf[64] = {};
+  int64_t legacy_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, legacy.serialize(legacy_buf, sizeof(legacy_buf), legacy_pos));
+  const int64_t legacy_len = legacy_pos;
+
+  // New binary reads the legacy payload: deserialization must succeed and
+  // leave redo_scn_ invalid (the recognized "legacy marker" shape).
+  ObTabletMdsRelocStatus decoded;
+  int64_t decode_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, decoded.deserialize(legacy_buf, legacy_len, decode_pos));
+  EXPECT_EQ(legacy_len, decode_pos);
+  EXPECT_TRUE(decoded.is_reloc_done());
+  EXPECT_FALSE(decoded.get_redo_scn().is_valid());
+  EXPECT_TRUE(decoded.is_valid());
+
+  // New-format bytes for the same marker state plus a redo SCN.
+  share::SCN redo_scn;
+  ASSERT_EQ(OB_SUCCESS, redo_scn.convert_for_tx(456));
+  ObTabletMdsRelocStatus current;
+  current.set_reloc_done();
+  current.enable_redo_fence();
+  current.on_redo(redo_scn);
+  char new_buf[64] = {};
+  int64_t new_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, current.serialize(new_buf, sizeof(new_buf), new_pos));
+  // Same UNIS version, strictly longer payload (the appended SCN field).
+  EXPECT_GT(new_pos, legacy_len);
+  EXPECT_EQ(0, MEMCMP(legacy_buf, new_buf, 1));
+
+  // A legacy reader of the new payload decodes the old fields and skips the
+  // trailing SCN via the object length header.
+  legacy_v1::LegacyRelocStatusV1 as_old_reader;
+  int64_t old_reader_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, as_old_reader.deserialize(new_buf, new_pos, old_reader_pos));
+  EXPECT_EQ(new_pos, old_reader_pos);
+  EXPECT_TRUE(as_old_reader.reloc_done_);
+}
+
+// Legacy V1 wire compatibility for the reloc target: a V1-encoded target
+// (tablet_id_ + transfer_scn_ only) must deserialize under the new binary with
+// src_tablet_id_ / src_reorg_scn_ left invalid, and a legacy reader must still
+// decode the new-format payload (V2 fields are skipped via the length header).
+TEST_F(TestMdsTableUnit, reloc_target_legacy_v1_payload_compat)
+{
+  ObTabletID tablet_id(200001);
+  share::SCN transfer_scn;
+  ASSERT_EQ(OB_SUCCESS, transfer_scn.convert_for_tx(1100));
+
+  // Old-binary bytes for {tablet_id_, transfer_scn_}.
+  legacy_v1::LegacyRelocTargetV1 legacy;
+  legacy.tablet_id_ = tablet_id;
+  legacy.transfer_scn_ = transfer_scn;
+  char legacy_buf[128] = {};
+  int64_t legacy_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, legacy.serialize(legacy_buf, sizeof(legacy_buf), legacy_pos));
+  const int64_t legacy_len = legacy_pos;
+
+  // New-format bytes: the same two fields plus the appended V2-only fields.
+  ObTabletMdsRelocTarget v2_target;
+  v2_target.tablet_id_ = tablet_id;
+  v2_target.transfer_scn_ = transfer_scn;
+  v2_target.src_tablet_id_ = ObTabletID(200002);
+  ASSERT_EQ(OB_SUCCESS, v2_target.src_reorg_scn_.convert_for_tx(900));
+  char v2_buf[128] = {};
+  int64_t v2_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, v2_target.serialize(v2_buf, sizeof(v2_buf), v2_pos));
+  // Same UNIS version, strictly longer payload (the appended fields).
+  EXPECT_GT(v2_pos, legacy_len);
+  EXPECT_EQ(0, MEMCMP(legacy_buf, v2_buf, 1));
+
+  // New reader on old data: succeeds, V2-only fields stay invalid.
+  ObTabletMdsRelocTarget decoded_v1;
+  int64_t decode_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, decoded_v1.deserialize(legacy_buf, legacy_len, decode_pos));
+  EXPECT_EQ(legacy_len, decode_pos);
+  EXPECT_EQ(tablet_id, decoded_v1.tablet_id_);
+  EXPECT_EQ(transfer_scn, decoded_v1.transfer_scn_);
+  EXPECT_FALSE(decoded_v1.src_tablet_id_.is_valid());
+  EXPECT_FALSE(decoded_v1.src_reorg_scn_.is_valid());
+
+  // Old reader on new data: decodes the V1 fields, skips the appended fields.
+  legacy_v1::LegacyRelocTargetV1 as_old_reader;
+  int64_t old_reader_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, as_old_reader.deserialize(v2_buf, v2_pos, old_reader_pos));
+  EXPECT_EQ(v2_pos, old_reader_pos);
+  EXPECT_EQ(tablet_id, as_old_reader.tablet_id_);
+  EXPECT_EQ(transfer_scn, as_old_reader.transfer_scn_);
 }
 
 TEST_F(TestMdsTableUnit, mds_reloc_status_lifecycle)
 {
   ObTabletMdsRelocStatus data;
-  EXPECT_FALSE(data.reloc_done_);
+  EXPECT_FALSE(data.is_reloc_done());
+  EXPECT_FALSE(data.get_redo_scn().is_valid());
   EXPECT_FALSE(data.is_valid());
-  data.reloc_done_ = true;
+  data.set_reloc_done();
+  share::SCN redo_scn;
+  ASSERT_EQ(OB_SUCCESS, redo_scn.convert_for_tx(123));
+  ObMdsTypeRegistry &registry = ObMdsTypeRegistry::get_instance();
+  EXPECT_TRUE(registry.has_on_redo(RELOC_MDS_TYPE));
+  // A V1 marker written by the new binary still receives the generic MDS redo
+  // callback, but must not acquire the V2 persistence fence.
+  ASSERT_EQ(OB_SUCCESS, registry.invoke_on_redo(RELOC_MDS_TYPE, &data, redo_scn));
+  EXPECT_FALSE(data.get_redo_scn().is_valid());
+  data.enable_redo_fence();
+  EXPECT_TRUE(data.get_redo_scn().is_min());
+  // Illegal redo SCNs must leave the parked min fence unchanged. on_redo
+  // is an in-place seqlock patch and does not log or rewrite the field,
+  // so the persistence gate can still observe min SCN.
+  share::SCN invalid_scn;
+  ASSERT_EQ(OB_SUCCESS, registry.invoke_on_redo(RELOC_MDS_TYPE, &data, invalid_scn));
+  EXPECT_TRUE(data.get_redo_scn().is_min());
+  ASSERT_EQ(OB_SUCCESS, registry.invoke_on_redo(RELOC_MDS_TYPE, &data, share::SCN::min_scn()));
+  EXPECT_TRUE(data.get_redo_scn().is_min());
+  ASSERT_EQ(OB_SUCCESS, registry.invoke_on_redo(RELOC_MDS_TYPE, &data, share::SCN::max_scn()));
+  EXPECT_TRUE(data.get_redo_scn().is_min());
+  ASSERT_EQ(OB_SUCCESS, registry.invoke_on_redo(RELOC_MDS_TYPE, &data, redo_scn));
   EXPECT_TRUE(data.is_valid());
+  EXPECT_TRUE(data.has_captured_redo_fence());
+  EXPECT_EQ(redo_scn, data.get_redo_scn());
 
   char buf[1024] = {};
   int64_t pos = 0;
@@ -363,16 +563,19 @@ TEST_F(TestMdsTableUnit, mds_reloc_status_lifecycle)
   int64_t decode_pos = 0;
   ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buf, pos, decode_pos));
   EXPECT_EQ(pos, decode_pos);
-  EXPECT_TRUE(decoded.reloc_done_);
+  EXPECT_TRUE(decoded.is_reloc_done());
+  EXPECT_EQ(redo_scn, decoded.get_redo_scn());
 
   ObTabletMdsRelocStatus assigned;
   ASSERT_EQ(OB_SUCCESS, assigned.assign(decoded));
-  EXPECT_TRUE(assigned.reloc_done_);
+  EXPECT_TRUE(assigned.is_reloc_done());
+  EXPECT_EQ(redo_scn, assigned.get_redo_scn());
   char print_buf[1024] = {};
   EXPECT_GT(assigned.to_string(print_buf, sizeof(print_buf)), 0);
   EXPECT_NE(nullptr, std::strstr(print_buf, "reloc_done"));
   assigned.reset();
-  EXPECT_FALSE(assigned.reloc_done_);
+  EXPECT_FALSE(assigned.is_reloc_done());
+  EXPECT_FALSE(assigned.get_redo_scn().is_valid());
 }
 
 TEST_F(TestMdsTableUnit, registry_serialize_roundtrip)

@@ -4,6 +4,7 @@
  */
 
 #define USING_LOG_PREFIX STORAGE
+#include "storage/mds_table/ob_tablet_mds_reloc_helper.h"
 #include "ob_ss_transfer_tablet_replace.h"
 #include "storage/incremental/ob_ss_minor_compaction.h"
 #include "storage/incremental/ob_shared_meta_service.h"
@@ -333,7 +334,7 @@ int ObSSTabletReplaceTableTask::process()
   bool src_need_upload = false;
   bool src_need_backfill_tx = false;
   bool need_replace = false;
-  bool is_mds_reloc_done = false;
+  bool is_mds_reloc_persisted = false;
   ObLS *dest_ls = nullptr;
   LOG_INFO("[SS_TRANSFER_BACKFILL] start do ss transfer tablet replace process", K(ls_id_), K(tablet_info_), KPC(ha_dag_net_ctx_));
 
@@ -354,12 +355,13 @@ int ObSSTabletReplaceTableTask::process()
     //do nothing
   } else if (OB_FAIL(ha_dag_net_ctx_->get_dest_ls(dest_ls))) {
     LOG_WARN("failed to get dest ls", K(ret), KPC(ha_dag_net_ctx_));
-  } else if (OB_FAIL(ObSSTransferBackfillUtils::check_tablet_mds_reloc_done(
-      dest_ls, tablet_info_.tablet_id_, tablet_info_.backfill_scn_, is_mds_reloc_done))) {
-    LOG_WARN("failed to check tablet mds reloc done", K(ret), K(ls_id_), K(tablet_info_));
-  } else if (!is_mds_reloc_done) {
-    // 调度门禁已过滤；此处仅作兜底，未完成则跳过，不再 EAGAIN。
-    LOG_INFO("skip replace because mds relocation is not done", K(ls_id_), K(tablet_info_));
+  } else if (OB_FAIL(ObTabletMdsRelocHelper::check_tablet_mds_reloc_persisted(
+      dest_ls, tablet_info_.tablet_id_, tablet_info_.backfill_scn_, is_mds_reloc_persisted))) {
+    LOG_WARN("failed to check tablet mds reloc persisted", K(ret), K(ls_id_), K(tablet_info_));
+  } else if (!is_mds_reloc_persisted) {
+    ret = OB_EAGAIN;
+    LOG_INFO("wait for tablet mds relocation persistence before replace",
+        K(ret), K(ls_id_), K(tablet_info_));
   } else if (OB_FAIL(do_replace_tables_())) {
     LOG_WARN("failed to do replace table work", K(ret));
   }

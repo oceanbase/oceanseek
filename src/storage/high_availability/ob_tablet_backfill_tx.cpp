@@ -7,7 +7,7 @@
 #include "ob_tablet_backfill_tx.h"
 #include "share/scheduler/ob_dag_warning_history_mgr.h"
 #include "storage/high_availability/ob_storage_ha_utils.h"
-#include "storage/mds_table/ob_ls_mds_tablet_logical_reloc.h"
+#include "storage/mds_table/ob_tablet_mds_logical_reloc.h"
 #include "share/ob_server_struct.h"
 #ifdef OB_BUILD_SHARED_STORAGE
 #include "storage/high_availability/ob_ss_transfer_tablet_upload.h"
@@ -2062,7 +2062,7 @@ int ObTabletMdsTableBackfillTXTask::process()
     if (OB_ISNULL(tablet)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("tablet is null", KR(ret));
-    } else if (OB_FAIL(ObLsMdsTabletTransferReloc::submit_transfer_mds_reloc(
+    } else if (OB_FAIL(ObTabletTransferMdsReloc::submit_transfer_mds_reloc(
                    *tablet,
                    backfill_tx_ctx_->backfill_scn_,
                    ha_dag_net_ctx_->tenant_id_,
