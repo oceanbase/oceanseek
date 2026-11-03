@@ -825,6 +825,11 @@ int ObDSLResolver::build_array_intersects_expr(ObColumnRefRawExpr *col_expr,
   //   for single value, build ARRAY_CONTAINS(col, scalar) with better execution performance
   //   for multiple values, build ARRAY_OVERLAPS(col, array)
   if (OB_FAIL(ret)) {
+  } else if (value_exprs.empty()) {
+    // Integer terms can discard every fractional candidate. Validate the array type first.
+    if (OB_FAIL(ObRawExprUtils::build_const_bool_expr(expr_factory, expr, false))) {
+      LOG_WARN("failed to build non-matching array terms expression", K(ret));
+    }
   } else if (value_exprs.count() == 1) {
     if (OB_FAIL(expr_factory->create_raw_expr(T_FUNC_SYS_ARRAY_CONTAINS, func_expr))) {
       LOG_WARN("fail to create array contains expr", K(ret));
@@ -5836,13 +5841,11 @@ int ObDSLResolver::resolve_terms(ObIJsonBase &req_node, ObDSLQuery *&query, ObDS
         query_type = QUERY_ITEM_TERM;
       }
       for (uint64_t j = 0; OB_SUCC(ret) && j < array_count; j++) {
-        ObJsonNodeType element_type = ObJsonNodeType::J_MAX_TYPE;
         ObIJsonBase *element = nullptr;
         ObRawExpr *value_expr = nullptr;
         if (OB_FAIL(sub_node->get_array_element(j, element))) {
           LOG_WARN("fail to get array element", K(ret), K(j));
-        } else if (!is_scalar_json_type(element->json_type()) &&
-                   (element->json_type() != ObJsonNodeType::J_OBJECT || !col_expr->get_result_type().is_json())) {
+        } else if (!is_scalar_json_type(element->json_type())) {
           ret = OB_INVALID_ARGUMENT;
           LOG_USER_ERROR(OB_INVALID_ARGUMENT, "value in terms query, should be scalar like string, number, boolean, etc.");
           LOG_WARN("invalid value type in terms query", K(ret), K(col_expr->get_result_type()), K(element->json_type()));
@@ -5855,9 +5858,10 @@ int ObDSLResolver::resolve_terms(ObIJsonBase &req_node, ObDSLQuery *&query, ObDS
             array_elem_node = element;
             break;
           }
-        } else if (OB_FALSE_IT(element_type = resolve_type_mapping(element->json_type(), col_expr, query_type, array_base_type))) {
-        } else if (OB_FAIL(resolve_const(*element, value_expr, element_type, query_type, array_base_type))) {
+        } else if (OB_FAIL(resolve_terms_value(*element, col_expr, query_type, array_base_type, value_expr))) {
           LOG_WARN("fail to resolve const value", K(ret), K(j));
+        } else if (OB_ISNULL(value_expr)) {
+          // Ignore fractional integer candidates, but never skip conversion errors.
         } else if (OB_FAIL(value_exprs.push_back(value_expr))) {
           LOG_WARN("fail to add value to value_exprs", K(ret));
         }
@@ -5873,11 +5877,14 @@ int ObDSLResolver::resolve_terms(ObIJsonBase &req_node, ObDSLQuery *&query, ObDS
     if (OB_FAIL(build_array_intersects_expr(col_expr, value_exprs, expr))) {
       LOG_WARN("fail to build array intersects expr for terms", K(ret));
     }
+  } else if (value_exprs.empty() && query_type != QUERY_ITEM_JSON_CONTAINS) {
+    field_expr = col_expr;
+    if (OB_FAIL(ObRawExprUtils::build_const_bool_expr(expr_factory, expr, false))) {
+      LOG_WARN("failed to build non-matching terms expression", K(ret));
+    }
   } else if (OB_FAIL(build_field_expr_with_path(col_expr, path_str, query_type, field_expr))) {
     LOG_WARN("fail to build field expr with path for terms", K(ret));
   } else if (col_expr->get_result_type().is_json() && multi_value) {
-    // for single-value, JSON_CONTAINS is closer to ES with a narrow performance gap compared to JSON_OVERLAPS
-    // for multiple values, JSON_OVERLAPS is approximately ES-compatible, but has better performance
     if (query_type == QUERY_ITEM_JSON_CONTAINS) {
       if (OB_FAIL(build_json_contains_scalar_expr(field_expr, *array_elem_node, expr))) {
         LOG_WARN("fail to build json contains scalar expr for terms on json column", K(ret));
@@ -5909,6 +5916,105 @@ int ObDSLResolver::resolve_terms(ObIJsonBase &req_node, ObDSLQuery *&query, ObDS
     terms_query->scalar_expr_ = expr;
     terms_query->boost_ = setup_boost(boost_expr);
     query = terms_query;
+  }
+  return ret;
+}
+
+int ObDSLResolver::resolve_terms_value(ObIJsonBase &node, ObColumnRefRawExpr *col_expr,
+                                       ObEsQueryItem query_type, ObObjType array_base_type, ObRawExpr *&expr)
+{
+  int ret = OB_SUCCESS;
+  const ObObjType target_type = array_base_type == ObMaxType ? col_expr->get_result_type().get_type() : array_base_type;
+  const ObJsonNodeType json_type = resolve_type_mapping(node.json_type(), col_expr, query_type, array_base_type);
+  expr = nullptr;
+  if (!ob_is_integer_type(target_type) || json_type == ObJsonNodeType::J_BOOLEAN) {
+    if (OB_FAIL(resolve_const(node, expr, json_type, query_type, array_base_type))) {
+      LOG_WARN("failed to resolve terms constant", K(ret));
+    }
+  } else if (!ObIJsonBase::is_json_number_type(node.json_type()) && node.json_type() != ObJsonNodeType::J_STRING) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "terms query: expected a number or numeric string for an integer field");
+    LOG_WARN("invalid terms value type for integer field", K(ret), K(target_type), K(node.json_type()));
+  } else if (node.json_type() == ObJsonNodeType::J_DOUBLE &&
+             (isnan(node.get_double()) || isinf(node.get_double()))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "terms query: numeric values for an integer field must be finite");
+    LOG_WARN("non-finite terms value for integer field", K(ret), K(target_type), K(node.get_double()));
+  } else if (node.json_type() == ObJsonNodeType::J_DOUBLE && trunc(node.get_double()) != node.get_double()) {
+    // Fractional candidates cannot match an integer field. Keep validating subsequent candidates.
+  } else {
+    // Parse numeric strings as NUMBER, not double: BIGINT boundaries must retain all digits.
+    number::ObNumber value;
+    ObConstRawExpr *constant = nullptr;
+    int64_t int_value = 0;
+    uint64_t uint_value = 0;
+    bool has_fraction = false;
+    if (node.json_type() == ObJsonNodeType::J_STRING) {
+      double parsed_double = 0;
+      // Validate the complete string first; NUMBER alone accepts sign-only strings in MySQL mode.
+      // Use double for syntax/fraction checks, never to construct the integer constant.
+      if (OB_FAIL(node.to_double(parsed_double))) {
+        LOG_WARN("invalid numeric string in terms", K(ret));
+      } else if (isnan(parsed_double) || isinf(parsed_double)) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("non-finite numeric string in terms", K(ret), K(target_type), K(parsed_double));
+      } else if (trunc(parsed_double) != parsed_double) {
+        // Do not let NUMBER underflow turn a small fractional string into an integer zero.
+        has_fraction = true;
+      } else if (parsed_double == 0) {
+        // Syntax is already validated. A nonzero significand rounded to double zero
+        // denotes underflow, in either scientific or ordinary decimal notation.
+        const char *data = node.get_data();
+        for (uint64_t i = 0; !has_fraction && i < node.get_data_length(); ++i) {
+          if (data[i] == 'e' || data[i] == 'E') {
+            break;
+          }
+          has_fraction = data[i] >= '1' && data[i] <= '9';
+        }
+        if (!has_fraction) {
+          value.set_zero();
+        }
+      } else if (OB_FAIL(value.from_sci_opt(node.get_data(), node.get_data_length(), *allocator_))) {
+        LOG_WARN("failed to parse numeric terms string", K(ret));
+      }
+    } else if (node.json_type() == ObJsonNodeType::J_DOUBLE) {
+      if (OB_FAIL(trunc_json_float_to_int(node, ob_is_uint_tc(target_type), int_value, uint_value))) {
+        LOG_WARN("integer terms value out of range", K(ret));
+      } else if (ob_is_uint_tc(target_type)) {
+        ret = value.from(uint_value, *allocator_);
+      } else {
+        ret = value.from(int_value, *allocator_);
+      }
+    } else if (OB_FAIL(node.to_number(allocator_, value))) {
+      LOG_WARN("failed to parse integer terms value", K(ret), K(target_type));
+    }
+    if (OB_FAIL(ret)) {
+      LOG_WARN("failed to convert integer terms value", K(ret), K(target_type), K(node.json_type()));
+      if (ret != OB_ALLOCATE_MEMORY_FAILED) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "terms query: invalid numeric value or value out of range for the integer field");
+      }
+    } else if (has_fraction || !value.is_integer()) {
+      // A null output denotes a valid, non-matching fractional candidate.
+    } else if (ob_is_uint_tc(target_type)) {
+      if (!value.is_valid_uint64(uint_value) || uint_value > UINT_MAX_VAL[target_type]) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "terms query: value is out of range for the unsigned integer field");
+        LOG_WARN("terms value out of unsigned integer range", K(ret), K(target_type), K(value), K(uint_value));
+      } else if (OB_FAIL(ObRawExprUtils::build_const_uint_expr(*params_.expr_factory_, target_type, uint_value, constant))) {
+        LOG_WARN("failed to build unsigned terms value", K(ret));
+      }
+    } else if (!value.is_valid_int64(int_value) || int_value < INT_MIN_VAL[target_type]
+               || int_value > INT_MAX_VAL[target_type]) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "terms query: value is out of range for the integer field");
+      LOG_WARN("terms value out of integer range", K(ret), K(target_type), K(value), K(int_value));
+    } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(*params_.expr_factory_, target_type, int_value, constant))) {
+      LOG_WARN("failed to build integer terms value", K(ret));
+    }
+    if (OB_SUCC(ret)) {
+      expr = constant;
+    }
   }
   return ret;
 }

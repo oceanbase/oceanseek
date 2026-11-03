@@ -655,6 +655,7 @@ private :
   int resolve_slop(ObIJsonBase &req_node, int32_t &slop);
   int resolve_term(ObIJsonBase &req_node, ObDSLQuery *&query, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type);
   int resolve_terms(ObIJsonBase &req_node, ObDSLQuery *&query, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type);
+  int resolve_terms_value(ObIJsonBase &node, ObColumnRefRawExpr *col_expr, ObEsQueryItem query_type, ObObjType array_base_type, ObRawExpr *&expr);
   int resolve_wildcard(ObIJsonBase &req_node, ObDSLQuery *&query, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type);
   int resolve_weighted_sum(ObIJsonBase &req_node);
   int resolve_sort(ObIJsonBase &req_node);
