@@ -2191,6 +2191,7 @@ bool ObSSTableIndexBuilder::is_retriable_error(const int ret_code) const
 int ObSSTableIndexBuilder::merge_inv_meta(const ObInvIdxStatsMeta &partial)
 {
   int ret = OB_SUCCESS;
+  lib::ObMutexGuard mutex_guard(mutex_);
   ObBlockWriterConcurrentGuard guard(concurrent_lock_);
   if (OB_UNLIKELY(!is_async_index_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -2208,16 +2209,8 @@ int ObSSTableIndexBuilder::merge_inv_meta(const ObInvIdxStatsMeta &partial)
     ret = OB_ERR_UNEXPECTED;
     STORAGE_LOG(WARN, "inconsistent static inv meta fields across partials", K(ret),
         K(inv_meta_), K(partial), KPC(this));
-  } else {
-    inv_meta_.min_doc_id_ = MIN(inv_meta_.min_doc_id_, partial.min_doc_id_);
-    inv_meta_.max_doc_id_ = MAX(inv_meta_.max_doc_id_, partial.max_doc_id_);
-    if (UINT64_MAX - inv_meta_.total_doc_length_ < partial.total_doc_length_) {
-      inv_meta_.total_doc_length_ = UINT64_MAX;
-      STORAGE_LOG(WARN, "aggregated total doc length overflow, saturate it",
-          K(inv_meta_.total_doc_length_), K(partial));
-    } else {
-      inv_meta_.total_doc_length_ += partial.total_doc_length_;
-    }
+  } else if (!partial.is_empty_range() && OB_FAIL(inv_meta_.update(partial))) {
+    STORAGE_LOG(WARN, "failed to update inverted index stats", K(ret), K(inv_meta_), K(partial));
   }
   return ret;
 }

@@ -9,7 +9,9 @@
 #include "mtlenv/mock_tenant_module_env.h"
 // put top to use macro tricks
 
+#include <atomic>
 #include <gtest/gtest.h>
+#include <thread>
 
 #define private public
 #define protected public
@@ -424,6 +426,22 @@ protected:
     table_schema_.reset();
     row_allocator_.reset();
     allocator_.reset();
+  }
+
+  static ObInvIdxStatsMeta make_inv_meta(
+      const uint64_t min_doc_id = UINT64_MAX,
+      const uint64_t max_doc_id = 0,
+      const uint64_t total_doc_length = 0)
+  {
+    ObInvIdxStatsMeta meta;
+    meta.index_type_ = INV_IDX_TYPE_FTS;
+    meta.has_relevance_params_ = true;
+    meta.has_position_list_ = true;
+    meta.doc_id_obj_meta_.set_type(ObUInt64Type);
+    meta.min_doc_id_ = min_doc_id;
+    meta.max_doc_id_ = max_doc_id;
+    meta.total_doc_length_ = total_doc_length;
+    return meta;
   }
 
   // Set up a minimal but valid environment ready for writer.open().
@@ -2326,6 +2344,92 @@ TEST_F(ObInvIdxMacroBlockWriterTest, append_macro_block_clustered_rejects_nonclu
   EXPECT_EQ(OB_ERR_UNEXPECTED, writer.append_macro_block(desc, stats));
   EXPECT_EQ(0, writer.get_merge_block_info().multiplexed_macro_block_count_);
   EXPECT_EQ(0, writer.get_merge_block_info().macro_block_count_);
+}
+
+TEST_F(ObInvIdxMacroBlockWriterTest, merge_inv_meta_concurrent_partials)
+{
+  ObSSTableIndexBuilder builder(false /*use_double_write_buffer*/);
+  builder.set_is_async_index(true);
+  const int64_t thread_count = 8;
+  const int64_t iterations = 1024;
+  std::atomic<int64_t> ready(0);
+  std::atomic<bool> start(false);
+  std::thread threads[thread_count];
+  int results[thread_count] = {};
+  for (int64_t i = 0; i < thread_count; ++i) {
+    threads[i] = std::thread([&, i]() {
+      const ObInvIdxStatsMeta partial = make_inv_meta(thread_count - i, 100 + i, i + 1);
+      ready.fetch_add(1);
+      while (!start.load()) {
+        std::this_thread::yield();
+      }
+      for (int64_t j = 0; OB_SUCCESS == results[i] && j < iterations; ++j) {
+        results[i] = builder.merge_inv_meta(partial);
+      }
+    });
+  }
+  while (ready.load() != thread_count) {
+    std::this_thread::yield();
+  }
+  start.store(true);
+  for (int64_t i = 0; i < thread_count; ++i) {
+    threads[i].join();
+    EXPECT_EQ(OB_SUCCESS, results[i]);
+  }
+  const ObInvIdxStatsMeta &meta = builder.get_inv_meta();
+  EXPECT_TRUE(meta.is_valid());
+  EXPECT_EQ(1U, meta.min_doc_id_);
+  EXPECT_EQ(107U, meta.max_doc_id_);
+  EXPECT_EQ(static_cast<uint64_t>(iterations * thread_count * (thread_count + 1) / 2),
+      meta.total_doc_length_);
+}
+
+TEST_F(ObInvIdxMacroBlockWriterTest, merge_inv_meta_accepts_empty_partials)
+{
+  ObSSTableIndexBuilder builder(false /*use_double_write_buffer*/);
+  builder.set_is_async_index(true);
+  const ObInvIdxStatsMeta empty = make_inv_meta();
+  ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(empty));
+  ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(empty));
+  EXPECT_TRUE(builder.get_inv_meta().is_valid());
+  EXPECT_TRUE(builder.get_inv_meta().is_empty_range());
+
+  const ObInvIdxStatsMeta partial = make_inv_meta(3, 9, 7);
+  ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(partial));
+  ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(empty));
+  EXPECT_EQ(3U, builder.get_inv_meta().min_doc_id_);
+  EXPECT_EQ(9U, builder.get_inv_meta().max_doc_id_);
+  EXPECT_EQ(7U, builder.get_inv_meta().total_doc_length_);
+}
+
+TEST_F(ObInvIdxMacroBlockWriterTest, merge_inv_meta_rejects_invalid_and_inconsistent_partials)
+{
+  ObSSTableIndexBuilder builder(false /*use_double_write_buffer*/);
+  builder.set_is_async_index(true);
+  const ObInvIdxStatsMeta invalid;
+  EXPECT_EQ(OB_INVALID_ARGUMENT, builder.merge_inv_meta(invalid));
+  EXPECT_FALSE(builder.get_inv_meta().is_valid());
+
+  const ObInvIdxStatsMeta partial = make_inv_meta(3, 9, 7);
+  ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(partial));
+  ObInvIdxStatsMeta incompatible_empty = make_inv_meta();
+  incompatible_empty.has_position_list_ = false;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, builder.merge_inv_meta(incompatible_empty));
+  EXPECT_EQ(3U, builder.get_inv_meta().min_doc_id_);
+  EXPECT_EQ(9U, builder.get_inv_meta().max_doc_id_);
+  EXPECT_EQ(7U, builder.get_inv_meta().total_doc_length_);
+  EXPECT_TRUE(builder.get_inv_meta().has_position_list_);
+}
+
+TEST_F(ObInvIdxMacroBlockWriterTest, merge_inv_meta_saturates_total_doc_length)
+{
+  ObSSTableIndexBuilder builder(false /*use_double_write_buffer*/);
+  builder.set_is_async_index(true);
+  ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(make_inv_meta(3, 7, UINT64_MAX - 1)));
+  ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(make_inv_meta(2, 8, 2)));
+  EXPECT_EQ(2U, builder.get_inv_meta().min_doc_id_);
+  EXPECT_EQ(8U, builder.get_inv_meta().max_doc_id_);
+  EXPECT_EQ(UINT64_MAX, builder.get_inv_meta().total_doc_length_);
 }
 
 TEST_F(ObInvIdxMacroBlockWriterTest, sstable_index_builder_reset_clears_async_index_flag)
