@@ -2044,6 +2044,10 @@ int ObDDLIncMajorCommitReplayExecutor::do_replay_(ObTabletHandle &tablet_handle)
                      ls_, tablet_handle, trans_id_, seq_no_))) {
         LOG_WARN("fail to link inc major", KR(ret), K(trans_id_), K(seq_no_));
       }
+      if (OB_TABLET_NOT_EXIST == ret) {
+        // Retry missing dependencies in the SS commit stage.
+        ret = OB_EAGAIN;
+      }
 #endif
     } else {
       // sn模式
