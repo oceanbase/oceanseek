@@ -610,7 +610,8 @@ ObLSAsyncIndexScheduler *ObTenantAsyncIndexRefresher::probe_owning_leader_(
     } else {
       ObTabletHandle tablet_handle;
       const int tmp_ret = get_async_index_refresh_tablet(
-          *scheduler->get_ls(), data_tablet_id, tablet_handle);
+          *scheduler->get_ls(), data_tablet_id, tablet_handle,
+          -1 /* transfer_seq */, true /* is_probe */);
       if (OB_SUCCESS == tmp_ret) {
         owner = scheduler;  // tablet resides on this leader LS
       } else if (OB_TABLET_NOT_EXIST == tmp_ret || OB_EAGAIN == tmp_ret) {

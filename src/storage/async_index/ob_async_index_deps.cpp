@@ -46,7 +46,7 @@ using namespace share::schema;
 
 int get_async_index_refresh_tablet(
     ObLS &ls, const ObTabletID &tablet_id, ObTabletHandle &handle,
-    const int64_t transfer_seq)
+    const int64_t transfer_seq, const bool is_probe)
 {
   int ret = OB_SUCCESS;
   ObTabletCreateDeleteMdsUserData data;
@@ -54,7 +54,13 @@ int get_async_index_refresh_tablet(
   mds::TwoPhaseCommitState trans_state;
   SCN trans_version;
   if (OB_FAIL(ls.get_tablet(tablet_id, handle, 0, ObMDSGetTabletMode::READ_WITHOUT_CHECK))) {
-    LOG_WARN("failed to get tablet for async index refresh", K(ret), K(tablet_id));
+    if (is_probe && (OB_TABLET_NOT_EXIST == ret || OB_EAGAIN == ret)) {
+      LOG_DEBUG("failed to get tablet for async index refresh", K(ret), K(tablet_id),
+                "ls_id", ls.get_ls_id());
+    } else {
+      LOG_WARN("failed to get tablet for async index refresh", K(ret), K(tablet_id),
+               "ls_id", ls.get_ls_id());
+    }
   } else if (OB_ISNULL(handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
   } else if (handle.get_obj()->is_empty_shell()) {
@@ -65,15 +71,26 @@ int get_async_index_refresh_tablet(
     LOG_INFO("async index refresh tablet location changed", K(ret), K(tablet_id),
              "ls_id", ls.get_ls_id(), K(transfer_seq), "tablet_meta", handle.get_obj()->get_tablet_meta());
   } else if (OB_FAIL(handle.get_obj()->get_latest_tablet_status(data, writer, trans_state, trans_version))) {
-    LOG_WARN("failed to get tablet status for async index refresh", K(ret), K(tablet_id));
+    if (is_probe && (OB_TABLET_NOT_EXIST == ret || OB_EAGAIN == ret)) {
+      LOG_DEBUG("failed to get tablet status for async index refresh", K(ret), K(tablet_id),
+                "ls_id", ls.get_ls_id());
+    } else {
+      LOG_WARN("failed to get tablet status for async index refresh", K(ret), K(tablet_id),
+               "ls_id", ls.get_ls_id());
+    }
   } else if (mds::TwoPhaseCommitState::ON_COMMIT != trans_state
       || (ObTabletStatus::NORMAL != data.tablet_status_
           && ObTabletStatus::SPLIT_DST != data.tablet_status_
           && ObTabletStatus::FORK_DST != data.tablet_status_)) {
     // A source tablet may remain locally accessible after transfer out.
     ret = OB_EAGAIN;
-    LOG_INFO("tablet is not ready for async index refresh", K(ret), K(tablet_id),
-             "ls_id", ls.get_ls_id(), K(data), K(trans_state));
+    if (is_probe) {
+      LOG_DEBUG("tablet is not ready for async index refresh", K(ret), K(tablet_id),
+                "ls_id", ls.get_ls_id(), K(data), K(trans_state));
+    } else {
+      LOG_INFO("tablet is not ready for async index refresh", K(ret), K(tablet_id),
+               "ls_id", ls.get_ls_id(), K(data), K(trans_state));
+    }
   }
   return ret;
 }
