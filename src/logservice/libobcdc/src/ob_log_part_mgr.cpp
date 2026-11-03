@@ -2747,6 +2747,10 @@ int ObLogPartMgr::get_table_info_of_table_schema_(ObLogSchemaGuard &schema_guard
     } else if (OB_ISNULL(primary_table_schema)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_ERROR("primary_table_schema is NULL", KR(ret), K(primary_table_schema));
+    } else if (primary_table_schema->is_index_table()) {
+      is_index_table = true;
+      LOG_INFO("lob auxiliary table belongs to index table, ignore it",
+          K(table_id), KPC(primary_table_schema));
     } else if (primary_table_schema->is_ddl_table_ignored_to_sync_cdc()) {
       is_ddl_ignored_table = true;
       LOG_INFO("table is ddl ignored table, ignore it", KPC(table_schema));
@@ -2857,6 +2861,10 @@ int ObLogPartMgr::get_table_info_of_table_meta_(ObDictTenantInfo *tenant_info,
     } else if (OB_ISNULL(primary_table_meta)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_ERROR("primary_table_meta is NULL", KR(ret), K(primary_table_meta));
+    } else if (primary_table_meta->is_index_table()) {
+      is_index_table = true;
+      LOG_INFO("lob auxiliary table belongs to index table, ignore it",
+          K(table_id), KPC(primary_table_meta));
     } else if (primary_table_meta->is_ddl_table_ignored_to_sync_cdc()) {
       is_ddl_ignored_table = true;
       LOG_INFO("table is ddl ignored table, ignore it", KPC(primary_table_meta));
