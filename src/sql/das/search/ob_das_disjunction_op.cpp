@@ -209,7 +209,6 @@ int ObDASDisjunctionOp::do_advance_shallow(
         LOG_WARN("unexpected nullptr merge iter", K(ret), K(i));
       } else if (merge_iter->iter_end()) {
         // skip
-      } else if (FALSE_IT(all_iter_end = false)) {
       } else if (OB_FAIL(merge_iter->advance_shallow(target, inclusive))) {
         if (OB_UNLIKELY(OB_ITER_END != ret)) {
           LOG_WARN("failed to advance shallow", K(ret));
@@ -226,6 +225,7 @@ int ObDASDisjunctionOp::do_advance_shallow(
       } else if (OB_FAIL(compare_rowid(max_score_tuple->get_max_id(), max_id, max_cmp_ret))) {
         LOG_WARN("failed to compare max id", K(ret));
       } else {
+        all_iter_end = false;
         max_score += max_score_tuple->get_max_score();
         if (min_cmp_ret < 0) {
           min_id = max_score_tuple->get_min_id();

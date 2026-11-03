@@ -664,6 +664,8 @@ int ObDisjunctiveDAATMerger<RowIDType, USE_SIMPLE_MERGER>::advance_for_block_max
       if (OB_FAIL(iter.advance_shallow(pivot_id_, true))) {
         if (OB_UNLIKELY(OB_ITER_END != ret)) {
           SQL_LOG(WARN, "failed to advance shallow", K(ret));
+        } else {
+          ret = OB_SUCCESS;
         }
       } else if (OB_FAIL(iter.get_curr_block_max_info(max_score_tuple))) {
         SQL_LOG(WARN, "failed to get curr block max info", K(ret));
