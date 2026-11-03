@@ -35,6 +35,7 @@ struct EndpointType final
     SPARSE_EMBEDDING = 2,
     COMPLETION = 3,
     RERANK = 4,
+    DECISION = 5,
     // add new endpoint type before this line
     // also remember to add ENDPOINT_TYPE_STR
     MAX_TYPE

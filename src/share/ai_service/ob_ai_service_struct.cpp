@@ -415,6 +415,7 @@ const char *EndpointType::ENDPOINT_TYPE_STR[] = {
   "SPARSE_EMBEDDING",
   "COMPLETION",
   "RERANK",
+  "DECISION",
 };
 
 EndpointType::TYPE EndpointType::str_to_endpoint_type(const ObString &type_str)
