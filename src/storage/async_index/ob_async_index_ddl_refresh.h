@@ -43,6 +43,7 @@ class ObAsyncIndexDDLRefreshOp : public ObIAsyncIndexDDLRefreshOp
 public:
   ObAsyncIndexDDLRefreshOp(
       ObLS &ls,
+      const int64_t leader_proposal_id,
       ObAsyncIndexService &service,
       ObIAsyncIndexDepProvider &dep_provider,
       const obrpc::ObAsyncIndexRefreshArg &arg,
@@ -54,6 +55,7 @@ public:
   virtual int64_t to_string(char *buf, const int64_t buf_len) const override;
 private:
   ObLS &ls_;
+  const int64_t leader_proposal_id_;
   ObAsyncIndexService &service_;
   ObIAsyncIndexDepProvider &dep_provider_;
   const obrpc::ObAsyncIndexRefreshArg &arg_;

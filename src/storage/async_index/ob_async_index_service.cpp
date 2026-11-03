@@ -20,6 +20,10 @@
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/ob_debug_sync.h"
 #include "lib/utility/utility.h"       // ob_usleep
+#include "lib/utility/ob_tracepoint.h"
+
+ERRSIM_POINT_DEF(EN_ASYNC_INDEX_SLICE_INFO_WRITE_MISS);
+ERRSIM_POINT_DEF(EN_ASYNC_INDEX_SLICE_INFO_READ_MISS);
 
 namespace oceanbase
 {
@@ -134,7 +138,7 @@ int ObAsyncIndexService::get_inner_sql_start_refresh_scn(const int64_t refresh_t
     LOG_WARN("invalid argument", K(ret), K(refresh_task_id));
   } else if (OB_FAIL(tmp_info_map_.get_refactored(refresh_task_id, tmp_info))) {
     if (OB_HASH_NOT_EXIST == ret) {
-      ret = OB_EAGAIN;  // retryable
+      ret = OB_NEED_RETRY;  // PX must preserve this error so the RPC can reroute.
     }
     LOG_WARN("failed to get async index refresh start scn", K(ret), K(refresh_task_id));
   } else if (OB_ISNULL(tmp_info)) {
@@ -159,7 +163,7 @@ int ObAsyncIndexService::get_inner_sql_snapshot_version(const int64_t refresh_ta
     LOG_WARN("invalid argument", K(ret), K(refresh_task_id));
   } else if (OB_FAIL(tmp_info_map_.get_refactored(refresh_task_id, tmp_info))) {
     if (OB_HASH_NOT_EXIST == ret) {
-      ret = OB_EAGAIN;  // retryable: registration not visible (e.g. cross-node); caller retries
+      ret = OB_NEED_RETRY;  // PX must preserve this error so the RPC can reroute.
     }
     LOG_WARN("failed to get async index refresh snapshot version", K(ret), K(refresh_task_id));
   } else if (OB_ISNULL(tmp_info)) {
@@ -184,7 +188,7 @@ int ObAsyncIndexService::get_inner_sql_schema_version(const int64_t refresh_task
     LOG_WARN("invalid argument", K(ret), K(refresh_task_id));
   } else if (OB_FAIL(tmp_info_map_.get_refactored(refresh_task_id, tmp_info))) {
     if (OB_HASH_NOT_EXIST == ret) {
-      ret = OB_EAGAIN;  // retryable
+      ret = OB_NEED_RETRY;  // PX must preserve this error so the RPC can reroute.
     }
     LOG_WARN("failed to get async index refresh schema version", K(ret), K(refresh_task_id));
   } else if (OB_ISNULL(tmp_info)) {
@@ -210,7 +214,7 @@ int ObAsyncIndexService::get_inner_sql_ddl_build_id(const int64_t refresh_task_i
     LOG_WARN("invalid argument", K(ret), K(refresh_task_id));
   } else if (OB_FAIL(tmp_info_map_.get_refactored(refresh_task_id, tmp_info))) {
     if (OB_HASH_NOT_EXIST == ret) {
-      ret = OB_EAGAIN;
+      ret = OB_NEED_RETRY;  // PX must preserve this error so the RPC can reroute.
     }
     LOG_WARN("failed to get async index refresh build id", K(ret), K(refresh_task_id));
   } else if (OB_ISNULL(tmp_info)) {
@@ -230,6 +234,7 @@ int ObAsyncIndexService::prepare_tenant_major_refresh(
 {
   int ret = OB_SUCCESS;
   int64_t min_published_snapshot = 0;
+  int64_t leader_proposal_id = -1;
   common::ObSEArray<share::SCN, 4> publish_scns;
   ObAsyncIndexDepProvider &dep_provider = refresher_.get_dep_provider();
   if (IS_NOT_INIT) {
@@ -240,6 +245,8 @@ int ObAsyncIndexService::prepare_tenant_major_refresh(
                          || tenant_major_snapshot <= 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(data_tablet_id), K(index_tablet_ids), K(tenant_major_snapshot));
+  } else if (OB_FAIL(dep_provider.get_leader_proposal_id(&ls, leader_proposal_id))) {
+    LOG_WARN("failed to capture tenant major refresh proposal", K(ret), K(data_tablet_id));
   } else if (OB_FAIL(dep_provider.get_publish_scns(&ls, index_tablet_ids, publish_scns))) {
     LOG_WARN("failed to get async index published versions", K(ret),
         K(data_tablet_id), K(index_tablet_ids), K(tenant_major_snapshot));
@@ -251,22 +258,23 @@ int ObAsyncIndexService::prepare_tenant_major_refresh(
     for (int64_t i = 0; i < publish_scns.count(); ++i) {
       min_published_snapshot = MIN(min_published_snapshot, async_index_scn_to_snapshot(publish_scns.at(i)));
     }
-    if (min_published_snapshot < tenant_major_snapshot) {
-      ObTabletAsyncIndexRefreshInfo refresh_info;
-      const share::SCN target_scn = async_index_snapshot_to_scn(tenant_major_snapshot);
-      const share::SCN min_publish_scn = async_index_snapshot_to_scn(min_published_snapshot);
-      if (OB_FAIL(maintain_async_index_refresh_info(
-              tenant_id_, &ls, data_tablet_id, target_scn, min_publish_scn,
-              &dep_provider, refresh_info,
-              OB_ASYNC_INDEX_REFRESH_LOCK_TIMEOUT_US,
-              true /*强制建立租户 major 刷新检查点*/))) {
-        LOG_WARN("failed to maintain tenant major refresh barrier", K(ret),
-            K(data_tablet_id), K(tenant_major_snapshot), K(min_published_snapshot));
-      } else {
-        LOG_DEBUG("tenant major refresh checkpoint prepared",
-            K(ret), K(data_tablet_id), K(index_tablet_ids), K(tenant_major_snapshot),
-            K(min_published_snapshot), K(refresh_info));
-      }
+    // T1 validates the proposal even when this preliminary read says the
+    // target is already published; no successful return bypasses that boundary.
+    ObTabletAsyncIndexRefreshInfo refresh_info;
+    const share::SCN target_scn = async_index_snapshot_to_scn(tenant_major_snapshot);
+    const share::SCN min_publish_scn = async_index_snapshot_to_scn(min_published_snapshot);
+    if (OB_FAIL(maintain_async_index_refresh_info(
+            tenant_id_, &ls, leader_proposal_id, data_tablet_id, target_scn, min_publish_scn,
+            &dep_provider, refresh_info,
+            OB_ASYNC_INDEX_REFRESH_LOCK_TIMEOUT_US,
+            true /*skip_incr_check*/, nullptr /*checkpoint_capacity_full*/,
+            false /*is_manual_refresh*/, true /*skip_if_published*/))) {
+      LOG_WARN("failed to maintain tenant major refresh barrier", K(ret),
+          K(data_tablet_id), K(tenant_major_snapshot), K(min_published_snapshot));
+    } else {
+      LOG_DEBUG("tenant major refresh checkpoint prepared",
+          K(ret), K(data_tablet_id), K(index_tablet_ids), K(tenant_major_snapshot),
+          K(min_published_snapshot), K(refresh_info));
     }
   }
   return ret;
@@ -381,9 +389,13 @@ int ObAsyncIndexService::set_inner_sql_slice_info(const int64_t refresh_task_id,
   } else if (OB_UNLIKELY(refresh_task_id <= 0 || !ddl_slice_info.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(refresh_task_id), K(ddl_slice_info));
-  } else if (OB_FAIL(tmp_info_map_.get_refactored(refresh_task_id, tmp_info))) {
+  } else if (OB_FAIL(EN_ASYNC_INDEX_SLICE_INFO_WRITE_MISS)
+             || OB_FAIL(tmp_info_map_.get_refactored(refresh_task_id, tmp_info))) {
     // The entry is created by register_refresh_versions before the SQL runs, so a
     // miss here means the inner SQL connection lost its refresh registration.
+    if (OB_HASH_NOT_EXIST == ret) {
+      ret = OB_NEED_RETRY;
+    }
     LOG_WARN("failed to get tmp info for slice info", K(ret), K(refresh_task_id));
   } else if (OB_ISNULL(tmp_info)) {
     ret = OB_ERR_UNEXPECTED;
@@ -421,9 +433,10 @@ int ObAsyncIndexService::get_inner_sql_slice_info(const int64_t refresh_task_id,
       }
     };
     IncRefFn inc_ref_fn(tmp_info);
-    if (OB_FAIL(tmp_info_map_.atomic_refactored(refresh_task_id, inc_ref_fn))) {
+    if (OB_FAIL(EN_ASYNC_INDEX_SLICE_INFO_READ_MISS)
+        || OB_FAIL(tmp_info_map_.atomic_refactored(refresh_task_id, inc_ref_fn))) {
       if (OB_HASH_NOT_EXIST == ret) {
-        ret = OB_EAGAIN;  // retryable
+        ret = OB_NEED_RETRY;  // PX must preserve this error so the RPC can reroute.
       }
       LOG_WARN("failed to get async index refresh slice info", K(ret), K(refresh_task_id));
     } else if (OB_ISNULL(tmp_info)) {
@@ -603,7 +616,8 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
       {
         ObTabletHandle data_tablet_handle;
         ObTabletHandle tablet_handle;
-        int64_t published_version = ASYNC_INDEX_INITIAL_VERSION;
+        ObAsyncIndexReadState read_state;
+        // This read may finish the request without T2, so validate the original proposal.
         if (OB_FAIL(get_async_index_refresh_tablet(
                 *param.ls_, param.data_tablet_id_, data_tablet_handle))) {
           LOG_WARN("data tablet location is not ready for direct refresh", K(ret), K(param));
@@ -620,10 +634,13 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
         } else if (OB_ISNULL(tablet_handle.get_obj())) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("index tablet handle is null", K(ret), K(param.index_tablet_id_));
-        } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_refresh_start_version(published_version))) {
-          LOG_WARN("failed to get max published version from index tablet",
-                   K(ret), K(param.index_tablet_id_));
+        } else if (OB_FAIL(refresher_.get_dep_provider().read_async_index_state_on_leader(
+                       param.tenant_id_, param.ls_, param.leader_proposal_id_, param.index_tablet_id_,
+                       ObAsyncIndexReadType::PUBLISHED_VERSION,
+                       tablet_handle.get_obj()->get_transfer_seq(), read_state))) {
+          LOG_WARN("failed to read published version for direct refresh", K(ret), K(param));
         } else {
+          const int64_t published_version = read_state.published_version_;
           data_transfer_seq = data_tablet_handle.get_obj()->get_transfer_seq();
           index_transfer_seq = tablet_handle.get_obj()->get_transfer_seq();
           start_refresh_scn = async_index_snapshot_to_scn(published_version);
@@ -757,6 +774,7 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
         task_param.refresh_type_        = static_cast<ObAsyncRefreshType>(param.refresh_type_);
         task_param.parallelism_         = OB_ASYNC_INDEX_MIN_PARALLELISM;
         task_param.schema_version_      = data_table_info.schema_version_;
+        task_param.leader_proposal_id_   = param.leader_proposal_id_;
         task_param.retry_cnt_           = retry_cnt;
         // Delete-old carries every partition routing column, so keep the normal
         // PARTITION_RANGE/RANGE/SORT DDL path enabled.

@@ -41,6 +41,12 @@ class EnumFakeProvider : public ObIAsyncIndexDepProvider
 public:
   EnumFakeProvider() : enum_call_cnt_(0) {}
 
+  int get_leader_proposal_id(ObLS * /*ls*/, int64_t &proposal_id) override
+  {
+    proposal_id = 1;
+    return OB_SUCCESS;
+  }
+
   // ls_id is optional: when valid it is stamped onto the data tablet's
   // data_ls_id_ so the scheduler routes it via the O(1) leader map; when left
   // invalid the scheduler falls back to probing.

@@ -154,6 +154,7 @@ int ObAsyncIndexRefreshTask::set_task(const ObAsyncIndexRefreshTaskParam &param)
     stat.refresh_type_ = param.refresh_type_;
     stat.refresh_parallelism_ = param.parallelism_;
     stat.schema_version_ = param.schema_version_;
+    stat.leader_proposal_id_ = param.leader_proposal_id_;
     stat.is_partition_local_ = param.is_partition_local_;
     stat.is_delete_index_ = param.is_delete_index_;
     stat.is_complete_refresh_ = param.is_complete_refresh_;
@@ -246,9 +247,9 @@ int ObAsyncIndexRefreshTask::recheck_publish_scn_after_lock_(const ObRefreshTask
   int ret = OB_SUCCESS;
   ObLSService *ls_service = MTL(ObLSService *);
   ObLSHandle ls_handle;
-  ObTabletHandle tablet_handle;
   ObTabletHandle data_tablet_handle;
-  int64_t published_version = 0;
+  ObAsyncIndexDepProvider dep_provider;
+  ObAsyncIndexReadState read_state;
   // The OnlineDDL tablet ROW_EXCLUSIVE lock conflicts with transfer's
   // EXCLUSIVE lock and is held through trans.end(). Validate the scheduled
   // generation now, before reading its watermark or executing refresh SQL.
@@ -267,19 +268,12 @@ int ObAsyncIndexRefreshTask::recheck_publish_scn_after_lock_(const ObRefreshTask
                  *ls_handle.get_ls(), stat.data_tablet_id_, data_tablet_handle,
                  stat.data_transfer_seq_))) {
     LOG_WARN("data tablet location changed", K(ret), K(stat));
-  } else if (OB_FAIL(get_async_index_refresh_tablet(
-                 *ls_handle.get_ls(), stat.tablet_id_, tablet_handle,
-                 stat.index_transfer_seq_))) {
-    LOG_WARN("failed to get index tablet at scheduled location",
-             K(ret), K(stat.tablet_id_));
-  } else if (OB_ISNULL(tablet_handle.get_obj())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("tablet handle is null", K(ret), K(stat.tablet_id_));
-  } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_refresh_start_version(
-                 published_version, false /*use_cache*/))) {
-    LOG_WARN("failed to get max published version", K(ret), K(stat.tablet_id_));
+  } else if (OB_FAIL(dep_provider.read_async_index_state_on_leader(
+                 stat.tenant_id_, ls_handle.get_ls(), stat.leader_proposal_id_, stat.tablet_id_,
+                 ObAsyncIndexReadType::PUBLISHED_VERSION, stat.index_transfer_seq_, read_state))) {
+    LOG_WARN("failed to read publication under refresh locks", K(ret), K(stat));
   } else {
-    share::SCN current_publish_scn = async_index_snapshot_to_scn(published_version);
+    share::SCN current_publish_scn = async_index_snapshot_to_scn(read_state.published_version_);
     if (current_publish_scn >= stat.target_refresh_scn_) {
       ret = OB_NO_NEED_UPDATE;
       LOG_INFO("[ASYNC_INDEX_REFRESH] skip refresh after lock: target already reached",
@@ -354,8 +348,9 @@ int ObAsyncIndexRefreshTask::handle()
       // (1) register the execution context in the node-local
       // ObAsyncIndexService map keyed by refresh_task_id, and (2) flag the session with
       // is_async_index_refresh so start_ddl takes the map-lookup branch instead.
-      // start_ddl runs synchronously inside trans.write below (same node, the LS
-      // leader), so the registration is visible there; we release it afterwards.
+      // If PX runs on another node after a leader switch, missing TmpInfo returns
+      // OB_NEED_RETRY. Roll back before the caller reroutes and rebuilds the task.
+      // Release this registration only after trans.end().
       ObAsyncIndexService *svc = MTL(ObAsyncIndexService *);
       bool registered = false;
       bool refresh_dop_acquired = false;
@@ -394,6 +389,7 @@ int ObAsyncIndexRefreshTask::handle()
                  K(stat_.start_refresh_scn_), K(stat_.target_refresh_scn_),
                  K(stat_.schema_version_), K(ddl_build_id));
       } else if (FALSE_IT(registered = true)) {
+      } else if (FALSE_IT(DEBUG_SYNC(AFTER_ASYNC_INDEX_PREPARE_REFRESH_CONTEXT))) {
       } else if (OB_FAIL(trans.start(
                      GCTX.ddl_sql_proxy_, stat.tenant_id_, false /* with_snapshot */,
                      static_cast<int32_t>(GET_GROUP_ID())))) {
@@ -467,6 +463,7 @@ int ObAsyncIndexRefreshTask::handle()
             common::ObCurTraceId::init(observer::ObServer::get_instance().get_self());
             trace_id_owned = true;
           }
+          DEBUG_SYNC(BEFORE_ASYNC_INDEX_REFRESH_INNER_SQL);
           if (OB_FAIL(trans.write(stat.tenant_id_, sql_.ptr(), stat.affected_rows_))) {
             LOG_WARN("[ASYNC_INDEX_REFRESH] failed to execute async index refresh sql", K(ret),
                      K(stat.tenant_id_), K(stat.tablet_id_),

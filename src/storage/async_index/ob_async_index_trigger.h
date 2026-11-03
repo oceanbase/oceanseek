@@ -28,6 +28,7 @@ struct ObRefreshDecision
     target_refresh_scn_.reset();
     parallelism_ = OB_ASYNC_INDEX_MIN_PARALLELISM;
     checkpoint_backlog_ = 0;
+    leader_proposal_id_ = -1;
     is_complete_refresh_ = false;
   }
   bool is_valid() const
@@ -37,7 +38,7 @@ struct ObRefreshDecision
         && parallelism_ >= OB_ASYNC_INDEX_MIN_PARALLELISM;
   }
   TO_STRING_KV(K_(index_tablet_id), K_(start_refresh_scn), K_(target_refresh_scn),
-               K_(parallelism), K_(checkpoint_backlog),
+               K_(parallelism), K_(checkpoint_backlog), K_(leader_proposal_id),
                K_(is_complete_refresh));
 
   common::ObTabletID index_tablet_id_;
@@ -45,6 +46,7 @@ struct ObRefreshDecision
   share::SCN target_refresh_scn_;
   int64_t parallelism_;
   int64_t checkpoint_backlog_;
+  int64_t leader_proposal_id_; // proposal captured before reading this decision's inputs
   // true => this index tablet has no usable incremental start point (first
   // refresh / no baseline), so it must be refreshed by a COMPLETE (full
   // snapshot) scan rather than an mview incremental delta scan.

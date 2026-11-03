@@ -722,6 +722,7 @@ int ObTenantAsyncIndexRefresher::refresh_one_data_table_(
       base_param.refresh_type_ = ASYNC_REFRESH_TYPE_PERIOD;
       base_param.parallelism_ = decision.parallelism_;
       base_param.schema_version_ = data_table_info.schema_version_;
+      base_param.leader_proposal_id_ = decision.leader_proposal_id_;
       // Delete-old carries every partition routing column, so keep the normal
       // PARTITION_RANGE/RANGE/SORT DDL path enabled.
       base_param.is_partition_local_ = false;

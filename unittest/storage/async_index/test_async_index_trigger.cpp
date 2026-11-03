@@ -40,9 +40,46 @@ public:
     : snapshot_scn_(make_scn(2000)),
       incr_total_(0),
       sstable_count_(0),
-      set_refresh_info_count_(0)
+      set_refresh_info_count_(0),
+      proposal_id_(1),
+      proposal_calls_(0),
+      proposal_error_call_(0),
+      proposal_error_(OB_NOT_MASTER),
+      state_read_count_(0),
+      state_read_ret_(OB_SUCCESS),
+      proposal_change_on_read_(0),
+      published_version_(100)
   {
     refresh_info_.set_has_async_index(true);
+  }
+
+  int get_leader_proposal_id(ObLS * /*ls*/, int64_t &proposal_id) override
+  {
+    int ret = OB_SUCCESS;
+    proposal_id = proposal_id_;
+    if (++proposal_calls_ == proposal_error_call_) {
+      ret = proposal_error_;
+    }
+    return ret;
+  }
+
+  int get_async_index_read_state(const uint64_t tenant_id, ObLS *ls,
+      const ObTabletID &tablet_id, const ObAsyncIndexReadType read_type,
+      const int64_t transfer_seq, ObAsyncIndexReadState &state) override
+  {
+    int ret = OB_SUCCESS;
+    ++state_read_count_;
+    if (ObAsyncIndexReadType::PUBLISHED_VERSION == read_type) {
+      state.published_version_ = published_version_;
+    } else {
+      ret = ObIAsyncIndexDepProvider::get_async_index_read_state(
+          tenant_id, ls, tablet_id, read_type, transfer_seq, state);
+    }
+    proposal_id_ += proposal_change_on_read_;
+    if (OB_SUCC(ret)) {
+      ret = state_read_ret_;
+    }
+    return ret;
   }
 
   int get_publish_scns(ObLS *, const ObIArray<ObTabletID> &index_tablet_ids,
@@ -112,6 +149,14 @@ public:
   int64_t incr_total_;
   int64_t sstable_count_;
   int64_t set_refresh_info_count_;
+  int64_t proposal_id_;
+  int64_t proposal_calls_;
+  int64_t proposal_error_call_;
+  int proposal_error_;
+  int64_t state_read_count_;
+  int state_read_ret_;
+  int64_t proposal_change_on_read_;
+  int64_t published_version_;
   ObTabletID delete_tablet_id_;  // invalid by default
   ObSEArray<ObTabletID, 4> index_tablets_;
   ObSEArray<SCN, 4> index_publish_scns_;
@@ -197,6 +242,7 @@ TEST_F(TestAsyncIndexTrigger, test_trigger_with_incr_data)
   ASSERT_EQ(make_scn(1000), decisions.at(0).start_refresh_scn_);
   ASSERT_EQ(make_scn(2000), decisions.at(0).target_refresh_scn_);
   ASSERT_EQ(1, decisions.at(0).parallelism_);
+  ASSERT_EQ(provider.proposal_id_, decisions.at(0).leader_proposal_id_);
 }
 
 // No incremental data exists => no trigger.
@@ -656,7 +702,7 @@ TEST_F(TestAsyncIndexTrigger, test_create_index_path_anchors_s0_via_min_publish_
 
   ObTabletAsyncIndexRefreshInfo out_info;
   ASSERT_EQ(OB_SUCCESS, maintain_async_index_refresh_info(
-      1001, nullptr, ObTabletID(100001), make_scn(2000), min_publish_scn,
+      1001, nullptr, 1 /*original proposal*/, ObTabletID(100001), make_scn(2000), min_publish_scn,
       &provider, out_info, 0, true /* skip_incr_check */));
 
   const ObIArray<int64_t> &snaps = provider.refresh_info_.get_refresh_snapshots();
@@ -812,7 +858,8 @@ public:
     if (OB_SUCC(ret)) {
       ret = calc_min_publish_scn(provider_.index_publish_scns_, min_scn);
       if (OB_SUCC(ret)) {
-        ret = maintain_async_index_refresh_info(1001, nullptr, ObTabletID(100001),
+        ret = maintain_async_index_refresh_info(
+            1001, nullptr, 1 /*original proposal*/, ObTabletID(100001),
             make_scn(target_snapshot_), min_scn, &provider_, info, 0, true, &capacity_full);
       }
     }
@@ -1131,7 +1178,8 @@ TEST_F(TestAsyncIndexTrigger, manual_refresh_checkpoint_throttle_boundary)
     ObTabletAsyncIndexRefreshInfo out;
     bool capacity_full = false;
     const int64_t target = (count + 1) * 100;
-    const int ret = maintain_async_index_refresh_info(1001, nullptr, ObTabletID(100001),
+    const int ret = maintain_async_index_refresh_info(
+        1001, nullptr, 1 /*original proposal*/, ObTabletID(100001),
         make_scn(target), SCN::base_scn(), &provider, out, 0, true,
         &capacity_full, true /*is_manual_refresh*/);
     ASSERT_FALSE(capacity_full); // 主动流控不是物理数组容量溢出。
@@ -1164,16 +1212,19 @@ TEST_F(TestAsyncIndexTrigger, manual_refresh_resumes_after_background_checkpoint
     provider.seed_refresh_target(make_scn(i * 100));
   }
   ObTabletAsyncIndexRefreshInfo out;
-  ASSERT_EQ(OB_OP_NOT_ALLOW, maintain_async_index_refresh_info(1001, nullptr, ObTabletID(100001),
+  ASSERT_EQ(OB_OP_NOT_ALLOW, maintain_async_index_refresh_info(
+      1001, nullptr, 1 /*original proposal*/, ObTabletID(100001),
       make_scn(1200), SCN::base_scn(), &provider, out, 0, true, nullptr, true));
   ASSERT_EQ(0, provider.set_refresh_info_count_);
 
   // 后台维护不受手动刷新流控限制，按已发布进度清理旧 checkpoint。
-  ASSERT_EQ(OB_SUCCESS, maintain_async_index_refresh_info(1001, nullptr, ObTabletID(100001),
+  ASSERT_EQ(OB_SUCCESS, maintain_async_index_refresh_info(
+      1001, nullptr, 1 /*original proposal*/, ObTabletID(100001),
       make_scn(1200), make_scn(1000), &provider, out, 0, true));
   ASSERT_EQ(3, provider.refresh_info_.get_refresh_snapshots().count());
   ASSERT_EQ(1000, provider.refresh_info_.get_refresh_snapshots().at(0));
-  ASSERT_EQ(OB_SUCCESS, maintain_async_index_refresh_info(1001, nullptr, ObTabletID(100001),
+  ASSERT_EQ(OB_SUCCESS, maintain_async_index_refresh_info(
+      1001, nullptr, 1 /*original proposal*/, ObTabletID(100001),
       make_scn(1300), SCN::base_scn(), &provider, out, 0, true, nullptr, true));
   // 沿用手动刷新原有行为：补入 base_scn 下界并追加本轮目标。
   ASSERT_EQ(5, out.get_refresh_snapshots().count());
@@ -1186,12 +1237,14 @@ TEST_F(TestAsyncIndexTrigger, maintenance_full_append_preserves_capacity_error)
   DDLRefreshHarness h;
   h.seed(MAX_INC_MAJOR_SSTABLE_CNT, 100);
   ObTabletAsyncIndexRefreshInfo out;
-  ASSERT_EQ(OB_SIZE_OVERFLOW, maintain_async_index_refresh_info(1001, nullptr, ObTabletID(100001),
+  ASSERT_EQ(OB_SIZE_OVERFLOW, maintain_async_index_refresh_info(
+      1001, nullptr, 1 /*original proposal*/, ObTabletID(100001),
       make_scn(6500), make_scn(100), &h.provider_, out, 0, true));
   ASSERT_TRUE(out.get_refresh_snapshots().empty());
   ASSERT_EQ(6400, h.provider_.refresh_info_.get_refresh_snapshots().at(MAX_INC_MAJOR_SSTABLE_CNT - 1));
   bool capacity_full = false;
-  ASSERT_EQ(OB_SIZE_OVERFLOW, maintain_async_index_refresh_info(1001, nullptr, ObTabletID(100001),
+  ASSERT_EQ(OB_SIZE_OVERFLOW, maintain_async_index_refresh_info(
+      1001, nullptr, 1 /*original proposal*/, ObTabletID(100001),
       make_scn(6500), make_scn(100), &h.provider_, out, 0, true, &capacity_full));
   ASSERT_TRUE(capacity_full);
   ASSERT_TRUE(out.get_refresh_snapshots().empty());
@@ -1487,6 +1540,204 @@ TEST_F(TestAsyncIndexTrigger, ddl_publish_rechecks_skipped_alignment_before_gts)
   ASSERT_EQ(1, publish_op.gts_calls_);
   ASSERT_EQ(1, publish_op.publish_calls_);
   ASSERT_TRUE(context.is_prepared());
+}
+
+// Both T1 and T2 use this boundary; the fake changes its role/proposal inside
+// the local read, so these tests exercise the production check-read-check code.
+TEST_F(TestAsyncIndexTrigger, protected_read_accepts_same_proposal)
+{
+  const ObAsyncIndexReadType READ_TYPES[] = {
+      ObAsyncIndexReadType::CHECKPOINTS, ObAsyncIndexReadType::PUBLISHED_VERSION};
+  for (int64_t i = 0; i < ARRAYSIZEOF(READ_TYPES); ++i) {
+    const ObAsyncIndexReadType type = READ_TYPES[i];
+    FakeDepProvider provider;
+    provider.seed_refresh_target(make_scn(100));
+    ObAsyncIndexReadState state;
+    ASSERT_EQ(OB_SUCCESS, provider.read_async_index_state_on_leader(
+        1001, nullptr, 1, ObTabletID(100001), type, -1 /*transfer_seq*/, state));
+    EXPECT_EQ(2, provider.proposal_calls_);
+    EXPECT_EQ(1, provider.state_read_count_);
+    if (ObAsyncIndexReadType::CHECKPOINTS == type) {
+      ASSERT_EQ(1, state.refresh_info_.get_refresh_snapshots().count());
+      EXPECT_EQ(100, state.refresh_info_.get_refresh_snapshots().at(0));
+    } else {
+      EXPECT_EQ(100, state.published_version_);
+    }
+  }
+}
+
+TEST_F(TestAsyncIndexTrigger, protected_read_rejects_old_proposal_before_read)
+{
+  const ObAsyncIndexReadType READ_TYPES[] = {
+      ObAsyncIndexReadType::CHECKPOINTS, ObAsyncIndexReadType::PUBLISHED_VERSION};
+  for (int64_t i = 0; i < ARRAYSIZEOF(READ_TYPES); ++i) {
+    const ObAsyncIndexReadType type = READ_TYPES[i];
+    FakeDepProvider provider;
+    provider.proposal_id_ = 3; // A -> B -> A, same server but a new proposal.
+    ObAsyncIndexReadState state;
+    state.published_version_ = 300;
+    ASSERT_EQ(OB_NOT_MASTER, provider.read_async_index_state_on_leader(
+        1001, nullptr, 1, ObTabletID(100001), type, -1 /*transfer_seq*/, state));
+    EXPECT_EQ(0, provider.state_read_count_);
+    EXPECT_TRUE(state.refresh_info_.get_refresh_snapshots().empty());
+    EXPECT_EQ(ASYNC_INDEX_INITIAL_VERSION, state.published_version_);
+  }
+}
+
+TEST_F(TestAsyncIndexTrigger, protected_read_discards_result_if_proposal_changes_during_read)
+{
+  const ObAsyncIndexReadType READ_TYPES[] = {
+      ObAsyncIndexReadType::CHECKPOINTS, ObAsyncIndexReadType::PUBLISHED_VERSION};
+  for (int64_t i = 0; i < ARRAYSIZEOF(READ_TYPES); ++i) {
+    const ObAsyncIndexReadType type = READ_TYPES[i];
+    FakeDepProvider provider;
+    provider.seed_refresh_target(make_scn(100));
+    provider.proposal_change_on_read_ = 2;
+    ObAsyncIndexReadState state;
+    ASSERT_EQ(OB_NOT_MASTER, provider.read_async_index_state_on_leader(
+        1001, nullptr, 1, ObTabletID(100001), type, -1 /*transfer_seq*/, state));
+    EXPECT_EQ(2, provider.proposal_calls_);
+    EXPECT_EQ(1, provider.state_read_count_);
+    EXPECT_TRUE(state.refresh_info_.get_refresh_snapshots().empty());
+    EXPECT_EQ(ASYNC_INDEX_INITIAL_VERSION, state.published_version_);
+  }
+}
+
+TEST_F(TestAsyncIndexTrigger, protected_read_propagates_role_failures_before_and_after_read)
+{
+  const ObAsyncIndexReadType READ_TYPES[] = {
+      ObAsyncIndexReadType::CHECKPOINTS, ObAsyncIndexReadType::PUBLISHED_VERSION};
+  const int ERRORS[] = {OB_NOT_MASTER, OB_EAGAIN, OB_TIMEOUT};
+  for (int64_t i = 0; i < ARRAYSIZEOF(READ_TYPES); ++i) {
+    const ObAsyncIndexReadType type = READ_TYPES[i];
+    for (int64_t j = 0; j < ARRAYSIZEOF(ERRORS); ++j) {
+      const int error = ERRORS[j];
+      for (int64_t call = 1; call <= 2; ++call) {
+        FakeDepProvider provider;
+        provider.seed_refresh_target(make_scn(100));
+        provider.proposal_error_call_ = call;
+        provider.proposal_error_ = error;
+        ObAsyncIndexReadState state;
+        ASSERT_EQ(error, provider.read_async_index_state_on_leader(
+            1001, nullptr, 1, ObTabletID(100001), type, -1 /*transfer_seq*/, state));
+        EXPECT_EQ(call - 1, provider.state_read_count_);
+        EXPECT_TRUE(state.refresh_info_.get_refresh_snapshots().empty());
+        EXPECT_EQ(ASYNC_INDEX_INITIAL_VERSION, state.published_version_);
+      }
+    }
+  }
+}
+
+TEST_F(TestAsyncIndexTrigger, protected_read_preserves_read_error_and_clears_partial_result)
+{
+  const ObAsyncIndexReadType READ_TYPES[] = {
+      ObAsyncIndexReadType::CHECKPOINTS, ObAsyncIndexReadType::PUBLISHED_VERSION};
+  for (int64_t i = 0; i < ARRAYSIZEOF(READ_TYPES); ++i) {
+    const ObAsyncIndexReadType type = READ_TYPES[i];
+    FakeDepProvider provider;
+    provider.seed_refresh_target(make_scn(100));
+    provider.state_read_ret_ = OB_TABLET_TRANSFER_SEQ_NOT_MATCH;
+    ObAsyncIndexReadState state;
+    ASSERT_EQ(OB_TABLET_TRANSFER_SEQ_NOT_MATCH, provider.read_async_index_state_on_leader(
+        1001, nullptr, 1, ObTabletID(100001), type, -1 /*transfer_seq*/, state));
+    EXPECT_EQ(1, provider.proposal_calls_);
+    EXPECT_TRUE(state.refresh_info_.get_refresh_snapshots().empty());
+    EXPECT_EQ(ASYNC_INDEX_INITIAL_VERSION, state.published_version_);
+  }
+}
+
+TEST_F(TestAsyncIndexTrigger, protected_read_rejects_missing_proposal_and_invalid_read_type)
+{
+  FakeDepProvider provider;
+  ObAsyncIndexReadState state;
+  EXPECT_EQ(OB_INVALID_ARGUMENT, provider.read_async_index_state_on_leader(
+      1001, nullptr, -1, ObTabletID(100001), ObAsyncIndexReadType::CHECKPOINTS,
+      -1 /*transfer_seq*/, state));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, provider.read_async_index_state_on_leader(
+      1001, nullptr, 1, ObTabletID(100001), static_cast<ObAsyncIndexReadType>(-1),
+      -1 /*transfer_seq*/, state));
+  EXPECT_EQ(0, provider.proposal_calls_);
+  EXPECT_EQ(0, provider.state_read_count_);
+  // A null LS is supported only by test providers, never by production.
+  ObAsyncIndexDepProvider real_provider;
+  EXPECT_EQ(OB_INVALID_ARGUMENT, real_provider.read_async_index_state_on_leader(
+      1001, nullptr, 1, ObTabletID(100001), ObAsyncIndexReadType::CHECKPOINTS,
+      -1 /*transfer_seq*/, state));
+}
+
+TEST_F(TestAsyncIndexTrigger, t1_does_not_write_queue_if_read_loses_original_proposal)
+{
+  FakeDepProvider provider;
+  provider.seed_refresh_target(make_scn(100));
+  provider.proposal_change_on_read_ = 2;
+  ObTabletAsyncIndexRefreshInfo info;
+  ASSERT_EQ(OB_NOT_MASTER, maintain_async_index_refresh_info(
+      1001, nullptr, 1, ObTabletID(100001), make_scn(200), make_scn(100),
+      &provider, info, 0, true /*skip_incr_check*/));
+  EXPECT_EQ(0, provider.set_refresh_info_count_);
+  EXPECT_TRUE(info.get_refresh_snapshots().empty());
+  ASSERT_EQ(1, provider.refresh_info_.get_refresh_snapshots().count());
+  EXPECT_EQ(100, provider.refresh_info_.get_refresh_snapshots().at(0));
+}
+
+TEST_F(TestAsyncIndexTrigger,
+       major_completed_target_still_validates_proposal_without_changing_queue)
+{
+  for (int64_t proposal_change = 0; proposal_change <= 2; proposal_change += 2) {
+    FakeDepProvider provider;
+    provider.seed_refresh_target(make_scn(100));
+    provider.seed_refresh_target(make_scn(300));
+    provider.proposal_change_on_read_ = proposal_change;
+    ObTabletAsyncIndexRefreshInfo info;
+    ASSERT_EQ(0 == proposal_change ? OB_SUCCESS : OB_NOT_MASTER, maintain_async_index_refresh_info(
+        1001, nullptr, 1, ObTabletID(100001), make_scn(200), make_scn(300),
+        &provider, info, 0, true /*skip_incr_check*/, nullptr,
+        false /*is_manual_refresh*/, true /*skip_if_published*/));
+    EXPECT_EQ(0, provider.set_refresh_info_count_);
+    EXPECT_EQ(2, provider.proposal_calls_);
+    EXPECT_EQ(0 == proposal_change ? 2 : 0, info.get_refresh_snapshots().count());
+    EXPECT_EQ(2, provider.refresh_info_.get_refresh_snapshots().count());
+  }
+}
+
+TEST_F(TestAsyncIndexTrigger, timer_drops_decision_when_t1_read_loses_original_proposal)
+{
+  FakeDepProvider provider;
+  provider.incr_total_ = 1;
+  provider.proposal_change_on_read_ = 2;
+  add_index(provider, ObTabletID(200002), make_scn(100));
+  ObAsyncIndexTrigger trigger;
+  ASSERT_EQ(OB_SUCCESS, trigger.init(1001, &provider));
+  ObAsyncIndexDataTableInfo info;
+  build_data_table_info(provider, info);
+  ObRefreshDecisionArray decisions;
+  EXPECT_EQ(OB_NOT_MASTER, trigger.check_and_generate_tasks(info, 0, nullptr, decisions));
+  EXPECT_TRUE(decisions.empty());
+  EXPECT_EQ(0, provider.set_refresh_info_count_);
+}
+
+TEST_F(TestAsyncIndexTrigger, timer_capacity_reread_cannot_bypass_original_proposal)
+{
+  for (int64_t error_call = 4; error_call <= 5; ++error_call) {
+    DDLRefreshHarness h;
+    h.seed(MAX_INC_MAJOR_SSTABLE_CNT, 100);
+    h.provider_.snapshot_scn_ = make_scn(6500);
+    h.provider_.incr_total_ = 1;
+    // Capture + T1 pre/post checks succeed. Lose leadership before/after the
+    // separate committed-queue read used by capacity recovery.
+    h.provider_.proposal_error_call_ = error_call;
+    ObAsyncIndexTrigger trigger;
+    ASSERT_EQ(OB_SUCCESS, trigger.init(1001, &h.provider_));
+    ObAsyncIndexDataTableInfo info;
+    build_data_table_info(h.provider_, info);
+    ObRefreshDecisionArray decisions;
+    EXPECT_EQ(OB_NOT_MASTER, trigger.check_and_generate_tasks(info, 0, nullptr, decisions));
+    EXPECT_TRUE(decisions.empty());
+    EXPECT_EQ(0, h.provider_.set_refresh_info_count_);
+    ASSERT_EQ(MAX_INC_MAJOR_SSTABLE_CNT, h.provider_.refresh_info_.get_refresh_snapshots().count());
+    EXPECT_EQ(6400,
+        h.provider_.refresh_info_.get_refresh_snapshots().at(MAX_INC_MAJOR_SSTABLE_CNT - 1));
+  }
 }
 
 } // namespace unittest

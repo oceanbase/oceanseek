@@ -34,6 +34,7 @@
 #include "storage/tablelock/ob_lock_inner_connection_util.h" // ObInnerConnectionLockUtil
 #include "storage/tablelock/ob_table_lock_rpc_struct.h"      // ObLockObjRequest
 #include "lib/utility/ob_sort.h"
+#include "share/ob_debug_sync.h"
 
 namespace oceanbase
 {
@@ -182,14 +183,99 @@ int get_min_index_published_scn(
   return ret;
 }
 
-// ============================================================================
-// maintain_async_index_refresh_info — unified, lock-protected refresh_info
-// maintenance interface.
-// ============================================================================
+int ObIAsyncIndexDepProvider::get_leader_proposal_id(ObLS *ls, int64_t &proposal_id)
+{
+  int ret = OB_SUCCESS;
+  ObRole role = FOLLOWER;
+  proposal_id = -1;
+  if (OB_ISNULL(ls)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("null LS for async index leader proposal", K(ret));
+  } else if (OB_FAIL(ls->get_log_handler()->get_role(role, proposal_id))) {
+    LOG_WARN("failed to get async index leader proposal", K(ret), K(ls->get_ls_id()));
+  } else if (!is_strong_leader(role)) {
+    ret = OB_NOT_MASTER;
+    LOG_INFO("async index LS is not leader", K(ret), K(ls->get_ls_id()), K(role), K(proposal_id));
+  }
+  return ret;
+}
+
+int ObIAsyncIndexDepProvider::get_async_index_read_state(
+    const uint64_t tenant_id, ObLS *ls, const ObTabletID &tablet_id,
+    const ObAsyncIndexReadType read_type, const int64_t transfer_seq,
+    ObAsyncIndexReadState &state)
+{
+  int ret = OB_SUCCESS;
+  ObTabletHandle tablet_handle;
+  if (ObAsyncIndexReadType::CHECKPOINTS == read_type) {
+    if (OB_FAIL(get_async_index_refresh_info(tenant_id, ls, tablet_id, state.refresh_info_))) {
+      LOG_WARN("failed to read async index checkpoints", K(ret), K(tablet_id));
+    }
+  } else if (ObAsyncIndexReadType::PUBLISHED_VERSION != read_type || OB_ISNULL(ls)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async index publication read", K(ret), KP(ls), K(tablet_id), K(read_type));
+  } else if (OB_FAIL(get_async_index_refresh_tablet(*ls, tablet_id, tablet_handle, transfer_seq))) {
+    LOG_WARN("failed to get async index tablet at expected generation",
+             K(ret), K(tablet_id), K(transfer_seq));
+  } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_refresh_start_version(
+                 state.published_version_, false /*use_cache*/))) {
+    LOG_WARN("failed to read async index publication", K(ret), K(tablet_id));
+  }
+  return ret;
+}
+
+int ObIAsyncIndexDepProvider::check_async_index_read_proposal_(
+    ObLS *ls, const int64_t expected_proposal_id)
+{
+  int ret = OB_SUCCESS;
+  int64_t proposal_id = -1;
+  if (OB_FAIL(get_leader_proposal_id(ls, proposal_id))) {
+    LOG_WARN("failed to check async index read proposal", K(ret), K(expected_proposal_id));
+  } else if (proposal_id != expected_proposal_id) {
+    ret = OB_NOT_MASTER;
+    LOG_INFO("async index read proposal changed", K(ret), K(proposal_id), K(expected_proposal_id));
+  }
+  return ret;
+}
+
+int ObIAsyncIndexDepProvider::read_async_index_state_on_leader(
+    const uint64_t tenant_id, ObLS *ls, const int64_t leader_proposal_id,
+    const ObTabletID &tablet_id, const ObAsyncIndexReadType read_type,
+    const int64_t transfer_seq, ObAsyncIndexReadState &state)
+{
+  int ret = OB_SUCCESS;
+  state.reset();
+  if (OB_INVALID_TENANT_ID == tenant_id || !tablet_id.is_valid() || leader_proposal_id < 0
+      || (ObAsyncIndexReadType::CHECKPOINTS != read_type
+          && ObAsyncIndexReadType::PUBLISHED_VERSION != read_type)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async index state read", K(ret), K(tenant_id), K(tablet_id),
+             K(leader_proposal_id), K(read_type));
+  } else if (OB_FAIL(check_async_index_read_proposal_(ls, leader_proposal_id))) {
+    LOG_WARN("leader changed before reading async index state", K(ret), K(tablet_id));
+  } else if (OB_FAIL(get_async_index_read_state(
+                 tenant_id, ls, tablet_id, read_type, transfer_seq, state))) {
+    LOG_WARN("failed to read local async index state", K(ret), K(tablet_id), K(read_type));
+  } else {
+    if (ObAsyncIndexReadType::CHECKPOINTS == read_type) {
+      DEBUG_SYNC(AFTER_ASYNC_INDEX_READ_REFRESH_INFO);
+    } else {
+      DEBUG_SYNC(AFTER_ASYNC_INDEX_READ_PUBLISH_SCN);
+    }
+    if (OB_FAIL(check_async_index_read_proposal_(ls, leader_proposal_id))) {
+      LOG_WARN("leader changed while reading async index state", K(ret), K(tablet_id));
+    }
+  }
+  if (OB_FAIL(ret)) {
+    state.reset();
+  }
+  return ret;
+}
 
 int maintain_async_index_refresh_info(
     const uint64_t tenant_id,
     ObLS *ls,
+    const int64_t leader_proposal_id,
     const ObTabletID &data_tablet_id,
     const SCN &new_snapshot,
     const SCN &min_publish_scn,
@@ -198,7 +284,8 @@ int maintain_async_index_refresh_info(
     const int64_t lock_timeout_us,
     const bool skip_incr_check,
     bool *checkpoint_capacity_full,
-    const bool is_manual_refresh)
+    const bool is_manual_refresh,
+    const bool skip_if_published)
 {
   int ret = OB_SUCCESS;
   out_refresh_info.reset();
@@ -206,6 +293,7 @@ int maintain_async_index_refresh_info(
     *checkpoint_capacity_full = false;
   }
   if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id)
+      || OB_UNLIKELY(leader_proposal_id < 0)
       || OB_UNLIKELY(!data_tablet_id.is_valid())
       || OB_UNLIKELY(!new_snapshot.is_valid())
       || OB_ISNULL(dep_provider)) {
@@ -218,10 +306,11 @@ int maintain_async_index_refresh_info(
     ObMySQLTransaction trans;
     observer::ObInnerSQLConnection *conn = nullptr;
     const ObLSID ls_id = (ls != nullptr) ? ls->get_ls_id() : ObLSID();
+    DEBUG_SYNC(ASYNC_INDEX_SNAPSHOT_WAIT_RESET);
 
     // Step 1: start a lightweight internal transaction (skip when ls is null)
     if (OB_ISNULL(ls)) {
-      // No LS provided — skip transaction/lock path (unit-test or lightweight mode)
+      // Test providers emulate leadership; production rejects a null LS on read.
     } else if (OB_ISNULL(sql_proxy)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("sql proxy is null", K(ret));
@@ -262,10 +351,12 @@ int maintain_async_index_refresh_info(
     }
 
     // Step 3: read current refresh_info
-    ObTabletAsyncIndexRefreshInfo refresh_info;
+    ObAsyncIndexReadState read_state;
+    ObTabletAsyncIndexRefreshInfo &refresh_info = read_state.refresh_info_;
     if (OB_SUCC(ret)) {
-      if (OB_FAIL(dep_provider->get_async_index_refresh_info(
-              tenant_id, ls, data_tablet_id, refresh_info))) {
+      if (OB_FAIL(dep_provider->read_async_index_state_on_leader(
+              tenant_id, ls, leader_proposal_id, data_tablet_id,
+              ObAsyncIndexReadType::CHECKPOINTS, -1 /*transfer_seq*/, read_state))) {
         LOG_WARN("failed to get async index refresh info", K(ret), K(data_tablet_id));
       } else if (!refresh_info.is_valid_for_refresh()) {
         ret = OB_ERR_UNEXPECTED;
@@ -291,10 +382,12 @@ int maintain_async_index_refresh_info(
           ? 0 : snapshots.at(snapshots.count() - 1);
       const int64_t new_snapshot_val = async_index_scn_to_snapshot(new_snapshot);
       const int64_t min_publish_snapshot = async_index_scn_to_snapshot(min_publish_scn);
+      // Major may skip only after its original proposal has been validated.
+      const bool already_published = skip_if_published && min_publish_snapshot >= new_snapshot_val;
 
       // Step 5: increment detection — probe (cur_max, new_snapshot] for DML
       bool has_incr = false;
-      if (new_snapshot_val > cur_max) {
+      if (!already_published && new_snapshot_val > cur_max) {
         if (skip_incr_check) {
           has_incr = true;
         } else {
@@ -311,7 +404,7 @@ int maintain_async_index_refresh_info(
       }
 
       // Step 6: prune retired snapshots (when min_publish_scn > SCN::min_scn())
-      if (OB_SUCC(ret)) {
+      if (OB_SUCC(ret) && !already_published) {
         if (!snapshots.empty() && min_publish_snapshot > 0) {
           const int64_t before_cnt = snapshots.count();
           const int64_t before_head = snapshots.at(0);

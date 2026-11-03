@@ -5492,6 +5492,7 @@ int ObAsyncIndexRefreshP::process()
       storage::ObLSService *ls_service = MTL(storage::ObLSService*);
       storage::ObLSHandle ls_handle;
       storage::ObLS *ls = nullptr;
+      int64_t leader_proposal_id = -1;
       share::SCN target_scn;
       storage::ObAsyncIndexService *async_index_service = MTL(storage::ObAsyncIndexService*);
       storage::ObIAsyncIndexDepProvider *dep_provider = nullptr;
@@ -5506,10 +5507,13 @@ int ObAsyncIndexRefreshP::process()
       } else if (OB_ISNULL(ls = ls_handle.get_ls())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("[ASYNC_INDEX] LS handle contains no LS", K(ret), K(arg_));
+      } else if (OB_FAIL(dep_provider->get_leader_proposal_id(ls, leader_proposal_id))) {
+        LOG_WARN("[ASYNC_INDEX] failed to capture refresh RPC proposal", K(ret), K(arg_));
       } else if (OB_FAIL(target_scn.convert_for_tx(arg_.target_refresh_scn_))) {
         LOG_WARN("[ASYNC_INDEX] fail to convert refresh target", K(ret), K(arg_));
       } else {
-        storage::ObAsyncIndexDDLRefreshOp refresh_op(*ls, *async_index_service, *dep_provider, arg_, target_scn);
+        storage::ObAsyncIndexDDLRefreshOp refresh_op(
+            *ls, leader_proposal_id, *async_index_service, *dep_provider, arg_, target_scn);
         bool rpc_registered = false;
         if (is_ddl_refresh) {
           // Both DDL types register the target and align multiple indexes.
@@ -5526,7 +5530,8 @@ int ObAsyncIndexRefreshP::process()
           // Non-DDL requests execute refresh even when there is only one index.
           storage::ObTabletAsyncIndexRefreshInfo info;
           if (OB_FAIL(storage::maintain_async_index_refresh_info(
-              arg_.tenant_id_, ls, arg_.tablet_id_, target_scn, share::SCN::base_scn(),
+              arg_.tenant_id_, ls, leader_proposal_id, arg_.tablet_id_, target_scn,
+              share::SCN::base_scn(),
               dep_provider, info, storage::OB_ASYNC_INDEX_DDL_LOCK_TIMEOUT_US, true /*skip_incr_check*/,
               nullptr /*checkpoint_capacity_full*/, ASYNC_REFRESH_TYPE_MANUAL == arg_.refresh_type_))) {
             LOG_WARN("[ASYNC_INDEX] fail to maintain refresh info", K(ret), K(arg_));

@@ -433,6 +433,7 @@ struct ObRefreshTaskStat
     refresh_parallelism_ = OB_ASYNC_INDEX_MIN_PARALLELISM;
     schema_version_ = 0;
     leader_epoch_ = 0;
+    leader_proposal_id_ = -1;
     is_partition_local_ = false;
     is_delete_index_ = false;
     is_complete_refresh_ = false;
@@ -475,6 +476,7 @@ struct ObRefreshTaskStat
                K_(refresh_parallelism),
                K_(schema_version),
                K_(leader_epoch),
+               K_(leader_proposal_id),
                K_(is_partition_local),
                K_(is_delete_index),
                K_(is_complete_refresh),
@@ -505,6 +507,7 @@ struct ObRefreshTaskStat
   int64_t leader_epoch_;               // LS-level leader epoch stamped when the task was enqueued;
                                        // re-validated before handle() executes so residual tasks
                                        // from a previous leader term on this LS are dropped
+  int64_t leader_proposal_id_;         // original PALF proposal, rechecked with the locked read
   bool is_partition_local_;            // true when the refresh target uses partition-local DDL
   bool is_delete_index_;               // true when the refresh target is the shared delete index
   bool is_complete_refresh_;           // true => COMPLETE (full snapshot) refresh; executor must
@@ -560,6 +563,7 @@ struct ObAsyncIndexRefreshTaskParam
       schema_version_(0),
       retry_cnt_(0),
       leader_epoch_(-1),
+      leader_proposal_id_(-1),
       is_partition_local_(false),
       is_delete_index_(false),
       is_complete_refresh_(false),
@@ -597,6 +601,7 @@ struct ObAsyncIndexRefreshTaskParam
                K_(parallelism),
                K_(schema_version),
                K_(retry_cnt),
+               K_(leader_proposal_id),
                K_(is_partition_local),
                K_(is_delete_index),
                K_(is_complete_refresh),
@@ -620,6 +625,7 @@ struct ObAsyncIndexRefreshTaskParam
   int64_t schema_version_;              // data table schema version captured at SQL generation time
   int64_t retry_cnt_;
   int64_t leader_epoch_;                // -1 for new tasks; retries retain their original epoch
+  int64_t leader_proposal_id_;          // retries must retain the proposal of the original decision
   bool is_partition_local_;             // whether this task uses partition-local DDL execution
   bool is_delete_index_;                // whether this task targets the shared delete index
   // true => COMPLETE (full snapshot) refresh. The executor MUST run this SQL as

@@ -51,6 +51,7 @@ int ObAsyncIndexTrigger::check_and_generate_tasks(
     const int64_t round_seq)
 {
   int ret = OB_SUCCESS;
+  int64_t leader_proposal_id = -1;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("trigger not inited", K(ret));
@@ -84,6 +85,8 @@ int ObAsyncIndexTrigger::check_and_generate_tasks(
     if (OB_FAIL(ret)) {
     } else if (index_tablet_ids.empty()) {
       // no index tablets on this data table; nothing to do
+    } else if (OB_FAIL(dep_provider_->get_leader_proposal_id(ls, leader_proposal_id))) {
+      LOG_WARN("failed to capture async index decision proposal", K(ret), K(data_tablet_id));
     } else if (OB_FAIL(dep_provider_->get_publish_scns(
             ls, index_tablet_ids, publish_scns))) {
       LOG_WARN("failed to get publish scns", K(ret), K(data_tablet_id));
@@ -108,17 +111,21 @@ int ObAsyncIndexTrigger::check_and_generate_tasks(
       if (OB_FAIL(calc_min_publish_scn(publish_scns, min_publish_scn))) {
         LOG_WARN("failed to calc min publish scn", K(ret));
       } else if (OB_FAIL(maintain_async_index_refresh_info(
-                     tenant_id_, ls, data_tablet_id, snapshot_scn,
+                     tenant_id_, ls, leader_proposal_id, data_tablet_id, snapshot_scn,
                      min_publish_scn, dep_provider_, refresh_info,
                      OB_ASYNC_INDEX_REFRESH_LOCK_TIMEOUT_US,
                      false /*skip_incr_check*/, &checkpoint_capacity_full))) {
         if (OB_SIZE_OVERFLOW == ret && checkpoint_capacity_full) {
+          ObAsyncIndexReadState state;
           // 维护事务已结束，失败时的输出不可用；重新读取已提交的 checkpoint。
           // 本轮不追加新目标，继续通过后台任务消费已有目标，为后续回收腾出空间。
-          if (OB_FAIL(dep_provider_->get_async_index_refresh_info(
-                  tenant_id_, ls, data_tablet_id, refresh_info))) {
+          if (OB_FAIL(dep_provider_->read_async_index_state_on_leader(
+                  tenant_id_, ls, leader_proposal_id, data_tablet_id,
+                  ObAsyncIndexReadType::CHECKPOINTS, -1 /*transfer_seq*/, state))) {
             LOG_WARN("failed to read committed refresh info after checkpoint capacity limit",
                      K(ret), K(data_tablet_id));
+          } else if (OB_FAIL(refresh_info.assign(state.refresh_info_))) {
+            LOG_WARN("failed to copy committed refresh info", K(ret), K(data_tablet_id));
           } else if (!refresh_info.is_valid() || !refresh_info.is_valid_for_refresh()) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("invalid committed refresh info after checkpoint capacity limit",
@@ -185,6 +192,7 @@ int ObAsyncIndexTrigger::check_and_generate_tasks(
             const common::ObIArray<int64_t> &refresh_snapshots =
                 refresh_info.get_refresh_snapshots();
             decision.index_tablet_id_ = index_tablet_id;
+            decision.leader_proposal_id_ = leader_proposal_id;
             decision.start_refresh_scn_ = publish_scn;
             decision.target_refresh_scn_ = next_target;
             decision.parallelism_ = parallelism;
