@@ -13,6 +13,7 @@
 #include "share/search_index/ob_search_index_config_filter.h"
 #include "share/vector_index/ob_vector_index_util.h"
 #include "share/ob_cluster_version.h"
+#include "sql/das/search/ob_das_msm_runtime_util.h"
 #include "sql/engine/expr/ob_array_expr_utils.h"
 #include "sql/engine/expr/ob_expr_json_func_helper.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
@@ -1201,6 +1202,40 @@ int ObHybridSearchGenerator::build_or_partition_filter(
   return ret;
 }
 
+int ObHybridSearchGenerator::check_should_required_for_partition_pruning(
+    const ObBooleanQueryNode &node,
+    bool &should_required)
+{
+  int ret = OB_SUCCESS;
+  const int64_t should_count = node.should_nodes_.count();
+  int64_t min_should_match = 0;
+  should_required = false;
+  if (0 == should_count) {
+  } else if (node.must_nodes_.empty() && node.filter_nodes_.empty()) {
+    should_required = true;
+  } else if (OB_ISNULL(node.minimum_should_match_)) {
+    should_required = node.min_should_match_ > 0;
+  } else if (node.minimum_should_match_->is_param_expr()) {
+    // Parameterized MSM cannot constrain partitions during plan generation.
+  } else if (ob_is_integer_type(node.minimum_should_match_->get_value().get_type())) {
+    if (OB_FAIL(ObDASMinShouldMatchSpec::int_calc(
+        should_count, node.minimum_should_match_->get_value().get_int(), min_should_match))) {
+      LOG_WARN("failed to calculate integer MSM for partition pruning", K(ret), K(should_count));
+    } else {
+      should_required = min_should_match > 0;
+    }
+  } else if (ob_is_string_type(node.minimum_should_match_->get_value().get_type())) {
+    ObArenaAllocator msm_allocator(ObModIds::OB_SQL_EXPR_CALC, OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+    if (OB_FAIL(ObDASMinShouldMatchSpec::string_calc(
+        msm_allocator, should_count, node.minimum_should_match_->get_value().get_string(), min_should_match))) {
+      LOG_WARN("failed to calculate string MSM for partition pruning", K(ret), K(should_count));
+    } else {
+      should_required = min_should_match > 0;
+    }
+  }
+  return ret;
+}
+
 int ObHybridSearchGenerator::extract_partition_filters_from_tree(
     ObIndexMergeNode *node,
     const ObIArray<uint64_t> &part_col_ids,
@@ -1222,6 +1257,7 @@ int ObHybridSearchGenerator::extract_partition_filters_from_tree(
       }
       case INDEX_MERGE_HYBRID_BOOLEAN_QUERY: {
         ObBooleanQueryNode *bool_node = static_cast<ObBooleanQueryNode*>(node);
+        bool should_required = false;
         for (int64_t i = 0; OB_SUCC(ret) && i < bool_node->must_nodes_.count(); ++i) {
           if (OB_FAIL(SMART_CALL(extract_partition_filters_from_tree(
                   bool_node->must_nodes_.at(i), part_col_ids, partition_filters)))) {
@@ -1234,15 +1270,12 @@ int ObHybridSearchGenerator::extract_partition_filters_from_tree(
             LOG_WARN("failed to extract from filter node", K(ret), K(i));
           }
         }
-        // For should (OR) nodes, the correct partition pruning semantics is:
-        //   partitions(branch1) UNION partitions(branch2) UNION ...
-        // We achieve this by building an OR expression from each branch's
-        // partition filters: (branch1_filters) OR (branch2_filters) OR ...
-        // The optimizer's partition pruning module will then compute the
-        // union of partitions from the OR expression.
-        // If any branch has no partition filter, we cannot prune at all
-        // because that branch could match rows in any partition.
-        if (OB_SUCC(ret) && bool_node->should_nodes_.count() > 0) {
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(check_should_required_for_partition_pruning(*bool_node, should_required))) {
+          LOG_WARN("failed to check should requirement for partition pruning", K(ret));
+        } else if (should_required) {
+          // Required should clauses constrain partitions by the union of their branches.
+          // A branch without partition filters keeps all partitions for the should group.
           ObSEArray<ObRawExpr*, 4> accumulated_filters;
           if (OB_FAIL(SMART_CALL(extract_partition_filters_from_tree(
                   bool_node->should_nodes_.at(0), part_col_ids, accumulated_filters)))) {

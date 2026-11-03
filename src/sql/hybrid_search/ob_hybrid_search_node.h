@@ -367,6 +367,9 @@ private:
       const common::ObIArray<ObRawExpr*> &filters,
       const common::ObIArray<uint64_t> &part_col_ids,
       common::ObIArray<ObRawExpr*> &partition_filters);
+  static int check_should_required_for_partition_pruning(
+      const ObBooleanQueryNode &node,
+      bool &should_required);
   int build_or_partition_filter(
       const common::ObIArray<ObRawExpr*> &left_filters,
       const common::ObIArray<ObRawExpr*> &right_filters,
