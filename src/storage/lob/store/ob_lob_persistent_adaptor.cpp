@@ -1063,6 +1063,7 @@ int ObPersistentLobAdaptor::scan_with_ctx(
     LOG_WARN("get_aux_reader_cache fail", K(ret), K(read_ctx));
   } else if (FALSE_IT(key.ls_id_ = read_ctx.ls_id_)) {
   } else if (FALSE_IT(key.snapshot_ = read_ctx.snapshot_.core_.version_.get_val_for_tx())) {
+  } else if (FALSE_IT(key.fb_snapshot_ = read_ctx.fb_snapshot_)) {
   } else if (FALSE_IT(key.tablet_id_ = read_ctx.tablet_id_)) {
   } else if (FALSE_IT(key.target_ = target)) {
   } else if (OB_FAIL(cache->get(key, reader))) {
