@@ -1929,10 +1929,14 @@ bool ObConfigUseDistinctWithExpansionChecker::check(const ObConfigItem &t) const
 
 bool ObConfigDefaultDeltaFormatChecker::check(const ObConfigItem &t) const
 {
-  int ret = OB_SUCCESS;
-  bool is_valid = true;
-  ObString delta_format(t.str());
-  return ObStoreFormat::is_delta_format_valid(delta_format);
+  const ObString delta_format(t.str());
+  bool is_valid = ObStoreFormat::is_delta_format_valid(delta_format);
+  if (is_valid && 0 == delta_format.case_compare("encoding")) {
+    is_valid = false;
+    OB_LOG_RET(WARN, OB_INVALID_CONFIG, "default_delta_format cannot be set to encoding", K(delta_format));
+    LOG_USER_ERROR(OB_INVALID_CONFIG, "default_delta_format cannot be set to 'encoding'; use 'flat' instead");
+  }
+  return is_valid;
 }
 
 bool ObConfigEvictOldSSTablePolicyChecker::check(const ObConfigItem &t) const
