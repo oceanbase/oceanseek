@@ -616,6 +616,7 @@ const char *ObSysVarFactory::SYS_VAR_NAMES_SORTED_BY_NAME[] = {
   "_set_reverse_dblink_infos",
   "_show_ddl_in_compat_mode",
   "_show_sync_placeholder_table",
+  "_unified_catalog_token",
   "_windowfunc_optimization_settings",
   "activate_all_roles_on_login",
   "ap_query_cost_threshold",
@@ -1469,6 +1470,7 @@ const ObSysVarClassType ObSysVarFactory::SYS_VAR_IDS_SORTED_BY_NAME[] = {
   SYS_VAR__SET_REVERSE_DBLINK_INFOS,
   SYS_VAR__SHOW_DDL_IN_COMPAT_MODE,
   SYS_VAR__SHOW_SYNC_PLACEHOLDER_TABLE,
+  SYS_VAR__UNIFIED_CATALOG_TOKEN,
   SYS_VAR__WINDOWFUNC_OPTIMIZATION_SETTINGS,
   SYS_VAR_ACTIVATE_ALL_ROLES_ON_LOGIN,
   SYS_VAR_AP_QUERY_COST_THRESHOLD,
@@ -3124,7 +3126,8 @@ const char *ObSysVarFactory::SYS_VAR_NAMES_SORTED_BY_ID[] = {
   "ap_query_cost_threshold",
   "ap_query_replica_fallback",
   "_enable_catalog_fusion",
-  "_show_sync_placeholder_table"
+  "_show_sync_placeholder_table",
+  "_unified_catalog_token"
 };
 
 bool ObSysVarFactory::sys_var_name_case_cmp(const char *name1, const ObString &name2)
@@ -4179,6 +4182,7 @@ int ObSysVarFactory::create_all_sys_vars()
         + sizeof(ObSysVarApQueryReplicaFallback)
         + sizeof(ObSysVarEnableCatalogFusion)
         + sizeof(ObSysVarShowSyncPlaceholderTable)
+        + sizeof(ObSysVarUnifiedCatalogToken)
         ;
     void *ptr = NULL;
     if (OB_ISNULL(ptr = allocator_.alloc(total_mem_size))) {
@@ -11835,6 +11839,15 @@ int ObSysVarFactory::create_all_sys_vars()
       } else {
         store_buf_[ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(SYS_VAR__SHOW_SYNC_PLACEHOLDER_TABLE))] = sys_var_ptr;
         ptr = (void *)((char *)ptr + sizeof(ObSysVarShowSyncPlaceholderTable));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarUnifiedCatalogToken())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarUnifiedCatalogToken", K(ret));
+      } else {
+        store_buf_[ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(SYS_VAR__UNIFIED_CATALOG_TOKEN))] = sys_var_ptr;
+        ptr = (void *)((char *)ptr + sizeof(ObSysVarUnifiedCatalogToken));
       }
     }
 
@@ -21194,6 +21207,17 @@ int ObSysVarFactory::create_sys_var(ObIAllocator &allocator_, ObSysVarClassType 
       } else if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarShowSyncPlaceholderTable())) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_ERROR("fail to new ObSysVarShowSyncPlaceholderTable", K(ret));
+      }
+      break;
+    }
+    case SYS_VAR__UNIFIED_CATALOG_TOKEN: {
+      void *ptr = NULL;
+      if (OB_ISNULL(ptr = allocator_.alloc(sizeof(ObSysVarUnifiedCatalogToken)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to alloc memory", K(ret), K(sizeof(ObSysVarUnifiedCatalogToken)));
+      } else if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarUnifiedCatalogToken())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarUnifiedCatalogToken", K(ret));
       }
       break;
     }

@@ -11713,13 +11713,26 @@ static struct VarsInit{
     ObSysVars[849].alias_ = "OB_SV__SHOW_SYNC_PLACEHOLDER_TABLE" ;
     }();
 
+    [&] (){
+      ObSysVars[850].default_value_ = "" ;
+      ObSysVars[850].info_ = "Access token for Unified Catalog requests in the current session" ;
+      ObSysVars[850].name_ = "_unified_catalog_token" ;
+      ObSysVars[850].data_type_ = ObVarcharType ;
+      ObSysVars[850].flags_ = ObSysVarFlag::SESSION_SCOPE | ObSysVarFlag::INVISIBLE | ObSysVarFlag::MYSQL_ONLY ;
+      ObSysVars[850].id_ = SYS_VAR__UNIFIED_CATALOG_TOKEN ;
+      cur_max_var_id = MAX(cur_max_var_id, static_cast<int64_t>(SYS_VAR__UNIFIED_CATALOG_TOKEN)) ;
+      ObSysVarsIdToArrayIdx[SYS_VAR__UNIFIED_CATALOG_TOKEN] = 850 ;
+      ObSysVars[850].base_value_ = "" ;
+    ObSysVars[850].alias_ = "OB_SV__UNIFIED_CATALOG_TOKEN" ;
+    }();
+
     if (cur_max_var_id >= ObSysVarFactory::OB_MAX_SYS_VAR_ID) { 
       HasInvalidSysVar = true;
     }
   }
 }vars_init;
 
-static int64_t var_amount = 850;
+static int64_t var_amount = 851;
 
 int64_t ObSysVariables::get_all_sys_var_count(){ return ObSysVarFactory::ALL_SYS_VARS_COUNT;}
 ObSysVarClassType ObSysVariables::get_sys_var_id(int64_t i){ return ObSysVars[i].id_;}
