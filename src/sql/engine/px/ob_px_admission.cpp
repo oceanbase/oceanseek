@@ -151,7 +151,10 @@ int64_t ObPxAdmission::admit(ObSQLSessionInfo &session, ObExecContext &exec_ctx,
   int64_t start_time_us = ObClockGenerator::getClock();
   bool need_retry = false;
   do {
-    if (OB_FAIL(THIS_WORKER.check_status())) {
+    // 后台基础 Worker 不检查 SQL 会话状态，准入时也必须检查执行上下文。
+    if (OB_FAIL(exec_ctx.check_status())) {
+      LOG_WARN("fail check execution status", K(ret));
+    } else if (OB_FAIL(THIS_WORKER.check_status())) {
       LOG_WARN("fail check query status", K(ret));
     } else if (OB_FAIL(OB_PX_TARGET_MGR.apply_target(tenant_id, worker_map, wait_time_us,
                       session_target, req_cnt, admit_cnt, admission_version))) {
@@ -323,7 +326,9 @@ int ObPxAdmission::enter_query_admission(ObSQLSessionInfo &session,
       }
       int64_t wait_time_us = THIS_WORKER.get_timeout_remain();
       int64_t session_target = INT64_MAX;
-      if (OB_FAIL(get_parallel_session_target(session, minimal_px_worker_count, session_target))) {
+      // 复制失败时保留原始错误，不能用后续成功调用覆盖后继续准入。
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(get_parallel_session_target(session, minimal_px_worker_count, session_target))) {
         LOG_WARN("fail get session target", K(ret));
       } else if (OB_FAIL(THIS_WORKER.check_status())) {
         LOG_WARN("fail check query status", K(ret));

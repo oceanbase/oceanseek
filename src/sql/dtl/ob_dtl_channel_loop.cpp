@@ -137,6 +137,7 @@ int ObDtlChannelLoop::ObDtlChannelLoopProc::process(
   int ret = OB_SUCCESS;
   DISABLE_SQL_MEMLEAK_GUARD;
   ObDtlMsgHeader header;
+  const int64_t message_pos = buffer.pos();
   if (buffer.is_data_msg()) {
     last_msg_type_ = static_cast<int16_t>(ObDtlMsgType::PX_NEW_ROW);
     if (last_msg_type_ >= static_cast<int16_t>(ObDtlMsgType::MAX)) {
@@ -157,13 +158,23 @@ int ObDtlChannelLoop::ObDtlChannelLoopProc::process(
     LOG_TRACE("failed to deserialize msg", K(ret), K(&buffer), K(lbt()));
   } else {
     last_msg_type_ = header.type_;
-    if (proc_map_[header.type_] == nullptr) {
+    ObDtlPacketProcBase *processor = proc_map_[header.type_];
+    if (processor == nullptr) {
       ret = OB_INVALID_ARGUMENT;
       SQL_DTL_LOG(WARN, "channel has received message without processor",
                   K(header), K(ret));
-    } else if (OB_FAIL(proc_map_[header.type_]->process(buffer, transferred))) {
-      LOG_WARN("process message in channel fail",
-              K(header), K(ret));
+    } else {
+      // 消息头已经消费，消息体解码失败时统一回退到消息头起点。
+      processor->set_process_stage(ObDtlPacketProcBase::ProcessStage::DECODE);
+      if (OB_FAIL(processor->process(buffer, transferred))) {
+        const int process_stage = static_cast<int>(processor->get_process_stage());
+        if (OB_ITER_END != ret && !transferred
+            && processor->get_process_stage() == ObDtlPacketProcBase::ProcessStage::DECODE) {
+          buffer.pos() = message_pos;
+        }
+        LOG_WARN("process message in channel fail",
+                 K(header), K(ret), K(process_stage), K(message_pos), "pos", buffer.pos());
+      }
     }
   }
   return ret;
