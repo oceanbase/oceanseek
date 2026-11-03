@@ -14951,8 +14951,7 @@ int ObDDLResolver::resolve_search_index_constraint(
          (index_keyname_value == static_cast<int64_t>(INDEX_KEYNAME::SEARCH_KEY)
           || index_keyname_value == static_cast<int64_t>(INDEX_KEYNAME::ASYNC_SEARCH_KEY));
     if (is_search_index
-        && OB_UNLIKELY(column_schema.is_virtual_generated_column()
-                       || column_schema.is_stored_generated_column())) {
+        && OB_UNLIKELY(column_schema.is_virtual_generated_column())) {
       ret = OB_NOT_SUPPORTED;
       LOG_USER_ERROR(OB_NOT_SUPPORTED, "search index on generated column is");
       LOG_WARN("search index on generated column is not supported", K(ret), K(column_schema));

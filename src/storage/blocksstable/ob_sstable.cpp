@@ -14,6 +14,7 @@
 #include "storage/access/ob_sstable_row_getter.h"
 #include "storage/access/ob_sstable_row_multi_getter.h"
 #include "storage/blocksstable/ob_shared_macro_block_manager.h"
+#include "storage/blocksstable/async_index/ob_inv_sstable.h"
 #include "storage/blocksstable/index_block/ob_sstable_index_scanner.h"
 #include "storage/ddl/ob_tablet_ddl_kv.h"
 #include "storage/async_index/ob_async_index_define.h"
@@ -1409,6 +1410,15 @@ int ObSSTable::deserialize(common::ObArenaAllocator &allocator,
     LOG_WARN("argument is invalid", K(ret), KP(buf), K(data_len));
   } else if (OB_FAIL(ObITable::deserialize(buf, data_len, pos))) {
     LOG_WARN("failed to deserialize ObITable", K(ret), K(data_len), K(pos));
+  } else if (OB_UNLIKELY(
+      (is_co_sstable() && typeid(*this) != typeid(ObCOSSTableV2))
+      || (is_inv_sstable() && typeid(*this) != typeid(ObInvSSTable)))) {
+    ret = OB_ERR_UNEXPECTED;
+    const char *expected_object_type = is_co_sstable() ? "ObCOSSTableV2"
+        : "ObInvSSTable";
+    LOG_WARN("sstable type does not match object type", K(ret), K_(key),
+        "table_type", ObITable::get_table_type_name(get_table_type()),
+        K(expected_object_type), "actual_object_type", typeid(*this).name());
   } else {
     // TODO: delete temporary compat here
     int64_t compat_temp_pos = pos;

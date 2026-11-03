@@ -134,7 +134,8 @@ int ObAsyncIndexMergePolicyHelper::collect_merge_infos(
     const ObSSTableArray &major_sstables = table_store->get_major_sstables();
     const ObSSTableArray &inc_major_sstables = table_store->get_inc_major_sstables();
     ObSSTable *last_major = static_cast<ObSSTable *>(major_sstables.get_boundary_table(true/*last*/));
-    if (OB_NOT_NULL(last_major)) {
+    if (OB_NOT_NULL(last_major)
+        && last_major->get_snapshot_version() <= schedule_snapshot_version) {
       if (OB_FAIL(push_sstable_merge_info_(last_major, all_merge_infos))) {
         LOG_WARN("failed to push back major merge info", KR(ret), KPC(last_major));
       }
@@ -200,8 +201,9 @@ int ObAsyncIndexMergePolicyHelper::collect_merge_infos(
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < all_merge_infos.count();) {
       const ObAsyncIndexSSTableMergeInfo &candidate = all_merge_infos.at(i);
-      if (candidate.end_snapshot_version_ > schedule_snapshot_version) {
-        LOG_INFO("skip range beyond read snapshot", K(i), K(candidate), K(schedule_snapshot_version), K(lbt()));
+      // Keep crossing ranges until alignment so they cannot be mistaken for empty intervals.
+      if (candidate.start_snapshot_version_ >= schedule_snapshot_version) {
+        LOG_DEBUG("skip range beyond schedule snapshot", K(i), K(candidate), K(schedule_snapshot_version));
         ++i;
       } else if (OB_FAIL(merge_infos.push_back(candidate))) {
         LOG_WARN("failed to push queryable range", KR(ret), K(i), K(candidate));
@@ -225,24 +227,43 @@ int ObAsyncIndexMergePolicyHelper::get_inc_major_sstables(
     ObGetMergeTablesResult &result)
 {
   int ret = OB_SUCCESS;
-  const bool is_inverted_index = tablet.is_async_inverted_storage_index();
-  const int64_t start_idx = result.handle_.get_count();
   ObTabletMemberWrapper<ObTabletTableStore> table_store_wrapper;
   const ObTabletTableStore *table_store = nullptr;
-  ObSEArray<ObITable *, 16> inc_major_tables;
-  bool has_aggregated_table_key_range = false;
-  bool has_aggregated_rec_scn = !result.handle_.empty();
-  if (OB_UNLIKELY(snapshot <= 0)) {
+  if (OB_UNLIKELY(snapshot <= 0 || last_major_snapshot < 0)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid snapshot", KR(ret), K(snapshot));
+    LOG_WARN("invalid snapshot", KR(ret), K(snapshot), K(last_major_snapshot));
   } else if (OB_FAIL(tablet.fetch_table_store(table_store_wrapper))) {
     LOG_WARN("failed to fetch table store", KR(ret), K(tablet));
   } else if (OB_ISNULL(table_store = table_store_wrapper.get_member())
       || OB_UNLIKELY(!table_store->is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid table store", KR(ret), K(tablet));
-  } else if (OB_FAIL(get_all_tables_(table_store->get_inc_major_sstables(), inc_major_tables))) {
-    LOG_WARN("failed to get inc major tables", KR(ret), K(tablet));
+  } else if (OB_FAIL(select_inc_major_sstables(ls, table_store->get_inc_major_sstables(),
+      table_store_wrapper.get_meta_handle(), snapshot, last_major_snapshot, result))) {
+    LOG_WARN("failed to select async index inc major sstables", KR(ret), K(tablet), K(snapshot));
+  }
+  return ret;
+}
+
+int ObAsyncIndexMergePolicyHelper::select_inc_major_sstables(
+    ObLS &ls,
+    const ObSSTableArray &inc_major_sstables,
+    const ObStorageMetaHandle &meta_handle,
+    const int64_t snapshot,
+    const int64_t last_major_snapshot,
+    ObGetMergeTablesResult &result)
+{
+  int ret = OB_SUCCESS;
+  const int64_t start_idx = result.handle_.get_count();
+  ObSEArray<ObITable *, 16> inc_major_tables;
+  ObSEArray<ObNewVersionRange, 8> crossing_ranges;
+  bool has_aggregated_table_key_range = false;
+  bool has_aggregated_rec_scn = !result.handle_.empty();
+  if (OB_UNLIKELY(snapshot <= 0 || last_major_snapshot < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid snapshot", KR(ret), K(snapshot), K(last_major_snapshot));
+  } else if (OB_FAIL(get_all_tables_(inc_major_sstables, inc_major_tables))) {
+    LOG_WARN("failed to get inc major tables", KR(ret));
   } else if (inc_major_tables.count() > 0) {
     lib::ob_sort(inc_major_tables.begin(), inc_major_tables.end(), IncMajorTableCmp());
     for (int64_t i = 0; OB_SUCC(ret) && i < inc_major_tables.count();) {
@@ -264,7 +285,14 @@ int ObAsyncIndexMergePolicyHelper::get_inc_major_sstables(
         ++i;
       } else if (version_range.base_version_ >= snapshot) {
         ++i;
-      } else if (OB_FAIL(result.handle_.add_sstable(sstable, table_store_wrapper.get_meta_handle()))) {
+      } else if (version_range.base_version_ < last_major_snapshot
+          || version_range.snapshot_version_ > snapshot) {
+        if (OB_FAIL(crossing_ranges.push_back(version_range))) {
+          LOG_WARN("failed to save crossing range", KR(ret), K(version_range));
+        } else {
+          ++i;
+        }
+      } else if (OB_FAIL(result.handle_.add_sstable(sstable, meta_handle))) {
         LOG_WARN("failed to add async index inc major sstable", KR(ret), K(i), K(version_range));
       } else {
         if (!has_aggregated_table_key_range) {
@@ -302,8 +330,29 @@ int ObAsyncIndexMergePolicyHelper::get_inc_major_sstables(
       }
     }
   }
-  if (OB_SUCC(ret) && is_inverted_index) {
-    ret = check_inc_major_sstables_(result.handle_, start_idx, last_major_snapshot, snapshot);
+  if (OB_SUCC(ret)) {
+    ret = check_inc_major_sstables_(result.handle_, start_idx, last_major_snapshot);
+  }
+  // A coarse table crossing a merge boundary can only be replaced by complete
+  // retained historical inputs, never by an inferred empty interval.
+  for (int64_t i = 0; OB_SUCC(ret) && i < crossing_ranges.count(); ++i) {
+    const ObNewVersionRange &range = crossing_ranges.at(i);
+    int64_t covered_end = MAX(last_major_snapshot, range.base_version_);
+    const int64_t required_end = MIN(snapshot, range.snapshot_version_);
+    for (int64_t j = start_idx; OB_SUCC(ret) && covered_end < required_end
+        && j < result.handle_.get_count(); ++j) {
+      ObNewVersionRange selected;
+      const ObSSTable *sstable = static_cast<const ObSSTable *>(result.handle_.get_table(j));
+      if (OB_FAIL(sstable->get_async_index_version_range(selected))) {
+        LOG_WARN("failed to get selected version range", KR(ret));
+      } else if (selected.base_version_ <= covered_end && selected.snapshot_version_ > covered_end) {
+        covered_end = selected.snapshot_version_;
+      }
+    }
+    if (OB_SUCC(ret) && covered_end < required_end) {
+      ret = OB_NO_NEED_MERGE;
+      LOG_INFO("historical inputs cannot replace crossing table", K(range), K(snapshot));
+    }
   }
   return ret;
 }
@@ -311,30 +360,15 @@ int ObAsyncIndexMergePolicyHelper::get_inc_major_sstables(
 int ObAsyncIndexMergePolicyHelper::check_inc_major_sstables_(
     const ObTablesHandleArray &tables_handle,
     const int64_t start_idx,
-    const int64_t last_major_snapshot,
-    const int64_t merge_snapshot)
+    const int64_t last_major_snapshot)
 {
   int ret = OB_SUCCESS;
   int64_t previous_snapshot = last_major_snapshot;
   const ObITable *table = nullptr;
   ObNewVersionRange version_range;
-  // The old TableKey range represented continuous version coverage, so the old
-  // policy required adjacent IncMajor ranges to cover [last_major_snapshot,
-  // merge_snapshot] exactly. After TableKey changes to describe the range that
-  // actually contains data, a missing range may simply mean that the interval
-  // has no data. Therefore range continuity is no longer a validity condition;
-  // prefix, middle, and suffix gaps, as well as no selected IncMajor, are legal.
-  //
-  // IncMajorTableCmp orders selected inputs by logical base version. For the
-  // resulting sequence, the current check enforces only two invariants:
-  //   1. base_version >= previous_snapshot, so an IncMajor does not overlap the
-  //      base Major or the previously selected IncMajor;
-  //   2. snapshot_version <= merge_snapshot, so no selected input crosses this
-  //      round's merge target.
-  // merge_snapshot is only the current merge target, not an MDS publish
-  // version. This helper does not prove that all data up to the target has been
-  // published; that will be determined from the SSTable data range and MDS
-  // publish version after the latter is implemented.
+  // The selector handles merge boundaries. Selected IncMajor ranges must be valid
+  // and must not overlap the base Major or the previous selected range.
+  // Empty refreshes permit prefix, middle and suffix gaps, or no IncMajor input.
   for (int64_t i = start_idx; OB_SUCC(ret) && i < tables_handle.get_count(); ++i) {
     version_range.reset();
     if (OB_ISNULL(table = tables_handle.get_table(i))
@@ -344,16 +378,15 @@ int ObAsyncIndexMergePolicyHelper::check_inc_major_sstables_(
     } else if (OB_FAIL(static_cast<const ObSSTable *>(table)->get_async_index_version_range(
         version_range))) {
       LOG_WARN("failed to get async index sstable version range", KR(ret), K(i), KPC(table));
-    } else if (version_range.base_version_ < previous_snapshot
-        || version_range.snapshot_version_ > merge_snapshot) {
+    } else if (version_range.base_version_ < previous_snapshot) {
       ret = OB_NO_NEED_MERGE;
     } else {
       previous_snapshot = version_range.snapshot_version_;
     }
   }
   if (OB_NO_NEED_MERGE == ret) {
-    LOG_INFO("async index input range overlaps or exceeds merge snapshot, skip this round",
-        KR(ret), K(last_major_snapshot), K(merge_snapshot), K(previous_snapshot),
+    LOG_INFO("selected async index ranges overlap, skip this round",
+        KR(ret), K(last_major_snapshot), K(previous_snapshot),
         K(version_range), KPC(table));
   }
   return ret;
@@ -414,6 +447,67 @@ int ObAsyncIndexMergePolicyHelper::calc_delete_percentage(
   return ret;
 }
 
+int ObAsyncIndexMergePolicyHelper::align_merge_infos(
+    const ObIArray<ObSEArray<ObAsyncIndexSSTableMergeInfo, 8>> &all_merge_infos,
+    int64_t &schedule_snapshot_version,
+    ObIArray<ObAsyncIndexSSTableMergeInfo> &merge_infos)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObAsyncIndexSSTableMergeInfo, 16> sorted_infos;
+  merge_infos.reuse();
+  if (schedule_snapshot_version <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid schedule snapshot", KR(ret), K(schedule_snapshot_version));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < all_merge_infos.count(); ++i) {
+    for (int64_t j = 0; OB_SUCC(ret) && j < all_merge_infos.at(i).count(); ++j) {
+      const ObAsyncIndexSSTableMergeInfo &info = all_merge_infos.at(i).at(j);
+      if (!info.is_valid() || (j > 0
+          && info.start_snapshot_version_ < all_merge_infos.at(i).at(j - 1).end_snapshot_version_)) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid async index merge input", KR(ret), K(i), K(j), K(info));
+      } else if (OB_FAIL(sorted_infos.push_back(info))) {
+        LOG_WARN("failed to collect async index merge input", KR(ret));
+      }
+    }
+  }
+  struct MergeInfoCompare {
+    bool operator()(const ObAsyncIndexSSTableMergeInfo &left,
+                    const ObAsyncIndexSSTableMergeInfo &right) const
+    {
+      return left.start_snapshot_version_ != right.start_snapshot_version_
+          ? left.start_snapshot_version_ < right.start_snapshot_version_
+          : left.end_snapshot_version_ > right.end_snapshot_version_;
+    }
+  };
+  if (OB_SUCC(ret) && !sorted_infos.empty()) {
+    lib::ob_sort(sorted_infos.begin(), sorted_infos.end(), MergeInfoCompare());
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < sorted_infos.count(); ++i) {
+    const ObAsyncIndexSSTableMergeInfo &info = sorted_infos.at(i);
+    if (merge_infos.empty()
+        || info.start_snapshot_version_ >= merge_infos.at(merge_infos.count() - 1).end_snapshot_version_) {
+      if (OB_FAIL(merge_infos.push_back(info))) {
+        LOG_WARN("failed to append aligned merge input", KR(ret));
+      }
+    } else {
+      // An overlap joins a group across indexes. Its boundaries never cut a real
+      // SSTable; absent inputs in the other indexes add no artificial segment.
+      ObAsyncIndexSSTableMergeInfo &last = merge_infos.at(merge_infos.count() - 1);
+      last.end_snapshot_version_ = MAX(last.end_snapshot_version_, info.end_snapshot_version_);
+      last.seg_size_ += info.seg_size_;
+    }
+  }
+  // Trim only after alignment: one crossing SSTable can overlap inputs from other indexes.
+  while (OB_SUCC(ret) && !merge_infos.empty()
+      && merge_infos.at(merge_infos.count() - 1).end_snapshot_version_ > schedule_snapshot_version) {
+    schedule_snapshot_version = MIN(schedule_snapshot_version,
+        merge_infos.at(merge_infos.count() - 1).start_snapshot_version_);
+    merge_infos.pop_back();
+  }
+  return ret;
+}
+
 int ObAsyncIndexMergePolicyHelper::calc_schedule_snapshot_version(
     ObLS &ls,
     const ObIArray<ObTabletID> &index_tablet_ids,
@@ -430,7 +524,7 @@ int ObAsyncIndexMergePolicyHelper::calc_schedule_snapshot_version(
     } else if (OB_UNLIKELY(!index_handle.is_valid() || OB_ISNULL(index_handle.get_obj()))) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid index tablet handle", KR(ret), K(i), K(index_tablet_id));
-    } else if (OB_FAIL(index_handle.get_obj()->get_async_index_max_published_version(max_published_version))) {
+    } else if (OB_FAIL(index_handle.get_obj()->get_latest_async_index_published_version(max_published_version))) {
       LOG_WARN("failed to calc eligible max scn", KR(ret), K(i), K(index_tablet_id));
     } else if (max_published_version <= 0) {
       ret = OB_NO_NEED_MERGE;
@@ -716,29 +810,11 @@ int ObAsyncIndexMergePolicy::choose_async_index_merge_range(
     } else if (all_merge_infos.count() <= 0) {
       ret = OB_NO_NEED_MERGE;
       LOG_INFO("no merge info, skip merge", KR(ret));
-    } else if (OB_FAIL(final_merge_infos.assign(all_merge_infos.at(0)))) {
-      LOG_WARN("failed to copy merge infos", KR(ret), K(all_merge_infos.at(0)));
+    } else if (OB_FAIL(ObAsyncIndexMergePolicyHelper::align_merge_infos(
+        all_merge_infos, schedule_snapshot_version, final_merge_infos))) {
+      LOG_WARN("failed to align sparse async index merge inputs", KR(ret));
     } else {
       final_merge_info_cnt = final_merge_infos.count();
-      for (int64_t i = 1; OB_SUCC(ret) && i < all_merge_infos.count(); ++i) {
-        const int64_t curr_cnt = all_merge_infos.at(i).count();
-        if (curr_cnt != final_merge_info_cnt) {
-          ret = OB_NO_NEED_MERGE;
-          LOG_INFO("index merge info count is not aligned, skip merge", KR(ret), K(i), K(final_merge_info_cnt), K(curr_cnt), K(index_tablet_ids.at(i)));
-        } else {
-          for (int64_t j = 0; OB_SUCC(ret) && j < curr_cnt; ++j) {
-            const ObAsyncIndexSSTableMergeInfo &curr_merge_info = all_merge_infos.at(i).at(j);
-            ObAsyncIndexSSTableMergeInfo &final_merge_info = final_merge_infos.at(j);
-            if (curr_merge_info.start_snapshot_version_ != final_merge_info.start_snapshot_version_
-                || curr_merge_info.end_snapshot_version_ != final_merge_info.end_snapshot_version_) {
-              ret = OB_ERR_UNEXPECTED;
-              LOG_WARN("merge info mismatch", KR(ret), K(i), K(j), K(curr_merge_info), K(final_merge_info));
-            } else {
-              final_merge_info.seg_size_ += curr_merge_info.seg_size_;
-            }
-          }
-        }
-      }
     }
     if (OB_FAIL(ret)) {
     } else if (ERRSIM_FORCE_ASYNC_INDEX_INC_MERGE != OB_SUCCESS && final_merge_info_cnt > 2) {

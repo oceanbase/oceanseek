@@ -85,7 +85,7 @@ int ObAsyncIndexTrigger::check_and_generate_tasks(
     } else if (index_tablet_ids.empty()) {
       // no index tablets on this data table; nothing to do
     } else if (OB_FAIL(dep_provider_->get_publish_scns(
-            tenant_id_, ls, index_tablet_ids, publish_scns))) {
+            ls, index_tablet_ids, publish_scns))) {
       LOG_WARN("failed to get publish scns", K(ret), K(data_tablet_id));
     } else if (OB_UNLIKELY(index_tablet_ids.count() != publish_scns.count())) {
       ret = OB_ERR_UNEXPECTED;

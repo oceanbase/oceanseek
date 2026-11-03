@@ -79,6 +79,25 @@ ObServerReloadConfig::~ObServerReloadConfig()
 
 }
 
+int ObServerReloadConfig::reload_cluster_config_(bool is_arbitration_mode, int previous_ret)
+{
+  int ret = previous_ret;
+  int tmp_ret = OB_SUCCESS;
+  if (!is_arbitration_mode) {
+    if (GCONF.cluster_id.get_value() > 0) {
+      obrpc::ObRpcNetHandler::CLUSTER_ID = GCONF.cluster_id.get_value();
+      LOG_INFO("set CLUSTER_ID for rpc", "cluster_id", GCONF.cluster_id.get_value());
+    }
+    // Cluster identity must still refresh when an unrelated reload has failed.
+    if (OB_TMP_FAIL(set_cluster_name_hash(GCONF.cluster.str()))) {
+      if (OB_SUCC(ret)) { ret = tmp_ret; }
+      LOG_WARN("failed to set_cluster_name_hash", KR(tmp_ret), "cluster_name", GCONF.cluster.str(),
+               "cluster_name_len", strlen(GCONF.cluster.str()));
+    }
+  }
+  return ret;
+}
+
 int ObServerReloadConfig::operator()()
 {
   int tmp_ret = OB_SUCCESS;
@@ -90,6 +109,7 @@ int ObServerReloadConfig::operator()()
     LOG_WARN("gctx not init", "gctx inited", gctx_.is_inited(), K(tmp_ret));
   } else {
     if (OB_TMP_FAIL(ObReloadConfig::operator()())) {
+      if (OB_SUCC(ret)) { ret = tmp_ret; }
       LOG_WARN("ObReloadConfig operator() failed", K(tmp_ret));
     }
     if (OB_TMP_FAIL(gctx_.root_service_->reload_config())) {
@@ -153,6 +173,7 @@ int ObServerReloadConfig::operator()()
     OB_LOGGER.set_info_as_wdiag(GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_1_0_0);
     // reload log config again after get MIN_CLUSTER_VERSION
     if (OB_TMP_FAIL(ObReloadConfig::operator()())) {
+      if (OB_SUCC(ret)) { ret = tmp_ret; }
       LOG_WARN("ObReloadConfig operator() failed", K(tmp_ret));
     }
     const int64_t reserved_memory = GCONF.cache_wash_threshold;
@@ -212,18 +233,7 @@ int ObServerReloadConfig::operator()()
   }
   lib::AChunkMgr::instance().set_max_chunk_cache_size(cache_size, use_large_chunk_cache);
 
-  if (!is_arbitration_mode) {
-    // Refresh cluster_id, cluster_name_hash for non arbitration mode
-    if (GCONF.cluster_id.get_value() > 0) {
-      obrpc::ObRpcNetHandler::CLUSTER_ID = GCONF.cluster_id.get_value();
-      LOG_INFO("set CLUSTER_ID for rpc", "cluster_id", GCONF.cluster_id.get_value());
-    }
-
-    if (FAILEDx(set_cluster_name_hash(GCONF.cluster.str()))) {
-      LOG_WARN("failed to set_cluster_name_hash", KR(ret), "cluster_name", GCONF.cluster.str(),
-                                                "cluster_name_len", strlen(GCONF.cluster.str()));
-    }
-  }
+  ret = reload_cluster_config_(is_arbitration_mode, ret);
 
   // reset mem leak
   {

@@ -43,6 +43,40 @@ using namespace common;
 using namespace share;
 using namespace share::schema;
 
+int get_async_index_refresh_tablet(
+    ObLS &ls, const ObTabletID &tablet_id, ObTabletHandle &handle,
+    const int64_t transfer_seq)
+{
+  int ret = OB_SUCCESS;
+  ObTabletCreateDeleteMdsUserData data;
+  mds::MdsWriter writer;
+  mds::TwoPhaseCommitState trans_state;
+  SCN trans_version;
+  if (OB_FAIL(ls.get_tablet(tablet_id, handle, 0, ObMDSGetTabletMode::READ_WITHOUT_CHECK))) {
+    LOG_WARN("failed to get tablet for async index refresh", K(ret), K(tablet_id));
+  } else if (OB_ISNULL(handle.get_obj())) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (handle.get_obj()->is_empty_shell()) {
+    ret = OB_TABLET_NOT_EXIST;
+  } else if (handle.get_obj()->get_tablet_meta().ls_id_ != ls.get_ls_id()
+      || (transfer_seq >= 0 && handle.get_obj()->get_transfer_seq() != transfer_seq)) {
+    ret = OB_TABLET_TRANSFER_SEQ_NOT_MATCH;
+    LOG_INFO("async index refresh tablet location changed", K(ret), K(tablet_id),
+             "ls_id", ls.get_ls_id(), K(transfer_seq), "tablet_meta", handle.get_obj()->get_tablet_meta());
+  } else if (OB_FAIL(handle.get_obj()->get_latest_tablet_status(data, writer, trans_state, trans_version))) {
+    LOG_WARN("failed to get tablet status for async index refresh", K(ret), K(tablet_id));
+  } else if (mds::TwoPhaseCommitState::ON_COMMIT != trans_state
+      || (ObTabletStatus::NORMAL != data.tablet_status_
+          && ObTabletStatus::SPLIT_DST != data.tablet_status_
+          && ObTabletStatus::FORK_DST != data.tablet_status_)) {
+    // A source tablet may remain locally accessible after transfer out.
+    ret = OB_EAGAIN;
+    LOG_INFO("tablet is not ready for async index refresh", K(ret), K(tablet_id),
+             "ls_id", ls.get_ls_id(), K(data), K(trans_state));
+  }
+  return ret;
+}
+
 // Acquire an exclusive async-refresh fence for every index tablet involved in
 // DROP, preventing new refresh tasks from entering the normal table-lock path.
 int lock_async_index_refresh_for_drop(
@@ -137,7 +171,7 @@ int get_min_index_published_scn(
     LOG_WARN("[ASYNC_INDEX] invalid argument", K(ret), K(tenant_id), KP(ls), KP(dep_provider));
   } else if (index_tablet_ids.empty()) {
     // No sibling indexes on this partition; keep the conservative base_scn.
-  } else if (OB_FAIL(dep_provider->get_publish_scns(tenant_id, ls, index_tablet_ids, publish_scns))) {
+  } else if (OB_FAIL(dep_provider->get_publish_scns(ls, index_tablet_ids, publish_scns))) {
     LOG_WARN("[ASYNC_INDEX] fail to get index publish scns", K(ret), K(index_tablet_ids));
   } else if (OB_UNLIKELY(publish_scns.count() != index_tablet_ids.count())) {
     ret = OB_ERR_UNEXPECTED;
@@ -418,36 +452,29 @@ int maintain_async_index_refresh_info(
 // ============================================================================
 
 int ObAsyncIndexDepProvider::get_publish_scns(
-    const uint64_t tenant_id,
     ObLS *ls,
     const ObIArray<ObTabletID> &index_tablet_ids,
     ObIArray<SCN> &publish_scns)
 {
-  UNUSED(tenant_id);
   int ret = OB_SUCCESS;
   publish_scns.reset();
   if (OB_ISNULL(ls)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("ls is null", K(ret));
   } else {
-    // The publish scn of an index tablet is the max published version: the
-    // snapshot up to which the index data has been materialized (the largest
-    // snapshot version across the index tablet's major / inc-major sstables).
-    // Read it from each index tablet via get_async_index_max_published_version,
-    // which returns a plain int64_t snapshot version; bridge it back into a
-    // share::SCN through the canonical async_index_snapshot_to_scn helper.
+    // Empty refreshes advance the committed logical watermark without adding
+    // a physical table. Use that watermark when choosing the next refresh start.
     for (int64_t i = 0; OB_SUCC(ret) && i < index_tablet_ids.count(); ++i) {
       const ObTabletID &index_tablet_id = index_tablet_ids.at(i);
       ObTabletHandle tablet_handle;
       int64_t published_version = 0;
-      if (OB_FAIL(ls->get_tablet(index_tablet_id, tablet_handle,
-                                 0 /*timeout_us*/,
-                                 ObMDSGetTabletMode::READ_WITHOUT_CHECK))) {
+      if (OB_FAIL(get_async_index_refresh_tablet(
+              *ls, index_tablet_id, tablet_handle))) {
         LOG_WARN("failed to get index tablet", K(ret), K(index_tablet_id));
       } else if (OB_ISNULL(tablet_handle.get_obj())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("tablet is null", K(ret), K(index_tablet_id));
-      } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_max_published_version(
+      } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_refresh_start_version(
                      published_version))) {
         LOG_WARN("failed to get index max published version", K(ret), K(index_tablet_id));
       } else if (OB_FAIL(publish_scns.push_back(
@@ -904,6 +931,9 @@ int ObAsyncIndexDepProvider::get_async_table_refresh_intervals(
         continue;
       } else if (OB_ISNULL(data_table_schema)) {
         LOG_WARN("data table schema is null, skip", K(tenant_id), K(data_table_id));
+        continue;
+      } else if (data_table_schema->is_user_hidden_table()) {
+        // Only the owning offline DDL may prepare this table before swap.
         continue;
       } else if (data_table_schema->is_ctas_tmp_table()) {
         // A target sampled before the final CTAS DDL can fall below its read
@@ -1509,7 +1539,7 @@ int ObAsyncIndexDepProvider::get_partition_min_async_published_scn(
   }
   if (OB_SUCC(ret) && has_async_index
       && OB_FAIL(get_publish_scns(
-          tenant_id, ls, index_tablet_ids, publish_scns))) {
+          ls, index_tablet_ids, publish_scns))) {
     LOG_WARN("failed to get async index publish scns", K(ret),
              K(data_table_id), K(data_tablet_id), K(index_tablet_ids));
   } else if (OB_SUCC(ret) && has_async_index

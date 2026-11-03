@@ -2193,6 +2193,12 @@ int check_will_be_having_domain_index_operation(
     const ObArray<ObTabletID> &tablet_ids,
     const int64_t schema_version,
     ObDDLSQLTransaction &trans);
+  int build_write_defense_for_table_(
+      const ObTableSchema &table_schema,
+      const int64_t new_data_table_schema_version,
+      const ObIArray<std::pair<uint64_t, int64_t>> &aux_schema_versions,
+      ObSchemaGetterGuard &schema_guard,
+      ObDDLSQLTransaction &trans);
   int build_rw_defense_for_table_(
       const uint64_t tenant_data_version,
       const ObTableSchema &table_schema,

@@ -59,10 +59,14 @@ public:
   static bool is_pending_refresh_snapshot(const int64_t snapshot) { return PENDING_REFRESH_SNAPSHOT == snapshot; }
   static bool is_committed_refresh_snapshot(const int64_t snapshot) { return snapshot > 0; }
   void on_commit(const share::SCN &commit_version, const share::SCN &commit_scn);
+  // Reserve the data-table checkpoints [R, pending-D] for the swap transaction.
+  int init_offline_refresh_snapshots(const int64_t base_snapshot);
   TO_STRING_KV(K_(refresh_snapshot_versions), K_(has_async_index), K_(published_version));
 
 private:
-  // ordered, strictly monotonically increasing, capped at MAX_INC_MAJOR_SSTABLE_CNT
+  // Committed entries are positive and strictly increasing. An offline swap
+  // reserves [R, pending-D] before commit; readers must not consume that value.
+  // Capped at MAX_INC_MAJOR_SSTABLE_CNT.
   ObSEArray<int64_t, common::MAX_INC_MAJOR_SSTABLE_CNT> refresh_snapshot_versions_;
   bool has_async_index_;
   int64_t published_version_;

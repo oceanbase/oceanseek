@@ -19,7 +19,8 @@ namespace storage
 namespace mds
 {
 
-// MdsCtx for the truncate_info / ttl_filter_info MDS streams.
+// MdsCtx for truncate, TTL and async-index cache notifications.
+// Async-index writes retain the committed cache; commit invalidates it, abort does not.
 //
 // Carries (ls_id, target, tablet_ids) so that on commit/abort we can find the
 // owning tablets and let their ObMdsInfoCache release the in-flight slot

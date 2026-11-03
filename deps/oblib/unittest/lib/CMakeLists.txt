@@ -78,6 +78,9 @@ oblib_addtest(net/test_ob_net_util.cpp)
 #oblib_addtest(oblog/test_base_log_buffer.cpp)
 oblib_addtest(oblog/test_base_log_writer.cpp)
 oblib_addtest(oblog/test_ob_log_compressor.cpp)
+# Fault injection is confined to this test executable.
+target_link_libraries(test_ob_log_compressor PRIVATE
+  "-Wl,--wrap=fopen,--wrap=fclose,--wrap=fwrite,--wrap=stat,--wrap=lstat,--wrap=__xstat,--wrap=__lxstat,--wrap=__fxstatat,--wrap=opendir,--wrap=readdir,--wrap=unlinkat,--wrap=fstatat,--wrap=statfs,--wrap=read,--wrap=write,--wrap=fsync,--wrap=close,--wrap=link,--wrap=unlink")
 oblib_addtest(oblog/test_ob_log_dba.cpp)
 oblib_addtest(oblog/test_ob_log_obj.cpp)
 oblib_addtest(oblog/test_ob_log_performance.cpp)

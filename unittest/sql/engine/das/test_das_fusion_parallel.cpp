@@ -308,8 +308,6 @@ static int fetch_filter_provider_test_partition(
       if (OB_ISNULL(storage_ctx.index_tablet_handles_.alloc_place_holder())) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
       } else if (OB_FAIL(storage_ctx.index_version_ranges_.push_back(ranges))) {
-      } else if (OB_FAIL(storage_ctx.index_physical_published_versions_.push_back(
-                     published_version))) {
       } else if (OB_FAIL(storage_ctx.index_published_versions_.push_back(
                      published_version))) {
       }

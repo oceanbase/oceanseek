@@ -41,19 +41,19 @@ TEST(TestVectorIndexUtil, hnsw_build_parameter_physical_degree_boundaries)
 TEST(TestVectorIndexUtil, alter_validates_physical_degree)
 {
   const char *invalid_params[] = {
-      "TYPE=HNSW,M=10,EF_CONSTRUCTION=15,SUPPORT_DUPLICATE=TRUE",
-      "TYPE=HNSW_SQ,M=10,EF_CONSTRUCTION=15,SUPPORT_DUPLICATE=FALSE",
-      "TYPE=HNSW_BQ,M=10,EF_CONSTRUCTION=15,SUPPORT_DUPLICATE=FALSE"};
+      "TYPE=HNSW,M=10,EF_CONSTRUCTION=15,DUPLICATE_GROUP=TRUE",
+      "TYPE=HNSW_SQ,M=10,EF_CONSTRUCTION=15,DUPLICATE_GROUP=FALSE",
+      "TYPE=HNSW_BQ,M=10,EF_CONSTRUCTION=15,DUPLICATE_GROUP=FALSE"};
   for (const char *params : invalid_params) {
     SCOPED_TRACE(params);
     EXPECT_EQ(OB_NOT_SUPPORTED, ObVectorIndexUtil::validate_alter_hnsw_index_params(
         common::ObString::make_string(params), false));
   }
   EXPECT_EQ(OB_SUCCESS, ObVectorIndexUtil::validate_alter_hnsw_index_params(
-      common::ObString::make_string("TYPE=HNSW,M=10,EF_CONSTRUCTION=15,SUPPORT_DUPLICATE=FALSE"),
+      common::ObString::make_string("TYPE=HNSW,M=10,EF_CONSTRUCTION=15,DUPLICATE_GROUP=FALSE"),
       false));
   EXPECT_EQ(OB_SUCCESS, ObVectorIndexUtil::validate_alter_hnsw_index_params(
-      common::ObString::make_string("TYPE=HNSW,M=10,EF_CONSTRUCTION=20,SUPPORT_DUPLICATE=TRUE"),
+      common::ObString::make_string("TYPE=HNSW,M=10,EF_CONSTRUCTION=20,DUPLICATE_GROUP=TRUE"),
       false));
 }
 
@@ -84,14 +84,14 @@ TEST(TestVectorIndexUtil, rebuild_validates_inherited_build_parameters)
   schema::ObTableSchema table_schema;
   const common::ObString old_params = common::ObString::make_string(
       "DISTANCE=L2,TYPE=HNSW,LIB=VSAG,M=10,EF_CONSTRUCTION=15,EF_SEARCH=64");
-  for (const char *patch : {"SUPPORT_DUPLICATE=TRUE", "TYPE=HNSW_SQ", "TYPE=HNSW_BQ"}) {
+  for (const char *patch : {"DUPLICATE_GROUP=TRUE", "TYPE=HNSW_SQ", "TYPE=HNSW_BQ"}) {
     SCOPED_TRACE(patch);
     common::ObString new_params = common::ObString::make_string(patch);
     EXPECT_EQ(OB_NOT_SUPPORTED, ObVectorIndexUtil::construct_rebuild_index_param(
         table_schema, old_params, new_params, VIT_HNSW_INDEX, &allocator));
   }
   common::ObString new_params = common::ObString::make_string(
-      "SUPPORT_DUPLICATE=TRUE,EF_CONSTRUCTION=20");
+      "DUPLICATE_GROUP=TRUE,EF_CONSTRUCTION=20");
   ASSERT_EQ(OB_SUCCESS, ObVectorIndexUtil::construct_rebuild_index_param(
       table_schema, old_params, new_params, VIT_HNSW_INDEX, &allocator));
   ObVectorIndexParam param;
@@ -107,11 +107,11 @@ TEST(TestVectorIndexUtil, rebuild_validates_inherited_duplicate_mode)
   common::ObArenaAllocator allocator(common::ObModIds::TEST);
   schema::ObTableSchema table_schema;
   const common::ObString old_params = common::ObString::make_string(
-      "DISTANCE=L2,TYPE=HNSW,LIB=VSAG,M=10,EF_CONSTRUCTION=20,EF_SEARCH=64,SUPPORT_DUPLICATE=TRUE");
+      "DISTANCE=L2,TYPE=HNSW,LIB=VSAG,M=10,EF_CONSTRUCTION=20,EF_SEARCH=64,DUPLICATE_GROUP=TRUE");
   common::ObString new_params = common::ObString::make_string("EF_CONSTRUCTION=15");
   EXPECT_EQ(OB_NOT_SUPPORTED, ObVectorIndexUtil::construct_rebuild_index_param(
       table_schema, old_params, new_params, VIT_HNSW_INDEX, &allocator));
-  new_params = common::ObString::make_string("SUPPORT_DUPLICATE=FALSE,EF_CONSTRUCTION=15");
+  new_params = common::ObString::make_string("DUPLICATE_GROUP=FALSE,EF_CONSTRUCTION=15");
   ASSERT_EQ(OB_SUCCESS, ObVectorIndexUtil::construct_rebuild_index_param(
       table_schema, old_params, new_params, VIT_HNSW_INDEX, &allocator));
   ObVectorIndexParam param;

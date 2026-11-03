@@ -6,11 +6,13 @@
 #pragma once
 
 #include "lib/string/ob_string.h"
+#include "lib/container/ob_iarray.h"
 #include "lib/utility/ob_print_utils.h"
 
 namespace oceanbase
 {
 namespace pl { class ObPLExecCtx; }
+namespace share { namespace schema { class ObSchemaGetterGuard; class ObTableSchema; } }
 namespace sql
 {
 class ObExecContext;
@@ -51,6 +53,10 @@ public:
 
 private:
   int resolve_table_name(const ObString &raw_name);
+  int check_has_available_async_index(share::schema::ObSchemaGetterGuard &schema_guard,
+                                      const share::schema::ObTableSchema *&table_schema,
+                                      bool &has_user_index,
+                                      common::ObIArray<uint64_t> &target_ids);
 
   uint64_t tenant_id_;
   ObString db_name_;

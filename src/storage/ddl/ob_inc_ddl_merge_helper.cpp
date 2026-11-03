@@ -1669,9 +1669,13 @@ int ObSSIncMajorDDLMergeHelper::merge_cg_sstable(ObIDag* dag,
     // which retains the physical range for redo and SSTable creation.
     ObWholeDataStoreDesc data_desc;
     ObSSTableIndexBuilder sstable_index_builder(true);
+    int64_t macro_block_op_id = 0;
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(clustered_index_flush_callback.init(init_param))) {
       LOG_WARN("fail to init sstable index builder", KR(ret), K(init_param));
+    } else if (OB_FAIL(dag_merge_param.ddl_task_param_.get_macro_block_op_id(
+        true, macro_block_op_id))) {
+      LOG_WARN("failed to get macro block op id", KR(ret), K(dag_merge_param));
     } else if (OB_FAIL(data_desc.init(true/*is_ddl*/,
                                       *storage_schema,
                                       ls_id,
@@ -1688,7 +1692,9 @@ int ObSSIncMajorDDLMergeHelper::merge_cg_sstable(ObIDag* dag,
                                       cg_idx,
                                       compaction::ObExecMode::EXEC_MODE_OUTPUT,
                                       true/*need_submit_io*/,
-                                      true/*is_inc_major*/))) {
+                                      true/*is_inc_major*/,
+                                      ObStorageObjectWriteStrategy::INVALID_WRITE_STRATEGY,
+                                      macro_block_op_id))) {
       LOG_WARN("fail to init data desc", KR(ret));
     } else if (FALSE_IT(data_desc.get_static_desc().schema_version_ = storage_schema->get_schema_version())) {
     } else if (OB_FAIL(sstable_index_builder.init(data_desc.get_desc(),
@@ -1906,13 +1912,9 @@ int ObSSIncMajorDDLMergeHelper::prepare_cg_table_key(
       // scn_range_.end_scn_. Only async-index fills the physical CLOG end here.
       if (dag_merge_param.ddl_task_param_.is_async_index_refresh_) {
         cur_cg_table_key.scn_range_.end_scn_ = end_scn_;
-        // TODO(yilan.zyn): temporary patch to avoid -4016 (OB_LOG_ID_RANGE_NOT_CONTINUOUS)
-        // before the new empty-refresh implementation lands. An empty async-index
-        // refresh has no data macro CLOG from which to derive end_scn_, so fall back
-        // to [start_scn, start_scn] to keep the physical TableKey valid without
-        // mixing the logical refresh snapshot into it; the logical [base, snapshot]
-        // range is stored separately in min/max_merged_trans_version.
-        // Remove this once empty refresh produces a proper physical end_scn_.
+        // Empty refreshes retain only in-memory metadata for commit-log/RPC
+        // compatibility. Give this metadata a valid physical key; it is never
+        // installed in the shared or local TableStore, including on replay.
         const bool is_empty_async_index_refresh = end_scn_.is_min();
         if (is_empty_async_index_refresh) {
           cur_cg_table_key.scn_range_.end_scn_ = user_data.start_scn_;
@@ -2413,9 +2415,10 @@ int ObSSIncMajorDDLMergeHelper::update_tablet_table_store_for_inc_major(
   }
 
   if (OB_FAIL(ret)) {
-  } else if (!dag_merge_param.ddl_task_param_.is_async_index_refresh_
-             && inc_major_sstable->is_empty()) {
-    LOG_INFO("inc major sstable is empty", K(dag_merge_param), KPC(inc_major_sstable));
+  } else if (inc_major_sstable->is_empty()) {
+    // Keep the in-memory metadata for the existing commit-log/RPC format, but
+    // publish only the transactional MDS watermark for an empty refresh.
+    LOG_INFO("skip installing empty inc major sstable", K(dag_merge_param), KPC(inc_major_sstable));
   } else if (OB_FAIL(ObSSDDLUtil::update_shared_tablet_table_store(ls_handle,
                                                               *inc_major_sstable,
                                                               *tablet_param->storage_schema_,

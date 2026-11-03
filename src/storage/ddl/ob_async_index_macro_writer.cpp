@@ -153,9 +153,12 @@ int ObAsyncIndexMacroWriterAdapter::prepare_data_store_desc(
   // block object type in the inverted index macro writer, which is driven by the
   // static desc's is_inc_major_ flag; keep it consistent with prepare_callback.
   const bool is_inc_major = nullptr != param.ddl_dag_ && param.ddl_dag_->is_inc_major_log();
+  int64_t macro_block_op_id = 0;
   if (OB_ISNULL(storage_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("storage schema is null", K(ret), K(param));
+  } else if (OB_FAIL(param.get_macro_block_op_id(is_inc_major, macro_block_op_id))) {
+    LOG_WARN("failed to get macro block op id", KR(ret), K(is_inc_major), K(param));
   } else if (OB_FAIL(data_desc_.init(true/*is_ddl*/,
                                      *storage_schema,
                                      param.ls_id_,
@@ -172,7 +175,9 @@ int ObAsyncIndexMacroWriterAdapter::prepare_data_store_desc(
                                      cg_idx_,
                                      exec_mode,
                                      true/*need_submit_io*/,
-                                     is_inc_major))) {
+                                     is_inc_major,
+                                     ObStorageObjectWriteStrategy::INVALID_WRITE_STRATEGY,
+                                     macro_block_op_id))) {
     LOG_WARN("fail to init data store desc", K(ret), K(param));
   } else if (FALSE_IT(data_desc_.get_static_desc().schema_version_ = param.schema_version_)) {
   } else if (OB_ISNULL(index_builder_ = OB_NEWx(ObSSTableIndexBuilder, &allocator_, true/*use_buffer*/))) {

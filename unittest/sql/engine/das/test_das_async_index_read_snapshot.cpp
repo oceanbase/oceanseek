@@ -10,6 +10,7 @@
 #define protected public
 #include "share/rc/ob_tenant_base.h"
 #include "sql/das/iter/ob_das_local_lookup_iter.h"
+#include "sql/das/iter/ob_das_scan_iter.h"
 #include "sql/das/ob_das_scan_op.h"
 #include "sql/das/search/ob_das_async_index_query_ctx.h"
 #include "sql/das/search/ob_das_async_token_op.h"
@@ -21,8 +22,11 @@
 #include "sql/das/search/ob_das_scalar_primary_ror_op.h"
 #include "sql/das/search/ob_das_scalar_scan_op.h"
 #include "sql/engine/ob_exec_context.h"
+#include "sql/session/ob_sql_session_info.h"
 #undef protected
 #undef private
+
+#include "mittest/mtlenv/mock_tenant_module_env.h"
 
 using namespace oceanbase;
 using namespace oceanbase::common;
@@ -52,7 +56,6 @@ int mock_async_snapshot_fetcher(
       static_cast<MockAsyncSnapshotFetcherCtx *>(arg);
   UNUSED(ls_id);
   UNUSED(delete_tablet_id);
-  UNUSED(sql_read_snapshot);
   if (OB_ISNULL(fetcher_ctx)
       || OB_UNLIKELY(fetcher_ctx->fetch_idx_ >= fetcher_ctx->snapshots_.count()
                      || 1 != index_table_ids.count()
@@ -60,24 +63,48 @@ int mock_async_snapshot_fetcher(
     ret = OB_INVALID_ARGUMENT;
   } else {
     const int64_t snapshot = fetcher_ctx->snapshots_.at(fetcher_ctx->fetch_idx_);
-    storage::ObAsyncIndexSegmentGroup *group = nullptr;
+    const int64_t upper_bound = snapshot + 10;
+    // Range registration copies the handle, so it needs a ref-counted T3M tablet.
+    storage::ObTenantMetaMemMgr *t3m = MTL(storage::ObTenantMetaMemMgr *);
+    storage::ObTabletHandle tablet_handle;
+    ObSEArray<ObNewVersionRange, 2> ranges;
     ObNewVersionRange range;
     range.base_version_ = 0;
     range.snapshot_version_ = snapshot;
-    if (OB_FAIL(out_seg_ctx.storage_group_ctx_.async_index_read_snapshot_.convert_for_tx(
-            snapshot))) {
-    } else if (OB_ISNULL(out_seg_ctx.storage_group_ctx_.index_tablet_handles_
-                             .alloc_place_holder())) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-    } else if (OB_ISNULL(group = OB_NEWx(
-                   storage::ObAsyncIndexSegmentGroup,
-                   &out_seg_ctx.storage_group_ctx_.allocator_))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-    } else if (OB_FAIL(group->init(1))) {
-    } else if (OB_FAIL(group->add_version_range(0, range))) {
-    } else if (OB_FAIL(out_seg_ctx.storage_group_ctx_.groups_.push_back(group))) {
+    if (OB_FAIL(ranges.push_back(range))) {
     } else {
-      out_seg_ctx.storage_group_ctx_.is_strict_aligned_ = true;
+      range.base_version_ = snapshot;
+      range.snapshot_version_ = snapshot + 20;
+      if (OB_FAIL(ranges.push_back(range))) {
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_ISNULL(t3m)) {
+      ret = OB_NOT_INIT;
+      LOG_WARN("mock tenant meta memory manager is not initialized", K(ret));
+    } else if (OB_FAIL(t3m->acquire_tablet(
+                   storage::ObTabletPoolType::TP_NORMAL, tablet_handle))) {
+      LOG_WARN("failed to acquire mock index tablet", K(ret));
+    } else if (OB_FAIL(out_seg_ctx.storage_group_ctx_.add_index_tablet_version_ranges(
+                   tablet_handle, ranges, upper_bound))) {
+    } else if (OB_FAIL(out_seg_ctx.storage_group_ctx_.set_delete_table_published_version(
+                   upper_bound))) {
+    } else if (OB_FAIL(out_seg_ctx.storage_group_ctx_.calc_query_version_ranges(
+                   sql_read_snapshot))) {
+    } else {
+      const storage::ObAsyncIndexSegmentGroupCtx &ctx = out_seg_ctx.storage_group_ctx_;
+      EXPECT_EQ(snapshot, ctx.get_async_index_read_snapshot().get_val_for_tx());
+      EXPECT_LT(ctx.get_async_index_read_snapshot().get_val_for_tx(), upper_bound);
+      EXPECT_LT(upper_bound, sql_read_snapshot.get_val_for_tx());
+      EXPECT_EQ(1, ctx.get_group_count());
+      if (1 != ctx.get_group_count() || 1 != ctx.get_group(0)->get_tablet_cnt()
+          || 1 != ctx.get_group(0)->get_tablet_version_ranges(0).count()) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        const ObNewVersionRange &selected = ctx.get_group(0)->get_tablet_version_ranges(0).at(0);
+        EXPECT_EQ(0, selected.base_version_);
+        EXPECT_EQ(snapshot, selected.snapshot_version_);
+      }
       ++fetcher_ctx->fetch_idx_;
     }
   }
@@ -271,7 +298,7 @@ class ObDASAsyncIndexReadSnapshotTest : public ::testing::Test
 protected:
   void SetUp() override
   {
-    share::ObTenantEnv::get_tenant_local()->id_ = 500;
+    ASSERT_TRUE(storage::MockTenantModuleEnv::get_instance().is_inited());
   }
 };
 
@@ -504,6 +531,37 @@ TEST_P(ObDASScalarPrimaryOpenTest, open_and_rescan_only_active_iterator)
 }
 
 INSTANTIATE_TEST_CASE_P(ScanAndProbe, ObDASScalarPrimaryOpenTest, ::testing::Bool());
+
+TEST_F(ObDASAsyncIndexReadSnapshotTest, check_tx_isolation)
+{
+  ObSQLSessionInfo session;
+  transaction::ObTxDesc tx_desc;
+  const transaction::ObTxIsolationLevel levels[] = {
+      transaction::ObTxIsolationLevel::RC,
+      transaction::ObTxIsolationLevel::RR,
+      transaction::ObTxIsolationLevel::SERIAL};
+
+  EXPECT_EQ(OB_ERR_UNEXPECTED, ObDASAsyncIndexQueryCtx::check_tx_isolation(nullptr));
+  for (int64_t i = 0; i < ARRAYSIZEOF(levels); ++i) {
+    session.set_tx_isolation(levels[i]);
+    EXPECT_EQ(0 == i ? OB_SUCCESS : OB_NOT_SUPPORTED,
+              ObDASAsyncIndexQueryCtx::check_tx_isolation(&session));
+  }
+
+  // The running transaction takes precedence over the next transaction's isolation.
+  session.get_tx_desc() = &tx_desc;
+  tx_desc.state_ = transaction::ObTxDesc::State::ACTIVE;
+  tx_desc.isolation_ = transaction::ObTxIsolationLevel::RC;
+  EXPECT_EQ(OB_SUCCESS, ObDASAsyncIndexQueryCtx::check_tx_isolation(&session));
+  session.set_tx_isolation(transaction::ObTxIsolationLevel::RC);
+  tx_desc.isolation_ = transaction::ObTxIsolationLevel::RR;
+  EXPECT_EQ(OB_NOT_SUPPORTED, ObDASAsyncIndexQueryCtx::check_tx_isolation(&session));
+  tx_desc.isolation_ = transaction::ObTxIsolationLevel::SERIAL;
+  EXPECT_EQ(OB_NOT_SUPPORTED, ObDASAsyncIndexQueryCtx::check_tx_isolation(&session));
+  tx_desc.state_ = transaction::ObTxDesc::State::IDLE;
+  EXPECT_EQ(OB_SUCCESS, ObDASAsyncIndexQueryCtx::check_tx_isolation(&session));
+  session.get_tx_desc() = nullptr;
+}
 
 TEST_F(ObDASAsyncIndexReadSnapshotTest,
        search_context_rebinds_current_partition_snapshot)
@@ -928,8 +986,14 @@ TEST_F(ObDASAsyncIndexReadSnapshotTest, local_lookup_uses_current_partition_asyn
   ObTabletID delete_tablet_id(3001);
   share::SCN sql_read_snapshot;
   transaction::ObTxReadSnapshot sql_snapshot;
-  storage::ObTableScanParam lookup_param;
   ObDASLocalLookupIter lookup_iter;
+  storage::ObTableScanParam &lookup_param = lookup_iter.get_lookup_param();
+  ObDASScanIter data_iter;
+  MockScalarAccessService access_service;
+  data_iter.set_scan_param(lookup_param);
+  data_iter.tsc_service_ = &access_service;
+  lookup_iter.data_table_iter_ = &data_iter;
+  lookup_iter.is_first_lookup_ = false;
 
   ASSERT_EQ(OB_SUCCESS, fetcher_ctx.snapshots_.push_back(120));
   ASSERT_EQ(OB_SUCCESS, fetcher_ctx.snapshots_.push_back(80));
@@ -954,14 +1018,20 @@ TEST_F(ObDASAsyncIndexReadSnapshotTest, local_lookup_uses_current_partition_asyn
             async_query_ctx.find_partition(ObTabletID(10001), partition));
   search_ctx.set_current_async_partition(partition);
   lookup_iter.set_async_search_ctx(&search_ctx);
-  ASSERT_EQ(OB_SUCCESS, lookup_iter.apply_async_index_read_snapshot_(lookup_param));
+  lookup_iter.set_tablet_id(ObTabletID(10001));
+  lookup_iter.set_ls_id(share::ObLSID(1001));
+  ASSERT_EQ(OB_SUCCESS, access_service.expect_scan_param(lookup_param, 120));
+  ASSERT_EQ(OB_SUCCESS, access_service.expect_scan_param(lookup_param, 80));
+  ASSERT_EQ(OB_SUCCESS, lookup_iter.do_index_lookup());
   EXPECT_EQ(120, lookup_param.snapshot_.version().get_val_for_tx());
 
   ASSERT_EQ(OB_SUCCESS,
             async_query_ctx.find_partition(ObTabletID(10002), partition));
   search_ctx.set_current_async_partition(partition);
-  ASSERT_EQ(OB_SUCCESS, lookup_iter.apply_async_index_read_snapshot_(lookup_param));
+  lookup_iter.set_tablet_id(ObTabletID(10002));
+  ASSERT_EQ(OB_SUCCESS, lookup_iter.do_index_lookup());
   EXPECT_EQ(80, lookup_param.snapshot_.version().get_val_for_tx());
+  EXPECT_EQ(2, access_service.get_rescan_call_count());
 }
 
 TEST_F(ObDASAsyncIndexReadSnapshotTest, async_delete_tablet_is_collected)
@@ -1024,7 +1094,19 @@ TEST_F(ObDASAsyncIndexReadSnapshotTest, multiple_async_delete_tablets_are_reject
 
 int main(int argc, char **argv)
 {
+  int ret = OB_SUCCESS;
   ::testing::InitGoogleTest(&argc, argv);
+  OB_LOGGER.set_file_name("test_das_async_index_read_snapshot.log", true);
   OB_LOGGER.set_log_level("INFO");
-  return RUN_ALL_TESTS();
+  if (::testing::GTEST_FLAG(list_tests)) {
+    ret = RUN_ALL_TESTS();
+  } else if (OB_FAIL(storage::MockTenantModuleEnv::get_instance().init())) {
+    LOG_WARN("failed to initialize mock tenant environment", K(ret));
+    ret = 1;
+  } else {
+    // Both test suites share the singleton, which cannot be reinitialized after destruction.
+    ret = RUN_ALL_TESTS();
+    storage::MockTenantModuleEnv::get_instance().destroy();
+  }
+  return ret;
 }

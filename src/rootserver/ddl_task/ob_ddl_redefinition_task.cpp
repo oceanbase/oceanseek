@@ -1542,8 +1542,12 @@ int ObDDLRedefinitionTask::sync_auto_increment_position()
 int ObDDLRedefinitionTask::modify_autoinc(const ObDDLTaskStatus next_task_status)
 {
   int ret = OB_SUCCESS;
+  uint64_t min_data_version = 0;
+  ObDDLTaskStatus new_status = next_task_status;
   ObRootService *root_service = GCTX.root_service_;
   bool is_update_autoinc_end = false;
+  bool has_async_index = false;
+  bool is_hidden_table = false;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("ObDDLRedefinitionTask has not been inited", K(ret));
@@ -1564,7 +1568,7 @@ int ObDDLRedefinitionTask::modify_autoinc(const ObDDLTaskStatus next_task_status
     const ObTableSchema *new_table_schema = nullptr;
     uint64_t alter_autoinc_column_id = 0;
     ObColumnNameMap col_name_map;
-    if (OB_FAIL(ObDDLUtil::get_tenant_schema_guard(tenant_id_, dst_tenant_id_,
+    if (OB_FAIL(root_service->get_ddl_service().get_tenant_schema_guard_with_version_in_inner_table(tenant_id_, dst_tenant_id_,
         hold_buf_src_tenant_schema_guard, hold_buf_dst_tenant_schema_guard,
         src_tenant_schema_guard, dst_tenant_schema_guard))) {
       LOG_WARN("get tenant schema guard failed", K(ret), K(tenant_id_), K(dst_tenant_id_));
@@ -1575,6 +1579,8 @@ int ObDDLRedefinitionTask::modify_autoinc(const ObDDLTaskStatus next_task_status
     } else if (OB_ISNULL(orig_table_schema) || OB_ISNULL(new_table_schema)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("table schemas should not be null", K(ret), K(orig_table_schema), K(new_table_schema));
+    } else if (OB_FALSE_IT(has_async_index = new_table_schema->has_async_index())) {
+    } else if (OB_FALSE_IT(is_hidden_table = new_table_schema->is_user_hidden_table())) {
     } else if (OB_FAIL(col_name_map.init(*orig_table_schema, *new_table_schema, alter_table_schema))) {
       LOG_WARN("failed to init column name map", K(ret));
     } else if (!is_update_autoinc_end && update_autoinc_job_time_ == 0) {
@@ -1657,8 +1663,39 @@ int ObDDLRedefinitionTask::modify_autoinc(const ObDDLTaskStatus next_task_status
     }
   }
 
+  if (OB_SUCC(ret) && is_update_autoinc_end && is_hidden_table && has_async_index
+      && ObDDLTaskStatus::TAKE_EFFECT == next_task_status
+      && DDL_TABLE_RESTORE != task_type_
+      && !alter_table_arg_.is_direct_load_partition_
+      && !alter_table_arg_.mview_refresh_info_.is_mview_complete_refresh_) {
+    if (OB_FAIL(GET_MIN_DATA_VERSION(dst_tenant_id_, min_data_version))) {
+      LOG_WARN("failed to get data version before take effect", K(ret));
+    } else if (min_data_version >= DATA_VERSION_4_6_3_0) {
+      // Persist the protocol snapshot before advancing the state. Reuse it on retries.
+      share::SCN snapshot;
+      if (OB_ISNULL(GCTX.sql_proxy_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("SQL proxy is null", K(ret));
+      } else {
+        if (0 == alter_table_arg_.async_index_offline_refresh_snapshot_) {
+          if (OB_FAIL(OB_TS_MGR.get_gts(dst_tenant_id_, nullptr, snapshot))) {
+            LOG_WARN("failed to obtain offline refresh snapshot", K(ret));
+          } else {
+            alter_table_arg_.async_index_offline_refresh_snapshot_ = snapshot.get_val_for_tx();
+          }
+        }
+        if (OB_SUCC(ret) && OB_FAIL(update_dependent_task_message(*GCTX.sql_proxy_))) {
+          LOG_WARN("failed to persist offline refresh snapshot", K(ret));
+        }
+        if (OB_SUCC(ret)) {
+          new_status = ObDDLTaskStatus::TRIGGER_ASYNC_INDEX_REFRESH;
+        }
+      }
+    }
+  }
+
   if (OB_FAIL(ret) || is_update_autoinc_end) {
-    if (OB_FAIL(switch_status(next_task_status, true, ret))) {
+    if (OB_FAIL(switch_status(new_status, true, ret))) {
       LOG_WARN("fail to switch status", K(ret));
     }
   }

@@ -609,12 +609,11 @@ ObLSAsyncIndexScheduler *ObTenantAsyncIndexRefresher::probe_owning_leader_(
       owner = scheduler;
     } else {
       ObTabletHandle tablet_handle;
-      const int tmp_ret = scheduler->get_ls()->get_tablet(
-          data_tablet_id, tablet_handle, 0 /*timeout_us: no wait*/,
-          ObMDSGetTabletMode::READ_WITHOUT_CHECK);
+      const int tmp_ret = get_async_index_refresh_tablet(
+          *scheduler->get_ls(), data_tablet_id, tablet_handle);
       if (OB_SUCCESS == tmp_ret) {
         owner = scheduler;  // tablet resides on this leader LS
-      } else if (OB_TABLET_NOT_EXIST == tmp_ret) {
+      } else if (OB_TABLET_NOT_EXIST == tmp_ret || OB_EAGAIN == tmp_ret) {
         // tablet not on this LS, keep probing
       } else {
         LOG_WARN_RET(tmp_ret, "failed to probe tablet existence on ls, skip",
@@ -637,7 +636,13 @@ int ObTenantAsyncIndexRefresher::refresh_one_data_table_(
       data_table_info.data_tablet_infos_.at(data_tablet_pos).data_tablet_id_;
   const share::ObLSID ls_id = ls_scheduler->get_ls_id();
   ObLS *ls = ls_scheduler->get_ls();
-  if (OB_FAIL(trigger_.check_and_generate_tasks(
+  ObTabletHandle data_tablet_handle;
+  // Validate even the cached LS mapping; it may predate a transfer.
+  if (OB_NOT_NULL(ls)
+      && OB_FAIL(get_async_index_refresh_tablet(
+          *ls, data_tablet_id, data_tablet_handle))) {
+    LOG_INFO("skip async index scheduling on stale data tablet", K(ret), K(ls_id), K(data_tablet_id));
+  } else if (OB_FAIL(trigger_.check_and_generate_tasks(
           data_table_info, data_tablet_pos, ls, decisions, round_seq_))) {
     LOG_WARN("failed to check and generate tasks", K(ret), K(data_table_id), K(data_tablet_id));
   } else {
@@ -693,6 +698,13 @@ int ObTenantAsyncIndexRefresher::refresh_one_data_table_(
         continue;
       }
       const ObAsyncIndexInfo &index_info = data_table_info.index_infos_.at(idx_pos);
+      ObTabletHandle index_tablet_handle;
+      if (OB_NOT_NULL(ls)
+          && OB_FAIL(get_async_index_refresh_tablet(
+              *ls, decision.index_tablet_id_, index_tablet_handle))) {
+        LOG_INFO("skip async index scheduling on stale index tablet", K(ret), K(ls_id), K(decision));
+        break;
+      }
 
       // Fields shared with the single task this decision produces. Per-call
       // fields (index_tablet_id_, refresh_id_, sql_) are filled in below.
@@ -701,6 +713,10 @@ int ObTenantAsyncIndexRefresher::refresh_one_data_table_(
       base_param.data_table_id_ = data_table_id;
       base_param.ls_id_ = ls_id;
       base_param.data_tablet_id_ = data_tablet_id;
+      if (OB_NOT_NULL(ls)) {
+        base_param.data_transfer_seq_ = data_tablet_handle.get_obj()->get_transfer_seq();
+        base_param.index_transfer_seq_ = index_tablet_handle.get_obj()->get_transfer_seq();
+      }
       base_param.start_refresh_scn_ = decision.start_refresh_scn_;
       base_param.target_refresh_scn_ = decision.target_refresh_scn_;
       base_param.refresh_type_ = ASYNC_REFRESH_TYPE_PERIOD;

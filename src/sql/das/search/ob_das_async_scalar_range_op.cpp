@@ -291,19 +291,23 @@ int ObDASAsyncScalarRangeOp::do_open()
 {
   int ret = OB_SUCCESS;
   current_range_idx_ = 0;
+  is_empty_segment_ = false;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("async scalar range op is not initialized", K(ret));
   } else if (OB_FAIL(init_inv_idx_scan_param())) {
     LOG_WARN("failed to init async scalar range table scan param", K(ret));
+  } else if (direct_bind_ && OB_FAIL(search_ctx_.resolve_direct_async_index_segment(
+                 index_table_id_, inv_idx_tablet_id_, group_slot_,
+                 version_range_, is_empty_segment_))) {
+    LOG_WARN("failed to resolve direct async scalar range segment", K(ret),
+        K_(index_table_id), K_(inv_idx_tablet_id), K_(group_slot));
+  } else if (is_empty_segment_) {
+    // No physical input in this partition and Group.
   } else if (OB_FAIL(init_range_scan_param())) {
     LOG_WARN("failed to init async scalar range scan param", K(ret));
   } else if (!has_current_range()) {
     // The caller may refresh key_ranges_ with a nonempty set before rescan.
-  } else if (direct_bind_ && OB_FAIL(search_ctx_.resolve_direct_async_index_segment(
-                 index_table_id_, inv_idx_tablet_id_, group_slot_, version_range_))) {
-    LOG_WARN("failed to resolve direct async scalar range segment", K(ret),
-        K_(index_table_id), K_(inv_idx_tablet_id), K_(group_slot));
   } else if (!direct_bind_) {
     LOG_INFO("[ASYNC_INDEX_QUERY] scalar range op open(lazy)", K_(inv_idx_tablet_id));
   } else if (OB_FAIL(open_range_iter_from_tablet())) {
@@ -329,16 +333,20 @@ int ObDASAsyncScalarRangeOp::do_rescan()
     version_range_.reset();
     batch_allocator_.reuse();
     current_range_idx_ = 0;
+    is_empty_segment_ = false;
     if (OB_FAIL(init_inv_idx_scan_param())) {
       LOG_WARN("failed to init async scalar range table scan param on rescan", K(ret));
+    } else if (direct_bind_ && OB_FAIL(search_ctx_.resolve_direct_async_index_segment(
+                   index_table_id_, inv_idx_tablet_id_, group_slot_,
+                   version_range_, is_empty_segment_))) {
+      LOG_WARN("failed to resolve direct async scalar range segment on rescan", K(ret),
+          K_(index_table_id), K_(inv_idx_tablet_id), K_(group_slot));
+    } else if (is_empty_segment_) {
+      // No physical input in this partition and Group.
     } else if (OB_FAIL(init_range_scan_param())) {
       LOG_WARN("failed to init async scalar range param on rescan", K(ret));
     } else if (!has_current_range()) {
       // Keep the leaf reusable after the caller refreshes key_ranges_.
-    } else if (direct_bind_ && OB_FAIL(search_ctx_.resolve_direct_async_index_segment(
-                   index_table_id_, inv_idx_tablet_id_, group_slot_, version_range_))) {
-      LOG_WARN("failed to resolve direct async scalar range segment on rescan", K(ret),
-          K_(index_table_id), K_(inv_idx_tablet_id), K_(group_slot));
     } else if (direct_bind_ && OB_FAIL(open_range_iter_from_tablet())) {
       LOG_WARN("failed to open direct async scalar range iter on rescan", K(ret),
           K_(version_range));
@@ -370,6 +378,7 @@ int ObDASAsyncScalarRangeOp::do_rescan_segment(const common::ObNewVersionRange &
     close_range_iter();
     version_range_ = range;
     current_range_idx_ = 0;
+    is_empty_segment_ = false;
     if (OB_FAIL(init_range_scan_param())) {
       LOG_WARN("failed to reset async scalar ranges for segment", K(ret), K(range));
     } else if (!has_current_range()) {
@@ -459,7 +468,7 @@ int ObDASAsyncScalarRangeOp::get_next_doc_ids(
   } else if (OB_UNLIKELY(capacity <= 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid raw doc-id drain capacity", K(ret), K(capacity));
-  } else if (!has_current_range()) {
+  } else if (is_empty_segment_ || !has_current_range()) {
     ret = OB_ITER_END;
   } else if (OB_ISNULL(range_iter_)) {
     ret = OB_NOT_INIT;
@@ -499,7 +508,7 @@ int ObDASAsyncScalarRangeOp::do_next_rowids(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid async scalar range batch size", K(ret), K(max_batch_size),
         "op_max_batch_size", this->max_batch_size());
-  } else if (!has_current_range()) {
+  } else if (is_empty_segment_ || !has_current_range()) {
     ret = OB_ITER_END;
   } else if (OB_ISNULL(range_iter_)) {
     ret = OB_NOT_INIT;
@@ -591,6 +600,7 @@ int ObDASAsyncScalarRangeOp::do_close()
   index_table_id_ = common::OB_INVALID_ID;
   group_slot_ = -1;
   direct_bind_ = false;
+  is_empty_segment_ = false;
   inv_idx_tablet_id_.reset();
   scalar_ctdef_ = nullptr;
   scalar_rtdef_ = nullptr;

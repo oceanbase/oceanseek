@@ -47,11 +47,15 @@ public:
       least_medium_snapshot_(least_medium_snapshot),
       table_id_(OB_INVALID_ID),
       merge_reason_(merge_reason),
-      window_decision_log_info_(window_decision_log_info)
+      window_decision_log_info_(window_decision_log_info),
+      async_delete_published_version_(-1)
   {}
   ~ObMediumCompactionScheduleFunc() {}
-  int init_tablet_handle(ObTabletHandle &tablet_handle) 
+  int init_tablet_handle(
+      ObTabletHandle &tablet_handle,
+      const int64_t async_delete_published_version = -1)
   {
+    async_delete_published_version_ = async_delete_published_version;
     return tablet_handle_.assign(tablet_handle);
   }
   /*
@@ -255,6 +259,7 @@ private:
   uint64_t table_id_; // for mlog
   ObAdaptiveMergePolicy::AdaptiveMergeReason merge_reason_;
   const ObWindowCompactionDecisionLogInfo *window_decision_log_info_; // optional debug payload from window compaction
+  int64_t async_delete_published_version_; // Read before tablet_handle_; never raised in this round.
 };
 
 } //namespace compaction

@@ -2708,7 +2708,8 @@ public:
       alter_mlog_arg_(),
       part_storage_cache_policy_(),
       data_version_(0),
-      enable_hidden_table_partition_pruning_(false)
+      enable_hidden_table_partition_pruning_(false),
+      async_index_offline_refresh_snapshot_(0)
   {
   }
   virtual ~ObAlterTableArg()
@@ -2885,6 +2886,7 @@ public:
   common::ObString part_storage_cache_policy_;
   uint64_t data_version_;
   bool enable_hidden_table_partition_pruning_;
+  int64_t async_index_offline_refresh_snapshot_;
   int serialize_index_args(char *buf, const int64_t data_len, int64_t &pos) const;
   int deserialize_index_args(const char *buf, const int64_t data_len, int64_t &pos);
   int64_t get_index_args_serialize_size() const;

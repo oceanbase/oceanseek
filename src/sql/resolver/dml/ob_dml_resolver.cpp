@@ -8171,11 +8171,16 @@ int ObDMLResolver::resolve_hybrid_search_item(const ParseNode &parse_tree, Table
   const ParseNode* table_node = NULL;
   const ParseNode* dsl_node = NULL;
   const ObTableSchema *table_schema = NULL;
+  bool is_column_store = false;
 
   if ((OB_ISNULL(stmt))) {
     ret = OB_NOT_INIT;
     LOG_WARN("resolver isn't init", K(ret), KP(stmt));
-  } else if (OB_FALSE_IT(stmt->set_hybrid_search())) {  
+  } else if (!stmt->is_select_stmt()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "hybrid_search in DML statements");
+    LOG_WARN("hybrid_search in DML statements is not supported", K(ret), K(stmt->get_stmt_type()));
+  } else if (OB_FALSE_IT(stmt->set_hybrid_search())) {
   } else if (T_HYBRID_SEARCH != parse_tree.type_ || 2 != parse_tree.num_child_) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("parse_tree type or num child is not correct", K(ret), K(parse_tree.type_), K(parse_tree.num_child_));
@@ -8196,6 +8201,13 @@ int ObDMLResolver::resolve_hybrid_search_item(const ParseNode &parse_tree, Table
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "hybrid search on non-heap organized table");
     LOG_WARN("hybrid search on non-heap organized table is not supported", K(ret));
+  } else if (OB_FAIL(table_schema->get_is_column_store(is_column_store))) {
+    LOG_WARN("failed to get is column store", K(ret), K(table_item->ref_id_));
+  } else if (is_column_store) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "hybrid search on column store or row-column store tables");
+    LOG_WARN("hybrid search on column store or row-column store tables is not supported",
+             K(ret), K(table_item->ref_id_));
   } else if (OB_NOT_NULL(params_.query_ctx_)) {
     params_.query_ctx_->has_hybrid_search_ = true;
   }

@@ -1115,6 +1115,127 @@ TEST_F(TestAsyncIndexMergePolicy, hit_too_large_merges_at_max_merged_cap)
   expect_merge(merge_policy_, merge_infos, 0, 70);
 }
 
+TEST_F(TestAsyncIndexMergePolicy, align_sparse_index_inputs_without_splitting_tables)
+{
+  ObSEArray<ObSEArray<ObAsyncIndexSSTableMergeInfo, 8>, 4> inputs;
+  ObSEArray<ObAsyncIndexSSTableMergeInfo, 8> index;
+  ObSEArray<ObAsyncIndexSSTableMergeInfo, 8> output;
+  ObAsyncIndexSSTableMergeInfo info;
+  info.start_snapshot_version_ = 0;
+  info.end_snapshot_version_ = 100;
+  info.seg_size_ = 10;
+  ASSERT_EQ(OB_SUCCESS, index.push_back(info));
+  info.start_snapshot_version_ = 200;
+  info.end_snapshot_version_ = 300;
+  info.seg_size_ = 20;
+  ASSERT_EQ(OB_SUCCESS, index.push_back(info));
+  ASSERT_EQ(OB_SUCCESS, inputs.push_back(index));
+  index.reuse();
+  info.start_snapshot_version_ = 0;
+  info.end_snapshot_version_ = 250;
+  info.seg_size_ = 40;
+  ASSERT_EQ(OB_SUCCESS, index.push_back(info));
+  info.start_snapshot_version_ = 400;
+  info.end_snapshot_version_ = 500;
+  info.seg_size_ = 80;
+  ASSERT_EQ(OB_SUCCESS, index.push_back(info));
+  ASSERT_EQ(OB_SUCCESS, inputs.push_back(index));
+  index.reuse();
+  ASSERT_EQ(OB_SUCCESS, inputs.push_back(index));
+  int64_t snapshot = 500;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicyHelper::align_merge_infos(inputs, snapshot, output));
+  ASSERT_EQ(2, output.count());
+  EXPECT_EQ(0, output.at(0).start_snapshot_version_);
+  EXPECT_EQ(300, output.at(0).end_snapshot_version_);
+  EXPECT_EQ(70, output.at(0).seg_size_);
+  EXPECT_EQ(400, output.at(1).start_snapshot_version_);
+  EXPECT_EQ(500, output.at(1).end_snapshot_version_);
+  EXPECT_EQ(80, output.at(1).seg_size_);
+  ObAsyncIndexMergePolicy policy;
+  ObNewVersionRange range;
+  ASSERT_EQ(OB_SUCCESS, policy.init(2));
+  ASSERT_EQ(OB_SUCCESS, policy.find_merges(output, range));
+  EXPECT_EQ(0, range.base_version_);
+  EXPECT_EQ(500, range.snapshot_version_);
+}
+
+TEST_F(TestAsyncIndexMergePolicy, align_empty_inputs_does_not_fabricate_segments)
+{
+  ObSEArray<ObSEArray<ObAsyncIndexSSTableMergeInfo, 8>, 4> inputs;
+  ObSEArray<ObAsyncIndexSSTableMergeInfo, 8> empty;
+  ObSEArray<ObAsyncIndexSSTableMergeInfo, 8> output;
+  ASSERT_EQ(OB_SUCCESS, inputs.push_back(empty));
+  ASSERT_EQ(OB_SUCCESS, inputs.push_back(empty));
+  int64_t snapshot = 100;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicyHelper::align_merge_infos(inputs, snapshot, output));
+  EXPECT_TRUE(output.empty());
+}
+
+TEST_F(TestAsyncIndexMergePolicy, align_sparse_adjacent_boundaries_remain_independent)
+{
+  ObSEArray<ObSEArray<ObAsyncIndexSSTableMergeInfo, 8>, 4> inputs;
+  ObSEArray<ObAsyncIndexSSTableMergeInfo, 8> index;
+  ObSEArray<ObAsyncIndexSSTableMergeInfo, 8> output;
+  ObAsyncIndexSSTableMergeInfo info;
+  for (int64_t i = 0; i < 3; ++i) {
+    index.reuse();
+    info.start_snapshot_version_ = i * 100;
+    info.end_snapshot_version_ = (i + 1) * 100;
+    info.seg_size_ = 10;
+    ASSERT_EQ(OB_SUCCESS, index.push_back(info));
+    ASSERT_EQ(OB_SUCCESS, inputs.push_back(index));
+  }
+  int64_t snapshot = 300;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicyHelper::align_merge_infos(inputs, snapshot, output));
+  ASSERT_EQ(3, output.count());
+  for (int64_t i = 0; i < 3; ++i) {
+    EXPECT_EQ(i * 100, output.at(i).start_snapshot_version_);
+    EXPECT_EQ((i + 1) * 100, output.at(i).end_snapshot_version_);
+    EXPECT_EQ(10, output.at(i).seg_size_);
+  }
+}
+
+TEST_F(TestAsyncIndexMergePolicy, align_crossing_inputs_keeps_mergeable_prefix)
+{
+  ObSEArray<ObSEArray<ObAsyncIndexSSTableMergeInfo, 8>, 4> inputs;
+  ObSEArray<ObAsyncIndexSSTableMergeInfo, 8> index;
+  ObSEArray<ObAsyncIndexSSTableMergeInfo, 8> output;
+  const MergeInfoSpec a[] = {{0, 100, 10}, {100, 200, 10}, {200, 400, 20}};
+  const MergeInfoSpec b[] = {{0, 100, 10}, {100, 200, 10}, {200, 300, 10}, {300, 400, 10}};
+  ASSERT_EQ(OB_SUCCESS, build_merge_infos(a, ARRAYSIZEOF(a), index));
+  ASSERT_EQ(OB_SUCCESS, inputs.push_back(index));
+  ASSERT_EQ(OB_SUCCESS, build_merge_infos(b, ARRAYSIZEOF(b), index));
+  ASSERT_EQ(OB_SUCCESS, inputs.push_back(index));
+
+  // Crossing, exact boundary, empty prefix, and a published empty tail.
+  const int64_t limits[] = {300, 200, 150, 100, 50, 450};
+  const int64_t expected_snapshots[] = {200, 200, 100, 100, 0, 450};
+  const int64_t expected_counts[] = {2, 2, 1, 1, 0, 3};
+  for (int64_t i = 0; i < ARRAYSIZEOF(limits); ++i) {
+    int64_t snapshot = limits[i];
+    ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicyHelper::align_merge_infos(inputs, snapshot, output));
+    EXPECT_EQ(expected_snapshots[i], snapshot);
+    ASSERT_EQ(expected_counts[i], output.count());
+    if (300 == limits[i]) {
+      ObAsyncIndexMergePolicy policy;
+      ObNewVersionRange range;
+      ASSERT_EQ(OB_SUCCESS, policy.init(2));
+      ASSERT_EQ(OB_SUCCESS, policy.find_merges(output, range));
+      EXPECT_EQ(0, range.base_version_);
+      EXPECT_EQ(200, range.snapshot_version_);
+    }
+  }
+
+  // B bridges A's boundary at 200, so lowering the limit to 200 is still unsafe.
+  const MergeInfoSpec bridging[] = {{0, 100, 10}, {100, 300, 20}, {300, 400, 10}};
+  ASSERT_EQ(OB_SUCCESS, build_merge_infos(bridging, ARRAYSIZEOF(bridging), inputs.at(1)));
+  int64_t snapshot = 300;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicyHelper::align_merge_infos(inputs, snapshot, output));
+  EXPECT_EQ(100, snapshot);
+  ASSERT_EQ(1, output.count());
+  EXPECT_EQ(100, output.at(0).end_snapshot_version_);
+}
+
 } // namespace unittest
 } // namespace oceanbase
 

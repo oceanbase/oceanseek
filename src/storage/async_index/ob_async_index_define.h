@@ -176,33 +176,34 @@ inline int64_t calc_async_index_retry_delay_us(const int64_t retry_cnt)
   return delay;
 }
 
-// Per-(refresh_task_id) snapshot/schema version, registered before the inner
+// Per-(refresh_task_id) execution context, registered before the inner
 // refresh SQL runs and read back by ObPxSubCoord::start_ddl() during execution.
 // The synthetic refresh_task_id is NOT a real __all_ddl_task_status record, so
-// start_ddl cannot use ObDDLUtil::get_data_information; it reads these versions
+// start_ddl cannot use ObDDLUtil::get_data_information; it reads this context
 // from ObAsyncIndexService's node-local map instead (mirrors the vector index
 // is_vec_tablet_rebuild path / ObVectorIndexTmpInfo).
 struct ObAsyncIndexRefreshTmpInfo final
 {
   ObAsyncIndexRefreshTmpInfo()
-    : start_refresh_scn_(), snapshot_version_(0), schema_version_(0), ddl_slice_info_(),
+    : start_refresh_scn_(), snapshot_version_(0), schema_version_(0), ddl_build_id_(0), ddl_slice_info_(),
       allocator_(lib::ObMemAttr(common::OB_SERVER_TENANT_ID, "AsyncIdxSlice")),
       ref_cnt_(0), skipped_rows_(0) {}
   ~ObAsyncIndexRefreshTmpInfo() {}
   void init(const uint64_t tenant_id) {
     allocator_.set_attr(lib::ObMemAttr(tenant_id, "AsyncIdxSlice"));
   }
-  void reset() { start_refresh_scn_.reset(); snapshot_version_ = 0; schema_version_ = 0; ddl_slice_info_.reset(); ATOMIC_STORE(&skipped_rows_, 0LL); }
+  void reset() { start_refresh_scn_.reset(); snapshot_version_ = 0; schema_version_ = 0; ddl_build_id_ = 0; ddl_slice_info_.reset(); ATOMIC_STORE(&skipped_rows_, 0LL); }
   void inc_ref() { ATOMIC_INC(&ref_cnt_); }
   int64_t dec_ref() { return ATOMIC_AAF(&ref_cnt_, -1); }
   int64_t get_ref_cnt() const { return ATOMIC_LOAD(&ref_cnt_); }
   void add_skipped_rows(const int64_t cnt) { ATOMIC_AAF(&skipped_rows_, cnt); }
   int64_t get_skipped_rows() const { return ATOMIC_LOAD(&skipped_rows_); }
-  TO_STRING_KV(K_(start_refresh_scn), K_(snapshot_version), K_(schema_version), K_(ddl_slice_info), K_(ref_cnt), K_(skipped_rows));
+  TO_STRING_KV(K_(start_refresh_scn), K_(snapshot_version), K_(schema_version), K_(ddl_build_id), K_(ddl_slice_info), K_(ref_cnt), K_(skipped_rows));
 
   share::SCN start_refresh_scn_; // refresh window lower bound, i.e. previous published SCN
   int64_t snapshot_version_;  // == refresh SQL's AS OF SNAPSHOT (target_refresh_scn get_val_for_sql)
   int64_t schema_version_;    // data table schema version captured at SQL generation time
+  int64_t ddl_build_id_;      // physical execution ID used by all slices of this refresh
   // Sample range cuts produced by ObDynamicSamplePieceMsgCtx::build_whole_msg during
   // the refresh SQL's PX sample scan, stashed here (deep-copied into allocator_) the
   // same way the vector path stashes them in ObVectorIndexTmpInfo.
@@ -416,6 +417,8 @@ struct ObRefreshTaskStat
     ls_id_.reset();
     data_tablet_id_.reset();
     tablet_id_.reset();
+    data_transfer_seq_ = -1;
+    index_transfer_seq_ = -1;
     refresh_id_ = 0;
     refresh_task_id_ = 0;
     retry_cnt_ = 0;
@@ -455,6 +458,8 @@ struct ObRefreshTaskStat
                K_(ls_id),
                K_(data_tablet_id),
                K_(tablet_id),
+               K_(data_transfer_seq),
+               K_(index_transfer_seq),
                K_(refresh_id),
                K_(refresh_task_id),
                K_(retry_cnt),
@@ -478,6 +483,8 @@ struct ObRefreshTaskStat
   share::ObLSID ls_id_;                   // LS that owns this tablet
   common::ObTabletID data_tablet_id_;  // data table tablet id
   common::ObTabletID tablet_id_;       // index table tablet id
+  int64_t data_transfer_seq_;          // generation observed during scheduling
+  int64_t index_transfer_seq_;
   int64_t refresh_id_;                 // monotonically increasing refresh batch id
   int64_t refresh_task_id_;            // synthetic unique id baked into the SQL's opt_param('ddl_task_id');
                                        // used as the key to register/lookup snapshot & schema version
@@ -539,6 +546,8 @@ struct ObAsyncIndexRefreshTaskParam
       ls_id_(),
       data_tablet_id_(),
       index_tablet_id_(),
+      data_transfer_seq_(-1),
+      index_transfer_seq_(-1),
       start_refresh_scn_(),
       target_refresh_scn_(),
       refresh_id_(0),
@@ -574,6 +583,8 @@ struct ObAsyncIndexRefreshTaskParam
                K_(ls_id),
                K_(data_tablet_id),
                K_(index_tablet_id),
+               K_(data_transfer_seq),
+               K_(index_transfer_seq),
                K_(start_refresh_scn),
                K_(target_refresh_scn),
                K_(refresh_id),
@@ -593,6 +604,8 @@ struct ObAsyncIndexRefreshTaskParam
   share::ObLSID ls_id_;                 // LS that owns the target tablet
   common::ObTabletID data_tablet_id_;   // data table tablet id (refresh source)
   common::ObTabletID index_tablet_id_;  // index table tablet id (refresh target)
+  int64_t data_transfer_seq_;
+  int64_t index_transfer_seq_;
   share::SCN start_refresh_scn_;        // begin SCN for this refresh
   share::SCN target_refresh_scn_;       // target SCN for this refresh
   int64_t refresh_id_;                  // monotonically increasing refresh batch id

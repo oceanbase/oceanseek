@@ -8403,6 +8403,7 @@ int ObDDLService::alter_table_index(obrpc::ObAlterTableArg &alter_table_arg,
                                                                       trans))) {
                   LOG_WARN("fail to persist async index table options", K(ret), K(new_table_schema));
                 } else if (OB_FAIL(ddl_operator.alter_table_create_index(new_table_schema,
+                                                                        origin_table_schema,
                                                                         gen_columns,
                                                                         index_schema,
                                                                         trans,
@@ -8433,8 +8434,13 @@ int ObDDLService::alter_table_index(obrpc::ObAlterTableArg &alter_table_arg,
                 }
 
                 if (OB_SUCC(ret) && need_init_async_index_membership) {
-                  if (OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(
-                          new_table_schema, true, trans))) {
+                  int64_t initial_snapshot = 0;
+                  if (!create_index_arg->is_offline_or_restore() && !new_table_schema.is_user_hidden_table()) {
+                    initial_snapshot = new_fetched_snapshot;
+                  }
+                  // Pin before background maintenance can fill the checkpoint array.
+                  // Later indexes in this ALTER inherit this protection without resetting it.
+                  if (OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(new_table_schema, trans, initial_snapshot))) {
                     LOG_WARN("failed to register async index membership",
                         K(ret), K(new_table_schema.get_table_id()));
                   }
@@ -14668,6 +14674,13 @@ int ObDDLService::update_global_index(ObAlterTableArg &arg,
         } else if (OB_UNLIKELY(op_type >= MAX_OP_TYPE || op_type < USE_OLD_UPDATE_FUNC)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("unexpected op type", KR(ret), K(op_type), K(data_table_id), K(index_table_id));
+        } else if (orig_table_schema.has_async_index() && arg.is_update_global_indexes_
+                   && (USE_OLD_UPDATE_FUNC == op_type || DROP_AND_CREATE_INDEX == op_type)
+                   && !share::ObAsyncIndexRefreshUtil::is_async_index_refresh_enabled(tenant_id)) {
+          ret = OB_OP_NOT_ALLOW;
+          LOG_WARN("rebuild global index on async-index table requires refresh", KR(ret),
+                   K(tenant_id), K(data_table_id), K(index_table_id), K(op_type));
+          LOG_USER_ERROR(OB_OP_NOT_ALLOW, "rebuild global index on async-index table while _enable_async_index_refresh is false");
         } else if (WRITE_TRUNCATE_INFO == op_type) {
           // truncate_service will be inited in func decide_global_index_suggest_op_type_()
           if (OB_FAIL(truncate_service.execute(trans, ddl_operator, new_index_table_schema))) {
@@ -16219,6 +16232,33 @@ int ObDDLService::alter_table_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
         if (0 == new_table_schema.get_autoinc_column_id()) {
           new_table_schema.set_auto_increment(1);
         }
+        // Name-only changes keep async snapshots readable while fencing old writers.
+        // Combined DDL operations retain the existing read/write defense.
+        const bool is_async_metadata_change =
+            tenant_data_version >= DATA_VERSION_4_6_3_0
+            && orig_table_schema->has_async_index()
+            && new_table_schema.has_async_index()
+            && !new_table_schema.is_tmp_table()
+            && !alter_table_arg.is_alter_columns_
+            && !alter_table_arg.is_alter_indexs_
+            && !alter_table_arg.is_alter_partitions_
+            && ObAlterTableArg::CONSTRAINT_NO_OPERATION == alter_table_arg.alter_constraint_type_
+            && 0 == alter_table_arg.foreign_key_arg_list_.count()
+            && 0 == alter_table_arg.index_arg_list_.count();
+        const bool is_async_ctas_publish = is_async_metadata_change
+            && orig_table_schema->is_ctas_tmp_table()
+            && orig_table_schema->get_session_id() > 0
+            && 0 == alter_table_schema.get_session_id()
+            && 2 == alter_table_schema.alter_option_bitset_.num_members()
+            && alter_table_schema.alter_option_bitset_.has_member(ObAlterTableArg::TABLE_NAME)
+            && alter_table_schema.alter_option_bitset_.has_member(ObAlterTableArg::SESSION_ID);
+        const bool is_async_table_rename = is_async_metadata_change
+            && !orig_table_schema->is_tmp_table()
+            && !orig_table_schema->is_ctas_tmp_table()
+            && 0 == orig_table_schema->get_session_id()
+            && 0 == new_table_schema.get_session_id()
+            && 1 == alter_table_schema.alter_option_bitset_.num_members()
+            && alter_table_schema.alter_option_bitset_.has_member(ObAlterTableArg::TABLE_NAME);
         ObSArray<std::pair<uint64_t, int64_t>> idx_schema_versions;
         if (OB_FAIL(ret)) {
           // error occur
@@ -16232,14 +16272,22 @@ int ObDDLService::alter_table_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
                 &idx_schema_versions))) {
           ObString origin_table_name = alter_table_schema.get_origin_table_name();
           LOG_WARN("failed to alter table options,", K(origin_table_name), K(new_table_schema), K(ret));
-        } else if (need_table_lock &&
-            OB_FAIL(build_rw_defense_for_table_(
-                tenant_data_version,
-                new_table_schema, 
-                new_table_schema.get_schema_version(),
-                idx_schema_versions,
-                trans))) {
-          LOG_WARN("failed to add rw defense for table", K(ret), K(new_table_schema));
+        } else if (need_table_lock) {
+          if (is_async_ctas_publish || is_async_table_rename) {
+            if (OB_FAIL(build_write_defense_for_table_(new_table_schema,
+                                                      new_table_schema.get_schema_version(),
+                                                      idx_schema_versions,
+                                                      schema_guard,
+                                                      trans))) {
+              LOG_WARN("failed to add write defense for async table rename", K(ret), K(new_table_schema));
+            }
+          } else if (OB_FAIL(build_rw_defense_for_table_(tenant_data_version,
+                                                       new_table_schema,
+                                                       new_table_schema.get_schema_version(),
+                                                       idx_schema_versions,
+                                                       trans))) {
+            LOG_WARN("failed to add rw defense for table", K(ret), K(new_table_schema));
+          }
         }
         if (OB_SUCC(ret)
             && !alter_table_schema.alter_option_bitset_.is_empty()
@@ -16340,8 +16388,13 @@ int ObDDLService::alter_table_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
         ObArray<AlterTableSchema*> inc_table_schemas;
         ObArray<AlterTableSchema*> del_table_schemas;
         ObArray<ObTableSchema*> upd_table_schemas;
-        ObArray<obrpc::ObLSTabletPair> truncate_membership_tablets;
-        ObArray<obrpc::ObLSTabletPair> truncate_index_published_tablets;
+        const bool creates_partition_tablets =
+            obrpc::ObAlterTableArg::ADD_PARTITION == alter_table_arg.alter_part_type_
+            || obrpc::ObAlterTableArg::ADD_SUB_PARTITION == alter_table_arg.alter_part_type_
+            || obrpc::ObAlterTableArg::TRUNCATE_PARTITION == alter_table_arg.alter_part_type_
+            || obrpc::ObAlterTableArg::TRUNCATE_SUB_PARTITION == alter_table_arg.alter_part_type_;
+        ObArray<obrpc::ObLSTabletPair> partition_membership_tablets;
+        ObArray<obrpc::ObLSTabletPair> partition_index_published_tablets;
         ObArenaAllocator allocator("ModifyPart");
         //table partitions
         ObArray<int64_t> new_partition_ids;
@@ -16648,10 +16701,7 @@ int ObDDLService::alter_table_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
           }
 
           if (OB_FAIL(ret)) {
-          } else if (obrpc::ObAlterTableArg::ADD_PARTITION == alter_table_arg.alter_part_type_
-                     || obrpc::ObAlterTableArg::ADD_SUB_PARTITION == alter_table_arg.alter_part_type_
-                     || obrpc::ObAlterTableArg::TRUNCATE_PARTITION == alter_table_arg.alter_part_type_
-                     || obrpc::ObAlterTableArg::TRUNCATE_SUB_PARTITION == alter_table_arg.alter_part_type_) {
+          } else if (creates_partition_tablets) {
             SCN frozen_scn;
             const bool need_check_tablet_cnt = obrpc::ObAlterTableArg::ADD_PARTITION == alter_table_arg.alter_part_type_
                      || obrpc::ObAlterTableArg::ADD_SUB_PARTITION == alter_table_arg.alter_part_type_;
@@ -16708,26 +16758,27 @@ int ObDDLService::alter_table_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
 
           if (OB_FAIL(ret)) {
           } else if (new_table_schema.has_async_index()) {
-            if (obrpc::ObAlterTableArg::TRUNCATE_PARTITION == alter_table_arg.alter_part_type_
-             || obrpc::ObAlterTableArg::TRUNCATE_SUB_PARTITION == alter_table_arg.alter_part_type_) {
+            // Initialize only the new tablets at this DDL's commit version.
+            // Existing partitions must retain their current refresh progress.
+            if (creates_partition_tablets) {
               ObArray<ObTabletID> inc_data_tablet_ids;
               if (OB_FAIL(get_tablets_with_table_id_(inc_table_schemas, new_table_schema.get_table_id(), inc_data_tablet_ids))) {
-                LOG_WARN("fail to get inc data tablet ids for truncate async membership", KR(ret), K(new_table_schema.get_table_id()));
+                LOG_WARN("fail to get inc data tablet ids for partition async membership", KR(ret), K(new_table_schema.get_table_id()));
               } else if (OB_UNLIKELY(inc_data_tablet_ids.count() != ls_id_array.count())) {
                 ret = OB_ERR_UNEXPECTED;
-                LOG_WARN("inc data tablet count and ls count mismatch for truncate async membership", KR(ret), K(inc_data_tablet_ids.count()), K(ls_id_array.count()));
+                LOG_WARN("inc data tablet count and ls count mismatch for partition async membership", KR(ret), K(inc_data_tablet_ids.count()), K(ls_id_array.count()));
               } else {
                 for (int64_t i = 0; OB_SUCC(ret) && i < inc_data_tablet_ids.count(); i++) {
                   obrpc::ObLSTabletPair ls_tablet_pair;
                   ls_tablet_pair.ls_id_ = ls_id_array.at(i);
                   ls_tablet_pair.tablet_id_ = inc_data_tablet_ids.at(i);
-                  if (OB_FAIL(truncate_membership_tablets.push_back(ls_tablet_pair))) {
-                    LOG_WARN("fail to push back truncate async membership tablet", KR(ret), K(ls_tablet_pair));
+                  if (OB_FAIL(partition_membership_tablets.push_back(ls_tablet_pair))) {
+                    LOG_WARN("fail to push back partition async membership tablet", KR(ret), K(ls_tablet_pair));
                   }
                 }
                 if (FAILEDx(collect_async_index_partition_ls_tablets_(
-                            new_table_schemas, inc_table_schemas, ls_id_array, truncate_index_published_tablets))) {
-                  LOG_WARN("fail to collect async index partition ls tablets for truncate published version", KR(ret));
+                            new_table_schemas, inc_table_schemas, ls_id_array, partition_index_published_tablets))) {
+                  LOG_WARN("fail to collect async index partition ls tablets for partition published version", KR(ret));
                 }
               }
             }
@@ -17031,18 +17082,17 @@ int ObDDLService::alter_table_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
         }
         if (FAILEDx(storage::ObSessionTabletGCHelper::is_table_has_active_session(orig_table_schema, &alter_table_arg))) {
           LOG_WARN("table has active session or error checking", KR(ret), K(alter_table_arg), KPC(orig_table_schema));
-        } else if (new_table_schema.has_async_index()
-                   && (obrpc::ObAlterTableArg::TRUNCATE_PARTITION == alter_table_arg.alter_part_type_
-                    || obrpc::ObAlterTableArg::TRUNCATE_SUB_PARTITION == alter_table_arg.alter_part_type_)) {
-          if (OB_UNLIKELY(truncate_membership_tablets.empty())) {
+        } else if (new_table_schema.has_async_index() && creates_partition_tablets) {
+          if (OB_UNLIKELY(partition_membership_tablets.empty())) {
             ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("truncate async membership tablets empty", KR(ret), K(tenant_id), K(new_table_schema.get_table_id()));
-          } else if (OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_ls_tablets_membership(tenant_id, truncate_membership_tablets, true, trans))) {
-            LOG_WARN("failed to register async-index membership after truncate partition ddl", KR(ret), K(truncate_membership_tablets));
-          } else if (!truncate_index_published_tablets.empty()
+            LOG_WARN("partition async membership tablets empty", KR(ret), K(tenant_id), K(new_table_schema.get_table_id()));
+          } else if (OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_ls_tablets_membership(
+                         tenant_id, partition_membership_tablets, trans))) {
+            LOG_WARN("failed to register async-index membership after add/truncate partition ddl", KR(ret), K(partition_membership_tablets));
+          } else if (!partition_index_published_tablets.empty()
                      && OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::
-                                register_ls_tablets_initial_published_versions(tenant_id, truncate_index_published_tablets, trans))) {
-            LOG_WARN("failed to register async-index initial published versions for truncate partition",
+                                register_ls_tablets_initial_published_versions(tenant_id, partition_index_published_tablets, trans))) {
+            LOG_WARN("failed to register async-index initial published versions for add/truncate partition",
                      KR(ret), K(tenant_id), "table_id", new_table_schema.get_table_id());
           }
         }
@@ -17736,33 +17786,6 @@ static int check_column_store_for_standalone(const ObTableSchema &orig_table_sch
   return ret;
 }
 
-// Check support for DDLs already routed to the offline path on tables with async indexes.
-// In shared-storage mode, DDL_COLUMN_REDEFINITION is converted to DDL_TABLE_REDEFINITION.
-static int check_support_async_index_offline_ddl(const ObDDLType ddl_type)
-{
-  int ret = OB_SUCCESS;
-  switch (ddl_type) {
-    case DDL_MODIFY_COLUMN:
-    case DDL_ADD_PRIMARY_KEY:
-    case DDL_ALTER_PRIMARY_KEY:
-    case DDL_ALTER_PARTITION_BY:
-    case DDL_CONVERT_TO_CHARACTER:
-    case DDL_TABLE_REDEFINITION:
-    case DDL_ALTER_COLUMN_GROUP:
-    case DDL_MODIFY_AUTO_INCREMENT_WITH_REDEFINITION:
-    case DDL_DROP_COLUMN:
-    case DDL_ADD_COLUMN_OFFLINE:
-    case DDL_COLUMN_REDEFINITION:
-      ret = OB_NOT_SUPPORTED;
-      LOG_WARN("offline table redefinition with async indexes is not supported", KR(ret), K(ddl_type));
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "offline table redefinition on tables with async indexes");
-      break;
-    default:
-      break;
-  }
-  return ret;
-}
-
 int ObDDLService::do_offline_ddl_in_trans(obrpc::ObAlterTableArg &alter_table_arg,
                                           const uint64_t tenant_data_version,
                                           obrpc::ObAlterTableRes &res)
@@ -17798,10 +17821,7 @@ int ObDDLService::do_offline_ddl_in_trans(obrpc::ObAlterTableArg &alter_table_ar
       LOG_WARN("fail to get and check table schema", K(ret));
     } else if (orig_table_schema->has_async_index()) {
       uint64_t min_data_version = 0;
-      if (OB_FAIL(check_support_async_index_offline_ddl(ddl_type))) {
-        LOG_WARN("offline table redefinition with async indexes is not supported",
-                 KR(ret), K(tenant_id), K(ddl_type), "table_id", orig_table_schema->get_table_id());
-      } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, min_data_version))) {
+      if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, min_data_version))) {
         LOG_WARN("failed to get min data version", KR(ret), K(tenant_id));
       } else if (min_data_version < DATA_VERSION_4_6_2_1) {
         ret = OB_NOT_SUPPORTED;
@@ -20965,12 +20985,18 @@ int ObDDLService::rename_table(const obrpc::ObRenameTableArg &rename_table_arg)
                   LOG_WARN("failed to rename table!", K(rename_item), K(table_id), K(ret));
                 } else if (need_table_lock_and_defense &&
                            !in_new_table_set && // to avoid defense twice on the same table
-                           OB_FAIL(build_rw_defense_for_table_(
-                              tenant_data_version,
-                              *from_table_schema, 
-                              new_table_schema_version, 
-                              idx_schema_versions,
-                              trans))) {
+                           OB_FAIL((tenant_data_version >= DATA_VERSION_4_6_3_0
+                              && from_table_schema->has_async_index())
+                              ? build_write_defense_for_table_(*from_table_schema,
+                                                               new_table_schema_version,
+                                                               idx_schema_versions,
+                                                               schema_guard,
+                                                               trans)
+                              : build_rw_defense_for_table_(tenant_data_version,
+                                                            *from_table_schema,
+                                                            new_table_schema_version,
+                                                            idx_schema_versions,
+                                                            trans))) {
                   LOG_WARN("fail to build rw defense for table", K(ret), K(new_table_schema_version), KPC(from_table_schema), KPC(database_schema));
                 } else if (OB_FAIL(ObPLDDLService::rebuild_trigger_on_rename(schema_guard,
                                                                              tenant_id,
@@ -21018,12 +21044,18 @@ int ObDDLService::rename_table(const obrpc::ObRenameTableArg &rename_table_arg)
                                                           idx_schema_versions))) {
                       LOG_WARN("failed to rename table!", K(ret), K(rename_item), K(table_id));
                     } else if (need_table_lock_and_defense &&
-                              OB_FAIL(build_rw_defense_for_table_(
-                                  tenant_data_version,
-                                  *from_table_schema, 
-                                  new_table_schema_version, 
-                                  idx_schema_versions,
-                                  trans))) {
+                              OB_FAIL((tenant_data_version >= DATA_VERSION_4_6_3_0
+                                  && from_table_schema->has_async_index())
+                                  ? build_write_defense_for_table_(*from_table_schema,
+                                                                   new_table_schema_version,
+                                                                   idx_schema_versions,
+                                                                   schema_guard,
+                                                                   trans)
+                                  : build_rw_defense_for_table_(tenant_data_version,
+                                                                *from_table_schema,
+                                                                new_table_schema_version,
+                                                                idx_schema_versions,
+                                                                trans))) {
                       LOG_WARN("fail to build rw defense for table", K(ret), K(new_table_schema_version), KPC(from_table_schema), KPC(database_schema));
                     } else if (OB_FAIL(ObPLDDLService::rebuild_trigger_on_rename(schema_guard,
                                                                               tenant_id,
@@ -21292,6 +21324,45 @@ int ObDDLService::build_single_table_rw_defensive_(
       } else if (OB_FAIL(trans.register_tx_data(args[i].tenant_id_, args[i].ls_id_, transaction::ObTxDataSourceType::UNBIND_TABLET_NEW_MDS, buf, pos))) {
         LOG_WARN("failed to register tx data", K(ret));
       }
+    }
+  }
+  return ret;
+}
+
+// Pure metadata renames preserve tablet layouts and published async snapshots.
+// Use the caller's guard for the same auxiliary cohort already locked by the DDL.
+int ObDDLService::build_write_defense_for_table_(
+    const ObTableSchema &table_schema,
+    const int64_t new_data_table_schema_version,
+    const ObIArray<std::pair<uint64_t, int64_t>> &aux_schema_versions,
+    ObSchemaGetterGuard &schema_guard,
+    ObDDLSQLTransaction &trans)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = table_schema.get_tenant_id();
+  if (!table_schema.is_valid() || !table_schema.is_user_table()
+      || new_data_table_schema_version <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid write defense argument", K(ret), K(table_schema), K(new_data_table_schema_version));
+  } else if (OB_FAIL(ObTabletBindingHelper::build_single_table_write_defensive(
+                 table_schema, new_data_table_schema_version, trans))) {
+    LOG_WARN("failed to add base table write defense", K(ret), K(table_schema));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < aux_schema_versions.count(); ++i) {
+    const uint64_t table_id = aux_schema_versions.at(i).first;
+    const int64_t schema_version = aux_schema_versions.at(i).second;
+    const ObTableSchema *aux_table_schema = nullptr;
+    if (OB_INVALID_ID == table_id || schema_version <= 0) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid auxiliary write defense argument", K(ret), K(table_id), K(schema_version));
+    } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, table_id, aux_table_schema))) {
+      LOG_WARN("failed to get auxiliary table schema", K(ret), K(tenant_id), K(table_id));
+    } else if (OB_ISNULL(aux_table_schema)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("auxiliary table schema is null", K(ret), K(tenant_id), K(table_id));
+    } else if (OB_FAIL(ObTabletBindingHelper::build_single_table_write_defensive(
+                   *aux_table_schema, schema_version, trans))) {
+      LOG_WARN("failed to add auxiliary table write defense", K(ret), K(table_id), K(schema_version));
     }
   }
   return ret;
@@ -21759,7 +21830,7 @@ int ObDDLService::truncate_table_in_trans(const obrpc::ObTruncateTableArg &arg,
       LOG_WARN("update ddl task status failed", K(ret));
     } else if (table_schemas.at(0).has_async_index()
                && OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(
-                      table_schemas.at(0), true, trans))) {
+                      table_schemas.at(0), trans))) {
       LOG_WARN("failed to register async-index membership for truncated table",
                KR(ret), K(tenant_id),
                "table_id", table_schemas.at(0).get_table_id());
@@ -22577,7 +22648,7 @@ int ObDDLService::create_user_hidden_table(const ObTableSchema &orig_table_schem
       } else if (OB_FAIL(table_creator.execute())) {
         LOG_WARN("fail to execute create tablet", KR(ret));
       } else if (hidden_table_schema.has_async_index()
-                 && OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(hidden_table_schema, true, trans))) {
+                 && OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(hidden_table_schema, trans))) {
         LOG_WARN("failed to register async-index membership for hidden table",KR(ret), K(tenant_id),
                  "table_id", hidden_table_schema.get_table_id());
       }
@@ -23163,14 +23234,40 @@ int ObDDLService::add_new_index_schema(obrpc::ObAlterTableArg &alter_table_arg,
                     LOG_WARN("failed to add new index id!", K(ret));
                   } else {
                     // add new function index should add additional SYS_NC column into data table.
+                    // Generated columns and the hidden table's history row share one schema version,
+                    // so unique check at the later index version can see the columns.
                     new_table_schema.set_in_offline_ddl_white_list(true);
-                    for (int64_t i = 0; OB_SUCC(ret) && i < gen_columns.count(); ++i) {
-                      ObColumnSchemaV2 *new_column_schema = gen_columns.at(i);
-                      if (OB_ISNULL(new_column_schema)) {
-                        ret = OB_ERR_UNEXPECTED;
-                        LOG_WARN("new column schema is null");
-                      } else if (OB_FAIL(ddl_operator.insert_single_column(trans, new_table_schema, *new_column_schema))) {
-                        LOG_WARN("failed to create table schema, ", K(ret));
+                    if (!gen_columns.empty()) {
+                      int64_t gen_column_schema_version = OB_INVALID_VERSION;
+                      if (OB_FAIL(schema_service_->gen_new_schema_version(
+                              new_table_schema.get_tenant_id(), gen_column_schema_version))) {
+                        LOG_WARN("fail to gen new schema_version for generated columns", K(ret),
+                                 K(new_table_schema.get_tenant_id()));
+                      } else {
+                        for (int64_t j = 0; OB_SUCC(ret) && j < gen_columns.count(); ++j) {
+                          ObColumnSchemaV2 *new_column_schema = gen_columns.at(j);
+                          if (OB_ISNULL(new_column_schema)) {
+                            ret = OB_ERR_UNEXPECTED;
+                            LOG_WARN("new column schema is null", K(ret));
+                          } else if (FALSE_IT(new_column_schema->set_schema_version(gen_column_schema_version))) {
+                          } else if (OB_FAIL(schema_service->get_table_sql_service().insert_single_column(
+                                     trans, new_table_schema, *new_column_schema, false/*record_ddl_operation*/))) {
+                            LOG_WARN("failed to insert generated column", K(ret));
+                          }
+                        }
+                        if (OB_SUCC(ret)) {
+                          HEAP_VAR(ObTableSchema, base_table_schema) {
+                            if (OB_FAIL(base_table_schema.assign(new_table_schema))) {
+                              LOG_WARN("fail to assign base table schema", K(ret));
+                            } else if (FALSE_IT(base_table_schema.set_schema_version(gen_column_schema_version))) {
+                            } else if (OB_FAIL(schema_service->get_table_sql_service().update_table_options(
+                                       trans, new_table_schema, base_table_schema, OB_DDL_ALTER_TABLE))) {
+                              LOG_WARN("fail to update hidden table options with generated columns", K(ret));
+                            } else {
+                              new_table_schema.set_schema_version(gen_column_schema_version);
+                            }
+                          }
+                        }
                       }
                     }
                   }
@@ -24953,6 +25050,7 @@ int ObDDLService::swap_orig_and_hidden_table_state(obrpc::ObAlterTableArg &alter
       schema_guard.set_session_id(alter_table_arg.session_id_);
       ObTableLockOwnerID owner_id;
       int64_t refreshed_schema_version = 0;
+      const int64_t async_publish_snapshot = alter_table_arg.async_index_offline_refresh_snapshot_;
       if (OB_FAIL(get_tenant_schema_guard_with_version_in_inner_table(tenant_id, schema_guard))) {
         LOG_WARN("fail to get schema guard with version in inner table", K(ret), K(tenant_id));
       } else if (OB_FAIL(schema_guard.get_schema_version(tenant_id, refreshed_schema_version))) {
@@ -25101,6 +25199,10 @@ int ObDDLService::swap_orig_and_hidden_table_state(obrpc::ObAlterTableArg &alter
         if (OB_SUCC(ret)) {
           if (hidden_table_schema->is_oracle_tmp_table_v2() || hidden_table_schema->is_oracle_tmp_table_v2_index_table()) {
             LOG_INFO("oracle temporary table v2 has no tablet, skip write ddl barrier", KPC(hidden_table_schema));
+          } else if (async_publish_snapshot > 0
+                     && OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_offline_publication(
+                         *hidden_table_schema, table_schemas, async_publish_snapshot, trans))) {
+            LOG_WARN("failed to register atomic offline publication", K(ret), K(async_publish_snapshot));
           } else if (OB_FAIL(write_ddl_barrier(*hidden_table_schema, trans))) {
             LOG_WARN("failed to write ddl barrier", K(ret));
           }
@@ -27039,7 +27141,7 @@ int ObDDLService::new_truncate_table_in_trans(const ObIArray<const ObTableSchema
     // flag alone does not initialize tablet MDS state.
     if (OB_SUCC(ret) && new_table_schemas.at(0)->has_async_index()
         && OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(
-               *new_table_schemas.at(0), true, trans))) {
+               *new_table_schemas.at(0), trans))) {
       LOG_WARN("failed to register async-index membership for truncated table",
                KR(ret), K(tenant_id),
                "table_id", new_table_schemas.at(0)->get_table_id());

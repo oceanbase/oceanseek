@@ -26,6 +26,7 @@ enum class ObMdsInfoCacheTarget : uint8_t
   INVALID = 0,
   TRUNCATE_INFO = 1,
   TTL_FILTER_INFO = 2,
+  ASYNC_INDEX_MEMBERSHIP = 3,
 };
 
 // Only for cache the most frequent case, Nomal tablet status
@@ -109,12 +110,15 @@ public:
   bool has_async_index() const { return has_async_index_; }
   bool has_published_version() const { return published_version_ >= 0; }
   int64_t get_published_version() const { return published_version_; }
+  int64_t get_invalidation_count() const { return invalidation_count_; }
   void set_value(const bool has_async_index, const int64_t published_version);
   void reset();
 
-  TO_STRING_KV(K_(is_valid), K_(has_async_index), K_(published_version));
+  TO_STRING_KV(K_(is_valid), K_(has_async_index), K_(published_version), K_(invalidation_count));
 private:
   int64_t published_version_;
+  // Protected by the Tablet cache lock; copied together with the cached value.
+  int64_t invalidation_count_;
   bool is_valid_;
   bool has_async_index_;
 };

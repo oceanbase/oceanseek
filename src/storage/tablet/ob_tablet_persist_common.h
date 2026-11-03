@@ -75,7 +75,8 @@ public:
       blocksstable::ObIMacroBlockFlushCallback *ddl_redo_callback = nullptr,
       blocksstable::ObIMacroBlockFlushCallback *ddl_finish_callback = nullptr,
       const bool is_inc_major_shared_object = false,
-      const share::SCN &reorganization_scn = share::SCN::min_scn());
+      const share::SCN &reorganization_scn = share::SCN::min_scn(),
+      const int64_t inc_major_ddl_block_op_id = 0);
 
   #ifdef OB_BUILD_SHARED_STORAGE
   // inc_shared tablet meta persistence
@@ -117,12 +118,17 @@ public:
     return is_major_shared_object() || is_inc_major_shared_object() || is_inc_shared_object();
   }
   int get_op_id(int64_t &op_id) const;
+  int64_t get_inc_major_ddl_block_op_id() const
+  {
+    return inc_major_ddl_block_op_id_ > 0 ? inc_major_ddl_block_op_id_ : snapshot_version_;
+  }
 
 
   TO_STRING_KV(K_(data_version), K_(ls_id), K_(ls_epoch), K_(tablet_id), K_(private_transfer_epoch),
-   K_(snapshot_version), K_(start_macro_seq), K_(is_inc_major_shared_object), KP_(ddl_redo_callback), KP_(ddl_finish_callback)
+   K_(snapshot_version), K_(inc_major_ddl_block_op_id), K_(start_macro_seq),
+   K_(is_inc_major_shared_object), KP_(ddl_redo_callback), KP_(ddl_finish_callback)
    #ifdef OB_BUILD_SHARED_STORAGE
-   , K_(update_reason), K_(sstable_op_id), K_(reorganization_scn), K_(meta_version),
+   , K_(update_reason), K_(reorganization_scn), K_(meta_version),
    KP_(src_tablet_block_info)
    #endif
    );
@@ -133,13 +139,15 @@ public:
   ObTabletID tablet_id_;
   int32_t private_transfer_epoch_;
   int64_t snapshot_version_;
+  // 用作 INC_MAJOR DDL 宏块 ID 的第四段；异步索引刷新传入 ddl_build_id_，
+  // 未指定（<= 0）时使用 snapshot_version_。
+  int64_t inc_major_ddl_block_op_id_;
   int64_t start_macro_seq_;
   bool is_inc_major_shared_object_;
   blocksstable::ObIMacroBlockFlushCallback *ddl_redo_callback_;
   blocksstable::ObIMacroBlockFlushCallback *ddl_finish_callback_;
   #ifdef OB_BUILD_SHARED_STORAGE
   ObMetaUpdateReason update_reason_;
-  int64_t sstable_op_id_;
   share::SCN reorganization_scn_;
   int64_t meta_version_;
   const ObSSTransferSrcTabletBlockInfo *src_tablet_block_info_;

@@ -72,6 +72,34 @@ TEST_F(TestAsyncIndexRefreshInfo, merge_floor_pin_preserves_checkpoints_and_meta
   EXPECT_EQ(250, next);
 }
 
+TEST_F(TestAsyncIndexRefreshInfo, initial_build_pin_survives_commit_and_full_checkpoints)
+{
+  ObTabletAsyncIndexRefreshInfo info;
+  ObTabletAsyncIndexRefreshInfo pin;
+  share::SCN commit_version;
+  share::SCN commit_scn;
+  ASSERT_EQ(OB_SUCCESS, commit_version.convert_for_tx(200));
+  ASSERT_EQ(OB_SUCCESS, commit_scn.convert_for_tx(201));
+  info.set_has_async_index(true);
+  ASSERT_EQ(OB_SUCCESS, info.append_refresh_snapshot(100));
+  ASSERT_EQ(OB_SUCCESS, info.init_pending_refresh_snapshot());
+  info.on_commit(commit_version, commit_scn);
+  ASSERT_EQ(100, info.get_refresh_snapshots().at(0));
+  for (int64_t i = 1; i < MAX_INC_MAJOR_SSTABLE_CNT; ++i) {
+    ASSERT_EQ(OB_SUCCESS, info.append_refresh_snapshot(200 + i));
+  }
+  ASSERT_EQ(OB_SUCCESS, pin.append_refresh_snapshot(100));
+  EXPECT_FALSE(info.need_apply_floor_pin(pin));
+  ASSERT_EQ(OB_SUCCESS, info.merge_floor_pin(pin));
+  ASSERT_EQ(MAX_INC_MAJOR_SSTABLE_CNT, info.get_refresh_snapshots().count());
+  EXPECT_EQ(100, info.get_refresh_snapshots().at(0));
+  for (int64_t i = 1; i < MAX_INC_MAJOR_SSTABLE_CNT; ++i) {
+    EXPECT_EQ(200 + i, info.get_refresh_snapshots().at(i));
+  }
+  EXPECT_TRUE(info.has_async_index());
+  EXPECT_FALSE(info.has_published_version());
+}
+
 TEST_F(TestAsyncIndexRefreshInfo, merge_floor_pin_empty_and_capacity)
 {
   ObTabletAsyncIndexRefreshInfo info;
@@ -155,6 +183,117 @@ TEST_F(TestAsyncIndexRefreshInfo, published_version_value_semantics)
   ASSERT_TRUE(info.is_valid());
   ASSERT_TRUE(info.need_fill_commit_version());
   ASSERT_FALSE(info.has_published_version());
+}
+
+TEST_F(TestAsyncIndexRefreshInfo, initial_commit_pin_matches_index_publication)
+{
+  ObTabletAsyncIndexRefreshInfo data_info;
+  ObTabletAsyncIndexRefreshInfo index_info;
+  share::SCN commit_version;
+  share::SCN commit_scn;
+  ASSERT_EQ(OB_SUCCESS, commit_version.convert_for_tx(300));
+  ASSERT_EQ(OB_SUCCESS, commit_scn.convert_for_tx(400));
+  data_info.set_has_async_index(true);
+  data_info.set_published_version(ObTabletAsyncIndexRefreshInfo::USE_COMMIT_REFRESH_SNAPSHOT);
+  ASSERT_EQ(OB_SUCCESS, data_info.init_pending_refresh_snapshot());
+  index_info.set_published_version(ObTabletAsyncIndexRefreshInfo::USE_COMMIT_VERSION);
+
+  data_info.on_commit(commit_version, commit_scn);
+  index_info.on_commit(commit_version, commit_scn);
+  ASSERT_TRUE(data_info.is_valid_for_refresh());
+  ASSERT_TRUE(data_info.has_async_index());
+  ASSERT_FALSE(data_info.has_published_version());
+  ASSERT_EQ(1, data_info.get_refresh_snapshots().count());
+  EXPECT_EQ(300, data_info.get_refresh_snapshots().at(0));
+  EXPECT_EQ(300, index_info.get_published_version());
+
+  // The data retention point and index publication resolve to the same C, not commit SCN.
+  // Later DML advances the refresh checkpoint from C to T.
+  int64_t next = 0;
+  EXPECT_EQ(OB_ITER_END, data_info.get_next_refresh_snapshot(300, next));
+  ASSERT_EQ(OB_SUCCESS, data_info.append_refresh_snapshot(500));
+  ASSERT_EQ(OB_SUCCESS, data_info.get_next_refresh_snapshot(300, next));
+  EXPECT_EQ(500, next);
+  ASSERT_EQ(OB_SUCCESS, data_info.cleanup_retired_snapshots(500));
+  ASSERT_EQ(1, data_info.get_refresh_snapshots().count());
+  EXPECT_EQ(500, data_info.get_refresh_snapshots().at(0));
+}
+
+TEST_F(TestAsyncIndexRefreshInfo, offline_publication_commits_pin_and_target_atomically)
+{
+  ObTabletAsyncIndexRefreshInfo data_info;
+  ObTabletAsyncIndexRefreshInfo index_info;
+  share::SCN commit_version;
+  ASSERT_EQ(OB_SUCCESS, commit_version.convert_for_tx(300));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, data_info.init_offline_refresh_snapshots(0));
+  ASSERT_EQ(OB_SUCCESS, data_info.init_offline_refresh_snapshots(100));
+  index_info.set_published_version(ObTabletAsyncIndexRefreshInfo::USE_COMMIT_VERSION);
+  EXPECT_TRUE(data_info.is_valid());
+  EXPECT_TRUE(index_info.is_valid());
+  EXPECT_FALSE(data_info.is_valid_for_refresh());
+  EXPECT_TRUE(index_info.is_valid_for_refresh()); // No data checkpoints to consume.
+
+  data_info.on_commit(commit_version, commit_version);
+  index_info.on_commit(commit_version, commit_version);
+  EXPECT_TRUE(data_info.is_valid());
+  EXPECT_TRUE(data_info.is_valid_for_refresh());
+  EXPECT_EQ(100, data_info.get_refresh_snapshots().at(0));
+  EXPECT_EQ(300, data_info.get_refresh_snapshots().at(1));
+  EXPECT_EQ(300, index_info.get_published_version());
+  int64_t target = 0;
+  ASSERT_EQ(OB_SUCCESS, data_info.get_next_refresh_snapshot(100, target));
+  EXPECT_EQ(300, target);
+  ASSERT_EQ(OB_SUCCESS, data_info.cleanup_retired_snapshots(100));
+  EXPECT_EQ(100, data_info.get_refresh_snapshots().at(0));
+  ASSERT_EQ(OB_SUCCESS, data_info.cleanup_retired_snapshots(300));
+  EXPECT_EQ(300, data_info.get_refresh_snapshots().at(0));
+}
+
+TEST_F(TestAsyncIndexRefreshInfo, offline_publication_survives_serialization_and_refresh)
+{
+  ObTabletAsyncIndexRefreshInfo original;
+  ObTabletAsyncIndexRefreshInfo decoded;
+  ObTabletAsyncIndexRefreshInfo next;
+  share::SCN commit_version;
+  ASSERT_EQ(OB_SUCCESS, commit_version.convert_for_tx(300));
+  for (int64_t is_data = 0; is_data < 2; ++is_data) {
+    original.reset();
+    if (is_data) {
+      ASSERT_EQ(OB_SUCCESS, original.init_offline_refresh_snapshots(100));
+    } else {
+      original.set_published_version(ObTabletAsyncIndexRefreshInfo::USE_COMMIT_VERSION);
+    }
+    char buf[1024];
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, original.serialize(buf, sizeof(buf), pos));
+    int64_t read_pos = 0;
+    ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buf, pos, read_pos));
+    EXPECT_TRUE(decoded.is_valid());
+    EXPECT_EQ(0 == is_data, decoded.is_valid_for_refresh());
+    decoded.on_commit(commit_version, commit_version);
+    EXPECT_TRUE(decoded.is_valid_for_refresh());
+    if (is_data) {
+      ASSERT_EQ(2, decoded.get_refresh_snapshots().count());
+      EXPECT_EQ(100, decoded.get_refresh_snapshots().at(0));
+      EXPECT_EQ(300, decoded.get_refresh_snapshots().at(1));
+    } else {
+      EXPECT_EQ(300, decoded.get_published_version());
+    }
+    ASSERT_EQ(OB_SUCCESS, next.assign(decoded));
+    next.set_published_version(500);
+    pos = 0;
+    ASSERT_EQ(OB_SUCCESS, next.serialize(buf, sizeof(buf), pos));
+    read_pos = 0;
+    ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buf, pos, read_pos));
+    if (is_data) {
+      ASSERT_EQ(2, decoded.get_refresh_snapshots().count());
+      EXPECT_EQ(100, decoded.get_refresh_snapshots().at(0));
+      EXPECT_EQ(300, decoded.get_refresh_snapshots().at(1));
+    }
+    EXPECT_EQ(500, decoded.get_published_version());
+    decoded.on_commit(commit_version, commit_version);
+    EXPECT_EQ(500, decoded.get_published_version());
+  }
 }
 
 TEST_F(TestAsyncIndexRefreshInfo, create_bootstrap_uses_commit_version)
@@ -665,6 +804,11 @@ TEST_F(TestAsyncIndexRefreshInfo, assign_deep_copy)
 TEST_F(TestAsyncIndexRefreshInfo, membership_cache_value_lifecycle)
 {
   ObAsyncIndexMembershipCache cache;
+  ASSERT_EQ(0, cache.get_invalidation_count());
+  cache.reset();
+  const int64_t before_read = cache.get_invalidation_count();
+  cache.reset(); // A second notification must invalidate an already pending refill.
+  ASSERT_NE(before_read, cache.get_invalidation_count());
   ASSERT_FALSE(cache.is_valid());
   ASSERT_FALSE(cache.has_async_index());
   ASSERT_FALSE(cache.has_published_version());
@@ -690,10 +834,13 @@ TEST_F(TestAsyncIndexRefreshInfo, membership_cache_copy_preserves_value)
 {
   ObAsyncIndexMembershipCache source;
   ObAsyncIndexMembershipCache destination;
+  source.reset();
   source.set_value(true, 200);
   destination = source;
+  ASSERT_EQ(source.get_invalidation_count(), destination.get_invalidation_count());
 
   source.reset();
+  ASSERT_NE(source.get_invalidation_count(), destination.get_invalidation_count());
   ASSERT_FALSE(source.is_valid());
   ASSERT_TRUE(destination.is_valid());
   ASSERT_TRUE(destination.has_async_index());

@@ -306,6 +306,7 @@ public:
                                    common::ObMySQLTransaction &trans,
                                    share::schema::ObSchemaGetterGuard &schema_guard);
   virtual int alter_table_create_index(const share::schema::ObTableSchema &new_table_schema,
+                                       const share::schema::ObTableSchema &orig_table_schema,
                                        common::ObIArray<share::schema::ObColumnSchemaV2*> &gen_columns,
                                        share::schema::ObTableSchema &index_schema,
                                        common::ObMySQLTransaction &trans,

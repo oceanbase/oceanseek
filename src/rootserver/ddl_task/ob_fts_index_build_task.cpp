@@ -34,6 +34,8 @@ namespace rootserver
 {
 /***************         ObFtsIndexBuildTask        *************/
 
+ERRSIM_POINT_DEF(ERRSIM_FTS_CREATE_AUX_INDEX_RPC_ERROR);
+
 ObFtsIndexBuildTask::ObFtsIndexBuildTask()
   : ObDDLTask(ObDDLType::DDL_CREATE_FTS_INDEX),
     index_table_id_(target_object_id_),
@@ -798,6 +800,9 @@ int ObFtsIndexBuildTask::prepare_aux_table(
                                                     ddl_rpc_timeout))) {
     LOG_WARN("get ddl rpc timeout fail", K(ret));
   } else {
+    // Rebuilt on every retry. Keep the copy out of the task-lifetime allocator_.
+    common::ObArenaAllocator attempt_allocator(
+        "FtsAuxArg", OB_MALLOC_NORMAL_BLOCK_SIZE);
     SMART_VARS_3((obrpc::ObCreateIndexArg, index_arg),
                  (obrpc::ObCreateAuxIndexArg, arg),
                  (obrpc::ObCreateAuxIndexRes, res)) {
@@ -807,12 +812,17 @@ int ObFtsIndexBuildTask::prepare_aux_table(
       arg.task_id_ = task_id_;
       if (task_submitted) {
         // do nothing
-      } else if (OB_FAIL(construct_create_index_arg(index_type, index_arg))) {
+      } else if (OB_FAIL(construct_create_index_arg(index_type, index_arg, attempt_allocator))) {
         LOG_WARN("failed to construct rowkey doc id arg", K(ret));
       } else if (OB_FAIL(arg.create_index_arg_.assign(index_arg))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("failed to assign create index arg", K(ret));
       } else if (OB_FALSE_IT(arg.snapshot_version_ = snapshot_version_)) {
+#ifdef ERRSIM
+      } else if (OB_UNLIKELY(ERRSIM_FTS_CREATE_AUX_INDEX_RPC_ERROR)) {
+        ret = OB_RPC_POST_ERROR;
+        LOG_WARN("errsim create fts aux index rpc failed", K(ret), K(index_type));
+#endif
       } else if (OB_FAIL(common_rpc->to(obrpc::ObRpcProxy::myaddr_).
                          timeout(ddl_rpc_timeout).create_aux_index(arg, res))) {
         LOG_WARN("generate fts aux index schema failed", K(ret), K(arg));
@@ -1253,39 +1263,40 @@ int ObFtsIndexBuildTask::prepare_aux_index_tables()
 
 int ObFtsIndexBuildTask::construct_create_index_arg(
     const ObIndexType index_type,
-    obrpc::ObCreateIndexArg &arg)
+    obrpc::ObCreateIndexArg &arg,
+    common::ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
   if (share::schema::is_rowkey_doc_aux(index_type)) {
-    if (OB_FAIL(construct_rowkey_doc_arg(arg))) {
+    if (OB_FAIL(construct_rowkey_doc_arg(arg, allocator))) {
       LOG_WARN("failed to construct rowkey doc arg", K(ret));
     }
   } else if (share::schema::is_doc_rowkey_aux(index_type)) {
-    if (OB_FAIL(construct_doc_rowkey_arg(arg))) {
+    if (OB_FAIL(construct_doc_rowkey_arg(arg, allocator))) {
       LOG_WARN("failed to construct doc rowkey arg", K(ret));
     }
   } else if (is_domain_index_aux(index_type)) {
-    if (OB_FAIL(construct_domain_index_aux_arg(arg))) {
+    if (OB_FAIL(construct_domain_index_aux_arg(arg, allocator))) {
       LOG_WARN("failed to construct fts index aux arg", K(ret));
     } else {
       arg.index_type_ = index_type;
     }
   } else if (share::schema::is_fts_doc_word_aux(index_type)) {
-    if (OB_FAIL(construct_fts_doc_word_arg(arg))) {
+    if (OB_FAIL(construct_fts_doc_word_arg(arg, allocator))) {
       LOG_WARN("failed to construct fts doc word arg", K(ret));
     }
   } else if (share::schema::is_search_data_index(index_type)) {
-    if (OB_FAIL(construct_search_data_index_arg(arg))) {
+    if (OB_FAIL(construct_search_data_index_arg(arg, allocator))) {
       LOG_WARN("failed to construct search data arg", K(ret));
     }
   } else if (share::schema::is_async_fts_index(index_type)) {
-    if (OB_FAIL(construct_domain_index_aux_arg(arg))) {
+    if (OB_FAIL(construct_domain_index_aux_arg(arg, allocator))) {
       LOG_WARN("failed to construct async fts index arg", K(ret));
     } else {
       arg.index_type_ = index_type;
     }
   } else if (share::schema::is_async_delete_index(index_type)) {
-    if (OB_FAIL(construct_async_delete_arg(arg))) {
+    if (OB_FAIL(construct_async_delete_arg(arg, allocator))) {
       LOG_WARN("failed to construct async delete index arg", K(ret));
     }
   } else {
@@ -1301,62 +1312,69 @@ int ObFtsIndexBuildTask::construct_create_index_arg(
   return ret;
 }
 
-int ObFtsIndexBuildTask::construct_rowkey_doc_arg(obrpc::ObCreateIndexArg &arg)
+int ObFtsIndexBuildTask::construct_rowkey_doc_arg(
+    obrpc::ObCreateIndexArg &arg,
+    common::ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(deep_copy_index_arg(allocator_, create_index_arg_, arg))) {
+  if (OB_FAIL(deep_copy_index_arg(allocator, create_index_arg_, arg))) {
     LOG_WARN("failed to deep copy index arg", K(ret));
   } else if (FALSE_IT(arg.index_type_ = INDEX_TYPE_ROWKEY_DOC_ID_LOCAL)) {
   } else if (FALSE_IT(arg.index_option_.parser_name_.reset())) {
-  } else if (OB_FAIL(ObFtsIndexBuilderUtil::generate_fts_aux_index_name(arg,
-                                                                        &allocator_))) {
+  } else if (OB_FAIL(ObFtsIndexBuilderUtil::generate_fts_aux_index_name(arg, &allocator))) {
     LOG_WARN("failed to generate index name", K(ret));
   }
   return ret;
 }
 
-int ObFtsIndexBuildTask::construct_doc_rowkey_arg(obrpc::ObCreateIndexArg &arg)
+int ObFtsIndexBuildTask::construct_doc_rowkey_arg(
+    obrpc::ObCreateIndexArg &arg,
+    common::ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(deep_copy_index_arg(allocator_, create_index_arg_, arg))) {
+  if (OB_FAIL(deep_copy_index_arg(allocator, create_index_arg_, arg))) {
     LOG_WARN("failed to deep copy index arg", K(ret));
   } else if (FALSE_IT(arg.index_type_ = INDEX_TYPE_DOC_ID_ROWKEY_LOCAL)) {
   } else if (FALSE_IT(arg.index_option_.parser_name_.reset())) {
-  } else if (OB_FAIL(ObFtsIndexBuilderUtil::generate_fts_aux_index_name(arg,
-                                                                        &allocator_))) {
+  } else if (OB_FAIL(ObFtsIndexBuilderUtil::generate_fts_aux_index_name(arg, &allocator))) {
     LOG_WARN("failed to generate index name", K(ret));
   }
   return ret;
 }
 
-int ObFtsIndexBuildTask::construct_domain_index_aux_arg(obrpc::ObCreateIndexArg &arg)
+int ObFtsIndexBuildTask::construct_domain_index_aux_arg(
+    obrpc::ObCreateIndexArg &arg,
+    common::ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(deep_copy_index_arg(allocator_, create_index_arg_, arg))) {
+  if (OB_FAIL(deep_copy_index_arg(allocator, create_index_arg_, arg))) {
     LOG_WARN("failed to deep copy index arg", K(ret));
   }
   return ret;
 }
 
-int ObFtsIndexBuildTask::construct_fts_doc_word_arg(obrpc::ObCreateIndexArg &arg)
+int ObFtsIndexBuildTask::construct_fts_doc_word_arg(
+    obrpc::ObCreateIndexArg &arg,
+    common::ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(deep_copy_index_arg(allocator_, create_index_arg_, arg))) {
+  if (OB_FAIL(deep_copy_index_arg(allocator, create_index_arg_, arg))) {
     LOG_WARN("failed to deep copy index arg", K(ret));
   } else if (FALSE_IT(arg.index_type_ = INDEX_TYPE_FTS_DOC_WORD_LOCAL)) {
-  } else if (OB_FAIL(ObFtsIndexBuilderUtil::generate_fts_aux_index_name(arg,
-                                                                        &allocator_))) {
+  } else if (OB_FAIL(ObFtsIndexBuilderUtil::generate_fts_aux_index_name(arg, &allocator))) {
     LOG_WARN("failed to generate index name", K(ret));
   }
   return ret;
 }
 
-int ObFtsIndexBuildTask::construct_async_delete_arg(obrpc::ObCreateIndexArg &arg)
+int ObFtsIndexBuildTask::construct_async_delete_arg(
+    obrpc::ObCreateIndexArg &arg,
+    common::ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
   ObColumnSortItem pk_sort_item;
   static const char PK_INCREMENT_COL_NAME[] = "__pk_increment";
-  if (OB_FAIL(deep_copy_index_arg(allocator_, create_index_arg_, arg))) {
+  if (OB_FAIL(deep_copy_index_arg(allocator, create_index_arg_, arg))) {
     LOG_WARN("failed to deep copy index arg", K(ret));
   } else if (FALSE_IT(arg.index_columns_.reuse())) {
   } else if (FALSE_IT(arg.store_columns_.reuse())) {
@@ -1364,27 +1382,29 @@ int ObFtsIndexBuildTask::construct_async_delete_arg(obrpc::ObCreateIndexArg &arg
   } else if (FALSE_IT(arg.index_option_.parser_name_.reset())) {
   } else if (OB_FAIL(ObIndexBuilderUtil::check_async_index_name(arg.index_name_))) {
     LOG_WARN("invalid async index name", K(ret), K(arg.index_name_));
-  } else if (OB_FAIL(ob_write_string(allocator_,
-                                       ObString::make_string(PK_INCREMENT_COL_NAME),
-                                       pk_sort_item.column_name_))) {
+  } else if (OB_FAIL(ob_write_string(allocator,
+                                     ObString::make_string(PK_INCREMENT_COL_NAME),
+                                     pk_sort_item.column_name_))) {
     LOG_WARN("failed to write pk increment column name", K(ret));
   } else if (OB_FAIL(arg.index_columns_.push_back(pk_sort_item))) {
     LOG_WARN("failed to push back pk increment column", K(ret));
-  } else if (OB_FAIL(ObIndexBuilderUtil::generate_async_delete_index_name(arg, &allocator_))) {
+  } else if (OB_FAIL(ObIndexBuilderUtil::generate_async_delete_index_name(arg, &allocator))) {
     LOG_WARN("failed to generate async delete index name", K(ret));
   }
   return ret;
 }
 
-int ObFtsIndexBuildTask::construct_search_data_index_arg(obrpc::ObCreateIndexArg &arg)
+int ObFtsIndexBuildTask::construct_search_data_index_arg(
+    obrpc::ObCreateIndexArg &arg,
+    common::ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(deep_copy_index_arg(allocator_, create_index_arg_, arg))) {
+  if (OB_FAIL(deep_copy_index_arg(allocator, create_index_arg_, arg))) {
     LOG_WARN("failed to deep copy index arg", K(ret));
   } else if (FALSE_IT(arg.index_type_ = is_async_search_task()
       ? INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL
       : INDEX_TYPE_SEARCH_DATA_INDEX_LOCAL)) {
-  } else if (OB_FAIL(ObSearchIndexBuilderUtil::generate_search_index_name(arg, &allocator_))) {
+  } else if (OB_FAIL(ObSearchIndexBuilderUtil::generate_search_index_name(arg, &allocator))) {
     LOG_WARN("failed to generate search data index name", K(ret), K(arg));
   } else {
     arg.def_index_id_ = index_table_id_;

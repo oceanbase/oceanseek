@@ -249,10 +249,7 @@ int ObDASAsyncSegmentMergeOp::load_current_partition_segments()
       }
     }
   }
-  if (OB_SUCC(ret) && OB_UNLIKELY(segment_ranges_.empty())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("empty segment ranges for async index domain", K(ret), K_(segment_domain));
-  } else if (OB_SUCC(ret) && OB_UNLIKELY(segment_ranges_.count() > children_cnt_)) {
+  if (OB_SUCC(ret) && OB_UNLIKELY(segment_ranges_.count() > children_cnt_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("current partition has more segments than the fixed tree",
              K(ret), K(segment_ranges_.count()), K_(children_cnt));
@@ -804,7 +801,8 @@ int ObDASAsyncSegmentMergeOp::bind_and_prime_active_children()
   active_segment_cnt_ = segment_ranges_.count();
   if (OB_FAIL(check_segment_rowid_ranges(use_ordered_concat_, ordered_child_indices_))) {
     LOG_WARN("failed to check async segment physical ranges", K(ret));
-  } else if (use_batch_merge_ && OB_FAIL(ensure_batch_buffer())) {
+  } else if (use_batch_merge_ && active_segment_cnt_ > 0
+             && OB_FAIL(ensure_batch_buffer())) {
     LOG_WARN("failed to initialize async segment batch buffer", K(ret),
         K_(active_segment_cnt));
   }
@@ -848,6 +846,7 @@ int ObDASAsyncSegmentMergeOp::reset_children_for_partition(const bool open_child
   if (OB_FAIL(load_current_partition_segments())) {
     LOG_WARN("failed to load current async index segments", K(ret));
   }
+  // Empty domains leave every fixed child unopened and never read physical index metadata.
   active_segment_cnt_ = segment_ranges_.count();
   for (int64_t i = 0; OB_SUCC(ret) && i < active_segment_cnt_; ++i) {
     if (OB_ISNULL(children_[i])) {
@@ -1963,6 +1962,10 @@ int ObDASAsyncSegmentMergeOp::do_advance_shallow(
   if (ObDASAsyncSegmentMergeMode::DIRECT_MERGE == mode_) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("shallow advance is unsupported by direct async segment merge", K(ret), K_(op_id));
+  } else if (0 == active_segment_cnt_) {
+    max_score_tuple = nullptr;
+    iter_end_ = true;
+    ret = OB_ITER_END;
   } else if (is_scoring_) {
     ObDASRowID min_id;
     ObDASRowID max_id;

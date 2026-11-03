@@ -10,6 +10,7 @@
 #include "sql/das/iter/ob_das_scan_iter.h"
 #include "sql/das/search/ob_i_das_search_op.h" // TODO: remove this dependency when dependency problem of ob_das_search_context.h is solved 
 #include "sql/das/search/ob_das_search_context.h"
+#include "sql/das/search/ob_das_async_index_query_ctx.h"
 #include "sql/das/search/ob_das_scalar_define.h"
 #include "sql/das/search/ob_das_logical_bm25_stats_provider.h"
 #include "sql/das/search/ob_das_logical_bm25_stats.h"
@@ -652,16 +653,30 @@ int ObAsyncBM25ParamEstimator::do_avg_doc_token_cnt_estimation_on_demand()
       ret = OB_SUCCESS;
       blocksstable::ObAsyncInvBM25Stats stats;
       ObAccessService *access_service = MTL(ObAccessService *);
-      const transaction::ObTxReadSnapshot *snapshot = nullptr;
+      const sql::ObAsyncIndexPartitionSegCtx *partition = nullptr;
+      const ObTabletHandle *pinned_tablet_handle = nullptr;
       if (OB_ISNULL(access_service) || OB_ISNULL(search_ctx_)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected null ptr", K(ret), KP(access_service), KP_(search_ctx));
-      } else if (OB_ISNULL(snapshot = search_ctx_->get_snapshot())) {
+      } else if (OB_ISNULL(partition = search_ctx_->get_current_async_partition())) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected null snapshot", K(ret));
+        LOG_WARN("unexpected null async index partition", K(ret));
+      } else if (OB_UNLIKELY(partition->ls_id_ != search_ctx_->get_ls_id())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("async index partition ls mismatch", K(ret), K(partition->ls_id_),
+            "search_ls_id", search_ctx_->get_ls_id());
+      } else if (OB_FAIL(partition->get_pinned_index_tablet_handle(
+          tablet_id_, pinned_tablet_handle))) {
+        LOG_WARN("failed to get pinned async index tablet handle", K(ret), K_(tablet_id));
+      } else if (OB_ISNULL(pinned_tablet_handle)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null pinned async index tablet handle", K(ret), K_(tablet_id));
+      // Use the same pinned tablet and logical read boundary as posting scans.
       } else if (OB_FAIL(access_service->get_async_inv_bm25_stats(
-          search_ctx_->get_ls_id(), tablet_id_, snapshot->version(), stats))) {
-        LOG_WARN("failed to get async inv bm25 stats", K(ret), K_(tablet_id), KPC(snapshot));
+          search_ctx_->get_ls_id(), tablet_id_, *pinned_tablet_handle,
+          partition->get_read_snapshot(), stats))) {
+        LOG_WARN("failed to get async inv bm25 stats", K(ret), K_(tablet_id),
+            "read_snapshot", partition->get_read_snapshot());
       } else {
         if (total_doc_cnt_ > 0 && stats.total_doc_length_ > 0) {
           avg_doc_token_cnt_ = static_cast<double>(stats.total_doc_length_) /

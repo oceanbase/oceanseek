@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_ddl_struct.h"
+#include "storage/ddl/ob_ddl_independent_dag.h"
 #include "storage/ddl/ob_tablet_ddl_kv.h"
 #include "storage/ob_i_table.h"
 #include "storage/ddl/ob_direct_load_mgr_utils.h"
@@ -970,6 +971,44 @@ int ObDDLTableSchema::assign(const ObDDLTableSchema &other)
     lob_piece_storage_schema_ = other.lob_piece_storage_schema_;
     src_tenant_id_ = other.src_tenant_id_;
     dst_tenant_id_ = other.dst_tenant_id_;
+  }
+  return ret;
+}
+
+int ObDDLTaskParam::get_macro_block_op_id(const bool is_inc_major, int64_t &op_id) const
+{
+  int ret = OB_SUCCESS;
+  op_id = 0;
+  if (is_inc_major && is_async_index_refresh_) {
+    if (OB_UNLIKELY(ddl_task_id_ <= 0)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid async index refresh task id", KR(ret), KPC(this));
+    } else if (OB_UNLIKELY(ddl_build_id_ <= 0)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid async index refresh ddl build id", KR(ret), KPC(this));
+    } else {
+      op_id = ddl_build_id_;
+    }
+  }
+  return ret;
+}
+
+int ObWriteMacroParam::get_macro_block_op_id(const bool is_inc_major, int64_t &op_id) const
+{
+  int ret = OB_SUCCESS;
+  op_id = 0;
+  const ObDDLTaskParam *ddl_task_param = OB_ISNULL(ddl_dag_)
+      ? nullptr
+      : &ddl_dag_->get_ddl_task_param();
+  if (is_inc_major && OB_NOT_NULL(ddl_task_param) && ddl_task_param->is_async_index_refresh_) {
+    if (OB_UNLIKELY(task_id_ != ddl_task_param->ddl_task_id_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("inconsistent ddl task ids for async index refresh",
+          KR(ret), "writer_task_id", task_id_, "dag_task_id", ddl_task_param->ddl_task_id_);
+    } else if (OB_FAIL(ddl_task_param->get_macro_block_op_id(is_inc_major, op_id))) {
+      LOG_WARN("failed to get async index refresh macro block op id",
+          KR(ret), K(is_inc_major), KPC(ddl_task_param));
+    }
   }
   return ret;
 }

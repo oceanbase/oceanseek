@@ -619,7 +619,8 @@ public:
   //will record log files in the directory for log file
   int set_record_old_log_file(bool rec_old_file_flag = false);
   int set_log_compressor(ObLogCompressor *log_compressor);
-  int64_t get_max_file_index() const { return max_file_index_; }
+  int64_t get_max_file_index() const { return ATOMIC_LOAD(&max_file_index_); }
+  bool get_record_old_log_file() const { return ATOMIC_LOAD(&rec_old_file_flag_); }
 
   //@brief Get the process-only ObLogger.
   static ObLogger &get_logger();
@@ -754,14 +755,15 @@ private:
   //@brief record log files in the log directory. It's used when max_file_index and rec_old_file_flag_ set.
   int record_old_log_file();
 
+  // Caller holds file_size_mutex_ until the sorted snapshot has been committed.
+  int collect_log_files_(void *files, void *wf_files, bool include_compressed);
   int get_log_files_in_dir(const char *filename,
                            void *files/*ObIArray<FileName> * */,
-                           void *wf_files/*ObIArray<FileName> * */);
+                           void *wf_files/*ObIArray<FileName> * */,
+                           bool include_compressed);
 
-  int add_files_to_list(void *files/*ObIArray<FileName> * */,
-                        void *wf_files/*ObIArray<FileName> * */,
-                        std::deque<std::string> &file_list,
-                        std::deque<std::string> &wf_file_list);
+  // Inputs are sorted; caller holds file_size_mutex_ and file_index_mutex_.
+  void replace_log_file_lists_(void *files, void *wf_files);
 
   void rotate_log(const int64_t size, const bool redirect_flag,
                   ObPLogFileStruct &log_struct, const ObPLogFDType fd_type);
@@ -849,6 +851,7 @@ private:
   ObPLogFileStruct log_file_[MAX_FD_FILE];
 
   int64_t max_file_size_;
+  friend class ObLogCompressor; // commits compression mode and recycling limits under file_index_mutex_
   int64_t max_file_index_;
 
   pthread_mutex_t file_size_mutex_;

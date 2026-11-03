@@ -3149,6 +3149,10 @@ int ObDSLResolver::resolve_knn(ObIJsonBase &req_node, ObDSLQuery *&query)
         LOG_WARN("num_candidates should be int type", K(ret), K(sub_node->json_type()));
       } else if (OB_FAIL(sub_node->to_int(num_candidates))) {
         LOG_WARN("fail to get int value from num_candidates", K(ret));
+      } else if (OB_ISNULL(search_option) &&
+                 OB_ISNULL(search_option = OB_NEWx(ObDSLKnnQuery::SearchOption, allocator_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("fail to allocate memory for search option", K(ret));
       } else {
         has_num_candidates = true;
       }

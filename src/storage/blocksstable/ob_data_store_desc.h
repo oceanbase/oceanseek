@@ -118,7 +118,7 @@ public:
   ObTabletID tablet_id_;
   int32_t private_transfer_epoch_;
   int64_t concurrent_cnt_;
-  int64_t op_id_; // operation namespace of shared/private macro block IDs
+  int64_t op_id_; // operation namespace of shared/private macro block IDs; fourth_id for inc-major DDL
   // Rebuild a complete ObMacroDataSeq for incremental SSTables. -1 means keeping legacy behavior.
   int16_t sstable_logic_seq_;
   int64_t macro_block_size_;
@@ -355,6 +355,10 @@ public:
   #undef COL_DESC_FUNC
   #undef STATIC_DESC_FUNC
   #undef STORE_DESC_DEFINE_POINT_FUNC
+  int64_t get_inc_major_ddl_block_op_id() const
+  {
+    return get_op_id() > 0 ? get_op_id() : get_snapshot_version();
+  }
   OB_INLINE int64_t get_encrypt_key_size() const { return sizeof(static_desc_->encrypt_key_); }
   OB_INLINE int64_t get_micro_block_size() const { return micro_block_size_; }
   OB_INLINE common::ObRowStoreType get_row_store_type() const { return row_store_type_; }

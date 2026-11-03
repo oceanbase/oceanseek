@@ -1506,8 +1506,9 @@ int ObInvIdxMacroBlockWriter::alloc_block()
 #undef CONVERT_TO_OBJ_TYPE
     if (OB_SUCC(ret)) {
       int64_t fourth_id = data_store_desc_->get_op_id();
-      if (is_inc_major_ddl
-          || compaction::is_major_merge(merge_type)
+      if (is_inc_major_ddl) {
+        fourth_id = data_store_desc_->get_inc_major_ddl_block_op_id();
+      } else if (compaction::is_major_merge(merge_type)
           || compaction::is_medium_merge(merge_type)) {
         fourth_id = data_store_desc_->get_snapshot_version();
       }

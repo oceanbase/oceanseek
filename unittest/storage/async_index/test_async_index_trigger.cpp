@@ -43,7 +43,7 @@ public:
     refresh_info_.set_has_async_index(true);
   }
 
-  int get_publish_scns(const uint64_t, ObLS *, const ObIArray<ObTabletID> &index_tablet_ids,
+  int get_publish_scns(ObLS *, const ObIArray<ObTabletID> &index_tablet_ids,
                        ObIArray<SCN> &scns) override
   {
     scns.reset();

@@ -867,7 +867,7 @@ int ObVectorIndexRefresher::do_rebuild() {
                K(ret), K(GET_MIN_CLUSTER_VERSION()),
                K(ObVectorIndexUtil::HGRAPH_DUPLICATE_VECTOR_VERSION));
       LOG_USER_ERROR(OB_NOT_SUPPORTED,
-                     "SUPPORT_DUPLICATE=TRUE vector index rebuild is not supported by this cluster version");
+                     "DUPLICATE_GROUP=TRUE vector index rebuild is not supported by this cluster version");
     }
   }
 

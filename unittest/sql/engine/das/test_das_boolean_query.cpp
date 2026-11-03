@@ -28,6 +28,7 @@
 #include "sql/hybrid_search/ob_hybrid_search_node.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "sql/optimizer/ob_log_table_scan.h"
+#include "sql/optimizer/ob_select_log_plan.h"
 #include "sql/das/search/ob_das_search_define.h"
 #include "sql/das/search/ob_das_req_opt_op.h"
 #include "sql/das/search/ob_das_topk_collect_op.h"
@@ -5187,6 +5188,40 @@ TEST_F(ObDASBooleanQueryCgTest, generate_ctdef_no_positive_clauses)
   ObDASBooleanQueryCtDef *ctdef = nullptr;
   ObLogTableScan *op = nullptr;
   EXPECT_EQ(OB_INVALID_ARGUMENT, cg_service_.generate_ctdef(*op, &node, ctdef));
+}
+
+TEST_F(ObDASBooleanQueryCgTest, generate_ctdef_registers_merged_probe_child)
+{
+  ObAddr addr;
+  ObGlobalHint global_hint(allocator_);
+  ObRawExprFactory expr_factory(allocator_);
+  ObOptimizerContext opt_ctx(nullptr, nullptr, nullptr, nullptr, allocator_, nullptr,
+                             addr, nullptr, global_hint, expr_factory, nullptr, false);
+  ObSelectLogPlan plan(opt_ctx, nullptr);
+  ObLogTableScan op(plan);
+  ObBooleanQueryNode node(allocator_);
+  ObScalarQueryNode must_node(allocator_);
+  ObScalarQueryNode filter_node(allocator_);
+  ObScalarQueryNode should_node(allocator_);
+  ObScalarQueryNode merged_node(allocator_);
+  ASSERT_EQ(OB_SUCCESS, node.must_nodes_.push_back(&must_node));
+  ASSERT_EQ(OB_SUCCESS, node.filter_nodes_.push_back(&filter_node));
+  ASSERT_EQ(OB_SUCCESS, node.should_nodes_.push_back(&should_node));
+  node.min_should_match_ = 0;
+
+  ObDASBooleanQueryCtDef *ctdef = nullptr;
+  ASSERT_EQ(OB_SUCCESS, cg_service_.generate_ctdef(op, &node, ctdef));
+  ASSERT_NE(nullptr, ctdef);
+  EXPECT_FALSE(ctdef->has_merged_probe());
+
+  node.merged_probe_scalar_node_ = &merged_node;
+  ASSERT_EQ(OB_SUCCESS, cg_service_.generate_ctdef(op, &node, ctdef));
+  ASSERT_NE(nullptr, ctdef);
+  ASSERT_TRUE(ctdef->has_merged_probe());
+  EXPECT_EQ(3, ctdef->get_merged_probe_offset());
+  EXPECT_EQ(0, ctdef->must_.offset_);
+  EXPECT_EQ(1, ctdef->should_.offset_);
+  EXPECT_EQ(2, ctdef->filter_.offset_);
 }
 
 // Regression for Dima 2026051500116116702 problem 2: inside block_max_pruning, when optional

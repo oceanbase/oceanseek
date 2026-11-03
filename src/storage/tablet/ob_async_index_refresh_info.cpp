@@ -67,7 +67,11 @@ bool ObTabletAsyncIndexRefreshInfo::is_valid() const
     }
   }
   for (int64_t i = 1; valid && i < refresh_snapshot_versions_.count(); ++i) {
-    if (refresh_snapshot_versions_.at(i) <= refresh_snapshot_versions_.at(i - 1)) {
+    const bool pending_offline_end = 1 == i && 2 == refresh_snapshot_versions_.count()
+        && has_async_index_ && need_fill_refresh_snapshot_on_commit()
+        && is_committed_refresh_snapshot(refresh_snapshot_versions_.at(0))
+        && is_pending_refresh_snapshot(refresh_snapshot_versions_.at(i));
+    if (!pending_offline_end && refresh_snapshot_versions_.at(i) <= refresh_snapshot_versions_.at(i - 1)) {
       valid = false;
     }
   }
@@ -79,6 +83,10 @@ bool ObTabletAsyncIndexRefreshInfo::is_valid_for_refresh() const
   bool valid = true;
   if (1 == refresh_snapshot_versions_.count()) {
     valid = is_committed_refresh_snapshot(refresh_snapshot_versions_.at(0));
+  } else if (2 == refresh_snapshot_versions_.count()
+             && is_pending_refresh_snapshot(refresh_snapshot_versions_.at(1))) {
+    // The offline [R, pending-D] checkpoint is not consumable before commit.
+    valid = false;
   }
   return valid;
 }
@@ -149,7 +157,7 @@ void ObTabletAsyncIndexRefreshInfo::on_commit(
 {
   const int64_t commit_val = commit_version.get_val_for_tx();
   UNUSED(commit_scn);
-  // 仅随表创建的索引 Tablet 会写入占位值；普通 refresh 写明确版本。
+  // Create/swap publication uses the transaction commit version; refresh writes an explicit version.
   if (need_fill_commit_version()) {
     published_version_ = commit_val;
   } else if (need_fill_refresh_snapshot_on_commit()) {
@@ -157,9 +165,33 @@ void ObTabletAsyncIndexRefreshInfo::on_commit(
         && is_pending_refresh_snapshot(refresh_snapshot_versions_.at(0))
         && commit_val > 0) {
       refresh_snapshot_versions_.at(0) = commit_val;
+    } else if (has_async_index_ && 2 == refresh_snapshot_versions_.count()
+        && is_committed_refresh_snapshot(refresh_snapshot_versions_.at(0))
+        && is_pending_refresh_snapshot(refresh_snapshot_versions_.at(1))
+        && commit_val > 0) {
+      // Offline swap keeps R and resolves only the pending commit checkpoint D.
+      refresh_snapshot_versions_.at(1) = commit_val;
     }
     published_version_ = INVALID_PUBLISHED_VERSION;
   }
+}
+
+int ObTabletAsyncIndexRefreshInfo::init_offline_refresh_snapshots(const int64_t base_snapshot)
+{
+  int ret = OB_SUCCESS;
+  if (base_snapshot <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    reset();
+    has_async_index_ = true;
+    published_version_ = USE_COMMIT_REFRESH_SNAPSHOT;
+    if (OB_FAIL(append_refresh_snapshot(base_snapshot))) {
+      LOG_WARN("failed to reserve offline GC boundary", K(ret), K(base_snapshot));
+    } else if (OB_FAIL(refresh_snapshot_versions_.push_back(PENDING_REFRESH_SNAPSHOT))) {
+      LOG_WARN("failed to reserve offline commit checkpoint", K(ret));
+    }
+  }
+  return ret;
 }
 
 // Append a new refresh snapshot version (called by the scheduling task).

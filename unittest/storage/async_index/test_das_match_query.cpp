@@ -311,7 +311,6 @@ protected:
                    partition.storage_group_ctx_.index_tablet_handles_.alloc_place_holder())) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else {
-      partition.storage_group_ctx_.is_strict_aligned_ = true;
       ret = add_mock_storage_group(partition);
     }
     return ret;

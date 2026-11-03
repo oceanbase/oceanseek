@@ -39,7 +39,8 @@ int64_t ObMediumCompactionScheduleFunc::to_string(char *buf, const int64_t buf_l
   if (OB_ISNULL(buf) || buf_len <= 0) {
   } else {
     J_OBJ_START();
-    J_KV("ls_id", ls_.get_ls_id(), "merge_reason", ObAdaptiveMergePolicy::merge_reason_to_str(merge_reason_), K_(least_medium_snapshot));
+    J_KV("ls_id", ls_.get_ls_id(), "merge_reason", ObAdaptiveMergePolicy::merge_reason_to_str(merge_reason_),
+        K_(least_medium_snapshot), K_(async_delete_published_version));
     J_COMMA();
     if (tablet_handle_.is_valid()) {
       J_KV("tablet_id", tablet_handle_.get_obj()->get_tablet_meta().tablet_id_);
@@ -527,9 +528,10 @@ int ObMediumCompactionScheduleFunc::choose_scn_for_user_request(
   return ret;
 }
 
-// Deletion tablets advance through async refresh. Keep the medium snapshot at
-// the published version: the installed major also contributes to publication,
-// so compaction must not advertise a version beyond the refreshed input.
+// Deletion tablets advance through async refresh. Cap the medium snapshot at
+// the committed MDS published version so compaction does not advance beyond
+// the logical refresh boundary.
+
 int ObMediumCompactionScheduleFunc::choose_async_delete_index_snapshot(
     const int64_t max_sync_medium_scn,
     ObMediumCompactionInfo &medium_info,
@@ -539,7 +541,7 @@ int ObMediumCompactionScheduleFunc::choose_async_delete_index_snapshot(
   int ret = OB_SUCCESS;
   schema_version = 0;
   int64_t max_reserved_snapshot = 0;
-  int64_t max_published_version = 0;
+  const int64_t max_published_version = async_delete_published_version_;
   ObTablet *tablet = nullptr;
 
   if (OB_UNLIKELY(!tablet_handle_.is_valid())) {
@@ -549,8 +551,9 @@ int ObMediumCompactionScheduleFunc::choose_async_delete_index_snapshot(
   } else if (OB_UNLIKELY(!tablet->is_async_delete_index())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("tablet is not async delete index", K(ret), KPC(tablet));
-  } else if (OB_FAIL(tablet->get_async_index_max_published_version(max_published_version))) {
-    LOG_WARN("failed to get async index max published version", K(ret), KPC(tablet));
+  } else if (-1 == max_published_version) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("deletion publication was not fixed before acquiring tablet", K(ret), KPC(tablet));
   } else if (max_published_version <= 0) {
     ret = OB_NO_NEED_MERGE;
     LOG_INFO("async delete index max published version is 0, no need merge", K(ret), KPC(tablet));
@@ -2204,6 +2207,7 @@ int ObMediumCompactionScheduleFunc::submit_async_index_medium_info(
     for (int64_t i = 0; OB_SUCC(ret) && i < index_tablet_ids.count(); ++i) {
       const ObTabletID &index_tablet_id = index_tablet_ids.at(i);
       ObTabletHandle index_handle;
+      ObGetMergeTablesResult inc_inputs;
       ObTablet *index_tablet = nullptr;
       const int64_t merge_version = MERGE_SCHEDULER_PTR->get_frozen_version();
       ObTabletStatusCache *tablet_status = nullptr;
@@ -2225,6 +2229,14 @@ int ObMediumCompactionScheduleFunc::submit_async_index_medium_info(
             K(target_snapshot), K(max_sync_medium_scn),
             "last_major_snapshot", index_tablet->get_last_major_snapshot_version(),
             "transfer_start_scn", index_tablet->get_tablet_meta().transfer_info_.transfer_start_scn_);
+      } else if (merge_version_range.base_version_ > 0
+          && OB_FAIL(ObAsyncIndexMergePolicyHelper::get_inc_major_sstables(
+              ls_, *index_tablet, target_snapshot, merge_version_range.base_version_, inc_inputs))) {
+        LOG_WARN("failed to check sparse async index merge inputs", KR(ret), K(index_tablet_id));
+      } else if (merge_version_range.base_version_ > 0 && inc_inputs.handle_.empty()) {
+        // No real table in this committed interval: it needs no compaction MDS
+        // item and must not prevent the other indexes from merging their inputs.
+        LOG_INFO("skip empty async index merge interval", K(index_tablet_id), K(merge_version_range));
       } else if (OB_ISNULL(tablet_status = OB_NEWx(
           ObTabletStatusCache, &status_cache_allocator, tenant_status_snapshot))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;

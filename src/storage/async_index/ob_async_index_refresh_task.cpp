@@ -10,6 +10,7 @@
 #include "storage/async_index/ob_async_index_deps.h"
 #include "storage/async_index/ob_ls_async_index_scheduler.h"
 #include "storage/async_index/ob_async_index_service.h"  // ObAsyncIndexService
+#include "storage/ob_common_id_utils.h"
 #include "storage/ddl/ob_ddl_lock.h"                    // ObOnlineDDLLock
 #include "storage/tablelock/ob_lock_inner_connection_util.h"
 #include "lib/oblog/ob_log_module.h"
@@ -19,6 +20,7 @@
 #include "lib/mysqlclient/ob_mysql_proxy.h"              // ObSessionDDLInfo
 #include "share/ob_server_struct.h"                    // GCTX
 #include "share/ob_debug_sync.h"                       // DEBUG_SYNC
+#include "share/schema/ob_multi_version_schema_service.h"
 #include "observer/ob_server.h"                        // observer::ObServer::get_instance()
 #include "share/ob_share_util.h"                       // ObShareUtil::set_default_timeout_ctx
 #include "share/ob_ddl_common.h"                       // ObDDLUtil::calc_inner_sql_execute_timeout
@@ -90,9 +92,22 @@ int ObAsyncIndexRefreshTask::set_inner_conn_ddl_info_(common::ObMySQLTransaction
 {
   int ret = OB_SUCCESS;
   sqlclient::ObISQLConnection *conn = trans.get_connection();
+  share::schema::ObSchemaGetterGuard schema_guard;
+  const share::schema::ObTableSchema *data_schema = nullptr;
   if (OB_ISNULL(conn)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("null inner sql connection", K(ret));
+  } else if (OB_FAIL(GSCHEMASERVICE.get_tenant_schema_guard(stat_.tenant_id_, schema_guard))) {
+    LOG_WARN("failed to get refresh schema guard", K(ret));
+  } else if (OB_FAIL(schema_guard.get_table_schema(stat_.tenant_id_, stat_.data_table_id_, data_schema))) {
+    LOG_WARN("failed to get refresh data schema", K(ret));
+  } else if (OB_ISNULL(data_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+  } else if (data_schema->get_schema_version() != stat_.schema_version_) {
+    ret = OB_DDL_SCHEMA_VERSION_NOT_MATCH;
+  } else if (data_schema->is_user_hidden_table() && ASYNC_REFRESH_TYPE_OFFLINE_DDL != stat_.refresh_type_) {
+    // Periodic work sampled before the DDL must not race offline preparation.
+    ret = OB_NEED_RETRY;
   } else {
     // is_ddl is already true on the ddl_sql_proxy connection's session; we set it
     // again for clarity and add the async-index-refresh flag, which makes
@@ -102,6 +117,8 @@ int ObAsyncIndexRefreshTask::set_inner_conn_ddl_info_(common::ObMySQLTransaction
     common::ObSessionDDLInfo ddl_info;
     ddl_info.set_is_ddl(true);
     ddl_info.set_is_async_index_refresh(true);
+    ddl_info.set_source_table_hidden(data_schema->is_user_hidden_table());
+    ddl_info.set_dest_table_hidden(data_schema->is_user_hidden_table());
     ddl_info.set_search_index_ddl(stat_.is_search_index_);
     ddl_info.set_partition_local_ddl(stat_.is_partition_local_);
     ddl_info.set_is_refresh_on_error_skip(stat_.is_refresh_on_error_skip_);
@@ -128,6 +145,8 @@ int ObAsyncIndexRefreshTask::set_task(const ObAsyncIndexRefreshTaskParam &param)
     stat.ls_id_ = param.ls_id_;
     stat.data_tablet_id_ = param.data_tablet_id_;
     stat.tablet_id_ = param.index_tablet_id_;
+    stat.data_transfer_seq_ = param.data_transfer_seq_;
+    stat.index_transfer_seq_ = param.index_transfer_seq_;
     stat.start_refresh_scn_ = param.start_refresh_scn_;
     stat.target_refresh_scn_ = param.target_refresh_scn_;
     stat.refresh_id_ = param.refresh_id_;
@@ -227,25 +246,36 @@ int ObAsyncIndexRefreshTask::recheck_publish_scn_after_lock_(const ObRefreshTask
   ObLSService *ls_service = MTL(ObLSService *);
   ObLSHandle ls_handle;
   ObTabletHandle tablet_handle;
+  ObTabletHandle data_tablet_handle;
   int64_t published_version = 0;
-  if (OB_ISNULL(ls_service)) {
+  // The OnlineDDL tablet ROW_EXCLUSIVE lock conflicts with transfer's
+  // EXCLUSIVE lock and is held through trans.end(). Validate the scheduled
+  // generation now, before reading its watermark or executing refresh SQL.
+  if (stat.data_transfer_seq_ < 0 || stat.index_transfer_seq_ < 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("missing async index refresh tablet generation", K(ret), K(stat));
+  } else if (OB_ISNULL(ls_service)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ls service is null", K(ret));
   } else if (OB_FAIL(ls_service->get_ls(stat.ls_id_, ls_handle, ObLSGetMod::STORAGE_MOD))) {
-    LOG_WARN("failed to get ls for publish_scn recheck", K(ret), K(stat.ls_id_));
+    LOG_WARN("failed to get ls for refresh tablet check", K(ret), K(stat.ls_id_));
   } else if (OB_ISNULL(ls_handle.get_ls())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ls is null", K(ret), K(stat.ls_id_));
-  } else if (OB_FAIL(ls_handle.get_ls()->get_tablet(
-                 stat.tablet_id_, tablet_handle, 0 /*timeout_us*/,
-                 ObMDSGetTabletMode::READ_WITHOUT_CHECK))) {
-    LOG_WARN("failed to get index tablet for publish_scn recheck",
+  } else if (OB_FAIL(get_async_index_refresh_tablet(
+                 *ls_handle.get_ls(), stat.data_tablet_id_, data_tablet_handle,
+                 stat.data_transfer_seq_))) {
+    LOG_WARN("data tablet location changed", K(ret), K(stat));
+  } else if (OB_FAIL(get_async_index_refresh_tablet(
+                 *ls_handle.get_ls(), stat.tablet_id_, tablet_handle,
+                 stat.index_transfer_seq_))) {
+    LOG_WARN("failed to get index tablet at scheduled location",
              K(ret), K(stat.tablet_id_));
   } else if (OB_ISNULL(tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet handle is null", K(ret), K(stat.tablet_id_));
-  } else if (OB_FAIL(tablet_handle.get_obj()->get_latest_async_index_published_version(
-                 published_version))) {
+  } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_refresh_start_version(
+                 published_version, false /*use_cache*/))) {
     LOG_WARN("failed to get max published version", K(ret), K(stat.tablet_id_));
   } else {
     share::SCN current_publish_scn = async_index_snapshot_to_scn(published_version);
@@ -320,25 +350,36 @@ int ObAsyncIndexRefreshTask::handle()
       // execution time ObPxSubCoord::start_ddl needs snapshot_version &
       // schema_version, which it normally reads from __all_ddl_task_status by
       // task id -- but refresh_task_id is synthetic and has no such record. So we
-      // (1) register the versions in the node-local ObAsyncIndexService map keyed
-      // by refresh_task_id, and (2) flag the inner connection's session with
+      // (1) register the execution context in the node-local
+      // ObAsyncIndexService map keyed by refresh_task_id, and (2) flag the session with
       // is_async_index_refresh so start_ddl takes the map-lookup branch instead.
       // start_ddl runs synchronously inside trans.write below (same node, the LS
       // leader), so the registration is visible there; we release it afterwards.
       ObAsyncIndexService *svc = MTL(ObAsyncIndexService *);
       bool registered = false;
       bool refresh_dop_acquired = false;
+      share::ObCommonID unique_build_id;
+      int64_t ddl_build_id = 0;
+      if (OB_FAIL(ObCommonIDUtils::gen_unique_id(stat.tenant_id_, unique_build_id))) {
+        LOG_WARN("failed to generate async index ddl build id", K(ret), K(stat.tenant_id_), K(stat.refresh_task_id_));
+      } else if (OB_UNLIKELY(unique_build_id.id() <= 0)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid async index ddl build id", K(ret), K(unique_build_id), K(stat.refresh_task_id_));
+      } else {
+        ddl_build_id = unique_build_id.id();
+      }
       // Key debug point #3: the actual refresh SQL about to execute, together
       // with its identifying context (tablet / refresh ids / scn window / dop).
       LOG_INFO("[ASYNC_INDEX_REFRESH] execute refresh sql", K(stat.tenant_id_),
                K(stat.data_table_id_),
                K(stat.ls_id_), K(stat.data_tablet_id_), K(stat.tablet_id_),
-               K(stat.refresh_id_), K(stat.refresh_task_id_),
+               K(stat.refresh_id_), K(stat.refresh_task_id_), K(ddl_build_id),
                K(stat.start_refresh_scn_), K(stat.target_refresh_scn_),
                K(stat.is_complete_refresh_), K(stat.is_partition_local_),
                K(stat.refresh_parallelism_),
                K(stat.schema_version_), "sql", sql_.ptr());
-      if (OB_FAIL(share::ObShareUtil::set_default_timeout_ctx(timeout_ctx, timeout_us))) {
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(share::ObShareUtil::set_default_timeout_ctx(timeout_ctx, timeout_us))) {
         LOG_WARN("failed to set timeout ctx for refresh sql", K(ret), K(timeout_us));
       } else if (OB_ISNULL(svc)) {
         ret = OB_ERR_UNEXPECTED;
@@ -346,10 +387,11 @@ int ObAsyncIndexRefreshTask::handle()
       } else if (OB_FAIL(svc->register_refresh_versions(stat_.refresh_task_id_,
                      stat_.start_refresh_scn_,
                      stat_.target_refresh_scn_.get_val_for_sql(),
-                     stat_.schema_version_))) {
-        LOG_WARN("failed to register refresh versions", K(ret), K(stat_.refresh_task_id_),
+                     stat_.schema_version_,
+                     ddl_build_id))) {
+        LOG_WARN("failed to register refresh context", K(ret), K(stat_.refresh_task_id_),
                  K(stat_.start_refresh_scn_), K(stat_.target_refresh_scn_),
-                 K(stat_.schema_version_));
+                 K(stat_.schema_version_), K(ddl_build_id));
       } else if (FALSE_IT(registered = true)) {
       } else if (OB_FAIL(trans.start(
                      GCTX.ddl_sql_proxy_, stat.tenant_id_, false /* with_snapshot */,

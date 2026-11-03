@@ -34,7 +34,8 @@ ObScheduleTabletFunc::ObScheduleTabletFunc(
     time_guard_(),
     clear_stat_tablets_(),
     merge_reason_(merge_reason),
-    schedule_mode_(schedule_mode)
+    schedule_mode_(schedule_mode),
+    async_delete_published_version_(-1)
 {
   clear_stat_tablets_.set_attr(ObMemAttr(MTL_ID(), "BatchClearTblts"));
 }
@@ -54,7 +55,7 @@ int ObScheduleTabletFunc::switch_and_schedule_tablet(
   } else if (OB_FAIL(schedule_tablet(tablet_handle, tablet_merge_finish))) {
     LOG_WARN("failed to schedule tablet", KR(ret), K(tablet_handle));
   }
-  tablet_status_.destroy();
+  destroy_tablet_status();
   return ret;
 }
 
@@ -70,7 +71,7 @@ int ObScheduleTabletFunc::iterate_switch_tablet(
   bool skip_async_index_schedule = false;
   can_merge = false;
   need_schedule = false;
-  tablet_status_.destroy();
+  destroy_tablet_status();
   if (OB_UNLIKELY(!ls_status_.is_valid())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid ls status", KR(ret), K_(ls_status));
@@ -120,6 +121,9 @@ int ObScheduleTabletFunc::iterate_switch_tablet(
   } else if (skip_async_index_schedule) {
     need_schedule = false;
     LOG_DEBUG("async index tablet does not need medium merge schedule", K(tablet_id), K_(ls_status));
+  } else if (OB_FAIL(prepare_async_delete_index_tablet_(tablet_handle))) {
+    LOG_WARN("failed to prepare deletion tablet for schedule", KR(ret), K(tablet_id));
+  } else if (FALSE_IT(tablet = tablet_handle.get_obj())) {
   } else if (OB_FAIL(tablet_status_.init_for_major(
                  ls_status_.get_ls(), merge_version_, *tablet,
                  ls_could_schedule_new_round_))) {
@@ -253,7 +257,7 @@ int ObScheduleTabletFunc::schedule_tablet_new_round(
                                         merge_reason_,
                                         0 /*least_medium_snapshot*/,
                                         get_window_decision_log_info());
-    if (OB_FAIL(func.init_tablet_handle(tablet_handle))) {
+    if (OB_FAIL(func.init_tablet_handle(tablet_handle, async_delete_published_version_))) {
       LOG_WARN("failed to init func with tablet_handle", K(ret), K(tablet_handle), K(func));
     // 主表已完成但异步索引未完成时，继续携带租户合并位点推进异步索引。
     } else if (OB_FAIL(func.schedule_next_medium_for_leader(
@@ -270,6 +274,41 @@ int ObScheduleTabletFunc::schedule_tablet_new_round(
       }
     }
     time_guard_.click(ObCompactionScheduleTimeGuard::SCHEDULE_NEXT_MEDIUM);
+  }
+  return ret;
+}
+
+int ObScheduleTabletFunc::prepare_async_delete_index_tablet_(ObTabletHandle &tablet_handle)
+{
+  int ret = OB_SUCCESS;
+  async_delete_published_version_ = -1;
+  if (OB_UNLIKELY(!tablet_handle.is_valid() || !ls_status_.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid deletion schedule input", KR(ret), K(tablet_handle), K_(ls_status));
+  } else if (ls_could_schedule_new_round_ && tablet_handle.get_obj()->is_async_delete_index()) {
+    const ObTabletID tablet_id = tablet_handle.get_obj()->get_tablet_id();
+    int32_t tablet_epoch = -1;
+    int64_t published_version = 0;
+    ObTabletHandle current_handle;
+    // Read P before acquiring the owner of both the medium list and the merge inputs.
+    if (OB_FAIL(tablet_handle.get_obj()->get_private_transfer_epoch(tablet_epoch))) {
+      LOG_WARN("failed to get deletion transfer epoch", KR(ret), K(tablet_id));
+    } else if (OB_FAIL(tablet_handle.get_obj()->get_latest_async_index_published_version(published_version))) {
+      LOG_WARN("failed to get deletion published version", KR(ret), K(tablet_id));
+    } else if (OB_FAIL(ls_status_.get_ls().get_tablet(tablet_id, current_handle))) {
+      LOG_WARN("failed to get deletion tablet after publication", KR(ret), K(tablet_id));
+    } else if (OB_UNLIKELY(!current_handle.is_valid()
+        || !current_handle.get_obj()->is_async_delete_index())) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_WARN("deletion tablet changed during preparation", KR(ret), K(tablet_id), K(tablet_epoch));
+    } else if (OB_FAIL(ObTablet::check_private_transfer_epoch_equal(
+        *current_handle.get_obj(), tablet_epoch))) {
+      LOG_WARN("deletion transfer epoch changed during preparation", KR(ret), K(tablet_id), K(tablet_epoch));
+    } else if (OB_FAIL(tablet_handle.assign(current_handle))) {
+      LOG_WARN("failed to hold deletion schedule tablet", KR(ret), K(tablet_id));
+    } else {
+      async_delete_published_version_ = published_version;
+    }
   }
   return ret;
 }
@@ -419,6 +458,10 @@ int ObScheduleTabletFunc::request_schedule_new_round(
     LOG_WARN("failed to check deletion tablet status", KR(ret), K(tablet_id));
   } else if (skip_async_index_schedule) {
     // A direct medium request must not bypass the DROP checks in the periodic scheduler.
+  } else if (need_load_tablet_status
+      && OB_FAIL(prepare_async_delete_index_tablet_(tablet_handle))) {
+    LOG_WARN("failed to prepare deletion tablet for request", KR(ret), K(tablet_id));
+  } else if (FALSE_IT(tablet = tablet_handle.get_obj())) {
   } else if (need_load_tablet_status && OB_FAIL(tablet_status_.init_for_major(
                  ls_status_.get_ls(), merge_version_, *tablet,
                  ls_could_schedule_new_round_))) {
@@ -472,7 +515,7 @@ int ObScheduleTabletFunc::request_schedule_new_round(
     LOG_WARN("failed to schedule tablet new round", KR(tmp_ret), K_(ls_status), K(tablet_id));
   }
   if (need_load_tablet_status) {
-    tablet_status_.destroy();
+    destroy_tablet_status();
   }
   return ret;
 }
@@ -628,7 +671,7 @@ int ObScheduleTabletFunc::diagnose_switch_tablet(
 {
   int ret = OB_SUCCESS;
   const ObTabletID &tablet_id = tablet.get_tablet_id();
-  tablet_status_.destroy();
+  destroy_tablet_status();
   if (OB_FAIL(tablet_status_.init_for_diagnose(ls, merge_version_, tablet))) {
     LOG_WARN("failed to init tablet status", KR(ret), K_(merge_version), K(ls_status_), K(tablet_id));
   }

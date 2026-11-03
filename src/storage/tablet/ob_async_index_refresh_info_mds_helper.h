@@ -39,15 +39,17 @@ class ObTabletAsyncIndexRefreshInfoArg
   OB_UNIS_VERSION(2);
 public:
   ObTabletAsyncIndexRefreshInfoArg()
-      : ls_id_(), tablet_id_(), info_(), floor_pin_only_(false) {}
+      : ls_id_(), tablet_id_(), info_(), floor_pin_only_(false), expected_published_version_(0) {}
   ~ObTabletAsyncIndexRefreshInfoArg() = default;
   bool is_valid() const;
-  TO_STRING_KV(K_(ls_id), K_(tablet_id), K_(info), K_(floor_pin_only));
+  TO_STRING_KV(K_(ls_id), K_(tablet_id), K_(info), K_(floor_pin_only), K_(expected_published_version));
 public:
   share::ObLSID ls_id_;
   ObTabletID tablet_id_;
   ObTabletAsyncIndexRefreshInfo info_;
   bool floor_pin_only_;
+  // Registration-only precondition for offline swap; not retained in the MDS value.
+  int64_t expected_published_version_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObTabletAsyncIndexRefreshInfoArg);
 };
@@ -58,18 +60,20 @@ public:
   static int on_register(const char *buf, const int64_t len, mds::BufferCtx &ctx);
   static int on_replay(const char *buf, const int64_t len, const share::SCN scn, mds::BufferCtx &ctx);
   static int process(const char *buf, const int64_t len, const share::SCN &scn, mds::BufferCtx &ctx, bool for_replay);
-  // Register an explicit membership value for every data tablet in the same
+  // Register membership from data_table_schema.has_async_index() for every data tablet in the same
   // SQL transaction that changes the table schema flag. This method also
   // serializes membership changes with background refresh-info maintenance.
+  // Pass the build snapshot for the first online async index to pin it atomically.
+  // Zero protects the commit version for new empty tablets; hidden tables only
+  // initialize membership.
   static int register_membership(
       const share::schema::ObTableSchema &data_table_schema,
-      const bool has_async_index,
-      common::ObMySQLTransaction &trans);
+      common::ObMySQLTransaction &trans,
+      const int64_t initial_snapshot = 0);
   // Register membership for tablets whose LS mapping is already known.
   static int register_ls_tablets_membership(
       const uint64_t tenant_id,
       const common::ObIArray<obrpc::ObLSTabletPair> &ls_tablets,
-      const bool has_async_index,
       common::ObMySQLTransaction &trans);
   // Register published_version for async-index TARGET tablets whose LS mapping is already known.
   static int register_ls_tablets_initial_published_versions(
@@ -81,6 +85,13 @@ public:
       const uint64_t tenant_id,
       const common::ObIArray<share::schema::ObTableSchema> &table_schemas,
       const int64_t snapshot_version,
+      common::ObMySQLTransaction &trans);
+  // Called only by offline swap, after every target's committed logical publication
+  // has reached base_snapshot. Empty refreshes may leave the physical watermark behind.
+  static int register_offline_publication(
+      const share::schema::ObTableSchema &data_table_schema,
+      const common::ObIArray<share::schema::ObTableSchema> &table_schemas,
+      const int64_t base_snapshot,
       common::ObMySQLTransaction &trans);
   // The caller holds the target Tablet refresh lock in this transaction.
   static int register_published_version(
@@ -114,8 +125,8 @@ private:
       common::ObMySQLTransaction &trans);
   static int register_membership_(
       const share::schema::ObTableSchema &data_table_schema,
-      const bool has_async_index,
-      common::ObMySQLTransaction &trans);
+      common::ObMySQLTransaction &trans,
+      const int64_t initial_snapshot);
   static int register_refresh_info_(
       const uint64_t tenant_id,
       const share::ObLSID &ls_id,
@@ -124,16 +135,17 @@ private:
       common::ObMySQLTransaction &trans,
       common::ObIAllocator &allocator,
       const bool need_flush_redo_instantly,
-      const bool floor_pin_only = false);
+      const bool floor_pin_only = false,
+      const int64_t expected_published_version = 0);
   static int register_tablets_refresh_info_(
       const uint64_t tenant_id,
       const common::ObIArray<common::ObTabletID> &tablet_ids,
       const ObTabletAsyncIndexRefreshInfo &refresh_info,
-      common::ObMySQLTransaction &trans);
+      common::ObMySQLTransaction &trans,
+      const int64_t expected_published_version = 0);
   static int register_ls_tablets_membership_(
       const uint64_t tenant_id,
       const common::ObIArray<obrpc::ObLSTabletPair> &ls_tablets,
-      const bool has_async_index,
       common::ObMySQLTransaction &trans);
   static int register_ls_tablets_refresh_info_(
       const uint64_t tenant_id,

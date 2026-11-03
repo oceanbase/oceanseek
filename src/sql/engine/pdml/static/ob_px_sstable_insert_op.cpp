@@ -511,6 +511,46 @@ int ObPxMultiPartSSTableInsertOp::eval_current_batch(ObIArray<ObIVector *> &vect
 
 }
 
+int ObPxMultiPartSSTableInsertOp::eval_idempotent_doc_id_batch(
+    ObIArray<ObIVector *> &vectors, const ObBatchRows &brs, const ObBatchSelector &selector,
+    const ObDDLAutoincParam &autoinc_param, const int64_t slice_row_count)
+{
+  int ret = OB_SUCCESS;
+  vectors.reuse();
+  const ObExprPtrIArray &exprs = get_spec().ins_ctdef_.new_row_;
+  ObEvalCtx &eval_ctx = get_eval_ctx();
+  ObEvalCtx::BatchInfoScopeGuard batch_guard(eval_ctx);
+  batch_guard.set_batch_size(brs.size_);
+  // The selector contains consecutive active rows from one tablet/slice. Keep
+  // their ordinals independent of batch boundaries and skipped input rows.
+  for (int64_t i = 0; OB_SUCC(ret) && i < selector.size(); ++i) {
+    const int64_t batch_idx = selector.get_offset() + i;
+    batch_guard.set_batch_idx(batch_idx);
+    eval_ctx.exec_ctx_.set_ddl_idempotent_autoinc_params(
+        autoinc_param.slice_count_, autoinc_param.slice_idx_, slice_row_count + i,
+        autoinc_param.autoinc_range_interval_);
+    for (int64_t j = 0; OB_SUCC(ret) && j < exprs.count(); ++j) {
+      ObDatum *datum = nullptr;
+      if (OB_FAIL(exprs.at(j)->eval(eval_ctx, datum))) {
+        LOG_WARN("evaluate idempotent doc id row failed", K(ret), K(batch_idx), K(j));
+      }
+    }
+  }
+  // Scalar evaluation has populated the datums. Only materialize a vector
+  // view if needed; do not re-enter expression evaluation for this slice.
+  for (int64_t i = 0; OB_SUCC(ret) && i < exprs.count(); ++i) {
+    const ObExpr *expr = exprs.at(i);
+    if (VEC_INVALID == expr->get_format(eval_ctx)
+        && OB_FAIL(expr->init_vector(eval_ctx,
+            expr->is_batch_result() ? VEC_UNIFORM : VEC_UNIFORM_CONST, brs.size_))) {
+      LOG_WARN("init evaluated vector failed", K(ret), K(i));
+    } else if (OB_FAIL(vectors.push_back(expr->get_vector(eval_ctx)))) {
+      LOG_WARN("push back current vector failed", K(ret), K(i));
+    }
+  }
+  return ret;
+}
+
 int ObPxMultiPartSSTableInsertOp::locate_exprs()
 {
   int ret = OB_SUCCESS;
@@ -863,6 +903,7 @@ int ObPxMultiPartSSTableInsertOp::write_ordered_slice_by_batch()
   
   ObArray<ObIVector *> vectors;
   ObISliceWriter *slice_writer = nullptr;
+  ObDDLAutoincParam autoinc_param;
   ObTabletID tablet_id;
   int64_t slice_idx = -1;
   ObIVector *slice_info_vector = nullptr;
@@ -890,7 +931,8 @@ int ObPxMultiPartSSTableInsertOp::write_ordered_slice_by_batch()
     } else if (FALSE_IT(need_update_tablet_range_count_ = false)) {
     } else if (OB_UNLIKELY(brs->size_ <= 0)) {
       is_all_partition_finished_ = brs->end_;
-    } else if (OB_FAIL(eval_current_batch(vectors, *brs))) {
+    } else if (need_idempotent_doc_id_ && FALSE_IT(clear_evaluated_flag())) {
+    } else if (!need_idempotent_doc_id_ && OB_FAIL(eval_current_batch(vectors, *brs))) {
       LOG_WARN("eval current batch failed", K(ret));
     } else if (slice_info_expr_ != nullptr && OB_FAIL(slice_info_expr_->eval_vector(eval_ctx, *brs))) {
       LOG_WARN("eval slice info expr failed", K(ret));
@@ -907,11 +949,18 @@ int ObPxMultiPartSSTableInsertOp::write_ordered_slice_by_batch()
         LOG_WARN("get continue slice failed", K(ret));
       } else if (OB_UNLIKELY(offset >= brs->size_)) {
         // do nothing
-      } else if (OB_FAIL(switch_slice_if_need(tablet_id, slice_idx, true/*is_append_batch*/, slice_writer))) {
+      } else if (OB_FAIL(switch_slice_if_need(
+          tablet_id, slice_idx, true/*is_append_batch*/, slice_writer, &autoinc_param))) {
         LOG_WARN("switch slice if need failed", K(ret), K(tablet_id), K(slice_idx));
       } else {
         ObBatchSelector selector(offset, row_count);
-        if (OB_FAIL(slice_writer->append_current_batch(vectors, selector))) {
+        int64_t slice_row_count = 0;
+        if (need_idempotent_doc_id_ && OB_FAIL(slice_writer->get_row_count(slice_row_count))) {
+          LOG_WARN("get slice row count failed", K(ret));
+        } else if (need_idempotent_doc_id_ && OB_FAIL(eval_idempotent_doc_id_batch(
+            vectors, *brs, selector, autoinc_param, slice_row_count))) {
+          LOG_WARN("eval idempotent doc id batch failed", K(ret));
+        } else if (OB_FAIL(slice_writer->append_current_batch(vectors, selector))) {
           LOG_WARN("append batch failed", K(ret));
         } else {
           offset += row_count;
@@ -920,7 +969,9 @@ int ObPxMultiPartSSTableInsertOp::write_ordered_slice_by_batch()
     }
   }
   if (OB_SUCC(ret) && is_all_partition_finished_ && nullptr != slice_writer) {
-    if (OB_FAIL(slice_writer->close())) {
+    if (need_idempotent_doc_id_ && OB_FAIL(sync_tablet_doc_id(slice_writer))) {
+      LOG_WARN("sync tablet doc id failed", K(ret), KPC(slice_writer));
+    } else if (OB_FAIL(slice_writer->close())) {
       LOG_WARN("close slice writer failed", K(ret));
     }
   }

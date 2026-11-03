@@ -672,11 +672,10 @@ int ObBackupMacroCopyTaskGenStrategy::generate_tasks_by_tablet(
   } else {
     MTL_SWITCH(tenant_id) {
       // Reuse the tablet meta value parser so minor shared-data macros are
-      // collected from each sstable. Prewarm files are rebuildable cache and may
-      // not exist, so BR does not copy them.
+      // collected from each sstable.
       if (OB_FAIL(ObSSMetaTabletMacroIDIterator::collect_blocks_from_tablet_meta_value(
               allocator, ls_id, tablet_id, reorganize_scn, ss_tablet_row.meta_value_,
-              true /*fill_occupy_size*/, false /*include_prewarm*/, block_infos))) {
+              true /*fill_occupy_size*/, block_infos))) {
         LOG_WARN("fail to collect blocks from tablet meta value", K(ret), K(ls_id), K(tablet_id));
       }
     }

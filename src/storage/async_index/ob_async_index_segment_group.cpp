@@ -63,10 +63,8 @@ ObAsyncIndexSegmentGroupCtx::ObAsyncIndexSegmentGroupCtx()
   : allocator_("AIndexSGC", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
     async_index_read_snapshot_(),
     delete_table_published_version_(INT64_MAX),
-    is_strict_aligned_(false),
     groups_(),
     index_tablet_handles_(),
-    index_physical_published_versions_(),
     index_published_versions_(),
     index_version_ranges_(OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator("AIndexSGCV", MTL_ID()))
 {
@@ -76,9 +74,20 @@ ObAsyncIndexSegmentGroupCtx::ObAsyncIndexSegmentGroupCtx()
 
 void ObAsyncIndexSegmentGroupCtx::reset()
 {
-  async_index_read_snapshot_.reset();
+  reset_query_result_();
   delete_table_published_version_ = INT64_MAX;
-  is_strict_aligned_ = false;
+  for (int64_t i = 0; i < index_version_ranges_.count(); ++i) {
+    index_version_ranges_.at(i).reset();
+  }
+  index_version_ranges_.reset();
+  index_tablet_handles_.reset();
+  index_published_versions_.reset();
+  allocator_.reset();
+}
+
+void ObAsyncIndexSegmentGroupCtx::reset_query_result_()
+{
+  async_index_read_snapshot_.reset();
   for (int64_t i = 0; i < groups_.count(); ++i) {
     ObAsyncIndexSegmentGroup *segment_group = groups_.at(i);
     if (OB_NOT_NULL(segment_group)) {
@@ -87,14 +96,6 @@ void ObAsyncIndexSegmentGroupCtx::reset()
     }
   }
   groups_.reset();
-  for (int64_t i = 0; i < index_version_ranges_.count(); ++i) {
-    index_version_ranges_.at(i).reset();
-  }
-  index_version_ranges_.reset();
-  index_tablet_handles_.reset();
-  index_physical_published_versions_.reset();
-  index_published_versions_.reset();
-  allocator_.reset();
 }
 
 bool ObAsyncIndexSegmentGroupCtx::ObNewVersionRangeCompare::operator()(
@@ -129,29 +130,33 @@ int ObAsyncIndexSegmentGroupCtx::add_index_tablet_version_ranges(
     const int64_t published_version)
 {
   int ret = OB_SUCCESS;
-  int64_t physical_published_version = 0;
-  for (int64_t i = 0; i < tablet_version_ranges.count(); ++i) {
-    physical_published_version = OB_MAX(
-        physical_published_version,
-        tablet_version_ranges.at(i).snapshot_version_);
-  }
-  if (OB_UNLIKELY(published_version < physical_published_version)) {
+  if (OB_UNLIKELY(published_version < 0)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("async-index query published version is behind physical ranges",
-             K(ret), K(physical_published_version), K(published_version));
+    LOG_WARN("invalid async index published version", K(ret), K(published_version));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < tablet_version_ranges.count(); ++i) {
+    const common::ObNewVersionRange &range = tablet_version_ranges.at(i);
+    if (OB_UNLIKELY(range.base_version_ < 0
+        || range.snapshot_version_ <= range.base_version_)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid async index version range", K(ret), K(range));
+    }
+  }
+  if (OB_FAIL(ret)) {
   } else if (OB_FAIL(index_tablet_handles_.push_back(tablet_handle))) {
     LOG_WARN("failed to push tablet handle", K(ret), K(tablet_handle));
   } else {
-    lib::ob_sort(tablet_version_ranges.get_data(), tablet_version_ranges.get_data() + tablet_version_ranges.count(), ObNewVersionRangeCompare());
+    // The tablet may have advanced after reading the committed logical watermark.
+    // Keep newer tables here; query selection checks the common read boundary.
+    if (!tablet_version_ranges.empty()) {
+      lib::ob_sort(tablet_version_ranges.get_data(),
+          tablet_version_ranges.get_data() + tablet_version_ranges.count(),
+          ObNewVersionRangeCompare());
+    }
     if (OB_FAIL(index_version_ranges_.push_back(tablet_version_ranges))) {
       LOG_WARN("failed to push tablet version ranges", K(ret));
-    } else if (OB_FAIL(index_physical_published_versions_.push_back(
-                   physical_published_version))) {
-      LOG_WARN("failed to push physical async-index published version", K(ret),
-               K(physical_published_version));
     } else if (OB_FAIL(index_published_versions_.push_back(published_version))) {
-      LOG_WARN("failed to push async-index published version", K(ret),
-               K(published_version));
+      LOG_WARN("failed to push async index published version", K(ret), K(published_version));
     }
   }
   return ret;
@@ -176,104 +181,18 @@ int ObAsyncIndexSegmentGroupCtx::build_query_ranges_(
     common::ObIArray<common::ObNewVersionRange> &out_ranges)
 {
   int ret = OB_SUCCESS;
-  out_ranges.reset();
-  for (int64_t j = 0; OB_SUCC(ret) && j < tablet_version_ranges.count();) {
-    const common::ObNewVersionRange &version_range = tablet_version_ranges.at(j);
-    if (version_range.snapshot_version_ > read_ver) {
-      // skip ranges beyond read snapshot
-      LOG_INFO("skip range beyond read snapshot", K(j), K(version_range), K(read_ver));
-      ++j;
-    } else if (OB_FAIL(out_ranges.push_back(version_range))) {
-      LOG_WARN("failed to push query range", K(ret), K(j), K(version_range));
-    } else {
-      while (j < tablet_version_ranges.count()
-        && tablet_version_ranges.at(j).base_version_ >= version_range.base_version_
-        && tablet_version_ranges.at(j).snapshot_version_ <= version_range.snapshot_version_) {
-        ++j;
-      }
+  out_ranges.reuse();
+  for (int64_t j = 0; OB_SUCC(ret) && j < tablet_version_ranges.count(); ++j) {
+    const common::ObNewVersionRange &range = tablet_version_ranges.at(j);
+    if (range.snapshot_version_ <= read_ver && OB_FAIL(out_ranges.push_back(range))) {
+      LOG_WARN("failed to push query range", K(ret), K(j), K(range));
     }
   }
   return ret;
 }
 
-int ObAsyncIndexSegmentGroupCtx::find_base_tablet_idx_(
-    const common::ObArrayArray<common::ObNewVersionRange, 8> &query_lists,
-    const common::ObIArray<int64_t> &physical_published_versions,
-    int64_t &base_idx,
-    bool &is_strict_aligned)
-{
-  int ret = OB_SUCCESS;
-  base_idx = 0;
-  is_strict_aligned = true;
-  const common::ObIArray<common::ObNewVersionRange> &first_list = query_lists.at(0);
-  const int64_t first_cnt = first_list.count();
-  int64_t max_cnt = first_cnt;
-  int64_t max_physical_published_version =
-      physical_published_versions.at(0);
-  for (int64_t i = 1; OB_SUCC(ret) && i < query_lists.count(); ++i) {
-    const common::ObIArray<common::ObNewVersionRange> &current_list = query_lists.at(i);
-    const int64_t cnt = query_lists.at(i).count();
-    const int64_t physical_published_version =
-        physical_published_versions.at(i);
-    // 随表创建可能使多个索引处于不同物理水位。基准 Tablet 必须先覆盖
-    // 最远的真实物理 range，避免用另一个索引的逻辑空后缀截断扫描范围；
-    // 物理水位相同时再选择 range 更多的 Tablet，保留原有细粒度对齐能力。
-    if (physical_published_version > max_physical_published_version
-        || (physical_published_version == max_physical_published_version
-            && cnt > max_cnt)) {
-      max_physical_published_version = physical_published_version;
-      max_cnt = cnt;
-      base_idx = i;
-    }
-    if (cnt != first_cnt) {
-      is_strict_aligned = false;
-    } else if (is_strict_aligned) {
-      for (int64_t j = 0; is_strict_aligned && j < cnt; ++j) {
-        is_strict_aligned =
-            first_list.at(j).base_version_ == current_list.at(j).base_version_
-            && first_list.at(j).snapshot_version_ == current_list.at(j).snapshot_version_;
-      }
-    }
-  }
-  return ret;
-}
-
-int ObAsyncIndexSegmentGroupCtx::build_strict_aligned_segment_groups_(
-    const common::ObArrayArray<common::ObNewVersionRange, 8> &query_lists,
-    const int64_t base_idx,
-    const int64_t tablet_cnt)
-{
-  int ret = OB_SUCCESS;
-  const common::ObIArray<common::ObNewVersionRange> &base_list = query_lists.at(base_idx);
-  for (int64_t k = 0; OB_SUCC(ret) && k < base_list.count(); ++k) {
-    ObAsyncIndexSegmentGroup *segment_group = nullptr;
-    if (OB_ISNULL(segment_group = OB_NEWx(ObAsyncIndexSegmentGroup, &allocator_))) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      LOG_WARN("failed to allocate segment group", K(ret), "size", sizeof(ObAsyncIndexSegmentGroup));
-    } else if (OB_FAIL(segment_group->init(tablet_cnt))) {
-      LOG_WARN("failed to init segment group", K(ret), K(tablet_cnt));
-    }
-    for (int64_t i = 0; OB_SUCC(ret) && i < tablet_cnt; ++i) {
-      if (OB_FAIL(segment_group->add_version_range(i, query_lists.at(i).at(k)))) {
-        LOG_WARN("failed to add version range to segment group", K(ret), K(i), K(k), "version_range", query_lists.at(i).at(k));
-      }
-    }
-    if (OB_FAIL(ret)) {
-      if (OB_NOT_NULL(segment_group)) {
-        segment_group->reset();
-        OB_DELETEx(ObAsyncIndexSegmentGroup, &allocator_, segment_group);
-      }
-    } else if (OB_FAIL(groups_.push_back(segment_group))) {
-      LOG_WARN("failed to push segment group", K(ret), K(k));
-      segment_group->reset();
-      OB_DELETEx(ObAsyncIndexSegmentGroup, &allocator_, segment_group);
-    }
-  }
-  return ret;
-}
-
-
-int ObAsyncIndexSegmentGroupCtx::calc_async_index_read_snapshot_(const share::SCN &sql_read_snapshot)
+int ObAsyncIndexSegmentGroupCtx::calc_async_index_read_snapshot_(
+    const share::SCN &sql_read_snapshot, share::SCN &upper_bound) const
 {
   int ret = OB_SUCCESS;
   int64_t min_published_version = INT64_MAX;
@@ -285,12 +204,10 @@ int ObAsyncIndexSegmentGroupCtx::calc_async_index_read_snapshot_(const share::SC
   } else if (OB_UNLIKELY(0 == tablet_cnt)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(tablet_cnt));
-  } else if (OB_UNLIKELY(index_physical_published_versions_.count() != tablet_cnt
-                         || index_published_versions_.count() != tablet_cnt)) {
+  } else if (OB_UNLIKELY(index_published_versions_.count() != tablet_cnt)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("async-index range and published-version count mismatch", K(ret), K(tablet_cnt),
-             "physical_published_version_count",
-             index_physical_published_versions_.count(), "published_version_count",
+             "published_version_count",
              index_published_versions_.count());
   }
   for (int64_t i = 0; OB_SUCC(ret) && i < tablet_cnt; ++i) {
@@ -302,251 +219,195 @@ int ObAsyncIndexSegmentGroupCtx::calc_async_index_read_snapshot_(const share::SC
   if (OB_SUCC(ret) && OB_FAIL(min_published_scn.convert_for_tx(min_published_version))) {
     LOG_WARN("failed to convert min published version to scn", K(ret), K(min_published_version));
   } else if (OB_SUCC(ret)) {
-    async_index_read_snapshot_ = share::SCN::min(sql_read_snapshot, min_published_scn);
+    upper_bound = share::SCN::min(sql_read_snapshot, min_published_scn);
   }
   return ret;
 }
 
 int ObAsyncIndexSegmentGroupCtx::find_version_chain_(
     const common::ObIArray<common::ObNewVersionRange> &tablet_version_ranges,
-    int64_t &pos,
     const int64_t merge_start,
     const int64_t merge_end,
     common::ObIArray<common::ObNewVersionRange> &out_chain)
 {
   int ret = OB_SUCCESS;
   out_chain.reuse();
-  int64_t covered_start = merge_start;
-  int64_t j = pos;
-  for (; OB_SUCC(ret) && j < tablet_version_ranges.count();) {
-    const common::ObNewVersionRange &version_range = tablet_version_ranges.at(j);
-    const int64_t covered_end = version_range.snapshot_version_;
-    if (version_range.base_version_ < covered_start) {
-      LOG_WARN("version range is before covered start", K(pos), K(j), K(version_range), K(covered_start));
-      ++j;
-    } else if (version_range.base_version_ != covered_start) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected version range", K(ret), K(pos), K(j), K(version_range), K(covered_start));
-    } else if (version_range.snapshot_version_ > merge_end) {
-      LOG_TRACE("this range is after merge_end", K(pos), K(j), K(version_range), K(merge_end));
-      ++j;
-      if (j < tablet_version_ranges.count()) {
-        if (tablet_version_ranges.at(j).base_version_ > merge_end) {
-          LOG_TRACE("covered start is greater than merge end", K(pos), K(j), K(covered_start), K(merge_end));
-          break;
-        } else if (tablet_version_ranges.at(j).snapshot_version_ > merge_end) {
-          LOG_TRACE("this range is after merge_end", K(pos), K(j), K(tablet_version_ranges.at(j)), K(merge_end));
-          break;
-        }
-      }
-    } else {
-      if (OB_FAIL(out_chain.push_back(version_range))) {
-        LOG_WARN("failed to push chain range", K(ret), K(version_range));
-      } else {
-        // Advance j until (base_version_, snapshot_version_] is not within (covered_start, covered_end]
-        ++j;
-        while (j < tablet_version_ranges.count()
-            && tablet_version_ranges.at(j).base_version_ >= covered_start
-            && tablet_version_ranges.at(j).snapshot_version_ <= covered_end) {
-          LOG_TRACE("skip this range", K(pos), K(j), K(tablet_version_ranges.at(j)), K(covered_start), K(covered_end));
-          ++j;
-        }
-        if (j < tablet_version_ranges.count()) {
-          covered_start = tablet_version_ranges.at(j).base_version_;
-          LOG_TRACE("update covered start", K(pos), K(j), K(covered_start));
-          if (covered_start > merge_end) {
-            LOG_TRACE("covered start is greater than merge end", K(pos), K(j), K(covered_start), K(merge_end));
-            break;
-          } else if (tablet_version_ranges.at(j).snapshot_version_ > merge_end) {
-            LOG_TRACE("this range is after merge_end", K(pos), K(j), K(tablet_version_ranges.at(j)), K(merge_end));
-            break;
-          }
-        }
-      }
+  // select_query_ranges_ has checked that both group boundaries do not cut an SSTable.
+  for (int64_t pos = 0; OB_SUCC(ret) && pos < tablet_version_ranges.count(); ++pos) {
+    const common::ObNewVersionRange &range = tablet_version_ranges.at(pos);
+    if (range.base_version_ >= merge_end) {
+      break;
+    } else if (range.snapshot_version_ <= merge_start) {
+      // Already consumed by an earlier group.
+    } else if (OB_FAIL(out_chain.push_back(range))) {
+      LOG_WARN("failed to push chain range", K(ret), K(range));
     }
-  }
-  if (OB_SUCC(ret)) {
-    LOG_TRACE("find version chain v2", K(pos), K(j), K(merge_start), K(merge_end));
-    pos = j;
   }
   return ret;
 }
 
-bool ObAsyncIndexSegmentGroupCtx::is_version_chain_complete_(
-    const common::ObIArray<common::ObNewVersionRange> &version_chain,
-    const int64_t merge_start,
-    const int64_t merge_end,
-    const int64_t physical_published_version,
-    const int64_t query_published_version)
+bool ObAsyncIndexSegmentGroupCtx::is_group_boundary_(
+    const common::ObIArray<common::ObNewVersionRange> &ranges,
+    const int64_t boundary)
 {
-  // query_published_version 只有在随表创建的 (P, C] 区间已证明
-  // 没有用户数据时才会高于物理水位 P。物理 chain 必须连续覆盖到 P；
-  // 这里只允许用逻辑空后缀补齐尾部，任何 P 之前的物理 gap 仍然失败。
-  const int64_t physical_cover_end = OB_MIN(merge_end, physical_published_version);
-  bool is_complete = merge_start < merge_end
-      && !version_chain.empty()
-      && physical_published_version >= 0
-      && query_published_version >= physical_published_version
-      && merge_end <= query_published_version;
-  int64_t covered_end = merge_start;
-  for (int64_t i = 0; is_complete && i < version_chain.count(); ++i) {
-    const common::ObNewVersionRange &version_range = version_chain.at(i);
-    if (version_range.base_version_ != covered_end
-        || version_range.snapshot_version_ <= version_range.base_version_
-        || version_range.snapshot_version_ > physical_cover_end) {
-      is_complete = false;
-    } else {
-      covered_end = version_range.snapshot_version_;
-    }
+  bool is_safe = true;
+  for (int64_t i = 0; is_safe && i < ranges.count(); ++i) {
+    is_safe = ranges.at(i).base_version_ >= boundary
+        || ranges.at(i).snapshot_version_ <= boundary;
   }
-  return is_complete && covered_end == physical_cover_end;
+  return is_safe;
 }
 
-static bool has_version_range_starting_at(
-    const common::ObIArray<common::ObNewVersionRange> &version_ranges,
-    const int64_t start_pos,
-    const int64_t base_version)
+int64_t ObAsyncIndexSegmentGroupCtx::next_group_end_(
+    const common::ObArrayArray<common::ObNewVersionRange, 8> &query_lists,
+    const int64_t base_idx,
+    const int64_t previous_end,
+    int64_t &base_pos)
 {
-  bool found = false;
-  for (int64_t i = start_pos; !found && i < version_ranges.count(); ++i) {
-    if (version_ranges.at(i).base_version_ < base_version) {
-      // Skip obsolete ranges that overlap a segment already selected for the current group.
-    } else {
-      found = version_ranges.at(i).base_version_ == base_version;
-      break;
+  const common::ObIArray<common::ObNewVersionRange> &base = query_lists.at(base_idx);
+  while (base_pos < base.count() && base.at(base_pos).snapshot_version_ <= previous_end) {
+    ++base_pos;
+  }
+  int64_t next_end = base_pos < base.count()
+      ? base.at(base_pos).snapshot_version_ : INT64_MAX;
+  const int64_t gap_end = base_pos < base.count()
+      ? base.at(base_pos).base_version_ : INT64_MAX;
+  // Probe other indexes' endpoints through the base tablet's head, middle and tail gaps.
+  for (int64_t i = 0; i < query_lists.count(); ++i) {
+    const common::ObIArray<common::ObNewVersionRange> &ranges = query_lists.at(i);
+    for (int64_t j = 0; j < ranges.count(); ++j) {
+      const int64_t end = ranges.at(j).snapshot_version_;
+      if (end > previous_end && (end <= gap_end || INT64_MAX == next_end)) {
+        next_end = OB_MIN(next_end, end);
+      }
     }
   }
-  return found;
+  return next_end;
+}
+
+int ObAsyncIndexSegmentGroupCtx::append_segment_group_(
+    const common::ObArrayArray<common::ObNewVersionRange, 8> &chains)
+{
+  int ret = OB_SUCCESS;
+  ObAsyncIndexSegmentGroup *group = nullptr;
+  if (OB_ISNULL(group = OB_NEWx(ObAsyncIndexSegmentGroup, &allocator_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate segment group", K(ret));
+  } else if (OB_FAIL(group->init(chains.count()))) {
+    LOG_WARN("failed to initialize segment group", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < chains.count(); ++i) {
+    for (int64_t j = 0; OB_SUCC(ret) && j < chains.at(i).count(); ++j) {
+      if (OB_FAIL(group->add_version_range(i, chains.at(i).at(j)))) {
+        LOG_WARN("failed to add group range", K(ret), K(i), K(j));
+      }
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(groups_.push_back(group))) {
+    LOG_WARN("failed to push segment group", K(ret));
+  }
+  if (OB_FAIL(ret) && OB_NOT_NULL(group)) {
+    OB_DELETEx(ObAsyncIndexSegmentGroup, &allocator_, group);
+  }
+  return ret;
 }
 
 int ObAsyncIndexSegmentGroupCtx::calc_query_version_ranges(const share::SCN &sql_read_snapshot)
 {
   int ret = OB_SUCCESS;
+  share::SCN upper_bound;
+  const bool already_calculated = !groups_.empty();
+  if (already_calculated) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("segment groups already calculated", K(ret));
+  } else if (OB_FAIL(calc_async_index_read_snapshot_(sql_read_snapshot, upper_bound))) {
+    LOG_WARN("failed to calculate async index upper bound", K(ret), K(sql_read_snapshot));
+  }
+  int64_t read_ver = OB_SUCC(ret) ? upper_bound.get_val_for_tx() : 0;
+  bool changed = true;
+  // No historical replacement: move R to the start of each crossing SSTable.
+  // Revisit other indexes because lowering R can cut an earlier SSTable there.
+  while (OB_SUCC(ret) && changed) {
+    changed = false;
+    for (int64_t i = 0; i < index_version_ranges_.count(); ++i) {
+      const common::ObIArray<common::ObNewVersionRange> &ranges = index_version_ranges_.at(i);
+      for (int64_t j = 0; j < ranges.count(); ++j) {
+        if (ranges.at(j).base_version_ < read_ver
+            && read_ver < ranges.at(j).snapshot_version_) {
+          read_ver = ranges.at(j).base_version_;
+          changed = true;
+        }
+      }
+    }
+    if (0 == read_ver && 0 < upper_bound.get_val_for_tx()) {
+      ret = OB_SNAPSHOT_DISCARDED;
+      LOG_WARN("latest async index baseline exceeds read boundary", K(ret), K(upper_bound));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(select_query_ranges_(read_ver))) {
+      LOG_WARN("failed to build async index groups", K(ret), K(read_ver));
+    } else if (OB_FAIL(async_index_read_snapshot_.convert_for_tx(read_ver))) {
+      LOG_WARN("failed to publish async index snapshot", K(ret), K(read_ver));
+    }
+  }
+  if (OB_FAIL(ret) && !already_calculated) {
+    reset_query_result_();
+  }
+  return ret;
+}
+
+int ObAsyncIndexSegmentGroupCtx::select_query_ranges_(const int64_t read_ver)
+{
+  int ret = OB_SUCCESS;
   const int64_t tablet_cnt = index_version_ranges_.count();
-  common::ObSEArray<int64_t, 8> pos_array;
-  common::ObArrayArray<common::ObNewVersionRange, 8> query_lists;
-  if (OB_FAIL(calc_async_index_read_snapshot_(sql_read_snapshot))) {
-    LOG_WARN("failed to calc async index read snapshot", K(ret), K(sql_read_snapshot));
-  } else if (OB_UNLIKELY(0 == tablet_cnt)) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), K(tablet_cnt));
-  } else {
-    int64_t base_idx = -1;
-    const int64_t read_ver = async_index_read_snapshot_.get_val_for_tx();
-    for (int64_t i = 0; OB_SUCC(ret) && i < tablet_cnt; ++i) {
-      common::ObSEArray<common::ObNewVersionRange, 8> query_ranges;
-      if (OB_FAIL(pos_array.push_back(0))) {
-        LOG_WARN("failed to push merge cursor", K(ret), K(i));
-      } else if (OB_FAIL(build_query_ranges_(index_version_ranges_.at(i), read_ver, query_ranges))) {
-        LOG_WARN("failed to build query ranges", K(ret), K(i), K(read_ver));
-      } else if (OB_FAIL(query_lists.push_back(query_ranges))) {
-        LOG_WARN("failed to push query ranges", K(ret), K(i));
+  int64_t base_idx = 0;
+  common::ObArrayArray<common::ObNewVersionRange, 8> query_lists(
+      OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator("AIndexSGCQ", MTL_ID()));
+  common::ObArrayArray<common::ObNewVersionRange, 8> chains(
+      OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator("AIndexSGCC", MTL_ID()));
+  common::ObSEArray<common::ObNewVersionRange, 8> chain;
+  chain.set_attr(ObMemAttr(MTL_ID(), "AIndexSGCT"));
+  for (int64_t i = 0; OB_SUCC(ret) && i < tablet_cnt; ++i) {
+    if (OB_FAIL(query_lists.push_back(chain)) || OB_FAIL(chains.push_back(chain))) {
+      LOG_WARN("failed to initialize query scratch buffers", K(ret));
+    } else if (OB_FAIL(build_query_ranges_(
+        index_version_ranges_.at(i), read_ver, query_lists.at(i)))) {
+      LOG_WARN("failed to build query ranges", K(ret), K(i), K(read_ver));
+    } else if (query_lists.at(i).count() > query_lists.at(base_idx).count()) {
+      base_idx = i;
+    }
+  }
+  int64_t base_pos = 0;
+  int64_t group_start = 0;
+  int64_t candidate_end = 0;
+  while (OB_SUCC(ret)) {
+    candidate_end = next_group_end_(query_lists, base_idx, candidate_end, base_pos);
+    if (INT64_MAX == candidate_end) {
+      break;
+    }
+    bool can_commit = true;
+    for (int64_t i = 0; can_commit && i < tablet_cnt; ++i) {
+      can_commit = is_group_boundary_(query_lists.at(i), candidate_end);
+    }
+    if (can_commit) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < tablet_cnt; ++i) {
+        if (OB_FAIL(find_version_chain_(
+            query_lists.at(i), group_start, candidate_end, chains.at(i)))) {
+          LOG_WARN("failed to select group ranges", K(ret), K(i));
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(append_segment_group_(chains))) {
+        LOG_WARN("failed to append segment group", K(ret));
+      } else if (OB_SUCC(ret)) {
+        group_start = candidate_end;
       }
     }
-
-    if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(find_base_tablet_idx_(
-                   query_lists, index_physical_published_versions_,
-                   base_idx, is_strict_aligned_))) {
-      LOG_WARN("failed to find base tablet", K(ret));
-    } else if (is_strict_aligned_) {
-      if (OB_FAIL(build_strict_aligned_segment_groups_(query_lists, base_idx, tablet_cnt))) {
-        LOG_WARN("failed to build strict aligned segment groups", K(ret));
-      }
-    } else {
-      const common::ObIArray<common::ObNewVersionRange> &base_list = query_lists.at(base_idx);
-      common::ObSEArray<common::ObNewVersionRange, 4> chain;
-      common::ObSEArray<int64_t, 8> candidate_pos_array;
-      int64_t start_pos = 0;
-      int64_t end_pos = 0;
-      while (OB_SUCC(ret) && end_pos < base_list.count()) {
-        const int64_t merge_start = base_list.at(start_pos).base_version_;
-        const int64_t merge_end = base_list.at(end_pos).snapshot_version_;
-
-        int64_t match_cnt = 0;
-        candidate_pos_array.reuse();
-        for (int64_t i = 0; OB_SUCC(ret) && i < tablet_cnt; ++i) {
-          chain.reuse();
-          // notice: not ref
-          int64_t pos = pos_array.at(i);
-          if (OB_FAIL(find_version_chain_(index_version_ranges_.at(i), pos, merge_start, merge_end, chain))) {
-            LOG_WARN("failed to pick ranges for logical segment", K(ret), K(i), K(merge_start), K(merge_end));
-          } else if (OB_FAIL(candidate_pos_array.push_back(pos))) {
-            LOG_WARN("failed to save candidate merge cursor", K(ret), K(i), K(pos));
-          } else if (is_version_chain_complete_(
-                         chain, merge_start, merge_end,
-                         index_physical_published_versions_.at(i),
-                         index_published_versions_.at(i))) {
-            ++match_cnt;
-          }
-        }
-        bool can_commit_group = match_cnt == tablet_cnt;
-        if (OB_SUCC(ret) && can_commit_group && end_pos + 1 < base_list.count()) {
-          const int64_t next_merge_start = base_list.at(end_pos + 1).base_version_;
-          for (int64_t i = 0; can_commit_group && i < tablet_cnt; ++i) {
-            can_commit_group = has_version_range_starting_at(
-                index_version_ranges_.at(i), candidate_pos_array.at(i), next_merge_start);
-          }
-        }
-        if (OB_FAIL(ret)) {
-        } else if (can_commit_group) {
-          ObAsyncIndexSegmentGroup *segment_group = nullptr;
-          if (OB_ISNULL(segment_group = OB_NEWx(ObAsyncIndexSegmentGroup, &allocator_))) {
-            ret = OB_ALLOCATE_MEMORY_FAILED;
-            LOG_WARN("failed to allocate segment group", K(ret), "size", sizeof(ObAsyncIndexSegmentGroup));
-          } else if (OB_FAIL(segment_group->init(tablet_cnt))) {
-            LOG_WARN("failed to init segment group", K(ret), K(tablet_cnt));
-          }
-          for (int64_t i = 0; OB_SUCC(ret) && i < tablet_cnt; ++i) {
-            chain.reuse();
-            // notice: is ref
-            int64_t &pos = pos_array.at(i);
-            if (OB_FAIL(find_version_chain_(index_version_ranges_.at(i), pos, merge_start, merge_end, chain))) {
-              LOG_WARN("failed to pick ranges for logical segment", K(ret), K(i), K(merge_start), K(merge_end));
-            } else if (!is_version_chain_complete_(
-                           chain, merge_start, merge_end,
-                           index_physical_published_versions_.at(i),
-                           index_published_versions_.at(i))) {
-              ret = OB_ERR_UNEXPECTED;
-              LOG_WARN("version chain does not cover logical segment", K(ret), K(i),
-                  K(merge_start), K(merge_end), K(chain));
-            } else {
-              for (int64_t j = 0; OB_SUCC(ret) && j < chain.count(); ++j) {
-                if (OB_FAIL(segment_group->add_version_range(i, chain.at(j)))) {
-                  LOG_WARN("failed to add version range to segment group", K(ret), K(i), K(chain.at(j)));
-                }
-              }
-            }
-          }
-          if (OB_FAIL(ret)) {
-            if (OB_NOT_NULL(segment_group)) {
-              segment_group->reset();
-              OB_DELETEx(ObAsyncIndexSegmentGroup, &allocator_, segment_group);
-            }
-          } else if (OB_FAIL(groups_.push_back(segment_group))) {
-            LOG_WARN("failed to push segment group", K(ret), K(merge_start), K(merge_end));
-            segment_group->reset();
-            OB_DELETEx(ObAsyncIndexSegmentGroup, &allocator_, segment_group);
-          } else {
-            start_pos = end_pos + 1;
-            end_pos = start_pos;
-          }
-        } else {
-          ++end_pos;
-        }
-      }
-      if (OB_FAIL(ret)) {
-      } else if (end_pos != start_pos) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected error", K(ret), K(end_pos), K(start_pos));
-      } else if (end_pos < base_list.count()) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected error", K(ret), K(end_pos), K(base_list.count()));
-      } else if (groups_.empty()) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("no segment group after merge, may be input is invalid", K(ret));
-      }
-    }
+  }
+  // The largest selected endpoint cannot cross any selected SSTable, so every
+  // nonempty input is consumed. Any remaining interval up to R is an empty gap.
+  if (OB_SUCC(ret) && groups_.empty() && OB_FAIL(append_segment_group_(chains))) {
+    LOG_WARN("failed to append all-empty segment group", K(ret));
   }
   return ret;
 }

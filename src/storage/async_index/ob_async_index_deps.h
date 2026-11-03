@@ -25,6 +25,13 @@ namespace storage
 {
 
 class ObLS;  // forward declaration; callers pass ObLS* without needing the full definition
+class ObTabletHandle;
+
+// Reject a migrated/deleted tablet, and optionally verify the generation saved
+// by the scheduler. The returned handle is also used to read its watermark.
+int get_async_index_refresh_tablet(
+    ObLS &ls, const common::ObTabletID &tablet_id, ObTabletHandle &handle,
+    const int64_t transfer_seq = -1);
 
 // Injectable abstraction over the external modules the trigger / scheduler depend on.
 //
@@ -48,7 +55,6 @@ public:
   // The caller passes the ObLS* that owns the tablets so the implementation can
   // access each index tablet directly without re-looking up the LS by id.
   virtual int get_publish_scns(
-      const uint64_t tenant_id,
       ObLS *ls,
       const common::ObIArray<common::ObTabletID> &index_tablet_ids,
       common::ObIArray<share::SCN> &publish_scns) = 0;
@@ -201,7 +207,6 @@ public:
   int refresh_snapshot_scn();
 
   virtual int get_publish_scns(
-      const uint64_t tenant_id,
       ObLS *ls,
       const common::ObIArray<common::ObTabletID> &index_tablet_ids,
       common::ObIArray<share::SCN> &publish_scns) override;

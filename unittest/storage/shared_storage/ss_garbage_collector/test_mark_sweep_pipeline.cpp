@@ -44,23 +44,18 @@ TEST(TestSSMarkSweepCostStat, persist_cost_sums_calls_instead_of_their_span)
   stat.record_kept_meta_scn_persist_cost(100, 110, 3, 1);
   stat.record_kept_meta_scn_persist_cost(1000, 1020, 5, 4);
   // The gap between calls belongs to other work, not persistence.
-  ASSERT_EQ(30, stat.kept_meta_scn_persist_total_cost_us_);
+  ASSERT_EQ(30, stat.kept_meta_scn_persist_cost_us_);
   stat.record_kept_meta_scn_persist_cost(1005, 1035, 2, 1);
   // Overlapping calls each contribute their own duration.
-  ASSERT_EQ(60, stat.kept_meta_scn_persist_total_cost_us_);
-  stat.inc_kept_meta_scn_persist_trans_attempt_count();
-  stat.inc_kept_meta_scn_persist_trans_attempt_count();
-  stat.set_kept_meta_scn_persist_parallelism(2);
+  ASSERT_EQ(60, stat.kept_meta_scn_persist_cost_us_);
+  stat.set_task_parallelism(2);
   ASSERT_EQ(10, stat.kept_meta_scn_persist_plan_count_);
   ASSERT_EQ(6, stat.kept_meta_scn_persist_candidate_count_);
-  ASSERT_EQ(2, stat.kept_meta_scn_persist_trans_attempt_count_);
 
   char buf[2048] = {};
   stat.to_string(buf, sizeof(buf));
   ASSERT_NE(nullptr, STRSTR(buf, ",kept_persist_cost_us=30,"));
-  ASSERT_NE(nullptr, STRSTR(buf, ",kept_persist_plan_cnt=10,"));
-  ASSERT_NE(nullptr, STRSTR(buf, ",kept_persist_candidate_cnt=6,"));
-  ASSERT_NE(nullptr, STRSTR(buf, ",kept_persist_trans_attempt_cnt=2,"));
+  ASSERT_NE(nullptr, STRSTR(buf, ",kept_persist_cnt=6/10),"));
 }
 
 TEST(TestSSMarkSweepCostStat, persist_parallelism_is_safe_for_normalization)
@@ -69,14 +64,14 @@ TEST(TestSSMarkSweepCostStat, persist_parallelism_is_safe_for_normalization)
   stat.record_kept_meta_scn_persist_cost(100, 220, 1, 1);
   const int64_t invalid_parallelisms[] = {0, -4};
   for (const int64_t parallelism : invalid_parallelisms) {
-    stat.set_kept_meta_scn_persist_parallelism(parallelism);
-    ASSERT_EQ(1, stat.kept_meta_scn_persist_parallelism_);
+    stat.set_task_parallelism(parallelism);
+    ASSERT_EQ(1, stat.task_parallelism_);
     char buf[2048] = {};
     stat.to_string(buf, sizeof(buf));
     ASSERT_NE(nullptr, STRSTR(buf, ",kept_persist_cost_us=120,"));
   }
 
-  stat.set_kept_meta_scn_persist_parallelism(3);
+  stat.set_task_parallelism(3);
   char buf[2048] = {};
   stat.to_string(buf, sizeof(buf));
   ASSERT_NE(nullptr, STRSTR(buf, ",kept_persist_cost_us=40,"));
@@ -86,14 +81,17 @@ TEST(TestSSMarkSweepCostStat, reset_clears_persist_cost_and_counts)
 {
   ObSSMarkSweepCostStat stat;
   stat.record_kept_meta_scn_persist_cost(100, 223, 7, 5);
-  stat.inc_kept_meta_scn_persist_trans_attempt_count();
-  stat.set_kept_meta_scn_persist_parallelism(4);
+  stat.set_task_parallelism(4);
+  stat.record_sort_detail_cost(13, 17, 29, 11);
   stat.reset();
-  ASSERT_EQ(0, stat.kept_meta_scn_persist_total_cost_us_);
-  ASSERT_EQ(1, stat.kept_meta_scn_persist_parallelism_);
+  ASSERT_EQ(0, stat.kept_meta_scn_persist_cost_us_);
+  ASSERT_EQ(0, stat.meta_scn_scan_cost_us_);
+  ASSERT_EQ(0, stat.replayed_scn_check_cost_us_);
+  ASSERT_EQ(0, stat.macro_iter_and_sorter_cost_us_);
+  ASSERT_EQ(0, stat.sorter_cost_us_);
+  ASSERT_EQ(1, stat.task_parallelism_);
   ASSERT_EQ(0, stat.kept_meta_scn_persist_plan_count_);
   ASSERT_EQ(0, stat.kept_meta_scn_persist_candidate_count_);
-  ASSERT_EQ(0, stat.kept_meta_scn_persist_trans_attempt_count_);
 
   char buf[2048] = {};
   stat.to_string(buf, sizeof(buf));
@@ -106,7 +104,7 @@ TEST(TestSSMarkSweepCostStat, concurrent_persist_calls_do_not_lose_cost_or_count
   const int64_t thread_count = 4;
   const int64_t calls_per_thread = 5000;
   const int64_t call_count = thread_count * calls_per_thread;
-  stat.set_kept_meta_scn_persist_parallelism(thread_count);
+  stat.set_task_parallelism(thread_count);
   std::atomic<int64_t> ready_count(0);
   std::atomic<bool> start(false);
   std::vector<std::thread> threads;
@@ -118,7 +116,6 @@ TEST(TestSSMarkSweepCostStat, concurrent_persist_calls_do_not_lose_cost_or_count
       }
       for (int64_t j = 0; j < calls_per_thread; ++j) {
         stat.record_kept_meta_scn_persist_cost(100, 117, 2, 1);
-        stat.inc_kept_meta_scn_persist_trans_attempt_count();
       }
     });
   }
@@ -129,14 +126,266 @@ TEST(TestSSMarkSweepCostStat, concurrent_persist_calls_do_not_lose_cost_or_count
   for (auto &thread : threads) {
     thread.join();
   }
-  ASSERT_EQ(17 * call_count, stat.kept_meta_scn_persist_total_cost_us_);
+  ASSERT_EQ(17 * call_count, stat.kept_meta_scn_persist_cost_us_);
   ASSERT_EQ(2 * call_count, stat.kept_meta_scn_persist_plan_count_);
   ASSERT_EQ(call_count, stat.kept_meta_scn_persist_candidate_count_);
-  ASSERT_EQ(call_count, stat.kept_meta_scn_persist_trans_attempt_count_);
 
   char buf[2048] = {};
   stat.to_string(buf, sizeof(buf));
   ASSERT_NE(nullptr, STRSTR(buf, ",kept_persist_cost_us=85000,"));
+}
+
+TEST(TestSSMarkSweepCostStat, sort_detail_cost_sums_before_normalization)
+{
+  ObSSMarkSweepCostStat stat;
+  stat.set_task_parallelism(3);
+  stat.record_sort_detail_cost(5, 7, 11, 3);
+  stat.record_sort_detail_cost(8, 9, 14, 5);
+  ASSERT_EQ(13, stat.meta_scn_scan_cost_us_);
+  ASSERT_EQ(16, stat.replayed_scn_check_cost_us_);
+  ASSERT_EQ(25, stat.macro_iter_and_sorter_cost_us_);
+  ASSERT_EQ(8, stat.sorter_cost_us_);
+
+  char buf[2048] = {};
+  stat.to_string(buf, sizeof(buf));
+  ASSERT_NE(nullptr, STRSTR(buf, "(meta_scn_scan_cost_us=4,"));
+  ASSERT_NE(nullptr, STRSTR(buf, ",replayed_scn_check_cost_us=5,"));
+  ASSERT_NE(nullptr, STRSTR(buf, ",macro_iter_and_sorter_cost_us=8,"));
+  ASSERT_NE(nullptr, STRSTR(buf, ",sorter_cost_us=2,"));
+  // Subtract raw totals before division: subtracting rounded output gives 6 instead of 5.
+  ASSERT_EQ(5, (stat.macro_iter_and_sorter_cost_us_ - stat.sorter_cost_us_)
+      / stat.task_parallelism_);
+}
+
+TEST(TestSSMarkSweepCostStat, concurrent_sort_detail_updates_do_not_lose_cost)
+{
+  ObSSMarkSweepCostStat stat;
+  const int64_t thread_count = 4;
+  const int64_t calls_per_thread = 2500;
+  const int64_t call_count = thread_count * calls_per_thread;
+  std::atomic<int64_t> ready_count(0);
+  std::atomic<bool> start(false);
+  std::vector<std::thread> threads;
+  for (int64_t i = 0; i < thread_count; ++i) {
+    threads.emplace_back([&]() {
+      ready_count.fetch_add(1);
+      while (!start.load()) {
+        std::this_thread::yield();
+      }
+      for (int64_t j = 0; j < calls_per_thread; ++j) {
+        stat.record_sort_detail_cost(13, 17, 29, 11);
+      }
+    });
+  }
+  while (ready_count.load() < thread_count) {
+    std::this_thread::yield();
+  }
+  start.store(true);
+  for (auto &thread : threads) {
+    thread.join();
+  }
+  ASSERT_EQ(13 * call_count, stat.meta_scn_scan_cost_us_);
+  ASSERT_EQ(17 * call_count, stat.replayed_scn_check_cost_us_);
+  ASSERT_EQ(29 * call_count, stat.macro_iter_and_sorter_cost_us_);
+  ASSERT_EQ(11 * call_count, stat.sorter_cost_us_);
+}
+
+TEST(TestSSMarkSweepCostStat, summary_fits_large_values_and_only_contains_fixed_fields)
+{
+  ObSSMarkSweepCostStat stat;
+  stat.set_total_start_us(0);
+  stat.set_total_end_us(INT64_MAX);
+  stat.record_sort_cost(0, INT64_MAX);
+  stat.record_sort_detail_cost(INT64_MAX, INT64_MAX, INT64_MAX, INT64_MAX);
+  stat.record_kept_meta_scn_persist_cost(0, INT64_MAX, INT64_MAX, INT64_MAX);
+  stat.record_merge_pass_cost(ObMarkSweepGroupType::DEL, 0, 0, INT64_MAX);
+  stat.record_diff_cost(0, INT64_MAX);
+
+  char buf[MAX_ROOTSERVICE_EVENT_EXTRA_INFO_LENGTH];
+  MEMSET(buf, 'x', sizeof(buf));
+  const int64_t len = stat.to_string(buf, sizeof(buf));
+  ASSERT_GT(len, 0);
+  ASSERT_LT(len, static_cast<int64_t>(sizeof(buf)));
+  ASSERT_EQ(len, STRLEN(buf));
+  ASSERT_EQ('}', buf[len - 1]);
+  ASSERT_EQ('\0', buf[len]);
+  ASSERT_STREQ(
+      "{total_cost_us=9223372036854775807,sort_cost_us=9223372036854775807("
+      "meta_scn_scan_cost_us=9223372036854775807,replayed_scn_check_cost_us=9223372036854775807,"
+      "macro_iter_and_sorter_cost_us=9223372036854775807,sorter_cost_us=9223372036854775807,"
+      "kept_persist_cost_us=9223372036854775807,"
+      "kept_persist_cnt=9223372036854775807/9223372036854775807),"
+      "merge_cost_us=9223372036854775807,diff_cost_us=9223372036854775807}",
+      buf);
+}
+
+TEST(TestSSMarkSweepCostStat, merge_cost_is_span_across_groups_and_ignores_unfinished_passes)
+{
+  ObSSMarkSweepCostStat stat;
+  char buf[MAX_ROOTSERVICE_EVENT_EXTRA_INFO_LENGTH] = {};
+  stat.to_string(buf, sizeof(buf));
+  ASSERT_NE(nullptr, STRSTR(buf, ",merge_cost_us=0,"));
+  // Input counts and a start point alone do not mean that a pass ran to completion.
+  stat.record_merge_pass_input_count(ObMarkSweepGroupType::DEL, 0, 7);
+  stat.merge_pass_start_us_[1][5] = 10;
+  stat.to_string(buf, sizeof(buf));
+  ASSERT_NE(nullptr, STRSTR(buf, ",merge_cost_us=0,"));
+
+  stat.record_merge_pass_cost(ObMarkSweepGroupType::DEL, 0, 100, 200);
+  stat.record_merge_pass_cost(ObMarkSweepGroupType::KEPT, 0, 150, 250);
+  stat.to_string(buf, sizeof(buf));
+  // DEL and KEPT overlap: the span is 150, rather than the sum of 200.
+  ASSERT_NE(nullptr, STRSTR(buf, ",merge_cost_us=150,"));
+
+  stat.record_merge_pass_cost(ObMarkSweepGroupType::DEL, 1, 300, 400);
+  stat.to_string(buf, sizeof(buf));
+  // A gap between passes is part of the complete merge stage's wall-clock span.
+  ASSERT_NE(nullptr, STRSTR(buf, ",merge_cost_us=300,"));
+
+  stat.merge_pass_end_us_[1][6] = 1000; // no valid start for this pass
+  stat.to_string(buf, sizeof(buf));
+  ASSERT_NE(nullptr, STRSTR(buf, ",merge_cost_us=300,"));
+  stat.reset();
+  stat.to_string(buf, sizeof(buf));
+  ASSERT_NE(nullptr, STRSTR(buf, ",merge_cost_us=0,"));
+}
+
+TEST(TestSSMarkSweepCostStat, merge_details_are_separate_from_fixed_summary)
+{
+  ObSSMarkSweepCostStat stat;
+  stat.record_merge_pass_cost(ObMarkSweepGroupType::DEL, 0, 100, 120);
+  stat.record_merge_pass_input_count(ObMarkSweepGroupType::DEL, 0, 7);
+  stat.record_merge_pass_cost(ObMarkSweepGroupType::KEPT, 0, 200, 230);
+  stat.record_merge_pass_input_count(ObMarkSweepGroupType::KEPT, 0, 9);
+  stat.set_merged_file_size(131072, 294912);
+
+  char summary_buf[MAX_ROOTSERVICE_EVENT_EXTRA_INFO_LENGTH] = {};
+  stat.to_string(summary_buf, sizeof(summary_buf));
+  ASSERT_NE(nullptr, STRSTR(summary_buf, ",merge_cost_us=130,"));
+  ASSERT_EQ(nullptr, STRSTR(summary_buf, "del_passes="));
+  ASSERT_EQ(nullptr, STRSTR(summary_buf, "kept_passes="));
+  ASSERT_EQ(nullptr, STRSTR(summary_buf, "merged_del_size="));
+  ASSERT_EQ(nullptr, STRSTR(summary_buf, "parallelism="));
+
+  char merge_buf[2048] = {};
+  const int64_t len = stat.to_merge_string(merge_buf, sizeof(merge_buf));
+  ASSERT_EQ(len, STRLEN(merge_buf));
+  ASSERT_EQ('}', merge_buf[len - 1]);
+  ASSERT_NE(nullptr, STRSTR(merge_buf, "del_passes=1[p0=(cost_us=20,files=7)]"));
+  ASSERT_NE(nullptr, STRSTR(merge_buf, ",kept_passes=1[p0=(cost_us=30,files=9)]"));
+  ASSERT_NE(nullptr, STRSTR(merge_buf, ",merged_del_size=131072,merged_kept_size=294912}"));
+}
+
+TEST(TestSSMarkSweepCostStat, full_merge_details_keep_every_pass_at_maximum_values)
+{
+  ObSSMarkSweepCostStat stat;
+  const int64_t max_merge_pass = ObSSMarkSweepCostStat::MAX_MERGE_PASS;
+  const ObMarkSweepGroupType groups[] = {ObMarkSweepGroupType::DEL, ObMarkSweepGroupType::KEPT};
+  for (const ObMarkSweepGroupType group : groups) {
+    for (int64_t pass_idx = 0; pass_idx < max_merge_pass; ++pass_idx) {
+      stat.record_merge_pass_cost(group, pass_idx, 0, INT64_MAX);
+      stat.record_merge_pass_input_count(group, pass_idx, INT64_MAX);
+    }
+  }
+  stat.set_merged_file_size(INT64_MAX, INT64_MAX);
+
+  char buf[8192];
+  MEMSET(buf, 'x', sizeof(buf));
+  const int64_t len = stat.to_merge_string(buf, sizeof(buf));
+  ASSERT_GT(len, 0);
+  ASSERT_LT(len, static_cast<int64_t>(sizeof(buf)));
+  ASSERT_EQ(len, STRLEN(buf));
+  ASSERT_EQ('}', buf[len - 1]);
+  ASSERT_EQ('\0', buf[len]);
+  ASSERT_NE(nullptr, STRSTR(buf, "del_passes=32["));
+  ASSERT_NE(nullptr, STRSTR(buf, ",kept_passes=32["));
+  ASSERT_EQ(nullptr, STRSTR(buf, "omitted_passes="));
+  const char *last_del_pass = STRSTR(buf,
+      "p31=(cost_us=9223372036854775807,files=9223372036854775807)");
+  ASSERT_NE(nullptr, last_del_pass);
+  ASSERT_NE(nullptr, STRSTR(last_del_pass + 1,
+      "p31=(cost_us=9223372036854775807,files=9223372036854775807)"));
+  ASSERT_NE(nullptr, STRSTR(buf,
+      ",merged_del_size=9223372036854775807,merged_kept_size=9223372036854775807}"));
+}
+
+TEST(TestSSMarkSweepCostStat, bounded_merge_details_report_omitted_passes_and_keep_complete_entries)
+{
+  ObSSMarkSweepCostStat stat;
+  const int64_t max_merge_pass = ObSSMarkSweepCostStat::MAX_MERGE_PASS;
+  const ObMarkSweepGroupType groups[] = {ObMarkSweepGroupType::DEL, ObMarkSweepGroupType::KEPT};
+  for (const ObMarkSweepGroupType group : groups) {
+    for (int64_t pass_idx = 0; pass_idx < max_merge_pass; ++pass_idx) {
+      stat.record_merge_pass_cost(group, pass_idx, 0, INT64_MAX);
+      stat.record_merge_pass_input_count(group, pass_idx, INT64_MAX);
+    }
+  }
+  stat.set_merged_file_size(INT64_MAX, INT64_MAX);
+
+  char buf[MAX_ROOTSERVICE_EVENT_EXTRA_INFO_LENGTH];
+  MEMSET(buf, 'x', sizeof(buf));
+  const int64_t len = stat.to_merge_string(buf, sizeof(buf));
+  ASSERT_GT(len, 0);
+  ASSERT_LT(len, static_cast<int64_t>(sizeof(buf)));
+  ASSERT_EQ(len, STRLEN(buf));
+  ASSERT_EQ('}', buf[len - 1]);
+  ASSERT_EQ('\0', buf[len]);
+  ASSERT_NE(nullptr, STRSTR(buf,
+      ",merged_del_size=9223372036854775807,merged_kept_size=9223372036854775807}"));
+
+  const char *group_starts[] = {STRSTR(buf, "del_passes=32["), STRSTR(buf, "kept_passes=32[")};
+  for (const char *group_start : group_starts) {
+    ASSERT_NE(nullptr, group_start);
+    const char *group_end = STRCHR(group_start, ']');
+    ASSERT_NE(nullptr, group_end);
+    const char *omitted = STRSTR(group_start, "omitted_passes=");
+    ASSERT_NE(nullptr, omitted);
+    ASSERT_LT(omitted, group_end);
+    int64_t omitted_passes = 0;
+    ASSERT_EQ(1, sscanf(omitted, "omitted_passes=%ld", &omitted_passes));
+    ASSERT_GT(omitted_passes, 0);
+
+    int64_t shown_passes = 0;
+    const char *entry = group_start;
+    while (nullptr != (entry = STRSTR(entry,
+        "=(cost_us=9223372036854775807,files=9223372036854775807)")) && entry < group_end) {
+      ++shown_passes;
+      ++entry;
+    }
+    int64_t started_entries = 0;
+    entry = group_start;
+    while (nullptr != (entry = STRSTR(entry, "(cost_us=")) && entry < group_end) {
+      ++started_entries;
+      ++entry;
+    }
+    ASSERT_GT(shown_passes, 0);
+    ASSERT_EQ(shown_passes, started_entries); // no partially written pass entry
+    ASSERT_EQ(max_merge_pass, shown_passes + omitted_passes);
+  }
+}
+
+TEST(TestSSMarkSweepCostStat, merge_details_skip_holes_and_invalid_passes)
+{
+  ObSSMarkSweepCostStat stat;
+  stat.record_merge_pass_cost(ObMarkSweepGroupType::DEL, 0, 100, 120);
+  stat.record_merge_pass_input_count(ObMarkSweepGroupType::DEL, 0, 7);
+  stat.record_merge_pass_cost(ObMarkSweepGroupType::DEL, 2, 200, 220);
+  stat.record_merge_pass_input_count(ObMarkSweepGroupType::DEL, 2, 3);
+  stat.record_merge_pass_cost(ObMarkSweepGroupType::KEPT, 1, 150, 200);
+  stat.record_merge_pass_input_count(ObMarkSweepGroupType::KEPT, 1, 9);
+  stat.merge_pass_end_us_[0][3] = 500; // missing start
+  stat.merge_pass_start_us_[0][4] = 10; // missing end
+  stat.record_merge_pass_cost(ObMarkSweepGroupType::DEL, 5, 90, 80); // reversed range
+
+  char summary_buf[MAX_ROOTSERVICE_EVENT_EXTRA_INFO_LENGTH] = {};
+  stat.to_string(summary_buf, sizeof(summary_buf));
+  ASSERT_NE(nullptr, STRSTR(summary_buf, ",merge_cost_us=120,"));
+  char merge_buf[2048] = {};
+  stat.to_merge_string(merge_buf, sizeof(merge_buf));
+  ASSERT_NE(nullptr, STRSTR(merge_buf,
+      "del_passes=2[p0=(cost_us=20,files=7),p2=(cost_us=20,files=3)]"));
+  ASSERT_NE(nullptr, STRSTR(merge_buf, ",kept_passes=1[p1=(cost_us=50,files=9)]"));
+  ASSERT_EQ(nullptr, STRSTR(merge_buf, "omitted_passes="));
 }
 
 // ==================== Test base class ====================
@@ -383,9 +632,12 @@ TEST_F(TestMarkSweepPipeline, test_sorted_run_writer_basic)
     ASSERT_EQ(OB_SUCCESS, writer.add_item(item));
   }
 
+  ASSERT_EQ(0, writer.get_flush_sorted_run_cost_us());
   ObSortedFileInfo result;
   ASSERT_EQ(OB_SUCCESS, finish_single_file(writer, result));
   ASSERT_TRUE(result.is_valid());
+  // The final partial run is measured by the caller, not by the add-triggered counter.
+  ASSERT_EQ(0, writer.get_flush_sorted_run_cost_us());
 
   // Read back and verify
   ObSEArray<int64_t, 128> out;
@@ -431,8 +683,11 @@ TEST_F(TestMarkSweepPipeline, test_sorted_run_writer_multi_runs)
     ASSERT_EQ(OB_SUCCESS, writer.add_item(item));
   }
 
+  const int64_t add_flush_cost_us = writer.get_flush_sorted_run_cost_us();
   ObSEArray<ObSortedFileInfo, 16> files;
   ASSERT_EQ(OB_SUCCESS, writer.finish(files));
+  // Finishing the last run must not count the same work again as an automatic flush.
+  ASSERT_EQ(add_flush_cost_us, writer.get_flush_sorted_run_cost_us());
   ASSERT_GT(files.count(), 1);  // small memory_limit_ must have spilled multiple runs
 
   // Collect the union across all run files. Each file is individually sorted
@@ -457,6 +712,8 @@ TEST_F(TestMarkSweepPipeline, test_sorted_run_writer_multi_runs)
   }
 
   for (int64_t f = 0; f < files.count(); ++f) { files.at(f).reset(); }
+  writer.reset();
+  ASSERT_EQ(0, writer.get_flush_sorted_run_cost_us());
   COMMON_LOG(INFO, "test_sorted_run_writer_multi_runs PASSED", K(total), "file_count", files.count());
 }
 

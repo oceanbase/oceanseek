@@ -22,7 +22,6 @@ class ObNewRowIterator;
 }
 namespace storage
 {
-
 class ObDeletionRowIter
 {
 public:
@@ -35,6 +34,14 @@ public:
       const uint64_t table_id,
       const int64_t async_snapshot,
       common::ObIAllocator &allocator);
+  // The caller must first observe deletion publication covering its logical read version.
+  // Acquire the current Tablet after that observation to derive physical MVCC visibility.
+  static int prepare_read_snapshot(
+      const share::ObLSID &ls_id,
+      const common::ObTabletID &tablet_id,
+      const int64_t expire_ts,
+      transaction::ObTxReadSnapshot &snapshot,
+      const int64_t minimum_snapshot = 0);
   void reset();
 
   int64_t get_current_doc_id() const { return current_doc_id_; }

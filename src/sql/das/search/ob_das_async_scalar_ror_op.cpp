@@ -969,9 +969,12 @@ int ObDASAsyncScalarRorOp::do_open()
   } else if (OB_FAIL(init_posting_scan_param())) {
     LOG_WARN("failed to init async scalar posting scan param", K(ret));
   } else if (direct_bind_ && OB_FAIL(search_ctx_.resolve_direct_async_index_segment(
-                 index_table_id_, inv_idx_tablet_id_, group_slot_, version_range_))) {
+                 index_table_id_, inv_idx_tablet_id_, group_slot_,
+                 version_range_, is_empty_range_))) {
     LOG_WARN("failed to resolve direct async scalar segment", K(ret),
              K_(index_table_id), K_(group_slot));
+  } else if (is_empty_range_) {
+    // No physical input in this partition and Group.
   } else if (!direct_bind_) {
     // The owning SegmentMerge actively calls rescan_segment to bind a physical Segment
     // for a non-direct Scalar.
@@ -1278,9 +1281,12 @@ int ObDASAsyncScalarRorOp::do_rescan()
     } else if (OB_FAIL(init_posting_scan_param())) {
       LOG_WARN("failed to init async scalar posting scan param on rescan", K(ret));
     } else if (direct_bind_ && OB_FAIL(search_ctx_.resolve_direct_async_index_segment(
-                   index_table_id_, inv_idx_tablet_id_, group_slot_, version_range_))) {
+                   index_table_id_, inv_idx_tablet_id_, group_slot_,
+                   version_range_, is_empty_range_))) {
       LOG_WARN("failed to resolve direct async scalar segment on rescan", K(ret),
                K_(index_table_id), K_(group_slot));
+    } else if (is_empty_range_) {
+      // No physical input in this partition and Group.
     } else if (!direct_bind_) {
       LOG_INFO("[ASYNC_INDEX_QUERY] scalar op rescan(lazy)", K_(inv_idx_tablet_id));
     } else if (OB_FAIL(open_posting_iter_from_tablet())) {

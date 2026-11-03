@@ -12,6 +12,7 @@
 #include "storage/ob_common_id_utils.h"
 #include "storage/ls/ob_ls.h"
 #include "storage/tablet/ob_tablet.h"
+#include "storage/async_index/ob_async_index_deps.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/time/ob_time_utility.h"
 #include "src/share/rc/ob_tenant_base.h"
@@ -63,7 +64,8 @@ int ObAsyncIndexService::init(const uint64_t tenant_id)
 int ObAsyncIndexService::register_refresh_versions(const int64_t refresh_task_id,
                                                    const share::SCN &start_refresh_scn,
                                                    const int64_t snapshot_version,
-                                                   const int64_t schema_version)
+                                                   const int64_t schema_version,
+                                                   const int64_t ddl_build_id)
 {
   int ret = OB_SUCCESS;
   ObAsyncIndexRefreshTmpInfo *tmp_info = nullptr;
@@ -73,10 +75,11 @@ int ObAsyncIndexService::register_refresh_versions(const int64_t refresh_task_id
   } else if (OB_UNLIKELY(refresh_task_id <= 0
                          || !start_refresh_scn.is_valid()
                          || snapshot_version <= 0
-                         || schema_version <= 0)) {
+                         || schema_version <= 0
+                         || ddl_build_id <= 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(refresh_task_id), K(start_refresh_scn),
-        K(snapshot_version), K(schema_version));
+        K(snapshot_version), K(schema_version), K(ddl_build_id));
   } else if (OB_FAIL(tmp_info_map_.get_refactored(refresh_task_id, tmp_info))) {
     if (OB_HASH_NOT_EXIST != ret) {
       LOG_WARN("failed to get tmp info", K(ret), K(refresh_task_id));
@@ -108,8 +111,9 @@ int ObAsyncIndexService::register_refresh_versions(const int64_t refresh_task_id
       tmp_info->start_refresh_scn_ = start_refresh_scn;
       tmp_info->snapshot_version_ = snapshot_version;
       tmp_info->schema_version_ = schema_version;
+      tmp_info->ddl_build_id_ = ddl_build_id;
       LOG_INFO("register async index refresh versions", K(refresh_task_id),
-               K(start_refresh_scn), K(snapshot_version), K(schema_version));
+               K(start_refresh_scn), K(snapshot_version), K(schema_version), K(ddl_build_id));
     }
   }
   return ret;
@@ -190,6 +194,32 @@ int ObAsyncIndexService::get_inner_sql_schema_version(const int64_t refresh_task
   return ret;
 }
 
+int ObAsyncIndexService::get_inner_sql_ddl_build_id(const int64_t refresh_task_id,
+                                                    int64_t &ddl_build_id)
+{
+  int ret = OB_SUCCESS;
+  ObAsyncIndexRefreshTmpInfo *tmp_info = nullptr;
+  ddl_build_id = 0;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not inited", K(ret));
+  } else if (OB_UNLIKELY(refresh_task_id <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), K(refresh_task_id));
+  } else if (OB_FAIL(tmp_info_map_.get_refactored(refresh_task_id, tmp_info))) {
+    if (OB_HASH_NOT_EXIST == ret) {
+      ret = OB_EAGAIN;
+    }
+    LOG_WARN("failed to get async index refresh build id", K(ret), K(refresh_task_id));
+  } else if (OB_ISNULL(tmp_info)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null tmp info", K(ret), K(refresh_task_id));
+  } else {
+    ddl_build_id = tmp_info->ddl_build_id_;
+  }
+  return ret;
+}
+
 int ObAsyncIndexService::prepare_tenant_major_refresh(
     ObLS &ls,
     const common::ObTabletID &data_tablet_id,
@@ -208,7 +238,7 @@ int ObAsyncIndexService::prepare_tenant_major_refresh(
                          || tenant_major_snapshot <= 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(data_tablet_id), K(index_tablet_ids), K(tenant_major_snapshot));
-  } else if (OB_FAIL(dep_provider.get_publish_scns(tenant_id_, &ls, index_tablet_ids, publish_scns))) {
+  } else if (OB_FAIL(dep_provider.get_publish_scns(&ls, index_tablet_ids, publish_scns))) {
     LOG_WARN("failed to get async index published versions", K(ret),
         K(data_tablet_id), K(index_tablet_ids), K(tenant_major_snapshot));
   } else if (OB_UNLIKELY(publish_scns.count() != index_tablet_ids.count())) {
@@ -566,12 +596,17 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
       ret = OB_SUCCESS;
       // ── Step 4: read publish_scn from index tablet (start_refresh_scn) ────
       share::SCN start_refresh_scn;
+      int64_t data_transfer_seq = -1;
+      int64_t index_transfer_seq = -1;
       {
+        ObTabletHandle data_tablet_handle;
         ObTabletHandle tablet_handle;
         int64_t published_version = ASYNC_INDEX_INITIAL_VERSION;
-        if (OB_FAIL(param.ls_->get_tablet(param.index_tablet_id_, tablet_handle,
-                                          0 /*timeout_us: no wait*/,
-                                          ObMDSGetTabletMode::READ_WITHOUT_CHECK))) {
+        if (OB_FAIL(get_async_index_refresh_tablet(
+                *param.ls_, param.data_tablet_id_, data_tablet_handle))) {
+          LOG_WARN("data tablet location is not ready for direct refresh", K(ret), K(param));
+        } else if (OB_FAIL(get_async_index_refresh_tablet(
+                *param.ls_, param.index_tablet_id_, tablet_handle))) {
           if (OB_ENTRY_NOT_EXIST == ret) {
             ret = OB_EAGAIN;
             LOG_INFO("[ASYNC_INDEX_REFRESH] index tablet not ready in shared storage, will retry",
@@ -583,10 +618,12 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
         } else if (OB_ISNULL(tablet_handle.get_obj())) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("index tablet handle is null", K(ret), K(param.index_tablet_id_));
-        } else if (OB_FAIL(tablet_handle.get_obj()->get_latest_async_index_published_version(published_version))) {
+        } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_refresh_start_version(published_version))) {
           LOG_WARN("failed to get max published version from index tablet",
                    K(ret), K(param.index_tablet_id_));
         } else {
+          data_transfer_seq = data_tablet_handle.get_obj()->get_transfer_seq();
+          index_transfer_seq = tablet_handle.get_obj()->get_transfer_seq();
           start_refresh_scn = async_index_snapshot_to_scn(published_version);
           const int64_t min_inc_major_base_version =
               ASYNC_INDEX_MIN_INC_MAJOR_BASE_VERSION;
@@ -709,6 +746,8 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
         task_param.ls_id_               = param.ls_->get_ls_id();
         task_param.data_tablet_id_      = param.data_tablet_id_;
         task_param.index_tablet_id_     = param.index_tablet_id_;
+        task_param.data_transfer_seq_   = data_transfer_seq;
+        task_param.index_transfer_seq_  = index_transfer_seq;
         task_param.start_refresh_scn_   = start_refresh_scn;
         task_param.target_refresh_scn_  = param.target_refresh_scn_;
         task_param.refresh_id_          = 0;

@@ -377,6 +377,9 @@ int ObDeletionBitmapProvider::scan_and_build_bitmap(
   common::ObNewRowIterator *scan_result = nullptr;
   ObAccessService *oas = MTL(ObAccessService *);
   common::ObRoaringBitmap *bm = OB_NEWx(common::ObRoaringBitmap, &allocator, &allocator);
+  const int64_t sql_snapshot = scan_param.snapshot_.is_valid()
+      && scan_param.snapshot_.core_.version_.is_valid()
+      ? scan_param.snapshot_.core_.version_.get_val_for_tx() : 0;
 
   if (OB_ISNULL(bm)) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -387,12 +390,19 @@ int ObDeletionBitmapProvider::scan_and_build_bitmap(
   } else if (OB_ISNULL(rtdef.p_pd_expr_op_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("pushdown operator is null", K(ret));
-  } else if (OB_UNLIKELY(async_snapshot <= 0
+  } else if (OB_UNLIKELY(async_snapshot <= 0 || INT64_MAX == async_snapshot
       || ctdef.pd_expr_spec_.access_exprs_.count() < 2)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid logical snapshot or deletion access exprs",
         K(ret), K(async_snapshot),
         K(ctdef.pd_expr_spec_.access_exprs_.count()));
+  } else if (OB_UNLIKELY(sql_snapshot <= 0 || INT64_MAX == sql_snapshot)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid SQL deletion snapshot", K(ret), K(sql_snapshot));
+  } else if (OB_FAIL(ObDeletionRowIter::prepare_read_snapshot(
+      scan_param.ls_id_, scan_param.tablet_id_,
+      scan_param.timeout_, scan_param.snapshot_, sql_snapshot))) {
+    LOG_WARN("failed to initialize deletion bitmap physical snapshot", K(ret), K(async_snapshot));
   } else if (OB_FAIL(oas->table_scan(scan_param, scan_result))) {
     LOG_WARN("failed to do table scan", K(ret));
   } else {
@@ -456,8 +466,12 @@ int ObDeletionBitmapProvider::scan_and_build_bitmap(
                   K(doc_id_datum), K(rowscn_datum));
             } else if (OB_SUCC(ret)) {
               const int64_t stored_rowscn = rowscn_datum.get_int();
-              const int64_t rowscn = stored_rowscn < 0 ? -stored_rowscn : stored_rowscn;
-              if (rowscn <= async_snapshot
+              const int64_t rowscn = INT64_MIN == stored_rowscn ? 0
+                  : (stored_rowscn < 0 ? -stored_rowscn : stored_rowscn);
+              if (rowscn <= 0) {
+                ret = OB_ERR_UNEXPECTED;
+                LOG_WARN("invalid deletion row scn", K(ret), K(stored_rowscn));
+              } else if (rowscn <= async_snapshot
                   && OB_FAIL(bm->value_add(doc_id_datum.get_uint64()))) {
                 LOG_WARN("failed to add doc_id to bitmap",
                     K(ret), K(i), K(rowscn), K(async_snapshot));

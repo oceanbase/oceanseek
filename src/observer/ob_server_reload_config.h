@@ -31,6 +31,7 @@ public:
     int operator()();
   };
 private:
+  static int reload_cluster_config_(bool is_arbitration_mode, int previous_ret);
   void reload_tenant_scheduler_config_();
   void reload_tenant_freezer_config_();
 private:

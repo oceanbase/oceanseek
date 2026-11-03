@@ -521,7 +521,7 @@ int ObCreateTableLikeHelper::operation_before_commit_() {
   int ret = OB_SUCCESS;
   if (!new_tables_.empty() && new_tables_.at(0).has_async_index()
       && OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(
-                 new_tables_.at(0), true /*has_async_index*/, get_trans_()))) {
+                 new_tables_.at(0), get_trans_()))) {
     LOG_WARN("failed to register async-index membership for create table like",
              K(ret), K_(tenant_id), "table_id", new_tables_.at(0).get_table_id());
   } else if (!new_tables_.empty() && new_tables_.at(0).has_async_index()

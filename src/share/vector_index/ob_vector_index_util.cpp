@@ -248,7 +248,7 @@ int ObVectorIndexUtil::parser_params_from_string(
             ret = OB_NOT_SUPPORTED;
             LOG_WARN("not support vector index bq_use_fht value", K(ret), K(new_param_name), K(new_param_value));
           }
-        } else if (new_param_name == "SUPPORT_DUPLICATE") {
+        } else if (new_param_name == "DUPLICATE_GROUP") {
           // Some schema/DDL compatibility paths parse the persisted parameter
           // string with a generic vector-index category.  The durable TYPE in
           // the parameter string is the authority for duplicate capability;
@@ -259,7 +259,7 @@ int ObVectorIndexUtil::parser_params_from_string(
             param.support_duplicate_ = true;
           } else {
             ret = OB_NOT_SUPPORTED;
-            LOG_WARN("invalid support_duplicate value", K(ret), K(new_param_value));
+            LOG_WARN("invalid DUPLICATE_GROUP value", K(ret), K(new_param_value));
           }
         } else if (new_param_name == "NBITS") {
           int64_t int_value = 0;
@@ -476,7 +476,7 @@ int ObVectorIndexUtil::parser_params_from_string(
     if (OB_SUCC(ret) && param.support_duplicate_
         && !is_hnsw_index_type(param.type_)) {
       ret = OB_NOT_SUPPORTED;
-      LOG_WARN("support_duplicate requires hnsw-family type", K(ret), K(param.type_));
+      LOG_WARN("DUPLICATE_GROUP requires hnsw-family type", K(ret), K(param.type_));
     }
     LOG_DEBUG("parser vector index param", K(ret), K(index_param_str), K(param));
   }
@@ -619,7 +619,7 @@ int ObVectorIndexUtil::validate_hnsw_build_params(const ObVectorIndexParam &para
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("ef_construction must be at least twice m for hgraph",
              K(ret), K(param.ef_construction_), K(param.m_), K(param.type_),
-             K(param.support_duplicate_));
+             "DUPLICATE_GROUP", param.support_duplicate_);
     LOG_USER_ERROR(OB_NOT_SUPPORTED,
                    "vector index EF_CONSTRUCTION less than 2*M for HGraph is");
   }
@@ -1133,7 +1133,7 @@ int ObVectorIndexParam::print_hnsw_params(char *buf, int64_t buf_len, int64_t &p
     PRINT_PARAM("refine_k=%f,", refine_k_);
     PRINT_PARAM("bq_use_fht=%s,", bq_use_fht_ ? "true" : "false");
   }
-  PRINT_PARAM("support_duplicate=%s,", support_duplicate_ ? "true" : "false");
+  PRINT_PARAM("DUPLICATE_GROUP=%s,", support_duplicate_ ? "true" : "false");
   PRINT_PARAM("sync_interval_type=%d,", static_cast<int>(sync_interval_type_));
   PRINT_PARAM("sync_interval_value=%ld,", sync_interval_value_);
   PRINT_PARAM("endpoint=%s,", endpoint_);
@@ -1541,7 +1541,7 @@ int ObVectorIndexUtil::inherit_missing_hnsw_index_params(
   ObArray<ObString> new_param_items;
   ObArray<ObString> inherited_param_items;
   ObVectorIndexAlgorithmType target_type = old_vec_param.type_;
-  static const char *COMMON_PARAMS[] = {"TYPE", "DISTANCE", "LIB", "M", "EF_CONSTRUCTION", "EF_SEARCH", "EXTRA_INFO_MAX_SIZE", "SUPPORT_DUPLICATE"};
+  static const char *COMMON_PARAMS[] = {"TYPE", "DISTANCE", "LIB", "M", "EF_CONSTRUCTION", "EF_SEARCH", "EXTRA_INFO_MAX_SIZE", "DUPLICATE_GROUP"};
   static const char *HYBRID_PARAMS[] = {
       "MODEL", "DIM", "CONTENT_TYPE", "SYNC_MODE", "SYNC_INTERVAL"};
   static const char *BQ_PARAMS[] = {
@@ -1711,16 +1711,16 @@ int ObVectorIndexUtil::construct_rebuild_index_param(
     LOG_WARN("fail to parse new index parsm", K(ret), K(new_index_params));
   } else if (OB_FAIL(filter_index_param_impl(
                  new_index_params,
-                 "SUPPORT_DUPLICATE",
+                 "DUPLICATE_GROUP",
                  filtered_support_duplicate_params,
                  filtered_support_duplicate_len,
                  &support_duplicate_count))) {
-    LOG_WARN("failed to canonicalize support_duplicate rebuild parameter",
+    LOG_WARN("failed to canonicalize DUPLICATE_GROUP rebuild parameter",
              K(ret), K(new_index_params));
   } else if (support_duplicate_count > 1) {
     ret = OB_ERR_PARAM_DUPLICATE;
-    LOG_WARN("duplicate support_duplicate rebuild parameter",
-             K(ret), K(new_index_params), K(support_duplicate_count));
+    LOG_WARN("duplicate DUPLICATE_GROUP rebuild parameter",
+             K(ret), K(new_index_params), "DUPLICATE_GROUP_count", support_duplicate_count);
   } else {
     support_duplicate_is_set = 1 == support_duplicate_count;
     if (!support_duplicate_is_set) {
@@ -2076,16 +2076,16 @@ int ObVectorIndexUtil::construct_rebuild_index_param(
 
     if (OB_SUCC(ret) && support_duplicate_is_set && !is_hnsw_index_type(old_vec_param.type_)) {
       ret = OB_NOT_SUPPORTED;
-      LOG_WARN("explicit support_duplicate only supports an HNSW-family index", K(ret), K(old_vec_param));
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "explicit SUPPORT_DUPLICATE for a non-HNSW vector index is");
+      LOG_WARN("explicit DUPLICATE_GROUP only supports an HNSW-family index", K(ret), K(old_vec_param));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "explicit DUPLICATE_GROUP for a non-HNSW vector index is");
     } else if (OB_SUCC(ret) && is_hnsw_index_type(old_vec_param.type_)) {
       if (new_vec_param.support_duplicate_
           && OB_FAIL(databuff_printf(
               not_set_params_str,
               OB_MAX_TABLE_NAME_LENGTH,
               pos,
-              ", SUPPORT_DUPLICATE=TRUE"))) {
-        LOG_WARN("failed to inherit support_duplicate during rebuild", K(ret), K(pos));
+              ", DUPLICATE_GROUP=TRUE"))) {
+        LOG_WARN("failed to inherit DUPLICATE_GROUP during rebuild", K(ret), K(pos));
       }
     }
 
@@ -4683,7 +4683,7 @@ int ObVectorIndexUtil::check_index_param(
                    new_variable_name != "REFINE" &&
                    new_variable_name != "DROP_RATIO_BUILD" &&
                    new_variable_name != "DROP_RATIO_SEARCH" &&
-                   new_variable_name != "SUPPORT_DUPLICATE" &&
+                   new_variable_name != "DUPLICATE_GROUP" &&
                    new_variable_name != "CENTROIDS_FRESH_MODE" &&
                    new_variable_name != "AI_SERVICE_TIER" &&
                    new_variable_name != "ALLOW_NULL_ON_FAILURE") {
@@ -5006,13 +5006,13 @@ int ObVectorIndexUtil::check_index_param(
             drop_ratio_search_is_set = true;
             drop_ratio_search = out_val;
           }
-        } else if (last_variable == "SUPPORT_DUPLICATE") {
+        } else if (last_variable == "DUPLICATE_GROUP") {
           if (option_node->children_[i]->type_ != T_BOOL
               || !(parser_value == 0 || parser_value == 1)) {
             ret = OB_NOT_SUPPORTED;
-            LOG_WARN("invalid support_duplicate value",
+            LOG_WARN("invalid DUPLICATE_GROUP value",
                      K(ret), K(option_node->children_[i]->type_), K(parser_value));
-            LOG_USER_ERROR(OB_NOT_SUPPORTED, "this value of vector index support_duplicate is");
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "this value of vector index DUPLICATE_GROUP is");
           } else {
             support_duplicate_is_set = true;
           }
@@ -5087,15 +5087,15 @@ int ObVectorIndexUtil::check_index_param(
     }
     if (OB_SUCC(ret) && support_duplicate_is_set && !type_hnsw_is_set) {
       ret = OB_NOT_SUPPORTED;
-      LOG_WARN("support_duplicate requires an HNSW-family index", K(ret));
-      LOG_USER_ERROR(OB_NOT_SUPPORTED, "SUPPORT_DUPLICATE for a non-HNSW vector index is");
+      LOG_WARN("DUPLICATE_GROUP requires an HNSW-family index", K(ret));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "DUPLICATE_GROUP for a non-HNSW vector index is");
     } else if (OB_SUCC(ret) && support_duplicate_is_set
                && !is_hgraph_duplicate_capability_ready()) {
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("duplicate-capable vector format is not supported by the cluster",
                K(ret), K(GET_MIN_CLUSTER_VERSION()), K(HGRAPH_DUPLICATE_VECTOR_VERSION));
       LOG_USER_ERROR(OB_NOT_SUPPORTED,
-                     "SUPPORT_DUPLICATE vector index parameter is not supported by this cluster version");
+                     "DUPLICATE_GROUP vector index parameter is not supported by this cluster version");
     }
     if (OB_SUCC(ret) && extra_info_max_size_is_set) {
       ObDocIDType vid_type = ObDocIDType::INVALID;

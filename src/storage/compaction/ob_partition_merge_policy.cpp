@@ -381,7 +381,9 @@ int ObPartitionMergePolicy::get_result_by_snapshot(
   } else if (tablet.is_async_index()) {
     // async delete tablet 虽然使用普通行存 SSTable，但它的 INC_MAJOR version range
     // 仍由异步 refresh 的逻辑 published version 推进，不能按 commit_version 选表。
-    if (OB_FAIL(ObAsyncIndexMergePolicyHelper::get_inc_major_sstables(ls, tablet, snapshot, base_table->get_snapshot_version(), result))) {
+    if (OB_FAIL(ObAsyncIndexMergePolicyHelper::select_inc_major_sstables(ls,
+        table_store_wrapper.get_member()->get_inc_major_sstables(),
+        table_store_wrapper.get_meta_handle(), snapshot, base_table->get_snapshot_version(), result))) {
       LOG_WARN("failed to select async index inc major sstables", KR(ret), K(snapshot), K(tablet));
     }
   } else {
@@ -424,21 +426,23 @@ int ObPartitionMergePolicy::get_result_by_snapshot(
 #endif
 
   // prepare minor tables
-  const ObSSTableArray &minor_tables = table_store_wrapper.get_member()->get_minor_sstables();
-  bool start_add_table_flag = false;
-  for (int64_t i = 0; OB_SUCC(ret) && i < minor_tables.count(); ++i) {
-    if (OB_ISNULL(minor_tables[i])) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_ERROR("table must not null", K(ret), K(i), K(minor_tables));
-    // TODO: add right boundary for major
-    } else if (!start_add_table_flag && minor_tables[i]->get_upper_trans_version() > base_table->get_snapshot_version()) {
-      start_add_table_flag = true;
-    }
-    if (OB_SUCC(ret) && start_add_table_flag) {
-      if (OB_FAIL(result.handle_.add_sstable(minor_tables[i], table_store_wrapper.get_meta_handle()))) {
-        LOG_WARN("failed to add table", K(ret));
-      } else if (result.rec_scn_.is_min()) {
-        result.rec_scn_ = minor_tables[i]->get_rec_scn();
+  if (OB_SUCC(ret)) {
+    const ObSSTableArray &minor_tables = table_store_wrapper.get_member()->get_minor_sstables();
+    bool start_add_table_flag = false;
+    for (int64_t i = 0; OB_SUCC(ret) && i < minor_tables.count(); ++i) {
+      if (OB_ISNULL(minor_tables[i])) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("table must not null", K(ret), K(i), K(minor_tables));
+      // TODO: add right boundary for major
+      } else if (!start_add_table_flag && minor_tables[i]->get_upper_trans_version() > base_table->get_snapshot_version()) {
+        start_add_table_flag = true;
+      }
+      if (OB_SUCC(ret) && start_add_table_flag) {
+        if (OB_FAIL(result.handle_.add_sstable(minor_tables[i], table_store_wrapper.get_meta_handle()))) {
+          LOG_WARN("failed to add table", K(ret));
+        } else if (result.rec_scn_.is_min()) {
+          result.rec_scn_ = minor_tables[i]->get_rec_scn();
+        }
       }
     }
   }

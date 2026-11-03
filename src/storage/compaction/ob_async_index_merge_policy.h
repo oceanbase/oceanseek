@@ -28,6 +28,7 @@ namespace storage
 {
 class ObLS;
 class ObTablet;
+class ObTabletHandle;
 class ObSSTableArray;
 class ObITable;
 }
@@ -55,6 +56,7 @@ public:
 class ObAsyncIndexMergePolicyHelper
 {
 public:
+  // Retain crossing IncMajor ranges for boundary alignment.
   static int collect_merge_infos(
       storage::ObLS &ls,
       const storage::ObTablet &tablet,
@@ -66,10 +68,22 @@ public:
       const int64_t snapshot,
       const int64_t last_major_snapshot,
       storage::ObGetMergeTablesResult &result);
+  static int select_inc_major_sstables(
+      storage::ObLS &ls,
+      const storage::ObSSTableArray &inc_major_sstables,
+      const storage::ObStorageMetaHandle &meta_handle,
+      const int64_t snapshot,
+      const int64_t last_major_snapshot,
+      storage::ObGetMergeTablesResult &result);
   static int calc_schedule_snapshot_version(
       storage::ObLS &ls,
       const common::ObIArray<common::ObTabletID> &index_tablet_ids,
       int64_t &schedule_snapshot_version);
+  // Lower the schedule snapshot if it cuts an aligned window, and retain complete windows.
+  static int align_merge_infos(
+      const common::ObIArray<common::ObSEArray<ObAsyncIndexSSTableMergeInfo, 8>> &all_merge_infos,
+      int64_t &schedule_snapshot_version,
+      common::ObIArray<ObAsyncIndexSSTableMergeInfo> &merge_infos);
   static int calc_delete_percentage(
       storage::ObLS &ls,
       const storage::ObTablet &data_tablet,
@@ -77,15 +91,13 @@ public:
       int64_t &delete_percentage);
 
 private:
-  // Validate the selected IncMajor data ranges against the base Major and the
-  // current merge target. Logical gaps are allowed; overlap and ranges beyond
-  // the merge target are not. This check does not determine whether all data
-  // up to the target has been published.
+  // Check selected IncMajor ranges for overlap with the base Major or the
+  // previous range. Logical gaps and empty input are allowed; the selector
+  // determines merge boundaries.
   static int check_inc_major_sstables_(
       const storage::ObTablesHandleArray &tables_handle,
       const int64_t start_idx,
-      const int64_t last_major_snapshot,
-      const int64_t merge_snapshot);
+      const int64_t last_major_snapshot);
   static int calc_tablet_visible_row_count_(
       const storage::ObTablet &tablet,
       int64_t &row_count);

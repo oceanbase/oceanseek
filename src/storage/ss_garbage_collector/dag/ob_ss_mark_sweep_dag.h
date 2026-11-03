@@ -46,7 +46,7 @@ struct ObSSMarkSweepCtx;
 // and merge stages run concurrent tasks, so their start/end timestamps are accumulated via
 // atomic min(start)/max(end) (common::dec_update / common::inc_update). total_/diff_ and the
 // per-pass input count are written by single tasks with no concurrency. Kept-meta persist
-// costs are atomically summed and normalized by the parallelism saved by PrepareTask.
+// costs and detailed sort costs are atomically summed and normalized by the parallelism saved by PrepareTask.
 // ====================================================================================
 struct ObSSMarkSweepCostStat final
 {
@@ -59,17 +59,19 @@ public:
   void set_total_end_us(const int64_t total_end_us) { total_end_us_ = total_end_us; }
   // sort stage runs concurrently -> atomic min/max
   void record_sort_cost(const int64_t start_us, const int64_t end_us);
+  // Each SortTask merges its local counters once, including failed and retried calls.
+  void record_sort_detail_cost(const int64_t meta_scn_scan_cost_us,
+                               const int64_t replayed_scn_check_cost_us,
+                               const int64_t macro_iter_and_sorter_cost_us,
+                               const int64_t sorter_cost_us);
   // PrepareTask freezes the effective parallelism before SortTasks run.
-  void set_kept_meta_scn_persist_parallelism(const int64_t parallelism)
-  { kept_meta_scn_persist_parallelism_ = MAX(parallelism, 1L); }
+  void set_task_parallelism(const int64_t parallelism)
+  { task_parallelism_ = MAX(parallelism, 1L); }
   // Concurrent SortTasks persist kept_meta_scn; atomically accumulate each call's cost and counts.
   void record_kept_meta_scn_persist_cost(const int64_t start_us,
                                          const int64_t end_us,
                                          const int64_t plan_count,
                                          const int64_t candidate_count);
-  // 事务启动成功即计数，失败重试和回滚事务也包含在内。
-  void inc_kept_meta_scn_persist_trans_attempt_count()
-  { ATOMIC_INC(&kept_meta_scn_persist_trans_attempt_count_); }
   void record_merge_pass_cost(const ObMarkSweepGroupType group,
                               const int64_t pass_idx,
                               const int64_t start_us,
@@ -90,7 +92,19 @@ public:
     diff_start_us_ = start_us;
     diff_end_us_ = end_us;
   }
+  // Fixed summary for the FINISH_MARK_SWEEP_GC event.
   int64_t to_string(char *buf, const int64_t buf_len) const;
+  // Keep complete pass entries; report the omitted count when the buffer is too small.
+  int64_t to_merge_string(char *buf, const int64_t buf_len) const;
+
+private:
+  // for stat
+  bool is_valid_merge_pass_(const int64_t group, const int64_t pass) const
+  {
+    return (INT64_MAX != merge_pass_start_us_[group][pass])
+        && (merge_pass_end_us_[group][pass] > 0)
+        && (merge_pass_end_us_[group][pass] >= merge_pass_start_us_[group][pass]);
+  }
 
 public:
   static const int64_t GROUP_CNT = 2;         // DEL=0, KEPT=1
@@ -101,19 +115,24 @@ public:
   // sort stage: min(start)/max(end) across all sort tasks. start inited to INT64_MAX, end to 0
   int64_t sort_start_us_;
   int64_t sort_end_us_;
-  // 多个 SortTask 的持久化调用耗时之和，通过原子操作累加，不包含调用之间的空档。
-  int64_t kept_meta_scn_persist_total_cost_us_;
-  // PrepareTask 单次写入的有效并发额度，至少为 1；用于折算耗时，不代表实际并行度。
-  int64_t kept_meta_scn_persist_parallelism_;
+  int64_t meta_scn_scan_cost_us_;
+  int64_t replayed_scn_check_cost_us_;
+  // Group traversal plus finish; includes ordinary add, checks and diagnose collection.
+  // Subtract sorter_cost_us_ to estimate traversal excluding sorting/file output.
+  int64_t macro_iter_and_sorter_cost_us_;
+  // Add-triggered flushes plus finish, including final flush/reset/file registration.
+  // Sorter initialization and ordinary add allocations/copies are excluded.
+  int64_t sorter_cost_us_;
+  // Sum of persist call durations across SortTasks, atomically accumulated; excludes gaps between calls.
+  int64_t kept_meta_scn_persist_cost_us_;
+  // Effective concurrency limit set once by PrepareTask, at least 1; used to normalize costs, not actual concurrency.
+  int64_t task_parallelism_;
   // 已完成分类并生成的 tablet 位点计划总数，
   // 尚未按 PrepareTask 冻结的 Lock Row 位点判断是否需要推进。
   int64_t kept_meta_scn_persist_plan_count_;
   // 与 PrepareTask 冻结的 Lock Row 位点比较后仍需推进的候选数，
   // 不等同于实际更新行数。
   int64_t kept_meta_scn_persist_candidate_count_;
-  // 成功启动的事务数，包含随后 no-op、失败、回滚以及重试产生的事务。
-  // start_trans() 自身失败的调用不计入。
-  int64_t kept_meta_scn_persist_trans_attempt_count_;
   // merge stage: per [group][pass] min(start)/max(end). start inited to INT64_MAX, end to 0
   int64_t merge_pass_start_us_[GROUP_CNT][MAX_MERGE_PASS];
   int64_t merge_pass_end_us_[GROUP_CNT][MAX_MERGE_PASS];
@@ -532,6 +551,8 @@ private:
     ~ObMarkSweepSorterPair() = default;
     int init(ObMarkSweepPipeline &pipeline);
     int finish_and_add_file();
+    int64_t get_flush_sorted_run_cost_us() const
+    { return del_sorter_.get_flush_sorted_run_cost_us() + kept_sorter_.get_flush_sorted_run_cost_us(); }
     ObMarkSweepSorter &del_sorter() { return del_sorter_; }
     ObMarkSweepSorter &kept_sorter() { return kept_sorter_; }
   private:
@@ -666,6 +687,11 @@ private:
   int64_t start_tablet_idx_;
   int64_t end_tablet_idx_;
   common::ObArray<ObSSPersistKeptMetaScnItem> kept_meta_scn_persist_items_;
+  // Single-task counters; reset once per process(), not between tablet retries.
+  int64_t meta_scn_scan_cost_us_;
+  int64_t replayed_scn_check_cost_us_;
+  int64_t macro_iter_and_sorter_cost_us_;
+  int64_t sorter_cost_us_;
   DISALLOW_COPY_AND_ASSIGN(ObSSMarkSweepSortTask);
 };
 

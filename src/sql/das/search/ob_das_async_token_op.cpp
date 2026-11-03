@@ -114,6 +114,7 @@ ObDASAsyncTokenOp::ObDASAsyncTokenOp(ObDASSearchCtx &search_ctx)
     index_table_id_(common::OB_INVALID_ID),
     group_slot_(-1),
     direct_bind_(false),
+    is_empty_segment_(false),
     tsc_service_(nullptr),
     query_flag_(),
     posting_iter_(nullptr),
@@ -196,16 +197,19 @@ int ObDASAsyncTokenOp::do_open()
     LOG_WARN("not initialized", K(ret));
   } else if (OB_FAIL(init_inv_idx_scan_param())) {
     LOG_WARN("failed to init inv idx scan param", K(ret));
+  } else if (direct_bind_ && OB_FAIL(search_ctx_.resolve_direct_async_index_segment(
+                 index_table_id_, inv_idx_tablet_id_, group_slot_,
+                 version_range_, is_empty_segment_))) {
+    LOG_WARN("failed to resolve direct async token segment", K(ret),
+             K_(index_table_id), K_(group_slot));
+  } else if (is_empty_segment_) {
+    // No physical input in this partition and Group.
   } else if (OB_FAIL(init_posting_scan_param())) {
     LOG_WARN("failed to init posting scan param", K(ret));
   } else if (OB_FAIL(init_bm25_param_estimator())) {
     LOG_WARN("failed to init bm25 param estimator", K(ret));
   } else if (OB_FAIL(fill_async_bm25_param(posting_scan_param_))) {
     LOG_WARN("failed to fill async bm25 param", K(ret));
-  } else if (direct_bind_ && OB_FAIL(search_ctx_.resolve_direct_async_index_segment(
-                 index_table_id_, inv_idx_tablet_id_, group_slot_, version_range_))) {
-    LOG_WARN("failed to resolve direct async token segment", K(ret),
-             K_(index_table_id), K_(group_slot));
   } else if (!direct_bind_) {
     // The owning SegmentMerge actively calls rescan_segment to bind a physical Segment
     // for a non-direct Token.
@@ -476,7 +480,9 @@ int ObDASAsyncTokenOp::do_next_rowid(ObDASRowID &next_id, double &score)
 {
   int ret = OB_SUCCESS;
   score = 0.0;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    ret = OB_ITER_END;
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_UNLIKELY(posting_iter_->in_shallow_status())) {
@@ -506,7 +512,9 @@ int ObDASAsyncTokenOp::do_drain_until(
   count = 0;
   next_id_after.reset();
   next_score_after = 0.0;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    next_id_after.set_max();
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_ISNULL(out_ids) || OB_UNLIKELY(capacity <= 0)) {
@@ -595,7 +603,11 @@ int ObDASAsyncTokenOp::do_drain_until_accumulated(
     double &next_score_after)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    count = 0;
+    next_score_after = 0.0;
+    next_id_after.set_max();
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else {
@@ -664,7 +676,8 @@ int ObDASAsyncTokenOp::do_drain_until_active(
 {
   int ret = OB_SUCCESS;
   count = 0;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else {
@@ -740,7 +753,9 @@ int ObDASAsyncTokenOp::do_advance_to(
   int ret = OB_SUCCESS;
   score = 0.0;
   common::ObDatum target_datum;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    ret = OB_ITER_END;
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_FAIL(search_ctx_.get_datum_from_rowid(target, target_datum))) {
@@ -762,7 +777,9 @@ int ObDASAsyncTokenOp::do_advance_to_id(
   int ret = OB_SUCCESS;
   common::ObDatum target_datum;
   const common::ObDatum *id_datum = nullptr;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    ret = OB_ITER_END;
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_FAIL(search_ctx_.get_datum_from_rowid(target, target_datum))) {
@@ -784,7 +801,9 @@ int ObDASAsyncTokenOp::do_load_curr_score(double &score)
   int ret = OB_SUCCESS;
   int64_t token_freq = 0;
   int64_t doc_length = 0;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    ret = OB_ITER_END;
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_FAIL(posting_iter_->load_curr_bm25_param(token_freq, doc_length))) {
@@ -807,7 +826,9 @@ int ObDASAsyncTokenOp::do_advance_shallow(
   uint64_t min_id = 0;
   uint64_t max_id = 0;
   double block_max_score = 0.0;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    ret = OB_ITER_END;
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_FAIL(search_ctx_.get_datum_from_rowid(target, target_datum))) {
@@ -832,7 +853,9 @@ int ObDASAsyncTokenOp::do_advance_shallow(
 int ObDASAsyncTokenOp::do_calc_max_score(double &threshold)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    // Empty input contributes no score.
+  } else if (OB_ISNULL(posting_iter_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else {
@@ -851,7 +874,10 @@ int ObDASAsyncTokenOp::do_calc_range_max_score(
 {
   int ret = OB_SUCCESS;
   can_calc = false;
-  if (OB_ISNULL(posting_iter_)) {
+  if (is_empty_segment_) {
+    max_score = 0.0;
+    can_calc = true;
+  } else if (OB_ISNULL(posting_iter_)) {
     // posting iterator 尚未打开时返回未初始化错误。
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
@@ -890,16 +916,19 @@ int ObDASAsyncTokenOp::do_rescan()
     bm25_calc_params_.reset();
     if (OB_FAIL(init_inv_idx_scan_param())) {
       LOG_WARN("failed to init inv idx scan param on rescan", K(ret));
+    } else if (direct_bind_ && OB_FAIL(search_ctx_.resolve_direct_async_index_segment(
+                   index_table_id_, inv_idx_tablet_id_, group_slot_,
+                   version_range_, is_empty_segment_))) {
+      LOG_WARN("failed to resolve direct async token segment on rescan", K(ret),
+               K_(index_table_id), K_(group_slot));
+    } else if (is_empty_segment_) {
+      // No physical input in this partition and Group.
     } else if (OB_FAIL(init_posting_scan_param())) {
       LOG_WARN("failed to init posting scan param on rescan", K(ret));
     } else if (OB_FAIL(init_bm25_param_estimator())) {
       LOG_WARN("failed to init bm25 param estimator on rescan", K(ret));
     } else if (OB_FAIL(fill_async_bm25_param(posting_scan_param_))) {
       LOG_WARN("failed to fill async bm25 param on rescan", K(ret));
-    } else if (direct_bind_ && OB_FAIL(search_ctx_.resolve_direct_async_index_segment(
-                   index_table_id_, inv_idx_tablet_id_, group_slot_, version_range_))) {
-      LOG_WARN("failed to resolve direct async token segment on rescan", K(ret),
-               K_(index_table_id), K_(group_slot));
     } else if (!direct_bind_) {
       // Keep a normal rescan of a non-direct Token lazy; SegmentMerge binds it precisely
       // afterward.
@@ -961,6 +990,7 @@ int ObDASAsyncTokenOp::do_close()
   index_table_id_ = common::OB_INVALID_ID;
   group_slot_ = -1;
   direct_bind_ = false;
+  is_empty_segment_ = false;
   term_key_.reset();
   term_datums_ = nullptr;
   query_token_.reset();

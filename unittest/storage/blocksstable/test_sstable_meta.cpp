@@ -11,6 +11,8 @@
 
 #include "src/share/io/io_schedule/ob_io_mclock.h"
 #include "storage/blocksstable/ob_data_file_prepare.h"
+#include "storage/blocksstable/async_index/ob_inv_sstable.h"
+#include "storage/tablet/ob_table_store_util.h"
 #include "storage/schema_utils.h"
 #include "storage/test_tablet_helper.h"
 
@@ -1076,6 +1078,159 @@ TEST_F(TestSSTableMeta, test_cosstable_illegal_serialize)
   ASSERT_EQ(OB_ERR_UNEXPECTED, sstable.serialize(DATA_CURRENT_VERSION, buf, buf_len, pos));
   ASSERT_EQ(OB_ERR_UNEXPECTED, sstable.serialize_full_table(DATA_CURRENT_VERSION, buf, buf_len, pos));
   allocator_.reset();
+}
+
+TEST_F(TestSSTableMeta, deserialize_rejects_mismatched_sstable_object_type)
+{
+  const ObITable::TableType table_types[] = {
+      ObITable::MAJOR_SSTABLE, ObITable::NORMAL_COLUMN_GROUP_SSTABLE,
+      ObITable::COLUMN_ORIENTED_SSTABLE, ObITable::INC_COLUMN_ORIENTED_SSTABLE,
+      ObITable::INV_INDEX_SSTABLE, ObITable::INC_INV_INDEX_SSTABLE
+  };
+  const uint64_t data_version = DATA_CURRENT_VERSION;
+  const int64_t start_pos = 7;
+  for (const ObITable::TableType table_type : table_types) {
+    SCOPED_TRACE(ObITable::get_table_type_name(table_type));
+    ObTabletCreateSSTableParam param;
+    TestTabletHelper::prepare_sstable_param(ObTabletID(1001), table_schema_, param);
+    param.table_key_.table_type_ = table_type;
+    param.table_key_.version_range_.snapshot_version_ = 100;
+    if (ObITable::is_inc_major_type_sstable(table_type)) {
+      ASSERT_EQ(OB_SUCCESS, param.table_key_.scn_range_.start_scn_.convert_for_tx(0));
+      ASSERT_EQ(OB_SUCCESS, param.table_key_.scn_range_.end_scn_.convert_for_tx(100));
+      ASSERT_EQ(OB_SUCCESS, param.uncommit_tx_info_.push_back(ObUncommitTxDesc(100, 200)));
+      param.uncommit_tx_info_.set_info_status_record_seq();
+    }
+
+    ObSSTable normal;
+    ObCOSSTableV2 co;
+    ObInvSSTable inv;
+    ObSSTable *table = &normal;
+    if (ObITable::is_co_sstable(table_type)) {
+      param.co_base_type_ = ObCOSSTableBaseType::ALL_CG_TYPE;
+      param.column_group_cnt_ = 2;
+      param.is_co_table_without_cgs_ = true;
+      table = &co;
+    } else if (ObITable::is_inv_sstable(table_type)) {
+      param.inv_meta_.min_doc_id_ = 7;
+      param.inv_meta_.max_doc_id_ = 100;
+      param.inv_meta_.doc_id_obj_meta_.set_uint64();
+      param.inv_meta_.index_type_ = INV_IDX_TYPE_FTS;
+      param.inv_meta_.has_relevance_params_ = true;
+      table = &inv;
+    }
+    ASSERT_EQ(OB_SUCCESS, table->init(param, &allocator_));
+
+    ObMacroBlockHandle block_handle;
+    for (int serialize_mode = 0; serialize_mode < 3; ++serialize_mode) {
+      SCOPED_TRACE(serialize_mode);
+      const bool full_table = 1 == serialize_mode;
+      const bool fixed_struct = 2 == serialize_mode;
+      if (fixed_struct) {
+        // Persist the full metadata, then serialize the disk-address shell
+        // used by the tablet table store instead of another with_meta stream.
+        const int64_t meta_size = table->get_full_serialize_size(data_version);
+        char *block_buf = static_cast<char *>(allocator_.alloc(macro_block_size_));
+        ASSERT_NE(nullptr, block_buf);
+        MEMSET(block_buf, 0, macro_block_size_);
+        int64_t meta_pos = 0;
+        ASSERT_EQ(OB_SUCCESS, table->serialize_full_table(
+            data_version, block_buf, macro_block_size_, meta_pos));
+        ASSERT_EQ(meta_size, meta_pos);
+        ObMacroBlockWriteInfo write_info;
+        write_info.io_desc_.set_wait_event(ObWaitEventIds::DB_FILE_COMPACT_WRITE);
+        write_info.buffer_ = block_buf;
+        write_info.size_ = macro_block_size_;
+        write_info.io_timeout_ms_ = DEFAULT_IO_WAIT_TIME_MS;
+        ASSERT_EQ(OB_SUCCESS, ObBlockManager::write_block(write_info, block_handle));
+        ObMetaDiskAddr addr;
+        ASSERT_EQ(OB_SUCCESS, addr.set_block_addr(
+            block_handle.get_macro_id(), 0, meta_size, ObMetaDiskAddr::BLOCK));
+        ASSERT_EQ(OB_SUCCESS, table->set_addr(addr));
+      }
+      const int64_t payload_size = full_table
+          ? table->get_full_serialize_size(data_version)
+          : table->get_serialize_size(data_version);
+      ASSERT_GT(payload_size, 0);
+      const int64_t buf_len = start_pos + payload_size;
+      char *buf = static_cast<char *>(allocator_.alloc(buf_len));
+      ASSERT_NE(nullptr, buf);
+      int64_t pos = start_pos;
+      ASSERT_EQ(OB_SUCCESS, full_table
+          ? table->serialize_full_table(data_version, buf, buf_len, pos)
+          : table->serialize(data_version, buf, buf_len, pos));
+      ASSERT_EQ(buf_len, pos);
+
+      ObSSTable decoded_key;
+      ObSSTable::StatusForSerialize status;
+      pos = start_pos;
+      ASSERT_EQ(OB_SUCCESS, decoded_key.ObITable::deserialize(buf, buf_len, pos));
+      ASSERT_EQ(OB_SUCCESS, serialization::decode(buf, buf_len, pos, status.pack_));
+      ASSERT_EQ(fixed_struct, status.with_fixed_struct());
+      ASSERT_EQ(!fixed_struct, status.with_meta());
+
+      ObSSTable base;
+      pos = start_pos;
+      if (table->is_co_sstable() || table->is_inv_sstable()) {
+        ASSERT_EQ(OB_ERR_UNEXPECTED, base.deserialize(allocator_, buf, buf_len, pos));
+        ASSERT_EQ(start_pos, pos);
+        ASSERT_FALSE(base.is_valid());
+        ASSERT_EQ(ObITable::MAX_TABLE_TYPE, base.get_table_type());
+      } else {
+        ASSERT_EQ(OB_SUCCESS, base.deserialize(allocator_, buf, buf_len, pos));
+        ASSERT_EQ(buf_len, pos);
+        ASSERT_TRUE(base.is_valid());
+        ASSERT_EQ(table_type, base.get_table_type());
+      }
+
+      // Derived decoders must still be able to call the base decoder.
+      ObCOSSTableV2 decoded_co;
+      ObInvSSTable decoded_inv;
+      ObSSTable decoded_normal;
+      ObSSTable *decoded = table->is_co_sstable()
+          ? static_cast<ObSSTable *>(&decoded_co)
+          : table->is_inv_sstable() ? static_cast<ObSSTable *>(&decoded_inv)
+          : &decoded_normal;
+      pos = start_pos;
+      ASSERT_EQ(OB_SUCCESS, decoded->deserialize(allocator_, buf, buf_len, pos));
+      ASSERT_EQ(buf_len, pos);
+      ASSERT_TRUE(decoded->is_valid());
+      ASSERT_EQ(table_type, decoded->get_table_type());
+      if (fixed_struct) {
+        ASSERT_EQ(table->get_addr(), decoded->get_addr());
+        ASSERT_FALSE(decoded->is_loaded());
+        ObSSTableArray source_array;
+        ObSSTableArray decoded_array;
+        ASSERT_EQ(OB_SUCCESS, source_array.init(allocator_, table));
+        const int64_t array_size = source_array.get_serialize_size(data_version);
+        char *array_buf = static_cast<char *>(allocator_.alloc(array_size));
+        ASSERT_NE(nullptr, array_buf);
+        pos = 0;
+        ASSERT_EQ(OB_SUCCESS, source_array.serialize(data_version, array_buf, array_size, pos));
+        ASSERT_EQ(array_size, pos);
+        pos = 0;
+        ASSERT_EQ(OB_SUCCESS, decoded_array.deserialize(allocator_, array_buf, array_size, pos));
+        ASSERT_EQ(array_size, pos);
+        ASSERT_EQ(1, decoded_array.count());
+        ASSERT_EQ(typeid(*table), typeid(*decoded_array.at(0)));
+        ASSERT_EQ(table->get_key(), decoded_array.at(0)->get_key());
+        ASSERT_EQ(table->get_addr(), decoded_array.at(0)->get_addr());
+        ASSERT_FALSE(decoded_array.at(0)->is_loaded());
+        if (table->is_inv_sstable()) {
+          const ObInvSSTable *array_inv = static_cast<const ObInvSSTable *>(decoded_array.at(0));
+          ASSERT_EQ(inv.get_inv_meta().min_doc_id_, array_inv->get_inv_meta().min_doc_id_);
+          ASSERT_EQ(inv.get_inv_meta().max_doc_id_, array_inv->get_inv_meta().max_doc_id_);
+        }
+      }
+      if (table->is_inv_sstable()) {
+        ASSERT_EQ(inv.get_inv_meta().min_doc_id_, decoded_inv.get_inv_meta().min_doc_id_);
+        ASSERT_EQ(inv.get_inv_meta().max_doc_id_, decoded_inv.get_inv_meta().max_doc_id_);
+        ASSERT_EQ(inv.get_inv_meta().index_type_, decoded_inv.get_inv_meta().index_type_);
+      } else if (table->is_co_sstable()) {
+        ASSERT_EQ(co.get_cs_meta().column_group_cnt_, decoded_co.get_cs_meta().column_group_cnt_);
+      }
+    }
+  }
 }
 
 TEST_F(TestSSTableMeta, test_sstable_deep_copy)

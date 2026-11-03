@@ -1861,8 +1861,6 @@ int ObIndexBuilder::do_create_local_index(
       ret = OB_OP_NOT_ALLOW;
       LOG_WARN("create async index not allowed while _enable_async_index is false", KR(ret), K(tenant_id));
       LOG_USER_ERROR(OB_OP_NOT_ALLOW, "create async index while _enable_async_index is false");
-    }
-    if (OB_FAIL(ret)) {
     } else if (OB_FAIL(schema_guard.get_schema_version(tenant_id, refreshed_schema_version))) {
       LOG_WARN("failed to get tenant schema version", KR(ret), K(tenant_id));
     } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, tenant_data_version))) {
@@ -2023,18 +2021,10 @@ int ObIndexBuilder::do_create_local_index(
       const bool need_update_async_index_options =
           is_async_index_ddl && !new_table_schema.has_async_index();
       if (OB_SUCC(ret) && need_update_async_index_options) {
-        char default_params_buf[OB_MAX_INDEX_PARAMS_LENGTH] = {0};
-        int64_t default_params_pos = 0;
-        if (OB_FAIL(ObAsyncIndexParams::get_default_params_str(
-            default_params_buf, OB_MAX_INDEX_PARAMS_LENGTH, default_params_pos))) {
-          LOG_WARN("fail to get default async index params str", K(ret));
+        if (OB_FAIL(ObFtsIndexBuilderUtil::mark_data_table_async_index_flag(new_table_schema))) {
+          LOG_WARN("fail to initialize async index table options", K(ret));
         } else {
-          new_table_schema.add_table_flag(HAS_ASYNC_INDEX_FLAG);
           need_init_async_index_membership = true;
-          if (OB_FAIL(new_table_schema.set_async_index_params(
-              ObString(default_params_pos, default_params_buf)))) {
-            LOG_WARN("fail to set async index params", K(ret));
-          }
         }
       }
       if (OB_FAIL(ret)) {
@@ -2096,10 +2086,14 @@ int ObIndexBuilder::do_create_local_index(
         }
       }
 
+      int64_t initial_snapshot = 0;
+      if (OB_SUCC(ret) && need_init_async_index_membership
+          && !create_index_arg.is_offline_or_restore() && !new_table_schema.is_user_hidden_table()) {
+        initial_snapshot = new_fetched_snapshot;
+      }
       if (OB_FAIL(ret)) {
       } else if (need_init_async_index_membership
-                 && OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(
-                     new_table_schema, true, trans))) {
+                 && OB_FAIL(storage::ObTabletAsyncIndexRefreshInfoMdsHelper::register_membership(new_table_schema, trans, initial_snapshot))) {
         LOG_WARN("failed to register async-index membership in create transaction",
                  K(ret), K(tenant_id), "table_id", new_table_schema.get_table_id());
       } else if (create_index_on_empty_table_opt && OB_FAIL(ObTabletBindingHelper::build_single_table_write_defensive(new_table_schema,

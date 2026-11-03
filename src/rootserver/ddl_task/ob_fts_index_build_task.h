@@ -141,13 +141,26 @@ private:
   int prepare_aux_index_tables();
   int construct_create_index_arg(
       const ObIndexType index_type,
-      obrpc::ObCreateIndexArg &arg);
-  int construct_rowkey_doc_arg(obrpc::ObCreateIndexArg &arg);
-  int construct_doc_rowkey_arg(obrpc::ObCreateIndexArg &arg);
-  int construct_domain_index_aux_arg(obrpc::ObCreateIndexArg &arg);
-  int construct_fts_doc_word_arg(obrpc::ObCreateIndexArg &arg);
-  int construct_async_delete_arg(obrpc::ObCreateIndexArg &arg);
-  int construct_search_data_index_arg(obrpc::ObCreateIndexArg &arg);
+      obrpc::ObCreateIndexArg &arg,
+      common::ObIAllocator &allocator);
+  int construct_rowkey_doc_arg(
+      obrpc::ObCreateIndexArg &arg,
+      common::ObIAllocator &allocator);
+  int construct_doc_rowkey_arg(
+      obrpc::ObCreateIndexArg &arg,
+      common::ObIAllocator &allocator);
+  int construct_domain_index_aux_arg(
+      obrpc::ObCreateIndexArg &arg,
+      common::ObIAllocator &allocator);
+  int construct_fts_doc_word_arg(
+      obrpc::ObCreateIndexArg &arg,
+      common::ObIAllocator &allocator);
+  int construct_async_delete_arg(
+      obrpc::ObCreateIndexArg &arg,
+      common::ObIAllocator &allocator);
+  int construct_search_data_index_arg(
+      obrpc::ObCreateIndexArg &arg,
+      common::ObIAllocator &allocator);
   int calculate_aux_table_parallelism(
       const ObIndexType index_type,
       const int64_t total_parallelism,

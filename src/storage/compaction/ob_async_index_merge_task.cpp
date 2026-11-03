@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE_COMPACTION
 
 #include "storage/compaction/ob_async_index_merge_task.h"
+#include "share/ob_debug_sync.h"
 
 namespace oceanbase
 {
@@ -89,6 +90,7 @@ int ObAsyncIndexMergeFinishTask::process()
   } else {
     ObAsyncIndexMergeCtx *ctx = static_cast<ObAsyncIndexMergeCtx *>(merge_dag_->get_ctx());
     SET_MEM_CTX(ctx->mem_ctx_);
+    DEBUG_SYNC(BEFORE_ASYNC_INDEX_MERGE_UPDATE_TABLET);
     if (OB_FAIL(ctx->update_tablet_after_merge())) {
       LOG_WARN("failed to update tablet after async index merge", K(ret), KPC(ctx));
     } else {

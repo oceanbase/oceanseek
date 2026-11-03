@@ -22,6 +22,7 @@ class ObAccessService;
 }
 namespace sql
 {
+class ObSQLSessionInfo;
 struct ObDASBaseCtDef;
 struct ObDASTabletLoc;
 
@@ -267,6 +268,7 @@ public:
   void set_mock_fetcher(MockFetcher fetcher, void *arg)
   { mock_fetcher_ = fetcher; mock_fetcher_arg_ = arg; }
 
+  static int check_tx_isolation(const ObSQLSessionInfo *session);
   // Recursively detect async fulltext or scalar index queries in an attach ctdef tree.
   static bool contains_async_index_query(const ObDASBaseCtDef *ctdef);
   // Validate async wrapper descriptors, analyze the user query domain, and count independent

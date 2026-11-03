@@ -2427,7 +2427,8 @@ void ObStorageSchema::update_column_cnt_and_schema_version(
       origin_store_column_cnt != store_column_cnt_ ||
       (origin_schema_version < schema_version_ &&
        !share::schema::is_fts_doc_word_aux(index_type_) &&
-       !share::schema::is_fts_index_aux(index_type_))) {
+       !share::schema::is_fts_index_aux(index_type_) &&
+       !share::schema::is_async_inverted_storage_index(index_type_))) {
     // In the scenario of column modification that increase the width of integer column
     // because cs encoding will discard MSB side data(truncate the integer to its width)
     // if we use the stale storage schema for the encoding of mini / minor sstables
@@ -2435,7 +2436,8 @@ void ObStorageSchema::update_column_cnt_and_schema_version(
     // To avoid this, when the table is user data table(currently only user data table support minor encoding)
     // if the schema version increases(there may be column modification that increase the width of integer column)
     // it will simplify the storage schema.
-    // For FTS index, the column info should not be simplified.
+    // Synchronous FTS and asynchronous inverted indexes need complete column info
+    // even when only the schema version increases.
     // TODO @cuiyuntian.cyt cs encoding should not truncate interger
     column_info_simplified_ = true;
     STORAGE_LOG(INFO, "update column cnt",

@@ -173,7 +173,7 @@ ORDER BY gmt_create DESC;
 
 ### 4.2 各阶段耗时统计 —— `FINISH_MARK_SWEEP_GC` 的 `extra_info`
 
-代码见 [ob_mark_sweep_dag.cpp:592-599](../../close_modules/shared_storage/storage/garbage_collector/dag/ob_mark_sweep_dag.cpp#L592-L599)。
+事件写入见 [ob_ss_mark_sweep_dag.cpp:797-808](../../close_modules/shared_storage/storage/ss_garbage_collector/dag/ob_ss_mark_sweep_dag.cpp#L797-L808)。
 
 | name | 列 | 含义 |
 |---|---|---|
@@ -183,45 +183,79 @@ ORDER BY gmt_create DESC;
 | `dag_ret` | value4 | DAG 结果码 |
 | `dag_id` | value5 | DAG ID |
 | `tablet_cnt` | value6 | 本轮处理的 tablet 总数 |
-| （裸串）cost_stat | `extra_info` | 各阶段耗时 + 临时文件大小统计 |
+| （裸串）cost_stat | `extra_info` | 固定 10 字段摘要：阶段耗时、排序细分耗时和 kept meta scn 候选/计划数 |
 
-`extra_info` 即 cost_stat，格式见 [ob_mark_sweep_dag.cpp:118-145](../../close_modules/shared_storage/storage/garbage_collector/dag/ob_mark_sweep_dag.cpp#L118-L145)：
+`extra_info` 即 cost_stat，格式见 [ObSSMarkSweepCostStat::to_string](../../close_modules/shared_storage/storage/ss_garbage_collector/dag/ob_ss_mark_sweep_dag.cpp#L143-L175)：
 
-```
-{total_cost_us=..,sort_cost_us=..,del_passes=N[p0=(cost_us=..,files=..),p1=(..)],kept_passes=N[..],diff_cost_us=..,merged_del_size=..,merged_kept_size=..}
+```text
+{total_cost_us=..,sort_cost_us=..(meta_scn_scan_cost_us=..,replayed_scn_check_cost_us=..,macro_iter_and_sorter_cost_us=..,sorter_cost_us=..,kept_persist_cost_us=..,kept_persist_cnt=../..),merge_cost_us=..,diff_cost_us=..}
 ```
 
 | 字段 | 含义 |
 |---|---|
-| `total_cost_us` | 整个 DAG 耗时（微秒），从 Prepare 到 Diff 完成 |
-| `sort_cost_us` | 排序阶段耗时（按 del/kept 对 tablet 分组排序） |
-| `del_passes=N[...]` | 删除集合的 merge 趟数 N，及每趟 `pX=(cost_us=耗时,files=归并的临时文件数)` |
-| `kept_passes=N[...]` | 保留集合的 merge 趟数 N，及每趟 `pX=(cost_us=耗时,files=归并的临时文件数)` |
+| `total_cost_us` | 整个 DAG 时间跨度（微秒），从 Prepare 开始到 `report_result` 报告结果 |
+| `sort_cost_us` | 所有 SortTask 的最早开始时间到最晚结束时间的跨度 |
+| `meta_scn_scan_cost_us` | 扫描 tablet meta scn 的调用耗时累计后归一化 |
+| `replayed_scn_check_cost_us` | 读取 tablet 并检查 replayed scn 的调用耗时累计后归一化 |
+| `macro_iter_and_sorter_cost_us` | 遍历 del/kept 宏块、加入 sorter 和收尾的调用耗时累计后归一化；包含 `sorter_cost_us` |
+| `sorter_cost_us` | `add_item` 触发的排序/临时文件写出，加上 sorter `finish`、最终写出及文件登记的耗时累计后归一化；不包含初始化及普通 add 的分配/复制 |
+| `kept_persist_cost_us` | `persist_kept_meta_scns_` 各次调用耗时累计后归一化，包含调用内过滤和重试，不包含两次调用之间的间隔 |
+| `kept_persist_cnt` | `候选数/计划数`：计划数为生成的 tablet 位点计划数；候选数为与 Prepare 冻结的 Lock Row 位点比较后仍需推进的数目 |
+| `merge_cost_us` | del/kept 两组所有有效 merge pass 的最早开始到最晚结束时间的跨度；无有效 pass 时为 `0` |
 | `diff_cost_us` | diff 阶段耗时（生成 GC 任务、删除元数据） |
-| `merged_del_size` / `merged_kept_size` | 见 4.3 |
+
+五项排序细分耗时（`meta_scn_scan_cost_us`、`replayed_scn_check_cost_us`、`macro_iter_and_sorter_cost_us`、`sorter_cost_us`、`kept_persist_cost_us`）均按 SortTask 调用累计，包含失败及重试调用的已计时部分，再除以 Prepare 冻结的有效并发额度（至少为 1，整数除法）。该额度用于统计归一化，并不表示实际同时运行的任务数；这些数值也不是各阶段独立的墙钟耗时。尤其 `macro_iter_and_sorter_cost_us` 包含 `sorter_cost_us`，不能将两者相加；前者减去后者可粗略估计宏块遍历中排序/文件写出以外的耗时。`sorter_cost_us` 同时包含排序和文件写出及相关等待，不是纯 I/O 写耗时。
+
+`kept_persist_cnt` 的分子、分母按持久化调用累计，不按并发额度归一化。候选数不等于实际成功更新行数，候选/计划比也不能用于判断事务重试次数或重试放大。摘要不输出事务 attempt 计数或 parallelism 字段；merge 趟数与文件大小见 4.3。
 
 ```sql
--- 查看 1002 租户第 5 轮 Mark Sweep GC 各阶段耗时（extra_info 为 cost_stat 文本）
-SELECT gmt_create, value4 AS dag_ret,
+-- 查看 1002 租户第 5 轮 Mark Sweep GC 的固定摘要
+SELECT gmt_create, svr_ip, svr_port, value4 AS dag_ret,
        value6 AS tablet_cnt, extra_info AS cost_stat
 FROM __all_server_event_history
 WHERE module = 'SHARED_GC' AND event = 'FINISH_MARK_SWEEP_GC'
-  AND value1 = '1002' and value2 = 5
+  AND value1 = '1002' AND value2 = '5'
 ORDER BY gmt_create DESC;
 ```
 
 ---
 
-### 4.3 临时文件大小统计
+### 4.3 Merge 趟数与临时文件大小 —— `MARK_SWEEP_MERGE_STAT`
 
-临时文件大小即 4.2 中 cost_stat 的两个字段：
+merge 详情单独写入 `MARK_SWEEP_MERGE_STAT`，事件写入见 [ob_ss_mark_sweep_dag.cpp:809-818](../../close_modules/shared_storage/storage/ss_garbage_collector/dag/ob_ss_mark_sweep_dag.cpp#L809-L818)。`value1` 至 `value6` 的含义与 4.2 相同，`extra_info` 由 [ObSSMarkSweepCostStat::to_merge_string](../../close_modules/shared_storage/storage/ss_garbage_collector/dag/ob_ss_mark_sweep_dag.cpp#L177-L228) 输出：
+
+```text
+{del_passes=N[p0=(cost_us=..,files=..),p1=(cost_us=..,files=..),omitted_passes=M],kept_passes=N[p0=(cost_us=..,files=..),omitted_passes=M],merged_del_size=..,merged_kept_size=..}
+```
 
 | 字段 | 含义 |
 |---|---|
-| `merged_del_size` | 删除集合最终合并临时文件大小（字节），`-1` 表示读取失败 |
-| `merged_kept_size` | 保留集合最终合并临时文件大小（字节），`-1` 表示读取失败 |
+| `del_passes=N[...]` | 删除集合有效 merge 趟数 N，及已输出的各趟详情 |
+| `kept_passes=N[...]` | 保留集合有效 merge 趟数 N，及已输出的各趟详情 |
+| `pX=(cost_us=..,files=..)` | 第 X 趟内 merge batch 的最早开始到最晚结束时间跨度，以及该趟开始时的输入临时文件数 |
+| `omitted_passes=M` | 因 `extra_info` 容量不足而省略的有效 pass 数；仅有省略时输出，N 仍包含这些 pass |
+| `merged_del_size` | 删除集合最终合并临时文件大小（字节），`-1` 表示大小未成功读取 |
+| `merged_kept_size` | 保留集合最终合并临时文件大小（字节），`-1` 表示大小未成功读取 |
 
-直接从 `FINISH_MARK_SWEEP_GC` 事件的 `extra_info` 中读取（SQL 同 4.2），定位 `merged_del_size` / `merged_kept_size`。
+有效 pass 要求记录过开始时间、结束时间大于 0 且不早于开始时间。`extra_info` 缓冲区为 512 字节，输出时保留完整 pass 条目，并为两组的省略计数和末尾文件大小预留空间；出现 `omitted_passes` 表示事件没有列出全部 pass。两组 pass 可能并发，不能累加各趟耗时作为总 merge 耗时；总跨度读取 4.2 的 `merge_cost_us`。
+
+```sql
+-- 查看 1002 租户第 5 轮的 merge 详情和最终临时文件大小
+SELECT gmt_create, svr_ip, svr_port, value2 AS round_id,
+       value4 AS dag_ret, value5 AS dag_id, extra_info AS merge_stat
+FROM __all_server_event_history
+WHERE module = 'SHARED_GC' AND event = 'MARK_SWEEP_MERGE_STAT'
+  AND value1 = '1002' AND value2 = '5'
+ORDER BY gmt_create DESC;
+```
+
+如需排查被省略的 pass 或定位合并耗时，可在执行 server 的 observer 日志中按该 DAG 的 trace 与下列关键词查看运行过程：
+
+- `finish to process ObSSMarkSweepMergePassCtrlTask`：查看 `group`、`pass_idx`、返回码和控制任务耗时。
+- `finish to process ObSSMarkSweepMergeBatchTask`：查看 `group`、`pass_idx`、`batch_idx`、`total_batch_count`、返回码、耗时和 `retry_cnt`。
+- `finish to process ObSSMarkSweepMergeCompleteTask`：查看合并收尾任务的返回码、耗时和重试数。
+
+这些阶段日志可辅助定位批次失败、重试和调度等待；当前没有保证输出全部 pass 的 `files` 统计或最终文件大小的专用成功日志，不能用阶段日志替代完整的 merge 统计。
 
 ---
 
@@ -567,7 +601,8 @@ WHERE status = 'DOING';
 2. **定位任务 / 轮次**：从 control 的 `gc_round_id`、或 `__all_virtual_shared_gc_task_history` 找到相关 `MARK_SWEEP_GC` 的 `round_id`；若排查 FAIL GC，则先查 `FAIL_GC` 源任务，再用 `FAIL_GC_MACRO_ID.extra_info` 关联宏块明细。
 3. **看本轮结果**：用 server event（module=`SHARED_GC`）：
    - 诊断是否完整 → `FINISH_MARK_SWEEP_DIAG`（4.1）；
-   - 各阶段耗时 + 临时文件大小 → `FINISH_MARK_SWEEP_GC` 的 cost_stat（4.2/4.3）；
+   - 阶段耗时、排序细分耗时与 kept meta scn 候选/计划数 → `FINISH_MARK_SWEEP_GC` 的固定摘要（4.2）；
+   - merge 趟数、每趟输入文件数与最终临时文件大小 → `MARK_SWEEP_MERGE_STAT`（4.3）。
    - 删除/保留宏块数 → `FINISH_MARK_SWEEP_DIFF`（4.4）。
    - FAIL GC 生成 DAG 是否成功 → `SUBMIT_FAIL_GC_DAG` / `START_FAIL_GC_DAG` /
      `FINISH_FAIL_GC_DAG`（4.5）；

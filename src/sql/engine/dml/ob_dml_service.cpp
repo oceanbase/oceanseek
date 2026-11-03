@@ -1641,9 +1641,10 @@ int ObDMLService::update_row(const ObUpdCtDef &upd_ctdef,
                                                     new_row))) {
           LOG_WARN("fail to update row", K(ret), KPC(old_row), KPC(new_row));
         }
-      } else if ((upd_ctdef.is_table_without_pk_ || upd_ctdef.is_table_with_clustering_key_) && upd_rtdef.has_vec_inc_index_
+      } else if ((upd_ctdef.is_table_without_pk_ || upd_ctdef.is_table_with_clustering_key_)
+                  && (upd_rtdef.has_vec_inc_index_ || upd_ctdef.is_async_index_opt_)
                   && OB_FAIL(set_update_hidden_pk(dml_rtctx.get_eval_ctx(), upd_ctdef, new_tablet_loc->tablet_id_))) {
-        LOG_WARN("failed to regenerate hidden pk for vector index update", K(ret), KPC(new_tablet_loc));
+        LOG_WARN("failed to regenerate hidden pk for index update", K(ret), KPC(new_tablet_loc));
       } else if (OB_FAIL(write_row_to_das_op<DAS_OP_TABLE_UPDATE>(upd_ctdef.dupd_ctdef_,
                                                                 upd_rtdef.dupd_rtdef_,
                                                                 old_tablet_loc,

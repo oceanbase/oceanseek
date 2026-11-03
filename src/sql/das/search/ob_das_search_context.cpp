@@ -166,11 +166,13 @@ int ObDASSearchCtx::resolve_direct_async_index_segment(
     const uint64_t index_table_id,
     const common::ObTabletID &index_tablet_id,
     const int64_t group_slot,
-    common::ObNewVersionRange &version_range) const
+    common::ObNewVersionRange &version_range,
+    bool &is_empty) const
 {
   int ret = OB_SUCCESS;
   int64_t tablet_idx = -1;
   version_range.reset();
+  is_empty = false;
   if (OB_ISNULL(current_async_partition_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("null partition for direct async index segment", K(ret),
@@ -203,10 +205,16 @@ int ObDASSearchCtx::resolve_direct_async_index_segment(
   } else {
     const storage::ObAsyncIndexSegmentGroup *group =
         current_async_partition_->get_storage_group_ctx().get_group(group_slot);
-    // Direct binding is selected only when this Group/index has a query-wide maximum
-    // segment count of one.
-    // Prepared storage groups guarantee one complete range chain for every index ordinal.
-    version_range = group->get_tablet_version_ranges(tablet_idx).at(0);
+    if (OB_ISNULL(group) || tablet_idx >= group->get_tablet_cnt()
+        || OB_UNLIKELY(group->get_tablet_version_ranges(tablet_idx).count() > 1)) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_WARN("direct async binding allows at most one segment", K(ret),
+               K(index_table_id), K(group_slot), K(tablet_idx));
+    } else if (group->get_tablet_version_ranges(tablet_idx).empty()) {
+      is_empty = true;
+    } else {
+      version_range = group->get_tablet_version_ranges(tablet_idx).at(0);
+    }
   }
   return ret;
 }

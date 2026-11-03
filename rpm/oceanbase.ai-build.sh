@@ -9,8 +9,13 @@ then
 else
     CURDIR=$PWD
     TOP_DIR=`pwd`/../
-    # CPack appends the distribution suffix for CE packages.
-    RELEASE="$4"
+    REDHAT=$(grep -Po '(?<=release )\d' /etc/redhat-release)
+    ID=$(grep -Po '(?<=^ID=).*' /etc/os-release | tr -d '"')
+    if [[ "${ID}"x == "alinux"x ]]; then
+	RELEASE="$4.al8"
+    else
+        RELEASE="$4.el${REDHAT}"
+    fi
 
     export BUILD_NUMBER=${4}
 fi
@@ -37,7 +42,7 @@ cd ${TOP_DIR}
 ./build.sh clean
 ./build.sh                               \
     rpm                                  \
-    -DOB_RELEASEID=$RELEASE              \
+    -DCPACK_RPM_PACKAGE_RELEASE=$RELEASE \
     -DBUILD_NUMBER=$BUILD_NUMBER         \
     -DUSE_LTO_CACHE=ON                   \
     ${OB_DISABLE_LSE_OPTION}             \

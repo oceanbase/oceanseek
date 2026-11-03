@@ -846,14 +846,17 @@ void ObLogger::rotate_log(const char *filename,
                  wf_filename, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday,
                  tm.tm_hour, tm.tm_min, tm.tm_sec, static_cast<int>(t.tv_usec/1000));
 
-        if (max_file_index_ > 0) {
+        if (get_max_file_index() > 0) {
           if (OB_LIKELY(0 == pthread_mutex_lock(&file_index_mutex_))) {
-            if (file_list.size() >= max_file_index_) {
-              std::string oldFile = file_list.front();
-              file_list.pop_front();
-              unlink_if_need(oldFile.c_str());
+            const int64_t limit = get_max_file_index();
+            if (limit > 0) {
+              if (file_list.size() >= limit) {
+                std::string oldFile = file_list.front();
+                file_list.pop_front();
+                unlink_if_need(oldFile.c_str());
+              }
+              file_list.push_back(old_log_file);
             }
-            file_list.push_back(old_log_file);
             (void)pthread_mutex_unlock(&file_index_mutex_);
           }
         }
@@ -881,14 +884,17 @@ void ObLogger::rotate_log(const char *filename,
         }
 
         if (open_wf_flag_ && enable_wf_flag_ && ObPLogFDType::FD_ALERT_FILE != fd_type) {
-          if (max_file_index_ > 0) {
+          if (get_max_file_index() > 0) {
             if (OB_LIKELY(0 == pthread_mutex_lock(&file_index_mutex_))) {
-              if (wf_file_list.size() >= max_file_index_) {
-                std::string old_wf_file = wf_file_list.front();
-                wf_file_list.pop_front();
-                unlink(old_wf_file.c_str());
+              const int64_t limit = get_max_file_index();
+              if (limit > 0) {
+                if (wf_file_list.size() >= limit) {
+                  std::string old_wf_file = wf_file_list.front();
+                  wf_file_list.pop_front();
+                  unlink(old_wf_file.c_str());
+                }
+                wf_file_list.push_back(old_wf_log_file);
               }
-              wf_file_list.push_back(old_wf_log_file);
               (void)pthread_mutex_unlock(&file_index_mutex_);
             }
           }
@@ -975,8 +981,8 @@ int ObLogger::set_max_file_index(int64_t max_file_index)
   if (max_file_index > MAX_LOG_FILE_COUNT) {// 10 * 1024
     max_file_index = MAX_LOG_FILE_COUNT;// 10 * 1024
   }
-  max_file_index_ = max_file_index;
-  if (max_file_index_ > 0 && rec_old_file_flag_) {
+  ATOMIC_STORE(&max_file_index_, max_file_index);
+  if (get_max_file_index() > 0 && get_record_old_log_file()) {
     if (OB_FAIL(record_old_log_file())) {
       LOG_WARN("Record old log file error", K(ret));
     }
@@ -987,8 +993,8 @@ int ObLogger::set_max_file_index(int64_t max_file_index)
 int ObLogger::set_record_old_log_file(bool rec_old_file_flag)
 {
   int ret = OB_SUCCESS;
-  rec_old_file_flag_ = rec_old_file_flag;
-  if (rec_old_file_flag_ && max_file_index_ > 0) {
+  ATOMIC_STORE(&rec_old_file_flag_, rec_old_file_flag);
+  if (get_record_old_log_file() && get_max_file_index() > 0) {
     if (OB_FAIL(record_old_log_file())) {
       LOG_WARN("Record old log file error", K(ret));
     }
@@ -1331,27 +1337,27 @@ void ObLogger::log_user_error_line_column(const UserMsgLevel user_msg_level,
 int ObLogger::record_old_log_file()
 {
   int ret = OB_SUCCESS;
-  if (max_file_index_ <= 0 || !rec_old_file_flag_) {
-  } else {
-    int tmp_ret = OB_SUCCESS;
+  if (get_max_file_index() > 0 && get_record_old_log_file()) {
     ObSEArray<FileName, 4> files;
     ObSEArray<FileName, 4> wf_files;
-    for (int type = FD_SVR_FILE; type < FD_AUDIT_FILE; ++type) {
-      if (OB_TMP_FAIL(get_log_files_in_dir(log_file_[type].filename_, &files, &wf_files))) {
-        OB_LOG(WARN, "Get log files in log dir error", K(ret));
+    if (0 != pthread_mutex_lock(&file_size_mutex_)) {
+      ret = OB_ERR_SYS;
+    } else {
+      const bool include_compressed = NULL == log_compressor_ || !log_compressor_->is_enable_compress();
+      if (OB_FAIL(collect_log_files_(&files, &wf_files, include_compressed))) {
+      } else if (0 != pthread_mutex_lock(&file_index_mutex_)) {
+        ret = OB_ERR_SYS;
+      } else {
+        replace_log_file_lists_(&files, &wf_files);
+        (void)pthread_mutex_unlock(&file_index_mutex_);
       }
-    }
-    if (OB_TMP_FAIL(get_log_files_in_dir(log_file_[FD_ALERT_FILE].filename_, &files, &wf_files))) {
-      OB_LOG(WARN, "Get log files in log dir error", K(ret));
-    }
-    if (OB_FAIL(add_files_to_list(&files, &wf_files, file_list_, wf_file_list_))) {
-        OB_LOG(WARN, "Add files to list error", K(ret));
+      (void)pthread_mutex_unlock(&file_size_mutex_);
     }
   }
   return ret;
 }
 
-int ObLogger::get_log_files_in_dir(const char *filename, void *files, void *wf_files)
+int ObLogger::get_log_files_in_dir(const char *filename, void *files, void *wf_files, bool include_compressed)
 {
   int ret = OB_SUCCESS;
   char *dirc = NULL;
@@ -1390,17 +1396,19 @@ int ObLogger::get_log_files_in_dir(const char *filename, void *files, void *wf_f
     //open dir
     DIR *dir_pointer = opendir(dir_name);
     if (NULL == dir_pointer) {
-      ret = OB_ERR_UNEXPECTED;
+      ret = errno == ENOENT ? OB_FILE_NOT_EXIST : OB_IO_ERROR;
       OB_LOG(WARN, "Open dir error", KCSTRING(dir_name), K(ret));
     } else {
       FileName tmp_file;
       struct dirent *dir_entry = NULL;//dir_entry is from dir_pointer stream, need not to be freed.
       int64_t print_len = 0;
-      bool enable_delete_compressed_file = true;
-      if (OB_NOT_NULL(log_compressor_) && log_compressor_->is_enable_compress()) {
-        enable_delete_compressed_file = false;
-      }
-      while (OB_SUCC(ret) && (dir_entry = readdir(dir_pointer)) != NULL) {
+      while (OB_SUCC(ret)) {
+        errno = 0;
+        dir_entry = readdir(dir_pointer);
+        if (NULL == dir_entry) {
+          if (errno != 0) { ret = OB_IO_ERROR; }
+          break;
+        }
         if (DT_DIR != dir_entry->d_type) {
           if (prefix_match(wf_file_prefix, dir_entry->d_name)) {
             print_len = snprintf(tmp_file.file_name_, ObPLogFileStruct::MAX_LOG_FILE_NAME_SIZE, "%s/%s", dir_name, dir_entry->d_name);
@@ -1412,7 +1420,7 @@ int ObLogger::get_log_files_in_dir(const char *filename, void *files, void *wf_f
           } else if (prefix_match(wf_file, dir_entry->d_name)) {
             //.wf file, do nothing.
           } else if (prefix_match(file_prefix, dir_entry->d_name)
-                     && (enable_delete_compressed_file || regexec(&uncompressed_regex, dir_entry->d_name, 0, NULL, 0) == 0)) {
+                     && (include_compressed || regexec(&uncompressed_regex, dir_entry->d_name, 0, NULL, 0) == 0)) {
             print_len = snprintf(tmp_file.file_name_, ObPLogFileStruct::MAX_LOG_FILE_NAME_SIZE, "%s/%s", dir_name, dir_entry->d_name);
             if (OB_UNLIKELY(print_len <0) || OB_UNLIKELY(print_len >= ObPLogFileStruct::MAX_LOG_FILE_NAME_SIZE)) {
               //do nothing
@@ -1449,63 +1457,67 @@ int compare_log_filename_by_date_suffix(const void *v1, const void *v2)
     const int DATE_LENGTH = 17;
     const char *str1 = static_cast<const char *>(v1);
     const char *str2 = static_cast<const char *>(v2);
-    if (strlen(str1) < DATE_LENGTH) {
+    int64_t len1 = strlen(str1);
+    int64_t len2 = strlen(str2);
+    if (len1 >= 4 && 0 == strcmp(str1 + len1 - 4, ".zst")) { len1 -= 4; }
+    if (len2 >= 4 && 0 == strcmp(str2 + len2 - 4, ".zst")) { len2 -= 4; }
+    if (len1 < DATE_LENGTH) {
       ret = -1;
-    } else if (strlen(str2) < DATE_LENGTH) {
+    } else if (len2 < DATE_LENGTH) {
       ret = 1;
     } else {
-      ret = str_cmp(str1 + strlen(str1) - DATE_LENGTH, str2 + strlen(str2) - DATE_LENGTH);
+      ret = strncmp(str1 + len1 - DATE_LENGTH, str2 + len2 - DATE_LENGTH, DATE_LENGTH);
     }
   }
   return ret;
 }
 
-int ObLogger::add_files_to_list(void *files,
-                                void *wf_files,
-                                std::deque<std::string> &file_list,
-                                std::deque<std::string> &wf_file_list)
+int ObLogger::collect_log_files_(void *files, void *wf_files, bool include_compressed)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(files) || OB_ISNULL(wf_files)) {
     ret = OB_INVALID_ARGUMENT;
     OB_LOG(WARN, "Input should not be NULL", K(files), K(wf_files), K(ret));
   } else {
+    for (int type = FD_SVR_FILE; OB_SUCC(ret) && type < MAX_FD_FILE; ++type) {
+      if (type != FD_AUDIT_FILE && log_file_[type].filename_[0] != '\0') {
+        ret = get_log_files_in_dir(log_file_[type].filename_, files, wf_files, include_compressed);
+        if (type == FD_ALERT_FILE && ret == OB_FILE_NOT_EXIST) { ret = OB_SUCCESS; }
+      }
+    }
     ObIArray<FileName> *files_arr = static_cast<ObIArray<FileName> *>(files);
     ObIArray<FileName> *wf_files_arr = static_cast<ObIArray<FileName> *>(wf_files);
-    //sort files
-    if (files_arr->count() > 0) {
+    if (OB_SUCC(ret) && files_arr->count() > 0) {
       qsort(&files_arr->at(0), files_arr->count(), sizeof(FileName), compare_log_filename_by_date_suffix);
     }
-    if (wf_files_arr->count() > 0) {
+    if (OB_SUCC(ret) && wf_files_arr->count() > 0) {
       qsort(&wf_files_arr->at(0), wf_files_arr->count(), sizeof(FileName), compare_log_filename_by_date_suffix);
-    }
-
-    //Add to file_list
-    if (OB_LIKELY(0 == pthread_mutex_lock(&file_index_mutex_))) {
-      file_list.clear();
-      std::string oldFile;
-      for (int64_t i = 0; OB_SUCC(ret) && i < files_arr->count(); ++i) {
-        if (file_list.size() >= max_file_index_) {
-          oldFile = file_list.front();
-          file_list.pop_front();
-          unlink_if_need(oldFile.c_str());
-        }
-        file_list.push_back(files_arr->at(i).file_name_);
-      }
-      wf_file_list.clear();
-      std::string old_wf_file;
-      for (int64_t i = 0; OB_SUCC(ret) && i < wf_files_arr->count(); ++i) {
-        if (wf_file_list.size() >= max_file_index_) {
-          old_wf_file = wf_file_list.front();
-          wf_file_list.pop_front();
-          unlink(old_wf_file.c_str());
-        }
-        wf_file_list.push_back(wf_files_arr->at(i).file_name_);
-      }
-      (void)pthread_mutex_unlock(&file_index_mutex_);
     }
   }
   return ret;
+}
+
+void ObLogger::replace_log_file_lists_(void *files, void *wf_files)
+{
+  const ObIArray<FileName> &files_arr = *static_cast<ObIArray<FileName> *>(files);
+  const ObIArray<FileName> &wf_files_arr = *static_cast<ObIArray<FileName> *>(wf_files);
+  const int64_t limit = get_max_file_index();
+  file_list_.clear();
+  for (int64_t i = 0; limit > 0 && i < files_arr.count(); ++i) {
+    if (file_list_.size() >= limit) {
+      unlink_if_need(file_list_.front().c_str());
+      file_list_.pop_front();
+    }
+    file_list_.push_back(files_arr.at(i).file_name_);
+  }
+  wf_file_list_.clear();
+  for (int64_t i = 0; limit > 0 && i < wf_files_arr.count(); ++i) {
+    if (wf_file_list_.size() >= limit) {
+      unlink(wf_file_list_.front().c_str());
+      wf_file_list_.pop_front();
+    }
+    wf_file_list_.push_back(wf_files_arr.at(i).file_name_);
+  }
 }
 
 int ObLogger::init(const ObBaseLogWriterCfg &log_cfg,

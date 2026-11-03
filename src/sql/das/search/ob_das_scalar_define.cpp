@@ -580,18 +580,14 @@ int ObDASScalarScanRtDef::generate_op(
         // generate only one fixed-binding instance for this leaf.
         max_segment_cnt = 1;
       }
-    } else if (FALSE_IT(max_segment_cnt = group_slot >= 0
-                   ? query_ctx->get_max_segment_cnt(group_slot, index_table_id)
-                   : query_ctx->get_max_segment_cnt(index_table_id))) {
-    } else if (OB_UNLIKELY(max_segment_cnt <= 0)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("async scalar index has no segment in current Group", K(ret),
-               K(index_table_id), K(group_slot), K(max_segment_cnt));
     } else {
-      binding_guard.set(index_table_id, group_slot,
-                        group_slot >= 0 && 1 == max_segment_cnt);
+      max_segment_cnt = group_slot >= 0
+          ? query_ctx->get_max_segment_cnt(group_slot, index_table_id)
+          : query_ctx->get_max_segment_cnt(index_table_id);
+      binding_guard.set(index_table_id, group_slot, group_slot >= 0 && 1 >= max_segment_cnt);
     }
-    for (int64_t segment_idx = 0; OB_SUCC(ret) && segment_idx < max_segment_cnt; ++segment_idx) {
+    for (int64_t segment_idx = 0;
+         OB_SUCC(ret) && segment_idx < MAX(1L, max_segment_cnt); ++segment_idx) {
       ObIDASSearchOp *segment_op = nullptr;
       if (use_ror) {
         ObSEArray<ObIDASSearchOp *, 4> ror_ops;

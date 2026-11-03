@@ -958,7 +958,10 @@ int ObTableRedefinitionTask::take_effect(const ObDDLTaskStatus next_task_status)
     }
     LOG_WARN("swap orig and hidden table state failed", K(ret), K(tmp_ret), K(has_took_effect_succ), K(target_object_id_));
   }
-  if (OB_SUCC(ret) && new_status != ObDDLTaskStatus::TAKE_EFFECT) {
+  // Normal offline DDL prepares async indexes before swap and publishes them atomically at swap.
+  // Retain post-swap refresh for legacy tasks and the other users of this task.
+  if (OB_SUCC(ret) && new_status != ObDDLTaskStatus::TAKE_EFFECT
+      && 0 == alter_table_arg_.async_index_offline_refresh_snapshot_) {
     uint64_t min_data_version = 0;
     ObSchemaGetterGuard post_swap_guard;
     const ObTableSchema *data_schema = nullptr;
@@ -1030,24 +1033,66 @@ void ObTableRedefinitionTask::clear_old_status_context()
 int ObTableRedefinitionTask::trigger_async_index_refresh()
 {
   int ret = OB_SUCCESS;
+  const bool pre_swap_refresh = alter_table_arg_.async_index_offline_refresh_snapshot_ > 0;
+  const int64_t refresh_snapshot = pre_swap_refresh
+      ? alter_table_arg_.async_index_offline_refresh_snapshot_ : snapshot_version_;
+  const ObDDLTaskStatus next_status = pre_swap_refresh
+      ? ObDDLTaskStatus::TAKE_EFFECT : ObDDLTaskStatus::SUCCESS;
   const int8_t refresh_type = static_cast<int8_t>(storage::ASYNC_REFRESH_TYPE_OFFLINE_DDL);
   ObSEArray<uint64_t, 4> async_index_table_ids;
-  // After swap, target_object_id_ is the user-visible data table.
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("[ASYNC_INDEX] table redefinition task is not initialized for refresh",
         K(ret), K_(task_id), K_(dst_tenant_id), K_(target_object_id));
+  } else if (pre_swap_refresh) {
+    // The persisted snapshot selects the protocol; schema must never silently disable it.
+    ObSchemaGetterGuard schema_guard;
+    const ObTableSchema *target_schema = nullptr;
+    if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(dst_tenant_id_, schema_guard))) {
+      LOG_WARN("failed to get async refresh schema guard", K(ret));
+    } else if (OB_FAIL(schema_guard.get_table_schema(dst_tenant_id_, target_object_id_, target_schema))) {
+      LOG_WARN("failed to get async refresh target schema", K(ret));
+    } else if (OB_ISNULL(target_schema)) {
+      ret = OB_TABLE_NOT_EXIST;
+      LOG_WARN("async refresh target table does not exist", K(ret), K(target_object_id_));
+    } else if (!target_schema->has_async_index()) {
+      ret = OB_SCHEMA_EAGAIN;
+      LOG_WARN("async indexes not visible for persisted offline refresh snapshot",
+          K(ret), K(target_object_id_), K(refresh_snapshot));
+    } else if (!target_schema->is_user_hidden_table()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("offline refresh target is not a hidden table",
+          K(ret), K(target_object_id_), K(refresh_snapshot));
+    }
+  }
+
+#ifdef ERRSIM
+  if (OB_SUCC(ret) && pre_swap_refresh) {
+    DEBUG_SYNC(BEFORE_OFFLINE_ASYNC_INDEX_REFRESH);
+  }
+#endif
+  if (OB_FAIL(ret)) {
   } else if (OB_FAIL(share::ObAsyncIndexRefreshUtil::collect_async_index_table_ids(
       dst_tenant_id_, target_object_id_, async_index_table_ids,
-      true /*retry_on_missing_search_schema*/, async_index_publish_refresh_target_.is_prepared()))) {
+      true /*retry_on_missing_search_schema*/, (pre_swap_refresh || async_index_publish_refresh_target_.is_prepared()) /*allow_unavailable*/))) {
     LOG_WARN("[ASYNC_INDEX] fail to collect async index table ids", K(ret), K_(task_id),
-        K_(dst_tenant_id), K_(target_object_id), K_(async_index_publish_refresh_target));
+        K_(dst_tenant_id), K_(target_object_id), K(pre_swap_refresh), K(refresh_snapshot),
+        K_(async_index_publish_refresh_target));
   } else if (async_index_table_ids.empty()) {
-    LOG_INFO("[ASYNC_INDEX] no async index found on table", K(target_object_id_));
-  } else if (snapshot_version_ <= 0) {
+    if (pre_swap_refresh) {
+      ret = OB_SCHEMA_EAGAIN;
+    } else {
+      LOG_INFO("[ASYNC_INDEX] no async index found on table", K(target_object_id_));
+    }
+  } else if (refresh_snapshot <= 0) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[ASYNC_INDEX] invalid offline DDL refresh snapshot", K(ret), K_(task_id),
-        K_(dst_tenant_id), K_(target_object_id), K_(snapshot_version));
+        K_(dst_tenant_id), K_(target_object_id), K(pre_swap_refresh), K(refresh_snapshot));
+  } else if (pre_swap_refresh) {
+    if (OB_FAIL(share::ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
+        dst_tenant_id_, target_object_id_, refresh_snapshot, async_index_table_ids, refresh_type))) {
+      LOG_WARN("failed to refresh async indexes before swap", K(ret), K(refresh_snapshot));
+    }
   } else {
     share::ObAsyncIndexDDLPublishOp publish_op(
         dst_tenant_id_, target_object_id_, snapshot_version_, async_index_table_ids, refresh_type);
@@ -1057,24 +1102,29 @@ int ObTableRedefinitionTask::trigger_async_index_refresh()
           K_(async_index_publish_refresh_target), K(publish_op));
     }
   }
+
   if (OB_FAIL(ret) && ObIDDLTask::in_ddl_retry_white_list(ret)) {
     LOG_WARN("[ASYNC_INDEX] offline ddl refresh will retry", K(ret), K_(task_id),
-        K_(dst_tenant_id), K_(target_object_id), K_(async_index_publish_refresh_target));
+        K_(dst_tenant_id), K_(target_object_id), K_(async_index_publish_refresh_target),
+        K(pre_swap_refresh), K(refresh_snapshot));
     const int refresh_ret = ret;
     if (OB_FAIL(retry_async_index_refresh(refresh_ret))) {
       LOG_WARN("[ASYNC_INDEX] failed to schedule offline DDL refresh retry", K(ret), K(refresh_ret),
-          K_(task_id), K_(dst_tenant_id), K_(target_object_id), K_(task_status), K_(async_index_publish_refresh_target));
+          K_(task_id), K_(dst_tenant_id), K_(target_object_id), K_(task_status), K_(async_index_publish_refresh_target),
+          K(pre_swap_refresh), K(refresh_snapshot));
     }
   } else {
     if (OB_FAIL(ret)) {
       LOG_WARN("[ASYNC_INDEX] offline DDL refresh failed with non-retryable error", K(ret),
-          K_(task_id), K_(dst_tenant_id), K_(target_object_id), K_(snapshot_version), K_(async_index_publish_refresh_target));
+          K_(task_id), K_(dst_tenant_id), K_(target_object_id), K_(snapshot_version), K_(async_index_publish_refresh_target),
+          K(pre_swap_refresh), K(refresh_snapshot));
     }
-    // Keep the cached target if persisting the next state fails.
-    const int switch_ret = switch_status(ObDDLTaskStatus::SUCCESS, true, ret);
+    // Retain the refresh target for retries if persisting the next state fails.
+    const int switch_ret = switch_status(next_status, true, ret);
     if (OB_SUCCESS != switch_ret) {
       LOG_WARN("[ASYNC_INDEX] failed to switch status after offline DDL refresh", K(ret), K(switch_ret),
-          K_(task_id), K_(dst_tenant_id), K_(task_status), K_(target_object_id), K_(async_index_publish_refresh_target));
+          K_(task_id), K_(dst_tenant_id), K_(task_status), K_(target_object_id), K_(async_index_publish_refresh_target),
+          K(pre_swap_refresh), K(refresh_snapshot));
     }
     ret = OB_SUCC(ret) ? switch_ret : ret;
     LOG_INFO("trigger async index refresh finished", K(ret), K(*this));

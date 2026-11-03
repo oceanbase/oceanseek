@@ -2719,7 +2719,8 @@ OB_DEF_SERIALIZE(ObAlterTableArg)
               alter_mlog_arg_,
               part_storage_cache_policy_,
               data_version_,
-              enable_hidden_table_partition_pruning_);
+              enable_hidden_table_partition_pruning_,
+              async_index_offline_refresh_snapshot_);
 
   return ret;
 }
@@ -2834,6 +2835,10 @@ OB_DEF_DESERIALIZE(ObAlterTableArg)
               part_storage_cache_policy_,
               data_version_,
               enable_hidden_table_partition_pruning_);
+  async_index_offline_refresh_snapshot_ = 0;
+  if (OB_SUCC(ret) && pos < data_len) {
+    OB_UNIS_DECODE(async_index_offline_refresh_snapshot_);
+  }
   return ret;
 }
 
@@ -2893,7 +2898,8 @@ OB_DEF_SERIALIZE_SIZE(ObAlterTableArg)
                 alter_mlog_arg_,
                 part_storage_cache_policy_,
                 data_version_,
-                enable_hidden_table_partition_pruning_);
+                enable_hidden_table_partition_pruning_,
+                async_index_offline_refresh_snapshot_);
   }
 
   if (OB_FAIL(ret)) {

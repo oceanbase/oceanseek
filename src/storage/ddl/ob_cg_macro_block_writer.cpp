@@ -97,6 +97,7 @@ int ObCgMacroBlockWriter::inner_init(
              K(ret), K(target), K(target_tablet_id), K(table_key));
   } else if (is_incremental_direct_load(param.direct_load_type_)) { // 增量
     const bool is_inc_major = is_incremental_major_direct_load(param.direct_load_type_);
+    int64_t macro_block_op_id = 0;
     const ObWriteTabletParam &tablet_param = *target_tablet_param;
     const int64_t parallel_idx = param.slice_idx_;
     const ObTxSEQ seq_no = ObTxSEQ::cast_from_int(param.tx_info_.seq_no_);
@@ -124,6 +125,8 @@ int ObCgMacroBlockWriter::inner_init(
     }
 
     if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(param.get_macro_block_op_id(is_inc_major, macro_block_op_id))) {
+      LOG_WARN("failed to get macro block op id", KR(ret), K(is_inc_major), K(param));
     } else if (OB_FAIL(pre_warm_param.init(param.ls_id_, table_key.tablet_id_))) {
       LOG_WARN("fail to init pre warm param", KR(ret), K(param.ls_id_), K(table_key.tablet_id_));
     } else if (OB_FAIL(data_desc_.init(true/*is ddl*/,
@@ -144,7 +147,9 @@ int ObCgMacroBlockWriter::inner_init(
                                        table_key.column_group_idx_/*table_cg_idx*/,
                                        exec_mode,
                                        true/*need_submit_io*/,
-                                       is_inc_major))) {
+                                       is_inc_major,
+                                       ObStorageObjectWriteStrategy::INVALID_WRITE_STRATEGY,
+                                       macro_block_op_id))) {
       LOG_WARN("fail to init data store desc", KR(ret), K(param.direct_load_type_));
     } else if (FALSE_IT(data_desc_.get_static_desc().schema_version_ = param.schema_version_)) {
       /* set as a fixed schema version */

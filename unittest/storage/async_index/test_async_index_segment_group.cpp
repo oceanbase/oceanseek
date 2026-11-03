@@ -14,9 +14,13 @@
 #define private public
 #define protected public
 #include "storage/async_index/ob_async_index_segment_group.h"
+#include "storage/tablet/ob_tablet.h"
+#include "storage/tablet/ob_tablet_table_store.h"
+#include "storage/async_index/ob_deletion_row_iter.h"
 #undef private
 #undef protected
 
+#include "lib/utility/ob_defer.h"
 #include "storage/schema_utils.h"
 #include "storage/test_dml_common.h"
 #include "storage/test_tablet_helper.h"
@@ -57,6 +61,8 @@ public:
       common::ObArenaAllocator &allocator,
       const int64_t tablet_id,
       ObTabletHandle &tablet_handle);
+
+  static int set_deletion_test_create_version(ObTablet &tablet, const int64_t create_version);
 
   static int add_tablet_ranges(
       ObAsyncIndexSegmentGroupCtx &handle,
@@ -110,7 +116,7 @@ void ObAsyncIndexSegmentGroupCtxTest::TearDownTestCase()
 void ObAsyncIndexSegmentGroupCtxTest::SetUp()
 {
   ASSERT_TRUE(MockTenantModuleEnv::get_instance().is_inited());
-  next_tablet_id_ = TEST_TABLET_ID;
+  // LS MDS survives Tablet pointer cleanup, so each test needs distinct Tablet IDs.
 }
 
 void ObAsyncIndexSegmentGroupCtxTest::TearDown()
@@ -253,20 +259,6 @@ static void expect_version_ranges(
   }
 }
 
-static void expect_strict_aligned(
-    const ObAsyncIndexSegmentGroupCtx &handle,
-    const bool expected_strict_aligned)
-{
-  EXPECT_EQ(expected_strict_aligned, handle.is_strict_aligned());
-}
-
-static void expect_one_segment(
-    const ObAsyncIndexSegmentGroupCtx &handle,
-    const bool expected_one_segment)
-{
-  EXPECT_EQ(expected_one_segment, handle.is_one_segment());
-}
-
 static void expect_uniform_groups(
     const ObAsyncIndexSegmentGroupCtx &handle,
     const std::initializer_list<std::pair<int64_t, int64_t>> expected_segments)
@@ -321,6 +313,261 @@ static void expect_groups(
   }
 }
 
+// Keep creation visibility independent of both the record commit and the create SCN.
+int ObAsyncIndexSegmentGroupCtxTest::set_deletion_test_create_version(
+    ObTablet &tablet, const int64_t create_version)
+{
+  int ret = OB_SUCCESS;
+  ObLSHandle ls;
+  ObTabletCreateDeleteMdsUserData status;
+  mds::MdsWriter writer;
+  mds::TwoPhaseCommitState state;
+  SCN version;
+  if (OB_FAIL(MTL(ObLSService *)->get_ls(tablet.get_ls_id(), ls, ObLSGetMod::STORAGE_MOD))) {
+    STORAGE_LOG(WARN, "failed to get test ls", K(ret));
+  } else if (OB_FAIL(tablet.get_latest_tablet_status(status, writer, state, version))) {
+    STORAGE_LOG(WARN, "failed to get test tablet status", K(ret));
+  } else {
+    status.data_type_ = ObTabletMdsUserDataType::FINISH_TRANSFER_IN;
+    status.create_commit_version_ = create_version;
+    const SCN committed = SCN::plus(version, 100);
+    ret = TestTabletHelper::write_tablet_status_for_test(*ls.get_ls(), tablet,
+        tablet.get_tablet_id(), status, committed, committed,
+        transaction::ObTransID(committed.get_val_for_tx()));
+    tablet.tablet_status_cache_.reset();
+  }
+  return ret;
+}
+
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, deletion_empty_major_requires_finite_creation_version)
+{
+  ObTabletHandle tablet;
+  ASSERT_EQ(OB_SUCCESS, mock_tablet(allocator_, next_tablet_id_++, tablet));
+  ASSERT_EQ(OB_SUCCESS, set_deletion_test_create_version(*tablet.get_obj(), 150));
+  int64_t snapshot = 0;
+  ASSERT_EQ(OB_SUCCESS, tablet.get_obj()->get_deletion_physical_snapshot(INT64_MAX, snapshot));
+  EXPECT_EQ(150, snapshot);
+  ASSERT_EQ(OB_SUCCESS, tablet.get_obj()->get_deletion_physical_snapshot(
+      INT64_MAX, snapshot, 100));
+  EXPECT_EQ(150, snapshot);
+  ASSERT_EQ(OB_SUCCESS, tablet.get_obj()->get_deletion_physical_snapshot(
+      INT64_MAX, snapshot, 250));
+  EXPECT_EQ(250, snapshot);
+  // A freeze and subsequent GC can leave MAJOR@100 with Tablet MVS=200.
+  tablet.get_obj()->table_store_addr_.get_ptr()->major_tables_.at(0)->set_snapshot_version(100);
+  tablet.get_obj()->tablet_meta_.snapshot_version_ = 300;
+  tablet.get_obj()->tablet_meta_.multi_version_start_ = 200;
+  ASSERT_EQ(OB_SUCCESS, tablet.get_obj()->get_deletion_physical_snapshot(INT64_MAX, snapshot));
+  EXPECT_EQ(200, snapshot);
+  ASSERT_EQ(OB_SUCCESS, tablet.get_obj()->get_deletion_physical_snapshot(
+      INT64_MAX, snapshot, 250));
+  EXPECT_EQ(250, snapshot);
+  tablet.get_obj()->tablet_meta_.multi_version_start_ = 0;
+  ASSERT_EQ(OB_SUCCESS, tablet.get_obj()->get_deletion_physical_snapshot(INT64_MAX, snapshot));
+  EXPECT_EQ(150, snapshot);
+  const int64_t invalid_mvs[] = {-1, INT64_MAX};
+  for (int64_t i = 0; i < ARRAYSIZEOF(invalid_mvs); ++i) {
+    tablet.get_obj()->tablet_meta_.multi_version_start_ = invalid_mvs[i];
+    EXPECT_EQ(OB_ERR_UNEXPECTED,
+        tablet.get_obj()->get_deletion_physical_snapshot(INT64_MAX, snapshot));
+    EXPECT_EQ(0, snapshot);
+  }
+  tablet.get_obj()->tablet_meta_.multi_version_start_ = 0;
+  const int64_t invalid_versions[] = {0, -1, INT64_MAX};
+  for (int64_t i = 0; i < ARRAYSIZEOF(invalid_versions); ++i) {
+    ASSERT_EQ(OB_SUCCESS, set_deletion_test_create_version(*tablet.get_obj(), invalid_versions[i]));
+    EXPECT_EQ(OB_ERR_UNEXPECTED,
+        tablet.get_obj()->get_deletion_physical_snapshot(INT64_MAX, snapshot));
+    EXPECT_EQ(0, snapshot);
+  }
+}
+
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, deletion_snapshot_uses_uncovered_committed_increments)
+{
+  ObTabletHandle tablet;
+  ObTabletHandle covered_owner;
+  ObTabletHandle first_owner;
+  ObTabletHandle second_owner;
+  ASSERT_EQ(OB_SUCCESS, mock_tablet(allocator_, next_tablet_id_++, tablet));
+  ASSERT_EQ(OB_SUCCESS, mock_tablet(allocator_, next_tablet_id_++, covered_owner));
+  ASSERT_EQ(OB_SUCCESS, mock_tablet(allocator_, next_tablet_id_++, first_owner));
+  ASSERT_EQ(OB_SUCCESS, mock_tablet(allocator_, next_tablet_id_++, second_owner));
+  blocksstable::ObSSTable *base = tablet.get_obj()->table_store_addr_.get_ptr()->major_tables_.at(0);
+  blocksstable::ObSSTable *covered = covered_owner.get_obj()->table_store_addr_.get_ptr()->major_tables_.at(0);
+  blocksstable::ObSSTable *first = first_owner.get_obj()->table_store_addr_.get_ptr()->major_tables_.at(0);
+  blocksstable::ObSSTable *second = second_owner.get_obj()->table_store_addr_.get_ptr()->major_tables_.at(0);
+  base->set_snapshot_version(100);
+  blocksstable::ObSSTable *increments[] = {covered, first, second};
+  ObSEArray<ObITable *, 3> input;
+  for (int64_t i = 0; i < ARRAYSIZEOF(increments); ++i) {
+    blocksstable::ObSSTable &inc = *increments[i];
+    inc.key_.table_type_ = ObITable::INC_MAJOR_SSTABLE;
+    inc.key_.tablet_id_ = tablet.get_obj()->get_tablet_id();
+    // Deliberately unrelated physical CLOG range and logical refresh interval.
+    inc.key_.scn_range_.start_scn_ = make_scn(1000 + i * 100);
+    inc.key_.scn_range_.end_scn_ = make_scn(1100 + i * 100);
+    inc.meta_cache_.min_merged_trans_version_ = i * 100;
+    inc.meta_cache_.max_merged_trans_version_ = (i + 1) * 100;
+    inc.meta_cache_.upper_trans_version_ = 150 + i * 100;
+    ASSERT_EQ(OB_SUCCESS, input.push_back(&inc));
+  }
+  // This covered increment must not raise D, even with a larger commit version.
+  covered->meta_cache_.upper_trans_version_ = 900;
+  ObTabletTableStore store;
+  ASSERT_EQ(OB_SUCCESS, store.inc_major_tables_.init(allocator_, input));
+  first = store.inc_major_tables_.at(1);
+  ObDeletionReadPreparation preparation(INT64_MAX);
+  ASSERT_EQ(OB_SUCCESS, store.calculate_deletion_inc_tables(
+      *tablet.get_obj(), base, preparation));
+  EXPECT_EQ(350, preparation.visibility_version_); // max(250, 350), excluding covered 900.
+  first->meta_cache_.upper_trans_version_ = 0;
+  ObDeletionReadPreparation invalid(INT64_MAX);
+  EXPECT_EQ(OB_ERR_UNEXPECTED, store.calculate_deletion_inc_tables(
+      *tablet.get_obj(), base, invalid));
+  EXPECT_EQ(0, invalid.visibility_version_);
+  // MAX is a request for TX metadata lookup, never a usable physical snapshot.
+  // This fixture has no transaction descriptor, so the real helper must fail.
+  first->meta_cache_.upper_trans_version_ = INT64_MAX;
+  ObDeletionReadPreparation missing_tx(INT64_MAX);
+  EXPECT_EQ(OB_ERR_UNEXPECTED, store.calculate_deletion_inc_tables(
+      *tablet.get_obj(), base, missing_tx));
+  EXPECT_EQ(0, missing_tx.visibility_version_);
+}
+
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, deletion_transfer_route_includes_source_and_local)
+{
+  ObLSHandle source_ls;
+  const ObLSID source_ls_id(TEST_LS_ID + 1);
+  ASSERT_EQ(OB_SUCCESS, TestDmlCommon::create_ls(TEST_TENANT_ID, source_ls_id, source_ls));
+  DEFER(source_ls.reset(); MTL(ObLSService *)->remove_ls(source_ls_id));
+  ObLSHandle target_ls;
+  ASSERT_EQ(OB_SUCCESS, MTL(ObLSService *)->get_ls(
+      ObLSID(TEST_LS_ID), target_ls, ObLSGetMod::STORAGE_MOD));
+  ObTabletHandle target;
+  ASSERT_EQ(OB_SUCCESS, mock_tablet(allocator_, next_tablet_id_++, target));
+  ObTableSchema schema;
+  TestSchemaUtils::prepare_data_schema(schema);
+  ObTabletHandle source;
+  ASSERT_EQ(OB_SUCCESS, TestTabletHelper::create_tablet(source_ls,
+      target.get_obj()->get_tablet_id(), schema, allocator_, ObTabletStatus::NORMAL,
+      SCN::min_scn(), source));
+  target.get_obj()->tablet_meta_.transfer_info_.has_transfer_table_ = true;
+  // A transfer flag without matching committed TRANSFER_IN remains an error.
+  int64_t snapshot = 0;
+  EXPECT_EQ(OB_SNAPSHOT_DISCARDED,
+      target.get_obj()->get_deletion_physical_snapshot(INT64_MAX, snapshot));
+  EXPECT_EQ(0, snapshot);
+  ObTabletCreateDeleteMdsUserData status;
+  mds::MdsWriter writer;
+  mds::TwoPhaseCommitState state;
+  SCN version;
+  ASSERT_EQ(OB_SUCCESS, target.get_obj()->get_latest_tablet_status(status, writer, state, version));
+  status.tablet_status_ = ObTabletStatus::TRANSFER_IN;
+  status.data_type_ = ObTabletMdsUserDataType::START_TRANSFER_IN;
+  status.transfer_ls_id_ = source_ls_id;
+  status.transfer_scn_ = SCN::base_scn();
+  ASSERT_EQ(OB_SUCCESS, target.get_obj()->tablet_meta_.transfer_info_.init(
+      source_ls_id, status.transfer_scn_,
+      source.get_obj()->tablet_meta_.transfer_info_.transfer_seq_ + 1, 1,
+      source.get_obj()->get_reorganization_scn()));
+  const SCN committed = SCN::plus(version, 100);
+  ASSERT_EQ(OB_SUCCESS, TestTabletHelper::write_tablet_status_for_test(*target_ls.get_ls(),
+      *target.get_obj(), target.get_obj()->get_tablet_id(), status, committed, committed,
+      transaction::ObTransID(987655)));
+  target.get_obj()->tablet_status_cache_.reset();
+  ASSERT_EQ(OB_SUCCESS, target.get_obj()->get_deletion_physical_snapshot(INT64_MAX, snapshot));
+  ObTabletCreateDeleteMdsUserData source_status;
+  ASSERT_EQ(OB_SUCCESS, source.get_obj()->get_latest_committed_tablet_status(source_status));
+  EXPECT_EQ(MAX(status.create_commit_version_, source_status.create_commit_version_), snapshot);
+  EXPECT_LT(snapshot, INT64_MAX);
+  const int64_t initial_snapshot = snapshot;
+  source.get_obj()->tablet_meta_.snapshot_version_ = initial_snapshot + 300;
+  target.get_obj()->tablet_meta_.snapshot_version_ = initial_snapshot + 300;
+  for (int64_t i = 0; i < 2; ++i) {
+    // Either side can own the stricter MVS; neither may be ignored.
+    source.get_obj()->tablet_meta_.multi_version_start_ = initial_snapshot + 100 + i * 100;
+    target.get_obj()->tablet_meta_.multi_version_start_ = initial_snapshot + 200 - i * 100;
+    ASSERT_EQ(OB_SUCCESS, target.get_obj()->get_deletion_physical_snapshot(INT64_MAX, snapshot));
+    EXPECT_EQ(initial_snapshot + 200, snapshot);
+    ASSERT_EQ(OB_SUCCESS, target.get_obj()->get_deletion_physical_snapshot(
+        INT64_MAX, snapshot, initial_snapshot + 300));
+    EXPECT_EQ(initial_snapshot + 300, snapshot);
+  }
+  ObTabletHandle mds_source;
+  ObITabletMdsInterface *mds_base = nullptr;
+  ASSERT_EQ(OB_SUCCESS, target.get_obj()->get_src_tablet_handle_and_base_ptr_(mds_source, mds_base));
+  EXPECT_EQ(source.get_obj(), mds_source.get_obj());
+  EXPECT_EQ(static_cast<ObITabletMdsInterface *>(source.get_obj()), mds_base);
+  // Replay must cover the transfer point before any source collection is accepted.
+  status.transfer_scn_ = SCN::max_scn();
+  const SCN later = SCN::plus(committed, 100);
+  ASSERT_EQ(OB_SUCCESS, TestTabletHelper::write_tablet_status_for_test(*target_ls.get_ls(),
+      *target.get_obj(), target.get_obj()->get_tablet_id(), status, later, later,
+      transaction::ObTransID(987656)));
+  EXPECT_EQ(OB_REPLICA_NOT_READABLE,
+      target.get_obj()->get_deletion_physical_snapshot(INT64_MAX, snapshot));
+  EXPECT_EQ(0, snapshot);
+}
+
+class DeletionCancelledWorker : public lib::Worker
+{
+public:
+  int check_status() override { return OB_CANCELED; }
+};
+
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, deletion_wait_limits_and_failure_reset)
+{
+  const int64_t saved_timeout = THIS_WORKER.get_timeout_ts();
+  DEFER(THIS_WORKER.set_timeout_ts(saved_timeout));
+  THIS_WORKER.set_timeout_ts(INT64_MAX);
+  ObDeletionReadPreparation unlimited(INT64_MAX);
+  const int64_t cap = ObTabletCommon::DEFAULT_GET_TABLET_DURATION_10_S;
+  EXPECT_EQ(cap, unlimited.remaining_time());
+  EXPECT_EQ(INT64_MAX, THIS_WORKER.get_timeout_ts());
+  ObTabletHandle tablet;
+  ASSERT_EQ(OB_SUCCESS, mock_tablet(allocator_, next_tablet_id_++, tablet));
+  const int64_t finite = ObTimeUtility::current_time() + 1000000;
+  ObDeletionReadPreparation earlier(finite);
+  EXPECT_GT(earlier.remaining_time(), 0);
+  EXPECT_LE(earlier.remaining_time(), 1000000);
+  THIS_WORKER.set_timeout_ts(finite);
+  EXPECT_GT(unlimited.remaining_time(), 0);
+  EXPECT_LE(unlimited.remaining_time(), 1000000);
+  ObDeletionReadPreparation expired(1);
+  EXPECT_EQ(0, expired.remaining_time());
+  EXPECT_EQ(OB_TIMEOUT, expired.check_status());
+  THIS_WORKER.set_timeout_ts(1);
+  EXPECT_EQ(0, unlimited.remaining_time());
+  EXPECT_EQ(OB_TIMEOUT, unlimited.check_status());
+  transaction::ObTxReadSnapshot snapshot;
+  snapshot.init_special_read(make_scn(200));
+  EXPECT_EQ(OB_TIMEOUT, ObDeletionRowIter::prepare_read_snapshot(
+      ObLSID(TEST_LS_ID), tablet.get_obj()->get_tablet_id(), INT64_MAX, snapshot));
+  EXPECT_FALSE(snapshot.is_valid());
+  THIS_WORKER.set_timeout_ts(INT64_MAX);
+  snapshot.init_weak_read(make_scn(200), transaction::ObTransID(123));
+  EXPECT_EQ(OB_TIMEOUT, ObDeletionRowIter::prepare_read_snapshot(
+      ObLSID(TEST_LS_ID), tablet.get_obj()->get_tablet_id(), 1, snapshot));
+  EXPECT_FALSE(snapshot.is_valid());
+  snapshot.init_special_read(make_scn(200));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, ObDeletionRowIter::prepare_read_snapshot(
+      ObLSID(), tablet.get_obj()->get_tablet_id(), INT64_MAX, snapshot));
+  EXPECT_FALSE(snapshot.is_valid());
+  {
+    lib::Worker *saved_worker = &THIS_WORKER;
+    DeletionCancelledWorker cancelled;
+    cancelled.set_timeout_ts(INT64_MAX);
+    lib::Worker::set_worker_to_thread_local(&cancelled);
+    DEFER(lib::Worker::set_worker_to_thread_local(saved_worker));
+    ObDeletionReadPreparation preparation(INT64_MAX);
+    snapshot.init_special_read(make_scn(200));
+    EXPECT_EQ(OB_CANCELED, preparation.check_status());
+    EXPECT_EQ(OB_CANCELED, ObDeletionRowIter::prepare_read_snapshot(
+        ObLSID(TEST_LS_ID), tablet.get_obj()->get_tablet_id(), INT64_MAX, snapshot));
+    EXPECT_FALSE(snapshot.is_valid());
+  }
+}
+
 TEST_F(ObAsyncIndexSegmentGroupCtxTest, add_index_tablet_with_valid_handle)
 {
   ObAsyncIndexSegmentGroupCtx handle;
@@ -339,7 +586,6 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_single_tablet)
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 200}}));
   ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(300)));
   expect_uniform_groups(handle, {{0, 100}, {100, 200}});
-  expect_strict_aligned(handle, true);
   EXPECT_EQ(200, handle.async_index_read_snapshot_.get_val_for_tx());
 }
 
@@ -372,40 +618,6 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_aligned_tablet
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 200}}));
   ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(300)));
   expect_uniform_groups(handle, {{0, 100}, {100, 200}});
-  expect_strict_aligned(handle, true);
-}
-
-// Scenario 1: A coarse+fine, B fine only -> fine-grained alignment, each tablet scans twice
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_scenario_a_coarse_fine_b_fine_only)
-{
-  ObAsyncIndexSegmentGroupCtx handle;
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 200}, {0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(300)));
-  expect_uniform_groups(handle, {{0, 100}, {100, 200}});
-}
-
-// 3 tablets: A coarse+fine, B/C fine only → fine-grained alignment, 2 segments each
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_three_tablets_a_coarse_fine_bc_fine_only)
-{
-  ObAsyncIndexSegmentGroupCtx handle;
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 200}, {0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(300)));
-  expect_uniform_groups(handle, {{0, 100}, {100, 200}});
-  EXPECT_EQ(200, handle.async_index_read_snapshot_.get_val_for_tx());
-}
-
-// Scenario 2: A coarse only, B coarse+fine -> merged to coarse, each tablet scans once
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_scenario_a_coarse_only_b_coarse_fine)
-{
-  ObAsyncIndexSegmentGroupCtx handle;
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 200}}));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 200}, {0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(300)));
-  expect_uniform_groups(handle, {{0, 200}});
-  expect_strict_aligned(handle, true);
 }
 
 // Scenario 3: A coarse only, B fine only -> logical interval [0, 200], B split into two fine ranges
@@ -419,29 +631,6 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_scenario_a_coa
       {{{0, 200}}, {{0, 100}, {100, 200}}},
   };
   expect_groups(handle, expected);
-  expect_strict_aligned(handle, false);
-}
-
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_skips_dead_end_historical_prefix)
-{
-  ObAsyncIndexSegmentGroupCtx handle;
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 300}, {0, 100}, {300, 400}}));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(
-      handle, {{0, 100}, {100, 200}, {200, 300}, {300, 400}}));
-  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(400)));
-
-  const GroupExpect expected = {
-      {
-          {{0, 300}},
-          {{0, 100}, {100, 200}, {200, 300}},
-      },
-      {
-          {{300, 400}},
-          {{300, 400}},
-      },
-  };
-  expect_groups(handle, expected);
-  expect_strict_aligned(handle, false);
 }
 
 TEST_F(ObAsyncIndexSegmentGroupCtxTest,
@@ -473,8 +662,6 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest,
   };
   expect_groups(handle, expected);
   EXPECT_EQ(S6, handle.async_index_read_snapshot_.get_val_for_tx());
-  expect_strict_aligned(handle, false);
-  expect_one_segment(handle, false);
 }
 
 TEST_F(ObAsyncIndexSegmentGroupCtxTest,
@@ -492,35 +679,6 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest,
       },
   };
   expect_groups(handle, expected);
-  expect_strict_aligned(handle, false);
-  expect_one_segment(handle, false);
-}
-
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_prefer_coarse_when_all_tablets_have_it)
-{
-  ObAsyncIndexSegmentGroupCtx handle;
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 200}, {0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 200}, {0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(200)));
-  expect_uniform_groups(handle, {{0, 200}});
-}
-
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_merged_tablet_uses_old_ranges)
-{
-  ObAsyncIndexSegmentGroupCtx handle;
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 200}, {0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(300)));
-  expect_uniform_groups(handle, {{0, 100}, {100, 200}});
-}
-
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_both_coarse_one_segment)
-{
-  ObAsyncIndexSegmentGroupCtx handle;
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 200}, {0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 200}}));
-  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(300)));
-  expect_uniform_groups(handle, {{0, 200}});
 }
 
 TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_coarse_only_tablet_uses_fine_ranges)
@@ -550,7 +708,7 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_read_snapshot_
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 200}}));
   ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(150)));
   expect_uniform_groups(handle, {{0, 100}});
-  EXPECT_EQ(150, handle.async_index_read_snapshot_.get_val_for_tx());
+  EXPECT_EQ(100, handle.async_index_read_snapshot_.get_val_for_tx());
 }
 
 TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_gap_between_segments)
@@ -573,7 +731,6 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_published_vers
     {{{100, 200}}, {{100, 150}, {150, 200}}},
   };
   expect_groups(handle, expected);
-  expect_strict_aligned(handle, false);
   EXPECT_EQ(200, handle.async_index_read_snapshot_.get_val_for_tx());
 }
 
@@ -581,18 +738,17 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest,
        calc_query_version_ranges_accepts_create_logical_empty_suffix)
 {
   ObAsyncIndexSegmentGroupCtx handle;
-  // 两个索引的 CREATE 逻辑水位均为 200。索引 0 已物理化空 INC，
-  // 索引 1 尚未物理化；两者仍应合并成一个只包含真实 range 的 Group。
+  // Committed progress permits an empty range list for the second index's tail.
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(
       handle, {{0, 100}, {100, 200}}, 200));
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(
       handle, {{0, 100}}, 200));
   ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(200)));
   const GroupExpect expected = {
-    {{{0, 100}, {100, 200}}, {{0, 100}}},
+    {{{0, 100}}, {{0, 100}}},
+    {{{100, 200}}, {}},
   };
   expect_groups(handle, expected);
-  expect_strict_aligned(handle, false);
   EXPECT_EQ(200, handle.async_index_read_snapshot_.get_val_for_tx());
 }
 
@@ -607,7 +763,8 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest,
       handle, {{0, 100}, {100, 200}}, 200));
   ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(200)));
   const GroupExpect expected = {
-    {{{0, 100}}, {{0, 100}, {100, 200}}},
+    {{{0, 100}}, {{0, 100}}},
+    {{}, {{100, 200}}},
   };
   expect_groups(handle, expected);
   EXPECT_EQ(200, handle.async_index_read_snapshot_.get_val_for_tx());
@@ -687,16 +844,20 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest,
 }
 
 TEST_F(ObAsyncIndexSegmentGroupCtxTest,
-       calc_query_version_ranges_does_not_hide_physical_middle_gap)
+       calc_query_version_ranges_accepts_published_middle_gap)
 {
   ObAsyncIndexSegmentGroupCtx handle;
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(
       handle, {{0, 100}, {100, 200}}, 200));
-  // 逻辑空后缀只能补齐 (150, 200]，不能掩盖物理 chain 中的 (50, 100] gap。
+  // Both the middle gap and the empty suffix are below committed progress.
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(
       handle, {{0, 50}, {100, 150}}, 200));
-  ASSERT_EQ(OB_ERR_UNEXPECTED,
-            handle.calc_query_version_ranges(make_scn(200)));
+  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(200)));
+  const GroupExpect expected = {
+    {{{0, 100}}, {{0, 50}}},
+    {{{100, 200}}, {{100, 150}}},
+  };
+  expect_groups(handle, expected);
 }
 
 TEST_F(ObAsyncIndexSegmentGroupCtxTest, delete_table_published_version_limits_read_snapshot)
@@ -707,7 +868,7 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, delete_table_published_version_limits_re
   ASSERT_EQ(OB_SUCCESS, handle.set_delete_table_published_version(120));
   ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(300)));
   expect_uniform_groups(handle, {{0, 100}});
-  EXPECT_EQ(120, handle.async_index_read_snapshot_.get_val_for_tx());
+  EXPECT_EQ(100, handle.async_index_read_snapshot_.get_val_for_tx());
 }
 
 TEST_F(ObAsyncIndexSegmentGroupCtxTest, delete_table_does_not_join_segment_alignment)
@@ -737,7 +898,6 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_invalid_empty_
 {
   ObAsyncIndexSegmentGroupCtx handle;
   EXPECT_EQ(OB_INVALID_ARGUMENT, handle.calc_query_version_ranges(make_scn(100)));
-  expect_strict_aligned(handle, false);
 }
 
 TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_invalid_sql_snapshot)
@@ -773,29 +933,8 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_single_cover_s
   EXPECT_EQ(300, handle.async_index_read_snapshot_.get_val_for_tx());
 }
 
-// Coarse range sits before fine ranges in sorted order; chain must skip it and
-// stitch fine ranges together.
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, find_version_chain_skips_non_adjacent_ranges_in_array)
-{
-  ObSEArray<ObNewVersionRange, 8> version_ranges;
-  ASSERT_EQ(OB_SUCCESS, version_ranges.push_back(make_range(0, 200)));
-  ASSERT_EQ(OB_SUCCESS, version_ranges.push_back(make_range(0, 100)));
-  ASSERT_EQ(OB_SUCCESS, version_ranges.push_back(make_range(100, 200)));
-  ASSERT_EQ(OB_SUCCESS, version_ranges.push_back(make_range(200, 300)));
-  lib::ob_sort(version_ranges.get_data(), version_ranges.get_data() + version_ranges.count(), ObAsyncIndexSegmentGroupCtx::ObNewVersionRangeCompare());
-
-  ObSEArray<ObNewVersionRange, 8> picked_ranges;
-  int64_t pos = 0;
-  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexSegmentGroupCtx::find_version_chain_(
-      version_ranges, pos, 0, 300, picked_ranges));
-  expect_version_ranges(picked_ranges, {{0, 200}, {200, 300}});
-
-  // ASSERT_FALSE(ObAsyncIndexSegmentGroupCtx::tablet_chain_covers_interval_(
-  //     version_ranges, 0, 0, 150));
-}
-
-// Version gap in data cannot be covered by a single chain.
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, find_version_chain_fails_on_version_gap)
+// Empty refresh intervals need no SSTable in the chain.
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, find_version_chain_accepts_version_gap)
 {
   ObSEArray<ObNewVersionRange, 8> version_ranges;
   ASSERT_EQ(OB_SUCCESS, version_ranges.push_back(make_range(0, 100)));
@@ -803,8 +942,7 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, find_version_chain_fails_on_version_gap)
   lib::ob_sort(version_ranges.get_data(), version_ranges.get_data() + version_ranges.count(), ObAsyncIndexSegmentGroupCtx::ObNewVersionRangeCompare());
 
   ObSEArray<ObNewVersionRange, 8> picked_ranges;
-  int64_t pos = 0;
-  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexSegmentGroupCtx::find_version_chain_(version_ranges, pos, 0, 300, picked_ranges));
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexSegmentGroupCtx::find_version_chain_(version_ranges, 0, 300, picked_ranges));
   ASSERT_EQ(2, picked_ranges.count());
 }
 
@@ -837,20 +975,6 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_three_tablets_
   EXPECT_EQ(100, handle.async_index_read_snapshot_.get_val_for_tx());
 }
 
-// Three tablets with coarse + 10 fine ranges: prefer single coarse segment.
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_three_tablets_prefer_coarse_over_many_fine)
-{
-  ObAsyncIndexSegmentGroupCtx handle;
-  std::vector<std::pair<int64_t, int64_t>> ranges = make_fine_ranges(0, 100, 10);
-  ranges.insert(ranges.begin(), std::make_pair(0, 100));
-  for (int64_t i = 0; i < 3; ++i) {
-    ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_vec(handle, ranges));
-  }
-  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(200)));
-  expect_uniform_groups(handle, {{0, 100}});
-  EXPECT_EQ(100, handle.async_index_read_snapshot_.get_val_for_tx());
-}
-
 // Five tablets, each with 12 fine ranges (0-120).
 TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_five_tablets_twelve_fine_ranges)
 {
@@ -863,33 +987,6 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_five_tablets_t
   expect_uniform_groups(handle, make_fine_ranges(0, 120, 10));
   ASSERT_EQ(12, handle.groups_.count());
   EXPECT_EQ(120, handle.async_index_read_snapshot_.get_val_for_tx());
-}
-
-// Four tablets with mixed granularity: one coarse+fine, three fine-only.
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_four_tablets_mixed_granularity)
-{
-  ObAsyncIndexSegmentGroupCtx handle;
-  const std::vector<std::pair<int64_t, int64_t>> fine_ranges = make_fine_ranges(0, 100, 10);
-  std::vector<std::pair<int64_t, int64_t>> coarse_and_fine = fine_ranges;
-  coarse_and_fine.insert(coarse_and_fine.begin(), std::make_pair(0, 100));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_vec(handle, coarse_and_fine));
-  for (int64_t i = 0; i < 3; ++i) {
-    ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_vec(handle, fine_ranges));
-  }
-  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(100)));
-  const GroupExpect expected = {
-      {{{0, 10}}, {{0, 10}}, {{0, 10}}, {{0, 10}}},
-      {{{10, 20}}, {{10, 20}}, {{10, 20}}, {{10, 20}}},
-      {{{20, 30}}, {{20, 30}}, {{20, 30}}, {{20, 30}}},
-      {{{30, 40}}, {{30, 40}}, {{30, 40}}, {{30, 40}}},
-      {{{40, 50}}, {{40, 50}}, {{40, 50}}, {{40, 50}}},
-      {{{50, 60}}, {{50, 60}}, {{50, 60}}, {{50, 60}}},
-      {{{60, 70}}, {{60, 70}}, {{60, 70}}, {{60, 70}}},
-      {{{70, 80}}, {{70, 80}}, {{70, 80}}, {{70, 80}}},
-      {{{80, 90}}, {{80, 90}}, {{80, 90}}, {{80, 90}}},
-      {{{90, 100}}, {{90, 100}}, {{90, 100}}, {{90, 100}}},
-  };
-  expect_groups(handle, expected);
 }
 
 // Three tablets with version gaps in aligned ranges.
@@ -907,43 +1004,6 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_three_tablets_
   ASSERT_EQ(6, handle.groups_.count());
 }
 
-// Three tablets with different max published versions limit read snapshot.
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_three_tablets_different_published_versions)
-{
-  ObAsyncIndexSegmentGroupCtx handle;
-  const std::vector<std::pair<int64_t, int64_t>> fine_to_120 = make_fine_ranges(0, 120, 10);
-  const std::vector<std::pair<int64_t, int64_t>> extra_t0 = make_fine_ranges(120, 200, 20);
-  const std::vector<std::pair<int64_t, int64_t>> extra_t1 = make_fine_ranges(120, 150, 15);
-  std::vector<std::pair<int64_t, int64_t>> ranges_t0 = fine_to_120;
-  ranges_t0.insert(ranges_t0.begin(), std::make_pair(0, 120));
-  ranges_t0.insert(ranges_t0.end(), extra_t0.begin(), extra_t0.end());
-  std::vector<std::pair<int64_t, int64_t>> ranges_t1 = fine_to_120;
-  ranges_t1.insert(ranges_t1.begin(), std::make_pair(0, 120));
-  ranges_t1.insert(ranges_t1.end(), extra_t1.begin(), extra_t1.end());
-  std::vector<std::pair<int64_t, int64_t>> ranges_t2 = fine_to_120;
-  ranges_t2.insert(ranges_t2.begin(), std::make_pair(0, 120));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_vec(handle, ranges_t0));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_vec(handle, ranges_t1));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_vec(handle, ranges_t2));
-  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(500)));
-  // min published = 120, read snapshot capped at 120
-  EXPECT_EQ(120, handle.async_index_read_snapshot_.get_val_for_tx());
-  expect_uniform_groups(handle, {{0, 120}});
-}
-
-// Three tablets: two coarse+fine, one fine-only with staggered boundaries.
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_three_tablets_staggered_boundaries)
-{
-  ObAsyncIndexSegmentGroupCtx handle;
-  std::vector<std::pair<int64_t, int64_t>> ranges_coarse_fine = make_fine_ranges(0, 60, 10);
-  ranges_coarse_fine.insert(ranges_coarse_fine.begin(), std::make_pair(0, 60));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_vec(handle, ranges_coarse_fine));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_vec(handle, ranges_coarse_fine));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_vec(handle, make_fine_ranges(0, 60, 10)));
-  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(60)));
-  expect_uniform_groups(handle, make_fine_ranges(0, 60, 10));
-}
-
 // find_version_chain with 15 sequential fine ranges.
 TEST_F(ObAsyncIndexSegmentGroupCtxTest, find_version_chain_fifteen_sequential_ranges)
 {
@@ -955,54 +1015,9 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, find_version_chain_fifteen_sequential_ra
   lib::ob_sort(version_ranges.get_data(), version_ranges.get_data() + version_ranges.count(), ObAsyncIndexSegmentGroupCtx::ObNewVersionRangeCompare());
 
   ObSEArray<ObNewVersionRange, 16> picked_ranges;
-  int64_t pos = 0;
   ASSERT_EQ(OB_SUCCESS, ObAsyncIndexSegmentGroupCtx::find_version_chain_(
-      version_ranges, pos, 0, 150, picked_ranges));
+      version_ranges, 0, 150, picked_ranges));
   expect_version_ranges(picked_ranges, fine_ranges);
-}
-
-// find_version_chain with coarse range before 12 fine ranges in sorted order.
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, find_version_chain_coarse_before_many_fine_ranges)
-{
-  std::vector<std::pair<int64_t, int64_t>> ranges = make_fine_ranges(0, 120, 10);
-  ranges.insert(ranges.begin(), std::make_pair(0, 120));
-  ObSEArray<ObNewVersionRange, 16> version_ranges;
-  for (size_t i = 0; i < ranges.size(); ++i) {
-    ASSERT_EQ(OB_SUCCESS, version_ranges.push_back(make_range(ranges[i].first, ranges[i].second)));
-  }
-  lib::ob_sort(version_ranges.get_data(), version_ranges.get_data() + version_ranges.count(), ObAsyncIndexSegmentGroupCtx::ObNewVersionRangeCompare());
-
-  ObSEArray<ObNewVersionRange, 16> picked_ranges;
-  int64_t pos = 0;
-  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexSegmentGroupCtx::find_version_chain_(
-      version_ranges, pos, 0, 50, picked_ranges));
-  expect_version_ranges(picked_ranges, make_fine_ranges(0, 50, 10));
-
-  picked_ranges.reuse();
-  pos = 0;
-  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexSegmentGroupCtx::find_version_chain_(
-      version_ranges, pos, 50, 120, picked_ranges));
-  expect_version_ranges(picked_ranges, make_fine_ranges(50, 120, 10));
-}
-
-// build_queryable_ranges filters nested ranges with 10+ entries.
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, build_queryable_ranges_nested_with_many_fine_ranges)
-{
-  std::vector<std::pair<int64_t, int64_t>> ranges = make_fine_ranges(0, 100, 10);
-  ranges.insert(ranges.begin(), std::make_pair(0, 100));
-  ObSEArray<ObNewVersionRange, 16> version_ranges;
-  for (size_t i = 0; i < ranges.size(); ++i) {
-    ASSERT_EQ(OB_SUCCESS, version_ranges.push_back(make_range(ranges[i].first, ranges[i].second)));
-  }
-  lib::ob_sort(version_ranges.get_data(), version_ranges.get_data() + version_ranges.count(), ObAsyncIndexSegmentGroupCtx::ObNewVersionRangeCompare());
-
-  ObSEArray<ObNewVersionRange, 16> queryable;
-  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexSegmentGroupCtx::build_query_ranges_(version_ranges, 100, queryable));
-  expect_version_ranges(queryable, {{0, 100}});
-
-  queryable.reuse();
-  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexSegmentGroupCtx::build_query_ranges_(version_ranges, 55, queryable));
-  expect_version_ranges(queryable, make_fine_ranges(0, 50, 10));
 }
 
 // ObAsyncIndexSegmentGroup basic init/add/get.
@@ -1072,64 +1087,234 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_three_tablets_
   }
   ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(65)));
   expect_uniform_groups(handle, make_fine_ranges(0, 60, 10));
-  EXPECT_EQ(65, handle.async_index_read_snapshot_.get_val_for_tx());
+  EXPECT_EQ(60, handle.async_index_read_snapshot_.get_val_for_tx());
 }
 
-// is_one_segment: true only when strict aligned and exactly one segment group.
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, is_one_segment_true_strict_aligned_single_group)
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_aligned_single_group)
 {
   ObAsyncIndexSegmentGroupCtx handle;
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 200}}));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 200}, {0, 100}, {100, 200}}));
+  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 200}}));
   ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(300)));
   expect_uniform_groups(handle, {{0, 200}});
-  expect_strict_aligned(handle, true);
   ASSERT_EQ(1, handle.groups_.count());
-  expect_one_segment(handle, true);
 }
 
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, is_one_segment_true_single_tablet_single_range)
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, calc_query_version_ranges_single_tablet_single_range)
 {
   ObAsyncIndexSegmentGroupCtx handle;
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 200}}));
   ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(300)));
   expect_uniform_groups(handle, {{0, 200}});
-  expect_strict_aligned(handle, true);
-  expect_one_segment(handle, true);
 }
 
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, is_one_segment_false_with_multiple_groups)
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, sparse_head_middle_tail_and_all_empty_index)
 {
-  ObAsyncIndexSegmentGroupCtx handle;
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(300)));
-  expect_strict_aligned(handle, true);
-  ASSERT_EQ(2, handle.groups_.count());
-  expect_one_segment(handle, false);
+  for (int empty_first = 0; empty_first <= 1; ++empty_first) {
+    SCOPED_TRACE(empty_first);
+    ObAsyncIndexSegmentGroupCtx handle;
+    if (empty_first) {
+      ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(handle, {}, 900));
+    }
+    ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(
+        handle, {{100, 200}, {400, 500}, {500, 600}}, 900));
+    ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(
+        handle, {{0, 50}, {200, 300}, {700, 800}}, 900));
+    if (!empty_first) {
+      ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(handle, {}, 900));
+    }
+    ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(900)));
+    GroupExpect expected = {
+      {{}, {{0, 50}}},
+      {{{100, 200}}, {}},
+      {{}, {{200, 300}}},
+      {{{400, 500}}, {}},
+      {{{500, 600}}, {}},
+      {{}, {{700, 800}}},
+    };
+    for (auto &group : expected) {
+      group.emplace(empty_first ? group.begin() : group.end());
+    }
+    expect_groups(handle, expected);
+    EXPECT_EQ(900, handle.get_async_index_read_snapshot().get_val_for_tx());
+  }
 }
 
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, is_one_segment_false_when_not_strict_aligned)
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, all_empty_has_one_empty_group)
 {
   ObAsyncIndexSegmentGroupCtx handle;
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 200}}));
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(300)));
-  expect_strict_aligned(handle, false);
-  ASSERT_EQ(1, handle.groups_.count());
-  expect_one_segment(handle, false);
+  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(handle, {}, 200));
+  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(handle, {}, 300));
+  ASSERT_EQ(OB_SUCCESS, handle.set_delete_table_published_version(150));
+  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(400)));
+  ASSERT_EQ(1, handle.get_group_count());
+  EXPECT_TRUE(handle.get_group(0)->get_tablet_version_ranges(0).empty());
+  EXPECT_TRUE(handle.get_group(0)->get_tablet_version_ranges(1).empty());
+  EXPECT_EQ(150, handle.get_async_index_read_snapshot().get_val_for_tx());
 }
 
-TEST_F(ObAsyncIndexSegmentGroupCtxTest, is_one_segment_false_before_calc_or_after_reset)
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, captured_publication_allows_newer_physical_tables)
 {
   ObAsyncIndexSegmentGroupCtx handle;
-  expect_one_segment(handle, false);
-  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}}));
-  expect_one_segment(handle, false);
-  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(100)));
-  expect_one_segment(handle, true);
-  handle.reset();
-  expect_one_segment(handle, false);
+  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(
+      handle, {{0, 100}, {200, 300}}, 200));
+  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(handle, {{0, 100}}, 250));
+  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(400)));
+  expect_uniform_groups(handle, {{0, 100}});
+  EXPECT_EQ(200, handle.get_async_index_read_snapshot().get_val_for_tx());
+}
+
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, query_uses_latest_major_without_history_fallback)
+{
+  ObTabletHandle old_owner;
+  ObTabletHandle new_owner;
+  ObTabletHandle inc_owner;
+  ASSERT_EQ(OB_SUCCESS, mock_tablet(allocator_, next_tablet_id_++, old_owner));
+  ASSERT_EQ(OB_SUCCESS, mock_tablet(allocator_, next_tablet_id_++, new_owner));
+  ASSERT_EQ(OB_SUCCESS, mock_tablet(allocator_, next_tablet_id_++, inc_owner));
+  blocksstable::ObSSTable *old_major =
+      old_owner.get_obj()->table_store_addr_.get_ptr()->major_tables_.at(0);
+  blocksstable::ObSSTable *new_major =
+      new_owner.get_obj()->table_store_addr_.get_ptr()->major_tables_.at(0);
+  blocksstable::ObSSTable *inc =
+      inc_owner.get_obj()->table_store_addr_.get_ptr()->major_tables_.at(0);
+  old_major->set_snapshot_version(200);
+  new_major->set_snapshot_version(300);
+  inc->key_.table_type_ = ObITable::INC_MAJOR_SSTABLE;
+  inc->key_.scn_range_.start_scn_ = make_scn(1000);
+  inc->key_.scn_range_.end_scn_ = make_scn(1100);
+  inc->meta_cache_.min_merged_trans_version_ = 200;
+  inc->meta_cache_.max_merged_trans_version_ = 300;
+  inc->meta_cache_.upper_trans_version_ = 400;
+  ObSEArray<ObITable *, 2> majors;
+  ObSEArray<ObITable *, 1> increments;
+  ASSERT_EQ(OB_SUCCESS, majors.push_back(old_major));
+  ASSERT_EQ(OB_SUCCESS, majors.push_back(new_major));
+  ASSERT_EQ(OB_SUCCESS, increments.push_back(inc));
+  ObTabletTableStore store;
+  ASSERT_EQ(OB_SUCCESS, store.major_tables_.init(allocator_, majors));
+  ASSERT_EQ(OB_SUCCESS, store.inc_major_tables_.init(allocator_, increments));
+  store.is_inited_ = true;
+  ObSEArray<ObNewVersionRange, 2> ranges;
+  ASSERT_EQ(OB_SUCCESS, store.get_async_index_sstable_version_ranges(
+      *new_owner.get_obj(), ranges));
+  // Old MAJOR and increments already covered by the latest MAJOR are excluded.
+  expect_version_ranges(ranges, {{0, 300}});
+  ObAsyncIndexSegmentGroupCtx ctx;
+  ASSERT_EQ(OB_SUCCESS, ctx.add_index_tablet_version_ranges(new_owner, ranges, 400));
+  EXPECT_EQ(OB_SNAPSHOT_DISCARDED, ctx.calc_query_version_ranges(make_scn(250)));
+  EXPECT_EQ(0, ctx.get_group_count());
+  EXPECT_FALSE(ctx.get_async_index_read_snapshot().is_valid());
+  ASSERT_EQ(OB_SUCCESS, ctx.calc_query_version_ranges(make_scn(300)));
+  expect_uniform_groups(ctx, {{0, 300}});
+}
+
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, later_created_coarse_index_spans_sparse_base)
+{
+  ObAsyncIndexSegmentGroupCtx handle;
+  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(
+      handle, {{0, 100}, {200, 300}, {400, 500}}, 600));
+  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(
+      handle, {{0, 300}, {500, 600}}, 600));
+  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(600)));
+  const GroupExpect expected = {
+    {{{0, 100}, {200, 300}}, {{0, 300}}},
+    {{{400, 500}}, {}},
+    {{}, {{500, 600}}},
+  };
+  expect_groups(handle, expected);
+}
+
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, read_boundary_requested_sparse_layouts)
+{
+  for (int layout = 0; layout < 2; ++layout) {
+    for (int limiter = 0; limiter < 3; ++limiter) {
+      for (int reverse = 0; reverse < 2; ++reverse) {
+        ObAsyncIndexSegmentGroupCtx handle;
+        for (int i = 0; i < 2; ++i) {
+          const bool is_a = (i == reverse);
+          const int64_t published = (1 == limiter && is_a) ? 210 : 400;
+          if (is_a) {
+            ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(
+                handle, {{0, 100}, {100, 200}, {200, 300}, {300, 400}}, published));
+          } else if (0 == layout) {
+            ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(
+                handle, {{0, 100}, {200, 400}}, published));
+          } else {
+            ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(
+                handle, {{0, 100}, {200, 300}, {300, 400}}, published));
+          }
+        }
+        ASSERT_EQ(OB_SUCCESS, handle.set_delete_table_published_version(
+            2 == limiter ? 210 : 400));
+        ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(
+            make_scn(0 == limiter ? 210 : 400)));
+        EXPECT_EQ(200, handle.get_async_index_read_snapshot().get_val_for_tx());
+        ASSERT_EQ(2, handle.get_group_count());
+        expect_version_ranges(handle.get_group(0)->get_tablet_version_ranges(0), {{0, 100}});
+        expect_version_ranges(handle.get_group(0)->get_tablet_version_ranges(1), {{0, 100}});
+        expect_version_ranges(handle.get_group(1)->get_tablet_version_ranges(reverse), {{100, 200}});
+        expect_version_ranges(handle.get_group(1)->get_tablet_version_ranges(1 - reverse), {});
+      }
+    }
+  }
+}
+
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, read_boundary_gap_starts_and_valid_upper_bounds)
+{
+  for (int64_t tablet_cnt = 1; tablet_cnt <= 2; ++tablet_cnt) {
+    const int64_t start = 1 == tablet_cnt ? 150 : 180;
+    const int64_t upper_bounds[] = {210, 120, start, 300, 350};
+    const int64_t expected_snapshots[] = {start, 120, start, 300, 350};
+    for (int64_t u = 0; u < ARRAYSIZEOF(upper_bounds); ++u) {
+      ObAsyncIndexSegmentGroupCtx handle;
+      for (int64_t i = 0; i < tablet_cnt; ++i) {
+        ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(
+            handle, {{0, 100}, {start, 300}}, 400));
+      }
+      ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(upper_bounds[u])));
+      EXPECT_EQ(expected_snapshots[u], handle.get_async_index_read_snapshot().get_val_for_tx());
+      if (upper_bounds[u] < 300) {
+        expect_uniform_groups(handle, {{0, 100}});
+      } else {
+        expect_uniform_groups(handle, {{0, 100}, {start, 300}});
+      }
+    }
+  }
+}
+
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, read_boundary_cascading_common_prefix)
+{
+  for (int reverse = 0; reverse < 2; ++reverse) {
+    ObAsyncIndexSegmentGroupCtx handle;
+    for (int i = 0; i < 2; ++i) {
+      if (i == reverse) {
+        ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 180}, {180, 300}}));
+      } else {
+        ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(
+            handle, {{0, 100}, {100, 160}, {160, 250}, {250, 300}}));
+      }
+    }
+    ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(210)));
+    EXPECT_EQ(100, handle.get_async_index_read_snapshot().get_val_for_tx());
+    expect_uniform_groups(handle, {{0, 100}});
+  }
+}
+
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, read_boundary_many_candidates_without_common_prefix)
+{
+  ObAsyncIndexSegmentGroupCtx handle;
+  const std::vector<std::pair<int64_t, int64_t>> fine = make_fine_ranges(0, 512, 2);
+  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_vec(handle, fine));
+  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 1024}}));
+  ASSERT_EQ(OB_SNAPSHOT_DISCARDED, handle.calc_query_version_ranges(make_scn(511)));
+  EXPECT_EQ(0, handle.get_group_count());
+  EXPECT_FALSE(handle.get_async_index_read_snapshot().is_valid());
+  // Failure preserves the inputs so the same context can later serve a valid U.
+  ASSERT_EQ(2, handle.get_index_tablet_count());
+  ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(0)));
+  expect_groups(handle, {{{}, {}}});
+  EXPECT_EQ(0, handle.get_async_index_read_snapshot().get_val_for_tx());
 }
 
 } // namespace unittest

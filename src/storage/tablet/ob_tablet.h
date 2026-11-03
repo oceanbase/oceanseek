@@ -59,6 +59,7 @@ namespace blocksstable
 {
 class ObSSTable;
 struct ObSSTableMergeRes;
+struct ObAsyncInvBM25Stats;
 }
 
 namespace compaction
@@ -673,23 +674,27 @@ public:
   int get_async_index_sstable(
       const ObITable::TableType table_type,
       const common::ObNewVersionRange &version_range,
-      const share::SCN &read_snapshot,
       ObTableHandleV2 &handle) const;
+  int get_async_inv_bm25_stats(
+      const share::SCN &read_snapshot,
+      blocksstable::ObAsyncInvBM25Stats &stats) const;
   int get_recycle_version(const int64_t multi_version_start, int64_t &recycle_version) const;
   int get_migration_sstable_size(int64_t &data_size);
   int get_async_index_max_published_version(int64_t &published_version) const;
-  int get_async_index_max_published_version(
-      const share::SCN &read_snapshot,
-      int64_t &published_version) const;
-  // 查询仅允许使用随表创建事务证明的逻辑空后缀抬高物理水位；该 MDS
-  // published_version 必须等于当前 Tablet 的 create commit version。
+  // Bound the latest committed logical publication by the SQL snapshot.
+  // Missing physical ranges below this watermark represent empty refreshes.
   int get_async_index_query_published_version(
       const share::SCN &read_snapshot,
-      const int64_t physical_published_version,
       int64_t &query_published_version) const;
-  // Latest committed logical watermark used by refresh writers after taking
-  // the target Tablet refresh lock. Legacy values fall back to TableStore.
+  // Cached committed logical watermark, read before reacquiring the Tablet.
   int get_latest_async_index_published_version(int64_t &published_version) const;
+  // Resolve a finite MVCC snapshot for scanning the async deletion table.
+  int get_deletion_physical_snapshot(
+      const int64_t expire_ts, int64_t &snapshot, const int64_t minimum_snapshot = 0);
+  // Refresh/DDL bootstrap only; this physical fallback is not a query publication.
+  // After taking the refresh lock, bypass the cache to observe the preceding commit.
+  int get_async_index_refresh_start_version(
+      int64_t &published_version, const bool use_cache = true) const;
 
   // column store replica
 public:
@@ -710,6 +715,11 @@ public:
       bool &need_update); 
 
 private:
+  int aggregate_async_inv_bm25_stats_(
+      const ObTabletTableStore &table_store,
+      const ObStorageMetaHandle &table_store_handle,
+      const share::SCN &read_snapshot,
+      blocksstable::ObAsyncInvBM25Stats &stats) const;
   int inner_pre_process_cs_replica(
       const ObDirectLoadType direct_load_type,
       ObITable::TableKey &table_key,
@@ -909,6 +919,8 @@ protected:// for MDS use
   virtual int get_mds_table_for_write_(ObLSHandle &ls_handle,
                                                     ObMdsTable *&mds_table) const override final;
 private:
+  int get_async_index_membership_(
+      ObAsyncIndexMembershipCache &membership, const bool use_cache) const;
   int check_tablet_schema_mismatch(
       const ObTablet &old_tablet,
       const ObStorageSchema &storage_schema,
@@ -1127,6 +1139,7 @@ private:
       int64_t &pos,
       const bool prepare_memtable);
 
+  int collect_transfer_source_deletion_snapshot_(ObDeletionReadPreparation &preparation);
   int get_src_tablet_read_tables_(
       const int64_t snapshot_version,
       const bool allow_no_ready_read,
@@ -1277,7 +1290,7 @@ private:
   ObDDLInfoCache ddl_data_cache_;                            // size: 24B, alignment: 8B
   ObTruncateInfoCache truncate_info_cache_;                  // size: 8B, alignment: 8B
   ObTTLFilterInfoCache ttl_filter_info_cache_;               // size: 16B, alignment: 8B
-  mutable ObAsyncIndexMembershipCache async_index_membership_cache_; // size: 16B, alignment: 8B
+  mutable ObAsyncIndexMembershipCache async_index_membership_cache_; // size: 24B, alignment: 8B
   ObTableStoreCache table_store_cache_; // no need to serialize, should be initialized after table store is initialized.
                                                              // size: 48B, alignment: 8B
   // Intrusive dirty-list state. Both fields are written under
