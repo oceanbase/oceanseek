@@ -87,10 +87,6 @@ private:
                        ObTenantSchemaPublishState &state,
                        const ObSchemaPublishSnapshot &publish_snapshot,
                        ObSchemaResolveRange &version_range);
-  int normalize_table_name_(const common::ObString &table_name,
-                            const common::ObNameCaseMode case_mode,
-                            common::ObIAllocator &allocator,
-                            common::ObString &normalized_name) const;
   // L1-cached lookup for one session_id. Caller owns session→0 fallback.
   int get_version_range_by_name_with_session_id_(
       ObSchemaGetterGuard &guard,

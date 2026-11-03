@@ -11,6 +11,7 @@
 #include "share/schema/ob_table_schema.h"
 #include "share/ob_get_compat_mode.h"
 #include "lib/ob_define.h"
+#include "lib/charset/ob_charset.h"
 #include "lib/string/ob_sql_string.h"
 #include "lib/utility/utility.h"
 #include "observer/ob_sql_client_decorator.h"
@@ -225,27 +226,27 @@ int resolve_oracle_index_cache_key_name(const ObSimpleTableSchemaV2 &schema,
 
 int append_name_predicate(ObSqlString &sql,
                                   const bool is_oracle_index,
-                                  const ObString &normalized_name)
+                                  const ObString &resolve_name)
 {
   int ret = OB_SUCCESS;
-  if (normalized_name.empty()) {
+  if (resolve_name.empty()) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid normalized name", KR(ret), K(is_oracle_index));
+    LOG_WARN("invalid resolve name", KR(ret), K(is_oracle_index));
   } else if (!is_oracle_index) {
     if (OB_FAIL(sql.append("table_name = "))) {
       LOG_WARN("failed to append exact name predicate", KR(ret));
-    } else if (OB_FAIL(sql_append_hex_escape_str(normalized_name, sql))) {
-      LOG_WARN("failed to append exact table name", KR(ret), K(normalized_name));
+    } else if (OB_FAIL(sql_append_hex_escape_str(resolve_name, sql))) {
+      LOG_WARN("failed to append exact table name", KR(ret), K(resolve_name));
     }
   } else {
     ObSqlString like_pattern;
-    if (OB_FAIL(build_oracle_origin_index_like_pattern_(normalized_name, like_pattern))) {
+    if (OB_FAIL(build_oracle_origin_index_like_pattern_(resolve_name, like_pattern))) {
       LOG_WARN("failed to build oracle origin index like pattern",
-               KR(ret), K(normalized_name));
+               KR(ret), K(resolve_name));
     } else if (OB_FAIL(sql.append("table_name LIKE "))) {
       LOG_WARN("failed to append like predicate", KR(ret));
     } else if (OB_FAIL(sql_append_hex_escape_str(like_pattern.string(), sql))) {
-      LOG_WARN("failed to append like pattern", KR(ret), K(normalized_name));
+      LOG_WARN("failed to append like pattern", KR(ret), K(resolve_name));
     } else if (OB_FAIL(sql.append(" ESCAPE '\\\\'"))) {
       LOG_WARN("failed to append like escape", KR(ret));
     }

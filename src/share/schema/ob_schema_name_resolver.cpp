@@ -59,7 +59,7 @@ int get_next_name_binding_version_(
     const uint64_t tenant_id,
     const ObTableNameNamespace table_namespace,
     const uint64_t database_id,
-    const ObString &normalized_name,
+    const ObString &resolve_name,
     const uint64_t session_id,
     const int64_t snapshot_version,
     const ObNameCaseMode name_case_mode,
@@ -96,15 +96,15 @@ int get_next_name_binding_version_(
     LOG_WARN("failed to append next name binding sql prefix", KR(ret), K(tenant_id),
              K(database_id), K(session_id));
   } else if (OB_FAIL(append_name_predicate(
-                 sql, is_oracle_index, normalized_name))) {
-    LOG_WARN("failed to append name predicate", KR(ret), K(normalized_name),
+                 sql, is_oracle_index, resolve_name))) {
+    LOG_WARN("failed to append name predicate", KR(ret), K(resolve_name),
              K(is_oracle_index));
   } else if (OB_FAIL(sql.append_fmt(
       " %sAND session_id = %lu AND is_deleted = 0 AND schema_version > %ld "
       "ORDER BY schema_version ASC",
       namespace_filter.ptr(), session_id, snapshot_version))) {
     LOG_WARN("failed to append next name binding sql", KR(ret), K(tenant_id),
-             K(database_id), K(normalized_name), K(session_id), K(snapshot_version));
+             K(database_id), K(resolve_name), K(session_id), K(snapshot_version));
   } else if (!is_oracle_index
              && OB_ORIGIN_AND_SENSITIVE != name_case_mode
              && OB_FAIL(sql.append(" LIMIT 1"))) {
@@ -116,12 +116,12 @@ int get_next_name_binding_version_(
       if (OB_FAIL(weak_read_sql(
           sql_client, snapshot_timestamp, exec_tenant_id, sql.ptr(), res))) {
         LOG_WARN("failed to read next name binding", KR(ret), K(tenant_id),
-                 K(database_id), K(normalized_name), K(session_id));
+                 K(database_id), K(resolve_name), K(session_id));
         LOG_TRACE("next name binding sql", K(sql));
       } else if (OB_ISNULL(result = res.get_result())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("next name binding result is null", KR(ret), K(tenant_id),
-                 K(database_id), K(normalized_name), K(session_id));
+                 K(database_id), K(resolve_name), K(session_id));
       } else {
         while (OB_SUCC(ret) && OB_SCHEMA_VERSION_INF == next_binding_version) {
           ObString row_table_name;
@@ -132,7 +132,7 @@ int get_next_name_binding_version_(
               break;
             } else {
               LOG_WARN("failed to get next name binding row", KR(ret), K(tenant_id),
-                       K(database_id), K(normalized_name), K(session_id));
+                       K(database_id), K(resolve_name), K(session_id));
             }
           } else {
             EXTRACT_VARCHAR_FIELD_MYSQL(*result, "table_name", row_table_name);
@@ -140,15 +140,15 @@ int get_next_name_binding_version_(
                 *result, "schema_version", row_schema_version, int64_t);
             if (OB_FAIL(ret)) {
               LOG_WARN("failed to extract next name binding row", KR(ret), K(tenant_id),
-                       K(database_id), K(normalized_name), K(session_id));
+                       K(database_id), K(resolve_name), K(session_id));
             } else {
               bool name_matched = false;
               if (OB_FAIL(stored_table_name_matches_resolve_name(
-                      normalized_name, row_table_name, is_oracle_index,
+                      resolve_name, row_table_name, is_oracle_index,
                       schema_service, case_compare, compare_with_collation,
                       name_matched))) {
                 LOG_WARN("failed to match next name binding row", KR(ret),
-                         K(normalized_name), K(row_table_name),
+                         K(resolve_name), K(row_table_name),
                          K(is_oracle_index));
               } else if (name_matched) {
                 next_binding_version = row_schema_version;
@@ -168,7 +168,7 @@ int build_not_exist_name_range_(
     const uint64_t tenant_id,
     const ObTableNameNamespace table_namespace,
     const uint64_t database_id,
-    const ObString &normalized_name,
+    const ObString &resolve_name,
     const uint64_t session_id,
     const int64_t snapshot_version,
     const ObNameCaseMode name_case_mode,
@@ -180,10 +180,10 @@ int build_not_exist_name_range_(
   int64_t next_binding_version = OB_SCHEMA_VERSION_INF;
   if (OB_FAIL(get_next_name_binding_version_(
       sql_client, schema_status, tenant_id, table_namespace, database_id,
-      normalized_name, session_id, snapshot_version, name_case_mode,
+      resolve_name, session_id, snapshot_version, name_case_mode,
       schema_service, next_binding_version))) {
     LOG_WARN("failed to get next name binding version", KR(ret), K(tenant_id),
-             K(database_id), K(normalized_name), K(session_id), K(snapshot_version));
+             K(database_id), K(resolve_name), K(session_id), K(snapshot_version));
   } else {
     const int64_t range_end = OB_SCHEMA_VERSION_INF == next_binding_version
         ? OB_SCHEMA_VERSION_INF : next_binding_version - 1;
@@ -331,7 +331,6 @@ int ObSchemaNameResolver::resolve_table_by_name_for_session_(
   const uint64_t tenant_id = key.tenant_id_;
   const ObTableNameNamespace table_namespace = key.table_namespace_;
   const uint64_t database_id = key.database_id_;
-  const ObString &normalized_name = key.normalized_name_;
   const uint64_t session_id = key.exact_session_id_;
   const int64_t snapshot_timestamp = schema_status.snapshot_timestamp_;
   const uint64_t exec_tenant_id = ObSchemaServiceSQLImpl::fill_exec_tenant_id(schema_status);
@@ -346,19 +345,19 @@ int ObSchemaNameResolver::resolve_table_by_name_for_session_(
   version_range.reset();
   LOG_TRACE("[OnDemandNameResolve] name backsource input",
            K(tenant_id), K(database_id), K(table_namespace), K(table_name),
-           K(normalized_name), K(session_id), K(snapshot_version), K(name_case_mode));
+           K(session_id), K(snapshot_version), K(name_case_mode));
   if (OB_FAIL(check_is_oracle_index(
           tenant_id, database_id, table_namespace, is_oracle_index))) {
     LOG_WARN("failed to check oracle index", KR(ret), K(tenant_id),
              K(database_id), K(table_namespace));
   } else if (OB_FAIL(append_table_namespace_filter(table_namespace, namespace_filter))) {
     LOG_WARN("failed to build table namespace filter", KR(ret), K(table_namespace));
-  } else if (normalized_name.empty()
+  } else if (table_name.empty()
              || name_case_mode <= OB_NAME_CASE_INVALID
              || name_case_mode >= OB_NAME_CASE_MAX) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid normalized table name or case mode", KR(ret), K(table_name),
-             K(normalized_name), K(name_case_mode));
+    LOG_WARN("invalid table name or case mode", KR(ret), K(table_name),
+             K(name_case_mode));
   } else if (OB_FAIL(ObSchemaUtils::get_all_table_history_name(
       exec_tenant_id, history_table, GCTX.schema_service_))) {
     LOG_WARN("failed to get table history name", KR(ret), K(exec_tenant_id));
@@ -370,7 +369,7 @@ int ObSchemaNameResolver::resolve_table_by_name_for_session_(
     LOG_WARN("failed to append resolve sql prefix", KR(ret), K(tenant_id), K(database_id),
              K(table_name), K(session_id));
   } else if (OB_FAIL(append_name_predicate(
-                 sql, is_oracle_index, normalized_name))) {
+                 sql, is_oracle_index, table_name))) {
     LOG_WARN("failed to append name predicate", KR(ret), K(table_name),
              K(is_oracle_index));
   } else if (OB_FAIL(sql.append_fmt(
@@ -424,7 +423,7 @@ int ObSchemaNameResolver::resolve_table_by_name_for_session_(
               matched_table_id = version_range.schema_id_;
               matched_namespace = version_range.table_namespace_;
               LOG_TRACE("[OnDemandNameResolve] name backsource phase-a hit",
-                       K(tenant_id), K(database_id), K(table_name), K(normalized_name),
+                       K(tenant_id), K(database_id), K(table_name),
                        K(table_namespace), K(matched_table_id), K(matched_namespace),
                        "name_row_exist", version_range.is_exist_, K(session_id),
                        K(snapshot_version));
@@ -454,7 +453,7 @@ int ObSchemaNameResolver::resolve_table_by_name_for_session_(
       // case-mismatched candidates. Treat that as a normal not-exist result.
       if (got_history_row && !name_row_matched) {
         LOG_TRACE("[OnDemandNameResolve] no exact name match after SQL filter",
-                  K(tenant_id), K(database_id), K(table_name), K(normalized_name),
+                  K(tenant_id), K(database_id), K(table_name),
                   K(table_namespace), K(session_id), K(snapshot_version), K(sql));
       }
       if (OB_FAIL(got_history_row
@@ -462,7 +461,7 @@ int ObSchemaNameResolver::resolve_table_by_name_for_session_(
               snapshot_version, table_namespace, version_range)
           : build_not_exist_name_range_(
               sql_client, schema_status, tenant_id, table_namespace, database_id,
-              normalized_name, session_id, snapshot_version, name_case_mode,
+              table_name, session_id, snapshot_version, name_case_mode,
               schema_service, 0 /*range_start*/, version_range))) {
         LOG_WARN("failed to build not exist name range", KR(ret), K(tenant_id),
                  K(database_id), K(table_name), K(session_id), K(snapshot_version));
@@ -490,7 +489,6 @@ int ObSchemaNameResolver::fill_version_range_by_table_id_(
   const uint64_t tenant_id = key.tenant_id_;
   const ObTableNameNamespace table_namespace = key.table_namespace_;
   const uint64_t database_id = key.database_id_;
-  const ObString &normalized_name = key.normalized_name_;
   const uint64_t session_id = key.exact_session_id_;
   const uint64_t table_id = version_range.schema_id_;
   bool identity_matched = false;
@@ -516,7 +514,7 @@ int ObSchemaNameResolver::fill_version_range_by_table_id_(
     version_range.table_namespace_ = table_namespace;
   } else if (OB_FAIL(build_not_exist_name_range_(
       sql_client, schema_status, tenant_id, table_namespace, database_id,
-      normalized_name, session_id, snapshot_version, name_case_mode,
+      table_name, session_id, snapshot_version, name_case_mode,
       schema_service, id_version_range.start_version_, version_range))) {
     LOG_WARN("failed to build not-exist name range", KR(ret), K(tenant_id),
              K(table_id), K(database_id), K(table_name), K(session_id),
@@ -541,7 +539,7 @@ int ObSchemaNameResolver::get_schema_version_range_by_name_for_session(
       || key.table_namespace_ >= NS_MAX
       || OB_INVALID_ID == key.database_id_
       || table_name.empty()
-      || key.normalized_name_.empty()
+      || key.lookup_name_.empty()
       || snapshot_version < 0) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), K(key), K(table_name), K(snapshot_version));
@@ -572,8 +570,6 @@ int ObSchemaNameResolver::get_schema_version_range_by_name(
   int ret = OB_SUCCESS;
   ObSchemaService *schema_service = NULL;
   ObSchemaResolveRange session_version_range;
-  ObArenaAllocator allocator("SchemaNameNorm");
-  ObString normalized_name;
   version_range.reset();
   if (OB_INVALID_TENANT_ID == tenant_id
       || table_namespace >= NS_MAX
@@ -591,23 +587,17 @@ int ObSchemaNameResolver::get_schema_version_range_by_name(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid name case mode", KR(ret), K(name_case_mode));
   } else {
-    if (OB_ORIGIN_AND_SENSITIVE == name_case_mode) {
-      if (OB_FAIL(ob_write_string(allocator, table_name, normalized_name))) {
-        LOG_WARN("failed to copy case-sensitive table name", KR(ret), K(table_name));
-      }
-    } else if (OB_FAIL(ObCharset::casedn(CS_TYPE_UTF8MB4_GENERAL_CI,
-                                         table_name, normalized_name, allocator))) {
-      LOG_WARN("failed to normalize table name", KR(ret), K(table_name), K(name_case_mode));
-    }
     // Prefer current-session temporary table, then fall back to session_id=0.
     // Each call runs phase A (name -> table_id) then phase B (table_id -> version range).
-    // cache_generation is unused by SQL backsource.
+    // cache_generation is unused by SQL backsource. The key keeps the requested
+    // name verbatim; name_case_mode selects the collation for key hash/compare,
+    // the same contract as the ORIGINAL SchemaMgr name map.
     const ObSchemaNameResolveKey session_key(
         tenant_id, 0 /*cache_generation*/, database_id, session_id,
-        table_namespace, normalized_name);
+        table_namespace, name_case_mode, table_name);
     const ObSchemaNameResolveKey global_key(
         tenant_id, 0 /*cache_generation*/, database_id, 0 /*exact_session_id*/,
-        table_namespace, normalized_name);
+        table_namespace, name_case_mode, table_name);
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(resolve_table_by_name_for_session_(
         sql_client, schema_status, session_key, table_name, snapshot_version,

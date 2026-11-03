@@ -60,6 +60,15 @@ public:
   uint64_t schema_id_;
 };
 
+// Name resolve cache key for the on-demand schema cache.
+//
+// The key keeps the requested name and the name case mode, and mirrors the
+// ORIGINAL SchemaMgr name map contract (ObTableSchemaHashWrapper): equality is
+// decided by ObCharset::strcmp on the collation selected by the case mode, and
+// hash() uses ObCharset::hash on the same collation. Deriving a canonical byte
+// string (lowercase or sort key) is not equivalent: lowercased bytes disagree
+// with general_ci for U+212A, and a sort key cannot stay equivalent for invalid
+// UTF-8 input.
 class ObSchemaNameResolveKey final : public common::ObIKVCacheKey
 {
 public:
@@ -69,7 +78,8 @@ public:
                          uint64_t database_id,
                          uint64_t exact_session_id,
                          ObTableNameNamespace table_namespace,
-                         const common::ObString &normalized_name);
+                         const common::ObNameCaseMode name_case_mode,
+                         const common::ObString &lookup_name);
   virtual ~ObSchemaNameResolveKey() {}
   bool is_valid() const;
   // The KVCache instance and its memory are owned by tenant 500. tenant_id_
@@ -81,14 +91,21 @@ public:
   virtual int deep_copy(char *buf, int64_t buf_len,
                         common::ObIKVCacheKey *&key) const override;
   TO_STRING_KV(K_(tenant_id), K_(cache_generation), K_(database_id),
-               K_(exact_session_id), K_(table_namespace), K_(normalized_name));
+               K_(exact_session_id), K_(table_namespace), K_(name_case_mode),
+               K_(lookup_name));
 
   uint64_t tenant_id_;
   uint64_t cache_generation_;
   uint64_t database_id_;
   uint64_t exact_session_id_;
   ObTableNameNamespace table_namespace_;
-  common::ObString normalized_name_;
+  // The requested name is kept verbatim. Equality and hash follow the same
+  // collation based contract as the ORIGINAL SchemaMgr name map
+  // (ObTableSchemaHashWrapper): case mode selects utf8mb4_general_ci or
+  // utf8mb4_bin, so keys never disagree with ObCharset::strcmp, including for
+  // invalid UTF-8 input.
+  common::ObNameCaseMode name_case_mode_;
+  common::ObString lookup_name_;
 };
 
 struct ObSchemaResolveRange

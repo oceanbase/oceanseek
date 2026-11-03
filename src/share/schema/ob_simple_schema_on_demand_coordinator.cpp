@@ -13,6 +13,7 @@
 #include "share/schema/ob_simple_schema_lookup_service.h"
 #include "share/schema/ob_schema_service.h"
 #include "share/schema/ob_schema_utils.h"
+#include "share/schema/ob_schema_resolve_util.h"
 #include "share/schema/ob_server_schema_service.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/allocator/page_arena.h"
@@ -371,30 +372,6 @@ int ObSimpleSchemaOnDemandCoordinator::get_schema_version_range_by_id(
   return ret;
 }
 
-int ObSimpleSchemaOnDemandCoordinator::normalize_table_name_(
-    const ObString &table_name,
-    const ObNameCaseMode case_mode,
-    ObIAllocator &allocator,
-    ObString &normalized_name) const
-{
-  int ret = OB_SUCCESS;
-  normalized_name.reset();
-  if (table_name.empty()
-      || case_mode <= OB_NAME_CASE_INVALID
-      || case_mode >= OB_NAME_CASE_MAX) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument for normalize table name", KR(ret), K(table_name), K(case_mode));
-  } else if (OB_ORIGIN_AND_SENSITIVE == case_mode) {
-    if (OB_FAIL(ob_write_string(allocator, table_name, normalized_name))) {
-      LOG_WARN("failed to copy case-sensitive table name", KR(ret), K(table_name));
-    }
-  } else if (OB_FAIL(ObCharset::casedn(CS_TYPE_UTF8MB4_GENERAL_CI,
-                                       table_name, normalized_name, allocator))) {
-    LOG_WARN("failed to normalize table name", KR(ret), K(table_name), K(case_mode));
-  }
-  return ret;
-}
-
 int ObSimpleSchemaOnDemandCoordinator::get_version_range_by_name_with_session_id_(
     ObSchemaGetterGuard &guard,
     const ObSchemaNameResolveKey &key,
@@ -511,8 +488,6 @@ int ObSimpleSchemaOnDemandCoordinator::get_schema_version_range_by_name(
   int64_t snapshot_version = OB_INVALID_VERSION;
   int64_t retry_count = 0;
   const int64_t abs_deadline_us = get_load_deadline_();
-  ObArenaAllocator allocator("SchemaNameNorm");
-  ObString normalized_name;
   version_range.reset();
   if (!check_inner_stat()) {
     ret = OB_INNER_STAT_ERROR;
@@ -535,13 +510,10 @@ int ObSimpleSchemaOnDemandCoordinator::get_schema_version_range_by_name(
   } else if (OB_FAIL(guard.get_schema_version(tenant_id, snapshot_version))) {
     LOG_WARN("failed to get snapshot version", KR(ret), K(tenant_id), K(database_id),
              K(table_name));
-  } else if (OB_FAIL(normalize_table_name_(table_name, name_case_mode, allocator,
-                                           normalized_name))) {
-    LOG_WARN("failed to normalize table name", KR(ret), K(table_name), K(name_case_mode));
   } else {
     LOG_TRACE("[OnDemandNameResolve] coordinator resolve by name",
              K(tenant_id), K(database_id), K(table_namespace), K(table_name),
-             K(normalized_name), K(session_id), K(name_case_mode), K(snapshot_version));
+             K(session_id), K(name_case_mode), K(snapshot_version));
     bool done = false;
     while (OB_SUCC(ret) && !done) {
       ObTenantSchemaPublishState *state = NULL;
@@ -557,9 +529,12 @@ int ObSimpleSchemaOnDemandCoordinator::get_schema_version_range_by_name(
         // Both probes use one publication token so they cannot cross generations.
         if (0 != session_id) {
           ObSchemaResolveRange private_range;
+          // The key keeps the requested name verbatim; the case mode drives the
+          // collation used by the key hash/compare (same contract as the
+          // ORIGINAL SchemaMgr name map).
           const ObSchemaNameResolveKey private_key(
               tenant_id, publish_snapshot.cache_generations_.name_resolve_,
-              database_id, session_id, table_namespace, normalized_name);
+              database_id, session_id, table_namespace, name_case_mode, table_name);
           ret = get_version_range_by_name_with_session_id_(
               guard, private_key, table_name, snapshot_version, name_case_mode,
               abs_deadline_us, *state, publish_snapshot, private_range);
@@ -574,7 +549,8 @@ int ObSimpleSchemaOnDemandCoordinator::get_schema_version_range_by_name(
         if (OB_SUCC(ret) && !found_private) {
           const ObSchemaNameResolveKey global_key(
               tenant_id, publish_snapshot.cache_generations_.name_resolve_,
-              database_id, 0 /*exact_session_id*/, table_namespace, normalized_name);
+              database_id, 0 /*exact_session_id*/, table_namespace, name_case_mode,
+              table_name);
           ret = get_version_range_by_name_with_session_id_(
               guard, global_key, table_name, snapshot_version, name_case_mode,
               abs_deadline_us, *state, publish_snapshot, candidate);

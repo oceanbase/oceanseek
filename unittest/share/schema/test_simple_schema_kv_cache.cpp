@@ -19,7 +19,9 @@
 #include "share/ob_simple_mem_limit_getter.h"
 #include "share/ob_thread_mgr.h"
 #include "share/config/ob_server_config.h"
+#include "lib/charset/ob_charset.h"
 #include "share/schema/ob_simple_schema_kv_cache.h"
+#include "share/schema/ob_schema_resolve_util.h"
 #include "share/schema/ob_tablegroup_table_id_cache.h"
 
 #define private public
@@ -416,6 +418,7 @@ TEST(SimpleSchemaKVCacheStruct, name_key_deep_copy_owns_name)
 {
   char name_buf[] = "MixedCaseName";
   ObSchemaNameResolveKey key(1001, 7, 2001, 0, NS_NORMAL_TABLE,
+                             OB_ORIGIN_AND_INSENSITIVE,
                              ObString(sizeof(name_buf) - 1, name_buf));
   ASSERT_TRUE(key.is_valid());
   ASSERT_EQ(OB_SERVER_TENANT_ID, key.get_tenant_id());
@@ -428,15 +431,15 @@ TEST(SimpleSchemaKVCacheStruct, name_key_deep_copy_owns_name)
   ASSERT_EQ(key.hash(), copy->hash());
   EXPECT_EQ(OB_SERVER_TENANT_ID, copy->get_tenant_id());
   name_buf[0] = 'x';
-  EXPECT_EQ(ObString("MixedCaseName"), copy->normalized_name_);
-  EXPECT_NE(key.normalized_name_, copy->normalized_name_);
+  EXPECT_EQ(ObString("MixedCaseName"), copy->lookup_name_);
+  EXPECT_NE(key.lookup_name_, copy->lookup_name_);
 }
 
 TEST(SimpleSchemaKVCacheStruct, on_demand_keys_charge_memory_to_server_tenant)
 {
   ObSchemaIDResolveKey id_key(TEST_TENANT_ID, 7, 500001);
   ObSchemaNameResolveKey name_key(
-      TEST_TENANT_ID, 7, 500010, 0, NS_NORMAL_TABLE,
+      TEST_TENANT_ID, 7, 500010, 0, NS_NORMAL_TABLE, OB_ORIGIN_AND_INSENSITIVE,
       ObString::make_string("t1"));
   ObSimpleSchemaCacheKey object_key(TEST_TENANT_ID, 500001, 100);
   ObTablegroupTableIdCacheKey tablegroup_key(TEST_TENANT_ID, 7, 500020);
@@ -1354,7 +1357,8 @@ TEST_F(TestSimpleSchemaKVCache, resolve_cache_writes_do_not_count_as_reads)
   ASSERT_EQ(OB_SUCCESS, state.read_stable(token));
   const ObSchemaIDResolveKey id_key(TEST_TENANT_ID, 1, 500001);
   const ObSchemaNameResolveKey name_key(
-      TEST_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE, ObString::make_string("table_a"));
+      TEST_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE, OB_ORIGIN_AND_INSENSITIVE,
+      ObString::make_string("table_a"));
   // Both loader merges and incremental repairs must leave read statistics alone.
   for (int64_t version = 80; version <= 100; version += 20) {
     ASSERT_EQ(OB_SUCCESS, cache.publish_if_current(id_key,
@@ -1415,7 +1419,8 @@ TEST_F(TestSimpleSchemaKVCache, on_demand_kvcache_hit_and_miss_stat_events)
   EXPECT_EQ(2, get_stat_event_value(slot, ObStatEventIds::SCHEMA_ID_RESOLVE_CACHE_HIT));
 
   const ObSchemaNameResolveKey name_key(
-      TEST_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE, ObString::make_string("t1"));
+      TEST_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE, OB_ORIGIN_AND_INSENSITIVE,
+      ObString::make_string("t1"));
   EXPECT_EQ(OB_ENTRY_NOT_EXIST, resolve_cache.get(name_key, 100, resolve_result));
   EXPECT_EQ(1, get_stat_event_value(slot, ObStatEventIds::SCHEMA_NAME_RESOLVE_CACHE_MISS));
   const ObSchemaResolveRange name_range = make_name_range(100, 110, 500001, 100, true);
@@ -1565,6 +1570,7 @@ TEST_F(TestSimpleSchemaKVCache, resolve_cache_rejects_mismatched_namespace)
   ObSchemaNameResolveKey name_key(TEST_TENANT_ID,
                                   token.cache_generations_.name_resolve_,
                                   500010, 0, NS_NORMAL_TABLE,
+                                  OB_ORIGIN_AND_INSENSITIVE,
                                   ObString::make_string("t1"));
   ObSchemaResolveRange wrong_name_range = make_exist_range(20, 29, 20, 2);
   EXPECT_EQ(OB_INVALID_ARGUMENT,
@@ -2395,9 +2401,11 @@ TEST_F(TestSimpleSchemaKVCache, incremental_refresh_repairs_only_resident_keys)
     ASSERT_EQ(OB_SUCCESS, state.read_stable(before));
     const ObSchemaIDResolveKey id_key(OB_SYS_TENANT_ID, 1, 500001);
     const ObSchemaNameResolveKey old_name(
-        OB_SYS_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE, ObString::make_string("before"));
+        OB_SYS_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE, OB_ORIGIN_AND_INSENSITIVE,
+        ObString::make_string("before"));
     const ObSchemaNameResolveKey new_name(
-        OB_SYS_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE, ObString::make_string("after"));
+        OB_SYS_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE, OB_ORIGIN_AND_INSENSITIVE,
+        ObString::make_string("after"));
     if (0 != (mask & 1)) {
       // Physical residency, not a hit at the DDL version, decides whether to repair.
       ASSERT_EQ(OB_SUCCESS, cache.publish_if_current(id_key,
@@ -2555,7 +2563,7 @@ TEST_F(TestSimpleSchemaKVCache, multi_version_refresh_preserves_history_and_fina
   const char *cached_names[] = {"plan_a", "plan_b", "plan_c", "plan_tmp", "plan_final"};
   for (int64_t i = 0; i < ARRAYSIZEOF(cached_names); ++i) {
     const ObSchemaNameResolveKey key(
-        OB_SYS_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE,
+        OB_SYS_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE, OB_ORIGIN_AND_INSENSITIVE,
         ObString::make_string(cached_names[i]));
     ASSERT_EQ(OB_SUCCESS, seed_resolve_cache(service.get_schema_resolve_cache(), key,
         make_name_range(100, OB_SCHEMA_VERSION_INF,
@@ -2587,7 +2595,7 @@ TEST_F(TestSimpleSchemaKVCache, multi_version_refresh_preserves_history_and_fina
   // final binding. Neither A's intermediate name nor deleted C can reopen.
   for (int64_t i = 0; i < ARRAYSIZEOF(name_results); ++i) {
     const ObSchemaNameResolveKey key(
-        OB_SYS_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE,
+        OB_SYS_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE, OB_ORIGIN_AND_INSENSITIVE,
         ObString::make_string(name_results[i].name_));
     ASSERT_EQ(OB_SUCCESS, service.get_schema_resolve_cache().get(
         key, name_results[i].snapshot_, result)) << "name expectation " << i;
@@ -2617,11 +2625,13 @@ TEST_F(TestSimpleSchemaKVCache, incremental_alter_keeps_unrelated_generation_and
                                       TEST_TENANT_ID,
                                       old_token.cache_generations_.name_resolve_,
                                       500010, 0, NS_NORMAL_TABLE,
+                                      OB_ORIGIN_AND_SENSITIVE,
                                       ObString::make_string("table_a"));
   ObSchemaNameResolveKey table_b_name(
                                       TEST_TENANT_ID,
                                       old_token.cache_generations_.name_resolve_,
                                       500010, 0, NS_NORMAL_TABLE,
+                                      OB_ORIGIN_AND_SENSITIVE,
                                       ObString::make_string("table_b"));
   ASSERT_EQ(OB_SUCCESS, resolve_cache.publish_if_current(
       table_a_id, make_exist_range(100, OB_SCHEMA_VERSION_INF, 100, 0, 500001),
@@ -2692,7 +2702,7 @@ TEST_F(TestSimpleSchemaKVCache, multiple_changes_before_end_sign_keep_historical
   ObSchemaIDResolveKey id_key(TEST_TENANT_ID, cache_generations.id_resolve_, 500001);
   ObSchemaNameResolveKey name_key(
       TEST_TENANT_ID, cache_generations.name_resolve_, 500010, 0,
-      NS_NORMAL_TABLE, ObString::make_string("table_a"));
+      NS_NORMAL_TABLE, OB_ORIGIN_AND_SENSITIVE, ObString::make_string("table_a"));
   ASSERT_EQ(OB_SUCCESS, seed_resolve_cache(resolve_cache,
       id_key, make_exist_range(100, OB_SCHEMA_VERSION_INF, 100, 0, 500001)));
   ASSERT_EQ(OB_SUCCESS, seed_resolve_cache(resolve_cache,
@@ -2752,10 +2762,10 @@ TEST_F(TestSimpleSchemaKVCache, incremental_create_rename_drop_and_recreate_repa
   ObSchemaIDResolveKey old_id(TEST_TENANT_ID, generation, 500001);
   ObSchemaIDResolveKey new_id(TEST_TENANT_ID, generation, 500002);
   ObSchemaNameResolveKey created_name(TEST_TENANT_ID, generation, 500010, 0,
-                                      NS_NORMAL_TABLE,
+                                      NS_NORMAL_TABLE, OB_LOWERCASE_AND_INSENSITIVE,
                                       ObString::make_string("created_table"));
   ObSchemaNameResolveKey renamed_name(TEST_TENANT_ID, generation, 500010, 0,
-                                      NS_NORMAL_TABLE,
+                                      NS_NORMAL_TABLE, OB_LOWERCASE_AND_INSENSITIVE,
                                       ObString::make_string("renamed_table"));
   ASSERT_EQ(OB_SUCCESS, seed_resolve_cache(resolve_cache,
       old_id, ObSchemaResolveRange(0, OB_SCHEMA_VERSION_INF, OB_INVALID_ID,
@@ -2831,10 +2841,10 @@ TEST_F(TestSimpleSchemaKVCache, incremental_same_boundary_name_swap_keeps_final_
   init_simple_table(after_b, 500002, 120, "index_name");
 
   const ObSchemaNameResolveKey original_name(
-      TEST_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE,
+      TEST_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE, OB_ORIGIN_AND_SENSITIVE,
       ObString::make_string("index_name"));
   const ObSchemaNameResolveKey temporary_name(
-      TEST_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE,
+      TEST_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE, OB_ORIGIN_AND_SENSITIVE,
       ObString::make_string("rebuild_tmp_name"));
   for (int64_t mask = 0; mask < 4; ++mask) {
     SCOPED_TRACE(mask);
@@ -2879,6 +2889,47 @@ TEST_F(TestSimpleSchemaKVCache, incremental_same_boundary_name_swap_keeps_final_
   }
 }
 
+// The key semantic of the collation based key: an alias that general_ci treats
+// as the same name must share one cache entry with the stored name, so a DDL on
+// the stored name closes the alias entry too. Before the collation key, `u_s`
+// (alias) and `u_ſ` (stored) produced different keys and the alias kept serving
+// a dropped table id.
+TEST_F(TestSimpleSchemaKVCache, stored_name_drop_closes_alias_name_key)
+{
+  ObSchemaResolveCache resolve_cache;
+  ObTablegroupTableIdCache tablegroup_cache;
+  ASSERT_EQ(OB_SUCCESS, resolve_cache.init());
+  ASSERT_EQ(OB_SUCCESS, tablegroup_cache.init());
+  const ObSchemaCacheGenerations cache_generations(1);
+
+  // Seed the entry through the alias name only.
+  const ObSchemaNameResolveKey alias_key(
+      TEST_TENANT_ID, cache_generations.name_resolve_, 500010, 0,
+      NS_NORMAL_TABLE, OB_ORIGIN_AND_INSENSITIVE, ObString::make_string("u_s"));
+  ASSERT_TRUE(alias_key.is_valid());
+  ASSERT_EQ(OB_SUCCESS, seed_resolve_cache(resolve_cache, alias_key,
+      make_name_range(100, OB_SCHEMA_VERSION_INF, 500001, 100, true)));
+  ObSchemaResolveResult result;
+  ASSERT_EQ(OB_SUCCESS, resolve_cache.get(alias_key, 110, result));
+  ASSERT_TRUE(result.is_exist_);
+  ASSERT_EQ(500001U, result.schema_id_);
+
+  // DROP the table: the refresh is driven by the stored name u_ſ.
+  ObSimpleTableSchemaV2 before;
+  init_simple_table(before, 500001, 100, "u_ſ");
+  ObSchemaCacheIncrementalRefresher refresher(resolve_cache, tablegroup_cache);
+  ASSERT_EQ(OB_SUCCESS, refresher.refresh_table(
+      TEST_TENANT_ID, cache_generations, 500001, 120, &before,
+      OB_ORIGIN_AND_INSENSITIVE, NULL, OB_NAME_CASE_INVALID));
+
+  // The alias entry must observe the close.
+  ASSERT_EQ(OB_SUCCESS, resolve_cache.get(alias_key, 125, result));
+  EXPECT_FALSE(result.is_exist_);
+  ASSERT_EQ(OB_SUCCESS, resolve_cache.get(alias_key, 110, result));
+  EXPECT_TRUE(result.is_exist_);
+  EXPECT_EQ(500001U, result.schema_id_);
+}
+
 TEST_F(TestSimpleSchemaKVCache, name_finalization_does_not_readmit_evicted_key)
 {
   ObSchemaResolveCache cache;
@@ -2886,7 +2937,8 @@ TEST_F(TestSimpleSchemaKVCache, name_finalization_does_not_readmit_evicted_key)
   ASSERT_EQ(OB_SUCCESS, cache.init());
   ASSERT_EQ(OB_SUCCESS, tablegroup_cache.init());
   const ObSchemaNameResolveKey name_key(
-      TEST_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE, ObString::make_string("table_a"));
+      TEST_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE, OB_ORIGIN_AND_SENSITIVE,
+      ObString::make_string("table_a"));
   ASSERT_EQ(OB_SUCCESS, seed_resolve_cache(cache, name_key,
       make_name_range(100, OB_SCHEMA_VERSION_INF, 500001, 100, true)));
   ObSimpleTableSchemaV2 before;
@@ -2925,10 +2977,12 @@ TEST_F(TestSimpleSchemaKVCache, incremental_session_table_drop_keeps_global_fall
   init_simple_table(session_table, 500002, 20, "same_name", 500010, 9988);
   ASSERT_EQ(OB_SUCCESS, seed_resolve_cache(resolve_cache,
       ObSchemaNameResolveKey(TEST_TENANT_ID, 1, 500010, 0, NS_NORMAL_TABLE,
+                              OB_ORIGIN_AND_SENSITIVE,
                               ObString::make_string("same_name")),
       make_name_range(10, OB_SCHEMA_VERSION_INF, 500001, 10, true)));
   ASSERT_EQ(OB_SUCCESS, seed_resolve_cache(resolve_cache,
       ObSchemaNameResolveKey(TEST_TENANT_ID, 1, 500010, 9988, NS_NORMAL_TABLE,
+                              OB_ORIGIN_AND_SENSITIVE,
                               ObString::make_string("same_name")),
       make_name_range(20, OB_SCHEMA_VERSION_INF, 500002, 20, true)));
   ASSERT_EQ(OB_SUCCESS, refresher.refresh_table(
@@ -2937,10 +2991,10 @@ TEST_F(TestSimpleSchemaKVCache, incremental_session_table_drop_keeps_global_fall
       NULL, OB_NAME_CASE_INVALID));
 
   ObSchemaNameResolveKey private_key(TEST_TENANT_ID, 1, 500010, 9988,
-                                     NS_NORMAL_TABLE,
+                                     NS_NORMAL_TABLE, OB_ORIGIN_AND_SENSITIVE,
                                      ObString::make_string("same_name"));
   ObSchemaNameResolveKey global_key(TEST_TENANT_ID, 1, 500010, 0,
-                                    NS_NORMAL_TABLE,
+                                    NS_NORMAL_TABLE, OB_ORIGIN_AND_SENSITIVE,
                                     ObString::make_string("same_name"));
   ObSchemaResolveResult result;
   ASSERT_EQ(OB_SUCCESS, resolve_cache.get(private_key, 35, result));
@@ -3078,6 +3132,127 @@ TEST_F(TestSimpleSchemaKVCache, incremental_repair_failure_invalidates_metadata)
       TEST_TENANT_ID, new_token.cache_generations_.id_resolve_, 500001);
   ObSchemaResolveResult result;
   EXPECT_EQ(OB_ENTRY_NOT_EXIST, resolve_cache.get(new_key, 120, result));
+}
+
+// The on-demand name resolve cache key must follow exactly the same equality
+// contract as the ORIGINAL SchemaMgr name map (ObTableSchemaHashWrapper):
+// equality is ObCharset::strcmp on the collation selected by the name case mode,
+// and hash() must be consistent with it. Deriving a canonical byte string
+// (lowercase, or a sort key) is not equivalent: lowercase disagrees with
+// general_ci for U+212A, and a sort key cannot stay equivalent for invalid
+// UTF-8 input.
+TEST(SimpleSchemaKVNameResolveKey, equality_matches_general_ci_contract)
+{
+  // Expectations are pinned here instead of being derived from
+  // ObCharset::strcmp: operator== already delegates to strcmp, so recomputing
+  // it would make the equality assertion tautological. Weight references from
+  // ob_unicase_default: 'ß' sorts as 'S' while U+1E9E sorts as U+1E9E, and
+  // U+212A KELVIN sorts as U+212A while 'k' sorts as 'K'.
+  const struct {
+    const char *lhs_;
+    const char *rhs_;
+    bool expected_equal_;
+  } pairs[] = {
+      {"u_İ", "u_i", true},     // U+0130 sorts as 'I'
+      {"u_ſ", "u_s", true},     // U+017F sorts as 'S'
+      {"u_ẞ", "u_ß", false},    // U+1E9E vs 'ß' (which sorts as 'S')
+      {"u_k", "u_K", false},    // 'k' vs U+212A KELVIN
+      {"u_k", "u_K", true},     // ASCII case pair
+      {"u_a", "u_Å", true},     // U+00C5 sorts as 'A'
+      {"u_ω", "u_Ω", true},     // Greek case pair
+      {"u_å", "u_Å", true},     // U+00E5/U+00C5 both sort as 'A'
+      {"t1", "T1", true},
+      {"T1", "t2", false},
+      {"u_É", "u_é", true},
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(pairs); ++i) {
+    const ObString lhs = ObString::make_string(pairs[i].lhs_);
+    const ObString rhs = ObString::make_string(pairs[i].rhs_);
+    const ObSchemaNameResolveKey lhs_key(
+        TEST_TENANT_ID, 7, 500010, 0, NS_NORMAL_TABLE,
+        OB_ORIGIN_AND_INSENSITIVE, lhs);
+    const ObSchemaNameResolveKey rhs_key(
+        TEST_TENANT_ID, 7, 500010, 0, NS_NORMAL_TABLE,
+        OB_ORIGIN_AND_INSENSITIVE, rhs);
+    ASSERT_TRUE(lhs_key.is_valid()) << pairs[i].lhs_;
+    ASSERT_TRUE(rhs_key.is_valid()) << pairs[i].rhs_;
+    EXPECT_EQ(pairs[i].expected_equal_, lhs_key == rhs_key)
+        << pairs[i].lhs_ << " vs " << pairs[i].rhs_;
+    // Equal keys must hash equally; that is the half of the contract that a
+    // wrong hash/compare pairing would break.
+    if (pairs[i].expected_equal_) {
+      EXPECT_EQ(lhs_key.hash(), rhs_key.hash())
+          << pairs[i].lhs_ << " vs " << pairs[i].rhs_;
+    }
+  }
+}
+
+// OB_ORIGIN_AND_SENSITIVE selects utf8mb4_bin, again matching the ORIGINAL name
+// map, and the case mode itself is part of the key identity.
+TEST(SimpleSchemaKVNameResolveKey, sensitive_mode_uses_binary_collation)
+{
+  const struct {
+    const char *lhs_;
+    const char *rhs_;
+    bool expected_equal_;
+  } pairs[] = {
+      {"T1", "t1", false},
+      {"u_İ", "u_i", false},
+      {"u_ſ", "u_s", false},
+      {"u_K", "u_k", false},
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(pairs); ++i) {
+    const ObString lhs = ObString::make_string(pairs[i].lhs_);
+    const ObString rhs = ObString::make_string(pairs[i].rhs_);
+    const ObSchemaNameResolveKey lhs_key(
+        TEST_TENANT_ID, 7, 500010, 0, NS_NORMAL_TABLE,
+        OB_ORIGIN_AND_SENSITIVE, lhs);
+    const ObSchemaNameResolveKey rhs_key(
+        TEST_TENANT_ID, 7, 500010, 0, NS_NORMAL_TABLE,
+        OB_ORIGIN_AND_SENSITIVE, rhs);
+    EXPECT_EQ(pairs[i].expected_equal_, lhs_key == rhs_key)
+        << pairs[i].lhs_ << " vs " << pairs[i].rhs_;
+    const ObSchemaNameResolveKey ci_key(
+        TEST_TENANT_ID, 7, 500010, 0, NS_NORMAL_TABLE,
+        OB_ORIGIN_AND_INSENSITIVE, lhs);
+    EXPECT_FALSE(lhs_key == ci_key) << pairs[i].lhs_
+        << " must not share a key across case modes";
+  }
+}
+
+// The name parser does not reject invalid UTF-8, so the key must stay equivalent
+// to ObCharset::strcmp for those inputs too. A canonical sort key cannot do
+// this: the collation compares the valid prefix by weight and the invalid
+// suffix byte by byte, so "A<invalid>" equals "a<invalid>" while their sort keys
+// (or raw bytes) differ.
+TEST(SimpleSchemaKVNameResolveKey, invalid_utf8_follows_collation_contract)
+{
+  char a_80[] = {'A', static_cast<char>(0x80)};
+  char lower_a_80[] = {'a', static_cast<char>(0x80)};
+  char a_81[] = {'A', static_cast<char>(0x81)};
+  char long_lone[] = {'u', '_', static_cast<char>(0xBF)};
+  const ObString names[] = {
+      ObString(2, a_80),
+      ObString(2, lower_a_80),
+      ObString(2, a_81),
+      ObString(3, long_lone),
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(names); ++i) {
+    for (int64_t j = 0; j < ARRAYSIZEOF(names); ++j) {
+      const ObSchemaNameResolveKey lhs_key(
+          TEST_TENANT_ID, 7, 500010, 0, NS_NORMAL_TABLE,
+          OB_ORIGIN_AND_INSENSITIVE, names[i]);
+      const ObSchemaNameResolveKey rhs_key(
+          TEST_TENANT_ID, 7, 500010, 0, NS_NORMAL_TABLE,
+          OB_ORIGIN_AND_INSENSITIVE, names[j]);
+      const bool collation_equal =
+          0 == ObCharset::strcmp(CS_TYPE_UTF8MB4_GENERAL_CI, names[i], names[j]);
+      EXPECT_EQ(collation_equal, lhs_key == rhs_key) << "pair " << i << "," << j;
+      if (collation_equal) {
+        EXPECT_EQ(lhs_key.hash(), rhs_key.hash()) << "pair " << i << "," << j;
+      }
+    }
+  }
 }
 
 } // namespace

@@ -80,9 +80,12 @@ int resolve_oracle_index_cache_key_name(const ObSimpleTableSchemaV2 &schema,
 // Exact `table_name =` for normal names; Oracle origin-index uses
 // `table_name LIKE '__idx\_%\_<origin>' ESCAPE '\'` because __all_table stores
 // the encoded physical name.
+// @param resolve_name origin lookup name, never a lowercased/sort-key form: the
+//        column comparison already applies the name collation, while a derived
+//        byte form would be narrower than the real name match.
 int append_name_predicate(common::ObSqlString &sql,
                                   const bool is_oracle_index,
-                                  const common::ObString &normalized_name);
+                                  const common::ObString &resolve_name);
 
 // Compare a history/cache stored table_name with the resolve key.
 // Oracle origin-index: peel __idx_<id>_ and compare origin names.

@@ -111,6 +111,16 @@ int get_latest_guard(ObSchemaGetterGuard &guard)
   return GCTX.schema_service_->get_tenant_schema_guard(R.tenant_id_, guard);
 }
 
+int get_name_case_mode(ObNameCaseMode &name_case_mode)
+{
+  ObSchemaGetterGuard guard;
+  int ret = get_latest_guard(guard);
+  if (OB_SUCC(ret)) {
+    ret = guard.get_tenant_name_case_mode(R.tenant_id_, name_case_mode);
+  }
+  return ret;
+}
+
 int read_publish_snapshot(ObSchemaPublishSnapshot &snapshot)
 {
   int ret = OB_SUCCESS;
@@ -139,11 +149,16 @@ int erase_id_resolve_cache()
 int erase_name_resolve_cache()
 {
   ObSchemaPublishSnapshot snapshot;
+  ObNameCaseMode name_case_mode = OB_NAME_CASE_INVALID;
   int ret = read_publish_snapshot(snapshot);
+  if (OB_SUCC(ret)) {
+    ret = get_name_case_mode(name_case_mode);
+  }
   if (OB_SUCC(ret)) {
     const ObSchemaNameResolveKey key(
         R.tenant_id_, snapshot.cache_generations_.name_resolve_, R.database_id_,
-        0 /*session_id*/, NS_NORMAL_TABLE, ObString::make_string("od_plan_target"));
+        0 /*session_id*/, NS_NORMAL_TABLE, name_case_mode,
+        ObString::make_string("od_plan_target"));
     ret = GCTX.schema_service_->get_schema_resolve_cache().erase(key);
   }
   return ret;

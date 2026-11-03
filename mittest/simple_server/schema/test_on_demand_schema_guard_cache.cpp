@@ -67,6 +67,16 @@ int get_latest_guard(const uint64_t tenant_id, ObSchemaGetterGuard &guard)
   return GCTX.schema_service_->get_tenant_schema_guard(tenant_id, guard);
 }
 
+int get_name_case_mode(const uint64_t tenant_id, ObNameCaseMode &name_case_mode)
+{
+  ObSchemaGetterGuard guard;
+  int ret = get_latest_guard(tenant_id, guard);
+  if (OB_SUCC(ret)) {
+    ret = guard.get_tenant_name_case_mode(tenant_id, name_case_mode);
+  }
+  return ret;
+}
+
 int count_pinned(const ObSchemaGetterGuard &guard, const uint64_t table_id)
 {
   int64_t n = 0;
@@ -85,14 +95,16 @@ int erase_name_resolve(const uint64_t tenant_id,
   int ret = OB_SUCCESS;
   ObTenantSchemaPublishState *state = NULL;
   ObSchemaPublishSnapshot snap;
+  ObNameCaseMode name_case_mode = OB_NAME_CASE_INVALID;
   if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_publish_state_map().get(
           tenant_id, state))) {
   } else if (OB_ISNULL(state)) {
     ret = OB_ERR_UNEXPECTED;
   } else if (OB_FAIL(state->read_stable(snap))) {
+  } else if (OB_FAIL(get_name_case_mode(tenant_id, name_case_mode))) {
   } else {
     ObSchemaNameResolveKey key(tenant_id, snap.cache_generations_.name_resolve_, database_id,
-                               0 /*session*/, NS_NORMAL_TABLE,
+                               0 /*session*/, NS_NORMAL_TABLE, name_case_mode,
                                ObString::make_string(table_name));
     ret = GCTX.schema_service_->get_schema_resolve_cache().erase(key);
     if (OB_ENTRY_NOT_EXIST == ret) {
@@ -131,6 +143,8 @@ void check_resolve_follower_(const bool by_name,
   ASSERT_EQ(OB_SUCCESS, get_latest_guard(R.tenant_id_, guard));
   int64_t snapshot_version = OB_INVALID_VERSION;
   ASSERT_EQ(OB_SUCCESS, guard.get_schema_version(R.tenant_id_, snapshot_version));
+  ObNameCaseMode name_case_mode = OB_NAME_CASE_INVALID;
+  ASSERT_EQ(OB_SUCCESS, guard.get_tenant_name_case_mode(R.tenant_id_, name_case_mode));
 
   // Isolate synthetic resolve ranges from the live tenant's cache generations.
   ObTenantSchemaPublishState state;
@@ -142,7 +156,7 @@ void check_resolve_follower_(const bool by_name,
       R.tenant_id_, token.cache_generations_.id_resolve_, R.table_id_);
   const ObSchemaNameResolveKey name_key(
       R.tenant_id_, token.cache_generations_.name_resolve_, R.database_id_,
-      session_id, NS_NORMAL_TABLE, name);
+      session_id, NS_NORMAL_TABLE, name_case_mode, name);
   ObSchemaResolveCache &cache = GCTX.schema_service_->get_schema_resolve_cache();
   ASSERT_EQ(OB_SUCCESS, by_name ? cache.erase(name_key) : cache.erase(id_key));
   const ObSchemaLoadKey load_key(
@@ -680,6 +694,8 @@ TEST_F(TestOnDemandSchemaGuardCache, miss_then_rename_before_publish)
       "where tenant_id = %lu and table_name = 'od_race' limit 1", R.tenant_id_));
   ASSERT_EQ(OB_SUCCESS, query_uint(sys, sql.ptr(), "table_id", race_table_id));
   ASSERT_NE(OB_INVALID_ID, race_table_id);
+  ObNameCaseMode name_case_mode = OB_NAME_CASE_INVALID;
+  ASSERT_EQ(OB_SUCCESS, get_name_case_mode(R.tenant_id_, name_case_mode));
   ASSERT_EQ(OB_SUCCESS, erase_name_resolve(R.tenant_id_, R.database_id_, "od_race"));
 
   ObTenantSchemaPublishState *state = NULL;
@@ -690,7 +706,8 @@ TEST_F(TestOnDemandSchemaGuardCache, miss_then_rename_before_publish)
   ASSERT_EQ(OB_SUCCESS, state->read_stable(pre_snap));
   const ObSchemaNameResolveKey pre_name_key(
       R.tenant_id_, pre_snap.cache_generations_.name_resolve_, R.database_id_,
-      0 /*session*/, NS_NORMAL_TABLE, ObString::make_string("od_race"));
+      0 /*session*/, NS_NORMAL_TABLE, name_case_mode,
+      ObString::make_string("od_race"));
   const ObSchemaLoadKey load_key(
       LOAD_NAME_RESOLVE, R.tenant_id_, pre_snap.cache_generations_.name_resolve_,
       pre_name_key.hash());
@@ -790,7 +807,8 @@ TEST_F(TestOnDemandSchemaGuardCache, miss_then_rename_before_publish)
   ASSERT_FALSE(state->can_publish(pre_snap));
   ObSchemaNameResolveKey cur_name_key(
       R.tenant_id_, post_snap.cache_generations_.name_resolve_, R.database_id_,
-      0 /*session*/, NS_NORMAL_TABLE, ObString::make_string("od_race"));
+      0 /*session*/, NS_NORMAL_TABLE, name_case_mode,
+      ObString::make_string("od_race"));
   ObSchemaResolveResult cached;
   const int cache_ret = GCTX.schema_service_->get_schema_resolve_cache().get(
       cur_name_key, post_snap.refreshed_version_, cached);

@@ -118,13 +118,27 @@ int ObSchemaIDResolveKey::deep_copy(
   return ret;
 }
 
+namespace
+{
+// Keep the key contract identical to the ORIGINAL SchemaMgr name map:
+// ObTableSchemaHashWrapper::hash() and ObCompareNameWithTenantID both derive the
+// collation from the name case mode. Only these two collations are used, so the
+// key never invents a canonical byte form.
+ObCollationType get_name_resolve_collation(const ObNameCaseMode name_case_mode)
+{
+  return OB_ORIGIN_AND_SENSITIVE == name_case_mode
+      ? CS_TYPE_UTF8MB4_BIN : CS_TYPE_UTF8MB4_GENERAL_CI;
+}
+} // namespace
+
 ObSchemaNameResolveKey::ObSchemaNameResolveKey()
   : tenant_id_(OB_INVALID_TENANT_ID),
     cache_generation_(0),
     database_id_(OB_INVALID_ID),
     exact_session_id_(0),
     table_namespace_(NS_MAX),
-    normalized_name_()
+    name_case_mode_(OB_NAME_CASE_INVALID),
+    lookup_name_()
 {
 }
 
@@ -134,13 +148,15 @@ ObSchemaNameResolveKey::ObSchemaNameResolveKey(
     const uint64_t database_id,
     const uint64_t exact_session_id,
     const ObTableNameNamespace table_namespace,
-    const ObString &normalized_name)
+    const ObNameCaseMode name_case_mode,
+    const ObString &lookup_name)
   : tenant_id_(tenant_id),
     cache_generation_(cache_generation),
     database_id_(database_id),
     exact_session_id_(exact_session_id),
     table_namespace_(table_namespace),
-    normalized_name_(normalized_name)
+    name_case_mode_(name_case_mode),
+    lookup_name_(lookup_name)
 {
 }
 
@@ -151,8 +167,10 @@ bool ObSchemaNameResolveKey::is_valid() const
       && cache_generation_ > 0
       && OB_INVALID_ID != database_id_
       && table_namespace_ < NS_MAX
-      && !normalized_name_.empty()
-      && normalized_name_.length() <= OB_MAX_TABLE_NAME_LENGTH;
+      && name_case_mode_ > OB_NAME_CASE_INVALID
+      && name_case_mode_ < OB_NAME_CASE_MAX
+      && !lookup_name_.empty()
+      && lookup_name_.length() <= OB_MAX_TABLE_NAME_LENGTH;
 }
 
 bool ObSchemaNameResolveKey::operator==(const ObIKVCacheKey &other) const
@@ -164,7 +182,9 @@ bool ObSchemaNameResolveKey::operator==(const ObIKVCacheKey &other) const
       && database_id_ == other_key.database_id_
       && exact_session_id_ == other_key.exact_session_id_
       && table_namespace_ == other_key.table_namespace_
-      && normalized_name_ == other_key.normalized_name_;
+      && name_case_mode_ == other_key.name_case_mode_
+      && 0 == ObCharset::strcmp(get_name_resolve_collation(name_case_mode_),
+                                lookup_name_, other_key.lookup_name_);
 }
 
 uint64_t ObSchemaNameResolveKey::hash() const
@@ -175,13 +195,17 @@ uint64_t ObSchemaNameResolveKey::hash() const
   hash_value = murmurhash(&database_id_, sizeof(database_id_), hash_value);
   hash_value = murmurhash(&exact_session_id_, sizeof(exact_session_id_), hash_value);
   hash_value = murmurhash(&table_namespace_, sizeof(table_namespace_), hash_value);
-  hash_value = murmurhash(normalized_name_.ptr(), normalized_name_.length(), hash_value);
+  hash_value = murmurhash(&name_case_mode_, sizeof(name_case_mode_), hash_value);
+  // Same collation (and the same end-space handling) as operator==, and the same
+  // call as ObTableSchemaHashWrapper::hash().
+  hash_value = ObCharset::hash(get_name_resolve_collation(name_case_mode_),
+                               lookup_name_, hash_value, true, NULL);
   return hash_value;
 }
 
 int64_t ObSchemaNameResolveKey::size() const
 {
-  return sizeof(*this) + normalized_name_.length();
+  return sizeof(*this) + lookup_name_.length();
 }
 
 int ObSchemaNameResolveKey::deep_copy(
@@ -197,8 +221,8 @@ int ObSchemaNameResolveKey::deep_copy(
   } else {
     ObSchemaNameResolveKey *new_key = new (buf) ObSchemaNameResolveKey(*this);
     char *name_buf = buf + sizeof(*this);
-    MEMCPY(name_buf, normalized_name_.ptr(), normalized_name_.length());
-    new_key->normalized_name_.assign_ptr(name_buf, normalized_name_.length());
+    MEMCPY(name_buf, lookup_name_.ptr(), lookup_name_.length());
+    new_key->lookup_name_.assign_ptr(name_buf, lookup_name_.length());
     key = new_key;
   }
   return ret;
@@ -1537,32 +1561,13 @@ ObTableNameNamespace get_table_name_namespace(const ObSimpleTableSchemaV2 &schem
   return table_namespace;
 }
 
-int normalize_schema_name(const ObString &name,
-                          const ObNameCaseMode case_mode,
-                          ObIAllocator &allocator,
-                          ObString &normalized_name)
-{
-  int ret = OB_SUCCESS;
-  normalized_name.reset();
-  if (name.empty()
-      || case_mode <= OB_NAME_CASE_INVALID
-      || case_mode >= OB_NAME_CASE_MAX) {
-    ret = OB_INVALID_ARGUMENT;
-  } else if (OB_ORIGIN_AND_SENSITIVE == case_mode) {
-    if (OB_FAIL(ob_write_string(allocator, name, normalized_name))) {
-      LOG_WARN("fail to copy case-sensitive schema name", KR(ret), K(name));
-    }
-  } else if (OB_FAIL(ObCharset::casedn(CS_TYPE_UTF8MB4_GENERAL_CI,
-                                       name, normalized_name, allocator))) {
-    LOG_WARN("fail to normalize schema name", KR(ret), K(name), K(case_mode));
-  }
-  return ret;
-}
-
+// Build the name resolve cache key for one table schema. The key keeps the
+// stored table name (or origin index name for Oracle user indexes) verbatim plus
+// the name case mode, exactly like ObTableSchemaHashWrapper: the collation
+// decides equality, so the reader and this refresher always agree.
 int build_name_resolve_key(const ObSimpleTableSchemaV2 &schema,
                            const ObNameCaseMode case_mode,
                            const uint64_t cache_generation,
-                           ObIAllocator &allocator,
                            ObSchemaNameResolveKey &key)
 {
   int ret = OB_SUCCESS;
@@ -1580,20 +1585,12 @@ int build_name_resolve_key(const ObSimpleTableSchemaV2 &schema,
   }
   if (OB_FAIL(ret)) {
   } else {
-    ObString normalized_name;
-    if (OB_FAIL(normalize_schema_name(name_for_key, case_mode,
-                                      allocator, normalized_name))) {
-      LOG_WARN("fail to normalize table name for incremental refresh",
-               KR(ret), K(schema), K(case_mode), K(name_for_key),
-               K(is_oracle_index));
-    } else {
-      key = ObSchemaNameResolveKey(schema.get_tenant_id(), cache_generation,
-                                   schema.get_database_id(), schema.get_session_id(),
-                                   table_namespace, normalized_name);
-      if (!key.is_valid()) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("invalid name resolve key for incremental refresh", KR(ret), K(key));
-      }
+    key = ObSchemaNameResolveKey(schema.get_tenant_id(), cache_generation,
+                                 schema.get_database_id(), schema.get_session_id(),
+                                 table_namespace, case_mode, name_for_key);
+    if (!key.is_valid()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid name resolve key for incremental refresh", KR(ret), K(key));
     }
   }
   return ret;
@@ -1621,7 +1618,6 @@ int ObSchemaCacheIncrementalRefresher::refresh_table(
   ObSchemaNameResolveKey after_name_key;
   bool has_before_name_key = false;
   bool has_after_name_key = false;
-  ObArenaAllocator allocator("SchCacheRefresh");
   if (OB_INVALID_TENANT_ID == tenant_id
       || !cache_generations.is_valid()
       || OB_INVALID_ID == table_id
@@ -1641,7 +1637,7 @@ int ObSchemaCacheIncrementalRefresher::refresh_table(
              KP(before_schema), KP(after_schema));
   } else if (OB_NOT_NULL(before_schema)
              && OB_FAIL(build_name_resolve_key(*before_schema, before_case_mode,
-                                               cache_generations.name_resolve_, allocator,
+                                               cache_generations.name_resolve_,
                                                before_name_key))) {
     LOG_WARN("fail to build before name key", KR(ret), KPC(before_schema));
   } else if (OB_NOT_NULL(before_schema)) {
@@ -1649,7 +1645,7 @@ int ObSchemaCacheIncrementalRefresher::refresh_table(
   }
   if (OB_SUCC(ret) && OB_NOT_NULL(after_schema)) {
     if (OB_FAIL(build_name_resolve_key(*after_schema, after_case_mode,
-                                       cache_generations.name_resolve_, allocator,
+                                       cache_generations.name_resolve_,
                                        after_name_key))) {
       LOG_WARN("fail to build after name key", KR(ret), KPC(after_schema));
     } else {
@@ -1722,7 +1718,6 @@ int ObSchemaCacheIncrementalRefresher::finalize_table_names_at_boundary(
     const ObNameCaseMode after_case_mode)
 {
   int ret = OB_SUCCESS;
-  ObArenaAllocator allocator("SchNameFinalize");
   if (OB_INVALID_TENANT_ID == tenant_id
       || !cache_generations.is_valid()
       || change_schema_version <= 0) {
@@ -1744,7 +1739,7 @@ int ObSchemaCacheIncrementalRefresher::finalize_table_names_at_boundary(
       ObSchemaNameResolveKey after_name_key;
       if (OB_FAIL(build_name_resolve_key(
               *after_schema, after_case_mode,
-              cache_generations.name_resolve_, allocator, after_name_key))) {
+              cache_generations.name_resolve_, after_name_key))) {
         LOG_WARN("fail to build final name resolve key", KR(ret), K(i),
                  KPC(after_schema));
       } else {
