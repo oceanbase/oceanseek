@@ -129,8 +129,6 @@ int ObAIFuncClient::init(common::ObIAllocator &allocator, const common::ObString
         } else if (OB_ISNULL(header_list_ = curl_slist_append(header_list_, header_c_str.ptr()))) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("failed to append header", K(ret), K(i));
-        } else {
-          LOG_DEBUG("ai_function, header:", K(headers.at(i)));
         }
       }
     }

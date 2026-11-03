@@ -41,6 +41,14 @@ private:
   static int fetch_new_ai_model_endpoint_id(const uint64_t tenant_id, uint64_t &new_ai_model_endpoint_id);
   static int lock_and_fetch_endpoint_version(ObMySQLTransaction &trans, const uint64_t tenant_id, int64_t &endpoint_version);
   static int insert_special_endpoint_for_version(ObMySQLTransaction &trans, const uint64_t tenant_id);
+  static int merge_model_profile_run_config(common::ObArenaAllocator &allocator,
+                                            const ObString &old_run_config,
+                                            const bool has_run_config,
+                                            const ObString &run_config,
+                                            const bool has_extra_headers,
+                                            const ObString &extra_headers,
+                                            common::ObJsonBuffer &merged_run_config,
+                                            bool &merged_extra_headers);
 };
 
 } // namespace share

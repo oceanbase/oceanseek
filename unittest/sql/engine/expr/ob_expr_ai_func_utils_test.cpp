@@ -11,6 +11,7 @@
 
 
 using namespace oceanbase::common;
+using namespace oceanbase::share;
 using namespace oceanbase::sql;
 
 class ObAiFuncImageUtilsTest: public ::testing::Test
@@ -334,6 +335,46 @@ TEST_F(ObAiFuncImageUtilsTest, test_vl_model_needs_individual_requests)
   ASSERT_TRUE(ObAIFuncUtils::vl_model_needs_individual_requests(ObString("qWeN3-vL-eMbEdDiNg-8b")));
   ASSERT_FALSE(ObAIFuncUtils::vl_model_needs_individual_requests(ObString("Qwen3-VL-Embedding-8B-Alias")));
   ASSERT_FALSE(ObAIFuncUtils::vl_model_needs_individual_requests(ObString("qwen3-vl-embedding")));
+}
+
+TEST_F(ObAiFuncImageUtilsTest, test_append_extra_headers)
+{
+  ObArenaAllocator allocator(ObModIds::TEST);
+  ObIJsonBase *base = nullptr;
+  ObString json = ObString::make_string(
+      R"({"X-TC-String":" value ","X-TC-Empty":"","X-TC-Int":30,)"
+      R"("X-TC-Bool":true,"X-TC-Null":null,"X-TC-Object":{"input":"disable"}})");
+  ASSERT_EQ(OB_SUCCESS,
+            ObJsonBaseFactory::get_json_base(&allocator,
+                                             json,
+                                             ObJsonInType::JSON_TREE,
+                                             ObJsonInType::JSON_TREE,
+                                             base));
+  ASSERT_NE(nullptr, base);
+  ASSERT_EQ(ObJsonNodeType::J_OBJECT, base->json_type());
+
+  ObArray<ObString> headers;
+  ASSERT_EQ(OB_SUCCESS, headers.push_back(ObString::make_string("System: value")));
+  ASSERT_EQ(OB_SUCCESS,
+            ObAIFuncUtils::append_extra_headers(
+                allocator, static_cast<const ObJsonObject *>(base), headers));
+  ASSERT_EQ(7, headers.count());
+  const char *expected[] = {
+      "System: value",
+      "X-TC-String: value",
+      "X-TC-Empty;",
+      "X-TC-Int: 30",
+      "X-TC-Bool: true",
+      "X-TC-Null: null",
+      R"(X-TC-Object: {"input":"disable"})"
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(expected); ++i) {
+    bool found = false;
+    for (int64_t j = 0; !found && j < headers.count(); ++j) {
+      found = 0 == headers.at(j).compare(expected[i]);
+    }
+    ASSERT_TRUE(found) << expected[i];
+  }
 }
 
 int main(int argc, char **argv)

@@ -27,6 +27,38 @@ const int64_t ObAiServiceExecutor::SPECIAL_ENDPOINT_ID_FOR_VERSION = -1;
 const int64_t ObAiServiceExecutor::INIT_ENDPOINT_VERSION = 0;
 const char *ObAiServiceExecutor::SPECIAL_ENDPOINT_SCOPE_FOR_VERSION = "";
 
+namespace
+{
+const int64_t MAX_RUN_CONFIG_LENGTH = 4096;
+
+enum RunConfigOption
+{
+  RUN_CONFIG_BATCH_SIZE,
+  RUN_CONFIG_MAX_IMAGE_SIZE,
+  RUN_CONFIG_MIN_CONCURRENCY,
+  RUN_CONFIG_MAX_CONCURRENCY,
+  RUN_CONFIG_INVALID
+};
+
+const char *const RUN_CONFIG_KEYS[RUN_CONFIG_INVALID] = {
+  "batch_size",
+  "max_image_size",
+  "min_concurrency",
+  "max_concurrency"
+};
+
+RunConfigOption get_run_config_option(const ObString &key)
+{
+  RunConfigOption option = RUN_CONFIG_INVALID;
+  for (int64_t i = 0; RUN_CONFIG_INVALID == option && i < RUN_CONFIG_INVALID; ++i) {
+    if (0 == key.case_compare(RUN_CONFIG_KEYS[i])) {
+      option = static_cast<RunConfigOption>(i);
+    }
+  }
+  return option;
+}
+}
+
 int ObAiServiceExecutor::create_ai_model_endpoint(common::ObArenaAllocator &allocator, const ObString &endpoint_name, const ObIJsonBase &create_jbase)
 {
   int ret = OB_SUCCESS;
@@ -365,6 +397,125 @@ int ObAiServiceExecutor::insert_special_endpoint_for_version(ObMySQLTransaction 
   return ret;
 }
 
+int ObAiServiceExecutor::merge_model_profile_run_config(
+    ObArenaAllocator &allocator,
+    const ObString &old_run_config,
+    const bool has_run_config,
+    const ObString &run_config,
+    const bool has_extra_headers,
+    const ObString &extra_headers,
+    ObJsonBuffer &merged_run_config,
+    bool &merged_extra_headers)
+{
+  int ret = OB_SUCCESS;
+  merged_extra_headers = false;
+  ObIJsonBase *old_base = nullptr;
+  ObIJsonBase *new_base = nullptr;
+  if (!old_run_config.empty() &&
+      OB_FAIL(ObJsonBaseFactory::get_json_base(&allocator,
+                                               old_run_config,
+                                               ObJsonInType::JSON_TREE,
+                                               ObJsonInType::JSON_TREE,
+                                               old_base))) {
+    LOG_WARN("failed to parse old run_config", K(ret));
+  } else if (OB_NOT_NULL(old_base) && old_base->json_type() != ObJsonNodeType::J_OBJECT) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("old run_config should be json object", K(ret));
+  } else if (has_run_config &&
+             OB_FAIL(ObJsonBaseFactory::get_json_base(&allocator,
+                                                      run_config,
+                                                      ObJsonInType::JSON_TREE,
+                                                      ObJsonInType::JSON_TREE,
+                                                      new_base))) {
+    LOG_WARN("failed to parse new run_config", K(ret));
+  } else if (OB_NOT_NULL(new_base) && new_base->json_type() != ObJsonNodeType::J_OBJECT) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("new run_config should be json object", K(ret));
+  }
+
+  const ObIJsonBase *ordinary_base = has_run_config ? new_base : old_base;
+  bool first = true;
+  if (OB_SUCC(ret) && OB_FAIL(merged_run_config.append("{"))) {
+    LOG_WARN("failed to append run_config object start", K(ret));
+  }
+  if (OB_SUCC(ret) && OB_NOT_NULL(ordinary_base)) {
+    JsonObjectIterator iter = ordinary_base->object_iterator();
+    while (OB_SUCC(ret) && !iter.end()) {
+      ObJsonObjPair elem;
+      RunConfigOption option = RUN_CONFIG_INVALID;
+      if (OB_FAIL(iter.get_elem(elem))) {
+        LOG_WARN("failed to get run_config element", K(ret));
+      } else {
+        option = get_run_config_option(elem.first);
+      }
+      if (OB_FAIL(ret)) {
+      } else if (RUN_CONFIG_INVALID == option) {
+        iter.next();
+      } else if (OB_ISNULL(elem.second)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("run_config value is null", K(ret), K(elem.first));
+      } else if (!first && OB_FAIL(merged_run_config.append(","))) {
+        LOG_WARN("failed to append run_config separator", K(ret));
+      } else if (OB_FAIL(merged_run_config.append("\""))) {
+        LOG_WARN("failed to append run_config key start", K(ret), K(elem.first));
+      } else if (OB_FAIL(merged_run_config.append(RUN_CONFIG_KEYS[option]))) {
+        LOG_WARN("failed to append run_config key", K(ret), K(elem.first));
+      } else if (OB_FAIL(merged_run_config.append("\":"))) {
+        LOG_WARN("failed to append run_config key end", K(ret), K(elem.first));
+      } else if (OB_FAIL(ObAIExtraHeadersUtils::serialize_compact(
+                     *elem.second, merged_run_config))) {
+        LOG_WARN("failed to append run_config value", K(ret), K(elem.first));
+      } else {
+        first = false;
+        iter.next();
+      }
+    }
+  }
+
+  ObIJsonBase *old_extra_headers = nullptr;
+  if (OB_SUCC(ret) && !has_extra_headers && OB_NOT_NULL(old_base)) {
+    JsonObjectIterator iter = old_base->object_iterator();
+    while (OB_SUCC(ret) && !iter.end() && OB_ISNULL(old_extra_headers)) {
+      ObJsonObjPair elem;
+      if (OB_FAIL(iter.get_elem(elem))) {
+        LOG_WARN("failed to get old run_config element", K(ret));
+      } else if (0 == elem.first.case_compare("extra_headers")) {
+        old_extra_headers = elem.second;
+      } else {
+        iter.next();
+      }
+    }
+  }
+  const bool append_extra_headers = has_extra_headers || OB_NOT_NULL(old_extra_headers);
+  merged_extra_headers = append_extra_headers;
+  if (OB_FAIL(ret)) {
+  } else if (append_extra_headers && !first && OB_FAIL(merged_run_config.append(","))) {
+    LOG_WARN("failed to append extra_headers separator", K(ret));
+  } else if (append_extra_headers &&
+             OB_FAIL(merged_run_config.append("\"extra_headers\":"))) {
+    LOG_WARN("failed to append extra_headers key", K(ret));
+  } else if (has_extra_headers && OB_FAIL(merged_run_config.append(extra_headers))) {
+    LOG_WARN("failed to append new extra_headers", K(ret));
+  } else if (!has_extra_headers && OB_NOT_NULL(old_extra_headers) &&
+             old_extra_headers->json_type() != ObJsonNodeType::J_OBJECT) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("old extra_headers should be json object", K(ret));
+  } else if (!has_extra_headers && OB_NOT_NULL(old_extra_headers) &&
+             OB_FAIL(ObAIExtraHeadersUtils::serialize_compact(
+                 *old_extra_headers, merged_run_config))) {
+    LOG_WARN("failed to append old extra_headers", K(ret));
+  } else if (OB_FAIL(merged_run_config.append("}"))) {
+    LOG_WARN("failed to append run_config object end", K(ret));
+  } else if (merged_run_config.length() > MAX_RUN_CONFIG_LENGTH) {
+    ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+    LOG_WARN("run config exceeds max length", K(ret), K(merged_run_config.length()),
+             K(MAX_RUN_CONFIG_LENGTH));
+    LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID,
+                   static_cast<int>(strlen("run_config")), "run_config");
+  }
+  return ret;
+}
+
 int ObAiServiceExecutor::alter_ai_model_profile(ObArenaAllocator &allocator, const ObString &model_str, const ObIJsonBase &alter_jbase)
 {
   int ret = OB_SUCCESS;
@@ -374,8 +525,10 @@ int ObAiServiceExecutor::alter_ai_model_profile(ObArenaAllocator &allocator, con
   ObString model_name;
   ObSqlString model_config;
   ObSqlString run_config;
+  ObSqlString extra_headers;
   bool has_model_config = false;
   bool has_run_config = false;
+  bool has_extra_headers = false;
 
   // parse "provider/model" from model_str
   const char *slash = static_cast<const char *>(MEMCHR(model_str.ptr(), '/', model_str.length()));
@@ -424,7 +577,11 @@ int ObAiServiceExecutor::alter_ai_model_profile(ObArenaAllocator &allocator, con
             ObJsonObjPair opt_elem;
             if (OB_FAIL(opt_iter.get_elem(opt_elem))) {
               LOG_WARN("failed to get run_config element", KR(ret));
-            } else if (0 == opt_elem.first.case_compare("batch_size")) {
+            }
+            const RunConfigOption option = OB_SUCC(ret)
+                ? get_run_config_option(opt_elem.first) : RUN_CONFIG_INVALID;
+            if (OB_FAIL(ret)) {
+            } else if (RUN_CONFIG_BATCH_SIZE == option) {
               if (opt_elem.second->json_type() != ObJsonNodeType::J_INT && opt_elem.second->json_type() != ObJsonNodeType::J_UINT) {
                 ret = OB_AI_FUNC_PARAM_TYPE_INVALID;
                 LOG_USER_ERROR(OB_AI_FUNC_PARAM_TYPE_INVALID, (int)strlen("batch_size"), "batch_size", (int)strlen("INT"), "INT");
@@ -432,7 +589,7 @@ int ObAiServiceExecutor::alter_ai_model_profile(ObArenaAllocator &allocator, con
                 ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
                 LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, (int)strlen("batch_size"), "batch_size");
               }
-            } else if (0 == opt_elem.first.case_compare("max_image_size")) {
+            } else if (RUN_CONFIG_MAX_IMAGE_SIZE == option) {
               if (opt_elem.second->json_type() != ObJsonNodeType::J_INT && opt_elem.second->json_type() != ObJsonNodeType::J_UINT) {
                 ret = OB_AI_FUNC_PARAM_TYPE_INVALID;
                 LOG_USER_ERROR(OB_AI_FUNC_PARAM_TYPE_INVALID, (int)strlen("max_image_size"), "max_image_size", (int)strlen("INT"), "INT");
@@ -440,7 +597,7 @@ int ObAiServiceExecutor::alter_ai_model_profile(ObArenaAllocator &allocator, con
                 ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
                 LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID, (int)strlen("max_image_size"), "max_image_size");
               }
-            } else if (0 == opt_elem.first.case_compare("min_concurrency")) {
+            } else if (RUN_CONFIG_MIN_CONCURRENCY == option) {
               if (opt_elem.second->json_type() != ObJsonNodeType::J_INT && opt_elem.second->json_type() != ObJsonNodeType::J_UINT) {
                 ret = OB_AI_FUNC_PARAM_TYPE_INVALID;
                 LOG_USER_ERROR(OB_AI_FUNC_PARAM_TYPE_INVALID, (int)strlen("min_concurrency"), "min_concurrency", (int)strlen("INT"), "INT");
@@ -451,7 +608,7 @@ int ObAiServiceExecutor::alter_ai_model_profile(ObArenaAllocator &allocator, con
                 has_min_concurrency = true;
                 min_concurrency = opt_elem.second->get_int();
               }
-            } else if (0 == opt_elem.first.case_compare("max_concurrency")) {
+            } else if (RUN_CONFIG_MAX_CONCURRENCY == option) {
               if (opt_elem.second->json_type() != ObJsonNodeType::J_INT && opt_elem.second->json_type() != ObJsonNodeType::J_UINT) {
                 ret = OB_AI_FUNC_PARAM_TYPE_INVALID;
                 LOG_USER_ERROR(OB_AI_FUNC_PARAM_TYPE_INVALID, (int)strlen("max_concurrency"), "max_concurrency", (int)strlen("INT"), "INT");
@@ -480,6 +637,22 @@ int ObAiServiceExecutor::alter_ai_model_profile(ObArenaAllocator &allocator, con
               run_config.assign(buf.ptr());
             }
           }
+        }
+      } else if (0 == elem.first.case_compare("extra_headers")) {
+        has_extra_headers = true;
+        common::ObJsonBuffer buf(&allocator);
+        if (OB_FAIL(ObAIExtraHeadersUtils::validate_and_serialize(*elem.second, buf))) {
+          if (OB_AI_FUNC_PARAM_TYPE_INVALID == ret) {
+            LOG_USER_ERROR(OB_AI_FUNC_PARAM_TYPE_INVALID,
+                           static_cast<int>(strlen("extra_headers")), "extra_headers",
+                           static_cast<int>(strlen("JSON_OBJECT")), "JSON_OBJECT");
+          } else if (OB_AI_FUNC_PARAM_VALUE_INVALID == ret) {
+            LOG_USER_ERROR(OB_AI_FUNC_PARAM_VALUE_INVALID,
+                           static_cast<int>(strlen("extra_headers")), "extra_headers");
+          }
+          LOG_WARN("failed to validate extra_headers", K(ret));
+        } else if (OB_FAIL(extra_headers.assign(buf.string()))) {
+          LOG_WARN("failed to assign extra_headers", K(ret));
         }
       } else if (0 == elem.first.case_compare("access_key")) {
         ret = OB_AI_FUNC_PARAM_INVALID;
@@ -532,17 +705,36 @@ int ObAiServiceExecutor::alter_ai_model_profile(ObArenaAllocator &allocator, con
       ObString old_model_config;
       ObString old_run_config;
       if (OB_FAIL(ret)) {
-      } else if (OB_FAIL(ObAiServiceProxy::select_ai_model_profile(user_tenant_id, allocator, trans,
-          provider_name, model_name, old_model_profile_id, old_model_config, old_run_config, exists))) {
+      } else if (OB_FAIL(ObAiServiceProxy::select_ai_model_profile(
+          user_tenant_id, allocator, trans, provider_name, model_name, old_model_profile_id,
+          old_model_config, old_run_config, exists, true))) {
         LOG_WARN("failed to select ai model profile", K(ret), K(provider_name), K(model_name));
+      }
+
+      ObJsonBuffer merged_run_config(&allocator);
+      bool merged_extra_headers = false;
+      if (OB_FAIL(ret)) {
+      } else if ((has_run_config || has_extra_headers) &&
+                 OB_FAIL(merge_model_profile_run_config(
+                     allocator,
+                     exists ? old_run_config : ObString(),
+                     has_run_config,
+                     run_config.string(),
+                     has_extra_headers,
+                     extra_headers.string(),
+                     merged_run_config,
+                     merged_extra_headers))) {
+        LOG_WARN("failed to merge model profile run_config", K(ret));
       } else if (exists) {
         // Empty JSON object {}: no field to merge; skip UPDATE. Otherwise a no-op UPDATE can
         // return affected_rows=0 while update_ai_model_profile requires exactly one row changed.
-        if (has_model_config || has_run_config) {
+        if (has_model_config || has_run_config || has_extra_headers) {
           ObString update_model_config = has_model_config ? ObString(model_config.length(), model_config.ptr()) : old_model_config;
-          ObString update_run_config = has_run_config ? ObString(run_config.length(), run_config.ptr()) : old_run_config;
+          ObString update_run_config = merged_extra_headers ? merged_run_config.string() :
+              (has_run_config ? ObString(run_config.length(), run_config.ptr()) : old_run_config);
           const bool config_unchanged = (0 == update_model_config.case_compare(old_model_config));
-          const bool run_unchanged = (0 == update_run_config.case_compare(old_run_config));
+          const bool run_unchanged = update_run_config.length() == old_run_config.length() &&
+                                     0 == update_run_config.compare(old_run_config);
           if (!config_unchanged || !run_unchanged) {
             if (OB_FAIL(ObAiServiceProxy::update_ai_model_profile(user_tenant_id, trans, old_model_profile_id,
                 update_model_config, update_run_config))) {
@@ -558,7 +750,8 @@ int ObAiServiceExecutor::alter_ai_model_profile(ObArenaAllocator &allocator, con
           LOG_WARN("failed to fetch new ai model profile id", KR(ret), K(user_tenant_id));
         } else {
           ObString insert_model_config = has_model_config ? ObString(model_config.length(), model_config.ptr()) : ObString();
-          ObString insert_run_config = has_run_config ? ObString(run_config.length(), run_config.ptr()) : ObString();
+          ObString insert_run_config = merged_extra_headers ? merged_run_config.string() :
+              (has_run_config ? ObString(run_config.length(), run_config.ptr()) : ObString());
           if (OB_FAIL(ObAiServiceProxy::insert_ai_model_profile(user_tenant_id, trans, new_model_profile_id,
               provider_name, model_name, insert_model_config, insert_run_config))) {
             LOG_WARN("failed to insert ai model profile", K(ret));

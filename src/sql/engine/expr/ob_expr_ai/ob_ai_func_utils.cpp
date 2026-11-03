@@ -1999,7 +1999,7 @@ int ObAIFuncUtils::get_header(ObIAllocator &allocator,
   if (OB_FAIL(endpoint_info.get_unencrypted_access_key(allocator, unencrypted_access_key))) {
     LOG_WARN("Failed to get unencrypted access key", K(ret));
   } else if (OB_FAIL(get_header(allocator, info.type_, endpoint_info.get_provider(),
-                                unencrypted_access_key, request_model_name, headers))) {
+                                unencrypted_access_key, request_model_name, nullptr, headers))) {
     LOG_WARN("Failed to get header", K(ret));
   }
   return ret;
@@ -2125,6 +2125,7 @@ int ObAIFuncUtils::get_header(ObIAllocator &allocator,
                               const ObString &provider,
                               const ObString &api_key,
                               const ObString &request_model_name,
+                              const ObJsonObject *extra_headers,
                               ObArray<ObString> &headers)
 {
   int ret = OB_SUCCESS;
@@ -2149,6 +2150,57 @@ int ObAIFuncUtils::get_header(ObIAllocator &allocator,
       LOG_WARN("Failed to get rerank provider", K(ret));
     } else if (OB_FAIL(rerank_provider->get_header(allocator, const_cast<ObString &>(api_key), headers))) {
       LOG_WARN("Failed to get header from rerank provider", K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(append_extra_headers(allocator, extra_headers, headers))) {
+    LOG_WARN("failed to append extra headers", K(ret));
+  }
+  return ret;
+}
+
+int ObAIFuncUtils::append_extra_headers(ObIAllocator &allocator,
+                                        const ObJsonObject *extra_headers,
+                                        ObArray<ObString> &headers)
+{
+  int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(extra_headers)) {
+    JsonObjectIterator iter = extra_headers->object_iterator();
+    while (OB_SUCC(ret) && !iter.end()) {
+      ObJsonObjPair elem;
+      ObJsonBuffer value_buf(&allocator);
+      if (OB_FAIL(iter.get_elem(elem))) {
+        LOG_WARN("failed to get extra header", K(ret));
+      } else if (OB_ISNULL(elem.second)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("extra header value is null", K(ret), K(elem.first));
+      } else if (OB_FAIL(share::ObAIExtraHeadersUtils::json_value_to_header_value(
+                     *elem.second, value_buf))) {
+        LOG_WARN("failed to convert extra header value", K(ret), K(elem.first));
+      } else {
+        const bool empty_value = value_buf.empty();
+        const int64_t separator_length = empty_value ? 1 : 2;
+        const int64_t header_length = elem.first.length() + separator_length +
+                                      value_buf.length();
+        char *header_buf = static_cast<char *>(allocator.alloc(header_length));
+        if (OB_ISNULL(header_buf)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("failed to allocate extra header", K(ret), K(header_length));
+        } else {
+          MEMCPY(header_buf, elem.first.ptr(), elem.first.length());
+          int64_t pos = elem.first.length();
+          header_buf[pos++] = empty_value ? ';' : ':';
+          if (!empty_value) {
+            header_buf[pos++] = ' ';
+            MEMCPY(header_buf + pos, value_buf.ptr(), value_buf.length());
+          }
+          if (OB_FAIL(headers.push_back(ObString(header_length, header_buf)))) {
+            allocator.free(header_buf);
+            LOG_WARN("failed to append extra header", K(ret), K(elem.first));
+          } else {
+            iter.next();
+          }
+        }
+      }
     }
   }
   return ret;
@@ -3264,6 +3316,11 @@ int ObAIFuncUtils::resolve_gateway_endpoint_config(ObIAllocator &allocator,
   schema::ObSchemaGetterGuard guard;
   uint64_t tenant_id = MTL_ID();
   const schema::ObAIProviderSchema *provider_schema = nullptr;
+  ObArenaAllocator profile_allocator("AIGwProfile", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id);
+  ObString profile_model_config;
+  ObString profile_run_config;
+  int64_t profile_id = OB_INVALID_ID;
+  bool profile_exists = false;
 
   if (endpoint.provider_.empty() || endpoint.model_name_.empty()) {
     ret = OB_INVALID_ARGUMENT;
@@ -3291,6 +3348,18 @@ int ObAIFuncUtils::resolve_gateway_endpoint_config(ObIAllocator &allocator,
                  allocator, *provider_schema, endpoint.model_, endpoint.model_name_, op_type, config))) {
     // endpoint.model_ is the original "provider/model" used as model_key
     LOG_WARN("init config from gateway endpoint failed", K(ret), K(endpoint));
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sql proxy is null", K(ret));
+  } else if (OB_FAIL(share::ObAiServiceProxy::select_ai_model_profile(
+                 tenant_id, profile_allocator, *GCTX.sql_proxy_, endpoint.provider_,
+                 endpoint.model_name_, profile_id, profile_model_config,
+                 profile_run_config, profile_exists))) {
+    LOG_WARN("failed to select gateway endpoint model profile", K(ret), K(endpoint));
+  } else if (profile_exists &&
+             OB_FAIL(config.apply_profile_params(
+                 allocator, profile_model_config, profile_run_config))) {
+    LOG_WARN("failed to apply gateway endpoint profile", K(ret), K(endpoint));
   } else {
     // Merge default model config for this provider/model
     share::ObAIModelConfigItem default_config;
@@ -3439,7 +3508,9 @@ int ObAIFuncModel::call_completion(ObString &prompt, ObJsonObject *config, ObStr
     LOG_WARN("Failed to get complete provider", K(ret));
   } else if (OB_FAIL(get_access_key_(unencrypted_access_key))) {
     LOG_WARN("Failed to get unencrypted access key", K(ret));
-  } else if (OB_FAIL(complete_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
+  } else if (OB_FAIL(ObAIFuncUtils::get_header(*allocator_, get_type_(), get_provider_(),
+                                               unencrypted_access_key, request_model_name,
+                                               get_extra_headers_(), headers))) {
     LOG_WARN("Failed to get header", K(ret));
   } else if (OB_FAIL(complete_provider->get_body(*allocator_, request_model_name, prompt_str, prompt, config, body))) {
     LOG_WARN("Failed to get body", K(ret));
@@ -3490,7 +3561,9 @@ int ObAIFuncModel::call_completion_vector(ObArray<ObString> &prompts, ObJsonObje
     LOG_WARN("Failed to get complete provider", K(ret));
   } else if (OB_FAIL(get_access_key_(unencrypted_access_key))) {
     LOG_WARN("Failed to get unencrypted access key", K(ret));
-  } else if (OB_FAIL(complete_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
+  } else if (OB_FAIL(ObAIFuncUtils::get_header(*allocator_, get_type_(), get_provider_(),
+                                               unencrypted_access_key, request_model_name,
+                                               get_extra_headers_(), headers))) {
     LOG_WARN("Failed to get header", K(ret));
   } else {
     for (int i = 0; OB_SUCC(ret) && i < prompts.count(); i++) {
@@ -3569,7 +3642,9 @@ int ObAIFuncModel::call_dense_embedding_vector(ObArray<ObString> &contents, ObJs
     LOG_WARN("Failed to get embed provider", K(ret));
   } else if (OB_FAIL(get_access_key_(unencrypted_access_key))) {
     LOG_WARN("Failed to get unencrypted access key", K(ret));
-  } else if (OB_FAIL(embed_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
+  } else if (OB_FAIL(ObAIFuncUtils::get_header(*allocator_, get_type_(), get_provider_(),
+                                               unencrypted_access_key, request_model_name,
+                                               get_extra_headers_(), headers))) {
     LOG_WARN("Failed to get header", K(ret));
   } else {
     for (int i = 0; OB_SUCC(ret) && i < contents.count(); i++) {
@@ -3651,7 +3726,9 @@ int ObAIFuncModel::call_dense_embedding_vector_v2(ObArray<ObString> &content, Ob
     LOG_WARN("Failed to get embed provider", K(ret));
   } else if (OB_FAIL(get_access_key_(unencrypted_access_key))) {
     LOG_WARN("Failed to get unencrypted access key", K(ret));
-  } else if (OB_FAIL(embed_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
+  } else if (OB_FAIL(ObAIFuncUtils::get_header(*allocator_, get_type_(), get_provider_(),
+                                               unencrypted_access_key, request_model_name,
+                                               get_extra_headers_(), headers))) {
     LOG_WARN("Failed to get header", K(ret));
   } else if (OB_FAIL(embed_provider->get_body(*allocator_, request_model_name, content, config, input_type_, body))) {
     LOG_WARN("Failed to get body", K(ret));
@@ -3734,7 +3811,9 @@ int ObAIFuncModel::call_rerank(ObString &query,
     LOG_WARN("Failed to get rerank provider", K(ret));
   } else if (OB_FAIL(get_access_key_(unencrypted_access_key))) {
     LOG_WARN("Failed to get unencrypted access key", K(ret));
-  } else if (OB_FAIL(rerank_provider->get_header(*allocator_, unencrypted_access_key, headers))) {
+  } else if (OB_FAIL(ObAIFuncUtils::get_header(*allocator_, get_type_(), get_provider_(),
+                                               unencrypted_access_key, request_model_name,
+                                               get_extra_headers_(), headers))) {
     LOG_WARN("Failed to get header", K(ret));
   } else if (OB_FAIL(rerank_provider->get_body(*allocator_, request_model_name, query, contents, config, body))) {
     LOG_WARN("Failed to get body", K(ret));
@@ -3840,6 +3919,10 @@ protected:
         LOG_WARN("failed to get header for retry", K(ret), K(provider));
       }
     }
+    if (OB_SUCC(ret) && OB_FAIL(ObAIFuncUtils::append_extra_headers(
+                            allocator_, ep_config_.get_extra_headers(), ep_headers_))) {
+      LOG_WARN("failed to append extra headers for retry", K(ret));
+    }
     return ret;
   }
 private:
@@ -3880,6 +3963,9 @@ static int build_completion_request(common::ObIAllocator &allocator,
       LOG_WARN("failed to get vl complete provider", K(ret));
     } else if (OB_FAIL(vl_provider->get_header(allocator, api_key, headers))) {
       LOG_WARN("failed to get header", K(ret));
+    } else if (OB_FAIL(ObAIFuncUtils::append_extra_headers(
+                   allocator, cfg.get_extra_headers(), headers))) {
+      LOG_WARN("failed to append extra headers", K(ret));
     } else if (OB_FAIL(vl_provider->get_body(allocator, model_name, prompt, prompt_object, merged_config, body))) {
       LOG_WARN("failed to get body", K(ret));
     }
@@ -3890,6 +3976,9 @@ static int build_completion_request(common::ObIAllocator &allocator,
       LOG_WARN("failed to get complete provider", K(ret));
     } else if (OB_FAIL(complete_provider->get_header(allocator, api_key, headers))) {
       LOG_WARN("failed to get header", K(ret));
+    } else if (OB_FAIL(ObAIFuncUtils::append_extra_headers(
+                   allocator, cfg.get_extra_headers(), headers))) {
+      LOG_WARN("failed to append extra headers", K(ret));
     } else if (OB_FAIL(complete_provider->get_body(allocator, model_name, system_prompt, prompt, merged_config, body))) {
       LOG_WARN("failed to get body", K(ret));
     }
@@ -4604,6 +4693,11 @@ const ObString &ObAIFuncModel::get_url_() const
   return OB_NOT_NULL(config_ptr_) ? config_ptr_->get_url() : endpoint_info_->get_url();
 }
 
+const ObJsonObject *ObAIFuncModel::get_extra_headers_() const
+{
+  return OB_NOT_NULL(config_ptr_) ? config_ptr_->get_extra_headers() : nullptr;
+}
+
 const ObString ObAIFuncModel::get_request_model_name()
 {
   const ObString *result = &info_->model_;
@@ -5024,6 +5118,7 @@ int ObAIFuncBatchUtils::init_pending_state(ObIAllocator &allocator,
                                             pending.config_.get_provider(),
                                             pending.config_.get_api_key(),
                                             pending.config_.get_request_model_name(),
+                                            pending.config_.get_extra_headers(),
                                             pending.headers_))) {
         LOG_WARN("fail to get header", K(ret));
       } else {

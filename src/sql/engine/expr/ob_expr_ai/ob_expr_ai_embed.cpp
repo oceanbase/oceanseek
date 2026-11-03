@@ -36,6 +36,9 @@ protected:
       LOG_WARN("failed to get embed provider for retry", K(ret), K(provider));
     } else if (OB_FAIL(embed_provider->get_header(allocator_, api_key, ep_headers_))) {
       LOG_WARN("failed to get embed header for retry", K(ret));
+    } else if (OB_FAIL(ObAIFuncUtils::append_extra_headers(
+                   allocator_, ep_config_.get_extra_headers(), ep_headers_))) {
+      LOG_WARN("failed to append extra headers for retry", K(ret));
     }
     return ret;
   }

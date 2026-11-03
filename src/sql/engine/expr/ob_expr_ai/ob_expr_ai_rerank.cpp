@@ -35,6 +35,7 @@ protected:
                                           ep_config_.get_provider(),
                                           ep_config_.get_api_key(),
                                           ep_config_.get_request_model_name(),
+                                          ep_config_.get_extra_headers(),
                                           ep_headers_))) {
       LOG_WARN("failed to get rerank header for retry", K(ret));
     }
@@ -264,6 +265,7 @@ int ObExprAIRerank::eval_ai_rerank_batched(const ObExpr &expr, ObEvalCtx &ctx,
                                         config.get_provider(),
                                         config.get_api_key(),
                                         config.get_request_model_name(),
+                                        config.get_extra_headers(),
                                         header_array))) {
     LOG_WARN("fail to get header", K(ret));
   } else if (OB_FAIL(ObAIFuncJsonUtils::get_json_array(allocator, result_array))) {

@@ -390,10 +390,16 @@ int ObAiServiceProxy::check_ai_endpoint_exists(const uint64_t tenant_id, ObArena
   return ret;
 }
 
-int ObAiServiceProxy::select_ai_model_profile(const uint64_t tenant_id, ObArenaAllocator &allocator, ObISQLClient &sql_proxy,
-                                                 const ObString &provider_name, const ObString &model_name,
-                                                 int64_t &model_profile_id, ObString &model_config, ObString &run_config,
-                                                 bool &exists)
+int ObAiServiceProxy::select_ai_model_profile(const uint64_t tenant_id,
+                                              ObArenaAllocator &allocator,
+                                              ObISQLClient &sql_proxy,
+                                              const ObString &provider_name,
+                                              const ObString &model_name,
+                                              int64_t &model_profile_id,
+                                              ObString &model_config,
+                                              ObString &run_config,
+                                              bool &exists,
+                                              bool for_update)
 {
   int ret = OB_SUCCESS;
   ObSqlString sql;
@@ -423,6 +429,8 @@ int ObAiServiceProxy::select_ai_model_profile(const uint64_t tenant_id, ObArenaA
     LOG_WARN("failed to append sql", KR(ret));
   } else if (OB_FAIL(sql_append_hex_escape_str(model_name, sql))) {
     LOG_WARN("failed to append model_name", KR(ret), K(model_name));
+  } else if (for_update && OB_FAIL(sql.append(" FOR UPDATE"))) {
+    LOG_WARN("failed to append for update", KR(ret));
   } else {
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       ObMySQLResult *result = NULL;
@@ -495,7 +503,8 @@ int ObAiServiceProxy::insert_ai_model_profile(const uint64_t tenant_id, ObMySQLT
   } else if (OB_FAIL(sql.splice_insert_sql(OB_ALL_AI_MODEL_PROFILE_TNAME, buffer))) {
     LOG_WARN("failed to splice_insert_sql", K(ret));
   } else if (OB_FAIL(trans.write(tenant_id, buffer.ptr(), affected_rows))) {
-    LOG_WARN("failed to write sql", KR(ret), K(tenant_id), K(buffer));
+    LOG_WARN("failed to insert ai model profile", KR(ret), K(tenant_id), K(model_profile_id),
+             K(provider_name), K(model_name));
   } else if (1 != affected_rows) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("affected_rows should be one", KR(ret), K(affected_rows));
@@ -506,7 +515,8 @@ int ObAiServiceProxy::insert_ai_model_profile(const uint64_t tenant_id, ObMySQLT
     LOG_USER_ERROR(OB_ENTRY_EXIST, "model profile already exists");
     LOG_WARN("ai model profile already exists", KR(ret), K(tenant_id));
   }
-  LOG_DEBUG("insert ai model profile", K(tenant_id), K(model_profile_id), K(provider_name), K(model_name), K(buffer), KR(ret));
+  LOG_DEBUG("insert ai model profile", K(tenant_id), K(model_profile_id), K(provider_name),
+            K(model_name), KR(ret));
   return ret;
 }
 
@@ -537,12 +547,12 @@ int ObAiServiceProxy::update_ai_model_profile(const uint64_t tenant_id, ObMySQLT
   } else if (OB_FAIL(sql.splice_update_sql(OB_ALL_AI_MODEL_PROFILE_TNAME, buffer))) {
     LOG_WARN("failed to splice_update_sql", K(ret));
   } else if (OB_FAIL(trans.write(tenant_id, buffer.ptr(), affected_rows))) {
-    LOG_WARN("failed to write sql", KR(ret), K(buffer));
+    LOG_WARN("failed to update ai model profile", KR(ret), K(tenant_id), K(model_profile_id));
   } else if (1 != affected_rows) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("affected_rows should be one", KR(ret), K(affected_rows));
   }
-  LOG_DEBUG("update ai model profile", K(tenant_id), K(model_profile_id), K(buffer), KR(ret));
+  LOG_DEBUG("update ai model profile", K(tenant_id), K(model_profile_id), KR(ret));
   return ret;
 }
 

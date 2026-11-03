@@ -29,10 +29,16 @@ public:
   static int check_ai_endpoint_exists(const uint64_t tenant_id, common::ObArenaAllocator &allocator, ObISQLClient &sql_proxy, const ObString &name, bool &is_exists);
 
   // ai model profile
-  static int select_ai_model_profile(const uint64_t tenant_id, common::ObArenaAllocator &allocator, ObISQLClient &sql_proxy,
-                                       const ObString &provider_name, const ObString &model_name,
-                                       int64_t &model_profile_id, ObString &model_config, ObString &run_config,
-                                       bool &exists);
+  static int select_ai_model_profile(const uint64_t tenant_id,
+                                     common::ObArenaAllocator &allocator,
+                                     ObISQLClient &sql_proxy,
+                                     const ObString &provider_name,
+                                     const ObString &model_name,
+                                     int64_t &model_profile_id,
+                                     ObString &model_config,
+                                     ObString &run_config,
+                                     bool &exists,
+                                     bool for_update = false);
   static int insert_ai_model_profile(const uint64_t tenant_id, ObMySQLTransaction &trans,
                                        const int64_t model_profile_id, const ObString &provider_name,
                                        const ObString &model_name, const ObString &model_config,

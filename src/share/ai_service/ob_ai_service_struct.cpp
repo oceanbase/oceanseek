@@ -4,8 +4,9 @@
  */
 
 #include "share/ai_service/ob_ai_service_struct.h"
-#include "share/ai_service/ob_ai_gateway_circuit_state.h"
+#include "lib/container/ob_array.h"
 #include "lib/json/ob_json.h"
+#include "share/ai_service/ob_ai_gateway_circuit_state.h"
 #include "share/ob_encryption_util.h"
 #include "share/rc/ob_tenant_base.h"
 #include "share/schema/ob_ai_model_mgr.h"
@@ -21,6 +22,300 @@ namespace oceanbase
 {
 namespace share
 {
+
+const int64_t ObAIExtraHeadersUtils::MAX_SERIALIZED_LENGTH;
+
+namespace
+{
+
+int append_json_string(const ObString &value, ObJsonBuffer &buf)
+{
+  int ret = OB_SUCCESS;
+  static const char HEX[] = "0123456789abcdef";
+  if (OB_FAIL(buf.append("\""))) {
+    LOG_WARN("failed to append json quote", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < value.length(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(value.ptr()[i]);
+    const char *escaped = nullptr;
+    switch (c) {
+      case '"': escaped = "\\\""; break;
+      case '\\': escaped = "\\\\"; break;
+      case '\b': escaped = "\\b"; break;
+      case '\f': escaped = "\\f"; break;
+      case '\n': escaped = "\\n"; break;
+      case '\r': escaped = "\\r"; break;
+      case '\t': escaped = "\\t"; break;
+      default: break;
+    }
+    if (OB_NOT_NULL(escaped)) {
+      if (OB_FAIL(buf.append(escaped))) {
+        LOG_WARN("failed to append escaped json character", K(ret), K(c));
+      }
+    } else if (c <= 0x1f || c == 0x7f) {
+      char unicode_escape[6] = {'\\', 'u', '0', '0', HEX[c >> 4], HEX[c & 0x0f]};
+      if (OB_FAIL(buf.append(unicode_escape, sizeof(unicode_escape)))) {
+        LOG_WARN("failed to append json unicode escape", K(ret), K(c));
+      }
+    } else if (OB_FAIL(buf.append(value.ptr() + i, 1))) {
+      LOG_WARN("failed to append json character", K(ret), K(c));
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(buf.append("\""))) {
+    LOG_WARN("failed to append json quote", K(ret));
+  }
+  return ret;
+}
+
+bool is_http_token_char(const unsigned char c)
+{
+  return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+         (c >= '0' && c <= '9') ||
+         c == '!' || c == '#' || c == '$' || c == '%' || c == '&' || c == '\'' ||
+         c == '*' || c == '+' || c == '-' || c == '.' || c == '^' || c == '_' ||
+         c == '`' || c == '|' || c == '~';
+}
+
+bool is_invalid_http_field_value_char(const unsigned char c)
+{
+  return (c <= 0x1f && c != '\t') || c == 0x7f;
+}
+
+bool matches_nonempty_header_prefix(const ObString &name, const ObString &prefix)
+{
+  return name.length() > prefix.length() && name.prefix_match_ci(prefix);
+}
+
+bool is_allowed_header_name(const ObString &name)
+{
+  bool allowed = matches_nonempty_header_prefix(name, "X-DashScope-") ||
+                 matches_nonempty_header_prefix(name, "OpenAI-") ||
+                 matches_nonempty_header_prefix(name, "X-TC-") ||
+                 matches_nonempty_header_prefix(name, "X-Bce-") ||
+                 0 == name.case_compare("X-Client-Request-Id") ||
+                 0 == name.case_compare("appid");
+  for (int64_t i = 0; allowed && i < name.length(); ++i) {
+    allowed = is_http_token_char(static_cast<unsigned char>(name.ptr()[i]));
+  }
+  return allowed && !name.empty();
+}
+
+int normalize_header_string(const ObIJsonBase &value, ObString &normalized)
+{
+  int ret = OB_SUCCESS;
+  if (value.json_type() != ObJsonNodeType::J_STRING) {
+    ret = OB_AI_FUNC_PARAM_TYPE_INVALID;
+    LOG_WARN("header value should be json string", K(ret), K(value.json_type()));
+  } else {
+    const char *data = value.get_data();
+    int64_t begin = 0;
+    int64_t end = value.get_data_length();
+    while (begin < end && (data[begin] == ' ' || data[begin] == '\t')) {
+      ++begin;
+    }
+    while (end > begin && (data[end - 1] == ' ' || data[end - 1] == '\t')) {
+      --end;
+    }
+    for (int64_t i = begin; OB_SUCC(ret) && i < end; ++i) {
+      const unsigned char c = static_cast<unsigned char>(data[i]);
+      if (is_invalid_http_field_value_char(c)) {
+        ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+        LOG_WARN("header string contains invalid character", K(ret), K(c));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      normalized.assign_ptr(end > begin ? data + begin : nullptr,
+                            static_cast<int32_t>(end - begin));
+    }
+  }
+  return ret;
+}
+
+} // namespace
+
+int ObAIExtraHeadersUtils::serialize_compact(const ObIJsonBase &value, ObJsonBuffer &buf)
+{
+  int ret = OB_SUCCESS;
+  switch (value.json_type()) {
+    case ObJsonNodeType::J_OBJECT: {
+      if (OB_FAIL(buf.append("{"))) {
+        LOG_WARN("failed to append json object start", K(ret));
+      }
+      JsonObjectIterator iter = value.object_iterator();
+      bool first = true;
+      while (OB_SUCC(ret) && !iter.end()) {
+        ObJsonObjPair elem;
+        if (OB_FAIL(iter.get_elem(elem))) {
+          LOG_WARN("failed to get json object element", K(ret));
+        } else if (!first && OB_FAIL(buf.append(","))) {
+          LOG_WARN("failed to append json object separator", K(ret));
+        } else if (OB_FAIL(append_json_string(elem.first, buf))) {
+          LOG_WARN("failed to append json object key", K(ret));
+        } else if (OB_FAIL(buf.append(":"))) {
+          LOG_WARN("failed to append json object colon", K(ret));
+        } else if (OB_ISNULL(elem.second)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_ERROR("json object value is null", K(ret));
+        } else if (OB_FAIL(serialize_compact(*elem.second, buf))) {
+          LOG_WARN("failed to serialize json object value", K(ret));
+        } else {
+          first = false;
+          iter.next();
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(buf.append("}"))) {
+        LOG_WARN("failed to append json object end", K(ret));
+      }
+      break;
+    }
+    case ObJsonNodeType::J_ARRAY: {
+      if (OB_FAIL(buf.append("["))) {
+        LOG_WARN("failed to append json array start", K(ret));
+      }
+      const uint64_t count = value.element_count();
+      for (uint64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+        ObIJsonBase *elem = nullptr;
+        if (i > 0 && OB_FAIL(buf.append(","))) {
+          LOG_WARN("failed to append json array separator", K(ret));
+        } else if (OB_FAIL(value.get_array_element(i, elem))) {
+          LOG_WARN("failed to get json array element", K(ret), K(i));
+        } else if (OB_ISNULL(elem)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_ERROR("json array value is null", K(ret), K(i));
+        } else if (OB_FAIL(serialize_compact(*elem, buf))) {
+          LOG_WARN("failed to serialize json array value", K(ret), K(i));
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(buf.append("]"))) {
+        LOG_WARN("failed to append json array end", K(ret));
+      }
+      break;
+    }
+    case ObJsonNodeType::J_STRING: {
+      ObString string_value(value.get_data_length(), value.get_data());
+      if (OB_FAIL(append_json_string(string_value, buf))) {
+        LOG_WARN("failed to append json string", K(ret));
+      }
+      break;
+    }
+    case ObJsonNodeType::J_INT:
+    case ObJsonNodeType::J_UINT:
+    case ObJsonNodeType::J_DECIMAL:
+    case ObJsonNodeType::J_DOUBLE:
+    case ObJsonNodeType::J_BOOLEAN:
+      if (OB_FAIL(value.print(buf, true))) {
+        LOG_WARN("failed to serialize json scalar", K(ret), K(value.json_type()));
+      }
+      break;
+    case ObJsonNodeType::J_NULL:
+      if (!value.is_real_json_null(&value)) {
+        ret = OB_AI_FUNC_PARAM_TYPE_INVALID;
+        LOG_WARN("json null is not real null", K(ret));
+      } else if (OB_FAIL(buf.append("null"))) {
+        LOG_WARN("failed to append json null", K(ret));
+      }
+      break;
+    default:
+      ret = OB_AI_FUNC_PARAM_TYPE_INVALID;
+      LOG_WARN("unsupported json type", K(ret), K(value.json_type()));
+      break;
+  }
+  return ret;
+}
+
+int ObAIExtraHeadersUtils::json_value_to_header_value(const ObIJsonBase &value,
+                                                      ObJsonBuffer &buf)
+{
+  int ret = OB_SUCCESS;
+  if (value.json_type() == ObJsonNodeType::J_STRING) {
+    ObString normalized;
+    if (OB_FAIL(normalize_header_string(value, normalized))) {
+      LOG_WARN("failed to normalize header string", K(ret));
+    } else if (!normalized.empty() && OB_FAIL(buf.append(normalized))) {
+      LOG_WARN("failed to append header string", K(ret));
+    }
+  } else if (OB_FAIL(serialize_compact(value, buf))) {
+    LOG_WARN("failed to serialize header value", K(ret));
+  }
+  for (uint64_t i = 0; OB_SUCC(ret) && i < buf.length(); ++i) {
+    const unsigned char c = static_cast<unsigned char>(buf.ptr()[i]);
+    if (is_invalid_http_field_value_char(c)) {
+      ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+      LOG_WARN("header value contains invalid character", K(ret), K(c));
+    }
+  }
+  return ret;
+}
+
+int ObAIExtraHeadersUtils::validate_and_serialize(const ObIJsonBase &headers,
+                                                  ObJsonBuffer &buf)
+{
+  int ret = OB_SUCCESS;
+  ObArray<ObString> names;
+  if (headers.json_type() != ObJsonNodeType::J_OBJECT) {
+    ret = OB_AI_FUNC_PARAM_TYPE_INVALID;
+    LOG_WARN("extra headers should be json object", K(ret), K(headers.json_type()));
+  } else if (OB_FAIL(buf.append("{"))) {
+    LOG_WARN("failed to append headers object start", K(ret));
+  } else {
+    JsonObjectIterator iter = headers.object_iterator();
+    bool first = true;
+    while (OB_SUCC(ret) && !iter.end()) {
+      ObJsonObjPair elem;
+      if (OB_FAIL(iter.get_elem(elem))) {
+        LOG_WARN("failed to get header element", K(ret));
+      } else if (!is_allowed_header_name(elem.first)) {
+        ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+        LOG_WARN("header name is not allowed", K(ret), K(elem.first));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < names.count(); ++i) {
+        if (0 == names.at(i).case_compare(elem.first)) {
+          ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+          LOG_WARN("duplicate header name", K(ret), K(elem.first));
+        }
+      }
+      ObJsonBuffer wire_value(buf.get_allocator());
+      if (OB_FAIL(ret)) {
+      } else if (OB_ISNULL(elem.second)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("header value is null", K(ret));
+      } else if (OB_FAIL(json_value_to_header_value(*elem.second, wire_value))) {
+        LOG_WARN("failed to convert header value", K(ret), K(elem.first));
+      } else if (!first && OB_FAIL(buf.append(","))) {
+        LOG_WARN("failed to append header separator", K(ret));
+      } else if (OB_FAIL(append_json_string(elem.first, buf))) {
+        LOG_WARN("failed to append header name", K(ret));
+      } else if (OB_FAIL(buf.append(":"))) {
+        LOG_WARN("failed to append header colon", K(ret));
+      } else if (elem.second->json_type() == ObJsonNodeType::J_STRING) {
+        const ObString normalized(wire_value.length(), wire_value.ptr());
+        if (OB_FAIL(append_json_string(normalized, buf))) {
+          LOG_WARN("failed to append normalized header string", K(ret), K(elem.first));
+        }
+      } else if (OB_FAIL(buf.append(wire_value.string()))) {
+        LOG_WARN("failed to append structured header value", K(ret), K(elem.first));
+      }
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(names.push_back(elem.first))) {
+          LOG_WARN("failed to record header name", K(ret));
+        } else {
+          first = false;
+          iter.next();
+        }
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(buf.append("}"))) {
+      LOG_WARN("failed to append headers object end", K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && buf.length() > MAX_SERIALIZED_LENGTH) {
+    ret = OB_AI_FUNC_PARAM_VALUE_INVALID;
+    LOG_WARN("extra headers exceed max serialized length", K(ret), K(buf.length()),
+             K(MAX_SERIALIZED_LENGTH));
+  }
+  return ret;
+}
+
 const ObString ObAiModelEndpointInfo::DEFAULT_SCOPE = "ALL";
 
 const char *VALID_PROVIDERS[] = {
@@ -653,19 +948,22 @@ int ObAIModelConfigInfo::apply_profile_params(ObIAllocator &allocator,
                                               const ObString &run_config)
 {
   int ret = OB_SUCCESS;
+  extra_headers_ = nullptr;
   if (!run_config.empty()) {
-    // use a temporary allocator: we only extract integer values and do not keep the JSON tree
-    ObArenaAllocator tmp_allocator("AIProfileOpt");
+    // JSON string nodes reference the input buffer, so keep the storage with extra_headers_.
+    ObString options_copy;
     ObIJsonBase *options_base = nullptr;
-    if (OB_FAIL(ObJsonBaseFactory::get_json_base(&tmp_allocator,
-                                                  run_config,
-                                                  ObJsonInType::JSON_TREE,
-                                                  ObJsonInType::JSON_TREE,
-                                                  options_base))) {
-      LOG_WARN("failed to parse run_config", K(ret), K(run_config));
+    if (OB_FAIL(ob_write_string(allocator, run_config, options_copy))) {
+      LOG_WARN("failed to copy run_config", K(ret));
+    } else if (OB_FAIL(ObJsonBaseFactory::get_json_base(&allocator,
+                                                        options_copy,
+                                                        ObJsonInType::JSON_TREE,
+                                                        ObJsonInType::JSON_TREE,
+                                                        options_base))) {
+      LOG_WARN("failed to parse run_config", K(ret), K(run_config.length()));
     } else if (OB_ISNULL(options_base) || options_base->json_type() != ObJsonNodeType::J_OBJECT) {
       ret = OB_INVALID_ARGUMENT;
-      LOG_WARN("run_config should be json object", K(ret), K(run_config));
+      LOG_WARN("run_config should be json object", K(ret), K(run_config.length()));
     } else {
       int64_t batch_size = 0;
       int64_t max_image_size = 0;
@@ -681,6 +979,14 @@ int ObAIModelConfigInfo::apply_profile_params(ObIAllocator &allocator,
           EXTRACT_JSON_ELEM_INT("max_image_size", max_image_size)
           EXTRACT_JSON_ELEM_INT("min_concurrency", min_concurrency)
           EXTRACT_JSON_ELEM_INT("max_concurrency", max_concurrency)
+          if (0 == elem.first.case_compare("extra_headers")) {
+            if (elem.second->json_type() != ObJsonNodeType::J_OBJECT) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_ERROR("extra_headers should be json object", K(ret));
+            } else {
+              extra_headers_ = static_cast<const ObJsonObject *>(elem.second);
+            }
+          } else
           EXTRACT_JSON_ELEM_NO_CHECK_END()
         }
         iter.next();

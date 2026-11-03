@@ -567,7 +567,11 @@ public:
                         const ObString &provider,
                         const ObString &api_key,
                         const ObString &request_model_name,
+                        const ObJsonObject *extra_headers,
                         ObArray<ObString> &headers);
+  static int append_extra_headers(ObIAllocator &allocator,
+                                  const ObJsonObject *extra_headers,
+                                  ObArray<ObString> &headers);
   static int get_complete_body(ObIAllocator &allocator,
                               const ObString &provider,
                               const ObString &request_model_name,
@@ -690,6 +694,7 @@ public:
    const ObString &get_provider_() const;
    int get_access_key_(ObString &key) const;
    const ObString &get_url_() const;
+   const ObJsonObject *get_extra_headers_() const;
 
    bool is_completion_type() { return get_type_() == share::EndpointType::COMPLETION; }
    bool is_dense_embedding_type() { return get_type_() == share::EndpointType::DENSE_EMBEDDING; }

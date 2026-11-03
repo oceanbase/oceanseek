@@ -187,6 +187,18 @@ public:
   TO_STRING_KV(K_(batch_size), K_(max_image_size), K_(min_concurrency), K_(max_concurrency));
 };
 
+class ObAIExtraHeadersUtils final
+{
+public:
+  static const int64_t MAX_SERIALIZED_LENGTH = 1024;
+
+  static int serialize_compact(const common::ObIJsonBase &value,
+                               common::ObJsonBuffer &buf);
+  static int validate_and_serialize(const common::ObIJsonBase &headers,
+                                    common::ObJsonBuffer &buf);
+  static int json_value_to_header_value(const common::ObIJsonBase &value,
+                                        common::ObJsonBuffer &buf);
+};
 
 struct ObAIModelConfigInfo
 {
@@ -205,6 +217,7 @@ public:
     request_model_name_.reset();
     provider_base_url_.reset();
     message_parameters_ = nullptr;
+    extra_headers_ = nullptr;
     batch_size_ = 0;
     max_image_size_ = 0;
     min_concurrency_ = ObAIModelConfigItem::DEFAULT_MIN_CONCURRENCY;
@@ -245,6 +258,7 @@ public:
   const ObString &get_provider_base_url() const { return provider_base_url_; }
   const ObString &get_request_model_name() const { return request_model_name_; }
   common::ObJsonObject* get_message_parameters() const { return message_parameters_; }
+  const common::ObJsonObject *get_extra_headers() const { return extra_headers_; }
   int64_t get_batch_size() const { return batch_size_; }
   int64_t get_max_image_size() const { return max_image_size_; }
   int64_t get_min_concurrency() const { return min_concurrency_; }
@@ -279,6 +293,7 @@ private:
   ObString request_model_name_;
   ObString provider_base_url_; // only set for inline provider/model; empty for DDL-created models
   common::ObJsonObject* message_parameters_;
+  const common::ObJsonObject *extra_headers_;
   int64_t batch_size_;
   int64_t max_image_size_;
   int64_t min_concurrency_;
