@@ -2208,6 +2208,10 @@ public:
   void *get_external_resource_schema_cache() { return external_resource_schema_cache_; }
   void set_external_resource_schema_cache(void *cache) { external_resource_schema_cache_ = cache; }
   void set_retry_wait_event_begin_time();
+  int set_mlog_expected_rows(uint64_t mlog_table_id, int64_t expected_rows);
+  int get_mlog_expected_rows(uint64_t mlog_table_id, int64_t &expected_rows) const;
+  void reset_mlog_expected_rows();
+  bool has_mlog_expected_rows() const { return mlog_expected_rows_map_.created() && mlog_expected_rows_map_.size() > 0; }
 
 private:
   transaction::ObTxnFreeRouteCtx txn_free_route_ctx_;
@@ -2262,6 +2266,7 @@ private:
   int64_t trans_gtt_v2_sequence_;
   // The minimal data version at session creation.
   uint64_t min_data_version_of_init_sess_;
+  common::hash::ObHashMap<uint64_t, int64_t> mlog_expected_rows_map_;
 
   private:
   pl::ObUtlHttp* ob_utl_http_info_ = NULL;
