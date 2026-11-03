@@ -538,6 +538,126 @@ TEST_F(ObTestTxCtx, XaPreparedWaitsForExternalRollback)
   n2->wait_all_redolog_applied();
 }
 
+TEST_F(ObTestTxCtx, StoreContextChecksElectionRole)
+{
+  START_ONE_TX_NODE(n1);
+  PREPARE_TX_PARAM(tx_param);
+  tx_param.timeout_us_ = 30 * 1000 * 1000;
+  auto *adapter = n1->fake_tx_log_adapter_;
+  for (const bool has_ctx : {false, true}) {
+    PREPARE_TX(n1, tx);
+    ASSERT_EQ(OB_SUCCESS, n1->start_tx(tx, tx_param));
+    if (has_ctx) {
+      ASSERT_EQ(OB_SUCCESS, n1->write(tx, 100, 112));
+    } else {
+      // The scheduler knows this participant, but this replica has no context.
+      ASSERT_EQ(OB_SUCCESS, tx.add_clean_part_if_absent(n1->ls_id_, 1, n1->addr_, false));
+      tx.parts_.at(0).flag_.set_dirty();
+    }
+    GET_READ_SNAPSHOT(n1, tx, tx_param, snapshot);
+    ASSERT_EQ(1, snapshot.parts_.count());
+    auto check_access = [&](const int expected_ret) {
+      for (const bool write : {false, true}) {
+        ObStoreCtx store_ctx;
+        store_ctx.ls_ = &n1->fake_ls_;
+        store_ctx.ls_id_ = n1->ls_id_;
+        store_ctx.timeout_ = tx.get_expire_ts();
+        const concurrent_control::ObWriteFlag write_flag;
+        const int ret = write
+            ? n1->txs_.get_write_store_ctx(tx, snapshot, write_flag, store_ctx)
+            : n1->txs_.get_read_store_ctx(snapshot, false, -1, store_ctx);
+        EXPECT_EQ(expected_ret, ret) << "has_ctx=" << has_ctx << ", write=" << write;
+        if (OB_SUCCESS == ret) {
+          EXPECT_EQ(OB_SUCCESS, n1->txs_.revert_store_ctx(store_ctx));
+        } else {
+          EXPECT_EQ(nullptr, store_ctx.mvcc_acc_ctx_.tx_ctx_);
+        }
+      }
+    };
+    NAMED_DEFER(restore_role, {
+      ATOMIC_STORE(&adapter->is_leader_, true);
+      ATOMIC_STORE(&adapter->get_role_ret_, OB_SUCCESS);
+    });
+    // Only the election role changes: the transaction layer still serves as leader.
+    ASSERT_TRUE(n1->fake_tx_table_.tx_ctx_table_.ls_tx_ctx_mgr_->is_master());
+    ATOMIC_STORE(&adapter->is_leader_, false);
+    check_access(OB_NOT_MASTER);
+    ATOMIC_STORE(&adapter->get_role_ret_, OB_TIMEOUT);
+    check_access(OB_TIMEOUT);
+    ATOMIC_STORE(&adapter->get_role_ret_, OB_SUCCESS);
+    ATOMIC_STORE(&adapter->is_leader_, true);
+    check_access(has_ctx ? OB_SUCCESS : OB_TRANS_CTX_NOT_EXIST);
+    if (!has_ctx) {
+      // read_latest tolerates a missing unrecorded participant only on the leader.
+      snapshot.parts_.reset();
+      for (const bool leader : {false, true}) {
+        ATOMIC_STORE(&adapter->is_leader_, leader);
+        ObStoreCtx store_ctx;
+        store_ctx.ls_ = &n1->fake_ls_;
+        store_ctx.ls_id_ = n1->ls_id_;
+        store_ctx.timeout_ = tx.get_expire_ts();
+        const int ret = n1->txs_.get_read_store_ctx(snapshot, true, -1, store_ctx);
+        EXPECT_EQ(leader ? OB_SUCCESS : OB_NOT_MASTER, ret);
+        EXPECT_EQ(nullptr, store_ctx.mvcc_acc_ctx_.tx_ctx_);
+        if (OB_SUCCESS == ret) {
+          EXPECT_EQ(OB_SUCCESS, n1->txs_.revert_store_ctx(store_ctx));
+        }
+      }
+    }
+  }
+}
+
+TEST_F(ObTestTxCtx, AcquireContextChecksRoleWithoutDuplicatingCreateCheck)
+{
+  START_ONE_TX_NODE(n1);
+  PREPARE_TX_PARAM(tx_param);
+  tx_param.timeout_us_ = 30 * 1000 * 1000;
+  auto *adapter = n1->fake_tx_log_adapter_;
+  for (const bool try_get : {false, true}) {
+    PREPARE_TX(n1, tx);
+    ASSERT_EQ(OB_SUCCESS, n1->start_tx(tx, tx_param));
+    NAMED_DEFER(restore_role, {
+      ATOMIC_STORE(&adapter->is_leader_, true);
+      ATOMIC_STORE(&adapter->get_role_ret_, OB_SUCCESS);
+    });
+    bool exist = false;
+    ObPartTransCtx *ctx = nullptr;
+    ATOMIC_STORE(&adapter->get_role_count_, 0);
+    ASSERT_EQ(OB_SUCCESS, n1->txs_.acquire_tx_ctx(
+        n1->ls_id_, tx, ctx, &n1->fake_ls_, false, try_get, exist));
+    ASSERT_NE(nullptr, ctx);
+    NAMED_DEFER(revert_ctx, n1->txs_.revert_tx_ctx_(&n1->fake_ls_, ctx));
+    EXPECT_FALSE(exist);
+    EXPECT_EQ(1, ATOMIC_LOAD(&adapter->get_role_count_));
+
+    // No participant has been recorded yet: try_get must check a reused context.
+    const int32_t ref_count = ctx->get_ref();
+    for (const int role_ret : {OB_SUCCESS, OB_TIMEOUT}) {
+      ATOMIC_STORE(&adapter->is_leader_, false);
+      ATOMIC_STORE(&adapter->get_role_ret_, role_ret);
+      ATOMIC_STORE(&adapter->get_role_count_, 0);
+      ObPartTransCtx *reused_ctx = nullptr;
+      const int ret = n1->txs_.acquire_tx_ctx(
+          n1->ls_id_, tx, reused_ctx, &n1->fake_ls_, false, true, exist);
+      EXPECT_EQ(OB_SUCCESS == role_ret ? OB_NOT_MASTER : role_ret, ret);
+      EXPECT_EQ(nullptr, reused_ctx);
+      EXPECT_EQ(ref_count, ctx->get_ref());
+      EXPECT_EQ(1, ATOMIC_LOAD(&adapter->get_role_count_));
+      if (nullptr != reused_ctx) {
+        EXPECT_EQ(OB_SUCCESS, n1->txs_.revert_tx_ctx_(&n1->fake_ls_, reused_ctx));
+      }
+    }
+    ATOMIC_STORE(&adapter->is_leader_, true);
+    ATOMIC_STORE(&adapter->get_role_ret_, OB_SUCCESS);
+    ObPartTransCtx *reused_ctx = nullptr;
+    ASSERT_EQ(OB_SUCCESS, n1->txs_.acquire_tx_ctx(
+        n1->ls_id_, tx, reused_ctx, &n1->fake_ls_, false, true, exist));
+    EXPECT_EQ(ctx, reused_ctx);
+    EXPECT_EQ(OB_SUCCESS, n1->txs_.revert_tx_ctx_(&n1->fake_ls_, reused_ctx));
+    ASSERT_EQ(OB_SUCCESS, tx.add_clean_part_if_absent(n1->ls_id_, ctx->epoch_, n1->addr_, false));
+  }
+}
+
 TEST_F(ObTestTxCtx, DelayAbort)
 {
   ObTxPartList backup_parts;

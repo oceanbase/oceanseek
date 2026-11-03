@@ -590,10 +590,15 @@ public:
   }
 
   int get_role(bool &is_leader, int64_t &epoch) {
-    is_leader = true;
+    ATOMIC_INC(&get_role_count_);
+    is_leader = ATOMIC_LOAD(&is_leader_);
     epoch = 1;
-    return OB_SUCCESS;
+    return ATOMIC_LOAD(&get_role_ret_);
   }
+
+  bool is_leader_ = true;
+  int get_role_ret_ = OB_SUCCESS;
+  int64_t get_role_count_ = 0;
 
   int get_max_decided_scn(share::SCN &scn) {
     int ret = OB_SUCCESS;

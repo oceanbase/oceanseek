@@ -992,7 +992,13 @@ int ObTransService::get_read_store_ctx(const ObTxReadSnapshot &snapshot,
     int64_t part_epoch = 0;
     CHECK_TX_PARTS_CONTAIN_(snapshot.parts_, left_, right_, ls_id, part_epoch, exist);
     if (OB_SUCC(ret) && (exist || read_latest)) {
-      if (OB_FAIL(get_tx_ctx_(ls_id, store_ctx.ls_, snap_tx_id, tx_ctx))) {
+      bool leader = false;
+      // Transaction role changes can lag behind the election role change.
+      if (OB_FAIL(check_ls_status_(ls_id, leader))) {
+        TRANS_LOG(WARN, "check ls role fail", K(ret), K(ls_id));
+      } else if (!leader) {
+        ret = OB_NOT_MASTER;
+      } else if (OB_FAIL(get_tx_ctx_(ls_id, store_ctx.ls_, snap_tx_id, tx_ctx))) {
         if (OB_TRANS_CTX_NOT_EXIST == ret && !exist) {
           ret = OB_SUCCESS;
         } else {
@@ -1229,10 +1235,15 @@ int ObTransService::acquire_tx_ctx(const share::ObLSID &ls_id,
 {
   int ret = OB_SUCCESS;
   int64_t part_epoch = 0;
+  bool leader = false;
   CHECK_TX_PARTS_CONTAIN_(tx.parts_, id_, epoch_, ls_id, part_epoch, exist);
   if (OB_FAIL(ret)) {
   } else if (exist) {
-    if (OB_FAIL(get_tx_ctx_(ls_id, ls, tx.tx_id_, ctx))) {
+    if (OB_FAIL(check_ls_status_(ls_id, leader))) {
+      TRANS_LOG(WARN, "check ls role fail", K(ret), K(ls_id));
+    } else if (!leader) {
+      ret = OB_NOT_MASTER;
+    } else if (OB_FAIL(get_tx_ctx_(ls_id, ls, tx.tx_id_, ctx))) {
       TRANS_LOG(WARN, "get tx ctx fail", K(ret), K(ls_id), K(tx));
       if (ret == OB_TRANS_CTX_NOT_EXIST) {
         TRANS_LOG(WARN, "participant lost update", K(ls_id), K_(tx.tx_id));
@@ -1245,6 +1256,15 @@ int ObTransService::acquire_tx_ctx(const share::ObLSID &ls_id,
       ctx = NULL;
     }
   } else if (try_get && OB_SUCC(get_tx_ctx_(ls_id, ls, tx.tx_id_, ctx))) {
+    if (OB_FAIL(check_ls_status_(ls_id, leader))) {
+      TRANS_LOG(WARN, "check ls role fail", K(ret), K(ls_id));
+    } else if (!leader) {
+      ret = OB_NOT_MASTER;
+    }
+    if (OB_FAIL(ret)) {
+      revert_tx_ctx_(ls, ctx);
+      ctx = NULL;
+    }
   } else if (OB_FAIL(create_tx_ctx_(ls_id, ls, tx, ctx, special, exist))) {
       TRANS_LOG(WARN, "create tx ctx fail", K(ret), K(ls_id), K(tx), K(special));
   }
