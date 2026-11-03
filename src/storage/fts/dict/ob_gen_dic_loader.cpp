@@ -271,7 +271,7 @@ int ObGenDicLoader::gen_dic_loader(
   }
 
   if (OB_FAIL(ret)) {
-    if (OB_ISNULL(dic_loader)) {
+    if (OB_NOT_NULL(dic_loader)) {
       OB_DELETE(ObTenantDicLoader, attr, dic_loader);
       dic_loader = nullptr;
     }
