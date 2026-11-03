@@ -27,12 +27,11 @@ int ObVecAsyncTaskExecutor::load_triggered_task(const ObVecIndexTaskStatus &task
     LOG_WARN("unexpected null index_ls_mgr", K(ret));
   } else {
     storage::ObLS *ls = ls_handle_.get_ls();
-    ObVecIndexAsyncTaskOption &task_opt = index_ls_mgr->get_async_task_opt();
     // Transition STANDBY → PREPARE so that the task is picked up by task scheduling.
     ObVecIndexTaskStatus task_row_copy = task_row;
     task_row_copy.status_ = ObVecIndexAsyncTaskStatus::OB_VECTOR_ASYNC_TASK_PREPARE;
     if (OB_FAIL(ObVecIndexAsyncTaskUtil::try_add_task_ctx_from_inner_row(
-            tenant_id_, task_row_copy, ls, ls_handle_, task_opt, true /*verify_tablet_on_ls*/))) {
+            tenant_id_, task_row_copy, ls, ls_handle_, *index_ls_mgr, true /*verify_tablet_on_ls*/))) {
       LOG_WARN("fail to add triggered task ctx", K(ret), K(task_row));
     } else {
       LOG_INFO("[VEC_ASYNC_TASK] triggered task loaded, STANDBY->PREPARE", K(ret), K(task_row));
@@ -139,16 +138,30 @@ int ObVecAsyncTaskExecutor::load_task(uint64_t &task_trace_base_num)
     }
 
     schema::ObSchemaGetterGuard schema_guard;
+    ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
     if (OB_FAIL(schema::ObMultiVersionSchemaService::get_instance()
             .get_tenant_schema_guard(tenant_id_, schema_guard))) {
       LOG_WARN("failed to get tenant schema guard before loading optimize tasks",
                K(ret), K_(tenant_id));
     }
-    RWLock::RLockGuard lock_guard(index_ls_mgr->get_adapter_map_lock());
-    FOREACH_X(iter, index_ls_mgr->get_vec_adaptor_map(),
-        OB_SUCC(ret) && (task_ctx_array.count() + current_task_cnt <= MAX_ASYNC_TASK_PROCESSING_COUNT)) {
-      ObTabletID tablet_id = iter->first;
-      ObPluginVectorIndexAdaptor *adapter = iter->second;
+    ObSEArray<ObTabletID, 64> adapter_tablet_ids;
+    if (OB_SUCC(ret) && OB_FAIL(index_ls_mgr->collect_adaptor_tablet_ids(adapter_tablet_ids))) {
+      LOG_WARN("fail to collect task adapter tablets", KR(ret), K_(tenant_id), K_(ls_handle));
+    }
+    for (int64_t adapter_idx = 0; OB_SUCC(ret) && adapter_idx < adapter_tablet_ids.count()
+         && task_ctx_array.count() + current_task_cnt <= MAX_ASYNC_TASK_PROCESSING_COUNT; ++adapter_idx) {
+      const ObTabletID adapter_tablet_id = adapter_tablet_ids.at(adapter_idx);
+      ObPluginVectorIndexAdapterGuard adapter_guard;
+      if (OB_FAIL(index_ls_mgr->get_adapter_inst_guard(adapter_tablet_id, adapter_guard))) {
+        if (OB_HASH_NOT_EXIST == ret) {
+          ret = OB_SUCCESS;
+        } else {
+          LOG_WARN("fail to get task adapter", KR(ret), K_(tenant_id), K(adapter_tablet_id));
+        }
+        continue;
+      }
+      ObPluginVectorIndexAdaptor *adapter = adapter_guard.get_adatper();
+      ObTabletID tablet_id = adapter_tablet_id;
       if (OB_ISNULL(adapter)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected nullptr", K(ret));
@@ -161,7 +174,20 @@ int ObVecAsyncTaskExecutor::load_task(uint64_t &task_trace_base_num)
           continue;
         }
         const schema::ObTableSchema *data_schema = nullptr;
-        if (OB_FAIL(schema_guard.get_table_schema(
+        bool schema_active = false;
+        if (OB_FAIL(schema_checker.check_table(adapter->get_inc_table_id(), schema_active))) {
+          LOG_WARN("fail to check optimize task schema", KR(ret), K(tablet_id));
+          continue;
+        } else if (!schema_active) {
+          if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+            LOG_WARN("[VEC_SCHEMA_SKIP] skip optimize task for inactive schema",
+                     K_(tenant_id), K_(ls_handle), K(tablet_id), K(adapter->get_inc_table_id()));
+          } else {
+            LOG_DEBUG("[VEC_SCHEMA_SKIP] skip optimize task for inactive schema",
+                      K_(tenant_id), K_(ls_handle), K(tablet_id), K(adapter->get_inc_table_id()));
+          }
+          continue;
+        } else if (OB_FAIL(schema_guard.get_table_schema(
                 tenant_id_, adapter->get_data_table_id(), data_schema))) {
           LOG_WARN("failed to get data table schema before creating optimize task",
                    K(ret), K_(tenant_id), K(tablet_id),
@@ -238,7 +264,8 @@ int ObVecAsyncTaskExecutor::load_task(uint64_t &task_trace_base_num)
           if (OB_FAIL(ObVecIndexAsyncTaskUtil::estimate_task_memory(task_ctx, est_mem, adapter))) {
             LOG_WARN("fail to estimate optinal task memory", K(ret), K(tablet_id));
           } else if (OB_FALSE_IT(task_ctx->task_status_.task_info_.task_estimate_memory_ = est_mem)) {
-          } else if (OB_FAIL(index_ls_mgr->get_async_task_opt().add_task_ctx(tablet_id, task_ctx, inc_new_task))) { // not overwrite
+          } else if (OB_FAIL(try_add_task_ctx_for_adapter(
+                       *index_ls_mgr, adapter_tablet_id, adapter, task_ctx, inc_new_task))) {
             LOG_WARN("fail to add task ctx", K(ret));
           } else if (FALSE_IT(task_ctx_in_map = inc_new_task)) {
           } else if (inc_new_task && OB_FAIL(task_ctx_array.push_back(task_ctx))) {
@@ -307,7 +334,12 @@ int ObVecTaskManager::create_task(ObVecIndexAsyncTaskStatus initial_status)
   ObArray<ObVecIndexAsyncTaskCtx*> task_ctx_array;
   ObArenaAllocator allocator("VecTaskCtx", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
   common::hash::ObHashSet<ObTabletID> dedup_tablets;
-  if (OB_FAIL(ObDDLUtil::get_tablets(tenant_id_, index_table_id_, tablet_ids))) {
+  uint64_t task_table_id = index_table_id_;
+  if (task_type_ == ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_HYBRID_VECTOR_EMBEDDING
+      && OB_FAIL(ObVecIndexAsyncTaskUtil::get_embedding_snapshot_table_id(
+          tenant_id_, index_table_id_, task_table_id))) {
+    LOG_WARN("fail to resolve manual embedding snapshot table", KR(ret), K_(tenant_id), K_(index_table_id));
+  } else if (OB_FAIL(ObDDLUtil::get_tablets(tenant_id_, task_table_id, tablet_ids))) {
     LOG_WARN("failed to get tablet ids", K(ret));
   } else if (OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -317,7 +349,7 @@ int ObVecTaskManager::create_task(ObVecIndexAsyncTaskStatus initial_status)
                  "VecTaskDedup", "VecTaskDedup", tenant_id_))) {
     LOG_WARN("fail to create dedup tablet set", K(ret), K(tablet_ids.count()));
   } else if (OB_FAIL(ObVecIndexAsyncTaskUtil::get_tablets_with_standby_manual_task(
-                 tenant_id_, index_table_id_, task_type_, *GCTX.sql_proxy_, dedup_tablets))) {
+                 tenant_id_, task_table_id, task_type_, *GCTX.sql_proxy_, dedup_tablets))) {
     LOG_WARN("fail to get tablets with standby manual task", K(ret), K(tenant_id_), K(index_table_id_));
   } else {
     // Skip tablets that already have an identical STANDBY manual task; repeated
@@ -366,7 +398,7 @@ int ObVecTaskManager::create_task(ObVecIndexAsyncTaskStatus initial_status)
         task_ctx->tenant_id_ = tenant_id_;
         task_ctx->task_status_.tablet_id_ = tablet_id.id();
         task_ctx->task_status_.tenant_id_ = tenant_id_;
-        task_ctx->task_status_.table_id_ = index_table_id_;
+        task_ctx->task_status_.table_id_ = task_table_id;
         task_ctx->task_status_.task_id_ = new_task_id;
         task_ctx->task_status_.task_type_ = task_type_;
         task_ctx->task_status_.trigger_type_ = ObVecIndexAsyncTaskTriggerType::OB_VEC_TRIGGER_MANUAL;

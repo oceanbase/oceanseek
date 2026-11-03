@@ -677,7 +677,8 @@ public:
 
   int init(const int64_t capacity, const int64_t tenant_id, ObLSID &ls_id);
   void destroy();
-  int add_task_ctx(ObTabletID &tablet_id, ObVecIndexAsyncTaskCtx *task, bool &inc_new_task);
+  int add_task_ctx(ObTabletID &tablet_id, ObVecIndexAsyncTaskCtx *task, bool &inc_new_task,
+                   const bool check_truncate_version = true);
   int del_task_ctx(const common::ObTabletID &tablet_id, uint32_t task_type);
   int is_task_ctx_exist(const common::ObTabletID &tablet_id, uint32_t task_type, bool &is_exist);
   int get_task_ctx_status(const common::ObTabletID &tablet_id,
@@ -1060,6 +1061,23 @@ namespace schema
 class ObSchemaGetterGuard;
 }
 
+class ObVecIndexSchemaChecker final
+{
+public:
+  ObVecIndexSchemaChecker(const uint64_t tenant_id, schema::ObSchemaGetterGuard &schema_guard)
+      : tenant_id_(tenant_id), schema_guard_(schema_guard), schema_ready_(false)
+  {}
+  int check_table(const uint64_t table_id, bool &is_active);
+  int check_database(const uint64_t database_id, bool &is_active);
+
+private:
+  int prepare_schema_guard_();
+  uint64_t tenant_id_;
+  schema::ObSchemaGetterGuard &schema_guard_;
+  bool schema_ready_;
+  DISALLOW_COPY_AND_ASSIGN(ObVecIndexSchemaChecker);
+};
+
 class ObVecIndexAsyncTaskUtil final
 {
   static const int64_t DEFAULT_VEC_INSERT_BATCH_SIZE = 10;
@@ -1099,7 +1117,7 @@ public:
       const ObVecIndexTaskStatus &task_row,
       storage::ObLS *ls,
       storage::ObLSHandle &ls_handle,
-      ObVecIndexAsyncTaskOption &async_task_opt,
+      ObPluginVectorIndexMgr &index_ls_mgr,
       const bool verify_tablet_on_ls);
   static int delete_vec_task(
       uint64_t tenant_id,
@@ -1304,6 +1322,8 @@ public:
   static int get_vec_task_type_by_short_name(const char *name, ObVecIndexAsyncTaskType &type);
   static int get_truncate_version(
       uint64_t tenant_id, uint64_t table_id, int64_t &truncate_version);
+  static int get_embedding_snapshot_table_id(
+      uint64_t tenant_id, uint64_t index_table_id, uint64_t &snapshot_table_id);
   static int insert_new_task(uint64_t tenant_id, ObVecIndexTaskCtxArray &task_ctx_array);
   // Max STANDBY manual-trigger rows allowed in __all_vector_index_task per tenant.
   // Manual submission interfaces (dbms_vector.trigger_async_task / flush_index /

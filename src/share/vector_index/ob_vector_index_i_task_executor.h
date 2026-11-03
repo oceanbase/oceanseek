@@ -44,14 +44,25 @@ public:
   static int check_has_hnsw_ddl(
       const uint64_t tenant_id,
       common::hash::ObHashSet<uint64_t> &conflict_table_id_set,
-      common::hash::ObHashSet<uint64_t> &conflict_index_task_set);
+      common::hash::ObHashSet<uint64_t> &conflict_index_task_set,
+      common::hash::ObHashSet<uint64_t> *dropping_index_ids = nullptr);
+  static int get_dropping_index_ids(
+      const uint64_t tenant_id,
+      common::hash::ObHashSet<uint64_t> &dropping_index_ids);
   static int check_task_ddl_conflict(
       ObVecIndexAsyncTaskCtx *task_ctx,
       ObPluginVectorIndexMgr *index_ls_mgr,
       const common::hash::ObHashSet<uint64_t> &conflict_table_id_set,
       const common::hash::ObHashSet<uint64_t> &conflict_index_task_set,
+      const common::hash::ObHashSet<uint64_t> &dropping_index_ids,
       bool &is_conflict);
   static int check_task_result(ObVecIndexAsyncTaskCtx *task_ctx);
+  static int try_add_task_ctx_for_adapter(
+      ObPluginVectorIndexMgr &index_ls_mgr,
+      const common::ObTabletID &adapter_tablet_id,
+      ObPluginVectorIndexAdaptor *adapter,
+      ObVecIndexAsyncTaskCtx *task_ctx,
+      bool &inc_new_task);
 
 protected:
   struct ObVecTaskResultCheckAction

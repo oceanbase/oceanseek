@@ -26,15 +26,17 @@ int ObIvfAsyncTaskExecutor::LoadTaskCallback::is_cache_mgr_deprecated(ObIvfCache
 {
   int ret = OB_SUCCESS;
   is_deprecated = false;
-  const ObTableSchema *table_schema = nullptr;
+  bool schema_active = false;
   ObTabletHandle tablet_handle;
   ObLS *ls = nullptr;
   if (OB_ISNULL(ls = ls_handle_.get_ls())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ls is null", KR(ret));
-  } else if (OB_FAIL(schema_guard_.get_table_schema(tenant_id_, cache_mgr.get_table_id(), table_schema))) {
-    LOG_WARN("failed to get simple schema", KR(ret), K(tenant_id_), K(cache_mgr));
-  } else if (OB_ISNULL(table_schema) || table_schema->is_in_recyclebin()) {
+  } else if (OB_FAIL(schema_checker_.check_table(cache_mgr.get_table_id(), schema_active))) {
+    LOG_WARN("failed to check cache schema", KR(ret), K(tenant_id_), K(cache_mgr));
+  } else if (!schema_active) {
+    LOG_INFO("[VEC_SCHEMA_SKIP] clean IVF cache for inactive schema",
+             K(tenant_id_), K(ls_handle_), K(cache_mgr));
     is_deprecated = true;
   } else if (OB_FAIL(ls->get_tablet_svr()->get_tablet(
                  cache_mgr.get_cache_mgr_key().get_tablet_id(), tablet_handle))) {
@@ -48,11 +50,11 @@ int ObIvfAsyncTaskExecutor::LoadTaskCallback::is_cache_mgr_deprecated(ObIvfCache
   return ret;
 }
 
-int ObIvfAsyncTaskExecutor::LoadTaskCallback::operator()(IvfCacheMgrEntry &entry)
+int ObIvfAsyncTaskExecutor::LoadTaskCallback::load_clean_task(ObIvfCacheMgr &guarded_cache_mgr)
 {
   int ret = OB_SUCCESS;
-  ObTabletID tablet_id = entry.first.get_tablet_id();
-  ObIvfCacheMgr *cache_mgr = entry.second;
+  ObIvfCacheMgr *cache_mgr = &guarded_cache_mgr;
+  ObTabletID tablet_id = cache_mgr->get_cache_mgr_key().get_tablet_id();
   bool is_deprecated = false;
   if (OB_ISNULL(cache_mgr)) {
     ret = OB_ERR_UNEXPECTED;
@@ -444,6 +446,7 @@ int ObIvfAsyncTaskExecutor::check_schema_version_changed(bool &schema_changed)
 }
 
 int ObIvfAsyncTaskExecutor::generate_aux_table_info_map(ObSchemaGetterGuard &schema_guard,
+                                                       ObVecIndexSchemaChecker &schema_checker,
                                                        const int64_t table_id,
                                                        ObIvfAuxTableInfoMap &aux_table_info_map)
 {
@@ -453,8 +456,19 @@ int ObIvfAsyncTaskExecutor::generate_aux_table_info_map(ObSchemaGetterGuard &sch
   ObSEArray<uint64_t, 1> col_ids;
   ObIvfAuxTableInfo cur_aux_table_info;
   ObString index_prefix;
+  bool schema_active = false;
   if (is_sys_table(table_id)) {
     // do nothing
+  } else if (OB_FAIL(schema_checker.check_table(table_id, schema_active))) {
+    LOG_WARN("fail to check IVF load schema", KR(ret), K(table_id));
+  } else if (!schema_active) {
+    if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+      LOG_WARN("[VEC_SCHEMA_SKIP] skip IVF load for inactive schema",
+               K_(tenant_id), K_(ls_handle), K(table_id));
+    } else {
+      LOG_DEBUG("[VEC_SCHEMA_SKIP] skip IVF load for inactive schema",
+                K_(tenant_id), K_(ls_handle), K(table_id));
+    }
   } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id_, table_id, index_table_schema))) {
     LOG_WARN("failed to get simple schema", KR(ret), K(table_id));
   } else if (OB_ISNULL(index_table_schema)) {
@@ -534,6 +548,7 @@ int ObIvfAsyncTaskExecutor::generate_aux_table_info_map(ObIvfAuxTableInfoMap &au
   int64_t end_idx = 0;
   while (OB_SUCC(ret) && start_idx < table_id_array.count() && has_ivf_index) {
     ObSchemaGetterGuard schema_guard;
+    ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
     start_idx = end_idx;
     end_idx = MIN(table_id_array.count(), start_idx + DEFAULT_TABLE_ID_ARRAY_SIZE);
 
@@ -544,7 +559,7 @@ int ObIvfAsyncTaskExecutor::generate_aux_table_info_map(ObIvfAuxTableInfoMap &au
 
     for (int64_t idx = start_idx; OB_SUCC(ret) && idx < end_idx; ++idx) {
       const int64_t table_id = table_id_array.at(idx);
-      if (OB_FAIL(generate_aux_table_info_map(schema_guard, table_id, aux_table_info_map))) {
+      if (OB_FAIL(generate_aux_table_info_map(schema_guard, schema_checker, table_id, aux_table_info_map))) {
         LOG_WARN("fail to generate aux table info map for single table", K(ret), K(table_id));
       }
     }
@@ -580,10 +595,25 @@ int ObIvfAsyncTaskExecutor::load_task(uint64_t &task_trace_base_num)
         index_ls_mgr->get_async_task_opt(), tenant_id_, ls_handle_, scheduler_, task_status_array, schema_guard, task_trace_base_num);
     ObIvfAuxTableInfoMap aux_table_info_map;
 
-    if (OB_FAIL(index_ls_mgr->get_ivf_cache_mgr_map().foreach_refactored(
-            load_task_func))) {  // ivf clean task
-      LOG_WARN("fail to do load task each entry", K(ret), K(load_task_func));
-    } else if (index_ls_mgr->get_ls_leader()) {
+    ObSEArray<ObLSCacheMgrKeyPair, 64> cache_keys;
+    ObLSID ls_id = ls_handle_.get_ls()->get_ls_id();
+    if (OB_FAIL(index_ls_mgr->get_cache_keys(ls_id, cache_keys))) {
+      LOG_WARN("fail to collect IVF cache keys for clean tasks", KR(ret), K(ls_id));
+    }
+    for (int64_t cache_idx = 0; OB_SUCC(ret) && cache_idx < cache_keys.count(); ++cache_idx) {
+      const ObIvfCacheMgrKey &key = cache_keys.at(cache_idx).key_;
+      ObIvfCacheMgrGuard cache_guard;
+      if (OB_FAIL(index_ls_mgr->get_ivf_cache_mgr_guard(key, cache_guard))) {
+        if (OB_HASH_NOT_EXIST == ret) {
+          ret = OB_SUCCESS;
+        } else {
+          LOG_WARN("fail to get IVF cache for clean task", KR(ret), K(ls_id), K(key));
+        }
+      } else if (OB_FAIL(load_task_func.load_clean_task(*cache_guard.get_ivf_cache_mgr()))) {
+        LOG_WARN("fail to load IVF clean task", KR(ret), K(ls_id), K(key));
+      }
+    }
+    if (OB_SUCC(ret) && index_ls_mgr->get_ls_leader()) {
       if (OB_FAIL(generate_aux_table_info_map(aux_table_info_map))) {
         LOG_WARN("fail to generate aux table info map", K(ret), K(tenant_id_), K(ls_handle_));
       } else if (OB_FAIL(aux_table_info_map.foreach_refactored(load_task_func))) { // ivf load task

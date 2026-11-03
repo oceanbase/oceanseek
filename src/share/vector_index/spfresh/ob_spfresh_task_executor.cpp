@@ -630,8 +630,19 @@ int ObSpfreshTaskExecutor::submit_task(ObSpfreshTaskType task_type,
 {
   int ret = OB_SUCCESS;
   bool task_submitted = false;
+  bool dropped = false;
 
-  if (OB_FAIL(submit_task_if_absent_(task_type, index_table_id, tablet_id,
+  if (OB_FAIL(check_index_dropped_(index_table_id, dropped))) {
+    LOG_WARN("failed to check SPFresh submission schema", KR(ret), K(index_table_id), K(tablet_id));
+  } else if (dropped) {
+    if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+      LOG_WARN("[VEC_SCHEMA_SKIP] skip SPFresh submission for inactive schema",
+               K_(tenant_id), K(task_type), K(index_table_id), K(tablet_id), K(center_id));
+    } else {
+      LOG_DEBUG("[VEC_SCHEMA_SKIP] skip SPFresh submission for inactive schema",
+                K_(tenant_id), K(task_type), K(index_table_id), K(tablet_id), K(center_id));
+    }
+  } else if (OB_FAIL(submit_task_if_absent_(task_type, index_table_id, tablet_id,
       center_id, ns_id, ltable_id, task_submitted, cutover_modify_ts))) {
     LOG_WARN("failed to submit task", K(ret), K(task_type), K(index_table_id),
              K(tablet_id), K(center_id), K(ns_id), K(ltable_id));
@@ -720,18 +731,13 @@ int ObSpfreshTaskExecutor::check_index_dropped_(const uint64_t index_table_id, b
 {
   int ret = OB_SUCCESS;
   schema::ObSchemaGetterGuard schema_guard;
-  const schema::ObTableSchema *index_schema = nullptr;
+  ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
+  bool schema_active = false;
   dropped = false;
-  if (OB_INVALID_ID == index_table_id) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid SPFresh index table id", K(ret), K(index_table_id));
-  } else if (OB_FAIL(schema::ObMultiVersionSchemaService::get_instance()
-      .get_tenant_schema_guard(tenant_id_, schema_guard))) {
-    LOG_WARN("failed to get schema guard for SPFresh index", K(ret), K(index_table_id));
-  } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id_, index_table_id, index_schema))) {
-    LOG_WARN("failed to get SPFresh index schema", K(ret), K(index_table_id));
+  if (OB_FAIL(schema_checker.check_table(index_table_id, schema_active))) {
+    LOG_WARN("failed to check SPFresh index schema", KR(ret), K(index_table_id));
   } else {
-    dropped = OB_ISNULL(index_schema) || index_schema->is_in_recyclebin();
+    dropped = !schema_active;
   }
   return ret;
 }
@@ -1232,20 +1238,27 @@ int ObSpfreshTaskExecutor::recover_stuck_tasks_()
 int ObSpfreshTaskExecutor::check_and_submit_distribution_tasks_(
     ObIvfMapCentCache *map_cache,
     uint64_t tablet_id, uint64_t index_table_id,
-    int64_t ns_id, uint64_t ltable_id)
+    int64_t ns_id, uint64_t ltable_id,
+    ObVecIndexSchemaChecker &schema_checker)
 {
   int ret = OB_SUCCESS;
   ObSpfreshTaskQueue *queue = nullptr;
-  bool dropped = false;
+  bool schema_active = false;
 
   if (OB_ISNULL(map_cache)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("map cache is null", K(ret));
-  } else if (OB_FAIL(check_index_dropped_(index_table_id, dropped))) {
+  } else if (OB_FAIL(schema_checker.check_table(index_table_id, schema_active))) {
     LOG_WARN("failed to check SPFresh distribution index", K(ret), K(index_table_id));
-  } else if (dropped) {
+  } else if (!schema_active) {
     // Cache reclamation is asynchronous; do not schedule work from a dropped index's cache.
-    LOG_DEBUG("skip SPFresh distribution for dropped index", K(index_table_id));
+    if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+      LOG_WARN("[VEC_SCHEMA_SKIP] skip SPFresh distribution for inactive schema",
+               K_(tenant_id), K(index_table_id), K(tablet_id), K(ns_id), K(ltable_id));
+    } else {
+      LOG_DEBUG("[VEC_SCHEMA_SKIP] skip SPFresh distribution for inactive schema",
+                K_(tenant_id), K(index_table_id), K(tablet_id), K(ns_id), K(ltable_id));
+    }
   } else if (OB_FAIL(queue_map_.get_queue(tablet_id, queue))) {
     LOG_WARN("failed to get queue for distribution check", K(ret), K(tablet_id));
   } else if (OB_ISNULL(queue)) {
@@ -1501,6 +1514,8 @@ int ObSpfreshTaskExecutor::submit_merge_task_(
 int ObSpfreshTaskExecutor::check_all_spfresh_distributions_()
 {
   int ret = OB_SUCCESS;
+  schema::ObSchemaGetterGuard schema_guard;
+  ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
 
   if (OB_ISNULL(vector_index_service_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -1519,37 +1534,40 @@ int ObSpfreshTaskExecutor::check_all_spfresh_distributions_()
         LOG_WARN("ls mgr is null, skip", K(ls_iter->first));
         continue;
       }
-      common::RWLock::RLockGuard lock_guard(ls_mgr->get_ivf_cache_mgr_map_rwlock());
-      IvfCacheMgrMap &cache_map = ls_mgr->get_ivf_cache_mgr_map();
-      FOREACH_X(cache_iter, cache_map, OB_SUCC(ret)) {
+      ObSEArray<ObLSCacheMgrKeyPair, 64> cache_keys;
+      ObLSID ls_id = ls_iter->first;
+      if (OB_FAIL(ls_mgr->get_cache_keys(ls_id, cache_keys))) {
+        LOG_WARN("failed to collect SPFresh distribution cache keys", KR(ret), K(ls_id));
+      }
+      for (int64_t cache_idx = 0; OB_SUCC(ret) && cache_idx < cache_keys.count(); ++cache_idx) {
         ++cache_entry_count;
-        const ObIvfCacheMgrKey &key = cache_iter->first;
+        const ObIvfCacheMgrKey &key = cache_keys.at(cache_idx).key_;
         if (ObIvfCacheMgrKey::INVALID_NS_ID != key.namespace_id_) {
           ++valid_ns_count;
           uint64_t ltable_id = key.ltable_id_;
           if (OB_INVALID_ID != ltable_id) {
             ++valid_ltable_count;
-            if (OB_NOT_NULL(cache_iter->second)) {
-              ObIvfCacheMgr *cache_mgr = cache_iter->second;
-              ObIvfCacheMgrGuard cache_guard;
-              int set_ret = cache_guard.set_cache_mgr(cache_mgr);
-              if (OB_SUCCESS != set_ret) {
-                LOG_WARN("failed to set cache mgr guard", K(set_ret));
-              } else {
-                ObIvfMapCentCache *map_cache = nullptr;
-                int tmp_ret = cache_mgr->get_or_create_cache_node<ObIvfMapCentCache>(
-                    IvfCacheType::IVF_MAP_CENTROID_CACHE, map_cache);
-                if (OB_SUCCESS != tmp_ret) {
-                  LOG_WARN("failed to get map cache", K(tmp_ret));
-                } else if (OB_NOT_NULL(map_cache)) {
-                  ++checked_count;
-                  uint64_t index_table_id = static_cast<uint64_t>(cache_mgr->get_table_id());
-                  int check_ret = check_and_submit_distribution_tasks_(map_cache,
-                      key.tablet_id_.id(), index_table_id, key.namespace_id_, ltable_id);
-                  if (OB_SUCCESS != check_ret) {
-                    LOG_WARN("check_and_submit_distribution_tasks failed",
-                             K(check_ret), K(key.tablet_id_), K(index_table_id));
-                  }
+            ObIvfCacheMgrGuard cache_guard;
+            int guard_ret = ls_mgr->get_ivf_cache_mgr_guard(key, cache_guard);
+            if (OB_HASH_NOT_EXIST == guard_ret) {
+              LOG_DEBUG("SPFresh distribution cache removed", K(ls_id), K(key));
+            } else if (OB_SUCCESS != guard_ret) {
+              LOG_WARN("failed to get SPFresh distribution cache", KR(guard_ret), K(ls_id), K(key));
+            } else {
+              ObIvfCacheMgr *cache_mgr = cache_guard.get_ivf_cache_mgr();
+              ObIvfMapCentCache *map_cache = nullptr;
+              int tmp_ret = cache_mgr->get_or_create_cache_node<ObIvfMapCentCache>(
+                  IvfCacheType::IVF_MAP_CENTROID_CACHE, map_cache);
+              if (OB_SUCCESS != tmp_ret) {
+                LOG_WARN("failed to get map cache", K(tmp_ret));
+              } else if (OB_NOT_NULL(map_cache)) {
+                ++checked_count;
+                uint64_t index_table_id = static_cast<uint64_t>(cache_mgr->get_table_id());
+                int check_ret = check_and_submit_distribution_tasks_(map_cache,
+                    key.tablet_id_.id(), index_table_id, key.namespace_id_, ltable_id, schema_checker);
+                if (OB_SUCCESS != check_ret) {
+                  LOG_WARN("check_and_submit_distribution_tasks failed",
+                           K(check_ret), K(key.tablet_id_), K(index_table_id));
                 }
               }
             }

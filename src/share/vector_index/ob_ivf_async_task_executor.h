@@ -88,12 +88,13 @@ private:
           scheduler_(scheduler),
           task_status_array_(task_status_array),
           schema_guard_(schema_guard),
+          schema_checker_(tenant_id, schema_guard),
           task_trace_base_num_(task_trace_base_num)
     {}
 
     ~LoadTaskCallback() = default;
     int operator()(ObIvfAuxTableInfoEntry &entry);
-    int operator()(IvfCacheMgrEntry &entry);
+    int load_clean_task(ObIvfCacheMgr &cache_mgr);
     int is_cache_mgr_deprecated(ObIvfCacheMgr &cache_mgr, bool &is_deprecated);
     int is_cache_writable(const ObIvfAuxTableInfo &table_info, int64_t idx, bool &is_writable);
     TO_STRING_KV(K(task_opt_), K(trace_base_num_), K(tenant_id_), K(ls_handle_), KP_(scheduler));
@@ -106,12 +107,14 @@ private:
     ObVecIdxAsyncTaskScheduler *scheduler_;
     ObVecIndexTaskCtxArray &task_status_array_;
     ObSchemaGetterGuard &schema_guard_;
+    ObVecIndexSchemaChecker schema_checker_;
     uint64_t &task_trace_base_num_;
   };
 
   bool check_operation_allow() override;
   int generate_aux_table_info_map(ObIvfAuxTableInfoMap &aux_table_info_map);
-  int generate_aux_table_info_map(ObSchemaGetterGuard &schema_guard, const int64_t table_id,
+  int generate_aux_table_info_map(ObSchemaGetterGuard &schema_guard, ObVecIndexSchemaChecker &schema_checker,
+                                  const int64_t table_id,
                                   ObIvfAuxTableInfoMap &aux_table_info_map);
   int record_aux_table_info(ObSchemaGetterGuard &schema_guard,
                             const ObTableSchema &index_table_schema,

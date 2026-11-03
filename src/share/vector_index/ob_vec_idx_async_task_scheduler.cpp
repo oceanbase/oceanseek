@@ -752,6 +752,7 @@ int ObVecIdxAsyncTaskScheduler::finish_dropped_alter_param_parents_(
   ObMySQLTransaction trans;
   ObArenaAllocator allocator("AlterPrtClean", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id_);
   ObSchemaGetterGuard schema_guard;
+  ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
   if (alter_param_parent_cleanup_ids.empty()) {
   } else if (OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -781,7 +782,7 @@ int ObVecIdxAsyncTaskScheduler::finish_dropped_alter_param_parents_(
                  K(parent_task_id), K(parent_rows.count()));
       } else {
         ObVecIndexTaskStatus &parent = parent_rows.at(0);
-        const ObSimpleTableSchemaV2 *inc_table_schema = nullptr;
+        bool schema_active = false;
         const bool is_alter_param_parent =
             parent.tablet_id_.id() == static_cast<uint64_t>(-1)
             && parent.task_type_ == OB_VECTOR_ASYNC_ALTER_INDEX_PARAM
@@ -794,12 +795,10 @@ int ObVecIdxAsyncTaskScheduler::finish_dropped_alter_param_parents_(
         } else if (parent.status_ != OB_VECTOR_ASYNC_TASK_RUNNING) {
           LOG_INFO("skip alter param parent with unexpected status",
                    K(parent_task_id), K(parent.status_));
-        } else if (OB_FAIL(schema_guard.get_simple_table_schema(
-                       tenant_id_, parent.table_id_, inc_table_schema))) {
+        } else if (OB_FAIL(schema_checker.check_table(parent.table_id_, schema_active))) {
           LOG_WARN("fail to recheck dropped alter param parent schema",
                    KR(ret), K(parent_task_id), K(parent.table_id_));
-        } else if (OB_NOT_NULL(inc_table_schema)
-                   && !inc_table_schema->is_in_recyclebin()) {
+        } else if (schema_active) {
           LOG_INFO("skip alter param parent whose schema still exists",
                    K(parent_task_id), K(parent.table_id_));
         } else {
@@ -922,17 +921,34 @@ int ObVecIdxAsyncTaskScheduler::check_schema_version(bool &schema_version_change
 {
   int ret = OB_SUCCESS;
   ObSchemaGetterGuard schema_guard;
-  int64_t schema_version = 0;
-  if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(tenant_id_, schema_guard))) {
-    LOG_WARN("fail to get schema guard", K(ret), K_(tenant_id));
+  const ObSimpleTenantSchema *tenant_schema = nullptr;
+  int64_t schema_version = OB_INVALID_VERSION;
+  int64_t tenant_schema_version = OB_INVALID_VERSION;
+  schema_version_changed = false;
+  if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(
+          tenant_id_, schema_guard))) {
+    LOG_WARN("fail to get schema guard", KR(ret), K_(tenant_id));
   } else if (OB_FAIL(schema_guard.get_schema_version(tenant_id_, schema_version))) {
-    LOG_WARN("fail to get tenant schema version", K(ret), K_(tenant_id));
-  } else if (!ObSchemaService::is_formal_version(schema_version)) {
+    LOG_WARN("fail to get tenant schema version", KR(ret), K_(tenant_id));
+  } else if (OB_FAIL(schema_guard.get_tenant_info(tenant_id_, tenant_schema))) {
+    LOG_WARN("fail to get tenant schema", KR(ret), K_(tenant_id));
+  } else if (OB_ISNULL(tenant_schema)) {
+    ret = OB_TENANT_NOT_EXIST;
+    LOG_WARN("tenant schema does not exist", KR(ret), K_(tenant_id));
+  } else if (FALSE_IT(tenant_schema_version = tenant_schema->get_schema_version())) {
+  } else if (schema_version <= 0 || tenant_schema_version <= 0
+             || !ObSchemaService::is_formal_version(schema_version)
+             || !ObSchemaService::is_formal_version(tenant_schema_version)) {
     ret = OB_EAGAIN;
-    LOG_INFO("is not a formal_schema_version", KR(ret), K(schema_version));
-  } else if (local_schema_version_ == OB_INVALID_VERSION ||  local_schema_version_ < schema_version) {
-    FLOG_INFO("schema changed", KR(ret), K_(local_schema_version), K(schema_version));
+    LOG_INFO("schema versions are not ready", KR(ret), K_(tenant_id),
+             K(schema_version), K(tenant_schema_version));
+  } else if (local_schema_version_ != schema_version
+             || local_tenant_schema_version_ != tenant_schema_version) {
+    // Tenant recycle/flashback only changes the tenant object in sys schema.
+    FLOG_INFO("schema changed", KR(ret), K_(tenant_id), K_(local_schema_version), K(schema_version),
+              K_(local_tenant_schema_version), K(tenant_schema_version));
     local_schema_version_ = schema_version;
+    local_tenant_schema_version_ = tenant_schema_version;
     schema_version_changed = true;
   }
   return ret;
@@ -1108,6 +1124,8 @@ int ObVecIdxAsyncTaskScheduler::clean_deprecated_adapters(
   if (OB_SUCC(ret)) {
     ObSEArray<ObTabletID, DEFAULT_TABLE_ARRAY_SIZE> detach_tablet_id_array;
     ObSEArray<ObTabletID, DEFAULT_TABLE_ARRAY_SIZE> remove_tenant_tablet_id_array;
+    ObSchemaGetterGuard schema_guard;
+    ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
 
     for (int64_t i = 0; OB_SUCC(ret) && i < local_tablet_id_array.count(); i++) {
       if (mgr->is_ls_destroying()) {
@@ -1117,10 +1135,8 @@ int ObVecIdxAsyncTaskScheduler::clean_deprecated_adapters(
       const ObTabletID tablet_id = local_tablet_id_array.at(i);
       ObPluginVectorIndexAdapterGuard local_guard;
       ObPluginVectorIndexAdapterGuard tenant_guard;
-      ObSchemaGetterGuard schema_guard;
       const ObSimpleTableSchemaV2 *inc_table_schema = nullptr;
-      const ObSimpleTableSchemaV2 *data_table_schema = nullptr;
-      uint64_t data_table_id = OB_INVALID_ID;
+      bool schema_active = false;
       ObTabletHandle tablet_handle;
       bool need_detach = false;
       bool need_remove_tenant = false;
@@ -1139,9 +1155,16 @@ int ObVecIdxAsyncTaskScheduler::clean_deprecated_adapters(
       } else if (tenant_ret != OB_SUCCESS && tenant_ret != OB_HASH_NOT_EXIST) {
         ret = tenant_ret;
         LOG_WARN("failed to get tenant adaptor guard", KR(ret), K(tablet_id));
-      } else if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(
-                     tenant_id_, schema_guard))) {
-        LOG_WARN("fail to get schema guard", KR(ret), K_(tenant_id));
+      } else if (OB_FAIL(schema_checker.check_table(
+                     local_guard.get_adatper()->get_inc_table_id(), schema_active))) {
+        LOG_WARN("fail to check adapter schema", KR(ret), K_(tenant_id), K(tablet_id));
+        ret = OB_SUCCESS;
+        continue;
+      } else if (!schema_active) {
+        LOG_INFO("[VEC_SCHEMA_SKIP] remove adapter for inactive schema",
+                 K_(tenant_id), K(mgr->get_ls_id()), K(tablet_id), K(local_guard.get_adatper()->get_inc_table_id()));
+        need_detach = true;
+        need_remove_tenant = true;
       } else if (OB_FAIL(schema_guard.get_simple_table_schema(
                      tenant_id_, local_guard.get_adatper()->get_inc_table_id(), inc_table_schema))) {
         LOG_WARN("failed to get inc table schema", KR(ret), K_(tenant_id),
@@ -1149,18 +1172,6 @@ int ObVecIdxAsyncTaskScheduler::clean_deprecated_adapters(
         ret = OB_SUCCESS; // override error to success, not critical
       } else if (OB_ISNULL(inc_table_schema) || inc_table_schema->is_in_recyclebin()) {
         LOG_INFO("remove adapter if inc table not exist or is in recyclebin", K(tablet_id));
-        need_detach = true;
-        need_remove_tenant = true;
-      } else if (FALSE_IT(data_table_id = local_guard.get_adatper()->get_data_table_id())) {
-      } else if (OB_INVALID_ID != data_table_id
-                 && OB_FAIL(schema_guard.get_simple_table_schema(
-                        tenant_id_, data_table_id, data_table_schema))) {
-        LOG_WARN("failed to get data table schema", KR(ret), K_(tenant_id), K(data_table_id));
-        ret = OB_SUCCESS; // override error to success, not critical
-      } else if (OB_INVALID_ID != data_table_id
-                 && (OB_ISNULL(data_table_schema) || data_table_schema->is_in_recyclebin())) {
-        LOG_INFO("remove adapter if data table not exist or is in recyclebin",
-                 K(tablet_id), K(data_table_id));
         need_detach = true;
         need_remove_tenant = true;
       } else if (clear_ls_follower_adapter) {
@@ -1286,6 +1297,8 @@ void ObVecIdxAsyncTaskScheduler::clean_deprecated_ivf_caches(
     LOG_WARN("invalid argument", K(ret), KP(ls), KP(mgr));
   } else {
     {
+      ObSchemaGetterGuard schema_guard;
+      ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
       // Keep the legacy locking behavior: validate every cache manager while
       // holding the map read lock, and only erase after releasing the lock.
       RWLock::RLockGuard lock_guard(mgr->get_ivf_cache_mgr_map_rwlock());
@@ -1301,16 +1314,13 @@ void ObVecIdxAsyncTaskScheduler::clean_deprecated_ivf_caches(
           LOG_WARN("get null cache mgr skip current loop", KR(ret), K(cache_tablet_id));
           continue;
         }
-        ObSchemaGetterGuard schema_guard;
-        const ObSimpleTableSchemaV2 *simple_table_schema = nullptr;
-        if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(
-                tenant_id_, schema_guard))) {
-          LOG_WARN("fail to get schema guard", KR(ret), K_(tenant_id));
-        } else if (OB_FAIL(schema_guard.get_simple_table_schema(
-                       tenant_id_, cache_mgr->get_table_id(), simple_table_schema))) {
-          LOG_WARN("failed to get simple table schema",
+        bool schema_active = false;
+        if (OB_FAIL(schema_checker.check_table(cache_mgr->get_table_id(), schema_active))) {
+          LOG_WARN("failed to check cache table schema",
                    KR(ret), K_(tenant_id), K(cache_mgr->get_table_id()));
-        } else if (OB_ISNULL(simple_table_schema) || simple_table_schema->is_in_recyclebin()) {
+        } else if (!schema_active) {
+          LOG_INFO("[VEC_SCHEMA_SKIP] remove IVF cache for inactive schema",
+                   K_(tenant_id), K(mgr->get_ls_id()), K(cache_mgr_key), K(cache_mgr->get_table_id()));
           need_delete = true;
         }
         if (!need_delete && OB_SUCC(ret)) {
@@ -1559,6 +1569,7 @@ int ObVecIdxAsyncTaskScheduler::execute_adapter_maintenance_for_ls(
     // Phase 1: collect tablet info into ctx_map (non-shared) and shared_map (shared)
     while (OB_SUCC(ret) && need_maintenance && start_idx < vec_table_id_array.count()) {
       ObSchemaGetterGuard schema_guard;
+      ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
       start_idx = end_idx;
       end_idx = MIN(vec_table_id_array.count(), start_idx + TABLE_GENERATE_BATCH_SIZE);
       bool is_vector_index = false;
@@ -1569,6 +1580,7 @@ int ObVecIdxAsyncTaskScheduler::execute_adapter_maintenance_for_ls(
       for (int64_t idx = start_idx; OB_SUCC(ret) && idx < end_idx; ++idx) {
         const int64_t table_id = vec_table_id_array.at(idx);
         const ObSimpleTableSchemaV2 *table_schema = nullptr;
+        bool schema_active = false;
         if (is_sys_table(table_id)) {
           // do nothing
         } else if (OB_FAIL(schema_guard.get_simple_table_schema(tenant_id_, table_id, table_schema))) {
@@ -1578,6 +1590,16 @@ int ObVecIdxAsyncTaskScheduler::execute_adapter_maintenance_for_ls(
           LOG_WARN("table schema is null", K(ret), K(table_id), K_(tenant_id));
         } else if (table_schema->is_in_recyclebin()) {
           // do nothing
+        } else if (OB_FAIL(schema_checker.check_table(table_id, schema_active))) {
+          LOG_WARN("fail to check schema before creating adapter", KR(ret), K(table_id));
+        } else if (!schema_active) {
+          if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+            LOG_WARN("[VEC_SCHEMA_SKIP] skip adapter creation for inactive schema",
+                     K_(tenant_id), K(ls->get_ls_id()), K(table_id), K(table_schema->get_database_id()));
+          } else {
+            LOG_DEBUG("[VEC_SCHEMA_SKIP] skip adapter creation for inactive schema",
+                      K_(tenant_id), K(ls->get_ls_id()), K(table_id), K(table_schema->get_database_id()));
+          }
         } else if (table_schema->is_unavailable_index()) {
           LOG_INFO("skip unavailable index during maintenance",
                    K(table_id), K(table_schema->get_table_name()));
@@ -1763,11 +1785,8 @@ int ObVecIdxAsyncTaskScheduler::remove_zero_ls_ref_tenant_adaptors()
 int ObVecIdxAsyncTaskScheduler::check_and_execute_ivf_cache_maintenance_tasks_()
 {
   int ret = OB_SUCCESS;
-  bool schema_version_changed = false;
   ObSEArray<share::ObLSID, DEFAULT_LS_EXECUTOR_MAP_SIZE> follower_ls_ids;
-  if (OB_FAIL(check_schema_version(schema_version_changed))) {
-    LOG_WARN("fail to check schema version for ivf cache", KR(ret), K_(tenant_id));
-  } else {
+  {
     common::ObSpinLockGuard guard(ls_executor_lock_);
     LSIndexMgrMap &mgr_map = service_->get_ls_index_mgr_map();
     FOREACH_X(iter, ls_leader_executor_map_, OB_SUCC(ret)) {
@@ -3222,6 +3241,8 @@ struct ObVecTriggeredReadyItem
 int ObVecIdxAsyncTaskScheduler::load_triggered_tasks_()
 {
   int ret = OB_SUCCESS;
+  ObSchemaGetterGuard task_schema_guard;
+  ObVecIndexSchemaChecker schema_checker(tenant_id_, task_schema_guard);
   if (OB_UNLIKELY(ERRSIM_VEC_SKIP_LOAD_TRIGGERED_TASKS)) {
     LOG_WARN("ERRSIM_VEC_SKIP_LOAD_TRIGGERED_TASKS injected, skip loading triggered tasks",
              K_(tenant_id));
@@ -3288,9 +3309,22 @@ int ObVecIdxAsyncTaskScheduler::load_triggered_tasks_()
                   || row.task_type_ == ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_INDEX_MERGE);
           ObLSHandle ls_handle;
           int tmp_ret = OB_SUCCESS;
+          bool schema_active = false;
           if (!is_manual && !is_alter_child) {
             LOG_TRACE("skip unsupported standby task", K(row));
             continue;
+          } else if (OB_SUCCESS != (tmp_ret = schema_checker.check_table(row.table_id_, schema_active))) {
+            LOG_WARN("fail to check triggered task schema", KR(tmp_ret), K(row));
+            continue;
+          } else if (!schema_active) {
+            int finish_ret = finish_triggered_task_(
+                row, OB_CANCELED, ObVecIndexAsyncTaskStatus::OB_VECTOR_ASYNC_TASK_STANDBY);
+            if (OB_SUCCESS != finish_ret) {
+              LOG_WARN("fail to finish triggered task for inactive schema", KR(finish_ret), K(row));
+            } else {
+              LOG_INFO("[VEC_SCHEMA_SKIP] cancelled triggered task for inactive schema",
+                       K_(tenant_id), K(row));
+            }
           } else if (OB_SUCCESS != (tmp_ret = find_ls_holding_tablet_(tablet_id, ls_handle))) {
             // Tablet not located on any LS on this observer (OB_ENTRY_NOT_EXIST), or a
             // transient error occurred during the scan. We must NOT finish the task
@@ -3609,6 +3643,7 @@ int ObVecIdxAsyncTaskScheduler::load_alter_param_parent_infos_(
   ObVecIndexTaskStatusField tablet_filter;
   ObSchemaGetterGuard schema_guard;
   int64_t schema_version = OB_INVALID_VERSION;
+  ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
   parent_infos.reset();
   tenant_filter.field_name_ = "tenant_id";
   tenant_filter.type_ = ObVecIndexTaskStatusField::UINT_TYPE;
@@ -3652,7 +3687,7 @@ int ObVecIdxAsyncTaskScheduler::load_alter_param_parent_infos_(
     for (int64_t i = 0; OB_SUCC(ret) && i < parent_rows.count(); ++i) {
       const ObVecIndexTaskStatus &row = parent_rows.at(i);
       ObVecAlterParamParentInfo info;
-      const ObSimpleTableSchemaV2 *inc_table_schema = nullptr;
+      bool schema_active = false;
       bool parent_dropped = false;
       if (!row.task_info_.alter_param_info_.is_parent_valid()) {
         ret = OB_INVALID_ARGUMENT;
@@ -3662,16 +3697,18 @@ int ObVecIdxAsyncTaskScheduler::load_alter_param_parent_infos_(
         info.task_id_ = row.task_id_;
         info.trace_id_ = row.trace_id_;
         info.task_info_ = row.task_info_.alter_param_info_;
-        if (OB_FAIL(schema_guard.get_simple_table_schema(
-                tenant_id_, info.table_id_, inc_table_schema))) {
-          LOG_WARN("fail to get incremental table schema for alter param parent",
+        if (OB_FAIL(schema_checker.check_table(info.table_id_, schema_active))) {
+          LOG_WARN("fail to check schema for alter param parent",
                    KR(ret), K(info));
-        } else if (OB_ISNULL(inc_table_schema) || inc_table_schema->is_in_recyclebin()) {
+        } else if (!schema_active) {
           parent_dropped = true;
           int tmp_ret = record_alter_param_parent_cleanup_(info.task_id_);
           if (OB_SUCCESS != tmp_ret) {
             LOG_WARN("fail to recover dropped alter param parent cleanup",
                      KR(tmp_ret), K(info));
+          } else {
+            LOG_INFO("[VEC_SCHEMA_SKIP] queued alter param parent cleanup for inactive schema",
+                     K_(tenant_id), K(info));
           }
         }
         if (OB_SUCC(ret) && !parent_dropped
@@ -3741,6 +3778,7 @@ int ObVecIdxAsyncTaskScheduler::check_and_schedule_leader_ls_tasks(
   int ret = OB_SUCCESS;
   common::hash::ObHashSet<uint64_t> conflict_table_id_set;
   common::hash::ObHashSet<uint64_t> conflict_index_task_set;
+  common::hash::ObHashSet<uint64_t> dropping_index_ids;
   bool ddl_conflict_checked = false;
   {
     int tmp_ret = OB_SUCCESS;
@@ -3748,7 +3786,10 @@ int ObVecIdxAsyncTaskScheduler::check_and_schedule_leader_ls_tasks(
       LOG_INFO("fail to create conflict_table_id_set, skip DDL conflict check", K(tmp_ret));
     } else if (OB_TMP_FAIL(conflict_index_task_set.create(16))) {
       LOG_INFO("fail to create conflict_index_task_set, skip DDL conflict check", K(tmp_ret));
-    } else if (OB_TMP_FAIL(ObVecITaskExecutor::check_has_hnsw_ddl(tenant_id_, conflict_table_id_set, conflict_index_task_set))) {
+    } else if (OB_TMP_FAIL(dropping_index_ids.create(16))) {
+      LOG_WARN("fail to create dropping index set, skip DDL conflict check", KR(tmp_ret), K_(tenant_id));
+    } else if (OB_TMP_FAIL(ObVecITaskExecutor::check_has_hnsw_ddl(
+                   tenant_id_, conflict_table_id_set, conflict_index_task_set, &dropping_index_ids))) {
       LOG_INFO("fail to check hnsw ddl, skip DDL conflict check", K(tmp_ret));
     } else {
       ddl_conflict_checked = true;
@@ -3806,7 +3847,7 @@ int ObVecIdxAsyncTaskScheduler::check_and_schedule_leader_ls_tasks(
                     int tmp_ret = OB_SUCCESS;
                     if (OB_TMP_FAIL(ObVecITaskExecutor::check_task_ddl_conflict(
                             task_ctx, index_ls_mgr,
-                            conflict_table_id_set, conflict_index_task_set, is_conflict))) {
+                            conflict_table_id_set, conflict_index_task_set, dropping_index_ids, is_conflict))) {
                       LOG_WARN("fail to check ddl conflict for running task", K(tmp_ret), KPC(task_ctx));
                     }
                     if (is_conflict) {
@@ -3847,7 +3888,7 @@ int ObVecIdxAsyncTaskScheduler::check_and_schedule_leader_ls_tasks(
                     int tmp_ret = OB_SUCCESS;
                     if (OB_TMP_FAIL(ObVecITaskExecutor::check_task_ddl_conflict(
                             task_ctx, index_ls_mgr,
-                            conflict_table_id_set, conflict_index_task_set, is_conflict))) {
+                            conflict_table_id_set, conflict_index_task_set, dropping_index_ids, is_conflict))) {
                       LOG_WARN("fail to check ddl conflict, treat as no conflict", K(tmp_ret), KPC(task_ctx));
                     }
                     if (is_conflict) {
@@ -3992,6 +4033,7 @@ int ObVecIdxAsyncTaskScheduler::check_and_schedule_follower_ls_tasks(
   int ret = OB_SUCCESS;
   common::hash::ObHashSet<uint64_t> conflict_table_id_set;
   common::hash::ObHashSet<uint64_t> conflict_index_task_set;
+  common::hash::ObHashSet<uint64_t> dropping_index_ids;
   bool ddl_conflict_checked = false;
   {
     int tmp_ret = OB_SUCCESS;
@@ -3999,7 +4041,10 @@ int ObVecIdxAsyncTaskScheduler::check_and_schedule_follower_ls_tasks(
       LOG_INFO("fail to create conflict_table_id_set, skip DDL conflict check", K(tmp_ret));
     } else if (OB_TMP_FAIL(conflict_index_task_set.create(16))) {
       LOG_INFO("fail to create conflict_index_task_set, skip DDL conflict check", K(tmp_ret));
-    } else if (OB_TMP_FAIL(ObVecITaskExecutor::check_has_hnsw_ddl(tenant_id_, conflict_table_id_set, conflict_index_task_set))) {
+    } else if (OB_TMP_FAIL(dropping_index_ids.create(16))) {
+      LOG_WARN("fail to create dropping index set, skip DDL conflict check", KR(tmp_ret), K_(tenant_id));
+    } else if (OB_TMP_FAIL(ObVecITaskExecutor::check_has_hnsw_ddl(
+                   tenant_id_, conflict_table_id_set, conflict_index_task_set, &dropping_index_ids))) {
       LOG_INFO("fail to check hnsw ddl, skip DDL conflict check", K(tmp_ret));
     } else {
       ddl_conflict_checked = true;
@@ -4057,7 +4102,7 @@ int ObVecIdxAsyncTaskScheduler::check_and_schedule_follower_ls_tasks(
                     int tmp_ret = OB_SUCCESS;
                     if (OB_TMP_FAIL(ObVecITaskExecutor::check_task_ddl_conflict(
                             task_ctx, index_ls_mgr,
-                            conflict_table_id_set, conflict_index_task_set, is_conflict))) {
+                            conflict_table_id_set, conflict_index_task_set, dropping_index_ids, is_conflict))) {
                       LOG_WARN("fail to check ddl conflict for running task", K(tmp_ret), KPC(task_ctx));
                     }
                     if (is_conflict) {
@@ -4098,7 +4143,7 @@ int ObVecIdxAsyncTaskScheduler::check_and_schedule_follower_ls_tasks(
                     int tmp_ret = OB_SUCCESS;
                     if (OB_TMP_FAIL(ObVecITaskExecutor::check_task_ddl_conflict(
                             task_ctx, index_ls_mgr,
-                            conflict_table_id_set, conflict_index_task_set, is_conflict))) {
+                            conflict_table_id_set, conflict_index_task_set, dropping_index_ids, is_conflict))) {
                       LOG_WARN("fail to check ddl conflict, treat as no conflict", K(tmp_ret), KPC(task_ctx));
                     }
                     if (is_conflict) {
@@ -4333,6 +4378,7 @@ int ObVecIdxAsyncTaskScheduler::pop_tasks_to_work()
 
     common::hash::ObHashSet<uint64_t> conflict_table_id_set;
     common::hash::ObHashSet<uint64_t> conflict_index_task_set;
+    common::hash::ObHashSet<uint64_t> dropping_index_ids;
     bool ddl_conflict_checked = false;
     {
       int tmp_ret = OB_SUCCESS;
@@ -4340,7 +4386,10 @@ int ObVecIdxAsyncTaskScheduler::pop_tasks_to_work()
         LOG_INFO("fail to create conflict_table_id_set, skip DDL conflict check", K(tmp_ret));
       } else if (OB_TMP_FAIL(conflict_index_task_set.create(16))) {
         LOG_INFO("fail to create conflict_index_task_set, skip DDL conflict check", K(tmp_ret));
-      } else if (OB_TMP_FAIL(ObVecITaskExecutor::check_has_hnsw_ddl(tenant_id_, conflict_table_id_set, conflict_index_task_set))) {
+      } else if (OB_TMP_FAIL(dropping_index_ids.create(16))) {
+        LOG_WARN("fail to create dropping index set, skip DDL conflict check", KR(tmp_ret), K_(tenant_id));
+      } else if (OB_TMP_FAIL(ObVecITaskExecutor::check_has_hnsw_ddl(
+                     tenant_id_, conflict_table_id_set, conflict_index_task_set, &dropping_index_ids))) {
         LOG_INFO("fail to check hnsw ddl, skip DDL conflict check", K(tmp_ret));
       } else {
         ddl_conflict_checked = true;
@@ -4455,7 +4504,7 @@ int ObVecIdxAsyncTaskScheduler::pop_tasks_to_work()
         int tmp_ret = OB_SUCCESS;
         if (OB_TMP_FAIL(ObVecITaskExecutor::check_task_ddl_conflict(
                 task_ctx, index_ls_mgr,
-                conflict_table_id_set, conflict_index_task_set, is_conflict))) {
+                conflict_table_id_set, conflict_index_task_set, dropping_index_ids, is_conflict))) {
           LOG_WARN("fail to check ddl conflict in pop, treat as no conflict", K(tmp_ret), KPC(task_ctx));
         }
         if (is_conflict) {

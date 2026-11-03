@@ -32,6 +32,8 @@ int ObVecEmbeddingAsyncTaskExecutor::load_triggered_task(const ObVecIndexTaskSta
 int ObVecEmbeddingAsyncTaskExecutor::load_task(uint64_t &task_trace_base_num)
 {
   int ret = OB_SUCCESS;
+  ObSchemaGetterGuard schema_guard;
+  ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
   ObPluginVectorIndexMgr *index_ls_mgr = nullptr;
   ObArray<ObVecIndexAsyncTaskCtx*> task_ctx_array;
   if (IS_NOT_INIT) {
@@ -50,24 +52,46 @@ int ObVecEmbeddingAsyncTaskExecutor::load_task(uint64_t &task_trace_base_num)
     ObVecIndexAsyncTaskOption &task_opt = index_ls_mgr->get_async_task_opt();
     ObIAllocator *allocator = task_opt.get_allocator();
     const int64_t current_task_cnt = ObVecIndexAsyncTaskUtil::get_processing_task_cnt(task_opt);
-    ObSEArray<ObAdapterMapKeyValue, 4> adapter_array;
-    ObAdapterMapFunc adapter_map_func(adapter_array);
-
-    RWLock::RLockGuard lock_guard(index_ls_mgr->get_adapter_map_lock());
-    if (OB_FAIL(index_ls_mgr->get_vec_adaptor_map().foreach_refactored(adapter_map_func))) {
-      LOG_WARN("fail to foreach adapter map", KR(ret));
+    ObSEArray<ObTabletID, 64> adapter_tablet_ids;
+    if (OB_SUCC(ret) && OB_FAIL(index_ls_mgr->collect_adaptor_tablet_ids(adapter_tablet_ids))) {
+      LOG_WARN("fail to collect task adapter tablets", KR(ret), K_(tenant_id), K_(ls_handle));
     }
-    FOREACH_X(iter, adapter_array, OB_SUCC(ret) && (task_ctx_array.count() + current_task_cnt <= MAX_ASYNC_TASK_PROCESSING_COUNT)) {
-      ObTabletID snap_tablet_id = iter->tablet_id_;
-      ObPluginVectorIndexAdaptor *adapter = iter->adapter_;
+    for (int64_t adapter_idx = 0; OB_SUCC(ret) && adapter_idx < adapter_tablet_ids.count()
+         && task_ctx_array.count() + current_task_cnt <= MAX_ASYNC_TASK_PROCESSING_COUNT; ++adapter_idx) {
+      const ObTabletID adapter_tablet_id = adapter_tablet_ids.at(adapter_idx);
+      ObPluginVectorIndexAdapterGuard adapter_guard;
+      if (OB_FAIL(index_ls_mgr->get_adapter_inst_guard(adapter_tablet_id, adapter_guard))) {
+        if (OB_HASH_NOT_EXIST == ret) {
+          ret = OB_SUCCESS;
+        } else {
+          LOG_WARN("fail to get task adapter", KR(ret), K_(tenant_id), K(adapter_tablet_id));
+        }
+        continue;
+      }
+      ObPluginVectorIndexAdaptor *adapter = adapter_guard.get_adatper();
+      ObTabletID snap_tablet_id = OB_ISNULL(adapter) ? ObTabletID() : adapter->get_snap_tablet_id();
       int64_t index_table_id = OB_INVALID_ID;
       if (OB_ISNULL(adapter)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected nullptr", K(ret));
-      } else if (! adapter->is_snap_tablet_valid() || snap_tablet_id != adapter->get_snap_tablet_id()) {
+      } else if (!adapter->is_snap_tablet_valid()) {
         LOG_DEBUG("index table id is invalid, skip", K(ret)); // skip to next
       } else if (OB_FALSE_IT(index_table_id = adapter->get_snapshot_table_id())) {
       } else if (adapter->is_hybrid_index() && adapter->check_need_embedding()) {
+        bool schema_active = false;
+        if (OB_FAIL(schema_checker.check_table(index_table_id, schema_active))) {
+          LOG_WARN("fail to check embedding task schema", KR(ret), K(index_table_id), K(snap_tablet_id));
+          continue;
+        } else if (!schema_active) {
+          if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+            LOG_WARN("[VEC_SCHEMA_SKIP] skip embedding task for inactive schema",
+                     K_(tenant_id), K_(ls_handle), K(snap_tablet_id), K(index_table_id));
+          } else {
+            LOG_DEBUG("[VEC_SCHEMA_SKIP] skip embedding task for inactive schema",
+                      K_(tenant_id), K_(ls_handle), K(snap_tablet_id), K(index_table_id));
+          }
+          continue;
+        }
         share::SCN last_empty_scn = adapter->get_last_empty_scan_scn();
         if (last_empty_scn.is_valid()) {
           bool has_new_delta = true;
@@ -129,6 +153,7 @@ int ObVecEmbeddingAsyncTaskExecutor::load_task(uint64_t &task_trace_base_num)
           task_ctx->tenant_id_ = tenant_id_;
           task_ctx->ls_handle_ = ls_handle_;
           task_ctx->task_status_.tablet_id_ = snap_tablet_id.id();
+          task_ctx->task_status_.inc_tablet_id_ = adapter->get_inc_tablet_id();
           task_ctx->task_status_.tenant_id_ = tenant_id_;
           task_ctx->task_status_.table_id_ = index_table_id;
           task_ctx->task_status_.task_id_ = new_task_id;
@@ -139,7 +164,8 @@ int ObVecEmbeddingAsyncTaskExecutor::load_task(uint64_t &task_trace_base_num)
           task_ctx->task_status_.trace_id_ = new_trace_id;
           task_ctx->task_status_.target_scn_.convert_from_ts(ObTimeUtility::current_time());
           task_ctx->allocator_.set_tenant_id(tenant_id_);
-          if (OB_FAIL(index_ls_mgr->get_async_task_opt().add_task_ctx(snap_tablet_id, task_ctx, inc_new_task))) { // not overwrite
+          if (OB_FAIL(try_add_task_ctx_for_adapter(
+                       *index_ls_mgr, adapter_tablet_id, adapter, task_ctx, inc_new_task))) {
             LOG_WARN("fail to add task ctx", K(ret));
           } else if (FALSE_IT(task_ctx_in_map = inc_new_task)) {
           } else if (inc_new_task && OB_FAIL(task_ctx_array.push_back(task_ctx))) {
@@ -243,6 +269,9 @@ int ObHybridVectorRefreshTask::do_work()
   } else {
     LOG_INFO("[VEC_ASYNC_TASK] start do_work", K(ret), K(task_ctx->status_), K(task_ctx->task_status_), K(ls_id_));
   }
+  if (OB_SUCC(ret)) {
+    DEBUG_SYNC(HANDLE_VECTOR_INDEX_ASYNC_TASK);
+  }
   while (OB_SUCC(ret) && !exec_finish) {
     switch (current_status()) {
       case ObHybridVectorRefreshTaskStatus::TASK_PREPARE:
@@ -305,10 +334,16 @@ int ObHybridVectorRefreshTask::prepare_for_task()
   int ret = OB_SUCCESS;
   ObHybridVectorRefreshTaskCtx *task_ctx = static_cast<ObHybridVectorRefreshTaskCtx *>(get_task_ctx());
   const uint64_t timeout_us = ObTimeUtility::current_time() + ObInsertLobColumnHelper::LOB_TX_TIMEOUT;
-  if (OB_ISNULL(task_ctx)) {
+  if (OB_ISNULL(task_ctx) || OB_ISNULL(vec_idx_mgr_)) {
     ret =  OB_ERR_UNEXPECTED;
-    LOG_WARN("get null pointer", K(ret), KPC(task_ctx));
-  } else if (OB_ISNULL(task_ctx->adp_guard_.get_adatper()) && OB_FAIL(vec_idx_mgr_->get_adapter_inst_guard(ctx_->task_status_.tablet_id_, task_ctx->adp_guard_))) {
+    LOG_WARN("get null pointer", K(ret), KPC(task_ctx), KP(vec_idx_mgr_));
+  } else if (OB_INVALID_ID == task_ctx->task_status_.inc_tablet_id_.id()
+             || !task_ctx->task_status_.inc_tablet_id_.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("hybrid task has no incremental tablet identity", KR(ret), KPC(task_ctx));
+  } else if (OB_ISNULL(task_ctx->adp_guard_.get_adatper())
+             && OB_FAIL(vec_idx_mgr_->get_adapter_inst_guard(
+                 task_ctx->task_status_.inc_tablet_id_, task_ctx->adp_guard_))) {
     if (OB_HASH_NOT_EXIST == ret) {
       ret = OB_EAGAIN;
       LOG_INFO("can not get adapter, need wait", K(ret), KPC(ctx_));

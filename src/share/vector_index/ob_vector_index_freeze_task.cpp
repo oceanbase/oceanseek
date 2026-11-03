@@ -65,11 +65,10 @@ int ObVecIdxFreezeTaskExecutor::load_triggered_task(const ObVecIndexTaskStatus &
     LOG_WARN("unexpected null index_ls_mgr", K(ret));
   } else {
     storage::ObLS *ls = ls_handle_.get_ls();
-    ObVecIndexAsyncTaskOption &task_opt = index_ls_mgr->get_async_task_opt();
     ObVecIndexTaskStatus task_row_copy = task_row;
     task_row_copy.status_ = ObVecIndexAsyncTaskStatus::OB_VECTOR_ASYNC_TASK_PREPARE;
     if (OB_FAIL(ObVecIndexAsyncTaskUtil::try_add_task_ctx_from_inner_row(
-            tenant_id_, task_row_copy, ls, ls_handle_, task_opt, true /*verify_tablet_on_ls*/))) {
+            tenant_id_, task_row_copy, ls, ls_handle_, *index_ls_mgr, true /*verify_tablet_on_ls*/))) {
       LOG_WARN("fail to add triggered freeze task ctx", K(ret), K(task_row));
     }
   }
@@ -79,6 +78,8 @@ int ObVecIdxFreezeTaskExecutor::load_triggered_task(const ObVecIndexTaskStatus &
 int ObVecIdxFreezeTaskExecutor::load_task(uint64_t &task_trace_base_num)
 {
   int ret = OB_SUCCESS;
+  ObSchemaGetterGuard schema_guard;
+  ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
   ObPluginVectorIndexMgr *index_ls_mgr = nullptr;
   ObArray<ObVecIndexAsyncTaskCtx*> task_ctx_array;
   if (IS_NOT_INIT) {
@@ -94,12 +95,20 @@ int ObVecIdxFreezeTaskExecutor::load_task(uint64_t &task_trace_base_num)
              K(ls_handle_.get_ls()->get_ls_id()));
   } else {
     storage::ObLS *ls = ls_handle_.get_ls();
+    common::hash::ObHashSet<uint64_t> dropping_index_ids;
+    if (OB_FAIL(dropping_index_ids.create(16))) {
+      LOG_WARN("fail to create dropping index set", KR(ret), K_(tenant_id), K_(ls_handle));
+    } else if (OB_FAIL(get_dropping_index_ids(tenant_id_, dropping_index_ids))) {
+    }
     ObSharedMemAllocMgr *shared_mem_mgr = MTL(ObSharedMemAllocMgr*);
     ObTenantVectorAllocator& vector_allocator = shared_mem_mgr->vector_allocator();
     ObVecIndexAsyncTaskOption &task_opt = index_ls_mgr->get_async_task_opt();
     ObIAllocator *allocator = task_opt.get_allocator();
     const int64_t current_task_cnt = ObVecIndexAsyncTaskUtil::get_processing_task_cnt(task_opt);
-    RWLock::RLockGuard lock_guard(index_ls_mgr->get_adapter_map_lock());
+    ObSEArray<ObTabletID, 64> adapter_tablet_ids;
+    if (OB_SUCC(ret) && OB_FAIL(index_ls_mgr->collect_adaptor_tablet_ids(adapter_tablet_ids))) {
+      LOG_WARN("fail to collect task adapter tablets", KR(ret), K_(tenant_id), K_(ls_handle));
+    }
 
     // 冻结持久化不会引入额外内存消耗, 这里主要是根据租户剩余内存, 判断是否需要提前冻结，避免合并时内存不足
     // 对与HNSW主要是避免Segment过大, 导致写入变慢
@@ -107,10 +116,20 @@ int ObVecIdxFreezeTaskExecutor::load_task(uint64_t &task_trace_base_num)
     int64_t freeze_segment_size = 128 * 1024 * 1024; // default 128MB
     int64_t total_pre_alloc_size = 0;
     int64_t freeze_threshold = 0;
-    FOREACH_X(iter, index_ls_mgr->get_vec_adaptor_map(), 
-        OB_SUCC(ret) && (task_ctx_array.count() + current_task_cnt <= MAX_ASYNC_TASK_PROCESSING_COUNT)) {
-      ObTabletID tablet_id = iter->first;
-      ObPluginVectorIndexAdaptor *adapter = iter->second;
+    for (int64_t adapter_idx = 0; OB_SUCC(ret) && adapter_idx < adapter_tablet_ids.count()
+         && task_ctx_array.count() + current_task_cnt <= MAX_ASYNC_TASK_PROCESSING_COUNT; ++adapter_idx) {
+      const ObTabletID adapter_tablet_id = adapter_tablet_ids.at(adapter_idx);
+      ObPluginVectorIndexAdapterGuard adapter_guard;
+      if (OB_FAIL(index_ls_mgr->get_adapter_inst_guard(adapter_tablet_id, adapter_guard))) {
+        if (OB_HASH_NOT_EXIST == ret) {
+          ret = OB_SUCCESS;
+        } else {
+          LOG_WARN("fail to get task adapter", KR(ret), K_(tenant_id), K(adapter_tablet_id));
+        }
+        continue;
+      }
+      ObPluginVectorIndexAdaptor *adapter = adapter_guard.get_adatper();
+      ObTabletID tablet_id = adapter_tablet_id;
       if (OB_ISNULL(adapter)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected nullptr", K(ret));
@@ -124,6 +143,7 @@ int ObVecIdxFreezeTaskExecutor::load_task(uint64_t &task_trace_base_num)
         char *task_ctx_buf = nullptr;
         ObVecIndexAsyncTaskCtx* task_ctx = nullptr;
         bool need_freeze = false;
+        bool schema_active = false;
         int64_t inc_mem_size = 0;
         if (! adapter->is_complete()) {
           LOG_TRACE("adapter not complete, no need freeze", K(ret), KPC(adapter));
@@ -131,6 +151,14 @@ int ObVecIdxFreezeTaskExecutor::load_task(uint64_t &task_trace_base_num)
           LOG_INFO("adapter is not complete, no need freeze", K(ret), KPC(adapter));
         } else if (adapter->is_sparse_vector_index_type()) {
           LOG_TRACE("adapter is sparse vector index, no need merge", K(ret), KPC(adapter));
+        } else if (OB_HASH_EXIST == dropping_index_ids.exist_refactored(adapter->get_inc_table_id())) {
+          if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+            LOG_WARN("[VEC_DDL_SKIP] skip freeze generation for dropping index",
+                     K_(tenant_id), K_(ls_handle), K(tablet_id), K(adapter->get_inc_table_id()));
+          } else {
+            LOG_DEBUG("[VEC_DDL_SKIP] skip freeze generation for dropping index",
+                      K_(tenant_id), K_(ls_handle), K(tablet_id), K(adapter->get_inc_table_id()));
+          }
         } else if (OB_FALSE_IT(inc_mem_size = adapter->get_incr_vsag_mem_used())) {
         } else if (inc_mem_size <= 0) {
           LOG_TRACE("incr vsag mem used is 0, no need to freeze", K(ret), K(inc_mem_size));
@@ -148,6 +176,16 @@ int ObVecIdxFreezeTaskExecutor::load_task(uint64_t &task_trace_base_num)
           LOG_TRACE("active segment is not need to freeze", K(ret), KPC(adapter));
         } else if (adapter->is_frozen_finish()) {
           LOG_INFO("frozen data is already finished, no need to freeze", K(ret), KPC(adapter));
+        } else if (OB_FAIL(schema_checker.check_table(adapter->get_inc_table_id(), schema_active))) {
+          LOG_WARN("fail to check freeze task schema", KR(ret), K(tablet_id));
+        } else if (!schema_active) {
+          if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+            LOG_WARN("[VEC_SCHEMA_SKIP] skip freeze task for inactive schema",
+                     K_(tenant_id), K_(ls_handle), K(tablet_id), K(adapter->get_inc_table_id()));
+          } else {
+            LOG_DEBUG("[VEC_SCHEMA_SKIP] skip freeze task for inactive schema",
+                      K_(tenant_id), K_(ls_handle), K(tablet_id), K(adapter->get_inc_table_id()));
+          }
         } else if (OB_NOT_NULL(scheduler_) && scheduler_->is_task_disabled(
                        ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_INDEX_FREEZE, tablet_id.id())) {
           LOG_TRACE("[VEC_IDX_TASK_DISABLED] skip generating disabled task",
@@ -181,7 +219,8 @@ int ObVecIdxFreezeTaskExecutor::load_task(uint64_t &task_trace_base_num)
           task_ctx->task_status_.exec_addr_ = GCTX.self_addr();
           task_ctx->task_status_.trace_id_ = new_trace_id;
           task_ctx->allocator_.set_tenant_id(tenant_id_);
-          if (OB_FAIL(index_ls_mgr->get_async_task_opt().add_task_ctx(tablet_id, task_ctx, inc_new_task))) { // not overwrite
+          if (OB_FAIL(try_add_task_ctx_for_adapter(
+                       *index_ls_mgr, adapter_tablet_id, adapter, task_ctx, inc_new_task))) {
             LOG_WARN("fail to add task ctx", K(ret));
           } else if (FALSE_IT(task_ctx_in_map = inc_new_task)) {
           } else if (inc_new_task && OB_FAIL(task_ctx_array.push_back(task_ctx))) {

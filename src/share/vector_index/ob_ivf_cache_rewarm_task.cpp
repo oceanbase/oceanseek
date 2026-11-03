@@ -739,6 +739,10 @@ int ObIvfCacheRewarmTask::rewarm_database_(
     int64_t &ls_collections_rewarmed)
 {
   int ret = OB_SUCCESS;
+  ObSchemaGetterGuard database_guard;
+  ObVecIndexSchemaChecker schema_checker(tenant_id_, database_guard);
+  uint64_t database_id = OB_INVALID_ID;
+  bool database_active = false;
   ObPluginVectorIndexService *service = MTL(ObPluginVectorIndexService *);
   if (OB_ISNULL(service)) {
     ret = OB_ERR_UNEXPECTED;
@@ -746,6 +750,29 @@ int ObIvfCacheRewarmTask::rewarm_database_(
   } else if (OB_UNLIKELY(sdk_db_name_.empty())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[IVF_CACHE_REWARM] sdk database name is empty", KR(ret));
+  } else if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(
+                 tenant_id_, database_guard))) {
+    LOG_WARN("fail to get rewarm database guard", KR(ret), K_(tenant_id), K_(sdk_db_name));
+  } else if (OB_FAIL(database_guard.get_database_id(tenant_id_, sdk_db_name_, database_id))) {
+    LOG_WARN("fail to get rewarm database id", KR(ret), K_(tenant_id), K_(sdk_db_name));
+  } else if (OB_INVALID_ID == database_id) {
+    if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+      LOG_WARN("[VEC_SCHEMA_SKIP] skip IVF rewarm for missing database",
+               K_(tenant_id), K_(sdk_db_name));
+    } else {
+      LOG_DEBUG("[VEC_SCHEMA_SKIP] skip IVF rewarm for missing database",
+                K_(tenant_id), K_(sdk_db_name));
+    }
+  } else if (OB_FAIL(schema_checker.check_database(database_id, database_active))) {
+    LOG_WARN("fail to check rewarm database schema", KR(ret), K_(tenant_id), K(database_id));
+  } else if (!database_active) {
+    if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+      LOG_WARN("[VEC_SCHEMA_SKIP] skip IVF rewarm for inactive schema",
+               K_(tenant_id), K(database_id), K_(sdk_db_name));
+    } else {
+      LOG_DEBUG("[VEC_SCHEMA_SKIP] skip IVF rewarm for inactive schema",
+                K_(tenant_id), K(database_id), K_(sdk_db_name));
+    }
   } else {
     int64_t collections_total = 0;
     int64_t collections_skipped = 0;
