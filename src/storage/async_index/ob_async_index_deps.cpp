@@ -717,7 +717,8 @@ int ObAsyncIndexDepProvider::has_incr_dml(
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("tablet is null", K(ret), K(data_tablet_id));
     } else {
-      // 1. Check minor sstables — early exit on first overlapping SSTable with data
+      // 1. Check every non-empty minor SSTable: a transaction may commit after
+      //    the SSTable's log SCN range ends.
       ObTabletMemberWrapper<ObTabletTableStore> wrapper;
       if (OB_FAIL(tablet->fetch_table_store(wrapper))) {
         LOG_WARN("failed to fetch table store", K(ret), K(data_tablet_id));
@@ -727,11 +728,6 @@ int ObAsyncIndexDepProvider::has_incr_dml(
         for (int64_t i = 0; OB_SUCC(ret) && !has_data && i < minor_tables.count(); ++i) {
           blocksstable::ObSSTable *sstable = minor_tables[i];
           if (OB_ISNULL(sstable)) {
-            continue;
-          }
-          const SCN tbl_start = sstable->get_start_scn();
-          const SCN tbl_end = sstable->get_end_scn();
-          if (tbl_end <= begin_scn || tbl_start >= end_scn) {
             continue;
           }
           ObSSTableMetaHandle meta_handle;
