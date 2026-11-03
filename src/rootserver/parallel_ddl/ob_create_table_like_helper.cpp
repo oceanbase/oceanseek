@@ -22,6 +22,9 @@ using namespace oceanbase::share::schema;
 using namespace oceanbase::rootserver;
 
 
+ERRSIM_POINT_DEF(EN_SKIP_LIKE_ASYNC_ATTRIBUTE_RECONCILIATION,
+    "Skip LIKE async attribute reconciliation for before/after regression testing");
+
 ObCreateTableLikeHelper::ObCreateTableLikeHelper(
     share::schema::ObMultiVersionSchemaService *schema_service,
     const uint64_t tenant_id,
@@ -122,11 +125,6 @@ int ObCreateTableLikeHelper::check_schema_valid_(const ObTableSchema *&orig_tabl
                                         helper.convert(arg_.origin_table_name_),
                    "BASE TABLE");
     LOG_WARN("create table like inner table not allowed", KR(ret), K_(arg));
-  } else if (orig_table_schema->has_async_index()
-             && !share::ObAsyncIndexRefreshUtil::is_async_index_enabled(tenant_id_)) {
-    ret = OB_OP_NOT_ALLOW;
-    LOG_WARN("create table like with async index not allowed while _enable_async_index is false", KR(ret), K_(tenant_id));
-    LOG_USER_ERROR(OB_OP_NOT_ALLOW, "create table like with async index while _enable_async_index is false");
   } else if (OB_FAIL(check_database_legitimacy_(arg_.new_db_name_, new_database_id))) {
     LOG_WARN("fail to check database legitimacy", KR(ret), K_(tenant_id), K(arg_.origin_db_name_));
   } else if (OB_FAIL(schema_guard_wrapper_.get_table_id(new_database_id, arg_.session_id_, arg_.new_table_name_, new_table_id, table_type, new_schema_version))) {
@@ -273,12 +271,14 @@ int ObCreateTableLikeHelper::generate_aux_table_schemas_()
     ObTableSchema *new_table_schema = &new_tables_.at(0);
     ObIDGenerator id_generator;
     ObSEArray<ObAuxTableMetaInfo,16> simple_index_infos;
+    ObSEArray<uint64_t, 16> search_def_index_ids;
     common::hash::ObHashMap<uint64_t, uint64_t> search_def_id_map;
     ObSArray<ObTableSchema> shared_schema_array;
     ObSArray<ObTableSchema> domain_schema_array;
     ObSArray<ObTableSchema> aux_schema_array;
     ObSArray<ObTableSchema> search_def_schema_array;
     ObSArray<ObTableSchema> search_data_schema_array;
+    bool has_async_logical_index = false;
     int64_t obj_cnt = 0;
     uint64_t new_table_id = OB_INVALID_ID;
     uint64_t new_database_id = OB_INVALID_ID;
@@ -287,7 +287,9 @@ int ObCreateTableLikeHelper::generate_aux_table_schemas_()
       LOG_WARN("new table scheam is null", KR(ret));
     } else if (OB_FAIL(new_table_schema->get_simple_index_infos(simple_index_infos))) {
       LOG_WARN("get simple_index_infos failed", KR(ret));
-    } else if (OB_FAIL(append_search_data_index_infos_(simple_index_infos))) {
+    } else if (OB_FAIL(collect_available_index_info_(simple_index_infos, search_def_index_ids, has_async_logical_index))) {
+      LOG_WARN("collect available index info failed", KR(ret));
+    } else if (OB_FAIL(append_search_data_index_infos_(search_def_index_ids, simple_index_infos))) {
       LOG_WARN("append search data index infos failed", KR(ret));
     } else {
       obj_cnt= simple_index_infos.count();
@@ -318,7 +320,8 @@ int ObCreateTableLikeHelper::generate_aux_table_schemas_()
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("table schema should not be null", KR(ret));
       } else if (index_table_schema->is_in_recyclebin() ||
-                 INDEX_STATUS_AVAILABLE != index_table_schema->get_index_status()) {
+                 INDEX_STATUS_AVAILABLE != index_table_schema->get_index_status()
+                 || (index_table_schema->is_async_delete_index() && !has_async_logical_index)) {
         continue;
       } else {
         ObString index_name;
@@ -471,10 +474,17 @@ int ObCreateTableLikeHelper::generate_aux_table_schemas_()
       }
       }// end heap vars
     }
+    if (FAILEDx(reconcile_async_index_attributes_())) {
+      LOG_WARN("failed to reconcile async index attributes", KR(ret));
+    } else if (new_tables_.at(0).has_async_index()
+               && !share::ObAsyncIndexRefreshUtil::is_async_index_enabled(tenant_id_)) {
+      ret = OB_OP_NOT_ALLOW;
+      LOG_WARN("create table like with async index not allowed while _enable_async_index is false", KR(ret), K_(tenant_id));
+      LOG_USER_ERROR(OB_OP_NOT_ALLOW, "create table like with async index while _enable_async_index is false");
+    }
   }
   return ret;
 }
-
 
 int ObCreateTableLikeHelper::generate_foreign_keys_()
 {
@@ -555,12 +565,15 @@ int ObCreateTableLikeHelper::construct_and_adjust_result_(int &return_ret) {
   return ret;
 }
 
-int ObCreateTableLikeHelper::append_search_data_index_infos_(
-    ObIArray<ObAuxTableMetaInfo> &simple_index_infos)
+int ObCreateTableLikeHelper::collect_available_index_info_(
+    const ObIArray<ObAuxTableMetaInfo> &simple_index_infos,
+    ObIArray<uint64_t> &search_def_index_ids,
+    bool &has_async_logical_index)
 {
   int ret = OB_SUCCESS;
-  ObSEArray<uint64_t, 16> search_def_index_ids;
-  // collect search def index ids first
+  has_async_logical_index = false;
+  search_def_index_ids.reset();
+  // Auxiliaries may become AVAILABLE before their logical index.
   for (int64_t i = 0; OB_SUCC(ret) && i < simple_index_infos.count(); ++i) {
     const ObTableSchema *def_schema = nullptr;
     if (OB_FAIL(schema_guard_wrapper_.get_table_schema(simple_index_infos.at(i).table_id_, def_schema))) {
@@ -568,13 +581,23 @@ int ObCreateTableLikeHelper::append_search_data_index_infos_(
     } else if (OB_ISNULL(def_schema)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("index table schema is null", KR(ret), K_(simple_index_infos.at(i).table_id));
-    } else if (def_schema->is_search_def_index()) {
-      if (OB_FAIL(search_def_index_ids.push_back(def_schema->get_table_id()))) {
+    } else if (!def_schema->is_in_recyclebin()
+               && INDEX_STATUS_AVAILABLE == def_schema->get_index_status()) {
+      has_async_logical_index |= share::schema::is_async_logical_index(def_schema->get_index_type());
+      if (def_schema->is_search_def_index()
+          && OB_FAIL(search_def_index_ids.push_back(def_schema->get_table_id()))) {
         LOG_WARN("fail to push back search def index id", KR(ret), K(def_schema->get_table_id()));
       }
     }
   }
-  // append search data index infos for each search def index
+  return ret;
+}
+
+int ObCreateTableLikeHelper::append_search_data_index_infos_(
+    const ObIArray<uint64_t> &search_def_index_ids,
+    ObIArray<ObAuxTableMetaInfo> &simple_index_infos)
+{
+  int ret = OB_SUCCESS;
   for (int64_t i = 0; OB_SUCC(ret) && i < search_def_index_ids.count(); ++i) {
     const uint64_t def_tid = search_def_index_ids.at(i);
     const ObTableSchema *def_schema = nullptr;
@@ -598,6 +621,33 @@ int ObCreateTableLikeHelper::append_search_data_index_infos_(
         } else if (OB_FAIL(simple_index_infos.push_back(child_infos.at(j)))) {
           LOG_WARN("push back search data index info failed", KR(ret), K(child_infos.at(j).table_id_));
         }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObCreateTableLikeHelper::reconcile_async_index_attributes_()
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(new_tables_.empty())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("missing data table schema", KR(ret));
+  } else {
+    // Reacquire the base schema after all appends, which may relocate new_tables_.
+    ObTableSchema &table_schema = new_tables_.at(0);
+    if (table_schema.has_async_index() && !EN_SKIP_LIKE_ASYNC_ATTRIBUTE_RECONCILIATION) {
+      bool has_async_index = false;
+      for (int64_t i = 1; !has_async_index && i < new_tables_.count(); ++i) {
+        const ObIndexType index_type = new_tables_.at(i).get_index_type();
+        has_async_index = share::schema::is_async_logical_index(index_type);
+      }
+      if (has_async_index) {
+        // Only copied logical indexes retain async attributes.
+      } else if (OB_FAIL(table_schema.set_async_index_params(ObString::make_empty_string()))) {
+        LOG_WARN("failed to clear async index params", KR(ret));
+      } else {
+        table_schema.del_table_flag(HAS_ASYNC_INDEX_FLAG);
       }
     }
   }

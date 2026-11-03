@@ -1244,6 +1244,12 @@ inline bool is_async_delete_index(const ObIndexType index_type)
   return INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL == index_type;
 }
 
+// Excludes physical auxiliary tables.
+inline bool is_async_logical_index(const ObIndexType index_type)
+{
+  return is_async_fts_index(index_type) || is_async_search_def_index(index_type);
+}
+
 // Schema-level async index family, including logical definitions and physical auxiliary tables.
 inline bool is_async_index(const ObIndexType index_type)
 {
