@@ -43,9 +43,10 @@ struct ObAsyncIndexReadState
 
 // Reject a migrated/deleted tablet, and optionally verify the generation saved
 // by the scheduler. The returned handle is also used to read its watermark.
+// 仅归属探测可启用 is_probe，降低预期负向结果的日志级别，不改变校验或返回码。
 int get_async_index_refresh_tablet(
     ObLS &ls, const common::ObTabletID &tablet_id, ObTabletHandle &handle,
-    const int64_t transfer_seq = -1);
+    const int64_t transfer_seq = -1, const bool is_probe = false);
 
 // Injectable abstraction over the external modules the trigger / scheduler depend on.
 //
