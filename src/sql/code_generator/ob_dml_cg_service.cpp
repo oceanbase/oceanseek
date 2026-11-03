@@ -4897,8 +4897,18 @@ int ObDmlCgService::generate_fk_arg(ObForeignKeyArg &fk_arg,
     }
     /* For non-unique indexes, we do not generate das scan parameters */
     if (check_parent_table && fk_arg.use_das_scan_) {
+      ObDMLStmt *stmt = cg_.opt_ctx_->get_root_stmt();
+      // Register the parent only when its FK scan is compiled into this plan.
+      ObSchemaObjVersion parent_table_version;
+      parent_table_version.object_id_ = name_table_id;
+      parent_table_version.object_type_ = DEPENDENCY_TABLE;
+      parent_table_version.version_ = table_schema->get_schema_version();
+      parent_table_version.is_db_explicit_ = true;
       ObDMLCtDefAllocator<ObForeignKeyCheckerCtdef> fk_allocator(cg_.phy_plan_->get_allocator());
-      if (OB_ISNULL(fk_arg.fk_ctdef_ = fk_allocator.alloc())) {
+      if (OB_ISNULL(stmt)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("root statement is null", K(ret));
+      } else if (OB_ISNULL(fk_arg.fk_ctdef_ = fk_allocator.alloc())) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_WARN("failed to alocate foreign key ctdef", K(ret));
       } else if (OB_FAIL(generate_fk_check_ctdef(op, name_table_id,
@@ -4907,6 +4917,8 @@ int ObDmlCgService::generate_fk_arg(ObForeignKeyArg &fk_arg,
                                                 schema_guard,
                                                 *fk_arg.fk_ctdef_))) {
         LOG_WARN("failed to check foreign key check ctdef", K(ret));
+      } else if (OB_FAIL(stmt->add_global_dependency_table(parent_table_version))) {
+        LOG_WARN("failed to add foreign key parent table dependency", K(ret), K(parent_table_version));
       } else if (OB_FAIL(dml_ctdef.fk_args_.push_back(fk_arg))) {
         LOG_WARN("failed to add foreign key arg", K(fk_arg), K(ret));
       } else {
