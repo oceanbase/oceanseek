@@ -63,7 +63,6 @@ private:
 
   common::hash::ObHashSet<uint64_t> tenants_;
 
-
   common::ObCond wait_cond_;
 };
 

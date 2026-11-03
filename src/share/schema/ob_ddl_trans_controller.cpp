@@ -4,6 +4,7 @@
 #define USING_LOG_PREFIX RS
 #include "ob_ddl_trans_controller.h"
 #include "rootserver/ob_root_service.h"
+#include "share/ob_all_server_tracer.h" // for SVR_TRACER
 
 
 namespace oceanbase
@@ -99,6 +100,7 @@ void ObDDLTransController::run1()
         for (int64_t i = 0; i < tenant_ids.count(); i++) {
           ObZone zone;
           ObArray<ObAddr> server_list;
+          ObArray<ObAddr> broadcast_server_list;
           const uint64_t tenant_id = tenant_ids.at(i);
           int64_t refreshed_schema_version = OB_INVALID_VERSION;
           int64_t start_time = ObTimeUtility::current_time();
@@ -112,13 +114,36 @@ void ObDDLTransController::run1()
             LOG_WARN("get alive server failed", KR(ret), K(tenant_id));
           } else if (OB_FAIL(GCTX.root_service_->get_ddl_service().publish_schema_and_get_schema_version(tenant_id, server_list, refreshed_schema_version))) {
             LOG_WARN("fail to publish_schema", KR(ret), K(tenant_id));
-          } else if (OB_FAIL(broadcast_consensus_version(tenant_id, refreshed_schema_version, server_list))) {
+          } else if (OB_FAIL(SVR_TRACER.get_alive_servers(zone, broadcast_server_list))) {
+            // Broadcast the consensus version to all alive servers, not only the
+            // servers which currently hold the tenant. A server that has just
+            // been told to drop the tenant may still keep it (and the ddl
+            // sessions waiting for the consensus version) until the unit gc
+            // protection window expires, while it is already excluded from
+            // get_alive_servers_by_tenant. Use get_alive_servers instead of
+            // get_alive_and_not_stopped_servers so that a still alive but
+            // stopped server, which may also host ddl sessions waiting for the
+            // consensus version, is not skipped.
+            LOG_WARN("get alive servers failed, fall back to servers of tenant", KR(ret), K(tenant_id));
+            // Fall back to the servers which hold the tenant: the tenant has
+            // already been removed from tenants_, so if the broadcast is
+            // skipped here the ddl sessions waiting for the consensus version
+            // will not be served again.
+            if (OB_FAIL(broadcast_server_list.assign(server_list))) {
+              LOG_WARN("fail to assign servers of tenant", KR(ret), K(tenant_id));
+            } else {
+              ret = OB_SUCCESS;
+            }
+          }
+          if (OB_FAIL(ret)) {
+          } else if (OB_FAIL(broadcast_consensus_version(tenant_id, refreshed_schema_version, broadcast_server_list))) {
             LOG_WARN("fail to broadcast consensus version", KR(ret), K(tenant_id), K(refreshed_schema_version));
           } else {
             int64_t end_time = ObTimeUtility::current_time();
-            LOG_INFO("refresh_schema", KR(ret), K(tenant_id), K(end_time - start_time), K(refreshed_schema_version));
+            LOG_INFO("refresh_schema", KR(ret), K(tenant_id), K(end_time - start_time),
+                     K(refreshed_schema_version), K(broadcast_server_list));
           }
-         }
+        }
       }
     }
     if (tenant_ids.empty()) {
