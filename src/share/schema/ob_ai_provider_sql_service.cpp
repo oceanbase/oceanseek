@@ -120,6 +120,8 @@ int ObAIProviderSqlService::alter_ai_provider(const ObAIProviderSchema &new_sche
     LOG_WARN("failed to add column", K(ret), K(new_schema));
   } else if (OB_FAIL(sql.add_column("access_key", ObHexEscapeSqlStr(new_schema.get_access_key())))) {
     LOG_WARN("failed to add column", K(ret), K(new_schema));
+  } else if (OB_FAIL(sql.add_gmt_modified())) {
+    LOG_WARN("failed to add gmt_modified", K(ret));
   } else if (OB_FAIL(sql.splice_update_sql(OB_ALL_AI_MODEL_PROVIDER_TNAME, buffer))) {
     LOG_WARN("failed to splice_update_sql", K(ret));
   } else if (OB_FAIL(sql_client.write(tenant_id, buffer.ptr(), affected_rows))) {
