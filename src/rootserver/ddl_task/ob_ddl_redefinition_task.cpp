@@ -1539,11 +1539,9 @@ int ObDDLRedefinitionTask::sync_auto_increment_position()
   return ret;
 }
 
-int ObDDLRedefinitionTask::modify_autoinc(const ObDDLTaskStatus next_task_status)
+int ObDDLRedefinitionTask::modify_autoinc(ObDDLTaskStatus next_task_status)
 {
   int ret = OB_SUCCESS;
-  uint64_t min_data_version = 0;
-  ObDDLTaskStatus new_status = next_task_status;
   ObRootService *root_service = GCTX.root_service_;
   bool is_update_autoinc_end = false;
   bool has_async_index = false;
@@ -1663,11 +1661,28 @@ int ObDDLRedefinitionTask::modify_autoinc(const ObDDLTaskStatus next_task_status
     }
   }
 
-  if (OB_SUCC(ret) && is_update_autoinc_end && is_hidden_table && has_async_index
+  if (OB_SUCC(ret) && is_update_autoinc_end && has_async_index) {
+    if (OB_FAIL(prepare_async_index_refresh(is_hidden_table, next_task_status))) {
+      LOG_WARN("failed to prepare async index refresh", K(ret));
+    }
+  }
+  if (OB_FAIL(ret) || is_update_autoinc_end) {
+    if (OB_FAIL(switch_status(next_task_status, true, ret))) {
+      LOG_WARN("fail to switch status", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObDDLRedefinitionTask::prepare_async_index_refresh(const bool is_hidden_table, ObDDLTaskStatus &next_task_status)
+{
+  int ret = OB_SUCCESS;
+  if (is_hidden_table
       && ObDDLTaskStatus::TAKE_EFFECT == next_task_status
       && DDL_TABLE_RESTORE != task_type_
       && !alter_table_arg_.is_direct_load_partition_
       && !alter_table_arg_.mview_refresh_info_.is_mview_complete_refresh_) {
+    uint64_t min_data_version = 0;
     if (OB_FAIL(GET_MIN_DATA_VERSION(dst_tenant_id_, min_data_version))) {
       LOG_WARN("failed to get data version before take effect", K(ret));
     } else if (min_data_version >= DATA_VERSION_4_6_3_0) {
@@ -1684,19 +1699,13 @@ int ObDDLRedefinitionTask::modify_autoinc(const ObDDLTaskStatus next_task_status
             alter_table_arg_.async_index_offline_refresh_snapshot_ = snapshot.get_val_for_tx();
           }
         }
-        if (OB_SUCC(ret) && OB_FAIL(update_dependent_task_message(*GCTX.sql_proxy_))) {
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(update_dependent_task_message(*GCTX.sql_proxy_))) {
           LOG_WARN("failed to persist offline refresh snapshot", K(ret));
-        }
-        if (OB_SUCC(ret)) {
-          new_status = ObDDLTaskStatus::TRIGGER_ASYNC_INDEX_REFRESH;
+        } else {
+          next_task_status = ObDDLTaskStatus::TRIGGER_ASYNC_INDEX_REFRESH;
         }
       }
-    }
-  }
-
-  if (OB_FAIL(ret) || is_update_autoinc_end) {
-    if (OB_FAIL(switch_status(new_status, true, ret))) {
-      LOG_WARN("fail to switch status", K(ret));
     }
   }
   return ret;

@@ -203,7 +203,8 @@ protected:
   int serialize_dependent_tasks(char *buf, const int64_t buf_len, int64_t &pos) const;
   int deserialize_dependent_tasks(const char *buf, const int64_t data_len, int64_t &pos);
   int sync_auto_increment_position();
-  int modify_autoinc(const share::ObDDLTaskStatus next_task_status);
+  int modify_autoinc(share::ObDDLTaskStatus next_task_status);
+  int prepare_async_index_refresh(const bool is_hidden_table, share::ObDDLTaskStatus &next_task_status);
   int finish();
   int check_health();
   int check_update_autoinc_end(bool &is_end);

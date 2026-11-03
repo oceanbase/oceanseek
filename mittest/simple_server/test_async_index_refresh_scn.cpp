@@ -105,6 +105,7 @@ public:
   int get_tablet_handle(const ObLSID &ls_id, const ObTabletID &tablet_id, ObTabletHandle &tablet_handle);
 
 #ifdef ERRSIM
+  void check_first_online_index_snapshot(const bool use_alter);
   void check_offline_refresh_recovery(const int phase);
   void check_offline_refresh_route(const uint64_t version, const bool with_async_index);
   void read_offline_versions(const uint64_t table_id, ObIArray<int64_t> &physical,
@@ -1172,6 +1173,170 @@ TEST_F(ObAsyncIndexRefreshScnTest, offline_refresh_version_and_membership_routes
     }
     ASSERT_NO_FATAL_FAILURE(check_offline_refresh_route(version, true));
   }
+}
+// Exercise both SQL entry points, rather than constructing refresh_info with S
+// already installed. A zero initial_snapshot regression would retain C instead.
+void ObAsyncIndexRefreshScnTest::check_first_online_index_snapshot(const bool use_alter)
+{
+  using namespace rootserver;
+  SCOPED_TRACE(use_alter ? "ALTER ADD" : "CREATE INDEX");
+  auto &proxy = get_curr_simple_server().get_sql_proxy2();
+  const auto sys_sql = [&](const char *sql) {
+    int64_t affected = 0;
+    return exec_write_sql_sys(sql, affected);
+  };
+  const uint64_t previous_mock_version = ATOMIC_LOAD(&ODV_MGR.mock_data_version_);
+  auto &cluster_version = ObClusterVersion::get_instance();
+  const uint64_t previous_data_version = ATOMIC_LOAD(&cluster_version.data_version_);
+  const int64_t previous_sync_timeout = static_cast<int64_t>(GCONF.debug_sync_timeout);
+  ObMalloc sync_allocator;
+  ObDSSessionActions control_actions;
+  ASSERT_EQ(OB_SUCCESS, control_actions.init(1024, sync_allocator));
+  // Fresh events also isolate CREATE/ALTER and repeated gtest runs from signals
+  // emitted by the cleanup path after a waiter has already consumed its signal.
+  // ObSyncEventName has a 32-byte buffer; keep prefixes short enough for the timestamp.
+  const int64_t event_id = ObTimeUtility::current_time();
+  ObSqlString pause_action;
+  ObSqlString wait_action;
+  ObSqlString resume_action;
+  ObSqlString ddl_done_action;
+  ASSERT_EQ(OB_SUCCESS, pause_action.assign_fmt(
+      "set ob_global_debug_sync='BUILD_FTS_INDEX_PREPARE_STATUS signal fs_hit_%ld "
+      "wait_for fs_go_%ld timeout 120000000 execute 1'", event_id, event_id));
+  ASSERT_EQ(OB_SUCCESS, wait_action.assign_fmt(
+      "now wait_for fs_hit_%ld timeout 60000000 execute 1", event_id));
+  ASSERT_EQ(OB_SUCCESS, resume_action.assign_fmt("now signal fs_go_%ld", event_id));
+  ASSERT_EQ(OB_SUCCESS, ddl_done_action.assign_fmt("now signal fs_hit_%ld", event_id));
+  std::thread ddl_thread;
+  std::atomic<int> ddl_ret(OB_EAGAIN);
+  std::atomic<bool> ddl_done(false);
+  DEFER({
+    // Release even after a fatal assertion, before joining or restoring versions.
+    EXPECT_EQ(OB_SUCCESS, sys_sql(
+        "set ob_global_debug_sync='BUILD_FTS_INDEX_PREPARE_STATUS clear'"));
+    EXPECT_EQ(OB_SUCCESS, GDS.add_debug_sync(
+        resume_action.string(), false, control_actions));
+    if (ddl_thread.joinable()) { ddl_thread.join(); }
+    ODV_MGR.set_mock_data_version(previous_mock_version);
+    ATOMIC_STORE(&cluster_version.data_version_, previous_data_version);
+    ObSqlString restore_sql;
+    if (OB_SUCCESS == restore_sql.assign_fmt(
+        "alter system set debug_sync_timeout='%ldus'", previous_sync_timeout)) {
+      EXPECT_EQ(OB_SUCCESS, sys_sql(restore_sql.ptr()));
+    }
+    EXPECT_EQ(OB_SUCCESS, GDS.add_debug_sync("reset", false, control_actions));
+    EXPECT_EQ(OB_SUCCESS, exe_sql("drop table if exists t_first_online_snapshot"));
+  });
+  ASSERT_EQ(OB_SUCCESS, exe_sql("drop table if exists t_first_online_snapshot"));
+  ASSERT_EQ(OB_SUCCESS, exe_sql(
+      "create table t_first_online_snapshot (id int primary key, body varchar(256)) organization heap"));
+  // Nonempty input prevents the empty-table optimization from bypassing PREPARE.
+  ASSERT_EQ(OB_SUCCESS, exe_sql("insert into t_first_online_snapshot values (1, 'snapshot token')"));
+  int64_t table_id = 0;
+  ObSqlString sql;
+  ASSERT_EQ(OB_SUCCESS, sql.assign_fmt(
+      "select table_id as val from oceanbase.__all_virtual_table where tenant_id=%lu "
+      "and table_name='t_first_online_snapshot' and data_table_id=0", tenant_id_));
+  ASSERT_EQ(OB_SUCCESS, SimpleServerHelper::select_int64(proxy, sql.ptr(), table_id));
+  ObTabletID tablet_id;
+  ObLSID ls_id;
+  ASSERT_EQ(OB_SUCCESS, get_tablet_and_ls_id_by_table_id(proxy, table_id, tablet_id, ls_id));
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(tenant_id_));
+  ObTabletHandle tablet;
+  ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ls_id, tablet_id, tablet));
+  bool has_async_index = true;
+  ASSERT_EQ(OB_SUCCESS, tablet.get_obj()->get_has_async_index(has_async_index));
+  ASSERT_FALSE(has_async_index);
+  // CREATE/ALTER require refresh to be enabled. Quiesce only the periodic
+  // scheduler, leaving the DDL-driven worker available after PREPARE resumes.
+  const int64_t refresh_deadline = ObTimeUtility::current_time() + 10_s;
+  while (!ObAsyncIndexRefreshUtil::is_async_index_refresh_enabled(tenant_id_)
+         && ObTimeUtility::current_time() < refresh_deadline) {
+    ob_usleep(10 * 1000);
+  }
+  ASSERT_TRUE(ObAsyncIndexRefreshUtil::is_async_index_refresh_enabled(tenant_id_));
+  ObAsyncIndexService *service = MTL(ObAsyncIndexService *);
+  ASSERT_NE(nullptr, service);
+  ObTenantAsyncIndexRefresher &refresher = service->get_refresher();
+  ASSERT_EQ(OB_SUCCESS, TG_CANCEL_R(refresher.tg_id_, refresher.timer_task_));
+  DEFER(EXPECT_EQ(OB_SUCCESS, TG_SCHEDULE(refresher.tg_id_, refresher.timer_task_,
+      ObTenantAsyncIndexRefresher::SCHEDULE_PERIOD_US, true /*repeat*/)));
+  ASSERT_EQ(OB_SUCCESS, TG_INVOKE(refresher.tg_id_, wait_task, refresher.timer_task_));
+  ASSERT_EQ(OB_SUCCESS, sys_sql("alter system set debug_sync_timeout='120s'"));
+  const int64_t config_deadline = ObTimeUtility::current_time() + 10_s;
+  while (120_s != static_cast<int64_t>(GCONF.debug_sync_timeout)
+         && ObTimeUtility::current_time() < config_deadline) {
+    ob_usleep(10 * 1000);
+  }
+  ASSERT_EQ(120_s, static_cast<int64_t>(GCONF.debug_sync_timeout));
+  ASSERT_EQ(OB_SUCCESS, sys_sql(pause_action.ptr()));
+  // 4.6.3 defers S to PREPARE. Use the supported older protocol to exercise
+  // new_fetched_snapshot -> initial_snapshot in the CREATE/ALTER transaction.
+  ATOMIC_STORE(&cluster_version.data_version_, 0);
+  ODV_MGR.set_mock_data_version(DATA_VERSION_4_6_2_1);
+  uint64_t effective_version = 0;
+  ASSERT_EQ(OB_SUCCESS, GET_MIN_DATA_VERSION(tenant_id_, effective_version));
+  ASSERT_EQ(DATA_VERSION_4_6_2_1, effective_version);
+  ddl_thread = std::thread([&]() {
+    ddl_ret.store(exe_sql(use_alter
+        ? "alter table t_first_online_snapshot add async fulltext index ft(body)"
+        : "create async fulltext index ft on t_first_online_snapshot(body)"));
+    ddl_done.store(true);
+    // Wake the controller on early SQL failure as well as on the sync point.
+    // Use thread-local actions: control_actions belongs to the waiting thread.
+    ObMalloc allocator;
+    ObDSSessionActions actions;
+    if (OB_SUCCESS == actions.init(1024, allocator)) {
+      GDS.add_debug_sync(ddl_done_action.string(), false, actions);
+    }
+  });
+  const int64_t wait_started = ObTimeUtility::current_time();
+  ASSERT_EQ(OB_SUCCESS, GDS.add_debug_sync(
+      wait_action.string(), false, control_actions));
+  if (ddl_done.load()) {
+    ASSERT_EQ(OB_SUCCESS, ddl_ret.load()) << "DDL exited before PREPARE";
+    FAIL() << "DDL completed without pausing at PREPARE";
+  }
+  // DEBUG_SYNC timeout returns success; verify that the handshake actually hit.
+  ASSERT_LT(ObTimeUtility::current_time() - wait_started, 59_s);
+  ASSERT_FALSE(ddl_done.load());
+  ObArenaAllocator allocator;
+  ObSEArray<ObDDLTaskRecord, 4> records;
+  ASSERT_EQ(OB_SUCCESS, ObDDLTaskRecordOperator::get_ddl_task_record_by_table_id(
+      tenant_id_, table_id, *GCTX.sql_proxy_, allocator, records));
+  ASSERT_EQ(1, records.count());
+  ASSERT_EQ(ObDDLTaskStatus::PREPARE, records.at(0).task_status_);
+  const int64_t selected_snapshot = records.at(0).snapshot_version_;
+  ASSERT_GT(selected_snapshot, 0);
+  // PREPARE has not started the build/DDL refresh; the periodic timer is quiesced.
+  // Read C independently from the committed membership MDS row, not from S.
+  ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ls_id, tablet_id, tablet));
+  ObTabletAsyncIndexRefreshInfo info;
+  mds::MdsWriter writer;
+  mds::TwoPhaseCommitState state;
+  SCN commit_version;
+  ASSERT_EQ(OB_SUCCESS, tablet.get_obj()->get_latest_async_index_refresh_info(
+      info, writer, state, commit_version));
+  ASSERT_EQ(mds::TwoPhaseCommitState::ON_COMMIT, state);
+  ASSERT_TRUE(info.has_async_index());
+  ASSERT_LT(selected_snapshot, commit_version.get_val_for_tx());
+  ASSERT_EQ(1, info.get_refresh_snapshots().count());
+  ASSERT_EQ(selected_snapshot, info.get_refresh_snapshots().at(0));
+  ASSERT_EQ(OB_SUCCESS, GDS.add_debug_sync(
+      resume_action.string(), false, control_actions));
+  ddl_thread.join();
+  ASSERT_EQ(OB_SUCCESS, ddl_ret.load());
+}
+
+TEST_F(ObAsyncIndexRefreshScnTest, create_first_online_index_preserves_selected_snapshot)
+{
+  ASSERT_NO_FATAL_FAILURE(check_first_online_index_snapshot(false));
+}
+
+TEST_F(ObAsyncIndexRefreshScnTest, alter_first_online_index_preserves_selected_snapshot)
+{
+  ASSERT_NO_FATAL_FAILURE(check_first_online_index_snapshot(true));
 }
 #endif // ERRSIM
 
