@@ -2197,6 +2197,23 @@ int ObDelUpdResolver::add_all_part_columns_to_stmt(const TableItem &table_item,
           LOG_WARN("get column schema failed", K(table_schema->get_table_id()), K(rowkey_column_id));
         } else if (OB_FAIL(add_column_to_stmt(table_item, *column_schema, column_exprs, stmt))) {
           LOG_WARN("add column to stmt failed", K(ret), K(table_item), KPC(column_schema));
+        } else if (column_schema->is_generated_column()) {
+          ObSEArray<uint64_t, 5> dependent_column_ids;
+          // The backfill SQL projects these dependencies too. Keep them in the insert
+          // column list so the optimizer can find their corresponding converted values.
+          if (OB_FAIL(column_schema->get_cascaded_column_ids(dependent_column_ids))) {
+            LOG_WARN("failed to get generated partition column dependencies", K(ret));
+          }
+          for (int64_t j = 0; OB_SUCC(ret) && j < dependent_column_ids.count(); ++j) {
+            const ObColumnSchemaV2 *dependent_column =
+                table_schema->get_column_schema(dependent_column_ids.at(j));
+            if (OB_ISNULL(dependent_column)) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("generated partition column dependency is null", K(ret), K(dependent_column_ids.at(j)));
+            } else if (OB_FAIL(add_column_to_stmt(table_item, *dependent_column, column_exprs, stmt))) {
+              LOG_WARN("failed to add generated partition column dependency", K(ret), KPC(dependent_column));
+            }
+          }
         }
       }
     }

@@ -12933,6 +12933,10 @@ int ObTransformPreProcess::collect_gen_cols_for_replace(ObDMLStmt *stmt,
           ObColumnRefRawExpr *col_expr = column_items.at(j).expr_;
           ObRawExpr *depend_expr = NULL;
           bool is_valid_gen_col = false;
+          // Search DDL carries base-table routing columns on the index TableItem.
+          const bool use_base_column = ctx_->session_info_->get_ddl_info().is_search_index_ddl()
+              && column_items.at(j).base_tid_ != OB_INVALID_ID
+              && column_items.at(j).base_cid_ != OB_INVALID_ID;
           if (OB_ISNULL(col_expr)) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("unexpected null", K(ret), KP(col_expr));
@@ -12954,8 +12958,8 @@ int ObTransformPreProcess::collect_gen_cols_for_replace(ObDMLStmt *stmt,
           } else if (col_expr->is_stored_generated_column()) {
             is_valid_gen_col = true;
           } else if (OB_FAIL(schema_guard->column_is_key(ctx_->session_info_->get_effective_tenant_id(), 
-                                                         table_item->ref_id_, 
-                                                         col_expr->get_column_id(), 
+                                                         use_base_column ? column_items.at(j).base_tid_ : table_item->ref_id_,
+                                                         use_base_column ? column_items.at(j).base_cid_ : col_expr->get_column_id(),
                                                          col_is_key))) {
             LOG_WARN("failed to check column is key", K(ret));
           } else if (col_expr->is_virtual_generated_column() && col_is_key) {

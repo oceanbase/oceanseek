@@ -2929,6 +2929,13 @@ int ObDMLResolver::resolve_basic_column_item(const TableItem &table_item,
       column_item.column_name_ = col_expr->get_column_name();
       column_item.base_tid_ = tid;
       column_item.base_cid_ = column_item.column_id_;
+      if (schema_checker_->is_search_index_ddl()
+          && table_schema->is_search_data_index()
+          && col_schema->get_table_id() != tid) {
+        // Routing columns resolved through the search-data schema belong to the base table.
+        column_item.base_tid_ = col_schema->get_table_id();
+        column_item.base_cid_ = col_schema->get_column_id();
+      }
       column_item.is_geo_ = col_schema->is_geometry();
       if (col_schema->is_mock_column()) {
         col_expr->set_is_pseudo_column_ref(true);
