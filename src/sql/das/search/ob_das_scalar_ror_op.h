@@ -21,6 +21,7 @@ public:
   ObDASScalarROROp(ObDASSearchCtx &search_ctx)
     : ObIDASSearchOp(search_ctx),
       scan_param_(),
+      scan_range_allocator_(common::ObMemAttr(MTL_ID(), "DASRORRange")),
       scalar_ctdef_(nullptr),
       scalar_rtdef_(nullptr),
       result_(nullptr),
@@ -62,6 +63,8 @@ protected:
 
 protected:
   storage::ObTableScanParam scan_param_;
+  // Mutable DocID slices belong to this operator, not the rtdef shared by Groups.
+  common::ObArenaAllocator scan_range_allocator_;
   const ObDASScalarScanCtDef *scalar_ctdef_;
   ObDASScalarScanRtDef *scalar_rtdef_;
   common::ObNewRowIterator *result_;

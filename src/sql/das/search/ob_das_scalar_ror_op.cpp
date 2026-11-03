@@ -155,6 +155,7 @@ int ObDASScalarROROp::do_close()
   scan_param_.destroy_schema_guard();
   scan_param_.snapshot_.reset();
   scan_param_.destroy();
+  scan_range_allocator_.reset();
   if (OB_NOT_NULL(rowid_store_)) {
     rowid_store_->reset();
     rowid_store_iter_.reset();
@@ -310,6 +311,13 @@ int ObDASScalarROROp::prepare_scan_ranges(const ObDASScalarScanRtDef *rtdef)
   if (OB_ISNULL(rtdef)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected nullptr scan rtdef", K(ret));
+  } else {
+    // On rescan the old storage iterator has already been reused. Drop its
+    // range references before recycling the operator-local rowkey memory.
+    scan_param_.key_ranges_.reuse();
+    scan_range_allocator_.reuse();
+  }
+  if (OB_FAIL(ret)) {
   } else if (lt_ctx.is_enabled_ && OB_NOT_NULL(scalar_ctdef_) && scalar_ctdef_->is_logical_table()) {
     if (OB_FAIL(ObDASScalarScanOp::prepare_logical_table_kv_scan_ranges(
                     lt_ctx, scalar_ctdef_, rtdef->key_ranges_,
@@ -318,6 +326,17 @@ int ObDASScalarROROp::prepare_scan_ranges(const ObDASScalarScanRtDef *rtdef)
     } else {
       scan_param_.index_id_ = lt_ctx.physical_data_table_id_;
       scan_param_.tablet_id_ = lt_ctx.physical_tablet_id_;
+    }
+  } else if (search_ctx_.has_docid_range()) {
+    // assign() copies border flags but aliases the ObObj arrays in the rowkeys.
+    // Narrowing such a copy corrupts the shared rtdef for subsequent Groups.
+    for (int64_t i = 0; OB_SUCC(ret) && i < rtdef->key_ranges_.count(); ++i) {
+      ObNewRange range;
+      if (OB_FAIL(deep_copy_range(scan_range_allocator_, rtdef->key_ranges_.at(i), range))) {
+        LOG_WARN("failed to copy scalar ROR scan range", K(ret), K(i));
+      } else if (OB_FAIL(scan_param_.key_ranges_.push_back(range))) {
+        LOG_WARN("failed to append scalar ROR scan range", K(ret), K(i));
+      }
     }
   } else if (OB_FAIL(scan_param_.key_ranges_.assign(rtdef->key_ranges_))) {
     LOG_WARN("failed to assign key ranges", K(ret));
