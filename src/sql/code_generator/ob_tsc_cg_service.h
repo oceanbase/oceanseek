@@ -125,6 +125,8 @@ public:
     ObIArray<ObRawExpr*> &access_exprs,
     const bool is_vec_com_aux_scan = false);
 private:
+  int add_async_index_plan_constraint();
+
   // temporary context for multiple das scan in one table scan operator
   struct DASScanCGCtx
   {

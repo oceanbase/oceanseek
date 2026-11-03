@@ -78,6 +78,11 @@ int ObPlanSet::match_params_info(const ParamStore *params,
   if (false == is_match_outline_param(outline_param_idx)) {
     is_same = false;
     RECORD_CACHE_MISS(PARAMS_INFO_NOT_MATCH, pc_ctx, "outline param not match", K(outline_param_idx));
+  } else if (OB_FAIL(match_session_state_constraints(pc_ctx, is_same))) {
+    LOG_WARN("failed to match session state constraints", K(ret));
+  } else if (!is_same) {
+    RECORD_CACHE_MISS(PARAMS_INFO_NOT_MATCH, pc_ctx,
+                      "session state constraints not match", K_(session_state_constraints));
   } else if (OB_ISNULL(params)) {
     is_same = true;
   } else if (params->count() > params_info_.count()) {
@@ -242,6 +247,30 @@ int ObPlanSet::match_params_info(const ParamStore *params,
     }
   }
   LOG_DEBUG("after match param result", K(ret), K(is_same), K(params_info_), K(params_constraint_));
+  return ret;
+}
+
+int ObPlanSet::match_session_state_constraints(ObPlanCacheCtx &pc_ctx, bool &is_same) const
+{
+  int ret = OB_SUCCESS;
+  is_same = true;
+  if (NO_SESSION_STATE_CONSTRAINT == session_state_constraints_) {
+    // Unconstrained plans do not require a session for session state constraint matching.
+  } else if (0 != (session_state_constraints_ &
+                   ~static_cast<uint64_t>(SESSION_STATE_NO_MULTI_STMT_TRANSACTION))) {
+    ret = OB_ERR_UNEXPECTED;
+    is_same = false;
+    LOG_WARN("unsupported session state constraints", K(ret), K_(session_state_constraints));
+  } else {
+    ObSQLSessionInfo *session = pc_ctx.exec_ctx_.get_my_session();
+    if (OB_ISNULL(session)) {
+      ret = OB_ERR_UNEXPECTED;
+      is_same = false;
+      LOG_WARN("unexpected null session for session state constraints", K(ret));
+    } else {
+      is_same = ObSqlSchemaGuard::can_use_async_index(session);
+    }
+  }
   return ret;
 }
 
@@ -647,6 +676,9 @@ int ObPlanSet::match_params_info(const Ob2DArray<ObParamInfo,
   if (OB_ISNULL(session_info)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null session_info", K(ret));
+  } else if (is_sql_planset() &&
+             session_state_constraints_ != pc_ctx.sql_ctx_.session_state_constraints_) {
+    is_same = false;
   } else if (false == is_match_outline_param(outline_param_idx)) {
     is_same = false;
   } else if (infos.count() != params_info_.count()) {
@@ -740,11 +772,12 @@ bool ObPlanSet::can_skip_params_match()
   if (can_skip) {
     if (!all_plan_const_param_constraints_.empty() ||
         !all_equal_param_constraints_.empty() ||
-        all_pre_calc_constraints_.get_size() != 0) {
+        all_pre_calc_constraints_.get_size() != 0 ||
+        NO_SESSION_STATE_CONSTRAINT != session_state_constraints_) {
       can_skip = false;
       LOG_DEBUG("print can't skip", K(can_skip), K(all_plan_const_param_constraints_.empty()),
       K(all_equal_param_constraints_.empty()),
-      K(all_pre_calc_constraints_.get_size()));
+      K(all_pre_calc_constraints_.get_size()), K_(session_state_constraints));
     }
   }
   return can_skip;
@@ -779,6 +812,7 @@ void ObPlanSet::reset()
   all_equal_param_constraints_.reset();
   all_pre_calc_constraints_.reset();
   all_priv_constraints_.reset();
+  session_state_constraints_ = NO_SESSION_STATE_CONSTRAINT;
   can_skip_params_match_ = false;
   can_delay_init_datum_store_ = false;
   params_constraint_.reset();
@@ -911,7 +945,9 @@ int ObPlanSet::init_new_set(const ObPlanCacheCtx &pc_ctx,
         all_equal_param_constraints_.reset();
         all_pre_calc_constraints_.reset();
         all_priv_constraints_.reset();
+        session_state_constraints_ = NO_SESSION_STATE_CONSTRAINT;
     } else if (PST_SQL_CRSR == ps_t) {
+      session_state_constraints_ = sql_ctx.session_state_constraints_;
       // otherwise it should not be empty
       CK( OB_NOT_NULL(sql_ctx.all_plan_const_param_constraints_),
           OB_NOT_NULL(sql_ctx.all_equal_param_constraints_),
@@ -2784,6 +2820,9 @@ int ObPlanSet::match_and_merge_plan_cons(const ObPlanCacheCtx &pc_ctx, bool &is_
       OB_ISNULL(priv_cons) || OB_ISNULL(pre_calc_cons)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(param_cons), K(equal_cons), K(pre_calc_cons));
+  } else if (session_state_constraints_ != pc_ctx.sql_ctx_.session_state_constraints_) {
+    // Session state constraints must match before merging any constraint category.
+    is_matched = false;
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < param_cons->count(); ++i) {
       bool find = false;

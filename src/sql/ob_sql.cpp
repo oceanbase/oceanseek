@@ -3280,6 +3280,7 @@ int ObSql::generate_stmt(ParseResult &parse_result,
       LOG_WARN("failed to get_optimizer_features_enable_version", K(ret));
     } else {
       resolver_ctx.query_ctx_->sql_schema_guard_.set_schema_guard(context.schema_guard_);
+      resolver_ctx.query_ctx_->sql_schema_guard_.set_session_info(context.session_info_);
       resolver_ctx.expr_factory_->set_query_ctx(resolver_ctx.query_ctx_);
       if (OB_FAIL(resolver_ctx.schema_checker_->init(resolver_ctx.query_ctx_->sql_schema_guard_, session_id))) {
         LOG_WARN("init schema checker failed", K(ret));
@@ -4182,6 +4183,8 @@ int ObSql::code_generate(
   int64_t codegen_mem_usage = 0;
   ObPhysicalPlanCtx *pctx = result.get_exec_context().get_physical_plan_ctx();
   bool use_jit = false;
+  // A fresh top-level CG attempt must not inherit conditions from an earlier attempt.
+  sql_ctx.session_state_constraints_ = NO_SESSION_STATE_CONSTRAINT;
   if (OB_ISNULL(stmt) || OB_ISNULL(logical_plan) || OB_ISNULL(stmt->get_query_ctx())
         || OB_ISNULL(phy_plan) || OB_ISNULL(sql_ctx.session_info_)
         || OB_ISNULL(pctx)) {
@@ -4354,6 +4357,9 @@ int ObSql::code_generate(
   }
   LOG_DEBUG("SQL MEM USAGE", K(codegen_mem_usage), K(last_mem_usage));
 
+  if (OB_FAIL(ret)) {
+    sql_ctx.session_state_constraints_ = NO_SESSION_STATE_CONSTRAINT;
+  }
   return ret;
 }
 

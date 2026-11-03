@@ -39,6 +39,7 @@ class ObPlanCacheValue;
 class ObPlanCache;
 class ObPlanCacheObject;
 class ObPhysicalPlan;
+class ObOpSpec;
 class ObExecContext;
 struct ObSqlCtx;
 struct ObPCUserVarMeta;
@@ -166,6 +167,7 @@ public:
         all_plan_const_param_constraints_(alloc_),
         all_pre_calc_constraints_(),
         all_priv_constraints_(),
+        session_state_constraints_(NO_SESSION_STATE_CONSTRAINT),
         need_match_all_params_(false),
         multi_stmt_rowkey_pos_(alloc_),
         pre_cal_expr_handler_(NULL),
@@ -237,6 +239,7 @@ public:
   bool get_can_skip_params_match() { return can_skip_params_match_; }
   bool get_can_delay_init_datum_store() { return can_delay_init_datum_store_; }
   bool is_route_to_column_replica() const { return route_to_column_replica_; }
+  uint64_t get_session_state_constraints() const { return session_state_constraints_; }
   static int process_replica_error(const int error_code,
                                    const ObPhysicalPlan *plan,
                                    ObBasicSessionInfo *session_info);
@@ -266,6 +269,7 @@ private:
                                     ObPreCalcExprConstraint*& dst);
 
   int match_cons(const ObPlanCacheCtx &pc_ctx, bool &is_matched);
+  int match_session_state_constraints(ObPlanCacheCtx &pc_ctx, bool &is_same) const;
   /**
    * @brief Match const param constraint.
    * If all_plan_const_param_constraints_ is not empty, check wether the constraints is mached and return the result.
@@ -308,6 +312,7 @@ protected:
   EqualParamConstraint all_equal_param_constraints_;
   PreCalcExprConstraint all_pre_calc_constraints_;
   PrivConstraint all_priv_constraints_;
+  uint64_t session_state_constraints_;
   //if true, check the datatypes of all params
   bool need_match_all_params_;
   // maintain the rowkey position for multi_stmt

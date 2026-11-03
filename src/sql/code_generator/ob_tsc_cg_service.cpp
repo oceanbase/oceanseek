@@ -36,6 +36,27 @@ using namespace share::schema;
 namespace sql
 {
 
+int ObTscCgService::add_async_index_plan_constraint()
+{
+  int ret = OB_SUCCESS;
+  ObExecContext *exec_ctx = nullptr;
+  ObSqlCtx *sql_ctx = nullptr;
+  if (OB_ISNULL(cg_.opt_ctx_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null optimizer context", K(ret));
+  } else if (OB_ISNULL(exec_ctx = cg_.opt_ctx_->get_exec_ctx())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null execution context", K(ret));
+  } else if (OB_ISNULL(sql_ctx = exec_ctx->get_sql_ctx())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null sql context", K(ret));
+  } else {
+    // Multiple actual async scans share one plan validity condition.
+    sql_ctx->session_state_constraints_ |= SESSION_STATE_NO_MULTI_STMT_TRANSACTION;
+  }
+  return ret;
+}
+
 int ObTscCgService::generate_tsc_ctdef(ObLogTableScan &op, ObTableScanCtDef &tsc_ctdef)
 {
   int ret = OB_SUCCESS;
@@ -450,6 +471,9 @@ int ObTscCgService::generate_tsc_ctdef(ObLogTableScan &op, ObTableScanCtDef &tsc
   if (OB_SUCC(ret)) {
     tsc_ctdef.is_async_index_query_ =
         ObDASAsyncIndexQueryCtx::contains_async_index_query(root_ctdef);
+    if (tsc_ctdef.is_async_index_query_ && OB_FAIL(add_async_index_plan_constraint())) {
+      LOG_WARN("failed to add async index plan constraint", K(ret));
+    }
   }
 
   if (OB_SUCC(ret) && need_attach) {
