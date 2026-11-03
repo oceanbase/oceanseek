@@ -12,12 +12,15 @@
 #include "lib/time/ob_time_utility.h"
 #include "lib/utility/ob_tracepoint.h"
 #include "share/ob_cluster_version.h"
+#include "observer/omt/ob_tenant_config_mgr.h"
 #include "src/storage/ss_garbage_collector/shared_gc_task/ob_shared_gc_task_table_iterator.h"
 #include "src/storage/ss_garbage_collector/dag/ob_ss_gc_exec_dag.h"
 #include "src/storage/ss_garbage_collector/shared_gc_task/ob_shared_gc_task_table_operator.h"
+#include "src/storage/ss_garbage_collector/task/ob_ss_gc_history_cleanup_task.h"
 #undef protected
 #undef private
 #include "lib/alloc/ob_malloc_callback.h"
+#include "lib/worker.h"
 #include "observer/mysql/obmp_base.h"
 #include "share/ob_upgrade_utils.h"
 #include "src/storage/ss_garbage_collector/shared_gc_task/ob_shared_gc_task_define.h"
@@ -120,6 +123,22 @@ public:
   static int get_active_task_modified_us(const ObSharedGCTaskKey &key,
                                          ObISQLClient &client,
                                          int64_t &modified_us);
+  static int insert_history_rows(
+      const uint64_t tenant_id,
+      const ObSharedGCTaskType type,
+      const int64_t round_id,
+      const int64_t first_task_id,
+      const int64_t row_count,
+      const int64_t create_ts,
+      ObISQLClient &client);
+  static int insert_history_rows(
+      const uint64_t tenant_id,
+      const int64_t type,
+      const int64_t round_id,
+      const int64_t first_task_id,
+      const int64_t row_count,
+      const int64_t create_ts,
+      ObISQLClient &client);
   // Delete all history rows with the given round_id; used as test cleanup.
   static int delete_history_by_round(const uint64_t tenant_id,
                                      const int64_t round_id,
@@ -2275,134 +2294,197 @@ int TestSharedGCTaskTableOperator::delete_history_by_round(
 // delete_expired_history tests
 // =====================================================================
 
-// No rows match the expire filter → OB_SUCCESS with affected_rows=0.
-// Use epoch-time as expire_ts so no real row could ever qualify.
-TEST_F(TestSharedGCTaskTableOperator, delete_expired_history_empty_table)
+// Defaults are not persisted, so an existing tenant adopts the new default after upgrade.
+TEST_F(TestSharedGCTaskTableOperator, delete_expired_history_config_reload)
 {
-  int64_t affected_rows = -1;
-  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_expired(
-      TENANT_ID, OB_ALL_SHARED_GC_TASK_HISTORY_TNAME,
-      1 /*epoch; no row is ever this old*/, 1000,
-      sql_proxy(), affected_rows));
-  ASSERT_EQ(0, affected_rows);
+  int ret = OB_SUCCESS;
+  const int64_t day_us = 86400LL * 1000000LL;
+  const int64_t fallback_retention_us = ObSSGCHistoryCleanupTask::DEFAULT_RETENTION_US;
+  char buf[4096] = {};
+  int64_t pos = 0;
+  int64_t read_pos = 0;
+  const char *configured_values[] = {"7d", "45d"};
+  const int64_t configured_days[] = {7, 45};
+  HEAP_VARS_2((omt::ObTenantConfig, old_config, TENANT_ID),
+             (omt::ObTenantConfig, restored_config, TENANT_ID)) {
+    ASSERT_EQ(30 * day_us, old_config._shared_gc_task_history_expiration_time.get());
+    ASSERT_EQ(fallback_retention_us,
+        old_config._shared_gc_task_history_expiration_time.get());
+    ASSERT_EQ(OB_SUCCESS, restored_config.init(&OTC_MGR));
+    ASSERT_EQ(OB_SUCCESS, restored_config.read_config());
+    ASSERT_EQ(30 * day_us, restored_config._shared_gc_task_history_expiration_time.get());
+
+    // Reproduce the old binary's unmodified 7d default without a persisted override.
+    ASSERT_TRUE(old_config._shared_gc_task_history_expiration_time.set_value("7d"));
+    old_config._shared_gc_task_history_expiration_time.value_updated_ = false;
+    ASSERT_EQ(OB_SUCCESS, old_config.serialize(buf, sizeof(buf), pos));
+    ASSERT_EQ(OB_SUCCESS, restored_config.deserialize(buf, pos, read_pos));
+    ASSERT_EQ(OB_SUCCESS, restored_config.read_config());
+    ASSERT_EQ(30 * day_us, restored_config._shared_gc_task_history_expiration_time.get());
+    ASSERT_FALSE(restored_config._shared_gc_task_history_expiration_time.value_updated());
+
+    // Explicit settings, including the old default, survive reload and upgrade.
+    for (int64_t i = 0; i < 2; ++i) {
+      pos = 0;
+      read_pos = 0;
+      ASSERT_TRUE(
+          old_config._shared_gc_task_history_expiration_time.set_value(configured_values[i]));
+      ASSERT_EQ(OB_SUCCESS, old_config.serialize(buf, sizeof(buf), pos));
+      ASSERT_EQ(OB_SUCCESS, restored_config.deserialize(buf, pos, read_pos));
+      ASSERT_EQ(OB_SUCCESS, restored_config.read_config());
+      ASSERT_EQ(configured_days[i] * day_us,
+          restored_config._shared_gc_task_history_expiration_time.get());
+      ASSERT_TRUE(restored_config._shared_gc_task_history_expiration_time.value_updated());
+    }
+  } else {
+    FAIL() << "failed to allocate tenant configs";
+  }
 }
 
-// Insert 3 rows older than retention + 2 rows newer than retention.
-// After one cleanup call (limit >> total rows), the 3 old rows are gone
-// and the 2 new rows survive.
-TEST_F(TestSharedGCTaskTableOperator, delete_expired_history_retention_basic)
+// Exercise the cleanup task's configured retention rather than a manually calculated cutoff.
+TEST_F(TestSharedGCTaskTableOperator, delete_expired_history_configured_retention)
 {
-  const int64_t round_id   = 3000;
-  const int64_t OLD_AGE_US = 10LL * 86400LL * 1000000LL;  // 10d → older than 7d retention
-  const int64_t NEW_AGE_US =  1LL * 86400LL * 1000000LL;  //  1d → newer than 7d retention
-  const int64_t RETENTION  =  7LL * 86400LL * 1000000LL;  //  7d
-
-  // Pre-test cleanup in case of leftover rows from a prior crashed run.
-  ASSERT_EQ(OB_SUCCESS, delete_history_by_round(TENANT_ID, round_id, sql_proxy()));
-
-  for (int64_t tid = 1; tid <= 3; ++tid) {
-    ASSERT_EQ(OB_SUCCESS,
-              insert_history_backdated(TENANT_ID, round_id, tid, OLD_AGE_US, sql_proxy()));
-  }
-  for (int64_t tid = 4; tid <= 5; ++tid) {
-    ASSERT_EQ(OB_SUCCESS,
-              insert_history_backdated(TENANT_ID, round_id, tid, NEW_AGE_US, sql_proxy()));
-  }
-
-  const int64_t expire_ts_us = ObTimeUtility::current_time() - RETENTION;
+  const int64_t round_id = 3001;
+  const int64_t day_us = 86400LL * 1000000LL;
+  const int64_t ages[] = {31, 29, 8, 1};
   int64_t affected_rows = 0;
-  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_expired(
-      TENANT_ID, OB_ALL_SHARED_GC_TASK_HISTORY_TNAME,
-      expire_ts_us, 1000, sql_proxy(), affected_rows));
-  ASSERT_EQ(3, affected_rows);
-
-  // Old rows are gone.
+  volatile bool is_stopped = false;
   ObArenaAllocator allocator;
   ObSharedGCTask task;
-  for (int64_t tid = 1; tid <= 3; ++tid) {
-    ObSharedGCTaskKey key(TENANT_ID, ObSharedGCTaskType::FAIL_GC, round_id, tid);
-    ASSERT_EQ(OB_ENTRY_NOT_EXIST,
-              ObSharedGCTaskTableOperator::get_history(key, allocator, sql_proxy(), task));
+  ObSharedGCTaskKey key(TENANT_ID, ObSharedGCTaskType::FAIL_GC, round_id, 0);
+  ObSSGCHistoryCleanupTask cleanup(is_stopped);
+  ObSqlString saved_retention;
+  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(TENANT_ID));
+  ASSERT_TRUE(tenant_config.is_valid());
+  ASSERT_EQ(30 * day_us, tenant_config->_shared_gc_task_history_expiration_time.get());
+  ASSERT_EQ(OB_SUCCESS, saved_retention.assign(
+      tenant_config->_shared_gc_task_history_expiration_time.str()));
+  const bool saved_updated = tenant_config->_shared_gc_task_history_expiration_time.value_updated();
+  DEFER({
+    EXPECT_TRUE(
+        tenant_config->_shared_gc_task_history_expiration_time.set_value(saved_retention.ptr()));
+    tenant_config->_shared_gc_task_history_expiration_time.value_updated_ = saved_updated;
+    EXPECT_EQ(OB_SUCCESS, delete_history_by_round(TENANT_ID, round_id, sql_proxy()));
+  });
+  ASSERT_EQ(OB_SUCCESS, sql_proxy().write(TENANT_ID,
+      "DELETE FROM __all_shared_gc_task_history WHERE tenant_id = 1", affected_rows));
+  ASSERT_EQ(OB_SUCCESS, cleanup.init(TENANT_ID));
+  for (int64_t i = 0; i < 4; ++i) {
+    ASSERT_EQ(OB_SUCCESS, insert_history_backdated(
+        TENANT_ID, round_id, i + 1, ages[i] * day_us, sql_proxy()));
   }
-  // New rows are still there.
-  for (int64_t tid = 4; tid <= 5; ++tid) {
-    ObSharedGCTaskKey key(TENANT_ID, ObSharedGCTaskType::FAIL_GC, round_id, tid);
-    ASSERT_EQ(OB_SUCCESS,
-              ObSharedGCTaskTableOperator::get_history(key, allocator, sql_proxy(), task));
+  ASSERT_EQ(OB_SUCCESS, cleanup.do_cleanup_());
+  for (int64_t i = 0; i < 4; ++i) {
+    key.task_id_ = i + 1;
+    ASSERT_EQ((0 == i) ? OB_ENTRY_NOT_EXIST : OB_SUCCESS,
+        ObSharedGCTaskTableOperator::get_history(key, allocator, sql_proxy(), task));
   }
 
-  ASSERT_EQ(OB_SUCCESS, delete_history_by_round(TENANT_ID, round_id, sql_proxy()));
+  ASSERT_TRUE(tenant_config->_shared_gc_task_history_expiration_time.set_value("45d"));
+  ASSERT_EQ(OB_SUCCESS, insert_history_backdated(
+      TENANT_ID, round_id, 5, 41 * day_us, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, cleanup.do_cleanup_());
+  key.task_id_ = 5;
+  ASSERT_EQ(OB_SUCCESS,
+      ObSharedGCTaskTableOperator::get_history(key, allocator, sql_proxy(), task));
+
+  ASSERT_TRUE(tenant_config->_shared_gc_task_history_expiration_time.set_value("7d"));
+  ASSERT_EQ(OB_SUCCESS, cleanup.do_cleanup_());
+  for (int64_t task_id = 2; task_id <= 5; ++task_id) {
+    key.task_id_ = task_id;
+    ASSERT_EQ((4 == task_id) ? OB_SUCCESS : OB_ENTRY_NOT_EXIST,
+        ObSharedGCTaskTableOperator::get_history(key, allocator, sql_proxy(), task));
+  }
 }
 
-// All three aggregate readers (get_min_round_id, get_round_id_range,
-// get_task_id_range) use `GROUP BY type` so an empty matching set produces
-// 0 rows (next() -> OB_ITER_END -> is_empty=true) instead of 1 row of NULLs.
-// This test verifies they report is_empty=true rather than failing or returning
-// stale data.
-TEST_F(TestSharedGCTaskTableOperator, aggregate_readers_on_empty_set)
+// Public range readers retain their original enum and output contracts.
+TEST_F(TestSharedGCTaskTableOperator, get_range_invalid_args)
 {
-  // Drain the table so the MARK_SWEEP_GC bucket is provably empty. Other
-  // tests in this binary may have left rows behind.
-  bool dummy_stop = false;
-  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete(TENANT_ID, dummy_stop));
-
-  // get_min_round_id: WHERE tenant_id=? AND type=MARK_SWEEP_GC AND round_id<=?
-  // allow_gc_round_id is required to be >= 0 by the operator's arg check, so
-  // use INT64_MAX; with the bucket empty the predicate matches nothing.
-  {
+  const uint64_t tenant_ids[] = {OB_INVALID_TENANT_ID, TENANT_ID, TENANT_ID, TENANT_ID, TENANT_ID};
+  const ObSharedGCTaskType types[] = {
+      ObSharedGCTaskType::FAIL_GC, ObSharedGCTaskType::INVALID_TYPE, ObSharedGCTaskType::MAX_TYPE,
+      ObSharedGCTaskType::FAIL_GC, ObSharedGCTaskType::FAIL_GC};
+  const char *table_names[] = {
+      OB_ALL_SHARED_GC_TASK_TNAME, OB_ALL_SHARED_GC_TASK_TNAME, OB_ALL_SHARED_GC_TASK_TNAME,
+      nullptr, "invalid_shared_gc_task"};
+  for (int64_t i = 0; i < ARRAYSIZEOF(tenant_ids); ++i) {
     bool is_empty = false;
-    int64_t min_round_id = 0;
-    ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::get_min_round_id(
-        TENANT_ID, ObSharedGCTaskType::MARK_SWEEP_GC,
-        INT64_MAX /*allow_gc_round_id*/, sql_proxy(),
-        is_empty, min_round_id));
+    int64_t min_round_id = 7;
+    int64_t max_round_id = 8;
+    int64_t min_task_id = 7;
+    ObSSGCTaskIdRange range(7, 8);
+    ASSERT_EQ(OB_INVALID_ARGUMENT, ObSharedGCTaskTableOperator::get_round_id_range(
+        tenant_ids[i], types[i], table_names[i], sql_proxy(), is_empty, min_round_id, max_round_id));
     ASSERT_TRUE(is_empty);
-  }
-
-  // get_task_id_range: WHERE tenant_id=? AND type=? AND round_id=?
-  // Pick a round_id high enough that no other test could have inserted there
-  // (belt-and-suspenders on top of the batch_delete above).
-  constexpr int64_t EMPTY_ROUND_ID = 1'000'000'000LL;
-  for (const ObSharedGCTaskType type :
-       {ObSharedGCTaskType::MARK_SWEEP_GC, ObSharedGCTaskType::FAIL_GC}) {
-    bool is_empty = false;
-    ObSSGCTaskIdRange round_range;
-    ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::get_task_id_range(
-        TENANT_ID, type, EMPTY_ROUND_ID, sql_proxy(), is_empty, round_range));
+    ASSERT_EQ(-1, min_round_id);
+    ASSERT_EQ(-1, max_round_id);
+    // The task range reader leaves outputs unchanged when validation fails.
+    is_empty = false;
+    ASSERT_EQ(OB_INVALID_ARGUMENT, ObSharedGCTaskTableOperator::get_task_id_range(
+        tenant_ids[i], types[i], 0, table_names[i], sql_proxy(), is_empty, range));
+    ASSERT_FALSE(is_empty);
+    ASSERT_EQ(7, range.start_task_id);
+    ASSERT_EQ(8, range.end_task_id);
+    ASSERT_EQ(OB_INVALID_ARGUMENT, ObSharedGCTaskTableOperator::get_min_task_id(
+        tenant_ids[i], types[i], 0, table_names[i], is_empty, min_task_id));
     ASSERT_TRUE(is_empty);
+    ASSERT_EQ(-1, min_task_id);
   }
+  bool is_empty = false;
+  int64_t min_task_id = 7;
+  ObSSGCTaskIdRange range(7, 8);
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ObSharedGCTaskTableOperator::get_task_id_range(
+      TENANT_ID, ObSharedGCTaskType::FAIL_GC, -1, OB_ALL_SHARED_GC_TASK_TNAME,
+      sql_proxy(), is_empty, range));
+  ASSERT_FALSE(is_empty);
+  ASSERT_EQ(7, range.start_task_id);
+  ASSERT_EQ(8, range.end_task_id);
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ObSharedGCTaskTableOperator::get_min_task_id(
+      TENANT_ID, ObSharedGCTaskType::FAIL_GC, -1, OB_ALL_SHARED_GC_TASK_TNAME,
+      is_empty, min_task_id));
+  ASSERT_TRUE(is_empty);
+  ASSERT_EQ(-1, min_task_id);
 }
 
 // get_round_id_range happy-path + empty-set coverage.
 //   - Empty: clear the table via batch_delete, then verify both type buckets
-//     report is_empty=true. With GROUP BY type, the empty set yields 0 rows
-//     (OB_ITER_END), not 1 row of NULLs.
+//     report is_empty=true when HAVING filters out empty input.
 //   - Non-empty: insert rows with known round_ids for both types and verify
 //     min/max match per-type, independent of the other type's rows. This also
-//     exercises the assumption that GROUP BY columns don't need to be in the
-//     SELECT list: the SQL is `SELECT MIN(round_id), MAX(round_id) ...
-//     GROUP BY type`, and we still read min/max by alias without touching
-//     the type column.
+//     verifies that the aggregate query stays within the requested type.
 TEST_F(TestSharedGCTaskTableOperator, get_round_id_range_basic)
 {
   ObArenaAllocator allocator;
+  ObSSGCTaskIdRange task_range;
   bool dummy_stop = false;
   bool is_empty = true;
   int64_t min_round_id = -1;
   int64_t max_round_id = -1;
 
-  // Pre-clean: drain leftover rows from any prior test/crash. batch_delete
+  // Pre-clean: drain leftover rows from any prior test/crash. batch_delete_task
   // sweeps both MARK_SWEEP_GC and FAIL_GC buckets.
-  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete(TENANT_ID, dummy_stop));
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_task(
+      TENANT_ID, dummy_stop));
 
-  // Empty bucket: aggregate returns NULL, must surface as is_empty=true.
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::get_min_round_id(
+      TENANT_ID, ObSharedGCTaskType::MARK_SWEEP_GC, OB_ALL_SHARED_GC_TASK_TNAME,
+      sql_proxy(), is_empty, min_round_id));
+  ASSERT_TRUE(is_empty);
+  ASSERT_EQ(-1, min_round_id);
+
+  // Empty bucket: HAVING filters out the aggregate row and must report is_empty=true.
   for (const ObSharedGCTaskType type :
        {ObSharedGCTaskType::MARK_SWEEP_GC, ObSharedGCTaskType::FAIL_GC}) {
     is_empty = false;
     min_round_id = -1;
     max_round_id = -1;
     ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::get_round_id_range(
-        TENANT_ID, type, sql_proxy(), is_empty, min_round_id, max_round_id));
+        TENANT_ID, type, OB_ALL_SHARED_GC_TASK_TNAME, sql_proxy(),
+        is_empty, min_round_id, max_round_id));
+    ASSERT_TRUE(is_empty) << "type=" << static_cast<int>(type);
+    is_empty = false;
+    ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::get_task_id_range(
+        TENANT_ID, type, 0, OB_ALL_SHARED_GC_TASK_TNAME, sql_proxy(), is_empty, task_range));
     ASSERT_TRUE(is_empty) << "type=" << static_cast<int>(type);
   }
 
@@ -2431,8 +2513,8 @@ TEST_F(TestSharedGCTaskTableOperator, get_round_id_range_basic)
   // FAIL_GC: min=5000, max=5200.
   is_empty = true;
   ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::get_round_id_range(
-      TENANT_ID, ObSharedGCTaskType::FAIL_GC, sql_proxy(),
-      is_empty, min_round_id, max_round_id));
+      TENANT_ID, ObSharedGCTaskType::FAIL_GC, OB_ALL_SHARED_GC_TASK_TNAME,
+      sql_proxy(), is_empty, min_round_id, max_round_id));
   ASSERT_FALSE(is_empty);
   ASSERT_EQ(5000, min_round_id);
   ASSERT_EQ(5200, max_round_id);
@@ -2440,113 +2522,478 @@ TEST_F(TestSharedGCTaskTableOperator, get_round_id_range_basic)
   // MARK_SWEEP_GC: min=max=9999 (single row, distinct from FAIL_GC rows).
   is_empty = true;
   ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::get_round_id_range(
-      TENANT_ID, ObSharedGCTaskType::MARK_SWEEP_GC, sql_proxy(),
-      is_empty, min_round_id, max_round_id));
+      TENANT_ID, ObSharedGCTaskType::MARK_SWEEP_GC, OB_ALL_SHARED_GC_TASK_TNAME,
+      sql_proxy(), is_empty, min_round_id, max_round_id));
   ASSERT_FALSE(is_empty);
   ASSERT_EQ(9999, min_round_id);
   ASSERT_EQ(9999, max_round_id);
 
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::get_min_round_id(
+      TENANT_ID, ObSharedGCTaskType::MARK_SWEEP_GC, OB_ALL_SHARED_GC_TASK_TNAME,
+      sql_proxy(), is_empty, min_round_id));
+  ASSERT_FALSE(is_empty);
+  ASSERT_EQ(9999, min_round_id);
+
   // Cleanup so the next test starts clean.
-  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete(TENANT_ID, dummy_stop));
-}
-
-// Direct probe of the assumption behind the GROUP BY fix:
-//   SELECT MIN(round_id), MAX(round_id) FROM t WHERE ... GROUP BY type
-// must be accepted by OB even though the GROUP BY column `type` is not in
-// the SELECT list (some engines reject this; OB / MySQL should not).
-// We also verify that when WHERE pins `type` to a single value, the result
-// is exactly one row carrying the per-type aggregate.
-TEST_F(TestSharedGCTaskTableOperator, group_by_unselected_column_works)
-{
-  int ret =  OB_SUCCESS;
-  ObArenaAllocator allocator;
-  bool dummy_stop = false;
-  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete(TENANT_ID, dummy_stop));
-
-  // Insert 3 FAIL_GC rows + 1 MARK_SWEEP_GC row so the table has multiple types.
-  for (const int64_t rid : {6000LL, 6001LL, 6002LL}) {
-    ObSharedGCTask task; ObSharedGCFailInfo info;
-    ASSERT_EQ(OB_SUCCESS, build_fail_task(allocator, rid, 1 /*task_id*/, task, info));
-    ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::insert_task(task, sql_proxy()));
-  }
-  {
-    ObSharedGCMacroIdList list;
-    ObString value;
-    ASSERT_EQ(OB_SUCCESS, build_mark_sweep_value(allocator, 1, list, value));
-    ObSharedGCTask task;
-    task.key_ = ObSharedGCTaskKey(TENANT_ID, ObSharedGCTaskType::MARK_SWEEP_GC,
-                                  7000, 1);
-    task.value_ = value;
-    task.extra_info_ = ObString::make_string("ms");
-    task.server_id_ = ObSharedGCTask::INVALID_SERVER_ID;
-    task.trace_id_.reset();
-    ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::insert_task(task, sql_proxy()));
-  }
-
-  // Issue the exact SQL shape the operator builds: GROUP BY type without
-  // including type in the SELECT list.
-  const uint64_t real_tenant_id = TENANT_ID;  // sys tenant maps to itself
-  ObSqlString sql;
-  ASSERT_EQ(OB_SUCCESS, sql.assign_fmt(
-      "SELECT MIN(round_id) AS min_round_id, MAX(round_id) AS max_round_id "
-      "FROM %s WHERE tenant_id = %lu AND type = %ld GROUP BY type",
-      OB_ALL_SHARED_GC_TASK_TNAME,
-      TENANT_ID,
-      static_cast<int64_t>(ObSharedGCTaskType::FAIL_GC)));
-
-  HEAP_VAR(ObMySQLProxy::MySQLResult, result) {
-    sqlclient::ObMySQLResult *r = nullptr;
-    ASSERT_EQ(OB_SUCCESS, sql_proxy().read(result, real_tenant_id, sql.ptr()));
-    ASSERT_NE(nullptr, r = result.get_result());
-
-    // First (and only) row: aggregates over the FAIL_GC bucket.
-    ASSERT_EQ(OB_SUCCESS, r->next());
-    int64_t min_rid = -1;
-    int64_t max_rid = -1;
-    ASSERT_EQ(OB_SUCCESS, r->get_int("min_round_id", min_rid));
-    ASSERT_EQ(OB_SUCCESS, r->get_int("max_round_id", max_rid));
-    ASSERT_EQ(6000, min_rid);
-    ASSERT_EQ(6002, max_rid);
-
-    // No second row (WHERE pinned type to FAIL_GC -> at most one group).
-    ASSERT_EQ(OB_ITER_END, r->next());
-  }
-
-  // Empty-set sanity check on the same SQL shape: WHERE selects no rows ->
-  // GROUP BY yields zero groups -> first next() returns OB_ITER_END.
-  ObSqlString empty_sql;
-  ASSERT_EQ(OB_SUCCESS, empty_sql.assign_fmt(
-      "SELECT MIN(round_id) AS min_round_id, MAX(round_id) AS max_round_id "
-      "FROM %s WHERE tenant_id = %lu AND type = %ld AND round_id = -1 "
-      "GROUP BY type",
-      OB_ALL_SHARED_GC_TASK_TNAME,
-      TENANT_ID,
-      static_cast<int64_t>(ObSharedGCTaskType::FAIL_GC)));
-  HEAP_VAR(ObMySQLProxy::MySQLResult, result2) {
-    sqlclient::ObMySQLResult *r = nullptr;
-    ASSERT_EQ(OB_SUCCESS, sql_proxy().read(result2, real_tenant_id, empty_sql.ptr()));
-    ASSERT_NE(nullptr, r = result2.get_result());
-    ASSERT_EQ(OB_ITER_END, r->next());
-  }
-
-  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete(TENANT_ID, dummy_stop));
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_task(
+      TENANT_ID, dummy_stop));
 }
 
 // Invalid arguments are rejected before any SQL is executed.
 TEST_F(TestSharedGCTaskTableOperator, delete_expired_history_invalid_args)
 {
-  const int64_t valid_expire = ObTimeUtility::current_time() - 86400LL * 1000000LL;
-  int64_t affected_rows = 0;
+  const int64_t cutoff = 1600000000000000;
+  volatile bool is_stopped = false;
+  ObArenaAllocator allocator;
+  ObSharedGCTask active_task;
+  ObSharedGCTask read_task;
+  ObSharedGCFailInfo info;
+  ASSERT_EQ(OB_SUCCESS, build_fail_task(allocator, 99997070, 1, active_task, info));
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::insert_task(active_task, sql_proxy()));
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ObSharedGCTaskTableOperator::batch_delete_history(
+      OB_INVALID_TENANT_ID, is_stopped, cutoff));
+  // Invalid history cutoffs must not select the active-table implementation.
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ObSharedGCTaskTableOperator::batch_delete_history(
+      TENANT_ID, is_stopped, 0/*invalid cutoff*/));
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::get_task(
+      active_task.key_, allocator, sql_proxy(), read_task));
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ObSharedGCTaskTableOperator::batch_delete_history(
+      TENANT_ID, is_stopped, -1/*invalid cutoff*/));
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::get_task(
+      active_task.key_, allocator, sql_proxy(), read_task));
+  ATOMIC_STORE(&is_stopped, true);
+  ASSERT_EQ(OB_CANCELED, ObSharedGCTaskTableOperator::batch_delete_history(
+      TENANT_ID, is_stopped, cutoff));
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::delete_task(active_task.key_, sql_proxy()));
+}
 
-  ASSERT_EQ(OB_INVALID_ARGUMENT, ObSharedGCTaskTableOperator::batch_delete_expired(
-      OB_INVALID_TENANT_ID, OB_ALL_SHARED_GC_TASK_HISTORY_TNAME,
-      valid_expire, 1000, sql_proxy(), affected_rows));
-  ASSERT_EQ(OB_INVALID_ARGUMENT, ObSharedGCTaskTableOperator::batch_delete_expired(
-      TENANT_ID, OB_ALL_SHARED_GC_TASK_HISTORY_TNAME,
-      0 /*expire_ts_us == 0*/, 1000, sql_proxy(), affected_rows));
-  ASSERT_EQ(OB_INVALID_ARGUMENT, ObSharedGCTaskTableOperator::batch_delete_expired(
-      TENANT_ID, "invalid_table_name",
-      valid_expire, 1000, sql_proxy(), affected_rows));
+int TestSharedGCTaskTableOperator::insert_history_rows(
+    const uint64_t tenant_id,
+    const ObSharedGCTaskType type,
+    const int64_t round_id,
+    const int64_t first_task_id,
+    const int64_t row_count,
+    const int64_t create_ts,
+    ObISQLClient &client)
+{
+  int ret = OB_SUCCESS;
+  if (!is_valid_shared_gc_task_type(type)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(insert_history_rows(tenant_id, static_cast<int64_t>(type), round_id,
+      first_task_id, row_count, create_ts, client))) {
+    LOG_WARN("fail to insert history rows", KR(ret), K(tenant_id), K(type), K(round_id));
+  }
+  return ret;
+}
+
+int TestSharedGCTaskTableOperator::insert_history_rows(
+    const uint64_t tenant_id,
+    const int64_t type,
+    const int64_t round_id,
+    const int64_t first_task_id,
+    const int64_t row_count,
+    const int64_t create_ts,
+    ObISQLClient &client)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  int64_t affected_rows = 0;
+  if (!is_valid_tenant_id(tenant_id) || row_count < 0 || row_count > 1001 || create_ts < 0
+      || (row_count > 0 && first_task_id > INT64_MAX - (row_count - 1))) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (row_count > 0 && OB_FAIL(sql.assign_fmt(
+      "INSERT INTO %s (tenant_id,type,round_id,task_id,value,gmt_create) VALUES ",
+      OB_ALL_SHARED_GC_TASK_HISTORY_TNAME))) {
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < row_count; ++i) {
+    if (OB_FAIL(sql.append_fmt("%s(%lu,%ld,%ld,%ld,X'31',", 0 == i ? "" : ",",
+        tenant_id, type, round_id, first_task_id + i))) {
+    } else if (0 == create_ts) {
+      if (OB_FAIL(sql.append("NULL)"))) {
+        LOG_WARN("fail to append null history timestamp", KR(ret), K(i));
+      }
+    } else if (OB_FAIL(sql.append_fmt("usec_to_time(%ld))", create_ts))) {
+      LOG_WARN("fail to append history timestamp", KR(ret), K(i), K(create_ts));
+    }
+  }
+  if (OB_SUCC(ret) && row_count > 0) {
+    if (OB_FAIL(client.write(OB_SYS_TENANT_ID, sql.ptr(), affected_rows))) {
+      LOG_WARN("fail to insert history rows", KR(ret), K(tenant_id), K(type), K(round_id));
+    } else if (affected_rows != row_count) {
+      ret = OB_ERR_UNEXPECTED;
+    }
+  }
+  return ret;
+}
+
+TEST_F(TestSharedGCTaskTableOperator, delete_expired_history_batch_boundaries)
+{
+  const int64_t row_counts[] = {0, 99, 100, 101};
+  const int64_t end_row_counts[] = {1, 99, 100, 101};
+  const int64_t cutoff = 1600000000000000;
+  volatile bool is_stopped = false;
+  int64_t affected_rows = 0;
+  int64_t row_count = 0;
+  int64_t value_length = 0;
+  ASSERT_EQ(OB_SUCCESS, sql_proxy().write(TENANT_ID,
+      "DELETE FROM __all_shared_gc_task_history WHERE tenant_id = 1", affected_rows));
+  for (int64_t i = 0; i < ARRAYSIZEOF(row_counts); ++i) {
+    const int64_t round_id = 99997000 + i;
+    ASSERT_EQ(OB_SUCCESS, insert_history_rows(TENANT_ID, ObSharedGCTaskType::MARK_SWEEP_GC_DIAG,
+        round_id, 1, row_counts[i], cutoff - 1, sql_proxy()));
+    ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_history(
+        TENANT_ID, is_stopped, cutoff));
+    ASSERT_EQ(OB_SUCCESS, get_history_count(round_id, sql_proxy(), row_count, value_length));
+    ASSERT_EQ(0, row_count);
+  }
+  // Legal maximum IDs must be deleted across slice boundaries without blocking later types.
+  for (int64_t i = 0; i < ARRAYSIZEOF(end_row_counts); ++i) {
+    const int64_t first_task_id = INT64_MAX - (end_row_counts[i] - 1);
+    ASSERT_EQ(OB_SUCCESS, insert_history_rows(TENANT_ID, ObSharedGCTaskType::FAIL_GC,
+        0/*round_id*/, first_task_id, end_row_counts[i], cutoff - 1, sql_proxy()));
+    ASSERT_EQ(OB_SUCCESS, insert_history_rows(TENANT_ID, ObSharedGCTaskType::FAIL_GC_MACRO_ID,
+        0/*round_id*/, 1, 1, cutoff - 1, sql_proxy()));
+    ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_history(
+        TENANT_ID, is_stopped, cutoff));
+    ASSERT_EQ(OB_SUCCESS, get_history_count(0/*round_id*/, sql_proxy(), row_count, value_length));
+    ASSERT_EQ(0, row_count);
+  }
+}
+
+TEST_F(TestSharedGCTaskTableOperator, delete_expired_history_no_expired_pages)
+{
+  const int64_t round_id = 99997010;
+  const int64_t cutoff = 1600000000000000;
+  const int64_t fresh_ts = ObTimeUtility::current_time() + 86400000000LL;
+  const ObSharedGCTaskType type = ObSharedGCTaskType::FAIL_GC;
+  volatile bool is_stopped = false;
+  ObSSGCHistoryCleanupTask task(is_stopped);
+  ObSqlString round_range_sql;
+  ObSqlString task_range_sql;
+  ObSqlString explain_sql;
+  ObSqlString plan;
+  ObString plan_line;
+  int ret = OB_SUCCESS;
+  int64_t affected_rows = 0;
+  int64_t row_count = 0;
+  int64_t value_length = 0;
+  ASSERT_EQ(OB_SUCCESS, sql_proxy().write(TENANT_ID,
+      "DELETE FROM __all_shared_gc_task_history WHERE tenant_id = 1", affected_rows));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(TENANT_ID, ObSharedGCTaskType::FAIL_GC,
+      round_id, 1, 100, fresh_ts, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(TENANT_ID, ObSharedGCTaskType::FAIL_GC,
+      round_id, 101, 1, cutoff - 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(TENANT_ID, ObSharedGCTaskType::FAIL_GC,
+      round_id + 1, 1, 1, cutoff - 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_history(
+      TENANT_ID, is_stopped, cutoff));
+  ASSERT_EQ(OB_SUCCESS, get_history_count(round_id, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(101, row_count);
+  // A zero-delete first slice defers later task IDs and rounds of the same type.
+  ASSERT_EQ(OB_SUCCESS, get_history_count(round_id + 1, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(1, row_count);
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::build_get_round_id_range_sql_(
+      TENANT_ID, type, OB_ALL_SHARED_GC_TASK_HISTORY_TNAME, round_range_sql));
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::build_get_task_id_range_sql_(
+      TENANT_ID, type, round_id, OB_ALL_SHARED_GC_TASK_HISTORY_TNAME, task_range_sql));
+  ASSERT_FALSE(round_range_sql.empty());
+  ASSERT_FALSE(task_range_sql.empty());
+  ASSERT_NE(nullptr, STRSTR(round_range_sql.ptr(), "HAVING MIN(round_id) IS NOT NULL"));
+  ASSERT_NE(nullptr, STRSTR(task_range_sql.ptr(), "HAVING MIN(task_id) IS NOT NULL"));
+  for (int64_t i = 0; i < 2; ++i) {
+    ret = OB_SUCCESS;
+    plan.reset();
+    ASSERT_EQ(OB_SUCCESS, explain_sql.assign_fmt("EXPLAIN EXTENDED %s",
+        0 == i ? round_range_sql.ptr() : task_range_sql.ptr()));
+    HEAP_VAR(ObMySQLProxy::MySQLResult, result) {
+      sqlclient::ObMySQLResult *mysql_result = nullptr;
+      ASSERT_EQ(OB_SUCCESS, sql_proxy().read(result, TENANT_ID, explain_sql.ptr()));
+      ASSERT_NE(nullptr, mysql_result = result.get_result());
+      while (OB_SUCCESS == (ret = mysql_result->next())) {
+        ASSERT_EQ(OB_SUCCESS, mysql_result->get_varchar(static_cast<int64_t>(0), plan_line));
+        ASSERT_EQ(OB_SUCCESS, plan.append_fmt("%.*s\n", plan_line.length(), plan_line.ptr()));
+      }
+      ASSERT_EQ(OB_ITER_END, ret);
+    }
+    LOG_INFO("history cleanup range explain", K(i), K(plan));
+    // Both MIN and MAX must stop at an index endpoint instead of aggregating the full range.
+    const char *first_limit = STRSTR(plan.ptr(), "limit(1)");
+    ASSERT_NE(nullptr, first_limit);
+    ASSERT_NE(nullptr, STRSTR(first_limit + 1, "limit(1)"));
+    ASSERT_NE(nullptr, STRSTR(plan.ptr(), "(Reverse)"));
+    ASSERT_EQ(nullptr, STRSTR(plan.ptr(), "SORT"));
+  }
+  // Repeating cleanup must preserve deferred rows without looping on the first slice.
+  ASSERT_EQ(OB_SUCCESS, task.init(TENANT_ID));
+  ASSERT_EQ(OB_SUCCESS, task.do_cleanup_());
+  ASSERT_EQ(OB_SUCCESS, get_history_count(round_id, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(101, row_count);
+  task.destroy();
+  // Once the first slice expires, both the remaining tasks and the next round are drained.
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_history(
+      TENANT_ID, is_stopped, fresh_ts + 1));
+  ASSERT_EQ(OB_SUCCESS, get_history_count(round_id, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(0, row_count);
+  ASSERT_EQ(OB_SUCCESS, get_history_count(round_id + 1, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(0, row_count);
+  ASSERT_EQ(OB_SUCCESS, delete_history_by_round(TENANT_ID, round_id, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, delete_history_by_round(TENANT_ID, round_id + 1, sql_proxy()));
+}
+
+TEST_F(TestSharedGCTaskTableOperator, delete_expired_history_full_key_and_cutoff)
+{
+  const int64_t round_id = 99997020;
+  const int64_t cutoff = 1600000000000000;
+  const uint64_t other_tenant_id = 1001;
+  const ObSharedGCTaskType type = ObSharedGCTaskType::MARK_SWEEP_GC_OBJECT_STORAGE_STAT;
+  volatile bool is_stopped = false;
+  int64_t affected_rows = 0;
+  int64_t row_count = 0;
+  int64_t value_length = 0;
+  ASSERT_EQ(OB_SUCCESS, sql_proxy().write(TENANT_ID,
+      "DELETE FROM __all_shared_gc_task_history WHERE tenant_id IN (1,1001)", affected_rows));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(
+      TENANT_ID, type, round_id, 7, 1, cutoff - 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(
+      TENANT_ID, type, round_id + 1, 0, 1, cutoff, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(TENANT_ID, ObSharedGCTaskType::MARK_SWEEP_GC_DIAG,
+      round_id, 0, 1, cutoff - 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(TENANT_ID, ObSharedGCTaskType::MARK_SWEEP_GC_DIAG,
+      round_id, 1, 1, 0/*NULL gmt_create*/, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(TENANT_ID, ObSharedGCTaskType::MARK_SWEEP_GC_DIAG,
+      round_id + 1, 0, 1, cutoff + 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(other_tenant_id, type,
+      round_id, 7, 1, cutoff - 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_history(
+      TENANT_ID, is_stopped, cutoff));
+  ASSERT_EQ(OB_SUCCESS, get_history_count(round_id, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(1, row_count);
+  ASSERT_EQ(OB_SUCCESS, get_history_count(round_id + 1, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(2, row_count);
+  ASSERT_EQ(OB_SUCCESS, sql_proxy().write(TENANT_ID,
+      "DELETE FROM __all_shared_gc_task_history WHERE tenant_id IN (1,1001)", affected_rows));
+  ASSERT_EQ(4, affected_rows);
+}
+
+TEST_F(TestSharedGCTaskTableOperator, delete_expired_history_retry_and_reinsert)
+{
+  const int64_t round_id = 99997030;
+  const int64_t cutoff = 1600000000000000;
+  const ObSharedGCTaskType type = ObSharedGCTaskType::MARK_SWEEP_GC_DIAG;
+  const ObSSGCTaskIdRange first_slice(1, 100);
+  const ObSSGCTaskIdRange last_slice(101, 101);
+  const ObSharedGCTaskKey reinsert_key(TENANT_ID, type, round_id, 101);
+  const int64_t saved_timeout = THIS_WORKER.get_timeout_ts();
+  volatile bool is_stopped = false;
+  ObSSGCTaskIdRange scanned_range;
+  bool is_empty = true;
+  int cleanup_ret = OB_SUCCESS;
+  int64_t affected_rows = 0;
+  int64_t row_count = 0;
+  int64_t value_length = 0;
+  ASSERT_EQ(OB_SUCCESS, sql_proxy().write(TENANT_ID,
+      "DELETE FROM __all_shared_gc_task_history WHERE tenant_id = 1", affected_rows));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(TENANT_ID, type,
+      round_id, 1, 101, cutoff - 1, sql_proxy()));
+  THIS_WORKER.set_timeout_ts(1/*expired deadline*/);
+  cleanup_ret = ObSharedGCTaskTableOperator::batch_delete_history(
+      TENANT_ID, is_stopped, cutoff);
+  THIS_WORKER.set_timeout_ts(saved_timeout);
+  ASSERT_EQ(OB_TIMEOUT, cleanup_ret);
+  ASSERT_EQ(OB_SUCCESS, get_history_count(round_id, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(101, row_count);
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_slice_(
+      TENANT_ID, type, round_id, first_slice, OB_ALL_SHARED_GC_TASK_HISTORY_TNAME,
+      cutoff, affected_rows));
+  ASSERT_EQ(100, affected_rows);
+  THIS_WORKER.set_timeout_ts(1/*expired deadline*/);
+  cleanup_ret = ObSharedGCTaskTableOperator::batch_delete_slice_(
+      TENANT_ID, type, round_id, last_slice, OB_ALL_SHARED_GC_TASK_HISTORY_TNAME,
+      cutoff, affected_rows);
+  THIS_WORKER.set_timeout_ts(saved_timeout);
+  ASSERT_EQ(OB_TIMEOUT, cleanup_ret);
+  ASSERT_EQ(0, affected_rows);
+  ASSERT_EQ(OB_SUCCESS, get_history_count(round_id, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(1, row_count);
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_history(
+      TENANT_ID, is_stopped, cutoff));
+  ASSERT_EQ(OB_SUCCESS, get_history_count(round_id, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(0, row_count);
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(TENANT_ID, type,
+      round_id, 101, 1, cutoff - 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::get_task_id_range(
+      TENANT_ID, type, round_id, OB_ALL_SHARED_GC_TASK_HISTORY_TNAME,
+      sql_proxy(), is_empty, scanned_range));
+  ASSERT_FALSE(is_empty);
+  ASSERT_EQ(101, scanned_range.start_task_id);
+  ASSERT_EQ(101, scanned_range.end_task_id);
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::delete_history(reinsert_key, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(TENANT_ID, type,
+      round_id, 101, 1, cutoff + 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_slice_(
+      TENANT_ID, type, round_id, scanned_range, OB_ALL_SHARED_GC_TASK_HISTORY_TNAME,
+      cutoff, affected_rows));
+  ASSERT_EQ(0, affected_rows);
+  ASSERT_EQ(OB_SUCCESS, get_history_count(round_id, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(1, row_count);
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(TENANT_ID, type,
+      round_id, 0, 1, cutoff - 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_history(
+      TENANT_ID, is_stopped, cutoff));
+  ASSERT_EQ(OB_SUCCESS, get_history_count(round_id, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(1, row_count);
+  ASSERT_EQ(OB_SUCCESS, delete_history_by_round(TENANT_ID, round_id, sql_proxy()));
+}
+
+// Stop on an unexpired first slice, and revisit deferred rounds on the next sweep.
+TEST_F(TestSharedGCTaskTableOperator, delete_expired_history_stop_after_unexpired_round)
+{
+  const int64_t cutoff = 1600000000000000;
+  const ObSharedGCTaskType type = ObSharedGCTaskType::FAIL_GC;
+  volatile bool is_stopped = false;
+  ObSqlString sql;
+  int64_t affected_rows = 0;
+  int64_t row_count = 0;
+  int64_t value_length = 0;
+  ASSERT_EQ(OB_SUCCESS, sql_proxy().write(TENANT_ID,
+      "DELETE FROM __all_shared_gc_task_history WHERE tenant_id = 1", affected_rows));
+  // The first round spans two slices. The later type must still be visited after its early stop.
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(
+      TENANT_ID, type, 2, 1, 101, cutoff + 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(
+      TENANT_ID, type, 3, 1, 1, cutoff - 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(
+      TENANT_ID, ObSharedGCTaskType::MARK_SWEEP_GC_DIAG, 4, 1, 1, cutoff - 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_history(
+      TENANT_ID, is_stopped, cutoff));
+  ASSERT_EQ(OB_SUCCESS, get_history_count(2, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(101, row_count);
+  ASSERT_EQ(OB_SUCCESS, get_history_count(3, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(1, row_count);
+  ASSERT_EQ(OB_SUCCESS, get_history_count(4, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(0, row_count);
+  // Partial cleanup leaves the smallest round in place and defers later rounds.
+  ASSERT_EQ(OB_SUCCESS, sql.assign_fmt(
+      "UPDATE %s SET gmt_create=usec_to_time(%ld) "
+      "WHERE tenant_id=%lu AND type=%ld AND round_id=2 AND task_id=1",
+      OB_ALL_SHARED_GC_TASK_HISTORY_TNAME, cutoff - 1, TENANT_ID, static_cast<int64_t>(type)));
+  ASSERT_EQ(OB_SUCCESS, sql_proxy().write(TENANT_ID, sql.ptr(), affected_rows));
+  ASSERT_EQ(1, affected_rows);
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_history(
+      TENANT_ID, is_stopped, cutoff));
+  ASSERT_EQ(OB_SUCCESS, get_history_count(2, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(100, row_count);
+  ASSERT_EQ(OB_SUCCESS, get_history_count(3, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(1, row_count);
+  // Once the remaining rows expire, the next sweep drains both rounds.
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_history(
+      TENANT_ID, is_stopped, cutoff + 2));
+  ASSERT_EQ(OB_SUCCESS, get_history_count(2, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(0, row_count);
+  ASSERT_EQ(OB_SUCCESS, get_history_count(3, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(0, row_count);
+}
+
+// Sparse task IDs must not turn a small history bucket into a numeric range scan.
+TEST_F(TestSharedGCTaskTableOperator, delete_expired_history_sparse_task_ids)
+{
+  const ObSharedGCTaskType types[] = {
+      ObSharedGCTaskType::FAIL_GC, ObSharedGCTaskType::MARK_SWEEP_GC_IN_TABLE_STAT};
+  const int64_t cutoff = 1600000000000000;
+  const int64_t saved_timeout = THIS_WORKER.get_timeout_ts();
+  volatile bool is_stopped = false;
+  int cleanup_ret = OB_SUCCESS;
+  int64_t affected_rows = 0;
+  int64_t row_count = 0;
+  int64_t value_length = 0;
+  ASSERT_EQ(OB_SUCCESS, sql_proxy().write(TENANT_ID,
+      "DELETE FROM __all_shared_gc_task_history WHERE tenant_id = 1", affected_rows));
+  for (int64_t i = 0; i < ARRAYSIZEOF(types); ++i) {
+    const int64_t round_id = i;
+    ASSERT_EQ(OB_SUCCESS, insert_history_rows(
+        TENANT_ID, types[i], round_id, 1, 1, cutoff - 1, sql_proxy()));
+    ASSERT_EQ(OB_SUCCESS, insert_history_rows(
+        TENANT_ID, types[i], round_id, INT64_MAX, 1, cutoff - 1, sql_proxy()));
+    // A deadline makes regression to numeric iteration fail instead of hanging the suite.
+    THIS_WORKER.set_timeout_ts(ObTimeUtility::current_time() + 10000000);
+    cleanup_ret = ObSharedGCTaskTableOperator::batch_delete_history(
+        TENANT_ID, is_stopped, cutoff);
+    THIS_WORKER.set_timeout_ts(saved_timeout);
+    ASSERT_EQ(OB_SUCCESS, cleanup_ret);
+    ASSERT_EQ(OB_SUCCESS, get_history_count(round_id, sql_proxy(), row_count, value_length));
+    ASSERT_EQ(0, row_count);
+  }
+}
+
+// Sparse round IDs must seek existing rows rather than walk their numeric gap.
+TEST_F(TestSharedGCTaskTableOperator, delete_expired_history_sparse_rounds)
+{
+  const int64_t cutoff = 1600000000000000;
+  const ObSharedGCTaskType type = ObSharedGCTaskType::MARK_SWEEP_GC_DIAG;
+  const int64_t saved_timeout = THIS_WORKER.get_timeout_ts();
+  volatile bool is_stopped = false;
+  int cleanup_ret = OB_SUCCESS;
+  int64_t affected_rows = 0;
+  int64_t row_count = 0;
+  int64_t value_length = 0;
+  ASSERT_EQ(OB_SUCCESS, sql_proxy().write(TENANT_ID,
+      "DELETE FROM __all_shared_gc_task_history WHERE tenant_id = 1", affected_rows));
+  // Removing round 0 must expose the next existing round across a large numeric gap.
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(
+      TENANT_ID, type, 0, 1, 1, cutoff - 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(
+      TENANT_ID, type, INT64_MAX, 1, 1, cutoff - 1, sql_proxy()));
+  // Bound the regression so numeric round iteration fails instead of hanging.
+  THIS_WORKER.set_timeout_ts(ObTimeUtility::current_time() + 10000000);
+  cleanup_ret = ObSharedGCTaskTableOperator::batch_delete_history(
+      TENANT_ID, is_stopped, cutoff);
+  THIS_WORKER.set_timeout_ts(saved_timeout);
+  ASSERT_EQ(OB_SUCCESS, cleanup_ret);
+  ASSERT_EQ(OB_SUCCESS, get_history_count(0, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(0, row_count);
+  ASSERT_EQ(OB_SUCCESS, get_history_count(INT64_MAX, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(0, row_count);
+  // An unexpired first round defers later rounds until a subsequent sweep.
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(
+      TENANT_ID, type, 1, 1, 1, cutoff + 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(
+      TENANT_ID, type, INT64_MAX, 1, 1, cutoff - 1, sql_proxy()));
+  THIS_WORKER.set_timeout_ts(ObTimeUtility::current_time() + 10000000);
+  cleanup_ret = ObSharedGCTaskTableOperator::batch_delete_history(
+      TENANT_ID, is_stopped, cutoff);
+  THIS_WORKER.set_timeout_ts(saved_timeout);
+  ASSERT_EQ(OB_SUCCESS, cleanup_ret);
+  ASSERT_EQ(OB_SUCCESS, get_history_count(1, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(1, row_count);
+  ASSERT_EQ(OB_SUCCESS, get_history_count(INT64_MAX, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(1, row_count);
+  ASSERT_EQ(OB_SUCCESS, delete_history_by_round(TENANT_ID, 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, delete_history_by_round(TENANT_ID, INT64_MAX, sql_proxy()));
+}
+
+// An unexpired type bucket must not prevent cleanup of later known types.
+TEST_F(TestSharedGCTaskTableOperator, delete_expired_history_unexpired_type_buckets)
+{
+  const int64_t round_id = 99997060;
+  const int64_t cutoff = 1600000000000000;
+  const int64_t last_type = static_cast<int64_t>(ObSharedGCTaskType::MAX_TYPE) - 1;
+  volatile bool is_stopped = false;
+  int64_t affected_rows = 0;
+  int64_t row_count = 0;
+  int64_t value_length = 0;
+  ASSERT_EQ(OB_SUCCESS, sql_proxy().write(TENANT_ID,
+      "DELETE FROM __all_shared_gc_task_history WHERE tenant_id = 1", affected_rows));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(
+      TENANT_ID, ObSharedGCTaskType::MARK_SWEEP_GC, round_id, 1, 100, cutoff + 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(
+      TENANT_ID, ObSharedGCTaskType::FAIL_GC, round_id, 1, 1, cutoff - 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, insert_history_rows(
+      TENANT_ID, last_type, round_id, 1, 1, cutoff - 1, sql_proxy()));
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::batch_delete_history(
+      TENANT_ID, is_stopped, cutoff));
+  ASSERT_EQ(OB_SUCCESS, get_history_count(round_id, sql_proxy(), row_count, value_length));
+  ASSERT_EQ(100, row_count);
+  ASSERT_EQ(OB_SUCCESS, delete_history_by_round(TENANT_ID, round_id, sql_proxy()));
 }
 
 // =====================================================================

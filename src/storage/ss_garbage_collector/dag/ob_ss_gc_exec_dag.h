@@ -184,7 +184,7 @@ private:
 // ====================================================================================
 // MarkSweep plan task for ObSSGCExecDag.
 //
-//   Step 1: SELECT MIN(round_id) over [0, allow_gc_round_id] -> min_round_id.
+//   Step 1: SELECT MIN(round_id) and skip if it exceeds allow_gc_round_id.
 //   Step 2: SELECT MIN(task_id), MAX(task_id) for min_round_id and compute the first slice.
 //   Step 3: create_task for the first execute task; subsequent slices chain via generate_next_task.
 // ====================================================================================

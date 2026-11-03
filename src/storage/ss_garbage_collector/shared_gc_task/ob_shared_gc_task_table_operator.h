@@ -56,42 +56,37 @@ public:
       common::ObISQLClient &client,
       ObSharedGCTask &task);
 
-  // MarkSweep GC only. Returns OB_INVALID_ARGUMENT for other types.
-  // MIN(round_id) in (tenant_id, type) under the watermark:
-  //   round_id <= allow_gc_round_id
-  // is_empty=true  : no eligible row exists; min_round_id is undefined.
-  // is_empty=false : eligible row found; min_round_id carries MIN(round_id).
-  // One timer cycle only drains the rows under this min_round_id; the next
-  // cycle will pick up the next smallest round_id, so the worker chain never
-  // needs to advance across rounds.
-  static int get_min_round_id(
-      const uint64_t tenant_id,
-      const ObSharedGCTaskType type,
-      const int64_t allow_gc_round_id,
-      common::ObISQLClient &client,
-      bool &is_empty,
-      int64_t &min_round_id);
-
-  // Planner Step 2: MIN/MAX(task_id) for one specific round_id.
+  // MIN/MAX(task_id) for one round in the task or history table.
   // is_empty=true  : no rows match the round; round_range is undefined.
   // is_empty=false : rows found; round_range carries [MIN(task_id), MAX(task_id)].
   static int get_task_id_range(
       const uint64_t tenant_id,
       const ObSharedGCTaskType type,
       const int64_t round_id,
+      const char *table_name,
       common::ObISQLClient &client,
       bool &is_empty,
       ObSSGCTaskIdRange &round_range);
 
+  // MIN(task_id) for one round in the task or history table.
+  // An empty result sets is_empty=true and min_task_id=-1.
+  static int get_min_task_id(
+      const uint64_t tenant_id,
+      const ObSharedGCTaskType type,
+      const int64_t round_id,
+      const char *table_name,
+      bool &is_empty,
+      int64_t &min_task_id);
+
   // MIN(round_id), MAX(round_id) over the whole (tenant_id, type) bucket, with
   // no upper-bound watermark filter. Intended for unconditional sweeps (e.g.
-  // batch_delete) that drain every row regardless of allow_gc_round_id.
-  // Accepts any valid ObSharedGCTaskType (MARK_SWEEP_GC or FAIL_GC).
+  // batch_delete_task) that drain every row regardless of allow_gc_round_id.
   // is_empty=true  : no rows exist; min/max are undefined.
   // is_empty=false : rows found; min_round_id and max_round_id are set.
   static int get_round_id_range(
       const uint64_t tenant_id,
       const ObSharedGCTaskType type,
+      const char *table_name,
       common::ObISQLClient &client,
       bool &is_empty,
       int64_t &min_round_id,
@@ -166,37 +161,27 @@ public:
       const ObSharedGCTaskKey &key,
       common::ObISQLClient &client);
 
-  // Delete up to `limit` rows from `table_name` whose gmt_create < usec_to_time(expire_ts_us).
-  // Only acts on the calling tenant's rows (WHERE tenant_id = ?).
-  // Callers are responsible for looping until affected_rows < limit.
-  // `table_name` must be OB_ALL_SHARED_GC_TASK_TNAME or OB_ALL_SHARED_GC_TASK_HISTORY_TNAME.
-  static int batch_delete_expired(
-      const uint64_t tenant_id,
-      const char *table_name,
-      const int64_t expire_ts_us,
-      const int64_t limit,
-      common::ObISQLClient &client,
-      int64_t &affected_rows);
-
-  // Unconditional sweep of __all_shared_gc_task: deletes every row owned by
-  // tenant_id across all ObSharedGCTaskType buckets (MARK_SWEEP_GC and
-  // FAIL_GC). Mirrors the ObMarkSweepPlanTask drain pattern but ignores the
-  // allow_gc_round_id watermark. Steps:
-  //   1. For each type, resolve [MIN(round_id), MAX(round_id)] via
-  //      get_round_id_range.
-  //   2. For each round_id in the closed range, fetch its task_id range and
-  //      delete it in DEFAULT_SLICE_SIZE-sized slices using
-  //      task_id BETWEEN ? AND ?.
-  //   3. Check `is_stop` before/after every slice; on stop, return
-  //      OB_CANCELED. Slices already committed are left as-is — each slice is
-  //      its own auto-commit DELETE.
-  // Empty rounds are skipped silently (a concurrent worker may have drained
-  // them between the planning and execute step).
-  static int batch_delete(
+  // Sweep active tasks without a time filter.
+  // Re-reads the smallest task ID for each bounded DELETE slice.
+  // Stop or SQL failure ends this call; committed slices are safe to retry next time.
+  static int batch_delete_task(
       const uint64_t tenant_id,
       const volatile bool &is_stop);
+  // Delete expired history and recheck the cutoff in every DELETE slice.
+  // A zero-delete slice defers the remaining rows of that type to a later sweep.
+  static int batch_delete_history(
+      const uint64_t tenant_id,
+      const volatile bool &is_stop,
+      const int64_t expired_time_us);
 
 private:
+  // Sweep the specified table; a positive cutoff enables expiration filtering.
+  static int batch_delete_(
+      const uint64_t tenant_id,
+      const volatile bool &is_stop,
+      const char *table_name,
+      const int64_t expired_time_us);
+
   // A task and its statistics rows must fit both limits. Validate task-size and
   // batch-limit changes with the maximum-input history batch test.
   static constexpr int64_t MAX_HISTORY_BATCH_ROW_COUNT = 100;
@@ -268,11 +253,6 @@ private:
       ObSharedGCTask &task,
       int64_t &gmt_create,
       int64_t &gmt_modified);
-  static int build_get_min_round_id_sql_(
-      const uint64_t tenant_id,
-      const ObSharedGCTaskType type,
-      const int64_t allow_gc_round_id,
-      common::ObSqlString &sql);
   static int read_min_round_id_(
       common::ObISQLClient &client,
       const uint64_t real_tenant_id,
@@ -283,6 +263,7 @@ private:
       const uint64_t tenant_id,
       const ObSharedGCTaskType type,
       const int64_t round_id,
+      const char *table_name,
       common::ObSqlString &sql);
   static int read_task_id_range_(
       common::ObISQLClient &client,
@@ -293,6 +274,7 @@ private:
   static int build_get_round_id_range_sql_(
       const uint64_t tenant_id,
       const ObSharedGCTaskType type,
+      const char *table_name,
       common::ObSqlString &sql);
   static int read_round_id_range_(
       common::ObISQLClient &client,
@@ -301,13 +283,13 @@ private:
       bool &is_empty,
       int64_t &min_round_id,
       int64_t &max_round_id);
-  // DELETE one slice from __all_shared_gc_task by
-  // (tenant_id, type, round_id, task_id BETWEEN start AND end).
   static int batch_delete_slice_(
       const uint64_t tenant_id,
       const ObSharedGCTaskType type,
       const int64_t round_id,
       const ObSSGCTaskIdRange &slice_range,
+      const char *table_name,
+      const int64_t expired_time_us,
       int64_t &affected_rows);
   static int get_sql_timeout_us_(const uint64_t tenant_id, int64_t &timeout_us);
 };

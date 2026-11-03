@@ -6,10 +6,8 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/ss_garbage_collector/task/ob_ss_gc_history_cleanup_task.h"
-#include "lib/atomic/ob_atomic.h"
 #include "lib/time/ob_time_utility.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
-#include "share/inner_table/ob_inner_table_schema_constants.h"
 #include "share/ob_server_struct.h"
 #include "storage/ss_garbage_collector/shared_gc_task/ob_shared_gc_task_table_operator.h"
 
@@ -94,25 +92,12 @@ int ObSSGCHistoryCleanupTask::do_cleanup_()
     const int64_t now_us       = ObTimeUtility::current_time();
     const int64_t expire_ts_us = now_us - retention_us;
 
-    // Step 3: delete expired rows in batches until done or stopped
-    int64_t total_affected_rows = 0;
-    int64_t cur_affected_rows   = DEFAULT_DELETE_EXPIRED_HISTORY_LIMIT;
-    while (OB_SUCC(ret) && !ATOMIC_LOAD(&is_stopped_) &&
-           (cur_affected_rows == DEFAULT_DELETE_EXPIRED_HISTORY_LIMIT)) {
-      cur_affected_rows = 0;
-      if (OB_FAIL(ObSharedGCTaskTableOperator::batch_delete_expired(
-            tenant_id_, share::OB_ALL_SHARED_GC_TASK_HISTORY_TNAME,
-            expire_ts_us, DEFAULT_DELETE_EXPIRED_HISTORY_LIMIT,
-            *GCTX.sql_proxy_, cur_affected_rows))) {
-        LOG_WARN("history cleanup tick failed",
-                 KR(ret), K_(tenant_id), K(expire_ts_us), K(total_affected_rows));
-      } else {
-        total_affected_rows += cur_affected_rows;
-      }
-    }
-    if (OB_SUCC(ret)) {
-      LOG_INFO("history cleanup tick finished",
-               K_(tenant_id), K(total_affected_rows), K(expire_ts_us));
+    // Step 3: reuse the primary-key range sweep and recheck expiration in DELETE.
+    if (OB_FAIL(ObSharedGCTaskTableOperator::batch_delete_history(
+        tenant_id_, is_stopped_, expire_ts_us))) {
+      LOG_WARN("history cleanup tick failed", KR(ret), K_(tenant_id), K(expire_ts_us));
+    } else {
+      LOG_INFO("history cleanup tick finished", K_(tenant_id), K(expire_ts_us));
     }
   }
   return ret;
