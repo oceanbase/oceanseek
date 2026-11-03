@@ -652,7 +652,7 @@ int ObInvSSTableMergeHelper::check_macro_block_reuse_compatibility_(
   } else {
     const ObInvSSTable *inv_sstable = static_cast<const ObInvSSTable *>(
         static_cast<const ObSSTable *>(table));
-    const ObInvIdxStatsMeta &source_inv_meta = inv_sstable->get_inv_meta();
+    const ObInvIdxStatsMeta &source_inv_meta = inv_sstable->get_inv_meta().get_stats();
     if (OB_UNLIKELY(!source_inv_meta.is_valid())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid source inverted sstable meta", K(ret), K(source_inv_meta));
@@ -661,7 +661,13 @@ int ObInvSSTableMergeHelper::check_macro_block_reuse_compatibility_(
       // Without a valid output descriptor physical compatibility cannot be proven. Keep the default
       // false and force the caller down to a finer-grained rewrite path.
     } else {
-      is_compatible = source_inv_meta.index_type_ == inv_idx_row_desc_.index_type_
+      const common::ObIArray<share::schema::ObColDesc> &col_descs =
+          data_store_desc_->get_full_stored_col_descs();
+      const int64_t doc_id_col_idx = inv_idx_row_desc_.doc_id_col_idx_;
+      // Match the layout check used when the writer merges reused macro metadata.
+      is_compatible = doc_id_col_idx >= 0 && doc_id_col_idx < col_descs.count()
+          && source_inv_meta.doc_id_obj_meta_ == col_descs.at(doc_id_col_idx).col_type_
+          && source_inv_meta.index_type_ == inv_idx_row_desc_.index_type_
           && source_inv_meta.has_relevance_params_ == (inv_idx_row_desc_.token_freq_col_idx_ >= 0)
           && source_inv_meta.has_position_list_ == (inv_idx_row_desc_.pos_list_col_idx_ >= 0)
           && source_inv_meta.has_nested_key_ == (inv_idx_row_desc_.nested_key_col_idx_ >= 0);

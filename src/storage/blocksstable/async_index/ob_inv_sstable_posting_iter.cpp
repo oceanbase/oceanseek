@@ -207,7 +207,7 @@ int ObInvSSTablePostingIter::open(
     doc_freq_ = param.doc_freq_;
     total_doc_cnt_ = param.total_doc_cnt_;
     avg_doc_length_ = param.avg_doc_length_;
-    has_relevance_params_ = sstable.get_inv_meta().has_relevance_params_;
+    has_relevance_params_ = sstable.get_inv_meta().get_stats().has_relevance_params_;
     need_posting_value_ = param.need_posting_value_;
     min_doc_id_ = param.min_doc_id_;
     max_doc_id_ = param.max_doc_id_;

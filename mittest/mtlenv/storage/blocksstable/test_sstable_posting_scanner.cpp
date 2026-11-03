@@ -459,8 +459,8 @@ TEST_F(TestInvIdxSSTablePrepare, scan_all_terms_accounting)
   // Every input (term, doc_id) row lands in exactly one posting block.
   ASSERT_EQ(row_cnt, total_doc_count);
   // The leaf-layer doc-id extremes match the sstable's inv extended meta.
-  ASSERT_EQ(inv_sstable.get_inv_meta().min_doc_id_, global_min_id);
-  ASSERT_EQ(inv_sstable.get_inv_meta().max_doc_id_, global_max_id);
+  ASSERT_EQ(inv_sstable.get_inv_meta().get_stats().min_doc_id_, global_min_id);
+  ASSERT_EQ(inv_sstable.get_inv_meta().get_stats().max_doc_id_, global_max_id);
   STORAGE_LOG(INFO, "scanned all terms", K(term_cnt), K(total_doc_count),
       K(global_min_id), K(global_max_id));
 }

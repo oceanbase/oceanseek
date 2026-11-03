@@ -1937,7 +1937,7 @@ int ObSSIncMajorDDLMergeHelper::init_empty_inv_meta(
   ObTabletMemberWrapper<ObTabletTableStore> table_store_wrapper;
   const ObSSTable *major_sstable = nullptr;
   const ObInvSSTable *major_inv_sstable = nullptr;
-  ObInvIdxStatsMeta empty_inv_meta;
+  ObInvSSTableMeta empty_inv_meta;
   if (OB_UNLIKELY(!ls_id.is_valid() || !tablet_id.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), K(ls_id), K(tablet_id));
@@ -1956,7 +1956,9 @@ int ObSSIncMajorDDLMergeHelper::init_empty_inv_meta(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("major sstable is not inverted index sstable", KR(ret), KPC(major_sstable));
   } else if (FALSE_IT(major_inv_sstable = static_cast<const ObInvSSTable *>(major_sstable))) {
-  } else if (FALSE_IT(empty_inv_meta = major_inv_sstable->get_inv_meta())) {
+  } else if (OB_FAIL(empty_inv_meta.assign(
+      major_inv_sstable->get_inv_meta()))) {
+    LOG_WARN("failed to copy major inverted stats", KR(ret));
   } else if (OB_UNLIKELY(!empty_inv_meta.is_valid())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("major inverted index meta is invalid", KR(ret), K(empty_inv_meta), KPC(major_inv_sstable));

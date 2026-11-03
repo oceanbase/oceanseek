@@ -461,17 +461,18 @@ public:
     param.full_column_cnt_ = param.column_cnt_;
     param.co_base_type_ = ObCOSSTableBaseType::INVALID_TYPE;
     param.co_base_snapshot_version_ = 0;
-    param.inv_meta_.reset();
-    param.inv_meta_.index_type_ = INV_IDX_TYPE_FTS;
-    param.inv_meta_.has_relevance_params_ = true;
-    param.inv_meta_.has_position_list_ = true;
-    param.inv_meta_.doc_id_obj_meta_.set_uint64();
-    param.inv_meta_.min_doc_id_ = 7;
-    param.inv_meta_.max_doc_id_ = 100;
-    param.inv_meta_.total_doc_length_ = 123;
-
+    ObInvIdxStatsMeta inv_stats;
+    inv_stats.index_type_ = INV_IDX_TYPE_FTS;
+    inv_stats.has_relevance_params_ = true;
+    inv_stats.has_position_list_ = true;
+    inv_stats.doc_id_obj_meta_.set_uint64();
+    inv_stats.min_doc_id_ = 7;
+    inv_stats.max_doc_id_ = 100;
     compaction::ObUncommitTxDesc tx_desc(100, 200);
-    if (OB_FAIL(param.column_checksums_.reserve(param.column_cnt_))) {
+    inv_stats.total_doc_length_ = 123;
+    if (OB_FAIL(param.inv_meta_.init(inv_stats))) {
+      LOG_WARN("failed to initialize inverted sstable metadata", K(ret));
+    } else if (OB_FAIL(param.column_checksums_.reserve(param.column_cnt_))) {
       LOG_WARN("failed to reserve column checksums", K(ret), K(param.column_cnt_));
     } else if (OB_FAIL(param.uncommit_tx_info_.push_back(tx_desc))) {
       LOG_WARN("failed to push back tx desc", K(ret));
@@ -1732,9 +1733,9 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_with_inv_sstable)
   ASSERT_TRUE(restored_sstable.is_valid());
   ASSERT_TRUE(restored_sstable.is_inc_inv_sstable());
   ASSERT_TRUE(restored_sstable.get_inv_meta().is_valid());
-  ASSERT_EQ(7, restored_sstable.get_inv_meta().min_doc_id_);
-  ASSERT_EQ(100, restored_sstable.get_inv_meta().max_doc_id_);
-  ASSERT_EQ(123, restored_sstable.get_inv_meta().total_doc_length_);
+  ASSERT_EQ(7, restored_sstable.get_inv_meta().get_stats().min_doc_id_);
+  ASSERT_EQ(100, restored_sstable.get_inv_meta().get_stats().max_doc_id_);
+  ASSERT_EQ(123, restored_sstable.get_inv_meta().get_stats().total_doc_length_);
   ASSERT_EQ(buffer.length(), pos);
 }
 

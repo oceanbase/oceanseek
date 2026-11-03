@@ -618,10 +618,13 @@ void TestInvIdxSSTablePrepare::build_inv_sstable(
   //    not on the merge res; res carries the inv extended meta as payload. The
   //    schema-driven fields are derived from the resolved row desc, and the
   //    data-driven fields (doc id range, total_doc_length_) from the feeder.
-  fill_inv_meta_from_schema(table_schema_, inv_idx_row_desc_, res.inv_meta_);
-  res.inv_meta_.min_doc_id_ = feeder.min_doc_id();
-  res.inv_meta_.max_doc_id_ = feeder.max_doc_id();
-  res.inv_meta_.total_doc_length_ = feeder.total_token_freq();  // sum(token_freq)
+  ObInvIdxStatsMeta inv_meta_stats;
+  fill_inv_meta_from_schema(table_schema_, inv_idx_row_desc_, inv_meta_stats);
+  inv_meta_stats.min_doc_id_ = feeder.min_doc_id();
+  inv_meta_stats.max_doc_id_ = feeder.max_doc_id();
+  // sum(token_freq)
+  inv_meta_stats.total_doc_length_ = feeder.total_token_freq();
+  ASSERT_EQ(OB_SUCCESS, res.inv_meta_.init(inv_meta_stats));
   ASSERT_TRUE(res.inv_meta_.is_valid());
 
   // Build a storage schema from the FTS table schema; init_for_merge reads the
@@ -650,12 +653,12 @@ void TestInvIdxSSTablePrepare::build_inv_sstable(
   OK(param.init_for_merge(merge_ctx, res, nullptr /*cg_schema*/, 0 /*cg_idx*/));
   ASSERT_TRUE(param.table_key_.is_inv_sstable());
   ASSERT_TRUE(param.inv_meta_.is_valid());
-  ASSERT_TRUE(param.inv_meta_.is_fts_index());
-  ASSERT_EQ(has_pos_list, param.inv_meta_.has_position_list_);
-  ASSERT_FALSE(param.inv_meta_.has_nested_key_);
-  ASSERT_EQ(feeder.min_doc_id(), param.inv_meta_.min_doc_id_);
-  ASSERT_EQ(feeder.max_doc_id(), param.inv_meta_.max_doc_id_);
-  ASSERT_EQ(feeder.total_token_freq(), param.inv_meta_.total_doc_length_);
+  ASSERT_TRUE(param.inv_meta_.get_stats().is_fts_index());
+  ASSERT_EQ(has_pos_list, param.inv_meta_.get_stats().has_position_list_);
+  ASSERT_FALSE(param.inv_meta_.get_stats().has_nested_key_);
+  ASSERT_EQ(feeder.min_doc_id(), param.inv_meta_.get_stats().min_doc_id_);
+  ASSERT_EQ(feeder.max_doc_id(), param.inv_meta_.get_stats().max_doc_id_);
+  ASSERT_EQ(feeder.total_token_freq(), param.inv_meta_.get_stats().total_doc_length_);
 
   // 7. construct the ObInvSSTable
   inv_sstable.reset();
@@ -664,13 +667,13 @@ void TestInvIdxSSTablePrepare::build_inv_sstable(
   // 8. assertions
   ASSERT_TRUE(inv_sstable.is_inv_sstable());
   ASSERT_TRUE(inv_sstable.is_valid());
-  ASSERT_TRUE(inv_sstable.get_inv_meta().is_valid());
-  ASSERT_TRUE(inv_sstable.get_inv_meta().is_fts_index());
-  ASSERT_EQ(has_pos_list, inv_sstable.get_inv_meta().has_position_list_);
-  ASSERT_FALSE(inv_sstable.get_inv_meta().has_nested_key_);
-  ASSERT_EQ(feeder.min_doc_id(), inv_sstable.get_inv_meta().min_doc_id_);
-  ASSERT_EQ(feeder.max_doc_id(), inv_sstable.get_inv_meta().max_doc_id_);
-  ASSERT_EQ(feeder.total_token_freq(), inv_sstable.get_inv_meta().total_doc_length_);
+  ASSERT_TRUE(inv_sstable.get_inv_meta().get_stats().is_valid());
+  ASSERT_TRUE(inv_sstable.get_inv_meta().get_stats().is_fts_index());
+  ASSERT_EQ(has_pos_list, inv_sstable.get_inv_meta().get_stats().has_position_list_);
+  ASSERT_FALSE(inv_sstable.get_inv_meta().get_stats().has_nested_key_);
+  ASSERT_EQ(feeder.min_doc_id(), inv_sstable.get_inv_meta().get_stats().min_doc_id_);
+  ASSERT_EQ(feeder.max_doc_id(), inv_sstable.get_inv_meta().get_stats().max_doc_id_);
+  ASSERT_EQ(feeder.total_token_freq(), inv_sstable.get_inv_meta().get_stats().total_doc_length_);
   ASSERT_GT(inv_sstable.get_data_macro_block_count(), 0);
   STORAGE_LOG(INFO, "built inv sstable", K(inv_sstable), K(param));
 }

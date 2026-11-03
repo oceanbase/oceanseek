@@ -176,8 +176,9 @@ protected:
     if (OB_FAIL(build_empty_sstable_param(ObITable::TableType::INV_INDEX_SSTABLE, storage_schema, param))) {
       LOG_WARN("failed to build sstable param", K(ret));
     } else {
-      param.inv_meta_ = inv_meta;
-      if (OB_FAIL(sstable.init(param, &allocator_))) {
+      if (OB_FAIL(param.inv_meta_.init(inv_meta))) {
+        LOG_WARN("failed to initialize inv meta", K(ret));
+      } else if (OB_FAIL(sstable.init(param, &allocator_))) {
         LOG_WARN("failed to init inv sstable", K(ret));
       }
     }
@@ -377,51 +378,51 @@ TEST_F(TestInvSSTable, extended_meta_reset_sets_empty_sentinel)
 TEST_F(TestInvSSTable, init_empty_inv_meta_derives_all_static_formats)
 {
   ObStorageSchema storage_schema;
-  ObInvIdxStatsMeta inv_meta;
+  ObInvSSTableMeta inv_meta;
 
   ASSERT_EQ(OB_SUCCESS, build_async_storage_schema(
       share::schema::INDEX_TYPE_ASYNC_FTS_INDEX_LOCAL, 4, 2, storage_schema));
   ASSERT_EQ(OB_SUCCESS, ObTabletCreateSSTableParam::init_empty_inv_meta(
       storage_schema, inv_meta));
   ASSERT_TRUE(inv_meta.is_valid());
-  ASSERT_EQ(INV_IDX_TYPE_FTS, inv_meta.index_type_);
-  ASSERT_TRUE(inv_meta.has_relevance_params_);
-  ASSERT_FALSE(inv_meta.has_position_list_);
-  ASSERT_FALSE(inv_meta.has_nested_key_);
-  ASSERT_EQ(ObUInt64Type, inv_meta.doc_id_obj_meta_.get_type());
-  ASSERT_EQ(UINT64_MAX, inv_meta.min_doc_id_);
-  ASSERT_EQ(0, inv_meta.max_doc_id_);
-  ASSERT_EQ(0, inv_meta.total_doc_length_);
+  ASSERT_EQ(INV_IDX_TYPE_FTS, inv_meta.get_stats().index_type_);
+  ASSERT_TRUE(inv_meta.get_stats().has_relevance_params_);
+  ASSERT_FALSE(inv_meta.get_stats().has_position_list_);
+  ASSERT_FALSE(inv_meta.get_stats().has_nested_key_);
+  ASSERT_EQ(ObUInt64Type, inv_meta.get_stats().doc_id_obj_meta_.get_type());
+  ASSERT_EQ(UINT64_MAX, inv_meta.get_stats().min_doc_id_);
+  ASSERT_EQ(0, inv_meta.get_stats().max_doc_id_);
+  ASSERT_EQ(0, inv_meta.get_stats().total_doc_length_);
 
   ASSERT_EQ(OB_SUCCESS, build_async_storage_schema(
       share::schema::INDEX_TYPE_ASYNC_FTS_INDEX_LOCAL, 5, 2, storage_schema));
   ASSERT_EQ(OB_SUCCESS, ObTabletCreateSSTableParam::init_empty_inv_meta(
       storage_schema, inv_meta));
   ASSERT_TRUE(inv_meta.is_valid());
-  ASSERT_TRUE(inv_meta.has_position_list_);
+  ASSERT_TRUE(inv_meta.get_stats().has_position_list_);
 
   ASSERT_EQ(OB_SUCCESS, build_async_storage_schema(
       share::schema::INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL, 4, 4, storage_schema));
   ASSERT_EQ(OB_SUCCESS, ObTabletCreateSSTableParam::init_empty_inv_meta(
       storage_schema, inv_meta));
   ASSERT_TRUE(inv_meta.is_valid());
-  ASSERT_EQ(INV_IDX_TYPE_SEARCH, inv_meta.index_type_);
-  ASSERT_FALSE(inv_meta.has_relevance_params_);
-  ASSERT_FALSE(inv_meta.has_position_list_);
-  ASSERT_FALSE(inv_meta.has_nested_key_);
+  ASSERT_EQ(INV_IDX_TYPE_SEARCH, inv_meta.get_stats().index_type_);
+  ASSERT_FALSE(inv_meta.get_stats().has_relevance_params_);
+  ASSERT_FALSE(inv_meta.get_stats().has_position_list_);
+  ASSERT_FALSE(inv_meta.get_stats().has_nested_key_);
 
   ASSERT_EQ(OB_SUCCESS, build_async_storage_schema(
       share::schema::INDEX_TYPE_ASYNC_SEARCH_DATA_INDEX_LOCAL, 5, 4, storage_schema));
   ASSERT_EQ(OB_SUCCESS, ObTabletCreateSSTableParam::init_empty_inv_meta(
       storage_schema, inv_meta));
   ASSERT_TRUE(inv_meta.is_valid());
-  ASSERT_TRUE(inv_meta.has_nested_key_);
+  ASSERT_TRUE(inv_meta.get_stats().has_nested_key_);
 }
 
 TEST_F(TestInvSSTable, init_empty_inv_meta_rejects_invalid_layout)
 {
   ObStorageSchema storage_schema;
-  ObInvIdxStatsMeta inv_meta;
+  ObInvSSTableMeta inv_meta;
 
   ASSERT_EQ(OB_SUCCESS, build_async_storage_schema(
       share::schema::INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL, 4, 2, storage_schema));
@@ -453,7 +454,7 @@ TEST_F(TestInvSSTable, init_accepts_only_inv_table_type)
   {
     ObInvIdxStatsMeta inv_meta;
     fill_inv_meta(1, 10, inv_meta);
-    inv_param.inv_meta_ = inv_meta;
+    ASSERT_EQ(OB_SUCCESS, inv_param.inv_meta_.init(inv_meta));
   }
   ASSERT_EQ(OB_SUCCESS, inv_sstable.init(inv_param, &allocator_));
   ASSERT_TRUE(inv_sstable.is_inv_sstable());
@@ -483,8 +484,8 @@ TEST_F(TestInvSSTable, inv_sstable_deep_copy_keeps_type_and_meta)
   ASSERT_EQ(ObStorageMetaValue::MetaType::INV_SSTABLE, copied_sstable->get_meta_type());
   ASSERT_TRUE(copied_sstable->get_inv_meta().is_valid());
   ASSERT_NE(&sstable.get_inv_meta(), &copied_sstable->get_inv_meta());
-  ASSERT_EQ(100, copied_sstable->get_inv_meta().max_doc_id_);
-  ASSERT_EQ(7, copied_sstable->get_inv_meta().min_doc_id_);
+  ASSERT_EQ(100, copied_sstable->get_inv_meta().get_stats().max_doc_id_);
+  ASSERT_EQ(7, copied_sstable->get_inv_meta().get_stats().min_doc_id_);
 }
 
 TEST_F(TestInvSSTable, inv_sstable_serialize_deserialize_round_trip)
@@ -509,8 +510,8 @@ TEST_F(TestInvSSTable, inv_sstable_serialize_deserialize_round_trip)
   ASSERT_TRUE(decoded_sstable.is_inv_sstable());
   ASSERT_EQ(ObStorageMetaValue::MetaType::INV_SSTABLE, decoded_sstable.get_meta_type());
   ASSERT_TRUE(decoded_sstable.get_inv_meta().is_valid());
-  ASSERT_EQ(100, decoded_sstable.get_inv_meta().max_doc_id_);
-  ASSERT_EQ(7, decoded_sstable.get_inv_meta().min_doc_id_);
+  ASSERT_EQ(100, decoded_sstable.get_inv_meta().get_stats().max_doc_id_);
+  ASSERT_EQ(7, decoded_sstable.get_inv_meta().get_stats().min_doc_id_);
 }
 
 TEST_F(TestInvSSTable, inv_sstable_rejects_invalid_inv_meta_on_serialize_and_deserialize)
@@ -535,8 +536,11 @@ TEST_F(TestInvSSTable, inv_sstable_rejects_invalid_inv_meta_on_serialize_and_des
   ASSERT_NE(nullptr, buf);
   pos = 0;
   ASSERT_EQ(OB_SUCCESS, sstable.ObSSTable::serialize(data_version, buf, buf_len, pos));
-  sstable.inv_meta_.index_type_ = INV_IDX_TYPE_INVALID;
+  const int64_t inv_meta_start = pos;
   ASSERT_EQ(OB_SUCCESS, sstable.inv_meta_.serialize(buf, buf_len, pos));
+  // Corrupt the index type after the outer and shared-statistics UNIS headers.
+  const int64_t header_size = 1 + serialization::OB_SERIALIZE_SIZE_NEED_BYTES;
+  buf[inv_meta_start + 2 * header_size] = INV_IDX_TYPE_INVALID;
   ASSERT_EQ(buf_len, pos);
 
   pos = 0;
@@ -684,7 +688,7 @@ TEST_F(TestInvSSTable, inc_inv_sstable_supports_backfill_commit_version)
   fill_inv_meta(7, 100, inv_meta);
   ASSERT_EQ(OB_SUCCESS, build_empty_sstable_param(
       ObITable::TableType::INC_INV_INDEX_SSTABLE, storage_schema, param));
-  param.inv_meta_ = inv_meta;
+  ASSERT_EQ(OB_SUCCESS, param.inv_meta_.init(inv_meta));
   // INC_INV 属于 is_inc_major_sstable，ObSSTableMeta::init 要求 inc major 的 param
   // 恰好携带一条未提交事务信息（真实链路由 inc major DDL 的 tx_id/seq_no 填入），
   // 否则 init 报 OB_ERR_UNEXPECTED；info_status 也需从默认的 INFO_OVERFLOW 改为
@@ -933,7 +937,7 @@ TEST_F(TestInvSSTable, inc_inv_reads_logical_range_from_basic_meta)
   fill_inv_meta(7, 100, inv_meta);
   ASSERT_EQ(OB_SUCCESS, build_empty_sstable_param(
       ObITable::TableType::INC_INV_INDEX_SSTABLE, storage_schema, param));
-  param.inv_meta_ = inv_meta;
+  ASSERT_EQ(OB_SUCCESS, param.inv_meta_.init(inv_meta));
   compaction::ObUncommitTxDesc tx_desc(100/*tx_id*/, 200/*sql_seq*/);
   ASSERT_EQ(OB_SUCCESS, param.uncommit_tx_info_.push_back(tx_desc));
   param.uncommit_tx_info_.set_info_status_record_seq();
@@ -997,8 +1001,8 @@ TEST_F(TestInvSSTable, full_serialize_round_trip)
   ASSERT_EQ(buf_len, pos);
   ASSERT_TRUE(decoded_sstable.is_inv_sstable());
   ASSERT_TRUE(decoded_sstable.get_inv_meta().is_valid());
-  ASSERT_EQ(100, decoded_sstable.get_inv_meta().max_doc_id_);
-  ASSERT_EQ(7, decoded_sstable.get_inv_meta().min_doc_id_);
+  ASSERT_EQ(100, decoded_sstable.get_inv_meta().get_stats().max_doc_id_);
+  ASSERT_EQ(7, decoded_sstable.get_inv_meta().get_stats().min_doc_id_);
 }
 
 TEST_F(TestInvSSTable, inc_dec_macro_ref_on_empty_inv_sstable)
@@ -1032,7 +1036,7 @@ TEST_F(TestInvSSTable, posting_scanner_accepts_empty_inv_sstable_with_valid_meta
   ASSERT_EQ(OB_SUCCESS, build_inv_sstable(sstable));
   ASSERT_TRUE(sstable.is_empty());
   ASSERT_TRUE(sstable.get_inv_meta().is_valid());
-  ASSERT_EQ(INV_IDX_TYPE_FTS, sstable.get_inv_meta().index_type_);
+  ASSERT_EQ(INV_IDX_TYPE_FTS, sstable.get_inv_meta().get_stats().index_type_);
   ASSERT_EQ(OB_SUCCESS, sstable.get_meta(meta_handle));
 
   const int64_t rowkey_column_cnt =
@@ -1078,13 +1082,13 @@ TEST_F(TestInvSSTable, init_with_inv_meta_in_param)
 
   ASSERT_EQ(OB_SUCCESS, build_empty_sstable_param(
       ObITable::TableType::INV_INDEX_SSTABLE, storage_schema, param));
-  param.inv_meta_ = inv_meta;
+  ASSERT_EQ(OB_SUCCESS, param.inv_meta_.init(inv_meta));
   ASSERT_EQ(OB_SUCCESS, sstable.init(param, &allocator_));
   ASSERT_TRUE(sstable.is_inv_sstable());
   ASSERT_TRUE(sstable.get_inv_meta().is_valid());
-  ASSERT_EQ(9999, sstable.get_inv_meta().max_doc_id_);
-  ASSERT_EQ(42, sstable.get_inv_meta().min_doc_id_);
-  ASSERT_EQ(ObUInt64Type, sstable.get_inv_meta().doc_id_obj_meta_.get_type());
+  ASSERT_EQ(9999, sstable.get_inv_meta().get_stats().max_doc_id_);
+  ASSERT_EQ(42, sstable.get_inv_meta().get_stats().min_doc_id_);
+  ASSERT_EQ(ObUInt64Type, sstable.get_inv_meta().get_stats().doc_id_obj_meta_.get_type());
 }
 
 TEST_F(TestInvSSTable, init_without_inv_meta_in_param_returns_error)
@@ -1099,6 +1103,224 @@ TEST_F(TestInvSSTable, init_without_inv_meta_in_param_returns_error)
   // An inv sstable must carry a valid inv_meta; a missing one is an upstream
   // inconsistency and init must reject it instead of silently filling a blank.
   ASSERT_EQ(OB_INVALID_ARGUMENT, sstable.init(param, &allocator_));
+}
+
+
+TEST_F(TestInvSSTable, inv_stats_merge_identity_layout_and_overflow_contracts)
+{
+  ObInvIdxStatsMeta source;
+  fill_inv_meta(1, 9, source);
+  source.min_doc_id_ = 10;
+  source.max_doc_id_ = 20;
+  source.total_doc_length_ = 100;
+  ObInvIdxStatsMeta target;
+  ASSERT_TRUE(target.is_reset());
+  ASSERT_EQ(OB_SUCCESS, target.merge(source));
+  ObInvIdxStatsMeta empty;
+  ASSERT_EQ(OB_SUCCESS, empty.assign(source));
+  empty.reuse();
+  ASSERT_TRUE(empty.is_valid());
+  ASSERT_EQ(OB_SUCCESS, target.merge(empty));
+  ASSERT_EQ(100, target.total_doc_length_);
+  ASSERT_EQ(10, target.min_doc_id_);
+  ASSERT_EQ(20, target.max_doc_id_);
+
+  empty.has_position_list_ = !source.has_position_list_;
+  ASSERT_EQ(OB_ERR_UNEXPECTED, target.merge(empty));
+  ASSERT_EQ(100, target.total_doc_length_);
+  ASSERT_EQ(OB_SUCCESS, empty.assign(source));
+  empty.min_doc_id_ = 30;
+  empty.max_doc_id_ = 20;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, target.merge(empty));
+  target.index_type_ = INV_IDX_TYPE_INVALID;
+  ASSERT_FALSE(target.is_reset());
+  ASSERT_EQ(OB_INVALID_ARGUMENT, target.merge(source));
+  ASSERT_EQ(100, target.total_doc_length_);
+
+  target.reset();
+  source.total_doc_length_ = UINT64_MAX;
+  ASSERT_EQ(OB_SUCCESS, target.merge(source));
+  source.total_doc_length_ = 1;
+  ASSERT_EQ(OB_SUCCESS, target.merge(source));
+  ASSERT_EQ(UINT64_MAX, target.total_doc_length_);
+}
+
+template <typename Meta>
+void check_inv_meta_init_lifecycle(const ObInvIdxStatsMeta &source)
+{
+  Meta meta;
+  EXPECT_FALSE(meta.is_inited_);
+  ObInvIdxStatsMeta invalid;
+  EXPECT_EQ(OB_INVALID_ARGUMENT, meta.init(invalid));
+  EXPECT_FALSE(meta.is_inited_);
+  EXPECT_TRUE(meta.get_stats().is_reset());
+  ASSERT_EQ(OB_SUCCESS, meta.init(source));
+  EXPECT_TRUE(meta.is_inited_);
+  ObInvIdxStatsMeta changed = source;
+  changed.total_doc_length_ += 1;
+  EXPECT_EQ(OB_INIT_TWICE, meta.init(changed));
+  EXPECT_EQ(source.total_doc_length_, meta.get_stats().total_doc_length_);
+  EXPECT_EQ(source.min_doc_id_, meta.get_stats().min_doc_id_);
+  EXPECT_EQ(source.max_doc_id_, meta.get_stats().max_doc_id_);
+
+  Meta copied;
+  ASSERT_EQ(OB_SUCCESS, copied.assign(meta));
+  EXPECT_TRUE(copied.is_inited_);
+  EXPECT_EQ(OB_INIT_TWICE, copied.init(source));
+  Meta merged;
+  ASSERT_EQ(OB_SUCCESS, merged.merge(meta));
+  EXPECT_TRUE(merged.is_inited_);
+  EXPECT_TRUE(merged.is_valid());
+  EXPECT_EQ(OB_INIT_TWICE, merged.init(source));
+
+  meta.reuse();
+  EXPECT_TRUE(meta.is_inited_);
+  EXPECT_EQ(OB_INIT_TWICE, meta.init(source));
+  EXPECT_TRUE(meta.get_stats().is_empty_range());
+  EXPECT_EQ(0, meta.get_stats().total_doc_length_);
+  meta.reset();
+  EXPECT_FALSE(meta.is_inited_);
+  ASSERT_EQ(OB_SUCCESS, copied.assign(meta));
+  EXPECT_FALSE(copied.is_inited_);
+  EXPECT_EQ(OB_SUCCESS, copied.init(source));
+  changed.reuse();
+  ASSERT_EQ(OB_SUCCESS, meta.init(changed));
+  EXPECT_TRUE(meta.is_inited_);
+  EXPECT_EQ(OB_INIT_TWICE, meta.init(source));
+  EXPECT_TRUE(meta.get_stats().is_empty_range());
+  meta.reset();
+  EXPECT_FALSE(meta.is_inited_);
+  EXPECT_EQ(OB_SUCCESS, meta.init(source));
+}
+
+TEST_F(TestInvSSTable, inv_meta_init_rejects_reinitialization)
+{
+  ObInvIdxStatsMeta source;
+  fill_inv_meta(10, 20, source);
+  source.total_doc_length_ = 100;
+  check_inv_meta_init_lifecycle<ObInvSSTableMeta>(source);
+  check_inv_meta_init_lifecycle<ObInvMacroMeta>(source);
+  ObInvMacroMeta macro_meta;
+  ASSERT_EQ(OB_SUCCESS, macro_meta.init(source));
+  ObInvSSTableMeta sstable_meta;
+  ASSERT_EQ(OB_SUCCESS, sstable_meta.merge_macro(macro_meta));
+  EXPECT_TRUE(sstable_meta.is_inited_);
+  EXPECT_TRUE(sstable_meta.is_valid());
+  EXPECT_EQ(OB_INIT_TWICE, sstable_meta.init(source));
+}
+
+TEST_F(TestInvSSTable, macro_inv_stats_reject_empty_range_without_mutating_target)
+{
+  for (int64_t i = 0; i < 2; ++i) {
+    ObInvIdxStatsMeta source;
+    fill_inv_meta(10, 20, source);
+    source.index_type_ = 0 == i ? INV_IDX_TYPE_FTS : INV_IDX_TYPE_SEARCH;
+    source.has_relevance_params_ = 0 == i;
+    ObInvSSTableMeta target;
+    source.total_doc_length_ = 100;
+    ASSERT_EQ(OB_SUCCESS, target.init(source));
+    source.reuse();
+    ASSERT_TRUE(source.is_valid());
+    ASSERT_TRUE(source.is_empty_range());
+
+    ObInvMacroMeta macro_stats;
+    ASSERT_EQ(OB_SUCCESS, macro_stats.init(source));
+    ASSERT_EQ(OB_INVALID_ARGUMENT, target.check_merge_macro(macro_stats));
+    ASSERT_EQ(OB_INVALID_ARGUMENT, target.merge_macro(macro_stats));
+    EXPECT_EQ(10, target.get_stats().min_doc_id_);
+    EXPECT_EQ(20, target.get_stats().max_doc_id_);
+    EXPECT_EQ(100, target.get_stats().total_doc_length_);
+
+    // A nonempty macro with zero total length remains valid, including SEARCH indexes.
+    ObInvIdxStatsMeta nonempty_stats;
+    ASSERT_EQ(OB_SUCCESS, nonempty_stats.assign(source));
+    nonempty_stats.min_doc_id_ = 30;
+    nonempty_stats.max_doc_id_ = 40;
+    macro_stats.reset();
+    ASSERT_EQ(OB_SUCCESS, macro_stats.init(nonempty_stats));
+    ASSERT_EQ(OB_SUCCESS, target.check_merge_macro(macro_stats));
+    EXPECT_EQ(20, target.get_stats().max_doc_id_);
+    ASSERT_EQ(OB_SUCCESS, target.merge_macro(macro_stats));
+    EXPECT_EQ(10, target.get_stats().min_doc_id_);
+    EXPECT_EQ(40, target.get_stats().max_doc_id_);
+    EXPECT_EQ(100, target.get_stats().total_doc_length_);
+  }
+}
+
+template <typename Meta>
+void check_inv_meta_codec(const ObInvIdxStatsMeta &source)
+{
+  Meta meta;
+  ASSERT_EQ(OB_SUCCESS, meta.init(source));
+  char buf[512] = {};
+  const int64_t start = 3;
+  int64_t pos = start;
+  const int64_t size = meta.get_serialize_size();
+  ASSERT_EQ(OB_SUCCESS, meta.serialize(buf, sizeof(buf), pos));
+  ASSERT_EQ(start + size, pos);
+  const int64_t end = pos;
+  Meta decoded;
+  pos = start;
+  ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buf, end, pos));
+  EXPECT_TRUE(decoded.is_inited_);
+  EXPECT_EQ(OB_INIT_TWICE, decoded.init(source));
+  ASSERT_EQ(end, pos);
+  ASSERT_EQ(source.total_doc_length_, decoded.get_stats().total_doc_length_);
+  ASSERT_EQ(source.min_doc_id_, decoded.get_stats().min_doc_id_);
+  ASSERT_TRUE(source.has_same_layout(decoded.get_stats()));
+
+  // Use the framework's error semantics; failed decoding need not preserve pos or the object.
+  decoded.reset();
+  pos = start;
+  EXPECT_NE(OB_SUCCESS, decoded.deserialize(buf, end - 1, pos));
+  pos = start;
+  EXPECT_NE(OB_SUCCESS, meta.serialize(buf, end - 1, pos));
+
+  // Rewrite the complete value before checking version rejection.
+  pos = start;
+  ASSERT_EQ(OB_SUCCESS, meta.serialize(buf, sizeof(buf), pos));
+  buf[start] = 2;
+  pos = start;
+  EXPECT_EQ(OB_NOT_SUPPORTED, decoded.deserialize(buf, end, pos));
+
+  Meta copied;
+  ASSERT_EQ(OB_SUCCESS, copied.assign(meta));
+  meta.reset();
+  ASSERT_EQ(123, copied.get_stats().total_doc_length_);
+}
+
+TEST_F(TestInvSSTable, inv_meta_independent_nested_codecs)
+{
+  ObInvIdxStatsMeta source;
+  fill_inv_meta(1, 9, source);
+  source.min_doc_id_ = 1;
+  source.max_doc_id_ = 9;
+  source.total_doc_length_ = 123;
+  check_inv_meta_codec<ObInvSSTableMeta>(source);
+  check_inv_meta_codec<ObInvMacroMeta>(source);
+
+  source.reuse();
+  ObInvSSTableMeta sstable_meta;
+  ObInvMacroMeta macro_meta;
+  ASSERT_EQ(OB_SUCCESS, sstable_meta.init(source));
+  ASSERT_EQ(OB_SUCCESS, macro_meta.init(source));
+  ASSERT_TRUE(sstable_meta.is_valid());
+  ASSERT_FALSE(macro_meta.is_valid());
+  char buf[256];
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, sstable_meta.serialize(buf, sizeof(buf), pos));
+  ObInvSSTableMeta decoded;
+  int64_t read_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buf, pos, read_pos));
+  ASSERT_TRUE(decoded.get_stats().is_empty_range());
+  ASSERT_EQ(0, decoded.get_stats().total_doc_length_);
+  pos = 0;
+  // Serialization encodes fields; callers validate whether an empty macro is usable.
+  ASSERT_EQ(OB_SUCCESS, macro_meta.serialize(buf, sizeof(buf), pos));
+  ObInvMacroMeta decoded_macro;
+  read_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, decoded_macro.deserialize(buf, pos, read_pos));
+  ASSERT_FALSE(decoded_macro.is_valid());
 }
 
 } // namespace unittest

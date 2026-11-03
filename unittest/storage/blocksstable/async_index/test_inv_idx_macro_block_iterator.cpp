@@ -107,8 +107,9 @@ protected:
     if (OB_FAIL(build_empty_sstable_param(ObITable::TableType::INV_INDEX_SSTABLE, storage_schema, param))) {
       LOG_WARN("failed to build sstable param", K(ret));
     } else {
-      param.inv_meta_ = inv_meta;
-      if (OB_FAIL(sstable.init(param, &allocator_))) {
+      if (OB_FAIL(param.inv_meta_.init(inv_meta))) {
+        LOG_WARN("failed to initialize inv meta", K(ret));
+      } else if (OB_FAIL(sstable.init(param, &allocator_))) {
         LOG_WARN("failed to init inv sstable", K(ret));
       }
     }

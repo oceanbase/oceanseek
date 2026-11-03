@@ -444,6 +444,21 @@ protected:
     return meta;
   }
 
+  static ObInvSSTableMeta make_inv_sstable_meta(const ObInvIdxStatsMeta &stats)
+  {
+    ObInvSSTableMeta meta;
+    EXPECT_EQ(OB_SUCCESS, meta.init(stats));
+    return meta;
+  }
+
+  static ObInvSSTableMeta make_inv_sstable_meta(
+      const uint64_t min_doc_id = UINT64_MAX,
+      const uint64_t max_doc_id = 0,
+      const uint64_t total_doc_length = 0)
+  {
+    return make_inv_sstable_meta(make_inv_meta(min_doc_id, max_doc_id, total_doc_length));
+  }
+
   // Set up a minimal but valid environment ready for writer.open().
   // has_pos_list=false builds a schema without pos_list (has_posting_value()==false).
   // has_relevance=false further drops token_freq/doc_length (no BM25, doc_id-only posting).
@@ -1176,7 +1191,7 @@ TEST_F(ObInvIdxMacroBlockWriterTest, append_row_multiple_terms_multiple_logical_
   EXPECT_EQ(600, writer.current_micro_stats_.doc_count_);
   EXPECT_EQ(0, writer.macro_stats_.doc_count_);
   EXPECT_EQ(1, writer.posting_encoder_.get_doc_count());
-  EXPECT_TRUE(writer.macro_stats_.inv_meta_.is_empty_range());
+  EXPECT_TRUE(writer.macro_stats_.inv_meta_.get_stats().is_empty_range());
   EXPECT_TRUE(writer.has_pending_rows_);
 
   ASSERT_EQ(OB_SUCCESS, writer.close());
@@ -1216,6 +1231,56 @@ TEST_F(ObInvIdxMacroBlockWriterTest, append_rows_keeps_logical_block_pending)
   ASSERT_EQ(OB_SUCCESS, writer.close());
 }
 
+TEST_F(ObInvIdxMacroBlockWriterTest, invalid_macro_meta_is_rejected_before_writing_index)
+{
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  ASSERT_EQ(OB_SUCCESS, prepare_open_env());
+  ASSERT_EQ(OB_SUCCESS, open_writer(writer, cleaner));
+  ObDatumRow row;
+  ASSERT_EQ(OB_SUCCESS, make_inv_idx_row(row, inv_idx_row_desc_, mv_col_cnt_,
+      "a", 1, 1, 100, "p"));
+  ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  ASSERT_EQ(OB_SUCCESS, writer.flush_logical_block());
+  ASSERT_EQ(OB_SUCCESS, writer.flush_micro_block_pair());
+  ASSERT_TRUE(writer.macro_block_.is_dirty());
+  ASSERT_TRUE(writer.macro_stats_.is_valid());
+
+  ObInvMacroMeta valid_meta;
+  ASSERT_EQ(OB_SUCCESS, valid_meta.assign(writer.macro_stats_.inv_meta_));
+  const int64_t data_size = writer.macro_block_.get_data_size();
+  const int64_t index_offset = writer.index_block_builder_.index_block_offset_;
+  const int64_t row_offset = writer.index_block_builder_.row_offset_;
+  for (int64_t i = 0; i < 2; ++i) {
+    ASSERT_EQ(OB_SUCCESS, writer.macro_stats_.inv_meta_.assign(valid_meta));
+    if (0 == i) {
+      writer.macro_stats_.inv_meta_.reset();
+    } else {
+      writer.macro_stats_.inv_meta_.reuse();
+      ASSERT_TRUE(writer.macro_stats_.inv_meta_.get_stats().is_valid());
+      ASSERT_FALSE(writer.macro_stats_.inv_meta_.is_valid());
+    }
+    ASSERT_TRUE(writer.macro_stats_.endkey_.is_valid());
+    ASSERT_GT(writer.macro_stats_.doc_count_, 0);
+    int64_t estimate_size = -1;
+    EXPECT_EQ(OB_INVALID_ARGUMENT,
+        writer.index_block_builder_.estimate_projected_macro_meta_block_size(
+            writer.macro_stats_, estimate_size));
+    EXPECT_EQ(0, estimate_size);
+    EXPECT_EQ(OB_INVALID_ARGUMENT, writer.flush_macro_block(true /*is_close_flush*/));
+    EXPECT_EQ(data_size, writer.macro_block_.get_data_size());
+    EXPECT_EQ(index_offset, writer.index_block_builder_.index_block_offset_);
+    EXPECT_EQ(row_offset, writer.index_block_builder_.row_offset_);
+    EXPECT_EQ(0, writer.get_macro_block_write_ctx().get_macro_block_count());
+  }
+
+  // Rejected inputs must leave the buffered macro usable with its original metadata.
+  ASSERT_EQ(OB_SUCCESS, writer.macro_stats_.inv_meta_.assign(valid_meta));
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+  ASSERT_NE(nullptr, writer.index_block_builder_.index_tree_root_ctx_->data_write_ctx_);
+  EXPECT_EQ(1, writer.index_block_builder_.index_tree_root_ctx_->data_write_ctx_->get_macro_block_count());
+}
+
 // 4a.2 flush_logical_block_updates_candidate_only: logical-block statistics stay uncommitted.
 TEST_F(ObInvIdxMacroBlockWriterTest, flush_logical_block_updates_candidate_only)
 {
@@ -1242,14 +1307,14 @@ TEST_F(ObInvIdxMacroBlockWriterTest, flush_logical_block_updates_candidate_only)
   EXPECT_EQ(5, writer.pending_term_group_.doc_count_);
   EXPECT_EQ(5ul, writer.pending_term_group_.max_doc_id_);
   EXPECT_EQ(5, writer.current_micro_stats_.doc_count_);
-  EXPECT_EQ(1ul, writer.current_micro_stats_.inv_meta_.min_doc_id_);
-  EXPECT_EQ(5ul, writer.current_micro_stats_.inv_meta_.max_doc_id_);
-  EXPECT_EQ(5ul, writer.current_micro_stats_.inv_meta_.total_doc_length_);
+  EXPECT_EQ(1ul, writer.current_micro_stats_.inv_meta_.get_stats().min_doc_id_);
+  EXPECT_EQ(5ul, writer.current_micro_stats_.inv_meta_.get_stats().max_doc_id_);
+  EXPECT_EQ(5ul, writer.current_micro_stats_.inv_meta_.get_stats().total_doc_length_);
   EXPECT_EQ(0, writer.macro_stats_.doc_count_);
   EXPECT_EQ(0, writer.micro_index_size_);
   EXPECT_GT(writer.pending_index_size_, 0);
-  EXPECT_TRUE(writer.macro_stats_.inv_meta_.is_empty_range());
-  EXPECT_TRUE(writer.seg_inv_meta_.is_empty_range());
+  EXPECT_TRUE(writer.macro_stats_.inv_meta_.get_stats().is_empty_range());
+  EXPECT_TRUE(writer.seg_inv_meta_.get_stats().is_empty_range());
 
   ASSERT_EQ(OB_SUCCESS, writer.close());
 }
@@ -1281,14 +1346,14 @@ TEST_F(ObInvIdxMacroBlockWriterTest, flush_micro_block_pair_commits_candidate)
   EXPECT_TRUE(writer.micro_term_groups_.empty());
   EXPECT_TRUE(writer.pending_term_group_.logical_block_metas_.empty());
   EXPECT_EQ(0, writer.current_micro_stats_.doc_count_);
-  EXPECT_TRUE(writer.current_micro_stats_.inv_meta_.is_empty_range());
+  EXPECT_TRUE(writer.current_micro_stats_.inv_meta_.get_stats().is_empty_range());
   EXPECT_EQ(0, writer.micro_index_size_);
   EXPECT_EQ(0, writer.pending_index_size_);
   EXPECT_EQ(5, writer.macro_stats_.doc_count_);
-  EXPECT_EQ(1ul, writer.macro_stats_.inv_meta_.min_doc_id_);
-  EXPECT_EQ(5ul, writer.macro_stats_.inv_meta_.max_doc_id_);
-  EXPECT_EQ(5ul, writer.macro_stats_.inv_meta_.total_doc_length_);
-  EXPECT_TRUE(writer.seg_inv_meta_.is_empty_range());
+  EXPECT_EQ(1ul, writer.macro_stats_.inv_meta_.get_stats().min_doc_id_);
+  EXPECT_EQ(5ul, writer.macro_stats_.inv_meta_.get_stats().max_doc_id_);
+  EXPECT_EQ(5ul, writer.macro_stats_.inv_meta_.get_stats().total_doc_length_);
+  EXPECT_TRUE(writer.seg_inv_meta_.get_stats().is_empty_range());
   EXPECT_EQ(2, writer.macro_block_.get_micro_block_count());
   EXPECT_EQ(1, writer.index_block_builder_.actual_index_micro_writer_->get_row_count());
   EXPECT_EQ(1, writer.index_block_builder_.trial_index_micro_writer_->get_row_count());
@@ -1297,9 +1362,9 @@ TEST_F(ObInvIdxMacroBlockWriterTest, flush_micro_block_pair_commits_candidate)
   EXPECT_EQ(4, writer.index_block_builder_.row_offset_);
 
   ASSERT_EQ(OB_SUCCESS, writer.close());
-  EXPECT_EQ(1ul, writer.get_seg_inv_meta().min_doc_id_);
-  EXPECT_EQ(5ul, writer.get_seg_inv_meta().max_doc_id_);
-  EXPECT_EQ(5ul, writer.get_seg_inv_meta().total_doc_length_);
+  EXPECT_EQ(1ul, writer.get_seg_inv_meta().get_stats().min_doc_id_);
+  EXPECT_EQ(5ul, writer.get_seg_inv_meta().get_stats().max_doc_id_);
+  EXPECT_EQ(5ul, writer.get_seg_inv_meta().get_stats().total_doc_length_);
 }
 
 // 4a.4 close_flushes_all_pending_levels_once: close drains encoder, pair and macro exactly once.
@@ -1322,9 +1387,9 @@ TEST_F(ObInvIdxMacroBlockWriterTest, close_flushes_all_pending_levels_once)
   EXPECT_FALSE(writer.is_opened());
   EXPECT_EQ(7, writer.get_merge_block_info().total_row_count_);
   EXPECT_EQ(1, writer.get_merge_block_info().macro_block_count_);
-  EXPECT_EQ(1ul, writer.get_seg_inv_meta().min_doc_id_);
-  EXPECT_EQ(7ul, writer.get_seg_inv_meta().max_doc_id_);
-  EXPECT_EQ(7ul, writer.get_seg_inv_meta().total_doc_length_);
+  EXPECT_EQ(1ul, writer.get_seg_inv_meta().get_stats().min_doc_id_);
+  EXPECT_EQ(7ul, writer.get_seg_inv_meta().get_stats().max_doc_id_);
+  EXPECT_EQ(7ul, writer.get_seg_inv_meta().get_stats().total_doc_length_);
   EXPECT_EQ(OB_NOT_INIT, writer.close());
   EXPECT_EQ(7, writer.get_merge_block_info().total_row_count_);
   EXPECT_EQ(1, writer.get_merge_block_info().macro_block_count_);
@@ -1415,10 +1480,10 @@ TEST_F(ObInvIdxMacroBlockWriterTest, append_row_same_term_across_micro_blocks)
   EXPECT_NE(nullptr, writer.index_block_builder_.index_tree_root_ctx_->data_write_ctx_);
   EXPECT_EQ(1, writer.index_block_builder_.index_tree_root_ctx_->data_write_ctx_->get_macro_block_count());
   EXPECT_EQ(row_cnt, writer.get_merge_block_info().total_row_count_);
-  EXPECT_EQ(1ul, writer.get_seg_inv_meta().min_doc_id_);
-  EXPECT_EQ(static_cast<uint64_t>(row_cnt), writer.get_seg_inv_meta().max_doc_id_);
+  EXPECT_EQ(1ul, writer.get_seg_inv_meta().get_stats().min_doc_id_);
+  EXPECT_EQ(static_cast<uint64_t>(row_cnt), writer.get_seg_inv_meta().get_stats().max_doc_id_);
   EXPECT_EQ(static_cast<uint64_t>(row_cnt) * big_val,
-      writer.get_seg_inv_meta().total_doc_length_);
+      writer.get_seg_inv_meta().get_stats().total_doc_length_);
 }
 
 // 5.2 full_macro_retries_candidate_on_next_macro: a rejected pair is retried without loss.
@@ -1450,10 +1515,10 @@ TEST_F(ObInvIdxMacroBlockWriterTest, full_macro_retries_candidate_on_next_macro)
   EXPECT_NE(nullptr, writer.index_block_builder_.index_tree_root_ctx_->data_write_ctx_);
   EXPECT_GE(writer.index_block_builder_.index_tree_root_ctx_->data_write_ctx_
       ->get_macro_block_count(), 2);
-  EXPECT_EQ(1ul, writer.get_seg_inv_meta().min_doc_id_);
-  EXPECT_EQ(static_cast<uint64_t>(row_cnt), writer.get_seg_inv_meta().max_doc_id_);
+  EXPECT_EQ(1ul, writer.get_seg_inv_meta().get_stats().min_doc_id_);
+  EXPECT_EQ(static_cast<uint64_t>(row_cnt), writer.get_seg_inv_meta().get_stats().max_doc_id_);
   EXPECT_EQ(static_cast<uint64_t>(row_cnt),
-      writer.get_seg_inv_meta().total_doc_length_);
+      writer.get_seg_inv_meta().get_stats().total_doc_length_);
 }
 
 // 5.3 oversized_pair_fails_on_empty_macro: an empty macro is not switched repeatedly.
@@ -1861,15 +1926,15 @@ TEST_F(ObInvIdxMacroBlockWriterTest, search_index_inv_meta_type)
   ASSERT_EQ(OB_SUCCESS, open_writer(writer, cleaner));
   ASSERT_TRUE(writer.is_opened());
 
-  EXPECT_EQ(INV_IDX_TYPE_SEARCH, writer.current_micro_stats_.inv_meta_.index_type_);
-  EXPECT_EQ(INV_IDX_TYPE_SEARCH, writer.macro_stats_.inv_meta_.index_type_);
-  EXPECT_EQ(INV_IDX_TYPE_SEARCH, writer.seg_inv_meta_.index_type_);
-  EXPECT_FALSE(writer.macro_stats_.inv_meta_.has_relevance_params_);
-  EXPECT_FALSE(writer.macro_stats_.inv_meta_.has_position_list_);
-  EXPECT_TRUE(writer.macro_stats_.inv_meta_.has_nested_key_);
-  EXPECT_TRUE(writer.current_micro_stats_.inv_meta_.has_nested_key_);
-  EXPECT_TRUE(writer.macro_stats_.inv_meta_.is_empty_range());
-  EXPECT_TRUE(writer.seg_inv_meta_.is_empty_range());
+  EXPECT_EQ(INV_IDX_TYPE_SEARCH, writer.current_micro_stats_.inv_meta_.get_stats().index_type_);
+  EXPECT_EQ(INV_IDX_TYPE_SEARCH, writer.macro_stats_.inv_meta_.get_stats().index_type_);
+  EXPECT_EQ(INV_IDX_TYPE_SEARCH, writer.seg_inv_meta_.get_stats().index_type_);
+  EXPECT_FALSE(writer.macro_stats_.inv_meta_.get_stats().has_relevance_params_);
+  EXPECT_FALSE(writer.macro_stats_.inv_meta_.get_stats().has_position_list_);
+  EXPECT_TRUE(writer.macro_stats_.inv_meta_.get_stats().has_nested_key_);
+  EXPECT_TRUE(writer.current_micro_stats_.inv_meta_.get_stats().has_nested_key_);
+  EXPECT_TRUE(writer.macro_stats_.inv_meta_.get_stats().is_empty_range());
+  EXPECT_TRUE(writer.seg_inv_meta_.get_stats().is_empty_range());
 
   ASSERT_EQ(OB_SUCCESS, writer.close());
   writer.reset();
@@ -2162,10 +2227,13 @@ TEST_F(ObInvIdxMacroBlockWriterTest, append_row_after_reuse_restarts_macro_row_o
 
   ObMacroBlockDesc desc;
   make_reuse_desc(*reused, desc);
-  ObInvIdxMacroBlockInvStats stats;
-  stats.min_doc_id_ = 1;
-  stats.max_doc_id_ = 20;
-  stats.total_doc_length_ = 2000;
+  ObInvMacroMeta stats;
+  ObInvIdxStatsMeta stats_value;
+  ASSERT_EQ(OB_SUCCESS, stats_value.assign(writer.get_seg_inv_meta().get_stats()));
+  stats_value.min_doc_id_ = 1;
+  stats_value.max_doc_id_ = 20;
+  stats_value.total_doc_length_ = 2000;
+  ASSERT_EQ(OB_SUCCESS, stats.init(stats_value));
   ASSERT_EQ(OB_SUCCESS, writer.append_macro_block(desc, stats));
   EXPECT_EQ(-1, writer.index_block_builder_.row_offset_);
   EXPECT_EQ(1, writer.get_merge_block_info().multiplexed_macro_block_count_);
@@ -2203,16 +2271,16 @@ TEST_F(ObInvIdxMacroBlockWriterTest, append_row_after_reuse_restarts_macro_row_o
   EXPECT_NE(reused->get_macro_id(), res.data_block_ids_.at(0));
   EXPECT_EQ(reused->get_macro_id(), res.data_block_ids_.at(1));
   EXPECT_NE(reused->get_macro_id(), res.data_block_ids_.at(2));
-  EXPECT_EQ(1, writer.get_seg_inv_meta().min_doc_id_);
-  EXPECT_EQ(21, writer.get_seg_inv_meta().max_doc_id_);
-  EXPECT_EQ(2002, writer.get_seg_inv_meta().total_doc_length_);
+  EXPECT_EQ(1, writer.get_seg_inv_meta().get_stats().min_doc_id_);
+  EXPECT_EQ(21, writer.get_seg_inv_meta().get_stats().max_doc_id_);
+  EXPECT_EQ(2002, writer.get_seg_inv_meta().get_stats().total_doc_length_);
 }
 
 TEST_F(ObInvIdxMacroBlockWriterTest, append_macro_block_requires_open_writer)
 {
   ObInvIdxMacroBlockWriter writer;
   ObMacroBlockDesc desc;
-  ObInvIdxMacroBlockInvStats stats;
+  ObInvMacroMeta stats;
   ASSERT_EQ(OB_NOT_INIT, writer.append_macro_block(desc, stats));
   EXPECT_EQ(0, writer.get_merge_block_info().multiplexed_macro_block_count_);
   EXPECT_EQ(0, writer.get_merge_block_info().macro_block_count_);
@@ -2226,7 +2294,7 @@ TEST_F(ObInvIdxMacroBlockWriterTest, append_macro_block_validates_descriptor)
   ASSERT_EQ(OB_SUCCESS, open_writer(writer, cleaner));
 
   ObMacroBlockDesc desc;
-  ObInvIdxMacroBlockInvStats stats;
+  ObInvMacroMeta stats;
   EXPECT_EQ(OB_INVALID_ARGUMENT, writer.append_macro_block(desc, stats));
   EXPECT_EQ(0, writer.get_merge_block_info().multiplexed_macro_block_count_);
 
@@ -2262,17 +2330,50 @@ TEST_F(ObInvIdxMacroBlockWriterTest, append_macro_block_rejects_invalid_stats_be
   ObInvIdxMacroBlockWriter writer;
   ObSSTablePrivateObjectCleaner cleaner;
   ASSERT_EQ(OB_SUCCESS, open_writer(writer, cleaner));
+  ObDatumRow row;
+  ASSERT_EQ(OB_SUCCESS, make_inv_idx_row(row, inv_idx_row_desc_, mv_col_cnt_,
+      "a", 1, 1, 100, "p"));
+  ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+  ASSERT_TRUE(writer.has_pending_rows_);
+  const int64_t row_offset = writer.index_block_builder_.row_offset_;
+  const auto expect_unchanged = [&]() {
+    EXPECT_TRUE(writer.has_pending_rows_);
+    EXPECT_EQ(1, writer.posting_encoder_.get_doc_count());
+    EXPECT_EQ(row_offset, writer.index_block_builder_.row_offset_);
+    EXPECT_EQ(0, writer.get_macro_block_write_ctx().get_macro_block_count());
+    EXPECT_EQ(0, writer.get_merge_block_info().multiplexed_macro_block_count_);
+    EXPECT_EQ(0, writer.get_merge_block_info().macro_block_count_);
+    EXPECT_EQ(0, writer.get_merge_block_info().total_row_count_);
+    EXPECT_TRUE(writer.get_seg_inv_meta().get_stats().is_empty_range());
+    EXPECT_EQ(0, writer.get_seg_inv_meta().get_stats().total_doc_length_);
+  };
   ObMacroBlockDesc desc;
   make_reuse_desc(*reused, desc);
-  ObInvIdxMacroBlockInvStats stats;
-  stats.min_doc_id_ = 2;
-  stats.max_doc_id_ = 1;
+  ObInvMacroMeta stats;
+  ObInvIdxStatsMeta invalid_stats;
+  invalid_stats.min_doc_id_ = 2;
+  invalid_stats.max_doc_id_ = 1;
+  // Inject malformed metadata to exercise the writer validation.
+  ASSERT_EQ(OB_SUCCESS, stats.stats_.assign(invalid_stats));
+  stats.is_inited_ = true;
 
   ASSERT_EQ(OB_INVALID_ARGUMENT, writer.append_macro_block(desc, stats));
-  EXPECT_EQ(0, writer.get_merge_block_info().multiplexed_macro_block_count_);
-  EXPECT_EQ(0, writer.get_merge_block_info().macro_block_count_);
-  EXPECT_EQ(0, writer.get_merge_block_info().total_row_count_);
-  EXPECT_TRUE(writer.get_seg_inv_meta().is_empty_range());
+  expect_unchanged();
+
+  // Default macro metadata has neither a populated range nor a valid layout.
+  stats.reset();
+  ASSERT_EQ(OB_INVALID_ARGUMENT, writer.append_macro_block(desc, stats));
+  expect_unchanged();
+
+  ObInvIdxStatsMeta incompatible;
+  ASSERT_EQ(OB_SUCCESS, incompatible.assign(writer.get_seg_inv_meta().get_stats()));
+  incompatible.min_doc_id_ = 1;
+  incompatible.max_doc_id_ = 20;
+  incompatible.has_position_list_ = !incompatible.has_position_list_;
+  ASSERT_TRUE(incompatible.is_valid());
+  ASSERT_EQ(OB_SUCCESS, stats.init(incompatible));
+  ASSERT_EQ(OB_ERR_UNEXPECTED, writer.append_macro_block(desc, stats));
+  expect_unchanged();
 }
 
 // 11.5 append_macro_block_clustered_requires_micro_block_data
@@ -2302,10 +2403,13 @@ TEST_F(ObInvIdxMacroBlockWriterTest, append_macro_block_clustered_requires_micro
   ObMacroBlockDesc desc;
   make_reuse_desc(*reused, desc);
   desc.is_clustered_index_tree_ = true;
-  ObInvIdxMacroBlockInvStats stats;
-  stats.min_doc_id_ = 1;
-  stats.max_doc_id_ = 20;
-  stats.total_doc_length_ = 2000;
+  ObInvMacroMeta stats;
+  ObInvIdxStatsMeta stats_value;
+  ASSERT_EQ(OB_SUCCESS, stats_value.assign(writer.get_seg_inv_meta().get_stats()));
+  stats_value.min_doc_id_ = 1;
+  stats_value.max_doc_id_ = 20;
+  stats_value.total_doc_length_ = 2000;
+  ASSERT_EQ(OB_SUCCESS, stats.init(stats_value));
   // The clustered replay path requires the reused macro's clustered index micro block;
   // a null payload must be rejected before any writer state changes.
   EXPECT_EQ(OB_ERR_UNEXPECTED, writer.append_macro_block(desc, stats, nullptr));
@@ -2340,7 +2444,7 @@ TEST_F(ObInvIdxMacroBlockWriterTest, append_macro_block_clustered_rejects_nonclu
 
   ObMacroBlockDesc desc;
   make_reuse_desc(*reused, desc);   // is_clustered_index_tree_ = false
-  ObInvIdxMacroBlockInvStats stats;
+  ObInvMacroMeta stats;
   EXPECT_EQ(OB_ERR_UNEXPECTED, writer.append_macro_block(desc, stats));
   EXPECT_EQ(0, writer.get_merge_block_info().multiplexed_macro_block_count_);
   EXPECT_EQ(0, writer.get_merge_block_info().macro_block_count_);
@@ -2358,7 +2462,7 @@ TEST_F(ObInvIdxMacroBlockWriterTest, merge_inv_meta_concurrent_partials)
   int results[thread_count] = {};
   for (int64_t i = 0; i < thread_count; ++i) {
     threads[i] = std::thread([&, i]() {
-      const ObInvIdxStatsMeta partial = make_inv_meta(thread_count - i, 100 + i, i + 1);
+      const ObInvSSTableMeta partial = make_inv_sstable_meta(thread_count - i, 100 + i, i + 1);
       ready.fetch_add(1);
       while (!start.load()) {
         std::this_thread::yield();
@@ -2376,8 +2480,8 @@ TEST_F(ObInvIdxMacroBlockWriterTest, merge_inv_meta_concurrent_partials)
     threads[i].join();
     EXPECT_EQ(OB_SUCCESS, results[i]);
   }
-  const ObInvIdxStatsMeta &meta = builder.get_inv_meta();
-  EXPECT_TRUE(meta.is_valid());
+  const ObInvIdxStatsMeta &meta = builder.get_inv_meta().get_stats();
+  EXPECT_TRUE(builder.get_inv_meta().is_valid());
   EXPECT_EQ(1U, meta.min_doc_id_);
   EXPECT_EQ(107U, meta.max_doc_id_);
   EXPECT_EQ(static_cast<uint64_t>(iterations * thread_count * (thread_count + 1) / 2),
@@ -2388,48 +2492,49 @@ TEST_F(ObInvIdxMacroBlockWriterTest, merge_inv_meta_accepts_empty_partials)
 {
   ObSSTableIndexBuilder builder(false /*use_double_write_buffer*/);
   builder.set_is_async_index(true);
-  const ObInvIdxStatsMeta empty = make_inv_meta();
+  const ObInvSSTableMeta empty = make_inv_sstable_meta();
   ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(empty));
   ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(empty));
   EXPECT_TRUE(builder.get_inv_meta().is_valid());
-  EXPECT_TRUE(builder.get_inv_meta().is_empty_range());
+  EXPECT_TRUE(builder.get_inv_meta().get_stats().is_empty_range());
 
-  const ObInvIdxStatsMeta partial = make_inv_meta(3, 9, 7);
+  const ObInvSSTableMeta partial = make_inv_sstable_meta(3, 9, 7);
   ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(partial));
   ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(empty));
-  EXPECT_EQ(3U, builder.get_inv_meta().min_doc_id_);
-  EXPECT_EQ(9U, builder.get_inv_meta().max_doc_id_);
-  EXPECT_EQ(7U, builder.get_inv_meta().total_doc_length_);
+  EXPECT_EQ(3U, builder.get_inv_meta().get_stats().min_doc_id_);
+  EXPECT_EQ(9U, builder.get_inv_meta().get_stats().max_doc_id_);
+  EXPECT_EQ(7U, builder.get_inv_meta().get_stats().total_doc_length_);
 }
 
 TEST_F(ObInvIdxMacroBlockWriterTest, merge_inv_meta_rejects_invalid_and_inconsistent_partials)
 {
   ObSSTableIndexBuilder builder(false /*use_double_write_buffer*/);
   builder.set_is_async_index(true);
-  const ObInvIdxStatsMeta invalid;
+  const ObInvSSTableMeta invalid;
   EXPECT_EQ(OB_INVALID_ARGUMENT, builder.merge_inv_meta(invalid));
   EXPECT_FALSE(builder.get_inv_meta().is_valid());
 
-  const ObInvIdxStatsMeta partial = make_inv_meta(3, 9, 7);
+  const ObInvSSTableMeta partial = make_inv_sstable_meta(3, 9, 7);
   ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(partial));
-  ObInvIdxStatsMeta incompatible_empty = make_inv_meta();
-  incompatible_empty.has_position_list_ = false;
+  ObInvIdxStatsMeta incompatible_stats = make_inv_meta();
+  incompatible_stats.has_position_list_ = false;
+  const ObInvSSTableMeta incompatible_empty = make_inv_sstable_meta(incompatible_stats);
   EXPECT_EQ(OB_ERR_UNEXPECTED, builder.merge_inv_meta(incompatible_empty));
-  EXPECT_EQ(3U, builder.get_inv_meta().min_doc_id_);
-  EXPECT_EQ(9U, builder.get_inv_meta().max_doc_id_);
-  EXPECT_EQ(7U, builder.get_inv_meta().total_doc_length_);
-  EXPECT_TRUE(builder.get_inv_meta().has_position_list_);
+  EXPECT_EQ(3U, builder.get_inv_meta().get_stats().min_doc_id_);
+  EXPECT_EQ(9U, builder.get_inv_meta().get_stats().max_doc_id_);
+  EXPECT_EQ(7U, builder.get_inv_meta().get_stats().total_doc_length_);
+  EXPECT_TRUE(builder.get_inv_meta().get_stats().has_position_list_);
 }
 
 TEST_F(ObInvIdxMacroBlockWriterTest, merge_inv_meta_saturates_total_doc_length)
 {
   ObSSTableIndexBuilder builder(false /*use_double_write_buffer*/);
   builder.set_is_async_index(true);
-  ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(make_inv_meta(3, 7, UINT64_MAX - 1)));
-  ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(make_inv_meta(2, 8, 2)));
-  EXPECT_EQ(2U, builder.get_inv_meta().min_doc_id_);
-  EXPECT_EQ(8U, builder.get_inv_meta().max_doc_id_);
-  EXPECT_EQ(UINT64_MAX, builder.get_inv_meta().total_doc_length_);
+  ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(make_inv_sstable_meta(3, 7, UINT64_MAX - 1)));
+  ASSERT_EQ(OB_SUCCESS, builder.merge_inv_meta(make_inv_sstable_meta(2, 8, 2)));
+  EXPECT_EQ(2U, builder.get_inv_meta().get_stats().min_doc_id_);
+  EXPECT_EQ(8U, builder.get_inv_meta().get_stats().max_doc_id_);
+  EXPECT_EQ(UINT64_MAX, builder.get_inv_meta().get_stats().total_doc_length_);
 }
 
 TEST_F(ObInvIdxMacroBlockWriterTest, sstable_index_builder_reset_clears_async_index_flag)

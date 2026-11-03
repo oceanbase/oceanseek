@@ -210,17 +210,19 @@ public:
     ASSERT_EQ(doc_cnt, res.row_count_);
 
     // 6. fill inv meta (schema-driven + data-driven) and build the ObInvSSTable
-    fill_inv_meta_from_schema(table_schema_, inv_idx_row_desc_, res.inv_meta_);
-    res.inv_meta_.min_doc_id_ = min_doc_id;
-    res.inv_meta_.max_doc_id_ = max_doc_id;
-    res.inv_meta_.total_doc_length_ = total_token_freq;
+    ObInvIdxStatsMeta inv_meta_stats;
+    fill_inv_meta_from_schema(table_schema_, inv_idx_row_desc_, inv_meta_stats);
+    inv_meta_stats.min_doc_id_ = min_doc_id;
+    inv_meta_stats.max_doc_id_ = max_doc_id;
+    inv_meta_stats.total_doc_length_ = total_token_freq;
+    ASSERT_EQ(OB_SUCCESS, res.inv_meta_.init(inv_meta_stats));
     ASSERT_TRUE(res.inv_meta_.is_valid());
 
     finalize_inv_sstable_from_res(res, inv_sstable);
     ASSERT_TRUE(inv_sstable.is_inv_sstable());
     ASSERT_TRUE(inv_sstable.is_valid());
-    ASSERT_EQ(min_doc_id, inv_sstable.get_inv_meta().min_doc_id_);
-    ASSERT_EQ(max_doc_id, inv_sstable.get_inv_meta().max_doc_id_);
+    ASSERT_EQ(min_doc_id, inv_sstable.get_inv_meta().get_stats().min_doc_id_);
+    ASSERT_EQ(max_doc_id, inv_sstable.get_inv_meta().get_stats().max_doc_id_);
     STORAGE_LOG(INFO, "built single term inv sstable", K(inv_sstable));
   }
 
@@ -380,25 +382,27 @@ public:
     ASSERT_TRUE(res.root_desc_.is_valid());
     ASSERT_EQ(doc_cnt, res.row_count_);
 
-    fill_inv_meta_from_schema(table_schema_, inv_idx_row_desc_, res.inv_meta_);
-    res.inv_meta_.index_type_ = INV_IDX_TYPE_SEARCH;
-    res.inv_meta_.has_nested_key_ = has_nested_key;
-    res.inv_meta_.min_doc_id_ = min_doc_id;
-    res.inv_meta_.max_doc_id_ = max_doc_id;
-    res.inv_meta_.total_doc_length_ = 0;
+    ObInvIdxStatsMeta inv_meta_stats;
+    fill_inv_meta_from_schema(table_schema_, inv_idx_row_desc_, inv_meta_stats);
+    inv_meta_stats.index_type_ = INV_IDX_TYPE_SEARCH;
+    inv_meta_stats.has_nested_key_ = has_nested_key;
+    inv_meta_stats.min_doc_id_ = min_doc_id;
+    inv_meta_stats.max_doc_id_ = max_doc_id;
+    inv_meta_stats.total_doc_length_ = 0;
+    ASSERT_EQ(OB_SUCCESS, res.inv_meta_.init(inv_meta_stats));
     ASSERT_TRUE(res.inv_meta_.is_valid());
-    ASSERT_FALSE(res.inv_meta_.has_relevance_params_);
-    ASSERT_EQ(has_nested_key, res.inv_meta_.has_nested_key_);
-    ASSERT_FALSE(res.inv_meta_.is_fts_index());
+    ASSERT_FALSE(res.inv_meta_.get_stats().has_relevance_params_);
+    ASSERT_EQ(has_nested_key, res.inv_meta_.get_stats().has_nested_key_);
+    ASSERT_FALSE(res.inv_meta_.get_stats().is_fts_index());
 
     finalize_inv_sstable_from_res(res, inv_sstable);
     ASSERT_TRUE(inv_sstable.is_inv_sstable());
     ASSERT_TRUE(inv_sstable.is_valid());
-    ASSERT_FALSE(inv_sstable.get_inv_meta().has_relevance_params_);
-    ASSERT_EQ(has_nested_key, inv_sstable.get_inv_meta().has_nested_key_);
-    ASSERT_FALSE(inv_sstable.get_inv_meta().is_fts_index());
-    ASSERT_EQ(min_doc_id, inv_sstable.get_inv_meta().min_doc_id_);
-    ASSERT_EQ(max_doc_id, inv_sstable.get_inv_meta().max_doc_id_);
+    ASSERT_FALSE(inv_sstable.get_inv_meta().get_stats().has_relevance_params_);
+    ASSERT_EQ(has_nested_key, inv_sstable.get_inv_meta().get_stats().has_nested_key_);
+    ASSERT_FALSE(inv_sstable.get_inv_meta().get_stats().is_fts_index());
+    ASSERT_EQ(min_doc_id, inv_sstable.get_inv_meta().get_stats().min_doc_id_);
+    ASSERT_EQ(max_doc_id, inv_sstable.get_inv_meta().get_stats().max_doc_id_);
     STORAGE_LOG(INFO, "built no-bm25 single term inv sstable", K(inv_sstable));
   }
 };
@@ -898,7 +902,7 @@ TEST_F(TestInvSSTablePostingIter, get_cur_nested_key_list_returns_blob)
   OK(inv_sstable.scan_posting(param, read_info, iter));
   ASSERT_NE(nullptr, iter);
   ASSERT_FALSE(iter->has_relevance_params_);
-  ASSERT_TRUE(inv_sstable.get_inv_meta().has_nested_key_);
+  ASSERT_TRUE(inv_sstable.get_inv_meta().get_stats().has_nested_key_);
 
   OK(iter->next());
   const ObDatum *id_datum = nullptr;
@@ -1114,7 +1118,7 @@ TEST_F(TestInvSSTablePostingIter, single_term_full_next_scan)
   ASSERT_TRUE(iter->is_end());
   ASSERT_EQ(OB_ITER_END, iter->next());
   ASSERT_EQ(OB_ITER_END, iter->next());
-  ASSERT_EQ(st_max_doc(), inv_sstable.get_inv_meta().max_doc_id_);
+  ASSERT_EQ(st_max_doc(), inv_sstable.get_inv_meta().get_stats().max_doc_id_);
   STORAGE_LOG(INFO, "single term full next scan done", K(i));
 
   free_iter(iter);

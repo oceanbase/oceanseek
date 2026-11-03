@@ -545,7 +545,8 @@ int ObInvIdxIndexBlockBuilder::build_estimate_macro_meta_row(
     estimate_macro_meta.val_.logic_id_.column_group_idx_ = data_store_desc_->get_table_cg_idx();
     estimate_macro_meta.val_.logic_id_.tablet_id_ = data_store_desc_->get_tablet_id().id();
     estimate_macro_meta.val_.macro_id_ = ObIndexBlockRowHeader::DEFAULT_IDX_ROW_MACRO_ID;
-    agg_size = projected_stats.inv_meta_.get_serialize_size();
+    const ObInvMacroMeta &inv_macro_meta = projected_stats.inv_meta_;
+    agg_size = inv_macro_meta.get_serialize_size();
     if (OB_UNLIKELY(agg_size <= 0)) {
       ret = OB_ERR_UNEXPECTED;
       STORAGE_LOG(WARN, "unexpected projected inv meta serialize size", K(ret),
@@ -554,7 +555,7 @@ int ObInvIdxIndexBlockBuilder::build_estimate_macro_meta_row(
         meta_row_allocator_.alloc(agg_size)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       STORAGE_LOG(WARN, "fail to alloc estimate inv macro meta buffer", K(ret), K(agg_size));
-    } else if (OB_FAIL(projected_stats.inv_meta_.serialize(agg_buf, agg_size, agg_pos))) {
+    } else if (OB_FAIL(inv_macro_meta.serialize(agg_buf, agg_size, agg_pos))) {
       STORAGE_LOG(WARN, "fail to serialize projected inv macro meta", K(ret),
           K(agg_size), K(projected_stats));
     } else if (OB_UNLIKELY(agg_pos != agg_size)) {
@@ -760,7 +761,8 @@ int ObInvIdxIndexBlockBuilder::generate_macro_row(
     macro_meta_.val_.ddl_end_row_offset_ = ddl_start_row_offset >= 0
         ? ddl_start_row_offset + macro_stats.doc_count_ - 1
         : -1;
-    const int64_t agg_size = macro_stats.inv_meta_.get_serialize_size();
+    const ObInvMacroMeta &inv_macro_meta = macro_stats.inv_meta_;
+    const int64_t agg_size = inv_macro_meta.get_serialize_size();
     char *agg_buf = nullptr;
     int64_t agg_pos = 0;
     if (OB_UNLIKELY(agg_size <= 0)) {
@@ -770,7 +772,7 @@ int ObInvIdxIndexBlockBuilder::generate_macro_row(
     } else if (OB_ISNULL(agg_buf = static_cast<char *>(meta_row_allocator_.alloc(agg_size)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       STORAGE_LOG(WARN, "fail to alloc macro meta buffer", K(ret), K(agg_size));
-    } else if (OB_FAIL(macro_stats.inv_meta_.serialize(agg_buf, agg_size, agg_pos))) {
+    } else if (OB_FAIL(inv_macro_meta.serialize(agg_buf, agg_size, agg_pos))) {
       STORAGE_LOG(WARN, "fail to serialize macro meta", K(ret),
           K(agg_size), K(macro_stats));
     } else if (OB_UNLIKELY(agg_pos != agg_size)) {

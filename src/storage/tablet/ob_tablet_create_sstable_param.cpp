@@ -224,9 +224,10 @@ int ObTabletCreateSSTableParam::inner_init_with_merge_res(const blocksstable::Ob
 
 int ObTabletCreateSSTableParam::init_empty_inv_meta(
     const ObStorageSchema &storage_schema,
-    ObInvIdxStatsMeta &inv_meta)
+    ObInvSSTableMeta &inv_meta)
 {
   int ret = OB_SUCCESS;
+  ObInvIdxStatsMeta stats;
   ObSEArray<ObColDesc, 8> rowkey_col_descs;
   int64_t doc_id_col_idx = -1;
   inv_meta.reset();
@@ -245,10 +246,10 @@ int ObTabletCreateSSTableParam::init_empty_inv_meta(
           K(rowkey_col_descs), K(column_cnt), K(storage_schema));
     } else {
       doc_id_col_idx = rowkey_col_descs.count() - 1;
-      inv_meta.index_type_ = INV_IDX_TYPE_FTS;
-      inv_meta.has_relevance_params_ = true;
-      inv_meta.has_position_list_ = ObFTSConstants::INVERTED_COL_CNT_WITH_POS == column_cnt;
-      inv_meta.has_nested_key_ = false;
+      stats.index_type_ = INV_IDX_TYPE_FTS;
+      stats.has_relevance_params_ = true;
+      stats.has_position_list_ = ObFTSConstants::INVERTED_COL_CNT_WITH_POS == column_cnt;
+      stats.has_nested_key_ = false;
     }
   } else if (share::schema::is_async_search_data_index(storage_schema.get_index_type())) {
     const int64_t column_cnt = storage_schema.get_column_count();
@@ -260,10 +261,10 @@ int ObTabletCreateSSTableParam::init_empty_inv_meta(
           K(rowkey_col_descs), K(column_cnt), K(storage_schema));
     } else {
       doc_id_col_idx = share::SEARCH_INDEX_DOC_ID;
-      inv_meta.index_type_ = INV_IDX_TYPE_SEARCH;
-      inv_meta.has_relevance_params_ = false;
-      inv_meta.has_position_list_ = false;
-      inv_meta.has_nested_key_ = share::SEARCH_INDEX_KEY_CNT_WITH_NK == column_cnt;
+      stats.index_type_ = INV_IDX_TYPE_SEARCH;
+      stats.has_relevance_params_ = false;
+      stats.has_position_list_ = false;
+      stats.has_nested_key_ = share::SEARCH_INDEX_KEY_CNT_WITH_NK == column_cnt;
     }
   } else {
     ret = OB_ERR_UNEXPECTED;
@@ -276,12 +277,15 @@ int ObTabletCreateSSTableParam::init_empty_inv_meta(
     LOG_WARN("invalid doc id column index for empty inverted index meta", K(ret),
         K(doc_id_col_idx), K(rowkey_col_descs), K(storage_schema));
   } else {
-    inv_meta.doc_id_obj_meta_ = rowkey_col_descs.at(doc_id_col_idx).col_type_;
-    if (OB_UNLIKELY(!inv_meta.is_valid())) {
+    stats.doc_id_obj_meta_ = rowkey_col_descs.at(doc_id_col_idx).col_type_;
+    if (OB_UNLIKELY(!stats.is_valid())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("failed to initialize valid empty inverted index meta", K(ret),
-          K(inv_meta), K(storage_schema));
+          K(stats), K(storage_schema));
     }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(inv_meta.init(stats))) {
+    LOG_WARN("failed to construct empty inverted sstable metadata", K(ret), K(stats));
   }
   return ret;
 }
@@ -760,9 +764,9 @@ int ObTabletCreateSSTableParam::init_for_merge(const compaction::ObBasicTabletMe
     table_shared_flag_.reset();
     co_base_snapshot_version_ = ctx.static_param_.co_static_param_.co_base_snapshot_version_;
     tx_data_recycle_scn_.set_min();
-    inv_meta_ = res.inv_meta_;
-
-    if (OB_FAIL(inner_init_with_merge_res(res))) {
+    if (OB_FAIL(inv_meta_.assign(res.inv_meta_))) {
+      LOG_WARN("failed to copy inverted stats to create param", K(ret));
+    } else if (OB_FAIL(inner_init_with_merge_res(res))) {
       LOG_WARN("fail to init with merge res", K(ret), K(res.data_block_ids_));
     } else if (OB_UNLIKELY(!is_valid_mini_merge_rec_scn_())) {
       ret = OB_ERR_UNEXPECTED;
@@ -975,10 +979,12 @@ int ObTabletCreateSSTableParam::init_for_ddl(blocksstable::ObSSTableIndexBuilder
         rec_scn_.set_min();
       }
 
-      if (ddl_param.table_key_.is_inv_sstable()) {
-        inv_meta_ = res.inv_meta_;
+      if (ddl_param.table_key_.is_inv_sstable()
+          && OB_FAIL(inv_meta_.assign(res.inv_meta_))) {
+        LOG_WARN("failed to copy inverted stats to ddl param", K(ret));
       }
-      if (OB_FAIL(inner_init_with_merge_res(res))) {
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(inner_init_with_merge_res(res))) {
         LOG_WARN("fail to inner init with merge res", K(ret), K(res));
       } else if (ddl_param.table_key_.is_co_sstable()) {
         column_group_cnt_ = storage_schema.get_column_group_count();
@@ -1337,9 +1343,9 @@ int ObTabletCreateSSTableParam::inner_init_for_ss_ddl_(
     }
     // carry the inverted-index extended meta from the merge result, mirroring
     // init_for_merge; left default (invalid) for non-inverted-index ddl sstables.
-    inv_meta_ = res.inv_meta_;
-
-    if (OB_FAIL(inner_init_with_merge_res(res))) {
+    if (OB_FAIL(inv_meta_.assign(res.inv_meta_))) {
+      LOG_WARN("failed to copy inverted stats to create param", K(ret));
+    } else if (OB_FAIL(inner_init_with_merge_res(res))) {
       LOG_WARN("fail to inner init with merge res", K(ret), K(res));
     } else if (table_key.is_co_sstable()) {
       column_group_cnt_ = storage_schema.get_column_group_count();

@@ -348,10 +348,11 @@ int ObSSTableMergeRes::assign(const ObSSTableMergeRes &src)
     nested_offset_ = src.nested_offset_;
     root_row_store_type_ = src.root_row_store_type_;
     is_small_sstable_ = src.is_small_sstable_;
-    inv_meta_ = src.inv_meta_;
     MEMCPY(encrypt_key_, src.encrypt_key_, sizeof(encrypt_key_));
 
-    if (OB_FAIL(data_block_ids_.reserve(src.data_block_ids_.count()))) {
+    if (OB_FAIL(inv_meta_.assign(src.inv_meta_))) {
+      STORAGE_LOG(WARN, "failed to copy merge result inverted stats", K(ret));
+    } else if (OB_FAIL(data_block_ids_.reserve(src.data_block_ids_.count()))) {
       STORAGE_LOG(WARN, "failed to reserve count", K(ret));
     } else {
       for (int64_t i = 0; OB_SUCC(ret) && i < src.data_block_ids_.count();
@@ -1776,10 +1777,11 @@ int ObSSTableIndexBuilder::close_with_macro_seq_inner(
            share::OB_MAX_TABLESPACE_ENCRYPT_KEY_LENGTH);
     res.master_key_id_ = desc.get_master_key_id();
     res.set_table_flag_with_macro_id_array();
-    if (is_async_index_) {
-      res.inv_meta_ = inv_meta_;
+    if (is_async_index_ && OB_FAIL(res.assign_inv_meta(inv_meta_))) {
+      STORAGE_LOG(WARN, "failed to copy inverted stats to merge result", K(ret));
     }
-    if (OB_FAIL(res_.assign(res))) {
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(res_.assign(res))) {
       STORAGE_LOG(WARN, "fail to save merge res", K(ret), K(res));
     } else if (OB_ISNULL(object_cleaner_)) {
       ret = OB_ERR_UNEXPECTED;
@@ -2188,7 +2190,7 @@ bool ObSSTableIndexBuilder::is_retriable_error(const int ret_code) const
   return b_ret;
 }
 
-int ObSSTableIndexBuilder::merge_inv_meta(const ObInvIdxStatsMeta &partial)
+int ObSSTableIndexBuilder::merge_inv_meta(const ObInvSSTableMeta &partial)
 {
   int ret = OB_SUCCESS;
   lib::ObMutexGuard mutex_guard(mutex_);
@@ -2199,18 +2201,24 @@ int ObSSTableIndexBuilder::merge_inv_meta(const ObInvIdxStatsMeta &partial)
   } else if (OB_UNLIKELY(!partial.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     STORAGE_LOG(WARN, "partial inv meta is invalid", K(ret), K(partial), KPC(this));
-  } else if (!inv_meta_.is_valid()) {
-    inv_meta_ = partial;
-  } else if (OB_UNLIKELY(inv_meta_.index_type_ != partial.index_type_
-      || inv_meta_.has_relevance_params_ != partial.has_relevance_params_
-      || inv_meta_.has_position_list_ != partial.has_position_list_
-      || inv_meta_.has_nested_key_ != partial.has_nested_key_
-      || inv_meta_.doc_id_obj_meta_ != partial.doc_id_obj_meta_)) {
+  } else if (OB_FAIL(inv_meta_.merge(partial))) {
+    STORAGE_LOG(WARN, "failed to merge inverted index stats", K(ret), K_(inv_meta), K(partial));
+  }
+  return ret;
+}
+
+int ObSSTableIndexBuilder::merge_macro_inv_meta(const ObInvMacroMeta &macro_meta)
+{
+  int ret = OB_SUCCESS;
+  lib::ObMutexGuard mutex_guard(mutex_);
+  ObBlockWriterConcurrentGuard guard(concurrent_lock_);
+  if (OB_UNLIKELY(!is_async_index_)) {
     ret = OB_ERR_UNEXPECTED;
-    STORAGE_LOG(WARN, "inconsistent static inv meta fields across partials", K(ret),
-        K(inv_meta_), K(partial), KPC(this));
-  } else if (!partial.is_empty_range() && OB_FAIL(inv_meta_.update(partial))) {
-    STORAGE_LOG(WARN, "failed to update inverted index stats", K(ret), K(inv_meta_), K(partial));
+    STORAGE_LOG(WARN, "merge macro metadata called on non-async index builder",
+        K(ret), KPC(this));
+  } else if (OB_FAIL(inv_meta_.merge_macro(macro_meta))) {
+    STORAGE_LOG(WARN, "failed to merge inverted macro metadata",
+        K(ret), K_(inv_meta), K(macro_meta));
   }
   return ret;
 }
@@ -4621,11 +4629,12 @@ int ObIndexBlockRebuilder::inner_append_macro_row(
       STORAGE_LOG(WARN, "failed to add abs row offset", K(ret), K(abs_offset));
     } else if (INV_IDX_ROW_STORE == macro_meta.val_.row_store_type_
                && macro_meta.val_.agg_row_len_ > 0 && nullptr != macro_meta.val_.agg_row_buf_) {
-      ObInvIdxStatsMeta macro_inv_meta;
+      ObInvMacroMeta macro_inv_meta;
       int64_t agg_pos = 0;
-      if (OB_FAIL(macro_inv_meta.deserialize(macro_meta.val_.agg_row_buf_, macro_meta.val_.agg_row_len_, agg_pos))) {
+      if (OB_FAIL(macro_inv_meta.deserialize(
+          macro_meta.val_.agg_row_buf_, macro_meta.val_.agg_row_len_, agg_pos))) {
         STORAGE_LOG(WARN, "fail to deserialize inv macro agg data", K(ret), K(macro_meta));
-      } else if (OB_FAIL(sstable_builder_->merge_inv_meta(macro_inv_meta))) {
+      } else if (OB_FAIL(sstable_builder_->merge_macro_inv_meta(macro_inv_meta))) {
         STORAGE_LOG(WARN, "fail to merge inv meta from macro agg data", K(ret), K(macro_inv_meta), K(macro_meta));
       }
     } else {

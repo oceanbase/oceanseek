@@ -300,12 +300,15 @@ int TestCompactionPolicy::mock_sstable(
       }
     }
     if (ObITable::is_inv_sstable(type)) {
-      param.inv_meta_.index_type_ = INV_IDX_TYPE_FTS;
-      param.inv_meta_.has_relevance_params_ = true;
-      param.inv_meta_.doc_id_obj_meta_.set_uint64();
-      param.inv_meta_.min_doc_id_ = 1;
-      param.inv_meta_.max_doc_id_ = 1;
-      param.inv_meta_.total_doc_length_ = 0;
+      ObInvIdxStatsMeta stats;
+      stats.index_type_ = INV_IDX_TYPE_FTS;
+      stats.has_relevance_params_ = true;
+      stats.doc_id_obj_meta_.set_uint64();
+      stats.min_doc_id_ = 1;
+      stats.max_doc_id_ = 1;
+      if (OB_FAIL(param.inv_meta_.init(stats))) {
+        LOG_WARN("failed to initialize inv meta", K(ret));
+      }
     }
   }
 
@@ -1237,12 +1240,15 @@ TEST_F(TestCompactionPolicy, calculate_inc_major_read_tables_filters_abort_from_
   pending->meta_cache_.max_merged_trans_version_ = 150;
   pending->meta_cache_.upper_trans_version_ = INT64_MAX;
   pending->meta_->uncommit_tx_info_.tx_infos_[0].tx_id_ = abort_tx_id;
-  ObInvIdxStatsMeta pending_inv_meta =
+  ObInvSSTableMeta pending_inv_meta =
       static_cast<ObInvSSTable *>(pending)->get_inv_meta();
-  pending_inv_meta.total_doc_length_ = 1000;
+  ObInvIdxStatsMeta pending_stats = pending_inv_meta.get_stats();
+  pending_stats.total_doc_length_ = 1000;
+  pending_inv_meta.reset();
+  ASSERT_EQ(OB_SUCCESS, pending_inv_meta.init(pending_stats));
   ASSERT_EQ(OB_SUCCESS,
       static_cast<ObInvSSTable *>(pending)->set_inv_meta(
-          allocator_, pending_inv_meta));
+          pending_inv_meta));
   ASSERT_EQ(OB_SUCCESS,
             mock_tx_data(abort_tx_id, 200, transaction::ObTxData::ABORT));
 
@@ -1262,12 +1268,15 @@ TEST_F(TestCompactionPolicy, calculate_inc_major_read_tables_filters_abort_from_
   committed_retry->meta_->basic_meta_.max_merged_trans_version_ = 150;
   committed_retry->meta_cache_.min_merged_trans_version_ = 1;
   committed_retry->meta_cache_.max_merged_trans_version_ = 150;
-  ObInvIdxStatsMeta committed_inv_meta =
+  ObInvSSTableMeta committed_inv_meta =
       static_cast<ObInvSSTable *>(committed_retry)->get_inv_meta();
-  committed_inv_meta.total_doc_length_ = 200;
+  ObInvIdxStatsMeta committed_stats = committed_inv_meta.get_stats();
+  committed_stats.total_doc_length_ = 200;
+  committed_inv_meta.reset();
+  ASSERT_EQ(OB_SUCCESS, committed_inv_meta.init(committed_stats));
   ASSERT_EQ(OB_SUCCESS,
       static_cast<ObInvSSTable *>(committed_retry)->set_inv_meta(
-          allocator_, committed_inv_meta));
+          committed_inv_meta));
 
   for (int64_t pending_first = 0; pending_first < 2; ++pending_first) {
     ObSEArray<ObITable *, 2> inc_major_tables;
@@ -1329,9 +1338,11 @@ TEST_F(TestCompactionPolicy, async_bm25_filters_uncommitted_and_future_logical_r
           ? transaction::ObTransID::OB_MIN_TRANS_ID - 1 : abort_tx_id;
     }
     ObInvSSTable *inv_sstable = static_cast<ObInvSSTable *>(sstable);
-    ObInvIdxStatsMeta meta = inv_sstable->get_inv_meta();
-    meta.total_doc_length_ = doc_lengths[i];
-    ASSERT_EQ(OB_SUCCESS, inv_sstable->set_inv_meta(allocator_, meta));
+    ObInvIdxStatsMeta stats_meta = inv_sstable->get_inv_meta().get_stats();
+    stats_meta.total_doc_length_ = doc_lengths[i];
+    ObInvSSTableMeta meta;
+    ASSERT_EQ(OB_SUCCESS, meta.init(stats_meta));
+    ASSERT_EQ(OB_SUCCESS, inv_sstable->set_inv_meta(meta));
     ASSERT_EQ(OB_SUCCESS, increments.push_back(sstable));
   }
   ObTabletTableStore table_store;
@@ -1356,9 +1367,11 @@ TEST_F(TestCompactionPolicy, async_bm25_filters_uncommitted_and_future_logical_r
   ObSSTable *major = nullptr;
   ASSERT_EQ(OB_SUCCESS, major_handle.get_sstable(major));
   ObInvSSTable *inv_major = static_cast<ObInvSSTable *>(major);
-  ObInvIdxStatsMeta major_meta = inv_major->get_inv_meta();
-  major_meta.total_doc_length_ = 50;
-  ASSERT_EQ(OB_SUCCESS, inv_major->set_inv_meta(allocator_, major_meta));
+  ObInvIdxStatsMeta major_stats = inv_major->get_inv_meta().get_stats();
+  major_stats.total_doc_length_ = 50;
+  ObInvSSTableMeta major_meta;
+  ASSERT_EQ(OB_SUCCESS, major_meta.init(major_stats));
+  ASSERT_EQ(OB_SUCCESS, inv_major->set_inv_meta(major_meta));
   ObSEArray<ObITable *, 1> majors;
   ASSERT_EQ(OB_SUCCESS, majors.push_back(major));
   ASSERT_EQ(OB_SUCCESS, table_store.major_tables_.init(allocator_, majors));

@@ -189,10 +189,12 @@ public:
     ASSERT_TRUE(res.root_desc_.is_valid());
     ASSERT_EQ(1, res.row_count_);
 
-    fill_inv_meta_from_schema(table_schema_, inv_idx_row_desc_, res.inv_meta_);
-    res.inv_meta_.min_doc_id_ = start_doc_id;
-    res.inv_meta_.max_doc_id_ = start_doc_id;
-    res.inv_meta_.total_doc_length_ = 1;
+    ObInvIdxStatsMeta inv_meta_stats;
+    fill_inv_meta_from_schema(table_schema_, inv_idx_row_desc_, inv_meta_stats);
+    inv_meta_stats.min_doc_id_ = start_doc_id;
+    inv_meta_stats.max_doc_id_ = start_doc_id;
+    inv_meta_stats.total_doc_length_ = 1;
+    ASSERT_EQ(OB_SUCCESS, res.inv_meta_.init(inv_meta_stats));
     ASSERT_TRUE(res.inv_meta_.is_valid());
 
     finalize_inv_sstable_from_res(res, inv_sstable);
@@ -250,10 +252,12 @@ public:
     ASSERT_TRUE(res.root_desc_.is_valid());
     ASSERT_EQ(doc_cnt, res.row_count_);
 
-    fill_inv_meta_from_schema(table_schema_, inv_idx_row_desc_, res.inv_meta_);
-    res.inv_meta_.min_doc_id_ = min_doc_id;
-    res.inv_meta_.max_doc_id_ = max_doc_id;
-    res.inv_meta_.total_doc_length_ = doc_cnt;
+    ObInvIdxStatsMeta inv_meta_stats;
+    fill_inv_meta_from_schema(table_schema_, inv_idx_row_desc_, inv_meta_stats);
+    inv_meta_stats.min_doc_id_ = min_doc_id;
+    inv_meta_stats.max_doc_id_ = max_doc_id;
+    inv_meta_stats.total_doc_length_ = doc_cnt;
+    ASSERT_EQ(OB_SUCCESS, res.inv_meta_.init(inv_meta_stats));
     ASSERT_TRUE(res.inv_meta_.is_valid());
 
     finalize_inv_sstable_from_res(res, inv_sstable);
@@ -293,18 +297,20 @@ public:
     ASSERT_TRUE(res.root_desc_.is_valid());
     ASSERT_EQ(1, res.row_count_);
 
-    fill_inv_meta_from_schema(table_schema_, inv_idx_row_desc_, res.inv_meta_);
-    res.inv_meta_.index_type_ = INV_IDX_TYPE_SEARCH;
-    res.inv_meta_.min_doc_id_ = doc_id;
-    res.inv_meta_.max_doc_id_ = doc_id;
-    res.inv_meta_.total_doc_length_ = 0;
+    ObInvIdxStatsMeta inv_meta_stats;
+    fill_inv_meta_from_schema(table_schema_, inv_idx_row_desc_, inv_meta_stats);
+    inv_meta_stats.index_type_ = INV_IDX_TYPE_SEARCH;
+    inv_meta_stats.min_doc_id_ = doc_id;
+    inv_meta_stats.max_doc_id_ = doc_id;
+    inv_meta_stats.total_doc_length_ = 0;
+    ASSERT_EQ(OB_SUCCESS, res.inv_meta_.init(inv_meta_stats));
     ASSERT_TRUE(res.inv_meta_.is_valid());
-    ASSERT_FALSE(res.inv_meta_.has_relevance_params_);
+    ASSERT_FALSE(res.inv_meta_.get_stats().has_relevance_params_);
 
     finalize_inv_sstable_from_res(res, inv_sstable);
     ASSERT_TRUE(inv_sstable.is_inv_sstable());
     ASSERT_TRUE(inv_sstable.is_valid());
-    ASSERT_FALSE(inv_sstable.get_inv_meta().has_relevance_params_);
+    ASSERT_FALSE(inv_sstable.get_inv_meta().get_stats().has_relevance_params_);
   }
 
   void create_helper(

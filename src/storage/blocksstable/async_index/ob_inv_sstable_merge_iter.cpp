@@ -657,23 +657,23 @@ int ObInvSSTableMergeIter::get_macro_block_desc(ObMacroBlockDesc &desc) const
   return ret;
 }
 
-int ObInvSSTableMergeIter::get_curr_macro_inv_stats(ObInvIdxMacroBlockInvStats &stats) const
+int ObInvSSTableMergeIter::get_curr_macro_inv_meta(ObInvMacroMeta &meta) const
 {
   int ret = OB_SUCCESS;
-  stats.reset();
+  meta.reset();
   const ObDataMacroBlockMeta *macro_meta = curr_macro_desc_.macro_meta_;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
   } else if (OB_UNLIKELY(Level::MACRO != curr_level_)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("get_curr_macro_inv_stats requires MACRO level", K(ret), K_(curr_level));
+    LOG_WARN("get_curr_macro_inv_meta requires MACRO level", K(ret), K_(curr_level));
   } else if (OB_UNLIKELY(!curr_macro_desc_.is_valid() || OB_ISNULL(macro_meta))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid macro desc / meta", K(ret), K_(curr_macro_desc), KP(macro_meta));
   } else {
     const ObDataBlockMetaVal &val = macro_meta->val_;
-    ObInvIdxStatsMeta macro_inv_meta;
+    ObInvMacroMeta macro_inv_meta;
     int64_t pos = 0;
     if (OB_UNLIKELY(common::INV_IDX_ROW_STORE != val.row_store_type_
         || val.agg_row_len_ <= 0 || OB_ISNULL(val.agg_row_buf_))) {
@@ -681,14 +681,11 @@ int ObInvSSTableMergeIter::get_curr_macro_inv_stats(ObInvIdxMacroBlockInvStats &
       LOG_WARN("invalid inverted index macro agg meta", K(ret), K(val), KPC(macro_meta));
     } else if (OB_FAIL(macro_inv_meta.deserialize(val.agg_row_buf_, val.agg_row_len_, pos))) {
       LOG_WARN("fail to deserialize inverted index macro agg meta", K(ret), K(val));
-    } else if (OB_UNLIKELY(!macro_inv_meta.is_valid() || macro_inv_meta.is_empty_range())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("invalid inverted index stats in macro meta", K(ret),
-          K(macro_inv_meta), KPC(macro_meta));
-    } else {
-      stats.min_doc_id_ = macro_inv_meta.min_doc_id_;
-      stats.max_doc_id_ = macro_inv_meta.max_doc_id_;
-      stats.total_doc_length_ = macro_inv_meta.total_doc_length_;
+    } else if (OB_UNLIKELY(!macro_inv_meta.is_valid())) {
+      ret = OB_DESERIALIZE_ERROR;
+      LOG_WARN("invalid decoded inverted macro metadata", K(ret), K(macro_inv_meta));
+    } else if (OB_FAIL(meta.assign(macro_inv_meta))) {
+      LOG_WARN("failed to copy macro inverted stats", K(ret));
     }
   }
   return ret;

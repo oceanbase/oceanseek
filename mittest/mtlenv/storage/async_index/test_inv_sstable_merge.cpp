@@ -142,7 +142,7 @@ TEST_F(TestInvSSTableMerge, init_for_merge_emits_inv_sstable_when_ctx_marks_inv_
   build_real_merge_res(micro_data, snapshot_version, res);
   ObInvIdxStatsMeta inv_meta;
   fill_inv_meta(7, 99, inv_meta);
-  res.inv_meta_ = inv_meta;
+  ASSERT_EQ(OB_SUCCESS, res.inv_meta_.init(inv_meta));
 
   ObTabletCreateSSTableParam param;
   ASSERT_EQ(OB_SUCCESS, param.init_for_merge(merge_context, res, nullptr /*cg_schema*/, 0 /*cg_idx*/));
@@ -150,8 +150,8 @@ TEST_F(TestInvSSTableMerge, init_for_merge_emits_inv_sstable_when_ctx_marks_inv_
   ASSERT_TRUE(param.table_key_.is_major_sstable());
   ASSERT_FALSE(param.table_key_.is_inc_major_type_sstable());
   ASSERT_TRUE(param.inv_meta_.is_valid());
-  ASSERT_EQ(inv_meta.max_doc_id_, param.inv_meta_.max_doc_id_);
-  ASSERT_EQ(inv_meta.min_doc_id_, param.inv_meta_.min_doc_id_);
+  ASSERT_EQ(inv_meta.max_doc_id_, param.inv_meta_.get_stats().max_doc_id_);
+  ASSERT_EQ(inv_meta.min_doc_id_, param.inv_meta_.get_stats().min_doc_id_);
 
   // Inc-major inv merge should stay in the inc-major table family instead of
   // being folded into the base major INV_INDEX_SSTABLE type.
@@ -173,7 +173,7 @@ TEST_F(TestInvSSTableMerge, init_for_merge_emits_inv_sstable_when_ctx_marks_inv_
   merge_context.static_param_.is_inv_index_ = false;
   ObSSTableMergeRes normal_res;
   build_real_merge_res(micro_data, snapshot_version, normal_res);
-  normal_res.inv_meta_ = inv_meta;
+  ASSERT_EQ(OB_SUCCESS, normal_res.inv_meta_.init(inv_meta));
   ObTabletCreateSSTableParam normal_param;
   ASSERT_EQ(OB_SUCCESS, normal_param.init_for_merge(merge_context, normal_res, nullptr, 0));
   ASSERT_FALSE(normal_param.table_key_.is_inv_sstable());
@@ -225,7 +225,7 @@ TEST_F(TestInvSSTableMerge, create_inv_sstable_and_load_into_table_store)
   build_real_merge_res(micro_data, snapshot_version, res);
   ObInvIdxStatsMeta inv_meta;
   fill_inv_meta(3, 88, inv_meta);
-  res.inv_meta_ = inv_meta;
+  ASSERT_EQ(OB_SUCCESS, res.inv_meta_.init(inv_meta));
 
   ObTabletCreateSSTableParam param;
   ASSERT_EQ(OB_SUCCESS, param.init_for_merge(merge_context, res, nullptr /*cg_schema*/, 0 /*cg_idx*/));
@@ -240,8 +240,8 @@ TEST_F(TestInvSSTableMerge, create_inv_sstable_and_load_into_table_store)
   ASSERT_NE(nullptr, inv_sstable);
   ASSERT_TRUE(inv_sstable->is_inv_sstable());
   ASSERT_TRUE(inv_sstable->is_major_sstable());
-  ASSERT_EQ(88, static_cast<ObInvSSTable *>(inv_sstable)->get_inv_meta().max_doc_id_);
-  ASSERT_EQ(3, static_cast<ObInvSSTable *>(inv_sstable)->get_inv_meta().min_doc_id_);
+  ASSERT_EQ(88, static_cast<ObInvSSTable *>(inv_sstable)->get_inv_meta().get_stats().max_doc_id_);
+  ASSERT_EQ(3, static_cast<ObInvSSTable *>(inv_sstable)->get_inv_meta().get_stats().min_doc_id_);
 
   // --- install into the tablet's table store ---
   ObUpdateTableStoreParam update_param;

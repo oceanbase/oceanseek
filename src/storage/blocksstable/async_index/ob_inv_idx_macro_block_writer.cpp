@@ -386,9 +386,13 @@ int ObInvIdxMacroBlockWriter::init_inv_meta()
       initial_meta.has_position_list_ = inv_idx_row_desc_.pos_list_col_idx_ >= 0;
       initial_meta.has_nested_key_ = inv_idx_row_desc_.nested_key_col_idx_ >= 0;
       initial_meta.doc_id_obj_meta_ = col_descs.at(inv_idx_row_desc_.doc_id_col_idx_).col_type_;
-      current_micro_stats_.inv_meta_ = initial_meta;
-      macro_stats_.inv_meta_ = initial_meta;
-      seg_inv_meta_ = initial_meta;
+      if (OB_FAIL(current_micro_stats_.inv_meta_.init(initial_meta))) {
+        STORAGE_LOG(WARN, "failed to initialize micro stats", K(ret));
+      } else if (OB_FAIL(macro_stats_.inv_meta_.init(initial_meta))) {
+        STORAGE_LOG(WARN, "failed to initialize macro stats", K(ret));
+      } else if (OB_FAIL(seg_inv_meta_.init(initial_meta))) {
+        STORAGE_LOG(WARN, "failed to initialize segment stats", K(ret));
+      }
     }
   }
   return ret;
@@ -1121,8 +1125,9 @@ int ObInvIdxMacroBlockWriter::estimate_projected_macro_meta_block_size(int64_t &
   int ret = OB_SUCCESS;
   ObInvIdxMacroBlockStats projected_macro_stats;
   estimate_size = 0;
-  projected_macro_stats = macro_stats_;
-  if (OB_FAIL(projected_macro_stats.endkey_.assign(
+  if (OB_FAIL(projected_macro_stats.assign(macro_stats_))) {
+    STORAGE_LOG(WARN, "failed to copy projected macro stats", K(ret));
+  } else if (OB_FAIL(projected_macro_stats.endkey_.assign(
       current_micro_stats_.endkey_.datums_,
       current_micro_stats_.endkey_.get_datum_cnt()))) {
     STORAGE_LOG(WARN, "fail to assign projected inverted index macro endkey", K(ret),
@@ -1132,7 +1137,8 @@ int ObInvIdxMacroBlockWriter::estimate_projected_macro_meta_block_size(int64_t &
     STORAGE_LOG(WARN, "projected inverted index macro doc count overflows", K(ret),
         K_(macro_stats), K_(current_micro_stats));
   } else if (FALSE_IT(projected_macro_stats.doc_count_ += current_micro_stats_.doc_count_)) {
-  } else if (OB_FAIL(projected_macro_stats.inv_meta_.update(current_micro_stats_.inv_meta_))) {
+  } else if (OB_FAIL(projected_macro_stats.inv_meta_.merge(
+      current_micro_stats_.inv_meta_))) {
     STORAGE_LOG(WARN, "fail to update projected inverted index macro stats", K(ret),
         K_(current_micro_stats));
   } else if (OB_FAIL(index_block_builder_.estimate_projected_macro_meta_block_size(
@@ -1163,7 +1169,7 @@ int ObInvIdxMacroBlockWriter::commit_micro_block_pair(
     STORAGE_LOG(WARN, "inverted index macro doc count overflows on commit", K(ret),
         K_(macro_stats), K_(current_micro_stats));
   } else if (FALSE_IT(macro_stats_.doc_count_ += current_micro_stats_.doc_count_)) {
-  } else if (OB_FAIL(macro_stats_.inv_meta_.update(current_micro_stats_.inv_meta_))) {
+  } else if (OB_FAIL(macro_stats_.inv_meta_.merge(current_micro_stats_.inv_meta_))) {
     STORAGE_LOG(WARN, "fail to update committed inverted index macro stats", K(ret),
         K_(current_micro_stats));
   } else if (OB_FAIL(posting_micro_writer_.reuse())) {
@@ -1238,7 +1244,7 @@ int ObInvIdxMacroBlockWriter::flush_macro_block(const bool is_close_flush)
     } else if (OB_FAIL(block_write_ctx_.add_macro_block_id(macro_handle_.get_macro_id()))) {
       STORAGE_LOG(WARN, "fail to add inverted index macro id to write ctx", K(ret),
           K(macro_handle_.get_macro_id()));
-    } else if (OB_FAIL(seg_inv_meta_.update(macro_stats_.inv_meta_))) {
+    } else if (OB_FAIL(seg_inv_meta_.merge_macro(macro_stats_.inv_meta_))) {
       STORAGE_LOG(WARN, "fail to update inverted index segment stats", K(ret),
           K_(macro_stats));
     }
@@ -1337,7 +1343,7 @@ int ObInvIdxMacroBlockWriter::append_logical_block(
 
 int ObInvIdxMacroBlockWriter::append_macro_block(
     const ObMacroBlockDesc &macro_desc,
-    const ObInvIdxMacroBlockInvStats &stats,
+    const ObInvMacroMeta &inv_macro_meta,
     const ObMicroBlockData *micro_block_data)
 {
   int ret = OB_SUCCESS;
@@ -1363,10 +1369,10 @@ int ObInvIdxMacroBlockWriter::append_macro_block(
     ret = OB_INVALID_ARGUMENT;
     STORAGE_LOG(WARN, "inconsistent inverted index macro row count to reuse", K(ret),
         K(macro_desc.row_count_), K(macro_meta->val_.row_count_), K(macro_desc));
-  } else if (OB_UNLIKELY(stats.min_doc_id_ > stats.max_doc_id_)) {
+  } else if (OB_UNLIKELY(!inv_macro_meta.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
-    STORAGE_LOG(WARN, "invalid inverted index macro stats to reuse", K(ret),
-        K(stats), K(macro_desc));
+    STORAGE_LOG(WARN, "invalid inverted index macro metadata to reuse", K(ret),
+        K(inv_macro_meta), K(macro_desc));
   } else if (OB_UNLIKELY(macro_meta->end_key_.get_datum_cnt()
       != data_store_desc_->get_rowkey_column_count())) {
     ret = OB_ERR_SYS;
@@ -1378,8 +1384,11 @@ int ObInvIdxMacroBlockWriter::append_macro_block(
     ret = OB_ERR_UNEXPECTED;
     STORAGE_LOG(WARN, "unexpected null clustered index micro block data to reuse", K(ret),
         K(macro_desc));
+  } else if (OB_FAIL(seg_inv_meta_.check_merge_macro(inv_macro_meta))) {
+    STORAGE_LOG(WARN, "invalid inverted index macro metadata before reuse", K(ret),
+        K(inv_macro_meta), K_(seg_inv_meta));
   } else if (OB_FAIL(inner_append_macro_block(
-      *macro_meta, stats, is_micro_index_clustered ? micro_block_data : nullptr))) {
+      *macro_meta, inv_macro_meta, is_micro_index_clustered ? micro_block_data : nullptr))) {
     STORAGE_LOG(WARN, "fail to append reused inverted index macro block", K(ret),
         K(macro_desc), K(is_micro_index_clustered));
   }
@@ -1388,7 +1397,7 @@ int ObInvIdxMacroBlockWriter::append_macro_block(
 
 int ObInvIdxMacroBlockWriter::inner_append_macro_block(
     const ObDataMacroBlockMeta &macro_meta,
-    const ObInvIdxMacroBlockInvStats &stats,
+    const ObInvMacroMeta &inv_macro_meta,
     const ObMicroBlockData *micro_block_data)
 {
   int ret = OB_SUCCESS;
@@ -1402,7 +1411,7 @@ int ObInvIdxMacroBlockWriter::inner_append_macro_block(
   } else if (OB_FAIL(index_block_builder_.append_macro_block(macro_meta, micro_block_data))) {
     STORAGE_LOG(WARN, "fail to append reused macro meta to index builder", K(ret),
         K(macro_meta));
-  } else if (OB_FAIL(flush_reuse_macro_block(macro_meta, stats))) {
+  } else if (OB_FAIL(flush_reuse_macro_block(macro_meta, inv_macro_meta))) {
     STORAGE_LOG(WARN, "fail to flush reused inverted index macro block", K(ret), K(macro_meta));
   } else if (OB_FAIL(macro_meta.end_key_.deep_copy(macro_stats_.endkey_, macro_allocator_))) {
     STORAGE_LOG(WARN, "fail to record reused macro endkey", K(ret), K(macro_meta));
@@ -1412,17 +1421,16 @@ int ObInvIdxMacroBlockWriter::inner_append_macro_block(
 
 int ObInvIdxMacroBlockWriter::flush_reuse_macro_block(
     const ObDataMacroBlockMeta &macro_meta,
-    const ObInvIdxMacroBlockInvStats &stats)
+    const ObInvMacroMeta &inv_macro_meta)
 {
   int ret = OB_SUCCESS;
   const MacroBlockId &macro_id = macro_meta.get_macro_id();
   if (OB_FAIL(block_write_ctx_.add_macro_block_id(macro_id))) {
     STORAGE_LOG(WARN, "fail to add reused inverted index macro id to write ctx",
         K(ret), K(macro_id));
-  } else if (OB_FAIL(seg_inv_meta_.update(
-      stats.min_doc_id_, stats.max_doc_id_, stats.total_doc_length_))) {
-    STORAGE_LOG(WARN, "fail to accumulate reused inverted index macro stats",
-        K(ret), K(stats), K(macro_meta));
+  } else if (OB_FAIL(seg_inv_meta_.merge_macro(inv_macro_meta))) {
+    STORAGE_LOG(WARN, "fail to accumulate reused inverted index macro metadata",
+        K(ret), K(inv_macro_meta), K(macro_meta));
   } else {
     block_write_ctx_.increment_old_block_count();
     merge_block_info_.multiplexed_macro_block_count_++;

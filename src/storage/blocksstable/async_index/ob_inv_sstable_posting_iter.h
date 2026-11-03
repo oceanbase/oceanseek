@@ -296,7 +296,7 @@ private:
   // kernel as the SQL-layer document scoring.
   sql::ObBM25PrecomputedParams bm25_calc_params_;
   // Whether the bound SSTable carries BM25 relevance params (token_freq / doc_length).
-  // Copied from sstable.get_inv_meta().has_relevance_params_ at open time. When false,
+  // Copied from sstable.get_inv_meta().get_stats().has_relevance_params_ at open time. When false,
   // BM25 scoring and block-max frontier computation are skipped (search index path).
   bool has_relevance_params_;
   storage::ObTabletHandle tablet_handle_;

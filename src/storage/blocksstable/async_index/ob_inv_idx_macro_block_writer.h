@@ -48,7 +48,7 @@ public:
       const ObPostingValueBlockDesc &posting_value_block);
   int append_macro_block(
       const ObMacroBlockDesc &macro_desc,
-      const ObInvIdxMacroBlockInvStats &stats,
+      const ObInvMacroMeta &inv_macro_meta,
       const ObMicroBlockData *micro_block_data = nullptr);
 
   int close();
@@ -60,7 +60,7 @@ public:
   const compaction::ObMergeBlockInfo &get_merge_block_info() const { return merge_block_info_; }
   void inc_incremental_row_count() { ++merge_block_info_.incremental_row_count_; }
   void inc_filter_row_count() { ++merge_block_info_.filter_row_count_; }
-  const ObInvIdxStatsMeta &get_seg_inv_meta() const { return seg_inv_meta_; }
+  const ObInvSSTableMeta &get_seg_inv_meta() const { return seg_inv_meta_; }
 
 private:
   static constexpr int64_t POSTING_VALUE_MICRO_BLOCK_SIZE_LIMIT_FACTOR = 3;
@@ -170,11 +170,11 @@ private:
 
   int inner_append_macro_block(
       const ObDataMacroBlockMeta &macro_meta,
-      const ObInvIdxMacroBlockInvStats &stats,
+      const ObInvMacroMeta &inv_macro_meta,
       const ObMicroBlockData *micro_block_data);
   int flush_reuse_macro_block(
       const ObDataMacroBlockMeta &macro_meta,
-      const ObInvIdxMacroBlockInvStats &stats);
+      const ObInvMacroMeta &inv_macro_meta);
 
   int alloc_block();
   void gen_logic_macro_id(ObLogicMacroBlockId &logic_macro_id);
@@ -218,7 +218,7 @@ private:
   ObInvIdxMacroBlockStats current_micro_stats_;
 
   ObInvIdxMacroBlockStats macro_stats_;
-  ObInvIdxStatsMeta seg_inv_meta_;
+  ObInvSSTableMeta seg_inv_meta_;
 
   volatile bool concurrent_lock_;
   compaction::ObLocalArena allocator_;

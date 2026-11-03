@@ -554,7 +554,7 @@ int ObInvSSTableRangeIter::get_next_doc_ids(
   } else if (OB_UNLIKELY(!enable_doc_id_drain_
              || need_posting_value_
              || OB_ISNULL(sstable_)
-             || INV_IDX_TYPE_SEARCH != sstable_->get_inv_meta().index_type_)) {
+             || INV_IDX_TYPE_SEARCH != sstable_->get_inv_meta().get_stats().index_type_)) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("raw doc-id batch route is not enabled", K(ret),
              K_(enable_doc_id_drain), K_(need_posting_value));
@@ -634,7 +634,7 @@ int ObInvSSTableRangeIter::get_cur_pos_list(const ObDatum *&datum)
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
       LOG_WARN("failed to validate posting value row state", K(ret));
     }
-  } else if (OB_UNLIKELY(!sstable_->get_inv_meta().has_position_list_)) {
+  } else if (OB_UNLIKELY(!sstable_->get_inv_meta().get_stats().has_position_list_)) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("pos list not available", K(ret), "inv_meta", sstable_->get_inv_meta());
   } else if (OB_FAIL(load_current_value_block())) {
@@ -656,7 +656,7 @@ int ObInvSSTableRangeIter::get_cur_nested_key_list(const ObDatum *&datum)
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
       LOG_WARN("failed to validate posting value row state", K(ret));
     }
-  } else if (OB_UNLIKELY(!sstable_->get_inv_meta().has_nested_key_)) {
+  } else if (OB_UNLIKELY(!sstable_->get_inv_meta().get_stats().has_nested_key_)) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("nested key list not available", K(ret), "inv_meta", sstable_->get_inv_meta());
   } else if (OB_FAIL(load_current_value_block())) {

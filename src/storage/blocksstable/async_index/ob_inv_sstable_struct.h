@@ -23,9 +23,9 @@ enum ObInvIdxType
 };
 
 // =============================================================================
-// Inverted index SSTable extended metadata (inv-specific fields)
+// Shared inverted-index layout and statistics.
 //
-// Only carries metadata that is unique to an inverted-index segment. Generic
+// SSTable- and macro-specific metadata belongs to the dedicated types below. Generic
 // block/size statistics (data_macro_block_count / occupy_size / data_checksum /
 // row_count ...) are NOT duplicated here — they already live in the base
 // ObSSTableMeta and are reachable through the owning ObSSTable accessors.
@@ -36,7 +36,12 @@ struct ObInvIdxStatsMeta final
   ~ObInvIdxStatsMeta() = default;
   OB_INLINE void reset()
   {
-    MEMSET(this, 0, sizeof(ObInvIdxStatsMeta));
+    index_type_ = INV_IDX_TYPE_INVALID;
+    has_relevance_params_ = false;
+    has_position_list_ = false;
+    has_nested_key_ = false;
+    doc_id_obj_meta_.reset();
+    total_doc_length_ = 0;
     min_doc_id_ = UINT64_MAX;
     max_doc_id_ = 0;
   }
@@ -73,15 +78,20 @@ struct ObInvIdxStatsMeta final
     return ret;
   }
 
-  int update(const ObInvIdxStatsMeta &other)
-  {
-    return update(other.min_doc_id_, other.max_doc_id_, other.total_doc_length_);
-  }
+  int assign(const ObInvIdxStatsMeta &other);
+  int merge(const ObInvIdxStatsMeta &other);
+  bool has_same_layout(const ObInvIdxStatsMeta &other) const;
 
   OB_INLINE bool is_empty_range() const { return min_doc_id_ > max_doc_id_; }
+  bool is_reset() const;
+  bool has_valid_range() const
+  {
+    return min_doc_id_ <= max_doc_id_
+        || (UINT64_MAX == min_doc_id_ && 0 == max_doc_id_ && 0 == total_doc_length_);
+  }
   OB_INLINE bool is_valid() const
   {
-    return index_type_ > INV_IDX_TYPE_INVALID
+    return has_valid_range() && index_type_ > INV_IDX_TYPE_INVALID
         && index_type_ < INV_IDX_TYPE_MAX
         && doc_id_obj_meta_.is_valid()
         && doc_id_obj_meta_.is_uint64()
@@ -113,24 +123,52 @@ public:
   uint64_t total_doc_length_;      // sum(token_freq) across all documents
 };
 
-// Statistics decoded from one macro block's inverted-index aggregate entries.
-// This is transient merge data, deliberately separate from the serialized
-// ObInvIdxStatsMeta. Logical-block doc counts are not carried because
-// they count postings and cannot represent a macro's unique document count.
-struct ObInvIdxMacroBlockInvStats
-{
-  ObInvIdxMacroBlockInvStats() { reset(); }
-  void reset()
-  {
-    min_doc_id_ = 0;
-    max_doc_id_ = 0;
-    total_doc_length_ = 0;
-  }
-  TO_STRING_KV(K_(min_doc_id), K_(max_doc_id), K_(total_doc_length));
+class ObInvMacroMeta;
 
-  uint64_t min_doc_id_;
-  uint64_t max_doc_id_;
-  uint64_t total_doc_length_;
+// Complete SSTable metadata, carried through build results, creation and persistence.
+// init() constructs a new value from shared statistics; assign() copies the full value.
+class ObInvSSTableMeta final
+{
+public:
+  ObInvSSTableMeta() : stats_(), is_inited_(false) {}
+  void reset() { stats_.reset(); is_inited_ = false; }
+  void reuse() { stats_.reuse(); }
+  bool is_valid() const { return is_inited_ && stats_.is_valid(); }
+  const ObInvIdxStatsMeta &get_stats() const { return stats_; }
+  int init(const ObInvIdxStatsMeta &stats);
+  int assign(const ObInvSSTableMeta &other)
+  { *this = other; return common::OB_SUCCESS; }
+  int merge(const ObInvSSTableMeta &other);
+  int merge_macro(const ObInvMacroMeta &macro_meta);
+  int check_merge_macro(const ObInvMacroMeta &macro_meta) const;
+  TO_STRING_KV(K_(stats), K_(is_inited));
+  OB_UNIS_VERSION(1);
+private:
+  ObInvIdxStatsMeta stats_;
+  bool is_inited_;
+};
+
+// Complete macro metadata, used by accumulation, reuse, rebuild and the on-disk codec.
+class ObInvMacroMeta final
+{
+public:
+  ObInvMacroMeta() : stats_(), is_inited_(false) {}
+  void reset() { stats_.reset(); is_inited_ = false; }
+  void reuse() { stats_.reuse(); }
+  bool is_valid() const { return is_inited_ && stats_.is_valid() && !stats_.is_empty_range(); }
+  const ObInvIdxStatsMeta &get_stats() const { return stats_; }
+  int init(const ObInvIdxStatsMeta &stats);
+  int assign(const ObInvMacroMeta &other)
+  { *this = other; return common::OB_SUCCESS; }
+  int merge(const ObInvMacroMeta &other);
+  int update(const uint64_t min_doc_id, const uint64_t max_doc_id,
+      const uint64_t total_doc_length)
+  { return stats_.update(min_doc_id, max_doc_id, total_doc_length); }
+  TO_STRING_KV(K_(stats), K_(is_inited));
+  OB_UNIS_VERSION(1);
+private:
+  ObInvIdxStatsMeta stats_;
+  bool is_inited_;
 };
 
 // Aggregated BM25 corpus statistics over the set of inverted-index sstables
