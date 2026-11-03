@@ -555,6 +555,9 @@ int ObSSTransferWorkerMgr::schedule_transfer_in_replace_(
   ObArray<ObTabletBackfillInfo> ready_tablet_info_array;
   ObArray<ObTabletBackfillInfo> replace_tablet_info_array;
 
+  // Pause before either path installs SSTables on the committed transfer-in tablets.
+  DEBUG_SYNC(BEFORE_SS_TRANSFER_IN_REPLACE_AND_REFRESH);
+
   if (!is_inited_) {
     ret = OB_NOT_INIT;
     LOG_WARN("ss transfer worker mgr do not init", K(ret));

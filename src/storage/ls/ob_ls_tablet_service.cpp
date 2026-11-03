@@ -10530,6 +10530,105 @@ int ObLSTabletService::rewrite_tablet_for_ss_change_scn_(
 
 #endif
 
+int ObLSTabletService::get_async_index_src_tablet_(
+    ObTabletHandle &tablet_handle)
+{
+  int ret = OB_SUCCESS;
+  ObTabletHandle src_tablet_handle;
+  if (OB_UNLIKELY(!tablet_handle.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async index transfer destination tablet handle", K(ret), K(tablet_handle));
+  } else if (OB_FAIL(do_get_async_index_src_tablet(*tablet_handle.get_obj(), 0, src_tablet_handle))) {
+    LOG_WARN("failed to get async index transfer source tablet", K(ret), K(tablet_handle));
+  } else if (OB_FAIL(tablet_handle.assign(src_tablet_handle))) {
+    LOG_WARN("failed to assign async index transfer source tablet", K(ret), K(tablet_handle));
+  }
+  return ret;
+}
+
+int ObLSTabletService::do_get_async_index_src_tablet(
+    const ObTablet &dest_tablet,
+    const int64_t timeout_us,
+    ObTabletHandle &src_tablet_handle)
+{
+  int ret = OB_SUCCESS;
+  const common::ObTabletID tablet_id = dest_tablet.get_tablet_id();
+  const int64_t dest_transfer_seq = dest_tablet.get_transfer_seq();
+  ObTabletHandle source_handle;
+  src_tablet_handle.reset();
+  if (OB_UNLIKELY(!tablet_id.is_valid() || !dest_tablet.get_ls_id().is_valid() || timeout_us < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async index transfer source lookup", K(ret), K(tablet_id), K(timeout_us));
+  } else {
+    // Transfer holds the data tablet's exclusive Online DDL lock until completion;
+    // async-index refresh needs a conflicting ROW_EXCLUSIVE lock. No new refresh
+    // SSTables can be published on the destination before transfer replacement.
+    // Pin the source tablet for both range enumeration and subsequent scans.
+    ObTabletCreateDeleteMdsUserData user_data;
+    mds::MdsWriter unused_writer;
+    mds::TwoPhaseCommitState unused_trans_stat = mds::TwoPhaseCommitState::STATE_INIT;
+    share::SCN unused_trans_version;
+    share::SCN max_decided_scn;
+    ObLSService *ls_service = MTL(ObLSService*);
+    ObLSHandle src_ls_handle;
+    ObLS *src_ls = nullptr;
+    ObLSTabletService *src_tablet_service = nullptr;
+    if (OB_FAIL(dest_tablet.get_latest_tablet_status(
+        user_data, unused_writer, unused_trans_stat, unused_trans_version))) {
+      LOG_WARN("failed to get async index transfer tablet status", K(ret), K(tablet_id));
+    } else if (ObTabletStatus::TRANSFER_IN != user_data.tablet_status_) {
+      ret = OB_SNAPSHOT_DISCARDED;
+      LOG_WARN("async index transfer tablet status changed, need retry", K(ret), K(tablet_id), K(user_data));
+    } else if (OB_UNLIKELY(!user_data.transfer_ls_id_.is_valid())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid async index transfer source ls", K(ret), K(tablet_id), K(user_data));
+    } else if (OB_ISNULL(ls_service)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ls service is null", K(ret), K(tablet_id));
+    } else if (OB_FAIL(ls_service->get_ls(user_data.transfer_ls_id_, src_ls_handle, ObLSGetMod::HA_MOD))) {
+      LOG_WARN("failed to get async index transfer source ls", K(ret), K(tablet_id), K(user_data));
+    } else if (OB_ISNULL(src_ls = src_ls_handle.get_ls())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("async index transfer source ls is null", K(ret), K(tablet_id), K(user_data));
+    } else if (OB_ISNULL(src_tablet_service = src_ls->get_tablet_svr())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("async index transfer source tablet service is null", K(ret), K(tablet_id), K(user_data));
+    } else if (OB_FAIL(src_tablet_service->check_allow_to_read())) {
+      LOG_WARN("async index transfer source ls is not readable", K(ret), K(tablet_id), K(user_data));
+    } else if (OB_FAIL(src_ls->get_max_decided_scn(max_decided_scn))) {
+      LOG_WARN("failed to get async index source max decided scn", K(ret), K(tablet_id), K(user_data));
+    } else if (max_decided_scn < user_data.transfer_scn_) {
+      ret = OB_REPLICA_NOT_READABLE;
+      LOG_WARN("async index source has not reached transfer scn",
+          K(ret), K(tablet_id), K(max_decided_scn), K(user_data));
+    } else if (OB_FAIL(src_ls->get_tablet(
+        tablet_id, source_handle, timeout_us, ObMDSGetTabletMode::READ_WITHOUT_CHECK))) {
+      LOG_WARN("failed to get async index transfer source tablet", K(ret), K(tablet_id), K(user_data));
+    } else if (OB_UNLIKELY(!source_handle.is_valid())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid async index transfer source tablet handle", K(ret), K(tablet_id), K(user_data));
+    } else if (source_handle.get_obj()->is_empty_shell()) {
+      // The source location is gone; preserve location retry for deletion reads.
+      ret = OB_TABLET_NOT_EXIST;
+      LOG_WARN("async index transfer source tablet is an empty shell, need retry",
+          K(ret), K(tablet_id), K(user_data));
+    } else if (source_handle.get_obj()->get_transfer_seq() != dest_transfer_seq - 1) {
+      const int64_t src_transfer_seq = source_handle.get_obj()->get_transfer_seq();
+      // The LS/tablet key may refer to another transfer generation by now.
+      ret = src_transfer_seq < dest_transfer_seq - 1
+          ? OB_REPLICA_NOT_READABLE : OB_SNAPSHOT_DISCARDED;
+      LOG_WARN("async index transfer source tablet generation mismatch, need retry",
+          K(ret), K(tablet_id), K(src_transfer_seq), K(dest_transfer_seq), K(user_data));
+    } else if (OB_FAIL(src_tablet_handle.assign(source_handle))) {
+      LOG_WARN("failed to assign async index transfer source tablet", K(ret), K(tablet_id), K(user_data));
+    }
+  }
+  if (OB_FAIL(ret)) {
+    src_tablet_handle.reset();
+  }
+  return ret;
+}
+
 int ObLSTabletService::get_async_index_segment_group_ctx(
     const common::ObIArray<common::ObTabletID> &index_tablet_ids,
     const common::ObTabletID &delete_tablet_id,
@@ -10555,6 +10654,9 @@ int ObLSTabletService::get_async_index_segment_group_ctx(
       } else if (OB_UNLIKELY(!tablet_handle.is_valid())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected invalid tablet handle", K(ret), K(tablet_id));
+      } else if (tablet_handle.get_obj()->get_tablet_meta().has_transfer_table()
+          && OB_FAIL(get_async_index_src_tablet_(tablet_handle))) {
+        LOG_WARN("failed to switch async index to transfer source tablet", K(ret), K(tablet_id));
       } else if (OB_UNLIKELY(!tablet_handle.get_obj()->is_async_inverted_storage_index())) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("tablet is not async index tablet", K(ret), K(tablet_id), K(tablet_handle));
@@ -10568,6 +10670,11 @@ int ObLSTabletService::get_async_index_segment_group_ctx(
       } else if (OB_UNLIKELY(!tablet_handle.is_valid())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("invalid published async-index tablet", K(ret), K(tablet_id));
+      // Reacquisition above returns the destination; select the source again
+      // so range enumeration and subsequent scans retain the source tablet.
+      } else if (tablet_handle.get_obj()->get_tablet_meta().has_transfer_table()
+          && OB_FAIL(get_async_index_src_tablet_(tablet_handle))) {
+        LOG_WARN("failed to reacquire async index transfer source", K(ret), K(tablet_id));
       } else if (OB_FAIL(tablet_handle.get_obj()->fetch_table_store(tablet_table_store_wrapper))) {
         LOG_WARN("failed to fetch tablet table store", K(ret), K(tablet_id));
       } else if (OB_UNLIKELY(!tablet_table_store_wrapper.is_valid())) {
@@ -10596,6 +10703,9 @@ int ObLSTabletService::get_async_index_segment_group_ctx(
       } else if (OB_UNLIKELY(!tablet_handle.is_valid())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected invalid tablet handle", K(ret), K(delete_tablet_id));
+      } else if (tablet_handle.get_obj()->get_tablet_meta().has_transfer_table()
+          && OB_FAIL(get_async_index_src_tablet_(tablet_handle))) {
+        LOG_WARN("failed to switch async delete to transfer source tablet", K(ret), K(delete_tablet_id));
       } else if (OB_UNLIKELY(!tablet_handle.get_obj()->is_async_delete_index())) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("async delete tablet is not async delete index tablet",

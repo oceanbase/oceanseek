@@ -551,6 +551,12 @@ public:
       ObBlockStatIterator &iter);
 
   // async index
+  // Resolve the source of this exact transfer-in Tablet generation.
+  // The caller must keep dest_tablet alive and use a separate output handle.
+  static int do_get_async_index_src_tablet(
+      const ObTablet &dest_tablet,
+      const int64_t timeout_us,
+      ObTabletHandle &src_tablet_handle);
   int get_async_index_segment_group_ctx(
       const common::ObIArray<common::ObTabletID> &index_tablet_ids,
       const common::ObTabletID &delete_tablet_id,
@@ -959,6 +965,8 @@ private:
   int reuse_inner_tablet_memtable_mgr_();
 #endif
 private:
+  // Called only for transfer-in tablets; replace the handle after source validation.
+  int get_async_index_src_tablet_(ObTabletHandle &tablet_handle);
   static int replay_deserialize_tablet(
       const ObTabletMapKey &key,
       const char *buf,
