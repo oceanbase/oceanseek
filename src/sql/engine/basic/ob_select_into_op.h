@@ -63,6 +63,33 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObSelectIntoOpInput);
 };
 
+// Serialization placeholder for async result targets.
+struct ObAsyncResultTargetInfo
+{
+  explicit ObAsyncResultTargetInfo(common::ObIAllocator &alloc)
+      : enabled_(false),
+        tenant_id_(common::OB_INVALID_TENANT_ID),
+        job_id_(common::OB_INVALID_ID),
+        parquet_row_group_rows_(DEFAULT_PARQUET_ROW_GROUP_ROWS),
+        input_ordering_column_idxs_(alloc),
+        input_ordering_directions_(alloc)
+  {}
+
+  bool enabled_;
+  uint64_t tenant_id_;
+  uint64_t job_id_;
+  // The effective tenant's configuration is snapshotted before optimizer
+  // initialization, then carried to the coordinator and every PX worker.
+  int64_t parquet_row_group_rows_;
+  // Result Catalog ordering is advisory metadata. These are result-schema
+  // column positions and ObOrderDirection values copied from the finalized
+  // logical child's input property; the runtime never sorts by them.
+  common::ObFixedArray<int64_t, common::ObIAllocator> input_ordering_column_idxs_;
+  common::ObFixedArray<int64_t, common::ObIAllocator> input_ordering_directions_;
+
+  static const int64_t DEFAULT_PARQUET_ROW_GROUP_ROWS = 1024L * 1024;
+};
+
 class ObSelectIntoSpec : public ObOpSpec
 {
   OB_UNIS_VERSION_V(1);
@@ -89,7 +116,8 @@ public:
       external_partition_(alloc),
       alias_names_(alloc),
       field_ids_(alloc),
-      lake_table_format_(share::ObLakeTableFormat::INVALID)
+      lake_table_format_(share::ObLakeTableFormat::INVALID),
+      async_result_target_(alloc)
   {
   }
 
@@ -115,6 +143,7 @@ public:
   ObExternalFileFormat::StringList alias_names_;
   common::ObFixedArray<uint64_t, common::ObIAllocator> field_ids_;
   share::ObLakeTableFormat lake_table_format_;
+  ObAsyncResultTargetInfo async_result_target_;
   static const int64_t DEFAULT_MAX_FILE_SIZE = 256LL * 1024 * 1024;
   static const int64_t DEFAULT_BUFFER_SIZE = 1LL * 1024 * 1024;
 };

@@ -49,7 +49,11 @@ OB_SERIALIZE_MEMBER((ObSelectIntoSpec, ObOpSpec), into_type_, user_vars_, outfil
     field_str_, // FARM COMPAT WHITELIST FOR filed_str_: renamed
     line_str_, closed_cht_, is_optional_, select_exprs_, is_single_, max_file_size_,
     escaped_cht_, cs_type_, parallel_, file_partition_expr_, buffer_size_, is_overwrite_,
-    external_properties_, external_partition_, alias_names_, field_ids_, lake_table_format_);
+    external_properties_, external_partition_, alias_names_, field_ids_, lake_table_format_,
+    async_result_target_.enabled_, async_result_target_.tenant_id_,
+    async_result_target_.job_id_, async_result_target_.parquet_row_group_rows_,
+    async_result_target_.input_ordering_column_idxs_,
+    async_result_target_.input_ordering_directions_);
 
 
 int ObSelectIntoOp::inner_open()

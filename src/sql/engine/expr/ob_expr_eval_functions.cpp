@@ -1486,7 +1486,7 @@ static ObExpr::EvalFunc g_expr_eval_functions[] = {
   ObExprIsNan::eval_is_nan,                                           /* 887 */
   ObExprCollectFileList::collect_file_list,                           /* 888 */
   ObExprVoid::calc_void_expr,                                         /* 889 */
-ObExprRandCanonical::calc_random_expr_canonical,                    /* 890 */
+  ObExprRandCanonical::calc_random_expr_canonical,                    /* 890 */
   ObExprLoadFile::eval_load_file,                                     /* 891 */
   NULL, // ObExprAIParseDocument::eval_ai_parse_document              /* 892 */
   ObExprSearchIndexInnerPath::calc_search_index_inner_path,           /* 893 */
@@ -1505,8 +1505,8 @@ ObExprRandCanonical::calc_random_expr_canonical,                    /* 890 */
   ObExprImageType::eval_image_type,                                   /* 906 */
   NULL, // ObExprRandomPartNextval::eval_nextval,                     /* 907 */
   ObExprGetRoutineParamTypeStr::eval_routine_param_type_str,          /* 908 */
-  ObExprArrowStream::eval_sentinel,                                   /* 909 */
-  ObExprArrowStreams::eval_sentinel,                                  /* 910 */
+  ObExprArrowStream::eval_arrow_stream,                               /* 909 */
+  ObExprArrowStreams::eval_arrow_streams,                             /* 910 */
   ObExprNchr::calc_nchr_expr,                                         /* 911 */
   NULL, // ObExprToMonday::calc_to_monday,                            /* 912 */
   NULL, // ObExprSplitByString::calc_split_by_string,                 /* 913 */
@@ -1523,8 +1523,9 @@ ObExprRandCanonical::calc_random_expr_canonical,                    /* 890 */
   NULL, // ObExprVecIVFBase::eval_vec_ivf_cid,                        /* 924 */
   NULL, // ObExprVecIVFBase::eval_vec_ivf_data,                       /* 925 */
   ObExprDslMultiValueRange::eval_dsl_multi_value_range,               /* 926 */
-  NULL, // ObExprExternalLob::eval_external_lob,                       /* 927 */
-  NULL, // ObExprLobMeta::eval_lob_meta,                               /* 928 */
+  NULL, // ObExprExternalLob::eval_external_lob,                      /* 927 */
+  NULL, // ObExprLobMeta::eval_lob_meta,                              /* 928 */
+  NULL, // ObExprResultScan::eval_result_scan,                        /* 929 */
 };
 
 static ObExpr::EvalBatchFunc g_expr_eval_batch_functions[] = {

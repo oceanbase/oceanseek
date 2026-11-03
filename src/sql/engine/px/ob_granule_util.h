@@ -231,6 +231,7 @@ enum ObGranuleSplitterType
     * |       TABLE SCAN                |A         |
     */
   GIT_RANDOM,
+  GIT_RESULT_ORDERED,
 };
 
 // the params used to decide the load of every task

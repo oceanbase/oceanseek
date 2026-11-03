@@ -33,6 +33,7 @@ enum class ObLakeTableFormat : int32_t
   ICEBERG,
   HIVE,
   ODPS,
+  RESULT,
 };
 
 /// Raw plugin slot index ([0, 256)) used internally by ObExtFormatRegistry (and the

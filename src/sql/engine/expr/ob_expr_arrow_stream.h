@@ -72,7 +72,7 @@ public:
   // Extract the literal stream id from an arrow_stream(stream_id) raw expression.
   static int extract_stream_id(const ObRawExpr *expr, uint64_t &stream_id);
 
-  static int eval_sentinel(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res_datum);
+  static int eval_arrow_stream(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res_datum);
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObExprArrowStream);
@@ -94,7 +94,7 @@ public:
                       const ObRawExpr &raw_expr,
                       ObExpr &rt_expr) const override;
 
-  static int eval_sentinel(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res_datum);
+  static int eval_arrow_streams(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res_datum);
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObExprArrowStreams);

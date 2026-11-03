@@ -99,14 +99,14 @@ int ObExprArrowStream::cg_expr(ObExprCGCtx &expr_cg_ctx,
     LOG_USER_ERROR(OB_INVALID_ARGUMENT,
                    "arrow_stream: stream_id must be a literal integer");
   } else {
-    rt_expr.eval_func_ = ObExprArrowStream::eval_sentinel;
+    rt_expr.eval_func_ = ObExprArrowStream::eval_arrow_stream;
   }
   return ret;
 }
 
-int ObExprArrowStream::eval_sentinel(const ObExpr &expr,
-                                      ObEvalCtx &ctx,
-                                      ObDatum &res_datum)
+int ObExprArrowStream::eval_arrow_stream(const ObExpr &expr,
+                                         ObEvalCtx &ctx,
+                                         ObDatum &res_datum)
 {
 #ifndef OB_BUILD_OBSERVER_FLIGHT_SQL
   UNUSED(expr);
@@ -167,14 +167,14 @@ int ObExprArrowStreams::cg_expr(ObExprCGCtx &expr_cg_ctx,
     LOG_USER_ERROR(OB_INVALID_ARGUMENT,
                    "arrow_streams: ingest_id must be a literal string");
   } else {
-    rt_expr.eval_func_ = ObExprArrowStreams::eval_sentinel;
+    rt_expr.eval_func_ = ObExprArrowStreams::eval_arrow_streams;
   }
   return ret;
 }
 
-int ObExprArrowStreams::eval_sentinel(const ObExpr &expr,
-                                      ObEvalCtx &ctx,
-                                      ObDatum &res_datum)
+int ObExprArrowStreams::eval_arrow_streams(const ObExpr &expr,
+                                           ObEvalCtx &ctx,
+                                           ObDatum &res_datum)
 {
 #ifndef OB_BUILD_OBSERVER_FLIGHT_SQL
   UNUSED(expr);

@@ -378,7 +378,7 @@ int ObIcebergScanTask::init_with_opt_lake_table_file(ObIAllocator &allocator,
 }
 
 OB_SERIALIZE_MEMBER((ObHiveScanTask, ObFileScanTask),
-                    part_id_);
+                    part_id_, first_lineno_, last_lineno_);
 
 int ObHiveScanTask::init_with_opt_lake_table_file(ObIAllocator &allocator,
                                                   const ObIOptLakeTableFile &opt_table_file)

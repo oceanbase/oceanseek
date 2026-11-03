@@ -260,6 +260,7 @@ struct ObOptParamHint
     DEF(EXTERNAL_TABLE_FILE_SIZE_LOAD_BALANCE,)    \
     DEF(ENABLE_LAKE_TABLE_PARALLEL_RESOLVING,)      \
     DEF(EXT_TABLE_OPTIONS,) /* per-query JSON tuning blob; OB passes verbatim into plugin options_json (OB_EXT_K_EXT_OPTIONS), does NOT validate; plugin unwraps + applies its own format-private knobs. Replaces deleted PAIMON_SOURCE_SPLIT_*. */ \
+    DEF(ENABLE_RESULT_SCAN_ORDERED_READ,)          \
 
 
   DECLARE_ENUM(OptParamType, opt_param, OPT_PARAM_TYPE_DEF, static);
