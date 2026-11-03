@@ -8195,8 +8195,18 @@ int ObAggregateProcessor::get_json_arrayagg_result(const ObAggrInfo &aggr_info,
                                                              CS_TYPE_UTF8MB4_BIN, tmp_alloc))) {
               LOG_WARN("convert string collation failed", K(ret), K(cs_type), K(origin_str.length()));
             } else {
-              converted_datum.set_string(converted_str);
-              cs_type = CS_TYPE_UTF8MB4_BIN;
+              if (is_lob_storage(val_type)) {
+                // Keep the original LOB type paired with a valid header after conversion.
+                if (OB_FAIL(ObTextStringHelper::string_to_templob_result(
+                        val_type, tmp_alloc, converted_str, converted_datum))) {
+                  LOG_WARN("failed to build converted temporary LOB", K(ret), K(val_type));
+                }
+              } else {
+                converted_datum.set_string(converted_str);
+              }
+              if (OB_SUCC(ret)) {
+                cs_type = CS_TYPE_UTF8MB4_BIN;
+              }
             }
           }
 
@@ -8484,8 +8494,18 @@ int ObAggregateProcessor::get_json_objectagg_result(const ObAggrInfo &aggr_info,
                                                               CS_TYPE_UTF8MB4_BIN, tmp_alloc))) {
                 LOG_WARN("convert string collation failed", K(ret), K(cs_type1), K(origin_str.length()));
               } else {
-                converted_datum.set_string(converted_str);
-                cs_type1 = CS_TYPE_UTF8MB4_BIN;
+                if (is_lob_storage(val_type1)) {
+                  // Keep the original LOB type paired with a valid header after conversion.
+                  if (OB_FAIL(ObTextStringHelper::string_to_templob_result(
+                          val_type1, tmp_alloc, converted_str, converted_datum))) {
+                    LOG_WARN("failed to build converted temporary LOB", K(ret), K(val_type1));
+                  }
+                } else {
+                  converted_datum.set_string(converted_str);
+                }
+                if (OB_SUCC(ret)) {
+                  cs_type1 = CS_TYPE_UTF8MB4_BIN;
+                }
               }
             }
 
