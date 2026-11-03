@@ -23,8 +23,10 @@ public:
       const ObLSID &ls_id,
       const ObTabletID &tablet_id,
       const share::SCN &transfer_scn,
-      const share::SCN &check_scn,
       bool &need_upload);
+  static int get_and_check_source_tablet(
+      ObLS &ls, const ObTabletBackfillInfo &tablet_info, ObTabletHandle &tablet_handle);
+  static int finish_tablet_upload(ObLS &ls, const ObTabletBackfillInfo &tablet_info);
   static int check_tablet_need_backfill_tx(
       const ObTabletHandle &tablet_handle,
       const share::SCN &backfill_scn,

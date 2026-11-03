@@ -569,6 +569,131 @@ TEST_F(TestTablet, test_tablet_meta_min_minor_meta_scn)
 #endif
 }
 
+TEST_F(TestTablet, test_transfer_upload_info_serialization)
+{
+  ObTabletTransferInfo info;
+  ASSERT_FALSE(info.is_transfer_upload_completed());
+  ASSERT_EQ(OB_SUCCESS, info.init());
+  info.set_transfer_upload_completed(true);
+  char buf[256];
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, info.serialize(buf, sizeof(buf), pos));
+  const int64_t len = pos;
+  info.reset();
+  ASSERT_FALSE(info.is_transfer_upload_completed());
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, info.deserialize(buf, len, pos));
+  ASSERT_TRUE(info.is_transfer_upload_completed());
+  ASSERT_TRUE(info.is_valid());
+
+  // A payload without the appended field keeps the default false value.
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, info.serialize_(buf, sizeof(buf), pos));
+  const int64_t old_len = pos - serialization::encoded_length_bool(true);
+  ObTabletTransferInfo old_format;
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, old_format.deserialize_(buf, old_len, pos));
+  EXPECT_FALSE(old_format.is_transfer_upload_completed());
+  EXPECT_TRUE(old_format.is_valid());
+
+  ASSERT_EQ(OB_SUCCESS, info.init());
+  EXPECT_FALSE(info.is_transfer_upload_completed());
+  info.set_transfer_upload_completed(true);
+  ASSERT_EQ(OB_SUCCESS, info.init(ObLSID(3), SCN::base_scn(), 1, 1, SCN::base_scn()));
+  EXPECT_FALSE(info.is_transfer_upload_completed());
+  info.set_transfer_upload_completed(true);
+  info.reset_transfer_table();
+  EXPECT_FALSE(info.is_transfer_upload_completed());
+}
+
+#ifdef OB_BUILD_SHARED_STORAGE
+TEST_F(TestTablet, test_transfer_upload_meta_update_is_monotonic)
+{
+  ObTabletMeta local_meta;
+  ASSERT_EQ(OB_SUCCESS, local_meta.init(ObLSID(3), ObTabletID(1), ObTabletID(4),
+      SCN::base_scn(), 5, lib::Worker::CompatMode::MYSQL, ObTabletTableStoreFlag(),
+      1, SCN::base_scn(), ObSplitTabletInfo(), ObForkTabletInfo(), false, false, false, false, 0));
+  ObTabletMeta shared_meta;
+  ASSERT_EQ(OB_SUCCESS, shared_meta.init_for_shared_storage_first_creation(local_meta));
+  ObTabletMeta update_meta;
+  ASSERT_EQ(OB_SUCCESS, update_meta.assign(shared_meta));
+  update_meta.transfer_info_.set_transfer_upload_completed(true);
+  ASSERT_EQ(OB_SUCCESS, shared_meta.clog_checkpoint_scn_.convert_for_tx(100));
+  ASSERT_EQ(OB_SUCCESS, shared_meta.ddl_checkpoint_scn_.convert_for_tx(200));
+  shared_meta.table_store_flag_.set_is_user_data_table(true);
+
+  ASSERT_EQ(OB_SUCCESS, shared_meta.update_for_share_storage(update_meta));
+  ASSERT_TRUE(shared_meta.transfer_info_.is_transfer_upload_completed());
+  EXPECT_FALSE(local_meta.transfer_info_.is_transfer_upload_completed());
+  ASSERT_TRUE(shared_meta.table_store_flag_.is_user_data_table());
+  EXPECT_EQ(100, shared_meta.clog_checkpoint_scn_.get_val_for_tx());
+  EXPECT_EQ(200, shared_meta.ddl_checkpoint_scn_.get_val_for_tx());
+  ASSERT_EQ(OB_SUCCESS, shared_meta.update_for_share_storage(update_meta));
+  update_meta.transfer_info_.set_transfer_upload_completed(false);
+  ASSERT_EQ(OB_SUCCESS, shared_meta.update_for_share_storage(update_meta));
+  ASSERT_TRUE(shared_meta.transfer_info_.is_transfer_upload_completed());
+
+  const uint64_t data_version = DATA_VERSION_4_6_2_1;
+  const int64_t len = shared_meta.get_serialize_size(data_version);
+  char *buf = reinterpret_cast<char *>(allocator_.alloc(len));
+  ASSERT_NE(nullptr, buf);
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, shared_meta.serialize(data_version, buf, len, pos));
+  ObTabletMeta recovered;
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, recovered.deserialize(buf, len, pos));
+  ASSERT_TRUE(recovered.transfer_info_.is_transfer_upload_completed());
+
+  // An update prepared for another source generation must not complete this one.
+  shared_meta.transfer_info_.set_transfer_upload_completed(false);
+  update_meta.transfer_info_.set_transfer_upload_completed(true);
+  ++update_meta.transfer_info_.transfer_seq_;
+  EXPECT_EQ(OB_STATE_NOT_MATCH, shared_meta.update_for_share_storage(update_meta));
+  EXPECT_FALSE(shared_meta.transfer_info_.is_transfer_upload_completed());
+}
+
+TEST_F(TestTablet, test_transfer_destination_clears_upload_completion)
+{
+  ObTabletMeta source_meta;
+  ASSERT_EQ(OB_SUCCESS, source_meta.init(ObLSID(3), ObTabletID(1), ObTabletID(4),
+      SCN::base_scn(), 5, lib::Worker::CompatMode::MYSQL, ObTabletTableStoreFlag(),
+      1, SCN::base_scn(), ObSplitTabletInfo(), ObForkTabletInfo(), false, false, false, false, 0));
+  source_meta.transfer_info_.set_transfer_upload_completed(true);
+  ObTabletMeta first_shared_meta;
+  ASSERT_EQ(OB_SUCCESS, first_shared_meta.init_for_shared_storage_first_creation(source_meta));
+  EXPECT_FALSE(first_shared_meta.transfer_info_.is_transfer_upload_completed());
+
+  ObMigrationTabletParam param;
+  param.ls_id_ = source_meta.ls_id_;
+  param.tablet_id_ = source_meta.tablet_id_;
+  param.data_tablet_id_ = source_meta.data_tablet_id_;
+  param.create_scn_ = source_meta.create_scn_;
+  param.start_scn_ = source_meta.start_scn_;
+  param.clog_checkpoint_scn_ = source_meta.clog_checkpoint_scn_;
+  param.snapshot_version_ = source_meta.snapshot_version_;
+  param.multi_version_start_ = source_meta.multi_version_start_;
+  param.compat_mode_ = source_meta.compat_mode_;
+  param.table_store_flag_ = source_meta.table_store_flag_;
+  param.transfer_info_ = source_meta.transfer_info_;
+  param.is_empty_shell_ = true;
+  param.transfer_src_tablet_status_.tablet_status_ = ObTabletStatus::NORMAL;
+  ASSERT_EQ(OB_SUCCESS, param.ha_status_.init_status());
+  ASSERT_TRUE(param.is_valid());
+  ObTabletMeta migrated_meta;
+  ASSERT_EQ(OB_SUCCESS, migrated_meta.init(param, false /*is_transfer*/));
+  EXPECT_TRUE(migrated_meta.transfer_info_.is_transfer_upload_completed());
+  // Initialize the destination generation before copying its transfer info into tablet meta.
+  const int64_t transfer_seq = source_meta.transfer_info_.transfer_seq_ + 1;
+  ASSERT_EQ(OB_SUCCESS, param.transfer_info_.init(source_meta.ls_id_, SCN::base_scn(),
+      transfer_seq, static_cast<int32_t>(transfer_seq), source_meta.transfer_info_.transfer_start_scn_));
+  ASSERT_FALSE(param.transfer_info_.is_transfer_upload_completed());
+  ObTabletMeta destination_meta;
+  ASSERT_EQ(OB_SUCCESS, destination_meta.init(param, true /*is_transfer*/));
+  EXPECT_FALSE(destination_meta.transfer_info_.is_transfer_upload_completed());
+  EXPECT_TRUE(source_meta.transfer_info_.is_transfer_upload_completed());
+}
+#endif
+
 TEST_F(TestTablet, test_table_store_cache_inc_major_table_count)
 {
   const uint64_t old_data_version = DATA_VERSION_4_6_2_0;

@@ -74,6 +74,8 @@ int ObSSTabletBackfillUploadTask::process()
   bool is_valid_sswriter = false;
   share::SCN frozen_scn = SCN::invalid_scn();
   bool need_upload = true;
+  ObLS *ls = nullptr;
+  ObTabletHandle local_tablet_handle;
   LOG_INFO("[SS_TRANSFER_BACKFILL] start process transfer backfill tablet upload", K(ls_id_), K(tablet_info_), KPC(ha_dag_net_ctx_));
 
   DEBUG_SYNC(BEFORE_SS_TRANSFER_UPLOAD);
@@ -91,8 +93,16 @@ int ObSSTabletBackfillUploadTask::process()
     LOG_WARN("failed to check need upload", K(ret), K(ls_id_), K(tablet_info_));
   } else if (!need_upload) {
     //do nothing
-  } else if (OB_FAIL(check_tablet_without_memtable_())) {
-    LOG_WARN("failed to check tablet without memtable", K(ret), K(ls_id_), K(tablet_info_));
+  } else if (OB_FAIL(ha_dag_net_ctx_->get_src_ls(ls))) {
+    LOG_WARN("failed to get source ls", K(ret), K(ls_id_));
+  } else if (OB_ISNULL(ls)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("source ls is null", K(ret), K(ls_id_));
+  } else if (OB_FAIL(ObSSTransferBackfillUtils::get_and_check_source_tablet(
+      *ls, tablet_info_, local_tablet_handle))) {
+    LOG_WARN("failed to get and check source tablet", K(ret), K(ls_id_), K(tablet_info_));
+  } else if (local_tablet_handle.get_obj()->is_async_index_refresh_target()) {
+    // DDL flush and upload finish before Transfer START; async targets do not need a mini SSTable.
   } else if (OB_FAIL(create_empty_mini_sstable_())) {
     LOG_WARN("failed to create empty mini sstable", K(ret), K(ls_id_), K(tablet_info_));
   } else if (OB_FAIL(generate_inc_upload_task_())) {
@@ -129,58 +139,13 @@ int ObSSTabletBackfillUploadTask::check_need_upload_(bool &need_upload)
     ret = OB_NOT_INIT;
     LOG_WARN("ObSSTabletBackfillUploadTask do not init", K(ret));
   } else if (OB_FAIL(ObSSTransferBackfillUtils::check_tablet_need_upload(
-      ls_id_, tablet_info_.tablet_id_, tablet_info_.reorganization_scn_, tablet_info_.backfill_scn_, need_upload))) {
+      ls_id_, tablet_info_.tablet_id_, tablet_info_.reorganization_scn_, need_upload))) {
     if (OB_TABLET_NOT_EXIST == ret) {
       need_upload = true;
       ret = OB_SUCCESS;
     } else {
       LOG_WARN("failed to check tablet need upload", K(ret), K(ls_id_), K(tablet_info_));
     }
-  }
-  return ret;
-}
-
-int ObSSTabletBackfillUploadTask::check_tablet_without_memtable_()
-{
-  int ret = OB_SUCCESS;
-  ObLS *ls = nullptr;
-  ObTabletHandle tablet_handle;
-  ObTablet *tablet = nullptr;
-  common::ObArray<ObTableHandleV2> handle_array;
-
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("ObSSTabletBackfillUploadTask do not init", K(ret));
-  } else if (OB_FAIL(ha_dag_net_ctx_->get_src_ls(ls))) {
-    LOG_WARN("failed to get ls", K(ret), KPC(ha_dag_net_ctx_));
-  } else if (OB_FAIL(ls->ha_get_tablet(tablet_info_.tablet_id_, tablet_handle))) {
-    LOG_WARN("failed to get tablet", K(ret), K(ls_id_), K(tablet_info_));
-  } else if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("tablet should not be NULL", K(ret), K(ls_id_), K(tablet_info_));
-  } else if (OB_FAIL(tablet->get_memtables(handle_array))) {
-    LOG_WARN("failed to get memtables", K(ret), K(ls_id_), K(tablet_info_));
-  } else if (!handle_array.empty()) {
-    ObTableHandleV2 &last_table = handle_array.at(handle_array.count() - 1);
-    ObIMemtable *memtable = nullptr;
-    if (OB_FAIL(last_table.get_memtable(memtable))) {
-    LOG_WARN("failed to get last memtable", K(ret), K(last_table), K(ls_id_), K(tablet_info_));
-    } else if (memtable->get_end_scn() <= tablet->get_tablet_meta().clog_checkpoint_scn_) {
-      FLOG_INFO("memtable end scn is smaller than tablet clog checkpoint scn, sstable contains memtable whole range",
-          KPC(tablet), KPC(memtable));
-    } else {
-      ret = OB_EAGAIN;
-      LOG_WARN("tablet still has memtables, need retry", K(ret), K(ls_id_), K(tablet_info_), KPC(tablet));
-    }
-  }
-
-  if (OB_FAIL(ret)) {
-  } else if (FALSE_IT(handle_array.reset())) {
-  } else if (OB_FAIL(tablet->get_all_memtables_from_memtable_mgr(handle_array))) {
-    LOG_WARN("failed to get all memtables from memtable mgr", K(ret), K(ls_id_), K(tablet_info_), KPC(tablet));
-  } else if (!handle_array.empty()) {
-    ret = OB_EAGAIN;
-    LOG_WARN("tablet still has memtables, need retry", K(ret), K(ls_id_), K(tablet_info_), KPC(tablet));
   }
   return ret;
 }

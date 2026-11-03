@@ -885,6 +885,10 @@ int ObSSTabletBackfillTXTask::add_sstable_into_handles_(
       LOG_WARN("unexpected error, table is nullptr", K(ret), K(table_handle));
     } else if (table_handle.get_table()->is_major_sstable()) {
       //do nothing
+    } else if (table_handle.get_table()->is_inc_major_ddl_sstable()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected inc major ddl kv or dump sstable during transfer backfill",
+          K(ret), K(ls_id_), K(tablet_info_), K(table_handle));
     } else if (table_handle.get_table()->is_inc_major_type_sstable()) {
       if (OB_FAIL(inc_major_sstable_handles.add_table(table_handle))) {
         LOG_WARN("fail to add inc major sstable into handle", K(ret), K(table_handle));

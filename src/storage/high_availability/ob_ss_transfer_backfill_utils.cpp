@@ -5,6 +5,8 @@
 
 #define USING_LOG_PREFIX STORAGE
 #include "ob_ss_transfer_backfill_utils.h"
+#include "storage/ob_i_table.h"
+#include "storage/memtable/ob_memtable_interface.h"
 #include "storage/incremental/ob_shared_meta_service.h"
 #include "storage/incremental/ob_sswriter_service.h"
 #include "storage/compaction/ob_partition_merge_policy.h"
@@ -23,7 +25,6 @@ int ObSSTransferBackfillUtils::check_tablet_need_upload(
     const ObLSID &ls_id,
     const ObTabletID &tablet_id,
     const share::SCN &transfer_scn,
-    const share::SCN &check_scn,
     bool &need_upload)
 {
   int ret = OB_SUCCESS;
@@ -45,14 +46,14 @@ int ObSSTransferBackfillUtils::check_tablet_need_upload(
   } else if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet should not be NULL", K(ret), K(tablet_handle), K(ls_id), K(tablet_id));
-  } else if (check_scn > tablet->get_clog_checkpoint_scn()) {
+  } else if (!tablet->get_tablet_meta().transfer_info_.is_transfer_upload_completed()) {
     need_upload = true;
   } else {
     need_upload = false;
   }
 
   if (OB_NOT_NULL(tablet)) {
-    LOG_INFO("check tablet need upload", K(ret), K(ls_id), K(tablet_id), K(transfer_scn), K(check_scn),
+    LOG_INFO("check tablet need upload", K(ret), K(ls_id), K(tablet_id), K(transfer_scn),
       K(tablet->get_clog_checkpoint_scn()),
       K(need_upload));
   }
@@ -60,7 +61,86 @@ int ObSSTransferBackfillUtils::check_tablet_need_upload(
   return ret;
 }
 
-// TODO(jyx441808): this method will access 2nd meta (sstable meta), need a flag in 1st meta to optimize ss I/O
+int ObSSTransferBackfillUtils::get_and_check_source_tablet(
+    ObLS &ls, const ObTabletBackfillInfo &tablet_info, ObTabletHandle &tablet_handle)
+{
+  int ret = OB_SUCCESS;
+  common::ObArray<ObTableHandleV2> memtables;
+  tablet_handle.reset();
+  if (!tablet_info.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(ls.ha_get_tablet(tablet_info.tablet_id_, tablet_handle))) {
+    LOG_WARN("failed to get source tablet", K(ret), K(tablet_info));
+  } else if (!tablet_handle.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (tablet_handle.get_obj()->get_reorganization_scn() != tablet_info.reorganization_scn_) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("source tablet generation changed", K(ret), K(tablet_info), K(tablet_handle));
+  } else if (OB_FAIL(tablet_handle.get_obj()->get_memtables(memtables))) {
+    LOG_WARN("failed to get source memtables", K(ret), K(tablet_info), K(tablet_handle));
+  } else if (!memtables.empty()) {
+    // The old tablet may retain released memtable handles whose ranges are covered by its checkpoint.
+    ObTableHandleV2 &last_table = memtables.at(memtables.count() - 1);
+    ObIMemtable *memtable = nullptr;
+    if (OB_FAIL(last_table.get_memtable(memtable))) {
+      LOG_WARN("failed to get last source memtable", K(ret), K(last_table), K(tablet_info));
+    } else if (memtable->get_end_scn() > tablet_handle.get_obj()->get_clog_checkpoint_scn()) {
+      ret = OB_EAGAIN;
+      LOG_WARN("source still has unflushed memtables, need retry", K(ret), K(tablet_info), K(tablet_handle));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    memtables.reset();
+    if (OB_FAIL(tablet_handle.get_obj()->get_all_memtables_from_memtable_mgr(memtables))) {
+      LOG_WARN("failed to get all source memtables from memtable mgr", K(ret), K(tablet_info), K(tablet_handle));
+    } else if (!memtables.empty()) {
+      ret = OB_EAGAIN;
+      LOG_WARN("source memtable manager is not empty, need retry", K(ret), K(tablet_info), K(tablet_handle));
+    }
+  }
+  return ret;
+}
+
+int ObSSTransferBackfillUtils::finish_tablet_upload(ObLS &ls, const ObTabletBackfillInfo &tablet_info)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator(lib::ObMemAttr(MTL_ID(), "SSTfBackfill"));
+  ObTabletHandle local_tablet_handle;
+  ObTabletHandle ss_tablet_handle;
+  ObTabletMeta new_meta;
+  bool is_sswriter = false;
+  const ObLSID &ls_id = ls.get_ls_id();
+  if (OB_FAIL(ObSSTransferBackfillUtils::get_ss_tablet(ls_id, tablet_info.tablet_id_,
+      tablet_info.reorganization_scn_, allocator, ss_tablet_handle, true /*read_mark_delete*/))) {
+    LOG_WARN("failed to get shared source tablet", K(ret), K(tablet_info));
+  } else if (ss_tablet_handle.get_obj()->get_tablet_meta().transfer_info_.is_transfer_upload_completed()) {
+    // A previous attempt may have committed this tablet's marker before another tablet failed.
+  } else if (OB_FAIL(get_and_check_source_tablet(ls, tablet_info, local_tablet_handle))) {
+    LOG_WARN("failed to get and check source tablet", K(ret), K(ls_id), K(tablet_info));
+  } else if (!local_tablet_handle.get_obj()->is_async_index_refresh_target()
+      && ss_tablet_handle.get_obj()->get_clog_checkpoint_scn() < tablet_info.backfill_scn_) {
+    ret = OB_EAGAIN;
+    LOG_WARN("source minor upload is incomplete", K(ret), K(tablet_info), K(ss_tablet_handle));
+  } else if (OB_FAIL(ObSSTransferBackfillUtils::check_self_is_sswriter(
+      ObSSWriterType::FREEZE, ls_id, tablet_info.tablet_id_, is_sswriter))) {
+    LOG_WARN("failed to check upload lease", K(ret), K(tablet_info));
+  } else if (!is_sswriter) {
+    ret = OB_NOT_MASTER;
+  } else if (OB_FAIL(new_meta.assign(ss_tablet_handle.get_obj()->get_tablet_meta()))) {
+    LOG_WARN("failed to copy shared tablet meta", K(ret), K(tablet_info));
+  } else {
+    new_meta.transfer_info_.set_transfer_upload_completed(true);
+    if (OB_FAIL(MTL(ObSSMetaService *)->update_tablet_meta(
+        ls_id, tablet_info.tablet_id_, tablet_info.reorganization_scn_, new_meta))) {
+      LOG_WARN("failed to persist transfer upload completion", K(ret), K(tablet_info));
+    } else {
+      FLOG_INFO("[SS_TRANSFER_BACKFILL] source tablet upload completed", K(ls_id), K(tablet_info));
+    }
+  }
+  return ret;
+}
+
 int ObSSTransferBackfillUtils::check_tablet_need_backfill_tx(
     const ObTabletHandle &tablet_handle,
     const share::SCN &backfill_scn,
@@ -74,6 +154,7 @@ int ObSSTransferBackfillUtils::check_tablet_need_backfill_tx(
   ObTableStoreIterator table_store_iter;
   SCN min_recycle_scn;
   bool need_scan_sstable = false;
+  bool is_upload_completed = false;
 
   if (!tablet_handle.is_valid() || !backfill_scn.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
@@ -81,7 +162,8 @@ int ObSSTransferBackfillUtils::check_tablet_need_backfill_tx(
   } else if (OB_ISNULL(tablet = tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet is null", K(ret), K(tablet_handle));
-  } else if (tablet->get_tablet_meta().clog_checkpoint_scn_ < backfill_scn) {
+  } else if (FALSE_IT(is_upload_completed = tablet->get_tablet_meta().transfer_info_.is_transfer_upload_completed())) {
+  } else if (!is_upload_completed) {
     need_backfill_tx = false;
   } else if (FALSE_IT(min_recycle_scn = tablet->get_min_recycle_scn())) {
   } else if (min_recycle_scn.is_min()) {
@@ -144,7 +226,7 @@ int ObSSTransferBackfillUtils::check_tablet_need_backfill_tx(
     }
   }
 
-  if (OB_SUCC(ret) && !need_backfill_tx) {
+  if (OB_SUCC(ret) && !need_backfill_tx && is_upload_completed) {
     const int64_t minor_table_count = tablet->get_minor_table_count();
     if (minor_table_count > compaction::ObPartitionMergePolicy::OB_EMERGENCY_TABLE_CNT) {
       need_backfill_tx = true;
@@ -428,7 +510,7 @@ int ObSSTransferBackfillUtils::check_ss_src_tablet_ready(
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet should not be NULL", K(ret), K(tablet_handle), K(ls_id), K(tablet_id), K(reorg_scn));
   } else if (FALSE_IT(is_tablet_exist = true)) {
-  } else if (ss_src_tablet->get_tablet_meta().clog_checkpoint_scn_ < backfill_scn) {
+  } else if (!ss_src_tablet->get_tablet_meta().transfer_info_.is_transfer_upload_completed()) {
     is_data_uploaded = false;
   } else if (FALSE_IT(is_data_uploaded = true)) {
   } else if (OB_FAIL(ObSSTransferBackfillUtils::check_tablet_need_backfill_tx(tablet_handle, backfill_scn,
