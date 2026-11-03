@@ -2226,6 +2226,88 @@ TEST_F(ObDASFusionParallelCtxTest,
   EXPECT_EQ(321, estimate.get_ror_work_row_count());
 }
 
+// A task owns one rtdef, but each Segment Group generates another Scalar ROR.
+// Both the original query bounds and the other Group's slice must stay intact.
+TEST_F(ObDASFusionParallelCtxTest, scalar_ror_ranges_are_owned_per_group)
+{
+  ObArenaAllocator scan_alloc("MockScan");
+  ObDASScanOp mock_scan_op(scan_alloc);
+  ObDASSearchCtx search_ctx(alloc_, mock_scan_op);
+  ObDASScalarScanCtDef ctdef(alloc_);
+  ObDASScalarScanRtDef rtdef;
+  ObExpr rowid_expr;
+  ExprFixedArray rowid_exprs(alloc_);
+  ASSERT_EQ(OB_SUCCESS, rowid_exprs.init(1));
+  ASSERT_EQ(OB_SUCCESS, rowid_exprs.push_back(&rowid_expr));
+  ASSERT_EQ(OB_SUCCESS, ctdef.rowkey_exprs_.init(1));
+  ASSERT_EQ(OB_SUCCESS, ctdef.rowkey_exprs_.push_back(&rowid_expr));
+  search_ctx.rowid_exprs_ = &rowid_exprs;
+  search_ctx.rowid_type_ = DAS_ROWID_TYPE_UINT64;
+  search_ctx.scopes_[DAS_SCOPE_BASE].rowid_exprs_ = &rowid_exprs;
+  search_ctx.scopes_[DAS_SCOPE_BASE].rowid_type_ = DAS_ROWID_TYPE_UINT64;
+
+  ObObj starts[2];
+  ObObj ends[2];
+  starts[0].set_min_value();
+  ends[0].set_max_value();
+  starts[1].set_uint64(228);
+  ends[1].set_uint64(1024);
+  for (int64_t i = 0; i < 2; ++i) {
+    ObNewRange range;
+    range.table_id_ = 12345;
+    range.start_key_.assign(&starts[i], 1);
+    range.end_key_.assign(&ends[i], 1);
+    ASSERT_EQ(OB_SUCCESS, rtdef.key_ranges_.push_back(range));
+  }
+  ObDASScalarIndexROROp first(search_ctx);
+  ObDASScalarIndexROROp second(search_ctx);
+  ObDASScalarIndexROROp *groups[] = {&first, &second};
+  for (auto *group : groups) {
+    group->scalar_ctdef_ = &ctdef;
+    group->scalar_rtdef_ = &rtdef;
+    ASSERT_EQ(OB_SUCCESS, group->rowid_output_exprs_.init(rowid_exprs, 1));
+  }
+
+  // Reprepare with a wider slice and then a narrower slice, as on rescan.
+  const uint64_t lows[] = {228, 100, 300};
+  const uint64_t highs[] = {1024, 2000, 900};
+  for (int64_t round = 0; round < 3; ++round) {
+    ObObj lo;
+    ObObj hi;
+    lo.set_uint64(lows[round]);
+    hi.set_uint64(highs[round]);
+    search_ctx.set_docid_range(lo, hi);
+    for (auto *group : groups) {
+      ASSERT_EQ(OB_SUCCESS, group->prepare_scan_ranges(&rtdef));
+      ASSERT_EQ(2, group->scan_param_.key_ranges_.count());
+      ASSERT_EQ(OB_SUCCESS, group->narrow_scan_ranges_by_docid_range());
+      const ObNewRange &whole = group->scan_param_.key_ranges_.at(0);
+      EXPECT_EQ(lows[round], whole.start_key_.get_obj_ptr()[0].get_uint64());
+      EXPECT_EQ(highs[round], whole.end_key_.get_obj_ptr()[0].get_uint64());
+      EXPECT_TRUE(whole.border_flag_.inclusive_start());
+      EXPECT_TRUE(whole.border_flag_.inclusive_end());
+      const ObNewRange &bounded = group->scan_param_.key_ranges_.at(1);
+      EXPECT_EQ(MAX(lows[round], 228UL), bounded.start_key_.get_obj_ptr()[0].get_uint64());
+      EXPECT_EQ(MIN(highs[round], 1024UL), bounded.end_key_.get_obj_ptr()[0].get_uint64());
+      EXPECT_EQ(round == 2, bounded.border_flag_.inclusive_start());
+      EXPECT_EQ(round == 2, bounded.border_flag_.inclusive_end());
+      // The finite query bounds are exclusive until the task really tightens them.
+      EXPECT_TRUE(starts[0].is_min_value());
+      EXPECT_TRUE(ends[0].is_max_value());
+      EXPECT_EQ(228UL, starts[1].get_uint64());
+      EXPECT_EQ(1024UL, ends[1].get_uint64());
+      EXPECT_FALSE(rtdef.key_ranges_.at(0).border_flag_.inclusive_start());
+      EXPECT_FALSE(rtdef.key_ranges_.at(0).border_flag_.inclusive_end());
+    }
+    EXPECT_NE(first.scan_param_.key_ranges_.at(0).start_key_.get_obj_ptr(),
+              second.scan_param_.key_ranges_.at(0).start_key_.get_obj_ptr());
+  }
+  ASSERT_EQ(OB_SUCCESS, first.do_close());
+  // Closing another Group cannot invalidate this Group's owned range.
+  EXPECT_EQ(300UL, second.scan_param_.key_ranges_.at(0).start_key_.get_obj_ptr()[0].get_uint64());
+  ASSERT_EQ(OB_SUCCESS, second.do_close());
+}
+
 TEST_F(ObDASFusionParallelCtxTest,
        dummy_op_does_not_enter_ror_admission_work)
 {
