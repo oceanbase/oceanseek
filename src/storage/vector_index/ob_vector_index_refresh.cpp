@@ -654,6 +654,7 @@ int ObVectorIndexRefresher::do_rebuild() {
   int64_t domain_table_row_cnt = 0;
   int64_t index_id_table_row_cnt = 0;
   bool triggered = true;
+  bool skip_empty_auto_rebuild = false;
   bool rebuild_index_online = false;
   bool has_index_param_change = false;
   bool support_duplicate_changed = false;
@@ -767,7 +768,8 @@ int ObVectorIndexRefresher::do_rebuild() {
     // do nothing
     triggered = false;
     LOG_INFO("[VEC_INDEX][REBUILD] table or db in recyclebin", KPC(db_schema), KPC(domain_table_schema), KPC(index_id_tb_schema));
-  } else if (OB_UNLIKELY(0 == refresh_ctx_->delta_rate_threshold_)) {
+  } else if (OB_UNLIKELY(0 == refresh_ctx_->delta_rate_threshold_)
+             && (!refresh_ctx_->is_auto_rebuild_ || !refresh_ctx_->idx_parameters_.empty())) {
     // do nothing
   } else if (!domain_table_schema->is_vec_hnsw_index()) {
     // no need to get table cnt if not hnsw index
@@ -777,6 +779,12 @@ int ObVectorIndexRefresher::do_rebuild() {
                                          base_table_row_cnt))) {
     LOG_WARN("fail to get base table row count", KR(ret),
              K(base_table_schema->get_table_name_str()));
+  } else if (refresh_ctx_->is_auto_rebuild_ && refresh_ctx_->idx_parameters_.empty()
+             && 0 == base_table_row_cnt) {
+    triggered = false;
+    skip_empty_auto_rebuild = true;
+  } else if (OB_UNLIKELY(0 == refresh_ctx_->delta_rate_threshold_)) {
+    // A zero threshold still forces automatic rebuilds of nonempty tables.
   } else if (OB_FAIL(get_table_row_count(db_schema->get_database_name_str(),
                                          domain_table_schema->get_table_name_str(), 
                                          refresh_ctx_->scn_, 
@@ -872,6 +880,8 @@ int ObVectorIndexRefresher::do_rebuild() {
   }
 
   if (OB_FAIL(ret)) {
+  } else if (skip_empty_auto_rebuild) {
+    LOG_INFO("[VEC_INDEX][REBUILD] skip automatic rebuild of empty table", KPC(refresh_ctx_));
   } else if (is_hybrid_vector && !need_embedding_when_rebuild && !support_duplicate_changed) {
     // The optional-task shortcut only re-optimizes the in-memory adapter of the
     // current generation; it must only be taken when the request cannot change

@@ -1908,6 +1908,7 @@ int ObVectorRefreshIndexExecutor::do_rebuild_with_retry()
   refresh_ctx.idx_parameters_ = idx_parameters_;
   refresh_ctx.idx_parallel_creation_ = idx_parallel_creation_;
   refresh_ctx.delta_rate_threshold_ = delta_rate_threshold_;
+  refresh_ctx.is_auto_rebuild_ = true;
   int retry_cnt = 0;
   int64_t start_time_us = common::ObTimeUtility::fast_current_time();
 
