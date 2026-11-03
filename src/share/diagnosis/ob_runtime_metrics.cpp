@@ -403,6 +403,35 @@ void ObMergeMetric::update(uint64_t value)
   }
 }
 
+void ObMergeMetric::merge(const ObMergeMetric &other)
+{
+  // 例如两批样本为 [10] 和 [30,30,30]，合并平均值应为 25，而不是 (10+30)/2=20。
+  // 合并 M2 保持标准差的统计语义；浮点运算顺序不同，允许微小舍入差异。
+  if (get_metric_agg_type(id_) & E_STDDEV) {
+    if (count_ == 0) {
+      M2_ = other.M2_;
+    } else if (other.count_ > 0) {
+      const double delta = static_cast<double>(other.sum_value_) / other.count_
+          - static_cast<double>(sum_value_) / count_;
+      M2_ += other.M2_ + delta * delta * static_cast<double>(count_)
+          * other.count_ / (static_cast<double>(count_) + other.count_);
+    }
+  }
+  sum_value_ += other.sum_value_;
+  count_ += other.count_;
+  // 延续 update 的首个非零值语义，以及独立的最小值有效标志。
+  if (first_value_ == 0) {
+    first_value_ = other.first_value_;
+  }
+  if (other.is_min_set_ && (!is_min_set_ || other.min_value_ < min_value_)) {
+    min_value_ = other.min_value_;
+    is_min_set_ = true;
+  }
+  if (other.max_value_ > max_value_) {
+    max_value_ = other.max_value_;
+  }
+}
+
 uint64_t ObMergeMetric::value() const
 {
   int agg_type = get_metric_agg_type(id_);

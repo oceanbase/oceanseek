@@ -348,6 +348,11 @@ SQL_MONITOR_STATNAME_DEF(HS_VEC_BRUTE_OUTPUT_ROWS, metric::Unit::INT, "brute out
 // Hybrid Search fusion observability
 SQL_MONITOR_STATNAME_DEF(HS_FUSION_INPUT_ROW_COUNT, metric::Unit::INT, "input row count", "deduplicated fusion candidate rows before final offset/size trimming", M_SUM, metric::Level::STANDARD)
 
+// 仅展示侧统计聚合 Task 的原始实例数量，不改变已有指标编号。
+SQL_MONITOR_STATNAME_DEF(HS_MERGED_TASK_COUNT, metric::Unit::INT, "merged task count", "number of original tasks merged into this profile", M_SUM, metric::Level::STANDARD)
+// 追加分区聚合数量，已有持久化指标编号保持不变。
+SQL_MONITOR_STATNAME_DEF(HS_MERGED_PARTITION_COUNT, metric::Unit::INT, "merged partition count", "number of original partition profiles merged into this profile", M_SUM, metric::Level::STANDARD)
+
 //end
 SQL_MONITOR_STATNAME_DEF(MONITOR_STATNAME_END, metric::Unit::INVALID, "monitor end", "monitor stat name end", E_MIN | E_MAX, metric::Level::AD_HOC)
 #endif

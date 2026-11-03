@@ -124,6 +124,22 @@ public:
   static bool is_hybrid_search_profile(ObProfileId id);
 
 private:
+  // 通用指标聚合，普通 Profile 和混搜 Profile 共用。
+  static int hs_merge_metrics(ObMergedProfile &merged_profile, const ObProfile &piece_profile);
+  // 以下 hs_ 辅助函数仅用于混搜 Task、Partition 的展示侧聚合，不参与查询执行。
+  template <typename MetricType>
+  static int hs_is_same_shape(const ObMergedProfile &merged_profile,
+                             const ObOpProfile<MetricType> &piece_profile, bool &same_shape);
+  static int hs_merge_task_profile(ObMergedProfile &merged_parent, const ObProfile &piece_task);
+  static int hs_merge_same_shape_tree(ObMergedProfile &merged_profile,
+                                   const ObProfile &piece_profile);
+  static int hs_copy_task_tree(ObMergedProfile &merged_profile,
+                            const ObProfile &piece_profile);
+  // 分区先完成内部 Task 聚合，再按有序树形匹配并合并统计状态。
+  static int hs_merge_partition_profile(ObMergedProfile &merged_parent,
+                                       const ObProfile &piece_partition);
+  static int hs_merge_partition_tree(ObMergedProfile &merged_profile,
+                                    const ObMergedProfile &piece_profile);
   static int merge_children_for_hybrid_search(ObMergedProfile &merged_profile,
                                               const ObProfile *piece_profile,
                                               ObIAllocator *alloc);

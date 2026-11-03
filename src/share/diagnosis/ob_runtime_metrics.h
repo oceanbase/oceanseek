@@ -136,6 +136,9 @@ struct ObMergeMetric
 {
 public:
   void update(uint64_t value);
+  // 合并同一指标的完整统计状态；update 只用于加入单个原始样本。
+  // Partition 内的 Task 已聚合，跨 Partition 合并需保留样本数量，不能对平均值再次 update。
+  void merge(const ObMergeMetric &other);
   int64_t get_format_size(bool with_braces = true);
   int to_format_json(char *buf, const int64_t buf_len, int64_t &pos, bool with_braces);
   int pretty_print(char *buf, const int64_t buf_len, int64_t &pos, const ObString &prefix) const;

@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_profile_util.h"
+#include "common/ob_common_utility.h"
 #include "observer/ob_inner_sql_connection_pool.h"
 #include "share/diagnosis/ob_runtime_profile.h"
 #include "lib/string/ob_sql_string.h"
@@ -275,25 +276,18 @@ int ObProfileUtil::merge_profile(ObMergedProfile &merged_profile, const ObProfil
                                  ObIAllocator *alloc)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(piece_profile)) {
+  // 递归展示树显式检查栈空间，检查失败直接返回，不能继续合并覆盖错误码。
+  if (OB_FAIL(check_stack_overflow())) {
+    LOG_WARN("profile merge stack check failed", KR(ret));
+  } else if (OB_ISNULL(piece_profile)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("other profile is null");
   } else if (merged_profile.get_id() != piece_profile->get_id()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("profile name is not the same", K(merged_profile.get_id()), K(piece_profile->get_id()));
   } else {
-    ObOpProfile<ObMetric>::MetricWrap *cur_metric_wrap = piece_profile->get_metric_head();
-    while (OB_SUCC(ret) && nullptr != cur_metric_wrap) {
-      ObMergeMetric *new_metric = nullptr;
-      if (OB_FAIL(merged_profile.get_or_register_metric(
-              static_cast<ObMetricId>(cur_metric_wrap->elem_.get_metric_id()), new_metric))) {
-        LOG_WARN("failed to get or register metric", K(cur_metric_wrap->elem_.get_metric_id()));
-      } else {
-        new_metric->update(cur_metric_wrap->elem_.value());
-      }
-      cur_metric_wrap = cur_metric_wrap->next_;
-    }
-    if (OB_FAIL(ret)) {
+    if (OB_FAIL(hs_merge_metrics(merged_profile, *piece_profile))) {
+      LOG_WARN("failed to merge metrics", KR(ret));
     } else if (is_hybrid_search_profile(merged_profile.get_id())
                || merged_profile.get_id() == common::ObProfileId::VECTOR_SEARCH) {
       if (OB_FAIL(merge_children_for_hybrid_search(merged_profile, piece_profile, alloc))) {
@@ -320,6 +314,240 @@ bool ObProfileUtil::is_hybrid_search_profile(ObProfileId id)
   return id >= common::ObProfileId::HYBRID_SEARCH_BEGIN && id <= common::ObProfileId::HYBRID_SEARCH_END;
 }
 
+// 通用指标聚合；仅对混搜 Task 跳过实例编号和单独维护的合并数量。
+int ObProfileUtil::hs_merge_metrics(ObMergedProfile &merged_profile, const ObProfile &piece_profile)
+{
+  int ret = OB_SUCCESS;
+  for (auto *metric_wrap = piece_profile.get_metric_head();
+       OB_SUCC(ret) && OB_NOT_NULL(metric_wrap); metric_wrap = metric_wrap->next_) {
+    const ObMetricId metric_id = static_cast<ObMetricId>(metric_wrap->elem_.get_metric_id());
+    // 聚合 Task 不冒充某个实例；合并数量由 Task 分支单独维护。
+    if (merged_profile.get_id() == ObProfileId::HYBRID_SEARCH_PARALLEL_TASK
+        && (metric_id == ObMetricId::HS_PARALLEL_WORK_UNIT_ID
+            || metric_id == ObMetricId::HS_MERGED_TASK_COUNT)) {
+    } else {
+      ObMergeMetric *metric = nullptr;
+      if (OB_FAIL(merged_profile.get_or_register_metric(metric_id, metric))) {
+        LOG_WARN("failed to get or register metric", KR(ret), K(metric_id));
+      } else {
+        metric->update(metric_wrap->elem_.value());
+      }
+    }
+  }
+  return ret;
+}
+
+// 仅供混搜 Task、Partition 聚合比较有序子树，不以指标或 ID 作为匹配条件。
+template <typename MetricType>
+int ObProfileUtil::hs_is_same_shape(const ObMergedProfile &merged_profile,
+                                  const ObOpProfile<MetricType> &piece_profile, bool &same_shape)
+{
+  int ret = OB_SUCCESS;
+  same_shape = false;
+  if (OB_FAIL(check_stack_overflow())) {
+    LOG_WARN("profile shape comparison stack check failed", KR(ret));
+  } else {
+    same_shape = merged_profile.get_id() == piece_profile.get_id();
+  }
+  auto *merged_child = merged_profile.get_child_head();
+  auto *piece_child = piece_profile.get_child_head();
+  // 只比较有序树形，所有指标及任务、算子编号均不参与匹配。
+  while (OB_SUCC(ret) && same_shape && OB_NOT_NULL(merged_child) && OB_NOT_NULL(piece_child)) {
+    if (OB_FAIL(hs_is_same_shape(*merged_child->elem_, *piece_child->elem_, same_shape))) {
+      LOG_WARN("failed to compare hybrid search profile shape", KR(ret));
+    } else {
+      merged_child = merged_child->next_;
+      piece_child = piece_child->next_;
+    }
+  }
+  same_shape = same_shape && OB_ISNULL(merged_child) && OB_ISNULL(piece_child);
+  return ret;
+}
+
+// 仅供混搜同构 Task 按对应位置递归合并指标。
+int ObProfileUtil::hs_merge_same_shape_tree(ObMergedProfile &merged_profile,
+                                        const ObProfile &piece_profile)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(check_stack_overflow())) {
+    LOG_WARN("task tree merge stack check failed", KR(ret));
+  } else if (OB_UNLIKELY(merged_profile.get_id() != piece_profile.get_id())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("profile type differs after task shape comparison", KR(ret));
+  } else if (OB_FAIL(hs_merge_metrics(merged_profile, piece_profile))) {
+    LOG_WARN("failed to merge task node metrics", KR(ret));
+  } else {
+    auto *merged_child = merged_profile.get_child_head();
+    auto *piece_child = piece_profile.get_child_head();
+    // 同构检查完成后按位置更新，不能调用会追加 Hybrid 子树的通用合并。
+    while (OB_SUCC(ret) && OB_NOT_NULL(merged_child) && OB_NOT_NULL(piece_child)) {
+      if (OB_FAIL(hs_merge_same_shape_tree(*merged_child->elem_, *piece_child->elem_))) {
+        LOG_WARN("failed to merge same shape child", KR(ret));
+      } else {
+        merged_child = merged_child->next_;
+        piece_child = piece_child->next_;
+      }
+    }
+    if (OB_SUCC(ret) && (OB_NOT_NULL(merged_child) || OB_NOT_NULL(piece_child))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("child count differs after task shape comparison", KR(ret));
+    }
+  }
+  return ret;
+}
+
+// 仅在混搜 Task 展示侧按树形分桶，同构合并、异构保留。
+int ObProfileUtil::hs_merge_task_profile(ObMergedProfile &merged_parent,
+                                     const ObProfile &piece_task)
+{
+  int ret = OB_SUCCESS;
+  ObMergedProfile *target_task = nullptr;
+  // 同一个父节点下按树形分桶，不预先按 path 或 work kind 分组。
+  for (auto *child = merged_parent.get_child_head();
+       OB_SUCC(ret) && OB_ISNULL(target_task) && OB_NOT_NULL(child); child = child->next_) {
+    if (child->elem_->get_id() == ObProfileId::HYBRID_SEARCH_PARALLEL_TASK) {
+      bool same_shape = false;
+      if (OB_FAIL(hs_is_same_shape(*child->elem_, piece_task, same_shape))) {
+        LOG_WARN("failed to compare existing task", KR(ret));
+      } else if (same_shape) {
+        target_task = child->elem_;
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_NOT_NULL(target_task)) {
+    if (OB_FAIL(hs_merge_same_shape_tree(*target_task, piece_task))) {
+      LOG_WARN("failed to merge existing task", KR(ret));
+    }
+  } else if (OB_FAIL(merged_parent.register_child(piece_task.get_id(), target_task))) {
+    LOG_WARN("failed to register aggregated task", KR(ret));
+  } else if (OB_FAIL(hs_copy_task_tree(*target_task, piece_task))) {
+    LOG_WARN("failed to initialize aggregated task", KR(ret));
+  }
+  // 每加入一个原始 Task 只计数一次，Fusion 原有任务总数保持不变。
+  if (OB_SUCC(ret)) {
+    ObMergeMetric *task_count = nullptr;
+    if (OB_FAIL(target_task->get_or_register_metric(ObMetricId::HS_MERGED_TASK_COUNT, task_count))) {
+      LOG_WARN("failed to register merged task count", KR(ret));
+    } else {
+      task_count->update(1);
+    }
+  }
+  return ret;
+}
+
+// 仅供混搜新聚合 Task 初始化，逐节点保留原始子树结构。
+int ObProfileUtil::hs_copy_task_tree(ObMergedProfile &merged_profile, const ObProfile &piece_profile)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(check_stack_overflow())) {
+    LOG_WARN("task tree copy stack check failed", KR(ret));
+  } else if (OB_FAIL(hs_merge_metrics(merged_profile, piece_profile))) {
+    LOG_WARN("failed to initialize task node metrics", KR(ret));
+  }
+  // 首份任务逐节点复制，任何类型的同名兄弟节点都不折叠。
+  for (auto *child = piece_profile.get_child_head();
+       OB_SUCC(ret) && OB_NOT_NULL(child); child = child->next_) {
+    ObMergedProfile *new_child = nullptr;
+    if (OB_FAIL(merged_profile.register_child(child->elem_->get_id(), new_child))) {
+      LOG_WARN("failed to register task child", KR(ret));
+    } else if (OB_FAIL(hs_copy_task_tree(*new_child, *child->elem_))) {
+      LOG_WARN("failed to copy task child", KR(ret));
+    }
+  }
+  return ret;
+}
+
+// 仅供混搜 Partition 聚合；临时树只保留当前分区，避免重复保存所有原始分区。
+int ObProfileUtil::hs_merge_partition_profile(ObMergedProfile &merged_parent,
+                                            const ObProfile &piece_partition)
+{
+  int ret = OB_SUCCESS;
+  // 临时树只用于匹配；结果树的节点由 merged_parent 的 allocator 分配，指标按值复制。
+  // hs_merge_partition_tree 不保存临时树指针，局部 arena 退出时可以安全释放。
+  ObArenaAllocator scratch_allocator("HsProfileMerge");
+  ObMergedProfile partition(ObProfileId::HYBRID_SEARCH_PARTITION, &scratch_allocator);
+  ObMergedProfile *target_partition = nullptr;
+  // 先折叠分区内部 Task，树形比较不受各分区 Task 实例数量影响。
+  if (OB_FAIL(merge_profile(partition, &piece_partition, &scratch_allocator))) {
+    LOG_WARN("failed to aggregate tasks inside partition", KR(ret));
+  } else {
+    for (auto *child = merged_parent.get_child_head();
+         OB_SUCC(ret) && OB_ISNULL(target_partition) && OB_NOT_NULL(child); child = child->next_) {
+      if (child->elem_->get_id() == ObProfileId::HYBRID_SEARCH_PARTITION) {
+        bool same_shape = false;
+        if (OB_FAIL(hs_is_same_shape(*child->elem_, partition, same_shape))) {
+          LOG_WARN("failed to compare existing partition", KR(ret));
+        } else if (same_shape) {
+          target_partition = child->elem_;
+        }
+      }
+    }
+  }
+  // 新桶与已有桶共用按位置的复制/合并；只保存最终聚合树。
+  if (OB_SUCC(ret) && OB_ISNULL(target_partition)) {
+    if (OB_FAIL(merged_parent.register_child(piece_partition.get_id(), target_partition))) {
+      LOG_WARN("failed to register aggregated partition", KR(ret));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(hs_merge_partition_tree(*target_partition, partition))) {
+      LOG_WARN("failed to merge partition profile", KR(ret));
+    } else {
+      ObMergeMetric *partition_count = nullptr;
+      if (OB_FAIL(target_partition->get_or_register_metric(
+              ObMetricId::HS_MERGED_PARTITION_COUNT, partition_count))) {
+        LOG_WARN("failed to register merged partition count", KR(ret));
+      } else {
+        partition_count->update(1);
+      }
+    }
+  }
+  return ret;
+}
+
+// 仅供混搜同构 Partition 复制/相加；Task 数量已在临时树中正确统计。
+int ObProfileUtil::hs_merge_partition_tree(ObMergedProfile &merged_profile,
+                                         const ObMergedProfile &piece_profile)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(check_stack_overflow())) {
+    LOG_WARN("partition tree merge stack check failed", KR(ret));
+  } else if (OB_UNLIKELY(merged_profile.get_id() != piece_profile.get_id())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("profile type differs after partition shape comparison", KR(ret));
+  }
+  for (auto *metric_wrap = piece_profile.get_metric_head();
+       OB_SUCC(ret) && OB_NOT_NULL(metric_wrap); metric_wrap = metric_wrap->next_) {
+    const ObMetricId metric_id = metric_wrap->elem_.get_metric_id();
+    // 跨分区聚合不冒充某个 tablet；原始实例编号保留在 ORIGINAL。
+    if (metric_id != ObMetricId::HS_TABLET_ID) {
+      ObMergeMetric *metric = nullptr;
+      if (OB_FAIL(merged_profile.get_or_register_metric(metric_id, metric))) {
+        LOG_WARN("failed to register aggregated partition metric", KR(ret), K(metric_id));
+      } else {
+        metric->merge(metric_wrap->elem_);
+      }
+    }
+  }
+  auto *merged_child = merged_profile.get_child_head();
+  for (auto *piece_child = piece_profile.get_child_head();
+       OB_SUCC(ret) && OB_NOT_NULL(piece_child); piece_child = piece_child->next_) {
+    ObMergedProfile *target_child = nullptr;
+    // 已匹配子树按位置相加；首份子树按位置复制，保留重复类型的兄弟节点。
+    if (OB_NOT_NULL(merged_child)) {
+      target_child = merged_child->elem_;
+      merged_child = merged_child->next_;
+    } else if (OB_FAIL(merged_profile.register_child(piece_child->elem_->get_id(), target_child))) {
+      LOG_WARN("failed to register partition child", KR(ret));
+    }
+    if (OB_SUCC(ret) && OB_FAIL(hs_merge_partition_tree(*target_child, *piece_child->elem_))) {
+      LOG_WARN("failed to merge partition child", KR(ret));
+    }
+  }
+  return ret;
+}
+
 // In the hybrid search op tree, a parent op may have multiple children with the same op type,
 // for example, a conjunction op contains two scalar ops:
 //  ConjunctionOp{
@@ -328,9 +556,7 @@ bool ObProfileUtil::is_hybrid_search_profile(ObProfileId id)
 //  }
 // The two scalar ops have the same profile type, but they are different index scans, so they should 
 // not be merged into one.
-// In addition, we ensure that the execution of a hybrid search op tree is single-threaded, so there
-// is no need to merge from different threads.
-// So we use register_child instead of get_or_register_child to avoid merging the same profile type.
+// Task、混搜 Partition 在有序子树同构时聚合；其余节点继续保留实例。
 // Vector Search reuses the same behavior at its root so every Partition execution instance is
 // preserved instead of being merged by VECTOR_SEARCH_PARTITION profile ID.
 int ObProfileUtil::merge_children_for_hybrid_search(ObMergedProfile &merged_profile,
@@ -339,19 +565,26 @@ int ObProfileUtil::merge_children_for_hybrid_search(ObMergedProfile &merged_prof
 {
   int ret = OB_SUCCESS;
   ObOpProfile<ObMetric>::ProfileWrap *cur_child_wrap = piece_profile->get_child_head();
-  ObOpProfile<ObMergeMetric>::ProfileWrap *merged_child_wrap = merged_profile.get_child_head();
   while (OB_SUCC(ret) && OB_NOT_NULL(cur_child_wrap)) {
     ObOpProfile<ObMergeMetric> *new_child = nullptr;
-    if (OB_FAIL(merged_profile.register_child(cur_child_wrap->elem_->get_id(), new_child))) {
+    if (cur_child_wrap->elem_->get_id() == ObProfileId::HYBRID_SEARCH_PARALLEL_TASK) {
+      if (OB_FAIL(hs_merge_task_profile(merged_profile, *cur_child_wrap->elem_))) {
+        LOG_WARN("failed to merge task profile", KR(ret));
+      }
+    } else if (merged_profile.get_id() == ObProfileId::HYBRID_SEARCH
+               && cur_child_wrap->elem_->get_id() == ObProfileId::HYBRID_SEARCH_PARTITION) {
+      if (OB_FAIL(hs_merge_partition_profile(merged_profile, *cur_child_wrap->elem_))) {
+        LOG_WARN("failed to merge hybrid search partition profile", KR(ret));
+      }
+    } else if (OB_FAIL(merged_profile.register_child(cur_child_wrap->elem_->get_id(), new_child))) {
       LOG_WARN("failed to register child", KR(ret), K(cur_child_wrap->elem_->get_id()));
     } else if (OB_ISNULL(new_child)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("new child is null", KR(ret), K(cur_child_wrap->elem_->get_id()));
     } else if (OB_FAIL(ObProfileUtil::merge_profile(*new_child, cur_child_wrap->elem_, alloc))) {
       LOG_WARN("failed to merge profile", KR(ret), K(cur_child_wrap->elem_->get_id()));
-    } else {
-      cur_child_wrap = cur_child_wrap->next_;
     }
+    cur_child_wrap = cur_child_wrap->next_;
   }
   return ret;
 }
@@ -374,7 +607,8 @@ int ObProfileUtil::inner_get_profile(ObIAllocator *alloc, int64_t tenant_id, con
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("execute sql fail", K(tenant_id), K(sql));
       }
-      while (OB_SUCC(ret) && OB_SUCC(mysql_result->next())) {
+      // 读取下一行的错误也必须返回，仅正常迭代结束可转换为成功。
+      while (OB_SUCC(ret) && OB_SUCC(ret = mysql_result->next())) {
         ObProfileItem profile_item;
         if (OB_FAIL(read_profile_from_result(alloc, *mysql_result, profile_item))) {
           LOG_WARN("failed to read profile info");

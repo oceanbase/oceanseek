@@ -188,6 +188,8 @@ int ObDbmsXprofile::flatten_op_profile(const ObIArray<ObProfileItem> &profile_it
     const ObProfileItem &item = profile_items.at(i);
     int64_t format_size = item.profile_->get_format_size() + item.plan_depth_;
     if (format_size + pos > buf_len) {
+      // 返回溢出以触发外层扩容，不能成功返回空文本或部分结果。
+      ret = OB_SIZE_OVERFLOW;
       LOG_WARN("too many profile to print", K(profile_items.count()), K(pos), K(format_size),
                K(buf_len));
       break;
