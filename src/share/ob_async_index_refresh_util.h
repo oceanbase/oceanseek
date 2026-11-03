@@ -24,8 +24,14 @@ class ObLocationService;
 class ObAsyncIndexRefreshProgress
 {
 public:
-  void reset() { targets_.reset(); succeeded_.reset(); }
-  int prepare(const common::ObIArray<obrpc::ObAsyncIndexRefreshArg> &targets);
+  void reset()
+  {
+    targets_.reset();
+    succeeded_.reset();
+    memory_tenant_id_ = common::OB_INVALID_TENANT_ID;
+  }
+  // The caller owns the local buffers; the RPC tenant may not exist on this server.
+  int prepare(const common::ObIArray<obrpc::ObAsyncIndexRefreshArg> &targets, const uint64_t memory_tenant_id);
   bool is_success(const int64_t i) const { return succeeded_.has_member(i); }
   int mark_success(const int64_t i) { return succeeded_.add_member(i); }
 private:
@@ -39,9 +45,10 @@ private:
   struct PartitionTarget
   {
     int assign(const PartitionTarget &other);
-    int init(const obrpc::ObAsyncIndexRefreshArg &arg);
+    int init(const obrpc::ObAsyncIndexRefreshArg &arg, const uint64_t memory_tenant_id);
     bool matches(const obrpc::ObAsyncIndexRefreshArg &arg) const;
     uint64_t tenant_id_ = common::OB_INVALID_TENANT_ID;
+    uint64_t memory_tenant_id_ = common::OB_INVALID_TENANT_ID;
     uint64_t data_table_id_ = common::OB_INVALID_ID;
     uint64_t tablet_id_ = common::OB_INVALID_ID;
     int64_t target_scn_ = 0;
@@ -50,6 +57,7 @@ private:
     TO_STRING_KV(K_(tenant_id), K_(data_table_id), K_(tablet_id),
         K_(target_scn), K_(refresh_type), K_(indexes));
   };
+  uint64_t memory_tenant_id_ = common::OB_INVALID_TENANT_ID;
   common::ObArray<PartitionTarget> targets_;
   common::ObBitSet<64> succeeded_;
 };
@@ -177,6 +185,7 @@ private:
     static constexpr int64_t MAX_RPC_RETRY_COUNT = 3; // Three retries after the initial attempt.
     static constexpr int64_t RETRY_INTERVAL_US = 200 * 1000;
     const uint64_t tenant_id_;
+    const uint64_t memory_tenant_id_;
     const uint64_t data_table_id_;
     const int64_t target_scn_;
     const int8_t refresh_type_;

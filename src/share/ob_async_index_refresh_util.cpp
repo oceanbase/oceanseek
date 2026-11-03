@@ -31,32 +31,35 @@ namespace share
 
 int ObAsyncIndexRefreshProgress::PartitionTarget::assign(const PartitionTarget &other)
 {
-  if (tenant_id_ != other.tenant_id_) {
+  if (memory_tenant_id_ != other.memory_tenant_id_) {
     indexes_.reset();
   }
   tenant_id_ = other.tenant_id_;
+  memory_tenant_id_ = other.memory_tenant_id_;
   data_table_id_ = other.data_table_id_;
   tablet_id_ = other.tablet_id_;
   target_scn_ = other.target_scn_;
   refresh_type_ = other.refresh_type_;
   int ret = OB_SUCCESS;
-  indexes_.set_attr(ObMemAttr(tenant_id_, "AsyncIdxPrg"));
+  indexes_.set_attr(ObMemAttr(memory_tenant_id_, "AsyncIdxPrg"));
   if (OB_FAIL(indexes_.assign(other.indexes_))) {
     LOG_WARN("failed to copy async index refresh partition target", K(ret), K(other));
   }
   return ret;
 }
 
-int ObAsyncIndexRefreshProgress::PartitionTarget::init(const obrpc::ObAsyncIndexRefreshArg &arg)
+int ObAsyncIndexRefreshProgress::PartitionTarget::init(
+    const obrpc::ObAsyncIndexRefreshArg &arg, const uint64_t memory_tenant_id)
 {
   int ret = OB_SUCCESS;
   tenant_id_ = arg.tenant_id_;
+  memory_tenant_id_ = memory_tenant_id;
   data_table_id_ = arg.data_table_id_;
   tablet_id_ = arg.tablet_id_.id();
   target_scn_ = arg.target_refresh_scn_;
   refresh_type_ = arg.refresh_type_;
   indexes_.reset();
-  indexes_.set_attr(ObMemAttr(tenant_id_, "AsyncIdxPrg"));
+  indexes_.set_attr(ObMemAttr(memory_tenant_id_, "AsyncIdxPrg"));
   for (int64_t i = 0; OB_SUCC(ret) && i < arg.index_table_ids_.count(); ++i) {
     const IndexTarget index = {arg.index_table_ids_.at(i), arg.index_tablet_ids_.at(i).id(), arg.is_delete_flags_.at(i)};
     if (OB_FAIL(indexes_.push_back(index))) {
@@ -81,10 +84,10 @@ bool ObAsyncIndexRefreshProgress::PartitionTarget::matches(const obrpc::ObAsyncI
 }
 
 int ObAsyncIndexRefreshProgress::prepare(
-    const ObIArray<obrpc::ObAsyncIndexRefreshArg> &targets)
+    const ObIArray<obrpc::ObAsyncIndexRefreshArg> &targets, const uint64_t memory_tenant_id)
 {
   int ret = OB_SUCCESS;
-  bool same = targets.count() == targets_.count();
+  bool same = memory_tenant_id_ == memory_tenant_id && targets.count() == targets_.count();
   for (int64_t i = 0; OB_SUCC(ret) && i < targets.count(); ++i) {
     if (!targets.at(i).is_valid()) {
       ret = OB_INVALID_ARGUMENT;
@@ -97,11 +100,13 @@ int ObAsyncIndexRefreshProgress::prepare(
       same = targets_.at(i).matches(targets.at(i));
     }
   }
-  if (OB_SUCC(ret) && targets.empty()) {
+  if (OB_FAIL(ret)) {
+  } else if (targets.empty()) {
     reset();
-  } else if (OB_SUCC(ret) && !same) {
+  } else if (!same) {
     reset();
-    const ObMemAttr attr(targets.at(0).tenant_id_, "AsyncIdxPrg");
+    memory_tenant_id_ = memory_tenant_id;
+    const ObMemAttr attr(memory_tenant_id_, "AsyncIdxPrg");
     targets_.set_attr(attr);
     succeeded_.set_attr(attr);
     if (OB_FAIL(targets_.prepare_allocate(targets.count()))) {
@@ -110,7 +115,7 @@ int ObAsyncIndexRefreshProgress::prepare(
       LOG_WARN("failed to reserve async index refresh success bitmap", K(ret));
     } else {
       for (int64_t i = 0; OB_SUCC(ret) && i < targets.count(); ++i) {
-        if (OB_FAIL(targets_.at(i).init(targets.at(i)))) {
+        if (OB_FAIL(targets_.at(i).init(targets.at(i), memory_tenant_id_))) {
           LOG_WARN("failed to cache async index refresh target", K(ret), K(i));
         }
       }
@@ -185,15 +190,16 @@ ObAsyncIndexRefreshUtil::RefreshDispatcher::RefreshDispatcher(
     const int64_t target_scn, const int8_t refresh_type,
     ObLocationService &location_service, obrpc::ObSrvRpcProxy &rpc_proxy,
     ObAsyncIndexRefreshProgress &progress)
-  : tenant_id_(tenant_id), data_table_id_(data_table_id), target_scn_(target_scn),
+  : tenant_id_(tenant_id), memory_tenant_id_(MTL_CTX() ? MTL_ID() : ob_thread_tenant_id()),
+    data_table_id_(data_table_id), target_scn_(target_scn),
     refresh_type_(refresh_type), refresh_rpc_timeout_(GCONF._ob_ddl_timeout),
     location_service_(location_service), progress_(progress), rpc_proxy_(rpc_proxy),
-    allocator_(ObMemAttr(tenant_id, "AsyncIdxRpc")), pending_count_(0),
+    allocator_(ObMemAttr(memory_tenant_id_, "AsyncIdxRpc")), pending_count_(0),
     round_start_ts_(ObTimeUtility::current_time()), rpc_count_(0), skipped_count_(0)
 {
   // Cancellation detection belongs to this call, not the shared RPC proxy.
   rpc_proxy_.detect_session_killed(true);
-  callbacks_.set_attr(ObMemAttr(tenant_id, "AsyncIdxRpc"));
+  callbacks_.set_attr(ObMemAttr(memory_tenant_id_, "AsyncIdxRpc"));
 }
 
 rpc::frame::ObReqTransport::AsyncCB *ObAsyncIndexRefreshUtil::RefreshDispatcher::Callback::clone(
@@ -369,7 +375,8 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::init(
     const ObIArray<bool> &is_delete_flags)
 {
   int ret = OB_SUCCESS;
-  const ObMemAttr attr(tenant_id_, "AsyncIdxPrg");
+  // DDL runs on the coordinator, which need not host the business tenant.
+  const ObMemAttr attr(memory_tenant_id_, "AsyncIdxPrg");
   args_.set_attr(attr);
   retry_states_.set_attr(attr);
   // Validate the complete target set before posting any RPC.
@@ -401,12 +408,12 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::init(
       }
     }
   }
-  if (OB_SUCC(ret) && OB_FAIL(progress_.prepare(args_))) {
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(progress_.prepare(args_, memory_tenant_id_))) {
     LOG_WARN("failed to prepare async index refresh progress", K(ret));
-  }
-  if (OB_SUCC(ret) && OB_FAIL(retry_states_.prepare_allocate(args_.count()))) {
+  } else if (OB_FAIL(retry_states_.prepare_allocate(args_.count()))) {
     LOG_WARN("failed to allocate refresh retry states", K(ret));
-  } else if (OB_SUCC(ret) && OB_FAIL(callbacks_.reserve(args_.count()))) {
+  } else if (OB_FAIL(callbacks_.reserve(args_.count()))) {
     LOG_WARN("failed to reserve async index refresh callbacks", K(ret));
   }
   return ret;
@@ -452,13 +459,12 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::send_partition(const int64_t i)
     } else if (timeout_ctx.is_timeouted()) {
       ret = OB_TIMEOUT;
       LOG_WARN("refresh RPC deadline expired before dispatch", K(ret), K(arg), K(state.deadline_));
-    }
-  }
-  if (OB_SUCC(ret)) {
-    ++rpc_count_;
-    if (OB_FAIL(post_partition(leader_addr, timeout_ctx.get_timeout(), i))) {
-      // The caller retains posting failures even when no callback was allocated.
-      LOG_WARN("failed to post async index refresh RPC", K(ret), K(arg), K(leader_addr));
+    } else {
+      ++rpc_count_;
+      if (OB_FAIL(post_partition(leader_addr, timeout_ctx.get_timeout(), i))) {
+        // The caller retains posting failures even when no callback was allocated.
+        LOG_WARN("failed to post async index refresh RPC", K(ret), K(arg), K(leader_addr));
+      }
     }
   }
   return ret;
@@ -719,12 +725,10 @@ int ObAsyncIndexDDLPublishOp::publish(const SCN &scn)
   } else if (index_table_ids_.empty() && storage::ASYNC_REFRESH_TYPE_OFFLINE_DDL == refresh_type_) {
     // All async indexes may have been dropped since target preparation.
     LOG_INFO("[ASYNC_INDEX] skip DDL publish after all indexes were dropped", K(scn), K(*this));
-  } else {
-    if (OB_FAIL(ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
-        tenant_id_, data_table_id_, scn.get_val_for_tx(), index_table_ids_, refresh_type_, progress_))) {
-      if (OB_EAGAIN != ret || REACH_TIME_INTERVAL(1000L * 1000L)) {
-        LOG_WARN("[ASYNC_INDEX] failed to refresh DDL publish snapshot", K(ret), K(scn), K(*this));
-      }
+  } else if (OB_FAIL(ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
+      tenant_id_, data_table_id_, scn.get_val_for_tx(), index_table_ids_, refresh_type_, progress_))) {
+    if (OB_EAGAIN != ret || REACH_TIME_INTERVAL(1000L * 1000L)) {
+      LOG_WARN("[ASYNC_INDEX] failed to refresh DDL publish snapshot", K(ret), K(scn), K(*this));
     }
   }
   return ret;

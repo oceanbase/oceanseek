@@ -1794,7 +1794,7 @@ TEST_F(TestAsyncIndexTrigger, ddl_fixed_snapshot_reuses_progress_without_getting
   ASSERT_EQ(OB_EAGAIN, context.refresh(publish_op, make_scn(5000)));
   ObArray<obrpc::ObAsyncIndexRefreshArg> args;
   ASSERT_NO_FATAL_FAILURE(make_refresh_targets(args));
-  ASSERT_EQ(OB_SUCCESS, context.progress_.prepare(args));
+  ASSERT_EQ(OB_SUCCESS, context.progress_.prepare(args, 1001));
   ASSERT_EQ(OB_SUCCESS, context.progress_.mark_success(0));
   ASSERT_EQ(OB_TIMEOUT, context.refresh(publish_op, make_scn(5000)));
   EXPECT_TRUE(context.progress_.is_success(0));
@@ -1832,57 +1832,57 @@ TEST_F(TestAsyncIndexTrigger, refresh_partition_progress_survives_transfer_but_n
   ObArray<obrpc::ObAsyncIndexRefreshArg> args;
   ASSERT_NO_FATAL_FAILURE(make_refresh_targets(args, 65));
   ObAsyncIndexRefreshProgress progress;
-  ASSERT_EQ(OB_SUCCESS, progress.prepare(args));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
   // Exercise both sides of bitmap word boundaries.
   const int64_t completed[] = {0, 31, 32, 63, 64};
   for (const int64_t i : completed) {
     ASSERT_EQ(OB_SUCCESS, progress.mark_success(i));
   }
   args.at(0).ls_id_ = ObLSID(2001);
-  ASSERT_EQ(OB_SUCCESS, progress.prepare(args));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
   for (int64_t i = 0; i < args.count(); ++i) {
     EXPECT_EQ(i == 0 || i == 31 || i == 32 || i == 63 || i == 64, progress.is_success(i));
   }
 
   // A new physical tablet for an existing index invalidates the old success.
   args.at(0).index_tablet_ids_.at(0) = ObTabletID(500001);
-  ASSERT_EQ(OB_SUCCESS, progress.prepare(args));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
   for (const int64_t i : completed) {
     EXPECT_FALSE(progress.is_success(i));
   }
   ASSERT_EQ(OB_SUCCESS, progress.mark_success(0));
   args.at(0).target_refresh_scn_++;
-  ASSERT_EQ(OB_SUCCESS, progress.prepare(args));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
   EXPECT_FALSE(progress.is_success(0));
   ASSERT_EQ(OB_SUCCESS, progress.mark_success(0));
   args.at(0).is_delete_flags_.at(0) = true;
-  ASSERT_EQ(OB_SUCCESS, progress.prepare(args));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
   EXPECT_FALSE(progress.is_success(0));
   ASSERT_EQ(OB_SUCCESS, progress.mark_success(0));
   // Manual refresh uses the same progress format; changing refresh type invalidates it.
   for (int64_t i = 0; i < args.count(); ++i) {
     args.at(i).refresh_type_ = ASYNC_REFRESH_TYPE_MANUAL;
   }
-  ASSERT_EQ(OB_SUCCESS, progress.prepare(args));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
   EXPECT_FALSE(progress.is_success(0));
   ASSERT_EQ(OB_SUCCESS, progress.mark_success(64));
-  ASSERT_EQ(OB_SUCCESS, progress.prepare(args));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
   EXPECT_TRUE(progress.is_success(64));
   // Shrinking the target set must also clear success bits from the old set.
   args.reset();
   ASSERT_NO_FATAL_FAILURE(make_refresh_targets(args, 2));
-  ASSERT_EQ(OB_SUCCESS, progress.prepare(args));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
   EXPECT_FALSE(progress.is_success(0));
   ASSERT_EQ(OB_SUCCESS, progress.mark_success(1));
   args.reset();
   ASSERT_NO_FATAL_FAILURE(make_refresh_targets(args, 65));
-  ASSERT_EQ(OB_SUCCESS, progress.prepare(args));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
   for (int64_t i = 0; i < args.count(); ++i) {
     EXPECT_FALSE(progress.is_success(i));
   }
   ASSERT_EQ(OB_SUCCESS, progress.mark_success(0));
   progress.reset();
-  ASSERT_EQ(OB_SUCCESS, progress.prepare(args));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(args, 1001));
   EXPECT_FALSE(progress.is_success(0));
 }
 
@@ -1914,8 +1914,9 @@ struct RefreshRpcWorkerGuard
 struct RefreshTestDispatcher : public ObAsyncIndexRefreshUtil::RefreshDispatcher
 {
   RefreshTestDispatcher(obrpc::ObSrvRpcProxy &transport, ObLocationService &location,
-      ObAsyncIndexRefreshProgress &progress)
-    : RefreshDispatcher(1001, 100001, 5000, ASYNC_REFRESH_TYPE_MANUAL, location, transport, progress), callback_(nullptr), worker_(nullptr), fail_post_(false),
+      ObAsyncIndexRefreshProgress &progress, const uint64_t tenant_id = 1001,
+      const int8_t refresh_type = ASYNC_REFRESH_TYPE_MANUAL)
+    : RefreshDispatcher(tenant_id, 100001, 5000, refresh_type, location, transport, progress), callback_(nullptr), worker_(nullptr), fail_post_(false),
       terminate_count_(0), terminated_gtid_(0), terminated_pkt_id_(0) {}
   int post_rpc(const ObAddr &, const int64_t,
       const obrpc::ObAsyncIndexRefreshArg &, Callback &cb) override
@@ -1950,7 +1951,8 @@ struct RefreshTestDispatcher : public ObAsyncIndexRefreshUtil::RefreshDispatcher
   uint32_t terminated_pkt_id_;
 };
 
-static void init_refresh_test_dispatcher(RefreshTestDispatcher &proxy, const int64_t count)
+static void init_refresh_test_dispatcher(RefreshTestDispatcher &proxy, const int64_t count,
+    const int64_t index_count = 1)
 {
   ObArray<obrpc::ObAsyncIndexRefreshArg> args;
   ASSERT_NO_FATAL_FAILURE(make_refresh_targets(args, count));
@@ -1963,9 +1965,94 @@ static void init_refresh_test_dispatcher(RefreshTestDispatcher &proxy, const int
     ASSERT_EQ(OB_SUCCESS, index_tablets.push_back(args.at(i).index_tablet_ids_.at(0)));
   }
   ObSEArray<ObSEArray<ObTabletID, 16>, 1> index_arrays;
-  ASSERT_EQ(OB_SUCCESS, index_arrays.push_back(index_tablets));
-  ASSERT_EQ(OB_SUCCESS, proxy.init(data_tablets, ls_ids, args.at(0).index_table_ids_,
-      index_arrays, args.at(0).is_delete_flags_));
+  ObSEArray<uint64_t, 4> index_ids;
+  ObSEArray<bool, 4> delete_flags;
+  ASSERT_EQ(OB_SUCCESS, index_arrays.prepare_allocate(index_count));
+  for (int64_t j = 0; j < index_count; ++j) {
+    ASSERT_EQ(OB_SUCCESS, index_arrays.at(j).assign(index_tablets));
+    ASSERT_EQ(OB_SUCCESS, index_ids.push_back(300001 + j));
+    ASSERT_EQ(OB_SUCCESS, delete_flags.push_back(false));
+  }
+  ASSERT_EQ(OB_SUCCESS, proxy.init(data_tablets, ls_ids, index_ids, index_arrays, delete_flags));
+}
+
+// The coordinator has no allocator for the RPC tenant. Exceed the inline
+// capacities of the RPC arrays, progress indexes and success bitmap.
+TEST_F(TestAsyncIndexTrigger, ddl_refresh_allocates_on_coordinator_without_business_tenant)
+{
+  constexpr uint64_t absent_tenant_id = 987654;
+  constexpr int64_t partition_count = 2049;
+  auto *allocator = lib::ObMallocAllocator::get_instance();
+  ASSERT_EQ(nullptr, allocator->get_tenant_ctx_allocator(absent_tenant_id, ObCtxIds::DEFAULT_CTX_ID));
+  ObTenantBase coordinator(OB_SYS_TENANT_ID);
+  ObTenantSwitchGuard tenant_guard(&coordinator);
+  ObAddr server;
+  ASSERT_TRUE(server.set_ip_addr("127.0.0.1", 2882));
+  for (const auto type : {ASYNC_REFRESH_TYPE_CREATE_INDEX, ASYNC_REFRESH_TYPE_OFFLINE_DDL}) {
+    SCOPED_TRACE(type);
+    obrpc::ObSrvRpcProxy transport;
+    ObLocationService location;
+    ObAsyncIndexRefreshProgress progress;
+    {
+      RefreshTestDispatcher proxy(transport, location, progress, absent_tenant_id, type);
+      ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, partition_count, 5));
+      EXPECT_EQ(OB_SYS_TENANT_ID, proxy.args_.get_block_allocator().get_attr().tenant_id_);
+      EXPECT_EQ(OB_SYS_TENANT_ID, proxy.retry_states_.get_block_allocator().get_attr().tenant_id_);
+      EXPECT_EQ(OB_SYS_TENANT_ID, proxy.callbacks_.get_block_allocator().get_attr().tenant_id_);
+      EXPECT_EQ(absent_tenant_id, proxy.args_.at(0).tenant_id_);
+      EXPECT_EQ(type, proxy.args_.at(0).refresh_type_);
+      // Allocate callbacks and exercise retry reuse without real network traffic.
+      for (int round = 0; round < 2; ++round) {
+        ASSERT_EQ(OB_SUCCESS, proxy.post_partition(server, 1000000, partition_count - 1));
+        ASSERT_EQ(OB_SUCCESS, proxy.callback_->process());
+        ASSERT_EQ(OB_SUCCESS, proxy.collect_results());
+        EXPECT_TRUE(progress.is_success(partition_count - 1));
+        proxy.reuse_callbacks();
+      }
+      ASSERT_EQ(OB_SUCCESS, progress.prepare(proxy.args_, OB_SYS_TENANT_ID));
+      EXPECT_TRUE(progress.is_success(partition_count - 1));
+      // Copying a nested target must retain its memory owner, not the RPC tenant.
+      ObAsyncIndexRefreshProgress::PartitionTarget copied;
+      ASSERT_EQ(OB_SUCCESS, copied.assign(progress.targets_.at(0)));
+      EXPECT_TRUE(copied.matches(proxy.args_.at(0)));
+      EXPECT_EQ(OB_SYS_TENANT_ID, copied.memory_tenant_id_);
+    }
+    // Progress outlives the dispatcher and remains safe to clear afterwards.
+    EXPECT_TRUE(progress.is_success(partition_count - 1));
+    progress.reset();
+    EXPECT_EQ(0, progress.targets_.count());
+    EXPECT_FALSE(progress.is_success(partition_count - 1));
+    EXPECT_EQ(nullptr, allocator->get_tenant_ctx_allocator(absent_tenant_id, ObCtxIds::DEFAULT_CTX_ID));
+  }
+}
+
+TEST_F(TestAsyncIndexTrigger, manual_refresh_charges_local_tenant_and_rebinds_progress)
+{
+  ObTenantBase tenant(1001);
+  ObTenantSwitchGuard tenant_guard(&tenant);
+  obrpc::ObSrvRpcProxy transport;
+  ObLocationService location;
+  ObAsyncIndexRefreshProgress progress;
+  RefreshTestDispatcher proxy(transport, location, progress);
+  ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, 65, 5));
+  EXPECT_EQ(1001, proxy.args_.get_block_allocator().get_attr().tenant_id_);
+  EXPECT_EQ(1001, proxy.retry_states_.get_block_allocator().get_attr().tenant_id_);
+  EXPECT_EQ(1001, proxy.callbacks_.get_block_allocator().get_attr().tenant_id_);
+  EXPECT_EQ(1001, progress.targets_.get_block_allocator().get_attr().tenant_id_);
+  ASSERT_EQ(OB_SUCCESS, progress.mark_success(64));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(proxy.args_, 1001));
+  EXPECT_TRUE(progress.is_success(64));
+  // A different local owner must not reuse buffers charged to the old owner.
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(proxy.args_, OB_SYS_TENANT_ID));
+  EXPECT_FALSE(progress.is_success(64));
+  EXPECT_EQ(OB_SYS_TENANT_ID, progress.targets_.get_block_allocator().get_attr().tenant_id_);
+  EXPECT_EQ(1001, progress.targets_.at(0).tenant_id_);
+  ObAsyncIndexRefreshProgress::PartitionTarget copied;
+  ASSERT_EQ(OB_SUCCESS, copied.assign(progress.targets_.at(0)));
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(proxy.args_, 1001));
+  ASSERT_EQ(OB_SUCCESS, copied.assign(progress.targets_.at(0)));
+  EXPECT_EQ(1001, copied.memory_tenant_id_);
+  EXPECT_TRUE(copied.matches(proxy.args_.at(0)));
 }
 
 TEST_F(TestAsyncIndexTrigger, async_refresh_transport_errors_preserve_retry_classification)
