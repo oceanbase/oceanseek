@@ -652,8 +652,7 @@ public:
     blocksstable::ObStorageObjectOpt opt;
     share::SCN reorg_min;
     reorg_min.set_min();
-    // is_object_storage = false → SHARED_TABLET_SUB_META (in_table bit set); the only
-    // variant ObTieredMetadataObjectManager accepts.
+    // Build the TABLE location; OSS tests change the location after construction.
     opt.set_ss_tablet_sub_meta_opt(ls_id.id(),
                                    tablet_id.id(),
                                    op_id,
@@ -1963,8 +1962,8 @@ TEST_F(TestSSMarkSweepGC, slice_chain_e2e)
 }
 
 // ---------------------------------------------------------------------------
-// sys_tablet_meta_double_route: verify GC classifies a sys-tenant sub-meta id
-// as double-delete when LS checkpoint is enabled.
+// sys_tablet_meta_double_route: verify the metadata manager deletes both copies
+// for a sys-tenant sub-meta ID when LS checkpoint is enabled.
 // ---------------------------------------------------------------------------
 TEST_F(TestSSMarkSweepGC, sys_tablet_meta_double_route)
 {
@@ -1981,7 +1980,6 @@ TEST_F(TestSSMarkSweepGC, sys_tablet_meta_double_route)
   uint64_t actual_data_version = 0;
   MacroBlockId in_table_id;
   MacroBlockId remote_id;
-  MacroBlockId sstable_id;
   ObTieredMetadataStore store;
   const char *data = "gc_sys_double_delete";
   const ObString meta_value(STRLEN(data), data);
@@ -2011,7 +2009,6 @@ TEST_F(TestSSMarkSweepGC, sys_tablet_meta_double_route)
   ObSharedGCTask original_history;
   ObSharedGCTask in_table_stat;
   ObSharedGCTask object_storage_stat;
-  bool need_double_delete = false;
   bool table_exist = true;
   int cleanup_ret = OB_SUCCESS;
   ASSERT_TRUE(share::ObUpgradeChecker::check_data_version_exist(DATA_VERSION_4_6_3_0));
@@ -2031,9 +2028,6 @@ TEST_F(TestSSMarkSweepGC, sys_tablet_meta_double_route)
   ASSERT_TRUE(OB_SUCCESS == cleanup_ret || OB_ENTRY_NOT_EXIST == cleanup_ret);
   ASSERT_EQ(OB_SUCCESS, build_tablet_sub_meta_macro_id_(
       ls_id, tablet_id, 23/*op_id*/, 1/*data_seq*/, in_table_id));
-  ASSERT_EQ(OB_SUCCESS, ObSSGCUtil::check_need_double_delete_(
-      OB_SYS_TENANT_ID, in_table_id, need_double_delete));
-  ASSERT_TRUE(need_double_delete);
   ASSERT_EQ(OB_SUCCESS, store.init(OB_SYS_TENANT_ID, &sql_proxy()));
   ASSERT_EQ(OB_SUCCESS, store.write_meta(
       in_table_id,
@@ -2043,15 +2037,6 @@ TEST_F(TestSSMarkSweepGC, sys_tablet_meta_double_route)
   remote_id.set_location(ObMacroBlockIdLocation::OBJECT_STORAGE);
   write_macro_block_(remote_id);
   assert_block_exists_(remote_id, true);
-  ASSERT_EQ(OB_SUCCESS, ObSSGCUtil::check_need_double_delete_(
-      tenant_id_, in_table_id, need_double_delete));
-  ASSERT_FALSE(need_double_delete);
-  ASSERT_EQ(OB_SUCCESS, build_sstable_macro_id_(
-      ObStorageObjectType::SHARED_MINI_DATA_MACRO,
-      ls_id, tablet_id, 2/*data_seq*/, sstable_id));
-  ASSERT_EQ(OB_SUCCESS, ObSSGCUtil::check_need_double_delete_(
-      OB_SYS_TENANT_ID, sstable_id, need_double_delete));
-  ASSERT_FALSE(need_double_delete);
   ASSERT_EQ(OB_SUCCESS, macro_ids.push_back(in_table_id));
   ASSERT_EQ(OB_SUCCESS, build_mark_sweep_task(alloc, ROUND_ID, TASK_ID, macro_ids, row));
   // 通用构造函数默认生成用户租户任务，SYS DAG 只扫描 SYS 租户任务。
@@ -2101,7 +2086,7 @@ TEST_F(TestSSMarkSweepGC, sys_tablet_meta_double_route)
 // ---------------------------------------------------------------------------
 // tablet_meta_in_list_e2e: a MARK_SWEEP row whose macro-id list contains
 // tablet_meta ids.  batch_delete_blocks must dispatch them into
-// tablet_meta_single → ObTieredMetadataObjectManager::batch_del_tiered_metadata
+// tablet_meta_blocks → ObTieredMetadataObjectManager::batch_del_tiered_metadata
 // instead of batch_del_files (which would reject the wrong storage type).
 // ---------------------------------------------------------------------------
 TEST_F(TestSSMarkSweepGC, tablet_meta_in_list_e2e)
@@ -2160,8 +2145,8 @@ TEST_F(TestSSMarkSweepGC, tablet_meta_in_list_e2e)
 }
 
 // ---------------------------------------------------------------------------
-// mixed_id_e2e: one row whose list contains BOTH sstable and tablet_meta ids.
-// batch_delete_blocks must split them by family and call both backends.
+// mixed_id_e2e: one row contains SSTable IDs and TABLE/OSS sub-meta IDs.
+// Both sub-meta locations use the metadata manager.
 // ---------------------------------------------------------------------------
 TEST_F(TestSSMarkSweepGC, mixed_id_e2e)
 {
@@ -2173,10 +2158,11 @@ TEST_F(TestSSMarkSweepGC, mixed_id_e2e)
   const uint32_t OP_ID = 19;
   ObArenaAllocator alloc;
 
-  // Two sstable macros + two tablet meta entries, interleaved in the list.
+  // Interleave both metadata locations with SSTable blocks in the same task.
   ObArray<MacroBlockId> macro_ids;
   MacroBlockId sst_ids[2];
   MacroBlockId tm_ids[2];
+  MacroBlockId remote_meta_id;
   {
     share::ObTenantSwitchGuard guard;
     ASSERT_EQ(OB_SUCCESS, guard.switch_to(tenant_id_));
@@ -2192,9 +2178,14 @@ TEST_F(TestSSMarkSweepGC, mixed_id_e2e)
       write_tablet_meta_entry_(tm_ids[i]);
       assert_tablet_meta_exists_(tm_ids[i], true);
     }
-    // Interleave to make sure the dispatch loop doesn't depend on order.
+    ASSERT_EQ(OB_SUCCESS, build_tablet_sub_meta_macro_id_(
+        LS_ID, TABLET_ID, OP_ID, 2/*data_seq*/, remote_meta_id));
+    remote_meta_id.set_location(ObMacroBlockIdLocation::OBJECT_STORAGE);
+    ASSERT_NO_FATAL_FAILURE(write_macro_block_(remote_meta_id));
+    ASSERT_NO_FATAL_FAILURE(assert_block_exists_(remote_meta_id, true));
     ASSERT_EQ(OB_SUCCESS, macro_ids.push_back(sst_ids[0]));
     ASSERT_EQ(OB_SUCCESS, macro_ids.push_back(tm_ids[0]));
+    ASSERT_EQ(OB_SUCCESS, macro_ids.push_back(remote_meta_id));
     ASSERT_EQ(OB_SUCCESS, macro_ids.push_back(sst_ids[1]));
     ASSERT_EQ(OB_SUCCESS, macro_ids.push_back(tm_ids[1]));
   }
@@ -2215,16 +2206,20 @@ TEST_F(TestSSMarkSweepGC, mixed_id_e2e)
       assert_block_exists_(sst_ids[i], false);
       assert_tablet_meta_exists_(tm_ids[i], false);
     }
+    ASSERT_NO_FATAL_FAILURE(assert_block_exists_(remote_meta_id, false));
     int64_t sstable_macro_cnt = -1;
     int64_t tablet_sub_meta_cnt = -1;
     ASSERT_EQ(OB_SUCCESS, ObSSGCUtil::batch_delete_blocks(
         tenant_id_, macro_ids, sstable_macro_cnt, tablet_sub_meta_cnt));
     ASSERT_EQ(2, sstable_macro_cnt);
-    ASSERT_EQ(2, tablet_sub_meta_cnt);
+    ASSERT_EQ(3, tablet_sub_meta_cnt);
   }
 
   ObSharedGCTaskKey key(tenant_id_, ObSharedGCTaskType::MARK_SWEEP_GC,
                         ROUND_ID, TASK_ID);
+  ObSharedGCTask history_row;
+  ASSERT_EQ(OB_SUCCESS,
+      ObSharedGCTaskTableOperator::get_history(key, alloc, sql_proxy(), history_row));
   ASSERT_EQ(OB_SUCCESS,
             ObSharedGCTaskTableOperator::delete_history(key, sql_proxy()));
 }

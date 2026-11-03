@@ -545,21 +545,6 @@ bool ObSSGCUtil::is_sstable_block_(const MacroBlockId &id)
   return SSObjUtil::is_shared(id) && (SSObjUtil::is_macro(id) || SSObjUtil::is_major(id));
 }
 
-int ObSSGCUtil::check_need_double_delete_(
-    const uint64_t tenant_id,
-    const MacroBlockId &id,
-    bool &need_double_delete)
-{
-  int ret = OB_SUCCESS;
-  need_double_delete = false;
-  if (!SSObjUtil::is_shared_tablet_sub_meta_in_table(id)) {
-    // Only tablet sub-meta can use the tiered-metadata double-delete route.
-  } else if (OB_FAIL(check_double_route_ss_meta(tenant_id, need_double_delete))) {
-    LOG_WARN("fail to check gc needs double delete ss_meta", KR(ret), K(tenant_id), K(id));
-  }
-  return ret;
-}
-
 int ObSSGCUtil::is_exist_block(const MacroBlockId &block_id, bool &is_exist)
 {
   int ret = OB_SUCCESS;
@@ -599,59 +584,41 @@ int ObSSGCUtil::batch_delete_blocks(
     // empty list, just return success
     LOG_INFO("empty block_ids, skip", K(tenant_id));
   } else {
-    // SSTABLE (mini/minor/major/prewarm) is always single-delete. tablet_meta is
-    // single-delete on user/meta tenants and double-delete on the sys tenant.
-    ObSEArray<MacroBlockId, OB_DEFAULT_SE_ARRAY_COUNT> sstable_single;
-    ObSEArray<MacroBlockId, OB_DEFAULT_SE_ARRAY_COUNT> tablet_meta_single;
-    ObSEArray<MacroBlockId, OB_DEFAULT_SE_ARRAY_COUNT> tablet_meta_double;
-    sstable_single.set_attr(ObMemAttr(tenant_id, "GCSSTSingle"));
-    tablet_meta_single.set_attr(ObMemAttr(tenant_id, "GCTMSingle"));
-    tablet_meta_double.set_attr(ObMemAttr(tenant_id, "GCTMDouble"));
-    bool has_checked_tablet_meta_delete = false;
-    bool need_double_delete = false;
+    ObSEArray<MacroBlockId, OB_DEFAULT_SE_ARRAY_COUNT> sstable_blocks;
+    ObSEArray<MacroBlockId, OB_DEFAULT_SE_ARRAY_COUNT> tablet_meta_blocks;
+    sstable_blocks.set_attr(ObMemAttr(tenant_id, "GCSSTBlocks"));
+    tablet_meta_blocks.set_attr(ObMemAttr(tenant_id, "GCTMBlocks"));
 
     for (int64_t i = 0; OB_SUCC(ret) && i < block_ids.count(); ++i) {
       const MacroBlockId &id = block_ids.at(i);
       if (is_sstable_block_(id)) {
-        if (OB_FAIL(sstable_single.push_back(id))) {
+        if (OB_FAIL(sstable_blocks.push_back(id))) {
           LOG_WARN("fail to push sstable id", KR(ret), K(id));
         }
-      } else if (SSObjUtil::is_shared_tablet_sub_meta_in_table(id)) {
-        if (!has_checked_tablet_meta_delete) {
-          if (OB_FAIL(check_need_double_delete_(tenant_id, id, need_double_delete))) {
-            LOG_WARN("failed to classify tablet metadata delete",
-                     KR(ret), K(tenant_id), K(id));
-          } else {
-            has_checked_tablet_meta_delete = true;
-          }
-        }
-        if (OB_SUCCESS != ret) {
-        } else if (need_double_delete) {
-          if (OB_FAIL(tablet_meta_double.push_back(id))) {
-            LOG_WARN("fail to push tablet meta double id", KR(ret), K(id));
-          }
-        } else {
-          if (OB_FAIL(tablet_meta_single.push_back(id))) {
-            LOG_WARN("fail to push tablet meta single id", KR(ret), K(id));
-          }
+      } else if (SSObjUtil::is_shared_tablet_sub_meta_in_table(id)
+          || SSObjUtil::is_shared_tablet_sub_meta(id)) {
+        // is_shared_tablet_sub_meta_in_table() matches TABLE.
+        // is_shared_tablet_sub_meta() matches OBJECT_STORAGE for LINKED_BLOCK.
+        if (OB_FAIL(tablet_meta_blocks.push_back(id))) {
+          LOG_WARN("fail to push tablet meta id", KR(ret), K(id));
         }
       } else {
         ret = OB_NOT_SUPPORTED;
-        LOG_WARN("unsupported storage object type for batch delete",
+        LOG_ERROR("unsupported storage object type for batch delete",
             KR(ret), "type", id.storage_object_type(), K(id));
       }
     }
 
-    if (OB_SUCC(ret) && !sstable_single.empty()) {
+    if (OB_SUCC(ret) && !sstable_blocks.empty()) {
       if (OB_FAIL(ObRemoteIoAdapter::batch_del_files(
-          tenant_id, sstable_single, GCONF.observer_id))) {
+          tenant_id, sstable_blocks, GCONF.observer_id))) {
         if (OB_NO_SUCH_FILE_OR_DIRECTORY == ret) {
           LOG_INFO("some sstable blocks do not exist, skip",
-              K(tenant_id), "count", sstable_single.count());
+              K(tenant_id), "count", sstable_blocks.count());
           ret = OB_SUCCESS;
         } else {
           LOG_WARN("fail to batch del sstable blocks", KR(ret), K(tenant_id),
-              "count", sstable_single.count());
+              "count", sstable_blocks.count());
         }
       }
     }
@@ -668,29 +635,16 @@ int ObSSGCUtil::batch_delete_blocks(
         tenant_id,
         tablet_meta_io_timeout_us);
 
-    if (OB_SUCC(ret) && !tablet_meta_single.empty()) {
-      if (OB_FAIL(ObTieredMetadataObjectManager::batch_del_tiered_metadata(tablet_meta_single))) {
+    if (OB_SUCC(ret) && !tablet_meta_blocks.empty()) {
+      if (OB_FAIL(ObTieredMetadataObjectManager::batch_del_tiered_metadata(tablet_meta_blocks))) {
         LOG_WARN("fail to batch del tablet meta tiered metadata", KR(ret), K(tenant_id),
-            "count", tablet_meta_single.count());
+            "count", tablet_meta_blocks.count());
       }
     }
 
-    if (OB_SUCC(ret) && !tablet_meta_double.empty()) {
-      // TODO(likaiying.lky): Step 1: call batch_del_tiered_metadata() above for
-      // the tiered-metadata side. sys tenant now use single-delete for tablet meta because
-      // sys tenant now use single-write API.
-      // TODO(likaiying.lky): Step 2: call the sys-tenant tablet meta
-      // double-delete API once it is ready to remove the inner-table row.
-      if (OB_FAIL(ObTieredMetadataObjectManager::batch_del_tiered_metadata(tablet_meta_double))) {
-        LOG_WARN("fail to batch del tablet meta tiered metadata", KR(ret), K(tenant_id),
-            "count", tablet_meta_double.count());
-      }
-    }
-    // TODO(likaiying.lky): Step 3: The first-level meta calls the deletion interface, 
-    // the ObSSMetaService deletion interface, and waits for the interface to be ready.
     if (OB_SUCC(ret)) {
-      sstable_macro_cnt = sstable_single.count();
-      tablet_sub_meta_cnt = tablet_meta_single.count() + tablet_meta_double.count();
+      sstable_macro_cnt = sstable_blocks.count();
+      tablet_sub_meta_cnt = tablet_meta_blocks.count();
     }
   }
   return ret;

@@ -149,10 +149,9 @@ public:
    * The input may mix SSTABLE and tablet-meta block ids. Internally the function
    * partitions block_ids by storage_object_type():
    *   - SSTABLE-family   -> ObRemoteIoAdapter::batch_del_files
-   *   - tablet-meta-family -> batch_del_tiered_metadata (TODO, placeholder log)
-   * Each family is further split into single-delete and double-delete (tablet
-   * meta needs both the object-storage object and the inner-table row removed;
-   * double-delete API also TODO).
+   *   - tablet-meta-family -> batch_del_tiered_metadata
+   * Tablet sub-meta ids may use TABLE or OBJECT_STORAGE locations. The tiered
+   * metadata manager routes deletion by location and applies the TABLE delete policy.
    * Unknown storage_object_type returns OB_NOT_SUPPORTED.
    *
    * Output counts report successfully processed input ids, including already
@@ -173,9 +172,6 @@ public:
 
 private:
   static bool is_sstable_block_(const blocksstable::MacroBlockId &id);
-  static int check_need_double_delete_(
-      const uint64_t tenant_id, const blocksstable::MacroBlockId &id,
-      bool &need_double_delete);
 
   /**
    * 从 __all_tenant.gmt_create 获取租户的创建时间（微秒）。
