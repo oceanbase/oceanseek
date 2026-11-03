@@ -205,9 +205,12 @@ private:
   int clear_drop_history_();
 
 private:
+  friend class ObLTableBGTaskTestPeer;
+
   // compile-time constants, not configurable
   static const int64_t SCHEDULER_PERIOD_US = 1 * 1000 * 1000; // 1s
   static const int64_t TASK_INTERVAL_US = 10 * 1000 * 1000; // 10s
+  static const int64_t DROP_RETRY_INTERVAL_US = 30L * 1000 * 1000;
   static const int64_t DELETE_BATCH_LIMIT = 1000;
   static const int64_t SCAN_LIMIT = 100;
   static const int64_t HISTORY_CLEANUP_BATCH_LIMIT = 1000;

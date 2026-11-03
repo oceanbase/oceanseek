@@ -258,6 +258,9 @@ public:
   int get_ivf_cache_mgr_guard(const ObIvfCacheMgrKey& cachr_mgr_key, ObIvfCacheMgrGuard &cache_mgr_guard);
   int mark_namespace_cache_deleted(const common::ObTabletID &tablet_id,
                                    int64_t namespace_id);
+  int mark_ltable_cache_deleted(const common::ObTabletID &tablet_id,
+                                int64_t namespace_id,
+                                uint64_t ltable_id);
   int reclaim_deleted_ivf_caches();
   int get_or_create_ivf_cache_mgr_guard(ObIAllocator &allocator,
                                         const ObIvfCacheMgrKey &key,
@@ -315,8 +318,6 @@ public:
   // for virtual table
   int get_snapshot_tablet_ids(ObIArray<obrpc::ObLSTabletPair> &complete_tablet_ids,  ObIArray<obrpc::ObLSTabletPair> &partial_tablet_ids);
   int get_cache_keys(ObLSID &ls_id, ObIArray<ObLSCacheMgrKeyPair> &cache_keys);
-  int release_ivf_cache_by_namespace_(int64_t namespace_id);
-  int release_ivf_cache_by_ltable_(int64_t namespace_id, uint64_t ltable_id);
 
   int get_migration_adaptor_list(common::ObIArray<storage::ObMigrationVectorIndexAdaptorMeta> &adaptor_metas);
   int batch_create_adaptor_shells(
@@ -539,11 +540,12 @@ public:
                               ObIndexType type,
                               ObString &vec_index_param);
   int erase_ivf_build_helper(ObLSID ls_id, const ObIvfHelperKey &key, bool *fully_cleared = nullptr);
-  int release_ivf_cache_by_namespace(int64_t namespace_id);
   int mark_namespace_cache_deleted(const common::ObTabletID &tablet_id,
                                    int64_t namespace_id);
+  int mark_ltable_cache_deleted(const common::ObTabletID &tablet_id,
+                                int64_t namespace_id,
+                                uint64_t ltable_id);
   int reclaim_deleted_ivf_caches(const share::ObLSID &ls_id);
-  int release_ivf_cache_by_ltable(int64_t namespace_id, uint64_t ltable_id);
   int acquire_vector_index_mgr(ObLSID ls_id,
                              ObPluginVectorIndexMgr *&mgr,
                              const bool check_ls_exist = true);

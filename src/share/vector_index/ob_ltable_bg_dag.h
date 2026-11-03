@@ -18,6 +18,8 @@ namespace oceanbase
 namespace share
 {
 
+class ObLTableBGTaskTestPeer;
+
 // ---- Task Type Enum ----
 
 enum ObLTableBGTaskType
@@ -104,6 +106,8 @@ public:
   virtual int process() override;
 
 private:
+  friend class ObLTableBGTaskTestPeer;
+
   int process_ltable_delete_();
   int process_namespace_delete_();
   int process_hot_ns_expire_();

@@ -1960,26 +1960,6 @@ int ObPluginVectorIndexService::get_cache_keys(ObIArray<ObLSCacheMgrKeyPair> &ca
   return ret;
 }
 
-int ObPluginVectorIndexService::release_ivf_cache_by_namespace(int64_t namespace_id)
-{
-  int ret = OB_SUCCESS;
-  TCRWLock::RLockGuard lock_guard(ls_mgr_map_rwlock_);
-  FOREACH_X(iter, index_ls_mgr_map_, OB_SUCC(ret)) {
-    ObPluginVectorIndexMgr *ls_mgr = iter->second;
-    if (OB_ISNULL(ls_mgr)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("[IVF_CACHE] ls mgr is null", K(ret));
-    } else {
-      int tmp_ret = OB_SUCCESS;
-      if (OB_TMP_FAIL(ls_mgr->release_ivf_cache_by_namespace_(namespace_id))) {
-        LOG_WARN("[IVF_CACHE] fail to release ivf cache for namespace in ls",
-                 K(tmp_ret), K(namespace_id), K(iter->first));
-      }
-    }
-  }
-  return ret;
-}
-
 int ObPluginVectorIndexService::mark_namespace_cache_deleted(
     const ObTabletID &tablet_id, const int64_t namespace_id)
 {
@@ -2006,6 +1986,34 @@ int ObPluginVectorIndexService::mark_namespace_cache_deleted(
   return ret;
 }
 
+int ObPluginVectorIndexService::mark_ltable_cache_deleted(
+    const ObTabletID &tablet_id, const int64_t namespace_id, const uint64_t ltable_id)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!tablet_id.is_valid()
+      || ObIvfCacheMgrKey::INVALID_NS_ID == namespace_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid ltable cache identity", K(ret), K(tablet_id),
+             K(namespace_id), K(ltable_id));
+  } else {
+    TCRWLock::RLockGuard lock(ls_mgr_map_rwlock_);
+    FOREACH_X(iter, index_ls_mgr_map_, OB_SUCC(ret)) {
+      if (OB_ISNULL(iter->second)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("LS vector index mgr is null", K(ret), K(iter->first));
+      } else if (OB_FAIL(iter->second->mark_ltable_cache_deleted(
+                     tablet_id, namespace_id, ltable_id))) {
+        LOG_WARN("failed to mark ltable IVF cache deleted", K(ret), K(tablet_id),
+                 K(namespace_id), K(ltable_id), K(iter->first));
+      } else if (OB_FAIL(iter->second->reclaim_deleted_ivf_caches())) {
+        LOG_WARN("failed to reclaim unreferenced ltable IVF cache", K(ret), K(tablet_id),
+                 K(namespace_id), K(ltable_id), K(iter->first));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObPluginVectorIndexService::reclaim_deleted_ivf_caches(const share::ObLSID &ls_id)
 {
   int ret = OB_SUCCESS;
@@ -2022,33 +2030,6 @@ int ObPluginVectorIndexService::reclaim_deleted_ivf_caches(const share::ObLSID &
     LOG_WARN("LS vector index mgr is null", K(ret), K(ls_id));
   } else if (OB_FAIL(ls_mgr->reclaim_deleted_ivf_caches())) {
     LOG_WARN("failed to reclaim deleted IVF caches", K(ret), K(ls_id));
-  }
-  return ret;
-}
-
-int ObPluginVectorIndexService::release_ivf_cache_by_ltable(int64_t namespace_id,
-                                                            uint64_t ltable_id)
-{
-  int ret = OB_SUCCESS;
-  TCRWLock::RLockGuard lock_guard(ls_mgr_map_rwlock_);
-  FOREACH(iter, index_ls_mgr_map_) {
-    ObPluginVectorIndexMgr *ls_mgr = iter->second;
-    if (OB_ISNULL(ls_mgr)) {
-      if (OB_SUCC(ret)) {
-        ret = OB_ERR_UNEXPECTED;
-      }
-      LOG_WARN("[IVF_CACHE] ls mgr is null", K(ret), K(iter->first));
-    } else {
-      const int tmp_ret =
-          ls_mgr->release_ivf_cache_by_ltable_(namespace_id, ltable_id);
-      if (OB_SUCCESS != tmp_ret) {
-        LOG_WARN("[IVF_CACHE] fail to release ivf cache for ltable in ls",
-                 K(tmp_ret), K(namespace_id), K(ltable_id), K(iter->first));
-        if (OB_SUCC(ret)) {
-          ret = tmp_ret;
-        }
-      }
-    }
   }
   return ret;
 }
@@ -2206,77 +2187,6 @@ int ObPluginVectorIndexMgr::erase_ivf_cache_mgr(const ObIvfCacheMgrKey &cachr_mg
   return ret;
 }
 
-int ObPluginVectorIndexMgr::release_ivf_cache_by_namespace_(int64_t namespace_id)
-{
-  int ret = OB_SUCCESS;
-  common::ObSEArray<ObIvfCacheMgrKey, 16> keys_to_erase;
-  // Phase 1: collect matching keys under read lock
-  {
-    RLockGuard guard(ivf_cache_mgr_map_rwlock_);
-    FOREACH(iter, ivf_cache_mgr_map_) {
-      if (iter->first.namespace_id_ == namespace_id) {
-        if (OB_FAIL(keys_to_erase.push_back(iter->first))) {
-          LOG_WARN("[IVF_CACHE] fail to collect key for ns eviction",
-                   K(ret), K(namespace_id));
-          break;
-        }
-      }
-    }
-  }
-  // Phase 2: erase collected keys under write lock
-  if (OB_SUCC(ret)) {
-    for (int64_t i = 0; i < keys_to_erase.count(); i++) {
-      int tmp_ret = OB_SUCCESS;
-      if (OB_TMP_FAIL(erase_ivf_cache_mgr(keys_to_erase.at(i)))) {
-        if (OB_HASH_NOT_EXIST != tmp_ret) {
-          LOG_WARN("[IVF_CACHE] fail to erase cache mgr for ns eviction",
-                   K(tmp_ret), K(keys_to_erase.at(i)));
-        }
-      }
-    }
-  }
-  return ret;
-}
-
-int ObPluginVectorIndexMgr::release_ivf_cache_by_ltable_(int64_t namespace_id,
-                                                         uint64_t ltable_id)
-{
-  int ret = OB_SUCCESS;
-  int first_erase_ret = OB_SUCCESS;
-  common::ObSEArray<ObIvfCacheMgrKey, 16> keys_to_erase;
-  // Phase 1: collect matching keys under read lock
-  {
-    RLockGuard guard(ivf_cache_mgr_map_rwlock_);
-    FOREACH(iter, ivf_cache_mgr_map_) {
-      if (iter->first.namespace_id_ == namespace_id
-          && iter->first.ltable_id_ == ltable_id) {
-        if (OB_FAIL(keys_to_erase.push_back(iter->first))) {
-          LOG_WARN("[IVF_CACHE] fail to collect key for ltable eviction",
-                   K(ret), K(namespace_id), K(ltable_id));
-          break;
-        }
-      }
-    }
-  }
-  // Phase 2: erase collected keys under write lock
-  if (OB_SUCC(ret)) {
-    for (int64_t i = 0; i < keys_to_erase.count(); i++) {
-      const int tmp_ret = erase_ivf_cache_mgr(keys_to_erase.at(i));
-      if (OB_SUCCESS != tmp_ret && OB_HASH_NOT_EXIST != tmp_ret) {
-        LOG_WARN("[IVF_CACHE] fail to erase cache mgr for ltable eviction",
-                 K(tmp_ret), K(keys_to_erase.at(i)));
-        if (OB_SUCC(first_erase_ret)) {
-          first_erase_ret = tmp_ret;
-        }
-      }
-    }
-    if (OB_SUCCESS != first_erase_ret) {
-      ret = first_erase_ret;
-    }
-  }
-  return ret;
-}
-
 int ObPluginVectorIndexMgr::get_ivf_cache_mgr(const ObIvfCacheMgrKey& cachr_mgr_key, ObIvfCacheMgr *&cache_mgr)
 {
   int ret = OB_SUCCESS;
@@ -2324,6 +2234,29 @@ int ObPluginVectorIndexMgr::mark_namespace_cache_deleted(
       ObIvfCacheMgr *cache_mgr = iter->second;
       if (iter->first.tablet_id_ == tablet_id
           && iter->first.namespace_id_ == namespace_id
+          && OB_NOT_NULL(cache_mgr)) {
+        cache_mgr->mark_delete_pending();
+      }
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexMgr::mark_ltable_cache_deleted(
+    const ObTabletID &tablet_id, const int64_t namespace_id, const uint64_t ltable_id)
+{
+  int ret = OB_SUCCESS;
+  if (!tablet_id.is_valid() || ObIvfCacheMgrKey::INVALID_NS_ID == namespace_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid ltable cache identity", K(ret), K(tablet_id),
+             K(namespace_id), K(ltable_id));
+  } else {
+    WLockGuard lock_guard(ivf_cache_mgr_map_rwlock_);
+    FOREACH(iter, ivf_cache_mgr_map_) {
+      ObIvfCacheMgr *cache_mgr = iter->second;
+      if (iter->first.tablet_id_ == tablet_id
+          && iter->first.namespace_id_ == namespace_id
+          && iter->first.ltable_id_ == ltable_id
           && OB_NOT_NULL(cache_mgr)) {
         cache_mgr->mark_delete_pending();
       }

@@ -378,8 +378,9 @@ int ObLTableBGDeleteTask::process_namespace_delete_()
       LOG_TRACE("[LTABLE_BG] delete hot table entry failed (ignored)",
                 K(tmp_ret));
     }
-    if (OB_TMP_FAIL(release_ivf_cache_for_namespace_())) {
-      LOG_DEBUG("[LTABLE_BG] release ivf cache failed (ignored)", K(tmp_ret));
+    if (OB_FAIL(release_ivf_cache_for_namespace_())) {
+      LOG_WARN("[LTABLE_BG] fail to release namespace IVF cache, keep task incomplete",
+               K(ret), K_(ctx));
     }
   }
   if (OB_SUCC(ret)) {
@@ -721,13 +722,19 @@ int ObLTableBGDeleteTask::delete_hot_table_entry_(common::ObISQLClient &sql_clie
 int ObLTableBGDeleteTask::release_ivf_cache_for_namespace_()
 {
   int ret = OB_SUCCESS;
+  bool has_ivf_cache = false;
+  ObTabletID cache_tablet_id;
   ObPluginVectorIndexService *service = MTL(ObPluginVectorIndexService *);
   if (OB_ISNULL(service)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[LTABLE_BG] vector index service is null", K(ret), K(ctx_.tenant_id_));
-  } else if (OB_FAIL(service->release_ivf_cache_by_namespace(ctx_.namespace_id_))) {
-    LOG_WARN("[LTABLE_BG] fail to release ivf cache for namespace",
-             K(ret), K(ctx_.namespace_id_));
+  } else if (OB_FAIL(resolve_hot_ns_cache_tablet_(cache_tablet_id, has_ivf_cache))) {
+    LOG_WARN("[LTABLE_BG] fail to resolve namespace cache identity", K(ret), K_(ctx));
+  } else if (has_ivf_cache
+             && OB_FAIL(service->mark_namespace_cache_deleted(
+                 cache_tablet_id, ctx_.namespace_id_))) {
+    LOG_WARN("[LTABLE_BG] fail to mark namespace IVF cache deleted",
+             K(ret), K(cache_tablet_id), K(ctx_.namespace_id_));
   }
   return ret;
 }
@@ -735,23 +742,28 @@ int ObLTableBGDeleteTask::release_ivf_cache_for_namespace_()
 int ObLTableBGDeleteTask::release_ivf_cache_for_ltable_()
 {
   int ret = OB_SUCCESS;
+  bool has_ivf_cache = false;
+  ObTabletID cache_tablet_id;
   ObPluginVectorIndexService *service = MTL(ObPluginVectorIndexService *);
   const uint64_t ltable_id = static_cast<uint64_t>(ctx_.ltable_id_);
   if (OB_ISNULL(service)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[LTABLE_BG] vector index service is null", K(ret), K(ctx_.tenant_id_));
-  } else {
+  } else if (OB_FAIL(resolve_hot_ns_cache_tablet_(cache_tablet_id, has_ivf_cache))) {
+    LOG_WARN("[LTABLE_BG] fail to resolve ltable cache identity", K(ret), K_(ctx));
+  } else if (has_ivf_cache) {
     for (int64_t attempt = 1;
          attempt <= LTABLE_IVF_CACHE_RELEASE_MAX_ATTEMPTS;
          ++attempt) {
-      ret = service->release_ivf_cache_by_ltable(ctx_.namespace_id_, ltable_id);
+      ret = service->mark_ltable_cache_deleted(
+          cache_tablet_id, ctx_.namespace_id_, ltable_id);
       if (OB_SUCC(ret)) {
-        LOG_INFO("[LTABLE_BG] released ivf cache for ltable",
-                 K(attempt), K(ctx_.namespace_id_), K(ltable_id));
+        LOG_INFO("[LTABLE_BG] marked ltable IVF cache deleted",
+                 K(attempt), K(cache_tablet_id), K(ctx_.namespace_id_), K(ltable_id));
         break;
       } else {
-        LOG_WARN("[LTABLE_BG] fail to release ivf cache for ltable",
-                 K(ret), K(attempt), K(ctx_.namespace_id_), K(ltable_id));
+        LOG_WARN("[LTABLE_BG] fail to mark ltable IVF cache deleted",
+                 K(ret), K(attempt), K(cache_tablet_id), K(ctx_.namespace_id_), K(ltable_id));
         if (attempt < LTABLE_IVF_CACHE_RELEASE_MAX_ATTEMPTS) {
           ob_usleep(LTABLE_IVF_CACHE_RELEASE_RETRY_INTERVAL_US);
         }
@@ -988,7 +1000,7 @@ int ObLTableBGDeleteTask::fail_drop_task_(int error_ret)
   // error-name constants ([A-Z_]+); no escaping needed.
   // Step 1: archive to history with FAILED status
   if (OB_SUCC(ret) && OB_FAIL(sql.assign_fmt(
-          "INSERT IGNORE INTO %s "
+          "INSERT INTO %s "
           "(gmt_create, gmt_modified, tenant_id, database_id, collection_id, namespace_id, "
           " ltable_id, tablet_id, database_name, collection_name, namespace_name, "
           " ltable_name, operation_type, operation_status, "
@@ -1002,7 +1014,12 @@ int ObLTableBGDeleteTask::fail_drop_task_(int error_ret)
           "WHERE tenant_id = %ld AND database_id = %lu "
           "  AND collection_id = '%s' "
           "  AND namespace_id = %ld AND ltable_id = %ld"
-          "  AND tablet_id = %ld",
+          "  AND tablet_id = %ld "
+          // Refresh the cooldown after each failed attempt, without replacing a
+          // COMPLETED record written by another DAG.
+          "ON DUPLICATE KEY UPDATE "
+          "gmt_modified = IF(operation_status = 'FAILED', VALUES(gmt_modified), gmt_modified), "
+          "ret_code = IF(operation_status = 'FAILED', VALUES(ret_code), ret_code)",
           OB_ALL_AGENT_DB_BACKGROUND_TASK_HISTORY_TNAME,
           ret_code_str,
           OB_ALL_AGENT_DB_BACKGROUND_TASK_TNAME,

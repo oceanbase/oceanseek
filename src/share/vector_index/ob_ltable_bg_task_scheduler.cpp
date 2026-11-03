@@ -281,10 +281,8 @@ int ObLTableBGTaskScheduler::scan_and_schedule_ltable_delete_()
           LOG_WARN("[LTABLE_BG] fail to check ltable delete terminal failure",
                    K(tmp_ret), K(entry));
         } else if (is_failed) {
-          // Cache eviction has already exhausted its three in-DAG attempts.
-          // Keep the recyclebin mapping for diagnosis/manual recovery, but do
-          // not submit the same permanently failing task forever.
-          LOG_WARN("[LTABLE_BG] ltable delete is terminal FAILED, skip reschedule",
+          // A permanent failure or a transient failure still in its cooldown.
+          LOG_TRACE("[LTABLE_BG] ltable delete retry is blocked",
                    K(entry));
           last_scanned_ltable_id_ = entry.ltable_id_;
         } else if (OB_TMP_FAIL(get_cached_kv_data_table_id_(
@@ -396,6 +394,7 @@ int ObLTableBGTaskScheduler::scan_and_schedule_namespace_delete_()
         int tmp_ret = OB_SUCCESS;
         ObNamespaceDroppedEntry &entry = entries.at(i);
         bool is_completed = false;
+        bool is_failed = false;
         int64_t ltable_count = 0;
         uint64_t kv_data_table_id = OB_INVALID_ID;
         bool is_local = false;
@@ -413,6 +412,13 @@ int ObLTableBGTaskScheduler::scan_and_schedule_namespace_delete_()
           } else {
             last_scanned_namespace_id_ = entry.namespace_id_;
           }
+        } else if (OB_TMP_FAIL(check_drop_task_failed_(
+                       entry.collection_id_, entry.namespace_id_, -1,
+                       entry.recycle_time_us_, "NAMESPACE_DELETE", is_failed))) {
+          LOG_WARN("[LTABLE_BG] fail to check namespace delete failure", K(tmp_ret), K(entry));
+        } else if (is_failed) {
+          LOG_TRACE("[LTABLE_BG] namespace delete retry is blocked", K(entry));
+          last_scanned_namespace_id_ = entry.namespace_id_;
         } else if (OB_TMP_FAIL(count_ltables_under_namespace_(
                 entry.collection_id_, entry.namespace_id_, ltable_count))) {
           LOG_WARN("[LTABLE_BG] fail to count ltables under namespace",
@@ -1892,10 +1898,18 @@ int ObLTableBGTaskScheduler::check_drop_task_failed_(
           "WHERE tenant_id = %lu AND database_id = %lu "
           "AND collection_id = '%s' AND namespace_id = %ld AND ltable_id = %ld "
           "AND operation_type = '%s' AND operation_status = 'FAILED' "
-          "AND gmt_modified >= usec_to_time(%ld)",
+          "AND gmt_modified >= usec_to_time(%ld) "
+          // Keep permanent failures terminal. Transient failures become eligible
+          // again after a persisted cooldown, including after a leader switch.
+          "AND (ret_code NOT IN ('OB_EAGAIN', 'OB_TIMEOUT', 'OB_TRANS_TIMEOUT', "
+          "'OB_NEED_RETRY', 'OB_NOT_MASTER', 'OB_LS_NOT_EXIST', "
+          "'OB_PARTITION_NOT_EXIST', 'OB_LOCATION_NOT_EXIST', "
+          "'OB_SCHEMA_EAGAIN', 'OB_TENANT_SCHEMA_NOT_FULL', 'OB_ERR_REMOTE_SCHEMA_NOT_FULL', "
+          "'OB_ALLOCATE_MEMORY_FAILED', 'OB_ENTRY_NOT_EXIST') "
+          "OR gmt_modified > DATE_SUB(now(6), INTERVAL %ld MICROSECOND))",
           OB_ALL_AGENT_DB_BACKGROUND_TASK_HISTORY_TNAME,
           tenant_id_, sdk_database_id_, collection_id, namespace_id,
-          ltable_id, operation_type, recycle_time_us))) {
+          ltable_id, operation_type, recycle_time_us, DROP_RETRY_INTERVAL_US))) {
     LOG_WARN("[LTABLE_BG] fail to construct failure check sql", K(ret));
   } else {
     SMART_VAR(common::ObMySQLProxy::MySQLResult, res) {
