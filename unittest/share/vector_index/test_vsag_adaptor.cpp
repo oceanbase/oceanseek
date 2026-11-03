@@ -215,7 +215,7 @@ TEST_F(TestVsagAdaptor, test_hnsw)
 {
   ASSERT_TRUE(obvsag::is_init());
   obvsag::VectorIndexPtr index_handler = nullptr;
-  int dim = 1536;
+  int dim = 64;
   int max_degree = 16;
   int ef_search = 200;
   int ef_construction = 100;
@@ -797,7 +797,7 @@ TEST_F(TestVsagAdaptor, test_hgraph_extra_info)
 {
   ASSERT_TRUE(obvsag::is_init());
   obvsag::VectorIndexPtr index_handler = NULL;
-  int dim = 1536;
+  int dim = 64;
   int max_degree = 16;
   int ef_search = 200;
   int ef_construction = 100;
@@ -907,7 +907,7 @@ TEST_F(TestVsagAdaptor, test_hgraph_iter_filter)
   std::cout<<"test hgraph_iter_filter_example: "<<std::endl;
   ASSERT_TRUE(obvsag::is_init());
   obvsag::VectorIndexPtr index_handler = NULL;
-  int dim = 1536;
+  int dim = 64;
   int max_degree = 16;
   int ef_search = 200;
   int ef_construction = 100;
@@ -1024,7 +1024,7 @@ TEST_F(TestVsagAdaptor, test_hnsw_iter_filter)
   std::cout<<"test iter_filter_example: "<<std::endl;
   ASSERT_TRUE(obvsag::is_init());
   obvsag::VectorIndexPtr index_handler = NULL;
-  int dim = 1536;
+  int dim = 64;
   int max_degree = 16;
   int ef_search = 200;
   int ef_construction = 100;
