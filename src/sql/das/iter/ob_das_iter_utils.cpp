@@ -5217,6 +5217,11 @@ int ObDASIterUtils::create_vec_index_scan_iter(common::ObIAllocator &alloc,
     if (OB_NOT_NULL(index_id_tbl_rtdef)) {
       index_id_tbl_rtdef->scan_flag_.scan_order_ = ObQueryFlag::Reverse;
     }
+    ObDASScanRtDef *com_aux_vec_tbl_rtdef = vec_index_scan_rtdef->get_com_aux_vec_table_rtdef();
+    if (OB_NOT_NULL(com_aux_vec_tbl_rtdef)) {
+      // Batch com aux vector lookup consumes vectors in the same order as the lookup keys.
+      com_aux_vec_tbl_rtdef->scan_flag_.scan_order_ = ObQueryFlag::KeepOrder;
+    }
 
     if (OB_FAIL(create_das_scan_iter(alloc, vec_index_scan_ctdef->get_delta_buf_table_ctdef(), vec_index_scan_rtdef->get_delta_buf_table_rtdef(), delta_buf_table_iter))) {
       LOG_WARN("failed to create delta buf table iter", K(ret));

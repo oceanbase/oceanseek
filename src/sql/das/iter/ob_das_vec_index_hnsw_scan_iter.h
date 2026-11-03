@@ -215,11 +215,13 @@ private:
   int prepare_complete_vector_data(ObVectorQueryAdaptorResultContext& ada_ctx);
   int build_vec_index_acquire_ctx(share::ObVectorIndexAcquireCtx &index_ctx);
 
-  int get_vector_from_com_aux_vec_table(ObIAllocator &allocator, ObRowkey *rowkey, ObString &vector);
-  int get_vector_from_com_aux_vec_table(ObIAllocator &allocator, ObString &vector);
-  // Recompute exact distances by fetching raw fp32 vectors from the com aux vec table row by
-  // row and evaluating the vector distance function, then overwrite adaptor_vid_iter_'s
-  // distances.
+  int get_com_aux_vec_lookup_batch_size(int64_t &batch_size) const;
+  int get_vectors_from_com_aux_vec_table(common::ObIAllocator &allocator,
+                                         common::ObRowkey *vid_rowkeys,
+                                         common::ObString *raw_vectors,
+                                         int64_t batch_row_count);
+  // Recompute exact distances by fetching raw fp32 vectors from the com aux vec table in batches
+  // and evaluating the vector distance function, then overwrite adaptor_vid_iter_'s distances.
   int recompute_exact_distances();
 
   int do_delta_buf_table_scan();

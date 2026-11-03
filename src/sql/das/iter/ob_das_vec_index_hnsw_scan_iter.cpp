@@ -17,6 +17,9 @@
 ERRSIM_POINT_DEF(ERRSIM_VEC_HNSW_BQ_COM_AUX_VEC_NOT_FOUND,
                  "When enabled, simulate a missing com aux vector during HNSW BQ exact distance recomputation.");
 
+ERRSIM_POINT_DEF(ERRSIM_VEC_HNSW_BQ_INVALID_DISTANCE,
+                 "When enabled, simulate a NaN exact distance during HNSW BQ recomputation.");
+
 namespace oceanbase
 {
 using namespace common;
@@ -1440,113 +1443,165 @@ int ObDASVecIndexHNSWScanIter::prepare_complete_vector_data(ObVectorQueryAdaptor
       complete_profile);
 
   ObObj *vids = nullptr;
-  int64_t vec_cnt = ada_ctx.get_vec_cnt();
+  const int64_t vec_cnt = ada_ctx.get_vec_cnt();
+  const int64_t curr_idx = ada_ctx.get_curr_idx();
+  int64_t max_batch_row_count = 0;
 
   if (OB_ISNULL(vids = ada_ctx.get_vids())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("failed to get vectors.", K(ret));
-  } 
+  } else if (OB_FAIL(get_com_aux_vec_lookup_batch_size(max_batch_row_count))) {
+    LOG_WARN("failed to get com aux vector lookup batch size", K(ret));
+  } else {
+    ObArenaAllocator tmp_allocator("VecCompIncr", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+    for (int64_t processed = 0; OB_SUCC(ret) && processed < vec_cnt;) {
+      tmp_allocator.reuse();
+      const int64_t batch_row_count = min(max_batch_row_count, vec_cnt - processed);
+      ObRowkey *vid_rowkeys = nullptr;
+      ObString *raw_vectors = nullptr;
+      if (OB_ISNULL(vid_rowkeys = static_cast<ObRowkey *>(tmp_allocator.alloc(sizeof(ObRowkey) * batch_row_count)))
+          || OB_ISNULL(raw_vectors = static_cast<ObString *>(tmp_allocator.alloc(sizeof(ObString) * batch_row_count)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate vid rowkeys or raw vectors", K(ret), K(batch_row_count));
+      } else {
+        for (int64_t i = 0; i < batch_row_count; ++i) {
+          ObObj &vid = vids[curr_idx + processed + i];
+          vid.meta_.set_uint64();
+          new (&vid_rowkeys[i]) ObRowkey(&vid, 1);
+          new (&raw_vectors[i]) ObString();
+        }
+      }
 
-  for (int i = 0; OB_SUCC(ret) && i < vec_cnt; i++) {
-    ObRowkey vid(&(vids[i + ada_ctx.get_curr_idx()]), 1);
-    ObRowkey *rowkey;
-    ObString vector;
-    vid.get_obj_ptr()->meta_.set_uint64();
-    rowkey = &vid;
-    
-    if (OB_SUCC(ret)) {
-      if (OB_FAIL(get_vector_from_com_aux_vec_table(mem_context_->get_arena_allocator(), rowkey, vector))) {
-        if (OB_ITER_END != ret) {
-          LOG_WARN("failed to get vector from com aux vec table.", K(ret));
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(get_vectors_from_com_aux_vec_table(tmp_allocator, vid_rowkeys, raw_vectors, batch_row_count))) {
+        LOG_WARN("failed to batch get vectors from com aux vec table", K(ret), K(processed), K(batch_row_count));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < batch_row_count; ++i) {
+        if (OB_FAIL(ada_ctx.set_vector(processed + i, raw_vectors[i].ptr(), raw_vectors[i].length()))) {
+          LOG_WARN("failed to set complete incr vector", K(ret), K(processed), K(i));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        processed += batch_row_count;
+      }
+    }
+  }
+
+  return ret;
+}
+
+int ObDASVecIndexHNSWScanIter::get_com_aux_vec_lookup_batch_size(int64_t &batch_size) const
+{
+  int ret = OB_SUCCESS;
+  ObDASScanRtDef *com_aux_vec_rtdef = nullptr;
+  ObEvalCtx *scan_eval_ctx = nullptr;
+  batch_size = 0;
+  if (OB_ISNULL(vec_index_scan_rtdef_)
+      || OB_ISNULL(com_aux_vec_rtdef = vec_index_scan_rtdef_->get_com_aux_vec_table_rtdef())
+      || OB_ISNULL(scan_eval_ctx = com_aux_vec_rtdef->eval_ctx_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("com aux vector rtdef or eval ctx is null", K(ret), KP(vec_index_scan_rtdef_),
+             KP(com_aux_vec_rtdef), KP(scan_eval_ctx));
+  } else if (OB_UNLIKELY(!scan_eval_ctx->is_vectorized())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("HNSW com aux vector lookup requires vectorized eval context",
+              K(ret), K(scan_eval_ctx->max_batch_size_));
+  } else {
+    batch_size = min(scan_eval_ctx->max_batch_size_, ObVectorParamData::VI_PARAM_DATA_BATCH_SIZE);
+  }
+  return ret;
+}
+
+int ObDASVecIndexHNSWScanIter::get_vectors_from_com_aux_vec_table(ObIAllocator &allocator,
+                                                                  ObRowkey *vid_rowkeys,
+                                                                  ObString *raw_vectors,
+                                                                  int64_t batch_row_count)
+{
+  int ret = OB_SUCCESS;
+  const int64_t vec_col_idx = 0;
+  const ObDASScanCtDef *com_aux_vec_ctdef = nullptr;
+  ObDASScanRtDef *com_aux_vec_rtdef = nullptr;
+  ObEvalCtx *scan_eval_ctx = nullptr;
+  ObExpr *vec_expr = nullptr;
+
+  if (OB_ISNULL(vid_rowkeys) || OB_ISNULL(raw_vectors) || OB_UNLIKELY(batch_row_count <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret), KP(vid_rowkeys), KP(raw_vectors), K(batch_row_count));
+  } else if (OB_ISNULL(com_aux_vec_iter_) || OB_ISNULL(vec_index_scan_ctdef_)
+             || OB_ISNULL(vec_index_scan_rtdef_)
+             || OB_ISNULL(com_aux_vec_ctdef = vec_index_scan_ctdef_->get_com_aux_vec_table_ctdef())
+             || OB_ISNULL(com_aux_vec_rtdef = vec_index_scan_rtdef_->get_com_aux_vec_table_rtdef())
+             || OB_ISNULL(scan_eval_ctx = com_aux_vec_rtdef->eval_ctx_)
+             || com_aux_vec_ctdef->pd_expr_spec_.access_exprs_.count() <= vec_col_idx
+             || OB_ISNULL(vec_expr = com_aux_vec_ctdef->pd_expr_spec_.access_exprs_.at(vec_col_idx))
+             || T_REF_COLUMN != vec_expr->type_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid com aux vector scan state", K(ret), KP(com_aux_vec_iter_),
+             KP(com_aux_vec_ctdef), KP(com_aux_vec_rtdef), KP(scan_eval_ctx), KP(vec_expr));
+  } else if (OB_UNLIKELY(!com_aux_vec_rtdef->scan_flag_.is_keep_order())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("com aux vector batch lookup must keep lookup-key order", K(ret),
+             K(com_aux_vec_rtdef->scan_flag_));
+  } else if (!com_aux_vec_iter_first_scan_ && OB_FAIL(reuse_com_aux_vec_iter())) {
+    LOG_WARN("failed to reuse com aux vec iter.", K(ret));
+  } else {
+    com_aux_vec_scan_param_.key_ranges_.reuse();
+    com_aux_vec_scan_param_.ss_key_ranges_.reuse();
+    const int64_t lookup_key_count = OB_UNLIKELY(OB_SUCCESS != ERRSIM_VEC_HNSW_BQ_COM_AUX_VEC_NOT_FOUND)
+                                       ? batch_row_count - 1
+                                       : batch_row_count;
+    for (int64_t i = 0; OB_SUCC(ret) && i < lookup_key_count; i++) {
+      if (OB_FAIL(ObDasVecScanUtils::set_lookup_key(
+              vid_rowkeys[i], com_aux_vec_scan_param_, com_aux_vec_ctdef->ref_table_id_))) {
+        LOG_WARN("failed to set lookup key", K(ret), K(i));
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(do_com_aux_vec_table_scan())) {
+    LOG_WARN("failed to do com aux vec table scan", K(ret));
+  } else {
+    int64_t scan_row_count = 0;
+    com_aux_vec_iter_->clear_evaluated_flag();
+    if (OB_FAIL(com_aux_vec_iter_->get_next_rows(scan_row_count, batch_row_count))) {
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("failed to get next com aux vector rows", K(ret), K(batch_row_count));
+      }
+    }
+    if (OB_SUCC(ret) && OB_UNLIKELY(scan_row_count != batch_row_count)) {
+      ret = OB_ERR_DEFENSIVE_CHECK;
+      LOG_WARN("vector count does not match lookup key count", K(ret), K(scan_row_count),
+               K(batch_row_count));
+    } else if (OB_SUCC(ret)) {
+      ObEvalCtx::BatchInfoScopeGuard guard(*scan_eval_ctx);
+      guard.set_batch_size(scan_row_count);
+      const bool use_rich_format = vec_expr->enable_rich_format()
+                                   && is_valid_format(vec_expr->get_format(*scan_eval_ctx));
+      ObIVector *vec = nullptr;
+      ObDatum *vec_datums = nullptr;
+      if (use_rich_format && OB_ISNULL(vec = vec_expr->get_vector(*scan_eval_ctx))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("failed to get com aux vector", K(ret));
+      } else if (!use_rich_format
+                 && OB_ISNULL(vec_datums = vec_expr->locate_batch_datums(*scan_eval_ctx))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("failed to locate com aux vector batch datums", K(ret));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < scan_row_count; ++i) {
+        ObString vector = use_rich_format ? vec->get_string(i) : vec_datums[i].get_string();
+        if (OB_FAIL(ObTextStringHelper::read_real_string_data(&allocator,
+                                                              ObLongTextType,
+                                                              CS_TYPE_BINARY,
+                                                              vector))) {
+          LOG_WARN("failed to get real com aux vector data", K(ret), K(i));
+        } else {
+          raw_vectors[i] = vector;
         }
       }
     }
-    
-    if (ret == OB_ITER_END) {
-      ada_ctx.set_vector(i, nullptr, 0);
-      ret = OB_SUCCESS;
-    } else if (OB_SUCC(ret)) {
-      ada_ctx.set_vector(i, vector.ptr(), vector.length());
-    }
   }
-
-  if (OB_ITER_END == ret) {
-    ret = OB_SUCCESS;
-  }
-
-  return ret;
-}
-
-int ObDASVecIndexHNSWScanIter::get_vector_from_com_aux_vec_table(ObIAllocator &allocator, ObRowkey *rowkey, ObString &vector) 
-{
-  int ret = OB_SUCCESS;
-
-  const ObDASScanCtDef *com_aux_vec_ctdef = vec_index_scan_ctdef_->get_com_aux_vec_table_ctdef();
-  
-  if (!com_aux_vec_iter_first_scan_ && OB_FAIL(reuse_com_aux_vec_iter())) {
-    LOG_WARN("failed to reuse com aux vec iter.", K(ret));
-  } else if (OB_FAIL(ObDasVecScanUtils::set_lookup_key(*rowkey, com_aux_vec_scan_param_, com_aux_vec_ctdef->ref_table_id_))) {
-    LOG_WARN("failed to set lookup key", K(ret));
-  } else if (OB_FAIL(do_com_aux_vec_table_scan())) {
-    LOG_WARN("failed to do com aux vec table scan", K(ret));
-  } else if (OB_FAIL(get_vector_from_com_aux_vec_table(allocator, vector))) {
-    LOG_WARN_IGNORE_ITER_END(ret, "failed to get vector from com aux vec table", K(ret));
-  }
-
-  return ret;
-}
-
-int ObDASVecIndexHNSWScanIter::get_vector_from_com_aux_vec_table(ObIAllocator &allocator, ObString &vector)
-{
-  int ret = OB_SUCCESS;
-
-  const ObDASScanCtDef *com_aux_vec_ctdef = vec_index_scan_ctdef_->get_com_aux_vec_table_ctdef();
-  storage::ObTableScanIterator *table_scan_iter = dynamic_cast<storage::ObTableScanIterator *>(com_aux_vec_iter_->get_output_result_iter());
-  blocksstable::ObDatumRow *datum_row = nullptr;
-  
-  com_aux_vec_iter_->clear_evaluated_flag();
-
-  const int64_t INVALID_COLUMN_ID = -1;
-  int64_t vec_col_idx = INVALID_COLUMN_ID;
-  int output_row_cnt = com_aux_vec_ctdef->pd_expr_spec_.access_exprs_.count();
-  for (int64_t i = 0; OB_SUCC(ret) && i < output_row_cnt; i++) {
-    ObExpr *expr = com_aux_vec_ctdef->pd_expr_spec_.access_exprs_.at(i);
-    if (T_REF_COLUMN == expr->type_) {
-      if (vec_col_idx == INVALID_COLUMN_ID) {
-        vec_col_idx = i;
-      } else {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("already get vec col idx.", K(ret), K(vec_col_idx), K(i));
-      }
-    }
-  }
-
-  if (vec_col_idx == INVALID_COLUMN_ID) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("failed to get vec col idx.", K(ret));
-  }
-
-  if (OB_SUCC(ret)) {
-    if (OB_FAIL(table_scan_iter->get_next_row(datum_row))) {
-      if (OB_ITER_END != ret) {
-        LOG_WARN("failed to scan com aux vec iter", K(ret));
-      }
-    }
-  }
-
-  if (OB_FAIL(ret)) {
-  } else if (datum_row->get_column_count() != output_row_cnt) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("get row column cnt invalid.", K(ret), K(datum_row->get_column_count()));
-  } else if (OB_FALSE_IT(vector = datum_row->storage_datums_[vec_col_idx].get_string())) {
-    LOG_WARN("failed to get vid.", K(ret));
-  } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(&allocator, 
-                                                                ObLongTextType, 
-                                                                CS_TYPE_BINARY,
-                                                                vector))) {
-    LOG_WARN("failed to get real data.", K(ret));
-  }
-
   return ret;
 }
 
@@ -1591,56 +1646,82 @@ int ObDASVecIndexHNSWScanIter::recompute_exact_distances()
         ret = OB_ERR_INVALID_VECTOR_DIM;
         LOG_WARN("query vector dim mismatch", K(ret), K(query_size), K(vec_dim), K(search_param_.dim_));
       } else {
-        // Reuse the temporary allocator after each row to avoid retaining all raw vectors
-        // in the query-level arena and causing memory growth for a large result set.
-        ObArenaAllocator tmp_allocator("VecBQRecomp", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
-        for (int64_t i = 0; OB_SUCC(ret) && i < total; ++i) {
-          tmp_allocator.reuse();
-          ObObj vid_obj;
-          vid_obj.set_uint64(static_cast<uint64_t>(vids[i]));
-          ObRowkey vid_rowkey(&vid_obj, 1);
-          ObString raw;
-          double dis_value = 0;
-          const int errsim_ret = ERRSIM_VEC_HNSW_BQ_COM_AUX_VEC_NOT_FOUND;
-          if (OB_UNLIKELY(OB_SUCCESS != errsim_ret)) {
-            ret = errsim_ret;
-          } else {
-            ret = get_vector_from_com_aux_vec_table(tmp_allocator, &vid_rowkey, raw);
+        int64_t max_batch_row_count = 0;
+        int64_t batch_row_count = 0;
+        ObObj *vid_objs = nullptr;
+        ObRowkey *vid_rowkeys = nullptr;
+        ObString *raw_vectors = nullptr;
+        ObArenaAllocator workspace_allocator("VecBQWork", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+        ObArenaAllocator payload_allocator("VecBQRecomp", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+        if (OB_FAIL(get_com_aux_vec_lookup_batch_size(max_batch_row_count))) {
+          LOG_WARN("failed to get com aux vector lookup batch size", K(ret));
+        } else if (OB_ISNULL(vid_objs = static_cast<ObObj *>(
+                       workspace_allocator.alloc(sizeof(ObObj) * max_batch_row_count)))
+                   || OB_ISNULL(vid_rowkeys = static_cast<ObRowkey *>(
+                       workspace_allocator.alloc(sizeof(ObRowkey) * max_batch_row_count)))
+                   || OB_ISNULL(raw_vectors = static_cast<ObString *>(
+                       workspace_allocator.alloc(sizeof(ObString) * max_batch_row_count)))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("failed to allocate memory for vid rowkeys or raw vectors", K(ret), K(max_batch_row_count));
+        } else {
+          for (int64_t j = 0; j < max_batch_row_count; ++j) {
+            new (&vid_objs[j]) ObObj();
+            new (&vid_rowkeys[j]) ObRowkey(&vid_objs[j], 1);
+            new (&raw_vectors[j]) ObString();
           }
-          if (OB_FAIL(ret)) {
-            if (OB_ITER_END == ret) {
-              ret = OB_ERR_DEFENSIVE_CHECK;
+          for (int64_t i = 0; OB_SUCC(ret) && i < total; i += batch_row_count) {
+            payload_allocator.reuse();
+            batch_row_count = min(max_batch_row_count, total - i);
+            for (int64_t j = 0; j < batch_row_count; ++j) {
+              vid_objs[j].set_uint64(static_cast<uint64_t>(vids[i + j]));
+              vid_objs[j].meta_.set_uint64();
+              raw_vectors[j].reset();
             }
-            LOG_WARN("failed to get vector from com aux vec table", K(ret), K(i), K(vids[i]));
-          } else if (raw.empty()) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("empty raw vector for exact distance recompute", K(ret), K(i), K(vids[i]));
-          } else if (0 != raw.length() % sizeof(float)) {
-            ret = OB_ERR_INVALID_VECTOR_DIM;
-            LOG_WARN("raw vector length is invalid", K(ret), K(i), K(raw.length()));
-          } else {
-            const float *raw_data = reinterpret_cast<const float *>(raw.ptr());
-            const int64_t raw_size = raw.length() / sizeof(float);
-            if (raw_size != vec_dim) {
-              ret = OB_ERR_INVALID_VECTOR_DIM;
-              LOG_WARN("raw vector dim mismatch", K(ret), K(i), K(raw_size),
-                       K(vec_dim), K(search_param_.dim_));
-            } else if (OB_FAIL(ObExprVectorDistance::DisFunc<float>::distance_funcs[vec_dis_type](
-                           raw_data, query_data, raw_size, dis_value))) {
-              if (OB_ERR_NULL_VALUE == ret) {
-                ret = OB_SUCCESS;
-                distances[i] = FLT_MAX;
+            if (OB_FAIL(get_vectors_from_com_aux_vec_table(payload_allocator,
+                                                           vid_rowkeys,
+                                                           raw_vectors,
+                                                           batch_row_count))) {
+              LOG_WARN("failed to get vector from com aux vec table", K(ret), K(i), K(vids[i]));
+            }
+            for (int64_t j = 0; OB_SUCC(ret) && j < batch_row_count; j++) {
+              const ObString &raw = raw_vectors[j];
+              if (raw.empty()) {
+                ret = OB_ERR_UNEXPECTED;
+                LOG_WARN("empty raw vector for exact distance recompute", K(ret), K(i), K(j), K(vids[i + j]));
+              } else if (0 != raw.length() % sizeof(float)) {
+                ret = OB_ERR_INVALID_VECTOR_DIM;
+                LOG_WARN("raw vector length is invalid", K(ret), K(i), K(j), K(raw.length()));
               } else {
-                LOG_WARN("failed to calculate distance", K(ret), K(i), K(vec_dis_type), K(vids[i]));
+                const float *raw_data = reinterpret_cast<const float *>(raw.ptr());
+                const int64_t raw_size = raw.length() / sizeof(float);
+                double dis_value = 0;
+                if (raw_size != vec_dim) {
+                  ret = OB_ERR_INVALID_VECTOR_DIM;
+                  LOG_WARN("raw vector dim mismatch", K(ret), K(i), K(j), K(raw_size),
+                          K(vec_dim), K(search_param_.dim_));
+                } else if (OB_FAIL(ObExprVectorDistance::DisFunc<float>::distance_funcs[vec_dis_type](
+                              raw_data, query_data, raw_size, dis_value))) {
+                  if (OB_ERR_NULL_VALUE == ret) {
+                    ret = OB_SUCCESS;
+                    distances[i + j] = FLT_MAX;
+                  } else {
+                    LOG_WARN("failed to calculate distance", K(ret), K(i), K(j), K(vec_dis_type), K(vids[i + j]));
+                  }
+                } else {
+                  if (OB_UNLIKELY(OB_SUCCESS != ERRSIM_VEC_HNSW_BQ_INVALID_DISTANCE)) {
+                    dis_value = NAN;
+                  }
+                  if (::isnan(dis_value) || ::isinf(dis_value)) {
+                    ret = OB_NUMERIC_OVERFLOW;
+                    LOG_WARN("distance value is invalid", K(ret), K(i), K(j), K(dis_value));
+                  } else {
+                    if (ObVectorIndexDistAlgorithm::VIDA_IP == search_param_.dist_algorithm_) {
+                      dis_value = -dis_value;
+                    }
+                    distances[i + j] = static_cast<float>(dis_value);
+                  }
+                }
               }
-            } else if (::isnan(dis_value) || ::isinf(dis_value)) {
-              ret = OB_NUMERIC_OVERFLOW;
-              LOG_WARN("distance value is invalid", K(ret), K(i), K(dis_value));
-            } else {
-              if (ObVectorIndexDistAlgorithm::VIDA_IP == search_param_.dist_algorithm_) {
-                dis_value = -dis_value;
-              }
-              distances[i] = static_cast<float>(dis_value);
             }
           }
         }
@@ -1749,7 +1830,7 @@ int ObDASVecIndexHNSWScanIter::do_com_aux_vec_table_scan()
   if (com_aux_vec_iter_first_scan_) {
     const ObDASScanCtDef *com_aux_tbl_ctdef = vec_index_scan_ctdef_->get_com_aux_vec_table_ctdef();
     ObDASScanRtDef *com_aux_tbl_rtdef = vec_index_scan_rtdef_->get_com_aux_vec_table_rtdef();
-    if (OB_FAIL(ObDasVecScanUtils::init_vec_aux_scan_param(ls_id_,
+    if (OB_FAIL(ObDasVecScanUtils::init_scan_param(ls_id_,
                                                           com_aux_vec_tablet_id_,
                                                           com_aux_tbl_ctdef,
                                                           com_aux_tbl_rtdef,

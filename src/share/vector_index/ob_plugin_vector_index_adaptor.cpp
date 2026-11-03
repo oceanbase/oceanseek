@@ -61,6 +61,10 @@ static common::ObOpProfile<common::ObMetric> *get_current_vector_iter_profile()
 }
 
 ERRSIM_POINT_DEF(ERRSIM_VEC_DISABLE_MERGE, "When set, check_need_merge always returns false and vector index merge is disabled.");
+ERRSIM_POINT_DEF(ERRSIM_VEC_HNSW_BQ_RESET_INCR_DATA_BEFORE_QUERY,
+                 "When set, reset HNSW_BQ incremental memory before query to test query-side completion.");
+ERRSIM_POINT_DEF(ERRSIM_VEC_HNSW_COMPLETE_DELETED_VIDS,
+                 "When set, add historical deleted VIDs before filtering the query-side completion bitmap.");
 ObVectorIndexInfo::ObVectorIndexInfo()
   : ls_id_(share::ObLSID::INVALID_LS_ID),
     rowkey_vid_table_id_(common::OB_INVALID_ID),
@@ -3227,6 +3231,18 @@ int ObPluginVectorIndexAdaptor::check_delta_buffer_table_readnext_status(ObVecto
   if (OB_ISNULL(ctx) || OB_ISNULL(row_iter)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get ctx or row_iter invalid.", K(ret), KP(row_iter));
+  } else {
+    if (OB_UNLIKELY(!ctx->get_is_refresh_adaptor()
+                    && VIAT_HNSW_BQ == get_index_type()
+                    && OB_SUCCESS != ERRSIM_VEC_HNSW_BQ_RESET_INCR_DATA_BEFORE_QUERY)
+        && incr_data_.is_valid()) {
+      TCWLockGuard lock_guard(incr_data_->mem_data_rwlock_);
+      incr_data_->free_memdata_resource(get_allocator(), tenant_id_);
+      incr_data_->has_complete_ = false;
+      LOG_INFO("reset HNSW_BQ incremental memory before query", KPC(this));
+    }
+  }
+  if (OB_FAIL(ret)) {
   } else if (OB_FAIL(ctx->init_bitmaps())) {
     LOG_WARN("failed to init ctx bitmaps.", K(ret));
   } else if (OB_FAIL(ObPluginVectorIndexUtils::try_get_ls_index_mgr(ctx->get_ls_id(), ls_index_mgr))) {
@@ -4352,7 +4368,8 @@ int ObPluginVectorIndexAdaptor::prepare_delta_mem_data(roaring::api::roaring64_b
   if (OB_FAIL(try_init_mem_data(VIRT_INC))) {
     LOG_WARN("failed to init mem data incr.", K(ret));
   } else if (OB_ISNULL(gene_bitmap)
-            || OB_ISNULL(ctx) || OB_ISNULL(ctx->tmp_allocator_)) {
+            || OB_ISNULL(ctx) || OB_ISNULL(ctx->tmp_allocator_)
+            || OB_ISNULL(ctx->bitmaps_) || OB_ISNULL(ctx->bitmaps_->delete_bitmap_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get invalid bitmap.", K(ret), KP(gene_bitmap), KP(delta_bitmap), KP(ctx));
   } else {
@@ -4377,6 +4394,14 @@ int ObPluginVectorIndexAdaptor::prepare_delta_mem_data(roaring::api::roaring64_b
       if (OB_SUCC(ret)) {
         TCRLockGuard rd_bitmap_lock_guard(incr_data_->segment_handle_->ibitmap_->rwlock_);
         ROARING_TRY_CATCH(roaring64_bitmap_andnot_inplace(res_bitmap, delta_bitmap));
+      }
+      if (OB_SUCC(ret) && !ctx->get_is_refresh_adaptor()
+          && OB_UNLIKELY(OB_SUCCESS != ERRSIM_VEC_HNSW_COMPLETE_DELETED_VIDS)) {
+        ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(res_bitmap, ctx->bitmaps_->delete_bitmap_));
+      }
+      if (OB_SUCC(ret)) {
+        // Historical index-id inserts can refer to VIDs deleted in the delta table.
+        ROARING_TRY_CATCH(roaring64_bitmap_andnot_inplace(res_bitmap, ctx->bitmaps_->delete_bitmap_));
       }
     }
     if (OB_FAIL(ret)) {
