@@ -367,11 +367,8 @@ int ObTransService::handle_sby_msg(const ObTxSbyBaseMsg *sby_msg)
                 sby_msg->msg_snapshot_, orphan_resp.src_state_info_))) {
           TRANS_LOG(WARN, "get standby tx state from tx table failed", K(ret), K(tmp_ret),
                     KPC(sby_msg), K(orphan_resp));
-        } else if (orphan_resp.src_state_info_.is_valid()
-                   && orphan_resp.src_state_info_.tx_state_ == ObTxState::UNKNOWN
-                   && (!orphan_resp.src_state_info_.ls_readable_scn_.is_valid_and_not_min()
-                       || !orphan_resp.src_state_info_.max_applied_snapshot_.is_valid_and_not_min()
-                       || orphan_resp.src_state_info_.ls_readable_scn_ < sby_msg->msg_snapshot_)) {
+        } else if (need_ask_sby_state_from_replicas_(orphan_resp.src_state_info_,
+                                                     sby_msg->msg_snapshot_)) {
           orphan_resp.src_state_info_.reset();
 
           tmp_ret = ask_sby_state_info_from_replicas(sby_msg);
@@ -404,6 +401,74 @@ int ObTransService::handle_sby_msg(const ObTxSbyBaseMsg *sby_msg)
   return ret;
 }
 
+bool ObTransService::need_ask_sby_state_from_replicas_(
+    const ObTxSbyStateInfo &sby_state_info,
+    const share::SCN &msg_snapshot)
+{
+  const bool is_undecided_state = sby_state_info.tx_state_ == ObTxState::UNKNOWN
+                                  || sby_state_info.tx_state_ == ObTxState::INIT;
+  return sby_state_info.is_valid()
+         && is_undecided_state
+         && (!sby_state_info.ls_readable_scn_.is_valid_and_not_min()
+             || !sby_state_info.max_applied_snapshot_.is_valid_and_not_min()
+             || sby_state_info.ls_readable_scn_ < msg_snapshot);
+}
+
+int ObTransService::convert_tx_table_result_to_sby_state_info_(
+    const int tx_table_ret,
+    const ObLSID &ls_id,
+    const int64_t tx_data_state,
+    const share::SCN &trans_version,
+    const share::SCN &ls_readable_scn,
+    const share::SCN &msg_snapshot,
+    ObTxSbyStateInfo &sby_state_info)
+{
+  int ret = tx_table_ret;
+
+  sby_state_info.reset();
+  sby_state_info.init(ls_id);
+  if (!sby_state_info.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    TRANS_LOG(WARN, "invalid ls id", K(ret), K(ls_id));
+  } else if (OB_TRANS_CTX_NOT_EXIST == ret) {
+    sby_state_info.fill(
+        ls_id, ObTxState::UNKNOWN, trans_version, ls_readable_scn, msg_snapshot);
+    ret = OB_SUCCESS;
+  } else if (OB_SUCC(ret)) {
+    switch (tx_data_state) {
+    case ObTxData::COMMIT:
+      if (!trans_version.is_valid_and_not_min()) {
+        ret = OB_ERR_UNEXPECTED;
+        TRANS_LOG(ERROR, "invalid trans_version with the commited state", K(ret), K(tx_data_state),
+                  K(msg_snapshot), K(trans_version), K(ls_readable_scn), K(sby_state_info));
+      } else {
+        sby_state_info.fill(
+            ls_id, ObTxState::COMMIT, trans_version, ls_readable_scn, msg_snapshot);
+      }
+      break;
+    case ObTxData::ABORT:
+      sby_state_info.fill(
+          ls_id, ObTxState::ABORT, trans_version, ls_readable_scn, msg_snapshot);
+      break;
+    case ObTxData::RUNNING:
+      sby_state_info.fill(
+          ls_id, ObTxState::INIT, share::SCN::invalid_scn(), ls_readable_scn, msg_snapshot);
+      break;
+    default:
+      ret = OB_ERR_UNEXPECTED;
+      TRANS_LOG(ERROR, "unexpected tx data state with ctx miss", K(ret), K(tx_data_state),
+                K(sby_state_info));
+      break;
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+    sby_state_info.reset();
+  }
+
+  return ret;
+}
+
 int ObTransService::get_sby_tx_state_from_tx_table(const ObLSID &ls_id,
                                                    const ObTransID &tx_id,
                                                    const share::SCN &ls_readable_scn,
@@ -411,56 +476,40 @@ int ObTransService::get_sby_tx_state_from_tx_table(const ObLSID &ls_id,
                                                    ObTxSbyStateInfo &sby_state_info)
 {
   int ret = OB_SUCCESS;
-
+  int tx_table_ret = OB_SUCCESS;
   int64_t tx_data_state = ObTxData::RUNNING;
   SCN trans_version = share::SCN::invalid_scn();
+
   sby_state_info.reset();
-  sby_state_info.init(ls_id);
-  if (!sby_state_info.is_valid() || !tx_id.is_valid()) {
+  if (!ls_id.is_valid() || !tx_id.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
-    TRANS_LOG(WARN, "invalid arguments", K(ret), K(sby_state_info), K(tx_id));
-  } else if (OB_FAIL(get_tx_state_from_tx_table_(ls_id, tx_id, tx_data_state, trans_version))) {
-    if (OB_TRANS_CTX_NOT_EXIST == ret) {
-      sby_state_info.fill(ls_id, ObTxState::UNKNOWN, trans_version, ls_readable_scn, msg_snapshot);
-      ret = OB_SUCCESS;
-    }
-    TRANS_LOG(INFO, "get tx state from tx table fail", K(ret), K(tx_data_state), K(msg_snapshot),
-              K(trans_version), K(ls_readable_scn), K(sby_state_info), K(tx_id));
-#ifdef ERRSIM
-  } else if (ERRSIM_STANDBY_CTX_NOT_EXIST == OB_TRANS_CTX_NOT_EXIST) {
-    ret = OB_TRANS_CTX_NOT_EXIST;
-    TRANS_LOG(INFO, "[ERRSIM] standby ctx not exist", K(ret), K(ls_id), K(tx_id),
-              K(ls_readable_scn), K(msg_snapshot));
-    if (OB_TRANS_CTX_NOT_EXIST == ret) {
-      sby_state_info.fill(ls_id, ObTxState::UNKNOWN, trans_version, ls_readable_scn, msg_snapshot);
-      ret = OB_SUCCESS;
-    }
-    TRANS_LOG(INFO, "get tx state from tx table fail", K(ret), K(tx_data_state), K(msg_snapshot),
-              K(trans_version), K(ls_readable_scn), K(sby_state_info), K(tx_id));
-#endif
+    TRANS_LOG(WARN, "invalid arguments", K(ret), K(ls_id), K(tx_id));
   } else {
-    switch (tx_data_state) {
-    case ObTxData::COMMIT:
-      sby_state_info.tx_state_ = ObTxState::COMMIT;
-      if (!trans_version.is_valid_and_not_min()) {
-        ret = OB_ERR_UNEXPECTED;
-        TRANS_LOG(ERROR, "invalid trans_version with the commited state", K(ret), K(tx_data_state),
-                  K(msg_snapshot), K(trans_version), K(ls_readable_scn), K(sby_state_info),
-                  K(tx_id));
-      } else {
-        sby_state_info.fill(ls_id, ObTxState::COMMIT, trans_version, ls_readable_scn, msg_snapshot);
-      }
-      break;
-    case ObTxData::ABORT:
-      sby_state_info.fill(ls_id, ObTxState::ABORT, trans_version, ls_readable_scn, msg_snapshot);
-      break;
-    case ObTxData::RUNNING:
-    default:
-      ret = OB_ERR_UNEXPECTED;
-      TRANS_LOG(ERROR, "tx in-progress but ctx miss", K(ret), K(tx_data_state), K(tx_id),
-                K(sby_state_info));
+    tx_table_ret = get_tx_state_from_tx_table_(ls_id, tx_id, tx_data_state, trans_version);
+#ifdef ERRSIM
+    if (OB_SUCCESS == tx_table_ret
+        && ERRSIM_STANDBY_CTX_NOT_EXIST == OB_TRANS_CTX_NOT_EXIST) {
+      tx_table_ret = OB_TRANS_CTX_NOT_EXIST;
+      TRANS_LOG(INFO, "[ERRSIM] standby ctx not exist", K(tx_table_ret), K(ls_id), K(tx_id),
+                K(ls_readable_scn), K(msg_snapshot));
     }
-    // state_info.version_ = version;
+#endif
+    ret = convert_tx_table_result_to_sby_state_info_(tx_table_ret,
+                                                     ls_id,
+                                                     tx_data_state,
+                                                     trans_version,
+                                                     ls_readable_scn,
+                                                     msg_snapshot,
+                                                     sby_state_info);
+    if (OB_SUCCESS == ret && OB_SUCCESS == tx_table_ret && ObTxData::RUNNING == tx_data_state
+        && REACH_TIME_INTERVAL(1 * 1000 * 1000)) {
+      TRANS_LOG(INFO, "tx data is running while tx ctx is missing, infer standby tx state as init",
+                K(tx_id), K(ls_id), K(ls_readable_scn), K(msg_snapshot), K(sby_state_info));
+    }
+    if (OB_SUCCESS != tx_table_ret) {
+      TRANS_LOG(INFO, "get tx state from tx table fail", K(ret), K(tx_table_ret), K(tx_data_state),
+                K(msg_snapshot), K(trans_version), K(ls_readable_scn), K(sby_state_info), K(tx_id));
+    }
   }
 
   if (OB_FAIL(ret)) {

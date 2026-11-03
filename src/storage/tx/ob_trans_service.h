@@ -309,6 +309,19 @@ public:
                                  const int64_t max_read_stale_time,
                                  const bool local_single_ls_plan,
                                  ObTxReadSnapshot &snapshot);
+private:
+  static int convert_tx_table_result_to_sby_state_info_(
+      const int tx_table_ret,
+      const ObLSID &ls_id,
+      const int64_t tx_data_state,
+      const share::SCN &trans_version,
+      const share::SCN &ls_readable_scn,
+      const share::SCN &msg_snapshot,
+      ObTxSbyStateInfo &sby_state_info);
+  static bool need_ask_sby_state_from_replicas_(
+      const ObTxSbyStateInfo &sby_state_info,
+      const share::SCN &msg_snapshot);
+public:
   int handle_sby_msg(const ObTxSbyBaseMsg *sby_msg);
   int get_sby_tx_state_from_tx_table(const ObLSID &ls_id,
                                      const ObTransID &tx_id,

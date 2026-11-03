@@ -6,6 +6,7 @@
 #include <gtest/gtest.h>
 #define private public
 #define protected public
+#include "src/storage/tx/ob_trans_service.h"
 #include "src/storage/tx/ob_trans_part_ctx.h"
 
 namespace oceanbase
@@ -472,6 +473,160 @@ TEST_F(TestObStandbyRead, trans_check_for_standby)
   ASSERT_EQ(OB_SUCCESS, part1.handle_trans_ask_state_resp(resp));
   ASSERT_EQ(OB_SUCCESS, part1.check_for_standby(snapshot, can_read, trans_version));
   ASSERT_EQ(false, can_read);
+}
+
+TEST_F(TestObStandbyRead, running_tx_without_ctx_infer_as_init)
+{
+  TRANS_LOG(INFO, "called", "func", test_info_->name());
+  const ObLSID ls_id(1001);
+  const ObLSID dst_ls_id(1002);
+  SCN ls_readable_scn;
+  SCN msg_snapshot;
+  SCN unreadable_snapshot;
+  SCN commit_version;
+  ASSERT_EQ(OB_SUCCESS, ls_readable_scn.convert_for_tx(200));
+  ASSERT_EQ(OB_SUCCESS, msg_snapshot.convert_for_tx(100));
+  ASSERT_EQ(OB_SUCCESS, unreadable_snapshot.convert_for_tx(201));
+  ASSERT_EQ(OB_SUCCESS, commit_version.convert_for_tx(150));
+
+  ObTxSbyStateInfo state_info;
+  const SCN running_version = SCN::max_scn();
+  ASSERT_EQ(OB_SUCCESS,
+            ObTransService::convert_tx_table_result_to_sby_state_info_(
+                OB_SUCCESS,
+                ls_id,
+                storage::ObTxData::RUNNING,
+                running_version,
+                ls_readable_scn,
+                msg_snapshot,
+                state_info));
+  ASSERT_TRUE(state_info.is_valid());
+  ASSERT_EQ(ls_id, state_info.part_id_);
+  ASSERT_EQ(ObTxState::INIT, state_info.tx_state_);
+  ASSERT_EQ(SCN::invalid_scn(), state_info.trans_version_);
+  ASSERT_EQ(ls_readable_scn, state_info.ls_readable_scn_);
+  ASSERT_EQ(msg_snapshot, state_info.max_applied_snapshot_);
+  ASSERT_FALSE(state_info.is_confirmed());
+  ASSERT_FALSE(ObTransService::need_ask_sby_state_from_replicas_(state_info, msg_snapshot));
+
+  ObTxSbyStateInfo lagging_state_info;
+  ASSERT_EQ(OB_SUCCESS,
+            ObTransService::convert_tx_table_result_to_sby_state_info_(
+                OB_SUCCESS,
+                ls_id,
+                storage::ObTxData::RUNNING,
+                running_version,
+                ls_readable_scn,
+                unreadable_snapshot,
+                lagging_state_info));
+  ASSERT_EQ(ObTxState::INIT, lagging_state_info.tx_state_);
+  ASSERT_EQ(SCN::invalid_scn(), lagging_state_info.trans_version_);
+  ASSERT_EQ(unreadable_snapshot, lagging_state_info.max_applied_snapshot_);
+  ASSERT_TRUE(ObTransService::need_ask_sby_state_from_replicas_(
+      lagging_state_info, unreadable_snapshot));
+
+  storage::ObTxCommitData::TxDataState inferred_state = storage::ObTxCommitData::UNKOWN;
+  SCN inferred_version = SCN::invalid_scn();
+  ASSERT_EQ(OB_EAGAIN, state_info.get_confirmed_state(inferred_state, inferred_version));
+  ASSERT_EQ(OB_SUCCESS,
+            state_info.infer_by_userful_info(
+                msg_snapshot, false, inferred_state, inferred_version));
+  ASSERT_EQ(storage::ObTxCommitData::RUNNING, inferred_state);
+  ASSERT_EQ(SCN::max_scn(), inferred_version);
+  ASSERT_EQ(OB_EAGAIN,
+            state_info.infer_by_userful_info(
+                unreadable_snapshot, false, inferred_state, inferred_version));
+
+  ObAddr src_addr;
+  ObAddr dst_addr;
+  ASSERT_TRUE(src_addr.set_ip_addr("127.0.0.1", 2882));
+  ASSERT_TRUE(dst_addr.set_ip_addr("127.0.0.2", 2882));
+  ObTxSbyStateResultMsg state_result;
+  state_result.fill_common_header(OB_SYS_TENANT_ID,
+                                  1,
+                                  ObTransID(1),
+                                  msg_snapshot,
+                                  ls_id,
+                                  src_addr,
+                                  dst_ls_id,
+                                  dst_addr);
+  state_result.src_state_info_ = state_info;
+  ASSERT_EQ(ObTxSbyMsgType::STATE_RESULT, state_result.msg_type_);
+  ASSERT_TRUE(state_result.is_valid());
+  ASSERT_EQ(ObTxState::INIT, state_result.src_state_info_.tx_state_);
+
+  ASSERT_EQ(OB_SUCCESS,
+            ObTransService::convert_tx_table_result_to_sby_state_info_(
+                OB_SUCCESS,
+                ls_id,
+                storage::ObTxData::COMMIT,
+                commit_version,
+                ls_readable_scn,
+                msg_snapshot,
+                state_info));
+  ASSERT_TRUE(state_info.is_valid());
+  ASSERT_EQ(ObTxState::COMMIT, state_info.tx_state_);
+  ASSERT_EQ(commit_version, state_info.trans_version_);
+  ASSERT_FALSE(ObTransService::need_ask_sby_state_from_replicas_(state_info, unreadable_snapshot));
+
+  ASSERT_EQ(OB_SUCCESS,
+            ObTransService::convert_tx_table_result_to_sby_state_info_(
+                OB_SUCCESS,
+                ls_id,
+                storage::ObTxData::ABORT,
+                SCN::invalid_scn(),
+                ls_readable_scn,
+                msg_snapshot,
+                state_info));
+  ASSERT_TRUE(state_info.is_valid());
+  ASSERT_EQ(ObTxState::ABORT, state_info.tx_state_);
+
+  ASSERT_EQ(OB_SUCCESS,
+            ObTransService::convert_tx_table_result_to_sby_state_info_(
+                OB_TRANS_CTX_NOT_EXIST,
+                ls_id,
+                storage::ObTxData::RUNNING,
+                SCN::invalid_scn(),
+                ls_readable_scn,
+                msg_snapshot,
+                state_info));
+  ASSERT_TRUE(state_info.is_valid());
+  ASSERT_EQ(ObTxState::UNKNOWN, state_info.tx_state_);
+  ASSERT_EQ(ls_readable_scn, state_info.ls_readable_scn_);
+  ASSERT_EQ(msg_snapshot, state_info.max_applied_snapshot_);
+  ASSERT_FALSE(ObTransService::need_ask_sby_state_from_replicas_(state_info, msg_snapshot));
+  ASSERT_TRUE(ObTransService::need_ask_sby_state_from_replicas_(state_info, unreadable_snapshot));
+
+  ASSERT_EQ(OB_ERR_UNEXPECTED,
+            ObTransService::convert_tx_table_result_to_sby_state_info_(
+                OB_SUCCESS,
+                ls_id,
+                storage::ObTxData::COMMIT,
+                SCN::invalid_scn(),
+                ls_readable_scn,
+                msg_snapshot,
+                state_info));
+  ASSERT_FALSE(state_info.is_valid());
+  ASSERT_EQ(OB_ERR_UNEXPECTED,
+            ObTransService::convert_tx_table_result_to_sby_state_info_(
+                OB_SUCCESS,
+                ls_id,
+                storage::ObTxData::MAX_STATE_CNT,
+                commit_version,
+                ls_readable_scn,
+                msg_snapshot,
+                state_info));
+  ASSERT_FALSE(state_info.is_valid());
+  ASSERT_EQ(OB_TIMEOUT,
+            ObTransService::convert_tx_table_result_to_sby_state_info_(
+                OB_TIMEOUT,
+                ls_id,
+                storage::ObTxData::RUNNING,
+                running_version,
+                ls_readable_scn,
+                msg_snapshot,
+                state_info));
+  ASSERT_FALSE(state_info.is_valid());
 }
 
 
