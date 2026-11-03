@@ -48,6 +48,7 @@ public:
   OB_INLINE uint64_t get_table_id() const { return table_id_; }
   OB_INLINE int64_t get_schema_version() const { return schema_version_; }
   OB_INLINE ObTableType get_table_type() const { return table_type_; }
+  OB_INLINE ObTableDefType get_def_type() const { return def_type_; }
   OB_INLINE ObIndexType get_index_type() const { return index_type_; }
   OB_INLINE ObIndexStatus get_index_status() const { return index_status_; }
   OB_INLINE int64_t get_rowkey_column_num() const { return read_info_.get_schema_rowkey_count(); }
@@ -163,6 +164,7 @@ private:
   uint64_t table_id_;
   int64_t schema_version_;
   ObTableType table_type_;
+  ObTableDefType def_type_;
   ObIndexType index_type_;
   ObIndexStatus index_status_;
   int64_t shadow_rowkey_column_num_;
@@ -194,8 +196,7 @@ private:
   ObMvMode mv_mode_;
   bool is_delete_insert_;
   bool is_rowscn_ttl_table_;
-  // TODO fengyun 先添加白名单方便合入，后续删除
-  bool is_table_without_pk_;    //FARM COMPAT WHITELIST
+  bool is_table_without_pk_;
   ObMergeEngineType merge_engine_type_;
   uint64_t inc_pk_doc_id_col_id_;
   uint64_t vec_chunk_col_id_;
@@ -204,6 +205,7 @@ private:
   Projector search_idx_included_cid_idxes_;
   ArrayTypeArray search_idx_arr_types_;
   ColumnConfigArray search_idx_column_comments_;
+  int64_t lob_intable_threshold_;
 };
 
 class ObTableDMLParam

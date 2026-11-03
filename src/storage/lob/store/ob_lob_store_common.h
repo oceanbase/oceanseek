@@ -40,8 +40,7 @@ public:
     INVALID_TYPE = 0,
     IN_TABLE,
     OUT_TABLE,
-    OUT_LINK = 3,
-    EXTERNAL_REFERENCE = 4, // Reserved for External LOB.
+    EXTERNAL_REFERENCE = 3,
   };
   ObLobChunkType() : type_(INVALID_TYPE) {}
   void reset() { type_ = INVALID_TYPE; }

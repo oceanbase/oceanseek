@@ -28,6 +28,7 @@ ObTableSchemaParam::ObTableSchemaParam(ObIAllocator &allocator)
     table_id_(OB_INVALID_ID),
     schema_version_(OB_INVALID_VERSION),
     table_type_(MAX_TABLE_TYPE),
+    def_type_(TABLE_DEF_TYPE_MAX),
     index_type_(INDEX_TYPE_IS_NOT),
     index_status_(INDEX_STATUS_NOT_FOUND),
     shadow_rowkey_column_num_(0),
@@ -65,7 +66,8 @@ ObTableSchemaParam::ObTableSchemaParam(ObIAllocator &allocator)
     search_idx_included_cids_(allocator),
     search_idx_included_cid_idxes_(allocator),
     search_idx_arr_types_(allocator),
-    search_idx_column_comments_(allocator)
+    search_idx_column_comments_(allocator),
+    lob_intable_threshold_(OB_DEFAULT_LOB_INTABLE_THRESHOLD)
 {
 }
 
@@ -79,6 +81,7 @@ void ObTableSchemaParam::reset()
   table_id_ = OB_INVALID_ID;
   schema_version_ = OB_INVALID_VERSION;
   table_type_ = MAX_TABLE_TYPE;
+  def_type_ = TABLE_DEF_TYPE_MAX;
   index_type_ = INDEX_TYPE_IS_NOT;
   index_status_ = INDEX_STATUS_NOT_FOUND;
   shadow_rowkey_column_num_ = 0;
@@ -117,6 +120,7 @@ void ObTableSchemaParam::reset()
   search_idx_included_cid_idxes_.reset();
   search_idx_arr_types_.reset();
   search_idx_column_comments_.reset();
+  lob_intable_threshold_ = OB_DEFAULT_LOB_INTABLE_THRESHOLD;
 }
 
 int ObTableSchemaParam::convert(const ObTableSchema *schema)
@@ -138,7 +142,9 @@ int ObTableSchemaParam::convert(const ObTableSchema *schema)
     table_id_ = schema->get_table_id();
     schema_version_ = schema->get_schema_version();
     table_type_ = schema->get_table_type();
+    def_type_ = schema->get_def_type();
     lob_inrow_threshold_ = schema->get_lob_inrow_threshold();
+    lob_intable_threshold_ = schema->get_lob_intable_threshold();
     is_delete_insert_ = schema->is_delete_insert_merge_engine();
     is_rowscn_ttl_table_ = schema->get_ttl_flag().ttl_column_type_ == ObTTLFlag::TTLColumnType::ROWSCN;
     is_table_without_pk_ = schema->is_table_without_pk();
@@ -627,6 +633,7 @@ int64_t ObTableSchemaParam::to_string(char *buf, const int64_t buf_len) const
   J_KV(K_(table_id),
        K_(schema_version),
        K_(table_type),
+       K_(def_type),
        K_(index_type),
        K_(index_status),
        K_(shadow_rowkey_column_num),
@@ -639,6 +646,7 @@ int64_t ObTableSchemaParam::to_string(char *buf, const int64_t buf_len) const
        K_(columns),
        K_(read_info),
        K_(lob_inrow_threshold),
+       K_(lob_intable_threshold),
        K_(inc_pk_doc_id_col_id));
 
   J_OBJ_END();
@@ -730,6 +738,8 @@ OB_DEF_SERIALIZE(ObTableSchemaParam)
   OB_UNIS_ENCODE(is_rowscn_ttl_table_);
   OB_UNIS_ENCODE(is_table_without_pk_);
   OB_UNIS_ENCODE(search_idx_column_comments_);
+  OB_UNIS_ENCODE(lob_intable_threshold_);
+  OB_UNIS_ENCODE(def_type_);
   return ret;
 }
 
@@ -933,6 +943,8 @@ OB_DEF_DESERIALIZE(ObTableSchemaParam)
   OB_UNIS_DECODE(is_rowscn_ttl_table_);
   OB_UNIS_DECODE(is_table_without_pk_);
   OB_UNIS_DECODE(search_idx_column_comments_);
+  OB_UNIS_DECODE(lob_intable_threshold_);
+  OB_UNIS_DECODE(def_type_);
   return ret;
 }
 
@@ -1008,6 +1020,8 @@ OB_DEF_SERIALIZE_SIZE(ObTableSchemaParam)
   OB_UNIS_ADD_LEN(is_rowscn_ttl_table_);
   OB_UNIS_ADD_LEN(is_table_without_pk_);
   OB_UNIS_ADD_LEN(search_idx_column_comments_);
+  OB_UNIS_ADD_LEN(lob_intable_threshold_);
+  OB_UNIS_ADD_LEN(def_type_);
   return len;
 }
 

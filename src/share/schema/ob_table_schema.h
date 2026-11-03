@@ -1786,6 +1786,7 @@ public:
   inline const common::ObString &get_async_index_params() const { return async_index_params_; }
   inline const common::ObString &get_exec_env() const { return exec_env_; }
   inline int64_t get_lob_inrow_threshold() const { return lob_inrow_threshold_; }
+  inline int64_t get_lob_intable_threshold() const { return lob_intable_threshold_; }
   inline int64_t get_auto_increment_cache_size() const { return auto_increment_cache_size_; }
   bool has_check_constraint() const;
   inline bool has_constraint() const { return cst_cnt_ > 0; }

@@ -8220,7 +8220,6 @@ OB_DEF_DESERIALIZE(ObTableSchema)
   OB_UNIS_DECODE(skip_index_level_);
   OB_UNIS_DECODE(external_file_pattern_type_);
   OB_UNIS_DECODE_AND_FUNC(async_index_params_, deep_copy_str);
-  lob_intable_threshold_ = OB_DEFAULT_LOB_INTABLE_THRESHOLD;
   OB_UNIS_DECODE(lob_intable_threshold_);
   // !!! FOR STATIC CHECKER BEGIN
   // THE FOLLOWING CODE CANNOT BE DESCRIBED USING SERIALIZE MACROS. THEY ARE EQUIVALENT TO THESE CODES:
