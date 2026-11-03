@@ -317,6 +317,7 @@ void ObTenantAsyncIndexRefresher::run_refresh_task()
       // unregister + ObLS free concurrently). Every acquired reference is released
       // at the end of the round below.
       ObSEArray<ObLSAsyncIndexScheduler *, 16> schedulers;
+      schedulers.set_attr(ObMemAttr(tenant_id_, "AsyncIdxDeps"));
       {
         SpinRLockGuard guard(ls_schedulers_lock_);
         for (int64_t i = 0; OB_SUCC(ret) && i < ls_schedulers_.count(); ++i) {
@@ -358,7 +359,9 @@ void ObTenantAsyncIndexRefresher::run_refresh_task()
           const int64_t now_ts = common::ObTimeUtility::current_monotonic_time();
           ObSEArray<ObAsyncTableRefreshInterval, 8> table_refresh_intervals;
           ObSEArray<uint64_t, 8> due_data_table_ids;
-          ObAsyncIndexRefreshDeps refresh_deps;
+          table_refresh_intervals.set_attr(ObMemAttr(tenant_id_, "AsyncIdxDeps"));
+          due_data_table_ids.set_attr(ObMemAttr(tenant_id_, "AsyncIdxDeps"));
+          ObAsyncIndexRefreshDeps refresh_deps(tenant_id_);
           if (OB_FAIL(get_dep_provider_().get_async_table_refresh_intervals(tenant_id_, table_refresh_intervals))) {
             LOG_WARN("failed to get async table refresh intervals", K(ret), K_(tenant_id));
           } else if (OB_FAIL(filter_due_data_tables_(table_refresh_intervals, now_ts, due_data_table_ids))) {
@@ -409,6 +412,7 @@ int ObTenantAsyncIndexRefresher::filter_due_data_tables_(
   } else {
     common::hash::ObHashSet<uint64_t, common::hash::NoPthreadDefendMode> current_table_ids;
     ObSEArray<uint64_t, 8> stale_table_ids;
+    stale_table_ids.set_attr(ObMemAttr(tenant_id_, "AsyncIdxDeps"));
     if (OB_FAIL(current_table_ids.create(table_refresh_intervals.count(), "AsyncIdxTblSet", "AsyncIdxTblSet", tenant_id_))) {
       LOG_WARN("failed to create current async table id set", K(ret), K_(tenant_id));
     }

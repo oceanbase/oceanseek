@@ -1014,6 +1014,7 @@ int ObAsyncIndexDepProvider::get_async_table_refresh_intervals(
   table_refresh_intervals.reset();
   ObSchemaGetterGuard schema_guard;
   ObSEArray<const ObSimpleTableSchemaV2 *, 16> table_schemas;
+  table_schemas.set_attr(ObMemAttr(tenant_id, "AsyncIdxDeps"));
   if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid tenant id", K(ret), K(tenant_id));
@@ -1078,7 +1079,8 @@ static int build_data_table_info_from_schema_(
     ObAsyncIndexDataTableInfo &data_table_info)
 {
   int ret = OB_SUCCESS;
-  data_table_info.reset();
+  data_table_info.reset(tenant_id);
+  const ObMemAttr attr(tenant_id, "AsyncIdxDeps");
   const uint64_t data_table_id = data_table_schema->get_table_id();
   ObAsyncIndexParams async_index_params;
   int params_ret = parse_async_index_params_(
@@ -1152,7 +1154,7 @@ static int build_data_table_info_from_schema_(
       continue;
     }
 
-    ObAsyncIndexInfo index_info;
+    ObAsyncIndexInfo index_info(tenant_id);
     index_info.index_table_id_  = index_table_id;
     index_info.def_index_table_id_ = is_async_search ? aux_info.table_id_ : OB_INVALID_ID;
     index_info.index_type_ = index_schema->get_index_type();
@@ -1167,6 +1169,7 @@ static int build_data_table_info_from_schema_(
 
     // select_columns
     ObSEArray<ObColDesc, 16> index_col_ids;
+    index_col_ids.set_attr(attr);
     if (OB_FAIL(index_schema->get_column_ids(index_col_ids))) {
       LOG_WARN("failed to get index column ids", K(ret), K(index_table_id));
       break;
@@ -1190,6 +1193,8 @@ static int build_data_table_info_from_schema_(
     if (OB_SUCC(ret) && is_async_search) {
       ObSEArray<ObString, 8> source_column_names;
       ObSEArray<ObString, 8> col_comments;
+      source_column_names.set_attr(attr);
+      col_comments.set_attr(attr);
       if (OB_FAIL(ObSearchIndexBuilderUtil::get_search_index_column_name(
           *data_table_schema, *search_def_schema, source_column_names, col_comments))) {
         LOG_WARN("failed to get async search source columns", K(ret),
@@ -1221,6 +1226,8 @@ static int build_data_table_info_from_schema_(
     if (OB_SUCC(ret) && index_schema->need_partition_key_for_build_local_index(*data_table_schema)) {
       ObSEArray<ObColDesc, 16> data_col_ids;
       ObSEArray<uint64_t, 8> routing_column_ids;
+      data_col_ids.set_attr(attr);
+      routing_column_ids.set_attr(attr);
       if (OB_FAIL(data_table_schema->get_column_ids(data_col_ids))) {
         LOG_WARN("failed to get data table column ids for partition key check", K(ret));
       } else {
@@ -1236,6 +1243,7 @@ static int build_data_table_info_from_schema_(
               LOG_WARN("failed to push partition key column id", K(ret), K(col_id));
             } else if (col->is_generated_column()) {
               ObSEArray<uint64_t, 8> cascaded_column_ids;
+              cascaded_column_ids.set_attr(attr);
               if (OB_FAIL(col->get_cascaded_column_ids(cascaded_column_ids))) {
                 LOG_WARN("failed to get cascaded partition column ids", K(ret), K(col_id));
               }
@@ -1351,6 +1359,7 @@ static int build_data_table_info_from_schema_(
 
   // Build per-data-tablet info and fill index tablet mappings
   ObSEArray<ObTabletID, 16> data_tablet_ids;
+  data_tablet_ids.set_attr(attr);
   if (OB_FAIL(data_table_schema->get_tablet_ids(data_tablet_ids))) {
     LOG_WARN("failed to get data tablet ids", K(ret), K(data_table_id));
     return ret;
@@ -1359,13 +1368,15 @@ static int build_data_table_info_from_schema_(
   const int64_t index_cnt = data_table_info.index_infos_.count();
   ObSEArray<ObSEArray<ObTabletID, 16>, 4> index_tablet_bufs;
   ObSEArray<const ObTableSchema *, 4> index_schemas;
-  for (int64_t j = 0; OB_SUCC(ret) && j < index_cnt; ++j) {
-    ObSEArray<ObTabletID, 16> tmp_arr;
-    if (OB_FAIL(index_tablet_bufs.push_back(tmp_arr))) {
-      LOG_WARN("failed to init index tablet buf", K(ret)); break;
-    }
+  index_tablet_bufs.set_attr(attr);
+  index_schemas.set_attr(attr);
+  // Construct the empty buffers together: growing this outer array after
+  // filling its elements would copy their arrays with default allocators.
+  if (OB_FAIL(index_tablet_bufs.prepare_allocate(index_cnt))) {
+    LOG_WARN("failed to init index tablet buffers", K(ret), K(index_cnt));
   }
   for (int64_t j = 0; OB_SUCC(ret) && j < index_cnt; ++j) {
+    index_tablet_bufs.at(j).set_attr(attr);
     const uint64_t idx_table_id = data_table_info.index_infos_.at(j).index_table_id_;
     const ObTableSchema *idx_schema = nullptr;
     if (OB_FAIL(schema_guard.get_table_schema(tenant_id, idx_table_id, idx_schema))) {
@@ -1503,6 +1514,9 @@ int ObAsyncIndexDepProvider::get_async_index_refresh_deps(
     LOG_WARN("invalid tenant id", K(ret), K(tenant_id));
   } else if (OB_FAIL(GSCHEMASERVICE.get_tenant_schema_guard(tenant_id, schema_guard))) {
     LOG_WARN("failed to get tenant schema guard", K(ret), K(tenant_id));
+  } else if (OB_FAIL(refresh_deps.prepare(tenant_id, data_table_ids.count()))) {
+    LOG_WARN("failed to reserve async index refresh dependencies", K(ret), K(tenant_id),
+             "table_count", data_table_ids.count());
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < data_table_ids.count(); ++i) {
       const uint64_t data_table_id = data_table_ids.at(i);
@@ -1513,7 +1527,7 @@ int ObAsyncIndexDepProvider::get_async_index_refresh_deps(
       } else if (OB_ISNULL(data_table_schema)) {
         LOG_WARN("data table schema is null, skip", K(tenant_id), K(data_table_id));
       } else {
-        ObAsyncIndexDataTableInfo data_table_info;
+        ObAsyncIndexDataTableInfo data_table_info(tenant_id);
         if (OB_TMP_FAIL(build_data_table_info_from_schema_(
                 tenant_id, data_table_schema, schema_guard, allocator,
                 data_table_info))) {

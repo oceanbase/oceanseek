@@ -10,6 +10,7 @@
 #include "lib/utility/ob_print_utils.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/container/ob_se_array.h"
+#include "lib/oblog/ob_log.h"
 #include "lib/string/ob_string.h"
 #include "lib/string/ob_sql_string.h"
 #include "common/ob_tablet_id.h"
@@ -260,8 +261,10 @@ struct ObAsyncIndexDataTabletInfo
 // ObAsyncIndexDataTableInfo::data_tablet_infos_[t] (same partition).
 struct ObAsyncIndexInfo
 {
-  ObAsyncIndexInfo() { reset(); }
-  void reset()
+  explicit ObAsyncIndexInfo(const uint64_t tenant_id = common::OB_SERVER_TENANT_ID)
+  { reset(tenant_id); }
+  void reset() { reset(tenant_id_); }
+  void reset(const uint64_t tenant_id)
   {
     index_table_id_ = OB_INVALID_ID;
     def_index_table_id_ = OB_INVALID_ID;
@@ -277,6 +280,59 @@ struct ObAsyncIndexInfo
     is_refresh_on_error_skip_ = false;
     tablet_ids_.reset();
     partition_names_.reset();
+    tenant_id_ = tenant_id;
+    const lib::ObMemAttr attr(tenant_id, "AsyncIdxDeps");
+    select_columns_.set_attr(attr);
+    source_columns_.set_attr(attr);
+    partition_key_columns_.set_attr(attr);
+    rowkey_columns_.set_attr(attr);
+    order_columns_.set_attr(attr);
+    tablet_ids_.set_attr(attr);
+    partition_names_.set_attr(attr);
+  }
+  // ObSEArray calls assign() when copying an element, including during reserve().
+  // Bind every nested array before copying; its default copy ctor loses the attr.
+  // Strings continue to refer to the arena owned by the refresh dependency set.
+  int assign(const ObAsyncIndexInfo &other)
+  {
+    int ret = OB_SUCCESS;
+    if (this != &other) {
+      reset(other.tenant_id_);
+      if (OB_FAIL(select_columns_.assign(other.select_columns_))) {
+        STORAGE_LOG(WARN, "failed to assign async index select columns", K(ret),
+                    K_(tenant_id), "index_table_id", other.index_table_id_);
+      } else if (OB_FAIL(source_columns_.assign(other.source_columns_))) {
+        STORAGE_LOG(WARN, "failed to assign async index source columns", K(ret),
+                    K_(tenant_id), "index_table_id", other.index_table_id_);
+      } else if (OB_FAIL(partition_key_columns_.assign(other.partition_key_columns_))) {
+        STORAGE_LOG(WARN, "failed to assign async index partition key columns", K(ret),
+                    K_(tenant_id), "index_table_id", other.index_table_id_);
+      } else if (OB_FAIL(rowkey_columns_.assign(other.rowkey_columns_))) {
+        STORAGE_LOG(WARN, "failed to assign async index rowkey columns", K(ret),
+                    K_(tenant_id), "index_table_id", other.index_table_id_);
+      } else if (OB_FAIL(order_columns_.assign(other.order_columns_))) {
+        STORAGE_LOG(WARN, "failed to assign async index order columns", K(ret),
+                    K_(tenant_id), "index_table_id", other.index_table_id_);
+      } else if (OB_FAIL(tablet_ids_.assign(other.tablet_ids_))) {
+        STORAGE_LOG(WARN, "failed to assign async index tablet ids", K(ret),
+                    K_(tenant_id), "index_table_id", other.index_table_id_);
+      } else if (OB_FAIL(partition_names_.assign(other.partition_names_))) {
+        STORAGE_LOG(WARN, "failed to assign async index partition names", K(ret),
+                    K_(tenant_id), "index_table_id", other.index_table_id_);
+      }
+      if (OB_SUCC(ret)) {
+        index_table_id_ = other.index_table_id_;
+        def_index_table_id_ = other.def_index_table_id_;
+        index_type_ = other.index_type_;
+        index_table_name_ = other.index_table_name_;
+        enable_newsort_ = other.enable_newsort_;
+        is_delete_index_ = other.is_delete_index_;
+        is_refresh_on_error_skip_ = other.is_refresh_on_error_skip_;
+      } else {
+        reset();
+      }
+    }
+    return ret;
   }
   bool is_valid() const
   {
@@ -314,13 +370,18 @@ struct ObAsyncIndexInfo
   common::ObSEArray<common::ObTabletID, 16> tablet_ids_;
   // partition_names_[t] is the index partition name for tablet_ids_[t]
   common::ObSEArray<common::ObString, 16> partition_names_;
+private:
+  uint64_t tenant_id_;
+  DISALLOW_COPY_AND_ASSIGN(ObAsyncIndexInfo);
 };
 
 // Complete refresh dependency information for one data table.
 struct ObAsyncIndexDataTableInfo
 {
-  ObAsyncIndexDataTableInfo() { reset(); }
-  void reset()
+  explicit ObAsyncIndexDataTableInfo(const uint64_t tenant_id = common::OB_SERVER_TENANT_ID)
+  { reset(tenant_id); }
+  void reset() { reset(tenant_id_); }
+  void reset(const uint64_t tenant_id)
   {
     data_table_id_ = OB_INVALID_ID;
     database_name_.reset();
@@ -329,6 +390,46 @@ struct ObAsyncIndexDataTableInfo
     refresh_interval_us_ = OB_ASYNC_INDEX_DEFAULT_REFRESH_INTERVAL_US;
     data_tablet_infos_.reset();
     index_infos_.reset();
+    tenant_id_ = tenant_id;
+    const lib::ObMemAttr attr(tenant_id, "AsyncIdxDeps");
+    data_tablet_infos_.set_attr(attr);
+    index_infos_.set_attr(attr);
+  }
+  int assign(const ObAsyncIndexDataTableInfo &other)
+  {
+    int ret = OB_SUCCESS;
+    if (this != &other) {
+      reset(other.tenant_id_);
+      if (OB_FAIL(data_tablet_infos_.assign(other.data_tablet_infos_))) {
+        STORAGE_LOG(WARN, "failed to assign async index data tablet infos", K(ret),
+                    K_(tenant_id), "data_table_id", other.data_table_id_);
+      } else if (OB_FAIL(index_infos_.reserve(other.index_infos_.count()))) {
+        STORAGE_LOG(WARN, "failed to reserve async index infos", K(ret),
+                    K_(tenant_id), "data_table_id", other.data_table_id_,
+                    "index_count", other.index_infos_.count());
+      } else {
+        // Keep the constructed prefix in count_ so reset() releases it if a
+        // later index's nested allocation fails. ObSEArray::assign() only sets
+        // count_ after the entire copy succeeds.
+        for (int64_t i = 0; OB_SUCC(ret) && i < other.index_infos_.count(); ++i) {
+          if (OB_FAIL(index_infos_.push_back(other.index_infos_.at(i)))) {
+            STORAGE_LOG(WARN, "failed to copy async index info", K(ret),
+                        K_(tenant_id), "data_table_id", other.data_table_id_, K(i),
+                        "index_table_id", other.index_infos_.at(i).index_table_id_);
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        data_table_id_ = other.data_table_id_;
+        database_name_ = other.database_name_;
+        data_table_name_ = other.data_table_name_;
+        schema_version_ = other.schema_version_;
+        refresh_interval_us_ = other.refresh_interval_us_;
+      } else {
+        reset();
+      }
+    }
+    return ret;
   }
   bool is_valid() const
   {
@@ -354,6 +455,9 @@ struct ObAsyncIndexDataTableInfo
   // Per-index info (schema + tablet mapping).
   // index_infos_[i].tablet_ids_[t] is the index tablet for data_tablet_infos_[t].
   common::ObSEArray<ObAsyncIndexInfo, 4> index_infos_;
+private:
+  uint64_t tenant_id_;
+  DISALLOW_COPY_AND_ASSIGN(ObAsyncIndexDataTableInfo);
 };
 
 // Lightweight scheduling metadata collected before the expensive schema deep
@@ -386,14 +490,33 @@ struct ObAsyncTableRefreshInterval
 // Built once per timer round and consumed by the scheduling loop.
 struct ObAsyncIndexRefreshDeps
 {
-  ObAsyncIndexRefreshDeps()
-    : allocator_("AsyncIdxDeps"),
+  explicit ObAsyncIndexRefreshDeps(const uint64_t tenant_id)
+    : allocator_(lib::ObMemAttr(tenant_id, "AsyncIdxDeps")),
       data_table_infos_()
-  {}
+  { data_table_infos_.set_attr(lib::ObMemAttr(tenant_id, "AsyncIdxDeps")); }
   void reset()
   {
     data_table_infos_.reset();
     allocator_.reset();
+  }
+  int prepare(const uint64_t tenant_id, const int64_t table_count)
+  {
+    int ret = OB_SUCCESS;
+    reset();
+    if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id || table_count < 0)) {
+      ret = OB_INVALID_ARGUMENT;
+      STORAGE_LOG(WARN, "invalid async index refresh dependencies argument", K(ret),
+                  K(tenant_id), K(table_count));
+    } else {
+      const lib::ObMemAttr attr(tenant_id, "AsyncIdxDeps");
+      allocator_.set_attr(attr);
+      data_table_infos_.set_attr(attr);
+      if (OB_FAIL(data_table_infos_.reserve(table_count))) {
+        STORAGE_LOG(WARN, "failed to reserve async index data table infos", K(ret),
+                    K(tenant_id), K(table_count));
+      }
+    }
+    return ret;
   }
   bool empty() const { return data_table_infos_.empty(); }
   TO_STRING_KV("data_table_cnt", data_table_infos_.count());
