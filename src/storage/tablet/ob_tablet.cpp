@@ -10095,6 +10095,7 @@ int ObTablet::build_transfer_backfill_tablet_param(
     param.storage_schema_.reset();
     param.snapshot_version_ = src_tablet_meta.snapshot_version_;
     param.multi_version_start_ = src_tablet_meta.multi_version_start_;
+    param.inc_major_snapshot_ = src_tablet_meta.inc_major_snapshot_;
     param.extra_medium_info_ = src_tablet_meta.extra_medium_info_;
     param.table_store_flag_ = src_tablet_meta.table_store_flag_;
     if (OB_FAIL(param.storage_schema_.assign(param.allocator_, src_storage_schema))) {

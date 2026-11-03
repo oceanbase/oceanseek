@@ -717,6 +717,8 @@ int ObTabletMeta::init(
       ref_tablet_id_ = old_tablet_meta.ref_tablet_id_;
       create_scn_ = old_tablet_meta.create_scn_;
       start_scn_ = old_tablet_meta.start_scn_;
+      inc_major_snapshot_ = OB_ISNULL(tablet_meta) ? old_tablet_meta.inc_major_snapshot_
+          : MAX(old_tablet_meta.inc_major_snapshot_, tablet_meta->inc_major_snapshot_);
       inc_major_replay_scn_ = old_tablet_meta.inc_major_replay_scn_;
       clog_checkpoint_scn_ = clog_checkpoint_scn;
       ddl_checkpoint_scn_ = ddl_checkpoint_scn;
