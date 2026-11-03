@@ -540,6 +540,15 @@ public:
     return rpc_throttle_;
   }
 
+  bool skip_rpc_di() const
+  {
+    return skip_rpc_di_;
+  }
+  bool skip_worker_rpc_di() const
+  {
+    return skip_worker_rpc_di_;
+  }
+
 private:
   union {
     int64_t flags_;
@@ -548,6 +557,8 @@ private:
       bool mysql_obrequest_ref_ : 1;
       bool di_rpc_cache_ : 1;
       bool rpc_throttle_ : 1;
+      bool skip_rpc_di_ : 1;
+      bool skip_worker_rpc_di_ : 1;
     };
   };
 };

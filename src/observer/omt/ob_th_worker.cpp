@@ -512,7 +512,8 @@ int ObThWorker::acquire_diagnostic_info(ObDiagnosticInfo *&di, rpc::ObRequest *r
   int ret = OB_SUCCESS;
   if (di != nullptr) {
     //do nothing
-  } else if (req->get_type() == ObRequest::OB_RPC && oceanbase::lib::is_diagnose_info_enabled()) {
+  } else if (req->get_type() == ObRequest::OB_RPC && oceanbase::lib::is_diagnose_info_enabled()
+             && !ObDiagnosticInfoContainer::get_di_experimental_feature_flag().skip_worker_rpc_di()) {
     int64_t session_id = ObBackgroundSessionIdGenerator::get_instance().get_next_rpc_session_id();
     const obrpc::ObRpcPacket &pkt
         = reinterpret_cast<const obrpc::ObRpcPacket &>(req->get_packet());

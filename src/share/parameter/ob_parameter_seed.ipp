@@ -2450,7 +2450,13 @@ DEF_INT(_inlist_rewrite_threshold, OB_TENANT_PARAMETER, "1000", "[1, 2147483647]
         "specifies transform how much const params in IN list to values table",
         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_INT(_enable_di_experimental_feature_flags, OB_CLUSTER_PARAMETER, "7", "[0, +∞)"
-         "enable diagnostic info experimental feature",
+         "enable diagnostic info experimental feature. This value is a bitmask and is assigned as a whole: "
+         "bit0 mysql_obrequest_ref, bit1 di_rpc_cache, bit2 rpc_throttle, "
+         "bit3 skip_rpc_di (skip DI creation in RPC deliver stage only), "
+         "bit4 skip_worker_rpc_di (skip DI creation in worker fallback stage only). "
+         "Only bit3 and bit4 both set skips all RPC-path DI creation, and then RPC wait events and ASH stats are lost. "
+         "Default 7 enables bit0-bit2. Keep bit0-bit2 set when turning on bit3/bit4, e.g. 31 (both); "
+         "do not write 8/16/24, which clear bit0-bit2.",
          ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 
 // for set errsim module types, format like transfer;migration

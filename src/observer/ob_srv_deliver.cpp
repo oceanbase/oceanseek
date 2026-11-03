@@ -618,7 +618,8 @@ int ObSrvDeliver::deliver_rpc_request(ObRequest &req)
     if (OB_UNLIKELY(req.get_diagnostic_info())) {
       // possible repost
       req.get_diagnostic_info()->inner_begin_wait_event(ObWaitEventIds::NETWORK_QUEUE_WAIT, 0, pkt.get_pcode(), pkt.get_request_level(), 0);
-    } else if (need_update_stat) {  // simplest way to check is_diagnose_info_enabled
+    } else if (need_update_stat
+               && !ObDiagnosticInfoContainer::get_di_experimental_feature_flag().skip_rpc_di()) {  // simplest way to check is_diagnose_info_enabled
       // using_cache = true means session_id = 0
       const bool using_cache =
           ObDiagnosticInfoContainer::get_di_experimental_feature_flag().di_rpc_cache();
