@@ -85,7 +85,7 @@ int ObJavaUDAFExecutor::execute(ObDatum &result)
 
     using ColumnType = ObSEArray<ObObj, 512>;
 
-    ObSEArray<ObObjMeta, 8> arg_types;
+    const ObIArray<ObExprResType> &arg_types = aggr_info_.pl_agg_udf_params_type_;
     ObSEArray<ObIArray<ObObj> *, 8> args;
 
     JNIEnv *env = nullptr;
@@ -93,29 +93,19 @@ int ObJavaUDAFExecutor::execute(ObDatum &result)
     jclass executor_clazz = nullptr;
     jmethodID execute_method = nullptr;
 
-    jclass class_loader_clazz = nullptr;
-    jmethodID loader_constructor = nullptr;
-    jmethodID find_class_method = nullptr;
     jclass object_clazz = nullptr;
 
-    jstring class_name = nullptr;
-    jclass udf_clazz = nullptr;
     jobject udf_obj = nullptr;
-    jmethodID udf_constructor = nullptr;
 
     jstring iterate_name = nullptr;
     jstring terminate_name = nullptr;
 
     int64_t timeout_ts = eval_ctx_.exec_ctx_.get_my_session()->get_query_timeout_ts();
 
-    ObString entry;
-
     for (int64_t i = 0; OB_SUCC(ret) && i < arg_count; ++i) {
       ColumnType *column = nullptr;
 
-      if (OB_FAIL(arg_types.push_back(aggr_info_.pl_agg_udf_params_type_.at(i)))) {
-        LOG_WARN("failed to push_back", K(ret), K(i), K(aggr_info_.pl_agg_udf_params_type_));
-      } else if (OB_ISNULL(column = static_cast<ColumnType*>(allocator.alloc(sizeof(ColumnType))))) {
+      if (OB_ISNULL(column = static_cast<ColumnType*>(allocator.alloc(sizeof(ColumnType))))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_WARN("failed to alloc memory for column", K(ret), K(i));
       } else if (OB_ISNULL(column = new(column)ColumnType())) {
@@ -143,41 +133,10 @@ int ObJavaUDAFExecutor::execute(ObDatum &result)
     } else if (OB_ISNULL(executor_clazz) || OB_ISNULL(execute_method)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected NULL executor_clazz or execute_method", K(ret), K(executor_clazz), K(execute_method));
-    } else if (OB_FAIL(ObJavaUtils::get_udf_loader_class(*env, class_loader_clazz, loader_constructor, find_class_method))) {
-      LOG_WARN("failed to get_udf_loader_class", K(ret));
-    } else if (OB_ISNULL(class_loader_clazz) || OB_ISNULL(find_class_method)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected NULL class_loader_clazz or find_class_method", K(ret), K(class_loader_clazz), K(find_class_method));
-    } else if (OB_FAIL(ob_write_string(allocator, aggr_info_.external_routine_entry_, entry, true))) {
-      LOG_WARN("failed to ob_write_string", K(ret), K(aggr_info_));
-    } else if (FALSE_IT(class_name = env->NewStringUTF(entry.ptr()))) {
-      // unreachable
-    } else if (OB_FAIL(ObJavaUtils::exception_check(env))) {
-      LOG_WARN("failed to NewStringUTF", K(ret));
-    } else if (OB_ISNULL(class_name)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected NULL class_name", K(ret));
-    } else if (FALSE_IT(udf_clazz = static_cast<jclass>(env->CallObjectMethod(loader_, find_class_method, class_name)))) {
-      // unreachable
-    } else if (OB_FAIL(ObJavaUtils::exception_check(env))) {
-      LOG_WARN("failed to findClass", K(ret));
-    } else if (OB_ISNULL(udf_clazz)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected NULL udf_clazz", K(ret));
-    } else if (FALSE_IT(udf_constructor = env->GetMethodID(udf_clazz, "<init>", "()V"))) {
-      // unreachable
-    } else if (OB_FAIL(ObJavaUtils::exception_check(env))) {
-      LOG_WARN("failed to <init> of udf_clazz", K(ret));
-    } else if (OB_ISNULL(udf_constructor)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected NULL udf_constructor", K(ret));
-    } else if (FALSE_IT(udf_obj = env->NewObject(udf_clazz, udf_constructor))) {
-      // unreachable
-    } else if (OB_FAIL(ObJavaUtils::exception_check(env))) {
-      LOG_WARN("failed to newObject", K(ret));
-    } else if (OB_ISNULL(udf_obj)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected NULL udf_obj", K(ret));
+    } else if (OB_FAIL(ObJavaUtils::create_function_adapter(
+                   eval_ctx_.exec_ctx_, *env, loader_, aggr_info_.external_routine_entry_,
+                   "iterate", arg_types, aggr_info_.pl_result_type_, allocator, udf_obj))) {
+      LOG_WARN("failed to create Java UDAF object", K(ret));
     } else if (FALSE_IT(iterate_name = env->NewStringUTF("iterate"))) {
       // unreachable
     } else if (OB_FAIL(ObJavaUtils::exception_check(env))) {
@@ -286,13 +245,13 @@ int ObJavaUDAFExecutor::execute(ObDatum &result)
       int64_t buffer_size = OB_INVALID_SIZE;
 
       batch_allocator.reuse();
-      arg_types.reuse();
+      ObSEArray<ObExprResType, 1> empty_types;
       args.reuse();
 
       if (OB_FAIL(ObJavaUDFExecutor::build_udf_args(*eval_ctx_.exec_ctx_.get_my_session(),
                                                     *eval_ctx_.exec_ctx_.get_sql_ctx()->schema_guard_,
                                                     1,
-                                                    arg_types,
+                                                    empty_types,
                                                     args,
                                                     *env,
                                                     batch_allocator,
@@ -371,8 +330,6 @@ int ObJavaUDAFExecutor::execute(ObDatum &result)
       ObJavaUtils::delete_local_ref(terminate_result, env);
     }
 
-    ObJavaUtils::delete_local_ref(class_name, env);
-    ObJavaUtils::delete_local_ref(udf_clazz, env);
     ObJavaUtils::delete_local_ref(udf_obj, env);
     ObJavaUtils::delete_local_ref(iterate_name, env);
     ObJavaUtils::delete_local_ref(terminate_name, env);

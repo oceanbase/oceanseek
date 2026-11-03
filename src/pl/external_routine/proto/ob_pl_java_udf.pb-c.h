@@ -32,6 +32,8 @@ typedef struct ObPl__JavaUdf__DoubleValues ObPl__JavaUdf__DoubleValues;
 typedef struct ObPl__JavaUdf__BigDecimalValues ObPl__JavaUdf__BigDecimalValues;
 typedef struct ObPl__JavaUdf__StringValues ObPl__JavaUdf__StringValues;
 typedef struct ObPl__JavaUdf__ByteBufferValues ObPl__JavaUdf__ByteBufferValues;
+typedef struct ObPl__JavaUdf__JavaTypeDesc ObPl__JavaUdf__JavaTypeDesc;
+typedef struct ObPl__JavaUdf__FunctionInfo ObPl__JavaUdf__FunctionInfo;
 
 
 /* --- enums --- */
@@ -201,6 +203,52 @@ struct  ObPl__JavaUdf__ByteBufferValues
 #define OB_PL__JAVA_UDF__BYTE_BUFFER_VALUES__INIT \
  { PROTOBUF_C_MESSAGE_INIT (&ob_pl__java_udf__byte_buffer_values__descriptor) \
 , 0,NULL }
+
+
+typedef enum {
+  OB_PL__JAVA_UDF__JAVA_TYPE_DESC__DECIMAL_PRECISION__NOT_SET = 0,
+  OB_PL__JAVA_UDF__JAVA_TYPE_DESC__DECIMAL_PRECISION_PRECISION = 2
+    PROTOBUF_C__FORCE_ENUM_TO_BE_INT_SIZE(OB_PL__JAVA_UDF__JAVA_TYPE_DESC__DECIMAL_PRECISION__CASE)
+} ObPl__JavaUdf__JavaTypeDesc__DecimalPrecisionCase;
+
+typedef enum {
+  OB_PL__JAVA_UDF__JAVA_TYPE_DESC__DECIMAL_SCALE__NOT_SET = 0,
+  OB_PL__JAVA_UDF__JAVA_TYPE_DESC__DECIMAL_SCALE_SCALE = 3
+    PROTOBUF_C__FORCE_ENUM_TO_BE_INT_SIZE(OB_PL__JAVA_UDF__JAVA_TYPE_DESC__DECIMAL_SCALE__CASE)
+} ObPl__JavaUdf__JavaTypeDesc__DecimalScaleCase;
+
+struct  ObPl__JavaUdf__JavaTypeDesc
+{
+  ProtobufCMessage base;
+  char *java_type;
+  ObPl__JavaUdf__JavaTypeDesc__DecimalPrecisionCase decimal_precision_case;
+  union {
+    int32_t precision;
+  };
+  ObPl__JavaUdf__JavaTypeDesc__DecimalScaleCase decimal_scale_case;
+  union {
+    int32_t scale;
+  };
+};
+#define OB_PL__JAVA_UDF__JAVA_TYPE_DESC__INIT \
+ { PROTOBUF_C_MESSAGE_INIT (&ob_pl__java_udf__java_type_desc__descriptor) \
+    , (char *)protobuf_c_empty_string, OB_PL__JAVA_UDF__JAVA_TYPE_DESC__DECIMAL_PRECISION__NOT_SET, {0}, OB_PL__JAVA_UDF__JAVA_TYPE_DESC__DECIMAL_SCALE__NOT_SET, {0} }
+
+
+/*
+ * Initialization metadata; values still use BatchedArgs / Values.
+ */
+struct  ObPl__JavaUdf__FunctionInfo
+{
+  ProtobufCMessage base;
+  char *class_name;
+  size_t n_input_types;
+  ObPl__JavaUdf__JavaTypeDesc **input_types;
+  ObPl__JavaUdf__JavaTypeDesc *result_type;
+};
+#define OB_PL__JAVA_UDF__FUNCTION_INFO__INIT \
+ { PROTOBUF_C_MESSAGE_INIT (&ob_pl__java_udf__function_info__descriptor) \
+    , (char *)protobuf_c_empty_string, 0,NULL, NULL }
 
 
 /* ObPl__JavaUdf__BatchedArgs methods */
@@ -431,6 +479,44 @@ ObPl__JavaUdf__ByteBufferValues *
 void   ob_pl__java_udf__byte_buffer_values__free_unpacked
                      (ObPl__JavaUdf__ByteBufferValues *message,
                       ProtobufCAllocator *allocator);
+/* ObPl__JavaUdf__JavaTypeDesc methods */
+void   ob_pl__java_udf__java_type_desc__init
+                     (ObPl__JavaUdf__JavaTypeDesc         *message);
+size_t ob_pl__java_udf__java_type_desc__get_packed_size
+                     (const ObPl__JavaUdf__JavaTypeDesc   *message);
+size_t ob_pl__java_udf__java_type_desc__pack
+                     (const ObPl__JavaUdf__JavaTypeDesc   *message,
+                      uint8_t             *out);
+size_t ob_pl__java_udf__java_type_desc__pack_to_buffer
+                     (const ObPl__JavaUdf__JavaTypeDesc   *message,
+                      ProtobufCBuffer     *buffer);
+ObPl__JavaUdf__JavaTypeDesc *
+       ob_pl__java_udf__java_type_desc__unpack
+                     (ProtobufCAllocator  *allocator,
+                      size_t               len,
+                      const uint8_t       *data);
+void   ob_pl__java_udf__java_type_desc__free_unpacked
+                     (ObPl__JavaUdf__JavaTypeDesc *message,
+                      ProtobufCAllocator *allocator);
+/* ObPl__JavaUdf__FunctionInfo methods */
+void   ob_pl__java_udf__function_info__init
+                     (ObPl__JavaUdf__FunctionInfo         *message);
+size_t ob_pl__java_udf__function_info__get_packed_size
+                     (const ObPl__JavaUdf__FunctionInfo   *message);
+size_t ob_pl__java_udf__function_info__pack
+                     (const ObPl__JavaUdf__FunctionInfo   *message,
+                      uint8_t             *out);
+size_t ob_pl__java_udf__function_info__pack_to_buffer
+                     (const ObPl__JavaUdf__FunctionInfo   *message,
+                      ProtobufCBuffer     *buffer);
+ObPl__JavaUdf__FunctionInfo *
+       ob_pl__java_udf__function_info__unpack
+                     (ProtobufCAllocator  *allocator,
+                      size_t               len,
+                      const uint8_t       *data);
+void   ob_pl__java_udf__function_info__free_unpacked
+                     (ObPl__JavaUdf__FunctionInfo *message,
+                      ProtobufCAllocator *allocator);
 /* --- per-message closures --- */
 
 typedef void (*ObPl__JavaUdf__BatchedArgs_Closure)
@@ -469,6 +555,12 @@ typedef void (*ObPl__JavaUdf__StringValues_Closure)
 typedef void (*ObPl__JavaUdf__ByteBufferValues_Closure)
                  (const ObPl__JavaUdf__ByteBufferValues *message,
                   void *closure_data);
+typedef void (*ObPl__JavaUdf__JavaTypeDesc_Closure)
+                 (const ObPl__JavaUdf__JavaTypeDesc *message,
+                  void *closure_data);
+typedef void (*ObPl__JavaUdf__FunctionInfo_Closure)
+                 (const ObPl__JavaUdf__FunctionInfo *message,
+                  void *closure_data);
 
 /* --- services --- */
 
@@ -487,6 +579,8 @@ extern const ProtobufCMessageDescriptor ob_pl__java_udf__double_values__descript
 extern const ProtobufCMessageDescriptor ob_pl__java_udf__big_decimal_values__descriptor;
 extern const ProtobufCMessageDescriptor ob_pl__java_udf__string_values__descriptor;
 extern const ProtobufCMessageDescriptor ob_pl__java_udf__byte_buffer_values__descriptor;
+extern const ProtobufCMessageDescriptor ob_pl__java_udf__java_type_desc__descriptor;
+extern const ProtobufCMessageDescriptor ob_pl__java_udf__function_info__descriptor;
 
 PROTOBUF_C__END_DECLS
 

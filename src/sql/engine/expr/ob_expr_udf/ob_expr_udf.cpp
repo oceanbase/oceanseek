@@ -561,7 +561,7 @@ int ObExprUDF::eval_external_udf(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &re
                   ctx.exec_ctx_, udf_info.udf_id_, udf_info.external_routine_type_,
                   udf_info.external_routine_url_, udf_info.external_routine_resource_,
                   udf_info.external_routine_entry_, 1, "evaluate",
-                  arg_types, args, udf_info.result_type_, alloc, res_array))) {
+                  udf_info.params_type_, args, udf_info.result_type_, alloc, res_array))) {
             LOG_WARN("failed to execute java udf", K(ret));
           }
         }
@@ -705,7 +705,7 @@ int ObExprUDF::eval_external_udf_vector(const ObExpr &expr,
                   ctx.exec_ctx_, udf_info.udf_id_, udf_info.external_routine_type_,
                   udf_info.external_routine_url_, udf_info.external_routine_resource_,
                   udf_info.external_routine_entry_, batch_size, "evaluate",
-                  arg_types, args, udf_info.result_type_, alloc, res_array))) {
+                  udf_info.params_type_, args, udf_info.result_type_, alloc, res_array))) {
             LOG_WARN("failed to execute java udf", K(ret), K(batch_size));
           }
         }
@@ -892,7 +892,6 @@ int ObExprUDF::eval_mysql_udtf(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res)
     } else {
       ObExprUDFInfo &udf_info = *static_cast<ObExprUDFInfo*>(expr.extra_info_);
 
-      ObSEArray<ObObjMeta, 8> arg_types;
       using ColumnType = ObSEArray<ObObj, 1>;
       ObSEArray<ObIArray<ObObj>*, 8> args;
       ObArenaAllocator alloc;
@@ -900,8 +899,6 @@ int ObExprUDF::eval_mysql_udtf(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res)
       for (int64_t i = 0; OB_SUCC(ret) && i < expr.arg_cnt_; ++i) {
         if (OB_ISNULL(expr.args_[i])) {
           ret = OB_ERR_UNEXPECTED;
-        } else if (OB_FAIL(arg_types.push_back(udf_info.params_type_.at(i)))) {
-            LOG_WARN("failed to push_back arg datum meta", K(ret), K(i), K(expr));
         } else {
           const ObDatum &datum = expr.args_[i]->locate_expr_datum(ctx);
           ObObj obj;
@@ -938,7 +935,7 @@ int ObExprUDF::eval_mysql_udtf(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &res)
                   ctx.exec_ctx_, udf_info.udf_id_, udf_info.external_routine_type_,
                   udf_info.external_routine_url_, udf_info.external_routine_resource_,
                   udf_info.external_routine_entry_, 1, "process",
-                  arg_types, args, udf_info.result_type_, alloc, res_array, true))) {
+                  udf_info.params_type_, args, udf_info.result_type_, alloc, res_array, true))) {
             LOG_WARN("failed to execute java udtf", K(ret));
           }
         }

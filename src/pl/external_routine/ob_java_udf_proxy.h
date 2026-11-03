@@ -180,7 +180,7 @@ public:
                     const common::ObString &entry,
                     int64_t batch_size,
                     const char *method_name,
-                    const common::ObIArray<common::ObObjMeta> &arg_types,
+                    const common::ObIArray<sql::ObExprResType> &arg_types,
                     const common::ObIArray<common::ObIArray<common::ObObj>*> &args,
                     const sql::ObExprResType &res_type,
                     common::ObIAllocator &result_allocator,
@@ -252,6 +252,19 @@ private:
                                         char *&payload,
                                         int64_t &payload_len);
 
+  static int build_execute_adapter_req_payload(int64_t session_id,
+                                               int64_t timeout_ts,
+                                               int64_t udf_id,
+                                               int64_t ctx_id,
+                                               const common::ObString &method_name,
+                                               const char *function_info_buf,
+                                               int64_t function_info_len,
+                                               const char *batched_args_buf,
+                                               int64_t batched_args_len,
+                                               common::ObIAllocator &alloc,
+                                               char *&payload,
+                                               int64_t &payload_len);
+
   static int parse_execute_resp(const char *payload,
                                  int64_t payload_len,
                                  const sql::ObExprResType &res_type,
@@ -269,7 +282,6 @@ private:
                                      common::ObIAllocator &alloc,
                                      common::ObIArray<common::ObObj> &result);
 
-  static const char *get_java_type_name_for_ob_type(const common::ObObjMeta &meta);
   static JavaSandboxDrainReason classify_sandbox_error(int32_t error_code,
                                                        const common::ObString &error_msg);
   static bool is_sandbox_channel_failure(int ret);

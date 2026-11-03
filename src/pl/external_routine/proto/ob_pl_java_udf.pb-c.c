@@ -552,6 +552,96 @@ void   ob_pl__java_udf__byte_buffer_values__free_unpacked
   assert(message->base.descriptor == &ob_pl__java_udf__byte_buffer_values__descriptor);
   protobuf_c_message_free_unpacked ((ProtobufCMessage*)message, allocator);
 }
+void   ob_pl__java_udf__java_type_desc__init
+                     (ObPl__JavaUdf__JavaTypeDesc         *message)
+{
+  static const ObPl__JavaUdf__JavaTypeDesc init_value = OB_PL__JAVA_UDF__JAVA_TYPE_DESC__INIT;
+  *message = init_value;
+}
+size_t ob_pl__java_udf__java_type_desc__get_packed_size
+                     (const ObPl__JavaUdf__JavaTypeDesc *message)
+{
+  assert(message->base.descriptor == &ob_pl__java_udf__java_type_desc__descriptor);
+  return protobuf_c_message_get_packed_size ((const ProtobufCMessage*)(message));
+}
+size_t ob_pl__java_udf__java_type_desc__pack
+                     (const ObPl__JavaUdf__JavaTypeDesc *message,
+                      uint8_t       *out)
+{
+  assert(message->base.descriptor == &ob_pl__java_udf__java_type_desc__descriptor);
+  return protobuf_c_message_pack ((const ProtobufCMessage*)message, out);
+}
+size_t ob_pl__java_udf__java_type_desc__pack_to_buffer
+                     (const ObPl__JavaUdf__JavaTypeDesc *message,
+                      ProtobufCBuffer *buffer)
+{
+  assert(message->base.descriptor == &ob_pl__java_udf__java_type_desc__descriptor);
+  return protobuf_c_message_pack_to_buffer ((const ProtobufCMessage*)message, buffer);
+}
+ObPl__JavaUdf__JavaTypeDesc *
+       ob_pl__java_udf__java_type_desc__unpack
+                     (ProtobufCAllocator  *allocator,
+                      size_t               len,
+                      const uint8_t       *data)
+{
+  return (ObPl__JavaUdf__JavaTypeDesc *)
+     protobuf_c_message_unpack (&ob_pl__java_udf__java_type_desc__descriptor,
+                                allocator, len, data);
+}
+void   ob_pl__java_udf__java_type_desc__free_unpacked
+                     (ObPl__JavaUdf__JavaTypeDesc *message,
+                      ProtobufCAllocator *allocator)
+{
+  if(!message)
+    return;
+  assert(message->base.descriptor == &ob_pl__java_udf__java_type_desc__descriptor);
+  protobuf_c_message_free_unpacked ((ProtobufCMessage*)message, allocator);
+}
+void   ob_pl__java_udf__function_info__init
+                     (ObPl__JavaUdf__FunctionInfo         *message)
+{
+  static const ObPl__JavaUdf__FunctionInfo init_value = OB_PL__JAVA_UDF__FUNCTION_INFO__INIT;
+  *message = init_value;
+}
+size_t ob_pl__java_udf__function_info__get_packed_size
+                     (const ObPl__JavaUdf__FunctionInfo *message)
+{
+  assert(message->base.descriptor == &ob_pl__java_udf__function_info__descriptor);
+  return protobuf_c_message_get_packed_size ((const ProtobufCMessage*)(message));
+}
+size_t ob_pl__java_udf__function_info__pack
+                     (const ObPl__JavaUdf__FunctionInfo *message,
+                      uint8_t       *out)
+{
+  assert(message->base.descriptor == &ob_pl__java_udf__function_info__descriptor);
+  return protobuf_c_message_pack ((const ProtobufCMessage*)message, out);
+}
+size_t ob_pl__java_udf__function_info__pack_to_buffer
+                     (const ObPl__JavaUdf__FunctionInfo *message,
+                      ProtobufCBuffer *buffer)
+{
+  assert(message->base.descriptor == &ob_pl__java_udf__function_info__descriptor);
+  return protobuf_c_message_pack_to_buffer ((const ProtobufCMessage*)message, buffer);
+}
+ObPl__JavaUdf__FunctionInfo *
+       ob_pl__java_udf__function_info__unpack
+                     (ProtobufCAllocator  *allocator,
+                      size_t               len,
+                      const uint8_t       *data)
+{
+  return (ObPl__JavaUdf__FunctionInfo *)
+     protobuf_c_message_unpack (&ob_pl__java_udf__function_info__descriptor,
+                                allocator, len, data);
+}
+void   ob_pl__java_udf__function_info__free_unpacked
+                     (ObPl__JavaUdf__FunctionInfo *message,
+                      ProtobufCAllocator *allocator)
+{
+  if(!message)
+    return;
+  assert(message->base.descriptor == &ob_pl__java_udf__function_info__descriptor);
+  protobuf_c_message_free_unpacked ((ProtobufCMessage*)message, allocator);
+}
 static const ProtobufCFieldDescriptor ob_pl__java_udf__batched_args__field_descriptors[3] =
 {
   {
@@ -1188,5 +1278,134 @@ const ProtobufCMessageDescriptor ob_pl__java_udf__byte_buffer_values__descriptor
   ob_pl__java_udf__byte_buffer_values__field_indices_by_name,
   1,  ob_pl__java_udf__byte_buffer_values__number_ranges,
   (ProtobufCMessageInit) ob_pl__java_udf__byte_buffer_values__init,
+  NULL,NULL,NULL    /* reserved[123] */
+};
+static const ProtobufCFieldDescriptor ob_pl__java_udf__java_type_desc__field_descriptors[3] =
+{
+  {
+    "java_type",
+    1,
+    PROTOBUF_C_LABEL_NONE,
+    PROTOBUF_C_TYPE_STRING,
+    0,   /* quantifier_offset */
+    offsetof(ObPl__JavaUdf__JavaTypeDesc, java_type),
+    NULL,
+    &protobuf_c_empty_string,
+    0,             /* flags */
+    0,NULL,NULL    /* reserved1,reserved2, etc */
+  },
+  {
+    "precision",
+    2,
+    PROTOBUF_C_LABEL_NONE,
+    PROTOBUF_C_TYPE_INT32,
+    offsetof(ObPl__JavaUdf__JavaTypeDesc, decimal_precision_case),
+    offsetof(ObPl__JavaUdf__JavaTypeDesc, precision),
+    NULL,
+    NULL,
+    PROTOBUF_C_FIELD_FLAG_ONEOF,             /* flags */
+    0,NULL,NULL    /* reserved1,reserved2, etc */
+  },
+  {
+    "scale",
+    3,
+    PROTOBUF_C_LABEL_NONE,
+    PROTOBUF_C_TYPE_INT32,
+    offsetof(ObPl__JavaUdf__JavaTypeDesc, decimal_scale_case),
+    offsetof(ObPl__JavaUdf__JavaTypeDesc, scale),
+    NULL,
+    NULL,
+    PROTOBUF_C_FIELD_FLAG_ONEOF,             /* flags */
+    0,NULL,NULL    /* reserved1,reserved2, etc */
+  },
+};
+static const unsigned ob_pl__java_udf__java_type_desc__field_indices_by_name[] = {
+  0,   /* field[0] = java_type */
+  1,   /* field[1] = precision */
+  2,   /* field[2] = scale */
+};
+static const ProtobufCIntRange ob_pl__java_udf__java_type_desc__number_ranges[1 + 1] =
+{
+  { 1, 0 },
+  { 0, 3 }
+};
+const ProtobufCMessageDescriptor ob_pl__java_udf__java_type_desc__descriptor =
+{
+  PROTOBUF_C__MESSAGE_DESCRIPTOR_MAGIC,
+  "ob_pl.java_udf.JavaTypeDesc",
+  "JavaTypeDesc",
+  "ObPl__JavaUdf__JavaTypeDesc",
+  "ob_pl.java_udf",
+  sizeof(ObPl__JavaUdf__JavaTypeDesc),
+  3,
+  ob_pl__java_udf__java_type_desc__field_descriptors,
+  ob_pl__java_udf__java_type_desc__field_indices_by_name,
+  1,  ob_pl__java_udf__java_type_desc__number_ranges,
+  (ProtobufCMessageInit) ob_pl__java_udf__java_type_desc__init,
+  NULL,NULL,NULL    /* reserved[123] */
+};
+static const ProtobufCFieldDescriptor ob_pl__java_udf__function_info__field_descriptors[3] =
+{
+  {
+    "class_name",
+    1,
+    PROTOBUF_C_LABEL_NONE,
+    PROTOBUF_C_TYPE_STRING,
+    0,   /* quantifier_offset */
+    offsetof(ObPl__JavaUdf__FunctionInfo, class_name),
+    NULL,
+    &protobuf_c_empty_string,
+    0,             /* flags */
+    0,NULL,NULL    /* reserved1,reserved2, etc */
+  },
+  {
+    "input_types",
+    3,
+    PROTOBUF_C_LABEL_REPEATED,
+    PROTOBUF_C_TYPE_MESSAGE,
+    offsetof(ObPl__JavaUdf__FunctionInfo, n_input_types),
+    offsetof(ObPl__JavaUdf__FunctionInfo, input_types),
+    &ob_pl__java_udf__java_type_desc__descriptor,
+    NULL,
+    0,             /* flags */
+    0,NULL,NULL    /* reserved1,reserved2, etc */
+  },
+  {
+    "result_type",
+    4,
+    PROTOBUF_C_LABEL_NONE,
+    PROTOBUF_C_TYPE_MESSAGE,
+    0,   /* quantifier_offset */
+    offsetof(ObPl__JavaUdf__FunctionInfo, result_type),
+    &ob_pl__java_udf__java_type_desc__descriptor,
+    NULL,
+    0,             /* flags */
+    0,NULL,NULL    /* reserved1,reserved2, etc */
+  },
+};
+static const unsigned ob_pl__java_udf__function_info__field_indices_by_name[] = {
+  0,   /* field[0] = class_name */
+  1,   /* field[1] = input_types */
+  2,   /* field[2] = result_type */
+};
+static const ProtobufCIntRange ob_pl__java_udf__function_info__number_ranges[2 + 1] =
+{
+  { 1, 0 },
+  { 3, 1 },
+  { 0, 3 }
+};
+const ProtobufCMessageDescriptor ob_pl__java_udf__function_info__descriptor =
+{
+  PROTOBUF_C__MESSAGE_DESCRIPTOR_MAGIC,
+  "ob_pl.java_udf.FunctionInfo",
+  "FunctionInfo",
+  "ObPl__JavaUdf__FunctionInfo",
+  "ob_pl.java_udf",
+  sizeof(ObPl__JavaUdf__FunctionInfo),
+  3,
+  ob_pl__java_udf__function_info__field_descriptors,
+  ob_pl__java_udf__function_info__field_indices_by_name,
+  2,  ob_pl__java_udf__function_info__number_ranges,
+  (ProtobufCMessageInit) ob_pl__java_udf__function_info__init,
   NULL,NULL,NULL    /* reserved[123] */
 };

@@ -33,7 +33,7 @@ public:
 
   int execute(int64_t batch_size,
               const char *method_name,
-              const ObIArray<ObObjMeta> &arg_types,
+              const ObIArray<ObExprResType> &arg_types,
               const ObIArray<ObIArray<ObObj>*> &args,
               const ObExprResType &res_type,
               ObIAllocator &result_allocator,
@@ -58,7 +58,7 @@ private:
   static int build_udf_args(const ObSQLSessionInfo &session,
                             ObSchemaGetterGuard &schema_guard,
                             int64_t batch_size,
-                            const ObIArray<ObObjMeta> &arg_types,
+                            const ObIArray<ObExprResType> &arg_types,
                             const ObIArray<ObIArray<ObObj> *> &args,
                             JNIEnv &env,
                             ObIAllocator &arg_alloc,

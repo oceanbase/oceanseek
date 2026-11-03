@@ -22,6 +22,7 @@ enum ObJavaSandboxMsgType : uint8_t {
   JAVA_SANDBOX_CREATE_CHANNEL      = 0x0A,
   JAVA_SANDBOX_SHUTDOWN            = 0x0C,
   JAVA_SANDBOX_EVICT_STATEMENT     = 0x0D,
+  JAVA_SANDBOX_EXECUTE_ADAPTER_REQ = 0x0E, // FunctionInfo; response is EXECUTE_RESP.
 };
 
 // Sandbox-internal error codes carried in the error payload of *_RESP frames

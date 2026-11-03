@@ -117,7 +117,7 @@ int ObJavaUDFExecutor::get_class_loader(ObExecContext &exec_ctx,
 
 int ObJavaUDFExecutor::execute(int64_t batch_size,
                                const char *method,
-                               const ObIArray<ObObjMeta> &arg_types,
+                               const ObIArray<ObExprResType> &arg_types,
                                const ObIArray<ObIArray<ObObj> *> &args,
                                const ObExprResType &res_type,
                                ObIAllocator &result_allocator,
@@ -146,12 +146,6 @@ int ObJavaUDFExecutor::execute(int64_t batch_size,
     } else {
       jclass executor_clazz = nullptr;
       jmethodID execute_method = nullptr;
-      jclass class_loader_clazz = nullptr;
-      jmethodID loader_constructor = nullptr;
-      jmethodID find_class_method = nullptr;
-      jstring class_name = nullptr;
-      jclass udf_clazz = nullptr;
-      jmethodID udf_obj_constructor = nullptr;
       jobject udf_obj = nullptr;
       jstring method_name = nullptr;
       jclass object_clazz =nullptr;
@@ -167,35 +161,10 @@ int ObJavaUDFExecutor::execute(int64_t batch_size,
       } else if (OB_ISNULL(executor_clazz) || OB_ISNULL(execute_method)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected NULL loader or method", K(ret), K(executor_clazz), K(execute_method));
-      } else if (OB_FAIL(ObJavaUtils::get_udf_loader_class(*env, class_loader_clazz, loader_constructor, find_class_method))) {
-        LOG_WARN("failed to get_udf_loader_class", K(ret));
-      } else if (OB_ISNULL(class_loader_clazz) || OB_ISNULL(find_class_method)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected NULL class_loader_clazz or find_class_method", K(ret), K(class_loader_clazz), K(find_class_method));
-      } else if (OB_ISNULL(class_name = env->NewStringUTF(entry_.ptr()))) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("failed to NewStringUTF", K(ret), K(entry_));
-      } else if (FALSE_IT(udf_clazz = static_cast<jclass>(env->CallObjectMethod(loader_, find_class_method, class_name)))) {
-        // unreachable
-      } else if (OB_FAIL(ObJavaUtils::exception_check(env))) {
-        LOG_WARN("failed to findClass of ObJavaUDFClassLoader", K(ret));
-      } else if (OB_ISNULL(udf_clazz)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected NULL udf_obj", K(ret));
-      } else if (FALSE_IT(udf_obj_constructor = env->GetMethodID(udf_clazz, "<init>", "()V"))) {
-        // unreachable
-      } else if (OB_FAIL(ObJavaUtils::exception_check(env))) {
-        LOG_WARN("failed to get udf_obj_constructor", K(ret));
-      } else if (OB_ISNULL(udf_obj_constructor)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected NULL udf_obj_constructor", K(ret));
-      } else if (FALSE_IT(udf_obj = env->NewObject(udf_clazz, udf_obj_constructor))) {
-        // unreachable
-      } else if (OB_FAIL(ObJavaUtils::exception_check(env))) {
-        LOG_WARN("failed to construct udf_obj", K(ret));
-      } else if (OB_ISNULL(udf_obj)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected NULL udf_obj", K(ret));
+      } else if (OB_FAIL(ObJavaUtils::create_function_adapter(
+                     exec_ctx_, *env, loader_, entry_, method,
+                     arg_types, res_type, result_allocator, udf_obj))) {
+        LOG_WARN("failed to create Java UDF object", K(ret));
       } else if (OB_ISNULL(method_name = env->NewStringUTF(method))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("failed to NewStringUTF execute", K(ret));
@@ -287,8 +256,6 @@ int ObJavaUDFExecutor::execute(int64_t batch_size,
       }
 
       // always delete local ref
-      ObJavaUtils::delete_local_ref(class_name, env);
-      ObJavaUtils::delete_local_ref(udf_clazz, env);
       ObJavaUtils::delete_local_ref(udf_obj, env);
       ObJavaUtils::delete_local_ref(method_name, env);
       ObJavaUtils::delete_local_ref(java_types, env);
@@ -303,7 +270,7 @@ int ObJavaUDFExecutor::execute(int64_t batch_size,
 int ObJavaUDFExecutor::build_udf_args(const ObSQLSessionInfo &session,
                                       ObSchemaGetterGuard &schema_guard,
                                       int64_t batch_size,
-                                      const ObIArray<ObObjMeta> &arg_types,
+                                      const ObIArray<ObExprResType> &arg_types,
                                       const ObIArray<ObIArray<ObObj> *> &args,
                                       JNIEnv &env,
                                       ObIAllocator &arg_alloc,

@@ -25,7 +25,7 @@ class ObObjMeta;
 }
 
 namespace share { namespace schema { class ObSchemaGetterGuard; } }
-namespace sql { class ObSQLSessionInfo; }
+namespace sql { class ObSQLSessionInfo; class ObExecContext; }
 
 namespace pl
 {
@@ -33,6 +33,21 @@ namespace pl
 class ObJavaUtils
 {
 public:
+  static const char *get_java_type_name_for_ob_type(const common::ObObjMeta &meta);
+  static int build_java_type_desc(const sql::ObExprResType &type,
+                                  ObPl__JavaUdf__JavaTypeDesc &desc);
+  static int build_function_info(const ObString &entry,
+                                 const common::ObIArray<sql::ObExprResType> &input_types,
+                                 const sql::ObExprResType &result_type,
+                                 common::ObIAllocator &allocator, char *&buffer, int64_t &size);
+  static int create_raw_udf_obj(JNIEnv &env, jobject loader, const ObString &entry,
+                                common::ObIAllocator &allocator, jobject &udf_obj);
+  static int create_function_adapter(sql::ObExecContext &ctx, JNIEnv &env, jobject loader,
+                                     const ObString &entry, const char *method_name,
+                                     const common::ObIArray<sql::ObExprResType> &inputs,
+                                     const sql::ObExprResType &result_type,
+                                     common::ObIAllocator &alloc, jobject &adapter);
+
   static int load_routine_jar(const ObString &jar, jobject &class_loader);
   static void delete_local_ref(jobject obj, JNIEnv *env = nullptr);
   static void delete_global_ref(jobject obj, JNIEnv *env = nullptr);
@@ -360,7 +375,7 @@ public:
       const sql::ObSQLSessionInfo &session,
       share::schema::ObSchemaGetterGuard &schema_guard,
       int64_t batch_size,
-      const common::ObIArray<common::ObObjMeta> &arg_types,
+      const common::ObIArray<sql::ObExprResType> &arg_types,
       const common::ObIArray<common::ObIArray<common::ObObj> *> &args,
       common::ObIAllocator &alloc,
       char *&buffer,

@@ -26,6 +26,7 @@
 #include <stdlib.h>
 #include <arpa/inet.h>
 #include <dirent.h>
+#include <libgen.h>
 #include <sys/stat.h>
 
 namespace oceanbase
@@ -975,6 +976,8 @@ int ObJavaUDFProxy::launch_sandbox(JavaSandboxInstance &instance)
   char java_home[common::MAX_PATH_SIZE] = {0};
   char java_path[common::MAX_PATH_SIZE] = {0};
   char sdk_jar[common::MAX_PATH_SIZE] = {0};
+  char sdk_dir_buf[common::MAX_PATH_SIZE] = {0};
+  char *sdk_dir = nullptr;
   char java_opts[4096] = {0};
   char execute_arg[8192] = {0};
 
@@ -1031,6 +1034,10 @@ int ObJavaUDFProxy::launch_sandbox(JavaSandboxInstance &instance)
         if (n < 0 || n >= (int)sizeof(sdk_jar)) {
           ret = common::OB_SIZE_OVERFLOW;
           LOG_WARN("resolved sdk_jar too long", K(ret), K(n));
+        } else {
+          // Mount the installation directory, including compat/; only sdk_jar is on -cp.
+          MEMCPY(sdk_dir_buf, sdk_jar, n + 1);
+          sdk_dir = dirname(sdk_dir_buf);
         }
       }
     }
@@ -1066,9 +1073,9 @@ int ObJavaUDFProxy::launch_sandbox(JavaSandboxInstance &instance)
       } else if (OB_FAIL(process->mount_path(java_home, java_home,
                                              observer::ObSandboxProcess::MOUNT_RDONLY))) {
         LOG_WARN("mount java_home failed", K(ret));
-      } else if (OB_FAIL(process->mount_path(sdk_jar, sdk_jar,
+      } else if (OB_FAIL(process->mount_path(sdk_dir, sdk_dir,
                                              observer::ObSandboxProcess::MOUNT_RDONLY))) {
-        LOG_WARN("mount sdk_jar failed", K(ret));
+        LOG_WARN("mount java udf directory failed", K(ret), K(sdk_dir));
       }
       // mount system crypto-policies for JDK11+ java.security initialization (best-effort)
       if (OB_SUCC(ret) && 0 == access("/etc/crypto-policies", R_OK)) {
@@ -1175,67 +1182,6 @@ int ObJavaUDFProxy::unpack_values_to_obobj(
   return ret;
 }
 
-// ---- result type name mapping ----
-
-const char *ObJavaUDFProxy::get_java_type_name_for_ob_type(const common::ObObjMeta &meta)
-{
-  const char *name = "";
-  switch (meta.get_type()) {
-  case ObTinyIntType:
-  case ObUTinyIntType:
-    name = "java.lang.Byte";
-    break;
-  case ObSmallIntType:
-  case ObUSmallIntType:
-    name = "java.lang.Short";
-    break;
-  case ObMediumIntType:
-  case ObUMediumIntType:
-  case ObInt32Type:
-  case ObUInt32Type:
-    name = "java.lang.Integer";
-    break;
-  case ObBitType:
-  case ObIntType:
-  case ObUInt64Type:
-    name = "java.lang.Long";
-    break;
-  case ObFloatType:
-  case ObUFloatType:
-    name = "java.lang.Float";
-    break;
-  case ObDoubleType:
-  case ObUDoubleType:
-    name = "java.lang.Double";
-    break;
-  case ObNumberType:
-  case ObUNumberType:
-  case ObNumberFloatType:
-    name = "java.math.BigDecimal";
-    break;
-  case ObVarcharType:
-  case ObCharType:
-  case ObHexStringType:
-  case ObNVarchar2Type:
-  case ObNCharType:
-  case ObTinyTextType:
-  case ObTextType:
-  case ObMediumTextType:
-  case ObLongTextType:
-  case ObLobType:
-    name = (CHARSET_BINARY != meta.get_charset_type()) ? "java.lang.String" : "java.nio.ByteBuffer";
-    break;
-  default:
-    break;
-  }
-  return name;
-}
-
-// ---- EXECUTE_REQ payload encoding ----
-// Wire format: session_id(8B) + timeout_ts(8B) + mode(1B) + udf_id(8B) +
-//   class_name_len(2B) + class_name + method_name_len(2B) + method_name +
-//   result_type_len(2B) + result_type_name + batched_args(var)
-
 static void encode_be64(char *buf, int64_t val)
 {
   uint64_t n = htobe64(static_cast<uint64_t>(val));
@@ -1246,6 +1192,12 @@ static void encode_be16(char *buf, uint16_t val)
 {
   uint16_t n = htons(val);
   memcpy(buf, &n, 2);
+}
+
+static void encode_be32(char *buf, int32_t val)
+{
+  uint32_t n = htonl(static_cast<uint32_t>(val));
+  memcpy(buf, &n, 4);
 }
 
 static int64_t decode_be64(const char *buf)
@@ -1262,6 +1214,9 @@ static int32_t decode_be32(const char *buf)
   return static_cast<int32_t>(ntohl(n));
 }
 
+// EXECUTE_REQ (MySQL):
+// session_id(8B) + timeout_ts(8B) + mode(1B) + udf_id(8B) + ctx_id(8B)
+// + class_name(2B length) + method_name(2B length) + result_type_name(2B length) + BatchedArgs.
 int ObJavaUDFProxy::build_execute_req_payload(
     int64_t session_id,
     int64_t timeout_ts,
@@ -1302,6 +1257,54 @@ int ObJavaUDFProxy::build_execute_req_payload(
 
     encode_be16(payload + pos, static_cast<uint16_t>(result_type_name.length())); pos += 2;
     memcpy(payload + pos, result_type_name.ptr(), result_type_name.length()); pos += result_type_name.length();
+
+    if (batched_args_len > 0 && OB_NOT_NULL(batched_args_buf)) {
+      memcpy(payload + pos, batched_args_buf, batched_args_len); pos += batched_args_len;
+    }
+    payload_len = pos;
+  }
+  return ret;
+}
+
+// EXECUTE_ADAPTER_REQ:
+// session_id(8B) + timeout_ts(8B) + mode(1B) + udf_id(8B) + ctx_id(8B)
+// + method_name(2B length) + FunctionInfo(4B length) + BatchedArgs.
+int ObJavaUDFProxy::build_execute_adapter_req_payload(
+    int64_t session_id,
+    int64_t timeout_ts,
+    int64_t udf_id,
+    int64_t ctx_id,
+    const common::ObString &method_name,
+    const char *function_info_buf,
+    int64_t function_info_len,
+    const char *batched_args_buf,
+    int64_t batched_args_len,
+    common::ObIAllocator &alloc,
+    char *&payload,
+    int64_t &payload_len)
+{
+  int ret = OB_SUCCESS;
+  // Fixed context, method name, length-delimited FunctionInfo, then original BatchedArgs.
+  int64_t total = 33
+      + 2 + method_name.length()
+      + 4 + function_info_len
+      + batched_args_len;
+  payload = static_cast<char*>(alloc.alloc(total));
+  if (OB_ISNULL(payload)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    int64_t pos = 0;
+    encode_be64(payload + pos, session_id); pos += 8;
+    encode_be64(payload + pos, timeout_ts); pos += 8;
+    payload[pos++] = 0; // mode = MySQL
+    encode_be64(payload + pos, udf_id); pos += 8;
+    encode_be64(payload + pos, ctx_id); pos += 8;
+
+    encode_be16(payload + pos, static_cast<uint16_t>(method_name.length())); pos += 2;
+    memcpy(payload + pos, method_name.ptr(), method_name.length()); pos += method_name.length();
+
+    encode_be32(payload + pos, static_cast<int32_t>(function_info_len)); pos += 4;
+    memcpy(payload + pos, function_info_buf, function_info_len); pos += function_info_len;
 
     if (batched_args_len > 0 && OB_NOT_NULL(batched_args_buf)) {
       memcpy(payload + pos, batched_args_buf, batched_args_len); pos += batched_args_len;
@@ -1791,7 +1794,7 @@ int ObJavaUDFProxy::execute_mysql(
     const common::ObString &entry,
     int64_t batch_size,
     const char *method_name,
-    const common::ObIArray<common::ObObjMeta> &arg_types,
+    const common::ObIArray<sql::ObExprResType> &arg_types,
     const common::ObIArray<common::ObIArray<common::ObObj>*> &args,
     const sql::ObExprResType &res_type,
     common::ObIAllocator &result_allocator,
@@ -1848,14 +1851,18 @@ int ObJavaUDFProxy::execute_mysql(
           // 1. build protobuf args
           char *args_buf = nullptr;
           int64_t args_len = 0;
-          if (OB_FAIL(ObJavaUtils::build_udf_args_to_buffer(*session, *schema_guard, batch_size,
+          char *function_info_buf = nullptr;
+          int64_t function_info_len = 0;
+          if (OB_FAIL(ObJavaUtils::build_function_info(
+                  entry,
+                  arg_types, res_type, tmp_alloc, function_info_buf, function_info_len))) {
+            LOG_WARN("build function info failed", K(ret));
+          } else if (OB_FAIL(ObJavaUtils::build_udf_args_to_buffer(*session, *schema_guard, batch_size,
                                                 arg_types, args, tmp_alloc,
                                                 args_buf, args_len))) {
             LOG_WARN("build_udf_args_to_buffer failed", K(ret));
           } else {
-            // 2. build EXECUTE_REQ payload
-            const char *result_type_str = get_java_type_name_for_ob_type(res_type);
-            common::ObString result_type_name(strlen(result_type_str), result_type_str);
+            // 2. build EXECUTE_ADAPTER_REQ payload
             common::ObString method_str(strlen(method_name), method_name);
 
             int64_t ctx_id = 0;
@@ -1870,13 +1877,14 @@ int ObJavaUDFProxy::execute_mysql(
 
             char *payload = nullptr;
             int64_t payload_len = 0;
-            if (OB_FAIL(build_execute_req_payload(
+            if (OB_FAIL(build_execute_adapter_req_payload(
                     session->get_server_sid(),
                     std::min(session->get_query_timeout_ts(), THIS_WORKER.get_timeout_ts()),
-                    udf_id, ctx_id, entry, method_str, result_type_name,
+                    udf_id, ctx_id, method_str, function_info_buf, function_info_len,
                     args_buf, args_len, tmp_alloc, payload, payload_len))) {
               LOG_WARN("build payload failed", K(ret));
-            } else {
+            }
+            if (OB_SUCC(ret)) {
               // 3. send/recv via channel
               ObJavaChannel *ch = nullptr;
               JavaSandboxDrainReason failure_reason = JSDR_NONE;
@@ -1890,7 +1898,7 @@ int ObJavaUDFProxy::execute_mysql(
                           "sandbox_pid", OB_NOT_NULL(instance->get_sandbox_process())
                                           ? instance->get_sandbox_process()->get_pid() : -1,
                           "generation_id", instance->get_generation_id());
-                if (OB_FAIL(ch->send_frame(JAVA_SANDBOX_EXECUTE_REQ, payload, payload_len, req_id))) {
+                if (OB_FAIL(ch->send_frame(JAVA_SANDBOX_EXECUTE_ADAPTER_REQ, payload, payload_len, req_id))) {
                   channel_reusable = false;
                   retryable_failure = is_sandbox_channel_failure(ret);
                   LOG_WARN("[SANDBOX_DIAG] send EXECUTE_REQ failed",
@@ -2020,14 +2028,12 @@ int ObJavaUDFProxy::execute_mysql_udaf(
 
     using ColumnType = common::ObSEArray<common::ObObj, 512>;
 
-    common::ObSEArray<common::ObObjMeta, 8> arg_types;
+    const common::ObIArray<sql::ObExprResType> &arg_types = aggr_info.pl_agg_udf_params_type_;
     common::ObSEArray<common::ObIArray<common::ObObj>*, 8> args;
 
     for (int64_t i = 0; OB_SUCC(ret) && i < arg_count; ++i) {
       ColumnType *column = nullptr;
-      if (OB_FAIL(arg_types.push_back(aggr_info.pl_agg_udf_params_type_.at(i)))) {
-        LOG_WARN("push_back arg_types failed", K(ret));
-      } else if (OB_ISNULL(column = static_cast<ColumnType*>(allocator.alloc(sizeof(ColumnType))))) {
+      if (OB_ISNULL(column = static_cast<ColumnType*>(allocator.alloc(sizeof(ColumnType))))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
       } else if (OB_ISNULL(column = new(column)ColumnType())) {
         ret = OB_ERR_UNEXPECTED;
@@ -2037,8 +2043,6 @@ int ObJavaUDFProxy::execute_mysql_udaf(
     }
 
     int64_t timeout_ts = std::min(session->get_query_timeout_ts(), THIS_WORKER.get_timeout_ts());
-    const char *result_type_str = get_java_type_name_for_ob_type(aggr_info.pl_result_type_);
-    common::ObString result_type_name(strlen(result_type_str), result_type_str);
 
     int64_t udaf_ctx_id = 0;
     {
@@ -2051,9 +2055,15 @@ int ObJavaUDFProxy::execute_mysql_udaf(
     }
 
     common::ObString entry;
+    char *function_info_buf = nullptr;
+    int64_t function_info_len = 0;
     if (OB_SUCC(ret)) {
       if (OB_FAIL(ob_write_string(allocator, aggr_info.external_routine_entry_, entry, true))) {
         LOG_WARN("ob_write_string failed", K(ret));
+      } else if (OB_FAIL(ObJavaUtils::build_function_info(
+                     entry, arg_types, aggr_info.pl_result_type_, allocator,
+                     function_info_buf, function_info_len))) {
+        LOG_WARN("build aggregate function info failed", K(ret));
       }
     }
 
@@ -2110,15 +2120,16 @@ int ObJavaUDFProxy::execute_mysql_udaf(
           common::ObString method_str("iterate");
           char *payload = nullptr;
           int64_t payload_len = 0;
-          if (OB_FAIL(build_execute_req_payload(
+          if (OB_FAIL(build_execute_adapter_req_payload(
                   session->get_server_sid(), timeout_ts,
-                  aggr_info.pl_agg_udf_type_id_, udaf_ctx_id, entry, method_str,
-                  result_type_name, args_buf, args_len,
+                  aggr_info.pl_agg_udf_type_id_, udaf_ctx_id, method_str,
+                  function_info_buf, function_info_len, args_buf, args_len,
                   batch_allocator, payload, payload_len))) {
             LOG_WARN("build payload failed", K(ret));
-          } else {
+          }
+          if (OB_SUCC(ret)) {
             uint32_t req_id = 0;
-            if (OB_FAIL(ch->send_frame(JAVA_SANDBOX_EXECUTE_REQ, payload, payload_len, req_id))) {
+            if (OB_FAIL(ch->send_frame(JAVA_SANDBOX_EXECUTE_ADAPTER_REQ, payload, payload_len, req_id))) {
               channel_reusable = false;
               LOG_WARN("send iterate failed", K(ret));
             } else {
@@ -2185,7 +2196,7 @@ int ObJavaUDFProxy::execute_mysql_udaf(
     // terminate phase
     if (OB_SUCC(ret)) {
       batch_allocator.reuse();
-      common::ObSEArray<common::ObObjMeta, 1> empty_types;
+      common::ObSEArray<sql::ObExprResType, 1> empty_types;
       common::ObSEArray<common::ObIArray<common::ObObj>*, 1> empty_args;
 
       char *args_buf = nullptr;
@@ -2198,15 +2209,16 @@ int ObJavaUDFProxy::execute_mysql_udaf(
         common::ObString method_str("terminate");
         char *payload = nullptr;
         int64_t payload_len = 0;
-        if (OB_FAIL(build_execute_req_payload(
+        if (OB_FAIL(build_execute_adapter_req_payload(
                 session->get_server_sid(), timeout_ts,
-                aggr_info.pl_agg_udf_type_id_, udaf_ctx_id, entry, method_str,
-                result_type_name, args_buf, args_len,
+                aggr_info.pl_agg_udf_type_id_, udaf_ctx_id, method_str,
+                function_info_buf, function_info_len, args_buf, args_len,
                 batch_allocator, payload, payload_len))) {
           LOG_WARN("build terminate payload failed", K(ret));
-        } else {
+        }
+        if (OB_SUCC(ret)) {
           uint32_t req_id = 0;
-          if (OB_FAIL(ch->send_frame(JAVA_SANDBOX_EXECUTE_REQ, payload, payload_len, req_id))) {
+          if (OB_FAIL(ch->send_frame(JAVA_SANDBOX_EXECUTE_ADAPTER_REQ, payload, payload_len, req_id))) {
             channel_reusable = false;
             LOG_WARN("send terminate failed", K(ret));
           } else {

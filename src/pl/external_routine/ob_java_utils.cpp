@@ -21,6 +21,275 @@ using namespace common;
 namespace pl
 {
 
+const char *ObJavaUtils::get_java_type_name_for_ob_type(const common::ObObjMeta &meta)
+{
+  const char *name = "";
+  switch (meta.get_type()) {
+  case ObTinyIntType:
+  case ObUTinyIntType:
+    name = "java.lang.Byte";
+    break;
+  case ObSmallIntType:
+  case ObUSmallIntType:
+    name = "java.lang.Short";
+    break;
+  case ObMediumIntType:
+  case ObUMediumIntType:
+  case ObInt32Type:
+  case ObUInt32Type:
+    name = "java.lang.Integer";
+    break;
+  case ObBitType:
+  case ObIntType:
+  case ObUInt64Type:
+    name = "java.lang.Long";
+    break;
+  case ObFloatType:
+  case ObUFloatType:
+    name = "java.lang.Float";
+    break;
+  case ObDoubleType:
+  case ObUDoubleType:
+    name = "java.lang.Double";
+    break;
+  case ObNumberType:
+  case ObUNumberType:
+  case ObNumberFloatType:
+    name = "java.math.BigDecimal";
+    break;
+  case ObVarcharType:
+  case ObCharType:
+  case ObHexStringType:
+  case ObNVarchar2Type:
+  case ObNCharType:
+  case ObTinyTextType:
+  case ObTextType:
+  case ObMediumTextType:
+  case ObLongTextType:
+  case ObLobType:
+    name = (CHARSET_BINARY != meta.get_charset_type()) ? "java.lang.String" : "java.nio.ByteBuffer";
+    break;
+  default:
+    break;
+  }
+  return name;
+}
+
+int ObJavaUtils::build_java_type_desc(const sql::ObExprResType &type,
+                                     ObPl__JavaUdf__JavaTypeDesc &desc)
+{
+  int ret = OB_SUCCESS;
+  ob_pl__java_udf__java_type_desc__init(&desc);
+  desc.java_type = const_cast<char*>(get_java_type_name_for_ob_type(type));
+  if ('\0' == desc.java_type[0]) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("type in Java UDF is not supported yet", K(ret), K(type));
+    LOG_USER_WARN(OB_NOT_SUPPORTED, "type in Java UDF is");
+  } else if (type.is_number() && type.get_precision() > 0 && type.get_scale() >= 0) {
+    desc.decimal_precision_case = OB_PL__JAVA_UDF__JAVA_TYPE_DESC__DECIMAL_PRECISION_PRECISION;
+    desc.precision = type.get_precision();
+    desc.decimal_scale_case = OB_PL__JAVA_UDF__JAVA_TYPE_DESC__DECIMAL_SCALE_SCALE;
+    desc.scale = type.get_scale();
+  }
+  return ret;
+}
+
+int ObJavaUtils::build_function_info(const ObString &entry,
+                                    const ObIArray<sql::ObExprResType> &input_types,
+                                    const sql::ObExprResType &result_type,
+                                    ObIAllocator &allocator, char *&buffer, int64_t &size)
+{
+  int ret = OB_SUCCESS;
+  buffer = nullptr;
+  size = 0;
+  ObPl__JavaUdf__FunctionInfo info = OB_PL__JAVA_UDF__FUNCTION_INFO__INIT;
+  ObPl__JavaUdf__JavaTypeDesc output;
+  ObString class_name;
+  info.result_type = &output;
+  if (OB_FAIL(ob_write_string(allocator, entry, class_name, true))) {
+    LOG_WARN("copy UDF class name failed", K(ret));
+  } else {
+    info.class_name = class_name.ptr();
+    if (input_types.count() > 0) {
+      info.input_types = static_cast<ObPl__JavaUdf__JavaTypeDesc**>(
+          allocator.alloc(input_types.count() * sizeof(*info.input_types)));
+      auto *types = static_cast<ObPl__JavaUdf__JavaTypeDesc*>(
+          allocator.alloc(input_types.count() * sizeof(ObPl__JavaUdf__JavaTypeDesc)));
+      if (OB_ISNULL(info.input_types) || OB_ISNULL(types)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      } else {
+        info.n_input_types = input_types.count();
+        for (int64_t i = 0; OB_SUCC(ret) && i < input_types.count(); ++i) {
+          if (OB_FAIL(build_java_type_desc(input_types.at(i), types[i]))) {
+            LOG_WARN("build Java input type failed", K(ret), K(i));
+          } else {
+            info.input_types[i] = &types[i];
+          }
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (ObNullType == result_type.get_type()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null of ob type", K(ret));
+    } else if (OB_FAIL(build_java_type_desc(result_type, output))) {
+      LOG_WARN("build Java result type failed", K(ret));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    size = ob_pl__java_udf__function_info__get_packed_size(&info);
+    auto *data = static_cast<uint8_t*>(allocator.alloc(size));
+    if (OB_ISNULL(data)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      ob_pl__java_udf__function_info__pack(&info, data);
+      buffer = reinterpret_cast<char*>(data);
+    }
+  }
+  return ret;
+}
+
+int ObJavaUtils::create_raw_udf_obj(JNIEnv &env, jobject loader, const ObString &entry,
+                                   ObIAllocator &allocator, jobject &udf_obj)
+{
+  int ret = OB_SUCCESS;
+  jclass class_loader_clazz = nullptr;
+  jmethodID loader_constructor = nullptr;
+  jmethodID find_class_method = nullptr;
+  jstring class_name = nullptr;
+  jclass udf_clazz = nullptr;
+  jmethodID udf_constructor = nullptr;
+  ObString class_entry;
+  udf_obj = nullptr;
+
+  if (OB_FAIL(get_udf_loader_class(env, class_loader_clazz, loader_constructor, find_class_method))) {
+    LOG_WARN("failed to get_udf_loader_class", K(ret));
+  } else if (OB_ISNULL(class_loader_clazz) || OB_ISNULL(find_class_method)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected NULL class_loader_clazz or find_class_method", K(ret));
+  } else if (OB_FAIL(ob_write_string(allocator, entry, class_entry, true))) {
+    LOG_WARN("failed to copy UDF class name", K(ret), K(entry));
+  } else if (FALSE_IT(class_name = env.NewStringUTF(class_entry.ptr()))) {
+    // unreachable
+  } else if (OB_FAIL(exception_check(&env))) {
+    LOG_WARN("failed to NewStringUTF", K(ret));
+  } else if (OB_ISNULL(class_name)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected NULL class_name", K(ret));
+  } else if (FALSE_IT(udf_clazz = static_cast<jclass>(env.CallObjectMethod(loader, find_class_method, class_name)))) {
+    // unreachable
+  } else if (OB_FAIL(exception_check(&env))) {
+    LOG_WARN("failed to findClass", K(ret));
+  } else if (OB_ISNULL(udf_clazz)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected NULL udf_clazz", K(ret));
+  } else if (FALSE_IT(udf_constructor = env.GetMethodID(udf_clazz, "<init>", "()V"))) {
+    // unreachable
+  } else if (OB_FAIL(exception_check(&env))) {
+    LOG_WARN("failed to get UDF constructor", K(ret));
+  } else if (OB_ISNULL(udf_constructor)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected NULL udf_constructor", K(ret));
+  } else if (FALSE_IT(udf_obj = env.NewObject(udf_clazz, udf_constructor))) {
+    // unreachable
+  } else if (OB_FAIL(exception_check(&env))) {
+    LOG_WARN("failed to construct udf_obj", K(ret));
+  } else if (OB_ISNULL(udf_obj)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected NULL udf_obj", K(ret));
+  }
+  delete_local_ref(class_name, &env);
+  delete_local_ref(udf_clazz, &env);
+  return ret;
+}
+
+int ObJavaUtils::create_function_adapter(sql::ObExecContext &ctx, JNIEnv &env, jobject loader,
+                                        const ObString &entry, const char *method_name,
+                                        const ObIArray<sql::ObExprResType> &inputs,
+                                        const sql::ObExprResType &result_type,
+                                        ObIAllocator &allocator, jobject &adapter)
+{
+  int ret = OB_SUCCESS;
+  adapter = nullptr;
+  char *function_info = nullptr;
+  int64_t function_info_size = 0;
+  char *permissions = nullptr;
+  int64_t permissions_size = 0;
+  ObSEArray<sql::ObExprResType, 1> empty_types;
+  ObSEArray<ObIArray<ObObj>*, 1> empty_args;
+  jobject sdk_loader = nullptr;
+  jmethodID load_class = nullptr;
+  jstring factory_name = nullptr;
+  jstring method = nullptr;
+  jclass factory = nullptr;
+  jmethodID create = nullptr;
+  jobject info_buffer = nullptr;
+  jobject permissions_buffer = nullptr;
+  const int64_t timeout_ts = std::min(ctx.get_my_session()->get_query_timeout_ts(), THIS_WORKER.get_timeout_ts());
+  if (OB_FAIL(build_function_info(entry, inputs, result_type, allocator,
+                                 function_info, function_info_size))) {
+    LOG_WARN("build function info failed", K(ret));
+  } else if (OB_FAIL(build_udf_args_to_buffer(*ctx.get_my_session(), *ctx.get_sql_ctx()->schema_guard_,
+                                            0, empty_types, empty_args, allocator,
+                                            permissions, permissions_size))) {
+    LOG_WARN("build initialization permissions failed", K(ret));
+  } else if (OB_FAIL(get_executor_class_loader(env, sdk_loader, load_class))) {
+    LOG_WARN("get Java Extension class loader failed", K(ret));
+  } else if (OB_ISNULL(sdk_loader) || OB_ISNULL(load_class)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (FALSE_IT(factory_name = env.NewStringUTF("com.oceanbase.internal.JavaAdapterFactory"))) {
+  } else if (OB_FAIL(exception_check(&env))) {
+    LOG_WARN("create Java Adapter factory class name failed", K(ret));
+  } else if (OB_ISNULL(factory_name)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (FALSE_IT(factory = static_cast<jclass>(env.CallObjectMethod(sdk_loader, load_class, factory_name)))) {
+    // Load the factory with the existing SDK loader to preserve Adapter class identity.
+  } else if (OB_FAIL(exception_check(&env))) {
+    LOG_WARN("load Java Adapter factory failed", K(ret));
+  } else if (OB_ISNULL(factory)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (FALSE_IT(create = env.GetStaticMethodID(factory, "create_function_adapter",
+                 "(Ljava/lang/Object;Ljava/lang/String;Ljava/nio/ByteBuffer;JJLjava/nio/ByteBuffer;)Ljava/lang/Object;"))) {
+    // The creation entry receives function metadata separately from call permissions and timeout.
+  } else if (OB_FAIL(exception_check(&env))) {
+    LOG_WARN("find create_function_adapter failed", K(ret));
+  } else if (OB_ISNULL(create)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (FALSE_IT(method = env.NewStringUTF(method_name))) {
+  } else if (OB_FAIL(exception_check(&env))) {
+    LOG_WARN("create Java method name failed", K(ret));
+  } else if (OB_ISNULL(method)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (FALSE_IT(info_buffer = env.NewDirectByteBuffer(function_info, function_info_size))) {
+    // Input buffers remain owned by allocator until the synchronous JNI call returns.
+  } else if (OB_FAIL(exception_check(&env))) {
+    LOG_WARN("create function info buffer failed", K(ret));
+  } else if (OB_ISNULL(info_buffer)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (FALSE_IT(permissions_buffer = env.NewDirectByteBuffer(permissions, permissions_size))) {
+  } else if (OB_FAIL(exception_check(&env))) {
+    LOG_WARN("create initialization permissions buffer failed", K(ret));
+  } else if (OB_ISNULL(permissions_buffer)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    adapter = env.CallStaticObjectMethod(factory, create, loader, method, info_buffer,
+                                        static_cast<jlong>(ctx.get_my_session()->get_server_sid()),
+                                        timeout_ts, permissions_buffer);
+    if (OB_FAIL(exception_check(&env))) {
+      LOG_WARN("create function adapter failed", K(ret));
+    } else if (OB_ISNULL(adapter)) {
+      ret = OB_ERR_UNEXPECTED;
+    }
+  }
+  delete_local_ref(permissions_buffer, &env);
+  delete_local_ref(info_buffer, &env);
+  delete_local_ref(method, &env);
+  delete_local_ref(factory, &env);
+  delete_local_ref(factory_name, &env);
+  return ret;
+}
+
 int ObJavaUtils::load_routine_jar(const ObString &jar, jobject &class_loader)
 {
   int ret = OB_SUCCESS;
@@ -97,7 +366,7 @@ int ObJavaUtils::build_udf_args_to_buffer(
     const sql::ObSQLSessionInfo &session,
     share::schema::ObSchemaGetterGuard &schema_guard,
     int64_t batch_size,
-    const ObIArray<ObObjMeta> &arg_types,
+    const ObIArray<ObExprResType> &arg_types,
     const ObIArray<ObIArray<ObObj> *> &args,
     ObIAllocator &alloc,
     char *&buffer,
@@ -152,7 +421,7 @@ int ObJavaUtils::build_udf_args_to_buffer(
 
   if (OB_SUCC(ret)) {
     int64_t size = ob_pl__java_udf__batched_args__get_packed_size(&batched_args);
-    uint8_t *buf = static_cast<uint8_t*>(alloc.alloc(size));
+    uint8_t *buf = static_cast<uint8_t*>(alloc.alloc(std::max<int64_t>(1, size)));
     if (OB_ISNULL(buf)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
     } else if (OB_UNLIKELY(0 > ob_pl__java_udf__batched_args__pack(&batched_args, buf))) {
