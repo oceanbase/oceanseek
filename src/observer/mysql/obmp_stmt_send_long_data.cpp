@@ -308,14 +308,16 @@ int ObMPStmtSendLongData::do_process(ObSQLSessionInfo &session)
       ObPsStmtInfoGuard guard;
       ObPsStmtInfo *ps_info = NULL;
       ObPsStmtId inner_stmt_id = OB_INVALID_ID;
-      if (OB_SUCC(session.get_inner_ps_stmt_id(stmt_id_, inner_stmt_id))
-            && OB_SUCC(session.get_ps_cache()->get_stmt_info_guard(inner_stmt_id, guard))
+      // Audit lookups must preserve the statement result in ret.
+      int aret = OB_SUCCESS;
+      if (OB_SUCCESS == (aret = session.get_inner_ps_stmt_id(stmt_id_, inner_stmt_id))
+            && OB_SUCCESS == (aret = session.get_ps_cache()->get_stmt_info_guard(inner_stmt_id, guard))
             && OB_NOT_NULL(ps_info = guard.get_stmt_info())) {
         audit_record.ps_inner_stmt_id_ = inner_stmt_id;
         audit_record.sql_ = const_cast<char *>(ps_info->get_ps_sql().ptr());
         audit_record.sql_len_ = min(ps_info->get_ps_sql().length(), OB_MAX_SQL_LENGTH);
       } else {
-        LOG_WARN("get sql fail in send long data", K(stmt_id_));
+        LOG_WARN("get sql fail in send long data", K(ret), K(aret), K(stmt_id_));
       }
     }
   }
