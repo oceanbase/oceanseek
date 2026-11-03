@@ -548,7 +548,11 @@ int ObInvSSTablePostingIter::advance_to(const ObDatum &target)
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_FAIL(decode_target_doc_id(target, target_doc_id))) {
     LOG_WARN("failed to decode target doc id", K(ret));
-  } else if (FALSE_IT(target_doc_id = MAX(target_doc_id, min_doc_id_))) {
+    // Never seek below the monotone scan frontier: after a shallow reposition the
+    // row cursor is reset and locate_target() searches from the block start, so a
+    // stale target smaller than the already emitted doc id would rewind the
+    // iterator and break stateful consumers (e.g. ReqExcl must_not filtering).
+  } else if (FALSE_IT(target_doc_id = MAX(target_doc_id, MAX(min_doc_id_, frontier_min_id_)))) {
   } else if (target_doc_id > max_doc_id_) {
     ret = OB_ITER_END;
   } else if (is_end_) {
@@ -584,7 +588,9 @@ int ObInvSSTablePostingIter::advance_to_id(const ObDatum &target)
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_FAIL(decode_target_doc_id(target, target_doc_id))) {
     LOG_WARN("failed to decode target doc id", K(ret));
-  } else if (FALSE_IT(target_doc_id = MAX(target_doc_id, min_doc_id_))) {
+    // Same frontier guard as advance_to(): the seek target must not move the
+    // iterator below the already advanced scan frontier.
+  } else if (FALSE_IT(target_doc_id = MAX(target_doc_id, MAX(min_doc_id_, frontier_min_id_)))) {
   } else if (target_doc_id > max_doc_id_) {
     ret = OB_ITER_END;
   } else if (is_end_) {
