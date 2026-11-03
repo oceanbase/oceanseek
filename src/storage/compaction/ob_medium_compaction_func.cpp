@@ -33,6 +33,13 @@ ERRSIM_POINT_DEF(EN_COMPACTION_SET_MAJOR_PARALLEL_CNT);
 ERRSIM_POINT_DEF(EN_CHOOSE_USER_REQUEST_SNAPSHOT_FAILED);
 ERRSIM_POINT_DEF(EN_FORCE_MEDIUM_SNAPSHOT_BEFORE_MVS);
 
+static bool can_merge_async_index_before_transfer(const ObAdaptiveMergePolicy::AdaptiveMergeReason merge_reason)
+{
+  return ObAdaptiveMergePolicy::TENANT_MAJOR == merge_reason
+      || ObAdaptiveMergePolicy::WINDOW_COMPACTION == merge_reason
+      || ObAdaptiveMergePolicy::ASYNC_INDEX_FORCE_MERGE == merge_reason;
+}
+
 int64_t ObMediumCompactionScheduleFunc::to_string(char *buf, const int64_t buf_len) const
 {
   int64_t pos = 0;
@@ -565,7 +572,8 @@ int ObMediumCompactionScheduleFunc::choose_async_delete_index_snapshot(
   } else if (medium_info.medium_snapshot_ <= max_sync_medium_scn) {
     ret = OB_NO_NEED_MERGE;
     LOG_INFO("chosen medium snapshot is synced before", K(ret), K(medium_info), K(max_sync_medium_scn));
-  } else if (medium_info.medium_snapshot_ < tablet->get_tablet_meta().transfer_info_.transfer_start_scn_.get_val_for_tx()) {
+  } else if (!can_merge_async_index_before_transfer(merge_reason_)
+             && medium_info.medium_snapshot_ < tablet->get_tablet_meta().transfer_info_.transfer_start_scn_.get_val_for_tx()) {
     ret = OB_NO_NEED_MERGE;
     LOG_INFO("medium snapshot is smaller than transfer start snapshot, no need merge", K(ret),
         K(medium_info), "transfer_start_snapshot",
@@ -2135,9 +2143,10 @@ int ObMediumCompactionScheduleFunc::build_async_index_medium_info(
     } else if (medium_snapshot <= max_sync_medium_scn) {
       ret = OB_NO_NEED_MERGE;
       LOG_INFO("max sync medium scn is greater than medium snapshot, so skip", KR(ret), K(index_tablet_id), K(merge_version_range), K(max_sync_medium_scn));
-    } else if (medium_snapshot < transfer_start_snapshot) {
+    } else if (!can_merge_async_index_before_transfer(merge_reason_) && medium_snapshot < transfer_start_snapshot) {
       ret = OB_NO_NEED_MERGE;
-      LOG_INFO("medium snapshot is less than transfer start snapshot, so skip", KR(ret), K(index_tablet_id), K(merge_version_range), K(transfer_start_snapshot));
+      LOG_INFO("medium snapshot is less than transfer start snapshot, so skip", KR(ret),
+          K(index_tablet_id), K(merge_version_range), K(transfer_start_snapshot), K_(merge_reason));
     } else if (OB_FAIL(get_max_reserved_snapshot(max_reserved_snapshot))) {
       LOG_WARN("failed to get reserved snapshot", KR(ret), KPC(this));
     } else if (OB_FAIL(check_frequency(max_reserved_snapshot, medium_snapshot))) {
@@ -2220,15 +2229,17 @@ int ObMediumCompactionScheduleFunc::submit_async_index_medium_info(
         LOG_WARN("index tablet is null", KR(ret), K(index_tablet_id));
       } else if (OB_FAIL(index_tablet->get_max_sync_medium_scn(max_sync_medium_scn))) {
         LOG_WARN("failed to get index max sync medium scn", K(ret), K(index_tablet_id));
-      // 已完成目标、已有覆盖目标的 medium，或转移起点高于目标时，跳过当前 Tablet。
+      // Tenant major, window compaction and force merge can target a published
+      // snapshot before transfer start; other reasons keep the transfer guard.
       } else if (index_tablet->get_last_major_snapshot_version() >= target_snapshot
                  || max_sync_medium_scn >= target_snapshot
-                 || index_tablet->get_tablet_meta().transfer_info_.transfer_start_scn_.get_val_for_tx()
-                      > target_snapshot) {
+                 || (!can_merge_async_index_before_transfer(merge_reason_)
+                     && index_tablet->get_tablet_meta().transfer_info_.transfer_start_scn_.get_val_for_tx()
+                         > target_snapshot)) {
         LOG_INFO("async index tablet already satisfies common merge target", K(index_tablet_id),
             K(target_snapshot), K(max_sync_medium_scn),
             "last_major_snapshot", index_tablet->get_last_major_snapshot_version(),
-            "transfer_start_scn", index_tablet->get_tablet_meta().transfer_info_.transfer_start_scn_);
+            "transfer_start_scn", index_tablet->get_tablet_meta().transfer_info_.transfer_start_scn_, K_(merge_reason));
       } else if (merge_version_range.base_version_ > 0
           && OB_FAIL(ObAsyncIndexMergePolicyHelper::get_inc_major_sstables(
               ls_, *index_tablet, target_snapshot, merge_version_range.base_version_, inc_inputs))) {

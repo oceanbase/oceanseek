@@ -30,9 +30,11 @@ ob_unittest_observer(test_tiered_metadata_store test_tiered_metadata_store.cpp)
 ob_unittest_observer(test_tenant_slog_ckpt_ss test_tenant_slog_ckpt_ss.cpp)
 ob_unittest_observer(test_async_index_compaction test_async_index_compaction.cpp)
 ob_unittest_observer(test_async_index_compaction_integration test_async_index_compaction_integration.cpp)
-# Keep the existing farm exclusion until both split executables are validated.
+ob_unittest_observer(test_async_index_transfer_boundary test_async_index_transfer_boundary.cpp)
+# Keep the existing farm exclusion for the async-index executables.
 # The integration executable isolates refresh/DAG/GC state from the basic cases.
 set_tests_properties(test_async_index_compaction test_async_index_compaction_integration
+  test_async_index_transfer_boundary
   PROPERTIES LABELS "simpleserver")
 ob_unittest_observer(test_on_demand_scan_ss test_on_demand_scan_ss.cpp)
 ob_unittest_observer(test_ss_window_compaction_observer test_ss_window_compaction_observer.cpp)
