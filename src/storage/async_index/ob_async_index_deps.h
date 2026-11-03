@@ -27,6 +27,20 @@ namespace storage
 class ObLS;  // forward declaration; callers pass ObLS* without needing the full definition
 class ObTabletHandle;
 
+enum class ObAsyncIndexReadType
+{
+  CHECKPOINTS,
+  PUBLISHED_VERSION,
+};
+
+struct ObAsyncIndexReadState
+{
+  ObAsyncIndexReadState() : refresh_info_(), published_version_(ASYNC_INDEX_INITIAL_VERSION) {}
+  void reset() { refresh_info_.reset(); published_version_ = ASYNC_INDEX_INITIAL_VERSION; }
+  ObTabletAsyncIndexRefreshInfo refresh_info_;
+  int64_t published_version_;
+};
+
 // Reject a migrated/deleted tablet, and optionally verify the generation saved
 // by the scheduler. The returned handle is also used to read its watermark.
 int get_async_index_refresh_tablet(
@@ -48,6 +62,27 @@ class ObIAsyncIndexDepProvider
 public:
   ObIAsyncIndexDepProvider() {}
   virtual ~ObIAsyncIndexDepProvider() {}
+
+  // Capture once before preparing local inputs. Tests override this to model
+  // role/proposal changes; production rejects a null LS or a follower.
+  virtual int get_leader_proposal_id(ObLS *ls, int64_t &proposal_id);
+
+  // Raw local read. Call read_async_index_state_on_leader for a final decision.
+  // Publication reads bypass the cache and preserve the initial baseline fallback.
+  virtual int get_async_index_read_state(
+      const uint64_t tenant_id, ObLS *ls, const common::ObTabletID &tablet_id,
+      const ObAsyncIndexReadType read_type, const int64_t transfer_seq,
+      ObAsyncIndexReadState &state);
+
+  // Check the original proposal -> read local state -> check the same proposal.
+  // Callers keep their LS handle alive; T1/T2 also hold their transaction locks.
+  // Used for direct-refresh preparation and T1/T2 final decisions. Failed reads clear
+  // the output; this function never captures a replacement proposal for old work.
+  // transfer_seq checks the publication tablet generation; -1 disables that check.
+  int read_async_index_state_on_leader(
+      const uint64_t tenant_id, ObLS *ls, const int64_t leader_proposal_id,
+      const common::ObTabletID &tablet_id, const ObAsyncIndexReadType read_type,
+      const int64_t transfer_seq, ObAsyncIndexReadState &state);
 
   // Get the publish SCNs for the given index tablets.
   // The publish SCN is the SCN up to which an index tablet has been refreshed.
@@ -188,6 +223,8 @@ public:
     leader_ls_ids.reset();
     return common::OB_SUCCESS;
   }
+private:
+  int check_async_index_read_proposal_(ObLS *ls, const int64_t expected_proposal_id);
 };
 
 // Production implementation backed by the real schema guard / MDS / storage.
@@ -324,6 +361,9 @@ int get_min_index_published_scn(
 // when the transaction commits.
 //
 // Returns OB_EAGAIN on lock conflict (caller should skip this round).
+// Returns OB_NOT_MASTER if the original proposal changed while reading.
+// skip_if_published lets major validate the original proposal without changing
+// checkpoints when its preliminary min_publish_scn already covers the target.
 // Returns OB_SIZE_OVERFLOW when the checkpoint array is full, regardless of
 // whether checkpoint_capacity_full is supplied. This optional output identifies
 // checkpoint capacity errors only; other OB_SIZE_OVERFLOW sources do not set it.
@@ -333,6 +373,7 @@ int get_min_index_published_scn(
 int maintain_async_index_refresh_info(
     const uint64_t tenant_id,
     ObLS *ls,
+    const int64_t leader_proposal_id,
     const common::ObTabletID &data_tablet_id,
     const share::SCN &new_snapshot,
     const share::SCN &min_publish_scn,
@@ -341,7 +382,8 @@ int maintain_async_index_refresh_info(
     const int64_t lock_timeout_us = 0,
     const bool skip_incr_check = false,
     bool *checkpoint_capacity_full = nullptr,
-    const bool is_manual_refresh = false);
+    const bool is_manual_refresh = false,
+    const bool skip_if_published = false);
 
 // Fence async-index refresh tasks before DROP TABLE enters the normal table-lock path.
 // The ids must be the index tablet ids used by ObAsyncIndexRefreshTask.

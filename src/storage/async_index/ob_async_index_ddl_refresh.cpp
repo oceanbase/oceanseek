@@ -25,11 +25,13 @@ int64_t ObIAsyncIndexDDLRefreshOp::current_time_us() const
 
 ObAsyncIndexDDLRefreshOp::ObAsyncIndexDDLRefreshOp(
     ObLS &ls,
+    const int64_t leader_proposal_id,
     ObAsyncIndexService &service,
     ObIAsyncIndexDepProvider &dep_provider,
     const obrpc::ObAsyncIndexRefreshArg &arg,
     const share::SCN &target_scn)
-  : ls_(ls), service_(service), dep_provider_(dep_provider), arg_(arg), target_scn_(target_scn)
+    : ls_(ls), leader_proposal_id_(leader_proposal_id), service_(service),
+      dep_provider_(dep_provider), arg_(arg), target_scn_(target_scn)
 {
 }
 
@@ -37,7 +39,7 @@ DEF_TO_STRING(ObAsyncIndexDDLRefreshOp)
 {
   int64_t pos = 0;
   J_OBJ_START();
-  J_KV(K_(arg), K_(target_scn));
+  J_KV(K_(arg), K_(target_scn), K_(leader_proposal_id));
   J_OBJ_END();
   return pos;
 }
@@ -52,7 +54,7 @@ int ObAsyncIndexDDLRefreshOp::maintain_refresh_info(
       arg_.tenant_id_, &ls_, &dep_provider_, arg_.index_tablet_ids_, min_publish_scn))) {
     LOG_WARN("[ASYNC_INDEX] fail to get min index published scn", K(ret), K(arg_));
   } else if (OB_FAIL(maintain_async_index_refresh_info(
-      arg_.tenant_id_, &ls_, arg_.tablet_id_, target_scn_, min_publish_scn,
+      arg_.tenant_id_, &ls_, leader_proposal_id_, arg_.tablet_id_, target_scn_, min_publish_scn,
       &dep_provider_, info, OB_ASYNC_INDEX_DDL_LOCK_TIMEOUT_US,
       true /*skip_incr_check*/, &capacity_full))) {
     if (OB_SIZE_OVERFLOW == ret && capacity_full) {
@@ -70,8 +72,14 @@ int ObAsyncIndexDDLRefreshOp::maintain_refresh_info(
 int ObAsyncIndexDDLRefreshOp::read_refresh_info(ObTabletAsyncIndexRefreshInfo &info)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(dep_provider_.get_async_index_refresh_info(arg_.tenant_id_, &ls_, arg_.tablet_id_, info))) {
+  ObAsyncIndexReadState state;
+  info.reset();
+  if (OB_FAIL(dep_provider_.read_async_index_state_on_leader(
+          arg_.tenant_id_, &ls_, leader_proposal_id_, arg_.tablet_id_,
+          ObAsyncIndexReadType::CHECKPOINTS, -1 /*transfer_seq*/, state))) {
     LOG_WARN("[ASYNC_INDEX] failed to read committed DDL refresh info", K(ret), K(arg_));
+  } else if (OB_FAIL(info.assign(state.refresh_info_))) {
+    LOG_WARN("[ASYNC_INDEX] failed to copy committed DDL refresh info", K(ret), K(arg_));
   }
   return ret;
 }
@@ -82,6 +90,7 @@ int ObAsyncIndexDDLRefreshOp::refresh_index(const int64_t snapshot, const int64_
   ObAsyncIndexDirectRefreshParam param;
   param.tenant_id_ = arg_.tenant_id_;
   param.ls_ = &ls_;
+  param.leader_proposal_id_ = leader_proposal_id_;
   param.data_table_id_ = arg_.data_table_id_;
   param.index_table_id_ = arg_.index_table_ids_.at(index);
   param.data_tablet_id_ = arg_.tablet_id_;

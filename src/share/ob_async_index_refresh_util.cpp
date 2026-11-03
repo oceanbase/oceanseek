@@ -11,8 +11,11 @@
 #include "lib/oblog/ob_log_module.h"
 #include "lib/time/ob_time_utility.h"
 #include "share/ob_ddl_common.h"
+#include "share/ob_share_util.h"
+#include "common/ob_timeout_ctx.h"
 #include "share/tablet/ob_tablet_to_ls_operator.h"
 #include "share/location_cache/ob_location_service.h"
+#include "share/location_cache/ob_location_struct.h"
 #include "share/ob_srv_rpc_proxy.h"
 #include "share/rc/ob_tenant_base.h"
 #include "share/schema/ob_multi_version_schema_service.h"
@@ -165,9 +168,9 @@ int ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
   ObArray<ObLSID> ls_ids;
   share::ObLocationService *location_service = nullptr;
   obrpc::ObSrvRpcProxy *srv_rpc_proxy = nullptr;
-  const int64_t leader_lookup_timeout = ObDDLUtil::get_default_ddl_rpc_timeout();
   const int64_t refresh_rpc_timeout = GCONF._ob_ddl_timeout;
   const int64_t retry_interval_us = 200 * 1000; // 200ms
+  constexpr int64_t MAX_RPC_RETRY_COUNT = 3; // Three retries after the initial attempt.
   const bool is_manual = storage::ASYNC_REFRESH_TYPE_MANUAL == refresh_type;
 
   if (OB_UNLIKELY(OB_INVALID_ID == tenant_id || OB_INVALID_ID == data_table_id
@@ -252,64 +255,122 @@ int ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
     for (int64_t i = 0; OB_SUCC(ret) && i < data_tablet_ids.count(); ++i) {
       const ObTabletID &data_tablet_id = data_tablet_ids.at(i);
       const ObLSID &ls_id = ls_ids.at(i);
-      ObAddr leader_addr;
-      if (OB_FAIL(location_service->get_leader_with_retry_until_timeout(
-          GCONF.cluster_id, tenant_id, ls_id, leader_addr,
-          leader_lookup_timeout, retry_interval_us))) {
-        LOG_WARN("fail to get ls leader", K(ret), K(tenant_id), K(ls_id), K(data_tablet_id));
-      } else {
-        obrpc::ObAsyncIndexRefreshArg arg;
-        arg.tenant_id_ = tenant_id;
-        arg.ls_id_ = ls_id;
-        arg.tablet_id_ = data_tablet_id;
-        arg.target_refresh_scn_ = target_scn;
-        arg.data_table_id_ = data_table_id;
-        arg.refresh_type_ = refresh_type;
-        for (int64_t j = 0; OB_SUCC(ret) && j < valid_index_table_ids.count(); ++j) {
-          if (OB_FAIL(arg.index_table_ids_.push_back(valid_index_table_ids.at(j)))) {
-            LOG_WARN("fail to push back index_table_id", K(ret));
-          } else if (OB_FAIL(arg.index_tablet_ids_.push_back(index_tablet_arrays.at(j).at(i)))) {
-            LOG_WARN("fail to push back index_tablet_id", K(ret));
-          } else if (OB_FAIL(arg.is_delete_flags_.push_back(is_delete_flags.at(j)))) {
-            LOG_WARN("fail to push back is_delete_flag", K(ret));
-          }
+      // Each tablet gets its own retry budget. This context inherits the caller's
+      // deadline and restores it on scope exit; retries never reset the budget.
+      common::ObTimeoutCtx timeout_ctx;
+      int64_t tablet_deadline = ObTimeUtility::current_time() + refresh_rpc_timeout;
+      const int64_t worker_deadline = THIS_WORKER.get_timeout_ts();
+      if (worker_deadline > 0) {
+        tablet_deadline = MIN(tablet_deadline, worker_deadline);
+      }
+      if (OB_FAIL(ObShareUtil::set_default_timeout_ctx(timeout_ctx, refresh_rpc_timeout))) {
+        LOG_WARN("failed to set tablet refresh timeout",
+                 K(ret), K(data_tablet_id), K(refresh_rpc_timeout));
+      } else if (OB_FAIL(timeout_ctx.set_abs_timeout(
+                     MIN(timeout_ctx.get_abs_timeout(), tablet_deadline)))) {
+        LOG_WARN("failed to limit tablet refresh timeout", K(ret), K(data_tablet_id));
+      }
+      obrpc::ObAsyncIndexRefreshArg arg;
+      arg.tenant_id_ = tenant_id;
+      arg.ls_id_ = ls_id;
+      arg.tablet_id_ = data_tablet_id;
+      arg.target_refresh_scn_ = target_scn;
+      arg.data_table_id_ = data_table_id;
+      arg.refresh_type_ = refresh_type;
+      for (int64_t j = 0; OB_SUCC(ret) && j < valid_index_table_ids.count(); ++j) {
+        if (OB_FAIL(arg.index_table_ids_.push_back(valid_index_table_ids.at(j)))) {
+          LOG_WARN("fail to push back index_table_id", K(ret));
+        } else if (OB_FAIL(arg.index_tablet_ids_.push_back(index_tablet_arrays.at(j).at(i)))) {
+          LOG_WARN("fail to push back index_tablet_id", K(ret));
+        } else if (OB_FAIL(arg.is_delete_flags_.push_back(is_delete_flags.at(j)))) {
+          LOG_WARN("fail to push back is_delete_flag", K(ret));
         }
-        if (OB_FAIL(ret)) {
-        } else if (!arg.is_valid()) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("[ASYNC_INDEX] invalid refresh arg", K(ret), K(arg));
+      }
+      if (OB_SUCC(ret) && !arg.is_valid()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("[ASYNC_INDEX] invalid refresh arg", K(ret), K(arg));
+      }
+      bool force_renew = false;
+      bool need_retry = true;
+      int64_t retry_cnt = 0;
+      while (OB_SUCC(ret) && need_retry) {
+        need_retry = false;
+        ObAddr leader_addr;
+        obrpc::ObAsyncIndexRefreshRes res;
+        if (timeout_ctx.is_timeouted()) {
+          ret = OB_TIMEOUT;
+          LOG_WARN("tablet refresh timed out before leader lookup",
+                   K(ret), K(data_tablet_id), K(target_scn), K(tablet_deadline));
+        } else if (OB_FAIL(THIS_WORKER.check_status())) {
+          LOG_WARN("refresh request interrupted", K(ret), K(data_tablet_id));
+        } else if (OB_FAIL(location_service->get_leader(
+                       GCONF.cluster_id, tenant_id, ls_id, force_renew, leader_addr))) {
+          LOG_WARN("fail to get refresh leader", K(ret), K(tenant_id), K(ls_id));
+        } else if (is_manual && FALSE_IT(DEBUG_SYNC(BEFORE_MANUAL_ASYNC_INDEX_REFRESH_RPC))) {
+        } else if (timeout_ctx.is_timeouted()) {
+          ret = OB_TIMEOUT;
+          LOG_WARN("tablet refresh timed out after leader lookup",
+                   K(ret), K(leader_addr), K(data_tablet_id), K(target_scn), K(tablet_deadline));
+        } else if (OB_FAIL(THIS_WORKER.check_status())) {
+          LOG_WARN("refresh request interrupted after leader lookup", K(ret), K(data_tablet_id));
+        } else if (OB_FAIL(srv_rpc_proxy->to(leader_addr)
+                       .detect_session_killed(true)
+                       .timeout(timeout_ctx.get_timeout())
+                       .async_index_refresh(arg, res))) {
+          LOG_WARN("[ASYNC_INDEX] refresh RPC failed", K(ret), K(leader_addr), K(arg));
         } else {
-          if (is_manual) {
-            DEBUG_SYNC(BEFORE_MANUAL_ASYNC_INDEX_REFRESH_RPC);
-          }
-          obrpc::ObAsyncIndexRefreshRes res;
-          if (OB_FAIL(srv_rpc_proxy->to(leader_addr)
-                      .timeout(refresh_rpc_timeout)
-                      .async_index_refresh(arg, res))) {
-            LOG_WARN("[ASYNC_INDEX] refresh RPC failed", K(ret),
-                K(leader_addr), K(data_tablet_id), K(target_scn), K(refresh_rpc_timeout));
-          } else if (res.ret_code_ != OB_SUCCESS) {
-            ret = res.ret_code_;
-            LOG_WARN("[ASYNC_INDEX] refresh returned error", K(ret),
-                K(data_tablet_id), K(target_scn), K(res.already_refreshed_));
-          }
-#ifdef ERRSIM
-          if (OB_SUCC(ret) && 0 == i
-              && static_cast<int8_t>(storage::ASYNC_REFRESH_TYPE_OFFLINE_DDL) == refresh_type) {
-            DEBUG_SYNC(AFTER_OFFLINE_ASYNC_INDEX_PARTITION_REFRESH);
-          }
-#endif
-          if (is_manual && is_master_changed_error(ret)) {
-            int tmp_ret = OB_SUCCESS;
-            ObAddr new_leader;
-            if (OB_SUCCESS != (tmp_ret = location_service->get_leader(
-                GCONF.cluster_id, tenant_id, ls_id, true /*force_renew*/, new_leader))) {
-              LOG_WARN("failed to renew leader after manual refresh error",
-                       K(tmp_ret), K(ret), K(tenant_id), K(ls_id));
-            }
-            // Preserve the original error so the caller retries the whole table.
+          ret = res.ret_code_;
+          if (OB_FAIL(ret)) {
+            LOG_WARN("[ASYNC_INDEX] refresh returned error",
+                     K(ret), K(leader_addr), K(arg), K(res.already_refreshed_));
           }
         }
+        // Retry routing within the same LS. Mapping/schema errors must reach the
+        // caller, which rebuilds tablet-to-LS routing and the full request.
+        const bool renew_leader = OB_NOT_MASTER == ret || OB_NEED_RETRY == ret
+            || is_server_down_error(ret) || OB_TENANT_NOT_IN_SERVER == ret
+            || OB_LOCATION_NOT_EXIST == ret || OB_LS_LOCATION_NOT_EXIST == ret
+            || OB_LS_LOCATION_LEADER_NOT_EXIST == ret;
+        if (OB_EAGAIN == ret || renew_leader) {
+          // Keep this tablet's original target and deadline. The next leader rereads the
+          // checkpoint queue and rebuilds SQL; never retry an old node's window.
+          // EAGAIN also covers lock/capacity contention; wait without renewing the leader.
+          const int64_t remain_us = timeout_ctx.get_timeout();
+          if (remain_us <= 0) {
+            ret = OB_TIMEOUT;
+            LOG_WARN("tablet refresh retry budget exhausted",
+                     K(ret), K(leader_addr), K(data_tablet_id), K(target_scn), K(tablet_deadline));
+          } else if (retry_cnt >= MAX_RPC_RETRY_COUNT) {
+            // Preserve the last error for the manual/DDL caller's retry policy.
+            LOG_WARN("[ASYNC_INDEX] tablet refresh retry count exhausted",
+                     K(ret), K(data_tablet_id), K(ls_id), K(target_scn), K(retry_cnt));
+          } else {
+            ++retry_cnt;
+            LOG_INFO("[ASYNC_INDEX] retry refresh on current leader", K(ret), K(leader_addr),
+                     K(data_tablet_id), K(arg), K(retry_cnt), K(renew_leader));
+            ob_usleep(MIN(retry_interval_us, remain_us));
+            force_renew = renew_leader;
+            ret = OB_SUCCESS;
+            // Retry only the same target, within this tablet's remaining budget.
+            need_retry = true;
+          }
+        }
+      }
+#ifdef ERRSIM
+      if (OB_SUCC(ret) && 0 == i
+          && static_cast<int8_t>(storage::ASYNC_REFRESH_TYPE_OFFLINE_DDL) == refresh_type) {
+        DEBUG_SYNC(AFTER_OFFLINE_ASYNC_INDEX_PARTITION_REFRESH);
+      }
+#endif
+      if (is_manual && is_master_changed_error(ret)) {
+        int tmp_ret = OB_SUCCESS;
+        ObAddr new_leader;
+        if (OB_SUCCESS != (tmp_ret = location_service->get_leader(
+            GCONF.cluster_id, tenant_id, ls_id, true /*force_renew*/, new_leader))) {
+          LOG_WARN("failed to renew leader after manual refresh error",
+                   K(tmp_ret), K(ret), K(tenant_id), K(ls_id));
+        }
+        // Preserve the original error so the caller retries the whole table.
       }
     }
     if (OB_SUCC(ret)) {

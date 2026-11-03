@@ -30,8 +30,8 @@ enum ObAsyncIndexDirectRefreshOp
 
 // Parameters for triggering a single index-tablet refresh directly and
 // synchronously. The caller must guarantee:
-//   - ls_ points to the leader LS that owns both data_tablet_id_ and
-//     index_tablet_id_ (leader validity is NOT checked inside the interface).
+//   - ls_ stays alive and leader_proposal_id_ is the original RPC proposal.
+//     T2 validates that proposal when reading publication under its locks.
 //   - data_table_id_ / index_table_id_ are the table IDs whose schemas are
 //     used to build the SQL.  data_tablet_id_ / index_tablet_id_ must be valid
 //     tablets of those tables respectively.
@@ -47,6 +47,7 @@ struct ObAsyncIndexDirectRefreshParam
   ObAsyncIndexDirectRefreshParam()
     : tenant_id_(OB_INVALID_TENANT_ID),
       ls_(nullptr),
+      leader_proposal_id_(-1),
       data_table_id_(OB_INVALID_ID),
       index_table_id_(OB_INVALID_ID),
       data_tablet_id_(),
@@ -60,6 +61,7 @@ struct ObAsyncIndexDirectRefreshParam
   {
     return OB_INVALID_TENANT_ID != tenant_id_
         && OB_NOT_NULL(ls_)
+        && leader_proposal_id_ >= 0
         && OB_INVALID_ID != data_table_id_
         && OB_INVALID_ID != index_table_id_
         && data_tablet_id_.is_valid()
@@ -67,13 +69,14 @@ struct ObAsyncIndexDirectRefreshParam
         && target_refresh_scn_.is_valid();
   }
 
-  TO_STRING_KV(K_(tenant_id), KP_(ls),
+  TO_STRING_KV(K_(tenant_id), KP_(ls), K_(leader_proposal_id),
                K_(data_table_id), K_(index_table_id),
                K_(data_tablet_id), K_(index_tablet_id),
                K_(target_refresh_scn), K_(op), K_(refresh_type));
 
   uint64_t tenant_id_;
-  ObLS *ls_;                           // leader LS; caller guarantees leadership
+  ObLS *ls_;                           // caller keeps the LS handle alive
+  int64_t leader_proposal_id_;         // captured once by the refresh RPC, never renewed in-place
   uint64_t data_table_id_;             // source data table (schema + lock)
   uint64_t index_table_id_;            // target index table (schema)
   common::ObTabletID data_tablet_id_;  // source partition tablet
