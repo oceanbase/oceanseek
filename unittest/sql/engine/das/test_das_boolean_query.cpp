@@ -21,6 +21,7 @@
 #include "sql/engine/expr/ob_expr.h"
 #include "sql/das/search/ob_das_conjunction_op.h"
 #include "sql/das/search/ob_das_disjunction_op.h"
+#include "sql/das/search/ob_das_bmw_op.h"
 #include "sql/das/search/ob_das_bmm_op.h"
 #include "sql/das/search/ob_das_bitmap_op.h"
 #include "sql/code_generator/ob_hybrid_search_cg_service.h"
@@ -187,6 +188,37 @@ private:
   int next_rowid_error_;
   int64_t open_count_;
   int64_t rescan_count_;
+};
+
+class MockShallowSearchOp : public MockSearchOp
+{
+public:
+  MockShallowSearchOp(ObDASSearchCtx &search_ctx, const int shallow_ret, const double max_score)
+      : MockSearchOp(search_ctx), shallow_ret_(shallow_ret), max_score_(max_score)
+  {}
+
+  void set_shallow_ret(const int ret) { shallow_ret_ = ret; }
+
+protected:
+  int do_advance_shallow(
+      const ObDASRowID &target,
+      const bool inclusive,
+      const MaxScoreTuple *&max_score_tuple) override
+  {
+    UNUSED(inclusive);
+    max_score_tuple = nullptr;
+    if (OB_SUCCESS == shallow_ret_) {
+      ObDASRowID max_id;
+      max_id.set_max();
+      max_score_tuple_.set(target, max_id, max_score_);
+      max_score_tuple = &max_score_tuple_;
+    }
+    return shallow_ret_;
+  }
+
+private:
+  int shallow_ret_;
+  double max_score_;
 };
 
 class MockProbeSearchOp : public MockSearchOp
@@ -3822,6 +3854,178 @@ TEST_F(ObDASBooleanQueryTest, disjunction_op_execution)
       {6, 7, 0.7},
       {8, UINT64_MAX, -1.0}
   });
+}
+
+TEST_F(ObDASBooleanQueryTest, disjunction_shallow_child_exhaustion)
+{
+  struct TestCase {
+    int64_t child_count_;
+    int first_ret_;
+    int second_ret_;
+    int expected_ret_;
+    double expected_max_score_;
+  };
+  const TestCase cases[] = {
+    {1, OB_ITER_END, OB_ITER_END, OB_ITER_END, 0.0},
+    {2, OB_ITER_END, OB_ITER_END, OB_ITER_END, 0.0},
+    {2, OB_ITER_END, OB_SUCCESS, OB_SUCCESS, 2.0},
+    {2, OB_SUCCESS, OB_ITER_END, OB_SUCCESS, 1.0},
+    {2, OB_SUCCESS, OB_SUCCESS, OB_SUCCESS, 3.0},
+    {2, OB_ITER_END, OB_TIMEOUT, OB_TIMEOUT, 0.0},
+  };
+  for (const TestCase &test_case : cases) {
+    SCOPED_TRACE(test_case.child_count_);
+    SCOPED_TRACE(test_case.first_ret_);
+    SCOPED_TRACE(test_case.second_ret_);
+    SearchCtxSetup ctx_setup(allocator_);
+    MockShallowSearchOp first_op(ctx_setup.search_ctx_, test_case.first_ret_, 1.0);
+    MockShallowSearchOp second_op(ctx_setup.search_ctx_, test_case.second_ret_, 2.0);
+    MockSearchOpParam child_param;
+    child_param.set_is_scoring(true);
+    ASSERT_EQ(OB_SUCCESS, first_op.init(child_param));
+    ASSERT_EQ(OB_SUCCESS, second_op.init(child_param));
+    ObArray<ObIDASSearchOp *> children;
+    ASSERT_EQ(OB_SUCCESS, children.push_back(&first_op));
+    if (2 == test_case.child_count_) {
+      ASSERT_EQ(OB_SUCCESS, children.push_back(&second_op));
+    }
+    ObDASDisjunctionOpParam param(children, 1, false, ObDASSearchCost(0));
+    param.set_is_scoring(true);
+    ObDASDisjunctionOp op(ctx_setup.search_ctx_);
+    ASSERT_EQ(OB_SUCCESS, op.init(param));
+    ASSERT_EQ(OB_SUCCESS, op.open());
+    ObDASRowID target;
+    target.set_uint64(1);
+    int expected_ret = test_case.expected_ret_;
+    double expected_max_score = test_case.expected_max_score_;
+    for (int64_t round = 0; round < 3; ++round) {
+      if (2 == round) {
+        // Return valid ranges after rescan to verify that exhausted children contribute again.
+        first_op.set_shallow_ret(OB_SUCCESS);
+        second_op.set_shallow_ret(OB_SUCCESS);
+        ASSERT_EQ(OB_SUCCESS, op.rescan());
+        EXPECT_EQ(1, first_op.get_rescan_count());
+        EXPECT_EQ(2 == test_case.child_count_ ? 1 : 0, second_op.get_rescan_count());
+        target.set_uint64(2);
+        expected_ret = OB_SUCCESS;
+        expected_max_score = 1 == test_case.child_count_ ? 1.0 : 3.0;
+      }
+      const MaxScoreTuple *tuple = nullptr;
+      EXPECT_EQ(expected_ret, op.advance_shallow(target, true, tuple));
+      if (OB_SUCCESS == expected_ret) {
+        ASSERT_NE(nullptr, tuple);
+        ASSERT_TRUE(tuple->get_min_id().is_normal());
+        EXPECT_EQ(target.get_uint64(), tuple->get_min_id().get_uint64());
+        EXPECT_TRUE(tuple->get_max_id().is_max());
+        EXPECT_DOUBLE_EQ(expected_max_score, tuple->get_max_score());
+      } else {
+        EXPECT_EQ(nullptr, tuple);
+      }
+    }
+    ASSERT_EQ(OB_SUCCESS, op.close());
+  }
+}
+
+TEST_F(ObDASBooleanQueryTest, topk_bmw_continues_after_disjunction_shallow_exhaustion)
+{
+  class MockBlockSearchOp : public MockSearchOp
+  {
+  public:
+    MockBlockSearchOp(
+        ObDASSearchCtx &ctx,
+        const std::vector<uint64_t> &rowids,
+        const std::vector<double> &scores)
+      : MockSearchOp(ctx, rowids, scores),
+        last_id_(rowids.back()), max_score_(*std::max_element(scores.begin(), scores.end()))
+    {}
+
+  protected:
+    int do_advance_shallow(
+        const ObDASRowID &target,
+        const bool inclusive,
+        const MaxScoreTuple *&tuple) override
+    {
+      int ret = OB_SUCCESS;
+      tuple = nullptr;
+      if (target.is_max() || (target.is_normal()
+          && (target.get_uint64() > last_id_
+              || (!inclusive && target.get_uint64() == last_id_)))) {
+        ret = OB_ITER_END;
+      } else {
+        ObDASRowID max_id;
+        max_id.set_uint64(last_id_);
+        max_score_tuple_.set(target, max_id, max_score_);
+        tuple = &max_score_tuple_;
+      }
+      return ret;
+    }
+
+    int do_calc_max_score(double &score) override
+    {
+      score = max_score_;
+      return OB_SUCCESS;
+    }
+
+  private:
+    uint64_t last_id_;
+    double max_score_;
+  };
+
+  SearchCtxSetup ctx_setup(allocator_);
+  // Keep the single rowid expression alive until TopK finishes writing its result.
+  ObExpr rowid_expr;
+  ExprFixedArray rowid_exprs(allocator_);
+  ASSERT_EQ(OB_SUCCESS, rowid_exprs.init(1));
+  ASSERT_EQ(OB_SUCCESS, rowid_exprs.push_back(&rowid_expr));
+  ctx_setup.search_ctx_.rowid_exprs_ = &rowid_exprs;
+  ctx_setup.search_ctx_.scopes_[DAS_SCOPE_BASE].rowid_exprs_ = &rowid_exprs;
+
+  MockBlockSearchOp a1(ctx_setup.search_ctx_, {2}, {0.5});
+  MockBlockSearchOp a2(ctx_setup.search_ctx_, {2}, {0.5});
+  MockBlockSearchOp b(ctx_setup.search_ctx_, {1, 10}, {1.0, 6.0});
+  MockBlockSearchOp c(ctx_setup.search_ctx_, {1, 10}, {1.0, 6.0});
+  MockSearchOpParam child_param;
+  child_param.set_is_scoring(true);
+  for (MockBlockSearchOp *child : {&a1, &a2, &b, &c}) {
+    ASSERT_EQ(OB_SUCCESS, child->init(child_param));
+  }
+
+  ObArray<ObIDASSearchOp *> disjunction_children;
+  ASSERT_EQ(OB_SUCCESS, disjunction_children.push_back(&a1));
+  ASSERT_EQ(OB_SUCCESS, disjunction_children.push_back(&a2));
+  ObDASDisjunctionOpParam disjunction_param(disjunction_children, 1, false, ObDASSearchCost(0));
+  disjunction_param.set_is_scoring(true);
+  ObDASDisjunctionOp disjunction(ctx_setup.search_ctx_);
+  ASSERT_EQ(OB_SUCCESS, disjunction.init(disjunction_param));
+
+  ObArray<ObIDASSearchOp *> bmw_children;
+  ASSERT_EQ(OB_SUCCESS, bmw_children.push_back(&disjunction));
+  ASSERT_EQ(OB_SUCCESS, bmw_children.push_back(&b));
+  ASSERT_EQ(OB_SUCCESS, bmw_children.push_back(&c));
+  ObDASBMWOpParam bmw_param(bmw_children, 2, allocator_);
+  bmw_param.set_is_scoring(true);
+  ObDASBMWOp bmw(ctx_setup.search_ctx_);
+  ASSERT_EQ(OB_SUCCESS, bmw.init(bmw_param));
+
+  ObDASTopKCollectOpParam topk_param;
+  topk_param.limit_ = 1;
+  topk_param.child_ = &bmw;
+  topk_param.dynamic_pruning_enabled_ = true;
+  topk_param.set_is_scoring(true);
+  ObDASTopKCollectOp topk(ctx_setup.search_ctx_);
+  ASSERT_EQ(OB_SUCCESS, topk.init(topk_param));
+  ASSERT_EQ(OB_SUCCESS, topk.open());
+
+  // row1 raises the pruning threshold to 2; after A exhausts at row10, B/C must still contribute a total score of 12.
+  ObDASRowID rowid;
+  double score = 0.0;
+  ASSERT_EQ(OB_SUCCESS, topk.next_rowid(rowid, score));
+  EXPECT_EQ(10, rowid.get_uint64());
+  EXPECT_DOUBLE_EQ(12.0, score);
+  EXPECT_EQ(OB_ITER_END, topk.next_rowid(rowid, score));
+  ASSERT_EQ(OB_SUCCESS, topk.close());
+  ASSERT_EQ(OB_SUCCESS, bmw.close());
+  ASSERT_EQ(OB_SUCCESS, disjunction.close());
 }
 
 // Test: Mixed MUST and SHOULD clauses with min_should_match = 1
