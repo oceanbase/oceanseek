@@ -444,7 +444,9 @@ int ObPluginVectorIndexMgr::get_adapter_inst_guard(ObTabletID tablet_id, ObPlugi
 
   ObPluginVectorIndexAdaptor *index_inst = nullptr;
   if (OB_FAIL(get_adapter_inst_(tablet_id, index_inst))) {
-    LOG_WARN("failed to get adapter inst", K(tablet_id), KR(ret));
+    if (OB_HASH_NOT_EXIST != ret) {
+      LOG_WARN("failed to get adapter inst", K(tablet_id), KR(ret));
+    }
   } else if (OB_FAIL(adpt_guard.set_adapter(index_inst))) {
     LOG_WARN("failed to set adapter", K(tablet_id), KR(ret));
   } else {
@@ -489,6 +491,29 @@ int ObPluginVectorIndexMgr::get_inc_tablet_id_by_vbitmap(
         && adapter->is_inc_tablet_valid()) {
       inc_tablet_id = adapter->get_inc_tablet_id();
       ret = OB_SUCCESS;
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexMgr::get_adapter_inst_guard_for_embedding(
+    const int64_t table_id,
+    const common::ObTabletID &tablet_id,
+    ObPluginVectorIndexAdapterGuard &adapter_guard)
+{
+  int ret = OB_HASH_NOT_EXIST;
+  RLockGuard lock_guard(adapter_map_rwlock_);
+  FOREACH_X(iter, vec_adaptor_map_, OB_HASH_NOT_EXIST == ret) {
+    ObPluginVectorIndexAdaptor *adapter = iter->second;
+    if (OB_NOT_NULL(adapter)
+        && ((adapter->get_snapshot_table_id() == table_id
+             && adapter->get_snap_tablet_id() == tablet_id)
+            || (adapter->get_inc_table_id() == table_id
+                && adapter->get_inc_tablet_id() == tablet_id))
+        && adapter->is_inc_tablet_valid()) {
+      if (OB_FAIL(adapter_guard.set_adapter(adapter))) {
+        LOG_WARN("fail to hold embedding adapter", KR(ret), K_(ls_id), K(table_id), K(tablet_id));
+      }
     }
   }
   return ret;
@@ -3298,6 +3323,7 @@ int ObPluginVectorIndexService::resolve_sdk_databases_for_ivf_rewarm(
 {
   int ret = OB_SUCCESS;
   ObSchemaGetterGuard schema_guard;
+  ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
   ObString copied_name;
   common::ObSEArray<const schema::ObSimpleDatabaseSchema *, 16> db_schemas;
   sdk_db_names.reset();
@@ -3325,7 +3351,18 @@ int ObPluginVectorIndexService::resolve_sdk_databases_for_ivf_rewarm(
           table_id))) {
         LOG_WARN("[IVF_CACHE_REWARM] fail to resolve sdk_collections", KR(ret), K(db_id));
       } else if (OB_INVALID_ID != table_id) {
-        if (OB_FAIL(ob_write_string(allocator, db_schemas.at(i)->get_database_name(), copied_name))) {
+        bool database_active = false;
+        if (OB_FAIL(schema_checker.check_database(db_id, database_active))) {
+          LOG_WARN("fail to check IVF rewarm database schema", KR(ret), K_(tenant_id), K(db_id));
+        } else if (!database_active) {
+          if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+            LOG_WARN("[VEC_SCHEMA_SKIP] skip IVF rewarm database discovery for inactive schema",
+                     K_(tenant_id), K(db_id), K(db_schemas.at(i)->get_database_name()));
+          } else {
+            LOG_DEBUG("[VEC_SCHEMA_SKIP] skip IVF rewarm database discovery for inactive schema",
+                      K_(tenant_id), K(db_id), K(db_schemas.at(i)->get_database_name()));
+          }
+        } else if (OB_FAIL(ob_write_string(allocator, db_schemas.at(i)->get_database_name(), copied_name))) {
           LOG_WARN("[IVF_CACHE_REWARM] fail to copy database name", KR(ret), K(db_id));
         } else if (OB_FAIL(sdk_db_names.push_back(copied_name))) {
           LOG_WARN("[IVF_CACHE_REWARM] fail to collect database name", KR(ret), K(db_id));

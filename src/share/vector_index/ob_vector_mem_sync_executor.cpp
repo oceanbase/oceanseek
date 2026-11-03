@@ -718,6 +718,8 @@ int ObVecMemSyncExecutor::log_tablets_need_memdata_sync(ObPluginVectorIndexMgr *
 int ObVecMemSyncExecutor::load_task(uint64_t &task_trace_base_num)
 {
   int ret = OB_SUCCESS;
+  ObSchemaGetterGuard schema_guard;
+  ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
   ObPluginVectorIndexMgr *index_ls_mgr = nullptr;
   bool need_skip = false;
   bool need_sync = false;
@@ -760,6 +762,7 @@ int ObVecMemSyncExecutor::load_task(uint64_t &task_trace_base_num)
       ObTabletID tablet_id = iter->first;
       ObVecIndexAsyncTaskCtx *task_ctx_tmp = iter->second;
       bool is_in_flight = false;
+      bool schema_active = false;
       if (OB_ISNULL(task_ctx_tmp)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected nullptr task_ctx_tmp", K(ret), K(tablet_id));
@@ -771,6 +774,16 @@ int ObVecMemSyncExecutor::load_task(uint64_t &task_trace_base_num)
         LOG_WARN("fail to check mem sync tablet in flight", KR(ret), K(tablet_id));
       } else if (is_in_flight) {
         LOG_TRACE("skip tablet already in flight for mem sync", K_(tenant_id), K(tablet_id));
+      } else if (OB_FAIL(schema_checker.check_table(task_ctx_tmp->task_status_.table_id_, schema_active))) {
+        LOG_WARN("fail to check mem sync task schema", KR(ret), K(tablet_id));
+      } else if (!schema_active) {
+        if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+          LOG_WARN("[VEC_SCHEMA_SKIP] skip mem sync task for inactive schema",
+                   K_(tenant_id), K_(ls_handle), K(tablet_id), K(task_ctx_tmp->task_status_.table_id_));
+        } else {
+          LOG_DEBUG("[VEC_SCHEMA_SKIP] skip mem sync task for inactive schema",
+                    K_(tenant_id), K_(ls_handle), K(tablet_id), K(task_ctx_tmp->task_status_.table_id_));
+        }
       } else if (OB_FAIL(eligible_tablets.push_back(tablet_id.id()))) {
         LOG_WARN("fail to push back eligible tablet", KR(ret), K(tablet_id));
       }

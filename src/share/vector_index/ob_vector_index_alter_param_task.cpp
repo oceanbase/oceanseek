@@ -182,6 +182,8 @@ int ObVecAlterIndexParamTask::load_tablet_progresses_(
 {
   int ret = OB_SUCCESS;
   ObSchemaGetterGuard schema_guard;
+  ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
+  bool schema_active = false;
   const ObTableSchema *inc_schema = nullptr;
   const ObTableSchema *data_schema = nullptr;
   const ObTableSchema *vbitmap_schema = nullptr;
@@ -197,9 +199,11 @@ int ObVecAlterIndexParamTask::load_tablet_progresses_(
   hash::ObHashMap<ObTabletID, int64_t> progress_idx_map;
   progresses.reset();
   schema_version = OB_INVALID_VERSION;
-  if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(
-          tenant_id_, schema_guard))) {
-    LOG_WARN("fail to get schema guard", KR(ret), K_(tenant_id));
+  if (OB_FAIL(schema_checker.check_table(ctx_->task_status_.table_id_, schema_active))) {
+    LOG_WARN("fail to check alter index params schema", KR(ret), KPC(ctx_));
+  } else if (!schema_active) {
+    ret = OB_CANCELED;
+    LOG_INFO("cancel alter index params for inactive schema", KR(ret), KPC(ctx_));
   } else if (OB_FAIL(schema_guard.get_table_schema(
           tenant_id_, ctx_->task_status_.table_id_, inc_schema))) {
     LOG_WARN("fail to get incremental index schema", KR(ret), KPC(ctx_));

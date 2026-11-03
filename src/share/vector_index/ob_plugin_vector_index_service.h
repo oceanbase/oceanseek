@@ -212,6 +212,10 @@ public:
       const int64_t vbitmap_table_id,
       const common::ObTabletID &vbitmap_tablet_id,
       common::ObTabletID &inc_tablet_id);
+  int get_adapter_inst_guard_for_embedding(
+      const int64_t table_id,
+      const common::ObTabletID &tablet_id,
+      ObPluginVectorIndexAdapterGuard &adapter_guard);
   int collect_adaptor_tablet_ids(ObIArray<ObTabletID> &tablet_ids);
   int attach_adapter(ObPluginVectorIndexAdaptor *adapter_inst, bool &attached, int overwrite = 0);
   int detach_adapter(ObTabletID tablet_id, bool &detached);

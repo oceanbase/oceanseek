@@ -62,6 +62,80 @@ ERRSIM_POINT_DEF(ERRSIM_VEC_ASYNC_TASK_SKIP_STATUS_UPDATE,
 ERRSIM_POINT_DEF(ERRSIM_ALTER_INDEX_PARAMS_AFTER_PARENT_DELETE);
 ERRSIM_POINT_DEF(ERRSIM_ALTER_INDEX_PARAMS_AFTER_PARENT_INSERT);
 
+int ObVecIndexSchemaChecker::prepare_schema_guard_()
+{
+  int ret = OB_SUCCESS;
+  int64_t schema_version = OB_INVALID_VERSION;
+  if (schema_ready_) {
+  } else if (!schema_guard_.is_inited()
+             && OB_FAIL(schema::ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(
+                 tenant_id_, schema_guard_))) {
+    LOG_WARN("fail to get vector task schema guard", KR(ret), K_(tenant_id));
+  } else if (OB_FAIL(schema_guard_.get_schema_version(tenant_id_, schema_version))) {
+    LOG_WARN("fail to get vector task schema version", KR(ret), K_(tenant_id));
+  } else if (!schema::ObSchemaService::is_formal_version(schema_version)) {
+    ret = OB_EAGAIN;
+    LOG_INFO("vector task schema is not ready", KR(ret), K_(tenant_id), K(schema_version));
+  } else {
+    schema_ready_ = true;
+  }
+  return ret;
+}
+
+int ObVecIndexSchemaChecker::check_database(const uint64_t database_id, bool &is_active)
+{
+  int ret = OB_SUCCESS;
+  is_active = false;
+  const schema::ObSimpleTenantSchema *tenant_schema = nullptr;
+  const schema::ObDatabaseSchema *database_schema = nullptr;
+  if (OB_INVALID_ID == database_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid vector database id", KR(ret), K_(tenant_id), K(database_id));
+  } else if (OB_FAIL(prepare_schema_guard_())) {
+  } else if (OB_FAIL(schema_guard_.get_tenant_info(tenant_id_, tenant_schema))) {
+    LOG_WARN("fail to get vector tenant schema", KR(ret), K_(tenant_id), K(database_id));
+  } else if (OB_ISNULL(tenant_schema)) {
+    LOG_DEBUG("[VEC_SCHEMA_SKIP] tenant does not exist", K_(tenant_id), K(database_id));
+  } else if (tenant_schema->is_in_recyclebin() || tenant_schema->is_dropping()) {
+    LOG_DEBUG("[VEC_SCHEMA_SKIP] tenant is in recyclebin or dropping",
+              K_(tenant_id), K(database_id), K(tenant_schema->get_schema_version()),
+              K(tenant_schema->get_status()), K(tenant_schema->is_in_recyclebin()));
+  } else if (OB_FAIL(schema_guard_.get_database_schema(tenant_id_, database_id, database_schema))) {
+    LOG_WARN("fail to get vector database schema", KR(ret), K_(tenant_id), K(database_id));
+  } else if (OB_ISNULL(database_schema)) {
+    LOG_DEBUG("[VEC_SCHEMA_SKIP] database does not exist", K_(tenant_id), K(database_id));
+  } else if (database_schema->is_in_recyclebin()) {
+    LOG_DEBUG("[VEC_SCHEMA_SKIP] database is in recyclebin",
+              K_(tenant_id), K(database_id), K(database_schema->get_schema_version()));
+  } else {
+    is_active = true;
+  }
+  return ret;
+}
+
+int ObVecIndexSchemaChecker::check_table(const uint64_t table_id, bool &is_active)
+{
+  int ret = OB_SUCCESS;
+  is_active = false;
+  const schema::ObSimpleTableSchemaV2 *table_schema = nullptr;
+  if (OB_INVALID_ID == table_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid vector table id", KR(ret), K_(tenant_id), K(table_id));
+  } else if (OB_FAIL(prepare_schema_guard_())) {
+  } else if (OB_FAIL(schema_guard_.get_simple_table_schema(tenant_id_, table_id, table_schema))) {
+    LOG_WARN("fail to get vector table schema", KR(ret), K_(tenant_id), K(table_id));
+  } else if (OB_ISNULL(table_schema)) {
+    LOG_DEBUG("[VEC_SCHEMA_SKIP] table does not exist", K_(tenant_id), K(table_id));
+  } else if (table_schema->is_in_recyclebin()) {
+    LOG_DEBUG("[VEC_SCHEMA_SKIP] table is in recyclebin",
+              K_(tenant_id), K(table_id), K(table_schema->get_schema_version()));
+  } else if (OB_FAIL(check_database(table_schema->get_database_id(), is_active))) {
+  } else if (is_active && table_schema->is_index_table()
+             && OB_FAIL(check_table(table_schema->get_data_table_id(), is_active))) {
+  }
+  return ret;
+}
+
 ObVecIndexAsyncTaskCtx::~ObVecIndexAsyncTaskCtx()
 {
   if (OB_NOT_NULL(queue_node_)) {
@@ -501,7 +575,9 @@ void ObVecIndexAsyncTaskOption::destroy()
   allocator_.reset();
 }
 
-int ObVecIndexAsyncTaskOption::add_task_ctx(ObTabletID &tablet_id, ObVecIndexAsyncTaskCtx *task, bool &inc_new_task)
+int ObVecIndexAsyncTaskOption::add_task_ctx(
+    ObTabletID &tablet_id, ObVecIndexAsyncTaskCtx *task, bool &inc_new_task,
+    const bool check_truncate_version)
 {
   int ret = OB_SUCCESS;
   int tmp_ret = OB_SUCCESS;
@@ -512,7 +588,7 @@ int ObVecIndexAsyncTaskOption::add_task_ctx(ObTabletID &tablet_id, ObVecIndexAsy
   } else {
     uint32_t task_type = task->task_status_.task_type_;
     ObVecIndexAsyncTaskKey key(tablet_id, task_type);
-    if (task->truncate_version_ == OB_INVALID_VERSION
+    if (check_truncate_version && task->truncate_version_ == OB_INVALID_VERSION
         && !ObVecIndexAsyncTaskUtil::disallow_cancel_task(task)
         && OB_TMP_FAIL(ObVecIndexAsyncTaskUtil::get_truncate_version(
            task->tenant_id_, task->task_status_.table_id_, task->truncate_version_))) {
@@ -1117,6 +1193,39 @@ int ObVecIndexAsyncTaskUtil::get_vec_task_type_by_short_name(
         break;
       }
     }
+  }
+  return ret;
+}
+
+int ObVecIndexAsyncTaskUtil::get_embedding_snapshot_table_id(
+    const uint64_t tenant_id, const uint64_t index_table_id, uint64_t &snapshot_table_id)
+{
+  int ret = OB_SUCCESS;
+  schema::ObSchemaGetterGuard schema_guard;
+  const schema::ObTableSchema *index_schema = nullptr;
+  const schema::ObTableSchema *data_schema = nullptr;
+  uint64_t inc_table_id = OB_INVALID_ID;
+  uint64_t vbitmap_table_id = OB_INVALID_ID;
+  uint64_t embedded_table_id = OB_INVALID_ID;
+  snapshot_table_id = OB_INVALID_ID;
+  if (OB_FAIL(schema::ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(
+          tenant_id, schema_guard))) {
+    LOG_WARN("fail to get embedding identity schema guard", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, index_table_id, index_schema))) {
+    LOG_WARN("fail to get embedding index schema", KR(ret), K(tenant_id), K(index_table_id));
+  } else if (OB_ISNULL(index_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+    LOG_WARN("embedding index schema does not exist", KR(ret), K(tenant_id), K(index_table_id));
+  } else if (OB_FAIL(schema_guard.get_table_schema(
+                 tenant_id, index_schema->get_data_table_id(), data_schema))) {
+    LOG_WARN("fail to get embedding data schema", KR(ret), K(tenant_id), K(index_table_id));
+  } else if (OB_ISNULL(data_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+    LOG_WARN("embedding data schema does not exist", KR(ret), K(tenant_id), K(index_table_id));
+  } else if (OB_FAIL(ObVectorIndexUtil::get_index_tids_for_hnsw_by_prefix(
+                 &schema_guard, *data_schema, index_table_id, inc_table_id, vbitmap_table_id,
+                 snapshot_table_id, embedded_table_id, true))) {
+    LOG_WARN("fail to resolve embedding snapshot table", KR(ret), K(tenant_id), K(index_table_id));
   }
   return ret;
 }
@@ -2781,11 +2890,12 @@ int ObVecIndexAsyncTaskUtil::try_add_task_ctx_from_inner_row(
     const ObVecIndexTaskStatus &task_row,
     storage::ObLS *ls,
     storage::ObLSHandle &ls_handle,
-    ObVecIndexAsyncTaskOption &async_task_opt,
+    ObPluginVectorIndexMgr &index_ls_mgr,
     const bool verify_tablet_on_ls)
 {
   int ret = OB_SUCCESS;
   ObVecIndexTaskStatus task_result = task_row;
+  ObVecIndexAsyncTaskOption &async_task_opt = index_ls_mgr.get_async_task_opt();
   bool need_resumed = true;
   ObTabletID tablet_id(task_result.tablet_id_);
 
@@ -2845,8 +2955,11 @@ int ObVecIndexAsyncTaskUtil::try_add_task_ctx_from_inner_row(
   } else {
     ObIAllocator *allocator = async_task_opt.get_allocator();
     ObVecIndexAsyncTaskCtx *task_ctx = nullptr;
+    ObPluginVectorIndexAdapterGuard embedding_adapter_guard;
     char *task_ctx_buf = nullptr;
     bool is_task_exist = false;
+    const bool is_embedding =
+        task_result.task_type_ == ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_HYBRID_VECTOR_EMBEDDING;
 
     if (task_result.task_type_ != ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_INDEX_OPTINAL) {
       task_result.status_ = ObVecIndexAsyncTaskStatus::OB_VECTOR_ASYNC_TASK_PREPARE;
@@ -2858,6 +2971,11 @@ int ObVecIndexAsyncTaskUtil::try_add_task_ctx_from_inner_row(
       ret = OB_ENTRY_EXIST;
       LOG_INFO("[VEC_ASYNC_TASK] skip task installed from inner table, duplicate task exists",
                K(ret), K(tenant_id), K(task_result));
+    } else if (is_embedding && OB_FAIL(index_ls_mgr.get_adapter_inst_guard_for_embedding(
+                   task_result.table_id_, tablet_id, embedding_adapter_guard))) {
+      LOG_WARN("fail to resolve embedding adapter before task registration", KR(ret), K(tenant_id), K(task_result));
+    } else if (is_embedding && OB_FALSE_IT(task_result.inc_tablet_id_ =
+                   embedding_adapter_guard.get_adatper()->get_inc_tablet_id())) {
     } else if (task_result.task_type_ == ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_HYBRID_VECTOR_EMBEDDING
                && OB_FALSE_IT(task_ctx_buf = static_cast<char *>(
                    allocator->alloc(sizeof(ObHybridVectorRefreshTaskCtx))))) {
@@ -2889,8 +3007,21 @@ int ObVecIndexAsyncTaskUtil::try_add_task_ctx_from_inner_row(
 
     bool inc_new_task = false;
     if (OB_FAIL(ret)) {
+    } else if (is_embedding) {
+      // Publish the complete identity once; the worker must never fill it in later.
+      if (OB_FAIL(ObVecITaskExecutor::try_add_task_ctx_for_adapter(
+              index_ls_mgr, task_result.inc_tablet_id_, embedding_adapter_guard.get_adatper(),
+              task_ctx, inc_new_task))) {
+        LOG_WARN("fail to register embedding task for current adapter", KR(ret), K(tenant_id), K(task_result));
+      } else if (!inc_new_task) {
+        ret = OB_CANCELED;
+        LOG_INFO("skip embedding task for changed or stopping adapter, or duplicate task",
+                 KR(ret), K(tenant_id), K(task_result));
+      }
     } else if (OB_FAIL(async_task_opt.add_task_ctx(tablet_id, task_ctx, inc_new_task))) {
       LOG_WARN("fail to push back task", K(ret), K(task_ctx));
+    }
+    if (OB_FAIL(ret)) {
     } else if (inc_new_task) {
       LOG_INFO("[VEC_ASYNC_TASK] task installed from inner table", K(tenant_id), KPC(task_ctx));
     } else {

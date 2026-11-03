@@ -234,7 +234,8 @@ private:
   // Iterate centroids in map_cache and submit SPLIT/MERGE tasks
   int check_and_submit_distribution_tasks_(ObIvfMapCentCache *map_cache,
                                            uint64_t tablet_id, uint64_t index_table_id,
-                                           int64_t ns_id, uint64_t ltable_id);
+                                           int64_t ns_id, uint64_t ltable_id,
+                                           ObVecIndexSchemaChecker &schema_checker);
   // The caller holds the per-tablet distribution mutex.
   int do_check_and_submit_distribution_tasks_(ObIvfMapCentCache *map_cache,
                                               uint64_t tablet_id,

@@ -143,6 +143,7 @@ public:
       can_schedule_{},
       current_memory_config_(0),
       local_schema_version_(OB_INVALID_VERSION),
+      local_tenant_schema_version_(OB_INVALID_VERSION),
       is_tenant_cancel_done_(false),
       is_first_startup_round_done_(false),
       is_first_update_round_done_(false),
@@ -420,6 +421,7 @@ private:
   bool can_schedule_[ObVectorTaskScheduleType::SCHEDULE_MAX];
   int64_t current_memory_config_;
   int64_t local_schema_version_;
+  int64_t local_tenant_schema_version_; // Current tenant object's version in sys schema.
   // Latched true only after a full successful cancel sweep in cancel_all_tenant_tasks_()
   // for OB_TENANT_NOT_EXIST. Accessed via ATOMIC_LOAD/STORE so future non-timer callers
   // (if any) do not hit TOCTOU. Stays false while any per-ctx cancel failed so the next

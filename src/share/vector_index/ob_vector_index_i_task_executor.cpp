@@ -87,7 +87,8 @@ int ObVecITaskExecutor::resume_task()
 int ObVecITaskExecutor::check_has_hnsw_ddl(
     const uint64_t tenant_id,
     common::hash::ObHashSet<uint64_t> &conflict_table_id_set,
-    common::hash::ObHashSet<uint64_t> &conflict_index_task_set)
+    common::hash::ObHashSet<uint64_t> &conflict_index_task_set,
+    common::hash::ObHashSet<uint64_t> *dropping_index_ids)
 {
   int ret = OB_SUCCESS;
   ObSqlString sql;
@@ -123,6 +124,15 @@ int ObVecITaskExecutor::check_has_hnsw_ddl(
           EXTRACT_INT_FIELD_MYSQL(*result, "object_id", object_id, uint64_t);
           EXTRACT_INT_FIELD_MYSQL(*result, "target_object_id", target_object_id, uint64_t);
           EXTRACT_INT_FIELD_MYSQL(*result, "ddl_type", ddl_type, int64_t);
+          if (OB_SUCC(ret) && DDL_DROP_VEC_INDEX == static_cast<ObDDLType>(ddl_type)
+              && OB_NOT_NULL(dropping_index_ids)
+              && OB_FAIL(dropping_index_ids->set_refactored(target_object_id, 0))) {
+            if (OB_HASH_EXIST == ret) {
+              ret = OB_SUCCESS;
+            } else {
+              LOG_WARN("fail to collect dropping vector index", KR(ret), K(tenant_id), K(target_object_id));
+            }
+          }
           if (OB_SUCC(ret)) {
             if (static_cast<ObDDLType>(ddl_type) == DDL_REBUILD_INDEX) {
               if (OB_FAIL(conflict_index_task_set.set_refactored(target_object_id, 0))) {
@@ -173,11 +183,94 @@ int ObVecITaskExecutor::check_has_hnsw_ddl(
   return ret;
 }
 
+int ObVecITaskExecutor::get_dropping_index_ids(
+    const uint64_t tenant_id,
+    common::hash::ObHashSet<uint64_t> &dropping_index_ids)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString sql;
+  if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sql proxy is null when checking dropping vector indexes", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(sql.assign_fmt("SELECT target_object_id FROM %s WHERE ddl_type = %d",
+                                  OB_ALL_DDL_TASK_STATUS_TNAME, static_cast<int>(DDL_DROP_VEC_INDEX)))) {
+    LOG_WARN("fail to build dropping vector index query", KR(ret), K(tenant_id));
+  } else {
+    SMART_VAR(ObMySQLProxy::MySQLResult, res) {
+      common::sqlclient::ObMySQLResult *result = nullptr;
+      if (OB_FAIL(GCTX.sql_proxy_->read(res, tenant_id, sql.ptr(), nullptr, 5L * 1000L * 1000L))) {
+        LOG_WARN("fail to query dropping vector indexes", KR(ret), K(tenant_id));
+      } else if (OB_ISNULL(result = res.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("dropping vector index query returned null result", KR(ret), K(tenant_id));
+      } else {
+        while (OB_SUCC(ret) && OB_SUCC(result->next())) {
+          uint64_t target_object_id = OB_INVALID_ID;
+          EXTRACT_INT_FIELD_MYSQL(*result, "target_object_id", target_object_id, uint64_t);
+          if (OB_SUCC(ret) && OB_FAIL(dropping_index_ids.set_refactored(target_object_id, 0))) {
+            if (OB_HASH_EXIST == ret) {
+              ret = OB_SUCCESS;
+            } else {
+              LOG_WARN("fail to collect dropping vector index", KR(ret), K(tenant_id), K(target_object_id));
+            }
+          }
+        }
+        if (OB_ITER_END == ret) {
+          ret = OB_SUCCESS;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObVecITaskExecutor::try_add_task_ctx_for_adapter(
+    ObPluginVectorIndexMgr &index_ls_mgr,
+    const common::ObTabletID &adapter_tablet_id,
+    ObPluginVectorIndexAdaptor *adapter,
+    ObVecIndexAsyncTaskCtx *task_ctx,
+    bool &inc_new_task)
+{
+  int ret = OB_SUCCESS;
+  inc_new_task = false;
+  if (OB_ISNULL(adapter) || OB_ISNULL(task_ctx) || !adapter_tablet_id.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid adapter task", KR(ret), K(adapter_tablet_id), KP(adapter), KP(task_ctx));
+  } else {
+    int tmp_ret = OB_SUCCESS;
+    if (task_ctx->truncate_version_ == OB_INVALID_VERSION
+        && !ObVecIndexAsyncTaskUtil::disallow_cancel_task(task_ctx)
+        && OB_TMP_FAIL(ObVecIndexAsyncTaskUtil::get_truncate_version(
+            task_ctx->tenant_id_, task_ctx->task_status_.table_id_, task_ctx->truncate_version_))) {
+      LOG_WARN("fail to get task truncate version before locking adapter map", K(tmp_ret), KPC(task_ctx));
+    }
+    RWLock::RLockGuard lock_guard(index_ls_mgr.get_adapter_map_lock());
+    ObPluginVectorIndexAdaptor *current_adapter = nullptr;
+    if (OB_FAIL(index_ls_mgr.get_vec_adaptor_map().get_refactored(adapter_tablet_id, current_adapter))) {
+      if (OB_HASH_NOT_EXIST == ret) {
+        ret = OB_SUCCESS;
+        LOG_DEBUG("adapter removed while loading task", K(adapter_tablet_id), KPC(task_ctx));
+      } else {
+        LOG_WARN("fail to recheck task adapter", KR(ret), K(adapter_tablet_id), KPC(task_ctx));
+      }
+    } else if (current_adapter != adapter || adapter->is_need_cancel_task()
+               || index_ls_mgr.is_ls_destroying() || index_ls_mgr.get_async_task_opt().is_stop()) {
+      LOG_DEBUG("skip task for changed or stopping adapter",
+                K(adapter_tablet_id), KP(adapter), KP(current_adapter), KPC(task_ctx));
+    } else if (OB_FAIL(index_ls_mgr.get_async_task_opt().add_task_ctx(
+                   task_ctx->task_status_.tablet_id_, task_ctx, inc_new_task, false))) {
+      LOG_WARN("fail to add task for current adapter", KR(ret), K(adapter_tablet_id), KPC(task_ctx));
+    }
+  }
+  return ret;
+}
+
 int ObVecITaskExecutor::check_task_ddl_conflict(
     ObVecIndexAsyncTaskCtx *task_ctx,
     ObPluginVectorIndexMgr *index_ls_mgr,
     const common::hash::ObHashSet<uint64_t> &conflict_table_id_set,
     const common::hash::ObHashSet<uint64_t> &conflict_index_task_set,
+    const common::hash::ObHashSet<uint64_t> &dropping_index_ids,
     bool &is_conflict)
 {
   int ret = OB_SUCCESS;
@@ -211,6 +304,31 @@ int ObVecITaskExecutor::check_task_ddl_conflict(
           is_conflict = true;
         }
       }
+    }
+  } else if ((task_ctx->task_status_.trigger_type_ == OB_VEC_TRIGGER_AUTO
+              || task_ctx->task_status_.trigger_type_ == OB_VEC_TRIGGER_MANUAL)
+             && (task_ctx->task_status_.task_type_ == OB_VECTOR_ASYNC_INDEX_FREEZE
+                 || task_ctx->task_status_.task_type_ == OB_VECTOR_ASYNC_INDEX_MERGE)
+             && dropping_index_ids.size() > 0) {
+    uint64_t inc_table_id = task_ctx->task_status_.table_id_;
+    if (OB_VECTOR_ASYNC_INDEX_MERGE == task_ctx->task_status_.task_type_) {
+      ObTabletID inc_tablet_id = task_ctx->task_status_.inc_tablet_id_;
+      ObPluginVectorIndexAdapterGuard adapter_guard;
+      if ((!inc_tablet_id.is_valid() || OB_INVALID_ID == inc_tablet_id.id())
+          && OB_FAIL(index_ls_mgr->get_inc_tablet_id_by_vbitmap(
+              task_ctx->task_status_.table_id_, task_ctx->task_status_.tablet_id_, inc_tablet_id))) {
+        LOG_WARN("fail to resolve merge tablet for DROP conflict check", KR(ret), KPC(task_ctx));
+      } else if (OB_FAIL(index_ls_mgr->get_adapter_inst_guard(inc_tablet_id, adapter_guard))) {
+        LOG_WARN("fail to get merge adapter for DROP conflict check", KR(ret), K(inc_tablet_id), KPC(task_ctx));
+      } else if (OB_ISNULL(adapter_guard.get_adatper())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("null merge adapter for DROP conflict check", KR(ret), K(inc_tablet_id), KPC(task_ctx));
+      } else {
+        inc_table_id = adapter_guard.get_adatper()->get_inc_table_id();
+      }
+    }
+    if (OB_SUCC(ret)) {
+      is_conflict = OB_HASH_EXIST == dropping_index_ids.exist_refactored(inc_table_id);
     }
   } else if (task_ctx->task_status_.trigger_type_ == OB_VEC_TRIGGER_ALTER_INDEX_PARAM
              && task_ctx->task_status_.task_type_ == OB_VECTOR_ASYNC_INDEX_MERGE
@@ -265,6 +383,7 @@ int ObVecITaskExecutor::start_task()
 
     common::hash::ObHashSet<uint64_t> conflict_table_id_set;
     common::hash::ObHashSet<uint64_t> conflict_index_task_set;
+    common::hash::ObHashSet<uint64_t> dropping_index_ids;
     bool ddl_conflict_checked = false;
     if (task_opt.get_async_task_map().size() > 0) {
       int tmp_ret = OB_SUCCESS;
@@ -272,7 +391,10 @@ int ObVecITaskExecutor::start_task()
         LOG_WARN("fail to create conflict_table_id_set, skip DDL conflict check", K(tmp_ret));
       } else if (OB_TMP_FAIL(conflict_index_task_set.create(16))) {
         LOG_WARN("fail to create conflict_index_task_set, skip DDL conflict check", K(tmp_ret));
-      } else if (OB_TMP_FAIL(check_has_hnsw_ddl(tenant_id_, conflict_table_id_set, conflict_index_task_set))) {
+      } else if (OB_TMP_FAIL(dropping_index_ids.create(16))) {
+        LOG_WARN("fail to create dropping index set, skip DDL conflict check", KR(tmp_ret), K_(tenant_id));
+      } else if (OB_TMP_FAIL(check_has_hnsw_ddl(
+                     tenant_id_, conflict_table_id_set, conflict_index_task_set, &dropping_index_ids))) {
         LOG_WARN("fail to check hnsw ddl, skip DDL conflict check", K(tmp_ret));
       } else {
         ddl_conflict_checked = true;
@@ -293,7 +415,7 @@ int ObVecITaskExecutor::start_task()
           int tmp_ret = OB_SUCCESS;
           if (OB_TMP_FAIL(check_task_ddl_conflict(task_ctx, index_ls_mgr,
                                                    conflict_table_id_set,
-                                                   conflict_index_task_set,
+                                                   conflict_index_task_set, dropping_index_ids,
                                                    is_conflict))) {
             LOG_WARN("fail to check task ddl conflict, treat as no conflict",
                      K(tmp_ret), KPC(task_ctx));

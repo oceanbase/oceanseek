@@ -131,6 +131,8 @@ void ObPluginVectorIndexLoadScheduler::clean_deprecated_adapters()
 
   if (OB_SUCC(ret) && OB_NOT_NULL(index_ls_mgr)) {
     bool is_in_migration = false;
+    ObSchemaGetterGuard schema_guard;
+    ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
     if (OB_FAIL(index_ls_mgr->collect_adaptor_tablet_ids(local_tablet_id_array))) {
       LOG_WARN("failed to collect adaptor tablet ids", KR(ret), K(ls_->get_ls_id()));
     } else if (OB_FAIL(check_ls_in_vector_migration(is_in_migration))) {
@@ -141,8 +143,8 @@ void ObPluginVectorIndexLoadScheduler::clean_deprecated_adapters()
       const ObTabletID tablet_id = local_tablet_id_array.at(i);
       ObPluginVectorIndexAdapterGuard local_guard;
       ObPluginVectorIndexAdapterGuard tenant_guard;
-      ObSchemaGetterGuard schema_guard;
       const ObSimpleTableSchemaV2 *table_schema = NULL;
+      bool schema_active = false;
       ObTabletHandle tablet_handle;
       bool need_detach = false;
       bool need_remove_tenant = false;
@@ -160,8 +162,16 @@ void ObPluginVectorIndexLoadScheduler::clean_deprecated_adapters()
       } else if (tenant_ret != OB_SUCCESS && tenant_ret != OB_HASH_NOT_EXIST) {
         ret = tenant_ret;
         LOG_WARN("failed to get tenant adaptor guard", KR(ret), K(tablet_id));
-      } else if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(tenant_id_, schema_guard))) {
-        LOG_WARN("fail to get schema guard", KR(ret), K(tenant_id_));
+      } else if (OB_FAIL(schema_checker.check_table(
+                     local_guard.get_adatper()->get_inc_table_id(), schema_active))) {
+        LOG_WARN("fail to check adapter schema", KR(ret), K(tenant_id_), K(tablet_id));
+        ret = OB_SUCCESS;
+        continue;
+      } else if (!schema_active) {
+        LOG_INFO("[VEC_SCHEMA_SKIP] remove adapter for inactive schema",
+                 K_(tenant_id), K(ls_->get_ls_id()), K(tablet_id), K(local_guard.get_adatper()->get_inc_table_id()));
+        need_detach = true;
+        need_remove_tenant = true;
       } else if (OB_FAIL(schema_guard.get_simple_table_schema(tenant_id_,
                                                               local_guard.get_adatper()->get_inc_table_id(),
                                                               table_schema))) {
@@ -701,6 +711,7 @@ int ObPluginVectorIndexLoadScheduler::execute_adapter_maintenance(ObIArray<uint6
     // Phase 1: Collect all auxiliary table info into ctx_map (non-shared) and shared_map (shared)
     while (OB_SUCC(ret) && need_maintenance && start_idx < vec_table_id_array.count()) {
       ObSchemaGetterGuard schema_guard;
+      ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
       start_idx = end_idx;
       end_idx = MIN(vec_table_id_array.count(), start_idx + TBALE_GENERATE_BATCH_SIZE);
 
@@ -713,6 +724,7 @@ int ObPluginVectorIndexLoadScheduler::execute_adapter_maintenance(ObIArray<uint6
       for (int64_t idx = start_idx; OB_SUCC(ret) && idx < end_idx; ++idx) {
         const int64_t table_id = vec_table_id_array.at(idx);
         const ObSimpleTableSchemaV2 *table_schema = nullptr;
+        bool schema_active = false;
         if (is_sys_table(table_id)) {
           // do nothing
         } else if (OB_FAIL(schema_guard.get_simple_table_schema(tenant_id_, table_id, table_schema))) {
@@ -722,6 +734,16 @@ int ObPluginVectorIndexLoadScheduler::execute_adapter_maintenance(ObIArray<uint6
           LOG_WARN("table schema is null", KR(ret), K(table_id), K_(tenant_id));
         } else if (table_schema->is_in_recyclebin()) {
           // do nothing
+        } else if (OB_FAIL(schema_checker.check_table(table_id, schema_active))) {
+          LOG_WARN("fail to check schema before creating adapter", KR(ret), K(table_id));
+        } else if (!schema_active) {
+          if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
+            LOG_WARN("[VEC_SCHEMA_SKIP] skip adapter creation for inactive schema",
+                     K_(tenant_id), K(ls_->get_ls_id()), K(table_id), K(table_schema->get_database_id()));
+          } else {
+            LOG_DEBUG("[VEC_SCHEMA_SKIP] skip adapter creation for inactive schema",
+                      K_(tenant_id), K(ls_->get_ls_id()), K(table_id), K(table_schema->get_database_id()));
+          }
         } else if (table_schema->is_unavailable_index()) {
           LOG_INFO("skip unavailable index during maintenance",
                    K(table_id), K(table_schema->get_table_name()));
