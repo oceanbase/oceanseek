@@ -742,13 +742,14 @@ void ObStorageAsyncBufferedMultiPartWriter::reset()
     cur_buf_ = nullptr;
   }
   cur_buf_pos_ = 0;
-  hash::ObHashMap<int64_t, PartData>::iterator iter =
-      part_id_to_data_map_.begin();
-  while (iter != part_id_to_data_map_.end()) {
-    free_part_data_(iter->second);
-    iter++;
+  if (part_id_to_data_map_.created()) {
+    hash::ObHashMap<int64_t, PartData>::iterator iter = part_id_to_data_map_.begin();
+    while (iter != part_id_to_data_map_.end()) {
+      free_part_data_(iter->second);
+      iter++;
+    }
+    part_id_to_data_map_.destroy();
   }
-  part_id_to_data_map_.destroy();
   ObStorageAsyncDirectMultiPartWriter::reset();
 }
 
