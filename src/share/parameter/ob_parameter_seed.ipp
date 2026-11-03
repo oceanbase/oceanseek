@@ -3076,7 +3076,7 @@ DEF_INT(_shared_gc_task_scan_batch_size, OB_TENANT_PARAMETER, "1024", "[1,104857
         "The shared gc executor max rows fetched per scan round."
         "Range: [1, 1048576]",
         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
-DEF_TIME(_shared_gc_task_history_expiration_time, OB_TENANT_PARAMETER, "7d", "[1s,365d]",
+DEF_TIME(_shared_gc_task_history_expiration_time, OB_TENANT_PARAMETER, "30d", "[1s,365d]",
          "The expiration time of the shared data GC task history. "
          "Task history records that exceed the expiration time will be clean. "
          "Range: [1s, 365d]",

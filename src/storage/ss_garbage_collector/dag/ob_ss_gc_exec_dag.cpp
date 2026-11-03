@@ -10,6 +10,7 @@
 #include "lib/time/ob_time_utility.h"
 #include "observer/ob_server_event_history_table_operator.h"
 #include "observer/ob_server_struct.h"
+#include "share/inner_table/ob_inner_table_schema_constants.h"
 #include "share/scheduler/ob_dag_warning_history_mgr.h"
 #include "storage/ss_garbage_collector/ob_ss_gc_util.h"
 #include "storage/ss_garbage_collector/ob_ss_fail_gc_util.h"
@@ -588,20 +589,20 @@ int ObMarkSweepPlanTask::process()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("dag is null", KR(ret));
   } else if (FALSE_IT(dag->record_start_us())) {
-  // Step 1: find the smallest round_id under the watermark. If there is
+  // Step 1: find the smallest round_id and check the watermark. If there is
   // nothing to GC, the plan finishes immediately and the DAG is a no-op.
   // One timer cycle only drains rows under this min_round_id; the next
   // timer-triggered DAG will pick up the next smallest round_id.
   } else if (OB_FAIL(ObSharedGCTaskTableOperator::get_min_round_id(
           tenant_id_,
           ObSharedGCTaskType::MARK_SWEEP_GC,
-          allow_gc_round_id_,
+          OB_ALL_SHARED_GC_TASK_TNAME,
           *GCTX.sql_proxy_,
           is_empty,
           min_round_id))) {
     LOG_WARN("fail to get min_round_id", KR(ret),
         K_(tenant_id), K_(allow_gc_round_id));
-  } else if (is_empty) {
+  } else if (is_empty || (min_round_id > allow_gc_round_id_)) {
     LOG_INFO("no rows to gc in window, plan task exits",
         K_(tenant_id), K_(allow_gc_round_id));
   // Step 2: query task_id range and compute the first slice for min_round_id.
@@ -634,6 +635,7 @@ int ObMarkSweepPlanTask::slice_task_id_range_(
           tenant_id_,
           ObSharedGCTaskType::MARK_SWEEP_GC,
           round_id,
+          OB_ALL_SHARED_GC_TASK_TNAME,
           *GCTX.sql_proxy_,
           is_empty,
           round_range))) {
@@ -796,6 +798,7 @@ int ObFailGCPlanTask::process()
           tenant_id_,
           ObSharedGCTaskType::FAIL_GC,
           0 /*round_id*/,
+          OB_ALL_SHARED_GC_TASK_TNAME,
           *GCTX.sql_proxy_,
           is_empty,
           full_range))) {

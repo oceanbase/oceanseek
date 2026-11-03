@@ -28,9 +28,7 @@ private:
 
   static const int64_t SCHEDULE_INTERVAL_US  = 1LL * 24LL * 60LL * 60LL * 1000LL * 1000LL;   // 1d
 
-  static const int64_t DEFAULT_RETENTION_US  = 7LL * 24LL * 60LL * 60LL * 1000LL * 1000LL;   // 7d
-
-  static const int64_t DEFAULT_DELETE_EXPIRED_HISTORY_LIMIT = 1000;
+  static const int64_t DEFAULT_RETENTION_US  = 30LL * 24LL * 60LL * 60LL * 1000LL * 1000LL;   // 30d
 
   DISALLOW_COPY_AND_ASSIGN(ObSSGCHistoryCleanupTask);
 };

@@ -318,27 +318,6 @@ int ObSharedGCTaskTableOperator::parse_row_(
   return ret;
 }
 
-int ObSharedGCTaskTableOperator::build_get_min_round_id_sql_(
-    const uint64_t tenant_id,
-    const ObSharedGCTaskType type,
-    const int64_t allow_gc_round_id,
-    ObSqlString &sql)
-{
-  int ret = OB_SUCCESS;
-  int64_t timeout_us = 0;
-  if (OB_FAIL(get_sql_timeout_us_(tenant_id, timeout_us))) {
-    LOG_WARN("failed to get sql timeout", KR(ret), K(tenant_id));
-  } else if (OB_FAIL(sql.assign_fmt(
-      "SELECT /*+ QUERY_TIMEOUT(%ld) */ MIN(round_id) AS min_round_id FROM %s "
-      "WHERE tenant_id = %lu AND type = %ld AND round_id <= %ld "
-      "GROUP BY type",
-      timeout_us, OB_ALL_SHARED_GC_TASK_TNAME,
-      tenant_id, static_cast<int64_t>(type), allow_gc_round_id))) {
-    LOG_WARN("failed to assign sql", K(ret));
-  }
-  return ret;
-}
-
 int ObSharedGCTaskTableOperator::read_min_round_id_(
     ObISQLClient &client,
     const uint64_t real_tenant_id,
@@ -378,21 +357,23 @@ int ObSharedGCTaskTableOperator::read_min_round_id_(
 int ObSharedGCTaskTableOperator::build_get_round_id_range_sql_(
     const uint64_t tenant_id,
     const ObSharedGCTaskType type,
+    const char *table_name,
     ObSqlString &sql)
 {
   int ret = OB_SUCCESS;
   int64_t timeout_us = 0;
-  if (OB_FAIL(get_sql_timeout_us_(tenant_id, timeout_us))) {
+  if (OB_ISNULL(table_name)
+      || ((0 != strcmp(table_name, OB_ALL_SHARED_GC_TASK_TNAME))
+          && (0 != strcmp(table_name, OB_ALL_SHARED_GC_TASK_HISTORY_TNAME)))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid table name", KR(ret), K(table_name));
+  } else if (OB_FAIL(get_sql_timeout_us_(tenant_id, timeout_us))) {
     LOG_WARN("failed to get sql timeout", KR(ret), K(tenant_id));
   } else if (OB_FAIL(sql.assign_fmt(
       "SELECT /*+ QUERY_TIMEOUT(%ld) */ "
       "MIN(round_id) AS min_round_id, MAX(round_id) AS max_round_id FROM %s "
-      "WHERE tenant_id = %lu AND type = %ld "
-      "GROUP BY type",
-      timeout_us,
-      OB_ALL_SHARED_GC_TASK_TNAME,
-      tenant_id,
-      static_cast<int64_t>(type)))) {
+      "WHERE tenant_id = %lu AND type = %ld HAVING MIN(round_id) IS NOT NULL",
+      timeout_us, table_name, tenant_id, static_cast<int64_t>(type)))) {
     LOG_WARN("failed to assign sql", K(ret));
   }
   return ret;
@@ -443,22 +424,24 @@ int ObSharedGCTaskTableOperator::build_get_task_id_range_sql_(
     const uint64_t tenant_id,
     const ObSharedGCTaskType type,
     const int64_t round_id,
+    const char *table_name,
     ObSqlString &sql)
 {
   int ret = OB_SUCCESS;
   int64_t timeout_us = 0;
-  if (OB_FAIL(get_sql_timeout_us_(tenant_id, timeout_us))) {
+  if (OB_ISNULL(table_name)
+      || ((0 != strcmp(table_name, OB_ALL_SHARED_GC_TASK_TNAME))
+          && (0 != strcmp(table_name, OB_ALL_SHARED_GC_TASK_HISTORY_TNAME)))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid table name", KR(ret), K(table_name));
+  } else if (OB_FAIL(get_sql_timeout_us_(tenant_id, timeout_us))) {
     LOG_WARN("failed to get sql timeout", KR(ret), K(tenant_id));
   } else if (OB_FAIL(sql.assign_fmt(
       "SELECT /*+ QUERY_TIMEOUT(%ld) */ "
       "MIN(task_id) AS start_task_id, MAX(task_id) AS end_task_id FROM %s "
       "WHERE tenant_id = %lu AND type = %ld AND round_id = %ld "
-      "GROUP BY type",
-      timeout_us,
-      OB_ALL_SHARED_GC_TASK_TNAME,
-      tenant_id,
-      static_cast<int64_t>(type),
-      round_id))) {
+      "HAVING MIN(task_id) IS NOT NULL",
+      timeout_us, table_name, tenant_id, static_cast<int64_t>(type), round_id))) {
     LOG_WARN("failed to assign sql", K(ret));
   }
   return ret;
@@ -821,43 +804,10 @@ int ObSharedGCTaskTableOperator::update_extra_info(
   return ret;
 }
 
-int ObSharedGCTaskTableOperator::get_min_round_id(
-    const uint64_t tenant_id,
-    const ObSharedGCTaskType type,
-    const int64_t allow_gc_round_id,
-    ObISQLClient &client,
-    bool &is_empty,
-    int64_t &min_round_id)
-{
-  int ret = OB_SUCCESS;
-  is_empty = true;
-  min_round_id = -1;
-  if (OB_UNLIKELY(!is_mark_sweep_gc_type(type))) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("get_min_round_id is only for MARK_SWEEP_GC", K(ret), K(type));
-  } else if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id) || allow_gc_round_id < 0)) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), K(tenant_id), K(type),
-        K(allow_gc_round_id));
-  } else {
-    uint64_t real_tenant_id = OB_INVALID_TENANT_ID;
-    ObSqlString sql;
-    if (OB_FAIL(get_real_tenant_id_(tenant_id, real_tenant_id))) {
-      LOG_WARN("failed to get real tenant id", K(ret), K(tenant_id));
-    } else if (OB_FAIL(build_get_min_round_id_sql_(
-        tenant_id, type, allow_gc_round_id, sql))) {
-      LOG_WARN("failed to build get min round id sql", K(ret), K(tenant_id),
-          K(type), K(allow_gc_round_id));
-    } else if (OB_FAIL(read_min_round_id_(client, real_tenant_id, sql, is_empty, min_round_id))) {
-      LOG_WARN("failed to read min round id", K(ret), K(real_tenant_id), K(sql));
-    }
-  }
-  return ret;
-}
-
 int ObSharedGCTaskTableOperator::get_round_id_range(
     const uint64_t tenant_id,
     const ObSharedGCTaskType type,
+    const char *table_name,
     ObISQLClient &client,
     bool &is_empty,
     int64_t &min_round_id,
@@ -878,7 +828,8 @@ int ObSharedGCTaskTableOperator::get_round_id_range(
     ObSqlString sql;
     if (OB_FAIL(get_real_tenant_id_(tenant_id, real_tenant_id))) {
       LOG_WARN("failed to get real tenant id", K(ret), K(tenant_id));
-    } else if (OB_FAIL(build_get_round_id_range_sql_(tenant_id, type, sql))) {
+    } else if (OB_FAIL(build_get_round_id_range_sql_(tenant_id,
+        type, table_name, sql))) {
       LOG_WARN("failed to build get round id range sql", K(ret), K(tenant_id), K(type));
     } else if (OB_FAIL(read_round_id_range_(
         client, real_tenant_id, sql, is_empty, min_round_id, max_round_id))) {
@@ -899,7 +850,7 @@ int ObSharedGCTaskTableOperator::get_min_round_id(
   int ret = OB_SUCCESS;
   is_empty = true;
   min_round_id = -1;
-  if (OB_UNLIKELY(!is_mark_sweep_gc_type(type))) {
+  if (OB_UNLIKELY(!is_valid_shared_gc_task_type(type))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid type", K(ret), K(type));
   } else if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id) || OB_ISNULL(table_name)
@@ -917,7 +868,7 @@ int ObSharedGCTaskTableOperator::get_min_round_id(
       LOG_WARN("failed to get sql timeout", KR(ret), K(tenant_id));
     } else if (OB_FAIL(sql.assign_fmt(
         "SELECT /*+ QUERY_TIMEOUT(%ld) */ MIN(round_id) AS min_round_id FROM %s "
-        "WHERE tenant_id = %lu AND type = %ld GROUP BY type",
+        "WHERE tenant_id = %lu AND type = %ld HAVING MIN(round_id) IS NOT NULL",
         timeout_us, table_name, tenant_id, static_cast<int64_t>(type)))) {
       LOG_WARN("failed to assign sql", K(ret));
     } else if (OB_FAIL(read_min_round_id_(client, real_tenant_id, sql, is_empty, min_round_id))) {
@@ -931,6 +882,7 @@ int ObSharedGCTaskTableOperator::get_task_id_range(
     const uint64_t tenant_id,
     const ObSharedGCTaskType type,
     const int64_t round_id,
+    const char *table_name,
     ObISQLClient &client,
     bool &is_empty,
     ObSSGCTaskIdRange &round_range)
@@ -947,12 +899,70 @@ int ObSharedGCTaskTableOperator::get_task_id_range(
     ObSqlString sql;
     if (OB_FAIL(get_real_tenant_id_(tenant_id, real_tenant_id))) {
       LOG_WARN("failed to get real tenant id", K(ret), K(tenant_id));
-    } else if (OB_FAIL(build_get_task_id_range_sql_(tenant_id, type, round_id, sql))) {
+    } else if (OB_FAIL(build_get_task_id_range_sql_(tenant_id,
+        type, round_id, table_name, sql))) {
       LOG_WARN("failed to build get task id range sql", K(ret),
           K(tenant_id), K(type), K(round_id));
     } else if (OB_FAIL(read_task_id_range_(
         client, real_tenant_id, sql, is_empty, round_range))) {
       LOG_WARN("failed to read task id range", K(ret), K(real_tenant_id), K(sql));
+    }
+  }
+  return ret;
+}
+
+int ObSharedGCTaskTableOperator::get_min_task_id(
+    const uint64_t tenant_id,
+    const ObSharedGCTaskType type,
+    const int64_t round_id,
+    const char *table_name,
+    bool &is_empty,
+    int64_t &min_task_id)
+{
+  int ret = OB_SUCCESS;
+  uint64_t real_tenant_id = OB_INVALID_TENANT_ID;
+  int64_t timeout_us = 0;
+  ObSqlString sql;
+  is_empty = true;
+  min_task_id = -1;
+  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id) || !is_valid_shared_gc_task_type(type)
+      || (round_id < 0) || OB_ISNULL(table_name)
+      || ((0 != strcmp(table_name, OB_ALL_SHARED_GC_TASK_TNAME))
+          && (0 != strcmp(table_name, OB_ALL_SHARED_GC_TASK_HISTORY_TNAME))))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(tenant_id), K(type), K(round_id), K(table_name));
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sql proxy is null", KR(ret));
+  } else if (OB_FAIL(get_real_tenant_id_(tenant_id, real_tenant_id))) {
+    LOG_WARN("fail to get real tenant id", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(get_sql_timeout_us_(tenant_id, timeout_us))) {
+    LOG_WARN("fail to get sql timeout", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(sql.assign_fmt(
+      "SELECT /*+ QUERY_TIMEOUT(%ld) */ MIN(task_id) AS min_task_id FROM %s "
+      "WHERE tenant_id = %lu AND type = %ld AND round_id = %ld "
+      "HAVING MIN(task_id) IS NOT NULL",
+      timeout_us, table_name, tenant_id, static_cast<int64_t>(type), round_id))) {
+    LOG_WARN("fail to build min task id sql", KR(ret), K(type), K(round_id));
+  } else {
+    HEAP_VAR(ObMySQLProxy::MySQLResult, result) {
+      sqlclient::ObMySQLResult *mysql_result = nullptr;
+      if (OB_FAIL(GCTX.sql_proxy_->read(result, real_tenant_id, sql.ptr(), share::OBCG_STORAGE))) {
+        LOG_WARN("fail to read min task id", KR(ret), K(real_tenant_id), K(sql));
+      } else if (OB_ISNULL(mysql_result = result.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("result is null", KR(ret));
+      } else if (OB_FAIL(mysql_result->next())) {
+        if (OB_ITER_END == ret) {
+          ret = OB_SUCCESS;
+        } else {
+          LOG_WARN("fail to fetch min task id", KR(ret));
+        }
+      } else if (OB_FAIL(mysql_result->get_int("min_task_id", min_task_id))) {
+        LOG_WARN("fail to read min task id value", KR(ret));
+      } else {
+        is_empty = false;
+      }
     }
   }
   return ret;
@@ -1051,66 +1061,31 @@ int ObSharedGCTaskTableOperator::delete_task_and_insert_history(
   return ret;
 }
 
-int ObSharedGCTaskTableOperator::batch_delete_expired(
-    const uint64_t tenant_id,
-    const char *table_name,
-    const int64_t expire_ts_us,
-    const int64_t limit,
-    ObISQLClient &client,
-    int64_t &affected_rows)
-{
-  int ret = OB_SUCCESS;
-  affected_rows = 0;
-  uint64_t real_tenant_id = OB_INVALID_TENANT_ID;
-  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id) || OB_ISNULL(table_name) ||
-                  expire_ts_us <= 0 || limit <= 0 ||
-                  ((0 != strcmp(table_name, OB_ALL_SHARED_GC_TASK_TNAME)) &&
-                   (0 != strcmp(table_name, OB_ALL_SHARED_GC_TASK_HISTORY_TNAME))))) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid args", KR(ret), K(tenant_id), K(table_name), K(expire_ts_us), K(limit));
-  } else if (OB_FAIL(get_real_tenant_id_(tenant_id, real_tenant_id))) {
-    LOG_WARN("fail to get real tenant id", KR(ret), K(tenant_id));
-  } else {
-    ObSqlString sql;
-    int64_t timeout_us = 0;
-    if (OB_FAIL(get_sql_timeout_us_(tenant_id, timeout_us))) {
-      LOG_WARN("fail to get sql timeout", KR(ret), K(tenant_id));
-    } else if (OB_FAIL(sql.assign_fmt(
-          "DELETE /*+ QUERY_TIMEOUT(%ld) */ FROM %s "
-          "WHERE tenant_id = %lu AND gmt_create < usec_to_time(%ld) "
-          "LIMIT %ld",
-          timeout_us,
-          table_name,
-          tenant_id,
-          expire_ts_us,
-          limit))) {
-      LOG_WARN("fail to assign sql", KR(ret));
-    } else if (OB_FAIL(client.write(real_tenant_id, sql.ptr(),
-                                    share::OBCG_STORAGE, affected_rows))) {
-      LOG_WARN("fail to exec batch delete expired", KR(ret), K(sql));
-    }
-  }
-  return ret;
-}
-
 int ObSharedGCTaskTableOperator::batch_delete_slice_(
     const uint64_t tenant_id,
     const ObSharedGCTaskType type,
     const int64_t round_id,
     const ObSSGCTaskIdRange &slice_range,
+    const char *table_name,
+    const int64_t expired_time_us,
     int64_t &affected_rows)
 {
   int ret = OB_SUCCESS;
   affected_rows = 0;
   uint64_t real_tenant_id = OB_INVALID_TENANT_ID;
   int64_t timeout_us = 0;
+  const bool is_used_expired_time = (expired_time_us > 0);
   ObSqlString sql;
   if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id)
-                  || !is_valid_shared_gc_task_type(type)
-                  || round_id < 0
-                  || !slice_range.is_valid())) {
+                  || (slice_range.start_task_id > slice_range.end_task_id)
+                  || (expired_time_us < 0) || OB_ISNULL(table_name)
+                  || ((0 != strcmp(table_name, OB_ALL_SHARED_GC_TASK_TNAME))
+                      && (0 != strcmp(table_name, OB_ALL_SHARED_GC_TASK_HISTORY_TNAME))))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid args", KR(ret), K(tenant_id), K(type), K(round_id), K(slice_range));
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sql_proxy is null", KR(ret));
   } else if (OB_FAIL(get_real_tenant_id_(tenant_id, real_tenant_id))) {
     LOG_WARN("fail to get real tenant id", KR(ret), K(tenant_id));
   } else if (OB_FAIL(get_sql_timeout_us_(tenant_id, timeout_us))) {
@@ -1120,13 +1095,16 @@ int ObSharedGCTaskTableOperator::batch_delete_slice_(
         "WHERE tenant_id = %lu AND type = %ld AND round_id = %ld "
         "AND task_id BETWEEN %ld AND %ld",
         timeout_us,
-        OB_ALL_SHARED_GC_TASK_TNAME,
+        table_name,
         tenant_id,
         static_cast<int64_t>(type),
         round_id,
         slice_range.start_task_id,
         slice_range.end_task_id))) {
     LOG_WARN("fail to assign sql", KR(ret));
+  } else if (is_used_expired_time && OB_FAIL(sql.append_fmt(
+        " AND gmt_create < usec_to_time(%ld)", expired_time_us))) {
+    LOG_WARN("fail to append expiration time", KR(ret), K(expired_time_us));
   } else if (OB_FAIL(GCTX.sql_proxy_->write(real_tenant_id, sql.ptr(),
                                             share::OBCG_STORAGE, affected_rows))) {
     LOG_WARN("fail to exec batch delete slice", KR(ret), K(sql));
@@ -1134,17 +1112,47 @@ int ObSharedGCTaskTableOperator::batch_delete_slice_(
   return ret;
 }
 
-int ObSharedGCTaskTableOperator::batch_delete(
+int ObSharedGCTaskTableOperator::batch_delete_task(
     const uint64_t tenant_id,
     const volatile bool &is_stop)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(batch_delete_(tenant_id, is_stop, OB_ALL_SHARED_GC_TASK_TNAME, 0 /*expired_time_us*/))) {
+    LOG_WARN("fail to batch delete tasks", KR(ret), K(tenant_id));
+  }
+  return ret;
+}
+
+int ObSharedGCTaskTableOperator::batch_delete_history(
+    const uint64_t tenant_id,
+    const volatile bool &is_stop,
+    const int64_t expired_time_us)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(expired_time_us <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid history cutoff", KR(ret), K(tenant_id), K(expired_time_us));
+  } else if (OB_FAIL(batch_delete_(
+      tenant_id, is_stop, OB_ALL_SHARED_GC_TASK_HISTORY_TNAME, expired_time_us))) {
+    LOG_WARN("fail to batch delete history", KR(ret), K(tenant_id), K(expired_time_us));
+  }
+  return ret;
+}
+
+int ObSharedGCTaskTableOperator::batch_delete_(
+    const uint64_t tenant_id,
+    const volatile bool &is_stop,
+    const char *table_name,
+    const int64_t expired_time_us)
 {
   int ret = OB_SUCCESS;
   // Mirrors ObExecuteBaseTask::DEFAULT_SLICE_SIZE (100). Kept local to avoid
   // pulling the dag header into the operator layer.
   constexpr int64_t SLICE_SIZE = 100;
-  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id))) {
+  ObSSGCTaskIdRange slice_range;
+  if (OB_UNLIKELY(!is_valid_tenant_id(tenant_id) || (expired_time_us < 0))) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid args", KR(ret), K(tenant_id));
+    LOG_WARN("invalid args", KR(ret), K(tenant_id), K(expired_time_us));
   } else if (OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("sql_proxy is null", KR(ret));
@@ -1155,54 +1163,46 @@ int ObSharedGCTaskTableOperator::batch_delete(
   for (uint8_t t = static_cast<uint8_t>(ObSharedGCTaskType::INVALID_TYPE) + 1;
        OB_SUCC(ret) && t < static_cast<uint8_t>(ObSharedGCTaskType::MAX_TYPE); ++t) {
     const ObSharedGCTaskType type = static_cast<ObSharedGCTaskType>(t);
-    bool round_id_range_empty = true;
-    int64_t min_round_id = -1;
-    int64_t max_round_id = -1;
-    if (ATOMIC_LOAD(&is_stop)) {
-      ret = OB_CANCELED;
-      LOG_INFO("batch_delete cancelled between types", KR(ret), K(tenant_id), K(type));
-    } else if (OB_FAIL(get_round_id_range(
-                   tenant_id, type, *GCTX.sql_proxy_,
-                   round_id_range_empty, min_round_id, max_round_id))) {
-      LOG_WARN("fail to get round id range", KR(ret), K(tenant_id), K(type));
-    } else if (round_id_range_empty) {
-      LOG_INFO("no rows to batch_delete", K(tenant_id), K(type));
-    } else {
-      for (int64_t round_id = min_round_id;
-           OB_SUCC(ret) && round_id <= max_round_id; ++round_id) {
-        bool task_id_range_empty = true;
-        ObSSGCTaskIdRange round_range;
-        if (ATOMIC_LOAD(&is_stop)) {
-          ret = OB_CANCELED;
-          LOG_INFO("batch_delete cancelled between rounds", KR(ret),
-              K(tenant_id), K(type), K(round_id));
-        } else if (OB_FAIL(get_task_id_range(
-                       tenant_id, type, round_id,
-                       *GCTX.sql_proxy_, task_id_range_empty, round_range))) {
-          LOG_WARN("fail to get task id range", KR(ret), K(tenant_id), K(type), K(round_id));
-        } else if (task_id_range_empty) {
-          // Round may have been drained by a concurrent worker between
-          // get_round_id_range and now; skip it.
-          LOG_INFO("round empty, skip", K(tenant_id), K(type), K(round_id));
-        } else {
-          int64_t slice_start_task_id = round_range.start_task_id;
-          while (OB_SUCC(ret) && slice_start_task_id <= round_range.end_task_id) {
-            if (ATOMIC_LOAD(&is_stop)) {
-              ret = OB_CANCELED;
-              LOG_INFO("batch_delete cancelled mid-round", KR(ret),
-                  K(tenant_id), K(type), K(round_id), K(slice_start_task_id));
+    bool is_type_finished = false;
+    bool is_round_empty = true;
+    int64_t round_id = -1;
+    while (OB_SUCC(ret) && !is_type_finished) {
+      if (ATOMIC_LOAD(&is_stop)) {
+        ret = OB_CANCELED;
+        LOG_INFO("batch_delete cancelled between rounds", KR(ret),
+            K(tenant_id), K(type), K(round_id));
+      } else if (OB_FAIL(get_min_round_id(
+          tenant_id, type, table_name, *GCTX.sql_proxy_, is_round_empty, round_id))) {
+        LOG_WARN("fail to get min round", KR(ret), K(tenant_id), K(type));
+      } else if (is_round_empty) {
+        is_type_finished = true;
+        LOG_INFO("no rows to batch_delete", K(tenant_id), K(type));
+      } else {
+        bool is_task_empty = false;
+        while (OB_SUCC(ret) && !is_task_empty && !is_type_finished) {
+          int64_t affected_rows = 0;
+          if (ATOMIC_LOAD(&is_stop)) {
+            ret = OB_CANCELED;
+            LOG_INFO("batch_delete cancelled mid-round", KR(ret),
+                K(tenant_id), K(type), K(round_id));
+          } else if (OB_FAIL(get_min_task_id(tenant_id, type, round_id, table_name,
+              is_task_empty, slice_range.start_task_id))) {
+            LOG_WARN("fail to get min task id", KR(ret), K(tenant_id), K(type), K(round_id));
+          } else if (!is_task_empty) {
+            // Re-read the smallest existing key after each DELETE to skip task ID gaps.
+            slice_range.end_task_id = INT64_MAX;
+            if (slice_range.start_task_id <= INT64_MAX - (SLICE_SIZE - 1)) {
+              slice_range.end_task_id = slice_range.start_task_id + (SLICE_SIZE - 1);
+            }
+            if (OB_FAIL(batch_delete_slice_(tenant_id, type, round_id, slice_range,
+                table_name, expired_time_us, affected_rows))) {
+              LOG_WARN("fail to exec batch delete slice", KR(ret),
+                  K(tenant_id), K(type), K(round_id), K(slice_range));
             } else {
-              const int64_t slice_end_task_id = MIN(slice_start_task_id + SLICE_SIZE - 1, round_range.end_task_id);
-              const ObSSGCTaskIdRange slice_range(slice_start_task_id, slice_end_task_id);
-              int64_t affected_rows = 0;
-              if (OB_FAIL(batch_delete_slice_(tenant_id, type, round_id, slice_range, affected_rows))) {
-                LOG_WARN("fail to exec batch delete slice", KR(ret),
-                    K(tenant_id), K(type), K(round_id), K(slice_range));
-              } else {
-                LOG_INFO("batch_delete slice done",
-                    K(tenant_id), K(type), K(round_id), K(slice_range), K(affected_rows));
-                slice_start_task_id = slice_end_task_id + 1;
-              }
+              LOG_INFO("batch_delete slice done",
+                  K(tenant_id), K(type), K(round_id), K(slice_range), K(affected_rows));
+              // Any zero-delete slice ends this history type's sweep.
+              is_type_finished = (expired_time_us > 0) && (0 == affected_rows);
             }
           }
         }

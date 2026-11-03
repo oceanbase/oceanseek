@@ -1815,7 +1815,8 @@ TEST_F(TestSSMarkSweepGC, sstable_macro_e2e)
 // round_id > allow_gc_round_id MUST NOT be touched.
 //
 // Insert one row at round_id=8000 (eligible) and one at round_id=9000 (not).
-// Trigger DAG with allow_gc_round_id = 8000:
+// First use allow_gc_round_id = 7999 and verify neither row is touched.
+// Then trigger DAG with allow_gc_round_id = 8000:
 //   * row 8000/1 → drains into history.
 //   * row 9000/1 → stays in __all_shared_gc_task untouched.
 // ---------------------------------------------------------------------------
@@ -1850,6 +1851,23 @@ TEST_F(TestSSMarkSweepGC, round_bound_e2e)
               build_mark_sweep_task(alloc, OUT_ROUND, TASK_ID, macro_ids, row));
     ASSERT_EQ(OB_SUCCESS,
               ObSharedGCTaskTableOperator::insert_task(row, sql_proxy()));
+  }
+
+  // The minimum active round is above the watermark: do not plan any deletion.
+  ASSERT_NO_FATAL_FAILURE(trigger_mark_sweep_dag(IN_ROUND - 1));
+  ASSERT_NO_FATAL_FAILURE(wait_dag_scheduler_empty_(60));
+  ObSharedGCTask pending_row;
+  ObSharedGCTaskKey pending_key(tenant_id_, ObSharedGCTaskType::MARK_SWEEP_GC,
+      IN_ROUND, TASK_ID);
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::get_task(
+      pending_key, alloc, sql_proxy(), pending_row));
+  ASSERT_EQ(OB_ENTRY_NOT_EXIST, ObSharedGCTaskTableOperator::get_history(
+      pending_key, alloc, sql_proxy(), pending_row));
+  {
+    share::ObTenantSwitchGuard guard;
+    ASSERT_EQ(OB_SUCCESS, guard.switch_to(tenant_id_));
+    assert_block_exists_(in_macro_id, true);
+    assert_block_exists_(out_macro_id, true);
   }
 
   trigger_mark_sweep_dag(allow_gc_round_id);
