@@ -54,6 +54,7 @@ ob_set_subtarget(ob_server flight_sql_server
   flight_sql/ob_flight_sql_audit.cpp
   flight_sql/ob_flightsql_stream_registry.cpp
   flight_sql/ob_flightsql_arrow_converter.cpp
+  flight_sql/ob_flightsql_param_converter.cpp
   flight_sql/ob_arrow_stream_catalog.cpp
   flight_sql/ob_flightsql_ingest_registry.cpp
 )

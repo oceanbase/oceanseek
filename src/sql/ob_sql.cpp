@@ -207,6 +207,11 @@ int ObSql::stmt_execute(const ObPsStmtId stmt_id,
 {
   int ret = OB_SUCCESS;
   LinkExecCtxGuard link_guard(result.get_session(), result.get_exec_context());
+  // init_result_set() runs before handle_ps_execute(), but an execute already
+  // has prepared-statement semantics at that point.  In particular, a native
+  // parameter binder may have installed source collection subschemas in the
+  // otherwise-empty physical-plan context.
+  context.is_prepare_protocol_ = true;
   if (OB_FAIL(sanity_check(context))) {
     LOG_WARN("failed to do sanity check", K(ret));
   } else if (OB_FAIL(init_result_set(context, result))) {
@@ -2763,6 +2768,11 @@ int ObSql::handle_remote_query(const ObRemoteSqlInfo &remote_sql_info,
   if (OB_ISNULL(session) || OB_ISNULL(remote_sql_info.ps_params_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("session is null", K(ret), K(session), K(remote_sql_info.ps_params_));
+  } else if (OB_ISNULL(exec_ctx.get_physical_plan_ctx())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("remote physical plan context is null", K(ret));
+  } else if (OB_FAIL(exec_ctx.get_physical_plan_ctx()->restore_remote_collection_param_subschemas())) {
+    LOG_WARN("restore remote prepared parameter subschemas failed", K(ret));
   } else if (OB_ISNULL(pc_ctx =
       static_cast<ObPlanCacheCtx *>(allocator.alloc(sizeof(ObPlanCacheCtx))))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -4391,7 +4401,19 @@ OB_INLINE int ObSql::init_exec_context(const ObSqlCtx &context, ObExecContext &e
   int ret = OB_SUCCESS;
   ObTaskExecutorCtx &task_exec_ctx = exec_ctx.get_task_exec_ctx();
   task_exec_ctx.set_retry_times(context.retry_times_);
-  if (OB_FAIL(exec_ctx.create_physical_plan_ctx())) {
+  ObPhysicalPlanCtx *phy_plan_ctx = exec_ctx.get_physical_plan_ctx();
+  const bool has_preinstalled_param_subschemas =
+      context.is_prepare_protocol_
+      && OB_NOT_NULL(phy_plan_ctx)
+      && OB_ISNULL(phy_plan_ctx->get_phy_plan())
+      && phy_plan_ctx->get_subschema_ctx().get_subschema_count() > 0;
+  if (OB_NOT_NULL(phy_plan_ctx) && !has_preinstalled_param_subschemas) {
+    // An existing context is only valid for a prepared execution whose
+    // parameter binder installed source subschemas before planning.
+    ret = OB_INIT_TWICE;
+    LOG_WARN("physical plan ctx is already initialized", K(ret));
+  } else if (OB_ISNULL(phy_plan_ctx)
+             && OB_FAIL(exec_ctx.create_physical_plan_ctx())) {
     LOG_WARN("faile to create physical plan ctx", K(ret));
   } else {
     exec_ctx.set_my_session(context.session_info_);
@@ -5165,6 +5187,19 @@ int ObSql::after_get_plan(ObPlanCacheCtx &pc_ctx,
   bool enable_send_plan_event = EVENT_CALL(EventTable::EN_DISABLE_REMOTE_EXEC_WITH_PLAN) == 0;
   bool evolution_plan = nullptr != phy_plan && phy_plan->get_evolution();
   bool enable_send_plan = (session.get_is_in_retry() || evolution_plan) && enable_send_plan_event;
+  const bool is_flight_sql_prepared_execute =
+      pc_ctx.sql_ctx_.is_flight_sql_
+      && PC_PS_MODE == pc_ctx.mode_
+      && OB_NOT_NULL(ps_params);
+  // The appended collection metadata is understood starting with this release.
+  // Keep plan shipping for collection values while older releases remain.
+  bool send_legacy_flight_collection_plan = false;
+  if (is_flight_sql_prepared_execute && min_cluster_version < CLUSTER_VERSION_4_6_3_0) {
+    for (int64_t i = 0; !send_legacy_flight_collection_plan && i < ps_params->count(); ++i) {
+      send_legacy_flight_collection_plan = ps_params->at(i).is_collection_sql_type()
+          && !ps_params->at(i).is_null();
+    }
+  }
   int last_query_retry_err = session.get_retry_info().get_last_query_retry_err();
   if (OB_TRANSACTION_SET_VIOLATION == last_query_retry_err
       || OB_TRY_LOCK_ROW_CONFLICT == last_query_retry_err) {
@@ -5188,6 +5223,8 @@ int ObSql::after_get_plan(ObPlanCacheCtx &pc_ctx,
       }
       // init auto increment param
       if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(pctx->remap_remote_collection_param_subschemas(*phy_plan))) {
+        LOG_WARN("remap remote prepared parameter subschemas failed", K(ret));
       } else if (OB_FAIL(pc_ctx.exec_ctx_.init_physical_plan_ctx(*phy_plan))) {
         LOG_WARN("fail init exec context", K(ret), K(phy_plan->get_stmt_type()));
       } else if (OB_FAIL(DAS_CTX(pc_ctx.exec_ctx_).init(*phy_plan, pc_ctx.exec_ctx_))) {
@@ -5223,9 +5260,12 @@ int ObSql::after_get_plan(ObPlanCacheCtx &pc_ctx,
       // the purpose of adding condition (!session.get_is_in_retry()) is
       // send the plan instead of continue sending sqlinfo when retrying remotely.
       // bug: 
+      // Remote Flight prepared collections carry their definitions in the SQL
+      // task. Older releases need the existing compiled-plan transport instead.
       if (OB_SUCC(ret) && phy_plan->is_remote_plan()
           && !phy_plan->contains_temp_table()
-          && !enable_send_plan) {
+          && !enable_send_plan
+          && !send_legacy_flight_collection_plan) {
         pctx->get_remote_sql_info().sql_from_pl_ = PC_PL_MODE == pc_ctx.mode_;
         //处理远程plan转发SQL的情况
         ParamStore &param_store = pctx->get_param_store_for_update();

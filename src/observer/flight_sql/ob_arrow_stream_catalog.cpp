@@ -22,7 +22,9 @@
 #include "sql/resolver/expr/ob_raw_expr.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/net/ob_addr.h"
+#include "lib/string/ob_sql_string.h"
 #include "lib/udt/ob_collection_type.h"
+#include <climits>
 #include <arrow/type.h>
 
 namespace oceanbase
@@ -31,53 +33,112 @@ using namespace common;
 namespace observer
 {
 
-// Resolve the complete collection type once during SQL resolution.  The
-// converter needs this metadata to distinguish ARRAY(FLOAT) from VECTOR(N),
-// and to validate element type and vector dimension before it selects an
-// encoder.  The same subschema id is also propagated to the function-table
-// output expression below.
-static int resolve_collection_meta(const share::schema::ObColumnSchemaV2 &ob_col,
-                                   const sql::ObSQLSessionInfo *session,
-                                   uint16_t &subschema_id,
-                                   const common::ObCollectionTypeBase *&collection_meta)
+static bool is_arrow_collection_field(const arrow::Field &arrow_field)
+{
+  const arrow::Type::type type_id = arrow_field.type()->id();
+  return type_id == arrow::Type::LIST
+      || type_id == arrow::Type::LARGE_LIST
+      || type_id == arrow::Type::FIXED_SIZE_LIST
+      || type_id == arrow::Type::MAP;
+}
+
+// Register the source collection carrier, not the destination column's
+// collection type.  The resolver installs this subschema on arrow_stream and
+// then performs its normal source-to-target collection compatibility check.
+static int resolve_middle_collection_meta(const arrow::Field &arrow_field,
+                                          const sql::ObSQLSessionInfo *session,
+                                          uint16_t &subschema_id,
+                                          const common::ObCollectionTypeBase *&collection_meta)
 {
   int ret = OB_SUCCESS;
   subschema_id = UINT_MAX16;
   collection_meta = nullptr;
-  if (!ob_col.is_collection()) {
-    // nothing to resolve
-  } else if (ob_col.get_extended_type_info().count() != 1) {
+  sql::ObExecContext *exec_ctx = OB_NOT_NULL(session)
+      ? const_cast<sql::ObSQLSessionInfo *>(session)->get_cur_exec_ctx() : nullptr;
+  sql::ObSubSchemaValue sub_meta;
+  ObSqlString type_string;
+  if (OB_ISNULL(exec_ctx)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("[FlightSQL] collection column has invalid type metadata", K(ret),
-             "type_info_count", ob_col.get_extended_type_info().count());
+    LOG_WARN("[FlightSQL] no execution context for Arrow middle collection", K(ret));
+  } else if (OB_FAIL(ob_flight_sql_get_middle_collection_type_string(
+                 arrow_field, session->is_oracle_compatible(), type_string))) {
+    LOG_WARN("[FlightSQL] failed to derive Arrow collection middle type", K(ret),
+             "field_name", arrow_field.name().c_str());
+  } else if (OB_UNLIKELY(type_string.empty()
+                         || type_string.length() > INT32_MAX)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[FlightSQL] invalid Arrow collection middle type string", K(ret),
+             "field_name", arrow_field.name().c_str(),
+             "type_string_length", type_string.length());
   } else {
-    sql::ObExecContext *exec_ctx = OB_NOT_NULL(session)
-        ? const_cast<sql::ObSQLSessionInfo *>(session)->get_cur_exec_ctx() : nullptr;
-    sql::ObSubSchemaValue sub_meta;
-    if (OB_ISNULL(exec_ctx)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("[FlightSQL] no execution context for collection column", K(ret));
-    } else if (OB_FAIL(exec_ctx->get_subschema_id_by_type_string(
-                   ob_col.get_extended_type_info().at(0), subschema_id))) {
-      LOG_WARN("[FlightSQL] failed to register collection subschema", K(ret),
-               "type_str", ob_col.get_extended_type_info().at(0));
+    const ObString type_str = type_string.string();
+    if (OB_FAIL(exec_ctx->get_subschema_id_by_type_string(type_str, subschema_id))) {
+      LOG_WARN("[FlightSQL] failed to register Arrow collection middle subschema", K(ret),
+               K(type_str));
     } else if (OB_FAIL(exec_ctx->get_sqludt_meta_by_subschema_id(subschema_id, sub_meta))) {
-      LOG_WARN("[FlightSQL] failed to resolve collection subschema", K(ret), K(subschema_id));
+      LOG_WARN("[FlightSQL] failed to resolve Arrow collection middle subschema", K(ret),
+               K(subschema_id));
     } else if (sub_meta.type_ != sql::OB_SUBSCHEMA_COLLECTION_TYPE
                || OB_ISNULL(sub_meta.value_)) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("[FlightSQL] invalid collection subschema", K(ret), K(subschema_id),
-               K(sub_meta.type_), KP(sub_meta.value_));
+      LOG_WARN("[FlightSQL] invalid Arrow collection middle subschema", K(ret),
+               K(subschema_id), K(sub_meta.type_), KP(sub_meta.value_));
     } else {
       const common::ObSqlCollectionInfo *collection_info =
           reinterpret_cast<const common::ObSqlCollectionInfo *>(sub_meta.value_);
       if (OB_ISNULL(collection_info->collection_meta_)) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("[FlightSQL] collection metadata is null", K(ret), K(subschema_id));
+        LOG_WARN("[FlightSQL] Arrow collection middle metadata is null", K(ret),
+                 K(subschema_id));
       } else {
         collection_meta = collection_info->collection_meta_;
       }
     }
+  }
+  return ret;
+}
+
+// MERGE can refer to source-only fields (for example old_id or op). Keep the
+// existing conversion contract for named target columns. Supply only the
+// metadata that the existing scalar converter needs when no target is named;
+// it still owns the Arrow-to-SQL type decision and rejects unsupported types.
+static int build_merge_source_column(const arrow::Field &field,
+                                     const sql::ObSQLSessionInfo &session,
+                                     share::schema::ObColumnSchemaV2 &column)
+{
+  int ret = OB_SUCCESS;
+  ObObjType type = ObVarcharType;
+  ObAccuracy accuracy = ObAccuracy::DDL_DEFAULT_ACCURACY[ObVarcharType];
+  ObCollationType collation = CS_TYPE_UTF8MB4_BIN;
+  switch (field.type()->id()) {
+    case arrow::Type::BINARY:
+    case arrow::Type::LARGE_BINARY: collation = CS_TYPE_BINARY; break;
+    case arrow::Type::DECIMAL128:
+    case arrow::Type::DECIMAL256: {
+      const arrow::DecimalType &decimal = static_cast<const arrow::DecimalType &>(*field.type());
+      type = session.is_oracle_compatible() ? ObNumberType : ObDecimalIntType;
+      accuracy.set_precision(decimal.precision());
+      accuracy.set_scale(decimal.scale());
+      break;
+    }
+    case arrow::Type::DATE32:
+      type = session.is_oracle_compatible() ? ObDateType : ObMySQLDateType;
+      break;
+    case arrow::Type::TIMESTAMP:
+      type = session.is_oracle_compatible() ? ObDateTimeType : ObMySQLDateTimeType;
+      break;
+    case arrow::Type::TIME32:
+    case arrow::Type::TIME64: type = ObTimeType; break;
+    default: break;
+  }
+  if (OB_SUCC(ret)) {
+    if (field.type()->id() != arrow::Type::DECIMAL128
+        && field.type()->id() != arrow::Type::DECIMAL256) {
+      accuracy = ObAccuracy::DDL_DEFAULT_ACCURACY[type];
+    }
+    column.set_data_type(type);
+    column.set_accuracy(accuracy);
+    column.set_collation_type(ob_is_string_type(type) ? collation : CS_TYPE_INVALID);
   }
   return ret;
 }
@@ -164,7 +225,14 @@ int ObArrowStreamCatalog::get_columns(uint64_t stream_id,
                                arrow_field.name().c_str());
     const share::schema::ObColumnSchemaV2 *ob_col =
         table_schema->get_column_schema(ob_col_name);
-    if (OB_ISNULL(ob_col)) {
+    share::schema::ObColumnSchemaV2 source_column;
+    if (OB_ISNULL(ob_col) && entry->is_merge_source) {
+      if (OB_FAIL(build_merge_source_column(arrow_field, *session, source_column))) {
+        LOG_WARN("[FlightSQL] failed to map source-only MERGE field", K(ret), K(i));
+        break;
+      }
+      ob_col = &source_column;
+    } else if (OB_ISNULL(ob_col)) {
       ret = OB_ERR_BAD_FIELD_ERROR;
       LOG_WARN("[FlightSQL] Arrow field not found in OB table schema", K(ret),
                "field_name", arrow_field.name().c_str(),
@@ -174,9 +242,10 @@ int ObArrowStreamCatalog::get_columns(uint64_t stream_id,
 
     uint16_t collection_subschema_id = UINT_MAX16;
     const common::ObCollectionTypeBase *collection_meta = nullptr;
-    if (OB_FAIL(resolve_collection_meta(*ob_col, session, collection_subschema_id,
-                                        collection_meta))) {
-      LOG_WARN("[FlightSQL] failed to resolve target collection metadata", K(ret), K(i));
+    if (is_arrow_collection_field(arrow_field)
+        && OB_FAIL(resolve_middle_collection_meta(
+               arrow_field, session, collection_subschema_id, collection_meta))) {
+      LOG_WARN("[FlightSQL] failed to resolve Arrow middle collection metadata", K(ret), K(i));
       break;
     }
 
@@ -186,19 +255,20 @@ int ObArrowStreamCatalog::get_columns(uint64_t stream_id,
     // the matching datum layout.  Do not replace it with the target table
     // type: column_conv in the generated INSERT owns the subsequent SQL cast.
     if (OB_FAIL(ob_flight_sql_get_output_col_desc(
-            arrow_field, *ob_col, collection_subschema_id, out))) {
+            arrow_field, session->is_oracle_compatible(), collection_subschema_id, out))) {
       LOG_WARN("[FlightSQL] failed to map Arrow field to converter output", K(ret), K(i));
       break;
     }
 
     // Populate conversion metadata into the registry entry for executor use.
-    if (OB_FAIL(ob_flight_sql_build_convert_fn(arrow_field, *ob_col, collection_meta,
+    if (OB_FAIL(ob_flight_sql_build_convert_fn(arrow_field, out, collection_meta,
                                                col_desc))) {
       LOG_WARN("[FlightSQL] ob_flight_sql_build_convert_fn failed", K(ret), K(i));
       break;
     }
 
-    const ObString raw_name(ob_col->get_column_name_str());
+    const ObString raw_name = entry->is_merge_source
+        ? ob_col_name : ob_col->get_column_name_str();
     char *buf = static_cast<char *>(alloc.alloc(raw_name.length()));
     if (OB_ISNULL(buf)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -361,7 +431,7 @@ int ObArrowStreamCatalog::get_columns_for_ingest(
   }
 
   // Build function-table descriptors and (for V2) the local converter mapping
-  // from the one shared Arrow-field + target-column decision.
+  // from the shared Arrow-field + compatibility-mode middle-type decision.
   const int64_t num_cols = mapping_schema->num_fields();
 
   for (int64_t i = 0; OB_SUCC(ret) && i < num_cols; ++i) {
@@ -386,16 +456,17 @@ int ObArrowStreamCatalog::get_columns_for_ingest(
 
     uint16_t collection_subschema_id = UINT_MAX16;
     const common::ObCollectionTypeBase *collection_meta = nullptr;
-    if (OB_FAIL(resolve_collection_meta(*ob_col, session, collection_subschema_id,
-                                        collection_meta))) {
-      LOG_WARN("[FlightSQL] failed to resolve target collection metadata for ingest", K(ret),
-               K(i));
+    if (is_arrow_collection_field(arrow_field)
+        && OB_FAIL(resolve_middle_collection_meta(
+               arrow_field, session, collection_subschema_id, collection_meta))) {
+      LOG_WARN("[FlightSQL] failed to resolve Arrow middle collection metadata for ingest",
+               K(ret), K(i));
       break;
     }
 
     sql::ObArrowStreamColDesc out;
     if (OB_FAIL(ob_flight_sql_get_output_col_desc(
-            arrow_field, *ob_col, collection_subschema_id, out))) {
+            arrow_field, session->is_oracle_compatible(), collection_subschema_id, out))) {
       LOG_WARN("[FlightSQL] failed to map ingest Arrow field to converter output", K(ret), K(i));
       break;
     }
@@ -408,7 +479,7 @@ int ObArrowStreamCatalog::get_columns_for_ingest(
         break;
       }
       ObFlightSqlColumnDesc &col_desc = first_stream->column_mapping.at(i);
-      if (OB_FAIL(ob_flight_sql_build_convert_fn(arrow_field, *ob_col, collection_meta,
+      if (OB_FAIL(ob_flight_sql_build_convert_fn(arrow_field, out, collection_meta,
                                                  col_desc))) {
         LOG_WARN("[FlightSQL] failed to build V2 ingest converter", K(ret), K(i));
         break;

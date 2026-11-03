@@ -17,6 +17,8 @@
 #include "lib/utility/ob_macro_utils.h"
 #include "lib/allocator/ob_malloc.h"
 #include "lib/thread/threads.h"
+#include "sql/ob_sql_define.h"
+#include "sql/resolver/ob_stmt_type.h"
 #include "sql/session/ob_sql_session_mgr.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "observer/flight_sql/ob_flightsql_stream_registry.h"
@@ -25,6 +27,34 @@ namespace oceanbase
 {
 namespace observer
 {
+
+// Flight SQL intentionally exposes only one prepared statement at a time for
+// each logical session.  The native client statement ID never leaves the
+// server; clients receive opaque_handle and stale handles are rejected by
+// exact equality with the active generation.
+struct ObFlightSqlPreparedContext
+{
+  bool active{false};
+  uint64_t generation{0};
+  std::string opaque_handle;
+  common::ObPsStmtId native_client_stmt_id{common::OB_INVALID_ID};
+  sql::stmt::StmtType statement_type{sql::stmt::T_NONE};
+  int64_t parameter_count{0};
+  std::string sql_text;
+  bool sensitive_sql{false};
+
+  void reset()
+  {
+    active = false;
+    generation = 0;
+    opaque_handle.clear();
+    native_client_stmt_id = common::OB_INVALID_ID;
+    statement_type = sql::stmt::T_NONE;
+    parameter_count = 0;
+    sql_text.clear();
+    sensitive_sql = false;
+  }
+};
 
 // One logical flight connection. Owns a single ObSQLSessionInfo.
 struct ObFlightSqlSession
@@ -60,6 +90,13 @@ struct ObFlightSqlSession
   ObArrowStreamRegistry stream_registry;
   std::atomic<uint64_t> next_stream_id_{1};
   bool doput_active_{false};  // protected by mutex; only one DoPut per Flight session
+
+  // Prepared DML state is separate from the general session mutex because
+  // prepare/execute can compile or run SQL while holding this lock.  The
+  // generation counter is never reset while the Flight session is alive.
+  mutable std::mutex prepared_mutex;
+  uint64_t prepared_generation_{0};
+  ObFlightSqlPreparedContext prepared;
 
   // V2/V3 ingest: last in-flight ingest_id for auto-abort on session death.
   std::string last_ingest_id;
@@ -168,6 +205,7 @@ public:
   std::shared_ptr<ObFlightSqlSession> create(uint64_t tenant_id,
                                            const std::string &tenant_name,
                                            const std::string &user_name,
+                                           const std::string &password,
                                            bool is_oracle_mode,
                                            const std::string &peer_ip = "",
                                            int32_t peer_port = 0,

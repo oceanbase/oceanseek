@@ -558,56 +558,122 @@ int convert_persist_profile_to_realtime(const char *persist_profile, const int64
                                         ObOpProfile<ObMetric> *&profile, ObIAllocator *alloc)
 {
   int ret = OB_SUCCESS;
-  static constexpr uint64_t step = sizeof(uint64_t) * 2;
-  int64_t buf_pos = 0;
-  const ObProfileHeads *profile_heads = reinterpret_cast<const ObProfileHeads *>(persist_profile);
-  int64_t profile_cnt = profile_heads->head_count_;
-  int64_t metric_cnt = profile_heads->metric_count_;
-  int64_t expected_persist_size = profile_heads->head_offset_ +
-                                  profile_cnt * sizeof(ObProfileHead) +
-                                  2 * metric_cnt * sizeof(uint64_t);
-  const ObProfileHead *profile_head =
-      reinterpret_cast<const ObProfileHead *>(persist_profile + profile_heads->head_offset_);
+  static constexpr int64_t step = sizeof(uint64_t) * 2;
+  ObProfileHeads profile_heads;
+  int64_t profile_cnt = 0;
+  int64_t metric_cnt = 0;
+  int64_t profile_head_size = 0;
+  int64_t metric_offset = 0;
+  int64_t expected_persist_size = 0;
   ObOpProfile<ObMetric> **profiles_array = nullptr;
-  if (expected_persist_size > persist_len) {
-    ret = OB_SIZE_OVERFLOW;
-    LOG_WARN("unexpected persist profile size", K(profile_cnt), K(metric_cnt),
-             K(expected_persist_size), K(persist_len));
+  profile = nullptr;
+  if (OB_ISNULL(persist_profile) || OB_ISNULL(alloc) || persist_len < 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid persist profile arguments", K(ret), KP(persist_profile), K(persist_len), KP(alloc));
+  } else if (persist_len < static_cast<int64_t>(sizeof(ObProfileHeads))) {
+    ret = OB_INVALID_DATA;
+    LOG_WARN("persist profile is shorter than its header", K(ret), K(persist_len));
+  } else {
+    MEMCPY(&profile_heads, persist_profile, sizeof(profile_heads));
+    profile_cnt = profile_heads.head_count_;
+    metric_cnt = profile_heads.metric_count_;
+    if (profile_cnt <= 0 || metric_cnt < 0
+        || profile_heads.head_offset_ < static_cast<int64_t>(sizeof(ObProfileHeads))
+        || profile_heads.head_offset_ > persist_len) {
+      ret = OB_INVALID_DATA;
+      LOG_WARN("invalid persist profile header", K(ret), K(profile_cnt), K(metric_cnt),
+               K(profile_heads.head_offset_), K(persist_len));
+    } else if (profile_cnt >
+               (persist_len - profile_heads.head_offset_) / static_cast<int64_t>(sizeof(ObProfileHead))) {
+      ret = OB_INVALID_DATA;
+      LOG_WARN("invalid persist profile head count", K(ret), K(profile_cnt),
+               K(profile_heads.head_offset_), K(persist_len));
+    } else {
+      profile_head_size = profile_cnt * sizeof(ObProfileHead);
+      metric_offset = profile_heads.head_offset_ + profile_head_size;
+      if (metric_cnt > (persist_len - metric_offset) / step) {
+        ret = OB_INVALID_DATA;
+        LOG_WARN("invalid persist profile metric count", K(ret), K(profile_cnt), K(metric_cnt),
+                 K(metric_offset), K(persist_len));
+      } else {
+        expected_persist_size = metric_offset + metric_cnt * step;
+      }
+    }
+  }
+
+  int64_t next_metric_offset = metric_offset;
+  for (int64_t i = 0; OB_SUCC(ret) && i < profile_cnt; ++i) {
+    ObProfileHead profile_head;
+    MEMCPY(&profile_head,
+           persist_profile + profile_heads.head_offset_ + i * sizeof(ObProfileHead),
+           sizeof(profile_head));
+    const bool valid_parent = (i == 0)
+        ? profile_head.parent_idx_ == -1
+        : profile_head.parent_idx_ >= 0 && profile_head.parent_idx_ < i;
+    if (!valid_parent
+        || profile_head.offset_ != next_metric_offset
+        || profile_head.length_ < 0
+        || profile_head.length_ % step != 0
+        || profile_head.offset_ > expected_persist_size
+        || profile_head.length_ > expected_persist_size - profile_head.offset_) {
+      ret = OB_INVALID_DATA;
+      LOG_WARN("invalid persist profile head", K(ret), K(i), K(profile_head.parent_idx_),
+               K(profile_head.offset_), K(profile_head.length_), K(next_metric_offset),
+               K(expected_persist_size));
+    } else {
+      next_metric_offset = profile_head.offset_ + profile_head.length_;
+    }
+  }
+  if (OB_SUCC(ret) && next_metric_offset != expected_persist_size) {
+    ret = OB_INVALID_DATA;
+    LOG_WARN("persist profile metric size does not match its heads", K(ret), K(next_metric_offset),
+             K(expected_persist_size), K(metric_cnt));
+  }
+
+  if (OB_FAIL(ret)) {
   } else if (OB_ISNULL(profiles_array = static_cast<ObOpProfile<ObMetric> **>(
                            alloc->alloc(sizeof(ObOpProfile<ObMetric> *) * profile_cnt)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate memory");
   } else {
     MEMSET(profiles_array, 0, sizeof(ObOpProfile<ObMetric> *) * profile_cnt);
-    const uint64_t *cur_metric_and_value_ptr = nullptr;
     uint64_t cur_metric_id = 0;
-    uint64_t cur_metric_value;
-    ObOpProfile<ObMetric> *new_profile = nullptr;
+    uint64_t cur_metric_value = 0;
     // even if the profile id unknown, we still create the profile,
     // since we need to keep the profile tree structure
     for (int64_t i = 0; OB_SUCC(ret) && i < profile_cnt; ++i) {
-      if (profile_head[i].parent_idx_ != -1 && profile_head[i].parent_idx_ < profile_cnt
-          && OB_NOT_NULL(profiles_array[profile_head[i].parent_idx_])) {
-        if (ObProfileUtil::is_hybrid_search_profile(profile_head[i].id_)
-            || profile_head[i].id_ == ObProfileId::VECTOR_SEARCH_PARTITION) {
-          // Preserve Hybrid Search children and Vector Search Partition execution instances.
-          profiles_array[profile_head[i].parent_idx_]->register_child(profile_head[i].id_, new_profile);
-        } else {
-          profiles_array[profile_head[i].parent_idx_]->get_or_register_child(profile_head[i].id_, new_profile);
+      ObProfileHead profile_head;
+      MEMCPY(&profile_head,
+             persist_profile + profile_heads.head_offset_ + i * sizeof(ObProfileHead),
+             sizeof(profile_head));
+      ObOpProfile<ObMetric> *new_profile = nullptr;
+      if (profile_head.parent_idx_ >= 0) {
+        ObOpProfile<ObMetric> *parent_profile = profiles_array[profile_head.parent_idx_];
+        if (ObProfileUtil::is_hybrid_search_profile(profile_head.id_)
+            || profile_head.id_ == ObProfileId::VECTOR_SEARCH_PARTITION) {
+          // Preserve distinct Hybrid Search and Vector Search Partition instances.
+          if (OB_FAIL(parent_profile->register_child(profile_head.id_, new_profile))) {
+            LOG_WARN("failed to register child profile", K(ret), K(i), K(profile_head.id_));
+          }
+        } else if (OB_FAIL(parent_profile->get_or_register_child(profile_head.id_, new_profile))) {
+          LOG_WARN("failed to get or register child profile", K(ret), K(i), K(profile_head.id_));
         }
       } else {
-        new_profile = OB_NEWx(ObOpProfile<ObMetric>, alloc, profile_head[i].id_, alloc,
-                              profile_head[i].enable_rich_format_);
+        new_profile = OB_NEWx(ObOpProfile<ObMetric>, alloc, profile_head.id_, alloc,
+                              profile_head.enable_rich_format_);
       }
-      if (OB_NOT_NULL(new_profile)) {
+      if (OB_FAIL(ret)) {
+      } else if (OB_ISNULL(new_profile)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate profile", K(ret), K(i), K(profile_head.id_));
+      } else {
         profiles_array[i] = new_profile;
-        cur_metric_and_value_ptr =
-            reinterpret_cast<const uint64_t *>(persist_profile + profile_head[i].offset_);
-        int64_t cur_metric_cnt = profile_head[i].length_ / sizeof(uint64_t) / 2;
-        int64_t pos = profile_head[i].offset_;
-        for (int64_t j = 0; j < cur_metric_cnt && pos + step <= persist_len && OB_SUCC(ret); j++) {
-          cur_metric_id = *cur_metric_and_value_ptr++;
-          cur_metric_value = *cur_metric_and_value_ptr++;
+        const int64_t cur_metric_cnt = profile_head.length_ / step;
+        int64_t pos = profile_head.offset_;
+        for (int64_t j = 0; j < cur_metric_cnt && OB_SUCC(ret); ++j) {
+          MEMCPY(&cur_metric_id, persist_profile + pos, sizeof(cur_metric_id));
+          MEMCPY(&cur_metric_value, persist_profile + pos + sizeof(cur_metric_id),
+                 sizeof(cur_metric_value));
           pos += step;
           ObMetric *metric = nullptr;
           if (cur_metric_id <= ObMetricId::MONITOR_STATNAME_BEGIN ||

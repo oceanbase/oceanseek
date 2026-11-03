@@ -45,26 +45,25 @@ struct ObArrowConvTraits
   }
 
 // Numeric：定宽直读，必要时做 static_cast。
-OB_ARROW_TRAITS_DIRECT(ObTinyIntType,   INT8,   int8_t,   int8_t,   Int8Builder);
-OB_ARROW_TRAITS_DIRECT(ObSmallIntType,  INT16,  int16_t,  int16_t,  Int16Builder);
-OB_ARROW_TRAITS_DIRECT(ObInt32Type,     INT32,  int32_t,  int32_t,  Int32Builder);
+OB_ARROW_TRAITS_DIRECT(ObTinyIntType,   INT8,   int64_t,  int8_t,   Int8Builder);
+OB_ARROW_TRAITS_DIRECT(ObSmallIntType,  INT16,  int64_t,  int16_t,  Int16Builder);
+OB_ARROW_TRAITS_DIRECT(ObInt32Type,     INT32,  int64_t,  int32_t,  Int32Builder);
 OB_ARROW_TRAITS_DIRECT(ObIntType,       INT64,  int64_t,  int64_t,  Int64Builder);
-OB_ARROW_TRAITS_DIRECT(ObUTinyIntType,  UINT8,  uint8_t,  uint8_t,  UInt8Builder);
-OB_ARROW_TRAITS_DIRECT(ObUSmallIntType, UINT16, uint16_t, uint16_t, UInt16Builder);
-OB_ARROW_TRAITS_DIRECT(ObUInt32Type,    UINT32, uint32_t, uint32_t, UInt32Builder);
+OB_ARROW_TRAITS_DIRECT(ObUTinyIntType,  UINT8,  uint64_t, uint8_t,  UInt8Builder);
+OB_ARROW_TRAITS_DIRECT(ObUSmallIntType, UINT16, uint64_t, uint16_t, UInt16Builder);
+OB_ARROW_TRAITS_DIRECT(ObUInt32Type,    UINT32, uint64_t, uint32_t, UInt32Builder);
 OB_ARROW_TRAITS_DIRECT(ObUInt64Type,    UINT64, uint64_t, uint64_t, UInt64Builder);
 OB_ARROW_TRAITS_DIRECT(ObFloatType,     FLOAT,  float,    float,    FloatBuilder);
 OB_ARROW_TRAITS_DIRECT(ObUFloatType,    FLOAT,  float,    float,    FloatBuilder);
 OB_ARROW_TRAITS_DIRECT(ObDoubleType,    DOUBLE, double,   double,   DoubleBuilder);
 OB_ARROW_TRAITS_DIRECT(ObUDoubleType,   DOUBLE, double,   double,   DoubleBuilder);
-// Bit：ObCppType=uint64，ArrowCppType=int64（异型 → static_cast）。
-OB_ARROW_TRAITS_DIRECT(ObBitType,       INT64,  uint64_t, int64_t,  Int64Builder);
+OB_ARROW_TRAITS_DIRECT(ObBitType,       UINT64, uint64_t, uint64_t, UInt64Builder);
 
 // Date：普通类型直传，Year 补 1900，MySQLDate* 经过 ObTimeConverter 转换。
 OB_ARROW_TRAITS_DIRECT(ObDateTimeType,     TIMESTAMP, int64_t, int64_t, TimestampBuilder);
 OB_ARROW_TRAITS_DIRECT(ObTimestampType,    TIMESTAMP, int64_t, int64_t, TimestampBuilder);
 OB_ARROW_TRAITS_DIRECT(ObDateType,         DATE32,    int32_t, int32_t, Date32Builder);
-OB_ARROW_TRAITS_DIRECT(ObTimeType,         TIME64,    int64_t, int64_t, Time64Builder);
+OB_ARROW_TRAITS_DIRECT(ObTimeType,         DURATION,  int64_t, int64_t, DurationBuilder);
 OB_ARROW_TRAITS_DIRECT(ObYearType,         INT16,     uint8_t, int16_t, Int16Builder);
 OB_ARROW_TRAITS_DIRECT(ObMySQLDateType,    DATE32,    common::ObMySQLDate,     int32_t, Date32Builder);
 OB_ARROW_TRAITS_DIRECT(ObMySQLDateTimeType, TIMESTAMP, common::ObMySQLDateTime, int64_t, TimestampBuilder);

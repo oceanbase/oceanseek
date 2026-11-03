@@ -340,6 +340,13 @@ OB_DEF_SERIALIZE(ObRemoteTask)
   OB_UNIS_ENCODE(remote_sql_info_->sql_from_pl_);
   OB_UNIS_ENCODE(ls_list_);
   OB_UNIS_ENCODE(detectable_id_);
+  // Append-only extension: older readers skip this tail, and newer readers
+  // accept an older request without it. SQL forwarding is release-gated.
+  OB_UNIS_ENCODE(collection_param_subschemas_.count());
+  for (int64_t i = 0; OB_SUCC(ret) && i < collection_param_subschemas_.count(); ++i) {
+    OB_UNIS_ENCODE(collection_param_subschemas_.at(i).param_idx_);
+    OB_UNIS_ENCODE(collection_param_subschemas_.at(i).subschema_);
+  }
   return ret;
 }
 
@@ -386,6 +393,11 @@ OB_DEF_SERIALIZE_SIZE(ObRemoteTask)
     OB_UNIS_ADD_LEN(remote_sql_info_->sql_from_pl_);
     OB_UNIS_ADD_LEN(ls_list_);
     OB_UNIS_ADD_LEN(detectable_id_);
+    OB_UNIS_ADD_LEN(collection_param_subschemas_.count());
+    for (int64_t i = 0; i < collection_param_subschemas_.count(); ++i) {
+      OB_UNIS_ADD_LEN(collection_param_subschemas_.at(i).param_idx_);
+      OB_UNIS_ADD_LEN(collection_param_subschemas_.at(i).subschema_);
+    }
   }
   return len;
 }
@@ -402,6 +414,9 @@ OB_DEF_DESERIALIZE(ObRemoteTask)
       || OB_ISNULL(ps_params = remote_sql_info_->ps_params_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("remote task not init", K(ret), K_(remote_sql_info), K(ps_params));
+  } else {
+    collection_param_subschemas_.reuse();
+    remote_sql_info_->collection_param_subschemas_ = nullptr;
   }
   LST_DO_CODE(OB_UNIS_DECODE,
               tenant_schema_version_,
@@ -472,6 +487,88 @@ OB_DEF_DESERIALIZE(ObRemoteTask)
       OB_UNIS_DECODE(remote_sql_info_->sql_from_pl_);
       OB_UNIS_DECODE(ls_list_);
       OB_UNIS_DECODE(detectable_id_);
+      int64_t collection_param_count = 0;
+      OB_UNIS_DECODE(collection_param_count);
+      if (OB_SUCC(ret)
+          && (collection_param_count < 0 || collection_param_count > ps_params->count())) {
+        ret = OB_DESERIALIZE_ERROR;
+        LOG_WARN("invalid remote collection parameter count", K(ret), K(collection_param_count));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < collection_param_count; ++i) {
+        ObRemoteCollectionParamSubschema param_subschema;
+        if (pos >= data_len) {
+          ret = OB_DESERIALIZE_ERROR;
+          LOG_WARN("truncated remote collection parameter subschema", K(ret), K(i));
+        } else {
+          OB_UNIS_DECODE(param_subschema.param_idx_);
+          if (OB_SUCC(ret) && pos >= data_len) {
+            ret = OB_DESERIALIZE_ERROR;
+          }
+          if (OB_FAIL(ret)) {
+          } else if (OB_FAIL(param_subschema.deserialize_subschema(
+                  buf, data_len, pos, exec_ctx_->get_allocator()))) {
+            LOG_WARN("decode remote collection parameter subschema failed", K(ret), K(i));
+          } else if (OB_FAIL(collection_param_subschemas_.push_back(param_subschema))) {
+            LOG_WARN("store remote collection parameter subschema failed", K(ret), K(i));
+          }
+        }
+      }
+      if (OB_SUCC(ret) && !collection_param_subschemas_.empty()) {
+        remote_sql_info_->collection_param_subschemas_ = &collection_param_subschemas_;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObRemoteTask::init_collection_param_subschemas(ObExecContext &exec_ctx)
+{
+  int ret = OB_SUCCESS;
+  collection_param_subschemas_.reuse();
+  ObPhysicalPlanCtx *plan_ctx = exec_ctx.get_physical_plan_ctx();
+  if (OB_ISNULL(remote_sql_info_) || OB_ISNULL(remote_sql_info_->ps_params_)
+      || OB_ISNULL(plan_ctx)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("remote sql parameters not initialized", K(ret));
+  } else if (remote_sql_info_->use_ps_) {
+    const ParamStore &params = *remote_sql_info_->ps_params_;
+    for (int64_t i = 0; OB_SUCC(ret) && i < params.count(); ++i) {
+      const ObObjParam &param = params.at(i);
+      if (param.is_collection_sql_type() && !param.is_null()) {
+        ObRemoteCollectionParamSubschema param_subschema;
+        param_subschema.param_idx_ = i;
+        bool has_binding_subschema = false;
+        // Arrow binding registers ids in the current execution context. A
+        // cached plan can use a different layout when another parameter is NULL.
+        // Prefer the binding definition, not the attached plan's numeric id.
+        if (OB_SUCCESS == plan_ctx->get_subschema_ctx().get_subschema(
+                param.get_udt_subschema_id(), param_subschema.subschema_)
+            && param_subschema.subschema_.type_ == OB_SUBSCHEMA_COLLECTION_TYPE
+            && OB_NOT_NULL(param_subschema.subschema_.value_)) {
+          const ObSqlCollectionInfo *binding_info =
+              static_cast<const ObSqlCollectionInfo *>(param_subschema.subschema_.value_);
+          has_binding_subschema = static_cast<uint64_t>(binding_info->get_signature())
+              == static_cast<uint64_t>(param.get_accuracy().get_accuracy());
+        }
+        if (!has_binding_subschema && OB_FAIL(exec_ctx.get_sqludt_meta_by_subschema_id(
+                param.get_udt_subschema_id(), param_subschema.subschema_))) {
+          LOG_WARN("get remote collection parameter subschema failed", K(ret), K(i));
+        } else if (param_subschema.subschema_.type_ != OB_SUBSCHEMA_COLLECTION_TYPE
+                   || OB_ISNULL(param_subschema.subschema_.value_)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid remote collection parameter subschema", K(ret), K(i));
+        } else {
+          const ObSqlCollectionInfo *collection_info =
+              static_cast<const ObSqlCollectionInfo *>(param_subschema.subschema_.value_);
+          if (static_cast<uint64_t>(collection_info->get_signature())
+              != static_cast<uint64_t>(param.get_accuracy().get_accuracy())) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("remote collection parameter signature mismatch", K(ret), K(i), K(param));
+          } else if (OB_FAIL(collection_param_subschemas_.push_back(param_subschema))) {
+            LOG_WARN("store remote collection parameter subschema failed", K(ret), K(i));
+          }
+        }
+      }
     }
   }
   return ret;

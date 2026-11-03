@@ -173,7 +173,8 @@ struct ObPlanCacheKey : public ObILibCacheKey
       uint16_t use_rich_vector_format_ : 1; // FARM COMPAT WHITELIST
       uint16_t config_use_rich_format_ : 1;
       uint16_t enable_mysql_compatible_dates_ : 1;
-      uint16_t reserved_ : 12; // reserved
+      uint16_t is_flight_sql_ : 1; // Flight and MySQL plans have different root output layouts
+      uint16_t reserved_ : 11; // reserved
     };
   };
   uint64_t sys_var_config_hash_val_;

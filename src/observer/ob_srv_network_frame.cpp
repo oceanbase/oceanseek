@@ -13,6 +13,8 @@
 #include "observer/ob_rpc_intrusion_detect.h"
 #include "observer/net/ob_rpc_reverse_keepalive.h"
 #include "storage/ob_locality_manager.h"
+#include "lib/utility/utility.h"
+#include <openssl/crypto.h>
 extern "C" {
 #include "ussl-hook.h"
 #include "auth-methods.h"
@@ -28,6 +30,246 @@ using namespace oceanbase::common;
 using namespace oceanbase::observer;
 using namespace oceanbase::share;
 using namespace oceanbase::obmysql;
+
+namespace oceanbase
+{
+namespace observer
+{
+namespace
+{
+
+int validate_flight_tls_certificate(const ObString &public_cert)
+{
+  int ret = OB_SUCCESS;
+  BIO *bio = NULL;
+  X509 *cert = NULL;
+  if (public_cert.empty()) {
+    ret = OB_INVALID_CONFIG;
+    LOG_WARN("Flight SQL TLS certificate is empty", K(ret));
+  } else if (OB_ISNULL(bio = BIO_new_mem_buf(public_cert.ptr(), public_cert.length()))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate BIO for Flight SQL TLS certificate", K(ret));
+  } else if (OB_ISNULL(cert = PEM_read_bio_X509(bio, NULL, NULL, NULL))) {
+    ret = OB_INVALID_CONFIG;
+    LOG_WARN("failed to parse Flight SQL TLS certificate", K(ret));
+  } else {
+    const int not_before_cmp = X509_cmp_current_time(X509_get_notBefore(cert));
+    const int not_after_cmp = X509_cmp_current_time(X509_get_notAfter(cert));
+    if (0 == not_before_cmp || 0 == not_after_cmp) {
+      ret = OB_INVALID_CONFIG;
+      LOG_WARN("failed to validate Flight SQL TLS certificate validity period", K(ret));
+    } else if (not_before_cmp > 0) {
+      ret = OB_INVALID_CONFIG;
+      LOG_WARN("Flight SQL TLS certificate is not valid yet", K(ret));
+    } else if (not_after_cmp < 0) {
+      ret = OB_INVALID_CONFIG;
+      LOG_WARN("Flight SQL TLS certificate has expired", K(ret));
+    }
+  }
+
+  if (OB_NOT_NULL(cert)) {
+    X509_free(cert);
+  }
+  if (OB_NOT_NULL(bio)) {
+    BIO_free(bio);
+  }
+  return ret;
+}
+
+class ObResolvedServerSslConfig
+{
+public:
+  ObResolvedServerSslConfig()
+      : use_bkmi_(false),
+        use_sm_(false),
+        ca_cert_(NULL),
+        public_cert_(NULL),
+        private_key_(NULL),
+        enc_cert_(NULL),
+        enc_private_key_(NULL),
+        public_cert_len_(0),
+        private_key_len_(0),
+        key_expired_time_(0)
+  {}
+
+  ~ObResolvedServerSslConfig()
+  {
+#ifdef OB_USE_BABASSL
+    cleanse_secret(client_.private_key_.content_);
+    cleanse_secret(client_.private_key_for_enc_.content_);
+#endif
+  }
+
+  int resolve()
+  {
+    int ret = OB_SUCCESS;
+    const ObString ssl_config(GCONF.ssl_external_kms_info.str());
+
+#ifdef OB_USE_BABASSL
+    if (!ssl_config.empty()) {
+      if (OB_FAIL(client_.init(ssl_config.ptr(), ssl_config.length()))) {
+        LOG_WARN("kms client init failed", K(ret));
+      } else if (OB_FAIL(client_.check_param_valid())) {
+        LOG_WARN("kms client param is not valid", K(ret));
+      } else {
+        use_bkmi_ = client_.is_bkmi_mode();
+        use_sm_ = client_.is_sm_scene();
+        ca_cert_ = client_.get_root_ca().ptr();
+        public_cert_ = client_.public_cert_.content_.ptr();
+        private_key_ = client_.private_key_.content_.ptr();
+        enc_cert_ = client_.public_cert_for_enc_.content_.ptr();
+        enc_private_key_ = client_.private_key_for_enc_.content_.ptr();
+        public_cert_len_ = client_.public_cert_.content_.length();
+        private_key_len_ = client_.private_key_.content_.length();
+        key_expired_time_ = client_.public_cert_.key_expired_time_;
+      }
+    }
+#else
+    UNUSED(ssl_config);
+#endif
+
+    if (OB_SUCC(ret)) {
+      const bool allow_sm = GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_4_1_0
+          || (GET_MIN_CLUSTER_VERSION() >= MOCK_CLUSTER_VERSION_4_2_5_2
+              && GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_3_0_0);
+      if (use_sm_ && !allow_sm) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("national encryption is not supported by the current cluster version", K(ret));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                       "CLUSTER_VERSION < 4.4.1.0 or not in [4.2.5.2, 4.3.0.0), national encryption not supported");
+      }
+    }
+
+    if (OB_SUCC(ret) && !use_bkmi_) {
+      if (!use_sm_) {
+        if (EASY_OK != easy_ssl_ob_config_check(OB_SSL_CA_FILE, OB_SSL_CERT_FILE,
+                                                OB_SSL_KEY_FILE, NULL, NULL, true, false)) {
+          ret = OB_INVALID_CONFIG;
+          LOG_WARN("key and cert not match", K(ret));
+          LOG_USER_ERROR(OB_INVALID_CONFIG, "key and cert not match");
+        } else {
+          ca_cert_ = OB_SSL_CA_FILE;
+          public_cert_ = OB_SSL_CERT_FILE;
+          private_key_ = OB_SSL_KEY_FILE;
+        }
+#ifdef OB_USE_BABASSL
+      } else if (EASY_OK != easy_ssl_ob_config_check(OB_SSL_CA_FILE,
+                                                     OB_SSL_SM_SIGN_CERT_FILE,
+                                                     OB_SSL_SM_SIGN_KEY_FILE,
+                                                     OB_SSL_SM_ENC_CERT_FILE,
+                                                     OB_SSL_SM_ENC_KEY_FILE,
+                                                     true, true)) {
+        ret = OB_INVALID_CONFIG;
+        LOG_WARN("key and cert not match", K(ret));
+        LOG_USER_ERROR(OB_INVALID_CONFIG, "key and cert not match");
+      } else {
+        ca_cert_ = OB_SSL_CA_FILE;
+        public_cert_ = OB_SSL_SM_SIGN_CERT_FILE;
+        private_key_ = OB_SSL_SM_SIGN_KEY_FILE;
+        enc_cert_ = OB_SSL_SM_ENC_CERT_FILE;
+        enc_private_key_ = OB_SSL_SM_ENC_KEY_FILE;
+#endif
+      }
+    }
+
+    return ret;
+  }
+
+  int copy_flight_key_pair(ObArenaAllocator &allocator,
+                           ObString &public_cert,
+                           ObString &private_key) const
+  {
+    int ret = OB_SUCCESS;
+    public_cert.reset();
+    private_key.reset();
+
+    if (use_sm_) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("Arrow Flight SQL TLS does not support national-encryption dual certificates", K(ret));
+    } else if (OB_ISNULL(public_cert_) || OB_ISNULL(private_key_)) {
+      ret = OB_INVALID_CONFIG;
+      LOG_WARN("server TLS certificate or private key is missing", K(ret));
+    } else if (use_bkmi_) {
+      if (public_cert_len_ <= 0 || private_key_len_ <= 0) {
+        ret = OB_INVALID_CONFIG;
+        LOG_WARN("external KMS returned empty server TLS credentials", K(ret));
+      } else if (OB_FAIL(ob_write_string(allocator,
+                                         ObString(public_cert_len_, public_cert_),
+                                         public_cert))) {
+        LOG_WARN("failed to copy Flight SQL TLS certificate", K(ret));
+      } else if (OB_FAIL(ob_write_string(allocator,
+                                         ObString(private_key_len_, private_key_),
+                                         private_key))) {
+        LOG_WARN("failed to copy Flight SQL TLS private key", K(ret));
+      }
+    } else {
+      if (OB_FAIL(load_file_to_string(public_cert_, allocator.get_arena(), public_cert))) {
+        LOG_WARN("failed to load Flight SQL TLS certificate", K(ret), K(public_cert_));
+      } else if (OB_FAIL(load_file_to_string(private_key_, allocator.get_arena(), private_key))) {
+        LOG_WARN("failed to load Flight SQL TLS private key", K(ret), K(private_key_));
+      } else if (public_cert.empty() || private_key.empty()) {
+        ret = OB_INVALID_CONFIG;
+        LOG_WARN("Flight SQL TLS certificate or private key is empty", K(ret));
+      }
+    }
+
+    return ret;
+  }
+
+  bool use_bkmi() const { return use_bkmi_; }
+  bool use_sm() const { return use_sm_; }
+  const char *ca_cert() const { return ca_cert_; }
+  const char *public_cert() const { return public_cert_; }
+  const char *private_key() const { return private_key_; }
+  const char *enc_cert() const { return enc_cert_; }
+  const char *enc_private_key() const { return enc_private_key_; }
+  int64_t key_expired_time() const { return key_expired_time_; }
+
+private:
+#ifdef OB_USE_BABASSL
+  static void cleanse_secret(ObString &secret)
+  {
+    if (!secret.empty()) {
+      OPENSSL_cleanse(secret.ptr(), static_cast<size_t>(secret.length()));
+      secret.reset();
+    }
+  }
+#endif
+
+  bool use_bkmi_;
+  bool use_sm_;
+  const char *ca_cert_;
+  const char *public_cert_;
+  const char *private_key_;
+  const char *enc_cert_;
+  const char *enc_private_key_;
+  int64_t public_cert_len_;
+  int64_t private_key_len_;
+  int64_t key_expired_time_;
+#ifdef OB_USE_BABASSL
+  oceanbase::share::ObSSLClient client_;
+#endif
+};
+
+} // namespace
+} // namespace observer
+} // namespace oceanbase
+
+int ObSrvNetworkFrame::load_flight_tls_credentials(ObArenaAllocator &allocator,
+                                                   ObString &public_cert,
+                                                   ObString &private_key)
+{
+  int ret = OB_SUCCESS;
+  ObResolvedServerSslConfig ssl_config;
+  if (OB_FAIL(ssl_config.resolve())) {
+    LOG_WARN("failed to resolve server SSL credentials for Flight SQL", K(ret));
+  } else if (OB_FAIL(ssl_config.copy_flight_key_pair(allocator, public_cert, private_key))) {
+    LOG_WARN("failed to materialize server SSL credentials for Flight SQL", K(ret));
+  } else if (OB_FAIL(validate_flight_tls_certificate(public_cert))) {
+    LOG_WARN("invalid server SSL certificate for Flight SQL", K(ret));
+  }
+  return ret;
+}
 
 ObSrvNetworkFrame::ObSrvNetworkFrame(ObGlobalContext &gctx)
     : gctx_(gctx),
@@ -538,76 +780,17 @@ int ObSrvNetworkFrame::reload_ssl_config()
     } else if (last_ssl_info_hash_ == new_hash_value) {
       LOG_INFO("no need reload_ssl_config", K(new_hash_value));
     } else {
-      bool use_bkmi = false;
-      bool use_sm = false;
-      const char *ca_cert = NULL;
-      const char *public_cert = NULL;
-      const char *private_key = NULL;
-      const char *enc_cert  = NULL;
-      const char *enc_private_key = NULL;
-
-#ifdef OB_USE_BABASSL
-      share::ObSSLClient client;
-      if (!ssl_config.empty()) {
-        if (OB_FAIL(client.init(ssl_config.ptr(), ssl_config.length()))) {
-          OB_LOG(WARN, "kms client init", K(ret), K(ssl_config));
-        } else if (OB_FAIL(client.check_param_valid())) {
-          OB_LOG(WARN, "kms client param is not valid", K(ret));
-        } else {
-          use_bkmi = client.is_bkmi_mode();
-          use_sm = client.is_sm_scene();
-          ca_cert = client.get_root_ca().ptr();
-          public_cert = client.public_cert_.content_.ptr();
-          private_key = client.private_key_.content_.ptr();
-          enc_cert = client.public_cert_for_enc_.content_.ptr();
-          enc_private_key = client.private_key_for_enc_.content_.ptr();
-        }
-      }
-#endif
-      if (OB_SUCC(ret)) {
-        bool allow_sm = GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_4_1_0 ||
-                      (GET_MIN_CLUSTER_VERSION() >= MOCK_CLUSTER_VERSION_4_2_5_2 && GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_3_0_0);
-        if (use_sm && !allow_sm) {
-          ret = OB_NOT_SUPPORTED;
-          LOG_WARN("CLUSTER_VERSION < 4.4.1.0 or not in [4.2.5.2, 4.3.0.0)", KR(ret));
-          LOG_USER_ERROR(OB_NOT_SUPPORTED, "CLUSTER_VERSION < 4.4.1.0 or not in [4.2.5.2, 4.3.0.0), national encryption not supported");
-        }
-      }
-      if (OB_SUCC(ret)) {
-        if (!use_bkmi) {
-          if (!use_sm) {
-            if (EASY_OK != easy_ssl_ob_config_check(OB_SSL_CA_FILE, OB_SSL_CERT_FILE,
-                                                    OB_SSL_KEY_FILE, NULL, NULL, true, false)) {
-              ret = OB_INVALID_CONFIG;
-              LOG_WARN("key and cert not match", K(ret));
-              LOG_USER_ERROR(OB_INVALID_CONFIG, "key and cert not match");
-            } else {
-              ca_cert = OB_SSL_CA_FILE;
-              public_cert = OB_SSL_CERT_FILE;
-              private_key = OB_SSL_KEY_FILE;
-            }
-  #ifdef OB_USE_BABASSL
-          } else {
-            if (EASY_OK != easy_ssl_ob_config_check(OB_SSL_CA_FILE,
-                                                    OB_SSL_SM_SIGN_CERT_FILE, OB_SSL_SM_SIGN_KEY_FILE,
-                                                    OB_SSL_SM_ENC_CERT_FILE, OB_SSL_SM_ENC_KEY_FILE,
-                                                    true, true)) {
-              ret = OB_INVALID_CONFIG;
-              LOG_WARN("key and cert not match", K(ret));
-              LOG_USER_ERROR(OB_INVALID_CONFIG, "key and cert not match");
-            } else {
-              ca_cert = OB_SSL_CA_FILE;
-              public_cert = OB_SSL_SM_SIGN_CERT_FILE;
-              private_key = OB_SSL_SM_SIGN_KEY_FILE;
-              enc_cert = OB_SSL_SM_ENC_CERT_FILE;
-              enc_private_key = OB_SSL_SM_ENC_KEY_FILE;
-            }
-  #endif
-          }
-        }
-      }
-
-      if (OB_SUCC(ret)) {
+      ObResolvedServerSslConfig resolved_ssl_config;
+      if (OB_FAIL(resolved_ssl_config.resolve())) {
+        LOG_WARN("failed to resolve server SSL credentials", K(ret));
+      } else {
+        const bool use_bkmi = resolved_ssl_config.use_bkmi();
+        const bool use_sm = resolved_ssl_config.use_sm();
+        const char *ca_cert = resolved_ssl_config.ca_cert();
+        const char *public_cert = resolved_ssl_config.public_cert();
+        const char *private_key = resolved_ssl_config.private_key();
+        const char *enc_cert = resolved_ssl_config.enc_cert();
+        const char *enc_private_key = resolved_ssl_config.enc_private_key();
         int64_t ssl_key_expired_time = 0;
         if (!use_bkmi && !use_sm &&OB_FAIL(extract_expired_time(OB_SSL_CERT_FILE, ssl_key_expired_time))) {
           OB_LOG(WARN, "extract_expired_time intl failed", K(ret), K(use_bkmi));
@@ -629,7 +812,7 @@ int ObSrvNetworkFrame::reload_ssl_config()
           GCTX.ssl_key_expired_time_ =  ssl_key_expired_time;
 #else
           if (use_bkmi) {
-            GCTX.ssl_key_expired_time_ =  client.public_cert_.key_expired_time_;
+            GCTX.ssl_key_expired_time_ = resolved_ssl_config.key_expired_time();
           } else {
             GCTX.ssl_key_expired_time_ =  ssl_key_expired_time;
           }

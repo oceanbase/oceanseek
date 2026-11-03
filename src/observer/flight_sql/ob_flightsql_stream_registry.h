@@ -127,6 +127,10 @@ struct ObArrowStreamEntry
   std::string                         db_name;
   std::string                         table_name;
 
+  // V1 MERGE source fields need not have target column names. The catalog
+  // derives scalar types for those fields from the Arrow schema.
+  bool                                is_merge_source{false};
+
   // Cursor state used by the row-mode ObFunctionTableOp (single-threaded).
   // ObSysFunctionTableVecOp uses per-worker local cursors instead and never
   // touches these fields, so they are safe without locking in the row-mode path.

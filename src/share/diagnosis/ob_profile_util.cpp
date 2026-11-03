@@ -520,8 +520,20 @@ int ObProfileUtil::read_profile_from_result(ObIAllocator *alloc, const ObMySQLRe
     raw_profile_len = varchar_val.length();
   }
 
+  bool use_default_profile = (raw_profile_len == 0);
   if (OB_FAIL(ret)) {
-  } else if (raw_profile_len == 0) {
+  } else if (!use_default_profile) {
+    const int convert_ret = convert_persist_profile_to_realtime(
+        raw_profile, raw_profile_len, profile_item.profile_, alloc);
+    if (OB_SUCCESS != convert_ret) {
+      use_default_profile = true;
+      LOG_WARN_RET(convert_ret, "failed to convert persist profile, use common metrics instead",
+                   K(profile_item.addr_), K(profile_item.thread_id_), K(profile_item.op_id_),
+                   K(profile_item.plan_depth_), K(profile_item.sql_id_), K(raw_profile_len));
+    }
+  }
+
+  if (OB_SUCC(ret) && use_default_profile) {
     // if profile is not collect, allocate a profile do display the common metrics and other stat
     bool enable_rich_format = false;
     ObProfileId profile_id = static_cast<ObProfileId>(sql::get_phy_type_from_name(
@@ -531,9 +543,6 @@ int ObProfileUtil::read_profile_from_result(ObIAllocator *alloc, const ObMySQLRe
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("failed to allocate new profile");
     }
-  } else if (OB_FAIL(convert_persist_profile_to_realtime(
-                 raw_profile, raw_profile_len, profile_item.profile_, alloc))) {
-    LOG_WARN("failed to convert persist profile to realtime");
   }
 
   // fill common metrics and other stats into profile

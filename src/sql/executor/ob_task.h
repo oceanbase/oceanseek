@@ -8,6 +8,7 @@
 
 #include "share/ob_define.h"
 #include "sql/executor/ob_job.h"
+#include "sql/engine/ob_physical_plan_ctx.h"
 #include "lib/ob_name_id_def.h"
 #include "share/rpc/ob_batch_proxy.h"
 #include "share/detect/ob_detectable_id.h"
@@ -204,7 +205,9 @@ public:
     dependency_tables_(&inner_alloc_),
     snapshot_(),
     ls_list_(),
-    detectable_id_()
+    detectable_id_(),
+    collection_param_subschemas_(common::OB_MALLOC_NORMAL_BLOCK_SIZE,
+        common::ModulePageAllocator(inner_alloc_, "RemoteParam"))
   {
   }
   ~ObRemoteTask() = default;
@@ -230,6 +233,7 @@ public:
   const ObRemoteSqlInfo *get_remote_sql_info() const { return remote_sql_info_; }
   void set_exec_ctx(ObDesExecContext *exec_ctx) { exec_ctx_ = exec_ctx; }
   int assign_dependency_tables(const DependenyTableStore &dependency_tables);
+  int init_collection_param_subschemas(ObExecContext &exec_ctx);
   const DependenyTableStore &get_dependency_tables() const {
     return dependency_tables_;
   }
@@ -274,6 +278,7 @@ private:
   // remote执行前保存的ls
   share::ObLSArray ls_list_;
   common::ObDetectableId detectable_id_;
+  common::ObSEArray<ObRemoteCollectionParamSubschema, 4> collection_param_subschemas_;
 };
 }
 }

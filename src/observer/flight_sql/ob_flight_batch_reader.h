@@ -9,6 +9,7 @@
 #include <memory>
 #include "lib/allocator/ob_allocator.h"
 #include "lib/allocator/page_arena.h"
+#include "lib/worker.h"
 #include "observer/flight_sql/ob_flightsql_query_processor.h"
 #include "sql/engine/basic/ob_arrow_basic.h"
 
@@ -41,9 +42,28 @@ struct ObFlightReaderCtx
   uint64_t    plan_id{0};
   std::string sql_id;
   std::string trace_id;
+  std::string request_name;
   int         plan_type{0};
   int         stmt_type{0};
   int64_t     request_time{0};
+  uint64_t    resource_group_id{0};
+  int64_t     timeout_ts{INT64_MAX};
+};
+
+// SQL session state follows the streamed query, rather than the gRPC thread
+// which happens to run a fetch, serialization, or cleanup callback.
+class ObFlightSqlStreamExecutionScope
+{
+public:
+  ObFlightSqlStreamExecutionScope(sql::ObSQLSessionInfo *session, int64_t timeout_ts);
+  ~ObFlightSqlStreamExecutionScope();
+
+private:
+  sql::ObSQLSessionInfo *previous_session_;
+  uint64_t previous_rpc_tenant_;
+  lib::CompatModeGuard compat_mode_guard_;
+  lib::WorkerTimeoutGuard timeout_guard_;
+  DISALLOW_COPY_AND_ASSIGN(ObFlightSqlStreamExecutionScope);
 };
 
 class ObFlightBatchReader : public arrow::RecordBatchReader
@@ -64,11 +84,13 @@ public:
 
   std::shared_ptr<arrow::Schema> schema() const override { return schema_; }
   arrow::Status ReadNext(std::shared_ptr<arrow::RecordBatch> *out) override;
+  arrow::Status Close() override;
 
   // DoGetStatement 在 try_lock_query 成功后调用，用于转移 query_lock 所有权。
   void set_query_locked() { query_locked_ = true; }
 
 private:
+  int close_result();
   int read_next_vectorized(std::shared_ptr<arrow::RecordBatch> *out);
   int read_next_rows(std::shared_ptr<arrow::RecordBatch> *out);
 
@@ -111,6 +133,7 @@ private:
   int64_t total_rows_{0};
   int     last_ret_{0};
   bool    query_locked_{false};
+  bool    closed_{false};
   std::string flight_session_tag_;
 
   // LOB/Json 解码专用 arena。它必须独立于 arena_alloc_：

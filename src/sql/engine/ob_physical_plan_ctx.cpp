@@ -1459,12 +1459,53 @@ int ObPhysicalPlanCtx::build_subschema_by_fields(const ColumnsFieldIArray *field
   return ret;
 }
 
+static bool is_matching_param_subschema(const ObObjParam &param,
+                                        const uint16_t subschema_id,
+                                        const ObSubSchemaValue &subschema)
+{
+  const ObSubSchemaType expected_subschema_type = param.is_collection_sql_type()
+      ? OB_SUBSCHEMA_COLLECTION_TYPE : OB_SUBSCHEMA_UDT_TYPE;
+  return (param.is_user_defined_sql_type() || param.is_collection_sql_type())
+      && param.get_udt_subschema_id() == subschema_id
+      && subschema.type_ == expected_subschema_type;
+}
+
+static bool has_only_param_subschemas(const ParamStore &param_store,
+                                      const ObSubSchemaCtx &subschema_ctx)
+{
+  bool has_subschema = false;
+  bool all_match = true;
+  const auto &subschemas = subschema_ctx.get_subschema_array();
+  for (int64_t subschema_id = 0;
+       all_match && subschema_id < subschemas.count();
+       ++subschema_id) {
+    const ObSubSchemaValue &subschema = subschemas.at(subschema_id);
+    if (subschema.is_valid()) {
+      has_subschema = true;
+      bool matched = false;
+      for (int64_t param_idx = 0;
+           !matched && param_idx < param_store.count();
+           ++param_idx) {
+        matched = is_matching_param_subschema(
+            param_store.at(param_idx), static_cast<uint16_t>(subschema_id), subschema);
+      }
+      all_match = matched;
+    }
+  }
+  return has_subschema && all_match;
+}
+
 // for ps with sql udt param without plan
 int ObPhysicalPlanCtx::build_subschema_ctx_by_param_store(share::schema::ObSchemaGetterGuard *schema_guard)
 {
   int ret = OB_SUCCESS;
   ParamStore *param_store = &get_param_store_for_update();
-  if (OB_NOT_NULL(phy_plan_) || subschema_ctx_.get_subschema_count() > 0) {
+  const bool has_preinstalled_param_subschemas =
+      subschema_ctx_.get_subschema_count() > 0
+      && has_only_param_subschemas(*param_store, subschema_ctx_);
+  if (OB_NOT_NULL(phy_plan_)
+      || (subschema_ctx_.get_subschema_count() > 0
+          && !has_preinstalled_param_subschemas)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("physical plan exists, should not build subschema ctx in plan ctx",
              K(ret), K(subschema_ctx_));
@@ -1475,7 +1516,14 @@ int ObPhysicalPlanCtx::build_subschema_ctx_by_param_store(share::schema::ObSchem
     if (param.is_user_defined_sql_type() || param.is_collection_sql_type()) {
       uint64_t udt_id = param.get_accuracy().get_accuracy();
       uint16_t subschema_id = 0;
-      if (!ob_is_reserved_udt_id(udt_id)) { // is not reserved subschema id
+      ObSubSchemaValue existing_subschema;
+      const bool has_preinstalled_subschema =
+          !ob_is_reserved_subschema_id(param.get_udt_subschema_id())
+          && OB_SUCCESS == subschema_ctx_.get_subschema(
+              param.get_udt_subschema_id(), existing_subschema)
+          && is_matching_param_subschema(
+              param, param.get_udt_subschema_id(), existing_subschema);
+      if (!ob_is_reserved_udt_id(udt_id) && !has_preinstalled_subschema) {
         if (!subschema_ctx_.is_inited() && OB_FAIL(subschema_ctx_.init())) {
           LOG_WARN("subschema ctx init failed", K(ret));
         } else if(OB_FAIL(get_subschema_id_by_udt_id(udt_id, subschema_id, schema_guard))) {
@@ -1484,6 +1532,153 @@ int ObPhysicalPlanCtx::build_subschema_ctx_by_param_store(share::schema::ObSchem
           LOG_WARN("failed to get subschema id", K(ret), K(param), K(udt_id));
         } else {
           param.set_subschema_id(subschema_id);
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObRemoteCollectionParamSubschema::deserialize_subschema(
+    const char *buf, const int64_t data_len, int64_t &pos, ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  subschema_.allocator_ = &allocator;
+  if (OB_FAIL(subschema_.deserialize(buf, data_len, pos))) {
+    LOG_WARN("deserialize remote collection parameter subschema failed", K(ret), K_(param_idx));
+  } else if (subschema_.type_ != OB_SUBSCHEMA_COLLECTION_TYPE || OB_ISNULL(subschema_.value_)) {
+    ret = OB_DESERIALIZE_ERROR;
+    LOG_WARN("invalid remote collection parameter subschema type", K(ret), K_(param_idx));
+  } else {
+    ObSqlCollectionInfo *collection_info = static_cast<ObSqlCollectionInfo *>(subschema_.value_);
+    ObString type_def;
+    // Native collection decoding owns the parsed metadata, but borrows the
+    // definition string from the RPC buffer. Reverse lookup needs an owned key.
+    if (OB_FAIL(ob_write_string(allocator, collection_info->get_def_string(), type_def))) {
+      LOG_WARN("copy remote collection parameter definition failed", K(ret), K_(param_idx));
+    } else {
+      collection_info->set_name(type_def);
+    }
+  }
+  return ret;
+}
+
+static int check_remote_collection_param_subschema(
+    const ObRemoteCollectionParamSubschema &param_subschema, const ParamStore &params)
+{
+  int ret = OB_SUCCESS;
+  const int64_t param_idx = param_subschema.param_idx_;
+  if (param_idx < 0 || param_idx >= params.count()
+      || param_subschema.subschema_.type_ != OB_SUBSCHEMA_COLLECTION_TYPE
+      || OB_ISNULL(param_subschema.subschema_.value_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid remote collection parameter subschema", K(ret), K(param_idx));
+  } else {
+    const ObObjParam &param = params.at(param_idx);
+    const ObSqlCollectionInfo *collection_info =
+        static_cast<const ObSqlCollectionInfo *>(param_subschema.subschema_.value_);
+    if (!param.is_collection_sql_type() || param.is_null()
+        || OB_ISNULL(collection_info->collection_meta_)
+        || collection_info->get_def_string().empty()
+        || static_cast<uint64_t>(collection_info->get_signature())
+            != static_cast<uint64_t>(param.get_accuracy().get_accuracy())) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("remote collection parameter definition does not match value",
+               K(ret), K(param_idx), K(param));
+    }
+  }
+  return ret;
+}
+
+int ObPhysicalPlanCtx::restore_remote_collection_param_subschemas()
+{
+  int ret = OB_SUCCESS;
+  const ObIArray<ObRemoteCollectionParamSubschema> *param_subschemas =
+      remote_sql_info_.collection_param_subschemas_;
+  if (OB_ISNULL(param_subschemas) || param_subschemas->empty()) {
+    // Scalar parameters and older requests retain their original behavior.
+  } else if (OB_NOT_NULL(phy_plan_) || subschema_ctx_.get_subschema_count() > 0) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("remote parameter subschemas must be restored before compilation", K(ret));
+  } else if (!subschema_ctx_.is_inited() && OB_FAIL(subschema_ctx_.init())) {
+    LOG_WARN("initialize remote parameter subschema context failed", K(ret));
+  } else {
+    int64_t collection_param_count = 0;
+    for (int64_t i = 0; i < param_store_.count(); ++i) {
+      if (param_store_.at(i).is_collection_sql_type() && !param_store_.at(i).is_null()) {
+        ++collection_param_count;
+      }
+    }
+    if (collection_param_count != param_subschemas->count()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("incomplete remote collection parameter subschemas",
+               K(ret), K(collection_param_count), K(param_subschemas->count()));
+    }
+    int64_t last_param_idx = -1;
+    for (int64_t i = 0; OB_SUCC(ret) && i < param_subschemas->count(); ++i) {
+      const ObRemoteCollectionParamSubschema &param_subschema = param_subschemas->at(i);
+      uint16_t local_subschema_id = UINT_MAX16;
+      if (param_subschema.param_idx_ <= last_param_idx) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("duplicate or unordered remote collection parameter", K(ret), K(i));
+      } else if (OB_FAIL(check_remote_collection_param_subschema(param_subschema, param_store_))) {
+        LOG_WARN("check remote collection parameter subschema failed", K(ret), K(i));
+      } else {
+        const ObSqlCollectionInfo *collection_info =
+            static_cast<const ObSqlCollectionInfo *>(param_subschema.subschema_.value_);
+        // The receiver context is fresh. Deduplicate identical parameter types
+        // without importing source ids or unrelated source-plan subschemas.
+        for (int64_t j = 0; local_subschema_id == UINT_MAX16 && j < i; ++j) {
+          const ObRemoteCollectionParamSubschema &previous = param_subschemas->at(j);
+          const ObSqlCollectionInfo *previous_info =
+              static_cast<const ObSqlCollectionInfo *>(previous.subschema_.value_);
+          if (collection_info->get_def_string() == previous_info->get_def_string()) {
+            local_subschema_id = param_store_.at(previous.param_idx_).get_udt_subschema_id();
+          }
+        }
+        if (local_subschema_id == UINT_MAX16) {
+          ObSubSchemaValue subschema = param_subschema.subschema_;
+          // Native collection reverse lookup keys use the type definition.
+          subschema.signature_ = 0;
+          if (OB_FAIL(subschema_ctx_.get_new_subschema_id(local_subschema_id))) {
+            LOG_WARN("allocate remote parameter subschema id failed", K(ret), K(i));
+          } else if (OB_FAIL(subschema_ctx_.set_subschema(local_subschema_id, subschema))) {
+            LOG_WARN("register remote parameter subschema failed", K(ret), K(i));
+          }
+        }
+        if (OB_SUCC(ret)) {
+          ObObjParam &param = param_store_.at(param_subschema.param_idx_);
+          param.set_subschema_id(local_subschema_id);
+          param.set_param_meta();
+          last_param_idx = param_subschema.param_idx_;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObPhysicalPlanCtx::remap_remote_collection_param_subschemas(const ObPhysicalPlan &plan)
+{
+  int ret = OB_SUCCESS;
+  const ObIArray<ObRemoteCollectionParamSubschema> *param_subschemas =
+      remote_sql_info_.collection_param_subschemas_;
+  if (OB_NOT_NULL(param_subschemas)) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < param_subschemas->count(); ++i) {
+      const ObRemoteCollectionParamSubschema &param_subschema = param_subschemas->at(i);
+      uint16_t plan_subschema_id = UINT_MAX16;
+      if (OB_FAIL(check_remote_collection_param_subschema(param_subschema, param_store_))) {
+        LOG_WARN("check cached remote parameter subschema failed", K(ret), K(i));
+      } else {
+        const ObSqlCollectionInfo *collection_info =
+            static_cast<const ObSqlCollectionInfo *>(param_subschema.subschema_.value_);
+        if (OB_FAIL(plan.get_subschema_ctx().get_subschema_id_by_typedef(
+                collection_info->get_def_string(), plan_subschema_id))) {
+          LOG_WARN("find remote parameter type in selected plan failed", K(ret), K(i));
+        } else {
+          ObObjParam &param = param_store_.at(param_subschema.param_idx_);
+          param.set_subschema_id(plan_subschema_id);
+          param.set_param_meta();
         }
       }
     }

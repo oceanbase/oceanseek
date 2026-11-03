@@ -217,7 +217,7 @@ public:
           if (OB_FAIL(read_real_string_data(
               &allocator,
               meta.type_,
-              meta.cs_type_,
+              meta.get_cs_type(),
               str,
               exec_ctx))) {
             COMMON_LOG(WARN, "read_real_string_data fail", K(ret), K(meta), K(datum));
@@ -261,7 +261,7 @@ public:
           if (OB_FAIL(read_real_string_data(
               &allocator,
               meta.type_,
-              meta.cs_type_,
+              meta.get_cs_type(),
               str,
               exec_ctx))) {
             COMMON_LOG(WARN, "read_real_string_data fail", K(ret), K(meta), K(vector));
@@ -310,7 +310,7 @@ public:
       if (tenant_id != OB_INVALID_TENANT_ID) {
         tmp_alloc_ptr = &tmp_allocator;
       }
-      ObTextStringIter str_iter(meta.type_, meta.cs_type_, str);
+      ObTextStringIter str_iter(meta.type_, meta.get_cs_type(), str);
       if (OB_FAIL(str_iter.init(0, NULL, &allocator, tmp_alloc_ptr))) {
         COMMON_LOG(WARN, "Lob: str iter init failed ", K(ret), K(str_iter));
       } else if (OB_FAIL(str_iter.get_full_data(str))) {
@@ -345,7 +345,7 @@ public:
     if (datum.is_null()) {
       str.reset();
     } else if (ob_is_text_tc(meta.type_)) {
-      ObTextStringIter str_iter(meta.type_, meta.cs_type_, str);
+      ObTextStringIter str_iter(meta.type_, meta.get_cs_type(), str);
       if (OB_FAIL(str_iter.init(0, NULL, allocator))) {
         COMMON_LOG(WARN, "Lob: init lob str iter failed ", K(ret), K(str_iter));
       } else if (OB_FAIL(str_iter.get_inrow_or_outrow_prefix_data(str, prefix_char_len))) {
@@ -383,7 +383,7 @@ public:
     int ret = OB_SUCCESS;
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
-    ObTextStringIter str_iter(meta.type_, meta.cs_type_, str);
+    ObTextStringIter str_iter(meta.type_, meta.get_cs_type(), str);
     if (OB_FAIL(str_iter.init(0, NULL, &temp_allocator))) {
       COMMON_LOG(WARN, "Lob: init lob str iter failed ", K(ret), K(str_iter));
     } else if (OB_FAIL(str_iter.get_char_len(char_len))) {

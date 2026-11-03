@@ -159,6 +159,9 @@ int ObRemoteScheduler::build_remote_task(ObExecContext &ctx,
     LOG_WARN("fail to assign ls list", K(ret));
   } else if (OB_FAIL(session->get_trans_result().add_touched_ls(task_ls_list))) {
     LOG_WARN("add touched ls failed", K(ret));
+  } else if (OB_NOT_NULL(ctx.get_sql_ctx()) && ctx.get_sql_ctx()->is_flight_sql_
+             && OB_FAIL(remote_task.init_collection_param_subschemas(ctx))) {
+    LOG_WARN("collect remote prepared parameter subschemas failed", K(ret));
   } else if (OB_ISNULL(DAS_CTX(ctx).get_table_loc_list().get_first()) ||
              OB_ISNULL(first_tablet_loc = DAS_CTX(ctx).get_table_loc_list().get_first()->get_first_tablet_loc())) {
     ret = OB_ERR_UNEXPECTED;
