@@ -1182,8 +1182,8 @@ TEST_F(TestDASAsyncTokenOp, advance_shallow_semantics)
   ObDASRowID rid;
   double score = 0.0;
   ASSERT_EQ(OB_ERR_UNEXPECTED, op->next_rowid(rid, score));  // shallow -> next rejected
-  OK(op->advance_to(target, rid, score));  // materializes
-  ASSERT_EQ(expect_doc(OP_START, 10), rid.get_uint64());
+  OK(op->advance_to(target, rid, score));  // materializes without rewinding the exclusive frontier
+  ASSERT_EQ(expect_doc(OP_START, 11), rid.get_uint64());
   // For uniform data the materialized row score equals the block-max upper bound.
   ASSERT_DOUBLE_EQ(expected_block_max, score);
   ASSERT_LE(score, dim_max_boosted);
@@ -1655,18 +1655,21 @@ TEST_F(TestDASAsyncTokenOp, advance_shallow_pareto_frontier)
   ASSERT_GE(op->posting_iter_->curr_meta_.block_max_.pair_count_, 2);
   ASSERT_DOUBLE_EQ(exp_block_max, tuple->get_max_score());
 
-  // Materialize one row of each pair (forward order: doc1 = i=0 even -> (5,200),
-  // then doc3 = i=1 odd -> (3,100)). The block-max must upper-bound both, with the
+  // Materialize one row of each pair at or beyond the shallow frontier:
+  // i=128 even -> (5,200), then i=129 odd -> (3,100).
+  // The block-max must upper-bound both, with the
   // losing pair strictly below — the whole point of a multi-point frontier.
   ObDASRowID rid;
   double score = 0.0;
-  target.set_uint64(expect_doc(OP_START, 0));  // i=0 even -> (5,200)
+  target.set_uint64(expect_doc(OP_START, 128));  // i=128 even -> (5,200)
   OK(op->advance_to(target, rid, score));
+  ASSERT_EQ(expect_doc(OP_START, 128), rid.get_uint64());
   ASSERT_DOUBLE_EQ(score_5_200, score);
   ASSERT_LE(score, tuple->get_max_score());
 
-  target.set_uint64(expect_doc(OP_START, 1));  // i=1 odd -> (3,100)
+  target.set_uint64(expect_doc(OP_START, 129));  // i=129 odd -> (3,100)
   OK(op->advance_to(target, rid, score));
+  ASSERT_EQ(expect_doc(OP_START, 129), rid.get_uint64());
   ASSERT_DOUBLE_EQ(score_3_100, score);
   ASSERT_LE(score, tuple->get_max_score());
 
