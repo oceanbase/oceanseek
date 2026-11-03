@@ -4480,67 +4480,18 @@ int ObTablet::collect_transfer_source_deletion_snapshot_(ObDeletionReadPreparati
 {
   int ret = OB_SUCCESS;
   ObTabletHandle source_tablet_handle;
-  ObLSHandle source_ls_handle;
   ObTabletMemberWrapper<ObTabletTableStore> source_store_wrapper;
   const ObTabletTableStore *source_store = nullptr;
   ObTablet *source_tablet = nullptr;
-  ObLSService *ls_service = MTL(ObLSService *);
-  ObLS *source_ls = nullptr;
-  ObLSTabletService *source_tablet_service = nullptr;
-  ObTabletCreateDeleteMdsUserData transfer_status;
-  mds::MdsWriter unused_writer;
-  mds::TwoPhaseCommitState unused_trans_state;
-  SCN unused_trans_version;
-  SCN max_decided_scn;
-  ObLSID source_ls_id;
-  ObTabletID source_tablet_id;
 
-  if (OB_FAIL(ObITabletMdsInterface::get_latest_tablet_status(
-          transfer_status, unused_writer, unused_trans_state, unused_trans_version))) {
-    LOG_WARN("failed to get transfer status for deletion snapshot", K(ret));
-  } else if (ObTabletStatus::TRANSFER_IN != transfer_status.tablet_status_) {
-    ret = OB_SNAPSHOT_DISCARDED;
-    LOG_WARN("transfer status does not match deletion snapshot", K(ret), K(transfer_status));
-  } else if (!transfer_status.transfer_ls_id_.is_valid()) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("invalid transfer source LS", K(ret), K(transfer_status));
-  } else {
-    source_ls_id = transfer_status.transfer_ls_id_;
-    source_tablet_id = tablet_meta_.tablet_id_;
-  }
-
-  if (OB_FAIL(ret)) {
-  } else if (OB_ISNULL(ls_service)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("LS service is null", K(ret));
-  } else if (OB_FAIL(preparation.check_status())) {
+  if (OB_FAIL(preparation.check_status())) {
     LOG_WARN("deletion source lookup interrupted", K(ret));
-  } else if (OB_FAIL(ls_service->get_ls(source_ls_id, source_ls_handle, ObLSGetMod::HA_MOD))) {
-    LOG_WARN("failed to get deletion source LS", K(ret), K(source_ls_id));
-  } else if (OB_ISNULL(source_ls = source_ls_handle.get_ls())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("deletion source LS is null", K(ret), K(source_ls_id));
-  } else if (OB_ISNULL(source_tablet_service = source_ls->get_tablet_svr())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("transfer source tablet service is null", K(ret), K(source_ls_id));
-  } else if (OB_FAIL(source_tablet_service->check_allow_to_read())) {
-    LOG_WARN("transfer source LS is not readable", K(ret), K(source_ls_id));
-  } else if (OB_FAIL(source_ls->get_max_decided_scn(max_decided_scn))) {
-    LOG_WARN("failed to get transfer source decided SCN", K(ret), K(source_ls_id));
-  } else if (max_decided_scn < transfer_status.transfer_scn_) {
-    ret = OB_REPLICA_NOT_READABLE;
-    LOG_WARN("transfer source has not replayed the transfer point",
-        K(ret), K(max_decided_scn), K(transfer_status));
-  } else if (OB_FAIL(source_ls->get_tablet(
-          source_tablet_id, source_tablet_handle, preparation.remaining_time(),
-          ObMDSGetTabletMode::READ_WITHOUT_CHECK))) {
-    LOG_WARN("failed to get deletion source tablet", K(ret), K(source_tablet_id));
+  } else if (OB_FAIL(ObLSTabletService::do_get_async_index_src_tablet(
+      *this, preparation.remaining_time(), source_tablet_handle))) {
+    LOG_WARN("failed to get deletion source tablet", K(ret), K(tablet_meta_));
   } else if (OB_ISNULL(source_tablet = source_tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("deletion source tablet is null", K(ret));
-  } else if (source_tablet->is_empty_shell()) {
-    ret = OB_TABLET_NOT_EXIST;
-    LOG_WARN("deletion source tablet became empty shell", K(ret), K(source_tablet_id));
   } else if (OB_FAIL(source_tablet->fetch_table_store(source_store_wrapper))) {
     LOG_WARN("failed to fetch deletion source TableStore", K(ret));
   } else if (OB_FAIL(source_store_wrapper.get_member(source_store))) {

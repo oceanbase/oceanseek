@@ -493,6 +493,36 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, deletion_transfer_route_includes_source_
         INT64_MAX, snapshot, initial_snapshot + 300));
     EXPECT_EQ(initial_snapshot + 300, snapshot);
   }
+  ObTabletHandle selected_source;
+  ASSERT_EQ(OB_SUCCESS, ObLSTabletService::do_get_async_index_src_tablet(*target.get_obj(), 0, selected_source));
+  EXPECT_EQ(source.get_obj(), selected_source.get_obj());
+  // An older source is not yet readable; a newer one belongs to another transfer.
+  ++target.get_obj()->tablet_meta_.transfer_info_.transfer_seq_;
+  EXPECT_EQ(OB_REPLICA_NOT_READABLE,
+      ObLSTabletService::do_get_async_index_src_tablet(*target.get_obj(), 0, selected_source));
+  EXPECT_FALSE(selected_source.is_valid());
+  EXPECT_EQ(OB_REPLICA_NOT_READABLE,
+      target.get_obj()->get_deletion_physical_snapshot(INT64_MAX, snapshot));
+  EXPECT_EQ(0, snapshot);
+  --target.get_obj()->tablet_meta_.transfer_info_.transfer_seq_;
+  ++source.get_obj()->tablet_meta_.transfer_info_.transfer_seq_;
+  EXPECT_EQ(OB_SNAPSHOT_DISCARDED,
+      target.get_obj()->get_deletion_physical_snapshot(INT64_MAX, snapshot));
+  EXPECT_EQ(0, snapshot);
+  --source.get_obj()->tablet_meta_.transfer_info_.transfer_seq_;
+  // An empty shell uses location retry, including under RR/SERIALIZABLE isolation.
+  source.get_obj()->tablet_meta_.is_empty_shell_ = true;
+  EXPECT_EQ(OB_TABLET_NOT_EXIST,
+      ObLSTabletService::do_get_async_index_src_tablet(*target.get_obj(), 0, selected_source));
+  EXPECT_FALSE(selected_source.is_valid());
+  EXPECT_EQ(OB_TABLET_NOT_EXIST,
+      target.get_obj()->get_deletion_physical_snapshot(INT64_MAX, snapshot));
+  EXPECT_EQ(0, snapshot);
+  source.get_obj()->tablet_meta_.is_empty_shell_ = false;
+  EXPECT_EQ(OB_TIMEOUT, target.get_obj()->get_deletion_physical_snapshot(1, snapshot));
+  EXPECT_EQ(0, snapshot);
+  ASSERT_EQ(OB_SUCCESS, target.get_obj()->get_deletion_physical_snapshot(INT64_MAX, snapshot));
+  EXPECT_EQ(initial_snapshot + 200, snapshot);
   ObTabletHandle mds_source;
   ObITabletMdsInterface *mds_base = nullptr;
   ASSERT_EQ(OB_SUCCESS, target.get_obj()->get_src_tablet_handle_and_base_ptr_(mds_source, mds_base));
