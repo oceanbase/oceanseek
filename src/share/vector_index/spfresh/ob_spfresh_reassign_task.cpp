@@ -815,7 +815,7 @@ int ObSpfreshReassignTask::reconcile_cache_posting_counts_(
       }
     }
     if (OB_FAIL(cache_->reconcile_posting_list_length(
-        cache_infos.at(i).first, cache_infos.at(i).second.posting_list_count_,
+        cache_infos.at(i).first, cache_infos.at(i).second,
         persistent_count))) {
       LOG_WARN("failed to publish reconciled centroid posting count", K(ret),
                "cid", cache_infos.at(i).first, K(persistent_count));

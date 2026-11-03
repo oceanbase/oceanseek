@@ -695,12 +695,134 @@ TEST_F(TestIvfMapCentCacheRefCnt, spfresh_compensation_target_state_is_idempoten
   EXPECT_EQ(ObIvfCentroidState::NORMAL, info.state_);
 }
 
+TEST_F(TestIvfMapCentCacheRefCnt, max_center_id_includes_retired_entry_until_gc)
+{
+  insert_centroid(129);
+  insert_centroid(130);
+  ASSERT_EQ(common::OB_SUCCESS, cache_->incr_posting_list_length(130, 50));
+  ObCentroidVecGuard guard;
+  ObCentroidInfo info;
+  ASSERT_EQ(common::OB_SUCCESS,
+            cache_->acquire_centroid_vec(130, SCN::min_scn(), guard, info));
+  ASSERT_EQ(common::OB_SUCCESS,
+            cache_->update_centroid_state(130, ObIvfCentroidState::MERGED));
+  mark_gc_erasable(130);
+  ASSERT_EQ(common::OB_ENTRY_NOT_EXIST,
+            cache_->get_center_info(130, SCN::max_scn(), info));
+
+  int64_t max_cid = 0;
+  ASSERT_EQ(common::OB_SUCCESS, cache_->get_max_center_id(max_cid));
+  EXPECT_EQ(130, max_cid);
+  bool erased = false;
+  ASSERT_EQ(common::OB_SUCCESS,
+            cache_->try_erase_centroid(130, TEST_MIN_RESERVED_SNAPSHOT, erased));
+  EXPECT_FALSE(erased);
+  ASSERT_EQ(common::OB_SUCCESS, guard.release());
+  ASSERT_EQ(common::OB_SUCCESS, cache_->get_max_center_id(max_cid));
+  EXPECT_EQ(130, max_cid);
+  ASSERT_EQ(common::OB_SUCCESS,
+            cache_->try_erase_centroid(130, TEST_MIN_RESERVED_SNAPSHOT, erased));
+  EXPECT_TRUE(erased);
+  ASSERT_EQ(common::OB_SUCCESS, cache_->get_max_center_id(max_cid));
+  EXPECT_EQ(129, max_cid);
+  insert_centroid(max_cid + 1);
+  ASSERT_EQ(common::OB_SUCCESS, cache_->incr_posting_list_length(130, 2000));
+  ASSERT_EQ(common::OB_SUCCESS, cache_->get_center_info(130, SCN::max_scn(), info));
+  EXPECT_EQ(2000, info.posting_list_count_);
+}
+
+TEST_F(TestIvfMapCentCacheRefCnt, max_center_id_handles_empty_and_uninitialized_map)
+{
+  int64_t max_cid = -1;
+  ASSERT_EQ(common::OB_SUCCESS, cache_->get_max_center_id(max_cid));
+  EXPECT_EQ(0, max_cid);
+  cache_->cent_map_.destroy();
+  EXPECT_EQ(common::OB_NOT_INIT, cache_->get_max_center_id(max_cid));
+}
+
+TEST_F(TestIvfMapCentCacheRefCnt, replacement_waits_for_single_and_batch_readers)
+{
+  insert_centroid(1);
+  ObCentroidVecGuard guard;
+  ObCentroidInfo info;
+  ASSERT_EQ(common::OB_SUCCESS,
+            cache_->acquire_centroid_vec(1, SCN::min_scn(), guard, info));
+  float *old_vec = info.cid_vec_;
+  float replacement[TEST_DIM] = {};
+  SCN scn = SCN::base_scn();
+  ASSERT_EQ(common::OB_EAGAIN, cache_->add_centroid(1, replacement, TEST_DIM, &scn));
+  EXPECT_FLOAT_EQ(dummy_vec_[0], old_vec[0]);
+  EXPECT_EQ(1, read_ref_cnt(1));
+  ASSERT_EQ(common::OB_SUCCESS, guard.release());
+
+  ObCentroidVecBatchGuard batch_guard;
+  common::ObSEArray<ObCentroidInfo, 4> infos;
+  ASSERT_EQ(common::OB_SUCCESS,
+            cache_->acquire_visible_centroids(SCN::min_scn(), batch_guard, infos));
+  ASSERT_EQ(common::OB_EAGAIN, cache_->add_centroid(1, replacement, TEST_DIM, &scn));
+  EXPECT_FLOAT_EQ(dummy_vec_[0], old_vec[0]);
+  ASSERT_EQ(common::OB_SUCCESS, batch_guard.release_all());
+  EXPECT_EQ(common::OB_SUCCESS, cache_->add_centroid(1, replacement, TEST_DIM, &scn));
+}
+
+TEST_F(TestIvfMapCentCacheRefCnt, reconciliation_rejects_aba_and_replacement)
+{
+  insert_centroid(1);
+  ASSERT_EQ(common::OB_SUCCESS, cache_->incr_posting_list_length(1, 10));
+  ObCentroidInfo snapshot;
+  ASSERT_EQ(common::OB_SUCCESS, cache_->get_center_info(1, SCN::max_scn(), snapshot));
+  ASSERT_EQ(common::OB_SUCCESS, cache_->incr_posting_list_length(1, 1));
+  ASSERT_EQ(common::OB_SUCCESS, cache_->decr_posting_list_length(1, 1));
+  EXPECT_EQ(common::OB_EAGAIN, cache_->reconcile_posting_list_length(1, snapshot, 7));
+  ASSERT_EQ(common::OB_SUCCESS, cache_->get_center_info(1, SCN::max_scn(), snapshot));
+  ASSERT_EQ(common::OB_SUCCESS, cache_->set_center_info(1, snapshot));
+  EXPECT_EQ(common::OB_EAGAIN, cache_->reconcile_posting_list_length(1, snapshot, 7));
+  ASSERT_EQ(common::OB_SUCCESS, cache_->get_center_info(1, SCN::max_scn(), snapshot));
+  SCN scn = SCN::base_scn();
+  ASSERT_EQ(common::OB_SUCCESS, cache_->add_centroid(1, dummy_vec_, TEST_DIM, &scn));
+  EXPECT_EQ(common::OB_EAGAIN, cache_->reconcile_posting_list_length(1, snapshot, 7));
+}
+
+TEST_F(TestIvfMapCentCacheRefCnt, concurrent_centroid_inserts_preserve_total_count)
+{
+  constexpr int64_t THREADS = 4;
+  constexpr int64_t WAVES = 32;
+  std::atomic<int> failures(0);
+  for (int64_t wave = 0; wave < WAVES; ++wave) {
+    // The fixture has no tenant throttle tool. Reset between joined waves,
+    // keeping each wave below the allocator's periodic throttle check.
+    sub_ctx_->check_cnt_ = 0;
+    std::atomic<bool> start(false);
+    std::vector<std::thread> workers;
+    for (int64_t t = 0; t < THREADS; ++t) {
+      workers.emplace_back([&, t]() {
+        SCN scn = SCN::min_scn();
+        while (!start.load(std::memory_order_acquire)) {
+          std::this_thread::yield();
+        }
+        if (common::OB_SUCCESS != cache_->add_centroid(
+            wave * THREADS + t, dummy_vec_, TEST_DIM, &scn)) {
+          ++failures;
+        }
+      });
+    }
+    start.store(true, std::memory_order_release);
+    for (auto &worker : workers) {
+      worker.join();
+    }
+  }
+  EXPECT_EQ(0, failures.load());
+  EXPECT_EQ(THREADS * WAVES, cache_->get_count());
+}
+
 TEST_F(TestIvfMapCentCacheRefCnt, reconcile_count_preserves_new_lifecycle_state)
 {
   insert_centroid(1);
   ASSERT_EQ(common::OB_SUCCESS, cache_->incr_posting_list_length(1, 10));
+  ObCentroidInfo snapshot;
+  ASSERT_EQ(common::OB_SUCCESS, cache_->get_center_info(1, SCN::max_scn(), snapshot));
   ASSERT_EQ(common::OB_SUCCESS, cache_->update_centroid_state(1, ObIvfCentroidState::REASSIGNING));
-  ASSERT_EQ(common::OB_SUCCESS, cache_->reconcile_posting_list_length(1, 10, 7));
+  ASSERT_EQ(common::OB_SUCCESS, cache_->reconcile_posting_list_length(1, snapshot, 7));
   ObCentroidInfo info;
   ASSERT_EQ(common::OB_SUCCESS, cache_->get_center_info(1, SCN::max_scn(), info));
   EXPECT_EQ(7, info.posting_list_count_);
@@ -711,14 +833,16 @@ TEST_F(TestIvfMapCentCacheRefCnt, reconcile_count_rejects_concurrent_count_chang
 {
   insert_centroid(1);
   ASSERT_EQ(common::OB_SUCCESS, cache_->incr_posting_list_length(1, 10));
+  ObCentroidInfo snapshot;
+  ASSERT_EQ(common::OB_SUCCESS, cache_->get_center_info(1, SCN::max_scn(), snapshot));
   ASSERT_EQ(common::OB_SUCCESS, cache_->incr_posting_list_length(1, 1));
-  EXPECT_EQ(common::OB_EAGAIN, cache_->reconcile_posting_list_length(1, 10, 7));
+  EXPECT_EQ(common::OB_EAGAIN, cache_->reconcile_posting_list_length(1, snapshot, 7));
   ObCentroidInfo info;
   ASSERT_EQ(common::OB_SUCCESS, cache_->get_center_info(1, SCN::max_scn(), info));
   EXPECT_EQ(11, info.posting_list_count_);
   EXPECT_EQ(common::OB_INVALID_ARGUMENT,
-            cache_->reconcile_posting_list_length(1, 11, static_cast<int64_t>(INT32_MAX) + 1));
-  EXPECT_EQ(common::OB_ENTRY_NOT_EXIST, cache_->reconcile_posting_list_length(2, 0, 1));
+            cache_->reconcile_posting_list_length(1, info, static_cast<int64_t>(INT32_MAX) + 1));
+  EXPECT_EQ(common::OB_ENTRY_NOT_EXIST, cache_->reconcile_posting_list_length(2, info, 1));
 }
 
 }  // namespace share

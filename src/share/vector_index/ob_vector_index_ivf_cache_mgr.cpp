@@ -995,7 +995,7 @@ ObIvfMapCentCache::~ObIvfMapCentCache()
     cent_map_.destroy();
   }
   cent_vec_dim_ = 0;
-  count_ = 0;
+  ATOMIC_STORE(&count_, 0);
   nlist_param_ = 0;
 }
 
@@ -1010,7 +1010,7 @@ void ObIvfMapCentCache::reuse()
     }
     cent_map_.reuse();
   }
-  count_ = 0;
+  ATOMIC_STORE(&count_, 0);
   nlist_param_ = 0;
   ObIvfICache::reuse();
 }
@@ -1026,7 +1026,7 @@ int ObIvfMapCentCache::init(ObIvfMemContext *parent_mem_ctx, const IvfCacheKey &
     LOG_WARN("fail to do ObIvfICache inner init", K(ret));
   } else {
     cent_vec_dim_ = param.dim_;
-    count_ = 0;
+    ATOMIC_STORE(&count_, 0);
     nlist_param_ = param.nlist_;
     if (OB_UNLIKELY(nlist_param_ <= 0)) {
       ret = OB_INVALID_ARGUMENT;
@@ -1066,6 +1066,32 @@ int ObIvfMapCentCache::release_centroids()
   return ret;
 }
 
+int ObIvfMapCentCache::get_max_center_id(int64_t &max_cid) const
+{
+  struct MaxCenterIdFn
+  {
+    explicit MaxCenterIdFn(int64_t &max_cid) : max_cid_(max_cid) {}
+    int operator()(const common::hash::HashMapPair<int64_t, ObCentroidInfo> &entry)
+    {
+      max_cid_ = std::max(max_cid_, entry.first);
+      return OB_SUCCESS;
+    }
+    int64_t &max_cid_;
+  };
+  int ret = OB_SUCCESS;
+  max_cid = 0;
+  if (!cent_map_.created()) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("centroid map not created", K(ret));
+  } else {
+    MaxCenterIdFn fn(max_cid);
+    if (OB_FAIL(cent_map_.foreach_refactored(fn))) {
+      LOG_WARN("failed to get maximum cached center id", K(ret));
+    }
+  }
+  return ret;
+}
+
 int64_t ObIvfMapCentCache::get_expect_memory_used(const IvfCacheKey &key,
                                                   const ObVectorIndexParam &param)
 {
@@ -1081,16 +1107,23 @@ class ObReplaceCentroidVecFn
 public:
   ObReplaceCentroidVecFn(float *new_vec, const SCN &create_scn,
                          ObIvfCentroidState state, float *&old_vec_out)
-      : new_vec_(new_vec), create_scn_(create_scn), state_(state), old_vec_out_(old_vec_out) {}
+      : cb_ret_(OB_SUCCESS), new_vec_(new_vec), create_scn_(create_scn),
+        state_(state), old_vec_out_(old_vec_out) {}
   int operator()(common::hash::HashMapPair<int64_t, ObCentroidInfo> &entry)
   {
-    old_vec_out_ = entry.second.cid_vec_;
-    entry.second.cid_vec_ = new_vec_;
-    entry.second.create_scn_ = create_scn_;
-    entry.second.delet_scn_.set_max();
-    entry.second.state_ = state_;
+    if (entry.second.ref_cnt_ > 0) {
+      cb_ret_ = OB_EAGAIN;
+    } else {
+      old_vec_out_ = entry.second.cid_vec_;
+      entry.second.cid_vec_ = new_vec_;
+      entry.second.create_scn_ = create_scn_;
+      entry.second.delet_scn_.set_max();
+      entry.second.state_ = state_;
+      ++entry.second.posting_list_version_;
+    }
     return common::OB_SUCCESS;
   }
+  int cb_ret_;
 private:
   float *new_vec_;
   SCN create_scn_;
@@ -1134,6 +1167,10 @@ int ObIvfMapCentCache::add_centroid(int64_t cid, const float *vec, int64_t dim,
           if (OB_FAIL(cent_map_.atomic_refactored(cid, replace_fn))) {
             sub_mem_ctx_->Deallocate(buf);
             LOG_WARN("fail to atomic replace centroid", K(ret), K(cid));
+          } else if (OB_SUCCESS != replace_fn.cb_ret_) {
+            ret = replace_fn.cb_ret_;
+            sub_mem_ctx_->Deallocate(buf);
+            LOG_TRACE("centroid replacement blocked by active readers", K(ret), K(cid));
           } else if (OB_NOT_NULL(old_vec)) {
             sub_mem_ctx_->Deallocate(old_vec);
           }
@@ -1142,7 +1179,7 @@ int ObIvfMapCentCache::add_centroid(int64_t cid, const float *vec, int64_t dim,
           LOG_WARN("fail to set cent_map in add_centroid", K(ret), K(cid));
         }
       } else {
-        count_++;
+        (void)ATOMIC_AAF(&count_, 1);
       }
     }
   }
@@ -1196,6 +1233,7 @@ public:
   {
     ObCentroidInfo &existing = entry.second;
     existing.posting_list_count_ = info_.posting_list_count_;
+    ++existing.posting_list_version_;
     existing.state_ = info_.state_;
     return common::OB_SUCCESS;
   }
@@ -1445,10 +1483,11 @@ int ObIvfMapCentCache::acquire_visible_centroids(const SCN &read_scn,
     // Phase 1: collect cid candidates under per-bucket RLock.
     ObSEArray<int64_t, 64> cids;
     cids.set_attr(ObMemAttr(MTL_ID(), "IvfAcqVis"));
-    if (count_ > 0 && OB_FAIL(cids.reserve(count_))) {
-      LOG_WARN("fail to reserve cids array", K(ret), K(count_));
-    } else if (count_ > 0 && OB_FAIL(out.reserve(count_))) {
-      LOG_WARN("fail to reserve out array", K(ret), K(count_));
+    const int64_t count = get_count();
+    if (count > 0 && OB_FAIL(cids.reserve(count))) {
+      LOG_WARN("fail to reserve cids array", K(ret), K(count));
+    } else if (count > 0 && OB_FAIL(out.reserve(count))) {
+      LOG_WARN("fail to reserve out array", K(ret), K(count));
     } else {
       ObCollectVisibleCidsFn collect_fn(read_scn, cids);
       if (OB_FAIL(cent_map_.foreach_refactored(collect_fn))) {
@@ -1525,9 +1564,7 @@ int ObIvfMapCentCache::try_erase_centroid(int64_t cid, const int64_t min_reserve
           LOG_ERROR("fail to erase cid after marking erasable", K(ret), K(cid));
         } else {
           old_vec_to_free = fn.old_vec_;
-          if (count_ > 0) {
-            --count_;
-          }
+          (void)ATOMIC_AAF(&count_, -1);
           erased = true;
           LOG_INFO("ivf centroid erased", K(cid));
         }
@@ -1669,6 +1706,7 @@ public:
     if (entry.second.posting_list_count_ < 0) {
       entry.second.posting_list_count_ = 0;
     }
+    ++entry.second.posting_list_version_;
     return common::OB_SUCCESS;
   }
 private:
@@ -1706,22 +1744,24 @@ int ObIvfMapCentCache::adjust_posting_list_length_(int64_t center_id, int64_t de
 }
 
 int ObIvfMapCentCache::reconcile_posting_list_length(
-    int64_t center_id, int64_t expected_count, int64_t persistent_count)
+    int64_t center_id, const ObCentroidInfo &expected_info, int64_t persistent_count)
 {
   struct ReconcileCountFn
   {
-    ReconcileCountFn(int64_t expected, int64_t count)
+    ReconcileCountFn(const ObCentroidInfo &expected, int64_t count)
       : expected_(expected), count_(count), ret_(OB_SUCCESS) {}
     int operator()(common::hash::HashMapPair<int64_t, ObCentroidInfo> &entry)
     {
-      if (entry.second.posting_list_count_ != expected_) {
+      if (entry.second.create_scn_ != expected_.create_scn_
+          || entry.second.posting_list_version_ != expected_.posting_list_version_) {
         ret_ = OB_EAGAIN;
       } else {
         entry.second.posting_list_count_ = static_cast<int32_t>(count_);
+        ++entry.second.posting_list_version_;
       }
       return ret_;
     }
-    int64_t expected_;
+    const ObCentroidInfo &expected_;
     int64_t count_;
     int ret_;
   };
@@ -1731,7 +1771,7 @@ int ObIvfMapCentCache::reconcile_posting_list_length(
   } else if (!cent_map_.created()) {
     ret = OB_NOT_INIT;
   } else {
-    ReconcileCountFn fn(expected_count, persistent_count);
+    ReconcileCountFn fn(expected_info, persistent_count);
     if (OB_FAIL(cent_map_.atomic_refactored(center_id, fn))) {
       if (OB_HASH_NOT_EXIST == ret) {
         ret = OB_ENTRY_NOT_EXIST;
@@ -1977,7 +2017,7 @@ int ObIvfMapCentCache::print_details(char *buf, int64_t buf_len, int64_t &pos) c
   // so the ObIvfMapCentCache object itself remains valid for the duration of this
   // call.  get_cent_vec_dim() / get_count() in the caller read members that are
   // either immutable post-init (cent_vec_dim_) or best-effort display values
-  // (count_), and are safe to read without additional synchronisation.
+  // (count_, read atomically), and are safe to read without additional synchronisation.
   if (!cent_map_.created()) {
     ret = OB_NOT_INIT;
     LOG_WARN("cent_map not created", K(ret));

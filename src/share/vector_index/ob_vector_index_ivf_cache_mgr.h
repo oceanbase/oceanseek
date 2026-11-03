@@ -155,6 +155,7 @@ struct ObCentroidInfo
       : cid_(0), cid_vec_(nullptr),
         state_(ObIvfCentroidState::NORMAL),
         posting_list_count_(0),
+        posting_list_version_(0),
         split_retry_after_us_(0),
         ref_cnt_(0)
   {
@@ -168,6 +169,7 @@ struct ObCentroidInfo
   SCN delet_scn_;
   ObIvfCentroidState state_;
   int32_t posting_list_count_; // 该聚类中心包含的点个数, 用于聚类中心点数量统计
+  uint64_t posting_list_version_; // Count mutation token, protected by the bucket lock.
   int64_t split_retry_after_us_; // In-memory cooldown deadline after a degenerate split.
   // 跨锁持有 cid_vec_ 的活跃使用者数量；仅在 cent_map_ 的桶级写锁内 ++/-- 。
   // try_erase_centroid 仅在 ref_cnt_ == 0 时才会真正释放 cid_vec_。
@@ -194,7 +196,8 @@ struct ObCentroidInfo
            && info.delet_scn_.get_val_for_tx() < min_reserved_snapshot;
   }
   TO_STRING_KV(KP_(cid_vec), K_(create_scn), K_(delet_scn), K_(state),
-               K_(posting_list_count), K_(split_retry_after_us), K_(ref_cnt));
+               K_(posting_list_count), K_(posting_list_version),
+               K_(split_retry_after_us), K_(ref_cnt));
 };
 
 enum IvfCacheType {
@@ -565,7 +568,7 @@ public:
   int decr_posting_list_length(int64_t center_id, int64_t length = 1);
   // Reconcile only the derived count, without overwriting lifecycle state.
   // A concurrent count change rejects the stale observation with OB_EAGAIN.
-  int reconcile_posting_list_length(int64_t center_id, int64_t expected_count,
+  int reconcile_posting_list_length(int64_t center_id, const ObCentroidInfo &expected_info,
                                     int64_t persistent_count);
   int set_split_retry_after_us(int64_t center_id, int64_t retry_after_us);
   int update_centroid_state(int64_t center_id, ObIvfCentroidState new_state);
@@ -592,7 +595,9 @@ public:
   int print_details(char *buf, int64_t buf_len, int64_t &pos) const;
   int release_centroids() override;
   int64_t get_capacity() const override { return cent_map_.size(); }
-  int64_t get_count() const override { return count_; }
+  int64_t get_count() const override { return ATOMIC_LOAD(&count_); }
+  // Include logically deleted entries: their CID must not be reused before GC.
+  int get_max_center_id(int64_t &max_cid) const;
   int64_t get_nlist_param() const { return nlist_param_; }
   int64_t get_cent_vec_dim() const override { return cent_vec_dim_; }
   int64_t get_nlist() const override;
@@ -714,7 +719,7 @@ public:
     return ret;
   }
 
-  TO_STRING_KV(K(cent_vec_dim_), K(count_));
+  TO_STRING_KV(K(cent_vec_dim_), "count", get_count());
 
 private:
   class SetSplitRetryAfterFn

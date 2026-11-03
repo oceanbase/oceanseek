@@ -1122,34 +1122,31 @@ int ObSpfreshSplitTask::migrate_vectors_(
 int ObSpfreshSplitTask::allocate_child_center_ids_(int64_t num_children)
 {
   int ret = OB_SUCCESS;
-  int probe_ret = OB_SUCCESS;
   uint64_t kv_max_cid = 0;
-  int64_t max_cid = 0;
-  ObCentroidInfo probe_info;
+  int64_t cache_max_cid = 0;
+  uint64_t max_cid = 0;
 
-  if (OB_UNLIKELY(num_children <= 0)) {
+  if (OB_UNLIKELY(num_children <= 0) || OB_ISNULL(cache_)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid num_children", K(ret), K(num_children), K_(center_id));
+    LOG_WARN("invalid child center allocation argument", K(ret), K(num_children), KP_(cache));
   } else if (OB_FAIL(table_helper_.get_max_center_id_from_kv(kv_max_cid))) {
     LOG_WARN("failed to get max center_id from KV", K(ret), K_(center_id));
-  } else if (kv_max_cid > static_cast<uint64_t>(INT64_MAX)
-             || static_cast<uint64_t>(num_children)
-                > static_cast<uint64_t>(INT64_MAX) - kv_max_cid) {
-    ret = OB_SIZE_OVERFLOW;
-    LOG_WARN("center_id allocation would overflow int64", K(ret),
-             K(kv_max_cid), K(num_children), K_(center_id));
+  } else if (OB_FAIL(cache_->get_max_center_id(cache_max_cid))) {
+    LOG_WARN("failed to get max center_id from cache", K(ret), K_(center_id));
   } else {
-    max_cid = static_cast<int64_t>(kv_max_cid);
-    if (kv_max_cid > 0 && OB_NOT_NULL(cache_)) {
-      probe_ret = cache_->get_center_info(max_cid, SCN::max_scn(), probe_info);
-      if (OB_SUCCESS != probe_ret) {
-        LOG_WARN("[SPFRESH] cache missing KV max centroid",
-                 K(probe_ret), K_(center_id), K(kv_max_cid));
-      }
+    // The caller holds the per-tablet migrate mutex through commit. Keep ids
+    // still present in cache reserved, even after their KV metadata is deleted.
+    max_cid = std::max(kv_max_cid, static_cast<uint64_t>(cache_max_cid));
+    if (max_cid > static_cast<uint64_t>(INT64_MAX)
+        || static_cast<uint64_t>(num_children)
+           > static_cast<uint64_t>(INT64_MAX) - max_cid) {
+      ret = OB_SIZE_OVERFLOW;
+      LOG_WARN("center_id allocation would overflow int64", K(ret),
+               K(max_cid), K(num_children), K_(center_id));
     }
     for (int64_t i = 1; OB_SUCC(ret) && i <= num_children; ++i) {
-      if (OB_FAIL(child_center_ids_.push_back(max_cid + i))) {
-        LOG_WARN("failed to push child center id", K(ret), "child_id", max_cid + i);
+      if (OB_FAIL(child_center_ids_.push_back(static_cast<int64_t>(max_cid) + i))) {
+        LOG_WARN("failed to push child center id", K(ret), K(max_cid), K(i));
       }
     }
   }
