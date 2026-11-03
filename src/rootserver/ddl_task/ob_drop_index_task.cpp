@@ -203,6 +203,7 @@ int ObDropIndexTask::set_unusable(const ObDDLTaskStatus new_status)
 int ObDropIndexTask::drop_index_impl()
 {
   int ret = OB_SUCCESS;
+  uint64_t data_table_id = OB_INVALID_ID;
   ObSchemaGetterGuard schema_guard;
   const ObDatabaseSchema *database_schema = nullptr;
   const ObTableSchema *data_table_schema = nullptr;
@@ -238,9 +239,10 @@ int ObDropIndexTask::drop_index_impl()
   } else if (OB_UNLIKELY(nullptr == database_schema || nullptr == data_table_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get null schema", K(ret), KP(database_schema), KP(data_table_schema));
+  } else if (OB_FALSE_IT(data_table_id = data_table_schema->get_data_table_id())) {
   } else if (data_table_schema->is_search_def_index()
-    && OB_FAIL(schema_guard.get_table_schema(tenant_id_, data_table_schema->get_data_table_id(), data_table_schema))) {
-    LOG_WARN("get data table schema failed", K(ret), K(data_table_schema->get_data_table_id()));
+    && OB_FAIL(schema_guard.get_table_schema(tenant_id_, data_table_id, data_table_schema))) {
+    LOG_WARN("get data table schema failed", K(ret), K(data_table_id));
   } else if (nullptr == data_table_schema) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get null schema", K(ret), KP(database_schema), KP(data_table_schema));

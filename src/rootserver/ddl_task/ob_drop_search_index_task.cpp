@@ -559,6 +559,7 @@ int ObDropSearchIndexTask::create_drop_index_task(
     int64_t &task_id)
 {
   int ret = OB_SUCCESS;
+  uint64_t data_table_id = OB_INVALID_ID;
   const ObTableSchema *index_schema = nullptr;
   const ObDatabaseSchema *database_schema = nullptr;
   const ObTableSchema *data_table_schema = nullptr;
@@ -594,9 +595,10 @@ int ObDropSearchIndexTask::create_drop_index_task(
   } else if (OB_UNLIKELY(nullptr == database_schema || nullptr == data_table_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected error, schema is nullptr", K(ret), KP(database_schema), KP(data_table_schema));
+  } else if (OB_FALSE_IT(data_table_id = data_table_schema->get_data_table_id())) {
   } else if (data_table_schema->is_search_def_index()
-    && OB_FAIL(guard.get_table_schema(tenant_id_, data_table_schema->get_data_table_id(), data_table_schema))) {
-    LOG_WARN("fail to get data table schema", K(ret), K(data_table_schema->get_data_table_id()));
+    && OB_FAIL(guard.get_table_schema(tenant_id_, data_table_id, data_table_schema))) {
+    LOG_WARN("fail to get data table schema", K(ret), K(data_table_id));
   } else if (nullptr == data_table_schema) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected error, schema is nullptr", K(ret), KP(database_schema), KP(data_table_schema));
@@ -691,6 +693,7 @@ int ObDropSearchIndexTask::cleanup_impl()
   } else {
     ObSchemaGetterGuard schema_guard;
     const ObTableSchema *data_table_schema = nullptr;
+    uint64_t data_table_id = OB_INVALID_ID;
     ObTableLockOwnerID owner_id;
     ObMySQLTransaction trans;
     if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(tenant_id_,
@@ -703,11 +706,12 @@ int ObDropSearchIndexTask::cleanup_impl()
     } else if (OB_UNLIKELY(nullptr == data_table_schema)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("data table schema is nullptr", K(ret), KP(data_table_schema));
+    } else if (OB_FALSE_IT(data_table_id = data_table_schema->get_data_table_id())) {
     } else if (data_table_schema->is_search_def_index()
       && OB_FAIL(schema_guard.get_table_schema(tenant_id_,
-                                               data_table_schema->get_data_table_id(),
+                                               data_table_id,
                                                data_table_schema))) {
-      LOG_WARN("fail to get data table schema", K(ret), K(data_table_schema->get_data_table_id()));
+      LOG_WARN("fail to get data table schema", K(ret), K(data_table_id));
     } else if (nullptr == data_table_schema) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected error, schema is nullptr", K(ret), KP(data_table_schema));
