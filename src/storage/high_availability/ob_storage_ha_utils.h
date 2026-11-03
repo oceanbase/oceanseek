@@ -8,6 +8,7 @@
 #include "lib/mysqlclient/ob_isql_client.h"
 #include "ob_storage_ha_struct.h"
 #include "share/ob_storage_ha_diagnose_struct.h"
+#include "share/restore/ob_physical_restore_info.h"
 #include "ob_transfer_struct.h"
 #include "storage/ob_storage_rpc.h"
 
@@ -25,6 +26,8 @@ class ObMigrationSourceValidationResult;
 class ObStorageHAUtils
 {
 public:
+  static int get_tenant_restore_status(
+      const uint64_t tenant_id, bool &is_in_restore, share::PhysicalRestoreStatus &status);
   static int get_ls_leader(const uint64_t tenant_id, const share::ObLSID &ls_id, common::ObAddr &leader_addr);
   static int check_tablet_replica_validity(const uint64_t tenant_id, const share::ObLSID &ls_id,
       const common::ObAddr &addr, const common::ObTabletID &tablet_id, common::ObISQLClient &sql_client);

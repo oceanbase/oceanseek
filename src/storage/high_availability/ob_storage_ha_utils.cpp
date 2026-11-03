@@ -5,6 +5,8 @@
 
 #include "ob_storage_ha_utils.h"
 #include "share/tablet/ob_tablet_table_operator.h"
+#include "share/ob_tenant_info_proxy.h"
+#include "share/restore/ob_physical_restore_table_operator.h"
 #include "share/ob_global_merge_table_operator.h"
 #include "share/ob_tablet_replica_checksum_operator.h"
 #include "observer/ob_server_event_history_table_operator.h"
@@ -29,6 +31,54 @@ namespace storage
 ERRSIM_POINT_DEF(EN_TRANSFER_ALLOW_RETRY);
 ERRSIM_POINT_DEF(EN_CHECK_LOG_NEED_REBUILD);
 ERRSIM_POINT_DEF(EN_TRANSFER_INC_MAJOR_BACKFILL);
+
+int ObStorageHAUtils::get_tenant_restore_status(
+    const uint64_t tenant_id,
+    bool &is_in_restore,
+    share::PhysicalRestoreStatus &status)
+{
+  int ret = OB_SUCCESS;
+  ObAllTenantInfo all_tenant_info;
+  status = PHYSICAL_RESTORE_MAX_STATUS;
+  is_in_restore = true;
+
+  if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sql proxy should not be null", K(ret), K(tenant_id));
+  } else if (OB_FAIL(ObAllTenantInfoProxy::load_tenant_info(
+              tenant_id, GCTX.sql_proxy_, false/*for_update*/, all_tenant_info))) {
+    LOG_WARN("fail to load tenant info", K(ret), K(tenant_id));
+  } else if (!all_tenant_info.is_restore()) {
+    is_in_restore = false;
+  } else {
+    share::ObPhysicalRestoreTableOperator restore_table_operator;
+    if (OB_FAIL(restore_table_operator.init(GCTX.sql_proxy_, tenant_id, share::OBCG_STORAGE))) {
+      LOG_WARN("fail to init restore table operator", K(ret), K(tenant_id));
+    } else {
+      HEAP_VAR(ObPhysicalRestoreJob, job_info) {
+        if (OB_FAIL(restore_table_operator.get_job_by_tenant_id(tenant_id, job_info))) {
+          ObAllTenantInfo curr_tenant_info;
+          if (OB_ENTRY_NOT_EXIST == ret) {
+            if (OB_FAIL(ObAllTenantInfoProxy::load_tenant_info(
+                        tenant_id, GCTX.sql_proxy_, false/*for_update*/, curr_tenant_info))) {
+              LOG_WARN("fail to load tenant info", K(ret), K(tenant_id));
+            } else if (curr_tenant_info.is_restore()) {
+              status = share::PhysicalRestoreStatus::PHYSICAL_RESTORE_FAIL;
+            } else {
+              is_in_restore = false;
+              ret = OB_SUCCESS;
+            }
+          } else {
+            LOG_WARN("fail to get restore job by tenant id", K(ret), K(tenant_id));
+          }
+        } else {
+          status = job_info.get_status();
+        }
+      }
+    }
+  }
+  return ret;
+}
 
 int ObStorageHAUtils::get_ls_leader(const uint64_t tenant_id, const share::ObLSID &ls_id, common::ObAddr &leader)
 {

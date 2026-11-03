@@ -14,6 +14,7 @@
 #include "storage/meta_store/ob_tenant_storage_meta_service.h"
 #include "storage/tx/ob_trans_service.h"
 #include "storage/high_availability/ob_tenant_startup_status.h"
+#include "storage/high_availability/ob_storage_ha_utils.h"
 
 namespace oceanbase
 {
@@ -1392,6 +1393,9 @@ int ObLSService::create_ls_for_ha(
     LOG_WARN("failed to trans migration op", K(ret), K(arg), K(task_id));
   } else if (OB_FAIL(get_restore_status_(restore_status))) {
     LOG_WARN("failed to get restore status", K(ret), K(arg), K(task_id));
+  } else if (restore_status.is_ss_restore_start()
+      && OB_FAIL(check_restore_status_for_ha_(arg.type_))) {
+    LOG_WARN("cannot create migration target in current restore stage", K(ret), K(arg), K(task_id));
   }
 #ifdef OB_BUILD_SHARED_STORAGE
   // SSLOG_LS removed: skip sslog ls existence check.
@@ -1644,6 +1648,43 @@ int ObLSService::iterate_diagnose(const ObFunction<int(const storage::ObLS &ls)>
     }
     if (OB_ITER_END == ret) {
       ret = OB_SUCCESS;
+    }
+  }
+  return ret;
+}
+
+int ObLSService::check_restore_status_for_ha_(const ObMigrationOpType::TYPE op_type)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = tenant_id_;
+  PhysicalRestoreStatus status = PHYSICAL_RESTORE_MAX_STATUS;
+  bool is_in_restore = false;
+
+  if (OB_FAIL(ObStorageHAUtils::get_tenant_restore_status(tenant_id, is_in_restore, status))) {
+    LOG_WARN("failed to get tenant restore status", K(ret), K(tenant_id));
+  } else if (!is_in_restore) {
+  } else if (ObMigrationOpType::REPLACE_LS_OP == op_type) {
+    ret = OB_OP_NOT_ALLOW;
+    LOG_WARN("cannot do replace ls when tenant is in restore", K(ret), K(tenant_id));
+  } else {
+    switch (status) {
+      case PHYSICAL_RESTORE_PRE:
+      case PHYSICAL_RESTORE_CREATE_INIT_LS:
+      case PHYSICAL_SS_RESTORE_GEN_TASK:
+      case PHYSICAL_SS_RESTORE_DATA:
+      case PHYSICAL_SS_RESTORE_LS: {
+        ret = OB_SRC_DO_NOT_ALLOWED_MIGRATE;
+        LOG_INFO("ls migration waits for tenant restore to reach log replay",
+            K(ret), K(tenant_id), K(op_type), K(status));
+        break;
+      }
+      case PHYSICAL_RESTORE_FAIL: {
+        ret = OB_RESTORE_TENANT_FAILED;
+        LOG_WARN("restore failed, cannot migrate", K(ret), K(tenant_id));
+        break;
+      }
+      default:
+        break;
     }
   }
   return ret;

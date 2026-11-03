@@ -199,6 +199,7 @@ static const char* disaster_recovery_task_ret_comment_strs[] = {
   "[rs] task can not persist because conflict with clone operation",
   "[rs] task can not execute because config version not match",
   "[rs] task can not execute because need generate replace replica task",
+  "[storage] migration waits for tenant restore to reach log replay; retry later",
   ""/*default max*/
 };
 
@@ -881,7 +882,9 @@ int ObMigrateLSReplicaTask::execute(
     LOG_WARN("fail to init arg", KR(ret));
   } else if (OB_FAIL(rpc_proxy.to(get_dst_server())
         .by(get_tenant_id()).ls_migrate_replica(arg))) {
-    ret_comment = ObDRTaskRetComment::FAIL_TO_SEND_RPC;
+    ret_comment = OB_SRC_DO_NOT_ALLOWED_MIGRATE == ret
+        ? ObDRTaskRetComment::CANNOT_EXECUTE_DUE_TO_RESTORE
+        : ObDRTaskRetComment::FAIL_TO_SEND_RPC;
     LOG_WARN("fail to send ls migrate replica rpc", KR(ret), K(arg));
   } else {
     LOG_INFO("start to execute ls migrate replica", K(arg));
@@ -1167,7 +1170,9 @@ int ObAddLSReplicaTask::execute(
     LOG_WARN("fail to init arg", KR(ret));
   } else if (OB_FAIL(rpc_proxy.to(get_dst_server())
         .by(get_tenant_id()).ls_add_replica(arg))) {
-    ret_comment = ObDRTaskRetComment::FAIL_TO_SEND_RPC;
+    ret_comment = OB_SRC_DO_NOT_ALLOWED_MIGRATE == ret
+        ? ObDRTaskRetComment::CANNOT_EXECUTE_DUE_TO_RESTORE
+        : ObDRTaskRetComment::FAIL_TO_SEND_RPC;
     LOG_WARN("fail to send ls add replica rpc", KR(ret), K(arg));
   } else {
     LOG_INFO("start to execute ls add replica", K(arg));

@@ -11,7 +11,6 @@
 #include "share/scheduler/ob_dag_warning_history_mgr.h"
 #include "storage/high_availability/ob_storage_ha_utils.h"
 #include "share/location_cache/ob_location_service.h"
-#include "share/restore/ob_physical_restore_table_operator.h"
 #include "rootserver/restore/ob_restore_util.h"
 #include "storage/meta_store/ob_tenant_storage_meta_service.h"
 #include "storage/incremental/atomic_protocol/ob_atomic_protocol_util.h"
@@ -914,8 +913,6 @@ int ObSSStartMigrationTask::process()
     LOG_WARN("failed to prepare ls checkpoint for migration", K(ret), KPC_(ctx));
   } else if (OB_FAIL(ls_->offline())) {
     LOG_WARN("failed to offline ls", K(ret), KPC_(ctx));
-  } else if (OB_FAIL(check_can_do_migrate_())) {
-    LOG_WARN("fail to check before ls migrate", K(ret));
   } else if (OB_FAIL(ls_->get_tablet_svr()->offline_for_ss_migration())) {
     LOG_WARN("failed to offline for ss migration", K(ret), KPC(ctx_));
   } else if ((ObMigrationOpType::TYPE::REPLACE_LS_OP != ctx_->arg_.type_) && OB_FAIL(report_ls_meta_table_())) {
@@ -956,98 +953,6 @@ int ObSSStartMigrationTask::process()
     }
   }
 
-  return ret;
-}
-
-int ObSSStartMigrationTask::check_can_do_migrate_()
-{
-  int ret = OB_SUCCESS;
-  ObAllTenantInfo all_tenant_info;
-  const uint64_t tenant_id = ctx_->tenant_id_;
-  PhysicalRestoreStatus status = PHYSICAL_RESTORE_MAX_STATUS;
-  bool is_in_restore = false;
-
-  if (ctx_->is_ls_restore()) {
-    //no need to check
-  } else if (OB_FAIL(get_tenant_restore_status_(is_in_restore, status))) {
-    LOG_WARN("fail to get tenant restore status", K(ret));
-  } else if (is_in_restore && (ObMigrationOpType::TYPE::REPLACE_LS_OP == ctx_->arg_.type_)) {
-    ret = OB_OP_NOT_ALLOW;
-    LOG_WARN("cannot do replace ls when tenant is in restore", K(ret), K(tenant_id));
-  } else if (is_in_restore && OB_FAIL(check_restore_status_(status))) {
-    LOG_WARN("fail to check restore status", K(ret), K(status));
-  }
-  return ret;
-}
-
-int ObSSStartMigrationTask::get_tenant_restore_status_(
-    bool &is_in_restore,
-    share::PhysicalRestoreStatus &status)
-{
-  int ret = OB_SUCCESS;
-  ObAllTenantInfo all_tenant_info;
-  const uint64_t tenant_id = ctx_->tenant_id_;
-  status = PHYSICAL_RESTORE_MAX_STATUS;
-  is_in_restore = true;
-
-  if (OB_FAIL(ObAllTenantInfoProxy::load_tenant_info(
-              tenant_id, GCTX.sql_proxy_, false/*for_update*/, all_tenant_info))) {
-    LOG_WARN("fail to load tenant info", K(ret), K(tenant_id));
-  } else if (!all_tenant_info.is_restore()) {
-    is_in_restore = false;
-  } else {
-    share::ObPhysicalRestoreTableOperator restore_table_operator;
-    if (OB_FAIL(restore_table_operator.init(GCTX.sql_proxy_, tenant_id, share::OBCG_STORAGE))) {
-      LOG_WARN("fail to init restore table operator", K(ret), K(tenant_id));
-    } else {
-      HEAP_VAR(ObPhysicalRestoreJob, job_info) {
-        if (OB_FAIL(restore_table_operator.get_job_by_tenant_id(tenant_id, job_info))) {
-          ObAllTenantInfo curr_tenant_info;
-          if (OB_ENTRY_NOT_EXIST == ret) {
-            if (OB_FAIL(ObAllTenantInfoProxy::load_tenant_info(
-                        tenant_id, GCTX.sql_proxy_, false/*for_update*/, curr_tenant_info))) {
-              LOG_WARN("fail to load tenant info", K(ret), K(tenant_id));
-            } else if (curr_tenant_info.is_restore()) {
-              status = share::PhysicalRestoreStatus::PHYSICAL_RESTORE_FAIL;
-            } else {
-              is_in_restore = false;
-              ret = OB_SUCCESS;
-            }
-          } else {
-            LOG_WARN("fail to get restore job by tenant id", K(ret), K(tenant_id));
-          }
-        } else {
-          status = job_info.get_status();
-        }
-      }
-    }
-  }
-  return ret;
-}
-
-
-int ObSSStartMigrationTask::check_restore_status_(const share::PhysicalRestoreStatus &status)
-{
-  int ret = OB_SUCCESS;
-  switch (status) {
-    case share::PhysicalRestoreStatus::PHYSICAL_RESTORE_PRE:
-    case share::PhysicalRestoreStatus::PHYSICAL_RESTORE_CREATE_INIT_LS:
-    case share::PhysicalRestoreStatus::PHYSICAL_SS_RESTORE_GEN_TASK:
-    case share::PhysicalRestoreStatus::PHYSICAL_SS_RESTORE_DATA:
-    case share::PhysicalRestoreStatus::PHYSICAL_SS_RESTORE_LS: {
-      ret = OB_SRC_DO_NOT_ALLOWED_MIGRATE;
-      LOG_WARN("not all ls are restoring clog, cannot migrate, wait later", K(ret));
-      break;
-    }
-    case share::PhysicalRestoreStatus::PHYSICAL_RESTORE_FAIL: {
-      ret = OB_RESTORE_TENANT_FAILED;
-      LOG_WARN("restore failed, can not migrate", K(ret));
-      break;
-    }
-    default:
-      ret = OB_SUCCESS;
-      break;
-  }
   return ret;
 }
 
@@ -1449,7 +1354,7 @@ int ObSSStartMigrationTask::try_update_warmup_src_info_()
       if (OB_DATA_SOURCE_NOT_EXIST == tmp_ret) {
         bool is_in_restore = false;
         PhysicalRestoreStatus restore_status = PHYSICAL_RESTORE_MAX_STATUS;
-        if (OB_TMP_FAIL(get_tenant_restore_status_(is_in_restore, restore_status))) {
+        if (OB_TMP_FAIL(ObStorageHAUtils::get_tenant_restore_status(ctx_->tenant_id_, is_in_restore, restore_status))) {
           LOG_WARN("failed to get tenant restore status for warmup source fallback",
               K(tmp_ret), K(ret), KPC(ctx_));
         } else if (is_in_restore

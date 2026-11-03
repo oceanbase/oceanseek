@@ -236,6 +236,7 @@ private:
   bool is_ls_to_restore_(const obrpc::ObCreateLSArg &arg) const;
   bool is_ls_to_clone_(const obrpc::ObCreateLSArg &arg) const;
   bool need_create_inner_tablets_(const obrpc::ObCreateLSArg &arg) const;
+  int check_restore_status_for_ha_(const ObMigrationOpType::TYPE op_type);
   int get_restore_status_(
       share::ObLSRestoreStatus &restore_status);
   ObLSRestoreStatus get_restore_status_by_tenant_role_(const ObTenantRole& tenant_role);

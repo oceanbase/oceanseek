@@ -201,11 +201,6 @@ private:
   int get_tx_data_table_filled_tx_scn_(share::SCN &filled_tx_scn);
   int join_learner_list_();
   int try_update_warmup_src_info_();
-  int check_can_do_migrate_();
-  int get_tenant_restore_status_(
-      bool &is_in_restore, 
-      share::PhysicalRestoreStatus &status);
-  int check_restore_status_(const share::PhysicalRestoreStatus &status);
   int report_ls_meta_table_();
   int wait_meta_ls_online_();
   int load_ls_ckpt_if_needed_();
