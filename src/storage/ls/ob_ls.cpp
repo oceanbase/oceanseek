@@ -2408,12 +2408,27 @@ int ObLS::logstream_freeze(const int64_t trace_id,
   return ret;
 }
 
+int ObLS::check_migration_status_for_freeze()
+{
+  int ret = OB_SUCCESS;
+  ObMigrationStatus migration_status = ObMigrationStatus::OB_MIGRATION_STATUS_MAX;
+  if (OB_FAIL(get_migration_status(migration_status))) {
+    LOG_WARN("failed to get migration status for freeze", K(ret), K(get_ls_id()));
+  } else if (ObMigrationStatusHelper::check_migration_status_is_fail(migration_status)) {
+    // This replica must be discarded. Do not keep GC waiting for freeze readers.
+    ret = OB_CANCELED;
+  }
+  return ret;
+}
+
 int ObLS::logstream_freeze_task(const int64_t trace_id,
                                 const int64_t abs_timeout_ts)
 {
   int ret = OB_SUCCESS;
   const int64_t start_time = ObClockGenerator::getClock();
-  {
+  if (OB_FAIL(check_migration_status_for_freeze())) {
+    STORAGE_LOG(WARN, "ls migration does not allow freeze", K(ret), K(get_ls_id()));
+  } else {
     int64_t read_lock = LSLOCKALL;
     int64_t write_lock = 0;
     ObLSLockGuard lock_myself(this, lock_, read_lock, write_lock, abs_timeout_ts);
@@ -2426,6 +2441,8 @@ int ObLS::logstream_freeze_task(const int64_t trace_id,
     } else if (OB_UNLIKELY(is_offline())) {
       ret = OB_LS_OFFLINE;
       STORAGE_LOG(WARN, "offline ls not allowed freeze", K(ret), K_(ls_meta));
+    } else if (OB_FAIL(check_migration_status_for_freeze())) {
+      STORAGE_LOG(WARN, "ls migration does not allow freeze", K(ret), K_(ls_meta));
     } else if (OB_FAIL(ls_freezer_.logstream_freeze(trace_id))) {
       STORAGE_LOG(WARN, "logstream freeze failed", K(ret), K_(ls_meta));
     }
@@ -2462,6 +2479,8 @@ int ObLS::tablet_freeze(const ObTabletID &tablet_id,
   if (!is_valid_freeze_source(source)) {
     ret = OB_ERR_UNEXPECTED;
     TRANS_LOG(ERROR, "unexpected freeze source", K(source));
+  } else if (OB_FAIL(check_migration_status_for_freeze())) {
+    STORAGE_LOG(WARN, "ls migration does not allow tablet freeze", K(ret), K(get_ls_id()));
   } else if (tablet_id.is_ls_inner_tablet()) {
     ret = ls_freezer_.ls_inner_tablet_freeze(tablet_id, freeze_trace_id);
   } else {
@@ -2495,6 +2514,8 @@ int ObLS::tablet_freeze(const int64_t trace_id,
   if (!is_valid_freeze_source(source)) {
     ret = OB_ERR_UNEXPECTED;
     TRANS_LOG(ERROR, "unexpected freeze source", K(source));
+  } else if (OB_FAIL(check_migration_status_for_freeze())) {
+    STORAGE_LOG(WARN, "ls migration does not allow tablet freeze", K(ret), K(get_ls_id()));
   } else if (need_rewrite_meta && (!is_sync)) {
     ret = OB_NOT_SUPPORTED;
     STORAGE_LOG(ERROR,
@@ -2543,12 +2564,14 @@ int ObLS::tablet_freeze_task(const int64_t trace_id,
                              const int64_t freeze_epoch)
 {
   int ret = OB_SUCCESS;
-
   bool print_warn_log = false;
   const int64_t start_time = ObClockGenerator::getClock();
   ObSEArray<ObTableHandleV2, 32> frozen_memtable_handles;
   ObSEArray<ObTabletID, 32> freeze_failed_tablets;
-  {
+  // Reject failed replicas before taking a read lock, and recheck under it.
+  if (OB_FAIL(check_migration_status_for_freeze())) {
+    STORAGE_LOG(WARN, "ls migration does not allow freeze", K(ret), K(get_ls_id()));
+  } else {
     int64_t read_lock = LSLOCKALL;
     int64_t write_lock = 0;
     ObLSLockGuard lock_myself(this, lock_, read_lock, write_lock, abs_timeout_ts);
@@ -2561,6 +2584,8 @@ int ObLS::tablet_freeze_task(const int64_t trace_id,
     } else if (OB_UNLIKELY(is_offline())) {
       ret = OB_LS_OFFLINE;
       STORAGE_LOG(WARN, "ls has offlined", K(ret), K_(ls_meta));
+    } else if (OB_FAIL(check_migration_status_for_freeze())) {
+      STORAGE_LOG(WARN, "ls migration does not allow freeze", K(ret), K_(ls_meta));
     } else if (OB_FAIL(ls_freezer_.tablet_freeze(
                    trace_id, tablet_ids, need_rewrite_meta, frozen_memtable_handles, freeze_failed_tablets))) {
       if (REACH_TIME_INTERVAL(1LL * 1000LL * 1000LL)) {
@@ -2580,7 +2605,7 @@ int ObLS::tablet_freeze_task(const int64_t trace_id,
       // some tablet freeze failed need retry
       ret = OB_EAGAIN;
     }
-    if (!is_sync) {
+    if (!is_sync && OB_CANCELED != ret) {
       (void)record_async_freeze_tablets_(freeze_failed_tablets, freeze_epoch);
     }
   }

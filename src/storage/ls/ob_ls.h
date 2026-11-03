@@ -978,6 +978,7 @@ public:
                        const ObFreezeSourceFlag source = ObFreezeSourceFlag::INVALID_SOURCE);
   int logstream_freeze_task(const int64_t trace_id,
                             const int64_t abs_timeout_ts);
+  int check_migration_status_for_freeze();
 
   int tablet_freeze(const ObTabletID &tablet_id,
                     const bool is_sync,

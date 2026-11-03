@@ -318,9 +318,11 @@ private:
   int set_freeze_flag_without_inc_freeze_clock();
   int loop_set_freeze_flag(const int64_t max_loop_time);
   void unset_freeze_();
+  void unset_freeze_flag_();
   void try_freeze_tx_data_();
 
   /* inner subfunctions for freeze process */
+  int submit_checkpoint_task(); // Called with the LS read lock and freeze flag held.
   int submit_log_for_freeze(const bool is_tablet_freeze, const bool is_try);
   void submit_log_if_needed_(ObIArray<ObTableHandleV2> &frozen_memtable_handles);
   void try_submit_log_for_freeze_(const bool is_tablet_freeze);
@@ -368,7 +370,6 @@ private:
                      ObIArray<ObTableHandleV2> &frozen_memtable_handles,
                      ObIArray<ObTabletID> &freeze_failed_tablets);
   int inner_wait_memtable_freeze_finish_(ObTableHandleV2 &memtable_handle);
-  void submit_checkpoint_task();
   bool async_freeze_task_already_exists_(const bool is_ls_freeze);
   bool acquired_exec_async_task_permission_(const bool is_ls_freeze);
 private:

@@ -519,7 +519,7 @@ int ObFreezer::logstream_freeze(int64_t trace_id)
   } else if (OB_FAIL(set_freeze_flag())) {
     FLOG_INFO("[Freezer] freeze is running", K(ret), K(ls_id));
   } else {
-    // ATTENTION! : once freeze_flag is set, ret code must be OB_SUCCESS
+    // Once enqueued, the checkpoint must finish before releasing freeze state.
     max_decided_scn_ = max_decided_scn;
     freeze_snapshot_version_ = freeze_snapshot_version;
 
@@ -533,8 +533,11 @@ int ObFreezer::logstream_freeze(int64_t trace_id)
                                       freeze_snapshot_version,
                                       ObTabletID(ObTabletID::INVALID_TABLET_ID),
                                       false /*need_rewrite_meta*/);
-    (void)submit_checkpoint_task();
-    (void)try_submit_log_for_freeze_(false);
+    if (OB_FAIL(submit_checkpoint_task())) {
+      STORAGE_LOG(WARN, "stop submitting checkpoint freeze task", K(ret), K(ls_id));
+    } else {
+      (void)try_submit_log_for_freeze_(false);
+    }
   }
 
   return ret;
@@ -550,17 +553,38 @@ void ObFreezer::try_submit_log_for_freeze_(const bool is_tablet_freeze)
   }
 }
 
-void ObFreezer::submit_checkpoint_task()
+int ObFreezer::submit_checkpoint_task()
 {
   int ret = OB_SUCCESS;
 
   do {
-    if (OB_FAIL(get_ls_data_checkpoint()->ls_freeze(SCN::max_scn()))) {
+    if (!enable_ || ls_->is_offline() || ls_->is_stopped()) {
+      ret = OB_NOT_RUNNING;
+      TRANS_LOG(WARN, "stop checkpoint submission for offline or stopped ls", K(ret), K(get_ls_id()));
+      break;
+    } else if (OB_FAIL(ls_->check_migration_status_for_freeze())) {
+      TRANS_LOG(WARN, "check migration status before checkpoint submission failed", K(ret), K(get_ls_id()));
+      if (OB_CANCELED == ret) {
+        break;
+      }
+    } else if (OB_FAIL(get_ls_data_checkpoint()->ls_freeze(SCN::max_scn()))) {
       TRANS_LOG(WARN, "[Freezer] data_checkpoint freeze failed", K(ret));
       stat_.add_diagnose_info("data_checkpoint freeze failed");
+    }
+    if (OB_FAIL(ret)) {
       ob_throttle_usleep(100, 0, get_ls_id().id());
     }
   } while (OB_FAIL(ret));
+
+  if (OB_FAIL(ret)) {
+    // No checkpoint was enqueued. The published clock may already have frozen
+    // memtables, so keep the clock and snapshot valid until the next freeze or
+    // LS reset. Only release this submission's flag; there is no worker to wait for.
+    stat_.end_set_freeze_stat(ObFreezeState::FINISH, ObClockGenerator::getClock(), ret);
+    set_need_resubmit_log(false);
+    unset_freeze_flag_();
+  }
+  return ret;
 }
 
 int ObFreezer::wait_ls_freeze_finish()
@@ -698,6 +722,8 @@ void ObFreezer::submit_an_async_freeze_task(const int64_t trace_id, const bool i
   if (OB_UNLIKELY(!enable_) || OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_RUNNING;
     LOG_WARN("freezer is offline, can not freeze now", K(ret), K(ls_id));
+  } else if (OB_FAIL(ls_->check_migration_status_for_freeze())) {
+    LOG_WARN("skip async freeze for failed migration", K(ret), K(ls_id));
   } else if (OB_ISNULL(tenant_freezer = MTL(storage::ObTenantFreezer *))) {
     ret = OB_ERR_UNEXPECTED;
     TRANS_LOG(WARN, "ObTenantFreezer is null", K(ret), K(ls_id));
@@ -1456,7 +1482,12 @@ int ObFreezer::loop_set_freeze_flag(const int64_t max_loop_time)
   int64_t cost_time = 0;
   do {
     ret = OB_SUCCESS;
-    if (OB_FAIL(set_freeze_flag_without_inc_freeze_clock())) {
+    if (OB_FAIL(ls_->check_migration_status_for_freeze())) {
+      TRANS_LOG(WARN, "stop waiting for freeze flag due to migration status", K(ret), K(ls_id));
+      // The caller still holds the LS read lock. Release it so GC can discard
+      // a failed migration even when another freeze never reaches its boundary.
+      break;
+    } else if (OB_FAIL(set_freeze_flag_without_inc_freeze_clock())) {
       cost_time = ObClockGenerator::getClock() - start;
       if (cost_time > max_loop_time) {
         break;
@@ -1516,9 +1547,6 @@ int ObFreezer::set_freeze_flag()
 
 void ObFreezer::unset_freeze_()
 {
-  uint32_t old_v;
-  uint32_t new_v;
-
   // Step1: unset freeze_snapshot_version to invalid value
   freeze_snapshot_version_.reset();
 
@@ -1529,6 +1557,13 @@ void ObFreezer::unset_freeze_()
   set_need_resubmit_log(false);
 
   // Step4: unset freeze_flag to flag the end of freeze
+  unset_freeze_flag_();
+}
+
+void ObFreezer::unset_freeze_flag_()
+{
+  uint32_t old_v;
+  uint32_t new_v;
   // set the first bit 0
   do {
     old_v = ATOMIC_LOAD(&freeze_flag_);
