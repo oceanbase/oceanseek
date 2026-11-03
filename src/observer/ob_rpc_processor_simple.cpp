@@ -5488,6 +5488,12 @@ int ObAsyncIndexRefreshP::process()
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[ASYNC_INDEX] invalid refresh RPC arg", K(ret), K(arg_));
   } else {
+#ifdef ERRSIM
+    // Pause before acquiring tablet ownership so recovery can refresh this partition.
+    if (ASYNC_REFRESH_TYPE_OFFLINE_DDL == arg_.refresh_type_) {
+      DEBUG_SYNC(BEFORE_OFFLINE_ASYNC_INDEX_PARTITION_REFRESH);
+    }
+#endif
     MTL_SWITCH(arg_.tenant_id_) {
       storage::ObLSService *ls_service = MTL(storage::ObLSService*);
       storage::ObLSHandle ls_handle;

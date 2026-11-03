@@ -200,6 +200,92 @@ int ObAsyncIndexRefreshScnTest::get_tablet_handle(
 // The request supplies the logical snapshot; transaction-keyed MDS supplies
 // the independent IncStart/IncCommit SCNs. Do not derive expectations from
 // the output TableKey (or compare two replicas that could both be wrong).
+// Compare the targeted builder against the full-table scheduler metadata, then
+// exercise cache reuse, partition validation and invalidation with real schemas.
+TEST_F(ObAsyncIndexRefreshScnTest, targeted_refresh_metadata_cache)
+{
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(tenant_id_));
+  ASSERT_EQ(OB_SUCCESS, exe_sql(
+      "create table t_refresh_metadata (id int primary key, body varchar(128), doc json, "
+      "async fulltext index ft(body), async search index si(doc)) organization heap "
+      "partition by hash(id) subpartition by hash(id) subpartitions 2 partitions 2"));
+  DEFER({
+    EXPECT_EQ(OB_SUCCESS, exe_sql("drop table if exists t_refresh_metadata"));
+    EXPECT_EQ(OB_SUCCESS, exe_sql("drop table if exists t_refresh_metadata_renamed"));
+  });
+  auto &proxy = get_curr_simple_server().get_sql_proxy2();
+  sqlclient::ObISQLConnection *conn = nullptr;
+  ASSERT_EQ(OB_SUCCESS, proxy.acquire(conn));
+  DEFER(EXPECT_EQ(OB_SUCCESS, proxy.close(conn, OB_SUCCESS)));
+  int64_t table_id = 0;
+  ASSERT_EQ(OB_SUCCESS, get_data_table_id(*conn, "t_refresh_metadata", table_id));
+  ObArenaAllocator allocator;
+  ObAsyncIndexDepProvider provider;
+  ObAsyncIndexDataTableInfo full;
+  ASSERT_EQ(OB_SUCCESS, provider.get_single_table_refresh_info(tenant_id_, table_id, allocator, full));
+  ASSERT_EQ(4, full.data_tablet_infos_.count());
+  ASSERT_EQ(3, full.index_infos_.count()); // FTS, Search Data, shared delete.
+  const auto compare_columns = [](const ObIArray<ObString> &expected, const ObIArray<ObString> &actual) {
+    ASSERT_EQ(expected.count(), actual.count());
+    for (int64_t i = 0; i < expected.count(); ++i) {
+      EXPECT_EQ(expected.at(i), actual.at(i));
+    }
+  };
+  ObAsyncIndexRefreshMetadataCache cache;
+  for (int64_t p = 0; p < full.data_tablet_infos_.count(); ++p) {
+    const auto &data = full.data_tablet_infos_.at(p);
+    for (int64_t i = 0; i < full.index_infos_.count(); ++i) {
+      const auto &index = full.index_infos_.at(i);
+      const ObAsyncIndexDataTableInfo *target = nullptr;
+      ASSERT_EQ(OB_SUCCESS, cache.get(tenant_id_, table_id, data.data_tablet_id_,
+          index.index_table_id_, index.tablet_ids_.at(p), target));
+      ASSERT_NE(nullptr, target);
+      ASSERT_EQ(1, target->data_tablet_infos_.count());
+      ASSERT_EQ(1, target->index_infos_.count());
+      EXPECT_EQ(full.database_name_, target->database_name_);
+      EXPECT_EQ(full.data_table_name_, target->data_table_name_);
+      EXPECT_EQ(full.schema_version_, target->schema_version_);
+      EXPECT_EQ(data.partition_name_, target->data_tablet_infos_.at(0).partition_name_);
+      const auto &actual = target->index_infos_.at(0);
+      EXPECT_EQ(index.index_table_name_, actual.index_table_name_);
+      EXPECT_EQ(index.def_index_table_id_, actual.def_index_table_id_);
+      EXPECT_EQ(index.index_type_, actual.index_type_);
+      EXPECT_EQ(index.enable_newsort_, actual.enable_newsort_);
+      EXPECT_EQ(index.is_delete_index_, actual.is_delete_index_);
+      EXPECT_EQ(index.is_refresh_on_error_skip_, actual.is_refresh_on_error_skip_);
+      EXPECT_EQ(index.tablet_ids_.at(p), actual.tablet_ids_.at(0));
+      EXPECT_EQ(index.partition_names_.at(p), actual.partition_names_.at(0));
+      ASSERT_NO_FATAL_FAILURE(compare_columns(index.select_columns_, actual.select_columns_));
+      ASSERT_NO_FATAL_FAILURE(compare_columns(index.source_columns_, actual.source_columns_));
+      ASSERT_NO_FATAL_FAILURE(compare_columns(index.partition_key_columns_, actual.partition_key_columns_));
+      ASSERT_NO_FATAL_FAILURE(compare_columns(index.rowkey_columns_, actual.rowkey_columns_));
+      ASSERT_NO_FATAL_FAILURE(compare_columns(index.order_columns_, actual.order_columns_));
+      const ObAsyncIndexDataTableInfo *reused = nullptr;
+      const int64_t version = cache.schema_version_;
+      ASSERT_EQ(OB_SUCCESS, cache.get(tenant_id_, table_id, data.data_tablet_id_,
+          index.index_table_id_, index.tablet_ids_.at(p), reused));
+      if (version == cache.schema_version_) {
+        EXPECT_EQ(target, reused);
+      }
+    }
+  }
+  const auto &index = full.index_infos_.at(0);
+  const ObTabletID data_tablet = full.data_tablet_infos_.at(0).data_tablet_id_;
+  const ObAsyncIndexDataTableInfo *target = nullptr;
+  EXPECT_EQ(OB_SCHEMA_EAGAIN, cache.get(tenant_id_, table_id, data_tablet,
+      index.index_table_id_, index.tablet_ids_.at(1), target));
+  EXPECT_EQ(nullptr, target);
+  ASSERT_EQ(OB_SUCCESS, cache.get(tenant_id_, table_id, data_tablet,
+      index.index_table_id_, index.tablet_ids_.at(0), target));
+  const int64_t old_version = cache.schema_version_;
+  ASSERT_EQ(OB_SUCCESS, exe_sql("rename table t_refresh_metadata to t_refresh_metadata_renamed"));
+  ASSERT_EQ(OB_SUCCESS, cache.get(tenant_id_, table_id, data_tablet,
+      index.index_table_id_, index.tablet_ids_.at(0), target));
+  EXPECT_NE(old_version, cache.schema_version_);
+  EXPECT_EQ(ObString::make_string("t_refresh_metadata_renamed"), target->data_table_name_);
+}
+
 TEST_F(ObAsyncIndexRefreshScnTest, refresh_ddl_physical_scn_and_macro_snapshot)
 {
   share::ObTenantSwitchGuard tguard;
@@ -712,7 +798,7 @@ void ObAsyncIndexRefreshScnTest::read_offline_versions(
   }
 }
 
-// phase 0: R 已落盘但未刷新；1: 首分区完成；2: swap 已提交但任务尚未转 SUCCESS；3: 消息保存持续失败。
+// phase 0: R 已落盘但未刷新；1: 一个分区暂停、其他分区完成；2: swap 已提交但任务尚未转 SUCCESS；3: 消息保存持续失败。
 // 暂停原任务后从任务表重建对象调用真实状态实现，覆盖任务恢复而非冒充真实 RS 切主。
 void ObAsyncIndexRefreshScnTest::check_offline_refresh_recovery(const int phase)
 {
@@ -748,7 +834,7 @@ void ObAsyncIndexRefreshScnTest::check_offline_refresh_recovery(const int phase)
   ASSERT_GT(original_id, 0);
 
   const char *points[] = {"BEFORE_OFFLINE_ASYNC_INDEX_REFRESH",
-                        "AFTER_OFFLINE_ASYNC_INDEX_PARTITION_REFRESH",
+                        "BEFORE_OFFLINE_ASYNC_INDEX_PARTITION_REFRESH",
                         "TABLE_REDEFINITION_TAKE_EFFECT"};
   const int64_t previous_sync_timeout = static_cast<int64_t>(GCONF.debug_sync_timeout);
   DEFER({
@@ -856,8 +942,24 @@ void ObAsyncIndexRefreshScnTest::check_offline_refresh_recovery(const int phase)
   ObSEArray<int64_t, 8> physical_before;
   ObSEArray<int64_t, 8> logical_before;
   ObSEArray<int64_t, 8> commit_before;
-  ASSERT_NO_FATAL_FAILURE(read_offline_versions(
-      recovered.target_object_id_, physical_before, logical_before, commit_before));
+  // Concurrent RPCs may finish after the paused partition signals the test.
+  // Wait for another partition to finish while the paused RPC holds no ownership.
+  const int64_t partial_refresh_deadline = ObTimeUtility::current_time() + 30_s;
+  do {
+    physical_before.reuse();
+    logical_before.reuse();
+    commit_before.reuse();
+    ASSERT_NO_FATAL_FAILURE(read_offline_versions(
+        recovered.target_object_id_, physical_before, logical_before, commit_before));
+    bool has_finished = false;
+    for (int64_t i = 0; i < logical_before.count(); ++i) {
+      has_finished |= logical_before.at(i) >= refresh_snapshot;
+    }
+    if (1 != phase || has_finished || ObTimeUtility::current_time() >= partial_refresh_deadline) {
+      break;
+    }
+    ob_usleep(10 * 1000);
+  } while (true);
   ASSERT_GE(physical_before.count(), 2);
   int64_t finished = 0;
   for (int64_t i = 0; i < physical_before.count(); ++i) {

@@ -22,15 +22,6 @@ namespace oceanbase
 namespace storage
 {
 
-static bool is_manual_refresh_retry_error(const int ret)
-{
-  return OB_OLD_SCHEMA_VERSION == ret || OB_SCHEMA_EAGAIN == ret
-      || OB_DDL_SCHEMA_VERSION_NOT_MATCH == ret || OB_NEED_RETRY == ret
-      || OB_INVALID_QUERY_TIMESTAMP == ret || OB_TASK_EXPIRED == ret
-      || is_master_changed_error(ret) || is_partition_change_error(ret)
-      || share::is_ddl_stmt_packet_retry_err(ret);
-}
-
 int ObAsyncIndexExecutor::execute_forcemerge(pl::ObPLExecCtx &pl_ctx, const ObAsyncIndexForceMergeCmdArg &arg)
 {
   int ret = OB_SUCCESS;
@@ -95,6 +86,7 @@ int ObAsyncIndexExecutor::execute_refresh(pl::ObPLExecCtx &pl_ctx, const ObAsync
         constexpr int64_t RETRY_INTERVAL_US = 1000 * 1000;
         int64_t retry_cnt = 0;
         bool need_retry = true;
+        share::ObAsyncIndexRefreshProgress progress;
         // Keep object IDs and the target across retries, including partially committed RPCs.
         // Each call rebuilds tablet/LS routing; the receiver fetches schema and regenerates SQL.
         while (need_retry) {
@@ -103,10 +95,11 @@ int ObAsyncIndexExecutor::execute_refresh(pl::ObPLExecCtx &pl_ctx, const ObAsync
             LOG_WARN("[ASYNC_INDEX] manual refresh was interrupted", KR(ret), K(retry_cnt));
           } else if (OB_FAIL(share::ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
                       tenant_id_, data_table_id, target_scn, async_index_table_ids,
-                      static_cast<int8_t>(ASYNC_REFRESH_TYPE_MANUAL)))) {
+                      static_cast<int8_t>(ASYNC_REFRESH_TYPE_MANUAL), &progress))) {
             LOG_WARN("[ASYNC_INDEX] fail to manually trigger refresh for table",
                      KR(ret), K_(tenant_id), K(data_table_id), K(target_scn), K(retry_cnt));
-            if (retry_cnt < MAX_RETRY_COUNT && is_manual_refresh_retry_error(ret)) {
+            if (retry_cnt < MAX_RETRY_COUNT
+                && share::ObAsyncIndexRefreshUtil::is_refresh_retry_error(ret, ASYNC_REFRESH_TYPE_MANUAL)) {
               ++retry_cnt;
               need_retry = true;
               LOG_INFO("[ASYNC_INDEX] retry manual refresh with fresh schema and routing",

@@ -1693,9 +1693,8 @@ int ObFtsIndexBuildTask::trigger_async_index_refresh()
     }
   }
   if (OB_SUCC(ret)) {
-    share::ObAsyncIndexDDLPublishOp publish_op(
-        tenant_id_, object_id_, snapshot_version_, refresh_index_ids, refresh_type);
-    ret = async_index_publish_refresh_target_.refresh(publish_op);
+    share::ObAsyncIndexDDLPublishOp publish_op(tenant_id_, object_id_, refresh_index_ids, refresh_type);
+    ret = async_index_publish_refresh_target_.refresh(publish_op, share::SCN::invalid_scn());
     if (OB_SUCC(ret)) {
       refresh_done_ = true;
       state_finished = true;

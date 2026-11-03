@@ -8,7 +8,6 @@
 #include "storage/async_index/ob_async_index_ddl_refresh.h"
 #include "lib/time/ob_time_utility.h"
 #include "share/ob_rpc_struct.h"
-#include "storage/async_index/ob_async_index_deps.h"
 #include "storage/async_index/ob_async_index_service.h"
 #include "storage/tablet/ob_async_index_refresh_info.h"
 
@@ -100,7 +99,7 @@ int ObAsyncIndexDDLRefreshOp::refresh_index(const int64_t snapshot, const int64_
   param.refresh_type_ = arg_.refresh_type_;
   if (OB_FAIL(param.target_refresh_scn_.convert_for_tx(snapshot))) {
     LOG_WARN("[ASYNC_INDEX] fail to convert DDL checkpoint", K(ret), K(snapshot), K(index), K(arg_));
-  } else if (OB_FAIL(service_.trigger_incr_refresh(param))) {
+  } else if (OB_FAIL(service_.trigger_incr_refresh(param, &metadata_cache_))) {
     if (OB_INC_MAJOR_COUNT_REACH_LIMIT == ret) {
       if (REACH_TIME_INTERVAL(1000L * 1000L)) {
         LOG_INFO("[ASYNC_INDEX] DDL refresh blocked by inc major capacity", K(ret), K(param), K(arg_));
