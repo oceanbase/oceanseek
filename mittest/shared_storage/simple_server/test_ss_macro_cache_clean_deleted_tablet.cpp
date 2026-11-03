@@ -301,12 +301,56 @@ public:
     return ret;
   }
 
+  // 仅推进指定 LS 的 MDS tablet，保持 source 数据 SSTable 的上传暂停。
+  // 成功仅表示本轮已尝试调度；异步 flush/upload 和暂时性资源不足由等待循环继续推进。
+  // LS handle 在本轮调用期间保活；非重试错误保留并交给调用方终止等待。
+  int flush_and_upload_mds_table_(const ObLSID &ls_id)
+  {
+    int ret = OB_SUCCESS;
+    ObLSHandle ls_handle;
+    ObLSService *ls_service = MTL(ObLSService *);
+    if (OB_ISNULL(ls_service)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ls service is null when uploading mds tablet", KR(ret), K(ls_id));
+    } else if (OB_FAIL(ls_service->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD))) {
+      LOG_WARN("fail to get ls for mds upload", KR(ret), K(ls_id));
+    } else if (OB_ISNULL(ls_handle.get_ls())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("ls is null when uploading mds tablet", KR(ret), K(ls_id));
+    } else {
+      ObLSIncSSTableUploader &uploader = ls_handle.get_ls()->get_inc_sstable_uploader();
+      if (OB_FAIL(ls_handle.get_ls()->flush_mds_table())) {
+        if (OB_EAGAIN == ret || OB_SIZE_OVERFLOW == ret) {
+          LOG_INFO("retry mds flush in next round", KR(ret), K(ls_id));
+          ret = OB_SUCCESS;
+        } else {
+          LOG_WARN("fail to flush mds table", KR(ret), K(ls_id));
+        }
+      }
+      // 即使新一轮 flush 尚未完成，也继续上传此前已生成的 MDS SSTable。
+      if (OB_SUCC(ret) && OB_FAIL(uploader.schedule_emergency_tablet_upload(LS_MDS_TABLET))) {
+        if (OB_EAGAIN == ret || OB_SIZE_OVERFLOW == ret) {
+          LOG_INFO("retry mds upload in next round", KR(ret), K(ls_id));
+          ret = OB_SUCCESS;
+        } else {
+          LOG_WARN("fail to schedule mds tablet upload", KR(ret), K(ls_id));
+        }
+      }
+    }
+    LOG_INFO("requested mds flush and upload while waiting for fork", KR(ret), K(ls_id));
+    return ret;
+  }
+
+  // 等待 Fork 任务数；传入有效 LS 时每秒定向推进 MDS，避免依赖已暂停的后台上传。
+  // 仍以查询到的任务数判断完成；上传调度成功不代表 Fork 已完成，总等待预算不变。
   int wait_ddl_task_count_(
       const int64_t expected_count,
-      const int64_t timeout_us)
+      const int64_t timeout_us,
+      const ObLSID &mds_upload_ls_id = ObLSID())
   {
     int ret = OB_SUCCESS;
     int64_t task_count = -1;
+    int64_t last_mds_upload_time_us = 0;
     const int64_t start_time_us = ObTimeUtility::current_time_us();
     ObSqlString sql;
     ObMySQLProxy &sql_proxy = get_curr_simple_server().get_sql_proxy();
@@ -332,13 +376,25 @@ public:
         }
       }
       if (OB_SUCC(ret) && expected_count != task_count) {
-        ob_usleep(100 * 1000);
+        const int64_t current_time_us = ObTimeUtility::current_time_us();
+        if (mds_upload_ls_id.is_valid()
+            && current_time_us - last_mds_upload_time_us >= 1_s) {
+          if (OB_FAIL(flush_and_upload_mds_table_(mds_upload_ls_id))) {
+            LOG_WARN("fail to advance mds upload while waiting for fork", KR(ret),
+                K(mds_upload_ls_id), K(task_count), K(expected_count));
+          } else {
+            last_mds_upload_time_us = current_time_us;
+          }
+        }
+        if (OB_SUCC(ret)) {
+          ob_usleep(100_ms);
+        }
       }
     }
     if (OB_SUCC(ret) && expected_count != task_count) {
       ret = OB_TIMEOUT;
       LOG_WARN("wait ddl task timeout", KR(ret), K(expected_count), K(task_count),
-          K(timeout_us), K(run_ctx_));
+          K(timeout_us), K(mds_upload_ls_id), K(run_ctx_));
     }
     return ret;
   }
@@ -570,8 +626,9 @@ protected:
 // ----------------------------------------------------------------------------
 // Private macro GC 只依据 born Tablet，忽略 effective owner 是否存活
 //
-// 场景：simple_server 通过 SQL 创建 source private MINI，只抑制 source 的普通
-//       SSTable upload 以保持 private 形态；卡住真实 Fork service 并创建 destination。
+// 场景：simple_server 通过 SQL 创建 source private MINI，暂停所在 LS 的普通
+//       SSTable upload 以保持 private 形态；等待 Fork 时定向推进 destination LS 的 MDS。
+//       卡住真实 Fork service 并创建 destination。
 //       当前 Fork source read 会保持 source owner，因此测试直接注入旧版本或异常状态下
 //       effective owner=destination 的 stale meta。
 // 操作：先删除 effective destination 并保留 born source，验证缓存保留；再创建一个 active
@@ -644,8 +701,23 @@ TEST_F(TestSSMacroCacheCleanDeletedTablet, private_macro_gc_uses_born_tablet_onl
       K(polluted_macro_id), K(source_tablet_id), K(destination_tablet_id));
 
   // step 3：完成 Fork 并删除 destination，确保 cleanup 的真实 active set 只保留 source。
+  // 保持普通上传暂停，仅反复推进 MDS，避免即时上传未完成后失去后台重试。
   OK(debug_sync_guard.release());
-  OK(wait_ddl_task_count_(0, 180_s));
+  OK(wait_ddl_task_count_(0 /*expected_count*/, 180_s, destination_ls_id));
+  ASSERT_TRUE(polluted_macro_id.is_private_macro());
+  // 检查 source 当前 SSTable 仍引用目标 private macro，避免上传改变测试前提后假通过。
+  ObSEArray<MacroBlockId, 16> source_data_macro_ids;
+  ObSEArray<MacroBlockId, 16> source_meta_macro_ids;
+  OK(get_macro_blocks(source_ls_id, source_tablet_id,
+      source_data_macro_ids, source_meta_macro_ids));
+  bool source_references_private_macro = false;
+  for (int64_t i = 0; !source_references_private_macro && i < source_data_macro_ids.count(); ++i) {
+    source_references_private_macro = (source_data_macro_ids.at(i) == polluted_macro_id);
+  }
+  LOG_INFO("step 3: fork finished with source private macro preserved",
+      K(source_ls_id), K(destination_ls_id), K(polluted_macro_id),
+      K(source_references_private_macro), K(source_data_macro_ids));
+  ASSERT_TRUE(source_references_private_macro);
   OK(exe_sql("drop table mc_cleanup_dst"));
   OK(remove_tablet_(destination_ls_id, destination_tablet_id));
   hash::ObHashSet<uint64_t> active_tablet_ids;
