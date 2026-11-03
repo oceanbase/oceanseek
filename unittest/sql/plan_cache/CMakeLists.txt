@@ -11,3 +11,4 @@
 #pc_unittest(test_plan_set)
 
 sql_unittest(test_rls_plan_cache_constraint)
+sql_unittest(test_async_index_plan_constraint)

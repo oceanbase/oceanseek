@@ -186,6 +186,7 @@ ObSqlCtx::ObSqlCtx()
     all_pre_calc_constraints_(nullptr),
     all_expr_constraints_(nullptr),
     all_priv_constraints_(nullptr),
+    session_state_constraints_(NO_SESSION_STATE_CONSTRAINT),
     need_match_all_params_(false),
     all_local_session_vars_(nullptr),
     is_ddl_from_primary_(false),
@@ -247,6 +248,7 @@ void ObSqlCtx::reset()
   all_pre_calc_constraints_ = nullptr;
   all_expr_constraints_ = nullptr;
   all_priv_constraints_ = nullptr;
+  session_state_constraints_ = NO_SESSION_STATE_CONSTRAINT;
   need_match_all_params_ = false;
   all_local_session_vars_ = nullptr;
   is_ddl_from_primary_ = false;
@@ -312,6 +314,7 @@ void ObSqlSchemaGuard::reset()
   }
   lake_table_metadatas_.reset();
   schema_guard_ = NULL;
+  session_info_ = nullptr;
   allocator_.reset();
   next_link_table_id_ = 1;
   dblink_scn_.reuse();
@@ -1017,6 +1020,13 @@ int ObSqlSchemaGuard::get_table_schema_version(const uint64_t table_id,
   return ret;
 }
 
+bool ObSqlSchemaGuard::can_use_async_index(const ObSQLSessionInfo *session_info)
+{
+  // Async indexes cannot see uncommitted changes in a multi-statement transaction.
+  return nullptr == session_info
+      || (session_info->get_local_autocommit() && !session_info->has_explicit_start_trans());
+}
+
 int ObSqlSchemaGuard::get_can_read_index_array(uint64_t table_id,
                                                  uint64_t *index_tid_array,
                                                  int64_t &size,
@@ -1025,10 +1035,11 @@ int ObSqlSchemaGuard::get_can_read_index_array(uint64_t table_id,
                                                  bool with_domain_index,
                                                  bool with_spatial_index,
                                                  bool with_vector_index,
-                                                 bool with_async_index)
+                                                 bool with_async_index) const
 {
   int ret = OB_SUCCESS;
   const uint64_t tenant_id = MTL_ID();
+  const bool allow_async_index = with_async_index && can_use_async_index(session_info_);
   if (is_external_object_id(table_id)) {
     size = 0;
   } else {
@@ -1037,7 +1048,7 @@ int ObSqlSchemaGuard::get_can_read_index_array(uint64_t table_id,
                                                 index_tid_array, size, with_mv,
                                                 with_global_index, with_domain_index,
                                                 with_spatial_index, with_vector_index,
-                                                with_async_index));
+                                                allow_async_index));
   }
   return ret;
 }

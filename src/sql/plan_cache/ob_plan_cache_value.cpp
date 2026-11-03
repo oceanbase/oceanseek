@@ -1384,6 +1384,13 @@ int ObPlanCacheValue::add_plan(ObPlanCacheObject &plan,
       } else if (OB_ISNULL(evo_plan_set)) {
         // plan set with evolving plan has been deleted, stoping add baseline plan
         ret = OB_SQL_PC_PLAN_DUPLICATE;
+      } else if (evo_plan_set->get_session_state_constraints()
+                 != pc_ctx.sql_ctx_.session_state_constraints_) {
+        spm_ctx.evolution_task_in_two_plan_set_ = true;
+        ret = OB_SQL_PC_PLAN_DUPLICATE;
+        LOG_TRACE("baseline session state constraints mismatch", K(ret),
+                  "source_constraints", evo_plan_set->get_session_state_constraints(),
+                  "baseline_constraints", pc_ctx.sql_ctx_.session_state_constraints_);
       } else if (OB_FAIL(evo_plan_set->match_and_merge_plan_cons(pc_ctx, is_same))) {
         LOG_WARN("failed to match baseline plan cons");
       } else if (OB_UNLIKELY(!is_same)) {

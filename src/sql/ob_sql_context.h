@@ -431,12 +431,15 @@ private:
 class ObSqlSchemaGuard
 {
 public:
+  static bool can_use_async_index(const ObSQLSessionInfo *session_info);
   ObSqlSchemaGuard()
   { reset(); }
   ~ObSqlSchemaGuard()
   { reset(); }
   void set_schema_guard(share::schema::ObSchemaGetterGuard *schema_guard)
   { schema_guard_ = schema_guard; }
+  void set_session_info(const ObSQLSessionInfo *session_info)
+  { session_info_ = session_info; }
   share::schema::ObSchemaGetterGuard *get_schema_guard() const
   { return schema_guard_; }
   void reset();
@@ -522,7 +525,7 @@ public:
                                bool with_domain_index = true,
                                bool with_spatial_index = true,
                                bool with_vector_index = true,
-                               bool with_async_index = false);
+                               bool with_async_index = false) const;
   int get_table_mlog_schema(const uint64_t table_id, const ObTableSchema *&mlog_schema);
   int get_link_table_schema(uint64_t table_id,
                             const share::schema::ObTableSchema *&table_schema) const;
@@ -560,6 +563,8 @@ public:
 
 private:
   share::schema::ObSchemaGetterGuard *schema_guard_;
+  // Non-owning statement session; schema-only guards leave this unset.
+  const ObSQLSessionInfo *session_info_;
   common::ObArenaAllocator allocator_;
   common::ObSEArray<const share::schema::ObTableSchema *, 1> table_schemas_;
   common::ObSEArray<const share::schema::ObDatabaseSchema *, 1> mocked_database_schemas_;
@@ -620,6 +625,12 @@ struct ObSpmCacheCtx
   ObBaselineKey bl_key_;
 };
 #endif
+
+enum ObSessionStateConstraint : uint64_t
+{
+  NO_SESSION_STATE_CONSTRAINT = 0,
+  SESSION_STATE_NO_MULTI_STMT_TRANSACTION = 1ULL << 0
+};
 
 struct ObSqlCtx
 {
@@ -773,6 +784,7 @@ public:
   common::ObDList<ObPreCalcExprConstraint> *all_pre_calc_constraints_;
   common::ObIArray<ObExprConstraint> *all_expr_constraints_;
   common::ObIArray<ObPCPrivInfo> *all_priv_constraints_;
+  uint64_t session_state_constraints_;
   bool need_match_all_params_; //only used for matching plans
   common::ObIArray<ObLocalSessionVar> *all_local_session_vars_; //store the old values of session vars which have changed after creating generated columns
   bool is_ddl_from_primary_;//备集群从主库同步过来需要处理的ddl sql语句

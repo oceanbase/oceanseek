@@ -186,28 +186,31 @@ int ObDSLFullTextQuery::resolve_index_with_field(
     }
   }
 
+  uint64_t readable_index_ids[OB_MAX_AUX_TABLE_PER_MAIN_TABLE + 1];
+  int64_t readable_index_count = OB_MAX_AUX_TABLE_PER_MAIN_TABLE + 1;
+  if (OB_SUCC(ret) && OB_FAIL(schema_guard.get_can_read_index_array(
+      main_table_schema.get_table_id(), readable_index_ids, readable_index_count,
+      false /* with_mv */, true /* with_global_index */, true /* with_domain_index */,
+      false /* with_spatial_index */, false /* with_vector_index */,
+      true /* with_async_index */))) {
+    LOG_WARN("failed to get readable fulltext index candidates", K(ret));
+  }
   const ObTableSchema *inv_idx_schema = nullptr;
   bool found_matched_index = false;
-  for (int64_t i = 0; OB_SUCC(ret) && i < index_infos.count() && !found_matched_index; ++i) {
-    const ObAuxTableMetaInfo &index_info = index_infos.at(i);
-    // sync fts inverted index aux and async fts inverted index are both candidates;
-    // sync/async are mutually exclusive on the same column, so at most one matches
-    if (!share::schema::is_fts_index_aux(index_info.index_type_)
-        && !share::schema::is_async_fts_index(index_info.index_type_)) {
-      // skip
-    } else if (OB_FAIL(schema_guard.get_table_schema(index_info.table_id_, inv_idx_schema))) {
+  for (int64_t i = 0; OB_SUCC(ret) && i < readable_index_count && !found_matched_index; ++i) {
+    if (OB_FAIL(schema_guard.get_table_schema(readable_index_ids[i], inv_idx_schema))) {
       LOG_WARN("failed to get index schema", K(ret));
     } else if (OB_ISNULL(inv_idx_schema)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected index schema", K(ret), KPC(inv_idx_schema));
-    } else if (!inv_idx_schema->can_read_index() || !inv_idx_schema->is_index_visible()) {
-      // index unavailable
+    } else if (!inv_idx_schema->is_fts_index_aux() && !inv_idx_schema->is_async_fts_index()) {
+      // Only fulltext indexes can match the requested column.
     } else if (OB_FAIL(ObTransformUtils::check_fulltext_index_match_column(
         column_set, &main_table_schema, inv_idx_schema, found_matched_index))) {
       LOG_WARN("failed to check fulltext index match column", K(ret));
     } else if (found_matched_index) {
-      inv_idx_tid = index_info.table_id_;
-      is_async = share::schema::is_async_fts_index(index_info.index_type_);
+      inv_idx_tid = readable_index_ids[i];
+      is_async = inv_idx_schema->is_async_fts_index();
       if (OB_FAIL(inv_idx_schema->get_index_name(index_name))) {
         LOG_WARN("fail to get index name", KR(ret));
       }
