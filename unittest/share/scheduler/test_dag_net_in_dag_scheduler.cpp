@@ -1018,6 +1018,7 @@ public:
   INHERIT_TO_STRING_KV("ObIDag", ObIDag, K_(is_inited), K_(type), K_(id), K(task_list_.get_size()), K_(dag_ret));
 };
 
+// 场景：生成后续任务失败后，DAG 收敛并保留对应的 OB_ERR_UNEXPECTED 告警。
 TEST_F(TestDagScheduler, test_generage_task_failed)
 {
   ObTenantDagScheduler *scheduler = MTL(ObTenantDagScheduler*);
@@ -1026,12 +1027,15 @@ TEST_F(TestDagScheduler, test_generage_task_failed)
   ASSERT_TRUE(nullptr != manager);
   ASSERT_EQ(OB_SUCCESS, MTL(ObDagWarningHistoryManager *)->init(true, MTL_ID(), "DagWarnHis"));
 
+  generate_cnt = 1;
   int ret = OB_SUCCESS;
+  uint64_t dag_hash = 0;
   ObGenerateFailedDag *dag = nullptr;
   for (int i = 0; i < 1; ++i) {
     if (OB_FAIL(scheduler->create_dag(nullptr, dag))) {
       COMMON_LOG(WARN, "failed to create dag", K(ret));
     } else if (FALSE_IT(dag->set_max_retry_times(7))) {
+    } else if (FALSE_IT(dag_hash = dag->hash())) {
     } else if (OB_FAIL(scheduler->add_dag(dag))) {
       COMMON_LOG(WARN, "failed to add dag", K(ret));
     }
@@ -1039,7 +1043,13 @@ TEST_F(TestDagScheduler, test_generage_task_failed)
   }
 
   wait_scheduler();
-  ASSERT_EQ(1, MTL(ObDagWarningHistoryManager *)->size());
+  // DAG 会先从队列移除，再写入告警；队列为空不代表告警已经生成。
+  CHECK_EQ_UTIL_TIMEOUT(1, manager->size());
+  ObDagWarningInfo warning_info;
+  compaction::ObInfoParamBuffer allocator;
+  ASSERT_EQ(OB_SUCCESS, manager->get_with_param(dag_hash, warning_info, allocator));
+  ASSERT_EQ(OB_ERR_UNEXPECTED, warning_info.dag_ret_);
+  ASSERT_EQ(2, generate_cnt);
 }
 
 //generate next dag

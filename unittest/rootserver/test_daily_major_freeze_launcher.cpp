@@ -8,6 +8,7 @@
 #include <gtest/gtest.h>
 #include <string>
 #include "common/ob_timeout_ctx.h"
+#include "lib/mysqlclient/ob_isql_result_handler.h"
 #include "lib/mysqlclient/ob_mysql_proxy.h"
 #include "lib/mysqlclient/ob_mysql_result_impl.h"
 #include "lib/mysqlclient/ob_mysql_statement.h"
