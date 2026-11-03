@@ -553,6 +553,7 @@ int ObHybridSearchCgService::generate_hybrid_search_ctdef(ObLogTableScan &op,
                                                  lookup_pushdown_filters))) {
         LOG_WARN("failed to prepare main scan access ctdef", K(ret));
       } else {
+        tsc_ctdef.flashback_item_.need_scn_ |= tsc_ctdef.scan_ctdef_.check_need_fill_scn();
         root_ctdef = search_ctdef;
       }
     } else if (OB_FAIL(generate_final_lookup_ctdef(op, tsc_ctdef, *search_ctdef, root_ctdef))) {
@@ -2789,6 +2790,7 @@ int ObHybridSearchCgService::generate_final_lookup_ctdef(ObLogTableScan &op,
       } else {
         lookup_ctdef->children_[0] = &search_ctdef;
         lookup_ctdef->children_[1] = main_scan_ctdef;
+        tsc_ctdef.flashback_item_.need_scn_ |= main_scan_ctdef->check_need_fill_scn();
       }
     }
   }
@@ -3075,7 +3077,8 @@ int ObHybridSearchCgService::check_column_ids_accessible(
       LOG_WARN("failed to get store column ids", K(ret));
     } else {
       for (int64_t i = 0; OB_SUCC(ret) && i < column_ids.count(); i++) {
-        bool is_found = false;
+        // ORA_ROWSCN is supplied by storage, not by a schema store column.
+        bool is_found = (OB_HIDDEN_TRANS_VERSION_COLUMN_ID == column_ids.at(i));
         for (int64_t j = 0; !is_found && j < column_descs.count(); j++) {
           if (column_ids.at(i) == column_descs.at(j).col_id_) {
             is_found = true;
