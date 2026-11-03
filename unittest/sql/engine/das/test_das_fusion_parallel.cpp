@@ -314,7 +314,8 @@ static int fetch_filter_provider_test_partition(
     }
   }
   if (OB_SUCC(ret)) {
-    ret = partition.storage_group_ctx_.set_delete_table_published_version(300);
+    ret = partition.storage_group_ctx_.set_delete_table_version_ranges(
+        ObSEArray<ObNewVersionRange, 1>(), 300);
   }
   if (OB_SUCC(ret)) {
     ret = partition.storage_group_ctx_.calc_query_version_ranges(sql_read_snapshot);

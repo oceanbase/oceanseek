@@ -631,7 +631,7 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest,
   ASSERT_EQ(OB_SUCCESS, version_ranges.push_back(make_range(100, 200)));
   ASSERT_EQ(OB_SUCCESS, handle.add_index_tablet_version_ranges(
       tablet_handle, version_ranges, 300));
-  ASSERT_EQ(OB_SUCCESS, handle.set_delete_table_published_version(300));
+  ASSERT_EQ(OB_SUCCESS, handle.set_delete_table_version_ranges(ObSEArray<ObNewVersionRange, 1>(), 300));
 
   ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(300)));
 
@@ -895,7 +895,7 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, delete_table_published_version_limits_re
   ObAsyncIndexSegmentGroupCtx handle;
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 200}}));
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, handle.set_delete_table_published_version(120));
+  ASSERT_EQ(OB_SUCCESS, handle.set_delete_table_version_ranges(ObSEArray<ObNewVersionRange, 1>(), 120));
   ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(300)));
   expect_uniform_groups(handle, {{0, 100}});
   EXPECT_EQ(100, handle.async_index_read_snapshot_.get_val_for_tx());
@@ -906,7 +906,7 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, delete_table_does_not_join_segment_align
   ObAsyncIndexSegmentGroupCtx handle;
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 200}}));
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, handle.set_delete_table_published_version(300));
+  ASSERT_EQ(OB_SUCCESS, handle.set_delete_table_version_ranges(ObSEArray<ObNewVersionRange, 1>(), 300));
   ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(300)));
   expect_uniform_groups(handle, {{0, 100}, {100, 200}});
   EXPECT_EQ(2, handle.index_version_ranges_.count());
@@ -917,7 +917,7 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, delete_table_published_version_reset)
 {
   ObAsyncIndexSegmentGroupCtx handle;
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 200}}));
-  ASSERT_EQ(OB_SUCCESS, handle.set_delete_table_published_version(120));
+  ASSERT_EQ(OB_SUCCESS, handle.set_delete_table_version_ranges(ObSEArray<ObNewVersionRange, 1>(), 120));
   handle.reset();
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(handle, {{0, 100}, {100, 200}}));
   ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(300)));
@@ -1175,7 +1175,7 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, all_empty_has_one_empty_group)
   ObAsyncIndexSegmentGroupCtx handle;
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(handle, {}, 200));
   ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(handle, {}, 300));
-  ASSERT_EQ(OB_SUCCESS, handle.set_delete_table_published_version(150));
+  ASSERT_EQ(OB_SUCCESS, handle.set_delete_table_version_ranges(ObSEArray<ObNewVersionRange, 1>(), 150));
   ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(400)));
   ASSERT_EQ(1, handle.get_group_count());
   EXPECT_TRUE(handle.get_group(0)->get_tablet_version_ranges(0).empty());
@@ -1275,7 +1275,7 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, read_boundary_requested_sparse_layouts)
                 handle, {{0, 100}, {200, 300}, {300, 400}}, published));
           }
         }
-        ASSERT_EQ(OB_SUCCESS, handle.set_delete_table_published_version(
+        ASSERT_EQ(OB_SUCCESS, handle.set_delete_table_version_ranges(ObSEArray<ObNewVersionRange, 1>(),
             2 == limiter ? 210 : 400));
         ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(
             make_scn(0 == limiter ? 210 : 400)));
@@ -1345,6 +1345,94 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, read_boundary_many_candidates_without_co
   ASSERT_EQ(OB_SUCCESS, handle.calc_query_version_ranges(make_scn(0)));
   expect_groups(handle, {{{}, {}}});
   EXPECT_EQ(0, handle.get_async_index_read_snapshot().get_val_for_tx());
+}
+
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, deletion_batch_rolls_back_empty_index_refresh)
+{
+  const int64_t snapshots[] = {100, 150, 200, 250};
+  const int64_t expected[] = {100, 100, 200, 250};
+  for (int64_t i = 0; i < ARRAYSIZEOF(snapshots); ++i) {
+    ObAsyncIndexSegmentGroupCtx ctx;
+    ObSEArray<ObNewVersionRange, 2> deletion_ranges;
+    ASSERT_EQ(OB_SUCCESS, deletion_ranges.push_back(make_range(0, 100)));
+    ASSERT_EQ(OB_SUCCESS, deletion_ranges.push_back(make_range(100, 200)));
+    ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(ctx, {{0, 100}}, 300));
+    ASSERT_EQ(OB_SUCCESS, ctx.set_delete_table_version_ranges(deletion_ranges, 300));
+    ASSERT_EQ(OB_SUCCESS, ctx.calc_query_version_ranges(make_scn(snapshots[i])));
+    EXPECT_EQ(expected[i], ctx.get_async_index_read_snapshot().get_val_for_tx());
+    ASSERT_EQ(1, ctx.get_index_tablet_count());
+    ASSERT_EQ(1, ctx.get_group_count());
+    ASSERT_EQ(1, ctx.get_group(0)->get_tablet_cnt());
+    expect_uniform_groups(ctx, {{0, 100}});
+  }
+}
+
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, deletion_gap_and_publication_bound)
+{
+  for (int64_t published = 120; published <= 300; published += 180) {
+    ObAsyncIndexSegmentGroupCtx ctx;
+    ObSEArray<ObNewVersionRange, 2> deletion_ranges;
+    ASSERT_EQ(OB_SUCCESS, deletion_ranges.push_back(make_range(0, 100)));
+    // Empty refreshes certify the gap (100, 200]; they must not invent a range.
+    ASSERT_EQ(OB_SUCCESS, deletion_ranges.push_back(make_range(200, 300)));
+    ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(ctx, {{0, 100}}, 300));
+    ASSERT_EQ(OB_SUCCESS, ctx.set_delete_table_version_ranges(deletion_ranges, published));
+    ASSERT_EQ(OB_SUCCESS, ctx.calc_query_version_ranges(make_scn(150)));
+    EXPECT_EQ(MIN(published, 150), ctx.get_async_index_read_snapshot().get_val_for_tx());
+    expect_uniform_groups(ctx, {{0, 100}});
+  }
+}
+
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, deletion_and_index_rollback_revisit_each_other)
+{
+  for (int reverse = 0; reverse < 2; ++reverse) {
+    ObAsyncIndexSegmentGroupCtx ctx;
+    ObSEArray<ObNewVersionRange, 3> deletion_ranges;
+    ASSERT_EQ(OB_SUCCESS, deletion_ranges.push_back(make_range(0, 100)));
+    ASSERT_EQ(OB_SUCCESS, deletion_ranges.push_back(make_range(100, reverse ? 160 : 180)));
+    ASSERT_EQ(OB_SUCCESS, deletion_ranges.push_back(make_range(reverse ? 160 : 180, 300)));
+    if (reverse) {
+      ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(ctx, {{0, 100}, {100, 180}, {180, 300}}));
+    } else {
+      ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(ctx, {{0, 100}, {100, 160}, {160, 300}}));
+    }
+    ASSERT_EQ(OB_SUCCESS, ctx.set_delete_table_version_ranges(deletion_ranges, 300));
+    ASSERT_EQ(OB_SUCCESS, ctx.calc_query_version_ranges(make_scn(210)));
+    EXPECT_EQ(100, ctx.get_async_index_read_snapshot().get_val_for_tx());
+    expect_uniform_groups(ctx, {{0, 100}});
+  }
+}
+
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, deletion_latest_major_discard_retry_and_reset)
+{
+  ObAsyncIndexSegmentGroupCtx ctx;
+  ObSEArray<ObNewVersionRange, 1> deletion_ranges;
+  ASSERT_EQ(OB_SUCCESS, deletion_ranges.push_back(make_range(0, 200)));
+  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(ctx, {{0, 100}}, 300));
+  ASSERT_EQ(OB_SUCCESS, ctx.set_delete_table_version_ranges(deletion_ranges, 300));
+  ASSERT_EQ(OB_SNAPSHOT_DISCARDED, ctx.calc_query_version_ranges(make_scn(150)));
+  EXPECT_EQ(0, ctx.get_group_count());
+  EXPECT_FALSE(ctx.get_async_index_read_snapshot().is_valid());
+  ASSERT_EQ(OB_SUCCESS, ctx.calc_query_version_ranges(make_scn(200)));
+  EXPECT_EQ(200, ctx.get_async_index_read_snapshot().get_val_for_tx());
+  ctx.reset();
+  EXPECT_TRUE(ctx.delete_version_ranges_.empty());
+  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges_with_published_version(ctx, {{0, 100}}, 300));
+  ASSERT_EQ(OB_SUCCESS, ctx.calc_query_version_ranges(make_scn(150)));
+  EXPECT_EQ(150, ctx.get_async_index_read_snapshot().get_val_for_tx());
+}
+
+TEST_F(ObAsyncIndexSegmentGroupCtxTest, deletion_ranges_do_not_split_index_groups)
+{
+  ObAsyncIndexSegmentGroupCtx ctx;
+  ObSEArray<ObNewVersionRange, 3> deletion_ranges;
+  ASSERT_EQ(OB_SUCCESS, deletion_ranges.push_back(make_range(0, 100)));
+  ASSERT_EQ(OB_SUCCESS, deletion_ranges.push_back(make_range(100, 150)));
+  ASSERT_EQ(OB_SUCCESS, deletion_ranges.push_back(make_range(150, 200)));
+  ASSERT_EQ(OB_SUCCESS, add_tablet_ranges(ctx, {{0, 200}}));
+  ASSERT_EQ(OB_SUCCESS, ctx.set_delete_table_version_ranges(deletion_ranges, 200));
+  ASSERT_EQ(OB_SUCCESS, ctx.calc_query_version_ranges(make_scn(200)));
+  expect_uniform_groups(ctx, {{0, 200}});
 }
 
 } // namespace unittest

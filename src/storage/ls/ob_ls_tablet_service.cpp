@@ -10693,10 +10693,11 @@ int ObLSTabletService::get_async_index_segment_group_ctx(
                   K(query_published_version));
       }
     }
-    // The delete Tablet contributes the same logical publication bound, but
-    // does not participate in segment grouping.
+    // Deletion batches constrain the read boundary, but are not segment group inputs.
     if (OB_SUCC(ret)) {
       ObTabletHandle tablet_handle;
+      common::ObSEArray<common::ObNewVersionRange, 64> tablet_version_ranges;
+      ObTabletMemberWrapper<ObTabletTableStore> tablet_table_store_wrapper;
       int64_t query_published_version = 0;
       if (OB_FAIL(get_tablet(delete_tablet_id, tablet_handle))) {
         LOG_WARN("failed to get async delete tablet", K(ret), K(delete_tablet_id));
@@ -10713,8 +10714,26 @@ int ObLSTabletService::get_async_index_segment_group_ctx(
       } else if (OB_FAIL(tablet_handle.get_obj()->get_latest_async_index_published_version(
           query_published_version))) {
         LOG_WARN("failed to get async delete logical publication", K(ret), K(delete_tablet_id));
-      } else if (OB_FAIL(ctx.set_delete_table_published_version(query_published_version))) {
-        LOG_WARN("failed to set async delete published version",
+      // Reacquire after publication, just like the index tablets above.
+      } else if (OB_FAIL(get_tablet(delete_tablet_id, tablet_handle))) {
+        LOG_WARN("failed to reacquire published async delete tablet", K(ret), K(delete_tablet_id));
+      } else if (OB_UNLIKELY(!tablet_handle.is_valid())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid published async delete tablet", K(ret), K(delete_tablet_id));
+      } else if (tablet_handle.get_obj()->get_tablet_meta().has_transfer_table()
+          && OB_FAIL(get_async_index_src_tablet_(tablet_handle))) {
+        LOG_WARN("failed to reacquire async delete transfer source", K(ret), K(delete_tablet_id));
+      } else if (OB_FAIL(tablet_handle.get_obj()->fetch_table_store(tablet_table_store_wrapper))) {
+        LOG_WARN("failed to fetch async delete table store", K(ret), K(delete_tablet_id));
+      } else if (OB_UNLIKELY(!tablet_table_store_wrapper.is_valid())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid async delete table store", K(ret), K(delete_tablet_id));
+      } else if (OB_FAIL(tablet_table_store_wrapper.get_member()->
+          get_async_index_sstable_version_ranges(*tablet_handle.get_obj(), tablet_version_ranges))) {
+        LOG_WARN("failed to get async delete version ranges", K(ret), K(delete_tablet_id));
+      } else if (OB_FAIL(ctx.set_delete_table_version_ranges(
+          tablet_version_ranges, query_published_version))) {
+        LOG_WARN("failed to set async delete version ranges",
             K(ret), K(delete_tablet_id), K(query_published_version));
       }
     }

@@ -63,12 +63,14 @@ ObAsyncIndexSegmentGroupCtx::ObAsyncIndexSegmentGroupCtx()
   : allocator_("AIndexSGC", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
     async_index_read_snapshot_(),
     delete_table_published_version_(INT64_MAX),
+    delete_version_ranges_(),
     groups_(),
     index_tablet_handles_(),
     index_published_versions_(),
     index_version_ranges_(OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator("AIndexSGCV", MTL_ID()))
 {
   groups_.set_attr(ObMemAttr(MTL_ID(), "AIndexSGCA"));
+  delete_version_ranges_.set_attr(ObMemAttr(MTL_ID(), "AIndexSGCV"));
   index_tablet_handles_.set_attr(ObMemAttr(MTL_ID(), "AIndexSGCH"));
 }
 
@@ -76,6 +78,7 @@ void ObAsyncIndexSegmentGroupCtx::reset()
 {
   reset_query_result_();
   delete_table_published_version_ = INT64_MAX;
+  delete_version_ranges_.reset();
   for (int64_t i = 0; i < index_version_ranges_.count(); ++i) {
     index_version_ranges_.at(i).reset();
   }
@@ -162,13 +165,16 @@ int ObAsyncIndexSegmentGroupCtx::add_index_tablet_version_ranges(
   return ret;
 }
 
-int ObAsyncIndexSegmentGroupCtx::set_delete_table_published_version(
+int ObAsyncIndexSegmentGroupCtx::set_delete_table_version_ranges(
+    const common::ObIArray<common::ObNewVersionRange> &version_ranges,
     const int64_t published_version)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(published_version < 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid published version", K(ret), K(published_version));
+  } else if (OB_FAIL(delete_version_ranges_.assign(version_ranges))) {
+    LOG_WARN("failed to copy deletion version ranges", K(ret), K(version_ranges));
   } else {
     delete_table_published_version_ = published_version;
   }
@@ -326,7 +332,7 @@ int ObAsyncIndexSegmentGroupCtx::calc_query_version_ranges(const share::SCN &sql
   int64_t read_ver = OB_SUCC(ret) ? upper_bound.get_val_for_tx() : 0;
   bool changed = true;
   // No historical replacement: move R to the start of each crossing SSTable.
-  // Revisit other indexes because lowering R can cut an earlier SSTable there.
+  // Revisit indexes and deletion batches because lowering R can cut another SSTable.
   while (OB_SUCC(ret) && changed) {
     changed = false;
     for (int64_t i = 0; i < index_version_ranges_.count(); ++i) {
@@ -334,9 +340,22 @@ int ObAsyncIndexSegmentGroupCtx::calc_query_version_ranges(const share::SCN &sql
       for (int64_t j = 0; j < ranges.count(); ++j) {
         if (ranges.at(j).base_version_ < read_ver
             && read_ver < ranges.at(j).snapshot_version_) {
+          LOG_DEBUG("rollback async index read snapshot across sstable",
+              "is_delete_table", false, K(read_ver), "new_read_ver", ranges.at(j).base_version_,
+              "version_range", ranges.at(j), K(upper_bound));
           read_ver = ranges.at(j).base_version_;
           changed = true;
         }
+      }
+    }
+    for (int64_t i = 0; i < delete_version_ranges_.count(); ++i) {
+      const common::ObNewVersionRange &range = delete_version_ranges_.at(i);
+      if (range.base_version_ < read_ver && read_ver < range.snapshot_version_) {
+        LOG_DEBUG("rollback async index read snapshot across sstable",
+            "is_delete_table", true, K(read_ver), "new_read_ver", range.base_version_,
+            "version_range", range, K(upper_bound));
+        read_ver = range.base_version_;
+        changed = true;
       }
     }
     if (0 == read_ver && 0 < upper_bound.get_val_for_tx()) {
