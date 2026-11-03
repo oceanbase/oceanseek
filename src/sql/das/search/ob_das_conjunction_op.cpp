@@ -402,7 +402,7 @@ int ObDASConjunctionOp::do_set_min_competitive_score(const double &threshold)
     }
     if (OB_SUCC(ret)) {
       ObIDASSearchOp *driver_op = driver_ops_.at(0);
-      const double driver_threshold = MAX(0.0, threshold - probe_max_score);
+      const double driver_threshold = threshold - probe_max_score;
       if (OB_ISNULL(driver_op)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected null driver op", KR(ret));

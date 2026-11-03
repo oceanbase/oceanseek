@@ -21,6 +21,9 @@
 #include "sql/das/ob_das_scan_op.h"
 #include "sql/das/search/ob_das_search_context.h"
 #include "sql/das/search/ob_das_bmm_op.h"
+#include "sql/das/search/ob_das_bmw_op.h"
+#include "sql/das/search/ob_das_disjunction_op.h"
+#include "sql/das/search/ob_das_req_opt_op.h"
 #include "sql/das/search/ob_das_topk_collect_op.h"
 #include "sql/engine/ob_exec_context.h"
 #undef protected
@@ -686,9 +689,9 @@ TEST_F(TestDASBMMVectorized, dense_threshold_raise_filters_materialized_and_futu
   EXPECT_EQ(OB_SUCCESS, bmm.close());
 }
 
-// With a zero threshold, merge all three dimensions without requesting range maxima and verify
+// With the initial threshold, merge all three dimensions without requesting range maxima and verify
 // the single result contains their full summed score.
-TEST_F(TestDASBMMVectorized, zero_threshold_skips_range_max_collection)
+TEST_F(TestDASBMMVectorized, initial_threshold_skips_range_max_collection)
 {
   BMMVectorizedMergeConfigGuard config_guard;
   ASSERT_TRUE(config_guard.is_valid());
@@ -1330,7 +1333,7 @@ TEST_F(TestDASBMMVectorized, dense_rescan_fully_resets_partial_window)
   EXPECT_DOUBLE_EQ(4.0, score);
   ASSERT_TRUE(bmm.doc_score_iter_.is_valid());
   ASSERT_EQ(OB_SUCCESS, bmm.rescan());
-  EXPECT_DOUBLE_EQ(0.0, bmm.min_competitive_score_);
+  EXPECT_DOUBLE_EQ(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, bmm.min_competitive_score_);
   EXPECT_EQ(ObDASBMMOp::SearchStatus::COMPUTE_VEC_BOUNDARY, bmm.status_);
   EXPECT_TRUE(bmm.curr_filter_id_.is_min());
   EXPECT_TRUE(bmm.vec_boundary_id_.is_min());
@@ -1395,7 +1398,7 @@ TEST_F(TestDASBMMVectorized, dense_segment_rescan_isolates_next_segment)
   EXPECT_DOUBLE_EQ(3.0, score);
   common::ObNewVersionRange range;
   ASSERT_EQ(OB_SUCCESS, bmm.rescan_segment(range));
-  EXPECT_DOUBLE_EQ(0.0, bmm.min_competitive_score_);
+  EXPECT_DOUBLE_EQ(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, bmm.min_competitive_score_);
   EXPECT_EQ(ObDASBMMOp::SearchStatus::COMPUTE_VEC_BOUNDARY, bmm.status_);
   EXPECT_TRUE(bmm.curr_filter_id_.is_min());
   EXPECT_TRUE(bmm.vec_boundary_id_.is_min());
@@ -1702,6 +1705,204 @@ TEST_F(TestDASBMMVectorized, topk_equal_scores_publish_threshold_when_heap_becom
   EXPECT_DOUBLE_EQ(5.0, bmm.min_competitive_score_);
   EXPECT_EQ(OB_SUCCESS, topk.close());
   EXPECT_EQ(OB_SUCCESS, bmm.close());
+}
+
+TEST_F(TestDASBMMVectorized, nested_boolean_zero_scores_survive_initial_threshold)
+{
+  for (const bool vectorized : {false, true}) {
+    for (const bool use_req_opt : {false, true}) {
+      SCOPED_TRACE(::testing::Message() << vectorized << ", req_opt=" << use_req_opt);
+      BMMVectorizedMergeConfigGuard config_guard(vectorized);
+      ASSERT_TRUE(config_guard.is_valid());
+      const ScriptedBMMPostingList postings = ScriptedBMMPostingBuilder()
+          .add(1, 0.0, 100, 0.0).build();
+      ScriptedBMMSearchOp filter(search_ctx_, postings, 0.0);
+      ScriptedBMMSearchOp inner_empty(search_ctx_, nullptr, 0, 0.0);
+      ScriptedBMMSearchOp outer_empty(search_ctx_, nullptr, 0, 0.0);
+      ASSERT_EQ(OB_SUCCESS, init_filter_op(filter));
+      ASSERT_EQ(OB_SUCCESS, init_score_op(inner_empty));
+      ASSERT_EQ(OB_SUCCESS, init_score_op(outer_empty));
+      ObSEArray<ObIDASSearchOp *, 2> inner_ops;
+      ASSERT_EQ(OB_SUCCESS, inner_ops.push_back(&filter));
+      ASSERT_EQ(OB_SUCCESS, inner_ops.push_back(&inner_empty));
+      ObDASDisjunctionOp disjunction(search_ctx_);
+      ObDASReqOptOp req_opt(search_ctx_);
+      ObIDASSearchOp *inner = nullptr;
+      if (use_req_opt) {
+        ObDASReqOptOpParam param(&filter, &inner_empty, true);
+        param.set_is_scoring(true);
+        ASSERT_EQ(OB_SUCCESS, req_opt.init(param));
+        inner = &req_opt;
+      } else {
+        ObDASDisjunctionOpParam param(inner_ops, 1, false, ObDASSearchCost(10));
+        param.set_is_scoring(true);
+        ASSERT_EQ(OB_SUCCESS, disjunction.init(param));
+        inner = &disjunction;
+      }
+      ObSEArray<ObIDASSearchOp *, 2> score_ops;
+      ASSERT_EQ(OB_SUCCESS, score_ops.push_back(inner));
+      ASSERT_EQ(OB_SUCCESS, score_ops.push_back(&outer_empty));
+      ObDASBMMOp bmm(search_ctx_);
+      ASSERT_EQ(OB_SUCCESS, init_dense_bmm(bmm, score_ops));
+      ASSERT_EQ(OB_SUCCESS, bmm.open());
+      for (int phase = 0; phase < 2; ++phase) {
+        if (phase > 0) {
+          ASSERT_EQ(OB_SUCCESS, bmm.rescan());
+        }
+        std::vector<BMMReferenceResult> actual;
+        ASSERT_EQ(OB_ITER_END, pull_all(bmm, actual));
+        expect_results(actual, {BMMReferenceResult(1, 0.0)});
+        ASSERT_EQ(OB_SUCCESS, bmm.set_min_competitive_score(0.0));
+      }
+      ASSERT_EQ(OB_SUCCESS, bmm.close());
+    }
+  }
+}
+
+TEST_F(TestDASBMMVectorized, optional_threshold_transition_and_lifecycle)
+{
+  for (int mode = 0; mode < 3; ++mode) {
+    SCOPED_TRACE(mode);
+    BMMVectorizedMergeConfigGuard config_guard(mode != 0);
+    ASSERT_TRUE(config_guard.is_valid());
+    const ScriptedBMMPostingList filter_postings = ScriptedBMMPostingBuilder()
+        .add(1, 0.0, 10000, 0.0).add(2, 0.0, 10000, 0.0)
+        .add(3, 0.0, 10000, 0.0).add(4, 0.0, 10000, 0.0)
+        .add(5, 0.0, 10000, 0.0).add(9000, 0.0, 10000, 0.0).build();
+    const ScriptedBMMPostingList score_postings = ScriptedBMMPostingBuilder()
+        .add(2, 0.0, 10000, 3.0).add(3, 1.0, 10000, 3.0)
+        .add(4, 0.0, 10000, 3.0).add(5, 2.0, 10000, 3.0)
+        .add(9000, 3.0, 10000, 3.0).build();
+    ScriptedBMMSearchOp filter(search_ctx_, filter_postings, 0.0);
+    ScriptedBMMSearchOp scoring(search_ctx_, score_postings, 3.0);
+    filter.use_batch_drain(true);
+    scoring.use_batch_drain(true);
+    ASSERT_EQ(OB_SUCCESS, init_filter_op(filter));
+    ASSERT_EQ(OB_SUCCESS, init_score_op(scoring));
+    ObSEArray<ObIDASSearchOp *, 1> score_ops;
+    ObSEArray<ObDASSearchCost, 1> score_costs;
+    ASSERT_EQ(OB_SUCCESS, score_ops.push_back(&scoring));
+    ASSERT_EQ(OB_SUCCESS, score_costs.push_back(ObDASSearchCost(100)));
+    ObDASBMMBuildOptions options(mode != 0);
+    options.query_optional_ = true;
+    options.lead_cost_ = ObDASSearchCost(mode == 2 ? 10 : 1001);
+    options.filter_cost_ = ObDASSearchCost(mode == 2 ? 1 : 1000);
+    search_ctx_.table_row_count_ = ObDASSearchCost(100000);
+    ObDASBMMOpParam param(score_ops, &filter, allocator_, options, &score_costs);
+    param.set_is_scoring(true);
+    ObDASBMMOp bmm(search_ctx_);
+    ASSERT_EQ(OB_SUCCESS, bmm.init(param));
+    ASSERT_EQ(OB_SUCCESS, bmm.open());
+    EXPECT_EQ(mode != 0, bmm.enable_vec_merge_);
+    if (mode == 2) {
+      EXPECT_EQ(ObDASBMMOp::FilterMergeMode::SPARSE_SEEK, bmm.filter_merge_mode_);
+    }
+    for (int phase = 0; phase < 3; ++phase) {
+      if (phase == 1) {
+        ASSERT_EQ(OB_SUCCESS, bmm.rescan());
+      } else if (phase == 2) {
+        common::ObNewVersionRange range;
+        ASSERT_EQ(OB_SUCCESS, bmm.rescan_segment(range));
+      }
+      EXPECT_DOUBLE_EQ(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, bmm.min_competitive_score_);
+      ASSERT_EQ(OB_SUCCESS, bmm.set_min_competitive_score(-2.0));
+      ObDASRowID rowid;
+      double score = 0.0;
+      ASSERT_EQ(OB_SUCCESS, bmm.next_rowid(rowid, score));
+      EXPECT_EQ(1, rowid.get_uint64());
+      EXPECT_DOUBLE_EQ(0.0, score);
+      ASSERT_EQ(OB_SUCCESS, bmm.set_min_competitive_score(0.0));
+      ASSERT_EQ(OB_SUCCESS, bmm.next_rowid(rowid, score));
+      EXPECT_EQ(3, rowid.get_uint64());
+      EXPECT_DOUBLE_EQ(1.0, score);
+      ASSERT_EQ(OB_SUCCESS, bmm.set_min_competitive_score(1.0));
+      ObDASRowID target;
+      target.set_uint64(4);
+      ASSERT_EQ(OB_SUCCESS, bmm.advance_to(target, rowid, score));
+      EXPECT_EQ(5, rowid.get_uint64());
+      EXPECT_DOUBLE_EQ(2.0, score);
+      ASSERT_EQ(OB_SUCCESS, bmm.next_rowid(rowid, score));
+      EXPECT_EQ(9000, rowid.get_uint64());
+      EXPECT_DOUBLE_EQ(3.0, score);
+      EXPECT_EQ(OB_ITER_END, bmm.next_rowid(rowid, score));
+    }
+    ASSERT_EQ(OB_SUCCESS, bmm.close());
+    EXPECT_DOUBLE_EQ(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, bmm.min_competitive_score_);
+  }
+}
+
+TEST_F(TestDASBMMVectorized, bmw_negative_threshold_preserves_zero_score_matches)
+{
+  const ScriptedBMMPostingList postings = ScriptedBMMPostingBuilder()
+      .add(1, 0.0, 100, 1.0).add(2, 0.0, 100, 1.0)
+      .add(3, 1.0, 100, 1.0).build();
+  ScriptedBMMSearchOp scoring(search_ctx_, postings, 1.0);
+  ASSERT_EQ(OB_SUCCESS, init_score_op(scoring));
+  ObSEArray<ObIDASSearchOp *, 1> ops;
+  ASSERT_EQ(OB_SUCCESS, ops.push_back(&scoring));
+  ObDASBMWOpParam param(ops, 1, allocator_);
+  param.set_is_scoring(true);
+  ObDASBMWOp bmw(search_ctx_);
+  ASSERT_EQ(OB_SUCCESS, bmw.init(param));
+  ASSERT_EQ(OB_SUCCESS, bmw.open());
+  ObDASRowID rowid;
+  double score = 0.0;
+  ASSERT_EQ(OB_SUCCESS, bmw.next_rowid(rowid, score));
+  EXPECT_EQ(1, rowid.get_uint64());
+  EXPECT_DOUBLE_EQ(0.0, score);
+  ASSERT_EQ(OB_SUCCESS, bmw.set_min_competitive_score(-2.0));
+  ASSERT_EQ(OB_SUCCESS, bmw.next_rowid(rowid, score));
+  EXPECT_EQ(2, rowid.get_uint64());
+  ASSERT_EQ(OB_SUCCESS, bmw.set_min_competitive_score(0.0));
+  ASSERT_EQ(OB_SUCCESS, bmw.next_rowid(rowid, score));
+  EXPECT_EQ(3, rowid.get_uint64());
+  EXPECT_DOUBLE_EQ(1.0, score);
+  EXPECT_EQ(OB_ITER_END, bmw.next_rowid(rowid, score));
+  ASSERT_EQ(OB_SUCCESS, bmw.rescan());
+  EXPECT_DOUBLE_EQ(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, bmw.min_competitive_score_);
+  ASSERT_EQ(OB_SUCCESS, bmw.next_rowid(rowid, score));
+  EXPECT_EQ(1, rowid.get_uint64());
+  ASSERT_EQ(OB_SUCCESS, bmw.close());
+}
+
+TEST_F(TestDASBMMVectorized, topk_collects_zero_scores_before_publishing_zero_threshold)
+{
+  BMMVectorizedMergeConfigGuard config_guard;
+  ASSERT_TRUE(config_guard.is_valid());
+  for (const bool pruning : {false, true}) {
+    const ScriptedBMMPostingList postings = ScriptedBMMPostingBuilder()
+        .add(1, 0.0, 100, 0.0).add(2, 0.0, 100, 0.0)
+        .add(3, 0.0, 100, 0.0).build();
+    ScriptedBMMSearchOp scoring(search_ctx_, postings, 0.0);
+    scoring.use_batch_drain(true);
+    ASSERT_EQ(OB_SUCCESS, init_score_op(scoring));
+    ObSEArray<ObIDASSearchOp *, 1> ops;
+    ASSERT_EQ(OB_SUCCESS, ops.push_back(&scoring));
+    ObDASBMMOp bmm(search_ctx_);
+    ASSERT_EQ(OB_SUCCESS, init_dense_bmm(bmm, ops));
+    ObDASTopKCollectOpParam param;
+    param.limit_ = 2;
+    param.child_ = &bmm;
+    param.set_is_scoring(true);
+    param.dynamic_pruning_enabled_ = pruning;
+    ObDASTopKCollectOp topk(search_ctx_);
+    ASSERT_EQ(OB_SUCCESS, topk.init(param));
+    ASSERT_EQ(OB_SUCCESS, topk.open());
+    ObDASRowID rowid;
+    double score = 0.0;
+    std::set<uint64_t> ids;
+    for (int i = 0; i < 2; ++i) {
+      ASSERT_EQ(OB_SUCCESS, topk.next_rowid(rowid, score));
+      ids.insert(rowid.get_uint64());
+      EXPECT_DOUBLE_EQ(0.0, score);
+    }
+    EXPECT_EQ((std::set<uint64_t>{1, 2}), ids);
+    EXPECT_EQ(OB_ITER_END, topk.next_rowid(rowid, score));
+    EXPECT_DOUBLE_EQ(pruning ? 0.0 : DAS_SEARCH_INITIAL_COMPETITIVE_SCORE,
+        bmm.min_competitive_score_);
+    ASSERT_EQ(OB_SUCCESS, topk.close());
+    ASSERT_EQ(OB_SUCCESS, bmm.close());
+  }
 }
 
 // Run fixed-seed dense cases without filters through vectorized and scalar BMM, verifying both

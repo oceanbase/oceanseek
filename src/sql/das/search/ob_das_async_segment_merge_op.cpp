@@ -890,7 +890,7 @@ int ObDASAsyncSegmentMergeOp::do_open()
         * (sizeof(uint64_t) + (is_scoring_ ? sizeof(double) : 0))
         + (is_scoring_ ? BATCH_SCORE_BLOCK_COUNT * sizeof(double) : 0);
     threshold_cached_ = false;
-    cached_threshold_ = 0.0;
+    cached_threshold_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
     use_batch_merge_ = DAS_ROWID_TYPE_UINT64 == get_rowid_type()
         && children_cnt_ > 0
         && children_cnt_ <= BATCH_BUFFER_BYTE_BUDGET / child_batch_bytes;
@@ -910,7 +910,7 @@ int ObDASAsyncSegmentMergeOp::do_rescan()
     LOG_WARN("failed to record async segment merge mode metric", K(ret));
   } else if (ObDASAsyncSegmentMergeMode::SORT_MERGE == mode_) {
     threshold_cached_ = false;
-    cached_threshold_ = 0.0;
+    cached_threshold_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
   }
   if (OB_SUCC(ret) && OB_FAIL(reset_children_for_partition(false))) {
     LOG_WARN("failed to rescan async segment merge", K(ret));
@@ -950,7 +950,7 @@ int ObDASAsyncSegmentMergeOp::do_close()
   force_merge_ = false;
   direct_drain_enabled_ = false;
   threshold_cached_ = false;
-  cached_threshold_ = 0.0;
+  cached_threshold_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
   use_batch_merge_ = false;
   return ret;
 }

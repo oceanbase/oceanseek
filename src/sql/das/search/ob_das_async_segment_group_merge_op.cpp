@@ -103,7 +103,7 @@ int ObDASAsyncSegmentGroupMergeOp::do_open()
 {
   int ret = OB_SUCCESS;
   threshold_cached_ = false;
-  cached_threshold_ = 0.0;
+  cached_threshold_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
   if (OB_FAIL(reset_children_for_partition(true))) {
     LOG_WARN("failed to open async segment group merge", K(ret));
   }
@@ -114,7 +114,7 @@ int ObDASAsyncSegmentGroupMergeOp::do_rescan()
 {
   int ret = OB_SUCCESS;
   threshold_cached_ = false;
-  cached_threshold_ = 0.0;
+  cached_threshold_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
   if (OB_FAIL(reset_children_for_partition(false))) {
     LOG_WARN("failed to rescan async segment group merge", K(ret));
   }
@@ -126,7 +126,7 @@ int ObDASAsyncSegmentGroupMergeOp::do_close()
   active_group_cnt_ = 0;
   current_group_idx_ = 0;
   threshold_cached_ = false;
-  cached_threshold_ = 0.0;
+  cached_threshold_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
   iter_end_ = false;
   child_opened_.reset();
   return OB_SUCCESS;

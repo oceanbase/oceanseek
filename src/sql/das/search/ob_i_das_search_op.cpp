@@ -4,6 +4,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_DAS
+#include <cmath>
 #include "ob_i_das_search_op.h"
 #include "sql/das/search/ob_das_search_context.h"
 #include "sql/das/search/ob_das_doc_score_accumulator.h"
@@ -473,7 +474,7 @@ int ObIDASSearchOp::do_next_rowids(int64_t capacity, int64_t &count)
 int ObIDASSearchOp::do_set_min_competitive_score(const double &threshold)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(threshold < min_competitive_score_)) {
+  if (OB_UNLIKELY(std::isnan(threshold) || threshold < min_competitive_score_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid threshold", K(ret), K(threshold), K_(min_competitive_score));
   } else {

@@ -17,6 +17,7 @@
 #ifndef OBDEV_SRC_SQL_DAS_SEARCH_OB_DAS_SEARCH_DEFINE_H_
 #define OBDEV_SRC_SQL_DAS_SEARCH_OB_DAS_SEARCH_DEFINE_H_
 
+#include <limits>
 #include "sql/das/ob_das_attach_define.h"
 #include "share/hybrid_search/ob_query_parse.h"
 
@@ -24,6 +25,10 @@ namespace oceanbase
 {
 namespace sql
 {
+
+// No score-based pruning before a competitive threshold is established.
+static constexpr double DAS_SEARCH_INITIAL_COMPETITIVE_SCORE =
+    -std::numeric_limits<double>::infinity();
 
 // Comparator required by ObBinaryHeap when building an int64_t max heap.
 struct ObDASInt64LessComp

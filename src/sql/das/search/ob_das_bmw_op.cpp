@@ -58,7 +58,7 @@ int ObDASBMWOp::do_init(const ObIDASSearchOpParam &op_param)
   } else {
     status_ = SearchStatus::FIND_NEXT_PIVOT;
     minimum_should_match_ = param.get_minimum_should_match();
-    min_competitive_score_ = 0.0;
+    min_competitive_score_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
     iter_allocator_ = param.get_iter_allocator();
     is_inited_ = true;
   }
@@ -105,7 +105,7 @@ int ObDASBMWOp::do_rescan_segment(const common::ObNewVersionRange &range)
   }
   if (OB_SUCC(ret)) {
     status_ = SearchStatus::FIND_NEXT_PIVOT;
-    min_competitive_score_ = 0.0;
+    min_competitive_score_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
   }
   return ret;
 }
@@ -131,7 +131,7 @@ int ObDASBMWOp::do_rescan()
   }
   if (OB_SUCC(ret)) {
     status_ = SearchStatus::FIND_NEXT_PIVOT;
-    min_competitive_score_ = 0.0;
+    min_competitive_score_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
   }
   return ret;
 }
@@ -196,7 +196,7 @@ int ObDASBMWOp::do_next_rowid(ObDASRowID &next_id, double &score)
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
-  } else if (0 == min_competitive_score_) {
+  } else if (min_competitive_score_ < 0.0) {
     if (OB_FAIL(inner_get_next_row_plain(next_id, score))) {
       if (OB_UNLIKELY(OB_ITER_END != ret)) {
         LOG_WARN("failed to get next row plain", K(ret));

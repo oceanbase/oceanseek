@@ -44,7 +44,7 @@ public:
       active_group_cnt_(0),
       current_group_idx_(0),
       threshold_cached_(false),
-      cached_threshold_(0.0),
+      cached_threshold_(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE),
       iter_end_(false)
   {
     op_type_ = DAS_SEARCH_OP_ASYNC_SEGMENT_GROUP_MERGE;
