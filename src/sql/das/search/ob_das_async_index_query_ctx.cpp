@@ -15,6 +15,7 @@
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
 #include "storage/tablet/ob_tablet.h"
 #include "storage/tx_storage/ob_access_service.h"
+#include "share/ob_debug_sync.h"
 
 namespace oceanbase
 {
@@ -1179,6 +1180,9 @@ int ObDASAsyncIndexQueryCtx::default_fetch_(
     ObAsyncIndexPartitionSegCtx &out_seg_ctx)
 {
   int ret = OB_SUCCESS;
+  // Hold the search context before it resolves the per-partition async read
+  // snapshot. Used by the refresh-window concurrency test.
+  DEBUG_SYNC(BEFORE_ASYNC_SEARCH_SEGMENT_GROUP_CTX);
   storage::ObAccessService *tsc_service = MTL(storage::ObAccessService *);
   if (OB_ISNULL(tsc_service)) {
     ret = OB_ERR_UNEXPECTED;

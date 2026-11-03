@@ -87,8 +87,8 @@ int mock_async_snapshot_fetcher(
       LOG_WARN("failed to acquire mock index tablet", K(ret));
     } else if (OB_FAIL(out_seg_ctx.storage_group_ctx_.add_index_tablet_version_ranges(
                    tablet_handle, ranges, upper_bound))) {
-    } else if (OB_FAIL(out_seg_ctx.storage_group_ctx_.set_delete_table_published_version(
-                   upper_bound))) {
+    } else if (OB_FAIL(out_seg_ctx.storage_group_ctx_.set_delete_table_version_ranges(
+                   ObSEArray<ObNewVersionRange, 1>(), upper_bound))) {
     } else if (OB_FAIL(out_seg_ctx.storage_group_ctx_.calc_query_version_ranges(
                    sql_read_snapshot))) {
     } else {

@@ -63,7 +63,9 @@ public:
       const ObTabletHandle &tablet_handle,
       common::ObIArray<common::ObNewVersionRange> &tablet_version_ranges,
       const int64_t published_version);
-  int set_delete_table_published_version(const int64_t published_version);
+  int set_delete_table_version_ranges(
+      const common::ObIArray<common::ObNewVersionRange> &version_ranges,
+      const int64_t published_version);
   int calc_query_version_ranges(const share::SCN &sql_read_snapshot);
 
   share::SCN get_async_index_read_snapshot() const { return async_index_read_snapshot_; }
@@ -78,6 +80,7 @@ public:
 
   TO_STRING_KV(K_(async_index_read_snapshot),
                K_(delete_table_published_version),
+               K_(delete_version_ranges),
                K_(index_published_versions),
                K_(groups),
                K_(index_tablet_handles),
@@ -119,6 +122,8 @@ private:
   ObArenaAllocator allocator_;
   share::SCN async_index_read_snapshot_;
   int64_t delete_table_published_version_;
+  // Deletion batches constrain R, but are not inputs to index segment groups.
+  common::ObSEArray<common::ObNewVersionRange, 8> delete_version_ranges_;
   common::ObSEArray<ObAsyncIndexSegmentGroup*, 8> groups_;
   common::ObSEArray<ObTabletHandle, 8> index_tablet_handles_;
   // Committed logical refresh watermarks certify gaps without materializing empty tables.
