@@ -195,7 +195,7 @@ private:
   // memtable on every retry (each retry would otherwise strand one node that
   // is only reclaimed when the memtable is released).
   static int probe_source_ready_(const ObTabletMdsRelocBatchArg &arg);
-  // Escape hatch for a permanently-absent reloc source on this replica.
+  // Escape hatch when the required source tablet generation is permanently absent.
   // Only the destination replica stuck replaying this batch benefits from
   // failing its own in-flight migration task (migration failure stops replay
   // via ls offline/disable_replay and lets RS reschedule the replica; the

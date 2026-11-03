@@ -3178,6 +3178,38 @@ TEST_F(TestMdsTransaction, reloc_absent_source_cancels_only_current_migration)
         buffer, pos, replay_scn, covered_ctx.mds_ctx()));
     covered_ctx.abort();
     EXPECT_EQ(OB_SUCCESS, handler->result_);
+
+    // Bring the missing source tablet back at a newer transfer generation.
+    ObMigrationTabletParam param;
+    ASSERT_EQ(OB_SUCCESS, tablet_handle.get_obj()->build_migration_tablet_param(param));
+    param.tablet_id_ = param.data_tablet_id_ = target.src_tablet_id_;
+    param.transfer_info_.transfer_start_scn_ = generation;
+    ObTabletHandle transferred;
+    ASSERT_EQ(OB_SUCCESS, ls->get_tablet_svr()->create_transfer_in_tablet(ls_id, param, transferred));
+    DEFER({
+      transferred.reset();
+      EXPECT_EQ(OB_SUCCESS, ls->get_tablet_svr()->rollback_remove_tablet(
+          ls_id, target.src_tablet_id_, generation));
+    });
+    ASSERT_NO_FATAL_FAILURE(write_committed_transfer_in_status(*ls, *transferred.get_obj(),
+        target.src_tablet_id_, generation, generation, ObTransID(443)));
+    auto probe = [&](bool for_replay, const share::SCN &expected) {
+      target.src_reorg_scn_ = expected;
+      ObTabletHandle found;
+      return ObTabletMdsRelocHelper::get_ready_source_tablet_(
+          for_replay, *ls, target, batch.read_snapshot_, ls_id, found);
+    };
+    ASSERT_EQ(OB_SUCCESS, probe(true, generation));
+    EXPECT_EQ(OB_EAGAIN, probe(true, share::SCN::scn_inc(generation)));
+    EXPECT_EQ(OB_STATE_NOT_MATCH, probe(false, share::SCN::min_scn()));
+    EXPECT_EQ(OB_SUCCESS, handler->result_);
+    for (int i = 0; i < 200 && OB_SUCCESS == handler->result_; ++i) {
+      EXPECT_EQ(OB_EAGAIN, probe(true, share::SCN::min_scn()));
+      if (OB_SUCCESS == handler->result_) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+      }
+    }
+    EXPECT_EQ(OB_LOG_REPLAY_ERROR, handler->result_);
   }
 }
 

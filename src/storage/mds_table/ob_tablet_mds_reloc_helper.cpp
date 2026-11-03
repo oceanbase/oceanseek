@@ -771,6 +771,8 @@ int ObTabletMdsRelocHelper::get_ready_source_tablet_(
 {
   int ret = OB_SUCCESS;
   ObTablet *src_tablet = nullptr;
+  share::SCN actual_reorg_scn;
+  bool source_generation_gone = false;
   // ObLS::get_max_decided_scn() delegates to ObLogHandler::get_max_decided_scn(),
   // which returns max(max_replayed_scn, max_applied_scn): a replay/apply
   // boundary rather than a "log decided" one (the transaction layer relies on
@@ -833,14 +835,7 @@ int ObTabletMdsRelocHelper::get_ready_source_tablet_(
       // lets RS reschedule this replica, whose fresh snapshot carries an MDS
       // checkpoint that already covers this batch.  Replay itself keeps the
       // EAGAIN semantics and is taken over by the migration failure flow.
-      {
-        int tmp_ret = OB_SUCCESS;
-        if (OB_TMP_FAIL(fail_dest_migration_for_absent_src_(
-                dest_ls_id, tgt, max_decided_scn))) {
-          LOG_WARN("fail dest migration for absent src failed", KR(tmp_ret),
-                   K(dest_ls_id), K(tgt));
-        }
-      }
+      source_generation_gone = true;
       ret = OB_EAGAIN;
       if (REACH_TIME_INTERVAL(1_s)) {
         LOG_WARN("src tablet not ready for op pull, will retry", KR(ret), K(tgt));
@@ -851,10 +846,18 @@ int ObTabletMdsRelocHelper::get_ready_source_tablet_(
   } else if (OB_ISNULL(src_tablet = src_tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("src tablet null", KR(ret), K(tgt));
-  } else if (src_tablet->get_reorganization_scn() != tgt.src_reorg_scn_) {
+  } else if ((actual_reorg_scn = src_tablet->get_reorganization_scn()) != tgt.src_reorg_scn_) {
+    // An older source may catch up. Once it is newer, the required generation is gone.
+    source_generation_gone = for_replay && actual_reorg_scn > tgt.src_reorg_scn_;
     ret = for_replay ? OB_EAGAIN : OB_STATE_NOT_MATCH;
     LOG_WARN("source tablet generation does not match reloc batch", KR(ret),
-        K(for_replay), K(tgt), "actual_reorg_scn", src_tablet->get_reorganization_scn());
+        K(for_replay), K(tgt), K(actual_reorg_scn));
+  }
+  if (source_generation_gone) {
+    int tmp_ret = OB_SUCCESS;
+    if (OB_TMP_FAIL(fail_dest_migration_for_absent_src_(dest_ls_id, tgt, max_decided_scn))) {
+      LOG_WARN("fail dest migration for absent src failed", KR(tmp_ret), K(dest_ls_id), K(tgt));
+    }
   }
   return ret;
 }
