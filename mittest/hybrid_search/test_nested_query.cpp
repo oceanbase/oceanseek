@@ -190,7 +190,7 @@ private:
   {
     return row.doc_id_ < target.doc_id_
         || (row.doc_id_ == target.doc_id_
-            && DAS_SCOPE_NESTED == get_scope()
+            && DAS_SCOPE_NESTED_SYNC == get_scope()
             && compare_nested_key(row.nested_key_, target.nested_key_) < 0);
   }
 
@@ -204,9 +204,9 @@ private:
       LOG_WARN("failed to decode mock doc id", K(ret));
     } else {
       row.doc_id_ = doc_id_datum.get_uint();
-      if (DAS_SCOPE_NESTED == get_scope()) {
+      if (DAS_SCOPE_NESTED_SYNC == get_scope()) {
         if (OB_FAIL(search_ctx_.get_datum_from_rowid(
-                DAS_SCOPE_NESTED, rowid, nested_key_datum, 1))) {
+                DAS_SCOPE_NESTED_SYNC, rowid, nested_key_datum, 1))) {
           LOG_WARN("failed to decode mock nested key", K(ret));
         } else {
           row.nested_key_.assign(nested_key_datum.ptr_, nested_key_datum.len_);
@@ -236,7 +236,7 @@ private:
       } else if (OB_FAIL(datums.push_back(nested_key_datum))) {
         LOG_WARN("failed to push mock nested key", K(ret));
       } else if (OB_FAIL(search_ctx_.write_datums_to_rowid(
-                     DAS_SCOPE_NESTED, datums, rowid, rowid_allocator_))) {
+                     DAS_SCOPE_NESTED_SYNC, datums, rowid, rowid_allocator_))) {
         LOG_WARN("failed to build mock nested rowid", K(ret));
       }
     }
@@ -310,10 +310,10 @@ public:
     ObDatum doc_id_datum;
     ObDatum nested_key_datum;
     if (OB_FAIL(search_ctx_.get_datum_from_rowid(
-            DAS_SCOPE_NESTED, rowid, doc_id_datum, 0))) {
+            DAS_SCOPE_NESTED_SYNC, rowid, doc_id_datum, 0))) {
       LOG_WARN("failed to decode nested result doc id", K(ret));
     } else if (OB_FAIL(search_ctx_.get_datum_from_rowid(
-                   DAS_SCOPE_NESTED, rowid, nested_key_datum, 1))) {
+                   DAS_SCOPE_NESTED_SYNC, rowid, nested_key_datum, 1))) {
       LOG_WARN("failed to decode nested result key", K(ret));
     } else {
       doc_id = doc_id_datum.get_uint();
@@ -502,7 +502,7 @@ TEST_F(TestHybridSearchNestedQuery, test_doc_id_only_eligibility)
   nested_ctdef.set_is_top_level_scoring(false);
 
   ObDASScopeId old_scope = DAS_SCOPE_BASE;
-  ctx.search_ctx_.enter_scope_for_op_creating(DAS_SCOPE_NESTED, old_scope);
+  ctx.search_ctx_.enter_scope_for_op_creating(DAS_SCOPE_NESTED_SYNC, old_scope);
   EXPECT_FALSE(nested_rtdef.can_generate_doc_id_only(ctx.search_ctx_));
   ctx.search_ctx_.exit_scope_after_op_created(old_scope);
 }
@@ -527,7 +527,7 @@ TEST_F(TestHybridSearchNestedQuery, test_parent_prefix_skip_eligibility)
   nested_rtdef.children_cnt_ = 1;
 
   ObDASScopeId old_scope = DAS_SCOPE_BASE;
-  ctx.search_ctx_.enter_scope_for_op_creating(DAS_SCOPE_NESTED, old_scope);
+  ctx.search_ctx_.enter_scope_for_op_creating(DAS_SCOPE_NESTED_SYNC, old_scope);
   EXPECT_TRUE(nested_rtdef.can_generate_parent_prefix_skip(ctx.search_ctx_));
   nested_ctdef.nesting_depth_ = 1;
   EXPECT_FALSE(nested_rtdef.can_generate_parent_prefix_skip(ctx.search_ctx_));
@@ -584,7 +584,7 @@ TEST_F(TestHybridSearchNestedQuery, test_rowid_output_expr_contract)
   // A synchronous NESTED producer must retain both child-local exprs. Sort
   // must not fall back to the registered anchor expr array.
   ObDASScopeId old_scope = DAS_SCOPE_BASE;
-  scope_ctx.search_ctx_.enter_scope_for_op_creating(DAS_SCOPE_NESTED, old_scope);
+  scope_ctx.search_ctx_.enter_scope_for_op_creating(DAS_SCOPE_NESTED_SYNC, old_scope);
   ObDASScalarScanOp nested_scan(scope_ctx.search_ctx_);
   ObDASSortOp sort_op(scope_ctx.search_ctx_);
   scope_ctx.search_ctx_.exit_scope_after_op_created(old_scope);
@@ -625,7 +625,7 @@ TEST_F(TestHybridSearchNestedQuery, test_rowid_output_expr_contract)
   EXPECT_EQ(child_ctx.get_nested_doc_expr(),
             async_base_output_exprs->at(0));
 
-  scope_ctx.search_ctx_.enter_scope_for_op_creating(DAS_SCOPE_NESTED, old_scope);
+  scope_ctx.search_ctx_.enter_scope_for_op_creating(DAS_SCOPE_NESTED_SYNC, old_scope);
   ObDASAsyncScalarRangeOp async_nested_scan(scope_ctx.search_ctx_);
   scope_ctx.search_ctx_.exit_scope_after_op_created(old_scope);
   ASSERT_EQ(OB_SUCCESS, async_nested_scan.init(async_param));
@@ -651,7 +651,7 @@ TEST_F(TestHybridSearchNestedQuery, test_base_group_skip_and_advance)
       MockNestedRow(4, make_nested_key({0}))};
 
   ObDASScopeId old_scope = DAS_SCOPE_BASE;
-  ctx.search_ctx_.enter_scope_for_op_creating(DAS_SCOPE_NESTED, old_scope);
+  ctx.search_ctx_.enter_scope_for_op_creating(DAS_SCOPE_NESTED_SYNC, old_scope);
   MockNestedRowIDOp child(ctx.search_ctx_, rows);
   ctx.search_ctx_.exit_scope_after_op_created(old_scope);
   MockNestedRowIDOpParam child_param;
@@ -708,7 +708,7 @@ TEST_F(TestHybridSearchNestedQuery, test_parent_prefix_group_skip)
       MockNestedRow(2, make_nested_key({0, 1}))};
 
   ObDASScopeId old_scope = DAS_SCOPE_BASE;
-  ctx.search_ctx_.enter_scope_for_op_creating(DAS_SCOPE_NESTED, old_scope);
+  ctx.search_ctx_.enter_scope_for_op_creating(DAS_SCOPE_NESTED_SYNC, old_scope);
   MockNestedRowIDOp child(ctx.search_ctx_, rows);
   ObDASNestedQueryOp nested_op(ctx.search_ctx_);
   ctx.search_ctx_.exit_scope_after_op_created(old_scope);

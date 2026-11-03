@@ -30,7 +30,7 @@ struct NestedRowIDDump
     int tret = ctx_.get_datum_from_rowid(scope_, rid_, d0, 0);
     if (OB_SUCCESS != tret) { common::databuff_printf(buf, buf_len, pos, "<col0_err=%d>", tret); return pos; }
     common::databuff_printf(buf, buf_len, pos, "doc_id=%lu", d0.get_uint());
-    if (scope_ == DAS_SCOPE_NESTED) {
+    if (scope_ == DAS_SCOPE_NESTED_SYNC) {
       ObDatum d1;
       tret = ctx_.get_datum_from_rowid(scope_, rid_, d1, 1);
       if (OB_SUCCESS != tret) {
@@ -165,7 +165,7 @@ bool ObDASNestedQueryRtDef::can_generate_parent_prefix_skip(const ObDASSearchCtx
 {
   const ObDASNestedQueryCtDef *ctdef = get_ctdef();
   ObIDASSearchRtDef *inner_rtdef = get_inner_rtdef();
-  return search_ctx.get_op_creating_scope() == DAS_SCOPE_NESTED
+  return search_ctx.get_op_creating_scope() == DAS_SCOPE_NESTED_SYNC
       && ctdef->nesting_depth_ > 1
       && ctdef->nesting_depth_ <= ObSearchIndexNestedKeyEncoder::MAX_DEPTH
       && !ctdef->is_scoring()
@@ -178,7 +178,7 @@ struct ScopePropagateGuard
 {
   ScopePropagateGuard(ObDASSearchCtx &search_ctx)
     : search_ctx_(search_ctx) {
-      search_ctx_.enter_scope_for_op_creating(ObDASScopeId::DAS_SCOPE_NESTED, old_scope_);
+      search_ctx_.enter_scope_for_op_creating(ObDASScopeId::DAS_SCOPE_NESTED_SYNC, old_scope_);
   }
   ~ScopePropagateGuard() {
     search_ctx_.exit_scope_after_op_created(old_scope_);
@@ -277,7 +277,7 @@ int ObDASNestedQueryOp::do_init(const ObIDASSearchOpParam &op_param)
     // DOC_ID_ONLY keeps both the boundary and its child in BASE/UINT64. The
     // regular path propagates NESTED/COMPACT only to the child.
     const ObDASScopeId expected_inner_scope =
-        is_doc_id_only_ ? DAS_SCOPE_BASE : DAS_SCOPE_NESTED;
+        is_doc_id_only_ ? DAS_SCOPE_BASE : DAS_SCOPE_NESTED_SYNC;
     const ObDASRowIDType expected_inner_rowid_type =
         is_doc_id_only_ ? DAS_ROWID_TYPE_UINT64 : DAS_ROWID_TYPE_COMPACT;
     const bool output_shape_valid =
@@ -311,7 +311,7 @@ int ObDASNestedQueryOp::do_init(const ObIDASSearchOpParam &op_param)
       const bool can_skip_doc_group = scope_ == DAS_SCOPE_BASE
           && get_rowid_type() == DAS_ROWID_TYPE_UINT64;
       const bool can_skip_parent_group = p.enable_parent_prefix_skip_
-          && scope_ == DAS_SCOPE_NESTED
+          && scope_ == DAS_SCOPE_NESTED_SYNC
           && get_rowid_type() == DAS_ROWID_TYPE_COMPACT;
       enable_group_skip_ = can_skip_doc_group || can_skip_parent_group;
     }
@@ -415,7 +415,7 @@ int ObDASNestedQueryOp::build_nested_rowid(
   } else if (OB_FAIL(datums.push_back(nested_key_datum))) {
     LOG_WARN("failed to push nested key datum", K(ret));
   } else if (OB_FAIL(search_ctx_.write_datums_to_rowid(
-                 DAS_SCOPE_NESTED, datums, rowid, allocator))) {
+                 DAS_SCOPE_NESTED_SYNC, datums, rowid, allocator))) {
     LOG_WARN("failed to build nested rowid", K(ret));
   }
   return ret;
@@ -424,7 +424,7 @@ int ObDASNestedQueryOp::build_nested_rowid(
 // The NESTED scope compact rowid holds: col 0 = doc_id (uint64), col 1 = nested_key (binary string).
 // We truncate the last BYTES_PER_LEVEL bytes of nested_key, then emit in this op's output scope (scope_).
 // If scope_ == DAS_SCOPE_BASE: emit plain uint64 doc_id.
-// If scope_ == DAS_SCOPE_NESTED: emit compact (doc_id, truncated_nk).
+// If scope_ == DAS_SCOPE_NESTED_SYNC: emit compact (doc_id, truncated_nk).
 int ObDASNestedQueryOp::build_truncated_rowid(const ObDASRowID &inner_rowid,
                                               ObDASRowID &emitted,
                                               common::ObIAllocator &allocator)
@@ -434,9 +434,9 @@ int ObDASNestedQueryOp::build_truncated_rowid(const ObDASRowID &inner_rowid,
   // Extract doc_id datum (col 0) and nested_key datum (col 1) from the NESTED-scope rowid.
   ObDatum doc_id_datum;
   ObDatum nk_datum;
-  if (OB_FAIL(search_ctx_.get_datum_from_rowid(DAS_SCOPE_NESTED, inner_rowid, doc_id_datum, 0))) {
+  if (OB_FAIL(search_ctx_.get_datum_from_rowid(DAS_SCOPE_NESTED_SYNC, inner_rowid, doc_id_datum, 0))) {
     LOG_WARN("failed to get doc_id datum from nested rowid", K(ret));
-  } else if (OB_FAIL(search_ctx_.get_datum_from_rowid(DAS_SCOPE_NESTED, inner_rowid, nk_datum, 1))) {
+  } else if (OB_FAIL(search_ctx_.get_datum_from_rowid(DAS_SCOPE_NESTED_SYNC, inner_rowid, nk_datum, 1))) {
     LOG_WARN("failed to get nested_key datum from nested rowid", K(ret));
   } else if (OB_UNLIKELY(nk_datum.len_ < ObSearchIndexNestedKeyEncoder::BYTES_PER_LEVEL)) {
     ret = OB_ERR_UNEXPECTED;
@@ -446,7 +446,7 @@ int ObDASNestedQueryOp::build_truncated_rowid(const ObDASRowID &inner_rowid,
     LOG_TRACE("[NESTED-DBG] truncate_and_emit IN", K(ret),
              K(scope_), K(doc_id_datum.get_uint()),
              K(nk_datum.len_),
-             "inner_rowid", NestedRowIDDump(search_ctx_, DAS_SCOPE_NESTED, inner_rowid));
+             "inner_rowid", NestedRowIDDump(search_ctx_, DAS_SCOPE_NESTED_SYNC, inner_rowid));
     // Truncated nested_key: drop last BYTES_PER_LEVEL bytes.
     ObDatum truncated_nk;
     truncated_nk.ptr_ = nk_datum.ptr_;
@@ -521,7 +521,7 @@ int ObDASNestedQueryOp::emit_base_rowid_fast(
     // UInt64 RowID is stored inline, so a DOC_ID_ONLY child can pass through.
     emitted = inner_rowid;
   } else if (OB_FAIL(search_ctx_.get_datum_from_rowid(
-                 DAS_SCOPE_NESTED, inner_rowid, doc_id_datum, 0))) {
+                 DAS_SCOPE_NESTED_SYNC, inner_rowid, doc_id_datum, 0))) {
     LOG_WARN("failed to get doc id from nested rowid", K(ret));
   } else {
     emitted.set_uint64(doc_id_datum.get_uint());
@@ -648,8 +648,8 @@ int ObDASNestedQueryOp::compare_inner_group_with_pending(
   ObDatum doc_id_datum;
   ObDatum nk_datum;
   const ObDASScopeId inner_scope =
-      is_doc_id_only_ ? DAS_SCOPE_BASE : DAS_SCOPE_NESTED;
-  const int64_t pending_prefix_len = scope_ == DAS_SCOPE_NESTED
+      is_doc_id_only_ ? DAS_SCOPE_BASE : DAS_SCOPE_NESTED_SYNC;
+  const int64_t pending_prefix_len = scope_ == DAS_SCOPE_NESTED_SYNC
       ? static_cast<int64_t>(nesting_depth_ - 1)
           * ObSearchIndexNestedKeyEncoder::BYTES_PER_LEVEL
       : 0;
@@ -665,7 +665,7 @@ int ObDASNestedQueryOp::compare_inner_group_with_pending(
     } else if (scope_ == DAS_SCOPE_BASE) {
       cmp = 0;
     } else if (OB_FAIL(search_ctx_.get_datum_from_rowid(
-                   DAS_SCOPE_NESTED, inner, nk_datum, 1))) {
+                   DAS_SCOPE_NESTED_SYNC, inner, nk_datum, 1))) {
       LOG_WARN("failed to get nested key from inner rowid", K(ret));
     } else if (OB_UNLIKELY(
                    nk_datum.len_ < ObSearchIndexNestedKeyEncoder::BYTES_PER_LEVEL)) {
@@ -709,7 +709,7 @@ int ObDASNestedQueryOp::emit_group_candidate(
 int ObDASNestedQueryOp::advance_to_next_group(ObDASRowID &next_id, double &score)
 {
   int ret = OB_SUCCESS;
-  const int64_t pending_prefix_len = scope_ == DAS_SCOPE_NESTED
+  const int64_t pending_prefix_len = scope_ == DAS_SCOPE_NESTED_SYNC
       ? static_cast<int64_t>(nesting_depth_ - 1)
           * ObSearchIndexNestedKeyEncoder::BYTES_PER_LEVEL
       : 0;
@@ -786,12 +786,12 @@ int ObDASNestedQueryOp::remember_for_next_skip(const ObDASRowID &emitted)
     if (OB_FAIL(search_ctx_.get_datum_from_rowid(
             scope_, emitted, group_doc_datum, 0))) {
       LOG_WARN("failed to extract emitted doc id for pending group skip", K(ret));
-    } else if (scope_ == DAS_SCOPE_NESTED) {
+    } else if (scope_ == DAS_SCOPE_NESTED_SYNC) {
       const int64_t expected_parent_len =
           static_cast<int64_t>(nesting_depth_ - 1)
           * ObSearchIndexNestedKeyEncoder::BYTES_PER_LEVEL;
       if (OB_FAIL(search_ctx_.get_datum_from_rowid(
-              DAS_SCOPE_NESTED, emitted, group_nk_datum, 1))) {
+              DAS_SCOPE_NESTED_SYNC, emitted, group_nk_datum, 1))) {
         LOG_WARN("failed to extract emitted nested prefix for pending skip", K(ret));
       } else if (OB_UNLIKELY(group_nk_datum.len_ != expected_parent_len)) {
         ret = OB_ERR_UNEXPECTED;

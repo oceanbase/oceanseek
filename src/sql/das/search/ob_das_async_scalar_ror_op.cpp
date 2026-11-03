@@ -588,7 +588,7 @@ int ObDASAsyncScalarRorOp::do_init(const ObIDASSearchOpParam &op_param)
         "direct_bind", param.get_direct_bind());
   } else if (OB_UNLIKELY(
       (DAS_SCOPE_BASE == scope_ && DAS_ROWID_TYPE_UINT64 != get_rowid_type())
-      || (DAS_SCOPE_NESTED == scope_ && DAS_ROWID_TYPE_COMPACT != get_rowid_type()))) {
+      || (DAS_SCOPE_NESTED_SYNC == scope_ && DAS_ROWID_TYPE_COMPACT != get_rowid_type()))) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("async scalar op has unexpected rowid type for scope", K(ret),
         K_(scope), "rowid_type", get_rowid_type());
@@ -732,7 +732,7 @@ int ObDASAsyncScalarRorOp::init_posting_scan_param()
   }
   // Nested scope reads the posting-value block paired with the current doc_id and expands its
   // nested_key_list.
-  posting_scan_param_.need_posting_value_ = (DAS_SCOPE_NESTED == scope_);
+  posting_scan_param_.need_posting_value_ = (DAS_SCOPE_NESTED_SYNC == scope_);
   // Scalar postings do not use BM25, but the shared posting reader validates
   // corpus statistics. A neutral average length keeps that contract satisfied.
   posting_scan_param_.avg_doc_length_ = 1.0;
@@ -1241,14 +1241,14 @@ int ObDASAsyncScalarRorOp::do_advance_to(
     LOG_WARN("async scalar posting iter is not opened", K(ret));
   } else if (OB_FAIL(get_datum_from_rowid(target, target_datum, 0))) {
     LOG_WARN("failed to convert async scalar target rowid", K(ret), K(target));
-  } else if (DAS_SCOPE_NESTED == scope_
+  } else if (DAS_SCOPE_NESTED_SYNC == scope_
       && OB_FAIL(get_datum_from_rowid(target, target_nested_key, 1))) {
     LOG_WARN("failed to get async scalar target nested key", K(ret), K(target));
   } else if (DAS_SCOPE_BASE == scope_ && OB_FAIL(posting_iter_->advance_to(target_datum))) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
       LOG_WARN("failed to advance async scalar posting iter to target", K(ret), K(target));
     }
-  } else if (DAS_SCOPE_NESTED == scope_
+  } else if (DAS_SCOPE_NESTED_SYNC == scope_
       && OB_FAIL(advance_nested_to(target_datum, target_nested_key))) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
       LOG_WARN("failed to advance nested async scalar posting", K(ret), K(target));

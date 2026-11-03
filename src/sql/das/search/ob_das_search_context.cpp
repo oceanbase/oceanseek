@@ -516,11 +516,11 @@ int ObDASSearchCtx::register_nested_scope(const sql::ExprFixedArray *nested_rowi
   if (OB_ISNULL(nested_rowid_exprs) || nested_rowid_exprs->empty()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("nested scope requires non-empty rowid_exprs", K(ret));
-  } else if (OB_FAIL(scopes_[DAS_SCOPE_NESTED].rowid_meta_.init(*nested_rowid_exprs, 0))) {
+  } else if (OB_FAIL(scopes_[DAS_SCOPE_NESTED_SYNC].rowid_meta_.init(*nested_rowid_exprs, 0))) {
     LOG_WARN("failed to init nested rowid_meta", K(ret));
   } else {
-    scopes_[DAS_SCOPE_NESTED].rowid_type_ = DAS_ROWID_TYPE_COMPACT;
-    scopes_[DAS_SCOPE_NESTED].rowid_exprs_ = nested_rowid_exprs;
+    scopes_[DAS_SCOPE_NESTED_SYNC].rowid_type_ = DAS_ROWID_TYPE_COMPACT;
+    scopes_[DAS_SCOPE_NESTED_SYNC].rowid_exprs_ = nested_rowid_exprs;
   }
   return ret;
 }

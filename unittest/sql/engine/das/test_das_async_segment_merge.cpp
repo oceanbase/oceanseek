@@ -975,7 +975,7 @@ public:
       const std::vector<ObDASRowID> &rowids)
     : ObIDASSearchOp(search_ctx), rows_(), output_buf_(), pos_(-1)
   {
-    scope_ = DAS_SCOPE_NESTED;
+    scope_ = DAS_SCOPE_NESTED_SYNC;
     op_type_ = DAS_SEARCH_OP_DUMMY;
     int64_t max_row_size = 0;
     for (int64_t i = 0; i < static_cast<int64_t>(rowids.size()); ++i) {
@@ -1443,7 +1443,7 @@ public:
       if (OB_FAIL(datums.push_back(doc_id_datum))) {
       } else if (OB_FAIL(datums.push_back(nested_key_datum))) {
       } else if (OB_FAIL(search_ctx_.write_datums_to_rowid(
-          DAS_SCOPE_NESTED, datums, rowid, source_allocator))) {
+          DAS_SCOPE_NESTED_SYNC, datums, rowid, source_allocator))) {
       } else {
         rowids.push_back(rowid);
       }
@@ -1472,7 +1472,7 @@ public:
         ret = OB_ALLOCATE_MEMORY_FAILED;
       } else {
         disjunction = new (disjunction_buf) ObDASDisjunctionFilterOp(search_ctx_);
-        disjunction->scope_ = DAS_SCOPE_NESTED;
+        disjunction->scope_ = DAS_SCOPE_NESTED_SYNC;
         ObDASDisjunctionFilterOpParam disjunction_param(
             children, 1, ObDASSearchCost(1));
         if (OB_FAIL(disjunction->init(disjunction_param))) {
@@ -1486,7 +1486,7 @@ public:
             ObDatum datum;
             if (OB_FAIL(disjunction->next_rowid(rowid, score))) {
             } else if (OB_FAIL(search_ctx_.get_datum_from_rowid(
-                DAS_SCOPE_NESTED, rowid, datum, 0))) {
+                DAS_SCOPE_NESTED_SYNC, rowid, datum, 0))) {
             } else if (datum.get_uint() != expected_rowids[i]) {
               ret = OB_ERR_UNEXPECTED;
             }
@@ -2149,7 +2149,7 @@ TEST_F(TestDASAsyncSegmentMerge, nested_async_scalar_enables_posting_value_read)
   EXPECT_FALSE(base_op.posting_scan_param_.need_posting_value_);
 
   ObDASAsyncScalarRorOp nested_op(search_ctx_);
-  nested_op.scope_ = DAS_SCOPE_NESTED;
+  nested_op.scope_ = DAS_SCOPE_NESTED_SYNC;
   nested_op.inv_idx_tablet_id_ = ObTabletID(10001);
   ASSERT_EQ(OB_SUCCESS, nested_op.init_posting_scan_param());
   EXPECT_TRUE(nested_op.posting_scan_param_.need_posting_value_);
@@ -2177,7 +2177,7 @@ TEST_F(TestDASAsyncSegmentMerge, nested_async_scalar_uses_four_column_range)
   ASSERT_EQ(OB_SUCCESS, scalar_rtdef.key_ranges_.push_back(logical_range));
 
   ObDASAsyncScalarRorOp nested_op(search_ctx_);
-  nested_op.scope_ = DAS_SCOPE_NESTED;
+  nested_op.scope_ = DAS_SCOPE_NESTED_SYNC;
   nested_op.scalar_ctdef_ = &scalar_ctdef;
   nested_op.scalar_rtdef_ = &scalar_rtdef;
   nested_op.range_idx_ = 0;
@@ -2213,25 +2213,25 @@ TEST_F(TestDASAsyncSegmentMerge, compact_rowid_records_size_and_rejects_null)
   ObArenaAllocator rowid_allocator("CompactRowID");
   ObDASRowID rowid;
   ASSERT_EQ(OB_SUCCESS, search_ctx_.write_datums_to_rowid(
-      DAS_SCOPE_NESTED, datums, rowid, rowid_allocator));
+      DAS_SCOPE_NESTED_SYNC, datums, rowid, rowid_allocator));
   const ObCompactRow *row = rowid.get_compact_row();
   ASSERT_NE(nullptr, row);
-  const RowMeta &row_meta = search_ctx_.get_scope(DAS_SCOPE_NESTED).rowid_meta_;
+  const RowMeta &row_meta = search_ctx_.get_scope(DAS_SCOPE_NESTED_SYNC).rowid_meta_;
   EXPECT_EQ(row_meta.get_row_fixed_size() + sizeof(nested_key), row->get_row_size());
 
   ObArenaAllocator copy_allocator("RowIDCopy");
   ObDASRowID copied_rowid;
   ASSERT_EQ(OB_SUCCESS, search_ctx_.deep_copy_rowid(
-      DAS_SCOPE_NESTED, rowid, copied_rowid, copy_allocator));
+      DAS_SCOPE_NESTED_SYNC, rowid, copied_rowid, copy_allocator));
   ASSERT_NE(nullptr, copied_rowid.get_compact_row());
   EXPECT_NE(row, copied_rowid.get_compact_row());
   EXPECT_EQ(row->get_row_size(), copied_rowid.get_compact_row()->get_row_size());
   ObDatum copied_doc_id;
   ObDatum copied_nested_key;
   ASSERT_EQ(OB_SUCCESS, search_ctx_.get_datum_from_rowid(
-      DAS_SCOPE_NESTED, copied_rowid, copied_doc_id, 0));
+      DAS_SCOPE_NESTED_SYNC, copied_rowid, copied_doc_id, 0));
   ASSERT_EQ(OB_SUCCESS, search_ctx_.get_datum_from_rowid(
-      DAS_SCOPE_NESTED, copied_rowid, copied_nested_key, 1));
+      DAS_SCOPE_NESTED_SYNC, copied_rowid, copied_nested_key, 1));
   EXPECT_EQ(doc_id, copied_doc_id.get_uint());
   ASSERT_EQ(sizeof(nested_key), copied_nested_key.len_);
   EXPECT_EQ(0, MEMCMP(nested_key, copied_nested_key.ptr_, sizeof(nested_key)));
@@ -2243,13 +2243,13 @@ TEST_F(TestDASAsyncSegmentMerge, compact_rowid_records_size_and_rejects_null)
   ASSERT_EQ(OB_SUCCESS, null_nested_key_datums.push_back(null_datum));
   ObDASRowID invalid_rowid;
   EXPECT_EQ(OB_ERR_UNEXPECTED, search_ctx_.write_datums_to_rowid(
-      DAS_SCOPE_NESTED, null_nested_key_datums, invalid_rowid, rowid_allocator));
+      DAS_SCOPE_NESTED_SYNC, null_nested_key_datums, invalid_rowid, rowid_allocator));
 
   ObSEArray<ObDatum, 2> null_doc_id_datums;
   ASSERT_EQ(OB_SUCCESS, null_doc_id_datums.push_back(null_datum));
   ASSERT_EQ(OB_SUCCESS, null_doc_id_datums.push_back(nested_key_datum));
   EXPECT_EQ(OB_ERR_UNEXPECTED, search_ctx_.write_datums_to_rowid(
-      DAS_SCOPE_NESTED, null_doc_id_datums, invalid_rowid, rowid_allocator));
+      DAS_SCOPE_NESTED_SYNC, null_doc_id_datums, invalid_rowid, rowid_allocator));
 }
 
 TEST_F(TestDASAsyncSegmentMerge, disjunction_owns_emitted_compact_rowid)
@@ -4263,7 +4263,7 @@ TEST_F(TestDASAsyncSegmentMerge, nested_multi_segment_range_uses_one_global_uniq
       append_async_scalar_range(rtdef, range, start_objs, end_objs, 3, 4));
 
   ObDASScopeId old_scope = DAS_SCOPE_BASE;
-  search_ctx_.enter_scope_for_op_creating(DAS_SCOPE_NESTED, old_scope);
+  search_ctx_.enter_scope_for_op_creating(DAS_SCOPE_NESTED_SYNC, old_scope);
   const int generate_ret = rtdef.generate_op(
       ObDASSearchCost(1), search_ctx_, root);
   search_ctx_.exit_scope_after_op_created(old_scope);
@@ -4271,7 +4271,7 @@ TEST_F(TestDASAsyncSegmentMerge, nested_multi_segment_range_uses_one_global_uniq
   ASSERT_NE(nullptr, root);
   ASSERT_EQ(DAS_SEARCH_OP_SORT, root->get_op_type());
   ObDASSortOp *sort = static_cast<ObDASSortOp *>(root);
-  EXPECT_EQ(DAS_SCOPE_NESTED, sort->scope_);
+  EXPECT_EQ(DAS_SCOPE_NESTED_SYNC, sort->scope_);
   EXPECT_TRUE(sort->unique_sort_);
   EXPECT_EQ(2, sort->nk_truncate_depth_);
   ASSERT_EQ(1, sort->get_children_cnt());
@@ -6883,7 +6883,7 @@ public:
   using Row = std::pair<uint64_t, std::string>;
   NestedRangeBatchOp(ObDASSearchCtx &ctx, const std::vector<Row> &rows)
     : ObIDASSearchOp(ctx), rows_(rows), pos_(0),
-      exprs_(ctx.get_scope(DAS_SCOPE_NESTED).rowid_exprs_)
+      exprs_(ctx.get_scope(DAS_SCOPE_NESTED_SYNC).rowid_exprs_)
   {}
   const ObIArray<ObExpr *> *get_rowid_output_exprs() const override { return exprs_; }
   void set_rows(const std::vector<Row> &rows) { rows_ = rows; }
@@ -6962,7 +6962,7 @@ TEST_F(TestDASMaterializedRange, nested_global_unique_sort_preserves_identity_an
       {{8, key_a}, {3, key_a + key_a}, {2, key_a}, {3, key_b}},
       {}, {{3, key_a + key_b}, {5, key_a}, {3, key_b}, {6, key_b}}};
   ObDASScopeId old_scope;
-  search_ctx_.enter_scope_for_op_creating(DAS_SCOPE_NESTED, old_scope);
+  search_ctx_.enter_scope_for_op_creating(DAS_SCOPE_NESTED_SYNC, old_scope);
   NestedRangeBatchOp child0(search_ctx_, input[0]);
   NestedRangeBatchOp child1(search_ctx_, input[1]);
   NestedRangeBatchOp child2(search_ctx_, input[2]);
@@ -7004,8 +7004,8 @@ TEST_F(TestDASMaterializedRange, nested_global_unique_sort_preserves_identity_an
     for (const Row &row : expected) {
       ASSERT_EQ(OB_SUCCESS, sort.next_rowid(rowid, score));
       ObDatum doc, key;
-      ASSERT_EQ(OB_SUCCESS, search_ctx_.get_datum_from_rowid(DAS_SCOPE_NESTED, rowid, doc, 0));
-      ASSERT_EQ(OB_SUCCESS, search_ctx_.get_datum_from_rowid(DAS_SCOPE_NESTED, rowid, key, 1));
+      ASSERT_EQ(OB_SUCCESS, search_ctx_.get_datum_from_rowid(DAS_SCOPE_NESTED_SYNC, rowid, doc, 0));
+      ASSERT_EQ(OB_SUCCESS, search_ctx_.get_datum_from_rowid(DAS_SCOPE_NESTED_SYNC, rowid, key, 1));
       EXPECT_EQ(row.first, doc.get_uint());
       EXPECT_EQ(row.second, std::string(key.ptr_, key.len_));
       EXPECT_DOUBLE_EQ(0, score);

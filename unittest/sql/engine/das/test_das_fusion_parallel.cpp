@@ -895,7 +895,7 @@ TEST(ObDASFusionSliceProviderTest, async_query_supports_docid_range)
 
   search_ctx.set_async_query_ctx(nullptr);
   ExprFixedArray nested_rowid_exprs(alloc);
-  search_ctx.scopes_[DAS_SCOPE_NESTED].rowid_exprs_ =
+  search_ctx.scopes_[DAS_SCOPE_NESTED_SYNC].rowid_exprs_ =
       &nested_rowid_exprs;
   EXPECT_FALSE(provider.is_supported(
       ObDASFusionPathType::QUERY, search_ctx));
@@ -5906,11 +5906,11 @@ TEST(ObDASBitmapOpDrainUntilTest, non_uint64_operator_scope_is_rejected)
   ObDASScanOp mock_scan_op(alloc);
   ObDASSearchCtx search_ctx(alloc, mock_scan_op);
   ASSERT_TRUE(search_ctx.is_uint64_rowid());
-  search_ctx.scopes_[DAS_SCOPE_NESTED].rowid_type_ =
+  search_ctx.scopes_[DAS_SCOPE_NESTED_SYNC].rowid_type_ =
       DAS_ROWID_TYPE_COMPACT;
 
   ObDASBitmapOp bitmap_op(search_ctx);
-  bitmap_op.scope_ = DAS_SCOPE_NESTED;
+  bitmap_op.scope_ = DAS_SCOPE_NESTED_SYNC;
   ObDASRowID boundary;
   boundary.set_max();
   uint64_t ids[2] = {};

@@ -377,7 +377,7 @@ int ObDASSortOp::do_sort()
 
       if (OB_SUCCESS == ret || (OB_ITER_END == ret && count > 0)) {
         fake_skip->reset(max_batch_size());
-        if (DAS_SCOPE_NESTED == scope_ && search_ctx_.has_docid_range()) {
+        if (DAS_SCOPE_NESTED_SYNC == scope_ && search_ctx_.has_docid_range()) {
           ObIVector *doc_id_vec = nullptr;
           ObExpr *doc_id_expr = get_sort_rowid_exprs().empty()
               ? nullptr : get_sort_rowid_exprs().at(0);

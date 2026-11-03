@@ -107,7 +107,7 @@ int ObDASAsyncScalarRangeOp::do_init(const ObIDASSearchOpParam &op_param)
         K(param.get_direct_bind()));
   } else if (OB_UNLIKELY(
       (DAS_SCOPE_BASE == scope_ && DAS_ROWID_TYPE_UINT64 != get_rowid_type())
-      || (DAS_SCOPE_NESTED == scope_ && DAS_ROWID_TYPE_COMPACT != get_rowid_type()))) {
+      || (DAS_SCOPE_NESTED_SYNC == scope_ && DAS_ROWID_TYPE_COMPACT != get_rowid_type()))) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("async scalar range op has unexpected rowid type", K(ret),
         K_(scope), "rowid_type", get_rowid_type());
@@ -121,7 +121,7 @@ int ObDASAsyncScalarRangeOp::do_init(const ObIDASSearchOpParam &op_param)
     // values, but in BASE mode it writes only the child scan's doc_id expr.
     const ObDASRowIDScope &rowid_scope = search_ctx_.get_scope(scope_);
     const common::ObIArray<ObExpr *> *producer_exprs = &scalar_ctdef_->rowkey_exprs_;
-    if (DAS_SCOPE_NESTED == scope_ || scalar_ctdef_->is_logical_table()) {
+    if (DAS_SCOPE_NESTED_SYNC == scope_ || scalar_ctdef_->is_logical_table()) {
       producer_exprs = rowid_scope.rowid_exprs_;
     }
     if (OB_ISNULL(producer_exprs)) {
@@ -197,7 +197,7 @@ int ObDASAsyncScalarRangeOp::init_range_scan_param()
     range_scan_param_.tablet_id_ = inv_idx_tablet_id_;
     range_scan_param_.query_flag_ = query_flag_;
     range_scan_param_.allocator_ = &range_iter_allocator_;
-    range_scan_param_.need_posting_value_ = DAS_SCOPE_NESTED == scope_;
+    range_scan_param_.need_posting_value_ = DAS_SCOPE_NESTED_SYNC == scope_;
     range_scan_param_.enable_doc_id_drain_ = DAS_SCOPE_BASE == scope_;
   }
   return ret;
@@ -469,7 +469,7 @@ int ObDASAsyncScalarRangeOp::get_output_exprs(
 {
   int ret = OB_SUCCESS;
   output_exprs = get_rowid_output_exprs();
-  const int64_t expected_count = DAS_SCOPE_NESTED == scope_ ? 2 : 1;
+  const int64_t expected_count = DAS_SCOPE_NESTED_SYNC == scope_ ? 2 : 1;
   if (OB_ISNULL(output_exprs) || OB_UNLIKELY(output_exprs->count() != expected_count)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected async scalar range output expr count", K(ret), K_(scope),
@@ -549,7 +549,7 @@ int ObDASAsyncScalarRangeOp::do_next_rowids(
         output_exprs->at(0), eval_ctx(), max_batch_size,
         doc_id_datums, doc_id_vector))) {
       LOG_WARN("failed to prepare async scalar doc id output", K(ret));
-    } else if (DAS_SCOPE_NESTED == scope_ && OB_FAIL(prepare_output_expr(
+    } else if (DAS_SCOPE_NESTED_SYNC == scope_ && OB_FAIL(prepare_output_expr(
         output_exprs->at(1), eval_ctx(), max_batch_size,
         nested_key_datums, nested_key_vector))) {
       LOG_WARN("failed to prepare async scalar nested key output", K(ret));

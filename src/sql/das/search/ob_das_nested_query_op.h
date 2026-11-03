@@ -10,7 +10,7 @@
  *
  * Key Responsibilities
  * - Crosses the BASE↔NESTED scope boundary. The general inner subtree runs in
- *   DAS_SCOPE_NESTED; a non-scoring direct scalar or pure should/MSM=1 subtree
+ *   DAS_SCOPE_NESTED_SYNC; a non-scoring direct scalar or pure should/MSM=1 subtree
  *   under a BASE/uint64 boundary can instead run in BASE DOC_ID_ONLY mode. Scope is
  *   selected when the inner ops are created by
  *   ObDASNestedQueryRtDef::generate_op(), not at runtime.

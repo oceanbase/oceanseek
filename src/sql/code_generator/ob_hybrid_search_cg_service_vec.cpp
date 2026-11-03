@@ -56,7 +56,7 @@ static bool extracted_scalar_has_non_pk_filter_(const ObScalarQueryNode *scalar_
 // search-index leaf generated underneath a nested() clause. BOTH conditions must hold:
 //   1) it is lexically inside an ObNestedQueryNode subtree (`in_nested`) — exactly the
 //      range that mark_subtree_nested_scope() flips to is_nested_scope_, which is what
-//      makes the runtime enter DAS_SCOPE_NESTED;
+//      makes the runtime enter DAS_SCOPE_NESTED_SYNC;
 //   2) the leaf itself carries enclosing_nested_paths_ (set by the DSL resolver when the
 //      predicate is resolved under a nested() clause).
 // Only such leaves materialize the search data index's nested_key column, so only they
@@ -127,7 +127,7 @@ static void collect_nested_scope_index_ids(const ObIndexMergeNode *node,
 // Every NESTED-scope leaf must sit on a search data index carrying nested_key: the
 // optimizer already guarantees this (check_nested_scalar_index_candidate), so a violation
 // is an internal error — reporting it here is far better than leaving
-// scopes_[DAS_SCOPE_NESTED].rowid_exprs_ null for ObDASNestedQueryOp to dereference.
+// scopes_[DAS_SCOPE_NESTED_SYNC].rowid_exprs_ null for ObDASNestedQueryOp to dereference.
 static int check_and_pick_nested_scope_anchor(ObSqlSchemaGuard *schema_guard,
                                               const ObIArray<uint64_t> &ids,
                                               uint64_t &anchor)
@@ -272,7 +272,7 @@ int ObHybridSearchCgService::populate_nested_rowid_exprs(ObLogTableScan &op,
     ObLogPlan *plan = op.get_plan();
     // Whether the NESTED rowid scope is needed is a property of the QUERY, not of the
     // referenced index schemas: only leaves generated under a nested() clause run in
-    // DAS_SCOPE_NESTED and materialize nested_key. A mixed table may own a nested-capable
+    // DAS_SCOPE_NESTED_SYNC and materialize nested_key. A mixed table may own a nested-capable
     // search index while this query never queries it in nested scope — in that case
     // nested_key must not become part of the rowid exprs. So collect the anchor strictly
     // from the NESTED-scope leaves; an empty result means "no nested key in this query".

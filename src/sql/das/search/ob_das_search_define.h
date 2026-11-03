@@ -55,7 +55,8 @@ enum ObDASRowIDType {
 
 enum ObDASScopeId {
   DAS_SCOPE_BASE = 0,
-  DAS_SCOPE_NESTED = 1,
+  DAS_SCOPE_NESTED_SYNC = 1,
+  DAS_SCOPE_NESTED_ASYNC = 2, // Reserved for async nested-key execution.
   DAS_SCOPE_MAX
 };
 

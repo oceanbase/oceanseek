@@ -139,7 +139,7 @@ public:
   */
   int get_related_tablet_id(const ObDASScalarScanCtDef *scalar_ctdef, common::ObTabletID &tablet_id);
 
-  // Populates scopes_[DAS_SCOPE_NESTED]. Call once after init() when ctdef has NESTED_PATHS.
+  // Populates scopes_[DAS_SCOPE_NESTED_SYNC]. Call once after init() when ctdef has NESTED_PATHS.
   // nested_rowid_exprs must be non-null and non-empty (typically [doc_id_expr, nested_key_expr]).
   int register_nested_scope(const sql::ExprFixedArray *nested_rowid_exprs);
 
@@ -258,7 +258,7 @@ public:
       common::ObNewVersionRange &version_range,
       bool &is_empty) const;
   OB_INLINE bool has_nested_scope() const
-  { return nullptr != scopes_[DAS_SCOPE_NESTED].rowid_exprs_; }
+  { return nullptr != scopes_[DAS_SCOPE_NESTED_SYNC].rowid_exprs_; }
   OB_INLINE void set_async_index_table_id(const uint64_t index_table_id)
   { async_index_table_id_ = index_table_id; }
   OB_INLINE uint64_t get_async_index_table_id() const { return async_index_table_id_; }
