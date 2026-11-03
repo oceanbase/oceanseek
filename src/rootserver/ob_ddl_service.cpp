@@ -7506,6 +7506,24 @@ int ObDDLService::generate_aux_index_schema_(
         LOG_WARN("fail to create inner expr index", K(ret));
       }
     }
+    if (OB_SUCC(ret) && INDEX_TYPE_SEARCH_DATA_INDEX_LOCAL == index_schema.get_index_type()) {
+      // The child task uses the search-data version as the base tablet's write fence.
+      // Creating search-data only advances its definition table's schema version.
+      ObSchemaService *schema_service = nullptr;
+      if (OB_ISNULL(schema_service_)
+          || OB_ISNULL(schema_service = schema_service_->get_schema_service())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("schema service is null", KR(ret));
+      } else if (OB_FAIL(schema_service->get_table_sql_service().update_data_table_schema_version(
+                     trans,
+                     tenant_id,
+                     data_schema->get_table_id(),
+                     index_schema.get_in_offline_ddl_white_list()))) {
+        LOG_WARN("fail to sync search index data table schema version", KR(ret),
+                 "data_table_id", data_schema->get_table_id(),
+                 "index_table_id", index_schema.get_table_id());
+      }
+    }
   }
   return ret;
 }
