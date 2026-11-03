@@ -5191,6 +5191,11 @@ int ObSQLUtils::handle_audit_record(bool need_retry,
     if (OB_ISNULL(req_manager)) {
       // failed to get request manager, maybe tenant has been dropped, NOT NEED TO record;
     } else {
+      ObAuditRecordData &raw_audit_record = session.get_raw_audit_record();
+      if (!raw_audit_record.is_executor_rpc_ && OB_SUCCESS != raw_audit_record.status_) {
+        // 语句失败时清零顶层冲突数，保留 worker 审计明细。
+        raw_audit_record.insert_update_or_replace_duplicate_row_count_ = 0;
+      }
       const ObAuditRecordData &audit_record = session.get_final_audit_record(exec_mode);
       if (OB_FAIL(req_manager->record_request(audit_record,
                                               session.enable_query_response_time_stats(),

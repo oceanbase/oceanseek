@@ -61,13 +61,16 @@ struct ObPxDmlRowInfo
 {
   OB_UNIS_VERSION(1);
 public:
-  ObPxDmlRowInfo() : row_match_count_(0), row_duplicated_count_(0), row_deleted_count_(0) {}
+  ObPxDmlRowInfo()
+      : row_match_count_(0), row_duplicated_count_(0), row_deleted_count_(0),
+        insert_update_or_replace_duplicate_row_count_(0) {}
   ~ObPxDmlRowInfo() = default;
   void reset()
   {
     row_match_count_ = 0;
     row_duplicated_count_ = 0;
     row_deleted_count_ = 0;
+    insert_update_or_replace_duplicate_row_count_ = 0;
   }
   void set_px_dml_row_info(const ObPhysicalPlanCtx &plan_ctx);
   void add_px_dml_row_info(ObPxDmlRowInfo &row_info)
@@ -75,12 +78,16 @@ public:
     row_match_count_ += row_info.row_match_count_;
     row_duplicated_count_ += row_info.row_duplicated_count_;
     row_deleted_count_ += row_info.row_deleted_count_;
+    insert_update_or_replace_duplicate_row_count_ += row_info.insert_update_or_replace_duplicate_row_count_;
   }
-  TO_STRING_KV(K_(row_match_count), K_(row_duplicated_count), K_(row_deleted_count))
+  TO_STRING_KV(K_(row_match_count), K_(row_duplicated_count), K_(row_deleted_count),
+               K_(insert_update_or_replace_duplicate_row_count))
 public:
   int64_t row_match_count_;
   int64_t row_duplicated_count_;
   int64_t row_deleted_count_;
+  // 审计冲突数包含不变值冲突，与客户端重复行统计口径不同。
+  int64_t insert_update_or_replace_duplicate_row_count_;
 };
 
 // keep for compatiblity. never should be used anymore

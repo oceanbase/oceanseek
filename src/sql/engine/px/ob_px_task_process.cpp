@@ -301,6 +301,11 @@ int ObPxTaskProcess::process()
         audit_record.total_ssstore_read_row_count_ = exec_record.get_ssstore_read_row_count();
       }
     }
+    // 成功执行后，在审计清空和 task 退出前保存本次冲突数。
+    if (OB_SUCC(ret) && OB_NOT_NULL(arg_.sqc_task_ptr_)) {
+      arg_.sqc_task_ptr_->dml_row_info_.insert_update_or_replace_duplicate_row_count_ =
+          audit_record.insert_update_or_replace_duplicate_row_count_;
+    }
     ObSQLUtils::handle_audit_record(false, EXECUTE_DIST, *session);
   }
   release();

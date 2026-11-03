@@ -38,7 +38,8 @@ OB_SERIALIZE_MEMBER(ObPxFinishSqcResultMsg, dfo_id_, sqc_id_, rc_, trans_result_
                     sqc_fuse_row_cache_hit_, sqc_network_wait_time_,
                     sqc_iceberg_data_files_, sqc_async_result_files_);
 OB_SERIALIZE_MEMBER(ObPxFinishTaskResultMsg, dfo_id_, sqc_id_, task_id_, rc_);
-OB_SERIALIZE_MEMBER(ObPxDmlRowInfo, row_match_count_, row_duplicated_count_, row_deleted_count_);
+OB_SERIALIZE_MEMBER(ObPxDmlRowInfo, row_match_count_, row_duplicated_count_, row_deleted_count_,
+                    insert_update_or_replace_duplicate_row_count_);
 OB_SERIALIZE_MEMBER(ObPxTabletRange, tablet_id_, range_cut_, range_weights_);
 OB_SERIALIZE_MEMBER(ObAsyncResultFileDesc, row_count_, byte_count_, file_path_,
                     writer_sqc_id_, writer_task_id_, file_sequence_);

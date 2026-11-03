@@ -402,6 +402,8 @@ int ObPxMsgProc::process_sqc_finish_msg_once(ObExecContext &ctx, const ObPxFinis
       } else  {
         ctx.get_physical_plan_ctx()->add_affected_rows(pkt.sqc_affected_rows_);
         ctx.get_physical_plan_ctx()->add_px_dml_row_info(pkt.dml_row_info_);
+        session->get_raw_audit_record().insert_update_or_replace_duplicate_row_count_ +=
+            pkt.dml_row_info_.insert_update_or_replace_duplicate_row_count_;
         ctx.get_physical_plan_ctx()->add_total_memstore_read_row_count(
           pkt.sqc_memstore_row_read_count_);
         ctx.get_physical_plan_ctx()->add_total_ssstore_read_row_count(
