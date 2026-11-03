@@ -120,6 +120,7 @@
 #include <atomic>
 #include <memory>
 #include "test_async_index_compaction_common.h"
+#include "storage/async_index/ob_async_index_trigger.h"
 #include "storage/async_index/ob_async_index_retention_helper.h"
 #include "rootserver/freeze/ob_major_merge_progress_checker.h"
 #include "rootserver/freeze/ob_major_merge_info_manager.h"
@@ -963,7 +964,8 @@ int ObAsyncIndexCompactionTest::add_delete_inc_major_to_tablet(
     const ObTabletID &tablet_id,
     const int64_t base_version,
     const int64_t snapshot_version,
-    const int64_t commit_version)
+    const int64_t commit_version,
+    const bool empty)
 {
   int ret = OB_SUCCESS;
   ObTabletHandle tablet_handle;
@@ -1019,9 +1021,9 @@ int ObAsyncIndexCompactionTest::add_delete_inc_major_to_tablet(
         create_param.ddl_scn_.set_base();
         create_param.filled_tx_scn_ = create_param.table_key_.scn_range_.end_scn_;
         create_param.rec_scn_ = SCN::plus(create_param.table_key_.get_start_scn(), 1);
-        create_param.occupy_size_ = DEFAULT_SEG_SIZE;
-        create_param.original_size_ = DEFAULT_SEG_SIZE;
-        create_param.row_count_ = 1;
+        create_param.occupy_size_ = empty ? 0 : DEFAULT_SEG_SIZE;
+        create_param.original_size_ = empty ? 0 : DEFAULT_SEG_SIZE;
+        create_param.row_count_ = empty ? 0 : 1;
       }
     }
   }
@@ -3354,7 +3356,8 @@ void ObAsyncIndexCompactionTest::set_undo_retention_zero()
   ObTenantFreezeInfoMgr *freeze_info_mgr = MTL(ObTenantFreezeInfoMgr *);
   ASSERT_NE(nullptr, freeze_info_mgr);
   int64_t duration = -1;
-  for (int64_t i = 0; duration != 0 && i < 100; ++i) {
+  // Config reload can exceed 10 seconds on a loaded shared test host.
+  for (int64_t i = 0; duration != 0 && i < 600; ++i) {
     ASSERT_EQ(OB_SUCCESS, freeze_info_mgr->get_multi_version_duration(duration));
     if (duration != 0) {
       ob_usleep(100 * 1000);
@@ -3376,7 +3379,7 @@ void ObAsyncIndexCompactionTest::set_mvcc_gc_using_min_txn_snapshot(const bool e
       enable ? "true" : "false"));
   OK(sys_exe_sql(sql.ptr()));
   bool applied = false;
-  for (int64_t i = 0; !applied && i < 100; ++i) {
+  for (int64_t i = 0; !applied && i < 600; ++i) {
     omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
     applied = tenant_config.is_valid()
         && tenant_config->_mvcc_gc_using_min_txn_snapshot == enable;
@@ -4529,7 +4532,7 @@ TEST_F(ObAsyncIndexCompactionTest, deletion_bitmap_survives_mvs_advance)
   ASSERT_EQ(OB_SUCCESS,
       before_delete_handle.get_obj()->get_kept_snapshot_for_async_index(
           deletion_kept_snapshot));
-  ASSERT_EQ(INT64_MAX, deletion_kept_snapshot);
+  ASSERT_EQ(deletion_latest_snapshot, deletion_kept_snapshot);
 
   int64_t actual_multi_version_start = 0;
   ASSERT_EQ(OB_SUCCESS, add_non_empty_delete_index_major_via_merge_ctx(
@@ -5843,7 +5846,7 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_common_checkpoint_and_major_reten
       MTL_ID(), ls_handle.get_ls(), ctx.data_tablet_id_, info));
   const ObTabletID ids[] = {ctx.data_tablet_id_, ctx.fts_index_tablet_ids_.at(0),
       ctx.fts_index_tablet_ids_.at(1), ctx.delete_index_tablet_id_};
-  const int64_t caps[] = {common, base, common, INT64_MAX};
+  const int64_t caps[] = {common, base, common, common};
   for (int64_t i = 0; i < ARRAYSIZEOF(ids); ++i) {
     SCOPED_TRACE(i);
     ObTabletHandle handle;
@@ -5873,7 +5876,7 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_common_checkpoint_and_major_reten
   }
   ObTabletHandle delete_handle;
   ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(ctx.delete_index_tablet_id_, delete_handle));
-  ASSERT_GE(delete_handle.get_obj()->get_multi_version_start(), common);
+  ASSERT_EQ(common, delete_handle.get_obj()->get_multi_version_start());
   ASSERT_FALSE(has_major_sstable_at_snapshot(ctx.ls_id_, ctx.delete_index_tablet_id_, base));
   ASSERT_TRUE(has_major_sstable_at_snapshot(ctx.ls_id_, ctx.delete_index_tablet_id_, common));
   // After delete catches up, an ordinary async index becomes the slow member.
@@ -5917,6 +5920,230 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_registered_major_survives_gc)
   MultiAsyncIndexTabletCtx ctx;
   resolve_multi_async_index_tablet_ctx(table_name, ctx);
   ASSERT_NO_FATAL_FAILURE(run_async_index_compaction_execute(ctx, true /*gc_after_schedule*/));
+}
+
+TEST(AsyncDeleteRetentionTest, no_major_keeps_current_mvs)
+{
+  ObTablet tablet;
+  tablet.table_store_cache_.is_async_delete_index_ = true;
+  tablet.table_store_cache_.last_major_snapshot_version_ = 0;
+  tablet.tablet_meta_.multi_version_start_ = 100;
+  int64_t retention = INT64_MAX;
+  ASSERT_EQ(OB_SUCCESS, tablet.get_kept_snapshot_for_async_index(retention));
+  ASSERT_EQ(100, retention);
+}
+
+// Regression for DIMA 2026102000119920051. Ordinary GC must preserve a future
+// published merge target, then an actual merge must release refresh capacity.
+TEST_F(ObAsyncIndexCompactionTest, async_delete_gc_preserves_merge_and_refresh_progress)
+{
+  share::ObTenantSwitchGuard tguard;
+  OK(tguard.switch_to(run_ctx_.tenant_id_));
+  exe_prepare_sql();
+  const char *table_name = "t_async_delete_gc_mvs_repro";
+  ASSERT_NO_FATAL_FAILURE(create_async_fts_table(table_name));
+  MultiAsyncIndexTabletCtx ctx;
+  ASSERT_NO_FATAL_FAILURE(resolve_multi_async_index_tablet_ctx(table_name, ctx));
+  ObLSHandle ls_handle;
+  ASSERT_EQ(OB_SUCCESS, get_ls_handle(ctx.ls_id_, ls_handle));
+  ObLS &ls = *ls_handle.get_ls();
+  const ObTabletID &tablet_id = ctx.delete_index_tablet_id_;
+  const int64_t old_major = get_max_tablet_create_commit_version(ctx) + 1;
+  const int64_t latest_major = old_major + 1;
+  const int64_t inc_count = OB_ASYNC_INDEX_SSTABLE_COUNT_THRESHOLD;
+  const int64_t published = latest_major + inc_count;
+
+  // Construct committed SSTable metadata using the existing fixture. Two
+  // Majors make ordinary GC eligible; 48 logical refresh windows reproduce
+  // the incident's capacity boundary without waiting for 48 timer rounds.
+  ASSERT_EQ(48, inc_count);
+  ASSERT_EQ(OB_SUCCESS, add_empty_data_major_to_tablet(ls_handle, tablet_id, old_major));
+  ASSERT_EQ(OB_SUCCESS, add_empty_data_major_to_tablet(ls_handle, tablet_id, latest_major));
+  ObAsyncIndexDepProvider provider;
+  ObAsyncIndexTrigger trigger;
+  ASSERT_EQ(OB_SUCCESS, trigger.init(MTL_ID(), &provider));
+  for (int64_t i = 1; i <= inc_count; ++i) {
+    ASSERT_EQ(OB_SUCCESS, add_delete_inc_major_to_tablet(ls_handle, tablet_id,
+        latest_major + i - 1, latest_major + i, latest_major + i + 1, true /*empty*/));
+    if (i == inc_count - 1) {
+      bool under_threshold = false;
+      ASSERT_EQ(OB_SUCCESS, trigger.check_index_sstable_count_(&ls, tablet_id, under_threshold));
+      ASSERT_TRUE(under_threshold) << "47 IncMajors must still permit refresh";
+    }
+  }
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(ls_handle, tablet_id, published));
+
+  ObTabletHandle before_gc;
+  ASSERT_EQ(OB_SUCCESS, ls.get_tablet(tablet_id, before_gc));
+  const int64_t old_mvs = before_gc.get_obj()->get_multi_version_start();
+  ASSERT_LE(old_mvs, latest_major);
+  int64_t retention = 0;
+  ASSERT_EQ(OB_SUCCESS, before_gc.get_obj()->get_kept_snapshot_for_async_index(retention));
+  ASSERT_EQ(latest_major, retention);
+
+  // A tablet's physical read snapshot can lead its logical publication.
+  // Prepare that input while preserving MVS, publication and every SSTable;
+  // the subsequent scheduler GC must stop at the installed Major.
+  const int64_t physical_snapshot = ObTimeUtility::current_time_ns();
+  ASSERT_GT(physical_snapshot, published);
+  ObStorageSchema *storage_schema = nullptr;
+  ASSERT_EQ(OB_SUCCESS, before_gc.get_obj()->load_storage_schema(allocator_, storage_schema));
+  ObUpdateTableStoreParam snapshot_param(
+      physical_snapshot, old_mvs, storage_schema, ls.get_rebuild_seq());
+  ObTabletHandle prepared;
+  ASSERT_EQ(OB_SUCCESS, ls.update_tablet_table_store(tablet_id, snapshot_param, prepared));
+  ASSERT_EQ(old_mvs, prepared.get_obj()->get_multi_version_start());
+  ASSERT_TRUE(has_major_sstable_at_snapshot(ctx.ls_id_, tablet_id, old_major));
+  int64_t actual_published = 0;
+  ASSERT_EQ(OB_SUCCESS, prepared.get_obj()->get_latest_async_index_published_version(actual_published));
+  ASSERT_EQ(published, actual_published);
+  fprintf(stdout, "FIX before_gc tablet=%lu latest_major=%ld published=%ld mvs=%ld physical=%ld inc_count=%ld\n",
+      tablet_id.id(), latest_major, published, old_mvs, physical_snapshot, inc_count);
+  fflush(stdout);
+
+  ASSERT_NO_FATAL_FAILURE(set_undo_retention_zero());
+  DEFER(set_undo_retention_default());
+  ASSERT_NO_FATAL_FAILURE(set_mvcc_gc_using_min_txn_snapshot(false));
+  DEFER(set_mvcc_gc_using_min_txn_snapshot(true));
+  ASSERT_NO_FATAL_FAILURE(trigger_async_index_sstable_gc(ctx, physical_snapshot));
+
+  ObTabletHandle after_gc;
+  ASSERT_EQ(OB_SUCCESS, ls.get_tablet(tablet_id, after_gc));
+  const int64_t new_mvs = after_gc.get_obj()->get_multi_version_start();
+  ASSERT_EQ(latest_major, new_mvs);
+  ASSERT_LT(new_mvs, published);
+  ASSERT_EQ(latest_major, after_gc.get_obj()->get_last_major_snapshot_version());
+  ASSERT_EQ(OB_SUCCESS, after_gc.get_obj()->get_latest_async_index_published_version(actual_published));
+  ASSERT_EQ(published, actual_published);
+  ASSERT_FALSE(has_major_sstable_at_snapshot(ctx.ls_id_, tablet_id, old_major));
+  int64_t actual_count = 0;
+  ASSERT_EQ(OB_SUCCESS, provider.get_index_minor_sstable_count(MTL_ID(), &ls, tablet_id, actual_count));
+  ASSERT_EQ(inc_count, actual_count);
+  fprintf(stdout, "FIX after_gc latest_major=%ld published=%ld mvs=%ld old_major_removed=1 inc_count=%ld\n",
+      latest_major, actual_published, new_mvs, actual_count);
+  fflush(stdout);
+
+  // Keep an actual pending checkpoint in MDS, with the FTS sibling caught up.
+  // Invoke the production timer trigger directly so background scheduling
+  // cannot consume our deliberately constructed SSTables.
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+      ls_handle, ctx.fts_index_tablet_ids_.at(0), physical_snapshot));
+  ObTabletAsyncIndexRefreshInfo refresh_info;
+  refresh_info.set_has_async_index(true);
+  ASSERT_EQ(OB_SUCCESS, refresh_info.append_refresh_snapshot(published));
+  ASSERT_EQ(OB_SUCCESS, refresh_info.append_refresh_snapshot(physical_snapshot));
+  ASSERT_EQ(OB_SUCCESS, provider.set_async_index_refresh_info(MTL_ID(), &ls, ctx.data_tablet_id_, refresh_info));
+  ObAsyncIndexDataTableInfo data_info;
+  ASSERT_EQ(OB_SUCCESS, provider.get_single_table_refresh_info(
+      MTL_ID(), ctx.data_table_id_, allocator_, data_info));
+  ASSERT_EQ(1, data_info.data_tablet_infos_.count());
+  ASSERT_EQ(2, data_info.index_infos_.count());
+  ASSERT_EQ(OB_SUCCESS, provider.refresh_snapshot_scn());
+
+  ObRefreshDecisionArray decisions;
+  ASSERT_EQ(OB_SUCCESS, trigger.check_and_generate_tasks(data_info, 0, &ls, decisions));
+  ASSERT_EQ(0, decisions.count()) << "48 IncMajors still defer refresh until compaction";
+  const ObMediumCompactionInfoList *medium_list = nullptr;
+  ASSERT_EQ(OB_SUCCESS, after_gc.get_obj()->read_medium_info_list(allocator_, medium_list));
+  ASSERT_NE(nullptr, medium_list);
+  SCN weak_read_scn;
+  ASSERT_EQ(OB_SUCCESS, weak_read_scn.convert_for_tx(physical_snapshot));
+  ObScheduleTabletCnt schedule_cnt;
+  ObMediumCompactionScheduleFunc medium_func(ls, weak_read_scn, *medium_list,
+      &schedule_cnt, ObAdaptiveMergePolicy::TOO_MANY_INC_MAJOR);
+  ASSERT_EQ(OB_SUCCESS, medium_func.init_tablet_handle(after_gc, actual_published));
+  bool submitted = false;
+  ASSERT_EQ(OB_SUCCESS, medium_func.decide_medium_snapshot(0, submitted));
+  ASSERT_TRUE(submitted);
+  ASSERT_EQ(1, schedule_cnt.submit_clog_cnt_);
+
+  const int64_t register_deadline = ObTimeUtility::current_time() + 30L * 1000 * 1000;
+  bool registered = false;
+  while (!registered && ObTimeUtility::current_time() < register_deadline) {
+    ASSERT_EQ(OB_SUCCESS, ls.get_tablet(tablet_id, after_gc));
+    ASSERT_EQ(OB_SUCCESS, after_gc.get_obj()->read_medium_info_list(allocator_, medium_list));
+    registered = nullptr != find_medium_info_by_snapshot(medium_list, published);
+    if (!registered) {
+      ob_usleep(100 * 1000);
+    }
+  }
+  ASSERT_TRUE(registered);
+  ASSERT_EQ(OB_SUCCESS, wait_ls_weak_read_ts(ls, published));
+  ObTabletMergeDagParam dag_param;
+  ASSERT_EQ(OB_SUCCESS, ObDagParamFunc::fill_param(
+      ctx.ls_id_, *after_gc.get_obj(), MEDIUM_MERGE, published, EXEC_MODE_LOCAL,
+      dag_param, 0 /*merge_base_version*/));
+  ASSERT_FALSE(dag_param.is_inv_index_);
+  const auto completion = std::make_shared<AsyncIndexMergeCompletion>();
+  ObDagId dag_id;
+  ObTenantTabletScheduler *scheduler = MTL(ObTenantTabletScheduler *);
+  ASSERT_NE(nullptr, scheduler);
+  // The fixture persists SUSPEND MERGE; resume that state too, otherwise
+  // FreezeInfoMgr can pause the scheduler again while the DAG is running.
+  ASSERT_EQ(OB_SUCCESS, sys_exe_sql("alter system resume merge tenant = tt1;"));
+  DEFER({
+    EXPECT_EQ(OB_SUCCESS, sys_exe_sql("alter system suspend merge tenant = tt1;"));
+    scheduler->stop_major_merge();
+  });
+  scheduler->resume_major_merge();
+  ASSERT_EQ(OB_SUCCESS, submit_observed_async_index_merge<ObTabletMajorMergeDag>(
+      dag_param, completion, dag_id));
+  const int64_t merge_deadline = ObTimeUtility::current_time() + 120L * 1000 * 1000;
+  while (!completion->finished_.load(std::memory_order_acquire)
+      && ObTimeUtility::current_time() < merge_deadline) {
+    ob_usleep(100 * 1000);
+  }
+  ASSERT_TRUE(completion->finished_.load(std::memory_order_acquire));
+  ASSERT_EQ(OB_SUCCESS, completion->ret_);
+  ASSERT_EQ(OB_SUCCESS, sys_exe_sql("alter system suspend merge tenant = tt1;"));
+  scheduler->stop_major_merge();
+  ASSERT_EQ(OB_SUCCESS, ls.get_tablet(tablet_id, after_gc));
+  ASSERT_EQ(published, after_gc.get_obj()->get_last_major_snapshot_version());
+  ASSERT_EQ(OB_SUCCESS, provider.get_index_minor_sstable_count(MTL_ID(), &ls, tablet_id, actual_count));
+  ASSERT_EQ(0, actual_count);
+  fprintf(stdout, "FIX merge_completed target=%ld latest_major=%ld inc_count=%ld submitted=%d\n",
+      published, after_gc.get_obj()->get_last_major_snapshot_version(), actual_count, submitted);
+  fflush(stdout);
+
+  // A new Major moves the retention boundary forward; GC may now reclaim L.
+  ASSERT_NO_FATAL_FAILURE(trigger_async_index_sstable_gc(ctx, physical_snapshot));
+  ASSERT_EQ(OB_SUCCESS, ls.get_tablet(tablet_id, after_gc));
+  ASSERT_EQ(OB_SUCCESS, after_gc.get_obj()->get_kept_snapshot_for_async_index(retention));
+  ASSERT_EQ(published, retention);
+  ASSERT_EQ(published, after_gc.get_obj()->get_multi_version_start());
+  ASSERT_FALSE(has_major_sstable_at_snapshot(ctx.ls_id_, tablet_id, latest_major));
+
+  ASSERT_EQ(OB_SUCCESS, trigger.check_and_generate_tasks(data_info, 0, &ls, decisions));
+  ASSERT_EQ(1, decisions.count());
+  ASSERT_EQ(tablet_id, decisions.at(0).index_tablet_id_);
+  ASSERT_EQ(published, async_index_scn_to_snapshot(decisions.at(0).start_refresh_scn_));
+  ASSERT_EQ(physical_snapshot, async_index_scn_to_snapshot(decisions.at(0).target_refresh_scn_));
+  ObAsyncIndexDirectRefreshParam refresh_param;
+  refresh_param.tenant_id_ = MTL_ID();
+  refresh_param.ls_ = &ls;
+  refresh_param.data_table_id_ = ctx.data_table_id_;
+  refresh_param.index_table_id_ = ctx.delete_index_table_id_;
+  refresh_param.data_tablet_id_ = ctx.data_tablet_id_;
+  refresh_param.index_tablet_id_ = tablet_id;
+  refresh_param.target_refresh_scn_ = decisions.at(0).target_refresh_scn_;
+  refresh_param.op_ = DIRECT_REFRESH_OP_DELETE_OLD;
+  refresh_param.refresh_type_ = ASYNC_REFRESH_TYPE_MANUAL;
+  ASSERT_EQ(OB_SUCCESS, MTL(ObAsyncIndexService *)->trigger_incr_refresh(refresh_param));
+  // The SQL can return before the local MDS on_commit callback is visible.
+  const int64_t publish_deadline = ObTimeUtility::current_time() + 30L * 1000 * 1000;
+  while (actual_published < physical_snapshot && ObTimeUtility::current_time() < publish_deadline) {
+    ASSERT_EQ(OB_SUCCESS, ls.get_tablet(tablet_id, after_gc));
+    ASSERT_EQ(OB_SUCCESS, after_gc.get_obj()->get_latest_async_index_published_version(actual_published));
+    if (actual_published < physical_snapshot) {
+      ob_usleep(100 * 1000);
+    }
+  }
+  ASSERT_EQ(physical_snapshot, actual_published);
+  ASSERT_EQ(OB_SUCCESS, after_gc.get_obj()->get_kept_snapshot_for_async_index(retention));
+  ASSERT_EQ(published, retention) << "retention follows the installed Major, not publication";
+  fprintf(stdout, "FIX refresh_completed published=%ld previous_published=%ld retention=%ld refresh_tasks=%ld\n",
+      actual_published, published, retention, decisions.count());
+  fflush(stdout);
 }
 
 TEST_F(ObAsyncIndexCompactionTest, async_delete_medium_selects_logical_inc_major)

@@ -1601,7 +1601,8 @@ public:
       const ObTabletID &tablet_id,
       const int64_t base_version,
       const int64_t snapshot_version,
-      const int64_t commit_version);
+      const int64_t commit_version,
+      const bool empty = false);
   int update_tablet_multi_version_start(
       ObLSHandle &ls_handle,
       const ObTabletID &tablet_id,
