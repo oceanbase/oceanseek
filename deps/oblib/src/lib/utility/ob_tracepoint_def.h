@@ -732,4 +732,8 @@ GLOBAL_ERRSIM_POINT_DEF(2721, EN_BATCH_FILE_OP_SUBMIT_TASK_ERR, "batch file oper
 GLOBAL_ERRSIM_POINT_DEF(2722, EN_BATCH_FILE_OP_POLL_SLOT_ERR, "batch file operator poll slot error");
 GLOBAL_ERRSIM_POINT_DEF(2723, EN_BATCH_FILE_OP_OUTPUT_RESULT_ERR, "batch file operator output result error");
 // AI/BatchFile Pipeline end
+// Database isolation
+GLOBAL_ERRSIM_POINT_DEF(2730, EN_ENABLE_DATABASE_ISOLATION, "force enable database isolation mode");
+GLOBAL_ERRSIM_POINT_DEF(2731, EN_CHECK_PROXY_DB_ACCURACY, "Check proxy specified database against resolved database");
+
 #endif /*GLOBAL_ERRSIM_POINT_DEF*/

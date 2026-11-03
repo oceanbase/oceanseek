@@ -38,6 +38,9 @@ int ObPxPools::init(uint64_t tenant_id)
   ObMemAttr attr(tenant_id, "PxPoolBkt");
   if (OB_FAIL(pool_map_.create(PX_POOL_COUNT, attr, attr))) {
     LOG_WARN("fail init pool map", K(ret));
+  } else {
+    ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
+    enable_database_isolation_mode_ = tenant_config.is_valid() ? tenant_config->_enable_database_isolation_mode : false;
   }
   return ret;
 }
@@ -72,6 +75,7 @@ int ObPxPools::create_pool(int64_t group_id, ObPxPool *&pool)
       } else {
         pool->set_tenant_id(tenant_id_);
         pool->set_group_id(group_id);
+        pool->set_enable_database_isolation_mode(enable_database_isolation_mode_);
         if (OBCG_DEFAULT == group_id) {
           pool->set_thread_group_id(OB_THREAD_GROUP_PX);
         }
@@ -335,13 +339,20 @@ void ObPxPool::run1()
 void ObPxPool::try_recycle(int64_t idle_time)
 {
   // recycle thread policy:
-  // 1. first N threads reserved for first 10 min idle period
-  // 2. no thread reserved after 1 hour idle period
+  // 1. first N threads reserved for first idle_start_recycle_us idle period
+  // 2. no thread reserved after idle_full_recycle_us idle period
+  // enable_database_isolation_mode_ cached at ObPxPools init
   //
   // impl. note: must ensure active_threads_ > concurrency_, otherwise may hang task
   const int N = 8;
-  if ((idle_time > 10LL * 60 * 1000 * 1000 && get_thread_count() >= N)
-      || idle_time > 60LL * 60 * 1000 * 1000) {
+  int64_t idle_start_recycle_us = enable_database_isolation_mode_
+      ? (1LL * 60 * 1000 * 1000)   // 1 min
+      : (10LL * 60 * 1000 * 1000); // 10 min
+  int64_t idle_full_recycle_us = enable_database_isolation_mode_
+      ? (5LL * 60 * 1000 * 1000)   // 5 min
+      : (60LL * 60 * 1000 * 1000); // 60 min
+  if ((idle_time > idle_start_recycle_us && get_thread_count() >= N)
+      || idle_time > idle_full_recycle_us) {
     if (OB_SUCCESS == recycle_lock_.trylock()) {
       if (ATOMIC_LOAD(&active_threads_) > ATOMIC_LOAD(&concurrency_)) {
         ATOMIC_DEC(&active_threads_);

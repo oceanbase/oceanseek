@@ -18847,7 +18847,31 @@ def_table_schema(**gen_iterate_virtual_table_def(
   table_name = '__all_virtual_optstat_catalog_global_prefs',
   keywords = all_def_keywords['__all_optstat_catalog_global_prefs']))
 
-# 12603: __all_virtual_tenant_worker_group
+def_table_schema(
+  owner             = 'fyy280124',
+  table_name        = '__all_virtual_tenant_worker_group',
+  table_id          = '12603',
+  table_type        = 'VIRTUAL_TABLE',
+  in_tenant_space   = True,
+  gm_columns        = [],
+  rowkey_columns    = [],
+  normal_columns    = [
+    ('svr_ip',              'varchar:MAX_IP_ADDR_LENGTH'),
+    ('svr_port',            'int'),
+    ('tenant_id',           'int'),
+    ('group_id',            'int'),
+    ('workers_size',        'int'),
+    ('req_queue_size',      'int'),
+    ('recv_req_cnt',        'int'),
+    ('deleted',             'bool'),
+    ('token_change_ts',     'int'),
+    ('throttled_time_us',   'int'),
+    ('idle_cnt',            'int'),
+    ('last_not_empty_ts',   'int'),
+  ],
+  partition_columns = ['svr_ip', 'svr_port'],
+  vtable_route_policy = 'distributed',
+)
 # 12604: __all_virtual_keyword
 # 12605: __all_virtual_shared_meta_control
 # 12606: __all_virtual_shared_gc_task
@@ -19838,7 +19862,7 @@ def_table_schema(**gen_oracle_mapping_real_virtual_table_def('15546', all_def_ke
 # 15549: __all_virtual_sql_group_commit_stat
 # 15550: __all_external_resource
 # 15551: __all_java_policy
-# 15552: __all_virtual_tenant_worker_group
+def_table_schema(**gen_oracle_mapping_virtual_table_def('15552', all_def_keywords['__all_virtual_tenant_worker_group']))
 # 15553: __all_virtual_keyword
 
 # 余留位置（此行之前占位）
@@ -48179,7 +48203,33 @@ def_table_schema(
 # 21720: DBA_SCHEDULER_RUNNING_JOBS
 # 21721: CDB_SCHEDULER_RUNNING_JOBS
 # 21722: CDB_SCHEDULER_JOBS
-# 21723: GV$OB_TENANT_WORKER_GROUPS
+def_table_schema(
+  owner           = 'fyy280124',
+  table_name      = 'GV$OB_TENANT_WORKER_GROUPS',
+  table_id        = '21723',
+  table_type      = 'SYSTEM_VIEW',
+  rowkey_columns  = [],
+  normal_columns  = [],
+  gm_columns      = [],
+  in_tenant_space = True,
+  view_definition = """
+SELECT
+     svr_ip AS SVR_IP,
+     svr_port AS SVR_PORT,
+     tenant_id AS TENANT_ID,
+     group_id AS GROUP_ID,
+     workers_size AS WORKERS_SIZE,
+     req_queue_size AS REQ_QUEUE_SIZE,
+     recv_req_cnt AS RECV_REQ_CNT,
+     deleted AS DELETED,
+     token_change_ts AS TOKEN_CHANGE_TS,
+     throttled_time_us AS THROTTLED_TIME_US,
+     idle_cnt AS IDLE_CNT,
+     last_not_empty_ts AS LAST_NOT_EMPTY_TS
+FROM
+    oceanbase.__all_virtual_tenant_worker_group
+""".replace("\n", " ")
+)
 # 21724: V$OB_KEYWORDS
 # 21725: DBA_OB_AGENT_DB_BACKGROUND_TASKS
 # 21726: CDB_OB_AGENT_DB_BACKGROUND_TASKS
@@ -83999,7 +84049,35 @@ LEFT JOIN SYS.ALL_VIRTUAL_TABLE_REAL_AGENT C ON A.table_id = C.table_id
 ORDER BY A.create_time
 """.replace("\n", " ")
 )
-# 28296: GV$OB_TENANT_WORKER_GROUPS
+def_table_schema(
+  owner           = 'fyy280124',
+  table_name      = 'GV$OB_TENANT_WORKER_GROUPS',
+  name_postfix    = '_ORA',
+  database_id     = 'OB_ORA_SYS_DATABASE_ID',
+  table_id        = '28296',
+  table_type      = 'SYSTEM_VIEW',
+  rowkey_columns  = [],
+  normal_columns  = [],
+  gm_columns      = [],
+  in_tenant_space = True,
+  view_definition = """
+SELECT
+    SVR_IP,
+    SVR_PORT,
+    TENANT_ID,
+    GROUP_ID,
+    WORKERS_SIZE,
+    REQ_QUEUE_SIZE,
+    RECV_REQ_CNT,
+    DELETED,
+    TOKEN_CHANGE_TS,
+    THROTTLED_TIME_US,
+    IDLE_CNT,
+    LAST_NOT_EMPTY_TS
+FROM
+    SYS.ALL_VIRTUAL_TENANT_WORKER_GROUP
+""".replace("\n", " ")
+)
 
 # 余留位置（此行之前占位）
 # 本区域占位建议：采用真实视图名进行占位

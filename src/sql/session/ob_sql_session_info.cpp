@@ -168,8 +168,9 @@ ObSQLSessionInfo::ObSQLSessionInfo(const uint64_t tenant_id) :
       dblink_context_(this),
       dblink_ctx_acc_cnt_(0),
       sql_req_level_(0),
-      expect_group_id_(OB_INVALID_ID),
-      group_id_not_expected_(false),
+      group_isolation_arr_(),
+      proxy_group_retry_pending_(false),
+      proxy_specified_db_name_(),
       gtt_session_scope_unique_id_(0),
       gtt_trans_scope_unique_id_(0),
       gtt_tablet_info_map_(),
@@ -384,9 +385,10 @@ void ObSQLSessionInfo::reset(bool skip_sys_var)
     int temp_ret = OB_SUCCESS;
     sql_req_level_ = 0;
     optimizer_tracer_.reset();
-    expect_group_id_ = OB_INVALID_ID;
+    reset_all_group_isolation();
+    proxy_group_retry_pending_ = false;
     flt_control_info_.reset();
-    group_id_not_expected_ = false;
+    proxy_specified_db_name_.reset();
     //call at last time
     if (dblink_ctx_acc_cnt_ > 0) {
       dblink_context_.reset(); // need reset before ObBasicSessionInfo::reset(skip_sys_var);
@@ -3499,6 +3501,7 @@ void ObSQLSessionInfo::ObCachedTenantConfigInfo::refresh()
       LOG_DEBUG("refresh tenant config where tenant changed",
                   K_(saved_tenant_info), K(effective_tenant_id));
       ATOMIC_STORE(&saved_tenant_info_, effective_tenant_id);
+      ATOMIC_STORE(&data_version_, 0); // Fail closed if the new tenant version cannot be loaded.
     }
     // 缓存data version 用于性能优化
     uint64_t data_version = 0;
@@ -3584,6 +3587,7 @@ void ObSQLSessionInfo::ObCachedTenantConfigInfo::refresh()
       ATOMIC_STORE(&multimodel_memory_trace_level_, 
                    tenant_config->_multimodel_memory_trace_level > 2 ? 0 : tenant_config->_multimodel_memory_trace_level);
       ATOMIC_STORE(&enable_pl_sql_parameterize_, tenant_config->_enable_pl_sql_parameterize);
+      enable_database_isolation_mode_ = tenant_config->_enable_database_isolation_mode;
     }
     conf_enable_sql_audit_ = GCONF.enable_sql_audit;
     ATOMIC_STORE(&last_check_ec_ts_, cur_ts);

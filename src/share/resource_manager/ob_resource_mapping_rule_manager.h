@@ -9,6 +9,7 @@
 #include "lib/utility/ob_macro_utils.h"
 #include "common/data_buffer.h"
 #include "lib/string/ob_string.h"
+#include "lib/charset/ob_charset.h"
 #include "lib/hash/ob_hashmap.h"
 #include "share/ob_define.h"
 #include "share/resource_manager/ob_resource_plan_info.h"
@@ -20,9 +21,46 @@ namespace common
 {
 class ObString;
 }
+namespace sql
+{
+class ObSQLSessionInfo;
+}
 namespace share
 {
 class ObResourceManagerProxy;
+
+// Own the database name and use the same comparison contract as database schema lookup.
+class ObTenantDatabaseKey : public ObTenantFunctionKey
+{
+public:
+  ObTenantDatabaseKey() : case_mode_(common::OB_ORIGIN_AND_SENSITIVE) {}
+  ObTenantDatabaseKey(uint64_t tenant_id, const common::ObString &database, common::ObNameCaseMode mode)
+      : ObTenantFunctionKey(tenant_id, database), case_mode_(mode) {}
+  int assign(const ObTenantDatabaseKey &other)
+  {
+    case_mode_ = other.case_mode_;
+    return ObTenantFunctionKey::assign(other);
+  }
+  uint64_t hash() const
+  {
+    const uint64_t seed = common::murmurhash(&tenant_id_, sizeof(tenant_id_), 0);
+    return common::ObCharset::hash(collation(), func_name_.get_value(), seed);
+  }
+  int hash(uint64_t &value) const { value = hash(); return common::OB_SUCCESS; }
+  bool operator==(const ObTenantDatabaseKey &other) const
+  {
+    return tenant_id_ == other.tenant_id_ && case_mode_ == other.case_mode_
+        && 0 == common::ObCharset::strcmp(collation(), func_name_.get_value(), other.func_name_.get_value());
+  }
+private:
+  common::ObCollationType collation() const
+  {
+    return common::OB_ORIGIN_AND_SENSITIVE == case_mode_
+        ? common::CS_TYPE_UTF8MB4_BIN : common::CS_TYPE_UTF8MB4_GENERAL_CI;
+  }
+  common::ObNameCaseMode case_mode_;
+};
+
 class ObResourceMappingRuleManager
 {
 public:
@@ -179,6 +217,9 @@ public:
     return ret;
   }
 
+  int get_group_id_by_database(const sql::ObSQLSessionInfo &session,
+                               const common::ObString &database, uint64_t &group_id);
+
   inline int get_group_name_by_id(const uint64_t tenant_id,
                                   const uint64_t group_id,
                                   ObGroupName &group_name)
@@ -218,12 +259,20 @@ private:
       const uint64_t tenant_id,
       const ObString &plan);
   int clear_resource_user_mapping_rule(const uint64_t tenant_id, const ObResourceUserMappingRuleSet &rules);
+  int refresh_resource_database_mapping_rule(
+      ObResourceManagerProxy &proxy,
+      const uint64_t tenant_id,
+      const ObString &plan);
+  int clear_resource_database_mapping_rule(const uint64_t tenant_id, const ObResourceMappingRuleSet &rules,
+                                           common::ObNameCaseMode case_mode);
 private:
   /* variables */
   // 将用户 id 映射到 group id，用于用户登录时快速确定登录用户所属 cgroup
   common::hash::ObHashMap<sql::ObTenantUserKey, uint64_t> user_rule_map_;
   // 将 function 映射到 group id，用于后台线程快速确定后台 session 所属 cgroup
   common::hash::ObHashMap<share::ObTenantFunctionKey, uint64_t> function_rule_map_;
+  // 将 database 映射到 group id，用于根据数据库名称快速确定所属 cgroup
+  common::hash::ObHashMap<ObTenantDatabaseKey, uint64_t> database_rule_map_;
   // 将 group_id 映射到 group_name, 用于快速更新 cgroup fs 目录(包括user和function使用的group)
   common::hash::ObHashMap<ObTenantGroupIdKey, ObGroupName> group_id_name_map_;
   // 将 group_name 映射到 group_id, 用于快速根据group_name找到id(主要是用于io控制)

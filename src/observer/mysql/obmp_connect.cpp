@@ -19,6 +19,7 @@
 #include "sql/engine/dml/ob_trigger_handler.h"
 #include "share/ob_license_utils.h"
 #include "share/ob_tenant_info_proxy.h"
+#include "share/resource_manager/ob_database_isolation_utils.h"
 #include "lib/encrypt/ob_encrypted_helper.h"
 
 using namespace oceanbase::share;
@@ -375,6 +376,7 @@ int ObMPConnect::process()
                "user_id", session->get_user_id(),
                K(tenant_id),
                K(user_name_),
+               "database_name", session->get_database_name(),
                "group_id", conn->group_id_,
                "sql_req_level", conn->sql_req_level_);
       conn->set_auth_phase();
@@ -1912,6 +1914,9 @@ int ObMPConnect::check_update_proxy_capability(ObSMConnection &conn) const
     ObProxyCapabilityFlags server_proxy_cap_flag;
     server_proxy_cap_flag.cap_flags_.OB_CAP_PARTITION_TABLE = 1;
     server_proxy_cap_flag.cap_flags_.OB_CAP_CHANGE_USER = 1;
+    // Database resource isolation uses one-way synchronization of proxy database info.
+    server_proxy_cap_flag.cap_flags_.OB_CAP_PROXY_EXTRA_INFO_ONE_WAY_SYNC =
+        GET_MIN_CLUSTER_VERSION() >= DATABASE_ISOLATION_MIN_CLUSTER_VERSION;
     server_proxy_cap_flag.cap_flags_.OB_CAP_READ_WEAK = 1;
     server_proxy_cap_flag.cap_flags_.OB_CAP_CHECKSUM = 1;
     server_proxy_cap_flag.cap_flags_.OB_CAP_SAFE_WEAK_READ = 0;

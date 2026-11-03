@@ -196,6 +196,7 @@
 #include "observer/virtual_table/ob_all_virtual_dup_ls_tablets.h"
 #include "observer/virtual_table/ob_all_virtual_opt_stat_gather_monitor.h"
 #include "observer/virtual_table/ob_all_virtual_thread.h"
+#include "observer/virtual_table/ob_all_virtual_tenant_worker_group.h"
 #include "observer/virtual_table/ob_all_virtual_sandbox_process.h"
 #include "observer/virtual_table/ob_all_virtual_dup_ls_tablet_set.h"
 #include "observer/virtual_table/ob_all_virtual_px_p2p_datahub.h"
@@ -2857,6 +2858,13 @@ int ObVTIterCreator::create_vt_iter(ObVTableScanParam &params,
             if (OB_SUCC(NEW_VIRTUAL_TABLE(ObAllVirtualSqlPlan, sql_plan_table))) {
               sql_plan_table->set_allocator(&allocator);
               vt_iter = static_cast<ObVirtualTableIterator *>(sql_plan_table);
+            }
+            break;
+          }
+          case OB_ALL_VIRTUAL_TENANT_WORKER_GROUP_TID: {
+            ObAllVirtualTenantWorkerGroup *all_virtual_tenant_worker_group = NULL;
+            if (OB_SUCC(NEW_VIRTUAL_TABLE(ObAllVirtualTenantWorkerGroup, all_virtual_tenant_worker_group))) {
+              vt_iter = static_cast<ObVirtualTableIterator *>(all_virtual_tenant_worker_group);
             }
             break;
           }

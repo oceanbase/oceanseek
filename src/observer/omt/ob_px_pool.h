@@ -38,6 +38,7 @@ public:
       is_inited_(false),
       concurrency_(0),
       active_threads_(0),
+      enable_database_isolation_mode_(false),
       is_expanding_(false),
       recycle_lock_(common::ObLatchIds::OB_PX_POOL_RECYCLE_LOCK)
   {}
@@ -53,6 +54,7 @@ public:
   int submit(const RunFuncT &func);
   void set_px_thread_name();
   int64_t get_queue_size() const { return queue_.size(); }
+  void set_enable_database_isolation_mode(bool mode) { enable_database_isolation_mode_ = mode; }
 private:
   void apply_px_worker_thread_sched_priority();
   void handle(common::ObLink *task);
@@ -72,6 +74,7 @@ private:
   bool is_inited_;
   int64_t concurrency_;
   int64_t active_threads_;
+  bool enable_database_isolation_mode_;
   bool is_expanding_;
   mutable common::ObSpinLock recycle_lock_;
 };
@@ -127,7 +130,9 @@ public:
     pools = nullptr;
   }
 public:
-  ObPxPools() : tenant_id_(common::OB_INVALID_ID), lock_(common::ObLatchIds::OB_PX_POOLS_LOCK)
+  ObPxPools() : tenant_id_(common::OB_INVALID_ID),
+                enable_database_isolation_mode_(false),
+                lock_(common::ObLatchIds::OB_PX_POOLS_LOCK)
   {}
   ~ObPxPools()
   {
@@ -141,6 +146,7 @@ private:
   int create_pool(int64_t group_id, ObPxPool *&pool);
 private:
   uint64_t tenant_id_;
+  bool enable_database_isolation_mode_;
   common::SpinRWLock lock_;
   common::hash::ObHashMap<int64_t, ObPxPool *> pool_map_;
 };

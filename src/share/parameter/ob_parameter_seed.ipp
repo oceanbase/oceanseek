@@ -3699,3 +3699,7 @@ DEF_BOOL(ob_enable_java_udf_sandbox, OB_CLUSTER_PARAMETER, "False",
 DEF_BOOL(_enable_search_index, OB_TENANT_PARAMETER, "True",
          "enable search index merge optimization for scalar predicates on search indexes",
          ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+
+DEF_BOOL(_enable_database_isolation_mode, OB_TENANT_PARAMETER, "False",
+    "enable database isolation mode",
+    ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::STATIC_EFFECTIVE));

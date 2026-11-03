@@ -5,6 +5,7 @@
 
 #include <gtest/gtest.h>
 #include "rpc/obmysql/ob_mysql_packet.h"
+#include "rpc/obmysql/obp20_extra_info.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::rpc;
@@ -156,4 +157,63 @@ int main(int argc, char *argv[])
 {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
+}
+
+TEST_F(TestMySQLPacket, proxy_database_decode_and_copy)
+{
+  char packet[128] = {};
+  int64_t size = 0;
+  ASSERT_EQ(OB_SUCCESS, ObProtoTransUtil::store_type_and_len(
+      packet, sizeof(packet), size, PROXY_ONE_WAY_SYNC_INFO, 11));
+  ASSERT_EQ(OB_SUCCESS, ObProtoTransUtil::store_str(
+      packet, sizeof(packet), size, "sales", 5, PROXY_SYNC_DATABASE_TYPE));
+  Obp20ProxyOneWaySyncDecoder decoder;
+  Ob20ExtraInfo decoded;
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, decoder.deserialize(packet, size, pos, decoded));
+  EXPECT_EQ(size, pos);
+  ASSERT_EQ(5, decoded.get_total_len());
+  EXPECT_EQ(ObString::make_string("sales"), decoded.get_sql_database());
+
+  char owned[5];
+  Ob20ExtraInfo copied;
+  ASSERT_EQ(OB_SUCCESS, copied.assign(decoded, owned, sizeof(owned)));
+  MEMSET(packet, 'x', sizeof(packet));
+  EXPECT_EQ(ObString::make_string("sales"), copied.get_sql_database());
+  copied.reset();
+  EXPECT_FALSE(copied.exist_sql_database());
+}
+
+TEST_F(TestMySQLPacket, proxy_database_rejects_truncated_container)
+{
+  char packet[128] = {};
+  int64_t size = 0;
+  // The parent has only one byte; following packet bytes cannot complete its TLV.
+  ASSERT_EQ(OB_SUCCESS, ObProtoTransUtil::store_type_and_len(
+      packet, sizeof(packet), size, PROXY_ONE_WAY_SYNC_INFO, 1));
+  ASSERT_EQ(OB_SUCCESS, ObProtoTransUtil::store_str(
+      packet, sizeof(packet), size, "sales", 5, PROXY_SYNC_DATABASE_TYPE));
+  Obp20ProxyOneWaySyncDecoder decoder;
+  Ob20ExtraInfo decoded;
+  int64_t pos = 0;
+  EXPECT_NE(OB_SUCCESS, decoder.deserialize(packet, size, pos, decoded));
+  EXPECT_LE(pos, 7);
+  EXPECT_FALSE(decoded.exist_sql_database());
+}
+
+TEST_F(TestMySQLPacket, proxy_database_skips_unknown_subkey)
+{
+  char packet[128] = {};
+  int64_t size = 0;
+  ASSERT_EQ(OB_SUCCESS, ObProtoTransUtil::store_type_and_len(
+      packet, sizeof(packet), size, PROXY_ONE_WAY_SYNC_INFO, 18));
+  ASSERT_EQ(OB_SUCCESS, ObProtoTransUtil::store_str(packet, sizeof(packet), size, "x", 1, 99));
+  ASSERT_EQ(OB_SUCCESS, ObProtoTransUtil::store_str(
+      packet, sizeof(packet), size, "sales", 5, PROXY_SYNC_DATABASE_TYPE));
+  Obp20ProxyOneWaySyncDecoder decoder;
+  Ob20ExtraInfo decoded;
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, decoder.deserialize(packet, size, pos, decoded));
+  EXPECT_EQ(size, pos);
+  EXPECT_EQ(ObString::make_string("sales"), decoded.get_sql_database());
 }

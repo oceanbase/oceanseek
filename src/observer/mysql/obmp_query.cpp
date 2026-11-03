@@ -88,6 +88,7 @@ int ObMPQuery::process()
     THIS_WORKER.set_session(sess);
     ObSQLSessionInfo &session = *sess;
     ObSQLSessionInfo::LockGuard lock_guard(session.get_query_lock());
+    DEFER(session.reset_proxy_specified_db_name());
     session.set_current_trace_id(ObCurTraceId::get_trace_id());
     session.init_use_rich_format();
     session.set_proxy_version(conn->is_proxy_ ? conn->proxy_version_ : 0);
@@ -147,6 +148,19 @@ int ObMPQuery::process()
       } else if (OB_FAIL(process_extra_info(session, pkt, need_response_error))) {
         LOG_WARN("fail get process extra info", K(ret));
       } else if (FALSE_IT(session.post_sync_session_info())) {
+        // Prepare the transaction baseline before group switching marks the session for retry.
+      } else if (OB_FAIL(check_proxy_db_resource_group(session))) {
+        if (OB_NEED_SWITCH_CONSUMER_GROUP == ret && THIS_WORKER.can_retry()) {
+          THIS_WORKER.set_need_retry();
+          retry_ctrl_.set_packet_retry(ret);
+          session.set_session_in_retry(retry_ctrl_.need_retry());
+          session.get_retry_info_for_update().set_last_query_retry_err(ret);
+          session.get_retry_info_for_update().inc_retry_cnt();
+          need_response_error = false;
+          LOG_TRACE("retry query by proxy specified database group", K(ret));
+        } else {
+          LOG_WARN("fail to check proxy database resource group", K(ret));
+        }
       } else if (OB_UNLIKELY(packet_len > session.get_max_packet_size())) {
         //packet size check with session variable max_allowd_packet or net_buffer_length
         need_disconnect = false;
@@ -341,22 +355,7 @@ int ObMPQuery::process()
     }
   }
 
-  /* Function setup_user_resource_group cause performance regression. 
-      No need to setup group_id here, 
-      Only setup group_id in MPConnect
-  */
   if (is_conn_valid()) {
-    // int tmp_ret = OB_SUCCESS;
-    // // Call setup_user_resource_group no matter OB_SUCC or OB_FAIL
-    // // because we have to reset conn.group_id_ according to user_name.
-    // // Otherwise, suppose we execute a query with a mapping rule on the column in the query at first,
-    // // we switch to the defined consumer group, batch_group for example,
-    // // and after that, the next query will also be executed with batch_group.
-    // if (OB_UNLIKELY(OB_SUCCESS !=
-    //         (tmp_ret = setup_user_resource_group(*conn, sess->get_effective_tenant_id(), sess)))) {
-    //   LOG_WARN("fail setup user resource group", K(tmp_ret), K(ret));
-    //   ret = OB_SUCC(ret) ? tmp_ret : ret;
-    // }
     set_request_expect_group_id(sess);
   }
   if (OB_FAIL(ret) && need_response_error && is_conn_valid()) {
@@ -824,6 +823,7 @@ OB_INLINE int ObMPQuery::do_process_trans_ctrl(ObSQLSessionInfo &session,
     }
     session.set_retry_wait_event_begin_time();
     ctx_.enable_sql_resource_manage_ = true;
+    ctx_.enable_database_isolation_mode_ = session.is_enable_database_isolation_mode();
     if (OB_FAIL(set_session_active(sql, session, single_process_timestamp_))) {
       LOG_WARN("fail to set session active", K(ret));
     } else {
@@ -1144,6 +1144,7 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
       task_ctx.set_min_cluster_version(GET_MIN_CLUSTER_VERSION());
       ctx_.retry_times_ = retry_ctrl_.get_retry_times();
       ctx_.enable_sql_resource_manage_ = true;
+      ctx_.enable_database_isolation_mode_ = session.is_enable_database_isolation_mode();
       //storage::ObPartitionService* ps = static_cast<storage::ObPartitionService *> (GCTX.par_ser_);
       //bool is_read_only = false;
       if (OB_FAIL(ret)) {
@@ -1219,6 +1220,16 @@ OB_INLINE int ObMPQuery::do_process(ObSQLSessionInfo &session,
             if (OB_TRANSACTION_SET_VIOLATION != ret && OB_REPLICA_NOT_READABLE != ret) {
               LOG_WARN("execute query fail", K(ret), "timeout_timestamp",
                        plan_ctx->get_timeout_timestamp());
+            }
+          }
+        }
+        if (OB_SUCC(ret) && stmt::T_USE_DATABASE == result.get_stmt_type() && is_conn_valid()) {
+          ObSMConnection *conn = get_conn();
+          if (OB_NOT_NULL(conn)) {
+            int tmp_ret = setup_user_resource_group(*conn, session.get_effective_tenant_id(), &session);
+            if (OB_SUCCESS != tmp_ret) {
+              LOG_WARN("fail setup user resource group after use database",
+                       K(tmp_ret), K(session.get_database_name()));
             }
           }
         }

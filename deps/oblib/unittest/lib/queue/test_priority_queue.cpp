@@ -4,6 +4,8 @@
  */
 
 #include <gtest/gtest.h>
+#include <atomic>
+#include <thread>
 #include "lib/allocator/ob_malloc.h"
 #include "lib/queue/ob_priority_queue.h"
 
@@ -110,6 +112,30 @@ private:
   Queue queue_;
   bool stop_ = false;
 }; // end of class Consumer
+
+// A signal after prepare must reach the chosen group slot, including wrapped
+// indices, even if the consumer has not entered futex wait yet.
+TEST(TestPriorityQueue, GroupIndexedWakeup)
+{
+  const int32_t indices[] = {0, SCondTemp<3>::COND_COUNT - 1,
+                             SCondTemp<3>::COND_COUNT + 3};
+  for (int32_t index : indices) {
+    SCondTemp<3> cond(ObWaitEventIds::PRIORITY_QUEUE_COND_WAIT);
+    std::atomic<bool> prepared(false);
+    int wait_ret = OB_ERR_UNEXPECTED;
+    std::thread consumer([&]() {
+      cond.prepare(2, index);
+      prepared.store(true);
+      wait_ret = cond.wait(1000000);
+    });
+    while (!prepared.load()) {
+      std::this_thread::yield();
+    }
+    cond.signal(1, 0, true);
+    consumer.join();
+    EXPECT_EQ(OB_SUCCESS, wait_ret) << "group index: " << index;
+  }
+}
 
 TEST(TestPriorityQueue, WithCoro)
 {

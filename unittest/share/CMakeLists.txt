@@ -128,3 +128,5 @@ add_subdirectory(scheduler)
 add_subdirectory(catalog)
 add_subdirectory(diagnosis)
 add_subdirectory(logical_table)
+
+ob_unittest(test_database_isolation)
