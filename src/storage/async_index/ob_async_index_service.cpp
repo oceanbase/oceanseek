@@ -17,6 +17,8 @@
 #include "lib/time/ob_time_utility.h"
 #include "src/share/rc/ob_tenant_base.h"
 #include "share/ob_get_compat_mode.h"  // ObCompatModeGetter
+#include "share/schema/ob_multi_version_schema_service.h"
+#include "share/ob_debug_sync.h"
 #include "lib/utility/utility.h"       // ob_usleep
 
 namespace oceanbase
@@ -564,7 +566,7 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
       }
     }
     if (data_tablet_pos < 0) {
-      ret = OB_ERR_UNEXPECTED;
+      ret = OB_TABLET_NOT_EXIST;
       LOG_WARN("data_tablet_id not found in schema tablet list",
                K(ret), K(param.data_tablet_id_), K(param.data_table_id_));
     }
@@ -775,6 +777,10 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
         if (OB_FAIL(task.set_task(task_param))) {
           LOG_WARN("failed to set direct refresh task", K(ret), K(task_param));
         } else {
+          // Pause the user index SQL, not the shared delete index that may run first.
+          if (ASYNC_REFRESH_TYPE_MANUAL == param.refresh_type_ && !index_info->is_delete_index_) {
+            DEBUG_SYNC(BEFORE_MANUAL_ASYNC_INDEX_REFRESH_EXECUTE);
+          }
           ret = task.handle();
           // When handle() skips execution (publish_scn already advanced by a
           // concurrent task), it does NOT call publish_stat(), so stat_.end_time_
@@ -821,6 +827,31 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
     } while ((OB_EAGAIN == ret || OB_NEED_RETRY == ret) && retry_cnt < MAX_REFRESH_RETRY_CNT);
   }
 
+  if (OB_TABLE_NOT_EXIST == ret && ASYNC_REFRESH_TYPE_MANUAL == param.refresh_type_) {
+    // The RPC caller ignores TABLE_NOT_EXIST for dropped indexes. A stale SQL name after
+    // RENAME must instead reach the outer retry, which rebuilds schema, SQL and routing.
+    int tmp_ret = OB_SUCCESS;
+    share::schema::ObSchemaGetterGuard schema_guard;
+    const share::schema::ObTableSchema *data_schema = nullptr;
+    const share::schema::ObTableSchema *index_schema = nullptr;
+    if (OB_SUCCESS != (tmp_ret = GSCHEMASERVICE.get_tenant_schema_guard(param.tenant_id_, schema_guard))) {
+      LOG_WARN("failed to get schema guard after manual refresh error", K(tmp_ret), K(param));
+    } else if (OB_SUCCESS != (tmp_ret = schema_guard.get_table_schema(
+        param.tenant_id_, param.data_table_id_, data_schema))) {
+      LOG_WARN("failed to recheck data table after manual refresh error", K(tmp_ret), K(param));
+    } else if (OB_SUCCESS != (tmp_ret = schema_guard.get_table_schema(
+        param.tenant_id_, param.index_table_id_, index_schema))) {
+      LOG_WARN("failed to recheck index table after manual refresh error", K(tmp_ret), K(param));
+    } else if (nullptr != data_schema && !data_schema->is_in_deleting() && !data_schema->is_in_recyclebin()
+        && nullptr != index_schema && !index_schema->is_in_deleting() && !index_schema->is_in_recyclebin()) {
+      ret = OB_SCHEMA_EAGAIN;
+      LOG_INFO("manual refresh objects still exist, retry with current schema", K(ret), K(param));
+    }
+    if (OB_SUCCESS != tmp_ret) {
+      // A failed lookup cannot establish that the object was dropped.
+      ret = OB_TABLE_NOT_EXIST == tmp_ret ? OB_SCHEMA_EAGAIN : tmp_ret;
+    }
+  }
   return ret;
 }
 

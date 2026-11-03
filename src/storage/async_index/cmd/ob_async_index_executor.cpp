@@ -10,6 +10,7 @@
 #include "pl/ob_pl.h"
 #include "lib/charset/ob_charset.h"
 #include "share/ob_async_index_refresh_util.h"
+#include "share/ob_ddl_common.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "storage/async_index/ob_async_index_define.h"
 #include "storage/tx/ob_ts_mgr.h"
@@ -20,6 +21,15 @@ namespace oceanbase
 {
 namespace storage
 {
+
+static bool is_manual_refresh_retry_error(const int ret)
+{
+  return OB_OLD_SCHEMA_VERSION == ret || OB_SCHEMA_EAGAIN == ret
+      || OB_DDL_SCHEMA_VERSION_NOT_MATCH == ret || OB_NEED_RETRY == ret
+      || OB_INVALID_QUERY_TIMESTAMP == ret || OB_TASK_EXPIRED == ret
+      || is_master_changed_error(ret) || is_partition_change_error(ret)
+      || share::is_ddl_stmt_packet_retry_err(ret);
+}
 
 int ObAsyncIndexExecutor::execute_forcemerge(pl::ObPLExecCtx &pl_ctx, const ObAsyncIndexForceMergeCmdArg &arg)
 {
@@ -79,13 +89,33 @@ int ObAsyncIndexExecutor::execute_refresh(pl::ObPLExecCtx &pl_ctx, const ObAsync
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("[ASYNC_INDEX] invalid gts", KR(ret), K_(tenant_id), K(cur_scn));
       } else {
+        const uint64_t data_table_id = table_schema->get_table_id();
         const int64_t target_scn = cur_scn.get_val_for_tx();
-        if (OB_FAIL(share::ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
-                    tenant_id_, table_schema->get_table_id(), target_scn, async_index_table_ids,
-                    static_cast<int8_t>(ASYNC_REFRESH_TYPE_MANUAL)))) {
-          LOG_WARN("[ASYNC_INDEX] fail to manually trigger refresh for table",
-                   KR(ret), K_(tenant_id), K_(db_name), K_(table_name), K(target_scn));
-        } else {
+        constexpr int64_t MAX_RETRY_COUNT = 3;
+        constexpr int64_t RETRY_INTERVAL_US = 1000 * 1000;
+        int64_t retry_cnt = 0;
+        bool need_retry = true;
+        // Keep object IDs and the target across retries, including partially committed RPCs.
+        // Each call rebuilds tablet/LS routing; the receiver fetches schema and regenerates SQL.
+        while (need_retry) {
+          need_retry = false;
+          if (OB_FAIL(ctx_->check_status())) {
+            LOG_WARN("[ASYNC_INDEX] manual refresh was interrupted", KR(ret), K(retry_cnt));
+          } else if (OB_FAIL(share::ObAsyncIndexRefreshUtil::trigger_refresh_for_table(
+                      tenant_id_, data_table_id, target_scn, async_index_table_ids,
+                      static_cast<int8_t>(ASYNC_REFRESH_TYPE_MANUAL)))) {
+            LOG_WARN("[ASYNC_INDEX] fail to manually trigger refresh for table",
+                     KR(ret), K_(tenant_id), K(data_table_id), K(target_scn), K(retry_cnt));
+            if (retry_cnt < MAX_RETRY_COUNT && is_manual_refresh_retry_error(ret)) {
+              ++retry_cnt;
+              need_retry = true;
+              LOG_INFO("[ASYNC_INDEX] retry manual refresh with fresh schema and routing",
+                       KR(ret), K_(tenant_id), K(data_table_id), K(target_scn), K(retry_cnt));
+              ob_usleep(RETRY_INTERVAL_US);
+            }
+          }
+        }
+        if (OB_SUCC(ret)) {
           LOG_INFO("[ASYNC_INDEX] manually triggered refresh for existing async indexes", K_(db_name), K_(table_name));
         }
       }
