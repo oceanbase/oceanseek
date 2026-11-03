@@ -131,7 +131,8 @@ public:
       inc_pk_proj_(0),
       index_column_cnt_(0),
       search_idx_included_cid_idxes_(alloc),
-      column_comments_(alloc) {}
+      column_comments_(alloc),
+      search_index_target_(share::SEARCH_DATA) {}
 
   int dup_origin_column_defs(common::ObIArray<ObJtColBaseInfo*>& columns);
   int construct_tree(common::ObArray<ObMultiModeTableNode*> all_nodes, JoinNode* parent);
@@ -151,6 +152,7 @@ public:
   int64_t index_column_cnt_;
   common::ObFixedArray<int32_t, common::ObIAllocator> search_idx_included_cid_idxes_;
   common::ObFixedArray<ObString, common::ObIAllocator> column_comments_;
+  share::ObSearchIndexRowTarget search_index_target_;
 };
 
 class ObJsonTableOp;

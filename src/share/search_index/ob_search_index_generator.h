@@ -26,6 +26,8 @@ class ObCollectionArrayType;
 namespace share
 {
 
+enum ObSearchIndexRowTarget { SEARCH_DATA = 0, SEARCH_TEXT_MATCH = 1, SEARCH_TEXT_PHRASE = 2 };
+
 // Generated search-index tuple: [column_idx, path, value, doc_id] or
 //                               [column_idx, path, value, doc_id, nested_key] for nested input.
 // The fifth column is a rowkey in synchronous search; async search folds it into a posting value.

@@ -346,6 +346,7 @@ OB_DEF_SERIALIZE(ObJsonTableSpec)
     OB_UNIS_ENCODE(index_column_cnt_);
     OB_UNIS_ENCODE(search_idx_included_cid_idxes_);
     OB_UNIS_ENCODE(column_comments_);
+    OB_UNIS_ENCODE(search_index_target_);
   }
   
   return ret;
@@ -390,6 +391,7 @@ OB_DEF_SERIALIZE_SIZE(ObJsonTableSpec)
     OB_UNIS_ADD_LEN(index_column_cnt_);
     OB_UNIS_ADD_LEN(search_idx_included_cid_idxes_);
     OB_UNIS_ADD_LEN(column_comments_);
+    OB_UNIS_ADD_LEN(search_index_target_);
   }
   return len;
 }
@@ -478,6 +480,7 @@ OB_DEF_DESERIALIZE(ObJsonTableSpec)
     OB_UNIS_DECODE(index_column_cnt_);
     OB_UNIS_DECODE(search_idx_included_cid_idxes_);
     OB_UNIS_DECODE(column_comments_);
+    OB_UNIS_DECODE(search_index_target_);
   } else if (OB_FAIL(value_exprs_.init(1))) {
     LOG_WARN("fail to init value_exprs_ array.", K(ret));
   } else if (OB_FAIL(value_exprs_.push_back(value_expr))) {
