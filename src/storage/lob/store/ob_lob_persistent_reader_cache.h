@@ -17,30 +17,36 @@ namespace storage
 class ObLobAuxTableBaseIterator;
 class ObLobAccessCtx;
 
-// @brief Lob reader cache key
-// reader cache 与 Sql Exec context 生命周期绑定，不会跨线程和 sql 使用
-// 因此 flashback_snapshot（闪回查询）不需要作为 key 的一部分
+// @brief LOB reader cache key.
 struct ObPersistLobReaderCacheKey
 {
   ObPersistLobReaderCacheKey():
     ls_id_(),
     tablet_id_(),
     snapshot_(0),
+    fb_snapshot_(),
     target_(LobAuxTarget::MAX)
   {}
 
   bool operator==(const ObPersistLobReaderCacheKey &other) const
-  { 
-    return snapshot_ == other.snapshot_ && tablet_id_ == other.tablet_id_ && ls_id_ == other.ls_id_ && target_ == other.target_;
+  {
+    return ls_id_ == other.ls_id_
+           && tablet_id_ == other.tablet_id_
+           && snapshot_ == other.snapshot_
+           && fb_snapshot_ == other.fb_snapshot_
+           && target_ == other.target_;
   }
 
   void reset();
 
-  TO_STRING_KV(K(ls_id_), K(tablet_id_), K(snapshot_), "target", get_lob_aux_target_str(target_));
+  TO_STRING_KV(K(ls_id_), K(tablet_id_), K(snapshot_), K(fb_snapshot_),
+               "target", get_lob_aux_target_str(target_));
 
   share::ObLSID ls_id_;
   common::ObTabletID tablet_id_;
   int64_t snapshot_;
+  // One SQL can mix flashback and current LOB reads, so the flashback snapshot is part of the key.
+  share::SCN fb_snapshot_;
   LobAuxTarget target_;
 };
 

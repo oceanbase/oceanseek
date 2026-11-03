@@ -19,6 +19,7 @@ void ObPersistLobReaderCacheKey::reset()
   ls_id_.reset();
   tablet_id_.reset();
   snapshot_ = 0;
+  fb_snapshot_.reset();
   target_ = LobAuxTarget::MAX;
 }
 
