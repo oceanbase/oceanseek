@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 #include "ob_ss_meta_table_iterator.h"
 #include "ob_ss_meta_info_util.h"
+#include "lib/worker.h"
 #include "share/inner_table/user_table/ob_user_table_schema.h"
 #include "share/rc/ob_tenant_base.h"
 #include "storage/incremental/share/ob_shared_meta_util.h"
@@ -210,19 +211,20 @@ int64_t ObSSMetaBaseIterator::get_next_page_limit_() const
 int ObSSMetaBaseIterator::build_select_sql_(common::ObSqlString &sql)
 {
   int ret = OB_SUCCESS;
-  const int64_t timeout_us = operator_.get_sql_timeout_us_(tenant_id_);
+  const bool has_worker_deadline = THIS_WORKER.is_timeout_ts_valid();
   const bool is_desc = version_filter_.is_desc_order();
   const char *cmp_op = is_desc ? "<" : ">";
   const char *order = is_desc ? "DESC" : "ASC";
   const int64_t page_limit = get_next_page_limit_();
 
-  if (OB_FAIL(sql.assign_fmt(
-      "SELECT /*+ QUERY_TIMEOUT(%ld) */ * FROM %s "
-      "WHERE tenant_id = %lu",
-      timeout_us,
-      get_table_name_(),
-      tenant_id_))) {
-    LOG_WARN("failed to assign fmt", K(ret), K_(tenant_id));
+  if (has_worker_deadline && OB_FAIL(sql.assign_fmt(
+      "SELECT * FROM %s WHERE tenant_id = %lu",
+      get_table_name_(), tenant_id_))) {
+    LOG_WARN("failed to assign select sql", K(ret), K_(tenant_id));
+  } else if (!has_worker_deadline && OB_FAIL(sql.assign_fmt(
+      "SELECT /*+ QUERY_TIMEOUT(%ld) */ * FROM %s WHERE tenant_id = %lu",
+      operator_.get_sql_timeout_us_(tenant_id_), get_table_name_(), tenant_id_))) {
+    LOG_WARN("failed to assign select sql", K(ret), K_(tenant_id));
   } else if (ls_id_.is_valid() && OB_FAIL(sql.append_fmt(" AND ls_id = %ld", ls_id_.id()))) {
     LOG_WARN("failed to append ls_id filter", K(ret), K_(ls_id));
   } else if (meta_type_.is_valid() && OB_FAIL(sql.append_fmt(" AND meta_type = %ld", meta_type_.get_type_val()))) {

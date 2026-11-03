@@ -10,7 +10,9 @@
 
 #include <gmock/gmock.h>
 #include "lib/mysqlclient/ob_mysql_transaction.h"
+#include "lib/worker.h"
 #include "storage/incremental/ssmeta/ob_ss_meta_base_operator.h"
+#include "storage/incremental/ssmeta/ob_ss_meta_info_util.h"
 #include "storage/incremental/ssmeta/ob_ss_meta_table_iterator.h"
 #include "storage/incremental/share/ob_shared_meta_util.h"
 #include "storage/blocksstable/ob_ss_obj_util.h"
@@ -111,6 +113,96 @@ public:
     ASSERT_TRUE(meta_value.empty());
   }
 };
+
+// Capture the iterator SQL while still executing through the real inner SQL client.
+class RecordingSSMetaSqlProxy : public ObMySQLProxy
+{
+public:
+  explicit RecordingSSMetaSqlProxy(ObISQLClient &client) : client_(client) {}
+  using ObMySQLProxy::read;
+  int read(ReadResult &result, const uint64_t tenant_id, const char *sql, const int32_t group_id) override
+  {
+    int ret = last_sql_.assign(sql);
+    if (OB_SUCC(ret)) {
+      ret = client_.read(result, tenant_id, sql, group_id);
+    }
+    return ret;
+  }
+  ObSqlString last_sql_;
+
+private:
+  ObISQLClient &client_;
+};
+
+TEST_F(TestSSMetaTableIterator, iterator_worker_deadline_keeps_sql_stable)
+{
+  RecordingSSMetaSqlProxy proxy(get_sql_client());
+  ObSSMetaType meta_type;
+  meta_type.type_val_ = static_cast<int64_t>(ObSSMetaTypeEnum::LS_META);
+  ObSSMetaVersionFilter version_filter;
+  ObArenaAllocator alloc;
+  ObSqlString first_sql;
+  const int64_t timeouts[] = {OB_MAX_USER_SPECIFIED_TIMEOUT, 60 * 1000 * 1000, 5 * 1000 * 1000};
+  for (const int64_t timeout : timeouts) {
+    lib::WorkerTimeoutGuard timeout_guard(ObTimeUtility::current_time() + timeout);
+    ObSSMetaTableIterator iter;
+    ASSERT_EQ(OB_SUCCESS, iter.init(proxy, 1, ObLSID(20001), meta_type,
+        ObString::make_string("deadline_stable"), version_filter));
+    uint64_t tenant_id;
+    ObLSID ls_id;
+    ObSSMetaBaseType type;
+    ObString key, value;
+    ASSERT_EQ(OB_ITER_END, iter.get_next(alloc, tenant_id, ls_id, type, key, value));
+    ASSERT_EQ(nullptr, strstr(proxy.last_sql_.ptr(), "QUERY_TIMEOUT"));
+    if (first_sql.empty()) {
+      ASSERT_EQ(OB_SUCCESS, first_sql.assign(proxy.last_sql_.string()));
+    } else {
+      ASSERT_STREQ(first_sql.ptr(), proxy.last_sql_.ptr());
+    }
+  }
+}
+
+TEST_F(TestSSMetaTableIterator, iterator_expired_worker_deadline)
+{
+  RecordingSSMetaSqlProxy proxy(get_sql_client());
+  ObSSMetaType meta_type;
+  meta_type.type_val_ = static_cast<int64_t>(ObSSMetaTypeEnum::LS_META);
+  ObSSMetaVersionFilter version_filter;
+  ObArenaAllocator alloc;
+  ObSSMetaTableIterator iter;
+  ASSERT_EQ(OB_SUCCESS, iter.init(proxy, 1, ObLSID(20002), meta_type,
+      ObString::make_string("deadline_expired"), version_filter));
+  uint64_t tenant_id;
+  ObLSID ls_id;
+  ObSSMetaBaseType type;
+  ObString key, value;
+  lib::WorkerTimeoutGuard timeout_guard(ObTimeUtility::current_time() - 1);
+  ASSERT_EQ(OB_TIMEOUT, iter.get_next(alloc, tenant_id, ls_id, type, key, value));
+  ASSERT_EQ(nullptr, strstr(proxy.last_sql_.ptr(), "QUERY_TIMEOUT"));
+}
+
+TEST_F(TestSSMetaTableIterator, iterator_without_worker_deadline_uses_config_timeout)
+{
+  RecordingSSMetaSqlProxy proxy(get_sql_client());
+  ObSSMetaType meta_type;
+  meta_type.type_val_ = static_cast<int64_t>(ObSSMetaTypeEnum::LS_META);
+  ObSSMetaVersionFilter version_filter;
+  ObArenaAllocator alloc;
+  ObSSMetaTableIterator iter;
+  ASSERT_EQ(OB_SUCCESS, iter.init(proxy, 1, ObLSID(20003), meta_type,
+      ObString::make_string("config_timeout"), version_filter));
+  uint64_t tenant_id;
+  ObLSID ls_id;
+  ObSSMetaBaseType type;
+  ObString key, value;
+  lib::WorkerTimeoutGuard timeout_guard(INT64_MAX);
+  ASSERT_EQ(OB_ITER_END, iter.get_next(alloc, tenant_id, ls_id, type, key, value));
+  int64_t timeout_us = 0;
+  ASSERT_EQ(OB_SUCCESS, ObSSMetaInfoUtil::get_ssmeta_trans_timeout_us(1, timeout_us));
+  ObSqlString hint;
+  ASSERT_EQ(OB_SUCCESS, hint.assign_fmt("/*+ QUERY_TIMEOUT(%ld) */", timeout_us));
+  ASSERT_NE(nullptr, strstr(proxy.last_sql_.ptr(), hint.ptr()));
+}
 
 // 插入辅助函数
 static int insert_row(ObSSMetaBaseOperator &op,
