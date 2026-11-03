@@ -62,6 +62,8 @@ private:
 
   int process_next_batch();
 
+  bool has_pending_token() const;
+
   int process_one_char(TokenizeContext &ctx,
                        const char *ch,
                        const uint8_t char_len,

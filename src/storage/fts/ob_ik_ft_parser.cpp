@@ -173,6 +173,17 @@ int ObIKFTParser::process_one_char(TokenizeContext &ctx,
   return ret;
 }
 
+bool ObIKFTParser::has_pending_token() const
+{
+  bool has_pending = false;
+  for (ObList<ObIIKProcessor *, ObIAllocator>::const_iterator iter = segmenters_.begin();
+       !has_pending && iter != segmenters_.end();
+       ++iter) {
+    has_pending = (*iter)->has_pending_token();
+  }
+  return has_pending;
+}
+
 int ObIKFTParser::process_next_batch()
 {
   int ret = OB_SUCCESS;
@@ -189,7 +200,9 @@ int ObIKFTParser::process_next_batch()
       const char *ch;
       uint8_t char_len = 0;
       ObFTCharUtil::CharType type = ObFTCharUtil::CharType::USELESS;
-      if (OB_FAIL(ctx_->current_char_and_type(ch, char_len, type))) {
+      if (OB_FAIL(ctx_->check_status())) {
+        LOG_WARN("Worker interrupted during IK character scanning", K(ret));
+      } else if (OB_FAIL(ctx_->current_char_and_type(ch, char_len, type))) {
         if (OB_LIKELY(OB_ITER_END == ret)) {
         } else {
           LOG_WARN("Failed to get current char and type", K(ret));
@@ -198,7 +211,10 @@ int ObIKFTParser::process_next_batch()
         LOG_WARN("Failed to process one char", K(ret));
       } else {
         // 1. check segmention
-        if (ctx_->handle_size() >= HANDLE_SIZE_LIMIT && type == ObFTCharUtil::CharType::USELESS) {
+        if (ctx_->is_batch_last()
+            || (ctx_->handle_size() >= HANDLE_SIZE_LIMIT
+                && type == ObFTCharUtil::CharType::USELESS
+                && !has_pending_token())) {
           do_seg = true;
         }
 
@@ -217,9 +233,8 @@ int ObIKFTParser::process_next_batch()
         LOG_WARN("Failed to process arbitrator", K(ret));
       } else if (OB_FAIL(arb_.output_result(*ctx_))) {
         LOG_WARN("Failed to make result list");
-      } else {
-        arb_.reuse();
       }
+      arb_.reuse();
     }
   }
 

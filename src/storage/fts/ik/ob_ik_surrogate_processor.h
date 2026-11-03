@@ -24,6 +24,8 @@ public:
                  const uint8_t char_len,
                  const ObFTCharUtil::CharType type) override;
 
+  bool has_pending_token() const override { return -1 != high_offset_; }
+
   void reuse() override { reset(); }
 
 private:

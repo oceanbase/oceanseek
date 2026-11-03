@@ -42,6 +42,15 @@ public:
 
   int step_next();
 
+  OB_INLINE int check_status()
+  {
+    int ret = common::OB_SUCCESS;
+    if (OB_UNLIKELY(++status_check_count_ >= CHECK_STATUS_INTERVAL)) {
+      ret = check_worker_status();
+    }
+    return ret;
+  }
+
   ObCollationType collation() const;
   int64_t get_end_cursor() const;
   const char *fulltext() const;
@@ -49,6 +58,7 @@ public:
   int64_t get_cursor() const;
 
   bool is_last() const;
+  bool is_batch_last() const;
   bool iter_end() const;
   bool is_smart() const;
   bool is_results_exhaust() const;
@@ -82,7 +92,12 @@ public:
   OB_INLINE int64_t get_buffer_end_cursor() const { return cursor_; }
 
 private:
+  static constexpr uint32_t MAX_BATCH_CODEPOINT_COUNT = 4096;
+  static constexpr int64_t CHECK_STATUS_INTERVAL = 512;
+
   int prepare_next_char();
+
+  int check_worker_status();
 
 private:
   ObCollationType coll_type_;
@@ -104,6 +119,7 @@ private:
       const char *,const char *, size_t, int *);
   ObCharsetType cs_type_;
   int64_t buffer_start_cursor_;
+  int64_t status_check_count_;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(TokenizeContext);
@@ -123,6 +139,8 @@ public:
                          const uint8_t char_len,
                          const ObFTCharUtil::CharType type)
       = 0;
+
+  virtual bool has_pending_token() const = 0;
 
   virtual void reuse() = 0;
 };
