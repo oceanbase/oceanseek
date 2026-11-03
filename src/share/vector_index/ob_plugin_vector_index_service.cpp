@@ -3246,7 +3246,11 @@ int ObPluginVectorIndexService::acquire_ivf_cache_mgr_guard(
   if (OB_FAIL(acquire_vector_index_mgr(ls_id, ls_index_mgr))) {
     LOG_WARN("failed to acquire vector index mgr", KR(ret), K(ls_id));
   } else if (OB_FAIL(ls_index_mgr->get_ivf_cache_mgr_guard(key, cache_mgr_guard))) {
-    LOG_WARN("fail to get ivf cache mgr guard", K(ret), K(key));
+    if (OB_HASH_NOT_EXIST == ret) {
+      LOG_DEBUG("fail to get ivf cache mgr guard", K(ret), K(key));
+    } else {
+      LOG_WARN("fail to get ivf cache mgr guard", K(ret), K(key));
+    }
   }
   return ret;
 }
