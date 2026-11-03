@@ -125,7 +125,7 @@ private:
   }
   bool is_filter_driven_optional() const
   {
-    return query_optional_ && 0.0 == min_competitive_score_;
+    return query_optional_ && min_competitive_score_ < 0.0;
   }
   double get_essential_dim_threshold() const { return min_competitive_score_ - non_essential_dim_max_score_; }
   int init_merge_iters(const ObDASBMMOpParam &op_param, ObIAllocator &iter_allocator);
@@ -144,7 +144,7 @@ private:
   int rebuild_vectorized_window_at(const ObDASRowID &target);
   int inner_get_next_batch();
   int inner_get_next_batch_scoring_driven();
-  // Query-optional BMM is filter-driven while the competitive threshold is zero:
+  // Query-optional BMM is filter-driven while zero-score rows are competitive:
   // filter hits create result presence and scoring dimensions enrich their scores.
   int inner_get_next_batch_filter_driven();
   int sort_iters_by_max_score();
@@ -293,7 +293,7 @@ private:
   // query-optional whose preselected scoring mode is SPARSE_SEEK.
   ObBitVector *filter_bitset_;
   // Dense score window and iterator. Query-optional always starts here so filter-only
-  // zero-score documents remain visible before a positive competitive threshold arrives.
+  // zero-score documents remain visible before a nonnegative competitive threshold arrives.
   DocScoreAccumulator doc_score_accumulator_;
   DocScoreIter doc_score_iter_;
   ObDASRowID vec_boundary_id_;
@@ -307,7 +307,7 @@ private:
   bool iters_sorted_;
   bool filter_end_;
   // Scoring exhaustion is not root EOF in query-optional mode; remaining filter
-  // rows are still emitted with score 0 while the competitive threshold is 0.
+  // rows are still emitted with score 0 while the competitive threshold is negative.
   bool optional_scoring_end_;
   // Set after skipping an ordered-filter DENSE_WINDOW batch with no hits. The next
   // vectorized batch is capped at curr_filter_id_ to avoid scoring past the first hit.

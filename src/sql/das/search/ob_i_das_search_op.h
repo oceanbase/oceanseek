@@ -340,7 +340,7 @@ public:
       max_score_tuple_(),
       children_(nullptr),
       children_cnt_(0),
-      min_competitive_score_(0.0),
+      min_competitive_score_(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE),
       is_scoring_(true),
       profile_(nullptr)
   { }
@@ -753,7 +753,7 @@ OB_INLINE int ObIDASSearchOp::close()
   op_type_ = DAS_SEARCH_OP_MAX;
   op_id_ = OB_INVALID_ID;
   max_score_tuple_.reset();
-  min_competitive_score_ = 0.0;
+  min_competitive_score_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
   if (OB_NOT_NULL(children_)) {
     ctx_allocator().free(children_);
     children_ = nullptr;
@@ -777,7 +777,7 @@ OB_INLINE int ObIDASSearchOp::rescan()
       // only if in the same tablet execution, we can reuse the old profile and record on it
       INC_METRIC_VAL(common::ObMetricId::HS_SAME_OP_SCAN_TIMES, 1);
     }
-    min_competitive_score_ = 0.0;
+    min_competitive_score_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
     if (OB_FAIL(do_rescan())) {
       LOG_WARN("failed to rescan impl", KR(ret));
     }
@@ -789,7 +789,7 @@ OB_INLINE int ObIDASSearchOp::rescan_segment(const common::ObNewVersionRange &ra
 {
   int ret = OB_SUCCESS;
   common::ObProfileSwitcher switcher(profile_);
-  min_competitive_score_ = 0.0;
+  min_competitive_score_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
   if (OB_FAIL(do_rescan_segment(range))) {
     LOG_WARN("failed to rescan segment impl", KR(ret));
   }

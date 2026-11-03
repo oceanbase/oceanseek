@@ -270,7 +270,7 @@ int ObDASBMMOp::do_init(const ObIDASSearchOpParam &op_param)
     iters_sorted_ = false;
     filter_end_ = false;
     optional_scoring_end_ = false;
-    min_competitive_score_ = 0.0;
+    min_competitive_score_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
     non_essential_dim_count_ = 0;
     non_essential_dim_max_score_ = 0.0;
     non_essential_dim_threshold_ = 0.0;
@@ -335,7 +335,7 @@ int ObDASBMMOp::do_rescan_segment(const common::ObNewVersionRange &range)
   }
   if (OB_SUCC(ret)) {
     status_ = enable_vec_merge_ ? SearchStatus::COMPUTE_VEC_BOUNDARY : SearchStatus::FIND_NEXT_PIVOT;
-    min_competitive_score_ = 0.0;
+    min_competitive_score_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
     iters_sorted_ = false;
     filter_end_ = false;
     optional_scoring_end_ = false;
@@ -394,7 +394,7 @@ int ObDASBMMOp::do_rescan()
 
   if (OB_SUCC(ret)) {
     status_ = enable_vec_merge_ ? SearchStatus::COMPUTE_VEC_BOUNDARY : SearchStatus::FIND_NEXT_PIVOT;
-    min_competitive_score_ = 0.0;
+    min_competitive_score_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
     iters_sorted_ = false;
     filter_end_ = false;
     optional_scoring_end_ = false;
@@ -471,7 +471,7 @@ int ObDASBMMOp::do_next_rowid(ObDASRowID &next_id, double &score)
     if (OB_FAIL(inner_get_next_row_vectorized(next_id, score))) {
       LOG_WARN_IGNORE_ITER_END(ret, "failed to get next row vectorized");
     }
-  } else if (0 == min_competitive_score_) {
+  } else if (min_competitive_score_ < 0.0) {
     if (OB_FAIL(inner_get_next_row_plain(next_id, score))) {
       LOG_WARN_IGNORE_ITER_END(ret, "failed to get next row plain");
     }
@@ -500,7 +500,7 @@ int ObDASBMMOp::do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, dou
       LOG_WARN_IGNORE_ITER_END(ret, "failed to advance to vectorized", K(ret), K(target));
     }
   } else {
-    if (0 == min_competitive_score_ && query_optional_) {
+    if (is_filter_driven_optional()) {
       // otherwise, merge iters must be involved, which are advanced below
       ObDASRowID temp_id;
       if (OB_FAIL(advance_filter_to(target, curr_filter_id_))) {
@@ -701,7 +701,7 @@ int ObDASBMMOp::do_set_min_competitive_score(const double &threshold)
     LOG_WARN("not initialized", K(ret));
   } else if (OB_FAIL(ObIDASSearchOp::do_set_min_competitive_score(threshold))) {
     LOG_WARN("failed to set min competitive score", K(ret));
-  } else if (OB_UNLIKELY(SearchStatus::FINISHED == status_)) {
+  } else if (SearchStatus::FINISHED == status_ || min_competitive_score_ < 0.0) {
     // skip
   } else if (enable_vec_merge_) {
     // Retain the materialized window. DocScoreIter applies the latest threshold
@@ -906,7 +906,7 @@ int ObDASBMMOp::inner_get_next_row_with_pruning(ObDASRowID &next_id, double &sco
     ret = OB_ITER_END;
   } else if (OB_UNLIKELY(SearchStatus::FIND_NEXT_PIVOT != status_
       || !iters_sorted_
-      || 0 == min_competitive_score_)) {
+      || min_competitive_score_ < 0.0)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected status for pruning", K(ret), K_(status), K(iters_sorted_), K(min_competitive_score_));
   }
@@ -1417,7 +1417,7 @@ int ObDASBMMOp::inner_get_next_row_vectorized(ObDASRowID &next_id, double &score
   bool got_row = false;
   // SPARSE_SEEK output is served from the compact candidate buffer; DENSE_WINDOW output from the
   // dense doc_score_iter_ window. A query-optional dense window remains active until its
-  // iterator is exhausted, even if a positive threshold has selected sparse scoring.
+  // iterator is exhausted, even if a nonnegative threshold has selected sparse scoring.
   bool need_convert_to_scoring_sparse = FilterMergeMode::SPARSE_SEEK == filter_merge_mode_
                                        && !is_filter_driven_optional(); 
   bool need_next_batch = !sparse_candidate_buffer_.has_unconsumed() && doc_score_iter_.iter_end();
@@ -1433,11 +1433,7 @@ int ObDASBMMOp::inner_get_next_row_vectorized(ObDASRowID &next_id, double &score
       } else if (need_convert_to_scoring_sparse) {
         // Candidate buffer was filled and scored by inner_get_next_batch().
         need_next_batch = false;
-      } else if (OB_FAIL(doc_score_iter_.open(
-                     doc_score_accumulator_,
-                     is_filter_driven_optional()
-                         ? DocScoreIter::ProjectionPolicy::INCLUDE_PRESENCE_AT_ZERO_THRESHOLD
-                         : DocScoreIter::ProjectionPolicy::STRICTLY_ABOVE_THRESHOLD))) {
+      } else if (OB_FAIL(doc_score_iter_.open(doc_score_accumulator_))) {
         LOG_WARN("failed to open doc score iter", K(ret));
       } else {
         need_next_batch = false;
@@ -1740,11 +1736,6 @@ int ObDASBMMOp::inner_get_next_batch_filter_driven()
     if (filter_mask_attached) {
       doc_score_accumulator_.clear_filter_mask();
     }
-    if (OB_SUCC(ret) && min_competitive_score_ > 0.0
-        && OB_FAIL(doc_score_accumulator_.filter_below_score(min_competitive_score_))) {
-      LOG_WARN("failed to filter optional batch by competitive score",
-          K(ret), K_(min_competitive_score));
-    }
     if (OB_SUCC(ret)) {
       found_valid_batch = !doc_score_accumulator_.is_empty();
       if (!found_valid_batch && filter_end_) {
@@ -1756,7 +1747,7 @@ int ObDASBMMOp::inner_get_next_batch_filter_driven()
   if (OB_ITER_END == ret) {
     status_ = SearchStatus::FINISHED;
   } else if (OB_SUCC(ret)) {
-    // A positive threshold may switch drivers after this batch. Resume the
+    // A nonnegative threshold may switch drivers after this batch. Resume the
     // current window: a filter-driven batch need not consume its entire boundary.
     status_ = FilterMergeMode::SPARSE_SEEK == filter_merge_mode_
         ? SearchStatus::EVALUATE_VEC_LEAP_FROG : SearchStatus::EVALUATE_VEC_ESSENTIAL;

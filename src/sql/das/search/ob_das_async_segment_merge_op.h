@@ -151,7 +151,7 @@ public:
       current_batch_child_idx_(0),
       target_allocator_(common::ObMemAttr(MTL_ID(), "AsyncSegTgt")),
       threshold_cached_(false),
-      cached_threshold_(0.0),
+      cached_threshold_(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE),
       shallow_target_(0),
       use_batch_merge_(false),
       shallow_inclusive_(true),

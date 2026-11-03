@@ -2969,8 +2969,8 @@ TEST_F(TestDASBMM, dense_filter_boundary_crossing_preserves_rows)
         if (scan > 0) {
           ASSERT_EQ(OB_SUCCESS, bmm.rescan());
         }
-        // Two scoring dimensions and a zero threshold exclude Range Max pruning.
-        ASSERT_DOUBLE_EQ(0.0, bmm.min_competitive_score_);
+        // Two scoring dimensions and the initial threshold exclude Range Max pruning.
+        ASSERT_DOUBLE_EQ(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, bmm.min_competitive_score_);
         ObDASRowID rowid;
         double score = 0.0;
         for (int64_t i = 0; i < 3; ++i) {
@@ -3196,7 +3196,7 @@ TEST_F(TestDASBMM, query_optional_switches_to_sparse_after_dense_window)
   EXPECT_DOUBLE_EQ(8.0, score);
   EXPECT_EQ(OB_ITER_END, optional_bmm.next_rowid(rowid, score));
 
-  // Rescan restores the threshold-zero filter-driven mode. An advance beyond the
+  // Rescan restores the initial filter-driven mode. An advance beyond the
   // current dense window switches only after that window has been discarded safely.
   ASSERT_EQ(OB_SUCCESS, optional_bmm.rescan());
   EXPECT_EQ(ObDASBMMOp::FilterMergeMode::SPARSE_SEEK,
@@ -3618,7 +3618,7 @@ TEST_F(TestDASBMM, finished_threshold_update_is_noop)
 
   ASSERT_EQ(OB_SUCCESS, bmm.rescan());
   EXPECT_EQ(ObDASBMMOp::SearchStatus::FIND_NEXT_PIVOT, bmm.status_);
-  EXPECT_DOUBLE_EQ(0.0, bmm.min_competitive_score_);
+  EXPECT_DOUBLE_EQ(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, bmm.min_competitive_score_);
   EXPECT_FALSE(bmm.merge_iters_.at(0)->in_shallow_status());
   ASSERT_EQ(OB_SUCCESS, bmm.set_min_competitive_score(1.0));
   EXPECT_DOUBLE_EQ(1.0, bmm.min_competitive_score_);

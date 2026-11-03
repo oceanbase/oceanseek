@@ -186,18 +186,17 @@ TEST_F(TestDASDocScoreAccumulator, seed_projection_and_uint64_tail_contract)
   EXPECT_TRUE(iter.iter_end());
   ASSERT_EQ(OB_SUCCESS, iter.open(accumulator));
   EXPECT_FALSE(iter.iter_end());
-  ASSERT_EQ(OB_SUCCESS, iter.next(rowid, score));
+  ASSERT_EQ(OB_SUCCESS, iter.next(rowid, score, 0.0));
   EXPECT_EQ(11, rowid);
   EXPECT_DOUBLE_EQ(2.0, score);
-  ASSERT_EQ(OB_SUCCESS, iter.next(rowid, score));
+  ASSERT_EQ(OB_SUCCESS, iter.next(rowid, score, 0.0));
   EXPECT_EQ(12, rowid);
   EXPECT_DOUBLE_EQ(3.0, score);
-  EXPECT_EQ(OB_ITER_END, iter.next(rowid, score));
+  EXPECT_EQ(OB_ITER_END, iter.next(rowid, score, 0.0));
   EXPECT_TRUE(iter.iter_end());
-  EXPECT_EQ(OB_ITER_END, iter.next(rowid, score));
+  EXPECT_EQ(OB_ITER_END, iter.next(rowid, score, 0.0));
 
-  ASSERT_EQ(OB_SUCCESS, iter.open(
-      accumulator, DocScoreIter::ProjectionPolicy::INCLUDE_PRESENCE_AT_ZERO_THRESHOLD));
+  ASSERT_EQ(OB_SUCCESS, iter.open(accumulator));
   ASSERT_EQ(OB_SUCCESS, iter.next(rowid, score));
   EXPECT_EQ(10, rowid);
   EXPECT_DOUBLE_EQ(0.0, score);
@@ -206,14 +205,12 @@ TEST_F(TestDASDocScoreAccumulator, seed_projection_and_uint64_tail_contract)
   ASSERT_EQ(OB_SUCCESS, iter.next(rowid, score));
   EXPECT_EQ(11, rowid);
 
-  ASSERT_EQ(OB_SUCCESS, iter.open(
-      accumulator, DocScoreIter::ProjectionPolicy::INCLUDE_PRESENCE_AT_ZERO_THRESHOLD));
+  ASSERT_EQ(OB_SUCCESS, iter.open(accumulator));
   EXPECT_EQ(OB_ITER_END, iter.advance(UINT64_MAX, rowid, score));
   EXPECT_TRUE(iter.iter_end());
   EXPECT_EQ(OB_ITER_END, iter.next(rowid, score));
 
-  ASSERT_EQ(OB_SUCCESS, iter.open(
-      accumulator, DocScoreIter::ProjectionPolicy::INCLUDE_PRESENCE_AT_ZERO_THRESHOLD));
+  ASSERT_EQ(OB_SUCCESS, iter.open(accumulator));
   ASSERT_EQ(OB_SUCCESS, iter.next(rowid, score, 2.0));
   EXPECT_EQ(12, rowid);
   EXPECT_DOUBLE_EQ(3.0, score);
@@ -227,11 +224,53 @@ TEST_F(TestDASDocScoreAccumulator, seed_projection_and_uint64_tail_contract)
   EXPECT_EQ(OB_INDEX_OUT_OF_RANGE, accumulator.seed_doc(UINT64_MAX - 2));
   EXPECT_EQ(OB_SUCCESS, accumulator.seed_doc(UINT64_MAX));
   EXPECT_EQ(OB_INDEX_OUT_OF_RANGE, accumulator.seed_doc(0));
-  ASSERT_EQ(OB_SUCCESS, iter.open(
-      accumulator, DocScoreIter::ProjectionPolicy::INCLUDE_PRESENCE_AT_ZERO_THRESHOLD));
+  ASSERT_EQ(OB_SUCCESS, iter.open(accumulator));
   ASSERT_EQ(OB_SUCCESS, iter.next(rowid, score));
   EXPECT_EQ(UINT64_MAX, rowid);
   EXPECT_EQ(OB_ITER_END, iter.next(rowid, score));
+}
+
+TEST_F(TestDASDocScoreAccumulator, initial_and_zero_thresholds_have_distinct_projection)
+{
+  DocScoreAccumulator accumulator;
+  DocScoreIter iter;
+  uint64_t max_id = 0;
+  ASSERT_EQ(OB_SUCCESS, accumulator.init(8, allocator_));
+  ASSERT_EQ(OB_SUCCESS, accumulator.reuse_with_start_id(1, max_id));
+  const uint64_t ids[] = {1, 2, 3, 4, 5};
+  const double scores[] = {0.0, 0.0, 1.0, 0.0, 2.0};
+  ASSERT_EQ(OB_SUCCESS, accumulator.add_dim_batch(ids, scores, ARRAYSIZEOF(ids)));
+  ASSERT_EQ(OB_SUCCESS, accumulator.filter_below_score(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE));
+  ASSERT_EQ(OB_SUCCESS, iter.open(accumulator));
+  uint64_t id = 0;
+  double score = 0.0;
+  ASSERT_EQ(OB_SUCCESS, iter.next(id, score));
+  EXPECT_EQ(1, id);
+  EXPECT_DOUBLE_EQ(0.0, score);
+  ASSERT_EQ(OB_SUCCESS, iter.next(id, score, 0.0));
+  EXPECT_EQ(3, id);
+  ASSERT_EQ(OB_SUCCESS, iter.advance(4, id, score, 1.0));
+  EXPECT_EQ(5, id);
+  EXPECT_DOUBLE_EQ(2.0, score);
+  EXPECT_EQ(OB_ITER_END, iter.next(id, score, 1.0));
+
+  ASSERT_EQ(OB_SUCCESS, accumulator.filter_below_score(0.0));
+  ASSERT_EQ(OB_SUCCESS, iter.open(accumulator));
+  ASSERT_EQ(OB_SUCCESS, iter.next(id, score));
+  EXPECT_EQ(3, id);
+  ASSERT_EQ(OB_SUCCESS, iter.next(id, score));
+  EXPECT_EQ(5, id);
+  EXPECT_EQ(OB_ITER_END, iter.next(id, score));
+
+  ASSERT_EQ(OB_SUCCESS, accumulator.reuse_with_start_id(1, max_id));
+  ASSERT_EQ(OB_SUCCESS, accumulator.seed_doc(1));
+  ASSERT_EQ(OB_SUCCESS, iter.open(accumulator));
+  ASSERT_EQ(OB_SUCCESS, iter.advance(1, id, score));
+  EXPECT_EQ(1, id);
+  ASSERT_EQ(OB_SUCCESS, iter.open(accumulator));
+  EXPECT_EQ(OB_ITER_END, iter.advance(1, id, score, 0.0));
+  ASSERT_EQ(OB_SUCCESS, accumulator.filter_below_score(0.0));
+  EXPECT_TRUE(accumulator.is_empty());
 }
 
 } // namespace

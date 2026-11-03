@@ -268,12 +268,12 @@ int ObDASDisjunctionOp::do_set_min_competitive_score(const double &threshold)
     LOG_WARN("not init", K(ret));
   } else if (!need_score_) {
     // do nothing
+  } else if (OB_FAIL(ObIDASSearchOp::do_set_min_competitive_score(threshold))) {
+    LOG_WARN("failed to update disjunction threshold", K(ret), K(threshold));
   } else if (children_cnt_ == 1) {
     if (OB_FAIL(children_[0]->set_min_competitive_score(threshold))) {
       LOG_WARN("failed to set min competitive score", K(ret));
     }
-  } else if (OB_FAIL(ObIDASSearchOp::do_set_min_competitive_score(threshold))) {
-    LOG_WARN("failed to set min competitive score", K(ret));
   }
   return ret;
 }
@@ -335,8 +335,7 @@ int ObDASDisjunctionOp::inner_get_next_row(ObDASRowID &next_id, double &score)
     } else if (OB_FAIL(row_merger_->merge_one_row(next_id, curr_score, dim_cnt))) {
       LOG_WARN("failed to merge one row", K(ret));
     } else {
-      const bool score_valid = need_score_
-          ? (curr_score > min_competitive_score_ || 0 == min_competitive_score_) : true;
+      const bool score_valid = !need_score_ || curr_score > min_competitive_score_;
       const bool dim_cnt_valid = dim_cnt >= minimum_should_match_;
       if (score_valid && dim_cnt_valid) {
         found_row = true;

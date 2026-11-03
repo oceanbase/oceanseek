@@ -6205,7 +6205,7 @@ TEST_F(TestDASAsyncSegmentMerge, direct_mode_public_api_and_zero_sort_state)
     EXPECT_EQ(0, merge.batch_allocator_.used());
     EXPECT_EQ(0, merge.target_allocator_.used());
     EXPECT_FALSE(merge.threshold_cached_);
-    EXPECT_DOUBLE_EQ(0.0, merge.cached_threshold_);
+    EXPECT_DOUBLE_EQ(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, merge.cached_threshold_);
     EXPECT_EQ(0, merge.shallow_target_);
     EXPECT_FALSE(merge.use_batch_merge_);
     EXPECT_TRUE(merge.shallow_inclusive_);
@@ -6635,7 +6635,7 @@ protected:
 };
 
 // Feed a real Bitmap over DIRECT_MERGE into dense, sparse, and query-optional BMM, checking
-// filtered scores and the zero-to-positive threshold transition against expected results.
+// filtered scores and the initial-to-positive threshold transition against expected results.
 // Verify partial-consumption rescans across 3/1/3 segments and recovery from a batch input error.
 TEST_F(TestDASMaterializedRange, materialized_range_filter_drives_vectorized_bmm_lifecycle)
 {
@@ -6852,7 +6852,7 @@ TEST_F(TestDASMaterializedRange, group_bmm_topk_feedback_survives_partition_resc
     if (phase > 0) {
       select_partition(catalog, phase + 1);
       ASSERT_EQ(OB_SUCCESS, topk.rescan());
-      EXPECT_DOUBLE_EQ(0, bmm_a.min_competitive_score_);
+      EXPECT_DOUBLE_EQ(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, bmm_a.min_competitive_score_);
     }
     EXPECT_EQ(phase == 1 ? 2 : 1, merge.active_group_cnt_);
     std::vector<std::pair<uint64_t, double>> actual;

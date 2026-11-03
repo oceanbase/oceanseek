@@ -251,24 +251,16 @@ private:
 class DocScoreIter final
 {
 public:
-  enum class ProjectionPolicy
-  {
-    STRICTLY_ABOVE_THRESHOLD,
-    // Query-optional semantics: while the competitive threshold is zero, every
-    // present filter document is projectable, including its zero-score seed.
-    INCLUDE_PRESENCE_AT_ZERO_THRESHOLD,
-  };
-
   DocScoreIter();
   virtual ~DocScoreIter() = default;
-  int open(
-      const DocScoreAccumulator &acc,
-      const ProjectionPolicy projection_policy = ProjectionPolicy::STRICTLY_ABOVE_THRESHOLD);
-  // Consume the next set bit. In strict mode docs with score <= min_score are skipped.
-  int next(uint64_t &next_id, double &score, double min_score = 0.0);
+  int open(const DocScoreAccumulator &acc);
+  // Consume the next set bit whose score exceeds min_score.
+  int next(uint64_t &next_id, double &score,
+      double min_score = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE);
   // Advance to the first un-consumed set bit >= target and consume it.
   // Projection uses the same threshold predicate as next().
-  int advance(uint64_t target, uint64_t &out_id, double &out_score, double min_score = 0.0);
+  int advance(uint64_t target, uint64_t &out_id, double &out_score,
+      double min_score = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE);
   OB_INLINE bool is_valid() const { return nullptr != accumulator_ && nullptr != bitset_words_; }
   // Whether the current window has reached sticky EOF. reset() leaves no active
   // window, so iter_end() remains true until the next successful open().
@@ -277,13 +269,11 @@ public:
 private:
   // Return the lowest un-consumed set bit from curr_word_ (consuming it), or
   // load successive words until a set bit is found or the bitset is exhausted.
-  // Docs rejected by the selected projection policy are consumed but not returned.
+  // Docs rejected by the threshold are consumed but not returned.
   int consume_next_set_bit(uint64_t &out_id, double &out_score, double min_score);
   OB_INLINE bool should_project(const double score, const double min_score) const
   {
-    return (ProjectionPolicy::INCLUDE_PRESENCE_AT_ZERO_THRESHOLD == projection_policy_
-            && min_score <= 0.0)
-        || score > min_score;
+    return score > min_score;
   }
 
   const DocScoreAccumulator *accumulator_;
@@ -295,7 +285,6 @@ private:
   // High-water mark: the highest doc_id ever returned. Used by advance() to
   // clamp target so backward seeks never re-scan consumed bits.
   uint64_t curr_id_;
-  ProjectionPolicy projection_policy_;
   bool curr_valid_;
   bool iter_end_;
 };

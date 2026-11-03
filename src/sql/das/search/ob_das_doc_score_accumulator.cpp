@@ -246,7 +246,7 @@ int DocScoreAccumulator::filter_below_score(const double min_required_score)
   if (OB_UNLIKELY(!is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid doc score accumulator", K(ret), K_(is_inited), KP_(bitset));
-  } else if (is_empty_ || min_required_score <= 0.0) {
+  } else if (is_empty_ || min_required_score < 0.0) {
     // do nothing
   } else if (max_score_ <= min_required_score) {
     // Fast path: all docs are below threshold, clear current batch.
@@ -329,14 +329,11 @@ DocScoreIter::DocScoreIter()
     word_cnt_(0),
     curr_word_(0),
     curr_id_(0),
-    projection_policy_(ProjectionPolicy::STRICTLY_ABOVE_THRESHOLD),
     curr_valid_(false),
     iter_end_(true)
 {}
 
-int DocScoreIter::open(
-    const DocScoreAccumulator &accumulator,
-    const ProjectionPolicy projection_policy)
+int DocScoreIter::open(const DocScoreAccumulator &accumulator)
 {
   int ret = OB_SUCCESS;
   reset();
@@ -347,7 +344,6 @@ int DocScoreIter::open(
     accumulator_ = &accumulator;
     bitset_words_ = accumulator.bitset_->reinterpret_data<uint64_t>();
     word_cnt_ = das_bitset_helper::word_count(accumulator.capacity_);
-    projection_policy_ = projection_policy;
     iter_end_ = false;
   }
   return ret;
@@ -402,7 +398,7 @@ int DocScoreIter::next(uint64_t &next_id, double &score, double min_score)
     LOG_WARN("unexpected invalid doc score iter", K(ret));
   } else if (iter_end_) {
     ret = OB_ITER_END;
-  } else if (min_score > 0.0 && accumulator_->max_score_ <= min_score) {
+  } else if (accumulator_->max_score_ <= min_score) {
     // No doc can beat min_score, skip the whole window.
     ret = OB_ITER_END;
   } else if (OB_FAIL(consume_next_set_bit(next_id, score, min_score))) {
@@ -422,7 +418,7 @@ int DocScoreIter::advance(uint64_t target, uint64_t &out_id, double &out_score, 
     LOG_WARN("unexpected invalid doc score iter", K(ret));
   } else if (iter_end_) {
     ret = OB_ITER_END;
-  } else if (min_score > 0.0 && accumulator_->max_score_ <= min_score) {
+  } else if (accumulator_->max_score_ <= min_score) {
     // No doc can beat min_score, skip the whole window.
     ret = OB_ITER_END;
   } else {
@@ -470,7 +466,6 @@ void DocScoreIter::reset()
   word_cnt_ = 0;
   curr_word_ = 0;
   curr_id_ = 0;
-  projection_policy_ = ProjectionPolicy::STRICTLY_ABOVE_THRESHOLD;
   curr_valid_ = false;
   iter_end_ = true;
 }

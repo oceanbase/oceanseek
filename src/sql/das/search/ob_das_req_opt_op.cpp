@@ -205,9 +205,8 @@ int ObDASReqOptOp::do_set_min_competitive_score(const double &threshold)
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
-  } else if (OB_UNLIKELY(threshold < min_competitive_score_)) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid threshold", K(ret), K(threshold), K_(min_competitive_score));
+  } else if (OB_FAIL(ObIDASSearchOp::do_set_min_competitive_score(threshold))) {
+    LOG_WARN("failed to update req opt threshold", K(ret), K(threshold));
   } else if (!max_score_calculated_) {
     double max_score = 0.0;
     if (OB_FAIL(calc_max_score(max_score))) {
@@ -228,11 +227,7 @@ int ObDASReqOptOp::do_set_min_competitive_score(const double &threshold)
       } else {
         score_propagated_ = true;
       }
-    } else {
-      min_competitive_score_ = threshold;
     }
-  } else {
-    min_competitive_score_ = threshold;
   }
   return ret;
 }
@@ -275,7 +270,7 @@ int ObDASReqOptOp::do_init(const ObIDASSearchOpParam &op_param)
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid required/optional op", K(ret), KP(req_opt_op_param.get_required()), KP(req_opt_op_param.get_optional()));
   } else {
-    min_competitive_score_ = 0.0;
+    min_competitive_score_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
     required_ = req_opt_op_param.get_required();
     optional_ = req_opt_op_param.get_optional();
     required_max_score_ = 0.0;
@@ -304,7 +299,7 @@ int ObDASReqOptOp::inner_get_next_row(
         LOG_WARN("failed to get next row with score propagated", K(ret));
       }
     }
-  } else if (req_score > min_competitive_score_ || 0 == min_competitive_score_) {
+  } else if (req_score > min_competitive_score_) {
     //get next row directly
     if (OB_FAIL(inner_get_next_row_from_req(req_id, req_score, next_id, score))) {
       if (OB_UNLIKELY(OB_ITER_END != ret)) {

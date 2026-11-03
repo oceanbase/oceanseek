@@ -4916,6 +4916,74 @@ TEST_F(ObDASBooleanQueryTest, conjunction_scoring_probe_contributes_score)
   EXPECT_EQ(OB_ITER_END, conjunction_op.next_rowid(row_id, score));
 }
 
+TEST_F(ObDASBooleanQueryTest, conjunction_preserves_negative_driver_threshold)
+{
+  SearchCtxSetup ctx_setup(allocator_);
+  MockSearchOp leaf(ctx_setup.search_ctx_, {1, 2}, {0.0, 0.0});
+  MockProbeSearchOp probe(ctx_setup.search_ctx_, {1, 2}, 5.0);
+  MockSearchOpParam leaf_param;
+  leaf_param.set_is_scoring(true);
+  ASSERT_EQ(OB_SUCCESS, leaf.init(leaf_param));
+  ASSERT_EQ(OB_SUCCESS, probe.init(leaf_param));
+  ObArray<ObIDASSearchOp *> driver_children;
+  ASSERT_EQ(OB_SUCCESS, driver_children.push_back(&leaf));
+  ObDASDisjunctionOpParam driver_param(driver_children, 1, false, ObDASSearchCost(10));
+  driver_param.set_is_scoring(true);
+  ObDASDisjunctionOp driver(ctx_setup.search_ctx_);
+  ASSERT_EQ(OB_SUCCESS, driver.init(driver_param));
+  ObArray<ObIDASSearchOp *> children;
+  ASSERT_EQ(OB_SUCCESS, children.push_back(&driver));
+  ASSERT_EQ(OB_SUCCESS, children.push_back(&probe));
+  ObDASConjunctionOpParam param(children);
+  param.set_is_scoring(true);
+  ObDASConjunctionOp conjunction(ctx_setup.search_ctx_);
+  ASSERT_EQ(OB_SUCCESS, conjunction.init(param));
+  ASSERT_EQ(OB_SUCCESS, conjunction.open());
+  ASSERT_EQ(OB_SUCCESS, conjunction.set_min_competitive_score(3.0));
+  EXPECT_DOUBLE_EQ(-2.0, driver.min_competitive_score_);
+  ObDASRowID rowid;
+  double score = 0.0;
+  ASSERT_EQ(OB_SUCCESS, conjunction.next_rowid(rowid, score));
+  EXPECT_EQ(1, rowid.get_uint64());
+  EXPECT_DOUBLE_EQ(5.0, score);
+  ASSERT_EQ(OB_SUCCESS, conjunction.set_min_competitive_score(5.0));
+  EXPECT_DOUBLE_EQ(0.0, driver.min_competitive_score_);
+  EXPECT_EQ(OB_ITER_END, conjunction.next_rowid(rowid, score));
+  ASSERT_EQ(OB_SUCCESS, conjunction.close());
+}
+
+TEST_F(ObDASBooleanQueryTest, propagated_req_opt_threshold_remains_monotonic)
+{
+  SearchCtxSetup ctx_setup(allocator_);
+  MockSearchOp required(ctx_setup.search_ctx_);
+  MockProbeSearchOp optional(ctx_setup.search_ctx_, {}, 5.0);
+  MockSearchOpParam child_param;
+  ASSERT_EQ(OB_SUCCESS, required.init(child_param));
+  child_param.set_is_scoring(true);
+  ASSERT_EQ(OB_SUCCESS, optional.init(child_param));
+  ObDASReqOptOpParam param(&required, &optional, true);
+  param.set_is_scoring(true);
+  ObDASReqOptOp req_opt(ctx_setup.search_ctx_);
+  ASSERT_EQ(OB_SUCCESS, req_opt.init(param));
+  ASSERT_EQ(OB_SUCCESS, req_opt.open());
+  EXPECT_DOUBLE_EQ(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, req_opt.min_competitive_score_);
+  EXPECT_EQ(OB_INVALID_ARGUMENT,
+      req_opt.set_min_competitive_score(std::numeric_limits<double>::quiet_NaN()));
+  EXPECT_DOUBLE_EQ(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, req_opt.min_competitive_score_);
+  ASSERT_EQ(OB_SUCCESS, req_opt.set_min_competitive_score(-2.0));
+  ASSERT_EQ(OB_SUCCESS, req_opt.set_min_competitive_score(0.0));
+  ASSERT_EQ(OB_SUCCESS, req_opt.set_min_competitive_score(1.0));
+  EXPECT_TRUE(req_opt.score_propagated_);
+  EXPECT_DOUBLE_EQ(1.0, req_opt.min_competitive_score_);
+  EXPECT_DOUBLE_EQ(1.0, optional.min_competitive_score_);
+  EXPECT_EQ(OB_INVALID_ARGUMENT, req_opt.set_min_competitive_score(0.0));
+  EXPECT_DOUBLE_EQ(1.0, req_opt.min_competitive_score_);
+  ASSERT_EQ(OB_SUCCESS, req_opt.rescan());
+  EXPECT_DOUBLE_EQ(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, req_opt.min_competitive_score_);
+  EXPECT_FALSE(req_opt.score_propagated_);
+  ASSERT_EQ(OB_SUCCESS, req_opt.close());
+}
+
 // ============================================================================
 // Section 8: ObDASDisjunctionOp Tests
 // ============================================================================
