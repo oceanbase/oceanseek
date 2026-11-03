@@ -158,12 +158,6 @@ int ObPLCompilerUtils::compile_routine(ObExecContext &ctx,
         OX (routine->get_stat_for_update().type_ = pl::ObPLCacheObjectType::STANDALONE_ROUTINE_TYPE);
         OZ (ctx.get_pl_engine()->add_pl_lib_cache(routine, pc_ctx));
       }
-      OZ (pl::ObPLCompiler::update_schema_object_dep_info(routine->get_dependency_table(), 
-                                                          routine->get_tenant_id(),
-                                                          routine->get_owner(),
-                                                          routine_info->get_routine_id(),
-                                                          routine_info->get_schema_version(), 
-                                                          routine_info->get_object_type()));
     }
   }
   return ret;
