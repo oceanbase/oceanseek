@@ -131,9 +131,9 @@ int ObTxLogCbPoolMgr::switch_to_leader(const int64_t active_tx_cnt)
     int64_t pool_list_size = 0;
     {
       SpinRLockGuard guard(pool_list_rw_lock_);
-      const int64_t pool_list_size = pool_list_.get_size();
+      pool_list_size = pool_list_.get_size();
     }
-    if (target_log_pool_cnt >= pool_list_size) {
+    if (pool_list_size >= target_log_pool_cnt) {
       // do nothing
     } else {
       for (int i = pool_list_size; OB_SUCC(ret) && i < target_log_pool_cnt; i++) {
