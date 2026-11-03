@@ -177,19 +177,24 @@ int ObTransDeadlockDetectorAdapter::gen_dependency_resource_array_(const ObIArra
   UserBinaryKey binary_key;
   ObDependencyHolder resource;
   for (int64_t idx = 0; idx < block_conflict_info_array.count() && OB_SUCC(ret); idx++) {
-    if (!block_conflict_info_array.at(idx).is_valid()) {
-      DETECT_LOG(WARN, "invalid conflict info", K(block_conflict_info_array.at(idx)));
-    } else {
-      ObTransDeadlockDetectorKey detector_key(detector_key_type, block_conflict_info_array.at(idx).conflict_tx_id_);
-      if (OB_FAIL(binary_key.set_user_key(detector_key))) {
-        DETECT_LOG(ERROR, "fail to create key");
-      } 
-    }
-    if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(resource.set_args(block_conflict_info_array.at(idx).conflict_tx_scheduler_, binary_key))) {
-      DETECT_LOG(ERROR, "fail to create resource");
+    const storage::ObRowConflictInfo &conflict_info = block_conflict_info_array.at(idx);
+    ObTransDeadlockDetectorKey detector_key(detector_key_type, conflict_info.conflict_tx_id_);
+    // The holder trans may have finished and its trans ctx has been recycled before the conflict
+    // info is consumed(one typical case is the out-trans lock of table lock, which outlives the
+    // trans ctx), then get_trans_info_on_participant() fails and the scheduler of the conflict
+    // info is left invalid. Such conflict info can not describe a dependency at all, building a
+    // resource with it only makes the detector return OB_INVALID_ARGUMENT again and again, so
+    // skip it here instead of passing it to the detector.
+    if (!conflict_info.is_valid()) {
+      if (REACH_TIME_INTERVAL(10_s)) {
+        DETECT_LOG(WARN, "invalid conflict info, skip building dependency", K(conflict_info));
+      }
+    } else if (OB_FAIL(binary_key.set_user_key(detector_key))) {
+      DETECT_LOG(ERROR, "fail to create key", K(conflict_info));
+    } else if (OB_FAIL(resource.set_args(conflict_info.conflict_tx_scheduler_, binary_key))) {
+      DETECT_LOG(ERROR, "fail to create resource", K(conflict_info));
     } else if (OB_FAIL(dependency_resources.push_back(resource))) {
-      DETECT_LOG(ERROR, "fail to push resource");
+      DETECT_LOG(ERROR, "fail to push resource", K(conflict_info));
     }
   }
   return ret;
@@ -240,6 +245,10 @@ int ObTransDeadlockDetectorAdapter::register_to_deadlock_detector_(const Session
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(gen_dependency_resource_array_(conflict_array, blocked_resources, detector_key_type))) {
     DETECT_LOG(WARN, "fail to generate block resource", PRINT_WRAPPER);
+  } else if (blocked_resources.empty()) {
+    // No conflict info can be used to build a dependency, there is nothing for the detector to
+    // detect, registering a detector with empty block list only wastes detector resources, skip it.
+    DETECT_LOG(INFO, "no usable conflict info, skip register to deadlock detector", PRINT_WRAPPER);
   } else if (OB_ISNULL(MTL(ObDeadLockDetectorMgr*))) {
     ret = OB_ERR_UNEXPECTED;
     DETECT_LOG(ERROR, "mtl deadlock detector mgr is null", PRINT_WRAPPER);
@@ -625,6 +634,7 @@ void ObTransDeadlockDetectorAdapter::check_if_needed_register_detector_when_end_
   if (ret_code == OB_TRY_LOCK_ROW_CONFLICT && // 1. must be 6005
       is_rollback == true && // 2. must rollback statment
       !conflict_info_array.empty() && // 3. must has conflict objects
+      has_valid_conflict_info_(conflict_info_array) && // 3.1 the conflict objects must be usable
       current_ts < query_timeout_ts && // 4. must not timeout
       continuous_lock_conflict_cnt > 10) {
       // 5. remote execution or local exection but retry more than 10 times for some unknown reasons
@@ -646,6 +656,16 @@ void ObTransDeadlockDetectorAdapter::check_if_needed_register_detector_when_end_
     DETECT_LOG(INFO, "this stmt retryed too much times already", PRINT_WRAPPER);
   }
   #undef PRINT_WRAPPER
+}
+
+bool ObTransDeadlockDetectorAdapter::has_valid_conflict_info_(
+    const ObIArray<storage::ObRowConflictInfo> &conflict_info_array)
+{
+  bool has_valid = false;
+  for (int64_t idx = 0; idx < conflict_info_array.count() && !has_valid; ++idx) {
+    has_valid = conflict_info_array.at(idx).is_valid();
+  }
+  return has_valid;
 }
 
 int ObTransDeadlockDetectorAdapter::fetch_conflict_info_array(transaction::ObTxDesc &desc,

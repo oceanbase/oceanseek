@@ -213,6 +213,7 @@ private:
   static int gen_dependency_resource_array_(const ObIArray<storage::ObRowConflictInfo> &blocked_trans_info_array,
                                             ObIArray<share::detector::ObDependencyHolder> &dependency_resources,
                                             const ObDeadlockKeyType &detector_key_type);
+  static bool has_valid_conflict_info_(const ObIArray<storage::ObRowConflictInfo> &conflict_info_array);
   static void check_if_needed_register_detector_when_end_stmt_(const bool is_rollback,
                                                                const int ret_code,
                                                                sql::ObSQLSessionInfo &session,
