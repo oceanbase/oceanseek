@@ -92,9 +92,8 @@ void ObLobId::reset()
 
 bool ObLobId::is_valid() const
 {
-  return get_column_idx() > 0
-         && get_tablet_id() > 0
-         && get_auto_inc_id() > 0;
+  // Heap-table LOBs reuse hidden row IDs, which can be zero after DDL.
+  return get_column_idx() > 0 && get_tablet_id() > 0;
 }
 
 uint64_t ObLobId::hash() const
