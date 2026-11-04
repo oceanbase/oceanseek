@@ -34,13 +34,15 @@ OB_DEF_SERIALIZE(obrpc::ObInnerSQLTransmitArg)
     use_external_session_,
     consumer_group_id_,
     name_case_mode_,
-    select_index_enabled_);
+    select_index_enabled_,
+    is_async_select_query_);
   return ret;
 }
 
 OB_DEF_DESERIALIZE(obrpc::ObInnerSQLTransmitArg)
 {
   int ret = OB_SUCCESS;
+  is_async_select_query_ = false;
   LST_DO_CODE(OB_UNIS_DECODE,
     ctrl_svr_,
     runner_svr_,
@@ -62,6 +64,9 @@ OB_DEF_DESERIALIZE(obrpc::ObInnerSQLTransmitArg)
     consumer_group_id_,
     name_case_mode_,
     select_index_enabled_);
+  if (OB_SUCC(ret) && pos < data_len) {
+    OB_UNIS_DECODE(is_async_select_query_);
+  }
   if (OB_SUCC(ret)) {
     (void)sql::ObSQLUtils::adjust_time_by_ntp_offset(worker_timeout_);
   }
@@ -91,7 +96,8 @@ OB_DEF_SERIALIZE_SIZE(obrpc::ObInnerSQLTransmitArg)
     use_external_session_,
     consumer_group_id_,
     name_case_mode_,
-    select_index_enabled_);
+    select_index_enabled_,
+    is_async_select_query_);
   return len;
 }
 // 

@@ -60,7 +60,8 @@ public:
       query_timeout_(OB_DEFAULT_SESSION_TIMEOUT), trx_timeout_(OB_DEFAULT_SESSION_TIMEOUT),
       sql_mode_(0), tz_info_wrap_(), ddl_info_(), is_load_data_exec_(false), nls_formats_{},
       use_external_session_(false), consumer_group_id_(0),
-      name_case_mode_(OB_NAME_CASE_INVALID), select_index_enabled_(false) {};
+      name_case_mode_(OB_NAME_CASE_INVALID), select_index_enabled_(false),
+      is_async_select_query_(false) {};
   ObInnerSQLTransmitArg(common::ObAddr ctrl_svr, common::ObAddr runner_svr,
                         uint64_t tenant_id, uint64_t conn_id, common::ObString inner_sql,
                         InnerSQLOperationType operation_type, bool is_oracle_mode,
@@ -76,7 +77,8 @@ public:
           query_timeout_(query_timeout), trx_timeout_(trx_timeout), sql_mode_(sql_mode),
           tz_info_wrap_(), ddl_info_(ddl_info), is_load_data_exec_(is_load_data_exec), nls_formats_{},
           use_external_session_(use_external_session), consumer_group_id_(consumer_group_id),
-          name_case_mode_(name_case_mode), select_index_enabled_(select_index_enabled) {}
+          name_case_mode_(name_case_mode), select_index_enabled_(select_index_enabled),
+          is_async_select_query_(false) {}
   ~ObInnerSQLTransmitArg() {}
 
   const common::ObAddr &get_ctrl_svr() const { return ctrl_svr_; }
@@ -191,6 +193,7 @@ private:
   uint64_t consumer_group_id_;
   ObNameCaseMode name_case_mode_;
   bool select_index_enabled_;
+  bool is_async_select_query_; // Serialization placeholder for async queries.
 };
 
 class ObInnerSQLTransmitResult
