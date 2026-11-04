@@ -25,7 +25,8 @@ MissLogTask::MissLogTask(
     LSFetchCtx &ls_fetch_ctx,
     IObCDCPartTransResolver::MissingLogInfo &missing_info,
     logfetcher::TransStatInfo &tsi)
-    : svr_(), rpc_(rpc), ls_fetch_ctx_(ls_fetch_ctx), missing_info_(missing_info), need_change_server_(false), tsi_(tsi)
+    : svr_(), rpc_(rpc), ls_fetch_ctx_(ls_fetch_ctx), missing_info_(missing_info), need_change_server_(false),
+      last_svr_list_refresh_tstamp_(OB_INVALID_TIMESTAMP), tsi_(tsi)
 {
   svr_ = orig_svr;
 }
@@ -35,6 +36,7 @@ void MissLogTask::reset()
   // only server is init by MissLogTask
   svr_.reset();
   need_change_server_ = false;
+  last_svr_list_refresh_tstamp_ = OB_INVALID_TIMESTAMP;
 }
 
 int MissLogTask::try_change_server(const int64_t timeout, volatile bool &stop_flag)
@@ -42,14 +44,19 @@ int MissLogTask::try_change_server(const int64_t timeout, volatile bool &stop_fl
   int ret = OB_SUCCESS;
   const int64_t end_time = get_timestamp() + timeout;
 
-  if (OB_UNLIKELY(need_change_server_)) {
+  if (OB_UNLIKELY(stop_flag)) {
+    ret = OB_IN_STOP_STATE;
+  } else if (OB_UNLIKELY(need_change_server_)) {
     common::ObAddr req_svr;
     int64_t retry_times = 0;
     bool is_timeout = false;
+    const static int64_t SVR_LIST_REFRESH_INTERVAL = 1 * _SEC_;
     const static int64_t RETRY_LOG_PRINT_INTERVAL = 30 * _SEC_;
     do {
       if (OB_FAIL(ls_fetch_ctx_.next_server(req_svr))) {
-        LOG_WARN("get next_server failed", KR(ret), K_(ls_fetch_ctx));
+        if (OB_ITER_END != ret && OB_ENTRY_NOT_EXIST != ret) {
+          LOG_WARN("get next_server failed", KR(ret), K_(ls_fetch_ctx));
+        }
       } else if (OB_UNLIKELY(!req_svr.is_valid())) {
         ret = OB_NEED_RETRY;
         LOG_WARN("next_server is not valid, need_retry", KR(ret), K(req_svr), K_(ls_fetch_ctx));
@@ -67,11 +74,24 @@ int MissLogTask::try_change_server(const int64_t timeout, volatile bool &stop_fl
           LOG_ERROR("[MISS_LOG][NEXT_SERVER]RETRY_GET_NEXT_SERVER TIMEOUT", KR(ret), K(timeout), KPC(this));
           ret = OB_TIMEOUT;
         } else {
+          const int64_t now = get_timestamp();
+          if (!stop_flag
+              && (OB_INVALID_TIMESTAMP == last_svr_list_refresh_tstamp_
+                  || now - last_svr_list_refresh_tstamp_ >= SVR_LIST_REFRESH_INTERVAL)
+              && ls_fetch_ctx_.need_update_svr_list()) {
+            // This task stays in the missing-log retry loop and cannot rely on IdlePool to refresh routes.
+            // Throttle attempts across RPC retries, including failures to enqueue the asynchronous refresh.
+            last_svr_list_refresh_tstamp_ = now;
+            const int refresh_ret = ls_fetch_ctx_.update_svr_list();
+            if (OB_SUCCESS != refresh_ret) {
+              LOG_WARN("refresh missing-log server list failed", KR(refresh_ret), K_(ls_fetch_ctx));
+            }
+          }
+
           ++retry_times;
           if (TC_REACH_TIME_INTERVAL(RETRY_LOG_PRINT_INTERVAL)) {
-            LOG_WARN("[MISS_LOG][NEXT_SERVER]RETRY_GET_NEXT_SERVER",
-                "tls_id", ls_fetch_ctx_.get_tls_id(), K(retry_times),
-                "end_time", TS_TO_STR(end_time));
+            LOG_WARN("[MISS_LOG][NEXT_SERVER]RETRY_GET_NEXT_SERVER", KR(ret),
+                "tls_id", ls_fetch_ctx_.get_tls_id(), K(retry_times), "end_time", TS_TO_STR(end_time));
           }
           ob_usleep(10 * _MSEC_);
         }
@@ -625,7 +645,9 @@ int ObCDCMissLogHandler::fetch_miss_log_(
   const int64_t last_handle_progress = misslog_task.get_handle_progress();
   LSFetchCtx &ls_fetch_ctx = misslog_task.ls_fetch_ctx_;
 
-  if (OB_UNLIKELY(! is_fetching_mode_valid(fetching_mode))) {
+  if (OB_UNLIKELY(stop_flag)) {
+    ret = OB_IN_STOP_STATE;
+  } else if (OB_UNLIKELY(! is_fetching_mode_valid(fetching_mode))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("fetching mode is not valid", KR(ret), K(fetching_mode));
   } else if (is_integrated_fetching_mode(fetching_mode)) {
@@ -633,6 +655,8 @@ int ObCDCMissLogHandler::fetch_miss_log_(
       if (OB_IN_STOP_STATE != ret) {
         LOG_ERROR("get fetch_miss_log server failed", KR(ret), K(ls_fetch_ctx));
       }
+    } else if (OB_UNLIKELY(stop_flag)) {
+      ret = OB_IN_STOP_STATE;
     } else if (OB_FAIL(fetch_srpc.fetch_log(
         misslog_task.rpc_,
         ls_fetch_ctx.get_tls_id().get_tenant_id(),

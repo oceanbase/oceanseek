@@ -54,6 +54,7 @@ public:
 
   IObCDCPartTransResolver::MissingLogInfo &missing_info_;
   bool need_change_server_;
+  int64_t last_svr_list_refresh_tstamp_;
   logfetcher::TransStatInfo &tsi_;
 };
 

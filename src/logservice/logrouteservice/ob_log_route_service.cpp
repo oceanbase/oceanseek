@@ -492,6 +492,11 @@ int ObLogRouteService::registered(
 
       if (OB_FAIL(TG_PUSH_TASK(tg_id_, asyn_task))) {
         LOG_WARN("TG_PUSH_TASK failed", KR(ret), K(router_key));
+        // No task owns this key when enqueueing fails; allow the next refresh attempt to retry.
+        const int erase_ret = ls_route_key_set_.erase_refactored(router_key);
+        if (OB_SUCCESS != erase_ret) {
+          LOG_WARN("remove failed asynchronous route query key failed", KR(erase_ret), K(router_key));
+        }
       }
     }
 
@@ -1217,4 +1222,3 @@ void ObLogRouteService::ObLSRouteTimerTask::runTimerTask()
 
 } // namespace logservice
 } // namespace oceanbase
-
