@@ -88,19 +88,23 @@ int ObSSTabletMergeHelper::check_can_generate_new_tablet(
     }
   } else if (ObTabletStatus::TRANSFER_OUT == user_data.tablet_status_ || ObTabletStatus::TRANSFER_OUT_DELETED == user_data.tablet_status_) {
     can_gc_sstable = false;
-    if (is_transfer_backfill_update_reason(update_reason)) {
+    const ObTabletTransferInfo &transfer_info = tablet->get_tablet_meta().transfer_info_;
+    if (!transfer_info.is_transfer_upload_completed()) {
       can_generate_new_tablet = true;
-      FLOG_INFO("backfill in transfer out status, can generate new tablet", K(update_reason), K(user_data));
+      FLOG_INFO("transfer upload is incomplete, can generate new tablet", K(update_reason), K(user_data), K(transfer_info));
+    } else if (is_transfer_backfill_update_reason(update_reason)) {
+      can_generate_new_tablet = true;
+      FLOG_INFO("backfill in transfer out status, can generate new tablet", K(update_reason), K(user_data), K(transfer_info));
     } else {
       can_generate_new_tablet = false;
-      FLOG_INFO("tablet is in transfer out status, cannot generate new tablet", K(update_reason), K(user_data));
-    }
+      FLOG_INFO("tablet is in transfer out status, cannot generate new tablet", K(update_reason), K(user_data), K(transfer_info));
 #ifdef ERRSIM
-    SERVER_EVENT_ADD("storage_ha", "abort_minor_after_backfill",
-                     "tenant_id", MTL_ID(),
-                     "ls_id", shared_tablet_handle.get_obj()->get_ls_id().id(),
-                     "tablet_id", shared_tablet_handle.get_obj()->get_tablet_id().id());
+      SERVER_EVENT_ADD("storage_ha", "abort_minor_after_backfill",
+                       "tenant_id", MTL_ID(),
+                       "ls_id", shared_tablet_handle.get_obj()->get_ls_id().id(),
+                       "tablet_id", shared_tablet_handle.get_obj()->get_tablet_id().id());
 #endif
+    }
   } else {
     can_generate_new_tablet = true;
     can_gc_sstable = true;

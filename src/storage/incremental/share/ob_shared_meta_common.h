@@ -86,7 +86,7 @@ static inline bool is_valid_update_reason(const ObMetaUpdateReason reason)
 }
 static inline bool is_transfer_backfill_update_reason(const ObMetaUpdateReason reason)
 {
-  // 仅 Transfer 回填类 reason 可在 TRANSFER_OUT/TRANSFER_OUT_DELETED 下生成新版本；
+  // 上传完成后，仅 Transfer 回填类 reason 可在 TRANSFER_OUT/TRANSFER_OUT_DELETED 下生成新版本；
   // 漏配会阻断回填与 replace，使 min_recycle_scn 无法刷新。通用 direct load/DDL reason
   // 不应借道放行。
   return reason == ObMetaUpdateReason::TABLET_BACKFILL_ADD_SSTABLE

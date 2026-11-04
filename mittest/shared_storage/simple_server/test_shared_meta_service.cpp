@@ -1785,9 +1785,126 @@ TEST_F(TestSharedMetaService, transfer_upload_completion_retries_and_checks_leas
     ASSERT_EQ(OB_SUCCESS, meta_svr->get_tablet(ls_id, tablet_ids.at(i),
         tablet_infos[i].reorganization_scn_, allocator, shared_tablet));
     EXPECT_EQ(expected, shared_tablet.get_obj()->get_tablet_meta().transfer_info_.is_transfer_upload_completed());
+    // Upload completion closes every ordinary update path, not just shared minor.
+    const ObMetaUpdateReason ordinary_reasons[] = {
+        ObMetaUpdateReason::TABLET_UPLOAD_DATA_MINI_SSTABLE,
+        ObMetaUpdateReason::TABLET_COMPACT_ADD_DATA_MINOR_SSTABLE,
+        ObMetaUpdateReason::TABLET_COMPACT_ADD_DATA_MAJOR_SSTABLE,
+        ObMetaUpdateReason::TABLET_UPLOAD_COMPACT_ADD_DATA_MINOR_SSTABLE,
+        ObMetaUpdateReason::TABLET_UPLOAD_REPLACE_MINOR_SSTABLE,
+        ObMetaUpdateReason::TABLET_UPLOAD_DDL_DUMP_SSTABLE,
+        ObMetaUpdateReason::TABLET_UPLOAD_INC_MAJOR_DDL_DUMP_SSTABLE,
+        ObMetaUpdateReason::TABLET_DDL_ADD_DATA_MAJOR_SSTABLE,
+        ObMetaUpdateReason::TABLET_ADD_DATA_INC_MAJOR_SSTABLE,
+        ObMetaUpdateReason::TABLET_UPDATE_DATA_INC_MAJOR_SSTABLE};
+    const ObMetaUpdateReason backfill_reasons[] = {
+        ObMetaUpdateReason::TABLET_BACKFILL_ADD_SSTABLE,
+        ObMetaUpdateReason::TABLET_BACKFILL_UPLOAD_SSTABLE,
+        ObMetaUpdateReason::TABLET_TRANSFER_REPLACE_MINOR_SSTABLE,
+        ObMetaUpdateReason::TABLET_BACKFILL_UPDATE_DATA_INC_MAJOR_SSTABLE};
+    bool can_generate = false;
+    bool can_gc = true;
+    for (const auto reason : ordinary_reasons) {
+      ASSERT_EQ(OB_SUCCESS, compaction::ObSSTabletMergeHelper::check_can_generate_new_tablet(
+          ls_id, shared_tablet, reason, true /*need_check_split*/, can_generate, can_gc));
+      EXPECT_EQ(!expected, can_generate) << static_cast<int64_t>(reason);
+      EXPECT_FALSE(can_gc);
+    }
+    for (const auto reason : backfill_reasons) {
+      ASSERT_EQ(OB_SUCCESS, compaction::ObSSTabletMergeHelper::check_can_generate_new_tablet(
+          ls_id, shared_tablet, reason, true /*need_check_split*/, can_generate, can_gc));
+      EXPECT_TRUE(can_generate) << static_cast<int64_t>(reason);
+      EXPECT_FALSE(can_gc);
+    }
   };
   ASSERT_NO_FATAL_FAILURE(check_marker(0, false));
   ASSERT_NO_FATAL_FAILURE(check_marker(1, false));
+
+  ObStorageSchema *storage_schema = nullptr;
+  ASSERT_EQ(OB_SUCCESS, local_tablets[0].get_obj()->load_storage_schema(allocator, storage_schema));
+  DEFER(ObTabletObjLoadHelper::free(allocator, storage_schema));
+  ObArray<ObSSMetaCtrlKeyInfo> empty_keys;
+  auto create_empty_minor = [&](const SCN &start, const SCN &end,
+                                const ObITable::TableType type, ObTableHandleV2 &handle) {
+    ObTabletCreateSSTableParam param;
+    ASSERT_EQ(OB_SUCCESS, param.init_for_transfer_empty_mini_minor_sstable(
+        tablet_ids.at(0), start, end, *storage_schema, type));
+    param.table_shared_flag_.set_shared_sstable();
+    ASSERT_EQ(OB_SUCCESS, ObTabletCreateDeleteHelper::create_sstable(param, allocator, handle));
+  };
+  auto publish_minor = [&](ObTableHandleV2 &handle, const ObMetaUpdateReason reason,
+                           const ObTablesHandleArray *inputs) {
+    blocksstable::ObSSTable *sstable = nullptr;
+    int ret = handle.get_sstable(sstable);
+    if (OB_SUCCESS == ret) {
+      ObUpdateTableStoreParam param(1, 1, storage_schema, 0, sstable);
+      param.compaction_info_.merge_type_ = nullptr == inputs ? compaction::MINI_MERGE : compaction::MINOR_MERGE;
+      param.compaction_info_.clog_checkpoint_scn_ = sstable->get_end_scn();
+      param.input_tables_handle_ = inputs;
+      ret = meta_svr->update_tablet_table_store(ls_id, tablet_ids.at(0),
+          tablet_infos[0].reorganization_scn_, reason, param, empty_keys, true /*check_lease*/);
+    }
+    return ret;
+  };
+  // Reproduce the 63 -> 64 upload overflow while the source is TRANSFER_OUT.
+  // Ordinary shared minor must reclaim slots before upload can finish.
+  ObTablesHandleArray minor_inputs;
+  const int64_t full_minor_count = MAX_SSTABLE_CNT_IN_STORAGE - 1;
+  for (int64_t i = 0; i < full_minor_count; ++i) {
+    ObTableHandleV2 mini;
+    ASSERT_NO_FATAL_FAILURE(create_empty_minor(SCN::plus(create_scn, i), SCN::plus(create_scn, i + 1),
+        ObITable::MINI_SSTABLE, mini));
+    ASSERT_EQ(OB_SUCCESS, publish_minor(mini, ObMetaUpdateReason::TABLET_BACKFILL_UPLOAD_SSTABLE, nullptr));
+    ASSERT_EQ(OB_SUCCESS, minor_inputs.add_table(mini));
+  }
+  ObTableHandleV2 pending_mini;
+  ASSERT_NO_FATAL_FAILURE(create_empty_minor(SCN::plus(create_scn, full_minor_count),
+      SCN::plus(create_scn, full_minor_count + 1), ObITable::MINI_SSTABLE, pending_mini));
+  ASSERT_EQ(OB_SIZE_OVERFLOW, publish_minor(pending_mini,
+      ObMetaUpdateReason::TABLET_BACKFILL_UPLOAD_SSTABLE, nullptr));
+  ObTableHandleV2 merged_minor;
+  ASSERT_NO_FATAL_FAILURE(create_empty_minor(create_scn, SCN::plus(create_scn, full_minor_count),
+      ObITable::MINOR_SSTABLE, merged_minor));
+  ASSERT_EQ(OB_SUCCESS, publish_minor(merged_minor,
+      ObMetaUpdateReason::TABLET_COMPACT_ADD_DATA_MINOR_SSTABLE, &minor_inputs));
+  ASSERT_EQ(OB_SUCCESS, publish_minor(pending_mini,
+      ObMetaUpdateReason::TABLET_BACKFILL_UPLOAD_SSTABLE, nullptr));
+  ObTabletHandle compacted_tablet;
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_tablet(ls_id, tablet_ids.at(0),
+      tablet_infos[0].reorganization_scn_, allocator, compacted_tablet));
+  EXPECT_EQ(2, compacted_tablet.get_obj()->get_minor_table_count());
+  EXPECT_FALSE(compacted_tablet.get_obj()->get_tablet_meta().transfer_info_.is_transfer_upload_completed());
+
+  // A normal major can also publish before upload completes. Completing upload
+  // must preserve that table store; a later publication must see the new marker.
+  ObTabletCreateSSTableParam create_param;
+  ASSERT_EQ(OB_SUCCESS, create_param.init_for_empty_major_sstable(tablet_ids.at(0), *storage_schema,
+      1 /*snapshot_version*/, -1 /*column_group_idx*/, false /*has_all_column_group*/, true /*is_shared*/));
+  ObTableHandleV2 major_handle;
+  ASSERT_EQ(OB_SUCCESS, ObTabletCreateDeleteHelper::create_sstable(create_param, allocator, major_handle));
+  blocksstable::ObSSTable *major = nullptr;
+  ASSERT_EQ(OB_SUCCESS, major_handle.get_sstable(major));
+  ObUpdateTableStoreParam update_param(1, 1, storage_schema, 0, major);
+  update_param.compaction_info_.merge_type_ = compaction::MAJOR_MERGE;
+  ASSERT_TRUE(update_param.is_valid());
+  ASSERT_EQ(OB_SUCCESS, meta_svr->update_tablet_table_store(ls_id, tablet_ids.at(0),
+      tablet_infos[0].reorganization_scn_, ObMetaUpdateReason::TABLET_COMPACT_ADD_DATA_MAJOR_SSTABLE,
+      update_param, empty_keys, true /*check_lease*/));
+
+  // Model a writer that already passed its check on upload=false, then loses
+  // the publication race to finish_upload_. Its old op_id must not commit.
+  ObTabletAtomicProtocol stale_update;
+  ObTabletAtomicProtocolParam protocol_param;
+  ASSERT_EQ(OB_SUCCESS, meta_svr->build_tablet_protocol_init_param_(
+      ls_id, tablet_ids.at(0), tablet_infos[0].reorganization_scn_, empty_keys, protocol_param));
+  ASSERT_EQ(OB_SUCCESS, stale_update.init(protocol_param));
+  ASSERT_EQ(OB_SUCCESS, stale_update.create(true /*need_check_sswriter*/));
+  DEFER(EXPECT_EQ(OB_SUCCESS, stale_update.abort_self()));
+  ObTabletHandle before_upload;
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_tablet(ls_id, tablet_ids.at(0),
+      tablet_infos[0].reorganization_scn_, allocator, before_upload));
+  ASSERT_FALSE(before_upload.get_obj()->get_tablet_meta().transfer_info_.is_transfer_upload_completed());
+
   ObSSTransferBackfillTXCtx ctx;
   ctx.backfill_type_ = ObSSTransferBackfillType::BACKFILL_UPLOAD;
   ctx.src_ls_handle_ = ls_handle;
@@ -1801,6 +1918,27 @@ TEST_F(TestSharedMetaService, transfer_upload_completion_retries_and_checks_leas
   ASSERT_EQ(OB_TABLET_NOT_EXIST, task.finish_upload_(ctx));
   ASSERT_NO_FATAL_FAILURE(check_marker(0, true));
   ASSERT_NO_FATAL_FAILURE(check_marker(1, false));
+  class StalePublishOP : public ObIAtomicProtocolOP
+  {
+  public:
+    int process(common::ObMySQLTransaction &, const share::SCN &) override
+    {
+      called_ = true;
+      return OB_SUCCESS;
+    }
+    bool called_ = false;
+  } stale_op;
+  ASSERT_EQ(OB_NEED_RETRY, stale_update.finish(stale_op));
+  EXPECT_FALSE(stale_op.called_);
+  EXPECT_FALSE(before_upload.get_obj()->get_tablet_meta().transfer_info_.is_transfer_upload_completed());
+  ASSERT_EQ(OB_OP_NOT_ALLOW, meta_svr->update_tablet_table_store(ls_id, tablet_ids.at(0),
+      tablet_infos[0].reorganization_scn_, ObMetaUpdateReason::TABLET_COMPACT_ADD_DATA_MAJOR_SSTABLE,
+      update_param, empty_keys, true /*check_lease*/));
+  ObTabletHandle after_upload;
+  ASSERT_EQ(OB_SUCCESS, meta_svr->get_tablet(ls_id, tablet_ids.at(0),
+      tablet_infos[0].reorganization_scn_, allocator, after_upload));
+  EXPECT_TRUE(after_upload.get_obj()->get_tablet_meta().transfer_info_.is_transfer_upload_completed());
+  EXPECT_EQ(1, after_upload.get_obj()->get_major_table_count());
   ctx.tablet_infos_.at(1).reorganization_scn_ = tablet_infos[1].reorganization_scn_;
 
   // Keep ctx successful: cancellation itself must prevent a new persisted marker.
