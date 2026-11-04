@@ -1,8 +1,8 @@
-# OceanBase 共享存储目录结构梳理（详细版 · 4.6.2）
+# OceanBase 共享存储目录结构梳理（详细版）
 
-> 代码分支：lakebase-master；关注 `OB_BUILD_SHARED_STORAGE` 宏闭包内的实现。
+> 代码基线：master b5909bf5399d36c06932c9189fbae3f61cc029a4；关注 `OB_BUILD_SHARED_STORAGE` 宏闭包内的实现。
 >
-> 本文为 4.6.2 版本目录结构说明，相对 4.6.0（`docs/architecture_design/4.6.0/ss-directory-structure.md`）的主要差异：
+> 本文是目录结构的当前维护版。当前版本源自 4.6.2 快照，并已按上述代码基线复核枚举与路径实现。相对 4.6.0 快照的主要差异：
 > `SHARED_TABLET_SUB_META`、`SHARED_TABLET_META`、`SHARED_LS_CKPT`、`SHARED_LS_META` 的对象存储形态与 in-table 形态使用同一 `ObStorageObjectType` 枚举值，由 `MacroBlockId.location_` 区分存储后端：
 > - `location=OBJECT_STORAGE`（0）：使用对象存储；需要本地缓存的类型仍按各自的 local path formatter 生成缓存路径；
 > - `location=TABLE`（1）：写入 inner table（如 `__all_shared_tiered_meta`），逻辑相对路径由 `ObPathContext` 加 `table://` 前缀后路由到 `ObTableDevice`。
@@ -18,13 +18,13 @@
 
 | 模块 | 路径 | 主要职责 |
 |------|------|----------|
-| 目录/文件常量 | `close_modules/shared_storage/storage/shared_storage/ob_file_helper.h` | 定义 `CLUSTER_DIR_STR="cluster"` 等字面量及键名 |
+| 目录/文件常量 | `src/storage/shared_storage/ob_file_helper.h` | 定义 `CLUSTER_DIR_STR="cluster"` 等字面量及键名 |
 | 对象类型枚举 + 虚基类 | `src/storage/blocksstable/ob_storage_object_type.h` | `ObStorageObjectType` (uint8)、`ObStorageObjectTypeBase` 抽象接口 |
 | 路径格式化主实现 | `src/storage/blocksstable/ob_storage_object_type.cpp`（每个 type 各自实现 `to_local/remote_path_format` / `to_relative_remote_path_format` / `remote_path_to_macro_id` / `local_path_to_macro_id`） |
 | 共享基方法 | `ObStorageObjectTypeBase::stract_remote_path_format()` | 所有 tenant 共享类型走"<root>/cluster_<cid>/tenant_<tid>/<relative_path>" |
 | MacroBlockId ↔ 路径工具 | `src/storage/blocksstable/ob_ss_obj_util.cpp` | 对 `ObStorageObjectTypeBase` 的统一派发 |
 | 目录/文件上下文 | `ObPathContext`、`ObFileHelper`（`ob_file_helper.h`） | 构造完整路径并附加 `.tmp.<seq>` / `.deleted` 后缀 |
-| 目录/磁盘配额管理 | `close_modules/shared_storage/storage/shared_storage/ob_dir_manager.cpp` | `create_tenant_dir` / `create_ls_id_dir` / `create_scatter_dir` |
+| 目录/磁盘配额管理 | `src/storage/shared_storage/ob_dir_manager.cpp` | `create_tenant_dir` / `create_ls_id_dir` / `create_scatter_dir` |
 
 ---
 
@@ -38,6 +38,7 @@
 | `TENANT_DIR_STR` | `"tenant"` | tenant 层（租户共享） |
 | `LS_DIR_STR` | `"ls"` | LS/LogStream 层 |
 | `TABLET_DIR_STR` | `"tablet"` | 用户 tablet 层 |
+| `TABLET_IDS_DIR_STR` | `"tablet_ids"` | tablet ID 集合 |
 | `TABLET_DATA_DIR_STR` | `"tablet_data"` | 私有 macro block（per-server） |
 | `TABLET_META_DIR_STR` | `"tablet_meta"` | 私有 tablet 元数据 |
 | `META_DIR_STR` | `"meta"` | 元数据子目录名 |
@@ -58,7 +59,9 @@
 | `OP_ID_DIR_STR` | `"op"` | op 目录（仅作目录名片段） |
 | `PREWARM_INFO_DIR_STR` | `"prewarm_info"` | Major prewarm 信息 |
 | `COMPACTION/COMPACTOR/SCHEDULER_DIR_STR` | `"compaction"/"compactor"/"scheduler"` | 合并调度器相关 |
-| `TX_CTX/TX_DATA/TX_LOCK/REORG_INFO_TABLET_DIR_STR` | `"TX_CTX"/"TX_DATA"/"TX_LOCK"/"REORG_INFO"` | 4 个 LS 内部 tablet 的固定目录名 |
+| `LOCK_DIR_STR` | `"lock"` | SS meta control row 的 lock 路径片段 |
+| `MARK_SWEEP_GC_DIAG_DIR_STR` / `ROUND_DIR_STR` / `BKT_KEY_STR` | `"mark_sweep_gc_diag"` / `"round"` / `"bkt"` | Mark-Sweep GC 诊断目录 |
+| `TX_CTX/TX_DATA/TX_LOCK/REORG_INFO/MDS_TABLET_DIR_STR` | `"TX_CTX"/"TX_DATA"/"TX_LOCK"/"REORG_INFO"/"MDS_DATA"` | 5 个 LS 内部 tablet 的固定目录名 |
 
 ### 1.2 文件名 key / 后缀
 | 常量 | 值 | 含义 |
@@ -78,6 +81,8 @@
 | `LEN_KEY_STR` | `len` | UNSEALED_REMOTE_SEG_FILE 的 valid_length |
 | `IDX_KEY_STR` | `idx` | EXTERNAL_TABLE_FILE 的 offset/2MB 索引 |
 | `TFR_KEY_STR` | `tsfr` | （备用） |
+| `BKT_KEY_STR` | `bkt` | Mark-Sweep GC 诊断桶号 |
+| `IO_DETECT_FILE_NAME` | `io_detect_file` | IO 检测文件 |
 | `OBJ_TIERED_METADATA_SEQ_WIDTH` | `10` | `SHARED_TABLET_SUB_META` 的对象存储完整路径和逻辑相对路径中，seq 用 `%010ld` 零填充；本地 cache 路径不补零 |
 
 ### 1.3 对象类型枚举完整表（`ob_storage_object_type.h`）
@@ -119,6 +124,8 @@ MAX=42
 
 ## 2. 远程存储完整目录树
 
+> 表中的 `<private_macro_third_id>` 是格式化层使用的 MacroBlockId.third_id，不强行解释成 transfer epoch。对共享 tablet 子元数据等 SS 对象，`set_ss_third_id` 在 inner tablet 时写 ls_id，否则写 reorganization_scn（`src/storage/blocksstable/ob_macro_block_id.h:152-162`）；私有 data/tablet meta 路径直接格式化该数值（`ob_storage_object_type.cpp:461-478,2304-2341`）。
+
 ```
 <object_storage_root_dir>/                      ← ObDirManager::set_object_storage_root_dir()
 └── cluster_<cluster_id>/
@@ -133,9 +140,9 @@ MAX=42
     │   │
     │   └── <tenant_id>_<tenant_epoch_id>/      ← 普通租户在该 server 上的私有目录
     │       ├── tablet_data/                    ← PRIVATE_{DATA,META}_MACRO
-    │       │   └── <tablet_id>/<macro_private_transfer_epoch>/
-    │       │       ├── data/svr<svr>seq<seq>.T0
-    │       │       └── meta/svr<svr>seq<seq>.T1
+    │       │   └── <tablet_id>/<private_macro_third_id>/
+    │       │       ├── data/svr<svr>op<op>seq<seq>.T0
+    │       │       └── meta/svr<svr>op<op>seq<seq>.T1
     │       │
     │       ├── tmp_data/                       ← TMP_FILE / UNSEALED_REMOTE_SEG_FILE
     │       │   └── <tmp_file_id>/seg<seg>.T8
@@ -146,7 +153,7 @@ MAX=42
     │       │
     │       ├── ls/<ls_id>_<ls_epoch_id>/       ← 租户在该 server 的 LS 私有元数据
     │       │   └── tablet_meta/
-    │       │       └── <tablet_id>/<meta_private_transfer_epoch>/
+    │       │       └── <tablet_id>/<private_macro_third_id>/
     │       │           └── ver<meta_version_id>.T10            ← PRIVATE_TABLET_META
     │       │
     │       └── macro_cache_ckpt/               ← MACRO_CACHE_CKPT_{DATA,META}
@@ -162,7 +169,7 @@ MAX=42
         │   ├── meta/
         │   │   ├── scn<20-digit>.T30                           ← SHARED_LS_CKPT
         │   │   └── scn<20-digit>.T31                           ← SHARED_LS_META
-        │   └── TX_CTX / TX_DATA / TX_LOCK / REORG_INFO/
+        │   └── TX_CTX / TX_DATA / TX_LOCK / REORG_INFO / MDS_DATA/
         │       ├── mini/sstable/op_<op>/data/seq<seq>.T2        ← SHARED_MINI_DATA_MACRO
         │       ├── mini/sstable/op_<op>/meta/seq<seq>.T3        ← SHARED_MINI_META_MACRO
         │       ├── minor/sstable/op_<op>/data/seq<seq>.T4       ← SHARED_MINOR_DATA_MACRO
@@ -197,20 +204,20 @@ MAX=42
         │       └── op<op>seq<10-digit>.T21             ← SHARED_TABLET_SUB_META
         │
         └── mark_sweep_gc_diag/round<round>/{del|kept}/
-            └── {macros|tablet_meta_scns}/bkt<bucket>.T32
+            └── {macros|tablet_meta_scns|study_results}/bkt<bucket>.T32
 ```
 
 ### 2.1 关键路径模板与对应实现
 
 | 类型 (.T) | 路径模板 | 实现 |
 |----------|----------|------|
-| PRIVATE_DATA_MACRO / PRIVATE_META_MACRO (.T0/.T1) | `<root>/cluster_<cid>/server_<svr>/<tid>_<tenant_epoch>/tablet_data/<tablet_id>/<transfer_epoch>/{data\|meta}/svr<svr>seq<seq>.T<n>` | `ObPrivateDataMacroType` / `ObPrivateMetaMacroType` |
+| PRIVATE_DATA_MACRO / PRIVATE_META_MACRO (.T0/.T1) | `<root>/cluster_<cid>/server_<svr>/<tid>_<tenant_epoch>/tablet_data/<tablet_id>/<private_macro_third_id>/{data\|meta}/svr<svr>op<op>seq<seq>.T<n>` | `ObPrivateDataMacroType` / `ObPrivateMetaMacroType` |
 | SHARED_MINI_*MACRO (.T2/.T3) | 用户tablet: `…/tenant_<tid>/tablet/<tablet_id>/<reorg_scn>/mini/sstable/op_<op>/{data\|meta}/seq<seq>.T<n>`；LS内部: `…/tenant_<tid>/ls/<ls_id>/<TABLET_NAME>/mini/sstable/op_<op>/{data\|meta}/seq<seq>.T<n>` | `ObSharedMiniDataMacroType` / `ObSharedMiniMetaMacroType` |
 | SHARED_MINOR_*MACRO (.T4/.T5) | 同上，`mini` 换成 `minor` | `ObSharedMinorDataMacroType` / `ObSharedMinorMetaMacroType` |
 | SHARED_MAJOR_*MACRO (.T6/.T7) | `…/tenant_<tid>/tablet/<tablet_id>/<reorg_scn>/major/sstable/cg_<cg_id>/{data\|meta}/seq<seq>.T<n>` | `ObSharedMajorDataMacroType` / `ObSharedMajorMetaMacroType` |
 | TMP_FILE (.T8) | `<root>/cluster_<cid>/server_<svr>/<tid>_<epoch>/tmp_data/<tmp_file_id>/seg<seg>.T8` | `ObTmpFileType` |
 | SERVER_META (.T9) | **仅本地**（pin_local）：`<local_cache_root>/SERVER_META.T9` | `ObServerMetaType`（无 remote 实现） |
-| PRIVATE_TABLET_META (.T10) | `<root>/cluster_<cid>/server_<svr>/<tid>_<epoch>/ls/<ls_id>_<ls_epoch>/tablet_meta/<tablet_id>/<meta_private_transfer_epoch>/ver<meta_version_id>.T10` | `ObPrivateTabletMetaType` |
+| PRIVATE_TABLET_META (.T10) | `<root>/cluster_<cid>/server_<svr>/<tid>_<epoch>/ls/<ls_id>_<ls_epoch>/tablet_meta/<tablet_id>/<private_macro_third_id>/ver<meta_version_id>.T10` | `ObPrivateTabletMetaType` |
 | PRIVATE_SLOG_FILE (.T11) | 普通租户：`…/server_<svr>/<tid>_<epoch>/slog/seq<file_id>.T11`；500 租户：`…/server_<svr>/server_slog/seq<file_id>.T11` | `ObPrivateSlogFileType` |
 | PRIVATE_CKPT_FILE (.T12) | 普通租户：`…/server_<svr>/<tid>_<epoch>/ckpt/<file_id>.T12`；500 租户：`…/server_<svr>/server_ckpt/<file_id>.T12` | `ObPrivateCkptFileType` |
 | MAJOR_PREWARM_{DATA,DATA_INDEX,META,META_INDEX} (.T13-16) | `…/tenant_<tid>/tablet/<tablet_id>/<reorg_scn>/major/prewarm_info/scn<compaction_scn>.T<n>` | 对应 `ObMajorPrewarm*Type` |
@@ -226,7 +233,11 @@ MAX=42
 | SHARED_INC_MAJOR_*MACRO (.T26/.T27) | `…/tenant_<tid>/tablet/<tablet_id>/<reorg_scn>/inc_major/sstable/cg_<cg_id>/op_<snapshot_version>/{data\|meta}/seq<seq>.T<n>` | `ObSharedIncMajorDataMacroType` / `ObSharedIncMajorMetaMacroType` |
 | SHARED_INC_MAJOR_COMPACTION_*MACRO (.T28/.T29) | `…/tenant_<tid>/tablet/<tablet_id>/<reorg_scn>/inc_major/sstable/cg_<cg_id>/op_<op_id>/{data\|meta}/seq<seq>.T<n>` | `ObSharedIncMajorCompactionDataMacroType` / `ObSharedIncMajorCompactionMetaMacroType` |
 | SHARED_LS_CKPT / SHARED_LS_META (.T30/.T31) | **对象存储**：`…/tenant_<tid>/ls/<ls_id>/meta/scn<20-digit>.T<n>`；**in-table**：去掉 tenant 前缀的同形逻辑相对路径 | `ObSharedLsCkptType` / `ObSharedLsMetaType` |
-| SHARED_MARK_SWEEP_GC_DIAG (.T32) | `…/tenant_<tid>/mark_sweep_gc_diag/round<round>/{del\|kept}/{macros\|tablet_meta_scns}/bkt<bucket>.T32` | `ObSharedMarkSweepGcDiagType::to_relative_remote_path_format()` |
+| SHARED_MARK_SWEEP_GC_DIAG (.T32) | `…/tenant_<tid>/mark_sweep_gc_diag/round<round>/{del\|kept}/{macros\|tablet_meta_scns\|study_results}/bkt<bucket>.T32` | `ObSharedMarkSweepGcDiagType::to_relative_remote_path_format()` |
+| SHARED_MINOR/MAJOR/INC_MAJOR_SSTABLE_CTRL (.T33-.T35) | **SS meta control row**（`MacroBlockId.location=CONTROL`），不是 OSS 独立文件；逻辑路径复用 tablet 或 LS 内部 tablet 的 meta 路径，`scn` 为 20 位 control SCN | `ObSharedMinorSstableCtrlType` / `ObSharedMajorSstableCtrlType` / `ObSharedIncMajorSstableCtrlType` |
+| SHARED_LS_LOCK / SHARED_LS_CKPT_LOCK (.T36/.T38) | **SS meta control row**：二者逻辑路径同为 `ls/<ls_id>/lock/scn<20-digit>.T36` / `.T38`，靠对象类型区分用途 | `ObSharedLsLockType` / `ObSharedLsCkptLockType` |
+| SHARED_TABLET_LOCK (.T37) | **SS meta control row**：用户 tablet 为 `tablet/<tablet_id>/<reorg_scn>/lock/scn<20-digit>.T37`；LS 内部 tablet 为 `ls/<ls_id>/<TABLET_NAME>/lock/scn<20-digit>.T37` | `ObSharedTabletLockType` |
+| SHARED_MINOR/MAJOR/INC_MAJOR_LOCK (.T39-.T41) | **SS meta control row**：与 `.T37` 同形，仅后缀类型换成 `.T39` / `.T40` / `.T41` | `ObSharedMinorLockType` / `ObSharedMajorLockType` / `ObSharedIncMajorLockType` |
 
 ### 2.2 统一 helper
 
@@ -242,8 +253,7 @@ MAX=42
 
 ## 3. 本地 cache 目录结构
 
-`ObDirManager::create_tenant_dir()` 一次性建出下列目录（实现位于
-`ob_dir_manager.cpp`）：
+`ObDirManager::create_tenant_dir()` 一次性创建租户根、ls、tablet_data、tmp_data、slog、mini/minor/major/inc_major 四类 shared macro cache、shared_tablet_sub_meta_cache 与 external_table_file（实现位于 `ob_dir_manager.cpp:374-565`）。macro_cache_ckpt、checksum_error_macro 等目录由对应模块按需创建，不在该函数范围内：
 
 ```
 <local_cache_root>/
@@ -251,12 +261,12 @@ MAX=42
     ├── ls/                                          ← MACRO_BLOCK 磁盘配额入口
     │   └── <ls_id>_<ls_epoch_id>/
     │       └── tablet_meta/<scatter[00-99]>/        ← PRIVATE_TABLET_META
-    │           └── <tablet_id>/<transfer_epoch>/ver<ver>.T10
+    │           └── <tablet_id>/<private_macro_third_id>/ver<ver>.T10
     │
     ├── tablet_data/<scatter[00-99]>/                ← PRIVATE_DATA/META_MACRO
-    │   └── <tablet_id>/<transfer_epoch>/
-    │       ├── data/svr<svr>seq<seq>.T0
-    │       └── meta/svr<svr>seq<seq>.T1
+    │   └── <tablet_id>/<private_macro_third_id>/
+    │       ├── data/svr<svr>op<op>seq<seq>.T0
+    │       └── meta/svr<svr>op<op>seq<seq>.T1
     │
     ├── tmp_data/<scatter[000-999]>/                 ← TMP_FILE
     │   └── <tmp_file_id>/seg<seg>.T8
@@ -320,10 +330,11 @@ MAX=42
 | `fsync_dir` | 目录 fsync |
 | `create_dir` | 带磁盘配额预分配/回滚的 mkdir |
 | `create_scatter_dir` | 批量创建 `<scatter>` 子目录 |
-| `create_tenant_dir` | **租户初始化**：一次性建出 ls/tablet_data/tmp_data/slog + 所有 shared_*_macro_cache + external_table_file + inc_major_macro_cache |
+| `create_tenant_dir` | **租户初始化**：创建本地租户根、ls/tablet_data/tmp_data/slog、mini/minor/major/inc_major cache、tablet sub meta cache 与 external_table_file（`:374-565`） |
 | `create_ls_id_dir` | 建出 `ls/<ls_id>_<ls_epoch>/tablet_meta/<scatter>/` |
 | `create_tablet_meta_tablet_id_dir` | 建 `tablet_meta/<scatter>/<tablet_id>/` |
-| `create_tablet_data_tablet_id_private_transfer_epoch_dir` | 建 `tablet_data/<scatter>/<tablet_id>/<transfer_epoch>/{data,meta}/` |
+| `create_tablet_data_tablet_id_private_macro_third_id_dir` | 建 `tablet_data/<scatter>/<tablet_id>/<private_macro_third_id>/{data,meta}/` |
+| `create_tablet_meta_tablet_id_private_macro_third_id_dir` | 建 `tablet_meta/<scatter>/<tablet_id>/<private_macro_third_id>/` |
 | `create_tmp_file_dir` | 建 `tmp_data/<scatter>/<tmp_file_id>/` |
 | `delete_dir` / `delete_dir_rec` | 删除目录并归还配额 |
 | `get_local_cache_root_dir` / `get_local_*_dir` 系列 | 各级目录 path getter |
@@ -335,8 +346,10 @@ class ObStorageObjectTypeBase {
   virtual int to_local_path_format(path, len, pos, file_id, tid, tenant_epoch, ls_epoch);
   virtual int to_remote_path_format(path, len, pos, file_id, root, cid, tid, tenant_epoch, svr, ls_epoch);
   virtual int to_relative_remote_path_format(path, len, pos, file_id);   // 供 stract_remote_path_format 拼接
+  virtual int to_ss_meta_ctrl_prefix_path_format(path, len, pos, file_id); // SS meta control 前缀
   virtual int local_path_to_macro_id(path, macro_id);                    // 反解析
   virtual int remote_path_to_macro_id(path, macro_id);
+  virtual int relative_remote_path_to_macro_id(path, macro_id);           // in-table 逻辑路径反解析
   virtual int get_parent_dir(...);
   virtual int create_parent_dir(...);
   virtual int get_effective_tablet_id(macro_id, effective_tablet_id);    // 数据 GC 用
@@ -373,8 +386,7 @@ class ObStorageObjectTypeBase {
 |----------|----------|----------|
 | `tenant_epoch_id` | server 私有区 `<tid>_<tenant_epoch>/` | 租户 drop / 重建 |
 | `ls_epoch_id` | server 私有区 `ls/<ls_id>_<ls_epoch>/` | LS 副本重建 |
-| `macro_private_transfer_epoch` | `tablet_data/<tablet_id>/<transfer_epoch>/` | tablet transfer 完成后递增，旧数据异步清理 |
-| `meta_private_transfer_epoch` | `tablet_meta/<tablet_id>/<meta_private_transfer_epoch>/` | 同上（meta 侧） |
+| `private_macro_third_id` | `tablet_data/<tablet_id>/<private_macro_third_id>/`、`tablet_meta/<tablet_id>/<private_macro_third_id>/` | 路径格式化 MacroBlockId.third_id；具体语义由对象构造分支决定，共享对象 inner tablet 写 ls_id，否则写 reorganization_scn |
 | `meta_version_id` | `ver<version>.T10` | 每次 tablet meta 更新 |
 | `reorganization_scn` | 共享区 `tablet/<tid>/<reorg_scn>/` | tablet split/merge 等物理重组 |
 | `op_<op>` | `sstable/op_<op>/` | 单次 compaction 任务号 |
@@ -391,8 +403,8 @@ class ObStorageObjectTypeBase {
 
 ```
 # 私有数据宏块（server_3 的租户 1002）
-<root>/cluster_1/server_3/1002_1/tablet_data/500021/8/data/svr3seq5.T0
-<root>/cluster_1/server_3/1002_1/tablet_data/500021/8/meta/svr3seq5.T1
+<root>/cluster_1/server_3/1002_1/tablet_data/500021/8/data/svr3op17seq5.T0
+<root>/cluster_1/server_3/1002_1/tablet_data/500021/8/meta/svr3op17seq5.T1
 
 # 共享 Mini 数据宏块（用户 tablet）
 <root>/cluster_1/tenant_1002/tablet/500021/100/mini/sstable/op_17/data/seq5.T2
@@ -454,4 +466,4 @@ table://tablet/500021/100/meta/op1seq0000000123.T21
 
 4. **本地 cache 为扁平文件 + 散列桶**：降低 open/mkdir 开销，而远程是深目录（可直接在 OSS 浏览并按前缀批量 list 清理）。
 
-5. **数据回收锚点**：`get_effective_tablet_id` + `reorganization_scn` + `transfer_epoch` 给 GC 提供可识别的 tablet 粒度。
+5. **数据回收锚点**：`get_effective_tablet_id` + 对象路径中的 tablet/third_id/op/seq 信息给 GC 提供可识别的对象粒度；third_id 的语义由对象构造分支决定，不再统称 transfer epoch。
