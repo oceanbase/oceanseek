@@ -404,6 +404,7 @@ int ObLockWaitMgr::handle_inform_dst_enqueue_req(const ObLockWaitMgrDstEnqueueMs
     remote_exec_side_node->sessid_ = msg.get_sess_id();
     remote_exec_side_node->need_wait_ = true;
     remote_exec_side_node->ls_id_ = msg.get_ls_id();
+    remote_exec_side_node->tablet_id_ = msg.get_tablet_id();
     remote_exec_side_node->holder_tx_hold_seq_value_ = msg.get_holder_tx_hold_seq();
     remote_exec_side_node->tx_active_ts_ = msg.get_tx_active_ts();
     remote_exec_side_node->lock_wait_expire_ts_ = msg.get_abs_timeout_ts();

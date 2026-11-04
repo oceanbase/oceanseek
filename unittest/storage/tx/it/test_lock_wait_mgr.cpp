@@ -4,6 +4,8 @@
  */
 
 #include <gtest/gtest.h>
+#include <gmock/gmock.h>
+#include <memory>
 #include <thread>
 #include <functional>
 #define private public
@@ -64,6 +66,192 @@ public:
   }
   MsgBus bus_;
 };
+
+static void init_enqueue_msg(ObLockWaitMgrDstEnqueueMsg &msg,
+                             uint64_t tablet_id,
+                             int64_t holder_seq,
+                             bool priority_wait = false,
+                             int64_t priority_head_seq = 0)
+{
+  ObAddr sender(ObAddr::IPV4, "127.0.0.1", 8888);
+  ObString sql = ObString::make_string("insert into t values (1)");
+  msg.init(1001, sender, TABLE_LOCK_FLAG | 1, 0, 100, 1, 2, 45794, 1,
+           1000000, 100, 1001, tablet_id, holder_seq, 100, INT64_MAX, sql,
+           priority_wait, priority_head_seq);
+}
+
+TEST(ObLockWaitMgrEnqueueMsg, table_lock_zero_holder_seq)
+{
+  for (bool priority_wait : {false, true}) {
+    for (int64_t head_seq : {0, 7}) {
+      ObLockWaitMgrDstEnqueueMsg msg;
+      init_enqueue_msg(msg, LS_LOCK_TABLET.id(), 0, priority_wait, head_seq);
+      ASSERT_TRUE(msg.is_valid());
+
+      char buffer[1024];
+      int64_t pos = 0;
+      ASSERT_EQ(OB_SUCCESS, msg.serialize(buffer, sizeof(buffer), pos));
+      const int64_t size = pos;
+      pos = 0;
+      ObLockWaitMgrDstEnqueueMsg decoded;
+      ASSERT_EQ(OB_SUCCESS, decoded.deserialize(buffer, size, pos));
+      ASSERT_EQ(size, pos);
+      EXPECT_TRUE(decoded.is_valid());
+      EXPECT_EQ(LS_LOCK_TABLET.id(), decoded.get_tablet_id());
+      EXPECT_EQ(0, decoded.get_holder_tx_hold_seq());
+      EXPECT_EQ(45794, decoded.get_holder_tx_id());
+      EXPECT_EQ(priority_wait, decoded.is_table_lock_priority_wait());
+      EXPECT_EQ(head_seq, decoded.get_priority_head_seq());
+    }
+  }
+}
+
+TEST(ObLockWaitMgrEnqueueMsg, row_lock_requires_holder_seq)
+{
+  ObLockWaitMgrDstEnqueueMsg msg;
+  init_enqueue_msg(msg, 200001, 1);
+  EXPECT_TRUE(msg.is_valid());
+  init_enqueue_msg(msg, 200001, 0);
+  EXPECT_FALSE(msg.is_valid());
+  init_enqueue_msg(msg, 200001, -1);
+  EXPECT_FALSE(msg.is_valid());
+  // An unrelated tablet cannot bypass the hold-sequence check with a priority flag.
+  init_enqueue_msg(msg, 200001, 0, true);
+  EXPECT_FALSE(msg.is_valid());
+}
+
+TEST(ObLockWaitMgrEnqueueMsg, table_lock_rejects_negative_holder_seq)
+{
+  for (bool priority_wait : {false, true}) {
+    ObLockWaitMgrDstEnqueueMsg msg;
+    init_enqueue_msg(msg, LS_LOCK_TABLET.id(), -1, priority_wait);
+    EXPECT_FALSE(msg.is_valid());
+  }
+}
+
+class MockTableLockWaitRpc : public ObILockWaitMgrRpc
+{
+public:
+  MOCK_METHOD2(post_msg, int(const ObAddr &, ObLockWaitMgrMsg &));
+};
+
+TEST_F(ObTestObLockWaitMgr, remote_table_lock_zero_seq_parks)
+{
+  const ObAddr ctrl_addr(ObAddr::IPV4, "127.0.0.1", 8888);
+  const ObAddr exec_addr(ObAddr::IPV4, "127.0.0.2", 8888);
+  MockTableLockWaitRpc rpc;
+  std::unique_ptr<ObMockLockWaitMgr> lwm(new ObMockLockWaitMgr(1001, nullptr, ctrl_addr));
+  ASSERT_EQ(OB_SUCCESS, lwm->init());
+  lwm->set_tenant_id(1001);
+  lwm->set_addr(ctrl_addr);
+  lwm->set_rpc(&rpc);
+  // Drive the queue synchronously, without the timeout worker.
+  lwm->has_set_stop() = false;
+
+  Node node;
+  node.addr_ = &node;
+  node.node_type_ = Node::REMOTE_CTRL_SIDE;
+  node.node_id_ = 1;
+  node.hash_ = TABLE_LOCK_FLAG | 1;
+  node.lock_seq_ = 0;
+  node.lock_ts_ = 100;
+  node.recv_ts_ = 100;
+  node.ls_id_ = 1001;
+  node.tablet_id_ = LS_LOCK_TABLET.id();
+  node.tx_id_ = 2;
+  node.holder_tx_id_ = 45794;
+  node.holder_tx_hold_seq_value_ = 0;
+  node.sessid_ = 1;
+  node.lock_wait_expire_ts_ = INT64_MAX;
+  node.exec_addr_ = exec_addr;
+  node.need_wait_ = true;
+  node.is_table_lock_priority_wait_ = false;
+
+  EXPECT_CALL(rpc, post_msg(exec_addr, _)).WillOnce(Invoke(
+      [](const ObAddr &, ObLockWaitMgrMsg &msg) {
+        EXPECT_EQ(LWM_DST_ENQUEUE, msg.get_msg_type());
+        auto &enqueue = static_cast<ObLockWaitMgrDstEnqueueMsg &>(msg);
+        EXPECT_TRUE(enqueue.is_valid());
+        EXPECT_EQ(0, enqueue.get_holder_tx_hold_seq());
+        EXPECT_FALSE(enqueue.is_table_lock_priority_wait());
+        return OB_SUCCESS;
+      }));
+  Node *delete_node = nullptr;
+  EXPECT_TRUE(lwm->wait_remote_ctrl_side_node_(&node, delete_node));
+  EXPECT_EQ(nullptr, delete_node);
+  EXPECT_EQ(&node, lwm->get_wait_head(node.hash()));
+  EXPECT_EQ(&node, lwm->fetch_wait_head(node.hash()));
+  EXPECT_EQ(0, lwm->wait_node_cnt());
+  lwm->has_set_stop() = true;
+}
+
+TEST_F(ObTestObLockWaitMgr, remote_table_lock_zero_seq_wakes_on_unlock)
+{
+  const ObAddr ctrl_addr(ObAddr::IPV4, "127.0.0.1", 8888);
+  const ObAddr exec_addr(ObAddr::IPV4, "127.0.0.2", 8888);
+  tablelock::ObLockID lock_id;
+  ASSERT_EQ(OB_SUCCESS, lock_id.set(tablelock::ObLockOBJType::OBJ_TYPE_TABLET, 201779));
+
+  for (bool priority_wait : {false, true}) {
+    MockTableLockWaitRpc rpc;
+    std::unique_ptr<ObMockLockWaitMgr> lwm(new ObMockLockWaitMgr(1001, nullptr, exec_addr));
+    ASSERT_EQ(OB_SUCCESS, lwm->init());
+    lwm->set_tenant_id(1001);
+    lwm->set_addr(exec_addr);
+    lwm->set_rpc(&rpc);
+    lwm->has_set_stop() = false;
+
+    ObLockWaitMgrDstEnqueueMsg msg;
+    init_enqueue_msg(msg, LS_LOCK_TABLET.id(), 0, priority_wait);
+    msg.hash_ = LockHashHelper::hash_lock_id(lock_id);
+    // No live holder transaction is required to park on a persistent lock.
+    EXPECT_TRUE(msg.is_valid());
+    EXPECT_CALL(rpc, post_msg(ctrl_addr, _)).WillOnce(Invoke(
+        [](const ObAddr &, ObLockWaitMgrMsg &reply) {
+          EXPECT_EQ(LWM_DST_ENQUEUE_RESP, reply.get_msg_type());
+          EXPECT_TRUE(static_cast<ObLockWaitMgrDstEnqueueRespMsg &>(reply).get_enqueue_succ());
+          return OB_SUCCESS;
+        }));
+    obrpc::ObLockWaitMgrRpcResult result;
+    ASSERT_EQ(OB_SUCCESS, lwm->handle_inform_dst_enqueue_req(msg, result));
+    EXPECT_EQ(1, lwm->wait_node_cnt());
+    EXPECT_EQ(1, lwm->get_not_free_remote_exec_side_node_cnt());
+    const ObLockWaitNode *remote_node = lwm->get_wait_head(msg.get_hash());
+    ASSERT_NE(nullptr, remote_node);
+    EXPECT_EQ(msg.get_tablet_id(), remote_node->tablet_id_);
+    ASSERT_TRUE(Mock::VerifyAndClearExpectations(&rpc));
+
+    EXPECT_CALL(rpc, post_msg(ctrl_addr, _)).WillOnce(Invoke(
+        [&msg](const ObAddr &, ObLockWaitMgrMsg &release) {
+          EXPECT_EQ(LWM_LOCK_RELEASE, release.get_msg_type());
+          EXPECT_EQ(msg.get_hash(), release.get_hash());
+          EXPECT_EQ(msg.get_node_id(), release.get_node_id());
+          return OB_SUCCESS;
+        }));
+    if (priority_wait) {
+      lwm->advance_priority_head_seq(lock_id);
+    }
+    lwm->wakeup(lock_id);
+    EXPECT_EQ(nullptr, lwm->get_wait_head(msg.get_hash()));
+    EXPECT_EQ(0, lwm->wait_node_cnt());
+    EXPECT_EQ(0, lwm->get_not_free_remote_exec_side_node_cnt());
+    if (priority_wait) {
+      ASSERT_TRUE(Mock::VerifyAndClearExpectations(&rpc));
+      // A stale head snapshot is a retry condition, not an invalid message.
+      EXPECT_TRUE(msg.is_valid());
+      EXPECT_CALL(rpc, post_msg(ctrl_addr, _)).WillOnce(Invoke(
+          [](const ObAddr &, ObLockWaitMgrMsg &reply) {
+            EXPECT_EQ(LWM_DST_ENQUEUE_RESP, reply.get_msg_type());
+            EXPECT_FALSE(static_cast<ObLockWaitMgrDstEnqueueRespMsg &>(reply).get_enqueue_succ());
+            return OB_SUCCESS;
+          }));
+      ASSERT_EQ(OB_SUCCESS, lwm->handle_inform_dst_enqueue_req(msg, result));
+      EXPECT_EQ(0, lwm->wait_node_cnt());
+      EXPECT_EQ(0, lwm->get_not_free_remote_exec_side_node_cnt());
+    }
+    lwm->has_set_stop() = true;
+  }
+}
 
 TEST_F(ObTestObLockWaitMgr, local_lock_conflict)
 {

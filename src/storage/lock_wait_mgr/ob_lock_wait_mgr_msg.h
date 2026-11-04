@@ -145,10 +145,10 @@ public:
         && recv_ts_ > 0
         && ls_id_ > 0
         && tablet_id_ > 0
-        // Table-lock priority waits block on the priority-queue head trans, which has
-        // no row-lock hold seq, so holder_tx_hold_seq_value_ is legitimately 0 here.
+        // Both holder conflicts and priority waits on the lock tablet have no row-lock
+        // hold sequence. Allow zero for table locks while retaining the row-lock check.
         && (transaction::ObTxSEQ::is_valid_seq(holder_tx_hold_seq_value_)
-            || (holder_tx_hold_seq_value_ == 0 && is_table_lock_priority_wait_))
+            || (holder_tx_hold_seq_value_ == 0 && common::ObTabletID(tablet_id_).is_ls_lock_tablet()))
         && abs_timeout_ts_ > 0
         && !query_sql_.empty();
   }
