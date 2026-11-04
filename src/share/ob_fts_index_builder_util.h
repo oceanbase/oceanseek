@@ -6,6 +6,7 @@
 #ifndef OCEANBASE_SHARE_FTS_INDEX_BUILDER_UTIL_H_
 #define OCEANBASE_SHARE_FTS_INDEX_BUILDER_UTIL_H_
 
+#include "lib/hash/ob_hashmap.h"
 #include "object/ob_object.h"
 #include "share/ob_rpc_struct.h"
 #include "share/schema/ob_schema_struct.h"
@@ -103,6 +104,19 @@ class ObFtsIndexBuilderUtil
 {
   friend class ObMulValueIndexBuilderUtil;
 public:
+  // Check whether each inverted tablet for a doc-word table has a major on at least one replica.
+  // Only for inverted tablets newly created by this DDL; major snapshots are not checked.
+  // An empty tablet list checks the whole index; non-doc-word tables return OB_INVALID_ARGUMENT.
+  // A nonempty tablet list requires the doc-word table to be partitioned.
+  // The optional, already-created map receives results for the supplied doc-word tablets, valid only on success.
+  static int check_inverted_tablet_merge_status(
+      const uint64_t tenant_id,
+      ObSchemaGetterGuard &schema_guard,
+      const uint64_t doc_word_table_id,
+      const ObIArray<ObTabletID> &doc_word_tablet_ids,
+      const int64_t snapshot_version,
+      bool &is_build_finished,
+      common::hash::ObHashMap<uint64_t, bool> *doc_word_tablet_finished_map);
   // Check if we can use rowkey instead of doc id.
   // if we want to add more types, make this one condition of them.
   static int determine_docid_type(const ObTableSchema &table_schema, ObDocIDType &doc_id_type);

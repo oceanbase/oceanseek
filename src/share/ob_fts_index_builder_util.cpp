@@ -37,6 +37,99 @@ using namespace storage;
 
 namespace share
 {
+int ObFtsIndexBuilderUtil::check_inverted_tablet_merge_status(
+    const uint64_t tenant_id,
+    ObSchemaGetterGuard &schema_guard,
+    const uint64_t doc_word_table_id,
+    const ObIArray<ObTabletID> &doc_word_tablet_ids,
+    const int64_t snapshot_version,
+    bool &is_build_finished,
+    hash::ObHashMap<uint64_t, bool> *doc_word_tablet_finished_map)
+{
+  int ret = OB_SUCCESS;
+  is_build_finished = false;
+  const ObTableSchema *doc_word_schema = nullptr;
+  const ObTableSchema *fts_index_schema = nullptr;
+  const int64_t suffix_len = strlen(ObFTSConstants::DOC_WORD_SUFFIX);
+  ObArray<ObTabletID> fts_tablet_ids;
+  hash::ObHashMap<ObTabletID, bool> fts_tablet_finished_map;
+  if (OB_FAIL(schema_guard.get_table_schema(tenant_id, doc_word_table_id, doc_word_schema))) {
+    LOG_WARN("get doc word schema failed", K(ret), K(tenant_id), K(doc_word_table_id));
+  } else if (OB_ISNULL(doc_word_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+    LOG_WARN("doc word table not exist", K(ret), K(tenant_id), K(doc_word_table_id));
+  } else if (!doc_word_schema->is_fts_doc_word_aux()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("table is not a doc word auxiliary table", K(ret), K(tenant_id), K(doc_word_table_id),
+        "index_type", doc_word_schema->get_index_type());
+  } else if (OB_UNLIKELY(doc_word_schema->get_table_name_str().length() <= suffix_len)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid doc word table name", K(ret), KPC(doc_word_schema));
+  } else {
+    const ObString fts_table_name(doc_word_schema->get_table_name_str().length() - suffix_len,
+                                 doc_word_schema->get_table_name_str().ptr());
+    if (OB_FAIL(schema_guard.get_table_schema(tenant_id, doc_word_schema->get_database_id(),
+        fts_table_name, true/*is_index*/, fts_index_schema, doc_word_schema->is_user_hidden_table()))) {
+      LOG_WARN("get fts index schema failed", K(ret), K(tenant_id), K(fts_table_name));
+    } else if (OB_ISNULL(fts_index_schema)) {
+      ret = OB_TABLE_NOT_EXIST;
+      LOG_WARN("fts index table not exist", K(ret), K(tenant_id), K(fts_table_name));
+    } else if (doc_word_tablet_ids.empty()) {
+      if (OB_FAIL(fts_index_schema->get_tablet_ids(fts_tablet_ids))) {
+        LOG_WARN("get fts index tablets failed", K(ret), K(fts_table_name));
+      }
+    } else {
+      // The auxiliaries share partition positions, but have different tablet IDs.
+      ObArray<uint64_t> tablet_ids;
+      ObArray<int64_t> part_idxs;
+      ObArray<int64_t> subpart_idxs;
+      for (int64_t i = 0; OB_SUCC(ret) && i < doc_word_tablet_ids.count(); ++i) {
+        if (OB_FAIL(tablet_ids.push_back(doc_word_tablet_ids.at(i).id()))) {
+          LOG_WARN("append doc word tablet failed", K(ret), K(doc_word_tablet_ids.at(i)));
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(doc_word_schema->get_part_idx_by_tablets(tablet_ids, part_idxs, subpart_idxs))) {
+        LOG_WARN("get doc word partition indexes failed", K(ret), K(doc_word_tablet_ids));
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < doc_word_tablet_ids.count(); ++i) {
+        const int64_t part_idx = part_idxs.at(i);
+        const int64_t subpart_idx = PARTITION_LEVEL_TWO == doc_word_schema->get_part_level()
+            ? subpart_idxs.at(i) : OB_INVALID_INDEX;
+        ObObjectID part_id = OB_INVALID_ID;
+        ObObjectID first_part_id = OB_INVALID_ID;
+        ObTabletID fts_tablet_id;
+        if (OB_FAIL(fts_index_schema->get_part_id_and_tablet_id_by_idx(
+            part_idx, subpart_idx, part_id, first_part_id, fts_tablet_id))) {
+          LOG_WARN("get fts index tablet failed", K(ret), K(part_idx), K(subpart_idx));
+        } else if (OB_FAIL(fts_tablet_ids.push_back(fts_tablet_id))) {
+          LOG_WARN("append fts index tablet failed", K(ret), K(fts_tablet_id));
+        }
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_NOT_NULL(doc_word_tablet_finished_map)
+        && OB_FAIL(fts_tablet_finished_map.create(
+            fts_tablet_ids.count(), "FtsBuildStatus", ObModIds::OB_HASH_NODE, tenant_id))) {
+      LOG_WARN("create fts tablet status map failed", K(ret), K(fts_tablet_ids));
+    } else if (OB_FAIL(ObCheckTabletDataComplementOp::check_tablet_merge_status(
+        tenant_id, fts_tablet_ids, snapshot_version, true/*only_check_one_replica*/, is_build_finished,
+        OB_NOT_NULL(doc_word_tablet_finished_map) ? &fts_tablet_finished_map : nullptr/*tablet_finished_map*/))) {
+      LOG_WARN("check fts index tablet merge status failed", K(ret), K(fts_table_name), K(fts_tablet_ids));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && OB_NOT_NULL(doc_word_tablet_finished_map)
+         && i < doc_word_tablet_ids.count(); ++i) {
+      bool is_tablet_finished = false;
+      if (OB_FAIL(fts_tablet_finished_map.get_refactored(fts_tablet_ids.at(i), is_tablet_finished))) {
+        LOG_WARN("get fts tablet merge status failed", K(ret), K(fts_tablet_ids.at(i)));
+      } else if (OB_FAIL(doc_word_tablet_finished_map->set_refactored(
+          doc_word_tablet_ids.at(i).id(), is_tablet_finished, true/*overwrite*/))) {
+        LOG_WARN("record doc word tablet build status failed", K(ret), K(doc_word_tablet_ids.at(i)));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObFtsIndexBuilderUtil::determine_docid_type(const ObTableSchema &table_schema, ObDocIDType &doc_id_type)
 {
   int ret = OB_SUCCESS;

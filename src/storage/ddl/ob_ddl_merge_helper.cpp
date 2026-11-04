@@ -33,6 +33,7 @@ ERRSIM_POINT_DEF(ERRSIM_DDL_RETRY_WRITE_COMPLETE);
 ERRSIM_POINT_DEF(ERRSIM_DDL_RETRY_REPORT_CHECKSUM);
 ERRSIM_POINT_DEF(ERRSIM_DDL_PRINT_DDL_CHECKPOINT_SCN);
 ERRSIM_POINT_DEF(ERRSIM_SET_DDL_COMPLETE_FOR_LOB);
+ERRSIM_POINT_DEF(ERRSIM_UPDATE_SHARED_TABLE_STORE);
 
 int ObIDDLMergeHelper::get_merge_helper(ObIAllocator &allocator, 
                                         const ObDirectLoadType direct_load_type,
@@ -1778,7 +1779,8 @@ int ObSSDDLMergeHelper::update_major_table_store(ObDDLTabletMergeDagParamV2 &dag
   } else if (is_exist) {
     LOG_INFO("major already exist on shared tablet, skip update shared tablet", K(ret), K(table_key), K(target_ls_id));
   } else if (FALSE_IT(DEBUG_SYNC(BEFORE_DDL_MERGE_UPDATE_SHARED_TABLE_STORE))) {
-  } else if (OB_FAIL(ObSSDDLUtil::update_shared_tablet_table_store(ls_handle, *major_sstable,
+  } else if (OB_FAIL(OB_E(ERRSIM_UPDATE_SHARED_TABLE_STORE, target_tablet_id.id())
+      ObSSDDLUtil::update_shared_tablet_table_store(ls_handle, *major_sstable,
       *tablet_param->storage_schema_, dag_merge_param.ddl_task_param_.tenant_data_version_,
       transfer_scn, false/*check_lease*/, SCN::min_scn(), false/*need_check_ddl_checkpoint*/))) {
     LOG_WARN("failed to update shared tablet", K(ret), K(target_ls_id), K(target_tablet_id));

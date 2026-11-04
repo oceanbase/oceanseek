@@ -1873,6 +1873,15 @@ public:
       const ObIArray<ObTabletID> &tablet_ids,
       bool &tablet_checksum_status);
 
+  // The optional, already-created map receives per-tablet results, valid only on success.
+  static int check_tablet_merge_status(
+      const uint64_t tenant_id,
+      const ObIArray<common::ObTabletID> &tablet_ids,
+      const int64_t snapshot_version,
+      const bool only_check_one_replica,
+      bool &is_all_tablets_commited,
+      hash::ObHashMap<ObTabletID, bool> *tablet_finished_map);
+
 private:
   
   static int check_all_tablet_sstable_status(
@@ -1899,14 +1908,8 @@ private:
       const bool only_check_one_replica,
       hash::ObHashMap<ObAddr, ObArray<ObTabletID>> &ip_tablets_map,
       hash::ObHashMap<ObTabletID, int32_t> &tablets_commited_map,
-      int64_t &tablet_commit_count);
-
-  static int check_tablet_merge_status(
-      const uint64_t tenant_id,
-      const ObIArray<common::ObTabletID> &tablet_ids,
-      const int64_t snapshot_version,
-      const bool only_check_one_replica,
-      bool &is_all_tablets_commited);
+      int64_t &tablet_commit_count,
+      hash::ObHashMap<ObTabletID, bool> *tablet_finished_map);
 
   static int update_replica_merge_status(
       const ObTabletID &tablet_id, 
@@ -1919,7 +1922,8 @@ private:
       const common::ObIArray<common::ObTabletID> &tablet_ids,
       const hash::ObHashMap<ObTabletID, int32_t> &tablets_commited_map,
       const bool only_check_one_replica,
-      int64_t &commit_succ_count);
+      int64_t &commit_succ_count,
+      hash::ObHashMap<ObTabletID, bool> *tablet_finished_map);
 
   static int construct_ls_tablet_map(
       const uint64_t tenant_id,

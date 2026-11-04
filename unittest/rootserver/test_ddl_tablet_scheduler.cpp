@@ -4,8 +4,10 @@
  */
 
 #include <gtest/gtest.h>
+#include <gmock/gmock.h>
 #include <string>
 #include "lib/alloc/ob_malloc_allocator.h"
+#include "lib/lock/ob_spin_rwlock.h"
 #include "lib/mysqlclient/ob_isql_result_handler.h"
 #include "lib/mysqlclient/ob_mysql_connection.h"
 #include "lib/mysqlclient/ob_mysql_connection_pool.h"
@@ -14,16 +16,87 @@
 #include "share/cache/ob_kv_storecache.h"
 #include "share/ob_simple_mem_limit_getter.h"
 #include "share/ob_thread_mgr.h"
+#include "share/ob_ddl_common.h"
 #define private public
 #define protected public
 #include "rootserver/ddl_task/ob_ddl_tablet_scheduler.h"
+#include "rootserver/ob_ddl_service_launcher.h"
 #include "share/ob_get_compat_mode.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #undef protected
 #undef private
+#include "rootserver/ob_root_service.h"
+#include "share/location_cache/ob_location_service.h"
+#include "share/ob_fts_index_builder_util.h"
+#include "share/tablet/ob_tablet_to_ls_operator.h"
 
 namespace oceanbase
 {
+namespace share
+{
+class TabletMergeStatusMock
+{
+public:
+  MOCK_METHOD6(check, int(const uint64_t, const common::ObIArray<common::ObTabletID> &,
+                          const int64_t, const bool, bool &,
+                          common::hash::ObHashMap<common::ObTabletID, bool> *));
+};
+
+static TabletMergeStatusMock *tablet_merge_status_mock = nullptr;
+
+// Mock only the shared library's RPC boundary; keep real FTS schema lookup and tablet mapping.
+int ObCheckTabletDataComplementOp::check_tablet_merge_status(
+    const uint64_t tenant_id,
+    const common::ObIArray<common::ObTabletID> &tablet_ids,
+    const int64_t snapshot_version,
+    const bool only_check_one_replica,
+    bool &is_all_tablets_commited,
+    common::hash::ObHashMap<common::ObTabletID, bool> *tablet_finished_map)
+{
+  return tablet_merge_status_mock->check(
+      tenant_id, tablet_ids, snapshot_version, only_check_one_replica,
+      is_all_tablets_commited, tablet_finished_map);
+}
+
+// Stub external queries for init; keep real candidate filtering, schema mapping, and queue insertion.
+int ObLocationService::get_leader_with_retry_until_timeout(
+    const int64_t, const uint64_t, const ObLSID &, common::ObAddr &leader,
+    const int64_t, const int64_t)
+{
+  leader = common::ObAddr(common::ObAddr::IPV4, "127.0.0.1", 2882);
+  return OB_SUCCESS;
+}
+
+int ObTabletToLSTableOperator::batch_get_ls(
+    common::ObISQLClient &, const uint64_t,
+    const common::ObIArray<common::ObTabletID> &tablet_ids,
+    common::ObIArray<ObLSID> &ls_ids)
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < tablet_ids.count(); ++i) {
+    if (OB_FAIL(ls_ids.push_back(ObLSID(1001 + i)))) {
+      ADD_FAILURE() << "append test LS failed: " << ret;
+    }
+  }
+  return ret;
+}
+
+int ObDDLUtil::get_tablet_data_size(
+    const uint64_t &, const common::ObTabletID &, const ObLSID &, int64_t &data_size)
+{
+  data_size = 1024;
+  return OB_SUCCESS;
+}
+
+int ObDDLUtil::get_tablet_data_row_cnt(
+    const uint64_t &, const common::ObTabletID &, const ObLSID &,
+    const uint64_t, const common::ObAddr &, int64_t &data_row_cnt)
+{
+  data_row_cnt = 100;
+  return OB_SUCCESS;
+}
+} // namespace share
+
 namespace rootserver
 {
 using namespace common;
@@ -34,6 +107,9 @@ using namespace share::schema;
 static const uint64_t TEST_TENANT_ID = 1002;
 static const uint64_t DATA_TABLE_ID = 500007;
 static const uint64_t INDEX_TABLE_ID = 739754;
+static const uint64_t DOC_WORD_TABLE_ID = 739755;
+static const uint64_t INVERTED_TABLE_ID = 739756;
+static const uint64_t FIRST_INVERTED_TABLET_ID = 300001;
 static const int64_t SCHEMA_VERSION = 100;
 static const int64_t LS_COUNT = 3;
 static const uint64_t FIRST_TABLET_ID = 200001;
@@ -42,18 +118,19 @@ class DDLQueryResult : public ObMySQLResultImpl
 {
 public:
   DDLQueryResult(ObMySQLStatement &statement, const uint64_t tablet_id,
-                const ObString &running_sql)
-    : ObMySQLResultImpl(statement), tablet_id_(tablet_id), running_sql_(running_sql), pos_(-1) {}
+                const ObString &running_sql, const int64_t tablet_count)
+    : ObMySQLResultImpl(statement), tablet_id_(tablet_id), running_sql_(running_sql),
+      tablet_count_(tablet_count), pos_(-1) {}
   using ObMySQLResultImpl::get_int;
   using ObMySQLResultImpl::get_varchar;
   int next() override
   {
-    return ++pos_ == 0 && (tablet_id_ != 0 || !running_sql_.empty()) ? OB_SUCCESS : OB_ITER_END;
+    return ++pos_ < tablet_count_ && (tablet_id_ != 0 || !running_sql_.empty()) ? OB_SUCCESS : OB_ITER_END;
   }
   int get_int(const char *column, int64_t &value) const override
   {
     EXPECT_STREQ("task_id", column);
-    value = tablet_id_;
+    value = tablet_id_ + pos_;
     return OB_SUCCESS;
   }
   int get_varchar(const char *column, ObString &value) const override
@@ -65,14 +142,15 @@ public:
 private:
   uint64_t tablet_id_;
   ObString running_sql_;
+  int64_t tablet_count_;
   int64_t pos_;
 };
 
 class DDLQueryResultHandler : public ObISQLResultHandler
 {
 public:
-  DDLQueryResultHandler(const uint64_t tablet_id, const ObString &running_sql)
-    : statement_(), result_(statement_, tablet_id, running_sql) {}
+  DDLQueryResultHandler(const uint64_t tablet_id, const ObString &running_sql, const int64_t tablet_count)
+    : statement_(), result_(statement_, tablet_id, running_sql, tablet_count) {}
   ObMySQLResult *mysql_result() override { return &result_; }
 private:
   ObMySQLStatement statement_;
@@ -92,6 +170,8 @@ public:
   {
     int ret = OB_SUCCESS;
     uint64_t tablet_id = 0;
+    uint64_t last_tablet_id = 0;
+    int64_t tablet_count = 1;
     ObString running_sql;
     const std::string sql_text(sql.ptr(), sql.length());
     if (sql_text.find("__all_virtual_session_info") != std::string::npos) {
@@ -101,7 +181,8 @@ public:
     } else if (sql_text.find("__all_ddl_checksum") != std::string::npos) {
       EXPECT_EQ(TEST_TENANT_ID, tenant_id);
       const char *range = strstr(sql_text.c_str(), "AND task_id >= ");
-      if (range == nullptr || 1 != sscanf(range, "AND task_id >= %lu", &tablet_id)) {
+      if (range == nullptr || 2 != sscanf(range, "AND task_id >= %lu and task_id <= %lu",
+                                         &tablet_id, &last_tablet_id)) {
         ADD_FAILURE() << "Unexpected checksum query";
         ret = OB_INVALID_ARGUMENT;
       } else if (OB_FAIL(checksum_reads_.push_back(tablet_id))) {
@@ -117,6 +198,7 @@ public:
         }
         callback_tablet_id_ = 0;
       }
+      tablet_count = last_tablet_id - tablet_id + 1;
       if (tablet_id == missing_tablet_id_) {
         tablet_id = 0;
       }
@@ -126,7 +208,7 @@ public:
     }
     if (OB_SUCC(ret)) {
       DDLQueryResultHandler *handler = nullptr;
-      ret = result.create_handler(handler, tablet_id, running_sql);
+      ret = result.create_handler(handler, tablet_id, running_sql, tablet_count);
     }
     return ret;
   }
@@ -200,6 +282,11 @@ public:
     ASSERT_NO_FATAL_FAILURE(prepare_schema_mgr(tenant_mgr_, TEST_TENANT_ID));
     ASSERT_NO_FATAL_FAILURE(add_table_schema(DATA_TABLE_ID, "data_table", false));
     ASSERT_NO_FATAL_FAILURE(add_table_schema(INDEX_TABLE_ID, "__idx_500007_idx", true));
+    ASSERT_NO_FATAL_FAILURE(add_table_schema(DOC_WORD_TABLE_ID, "__idx_500007_ft_fts_doc_word",
+                                             true, INDEX_TYPE_FTS_DOC_WORD_LOCAL));
+    ASSERT_NO_FATAL_FAILURE(add_table_schema(INVERTED_TABLE_ID, "__idx_500007_ft",
+                                             true, INDEX_TYPE_FTS_INDEX_LOCAL,
+                                             FIRST_INVERTED_TABLET_ID));
   }
   static void destroy_schema_context()
   {
@@ -221,6 +308,7 @@ public:
     ASSERT_EQ(OB_SUCCESS, proxy_.init(&pool_));
     old_proxy_ = GCTX.sql_proxy_;
     GCTX.sql_proxy_ = &proxy_;
+    tablet_merge_status_mock = &merge_status_mock_;
     connection_.scheduler_ = &scheduler_;
     scheduler_.tenant_id_ = TEST_TENANT_ID;
     scheduler_.table_id_ = INDEX_TABLE_ID;
@@ -237,6 +325,7 @@ public:
   {
     scheduler_.destroy();
     GCTX.sql_proxy_ = old_proxy_;
+    tablet_merge_status_mock = nullptr;
   }
   static void prepare_schema_mgr(ObSchemaMgr &mgr, const uint64_t tenant_id)
   {
@@ -260,7 +349,9 @@ public:
     ASSERT_EQ(nullptr, evicted);
     store->update_refreshed_version(SCHEMA_VERSION);
   }
-  static void add_table_schema(const uint64_t table_id, const char *name, const bool is_index)
+  static void add_table_schema(const uint64_t table_id, const char *name, const bool is_index,
+                               const ObIndexType index_type = INDEX_TYPE_NORMAL_LOCAL,
+                               const uint64_t first_tablet_id = FIRST_TABLET_ID)
   {
     ObTableSchema table;
     table.set_tenant_id(TEST_TENANT_ID);
@@ -272,7 +363,7 @@ public:
     ASSERT_EQ(OB_SUCCESS, table.set_table_name(name));
     if (is_index) {
       table.set_data_table_id(DATA_TABLE_ID);
-      table.set_index_type(INDEX_TYPE_NORMAL_LOCAL);
+      table.set_index_type(index_type);
     }
     table.set_part_level(PARTITION_LEVEL_ONE);
     table.get_part_option().set_part_num(LS_COUNT);
@@ -283,7 +374,7 @@ public:
       part.set_table_id(table_id);
       part.set_part_id(i);
       part.set_schema_version(SCHEMA_VERSION);
-      part.set_tablet_id(FIRST_TABLET_ID + i + (is_index ? 0 : 100));
+      part.set_tablet_id(first_tablet_id + i + (is_index ? 0 : 100));
       char part_name[16];
       snprintf(part_name, sizeof(part_name), "p%ld", i);
       ASSERT_EQ(OB_SUCCESS, part.set_part_name(part_name));
@@ -308,13 +399,20 @@ public:
   }
   int next_batch()
   {
+    int ret = OB_SUCCESS;
+    ObSchemaGetterGuard schema_guard;
     int64_t parallelism = 0;
     int64_t execution_id = 0;
     ObLSID ls_id;
     ObAddr leader;
     ObArray<ObTabletID> tablets;
-    return scheduler_.get_next_batch_tablets(
-        true, parallelism, execution_id, ls_id, leader, tablets);
+    if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(
+        TEST_TENANT_ID, schema_guard))) {
+    } else {
+      ret = scheduler_.get_next_batch_tablets(
+          true, parallelism, execution_id, ls_id, leader, tablets, schema_guard);
+    }
+    return ret;
   }
   void expect_pending(const int64_t first, const int64_t count)
   {
@@ -339,6 +437,7 @@ public:
   DDLQueryPool pool_;
   ObMySQLProxy proxy_;
   ObMySQLProxy *old_proxy_;
+  testing::StrictMock<TabletMergeStatusMock> merge_status_mock_;
   ObDDLTabletScheduler scheduler_;
 };
 
@@ -347,6 +446,105 @@ ObSchemaMgr TestDDLTabletScheduler::tenant_mgr_;
 ObSimpleMemLimitGetter TestDDLTabletScheduler::mem_limit_;
 decltype(GCTX.startup_mode_) TestDDLTabletScheduler::old_startup_mode_;
 bool TestDDLTabletScheduler::old_liboblog_mode_ = false;
+
+class TestDDLTabletSchedulerInit : public TestDDLTabletScheduler
+{
+public:
+  void SetUp() override
+  {
+    old_root_service_ = GCTX.root_service_;
+    old_location_service_ = GCTX.location_service_;
+    old_ddl_service_started_ = ObDDLServiceLauncher::is_ddl_service_started();
+    ASSERT_NO_FATAL_FAILURE(TestDDLTabletScheduler::SetUp());
+    scheduler_.destroy();
+    GCTX.root_service_ = &root_service_;
+    GCTX.location_service_ = &location_service_;
+    ATOMIC_SET(&ObDDLServiceLauncher::is_ddl_service_started_, true);
+  }
+  void TearDown() override
+  {
+    TestDDLTabletScheduler::TearDown();
+    GCTX.root_service_ = old_root_service_;
+    GCTX.location_service_ = old_location_service_;
+    ATOMIC_SET(&ObDDLServiceLauncher::is_ddl_service_started_, old_ddl_service_started_);
+  }
+  int init_scheduler(const uint64_t table_id = DOC_WORD_TABLE_ID)
+  {
+    int ret = OB_SUCCESS;
+    ObSchemaGetterGuard schema_guard;
+    ObArray<ObTabletID> tablets;
+    ObCurTraceId::TraceId trace_id;
+    trace_id.init(ObAddr(ObAddr::IPV4, "127.0.0.1", 2882));
+    if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(
+        TEST_TENANT_ID, schema_guard))) {
+    } else if (OB_FAIL(ObDDLUtil::get_tablets(TEST_TENANT_ID, table_id, tablets))) {
+    } else {
+      ret = scheduler_.init(TEST_TENANT_ID, table_id, DATA_TABLE_ID, 12229406, 2, 1000,
+          trace_id, tablets, DATA_VERSION_4_6_0_0, true, schema_guard);
+    }
+    return ret;
+  }
+  ObRootService root_service_;
+  ObLocationService location_service_;
+  ObRootService *old_root_service_;
+  ObLocationService *old_location_service_;
+  bool old_ddl_service_started_;
+};
+
+TEST_F(TestDDLTabletSchedulerInit, joint_fts_init_batches_candidates_and_preserves_running_tablets)
+{
+  connection_.running_sql_ = ObString::make_string("INSERT INTO t PARTITION(`p2`) SELECT 1");
+  EXPECT_CALL(merge_status_mock_, check(TEST_TENANT_ID,
+      testing::Truly([](const ObIArray<ObTabletID> &ids) {
+        return 2 == ids.count() && ObTabletID(FIRST_INVERTED_TABLET_ID) == ids.at(0)
+            && ObTabletID(FIRST_INVERTED_TABLET_ID + 1) == ids.at(1);
+      }), 1000, true, testing::_, testing::NotNull()))
+      .WillOnce(testing::Invoke([](const uint64_t, const ObIArray<ObTabletID> &ids,
+          const int64_t, const bool, bool &all_finished,
+          hash::ObHashMap<ObTabletID, bool> *statuses) {
+        int ret = OB_SUCCESS;
+        all_finished = false;
+        if (OB_FAIL(statuses->set_refactored(ids.at(0), true))) {
+        } else if (OB_FAIL(statuses->set_refactored(ids.at(1), false))) {
+        }
+        return ret;
+      }));
+  ASSERT_EQ(OB_SUCCESS, init_scheduler());
+  EXPECT_TRUE(scheduler_.is_inited_);
+  ASSERT_EQ(2, scheduler_.all_tablets_.count());
+  EXPECT_EQ(ObTabletID(FIRST_TABLET_ID + 1), scheduler_.all_tablets_.at(0));
+  EXPECT_EQ(ObTabletID(FIRST_TABLET_ID + 2), scheduler_.all_tablets_.at(1));
+  EXPECT_EQ(2, scheduler_.all_ls_to_tablets_map_.size());
+  EXPECT_EQ(1, scheduler_.running_ls_to_tablets_map_.size());
+  ASSERT_EQ(1, scheduler_.running_task_ls_ids_before_.count());
+  EXPECT_EQ(ObLSID(1003), scheduler_.running_task_ls_ids_before_.at(0));
+}
+
+TEST_F(TestDDLTabletSchedulerInit, joint_fts_init_error_does_not_enqueue_partial_results)
+{
+  EXPECT_CALL(merge_status_mock_, check(TEST_TENANT_ID,
+      testing::Truly([](const ObIArray<ObTabletID> &ids) { return LS_COUNT == ids.count(); }),
+      1000, true, testing::_, testing::NotNull()))
+      .WillOnce(testing::Invoke([](const uint64_t, const ObIArray<ObTabletID> &ids,
+          const int64_t, const bool, bool &, hash::ObHashMap<ObTabletID, bool> *statuses) {
+        EXPECT_EQ(OB_SUCCESS, statuses->set_refactored(ids.at(0), true));
+        return OB_TIMEOUT;
+      }));
+  EXPECT_EQ(OB_TIMEOUT, init_scheduler());
+  EXPECT_FALSE(scheduler_.is_inited_);
+  EXPECT_EQ(0, scheduler_.all_tablets_.count());
+  EXPECT_EQ(0, scheduler_.running_task_ls_ids_before_.count());
+  EXPECT_FALSE(scheduler_.all_ls_to_tablets_map_.created());
+  EXPECT_FALSE(scheduler_.running_ls_to_tablets_map_.created());
+}
+
+TEST_F(TestDDLTabletSchedulerInit, non_fts_init_does_not_check_inverted_major)
+{
+  // StrictMock rejects any unexpected inverted major check.
+  ASSERT_EQ(OB_SUCCESS, init_scheduler(INDEX_TABLE_ID));
+  EXPECT_TRUE(scheduler_.is_all_tasks_finished());
+  EXPECT_EQ(0, scheduler_.all_tablets_.count());
+}
 
 // Reading candidates repeatedly must not consume any recovered LS before confirmation.
 TEST_F(TestDDLTabletScheduler, candidate_query_preserves_pending_ls)
@@ -432,6 +630,115 @@ TEST_F(TestDDLTabletScheduler, missing_checksum_allows_rescheduling)
   bool need_send = false;
   ASSERT_EQ(OB_SUCCESS, scheduler_.determine_if_need_to_send_new_task(need_send));
   EXPECT_TRUE(need_send);
+}
+
+// SQL is still running at takeover; after it exits, a missing inverted major requires
+// rescheduling even when all checksums are present.
+TEST_F(TestDDLTabletScheduler, joint_fts_missing_major_allows_rescheduling)
+{
+  scheduler_.table_id_ = DOC_WORD_TABLE_ID;
+  scheduler_.need_single_partition_build_ = true;
+  ASSERT_NO_FATAL_FAILURE(add_running_ls(0));
+  connection_.running_sql_ = ObString::make_string("INSERT INTO t PARTITION(`p0`, `p9`) SELECT 1");
+  ASSERT_EQ(OB_EAGAIN, next_batch());
+  ASSERT_NO_FATAL_FAILURE(expect_pending(0, 1));
+  EXPECT_EQ(0, connection_.checksum_reads_.count());
+
+  connection_.running_sql_.reset();
+  EXPECT_CALL(merge_status_mock_, check(TEST_TENANT_ID,
+      testing::Truly([](const ObIArray<ObTabletID> &tablets) {
+        return 1 == tablets.count() && ObTabletID(FIRST_INVERTED_TABLET_ID) == tablets.at(0);
+      }), 1000, true, testing::_, nullptr))
+      .WillOnce(testing::DoAll(testing::SetArgReferee<4>(false), testing::Return(OB_SUCCESS)));
+  ASSERT_EQ(OB_EAGAIN, next_batch());
+  ASSERT_NO_FATAL_FAILURE(expect_pending(0, 0));
+  EXPECT_EQ(1, scheduler_.all_ls_to_tablets_map_.size());
+  EXPECT_EQ(0, scheduler_.running_ls_to_tablets_map_.size());
+  bool need_send = false;
+  ASSERT_EQ(OB_SUCCESS, scheduler_.determine_if_need_to_send_new_task(need_send));
+  EXPECT_TRUE(need_send);
+}
+
+// A major check error must preserve recovery markers; recheck before confirming completion.
+TEST_F(TestDDLTabletScheduler, joint_fts_merge_error_preserves_pending_ls)
+{
+  scheduler_.table_id_ = DOC_WORD_TABLE_ID;
+  scheduler_.need_single_partition_build_ = true;
+  ASSERT_NO_FATAL_FAILURE(add_running_ls(0));
+  EXPECT_CALL(merge_status_mock_, check(TEST_TENANT_ID, testing::_, 1000, true, testing::_, nullptr))
+      .WillOnce(testing::Return(OB_TIMEOUT))
+      .WillOnce(testing::DoAll(testing::SetArgReferee<4>(true), testing::Return(OB_SUCCESS)));
+  ASSERT_EQ(OB_TIMEOUT, next_batch());
+  ASSERT_NO_FATAL_FAILURE(expect_pending(0, 1));
+  EXPECT_EQ(1, scheduler_.all_ls_to_tablets_map_.size());
+  EXPECT_EQ(1, scheduler_.running_ls_to_tablets_map_.size());
+  ASSERT_EQ(OB_EAGAIN, next_batch());
+  ASSERT_NO_FATAL_FAILURE(expect_pending(0, 0));
+  EXPECT_EQ(OB_ITER_END, next_batch());
+}
+
+TEST_F(TestDDLTabletScheduler, joint_fts_batch_preserves_individual_status)
+{
+  ObSchemaGetterGuard schema_guard;
+  ASSERT_EQ(OB_SUCCESS, ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(
+      TEST_TENANT_ID, schema_guard));
+  ObArray<ObTabletID> tablets;
+  ASSERT_EQ(OB_SUCCESS, tablets.push_back(ObTabletID(FIRST_TABLET_ID + 2)));
+  ASSERT_EQ(OB_SUCCESS, tablets.push_back(ObTabletID(FIRST_TABLET_ID)));
+  hash::ObHashMap<uint64_t, bool> finished_map;
+  ASSERT_EQ(OB_SUCCESS, finished_map.create(LS_COUNT, "TestFtsStatus"));
+  for (int64_t i = 0; i < LS_COUNT; ++i) {
+    ASSERT_EQ(OB_SUCCESS, finished_map.set_refactored(FIRST_TABLET_ID + i, true));
+  }
+  EXPECT_CALL(merge_status_mock_, check(TEST_TENANT_ID,
+      testing::Truly([](const ObIArray<ObTabletID> &ids) {
+        return 2 == ids.count() && ObTabletID(FIRST_INVERTED_TABLET_ID + 2) == ids.at(0)
+            && ObTabletID(FIRST_INVERTED_TABLET_ID) == ids.at(1);
+      }), 1000, true, testing::_, testing::NotNull()))
+      .WillOnce(testing::Invoke([](const uint64_t, const ObIArray<ObTabletID> &ids,
+          const int64_t, const bool, bool &all_finished,
+          hash::ObHashMap<ObTabletID, bool> *statuses) {
+        int ret = OB_SUCCESS;
+        all_finished = false;
+        if (OB_FAIL(statuses->set_refactored(ids.at(0), true))) {
+        } else if (OB_FAIL(statuses->set_refactored(ids.at(1), false))) {
+        }
+        return ret;
+      }));
+  bool all_finished = true;
+  ASSERT_EQ(OB_SUCCESS, ObFtsIndexBuilderUtil::check_inverted_tablet_merge_status(
+      TEST_TENANT_ID, schema_guard, DOC_WORD_TABLE_ID, tablets, 1000, all_finished, &finished_map));
+  EXPECT_FALSE(all_finished);
+  for (int64_t i = 0; i < LS_COUNT; ++i) {
+    bool finished = false;
+    ASSERT_EQ(OB_SUCCESS, finished_map.get_refactored(FIRST_TABLET_ID + i, finished));
+    EXPECT_EQ(i != 0, finished);
+  }
+}
+
+TEST_F(TestDDLTabletScheduler, joint_fts_batch_error_does_not_update_finished_status)
+{
+  ObSchemaGetterGuard schema_guard;
+  ASSERT_EQ(OB_SUCCESS, ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(
+      TEST_TENANT_ID, schema_guard));
+  ObArray<ObTabletID> tablets;
+  ASSERT_EQ(OB_SUCCESS, tablets.push_back(ObTabletID(FIRST_TABLET_ID)));
+  hash::ObHashMap<uint64_t, bool> finished_map;
+  ASSERT_EQ(OB_SUCCESS, finished_map.create(1, "TestFtsStatus"));
+  ASSERT_EQ(OB_SUCCESS, finished_map.set_refactored(FIRST_TABLET_ID, true));
+  EXPECT_CALL(merge_status_mock_, check(TEST_TENANT_ID, testing::_, 1000, true,
+      testing::_, testing::NotNull()))
+      .WillOnce(testing::Invoke([](const uint64_t, const ObIArray<ObTabletID> &ids,
+          const int64_t, const bool, bool &, hash::ObHashMap<ObTabletID, bool> *statuses) {
+        EXPECT_EQ(OB_SUCCESS, statuses->set_refactored(ids.at(0), false));
+        return OB_TIMEOUT;
+      }));
+  bool all_finished = false;
+  ASSERT_EQ(OB_TIMEOUT, ObFtsIndexBuilderUtil::check_inverted_tablet_merge_status(
+      TEST_TENANT_ID, schema_guard, DOC_WORD_TABLE_ID, tablets, 1000, all_finished, &finished_map));
+  bool finished = false;
+  ASSERT_EQ(OB_SUCCESS, finished_map.get_refactored(FIRST_TABLET_ID, finished));
+  EXPECT_TRUE(finished);
 }
 
 // A rescheduled LS must lose its recovery marker even when a later LS fails confirmation.

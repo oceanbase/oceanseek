@@ -1072,7 +1072,20 @@ int ObIndexBuildTask::reap_old_replica_build_task(bool &need_exec_new_inner_sql)
       if (OB_EAGAIN != ret) {
         LOG_WARN("failed to check and wait old complement task", K(ret));
       }
-    } else if (!need_exec_new_inner_sql) {
+    }
+    if (OB_SUCC(ret) && !need_exec_new_inner_sql && is_joint_fts_build_task()) {
+      // A joint FTS build also needs the inverted major; doc-word checksums alone are insufficient.
+      need_exec_new_inner_sql = true;
+      const ObArray<ObTabletID> all_partitions;
+      bool is_fts_build_finished = false;
+      if (OB_FAIL(ObFtsIndexBuilderUtil::check_inverted_tablet_merge_status(
+          tenant_id_, schema_guard, dest_table_id, all_partitions, snapshot_version_, is_fts_build_finished, nullptr/*doc_word_tablet_finished_map*/))) {
+        LOG_WARN("check joint fts build status failed", K(ret), K(tenant_id_), K(dest_table_id));
+      } else {
+        need_exec_new_inner_sql = !is_fts_build_finished;
+      }
+    }
+    if (OB_SUCC(ret) && !need_exec_new_inner_sql) {
       ObAddr unused_addr;
       if (OB_FAIL(update_complete_sstable_job_status(unused_tablet_id, unused_addr, snapshot_version_, old_execution_id, old_ret_code, unused_addition_info))) {
         LOG_INFO("succ to wait and complete old task finished!", K(ret));
@@ -1148,7 +1161,8 @@ int ObIndexBuildTask::send_build_single_replica_request(const bool &is_partition
   return ret;
 }
 
-int ObIndexBuildTask::wait_and_send_single_partition_replica_task(bool &state_finished)
+int ObIndexBuildTask::wait_and_send_single_partition_replica_task(bool &state_finished,
+    ObSchemaGetterGuard &schema_guard)
 {
   int ret = OB_SUCCESS;
   int64_t parallelism = 0;
@@ -1162,7 +1176,7 @@ int ObIndexBuildTask::wait_and_send_single_partition_replica_task(bool &state_fi
   } else if (ObDDLTaskStatus::REDEFINITION != task_status_) {
     ret = OB_STATE_NOT_MATCH;
     LOG_WARN("task status not match", K(ret), K(task_status_));
-  } else if (OB_FAIL(tablet_scheduler_.get_next_batch_tablets(is_retryable_ddl_, parallelism, execution_id, ls_id, leader_addr, tablets))) {
+  } else if (OB_FAIL(tablet_scheduler_.get_next_batch_tablets(is_retryable_ddl_, parallelism, execution_id, ls_id, leader_addr, tablets, schema_guard))) {
     if (OB_UNLIKELY(ret == OB_EAGAIN)) {
       ret = OB_SUCCESS;
     } else if (OB_UNLIKELY(ret == OB_ITER_END)) {
@@ -1257,6 +1271,12 @@ bool ObIndexBuildTask::is_sstable_complete_task_submitted()
 bool ObIndexBuildTask::is_create_partitioned_local_index()
 {
   return ObDDLType::DDL_CREATE_PARTITIONED_LOCAL_INDEX == task_type_;
+}
+
+bool ObIndexBuildTask::is_joint_fts_build_task() const
+{
+  return create_index_arg_.is_partition_local_ddl_
+      && share::schema::is_fts_doc_word_aux(create_index_arg_.index_type_);
 }
 
 int ObIndexBuildTask::wait_data_complement()
@@ -1383,6 +1403,7 @@ int ObIndexBuildTask::wait_local_index_data_complement()
   int ret = OB_SUCCESS;
   bool state_finished = false;
   bool is_request_end = false;
+  ObSchemaGetterGuard schema_guard;
   if (OB_UNLIKELY(!is_inited_) || OB_ISNULL(GCTX.schema_service_) || OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", KR(ret), K_(is_inited), KP(GCTX.schema_service_), KP(GCTX.sql_proxy_));
@@ -1392,9 +1413,11 @@ int ObIndexBuildTask::wait_local_index_data_complement()
   } else if (OB_UNLIKELY(snapshot_version_ <= 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("unexpected snapshot", K(ret), KPC(this));
+  } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(tenant_id_, schema_guard))) {
+    LOG_WARN("get tenant schema guard failed", KR(ret), K(tenant_id_));
   }
   if (OB_SUCC(ret) && !state_finished && !is_sstable_complete_task_submitted()) {
-    if (OB_FAIL(create_schedule_queue())) {
+    if (OB_FAIL(create_schedule_queue(schema_guard))) {
       LOG_WARN("fail to create schedule queue", K(ret), KPC(this));
     }
   }
@@ -1412,7 +1435,7 @@ int ObIndexBuildTask::wait_local_index_data_complement()
   }
 
   if (OB_SUCC(ret) && !state_finished && is_sstable_complete_task_submitted()) {
-    if (OB_FAIL(wait_and_send_single_partition_replica_task(state_finished))) {
+    if (OB_FAIL(wait_and_send_single_partition_replica_task(state_finished, schema_guard))) {
       LOG_WARN("fail to send single partition replica task", K(ret), KPC(this));
     }
   }
@@ -1437,13 +1460,9 @@ int ObIndexBuildTask::wait_local_index_data_complement()
     ObArray<int64_t> ignore_col_ids;
     const ObTableSchema *data_table_schema = nullptr;
     uint64_t doc_id_col_id = OB_INVALID_ID;
-    share::schema::ObSchemaGetterGuard schema_guard;
-    ObMultiVersionSchemaService &schema_service = *GCTX.schema_service_;
     if (share::schema::is_rowkey_doc_aux(create_index_arg_.index_type_) ||
         share::schema::is_doc_rowkey_aux(create_index_arg_.index_type_)) {
-      if (OB_FAIL(schema_service.get_tenant_schema_guard(tenant_id_, schema_guard))) {
-        LOG_WARN("get tenant schema guard failed", KR(ret));
-      } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id_, object_id_, data_table_schema))) {
+      if (OB_FAIL(schema_guard.get_table_schema(tenant_id_, object_id_, data_table_schema))) {
         LOG_WARN("get table schema failed", KR(ret), K(object_id_));
       } else if (OB_ISNULL(data_table_schema)) {
         ret = OB_TABLE_NOT_EXIST;
@@ -1472,7 +1491,7 @@ int ObIndexBuildTask::wait_local_index_data_complement()
   return ret;
 }
 
-int ObIndexBuildTask::create_schedule_queue()
+int ObIndexBuildTask::create_schedule_queue(ObSchemaGetterGuard &schema_guard)
 {
   int ret = OB_SUCCESS;
   common::ObArray<ObTabletID> index_tablet_ids;
@@ -1499,7 +1518,8 @@ int ObIndexBuildTask::create_schedule_queue()
     trace_id_,
     index_tablet_ids,
     data_format_version_,
-    create_index_arg_.is_partition_local_ddl_))) {
+    create_index_arg_.is_partition_local_ddl_,
+    schema_guard))) {
     LOG_WARN("failed to init tablet scheduler", K(ret), K(tenant_id_), K(index_table_id_), K(index_tablet_ids));
   } else {
     is_sstable_complete_task_submitted_ = true;

@@ -138,7 +138,7 @@ private:
   int build_partitioned_local_fts_replica_build_longops_message(
       const share::ObSqlMonitorStats &sql_monitor_stats,
       int64_t &pos);
-  int create_schedule_queue();
+  int create_schedule_queue(ObSchemaGetterGuard &schema_guard);
   int verify_checksum();
   int trigger_async_index_refresh();
   virtual void clear_old_status_context() override;
@@ -163,7 +163,7 @@ private:
                                         const share::ObLSID &ls_id,
                                         const common::ObAddr &leader_addr,
                                         const ObIArray<ObTabletID> &index_partition_ids);
-  int wait_and_send_single_partition_replica_task(bool &state_finished);
+  int wait_and_send_single_partition_replica_task(bool &state_finished, ObSchemaGetterGuard &schema_guard);
   int check_build_single_replica(bool &is_end);
   int check_build_local_index_single_replica(bool &is_end, int &end_ret);
   int check_need_verify_checksum(bool &need_verify);
@@ -171,6 +171,7 @@ private:
   int check_target_cg_cnt();
   int update_mlog_last_purge_scn();
   bool is_create_partitioned_local_index();
+  bool is_joint_fts_build_task() const;
   int serialize_and_update_message(common::ObISQLClient &proxy);
   int pin_async_index_data_tablet(const int64_t snap_version, common::ObMySQLTransaction &trans);
   int push_tablet_execution_id(const int64_t task_id,
