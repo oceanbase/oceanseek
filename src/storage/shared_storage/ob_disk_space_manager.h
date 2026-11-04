@@ -18,6 +18,7 @@
 #include "storage/shared_storage/task/ob_persist_disk_space_task.h"
 #include "share/ob_unit_getter.h"
 #include "lib/time/ob_time_utility.h"
+#include "lib/literals/ob_literals.h"
 #include "share/storage_cache_policy/ob_storage_cache_common.h"
 
 namespace oceanbase
@@ -439,7 +440,7 @@ private:
   static constexpr char DIAG_SUBMOD_SHRINK[] = "SHRINK";
   static constexpr char DIAG_SUBMOD_CONSISTENCY[] = "CONSISTENCY";
   static constexpr int64_t NEED_EXPAND_STUCK_WARN_INTERVAL_US = 30LL * common::S_US; // 30s
-  static constexpr int64_t NEED_SHRINK_STUCK_WARN_INTERVAL_US = 30LL * common::S_US; // 30s
+  static constexpr int64_t NEED_SHRINK_STUCK_WARN_INTERVAL_US = 5_min;
   // used_size_delta = limiter_used - sum(macro_cache_stats_.used_)
   // Report ERROR when abs(delta) exceeds this threshold.
   static constexpr int64_t USED_SIZE_DELTA_ERROR_THRESHOLD = 100LL * common::MB; // 100MB

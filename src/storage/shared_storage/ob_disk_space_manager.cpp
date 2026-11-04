@@ -1049,7 +1049,7 @@ void ObTenantDiskSpaceManager::check_shrink_status_nolock_(const DiskScalingDiag
       diagnose_info,
       is_stuck ? "need shrink but no shrink for long time" : "");
 
-  if (is_stuck) {
+  if (is_stuck && TC_REACH_TIME_INTERVAL(1_min)) {
     LOG_ERROR_RET(OB_ERR_UNEXPECTED, "need shrink but no shrink for long time",
         K(common.config_data_disk_size_), K(common.actual_data_disk_size_), KPC(this));
   }
@@ -1564,17 +1564,10 @@ int ObTenantDiskSpaceManager::cal_cur_available_shrink_size(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), K(macro_cache_cur_min_shrinkable_size));
   } else {
-    const int64_t target_size = get_reserved_disk_size()
-        + macro_cache_cur_min_shrinkable_size;
-    // When computing the shrink size, the meta tenant may be heavily used while the user tenant
-    // has a small computed target, which could make the shrink value very large. Because the
-    // shrink acts on shared capacity, that may cause shrink failure (free space exhausted).
-    // To defend against this, we bound a single shrink step by a percentage of the current
-    // shared macro-cache free size (TENANT_DISK_SIZE_MAX_SHRINK_STEP_PCT). Even if both meta and
-    // user tenants shrink concurrently, the total shrink is capped at
-    // TENANT_DISK_SIZE_MAX_SHRINK_STEP_PCT * 2 of the shared free space, avoiding immediate
-    // exhaustion of the shared free capacity.
-    const int64_t raw_available = MAX(0, total_disk_size_ - target_size);
+    const int64_t target_size = macro_cache_cur_min_shrinkable_size;
+    // Use the shared macro-cache capacity above target_size as a disk-shrink candidate.
+    const int64_t raw_available =
+        MAX(0, get_allocated_shared_macro_cache_size_nolock_() - target_size);
     const int64_t max_step =
         get_allocated_shared_macro_cache_free_size_nolock_() / 100 * TENANT_DISK_SIZE_MAX_SHRINK_STEP_PCT;
     cur_available_shrink_size = MIN(raw_available, max_step);

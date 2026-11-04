@@ -3006,9 +3006,8 @@ int ObSSMacroCacheMgr::cal_cur_min_shrinkable_size(int64_t &cur_min_shrinkable_s
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("disk space manager is null", KR(ret));
   } else {
-    // Intent: choose a shrinkable size that, after shrinking,
-    // the macro cache usage reaches the eviction threshold (CACHE_EVICT_THRESHOLD).
-    const int64_t used_size = disk_space_mgr->get_tenant_macro_cache_used_size();
+    // Estimate the shared macro-cache capacity needed at CACHE_EVICT_THRESHOLD usage.
+    const int64_t used_size = disk_space_mgr->get_shared_macro_cache_used_size();
     cur_min_shrinkable_size = used_size / CACHE_EVICT_THRESHOLD * 100;
   }
 
@@ -3192,7 +3191,7 @@ int ObSSMacroCacheMgr::batch_flush_tail_write_cache(const ObSSMacroCacheType cac
 }
 
 // trigger eviction when:
-// 1. total macro cache used size exceeds CACHE_EVICT_THRESHOLD
+// 1. total macro cache used size reaches CACHE_EVICT_THRESHOLD
 // 2. one kind of macro cache used size exceeds its max size
 int ObSSMacroCacheMgr::check_if_need_evict(bool &need_evict)
 {
@@ -3212,7 +3211,7 @@ int ObSSMacroCacheMgr::check_if_need_evict(bool &need_evict)
     need_evict = true;
     ATOMIC_STORE(&fg_evict_trigger_, false); // reset flag
   } else { // 2. trigger by background
-    // check if total macro cache used size exceeds CACHE_EVICT_THRESHOLD
+    // Check whether shared cache usage reaches CACHE_EVICT_THRESHOLD.
     int64_t macro_cache_used_percent = 0;
     const int64_t macro_cache_size = disk_space_manager->get_unit_config_shared_macro_cache_size();
     const int64_t macro_cache_used_size = disk_space_manager->get_shared_macro_cache_used_size();
@@ -3222,7 +3221,7 @@ int ObSSMacroCacheMgr::check_if_need_evict(bool &need_evict)
                K(macro_cache_used_size), KPC(disk_space_manager));
     } else {
       macro_cache_used_percent = ((1.0 * macro_cache_used_size / macro_cache_size) * 100);
-      need_evict = ((macro_cache_used_percent > CACHE_EVICT_THRESHOLD) ? true : false);
+      need_evict = ((macro_cache_used_percent >= CACHE_EVICT_THRESHOLD) ? true : false);
     }
   }
 
