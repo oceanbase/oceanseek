@@ -11,6 +11,7 @@
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/blocksstable/index_block/ob_macro_meta_temp_store.h"
 #include "storage/ddl/ob_inc_ddl_merge_task_utils.h"
+#include "share/ob_async_index_refresh_util.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::storage;
@@ -246,6 +247,9 @@ int ObDDLIncRedoLogWriter::write_inc_commit_log(
   } else if (!remote_write_) {
     ObDDLIncLogBasic log_basic;
     ObDDLIncCommitLog log;
+    // Temporarily use the async-index switch for the 4.6.3.0 cherry-pick.
+    // TODO: Use data_format_version >= DATA_VERSION_4_6_3_1 in 4.6.3.1.
+    bool need_check_ddl_checkpoint = ObAsyncIndexRefreshUtil::is_async_index_enabled(MTL_ID());
     if (OB_FAIL(log_basic.init(tablet_id_, lob_meta_tablet_id, lob_piece_tablet_id,
           direct_load_type_, trans_id_, seq_no_, snapshot_version, data_format_version))) {
       LOG_WARN("fail to init log_basic", K(ret), K_(tablet_id), K(lob_meta_tablet_id), K(lob_piece_tablet_id),
@@ -254,11 +258,11 @@ int ObDDLIncRedoLogWriter::write_inc_commit_log(
       LOG_WARN("fail to init DDLIncCommitLog", K(ret), K(log_basic));
     }
 #ifdef OB_BUILD_SHARED_STORAGE
+    // Enable this flag only after every primary/standby replica has been upgraded.
     else if (GCTX.is_shared_storage_mode()
              && is_incremental_major_direct_load(direct_load_type_)
-             && OB_FAIL(log.set_ss_inc_major(inc_major,
-                                             lob_meta_inc_major,
-                                             lob_piece_inc_major))) {
+             && OB_FAIL(log.set_ss_inc_major(
+                 inc_major, lob_meta_inc_major, lob_piece_inc_major, need_check_ddl_checkpoint))) {
       LOG_WARN("fail to set ss inc major",
                KR(ret), K_(direct_load_type), KP(inc_major),
                KP(lob_meta_inc_major), KP(lob_piece_inc_major));

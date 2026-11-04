@@ -54,7 +54,8 @@ private:
                                  const bool is_rollback,
                                  const bool is_co_sstable,
                                  const ObString &inc_major_buffer,
-                                 const share::SCN &start_scn);
+                                 const share::SCN &start_scn,
+                                 const bool need_check_ddl_checkpoint);
   
 private:
   static const int64_t TOTAL_LIMIT = 10 * 1024 * 1024 * 1024L;

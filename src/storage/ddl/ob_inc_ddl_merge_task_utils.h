@@ -40,11 +40,13 @@ public:
       ObLS *ls,
       ObTabletHandle &tablet_handle,
       const ObStorageSchema *storage_schema);
+  // Complete the Local checkpoint even when the target does not require LINK.
   static int link_inc_major(
       ObLS *ls,
       const ObTabletHandle &tablet_handle,
       const transaction::ObTransID &trans_id,
-      const transaction::ObTxSEQ &seq_no);
+      const transaction::ObTxSEQ &seq_no,
+      const share::SCN &ddl_checkpoint_scn);
 
   static int get_all_inc_major_ddl_sstables(
     const ObTablet *tablet,

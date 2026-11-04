@@ -380,7 +380,7 @@ public:
   TO_STRING_KV(K_(keep_old_ddl_sstable), K_(update_with_major_flag),
                K_(ddl_start_scn), K_(ddl_commit_scn), K_(ddl_checkpoint_scn),
                K_(ddl_snapshot_version), K_(ddl_execution_id),
-               K_(data_format_version), KP_(ddl_redo_callback),
+               K_(data_format_version), K_(need_check_ddl_checkpoint), KP_(ddl_redo_callback),
                KP_(ddl_finish_callback), K_(ddl_replay_status), K_(slice_sstables));
 
 public:
@@ -392,6 +392,7 @@ public:
   int64_t ddl_snapshot_version_;
   int64_t ddl_execution_id_;
   int64_t data_format_version_;
+  bool need_check_ddl_checkpoint_;
   blocksstable::ObIMacroBlockFlushCallback *ddl_redo_callback_;
   blocksstable::ObIMacroBlockFlushCallback *ddl_finish_callback_;
   // used to decide storage type for replaying ddl clog in cs replica, see ObTabletMeta::ddl_replay_status_ for more detail

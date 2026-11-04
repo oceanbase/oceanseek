@@ -2111,6 +2111,25 @@ int ObLS::update_tablet_table_store_without_lock_(
   return ret;
 }
 
+int ObLS::update_tablet_ddl_checkpoint(const ObTabletID &tablet_id,
+    const int64_t rebuild_seq, const int64_t transfer_seq, const SCN &ddl_checkpoint_scn)
+{
+  int ret = OB_SUCCESS;
+  RDLockGuard guard(meta_rwlock_);
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ls is not inited", K(ret));
+  } else if (rebuild_seq != ls_meta_.get_rebuild_seq()) {
+    ret = OB_EAGAIN;
+    LOG_WARN("rebuild seq has changed, retry checkpoint update", K(ret), K(tablet_id),
+        K(rebuild_seq), "current_rebuild_seq", ls_meta_.get_rebuild_seq());
+  } else if (OB_FAIL(ls_tablet_svr_.update_tablet_ddl_checkpoint(
+      tablet_id, transfer_seq, ddl_checkpoint_scn))) {
+    LOG_WARN("failed to update tablet ddl checkpoint", K(ret), K(tablet_id), K(ddl_checkpoint_scn));
+  }
+  return ret;
+}
+
 int ObLS::update_tablet_table_store(
     const int64_t ls_rebuild_seq,
     const ObTabletHandle &old_tablet_handle,

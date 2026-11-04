@@ -138,6 +138,7 @@ storage_unittest(test_backup_clean_path backup/test_backup_clean_path.cpp)
 storage_unittest(test_backup_block_file_reader_writer backup/test_backup_block_file_reader_writer.cpp)
 
 if(OB_BUILD_SHARED_STORAGE)
+storage_unittest(test_ls_meta ls/test_ls_meta.cpp)
 storage_unittest(test_ss_backup_extern_info_mgr backup/test_ss_backup_extern_info_mgr.cpp)
 storage_unittest(test_ss_ha_macro_delete_dedup backup/test_ss_ha_macro_delete_dedup.cpp)
 storage_unittest(test_ss_ha_macro_copy_retry backup/test_ss_ha_macro_copy_retry.cpp)

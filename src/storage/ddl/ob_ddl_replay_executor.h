@@ -277,7 +277,8 @@ public:
            const bool is_rollback,
            const bool is_co_sstable,
            const ObString &inc_major_buffer,
-           const share::SCN &start_scn);
+           const share::SCN &start_scn,
+           const bool need_check_ddl_checkpoint);
 
 protected:
   // replay to the tablet
@@ -290,6 +291,8 @@ protected:
 private:
 #ifdef OB_BUILD_SHARED_STORAGE
   int deserialize_and_update_ss_inc_major(ObTabletHandle &tablet_handle, bool &need_publish);
+  int check_can_skip_shared_add_(const ObTabletHandle &tablet_handle,
+      const blocksstable::ObSSTable &target, bool &can_skip_shared_add);
 #endif
 private:
   common::ObTabletID tablet_id_;
@@ -301,6 +304,7 @@ private:
   bool is_co_sstable_;
   ObString inc_major_buffer_;
   share::SCN start_scn_;
+  bool need_check_ddl_checkpoint_;
 };
 
 class ObSplitStartReplayExecutor final : public ObDDLReplayExecutor

@@ -99,7 +99,7 @@ int ObSSDDLUtil::update_shared_tablet_table_store_if_absent(
       LOG_ERROR("storage schema is null", K(ret));
     } else if (OB_FAIL(update_shared_tablet_table_store(ls_handle,
         *sstable_ptr, *storage_schema, data_format_version,
-        transfer_scn, check_lease))) {
+        transfer_scn, check_lease, SCN::min_scn(), false/*need_check_ddl_checkpoint*/))) {
       LOG_WARN("update shared tablet table store fail", K(ret));
     } else {
       LOG_INFO("update shared tablet table store succ", K(ls_id), K(table_key));
@@ -153,7 +153,9 @@ int ObSSDDLUtil::update_shared_tablet_table_store(
     const ObStorageSchema &storage_schema,
     const uint64_t &data_format_version,
     const share::SCN &transfer_scn,
-    const bool check_lease)
+    const bool check_lease,
+    const SCN &ddl_checkpoint_scn,
+    const bool need_check_ddl_checkpoint)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(!ls_handle.is_valid())) {
@@ -164,7 +166,9 @@ int ObSSDDLUtil::update_shared_tablet_table_store(
                                                       storage_schema,
                                                       data_format_version,
                                                       transfer_scn,
-                                                      check_lease))) {
+                                                      check_lease,
+                                                      ddl_checkpoint_scn,
+                                                      need_check_ddl_checkpoint))) {
     LOG_WARN("fail to update shared tablet table store", KR(ret));
   }
   return ret;
@@ -176,7 +180,9 @@ int ObSSDDLUtil::update_shared_tablet_table_store(
     const storage::ObStorageSchema &storage_schema,
     const uint64_t &data_format_version,
     const share::SCN &transfer_scn,
-    const bool check_lease)
+    const bool check_lease,
+    const SCN &ddl_checkpoint_scn,
+    const bool need_check_ddl_checkpoint)
 {
   int ret = OB_SUCCESS;
   const ObTabletID &tablet_id = sstable.get_key().get_tablet_id();
@@ -188,6 +194,11 @@ int ObSSDDLUtil::update_shared_tablet_table_store(
                                      : ObMetaUpdateReason::TABLET_DDL_ADD_DATA_MAJOR_SSTABLE;
   if (OB_FAIL(build_update_table_store_param_(ls, sstable, storage_schema, data_format_version, param))) {
     LOG_WARN("build update table store param fail", K(ret), K(ls_id), K(tablet_id));
+  } else {
+    param.ddl_info_.ddl_checkpoint_scn_ = ddl_checkpoint_scn;
+    param.ddl_info_.need_check_ddl_checkpoint_ = need_check_ddl_checkpoint;
+  }
+  if (OB_FAIL(ret)) {
   } else if (OB_FAIL(share::SSCompactHelper::create_or_update_table_store(ls_id,
                                                                           tablet_id,
                                                                           transfer_scn,
