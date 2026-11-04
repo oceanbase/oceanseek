@@ -4,7 +4,10 @@
  */
 
 #include <gtest/gtest.h>
+#include <string>
+#include <thread>
 #include "lib/allocator/page_arena.h"
+#include "lib/json_type/ob_json_parse.h"
 using namespace oceanbase::common;
 using namespace oceanbase::lib;
 
@@ -144,6 +147,110 @@ TEST(TestPageArena, aligned_alloc_bf)
       void *p = alloc.alloc(sz);
       ASSERT_EQ(0, (uint64_t)p % 64);
     }
+  }
+}
+
+TEST(TestSafeArena, realloc_preserves_data)
+{
+  ObArenaAllocator arena;
+  ObSafeArenaAllocator safe_arena(arena);
+  ObIAllocator &allocator = safe_arena;
+  char *buf = static_cast<char *>(allocator.alloc(256));
+  ASSERT_NE(nullptr, buf);
+  MEMSET(buf, 'x', 256);
+  char *grown = static_cast<char *>(allocator.realloc(buf, 256, 384));
+  ASSERT_NE(nullptr, grown);
+  EXPECT_EQ(std::string(256, 'x'), std::string(grown, 256));
+  MEMSET(grown, 'y', 384);
+
+  // An intervening allocation prevents growing the buffer in place.
+  char *sentinel = static_cast<char *>(allocator.alloc(64));
+  ASSERT_NE(nullptr, sentinel);
+  MEMSET(sentinel, 's', 64);
+  char *moved = static_cast<char *>(allocator.realloc(grown, 384, 1024));
+  ASSERT_NE(nullptr, moved);
+  EXPECT_NE(grown, moved);
+  EXPECT_EQ(std::string(384, 'y'), std::string(moved, 384));
+  EXPECT_EQ(std::string(64, 's'), std::string(sentinel, 64));
+}
+
+TEST(TestSafeArena, concurrent_realloc)
+{
+  ObArenaAllocator arena;
+  ObSafeArenaAllocator safe_arena(arena);
+  ObIAllocator &allocator = safe_arena;
+  std::thread workers[4];
+  for (int i = 0; i < 4; ++i) {
+    workers[i] = std::thread([&allocator, i]() {
+      // Each thread owns its buffer; only the allocator is shared.
+      for (int round = 0; round < 100; ++round) {
+        int64_t size = 256;
+        char *buf = static_cast<char *>(allocator.alloc(size));
+        ASSERT_NE(nullptr, buf);
+        MEMSET(buf, 'a' + i, size);
+        for (int growth = 0; growth < 4; ++growth) {
+          char *grown = static_cast<char *>(allocator.realloc(buf, size, size * 2));
+          ASSERT_NE(nullptr, grown);
+          EXPECT_EQ(std::string(size, 'a' + i), std::string(grown, size));
+          MEMSET(grown + size, 'a' + i, size);
+          buf = grown;
+          size *= 2;
+        }
+      }
+    });
+  }
+  for (auto &worker : workers) {
+    worker.join();
+  }
+}
+
+TEST(TestSafeArena, reset_releases_pages)
+{
+  ObArenaAllocator arena;
+  ObSafeArenaAllocator safe_arena(arena);
+  ObIAllocator &allocator = safe_arena;
+  ASSERT_NE(nullptr, allocator.alloc(256));
+  ASSERT_GT(allocator.used(), 0);
+  ASSERT_GT(allocator.total(), 0);
+
+  allocator.reset();
+  EXPECT_EQ(0, allocator.used());
+  EXPECT_EQ(0, allocator.total());
+  ASSERT_NE(nullptr, allocator.alloc(512));
+  allocator.reset();
+  EXPECT_EQ(0, allocator.total());
+}
+
+TEST(TestSafeArena, set_attr_through_base_interface)
+{
+  ObArenaAllocator arena;
+  ObSafeArenaAllocator safe_arena(arena);
+  ObIAllocator &allocator = safe_arena;
+  const ObMemAttr attr(1001, "SafeArenaTest", 1);
+  allocator.set_attr(attr);
+
+  const ObMemAttr &actual = arena.get_arena().get_page_allocator().get_attr();
+  EXPECT_EQ(attr.tenant_id_, actual.tenant_id_);
+  EXPECT_EQ(attr.label_, actual.label_);
+  EXPECT_EQ(attr.ctx_id_, actual.ctx_id_);
+}
+
+TEST(TestSafeArena, strict_json_string_growth)
+{
+  // Strict parsing uses RapidJSON's 256-byte decoding stack, including the NUL.
+  // Exercise both the first growth and subsequent growth of that stack.
+  for (int64_t length : {255, 256, 257, 1024}) {
+    ObArenaAllocator arena;
+    ObSafeArenaAllocator safe_arena(arena);
+    const std::string value(length, 'z');
+    const std::string json = "\"" + value + "\"";
+    ObJsonNode *node = nullptr;
+    ASSERT_EQ(OB_SUCCESS, ObJsonParser::get_tree(&safe_arena, json.c_str(), json.size(),
+                                               node, ObJsonParser::JSN_STRICT_FLAG));
+    ASSERT_NE(nullptr, node);
+    ASSERT_EQ(ObJsonNodeType::J_STRING, node->json_type());
+    const ObString &parsed = static_cast<ObJsonString *>(node)->value();
+    EXPECT_EQ(value, std::string(parsed.ptr(), parsed.length()));
   }
 }
 

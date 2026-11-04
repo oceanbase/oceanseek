@@ -1099,6 +1099,11 @@ public:
     ObSpinLockGuard guard(lock_);
     return arena_.alloc(sz, attr);
   }
+  void *realloc(void *ptr, const int64_t oldsz, const int64_t newsz) override
+  {
+    ObSpinLockGuard guard(lock_);
+    return arena_.realloc(ptr, oldsz, newsz);
+  }
   //[[deprecated("Arena is not allowed to call free(ptr), use clear() instead")]]
   void free(void *ptr) override
   {
@@ -1109,10 +1114,20 @@ public:
     ObSpinLockGuard guard(lock_);
     arena_.clear();
   }
+  void reset() override
+  {
+    ObSpinLockGuard guard(lock_);
+    arena_.reset();
+  }
   void reuse() override
   {
     ObSpinLockGuard guard(lock_);
     arena_.reuse();
+  }
+  void set_attr(const ObMemAttr &attr) override
+  {
+    ObSpinLockGuard guard(lock_);
+    arena_.set_attr(attr);
   }
   int64_t total() const override
   {
