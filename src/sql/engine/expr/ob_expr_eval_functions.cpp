@@ -463,6 +463,7 @@
 #include "ob_expr_tmp_file_read.h"
 #include "ob_expr_tmp_file_close.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_complete.h"
+#include "sql/engine/expr/ob_expr_ai/ob_expr_ai_decide.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_embed.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_rerank.h"
 #include "ob_expr_local_dynamic_filter.h"
@@ -1486,7 +1487,7 @@ static ObExpr::EvalFunc g_expr_eval_functions[] = {
   ObExprIsNan::eval_is_nan,                                           /* 887 */
   ObExprCollectFileList::collect_file_list,                           /* 888 */
   ObExprVoid::calc_void_expr,                                         /* 889 */
-  ObExprRandCanonical::calc_random_expr_canonical,                    /* 890 */
+ObExprRandCanonical::calc_random_expr_canonical,                    /* 890 */
   ObExprLoadFile::eval_load_file,                                     /* 891 */
   NULL, // ObExprAIParseDocument::eval_ai_parse_document              /* 892 */
   ObExprSearchIndexInnerPath::calc_search_index_inner_path,           /* 893 */
@@ -1523,10 +1524,10 @@ static ObExpr::EvalFunc g_expr_eval_functions[] = {
   NULL, // ObExprVecIVFBase::eval_vec_ivf_cid,                        /* 924 */
   NULL, // ObExprVecIVFBase::eval_vec_ivf_data,                       /* 925 */
   ObExprDslMultiValueRange::eval_dsl_multi_value_range,               /* 926 */
-  NULL, // ObExprExternalLob::eval_external_lob,                      /* 927 */
-  NULL, // ObExprLobMeta::eval_lob_meta,                              /* 928 */
-  NULL, // ObExprResultScan::eval_result_scan,                        /* 929 */
-  NULL, // ObExprAIDecide::eval_ai_decide,                            /* 930 */
+  NULL, // ObExprExternalLob::eval_external_lob,                       /* 927 */
+  NULL, // ObExprLobMeta::eval_lob_meta,                               /* 928 */
+  NULL, // ObExprResultScan::eval_result_scan,                         /* 929 */
+  ObExprAIDecide::eval_ai_decide,                                     /* 930 */
 };
 
 static ObExpr::EvalBatchFunc g_expr_eval_batch_functions[] = {
@@ -2050,7 +2051,7 @@ static ObExpr::EvalVectorFunc g_expr_eval_vector_functions[] = {
   NULL, // ObExprCountSubstrings::eval_count_substrings_vector,          /* 332 */
   NULL, // ObExprImageType::eval_image_type_vector,                      /* 333 */
   ObExprRegexpReplace::eval_re2_regexp_replace_vector,                   /* 334 */
-  NULL, // ObExprAIDecide::eval_ai_decide_vector,                         /* 335 */
+  ObExprAIDecide::eval_ai_decide_vector,                                 /* 335 */
 };
 
 REG_SER_FUNC_ARRAY(OB_SFA_SQL_EXPR_EVAL,

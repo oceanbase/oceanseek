@@ -29,6 +29,7 @@ static const ObAIBuiltinProvider BUILTIN_PROVIDERS[] = {
   {"openai",           "openai",    "https://api.openai.com/v1"},
   {"cohere",           "cohere",    "https://api.cohere.com/v2"},
   {"tencent",          "openai",    "https://api.hunyuan.cloud.tencent.com/v1"},
+  {"typesafe",         "typesafe",  "https://api.typesafe.ai/v1"},
 };
 
 static const int64_t BUILTIN_PROVIDER_COUNT = sizeof(BUILTIN_PROVIDERS) / sizeof(BUILTIN_PROVIDERS[0]);

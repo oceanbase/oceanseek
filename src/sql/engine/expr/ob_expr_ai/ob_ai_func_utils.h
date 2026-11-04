@@ -496,6 +496,7 @@ public:
   static constexpr char HUNYUAN[20] = "HUNYUAN-OPENAI";
   static constexpr char DEEPSEEK[20] = "DEEPSEEK";
   static constexpr char VLLM[20] = "VLLM";
+  static constexpr char TYPESAFE[20] = "TYPESAFE";
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObAIFuncProviderUtils);

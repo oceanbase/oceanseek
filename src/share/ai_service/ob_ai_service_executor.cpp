@@ -62,6 +62,7 @@ RunConfigOption get_run_config_option(const ObString &key)
 int ObAiServiceExecutor::create_ai_model_endpoint(common::ObArenaAllocator &allocator, const ObString &endpoint_name, const ObIJsonBase &create_jbase)
 {
   int ret = OB_SUCCESS;
+  uint64_t data_version = 0;
   ObMySQLTransaction trans;
   ObAiModelEndpointInfo endpoint;
   uint64_t new_endpoint_id = OB_INVALID_ID;
@@ -71,6 +72,13 @@ int ObAiServiceExecutor::create_ai_model_endpoint(common::ObArenaAllocator &allo
   ObAiModelEndpointInfo tmp_endpoint;
   if (OB_FAIL(endpoint.parse_from_json_base(allocator, endpoint_name, create_jbase))) {
     LOG_WARN("failed to parse ai service endpoint info", KR(ret), K(create_jbase));
+  } else if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), data_version))) {
+    LOG_WARN("failed to get endpoint data version", K(ret));
+  } else if ((GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_6_3_1
+              || data_version < DATA_VERSION_4_6_3_1)
+             && 0 == endpoint.get_provider().case_compare("typesafe")) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "TypeSafe endpoints require version 4.6.3.1");
   } else if (OB_FAIL(trans.start(GCTX.sql_proxy_, tenant_id))) {
     LOG_WARN("failed to start transaction", KR(ret));
   } else if (OB_FAIL(ObAiServiceProxy::check_ai_endpoint_exists(tenant_id, allocator, trans, endpoint_name, is_exists))) {
@@ -117,6 +125,7 @@ int ObAiServiceExecutor::create_ai_model_endpoint(common::ObArenaAllocator &allo
 int ObAiServiceExecutor::alter_ai_model_endpoint(ObArenaAllocator &allocator, const ObString &name, const ObIJsonBase &alter_jbase)
 {
   int ret = OB_SUCCESS;
+  uint64_t data_version = 0;
   ObAiModelEndpointInfo old_endpoint;
   ObAiModelEndpointInfo new_endpoint;
   ObMySQLTransaction trans;
@@ -134,6 +143,13 @@ int ObAiServiceExecutor::alter_ai_model_endpoint(ObArenaAllocator &allocator, co
     LOG_WARN("failed to select ai endpoint", K(ret), K(name));
   } else if (OB_FAIL(construct_new_endpoint(allocator, old_endpoint, alter_jbase, new_endpoint))) {
     LOG_WARN("failed to construct new endpoint", KR(ret), K(old_endpoint), K(alter_jbase));
+  } else if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), data_version))) {
+    LOG_WARN("failed to get endpoint data version", K(ret));
+  } else if ((GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_6_3_1
+              || data_version < DATA_VERSION_4_6_3_1)
+             && 0 == new_endpoint.get_provider().case_compare("typesafe")) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "TypeSafe endpoints require version 4.6.3.1");
   } else if (OB_FAIL(new_endpoint.check_valid())) {
     LOG_WARN("invalid endpoint", KR(ret), K(new_endpoint));
   } else if (OB_FAIL(ObImportTableUtil::get_tenant_name_case_mode(user_tenant_id, name_case_mode))) {

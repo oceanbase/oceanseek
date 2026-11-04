@@ -125,6 +125,21 @@ TEST_F(TestAiServiceStruct, supported_provider_protocols_include_vllm)
   ASSERT_FALSE(is_supported_ai_provider_protocol(ObString::make_string("unknown")));
 }
 
+TEST_F(TestAiServiceStruct, supports_typesafe_decision_metadata)
+{
+  ASSERT_TRUE(is_supported_ai_provider_protocol(ObString::make_string("typesafe")));
+  ASSERT_TRUE(is_supported_ai_provider_protocol(ObString::make_string("TypeSafe")));
+  ASSERT_EQ(5, static_cast<int>(EndpointType::str_to_endpoint_type(
+                   ObString::make_string("decision"))));
+  ASSERT_EQ(3, static_cast<int>(EndpointType::str_to_endpoint_type(
+                   ObString::make_string("completion"))));
+  ObAiModelEndpointInfo endpoint;
+  init_valid_endpoint(endpoint);
+  endpoint.provider_ = ObString::make_string("typesafe");
+  endpoint.url_ = ObString::make_string("http://127.0.0.1:28880/v1/systemone");
+  ASSERT_EQ(OB_SUCCESS, endpoint.check_valid());
+}
+
 TEST_F(TestAiServiceStruct, legacy_model_endpoint_accepts_vllm_provider)
 {
   ObAiModelEndpointInfo endpoint;

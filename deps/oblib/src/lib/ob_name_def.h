@@ -1321,4 +1321,6 @@
 
 // Internal DSL expressions
 #define N_DSL_MULTI_VALUE_RANGE             "dsl_multi_value_range"
+
+#define N_AI_DECIDE                         "ai_decide"
 #endif //OCEANBASE_LIB_OB_NAME_DEF_H_

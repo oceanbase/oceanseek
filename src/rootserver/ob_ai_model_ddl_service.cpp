@@ -26,6 +26,11 @@ int ObAiModelDDLService::create_ai_model(const obrpc::ObCreateAiModelArg &arg)
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("data version less than 4.4.1.0 is not supported", K(ret), K(tenant_id), K(data_version));
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "data version less than 4.4.1.0");
+  } else if ((GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_6_3_1
+              || data_version < DATA_VERSION_4_6_3_1)
+             && share::EndpointType::DECISION == arg.model_info_.get_type()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI decisions require version 4.6.3.1");
   } else if (OB_FAIL(new_schema.assign(tenant_id, arg.model_info_))) {
     LOG_WARN("failed to assign new schema", K(ret), K(arg.model_info_));
   } else if (OB_FAIL(ddl_service_.get_tenant_schema_guard_with_version_in_inner_table(tenant_id, schema_guard))) {

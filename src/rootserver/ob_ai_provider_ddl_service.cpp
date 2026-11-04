@@ -90,6 +90,12 @@ int ObAIProviderDDLService::register_provider(const obrpc::ObRegisterProviderArg
       LOG_USER_ERROR(OB_ENTRY_EXIST, "ai provider already exists");
     }
 
+    if (OB_SUCC(ret) && (GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_6_3_1
+                         || data_version < DATA_VERSION_4_6_3_1)
+        && 0 == new_schema.get_protocol().case_compare("typesafe")) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "TypeSafe providers require version 4.6.3.1");
+    }
     if (OB_SUCC(ret)) {
       ObDDLSQLTransaction trans(&ddl_service_.get_schema_service());
       ObAIProviderDDLOperator ddl_operator(ddl_service_.get_schema_service());
@@ -192,6 +198,11 @@ int ObAIProviderDDLService::alter_provider(const obrpc::ObAlterProviderArg &arg)
       ret = OB_AI_FUNC_MODEL_NOT_FOUND;
       LOG_USER_ERROR(OB_AI_FUNC_MODEL_NOT_FOUND, arg.provider_name_.length(), arg.provider_name_.ptr());
       LOG_WARN("ai provider not found", K(ret), K(tenant_id), K(arg.provider_name_));
+    } else if ((GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_6_3_1
+                || data_version < DATA_VERSION_4_6_3_1)
+               && 0 == old_provider_schema->get_protocol().case_compare("typesafe")) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "TypeSafe providers require version 4.6.3.1");
     } else {
       // Construct new_schema: inherit from old_schema, override base_url/access_key if provided
       ObAIProviderSchema new_schema;

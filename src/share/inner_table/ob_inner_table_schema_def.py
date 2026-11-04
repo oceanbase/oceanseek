@@ -46999,6 +46999,7 @@ def_table_schema(
         when 2 then 'SPARSE_EMBEDDING'
         when 3 then 'COMPLETION'
         when 4 then 'RERANK'
+        when 5 then 'DECISION'
         else 'INVALID'
       END AS TYPE,
       MODEL_NAME
@@ -47053,6 +47054,7 @@ def_table_schema(
         when 2 then 'SPARSE_EMBEDDING'
         when 3 then 'COMPLETION'
         when 4 then 'RERANK'
+        when 5 then 'DECISION'
         else 'INVALID'
       END AS TYPE,
       MODEL_NAME

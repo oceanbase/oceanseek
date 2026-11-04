@@ -312,7 +312,8 @@ inline bool is_supported_ai_provider_protocol(const common::ObString &protocol)
   return 0 == protocol.case_compare("openai")
       || 0 == protocol.case_compare("dashscope")
       || 0 == protocol.case_compare("cohere")
-      || 0 == protocol.case_compare("vllm");
+      || 0 == protocol.case_compare("vllm")
+      || 0 == protocol.case_compare("typesafe");
 }
 
 const int64_t OB_MAX_AI_GATEWAY_NAME_LENGTH = 256;

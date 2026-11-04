@@ -1838,7 +1838,7 @@ int ObInnerTableSchema::dba_ob_ai_models_schema(ObTableSchema &table_schema)
   table_schema.set_collation_type(ObCharset::get_default_collation(ObCharset::get_default_charset()));
 
   if (OB_SUCC(ret)) {
-    if (OB_FAIL(table_schema.set_view_definition(R"__(     SELECT       MODEL_ID,       NAME,       case type         when 1 then 'DENSE_EMBEDDING'         when 2 then 'SPARSE_EMBEDDING'         when 3 then 'COMPLETION'         when 4 then 'RERANK'         else 'INVALID'       END AS TYPE,       MODEL_NAME     FROM oceanbase.__all_ai_model;   )__"))) {
+    if (OB_FAIL(table_schema.set_view_definition(R"__(     SELECT       MODEL_ID,       NAME,       case type         when 1 then 'DENSE_EMBEDDING'         when 2 then 'SPARSE_EMBEDDING'         when 3 then 'COMPLETION'         when 4 then 'RERANK'         when 5 then 'DECISION'         else 'INVALID'       END AS TYPE,       MODEL_NAME     FROM oceanbase.__all_ai_model;   )__"))) {
       LOG_ERROR("fail to set view_definition", K(ret));
     }
   }
@@ -1940,7 +1940,7 @@ int ObInnerTableSchema::cdb_ob_ai_models_schema(ObTableSchema &table_schema)
   table_schema.set_collation_type(ObCharset::get_default_collation(ObCharset::get_default_charset()));
 
   if (OB_SUCC(ret)) {
-    if (OB_FAIL(table_schema.set_view_definition(R"__(     SELECT       TENANT_ID,       MODEL_ID,       NAME,       case type         when 1 then 'DENSE_EMBEDDING'         when 2 then 'SPARSE_EMBEDDING'         when 3 then 'COMPLETION'         when 4 then 'RERANK'         else 'INVALID'       END AS TYPE,       MODEL_NAME     FROM oceanbase.__all_virtual_ai_model;   )__"))) {
+    if (OB_FAIL(table_schema.set_view_definition(R"__(     SELECT       TENANT_ID,       MODEL_ID,       NAME,       case type         when 1 then 'DENSE_EMBEDDING'         when 2 then 'SPARSE_EMBEDDING'         when 3 then 'COMPLETION'         when 4 then 'RERANK'         when 5 then 'DECISION'         else 'INVALID'       END AS TYPE,       MODEL_NAME     FROM oceanbase.__all_virtual_ai_model;   )__"))) {
       LOG_ERROR("fail to set view_definition", K(ret));
     }
   }

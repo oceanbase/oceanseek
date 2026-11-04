@@ -1230,6 +1230,7 @@ int ObRawExpr::is_non_pure_sys_func_expr(bool &is_non_pure) const
           || T_FUN_SYS_UUID == type_
           || T_FUN_SYS_UUID_SHORT == type_
           || T_FUN_SYS_SLEEP == type_
+          || T_FUN_SYS_AI_DECIDE == type_
           || T_FUN_SYS_LAST_INSERT_ID == type_
           || T_FUN_SYS_ROW_COUNT == type_
           || T_FUN_SYS_FOUND_ROWS == type_

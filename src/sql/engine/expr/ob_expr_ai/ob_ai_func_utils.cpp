@@ -2151,6 +2151,15 @@ int ObAIFuncUtils::get_header(ObIAllocator &allocator,
     } else if (OB_FAIL(rerank_provider->get_header(allocator, const_cast<ObString &>(api_key), headers))) {
       LOG_WARN("Failed to get header from rerank provider", K(ret));
     }
+  } else if (model_type == share::EndpointType::DECISION) {
+    ObString key = api_key;
+    if (OB_FAIL(ObOpenAIUtils::get_header(allocator, key, headers))) {
+      LOG_WARN("Failed to get decision header", K(ret));
+    }
+  } else {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("unsupported AI model type for request headers", K(ret), K(model_type));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI model type for request headers");
   }
   if (OB_SUCC(ret) && OB_FAIL(append_extra_headers(allocator, extra_headers, headers))) {
     LOG_WARN("failed to append extra headers", K(ret));
@@ -2985,6 +2994,8 @@ static int map_provider_row_to_dispatch_tag(const ObString &provider_name,
     } else {
       tag = ObAIFuncProviderUtils::OPENAI;
     }
+  } else if (0 == protocol_str.case_compare("typesafe")) {
+    tag = ObAIFuncProviderUtils::TYPESAFE;
   } else {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("unsupported ai provider protocol", K(ret), K(protocol_str));
@@ -3104,10 +3115,24 @@ static int build_inline_full_url(ObIAllocator &allocator,
       LOG_WARN("cohere does not support embedding", K(ret));
       LOG_USER_ERROR(OB_NOT_SUPPORTED, "cohere protocol does not support AI_EMBED");
     }
+  } else if (share::EndpointType::DECISION == op_type) {
+    if (dispatch_literal_eq(dispatch_tag, ObAIFuncProviderUtils::TYPESAFE)) {
+      path = "/systemone";
+    } else if (dispatch_literal_eq(dispatch_tag, ObAIFuncProviderUtils::OPENAI)) {
+      path = "/decisions";
+    } else {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "AI_DECIDE protocol");
+    }
   } else {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("unsupported endpoint type for inline model", K(ret), K(op_type));
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "endpoint type for inline provider/model");
+  }
+  if (OB_SUCC(ret) && share::EndpointType::DECISION != op_type
+      && dispatch_literal_eq(dispatch_tag, ObAIFuncProviderUtils::TYPESAFE)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "TypeSafe protocol requires AI_DECIDE");
   }
   if (OB_SUCC(ret) && OB_NOT_NULL(path)) {
     if (OB_FAIL(join_base_url_path(allocator, effective_base, path, full_url))) {
@@ -3182,6 +3207,18 @@ int ObAIFuncUtils::get_model_config_info(ObIAllocator &allocator,
       } else if (OB_ISNULL(endpoint_info)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("endpoint info is null", K(ret), K(model_key));
+      } else if ((share::EndpointType::DECISION == op_type
+                  || share::EndpointType::DECISION == ai_model_schema->get_type())
+                 && ai_model_schema->get_type() != op_type) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("AI model category does not support the requested operation", K(ret));
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                       "AI model category does not support the requested operation");
+      } else if (endpoint_info->get_provider().case_compare(ObAIFuncProviderUtils::TYPESAFE) == 0
+                 && share::EndpointType::DECISION != ai_model_schema->get_type()) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("TypeSafe endpoint requires a decision model", K(ret));
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "TypeSafe endpoint requires a decision model");
       } else if (OB_FAIL(config.init(allocator, *ai_model_schema, *endpoint_info))) {
         LOG_WARN("failed to init config", K(ret));
       }

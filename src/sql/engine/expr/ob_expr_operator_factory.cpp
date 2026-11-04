@@ -523,6 +523,7 @@
 #include "sql/engine/expr/ob_expr_tmp_file_write.h"
 #include "sql/engine/expr/ob_expr_tmp_file_read.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_complete.h"
+#include "sql/engine/expr/ob_expr_ai/ob_expr_ai_decide.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_embed.h"
 #include "sql/engine/expr/ob_expr_ai/ob_expr_ai_rerank.h"
 #include "sql/engine/expr/ob_expr_local_dynamic_filter.h"
@@ -1366,6 +1367,7 @@ void ObExprOperatorFactory::register_expr_operators()
     REG_OP(ObExprCheckLocationAccess, EAGER_EVALUATION);
     REG_OP(ObExprStartUpMode, EAGER_EVALUATION);
     REG_OP(ObExprAIComplete, SHORT_CIRCUIT_EVALUATION);
+    REG_OP(ObExprAIDecide, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprAIEmbed, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprAIRerank, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprLocalDynamicFilter, SHORT_CIRCUIT_EVALUATION);
