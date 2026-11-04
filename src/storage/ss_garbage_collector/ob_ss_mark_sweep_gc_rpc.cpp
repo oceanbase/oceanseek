@@ -207,6 +207,14 @@ int ObSSMarkSweepGCStudyP::handle_tablet_exist_(
     // 需要等待回放，现在不能回收任何版本
     study_info.set_to_min();
     ObSSGCUtil::report_mark_sweep_set_to_min_event(cur_gc_tablet, "TRANSFER_NOT_REPLAYED");
+  } else if (tablet_handle.get_obj()->get_tablet_meta().has_transfer_table()) {
+    // Refresh may lower min_minor_meta_scn when it links the source SSTables.
+    // Wait for it before caching the dependency SCN.
+    // During upgrade, an older version may have already persisted a higher GC watermark.
+    // GC may still fail temporarily until transfer completes and subsequent flushes/compactions
+    // advance the dependency SCN to the old watermark or beyond.
+    study_info.set_to_min();
+    ObSSGCUtil::report_mark_sweep_set_to_min_event(cur_gc_tablet, "TRANSFER_TABLE_NOT_REFRESHED");
   } else { // tablet_handle.get_obj()->get_reorganization_scn() == transfer_scn
     study_info.set_to_min();  // means can not recycle any versions
     // min_dep_meta_scn_ carries the shared physical lower bound of Minor and IncMajor;

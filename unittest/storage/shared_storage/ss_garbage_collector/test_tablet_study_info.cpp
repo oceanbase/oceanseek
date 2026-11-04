@@ -803,6 +803,93 @@ TEST_F(TestTabletStudyInfo, higher_generation_keeps_study_info)
   expect_study_info(gc_tablet, 100, 10);
 }
 
+TEST_F(TestTabletStudyInfo, transfer_table_does_not_cache_until_refresh)
+{
+  const ObSSGCTablet gc_tablet = make_tablet(1);
+  const ObTabletMapKey tablet_key(gc_tablet.ls_id_, gc_tablet.tablet_id_);
+  ObTabletHandle before_refresh;
+  ObTabletHandle after_refresh;
+  ObTabletPointerHandle ptr_handle(t3m_.tablet_map_);
+  ObSSGCTabletStudyResultArray study_results;
+  obrpc::ObSSMarkSweepGCStudyP study_processor;
+  ASSERT_EQ(OB_SUCCESS, t3m_.bucket_lock_.init(
+      16, ObLatchIds::BLOCK_MANAGER_LOCK, "TestStudyLock", TEST_TENANT_ID));
+  ASSERT_EQ(OB_SUCCESS,
+      set_current_tablet(gc_tablet, gc_tablet.transfer_scn_, false /* 非空壳 */));
+  ASSERT_EQ(OB_SUCCESS,
+      make_tablet_handle(gc_tablet, gc_tablet.transfer_scn_, before_refresh));
+  ASSERT_EQ(OB_SUCCESS, t3m_.tablet_map_.get(tablet_key, ptr_handle));
+  before_refresh.get_obj()->tablet_meta_.transfer_info_.has_transfer_table_ = true;
+  before_refresh.get_obj()->tablet_meta_.min_minor_meta_scn_ = make_scn(200); // H
+  before_refresh.get_obj()->tablet_meta_.min_inc_major_meta_scn_.set_max();
+  before_refresh.get_obj()->table_store_cache_.min_major_snapshot_ = 20;
+  ptr_handle.get_tablet_pointer()->set_obj(before_refresh);
+
+  for (int64_t i = 0; i < 2; ++i) {
+    study_results.reuse();
+    ASSERT_EQ(OB_SUCCESS, study_processor.handle_tablet_exist_(
+        before_refresh, gc_tablet, TEST_LS_EPOCH, study_results));
+    expect_min_result(study_results);
+    expect_study_info_not_exist(gc_tablet);
+    EXPECT_EQ(0, get_ls_study_info_ctx_count());
+    EXPECT_EQ(make_scn(200), before_refresh.get_obj()->get_tablet_meta().get_min_minor_meta_scn());
+  }
+
+  // Refresh publishes the completed transfer and the lower source dependency together.
+  ASSERT_EQ(OB_SUCCESS,
+      make_tablet_handle(gc_tablet, gc_tablet.transfer_scn_, after_refresh));
+  after_refresh.get_obj()->tablet_meta_.transfer_info_.has_transfer_table_ = false;
+  after_refresh.get_obj()->tablet_meta_.min_minor_meta_scn_ = make_scn(100); // L < H
+  after_refresh.get_obj()->tablet_meta_.min_inc_major_meta_scn_.set_max();
+  after_refresh.get_obj()->table_store_cache_.min_major_snapshot_ = 10;
+  ptr_handle.get_tablet_pointer()->set_obj(after_refresh);
+  study_results.reuse();
+  ASSERT_EQ(OB_SUCCESS, study_processor.handle_tablet_exist_(
+      after_refresh, gc_tablet, TEST_LS_EPOCH, study_results));
+  ASSERT_EQ(1, study_results.count());
+  EXPECT_EQ(make_scn(100), study_results.at(0).study_info_.min_dep_meta_scn_);
+  EXPECT_EQ(10, study_results.at(0).study_info_.min_major_snapshot_);
+  expect_study_info(gc_tablet, 100, 10);
+  EXPECT_EQ(1, get_tablet_study_info_count());
+  ASSERT_EQ(OB_SUCCESS, remove_current_tablet(gc_tablet));
+}
+
+TEST_F(TestTabletStudyInfo, transfer_table_keeps_existing_study_info)
+{
+  const ObSSGCTablet gc_tablet = make_tablet(1);
+  ObTabletHandle tablet_handle;
+  ObSSGCTabletStudyResultArray study_results;
+  obrpc::ObSSMarkSweepGCStudyP study_processor;
+  ASSERT_EQ(OB_SUCCESS, check_and_update_study_info(gc_tablet, 200, 20));
+  ASSERT_EQ(OB_SUCCESS,
+      make_tablet_handle(gc_tablet, gc_tablet.transfer_scn_, tablet_handle));
+  tablet_handle.get_obj()->tablet_meta_.transfer_info_.has_transfer_table_ = true;
+  tablet_handle.get_obj()->tablet_meta_.min_minor_meta_scn_ = make_scn(100);
+
+  ASSERT_EQ(OB_SUCCESS, study_processor.handle_tablet_exist_(
+      tablet_handle, gc_tablet, TEST_LS_EPOCH, study_results));
+  expect_min_result(study_results);
+  expect_study_info(gc_tablet, 200, 20);
+}
+
+TEST_F(TestTabletStudyInfo, transfer_table_preserves_reorganization_scn_checks)
+{
+  ObTabletHandle tablet_handle;
+  ObSSGCTabletStudyResultArray study_results;
+  obrpc::ObSSMarkSweepGCStudyP study_processor;
+  ASSERT_EQ(OB_SUCCESS, make_tablet_handle(make_tablet(2), make_scn(2), tablet_handle));
+  tablet_handle.get_obj()->tablet_meta_.transfer_info_.has_transfer_table_ = true;
+
+  ASSERT_EQ(OB_SUCCESS, study_processor.handle_tablet_exist_(
+      tablet_handle, make_tablet(1), TEST_LS_EPOCH, study_results));
+  expect_max_result(study_results);
+  study_results.reuse();
+  ASSERT_EQ(OB_SUCCESS, study_processor.handle_tablet_exist_(
+      tablet_handle, make_tablet(3), TEST_LS_EPOCH, study_results));
+  expect_min_result(study_results);
+  EXPECT_EQ(0, get_ls_study_info_ctx_count());
+}
+
 TEST_F(TestTabletStudyInfo, tablet_missing_before_scan_returns_not_exist)
 {
   const ObSSGCTablet gc_tablet = make_tablet(1);
