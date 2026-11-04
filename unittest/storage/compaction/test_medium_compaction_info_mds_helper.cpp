@@ -11,6 +11,8 @@
 #include "storage/compaction/ob_medium_compaction_info_mds_helper.h"
 #include "storage/compaction/ob_medium_list_checker.h"
 #include "storage/compaction/ob_tablet_medium_clog_replay_executor.h"
+#include "storage/compaction/ob_tablet_merge_ctx.h"
+#include "storage/compaction/ob_tablet_merge_task.h"
 #include "unittest/storage/test_schema_prepare.h"
 #include "unittest/storage/test_dml_common.h"
 #include "mtlenv/mock_tenant_module_env.h"
@@ -847,6 +849,104 @@ TEST_F(TestObMediumCompactionInfoMdsHelperMdsRegister, test_standalone_medium_cl
   EXPECT_TRUE(has_medium_snapshot(medium_list, 200));
   ObMediumCompactionInfoList *allocated_list = const_cast<ObMediumCompactionInfoList*>(medium_list);
   ObTabletObjLoadHelper::free(allocator_, allocated_list);
+}
+
+TEST_F(TestObMediumCompactionInfoMdsHelperMdsRegister, test_deletion_gc_survives_medium_replay_and_retry)
+{
+  ObLSHandle ls_handle;
+  ObTabletHandle tablet_handle;
+  const ObLSID ls_id(TEST_LS_ID);
+  const ObTabletID tablet_id(30027);
+  SCN redo_scn;
+  ASSERT_EQ(OB_SUCCESS, prepare_ls(ls_handle));
+  ASSERT_EQ(OB_SUCCESS, prepare_tablet(ls_handle, tablet_id));
+  ASSERT_EQ(OB_SUCCESS, calc_test_tablet_mds_replay_scn(
+      *ls_handle.get_ls(), SCN::min_scn(), redo_scn));
+  redo_scn = SCN::plus(redo_scn, 3000);
+
+  ObMediumCompactionInfo medium_info;
+  util_.set_basic_medium_info(medium_info, 300);
+  medium_info.medium_compat_version_ = ObMediumCompactionInfo::MEDIUM_COMPAT_VERSION_LATEST;
+  medium_info.data_version_ = DATA_CURRENT_VERSION;
+  medium_info.storage_schema_.index_type_ = schema::INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL;
+  ASSERT_EQ(OB_SUCCESS, medium_info.mds_filter_info_.init(medium_info.data_version_, 200));
+  medium_info.contain_mds_filter_info_ = true;
+  ASSERT_TRUE(medium_info.is_valid());
+  const int64_t buf_len = medium_info.get_serialize_size();
+  char *buf = static_cast<char *>(allocator_.alloc(buf_len));
+  ASSERT_NE(nullptr, buf);
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, medium_info.serialize(buf, buf_len, pos));
+  ASSERT_EQ(buf_len, pos);
+  ObMediumCompactionInfo replay_info;
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, replay_info.deserialize(allocator_, buf, buf_len, pos));
+  ASSERT_EQ(buf_len, pos);
+  ObTabletMediumClogReplayExecutor executor(replay_info);
+  ASSERT_EQ(OB_SUCCESS, executor.init(redo_scn));
+  ASSERT_EQ(OB_SUCCESS, executor.execute(redo_scn, ls_id, tablet_id));
+  ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(tablet_id, tablet_handle));
+  const ObMediumCompactionInfoList *medium_list = nullptr;
+  ASSERT_EQ(OB_SUCCESS, tablet_handle.get_obj()->read_medium_info_list(allocator_, medium_list));
+  ASSERT_NE(nullptr, medium_list);
+  ObMediumCompactionInfoList *allocated_list = const_cast<ObMediumCompactionInfoList *>(medium_list);
+  DEFER(ObTabletObjLoadHelper::free(allocator_, allocated_list));
+  const ObMediumCompactionInfo *saved_info = medium_list->get_list().get_first();
+  ASSERT_NE(nullptr, saved_info);
+  ASSERT_EQ(300, saved_info->medium_snapshot_);
+  ASSERT_TRUE(saved_info->contain_mds_filter_info_);
+  ASSERT_EQ(200, saved_info->mds_filter_info_.get_mlog_purge_scn());
+
+  // Reconstruct each attempt from the durable plan without an LS handle: filter
+  // creation must not consult the current sibling tablets, even after recovery.
+  for (int64_t attempt = 0; attempt < 2; ++attempt) {
+    ObTabletMergeDagParam param;
+    param.merge_type_ = MEDIUM_MERGE;
+    param.merge_version_ = 300;
+    param.ls_id_ = ls_id;
+    param.tablet_id_ = tablet_id;
+    ObTabletMergeCtx merge_ctx(param, allocator_);
+    ObStorageSchema *storage_schema = OB_NEWx(ObStorageSchema, &allocator_);
+    ASSERT_NE(nullptr, storage_schema);
+    merge_ctx.static_param_.schema_ = storage_schema;
+    ASSERT_EQ(OB_SUCCESS, storage_schema->init(allocator_, saved_info->storage_schema_));
+    ASSERT_EQ(OB_SUCCESS, merge_ctx.filter_ctx_.mds_filter_info_.assign(
+        allocator_, saved_info->mds_filter_info_));
+    ASSERT_EQ(OB_SUCCESS, merge_ctx.alloc_mds_info_compaction_filter());
+    ASSERT_NE(nullptr, merge_ctx.get_compaction_filter());
+    const int64_t scn_column = storage_schema->get_rowkey_column_num();
+    blocksstable::ObDatumRow row;
+    ASSERT_EQ(OB_SUCCESS, row.init(allocator_, scn_column + 1));
+    const int64_t row_scns[] = {150, 200, 250};
+    for (const int64_t row_scn : row_scns) {
+      row.storage_datums_[scn_column].set_int(-row_scn);
+      ObICompactionFilter::ObFilterRet filter_ret = ObICompactionFilter::FILTER_RET_MAX;
+      ASSERT_EQ(OB_SUCCESS, merge_ctx.get_compaction_filter()->filter(row, filter_ret));
+      EXPECT_EQ(row_scn <= 200 ? ObICompactionFilter::FILTER_RET_REMOVE
+                              : ObICompactionFilter::FILTER_RET_KEEP, filter_ret);
+    }
+  }
+}
+
+TEST_F(TestObMediumCompactionInfoMdsHelperMdsRegister, test_deletion_without_persisted_gc_keeps_rows)
+{
+  // A Medium scheduled without a safe GC boundary, and Meta Major without a
+  // Medium plan, must not introduce a filter as local sibling progress changes.
+  const ObMergeType merge_types[] = {MEDIUM_MERGE, META_MAJOR_MERGE};
+  for (const ObMergeType merge_type : merge_types) {
+    for (int64_t attempt = 0; attempt < 2; ++attempt) {
+      ObTabletMergeDagParam param;
+      param.merge_type_ = merge_type;
+      param.merge_version_ = 300;
+      ObTabletMergeCtx merge_ctx(param, allocator_);
+      ObStorageSchema *storage_schema = OB_NEWx(ObStorageSchema, &allocator_);
+      ASSERT_NE(nullptr, storage_schema);
+      merge_ctx.static_param_.schema_ = storage_schema;
+      storage_schema->index_type_ = schema::INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL;
+      ASSERT_EQ(OB_SUCCESS, merge_ctx.alloc_mds_info_compaction_filter());
+      EXPECT_EQ(nullptr, merge_ctx.get_compaction_filter());
+    }
+  }
 }
 
 } // namespace unittest

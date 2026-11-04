@@ -223,6 +223,7 @@ protected:
     int64_t &schema_version);
   int get_adaptive_reason(const int64_t schedule_major_snapshot);
   int fill_mds_filter_info(ObMediumCompactionInfo &medium_info);
+  int fill_deletion_gc_scn(ObMediumCompactionInfo &medium_info) const;
   int fill_mlog_purge_scn(ObMediumCompactionInfo &medium_info);
   int fill_window_decision_log_info(ObMediumCompactionInfo &medium_info);
   bool need_read_mds(const ObMediumCompactionInfo &medium_info);
