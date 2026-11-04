@@ -63,7 +63,10 @@ private:
 class ObDeletionBitmapProvider
 {
 public:
-  // Compaction path. async_snapshot (logical R) defines bitmap contents and the cache key.
+  // Compaction reads deletion rows in (base_snapshot, async_snapshot]. The lower
+  // bound is the fixed input Major snapshot and must be passed explicitly.
+  // Full-bitmap readers use 0; the DAS query entry point keeps that semantics.
+  // Both bounds are part of the cache key to keep different read ranges separate.
   // Both entry points require the caller to observe deletion publication >= R on this replica.
   // Cache misses acquire the current Tablet and scan at a finite physical D
   // derived from MAJOR/committed INC, Tablet creation and MVS; SQL scans also use S as a floor.
@@ -74,7 +77,8 @@ public:
       const uint64_t table_id,
       const int64_t async_snapshot,
       common::ObIAllocator &allocator,
-      ObDeletionBitmapHandle &handle);
+      ObDeletionBitmapHandle &handle,
+      const int64_t base_snapshot);
 
   // DAS query path: scan with ctdef/rtdef (vectorized get_next_rows)
   static int get_or_build_bitmap(
@@ -93,7 +97,8 @@ private:
       const uint64_t table_id,
       const int64_t async_snapshot,
       common::ObIAllocator &allocator,
-      common::ObRoaringBitmap *&bitmap);
+      common::ObRoaringBitmap *&bitmap,
+      const int64_t base_snapshot);
 
   static int scan_and_build_bitmap(
       common::ObIAllocator &allocator,
@@ -108,7 +113,8 @@ private:
       const common::ObTabletID &delete_log_tablet_id,
       const int64_t async_snapshot,
       common::ObRoaringBitmap &bitmap,
-      common::ObIAllocator &allocator);
+      common::ObIAllocator &allocator,
+      const int64_t base_snapshot);
 };
 
 } // namespace storage

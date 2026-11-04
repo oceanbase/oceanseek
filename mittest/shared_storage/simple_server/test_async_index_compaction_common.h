@@ -831,7 +831,9 @@ int build_non_empty_inv_merge_res(
     ObInvSSTableMeta &inv_meta,
     ObArenaAllocator &allocator,
     ObSSTableMergeRes &res,
-    const uint64_t doc_id_step = 1)
+    const uint64_t doc_id_step = 1,
+    const bool single_term = false,
+    const int64_t rows_per_macro = 0)
 {
   int ret = OB_SUCCESS;
   ObSchemaGetterGuard schema_guard;
@@ -932,7 +934,7 @@ int build_non_empty_inv_merge_res(
     for (int64_t i = 0; OB_SUCC(ret) && i < row_cnt; ++i) {
       const uint64_t doc_id = start_doc_id + static_cast<uint64_t>(i) * doc_id_step;
       char term_buf[32];
-      snprintf(term_buf, sizeof(term_buf), "term%010lu", doc_id);
+      snprintf(term_buf, sizeof(term_buf), "term%010lu", single_term ? uint64_t(0) : doc_id);
       const ObString term_str(static_cast<int32_t>(strlen(term_buf)), term_buf);
       const uint64_t token_freq = 1;
       if (OB_FAIL(make_single_inv_idx_row(
@@ -946,6 +948,18 @@ int build_non_empty_inv_merge_res(
         }
         max_doc_id = doc_id;
         total_token_freq += token_freq;
+      }
+      // Small, valid input macros make parallel retry tests independent of
+      // compression ratios and large data sets. Existing callers never force flush.
+      if (OB_SUCC(ret) && rows_per_macro > 0 && (i + 1) % rows_per_macro == 0
+          && i + 1 < row_cnt) {
+        if (OB_FAIL(writer.flush_logical_block())) {
+          LOG_WARN("failed to flush test logical block", KR(ret));
+        } else if (OB_FAIL(writer.flush_micro_block_pair())) {
+          LOG_WARN("failed to flush test micro block", KR(ret));
+        } else if (OB_FAIL(writer.flush_macro_block(false /*is_close_flush*/))) {
+          LOG_WARN("failed to flush test input macro", KR(ret));
+        }
       }
     }
     if (OB_SUCC(ret)) {
@@ -1740,7 +1754,9 @@ public:
       const bool micro_index_clustered,
       ObTabletMergeCtx &merge_context,
       ObTabletCreateSSTableParam &param,
-      const uint64_t doc_id_step = 1);
+      const uint64_t doc_id_step = 1,
+      const bool single_term = false,
+      const int64_t rows_per_macro = 0);
   int add_non_empty_inv_sstable_to_tablet(
       ObLSHandle &ls_handle,
       const ObTabletID &tablet_id,
@@ -1751,7 +1767,9 @@ public:
       const int64_t row_cnt,
       const uint64_t start_doc_id,
       const bool micro_index_clustered,
-      const uint64_t doc_id_step = 1);
+      const uint64_t doc_id_step = 1,
+      const bool single_term = false,
+      const int64_t rows_per_macro = 0);
   int add_non_empty_major_to_tablet(
       ObLSHandle &ls_handle,
       const ObTabletID &tablet_id,

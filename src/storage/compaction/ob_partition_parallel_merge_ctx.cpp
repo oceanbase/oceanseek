@@ -781,48 +781,58 @@ int ObParallelMergeCtx::init_parallel_async_index_merge(compaction::ObBasicTable
     STORAGE_LOG(WARN, "unexpected first inv sstable", K(ret), KPC(first_table), K(tables_handle));
   } else {
     const int64_t tablet_size = merge_ctx.get_schema()->get_tablet_size();
-    int64_t total_macro_cnt = 0;
-    for (int64_t idx = 0; OB_SUCC(ret) && idx < tables_handle.get_count(); ++idx) {
-      const ObITable *table = tables_handle.get_table(idx);
-      if (OB_ISNULL(table) || !table->is_sstable() || !table->is_inv_sstable()) {
-        ret = OB_ERR_UNEXPECTED;
-        STORAGE_LOG(WARN, "unexpected input table for async index parallel merge", K(ret), K(idx), KP(table));
-      } else {
-        total_macro_cnt += static_cast<const ObSSTable *>(table)->get_data_macro_block_count();
+    const ObInvSSTable *first_inv_sstable =
+        static_cast<const ObInvSSTable *>(static_cast<const ObSSTable *>(first_table));
+    concurrent_cnt_ = 1;
+    if (is_major_merge_type(merge_ctx.get_merge_type())) {
+      // Major retry ranges depend only on the fixed baseline and schema.
+      const int64_t base_macro_cnt = first_inv_sstable->get_data_macro_block_count();
+      if (base_macro_cnt > 1
+          && OB_FAIL(get_concurrent_cnt(tablet_size, base_macro_cnt, concurrent_cnt_))) {
+        STORAGE_LOG(WARN, "failed to get concurrent cnt for async index major merge", K(ret),
+            K(tablet_size), K(base_macro_cnt));
+      }
+    } else {
+      // INC_MAJOR keeps adaptive parallelism based on all input SSTables.
+      int64_t total_macro_cnt = 0;
+      for (int64_t idx = 0; OB_SUCC(ret) && idx < tables_handle.get_count(); ++idx) {
+        const ObITable *table = tables_handle.get_table(idx);
+        if (OB_ISNULL(table) || !table->is_sstable() || !table->is_inv_sstable()) {
+          ret = OB_ERR_UNEXPECTED;
+          STORAGE_LOG(WARN, "unexpected input table for async index parallel merge", K(ret), K(idx), KP(table));
+        } else {
+          total_macro_cnt += static_cast<const ObSSTable *>(table)->get_data_macro_block_count();
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (total_macro_cnt > 1) {
+        if (OB_FAIL(get_concurrent_cnt(tablet_size, total_macro_cnt, concurrent_cnt_))) {
+          STORAGE_LOG(WARN, "failed to get concurrent cnt for async index inc major merge", K(ret),
+              K(tablet_size), K(total_macro_cnt));
+        } else {
+          calc_adaptive_parallel_degree(
+              merge_ctx.get_merge_type(),
+              merge_ctx.get_dag_priority(),
+              ObCompactionEstimator::MAJOR_MEM_PER_THREAD,
+              concurrent_cnt_,
+              concurrent_cnt_);
+          concurrent_cnt_ = MIN(concurrent_cnt_, total_macro_cnt);
+        }
       }
     }
+
     if (OB_FAIL(ret)) {
-    } else if (OB_UNLIKELY(total_macro_cnt <= 1)) {
+    } else if (concurrent_cnt_ <= 1) {
       if (OB_FAIL(init_serial_merge())) {
         STORAGE_LOG(WARN, "failed to init serial merge for async index", K(ret));
       }
-    } else if (OB_FAIL(get_concurrent_cnt(tablet_size, total_macro_cnt, concurrent_cnt_))) {
-      STORAGE_LOG(WARN, "failed to get concurrent cnt for async index merge", K(ret),
-          K(tablet_size), K(total_macro_cnt));
-    } else {
-      calc_adaptive_parallel_degree(
-          merge_ctx.get_merge_type(),
-          merge_ctx.get_dag_priority(),
-          ObCompactionEstimator::MAJOR_MEM_PER_THREAD,
-          concurrent_cnt_,
-          concurrent_cnt_);
-      concurrent_cnt_ = MIN(concurrent_cnt_, total_macro_cnt);
-      if (concurrent_cnt_ <= 1) {
-        if (OB_FAIL(init_serial_merge())) {
-          STORAGE_LOG(WARN, "failed to init serial merge for async index", K(ret));
-        }
-      } else {
-        const ObInvSSTable *first_inv_sstable =
-            static_cast<const ObInvSSTable *>(static_cast<const ObSSTable *>(first_table));
-        if (OB_FAIL(get_async_index_parallel_ranges(
-            first_inv_sstable, merge_ctx.get_tablet()->get_rowkey_read_info()))) {
-          STORAGE_LOG(WARN, "failed to get async index parallel ranges", K(ret),
-              K(tablet_size), K_(concurrent_cnt));
-          CTX_SET_DIAGNOSE_LOCATION(merge_ctx);
-        } else if (SERIALIZE_MERGE != parallel_type_) {
-          parallel_type_ = PARALLEL_MAJOR;
-        }
-      }
+    } else if (OB_FAIL(get_async_index_parallel_ranges(
+        first_inv_sstable, merge_ctx.get_tablet()->get_rowkey_read_info()))) {
+      STORAGE_LOG(WARN, "failed to get async index parallel ranges", K(ret),
+          K(tablet_size), K_(concurrent_cnt));
+      CTX_SET_DIAGNOSE_LOCATION(merge_ctx);
+    } else if (SERIALIZE_MERGE != parallel_type_) {
+      parallel_type_ = PARALLEL_MAJOR;
     }
   }
   return ret;

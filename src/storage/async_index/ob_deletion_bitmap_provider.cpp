@@ -230,18 +230,21 @@ int ObDeletionBitmapProvider::get_or_build_bitmap(
     const uint64_t table_id,
     const int64_t async_snapshot,
     common::ObIAllocator &allocator,
-    ObDeletionBitmapHandle &handle)
+    ObDeletionBitmapHandle &handle,
+    const int64_t base_snapshot)
 {
   int ret = OB_SUCCESS;
   const uint64_t tenant_id = MTL_ID();
-  ObDeletionBitmapCacheKey cache_key(tenant_id, delete_log_tablet_id, async_snapshot);
+  ObDeletionBitmapCacheKey cache_key(tenant_id, delete_log_tablet_id, async_snapshot, base_snapshot);
   ObDeletionBitmapCacheHandle cache_handle;
   ObDeletionBitmapCache &cache = OB_DELETION_BITMAP_CACHE;
 
   if (OB_UNLIKELY(!ls_id.is_valid() || !delete_log_tablet_id.is_valid()
-      || OB_INVALID_ID == table_id || async_snapshot <= 0)) {
+      || OB_INVALID_ID == table_id || async_snapshot <= 0
+      || base_snapshot < 0 || base_snapshot > async_snapshot)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), K(ls_id), K(delete_log_tablet_id), K(table_id), K(async_snapshot));
+    LOG_WARN("invalid argument", K(ret), K(ls_id), K(delete_log_tablet_id), K(table_id),
+        K(async_snapshot), K(base_snapshot));
   } else if (OB_FAIL(cache.get_bitmap(cache_key, cache_handle))) {
     if (OB_UNLIKELY(OB_ENTRY_NOT_EXIST != ret)) {
       LOG_WARN("get from cache failed", K(ret), K(cache_key));
@@ -250,7 +253,7 @@ int ObDeletionBitmapProvider::get_or_build_bitmap(
       common::ObRoaringBitmap *bitmap = nullptr;
       if (OB_FAIL(scan_and_build_bitmap(ls_id, delete_log_tablet_id,
                                          table_id, async_snapshot,
-                                         allocator, bitmap))) {
+                                         allocator, bitmap, base_snapshot))) {
         LOG_WARN("failed to scan and build bitmap", K(ret), K(ls_id), K(delete_log_tablet_id));
       } else if (OB_FAIL(handle.init_from_bitmap(allocator, bitmap))) {
         LOG_WARN("failed to init handle from bitmap", K(ret));
@@ -261,7 +264,7 @@ int ObDeletionBitmapProvider::get_or_build_bitmap(
       } else {
         int tmp_ret = OB_SUCCESS;
         if (OB_TMP_FAIL(put_bitmap_to_cache(
-            tenant_id, delete_log_tablet_id, async_snapshot, *bitmap, allocator))) {
+            tenant_id, delete_log_tablet_id, async_snapshot, *bitmap, allocator, base_snapshot))) {
           LOG_WARN("put bitmap to cache failed, non-fatal", K(tmp_ret));
         }
       }
@@ -314,7 +317,7 @@ int ObDeletionBitmapProvider::get_or_build_bitmap(
         int tmp_ret = OB_SUCCESS;
         if (OB_TMP_FAIL(put_bitmap_to_cache(
             tenant_id, delete_log_tablet_id, async_snapshot,
-            *bitmap, allocator))) {
+            *bitmap, allocator, 0 /*base_snapshot*/))) {
           LOG_WARN("put bitmap to cache failed, non-fatal", K(tmp_ret));
         }
       }
@@ -331,7 +334,8 @@ int ObDeletionBitmapProvider::scan_and_build_bitmap(
     const uint64_t table_id,
     const int64_t async_snapshot,
     common::ObIAllocator &allocator,
-    common::ObRoaringBitmap *&bitmap)
+    common::ObRoaringBitmap *&bitmap,
+    const int64_t base_snapshot)
 {
   int ret = OB_SUCCESS;
   bitmap = nullptr;
@@ -341,7 +345,8 @@ int ObDeletionBitmapProvider::scan_and_build_bitmap(
     LOG_WARN("failed to allocate roaring bitmap", K(ret));
   } else {
     ObDeletionRowIter row_iter;
-    if (OB_FAIL(row_iter.init(ls_id, delete_log_tablet_id, table_id, async_snapshot, allocator))) {
+    if (OB_FAIL(row_iter.init(ls_id, delete_log_tablet_id, table_id,
+        async_snapshot, allocator, base_snapshot))) {
       LOG_WARN("failed to init deletion row iter", K(ret), K(ls_id), K(delete_log_tablet_id));
     } else {
       while (OB_SUCC(ret) && !row_iter.is_end()) {
@@ -507,11 +512,12 @@ int ObDeletionBitmapProvider::put_bitmap_to_cache(
     const common::ObTabletID &delete_log_tablet_id,
     const int64_t async_snapshot,
     common::ObRoaringBitmap &bitmap,
-    common::ObIAllocator &allocator)
+    common::ObIAllocator &allocator,
+    const int64_t base_snapshot)
 {
   int ret = OB_SUCCESS;
   ObDeletionBitmapCacheKey cache_key(
-      tenant_id, delete_log_tablet_id, async_snapshot);
+      tenant_id, delete_log_tablet_id, async_snapshot, base_snapshot);
   ObDeletionBitmapCacheValue cache_value;
 
   const int64_t cardinality = static_cast<int64_t>(bitmap.get_cardinality());

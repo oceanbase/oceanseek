@@ -22,7 +22,8 @@ public:
   ObDeletionBitmapCacheKey(
       const uint64_t tenant_id,
       const common::ObTabletID &tablet_id,
-      const int64_t snapshot_version);
+      const int64_t snapshot_version,
+      const int64_t base_snapshot = 0);
   virtual ~ObDeletionBitmapCacheKey() = default;
 
   virtual int equal(const ObIKVCacheKey &other, bool &equal) const override;
@@ -32,12 +33,13 @@ public:
   virtual int deep_copy(char *buf, const int64_t buf_len, ObIKVCacheKey *&key) const override;
   bool is_valid() const;
 
-  TO_STRING_KV(K_(tenant_id), K_(tablet_id), K_(snapshot_version));
+  TO_STRING_KV(K_(tenant_id), K_(tablet_id), K_(snapshot_version), K_(base_snapshot));
 
 private:
   uint64_t tenant_id_;
   common::ObTabletID tablet_id_;       // Delete Log tablet id
   int64_t snapshot_version_;           // query snapshot (refresh_scn)
+  int64_t base_snapshot_;              // exclusive lower bound; queries use 0
 
   DISALLOW_COPY_AND_ASSIGN(ObDeletionBitmapCacheKey);
 };

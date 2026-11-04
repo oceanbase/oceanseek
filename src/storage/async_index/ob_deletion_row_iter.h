@@ -33,7 +33,8 @@ public:
       const common::ObTabletID &delete_log_tablet_id,
       const uint64_t table_id,
       const int64_t async_snapshot,
-      common::ObIAllocator &allocator);
+      common::ObIAllocator &allocator,
+      const int64_t base_snapshot = 0);
   // The caller must first observe deletion publication covering its logical read version.
   // Acquire the current Tablet after that observation to derive physical MVCC visibility.
   static int prepare_read_snapshot(
@@ -66,6 +67,7 @@ private:
   bool is_empty_;
   int64_t current_doc_id_;
   int64_t async_snapshot_;
+  int64_t base_snapshot_;
   int64_t trans_col_idx_;
   common::ObArenaAllocator inner_allocator_;
   share::schema::ObTableParam table_param_;

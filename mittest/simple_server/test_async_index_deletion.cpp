@@ -284,7 +284,7 @@ TEST_F(TestDeletionBitmapProvider, test_bitmap_provider)
 
     ObDeletionBitmapHandle handle;
     EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
-        ls_id, tablet_id, table_id, snapshot_version, allocator, handle));
+        ls_id, tablet_id, table_id, snapshot_version, allocator, handle, 0 /*base_snapshot*/));
 
     // Basic validity
     ASSERT_TRUE(handle.is_valid());
@@ -353,7 +353,7 @@ TEST_F(TestDeletionBitmapProvider, test_bitmap_iterator)
 
     ObDeletionBitmapHandle handle;
     EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
-        ls_id, tablet_id, table_id, snapshot_version, allocator, handle));
+        ls_id, tablet_id, table_id, snapshot_version, allocator, handle, 0 /*base_snapshot*/));
 
     // Test open_iter + get_next
     EQ(OB_SUCCESS, handle.open_iter());
@@ -430,7 +430,7 @@ TEST_F(TestDeletionBitmapProvider, test_empty_table)
 
     ObDeletionBitmapHandle handle;
     EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
-        ls_id, tablet_id, table_id, snapshot_version, allocator, handle));
+        ls_id, tablet_id, table_id, snapshot_version, allocator, handle, 0 /*base_snapshot*/));
 
     ASSERT_TRUE(handle.is_empty());
     ASSERT_EQ(0, handle.get_deletion_count());
@@ -472,7 +472,7 @@ TEST_F(TestDeletionBitmapProvider, test_large_bitmap)
 
     ObDeletionBitmapHandle handle;
     EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
-        ls_id, tablet_id, table_id, snapshot_version, allocator, handle));
+        ls_id, tablet_id, table_id, snapshot_version, allocator, handle, 0 /*base_snapshot*/));
 
     ASSERT_TRUE(handle.is_valid());
     ASSERT_FALSE(handle.is_empty());
@@ -518,14 +518,14 @@ TEST_F(TestDeletionBitmapProvider, test_cache_hit)
     // First call: builds bitmap and puts into cache
     ObDeletionBitmapHandle handle1;
     EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
-        ls_id, tablet_id, table_id, snapshot_version, allocator, handle1));
+        ls_id, tablet_id, table_id, snapshot_version, allocator, handle1, 0 /*base_snapshot*/));
     ASSERT_TRUE(handle1.is_valid());
     ASSERT_EQ(9, handle1.get_deletion_count());
 
     // Second call with same params: should hit cache
     ObDeletionBitmapHandle handle2;
     EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
-        ls_id, tablet_id, table_id, snapshot_version, allocator, handle2));
+        ls_id, tablet_id, table_id, snapshot_version, allocator, handle2, 0 /*base_snapshot*/));
     ASSERT_TRUE(handle2.is_valid());
     ASSERT_EQ(9, handle2.get_deletion_count());
 
@@ -561,7 +561,7 @@ TEST_F(TestDeletionBitmapProvider, test_reset)
 
     ObDeletionBitmapHandle handle;
     EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
-        ls_id, tablet_id, table_id, snapshot_version, allocator, handle));
+        ls_id, tablet_id, table_id, snapshot_version, allocator, handle, 0 /*base_snapshot*/));
 
     ASSERT_TRUE(handle.is_valid());
     ASSERT_FALSE(handle.is_empty());
@@ -598,7 +598,7 @@ TEST_F(TestDeletionBitmapProvider, test_advance_then_get_next)
 
     ObDeletionBitmapHandle handle;
     EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
-        ls_id, tablet_id, table_id, snapshot_version, allocator, handle));
+        ls_id, tablet_id, table_id, snapshot_version, allocator, handle, 0 /*base_snapshot*/));
     EQ(OB_SUCCESS, handle.open_iter());
 
     // advance to 10, then get_next should return 100
@@ -699,7 +699,7 @@ TEST_F(TestDeletionBitmapProvider, test_single_element)
 
     ObDeletionBitmapHandle handle;
     EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
-        ls_id, tablet_id, table_id, snapshot_version, allocator, handle));
+        ls_id, tablet_id, table_id, snapshot_version, allocator, handle, 0 /*base_snapshot*/));
 
     ASSERT_TRUE(handle.is_valid());
     ASSERT_FALSE(handle.is_empty());
@@ -765,7 +765,7 @@ TEST_F(TestDeletionBitmapProvider, test_single_point_range)
 
     ObDeletionBitmapHandle handle;
     EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
-        ls_id, tablet_id, table_id, snapshot_version, allocator, handle));
+        ls_id, tablet_id, table_id, snapshot_version, allocator, handle, 0 /*base_snapshot*/));
 
     // Single point range: min == max, hit
     ASSERT_TRUE(handle.contains_any_in_range(1, 1));

@@ -85,21 +85,29 @@ int ObAsyncIndexMergeCtx::get_merge_tables(ObGetMergeTablesResult &get_merge_tab
 int ObAsyncIndexMergeCtx::prepare_schema()
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(ObBasicTabletMergeCtx::prepare_schema())) {
+  if (is_major_merge_type(get_merge_type())) {
+    // Major/MEDIUM restores both schema and data version from medium info.
+    ObArenaAllocator allocator("GetMediumInfo", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+    ObMediumCompactionInfo *medium_info = nullptr;
+    if (OB_FAIL(ObTabletMediumInfoReader::get_medium_info_with_merge_version(
+        get_merge_version(), *get_tablet(), allocator, medium_info))) {
+      LOG_WARN("failed to get async index medium info", KR(ret), KPC(this));
+    } else if (OB_FAIL(prepare_from_medium_compaction_info(medium_info))) {
+      LOG_WARN("failed to restore async index compaction parameters", KR(ret), KPC(medium_info), KPC(this));
+    }
+    ObTabletObjLoadHelper::free(allocator, medium_info);
+  } else if (OB_FAIL(ObBasicTabletMergeCtx::prepare_schema())) {
     LOG_WARN("failed to prepare async index storage schema", KR(ret), KPC(this));
+  } else if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), static_param_.data_version_))) {
+    LOG_WARN("failed to get min data version", KR(ret));
   } else {
-    // Unlike ObTabletMajorMergeCtx, async index merge uses the storage schema
-    // on tablet and does not call prepare_from_medium_compaction_info().  Load
-    // the matching medium info explicitly so the scheduling reason is carried
-    // into merge history and exposed by GV$OB_TABLET_COMPACTION_HISTORY.
+    // INC_MAJOR uses the Tablet schema and current data version. Medium info
+    // only supplies the optional scheduling reason for merge history.
     int tmp_ret = OB_SUCCESS;
     ObArenaAllocator allocator("GetMediumInfo", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
     ObMediumCompactionInfo *medium_info = nullptr;
     if (OB_TMP_FAIL(ObTabletMediumInfoReader::get_medium_info_with_merge_version(
         get_merge_version(), *get_tablet(), allocator, medium_info))) {
-      // Some tests construct an async index merge DAG directly without
-      // registering medium info.  Keep the existing merge behavior in that
-      // case; a normally scheduled merge always has the matching medium info.
       LOG_WARN("failed to get async index medium info for merge reason",
           KR(tmp_ret), "merge_version", get_merge_version(), KPC(this));
     } else {
@@ -228,10 +236,14 @@ int ObAsyncIndexMergeCtx::prepare_deletion_bitmap()
     LOG_WARN("invalid delete index tablet info", K(ret), K_(delete_index_table_id), K_(delete_index_tablet_id));
   } else {
     const int64_t async_snapshot = get_snapshot();
-    if (OB_UNLIKELY(async_snapshot <= 0)) {
+    // The input Major already applied deletions through this fixed snapshot.
+    // Exclude those rows even before deletion GC, so retries make the same
+    // macro/logical block reuse decisions after they are physically removed.
+    const int64_t base_snapshot = get_read_base_version();
+    if (OB_UNLIKELY(async_snapshot <= 0 || base_snapshot < 0 || base_snapshot > async_snapshot)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid logical snapshot for deletion bitmap", K(ret),
-          K(async_snapshot));
+          K(async_snapshot), K(base_snapshot));
     } else if (OB_ISNULL(get_ls())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("ls is null when preparing deletion bitmap", K(ret), K(get_ls_id()));
@@ -247,12 +259,12 @@ int ObAsyncIndexMergeCtx::prepare_deletion_bitmap()
     } else if (OB_FAIL(ObDeletionBitmapProvider::get_or_build_bitmap(
         get_ls_id(), delete_index_tablet_id_, delete_index_table_id_,
         async_snapshot,
-        mem_ctx_.get_allocator(), deletion_bitmap_handle_))) {
+        mem_ctx_.get_allocator(), deletion_bitmap_handle_, base_snapshot))) {
       LOG_WARN("failed to get or build deletion bitmap", K(ret), K_(delete_index_tablet_id),
-          K_(delete_index_table_id), K(async_snapshot));
+          K_(delete_index_table_id), K(async_snapshot), K(base_snapshot));
     } else {
       LOG_INFO("success to prepare deletion bitmap", K(ret), K_(delete_index_tablet_id),
-          K_(delete_index_table_id), K(async_snapshot));
+          K_(delete_index_table_id), K(async_snapshot), K(base_snapshot));
     }
   }
   return ret;
@@ -476,15 +488,11 @@ int ObAsyncIndexMergeCtx::init_inc_major_uncommit_tx_info()
 int ObAsyncIndexMergeCtx::cal_merge_param()
 {
   int ret = OB_SUCCESS;
-  uint64_t min_data_version = 0;
   if (OB_UNLIKELY(static_param_.tables_handle_.empty()
       || nullptr == static_param_.tables_handle_.get_table(0))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tables handle is invalid for async index merge", KR(ret), K(static_param_.tables_handle_));
-  } else if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), min_data_version))) {
-    LOG_WARN("failed to get min data version", KR(ret));
   } else {
-    static_param_.data_version_ = min_data_version;
     static_param_.merge_level_ = MACRO_BLOCK_MERGE_LEVEL;
     static_param_.is_full_merge_ = is_major_merge_type(get_merge_type());
   }
