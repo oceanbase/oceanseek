@@ -1151,6 +1151,17 @@ int ObHybridSearchCgService::plan_async_fts_boolean_domain_(
       }
     }
   } else {
+    const ObDASBooleanQueryCtDef *boolean_ctdef =
+        static_cast<const ObDASBooleanQueryCtDef *>(root_ctdef);
+    const int64_t probe_offset = boolean_ctdef->has_merged_probe()
+        ? boolean_ctdef->get_merged_probe_offset() : -1;
+    const int64_t query_child_cnt = root_ctdef->children_cnt_
+        - (boolean_ctdef->has_merged_probe() ? 1 : 0);
+    if (boolean_ctdef->has_merged_probe()
+        && OB_UNLIKELY(probe_offset < 0 || probe_offset >= root_ctdef->children_cnt_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid merged probe offset", K(ret), K(probe_offset), K(root_ctdef->children_cnt_));
+    }
     int64_t async_child_cnt = 0;
     ObSEArray<ObDASBaseCtDef *, 8> normalized_children;
     for (int64_t i = 0; OB_SUCC(ret) && i < root_ctdef->children_cnt_; ++i) {
@@ -1158,6 +1169,11 @@ int ObHybridSearchCgService::plan_async_fts_boolean_domain_(
       if (OB_ISNULL(root_ctdef->children_[i])) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("null hybrid search child ctdef", K(ret), K(i));
+      } else if (i == probe_offset) {
+        // The probe is an alternative execution path, not another Boolean clause.
+        if (OB_FAIL(normalized_children.push_back(root_ctdef->children_[i]))) {
+          LOG_WARN("failed to preserve merged probe child", K(ret), K(i));
+        }
       } else if (OB_FAIL(SMART_CALL(plan_async_fts_boolean_domain_(
                      root_ctdef->children_[i], rewrite_actions,
                      has_unowned_sync_filter, normalized_child)))) {
@@ -1172,8 +1188,6 @@ int ObHybridSearchCgService::plan_async_fts_boolean_domain_(
     }
     bool mixed_children_are_sync_filters = true;
     bool has_required_async_child = false;
-    const ObDASBooleanQueryCtDef *boolean_ctdef =
-        static_cast<const ObDASBooleanQueryCtDef *>(root_ctdef);
     for (int64_t i = 0; OB_SUCC(ret) && mixed_children_are_sync_filters
          && i < normalized_children.count(); ++i) {
       ObDASBaseCtDef *normalized_child = normalized_children.at(i);
@@ -1181,7 +1195,8 @@ int ObHybridSearchCgService::plan_async_fts_boolean_domain_(
           && static_cast<ObDASBooleanQueryCtDef *>(normalized_child)->is_async();
       bool is_filter_child = false;
       bool is_required_child = false;
-      if (OB_FAIL(get_boolean_required_child_role(
+      if (i == probe_offset) {
+      } else if (OB_FAIL(get_boolean_required_child_role(
               *boolean_ctdef, root_ctdef->children_[i],
               is_filter_child, is_required_child))) {
         LOG_WARN("failed to classify mixed boolean child", K(ret), K(i));
@@ -1201,7 +1216,7 @@ int ObHybridSearchCgService::plan_async_fts_boolean_domain_(
     }
     if (OB_SUCCESS != ret || 0 == async_child_cnt) {
       // Preserve the original tree when no async full-text domain exists.
-    } else if (async_child_cnt != root_ctdef->children_cnt_
+    } else if (async_child_cnt != query_child_cnt
                && (!mixed_children_are_sync_filters || !has_required_async_child)) {
       // Eligibility is checked before mutation. Keep this guard non-failing so an
       // unrecognized mixed shape always falls back to the original execution tree.
