@@ -671,7 +671,7 @@ int ObMPUtils::get_plain_str_literal(ObIAllocator &allocator, const ObObj &obj, 
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_ERROR("fail to alloc mem", K(plain_str_print_length), K(ret));
   } else {
-    ret = obj.print_plain_str_literal(data, plain_str_print_length, pos);
+    ret = obj.print_plain_str_literal(data, plain_str_print_length, pos, allocator);
   }
   if (OB_SUCC(ret)) {
     value_str.assign_ptr(data, static_cast<uint32_t>(pos));
@@ -695,7 +695,7 @@ int ObMPUtils::get_user_sql_literal(ObIAllocator &allocator, const ObObj &obj, O
   } else if (NULL == (data = static_cast<char *>(allocator.alloc(user_sql_print_length)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_ERROR("fail to alloc mem", K(user_sql_print_length), K(ret));
-  } else if (OB_FAIL(obj.print_sql_literal(data, user_sql_print_length, pos, print_param))) {
+  } else if (OB_FAIL(obj.print_sql_literal(data, user_sql_print_length, pos, allocator, print_param))) {
     LOG_WARN("fail to print sql  literal", K(ret), K(pos), K(user_sql_print_length), K(obj));
   } else {
     value_str.assign_ptr(data, static_cast<uint32_t>(pos));

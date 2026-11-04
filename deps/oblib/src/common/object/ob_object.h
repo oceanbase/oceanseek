@@ -2148,6 +2148,10 @@ public:
   int print_varchar_literal(const ObIArray<ObString> &type_infos, char *buffer, int64_t length, int64_t &pos) const;
   /// print as plain string
   int print_plain_str_literal(char *buffer, int64_t length, int64_t &pos, const ObObjPrintParams &params = ObObjPrintParams()) const;
+  /// print as plain string and extend the buffer when necessary
+  int print_plain_str_literal(char *&buffer, int64_t &length,
+                              int64_t &pos, ObIAllocator &alloc,
+                              const ObObjPrintParams &params = ObObjPrintParams()) const;
   //used for enum and set
   int print_plain_str_literal(const ObIArray<ObString> &type_infos, char *buffer, int64_t length, int64_t &pos) const;
 
