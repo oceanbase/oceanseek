@@ -1,13 +1,13 @@
-Name: oceanbase-ce
+Name: oceanbase.ai-ce
 Version: %{VERSION}
 Release: %{RELEASE}
-Summary: oceanbase-ce
+Summary: oceanbase.ai-ce
 Group: Applications/Databases
 License: Apache-2.0
 Url: https://open.oceanbase.com/
 Vendor: OceanBase Inc.
 Prefix: /home/admin/oceanbase
-Requires: curl, jq, oceanbase-ce-libs = %{version}
+Requires: curl, jq, oceanbase.ai-ce-libs = %{version}
 BuildRequires: wget, rpm, cpio, make, glibc-devel, glibc-headers, binutils, m4, python3, python2, libtool, libaio
 Autoreq: 0
 %systemd_requires
@@ -33,7 +33,7 @@ OceanBase is a distributed relational database
 Summary: Debug information for OceanBase
 Group: Development/Debug
 %description debuginfo
-This package provides debug information for package oceanbase-ce.
+This package provides debug information for package oceanbase.ai-ce.
 Debug information is useful when developing applications that use this
 package or when debugging this package.
 
@@ -47,7 +47,7 @@ This package contains libraries for OceanBase.
 Summary: Debug information for OceanBase Libs
 Group: Development/Debug
 %description libs-debuginfo
-This package provides debug information for package oceanbase-ce-libs.
+This package provides debug information for package oceanbase.ai-ce-libs.
 Debug information is useful when developing applications that use this
 package or when debugging this package.
 
@@ -67,7 +67,7 @@ This package contains table api libraries for OceanBase.
 Summary: Debug information for OceanBase Table
 Group: Development/Debug
 %description table-debuginfo
-This package provides debug information for package oceanbase-ce-table.
+This package provides debug information for package oceanbase.ai-ce-table.
 Debug information is useful when developing applications that use this
 package or when debugging this package.
 
@@ -81,7 +81,7 @@ This package contains tools for OceanBase.
 Summary: Debug information for OceanBase Utils
 Group: Development/Debug
 %description utils-debuginfo
-This package provides debug information for package oceanbase-ce-utils.
+This package provides debug information for package oceanbase.ai-ce-utils.
 Debug information is useful when developing applications that use this
 package or when debugging this package.
 
