@@ -324,6 +324,14 @@ private:
   // Sync ls_executor_map_ with current LS list in service, init executors for new LSes
   // and release executors for removed LSes.
   int sync_ls_executors();
+  void compensate_new_ls_executor_(const ObLSID &ls_id,
+                                   const bool is_leader,
+                                   ObVecIdxLeaderExecutors &leader_exec,
+                                   ObVecIdxFollowerExecutors &follower_exec);
+  int load_ivf_cache_rewarm_tasks_(const ObLSID &ls_id,
+                                   ObVecIdxLeaderExecutors &exec,
+                                   const bool residual_sweep_succeeded,
+                                   uint64_t &task_trace_base_num);
   int collect_leader_executors_to_run(
       ObSEArray<std::pair<ObLSID, ObVecIdxLeaderExecutors *>, DEFAULT_LS_EXECUTOR_MAP_SIZE> &leader_executors_to_run);
   int collect_follower_executors_to_run(

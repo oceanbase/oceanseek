@@ -478,7 +478,7 @@ void ObVecIdxAsyncTaskScheduler::mark_ls_ivf_rewarm_requested(
 {
   if (!ls_id.is_valid()) {
     LOG_WARN_RET(OB_INVALID_ARGUMENT, "invalid IVF cache rewarm request", K(ls_id));
-  } else {
+  } else if (!ls_id.is_sys_ls()) {
     common::ObSpinLockGuard guard(ls_executor_lock_);
     ObVecIdxLeaderExecutors *exec = nullptr;
     int tmp_ret = ls_leader_executor_map_.get_refactored(ls_id, exec);
@@ -1845,6 +1845,31 @@ int ObVecIdxAsyncTaskScheduler::check_and_execute_ivf_cache_maintenance_tasks_()
   return ret;
 }
 
+void ObVecIdxAsyncTaskScheduler::compensate_new_ls_executor_(
+    const ObLSID &ls_id,
+    const bool is_leader,
+    ObVecIdxLeaderExecutors &leader_exec,
+    ObVecIdxFollowerExecutors &follower_exec)
+{
+  if (is_leader) {
+    leader_exec.set_need_resume(true);
+    if (!ls_id.is_sys_ls()) {
+      int tmp_ret = leader_exec.ivf_cache_rewarm_exec_.request_rewarm();
+      if (OB_SUCCESS != tmp_ret) {
+        LOG_WARN_RET(tmp_ret, "fail to compensate IVF cache rewarm request", K(tmp_ret), K(ls_id));
+      }
+    }
+  } else {
+    follower_exec.set_need_resume(true);
+    if (!ls_id.is_sys_ls()) {
+      int tmp_ret = follower_exec.ivf_cache_cleanup_exec_.request_cleanup();
+      if (OB_SUCCESS != tmp_ret) {
+        LOG_WARN_RET(tmp_ret, "fail to compensate follower IVF cache cleanup request", K(tmp_ret), K(ls_id));
+      }
+    }
+  }
+}
+
 int ObVecIdxAsyncTaskScheduler::sync_ls_executors()
 {
   int ret = OB_SUCCESS;
@@ -2219,24 +2244,13 @@ int ObVecIdxAsyncTaskScheduler::sync_ls_executors()
                 // Both maps now own their respective objects.
                 executor_guard.release_leader();
                 executor_guard.release_follower();
-                if (mgr->get_ls_leader()) {
-                  // Compensate for mark_ls_need_resume() that fired before this executor existed.
-                  leader_exec->set_need_resume(true);
-                  int tmp_ret = leader_exec->ivf_cache_rewarm_exec_.request_rewarm();
-                  if (OB_SUCCESS != tmp_ret) {
-                    LOG_WARN_RET(tmp_ret, "fail to compensate IVF cache rewarm request",
-                                 K(tmp_ret), K(ls_id));
-                  }
+                const bool is_leader = mgr->get_ls_leader();
+                // Compensate for a role notification that fired before this executor existed.
+                compensate_new_ls_executor_(ls_id, is_leader, *leader_exec, *follower_exec);
+                if (is_leader) {
                   LOG_INFO("new executor for already-leader LS, auto-set need_resume",
                            K(ls_id), K_(tenant_id));
                 } else {
-                  // Symmetric compensation for the follower side.
-                  follower_exec->set_need_resume(true);
-                  int tmp_ret = follower_exec->ivf_cache_cleanup_exec_.request_cleanup();
-                  if (OB_SUCCESS != tmp_ret) {
-                    LOG_WARN_RET(tmp_ret, "fail to compensate follower IVF cache cleanup request",
-                                 K(tmp_ret), K(ls_id));
-                  }
                   LOG_INFO("new executor for already-follower LS, auto-set follower need_resume",
                            K(ls_id), K_(tenant_id));
                 }
@@ -4690,6 +4704,23 @@ int ObVecIdxAsyncTaskScheduler::pop_tasks_to_work()
   return ret;
 }
 
+int ObVecIdxAsyncTaskScheduler::load_ivf_cache_rewarm_tasks_(
+    const ObLSID &ls_id,
+    ObVecIdxLeaderExecutors &exec,
+    const bool residual_sweep_succeeded,
+    uint64_t &task_trace_base_num)
+{
+  int ret = OB_SUCCESS;
+  if (residual_sweep_succeeded && !ls_id.is_sys_ls()) {
+    if (OB_FAIL(exec.ivf_cache_rewarm_exec_.check_and_set_thread_pool())) {
+      LOG_WARN("fail to prepare IVF cache rewarm task pool", KR(ret), K(ls_id));
+    } else if (OB_FAIL(exec.ivf_cache_rewarm_exec_.load_task(task_trace_base_num))) {
+      LOG_WARN("fail to load IVF cache rewarm task", KR(ret), K(ls_id));
+    }
+  }
+  return ret;
+}
+
 int ObVecIdxAsyncTaskScheduler::load_leader_ls_tasks(
     const ObLSID &ls_id,
     ObVecIdxLeaderExecutors &exec,
@@ -4766,15 +4797,9 @@ int ObVecIdxAsyncTaskScheduler::load_leader_ls_tasks(
     }
     ret = first_ret;
   }
-  if (OB_SUCC(ret) && residual_sweep_succeeded) {
-    int tmp_ret = OB_SUCCESS;
-    if (OB_SUCCESS != (tmp_ret = exec.ivf_cache_rewarm_exec_.check_and_set_thread_pool())) {
-      LOG_WARN("fail to prepare IVF cache rewarm task pool", K(tmp_ret), K(ls_id));
-      ret = tmp_ret;
-    } else if (OB_SUCCESS != (tmp_ret = exec.ivf_cache_rewarm_exec_.load_task(task_trace_base_num))) {
-      LOG_WARN("fail to load IVF cache rewarm task", K(tmp_ret), K(ls_id));
-      ret = tmp_ret;
-    }
+  if (OB_SUCC(ret)) {
+    ret = load_ivf_cache_rewarm_tasks_(ls_id, exec, residual_sweep_succeeded,
+                                       task_trace_base_num);
   }
   // IVF_TASK
   if (!ls_id.is_sys_ls() && can_schedule(ObVectorTaskScheduleType::IVF_TASK)) {
@@ -5078,10 +5103,12 @@ void ObVecIdxAsyncTaskScheduler::mark_ls_need_resume_for_follower(const share::O
   int ret = ls_follower_executor_map_.get_refactored(ls_id, exec);
   if (OB_SUCCESS == ret && OB_NOT_NULL(exec)) {
     exec->set_need_resume(true);
-    int tmp_ret = exec->ivf_cache_cleanup_exec_.request_cleanup();
-    if (OB_SUCCESS != tmp_ret) {
-      LOG_WARN_RET(tmp_ret, "fail to request IVF cache cleanup on follower switch",
-                   K(tmp_ret), K(ls_id), K_(tenant_id));
+    if (!ls_id.is_sys_ls()) {
+      int tmp_ret = exec->ivf_cache_cleanup_exec_.request_cleanup();
+      if (OB_SUCCESS != tmp_ret) {
+        LOG_WARN_RET(tmp_ret, "fail to request IVF cache cleanup on follower switch",
+                     K(tmp_ret), K(ls_id), K_(tenant_id));
+      }
     }
     LOG_INFO("marked ls need resume on follower switch", K(ls_id), K_(tenant_id));
   } else if (OB_HASH_NOT_EXIST == ret) {
