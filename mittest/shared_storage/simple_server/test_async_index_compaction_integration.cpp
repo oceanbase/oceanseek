@@ -7,6 +7,8 @@
  * 集成组用例目录（按源码定义顺序；搜索完整用例名可定位实现）
  * 范围：DAG 提交与完成状态校验、真实合并执行、refresh、删除过滤、LOB、回收站及 GC。
  * 前 4 项属于 AsyncIndexMergeWaitTest，模拟提交/完成结果，不提交真实 DAG。
+ * ObAsyncIndexSnapshotTest 另覆盖 AIM-001/003/004 的参数与错误契约，以及
+ * AIM-002/005 的逻辑块复用、逐行重写两组未发布重试和真实对象存储条件写。
  * 其余默认 fixture 为 ObAsyncIndexCompactionTest。最后一项属于
  * ObAsyncIndexDestructiveGCTest，参数 Values(true) 只展开为 /0；它推进租户 GC
  * 水位，默认顺序下放在本文件最后执行，本文件与基础组使用独立进程。
@@ -130,12 +132,21 @@
 #include "storage/ddl/ob_ddl_independent_dag.h"
 #include "storage/ddl/ob_writer_args_struct.h"
 #include "storage/ob_common_id_utils.h"
+#include "storage/compaction_v2/ob_ss_compact_helper.h"
 #include "storage/slog_ckpt/ob_linked_macro_block_struct.h"
 #include "storage/tablet/ob_tablet_persist_common.h"
 #include "storage/tx/ob_trans_define_v4.h"
 #include "share/ob_ddl_common.h"
 #include "storage/tx/ob_trans_service.h"
 #include "storage/tx_storage/ob_access_service.h"
+#include "storage/shared_storage/ob_ss_reader_writer.h"
+#include "storage/shared_storage/ob_ss_object_access_util.h"
+#include "storage/shared_storage/ob_file_manager.h"
+#include "storage/compaction/ob_partition_merger.h"
+#include "storage/compaction/ob_medium_compaction_mgr.h"
+#include "storage/compaction_v2/ob_ss_major_merge_ctx.h"
+#include "storage/incremental/ob_shared_meta_service.h"
+#include "lib/alloc/alloc_func.h"
 
 const char *get_per_file_test_name()
 {
@@ -1165,7 +1176,12 @@ void ObAsyncIndexCompactionTest::run_build_async_index_medium_info_with_merge_ta
   ASSERT_EQ(OB_SUCCESS, ObMediumCompactionScheduleFunc::get_async_index_tablet_ids(
       *data_handle.get_obj(), index_tablet_ids, delete_index_tablet_id, async_index_params));
 
+  // Installing mock SSTables does not advance the committed refresh watermark.
+  const int64_t published_snapshot = mock_major_snapshot + DEFAULT_INC_MAJOR_CNT * DEFAULT_INC_MAJOR_STEP;
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(ls_handle, fts_tablet_id, published_snapshot));
   ASSERT_NO_FATAL_FAILURE(prepare_delete_index_publish_for_merge(ctx, ls_handle));
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+      ls_handle, ctx.delete_index_tablet_id_, published_snapshot));
 
   int64_t common_published_snapshot = 0;
   ASSERT_EQ(OB_SUCCESS, calc_common_published_snapshot(
@@ -1512,14 +1528,17 @@ int ObAsyncIndexCompactionTest::build_non_empty_inv_sstable_param_for_merge(
     const bool micro_index_clustered,
     ObTabletMergeCtx &merge_context,
     ObTabletCreateSSTableParam &param,
-    const uint64_t doc_id_step)
+    const uint64_t doc_id_step,
+    const bool single_term,
+    const int64_t rows_per_macro)
 {
   int ret = OB_SUCCESS;
   ObSSTableMergeRes res;
   ObInvSSTableMeta inv_meta;
   if (OB_FAIL(build_non_empty_inv_merge_res(
           ls_handle, tablet_id, storage_schema, merge_type, snapshot_version,
-          row_cnt, start_doc_id, micro_index_clustered, inv_meta, allocator_, res, doc_id_step))) {
+          row_cnt, start_doc_id, micro_index_clustered, inv_meta, allocator_, res,
+          doc_id_step, single_term, rows_per_macro))) {
     LOG_WARN("failed to build non-empty inv merge res", KR(ret), K(tablet_id), K(row_cnt), K(start_doc_id));
   } else if (OB_FAIL(prepare_inv_merge_context(
       ls_handle, tablet_id, storage_schema, merge_type, snapshot_version, base_version, merge_context))) {
@@ -1557,7 +1576,9 @@ int ObAsyncIndexCompactionTest::add_non_empty_inv_sstable_to_tablet(
     const int64_t row_cnt,
     const uint64_t start_doc_id,
     const bool micro_index_clustered,
-    const uint64_t doc_id_step)
+    const uint64_t doc_id_step,
+    const bool single_term,
+    const int64_t rows_per_macro)
 {
   int ret = OB_SUCCESS;
   ObTabletHandle tablet_handle;
@@ -1578,7 +1599,8 @@ int ObAsyncIndexCompactionTest::add_non_empty_inv_sstable_to_tablet(
     LOG_WARN("failed to load storage schema", KR(ret), K(tablet_id));
   } else if (OB_FAIL(build_non_empty_inv_sstable_param_for_merge(
       ls_handle, tablet_id, *schema_on_tablet, merge_type, snapshot_version, base_version,
-      row_cnt, start_doc_id, micro_index_clustered, merge_context, create_param, doc_id_step))) {
+      row_cnt, start_doc_id, micro_index_clustered, merge_context, create_param,
+      doc_id_step, single_term, rows_per_macro))) {
     LOG_WARN("failed to build non-empty inv sstable param", KR(ret), K(tablet_id), K(merge_type));
   } else if (OB_FAIL(create_inv_sstable_from_param(create_param, table_handle, sstable))) {
     LOG_WARN("failed to create non-empty inv sstable", KR(ret), K(tablet_id), K(merge_type));
@@ -2830,6 +2852,8 @@ void ObAsyncIndexCompactionTest::run_async_index_inc_major_compaction_schedule_a
     ASSERT_EQ(OB_SUCCESS, fill_non_empty_inv_inc_major_segments(
         ls_handle, fts_index_tablet_id, *storage_schema, mock_major_snapshot,
         DEFAULT_INC_MAJOR_CNT, DEFAULT_INC_MAJOR_STEP, inc_major_start_doc_id));
+    ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+        ls_handle, fts_index_tablet_id, calc_schedule_snapshot_version(mock_major_snapshot)));
     ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(fts_index_tablet_id, fts_index_handle));
     verify_inc_major_cnt(ctx.ls_id_, fts_index_tablet_id, DEFAULT_INC_MAJOR_CNT);
   }
@@ -2849,6 +2873,8 @@ void ObAsyncIndexCompactionTest::run_async_index_inc_major_compaction_schedule_a
       ls_handle, delete_index_tablet_id,
       calc_schedule_snapshot_version(mock_major_snapshot),
       0 /*row_count*/, INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL));
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+      ls_handle, delete_index_tablet_id, calc_schedule_snapshot_version(mock_major_snapshot)));
 
   ObNewVersionRange merge_version_range;
   ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicy::choose_async_index_merge_range(
@@ -4170,7 +4196,7 @@ TEST_F(ObAsyncIndexCompactionTest, deletion_empty_major_creation_cold_scans)
     }
     ObDeletionBitmapHandle bitmap;
     ASSERT_EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(ctx.ls_id_,
-        ctx.delete_index_tablet_id_, ctx.delete_index_table_id_, logical, allocator_, bitmap));
+        ctx.delete_index_tablet_id_, ctx.delete_index_table_id_, logical, allocator_, bitmap, 0 /*base_snapshot*/));
     ASSERT_NO_FATAL_FAILURE(verify_read_boundary_bitmap(bitmap, expected));
   }
 }
@@ -4253,7 +4279,7 @@ TEST_F(ObAsyncIndexCompactionTest, async_read_boundary_bitmap_filter_and_cache)
   ObDeletionBitmapHandle bitmap;
   ASSERT_EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
       ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_,
-      read_version, allocator_, bitmap));
+      read_version, allocator_, bitmap, 0 /*base_snapshot*/));
   ObSEArray<uint64_t, 2> expected;
   ASSERT_EQ(OB_SUCCESS, expected.push_back(2));
   ASSERT_EQ(OB_SUCCESS, expected.push_back(4));
@@ -4265,7 +4291,7 @@ TEST_F(ObAsyncIndexCompactionTest, async_read_boundary_bitmap_filter_and_cache)
   ObDeletionBitmapHandle cached_bitmap;
   ASSERT_EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
       ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_,
-      read_version, allocator_, cached_bitmap));
+      read_version, allocator_, cached_bitmap, 0 /*base_snapshot*/));
   ASSERT_TRUE(cached_bitmap.cache_handle_.is_valid());
   ASSERT_NO_FATAL_FAILURE(verify_read_boundary_bitmap(cached_bitmap, expected));
   ObDeletionRowIter iter;
@@ -4278,6 +4304,87 @@ TEST_F(ObAsyncIndexCompactionTest, async_read_boundary_bitmap_filter_and_cache)
   ASSERT_LT(iter.scan_param_.snapshot_.version(), SCN::max_scn());
   ASSERT_FALSE(iter.scan_param_.snapshot_.is_weak_read());
   ASSERT_FALSE(iter.scan_param_.snapshot_.tx_id().is_valid());
+}
+
+TEST_F(ObAsyncIndexCompactionTest, merge_bitmap_snapshot_bounds_and_cache_isolation)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_NO_FATAL_FAILURE(exe_prepare_sql());
+  const char *name = "t_merge_bitmap_bounds";
+  ASSERT_NO_FATAL_FAILURE(create_async_fts_table(name));
+  MultiAsyncIndexTabletCtx ctx;
+  ASSERT_NO_FATAL_FAILURE(resolve_multi_async_index_tablet_ctx(name, ctx));
+  DEFER(enable_async_index_flags());
+  ObLSHandle ls;
+  ASSERT_EQ(OB_SUCCESS, get_ls_handle(ctx.ls_id_, ls));
+  const int64_t base = get_mock_major_snapshot(ctx);
+  const int64_t snapshot = base + DEFAULT_INC_MAJOR_STEP;
+  const int64_t physical_snapshot = snapshot + DEFAULT_INC_MAJOR_STEP;
+  ASSERT_EQ(OB_SUCCESS, wait_ls_weak_read_ts(*ls.get_ls(), physical_snapshot));
+  ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(ls, ctx.fts_index_tablet_ids_.at(0), base));
+  const uint64_t doc_ids[] = {2, 4, 6, 8, 10};
+  const int64_t row_snapshots[] = {base - 1, base, base + 1, snapshot, snapshot + 1};
+  int64_t actual_mvs = 0;
+  ASSERT_EQ(OB_SUCCESS, add_non_empty_delete_index_major_via_merge_ctx(
+      ls, ctx.delete_index_tablet_id_, physical_snapshot, base, doc_ids, ARRAYSIZEOF(doc_ids),
+      allocator_, actual_mvs, 0, row_snapshots));
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(ls, ctx.delete_index_tablet_id_, physical_snapshot));
+
+  // Populate the query cache first. A Major must not reuse this full bitmap.
+  ObDeletionBitmapHandle query;
+  ASSERT_EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
+      ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_, snapshot, allocator_, query, 0 /*base_snapshot*/));
+  ASSERT_EQ(4, query.get_deletion_count());
+  for (uint64_t id : {2, 4, 6, 8}) {
+    ASSERT_TRUE(query.contains(id));
+  }
+  ASSERT_FALSE(query.contains(10));
+  ObDeletionBitmapHandle merge;
+  ASSERT_EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
+      ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_, snapshot, allocator_, merge, base));
+  ASSERT_EQ(2, merge.get_deletion_count());
+  ASSERT_FALSE(merge.contains(2));
+  ASSERT_FALSE(merge.contains(4));
+  ASSERT_TRUE(merge.contains(6));
+  ASSERT_TRUE(merge.contains(8));
+  ASSERT_FALSE(merge.contains(10));
+  ObDeletionBitmapHandle cached_merge;
+  ASSERT_EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
+      ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_, snapshot,
+      allocator_, cached_merge, base));
+  ASSERT_TRUE(cached_merge.cache_handle_.is_valid());
+  ASSERT_EQ(2, cached_merge.get_deletion_count());
+  ASSERT_TRUE(cached_merge.contains(6));
+  ASSERT_TRUE(cached_merge.contains(8));
+
+  // The same upper snapshot with a different baseline has a different key.
+  ObDeletionBitmapHandle later_merge;
+  ASSERT_EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
+      ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_, snapshot,
+      allocator_, later_merge, base + 1));
+  ASSERT_EQ(1, later_merge.get_deletion_count());
+  ASSERT_TRUE(later_merge.contains(8));
+  ObDeletionBitmapHandle empty;
+  ASSERT_EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
+      ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_, snapshot,
+      allocator_, empty, snapshot));
+  ASSERT_TRUE(empty.is_empty());
+  ObDeletionBitmapHandle cached_query;
+  ASSERT_EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
+      ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_, snapshot,
+      allocator_, cached_query, 0 /*base_snapshot*/));
+  ASSERT_TRUE(cached_query.cache_handle_.is_valid());
+  ASSERT_EQ(4, cached_query.get_deletion_count());
+  ASSERT_TRUE(cached_query.contains(4));
+
+  ObDeletionBitmapHandle invalid;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ObDeletionBitmapProvider::get_or_build_bitmap(
+      ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_, snapshot,
+      allocator_, invalid, snapshot + 1));
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ObDeletionBitmapProvider::get_or_build_bitmap(
+      ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_, snapshot,
+      allocator_, invalid, -1));
 }
 
 TEST_F(ObAsyncIndexCompactionTest, async_read_boundary_refresh_visibility)
@@ -4321,7 +4428,7 @@ TEST_F(ObAsyncIndexCompactionTest, async_read_boundary_refresh_visibility)
   ObDeletionBitmapHandle bitmap;
   ASSERT_EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
       ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_,
-      read_version, allocator_, bitmap));
+      read_version, allocator_, bitmap, 0 /*base_snapshot*/));
   ASSERT_NO_FATAL_FAILURE(verify_read_boundary_bitmap(bitmap, deleted_doc_ids));
   {
     ObDeletionRowIter iter;
@@ -4365,7 +4472,7 @@ TEST_F(ObAsyncIndexCompactionTest, async_read_boundary_refresh_visibility)
   ObDeletionBitmapHandle batch_bitmap;
   ASSERT_EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
       ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_,
-      read_version, allocator_, batch_bitmap));
+      read_version, allocator_, batch_bitmap, 0 /*base_snapshot*/));
   ASSERT_TRUE(batch_bitmap.cache_handle_.is_valid());
   ASSERT_NO_FATAL_FAILURE(verify_read_boundary_bitmap(batch_bitmap, deleted_doc_ids));
 }
@@ -4397,7 +4504,7 @@ TEST_F(ObAsyncIndexCompactionTest, async_read_boundary_unreadable_and_replay)
         ls_handle.get_ls()->disable_to_read();
         ASSERT_EQ(OB_REPLICA_NOT_READABLE, ObDeletionBitmapProvider::get_or_build_bitmap(
             ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_,
-            read_version, allocator_, bitmap));
+            read_version, allocator_, bitmap, 0 /*base_snapshot*/));
         ASSERT_FALSE(bitmap.is_valid());
         ASSERT_EQ(OB_ENTRY_NOT_EXIST, OB_DELETION_BITMAP_CACHE.get_bitmap(key, cache));
       }
@@ -4422,7 +4529,7 @@ TEST_F(ObAsyncIndexCompactionTest, async_read_boundary_unreadable_and_replay)
       if (OB_SUCCESS == read_ret) {
         read_ret = ObDeletionBitmapProvider::get_or_build_bitmap(
             ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_,
-            read_version, allocator_, bitmap);
+            read_version, allocator_, bitmap, 0 /*base_snapshot*/);
       }
       if (OB_SUCCESS != read_ret) {
         ASSERT_TRUE(OB_NEED_RETRY == read_ret || OB_REPLICA_NOT_READABLE == read_ret
@@ -4576,7 +4683,7 @@ TEST_F(ObAsyncIndexCompactionTest, deletion_bitmap_survives_mvs_advance)
       ctx.delete_index_table_id_,
       keep_snapshot,
       allocator_,
-      bitmap_handle);
+      bitmap_handle, 0 /*base_snapshot*/);
   ASSERT_EQ(OB_SUCCESS, scan_ret)
       << "logical bitmap snapshot must not require an old deletion MVCC snapshot";
   ASSERT_TRUE(bitmap_handle.is_valid());
@@ -4588,7 +4695,7 @@ TEST_F(ObAsyncIndexCompactionTest, deletion_bitmap_survives_mvs_advance)
   ObDeletionBitmapHandle later_bitmap;
   ASSERT_EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
       ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_,
-      deletion_latest_snapshot, allocator_, later_bitmap));
+      deletion_latest_snapshot, allocator_, later_bitmap, 0 /*base_snapshot*/));
   ASSERT_TRUE(later_bitmap.is_valid());
   EXPECT_EQ(3, later_bitmap.get_deletion_count());
   EXPECT_FALSE(later_bitmap.contains(2));
@@ -4742,7 +4849,7 @@ TEST_F(ObAsyncIndexCompactionTest, deletion_tablet_keep_inc_major_base_version_z
   ObDeletionBitmapHandle bitmap_handle;
   ASSERT_EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
       ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_,
-      keep_snapshot, allocator_, bitmap_handle));
+      keep_snapshot, allocator_, bitmap_handle, 0 /*base_snapshot*/));
   ASSERT_TRUE(bitmap_handle.is_valid());
   EXPECT_EQ(3, bitmap_handle.get_deletion_count());
   EXPECT_TRUE(bitmap_handle.contains(2));
@@ -4756,7 +4863,7 @@ TEST_F(ObAsyncIndexCompactionTest, deletion_tablet_keep_inc_major_base_version_z
   ObDeletionBitmapHandle later_bitmap;
   ASSERT_EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
       ctx.ls_id_, ctx.delete_index_tablet_id_, ctx.delete_index_table_id_,
-      sibling_latest_snapshot, allocator_, later_bitmap));
+      sibling_latest_snapshot, allocator_, later_bitmap, 0 /*base_snapshot*/));
   ASSERT_TRUE(later_bitmap.is_valid());
   EXPECT_EQ(DELETE_INDEX_MERGE_DOC_ID_CNT, later_bitmap.get_deletion_count());
   for (int64_t i = 0; i < DELETE_INDEX_MERGE_DOC_ID_CNT; ++i) {
@@ -5659,6 +5766,123 @@ TEST_F(ObAsyncIndexCompactionTest, empty_async_search_major_carries_scalar_and_n
   OK(exe_sql("drop table if exists t_async_search_empty_postbuild_nested"));
 }
 
+class ObAsyncIndexRowDescSchemaTest : public ObAsyncIndexCompactionTest
+{
+public:
+  void prepare_index(const char *name, const int kind, ObTabletHandle &tablet)
+  {
+    ASSERT_NO_FATAL_FAILURE(exe_prepare_sql());
+    const char *index_defs[] = {
+      "async search index idx_doc(doc)",
+      "async search index idx_doc(doc with (nested_paths = ('$.comments')))",
+      "async fulltext index ft(body) with parser beng fts_index_type=match",
+      "async fulltext index ft(body) with parser beng fts_index_type=phrase_match"
+    };
+    ObSqlString sql;
+    ASSERT_EQ(OB_SUCCESS, sql.assign_fmt(
+        "create table %s (id bigint, doc json, body varchar(128), %s) "
+        "organization heap async_index_params='ASYNC_REFRESH_INTERVAL=-1'", name, index_defs[kind]));
+    ASSERT_EQ(OB_SUCCESS, exe_sql(sql.ptr()));
+    ObLSID ls_id;
+    ObTabletID tablet_id;
+    if (kind < 2) {
+      ASSERT_NO_FATAL_FAILURE(resolve_search_index_tablet_ctx(name, ls_id, tablet_id));
+    } else {
+      MultiAsyncIndexTabletCtx tablets;
+      ASSERT_NO_FATAL_FAILURE(resolve_multi_async_index_tablet_ctx(name, tablets));
+      ASSERT_EQ(1, tablets.fts_index_tablet_ids_.count());
+      ls_id = tablets.ls_id_;
+      tablet_id = tablets.fts_index_tablet_ids_.at(0);
+    }
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ls_id, tablet_id, tablet));
+  }
+
+  void get_expected_desc(const ObTablet &tablet, const ObStorageSchema &storage_schema,
+      uint64_t &index_table_id, ObInvIdxRowDesc &desc)
+  {
+    ObSchemaGetterGuard current_guard;
+    const ObTableSchema *index_schema = nullptr;
+    ASSERT_EQ(OB_SUCCESS, get_table_schema_for_tablet(tablet.get_tablet_id(),
+        storage_schema.get_schema_version(), current_guard, index_schema));
+    ASSERT_NE(nullptr, index_schema);
+    index_table_id = index_schema->get_table_id();
+    // Capture column roles from the DDL result independently of the merge context.
+    const ObTableSchema *data_schema = nullptr;
+    ASSERT_EQ(OB_SUCCESS, current_guard.get_table_schema(
+        MTL_ID(), index_schema->get_data_table_id(), data_schema));
+    ASSERT_NE(nullptr, data_schema);
+    ASSERT_EQ(OB_SUCCESS, desc.init(*index_schema, *data_schema));
+  }
+
+  void expect_same_desc(const ObInvIdxRowDesc &expected, const ObInvIdxRowDesc &actual)
+  {
+    EXPECT_EQ(expected.index_type_, actual.index_type_);
+    EXPECT_EQ(expected.doc_id_col_idx_, actual.doc_id_col_idx_);
+    EXPECT_EQ(expected.token_freq_col_idx_, actual.token_freq_col_idx_);
+    EXPECT_EQ(expected.doc_length_col_idx_, actual.doc_length_col_idx_);
+    EXPECT_EQ(expected.pos_list_col_idx_, actual.pos_list_col_idx_);
+    EXPECT_EQ(expected.nested_key_col_idx_, actual.nested_key_col_idx_);
+  }
+
+  void prepare_merge_row_desc(const ObTabletHandle &tablet, const ObStorageSchema &schema,
+      const ObMergeType merge_type, ObInvIdxRowDesc &desc, const int expected_ret = OB_SUCCESS)
+  {
+    ObTabletMergeDagParam param;
+    param.merge_type_ = merge_type;
+    param.tablet_id_ = tablet.get_obj()->get_tablet_id();
+    param.merge_version_ = tablet.get_obj()->get_snapshot_version();
+    ObAsyncIndexMergeCtx ctx(param, allocator_);
+    ASSERT_EQ(OB_SUCCESS, ctx.tablet_handle_.assign(tablet));
+    ctx.static_param_.schema_ = &schema;
+    // This focused test borrows the schema; the merge context normally owns it.
+    DEFER(ctx.static_param_.schema_ = nullptr);
+    ASSERT_EQ(expected_ret, ctx.prepare_inv_row_desc());
+    desc = ctx.inv_idx_row_desc_;
+    if (OB_SUCCESS != expected_ret) {
+      ASSERT_FALSE(desc.is_valid());
+    }
+  }
+};
+
+TEST_F(ObAsyncIndexRowDescSchemaTest, current_row_desc_with_fixed_storage_schema)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(run_ctx_.tenant_id_));
+  const char *names[] = {"t_desc_search_scalar", "t_desc_search_nested",
+      "t_desc_fts_match", "t_desc_fts_phrase"};
+  for (int kind = 0; kind < 4; ++kind) {
+    SCOPED_TRACE(kind);
+    ObTabletHandle tablet;
+    ASSERT_NO_FATAL_FAILURE(prepare_index(names[kind], kind, tablet));
+    ObStorageSchema *schema = nullptr;
+    ASSERT_EQ(OB_SUCCESS, tablet.get_obj()->load_storage_schema(allocator_, schema));
+    DEFER(ObTabletObjLoadHelper::free(allocator_, schema));
+    uint64_t index_table_id = OB_INVALID_ID;
+    ObInvIdxRowDesc expected;
+    ASSERT_NO_FATAL_FAILURE(get_expected_desc(*tablet.get_obj(), *schema, index_table_id, expected));
+    ASSERT_EQ(kind < 2 ? INV_IDX_TYPE_SEARCH : INV_IDX_TYPE_FTS, expected.index_type_);
+    ASSERT_EQ(1 == kind, expected.nested_key_col_idx_ >= 0);
+    ASSERT_EQ(3 == kind, expected.pos_list_col_idx_ >= 0);
+    ASSERT_EQ(kind >= 2, expected.token_freq_col_idx_ >= 0);
+    ASSERT_EQ(kind >= 2, expected.doc_length_col_idx_ >= 0);
+
+    const int64_t size = schema->get_serialize_size();
+    char *buf = static_cast<char *>(allocator_.alloc(size));
+    ASSERT_NE(nullptr, buf);
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, schema->serialize(buf, size, pos));
+    ObStorageSchema restored;
+    pos = 0;
+    ASSERT_EQ(OB_SUCCESS, restored.deserialize(allocator_, buf, size, pos));
+    ASSERT_EQ(size, pos);
+    for (const ObMergeType type : {MAJOR_MERGE, MEDIUM_MERGE, INC_MAJOR_MERGE}) {
+      ObInvIdxRowDesc actual;
+      ASSERT_NO_FATAL_FAILURE(prepare_merge_row_desc(tablet, restored, type, actual));
+      ASSERT_NO_FATAL_FAILURE(expect_same_desc(expected, actual));
+    }
+  }
+}
+
 TEST_F(ObAsyncIndexCompactionTest, empty_async_fts_inc_major_copies_match_and_phrase_inv_meta)
 {
   share::ObTenantSwitchGuard tguard;
@@ -6321,6 +6545,946 @@ TEST_F(ObAsyncIndexCompactionTest, async_delete_medium_selects_logical_inc_major
   allocator_.free(row_iter);
 }
 
+// Snapshot regressions use the real SS writer. Write-through makes the failure
+// window deterministic: close() has persisted the object before we abandon the
+// context, without creating/publishing its SSTable. No production failpoint or
+// object-ID override is needed. Object storage is supplied by the mittest CI.
+class AsyncIndexSnapshotMergeCtx : public ObAsyncIndexMergeCtx
+{
+public:
+  AsyncIndexSnapshotMergeCtx(ObTabletMergeDagParam &param, ObArenaAllocator &allocator)
+      : ObAsyncIndexMergeCtx(param, allocator) {}
+  ObStorageObjectWriteStrategy get_io_write_strategy() const override
+  { return ObStorageObjectWriteStrategy::WRITE_THROUGH; }
+};
+
+// Negative control: restore the pre-fix current-Tablet-schema selection while
+// keeping the other merge parameters identical to the successful attempt.
+class AsyncIndexCurrentSchemaMergeCtx : public AsyncIndexSnapshotMergeCtx
+{
+public:
+  AsyncIndexCurrentSchemaMergeCtx(ObTabletMergeDagParam &param, ObArenaAllocator &allocator)
+      : AsyncIndexSnapshotMergeCtx(param, allocator) {}
+  int prepare_schema() override
+  {
+    int ret = ObAsyncIndexMergeCtx::prepare_schema();
+    if (OB_SUCC(ret)) {
+      free_schema();
+      ret = ObBasicTabletMergeCtx::prepare_schema();
+    }
+    return ret;
+  }
+};
+
+class ObAsyncIndexSnapshotTest : public ObAsyncIndexCompactionTest
+{
+public:
+  void prepare_inputs(const char *name, const bool single_term = false,
+      const bool parallel_retry = false, const bool bitmap_retry = false)
+  {
+    ASSERT_NO_FATAL_FAILURE(exe_prepare_sql());
+    ObSqlString sql;
+    ASSERT_EQ(OB_SUCCESS, sql.assign_fmt(
+        "create table %s (id bigint, body varchar(128), async fulltext index ft(body) "
+        "with parser beng fts_index_type=phrase_match) organization heap "
+        "compression='none' async_index_params='ASYNC_REFRESH_INTERVAL=-1'", name));
+    if (parallel_retry) {
+      ASSERT_EQ(OB_SUCCESS, sql.append_fmt(" tablet_size=%ld",
+          2 * OB_STORAGE_OBJECT_MGR.get_macro_block_size()));
+    }
+    ASSERT_EQ(OB_SUCCESS, exe_sql(sql.ptr()));
+    ASSERT_NO_FATAL_FAILURE(resolve_multi_async_index_tablet_ctx(name, tablets_));
+    ASSERT_EQ(1, tablets_.fts_index_tablet_ids_.count());
+    tablet_id_ = tablets_.fts_index_tablet_ids_.at(0);
+    ASSERT_EQ(OB_SUCCESS, get_ls_handle(tablets_.ls_id_, ls_));
+    base_ = get_mock_major_snapshot(tablets_);
+    snapshot_ = base_ + 2 * DEFAULT_INC_MAJOR_STEP;
+    ObTabletHandle tablet;
+    ASSERT_EQ(OB_SUCCESS, ls_.get_ls()->get_tablet(tablet_id_, tablet));
+    ObStorageSchema *schema = nullptr;
+    ASSERT_EQ(OB_SUCCESS, tablet.get_obj()->load_storage_schema(allocator_, schema));
+    DEFER(ObTabletObjLoadHelper::free(allocator_, schema));
+    if (parallel_retry || bitmap_retry) {
+      // First Shared Tablet creation requires the initial empty Major. Do it
+      // before replacing that Major with this case's deterministic inputs.
+      ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->create_tablet(
+          tablets_.ls_id_, tablet_id_, tablet.get_obj()->get_reorganization_scn(), true));
+      ASSERT_EQ(OB_SUCCESS, add_non_empty_inv_sstable_to_tablet(
+          ls_, tablet_id_, *schema, MEDIUM_MERGE, 0, base_,
+          parallel_retry ? 1024 : 32, 1, true /*micro_index_clustered*/,
+          parallel_retry ? 3 : 2 /*doc_id_step*/,
+          single_term, parallel_retry ? 32 : 0 /*rows_per_macro*/));
+    } else {
+      ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(ls_, tablet_id_, base_));
+    }
+    // Interleaved macro ranges prevent whole-macro reuse. Distinct terms allow
+    // logical reuse; a single term with interleaved doc IDs forces row merging.
+    for (uint64_t i = 0; i < 2; ++i) {
+      ASSERT_EQ(OB_SUCCESS, add_non_empty_inv_sstable_to_tablet(
+          ls_, tablet_id_, *schema, INC_MAJOR_MERGE,
+          base_ + i * DEFAULT_INC_MAJOR_STEP, base_ + (i + 1) * DEFAULT_INC_MAJOR_STEP,
+          parallel_retry ? 1024 : 32, bitmap_retry ? i + 100 : parallel_retry ? i + 2 : i + 1,
+          true /*micro_index_clustered*/, parallel_retry ? 3 : 2 /*doc_id_step*/,
+          single_term, parallel_retry ? 32 : 0 /*rows_per_macro*/));
+    }
+    ASSERT_EQ(OB_SUCCESS, add_empty_data_major_to_tablet(
+        ls_, tablets_.delete_index_tablet_id_, snapshot_));
+    // Installing SSTables does not publish the refresh's committed watermark.
+    ASSERT_EQ(OB_SUCCESS, publish_async_index_version(ls_, tablet_id_, snapshot_));
+    ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+        ls_, tablets_.delete_index_tablet_id_, snapshot_));
+    ASSERT_NO_FATAL_FAILURE(ensure_ls_reserved_snapshot_ready(tablets_.ls_id_));
+    ASSERT_EQ(OB_SUCCESS, wait_ls_weak_read_ts(*ls_.get_ls(), snapshot_));
+  }
+
+  void build_medium(ObMediumCompactionInfo &info, const bool incremental = false)
+  {
+    ObTabletHandle tablet;
+    ASSERT_EQ(OB_SUCCESS, ls_.get_ls()->get_tablet(tablet_id_, tablet));
+    const ObMediumCompactionInfoList *list = nullptr;
+    ASSERT_EQ(OB_SUCCESS, tablet.get_obj()->read_medium_info_list(allocator_, list));
+    ASSERT_NE(nullptr, list);
+    SCN weak_read;
+    ASSERT_EQ(OB_SUCCESS, weak_read.convert_for_tx(snapshot_));
+    ObMediumCompactionScheduleFunc schedule(*ls_.get_ls(), weak_read, *list,
+        nullptr, ObAdaptiveMergePolicy::USER_REQUEST, 0, nullptr);
+    ASSERT_EQ(OB_SUCCESS, schedule.init_tablet_handle(tablet));
+    ObNewVersionRange range;
+    range.base_version_ = incremental ? base_ : 0;
+    range.snapshot_version_ = snapshot_;
+    ObMediumCompactionInfo generated(allocator_);
+    ASSERT_EQ(OB_SUCCESS, schedule.build_async_index_medium_info(range, generated));
+    // The scheduler owns the generated schema; copy it before the scheduler dies.
+    ASSERT_EQ(OB_SUCCESS, info.assign(allocator_, generated));
+    ASSERT_TRUE(info.is_valid());
+  }
+
+  void register_medium(const ObMediumCompactionInfo &info)
+  {
+    ObTabletMediumCompactionInfoMdsArg arg;
+    arg.ls_id_ = tablets_.ls_id_;
+    ASSERT_EQ(OB_SUCCESS, arg.add_item(tablet_id_, info));
+    ASSERT_EQ(OB_SUCCESS, register_mds_in_transaction(arg, 7001));
+  }
+
+  void fill_param(const ObMergeType type, ObTabletMergeDagParam &param,
+      const ObExecMode exec_mode = EXEC_MODE_LOCAL)
+  {
+    ObTabletHandle tablet;
+    ASSERT_EQ(OB_SUCCESS, ls_.get_ls()->get_tablet(tablet_id_, tablet));
+    ASSERT_EQ(OB_SUCCESS, ObDagParamFunc::fill_param(tablets_.ls_id_, *tablet.get_obj(),
+        type, snapshot_, exec_mode, param, is_inc_major_merge(type) ? base_ : 0));
+  }
+
+  void advance_storage_schema(int64_t &version)
+  {
+    ObTabletHandle old_tablet;
+    ObTabletHandle new_tablet;
+    ObStorageSchema *schema = nullptr;
+    ASSERT_EQ(OB_SUCCESS, ls_.get_ls()->get_tablet(tablet_id_, old_tablet));
+    ASSERT_EQ(OB_SUCCESS, old_tablet.get_obj()->load_storage_schema(allocator_, schema));
+    DEFER(ObTabletObjLoadHelper::free(allocator_, schema));
+    // Tablet-to-table history lookups require a formal schema version.
+    schema->schema_version_ += share::schema::ObSchemaVersionGenerator::SCHEMA_VERSION_INC_STEP;
+    version = schema->schema_version_;
+    ObUpdateTableStoreParam update(old_tablet.get_obj()->get_snapshot_version(),
+        old_tablet.get_obj()->get_multi_version_start(), schema, ls_.get_ls()->get_rebuild_seq());
+    ASSERT_EQ(OB_SUCCESS, ls_.get_ls()->update_tablet_table_store(tablet_id_, update, new_tablet));
+    int64_t stored_version = 0;
+    ASSERT_EQ(OB_SUCCESS, new_tablet.get_obj()->get_schema_version_from_storage_schema(stored_version));
+    ASSERT_EQ(version, stored_version);
+    ASSERT_NE(old_tablet.get_obj(), new_tablet.get_obj());
+  }
+
+  void assert_unpublished()
+  {
+    ObTabletHandle tablet;
+    ASSERT_EQ(OB_SUCCESS, ls_.get_ls()->get_tablet(tablet_id_, tablet));
+    ASSERT_EQ(base_, tablet.get_obj()->get_last_major_snapshot_version());
+  }
+
+  void assert_remote_bytes(const MacroBlockId &id, const ObString &expected)
+  {
+    ObBaseFileManager *file_manager = nullptr;
+    int64_t remote_size = 0;
+    ASSERT_EQ(OB_SUCCESS, ObSSObjectAccessUtil::get_file_manager(MTL_ID(), file_manager));
+    ASSERT_NE(nullptr, file_manager);
+    ASSERT_EQ(OB_SUCCESS, file_manager->get_remote_file_length(id, 0 /*ls_epoch*/, remote_size));
+    ASSERT_EQ(expected.length(), remote_size);
+    ObArenaAllocator allocator("SnapshotRead", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+    char *buffer = static_cast<char *>(allocator.alloc(expected.length()));
+    ASSERT_NE(nullptr, buffer);
+    ObStorageObjectReadInfo read;
+    read.macro_block_id_ = id;
+    read.buf_ = buffer;
+    read.offset_ = 0;
+    read.size_ = expected.length();
+    read.mtl_tenant_id_ = MTL_ID();
+    read.io_desc_.set_mode(ObIOMode::READ);
+    read.io_desc_.set_wait_event(ObWaitEventIds::OBJECT_STORAGE_READ);
+    read.io_desc_.set_sys_module_id(ObIOModule::SHARED_BLOCK_RW_IO);
+    read.io_timeout_ms_ = OB_IO_MANAGER.get_object_storage_io_timeout_ms(MTL_ID());
+    ObSSObjectStorageReader reader; // bypass local macro cache
+    ObStorageObjectHandle handle;
+    ASSERT_EQ(OB_SUCCESS, reader.aio_read(read, handle));
+    ASSERT_EQ(OB_SUCCESS, handle.wait());
+    ASSERT_EQ(expected.length(), handle.get_data_size());
+    ASSERT_EQ(0, MEMCMP(expected.ptr(), buffer, expected.length()));
+  }
+
+  void roundtrip_medium(const ObMediumCompactionInfo &source, ObMediumCompactionInfo &restored)
+  {
+    const int64_t size = source.get_serialize_size();
+    char *buffer = static_cast<char *>(allocator_.alloc(size));
+    ASSERT_NE(nullptr, buffer);
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, source.serialize(buffer, size, pos));
+    ASSERT_EQ(size, pos);
+    pos = 0;
+    ASSERT_EQ(OB_SUCCESS, restored.deserialize(allocator_, buffer, size, pos));
+    ASSERT_EQ(size, pos);
+    ASSERT_TRUE(restored.is_valid());
+    ASSERT_EQ(source.contain_parallel_range_, restored.contain_parallel_range_);
+    ASSERT_FALSE(restored.contain_parallel_range_);
+    ASSERT_EQ(0, restored.parallel_merge_info_.get_size());
+  }
+
+  void run_parallel_retry(const char *name,
+      const bool single_term = false);
+
+
+  void run_retry(const bool logical_reuse)
+  {
+    ASSERT_NO_FATAL_FAILURE(prepare_inputs(logical_reuse ? "t_snapshot_reuse" : "t_snapshot_rows",
+        !logical_reuse));
+    ObMediumCompactionInfo medium(allocator_);
+    ASSERT_NO_FATAL_FAILURE(build_medium(medium));
+    ASSERT_NO_FATAL_FAILURE(register_medium(medium));
+    const int64_t fixed_schema = medium.storage_schema_.get_schema_version();
+    ObTabletMergeDagParam param;
+    ASSERT_NO_FATAL_FAILURE(fill_param(MEDIUM_MERGE, param, EXEC_MODE_LOCAL_WITH_SHARED_BLOCK));
+    MacroBlockId first_id;
+    ObString first_buffer;
+    uint64_t first_checksum = 0;
+    int64_t current_schema = fixed_schema;
+    ObSEArray<ObITable::TableKey, 4> input_keys;
+    ObSEArray<int64_t, 4> input_checksums;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      {
+        ObArenaAllocator allocator("SnapshotCtx", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+        AsyncIndexSnapshotMergeCtx ctx(param, allocator);
+        bool finish = false;
+        ASSERT_EQ(OB_SUCCESS, ctx.build_ctx(finish));
+        ASSERT_FALSE(finish);
+        ASSERT_EQ(OB_SUCCESS, ctx.check_merge_ctx_valid());
+        ASSERT_EQ(fixed_schema, ctx.get_schema()->get_schema_version());
+        ASSERT_EQ(1, ctx.get_concurrent_cnt());
+        ASSERT_TRUE(ctx.inv_idx_row_desc_.pos_list_col_idx_ >= 0);
+        ASSERT_EQ(snapshot_, ctx.get_snapshot());
+        ASSERT_TRUE(ctx.deletion_bitmap_handle_.is_empty());
+        for (int64_t i = 0; i < ctx.get_tables_handle().get_count(); ++i) {
+          const ObSSTable *table = static_cast<const ObSSTable *>(ctx.get_tables_handle().get_table(i));
+          if (0 == attempt) {
+            ASSERT_EQ(OB_SUCCESS, input_keys.push_back(table->get_key()));
+            ASSERT_EQ(OB_SUCCESS, input_checksums.push_back(table->get_data_checksum()));
+          } else {
+            ASSERT_EQ(input_keys.count(), ctx.get_tables_handle().get_count());
+            ASSERT_TRUE(input_keys.at(i) == table->get_key());
+            ASSERT_EQ(input_checksums.at(i), table->get_data_checksum());
+          }
+        }
+        ObLocalArena arena("SnapshotMerge");
+        arena.bind_mem_ctx(ctx.mem_ctx_);
+        ObPartitionInvSSTableMerger merger(arena, ctx.static_param_);
+        ASSERT_EQ(OB_SUCCESS, merger.merge_partition(ctx, 0));
+        ASSERT_EQ(64, ctx.get_merge_info().get_merge_history().block_info_.total_row_count_);
+        ASSERT_EQ(0, merger.macro_reuse_stats_.reuse_count_);
+        if (logical_reuse) {
+          ASSERT_GT(merger.logical_reuse_stats_.reuse_count_, 0);
+        } else {
+          ASSERT_EQ(0, merger.logical_reuse_stats_.reuse_count_);
+        }
+        ObInvIdxMacroBlockWriter *writer = merger.get_macro_writer();
+        ASSERT_NE(nullptr, writer);
+        // merge_partition() has closed the writer and waited for its real I/O.
+        // close() transfers the written block IDs to the index tree root.
+        ASSERT_NE(nullptr, writer->index_block_builder_.index_tree_root_ctx_);
+        ObMacroBlocksWriteCtx *write_ctx =
+            writer->index_block_builder_.index_tree_root_ctx_->data_write_ctx_;
+        ASSERT_NE(nullptr, write_ctx);
+        ASSERT_EQ(1, write_ctx->get_macro_block_count());
+        const MacroBlockId id = write_ctx->get_macro_block_list().at(0);
+        ASSERT_EQ(ObStorageObjectType::SHARED_MAJOR_DATA_MACRO, id.storage_object_type());
+        const int64_t size = upper_align(writer->macro_block_.get_data_size(), DIO_ALIGN_SIZE);
+        ASSERT_GT(size, writer->macro_block_.get_data_size()); // negative write changes padding only
+        const ObString buffer(static_cast<int32_t>(size), writer->macro_block_.get_data_buf());
+        const uint64_t checksum = ob_crc64(buffer.ptr(), buffer.length());
+        ASSERT_FALSE(ctx.merged_table_handle_.is_valid());
+        ASSERT_NO_FATAL_FAILURE(assert_unpublished());
+        ASSERT_NO_FATAL_FAILURE(assert_remote_bytes(id, buffer));
+        if (0 == attempt) {
+          first_id = id;
+          first_checksum = checksum;
+          ASSERT_EQ(OB_SUCCESS, deep_copy_inv_row_string(allocator_, buffer, first_buffer));
+          // Abandon the finished writer and context without invoking publication.
+        } else {
+          ASSERT_GT(current_schema, fixed_schema);
+          ASSERT_TRUE(first_id == id);
+          ASSERT_EQ(first_buffer.length(), buffer.length());
+          ASSERT_EQ(first_checksum, checksum);
+          // Compare independently generated buffers, including headers and DIO padding.
+          ASSERT_EQ(0, MEMCMP(first_buffer.ptr(), buffer.ptr(), buffer.length()));
+          ASSERT_EQ(OB_SUCCESS, ctx.update_tablet_after_merge());
+          ObTabletHandle published;
+          ASSERT_EQ(OB_SUCCESS, ls_.get_ls()->get_tablet(tablet_id_, published));
+          ASSERT_EQ(snapshot_, published.get_obj()->get_last_major_snapshot_version());
+          const ObSSTable *sstable = nullptr;
+          ASSERT_EQ(OB_SUCCESS, ctx.merged_table_handle_.get_sstable(sstable));
+          ASSERT_NE(nullptr, sstable);
+          ASSERT_EQ(64, sstable->get_row_count());
+          char object_id[256] = {0};
+          id.to_string(object_id, sizeof(object_id));
+          fprintf(stdout, "SNAPSHOT_RETRY fixed logical_reuse=%d object=%s schema=%ld "
+              "current_schema=%ld checksum=%lu rows=%ld published=%ld\n",
+              logical_reuse, object_id, fixed_schema, current_schema, checksum,
+              sstable->get_row_count(), published.get_obj()->get_last_major_snapshot_version());
+          fflush(stdout);
+        }
+      }
+      if (0 == attempt) {
+        ASSERT_NO_FATAL_FAILURE(assert_unpublished());
+        ASSERT_NO_FATAL_FAILURE(assert_remote_bytes(first_id, first_buffer));
+        ASSERT_NO_FATAL_FAILURE(advance_storage_schema(current_schema));
+        ASSERT_GT(current_schema, fixed_schema);
+        {
+          ObArenaAllocator allocator("SchemaDrift", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+          AsyncIndexCurrentSchemaMergeCtx ctx(param, allocator);
+          bool finish = false;
+          ASSERT_EQ(OB_SUCCESS, ctx.build_ctx(finish));
+          ASSERT_FALSE(finish);
+          ASSERT_EQ(current_schema, ctx.get_schema()->get_schema_version());
+          ASSERT_EQ(medium.data_version_, ctx.static_param_.data_version_);
+          ASSERT_EQ(medium.encoding_granularity_, ctx.static_param_.encoding_granularity_);
+          ObLocalArena arena("SchemaDrift");
+          arena.bind_mem_ctx(ctx.mem_ctx_);
+          ObPartitionInvSSTableMerger merger(arena, ctx.static_param_);
+          const int merge_ret = merger.merge_partition(ctx, 0);
+          ASSERT_EQ(OB_OBJECT_STORAGE_CONDITION_NOT_MATCH, merge_ret);
+          ObInvIdxMacroBlockWriter *writer = merger.get_macro_writer();
+          ASSERT_NE(nullptr, writer);
+          ASSERT_TRUE(first_id == writer->macro_handle_.get_macro_id());
+          ASSERT_EQ(first_buffer.length(),
+              upper_align(writer->macro_block_.get_data_size(), DIO_ALIGN_SIZE));
+          ASSERT_NE(0, MEMCMP(first_buffer.ptr(), writer->macro_block_.get_data_buf(),
+              first_buffer.length()));
+          ASSERT_FALSE(ctx.merged_table_handle_.is_valid());
+          ASSERT_NO_FATAL_FAILURE(assert_unpublished());
+          ASSERT_NO_FATAL_FAILURE(assert_remote_bytes(first_id, first_buffer));
+          char object_id[256] = {0};
+          first_id.to_string(object_id, sizeof(object_id));
+          fprintf(stdout, "SNAPSHOT_RETRY schema_drift logical_reuse=%d object=%s "
+              "fixed_schema=%ld current_schema=%ld ret=%d remote_unchanged=1 unpublished=1\n",
+              logical_reuse, object_id, fixed_schema, current_schema, merge_ret);
+          fflush(stdout);
+        }
+      }
+    }
+    // Real same-ID/same-size conflict: change only padding, leaving the encoded
+    // macro headers/payload valid. The condition write must not replace it.
+    char *different = static_cast<char *>(allocator_.alloc(first_buffer.length()));
+    ASSERT_NE(nullptr, different);
+    MEMCPY(different, first_buffer.ptr(), first_buffer.length());
+    different[first_buffer.length() - 1] ^= 1;
+    ObStorageObjectWriteInfo write;
+    write.buffer_ = different;
+    write.offset_ = 0;
+    write.size_ = first_buffer.length();
+    write.mtl_tenant_id_ = MTL_ID();
+    write.io_desc_.set_wait_event(ObWaitEventIds::DB_FILE_COMPACT_WRITE);
+    write.io_desc_.set_sealed();
+    write.io_desc_.set_sys_module_id(ObIOModule::SSTABLE_MACRO_BLOCK_WRITE_IO);
+    write.io_timeout_ms_ = OB_IO_MANAGER.get_object_storage_io_timeout_ms(MTL_ID());
+    write.write_strategy_ = ObStorageObjectWriteStrategy::WRITE_THROUGH;
+    ObStorageObjectHandle conflict;
+    ASSERT_EQ(OB_SUCCESS, conflict.set_macro_block_id(first_id));
+    ObSSObjectStorageWriter object_writer;
+    ASSERT_EQ(OB_SUCCESS, object_writer.aio_write(write, conflict));
+    ASSERT_EQ(OB_OBJECT_STORAGE_CONDITION_NOT_MATCH, conflict.wait());
+    ASSERT_NO_FATAL_FAILURE(assert_remote_bytes(first_id, first_buffer));
+  }
+
+  MultiAsyncIndexTabletCtx tablets_;
+  ObLSHandle ls_;
+  ObTabletID tablet_id_;
+  int64_t base_ = 0;
+  int64_t snapshot_ = 0;
+};
+
+TEST_F(ObAsyncIndexSnapshotTest, major_medium_fixed_parameters)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_NO_FATAL_FAILURE(prepare_inputs("t_snapshot_parameters"));
+  ObMediumCompactionInfo medium(allocator_);
+  ObMediumCompactionInfo generated(allocator_);
+  ASSERT_NO_FATAL_FAILURE(build_medium(generated));
+  ASSERT_FALSE(generated.contain_parallel_range_);
+  ASSERT_NO_FATAL_FAILURE(roundtrip_medium(generated, medium));
+  uint64_t current_data_version = 0;
+  ASSERT_EQ(OB_SUCCESS, GET_MIN_DATA_VERSION(MTL_ID(), current_data_version));
+  medium.data_version_ = DATA_VERSION_4_6_3_0;
+  ASSERT_GT(current_data_version, medium.data_version_);
+  {
+    omt::ObTenantConfigGuard config(TENANT_CONF(MTL_ID()));
+    ASSERT_TRUE(config.is_valid());
+    medium.encoding_granularity_ = config->ob_encoding_granularity == 1024 ? 8192 : 1024;
+    ASSERT_NE(config->ob_encoding_granularity, medium.encoding_granularity_);
+  }
+  ASSERT_NO_FATAL_FAILURE(register_medium(medium));
+  for (const ObMergeType type : {MAJOR_MERGE, MEDIUM_MERGE}) {
+    for (int attempt = 0; attempt < 2; ++attempt) {
+      int64_t current_schema = 0;
+      ASSERT_NO_FATAL_FAILURE(advance_storage_schema(current_schema));
+      ASSERT_GT(current_schema, medium.storage_schema_.get_schema_version());
+      ObTabletMergeDagParam param;
+      ASSERT_NO_FATAL_FAILURE(fill_param(type, param));
+      ObArenaAllocator allocator("SnapshotParam", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+      AsyncIndexSnapshotMergeCtx ctx(param, allocator);
+      bool finish = false;
+      ASSERT_EQ(OB_SUCCESS, ctx.build_ctx(finish));
+      ASSERT_FALSE(finish);
+      ASSERT_NE(&medium.storage_schema_, ctx.get_schema());
+      ASSERT_EQ(medium.storage_schema_.get_schema_version(), ctx.get_schema()->get_schema_version());
+      ASSERT_EQ(medium.data_version_, ctx.static_param_.data_version_);
+      ASSERT_EQ(medium.encoding_granularity_, ctx.static_param_.encoding_granularity_);
+      ASSERT_EQ(ObAdaptiveMergePolicy::USER_REQUEST, ctx.static_param_.merge_reason_);
+      ObDataStoreDesc desc;
+      ASSERT_EQ(OB_SUCCESS, ObDataDescHelper::build(ctx.static_param_, ctx.get_merge_info(), desc));
+      ASSERT_EQ(medium.storage_schema_.get_schema_version(), desc.get_schema_version());
+      ASSERT_EQ(medium.data_version_, desc.get_data_version_for_ss());
+      ASSERT_EQ(medium.encoding_granularity_, desc.static_desc_->encoding_granularity_);
+    }
+  }
+}
+
+TEST_F(ObAsyncIndexSnapshotTest, missing_and_invalid_medium_fail_before_write)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_NO_FATAL_FAILURE(prepare_inputs("t_snapshot_missing"));
+  for (const ObMergeType type : {MAJOR_MERGE, MEDIUM_MERGE}) {
+    ObTabletMergeDagParam param;
+    ASSERT_NO_FATAL_FAILURE(fill_param(type, param));
+    ObArenaAllocator allocator("MissingMedium", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+    AsyncIndexSnapshotMergeCtx ctx(param, allocator);
+    bool finish = false;
+    ASSERT_EQ(OB_ENTRY_NOT_EXIST, ctx.build_ctx(finish));
+    ASSERT_EQ(nullptr, ctx.get_schema());
+    ASSERT_FALSE(ctx.get_merge_info().get_index_builder()->is_inited());
+    ASSERT_EQ(nullptr, ctx.get_merge_info().get_index_builder()->get_object_cleaner());
+    ASSERT_FALSE(ctx.merged_table_handle_.is_valid());
+    ASSERT_NO_FATAL_FAILURE(assert_unpublished());
+  }
+  ObMediumCompactionInfo medium(allocator_);
+  ASSERT_NO_FATAL_FAILURE(build_medium(medium));
+  // Structurally valid MDS, but its predecessor does not match the input base.
+  // Keep the common validation rather than silently using the Tablet schema.
+  ++medium.last_medium_snapshot_;
+  ASSERT_TRUE(medium.is_valid());
+  ASSERT_TRUE(medium.from_cur_cluster());
+  ASSERT_NO_FATAL_FAILURE(register_medium(medium));
+  for (const ObMergeType type : {MAJOR_MERGE, MEDIUM_MERGE}) {
+    ObTabletMergeDagParam param;
+    ASSERT_NO_FATAL_FAILURE(fill_param(type, param));
+    ObArenaAllocator allocator("InvalidMedium", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+    AsyncIndexSnapshotMergeCtx ctx(param, allocator);
+    bool finish = false;
+    ASSERT_EQ(OB_ERR_UNEXPECTED, ctx.build_ctx(finish));
+    ASSERT_EQ(nullptr, ctx.get_schema());
+    ASSERT_FALSE(ctx.get_merge_info().get_index_builder()->is_inited());
+    ASSERT_EQ(nullptr, ctx.get_merge_info().get_index_builder()->get_object_cleaner());
+    ASSERT_FALSE(ctx.merged_table_handle_.is_valid());
+    ASSERT_NO_FATAL_FAILURE(assert_unpublished());
+  }
+}
+
+TEST_F(ObAsyncIndexSnapshotTest, unpublished_major_retry_logical_reuse)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_NO_FATAL_FAILURE(run_retry(true));
+}
+
+TEST_F(ObAsyncIndexSnapshotTest, unpublished_major_retry_row_rewrite)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_NO_FATAL_FAILURE(run_retry(false));
+}
+
+TEST_F(ObAsyncIndexSnapshotTest, unpublished_major_retry_after_old_deletion_removed)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_NO_FATAL_FAILURE(prepare_inputs("t_retry_old_deletion", true, false, true));
+  DEFER(enable_async_index_flags());
+  ObTabletHandle input;
+  ASSERT_EQ(OB_SUCCESS, ls_.get_ls()->get_tablet(tablet_id_, input));
+  ObSEArray<InvIdxRowSnapshot, 64> input_rows;
+  ObSEArray<InvIdxRowSnapshot, 64> expected_rows;
+  ASSERT_EQ(OB_SUCCESS, collect_inv_rows_from_async_index_merge_inputs(
+      *ls_.get_ls(), *input.get_obj(), snapshot_, allocator_, input_rows));
+  ASSERT_EQ(96, input_rows.count());
+  for (const InvIdxRowSnapshot &row : input_rows) {
+    ASSERT_NE(4, row.doc_id_); // A gap inside the baseline macro's [1, 63].
+    if (100 != row.doc_id_) {
+      ASSERT_EQ(OB_SUCCESS, expected_rows.push_back(row));
+    }
+  }
+  ASSERT_EQ(95, expected_rows.count());
+  ObMediumCompactionInfo medium(allocator_);
+  ASSERT_NO_FATAL_FAILURE(build_medium(medium));
+  ASSERT_NO_FATAL_FAILURE(register_medium(medium));
+  ObTabletMergeDagParam param;
+  ASSERT_NO_FATAL_FAILURE(fill_param(MEDIUM_MERGE, param, EXEC_MODE_LOCAL_WITH_SHARED_BLOCK));
+  const uint64_t doc_ids[] = {4, 100};
+  const int64_t row_snapshots[] = {base_ - 1, base_ + 1};
+  MacroBlockId first_id;
+  ObString first_bytes;
+  ObSEArray<ObITable::TableKey, 4> input_keys;
+  ObSEArray<int64_t, 4> input_checksums;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    SCOPED_TRACE(attempt);
+    const int64_t deletion_snapshot = snapshot_ + (attempt + 1) * DEFAULT_INC_MAJOR_STEP;
+    ASSERT_EQ(OB_SUCCESS, wait_ls_weak_read_ts(*ls_.get_ls(), deletion_snapshot));
+    int64_t actual_mvs = 0;
+    // Controlled GC aftermath: install a newer deletion Major without the old
+    // redundant row. This does not simulate cross-node GC/LINK safety.
+    ASSERT_EQ(OB_SUCCESS, add_non_empty_delete_index_major_via_merge_ctx(
+        ls_, tablets_.delete_index_tablet_id_, deletion_snapshot, base_,
+        doc_ids + attempt, ARRAYSIZEOF(doc_ids) - attempt, allocator_, actual_mvs,
+        0, row_snapshots + attempt));
+    ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+        ls_, tablets_.delete_index_tablet_id_, deletion_snapshot));
+    if (attempt > 0) {
+      ASSERT_EQ(OB_SUCCESS, OB_DELETION_BITMAP_CACHE.erase(ObDeletionBitmapCacheKey(
+          MTL_ID(), tablets_.delete_index_tablet_id_, snapshot_)));
+      ASSERT_EQ(OB_SUCCESS, OB_DELETION_BITMAP_CACHE.erase(ObDeletionBitmapCacheKey(
+          MTL_ID(), tablets_.delete_index_tablet_id_, snapshot_, base_)));
+    }
+    ObDeletionBitmapHandle query;
+    ASSERT_EQ(OB_SUCCESS, ObDeletionBitmapProvider::get_or_build_bitmap(
+        tablets_.ls_id_, tablets_.delete_index_tablet_id_, tablets_.delete_index_table_id_,
+        snapshot_, allocator_, query, 0 /*base_snapshot*/));
+    ASSERT_EQ(2 - attempt, query.get_deletion_count());
+    ASSERT_EQ(0 == attempt, query.contains_any_in_range(1, 63));
+    ASSERT_TRUE(query.contains(100));
+
+    ObArenaAllocator allocator("BitmapRetry", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+    AsyncIndexSnapshotMergeCtx ctx(param, allocator);
+    bool finish = false;
+    ASSERT_EQ(OB_SUCCESS, ctx.build_ctx(finish));
+    ASSERT_FALSE(finish);
+    ASSERT_EQ(OB_SUCCESS, ctx.check_merge_ctx_valid());
+    ASSERT_EQ(base_, ctx.get_read_base_version());
+    ASSERT_EQ(snapshot_, ctx.get_snapshot());
+    ASSERT_EQ(medium.storage_schema_.get_schema_version(), ctx.get_schema()->get_schema_version());
+    ASSERT_EQ(1, ctx.get_concurrent_cnt());
+    ASSERT_FALSE(ctx.deletion_bitmap_handle_.cache_handle_.is_valid()); // cold scan
+    ASSERT_EQ(1, ctx.deletion_bitmap_handle_.get_deletion_count());
+    ASSERT_FALSE(ctx.deletion_bitmap_handle_.contains_any_in_range(1, 63));
+    ASSERT_TRUE(ctx.deletion_bitmap_handle_.contains(100));
+    for (int64_t i = 0; i < ctx.get_tables_handle().get_count(); ++i) {
+      const ObSSTable *table = static_cast<const ObSSTable *>(ctx.get_tables_handle().get_table(i));
+      if (0 == attempt) {
+        ASSERT_EQ(OB_SUCCESS, input_keys.push_back(table->get_key()));
+        ASSERT_EQ(OB_SUCCESS, input_checksums.push_back(table->get_data_checksum()));
+      } else {
+        ASSERT_EQ(input_keys.count(), ctx.get_tables_handle().get_count());
+        ASSERT_TRUE(input_keys.at(i) == table->get_key());
+        ASSERT_EQ(input_checksums.at(i), table->get_data_checksum());
+      }
+    }
+    ObLocalArena arena("BitmapRetry");
+    arena.bind_mem_ctx(ctx.mem_ctx_);
+    ObPartitionInvSSTableMerger merger(arena, ctx.static_param_);
+    ASSERT_EQ(OB_SUCCESS, merger.merge_partition(ctx, 0));
+    ASSERT_EQ(1, merger.macro_reuse_stats_.reuse_count_);
+    ASSERT_EQ(95, ctx.get_merge_info().get_merge_history().block_info_.total_row_count_);
+    ObInvIdxMacroBlockWriter *writer = merger.get_macro_writer();
+    ASSERT_NE(nullptr, writer);
+    ASSERT_NE(nullptr, writer->index_block_builder_.index_tree_root_ctx_);
+    ObMacroBlocksWriteCtx *write_ctx = writer->index_block_builder_.index_tree_root_ctx_->data_write_ctx_;
+    ASSERT_NE(nullptr, write_ctx);
+    ASSERT_EQ(2, write_ctx->get_macro_block_count()); // one reused, one newly written
+    const MacroBlockId id = write_ctx->get_macro_block_list().at(1);
+    ASSERT_EQ(ObStorageObjectType::SHARED_MAJOR_DATA_MACRO, id.storage_object_type());
+    const int64_t size = upper_align(writer->macro_block_.get_data_size(), DIO_ALIGN_SIZE);
+    const ObString bytes(static_cast<int32_t>(size), writer->macro_block_.get_data_buf());
+    ASSERT_FALSE(ctx.merged_table_handle_.is_valid());
+    ASSERT_NO_FATAL_FAILURE(assert_unpublished());
+    if (0 == attempt) {
+      first_id = id;
+      ASSERT_EQ(OB_SUCCESS, deep_copy_inv_row_string(allocator_, bytes, first_bytes));
+      // Destroy the first context after real object writes, before publication.
+    } else {
+      ASSERT_TRUE(first_id == id);
+      ASSERT_EQ(first_bytes.length(), bytes.length());
+      ASSERT_EQ(0, MEMCMP(first_bytes.ptr(), bytes.ptr(), bytes.length()));
+    }
+    ASSERT_NO_FATAL_FAILURE(assert_remote_bytes(id, first_bytes));
+    if (attempt > 0) {
+      ASSERT_EQ(OB_SUCCESS, ctx.update_tablet_after_merge());
+      ASSERT_NO_FATAL_FAILURE(verify_merged_inv_rows_match_snapshot(
+          tablets_.ls_id_, tablet_id_, snapshot_, expected_rows));
+    }
+    fprintf(stdout, "BITMAP_RETRY_FIXED attempt=%d query_bitmap=%ld merge_bitmap=%ld "
+        "macro_reuse=%ld bytes=%ld checksum=%lu published=%d\n", attempt,
+        query.get_deletion_count(), ctx.deletion_bitmap_handle_.get_deletion_count(),
+        merger.macro_reuse_stats_.reuse_count_, size, ob_crc64(bytes.ptr(), bytes.length()), attempt > 0);
+    fflush(stdout);
+  }
+}
+
+// Rebuild the production SS DAG after data/index writes but before publication.
+// Deterministic ranges must survive resource changes.
+void ObAsyncIndexSnapshotTest::run_parallel_retry(
+    const char *name, const bool single_term)
+{
+  ASSERT_NO_FATAL_FAILURE(prepare_inputs(name, single_term, true));
+  ObTabletHandle input_tablet;
+  ASSERT_EQ(OB_SUCCESS, ls_.get_ls()->get_tablet(tablet_id_, input_tablet));
+  ObSEArray<InvIdxRowSnapshot, 64> expected_rows;
+  ASSERT_EQ(OB_SUCCESS, collect_inv_rows_from_async_index_merge_inputs(
+      *ls_.get_ls(), *input_tablet.get_obj(), snapshot_, allocator_, expected_rows));
+  ASSERT_EQ(3072, expected_rows.count());
+  ObMediumCompactionInfo generated(allocator_);
+  ObMediumCompactionInfo medium(allocator_);
+  ASSERT_NO_FATAL_FAILURE(build_medium(generated));
+  ASSERT_FALSE(generated.contain_parallel_range_);
+  ASSERT_EQ(0, generated.parallel_merge_info_.get_size());
+  ASSERT_NO_FATAL_FAILURE(roundtrip_medium(generated, medium));
+  ASSERT_NO_FATAL_FAILURE(register_medium(medium));
+  const int64_t expected_concurrent = 16;
+  ObTabletMergeDagParam param;
+  ASSERT_NO_FATAL_FAILURE(fill_param(MEDIUM_MERGE, param, EXEC_MODE_OUTPUT));
+  ObTenantDagScheduler *scheduler = MTL(ObTenantDagScheduler *);
+  ASSERT_NE(nullptr, scheduler);
+  const bool old_adaptive = MTL(ObTenantTabletScheduler *)->tenant_status_.enable_adaptive_merge_schedule_;
+  ASSERT_EQ(OB_SUCCESS, sys_exe_sql(
+      "alter system set _enable_adaptive_merge_schedule = true tenant tt1"));
+  DEFER(EXPECT_EQ(OB_SUCCESS, sys_exe_sql(old_adaptive
+      ? "alter system set _enable_adaptive_merge_schedule = true tenant tt1"
+      : "alter system set _enable_adaptive_merge_schedule = false tenant tt1")));
+  ATOMIC_STORE(&MTL(ObTenantTabletScheduler *)->tenant_status_.enable_adaptive_merge_schedule_, true);
+  DEFER(ATOMIC_STORE(&MTL(ObTenantTabletScheduler *)->tenant_status_.enable_adaptive_merge_schedule_, old_adaptive));
+  ObSEArray<MacroBlockId, 16> first_ids;
+  ObSEArray<ObString, 16> first_bytes;
+  ObSEArray<ObDatumRange, 16> first_ranges;
+  SCN first_control_scn;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    ObAsyncIndexMajorMergeDag dag;
+    ASSERT_EQ(OB_SUCCESS, dag.init_by_param(&param));
+    bool finish = false;
+    int prepare_ret = OB_SUCCESS;
+    int64_t planning_memory_remain = 0;
+    int64_t worker_limit = 0;
+    {
+      int64_t old_workers = 0;
+      ASSERT_EQ(OB_SUCCESS, scheduler->get_limit(dag.get_priority(), old_workers));
+      ASSERT_EQ(OB_SUCCESS, scheduler->set_thread_score(dag.get_priority(), attempt == 0 ? 8 : attempt == 1 ? 1 : 32));
+      DEFER(EXPECT_EQ(OB_SUCCESS, scheduler->set_thread_score(dag.get_priority(), old_workers)));
+      ASSERT_EQ(OB_SUCCESS, scheduler->get_limit(dag.get_priority(), worker_limit));
+      const int64_t old_limit = lib::get_tenant_memory_limit(MTL_ID());
+      const int64_t memory_budget = attempt < 2 ? 1024L * 1024 * 1024 : 128L * 1024 * 1024;
+      lib::set_tenant_memory_limit(MTL_ID(), lib::get_tenant_memory_hold(MTL_ID())
+          - lib::get_tenant_cache_hold(MTL_ID()) + memory_budget);
+      DEFER(lib::set_tenant_memory_limit(MTL_ID(), old_limit));
+      planning_memory_remain = lib::get_tenant_memory_remain(MTL_ID());
+      prepare_ret = dag.prepare_merge_ctx(finish);
+    }
+    ASSERT_EQ(OB_SUCCESS, prepare_ret);
+    ASSERT_FALSE(finish);
+    ObSSAsyncIndexMergeCtx *ctx = static_cast<ObSSAsyncIndexMergeCtx *>(dag.get_ctx());
+    ASSERT_NE(nullptr, ctx);
+    ASSERT_EQ(expected_concurrent, ctx->get_concurrent_cnt());
+    ASSERT_EQ(medium.storage_schema_.get_schema_version(), ctx->get_schema()->get_schema_version());
+    ASSERT_EQ(medium.data_version_, ctx->static_param_.data_version_);
+    ASSERT_EQ(medium.encoding_granularity_, ctx->static_param_.encoding_granularity_);
+    ASSERT_TRUE(ctx->deletion_bitmap_handle_.is_empty());
+    ASSERT_TRUE(ctx->sstable_protocol_.is_status_start());
+    ASSERT_EQ(expected_concurrent + 1, ctx->sstable_protocol_.object_info_.parallel_cnt_);
+    if (0 == attempt) {
+      first_control_scn = ctx->sstable_protocol_.control_scn_;
+    } else {
+      ASSERT_TRUE(first_control_scn == ctx->sstable_protocol_.control_scn_);
+    }
+    // Check physical FTS boundaries and compare every retry with the first
+    // attempt, including a different task completion order.
+    for (int64_t i = 0; i < expected_concurrent; ++i) {
+      // Reverse completion order on a retry to exercise index-root sorting too.
+      const int64_t task = attempt == 1 ? expected_concurrent - i - 1 : i;
+      SCOPED_TRACE(::testing::Message() << "attempt=" << attempt << " task=" << task);
+      ObDatumRange range;
+      ASSERT_EQ(OB_SUCCESS, ctx->get_merge_range(task, range));
+      int cmp = 0;
+      const ObStorageDatumUtils &utils = ctx->get_tablet()->get_rowkey_read_info().get_datum_utils();
+      if (0 == attempt) {
+        ObDatumRange copy;
+        ASSERT_EQ(OB_SUCCESS, copy.partial_copy(range, allocator_));
+        ASSERT_EQ(OB_SUCCESS, first_ranges.push_back(copy));
+      } else {
+        ASSERT_EQ(OB_SUCCESS, first_ranges.at(task).get_start_key().compare(range.get_start_key(), utils, cmp));
+        ASSERT_EQ(0, cmp);
+        ASSERT_EQ(OB_SUCCESS, first_ranges.at(task).get_end_key().compare(range.get_end_key(), utils, cmp));
+        ASSERT_EQ(0, cmp);
+        ASSERT_EQ(first_ranges.at(task).get_border_flag().get_data(), range.get_border_flag().get_data());
+      }
+      ObLocalArena arena("ParallelRetry");
+      arena.bind_mem_ctx(ctx->mem_ctx_);
+      ObPartitionInvSSTableMerger merger(arena, ctx->static_param_);
+      ASSERT_EQ(OB_SUCCESS, merger.merge_partition(*ctx, task));
+      ASSERT_EQ(0, merger.macro_reuse_stats_.reuse_count_);
+      if (single_term) {
+        ASSERT_EQ(0, merger.logical_reuse_stats_.reuse_count_);
+      }
+      ObInvIdxMacroBlockWriter *writer = merger.get_macro_writer();
+      ASSERT_NE(nullptr, writer);
+      ASSERT_NE(nullptr, writer->index_block_builder_.index_tree_root_ctx_);
+      ObMacroBlocksWriteCtx *write_ctx = writer->index_block_builder_.index_tree_root_ctx_->data_write_ctx_;
+      ASSERT_NE(nullptr, write_ctx);
+      ASSERT_EQ(1, write_ctx->get_macro_block_count());
+      const MacroBlockId id = write_ctx->get_macro_block_list().at(0);
+      ASSERT_EQ(ObStorageObjectType::SHARED_MAJOR_DATA_MACRO, id.storage_object_type());
+      const int64_t size = upper_align(writer->macro_block_.get_data_size(), DIO_ALIGN_SIZE);
+      const ObString bytes(static_cast<int32_t>(size), writer->macro_block_.get_data_buf());
+      if (0 == attempt) {
+        ObString copy;
+        ASSERT_EQ(OB_SUCCESS, deep_copy_inv_row_string(allocator_, bytes, copy));
+        ASSERT_EQ(OB_SUCCESS, first_ids.push_back(id));
+        ASSERT_EQ(OB_SUCCESS, first_bytes.push_back(copy));
+      } else {
+        ASSERT_TRUE(first_ids.at(task) == id);
+        ASSERT_EQ(first_bytes.at(task).length(), bytes.length());
+        ASSERT_EQ(0, MEMCMP(first_bytes.at(task).ptr(), bytes.ptr(), bytes.length()));
+      }
+      ASSERT_NO_FATAL_FAILURE(assert_remote_bytes(id, first_bytes.at(task)));
+    }
+    const ObSSTable *sstable = nullptr;
+    if (attempt < 2) {
+      ASSERT_EQ(OB_SUCCESS, ctx->create_sstable(sstable));
+      ASSERT_NE(nullptr, sstable);
+      ASSERT_EQ(3072, sstable->get_row_count());
+      ASSERT_NO_FATAL_FAILURE(assert_unpublished());
+    } else {
+      ASSERT_EQ(OB_SUCCESS, ctx->update_tablet_after_merge());
+      ASSERT_EQ(OB_SUCCESS, ctx->merged_table_handle_.get_sstable(sstable));
+      ASSERT_NE(nullptr, sstable);
+      ASSERT_EQ(3072, sstable->get_row_count());
+      ObTabletHandle published;
+      ObTabletHandle shared;
+      ASSERT_EQ(OB_SUCCESS, ls_.get_ls()->get_tablet(tablet_id_, published));
+      ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->get_tablet(
+          tablets_.ls_id_, tablet_id_, published.get_obj()->get_reorganization_scn(), allocator_, shared));
+      ASSERT_EQ(snapshot_, shared.get_obj()->get_last_major_snapshot_version());
+      ASSERT_EQ(snapshot_, published.get_obj()->get_last_major_snapshot_version());
+      ASSERT_NO_FATAL_FAILURE(verify_merged_inv_rows_match_snapshot(
+          tablets_.ls_id_, tablet_id_, snapshot_, expected_rows));
+    }
+    fprintf(stdout, "PARALLEL_RETRY_FIXED attempt=%d workers=%ld "
+        "memory_remain=%ld tasks=%ld identical_objects=%ld rows=%ld published=%d\n",
+        attempt, worker_limit, planning_memory_remain,
+        expected_concurrent, first_ids.count(),
+        sstable->get_row_count(), attempt == 2);
+    fflush(stdout);
+  }
+}
+
+TEST_F(ObAsyncIndexSnapshotTest, unpublished_major_retry_parallel_range_drift)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_NO_FATAL_FAILURE(run_parallel_retry("t_parallel_retry_fixed"));
+}
+
+TEST_F(ObAsyncIndexSnapshotTest, unpublished_major_parallel_retry_row_rewrite)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(run_ctx_.tenant_id_));
+  // One term spans every partition; interleaved doc IDs force row rewriting.
+  ASSERT_NO_FATAL_FAILURE(run_parallel_retry("t_parallel_retry_rows", true));
+}
+
+TEST_F(ObAsyncIndexSnapshotTest, major_retry_recreates_abandoned_protocol)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_NO_FATAL_FAILURE(prepare_inputs("t_retry_abandoned", false, true));
+  ObMediumCompactionInfo medium(allocator_);
+  ASSERT_NO_FATAL_FAILURE(build_medium(medium));
+  medium.clear_parallel_range();
+  ASSERT_NO_FATAL_FAILURE(register_medium(medium));
+  ObTabletHandle tablet;
+  ASSERT_EQ(OB_SUCCESS, ls_.get_ls()->get_tablet(tablet_id_, tablet));
+  ObSSTableAtomicProtocol abandoned;
+  ASSERT_EQ(OB_SUCCESS, SSCompactHelper::start_major_task(
+      tablets_.ls_id_, tablet_id_, tablet.get_obj()->get_reorganization_scn(),
+      snapshot_, 17 /*16 data tasks and one index task*/, 0 /*cg_count*/, abandoned));
+  ASSERT_TRUE(abandoned.is_status_start());
+  const SCN original_control_scn = abandoned.control_scn_;
+  ASSERT_EQ(OB_SUCCESS, abandoned.abort());
+  ASSERT_TRUE(abandoned.is_status_abandon());
+
+  ObAtomicProtocolType type;
+  type.type_ = ObAtomicProtocolTypeEnum::MAJOR_SSTABLE;
+  ObSSTableAtomicProtocol normal_lookup;
+  bool need_create = false;
+  ASSERT_EQ(OB_SUCCESS, normal_lookup.init_for_load(type, MTL_ID(), tablets_.ls_id_,
+      tablet_id_, tablet.get_obj()->get_reorganization_scn()));
+  ASSERT_EQ(OB_SUCCESS, normal_lookup.load_if_exist(snapshot_, need_create));
+  ASSERT_TRUE(need_create); // Normal create callers must still skip ABANDON.
+  ObTabletMergeDagParam param;
+  ASSERT_NO_FATAL_FAILURE(fill_param(MEDIUM_MERGE, param, EXEC_MODE_OUTPUT));
+  ObAsyncIndexMajorMergeDag dag;
+  ASSERT_EQ(OB_SUCCESS, dag.init_by_param(&param));
+  bool finish = false;
+  ASSERT_EQ(OB_SUCCESS, dag.prepare_merge_ctx(finish));
+  ASSERT_FALSE(finish);
+  ObSSAsyncIndexMergeCtx *ctx = static_cast<ObSSAsyncIndexMergeCtx *>(dag.get_ctx());
+  ASSERT_NE(nullptr, ctx);
+  ASSERT_EQ(16, ctx->get_concurrent_cnt());
+  ASSERT_TRUE(ctx->sstable_protocol_.is_status_start());
+  ASSERT_EQ(17, ctx->sstable_protocol_.object_info_.parallel_cnt_);
+  ASSERT_TRUE(original_control_scn < ctx->sstable_protocol_.control_scn_);
+  // A new START with the same plan may coexist with the old ABANDON row.
+  ObSSTableAtomicProtocol retry_lookup;
+  ASSERT_EQ(OB_SUCCESS, retry_lookup.init_for_load(type, MTL_ID(), tablets_.ls_id_,
+      tablet_id_, tablet.get_obj()->get_reorganization_scn()));
+  ASSERT_EQ(OB_SUCCESS, retry_lookup.load_if_exist(snapshot_, need_create));
+  ASSERT_FALSE(need_create);
+  ASSERT_TRUE(retry_lookup.is_status_start());
+  ASSERT_EQ(17, retry_lookup.object_info_.parallel_cnt_);
+  ASSERT_NO_FATAL_FAILURE(assert_unpublished());
+}
+
+TEST_F(ObAsyncIndexSnapshotTest, completed_major_protocol_recovers_publication)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_NO_FATAL_FAILURE(prepare_inputs("t_retry_complete_unpublished", false, true));
+  ObMediumCompactionInfo medium(allocator_);
+  ASSERT_NO_FATAL_FAILURE(build_medium(medium));
+  ASSERT_NO_FATAL_FAILURE(register_medium(medium));
+  ObTabletHandle tablet;
+  ASSERT_EQ(OB_SUCCESS, ls_.get_ls()->get_tablet(tablet_id_, tablet));
+  ObSEArray<InvIdxRowSnapshot, 64> expected_rows;
+  ASSERT_EQ(OB_SUCCESS, collect_inv_rows_from_async_index_merge_inputs(
+      *ls_.get_ls(), *tablet.get_obj(), snapshot_, allocator_, expected_rows));
+  ASSERT_EQ(3072, expected_rows.count());
+  ObTabletMergeDagParam param;
+  ASSERT_NO_FATAL_FAILURE(fill_param(MEDIUM_MERGE, param, EXEC_MODE_OUTPUT));
+  ObSEArray<MacroBlockId, 16> first_ids;
+  ObSEArray<ObString, 16> first_bytes;
+  SCN first_control_scn;
+  for (int attempt = 0; attempt < 2; ++attempt) {
+    ObAsyncIndexMajorMergeDag dag;
+    ASSERT_EQ(OB_SUCCESS, dag.init_by_param(&param));
+    bool finish = false;
+    ASSERT_EQ(OB_SUCCESS, dag.prepare_merge_ctx(finish));
+    ASSERT_FALSE(finish);
+    ObSSAsyncIndexMergeCtx *ctx = static_cast<ObSSAsyncIndexMergeCtx *>(dag.get_ctx());
+    ASSERT_NE(nullptr, ctx);
+    ASSERT_EQ(16, ctx->get_concurrent_cnt());
+    if (0 == attempt) {
+      ASSERT_TRUE(ctx->sstable_protocol_.is_status_start());
+      first_control_scn = ctx->sstable_protocol_.control_scn_;
+    } else {
+      ASSERT_TRUE(ctx->sstable_protocol_.is_status_complete());
+      ASSERT_TRUE(first_control_scn == ctx->sstable_protocol_.control_scn_);
+    }
+    for (int64_t task = 0; task < ctx->get_concurrent_cnt(); ++task) {
+      SCOPED_TRACE(::testing::Message() << "attempt=" << attempt << " task=" << task);
+      ObLocalArena arena("CompletedRetry");
+      arena.bind_mem_ctx(ctx->mem_ctx_);
+      ObPartitionInvSSTableMerger merger(arena, ctx->static_param_);
+      ASSERT_EQ(OB_SUCCESS, merger.merge_partition(*ctx, task));
+      ObInvIdxMacroBlockWriter *writer = merger.get_macro_writer();
+      ASSERT_NE(nullptr, writer);
+      ASSERT_NE(nullptr, writer->index_block_builder_.index_tree_root_ctx_);
+      ObMacroBlocksWriteCtx *written = writer->index_block_builder_.index_tree_root_ctx_->data_write_ctx_;
+      ASSERT_NE(nullptr, written);
+      ASSERT_EQ(1, written->get_macro_block_count());
+      const MacroBlockId id = written->get_macro_block_list().at(0);
+      const int64_t size = upper_align(writer->macro_block_.get_data_size(), DIO_ALIGN_SIZE);
+      const ObString bytes(static_cast<int32_t>(size), writer->macro_block_.get_data_buf());
+      if (0 == attempt) {
+        ObString copy;
+        ASSERT_EQ(OB_SUCCESS, deep_copy_inv_row_string(allocator_, bytes, copy));
+        ASSERT_EQ(OB_SUCCESS, first_ids.push_back(id));
+        ASSERT_EQ(OB_SUCCESS, first_bytes.push_back(copy));
+      } else {
+        ASSERT_TRUE(first_ids.at(task) == id);
+        ASSERT_EQ(first_bytes.at(task).length(), bytes.length());
+        ASSERT_EQ(0, MEMCMP(first_bytes.at(task).ptr(), bytes.ptr(), bytes.length()));
+      }
+      ASSERT_NO_FATAL_FAILURE(assert_remote_bytes(id, first_bytes.at(task)));
+    }
+    if (0 == attempt) {
+      const ObSSTable *sstable = nullptr;
+      ASSERT_EQ(OB_SUCCESS, ctx->pre_warm_writer_.complete());
+      ASSERT_EQ(OB_SUCCESS, ctx->create_sstable(sstable));
+      ASSERT_NE(nullptr, sstable);
+      ASSERT_EQ(expected_rows.count(), sstable->get_row_count());
+      ASSERT_EQ(OB_SUCCESS, SSCompactHelper::finish_major_task(
+          tablets_.ls_id_, tablet_id_, ctx->get_tablet()->get_reorganization_scn(),
+          snapshot_, ctx->sstable_protocol_));
+      ASSERT_TRUE(ctx->sstable_protocol_.is_status_complete());
+      // Stop in the real failure window: all objects and the COMPLETE protocol
+      // exist, but the shared TableStore has not published this SSTable.
+      ObTabletHandle shared;
+      ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->get_tablet(
+          tablets_.ls_id_, tablet_id_, ctx->get_tablet()->get_reorganization_scn(), allocator_, shared));
+      ASSERT_LT(shared.get_obj()->get_last_major_snapshot_version(), snapshot_);
+      ASSERT_NO_FATAL_FAILURE(assert_unpublished());
+    } else {
+      ASSERT_EQ(OB_SUCCESS, ctx->update_tablet_after_merge());
+      ObTabletHandle published;
+      ObTabletHandle shared;
+      ASSERT_EQ(OB_SUCCESS, ls_.get_ls()->get_tablet(tablet_id_, published));
+      ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->get_tablet(
+          tablets_.ls_id_, tablet_id_, published.get_obj()->get_reorganization_scn(), allocator_, shared));
+      ASSERT_EQ(snapshot_, shared.get_obj()->get_last_major_snapshot_version());
+      ASSERT_EQ(snapshot_, published.get_obj()->get_last_major_snapshot_version());
+      ASSERT_NO_FATAL_FAILURE(verify_merged_inv_rows_match_snapshot(
+          tablets_.ls_id_, tablet_id_, snapshot_, expected_rows));
+    }
+  }
+}
+
+TEST_F(ObAsyncIndexSnapshotTest, deterministic_ranges_keep_small_baselines_serial)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_NO_FATAL_FAILURE(prepare_inputs("t_fixed_serial_major"));
+  ObMediumCompactionInfo medium(allocator_);
+  ASSERT_NO_FATAL_FAILURE(build_medium(medium));
+  ASSERT_FALSE(medium.contain_parallel_range_);
+  ASSERT_NO_FATAL_FAILURE(register_medium(medium));
+  ObTabletMergeDagParam param;
+  ASSERT_NO_FATAL_FAILURE(fill_param(MEDIUM_MERGE, param));
+  ObAsyncIndexMajorMergeDag dag;
+  ASSERT_EQ(OB_SUCCESS, dag.init_by_param(&param));
+  bool finish = false;
+  ASSERT_EQ(OB_SUCCESS, dag.prepare_merge_ctx(finish));
+  ASSERT_FALSE(finish);
+  ASSERT_NE(nullptr, dag.get_ctx());
+  ASSERT_EQ(1, dag.get_ctx()->get_concurrent_cnt());
+  ObDatumRange range;
+  ASSERT_EQ(OB_SUCCESS, dag.get_ctx()->get_merge_range(0, range));
+  ASSERT_TRUE(range.get_start_key().is_min_rowkey());
+  ASSERT_TRUE(range.get_end_key().is_max_rowkey());
+}
+
 TEST_F(ObAsyncIndexCompactionTest, async_index_inc_major_merge_build_ctx)
 {
   share::ObTenantSwitchGuard tguard;
@@ -6382,6 +7546,10 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_inc_major_merge_build_ctx)
   ASSERT_NE(nullptr, merge_ctx);
   ASSERT_EQ(INC_MAJOR_MERGE, merge_ctx->get_merge_type());
   ASSERT_TRUE(merge_ctx->is_inv_index_merge());
+  uint64_t current_data_version = 0;
+  ASSERT_EQ(OB_SUCCESS, GET_MIN_DATA_VERSION(MTL_ID(), current_data_version));
+  ASSERT_EQ(current_data_version, merge_ctx->static_param_.data_version_);
+  ASSERT_EQ(current_data_version, merge_ctx->static_desc_.data_version_for_ss_);
   // Refresh may replace the current Tablet, but selection must use the retained one.
   const ObTablet *input_tablet = merge_ctx->get_tablet();
   fts_handle.reset();

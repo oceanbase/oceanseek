@@ -24,6 +24,7 @@ ObDeletionRowIter::ObDeletionRowIter()
       is_empty_(false),
       current_doc_id_(0),
       async_snapshot_(0),
+      base_snapshot_(0),
       trans_col_idx_(common::OB_INVALID_INDEX),
       inner_allocator_(lib::ObMemAttr(MTL_ID(), "DelRowIterA")),
       table_param_(inner_allocator_),
@@ -42,18 +43,22 @@ int ObDeletionRowIter::init(
     const common::ObTabletID &delete_log_tablet_id,
     const uint64_t table_id,
     const int64_t async_snapshot,
-    common::ObIAllocator &allocator)
+    common::ObIAllocator &allocator,
+    const int64_t base_snapshot)
 {
   int ret = OB_SUCCESS;
   if (IS_INIT) {
     ret = OB_INIT_TWICE;
     LOG_WARN("ObDeletionRowIter init twice", K(ret));
   } else if (OB_UNLIKELY(!ls_id.is_valid() || !delete_log_tablet_id.is_valid()
-      || OB_INVALID_ID == table_id || async_snapshot <= 0 || INT64_MAX == async_snapshot)) {
+      || OB_INVALID_ID == table_id || async_snapshot <= 0 || INT64_MAX == async_snapshot
+      || base_snapshot < 0 || base_snapshot > async_snapshot)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument", K(ret), K(ls_id), K(delete_log_tablet_id), K(table_id), K(async_snapshot));
+    LOG_WARN("invalid argument", K(ret), K(ls_id), K(delete_log_tablet_id), K(table_id),
+        K(async_snapshot), K(base_snapshot));
   } else {
     async_snapshot_ = async_snapshot;
+    base_snapshot_ = base_snapshot;
     if (OB_FAIL(build_scan_param(
         ls_id, delete_log_tablet_id, table_id, allocator))) {
       LOG_WARN("build scan param failed", K(ret), K(ls_id), K(delete_log_tablet_id));
@@ -88,6 +93,7 @@ void ObDeletionRowIter::reset()
   is_empty_ = false;
   current_doc_id_ = 0;
   async_snapshot_ = 0;
+  base_snapshot_ = 0;
   trans_col_idx_ = common::OB_INVALID_INDEX;
 }
 
@@ -124,7 +130,7 @@ int ObDeletionRowIter::next()
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("invalid deletion row scn", K(ret), K(stored_row_scn), K(row_scn),
               KPC(datum_row));
-        } else if (row_scn <= async_snapshot_) {
+        } else if (row_scn > base_snapshot_ && row_scn <= async_snapshot_) {
           current_doc_id_ = datum_row->storage_datums_[0].get_int();
           found_visible_row = true;
         }
