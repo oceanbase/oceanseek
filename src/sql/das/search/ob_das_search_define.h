@@ -298,6 +298,7 @@ struct ObDASBMMBuildOptions
   enum class FilterMode {
     ORDERED,
     DIRECT_DRAIN,
+    DIRECT_DRAIN_AFTER_ESSENTIAL,
   };
   ObDASBMMBuildOptions()
     : query_optional_(false),
