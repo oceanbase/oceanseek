@@ -614,12 +614,16 @@ int ObAsyncIndexDepProvider::get_async_index_refresh_info(
   } else if (OB_FAIL(ls->get_tablet(data_tablet_id, tablet_handle,
                                      0 /*timeout_us*/,
                                      ObMDSGetTabletMode::READ_WITHOUT_CHECK))) {
-    // tablet not on this LS / not yet created: treat as no refresh info (first round)
-    LOG_WARN("failed to get data tablet, treat as empty refresh info", K(ret), K(data_tablet_id));
-    ret = OB_SUCCESS;
+    // Preserve location and fatal errors; neither is a valid initial empty MDS.
+    LOG_WARN("failed to get data tablet for async index refresh", K(ret), K(data_tablet_id));
   } else if (OB_ISNULL(tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet is null", K(ret), K(data_tablet_id));
+  } else if (!tablet_handle.get_obj()->is_data_complete()) {
+    // Transfer/HA/fork may not have installed the source MDS yet. Such absence
+    // must not be mistaken for an initial empty record with false membership.
+    ret = OB_EAGAIN;
+    LOG_INFO("data tablet is incomplete for async index refresh", K(ret), K(data_tablet_id));
   } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_refresh_info(
                  SCN::max_scn(), info, timeout_us))) {
     if (OB_EMPTY_RESULT == ret) {

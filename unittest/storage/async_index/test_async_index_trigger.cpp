@@ -1814,8 +1814,83 @@ TEST_F(TestAsyncIndexTrigger, ddl_fixed_snapshot_reuses_progress_without_getting
   EXPECT_EQ(0, publish_op.gts_calls_); // The cached fixed target remains reusable.
 }
 
+// Provider failures must not be confused with an initially empty checkpoint
+// queue. These tests use a fake provider to cover the consumers of that error
+// contract, not real tablet acquisition or transaction rollback.
+TEST_F(TestAsyncIndexTrigger, refresh_read_failure_skips_timer_without_generating_work)
+{
+  for (const int error : {OB_EAGAIN, OB_TABLET_NOT_EXIST, OB_TIMEOUT, OB_ALLOCATE_MEMORY_FAILED}) {
+    SCOPED_TRACE(error);
+    FakeDepProvider provider;
+    provider.incr_total_ = 1;
+    provider.state_read_ret_ = error;
+    provider.seed_refresh_target(make_scn(1000));
+    add_index(provider, ObTabletID(200002), make_scn(1000));
+    ObAsyncIndexTrigger trigger;
+    ASSERT_EQ(OB_SUCCESS, trigger.init(1001, &provider));
+    ObAsyncIndexDataTableInfo info;
+    build_data_table_info(provider, info);
+    ObRefreshDecisionArray decisions;
+    EXPECT_EQ(OB_EAGAIN == error ? OB_SUCCESS : error,
+        trigger.check_and_generate_tasks(info, 0, nullptr, decisions));
+    EXPECT_TRUE(decisions.empty());
+    EXPECT_EQ(0, provider.set_refresh_info_count_);
+    ASSERT_EQ(1, provider.refresh_info_.get_refresh_snapshots().count());
+    EXPECT_TRUE(provider.refresh_info_.has_async_index());
+    EXPECT_EQ(1000, provider.refresh_info_.get_refresh_snapshots().at(0));
+    provider.state_read_ret_ = OB_SUCCESS;
+    ASSERT_EQ(OB_SUCCESS, trigger.check_and_generate_tasks(info, 0, nullptr, decisions));
+    ASSERT_EQ(1, decisions.count());
+    EXPECT_EQ(make_scn(2000), decisions.at(0).target_refresh_scn_);
+  }
+}
+
+TEST_F(TestAsyncIndexTrigger, refresh_read_failure_preserves_major_target_until_retry)
+{
+  for (const int error : {OB_EAGAIN, OB_TABLET_NOT_EXIST, OB_TIMEOUT, OB_ALLOCATE_MEMORY_FAILED}) {
+    SCOPED_TRACE(error);
+    FakeDepProvider provider;
+    provider.state_read_ret_ = error;
+    provider.seed_refresh_target(make_scn(1000));
+    provider.seed_refresh_target(make_scn(2000));
+    const SCN frozen_scn = make_scn(3000);
+    ObTabletAsyncIndexRefreshInfo output;
+    // A stale published watermark cannot turn a failed protected read into
+    // success, even on the Major early-completion path.
+    for (const SCN &floor : {make_scn(1000), frozen_scn}) {
+      EXPECT_EQ(error, maintain_async_index_refresh_info(1001, nullptr, 1,
+          ObTabletID(100001), frozen_scn, floor, &provider, output, 0,
+          true /*skip_incr_check*/, nullptr, false /*manual*/, true /*skip_if_published*/));
+      EXPECT_TRUE(output.get_refresh_snapshots().empty());
+      EXPECT_EQ(0, provider.set_refresh_info_count_);
+      ASSERT_EQ(2, provider.refresh_info_.get_refresh_snapshots().count());
+      EXPECT_EQ(1000, provider.refresh_info_.get_refresh_snapshots().at(0));
+      EXPECT_EQ(2000, provider.refresh_info_.get_refresh_snapshots().at(1));
+    }
+    provider.state_read_ret_ = OB_SUCCESS;
+    // No increment is needed to prepare the original frozen target.
+    ASSERT_EQ(OB_SUCCESS, maintain_async_index_refresh_info(1001, nullptr, 1,
+        ObTabletID(100001), frozen_scn, make_scn(1000), &provider, output, 0,
+        true, nullptr, false, true));
+    EXPECT_TRUE(output.has_async_index());
+    ASSERT_EQ(3, output.get_refresh_snapshots().count());
+    EXPECT_EQ(3000, output.get_refresh_snapshots().at(2));
+    EXPECT_EQ(1, provider.set_refresh_info_count_);
+  }
+}
+
 TEST_F(TestAsyncIndexTrigger, refresh_retry_policy_preserves_manual_and_ddl_boundaries)
 {
+  for (const auto type : {ASYNC_REFRESH_TYPE_MANUAL, ASYNC_REFRESH_TYPE_CREATE_INDEX,
+                          ASYNC_REFRESH_TYPE_OFFLINE_DDL}) {
+    EXPECT_TRUE(ObAsyncIndexRefreshUtil::is_refresh_retry_error(OB_EAGAIN, type));
+    EXPECT_TRUE(ObAsyncIndexRefreshUtil::is_refresh_retry_error(OB_TABLET_NOT_EXIST, type));
+    EXPECT_FALSE(ObAsyncIndexRefreshUtil::is_refresh_retry_error(OB_ALLOCATE_MEMORY_FAILED, type));
+    EXPECT_FALSE(ObAsyncIndexRefreshUtil::is_refresh_retry_error(OB_ERR_UNEXPECTED, type));
+    // A later recoverable error must never erase the first fatal error.
+    EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED,
+        record_refresh_error(OB_EAGAIN, type, OB_ALLOCATE_MEMORY_FAILED));
+  }
   EXPECT_FALSE(ObAsyncIndexRefreshUtil::is_refresh_retry_error(OB_TIMEOUT, ASYNC_REFRESH_TYPE_MANUAL));
   EXPECT_TRUE(ObAsyncIndexRefreshUtil::is_refresh_retry_error(
       OB_INVALID_QUERY_TIMESTAMP, ASYNC_REFRESH_TYPE_MANUAL));
