@@ -1159,7 +1159,6 @@ int ObSSFailGCExecutorTask::do_ctrl_row_failed_gc_(
       if (OB_FAIL(protocol_ctrl.init(key_info))) {
         LOG_WARN("fail to init atomic protocol ctrl", KR(ret), K(key_info));
       } else if (OB_TMP_FAIL(cancel_atomic_protocol_(protocol_ctrl))) {
-        ret = tmp_ret;
         LOG_WARN("fail to cancel atomic protocol", KR(tmp_ret), K(key_info),
             K_(ctx.gc_scn));
       } else {
