@@ -293,6 +293,7 @@ int ObInvIdxMacroBlockWriter::open(
     const common::ObIArray<share::schema::ObColDesc> &col_descs =
         data_store_desc.get_full_stored_col_descs();
     int64_t first_macro_seq = -1;
+    int64_t logic_macro_seq = -1;
     if (OB_FAIL(inv_idx_row_desc_.build_encoding_params(
         col_descs, posting_ctx_, posting_value_param_))) {
       STORAGE_LOG(WARN, "fail to build inverted index encoding params", K(ret), K(inv_idx_row_desc_));
@@ -320,7 +321,9 @@ int ObInvIdxMacroBlockWriter::open(
       STORAGE_LOG(WARN, "fail to init macro seq generator", K(ret));
     } else if (OB_FAIL(macro_seq_generator_->get_next(first_macro_seq))) {
       STORAGE_LOG(WARN, "fail to get first macro seq", K(ret));
-    } else if (OB_FAIL(macro_block_.init(data_store_desc, first_macro_seq, merge_block_info_, 0))) {
+    } else if (OB_FAIL(build_logic_macro_seq(first_macro_seq, logic_macro_seq))) {
+      STORAGE_LOG(WARN, "fail to build inverted index logical macro sequence", K(ret));
+    } else if (OB_FAIL(macro_block_.init(data_store_desc, logic_macro_seq, merge_block_info_, 0))) {
       STORAGE_LOG(WARN, "fail to init macro block", K(ret));
     } else if (OB_FAIL(index_block_builder_.init(data_store_desc, *sstable_index_builder,
         macro_seq_param, pre_warm_param, write_clustered_micro_idx, callback_, allocator_))) {
@@ -1260,6 +1263,7 @@ int ObInvIdxMacroBlockWriter::switch_to_next_macro_block()
 {
   int ret = OB_SUCCESS;
   int64_t next_macro_seq = -1;
+  int64_t logic_macro_seq = -1;
   if (OB_FAIL(wait_macro_block_io())) {
     STORAGE_LOG(WARN, "fail to wait inverted index macro block io before switch", K(ret),
         K_(macro_handle));
@@ -1267,10 +1271,11 @@ int ObInvIdxMacroBlockWriter::switch_to_next_macro_block()
     STORAGE_LOG(WARN, "fail to execute inverted index macro block callback", K(ret));
   } else if (OB_FAIL(macro_seq_generator_->get_next(next_macro_seq))) {
     STORAGE_LOG(WARN, "fail to get next inverted index macro sequence", K(ret));
+  } else if (OB_FAIL(build_logic_macro_seq(next_macro_seq, logic_macro_seq))) {
+    STORAGE_LOG(WARN, "fail to build inverted index logical macro sequence", K(ret));
   } else if (OB_FAIL(index_block_builder_.reuse_macro_scope())) {
     STORAGE_LOG(WARN, "fail to reuse inverted index builder macro scope", K(ret));
-  } else if (OB_FAIL(macro_block_.init(
-      *data_store_desc_, next_macro_seq, merge_block_info_, 0))) {
+  } else if (OB_FAIL(macro_block_.init(*data_store_desc_, logic_macro_seq, merge_block_info_, 0))) {
     STORAGE_LOG(WARN, "fail to initialize next inverted index macro block", K(ret),
         K(next_macro_seq));
   } else {
@@ -1594,11 +1599,38 @@ int ObInvIdxMacroBlockWriter::close()
   return ret;
 }
 
+int ObInvIdxMacroBlockWriter::build_logic_macro_seq(
+    const int64_t physical_macro_seq, int64_t &logic_macro_seq) const
+{
+  int ret = OB_SUCCESS;
+  logic_macro_seq = -1;
+  if (data_store_desc_->get_sstable_logic_seq() < 0) {
+    logic_macro_seq = physical_macro_seq;
+  } else if (OB_UNLIKELY(physical_macro_seq < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "invalid physical macro sequence", K(ret), K(physical_macro_seq));
+  } else if (OB_UNLIKELY(static_cast<uint64_t>(physical_macro_seq) >= ObMacroDataSeq::VERSION_LOCAL_SEQ_LIMIT)) {
+    ret = OB_SIZE_OVERFLOW;
+    STORAGE_LOG(WARN, "physical macro sequence overflows version local namespace", K(ret), K(physical_macro_seq));
+  } else {
+    // Keep physical allocation unchanged; only the logical data-block ID carries
+    // the SSTable generation, as in ObMacroBlockWriter::build_logic_macro_seq().
+    ObMacroDataSeq macro_data_seq(physical_macro_seq);
+    if (OB_FAIL(macro_data_seq.set_sstable_seq(data_store_desc_->get_sstable_logic_seq()))) {
+      STORAGE_LOG(WARN, "failed to set sstable logic seq", K(ret), K(data_store_desc_->get_sstable_logic_seq()));
+    } else {
+      macro_data_seq.set_data_block();
+      logic_macro_seq = macro_data_seq.macro_data_seq_;
+    }
+  }
+  return ret;
+}
+
 void ObInvIdxMacroBlockWriter::gen_logic_macro_id(ObLogicMacroBlockId &logic_macro_id)
 {
   logic_macro_id.logic_version_ = data_store_desc_->get_logical_version();
   logic_macro_id.column_group_idx_ = data_store_desc_->get_table_cg_idx();
-  logic_macro_id.data_seq_.macro_data_seq_ = macro_seq_generator_->get_current();
+  logic_macro_id.data_seq_.macro_data_seq_ = macro_block_.get_current_macro_seq();
   logic_macro_id.tablet_id_ = data_store_desc_->get_tablet_id().id();
   logic_macro_id.merge_type_ = (uint8_t)data_store_desc_->get_merge_type();
 }

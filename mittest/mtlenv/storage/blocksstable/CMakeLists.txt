@@ -31,3 +31,4 @@ target_sources(test_inv_idx_sstable_dumpsst PRIVATE
   ${PROJECT_SOURCE_DIR}/tools/ob_admin/ob_admin_common_utils.cpp)
 storage_dml_unittest(test_inv_sstable_merge_iter)
 storage_dml_unittest(test_inv_sstable_merge_reuse)
+storage_dml_unittest(test_inv_sstable_generation_wrap)

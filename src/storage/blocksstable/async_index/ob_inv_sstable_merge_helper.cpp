@@ -240,7 +240,7 @@ int ObInvSSTableMergeHelper::init(const compaction::ObMergeParameter &merge_para
     LOG_WARN("unexpected invalid merge param", K(ret), K(merge_param));
   } else if (OB_FAIL(init_merge_iters(merge_param))) {
     LOG_WARN("failed to init inv merge iters", K(ret), K(merge_param));
-  } else if (OB_FAIL(prepare_rows_merger_())) {
+  } else if (OB_FAIL(prepare_rows_merger_(merge_param.is_full_merge()))) {
     LOG_WARN("failed to prepare rows merger", K(ret), K(merge_param));
   } else {
     consume_iter_idx_ = INVALID_CONSUME_ITER_IDX;
@@ -339,7 +339,7 @@ int64_t ObInvSSTableMergeHelper::get_iters_row_count() const
   return iter_row_count;
 }
 
-int ObInvSSTableMergeHelper::prepare_rows_merger_()
+int ObInvSSTableMergeHelper::prepare_rows_merger_(const bool is_full_merge)
 {
   int ret = OB_SUCCESS;
   const int64_t max_table_cnt = INV_MERGE_DEFAULT_ITER_COUNT;
@@ -366,13 +366,13 @@ int ObInvSSTableMergeHelper::prepare_rows_merger_()
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(rows_merger_->init(max_table_cnt, iter_count, allocator_))) {
     LOG_WARN("failed to init rows merger", K(ret), K(iter_count));
-  } else if (OB_FAIL(build_rows_merger())) {
+  } else if (OB_FAIL(build_rows_merger(is_full_merge))) {
     LOG_WARN("failed to build rows merger", K(ret), K(iter_count));
   }
   return ret;
 }
 
-int ObInvSSTableMergeHelper::build_rows_merger()
+int ObInvSSTableMergeHelper::build_rows_merger(const bool is_full_merge)
 {
   int ret = OB_SUCCESS;
   const int64_t iter_count = iters_.count();
@@ -382,26 +382,23 @@ int ObInvSSTableMergeHelper::build_rows_merger()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("rows merger comparator is null", K(ret));
   } else {
-    // First position every source at its initial macro boundary. The builder
-    // below owns all rows-merger insertion and OB_BLOCK_SWITCHED retries.
+    // Full merges start every source at a row, so the merger cannot reuse macro
+    // or logical blocks. Other merges start at the first macro boundary.
     for (int64_t i = 0; OB_SUCC(ret) && i < iter_count; ++i) {
       ObInvSSTableMergeIter *iter = nullptr;
       if (OB_ISNULL(iter = iters_.at(i))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected null merge iter", K(ret), K(i));
       } else if (iter->is_end()) {
-      } else if (OB_FAIL(iter->next_macro_block())) {
-        // 统一 MACRO 停留驱动（对齐主线 next_range）：只定位到第一个宏块边界
-        // （Level::MACRO），不贪心下钻到 ROW。loser tree 用主线同构的
-        // range/row/hybrid 比较（交叠在 cmp 内 NEED_OPEN）；是否整块复用由
-        // do_merge_ 三段式 + check_macro_block_op 决定。空 sstable → OB_ITER_END，不入堆。
+      } else if (OB_FAIL(is_full_merge ? iter->next() : iter->next_macro_block())) {
+        // Empty sources return OB_ITER_END and are not inserted into the rows merger.
         if (OB_ITER_END == ret) {
           ret = OB_SUCCESS;
         } else {
-          LOG_WARN("failed to locate merge iter to first macro", K(ret), K(i));
+          LOG_WARN("failed to locate merge iter", K(ret), K(i), K(is_full_merge));
         }
       } else if (iter->is_end()) {
-        // next_macro_block 落到 END（无宏块），不入堆。
+        // The source is exhausted and is not inserted into the rows merger.
       }
     }
     if (OB_FAIL(ret)) {

@@ -87,6 +87,8 @@
  *     删除表先固定发布水位再取 Tablet；水位继续推进不改变本轮目标，选表及扫描仍按逻辑区间。
  * 37. async_index_inc_major_merge_build_ctx
  *     构造真实 merge ctx 并保留选表 Tablet；后续刷新替换当前 Tablet 不改变上下文及选表来源。
+ * 37a. async_index_inc_major_output_create_sstable
+ *     隔离发布前置条件，使用 OUTPUT 上下文执行数据合并和 SSTable 收尾，验证代次、索引发号及数据。
  * 38. async_index_inc_major_parallel_merge_ctx
  *     用大增量段构造并行 merge ctx，验证并发度至少为 2，分片范围合法且相邻边界连续、末尾到达最大键。
  * 39. async_index_inc_major_parallel_merge_execute
@@ -122,6 +124,7 @@
 #include <atomic>
 #include <memory>
 #include "test_async_index_compaction_common.h"
+#include "storage/compaction_v2/ob_ss_major_merge_ctx.h"
 #include "storage/async_index/ob_async_index_trigger.h"
 #include "storage/async_index/ob_async_index_retention_helper.h"
 #include "rootserver/freeze/ob_major_merge_progress_checker.h"
@@ -7684,6 +7687,121 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_inc_major_merge_build_ctx)
     }
     ASSERT_TRUE(found_owner);
   }
+}
+
+TEST_F(ObAsyncIndexCompactionTest, async_index_inc_major_output_create_sstable)
+{
+  share::ObTenantSwitchGuard tguard;
+  OK(tguard.switch_to(run_ctx_.tenant_id_));
+  exe_prepare_sql();
+  const char *table_name = "t_async_fts_inc_major_output_close";
+  create_async_fts_table(table_name);
+
+  MultiAsyncIndexTabletCtx ctx;
+  resolve_multi_async_index_tablet_ctx(table_name, ctx);
+  ASSERT_EQ(1, ctx.fts_index_tablet_ids_.count());
+  const ObTabletID &tablet_id = ctx.fts_index_tablet_ids_.at(0);
+  const int64_t base_snapshot = get_mock_major_snapshot(ctx);
+  ObLSHandle ls_handle;
+  ObTabletHandle tablet_handle;
+  ObStorageSchema *schema = nullptr;
+  ASSERT_EQ(OB_SUCCESS, get_ls_handle(ctx.ls_id_, ls_handle));
+  ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, tablet_id, tablet_handle));
+  ASSERT_EQ(OB_SUCCESS, tablet_handle.get_obj()->load_storage_schema(allocator_, schema));
+  ASSERT_NE(nullptr, schema);
+  ASSERT_EQ(OB_SUCCESS, add_non_empty_major_to_tablet(
+      ls_handle, tablet_id, *schema, base_snapshot, NON_EMPTY_INV_ROWS_PER_SEGMENT, 1));
+  ASSERT_EQ(OB_SUCCESS, fill_non_empty_inv_inc_major_segments(
+      ls_handle, tablet_id, *schema, base_snapshot, INC_MAJOR_MERGE_INPUT_CNT,
+      DEFAULT_INC_MAJOR_STEP, 1 + NON_EMPTY_INV_ROWS_PER_SEGMENT));
+  ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(tablet_id, tablet_handle));
+  int64_t merge_snapshot = 0;
+  int64_t merge_base_snapshot = 0;
+  int64_t input_table_cnt = 0;
+  ASSERT_EQ(OB_SUCCESS, resolve_inc_major_merge_snapshot(
+      *ls_handle.get_ls(), *tablet_handle.get_obj(), merge_snapshot, merge_base_snapshot, input_table_cnt));
+  ASSERT_EQ(INC_MAJOR_MERGE_INPUT_CNT, input_table_cnt);
+  ObSEArray<InvIdxRowSnapshot, 64> expected_rows;
+  ASSERT_EQ(OB_SUCCESS, collect_inv_rows_from_async_index_merge_inputs(
+      *ls_handle.get_ls(), *tablet_handle.get_obj(), merge_snapshot, allocator_, expected_rows,
+      false /*include_base_major*/));
+  ASSERT_GT(expected_rows.count(), 0);
+  ASSERT_NO_FATAL_FAILURE(ensure_ls_reserved_snapshot_ready(ctx.ls_id_));
+  ASSERT_EQ(OB_SUCCESS, wait_ls_weak_read_ts(*ls_handle.get_ls(), merge_snapshot));
+
+  // Exercise OUTPUT data writing and SSTable close independently of publication.
+  // The fixture installs local input SSTables at the target watermark, so the
+  // existing link-major precheck would treat the merge as already completed.
+  // Replace only publication setup; keep production sequence allocation,
+  // descriptor initialization, merge tasks and SSTable building below.
+  struct OutputDataMergeCtx : public ObSSAsyncIndexMergeCtx
+  {
+    using ObSSAsyncIndexMergeCtx::ObSSAsyncIndexMergeCtx;
+    int init_tablet_merge_info() override
+    {
+      int ret = ObAsyncIndexMergeCtx::init_tablet_merge_info();
+      if (OB_SUCC(ret)) {
+        task_cnt_ = get_concurrent_cnt();
+        ret = major_pre_warm_param_.init(get_ls_id(), get_tablet_id());
+      }
+      return ret;
+    }
+  };
+  ObTabletMergeDagParam param;
+  ASSERT_EQ(OB_SUCCESS, ObDagParamFunc::fill_param(
+      ctx.ls_id_, *tablet_handle.get_obj(), INC_MAJOR_MERGE, merge_snapshot,
+      EXEC_MODE_OUTPUT, param, merge_base_snapshot));
+  ObAsyncIndexIncMergeDag dag;
+  ASSERT_EQ(OB_SUCCESS, dag.init_by_param(&param));
+  OutputDataMergeCtx output_ctx(dag.get_param(), allocator_);
+  output_ctx.merge_dag_ = &dag;
+  bool finish_flag = false;
+  ASSERT_EQ(OB_SUCCESS, output_ctx.build_ctx(finish_flag));
+  ASSERT_FALSE(finish_flag);
+  ObAsyncIndexMergeCtx *merge_ctx = &output_ctx;
+  ASSERT_EQ(EXEC_MODE_OUTPUT, merge_ctx->get_exec_mode());
+  const int16_t generation = merge_ctx->static_param_.sstable_logic_seq_;
+  ASSERT_GT(generation, 0);
+  ASSERT_EQ(generation, merge_ctx->static_desc_.sstable_logic_seq_);
+  int64_t data_macro_seq = -1;
+  int64_t index_macro_seq = -1;
+  ASSERT_EQ(OB_SUCCESS, merge_ctx->generate_macro_seq_info(0, data_macro_seq));
+  ASSERT_EQ(0, data_macro_seq);
+  ASSERT_EQ(OB_SUCCESS, merge_ctx->get_index_tree_macro_start_seq(index_macro_seq));
+  ASSERT_GT(index_macro_seq, data_macro_seq);
+  ASSERT_LT(static_cast<uint64_t>(index_macro_seq), static_cast<uint64_t>(ObMacroDataSeq::VERSION_LOCAL_SEQ_LIMIT));
+  ASSERT_EQ(OB_SUCCESS, merge_ctx->init_inc_major_uncommit_tx_info());
+  for (int64_t i = 0; i < merge_ctx->get_concurrent_cnt(); ++i) {
+    ObAsyncIndexMergeTask task;
+    ASSERT_EQ(OB_SUCCESS, task.init(i, *merge_ctx));
+    ASSERT_EQ(OB_SUCCESS, task.process());
+  }
+
+  // Go through ObTabletMergeInfo and ObSSTableBuilder, not index_builder.close().
+  // Without the INC_MAJOR direct-close branch this returns OB_SIZE_OVERFLOW
+  // while opening the unnecessary rebuild writer, before the rebuild check.
+  const ObSSTable *output = nullptr;
+  ASSERT_EQ(OB_SUCCESS, merge_ctx->create_sstable(output));
+  ASSERT_NE(nullptr, output);
+  ASSERT_TRUE(output->is_inc_inv_sstable());
+  ASSERT_GT(output->get_data_macro_block_count(), 0);
+  ObSSTableMetaHandle meta;
+  ASSERT_EQ(OB_SUCCESS, output->get_meta(meta));
+  ASSERT_EQ(generation, meta.get_sstable_meta().get_sstable_seq());
+  ASSERT_EQ(merge_base_snapshot, output->get_async_index_base_version());
+  ASSERT_EQ(merge_snapshot, output->get_async_index_snapshot_version());
+  ObSSTable *readable_output = nullptr;
+  ASSERT_EQ(OB_SUCCESS, merge_ctx->merged_table_handle_.get_sstable(readable_output));
+  InvMergeIterReadInfo read_info;
+  ObInvIdxRowDesc row_desc;
+  bool has_pos_list = false;
+  ASSERT_EQ(OB_SUCCESS, init_inv_merge_iter_read_info_for_tablet(
+      *tablet_handle.get_obj(), allocator_, read_info, row_desc, has_pos_list));
+  ObSEArray<InvIdxRowSnapshot, 64> actual_rows;
+  ASSERT_EQ(OB_SUCCESS, collect_inv_rows_from_sstable(
+      *static_cast<ObInvSSTable *>(readable_output), read_info, row_desc, has_pos_list, allocator_, actual_rows));
+  sort_inv_row_snapshots(actual_rows);
+  verify_inv_row_snapshots_equal(expected_rows, actual_rows);
 }
 
 TEST_F(ObAsyncIndexCompactionTest, async_index_inc_major_parallel_merge_ctx)

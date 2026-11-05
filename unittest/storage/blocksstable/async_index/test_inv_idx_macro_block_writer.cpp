@@ -1890,6 +1890,63 @@ TEST_F(ObInvIdxMacroBlockWriterTest, logic_micro_id_filled_major)
   writer.reset();
 }
 
+TEST_F(ObInvIdxMacroBlockWriterTest, logical_generation_matches_header_meta_and_micro_index)
+{
+  ASSERT_EQ(OB_SUCCESS, prepare_open_env(true, true, "none", compaction::MAJOR_MERGE));
+  static_desc_.set_sstable_logic_seq(2);
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  ASSERT_EQ(OB_SUCCESS, open_writer(writer, cleaner));
+
+  for (int64_t physical_seq = 0; physical_seq < 2; ++physical_seq) {
+    ObMacroDataSeq expected(physical_seq);
+    ASSERT_EQ(OB_SUCCESS, expected.set_sstable_seq(2));
+    EXPECT_EQ(physical_seq, writer.get_last_macro_seq());
+    EXPECT_EQ(expected.macro_data_seq_, writer.macro_block_.get_current_macro_seq());
+    ObDatumRow row;
+    ASSERT_EQ(OB_SUCCESS, make_inv_idx_row(row, inv_idx_row_desc_, mv_col_cnt_,
+                                           "a", physical_seq + 1, 1, 100, "p"));
+    ASSERT_EQ(OB_SUCCESS, writer.append_row(row));
+    ASSERT_EQ(OB_SUCCESS, writer.flush_logical_block());
+    ASSERT_EQ(OB_SUCCESS, writer.flush_micro_block_pair());
+
+    ObIndexBlockRowParser parser;
+    const ObIndexBlockRowHeader *header = nullptr;
+    ASSERT_EQ(OB_SUCCESS, parser.init(writer.index_block_builder_.row_builder_.rowkey_column_count_,
+                                      writer.index_block_builder_.row_builder_.row_));
+    ASSERT_EQ(OB_SUCCESS, parser.get_header(header));
+    ASSERT_TRUE(header->has_valid_logic_micro_id());
+    EXPECT_EQ(expected.macro_data_seq_, header->get_logic_micro_id().logic_macro_id_.data_seq_.macro_data_seq_);
+    ASSERT_EQ(OB_SUCCESS, writer.flush_macro_block(true /*is_close_flush*/));
+    EXPECT_EQ(expected.macro_data_seq_, writer.index_block_builder_.macro_meta_.val_.logic_id_.data_seq_.macro_data_seq_);
+    ASSERT_EQ(OB_SUCCESS, writer.switch_to_next_macro_block());
+  }
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+}
+
+TEST_F(ObInvIdxMacroBlockWriterTest, logical_generation_preserves_physical_sequence_bits)
+{
+  ASSERT_EQ(OB_SUCCESS, prepare_open_env(true, true, "none", compaction::INC_MAJOR_MERGE));
+  static_desc_.exec_mode_ = compaction::EXEC_MODE_OUTPUT;
+  static_desc_.set_sstable_logic_seq(2);
+  ObInvIdxMacroBlockWriter writer;
+  ObSSTablePrivateObjectCleaner cleaner;
+  ASSERT_EQ(OB_SUCCESS, open_writer(writer, cleaner));
+  const int64_t physical_seq = ObMacroDataSeq::VERSION_LOCAL_SEQ_LIMIT - 1;
+  int64_t logical_seq = -1;
+  ASSERT_EQ(OB_SUCCESS, writer.build_logic_macro_seq(physical_seq, logical_seq));
+  ObMacroDataSeq encoded(logical_seq);
+  EXPECT_EQ(physical_seq, encoded.get_version_local_seq());
+  EXPECT_EQ(2, static_cast<int64_t>(encoded.sstable_logic_seq_));
+  EXPECT_TRUE(encoded.is_data_block());
+  EXPECT_EQ(OB_INVALID_ARGUMENT, writer.build_logic_macro_seq(-1, logical_seq));
+  EXPECT_EQ(OB_SIZE_OVERFLOW, writer.build_logic_macro_seq(ObMacroDataSeq::VERSION_LOCAL_SEQ_LIMIT, logical_seq));
+  static_desc_.set_sstable_logic_seq(-1);
+  ASSERT_EQ(OB_SUCCESS, writer.build_logic_macro_seq(physical_seq, logical_seq));
+  EXPECT_EQ(physical_seq, logical_seq);
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+}
+
 // =============================================================================
 // Group 10 — Search index write path
 // =============================================================================

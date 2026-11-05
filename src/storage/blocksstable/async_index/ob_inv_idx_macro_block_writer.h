@@ -177,6 +177,7 @@ private:
       const ObInvMacroMeta &inv_macro_meta);
 
   int alloc_block();
+  int build_logic_macro_seq(const int64_t physical_macro_seq, int64_t &logic_macro_seq) const;
   void gen_logic_macro_id(ObLogicMacroBlockId &logic_macro_id);
 
   OB_INLINE bool has_posting_value() const
