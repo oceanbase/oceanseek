@@ -199,8 +199,8 @@ function obd_prepare_global {
     SLOT_ID="${SLOT_ID:-$(echo "${_CONDOR_SLOT:-slot${SLICE_IDX:-0}}" | cut -c5-)}"
     PORT_NUM=`expr 5000 + $SLOT_ID \* 100`
 
-    # 根据传入的observer binary判断是否开源版
-    if [[ `$HOME/observer -V 2>&1 | grep -E '(OceanBase CE|OceanBase_CE)'` ]]
+    # 兼容新旧 CE ：OceanBase_AI_CE、OceanBase_CE 和 OceanBase CE。
+    if [[ `$HOME/observer -V 2>&1 | grep -E 'OceanBase([ _]AI)?[ _]CE'` ]]
     then
         COMPONENT="oceanbase-ce"
         export IS_CE=1
@@ -511,7 +511,7 @@ function obd_prepare_bin {
         obs_version=$(cat $HOME/oceanbase/tools/deploy/obd/.observer_obd_plugin_version)
     else
         $DOWNLOAD_DIR/bin/observer -V
-        obs_version=`$DOWNLOAD_DIR/bin/observer -V 2>&1 | grep -E "observer \(OceanBase([ \_]CE)? ([.0-9]+)\)" | grep -Eo '([.0-9]+)'`
+        obs_version=`$DOWNLOAD_DIR/bin/observer -V 2>&1 | grep -Eo "observer \(OceanBase([ \_](CE|Lite|SeekDB|seekdb|Database|AI|[.0-9]+))+\)" | grep -Eo '[0-9]+(\.[0-9]+)+' | tail -n1`
     fi
 
     mkdir $HOME/oceanbase/tools/deploy/admin

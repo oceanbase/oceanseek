@@ -65,7 +65,7 @@ extract_artifact() {
   fi
 }
 
-if [[ -x "$HOME/observer" ]] && "$HOME/observer" -V 2>&1 | grep -E '(OceanBase CE|OceanBase_CE)' >/dev/null 2>&1; then
+if [[ -x "$HOME/observer" ]] && "$HOME/observer" -V 2>&1 | grep -E 'OceanBase([ _]AI)?[ _]CE' >/dev/null 2>&1; then
   export COMPONENT="oceanbase-ce"
   export IS_CE=1
 else

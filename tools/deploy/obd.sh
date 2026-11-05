@@ -103,7 +103,7 @@ function mirror_create {
     echo $obs_version_info
     return 1
   fi
-  obs_version=$(echo "$obs_version_info" | grep -E "observer \(OceanBase([ \_]CE)? ([.0-9]+)\)" | grep -Eo '([.0-9]+)')
+  obs_version=$(echo "$obs_version_info" | grep -Eo "observer \(OceanBase([ \_](CE|Lite|SeekDB|seekdb|Database|AI|[.0-9]+))+\)" | grep -Eo '[0-9]+(\.[0-9]+)+' | tail -n1)
   if [[ "$obs_version" == "" ]]
   then
     echo "can not check observer version"
@@ -113,7 +113,7 @@ function mirror_create {
   if [ "x$IS_CE" == "x" ]
   then
     export IS_CE="0"
-    [[ $($OBSERVER_BIN -V 2>&1 | grep -E 'OceanBase[_ ]CE') ]] && COMPONENT="oceanbase-ce" && export IS_CE="1"
+    [[ $(echo "$obs_version_info" | grep -E 'OceanBase([ _]AI)?[ _]CE') ]] && COMPONENT="oceanbase-ce" && export IS_CE="1"
   fi
   $OBSERVER_BIN -V
   [[ -f "$BASE_DIR/tools/deploy/obd/.observer_obd_plugin_version" ]] && obs_version=$(cat $BASE_DIR/tools/deploy/obd/.observer_obd_plugin_version)
