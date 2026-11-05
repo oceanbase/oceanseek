@@ -159,11 +159,11 @@ int ObServerReloadConfig::operator()()
     }
 #endif
 #ifdef OB_BUILD_SHARED_LOG_SERVICE
-    if (GCTX.is_shared_storage_mode() && GCONF.logservice_access_point.size() > 0) {
+    if (GCONF.enable_logservice && GCONF.logservice_access_point.size() > 0) {
       if (OB_TMP_FAIL(
-          libpalf::LibPalfEnvFFIInstance::get_instance().rotate_object_store_ak(
+          libpalf::LibPalfEnvFFIInstance::get_instance().update_object_store_url(
               GCONF.logservice_access_point.str()))) {
-        LOG_WARN("rotate logservice AK/SK failed, will retry on next reload", K(tmp_ret));
+        LOG_WARN("update logservice access point failed, will retry on next reload", K(tmp_ret));
       }
     }
 #endif

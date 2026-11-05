@@ -9862,27 +9862,20 @@ int ObRootService::set_config_pre_hook(obrpc::ObAdminSetConfigArg &arg)
 #ifdef OB_BUILD_SHARED_LOG_SERVICE
       const libpalf::LibPalfEnvFFI *ffi = NULL;
       if (OB_FAIL(libpalf::LibPalfEnvFFIInstance::get_instance().get_ffi(ffi))) {
-        LOG_WARN("libpalf env not initialized, cannot rotate AK/SK", KR(ret));
+        LOG_WARN("libpalf env not initialized, cannot update access point", KR(ret));
         LOG_USER_ERROR(OB_NOT_INIT, "logservice_access_point: libpalf env not initialized");
       } else if (0 == strlen(GCONF.logservice_access_point.str())) {
-        // first time setting logservice_access_point (e.g. after bootstrap), skip rotation checks
-      } else if (OB_FAIL(libpalf::LibPalfEnvFFIInstance::check_non_aksk_fields_match(
-          GCONF.logservice_access_point.str(),
-          strlen(GCONF.logservice_access_point.str()),
-          item->value_.ptr(),
-          strlen(item->value_.ptr())))) {
-        LOG_WARN("only access_id and access_key may change during rotation", KR(ret));
-        LOG_USER_ERROR(OB_INVALID_ARGUMENT,
-            "logservice_access_point: only access_id and access_key can be changed");
-      } else if (OB_FAIL(libpalf::LibPalfEnvFFIInstance::get_instance().validate_object_store_ak(
+        // Bootstrap has already validated the initial access point.
+      } else if (OB_FAIL(libpalf::LibPalfEnvFFIInstance::get_instance().validate_object_store_url(
           item->value_.ptr()))) {
-        LOG_WARN("new AK/SK validation failed", KR(ret));
+        LOG_WARN("new logservice access point validation failed", KR(ret));
         LOG_USER_ERROR(OB_INVALID_ARGUMENT,
-            "logservice_access_point: new access_id/access_key validation failed");
+            "logservice_access_point: preserve protocol, bucket, directory and cluster ID; "
+            "the new URL must read ACCESS_POINT for the current logservice cluster");
       }
 #else
       ret = OB_NOT_SUPPORTED;
-      LOG_WARN("logservice_access_point rotation requires shared log service build", KR(ret));
+      LOG_WARN("logservice_access_point update requires shared log service build", KR(ret));
 #endif
     }
   }

@@ -6,6 +6,7 @@
 #ifndef OCEANBASE_LOGSERVICE_LIBPALF_ENV_FFI_INSTANCE_
 #define OCEANBASE_LOGSERVICE_LIBPALF_ENV_FFI_INSTANCE_
 
+#include "lib/lock/ob_mutex.h"
 #include "lib/lock/ob_tc_rwlock.h"
 #include "palf_ffi.h"
 
@@ -36,18 +37,14 @@ public:
     int get_ffi(const LibPalfEnvFFI *& ffi);
     int set_logservice_access_point(const char *logservice_access_point);
     int get_logservice_access_point(LogserviceAccessPointBuf& out_logservice_access_point) const;
-    static int check_non_aksk_fields_match(const char *old_encrypted, int64_t old_len,
-                                           const char *new_encrypted, int64_t new_len);
-    int rotate_object_store_ak(const char *encrypted_new_access_point);
-    int validate_object_store_ak(const char *encrypted_new_access_point);
+    int validate_object_store_url(const char *encrypted_access_point);
+    int update_object_store_url(const char *encrypted_access_point);
 private:
     int do_init_();
     int do_refresh_logservice_access_point_();
-    static int parse_aksk_from_encrypted_access_point_(const char *encrypted_access_point,
-        LogserviceAccessPointBuf &out_decrypted, int64_t &out_decrypted_len,
-        char *out_raw_ak_id, int64_t ak_id_buf_len,
-        char *out_raw_ak_secret, int64_t ak_secret_buf_len);
 private:
+    // Serialize access-point writes; acquire before lock_.
+    lib::ObMutex update_lock_;
     mutable common::RWLock lock_;
     const LibPalfEnvFFI* libpalf_env_ffi_;
     LogserviceAccessPointBuf logservice_access_point_;
