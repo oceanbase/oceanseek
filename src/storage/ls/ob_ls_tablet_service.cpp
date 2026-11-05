@@ -10629,6 +10629,31 @@ int ObLSTabletService::do_get_async_index_src_tablet(
   return ret;
 }
 
+int ObLSTabletService::get_min_async_index_snapshot_(
+    const ObAsyncIndexSegmentGroupCtx &ctx, int64_t &min_async_index_snapshot) const
+{
+  int ret = OB_SUCCESS;
+  const ObTabletHandle *index_handle = ctx.get_index_tablet_handle(0);
+  ObTabletHandle data_handle;
+  // Query retention is the data-table checkpoint; the index Major has a
+  // separate retention bound for its own compaction and LOBs.
+  int64_t unused_index_retention = INT64_MAX;
+  min_async_index_snapshot = INT64_MAX;
+  if (OB_ISNULL(index_handle) || OB_UNLIKELY(!index_handle->is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("missing index tablet for async retention checkpoint", K(ret), K(ctx));
+  } else if (OB_FAIL(index_handle->get_obj()->get_async_index_snapshot_source(
+      data_handle, unused_index_retention))) {
+    LOG_WARN("failed to get async index data tablet", K(ret), KPC(index_handle));
+  } else if (OB_UNLIKELY(!data_handle.is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("missing async index data tablet", K(ret), KPC(index_handle));
+  } else if (OB_FAIL(data_handle.get_obj()->get_min_async_index_snapshot(min_async_index_snapshot))) {
+    LOG_WARN("failed to get data tablet async retention checkpoint", K(ret), K(data_handle));
+  }
+  return ret;
+}
+
 int ObLSTabletService::get_async_index_segment_group_ctx(
     const common::ObIArray<common::ObTabletID> &index_tablet_ids,
     const common::ObTabletID &delete_tablet_id,
@@ -10636,6 +10661,7 @@ int ObLSTabletService::get_async_index_segment_group_ctx(
     ObAsyncIndexSegmentGroupCtx &ctx)
 {
   int ret = OB_SUCCESS;
+  int64_t min_async_index_snapshot = INT64_MAX;
   ctx.reset();
   if (OB_UNLIKELY(index_tablet_ids.empty() || !delete_tablet_id.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
@@ -10738,8 +10764,10 @@ int ObLSTabletService::get_async_index_segment_group_ctx(
       }
     }
     if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(get_min_async_index_snapshot_(ctx, min_async_index_snapshot))) {
+      LOG_WARN("failed to get async retention checkpoint", K(ret));
     // 2. merge version ranges across tablets to compute segment groups
-    } else if (OB_FAIL(ctx.calc_query_version_ranges(sql_read_snapshot))) {
+    } else if (OB_FAIL(ctx.calc_query_version_ranges(sql_read_snapshot, min_async_index_snapshot))) {
       LOG_WARN("failed to calc query version ranges", K(ret), K(ctx));
     }
   }

@@ -967,6 +967,8 @@ private:
 private:
   // Called only for transfer-in tablets; replace the handle after source validation.
   int get_async_index_src_tablet_(ObTabletHandle &tablet_handle);
+  int get_min_async_index_snapshot_(const ObAsyncIndexSegmentGroupCtx &ctx,
+      int64_t &min_async_index_snapshot) const;
   static int replay_deserialize_tablet(
       const ObTabletMapKey &key,
       const char *buf,

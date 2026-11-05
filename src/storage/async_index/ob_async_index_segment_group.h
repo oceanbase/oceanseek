@@ -66,7 +66,9 @@ public:
   int set_delete_table_version_ranges(
       const common::ObIArray<common::ObNewVersionRange> &version_ranges,
       const int64_t published_version);
-  int calc_query_version_ranges(const share::SCN &sql_read_snapshot);
+  // INT64_MAX means the data tablet has no active async-index retention checkpoint.
+  int calc_query_version_ranges(const share::SCN &sql_read_snapshot,
+      const int64_t min_async_index_snapshot = INT64_MAX);
 
   share::SCN get_async_index_read_snapshot() const { return async_index_read_snapshot_; }
   int64_t get_group_count() const { return groups_.count(); }
@@ -114,7 +116,9 @@ private:
       const common::ObArrayArray<common::ObNewVersionRange, 8> &chains);
 
   int calc_async_index_read_snapshot_(
-      const share::SCN &sql_read_snapshot, share::SCN &upper_bound) const;
+      const share::SCN &sql_read_snapshot, share::SCN &upper_bound,
+      bool &sql_limited, int64_t &min_published_version) const;
+  int calc_real_published_read_version_(const int64_t upper_bound, int64_t &read_version) const;
   int select_query_ranges_(const int64_t read_ver);
   void reset_query_result_();
 
@@ -122,7 +126,8 @@ private:
   ObArenaAllocator allocator_;
   share::SCN async_index_read_snapshot_;
   int64_t delete_table_published_version_;
-  // Deletion batches constrain R, but are not inputs to index segment groups.
+  // Deletion endpoints contribute to the SQL-limited starting version, but do not
+  // constrain subsequent index alignment: bitmap rows are filtered by rowscn <= R.
   common::ObSEArray<common::ObNewVersionRange, 8> delete_version_ranges_;
   common::ObSEArray<ObAsyncIndexSegmentGroup*, 8> groups_;
   common::ObSEArray<ObTabletHandle, 8> index_tablet_handles_;
