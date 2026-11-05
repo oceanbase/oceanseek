@@ -793,6 +793,26 @@ int ObTablet::init_for_merge(
     LOG_WARN("failed to check transfer seq eq", K(ret), K(old_tablet), K(param));
   } else if (OB_FAIL(check_new_sstable_can_be_acccepted_(old_tablet, param))) {
     LOG_WARN("fail to check new sstable can be accepted",  K(ret), K(old_tablet), K(param));
+  } else if (old_tablet.is_async_index()
+      && OB_NOT_NULL(param.sstable_)
+      && is_inc_major_merge(param.compaction_info_.merge_type_)
+      && old_tablet.get_last_inc_major_snapshot_version() >= param.sstable_->get_async_index_snapshot_version()) {
+    ret = OB_EAGAIN;
+    LOG_WARN("reject outdated async index inc major merge", K(ret), K(param),
+        "inc_major_snapshot", old_tablet.get_last_inc_major_snapshot_version(),
+        "incoming_snapshot", param.sstable_->get_async_index_snapshot_version());
+  } else if (old_tablet.is_async_index()
+      && OB_NOT_NULL(param.sstable_)
+      && (is_major_merge(param.compaction_info_.merge_type_)
+          || is_medium_merge(param.compaction_info_.merge_type_))
+      && param.sstable_->is_major_sstable()
+      && old_tablet.get_last_major_snapshot_version() >= param.sstable_->get_async_index_snapshot_version()) {
+    // Ordinary import LINK also uses MEDIUM_MERGE, but installs an IncMajor
+    // with snapshot_version_ = 0. Only reject outdated compaction results.
+    ret = OB_EAGAIN;
+    LOG_WARN("reject outdated async index major merge", K(ret), K(param),
+        "major_snapshot", old_tablet.get_last_major_snapshot_version(),
+        "incoming_snapshot", param.sstable_->get_async_index_snapshot_version());
   } else if (OB_FAIL(old_tablet.get_max_sync_storage_schema_version_(max_sync_schema_version))) {
     LOG_WARN("failed to get max sync storage schema version", K(ret));
   } else if (OB_FAIL(old_tablet.load_storage_schema(tmp_arena_allocator, old_storage_schema))) {
