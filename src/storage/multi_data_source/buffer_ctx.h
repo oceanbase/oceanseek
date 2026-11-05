@@ -41,6 +41,7 @@ public:
   BufferCtx() : binding_type_id_(INVALID_VALUE),
                 is_incomplete_replay_(false),
                 for_replay_(false),
+                needs_own_log_(false),
                 store_ctx_(nullptr),
                 mem_ctx_(nullptr),
                 target_memtable_(nullptr),
@@ -52,6 +53,8 @@ public:
   bool is_incomplete_replay() const { return is_incomplete_replay_; }
   void set_for_replay(const bool for_replay) { for_replay_ = for_replay; }
   bool is_for_replay() const { return for_replay_; }
+  void set_needs_own_log(bool value) { needs_own_log_ = value; }
+  bool needs_own_log() const { return needs_own_log_; }
 
   // MDS write path: carries the leader's ObStoreCtx produced by 
   // get_write_store_ctx(spec_seq_no=seq_no) so the handler's 
@@ -97,6 +100,10 @@ private:
   // Set true when HELPER_CLASS::on_replay runs (follower / log replay path).
   // Not serialized; write path leaves it false.
   bool for_replay_;
+  // Leader-side packing policy for an unsubmitted node. Not serialized.
+  // Controls log grouping; replay barriers are chosen by the MDS type.
+  // Only standalone V2 reloc finals are upgraded to STRICT_BARRIER.
+  bool needs_own_log_;
   // Raw pointer owned by the enclosing register_mds_into_tx call frame;
   // not serialized, cleared to nullptr on follower / replay. Declared here
   // (not on subclasses) so every BufferCtx flavor — MdsCtx and the

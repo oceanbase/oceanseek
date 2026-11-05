@@ -280,7 +280,8 @@ int ObTxMDSCache::fill_mds_log(ObPartTransCtx *ctx,
     // turns partial-fill+blocked back into OB_SUCCESS so the caller submits what
     // we packed, then re-surfaces OB_BLOCK_FROZEN on the next (empty) call.
     memtable::ObMemtable *first_target_memtable = nullptr;
-    for (; iter != mds_list_.end() && OB_SUCC(ret); iter++) {
+    bool needs_own_log = false;
+    for (; iter != mds_list_.end() && OB_SUCC(ret) && !needs_own_log; iter++) {
       if (iter->is_submitted()) {
         // do nothing
         continue;
@@ -289,9 +290,13 @@ int ObTxMDSCache::fill_mds_log(ObPartTransCtx *ctx,
       if (data_source_type > ObTxDataSourceType::BEFORE_VERSION_4_1) {
         memtable::ObMemtable *cur_target = nullptr;
         const storage::mds::BufferCtx *cur_ctx = iter->get_buffer_ctx_node().get_ctx();
+        needs_own_log = OB_NOT_NULL(cur_ctx) && cur_ctx->needs_own_log();
         if (OB_ISNULL(cur_ctx)) {
           ret = OB_ERR_UNEXPECTED;
           TRANS_LOG(ERROR, "mds buffer ctx is null", K(ret), K(iter->get_buffer_ctx_node()));
+        } else if (needs_own_log && mds_log.count() > 0) {
+          // Submit the prefix. This node is still outside both the log and its range.
+          break;
         } else if (OB_NOT_NULL(cur_target = cur_ctx->get_target_memtable())) {
           if (cur_target->get_logging_blocked()) {
             ret = OB_BLOCK_FROZEN;
@@ -320,6 +325,10 @@ int ObTxMDSCache::fill_mds_log(ObPartTransCtx *ctx,
       }
 
       if (OB_SUCC(ret)) {
+        if (data_source_type == ObTxDataSourceType::LS_MDS_TABLET_RELOC_BATCH && needs_own_log) {
+          // A V2 final may wait on another LS. Stop submitting later logs on this LS until it succeeds.
+          tmp_barrier_type = logservice::ObReplayBarrierType::STRICT_BARRIER;
+        }
         if (!mds_base_scn.is_valid() && tmp_base_scn.is_valid()) {
           mds_base_scn = tmp_base_scn;
         }

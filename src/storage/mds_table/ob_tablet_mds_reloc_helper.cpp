@@ -179,9 +179,7 @@ int ObTabletMdsRelocHelper::apply_reloc_marker_(
             user_data,
             meta))) {
       if (for_replay && (OB_ITER_END == ret || OB_EMPTY_RESULT == ret)) {
-        // Neither CREATE_TABLET_NEW_MDS nor LS_MDS_TABLET_RELOC_BATCH has a replay barrier.
-        // A standby tenant may replay a reloc marker before the destination tablet's
-        // committed status. Return OB_EAGAIN and retry after the status has been replayed.
+        // A leading marker or a legacy redo can replay before the committed destination status.
         ret = OB_EAGAIN;
         LOG_WARN("wait for committed tablet status before replaying reloc marker",
                  KR(ret), K(tgt), K(replay_scn));
@@ -455,6 +453,10 @@ int ObTabletMdsRelocHelper::on_register(
     if (OB_FAIL(arg.skip_bitmap_.rewrite_inplace())) {
       LOG_WARN("rewrite skip bitmap inplace failed", KR(ret));
     }
+  }
+  if (OB_SUCC(ret) && arg.is_v2() && arg.is_final_) {
+    // Retrying the final pull must not replay an earlier marker or payload.
+    ctx.set_needs_own_log(true);
   }
   return ret;
 }

@@ -243,8 +243,6 @@ int ObMdsRelocUtil::register_reloc_batch_via_inner_sql_conn_(
 {
   int ret = OB_SUCCESS;
   const bool registering_final = batch.is_final_;
-  transaction::ObRegisterMdsFlag flag;
-  flag.need_flush_redo_instantly_ = true;
   if (OB_UNLIKELY(final_batch_registered)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("must not register reloc batch after final batch", KR(ret), K(batch));
@@ -275,8 +273,7 @@ int ObMdsRelocUtil::register_reloc_batch_via_inner_sql_conn_(
                            batch.ls_id_,
                            transaction::ObTxDataSourceType::LS_MDS_TABLET_RELOC_BATCH,
                            buf,
-                           buf_len,
-                           flag))) {
+                           buf_len))) {
       if (OB_ALREADY_DONE != ret) {
         LOG_WARN("register reloc batch failed", KR(ret), K(tenant_id), K(batch.ls_id_));
       }

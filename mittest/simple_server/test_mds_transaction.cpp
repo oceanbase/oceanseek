@@ -699,6 +699,14 @@ private:
             matches |= target.tablet_id_ == tablet_id;
           }
           if (matches) {
+            // Check what registration and submission put in PALF, including
+            // when a final happened to be the only pending node.
+            const bool standalone_final = arg.is_v2() && arg.is_final_;
+            EXPECT_EQ(standalone_final, base_header.need_post_replay_barrier()) << lsn.val_;
+            if (standalone_final) {
+              EXPECT_TRUE(base_header.need_pre_replay_barrier()) << lsn.val_;
+              EXPECT_EQ(1, mds_log.count()) << lsn.val_;
+            }
             ObString copy;
             ASSERT_EQ(OB_SUCCESS, ob_write_string(allocator, data, copy));
             ASSERT_EQ(OB_SUCCESS, batches.push_back(copy));
@@ -2830,6 +2838,7 @@ TEST_F(TestMdsTransaction, reloc_v2_multibatch_medium_redo_fence)
       int64_t pos = 0;
       ASSERT_EQ(OB_SUCCESS, submitted.deserialize(data.ptr(), data.length(), pos));
       ASSERT_TRUE(submitted.is_v2());
+      EXPECT_EQ(0 == i, submitted.is_marker_lock_batch());
       EXPECT_EQ(ObTabletMdsRelocType::SPLIT, submitted.reloc_type_);
       for (const auto &submitted_row : submitted.rows_) {
         EXPECT_NE(medium_type, submitted_row.mds_unit_id_);
