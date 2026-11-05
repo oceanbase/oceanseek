@@ -3250,13 +3250,16 @@ TEST_F(TestSSFailGCGenTask,
 }
 
 TEST_F(TestSSFailGCGenTask,
-    fail_gc_executor_records_first_cancel_atomic_protocol_business_error)
+    fail_gc_executor_skips_cancel_errors_and_commits_remaining_rows)
 {
   ObTenantSwitchGuard tenant_guard;
   ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(OB_SYS_TENANT_ID));
+  ObMySQLProxy &proxy = get_curr_simple_server().get_observer().get_mysql_proxy();
   const ObLSID ls_id(870);
   const ObTabletID tablet_id(870001);
+  const ObTabletID abandoned_tablet_id(870002);
   ObSSMetaCtrlKey ctrl_key;
+  ObSSMetaCtrlKey abandoned_ctrl_key;
   ASSERT_EQ(OB_SUCCESS, insert_ctrl_row_(
       OB_SYS_TENANT_ID, ls_id,
       blocksstable::ObStorageObjectType::SHARED_TABLET_META,
@@ -3268,9 +3271,10 @@ TEST_F(TestSSFailGCGenTask,
   ASSERT_TRUE(ctrl_value.ctrl_info_.trace_id_.is_invalid());
 
   ObSSFailGCCtrlRow ctrl_row;
+  ObSSFailGCCtrlRow abandoned_ctrl_row;
   ASSERT_EQ(OB_SUCCESS, ctrl_row.ctrl_key_.assign(ctrl_key));
   ctrl_row.ctrl_value_ = ctrl_value;
-  ObSEArray<ObSSFailGCCtrlRow, 1> ctrl_rows;
+  ObSEArray<ObSSFailGCCtrlRow, 2> ctrl_rows;
   ASSERT_EQ(OB_SUCCESS, ctrl_rows.push_back(ctrl_row));
 
   ObArenaAllocator dag_allocator("FailGCDagTest");
@@ -3291,7 +3295,6 @@ TEST_F(TestSSFailGCGenTask,
   CancelErrorSSFailGCExecutorTask *executor = nullptr;
   ASSERT_EQ(OB_SUCCESS, dag.alloc_task(executor));
   ASSERT_NE(nullptr, executor);
-  ASSERT_EQ(OB_SUCCESS, executor->init(ls_ctx, ctrl_rows));
 
   CancelErrorSSFailGCExecutorTask *unexpected_executor = nullptr;
   ASSERT_EQ(OB_SUCCESS, dag.alloc_task(unexpected_executor));
@@ -3300,18 +3303,28 @@ TEST_F(TestSSFailGCGenTask,
   ASSERT_EQ(OB_SUCCESS, unexpected_executor->init(ls_ctx, ctrl_rows));
   ASSERT_EQ(OB_SUCCESS, unexpected_executor->process());
   ASSERT_EQ(1, unexpected_executor->cancel_count_);
-  ASSERT_EQ(OB_ERR_UNEXPECTED, ls_ctx->get_first_error_code());
-  ASSERT_EQ(OB_ERR_UNEXPECTED, ctx->get_first_error_code());
-  ASSERT_EQ(1, ctx->get_failed_ls_count());
+  ASSERT_EQ(OB_SUCCESS, ls_ctx->get_first_error_code());
+  ASSERT_EQ(OB_SUCCESS, ctx->get_first_error_code());
+  ASSERT_EQ(0, ctx->get_failed_ls_count());
 
+  // The failed START row must not block a later ABANDON row in the same batch.
+  ASSERT_EQ(OB_SUCCESS, insert_ctrl_row_(
+      OB_SYS_TENANT_ID, ls_id, blocksstable::ObStorageObjectType::SHARED_TABLET_META,
+      abandoned_tablet_id, make_scn(200), ObSSMetaCtrlStatus::STATUS::ABANDON,
+      abandoned_ctrl_key));
+  ASSERT_EQ(OB_SUCCESS, abandoned_ctrl_row.ctrl_key_.assign(abandoned_ctrl_key));
+  ASSERT_EQ(OB_SUCCESS, read_ctrl_value_(
+      OB_SYS_TENANT_ID, ls_id, abandoned_ctrl_key, abandoned_ctrl_row.ctrl_value_));
+  ASSERT_EQ(OB_SUCCESS, ctrl_rows.push_back(abandoned_ctrl_row));
+  ASSERT_EQ(OB_SUCCESS, executor->init(ls_ctx, ctrl_rows));
   ASSERT_EQ(OB_SUCCESS, executor->process());
 
   ASSERT_EQ(1, executor->cancel_count_);
-  ASSERT_EQ(OB_ERR_UNEXPECTED, ls_ctx->get_first_error_code());
-  ASSERT_EQ(OB_ERR_UNEXPECTED, ctx->get_first_error_code());
-  ASSERT_EQ(1, ctx->get_failed_ls_count());
-  ASSERT_EQ(0, ctx->get_abandoned_ctrl_row_count());
-  ASSERT_EQ(0, ctx->get_generated_task_count());
+  ASSERT_EQ(OB_SUCCESS, ls_ctx->get_first_error_code());
+  ASSERT_EQ(OB_SUCCESS, ctx->get_first_error_code());
+  ASSERT_EQ(0, ctx->get_failed_ls_count());
+  ASSERT_EQ(1, ctx->get_abandoned_ctrl_row_count());
+  ASSERT_EQ(1, ctx->get_generated_task_count());
   ASSERT_EQ(OB_SUCCESS, dag.get_dag_ret());
   ASSERT_FALSE(dag.is_dag_failed());
 
@@ -3319,12 +3332,19 @@ TEST_F(TestSSFailGCGenTask,
   ASSERT_EQ(OB_SUCCESS, read_ctrl_value_(
       OB_SYS_TENANT_ID, ls_id, ctrl_key, remaining_value));
   ASSERT_TRUE(remaining_value.ctrl_info_.status_.is_start_status());
+  ASSERT_EQ(OB_ITER_END, read_ctrl_value_(
+      OB_SYS_TENANT_ID, ls_id, abandoned_ctrl_key, remaining_value));
   ObSEArray<ObSharedGCTaskKey, 1> task_keys;
   ASSERT_EQ(OB_SUCCESS, get_matching_fail_gc_task_keys_(
       OB_SYS_TENANT_ID,
       blocksstable::ObStorageObjectType::SHARED_TABLET_META,
       1 /* op_id */, ls_id, tablet_id, task_keys));
   ASSERT_EQ(0, task_keys.count());
+  ASSERT_EQ(OB_SUCCESS, get_matching_fail_gc_task_keys_(
+      OB_SYS_TENANT_ID, blocksstable::ObStorageObjectType::SHARED_TABLET_META,
+      1 /*op_id*/, ls_id, abandoned_tablet_id, task_keys));
+  ASSERT_EQ(1, task_keys.count());
+  ASSERT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::delete_task(task_keys.at(0), proxy));
   ASSERT_EQ(OB_SUCCESS,
       delete_ctrl_row_(OB_SYS_TENANT_ID, ls_id, ctrl_key));
 }

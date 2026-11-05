@@ -66,12 +66,7 @@ int ObAtomicProtocolCtrl::cancel_atomic_protocol()
         if (OB_FAIL(lock_lock_row_(trans, lock_row_value))) {
           LOG_WARN("failed to lock lock row", K(ret));
         } else if (OB_FAIL(select_ctrl_row_(trans, ctrl_value))) {
-          if (OB_ITER_END == ret) {
-            //do nothing
-            ret = OB_SUCCESS;
-          } else {
-            LOG_WARN("failed to select ctrl row", K(ret), K(meta_key_info_));
-          }
+          LOG_WARN("failed to select ctrl row", K(ret), K(meta_key_info_));
         } else if (ctrl_value.ctrl_info_.status_.is_abandon_status()) {
           //do nothing
         } else if (!ctrl_value.ctrl_info_.status_.is_start_status() && !ctrl_value.ctrl_info_.status_.is_complete_status()) {
