@@ -6349,6 +6349,7 @@ TEST_F(ObAsyncIndexCompactionTest, async_delete_gc_preserves_merge_and_refresh_p
   ObAsyncIndexDirectRefreshParam refresh_param;
   refresh_param.tenant_id_ = MTL_ID();
   refresh_param.ls_ = &ls;
+  refresh_param.leader_proposal_id_ = decisions.at(0).leader_proposal_id_;
   refresh_param.data_table_id_ = ctx.data_table_id_;
   refresh_param.index_table_id_ = ctx.delete_index_table_id_;
   refresh_param.data_tablet_id_ = ctx.data_tablet_id_;
@@ -6372,6 +6373,109 @@ TEST_F(ObAsyncIndexCompactionTest, async_delete_gc_preserves_merge_and_refresh_p
   fprintf(stdout, "FIX refresh_completed published=%ld previous_published=%ld retention=%ld refresh_tasks=%ld\n",
       actual_published, published, retention, decisions.count());
   fflush(stdout);
+}
+
+TEST_F(ObAsyncIndexCompactionTest, async_delete_medium_keeps_gc_after_sibling_advance)
+{
+  share::ObTenantSwitchGuard tguard;
+  OK(tguard.switch_to(run_ctx_.tenant_id_));
+  exe_prepare_sql();
+  const char *table_name = "t_async_delete_fixed_gc";
+  ASSERT_NO_FATAL_FAILURE(create_async_fts_table(table_name));
+  MultiAsyncIndexTabletCtx ctx;
+  ASSERT_NO_FATAL_FAILURE(resolve_multi_async_index_tablet_ctx(table_name, ctx));
+  ObLSHandle ls_handle;
+  ASSERT_EQ(OB_SUCCESS, get_ls_handle(ctx.ls_id_, ls_handle));
+  const int64_t base_snapshot = get_mock_major_snapshot(ctx);
+  const int64_t next_fts_snapshot = base_snapshot + DEFAULT_INC_MAJOR_STEP;
+  const int64_t merge_snapshot = next_fts_snapshot + DEFAULT_INC_MAJOR_STEP;
+  ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(
+      ls_handle, ctx.fts_index_tablet_ids_.at(0), base_snapshot));
+  ASSERT_EQ(OB_SUCCESS, add_empty_data_major_to_tablet(
+      ls_handle, ctx.delete_index_tablet_id_, base_snapshot));
+  ASSERT_EQ(OB_SUCCESS, add_delete_inc_major_to_tablet(
+      ls_handle, ctx.delete_index_tablet_id_, base_snapshot, merge_snapshot, merge_snapshot + 1));
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+      ls_handle, ctx.delete_index_tablet_id_, merge_snapshot));
+  ObTabletHandle delete_handle;
+  ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, ctx.delete_index_tablet_id_, delete_handle));
+  ObStorageSchema *delete_schema = nullptr;
+  ASSERT_EQ(OB_SUCCESS, delete_handle.get_obj()->load_storage_schema(allocator_, delete_schema));
+  ObUpdateTableStoreParam snapshot_param(merge_snapshot,
+      delete_handle.get_obj()->get_multi_version_start(), delete_schema, ls_handle.get_ls()->get_rebuild_seq());
+  ObTabletHandle updated_handle;
+  ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->update_tablet_table_store(
+      ctx.delete_index_tablet_id_, snapshot_param, updated_handle));
+  ASSERT_EQ(OB_SUCCESS, delete_handle.assign(updated_handle));
+  ObNewVersionRange merge_range;
+  merge_range.base_version_ = 0;
+  merge_range.snapshot_version_ = merge_snapshot;
+  ASSERT_NO_FATAL_FAILURE(build_and_submit_medium_info(
+      ls_handle, delete_handle, ctx.delete_index_tablet_id_, merge_range,
+      ObAdaptiveMergePolicy::NONE, 8901));
+  ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, ctx.delete_index_tablet_id_, delete_handle));
+  const ObMediumCompactionInfoList *medium_list = nullptr;
+  ASSERT_EQ(OB_SUCCESS, delete_handle.get_obj()->read_medium_info_list(allocator_, medium_list));
+  ASSERT_NE(nullptr, medium_list);
+  ObMediumCompactionInfoList *allocated_list = const_cast<ObMediumCompactionInfoList *>(medium_list);
+  DEFER(ObTabletObjLoadHelper::free(allocator_, allocated_list));
+  const ObMediumCompactionInfo *saved_info = find_medium_info_by_snapshot(medium_list, merge_snapshot);
+  ASSERT_NE(nullptr, saved_info);
+  ASSERT_TRUE(saved_info->contain_mds_filter_info_);
+  const int64_t fixed_gc_scn = saved_info->mds_filter_info_.get_mlog_purge_scn();
+  ASSERT_GT(fixed_gc_scn, 0);
+  ASSERT_LE(fixed_gc_scn, base_snapshot);
+
+  // Advance the sibling's installed Major and reclaim its old Major. A newly
+  // scheduled task can now use a larger GC, but this registered task cannot.
+  ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(
+      ls_handle, ctx.fts_index_tablet_ids_.at(0), next_fts_snapshot));
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
+      ls_handle, ctx.fts_index_tablet_ids_.at(0), next_fts_snapshot));
+  ObAsyncIndexDepProvider provider;
+  ObTabletAsyncIndexRefreshInfo refresh_info;
+  refresh_info.set_has_async_index(true);
+  ASSERT_EQ(OB_SUCCESS, refresh_info.append_refresh_snapshot(next_fts_snapshot));
+  ASSERT_EQ(OB_SUCCESS, refresh_info.append_refresh_snapshot(merge_snapshot));
+  ASSERT_EQ(OB_SUCCESS, provider.set_async_index_refresh_info(
+      MTL_ID(), ls_handle.get_ls(), ctx.data_tablet_id_, refresh_info));
+  ASSERT_NO_FATAL_FAILURE(set_undo_retention_zero());
+  DEFER(set_undo_retention_default());
+  ASSERT_NO_FATAL_FAILURE(set_mvcc_gc_using_min_txn_snapshot(false));
+  DEFER(set_mvcc_gc_using_min_txn_snapshot(true));
+  ASSERT_NO_FATAL_FAILURE(trigger_async_index_sstable_gc(ctx, ObTimeUtility::current_time_ns()));
+  int64_t current_gc_scn = INT64_MAX;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexRetentionHelper::calc_deletion_gc_scn(
+      *ls_handle.get_ls(), ctx.delete_index_tablet_id_,
+      saved_info->storage_schema_.get_schema_version(), current_gc_scn));
+  ASSERT_NE(INT64_MAX, current_gc_scn);
+  ASSERT_GT(current_gc_scn, fixed_gc_scn);
+
+  ObTenantTabletScheduler *scheduler = MTL(ObTenantTabletScheduler *);
+  ASSERT_NE(nullptr, scheduler);
+  for (int64_t attempt = 0; attempt < 2; ++attempt) {
+    ObTabletMergeDagParam param;
+    ASSERT_EQ(OB_SUCCESS, ObDagParamFunc::fill_param(ctx.ls_id_, *delete_handle.get_obj(),
+        MEDIUM_MERGE, merge_snapshot, EXEC_MODE_LOCAL, param, 0 /*merge_base_version*/));
+    ObTabletMajorMergeDag dag;
+    ASSERT_EQ(OB_SUCCESS, dag.init_by_param(&param));
+    bool finish_flag = false;
+    scheduler->resume_major_merge();
+    const int prepare_ret = dag.prepare_merge_ctx(finish_flag);
+    scheduler->stop_major_merge();
+    ASSERT_EQ(OB_SUCCESS, prepare_ret);
+    ASSERT_FALSE(finish_flag);
+    ASSERT_NE(nullptr, dag.get_ctx());
+    ASSERT_NE(nullptr, dag.get_ctx()->get_compaction_filter());
+    ObDatumRow row;
+    const int64_t scn_column = dag.get_ctx()->get_schema()->get_rowkey_column_num();
+    ASSERT_EQ(OB_SUCCESS, row.init(allocator_, scn_column + 1));
+    // Dynamic GC would remove this row; the registered plan must keep it.
+    row.storage_datums_[scn_column].set_int(-current_gc_scn);
+    ObICompactionFilter::ObFilterRet filter_ret = ObICompactionFilter::FILTER_RET_MAX;
+    ASSERT_EQ(OB_SUCCESS, dag.get_ctx()->get_compaction_filter()->filter(row, filter_ret));
+    EXPECT_EQ(ObICompactionFilter::FILTER_RET_KEEP, filter_ret);
+  }
 }
 
 TEST_F(ObAsyncIndexCompactionTest, async_delete_medium_selects_logical_inc_major)

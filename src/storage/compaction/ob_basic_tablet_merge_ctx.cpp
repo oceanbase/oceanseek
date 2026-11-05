@@ -20,7 +20,6 @@
 #include "share/truncate_info/ob_truncate_info_util.h"
 #include "storage/compaction/filter/ob_rowscn_filter.h"
 #include "storage/compaction_ttl/ob_mlog_purge_info_helper.h"
-#include "storage/async_index/ob_async_index_retention_helper.h"
 
 namespace oceanbase
 {
@@ -1749,21 +1748,16 @@ int ObBasicTabletMergeCtx::prepare_from_medium_compaction_info(const ObMediumCom
       && OB_FAIL(filter_ctx_.mds_filter_info_.assign(mem_ctx_.get_allocator(), medium_info->mds_filter_info_))) {
     LOG_WARN("failed to assign mds filter info", KR(ret), KPC(medium_info));
   }
-
-  return ret;
-}
-
-int ObBasicTabletMergeCtx::calc_deletion_tablet_gc_scn(int64_t &gc_scn)
-{
-  int ret = OB_SUCCESS;
-  gc_scn = INT64_MAX;
-  if (OB_ISNULL(get_ls()) || OB_ISNULL(get_schema())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("invalid deletion merge context", K(ret), KP(get_ls()), KP(get_schema()));
-  } else if (OB_FAIL(ObAsyncIndexRetentionHelper::calc_deletion_gc_scn(
-      *get_ls(), get_tablet_id(), get_schema()->get_schema_version(), gc_scn))) {
-    LOG_WARN("failed to calculate deletion gc scn", K(ret), K(get_tablet_id()));
+  if (OB_SUCC(ret) && get_schema()->is_async_delete_index()) {
+    // Keep the DROP check formerly performed by GC calculation, without reading
+    // sibling progress or changing the persisted filter boundary.
+    const ObTableSchema *table_schema = nullptr;
+    ObSchemaGetterGuard schema_guard;
+    if (OB_FAIL(get_table_schema(get_schema()->get_schema_version(), table_schema, schema_guard))) {
+      LOG_WARN("failed to check deletion table schema", KR(ret), K(get_tablet_id()));
+    }
   }
+
   return ret;
 }
 
@@ -1778,11 +1772,12 @@ int ObBasicTabletMergeCtx::alloc_mds_info_compaction_filter()
   int64_t newest_commit_version = 0;
 
   if (is_async_delete_index(get_schema()->get_index_type())) {
-    int64_t gc_scn = INT64_MAX;
+    // The scalar belongs to the persisted Medium plan. Local sibling progress must
+    // not change the filter when this task is retried or moves to another SS writer.
+    const int64_t gc_scn = filter_ctx_.mds_filter_info_.get_mlog_purge_scn();
     const ObICompactionFilter::CompactionFilterType filter_type = ObICompactionFilter::MLOG_PURGE_FILTER;
-    if (OB_FAIL(calc_deletion_tablet_gc_scn(gc_scn))) {
-      LOG_WARN("failed to calc deletion tablet gc scn", K(ret));
-    } else if (INT64_MAX == gc_scn || gc_scn <= 0) {
+    if (INT64_MAX == gc_scn || gc_scn <= 0) {
+      // A task without a safe GC boundary retains deletion rows on every attempt.
       FLOG_INFO("[DELETION TABLET GC] skip gc this round",
           K(gc_scn), K(get_tablet_id()));
     } else if (OB_FAIL(ObCompactionFilterFactory::alloc_compaction_filter<ObRowscnFilter>(
@@ -1793,13 +1788,10 @@ int ObBasicTabletMergeCtx::alloc_mds_info_compaction_filter()
         filter_type))) {
       LOG_WARN("failed to alloc rowscn filter for deletion tablet gc", K(ret), K(gc_scn));
     } else {
-      FLOG_INFO("[DELETION TABLET GC] local calc gc scn",
+      FLOG_INFO("[DELETION TABLET GC] use gc scn from medium info",
           K(gc_scn), K(get_tablet_id()));
     }
-    return ret;
-  }
-
-  if (OB_UNLIKELY(static_param_.multi_version_column_descs_.empty())) {
+  } else if (OB_UNLIKELY(static_param_.multi_version_column_descs_.empty())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected not ready static param", KR(ret), KP_(static_param_.rowkey_read_info));
   } else if (OB_FAIL(mds_info_mgr.init(tmp_allocator, *get_tablet(), nullptr/*split_extra_tablet_handles_ptr*/, read_version_range, false/*for_access*/))) {

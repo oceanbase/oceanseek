@@ -422,7 +422,6 @@ protected:
   virtual int prepare_compaction_filter() { return OB_SUCCESS; }
 
   int alloc_mds_info_compaction_filter();
-  int calc_deletion_tablet_gc_scn(int64_t &gc_scn);
   void after_update_tablet_for_major();
   int prepare_from_medium_compaction_info(const ObMediumCompactionInfo *medium_info); // for major
   int get_meta_compaction_info(); // for meta major

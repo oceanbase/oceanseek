@@ -15,6 +15,7 @@
 #include "storage/compaction/ob_medium_compaction_info_mds_helper.h"
 #include "storage/compaction/ob_async_index_merge_policy.h"
 #include "storage/async_index/ob_async_index_service.h"
+#include "storage/async_index/ob_async_index_retention_helper.h"
 #include "share/schema/ob_async_index_params.h"
 #include "share/schema/ob_tenant_schema_service.h"
 #include "lib/mysqlclient/ob_mysql_transaction.h"
@@ -1766,7 +1767,7 @@ int ObMediumCompactionScheduleFunc::fill_mds_filter_info(ObMediumCompactionInfo 
   if (medium_info.storage_schema_.is_mlog_table()) {
     ret = fill_mlog_purge_scn(medium_info);
   } else if (is_async_delete_index(medium_info.storage_schema_.get_index_type())) {
-    medium_info.contain_mds_filter_info_ = false;
+    ret = fill_deletion_gc_scn(medium_info);
   } else if (read_mds && OB_FAIL(mds_info_mgr.init(allocator_, *tablet_handle_.get_obj(), nullptr/*split_extra_tablet_handles_ptr*/, read_version_range, false/*for_access*/))) {
     LOG_WARN("failed to init mds filter info mgr", KR(ret), K(read_version_range));
   } else if (!read_mds || mds_info_mgr.is_empty()) {
@@ -1798,6 +1799,33 @@ int ObMediumCompactionScheduleFunc::fill_mds_filter_info(ObMediumCompactionInfo 
       ret = OB_SUCCESS;
     }
 #endif
+  }
+  return ret;
+}
+
+int ObMediumCompactionScheduleFunc::fill_deletion_gc_scn(ObMediumCompactionInfo &medium_info) const
+{
+  int ret = OB_SUCCESS;
+  int64_t gc_scn = INT64_MAX;
+  medium_info.contain_mds_filter_info_ = false;
+  if (OB_UNLIKELY(!tablet_handle_.is_valid()
+      || !is_async_delete_index(medium_info.storage_schema_.get_index_type()))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid deletion gc schedule context", KR(ret), K(tablet_handle_), K(medium_info));
+  } else if (OB_FAIL(ObAsyncIndexRetentionHelper::calc_deletion_gc_scn(
+      ls_, tablet_handle_.get_obj()->get_tablet_id(),
+      medium_info.storage_schema_.get_schema_version(), gc_scn))) {
+    LOG_WARN("failed to calculate deletion gc scn", KR(ret), K(medium_info));
+  } else if (INT64_MAX == gc_scn || gc_scn <= 0) {
+    // An absent filter is a fixed no-GC decision, not a request to recalculate at execution.
+  } else if (OB_FAIL(medium_info.mds_filter_info_.init(medium_info.data_version_, gc_scn))) {
+    LOG_WARN("failed to init deletion gc filter info", KR(ret), K(gc_scn), K(medium_info));
+  } else {
+    // Reuse the Mlog scalar's wire format; for a deletion index it stores the deletion GC boundary.
+    medium_info.contain_mds_filter_info_ = true;
+  }
+  if (OB_SUCC(ret)) {
+    FLOG_INFO("[DELETION TABLET GC] fix gc scn in medium info", K(gc_scn), K(medium_info));
   }
   return ret;
 }
