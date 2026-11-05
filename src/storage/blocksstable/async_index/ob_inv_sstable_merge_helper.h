@@ -244,8 +244,8 @@ public:
 private:
   static const int64_t INVALID_CONSUME_ITER_IDX = -1;
   int init_merge_iters(const compaction::ObMergeParameter &merge_param);
-  int prepare_rows_merger_();
-  int build_rows_merger();
+  int prepare_rows_merger_(const bool is_full_merge);
+  int build_rows_merger(const bool is_full_merge);
   // 对齐 ObPartitionMergeHelper::build_rows_merger：从所有当前 iterator 重建；
   // 比较返回 OB_BLOCK_SWITCHED 时丢弃部分构造的树并重试。
   int rebuild_rows_merger_from_iters_();

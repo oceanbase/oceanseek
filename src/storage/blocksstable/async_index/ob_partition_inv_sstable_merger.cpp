@@ -138,6 +138,7 @@ int ObPartitionInvSSTableMerger::do_merge_()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("macro writer is null on do merge", K(ret), KP_(macro_writer));
   } else {
+    // Full merges enter and stay at ROW through next(), bypassing both block-reuse paths.
     // 分层主循环：唯一 winner 停在 MACRO 时优先物理复用；不能整宏复用才下钻到
     // TERM_ENTRY，继续尝试逻辑块复用；其余状态逐行重写。next_row(true) 停在下一
     // 逻辑块边界，使同一宏块内可形成 REUSE ↔ ROW 交替。
@@ -400,9 +401,10 @@ int ObPartitionInvSSTableMerger::merge_row_(ObInvSSTableMergeIter &iter)
       macro_writer_->inc_incremental_row_count();
     }
   }
-  if (OB_SUCC(ret) && OB_FAIL(iter.next_row(true /*stop_at_logical_block_boundary*/))) {
-    // 逐行仅消费当前逻辑块：块耗尽后停在下一 LOGICAL_BLOCK 边界（curr_row 为空），
-    // 主循环重建 loser tree 后重新判逻辑块复用；不得贪心打开后续逻辑块。
+  if (OB_SUCC(ret) && OB_FAIL(static_param_.is_full_merge_
+      ? iter.next() : iter.next_row(true /*stop_at_logical_block_boundary*/))) {
+    // Full merges continue to the next row across block boundaries. Other merges
+    // stop at the next logical block so the main loop can reconsider block reuse.
     if (OB_ITER_END == ret) {
       ret = OB_SUCCESS;
     } else {

@@ -206,17 +206,27 @@ int ObStaticMergeParam::init_sstable_logic_seq()
   const ObITable *table = nullptr;
   if (is_major_merge_type(get_merge_type()) || is_mini_merge(get_merge_type())) {
     sstable_logic_seq_ = 0;
-  } else if (OB_ISNULL(table = tables_handle_.get_table(tables_handle_.get_count() - 1))
-      || !table->is_sstable()) {
+  } else if (OB_UNLIKELY(tables_handle_.empty())) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected table type", K(ret), KPC(table), K(tables_handle_));
+    LOG_WARN("empty merge tables", K(ret), K(tables_handle_));
   } else {
-    const ObSSTable *sstable = static_cast<const ObSSTable *>(table);
-    ObSSTableMetaHandle meta_handle;
-    if (OB_FAIL(sstable->get_meta(meta_handle))) {
-      LOG_WARN("get meta handle fail", K(ret), KPC(sstable));
-    } else {
-      const int64_t next_sstable_logic_seq = meta_handle.get_sstable_meta().get_sstable_seq() + 1;
+    int64_t max_sstable_logic_seq = 0;
+    // INC_MAJOR may reuse blocks from every input, whose generations need not
+    // follow table order. Advance past all of them before restarting physical IDs.
+    const int64_t start_idx = is_inc_major_merge(get_merge_type()) ? 0 : tables_handle_.get_count() - 1;
+    for (int64_t i = start_idx; OB_SUCC(ret) && i < tables_handle_.get_count(); ++i) {
+      ObSSTableMetaHandle meta_handle;
+      if (OB_ISNULL(table = tables_handle_.get_table(i)) || !table->is_sstable()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected table type", K(ret), K(i), KPC(table));
+      } else if (OB_FAIL(static_cast<const ObSSTable *>(table)->get_meta(meta_handle))) {
+        LOG_WARN("get meta handle fail", K(ret), KPC(table));
+      } else {
+        max_sstable_logic_seq = MAX(max_sstable_logic_seq, meta_handle.get_sstable_meta().get_sstable_seq());
+      }
+    }
+    if (OB_SUCC(ret)) {
+      const int64_t next_sstable_logic_seq = max_sstable_logic_seq + 1;
       if (next_sstable_logic_seq >= ObMacroDataSeq::MAX_SSTABLE_SEQ) {
         // 如果 macro seq 溢出，则不进行重用，直接设置为 full merge
         set_full_merge_and_level(true/*is_full_merge*/);
@@ -1258,7 +1268,8 @@ int ObBasicTabletMergeCtx::init_static_desc()
                                 get_io_write_strategy()))) {
     LOG_WARN("failed to init static desc", KR(ret), KPC(this));
   } else if (GCTX.is_shared_storage_mode()
-      && is_multi_version_merge(get_merge_type())
+      && (is_multi_version_merge(get_merge_type())
+          || is_inc_major_merge(get_merge_type()))
       && FALSE_IT(static_desc_.set_sstable_logic_seq(
           static_param_.sstable_logic_seq_))) {
   } else {

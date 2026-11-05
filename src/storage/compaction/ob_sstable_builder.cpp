@@ -177,6 +177,7 @@ int ObSSTableBuilder::build_sstable_merge_res(
   if (GCTX.is_shared_storage_mode()
       && (is_major_merge_type(merge_type) 
       || is_minor_merge_type(merge_type) 
+      || is_inc_major_merge(merge_type)
       || is_mini_merge(merge_type))) {
 #ifdef OB_BUILD_SHARED_STORAGE
     // no need to rebuild sstable in shared storage mode

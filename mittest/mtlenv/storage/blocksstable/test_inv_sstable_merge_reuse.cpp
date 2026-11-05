@@ -280,9 +280,19 @@ inline void reset_output_desc(TestInvIdxSSTablePrepare &fixture)
 
 inline void open_output_writer(TestInvIdxSSTablePrepare &fixture,
     ObInvIdxMacroBlockWriter &writer,
-    ObSSTablePrivateObjectCleaner &cleaner)
+    ObSSTablePrivateObjectCleaner &cleaner,
+    const int16_t sstable_logic_seq = -1)
 {
   reset_output_desc(fixture);
+  if (sstable_logic_seq >= 0) {
+    ObDataStoreDesc &desc = fixture.whole_desc_.get_desc();
+    // Keep the MINI writer provided by this LocalDevice fixture. The merger
+    // below uses INC_MAJOR/OUTPUT parameters to test generation and reuse policy;
+    // shared-object allocation is covered by async_index_inc_major_output_create_sstable.
+    desc.static_desc_->set_sstable_logic_seq(sstable_logic_seq);
+    fixture.index_builder_->reset();
+    OK(fixture.index_builder_->init(desc));
+  }
   ObPreWarmerParam pre_warm_param(PRE_WARM_TYPE_NONE);
   OK(writer.open(fixture.inv_idx_row_desc_, fixture.whole_desc_.get_desc(),
       0 /*parallel_idx*/, fixture.seq_param_, pre_warm_param, cleaner, nullptr /*callback*/));
@@ -296,7 +306,15 @@ inline void finalize_closed_output_sstable(TestInvIdxSSTablePrepare &fixture,
   ASSERT_FALSE(writer.is_opened());
   OK(fixture.index_builder_->merge_inv_meta(writer.get_seg_inv_meta()));
   ObSSTableMergeRes res;
-  OK(fixture.index_builder_->close(res));
+  if (fixture.whole_desc_.get_desc().get_sstable_logic_seq() >= 0) {
+    // Generation encoding takes a raw SS physical sequence. close() instead
+    // supplies a legacy sequence with the index-block type already encoded.
+    int64_t macro_seq = writer.get_last_macro_seq() + 1;
+    ObPreWarmerParam pre_warm_param(PRE_WARM_TYPE_NONE);
+    OK(fixture.index_builder_->close_with_macro_seq(res, macro_seq, OB_DEFAULT_MACRO_BLOCK_SIZE, 0, pre_warm_param));
+  } else {
+    OK(fixture.index_builder_->close(res));
+  }
   ASSERT_TRUE(res.inv_meta_.is_valid());
   fixture.finalize_inv_sstable_from_res(res, output);
 }
@@ -429,14 +447,15 @@ inline void build_production_merged_sstable(TestInvIdxSSTablePrepare &fixture,
     const ObDatumRange &merge_range,
     storage::ObDeletionBitmapHandle &deletion_bitmap_handle,
     ObInvSSTable &output,
-    InvMergeRunStats &stats)
+    InvMergeRunStats &stats,
+    const int16_t sstable_logic_seq = -1)
 {
   ASSERT_GT(inputs.count(), 0);
   // open_output_writer() rebuilds whole_desc_; construct the helper afterward so its borrowed
   // descriptor pointer observes the initialized output format throughout all reuse checks.
   ObInvIdxMacroBlockWriter writer;
   ObSSTablePrivateObjectCleaner cleaner;
-  open_output_writer(fixture, writer, cleaner);
+  open_output_writer(fixture, writer, cleaner, sstable_logic_seq);
   ASSERT_TRUE(writer.is_opened());
   ObInvSSTableMergeHelper merge_helper(
       read_info, fixture.inv_idx_row_desc_, fixture.allocator_, deletion_bitmap_handle,
@@ -450,12 +469,19 @@ inline void build_production_merged_sstable(TestInvIdxSSTablePrepare &fixture,
         *inputs.at(i), read_info, fixture.inv_idx_row_desc_, merge_range, fixture.allocator_));
     OK(merge_helper.iters_.push_back(merge_iter));
   }
-  OK(merge_helper.prepare_rows_merger_());
+  OK(merge_helper.prepare_rows_merger_(false /*is_full_merge*/));
   merge_helper.is_inited_ = true;
 
   compaction::ObLocalArena merger_arena("TInvLogical");
   compaction::ObTabletMergeDagParam dag_param;
+  if (sstable_logic_seq >= 0) {
+    dag_param.merge_type_ = compaction::INC_MAJOR_MERGE;
+    dag_param.exec_mode_ = compaction::EXEC_MODE_OUTPUT;
+  }
   compaction::ObStaticMergeParam static_param(dag_param);
+  if (sstable_logic_seq >= 0) {
+    static_param.sstable_logic_seq_ = sstable_logic_seq;
+  }
   ObPartitionInvSSTableMerger merger(merger_arena, static_param);
   merger.merge_helper_ = &merge_helper;
   merger.macro_writer_ = &writer;
@@ -1200,7 +1226,7 @@ TEST_F(TestInvIdxSSTablePrepare, duplicate_key_from_multiple_sources_is_rejected
   OK(iter_b->init(input, read_info, inv_idx_row_desc_, whole, allocator_));
   OK(helper.iters_.push_back(iter_a));
   OK(helper.iters_.push_back(iter_b));
-  OK(helper.prepare_rows_merger_());
+  OK(helper.prepare_rows_merger_(false /*is_full_merge*/));
   helper.is_inited_ = true;
 
   ObInvSSTableMergeIter *winner = nullptr;
@@ -1240,7 +1266,7 @@ TEST_F(TestInvIdxSSTablePrepare, merge_iter_over_capacity_is_rejected_before_all
   for (int64_t i = 0; i <= INV_MERGE_DEFAULT_ITER_COUNT; ++i) {
     OK(helper.iters_.push_back(nullptr));
   }
-  EXPECT_EQ(OB_ERR_UNEXPECTED, helper.prepare_rows_merger_());
+  EXPECT_EQ(OB_ERR_UNEXPECTED, helper.prepare_rows_merger_(false /*is_full_merge*/));
   EXPECT_EQ(nullptr, helper.cmp_);
   EXPECT_EQ(nullptr, helper.rows_merger_);
 }
@@ -1894,6 +1920,132 @@ TEST_F(TestInvIdxSSTablePrepare, op_open_fallback_lands_same_first_row_as_next)
 // 端到端宏块复用正确性：真实 append_macro_block() 生成复用输出，与逐行重写输出
 // 比较完整 posting payload 摘要；同时精确校验复用的宏块数量与最终输出宏块 ID 序列。
 // =============================================================================
+TEST_F(TestInvIdxSSTablePrepare, inc_major_generation_covers_all_inputs)
+{
+  ObInvSSTable inputs[2];
+  for (int64_t i = 0; i < 2; ++i) {
+    if (OB_NOT_NULL(index_builder_)) {
+      index_builder_->~ObSSTableIndexBuilder();
+      index_builder_ = nullptr;
+    }
+    build_inv_sstable(true, 10, inputs[i]);
+  }
+  for (const int16_t first_seq : {int16_t(7), int16_t(1021), int16_t(1022)}) {
+    SCOPED_TRACE(first_seq);
+    ObTabletMergeDagParam dag_param;
+    dag_param.merge_type_ = INC_MAJOR_MERGE;
+    dag_param.exec_mode_ = EXEC_MODE_OUTPUT;
+    ObStaticMergeParam static_param(dag_param);
+    for (int64_t i = 0; i < 2; ++i) {
+      ObSSTableMetaHandle meta;
+      OK(inputs[i].get_meta(meta));
+      const_cast<ObSSTableBasicMeta &>(meta.get_sstable_meta().get_basic_meta()).sstable_logic_seq_ = 0 == i ? first_seq : 2;
+      OK(static_param.tables_handle_.add_sstable(&inputs[i], ObStorageMetaHandle()));
+    }
+    OK(static_param.init_sstable_logic_seq());
+    const bool wrapped = first_seq + 1 == ObMacroDataSeq::MAX_SSTABLE_SEQ;
+    EXPECT_EQ(wrapped ? 0 : first_seq + 1, static_param.sstable_logic_seq_);
+    EXPECT_EQ(wrapped, static_param.is_full_merge_);
+  }
+}
+
+// Component regression: use the fixture's MINI writer for LocalDevice IO and
+// INC_MAJOR/OUTPUT parameters for merge policy. Actual shared-output writing is
+// covered by async_index_inc_major_output_create_sstable in simple_server.
+TEST_F(TestInvIdxSSTablePrepare, macro_generation_mixed_reuse_preserves_logical_ids)
+{
+  const int64_t row_count = 100000;
+  prepare_inv_idx_schema(table_schema_, true);
+  OK(prepare_inv_idx_row_desc(table_schema_, inv_idx_row_desc_));
+  ObInvSSTable tables[4];
+  {
+    ObInvIdxMacroBlockWriter writer;
+    ObSSTablePrivateObjectCleaner cleaner;
+    open_output_writer(*this, writer, cleaner, 0);
+    ObInvIdxRowFeeder feeder(inv_idx_row_desc_, mv_col_cnt_, true /*vary_posting_payload*/,
+                             0 /*initial_term_seq*/, 0 /*initial_doc_id*/);
+    OK(feeder.feed_n(writer, row_count));
+    finalize_output_sstable(*this, writer, tables[0]);
+  }
+  ASSERT_GT(tables[0].get_data_macro_block_count(), 1);
+  ObRowkeyReadInfo read_info;
+  OK(build_merge_read_info(allocator_, table_schema_, read_info));
+  ObDatumRange whole;
+  whole.set_whole_range();
+
+  for (int64_t round = 1; round <= 3; ++round) {
+    SCOPED_TRACE(round);
+    ObInvSSTable &input = tables[round - 1];
+    ObInvSSTable &output = tables[round];
+    ObSSTableMetaHandle meta;
+    OK(input.get_meta(meta));
+    const_cast<ObSSTableBasicMeta &>(meta.get_sstable_meta().get_basic_meta()).sstable_logic_seq_ = round - 1;
+    ObTabletMergeDagParam dag_param;
+    dag_param.merge_type_ = INC_MAJOR_MERGE;
+    dag_param.exec_mode_ = EXEC_MODE_OUTPUT;
+    ObStaticMergeParam static_param(dag_param);
+    OK(static_param.tables_handle_.add_sstable(&input, ObStorageMetaHandle()));
+    OK(static_param.init_sstable_logic_seq());
+    // Keep macro zero reusable and rewrite a later macro. Both would receive
+    // sequence zero without the generation, exactly the reported collision.
+    ObInvSSTableMergeIter dirty_iter;
+    OK(dirty_iter.init(input, read_info, inv_idx_row_desc_, whole, allocator_));
+    OK(dirty_iter.next_macro_block());
+    OK(dirty_iter.next_macro_block());
+    ObInvMacroMeta dirty_meta;
+    OK(dirty_iter.get_curr_macro_inv_meta(dirty_meta));
+    const uint64_t deleted_doc_id = dirty_meta.get_stats().min_doc_id_;
+    ObDeletionBitmapHandle deletion_bitmap;
+    OK(init_deletion_bitmap(allocator_, &deleted_doc_id, 1, deletion_bitmap));
+    ObSEArray<ObInvSSTable *, 1> inputs;
+    OK(inputs.push_back(&input));
+    InvMergeRunStats stats;
+    build_production_merged_sstable(*this, inputs, read_info, whole,
+                                    deletion_bitmap, output, stats, static_param.sstable_logic_seq_);
+    EXPECT_GT(stats.reused_macro_count_, 0);
+    EXPECT_LT(stats.reused_macro_count_, output.get_data_macro_block_count());
+
+    ObSEArray<ObLogicMacroBlockId, 8> ids;
+    ObInvSSTableMergeIter iter;
+    OK(iter.init(output, read_info, inv_idx_row_desc_, whole, allocator_));
+    int ret = iter.next_macro_block();
+    int64_t new_macro_count = 0;
+    bool reused_sequence_zero = false;
+    while (OB_SUCC(ret)) {
+      ObMacroBlockDesc desc;
+      OK(iter.get_macro_block_desc(desc));
+      const ObLogicMacroBlockId &id = desc.macro_meta_->val_.logic_id_;
+      EXPECT_EQ(static_cast<uint64_t>(TestInvIdxSSTablePrepare::SNAPSHOT_VERSION), id.logic_version_);
+      for (int64_t i = 0; i < ids.count(); ++i) {
+        EXPECT_NE(ids.at(i), id);
+      }
+      if (id.data_seq_.sstable_logic_seq_ == static_param.sstable_logic_seq_) {
+        if (0 == new_macro_count) {
+          EXPECT_EQ(0, id.data_seq_.get_version_local_seq());
+        }
+        ++new_macro_count;
+      } else if (0 == id.data_seq_.get_version_local_seq()) {
+        reused_sequence_zero = true;
+      }
+      OK(ids.push_back(id));
+      ret = iter.next_macro_block();
+    }
+    ASSERT_EQ(OB_ITER_END, ret);
+    EXPECT_EQ(output.get_data_macro_block_count() - stats.reused_macro_count_, new_macro_count);
+    EXPECT_TRUE(reused_sequence_zero);
+
+    ObInvSSTable rewritten;
+    build_filtered_rewritten_sstable(*this, input, read_info, deletion_bitmap, rewritten);
+    InvSSTableDigest actual;
+    InvSSTableDigest expected;
+    digest_inv_sstable(output, read_info, inv_idx_row_desc_, allocator_, actual);
+    digest_inv_sstable(rewritten, read_info, inv_idx_row_desc_, allocator_, expected);
+    EXPECT_EQ(row_count - round, actual.row_count_);
+    EXPECT_EQ(expected.rowkey_checksum_, actual.rowkey_checksum_);
+    EXPECT_EQ(expected.posting_checksum_, actual.posting_checksum_);
+  }
+}
+
 TEST_F(TestInvIdxSSTablePrepare, macro_reuse_output_matches_row_rewrite)
 {
   assert_macro_reuse_output_matches_row_rewrite(*this, true /*has_pos_list*/, 1000000);
@@ -2612,7 +2764,7 @@ TEST_F(TestInvIdxSSTablePrepare, deletion_rewrites_dirty_macro_and_reuses_clean_
   ASSERT_NE(nullptr, merge_iter);
   OK(merge_iter->init(input, read_info, inv_idx_row_desc_, whole, allocator_));
   OK(merge_helper.iters_.push_back(merge_iter));
-  OK(merge_helper.prepare_rows_merger_());
+  OK(merge_helper.prepare_rows_merger_(false /*is_full_merge*/));
   merge_helper.is_inited_ = true;
 
   compaction::ObLocalArena merger_arena("TInvDelete");
@@ -2790,7 +2942,7 @@ TEST_F(TestInvIdxSSTablePrepare, clustered_deletion_rewrites_dirty_macro_and_reu
   ASSERT_NE(nullptr, merge_iter);
   OK(merge_iter->init(input, read_info, inv_idx_row_desc_, whole, allocator_));
   OK(merge_helper.iters_.push_back(merge_iter));
-  OK(merge_helper.prepare_rows_merger_());
+  OK(merge_helper.prepare_rows_merger_(false /*is_full_merge*/));
   merge_helper.is_inited_ = true;
 
   compaction::ObLocalArena merger_arena("TInvClstDel");
@@ -2900,7 +3052,7 @@ TEST_F(TestInvIdxSSTablePrepare, multi_source_merger_reuses_unambiguous_macros)
   OK(iter_b->init(input_b, read_info, inv_idx_row_desc_, whole, allocator_));
   OK(helper.iters_.push_back(iter_a));
   OK(helper.iters_.push_back(iter_b));
-  OK(helper.prepare_rows_merger_());
+  OK(helper.prepare_rows_merger_(false /*is_full_merge*/));
   helper.is_inited_ = true;
 
   compaction::ObLocalArena merger_arena("TInvReuse");
@@ -3309,7 +3461,7 @@ TEST_F(TestInvIdxSSTablePrepare, clustered_multi_source_merger_reuses_unambiguou
   OK(iter_b->init(input_b, read_info, inv_idx_row_desc_, whole, allocator_));
   OK(helper.iters_.push_back(iter_a));
   OK(helper.iters_.push_back(iter_b));
-  OK(helper.prepare_rows_merger_());
+  OK(helper.prepare_rows_merger_(false /*is_full_merge*/));
   helper.is_inited_ = true;
 
   compaction::ObLocalArena merger_arena("TInvClstMulti");
