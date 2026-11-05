@@ -1608,6 +1608,14 @@ int ObSSMetaService::do_update_tablet_table_store_(
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("old_ss_tablet is nullptr", KR(ret), K(ls_id), K(tablet_id));
       } else if (OB_NOT_NULL(param.sstable_)
+          && param.sstable_->is_inc_major_ddl_dump_sstable()
+          && param.sstable_->get_end_scn() <= old_ss_tablet->get_ddl_checkpoint_scn()) {
+        // Recheck the uploader's coverage condition against the latest Shared metadata.
+        need_update = false;
+        LOG_INFO("skip inc major dump covered by shared DDL checkpoint", K(ls_id), K(tablet_id),
+                 "dump_end_scn", param.sstable_->get_end_scn(),
+                 "ddl_checkpoint_scn", old_ss_tablet->get_ddl_checkpoint_scn());
+      } else if (OB_NOT_NULL(param.sstable_)
           && param.sstable_->is_inc_major_type_sstable()
           && ObIncMajorSSTableAction::ADD == param.inc_major_sstable_action_
           && param.ddl_info_.need_check_ddl_checkpoint_
@@ -1634,7 +1642,7 @@ int ObSSMetaService::do_update_tablet_table_store_(
       // for minor merge: verify all input sstables still exist in table-store, abort if any was GC'd
       // minor merge是'read-modify-write'流程，避免从调度到执行的时间内，有其他并发操作将输入sstable GC掉了;
       // 同时，也会检查sstable的filled_tx_scn是否一致，避免sstable元数据被修改
-      if (OB_SUCC(ret) && param.compaction_info_.merge_type_ == compaction::ObMergeType::MINOR_MERGE) {
+      if (OB_SUCC(ret) && compaction::ObMergeType::MINOR_MERGE == param.compaction_info_.merge_type_) {
         if (ObMetaUpdateReason::TABLET_UPLOAD_COMPACT_ADD_DATA_MINOR_SSTABLE == update_reason) {
         // this type of minor is compaction of local sstables
         } else if (OB_ISNULL(param.input_tables_handle_)) {
@@ -1680,7 +1688,7 @@ int ObSSMetaService::do_update_tablet_table_store_(
       } else if (!need_update) {
         // Release the empty atomic operation without creating a tablet version.
         if (OB_FAIL(tablet_protocol.abort_self())) {
-          LOG_WARN("failed to finish redundant dli end replay", KR(ret));
+          LOG_WARN("failed to finish covered inc major update", KR(ret), K(ls_id), K(tablet_id));
         }
       } else if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), data_version))) {
         LOG_WARN("fail to get min data version", KR(ret));

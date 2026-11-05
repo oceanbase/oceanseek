@@ -23,6 +23,7 @@ namespace storage
 {
 class ObLS;
 class ObLSIncSSTableUploader;
+class ObDDLIncLogBasic;
 class ObSSMetaUpdateMetaInfo;
 struct ObUploadRangeCheckResult;
 
@@ -278,6 +279,9 @@ public:
   void on_sstable_upload_succ(blocksstable::ObSSTable &sstable);
   int get_upload_min_end_scn_from_ss(share::SCN &min_end_scn);
   int get_tablet_upload_pos(const ObTabletID &tablet_id, const share::SCN &transfer_scn, share::SCN &upload_scn);
+  // Caller has stopped this batch's writes and drained its log callbacks.
+  // Final IncMajor publication must also advance the Shared DDL checkpoint.
+  int check_inc_major_dump_ready(const ObDDLIncLogBasic &batch_key, bool &ready);
 
   // ATTENTION: 不保证 emergency 任务一定注册成功，依赖上层重试
   int schedule_emergency_tablet_upload(const ObTabletID &tablet_id);
@@ -301,6 +305,8 @@ public:
   bool is_processing() { return ATOMIC_LOAD(&is_processing_); }
 
 private:
+  int check_inc_major_ddl_kvs_(const ObDDLIncLogBasic &batch_key, bool &pending);
+  int check_inc_major_ddl_checkpoint_(const ObDDLIncLogBasic &batch_key, bool &pending);
   int update_ckpt_on_ss_ls_meta_();
   int init_uploaded_info_(const IncSSTUploadInfo &upload_info,
                           const ObTabletHandle &local_tablet,

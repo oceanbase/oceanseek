@@ -552,7 +552,13 @@ int ObDDLMergeScheduler::schedule_tablet_ddl_inc_major_merge_for_ss(
       LOG_INFO("The tablet in the transfer process does not do ddl major_merge", K(tablet_handle));
     }
   } else if (OB_FAIL(tablet_handle.get_obj()->get_ddl_kv_mgr(ddl_kv_mgr_handle))) {
-    LOG_WARN("fail to get ddl kv mgr", KR(ret));
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      // No KV to dump; allow the caller to clean up dumps of finished transactions.
+      ret = OB_SUCCESS;
+      LOG_DEBUG("ddl kv mgr not exist, skip inc major kv merge", K(tablet_handle.get_obj()->get_tablet_id()));
+    } else {
+      LOG_WARN("fail to get ddl kv mgr", KR(ret));
+    }
   } else if (OB_UNLIKELY(!ddl_kv_mgr_handle.is_valid())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ddl kv mgr is unexpected", KR(ret));

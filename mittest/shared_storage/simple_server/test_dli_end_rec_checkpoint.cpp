@@ -392,6 +392,17 @@ TEST_F(TestDliEndRecCheckpoint, dump_checkpoint_does_not_skip_final_publication)
       *ctx.local_.get_obj(), dump, *ctx.schema_, DATA_VERSION_4_6_3_0, false,
       ctx.allocator_, param));
   ASSERT_EQ(ctx.rec_scn_, param.ddl_info_.ddl_checkpoint_scn_);
+  ObTabletHandle installed_local;
+  ASSERT_EQ(OB_SUCCESS, ctx.ls_.get_ls()->update_tablet_table_store(
+      ctx.tablet_id_, param, installed_local));
+  ObDDLIncLogBasic batch_key;
+  ASSERT_EQ(OB_SUCCESS, batch_key.init(ctx.tablet_id_, ObTabletID(), ObTabletID(),
+      DIRECT_LOAD_INCREMENTAL_MAJOR, ObTransID(77001), ObTxSEQ::from_seq(1),
+      ctx.local_.get_obj()->get_snapshot_version(), DATA_VERSION_4_6_3_0));
+  bool pending = false;
+  ASSERT_EQ(OB_SUCCESS, ctx.ls_.get_ls()->get_inc_sstable_uploader().check_inc_major_ddl_checkpoint_(
+      batch_key, pending));
+  ASSERT_TRUE(pending); // The local dump has not reached Shared yet.
   ObArray<ObSSMetaCtrlKeyInfo> keys;
   ASSERT_EQ(OB_SUCCESS, MTL(ObSSMetaService *)->update_tablet_table_store(ctx.ls_id_,
       ctx.tablet_id_, ctx.reorganization_scn_,
@@ -402,6 +413,9 @@ TEST_F(TestDliEndRecCheckpoint, dump_checkpoint_does_not_skip_final_publication)
   ASSERT_EQ(0, count);
   ASSERT_EQ(ctx.rec_scn_, ctx.shared_.get_obj()->get_ddl_checkpoint_scn());
   ASSERT_LT(ctx.shared_.get_obj()->get_ddl_checkpoint_scn(), ctx.end_scn_);
+  ASSERT_EQ(OB_SUCCESS, ctx.ls_.get_ls()->get_inc_sstable_uploader().check_inc_major_ddl_checkpoint_(
+      batch_key, pending));
+  ASSERT_FALSE(pending);
   ObTableStoreIterator installed_dumps;
   ASSERT_EQ(OB_SUCCESS, ctx.shared_.get_obj()->get_inc_major_ddl_sstables(
       installed_dumps, ObTransID(77001), ObTxSEQ::from_seq(1)));
@@ -1563,6 +1577,15 @@ TEST_F(TestDliEndRecCheckpoint, final_publication_uses_latest_batch_scn_without_
       ctx.tablet_id_, ctx.local_, ObTabletCommon::DEFAULT_GET_TABLET_NO_WAIT,
       ObMDSGetTabletMode::READ_ALL_COMMITED));
   ASSERT_EQ(ctx.end_scn_, ctx.local_.get_obj()->get_ddl_checkpoint_scn());
+  // A later batch with no dumps must not wait for the previous END to reach Shared.
+  ObDDLIncLogBasic next_batch;
+  ASSERT_EQ(OB_SUCCESS, next_batch.init(ctx.tablet_id_, ObTabletID(), ObTabletID(),
+      DIRECT_LOAD_INCREMENTAL_MAJOR, trans_id, ObTxSEQ::from_seq(2),
+      ctx.local_.get_obj()->get_snapshot_version(), DATA_VERSION_4_6_3_0));
+  bool pending = true;
+  ASSERT_EQ(OB_SUCCESS, ctx.ls_.get_ls()->get_inc_sstable_uploader().check_inc_major_ddl_checkpoint_(
+      next_batch, pending));
+  ASSERT_FALSE(pending);
   ASSERT_EQ(OB_SUCCESS, exe_sql("drop table rec_end_publish_boundary"));
 }
 
@@ -1731,14 +1754,21 @@ TEST_F(TestDliEndRecCheckpoint, primary_sql_keeps_data_checkpoint_for_main_and_l
 
 int main(int argc, char **argv)
 {
+  const char *bucket = getenv("OB_MITTEST_S3_BUCKET");
+  const char *endpoint = getenv("OB_MITTEST_S3_ENDPOINT");
+  const char *access_id = getenv("OB_MITTEST_S3_AK");
+  const char *access_key = getenv("OB_MITTEST_S3_SK");
+  const char *region = getenv("OB_MITTEST_S3_REGION");
   char storage_info[1000] = {0};
   const int64_t prefix = ObTimeUtility::current_time_ns();
   const int format_ret = databuff_printf(storage_info, sizeof(storage_info),
       "%s/%lu?host=%s&access_id=%s&access_key=%s&s3_region=%s"
       "&max_iops=10000&max_bandwidth=200000000B&scope=region",
-      oceanbase::unittest::S3_BUCKET, prefix, oceanbase::unittest::S3_ENDPOINT,
-      oceanbase::unittest::S3_AK, oceanbase::unittest::S3_SK,
-      oceanbase::unittest::S3_REGION);
+      nullptr == bucket ? oceanbase::unittest::S3_BUCKET : bucket, prefix,
+      nullptr == endpoint ? oceanbase::unittest::S3_ENDPOINT : endpoint,
+      nullptr == access_id ? oceanbase::unittest::S3_AK : access_id,
+      nullptr == access_key ? oceanbase::unittest::S3_SK : access_key,
+      nullptr == region ? oceanbase::unittest::S3_REGION : region);
   if (OB_SUCCESS != format_ret) {
     return format_ret;
   }

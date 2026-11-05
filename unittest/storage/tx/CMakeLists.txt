@@ -56,3 +56,5 @@ storage_unittest(test_freeze_mds_submit)
 storage_unittest(test_trans_callback_mgr_fill_redo)
 storage_unittest(test_misc)
 storage_unittest(test_gts_source_lifecycle)
+
+storage_unittest(test_dli_abort_gate)
