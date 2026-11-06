@@ -204,7 +204,7 @@ int Threads::start()
     stack_size_ = calc_available_stack_size(get_tenant_stack_size(run_wrapper_->id()));
   }
   if (OB_SUCC(ret)) {
-    stop_ = false;
+    ATOMIC_STORE(&stop_, false);
     MEMSET(threads_, 0, sizeof (Thread*) * n_threads_);
     for (int i = 0; i < n_threads_; i++) {
       Thread *thread = nullptr;
@@ -283,7 +283,7 @@ void Threads::wait()
 void Threads::stop()
 {
   common::SpinRLockGuard g(lock_);
-  stop_ = true;
+  ATOMIC_STORE(&stop_, true);
   if (OB_NOT_NULL(threads_)) {
     for (int i = 0; i < n_threads_; i++) {
       if (threads_[i] != nullptr) {
