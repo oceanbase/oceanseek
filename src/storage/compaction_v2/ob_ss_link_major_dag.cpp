@@ -21,8 +21,7 @@ bool ObLinkSSMajorSSTableDag::operator==(const ObIDag &other) const
   } else {
     const ObLinkSSMajorSSTableDag &o = static_cast<const ObLinkSSMajorSSTableDag&>(other);
     if (o.param_.ls_id_ == param_.ls_id_ 
-        && o.param_.tablet_id_ == param_.tablet_id_
-        && o.param_.merge_version_ == param_.merge_version_) {
+        && o.param_.tablet_id_ == param_.tablet_id_) {
       bret = true;
     }
   }
@@ -34,7 +33,6 @@ uint64_t ObLinkSSMajorSSTableDag::hash() const
   uint64_t hash_value = 0;
   hash_value = param_.tablet_id_.hash();
   hash_value = common::murmurhash(&param_.ls_id_, sizeof(param_.ls_id_), hash_value);
-  hash_value = common::murmurhash(&param_.merge_version_, sizeof(param_.merge_version_), hash_value);
   return hash_value;
 }
 
