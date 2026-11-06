@@ -1272,7 +1272,7 @@ int ObBasicTabletMergeCtx::init_static_desc()
     LOG_WARN("failed to init static desc", KR(ret), KPC(this));
   } else if (GCTX.is_shared_storage_mode()
       && (is_multi_version_merge(get_merge_type())
-          || is_inc_major_merge(get_merge_type()))
+          || (is_inc_major_merge(get_merge_type()) && is_output_exec_mode(get_exec_mode())))
       && FALSE_IT(static_desc_.set_sstable_logic_seq(
           static_param_.sstable_logic_seq_))) {
   } else {
