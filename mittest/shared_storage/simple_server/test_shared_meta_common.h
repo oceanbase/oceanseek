@@ -309,8 +309,8 @@ private:
 class TestSharedMetaService : public ObSimpleClusterTestBase
 {
 public:
-  TestSharedMetaService()
-    : ObSimpleClusterTestBase("test_shared_meta_service", "50G", "50G", "50G")
+  explicit TestSharedMetaService(const char *env_prefix = "test_shared_meta_service")
+    : ObSimpleClusterTestBase(env_prefix, "50G", "50G", "50G")
   {}
 
   int exe_sql(const char *sql_str)

@@ -273,9 +273,11 @@ int ObIncDDLMergeTaskUtils::link_inc_major(
     ObLS *ls,
     const ObTabletHandle &tablet_handle,
     const ObTransID &trans_id,
-    const ObTxSEQ &seq_no)
+    const ObTxSEQ &seq_no,
+    const SCN &ddl_checkpoint_scn)
 {
   int ret = OB_SUCCESS;
+  bool is_linked = false;
   if (OB_UNLIKELY(ls == nullptr || !tablet_handle.is_valid() || !trans_id.is_valid() ||
                   !seq_no.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
@@ -311,12 +313,21 @@ int ObIncDDLMergeTaskUtils::link_inc_major(
                                                                    tablet_id,
                                                                    snapshot_version,
                                                                    trans_id,
-                                                                   seq_no))) {
+                                                                   seq_no,
+                                                                   ddl_checkpoint_scn,
+                                                                   is_linked))) {
       LOG_WARN("fail to link inc major", KR(ret), K(ls_id), K(tablet_id),
                K(snapshot_version), K(trans_id), K(seq_no));
     } else {
-      FLOG_INFO("[SS INC MAJOR] link inc major succeed", K(ls_id), K(tablet_id), K(trans_id),
-                K(seq_no), K(is_exist));
+      if (!is_linked && OB_FAIL(ls->update_tablet_ddl_checkpoint(tablet_id,
+          ls->get_rebuild_seq(), tablet_handle.get_obj()->get_transfer_seq(),
+          ddl_checkpoint_scn))) {
+        LOG_WARN("failed to persist local END checkpoint", KR(ret), K(tablet_id), K(ddl_checkpoint_scn));
+      }
+      if (OB_SUCC(ret)) {
+        FLOG_INFO("[SS INC MAJOR] link inc major succeed", K(ls_id), K(tablet_id), K(trans_id),
+                  K(seq_no), K(is_exist));
+      }
     }
   }
   return ret;

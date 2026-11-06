@@ -1658,6 +1658,76 @@ int ObLSTabletService::update_fork_all_replicas_land_complete(const share::SCN &
   return ret;
 }
 
+int ObLSTabletService::ObUpdateDDLCheckpoint::modify_tablet_meta(ObTabletMeta &meta)
+{
+  meta.ddl_checkpoint_scn_ = SCN::max(meta.ddl_checkpoint_scn_, ddl_checkpoint_scn_);
+  return OB_SUCCESS;
+}
+
+int ObLSTabletService::update_tablet_ddl_checkpoint(const common::ObTabletID &tablet_id,
+    const int64_t transfer_seq, const SCN &ddl_checkpoint_scn)
+{
+  int ret = OB_SUCCESS;
+  ObTabletHandle old_handle;
+  uint64_t data_version = 0;
+  ObTimeGuard time_guard("ObLSTabletService::update_tablet_ddl_checkpoint", 1_s);
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not inited", K(ret));
+  } else if (OB_UNLIKELY(!tablet_id.is_valid() || transfer_seq < 0
+      || !ddl_checkpoint_scn.is_valid_and_not_min() || ddl_checkpoint_scn.is_max())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid checkpoint update", K(ret), K(tablet_id), K(transfer_seq), K(ddl_checkpoint_scn));
+  } else {
+    TabletBucketWLockGuard lock_guard(*this, tablet_id);
+    time_guard.click("Lock");
+    if (OB_FAIL(lock_guard.get_ret())) {
+      LOG_WARN("failed to lock tablet", K(ret), K(tablet_id));
+    } else if (OB_FAIL(direct_get_tablet(tablet_id, old_handle))) {
+      LOG_WARN("failed to get tablet", K(ret), K(tablet_id));
+    } else if (old_handle.get_obj()->is_empty_shell()) {
+      // Match the existing Local update contract for a deleted tablet.
+    } else if (OB_FAIL(ObTablet::check_transfer_seq_equal(*old_handle.get_obj(), transfer_seq))) {
+      LOG_WARN("tablet transfer changed before checkpoint update", K(ret), K(tablet_id), K(transfer_seq));
+    } else if (old_handle.get_obj()->get_ddl_checkpoint_scn() >= ddl_checkpoint_scn) {
+      // Recheck the latest tablet under the bucket lock before allocating a new version.
+    } else if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), data_version))) {
+      LOG_WARN("failed to get data version", K(ret));
+    } else {
+      ObTablet *old_tablet = old_handle.get_obj();
+      const ObTabletMapKey key(ls_->get_ls_id(), tablet_id);
+      int32_t private_transfer_epoch = -1;
+      int64_t tablet_meta_version = 0;
+      if (OB_FAIL(old_tablet->get_private_transfer_epoch(private_transfer_epoch))) {
+        LOG_WARN("failed to get private transfer epoch", K(ret), KPC(old_tablet));
+      } else if (OB_FAIL(alloc_private_tablet_meta_version_without_lock(
+          key, tablet_meta_version))) {
+        LOG_WARN("failed to alloc tablet meta version", K(ret), K(key));
+      } else {
+        const SCN &reorg_scn = old_tablet->get_reorganization_scn();
+        const ObTabletPersisterParam param(data_version, ls_->get_ls_id(), ls_->get_ls_epoch(),
+            tablet_id, private_transfer_epoch, tablet_meta_version, reorg_scn);
+        ObUpdateDDLCheckpoint modifier(ddl_checkpoint_scn);
+        ObTabletHandle new_handle;
+        if (OB_FAIL(old_tablet->check_valid())) {
+          LOG_WARN("failed to check tablet valid", K(ret), KPC(old_tablet));
+        } else if (OB_FAIL(ObTabletPersister::persist_and_transform_only_tablet_meta(
+            reorg_scn, param, *old_tablet, modifier, new_handle))) {
+          LOG_WARN("failed to persist local ddl checkpoint", K(ret), K(tablet_id), K(ddl_checkpoint_scn));
+        } else if (FALSE_IT(time_guard.click("Persist"))) {
+        } else if (OB_FAIL(safe_update_cas_tablet(key, new_handle.get_obj()->get_tablet_addr(),
+            old_handle, new_handle, time_guard, SCN::invalid_scn()))) {
+          LOG_WARN("failed to publish local ddl checkpoint", K(ret), K(tablet_id), K(ddl_checkpoint_scn));
+        } else {
+          LOG_INFO("updated local ddl checkpoint", K(tablet_id), K(ddl_checkpoint_scn),
+              "old_checkpoint_scn", old_tablet->get_ddl_checkpoint_scn(), K(time_guard));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObLSTabletService::update_tablet_snapshot_version(
     const common::ObTabletID &tablet_id,
     const int64_t snapshot_version)

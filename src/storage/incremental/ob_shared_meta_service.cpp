@@ -1595,6 +1595,8 @@ int ObSSMetaService::do_update_tablet_table_store_(
       // must have ss tablet first and then update.
       bool can_generate_new_tablet = true;
       bool can_gc_sstable = true;
+      // Whether to persist a new Shared tablet version.
+      bool need_update = true;
       ObSSTabletHdlDesFunc deserialize_func(ls_id, tablet_id, reorgan_scn, op_id, &allocator);
       if (CLICK_FAIL(tablet_meta_op.read_meta_info<ObTabletHandle>(old_ss_tablet_hdl, deserialize_func))) {
         if (OB_OBJECT_NOT_EXIST == ret) {
@@ -1605,22 +1607,42 @@ int ObSSMetaService::do_update_tablet_table_store_(
       } else if (OB_ISNULL(old_ss_tablet = old_ss_tablet_hdl.get_obj())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("old_ss_tablet is nullptr", KR(ret), K(ls_id), K(tablet_id));
-        // split和transfer会限制生成新版本与回收sstable
-      } else if (OB_FAIL(compaction::ObSSTabletMergeHelper::check_can_generate_new_tablet(
-                ls_id, old_ss_tablet_hdl/*shared_tablet_hdl*/, update_reason, true/*need_check_split*/,
-                can_generate_new_tablet, can_gc_sstable))) {
-        LOG_WARN("fail to check can_generate_new_tablet", KR(ret), K(old_ss_tablet_hdl));
-      } else if (!can_generate_new_tablet) {
-        ret = OB_OP_NOT_ALLOW;
-        LOG_WARN("disallowed to generate a new version", KR(ret), K(ls_id), K(tablet_id), K(reorgan_scn));
-      } else if (OB_FAIL(old_ss_tablet->fetch_table_store_with_prewarm(table_store_wrapper))) {
-        LOG_WARN("fail to fetch table store with sstable meta prewarm", KR(ret), K(ls_id), K(tablet_id));
+      } else if (OB_NOT_NULL(param.sstable_)
+          && param.sstable_->is_inc_major_ddl_dump_sstable()
+          && param.sstable_->get_end_scn() <= old_ss_tablet->get_ddl_checkpoint_scn()) {
+        // Recheck the uploader's coverage condition against the latest Shared metadata.
+        need_update = false;
+        LOG_INFO("skip inc major dump covered by shared DDL checkpoint", K(ls_id), K(tablet_id),
+                 "dump_end_scn", param.sstable_->get_end_scn(),
+                 "ddl_checkpoint_scn", old_ss_tablet->get_ddl_checkpoint_scn());
+      } else if (OB_NOT_NULL(param.sstable_)
+          && param.sstable_->is_inc_major_type_sstable()
+          && ObIncMajorSSTableAction::ADD == param.inc_major_sstable_action_
+          && param.ddl_info_.need_check_ddl_checkpoint_
+          && old_ss_tablet->get_ddl_checkpoint_scn() >= param.ddl_info_.ddl_checkpoint_scn_) {
+        // END replay supplies the actual log SCN, so exact coverage is sufficient.
+        need_update = false;
+        LOG_INFO("skip completed dli end replay in atomic update", K(ls_id), K(tablet_id),
+            "end_scn", param.ddl_info_.ddl_checkpoint_scn_,
+            "shared_ddl_checkpoint_scn", old_ss_tablet->get_ddl_checkpoint_scn());
+      } else if (need_update) {
+        // Split and transfer constrain new versions, not an already completed END.
+        if (OB_FAIL(compaction::ObSSTabletMergeHelper::check_can_generate_new_tablet(
+            ls_id, old_ss_tablet_hdl/*shared_tablet_hdl*/, update_reason, true/*need_check_split*/,
+            can_generate_new_tablet, can_gc_sstable))) {
+          LOG_WARN("fail to check can_generate_new_tablet", KR(ret), K(old_ss_tablet_hdl));
+        } else if (!can_generate_new_tablet) {
+          ret = OB_OP_NOT_ALLOW;
+          LOG_WARN("disallowed to generate a new version", KR(ret), K(ls_id), K(tablet_id), K(reorgan_scn));
+        } else if (OB_FAIL(old_ss_tablet->fetch_table_store_with_prewarm(table_store_wrapper))) {
+          LOG_WARN("fail to fetch table store with sstable meta prewarm", KR(ret), K(ls_id), K(tablet_id));
+        }
       }
 
       // for minor merge: verify all input sstables still exist in table-store, abort if any was GC'd
       // minor merge是'read-modify-write'流程，避免从调度到执行的时间内，有其他并发操作将输入sstable GC掉了;
       // 同时，也会检查sstable的filled_tx_scn是否一致，避免sstable元数据被修改
-      if (OB_SUCC(ret) && param.compaction_info_.merge_type_ == compaction::ObMergeType::MINOR_MERGE) {
+      if (OB_SUCC(ret) && compaction::ObMergeType::MINOR_MERGE == param.compaction_info_.merge_type_) {
         if (ObMetaUpdateReason::TABLET_UPLOAD_COMPACT_ADD_DATA_MINOR_SSTABLE == update_reason) {
         // this type of minor is compaction of local sstables
         } else if (OB_ISNULL(param.input_tables_handle_)) {
@@ -1636,7 +1658,7 @@ int ObSSMetaService::do_update_tablet_table_store_(
       ObSEArray<UpdateUpperTransParam::SCNAndVersion, 4> upper_trans_list;
       upper_trans_list.set_attr(ObMemAttr(MTL_ID(), "SSCaclUppVer"));
       // 如果sstable不允许被gc，回填upper_trans_version就没有收益；且查询事务模块是有实际开销的
-      if (OB_SUCC(ret) && can_gc_sstable) {
+      if (OB_SUCC(ret) && need_update && can_gc_sstable) {
         if (CLICK_TMP_FAIL(build_upper_trans_version_update_info_v2_(ls_id, *old_ss_tablet, upper_trans_list))) {
           LOG_WARN("build upper trans version param fail", K(tmp_ret), K(ls_id), K(tablet_id));
         } else if (OB_FALSE_IT(CLICK())) {
@@ -1651,6 +1673,7 @@ int ObSSMetaService::do_update_tablet_table_store_(
       ObTablet *tmp_tablet = nullptr;
       ObTabletHandle tmp_tablet_hdl;
       if (OB_FAIL(ret)) {
+      } else if (!need_update) {
       } else if (OB_FAIL(ObTabletCreateDeleteHelper::acquire_tmp_tablet(ObTabletMapKey(ls_id, tablet_id), allocator, tmp_tablet_hdl))) { // todo feidu inc_shared_storage : tablet maybe not exist in this server
         LOG_WARN("fail to acquire temporary tablet", KR(ret), K(ls_id), K(tablet_id));
       } else if (OB_ISNULL(tmp_tablet = tmp_tablet_hdl.get_obj())) {
@@ -1662,6 +1685,11 @@ int ObSSMetaService::do_update_tablet_table_store_(
 
       // 5. persist new tablet
       if (OB_FAIL(ret)) {
+      } else if (!need_update) {
+        // Release the empty atomic operation without creating a tablet version.
+        if (OB_FAIL(tablet_protocol.abort_self())) {
+          LOG_WARN("failed to finish covered inc major update", KR(ret), K(ls_id), K(tablet_id));
+        }
       } else if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), data_version))) {
         LOG_WARN("fail to get min data version", KR(ret));
       } else if (CLICK_FAIL(persist_tablet_(data_version, tmp_tablet, update_reason, &tablet_meta_op,

@@ -1134,7 +1134,8 @@ int ObTabletFullDirectLoadMgrV2::update_table_store(
     LOG_INFO("major already exist on shared tablet, skip update shared tablet", K(ret), K(table_key), K(ls_id_));
   } else if (FALSE_IT(DEBUG_SYNC(BEFORE_DIRECT_LOAD_UPDATE_SHARED_TABLE_STORE))) {
   } else if (OB_FAIL(ObSSDDLUtil::update_shared_tablet_table_store(ls_handle, *out_sstable,
-      *storage_schema, data_format_version_, transfer_scn, false/*check_lease*/))) {
+      *storage_schema, data_format_version_, transfer_scn, false/*check_lease*/,
+      SCN::min_scn(), false/*need_check_ddl_checkpoint*/))) {
     LOG_WARN("failed to update shared tablet", K(ret), K(tablet_id_), K(ls_id_));
   }
   if (FAILEDx(write_ddl_finish_log_(allocator, *out_sstable))) {

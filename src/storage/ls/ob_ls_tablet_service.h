@@ -260,6 +260,8 @@ public:
   int update_tablet_inc_major_replay_scn(
       const common::ObTabletID &tablet_id,
       const share::SCN &inc_major_replay_scn);
+  int update_tablet_ddl_checkpoint(const common::ObTabletID &tablet_id,
+      const int64_t transfer_seq, const share::SCN &ddl_checkpoint_scn);
   int update_tablet_snapshot_version(
       const common::ObTabletID &tablet_id,
       const int64_t snapshot_version);
@@ -763,6 +765,17 @@ private:
   private:
     const share::SCN inc_major_replay_scn_;
     DISALLOW_COPY_AND_ASSIGN(ObUpdateIncMajorReplayScn);
+  };
+  class ObUpdateDDLCheckpoint final : public ObITabletMetaModifier
+  {
+  public:
+    explicit ObUpdateDDLCheckpoint(const share::SCN &ddl_checkpoint_scn)
+      : ddl_checkpoint_scn_(ddl_checkpoint_scn) {}
+    virtual ~ObUpdateDDLCheckpoint() = default;
+    virtual int modify_tablet_meta(ObTabletMeta &meta) override;
+  private:
+    const share::SCN ddl_checkpoint_scn_;
+    DISALLOW_COPY_AND_ASSIGN(ObUpdateDDLCheckpoint);
   };
   class ObUpdateTabletReportStatus final : public ObITabletMetaModifier
   {

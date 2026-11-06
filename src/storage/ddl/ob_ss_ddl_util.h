@@ -33,13 +33,16 @@ public:
     const int64_t &snapshot_version,
     ObArenaAllocator &allocator,
     bool &is_exist);
+  // IncMajor END forwards its checkpoint-check flag to the atomic Shared ADD.
   static int update_shared_tablet_table_store(
     ObLSHandle &ls_handle,
     const blocksstable::ObSSTable &sstable,
     const storage::ObStorageSchema &storage_schema,
     const uint64_t &data_format_version,
     const share::SCN &transfer_scn,
-    const bool check_lease);
+    const bool check_lease,
+    const share::SCN &ddl_checkpoint_scn,
+    const bool need_check_ddl_checkpoint);
 
   static int update_shared_tablet_table_store(
     ObLS &ls,
@@ -47,7 +50,9 @@ public:
     const storage::ObStorageSchema &storage_schema,
     const uint64_t &data_format_version,
     const share::SCN &transfer_scn,
-    const bool check_lease);
+    const bool check_lease,
+    const share::SCN &ddl_checkpoint_scn,
+    const bool need_check_ddl_checkpoint);
 private:
   static int build_update_table_store_param_(
     ObLS &ls,

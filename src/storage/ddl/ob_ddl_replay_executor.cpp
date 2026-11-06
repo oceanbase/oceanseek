@@ -17,6 +17,7 @@
 #include "storage/compaction_v2/ob_ss_compact_helper.h"
 #include "storage/ddl/ob_ss_ddl_util.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
+#include "storage/incremental/ob_shared_meta_service.h"
 #include "share/scheduler/ob_partition_auto_split_helper.h"
 #endif
 using namespace oceanbase::common;
@@ -1882,7 +1883,8 @@ ObDDLIncMajorCommitReplayExecutor::ObDDLIncMajorCommitReplayExecutor()
     tablet_id_(),
     is_rollback_(false),
     is_co_sstable_(false),
-    inc_major_buffer_(nullptr)
+    inc_major_buffer_(nullptr),
+    need_check_ddl_checkpoint_(false)
 {
 }
 
@@ -1897,7 +1899,8 @@ int ObDDLIncMajorCommitReplayExecutor::init(
     const bool is_rollback,
     const bool is_co_sstable,
     const ObString &inc_major_buffer,
-    const share::SCN &start_scn)
+    const share::SCN &start_scn,
+    const bool need_check_ddl_checkpoint)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(is_inited_)) {
@@ -1926,6 +1929,7 @@ int ObDDLIncMajorCommitReplayExecutor::init(
     is_co_sstable_ = is_co_sstable;
     inc_major_buffer_ = inc_major_buffer;
     start_scn_ = start_scn;
+    need_check_ddl_checkpoint_ = need_check_ddl_checkpoint;
     is_inited_ = true;
   }
   return ret;
@@ -1947,7 +1951,7 @@ int ObDDLIncMajorCommitReplayExecutor::deserialize_and_update_ss_inc_major(
     ObCOSSTableV2 co_sstable;
     ObInvSSTable inv_sstable;
     ObSSTable *inc_major_ptr = &sstable;
-    bool is_exist = false;
+    bool can_skip_shared_add = false;
     ObStorageSchema *storage_schema = nullptr;
     if (is_co_sstable_) {
       inc_major_ptr = &co_sstable;
@@ -1959,40 +1963,45 @@ int ObDDLIncMajorCommitReplayExecutor::deserialize_and_update_ss_inc_major(
                                                                           inc_major_ptr))) {
       LOG_WARN("fail to deserialize inc major from string", KR(ret), K(is_co_sstable_));
     } else if (inc_major_ptr->is_empty()
-               && (tablet_handle.get_obj()->is_async_index_refresh_target()
+               && (need_check_ddl_checkpoint_
+                   || tablet_handle.get_obj()->is_async_index_refresh_target()
                    || inc_major_ptr->get_end_scn().is_min())) {
+      // Foreground does not install empty results, including ordinary batches with finite SCNs.
       need_publish = false;
       LOG_INFO("skip publishing empty inc major sstable in replay",
                KPC(inc_major_ptr));
-    } else if (OB_FAIL(OB_E(EN_REPLAY_INC_MAJOR_CHECK_EXIST)
-                       ObIncDDLMergeTaskUtils::check_ss_inc_major_exist(allocator,
-                                                                        ls_->get_ls_id(),
-                                                                        tablet_handle.get_obj()->get_tablet_id(),
-                                                                        tablet_handle.get_obj()->get_reorganization_scn(),
-                                                                        trans_id_,
-                                                                        seq_no_,
-                                                                        data_format_version_,
-                                                                        is_exist))) {
-      LOG_WARN("fail to check ss inc major exist",
-               KR(ret), "ls_id", ls_->get_ls_id(), "tablet_id", tablet_handle.get_obj()->get_tablet_id(),
-               K_(trans_id), K_(seq_no), K_(data_format_version));
-    } else if (is_exist) {
-    } else if (OB_FAIL(tablet_handle.get_obj()->load_storage_schema(allocator, storage_schema))) {
-      LOG_WARN("fail to load storage schema", KR(ret));
-    } else if (OB_ISNULL(storage_schema)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected null storage schema", KR(ret));
-    } else if (OB_FAIL(ObSSDDLUtil::update_shared_tablet_table_store(*ls_,
-                                                                     *inc_major_ptr,
-                                                                     *storage_schema,
-                                                                     data_format_version_,
-                                                                     tablet_handle.get_obj()->get_reorganization_scn(),
-                                                                     false/*check_lease*/))) {
-      LOG_WARN("fail to update shared tablet table store", KR(ret));
-    } else if (OB_FAIL(MTL(observer::ObTabletTableUpdater*)->submit_tablet_update_task(ls_->get_ls_id(),
-                                                                                       tablet_handle.get_obj()->get_tablet_id()))) {
-      LOG_WARN("fail to submit tablet update task",
-               KR(ret), "ls_id", ls_->get_ls_id(), "tablet_id", tablet_handle.get_obj()->get_tablet_id());
+    } else {
+      if (need_check_ddl_checkpoint_) {
+        if (OB_FAIL(check_can_skip_shared_add_(
+            tablet_handle, *inc_major_ptr, can_skip_shared_add))) {
+          LOG_WARN("failed to check shared inc major replay state", KR(ret), K_(scn));
+        }
+      } else if (OB_FAIL(OB_E(EN_REPLAY_INC_MAJOR_CHECK_EXIST)
+          ObIncDDLMergeTaskUtils::check_ss_inc_major_exist(allocator, ls_->get_ls_id(),
+              tablet_handle.get_obj()->get_tablet_id(),
+              tablet_handle.get_obj()->get_reorganization_scn(),
+              trans_id_, seq_no_, data_format_version_, can_skip_shared_add))) {
+        LOG_WARN("fail to check ss inc major exist",
+                 KR(ret), "ls_id", ls_->get_ls_id(), "tablet_id", tablet_handle.get_obj()->get_tablet_id(),
+                 K_(trans_id), K_(seq_no), K_(data_format_version));
+      }
+      if (OB_FAIL(ret)) {
+      } else if (can_skip_shared_add) {
+        // An existing result of this batch is sufficient, even in a long-running transaction.
+      } else if (OB_FAIL(tablet_handle.get_obj()->load_storage_schema(allocator, storage_schema))) {
+        LOG_WARN("fail to load storage schema", KR(ret));
+      } else if (OB_ISNULL(storage_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null storage schema", KR(ret));
+      } else if (OB_FAIL(ObSSDDLUtil::update_shared_tablet_table_store(*ls_, *inc_major_ptr,
+          *storage_schema, data_format_version_, tablet_handle.get_obj()->get_reorganization_scn(),
+          need_check_ddl_checkpoint_ /* check_lease */, scn_, need_check_ddl_checkpoint_))) {
+        LOG_WARN("fail to update shared tablet table store", KR(ret));
+      } else if (OB_FAIL(MTL(observer::ObTabletTableUpdater*)->submit_tablet_update_task(
+          ls_->get_ls_id(), tablet_handle.get_obj()->get_tablet_id()))) {
+        LOG_WARN("fail to submit tablet update task", KR(ret),
+                 "ls_id", ls_->get_ls_id(), "tablet_id", tablet_handle.get_obj()->get_tablet_id());
+      }
     }
     if (OB_NOT_NULL(storage_schema)) {
       ObTabletObjLoadHelper::free(allocator, storage_schema);
@@ -2000,6 +2009,60 @@ int ObDDLIncMajorCommitReplayExecutor::deserialize_and_update_ss_inc_major(
   }
   return ret;
 }
+
+int ObDDLIncMajorCommitReplayExecutor::check_can_skip_shared_add_(
+    const ObTabletHandle &tablet_handle, const ObSSTable &target, bool &can_skip_shared_add)
+{
+  int ret = OB_SUCCESS;
+  can_skip_shared_add = false;
+  ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "DliEndReady"));
+  ObTabletHandle shared_tablet;
+  ObTabletMemberWrapper<ObTabletTableStore> store;
+  if (OB_FAIL(MTL(ObSSMetaService *)->get_tablet(ls_->get_ls_id(), tablet_id_,
+      tablet_handle.get_obj()->get_reorganization_scn(), allocator, shared_tablet))) {
+    if (OB_TABLET_NOT_EXIST == ret) {
+      ret = OB_SUCCESS; // Only the qualified writer may attempt first creation.
+    }
+  } else if (shared_tablet.get_obj()->get_ddl_checkpoint_scn() >= scn_) {
+    can_skip_shared_add = true;
+    LOG_INFO("skip shared ADD because END checkpoint is covered",
+        "ls_id", ls_->get_ls_id(), K_(tablet_id), K_(trans_id), K_(seq_no), K_(scn),
+        "shared_checkpoint_scn", shared_tablet.get_obj()->get_ddl_checkpoint_scn());
+  } else if (OB_FAIL(shared_tablet.get_obj()->fetch_table_store_with_prewarm(store))) {
+    LOG_WARN("failed to load shared inc major store", KR(ret), K_(tablet_id));
+  } else {
+    if (shared_tablet.get_obj()->get_ddl_checkpoint_scn() >= target.get_end_scn()) {
+      // Dumps can cover the final table's end SCN before the final IncMajor is published.
+      // Final IncMajor ADD removes this batch's Dumps, so skip ADD only when none remain.
+      ObTableStoreIterator dumps;
+      if (OB_FAIL(store.get_member()->get_inc_major_ddl_sstables(
+          dumps, trans_id_, seq_no_))) {
+        LOG_WARN("failed to read batch dumps", KR(ret), K_(tablet_id), K_(trans_id), K_(seq_no));
+      } else {
+        can_skip_shared_add = 0 == dumps.count();
+        if (can_skip_shared_add) {
+          LOG_INFO("skip shared ADD because final range is covered without batch dumps",
+              "ls_id", ls_->get_ls_id(), K_(tablet_id), K_(trans_id), K_(seq_no), K_(scn),
+              "table_end_scn", target.get_end_scn(),
+              "shared_checkpoint_scn", shared_tablet.get_obj()->get_ddl_checkpoint_scn());
+        }
+      }
+    }
+    if (OB_SUCC(ret) && !can_skip_shared_add) {
+      if (OB_FAIL(ObIncMajorTxHelper::find_inc_major_sstable(
+          store.get_member()->get_inc_major_sstables(), &target, can_skip_shared_add))) {
+        LOG_WARN("failed to find published inc major", KR(ret), K_(tablet_id));
+      } else if (can_skip_shared_add) {
+        LOG_INFO("skip shared ADD because batch result already exists",
+            "ls_id", ls_->get_ls_id(), K_(tablet_id), K_(trans_id), K_(seq_no), K_(scn),
+            "shared_checkpoint_scn", shared_tablet.get_obj()->get_ddl_checkpoint_scn(),
+            "table_key", target.get_key());
+      }
+    }
+  }
+  return ret;
+}
+
 #endif
 
 int ObDDLIncMajorCommitReplayExecutor::do_replay_(ObTabletHandle &tablet_handle)
@@ -2036,12 +2099,13 @@ int ObDDLIncMajorCommitReplayExecutor::do_replay_(ObTabletHandle &tablet_handle)
     } else if (GCTX.is_shared_storage_mode()) {
       // ss模式
       if (is_rollback_) {
-      } else if (!MTL_TENANT_ROLE_CACHE_IS_PRIMARY()
+      } else if ((need_check_ddl_checkpoint_
+                  || !MTL_TENANT_ROLE_CACHE_IS_PRIMARY())
                  && OB_FAIL(deserialize_and_update_ss_inc_major(tablet_handle, need_publish))) {
         LOG_WARN("fail to deserialize and update ss inc major", KR(ret));
       } else if (need_publish
                  && OB_FAIL(OB_E(EN_REPLAY_INC_MAJOR_LINK) ObIncDDLMergeTaskUtils::link_inc_major(
-                     ls_, tablet_handle, trans_id_, seq_no_))) {
+                     ls_, tablet_handle, trans_id_, seq_no_, scn_))) {
         LOG_WARN("fail to link inc major", KR(ret), K(trans_id_), K(seq_no_));
       }
 #endif

@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX TRANS
 
+#include <type_traits>
 #include "ob_trans_part_ctx.h"
 #include "observer/ob_server_event_history_table_operator.h"
 #include "storage/tx/ob_trans_part_ctx_errsim.h"
@@ -19,8 +20,10 @@
 #include "share/allocator/ob_shared_memory_allocator_mgr.h"
 #include "logservice/ob_log_service.h"
 #include "storage/ddl/ob_ddl_inc_clog_callback.h"
+#include "storage/ddl/ob_direct_load_mgr_utils.h"
 #include "storage/tx/ob_tx_log_operator.h"
 #include "storage/tx_table/ob_tx_data_table.h"
+#include "storage/tx_storage/ob_ls_service.h"
 
 namespace oceanbase {
 
@@ -4224,7 +4227,21 @@ int ObPartTransCtx::submit_direct_load_inc_log_(
   submit_arg.suggested_buf_size_ = dli_log.get_serialize_size() + 200;
 
   ObTxCtxLogOperator<DLI_INC_TX_LOG_TYPE> dli_log_op(this, &log_block, &construct_arg, submit_arg);
-  if (OB_FAIL(dli_buf.serialize_log_object(&dli_log))) {
+
+  // For rollback END, check dump readiness to avoid publishing dumps after rollback cleanup.
+  // If not ready, return OB_EAGAIN and let the transaction retry instead of waiting here.
+  if constexpr (std::is_same<DLI_INC_TX_LOG_TYPE, ObTxDirectLoadIncMajorLog>::value
+                && std::is_same<DDL_LOG_TYPE, ObDDLIncCommitLog>::value) {
+    if (dli_log.is_rollback()
+        && is_incremental_major_direct_load(batch_key.get_direct_load_type())
+        && OB_FAIL(ObDirectLoadMgrUtil::check_inc_major_dump_ready(ls_id_, batch_key))) {
+      TRANS_LOG(DEBUG, "check dump readiness before rollback END failed", K(ret), K(ls_id_), K(batch_key));
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+    TRANS_LOG(DEBUG, "skip direct load log submission until dump check succeeds", K(ret), K(batch_key));
+  } else if (OB_FAIL(dli_buf.serialize_log_object(&dli_log))) {
     TRANS_LOG(WARN, "serialize direct load log failed", K(ret), K(dli_log), K(replay_hint),
               KPC(this));
   } else if (OB_FAIL(dli_log_op(ObTxLogOpType::SUBMIT))) {
@@ -4333,6 +4350,8 @@ int ObPartTransCtx::check_dli_batch_completed_(ObTxLogType submit_log_type)
     int64_t compensate_ddl_end_fail_cnt = 0;
     const int64_t MAX_COMPENSATE_FAIL_CNT = 100;
 
+    // Check once: END callbacks submitted in this round must not delay later batches.
+    const bool dli_writes_finished = 0 == ATOMIC_LOAD(&pending_write_) && busy_cbs_.is_empty();
     ObTxDirectLoadBatchKeyArray unused_batch_key_array;
     for (ObDLIBatchSet::iterator iter = exec_info_.dli_batch_set_.begin();
          iter != exec_info_.dli_batch_set_.end() && OB_SUCC(ret); iter++) {
@@ -4343,6 +4362,13 @@ int ObPartTransCtx::check_dli_batch_completed_(ObTxLogType submit_log_type)
         if (compensate_ddl_end_fail_cnt <= MAX_COMPENSATE_FAIL_CNT
             && (ObTxLogType::TX_ABORT_LOG == submit_log_type
                 || ObTxLogType::TX_COMMIT_INFO_LOG == submit_log_type)) {
+          if (iter->first.is_major() && !dli_writes_finished) {
+            // Existing writes or callbacks may still produce KV data.
+            TRANS_LOG(INFO, "wait for existing writes and callbacks before compensating END",
+                      K(submit_log_type), K(trans_id_), K(ls_id_), K(iter->first), K_(pending_write));
+            need_ddl_end_count += 1;
+            continue;
+          }
           ObDDLIncCommitLog inc_commit_log;
           ObDDLIncCommitClogCb *extra_cb = static_cast<ObDDLIncCommitClogCb *>(
               mtl_malloc(sizeof(ObDDLIncCommitClogCb), "TxExtraCb"));
@@ -4377,7 +4403,7 @@ int ObPartTransCtx::check_dli_batch_completed_(ObTxLogType submit_log_type)
                     submitted_scn, true);
             if (OB_TMP_FAIL(tmp_ret)) {
               if (tmp_ret != OB_TX_NOLOGCB) {
-                TRANS_LOG(WARN, "submit direct load inc major commit log failed", K(ret),
+                TRANS_LOG(WARN, "submit direct load inc major commit log failed", K(ret), K(tmp_ret),
                           K(inc_commit_log), KPC(extra_cb), K(submitted_scn), K(trans_id_),
                           K(ls_id_), K(iter->first));
               }

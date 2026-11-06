@@ -245,7 +245,8 @@ ObDDLIncCommitLog::ObDDLIncCommitLog()
     log_basic_(),
     is_rollback_(false),
     is_co_sstable_(false),
-    start_scn_()
+    start_scn_(),
+    need_check_ddl_checkpoint_(false)
 {
 }
 
@@ -276,6 +277,7 @@ int ObDDLIncCommitLog::init(const ObDDLIncLogBasic &log_basic, const bool is_rol
     log_basic_ = log_basic;
     is_rollback_ = is_rollback;
     start_scn_ = start_scn;
+    need_check_ddl_checkpoint_ = false;
   }
   return ret;
 }
@@ -284,7 +286,8 @@ int ObDDLIncCommitLog::init(const ObDDLIncLogBasic &log_basic, const bool is_rol
 int ObDDLIncCommitLog::set_ss_inc_major(
     const ObSSTable *data_inc_major,
     const ObSSTable *lob_meta_inc_major,
-    const ObSSTable *lob_piece_inc_major)
+    const ObSSTable *lob_piece_inc_major,
+    const bool need_check_ddl_checkpoint)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(ObIncDDLMergeTaskUtils::serialize_inc_major_to_string(allocator_,
@@ -306,6 +309,7 @@ int ObDDLIncCommitLog::set_ss_inc_major(
     LOG_WARN("fail to serialize lob piece inc major", KR(ret));
   } else {
     is_co_sstable_ = data_inc_major->is_co_sstable();
+    need_check_ddl_checkpoint_ = need_check_ddl_checkpoint;
   }
   return ret;
 }
@@ -321,7 +325,8 @@ OB_DEF_SERIALIZE_SIZE(ObDDLIncCommitLog)
               data_inc_major_buffer_,
               lob_meta_inc_major_buffer_,
               start_scn_,
-              lob_piece_inc_major_buffer_);
+              lob_piece_inc_major_buffer_,
+              need_check_ddl_checkpoint_);
   return len;
 }
 
@@ -335,13 +340,16 @@ OB_DEF_SERIALIZE(ObDDLIncCommitLog)
               data_inc_major_buffer_,
               lob_meta_inc_major_buffer_,
               start_scn_,
-              lob_piece_inc_major_buffer_);
+              lob_piece_inc_major_buffer_,
+              need_check_ddl_checkpoint_);
   return ret;
 }
 
 OB_DEF_DESERIALIZE(ObDDLIncCommitLog)
 {
   int ret = OB_SUCCESS;
+  // Historical END logs do not contain the checkpoint-check flag.
+  need_check_ddl_checkpoint_ = false;
   LST_DO_CODE(OB_UNIS_DECODE,
               log_basic_,
               is_rollback_,
@@ -349,7 +357,8 @@ OB_DEF_DESERIALIZE(ObDDLIncCommitLog)
               data_inc_major_buffer_,
               lob_meta_inc_major_buffer_,
               start_scn_,
-              lob_piece_inc_major_buffer_);
+              lob_piece_inc_major_buffer_,
+              need_check_ddl_checkpoint_);
 
 #ifdef OB_BUILD_SHARED_STORAGE
   if (OB_SUCC(ret)) {

@@ -89,6 +89,29 @@ public:
 OB_SERIALIZE_MEMBER(LegacyDDLIncCommitLog, log_basic_, is_rollback_, is_co_sstable_,
                     data_inc_major_buffer_, lob_meta_inc_major_buffer_, start_scn_);
 
+struct DDLIncCommitLogWithoutCheckpointFlag
+{
+  OB_UNIS_VERSION(1);
+public:
+  DDLIncCommitLogWithoutCheckpointFlag()
+    : log_basic_(), is_rollback_(false), is_co_sstable_(false),
+      data_inc_major_buffer_(), lob_meta_inc_major_buffer_(), start_scn_(),
+      lob_piece_inc_major_buffer_()
+  {}
+
+  ObDDLIncLogBasic log_basic_;
+  bool is_rollback_;
+  bool is_co_sstable_;
+  ObString data_inc_major_buffer_;
+  ObString lob_meta_inc_major_buffer_;
+  share::SCN start_scn_;
+  ObString lob_piece_inc_major_buffer_;
+};
+
+OB_SERIALIZE_MEMBER(DDLIncCommitLogWithoutCheckpointFlag, log_basic_, is_rollback_,
+    is_co_sstable_, data_inc_major_buffer_, lob_meta_inc_major_buffer_, start_scn_,
+    lob_piece_inc_major_buffer_);
+
 struct LegacyRemoteWriteDDLIncCommitLogArg
 {
   OB_UNIS_VERSION(1);
@@ -846,7 +869,7 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_serialize_deserialize_with_sstable)
   ASSERT_NE(nullptr, lob_sstable);
 
   // 使用 set_ss_inc_major 设置 data 和 lob sstable
-  ASSERT_SUCC(commit_log_src.set_ss_inc_major(data_sstable, lob_sstable, nullptr));
+  ASSERT_SUCC(commit_log_src.set_ss_inc_major(data_sstable, lob_sstable, nullptr, true));
 
   // 序列化 commit_log
   int64_t commit_log_serialize_size = commit_log_src.get_serialize_size();
@@ -941,7 +964,7 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_co_sstable_flag)
   ASSERT_SUCC(lob_table_handle.get_sstable(lob_sstable));
   ASSERT_NE(nullptr, lob_sstable);
   
-  ASSERT_SUCC(commit_log2.set_ss_inc_major(co_sstable, lob_sstable, nullptr));
+  ASSERT_SUCC(commit_log2.set_ss_inc_major(co_sstable, lob_sstable, nullptr, true));
   ASSERT_TRUE(commit_log2.is_co_sstable());
 #endif
 }
@@ -994,7 +1017,7 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_serialize_deserialize_with_co_sstabl
   ASSERT_NE(nullptr, lob_sstable);
 
   // 使用 set_ss_inc_major 设置 CO SSTable 和 lob SSTable
-  ASSERT_SUCC(commit_log_src.set_ss_inc_major(co_sstable, lob_sstable, nullptr));
+  ASSERT_SUCC(commit_log_src.set_ss_inc_major(co_sstable, lob_sstable, nullptr, true));
   ASSERT_TRUE(commit_log_src.is_co_sstable());
 
   // 序列化 commit_log
@@ -1065,7 +1088,7 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_with_both_data_and_lob_sstable)
   ASSERT_NE(nullptr, lob_sstable);
 
   // 使用 set_ss_inc_major 设置 data 和 lob SSTable
-  ASSERT_SUCC(commit_log_src.set_ss_inc_major(data_sstable, lob_sstable, nullptr));
+  ASSERT_SUCC(commit_log_src.set_ss_inc_major(data_sstable, lob_sstable, nullptr, true));
 
   // 序列化 commit_log
   int64_t commit_log_size = commit_log_src.get_serialize_size();
@@ -1140,7 +1163,7 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_serialize_deserialize_with_co_sstabl
   ASSERT_NE(nullptr, lob_sstable);
 
   // 使用 set_ss_inc_major 设置 CO SSTable 和 lob SSTable
-  ASSERT_SUCC(commit_log_src.set_ss_inc_major(co_sstable, lob_sstable, nullptr));
+  ASSERT_SUCC(commit_log_src.set_ss_inc_major(co_sstable, lob_sstable, nullptr, true));
   ASSERT_TRUE(commit_log_src.is_co_sstable());
 
   // 序列化 commit_log
@@ -1577,7 +1600,7 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_set_ss_inc_major_null_sstable)
   ASSERT_SUCC(commit_log.init(log_basic, false));
 
   // 测试传入 nullptr data_inc_major（应该返回 OB_INVALID_ARGUMENT）
-  int ret = commit_log.set_ss_inc_major(nullptr, nullptr, nullptr);
+  int ret = commit_log.set_ss_inc_major(nullptr, nullptr, nullptr, true);
   ASSERT_EQ(OB_INVALID_ARGUMENT, ret);
 }
 
@@ -1607,7 +1630,7 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_set_ss_inc_major_with_lob_validation
   ASSERT_NE(nullptr, data_sstable);
   
   // 测试：当 lob_meta_tablet_id 有效时，lob_inc_major 为 nullptr 应该返回 OB_INVALID_ARGUMENT
-  int ret = commit_log.set_ss_inc_major(data_sstable, nullptr, nullptr);
+  int ret = commit_log.set_ss_inc_major(data_sstable, nullptr, nullptr, true);
   ASSERT_EQ(OB_INVALID_ARGUMENT, ret);
   
   // 测试：提供有效的 lob_inc_major 应该成功
@@ -1617,7 +1640,7 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_set_ss_inc_major_with_lob_validation
   ASSERT_SUCC(lob_table_handle.get_sstable(lob_sstable));
   ASSERT_NE(nullptr, lob_sstable);
   
-  ASSERT_SUCC(commit_log.set_ss_inc_major(data_sstable, lob_sstable, nullptr));
+  ASSERT_SUCC(commit_log.set_ss_inc_major(data_sstable, lob_sstable, nullptr, true));
   ASSERT_GT(commit_log.get_data_inc_major_buffer().length(), 0);
   ASSERT_GT(commit_log.get_lob_meta_inc_major_buffer().length(), 0);
 }
@@ -1643,7 +1666,7 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_set_ss_inc_major_twice)
   ASSERT_SUCC(lob_table_handle1.get_sstable(lob_sstable1));
   ASSERT_NE(nullptr, lob_sstable1);
 
-  ASSERT_SUCC(commit_log.set_ss_inc_major(sstable1, lob_sstable1, nullptr));
+  ASSERT_SUCC(commit_log.set_ss_inc_major(sstable1, lob_sstable1, nullptr, true));
   int64_t first_buffer_len = commit_log.get_data_inc_major_buffer().length();
   ASSERT_GT(first_buffer_len, 0);
 
@@ -1661,7 +1684,7 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_set_ss_inc_major_twice)
   ASSERT_SUCC(lob_table_handle2.get_sstable(lob_sstable2));
   ASSERT_NE(nullptr, lob_sstable2);
 
-  ASSERT_SUCC(commit_log.set_ss_inc_major(sstable2, lob_sstable2, nullptr));
+  ASSERT_SUCC(commit_log.set_ss_inc_major(sstable2, lob_sstable2, nullptr, true));
   int64_t second_buffer_len = commit_log.get_data_inc_major_buffer().length();
   ASSERT_GT(second_buffer_len, 0);
   // 两次设置的 buffer 长度应该相同（因为 sstable 参数相同）
@@ -1690,7 +1713,7 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_with_co_sstable_flag_consistency)
   ASSERT_SUCC(lob_table_handle1.get_sstable(lob_sstable1));
   ASSERT_NE(nullptr, lob_sstable1);
 
-  ASSERT_SUCC(commit_log.set_ss_inc_major(normal_sstable, lob_sstable1, nullptr));
+  ASSERT_SUCC(commit_log.set_ss_inc_major(normal_sstable, lob_sstable1, nullptr, true));
   ASSERT_FALSE(commit_log.is_co_sstable());
 
   // 设置 CO SSTable，is_co_sstable 应该为 true
@@ -1708,7 +1731,7 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_with_co_sstable_flag_consistency)
   ASSERT_SUCC(lob_table_handle2.get_sstable(lob_sstable2));
   ASSERT_NE(nullptr, lob_sstable2);
 
-  ASSERT_SUCC(commit_log.set_ss_inc_major(co_sstable, lob_sstable2, nullptr));
+  ASSERT_SUCC(commit_log.set_ss_inc_major(co_sstable, lob_sstable2, nullptr, true));
   ASSERT_TRUE(commit_log.is_co_sstable());
 }
 
@@ -1724,7 +1747,7 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_with_inv_sstable)
   ASSERT_SUCC(table_handle.get_sstable(sstable));
   ASSERT_NE(nullptr, sstable);
   ASSERT_TRUE(sstable->is_inc_inv_sstable());
-  ASSERT_SUCC(commit_log.set_ss_inc_major(sstable, nullptr, nullptr));
+  ASSERT_SUCC(commit_log.set_ss_inc_major(sstable, nullptr, nullptr, true));
 
   const ObString &buffer = commit_log.get_data_inc_major_buffer();
   ObInvSSTable restored_sstable;
@@ -2117,6 +2140,72 @@ TEST_F(TestDDLIncCommitLog, test_commit_log_backward_compatibility)
   ASSERT_EQ(current_src.get_log_basic().get_tablet_id(), legacy_dst.log_basic_.tablet_id_);
   ASSERT_EQ(current_src.get_log_basic().get_direct_load_type(), legacy_dst.log_basic_.direct_load_type_);
   ASSERT_EQ(current_src.get_start_scn(), legacy_dst.start_scn_);
+}
+
+TEST_F(TestDDLIncCommitLog, test_commit_log_checkpoint_flag_compatibility)
+{
+  // A 4.6.3.0 END without the tail flag must reset a reused new reader to legacy behavior.
+  DDLIncCommitLogWithoutCheckpointFlag old_log;
+  ASSERT_SUCC(old_log.log_basic_.init(ObTabletID(100001), ObTabletID(100002),
+      ObTabletID(100003), ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR,
+      ObTransID(1001), ObTxSEQ(2001, 0), 1000000, DATA_VERSION_4_6_3_0));
+  old_log.is_co_sstable_ = true;
+  old_log.start_scn_ = SCN::base_scn();
+  old_log.data_inc_major_buffer_ = ObString::make_string("data_inc_major");
+  old_log.lob_meta_inc_major_buffer_ = ObString::make_string("lob_meta_inc_major");
+  old_log.lob_piece_inc_major_buffer_ = ObString::make_string("lob_piece_inc_major");
+  const int64_t old_size = old_log.get_serialize_size();
+  char *old_buf = static_cast<char *>(allocator_.alloc(old_size));
+  ASSERT_NE(nullptr, old_buf);
+  int64_t pos = 0;
+  ASSERT_SUCC(old_log.serialize(old_buf, old_size, pos));
+  ASSERT_EQ(old_size, pos);
+
+  ObDDLIncCommitLog current_log;
+  ASSERT_FALSE(current_log.need_check_ddl_checkpoint());
+  current_log.need_check_ddl_checkpoint_ = true;
+  pos = 0;
+  ASSERT_SUCC(current_log.deserialize(old_buf, old_size, pos));
+  ASSERT_EQ(old_size, pos);
+  ASSERT_FALSE(current_log.need_check_ddl_checkpoint());
+  ASSERT_EQ(old_log.log_basic_, current_log.get_log_basic());
+  ASSERT_EQ(old_log.start_scn_, current_log.get_start_scn());
+  ASSERT_EQ(old_log.is_co_sstable_, current_log.is_co_sstable());
+  ASSERT_EQ(old_log.data_inc_major_buffer_, current_log.get_data_inc_major_buffer());
+  ASSERT_EQ(old_log.lob_meta_inc_major_buffer_, current_log.get_lob_meta_inc_major_buffer());
+  ASSERT_EQ(old_log.lob_piece_inc_major_buffer_, current_log.get_lob_piece_inc_major_buffer());
+
+  // New readers retain the flag; old readers skip it and preserve all preceding fields.
+  current_log.need_check_ddl_checkpoint_ = true;
+  const int64_t new_size = current_log.get_serialize_size();
+  char *new_buf = static_cast<char *>(allocator_.alloc(new_size));
+  ASSERT_NE(nullptr, new_buf);
+  pos = 0;
+  ASSERT_SUCC(current_log.serialize(new_buf, new_size, pos));
+  ASSERT_EQ(new_size, pos);
+  ObDDLIncCommitLog new_reader;
+  pos = 0;
+  ASSERT_SUCC(new_reader.deserialize(new_buf, new_size, pos));
+  ASSERT_EQ(new_size, pos);
+  ASSERT_TRUE(new_reader.need_check_ddl_checkpoint());
+  ASSERT_EQ(DATA_VERSION_4_6_3_0, new_reader.get_log_basic().get_data_format_version());
+  ASSERT_EQ(current_log.get_lob_piece_inc_major_buffer(),
+      new_reader.get_lob_piece_inc_major_buffer());
+  DDLIncCommitLogWithoutCheckpointFlag old_reader;
+  pos = 0;
+  ASSERT_SUCC(old_reader.deserialize(new_buf, new_size, pos));
+  ASSERT_EQ(new_size, pos);
+  ASSERT_EQ(old_log.log_basic_, old_reader.log_basic_);
+  ASSERT_EQ(old_log.is_rollback_, old_reader.is_rollback_);
+  ASSERT_EQ(old_log.is_co_sstable_, old_reader.is_co_sstable_);
+  ASSERT_EQ(old_log.start_scn_, old_reader.start_scn_);
+  ASSERT_EQ(old_log.data_inc_major_buffer_, old_reader.data_inc_major_buffer_);
+  ASSERT_EQ(old_log.lob_meta_inc_major_buffer_, old_reader.lob_meta_inc_major_buffer_);
+  ASSERT_EQ(old_log.lob_piece_inc_major_buffer_, old_reader.lob_piece_inc_major_buffer_);
+
+  // A truncated new record is still an error, rather than an absent optional field.
+  pos = 0;
+  ASSERT_EQ(OB_DESERIALIZE_ERROR, new_reader.deserialize(new_buf, new_size - 1, pos));
 }
 
 TEST_F(TestDDLIncCommitLog, test_rpc_arg_backward_compatibility)

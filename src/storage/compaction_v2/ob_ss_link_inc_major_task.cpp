@@ -17,7 +17,14 @@ namespace compaction
 {
 int ObTabletSSLinkIncMajorTask::process()
 {
+  bool is_linked = false;
+  return process(is_linked);
+}
+
+int ObTabletSSLinkIncMajorTask::process(bool &is_linked)
+{
   int ret = OB_SUCCESS;
+  is_linked = false;
   ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "LinkIncMajor"));
   ObLSHandle ls_handle;
   ObTabletHandle tablet_handle;
@@ -55,6 +62,7 @@ int ObTabletSSLinkIncMajorTask::process()
   } else if (OB_FAIL(do_link_(ls_handle, tablet_handle, *ss_tablet_handle.get_obj(), *inc_major_sstable, ss_tablet_meta_scn, allocator))) {
     LOG_WARN("link major fail", KR(ret), K_(compaction_scn));
   } else {
+    is_linked = true;
     LOG_INFO("[SS INC MAJOR]link inc major succ",
               KPC(inc_major_sstable), K(ss_tablet_meta_scn), K_(compaction_scn));
   }
@@ -230,6 +238,7 @@ int ObTabletSSLinkIncMajorTask::do_link_(ObLSHandle &ls_handle,
         linked_inc_major,
         true/*allow dup sstable*/);
     param.inc_major_sstable_action_ = ObIncMajorSSTableAction::LINK;
+    param.ddl_info_.ddl_checkpoint_scn_ = ddl_checkpoint_scn_;
     if (OB_FAIL(param.init_with_compaction_info(
                     ObCompactionTableStoreParam(compaction::MEDIUM_MERGE,
                                                 SCN::min_scn(),

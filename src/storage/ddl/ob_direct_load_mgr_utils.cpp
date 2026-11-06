@@ -14,6 +14,27 @@ namespace oceanbase
 namespace storage
 {
 
+int ObDirectLoadMgrUtil::check_inc_major_dump_ready(
+    const ObLSID &ls_id, const ObDDLIncLogBasic &batch_key)
+{
+  int ret = OB_SUCCESS;
+  ObLSHandle ls_handle;
+  bool ready = false;
+  if (OB_FAIL(MTL(ObLSService *)->get_ls(ls_id, ls_handle, ObLSGetMod::TRANS_MOD))) {
+    LOG_WARN("get ls for inc major dump check failed", K(ret), K(ls_id), K(batch_key));
+  } else if (OB_FAIL(ls_handle.get_ls()->get_inc_sstable_uploader().check_inc_major_dump_ready(batch_key, ready))) {
+    if (OB_EAGAIN == ret) {
+      LOG_DEBUG("inc major dump check is not ready", K(ret), K(ls_id), K(batch_key));
+    } else {
+      LOG_WARN("check inc major dump ready failed", K(ret), K(ls_id), K(batch_key));
+    }
+  } else if (!ready) {
+    ret = OB_EAGAIN;
+    LOG_DEBUG("wait for inc major dump before rollback END", K(ret), K(ls_id), K(batch_key));
+  }
+  return ret;
+}
+
 /* TODO @ zhuoran.zzr 
  *        struct direct load mgr won't be used any more, wait to remove it
 */

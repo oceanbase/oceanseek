@@ -443,7 +443,7 @@ TEST_F(TestDirectLoadSSUpdateIncMajorTask, test_replay_deserialize_classifies_em
   const transaction::ObTxSEQ seq_no = transaction::ObTxSEQ::mk_v0(1);
   const int64_t snapshot_version = 200;
   const uint64_t data_format_version = DATA_CURRENT_VERSION;
-  ObSSTable *empty_without_progress = nullptr;
+  ObSSTable *empty_with_progress = nullptr;
   ObArenaAllocator tablet_allocator("ReplayTablet", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
   ObTabletHandle tablet_handle;
   ObDDLIncLogBasic log_basic;
@@ -453,12 +453,12 @@ TEST_F(TestDirectLoadSSUpdateIncMajorTask, test_replay_deserialize_classifies_em
   SCN replay_scn;
   bool need_publish = true;
 
-  // 验证 replay executor 从真实 commit buffer 恢复普通空表后稳定判定为不发布。
+  // The END checkpoint flag skips a finite empty result at the current data format.
   ASSERT_EQ(OB_SUCCESS, mock_row_store_inc_major_sstable(
-      TEST_UPPER_TRANS_VERSION, empty_without_progress, 0, 0));
-  ASSERT_NE(nullptr, empty_without_progress);
-  ASSERT_TRUE(empty_without_progress->is_empty());
-  ASSERT_TRUE(empty_without_progress->get_end_scn().is_min());
+      TEST_UPPER_TRANS_VERSION, empty_with_progress, 200, 0));
+  ASSERT_NE(nullptr, empty_with_progress);
+  ASSERT_TRUE(empty_with_progress->is_empty());
+  ASSERT_TRUE(empty_with_progress->get_end_scn().is_valid_and_not_min());
 
   void *tablet_buf = tablet_allocator.alloc(sizeof(ObTablet));
   ASSERT_NE(nullptr, tablet_buf);
@@ -475,12 +475,15 @@ TEST_F(TestDirectLoadSSUpdateIncMajorTask, test_replay_deserialize_classifies_em
       tablet_id_, ObTabletID(), ObTabletID(), ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR,
       trans_id, seq_no, snapshot_version, data_format_version));
   ASSERT_EQ(OB_SUCCESS, skip_commit_log.init(log_basic, false, start_scn));
-  ASSERT_EQ(OB_SUCCESS, skip_commit_log.set_ss_inc_major(empty_without_progress, nullptr, nullptr));
+  ASSERT_EQ(OB_SUCCESS, skip_commit_log.set_ss_inc_major(
+      empty_with_progress, nullptr, nullptr, true));
+  ASSERT_TRUE(skip_commit_log.need_check_ddl_checkpoint());
   ASSERT_FALSE(skip_commit_log.get_data_inc_major_buffer().empty());
   ASSERT_EQ(OB_SUCCESS, skip_replay_executor.init(
       ls_, tablet_id_, replay_scn, trans_id, seq_no, snapshot_version,
       data_format_version, false, false,
-      skip_commit_log.get_data_inc_major_buffer(), start_scn));
+      skip_commit_log.get_data_inc_major_buffer(), start_scn,
+      skip_commit_log.need_check_ddl_checkpoint()));
 
   ASSERT_EQ(OB_SUCCESS, skip_replay_executor.deserialize_and_update_ss_inc_major(
       tablet_handle, need_publish));
@@ -540,26 +543,31 @@ TEST_F(TestDirectLoadSSUpdateIncMajorTask, test_replay_publish_gate)
       tablet_id_, ObTabletID(), ObTabletID(), ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR,
       trans_id, seq_no, snapshot_version, data_format_version));
   ASSERT_EQ(OB_SUCCESS, commit_log.init(log_basic, false, start_scn));
-  ASSERT_EQ(OB_SUCCESS, commit_log.set_ss_inc_major(empty_without_progress, nullptr, nullptr));
+  ASSERT_EQ(OB_SUCCESS, commit_log.set_ss_inc_major(
+      empty_without_progress, nullptr, nullptr, false));
   ASSERT_FALSE(commit_log.get_data_inc_major_buffer().empty());
   ASSERT_EQ(OB_SUCCESS, skip_replay_executor.init(
       replay_ls_handle.get_ls(), tablet_id_, replay_scn, trans_id, seq_no,
       snapshot_version, data_format_version, false, false,
-      commit_log.get_data_inc_major_buffer(), start_scn));
+      commit_log.get_data_inc_major_buffer(), start_scn,
+      commit_log.need_check_ddl_checkpoint()));
   ASSERT_EQ(OB_SUCCESS, publish_replay_executor.init(
       replay_ls_handle.get_ls(), tablet_id_, replay_scn, trans_id, seq_no,
       snapshot_version, data_format_version, false, false,
-      commit_log.get_data_inc_major_buffer(), start_scn));
+      commit_log.get_data_inc_major_buffer(), start_scn,
+      commit_log.need_check_ddl_checkpoint()));
   ASSERT_EQ(OB_SUCCESS, finite_log_basic.init(
       tablet_id_, ObTabletID(), ObTabletID(), ObDirectLoadType::DIRECT_LOAD_INCREMENTAL_MAJOR,
       finite_trans_id, finite_seq_no, snapshot_version, data_format_version));
   ASSERT_EQ(OB_SUCCESS, finite_commit_log.init(finite_log_basic, false, start_scn));
-  ASSERT_EQ(OB_SUCCESS, finite_commit_log.set_ss_inc_major(empty_with_progress, nullptr, nullptr));
+  ASSERT_EQ(OB_SUCCESS, finite_commit_log.set_ss_inc_major(
+      empty_with_progress, nullptr, nullptr, false));
   ASSERT_FALSE(finite_commit_log.get_data_inc_major_buffer().empty());
   ASSERT_EQ(OB_SUCCESS, finite_replay_executor.init(
       replay_ls_handle.get_ls(), tablet_id_, replay_scn, finite_trans_id, finite_seq_no,
       snapshot_version, data_format_version, false, false,
-      finite_commit_log.get_data_inc_major_buffer(), start_scn));
+      finite_commit_log.get_data_inc_major_buffer(), start_scn,
+      finite_commit_log.need_check_ddl_checkpoint()));
 
   EventItem replay_event;
   replay_event.error_code_ = OB_BREAK_BY_TEST;

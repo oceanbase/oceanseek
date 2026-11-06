@@ -74,11 +74,14 @@ struct SSCompactHelper
                                           storage::ObSSTableAtomicProtocol &sstable_protocol,
                                           const bool need_add_ctrl_key,
                                           const bool check_lease);
+  // Report actual installation so skipped LINK can finish its checkpoint separately.
   static int link_inc_major(const share::ObLSID &ls_id,
                             const common::ObTabletID &tablet_id,
                             const int64_t compaction_scn,
                             const transaction::ObTransID &trans_id,
-                            const transaction::ObTxSEQ &seq_no);
+                            const transaction::ObTxSEQ &seq_no,
+                            const share::SCN &ddl_checkpoint_scn,
+                            bool &is_linked);
   static bool check_ls_dag_need_cancel(const ObIDag &dag, const ObLSID &ls_id, bool &need_cancel);
 };
 } // namespace compaction

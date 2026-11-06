@@ -2371,6 +2371,7 @@ int ObSSIncMajorDDLMergeHelper::update_tablet_table_store_for_inc_major(
 
   int64_t rebuild_seq = -1;
   int64_t snapshot_version = 0;
+  bool is_linked = false;
 
   ObLSService *ls_service = MTL(ObLSService*);
   share::SCN transfer_scn;
@@ -2378,6 +2379,7 @@ int ObSSIncMajorDDLMergeHelper::update_tablet_table_store_for_inc_major(
   ObArray<ObDDLKVHandle> ddl_kvs;
   ObTableStoreIterator ddl_dump_sstables;
   SCN min_scn = SCN::max_scn(); // unused
+  SCN publish_scn = dag_merge_param.rec_scn_;
 
   if (OB_UNLIKELY(!dag_merge_param.is_valid()
                   || OB_ISNULL(inc_major_sstable)
@@ -2402,7 +2404,7 @@ int ObSSIncMajorDDLMergeHelper::update_tablet_table_store_for_inc_major(
     LOG_WARN("failed to get tablet handle", K(ret));
   } else if (OB_FAIL(get_ddl_kvs_and_ddl_dump_sstables(tablet_handle,
                                                        dag_merge_param,
-                                                       true/*frozen_only*/,
+                                                       false /* frozen_only */,
                                                        ddl_kvs,
                                                        ddl_dump_sstables))) {
     LOG_WARN("failed to get ddl kvs and ddl dump sstables", KR(ret), K(tablet_handle), K(dag_merge_param));
@@ -2414,8 +2416,10 @@ int ObSSIncMajorDDLMergeHelper::update_tablet_table_store_for_inc_major(
     transfer_scn = tablet_handle.get_obj()->get_reorganization_scn();
     table_key = dag_merge_param.table_key_;
     allocator = &merge_ctx->arena_;
+    publish_scn = dag_merge_param.rec_scn_;
   }
 
+  // Final construction has finished; include late index REDO in the publication checkpoint.
   if (OB_FAIL(ret)) {
   } else if (inc_major_sstable->is_empty()) {
     // Keep the in-memory metadata for the existing commit-log/RPC format, but
@@ -2426,7 +2430,9 @@ int ObSSIncMajorDDLMergeHelper::update_tablet_table_store_for_inc_major(
                                                               *tablet_param->storage_schema_,
                                                               dag_merge_param.ddl_task_param_.tenant_data_version_,
                                                               transfer_scn,
-                                                              false/*check_lease*/))) {
+                                                              false /*check_lease*/,
+                                                              publish_scn,
+                                                              false/*need_check_ddl_checkpoint*/))) {
     LOG_WARN("failed to update shared tablet", K(ret), K(ls_id), K(tablet_id));
   } else if (OB_FAIL(MTL(observer::ObTabletTableUpdater*)->submit_tablet_update_task(ls_id, tablet_id))) {
     LOG_WARN("fail to submit tablet update task", K(ret), K(ls_id), K(tablet_id));
@@ -2434,21 +2440,13 @@ int ObSSIncMajorDDLMergeHelper::update_tablet_table_store_for_inc_major(
                                                     tablet_id,
                                                     snapshot_version,
                                                     dag_merge_param.trans_id_,
-                                                    dag_merge_param.seq_no_))) {
+                                                    dag_merge_param.seq_no_,
+                                                    publish_scn,
+                                                    is_linked))) {
     LOG_WARN("fail to link inc major", KR(ret));
-  } else {
-    ObUpdateTableStoreParam table_store_param(snapshot_version,
-                                              ObVersionRange::MIN_VERSION/*multi_version_start*/,
-                                              tablet_param->storage_schema_,
-                                              rebuild_seq);
-    table_store_param.ddl_info_.ddl_checkpoint_scn_ = dag_merge_param.rec_scn_;
-    ObTabletHandle new_tablet_handle; // unused
-    if (OB_FAIL(ls_handle.get_ls()->update_tablet_table_store(tablet_id,
-                                                              table_store_param,
-                                                              new_tablet_handle))) {
-      LOG_WARN("failed to update tablet table store", KR(ret), K(tablet_id),
-                                                      K(table_store_param), K(dag_merge_param));
-    }
+  } else if (!is_linked) {
+    LOG_WARN("foreground inc major link skipped", K(ls_id), K(tablet_id),
+        K(dag_merge_param.trans_id_), K(dag_merge_param.seq_no_), K(publish_scn));
   }
   FLOG_INFO("[SS INC MAJOR]update tablet table store for inc major", KR(ret), K(tablet_id), K(dag_merge_param));
   return ret;

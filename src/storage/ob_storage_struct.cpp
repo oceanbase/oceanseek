@@ -347,6 +347,7 @@ ObDDLTableStoreParam::ObDDLTableStoreParam()
     ddl_snapshot_version_(0),
     ddl_execution_id_(-1),
     data_format_version_(0),
+    need_check_ddl_checkpoint_(false),
     ddl_redo_callback_(nullptr),
     ddl_finish_callback_(nullptr),
     ddl_replay_status_(CS_REPLICA_REPLAY_NONE)

@@ -18,6 +18,8 @@
 #include "storage/incremental/ob_shared_meta_service.h"
 #include "storage/incremental/share/ob_ss_diagnose_mgr.h"
 #include "storage/ddl/ob_inc_ddl_merge_task_utils.h"
+#include "storage/ddl/ob_ddl_inc_clog.h"
+#include "storage/meta_mem/ob_tenant_meta_mem_mgr.h"
 #include "share/ob_debug_sync.h"
 #include "lib/utility/ob_sort.h"
 #include "share/ob_server_struct.h"
@@ -531,6 +533,131 @@ void ObLSIncSSTableUploader::register_upload_task_info(IncSSTUploadInfoHolder &h
   } else {
     FLOG_INFO("[IncSSTUploader]finish register upload task", K(holder.info_));
   }
+}
+
+int ObLSIncSSTableUploader::check_inc_major_dump_ready(
+    const ObDDLIncLogBasic &batch_key, bool &ready)
+{
+  int ret = OB_SUCCESS;
+  ready = false;
+  bool pending = false;
+  if (!batch_key.is_valid() || !is_incremental_major_direct_load(batch_key.get_direct_load_type())
+      || !batch_key.get_trans_id().is_valid() || !batch_key.get_seq_no().is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    UPLOADER_LOG(WARN, "invalid argument for inc major dump check", K(batch_key));
+  } else if (!ATOMIC_LOAD(&is_online_) || !ATOMIC_LOAD(&finish_reloading_)) {
+    ret = OB_EAGAIN;
+    UPLOADER_LOG(INFO, "inc major dump check waits for uploader online and reload",
+                 K(batch_key), K(is_online_), K(finish_reloading_));
+  } else if (OB_FAIL(check_inc_major_ddl_kvs_(batch_key, pending))) {
+    UPLOADER_LOG(WARN, "check inc major ddl kvs failed", KR(ret), K(batch_key));
+  } else if (!pending && OB_FAIL(check_inc_major_ddl_checkpoint_(batch_key, pending))) {
+    UPLOADER_LOG(WARN, "check inc major ddl checkpoint failed", KR(ret), K(batch_key));
+  } else {
+    ready = !pending;
+  }
+  return ret;
+}
+
+int ObLSIncSSTableUploader::check_inc_major_ddl_kvs_(
+    const ObDDLIncLogBasic &batch_key, bool &pending)
+{
+  int ret = OB_SUCCESS;
+  pending = false;
+  const ObTabletID tablet_ids[] = {batch_key.get_tablet_id(),
+      batch_key.get_lob_meta_tablet_id(), batch_key.get_lob_piece_tablet_id()};
+  ObDDLKVQueryParam query;
+  query.ddl_kv_type_ = ObDDLKVType::DDL_KV_INC_MAJOR;
+  query.trans_id_ = batch_key.get_trans_id();
+  query.seq_no_ = batch_key.get_seq_no();
+  // Check all KVs of this batch, including unfrozen KVs. Inspect resident
+  // metadata only; do not load tablets or trigger freezing/dumping here.
+  for (int64_t i = 0; OB_SUCC(ret) && !pending && i < ARRAYSIZEOF(tablet_ids); ++i) {
+    if (!tablet_ids[i].is_valid()) {
+      continue;
+    }
+    const ObTabletMapKey key(ls_.get_ls_id(), tablet_ids[i]);
+    ObTabletResidentInfo resident_info;
+    ObDDLKvMgrHandle mgr;
+    ObSEArray<ObDDLKVHandle, 4> kvs;
+    if (OB_FAIL(MTL(ObTenantMetaMemMgr *)->get_tablet_resident_info(key, resident_info))) {
+      UPLOADER_LOG(WARN, "get tablet resident info for inc major dump check failed", K(key), K(batch_key));
+    } else if (!resident_info.is_valid() || resident_info.is_empty_shell() || resident_info.has_transfer_table()) {
+      ret = OB_EAGAIN;
+      UPLOADER_LOG(INFO, "tablet resident info is not ready for inc major dump check",
+                   K(key), K(resident_info), K(batch_key));
+    } else if (OB_FAIL(MTL(ObTenantMetaMemMgr *)->get_tablet_ddl_kv_mgr(key, mgr))) {
+      if (OB_ENTRY_NOT_EXIST == ret) {
+        UPLOADER_LOG(DEBUG, "ddl kv manager does not exist during inc major dump check", K(key), K(batch_key));
+        ret = OB_SUCCESS;
+      } else {
+        UPLOADER_LOG(WARN, "get ddl kv manager for inc major dump check failed", K(key), K(batch_key));
+      }
+    } else if (OB_FAIL(mgr.get_obj()->get_ddl_kvs(false /*frozen_only*/, kvs, query))) {
+      UPLOADER_LOG(WARN, "get ddl kvs for inc major dump check failed", K(key), K(batch_key));
+    } else {
+      // Frozen KVs also remain pending until their dump has been built.
+      pending = !kvs.empty();
+      if (pending) {
+        UPLOADER_LOG(INFO, "inc major dump check waits for remaining ddl kvs",
+                     K(key), K(batch_key), "kv_count", kvs.count());
+      }
+    }
+  }
+  return ret;
+}
+
+int ObLSIncSSTableUploader::check_inc_major_ddl_checkpoint_(
+    const ObDDLIncLogBasic &batch_key, bool &pending)
+{
+  int ret = OB_SUCCESS;
+  pending = false;
+  const ObTabletID tablet_ids[] = {batch_key.get_tablet_id(),
+      batch_key.get_lob_meta_tablet_id(), batch_key.get_lob_piece_tablet_id()};
+  ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "IncDumpCheck"));
+  ObTabletHandle local_tablet;
+  ObTabletHandle shared_tablet;
+  ObTableStoreIterator dumps;
+  // Shared covers this batch through dumps or final IncMajor publication.
+  for (int64_t i = 0; OB_SUCC(ret) && !pending && i < ARRAYSIZEOF(tablet_ids); ++i) {
+    if (!tablet_ids[i].is_valid()) {
+      continue;
+    }
+    if (OB_FAIL(ls_.get_tablet(tablet_ids[i], local_tablet,
+        ObTabletCommon::DEFAULT_GET_TABLET_NO_WAIT, ObMDSGetTabletMode::READ_ALL_COMMITED))) {
+      UPLOADER_LOG(WARN, "get local tablet for inc major dump check failed",
+                   K(batch_key), K(tablet_ids[i]));
+    } else if (OB_FAIL(local_tablet.get_obj()->get_inc_major_ddl_sstables(
+        dumps, batch_key.get_trans_id(), batch_key.get_seq_no()))) {
+      UPLOADER_LOG(WARN, "get batch dumps for checkpoint check failed", K(batch_key), K(tablet_ids[i]));
+    } else if (0 == dumps.count()) {
+      // No dump remains for this batch; skip the checkpoint check.
+    } else if (OB_FAIL(MTL(ObSSMetaService *)->get_tablet(ls_.get_ls_id(), tablet_ids[i],
+        local_tablet.get_obj()->get_reorganization_scn(), allocator, shared_tablet))) {
+      if (OB_TABLET_NOT_EXIST == ret) {
+        ret = OB_SUCCESS;
+        pending = true;
+        UPLOADER_LOG(INFO, "inc major dump check waits for shared tablet", K(batch_key), K(tablet_ids[i]));
+      } else {
+        UPLOADER_LOG(WARN, "get shared tablet for inc major dump check failed",
+                     K(batch_key), K(tablet_ids[i]));
+      }
+    } else {
+      const SCN target_scn = local_tablet.get_obj()->get_ddl_checkpoint_scn();
+      const SCN shared_scn = shared_tablet.get_obj()->get_ddl_checkpoint_scn();
+      pending = shared_scn < target_scn;
+      if (pending) {
+        UPLOADER_LOG(INFO, "inc major dump check waits for shared DDL checkpoint",
+                     K(batch_key), K(tablet_ids[i]), K(target_scn), K(shared_scn));
+      }
+    }
+    // Release tablet handles before reusing the memory backing the shared tablet.
+    dumps.reset();
+    shared_tablet.reset();
+    local_tablet.reset();
+    allocator.reuse();
+  }
+  return ret;
 }
 
 int ObLSIncSSTableUploader::try_schedule_upload_task()

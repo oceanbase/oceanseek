@@ -303,14 +303,17 @@ int SSCompactHelper::link_inc_major(const share::ObLSID &ls_id,
                                     const common::ObTabletID &tablet_id,
                                     const int64_t compaction_scn,
                                     const transaction::ObTransID &trans_id,
-                                    const transaction::ObTxSEQ &seq_no)
+                                    const transaction::ObTxSEQ &seq_no,
+                                    const share::SCN &ddl_checkpoint_scn,
+                                    bool &is_linked)
 {
   ObTabletSSLinkIncMajorTask task(ls_id,
                                   tablet_id,
                                   compaction_scn,
                                   trans_id,
-                                  seq_no);
-  return task.process();
+                                  seq_no,
+                                  ddl_checkpoint_scn);
+  return task.process(is_linked);
 }
 
 bool SSCompactHelper::check_ls_dag_need_cancel(const ObIDag &dag, const ObLSID &ls_id, bool &need_cancel)

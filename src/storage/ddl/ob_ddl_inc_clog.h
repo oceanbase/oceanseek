@@ -119,17 +119,20 @@ public:
   int init(const ObDDLIncLogBasic &log_basic, const bool is_rollback, const share::SCN start_scn = share::SCN::base_scn());
   int set_ss_inc_major(const blocksstable::ObSSTable *data_inc_major,
                        const blocksstable::ObSSTable *lob_meta_inc_major,
-                       const blocksstable::ObSSTable *lob_piece_inc_major);
+                       const blocksstable::ObSSTable *lob_piece_inc_major,
+                       const bool need_check_ddl_checkpoint);
   bool is_valid() const { return log_basic_.is_valid(); }
   const ObDDLIncLogBasic &get_log_basic() const { return log_basic_; }
   bool is_rollback() const { return is_rollback_; }
   bool is_co_sstable() const { return is_co_sstable_; }
+  bool need_check_ddl_checkpoint() const { return need_check_ddl_checkpoint_; }
   const ObString &get_data_inc_major_buffer() const { return data_inc_major_buffer_; }
   const ObString &get_lob_meta_inc_major_buffer() const { return lob_meta_inc_major_buffer_; }
   const ObString &get_lob_piece_inc_major_buffer() const { return lob_piece_inc_major_buffer_; }
   share::SCN get_start_scn() const { return start_scn_; }
   TO_STRING_KV(K_(log_basic), K_(is_rollback), K_(is_co_sstable), K_(data_inc_major_buffer),
-      K_(lob_meta_inc_major_buffer), K_(lob_piece_inc_major_buffer), K_(start_scn));
+      K_(lob_meta_inc_major_buffer), K_(lob_piece_inc_major_buffer), K_(start_scn),
+      K_(need_check_ddl_checkpoint));
 private:
   ObArenaAllocator allocator_;
   ObDDLIncLogBasic log_basic_;
@@ -139,6 +142,7 @@ private:
   ObString lob_meta_inc_major_buffer_;
   ObString lob_piece_inc_major_buffer_;
   share::SCN start_scn_;
+  bool need_check_ddl_checkpoint_;
 };
 
 } // namespace storage

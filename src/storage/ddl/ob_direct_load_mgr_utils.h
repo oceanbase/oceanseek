@@ -25,6 +25,7 @@ static bool need_process_vec_index(const ObIndexType & index_type)
       || schema::is_vec_index_snapshot_data_type(index_type);
   }
   static int get_tablet_handle(const ObLSID &ls_id, const ObTabletID &tablet_id, ObTabletHandle &tablet_handle);
+  static int check_inc_major_dump_ready(const ObLSID &ls_id, const ObDDLIncLogBasic &batch_key);
   static int create_tablet_direct_load_mgr(const int64_t tenant_id,
                                            const int64_t execution_id,
                                            const int64_t context_id,

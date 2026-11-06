@@ -1780,7 +1780,7 @@ int ObSSDDLMergeHelper::update_major_table_store(ObDDLTabletMergeDagParamV2 &dag
   } else if (FALSE_IT(DEBUG_SYNC(BEFORE_DDL_MERGE_UPDATE_SHARED_TABLE_STORE))) {
   } else if (OB_FAIL(ObSSDDLUtil::update_shared_tablet_table_store(ls_handle, *major_sstable,
       *tablet_param->storage_schema_, dag_merge_param.ddl_task_param_.tenant_data_version_,
-      transfer_scn, false/*check_lease*/))) {
+      transfer_scn, false/*check_lease*/, SCN::min_scn(), false/*need_check_ddl_checkpoint*/))) {
     LOG_WARN("failed to update shared tablet", K(ret), K(target_ls_id), K(target_tablet_id));
   }  
   

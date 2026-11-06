@@ -1046,6 +1046,10 @@ public:
       const ObTabletID &tablet_id,
       const ObUpdateTableStoreParam &param,
       ObTabletHandle &handle);
+  // Persist only the Local DDL checkpoint, reusing the latest TableStore and schema.
+  int update_tablet_ddl_checkpoint(const ObTabletID &tablet_id,
+      const int64_t rebuild_seq, const int64_t transfer_seq,
+      const share::SCN &ddl_checkpoint_scn);
   int update_tablet_table_store(
       const int64_t ls_rebuild_seq,
       const ObTabletHandle &old_tablet_handle,
