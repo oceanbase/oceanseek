@@ -394,7 +394,8 @@ int ObSearchIndexQueryRangeUtils::json_prefix_path_encode(ObIAllocator &allocato
     pick_type = ctx.search_index_range_ctx_->get_pick_type();
     enclosing_nested_paths = &ctx.search_index_range_ctx_->get_enclosing_nested_paths();
   }
-  if (!path_expr.is_static_const_expr()) {
+  // A fixed prefix can be cached only for an immutable path literal.
+  if (!path_expr.is_immutable_const_expr()) {
     can_extract_range = false;
   } else {
     ObObj path_val;
