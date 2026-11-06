@@ -340,7 +340,8 @@ bool ObDbmsStatsUtils::is_no_stat_virtual_table(const int64_t table_id)
          table_id == share::OB_ALL_VIRTUAL_SHARED_EXISTING_SSTABLE_MGR_ORA_TID ||
          table_id == share::OB_ALL_VIRTUAL_SHARED_TABLET_META_INFO_TID ||
          table_id == share::OB_ALL_VIRTUAL_SHARED_GC_DIAGNOSE_TID ||
-         table_id == share::OB_ALL_VIRTUAL_TABLET_MACRO_CACHE_STAT_TID;
+         table_id == share::OB_ALL_VIRTUAL_TABLET_MACRO_CACHE_STAT_TID ||
+         table_id == share::OB_ALL_VIRTUAL_SHARED_TIERED_META_TID;
 }
 
 bool ObDbmsStatsUtils::is_virtual_index_table(const int64_t table_id)
