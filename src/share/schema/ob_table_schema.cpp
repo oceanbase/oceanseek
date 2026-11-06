@@ -5752,17 +5752,28 @@ int ObTableSchema::check_alter_column_in_index(const ObColumnSchemaV2 &src_colum
       ret = OB_TABLE_NOT_EXIST;
       LOG_WARN("index table schema must not be NULL", K(ret));
     } else {
+      bool is_in_current_index = false;
       column_ids.reuse();
       if (OB_FAIL(index_table_schema->get_column_ids(column_ids))) {
         LOG_WARN("fail to get column ids", K(ret));
       }
       for (int64_t j = 0; OB_SUCC(ret) && j < column_ids.count(); ++j) {
         if (column_id == column_ids.at(j).col_id_) {
+          is_in_current_index = true;
           is_in_index = true;
         }
       }
-      if (OB_SUCC(ret) && is_in_index) {
-        if (!index_table_schema->is_vec_index() && dst_column.is_key_forbid_lob()) {
+      if (OB_SUCC(ret) && is_in_current_index) {
+        // Offline DDL also revalidates unchanged columns. Keep legal synchronous
+        // and asynchronous Search LOB columns, without allowing type changes or
+        // bypassing other indexes.
+        bool is_same_search_type = false;
+        if (index_table_schema->is_search_index()
+            && dst_column.is_key_forbid_lob()
+            && OB_FAIL(check_is_exactly_same_type(src_column, dst_column, is_same_search_type))) {
+          LOG_WARN("failed to check is exactly same type", K(ret));
+        } else if (!index_table_schema->is_vec_index()
+                   && !is_same_search_type && dst_column.is_key_forbid_lob()) {
           ret = OB_ERR_WRONG_KEY_COLUMN;
           LOG_USER_ERROR(OB_ERR_WRONG_KEY_COLUMN, dst_column.get_column_name_str().length(),
           dst_column.get_column_name_str().ptr());
