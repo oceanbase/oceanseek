@@ -1,7 +1,6 @@
 
 目录
     1. 数据包的处理过程
-        见图 http://baike.corp.taobao.com/index.php/File:Easy%E6%95%B0%E6%8D%AE%E6%B5%81%E7%A8%8B%E5%9B%BE.png
 
     2. 主要数据类型（src/io/easy_io_struct.h中的数据结构）
 
