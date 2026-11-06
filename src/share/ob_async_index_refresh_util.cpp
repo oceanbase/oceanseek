@@ -7,16 +7,12 @@
 
 #include "share/ob_async_index_refresh_util.h"
 #include "share/ob_debug_sync.h"
-#include "share/schema/ob_schema_struct.h"
 #include "lib/oblog/ob_log_module.h"
-#include "lib/time/ob_time_utility.h"
 #include "share/ob_ddl_common.h"
 #include "share/ob_share_util.h"
 #include "common/ob_timeout_ctx.h"
 #include "share/tablet/ob_tablet_to_ls_operator.h"
 #include "share/location_cache/ob_location_service.h"
-#include "share/location_cache/ob_location_struct.h"
-#include "share/rc/ob_tenant_base.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/schema/ob_table_schema.h"
 #include "observer/ob_server_struct.h"
@@ -109,6 +105,7 @@ int ObAsyncIndexRefreshProgress::prepare(
     const ObMemAttr attr(memory_tenant_id_, "AsyncIdxPrg");
     targets_.set_attr(attr);
     succeeded_.set_attr(attr);
+    nodes_.set_attr(attr);
     if (OB_FAIL(targets_.prepare_allocate(targets.count()))) {
       LOG_WARN("failed to allocate async index refresh targets", K(ret));
     } else if (OB_FAIL(succeeded_.reserve(targets.count()))) {
@@ -122,6 +119,32 @@ int ObAsyncIndexRefreshProgress::prepare(
     }
     if (OB_FAIL(ret)) {
       reset();
+    }
+  }
+  return ret;
+}
+
+int ObAsyncIndexRefreshProgress::get_node(const ObAddr &server, int64_t &index)
+{
+  int ret = OB_SUCCESS;
+  index = -1;
+  if (!server.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid refresh node address", K(ret), K(server));
+  } else {
+    for (int64_t i = 0; index < 0 && i < nodes_.count(); ++i) {
+      if (nodes_.at(i).server_ == server) {
+        index = i;
+      }
+    }
+    if (index < 0) {
+      NodeState node;
+      node.server_ = server;
+      if (OB_FAIL(nodes_.push_back(node))) {
+        LOG_WARN("failed to append refresh node", K(ret), K(server));
+      } else {
+        index = nodes_.count() - 1;
+      }
     }
   }
   return ret;
@@ -195,6 +218,7 @@ ObAsyncIndexRefreshUtil::RefreshDispatcher::RefreshDispatcher(
     refresh_type_(refresh_type), refresh_rpc_timeout_(GCONF._ob_ddl_timeout),
     location_service_(location_service), progress_(progress), rpc_proxy_(rpc_proxy),
     allocator_(ObMemAttr(memory_tenant_id_, "AsyncIdxRpc")), pending_count_(0),
+    completed_head_(nullptr), completed_tail_(nullptr), fatal_result_(OB_SUCCESS),
     round_start_ts_(ObTimeUtility::current_time()), rpc_count_(0), skipped_count_(0)
 {
   // Cancellation detection belongs to this call, not the shared RPC proxy.
@@ -246,9 +270,9 @@ void ObAsyncIndexRefreshUtil::RefreshDispatcher::Callback::on_invalid()
 ObAsyncIndexRefreshUtil::RefreshDispatcher::~RefreshDispatcher()
 {
   // Keep callbacks alive even if a future error path exits before collection.
-  if (pending_count_ > 0) {
+  if (!callbacks_.empty()) {
     int ret = OB_SUCCESS;
-    if (OB_FAIL(drain_callbacks())) {
+    if (OB_FAIL(collect_results())) {
       LOG_WARN("failed while draining refresh callbacks during destruction", K(ret));
     }
   }
@@ -271,14 +295,18 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::post_partition(
   int ret = OB_SUCCESS;
   const auto &arg = args_.at(target_index);
   void *buf = nullptr;
+  int64_t node_index = -1;
   if (!server.is_valid() || timeout <= 0 || !arg.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid refresh RPC argument", K(ret), K(server), K(timeout), K(arg));
+  } else if (OB_FAIL(progress_.get_node(server, node_index))) {
+    LOG_WARN("failed to get refresh node", K(ret), K(server));
   } else if (OB_ISNULL(buf = allocator_.alloc(sizeof(Callback)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate refresh RPC callback", K(ret));
   } else {
     Callback *cb = new (buf) Callback(*this, target_index);
+    cb->node_index_ = node_index;
     if (OB_FAIL(callbacks_.push_back(cb))) {
       LOG_WARN("failed to append refresh RPC callback", K(ret));
       cb->~Callback();
@@ -286,6 +314,7 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::post_partition(
       {
         ObThreadCondGuard guard(cond_);
         ++pending_count_;
+        ++progress_.get_nodes().at(node_index).inflight_;
       }
       if (OB_FAIL(post_rpc(server, timeout, arg, *cb))) {
         int tmp_ret = OB_SUCCESS;
@@ -311,7 +340,13 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::complete(Callback &cb, const int
     cb.set_ret_code(code);
     cb.done_ = true;
     --pending_count_;
-    if (0 == pending_count_ && OB_FAIL(cond_.broadcast())) {
+    if (nullptr == completed_tail_) {
+      completed_head_ = &cb;
+    } else {
+      completed_tail_->next_completed_ = &cb;
+    }
+    completed_tail_ = &cb;
+    if (OB_FAIL(cond_.broadcast())) {
       LOG_WARN("failed to signal refresh RPC completion", K(ret));
     }
   }
@@ -340,7 +375,10 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::drain_callbacks()
       ret = tmp_ret;
       LOG_WARN("failed to wait for refresh RPCs, keep draining", K(ret));
     }
-    if (!terminated && obrpc::is_interrupt_error(THIS_WORKER.check_status())) {
+    const int status_ret = terminated ? OB_SUCCESS : THIS_WORKER.check_status();
+    if (!terminated && obrpc::is_interrupt_error(status_ret)) {
+      LOG_WARN("refresh interrupted, cancel outstanding RPCs",
+          K(status_ret), K_(tenant_id), K_(data_table_id), K_(pending_count));
       terminated = true;
       for (int64_t i = 0; i < callbacks_.count(); ++i) {
         Callback &cb = *callbacks_.at(i);
@@ -364,6 +402,8 @@ void ObAsyncIndexRefreshUtil::RefreshDispatcher::reuse_callbacks()
     callbacks_.at(i)->~Callback();
   }
   callbacks_.reuse();
+  completed_head_ = nullptr;
+  completed_tail_ = nullptr;
   allocator_.reuse();
 }
 
@@ -424,15 +464,8 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::send_partition(const int64_t i)
   int ret = OB_SUCCESS;
   auto &state = retry_states_.at(i);
   const auto &arg = args_.at(i);
-  ObAddr leader_addr;
+  ObAddr leader_addr = state.server_;
   common::ObTimeoutCtx timeout_ctx;
-  if (0 == state.deadline_) {
-    state.deadline_ = ObTimeUtility::current_time() + refresh_rpc_timeout_;
-    const int64_t worker_deadline = THIS_WORKER.get_timeout_ts();
-    if (worker_deadline > 0) {
-      state.deadline_ = MIN(state.deadline_, worker_deadline);
-    }
-  }
   if (OB_FAIL(ObShareUtil::set_default_timeout_ctx(timeout_ctx, refresh_rpc_timeout_))) {
     LOG_WARN("failed to initialize refresh RPC timeout", K(ret), K(arg));
   } else if (OB_FAIL(timeout_ctx.set_abs_timeout(
@@ -445,8 +478,7 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::send_partition(const int64_t i)
       LOG_WARN("refresh RPC deadline expired before leader lookup", K(ret), K(arg), K(state.deadline_));
     } else if (OB_FAIL(THIS_WORKER.check_status())) {
       LOG_WARN("refresh RPC interrupted before leader lookup", K(ret), K(arg));
-    } else if (OB_FAIL(location_service_.get_leader(
-        GCONF.cluster_id, tenant_id_, arg.ls_id_, state.force_renew_, leader_addr))) {
+    } else if (!leader_addr.is_valid() && OB_FAIL(resolve_server(i, leader_addr))) {
       LOG_WARN("failed to get refresh RPC leader", K(ret), K(arg), K(state.force_renew_));
     }
   }
@@ -473,25 +505,225 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::send_partition(const int64_t i)
 int ObAsyncIndexRefreshUtil::RefreshDispatcher::collect_results()
 {
   int ret = OB_SUCCESS;
-  // Drain unconditionally before reading callbacks or returning to the caller.
+  int drain_ret = OB_SUCCESS;
   if (OB_FAIL(drain_callbacks())) {
-    LOG_WARN("failed to drain async index refresh callbacks", K(ret));
+    LOG_WARN("failed to drain refresh callbacks", K(ret));
   }
-  for (int64_t i = 0; i < callbacks_.count(); ++i) {
-    const Callback &cb = *callbacks_.at(i);
+  // Always consume completed callbacks to release node slots, even if waiting failed.
+  drain_ret = ret;
+  if (OB_FAIL(consume_completed())) {
+    LOG_WARN("failed to consume refresh callbacks", K(ret), K(drain_ret));
+  }
+  ret = record_refresh_error(ret, refresh_type_, drain_ret);
+  return ret;
+}
+
+int ObAsyncIndexRefreshUtil::RefreshDispatcher::consume_completed()
+{
+  int ret = OB_SUCCESS;
+  ObThreadCondGuard guard(cond_);
+  while (nullptr != completed_head_) {
+    Callback &cb = *completed_head_;
+    completed_head_ = cb.next_completed_;
+    if (nullptr == completed_head_) {
+      completed_tail_ = nullptr;
+    }
+    auto &node = progress_.get_nodes().at(cb.node_index_);
+    --node.inflight_;
     auto &state = retry_states_.at(cb.target_index_);
-    // Allocation failures without callbacks remain in their partition states.
-    // Preserve a posting error instead of overwriting it with a response.
+    // Keep a synchronous posting error, if any.
     if (OB_SUCCESS == state.result_) {
       state.result_ = cb.get_ret_code();
       if (OB_SUCCESS == state.result_) {
         state.result_ = cb.get_result().ret_code_;
       }
     }
+    if (!can_retry_result(state.result_)) {
+      fatal_result_ = record_refresh_error(state.result_, refresh_type_, fatal_result_);
+    }
     if (OB_SUCCESS == state.result_) {
       const int mark_ret = progress_.mark_success(cb.target_index_);
-      if (OB_FAIL(record_refresh_error(mark_ret, refresh_type_, ret)) && OB_SUCCESS != mark_ret) {
-        LOG_WARN("failed to mark async index refresh success", K(ret), K(mark_ret), K(cb.target_index_));
+      if (OB_SUCCESS != mark_ret) {
+        LOG_WARN("failed to record refresh partition success", K(mark_ret), K(cb.target_index_));
+        ret = record_refresh_error(mark_ret, refresh_type_, ret);
+      }
+    }
+  }
+  return ret;
+}
+
+int ObAsyncIndexRefreshUtil::RefreshDispatcher::load_node_windows()
+{
+  int ret = OB_SUCCESS;
+  bool cached = !progress_.get_nodes().empty();
+  for (int64_t i = 0; cached && i < progress_.get_nodes().count(); ++i) {
+    cached = progress_.get_nodes().at(i).config_valid_;
+  }
+  if (cached) {
+    return ret;
+  }
+  common::ObTimeoutCtx timeout_ctx;
+  ObUnitInfoGetter getter;
+  ObArray<ObUnitInfoGetter::ObServerConfig> configs;
+  configs.set_attr(ObMemAttr(memory_tenant_id_, "AsyncIdxRpc"));
+  // This shared SQL-backed getter works on both DDL coordinators and manual
+  // callers. It includes migrate_from_server and aggregates units per server.
+  if (OB_FAIL(ObShareUtil::set_default_timeout_ctx(timeout_ctx, refresh_rpc_timeout_))) {
+    LOG_WARN("failed to set refresh config lookup timeout", K(ret));
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("SQL proxy is null for refresh CPU lookup", K(ret), K_(tenant_id));
+  } else if (OB_FAIL(getter.init(*GCTX.sql_proxy_))) {
+    LOG_WARN("failed to initialize refresh unit getter", K(ret));
+  } else if (OB_FAIL(getter.get_tenant_server_configs(tenant_id_, configs))) {
+    LOG_WARN("failed to read refresh unit configs", K(ret), K_(tenant_id));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < configs.count(); ++i) {
+      int64_t index = -1;
+      const double cpu = configs.at(i).config_.max_cpu();
+      if (!(cpu > 0 && cpu < static_cast<double>(INT64_MAX / REFRESH_RPC_CONCURRENCY_PER_CPU))) {
+        // Unknown/invalid configuration retains the conservative window.
+      } else if (OB_FAIL(progress_.get_node(configs.at(i).server_, index))) {
+        LOG_WARN("failed to cache refresh node window", K(ret));
+      } else {
+        auto &node = progress_.get_nodes().at(index);
+        if (!node.config_valid_) {
+          node.window_ = MAX(1L, static_cast<int64_t>(REFRESH_RPC_CONCURRENCY_PER_CPU * cpu));
+          node.config_valid_ = true;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObAsyncIndexRefreshUtil::RefreshDispatcher::resolve_server(const int64_t i, ObAddr &server)
+{
+  int ret = OB_SUCCESS;
+  common::ObTimeoutCtx timeout_ctx;
+  const auto &arg = args_.at(i);
+  const auto &state = retry_states_.at(i);
+  if (OB_FAIL(ObShareUtil::set_default_timeout_ctx(timeout_ctx, refresh_rpc_timeout_))) {
+    LOG_WARN("failed to initialize refresh location timeout", K(ret), K(arg));
+  } else if (state.deadline_ > 0 && OB_FAIL(timeout_ctx.set_abs_timeout(MIN(timeout_ctx.get_abs_timeout(), state.deadline_)))) {
+    LOG_WARN("failed to set refresh location deadline", K(ret), K(arg), K(state.deadline_));
+  } else if (timeout_ctx.is_timeouted()) {
+    ret = OB_TIMEOUT;
+    LOG_WARN("refresh location deadline expired", K(ret), K(arg), K(state.deadline_));
+  } else if (OB_FAIL(location_service_.get_leader(GCONF.cluster_id, tenant_id_, arg.ls_id_, state.force_renew_, server))) {
+    LOG_WARN("failed to resolve refresh leader", K(ret), K(arg), K(state.force_renew_));
+  }
+  return ret;
+}
+
+bool ObAsyncIndexRefreshUtil::RefreshDispatcher::can_retry_result(const int code) const
+{
+  return OB_SUCCESS == code || OB_EAGAIN == code || OB_NEED_RETRY == code
+      || OB_NOT_MASTER == code || is_server_down_error(code)
+      || OB_TENANT_NOT_IN_SERVER == code || OB_LOCATION_NOT_EXIST == code
+      || OB_LS_LOCATION_NOT_EXIST == code || OB_LS_LOCATION_LEADER_NOT_EXIST == code
+      || ObAsyncIndexRefreshUtil::is_refresh_retry_error(code, refresh_type_);
+}
+
+int ObAsyncIndexRefreshUtil::RefreshDispatcher::dispatch_partition(
+    const int64_t i, bool &waiting_for_slot)
+{
+  int ret = OB_SUCCESS;
+  waiting_for_slot = false;
+  auto &state = retry_states_.at(i);
+  if (!state.pending_ || state.handled_this_round_ || progress_.is_success(i)) {
+  } else if (OB_FAIL(THIS_WORKER.check_status())) {
+    LOG_WARN("refresh interrupted before partition dispatch", K(ret), K(i));
+  } else {
+    int64_t node_index = -1;
+    int dispatch_ret = OB_SUCCESS;
+    // Leader lookup, window waiting, RPC and retries share one deadline.
+    if (0 == state.deadline_) {
+      state.deadline_ = ObTimeUtility::current_time() + refresh_rpc_timeout_;
+      const int64_t worker_deadline = THIS_WORKER.get_timeout_ts();
+      if (worker_deadline > 0) {
+        state.deadline_ = MIN(state.deadline_, worker_deadline);
+      }
+    }
+    if (state.deadline_ <= ObTimeUtility::current_time()) {
+      dispatch_ret = OB_TIMEOUT;
+      LOG_WARN("refresh partition deadline expired before dispatch", K(dispatch_ret), K(i), K(state.deadline_));
+    } else if (!state.server_.is_valid()
+        && OB_SUCCESS != (dispatch_ret = resolve_server(i, state.server_))) {
+      LOG_WARN("failed to resolve partition destination", K(dispatch_ret), K(i), K(args_.at(i)));
+    }
+    if (OB_SUCCESS == dispatch_ret
+        && OB_SUCCESS != (dispatch_ret = progress_.get_node(state.server_, node_index))) {
+      LOG_WARN("failed to get partition dispatch window", K(dispatch_ret), K(i), K(state.server_));
+    }
+    if (OB_SUCCESS != dispatch_ret) {
+      state.handled_this_round_ = true;
+      state.result_ = dispatch_ret;
+    } else {
+      auto &node = progress_.get_nodes().at(node_index);
+      if (node.inflight_ >= node.window_) {
+        waiting_for_slot = true;
+      } else {
+        state.handled_this_round_ = true;
+        if (OB_SUCCESS != (dispatch_ret = send_partition(i))) {
+          LOG_WARN("failed to dispatch refresh partition", K(dispatch_ret), K(i), K(state.server_));
+        }
+        state.result_ = dispatch_ret;
+      }
+    }
+    if (!can_retry_result(state.result_)) {
+      ret = state.result_;
+      LOG_WARN("stop refresh dispatch after partition error", K(ret), K(i));
+    }
+  }
+  return ret;
+}
+
+int ObAsyncIndexRefreshUtil::RefreshDispatcher::dispatch_round()
+{
+  int ret = OB_SUCCESS;
+  bool finished = false;
+  fatal_result_ = OB_SUCCESS;
+  for (int64_t i = 0; i < retry_states_.count(); ++i) {
+    retry_states_.at(i).handled_this_round_ = false;
+    retry_states_.at(i).server_.reset();
+  }
+  while (OB_SUCC(ret) && !finished) {
+    if (OB_FAIL(THIS_WORKER.check_status())) {
+      LOG_WARN("refresh dispatch interrupted", K(ret), K_(tenant_id), K_(data_table_id));
+    } else if (OB_FAIL(consume_completed())) {
+      LOG_WARN("failed to consume refresh results", K(ret));
+    } else {
+      bool unsent = false;
+      for (int64_t i = 0; OB_SUCC(ret) && i < args_.count(); ++i) {
+        // Observe terminal failures before replenishing any node's window.
+        if (OB_FAIL(consume_completed())) {
+          LOG_WARN("failed to consume refresh results before dispatch", K(ret), K(i));
+        } else if (OB_SUCCESS != fatal_result_) {
+          ret = fatal_result_;
+          LOG_WARN("stop refresh dispatch after terminal result", K(ret), K(i));
+        }
+        if (OB_SUCC(ret)) {
+          bool waiting_for_slot = false;
+          if (OB_FAIL(dispatch_partition(i, waiting_for_slot))) {
+            LOG_WARN("failed to process refresh partition dispatch", K(ret), K(i));
+          } else {
+            unsent = unsent || waiting_for_slot;
+          }
+        }
+      }
+      if (OB_SUCC(ret)) {
+        ObThreadCondGuard guard(cond_);
+        finished = !unsent && pending_count_ == 0;
+        if (!finished && nullptr == completed_head_) {
+          // Check completion under the same lock as wait to avoid a lost wakeup.
+          // The timeout also permits checking query cancellation periodically.
+          const int wait_ret = cond_.wait(10);
+          if (OB_SUCCESS != wait_ret && OB_TIMEOUT != wait_ret) {
+            ret = wait_ret;
+            LOG_WARN("failed to wait for refresh completion", K(ret), K_(pending_count));
+          }
+        }
       }
     }
   }
@@ -532,7 +764,12 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::prepare_retry(
           if (OB_TMP_FAIL(renew_refresh_location(location_service_, args_.at(i), state.result_))) {
             LOG_WARN("failed to renew refresh location, preserve refresh error", K(tmp_ret), K(state.result_));
           }
-          LOG_WARN("async index partition refresh failed", K(state.result_), K(args_.at(i)), K(attempt));
+          // Sample retryable failures at most once a second.
+          if (!ObAsyncIndexRefreshUtil::is_refresh_retry_error(state.result_, refresh_type_)
+              || REACH_TIME_INTERVAL(1000L * 1000L)) {
+            LOG_WARN("async index partition refresh failed",
+                K(state.result_), K(args_.at(i)), K(state.server_), K(attempt));
+          }
           if (!ObAsyncIndexRefreshUtil::is_refresh_retry_error(state.result_, refresh_type_)
               && OB_FAIL(record_refresh_error(state.result_, refresh_type_, ret))) {
             LOG_WARN("stop refresh retries after terminal partition error", K(ret), K(i));
@@ -547,50 +784,57 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::prepare_retry(
 int ObAsyncIndexRefreshUtil::RefreshDispatcher::execute()
 {
   int ret = OB_SUCCESS;
-  bool interrupted = false;
   int interrupt_ret = OB_SUCCESS;
   bool has_pending = true;
   for (int64_t attempt = 0; OB_SUCC(ret) && has_pending
       && attempt <= MAX_RPC_RETRY_COUNT; ++attempt) {
     reuse_callbacks(); // The previous round has drained every callback.
-    for (int64_t i = 0; !interrupted && i < args_.count(); ++i) {
-      const int status_ret = THIS_WORKER.check_status();
-      auto &state = retry_states_.at(i);
-      if (obrpc::is_interrupt_error(status_ret)) {
-        interrupted = true;
-        interrupt_ret = status_ret;
-      } else if (progress_.is_success(i)) {
-        if (0 == attempt) {
+    if (0 == attempt) {
+      for (int64_t i = 0; i < args_.count(); ++i) {
+        if (progress_.is_success(i)) {
           ++skipped_count_;
+          retry_states_.at(i).pending_ = false;
         }
-        state.pending_ = false;
-      } else if (state.pending_) {
-        int tmp_ret = OB_SUCCESS;
-        if (OB_TMP_FAIL(send_partition(i))) {
-          LOG_WARN("failed to send async index refresh partition", K(tmp_ret), K(i));
+      }
+      if (OB_FAIL(THIS_WORKER.check_status())) {
+        LOG_WARN("refresh interrupted before loading node windows", K(ret), K_(tenant_id));
+        interrupt_ret = ret;
+      } else {
+        const int config_ret = load_node_windows();
+        if (OB_ALLOCATE_MEMORY_FAILED == config_ret || obrpc::is_interrupt_error(config_ret)) {
+          ret = config_ret;
+          LOG_WARN("failed to initialize refresh windows", K(ret), K_(tenant_id));
+          if (obrpc::is_interrupt_error(ret)) {
+            interrupt_ret = ret;
+          }
+        } else if (OB_SUCCESS != config_ret) {
+          // Config lookup is advisory: retain the documented W=1 fallback.
+          LOG_WARN("refresh CPU config unavailable, use cached windows or one", K(config_ret), K_(tenant_id));
         }
-        state.result_ = tmp_ret;
-        if (obrpc::is_interrupt_error(tmp_ret)) {
-          interrupted = true;
-          interrupt_ret = tmp_ret;
-        }
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(dispatch_round())) {
+      LOG_WARN("refresh dispatch stopped, drain outstanding callbacks", K(ret));
+      if (obrpc::is_interrupt_error(ret)) {
+        interrupt_ret = ret;
       }
     }
     // Collect unconditionally, including when a partition failed to post.
-    if (OB_FAIL(collect_results())) {
-      LOG_WARN("failed to collect async index refresh round", K(ret), K(attempt));
+    const int collect_ret = collect_results();
+    if (OB_SUCCESS != collect_ret) {
+      LOG_WARN("failed to collect refresh round results", K(collect_ret), K(ret), K(attempt));
+      ret = record_refresh_error(collect_ret, refresh_type_, ret);
     }
     // Cancellation takes precedence over errors from cancelled RPCs.
-    const int status_ret = interrupted ? interrupt_ret : THIS_WORKER.check_status();
+    const int status_ret = OB_SUCCESS != interrupt_ret ? interrupt_ret : THIS_WORKER.check_status();
     if (OB_SUCCESS != status_ret) {
-      interrupted = true;
-      if (OB_FAIL(status_ret)) {
-        LOG_WARN("async index refresh interrupted", K(ret), K(attempt));
-      }
+      interrupt_ret = status_ret;
+      ret = status_ret;
+      LOG_WARN("async index refresh interrupted", K(ret), K(attempt));
     }
     has_pending = false;
     int64_t sleep_us = RETRY_INTERVAL_US;
-    if (!interrupted && OB_FAIL(prepare_retry(attempt, ret, has_pending, sleep_us))) {
+    if (OB_SUCCESS == interrupt_ret && OB_FAIL(prepare_retry(attempt, ret, has_pending, sleep_us))) {
       LOG_WARN("async index refresh round cannot retry", K(ret), K(attempt));
     }
     if (OB_SUCC(ret) && has_pending) {
@@ -599,15 +843,19 @@ int ObAsyncIndexRefreshUtil::RefreshDispatcher::execute()
   }
   // Only unresolved errors survive: a successful retry must clear its earlier
   // failure, while completed partitions remain reusable by the outer caller.
-  for (int64_t i = 0; !interrupted && i < retry_states_.count(); ++i) {
-    if (!progress_.is_success(i)
-        && OB_FAIL(record_refresh_error(retry_states_.at(i).result_, refresh_type_, ret))) {
-      LOG_WARN("async index refresh target remains incomplete", K(ret), K(args_.at(i)));
+  for (int64_t i = 0; OB_SUCCESS == interrupt_ret && i < retry_states_.count(); ++i) {
+    if (!progress_.is_success(i)) {
+      ret = record_refresh_error(retry_states_.at(i).result_, refresh_type_, ret);
     }
   }
   int64_t success_count = 0;
   for (int64_t i = 0; i < args_.count(); ++i) {
     success_count += progress_.is_success(i) ? 1 : 0;
+  }
+  if (OB_FAIL(ret) && OB_SUCCESS == interrupt_ret) {
+    LOG_WARN("async index refresh call failed", K(ret), K_(tenant_id),
+        K_(data_table_id), K_(target_scn), K_(refresh_type), K_(rpc_count),
+        "success_count", success_count, "remaining_count", args_.count() - success_count);
   }
   if (OB_SUCC(ret) || REACH_TIME_INTERVAL(1000L * 1000L)) {
     LOG_INFO("[ASYNC_INDEX] async index refresh round completed", K(ret), K_(tenant_id),

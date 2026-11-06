@@ -2291,6 +2291,183 @@ TEST_F(TestAsyncIndexTrigger, async_refresh_cancel_stops_remaining_partition_dis
   }
 }
 
+// Keep the first request outstanding while later requests complete. This
+// distinguishes a rolling window from waiting for every request in a batch.
+struct WindowTestDispatcher : public RefreshTestDispatcher
+{
+  enum Mode { SUCCESS, ROLLING, BLOCKED_WINDOW, FATAL, POST_FAILURE };
+  WindowTestDispatcher(obrpc::ObSrvRpcProxy &transport, ObLocationService &location,
+      ObAsyncIndexRefreshProgress &progress)
+    : RefreshTestDispatcher(transport, location, progress, 1001, ASYNC_REFRESH_TYPE_CREATE_INDEX),
+      mode_(SUCCESS), window_(2), held_(nullptr), second_held_(nullptr),
+      posted_count_(0), peak_(0), replenished_before_first_(false) {}
+  int load_node_windows() override { return OB_SUCCESS; }
+  int resolve_server(const int64_t, ObAddr &server) override
+  {
+    int ret = OB_SUCCESS;
+    int64_t index = -1;
+    if (!server.set_ip_addr("127.0.0.1", 2882)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else {
+      ret = progress_.get_node(server, index);
+    }
+    if (OB_SUCCESS == ret) {
+      progress_.get_nodes().at(index).window_ = window_;
+    }
+    return ret;
+  }
+  int post_rpc(const ObAddr &, const int64_t,
+      const obrpc::ObAsyncIndexRefreshArg &, Callback &cb) override
+  {
+    std::lock_guard<std::mutex> lock(post_mutex_);
+    ++posted_count_;
+    post_cv_.notify_all();
+    peak_ = MAX(peak_, progress_.get_nodes().at(cb.node_index_).inflight_);
+    if ((ROLLING == mode_ || BLOCKED_WINDOW == mode_) && cb.target_index_ == 0) {
+      held_ = &cb;
+      return OB_SUCCESS;
+    }
+    if (BLOCKED_WINDOW == mode_ && cb.target_index_ == 1) {
+      second_held_ = &cb;
+      return OB_SUCCESS;
+    }
+    if ((ROLLING == mode_ || BLOCKED_WINDOW == mode_) && cb.target_index_ >= 2 && nullptr != held_) {
+      replenished_before_first_ = !held_->done_;
+    }
+    if (POST_FAILURE == mode_) {
+      return OB_ALLOCATE_MEMORY_FAILED;
+    }
+    cb.result_.ret_code_ = cb.target_index_ == 0 && FATAL == mode_ ? OB_INVALID_ARGUMENT : OB_SUCCESS;
+    int ret = cb.process();
+    if ((ROLLING == mode_ || BLOCKED_WINDOW == mode_)
+        && cb.target_index_ == args_.count() - 1 && nullptr != held_) {
+      held_->result_.ret_code_ = OB_SUCCESS;
+      const int finish_ret = held_->process();
+      EXPECT_EQ(OB_SUCCESS, finish_ret);
+      if (OB_SUCCESS == ret) {
+        ret = finish_ret;
+      }
+      held_ = nullptr;
+    }
+    return ret;
+  }
+  Mode mode_;
+  int64_t window_;
+  Callback *held_;
+  Callback *second_held_;
+  std::mutex post_mutex_;
+  std::condition_variable post_cv_;
+  int64_t posted_count_;
+  int64_t peak_;
+  bool replenished_before_first_;
+};
+
+TEST_F(TestAsyncIndexTrigger, refresh_window_replenishes_after_out_of_order_completion)
+{
+  RefreshRpcTestWorker worker;
+  RefreshRpcWorkerGuard worker_guard(worker);
+  obrpc::ObSrvRpcProxy transport;
+  ObLocationService location;
+  ObAsyncIndexRefreshProgress progress;
+  WindowTestDispatcher proxy(transport, location, progress);
+  ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, 6));
+  proxy.mode_ = WindowTestDispatcher::ROLLING;
+  ASSERT_EQ(OB_SUCCESS, proxy.execute());
+  EXPECT_EQ(6, proxy.posted_count_);
+  EXPECT_EQ(2, proxy.peak_);
+  EXPECT_TRUE(proxy.replenished_before_first_);
+  EXPECT_EQ(0, progress.get_nodes().at(0).inflight_);
+  for (int64_t i = 0; i < 6; ++i) {
+    EXPECT_TRUE(progress.is_success(i));
+  }
+}
+
+TEST_F(TestAsyncIndexTrigger, refresh_full_window_waits_then_replenishes_without_waiting_for_head)
+{
+  RefreshRpcTestWorker worker;
+  RefreshRpcWorkerGuard worker_guard(worker);
+  obrpc::ObSrvRpcProxy transport;
+  ObLocationService location;
+  ObAsyncIndexRefreshProgress progress;
+  WindowTestDispatcher proxy(transport, location, progress);
+  ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, 6));
+  proxy.mode_ = WindowTestDispatcher::BLOCKED_WINDOW;
+  bool reached_window = false;
+  bool over_dispatched = false;
+  int callback_ret = OB_ERROR;
+  std::thread network([&]() {
+    std::unique_lock<std::mutex> lock(proxy.post_mutex_);
+    reached_window = proxy.post_cv_.wait_for(lock, std::chrono::seconds(5),
+        [&]() { return proxy.second_held_ != nullptr; });
+    if (reached_window) {
+      over_dispatched = proxy.post_cv_.wait_for(lock, std::chrono::milliseconds(30),
+          [&]() { return proxy.posted_count_ > 2; });
+      proxy.second_held_->result_.ret_code_ = OB_SUCCESS;
+      callback_ret = proxy.second_held_->process();
+    }
+  });
+  const int ret = proxy.execute();
+  network.join();
+  EXPECT_EQ(OB_SUCCESS, ret);
+  EXPECT_TRUE(reached_window);
+  EXPECT_EQ(OB_SUCCESS, callback_ret);
+  EXPECT_FALSE(over_dispatched);
+  EXPECT_EQ(2, proxy.peak_);
+  EXPECT_TRUE(proxy.replenished_before_first_);
+  EXPECT_EQ(6, proxy.posted_count_);
+  EXPECT_EQ(0, progress.get_nodes().at(0).inflight_);
+}
+
+TEST_F(TestAsyncIndexTrigger, refresh_window_stops_on_terminal_error_and_releases_failed_post)
+{
+  RefreshRpcTestWorker worker;
+  RefreshRpcWorkerGuard worker_guard(worker);
+  obrpc::ObSrvRpcProxy transport;
+  ObLocationService location;
+  for (const auto mode : {WindowTestDispatcher::FATAL, WindowTestDispatcher::POST_FAILURE}) {
+    ObAsyncIndexRefreshProgress progress;
+    WindowTestDispatcher proxy(transport, location, progress);
+    ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, 4));
+    proxy.mode_ = mode;
+    const int expected = mode == WindowTestDispatcher::FATAL
+        ? OB_INVALID_ARGUMENT : OB_ALLOCATE_MEMORY_FAILED;
+    EXPECT_EQ(expected, proxy.execute());
+    EXPECT_EQ(1, proxy.posted_count_);
+    EXPECT_EQ(0, proxy.pending_count_);
+    ASSERT_EQ(1, progress.get_nodes().count());
+    EXPECT_EQ(0, progress.get_nodes().at(0).inflight_);
+  }
+}
+
+TEST_F(TestAsyncIndexTrigger, refresh_completion_releases_original_node_only_once)
+{
+  obrpc::ObSrvRpcProxy transport;
+  ObLocationService location;
+  ObAsyncIndexRefreshProgress progress;
+  RefreshTestDispatcher proxy(transport, location, progress);
+  ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, 1));
+  ObAddr old_server;
+  ObAddr new_server;
+  ASSERT_TRUE(old_server.set_ip_addr("127.0.0.1", 2882));
+  ASSERT_TRUE(new_server.set_ip_addr("127.0.0.1", 2883));
+  ASSERT_EQ(OB_SUCCESS, proxy.post_partition(old_server, 1000000, 0));
+  proxy.retry_states_.at(0).server_ = new_server;
+  int64_t new_index = -1;
+  ASSERT_EQ(OB_SUCCESS, progress.get_node(new_server, new_index));
+  ASSERT_EQ(OB_SUCCESS, proxy.callback_->process());
+  ASSERT_EQ(OB_SUCCESS, proxy.consume_completed());
+  ASSERT_EQ(OB_SUCCESS, proxy.consume_completed());
+  EXPECT_EQ(0, progress.get_nodes().at(0).inflight_);
+  EXPECT_EQ(0, progress.get_nodes().at(new_index).inflight_);
+  EXPECT_EQ(OB_ERR_UNEXPECTED, proxy.callback_->process());
+  EXPECT_EQ(0, progress.get_nodes().at(0).inflight_);
+  proxy.reuse_callbacks();
+  // Changing the target must invalidate both success and cached node windows.
+  proxy.args_.at(0).target_refresh_scn_++;
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(proxy.args_, proxy.memory_tenant_id_));
+  EXPECT_EQ(0, progress.get_nodes().count());
+}
+
 } // namespace unittest
 } // namespace oceanbase
 

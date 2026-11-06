@@ -28,12 +28,25 @@ public:
   {
     targets_.reset();
     succeeded_.reset();
+    nodes_.reset();
     memory_tenant_id_ = common::OB_INVALID_TENANT_ID;
   }
   // The caller owns the local buffers; the RPC tenant may not exist on this server.
   int prepare(const common::ObIArray<obrpc::ObAsyncIndexRefreshArg> &targets, const uint64_t memory_tenant_id);
   bool is_success(const int64_t i) const { return succeeded_.has_member(i); }
   int mark_success(const int64_t i) { return succeeded_.add_member(i); }
+  // Owned by one caller. Only the dispatch thread accesses node state; callbacks
+  // report completion under the dispatcher's condition lock.
+  struct NodeState
+  {
+    common::ObAddr server_;
+    int64_t window_ = 1;
+    int64_t inflight_ = 0;
+    bool config_valid_ = false;
+    TO_STRING_KV(K_(server), K_(window), K_(inflight), K_(config_valid));
+  };
+  int get_node(const common::ObAddr &server, int64_t &index);
+  common::ObArray<NodeState> &get_nodes() { return nodes_; }
 private:
   struct IndexTarget
   {
@@ -60,6 +73,7 @@ private:
   uint64_t memory_tenant_id_ = common::OB_INVALID_TENANT_ID;
   common::ObArray<PartitionTarget> targets_;
   common::ObBitSet<64> succeeded_;
+  common::ObArray<NodeState> nodes_;
 };
 
 class ObIAsyncIndexDDLPublishOp
@@ -134,7 +148,7 @@ private:
     struct Callback : public obrpc::ObSrvRpcProxy::AsyncCB<obrpc::OB_ASYNC_INDEX_REFRESH>
     {
       Callback(RefreshDispatcher &owner, const int64_t target_index)
-        : owner_(owner), target_index_(target_index), posted_(false), done_(false) {}
+        : owner_(owner), target_index_(target_index), posted_(false), done_(false), node_index_(-1), next_completed_(nullptr) {}
       rpc::frame::ObReqTransport::AsyncCB *clone(const rpc::frame::SPAlloc &) const override;
       void set_args(const obrpc::ObAsyncIndexRefreshArg &) override {}
       int process() override;
@@ -149,6 +163,8 @@ private:
       const int64_t target_index_;
       bool posted_;
       bool done_;
+      int64_t node_index_;
+      Callback *next_completed_;
     };
   public:
     RefreshDispatcher(const uint64_t tenant_id, const uint64_t data_table_id,
@@ -164,6 +180,15 @@ private:
   private:
     virtual int post_rpc(const common::ObAddr &server, const int64_t timeout,
         const obrpc::ObAsyncIndexRefreshArg &arg, Callback &cb);
+    virtual int load_node_windows();
+    virtual int resolve_server(const int64_t i, common::ObAddr &server);
+    int dispatch_round();
+    // Retryable partition failures stay in result_; only stop-worthy errors
+    // are returned. waiting_for_slot is true only for an unhandled full window.
+    int dispatch_partition(const int64_t i, bool &waiting_for_slot);
+    int consume_completed();
+    bool can_retry_result(const int code) const;
+    bool need_renew_leader(const int code) const;
     virtual int terminate_rpc(const uint64_t gtid, const uint32_t pkt_id);
     int post_partition(const common::ObAddr &server, const int64_t timeout, const int64_t target_index);
     int complete(Callback &cb, const int code);
@@ -171,17 +196,20 @@ private:
     void reuse_callbacks();
     struct PartitionRetryState
     {
-      PartitionRetryState() : deadline_(0), result_(common::OB_SUCCESS), pending_(true), force_renew_(false) {}
+      PartitionRetryState() : deadline_(0), result_(common::OB_SUCCESS), pending_(true), force_renew_(false), handled_this_round_(false) {}
       int64_t deadline_;
       int result_;
       bool pending_;
       bool force_renew_;
+      bool handled_this_round_;
+      common::ObAddr server_;
       TO_STRING_KV(K_(deadline), K_(result), K_(pending), K_(force_renew));
     };
     int send_partition(const int64_t i);
     int collect_results();
     int prepare_retry(const int64_t attempt, const int current_ret,
         bool &has_pending, int64_t &sleep_us);
+    static constexpr int64_t REFRESH_RPC_CONCURRENCY_PER_CPU = 4;
     static constexpr int64_t MAX_RPC_RETRY_COUNT = 3; // Three retries after the initial attempt.
     static constexpr int64_t RETRY_INTERVAL_US = 200 * 1000;
     const uint64_t tenant_id_;
@@ -199,6 +227,9 @@ private:
     common::ObArray<Callback *> callbacks_;
     common::ObThreadCond cond_;
     int64_t pending_count_;
+    Callback *completed_head_;
+    Callback *completed_tail_;
+    int fatal_result_;
     const int64_t round_start_ts_;
     int64_t rpc_count_;
     int64_t skipped_count_;
