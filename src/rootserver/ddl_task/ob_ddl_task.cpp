@@ -4443,6 +4443,45 @@ int ObDDLTaskRecordOperator::get_all_ddl_task_record(common::ObMySQLProxy &proxy
   return ret;
 }
 
+int ObDDLTaskRecordOperator::check_vec_index_ddl_conflict(
+    common::ObISQLClient &sql_client, const uint64_t tenant_id,
+    const uint64_t table_id, bool &has_conflict)
+{
+  int ret = OB_SUCCESS;
+  has_conflict = false;
+  ObSqlString sql;
+  if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id || OB_INVALID_ID == tenant_id
+      || 0 == table_id || OB_INVALID_ID == table_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid vector DDL conflict argument", K(ret), K(tenant_id), K(table_id));
+  } else if (OB_FAIL(sql.assign_fmt(
+      "select 1 from %s where object_id=%lu and ddl_type in (%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d) limit 1",
+      OB_ALL_DDL_TASK_STATUS_TNAME, table_id,
+      DDL_CREATE_VEC_INDEX, DDL_CREATE_VEC_IVFFLAT_INDEX, DDL_CREATE_VEC_IVFSQ8_INDEX,
+      DDL_CREATE_VEC_IVFPQ_INDEX, DDL_DROP_VEC_INDEX, DDL_DROP_VEC_IVFFLAT_INDEX,
+      DDL_DROP_VEC_IVFSQ8_INDEX, DDL_DROP_VEC_IVFPQ_INDEX, DDL_REBUILD_INDEX,
+      DDL_CREATE_VEC_SPIV_INDEX, DDL_DROP_VEC_SPIV_INDEX))) {
+    LOG_WARN("build vector DDL conflict query failed", K(ret));
+  } else {
+    // A completed task still conflicts until its record is removed by cleanup.
+    SMART_VAR(ObMySQLProxy::MySQLResult, result) {
+      if (OB_FAIL(sql_client.read(result, tenant_id, sql.ptr()))) {
+        LOG_WARN("query vector DDL conflicts failed", K(ret), K(tenant_id), K(table_id));
+      } else if (OB_ISNULL(result.get_result())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("vector DDL conflict result is null", K(ret));
+      } else if (OB_SUCCESS == (ret = result.get_result()->next())) {
+        has_conflict = true;
+      } else if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("read vector DDL conflict result failed", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObDDLTaskRecordOperator::get_ddl_task_record_by_table_id(const uint64_t tenant_id,
                                                              const uint64_t table_id,
                                                              common::ObMySQLProxy &proxy,

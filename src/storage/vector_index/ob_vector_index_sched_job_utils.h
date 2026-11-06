@@ -12,6 +12,7 @@ namespace oceanbase {
 namespace share {
 namespace schema {
 class ObSchemaGetterGuard;
+class ObMultiVersionSchemaService;
 }
 } // namespace share
 namespace common {
@@ -46,6 +47,19 @@ public:
                                const common::ObObj &start_date,
                                const int64_t repeat_interval_ts,
                                const common::ObString &exec_env);
+
+  static constexpr int64_t REBUILD_DEFER_INTERVAL_US = 20L * 1000000;
+  static int get_rebuild_job_retry_count(
+      const dbms_scheduler::ObDBMSSchedJobInfo &job, int64_t &retry_cnt);
+  static int build_rebuild_defer_job(common::ObIAllocator &allocator, const uint64_t index_id,
+                                    dbms_scheduler::ObDBMSSchedJobInfo &job,
+                                    dbms_scheduler::ObDBMSSchedJobInfo &root_job, const int64_t now,
+                                    const int64_t retry_cnt,
+                                    dbms_scheduler::ObDBMSSchedJobInfo &next_job);
+  static int check_and_defer_rebuild_job(common::ObISQLClient &sql_client,
+                                       const uint64_t index_id, const uint64_t table_id,
+                                       dbms_scheduler::ObDBMSSchedJobInfo &job,
+                                       const int64_t retry_cnt, bool &deferred);
 
   static int add_vector_index_refresh_job(common::ObISQLClient &sql_client,
                                           const uint64_t tenant_id,

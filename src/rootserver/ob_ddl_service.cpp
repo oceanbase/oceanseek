@@ -30832,6 +30832,7 @@ int ObDDLService::alter_vec_index_params(
 int ObDDLService::rebuild_vec_index(const ObRebuildIndexArg &arg, obrpc::ObAlterTableRes &res)
 {
   int ret = OB_SUCCESS;
+  bool admission_conflict = false;
   LOG_INFO("RS start to rebuild vec index", K(arg));
   
   if (OB_FAIL(check_inner_stat())) {
@@ -30889,10 +30890,12 @@ int ObDDLService::rebuild_vec_index(const ObRebuildIndexArg &arg, obrpc::ObAlter
         ret = OB_NOT_SUPPORTED;
         LOG_WARN("rebuild on not ready vector index is not support", K(ret), KPC(index_table_schema));
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "rebuild on not ready vector index is");
-      } else if (OB_FAIL(check_vec_index_conflict(table_schema->get_tenant_id(), table_id))) {
-        if (OB_EAGAIN != ret) {
-          LOG_WARN("failed to check vec index ", K(ret));
-        }
+      } else if (OB_FAIL(ObDDLTaskRecordOperator::check_vec_index_ddl_conflict(
+                     get_sql_proxy(), tenant_id, table_id, admission_conflict))) {
+        LOG_WARN("failed to check vector index conflict", K(ret), K(table_id));
+      } else if (admission_conflict) {
+        // This RPC code confirms rejection before creating a DDL task.
+        ret = OB_ERR_PARALLEL_DDL_CONFLICT;
       } else if (arg.is_need_check_based_schema_objects() && 
                  OB_FAIL(check_parallel_ddl_conflict(schema_guard, arg))) {
         LOG_WARN("index table schema changed since rebuild request, parallel ddl conflict", KR(ret), K(arg));
@@ -41541,26 +41544,13 @@ int ObDDLService::check_fts_rename_conflict(ObSchemaGetterGuard &schema_guard,
 
 int ObDDLService::check_vec_index_conflict(const uint64_t tenant_id, const uint64_t table_id) {
   int ret = OB_SUCCESS;
-  ObArenaAllocator allocator(lib::ObLabel("DdlTasRecord"));
-  ObArray<ObDDLTaskRecord> task_records;
-  if (OB_FAIL(ObDDLTaskRecordOperator::get_ddl_task_record_by_table_id(tenant_id, table_id, get_sql_proxy(), allocator, task_records))) {
-    LOG_WARN("get task record failed", K(ret));
-  } else {
-    for (int64_t i = 0; OB_SUCC(ret) && i < task_records.count(); ++i) {
-      const ObDDLTaskRecord &cur_record = task_records.at(i);
-      if (cur_record.ddl_type_ == ObDDLType::DDL_CREATE_VEC_INDEX || 
-          cur_record.ddl_type_ == ObDDLType::DDL_CREATE_VEC_IVFFLAT_INDEX ||
-          cur_record.ddl_type_ == ObDDLType::DDL_CREATE_VEC_IVFSQ8_INDEX ||
-          cur_record.ddl_type_ == ObDDLType::DDL_CREATE_VEC_IVFPQ_INDEX ||
-          cur_record.ddl_type_ == ObDDLType::DDL_DROP_VEC_INDEX || 
-          cur_record.ddl_type_ == ObDDLType::DDL_DROP_VEC_IVFFLAT_INDEX || 
-          cur_record.ddl_type_ == ObDDLType::DDL_DROP_VEC_IVFSQ8_INDEX || 
-          cur_record.ddl_type_ == ObDDLType::DDL_DROP_VEC_IVFPQ_INDEX || 
-          cur_record.ddl_type_ == ObDDLType::DDL_REBUILD_INDEX) {
-        ret = OB_EAGAIN;
-        LOG_WARN("vector index is building, will retry later", K(ret), K(table_id), K(cur_record));
-      }
-    }
+  bool has_conflict = false;
+  if (OB_FAIL(ObDDLTaskRecordOperator::check_vec_index_ddl_conflict(
+          get_sql_proxy(), tenant_id, table_id, has_conflict))) {
+    LOG_WARN("check vector index DDL conflicts failed", K(ret), K(tenant_id), K(table_id));
+  } else if (has_conflict) {
+    ret = OB_EAGAIN;
+    LOG_WARN("vector index is building, will retry later", K(ret), K(table_id));
   }
   return ret;
 }

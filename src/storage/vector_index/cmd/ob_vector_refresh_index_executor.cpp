@@ -12,6 +12,7 @@
 #include "pl/ob_pl.h"
 #include "share/ob_vec_index_builder_util.h"
 #include "storage/vector_index/ob_vector_index_sched_job_utils.h"
+#include "observer/dbms_scheduler/ob_dbms_sched_job_utils.h"
 
 namespace oceanbase {
 namespace storage {
@@ -1909,18 +1910,53 @@ int ObVectorRefreshIndexExecutor::do_rebuild_with_retry()
   refresh_ctx.idx_parallel_creation_ = idx_parallel_creation_;
   refresh_ctx.delta_rate_threshold_ = delta_rate_threshold_;
   refresh_ctx.is_auto_rebuild_ = true;
-  int retry_cnt = 0;
+  int64_t retry_cnt = 0;
   int64_t start_time_us = common::ObTimeUtility::fast_current_time();
 
   CK(OB_NOT_NULL(ctx_));
-  while (OB_SUCC(ret) && OB_SUCC(ctx_->check_status())) {
-    ObVectorIndexRefresher refresher;
-    if (OB_FAIL(refresher.init(*ctx_, refresh_ctx))) {
-      LOG_WARN("fail to init refresher", KR(ret), K(refresh_ctx));
-    } else if (OB_FAIL(refresher.refresh())) {
-      LOG_WARN("fail to do refresh", KR(ret), K(refresh_ctx));
+  OZ(ctx_->check_status());
+  bool deferred = false;
+  dbms_scheduler::ObDBMSSchedJobInfo *job = session_info_->get_job_info();
+  const bool is_auto_job = nullptr != job && job->get_func_type()
+      == dbms_scheduler::ObDBMSSchedFuncType::VECTOR_INDEX_REFRESH_JOB;
+  if (OB_SUCC(ret) && is_auto_job) {
+    OZ(ObVectorIndexSchedJobUtils::get_rebuild_job_retry_count(*job, retry_cnt));
+    CK(OB_NOT_NULL(GCTX.sql_proxy_));
+  }
+  while (OB_SUCC(ret) && !deferred) {
+    if (OB_FAIL(ctx_->check_status())) {
+      break;
+    }
+    if (is_auto_job) {
+      OZ(ObVectorIndexSchedJobUtils::check_and_defer_rebuild_job(
+          *GCTX.sql_proxy_, domain_tb_id_, base_tb_id_, *job, retry_cnt, deferred));
+    }
+    if (deferred) {
+      break;
+    }
+    if (OB_SUCC(ret)) {
+      ObVectorIndexRefresher refresher;
+      if (OB_FAIL(refresher.init(*ctx_, refresh_ctx))) {
+        LOG_WARN("fail to init refresher", KR(ret), K(refresh_ctx));
+      } else if (OB_FAIL(refresher.refresh())) {
+        LOG_WARN("fail to do refresh", KR(ret), K(refresh_ctx));
+      }
     }
     if (OB_FAIL(ret)) {
+      if (is_auto_job && OB_ERR_PARALLEL_DDL_CONFLICT == ret
+          && refresh_ctx.rebuild_admission_rejected_) {
+        const int rebuild_ret = ret;
+        ret = OB_SUCCESS;
+        OZ(ctx_->check_status());
+        OZ(ObVectorIndexSchedJobUtils::check_and_defer_rebuild_job(
+            *GCTX.sql_proxy_, domain_tb_id_, base_tb_id_, *job, retry_cnt, deferred));
+        if (deferred) {
+          break;
+        }
+        if (OB_SUCC(ret)) {
+          ret = rebuild_ret; // The conflict disappeared; retain the finite retry budget.
+        }
+      }
       if (retry_cnt < MAX_REFRESH_RETRY_THRESHOLD &&
           ObVectorRefreshIndexExecutor::is_refresh_retry_ret_code(ret)) {
         ret = OB_SUCCESS;
@@ -1933,7 +1969,7 @@ int ObVectorRefreshIndexExecutor::do_rebuild_with_retry()
     }
   }
   int64_t cost_ms = (common::ObTimeUtility::fast_current_time() - start_time_us) / 1000;
-  FLOG_INFO("[VEC_INDEX][REBUILD] rebuild index with retry cost", K(ret), K(cost_ms), K(refresh_ctx));
+  FLOG_INFO("[VEC_INDEX][REBUILD] rebuild index with retry cost", K(ret), K(cost_ms), K(retry_cnt), K(refresh_ctx));
   return ret;
 }
 
