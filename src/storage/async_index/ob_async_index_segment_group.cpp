@@ -198,12 +198,14 @@ int ObAsyncIndexSegmentGroupCtx::build_query_ranges_(
 }
 
 int ObAsyncIndexSegmentGroupCtx::calc_async_index_read_snapshot_(
-    const share::SCN &sql_read_snapshot, share::SCN &upper_bound) const
+    const share::SCN &sql_read_snapshot, share::SCN &upper_bound,
+    bool &sql_limited, int64_t &min_published_version) const
 {
   int ret = OB_SUCCESS;
-  int64_t min_published_version = INT64_MAX;
+  min_published_version = INT64_MAX;
   share::SCN min_published_scn;
   const int64_t tablet_cnt = index_version_ranges_.count();
+  sql_limited = false;
   if (OB_UNLIKELY(!sql_read_snapshot.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid sql read snapshot", K(ret), K(sql_read_snapshot));
@@ -226,6 +228,44 @@ int ObAsyncIndexSegmentGroupCtx::calc_async_index_read_snapshot_(
     LOG_WARN("failed to convert min published version to scn", K(ret), K(min_published_version));
   } else if (OB_SUCC(ret)) {
     upper_bound = share::SCN::min(sql_read_snapshot, min_published_scn);
+    sql_limited = sql_read_snapshot < min_published_scn;
+  }
+  return ret;
+}
+
+int ObAsyncIndexSegmentGroupCtx::calc_real_published_read_version_(
+    const int64_t upper_bound, int64_t &read_version) const
+{
+  int ret = OB_SUCCESS;
+  const int64_t base_version = share::SCN::base_scn().get_val_for_tx();
+  int64_t max_snapshot = base_version;
+  read_version = upper_bound;
+  if (OB_UNLIKELY(upper_bound < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async index upper bound", K(ret), K(upper_bound));
+  } else {
+    // These ranges contain installed MAJORs and committed, uncovered INC_MAJORs.
+    // Empty refresh watermarks and the initial placeholder are not candidates.
+    for (int64_t i = 0; i < index_version_ranges_.count(); ++i) {
+      const common::ObIArray<common::ObNewVersionRange> &ranges = index_version_ranges_.at(i);
+      for (int64_t j = 0; j < ranges.count(); ++j) {
+        const int64_t snapshot = ranges.at(j).snapshot_version_;
+        if (snapshot <= upper_bound) {
+          max_snapshot = OB_MAX(max_snapshot, snapshot);
+        }
+      }
+    }
+    for (int64_t i = 0; i < delete_version_ranges_.count(); ++i) {
+      const int64_t snapshot = delete_version_ranges_.at(i).snapshot_version_;
+      if (snapshot <= upper_bound) {
+        max_snapshot = OB_MAX(max_snapshot, snapshot);
+      }
+    }
+    if (max_snapshot > base_version) {
+      read_version = max_snapshot;
+    }
+    // With no candidate, retain U. Index alignment still rejects an unavailable
+    // baseline, while an all-empty input keeps a valid empty read boundary.
   }
   return ret;
 }
@@ -318,21 +358,33 @@ int ObAsyncIndexSegmentGroupCtx::append_segment_group_(
   return ret;
 }
 
-int ObAsyncIndexSegmentGroupCtx::calc_query_version_ranges(const share::SCN &sql_read_snapshot)
+int ObAsyncIndexSegmentGroupCtx::calc_query_version_ranges(
+    const share::SCN &sql_read_snapshot, const int64_t min_async_index_snapshot)
 {
   int ret = OB_SUCCESS;
   share::SCN upper_bound;
+  bool sql_limited = false;
+  int64_t min_published_version = INT64_MAX;
   const bool already_calculated = !groups_.empty();
   if (already_calculated) {
     ret = OB_INIT_TWICE;
     LOG_WARN("segment groups already calculated", K(ret));
-  } else if (OB_FAIL(calc_async_index_read_snapshot_(sql_read_snapshot, upper_bound))) {
+  } else if (OB_UNLIKELY(min_async_index_snapshot < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async index retention checkpoint", K(ret), K(min_async_index_snapshot));
+  } else if (OB_FAIL(calc_async_index_read_snapshot_(
+      sql_read_snapshot, upper_bound, sql_limited, min_published_version))) {
     LOG_WARN("failed to calculate async index upper bound", K(ret), K(sql_read_snapshot));
   }
   int64_t read_ver = OB_SUCC(ret) ? upper_bound.get_val_for_tx() : 0;
+  if (OB_SUCC(ret) && sql_limited
+      && OB_FAIL(calc_real_published_read_version_(upper_bound.get_val_for_tx(), read_ver))) {
+    LOG_WARN("failed to find real async index publication", K(ret), K(upper_bound));
+  }
   bool changed = true;
   // No historical replacement: move R to the start of each crossing SSTable.
-  // Revisit indexes and deletion batches because lowering R can cut another SSTable.
+  // Revisit indexes because lowering R can cut another index SSTable. Deletion
+  // compaction may cross R: its physical scan retains the original row SCNs.
   while (OB_SUCC(ret) && changed) {
     changed = false;
     for (int64_t i = 0; i < index_version_ranges_.count(); ++i) {
@@ -348,26 +400,29 @@ int ObAsyncIndexSegmentGroupCtx::calc_query_version_ranges(const share::SCN &sql
         }
       }
     }
-    for (int64_t i = 0; i < delete_version_ranges_.count(); ++i) {
-      const common::ObNewVersionRange &range = delete_version_ranges_.at(i);
-      if (range.base_version_ < read_ver && read_ver < range.snapshot_version_) {
-        LOG_DEBUG("rollback async index read snapshot across sstable",
-            "is_delete_table", true, K(read_ver), "new_read_ver", range.base_version_,
-            "version_range", range, K(upper_bound));
-        read_ver = range.base_version_;
-        changed = true;
-      }
-    }
     if (0 == read_ver && 0 < upper_bound.get_val_for_tx()) {
       ret = OB_SNAPSHOT_DISCARDED;
       LOG_WARN("latest async index baseline exceeds read boundary", K(ret), K(upper_bound));
     }
+  }
+  // Check the final R: index alignment can lower it again after endpoint selection.
+  // Reading this checkpoint does not register or pin a query snapshot with GC.
+  if (OB_SUCC(ret) && min_published_version > min_async_index_snapshot
+      && read_ver < min_async_index_snapshot) {
+    ret = OB_SNAPSHOT_DISCARDED;
+    LOG_WARN("async index read snapshot precedes retained checkpoint", K(ret),
+        K(sql_read_snapshot), K(upper_bound), K(read_ver),
+        K(min_published_version), K(min_async_index_snapshot));
   }
   if (OB_SUCC(ret)) {
     if (OB_FAIL(select_query_ranges_(read_ver))) {
       LOG_WARN("failed to build async index groups", K(ret), K(read_ver));
     } else if (OB_FAIL(async_index_read_snapshot_.convert_for_tx(read_ver))) {
       LOG_WARN("failed to publish async index snapshot", K(ret), K(read_ver));
+    } else {
+      LOG_TRACE("selected async index read snapshot", K(sql_read_snapshot), K(upper_bound),
+          K(sql_limited), K(read_ver), K(min_async_index_snapshot),
+          K_(index_published_versions), K_(delete_table_published_version));
     }
   }
   if (OB_FAIL(ret) && !already_calculated) {
