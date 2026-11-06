@@ -2187,7 +2187,17 @@ int ObDRWorker::check_tenant_locality_match(
     common::ObArray<share::ObLSStatusInfo> ls_status_info_array;
     common::ObArray<uint64_t> gts_unit_ids;
     if (OB_FAIL(ls_status_operator.get_all_ls_status_by_order(tenant_id, ls_status_info_array, *GCTX.sql_proxy_))) {
-      LOG_WARN("fail to get all ls status", KR(ret), K(tenant_id));
+      if (is_user_tenant(tenant_id)) {
+        // User tenant rows are stored in the meta tenant, so a read failure only means the
+        // meta tenant is not ready. Retry in the next round.
+        LOG_INFO("meta tenant not ready, treat locality as not matched this round",
+                 KR(ret), K(tenant_id));
+        ret = OB_SUCCESS;
+        locality_is_matched = false;
+      } else {
+        // Meta tenant rows are stored in sys, so a read failure here is a real error.
+        LOG_WARN("fail to get all ls status", KR(ret), K(tenant_id));
+      }
     } else if (ls_status_info_array.count() <= 0) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("ls_status_info_array has no member", KR(ret), K(ls_status_info_array));
@@ -2211,6 +2221,12 @@ int ObDRWorker::check_tenant_locality_match(
                 share::ObLSTable::COMPOSITE_MODE,
                 ls_info))) {
           LOG_WARN("fail to get log stream info", KR(ret));
+        } else if (0 == ls_info.get_replicas_cnt()) {
+          // The LS status row may have no reported replica, for example a newly recreated
+          // LS or an LS whose only replica zone is unreachable after a cross-az failover.
+          // There is no replica to align, so do not let it block locality matching.
+          LOG_INFO("skip ls without replica when checking locality match",
+                   K(ls_info), K(ls_status_info));
         } else if (OB_FAIL(dr_ls_info.init())) {
           LOG_WARN("fail to init dr log stream info", KR(ret));
         } else if (OB_FAIL(dr_ls_info.build_disaster_ls_info(
@@ -2765,36 +2781,30 @@ int ObDRWorker::try_tenant_single_replica_task(
     LOG_TRACE("config_ enable rereplication is false");
   } else {
     FLOG_INFO("start try tenant single replica", K(tenant_id), K(only_for_display));
-    // ObDRService::get_tenant_for_single_replica_task_ passes the meta tenant id here, but
-    // __all_ls_status rows are split by tenant id: the meta tenant's own log streams are stored
-    // under the meta tenant id and the user tenant's log streams (for example the one created
-    // by balance for the target locality zone) are stored under the user tenant id. Reading
-    // only one of the two sets makes the CREATING log stream of the other set invisible, so it
-    // is neither kept nor aborted for replace locality and the locality job hangs. Therefore
-    // the keep/abort check always covers the status rows of both the meta and the user tenant.
-    const uint64_t meta_tenant_id = gen_meta_tenant_id(tenant_id);
-    const uint64_t pool_tenant_id = gen_user_tenant_id(tenant_id);
+    // Only the processed tenant's own status rows are read. __all_ls_status is a private table
+    // whose exec tenant depends on the row's tenant id: meta tenant rows live in sys while user
+    // tenant rows live in the meta tenant. Reading only tenant_id keeps the routing consistent.
     share::ObLSStatusOperator ls_status_operator;
     common::ObArray<share::ObLSStatusInfo> ls_status_info_array;
-    common::ObArray<share::ObLSStatusInfo> meta_ls_status_info_array;
-    common::ObArray<share::ObLSStatusInfo> keep_check_ls_status_info_array;
     bool ls_status_refreshed = false;
-    if (OB_FAIL(ls_status_operator.get_all_ls_status_by_order(pool_tenant_id, ls_status_info_array, *GCTX.sql_proxy_))) {
-      LOG_WARN("fail to get all user tenant ls status", KR(ret), K(tenant_id), K(pool_tenant_id));
-    } else if (OB_FAIL(append(keep_check_ls_status_info_array, ls_status_info_array))) {
-      LOG_WARN("fail to append user tenant ls status", KR(ret), K(tenant_id), K(pool_tenant_id));
-    } else if (meta_tenant_id != pool_tenant_id
-               && OB_FAIL(ls_status_operator.get_all_ls_status_by_order(meta_tenant_id, meta_ls_status_info_array, *GCTX.sql_proxy_))) {
-      LOG_WARN("fail to get all meta tenant ls status", KR(ret), K(tenant_id), K(meta_tenant_id));
-    } else if (meta_tenant_id != pool_tenant_id
-               && OB_FAIL(append(keep_check_ls_status_info_array, meta_ls_status_info_array))) {
-      LOG_WARN("fail to append meta tenant ls status", KR(ret), K(tenant_id), K(meta_tenant_id));
+    if (OB_FAIL(ls_status_operator.get_all_ls_status_by_order(
+            tenant_id, ls_status_info_array, *GCTX.sql_proxy_))) {
+      if (is_user_tenant(tenant_id)) {
+        // User tenant rows are stored in the meta tenant, so a read failure only means the
+        // meta tenant is not ready. Skip this round and retry later.
+        ret = OB_SUCCESS;
+        LOG_INFO("meta tenant not ready, skip user tenant single replica task", K(tenant_id));
+      } else {
+        // Meta tenant rows are stored in sys, so a read failure here is a real error.
+        LOG_WARN("fail to get all ls status", KR(ret), K(tenant_id));
+      }
     } else if (OB_TMP_FAIL(try_create_abort_creating_ls_for_replace_locality_(
-                   tenant_id, keep_check_ls_status_info_array, ls_status_refreshed))) {
+                   tenant_id, ls_status_info_array, ls_status_refreshed))) {
       LOG_WARN("fail to create abort creating ls for replace locality", KR(tmp_ret), K(tenant_id));
     } else if (ls_status_refreshed
-               && OB_FAIL(ls_status_operator.get_all_ls_status_by_order(pool_tenant_id, ls_status_info_array, *GCTX.sql_proxy_))) {
-      LOG_WARN("fail to refresh user tenant ls status after create abort", KR(ret), K(tenant_id), K(pool_tenant_id));
+               && OB_FAIL(ls_status_operator.get_all_ls_status_by_order(
+                      tenant_id, ls_status_info_array, *GCTX.sql_proxy_))) {
+      LOG_WARN("fail to refresh ls status after create abort", KR(ret), K(tenant_id));
     } else {
       for (int64_t i = 0; OB_SUCC(ret) && i < ls_status_info_array.count(); ++i) {
         FREE_DISASTER_RECOVERY_WORKER_TASK_MEMORY
@@ -2834,8 +2844,8 @@ int ObDRWorker::try_tenant_single_replica_task(
           LOG_INFO("skip persist dr_task", K(only_for_display), "task_count", dr_tasks_.count());
         } else if (OB_UNLIKELY(ERRSIM_SKIP_PERSIST_REPLACE_REPLICA_TASK_INTO_INNER_TABLE)) {
           LOG_INFO("errsim skip persist replace replica task into inner table");
-        } else if (OB_TMP_FAIL(persist_tasks_into_inner_table(dr_tasks_, pool_tenant_id, ls_status_info.ls_id_, false/*is_manual*/))) {
-          LOG_WARN("fail to do end generated dr tasks", KR(ret), K(tenant_id), K(pool_tenant_id), K(ls_status_info));
+        } else if (OB_TMP_FAIL(persist_tasks_into_inner_table(dr_tasks_, ls_status_info.tenant_id_, ls_status_info.ls_id_, false/*is_manual*/))) {
+          LOG_WARN("fail to do end generated dr tasks", KR(ret), K(tenant_id), K(ls_status_info));
         }
         acc_dr_task += ls_acc_dr_task;
         FREE_DISASTER_RECOVERY_WORKER_TASK_MEMORY
