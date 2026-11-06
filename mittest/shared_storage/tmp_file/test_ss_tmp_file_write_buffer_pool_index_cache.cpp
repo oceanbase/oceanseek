@@ -8,6 +8,9 @@
 #define protected public
 #define private public
 #include "mittest/mtlenv/mock_tenant_module_env.h"
+#include "storage/tmp_file/ob_ss_tmp_file_shrink_manager.h"
+#include "lib/utility/ob_test_util.h"
+#include "lib/resource/ob_resource_mgr.h"
 
 namespace oceanbase
 {
@@ -857,6 +860,558 @@ TEST_F(TestTmpFileWBPIndexCache, test_search)
   ASSERT_EQ(page_virtual_id1, res_virtual_id);
 
   LOG_INFO("test_search");
+}
+
+// ============================================================================
+// WBP 缩容策略回归：比例与目标 (A，3 个用例)，状态推进与保护 (B，7 个用例)。
+// ============================================================================
+
+using common::ObTimeUtility;
+
+// A1. 非零页向上取整，释放最后一页后下一个窗口准确恢复为空池。
+// 场景：扩出 32 个块，只分配一页，使实际使用率低于 1%。
+// 操作：分配、释放该页，再结束一个带有旧高峰的统计窗口。
+// 校验：分配后峰值为 1%；窗口结束后为空池，下一分钟目标仅保留一个块。
+TEST_F(TestTmpFileWBPIndexCache, test_shrink_percentage_rounds_up)
+{
+  LOG_INFO("========== test_shrink_percentage_rounds_up begin ==========");
+  wbp_.default_wbp_memory_limit_ = 32 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+
+  // 单页不能因整数截断而被当成空池。
+  uint32_t page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  char *page_buf = nullptr;
+  const ObTmpFilePageUniqKey page_key(0 /*virtual_page_id*/);
+  OK(wbp_.alloc_page(fd, page_key, page_id, page_buf));
+  LOG_INFO("single-page usage", K(wbp_.used_page_num_), K(wbp_.fat_.size()),
+      K(wbp_.max_used_watermark_after_shrinking_));
+  ASSERT_EQ(1, wbp_.max_used_watermark_after_shrinking_);
+  uint32_t next_page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  OK(wbp_.free_page(fd, page_id, page_key, next_page_id));
+
+  // 旧高峰只阻止当前窗口；新窗口以当前零用量重新开始。
+  wbp_.max_used_watermark_after_shrinking_ = 100;
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  bool is_auto = true;
+  ASSERT_FALSE(wbp_.need_to_shrink(is_auto));
+  ASSERT_FALSE(is_auto);
+  ASSERT_EQ(0, wbp_.max_used_watermark_after_shrinking_);
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  ASSERT_TRUE(wbp_.need_to_shrink(is_auto));
+  ASSERT_TRUE(is_auto);
+  OK(wbp_.begin_shrinking(is_auto));
+  ASSERT_EQ(ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS, wbp_.shrink_ctx_.lower_page_id_);
+  OK(wbp_.advance_shrink_state());
+  OK(wbp_.finish_shrinking());
+  LOG_INFO("========== test_shrink_percentage_rounds_up end ==========");
+}
+
+// A2. 8% 历史水位启动后可继续执行，分钟门控和 40% 排他边界均生效。
+// 场景：32 个空闲块，构造已结束窗口的 8% 历史峰值。
+// 操作：选择目标并进入 SWAP，再检查本次回调末尾的继续条件；随后检查 39%/40%。
+// 校验：16% 目标向上对齐为 6 块，不会沿用旧 5% 阈值立即取消。
+TEST_F(TestTmpFileWBPIndexCache, test_shrink_window_and_continuation)
+{
+  LOG_INFO("========== test_shrink_window_and_continuation begin ==========");
+  wbp_.default_wbp_memory_limit_ = 32 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  wbp_.max_used_watermark_after_shrinking_ = 8;
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us();
+  bool is_auto = true;
+  ASSERT_FALSE(wbp_.need_to_shrink(is_auto));
+  ASSERT_FALSE(is_auto);
+
+  // 初始化读取完整旧窗口，再保存目标并重置统计；后续继续条件使用上下文目标。
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  const int64_t expected_target = 6 * ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS;
+  ASSERT_EQ(8, wbp_.max_used_watermark_after_shrinking_);
+  ObSSTmpFileFlushManager flush_mgr;
+  ObTmpFileShrinkWBPTask task;
+  OK(task.init(&wbp_, &flush_mgr));
+  task.runTimerTask();
+  ASSERT_TRUE(wbp_.shrink_ctx_.is_valid());
+  ASSERT_TRUE(wbp_.shrink_ctx_.is_auto());
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_SWAP, wbp_.get_wbp_state());
+  ASSERT_EQ(expected_target, wbp_.shrink_ctx_.lower_page_id_);
+  ASSERT_EQ(0, wbp_.max_used_watermark_after_shrinking_);
+  // 活跃轮次依据固定目标继续，历史水位重新升高不能触发旧的 5% 取消条件。
+  wbp_.max_used_watermark_after_shrinking_ = 100;
+  ASSERT_TRUE(wbp_.need_to_shrink(is_auto));
+  LOG_INFO("8 percent round remains active", K(wbp_.shrink_ctx_));
+  OK(wbp_.finish_shrinking());
+
+  // 触发判断验证严格小于 40%；目标表的预期块数独立给出，覆盖公式两侧。
+  ASSERT_FALSE(wbp_.is_tenant_memory_under_pressure_());
+  wbp_.max_used_watermark_after_shrinking_ = 39;
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  ASSERT_TRUE(wbp_.need_to_shrink(is_auto));
+  ASSERT_TRUE(is_auto);
+  {
+    common::TCRWLock::RLockGuard guard(wbp_.lock_);
+    ObSpinLockGuard list_guard(wbp_.free_list_lock_);
+    constexpr int64_t TARGET_CASES[][2] = {{0, 1}, {8, 6}, {19, 13}, {20, 13},
+        {21, 14}, {39, 19}, {40, 0}};
+    for (const int64_t (&target_case)[2] : TARGET_CASES) {
+      wbp_.max_used_watermark_after_shrinking_ = target_case[0];
+      const int64_t expected_pages = target_case[1] * ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS;
+      LOG_INFO("verify historical target", K(target_case[0]), K(expected_pages));
+      ASSERT_EQ(expected_pages, wbp_.cal_auto_shrink_target_page_num_());
+    }
+  }
+  // 拒绝启动的窗口也必须记录现存页面，而不能只清零等待下一次分配。
+  uint32_t page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  char *page_buf = nullptr;
+  OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(0 /*virtual_page_id*/), page_id, page_buf));
+  wbp_.max_used_watermark_after_shrinking_ = 40;
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  ASSERT_FALSE(wbp_.need_to_shrink(is_auto));
+  ASSERT_FALSE(is_auto);
+  ASSERT_EQ(1, wbp_.max_used_watermark_after_shrinking_);
+  LOG_INFO("========== test_shrink_window_and_continuation end ==========");
+}
+
+// A3. 无参目标计算读取当前租户压力，达到 85% 后采用当前用量绕过旧高峰。
+// 场景：32 个块只持有一页，历史峰值设为 90%。
+// 操作：切换到隔离租户，以固定 85MB 占用配合不同限额构造真实压力统计。
+// 校验：压力启动也遵守一分钟；当前用量 50% 时可绕过 40% 门槛，目标为 23 块。
+//       阈值以下或限额无效时旧高峰阻止缩容，当前用量过高时跳过无收益目标。
+TEST_F(TestTmpFileWBPIndexCache, test_shrink_tenant_pressure_target)
+{
+  LOG_INFO("========== test_shrink_tenant_pressure_target begin ==========");
+  wbp_.default_wbp_memory_limit_ = 32 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  uint32_t page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  char *page_buf = nullptr;
+  OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(0 /*virtual_page_id*/), page_id, page_buf));
+
+  // 隔离租户只登记合成 hold，不申请等量缓冲，也不修改原租户的额度和统计。
+  constexpr uint64_t PRESSURE_TENANT_ID = 9001;
+  constexpr int64_t SYNTHETIC_HOLD_BYTES = 85_MB;
+  lib::ObTenantResourceMgrHandle resource_handle;
+  OK(lib::ObResourceMgr::get_instance().get_tenant_resource_mgr(
+      PRESSURE_TENANT_ID, resource_handle));
+  lib::ObTenantMemoryMgr *memory_mgr = resource_handle.get_memory_mgr();
+  ASSERT_NE(nullptr, memory_mgr);
+  ASSERT_EQ(0, memory_mgr->get_sum_hold());
+  share::ObTenantBase pressure_tenant(PRESSURE_TENANT_ID);
+  struct MemoryAccountingGuard
+  {
+    lib::ObTenantMemoryMgr *manager_;
+    int64_t original_limit_;
+    int64_t hold_bytes_;
+    share::ObTenantBase *original_tenant_;
+    // Restore the MTL context, synthetic accounting, and limit on assertion failure too.
+    ~MemoryAccountingGuard()
+    {
+      share::ObTenantEnv::set_tenant(original_tenant_);
+      bool reach_ctx_limit = false;
+      if (hold_bytes_ > 0 && !manager_->update_hold(-hold_bytes_,
+          common::ObCtxIds::DEFAULT_CTX_ID, lib::ObLabel(), reach_ctx_limit)) {
+        const int ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("fail to restore synthetic tenant memory accounting", KR(ret), K(hold_bytes_));
+      }
+      manager_->set_limit(original_limit_);
+    }
+  } accounting_guard{memory_mgr, memory_mgr->get_limit(), 0 /*hold_bytes_*/,
+      share::ObTenantEnv::get_tenant()};
+  bool reach_ctx_limit = false;
+  ASSERT_TRUE(memory_mgr->update_hold(SYNTHETIC_HOLD_BYTES,
+      common::ObCtxIds::DEFAULT_CTX_ID, lib::ObLabel(), reach_ctx_limit));
+  accounting_guard.hold_bytes_ = SYNTHETIC_HOLD_BYTES;
+  ASSERT_EQ(SYNTHETIC_HOLD_BYTES, memory_mgr->get_sum_hold());
+  // 低于压力阈值时，真实启动判断仍被 90% 历史峰值阻止。
+  bool is_auto = true;
+  memory_mgr->set_limit(101_MB /*limit*/);
+  share::ObTenantEnv::set_tenant(&pressure_tenant);
+  ASSERT_EQ(PRESSURE_TENANT_ID, MTL_ID());
+  wbp_.max_used_watermark_after_shrinking_ = 90;
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  ASSERT_FALSE(wbp_.need_to_shrink(is_auto));
+  ASSERT_FALSE(is_auto);
+  share::ObTenantEnv::set_tenant(accounting_guard.original_tenant_);
+  {
+    common::TCRWLock::RLockGuard guard(wbp_.lock_);
+    ObSpinLockGuard list_guard(wbp_.free_list_lock_);
+    share::ObTenantEnv::set_tenant(&pressure_tenant);
+    wbp_.max_used_watermark_after_shrinking_ = 90;
+    LOG_INFO("verify tenant pressure boundary", K(SYNTHETIC_HOLD_BYTES));
+    memory_mgr->set_limit(101_MB /*limit*/);
+    ASSERT_FALSE(wbp_.is_tenant_memory_under_pressure_());
+    ASSERT_EQ(0, wbp_.cal_auto_shrink_target_page_num_());
+    memory_mgr->set_limit(100_MB /*limit*/);
+    ASSERT_TRUE(wbp_.is_tenant_memory_under_pressure_());
+    ASSERT_EQ(ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS,
+        wbp_.cal_auto_shrink_target_page_num_());
+    memory_mgr->set_limit(0 /*limit*/);
+    ASSERT_FALSE(wbp_.is_tenant_memory_under_pressure_());
+    ASSERT_EQ(0, wbp_.cal_auto_shrink_target_page_num_());
+    memory_mgr->set_limit(100_MB /*limit*/);
+    share::ObTenantEnv::set_tenant(accounting_guard.original_tenant_);
+  }
+  LOG_INFO("pressure ignores historical peak", K(wbp_.used_page_num_),
+      K(wbp_.max_used_watermark_after_shrinking_));
+
+  // 压力不能绕过周期，但到期后必须绕过 90% 的历史高峰触发自动缩容。
+  share::ObTenantEnv::set_tenant(&pressure_tenant);
+  is_auto = true;
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us();
+  ASSERT_FALSE(wbp_.need_to_shrink(is_auto));
+  ASSERT_FALSE(is_auto);
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  ASSERT_TRUE(wbp_.need_to_shrink(is_auto));
+  ASSERT_TRUE(is_auto);
+  share::ObTenantEnv::set_tenant(accounting_guard.original_tenant_);
+  LOG_INFO("pressure starts an eligible round", K(is_auto), K(wbp_.used_page_num_));
+
+  // 实际使用一半页面：压力下应按 50% + 20% 保留 70%，32 块向上对齐为 23 块。
+  const int64_t half_pages = wbp_.fat_.size() / 2;
+  for (int64_t i = 1; i < half_pages; ++i) {
+    OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(i), page_id, page_buf));
+  }
+  {
+    common::TCRWLock::RLockGuard guard(wbp_.lock_);
+    ObSpinLockGuard list_guard(wbp_.free_list_lock_);
+    share::ObTenantEnv::set_tenant(&pressure_tenant);
+    ASSERT_EQ(23 * ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS,
+        wbp_.cal_auto_shrink_target_page_num_());
+    share::ObTenantEnv::set_tenant(accounting_guard.original_tenant_);
+  }
+  LOG_INFO("pressure permits usage above normal watermark", K(wbp_.used_page_num_));
+
+  // 当前使用量较高时，即使有租户压力也不能启动没有容量收益的缩容。
+  const int64_t busy_pages = (wbp_.fat_.size() * 80 + 99) / 100;
+  for (int64_t i = half_pages; i < busy_pages; ++i) {
+    OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(i), page_id, page_buf));
+  }
+  {
+    common::TCRWLock::RLockGuard guard(wbp_.lock_);
+    ObSpinLockGuard list_guard(wbp_.free_list_lock_);
+    share::ObTenantEnv::set_tenant(&pressure_tenant);
+    ASSERT_EQ(0, wbp_.cal_auto_shrink_target_page_num_());
+    share::ObTenantEnv::set_tenant(accounting_guard.original_tenant_);
+  }
+  LOG_INFO("busy pool has no useful target", K(wbp_.used_page_num_), K(wbp_.fat_.size()));
+  LOG_INFO("========== test_shrink_tenant_pressure_target end ==========");
+}
+
+// B1. 完全空池复用原有状态机，一轮释放到一个块，并保留后续分配和扩容能力。
+// 场景：32 个块全部空闲，周期结束时选择最小池目标。
+// 操作：推进 SWAP、释放块、完成收尾，再分配一页并主动扩容。
+// 校验：只保留 253 页；上下文清除，释放后页可正常重新分配。
+TEST_F(TestTmpFileWBPIndexCache, test_empty_pool_shrinks_to_one_block)
+{
+  LOG_INFO("========== test_empty_pool_shrinks_to_one_block begin ==========");
+  wbp_.default_wbp_memory_limit_ = 32 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  bool is_auto = false;
+  ASSERT_TRUE(wbp_.need_to_shrink(is_auto));
+  ASSERT_TRUE(is_auto);
+
+  // 空池不需要真实 IO，直接验证原有逐页检查和释放路径。
+  OK(wbp_.begin_shrinking(is_auto));
+  OK(wbp_.advance_shrink_state());
+  OK(wbp_.advance_shrink_state());
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_RELEASE_BLOCKS, wbp_.get_wbp_state());
+  OK(wbp_.release_blocks_in_shrink_range());
+  OK(wbp_.advance_shrink_state());
+  OK(wbp_.finish_shrinking());
+  ASSERT_FALSE(wbp_.shrink_ctx_.is_valid());
+  ASSERT_EQ(ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE, wbp_.capacity_);
+  ASSERT_EQ(ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS, wbp_.fat_.size());
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  ASSERT_FALSE(wbp_.need_to_shrink(is_auto));
+  ASSERT_FALSE(is_auto);
+
+  uint32_t page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  char *page_buf = nullptr;
+  OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(0 /*virtual_page_id*/), page_id, page_buf));
+  OK(wbp_.expand_());
+  ASSERT_EQ(2 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE, wbp_.capacity_);
+  LOG_INFO("========== test_empty_pool_shrinks_to_one_block end ==========");
+}
+
+// B2. 新写入占满本轮目标时取消缩容，原收尾恢复禁分配页并重新允许扩容。
+// 场景：32 个块按 8% 历史峰值选择 6 块目标，尚未释放内存。
+// 操作：在保留区间内分配到目标容量，由真实定时回调执行取消收尾。
+// 校验：差一页时继续，恰满时取消；扩容先被禁止、取消后恢复，存活页水位为 19%。
+TEST_F(TestTmpFileWBPIndexCache, test_shrink_aborts_when_target_is_full)
+{
+  LOG_INFO("========== test_shrink_aborts_when_target_is_full begin ==========");
+  wbp_.default_wbp_memory_limit_ = 32 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  wbp_.max_used_watermark_after_shrinking_ = 8;
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  bool is_auto = false;
+  ASSERT_TRUE(wbp_.need_to_shrink(is_auto));
+  OK(wbp_.begin_shrinking(is_auto));
+  OK(wbp_.advance_shrink_state());
+  const int64_t target_pages = wbp_.shrink_ctx_.lower_page_id_;
+  const int64_t original_capacity = wbp_.capacity_;
+  wbp_.default_wbp_memory_limit_ = 64 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  ASSERT_EQ(OB_OP_NOT_ALLOW, wbp_.expand_());
+  ASSERT_EQ(original_capacity, wbp_.capacity_);
+
+  // 不模拟计数，真实分配以覆盖禁分配区间和缩容链表。
+  uint32_t page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  char *page_buf = nullptr;
+  for (int64_t i = 0; i < target_pages - 1; ++i) {
+    OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(0 /*tree_level*/, i), page_id, page_buf));
+  }
+  ASSERT_TRUE(wbp_.need_to_shrink(is_auto));
+  OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(0 /*tree_level*/, target_pages - 1),
+      page_id, page_buf));
+  ASSERT_FALSE(wbp_.need_to_shrink(is_auto));
+  ASSERT_GT(wbp_.shrink_ctx_.shrink_list_size_, 0);
+  LOG_INFO("target filled before release", K(target_pages), K(wbp_.used_page_num_),
+      K(wbp_.shrink_ctx_));
+  // 取消路径不进入 SWAP，未初始化的刷盘管理器不会参与 IO。
+  wbp_.max_used_watermark_after_shrinking_ = 100;
+  ObSSTmpFileFlushManager flush_mgr;
+  ObTmpFileShrinkWBPTask task;
+  OK(task.init(&wbp_, &flush_mgr));
+  const int64_t before_cancel_ts_us = ObTimeUtility::current_time_us();
+  task.runTimerTask();
+  ASSERT_FALSE(wbp_.shrink_ctx_.is_valid());
+  ASSERT_EQ(WBPShrinkContext::INVALID, wbp_.get_wbp_state());
+  ASSERT_EQ(original_capacity, wbp_.capacity_);
+  ASSERT_EQ(19, wbp_.max_used_watermark_after_shrinking_);
+  ASSERT_GE(wbp_.last_shrink_complete_ts_, before_cancel_ts_us);
+  ASSERT_FALSE(wbp_.need_to_shrink(is_auto));
+  OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(0 /*tree_level*/, target_pages), page_id, page_buf));
+  ASSERT_GE(page_id, target_pages);
+  OK(wbp_.expand_());
+  ASSERT_EQ(wbp_.default_wbp_memory_limit_, wbp_.capacity_);
+  LOG_INFO("========== test_shrink_aborts_when_target_is_full end ==========");
+}
+
+// B3. 超配置上限仍优先启动，单轮五分钟超时不随一分钟统计周期改变。
+// 场景：32 个块的池将配置上限调低到 16 块，当前周期尚未结束。
+// 操作：启动超限缩容，再把执行起点推进到五分钟前并检查取消。
+// 校验：启动不受周期或历史峰值限制，超时后沿用原收尾并保留原容量。
+TEST_F(TestTmpFileWBPIndexCache, test_manual_shrink_and_execution_timeout)
+{
+  LOG_INFO("========== test_manual_shrink_and_execution_timeout begin ==========");
+  wbp_.default_wbp_memory_limit_ = 32 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  const int64_t original_capacity = wbp_.capacity_;
+  uint32_t page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  char *page_buf = nullptr;
+  OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(0 /*virtual_page_id*/), page_id, page_buf));
+  wbp_.default_wbp_memory_limit_ = 16 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  wbp_.max_used_watermark_after_shrinking_ = 100;
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us();
+  bool is_auto = true;
+  ASSERT_TRUE(wbp_.need_to_shrink(is_auto));
+  ASSERT_FALSE(is_auto);
+  OK(wbp_.begin_shrinking(is_auto));
+  ASSERT_EQ(1, wbp_.max_used_watermark_after_shrinking_);
+  OK(wbp_.advance_shrink_state());
+  ASSERT_EQ(16 * ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS, wbp_.shrink_ctx_.lower_page_id_);
+
+  // 超时使用原上下文起点，不依赖等待五分钟，也不修改超时常量。
+  wbp_.shrink_ctx_.shrink_begin_ts_ = ObTimeUtility::current_time_us() - 2_min;
+  ASSERT_TRUE(wbp_.need_to_shrink(is_auto));
+  wbp_.shrink_ctx_.shrink_begin_ts_ = ObTimeUtility::current_time_us() - 5_min - 1_us;
+  ASSERT_FALSE(wbp_.need_to_shrink(is_auto));
+  OK(wbp_.finish_shrinking());
+  ASSERT_EQ(original_capacity, wbp_.capacity_);
+  ASSERT_FALSE(wbp_.shrink_ctx_.is_valid());
+  ASSERT_EQ(1, wbp_.max_used_watermark_after_shrinking_);
+  LOG_INFO("========== test_manual_shrink_and_execution_timeout end ==========");
+}
+
+// B4. 整块对齐后没有缩容收益时，定时任务保持未启动状态且不立即重试。
+// 场景：正常租户内存压力下，两个空闲块带有 39% 历史水位，满足触发条件。
+// 操作：连续调用真实定时回调，先验证跳过限频，再将时间推进一分钟重试。
+// 校验：周期内保持 INVALID 且时间戳不变；下个周期可按空池目标正常启动。
+TEST_F(TestTmpFileWBPIndexCache, test_shrink_timer_skips_unprofitable_target)
+{
+  LOG_INFO("========== test_shrink_timer_skips_unprofitable_target begin ==========");
+  ASSERT_FALSE(wbp_.is_tenant_memory_under_pressure_());
+  wbp_.default_wbp_memory_limit_ = 2 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  const int64_t original_capacity = wbp_.capacity_;
+  wbp_.max_used_watermark_after_shrinking_ = 39;
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+
+  // 未初始化的刷盘管理器刻意保证此路径不能进入 SWAP 或发出 IO。
+  ObSSTmpFileFlushManager flush_mgr;
+  ObTmpFileShrinkWBPTask task;
+  OK(task.init(&wbp_, &flush_mgr));
+  task.runTimerTask();
+  LOG_INFO("unprofitable round skipped", K(wbp_.get_wbp_state()), K(wbp_.capacity_),
+      K(wbp_.max_used_watermark_after_shrinking_));
+  ASSERT_EQ(WBPShrinkContext::INVALID, wbp_.get_wbp_state());
+  ASSERT_FALSE(wbp_.shrink_ctx_.is_valid());
+  ASSERT_EQ(original_capacity, wbp_.capacity_);
+  ASSERT_EQ(0, wbp_.max_used_watermark_after_shrinking_);
+  const int64_t skipped_round_ts_us = wbp_.last_shrink_complete_ts_;
+  for (int64_t i = 0; i < 3; ++i) {
+    task.runTimerTask();
+    LOG_INFO("verify skipped-round throttle", K(i), K(wbp_.get_wbp_state()));
+    ASSERT_EQ(WBPShrinkContext::INVALID, wbp_.get_wbp_state());
+    ASSERT_EQ(skipped_round_ts_us, wbp_.last_shrink_complete_ts_);
+  }
+  bool is_auto = true;
+  ASSERT_FALSE(wbp_.need_to_shrink(is_auto));
+  ASSERT_FALSE(is_auto);
+
+  // 旧峰值已清理，下一分钟无需新分配也能按空池目标启动。
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  task.runTimerTask();
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_SWAP, wbp_.get_wbp_state());
+  ASSERT_TRUE(wbp_.shrink_ctx_.is_valid());
+  ASSERT_EQ(ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS, wbp_.shrink_ctx_.lower_page_id_);
+  OK(wbp_.finish_shrinking());
+  LOG_INFO("========== test_shrink_timer_skips_unprofitable_target end ==========");
+}
+
+// B5. 预判后历史水位升高时，初始化拒绝本轮并正常结束旧窗口。
+// 场景：32 个空闲块以 8% 历史水位获得启动资格，随后出现短时使用高峰并释放。
+// 操作：初始化前将历史水位提高到 40%，使其不再满足正常缩容条件。
+// 校验：不创建上下文、不推进状态，窗口重置，下一次检查不会高频重试。
+TEST_F(TestTmpFileWBPIndexCache, test_shrink_init_revalidates_usage_window)
+{
+  LOG_INFO("========== test_shrink_init_revalidates_usage_window begin ==========");
+  ASSERT_FALSE(wbp_.is_tenant_memory_under_pressure_());
+  wbp_.default_wbp_memory_limit_ = 32 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  wbp_.max_used_watermark_after_shrinking_ = 8;
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  bool is_auto = false;
+  ASSERT_TRUE(wbp_.need_to_shrink(is_auto));
+  ASSERT_TRUE(is_auto);
+  ASSERT_EQ(8, wbp_.max_used_watermark_after_shrinking_);
+
+  // 模拟两次持锁区间之间新增的历史峰值；初始化必须读取它，不能提前清零。
+  wbp_.max_used_watermark_after_shrinking_ = 40;
+  ASSERT_EQ(OB_OP_NOT_ALLOW, wbp_.begin_shrinking(is_auto));
+  LOG_INFO("changed usage rejected", K(wbp_.get_wbp_state()),
+      K(wbp_.max_used_watermark_after_shrinking_));
+  ASSERT_EQ(WBPShrinkContext::INVALID, wbp_.get_wbp_state());
+  ASSERT_FALSE(wbp_.shrink_ctx_.is_valid());
+  ASSERT_EQ(0, wbp_.max_used_watermark_after_shrinking_);
+  ASSERT_FALSE(wbp_.need_to_shrink(is_auto));
+  ASSERT_FALSE(is_auto);
+  LOG_INFO("========== test_shrink_init_revalidates_usage_window end ==========");
+}
+
+// B6. 配置超限初始化失败也重置旧峰值，并保留当前存活页作为新窗口起点。
+// 场景：四个块中分配一页，降低上限触发非自动缩容，初始化前恢复上限。
+// 操作：按原超限模式初始化，目标回到池末尾而返回边界错误。
+// 校验：未启动、容量未变；即使 is_auto 为 false 且初始化失败，水位仍重置为 1%。
+TEST_F(TestTmpFileWBPIndexCache, test_manual_shrink_init_failure_reseeds_usage)
+{
+  LOG_INFO("========== test_manual_shrink_init_failure_reseeds_usage begin ==========");
+  constexpr int64_t INITIAL_BLOCKS = 4;
+  wbp_.default_wbp_memory_limit_ = INITIAL_BLOCKS * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  uint32_t page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  char *page_buf = nullptr;
+  OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(0 /*virtual_page_id*/), page_id, page_buf));
+
+  // 先取得超限启动资格，随后恢复配置，模拟两次判断之间的配置变化。
+  wbp_.default_wbp_memory_limit_ = 2 * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  wbp_.max_used_watermark_after_shrinking_ = 100;
+  bool is_auto = true;
+  ASSERT_TRUE(wbp_.need_to_shrink(is_auto));
+  ASSERT_FALSE(is_auto);
+  wbp_.default_wbp_memory_limit_ = INITIAL_BLOCKS * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, wbp_.begin_shrinking(is_auto));
+  LOG_INFO("manual initialization failed after config changed", K(wbp_.capacity_),
+      K(wbp_.max_used_watermark_after_shrinking_), K(wbp_.get_wbp_state()));
+  ASSERT_EQ(WBPShrinkContext::INVALID, wbp_.get_wbp_state());
+  ASSERT_FALSE(wbp_.shrink_ctx_.is_valid());
+  ASSERT_EQ(wbp_.default_wbp_memory_limit_, wbp_.capacity_);
+  ASSERT_EQ(1, wbp_.used_page_num_);
+  ASSERT_EQ(1, wbp_.max_used_watermark_after_shrinking_);
+  ASSERT_EQ(1, wbp_.get_current_used_percent_());
+  LOG_INFO("========== test_manual_shrink_init_failure_reseeds_usage end ==========");
+}
+
+// B7. 正常释放整块后按新容量记录存活页峰值，且没有新分配也能启动下一轮。
+// 场景：先在低地址两块内分配元数据页，再扩到 32 块，历史峰值为 8%。
+// 操作：完成到六块的缩容，保留原页面；一分钟后再选择目标，不执行新分配。
+// 校验：容量为六块且原页面内容有效，水位从旧峰值重置为 34%，下一轮目标为四块。
+TEST_F(TestTmpFileWBPIndexCache, test_shrink_completion_reseeds_surviving_pages)
+{
+  LOG_INFO("========== test_shrink_completion_reseeds_surviving_pages begin ==========");
+  ASSERT_FALSE(wbp_.is_tenant_memory_under_pressure_());
+  constexpr int64_t INITIAL_BLOCKS = 32;
+  constexpr int64_t LIVE_BLOCKS = 2;
+  constexpr int64_t FIRST_TARGET_BLOCKS = 6;
+  wbp_.default_wbp_memory_limit_ = INITIAL_BLOCKS * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+  const int64_t live_pages = LIVE_BLOCKS * ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS;
+  uint32_t page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  char *page_buf = nullptr;
+
+  // 先分配再扩容，确保所有存活页都在本轮保留区间，释放尾块不需要 IO。
+  for (int64_t i = 0; i < live_pages; ++i) {
+    OK(wbp_.alloc_page(fd, ObTmpFilePageUniqKey(0 /*tree_level*/, i), page_id, page_buf));
+    ASSERT_LT(page_id, live_pages);
+    page_buf[0] = 'w';
+  }
+  while (wbp_.capacity_ < wbp_.default_wbp_memory_limit_) {
+    OK(wbp_.expand_());
+  }
+  wbp_.max_used_watermark_after_shrinking_ = 8;
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  bool is_auto = false;
+  ASSERT_TRUE(wbp_.need_to_shrink(is_auto));
+  ASSERT_TRUE(is_auto);
+  OK(wbp_.begin_shrinking(is_auto));
+  ASSERT_EQ(FIRST_TARGET_BLOCKS * ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS,
+      wbp_.shrink_ctx_.lower_page_id_);
+  ASSERT_EQ(7, wbp_.max_used_watermark_after_shrinking_);
+  OK(wbp_.advance_shrink_state());
+  OK(wbp_.advance_shrink_state());
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_RELEASE_BLOCKS, wbp_.get_wbp_state());
+  OK(wbp_.release_blocks_in_shrink_range());
+  OK(wbp_.advance_shrink_state());
+  ASSERT_EQ(WBPShrinkContext::SHRINKING_FINISH, wbp_.get_wbp_state());
+
+  // 人为保留旧高峰以确认收尾既清理旧值，也按缩小后的分母记录现存用量。
+  wbp_.max_used_watermark_after_shrinking_ = 90;
+  const int64_t before_finish_ts_us = ObTimeUtility::current_time_us();
+  OK(wbp_.finish_shrinking());
+  LOG_INFO("surviving pages seeded after release", K(wbp_.capacity_), K(wbp_.used_page_num_),
+      K(wbp_.max_used_watermark_after_shrinking_));
+  ASSERT_EQ(FIRST_TARGET_BLOCKS * ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE, wbp_.capacity_);
+  ASSERT_EQ(live_pages, wbp_.used_page_num_);
+  ASSERT_EQ('w', page_buf[0]);
+  ASSERT_EQ(34, wbp_.max_used_watermark_after_shrinking_);
+  ASSERT_FALSE(wbp_.shrink_ctx_.is_valid());
+  ASSERT_GE(wbp_.last_shrink_complete_ts_, before_finish_ts_us);
+  ASSERT_FALSE(wbp_.need_to_shrink(is_auto));
+
+  // 下一分钟仍有相同页面，34% 峰值对应 54% 目标，六块向上对齐为四块。
+  wbp_.last_shrink_complete_ts_ = ObTimeUtility::current_time_us() - 1_min;
+  ASSERT_TRUE(wbp_.need_to_shrink(is_auto));
+  ASSERT_TRUE(is_auto);
+  OK(wbp_.begin_shrinking(is_auto));
+  ASSERT_EQ(4 * ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS, wbp_.shrink_ctx_.lower_page_id_);
+  OK(wbp_.advance_shrink_state());
+  OK(wbp_.finish_shrinking());
+  LOG_INFO("========== test_shrink_completion_reseeds_surviving_pages end ==========");
 }
 
 } // namespace oceanbase

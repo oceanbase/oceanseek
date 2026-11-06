@@ -7,6 +7,7 @@
 #define OCEANBASE_STORAGE_TMP_FILE_OB_SS_TMP_WRITE_BUFFER_POOL_H_
 
 #include "lib/lock/ob_tc_rwlock.h"
+#include "lib/literals/ob_literals.h"
 #include "lib/container/ob_array.h"
 #include "lib/allocator/ob_fifo_allocator.h"
 #include "storage/tmp_file/ob_tmp_file_global.h"
@@ -85,13 +86,10 @@ public:
   static const int64_t BLOCK_PAGE_NUMS = WBP_BLOCK_SIZE / ObTmpFileGlobal::PAGE_SIZE;    // 253 pages per block (24KB for header)
   static const int64_t INITIAL_POOL_SIZE = WBP_BLOCK_SIZE;
   static const int64_t INITIAL_PAGE_NUMS = INITIAL_POOL_SIZE / ObTmpFileGlobal::PAGE_SIZE;
-  static const int64_t SHRINKING_PERIOD = 5 * 60 * 1000 * 1000; // 5min
-  static const int32_t AUTO_SHRINKING_WATERMARK_L1 = 10;
-  static const int32_t AUTO_SHRINKING_WATERMARK_L2 = 5;
-  static const int32_t AUTO_SHRINKING_WATERMARK_L3 = 0;
-  static const int32_t AUTO_SHRINKING_TARGET_SIZE_L1 = 50; // 50%
-  static const int32_t AUTO_SHRINKING_TARGET_SIZE_L2 = 20; // 20%
-  static const int32_t AUTO_SHRINKING_TARGET_SIZE_L3 = 10; // 10%
+  static constexpr int64_t SHRINKING_PERIOD = 1_min;
+  static constexpr int32_t AUTO_SHRINKING_WATERMARK = 40; // Exclusive upper bound.
+  static constexpr int32_t TENANT_MEMORY_PRESSURE_WATERMARK = 85;
+  static constexpr int32_t AUTO_SHRINKING_RESERVE_PERCENT = 20;
   static const int32_t BACKGROUND_FLUSH_WATERMARK = 60;
   static const int32_t BACKGROUND_FLUSH_PERCENT = 20;
 public:
@@ -193,7 +191,9 @@ public:
   void print_statistics();
 public:
   // for shrinking
+  // Checks whether to start a shrink round or continue the current round.
   bool need_to_shrink(bool &is_auto);
+  // Selects and initializes the final target, then reseeds the automatic usage window.
   int init_shrink_context(const bool is_auto);
   int begin_shrinking(const bool is_auto);
   int finish_shrinking();
@@ -209,7 +209,15 @@ private:
   int64_t get_not_allow_alloc_percent_(const int64_t target_wbp_size);
   uint32_t cal_max_allow_alloc_page_id_(int64_t lower_bound, int64_t upper_bound);
   int cal_target_shrink_range_(const bool is_auto, int64_t &lower_page_id, int64_t &upper_page_id);
+  // Returns the current usage percentage rounded up, or zero for an empty pool.
+  int64_t get_current_used_percent_() const;
+  // Checks whether the current tenant has reached the memory pressure watermark.
+  static bool is_tenant_memory_under_pressure_();
+  // Returns an aligned auto-shrink target, or zero when no shrink is useful or allowed.
+  int64_t cal_auto_shrink_target_page_num_() const;
   void update_current_max_used_percent_();
+  // Restarts peak usage tracking from the current usage percentage.
+  void reset_used_watermark_();
 private:
   static double MAX_DATA_PAGE_USAGE_RATIO; // control data pages ratio, can be preempted by meta pages
   // only for unittest

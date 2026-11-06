@@ -6,12 +6,16 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "share/ob_server_struct.h"
+#include "lib/alloc/alloc_func.h"
 #include "storage/tmp_file/ob_ss_tmp_file_write_buffer_pool.h"
 
 namespace oceanbase
 {
 namespace tmp_file
 {
+
+const int64_t ObSSTmpWriteBufferPool::WBP_BLOCK_SIZE;
+const int64_t ObSSTmpWriteBufferPool::BLOCK_PAGE_NUMS;
 
 double ObSSTmpWriteBufferPool::MAX_DATA_PAGE_USAGE_RATIO = 0.9;
 
@@ -564,8 +568,7 @@ int ObSSTmpWriteBufferPool::release_all_blocks_()
 
 void ObSSTmpWriteBufferPool::update_current_max_used_percent_()
 {
-  const int64_t page_num = fat_.size();
-  const int64_t current_used_page_percent = page_num > 0 ? ATOMIC_LOAD(&used_page_num_) * 100 / page_num : 0;
+  const int64_t current_used_page_percent = get_current_used_percent_();
   int64_t max_used_watermark = ATOMIC_LOAD(&max_used_watermark_after_shrinking_);
   if (max_used_watermark < current_used_page_percent) {
     // missing a few updates is acceptable
@@ -575,9 +578,60 @@ void ObSSTmpWriteBufferPool::update_current_max_used_percent_()
   }
 }
 
+void ObSSTmpWriteBufferPool::reset_used_watermark_()
+{
+  ATOMIC_STORE(&max_used_watermark_after_shrinking_, 0);
+  update_current_max_used_percent_();
+}
+
+// Rounds up nonzero usage so that an integer zero cannot hide allocated pages.
+int64_t ObSSTmpWriteBufferPool::get_current_used_percent_() const
+{
+  const int64_t page_num = fat_.size();
+  const int64_t used_page_num = ATOMIC_LOAD(&used_page_num_);
+  return ((page_num > 0) ? (used_page_num * 100 + page_num - 1) / page_num : 0);
+}
+
+bool ObSSTmpWriteBufferPool::is_tenant_memory_under_pressure_()
+{
+  const int64_t tenant_memory_hold = lib::get_tenant_memory_hold(MTL_ID());
+  const int64_t tenant_memory_limit = lib::get_tenant_memory_limit(MTL_ID());
+  return (tenant_memory_limit > 0 &&
+      tenant_memory_hold * 100 >= tenant_memory_limit * TENANT_MEMORY_PRESSURE_WATERMARK);
+}
+
+// Selects a target using historical usage normally and current usage under tenant pressure.
+//
+// target_percent = min(2 * used_percent, used_percent + 20).
+// Round the target up to whole blocks and retain at least one block.
+// Returns zero when normal usage is too high or the aligned target would not reduce capacity.
+int64_t ObSSTmpWriteBufferPool::cal_auto_shrink_target_page_num_() const
+{
+  int64_t target_page_num = 0;
+  const int64_t page_num = fat_.size();
+  const bool under_memory_pressure = is_tenant_memory_under_pressure_();
+  const int64_t current_used_percent = get_current_used_percent_();
+  const int64_t used_percent = ((under_memory_pressure) ? current_used_percent :
+      MAX(current_used_percent, ATOMIC_LOAD(&max_used_watermark_after_shrinking_)));
+
+  if (under_memory_pressure || used_percent < AUTO_SHRINKING_WATERMARK) {
+    const int64_t target_percent = MIN(used_percent * 2,
+        used_percent + AUTO_SHRINKING_RESERVE_PERCENT);
+    const int64_t target_pages = (page_num * target_percent + 99) / 100;
+    target_page_num = MAX(BLOCK_PAGE_NUMS,
+        (target_pages + BLOCK_PAGE_NUMS - 1) / BLOCK_PAGE_NUMS * BLOCK_PAGE_NUMS);
+    if (target_page_num >= page_num) {
+      target_page_num = 0;
+    }
+  }
+  return target_page_num;
+}
+
 int ObSSTmpWriteBufferPool::cal_target_shrink_range_(const bool is_auto, int64_t &lower_page_id, int64_t &upper_page_id)
 {
   int ret = OB_SUCCESS;
+  lower_page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
+  upper_page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
   int64_t capacity = ATOMIC_LOAD(&capacity_);
   int64_t memory_limit = get_memory_limit();
   int64_t exceed_page_num =
@@ -585,19 +639,15 @@ int ObSSTmpWriteBufferPool::cal_target_shrink_range_(const bool is_auto, int64_t
   const int64_t max_used_page_watermark = ATOMIC_LOAD(&max_used_watermark_after_shrinking_);
   exceed_page_num = max(0, exceed_page_num);
 
-  if (is_auto) { // calculate target page id according to watermark when auto shrinking
-    int64_t target_page_id = 0;
-    if (max_used_page_watermark == AUTO_SHRINKING_WATERMARK_L3) {
-      target_page_id = fat_.count() * AUTO_SHRINKING_TARGET_SIZE_L3 / 100;
-    } else if (max_used_page_watermark <= AUTO_SHRINKING_WATERMARK_L2) {
-      target_page_id = fat_.count() * AUTO_SHRINKING_TARGET_SIZE_L2 / 100;
-    } else if (max_used_page_watermark <= AUTO_SHRINKING_WATERMARK_L1) {
-      target_page_id = fat_.count() * AUTO_SHRINKING_TARGET_SIZE_L1 / 100;
-    } else {
+  if (is_auto) {
+    // Select the target once, while initialization holds the pool and free-list locks.
+    lower_page_id = cal_auto_shrink_target_page_num_();
+    if (lower_page_id <= 0 || lower_page_id >= fat_.count() ||
+        ATOMIC_LOAD(&used_page_num_) >= lower_page_id) {
       ret = OB_OP_NOT_ALLOW;
-      LOG_INFO("used page number watermark increases, stop shrinking", KR(ret), K(max_used_page_watermark));
+      LOG_INFO("skip auto shrinking without a valid smaller target", KR(ret),
+          K(lower_page_id), K(fat_.size()), K(ATOMIC_LOAD(&used_page_num_)));
     }
-    lower_page_id = (target_page_id + BLOCK_PAGE_NUMS - 1) / BLOCK_PAGE_NUMS * BLOCK_PAGE_NUMS;
   } else {
     lower_page_id = fat_.count() - exceed_page_num;
   }
@@ -620,8 +670,11 @@ int ObSSTmpWriteBufferPool::init_shrink_context(const bool is_auto)
   uint32_t max_allow_alloc_page_id = ObTmpFileGlobal::INVALID_PAGE_ID;
 
   if (OB_FAIL(cal_target_shrink_range_(is_auto, lower_page_id, upper_page_id))) {
-    LOG_WARN("fail to calculate target shrinking range", KR(ret), K(is_auto),
-            K(ATOMIC_LOAD(&max_used_watermark_after_shrinking_)));
+    // OB_OP_NOT_ALLOW means this round has no eligible shrink target.
+    if (OB_OP_NOT_ALLOW != ret) {
+      LOG_WARN("fail to calculate target shrinking range", KR(ret), K(is_auto),
+          K(ATOMIC_LOAD(&max_used_watermark_after_shrinking_)));
+    }
   } else {
     max_allow_alloc_page_id = cal_max_allow_alloc_page_id_(lower_page_id, upper_page_id);
     if (OB_UNLIKELY(!is_valid_page_id_(lower_page_id) || !is_valid_page_id_(upper_page_id))) {
@@ -640,6 +693,8 @@ int ObSSTmpWriteBufferPool::init_shrink_context(const bool is_auto)
     }
   }
 
+  // Restart usage tracking after each initialization attempt, including failures and skips.
+  reset_used_watermark_();
   return ret;
 }
 
@@ -648,7 +703,6 @@ bool ObSSTmpWriteBufferPool::need_to_shrink(bool &is_auto)
   bool b_ret = false;
   int64_t current_capacity = ATOMIC_LOAD(&capacity_);
   int64_t memory_limit = get_memory_limit();
-  int64_t max_used_page_watermark = ATOMIC_LOAD(&max_used_watermark_after_shrinking_);
   is_auto = false;
 
   if (!ATOMIC_LOAD(&is_inited_)) {
@@ -658,27 +712,29 @@ bool ObSSTmpWriteBufferPool::need_to_shrink(bool &is_auto)
   } else if (current_capacity <= memory_limit) {
     if (shrink_ctx_.is_valid()) {
       if (shrink_ctx_.is_auto()) {
-        // if used_page_num exceeds threshold during auto-shrinking, stop shrinking
-        b_ret = AUTO_SHRINKING_WATERMARK_L1 / 2 >= max_used_page_watermark;
+        // New demand can cancel a round before the pool is reduced to a full target.
+        b_ret = (ATOMIC_LOAD(&used_page_num_) < shrink_ctx_.lower_page_id_);
         LOG_DEBUG("need to shrink after auto shrinking begin", K(b_ret));
       } else {
         // manual-shrinking would stop if memory_limit increase during shrinking
         b_ret = false;
       }
     } else if (ObTimeUtility::current_time() - last_shrink_complete_ts_ >= SHRINKING_PERIOD) {
-      if (AUTO_SHRINKING_WATERMARK_L1 >= max_used_page_watermark &&
-          current_capacity > WBP_BLOCK_SIZE) {
-        is_auto = true;
-        b_ret = true; // invoke auto-shrinking(no less than WBP_BLOCK_SIZE)
-        LOG_INFO("invoke auto shrinking due to low watermark", K(max_used_page_watermark));
-      } else {
-        // re-count max watermark for the next period
-        ObSpinLockGuard list_guard(free_list_lock_);
-        b_ret = false;
-        LOG_DEBUG("re-count max watermark for the next period", K(max_used_page_watermark), K(current_capacity), K(memory_limit));
-        ATOMIC_STORE(&max_used_watermark_after_shrinking_, 0);
-        ATOMIC_STORE(&last_shrink_complete_ts_, ObTimeUtility::current_time());
-        update_current_max_used_percent_();
+      common::TCRWLock::RLockGuard guard(lock_);
+      ObSpinLockGuard list_guard(free_list_lock_);
+      const int64_t max_used_page_watermark =
+          ATOMIC_LOAD(&max_used_watermark_after_shrinking_);
+      const bool under_memory_pressure = is_tenant_memory_under_pressure_();
+      is_auto = current_capacity > WBP_BLOCK_SIZE &&
+          (under_memory_pressure || max_used_page_watermark < AUTO_SHRINKING_WATERMARK);
+      b_ret = is_auto;
+      LOG_INFO("check auto shrinking usage window", K(is_auto), K(max_used_page_watermark),
+          K(under_memory_pressure));
+
+      // Throttle initialization failures as well as ordinary ineligible windows.
+      ATOMIC_STORE(&last_shrink_complete_ts_, ObTimeUtility::current_time_us());
+      if (!is_auto) {
+        reset_used_watermark_();
       }
     }
   }
@@ -778,7 +834,9 @@ int ObSSTmpWriteBufferPool::begin_shrinking(const bool is_auto)
   switch (shrink_ctx_.wbp_shrink_state_) {
     case WBPShrinkContext::INVALID:
       if (OB_FAIL(init_shrink_context(is_auto))) {
-        LOG_ERROR("fail to init shrink context, could not begin shrink process", KR(ret));
+        if (OB_OP_NOT_ALLOW != ret) {
+          LOG_ERROR("fail to init shrink context, could not begin shrink process", KR(ret));
+        }
       } else {
         LOG_INFO("wbp begin_shrinking", K(shrink_ctx_));
       }
@@ -838,8 +896,9 @@ int ObSSTmpWriteBufferPool::finish_shrinking()
     shrink_ctx_.reset();
   }
 
-  last_shrink_complete_ts_ = ObTimeUtility::current_time();
-  ATOMIC_STORE(&max_used_watermark_after_shrinking_, 0);
+  last_shrink_complete_ts_ = ObTimeUtility::current_time_us();
+  // Pages surviving completion or cancellation seed the next usage window.
+  reset_used_watermark_();
   return ret;
 }
 

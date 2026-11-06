@@ -50,7 +50,9 @@ void ObTmpFileShrinkWBPTask::runTimerTask()
     switch (wbp_->get_wbp_state()) {
       case WBPShrinkContext::INVALID:
         if (OB_FAIL(wbp_->begin_shrinking(is_auto))) {
-          LOG_WARN("fail to init shrink context", KR(ret));
+          if (OB_OP_NOT_ALLOW != ret) {
+            LOG_WARN("fail to init shrink context", KR(ret));
+          }
         } else {
           wbp_->advance_shrink_state();
         }
