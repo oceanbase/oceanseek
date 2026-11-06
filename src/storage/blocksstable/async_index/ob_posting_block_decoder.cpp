@@ -680,55 +680,6 @@ int ObPostingBlockDecoder::lower_bound(
   return ret;
 }
 
-int ObPostingBlockDecoder::decode_to_block_data(
-    ObIAllocator &out_alloc, ObPostingBlockData &out)
-{
-  int ret = OB_SUCCESS;
-  out.doc_count_ = 0;
-  out.doc_ids_ = nullptr;
-  out.token_freqs_ = nullptr;
-  out.doc_lengths_ = nullptr;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    STORAGE_LOG(WARN, "posting block decoder not inited", K(ret));
-  } else {
-    const int64_t row_count = header_->row_count_;
-    const int64_t col_cnt = header_->get_column_count();
-    const int64_t total_size = row_count * sizeof(uint64_t) * col_cnt;
-    char *buf = static_cast<char *>(out_alloc.alloc(total_size));
-    if (OB_ISNULL(buf)) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      STORAGE_LOG(WARN, "failed to alloc block data buffer", K(ret), K(total_size));
-    } else {
-      uint64_t *doc_ids = reinterpret_cast<uint64_t *>(buf);
-      const bool has_relevance = has_relevance_params();
-      uint64_t *token_freqs = has_relevance
-          ? reinterpret_cast<uint64_t *>(buf + row_count * sizeof(uint64_t))
-          : nullptr;
-      uint64_t *doc_lengths = has_relevance
-          ? reinterpret_cast<uint64_t *>(buf + 2 * row_count * sizeof(uint64_t))
-          : nullptr;
-
-      for (int64_t col = 0; OB_SUCC(ret) && col < col_cnt; ++col) {
-        uint64_t *dst = reinterpret_cast<uint64_t *>(buf + col * row_count * sizeof(uint64_t));
-        ObPostingColumnDecodeCtx &col_ctx = col_ctxs_[col];
-        if (OB_FAIL(decode_column_batch(col_ctx, row_count, dst))) {
-          STORAGE_LOG(WARN, "failed to batch decode posting column", K(ret), K(col));
-        }
-      }
-      if (OB_SUCC(ret)) {
-        out.doc_count_ = row_count;
-        out.doc_ids_ = doc_ids;
-        out.token_freqs_ = token_freqs;
-        out.doc_lengths_ = doc_lengths;
-      } else {
-        out_alloc.free(buf);
-      }
-    }
-  }
-  return ret;
-}
-
 void ObPostingBlockDecoder::reuse()
 {
   for (int64_t i = 0; i < col_cnt_; ++i) {

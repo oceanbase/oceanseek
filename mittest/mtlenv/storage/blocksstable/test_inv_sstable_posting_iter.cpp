@@ -4,6 +4,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <cmath>
 #include <vector>
 
 #define OK(ass) ASSERT_EQ(OB_SUCCESS, (ass))
@@ -47,6 +48,19 @@ void build_rowkey_read_info(
       schema_cols,
       nullptr /*storage_cols_index*/));
   ASSERT_TRUE(read_info.is_valid());
+}
+
+double reference_bm25_score(
+    const uint64_t token_freq, const uint64_t doc_length,
+    const sql::ObBM25PrecomputedParams &params)
+{
+  const double tf = static_cast<double>(token_freq);
+  volatile double biased_tf = tf + params.denom_bias_;
+  volatile double scaled_dl = params.doc_len_scale_ * static_cast<double>(doc_length);
+  volatile double denom = biased_tf + scaled_dl;
+  volatile double weighted = params.query_weight_ * (tf / denom);
+  volatile double result = weighted * params.score_multiplier_;
+  return result;
 }
 
 // Build a 1-datum rowkey holding the term string (the inverted-index query key).
@@ -146,7 +160,10 @@ public:
       const int64_t term_seq,
       ObInvSSTable &inv_sstable,
       const bool hetero = false,
-      const bool ascending_block_score = false)
+      const bool ascending_block_score = false,
+      const bool force_micro_blocks = false,
+      const bool distinct_positions = false,
+      const int64_t forced_micro_rows = DEFAULT_POSTING_BLOCK_CAPACITY)
   {
     ASSERT_GT(doc_cnt, 0);
     ASSERT_GT(stride, 0u);
@@ -187,9 +204,18 @@ public:
           ? 1 + static_cast<uint64_t>(i / DEFAULT_POSTING_BLOCK_CAPACITY)
           : (hetero ? hetero_tf(i) : 1);
       const uint64_t doc_length = hetero ? hetero_dl(i) : 100;
+      char distinct_pos[9] = {0};
+      if (distinct_positions) {
+        snprintf(distinct_pos, sizeof(distinct_pos), "p%07ld", static_cast<long>(i));
+        pos_list.assign_ptr(distinct_pos, 8);
+      }
       OK(make_inv_idx_row(row, inv_idx_row_desc_, mv_col_cnt_, term_str, doc_id,
           token_freq, doc_length, pos_list));
       OK(writer.append_row(row));
+      if (force_micro_blocks && 0 == (i + 1) % forced_micro_rows) {
+        OK(writer.flush_logical_block());
+        OK(writer.flush_micro_block_pair());
+      }
       if (0 == i) {
         min_doc_id = doc_id;
       }
@@ -1439,7 +1465,7 @@ TEST_F(TestInvSSTablePostingIter, advance_shallow_decoded_block_reuse)
     make_doc_id_datum(s0, expect_doc(5), d0);
     OK(iter->advance_to(d0));
     ASSERT_TRUE(iter->curr_block_loaded_);
-    const uint64_t *decoded_ids = iter->posting_block_data_.get_doc_ids();
+    const void *decoded_ids = iter->posting_block_data_.get_doc_ids();
     ASSERT_NE(nullptr, decoded_ids);
 
     // Shallow to a larger target still inside block 0 (covered hit → no scanner move).
@@ -1478,7 +1504,7 @@ TEST_F(TestInvSSTablePostingIter, advance_shallow_decoded_block_reuse)
     make_doc_id_datum(s0, expect_doc(3), d0);
     OK(iter->advance_to(d0));
     ASSERT_TRUE(iter->curr_block_loaded_);
-    const uint64_t *decoded_ids = iter->posting_block_data_.get_doc_ids();
+    const void *decoded_ids = iter->posting_block_data_.get_doc_ids();
 
     const uint64_t even_target = expect_doc(80) - 1;  // absent (even), inside block 0
     uint64_t st = 0;
@@ -2298,6 +2324,183 @@ TEST_F(TestInvSSTablePostingIter, drain_from_current_after_advance_to_id)
   free_iter(iter);
 }
 
+// Compact relevance projection stays zero-copy. The legacy uint64 doc-ID
+// API and scalar access preserve values while callers alternate interfaces.
+TEST_F(TestInvSSTablePostingIter, compact_typed_drain_and_legacy_compatibility)
+{
+  ObInvSSTable inv_sstable;
+  build_single_term_sstable(true, DRAIN_DOC_CNT, ST_START, ST_STRIDE, ST_TERM_SEQ,
+      inv_sstable, true /*hetero*/);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  char term_buf[32] = {0};
+  ObStorageDatum term_datum;
+  ObDatumRowkey query_key;
+  ObQueryFlag query_flag;
+  ObTabletID tablet_id(TABLET_ID);
+  ObInvPostingScanParam param;
+  ObInvSSTablePostingIter *iter = nullptr;
+  open_single_term_iter(inv_sstable, read_info, term_buf, sizeof(term_buf), term_datum,
+      query_key, query_flag, tablet_id, param, iter);
+  uint64_t target_storage = 0;
+  ObDatum target;
+  make_doc_id_datum(target_storage, expect_doc(10), target);
+  OK(iter->advance_to_id(target));
+  const uint64_t *pid = nullptr;
+  ObPostingDocIdView typed_ids;
+  ObPostingRelevanceView relevance;
+  int64_t n = 0;
+  OK(iter->drain_until_impl(expect_doc(13), 4, typed_ids, relevance, n, true));
+  ASSERT_EQ(4, n);
+  ASSERT_TRUE(relevance.is_uint32());
+  ObPostingRelevanceView base_relevance;
+  OK(iter->posting_block_data_.get_relevance_view(0, base_relevance));
+  ASSERT_EQ(base_relevance.get_token_freqs32() + 10, relevance.get_token_freqs32());
+  ASSERT_EQ(base_relevance.get_doc_lengths32() + 10, relevance.get_doc_lengths32());
+  ASSERT_EQ(nullptr, iter->legacy_relevance_buf_);
+  for (int64_t i = 0; i < n; ++i) {
+    EXPECT_EQ(expect_doc(10 + i), typed_ids.at(i));
+    EXPECT_EQ(hetero_tf(10 + i), relevance.get_token_freqs32()[i]);
+    EXPECT_EQ(hetero_dl(10 + i), relevance.get_doc_lengths32()[i]);
+  }
+  int64_t tf = 0;
+  int64_t dl = 0;
+  OK(iter->load_curr_bm25_param(tf, dl));
+  EXPECT_EQ(hetero_tf(13), static_cast<uint64_t>(tf));
+  EXPECT_EQ(hetero_dl(13), static_cast<uint64_t>(dl));
+  EXPECT_EQ(nullptr, iter->legacy_relevance_buf_);
+  const uint64_t *ptf = nullptr;
+  const uint64_t *pdl = nullptr;
+  OK(iter->drain_until(expect_doc(17), 4, pid, ptf, pdl, n));
+  ASSERT_EQ(4, n);
+  ASSERT_EQ(iter->legacy_relevance_buf_, ptf);
+  ASSERT_NE(nullptr, ptf);
+  for (int64_t i = 0; i < n; ++i) {
+    EXPECT_EQ(expect_doc(14 + i), pid[i]);
+    EXPECT_EQ(hetero_tf(14 + i), ptf[i]);
+    EXPECT_EQ(hetero_dl(14 + i), pdl[i]);
+  }
+  OK(iter->drain_until_impl(expect_doc(21), 4, typed_ids, relevance, n, false));
+  ASSERT_EQ(4, n);
+  ASSERT_TRUE(relevance.is_uint32());
+  for (int64_t i = 0; i < n; ++i) {
+    EXPECT_EQ(expect_doc(18 + i), typed_ids.at(i));
+    EXPECT_EQ(hetero_tf(18 + i), relevance.get_token_freqs32()[i]);
+    EXPECT_EQ(hetero_dl(18 + i), relevance.get_doc_lengths32()[i]);
+  }
+  make_doc_id_datum(target_storage, expect_doc(254), target);
+  OK(iter->advance_to_id(target));
+  OK(iter->drain_until_impl(drain_max_doc(), 4, typed_ids, relevance, n, true));
+  ASSERT_EQ(2, n);
+  EXPECT_EQ(expect_doc(254), typed_ids.at(0));
+  EXPECT_EQ(hetero_tf(255), relevance.get_token_freqs32()[1]);
+  OK(iter->drain_until_impl(drain_max_doc(), 4, typed_ids, relevance, n, false));
+  ASSERT_EQ(4, n);
+  EXPECT_EQ(expect_doc(256), typed_ids.at(0));
+  EXPECT_EQ(hetero_tf(256), relevance.get_token_freqs32()[0]);
+  EXPECT_EQ(hetero_dl(259), relevance.get_doc_lengths32()[3]);
+  do {
+    OK(iter->drain_until(drain_max_doc(), DEFAULT_POSTING_BLOCK_CAPACITY, pid, ptf, pdl, n));
+  } while (n > 0);
+  EXPECT_TRUE(iter->is_end());
+  EXPECT_EQ(nullptr, pid);
+  EXPECT_EQ(nullptr, ptf);
+  EXPECT_EQ(nullptr, pdl);
+  OK(iter->drain_until_impl(drain_max_doc(), 4, typed_ids, relevance, n, false));
+  EXPECT_EQ(0, n);
+  EXPECT_FALSE(typed_ids.is_valid());
+  EXPECT_FALSE(relevance.has_relevance_params());
+  iter->reset();
+  EXPECT_EQ(nullptr, iter->legacy_relevance_buf_);
+  EXPECT_EQ(nullptr, iter->legacy_doc_ids_buf_);
+  free_iter(iter);
+}
+
+// Four actual cache micros straddle UINT32_MAX. The same iterator must switch
+// U32/U64 layouts without truncation and without allocating either legacy buffer.
+TEST_F(TestInvSSTablePostingIter, typed_doc_ids_cross_micro_and_uint32_boundary)
+{
+  constexpr int64_t DOC_COUNT = 1024;
+  const uint64_t start = UINT32_MAX - 511ULL;
+  ObInvSSTable inv_sstable;
+  build_single_term_sstable(true, DOC_COUNT, start, 1, ST_TERM_SEQ,
+      inv_sstable, true /*hetero*/, false /*ascending*/, true /*forced micros*/);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  char term_buf[32] = {0};
+  ObStorageDatum term_datum;
+  ObDatumRowkey query_key;
+  ObQueryFlag query_flag;
+  ObTabletID tablet_id(TABLET_ID);
+  ObInvPostingScanParam param;
+  ObInvSSTablePostingIter *iter = nullptr;
+  open_single_term_iter(inv_sstable, read_info, term_buf, sizeof(term_buf), term_datum,
+      query_key, query_flag, tablet_id, param, iter, true /*values*/);
+  int64_t seen = 0;
+  int64_t compact_rows = 0;
+  int64_t fallback_rows = 0;
+  int64_t previous_micro = -1;
+  int64_t micro_changes = 0;
+  bool done = false;
+  while (!done) {
+    ObPostingDocIdView ids;
+    ObPostingRelevanceView relevance;
+    int64_t count = 0;
+    OK(iter->drain_until_impl(UINT64_MAX, DEFAULT_POSTING_BLOCK_CAPACITY,
+        ids, relevance, count, false));
+    if (count == 0) {
+      EXPECT_TRUE(iter->is_end());
+      EXPECT_FALSE(ids.is_valid());
+      EXPECT_FALSE(relevance.has_relevance_params());
+      done = true;
+    } else {
+      const int64_t micro = iter->scanner_.data_read_idx_;
+      if (previous_micro >= 0 && previous_micro != micro) { ++micro_changes; }
+      previous_micro = micro;
+      EXPECT_EQ(seen < 512, ids.is_uint32());
+      if (ids.is_uint32()) { compact_rows += count; } else { fallback_rows += count; }
+      for (int64_t i = 0; i < count; ++i) {
+        EXPECT_EQ(start + seen + i, ids.at(i));
+        EXPECT_EQ(hetero_tf(seen + i), relevance.get_token_freqs32()[i]);
+        EXPECT_EQ(hetero_dl(seen + i), relevance.get_doc_lengths32()[i]);
+      }
+      seen += count;
+      const ObDatum *position_list = nullptr;
+      OK(iter->get_cur_pos_list(position_list));
+      ASSERT_NE(nullptr, position_list);
+      EXPECT_EQ(8, position_list->len_);
+    }
+  }
+  EXPECT_EQ(DOC_COUNT, seen);
+  EXPECT_EQ(512, compact_rows);
+  EXPECT_EQ(512, fallback_rows);
+  EXPECT_GE(micro_changes, 3);
+  EXPECT_EQ(nullptr, iter->legacy_doc_ids_buf_);
+  EXPECT_EQ(nullptr, iter->legacy_relevance_buf_);
+  free_iter(iter);
+
+  open_single_term_iter(inv_sstable, read_info, term_buf, sizeof(term_buf), term_datum,
+      query_key, query_flag, tablet_id, param, iter);
+  uint64_t target_storage = 0;
+  ObDatum target;
+  make_doc_id_datum(target_storage, UINT32_MAX + 1ULL, target);
+  OK(iter->advance_to_id(target));
+  ObPostingDocIdView ids;
+  ObPostingRelevanceView relevance;
+  int64_t count = 0;
+  OK(iter->drain_until_impl(UINT32_MAX + 3ULL, 3,
+      ids, relevance, count, true));
+  ASSERT_EQ(3, count);
+  EXPECT_FALSE(ids.is_uint32());
+  EXPECT_EQ(UINT32_MAX + 1ULL, ids.at(0));
+  EXPECT_EQ(UINT32_MAX + 3ULL, ids.at(2));
+  // The scanner rejects UINT64_MAX as a seek target; use the first ID past this term.
+  make_doc_id_datum(target_storage, start + DOC_COUNT, target);
+  EXPECT_EQ(OB_ITER_END, iter->advance_to_id(target));
+  EXPECT_TRUE(iter->is_end());
+  free_iter(iter);
+}
+
 // advance_to_id() does not decode relevance for a newly positioned row.
 TEST_F(TestInvSSTablePostingIter, advance_to_id_positions_without_materializing_relevance)
 {
@@ -2717,7 +2920,7 @@ TEST_F(TestInvSSTablePostingIter, get_range_max_score_complete_coverage)
     // 单 term 数据按固定 stride 反解 posting 位置，再还原该 block 使用的递增 tf。
     const uint64_t posting_idx = (block_max_id - ST_START) / ST_STRIDE;
     const uint64_t token_freq = 1 + posting_idx / DEFAULT_POSTING_BLOCK_CAPACITY;
-    return iter->calc_bm25_score(token_freq, 100 /*doc_length*/);
+    return reference_bm25_score(token_freq, 100 /*doc_length*/, iter->bm25_calc_params_);
   };
 
   // inclusive 区间在当前 block 的 max_id 精确闭合，只返回当前 block 上界。
@@ -3445,6 +3648,17 @@ TEST_F(TestInvSSTablePostingIter, docid_range_seek_shallow_empty_and_reset)
   OK(iter->load_curr_bm25_param(frequency, length));
   EXPECT_EQ(1, frequency);
   EXPECT_EQ(100, length);
+  make_doc_id_datum(target_storage, 1200, target);
+  OK(iter->advance_shallow(target, false));
+  uint64_t typed_id = 0;
+  OK(iter->advance_to_id(1000, typed_id));
+  EXPECT_EQ(1201u, typed_id);
+  make_doc_id_datum(target_storage, 1300, target);
+  OK(iter->advance_shallow(target, false));
+  make_doc_id_datum(target_storage, 1000, target);
+  OK(iter->advance_to_id(target));
+  OK(iter->get_cur_id(id));
+  EXPECT_EQ(1301u, id->get_uint64());
   make_doc_id_datum(target_storage, 1534, target);
   OK(iter->advance_to(target));
   OK(iter->get_cur_id(id));
@@ -3464,6 +3678,1064 @@ TEST_F(TestInvSSTablePostingIter, docid_range_seek_shallow_empty_and_reset)
   OK(iter->get_cur_id(id));
   EXPECT_EQ(1u, id->get_uint64());
   free_iter(iter);
+}
+
+namespace
+{
+uint64_t micro_tf_at(const ObPostingRelevanceView &view, const int64_t idx)
+{
+  return view.is_uint32() ? view.get_token_freqs32()[idx] : view.get_token_freqs64()[idx];
+}
+uint64_t micro_dl_at(const ObPostingRelevanceView &view, const int64_t idx)
+{
+  return view.is_uint32() ? view.get_doc_lengths32()[idx] : view.get_doc_lengths64()[idx];
+}
+} // namespace
+
+// Typed batches retain a logical-block cursor and lazily loaded value columns.
+TEST_F(TestInvSSTablePostingIter, typed_drain_partial_windows_and_value_cursor)
+{
+  ObInvSSTable sstable;
+  build_single_term_sstable(true, DRAIN_DOC_CNT, ST_START, ST_STRIDE, ST_TERM_SEQ,
+      sstable, true /*hetero*/, true /*ascending_block_score*/, false /*force_micro_blocks*/,
+      true /*distinct_positions*/);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  for (int mode = 0; mode < 5; ++mode) {
+    char term_buf[32] = {0};
+    ObStorageDatum term_datum;
+    ObDatumRowkey query_key;
+    ObQueryFlag query_flag;
+    ObTabletID tablet_id(TABLET_ID);
+    ObInvPostingScanParam param;
+    ObInvSSTablePostingIter *iter = nullptr;
+    open_single_term_iter(sstable, read_info, term_buf, sizeof(term_buf), term_datum,
+        query_key, query_flag, tablet_id, param, iter, true /*need_value*/, 0,
+        mode == 4 ? expect_doc(600) : UINT64_MAX);
+    uint64_t target_storage = 0;
+    ObDatum target;
+    make_doc_id_datum(target_storage, expect_doc(200), target);
+    OK(iter->advance_to(target));
+    const ObDatum *pos = nullptr;
+    OK(iter->get_cur_pos_list(pos));
+    ASSERT_EQ(0, MEMCMP("p0000200", pos->ptr_, 8));
+    ASSERT_TRUE(iter->curr_value_block_loaded_);
+    const int64_t physical_row = iter->scanner_.data_read_idx_;
+    ObPostingDocIdView ids;
+    ObPostingRelevanceView relevance;
+    int64_t n = 0;
+    const bool from_current = 1 == mode;
+    const uint64_t boundary = 2 == mode ? expect_doc(256)
+        : (3 == mode ? expect_doc(255) + 1 : UINT64_MAX);
+    const int64_t capacity = mode <= 1 ? 400 : 1024;
+    const int64_t first = from_current ? 200 : 201;
+    const int64_t last = 0 == mode || 4 == mode ? 600
+        : (1 == mode ? 599 : (2 == mode ? 256 : 255));
+    int64_t total = 0;
+    while (total < last - first + 1) {
+      if (from_current && 0 == total) {
+        OK(iter->drain_until_impl(boundary, capacity, ids, relevance, n, true));
+      } else {
+        OK(iter->drain_until_typed(boundary, capacity - total, ids, relevance, n));
+      }
+      const int64_t batch_first = first + total;
+      ASSERT_GT(n, 0);
+      ASSERT_LE(n, last - batch_first + 1);
+      ASSERT_LE(n, DEFAULT_POSTING_BLOCK_CAPACITY - batch_first % DEFAULT_POSTING_BLOCK_CAPACITY);
+      for (int64_t i = 0; i < n; ++i) {
+        ASSERT_EQ(expect_doc(batch_first + i), ids.at(i));
+        ASSERT_EQ(1 + (batch_first + i) / DEFAULT_POSTING_BLOCK_CAPACITY, micro_tf_at(relevance, i));
+        ASSERT_EQ(hetero_dl(batch_first + i), micro_dl_at(relevance, i));
+      }
+      total += n;
+    }
+    ASSERT_EQ(last - first + 1, total) << mode;
+    ASSERT_EQ(physical_row, iter->scanner_.data_read_idx_);
+    ASSERT_EQ(last / DEFAULT_POSTING_BLOCK_CAPACITY, iter->curr_meta_.idx_);
+    ASSERT_EQ(last % DEFAULT_POSTING_BLOCK_CAPACITY, iter->curr_row_idx_);
+    ASSERT_FALSE(iter->curr_relevance_materialized_);
+    ASSERT_FALSE(iter->is_end());
+    if (3 != mode) {
+      ASSERT_FALSE(iter->curr_value_block_loaded_);
+    }
+    // Consume all borrowed batch data before materializing another view.
+    char expected_pos[9] = {0};
+    snprintf(expected_pos, sizeof(expected_pos), "p%07ld", static_cast<long>(last));
+    OK(iter->get_cur_pos_list(pos));
+    ASSERT_EQ(8, pos->len_);
+    ASSERT_EQ(0, MEMCMP(expected_pos, pos->ptr_, 8));
+    int64_t tf = 0;
+    int64_t dl = 0;
+    OK(iter->load_curr_bm25_param(tf, dl));
+    ASSERT_EQ(1 + last / DEFAULT_POSTING_BLOCK_CAPACITY, tf);
+    ASSERT_EQ(hetero_dl(last), static_cast<uint64_t>(dl));
+    // The cached upper bound must belong to the final block, not the source block.
+    const double expected_max = reference_bm25_score(
+        1 + last / DEFAULT_POSTING_BLOCK_CAPACITY, 50, iter->bm25_calc_params_);
+    uint64_t block_min = 0;
+    uint64_t block_max = 0;
+    double actual_max = -1.0;
+    OK(iter->get_block_max_tuple(block_min, block_max, actual_max));
+    ASSERT_DOUBLE_EQ(expected_max, actual_max);
+    if (3 == mode) {
+      OK(iter->drain_until_typed(boundary, capacity, ids, relevance, n));
+      ASSERT_EQ(0, n);
+      ASSERT_FALSE(ids.is_valid());
+      ASSERT_FALSE(iter->is_end());
+      const ObDatum *id = nullptr;
+      OK(iter->get_cur_id(id));
+      ASSERT_EQ(expect_doc(256), id->get_uint64());
+      OK(iter->drain_until_impl(expect_doc(600), 1024, ids, relevance, n, true));
+      ASSERT_EQ(256, n);
+      ASSERT_EQ(expect_doc(256), ids.at(0));
+      ASSERT_EQ(expect_doc(511), ids.at(n - 1));
+      OK(iter->drain_until_typed(expect_doc(600), 1024, ids, relevance, n));
+      ASSERT_EQ(89, n);
+      ASSERT_EQ(expect_doc(512), ids.at(0));
+      ASSERT_EQ(expect_doc(600), ids.at(n - 1));
+    } else if (4 == mode) {
+      OK(iter->drain_until_typed(UINT64_MAX, 1024, ids, relevance, n));
+      ASSERT_EQ(0, n);
+      ASSERT_TRUE(iter->is_end());
+      ASSERT_FALSE(ids.is_valid());
+    } else {
+      OK(iter->next());
+      const ObDatum *id = nullptr;
+      OK(iter->get_cur_id(id));
+      ASSERT_EQ(expect_doc(last + 1), id->get_uint64());
+      make_doc_id_datum(target_storage, expect_doc(1000), target);
+      OK(iter->advance_shallow(target, true /*inclusive*/));
+      ASSERT_EQ(OB_ERR_UNEXPECTED,
+          iter->drain_until_typed(UINT64_MAX, 1024, ids, relevance, n));
+      ASSERT_EQ(0, n);
+      ASSERT_FALSE(ids.is_valid());
+      OK(iter->advance_to(target));
+      OK(iter->drain_until_impl(UINT64_MAX, 300, ids, relevance, n, true));
+      ASSERT_EQ(24, n);
+      ASSERT_EQ(expect_doc(1000), ids.at(0));
+      ASSERT_EQ(expect_doc(1023), ids.at(n - 1));
+      OK(iter->drain_until_typed(UINT64_MAX, 276, ids, relevance, n));
+      ASSERT_EQ(256, n);
+      ASSERT_EQ(expect_doc(1024), ids.at(0));
+      ASSERT_EQ(expect_doc(1279), ids.at(n - 1));
+      OK(iter->drain_until_typed(UINT64_MAX, 20, ids, relevance, n));
+      ASSERT_EQ(20, n);
+      ASSERT_EQ(expect_doc(1280), ids.at(0));
+      ASSERT_EQ(expect_doc(1299), ids.at(n - 1));
+    }
+    ASSERT_EQ(nullptr, iter->legacy_doc_ids_buf_);
+    ASSERT_EQ(nullptr, iter->legacy_relevance_buf_);
+    free_iter(iter);
+  }
+}
+
+TEST_F(TestInvSSTablePostingIter, typed_drain_cross_micro_and_eof)
+{
+  const int64_t doc_count = 32768;
+  ObInvSSTable sstable;
+  build_single_term_sstable(false, doc_count, ST_START, ST_STRIDE, ST_TERM_SEQ,
+      sstable, true /*hetero*/);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  char term_buf[32] = {0};
+  ObStorageDatum term_datum;
+  ObDatumRowkey query_key;
+  ObQueryFlag query_flag;
+  ObTabletID tablet_id(TABLET_ID);
+  ObInvPostingScanParam param;
+  ObInvSSTablePostingIter *iter = nullptr;
+  open_single_term_iter(sstable, read_info, term_buf, sizeof(term_buf), term_datum,
+      query_key, query_flag, tablet_id, param, iter);
+  int64_t next = 0;
+  int64_t last_physical_row = -1;
+  int64_t physical_rows = 0;
+  while (true) {
+    ObPostingDocIdView ids;
+    ObPostingRelevanceView relevance;
+    int64_t n = 0;
+    OK(iter->drain_until_typed(UINT64_MAX, 1024, ids, relevance, n));
+    if (0 == n) {
+      ASSERT_TRUE(iter->is_end());
+      ASSERT_FALSE(ids.is_valid());
+      ASSERT_EQ(nullptr, relevance.get_token_freqs_data());
+      ASSERT_EQ(nullptr, relevance.get_doc_lengths_data());
+      break;
+    }
+    ASSERT_LE(n, DEFAULT_POSTING_BLOCK_CAPACITY);
+    ASSERT_FALSE(iter->is_end());
+    if (iter->scanner_.data_read_idx_ != last_physical_row) {
+      ++physical_rows;
+      last_physical_row = iter->scanner_.data_read_idx_;
+    }
+    for (int64_t i = 0; i < n; ++i, ++next) {
+      ASSERT_EQ(expect_doc(next), ids.at(i));
+      ASSERT_EQ(hetero_tf(next), micro_tf_at(relevance, i));
+      ASSERT_EQ(hetero_dl(next), micro_dl_at(relevance, i));
+    }
+    ASSERT_EQ(iter->posting_block_data_.doc_id_at(iter->curr_row_idx_), expect_doc(next - 1));
+    ASSERT_LT(iter->curr_row_idx_, iter->curr_meta_.doc_count_);
+  }
+  ASSERT_EQ(doc_count, next);
+  ASSERT_GT(physical_rows, 1);
+  ObPostingDocIdView ids;
+  ObPostingRelevanceView relevance;
+  int64_t n = 1;
+  OK(iter->drain_until_typed(UINT64_MAX, 1024, ids, relevance, n));
+  ASSERT_EQ(0, n);
+  ASSERT_EQ(OB_ITER_END, iter->next());
+  ASSERT_EQ(nullptr, iter->legacy_doc_ids_buf_);
+  ASSERT_EQ(nullptr, iter->legacy_relevance_buf_);
+  free_iter(iter);
+}
+
+TEST_F(TestInvSSTablePostingIter, typed_drain_saturated_tail)
+{
+  const int64_t doc_count = 700;
+  const uint64_t start = UINT64_MAX - doc_count + 1;
+  ObInvSSTable sstable;
+  build_single_term_sstable(false, doc_count, start, 1, ST_TERM_SEQ, sstable, true);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  char term_buf[32] = {0};
+  ObStorageDatum term_datum;
+  ObDatumRowkey query_key;
+  ObQueryFlag query_flag;
+  ObTabletID tablet_id(TABLET_ID);
+  ObInvPostingScanParam param;
+  ObInvSSTablePostingIter *iter = nullptr;
+  open_single_term_iter(sstable, read_info, term_buf, sizeof(term_buf), term_datum,
+      query_key, query_flag, tablet_id, param, iter);
+  ObPostingDocIdView ids;
+  ObPostingRelevanceView relevance;
+  int64_t n = 0;
+  int64_t total = 0;
+  while (total < doc_count) {
+    OK(iter->drain_until_typed(UINT64_MAX, 1024, ids, relevance, n));
+    ASSERT_GT(n, 0);
+    ASSERT_LE(n, DEFAULT_POSTING_BLOCK_CAPACITY);
+    ASSERT_LE(n, doc_count - total);
+    for (int64_t i = 0; i < n; ++i) {
+      ASSERT_EQ(start + total + i, ids.at(i));
+    }
+    total += n;
+  }
+  ASSERT_EQ(doc_count, total);
+  ASSERT_EQ(UINT64_MAX, ids.at(n - 1));
+  ASSERT_FALSE(iter->is_end());
+  OK(iter->drain_until_typed(UINT64_MAX, 1024, ids, relevance, n));
+  ASSERT_EQ(0, n);
+  ASSERT_FALSE(ids.is_valid());
+  ASSERT_TRUE(iter->is_end());
+  ASSERT_EQ(nullptr, iter->legacy_doc_ids_buf_);
+  ASSERT_EQ(nullptr, iter->legacy_relevance_buf_);
+  free_iter(iter);
+}
+
+TEST_F(TestInvSSTablePostingIter, typed_and_legacy_drains_reject_block_row_count_mismatch)
+{
+  ObInvSSTable sstable;
+  build_single_term_sstable(false, DRAIN_DOC_CNT, ST_START, ST_STRIDE, ST_TERM_SEQ,
+      sstable, true);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  for (const int64_t corrupt_block : {1, 2}) {
+    for (const int delta : {-1, 1}) {
+      for (int mode = 0; mode < 3; ++mode) {
+        SCOPED_TRACE(::testing::Message() << "block=" << corrupt_block
+            << " delta=" << delta << " mode=" << mode);
+        char term_buf[32] = {};
+        ObStorageDatum term_datum;
+        ObDatumRowkey query_key;
+        ObQueryFlag query_flag;
+        ObTabletID tablet_id(TABLET_ID);
+        ObInvPostingScanParam param;
+        ObInvSSTablePostingIter *iter = nullptr;
+        open_single_term_iter(sstable, read_info, term_buf, sizeof(term_buf), term_datum,
+            query_key, query_flag, tablet_id, param, iter);
+        auto &meta_scanner = iter->scanner_.meta_row_scanner_;
+        const ObInvIdxAggDataEntry *saved_entries = meta_scanner.entries_;
+        const int64_t entry_count = meta_scanner.header_->logical_block_count_;
+        ASSERT_GT(entry_count, corrupt_block);
+        ObPostingDocIdView ids;
+        ObPostingRelevanceView relevance;
+        int64_t n = 0;
+        for (int64_t block = 0; block < corrupt_block; ++block) {
+          OK(iter->drain_until_typed(UINT64_MAX, 1024, ids, relevance, n));
+          ASSERT_EQ(DEFAULT_POSTING_BLOCK_CAPACITY, n);
+          ASSERT_EQ(expect_doc(block * DEFAULT_POSTING_BLOCK_CAPACITY), ids.at(0));
+          ASSERT_EQ(block, iter->curr_meta_.idx_);
+        }
+        const int64_t read_idx = iter->scanner_.data_read_idx_;
+        std::vector<ObInvIdxAggDataEntry> entries(saved_entries, saved_entries + entry_count);
+        entries[corrupt_block].doc_count_ += delta;
+        meta_scanner.entries_ = entries.data();
+        const uint64_t *legacy_ids = reinterpret_cast<const uint64_t *>(1);
+        const uint64_t *legacy_tfs = legacy_ids;
+        const uint64_t *legacy_dls = legacy_ids;
+        bool finished = true;
+        int ret = OB_SUCCESS;
+        if (0 == mode) {
+          ret = iter->drain_until(UINT64_MAX, 1024, legacy_ids, legacy_tfs, legacy_dls, n);
+        } else if (1 == mode) {
+          ret = iter->drain_until_typed(UINT64_MAX, 1024, ids, relevance, n);
+        } else {
+          ret = iter->drain_until_typed_run(UINT64_MAX, 1024, ids, relevance, n, finished);
+        }
+        meta_scanner.entries_ = saved_entries;
+        ASSERT_EQ(OB_ERR_UNEXPECTED, ret);
+        ASSERT_EQ(0, n);
+        if (0 == mode) {
+          EXPECT_EQ(nullptr, legacy_ids);
+          EXPECT_EQ(nullptr, legacy_tfs);
+          EXPECT_EQ(nullptr, legacy_dls);
+        } else {
+          EXPECT_FALSE(ids.is_valid());
+          EXPECT_FALSE(relevance.has_relevance_params());
+          if (2 == mode) { EXPECT_FALSE(finished); }
+        }
+        EXPECT_EQ(corrupt_block, meta_scanner.cur_idx_);
+        EXPECT_EQ(read_idx, iter->scanner_.data_read_idx_);
+        EXPECT_FALSE(iter->curr_block_loaded_);
+        EXPECT_EQ(-1, iter->curr_row_idx_);
+        EXPECT_FALSE(iter->is_end());
+        free_iter(iter);
+      }
+    }
+  }
+}
+
+TEST_F(TestInvSSTablePostingIter, typed_drain_boundary_gap_and_same_micro_reuse)
+{
+  ObInvSSTable sstable;
+  build_single_term_sstable(false, DRAIN_DOC_CNT, ST_START, ST_STRIDE, ST_TERM_SEQ,
+      sstable, true);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  char term_buf[32] = {0};
+  ObStorageDatum term_datum;
+  ObDatumRowkey query_key;
+  ObQueryFlag query_flag;
+  ObTabletID tablet_id(TABLET_ID);
+  ObInvPostingScanParam param;
+  ObInvSSTablePostingIter *iter = nullptr;
+  open_single_term_iter(sstable, read_info, term_buf, sizeof(term_buf), term_datum,
+      query_key, query_flag, tablet_id, param, iter);
+  uint64_t target_storage = 0;
+  ObDatum target;
+  make_doc_id_datum(target_storage, expect_doc(200), target);
+  OK(iter->advance_to(target));
+  const int64_t read_idx = iter->scanner_.data_read_idx_;
+  const char *micro_buf = iter->curr_data_micro_block_.get_buf();
+  ObPostingDocIdView ids;
+  ObPostingRelevanceView relevance;
+  int64_t n = 0;
+  // The boundary exceeds this block but precedes the next block's first DocID.
+  OK(iter->drain_until_typed(expect_doc(255) + 1, 400, ids, relevance, n));
+  ASSERT_EQ(55, n);
+  for (int64_t i = 0; i < n; ++i) {
+    ASSERT_EQ(expect_doc(201 + i), ids.at(i));
+    ASSERT_EQ(hetero_tf(201 + i), micro_tf_at(relevance, i));
+    ASSERT_EQ(hetero_dl(201 + i), micro_dl_at(relevance, i));
+  }
+  ASSERT_EQ(255, iter->curr_row_idx_);
+  ASSERT_EQ(0, iter->curr_meta_.idx_);
+  ASSERT_EQ(0, iter->scanner_.meta_row_scanner_.cur_idx_);
+  ASSERT_EQ(read_idx, iter->scanner_.data_read_idx_);
+  ASSERT_FALSE(iter->is_end());
+  OK(iter->drain_until_typed(UINT64_MAX, 400, ids, relevance, n));
+  ASSERT_EQ(DEFAULT_POSTING_BLOCK_CAPACITY, n);
+  for (int64_t i = 0; i < n; ++i) {
+    ASSERT_EQ(expect_doc(256 + i), ids.at(i));
+    ASSERT_EQ(hetero_tf(256 + i), micro_tf_at(relevance, i));
+    ASSERT_EQ(hetero_dl(256 + i), micro_dl_at(relevance, i));
+  }
+  ASSERT_EQ(1, iter->curr_meta_.idx_);
+  ASSERT_EQ(read_idx, iter->scanner_.data_read_idx_);
+  ASSERT_EQ(micro_buf, iter->curr_data_micro_block_.get_buf());
+  ASSERT_EQ(nullptr, iter->legacy_doc_ids_buf_);
+  ASSERT_EQ(nullptr, iter->legacy_relevance_buf_);
+  free_iter(iter);
+}
+
+
+TEST_F(TestInvSSTablePostingIter, typed_drain_width_switch_and_range_frontier_cursor)
+{
+  const int64_t doc_count = 2048;
+  const uint64_t start = UINT32_MAX - 1023ULL;
+  ObInvSSTable sstable;
+  build_single_term_sstable(true, doc_count, start, 1, ST_TERM_SEQ, sstable,
+      true /*hetero*/, false /*ascending*/, true /*forced micros*/,
+      true /*distinct positions*/, 512 /*two logical blocks per micro*/);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  char term_buf[32] = {0};
+  ObStorageDatum term_datum;
+  ObDatumRowkey query_key;
+  ObQueryFlag query_flag;
+  ObTabletID tablet_id(TABLET_ID);
+  ObInvPostingScanParam param;
+  ObInvSSTablePostingIter *iter = nullptr;
+  open_single_term_iter(sstable, read_info, term_buf, sizeof(term_buf), term_datum,
+      query_key, query_flag, tablet_id, param, iter, true /*need value*/);
+  int64_t seen = 0;
+  int64_t compact_rows = 0;
+  int64_t wide_rows = 0;
+  while (true) {
+    ObPostingDocIdView ids;
+    ObPostingRelevanceView relevance;
+    int64_t n = 0;
+    OK(iter->drain_until_typed(UINT64_MAX, 1024, ids, relevance, n));
+    if (0 == n) {
+      ASSERT_TRUE(iter->is_end());
+      ASSERT_FALSE(ids.is_valid());
+      ASSERT_FALSE(relevance.has_relevance_params());
+      break;
+    }
+    ASSERT_EQ(DEFAULT_POSTING_BLOCK_CAPACITY, n);
+    ASSERT_EQ(seen < 1024, ids.is_uint32());
+    ASSERT_TRUE(relevance.is_uint32());
+    if (ids.is_uint32()) { compact_rows += n; } else { wide_rows += n; }
+    for (int64_t i = 0; i < n; ++i) {
+      ASSERT_EQ(start + seen + i, ids.at(i));
+      ASSERT_EQ(hetero_tf(seen + i), micro_tf_at(relevance, i));
+      ASSERT_EQ(hetero_dl(seen + i), micro_dl_at(relevance, i));
+    }
+    seen += n;
+    const int64_t saved_meta_idx = iter->scanner_.meta_row_scanner_.cur_idx_;
+    const int64_t saved_micro_idx = iter->scanner_.data_read_idx_;
+    const int64_t saved_row_idx = iter->curr_row_idx_;
+    const uint64_t saved_id = iter->curr_id_storage_;
+    // Inspecting future blocks must preserve the current value and row cursor.
+    double bound = 0;
+    bool can_calc = false;
+    OK(iter->get_range_max_score(saved_id, true, start + doc_count - 1, bound, can_calc));
+    ASSERT_TRUE(can_calc);
+    double remaining_max = 0;
+    for (int64_t i = seen - 1; i < doc_count; ++i) {
+      remaining_max = MAX(remaining_max,
+          reference_bm25_score(hetero_tf(i), hetero_dl(i), iter->bm25_calc_params_));
+    }
+    ASSERT_GE(bound, remaining_max);
+    ASSERT_EQ(saved_meta_idx, iter->scanner_.meta_row_scanner_.cur_idx_);
+    ASSERT_EQ(saved_micro_idx, iter->scanner_.data_read_idx_);
+    ASSERT_EQ(saved_row_idx, iter->curr_row_idx_);
+    ASSERT_EQ(saved_id, iter->curr_id_storage_);
+    const ObDatum *pos = nullptr;
+    OK(iter->get_cur_pos_list(pos));
+    char expected_pos[9] = {0};
+    snprintf(expected_pos, sizeof(expected_pos), "p%07ld", static_cast<long>(seen - 1));
+    ASSERT_EQ(8, pos->len_);
+    ASSERT_EQ(0, MEMCMP(expected_pos, pos->ptr_, 8));
+  }
+  ASSERT_EQ(doc_count, seen);
+  ASSERT_EQ(1024, compact_rows);
+  ASSERT_EQ(1024, wide_rows);
+  ASSERT_EQ(nullptr, iter->legacy_doc_ids_buf_);
+  ASSERT_EQ(nullptr, iter->legacy_relevance_buf_);
+  free_iter(iter);
+}
+
+// R9 is an observation of the existing range call, not another seek or a second
+// frontier pass. Exact scores, current row/value state and read cursor must agree.
+TEST_F(TestInvSSTablePostingIter, range_cached_metadata_guard_preserves_error_and_fresh_score)
+{
+  ObInvSSTable sstable;
+  build_single_term_sstable(true, 4096, ST_START, ST_STRIDE, ST_TERM_SEQ, sstable,
+      false /*hetero*/, true /*ascending*/);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  char term_buf[32] = {0};
+  ObStorageDatum term_datum;
+  ObDatumRowkey query_key;
+  ObQueryFlag query_flag;
+  ObTabletID tablet_id(TABLET_ID);
+  ObInvPostingScanParam param;
+  ObInvSSTablePostingIter *iter = nullptr;
+  open_single_term_iter(sstable, read_info, term_buf, sizeof(term_buf), term_datum,
+      query_key, query_flag, tablet_id, param, iter);
+  const char *agg = nullptr;
+  int64_t agg_size = 0;
+  uint64_t row_max = 0;
+  OK(iter->scanner_.get_prefetched_meta_row(0, agg, agg_size, row_max));
+  const uint64_t block_end = iter->curr_meta_.max_id_;
+  const int64_t read_idx = iter->scanner_.data_read_idx_;
+  const int64_t meta_idx = iter->scanner_.meta_row_scanner_.cur_idx_;
+  const uint64_t frontier = iter->frontier_min_id_;
+  auto &item = iter->scanner_.data_ring_[read_idx % ObSSTablePostingScanner::DATA_RING_CAP];
+  const char *saved_agg = item.index_info_.agg_row_buf_;
+  const int64_t saved_size = item.index_info_.agg_buf_size_;
+  std::vector<char> replacement(agg, agg + agg_size);
+  auto *header = reinterpret_cast<ObInvIdxAggDataHeader *>(replacement.data());
+  auto *entries = reinterpret_cast<ObInvIdxAggDataEntry *>(replacement.data() + sizeof(*header));
+  ASSERT_GE(header->logical_block_count_, meta_idx + 3);
+  ASSERT_GT(entries[meta_idx].frontier_count_, 0);
+  auto *pairs = reinterpret_cast<ObInvIdxBM25ParamPair *>(replacement.data()
+      + sizeof(*header) + header->logical_block_count_ * sizeof(*entries)
+      + entries[meta_idx].frontier_offset_);
+  pairs[0].token_freq_ = 100;
+  pairs[0].doc_length_ = 100;
+  const double expected = reference_bm25_score(100, 100, iter->bm25_calc_params_);
+  uint64_t block_min = 0;
+  uint64_t block_max = 0;
+  double original_bound = -1.0;
+  OK(iter->get_block_max_tuple(block_min, block_max, original_bound));
+  ASSERT_GT(expected, original_bound);
+  item.index_info_.agg_row_buf_ = replacement.data();
+  item.index_info_.agg_buf_size_ = replacement.size();
+  double score = -123.0;
+  bool can_calc = false;
+  OK(iter->get_range_max_score(ST_START, true, block_end, score, can_calc));
+  EXPECT_TRUE(can_calc);
+  EXPECT_DOUBLE_EQ(expected, score);
+  // Extended ranges must use the replacement's current frontier.
+  const uint64_t extended_end = entries[meta_idx + 1].max_doc_id_;
+  score = -123.0;
+  can_calc = false;
+  OK(iter->get_range_max_score(ST_START, true, extended_end, score, can_calc));
+  EXPECT_TRUE(can_calc);
+  EXPECT_DOUBLE_EQ(expected, score);
+  const uint16_t next_offset = entries[meta_idx + 1].frontier_offset_;
+  entries[meta_idx + 1].frontier_offset_ = entries[meta_idx + 2].frontier_offset_;
+  score = -123.0;
+  can_calc = false;
+  EXPECT_EQ(OB_ERR_UNEXPECTED,
+      iter->get_range_max_score(ST_START, true, extended_end, score, can_calc));
+  EXPECT_FALSE(can_calc);
+  EXPECT_DOUBLE_EQ(-123.0, score);
+  EXPECT_TRUE(iter->curr_block_max_score_valid_);
+  EXPECT_DOUBLE_EQ(original_bound, iter->curr_block_max_score_);
+  entries[meta_idx + 1].frontier_offset_ = next_offset;
+
+  // Make this copied image the parsed current image, then mutate the same pointer.
+  // A pointer-only check would incorrectly keep the cached fast path enabled.
+  OK(iter->scanner_.meta_row_scanner_.open(replacement.data(), replacement.size()));
+  for (int64_t i = 0; i < meta_idx; ++i) {
+    OK(iter->scanner_.meta_row_scanner_.next_block());
+  }
+  iter->curr_meta_.reset(); // force re-materialization of this synthetic new image
+  OK(iter->load_current_block_meta());
+  EXPECT_FALSE(iter->curr_block_max_score_valid_);
+  // Corruption is rejected even before the new metadata image has ever had its
+  // deferred bound evaluated. Header validation must stay ahead of lazy scoring.
+  ++header->version_;
+  score = -123.0;
+  can_calc = true;
+  EXPECT_EQ(OB_ERR_UNEXPECTED,
+      iter->get_range_max_score(ST_START, true, block_end, score, can_calc));
+  EXPECT_FALSE(can_calc);
+  EXPECT_DOUBLE_EQ(-123.0, score);
+  EXPECT_FALSE(iter->curr_block_max_score_valid_);
+  --header->version_;
+  double rebound = -1.0;
+  OK(iter->get_block_max_tuple(block_min, block_max, rebound));
+  EXPECT_DOUBLE_EQ(expected, rebound);
+  OK(iter->get_range_max_score(ST_START, true, block_end, score, can_calc));
+  ++header->version_;
+  score = -123.0;
+  can_calc = true;
+  EXPECT_EQ(OB_ERR_UNEXPECTED,
+      iter->get_range_max_score(ST_START, true, block_end, score, can_calc));
+  EXPECT_FALSE(can_calc);
+  EXPECT_DOUBLE_EQ(-123.0, score);
+  // The known-empty fast path must not bypass malformed header errors either.
+  score = -123.0;
+  can_calc = true;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, iter->get_range_max_score(0, true, 0, score, can_calc));
+  EXPECT_FALSE(can_calc);
+  EXPECT_DOUBLE_EQ(-123.0, score);
+  --header->version_;
+
+  const uint16_t saved_frontier_count = entries[meta_idx].frontier_count_;
+  entries[meta_idx].frontier_count_ = 0;
+  score = -123.0;
+  can_calc = true;
+  EXPECT_EQ(OB_SUCCESS, iter->get_range_max_score(ST_START, true, block_end, score, can_calc));
+  EXPECT_FALSE(can_calc);
+  EXPECT_DOUBLE_EQ(-123.0, score);
+  entries[meta_idx].frontier_count_ = saved_frontier_count;
+
+  const int64_t pin_generation = item.leaf_pin_generation_;
+  ++item.leaf_pin_generation_;
+  score = -123.0;
+  can_calc = true;
+  EXPECT_EQ(OB_ERR_UNEXPECTED,
+      iter->get_range_max_score(ST_START, true, block_end, score, can_calc));
+  EXPECT_FALSE(can_calc);
+  EXPECT_DOUBLE_EQ(-123.0, score);
+  item.leaf_pin_generation_ = pin_generation;
+  EXPECT_EQ(read_idx, iter->scanner_.data_read_idx_);
+  EXPECT_EQ(meta_idx, iter->scanner_.meta_row_scanner_.cur_idx_);
+  EXPECT_EQ(frontier, iter->frontier_min_id_);
+  item.index_info_.agg_row_buf_ = saved_agg;
+  item.index_info_.agg_buf_size_ = saved_size;
+  free_iter(iter);
+}
+
+
+TEST_F(TestInvSSTablePostingIter, typed_run_finished_matches_legacy_cursor_and_views)
+{
+  ObInvSSTable sstable;
+  build_single_term_sstable(true, 4096, ST_START, ST_STRIDE, ST_TERM_SEQ, sstable,
+      true /*hetero*/, true /*ascending*/, true /*force_micro_blocks*/,
+      true /*distinct_positions*/, 1024 /*forced_micro_rows*/);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  struct Case {
+    int64_t first;
+    uint64_t boundary;
+    int64_t capacity;
+    uint64_t scan_max;
+    bool from_current;
+    int64_t saved_calls;
+  };
+  const Case cases[] = {
+      {0, expect_doc(100), 1024, UINT64_MAX, false, 1},
+      {0, expect_doc(100), 101, UINT64_MAX, false, 1},
+      {0, expect_doc(100), 16, UINT64_MAX, false, 1},
+      {0, expect_doc(255), 1024, UINT64_MAX, false, 0},
+      {0, expect_doc(255) + 1, 1024, UINT64_MAX, false, 0},
+      {0, expect_doc(600), 1024, UINT64_MAX, false, 1},
+      {0, expect_doc(1023), 1024, UINT64_MAX, false, 0},
+      {0, UINT64_MAX, 1024, expect_doc(600), false, 1},
+      {200, expect_doc(600), 1024, UINT64_MAX, true, 1},
+      {0, UINT64_MAX, 1024, UINT64_MAX, false, 0},
+  };
+  for (const auto &test : cases) {
+    std::vector<uint64_t> reference_ids;
+    std::vector<uint64_t> reference_tfs;
+    std::vector<uint64_t> reference_dls;
+    uint64_t reference_next = 0;
+    bool reference_end = false;
+    int64_t reference_calls = 0;
+    int64_t reference_read_idx = 0;
+    int64_t reference_meta_idx = 0;
+    int64_t reference_row_idx = 0;
+    uint64_t reference_frontier = 0;
+    for (const bool terminal_status : {false, true}) {
+      SCOPED_TRACE(::testing::Message() << "boundary=" << test.boundary
+          << " capacity=" << test.capacity << " scan_max=" << test.scan_max
+          << " first=" << test.first << " status=" << terminal_status);
+      char term_buf[32] = {};
+      ObStorageDatum term_datum;
+      ObDatumRowkey query_key;
+      ObQueryFlag query_flag;
+      ObTabletID tablet_id(TABLET_ID);
+      ObInvPostingScanParam param;
+      ObInvSSTablePostingIter *iter = nullptr;
+      open_single_term_iter(sstable, read_info, term_buf, sizeof(term_buf), term_datum,
+          query_key, query_flag, tablet_id, param, iter, true, 0, test.scan_max);
+      if (test.from_current) {
+        uint64_t backing = 0;
+        ObDatum target;
+        make_doc_id_datum(backing, expect_doc(test.first), target);
+        OK(iter->advance_to_id(target));
+      }
+      std::vector<uint64_t> ids_out;
+      std::vector<uint64_t> tfs_out;
+      std::vector<uint64_t> dls_out;
+      bool first = true;
+      bool finished = false;
+      int64_t calls = 0;
+      while (!finished) {
+        ++calls;
+        ObPostingDocIdView ids;
+        ObPostingRelevanceView relevance;
+        int64_t count = -1;
+        if (terminal_status) {
+          OK(iter->drain_until_typed_run(test.boundary, test.capacity,
+              ids, relevance, count, finished, first && test.from_current));
+        } else if (first && test.from_current) {
+          OK(iter->drain_until_impl(test.boundary, test.capacity,
+              ids, relevance, count, true));
+          finished = 0 == count;
+        } else {
+          OK(iter->drain_until_typed(test.boundary, test.capacity, ids, relevance, count));
+          finished = 0 == count;
+        }
+        // Read every borrowed column even after positive-count terminal status.
+        // No call may switch the data pin until these views have been consumed.
+        for (int64_t i = 0; i < count; ++i) {
+          const int64_t expected_index = test.first + ids_out.size();
+          ASSERT_EQ(expect_doc(expected_index), ids.at(i));
+          ASSERT_EQ(1 + expected_index / DEFAULT_POSTING_BLOCK_CAPACITY, micro_tf_at(relevance, i));
+          ASSERT_EQ(hetero_dl(expected_index), micro_dl_at(relevance, i));
+          ids_out.push_back(ids.at(i));
+          tfs_out.push_back(micro_tf_at(relevance, i));
+          dls_out.push_back(micro_dl_at(relevance, i));
+        }
+        if (count == 0) { ASSERT_FALSE(ids.is_valid()); }
+        first = false;
+      }
+      const bool at_end = iter->is_end();
+      uint64_t next = 0;
+      if (!at_end) {
+        const ObDatum *id = nullptr;
+        OK(iter->get_cur_id(id));
+        next = id->get_uint64();
+        const int64_t next_index = test.first + ids_out.size();
+        ASSERT_EQ(expect_doc(next_index), next);
+        char expected_pos[9] = {};
+        snprintf(expected_pos, sizeof(expected_pos), "p%07ld", static_cast<long>(next_index));
+        const ObDatum *pos = nullptr;
+        OK(iter->get_cur_pos_list(pos));
+        ASSERT_EQ(8, pos->len_);
+        ASSERT_EQ(0, MEMCMP(expected_pos, pos->ptr_, 8));
+        int64_t tf = 0, dl = 0;
+        OK(iter->load_curr_bm25_param(tf, dl));
+        ASSERT_EQ(1 + next_index / DEFAULT_POSTING_BLOCK_CAPACITY, tf);
+        ASSERT_EQ(hetero_dl(next_index), static_cast<uint64_t>(dl));
+      }
+      if (!terminal_status) {
+        reference_ids = ids_out;
+        reference_tfs = tfs_out;
+        reference_dls = dls_out;
+        reference_next = next;
+        reference_end = at_end;
+        reference_calls = calls;
+        reference_read_idx = iter->scanner_.data_read_idx_;
+        reference_meta_idx = iter->scanner_.meta_row_scanner_.cur_idx_;
+        reference_row_idx = iter->curr_row_idx_;
+        reference_frontier = iter->frontier_min_id_;
+      } else {
+        EXPECT_EQ(reference_ids, ids_out);
+        EXPECT_EQ(reference_tfs, tfs_out);
+        EXPECT_EQ(reference_dls, dls_out);
+        EXPECT_EQ(reference_next, next);
+        EXPECT_EQ(reference_end, at_end);
+        EXPECT_EQ(reference_read_idx, iter->scanner_.data_read_idx_);
+        EXPECT_EQ(reference_meta_idx, iter->scanner_.meta_row_scanner_.cur_idx_);
+        EXPECT_EQ(reference_row_idx, iter->curr_row_idx_);
+        EXPECT_EQ(reference_frontier, iter->frontier_min_id_);
+        EXPECT_EQ(reference_calls - test.saved_calls, calls);
+      }
+      if (!at_end) {
+        // The next window must include, rather than skip, the cached lookahead.
+        ObPostingDocIdView ids;
+        ObPostingRelevanceView relevance;
+        int64_t count = 0;
+        bool next_finished = false;
+        OK(iter->drain_until_typed_run(next + 2 * ST_STRIDE, 16,
+            ids, relevance, count, next_finished, true /*include_current*/));
+        ASSERT_EQ(3, count);
+        ASSERT_EQ(next, ids.at(0));
+        ASSERT_EQ(next + 2 * ST_STRIDE, ids.at(2));
+        ASSERT_TRUE(next_finished);
+      }
+      free_iter(iter);
+    }
+  }
+}
+
+TEST_F(TestInvSSTablePostingIter, typed_run_finished_keeps_unknown_tail_error_timing)
+{
+  ObInvSSTable sstable;
+  build_single_term_sstable(false, 512, ST_START, ST_STRIDE, ST_TERM_SEQ, sstable,
+      false, false, true /*one logical block per physical micro*/);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  char term_buf[32] = {};
+  ObStorageDatum term_datum;
+  ObDatumRowkey query_key;
+  ObQueryFlag query_flag;
+  ObTabletID tablet_id(TABLET_ID);
+  ObInvPostingScanParam param;
+  ObInvSSTablePostingIter *iter = nullptr;
+  open_single_term_iter(sstable, read_info, term_buf, sizeof(term_buf), term_datum,
+      query_key, query_flag, tablet_id, param, iter);
+  OK(iter->scanner_.ensure_meta_lookahead(expect_doc(256)));
+  const int64_t read_idx = iter->scanner_.data_read_idx_;
+  const char *agg = nullptr;
+  int64_t size = 0;
+  uint64_t row_max = 0;
+  OK(iter->scanner_.get_prefetched_meta_row(1, agg, size, row_max));
+  std::vector<char> corrupt(agg, agg + size);
+  ++reinterpret_cast<ObInvIdxAggDataHeader *>(corrupt.data())->version_;
+  auto &item = iter->scanner_.data_ring_[
+      (read_idx + 1) % ObSSTablePostingScanner::DATA_RING_CAP];
+  item.index_info_.agg_row_buf_ = corrupt.data();
+  item.index_info_.agg_buf_size_ = corrupt.size();
+  ObPostingDocIdView ids;
+  ObPostingRelevanceView relevance;
+  int64_t count = 0;
+  bool finished = true;
+  OK(iter->drain_until_typed_run(expect_doc(255), 1024, ids, relevance, count, finished));
+  ASSERT_EQ(256, count);
+  ASSERT_FALSE(finished);
+  ASSERT_EQ(read_idx, iter->scanner_.data_read_idx_);
+  ASSERT_EQ(expect_doc(255), ids.at(255));
+  ASSERT_EQ(1u, micro_tf_at(relevance, 255));
+  EXPECT_EQ(OB_ERR_UNEXPECTED,
+      iter->drain_until_typed_run(expect_doc(255), 1024, ids, relevance, count, finished));
+  EXPECT_EQ(0, count);
+  EXPECT_FALSE(finished);
+  EXPECT_FALSE(ids.is_valid());
+  EXPECT_GT(iter->scanner_.data_read_idx_, read_idx);
+  // R12 integration: the failed deferred transition must discard the former
+  // metadata borrow as well as R11's returned views.
+  EXPECT_FALSE(iter->curr_meta_.is_valid());
+  EXPECT_FALSE(iter->curr_block_max_score_valid_);
+  uint64_t invalid_min = 0, invalid_max = 0;
+  double invalid_score = -1.0;
+  EXPECT_EQ(OB_ERR_UNEXPECTED,
+      iter->get_block_max_tuple(invalid_min, invalid_max, invalid_score));
+  item.index_info_.agg_row_buf_ = agg;
+  item.index_info_.agg_buf_size_ = size;
+  free_iter(iter);
+}
+
+
+TEST_F(TestInvSSTablePostingIter, typed_run_finished_uint64_tail_and_argument_protocol)
+{
+  const uint64_t start = UINT64_MAX - 699;
+  ObInvSSTable sstable;
+  build_single_term_sstable(false, 350, start, 2, ST_TERM_SEQ, sstable);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  char term_buf[32] = {};
+  ObStorageDatum term_datum;
+  ObDatumRowkey query_key;
+  ObQueryFlag query_flag;
+  ObTabletID tablet_id(TABLET_ID);
+  ObInvPostingScanParam param;
+  ObInvSSTablePostingIter *iter = nullptr;
+  open_single_term_iter(sstable, read_info, term_buf, sizeof(term_buf), term_datum,
+      query_key, query_flag, tablet_id, param, iter);
+  ObPostingDocIdView ids;
+  ObPostingRelevanceView relevance;
+  int64_t count = -1;
+  bool finished = true;
+  EXPECT_EQ(OB_INVALID_ARGUMENT,
+      iter->drain_until_typed_run(UINT64_MAX, 0, ids, relevance, count, finished));
+  ASSERT_FALSE(finished);
+  ASSERT_EQ(0, count);
+  ASSERT_FALSE(ids.is_valid());
+  const uint64_t boundary = start + 598;
+  OK(iter->drain_until_typed_run(boundary, 1024, ids, relevance, count, finished));
+  ASSERT_EQ(256, count);
+  ASSERT_FALSE(finished);
+  ASSERT_FALSE(ids.is_uint32());
+  ASSERT_EQ(start, ids.at(0));
+  ASSERT_EQ(start + 510, ids.at(255));
+  OK(iter->drain_until_typed_run(boundary, 1024, ids, relevance, count, finished));
+  ASSERT_EQ(44, count);
+  ASSERT_TRUE(finished);
+  ASSERT_FALSE(ids.is_uint32());
+  ASSERT_EQ(start + 512, ids.at(0));
+  ASSERT_EQ(boundary, ids.at(43));
+  const ObDatum *id = nullptr;
+  OK(iter->get_cur_id(id));
+  ASSERT_EQ(start + 600, id->get_uint64());
+  OK(iter->drain_until_typed_run(UINT64_MAX, 1024, ids, relevance, count,
+      finished, true /*include_current*/));
+  ASSERT_EQ(50, count);
+  ASSERT_FALSE(finished);
+  ASSERT_FALSE(iter->is_end());
+  ASSERT_EQ(start + 600, ids.at(0));
+  ASSERT_EQ(UINT64_MAX - 1, ids.at(49));
+  OK(iter->drain_until_typed_run(UINT64_MAX, 1024, ids, relevance, count, finished));
+  ASSERT_EQ(0, count);
+  ASSERT_TRUE(finished);
+  ASSERT_TRUE(iter->is_end());
+  free_iter(iter);
+}
+
+
+// Successive block drains defer block maxima; bound requests preserve the read cursor.
+TEST_F(TestInvSSTablePostingIter, lazy_current_block_bound_skips_drains_and_invalidates)
+{
+  ObInvSSTable sstable;
+  build_single_term_sstable(false, 3072, ST_START, ST_STRIDE, ST_TERM_SEQ, sstable,
+      false /*hetero*/, true /*ascending*/, true /*force_micro_blocks*/,
+      false /*distinct_positions*/, 1024 /*forced_micro_rows*/);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  char term_buf[32] = {0};
+  ObStorageDatum term_datum;
+  ObDatumRowkey query_key;
+  ObQueryFlag query_flag;
+  ObTabletID tablet_id(TABLET_ID);
+  ObInvPostingScanParam param;
+  ObInvSSTablePostingIter *iter = nullptr;
+  open_single_term_iter(sstable, read_info, term_buf, sizeof(term_buf), term_datum,
+      query_key, query_flag, tablet_id, param, iter);
+  ASSERT_FALSE(iter->curr_block_max_score_valid_);
+
+  ObPostingDocIdView ids;
+  ObPostingRelevanceView relevance;
+  int64_t count = 0;
+  int64_t total = 0;
+  int64_t batch_count = 0;
+  while (total < 768) {
+    OK(iter->drain_until_typed(expect_doc(767), 768 - total, ids, relevance, count));
+    ASSERT_GT(count, 0);
+    ASSERT_LE(count, MIN(768 - total, DEFAULT_POSTING_BLOCK_CAPACITY));
+    for (int64_t i = 0; i < count; ++i) {
+      ASSERT_EQ(expect_doc(total + i), ids.at(i));
+      ASSERT_EQ(1 + (total + i) / DEFAULT_POSTING_BLOCK_CAPACITY, micro_tf_at(relevance, i));
+      ASSERT_EQ(100u, micro_dl_at(relevance, i));
+    }
+    ASSERT_FALSE(iter->curr_block_max_score_valid_);
+    total += count;
+    ++batch_count;
+  }
+  ASSERT_EQ(768, total);
+  ASSERT_EQ(3, batch_count);
+  ASSERT_EQ(2, iter->curr_meta_.idx_);
+  ASSERT_EQ(DEFAULT_POSTING_BLOCK_CAPACITY - 1, iter->curr_row_idx_);
+  ASSERT_FALSE(iter->curr_block_max_score_valid_);
+
+  uint64_t block_min = 0;
+  uint64_t block_max = 0;
+  double actual = -1.0;
+  const double expected = reference_bm25_score(3, 100, iter->bm25_calc_params_);
+  const int64_t read_idx = iter->scanner_.data_read_idx_;
+  const int64_t meta_idx = iter->scanner_.meta_row_scanner_.cur_idx_;
+  const int64_t row_idx = iter->curr_row_idx_;
+  OK(iter->get_block_max_tuple(block_min, block_max, actual));
+  ASSERT_EQ(0, MEMCMP(&expected, &actual, sizeof(actual)));
+  ASSERT_TRUE(iter->curr_block_max_score_valid_);
+  OK(iter->get_block_max_tuple(block_min, block_max, actual));
+  bool can_calc = false;
+  OK(iter->get_range_max_score(expect_doc(767), true, expect_doc(767), actual, can_calc));
+  ASSERT_TRUE(can_calc);
+  ASSERT_EQ(0, MEMCMP(&expected, &actual, sizeof(actual)));
+  ASSERT_EQ(read_idx, iter->scanner_.data_read_idx_);
+  ASSERT_EQ(meta_idx, iter->scanner_.meta_row_scanner_.cur_idx_);
+  ASSERT_EQ(row_idx, iter->curr_row_idx_);
+
+  bool finished = true;
+  EXPECT_EQ(OB_INVALID_ARGUMENT, iter->drain_until_typed_run(
+      expect_doc(767), 0, ids, relevance, count, finished));
+  EXPECT_EQ(0, count);
+  EXPECT_FALSE(finished);
+  EXPECT_FALSE(ids.is_valid());
+  EXPECT_TRUE(iter->curr_block_max_score_valid_);
+  EXPECT_DOUBLE_EQ(expected, iter->curr_block_max_score_);
+  ObDatum invalid_target;
+  invalid_target.set_null();
+  EXPECT_EQ(OB_INVALID_ARGUMENT, iter->advance_to(invalid_target));
+  EXPECT_TRUE(iter->curr_block_max_score_valid_);
+
+  // An exact seek into the next logical block discards the old result but does
+  // not calculate a replacement. Crossing a physical micro via shallow seek
+  // also leaves scoring deferred and posting data unloaded.
+  uint64_t target_storage = 0;
+  ObDatum target;
+  make_doc_id_datum(target_storage, expect_doc(768), target);
+  OK(iter->advance_to_id(target));
+  ASSERT_FALSE(iter->curr_block_max_score_valid_);
+  make_doc_id_datum(target_storage, expect_doc(1024), target);
+  OK(iter->advance_shallow(target, true));
+  ASSERT_TRUE(iter->in_shallow_status());
+  ASSERT_FALSE(iter->curr_block_loaded_);
+  ASSERT_FALSE(iter->curr_block_max_score_valid_);
+  ASSERT_GT(iter->scanner_.data_read_idx_, read_idx);
+  const int64_t shallow_read_idx = iter->scanner_.data_read_idx_;
+  const int64_t shallow_meta_idx = iter->scanner_.meta_row_scanner_.cur_idx_;
+  const bool need_load = iter->need_load_micro_block_;
+  const double shallow_expected = reference_bm25_score(5, 100, iter->bm25_calc_params_);
+  OK(iter->get_block_max_tuple(block_min, block_max, actual));
+  ASSERT_EQ(0, MEMCMP(&shallow_expected, &actual, sizeof(actual)));
+  EXPECT_EQ(OB_ERR_UNEXPECTED, iter->next());
+  EXPECT_TRUE(iter->curr_block_max_score_valid_);
+  EXPECT_DOUBLE_EQ(shallow_expected, iter->curr_block_max_score_);
+  ASSERT_EQ(shallow_read_idx, iter->scanner_.data_read_idx_);
+  ASSERT_EQ(shallow_meta_idx, iter->scanner_.meta_row_scanner_.cur_idx_);
+  ASSERT_EQ(need_load, iter->need_load_micro_block_);
+  ASSERT_FALSE(iter->curr_block_loaded_);
+
+  iter->reset();
+  param.avg_doc_length_ = 200.0;
+  OK(iter->open(param, read_info, sstable));
+  ASSERT_FALSE(iter->curr_block_max_score_valid_);
+  const double reopened_expected = reference_bm25_score(1, 100, iter->bm25_calc_params_);
+  OK(iter->get_block_max_tuple(block_min, block_max, actual));
+  ASSERT_EQ(0, MEMCMP(&reopened_expected, &actual, sizeof(actual)));
+  ASSERT_NE(shallow_expected, actual);
+
+  // White-box rebind with equal max_id must invalidate, and a legal zero bound
+  // must be memoized rather than treated as an invalid-cache sentinel.
+  OK(sql::ObExprBM25::init_precomputed_params(0.0, 200.0, 1.0, iter->bm25_calc_params_));
+  const ObPostingBlockMeta same_meta = iter->curr_meta_;
+  iter->assign_current_block_meta(same_meta);
+  ASSERT_FALSE(iter->curr_block_max_score_valid_);
+  OK(iter->get_block_max_tuple(block_min, block_max, actual));
+  ASSERT_EQ(0.0, actual);
+  ASSERT_TRUE(iter->curr_block_max_score_valid_);
+  OK(iter->get_block_max_tuple(block_min, block_max, actual));
+
+  // Rejected targets leave the current metadata and its cached bound intact.
+  make_doc_id_datum(target_storage, UINT64_MAX, target);
+  ASSERT_EQ(OB_INVALID_ARGUMENT, iter->advance_shallow(target, true));
+  ASSERT_TRUE(iter->curr_meta_.is_valid());
+  ASSERT_TRUE(iter->curr_block_max_score_valid_);
+  OK(iter->get_block_max_tuple(block_min, block_max, actual));
+  ASSERT_EQ(0.0, actual);
+  make_doc_id_datum(target_storage, expect_doc(3072), target);
+  ASSERT_EQ(OB_ITER_END, iter->advance_to_id(target));
+  ASSERT_FALSE(iter->curr_block_max_score_valid_);
+  ASSERT_EQ(OB_ITER_END, iter->get_block_max_tuple(block_min, block_max, actual));
+  free_iter(iter);
+}
+
+
+// A failed scanner move can release the previous metadata pin before validating
+// the next row. No deferred bound request may dereference that old frontier.
+TEST_F(TestInvSSTablePostingIter, lazy_current_block_bound_failed_cursor_discards_borrow)
+{
+  ObInvSSTable sstable;
+  build_single_term_sstable(false, 3072, ST_START, ST_STRIDE, ST_TERM_SEQ, sstable,
+      false /*hetero*/, true /*ascending*/, true /*force_micro_blocks*/,
+      false /*distinct_positions*/, 1024 /*forced_micro_rows*/);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  for (int mode = 0; mode < 3; ++mode) {
+    char term_buf[32] = {0};
+    ObStorageDatum term_datum;
+    ObDatumRowkey query_key;
+    ObQueryFlag query_flag;
+    ObTabletID tablet_id(TABLET_ID);
+    ObInvPostingScanParam param;
+    ObInvSSTablePostingIter *iter = nullptr;
+    open_single_term_iter(sstable, read_info, term_buf, sizeof(term_buf), term_datum,
+        query_key, query_flag, tablet_id, param, iter);
+    uint64_t target_storage = 0;
+    ObDatum target;
+    make_doc_id_datum(target_storage, expect_doc(1023), target);
+    OK(iter->advance_shallow(target, true));
+    ASSERT_EQ(expect_doc(1023), iter->curr_meta_.max_id_);
+    uint64_t cached_min = 0;
+    uint64_t cached_max = 0;
+    double cached_score = 0.0;
+    OK(iter->get_block_max_tuple(cached_min, cached_max, cached_score));
+    ASSERT_TRUE(iter->curr_block_max_score_valid_);
+    OK(iter->scanner_.ensure_meta_lookahead(expect_doc(1024)));
+    const int64_t old_read_idx = iter->scanner_.data_read_idx_;
+    const char *next_agg = nullptr;
+    int64_t next_size = 0;
+    uint64_t next_row_max = 0;
+    OK(iter->scanner_.get_prefetched_meta_row(1, next_agg, next_size, next_row_max));
+    std::vector<char> corrupt(next_agg, next_agg + next_size);
+    ++reinterpret_cast<ObInvIdxAggDataHeader *>(corrupt.data())->version_;
+    auto &next_item = iter->scanner_.data_ring_[
+        (old_read_idx + 1) % ObSSTablePostingScanner::DATA_RING_CAP];
+    next_item.index_info_.agg_row_buf_ = corrupt.data();
+    next_item.index_info_.agg_buf_size_ = corrupt.size();
+    make_doc_id_datum(target_storage, expect_doc(1024), target);
+    const int result = 0 == mode ? iter->advance_to_id(target)
+        : (1 == mode ? iter->advance_shallow(target, true) : iter->move_to_next_block());
+    EXPECT_EQ(OB_ERR_UNEXPECTED, result) << mode;
+    EXPECT_GT(iter->scanner_.data_read_idx_, old_read_idx) << mode;
+    EXPECT_FALSE(iter->curr_meta_.is_valid()) << mode;
+    EXPECT_FALSE(iter->curr_block_max_score_valid_) << mode;
+    uint64_t min_id = 1;
+    uint64_t max_id = 1;
+    double score = -1.0;
+    EXPECT_EQ(OB_ERR_UNEXPECTED, iter->get_block_max_tuple(min_id, max_id, score)) << mode;
+    next_item.index_info_.agg_row_buf_ = next_agg;
+    next_item.index_info_.agg_buf_size_ = next_size;
+    free_iter(iter);
+  }
 }
 
 } // namespace unittest

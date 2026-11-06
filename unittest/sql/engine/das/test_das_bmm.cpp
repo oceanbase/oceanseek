@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX SQL_DAS
 
 #include <gtest/gtest.h>
+#include <memory>
 #define private public
 #define protected public
 #include "share/rc/ob_tenant_base.h"
@@ -35,27 +36,6 @@ using namespace oceanbase::sql::test;
 
 namespace
 {
-
-template <typename ScoreAt>
-struct TestBatchScorer
-{
-  const ScoreAt &score_at_;
-
-  double operator()(const int64_t i) const
-  {
-    return score_at_(i);
-  }
-
-  void eval_batch(
-      const int64_t start,
-      const int64_t batch_count,
-      double *scores) const
-  {
-    for (int64_t i = 0; i < batch_count; ++i) {
-      scores[i] = score_at_(start + i);
-    }
-  }
-};
 
 struct MockBMMTokenOpParam : public ObIDASSearchOpParam
 {
@@ -698,6 +678,47 @@ private:
   bool saw_score_buffer_;
 };
 
+struct BitmapTransposeRun
+{
+  std::vector<std::pair<uint64_t, uint64_t>> rows_;
+  uint64_t checksum_ = 1469598103934665603ULL;
+  int terminal_ret_ = OB_SUCCESS;
+  int64_t filter_next_ = 0;
+  int64_t filter_advance_ = 0;
+  int64_t filter_drain_ = 0;
+  int64_t posting_seeks_ = 0;
+  int64_t score_loads_ = 0;
+};
+
+class CountingTransposeBitmap : public ObDASBitmapOp
+{
+public:
+  explicit CountingTransposeBitmap(ObDASSearchCtx &ctx) : ObDASBitmapOp(ctx) {}
+  int64_t next_count_ = 0;
+  int64_t advance_count_ = 0;
+  int64_t drain_count_ = 0;
+  int drain_error_ = OB_SUCCESS;
+private:
+  int do_next_rowid(ObDASRowID &id, double &score) override
+  {
+    ++next_count_;
+    return ObDASBitmapOp::do_next_rowid(id, score);
+  }
+  int do_advance_to(const ObDASRowID &target, ObDASRowID &id, double &score) override
+  {
+    ++advance_count_;
+    return ObDASBitmapOp::do_advance_to(target, id, score);
+  }
+  int do_drain_until(const ObDASRowID &boundary, int64_t capacity,
+      uint64_t *ids, double *scores, int64_t &count,
+      ObDASRowID &next, double &next_score) override
+  {
+    ++drain_count_;
+    return OB_SUCCESS != drain_error_ ? drain_error_
+        : ObDASBitmapOp::do_drain_until(boundary, capacity, ids, scores, count, next, next_score);
+  }
+};
+
 class TestDASBMM : public ::testing::Test
 {
 public:
@@ -825,6 +846,126 @@ public:
       }
     }
     return ret;
+  }
+
+  void run_bitmap_transpose_case(const bool batched, const int shape, const int dim_count,
+      const int64_t capacity, const bool feedback, const bool external_advance,
+      const int sweeps, const bool capture, BitmapTransposeRun &result,
+      const int drain_error = OB_SUCCESS)
+  {
+    const uint64_t universe = 32768;
+    std::vector<uint64_t> filters;
+    const uint64_t filter_step = shape % 3 == 0 ? 1 : shape % 3 == 1 ? 97 : 997;
+    if (shape != 11) {
+      for (uint64_t id = shape % 7; id < universe; id += filter_step) {
+        filters.push_back(id);
+      }
+    }
+    ObFastBitmap bitmap(allocator_);
+    ASSERT_EQ(OB_SUCCESS, bitmap.init(universe));
+    if (!filters.empty()) {
+      ASSERT_EQ(OB_SUCCESS, bitmap.add_batch(filters.data(), filters.size()));
+    }
+    bitmap.finalize();
+    ObDASFilterBitmapProvider provider(search_ctx_, nullptr,
+        DAS_FILTER_BITMAP_QUERY_SCOPE, DAS_FILTER_BITMAP_QUERY_SCOPE_SLOT, nullptr, 0);
+    ASSERT_EQ(OB_SUCCESS, provider.set_external_bitmap(&bitmap));
+    CountingTransposeBitmap view(search_ctx_);
+    ObDASBitmapOpParam view_param(&provider);
+    view_param.set_is_scoring(false);
+    ASSERT_EQ(OB_SUCCESS, view.init(view_param));
+    view.drain_error_ = drain_error;
+    std::vector<std::vector<MockBMMPosting>> postings(dim_count);
+    std::vector<std::unique_ptr<MockBMMTokenOp>> tokens;
+    ObSEArray<ObIDASSearchOp *, 16> score_ops;
+    MockBMMTokenOpParam score_param;
+    score_param.set_is_scoring(true);
+    for (int d = 0; d < dim_count; ++d) {
+      ObBM25PrecomputedParams params;
+      ASSERT_EQ(OB_SUCCESS, ObExprBM25::init_precomputed_params(0.15 + d * 0.371, 73.25, 1.0, params));
+      const uint64_t stride = shape < 6 ? 3 + d * 2 : 211 + d * 193;
+      double max_score = 0.0;
+      if (shape != 10 || d % 2 == 0) {
+        for (uint64_t id = (d * 19 + shape) % stride; id < universe; id += stride) {
+          const double score = shape == 9 ? 0.0 : ObExprBM25::eval_with_precomputed_params(
+              1 + (id * 17 + d) % 23, 1 + (id * 37 + d * 53) % 4093, params);
+          max_score = std::max(max_score, score);
+          const uint64_t block_end = shape % 2 == 0 ? universe - 1 : (id / 257 + 1) * 257 - 1;
+          postings[d].push_back(MockBMMPosting(id, score, block_end, 0.0));
+        }
+      }
+      for (auto &posting : postings[d]) {
+        posting.block_max_score_ = max_score;
+      }
+      tokens.emplace_back(new MockBMMTokenOp(search_ctx_, postings[d].data(), postings[d].size(), max_score));
+      ASSERT_EQ(OB_SUCCESS, tokens.back()->init(score_param));
+      tokens.back()->enable_advance_to_id();
+      ASSERT_EQ(OB_SUCCESS, score_ops.push_back(tokens.back().get()));
+    }
+    ObDASBMMOp bmm(search_ctx_);
+    ASSERT_EQ(OB_SUCCESS, init_bmm_with_costs(bmm, score_ops, &view, 1000000, 100, false, filters.size()));
+    ASSERT_EQ(OB_SUCCESS, bmm.open());
+    ASSERT_EQ(ObDASBMMOp::FilterMergeMode::SPARSE_SEEK, bmm.filter_merge_mode_);
+    bmm.sparse_candidate_buffer_.reset();
+    ASSERT_EQ(OB_SUCCESS, bmm.sparse_candidate_buffer_.init(capacity, allocator_));
+    // Exercise the collector outside the production density guard to stress EOF,
+    // arbitrary batch capacity and external advances; guard coverage is separate.
+    bmm.enable_filter_essential_batch_ = batched;
+    for (int sweep = 0; sweep < sweeps; ++sweep) {
+      if (sweep > 0) {
+        ASSERT_EQ(OB_SUCCESS, bmm.rescan());
+      }
+      std::vector<double> heap;
+      ObDASRowID id;
+      double score = 0.0;
+      int ret = bmm.next_rowid(id, score);
+      int64_t outputs = 0;
+      while (OB_SUCCESS == ret) {
+        uint64_t bits = 0;
+        MEMCPY(&bits, &score, sizeof(bits));
+        if (capture) result.rows_.emplace_back(id.get_uint64(), bits);
+        result.checksum_ = (result.checksum_ ^ id.get_uint64()) * 1099511628211ULL;
+        result.checksum_ = (result.checksum_ ^ bits) * 1099511628211ULL;
+        ASSERT_LE(++outputs, static_cast<int64_t>(filters.size()));
+        if (external_advance && outputs % 7 == 0) {
+          ObDASRowID same;
+          double same_score = 0.0;
+          uint64_t same_bits = 0;
+          ASSERT_EQ(OB_SUCCESS, bmm.advance_to(id, same, same_score));
+          MEMCPY(&same_bits, &same_score, sizeof(same_bits));
+          ASSERT_EQ(id.get_uint64(), same.get_uint64());
+          ASSERT_EQ(bits, same_bits);
+        }
+        if (feedback) {
+          if (heap.size() < 10) {
+            heap.push_back(score);
+            std::push_heap(heap.begin(), heap.end(), std::greater<double>());
+          } else if (score > heap.front()) {
+            std::pop_heap(heap.begin(), heap.end(), std::greater<double>());
+            heap.back() = score;
+            std::push_heap(heap.begin(), heap.end(), std::greater<double>());
+          }
+          if (heap.size() == 10) ASSERT_EQ(OB_SUCCESS, bmm.set_min_competitive_score(heap.front()));
+        }
+        if (external_advance && outputs % 11 == 0) {
+          ObDASRowID target;
+          target.set_uint64(id.get_uint64() + 5);
+          ret = bmm.advance_to(target, id, score);
+        } else {
+          ret = bmm.next_rowid(id, score);
+        }
+      }
+      result.terminal_ret_ = ret;
+      if (OB_ITER_END != ret) break;
+    }
+    result.filter_next_ = view.next_count_;
+    result.filter_advance_ = view.advance_count_;
+    result.filter_drain_ = view.drain_count_;
+    for (const auto &token : tokens) {
+      result.posting_seeks_ += token->get_advance_to_id_count();
+      result.score_loads_ += token->get_load_curr_score_count();
+    }
+    ASSERT_EQ(OB_SUCCESS, bmm.close());
   }
 
   void SetUp() override
@@ -1630,7 +1771,9 @@ TEST_F(TestDASBMM, dense_filter_strategy_uses_filter_cost_ratio)
   ASSERT_EQ(OB_SUCCESS,
       init_bmm_with_costs(very_dense_filter_bmm, score_ops, &filter_op, 1024, 11, false, 512));
   EXPECT_TRUE(very_dense_filter_bmm.filter_after_score_);
-  EXPECT_FALSE(very_dense_filter_bmm.use_active_candidate_probe_);
+  EXPECT_TRUE(very_dense_filter_bmm.use_active_candidate_probe_);
+  ASSERT_EQ(OB_SUCCESS, very_dense_filter_bmm.rescan());
+  EXPECT_TRUE(very_dense_filter_bmm.use_active_candidate_probe_);
   EXPECT_EQ(OB_SUCCESS, very_dense_filter_bmm.close());
 
   ObDASBMMOp invalid_cost_bmm(search_ctx_);
@@ -1673,24 +1816,33 @@ TEST_F(TestDASBMM, direct_build_decision_survives_cost_changes)
     int64_t table_row_count_;
     int64_t lead_cost_;
     int64_t filter_cost_;
+    bool filter_after_score_;
   };
   const CostCase cases[] = {
-    {1000, 20, 1},
-    {1000, 10, 1},
-    {1000, 20, 900},
-    {10000, 20, 1},
-    {16, 20, 1},
+    {1000, 20, 1, false},
+    {1000, 10, 1, false},
+    {1000, 20, 900, false},
+    {10000, 20, 1, false},
+    {16, 20, 1, false},
+    {1000, 20, 1, true},
+    {1000, 10, 1, true},
+    {1000, 20, 900, true},
+    {10000, 20, 1, true},
+    {16, 20, 1, true},
   };
   const uint64_t score_ids[] = {5, 6, 7};
   const double score_values[] = {4.0, 3.0, 2.0};
   for (const CostCase &test_case : cases) {
     SCOPED_TRACE(::testing::Message() << "rows=" << test_case.table_row_count_
-        << " lead=" << test_case.lead_cost_ << " filter=" << test_case.filter_cost_);
+        << " lead=" << test_case.lead_cost_ << " filter=" << test_case.filter_cost_
+        << " after_score=" << test_case.filter_after_score_);
     search_ctx_.table_row_count_ = ObDASSearchCost(1000);
     ObDASBMMBuildOptions options(false);
     ObDASBMMOp::select_filter_build_options(search_ctx_, ObDASSearchCost(20),
-        ObDASSearchCost(1), false, true, options);
-    ASSERT_EQ(ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN, options.filter_mode_);
+        ObDASSearchCost(test_case.filter_after_score_ ? 62 : 1), false, true, options);
+    ASSERT_EQ(test_case.filter_after_score_
+        ? ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN_AFTER_ESSENTIAL
+        : ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN, options.filter_mode_);
 
     MockBMMTokenOpParam op_param;
     MockBMMPostingOp score_op(
@@ -1716,7 +1868,7 @@ TEST_F(TestDASBMM, direct_build_decision_survives_cost_changes)
         ASSERT_EQ(OB_SUCCESS, bmm.rescan());
       }
       EXPECT_EQ(ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, bmm.filter_merge_mode_);
-      EXPECT_FALSE(bmm.filter_after_score_);
+      EXPECT_EQ(test_case.filter_after_score_, bmm.filter_after_score_);
       ObDASRowID rowid;
       double score = 0.0;
       ASSERT_EQ(OB_SUCCESS, bmm.next_rowid(rowid, score));
@@ -1743,8 +1895,8 @@ TEST_F(TestDASBMM, direct_capability_preserves_filter_strategy_and_results)
   };
   const StrategyCase cases[] = {
     {20, 61, false, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, false, true},
-    {20, 62, false, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, true, false},
-    {20, 900, false, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, true, false},
+    {20, 62, false, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, true, true},
+    {20, 900, false, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, true, true},
     {10, 61, false, ObDASBMMOp::FilterMergeMode::SPARSE_SEEK, false, false},
     {10, 900, false, ObDASBMMOp::FilterMergeMode::SPARSE_SEEK, false, false},
     {20, 61, true, ObDASBMMOp::FilterMergeMode::DENSE_WINDOW, false, false},
@@ -1765,8 +1917,11 @@ TEST_F(TestDASBMM, direct_capability_preserves_filter_strategy_and_results)
       ObDASBMMOp::select_filter_build_options(search_ctx_,
           ObDASSearchCost(test_case.lead_cost_), ObDASSearchCost(test_case.filter_cost_),
           test_case.query_optional_, 0 != capability, options);
-      EXPECT_EQ(use_direct ? ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN
-          : ObDASBMMBuildOptions::FilterMode::ORDERED, options.filter_mode_);
+      const auto expected_filter_mode = !use_direct ? ObDASBMMBuildOptions::FilterMode::ORDERED
+          : (test_case.filter_after_score_
+              ? ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN_AFTER_ESSENTIAL
+              : ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN);
+      EXPECT_EQ(expected_filter_mode, options.filter_mode_);
       MockBMMTokenOpParam op_param;
       MockBMMPostingOp token(search_ctx_, score_ids, score_values, ARRAYSIZEOF(score_ids));
       MockBMMPostingOp ordered_filter(search_ctx_, filter_ids, filter_scores, 1);
@@ -1804,6 +1959,89 @@ TEST_F(TestDASBMM, direct_capability_preserves_filter_strategy_and_results)
       EXPECT_EQ(use_direct, direct_filter.get_drain_count() > 0);
       ASSERT_EQ(OB_SUCCESS, bmm.close());
     }
+  }
+}
+
+TEST_F(TestDASBMM, compact_probe_keeps_64_limit_without_dense_filter_veto)
+{
+  BMMVectorizedMergeConfigGuard config_guard;
+  ASSERT_TRUE(config_guard.is_valid());
+  const MockBMMPosting low_postings[] = {
+      {10, 2.0, 20000, 2.0}, {12, 2.0, 20000, 2.0},
+      {20010, 2.0, 40000, 2.0}, {20012, 2.0, 40000, 2.0}};
+  const MockBMMPosting high_postings[] = {
+      {10, 3.0, 20000, 3.0}, {30, 3.0, 20000, 3.0},
+      {20010, 3.0, 40000, 3.0}, {20030, 3.0, 40000, 3.0}};
+  struct Case { int64_t count_; int64_t filter_cost_; int64_t posting_cost_; bool high_probe_; };
+  const Case cases[] = {{64, -1, 127, false}, {64, -1, 128, true}, {65, -1, 128, false},
+      {128, -1, 128, false}, {64, 128, 128, true}, {65, 128, 128, false},
+      {64, 256, 128, true}, {64, 257, 128, true}, {65, 257, 128, false},
+      {64, 512, 128, true}, {65, 512, 128, false},
+      {2048, 512, 128, false}, {2049, 512, 128, false}};
+  for (const Case &c : cases) {
+    SCOPED_TRACE(::testing::Message() << c.count_ << " filter=" << c.filter_cost_
+        << " posting=" << c.posting_cost_);
+    MockBMMTokenOpParam param;
+    param.set_is_scoring(true);
+    MockBMMTokenOp low(search_ctx_, low_postings, ARRAYSIZEOF(low_postings), 2.0);
+    MockBMMTokenOp high(search_ctx_, high_postings, ARRAYSIZEOF(high_postings), 3.0);
+    MockBMMTokenOp filter(search_ctx_, 10, 20000, 0.0, 0.0);
+    low.enable_advance_to_id();
+    high.enable_advance_to_id();
+    ASSERT_EQ(OB_SUCCESS, low.init(param));
+    ASSERT_EQ(OB_SUCCESS, high.init(param));
+    ASSERT_EQ(OB_SUCCESS, filter.init(param));
+    ObSEArray<ObIDASSearchOp *, 2> ops;
+    ASSERT_EQ(OB_SUCCESS, ops.push_back(&low));
+    ASSERT_EQ(OB_SUCCESS, ops.push_back(&high));
+    ObDASBMMOp bmm(search_ctx_);
+    ASSERT_EQ(OB_SUCCESS, init_bmm_with_costs(bmm, ops, c.filter_cost_ < 0 ? nullptr : &filter,
+        1024, 11, false, c.filter_cost_));
+    bmm.score_op_costs_.at(0) = ObDASSearchCost(c.posting_cost_);
+    bmm.score_op_costs_.at(1) = ObDASSearchCost(c.posting_cost_);
+    EXPECT_EQ(0, bmm.sparse_candidate_buffer_.get_capacity());
+    ASSERT_EQ(OB_SUCCESS, bmm.open());
+    for (int64_t scan = 0; scan < 2; ++scan) {
+      if (scan > 0) {
+        ASSERT_EQ(OB_SUCCESS, bmm.rescan());
+      }
+      for (int64_t batch = 0; batch < 2; ++batch) {
+        const uint64_t start_id = 10 + batch * 20000;
+        ASSERT_EQ(OB_SUCCESS, bmm.sort_iters_by_max_score());
+        bmm.vec_non_essential_dim_count_ = 2;
+        bmm.vec_sorted_iter_idxes_.at(0) = 0;
+        bmm.vec_sorted_iter_idxes_.at(1) = 1;
+        bmm.non_ess_block_max_score_suffix_sums_.at(0) = 5.0;
+        bmm.non_ess_block_max_score_suffix_sums_.at(1) = 3.0;
+        bmm.min_competitive_score_ = 7.0;
+        uint64_t end = 0;
+        ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.reuse_with_start_id(start_id, end));
+        for (int64_t i = 0; i < c.count_; ++i) {
+          ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.add_dim(start_id + i * 2, 5.0));
+        }
+        ObDASRowID boundary;
+        boundary.set_uint64(end);
+        const int64_t high_probes = high.get_advance_to_id_count();
+        const int64_t low_probes = low.get_advance_to_id_count();
+        bool valid = false;
+        ASSERT_EQ(OB_SUCCESS, bmm.evaluate_non_essential_batch(boundary, valid));
+        EXPECT_TRUE(valid);
+        EXPECT_EQ(c.high_probe_, high.get_advance_to_id_count() > high_probes);
+        // Pruning to two IDs enables the next dimension even with a 50% filter.
+        EXPECT_EQ(c.filter_cost_ >= 0 || c.posting_cost_ >= 128,
+            low.get_advance_to_id_count() > low_probes);
+        EXPECT_EQ(2, bmm.doc_score_accumulator_.get_active_count());
+        double score = 0.0;
+        ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.get_score(start_id, score));
+        EXPECT_DOUBLE_EQ(10.0, score);
+        ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.get_score(start_id + 20, score));
+        EXPECT_DOUBLE_EQ(8.0, score);
+        EXPECT_DOUBLE_EQ(10.0, bmm.doc_score_accumulator_.get_max_score());
+        EXPECT_FALSE(bmm.sparse_candidate_buffer_.has_unconsumed());
+        EXPECT_EQ(0, bmm.sparse_candidate_buffer_.get_capacity());
+      }
+    }
+    ASSERT_EQ(OB_SUCCESS, bmm.close());
   }
 }
 
@@ -1876,7 +2114,7 @@ TEST_F(TestDASBMM, no_filter_non_essential_probe_requires_dense_posting_cost)
   }
 }
 
-TEST_F(TestDASBMM, sparse_active_candidates_seek_and_score_exact_hits)
+TEST_F(TestDASBMM, compact_candidates_skip_posting_gaps_and_score_exact_hits)
 {
   BMMVectorizedMergeConfigGuard config_guard;
   ASSERT_TRUE(config_guard.is_valid());
@@ -1902,7 +2140,11 @@ TEST_F(TestDASBMM, sparse_active_candidates_seek_and_score_exact_hits)
   for (const uint64_t doc_id : {10ULL, 11ULL, 12ULL, 25ULL, 40ULL}) {
     ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.add_dim(doc_id, 5.0));
   }
-  ASSERT_EQ(OB_SUCCESS, bmm.score_active_candidates(*bmm.merge_iters_.at(0)));
+  uint64_t doc_ids[5];
+  int64_t count = 0;
+  ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.collect_active_doc_ids(
+      doc_ids, ARRAYSIZEOF(doc_ids), count));
+  ASSERT_EQ(OB_SUCCESS, bmm.score_compact_candidates(*bmm.merge_iters_.at(0), doc_ids, count, false));
 
   double score = 0.0;
   ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.get_score(10, score));
@@ -1915,53 +2157,174 @@ TEST_F(TestDASBMM, sparse_active_candidates_seek_and_score_exact_hits)
   EXPECT_DOUBLE_EQ(5.0, score);
   ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.get_score(40, score));
   EXPECT_DOUBLE_EQ(5.0, score);
-  EXPECT_EQ(5, token.get_advance_to_id_count());
+  EXPECT_EQ(4, token.get_advance_to_id_count());
   EXPECT_EQ(2, token.get_load_curr_score_count());
   EXPECT_TRUE(bmm.merge_iters_.at(0)->iter_end());
   EXPECT_EQ(OB_SUCCESS, bmm.close());
 }
 
-TEST_F(TestDASBMM, candidate_filter_retains_only_scored_intersections)
+TEST_F(TestDASBMM, single_essential_compact_probe_skips_posting_gaps)
 {
   BMMVectorizedMergeConfigGuard config_guard;
   ASSERT_TRUE(config_guard.is_valid());
-  const uint64_t filter_ids[] = {10, 12, 15, 18};
+  for (const bool include_hit : {false, true}) {
+    SCOPED_TRACE(include_hit);
+    MockBMMTokenOpParam param;
+    param.set_is_scoring(true);
+    MockBMMTokenOp token(search_ctx_, 1000, 1001, 1.0, 1.0);
+    token.enable_advance_to_id();
+    ASSERT_EQ(OB_SUCCESS, token.init(param));
+    ObSEArray<ObIDASSearchOp *, 1> ops;
+    ASSERT_EQ(OB_SUCCESS, ops.push_back(&token));
+    ObDASBMMOp bmm(search_ctx_);
+    ASSERT_EQ(OB_SUCCESS, init_bmm_with_costs(bmm, ops, nullptr, 1024, 11));
+    bmm.score_op_costs_.at(0) = ObDASSearchCost(128);
+    ASSERT_EQ(OB_SUCCESS, bmm.open());
+    ASSERT_EQ(OB_SUCCESS, bmm.sort_iters_by_max_score());
+    ASSERT_TRUE(bmm.score_op_probe_allowed_.at(0));
+    bmm.vec_non_essential_dim_count_ = 1;
+    bmm.vec_sorted_iter_idxes_.at(0) = 0;
+    bmm.non_ess_block_max_score_suffix_sums_.at(0) = 1.0;
+    bmm.single_essential_score_cutoffs_.at(0) = 0.0;
+    ASSERT_EQ(OB_SUCCESS, bmm.sparse_candidate_buffer_.init(8, allocator_));
+    for (uint64_t id = 10; id < 15; ++id) {
+      ASSERT_EQ(OB_SUCCESS, bmm.sparse_candidate_buffer_.append(id, 5.0));
+    }
+    if (include_hit) {
+      ASSERT_EQ(OB_SUCCESS, bmm.sparse_candidate_buffer_.append(1000, 5.0));
+      ASSERT_EQ(OB_SUCCESS, bmm.sparse_candidate_buffer_.append(1001, 5.0));
+    }
+    const int64_t probes = token.get_advance_to_id_count();
+    const int64_t loads = token.get_load_curr_score_count();
+    ASSERT_EQ(OB_SUCCESS, bmm.score_sparse_candidates(true));
+    EXPECT_EQ(include_hit ? 2 : 1, token.get_advance_to_id_count() - probes);
+    EXPECT_EQ(include_hit ? 1 : 0, token.get_load_curr_score_count() - loads);
+    EXPECT_EQ(include_hit, bmm.merge_iters_.at(0)->iter_end());
+    uint64_t id = 0;
+    double score = 0.0;
+    for (uint64_t expected = 10; expected < 15; ++expected) {
+      ASSERT_EQ(OB_SUCCESS, bmm.sparse_candidate_buffer_.next(0.0, id, score));
+      EXPECT_EQ(expected, id);
+      EXPECT_DOUBLE_EQ(5.0, score);
+    }
+    if (include_hit) {
+      ASSERT_EQ(OB_SUCCESS, bmm.sparse_candidate_buffer_.next(0.0, id, score));
+      EXPECT_EQ(1000u, id);
+      EXPECT_DOUBLE_EQ(6.0, score);
+      ASSERT_EQ(OB_SUCCESS, bmm.sparse_candidate_buffer_.next(0.0, id, score));
+      EXPECT_EQ(1001u, id);
+      EXPECT_DOUBLE_EQ(5.0, score);
+    }
+    EXPECT_EQ(OB_ITER_END, bmm.sparse_candidate_buffer_.next(0.0, id, score));
+    EXPECT_EQ(OB_SUCCESS, bmm.close());
+  }
+}
+
+// Both stages intersect candidate presence. Only final filtering checks the score threshold.
+TEST_F(TestDASBMM, candidate_filter_preserves_intersections_at_each_stage)
+{
+  BMMVectorizedMergeConfigGuard config_guard;
+  ASSERT_TRUE(config_guard.is_valid());
+  const uint64_t filter_ids[] = {10, 12, 15, 30};
   const double filter_scores[] = {0.0, 0.0, 0.0, 0.0};
-  MockBMMTokenOpParam score_param;
-  MockBMMTokenOpParam filter_param;
-  MockBMMTokenOp score_op(search_ctx_, 10, 100, 5.0, 5.0);
-  MockBMMPostingOp filter_op(
-      search_ctx_, filter_ids, filter_scores, ARRAYSIZEOF(filter_ids));
-  ASSERT_EQ(OB_SUCCESS, score_op.init(score_param));
-  ASSERT_EQ(OB_SUCCESS, filter_op.init(filter_param));
-  ObSEArray<ObIDASSearchOp *, 1> score_ops;
-  ASSERT_EQ(OB_SUCCESS, score_ops.push_back(&score_op));
-  ObDASBMMOp bmm(search_ctx_);
-  ASSERT_EQ(OB_SUCCESS,
-      init_bmm_with_costs(bmm, score_ops, &filter_op, 1000, 11, false, 500));
-  ASSERT_EQ(OB_SUCCESS, bmm.open());
+  for (const bool middle_filter : {false, true}) {
+    SCOPED_TRACE(middle_filter);
+    MockBMMTokenOpParam score_param;
+    MockBMMTokenOpParam filter_param;
+    MockBMMTokenOp score_op(search_ctx_, 10, 100, 5.0, 5.0);
+    MockBMMPostingOp filter_op(
+        search_ctx_, filter_ids, filter_scores, ARRAYSIZEOF(filter_ids));
+    ASSERT_EQ(OB_SUCCESS, score_op.init(score_param));
+    ASSERT_EQ(OB_SUCCESS, filter_op.init(filter_param));
+    ObSEArray<ObIDASSearchOp *, 1> score_ops;
+    ASSERT_EQ(OB_SUCCESS, score_ops.push_back(&score_op));
+    ObDASBMMOp bmm(search_ctx_);
+    ASSERT_EQ(OB_SUCCESS,
+        init_bmm_with_costs(bmm, score_ops, &filter_op, 1000, 11, false, 500));
+    ASSERT_EQ(OB_SUCCESS, bmm.open());
+    ASSERT_EQ(OB_SUCCESS, bmm.set_min_competitive_score(2.0));
 
-  uint64_t max_id = 0;
-  ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.reuse_with_start_id(10, max_id));
-  ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.add_dim(10, 1.0));
-  ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.add_dim(11, 2.0));
-  ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.add_dim(15, 3.0));
-  ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.add_dim(17, 4.0));
-  ASSERT_EQ(OB_SUCCESS, bmm.apply_filter_to_scored_batch());
+    uint64_t max_id = 0;
+    ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.reuse_with_start_id(10, max_id));
+    ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.add_dim(10, 1.0));
+    ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.add_dim(11, 2.0));
+    ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.add_dim(15, 3.0));
+    ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.add_dim(17, 4.0));
+    ObDASRowID end;
+    end.set_uint64(20);
+    ASSERT_EQ(OB_SUCCESS, middle_filter
+        ? bmm.apply_bitmap_filter_to_batch(end) : bmm.apply_filter_to_scored_batch());
+    EXPECT_FALSE(bmm.doc_score_accumulator_.has_filter_mask());
 
-  DocScoreIter iter;
-  uint64_t rowid = 0;
-  double score = 0.0;
-  ASSERT_EQ(OB_SUCCESS, iter.open(bmm.doc_score_accumulator_));
-  ASSERT_EQ(OB_SUCCESS, iter.next(rowid, score));
-  EXPECT_EQ(10, rowid);
-  EXPECT_DOUBLE_EQ(1.0, score);
-  ASSERT_EQ(OB_SUCCESS, iter.next(rowid, score));
-  EXPECT_EQ(15, rowid);
-  EXPECT_DOUBLE_EQ(3.0, score);
-  EXPECT_EQ(OB_ITER_END, iter.next(rowid, score));
-  EXPECT_DOUBLE_EQ(3.0, bmm.doc_score_accumulator_.get_max_score());
-  EXPECT_EQ(OB_SUCCESS, bmm.close());
+    DocScoreIter iter;
+    uint64_t rowid = 0;
+    double score = 0.0;
+    ASSERT_EQ(OB_SUCCESS, iter.open(bmm.doc_score_accumulator_));
+    if (middle_filter) {
+      // A matching candidate below T must survive until non-essential scoring.
+      ASSERT_EQ(OB_SUCCESS, iter.next(rowid, score));
+      EXPECT_EQ(10, rowid);
+      EXPECT_DOUBLE_EQ(1.0, score);
+      EXPECT_EQ(30, bmm.curr_filter_id_.get_uint64());
+    }
+    ASSERT_EQ(OB_SUCCESS, iter.next(rowid, score));
+    EXPECT_EQ(15, rowid);
+    EXPECT_DOUBLE_EQ(3.0, score);
+    EXPECT_EQ(OB_ITER_END, iter.next(rowid, score));
+    EXPECT_DOUBLE_EQ(3.0, bmm.doc_score_accumulator_.get_max_score());
+    EXPECT_EQ(OB_SUCCESS, bmm.close());
+  }
+}
+
+TEST_F(TestDASBMM, ready_private_bitmap_word_windows_and_rescan)
+{
+  ObFastBitmap bitmap(allocator_);
+  ASSERT_EQ(OB_SUCCESS, bitmap.init(8));
+  const uint64_t ids[] = {2, 7, 11, 65};
+  ASSERT_EQ(OB_SUCCESS, bitmap.add_batch(ids, ARRAYSIZEOF(ids)));
+  bitmap.finalize();
+  ObDASBitmapOp op(search_ctx_);
+  op.is_scoring_ = false;
+  EXPECT_FALSE(op.can_copy_filter_words());
+  ASSERT_EQ(OB_SUCCESS, op.set_external_bitmap(&bitmap));
+  ASSERT_EQ(OB_SUCCESS, op.do_open());
+  ASSERT_FALSE(op.is_filter_bitmap_view());
+  ASSERT_TRUE(op.can_copy_filter_words());
+  op.is_scoring_ = true;
+  EXPECT_FALSE(op.can_copy_filter_words());
+  op.is_scoring_ = false;
+  for (int scan = 0; scan < 2; ++scan) {
+    if (scan > 0) {
+      ASSERT_EQ(OB_SUCCESS, op.do_rescan());
+    }
+    ObDASRowID current;
+    double score = 0.0;
+    ASSERT_EQ(OB_SUCCESS, op.do_next_rowid(current, score));
+    ASSERT_EQ(2, current.get_uint64());
+    bool end = false;
+    int64_t observed = 0;
+    uint64_t words[2] = {~0ULL, ~0ULL};
+    ObDASRowID start_id;
+    ObDASRowID end_id;
+    start_id.set_uint64(1);
+    end_id.set_uint64(64);
+    ASSERT_EQ(OB_SUCCESS, op.do_drain_into_filter_bitset(
+        start_id, end_id, 65, words, current, end, observed));
+    EXPECT_EQ((1ULL << 1) | (1ULL << 6) | (1ULL << 10), words[0]);
+    EXPECT_EQ(0, words[1]);
+    EXPECT_EQ(3, observed); // Two new copied IDs plus the next-window lookahead.
+    EXPECT_EQ(65, current.get_uint64());
+    EXPECT_FALSE(end);
+    start_id.set_uint64(65);
+    end_id.set_uint64(65);
+    ASSERT_EQ(OB_SUCCESS, op.do_drain_into_filter_bitset(
+        start_id, end_id, 1, words, current, end, observed));
+    EXPECT_EQ(1, words[0]);
+    EXPECT_EQ(0, observed); // Current ID has already been observed.
+    EXPECT_TRUE(end);
+  }
+  EXPECT_EQ(OB_SUCCESS, op.do_close());
+  EXPECT_FALSE(op.can_copy_filter_words());
 }
 
 TEST_F(TestDASBMM, dense_required_filter_cost_strategy_preserves_results)
@@ -2364,6 +2727,9 @@ TEST_F(TestDASBMM, optional_vectorized_accumulates_multiple_scoring_dimensions)
     ASSERT_EQ(OB_SUCCESS, bmm.next_rowid(rowid, score));
     EXPECT_EQ(expected_ids[i], rowid.get_uint64());
     EXPECT_DOUBLE_EQ(expected_scores[i], score);
+    if (0 == i) {
+      EXPECT_EQ(2, bmm.vec_essential_head_count_);
+    }
   }
   EXPECT_EQ(OB_ITER_END, bmm.next_rowid(rowid, score));
   EXPECT_EQ(OB_SUCCESS, bmm.close());
@@ -2413,11 +2779,13 @@ TEST_F(TestDASBMM, optional_vectorized_threshold_is_strict_and_does_not_replay)
   ASSERT_EQ(OB_SUCCESS, bmm.next_rowid(rowid, score));
   EXPECT_EQ(1, rowid.get_uint64());
   EXPECT_DOUBLE_EQ(0.0, score);
+  EXPECT_EQ(1, bmm.vec_essential_head_count_);
   ASSERT_EQ(OB_SUCCESS, bmm.set_min_competitive_score(2.0));
   EXPECT_FALSE(bmm.is_filter_driven_optional());
   ASSERT_EQ(OB_SUCCESS, bmm.next_rowid(rowid, score));
   EXPECT_EQ(33, rowid.get_uint64());
   EXPECT_DOUBLE_EQ(9.0, score);
+  EXPECT_EQ(1, bmm.vec_essential_head_count_);
   ASSERT_TRUE(bmm.doc_score_accumulator_.is_valid());
   EXPECT_EQ(33, bmm.doc_score_accumulator_.start_id_);
   EXPECT_TRUE(bmm.doc_score_accumulator_.bitset_->exist(0));
@@ -2681,6 +3049,9 @@ TEST_F(TestDASBMM, range_max_boundary_gap_public_iteration)
         ASSERT_EQ(OB_SUCCESS, bmm.next_rowid(rowid, score));
         EXPECT_EQ(base + 1, rowid.get_uint64());
         EXPECT_DOUBLE_EQ(essential_eof ? 10.0 : 12.0, score);
+        if (2 != mode) {
+          EXPECT_GT(bmm.vec_essential_head_count_, 0);
+        }
         ASSERT_EQ(OB_SUCCESS, bmm.next_rowid(rowid, score));
         EXPECT_EQ(base + 20000, rowid.get_uint64());
         EXPECT_DOUBLE_EQ(20.0, score);
@@ -2730,6 +3101,9 @@ TEST_F(TestDASBMM, optional_threshold_switch_resumes_unfinished_window)
     ASSERT_EQ(OB_SUCCESS, bmm.next_rowid(rowid, score));
     EXPECT_EQ(25, rowid.get_uint64());
     EXPECT_DOUBLE_EQ(9.0, score);
+    if (!sparse) {
+      EXPECT_EQ(1, bmm.vec_essential_head_count_);
+    }
     EXPECT_EQ(OB_ITER_END, bmm.next_rowid(rowid, score));
     EXPECT_EQ(OB_SUCCESS, bmm.close());
   }
@@ -2832,6 +3206,8 @@ TEST_F(TestDASBMM, direct_filter_bitset_accepts_unordered_callbacks_and_duplicat
   MockCallbackUnorderedDirectBMMFilterOp filter(search_ctx_);
   ASSERT_EQ(OB_SUCCESS, filter.init(filter_param));
   ASSERT_EQ(OB_SUCCESS, filter.open());
+  ObOpProfile<ObMetric> profile(ObProfileId::HYBRID_SEARCH_ASYNC_SCALAR_ROR, &allocator_);
+  filter.profile_ = &profile;
 
   ObDASBMMOp bmm(search_ctx_);
   const int64_t capacity = eval_ctx_.max_batch_size_ * 4;
@@ -2857,7 +3233,106 @@ TEST_F(TestDASBMM, direct_filter_bitset_accepts_unordered_callbacks_and_duplicat
   EXPECT_FALSE(bmm.filter_bitset_->exist(2));
   EXPECT_FALSE(bmm.filter_bitset_->exist(4));
   EXPECT_FALSE(bmm.filter_bitset_->exist(6));
+  bool metric_exists = false;
+  uint64_t output_count = 0;
+  profile.get_metric_value(ObMetricId::HS_OUTPUT_ROW_COUNT, metric_exists, output_count);
+  EXPECT_TRUE(metric_exists);
+  EXPECT_EQ(4, output_count);
   EXPECT_EQ(OB_SUCCESS, filter.close());
+}
+
+TEST_F(TestDASBMM, direct_filter_profile_counts_emitted_rows_across_windows_and_rescan)
+{
+  const uint64_t ids[] = {1, 3, 5};
+  MockBMMTokenOpParam param;
+  MockDirectBMMFilterOp filter(search_ctx_, ids, ARRAYSIZEOF(ids));
+  ASSERT_EQ(OB_SUCCESS, filter.init(param));
+  ASSERT_EQ(OB_SUCCESS, filter.open());
+  ObOpProfile<ObMetric> profile(ObProfileId::HYBRID_SEARCH_ASYNC_SCALAR_ROR, &allocator_);
+  filter.profile_ = &profile;
+  ObFastBitmap bitmap(allocator_);
+  ASSERT_EQ(OB_SUCCESS, bitmap.init(16));
+  ObFastBitmapRowIDConsumer sink(bitmap);
+  ObDASRowID next_id;
+  bool metric_exists = false;
+  uint64_t output_count = 0;
+  for (int64_t scan = 0; scan < 2; ++scan) {
+    if (scan > 0) {
+      ASSERT_EQ(OB_SUCCESS, filter.rescan());
+    }
+    ASSERT_EQ(OB_SUCCESS, filter.direct_drain_rowids(0, 1, sink, next_id));
+    ASSERT_TRUE(next_id.is_normal());
+    EXPECT_EQ(3, next_id.get_uint64());
+    profile.get_metric_value(ObMetricId::HS_OUTPUT_ROW_COUNT, metric_exists, output_count);
+    EXPECT_TRUE(metric_exists);
+    EXPECT_EQ(scan * 3 + 1, output_count);
+    ASSERT_EQ(OB_SUCCESS, filter.direct_drain_rowids(2, 5, sink, next_id));
+    EXPECT_TRUE(next_id.is_max());
+    profile.get_metric_value(ObMetricId::HS_OUTPUT_ROW_COUNT, metric_exists, output_count);
+    EXPECT_EQ((scan + 1) * 3, output_count);
+  }
+  EXPECT_EQ(OB_SUCCESS, filter.close());
+}
+
+TEST_F(TestDASBMM, filtered_batch_trims_empty_tail_and_preserves_lookahead)
+{
+  BMMVectorizedMergeConfigGuard config_guard;
+  ASSERT_TRUE(config_guard.is_valid());
+  eval_ctx_.max_batch_size_ = 16;
+  const uint64_t starts[] = {100, UINT64_MAX - 1024};
+  for (const uint64_t start : starts) {
+    const uint64_t ids[] = {start, start + 64, start + 130, start + 700};
+    const double scores[] = {1, 1, 1, 1};
+    const double filter_scores[] = {0, 0, 0, 0};
+    MockBMMTokenOpParam score_param;
+    MockBMMTokenOpParam filter_param;
+    score_param.set_is_scoring(true);
+    MockBMMPostingOp score_op(search_ctx_, ids, scores, ARRAYSIZEOF(ids));
+    MockBMMPostingOp filter(search_ctx_, ids, filter_scores, ARRAYSIZEOF(ids));
+    ASSERT_EQ(OB_SUCCESS, score_op.init(score_param));
+    ASSERT_EQ(OB_SUCCESS, filter.init(filter_param));
+    ObSEArray<ObIDASSearchOp *, 1> score_ops;
+    ASSERT_EQ(OB_SUCCESS, score_ops.push_back(&score_op));
+    ObDASBMMOp bmm(search_ctx_);
+    ASSERT_EQ(OB_SUCCESS, init_bmm_with_costs(bmm, score_ops, &filter, 1000, 11));
+    ASSERT_EQ(256, bmm.doc_score_accumulator_.get_capacity());
+    ASSERT_EQ(OB_SUCCESS, bmm.open());
+    ObDASRowID begin;
+    ObDASRowID end;
+    begin.set_uint64(start);
+    end.set_uint64(start + 255);
+    ASSERT_EQ(OB_SUCCESS, bmm.advance_filter_to(begin, bmm.curr_filter_id_));
+    uint64_t max_id = 0;
+    bool evaluate = true;
+    ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.reuse_with_start_id(start, max_id));
+    ASSERT_EQ(OB_SUCCESS, bmm.prepare_filter_for_vectorized_batch(begin, end, evaluate));
+    EXPECT_TRUE(evaluate);
+    EXPECT_EQ(start + 130, end.get_uint64());
+    EXPECT_EQ(start + 700, bmm.curr_filter_id_.get_uint64());
+    EXPECT_FALSE(bmm.filter_end_);
+    for (const int64_t bit : {0, 64, 130}) {
+      EXPECT_TRUE(bmm.filter_bitset_->exist(bit));
+    }
+    begin.set_uint64(start + 131);
+    end.set_uint64(start + 386);
+    ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.reuse_with_start_id(start + 131, max_id));
+    ASSERT_EQ(OB_SUCCESS, bmm.prepare_filter_for_vectorized_batch(begin, end, evaluate));
+    EXPECT_FALSE(evaluate);
+    EXPECT_EQ(start + 700, bmm.curr_filter_id_.get_uint64());
+    begin.set_uint64(start + 700);
+    end.set_uint64(start + 955);
+    ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.reuse_with_start_id(start + 700, max_id));
+    ASSERT_EQ(OB_SUCCESS, bmm.prepare_filter_for_vectorized_batch(begin, end, evaluate));
+    EXPECT_TRUE(evaluate);
+    EXPECT_EQ(start + 700, end.get_uint64());
+    EXPECT_TRUE(bmm.filter_bitset_->exist(0));
+    EXPECT_TRUE(bmm.filter_end_);
+    begin.set_uint64(start + 956);
+    end.set_uint64(start + 1023);
+    ASSERT_EQ(OB_SUCCESS, bmm.prepare_filter_for_vectorized_batch(begin, end, evaluate));
+    EXPECT_FALSE(evaluate);
+    ASSERT_EQ(OB_SUCCESS, bmm.close());
+  }
 }
 
 TEST_F(TestDASBMM, direct_filter_reuses_lookahead_across_windows)
@@ -2913,6 +3388,58 @@ TEST_F(TestDASBMM, direct_filter_reuses_lookahead_across_windows)
       batch_start_id, batch_end_id, need_evaluate_batch));
   EXPECT_FALSE(need_evaluate_batch);
   EXPECT_EQ(2, filter.get_drain_count());
+  EXPECT_EQ(OB_SUCCESS, filter.close());
+}
+
+TEST_F(TestDASBMM, direct_filter_after_essential_handoff_preserves_boundary_and_eof)
+{
+  const uint64_t filter_ids[] = {10, 199, 200, 250, 400};
+  MockBMMTokenOpParam filter_param;
+  MockDirectBMMFilterOp filter(search_ctx_, filter_ids, ARRAYSIZEOF(filter_ids));
+  ASSERT_EQ(OB_SUCCESS, filter.init(filter_param));
+  ASSERT_EQ(OB_SUCCESS, filter.open());
+
+  ObDASBMMOp bmm(search_ctx_);
+  const int64_t capacity = eval_ctx_.max_batch_size_ * 4;
+  ASSERT_EQ(OB_SUCCESS, bmm.doc_score_accumulator_.init(capacity, allocator_));
+  void *filter_buf = allocator_.alloc(ObBitVector::memory_size(capacity));
+  ASSERT_NE(nullptr, filter_buf);
+  bmm.filter_bitset_ = to_bit_vector(filter_buf);
+  bmm.filter_bitset_->init(capacity);
+  bmm.filter_op_ = &filter;
+  bmm.filter_mode_ = ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN_AFTER_ESSENTIAL;
+  for (int64_t scan = 0; scan < 2; ++scan) {
+    if (scan > 0) {
+      ASSERT_EQ(OB_SUCCESS, filter.rescan());
+    }
+    bmm.filter_end_ = false;
+    bmm.curr_filter_id_.set_min();
+    bmm.vec_boundary_id_.set_uint64(199);
+    ObDASRowID next;
+    ASSERT_EQ(OB_SUCCESS, bmm.find_next_vec_window_start(next));
+    EXPECT_EQ(200, next.get_uint64());
+    EXPECT_EQ(199, filter.get_last_range_end());
+    ObDASRowID start;
+    ObDASRowID end;
+    start.set_uint64(200);
+    end.set_uint64(200);
+    bool has_hit = false;
+    ASSERT_EQ(OB_SUCCESS, bmm.build_direct_filter_bitset(start, end, has_hit));
+    EXPECT_TRUE(has_hit);
+    EXPECT_TRUE(bmm.filter_bitset_->exist(0));
+    EXPECT_EQ(250, bmm.curr_filter_id_.get_uint64());
+    const int64_t drain_count = filter.get_drain_count();
+    bmm.vec_boundary_id_.set_uint64(249);
+    ASSERT_EQ(OB_SUCCESS, bmm.find_next_vec_window_start(next));
+    EXPECT_EQ(250, next.get_uint64());
+    EXPECT_EQ(drain_count, filter.get_drain_count());
+    bmm.vec_boundary_id_.set_uint64(250);
+    ASSERT_EQ(OB_SUCCESS, bmm.find_next_vec_window_start(next));
+    EXPECT_EQ(400, next.get_uint64());
+    bmm.vec_boundary_id_.set_uint64(400);
+    EXPECT_EQ(OB_ITER_END, bmm.find_next_vec_window_start(next));
+    EXPECT_TRUE(bmm.filter_end_);
+  }
   EXPECT_EQ(OB_SUCCESS, filter.close());
 }
 
@@ -2996,13 +3523,14 @@ TEST_F(TestDASBMM, dense_filter_boundary_crossing_preserves_rows)
 
 TEST_F(TestDASBMM, direct_filter_handoff_skips_unscored_filter_rows)
 {
+  eval_ctx_.max_batch_size_ = 16;
   const MockBMMPosting postings[] = {
     {1, 1.0, 16384, 1.0}, {40000, 1.0, 56383, 1.0},
   };
   const uint64_t filter_ids[] = {1, 5000, 40000};
   const double filter_scores[] = {0.0, 0.0, 0.0};
-  for (const bool direct : {false, true}) {
-    SCOPED_TRACE(::testing::Message() << "direct=" << direct);
+  for (int64_t filter_mode = 0; filter_mode < 3; ++filter_mode) {
+    SCOPED_TRACE(::testing::Message() << "filter_mode=" << filter_mode);
     MockBMMTokenOpParam score_param;
     MockBMMTokenOpParam filter_param;
     score_param.set_is_scoring(true);
@@ -3017,12 +3545,13 @@ TEST_F(TestDASBMM, direct_filter_handoff_skips_unscored_filter_rows)
     ObSEArray<ObIDASSearchOp *, 2> score_ops;
     ASSERT_EQ(OB_SUCCESS, score_ops.push_back(&first_token));
     ASSERT_EQ(OB_SUCCESS, score_ops.push_back(&second_token));
-    ObIDASSearchOp *filter = direct
+    ObIDASSearchOp *filter = 0 != filter_mode
         ? static_cast<ObIDASSearchOp *>(&direct_filter) : &ordered_filter;
+    const auto mode = 0 == filter_mode ? ObDASBMMBuildOptions::FilterMode::ORDERED
+        : (1 == filter_mode ? ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN
+            : ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN_AFTER_ESSENTIAL);
     ObDASBMMOpParam bmm_param(
-        score_ops, filter, allocator_, ObDASBMMBuildOptions(true,
-            direct ? ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN
-                : ObDASBMMBuildOptions::FilterMode::ORDERED));
+        score_ops, filter, allocator_, ObDASBMMBuildOptions(true, mode));
     bmm_param.set_is_scoring(true);
     ObDASBMMOp bmm(search_ctx_);
     ASSERT_EQ(OB_SUCCESS, bmm.init(bmm_param));
@@ -3045,10 +3574,95 @@ TEST_F(TestDASBMM, direct_filter_handoff_skips_unscored_filter_rows)
       EXPECT_EQ(40000, rowid.get_uint64());
       EXPECT_DOUBLE_EQ(2.0, score);
       EXPECT_EQ(OB_ITER_END, bmm.next_rowid(rowid, score));
-      if (direct) {
-        EXPECT_EQ(2, direct_filter.get_drain_count());
+      if (0 != filter_mode) {
+        EXPECT_EQ(1 == filter_mode ? 2 : 3, direct_filter.get_drain_count());
       }
     }
+    EXPECT_EQ(OB_SUCCESS, bmm.close());
+  }
+}
+
+TEST_F(TestDASBMM, direct_filter_after_essential_preserves_scores_and_threshold)
+{
+  BMMVectorizedMergeConfigGuard config_guard;
+  ASSERT_TRUE(config_guard.is_valid());
+  eval_ctx_.max_batch_size_ = 64;
+  ScriptedBMMPostingList scoring[4];
+  for (const uint64_t id : {1ULL, 63ULL, 64ULL, 65ULL, 4097ULL, 8193ULL, 16385ULL, 17000ULL}) {
+    for (int64_t dim = 0; dim < 4; ++dim) {
+      if (dim >= 2 || 65 != id) {
+        const double value = 0 == dim ? 0.1 : (1 == dim ? 0.2 : 1.0);
+        scoring[dim].push_back({id, value, 32768, dim < 2 ? value : 4.0});
+      }
+    }
+  }
+  const uint64_t filter_ids[] = {63, 64, 65, 4097, 16385, 20000};
+  const double filter_scores[] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+  const uint64_t expected_ids[] = {63, 64, 4097, 16385};
+  double expected_score = 2.0;
+  expected_score += 0.2;
+  expected_score += 0.1;
+  for (const bool direct : {false, true}) {
+    SCOPED_TRACE(::testing::Message() << "direct=" << direct);
+    std::vector<std::unique_ptr<ScriptedBMMSearchOp>> owned_ops;
+    ObSEArray<ObIDASSearchOp *, 4> score_ops;
+    ScriptedBMMSearchOpParam score_param;
+    score_param.set_is_scoring(true);
+    for (int64_t dim = 0; dim < 4; ++dim) {
+      const double bound = 0 == dim ? 0.1 : (1 == dim ? 0.2 : 4.0);
+      owned_ops.emplace_back(new ScriptedBMMSearchOp(search_ctx_, scoring[dim], bound));
+      owned_ops.back()->use_batch_drain(true);
+      ASSERT_EQ(OB_SUCCESS, owned_ops.back()->init(score_param));
+      ASSERT_EQ(OB_SUCCESS, score_ops.push_back(owned_ops.back().get()));
+    }
+    MockBMMTokenOpParam filter_param;
+    MockBMMPostingOp ordered_filter(search_ctx_, filter_ids, filter_scores, ARRAYSIZEOF(filter_ids));
+    MockDirectBMMFilterOp direct_filter(search_ctx_, filter_ids, ARRAYSIZEOF(filter_ids));
+    ASSERT_EQ(OB_SUCCESS, ordered_filter.init(filter_param));
+    ASSERT_EQ(OB_SUCCESS, direct_filter.init(filter_param));
+    ObIDASSearchOp *filter = direct
+        ? static_cast<ObIDASSearchOp *>(&direct_filter) : &ordered_filter;
+    ObDASBMMBuildOptions options(true, direct
+        ? ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN_AFTER_ESSENTIAL
+        : ObDASBMMBuildOptions::FilterMode::ORDERED);
+    options.lead_cost_ = ObDASSearchCost(1001);
+    options.filter_cost_ = ObDASSearchCost(10000);
+    search_ctx_.table_row_count_ = ObDASSearchCost(100000);
+    ObDASBMMOpParam param(score_ops, filter, allocator_, options);
+    param.set_is_scoring(true);
+    ObDASBMMOp bmm(search_ctx_);
+    ASSERT_EQ(OB_SUCCESS, bmm.init(param));
+    ASSERT_TRUE(bmm.filter_after_score_);
+    ASSERT_EQ(OB_SUCCESS, bmm.open());
+    for (int64_t scan = 0; scan < 2; ++scan) {
+      if (scan > 0) {
+        ASSERT_EQ(OB_SUCCESS, bmm.rescan());
+      }
+      ASSERT_EQ(OB_SUCCESS, bmm.set_min_competitive_score(2.0));
+      ObDASRowID rowid;
+      double score = 0.0;
+      for (const uint64_t expected_id : expected_ids) {
+        ASSERT_EQ(OB_SUCCESS, bmm.next_rowid(rowid, score));
+        EXPECT_EQ(expected_id, rowid.get_uint64());
+        EXPECT_EQ(0, MEMCMP(&expected_score, &score, sizeof(score)));
+      }
+      EXPECT_EQ(OB_ITER_END, bmm.next_rowid(rowid, score));
+      EXPECT_EQ(2, bmm.vec_non_essential_dim_count_);
+    }
+    ASSERT_EQ(OB_SUCCESS, bmm.rescan());
+    ASSERT_EQ(OB_SUCCESS, bmm.set_min_competitive_score(2.0));
+    ObDASRowID target;
+    ObDASRowID rowid;
+    double score = 0.0;
+    target.set_uint64(64);
+    ASSERT_EQ(OB_SUCCESS, bmm.advance_to(target, rowid, score));
+    EXPECT_EQ(64, rowid.get_uint64());
+    EXPECT_EQ(0, MEMCMP(&expected_score, &score, sizeof(score)));
+    target.set_uint64(16385);
+    ASSERT_EQ(OB_SUCCESS, bmm.advance_to(target, rowid, score));
+    EXPECT_EQ(16385, rowid.get_uint64());
+    EXPECT_EQ(0, MEMCMP(&expected_score, &score, sizeof(score)));
+    EXPECT_EQ(OB_ITER_END, bmm.next_rowid(rowid, score));
     EXPECT_EQ(OB_SUCCESS, bmm.close());
   }
 }
@@ -3249,6 +3863,314 @@ TEST_F(TestDASBMM, query_optional_conjunction_filter_disables_vectorized_merge)
   EXPECT_EQ(OB_SUCCESS, conjunction_op.close());
 }
 
+TEST_F(TestDASBMM, daat_sorted_candidates_restore_zero_and_shallow_heads)
+{
+  const MockBMMPosting postings[] = {
+      {0, 1.0, 255, 6.0}, {2, 0.0, 255, 6.0}, {5, 3.0, 255, 6.0},
+      {9, 4.0, 255, 6.0}, {200, 6.0, 255, 6.0}};
+  for (bool id_only : {false, true}) {
+    for (bool shallow : {false, true}) {
+      for (int64_t count : {1, 7, 8, 63, 64}) {
+        SCOPED_TRACE(::testing::Message() << "id_only=" << id_only
+            << " shallow=" << shallow << " count=" << count);
+        MockBMMTokenOpParam param;
+        param.set_is_scoring(true);
+        MockBMMTokenOp token(search_ctx_, postings, ARRAYSIZEOF(postings), 6.0);
+        if (id_only) token.enable_advance_to_id();
+        ASSERT_EQ(OB_SUCCESS, token.init(param));
+        ASSERT_EQ(OB_SUCCESS, token.open());
+        ObDAATMergeIter iter;
+        ASSERT_EQ(OB_SUCCESS, iter.init(0, token));
+        for (int repeat = 0; repeat < 2; ++repeat) {
+          if (repeat > 0) {
+            ASSERT_EQ(OB_SUCCESS, token.rescan());
+            iter.reuse();
+          }
+          EXPECT_TRUE(iter.curr_id_.is_min());
+          if (shallow) {
+            ObDASRowID target;
+            target.set_uint64(0);
+            ASSERT_EQ(OB_SUCCESS, iter.advance_shallow(target, true));
+          }
+          uint64_t ids[64];
+          double scores[64];
+          bool matched[64];
+          for (int64_t i = 0; i < count; ++i) {
+            ids[i] = i;
+            scores[i] = 0.25 * (i + 1);
+            matched[i] = i % 3 == 0;
+          }
+          ASSERT_EQ(OB_SUCCESS, iter.probe_sorted_candidates(ids, count, scores, matched));
+          for (int64_t i = 0; i < count; ++i) {
+            double expected_score = 0.25 * (i + 1);
+            bool expected_match = i % 3 == 0;
+            for (const MockBMMPosting &posting : postings) {
+              if (posting.doc_id_ == ids[i]) {
+                expected_score += posting.score_;
+                expected_match = true;
+              }
+            }
+            EXPECT_DOUBLE_EQ(expected_score, scores[i]);
+            EXPECT_EQ(expected_match, matched[i]);
+          }
+          const uint64_t expected_head = count == 1 ? 0 : count <= 8 ? 9 : 200;
+          ObDASRowID current;
+          ASSERT_EQ(OB_SUCCESS, iter.get_curr_id(current));
+          EXPECT_EQ(expected_head, current.get_uint64());
+          EXPECT_FALSE(iter.in_shallow_status());
+          EXPECT_FALSE(iter.iter_end());
+          EXPECT_EQ(!id_only || count == 1, iter.curr_score_materialized_);
+          double score = 0.0;
+          ASSERT_EQ(OB_SUCCESS, iter.load_curr_score(score));
+          EXPECT_DOUBLE_EQ(expected_head == 0 ? 1.0 : expected_head == 9 ? 4.0 : 6.0, score);
+          if (expected_head == 200) {
+            EXPECT_EQ(OB_ITER_END, iter.next());
+          } else {
+            ASSERT_EQ(OB_SUCCESS, iter.next());
+            ASSERT_EQ(OB_SUCCESS, iter.get_curr_id(current));
+            EXPECT_EQ(expected_head == 0 ? 2U : 200U, current.get_uint64());
+          }
+        }
+        ASSERT_EQ(OB_SUCCESS, token.close());
+      }
+    }
+  }
+}
+
+TEST_F(TestDASBMM, daat_sorted_candidates_count_initial_seek_and_reuse_cached_score)
+{
+  const MockBMMPosting postings[] = {
+      {10, 1.0, 64, 4.0}, {12, 2.0, 64, 4.0},
+      {20, 3.0, 64, 4.0}, {30, 4.0, 64, 4.0}};
+  const uint64_t ids[] = {10, 11, 12, 25, 40};
+  for (int initial : {0, 1, 2}) {
+    SCOPED_TRACE(initial);
+    MockBMMTokenOpParam param;
+    param.set_is_scoring(true);
+    MockBMMTokenOp token(search_ctx_, postings, ARRAYSIZEOF(postings), 4.0);
+    token.enable_advance_to_id();
+    ASSERT_EQ(OB_SUCCESS, token.init(param));
+    ASSERT_EQ(OB_SUCCESS, token.open());
+    ObDAATMergeIter iter;
+    ASSERT_EQ(OB_SUCCESS, iter.init(0, token));
+    if (initial == 1) {
+      ObDASRowID target;
+      target.set_uint64(10);
+      ASSERT_EQ(OB_SUCCESS, iter.advance_to_id(target));
+    } else if (initial == 2) {
+      ASSERT_EQ(OB_SUCCESS, iter.next());
+    }
+    double scores[] = {5.0, 5.0, 5.0, 5.0, 5.0};
+    bool matched[5] = {};
+    const int64_t seeks = token.get_advance_to_id_count();
+    const int64_t loads = token.get_load_curr_score_count();
+    ASSERT_EQ(OB_SUCCESS, iter.probe_sorted_candidates(ids, ARRAYSIZEOF(ids), scores, matched));
+    EXPECT_EQ(initial == 0 ? 4 : 3, token.get_advance_to_id_count() - seeks);
+    EXPECT_EQ(initial == 2 ? 1 : 2, token.get_load_curr_score_count() - loads);
+    EXPECT_TRUE(iter.iter_end());
+    for (int64_t i = 0; i < ARRAYSIZEOF(ids); ++i) {
+      EXPECT_DOUBLE_EQ(i == 0 ? 6.0 : i == 2 ? 7.0 : 5.0, scores[i]);
+      EXPECT_EQ(i == 0 || i == 2, matched[i]);
+    }
+    ASSERT_EQ(OB_SUCCESS, iter.probe_sorted_candidates(ids, ARRAYSIZEOF(ids), scores, matched));
+    EXPECT_EQ(initial == 0 ? 4 : 3, token.get_advance_to_id_count() - seeks);
+    EXPECT_EQ(initial == 2 ? 1 : 2, token.get_load_curr_score_count() - loads);
+    EXPECT_DOUBLE_EQ(6.0, scores[0]);
+    EXPECT_DOUBLE_EQ(7.0, scores[2]);
+    EXPECT_EQ(OB_ITER_END, iter.next());
+    ASSERT_EQ(OB_SUCCESS, token.close());
+  }
+}
+
+TEST_F(TestDASBMM, daat_sorted_candidates_reposition_after_active_drain)
+{
+  const MockBMMPosting postings[] = {
+      {0, 1.0, 255, 6.0}, {2, 2.0, 255, 6.0},
+      {9, 4.0, 255, 6.0}, {200, 6.0, 255, 6.0}};
+  MockBMMTokenOpParam param;
+  param.set_is_scoring(true);
+  MockBMMTokenOp token(search_ctx_, postings, ARRAYSIZEOF(postings), 6.0);
+  token.enable_advance_to_id();
+  ASSERT_EQ(OB_SUCCESS, token.init(param));
+  ASSERT_EQ(OB_SUCCESS, token.open());
+  ObDAATMergeIter iter;
+  ASSERT_EQ(OB_SUCCESS, iter.init(0, token));
+  ASSERT_EQ(OB_SUCCESS, iter.next());
+  DocScoreAccumulator acc;
+  ASSERT_EQ(OB_SUCCESS, acc.init(16, allocator_));
+  uint64_t end_id = 0;
+  ASSERT_EQ(OB_SUCCESS, acc.reuse_with_start_id(0, end_id));
+  ASSERT_EQ(OB_SUCCESS, acc.add_dim(2, 5.0));
+  ASSERT_EQ(OB_SUCCESS, iter.drain_until_active(2, 2, acc));
+  EXPECT_TRUE(iter.curr_id_.is_min());
+  EXPECT_FALSE(iter.curr_score_materialized_);
+  double score = 0.0;
+  ASSERT_EQ(OB_SUCCESS, acc.get_score(2, score));
+  EXPECT_DOUBLE_EQ(7.0, score);
+  const uint64_t ids[] = {0, 9};
+  double scores[] = {1.0, 1.0};
+  bool matched[2] = {};
+  ASSERT_EQ(OB_SUCCESS, iter.probe_sorted_candidates(ids, ARRAYSIZEOF(ids), scores, matched));
+  EXPECT_FALSE(matched[0]);
+  EXPECT_TRUE(matched[1]);
+  EXPECT_DOUBLE_EQ(1.0, scores[0]);
+  EXPECT_DOUBLE_EQ(5.0, scores[1]);
+  ASSERT_EQ(OB_SUCCESS, iter.next());
+  ObDASRowID current;
+  ASSERT_EQ(OB_SUCCESS, iter.get_curr_id(current));
+  EXPECT_EQ(200U, current.get_uint64());
+  ASSERT_EQ(OB_SUCCESS, token.close());
+}
+
+TEST_F(TestDASBMM, daat_sorted_candidates_validate_arguments_and_propagate_errors)
+{
+  uint64_t ids[65];
+  double scores[65] = {};
+  bool matched[65] = {};
+  for (int64_t i = 0; i < ARRAYSIZEOF(ids); ++i) ids[i] = i;
+  ObDAATMergeIter uninitialized;
+  EXPECT_EQ(OB_NOT_INIT, uninitialized.probe_sorted_candidates(ids, 1, scores, matched));
+  MockBMMTokenOpParam param;
+  param.set_is_scoring(true);
+  MockBMMTokenOp token(search_ctx_, 0, 100, 1.0, 1.0);
+  ASSERT_EQ(OB_SUCCESS, token.init(param));
+  ASSERT_EQ(OB_SUCCESS, token.open());
+  ObDAATMergeIter iter;
+  ASSERT_EQ(OB_SUCCESS, iter.init(0, token));
+  for (int64_t count : {-1, 0, 65}) {
+    EXPECT_EQ(OB_INVALID_ARGUMENT, iter.probe_sorted_candidates(ids, count, scores, matched));
+  }
+  EXPECT_EQ(OB_INVALID_ARGUMENT, iter.probe_sorted_candidates(nullptr, 1, scores, matched));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, iter.probe_sorted_candidates(ids, 1, nullptr, matched));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, iter.probe_sorted_candidates(ids, 1, scores, nullptr));
+  EXPECT_TRUE(iter.curr_id_.is_min());
+  EXPECT_EQ(0, token.get_advance_to_count());
+  EXPECT_EQ(0, token.get_advance_to_id_count());
+  ASSERT_EQ(OB_SUCCESS, token.close());
+
+  class FailingProbeToken : public MockBMMTokenOp
+  {
+  public:
+    FailingProbeToken(ObDASSearchCtx &ctx, bool fail_seek)
+      : MockBMMTokenOp(ctx, 0, 100, 1.0, 1.0), fail_seek_(fail_seek),
+        seek_calls_(0), load_calls_(0) {}
+    bool fail_seek_;
+    int64_t seek_calls_;
+    int64_t load_calls_;
+  private:
+    int do_advance_to_id(const ObDASRowID &target, ObDASRowID &rowid) override
+    {
+      ++seek_calls_;
+      double score = 0.0;
+      return fail_seek_ ? OB_TIMEOUT : advance_to(target, rowid, score);
+    }
+    int do_load_curr_score(double &score) override
+    {
+      UNUSED(score);
+      ++load_calls_;
+      return OB_TIMEOUT;
+    }
+  };
+  for (bool fail_seek : {false, true}) {
+    FailingProbeToken failing(search_ctx_, fail_seek);
+    failing.enable_advance_to_id();
+    ASSERT_EQ(OB_SUCCESS, failing.init(param));
+    ASSERT_EQ(OB_SUCCESS, failing.open());
+    ObDAATMergeIter failing_iter;
+    ASSERT_EQ(OB_SUCCESS, failing_iter.init(0, failing));
+    EXPECT_EQ(OB_TIMEOUT, failing_iter.probe_sorted_candidates(ids, 8, scores, matched));
+    EXPECT_EQ(1, failing.seek_calls_);
+    EXPECT_EQ(fail_seek ? 0 : 1, failing.load_calls_);
+    for (int64_t i = 0; i < 8; ++i) {
+      EXPECT_DOUBLE_EQ(0.0, scores[i]);
+      EXPECT_FALSE(matched[i]);
+    }
+    ASSERT_EQ(OB_SUCCESS, failing.close());
+  }
+}
+
+TEST_F(TestDASBMM, bitmap_transpose_rawbits_state_differential)
+{
+  BMMVectorizedMergeConfigGuard config_guard;
+  ASSERT_TRUE(config_guard.is_valid());
+  const int capacities[] = {1, 63, 64, 65, 255, 256, 257};
+  for (int shape = 0; shape < 12; ++shape) {
+    for (int feedback = 0; feedback < 2; ++feedback) {
+      BitmapTransposeRun a, b;
+      const int dims = 3 + shape % 6;
+      const int capacity = capacities[shape % ARRAYSIZEOF(capacities)];
+      ASSERT_NO_FATAL_FAILURE(run_bitmap_transpose_case(false, shape, dims, capacity, feedback, shape % 2, 2, true, a));
+      ASSERT_NO_FATAL_FAILURE(run_bitmap_transpose_case(true, shape, dims, capacity, feedback, shape % 2, 2, true, b));
+      ASSERT_EQ(OB_ITER_END, a.terminal_ret_);
+      ASSERT_EQ(OB_ITER_END, b.terminal_ret_);
+      ASSERT_EQ(a.rows_, b.rows_) << "shape=" << shape << " feedback=" << feedback;
+      ASSERT_EQ(a.checksum_, b.checksum_);
+      EXPECT_EQ(0, a.filter_drain_);
+      if (shape < 9 && capacity > 1) EXPECT_GT(b.filter_drain_, 0);
+    }
+  }
+}
+
+TEST_F(TestDASBMM, bitmap_transpose_drain_error_and_small_e_fallback)
+{
+  BMMVectorizedMergeConfigGuard config_guard;
+  ASSERT_TRUE(config_guard.is_valid());
+  BitmapTransposeRun failed;
+  ASSERT_NO_FATAL_FAILURE(run_bitmap_transpose_case(true, 1, 4, 256, false, false, 1, true, failed, OB_TIMEOUT));
+  EXPECT_EQ(OB_TIMEOUT, failed.terminal_ret_);
+  EXPECT_TRUE(failed.rows_.empty());
+  EXPECT_EQ(1, failed.filter_drain_);
+  for (int dims : {1, 2}) {
+    BitmapTransposeRun a, b;
+    ASSERT_NO_FATAL_FAILURE(run_bitmap_transpose_case(false, 1, dims, 256, true, true, 2, true, a));
+    ASSERT_NO_FATAL_FAILURE(run_bitmap_transpose_case(true, 1, dims, 256, true, true, 2, true, b));
+    ASSERT_EQ(a.rows_, b.rows_);
+    if (dims == 1) EXPECT_EQ(0, b.filter_drain_);
+    else EXPECT_GT(b.filter_drain_, 0);
+  }
+}
+
+TEST_F(TestDASBMM, ordered_filter_batch_scope_guard)
+{
+  BMMVectorizedMergeConfigGuard guard;
+  ASSERT_TRUE(guard.is_valid());
+  const uint64_t ids[] = {1, 2, 7};
+  const double scores[] = {1.0, 2.0, 3.0};
+  MockBMMTokenOpParam score_param, filter_param;
+  score_param.set_is_scoring(true);
+  MockBMMPostingOp scoring(search_ctx_, ids, scores, ARRAYSIZEOF(ids));
+  MockBMMPostingOp filter(search_ctx_, ids, scores, ARRAYSIZEOF(ids));
+  ASSERT_EQ(OB_SUCCESS, scoring.init(score_param));
+  ASSERT_EQ(OB_SUCCESS, filter.init(filter_param));
+  ObSEArray<ObIDASSearchOp *, 1> ops;
+  ASSERT_EQ(OB_SUCCESS, ops.push_back(&scoring));
+  struct Case { int64_t topk; int64_t table; int64_t filter; int64_t lead; bool optional; bool expected; };
+  const Case cases[] = {
+    {10, 100000, 49, 1, false, false},
+    {10, 100000, 50, 1, false, true},
+    {10, 100000, 1000, 1, false, true},
+    {10, 100000, 2000, 1, false, true},
+    {10, 100000, 2001, 1, false, false},
+    {1, 100000, 1000, 1, false, true},
+    {100, 100000, 1000, 1, false, true},
+    {1000, 100000, 1000, 1, false, true},
+    {-1, 100000, 1000, 1, false, true},
+    {10, 1999, 1, 1, false, false},
+    {10, 2000, 1, 1, false, true},
+    {10, 100000, 1000, 1, true, false},
+    {10, 100000, 1000, 100000, false, false}
+  };
+  for (const Case &c : cases) {
+    ObDASBMMOp bmm(search_ctx_);
+    search_ctx_.set_generating_topk_limit(c.topk);
+    ASSERT_EQ(OB_SUCCESS, init_bmm_with_costs(bmm, ops, &filter, c.table, c.lead, c.optional, c.filter));
+    search_ctx_.set_generating_topk_limit(-1);
+    EXPECT_EQ(c.expected, bmm.enable_filter_essential_batch_);
+    ASSERT_EQ(OB_SUCCESS, bmm.close());
+    EXPECT_FALSE(bmm.enable_filter_essential_batch_);
+  }
+}
+
 TEST_F(TestDASBMM, sparse_seek_leapfrog_aligns_filter_and_essential_iters)
 {
   BMMVectorizedMergeConfigGuard config_guard;
@@ -3413,7 +4335,7 @@ TEST_F(TestDASBMM, sparse_seek_scores_non_essential_dims_and_prunes)
   ASSERT_EQ(OB_SUCCESS, bmm.sparse_candidate_buffer_.append(20, 4.0));
   ASSERT_EQ(OB_SUCCESS, bmm.sparse_candidate_buffer_.append(30, 6.0));
 
-  ASSERT_EQ(OB_SUCCESS, bmm.score_leapfrog_candidates());
+  ASSERT_EQ(OB_SUCCESS, bmm.score_sparse_candidates(false));
   EXPECT_EQ(3, high_dim.get_advance_to_count());
   EXPECT_EQ(2, low_dim.get_advance_to_count());
   uint64_t doc_id = 0;
@@ -3471,7 +4393,7 @@ TEST_F(TestDASBMM, sparse_seek_stops_scoring_after_all_candidates_are_pruned)
   ASSERT_EQ(OB_SUCCESS, bmm.sparse_candidate_buffer_.append(10, 1.0));
   ASSERT_EQ(OB_SUCCESS, bmm.sparse_candidate_buffer_.append(20, 2.0));
 
-  ASSERT_EQ(OB_SUCCESS, bmm.score_leapfrog_candidates());
+  ASSERT_EQ(OB_SUCCESS, bmm.score_sparse_candidates(false));
   EXPECT_FALSE(bmm.sparse_candidate_buffer_.has_alive());
   EXPECT_EQ(2, high_dim.get_advance_to_count());
   EXPECT_EQ(0, low_dim.get_advance_to_count());
@@ -3479,6 +4401,65 @@ TEST_F(TestDASBMM, sparse_seek_stops_scoring_after_all_candidates_are_pruned)
   double score = 0.0;
   EXPECT_EQ(OB_ITER_END, bmm.sparse_candidate_buffer_.next(6.0, doc_id, score));
   EXPECT_EQ(OB_SUCCESS, bmm.close());
+}
+
+TEST_F(TestDASBMM, sparse_seek_pruned_batch_refills_or_finishes)
+{
+  BMMVectorizedMergeConfigGuard config_guard;
+  ASSERT_TRUE(config_guard.is_valid());
+  for (bool has_later_match : {false, true}) {
+    SCOPED_TRACE(has_later_match);
+    const ScriptedBMMPosting non_essential_postings[] = {
+      {100, 3.0, 100, 3.0},
+    };
+    const ScriptedBMMPosting essential_postings[] = {
+      {10, 4.0, 100, 8.0},
+      {20, 4.0, 100, 8.0},
+      {30, 8.0, 100, 8.0},
+    };
+    const ScriptedBMMPosting filter_postings[] = {
+      {10, 0.0, 100, 0.0},
+      {20, 0.0, 100, 0.0},
+      {30, 0.0, 100, 0.0},
+    };
+    ScriptedBMMSearchOpParam score_param;
+    ScriptedBMMSearchOpParam filter_param;
+    score_param.set_is_scoring(true);
+    ScriptedBMMSearchOp non_essential(
+        search_ctx_, non_essential_postings, ARRAYSIZEOF(non_essential_postings), 3.0);
+    ScriptedBMMSearchOp essential(
+        search_ctx_, essential_postings, ARRAYSIZEOF(essential_postings), 8.0);
+    ScriptedBMMSearchOp filter_op(
+        search_ctx_, filter_postings, has_later_match ? 3 : 2, 0.0);
+    ASSERT_EQ(OB_SUCCESS, non_essential.init(score_param));
+    ASSERT_EQ(OB_SUCCESS, essential.init(score_param));
+    ASSERT_EQ(OB_SUCCESS, filter_op.init(filter_param));
+    ObSEArray<ObIDASSearchOp *, 2> score_ops;
+    ASSERT_EQ(OB_SUCCESS, score_ops.push_back(&non_essential));
+    ASSERT_EQ(OB_SUCCESS, score_ops.push_back(&essential));
+    ObDASBMMOp bmm(search_ctx_);
+    ASSERT_EQ(OB_SUCCESS, init_bmm_with_costs(
+        bmm, score_ops, &filter_op, 100000, 10));
+    ASSERT_EQ(OB_SUCCESS, bmm.open());
+    ASSERT_EQ(ObDASBMMOp::FilterMergeMode::SPARSE_SEEK, bmm.filter_merge_mode_);
+    ASSERT_FALSE(bmm.doc_score_accumulator_.is_valid());
+    bmm.sparse_candidate_buffer_.reset();
+    ASSERT_EQ(OB_SUCCESS, bmm.sparse_candidate_buffer_.init(2, allocator_));
+    ASSERT_EQ(OB_SUCCESS, bmm.set_min_competitive_score(6.0));
+
+    // Docs 10/20 pass collection (4 + 3 > 6), but neither matches the non-essential
+    // posting. The first full batch is fully pruned before reaching output.
+    ObDASRowID rowid;
+    double score = 0.0;
+    if (has_later_match) {
+      ASSERT_EQ(OB_SUCCESS, bmm.next_rowid(rowid, score));
+      EXPECT_EQ(30, rowid.get_uint64());
+      EXPECT_DOUBLE_EQ(8.0, score);
+    }
+    EXPECT_EQ(OB_ITER_END, bmm.next_rowid(rowid, score));
+    EXPECT_EQ(ObDASBMMOp::SearchStatus::FINISHED, bmm.status_);
+    EXPECT_EQ(OB_SUCCESS, bmm.close());
+  }
 }
 
 TEST_F(TestDASBMM, sparse_seek_next_advance_and_rescan)
@@ -3626,136 +4607,6 @@ TEST_F(TestDASBMM, finished_threshold_update_is_noop)
   EXPECT_EQ(OB_SUCCESS, bmm.close());
 }
 
-TEST_F(TestDASBMM, scored_batch_is_bit_exact_with_materialized_bm25)
-{
-  ObBM25PrecomputedParams params;
-  ASSERT_EQ(OB_SUCCESS, ObExprBM25::init_precomputed_params(2.13, 67.0, 1.7, params));
-  for (const int64_t capacity : {1, 64, 257, 16384}) {
-    for (const uint64_t start : {uint64_t(0), UINT64_MAX - capacity + 1}) {
-      DocScoreAccumulator expected_acc;
-      DocScoreAccumulator actual_acc;
-      ASSERT_EQ(OB_SUCCESS, expected_acc.init(capacity, allocator_));
-      ASSERT_EQ(OB_SUCCESS, actual_acc.init(capacity, allocator_));
-      uint64_t max_id = 0;
-      ASSERT_EQ(OB_SUCCESS, expected_acc.reuse_with_start_id(start, max_id));
-      ASSERT_EQ(OB_SUCCESS, actual_acc.reuse_with_start_id(start, max_id));
-      uint64_t ids[513];
-      uint64_t tf[513];
-      uint64_t dl[513];
-      double scores[513];
-      for (int64_t i = 0; i < ARRAYSIZEOF(ids); ++i) {
-        ids[i] = start + MIN(i / 2, capacity - 1);
-        tf[i] = 1 + (i * 5) % 13;
-        dl[i] = i % 17 == 0 ? UINT64_MAX : uint64_t(20 + (i * 31) % 400);
-      }
-      ObExprBM25::eval_batch_with_precomputed_params(tf, dl, ARRAYSIZEOF(ids), params, scores);
-      for (int64_t pass = 0; pass < 3; ++pass) {
-        ASSERT_EQ(OB_SUCCESS, expected_acc.add_dim_batch(ids, scores, ARRAYSIZEOF(ids)));
-        int64_t calls = 0;
-        const auto score_at = [&](const int64_t i) {
-          ++calls;
-          return ObExprBM25::eval_with_precomputed_params(tf[i], dl[i], params);
-        };
-        const TestBatchScorer<decltype(score_at)> scorer{score_at};
-        ASSERT_EQ(OB_SUCCESS,
-            actual_acc.add_scored_dim_batch(ids, ARRAYSIZEOF(ids), scorer));
-        EXPECT_EQ(ARRAYSIZEOF(ids), calls);
-        EXPECT_EQ(expected_acc.is_empty(), actual_acc.is_empty());
-        double expected_max = expected_acc.get_max_score();
-        double actual_max = actual_acc.get_max_score();
-        EXPECT_EQ(0, MEMCMP(&expected_max, &actual_max, sizeof(double)));
-        for (int64_t offset = 0; offset < capacity; ++offset) {
-          EXPECT_EQ(expected_acc.bitset_->exist(offset), actual_acc.bitset_->exist(offset));
-          if (expected_acc.bitset_->exist(offset)) {
-            double expected = 0;
-            double actual = 0;
-            ASSERT_EQ(OB_SUCCESS, expected_acc.get_score(start + offset, expected));
-            ASSERT_EQ(OB_SUCCESS, actual_acc.get_score(start + offset, actual));
-            EXPECT_EQ(0, MEMCMP(&expected, &actual, sizeof(double)));
-          }
-        }
-        ASSERT_EQ(OB_SUCCESS, expected_acc.filter_below_score(1.0));
-        ASSERT_EQ(OB_SUCCESS, actual_acc.filter_below_score(1.0));
-      }
-    }
-  }
-}
-
-TEST_F(TestDASBMM, scored_batch_keeps_endpoint_validation)
-{
-  DocScoreAccumulator acc;
-  int64_t calls = 0;
-  const auto score_at = [&](const int64_t i) { ++calls; return double(i + 1); };
-  const TestBatchScorer<decltype(score_at)> scorer{score_at};
-  const uint64_t ids[] = {10, 11};
-  const uint64_t out_of_range_ids[] = {9, 12};
-  EXPECT_EQ(OB_SUCCESS, acc.add_scored_dim_batch(nullptr, 0, scorer));
-  EXPECT_EQ(OB_INVALID_ARGUMENT, acc.add_scored_dim_batch(ids, 1, scorer));
-  ASSERT_EQ(OB_SUCCESS, acc.init(8, allocator_));
-  uint64_t max_id = 0;
-  ASSERT_EQ(OB_SUCCESS, acc.reuse_with_start_id(10, max_id));
-  EXPECT_EQ(OB_INVALID_ARGUMENT, acc.add_scored_dim_batch(nullptr, 1, scorer));
-  EXPECT_EQ(OB_INDEX_OUT_OF_RANGE,
-      acc.add_scored_dim_batch(out_of_range_ids, ARRAYSIZEOF(out_of_range_ids), scorer));
-  EXPECT_EQ(0, calls);
-  EXPECT_TRUE(acc.is_empty());
-  acc.set_filter_mask(acc.bitset_);
-  EXPECT_EQ(OB_INVALID_ARGUMENT, acc.add_scored_dim_batch(ids, 2, scorer));
-  EXPECT_EQ(0, calls);
-  acc.clear_filter_mask();
-}
-
-TEST_F(TestDASBMM, scored_unroll_preserves_bits)
-{
-  ObBM25PrecomputedParams params;
-  ASSERT_EQ(OB_SUCCESS, ObExprBM25::init_precomputed_params(2.13, 67.0, 1.7, params));
-  const uint64_t edges[] = {0, 1, UINT32_MAX, (1ULL << 53) + 1, 1ULL << 63, UINT64_MAX};
-  for (const uint64_t start : {uint64_t(0), UINT64_MAX - 256}) {
-    for (const int64_t count : {0, 1, 2, 3, 31, 128, 255, 256, 513}) {
-      DocScoreAccumulator expected;
-      DocScoreAccumulator actual;
-      ASSERT_EQ(OB_SUCCESS, expected.init(257, allocator_));
-      ASSERT_EQ(OB_SUCCESS, actual.init(257, allocator_));
-      uint64_t max_id = 0;
-      ASSERT_EQ(OB_SUCCESS, expected.reuse_with_start_id(start, max_id));
-      ASSERT_EQ(OB_SUCCESS, actual.reuse_with_start_id(start, max_id));
-      uint64_t ids[513];
-      for (int64_t i = 0; i < ARRAYSIZEOF(ids); ++i) {
-        ids[i] = start + i / 2;
-      }
-      for (int64_t pass = 0; pass < 3; ++pass) {
-        const auto score_at = [&](const int64_t i) {
-          return ObExprBM25::eval_with_precomputed_params(
-              edges[(i + pass) % ARRAYSIZEOF(edges)],
-              edges[(i / ARRAYSIZEOF(edges) + pass) % ARRAYSIZEOF(edges)], params);
-        };
-        const TestBatchScorer<decltype(score_at)> scorer{score_at};
-        double scores[ARRAYSIZEOF(ids)];
-        for (int64_t i = 0; i < count; ++i) {
-          scores[i] = score_at(i);
-        }
-        ASSERT_EQ(OB_SUCCESS, expected.add_dim_batch(ids, scores, count));
-        ASSERT_EQ(OB_SUCCESS, actual.add_scored_dim_batch(ids, count, scorer));
-        EXPECT_EQ(expected.is_empty(), actual.is_empty());
-        const double expected_max = expected.get_max_score();
-        const double actual_max = actual.get_max_score();
-        EXPECT_EQ(0, MEMCMP(&expected_max, &actual_max, sizeof(double)));
-        for (int64_t offset = 0; offset < 257; ++offset) {
-          ASSERT_EQ(expected.bitset_->exist(offset), actual.bitset_->exist(offset));
-          if (expected.bitset_->exist(offset)) {
-            double a = 0, b = 0;
-            ASSERT_EQ(OB_SUCCESS, expected.get_score(start + offset, a));
-            ASSERT_EQ(OB_SUCCESS, actual.get_score(start + offset, b));
-            EXPECT_EQ(0, MEMCMP(&a, &b, sizeof(double)));
-          }
-        }
-        ASSERT_EQ(OB_SUCCESS, expected.filter_below_score(1.0));
-        ASSERT_EQ(OB_SUCCESS, actual.filter_below_score(1.0));
-      }
-    }
-  }
-}
-
 TEST_F(TestDASBMM, accumulated_drain_preserves_current_boundary_eof_and_rescan)
 {
   MockBMMPosting postings[600];
@@ -3892,9 +4743,7 @@ TEST_F(TestDASBMM, active_drain_fallback_positions_and_scores_current_row)
   ASSERT_EQ(OB_SUCCESS, acc.reuse_with_start_id(0, max_id));
   ASSERT_EQ(OB_SUCCESS, acc.add_dim(5, 1.0));
 
-  ObDASRowID boundary;
-  boundary.set_uint64(10);
-  ASSERT_EQ(OB_SUCCESS, token.drain_until_active(boundary, acc));
+  ASSERT_EQ(OB_SUCCESS, token.drain_until_active(acc.get_start_id(), 10, acc));
 
   double score = 0.0;
   ASSERT_EQ(OB_SUCCESS, acc.get_score(5, score));
@@ -4155,4 +5004,133 @@ int main(int argc, char **argv)
 {
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();
+}
+
+TEST_F(TestDASBMM, active_posting_runs_clip_only_empty_tails)
+{
+  ObDASAsyncTokenOp token(search_ctx_);
+  uint64_t ids[256];
+  uint32_t compact_ids[256];
+  for (const uint64_t start : {13ULL, (1ULL << 63) + 13, UINT64_MAX - 2048ULL}) {
+    for (const int64_t capacity : {65, 257, 2049}) {
+      for (const int64_t stride : {1, 8, 16, 64}) {
+        for (int pattern = 0; pattern < 6; ++pattern) {
+          SCOPED_TRACE(::testing::Message() << "start=" << start << " capacity=" << capacity
+              << " stride=" << stride << " pattern=" << pattern);
+          DocScoreAccumulator acc;
+          ASSERT_EQ(OB_SUCCESS, acc.init(capacity, allocator_));
+          uint64_t max_id = 0;
+          ASSERT_EQ(OB_SUCCESS, acc.reuse_with_start_id(start, max_id));
+          bool active[2049] = {};
+          int64_t active_count = 0;
+          for (int64_t i = 0; i < capacity; ++i) {
+            active[i] = pattern == 0 ? false : pattern == 1 ? true
+                : pattern == 2 ? (i >= 192 && i < 224)
+                : pattern == 3 ? (i % 7 == 0)
+                : pattern == 4 ? (i == 63 || i == 64 || i == capacity - 1)
+                : (i < 16);
+            if (active[i]) {
+              ++active_count;
+              ASSERT_EQ(OB_SUCCESS, acc.add_dim(start + i, 0.5));
+            }
+          }
+          const int64_t posting_count = MIN(
+              static_cast<int64_t>(ARRAYSIZEOF(ids)), (capacity - 1) / stride + 1);
+          for (int64_t i = 0; i < posting_count; ++i) {
+            ids[i] = start + i * stride;
+            compact_ids[i] = static_cast<uint32_t>(ids[i]);
+          }
+          const int64_t first_run_count = MIN(static_cast<int64_t>(224), posting_count);
+          for (const bool compact : {false, true}) {
+            if (compact && max_id > UINT32_MAX) {
+              continue;
+            }
+            for (int run = 0; run < 2; ++run) {
+              const int64_t first = run == 0 ? 0 : first_run_count;
+              const int64_t size = run == 0 ? first_run_count : posting_count - first_run_count;
+              blocksstable::ObPostingDocIdView view;
+              view.values_ = compact ? static_cast<const void *>(compact_ids + first)
+                  : static_cast<const void *>(ids + first);
+              view.width_ = compact ? sizeof(uint32_t) : sizeof(uint64_t);
+              int64_t expected_prefix = 0;
+              if (size > 0) {
+                int64_t last_active = -1;
+                for (int64_t offset = ids[first] - start;
+                    offset <= static_cast<int64_t>(ids[first + size - 1] - start); ++offset) {
+                  if (active[offset]) {
+                    last_active = offset;
+                  }
+                }
+                for (int64_t i = 0; i < size; ++i) {
+                  if (static_cast<int64_t>(ids[first + i] - start) <= last_active) {
+                    ++expected_prefix;
+                  }
+                }
+              }
+              int64_t scoring_count = -1;
+              ASSERT_EQ(OB_SUCCESS, token.get_active_posting_prefix_count(view, size, acc, scoring_count));
+              EXPECT_EQ(expected_prefix, scoring_count) << "compact=" << compact << " run=" << run;
+              EXPECT_EQ(compact ? static_cast<const void *>(compact_ids + first)
+                  : static_cast<const void *>(ids + first), view.get_data());
+            }
+          }
+          EXPECT_EQ(active_count, acc.get_active_count());
+          EXPECT_EQ(start, acc.get_start_id());
+          for (int64_t i = 0; i < capacity; ++i) {
+            double score = 0.0;
+            ASSERT_EQ(OB_SUCCESS, acc.get_score(start + i, score));
+            EXPECT_DOUBLE_EQ(active[i] ? 0.5 : 0.0, score);
+            EXPECT_EQ(active[i], acc.bitset_->exist(i));
+          }
+          EXPECT_DOUBLE_EQ(active_count > 0 ? 0.5 : 0.0, acc.get_max_score());
+          blocksstable::ObPostingDocIdView empty_view;
+          int64_t scoring_count = -1;
+          ASSERT_EQ(OB_SUCCESS, token.get_active_posting_prefix_count(empty_view, 0, acc, scoring_count));
+          EXPECT_EQ(0, scoring_count);
+        }
+      }
+    }
+  }
+}
+
+TEST_F(TestDASBMM, active_posting_prefix_rejects_out_of_window_endpoints)
+{
+  ObDASAsyncTokenOp token(search_ctx_);
+  constexpr int64_t CAPACITY = 65;
+  for (const uint64_t start : {1000ULL, UINT64_MAX - 1024ULL}) {
+    DocScoreAccumulator acc;
+    uint64_t max_id = 0;
+    ASSERT_EQ(OB_SUCCESS, acc.init(CAPACITY, allocator_));
+    ASSERT_EQ(OB_SUCCESS, acc.reuse_with_start_id(start, max_id));
+    ASSERT_EQ(OB_SUCCESS, acc.add_dim(start + 1, 0.5));
+    ASSERT_EQ(OB_SUCCESS, acc.add_dim(max_id, 0.5));
+    const uint64_t invalid_runs[][2] = {
+      {start - 1, start + 1},
+      {start + 1, start + CAPACITY},
+      {start + 1, start + 1024},
+    };
+    for (const auto &doc_ids : invalid_runs) {
+      for (const bool compact : {false, true}) {
+        if (compact && doc_ids[1] > UINT32_MAX) {
+          continue;
+        }
+        const uint32_t compact_ids[] = {
+          static_cast<uint32_t>(doc_ids[0]), static_cast<uint32_t>(doc_ids[1])};
+        blocksstable::ObPostingDocIdView view;
+        view.values_ = compact ? static_cast<const void *>(compact_ids) : static_cast<const void *>(doc_ids);
+        view.width_ = compact ? sizeof(uint32_t) : sizeof(uint64_t);
+        int64_t scoring_count = -1;
+        ASSERT_EQ(OB_ERR_UNEXPECTED, token.get_active_posting_prefix_count(
+            view, ARRAYSIZEOF(doc_ids), acc, scoring_count));
+        EXPECT_EQ(0, scoring_count);
+        EXPECT_EQ(2, acc.get_active_count());
+        EXPECT_DOUBLE_EQ(0.5, acc.get_max_score());
+        double score = 0.0;
+        ASSERT_EQ(OB_SUCCESS, acc.get_score(start + 1, score));
+        EXPECT_DOUBLE_EQ(0.5, score);
+        ASSERT_EQ(OB_SUCCESS, acc.get_score(max_id, score));
+        EXPECT_DOUBLE_EQ(0.5, score);
+      }
+    }
+  }
 }

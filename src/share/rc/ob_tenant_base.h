@@ -129,6 +129,7 @@ class ObTenantMdsService;
 #else
 #endif
   class ObGlobalIteratorPool;
+  class ObAsyncInvIteratorPool;
   class ObInnerTabletAccessService;
   class ObTabletReorgInfoTableService;
   class ObTenantStartupStatus;
@@ -393,6 +394,7 @@ using ObHMSClientUnifyPoolMgr = share::ObCatalogClientPoolMgr<oceanbase::share::
       tmp_file::ObTenantCompressTmpFileManager*,     \
       compaction::ObTenantCompactionProgressMgr*,    \
       compaction::ObServerCompactionEventHistory*,   \
+      storage::ObAsyncInvIteratorPool*,                   \
       storage::ObTenantTabletStatMgr*,               \
       lockwaitmgr::ObLockWaitMgr*,                      \
       transaction::tablelock::ObTableLockService*,   \

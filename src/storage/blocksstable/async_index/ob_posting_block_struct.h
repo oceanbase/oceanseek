@@ -17,7 +17,7 @@ namespace blocksstable
 {
 
 struct ObInvIdxBM25ParamPair;
-struct ObPostingBlockData;
+class ObPostingBlockData;
 
 // default fixed document count of one posting block
 static const int64_t DEFAULT_POSTING_BLOCK_CAPACITY = 256;
@@ -272,19 +272,22 @@ struct ObFlatCacheBlockDesc
 
 // FlatCache representation of one posting-data micro block.
 // The on-disk ObInvIdxMicroBlockPayloadHeader format stays unchanged. Cache
-// users see one descriptor array followed by shared uint64 columns. Search
-// indexes have only doc-id; full-text indexes additionally have token-freq and
-// doc-length. The payload base, header and descriptors are all 8B-aligned.
+// users see one descriptor array followed by shared columns. FTS doc IDs are
+// uint32 or uint64, while doc-only SEARCH cache values retain uint64 IDs;
+// token-freq and doc-length are both uint32 or both uint64 for the entire micro.
+// Column bases are aligned to their element width. Padding after compact doc
+// IDs preserves 8B alignment for uint64 relevance. The on-disk format is unchanged.
 struct ObFlatCacheHeader
 {
-  static const uint8_t FORMAT_VERSION = 3;
+  static const uint8_t FORMAT_VERSION = 4;
   static const int64_t MAX_BLOCK_COUNT = UINT16_MAX;
 
   ObFlatCacheHeader()
     : format_version_(FORMAT_VERSION),
       column_count_(ObPostingBlockHeader::POSTING_COL_CNT_DOC_ID_ONLY),
       block_count_(0),
-      reserved32_(0)
+      doc_id_width_(sizeof(uint64_t)),
+      relevance_width_(0)
   {}
   OB_INLINE bool has_relevance_params() const
   {
@@ -296,15 +299,82 @@ struct ObFlatCacheHeader
         && (ObPostingBlockHeader::POSTING_COL_CNT_DOC_ID_ONLY == column_count_
             || ObPostingBlockHeader::POSTING_COL_CNT_WITH_RELEVANCE_PARAMS == column_count_)
         && block_count_ > 0
-        && 0 == reserved32_;
+        && (sizeof(uint64_t) == doc_id_width_
+            || (has_relevance_params() && sizeof(uint32_t) == doc_id_width_))
+        && (has_relevance_params()
+            ? (sizeof(uint32_t) == relevance_width_ || sizeof(uint64_t) == relevance_width_)
+            : 0 == relevance_width_);
   }
-  TO_STRING_KV(K_(format_version), K_(column_count), K_(block_count));
+  static uint64_t doc_ids_offset(const uint64_t block_count)
+  { return sizeof(ObFlatCacheHeader) + block_count * sizeof(ObFlatCacheBlockDesc); }
+  static uint64_t relevance_offset(
+      const uint64_t block_count, const uint64_t row_count, const uint32_t doc_id_width)
+  { return (doc_ids_offset(block_count) + row_count * doc_id_width + 7) & ~7ULL; }
+  static uint64_t payload_size(const uint64_t block_count, const uint64_t row_count,
+      const uint32_t doc_id_width, const uint32_t relevance_width)
+  { return relevance_offset(block_count, row_count, doc_id_width) + 2 * row_count * relevance_width; }
+  TO_STRING_KV(K_(format_version), K_(column_count), K_(block_count), K_(doc_id_width), K_(relevance_width));
 
   uint8_t format_version_;
   uint8_t column_count_;
   uint16_t block_count_;
-  uint32_t reserved32_;
+  uint16_t doc_id_width_; // FTS: 4 or 8 bytes; doc-only cache remains uint64
+  uint16_t relevance_width_; // 0 without relevance, otherwise 4 or 8 bytes per value
 } __attribute__((packed));
+
+// Borrowed doc-id slice. Compact FTS micros use absolute uint32 IDs, so no
+// base reconstruction is needed. Doc-only SEARCH cache values remain uint64.
+class ObPostingDocIdView
+{
+public:
+  ObPostingDocIdView() : values_(nullptr), width_(0) {}
+  void reset() { values_ = nullptr; width_ = 0; }
+  bool is_uint32() const { return sizeof(uint32_t) == width_; }
+  bool is_valid() const
+  { return nullptr != values_ && (is_uint32() || sizeof(uint64_t) == width_); }
+  const void *get_data() const { return values_; }
+  const uint32_t *get_uint32() const
+  { return is_uint32() ? static_cast<const uint32_t *>(values_) : nullptr; }
+  const uint64_t *get_uint64() const
+  { return sizeof(uint64_t) == width_ ? static_cast<const uint64_t *>(values_) : nullptr; }
+  uint64_t at(const int64_t idx) const
+  { return is_uint32() ? get_uint32()[idx] : get_uint64()[idx]; }
+
+private:
+  friend class ObFlatCacheReader;
+  friend class ObPostingBlockData;
+  const void *values_;
+  uint32_t width_;
+};
+
+// Non-owning typed projection of the two relevance columns. Its lifetime is
+// bounded by the posting-data cache handle held by the originating iterator.
+class ObPostingRelevanceView
+{
+public:
+  ObPostingRelevanceView() : token_freqs_(nullptr), doc_lengths_(nullptr), width_(0) {}
+  void reset() { token_freqs_ = nullptr; doc_lengths_ = nullptr; width_ = 0; }
+  bool has_relevance_params() const
+  { return nullptr != token_freqs_ && nullptr != doc_lengths_; }
+  bool is_uint32() const { return sizeof(uint32_t) == width_; }
+  const void *get_token_freqs_data() const { return token_freqs_; }
+  const void *get_doc_lengths_data() const { return doc_lengths_; }
+  const uint32_t *get_token_freqs32() const
+  { return is_uint32() ? static_cast<const uint32_t *>(token_freqs_) : nullptr; }
+  const uint32_t *get_doc_lengths32() const
+  { return is_uint32() ? static_cast<const uint32_t *>(doc_lengths_) : nullptr; }
+  const uint64_t *get_token_freqs64() const
+  { return sizeof(uint64_t) == width_ ? static_cast<const uint64_t *>(token_freqs_) : nullptr; }
+  const uint64_t *get_doc_lengths64() const
+  { return sizeof(uint64_t) == width_ ? static_cast<const uint64_t *>(doc_lengths_) : nullptr; }
+
+private:
+  friend class ObFlatCacheReader;
+  friend class ObPostingBlockData;
+  const void *token_freqs_;
+  const void *doc_lengths_;
+  uint32_t width_;
+};
 
 // Non-owning reader over one Transformer-produced immutable cache value. It
 // enforces physical framing/layout and caller indexes; descriptor content and
@@ -320,6 +390,7 @@ public:
   {
     return OB_NOT_NULL(header_) ? header_->block_count_ : 0;
   }
+  // Legacy physical range API: compact FTS columns return OB_NOT_SUPPORTED.
   int get_doc_id_view(
       const int64_t first_block_idx,
       const int64_t last_block_idx,
@@ -330,60 +401,52 @@ public:
       ObPostingBlockData &block_data) const;
 
 private:
+  int assign_columns(const int64_t start_idx, const int64_t doc_count,
+      ObPostingBlockData &block_data) const;
   const ObFlatCacheHeader *header_;
   const ObFlatCacheBlockDesc *descs_;
-  const uint64_t *doc_ids_;
-  const uint64_t *token_freqs_;
-  const uint64_t *doc_lengths_;
+  ObPostingDocIdView doc_ids_;
+  ObPostingRelevanceView relevance_;
+  int64_t row_count_;
   DISALLOW_COPY_AND_ASSIGN(ObFlatCacheReader);
 };
 
-// Read-only transient view over one DECODED logical posting block living in a
-// cached ObMicroBlockData::buf_ (INV_IDX_POSTING_BLOCK). Pointers reference the
-// stable cached buffer; the view owns nothing and must not outlive the cache
-// handle. Built by pure offset resolution, no decoding and no allocation.
-//
-// Decoded logical block layout (self-relative, 8B-aligned uint64 columns):
-//   [ObPostingBlockHeader -> padded to HEADER_SIZE]
-//   [doc_id     : uint64 x row_count]
-//   [token_freq : uint64 x row_count]   only when has_relevance_params_
-//   [doc_length : uint64 x row_count]   only when has_relevance_params_
-// The decoded layout is governed by HEADER_SIZE, not by
-// ObPostingBlockHeader::get_header_size() (which sizes the encoded header).
-struct ObPostingBlockData
+// Non-owning view over a contiguous span of transformed posting columns.
+class ObPostingBlockData
 {
-  static constexpr int64_t COL_WIDTH = sizeof(uint64_t);
-  static constexpr int64_t HEADER_SIZE =
-      ((sizeof(ObPostingBlockHeader) + COL_WIDTH - 1) / COL_WIDTH) * COL_WIDTH;
-
-  ObPostingBlockData() : doc_count_(0), doc_ids_(nullptr),
-      token_freqs_(nullptr), doc_lengths_(nullptr) {}
-  int init(const char *block_buf, const int64_t block_size);
+public:
+  ObPostingBlockData() : doc_count_(0), doc_ids_(), relevance_() {}
+  int assign(const int64_t doc_count, const ObPostingDocIdView &doc_ids,
+      const ObPostingRelevanceView &relevance);
   void reset()
   {
     doc_count_ = 0;
-    doc_ids_ = nullptr;
-    token_freqs_ = nullptr;
-    doc_lengths_ = nullptr;
+    doc_ids_.reset();
+    relevance_.reset();
   }
-  OB_INLINE bool is_valid() const { return doc_count_ > 0 && nullptr != doc_ids_; }
-  OB_INLINE bool has_relevance_params() const { return nullptr != token_freqs_; }
+  OB_INLINE bool is_valid() const { return doc_count_ > 0 && doc_ids_.is_valid(); }
+  OB_INLINE bool has_relevance_params() const { return relevance_.has_relevance_params(); }
   OB_INLINE int64_t get_row_count() const { return doc_count_; }
-  // Read-only contiguous column pointers for batch access. Valid only while the
-  // backing micro block and this view are not reset/moved; never retain beyond.
-  OB_INLINE const uint64_t *get_doc_ids() const { return doc_ids_; }
-  OB_INLINE const uint64_t *get_token_freqs() const { return token_freqs_; }
-  OB_INLINE const uint64_t *get_doc_lengths() const { return doc_lengths_; }
+  // The pointer is valid only while the backing cache handle is retained.
+  // Use get_doc_id_view() or doc_id_at() to read values of either width.
+  OB_INLINE const void *get_doc_ids() const { return doc_ids_.values_; }
+  OB_INLINE uint64_t doc_id_at(const int64_t idx) const { return doc_ids_.at(idx); }
+  int get_doc_id_view(const int64_t start_idx, ObPostingDocIdView &view) const;
+  // Returns the appropriately typed slice without materializing either column.
+  int get_relevance_view(const int64_t start_idx, ObPostingRelevanceView &view) const;
   int get_doc_id(const int64_t idx, uint64_t &doc_id) const;
   int get_relevance_params(const int64_t idx, uint64_t &token_freq, uint64_t &doc_length) const;
-  // first idx in [start, end) with doc_ids_[idx] >= target; OB_BEYOND_THE_RANGE if none
+  // first idx in [start, end) with doc_id_at(idx) >= target; OB_BEYOND_THE_RANGE if none
   int lower_bound(const uint64_t target, const int64_t start, const int64_t end, int64_t &idx) const;
-  TO_STRING_KV(K_(doc_count), KP_(doc_ids), KP_(token_freqs), KP_(doc_lengths));
+  // first idx in [start, end) with doc_id_at(idx) > target; end if none
+  int upper_bound(const uint64_t target, const int64_t start, const int64_t end, int64_t &idx) const;
+  TO_STRING_KV(K_(doc_count), KP(doc_ids_.values_), K(doc_ids_.width_),
+      KP(relevance_.token_freqs_), KP(relevance_.doc_lengths_), K(relevance_.width_));
 
+private:
   int64_t doc_count_;
-  const uint64_t *doc_ids_;     // array with doc_count_ elements
-  const uint64_t *token_freqs_; // nullptr means absent
-  const uint64_t *doc_lengths_; // nullptr means absent
+  ObPostingDocIdView doc_ids_;
+  ObPostingRelevanceView relevance_;
 };
 
 // Layout of posting value block, row order is aligned with posting block:

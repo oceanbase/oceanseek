@@ -13,7 +13,9 @@
 #include "sql/das/search/ob_das_async_index_query_ctx.h"
 #include "sql/das/search/ob_das_bitmap_op.h"
 #include "storage/tx_storage/ob_access_service.h"
+#include "storage/access/ob_async_inv_iterator_pool.h"
 #include "share/logical_table/ob_logical_table_range_builder.h"
+#include "observer/omt/ob_tenant_config_mgr.h"
 
 namespace oceanbase
 {
@@ -40,6 +42,14 @@ void ObDASSearchCtx::reset()
     }
   }
   op_store_.reset();
+  posting_table_cache_.reset();
+  // Operators must return their leases before the query loses the pool binding.
+  if (nullptr != inv_iter_pool_) {
+    storage::ObAsyncInvIteratorPool *pool = inv_iter_pool_;
+    inv_iter_pool_ = nullptr;
+    pool->unpin();
+  }
+  enable_inv_iter_pool_ = false;
   op_count_ = 0;
   generating_topk_limit_ = -1;
   streaming_ror_costing_topk_hint_ = -1;
@@ -71,6 +81,65 @@ void ObDASSearchCtx::reset()
   for (int i = 0; i < DAS_SCOPE_MAX; ++i) {
     scopes_[i] = ObDASRowIDScope();
   }
+}
+
+int ObDASSearchCtx::acquire_posting_entry(blocksstable::ObInvPostingIterEntry *&entry)
+{
+  int ret = OB_SUCCESS;
+  if (enable_inv_iter_pool_ && nullptr == inv_iter_pool_) {
+    storage::ObAsyncInvIteratorPool *pool = MTL(storage::ObAsyncInvIteratorPool *);
+    // Admission is independent of the ordinary row iterator pool.
+    if (nullptr != pool && pool->pin()) {
+      inv_iter_pool_ = pool;
+    }
+  }
+  if (nullptr != inv_iter_pool_) {
+    if (OB_FAIL(inv_iter_pool_->get_inv_entry(
+        blocksstable::ObInvPostingIterEntry::ReuseKey{}, entry))) {
+      LOG_WARN("failed to acquire posting entry, use original allocation", K(ret));
+      // Pool allocation is optional; the original scan path remains available.
+      ret = OB_SUCCESS;
+    }
+  }
+  return ret;
+}
+
+int ObDASSearchCtx::prepare_posting_scan(
+    const bool use_pool,
+    common::ObIAllocator &scan_allocator,
+    blocksstable::ObInvPostingScanParam &param,
+    blocksstable::ObInvPostingIterEntry *&entry)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(nullptr != entry)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("posting entry must be closed before preparing a scan", K(ret), KP(entry));
+  } else if (use_pool && OB_FAIL(acquire_posting_entry(entry))) {
+    LOG_WARN("failed to acquire posting entry", K(ret));
+  } else {
+    param.allocator_ = &scan_allocator;
+    param.reusable_iter_ = nullptr != entry ? &entry->iter_ : nullptr;
+    param.table_cache_ = &posting_table_cache_;
+  }
+  return ret;
+}
+
+void ObDASSearchCtx::close_posting_scan(
+    blocksstable::ObInvPostingScanParam &param,
+    common::ObIAllocator &scan_allocator,
+    blocksstable::ObInvPostingIterEntry *&entry,
+    blocksstable::ObInvSSTablePostingIter *&iter)
+{
+  if (nullptr != entry) {
+    iter = nullptr;
+    inv_iter_pool_->release_inv_entry(entry);
+  } else if (nullptr != iter) {
+    iter->~ObInvSSTablePostingIter();
+    scan_allocator.free(iter);
+    iter = nullptr;
+  }
+  param.reusable_iter_ = nullptr;
+  param.allocator_ = &scan_allocator;
 }
 
 ObDASFilterBitmapProvider *ObDASSearchCtx::find_filter_bitmap_provider(
@@ -278,6 +347,9 @@ int ObDASSearchCtx::init(
 {
   int ret = OB_SUCCESS;
   void *buf = nullptr;
+  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
+  enable_inv_iter_pool_ = tenant_config.is_valid()
+      && static_cast<int64_t>(tenant_config->async_inverted_index_iter_cache_max_size) > 0;
   if (OB_ISNULL(root_das_task_.get_rtdef()) ||
       OB_ISNULL(eval_ctx_ = root_das_task_.get_rtdef()->eval_ctx_)) {
     ret = OB_ERR_UNEXPECTED;

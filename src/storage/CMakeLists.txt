@@ -765,6 +765,7 @@ ob_set_subtarget(ob_storage access
   access/ob_pushdown_aggregate.cpp
   access/ob_pushdown_aggregate_vec.cpp
   access/ob_empty_read_bucket.cpp
+  access/ob_async_inv_iterator_pool.cpp
   access/ob_global_iterator_pool.cpp
   access/ob_where_optimizer.cpp
   access/ob_skip_index_sortedness.cpp

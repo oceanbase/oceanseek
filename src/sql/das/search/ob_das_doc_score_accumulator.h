@@ -10,11 +10,15 @@
 #include "sql/engine/ob_bit_vector.h"
 #include "lib/container/ob_fixed_array.h"
 #include "lib/allocator/ob_allocator.h"
+#include "storage/blocksstable/async_index/ob_posting_block_struct.h"
 
 namespace oceanbase
 {
 namespace sql
 {
+
+template <bool ONLY_EXISTING> class BM25AccumulationKernels;
+struct ObBM25PrecomputedParams;
 
 // uint64_t-word bit utilities shared by the dense doc-score bitset scans
 // (DocScoreAccumulator / DocScoreIter) and the BMM filter drain sink.
@@ -51,6 +55,9 @@ OB_INLINE constexpr uint64_t clear_bit(uint64_t word, const int64_t offset)
 { return word & ~offset_mask(offset); }
 // Index of the lowest set bit.
 OB_INLINE constexpr int64_t lowest_set_bit(const uint64_t word) { return __builtin_ctzll(word); }
+// Index of the highest set bit. Requires word != 0.
+OB_INLINE constexpr int64_t highest_set_bit(const uint64_t word)
+{ return WORD_BITS - 1 - __builtin_clzll(word); }
 // Clear the lowest set bit of word.
 OB_INLINE constexpr uint64_t clear_lowest_set_bit(const uint64_t word) { return word & (word - 1); }
 // Clear all bits below `bit`, keeping bits [bit, WORD_BITS). Safe for bit in [0, WORD_BITS].
@@ -79,7 +86,6 @@ class DocScoreAccumulator final
 {
 public:
   friend class DocScoreIter;
-  static constexpr int64_t SCORE_BATCH_SIZE = 4;
   DocScoreAccumulator();
   ~DocScoreAccumulator() { reset(); }
 
@@ -94,64 +100,42 @@ public:
   int add_dim(const uint64_t doc_id, const double score);
   // Batch Invariant: doc_ids must be in ascending order.
   int add_dim_batch(const uint64_t *doc_ids, const double *scores, const int64_t count);
-  // Ascending IDs, no filter mask. scorer.eval_batch() evaluates each full SIMD
-  // batch, while scorer() handles the scalar tail. The scorer may not mutate or
-  // observe the accumulator or input IDs; accumulation preserves add_dim_batch's order.
-  template <typename Scorer>
-  OB_INLINE int add_scored_dim_batch(
-      const uint64_t *doc_ids,
+  // IDs are strictly increasing. The kernel-set type binds validation and execution
+  // to one mode: expansion requires in-window IDs; existing-only ignores outside IDs
+  // and preserves presence. Empty batches leave all state unchanged.
+  template <bool ONLY_EXISTING>
+  OB_INLINE int add_scored_dim_batch_fused(
+      const blocksstable::ObPostingDocIdView &doc_ids,
+      const blocksstable::ObPostingRelevanceView &relevance,
       const int64_t count,
-      const Scorer &scorer)
+      const ObBM25PrecomputedParams &params,
+      const BM25AccumulationKernels<ONLY_EXISTING> &kernels,
+      int64_t &matched)
   {
     int ret = OB_SUCCESS;
+    matched = 0;
+    const void *token_freqs = relevance.is_uint32()
+        ? static_cast<const void *>(relevance.get_token_freqs32()) : relevance.get_token_freqs64();
+    const void *doc_lengths = relevance.is_uint32()
+        ? static_cast<const void *>(relevance.get_doc_lengths32()) : relevance.get_doc_lengths64();
     if (OB_UNLIKELY(count <= 0)) {
-      // Match the empty-batch contract of add_dim_batch.
-    } else if (OB_UNLIKELY(nullptr == doc_ids || !is_valid() || has_filter_mask())) {
+    } else if (OB_UNLIKELY(!is_valid() || !kernels.is_valid() || !doc_ids.is_valid()
+                          || nullptr == token_freqs || nullptr == doc_lengths
+                          || (!ONLY_EXISTING && has_filter_mask()))) {
       ret = OB_INVALID_ARGUMENT;
-      LOG_WARN("invalid directly scored batch", K(ret), KP(doc_ids), K(count), K_(is_inited));
-    } else if (OB_UNLIKELY(!is_doc_in_window(doc_ids[0])
-                          || !is_doc_in_window(doc_ids[count - 1]))) {
+      LOG_WARN("invalid fused posting batch", K(ret), KP(token_freqs), KP(doc_lengths), K(count), K_(is_inited));
+    } else if (!ONLY_EXISTING && OB_UNLIKELY(!is_doc_in_window(doc_ids.at(0))
+                          || !is_doc_in_window(doc_ids.at(count - 1)))) {
       ret = OB_INDEX_OUT_OF_RANGE;
-      LOG_WARN("directly scored batch endpoints out of range", K(ret), K(count),
-          K(doc_ids[0]), K(doc_ids[count - 1]), K_(start_id), K_(capacity));
+      LOG_WARN("fused posting batch endpoints out of range", K(ret), K(count),
+          K(doc_ids.at(0)), K(doc_ids.at(count - 1)), K_(start_id), K_(capacity));
     } else {
-      double *acc_scores = scores_.get_data();
-      uint64_t *words = bitset_->reinterpret_data<uint64_t>();
-      int64_t i = 0;
-      for (; i + SCORE_BATCH_SIZE - 1 < count; i += SCORE_BATCH_SIZE) {
-        uint64_t offsets[SCORE_BATCH_SIZE];
-        for (int64_t lane = 0; lane < SCORE_BATCH_SIZE; ++lane) {
-          offsets[lane] = doc_ids[i + lane] - start_id_;
-        }
-        double values[SCORE_BATCH_SIZE];
-        scorer.eval_batch(i, SCORE_BATCH_SIZE, values);
-        for (int64_t lane = 0; lane < SCORE_BATCH_SIZE; ++lane) {
-          const uint64_t offset = offsets[lane];
-          const uint64_t mask = 1ULL << (offset & 63);
-          if (0 == (words[offset >> 6] & mask)) {
-            acc_scores[offset] = values[lane];
-            words[offset >> 6] |= mask;
-            max_score_ = MAX(max_score_, values[lane]);
-            is_empty_ = false;
-          } else {
-            acc_scores[offset] += values[lane];
-            max_score_ = MAX(max_score_, acc_scores[offset]);
-          }
-        }
-      }
-      for (; i < count; ++i) {
-        const uint64_t offset = doc_ids[i] - start_id_;
-        const double score = scorer(i);
-        const uint64_t mask = 1ULL << (offset & 63);
-        if (0 == (words[offset >> 6] & mask)) {
-          acc_scores[offset] = score;
-          words[offset >> 6] |= mask;
-          max_score_ = MAX(max_score_, score);
-          is_empty_ = false;
-        } else {
-          acc_scores[offset] += score;
-          max_score_ = MAX(max_score_, acc_scores[offset]);
-        }
+      const typename BM25AccumulationKernels<ONLY_EXISTING>::Kernel kernel = kernels.select(
+          doc_ids.is_uint32() ? sizeof(uint32_t) : sizeof(uint64_t),
+          relevance.is_uint32() ? sizeof(uint32_t) : sizeof(uint64_t));
+      matched = kernel(*this, doc_ids.get_data(), token_freqs, doc_lengths, count, params);
+      if (!ONLY_EXISTING && matched > 0) {
+        is_empty_ = false;
       }
     }
     return ret;
@@ -172,6 +156,15 @@ public:
       max_score_ = MAX(max_score_, scores_.at(offset));
     }
     return ret;
+  }
+
+  // Caller must provide a valid accumulator and an in-window offset already active in bitset_.
+  OB_INLINE void add_existing_dim_at_offset(const int64_t offset, const double score)
+  {
+    OB_ASSERT(is_valid() && offset >= 0 && offset < capacity_);
+    double &acc_score = scores_.get_data()[offset];
+    acc_score += score;
+    max_score_ = MAX(max_score_, acc_score);
   }
 
   OB_INLINE bool is_valid() const { return is_inited_ && nullptr != bitset_; }
@@ -198,11 +191,22 @@ public:
     return count;
   }
 
+  // Inclusive active bounds within [range_start, boundary]. Only empty edge words are scanned;
+  // candidates in both edge words make this constant work, regardless of window size.
+  // Requires a valid accumulator; false means there is no active doc in this range.
+  bool get_active_range(const uint64_t range_start, const uint64_t boundary,
+                        uint64_t &first_id, uint64_t &last_id) const;
+
   int get_score(const uint64_t doc_id, double &score) const;
   // Remove docs whose accumulated score <= min_required_score from the bitset and
   // update max_score_ and is_empty_ accordingly.
   // Used for per-doc competitive filtering between non-essential dimensions.
   int filter_below_score(const double min_required_score);
+  // Collect all active IDs in ascending order into caller-owned storage; overwrite count.
+  int collect_active_doc_ids(uint64_t *doc_ids, const int64_t doc_id_capacity, int64_t &count) const;
+  // Compact IDs collected from this window and prune it in place; scores stay in the accumulator.
+  // min_required_score must be positive.
+  int filter_scored_candidates(uint64_t *doc_ids, int64_t &count, const double min_required_score);
   // Keep only documents whose corresponding bit is present in `mask`.
   // The caller must provide a mask with the same capacity as this accumulator.
   int retain_by_mask(const ObBitVector &mask);
@@ -217,6 +221,9 @@ public:
   TO_STRING_KV(K_(start_id), K_(capacity), K_(max_score), K_(is_empty), K_(is_inited));
 
 private:
+  class FusedExecutor;
+  template <bool ONLY_EXISTING> friend class BM25AccumulationKernels;
+
   OB_INLINE bool is_doc_in_window(const uint64_t doc_id) const
   {
     return capacity_ > 0

@@ -1187,17 +1187,17 @@ int ObDASBitmapOp::do_drain_into_filter_bitset(
   int ret = OB_SUCCESS;
   int64_t copied_count = 0;
   observed_count = 0;
-  if (!is_filter_bitmap_view()) {
+  if (!can_copy_filter_words()) {
     ret = OB_NOT_SUPPORTED;
-    LOG_WARN("direct filter bitset drain requires a provider bitmap view", K(ret));
+    LOG_WARN("direct filter bitset drain requires a ready non-scoring UINT64 bitmap", K(ret));
   } else if (OB_FAIL(ensure_bitmap_ready())) {
-    LOG_WARN("failed to ensure provider bitmap for direct drain", K(ret));
+    LOG_WARN("failed to ensure filter bitmap for direct drain", K(ret));
   } else if (OB_UNLIKELY(exhausted_ || iter_end)) {
     ret = OB_STATE_NOT_MATCH;
-    LOG_WARN("cannot drain an exhausted provider bitmap", K(ret), K_(exhausted), K(iter_end));
+    LOG_WARN("cannot drain an exhausted filter bitmap", K(ret), K_(exhausted), K(iter_end));
   } else if (OB_UNLIKELY(!bitmap_iter_.is_inited() || OB_ISNULL(bitmap_))) {
     ret = OB_NOT_INIT;
-    LOG_WARN("provider bitmap is not initialized", K(ret), KP_(bitmap));
+    LOG_WARN("filter bitmap is not initialized", K(ret), KP_(bitmap));
   } else if (OB_UNLIKELY(!batch_start_id.is_normal()
                          || !batch_end_id.is_normal()
                          || !curr_id.is_normal()
@@ -1218,16 +1218,16 @@ int ObDASBitmapOp::do_drain_into_filter_bitset(
                     || effective_end < current
                     || effective_end - batch_start >= static_cast<uint64_t>(capacity))) {
       ret = OB_INVALID_ARGUMENT;
-      LOG_WARN("provider bitmap cursor is outside the destination window", K(ret),
+      LOG_WARN("filter bitmap cursor is outside the destination window", K(ret),
                K(batch_start), K(batch_end), K(current), K(effective_end), K(capacity));
     } else if (OB_FAIL(bitmap_->copy_range_to_words(
                    current, effective_end, batch_start, capacity,
                    filter_words, copied_count))) {
-      LOG_WARN("failed to copy provider bitmap range", K(ret),
+      LOG_WARN("failed to copy filter bitmap range", K(ret),
                K(batch_start), K(effective_end), K(current), K(capacity));
     } else if (OB_UNLIKELY(copied_count <= 0)) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("current provider bitmap row is missing from copied range", K(ret),
+      LOG_WARN("current filter bitmap row is missing from copied range", K(ret),
                K(current), K(effective_end), K(copied_count));
     } else {
       has_pending_first_ = false;
@@ -1245,7 +1245,7 @@ int ObDASBitmapOp::do_drain_into_filter_bitset(
           iter_end = true;
         } else if (OB_SUCCESS != advance_ret) {
           ret = advance_ret;
-          LOG_WARN("failed to advance provider bitmap after direct drain", K(ret), K(effective_end));
+          LOG_WARN("failed to advance filter bitmap after direct drain", K(ret), K(effective_end));
         } else {
           curr_id.set_uint64(next_val);
           iter_end = false;

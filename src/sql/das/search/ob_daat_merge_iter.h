@@ -6,6 +6,7 @@
 #ifndef SQL_DAS_SEARCH_OB_DAAT_MERGE_ITER_H_
 #define SQL_DAS_SEARCH_OB_DAAT_MERGE_ITER_H_
 
+#include <type_traits>
 #include "sql/das/search/ob_i_das_search_op.h"
 
 namespace oceanbase
@@ -15,6 +16,8 @@ namespace sql
 {
 
 class DocScoreAccumulator;
+class ObDASAsyncTokenOp;
+class SparseCandidateBuffer;
 
 // Operator wrapper iter for document-at-a-time query processing
 class ObDAATMergeIter
@@ -27,6 +30,14 @@ public:
   int next();
   int advance_to(const ObDASRowID &target);
   int advance_to_id(const ObDASRowID &target);
+  // EOF is reported as success with iter_end set; curr_id is invalid in that case.
+  // Otherwise curr_id is at least target. The fallback may materialize the score.
+  int advance_to_uint64(const uint64_t target, uint64_t &curr_id, bool &iter_end);
+  // Probe 1..MAX_SORTED_PROBE_COUNT strictly increasing physical IDs. Add scores and
+  // mark hits, including zero scores; leave unmatched slots unchanged. Restore row
+  // positioning as needed; EOF succeeds. Errors may leave partial results and cursor progress.
+  int probe_sorted_candidates(const uint64_t *ids, const int64_t count,
+      double *scores, bool *matched);
   int advance_shallow(const ObDASRowID &target, const bool inclusive);
   int to_shallow();
   int get_curr_id(ObDASRowID &curr_id) const;
@@ -42,13 +53,16 @@ public:
       bool &can_calc);
   int64_t get_iter_idx() const { return iter_idx_; }
   // Batch drain: consume this iterator's current doc and following docs <= boundary_id
-  // into doc_score_acc. The underlying search op drain starts from its next row, so this
+  // into the sink. The underlying search op drain starts from its next row, so this
   // wrapper owns the current cached row semantics.
   // After return: curr_id_/curr_score_ reflect the first doc beyond boundary (or iter_end_).
-  int drain_until(const ObDASRowID &boundary_id, DocScoreAccumulator &doc_score_acc);
-  // Non-essential scoring fast path. The accumulator window defines where the op starts;
-  // only active candidates are scored, and the cached scalar row is intentionally not refreshed.
-  int drain_until_active(const ObDASRowID &boundary_id, DocScoreAccumulator &doc_score_acc);
+  template <typename Sink>
+  int drain_until(const ObDASRowID &boundary_id, Sink &sink);
+  // Add scores to active docs within inclusive bounds and invalidate the cached scalar row.
+  int drain_until_active(const uint64_t range_start, const uint64_t range_end,
+                         DocScoreAccumulator &doc_score_acc);
+  // Supplement compact, unconsumed candidates and refresh the lookahead row.
+  int score_candidates(SparseCandidateBuffer &candidates);
 
   // Internal buffer size for batch drain.
   static constexpr int64_t DRAIN_BATCH_SIZE = DAS_SEARCH_ROWID_DRAIN_BATCH_SIZE;
@@ -65,6 +79,8 @@ public:
       K_(in_shallow_status),
       K_(iter_end));
 private:
+  int drain_into_accumulator(const ObDASRowID &boundary_id, DocScoreAccumulator &doc_score_acc);
+
   ObIDASSearchOp *op_;
   ObDASRowID curr_id_;
   double curr_score_;
@@ -75,6 +91,7 @@ private:
   bool max_score_calculated_;
   bool in_shallow_status_;
   bool iter_end_;
+  ObDASAsyncTokenOp *async_token_op_;
   bool is_inited_;
 };
 
@@ -183,6 +200,36 @@ int drain_search_op_until(
           drained = true;
         }
       }
+    }
+  }
+  return ret;
+}
+
+template <typename Sink>
+int ObDAATMergeIter::drain_until(
+    const ObDASRowID &boundary_id, Sink &sink)
+{
+  int ret = OB_SUCCESS;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("merge iterator not initialized", K(ret));
+  } else if (iter_end_) {
+  } else if (in_shallow_status_ || !curr_score_materialized_) {
+    // Shallow positioning or deferred scoring leaves no usable cached score to drain.
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("scored drain requires a materialized current row", K(ret));
+  } else {
+    if constexpr (std::is_same<Sink, DocScoreAccumulator>::value) {
+      if (OB_FAIL(drain_into_accumulator(boundary_id, sink))) {
+        LOG_WARN("failed to drain rows into accumulator", K(ret), K(boundary_id));
+      }
+    } else if (OB_FAIL(drain_search_op_until(
+        *op_, curr_id_, curr_score_, iter_end_, boundary_id, sink))) {
+      LOG_WARN("failed to drain scored rows until boundary", K(ret), K(boundary_id));
+    }
+    if (OB_SUCC(ret)) {
+      // A successful drain retains a materialized lookahead score unless the iterator reached EOF.
+      curr_score_materialized_ = !iter_end_;
     }
   }
   return ret;

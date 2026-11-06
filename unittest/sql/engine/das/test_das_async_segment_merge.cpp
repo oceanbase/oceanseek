@@ -478,7 +478,7 @@ public:
                 const std::vector<double> &scores)
     : ObIDASSearchOp(search_ctx), rowids_(rowids), scores_(scores), pos_(-1),
       bind_count_(0), last_range_base_(-1), last_threshold_(-1.0),
-      shallow_count_(0), open_count_(0), rescan_count_(0), advance_count_(0),
+      shallow_count_(0), open_count_(0), rescan_count_(0), release_count_(0), advance_count_(0),
       drain_count_(0), max_drain_capacity_(0), advance_ret_(OB_SUCCESS),
       next_ret_(OB_SUCCESS), drain_ret_(OB_SUCCESS), shallow_ret_(OB_SUCCESS),
       last_advance_target_(),
@@ -492,6 +492,12 @@ public:
   int64_t shallow_count() const { return shallow_count_; }
   int64_t open_count() const { return open_count_; }
   int64_t rescan_count() const { return rescan_count_; }
+  int64_t release_count() const { return release_count_; }
+  void release_scan_resources() override
+  {
+    ++release_count_;
+    ObIDASSearchOp::release_scan_resources();
+  }
   int64_t advance_count() const { return advance_count_; }
   int64_t drain_count() const { return drain_count_; }
   int64_t max_drain_capacity() const { return max_drain_capacity_; }
@@ -649,6 +655,7 @@ private:
   int64_t shallow_count_;
   int64_t open_count_;
   int64_t rescan_count_;
+  int64_t release_count_;
   int64_t advance_count_;
   int64_t drain_count_;
   int64_t max_drain_capacity_;
@@ -1702,6 +1709,62 @@ ObArenaAllocator TestDASAsyncSegmentMerge::fake_ls_allocator_("AsyncSegLS");
 storage::ObLSService TestDASAsyncSegmentMerge::fake_ls_service_;
 storage::ObLS *TestDASAsyncSegmentMerge::fake_ls_ = nullptr;
 
+TEST_F(TestDASAsyncSegmentMerge, scalar_release_scan_resources_without_pool)
+{
+  ObDASAsyncScalarRangeOp range_op(search_ctx_);
+  ObDASAsyncScalarRorOp ror_op(search_ctx_);
+  void *range_buf = range_op.range_iter_allocator_.alloc(
+      sizeof(blocksstable::ObInvSSTableRangeIter));
+  ASSERT_NE(nullptr, range_buf);
+  range_op.range_iter_ = new (range_buf) blocksstable::ObInvSSTableRangeIter();
+  void *posting_buf = ror_op.posting_iter_allocator_.alloc(
+      sizeof(blocksstable::ObInvSSTablePostingIter));
+  ASSERT_NE(nullptr, posting_buf);
+  ror_op.posting_iter_ = new (posting_buf) blocksstable::ObInvSSTablePostingIter();
+  ASSERT_EQ(nullptr, ror_op.posting_entry_);
+  // Dispatch through the same interface as GroupMerge; repeated release is safe.
+  ObIDASSearchOp *ops[] = { &range_op, &ror_op };
+  for (int64_t round = 0; round < 2; ++round) {
+    for (int64_t i = 0; i < 2; ++i) {
+      ops[i]->release_scan_resources();
+    }
+    EXPECT_EQ(nullptr, range_op.range_iter_);
+    EXPECT_EQ(nullptr, ror_op.posting_iter_);
+    EXPECT_EQ(0, range_op.range_iter_allocator_.total());
+    EXPECT_EQ(0, ror_op.posting_iter_allocator_.total());
+    EXPECT_EQ(nullptr, ror_op.posting_scan_param_.reusable_iter_);
+  }
+}
+
+TEST_F(TestDASAsyncSegmentMerge, posting_scan_helpers_preserve_fallback_lifecycle)
+{
+  ObArenaAllocator allocator;
+  blocksstable::ObInvPostingScanParam param;
+  blocksstable::ObInvPostingIterEntry *entry = nullptr;
+  const bool use_pool = false;
+  ASSERT_EQ(OB_SUCCESS, search_ctx_.prepare_posting_scan(
+      use_pool, allocator, param, entry));
+  EXPECT_EQ(nullptr, entry);
+  EXPECT_EQ(&allocator, param.allocator_);
+  EXPECT_EQ(nullptr, param.reusable_iter_);
+  EXPECT_EQ(&search_ctx_.get_posting_table_cache(), param.table_cache_);
+  void *buf = allocator.alloc(sizeof(blocksstable::ObInvSSTablePostingIter));
+  ASSERT_NE(nullptr, buf);
+  blocksstable::ObInvSSTablePostingIter *iter =
+      new (buf) blocksstable::ObInvSSTablePostingIter();
+  search_ctx_.close_posting_scan(param, allocator, entry, iter);
+  EXPECT_EQ(nullptr, iter);
+  EXPECT_EQ(nullptr, entry);
+  EXPECT_EQ(&allocator, param.allocator_);
+  EXPECT_EQ(nullptr, param.reusable_iter_);
+  // A live lease cannot be silently overwritten by another preparation.
+  blocksstable::ObInvPostingIterEntry live_entry;
+  entry = &live_entry;
+  EXPECT_EQ(OB_INVALID_ARGUMENT, search_ctx_.prepare_posting_scan(
+      use_pool, allocator, param, entry));
+  EXPECT_EQ(&live_entry, entry);
+}
+
 TEST_F(TestDASAsyncSegmentMerge, async_binding_guard_restores_complete_binding)
 {
   search_ctx_.set_async_binding(TEST_INDEX_TABLE_ID, 2, true);
@@ -1894,6 +1957,17 @@ TEST_F(TestDASAsyncSegmentMerge, empty_direct_token_interfaces_end_without_stora
   EXPECT_EQ(OB_SUCCESS, token.drain_until(target, 2, ids, nullptr, count, rowid, score));
   EXPECT_EQ(0, count);
   EXPECT_TRUE(rowid.is_max());
+  uint64_t typed_id = 0;
+  EXPECT_EQ(OB_ITER_END, token.advance_to_id_uint64(1, typed_id));
+  SparseCandidateBuffer candidates;
+  ASSERT_EQ(OB_SUCCESS, candidates.init(2, allocator_));
+  ASSERT_EQ(OB_SUCCESS, candidates.append(1, 2.0));
+  EXPECT_EQ(OB_SUCCESS, token.score_candidates(candidates, rowid, score));
+  EXPECT_TRUE(rowid.is_max());
+  EXPECT_DOUBLE_EQ(0.0, score);
+  ASSERT_EQ(OB_SUCCESS, candidates.next(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, typed_id, score));
+  EXPECT_EQ(1, typed_id);
+  EXPECT_DOUBLE_EQ(2.0, score);
   ObDASAsyncTokenHelper helper(search_ctx_);
   helper.is_empty_segment_ = true;
   uint64_t id_value = 1;
@@ -2009,9 +2083,10 @@ TEST_F(TestDASAsyncSegmentMerge, group_merge_activates_partition_specific_childr
   ObDASAsyncSegmentGroupMergeOp *merge = nullptr;
   ASSERT_EQ(OB_SUCCESS, search_ctx_.create_op(param, merge));
   ASSERT_EQ(OB_SUCCESS, merge->open());
-  EXPECT_EQ(1, group0->open_count());
+  EXPECT_EQ(0, group0->open_count());
   EXPECT_EQ(0, group1->open_count());
   EXPECT_EQ(0, group2->open_count());
+  EXPECT_EQ(0, group0->release_count());
 
   ObDASRowID target;
   ObDASRowID rowid;
@@ -2019,26 +2094,35 @@ TEST_F(TestDASAsyncSegmentMerge, group_merge_activates_partition_specific_childr
   target.set_uint64(1);
   EXPECT_EQ(OB_NOT_SUPPORTED, merge->advance_to(target, rowid, score));
   ASSERT_EQ(OB_SUCCESS, merge->next_rowid(rowid, score));
+  EXPECT_EQ(1, group0->open_count());
   EXPECT_EQ(1, rowid.get_uint64());
   EXPECT_EQ(OB_ITER_END, merge->next_rowid(rowid, score));
+  EXPECT_EQ(1, group0->release_count());
+  EXPECT_EQ(0, group1->release_count());
+  EXPECT_EQ(0, group2->release_count());
 
   select_partition(catalog, 2);
   ASSERT_EQ(OB_SUCCESS, merge->rescan());
-  EXPECT_EQ(1, group0->rescan_count());
-  EXPECT_EQ(1, group1->open_count());
-  EXPECT_EQ(1, group2->open_count());
+  EXPECT_EQ(2, group0->release_count());
+  EXPECT_EQ(0, group0->rescan_count());
+  EXPECT_EQ(0, group1->open_count());
+  EXPECT_EQ(0, group2->open_count());
   for (uint64_t expected_id = 1; expected_id <= 3; ++expected_id) {
     ASSERT_EQ(OB_SUCCESS, merge->next_rowid(rowid, score));
     EXPECT_EQ(expected_id, rowid.get_uint64());
+    EXPECT_EQ(1, group0->rescan_count());
+    EXPECT_EQ(expected_id >= 2 ? 1 : 0, group1->open_count());
+    EXPECT_EQ(expected_id >= 3 ? 1 : 0, group2->open_count());
   }
   EXPECT_EQ(OB_ITER_END, merge->next_rowid(rowid, score));
 
   select_partition(catalog, 1);
   ASSERT_EQ(OB_SUCCESS, merge->rescan());
-  EXPECT_EQ(2, group0->rescan_count());
+  EXPECT_EQ(1, group0->rescan_count());
   EXPECT_EQ(0, group1->rescan_count());
   EXPECT_EQ(0, group2->rescan_count());
   ASSERT_EQ(OB_SUCCESS, merge->next_rowid(rowid, score));
+  EXPECT_EQ(2, group0->rescan_count());
   EXPECT_EQ(1, rowid.get_uint64());
   ASSERT_EQ(OB_SUCCESS, merge->set_min_competitive_score(0.5));
   EXPECT_DOUBLE_EQ(0.5, group0->last_threshold());
@@ -3884,12 +3968,13 @@ TEST_F(TestDASAsyncSegmentMerge, async_bmm_direct_selection_preserves_candidate_
           ASSERT_TRUE(has_options);
           ASSERT_TRUE(options.enable_vectorized_merge_);
           ASSERT_EQ(cost, filter_cost.cost());
-          const bool expect_candidate_probes = cost >= 62;
-          EXPECT_EQ(expect_candidate_probes ? ObDASBMMBuildOptions::FilterMode::ORDERED
+          const bool expect_filter_after_score = cost >= 62;
+          EXPECT_EQ(expect_filter_after_score
+              ? ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN_AFTER_ESSENTIAL
               : ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN, options.filter_mode_);
-          if (expect_candidate_probes) {
-            EXPECT_TRUE(filter_op->can_enumerate_rowids());
-          }
+          EXPECT_TRUE(filter_op->supports_direct_rowid_drain());
+          EXPECT_EQ(0 == group_slot && !new_false_range && 1 == rtdef.key_ranges_.count(),
+              filter_op->can_enumerate_rowids());
 
           MockSegmentOp token(search_ctx_, {10}, {2.0});
           MockSegmentOpParam token_param;
@@ -3907,8 +3992,9 @@ TEST_F(TestDASAsyncSegmentMerge, async_bmm_direct_selection_preserves_candidate_
               score_ops, filter_op, allocator_, bmm_param_options, &score_costs);
           ObDASBMMOp bmm(search_ctx_);
           ASSERT_EQ(OB_SUCCESS, bmm.init(bmm_param));
-          EXPECT_EQ(expect_candidate_probes, bmm.filter_after_score_);
-          EXPECT_EQ(search_ctx_.max_batch_size() * (expect_candidate_probes ? 64 : 16),
+          EXPECT_EQ(options.filter_mode_, bmm.filter_mode_);
+          EXPECT_EQ(expect_filter_after_score, bmm.filter_after_score_);
+          EXPECT_EQ(search_ctx_.max_batch_size() * (expect_filter_after_score ? 64 : 16),
               bmm.doc_score_accumulator_.get_capacity());
           ASSERT_EQ(OB_SUCCESS, bmm.close());
         }
@@ -4457,8 +4543,12 @@ TEST_F(TestDASAsyncSegmentMerge, async_scalar_leaf_drains_storage_views_without_
   posting_iter.curr_meta_.min_id_ = ids[0];
   posting_iter.curr_meta_.max_id_ = ids[ROW_COUNT - 1];
   posting_iter.curr_meta_.doc_count_ = ROW_COUNT;
-  posting_iter.posting_block_data_.doc_count_ = ROW_COUNT;
-  posting_iter.posting_block_data_.doc_ids_ = ids;
+  blocksstable::ObPostingDocIdView doc_id_view;
+  doc_id_view.values_ = ids;
+  doc_id_view.width_ = sizeof(uint64_t);
+  blocksstable::ObPostingRelevanceView relevance_view;
+  ASSERT_EQ(OB_SUCCESS, posting_iter.posting_block_data_.assign(
+      ROW_COUNT, doc_id_view, relevance_view));
   posting_iter.scanner_.is_inited_ = true;
   posting_iter.scanner_.scan_iter_end_ = true;
   leaf.posting_iter_ = &posting_iter;
@@ -6852,7 +6942,14 @@ TEST_F(TestDASMaterializedRange, group_bmm_topk_feedback_survives_partition_resc
     if (phase > 0) {
       select_partition(catalog, phase + 1);
       ASSERT_EQ(OB_SUCCESS, topk.rescan());
-      EXPECT_DOUBLE_EQ(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, bmm_a.min_competitive_score_);
+      // Rescan is deferred until the group is prepared for its first read.
+      EXPECT_FALSE(merge.child_prepared_.at(0));
+      EXPECT_DOUBLE_EQ(2, bmm_a.min_competitive_score_);
+      // Leave the second rescan unprepared to exercise the normal next_rowid path.
+      if (1 == phase) {
+        ASSERT_EQ(OB_SUCCESS, merge.ensure_child_ready(0));
+        EXPECT_DOUBLE_EQ(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, bmm_a.min_competitive_score_);
+      }
     }
     EXPECT_EQ(phase == 1 ? 2 : 1, merge.active_group_cnt_);
     std::vector<std::pair<uint64_t, double>> actual;
@@ -6868,7 +6965,8 @@ TEST_F(TestDASMaterializedRange, group_bmm_topk_feedback_survives_partition_resc
         ? std::vector<std::pair<uint64_t, double>>{{11, 6}, {20000, 9}}
         : std::vector<std::pair<uint64_t, double>>{{2, 2}, {3, 5}};
     EXPECT_EQ(expected, actual);
-    EXPECT_DOUBLE_EQ(phase == 1 ? 6 : 2, bmm_a.min_competitive_score_);
+    // The exhausted first group no longer receives the next group's threshold.
+    EXPECT_DOUBLE_EQ(2, bmm_a.min_competitive_score_);
     if (phase == 1) {
       EXPECT_DOUBLE_EQ(6, bmm_b.min_competitive_score_);
     }

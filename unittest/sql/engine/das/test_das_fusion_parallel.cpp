@@ -15,6 +15,7 @@
 #define private public
 #define protected public
 #include "share/rc/ob_tenant_base.h"
+#include "storage/access/ob_async_inv_iterator_pool.h"
 #include "share/diagnosis/ob_runtime_profile.h"
 #include "sql/das/iter/ob_das_fusion_parallel.h"
 #include "sql/das/iter/ob_das_fusion_iter.h"
@@ -813,6 +814,49 @@ TEST(ObDASFusionSliceProviderTest, distinguishes_no_splits_from_invalid_empty_ta
   ObSEArray<ObStoreRange, 1> empty_task;
   ASSERT_EQ(OB_SUCCESS, splits.push_back(empty_task));
   EXPECT_EQ(OB_ERR_UNEXPECTED, ObDASFusionDocIdRangeSliceProvider::convert_split_ranges(splits, lo, hi));
+}
+
+TEST(ObDASSearchCtxTest, pool_binding_survives_mtl_destroy_until_reset)
+{
+  typedef storage::ObAsyncInvIteratorPool Pool;
+  share::ObTenantEnv::get_tenant_local()->id_ = 500;
+  ObArenaAllocator alloc("TestPoolBinding");
+  ObDASScanOp scan_op(alloc);
+  ObDASSearchCtx search_ctx(alloc, scan_op);
+  Pool *pool = OB_NEW(Pool, ObMemAttr(MTL_ID(), "TestInvPool"));
+  ASSERT_NE(nullptr, pool);
+  share::ObTenantBase *tenant = share::ObTenantEnv::get_tenant_local();
+  Pool *original = tenant->get<Pool *>();
+  tenant->set<Pool *>(nullptr);
+  search_ctx.enable_inv_iter_pool_ = true;
+  blocksstable::ObInvPostingIterEntry *entry = nullptr;
+  EXPECT_EQ(OB_SUCCESS, search_ctx.acquire_posting_entry(entry));
+  EXPECT_EQ(nullptr, entry);
+  EXPECT_EQ(nullptr, search_ctx.inv_iter_pool_);
+  tenant->set<Pool *>(pool);
+  EXPECT_EQ(OB_SUCCESS, search_ctx.acquire_posting_entry(entry));
+  EXPECT_EQ(nullptr, search_ctx.inv_iter_pool_);
+  EXPECT_EQ(1, pool->refs_);
+  EXPECT_EQ(OB_SUCCESS, pool->init());
+  EXPECT_EQ(OB_SUCCESS, search_ctx.acquire_posting_entry(entry));
+  EXPECT_EQ(pool, search_ctx.inv_iter_pool_);
+  // Any Entry lease is independent of the query binding.
+  if (nullptr != entry) {
+    pool->release_inv_entry(entry);
+  }
+  EXPECT_EQ(2, pool->refs_);
+  Pool *owner = pool;
+  tenant->set<Pool *>(original);
+  Pool::mtl_destroy(pool);
+  EXPECT_EQ(nullptr, pool);
+  EXPECT_EQ(1, owner->refs_);
+  EXPECT_FALSE(owner->pin());
+  EXPECT_EQ(OB_SUCCESS, search_ctx.acquire_posting_entry(entry));
+  EXPECT_EQ(nullptr, entry);
+  EXPECT_EQ(1, owner->refs_);
+  search_ctx.reset();
+  EXPECT_EQ(nullptr, search_ctx.inv_iter_pool_);
+  search_ctx.reset();
 }
 
 TEST(ObDASFusionPathAdapterTest, filtered_splits_keep_dense_ids_and_whole_path_fallback)

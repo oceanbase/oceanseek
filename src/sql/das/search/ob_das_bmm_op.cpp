@@ -4,11 +4,14 @@
  */
 
 #define USING_LOG_PREFIX SQL_DAS
+#include <algorithm>
 #include <cfloat>
+#include <cmath>
 #include "sql/das/search/ob_das_bmm_op.h"
 #include "sql/das/search/ob_das_bitmap_op.h"
 #include "sql/das/search/ob_disjunctive_daat_merger.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
+#include "storage/blocksstable/async_index/ob_inv_sstable_posting_iter.h"
 
 namespace oceanbase
 {
@@ -27,9 +30,34 @@ static constexpr int64_t BMM_RANGE_MAX_MIN_DIM_COUNT = 3;
 static constexpr int64_t BMM_ACTIVE_PROBE_MAX_COUNT = 64;
 // Without a scalar filter, keep low-density postings on the sequential path.
 static constexpr int64_t BMM_ACTIVE_PROBE_POSTING_COST_DENOMINATOR = 8;
-// Sparse active-candidate seeks pay off for the medium-density candidate-filter
-// path, but not for very dense filters where a sequential posting drain is cheaper.
-static constexpr int64_t BMM_ACTIVE_PROBE_FILTER_COST_DENOMINATOR = 4;
+
+// The sole essential iterator produces unique, ordered candidates with partial scores.
+struct SingleEssentialCandidateSink
+{
+  SparseCandidateBuffer &candidates_;
+  const double min_required_score_;
+
+  int add_dim(const uint64_t id, const double score)
+  {
+    int ret = OB_SUCCESS;
+    if (score <= min_required_score_) {
+      // The partial score does not exceed the required essential score.
+    } else if (OB_FAIL(candidates_.append(id, score))) {
+      LOG_WARN("failed to append single essential candidate", K(ret), K(id));
+    }
+    return ret;
+  }
+
+  int add_dim_batch(const uint64_t *ids, const double *scores, const int64_t count)
+  {
+    int ret = OB_SUCCESS;
+    if (OB_FAIL(candidates_.append_competitive_batch(
+        ids, scores, count, min_required_score_))) {
+      LOG_WARN("failed to collect single essential batch", K(ret), K(count));
+    }
+    return ret;
+  }
+};
 
 class ObBMMFilterBitsetDrainSink : public ObDASRowIDBatchConsumer
 {
@@ -147,11 +175,13 @@ void ObDASBMMOp::select_filter_build_options(
   omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
   options = ObDASBMMBuildOptions(tenant_config.is_valid()
       && tenant_config->_enable_bmm_vectorized_merge);
-  if (FilterMergeMode::DENSE_WINDOW == merge_mode && !filter_after_score
+  if (FilterMergeMode::DENSE_WINDOW == merge_mode
       && !query_optional && options.enable_vectorized_merge_
       && DAS_ROWID_TYPE_UINT64 == search_ctx.get_rowid_type()
       && !search_ctx.is_logical_table() && supports_direct_drain) {
-    options.filter_mode_ = ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN;
+    options.filter_mode_ = filter_after_score
+        ? ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN_AFTER_ESSENTIAL
+        : ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN;
   }
 }
 
@@ -192,6 +222,10 @@ int ObDASBMMOpParam::get_children_ops(ObIArray<ObIDASSearchOp *> &children) cons
   return ret;
 }
 
+static constexpr int64_t BMM_SPARSE_LARGE_WINDOW_TOPK_LIMIT = 75;
+static constexpr int64_t BMM_SPARSE_LARGE_WINDOW_SIZE = 128 * 1024;
+static constexpr int64_t BMM_SPARSE_SMALL_WINDOW_SIZE = 64 * 1024;
+
 ObDASBMMOp::ObDASBMMOp(ObDASSearchCtx &search_ctx)
   : ObIDASSearchOp(search_ctx),
     iter_allocator_(nullptr),
@@ -200,6 +234,8 @@ ObDASBMMOp::ObDASBMMOp(ObDASSearchCtx &search_ctx)
     score_op_probe_allowed_(),
     sorted_iter_idxes_(),
     vec_sorted_iter_idxes_(),
+    vec_essential_heads_(),
+    vec_essential_head_count_(0),
     vec_range_max_scores_(),
     dim_max_scores_(),
     non_essential_dim_count_(0),
@@ -213,10 +249,13 @@ ObDASBMMOp::ObDASBMMOp(ObDASSearchCtx &search_ctx)
     filter_op_(nullptr),
     curr_filter_id_(),
     status_(SearchStatus::MAX_STATUS),
+    single_essential_score_cutoff_(0.0),
+    single_essential_cutoff_min_score_(-1.0),
     filter_bitset_(nullptr),
     doc_score_accumulator_(),
     doc_score_iter_(),
     vec_boundary_id_(),
+    vec_min_boundary_size_(BMM_VEC_MIN_BOUNDARY_SIZE),
     enable_vec_merge_(false),
     filter_mode_(ObDASBMMBuildOptions::FilterMode::ORDERED),
     query_optional_(false),
@@ -228,6 +267,7 @@ ObDASBMMOp::ObDASBMMOp(ObDASSearchCtx &search_ctx)
     cap_next_batch_to_filter_id_(false),
     filter_after_score_(false),
     use_active_candidate_probe_(false),
+    enable_filter_essential_batch_(false),
     filter_merge_mode_(FilterMergeMode::DENSE_WINDOW),
     sparse_candidate_buffer_(),
     is_inited_(false) {}
@@ -278,9 +318,17 @@ int ObDASBMMOp::do_init(const ObIDASSearchOpParam &op_param)
     vec_non_essential_dim_max_score_ = 0.0;
     vec_non_essential_dim_max_score_sum_ = 0.0;
     vec_partition_iter_end_count_ = -1;
+    const int64_t topk_limit = search_ctx_.get_generating_topk_limit();
+    vec_min_boundary_size_ = BMM_VEC_MIN_BOUNDARY_SIZE;
+    if (enable_vec_merge_ && !query_optional_
+        && FilterMergeMode::SPARSE_SEEK == filter_merge_mode_
+        && can_seek_filter_for_vec_handoff() && topk_limit > 0) {
+      vec_min_boundary_size_ = topk_limit <= BMM_SPARSE_LARGE_WINDOW_TOPK_LIMIT
+          ? BMM_SPARSE_LARGE_WINDOW_SIZE : BMM_SPARSE_SMALL_WINDOW_SIZE;
+    }
     is_inited_ = true;
     LOG_TRACE("initialized bmm cost metadata", K_(lead_cost), K_(filter_cost),
-        K(score_op_costs_.count()), K(param.has_filter_op()));
+        K(score_op_costs_.count()), K(param.has_filter_op()), K_(vec_min_boundary_size));
   }
   return ret;
 }
@@ -432,8 +480,11 @@ int ObDASBMMOp::do_close()
   score_op_probe_allowed_.reset();
   sorted_iter_idxes_.reset();
   vec_sorted_iter_idxes_.reset();
+  vec_essential_heads_.reset();
+  vec_essential_head_count_ = 0;
   vec_range_max_scores_.reset();
   non_ess_block_max_score_suffix_sums_.reset();
+  single_essential_score_cutoffs_.reset();
   dim_max_scores_.reset();
   if (nullptr != row_merger_) {
     row_merger_->~ObIDisjunctiveDAATMerger();
@@ -450,6 +501,7 @@ int ObDASBMMOp::do_close()
     filter_bitset_ = nullptr;
   }
   sparse_candidate_buffer_.reset();
+  vec_min_boundary_size_ = BMM_VEC_MIN_BOUNDARY_SIZE;
   filter_merge_mode_ = FilterMergeMode::DENSE_WINDOW;
   filter_mode_ = ObDASBMMBuildOptions::FilterMode::ORDERED;
   query_optional_ = false;
@@ -457,6 +509,7 @@ int ObDASBMMOp::do_close()
   optional_scoring_end_ = false;
   filter_after_score_ = false;
   use_active_candidate_probe_ = false;
+  enable_filter_essential_batch_ = false;
   iter_allocator_ = nullptr;
   return ret;
 }
@@ -567,8 +620,7 @@ int ObDASBMMOp::inner_advance_to_vectorized_scoring_driven(
   bool got_result = false;
 
   // Fast path: the current window still has unconsumed docs.
-  if (FilterMergeMode::SPARSE_SEEK == filter_merge_mode_ 
-      && sparse_candidate_buffer_.has_unconsumed()) {
+  if (sparse_candidate_buffer_.has_unconsumed()) {
     // Skip candidates before target, then emit the first surviving candidate.
     const uint64_t target_u64 = target.get_uint64();
     uint64_t tmp_id = 0;
@@ -766,7 +818,7 @@ int ObDASBMMOp::init_vec_merge_on_demand(const ObDASBMMOpParam &op_param, ObIAll
   ObIDASSearchOp *filter_op = op_param.get_filter_op();
   filter_mode_ = OB_NOT_NULL(options) ? options->filter_mode_
       : ObDASBMMBuildOptions::FilterMode::ORDERED;
-  const bool has_direct_filter = ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN == filter_mode_;
+  const bool has_direct_filter = ObDASBMMBuildOptions::FilterMode::ORDERED != filter_mode_;
   // Multiple filters are represented by a conjunction. Until conjunction provides native
   // batch draining, its row-by-row fallback can regress a filter-driven optional query.
   const bool can_vectorize_optional_filter =
@@ -785,13 +837,14 @@ int ObDASBMMOp::init_vec_merge_on_demand(const ObDASBMMOpParam &op_param, ObIAll
   // Filter-before-score keeps the original 4K window. Filter-after-score uses a
   // 16K window so one candidate window aligns with the minimum BMM boundary.
   static constexpr int64_t VEC_WINDOW_BATCH_MULTIPLE = 16;
+  static constexpr int64_t NO_FILTER_VEC_WINDOW_BATCH_MULTIPLE = 32;
   static constexpr int64_t FILTER_AFTER_SCORE_WINDOW_BATCH_MULTIPLE = 64;
 
   if (has_direct_filter) {
     // The BMM build decision fixes the consumption protocol before creating the
     // filter. Later cost estimates cannot turn a drain-only input into a seeker.
     filter_merge_mode_ = FilterMergeMode::DENSE_WINDOW;
-    filter_after_score_ = false;
+    filter_after_score_ = ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN_AFTER_ESSENTIAL == filter_mode_;
   } else if (enable_vec_merge_) {
     select_filter_strategy(op_param.get_lead_cost(), op_param.get_filter_cost(),
         search_ctx_.get_row_count(), op_param.has_filter_op(), op_param.query_optional(),
@@ -800,7 +853,7 @@ int ObDASBMMOp::init_vec_merge_on_demand(const ObDASBMMOpParam &op_param, ObIAll
   if (has_direct_filter && (!enable_vec_merge_ || op_param.query_optional()
       || OB_ISNULL(filter_op) || !filter_op->supports_direct_rowid_drain())) {
     ret = OB_NOT_SUPPORTED;
-    LOG_WARN("direct BMM filter requires filter-before-score dense windows", K(ret),
+    LOG_WARN("direct BMM filter requires dense windows", K(ret),
         K(op_param.query_optional()), K(get_rowid_type()),
         "is_logical_table", search_ctx_.is_logical_table(),
         K_(filter_merge_mode), K_(filter_after_score));
@@ -813,18 +866,23 @@ int ObDASBMMOp::init_vec_merge_on_demand(const ObDASBMMOpParam &op_param, ObIAll
     // Sparse non-essential candidates also occur without a scalar filter. Keep
     // dense batches on the drain path; the active-count limit is checked per batch.
     const bool can_probe_without_filter = !op_param.has_filter_op() && !op_param.query_optional();
-    use_active_candidate_probe_ = can_probe_without_filter || (filter_after_score_
-        && table_row_count.cost() >= BMM_ACTIVE_PROBE_FILTER_COST_DENOMINATOR
-        && filter_cost.cost() <= table_row_count.cost() / BMM_ACTIVE_PROBE_FILTER_COST_DENOMINATOR);
+    // Even dense filters can leave at most 64 competitive candidates after pruning.
+    use_active_candidate_probe_ = can_probe_without_filter || filter_after_score_;
 
     non_ess_block_max_score_suffix_sums_.set_allocator(&iter_allocator);
+    single_essential_score_cutoffs_.set_allocator(&iter_allocator);
     vec_sorted_iter_idxes_.set_allocator(&iter_allocator);
+    vec_essential_heads_.set_allocator(&iter_allocator);
     vec_range_max_scores_.set_allocator(&iter_allocator);
     score_op_probe_allowed_.set_allocator(&iter_allocator);
     if (OB_FAIL(non_ess_block_max_score_suffix_sums_.prepare_allocate(iter_cnt))) {
       LOG_WARN("failed to prepare non essential block max score suffix sums", K(ret));
+    } else if (OB_FAIL(single_essential_score_cutoffs_.prepare_allocate(iter_cnt))) {
+      LOG_WARN("failed to prepare single essential score cutoffs", K(ret));
     } else if (OB_FAIL(vec_sorted_iter_idxes_.prepare_allocate(iter_cnt))) {
       LOG_WARN("failed to prepare vectorized iterator order", K(ret));
+    } else if (OB_FAIL(vec_essential_heads_.prepare_allocate(iter_cnt))) {
+      LOG_WARN("failed to prepare essential batch heads", K(ret));
     } else if (OB_FAIL(vec_range_max_scores_.prepare_allocate(iter_cnt))) {
       LOG_WARN("failed to prepare vectorized range max scores", K(ret));
     } else if (OB_FAIL(score_op_probe_allowed_.prepare_allocate(iter_cnt))) {
@@ -843,7 +901,7 @@ int ObDASBMMOp::init_vec_merge_on_demand(const ObDASBMMOpParam &op_param, ObIAll
         || FilterMergeMode::DENSE_WINDOW == filter_merge_mode_) {
       const int64_t window_batch_multiple = filter_after_score_
           ? FILTER_AFTER_SCORE_WINDOW_BATCH_MULTIPLE
-          : VEC_WINDOW_BATCH_MULTIPLE;
+          : !op_param.has_filter_op() ? NO_FILTER_VEC_WINDOW_BATCH_MULTIPLE : VEC_WINDOW_BATCH_MULTIPLE;
       if (OB_FAIL(doc_score_accumulator_.init(
           search_ctx_.max_batch_size() * window_batch_multiple, iter_allocator))) {
         LOG_WARN("failed to init doc score accumulator", K(ret));
@@ -873,6 +931,13 @@ int ObDASBMMOp::init_vec_merge_on_demand(const ObDASBMMOpParam &op_param, ObIAll
     }
 
     if (OB_SUCC(ret)) {
+      // Keep ordered filter tiles large enough to amortize head probes. Freeze
+      // qualification while the top-k generation context exists.
+      enable_filter_essential_batch_ = FilterMergeMode::SPARSE_SEEK == filter_merge_mode_
+          && !op_param.query_optional()
+          && table_row_count.cost() >= 2000
+          && filter_cost.cost() >= table_row_count.cost() / 2000
+          && filter_cost.cost() <= table_row_count.cost() / 50;
       vec_boundary_id_.set_min();
     }
   }
@@ -1415,11 +1480,6 @@ int ObDASBMMOp::inner_get_next_row_vectorized(ObDASRowID &next_id, double &score
   int ret = OB_SUCCESS;
   uint64_t tmp_id = 0;
   bool got_row = false;
-  // SPARSE_SEEK output is served from the compact candidate buffer; DENSE_WINDOW output from the
-  // dense doc_score_iter_ window. A query-optional dense window remains active until its
-  // iterator is exhausted, even if a nonnegative threshold has selected sparse scoring.
-  bool need_convert_to_scoring_sparse = FilterMergeMode::SPARSE_SEEK == filter_merge_mode_
-                                       && !is_filter_driven_optional(); 
   bool need_next_batch = !sparse_candidate_buffer_.has_unconsumed() && doc_score_iter_.iter_end();
   if (OB_UNLIKELY(!enable_vec_merge_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -1430,7 +1490,7 @@ int ObDASBMMOp::inner_get_next_row_vectorized(ObDASRowID &next_id, double &score
     if (need_next_batch) {
       if (OB_FAIL(inner_get_next_batch())) {
         LOG_WARN_IGNORE_ITER_END(ret, "failed to get next batch", K(ret));
-      } else if (need_convert_to_scoring_sparse) {
+      } else if (sparse_candidate_buffer_.has_unconsumed()) {
         // Candidate buffer was filled and scored by inner_get_next_batch().
         need_next_batch = false;
       } else if (OB_FAIL(doc_score_iter_.open(doc_score_accumulator_))) {
@@ -1490,6 +1550,8 @@ int ObDASBMMOp::inner_get_next_batch_scoring_driven()
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(SearchStatus::FINISHED == status_)) {
     ret = OB_ITER_END;
+  } else if (OB_UNLIKELY(query_optional_ && optional_scoring_end_)) {
+    ret = OB_ITER_END;
   }
 
   bool found_valid_batch = false;
@@ -1525,16 +1587,44 @@ int ObDASBMMOp::inner_get_next_batch_scoring_driven()
         // Generate a candidate batch window [batch_start_id, batch_end_id].
         if (filter_after_score_ && filter_end_) {
           ret = OB_ITER_END;
-        } else if (OB_UNLIKELY(row_merger_->is_empty())) {
+        } else if (OB_FAIL(prepare_vec_essential_batch(batch_start_id))) {
+          LOG_WARN("failed to prepare essential batch heads", K(ret));
+        } else if (batch_start_id.is_max()) {
           status_ = SearchStatus::COMPUTE_VEC_BOUNDARY;
           break;
-        } else if (OB_FAIL(row_merger_->get_top_id(batch_start_id))) {
-          LOG_WARN("failed to get batch start id", K(ret));
+        }
+        if (OB_FAIL(ret)) {
+          break;
         } else if (!vec_boundary_id_.is_max()
             && batch_start_id.get_uint64() > vec_boundary_id_.get_uint64()) {
           status_ = SearchStatus::COMPUTE_VEC_BOUNDARY;
           break;
-        } else if (OB_FAIL(doc_score_accumulator_.reuse_with_start_id(batch_start_id.get_uint64(), max_batch_id_u64))) {
+        }
+
+        const bool use_single_essential = !has_filter() && !query_optional_
+            && 1 == vec_sorted_iter_idxes_.count() - vec_non_essential_dim_count_
+            && vec_non_essential_dim_count_ >= 2
+            && min_competitive_score_ > vec_non_essential_dim_max_score_;
+        // Clear candidate state at batch entry, including transitions from compact to dense output.
+        if (!sparse_candidate_buffer_.is_empty()) {
+          sparse_candidate_buffer_.reuse();
+        }
+        if (use_single_essential) {
+          // Use only the window capacity; skip accumulator reset and filter preparation.
+          const uint64_t start_id = batch_start_id.get_uint64();
+          const uint64_t window_span = static_cast<uint64_t>(doc_score_accumulator_.get_capacity() - 1);
+          const uint64_t max_id = start_id > UINT64_MAX - window_span
+              ? UINT64_MAX : start_id + window_span;
+          batch_end_id.set_uint64(!vec_boundary_id_.is_max() && vec_boundary_id_.get_uint64() < max_id
+              ? vec_boundary_id_.get_uint64() : max_id);
+          if (OB_FAIL(evaluate_single_essential_batch(batch_end_id, found_valid_batch))) {
+            LOG_WARN("failed to evaluate single essential batch", K(ret), K(batch_end_id));
+          }
+          // Stay in essential evaluation; cached iterator heads determine the next batch.
+          break;
+        }
+
+        if (OB_FAIL(doc_score_accumulator_.reuse_with_start_id(batch_start_id.get_uint64(), max_batch_id_u64))) {
           LOG_WARN("failed to reuse doc score accumulator", K(ret), K(batch_start_id));
         } else if (FALSE_IT(max_batch_id.set_uint64(max_batch_id_u64))) {
         } else if (OB_FAIL(compare_uint64_rowid(max_batch_id, vec_boundary_id_, cmp_ret))) {
@@ -1572,11 +1662,9 @@ int ObDASBMMOp::inner_get_next_batch_scoring_driven()
                 LOG_WARN_IGNORE_ITER_END(ret, "failed to compute vec boundary at target", K(ret), K(skip_target));
               }
             } else {
-              // Skip target does not cross the vector boundary, rebuild the merger with advance.
-              if (OB_FAIL(row_merger_->pop_until_target(skip_target))) {
-                LOG_WARN("failed to drain merger heap before skip", K(ret), K(skip_target));
-              } else if (OB_FAIL(row_merger_->rebuild_with_advance(skip_target))) {
-                LOG_WARN_IGNORE_ITER_END(ret, "failed to rebuild with advance", K(ret), K(skip_target));
+              // Direct batch drains leave the merger stale; rebuild from the essential iterators.
+              if (OB_FAIL(rebuild_vec_essential_merger(skip_target))) {
+                LOG_WARN("failed to advance essential iterators after empty filter batch", K(ret), K(skip_target));
               }
             }
           }
@@ -1605,12 +1693,24 @@ int ObDASBMMOp::inner_get_next_batch_scoring_driven()
       }
       case SearchStatus::EVALUATE_VEC_NON_ESSENTIAL: {
         found_valid_batch = true;
-        if (OB_FAIL(evaluate_non_essential_batch(batch_end_id, found_valid_batch))) {
+        const bool use_middle_bitmap = filter_after_score_
+            && ((ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN_AFTER_ESSENTIAL == filter_mode_)
+                || (DAS_SEARCH_OP_BITMAP == filter_op_->get_op_type()
+                 && static_cast<ObDASBitmapOp *>(filter_op_)->can_copy_filter_words()));
+        if (use_middle_bitmap
+            && OB_FAIL(apply_bitmap_filter_to_batch(batch_end_id))) {
+          LOG_WARN("failed to filter essential candidates", K(ret), K(batch_end_id));
+        } else if (doc_score_accumulator_.is_empty()) {
+          found_valid_batch = false;
+        } else if (OB_FAIL(evaluate_non_essential_batch(batch_end_id, found_valid_batch))) {
           LOG_WARN("failed to evaluate non essential batch", K(ret));
         } else if (found_valid_batch && filter_after_score_
-            && OB_FAIL(apply_filter_to_scored_batch())) {
-          LOG_WARN("failed to apply filter to scored batch", K(ret), K(batch_end_id));
-        } else {
+            && OB_FAIL(use_middle_bitmap
+                ? doc_score_accumulator_.filter_below_score(min_competitive_score_)
+                : apply_filter_to_scored_batch())) {
+          LOG_WARN("failed to finalize candidate filtering", K(ret), K(batch_end_id));
+        }
+        if (OB_SUCC(ret)) {
           found_valid_batch = found_valid_batch && !doc_score_accumulator_.is_empty();
           doc_score_accumulator_.clear_filter_mask();
           status_ = SearchStatus::EVALUATE_VEC_ESSENTIAL;
@@ -1618,9 +1718,9 @@ int ObDASBMMOp::inner_get_next_batch_scoring_driven()
         break;
       }
       case SearchStatus::EVALUATE_VEC_LEAP_FROG: {
-        if (OB_FAIL(collect_leapfrog_candidates())) {
+        if (OB_FAIL(collect_sparse_candidates())) {
           LOG_WARN_IGNORE_ITER_END(ret, "failed to collect leapfrog candidates", K(ret));
-        } else if (OB_FAIL(score_leapfrog_candidates())) {
+        } else if (OB_FAIL(score_sparse_candidates(false))) {
           LOG_WARN("failed to score leapfrog candidates", K(ret));
         } else {
           found_valid_batch = true;
@@ -1724,7 +1824,11 @@ int ObDASBMMOp::inner_get_next_batch_filter_driven()
     }
 
     if (OB_SUCC(ret) && evaluate_scoring) {
-      if (OB_FAIL(evaluate_essential_batch(batch_end_id, has_scoring_candidate))) {
+      // The filter owns this batch's start and zero-score rows; only refresh scoring heads.
+      ObDASRowID scoring_start_id;
+      if (OB_FAIL(prepare_vec_essential_batch(scoring_start_id))) {
+        LOG_WARN("failed to prepare optional essential batch heads", K(ret));
+      } else if (OB_FAIL(evaluate_essential_batch(batch_end_id, has_scoring_candidate))) {
         LOG_WARN("failed to evaluate optional essential batch", K(ret), K(batch_end_id));
       } else if (OB_FAIL(evaluate_non_essential_batch(
                      batch_end_id, has_scoring_candidate))) {
@@ -1822,17 +1926,34 @@ int ObDASBMMOp::find_next_vec_window_start(ObDASRowID &min_id)
     ObDASRowID lower;
     lower.set_uint64(vec_boundary_id_.get_uint64() + 1);
     if (can_seek_filter_for_vec_handoff()) {
-      // Only enumerable filters can seek to prove the gap empty. Direct drains
-      // use scoring bounds below because they do not expose an ordered cursor.
-      if ((curr_filter_id_.is_min() || curr_filter_id_.get_uint64() < lower.get_uint64())
-          && OB_FAIL(advance_filter_to(lower, curr_filter_id_))) {
-        LOG_WARN_IGNORE_ITER_END(ret, "failed to locate filter after window", K(ret), K(lower));
-      } else {
+      if (curr_filter_id_.is_min() || curr_filter_id_.get_uint64() < lower.get_uint64()) {
+        if (ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN_AFTER_ESSENTIAL == filter_mode_) {
+          // Discard the previous boundary row and retain the first later RowID as lookahead.
+          const uint64_t previous_id = lower.get_uint64() - 1;
+          uint64_t ignored_word = 0;
+          ObBMMFilterBitsetDrainSink sink(previous_id, 1, &ignored_word, nullptr /* seed_accumulator */);
+          if (OB_FAIL(filter_op_->direct_drain_rowids(
+                  previous_id, previous_id, sink, curr_filter_id_))) {
+            LOG_WARN("failed to locate direct filter after window", K(ret), K(lower));
+          } else if (curr_filter_id_.is_max()) {
+            filter_end_ = true;
+            ret = OB_ITER_END;
+          } else if (OB_UNLIKELY(!curr_filter_id_.is_normal()
+                                 || curr_filter_id_.get_uint64() < lower.get_uint64())) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("invalid direct filter handoff", K(ret), K(lower), K_(curr_filter_id));
+          }
+        } else if (OB_FAIL(advance_filter_to(lower, curr_filter_id_))) {
+          LOG_WARN_IGNORE_ITER_END(ret, "failed to locate filter after window", K(ret), K(lower));
+        }
+      }
+      if (OB_SUCC(ret)) {
         min_id = curr_filter_id_;
       }
     } else {
-      if (!row_merger_->is_empty() && OB_FAIL(row_merger_->get_top_id(min_id))) {
-        LOG_WARN("failed to get essential successor", K(ret));
+      // Dense batches drain iterators directly; the tree is rebuilt at the next boundary.
+      if (OB_FAIL(prepare_vec_essential_batch(min_id))) {
+        LOG_WARN("failed to get essential batch successor", K(ret));
       } else if (vec_non_essential_dim_max_score_sum_ > min_competitive_score_
           && OB_FAIL(find_vec_handoff(lower, min_id))) {
         LOG_WARN("failed to restore candidate coverage", K(ret), K(lower));
@@ -1872,7 +1993,7 @@ int ObDASBMMOp::expand_vec_boundary(
   if (!boundary.is_max()) {
     // 按闭区间计算最小窗口右边界，并在 uint64 溢出前饱和到最大值。
     const uint64_t start_id = candidate_start.get_uint64();
-    const uint64_t boundary_delta = static_cast<uint64_t>(BMM_VEC_MIN_BOUNDARY_SIZE - 1);
+    const uint64_t boundary_delta = static_cast<uint64_t>(vec_min_boundary_size_ - 1);
     uint64_t floor_boundary = start_id > UINT64_MAX - boundary_delta
         ? UINT64_MAX : start_id + boundary_delta;
     // 查询指定有限 doc_id 范围时，将扩展结果截断到范围上界。
@@ -2214,6 +2335,7 @@ int ObDASBMMOp::rebuild_vec_essential_merger(const ObDASRowID &min_id)
 int ObDASBMMOp::compute_vec_boundary_at(const ObDASRowID &target)
 {
   int ret = OB_SUCCESS;
+  single_essential_cutoff_min_score_ = -1.0;
   ObDASRowID min_id = target;
   ObDASRowID mini_max_id;
   ObDASRowID natural_boundary;
@@ -2305,7 +2427,7 @@ int ObDASBMMOp::compute_vec_boundary_at(const ObDASRowID &target)
   const int64_t essential_dim_count =
       sorted_iter_idxes_.count() - vec_non_essential_dim_count_;
   LOG_TRACE("[BMM VEC MERGE] compute vec boundary finished", K(ret), K(min_id),
-      K(natural_boundary), K(vec_boundary_id_), K(BMM_VEC_MIN_BOUNDARY_SIZE),
+      K(natural_boundary), K(vec_boundary_id_), K_(vec_min_boundary_size),
       K(boundary_expanded), K_(vec_non_essential_dim_count), K(essential_dim_count));
   return ret;
 }
@@ -2401,6 +2523,71 @@ int ObDASBMMOp::prepare_filter_for_vectorized_batch(
         LOG_WARN("failed to build filter bitset", K(ret), K(batch_start_id), K(batch_end_id));
       } else {
         doc_score_accumulator_.set_filter_mask(filter_bitset_);
+        // The filter cursor already passed this window. Its empty tail needs no scoring.
+        const uint64_t start_id = batch_start_id.get_uint64();
+        const uint64_t *words = filter_bitset_->reinterpret_data<uint64_t>();
+        for (int64_t word_idx = (batch_end_id.get_uint64() - start_id)
+                                   / das_bitset_helper::WORD_BITS;
+             word_idx >= 0; --word_idx) {
+          if (0 != words[word_idx]) {
+            const int64_t last_bit = das_bitset_helper::WORD_BITS - 1
+                - __builtin_clzll(words[word_idx]);
+            batch_end_id.set_uint64(start_id + word_idx * das_bitset_helper::WORD_BITS + last_bit);
+            break;
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// Filter candidate presence only; leave all score pruning to the original scoring flow.
+int ObDASBMMOp::apply_bitmap_filter_to_batch(const ObDASRowID &batch_end_id)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(filter_bitset_) || !doc_score_accumulator_.is_valid() || !has_filter()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid bitmap filter state", K(ret));
+  } else {
+    // Intersect presence without attaching an input mask, preserving fused
+    // ONLY_EXISTING supplementation for the surviving candidates.
+    ObDASRowID batch_start_id;
+    batch_start_id.set_uint64(doc_score_accumulator_.get_start_id());
+    if (doc_score_accumulator_.is_empty()) {
+    } else if (filter_end_) {
+      doc_score_accumulator_.clear_all();
+    } else if (ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN_AFTER_ESSENTIAL == filter_mode_) {
+      bool has_hit = false;
+      if (OB_FAIL(build_direct_filter_bitset(batch_start_id, batch_end_id, has_hit))) {
+        LOG_WARN("failed to build direct essential candidate filter mask", K(ret));
+      } else if (!has_hit) {
+        doc_score_accumulator_.clear_all();
+      } else if (OB_FAIL(doc_score_accumulator_.retain_by_mask(*filter_bitset_))) {
+        LOG_WARN("failed to retain filtered essential candidates", K(ret));
+      }
+    } else {
+      int cmp_ret = 0;
+      if (OB_FAIL(compare_uint64_rowid(curr_filter_id_, batch_start_id, cmp_ret))) {
+        LOG_WARN("failed to compare filter start", K(ret));
+      } else if (cmp_ret < 0 && OB_FAIL(advance_filter_to(batch_start_id, curr_filter_id_))) {
+        if (OB_ITER_END == ret) {
+          ret = OB_SUCCESS;
+          doc_score_accumulator_.clear_all();
+        } else {
+          LOG_WARN("failed to advance filter to essential window", K(ret));
+        }
+      }
+      if (OB_SUCC(ret) && !doc_score_accumulator_.is_empty() && !filter_end_) {
+        if (OB_FAIL(compare_uint64_rowid(curr_filter_id_, batch_end_id, cmp_ret))) {
+          LOG_WARN("failed to compare filter end", K(ret));
+        } else if (cmp_ret > 0) {
+          doc_score_accumulator_.clear_all();
+        } else if (OB_FAIL(build_filter_bitset(batch_start_id, batch_end_id))) {
+          LOG_WARN("failed to build essential candidate filter mask", K(ret));
+        } else if (OB_FAIL(doc_score_accumulator_.retain_by_mask(*filter_bitset_))) {
+          LOG_WARN("failed to retain filtered essential candidates", K(ret));
+        }
       }
     }
   }
@@ -2428,6 +2615,7 @@ int ObDASBMMOp::apply_filter_to_scored_batch()
       const int64_t word_base = word_idx * das_bitset_helper::WORD_BITS;
       uint64_t candidates = das_bitset_helper::mask_window_tail(
           candidate_words[word_idx], word_base, capacity);
+      uint64_t matched_word = 0;
       while (OB_SUCC(ret) && !stop && 0 != candidates) {
         const int64_t bit_idx = das_bitset_helper::lowest_set_bit(candidates);
         candidates = das_bitset_helper::clear_lowest_set_bit(candidates);
@@ -2455,9 +2643,10 @@ int ObDASBMMOp::apply_filter_to_scored_batch()
           LOG_WARN("failed to compare advanced filter with candidate",
               K(ret), K_(curr_filter_id), K(candidate_id));
         } else if (0 == cmp_ret) {
-          matched_words[word_idx] |= das_bitset_helper::bit_mask(bit_idx);
+          matched_word |= das_bitset_helper::bit_mask(bit_idx);
         }
       }
+      matched_words[word_idx] = matched_word;
     }
     if (OB_SUCC(ret) && OB_FAIL(doc_score_accumulator_.retain_by_mask(*filter_bitset_))) {
       LOG_WARN("failed to retain filter-matched candidates", K(ret));
@@ -2466,58 +2655,123 @@ int ObDASBMMOp::apply_filter_to_scored_batch()
   return ret;
 }
 
+int ObDASBMMOp::prepare_vec_essential_batch(ObDASRowID &start_id)
+{
+  int ret = OB_SUCCESS;
+  start_id.set_max();
+  vec_essential_head_count_ = 0;
+  for (int64_t i = vec_non_essential_dim_count_; OB_SUCC(ret) && i < vec_sorted_iter_idxes_.count(); ++i) {
+    const int64_t idx = vec_sorted_iter_idxes_.at(i);
+    ObDAATMergeIter *iter = merge_iters_.at(idx);
+    ObDASRowID head;
+    if (iter->iter_end()) {
+    } else if (OB_FAIL(iter->get_curr_id(head))) {
+      LOG_WARN("failed to get essential head", K(ret), K(idx));
+    } else {
+      vec_essential_heads_.at(vec_essential_head_count_++) = {head.get_uint64(), idx};
+    }
+  }
+  if (OB_SUCC(ret) && vec_essential_head_count_ > 0) {
+    struct EssentialHeadCmp
+    {
+      bool operator()(const EssentialHead &lhs, const EssentialHead &rhs) const
+      {
+        return lhs.doc_id_ < rhs.doc_id_ || (lhs.doc_id_ == rhs.doc_id_ && lhs.iter_idx_ < rhs.iter_idx_);
+      }
+    };
+    EssentialHead *heads = vec_essential_heads_.get_data();
+    // Match the merger's initial-head ordering, including its iterator-index tie break.
+    lib::ob_sort(heads, heads + vec_essential_head_count_, EssentialHeadCmp());
+    start_id.set_uint64(heads[0].doc_id_);
+  }
+  return ret;
+}
+
 int ObDASBMMOp::evaluate_essential_batch(const ObDASRowID &batch_end_id, bool &is_batch_valid)
 {
   int ret = OB_SUCCESS;
   is_batch_valid = false;
-  if (OB_ISNULL(row_merger_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected null row merger", K(ret));
-  } else if (OB_FAIL(row_merger_->merge_one_batch(batch_end_id, doc_score_accumulator_))) {
-    LOG_WARN("failed to merge one batch", K(ret), K(batch_end_id));
-  } else {
+  for (int64_t i = 0; OB_SUCC(ret) && i < vec_essential_head_count_
+      && vec_essential_heads_.at(i).doc_id_ <= batch_end_id.get_uint64(); ++i) {
+    const int64_t idx = vec_essential_heads_.at(i).iter_idx_;
+    if (OB_FAIL(merge_iters_.at(idx)->drain_until(batch_end_id, doc_score_accumulator_))) {
+      LOG_WARN("failed to drain essential batch", K(ret), K(idx), K(batch_end_id));
+    }
+  }
+  if (OB_SUCC(ret)) {
     is_batch_valid = !doc_score_accumulator_.is_empty();
   }
   return ret;
 }
 
-int ObDASBMMOp::score_active_candidates(ObDAATMergeIter &iter)
+double ObDASBMMOp::get_single_essential_score_cutoff()
+{
+  if (single_essential_cutoff_min_score_ != min_competitive_score_) {
+    double cutoff = min_competitive_score_;
+    // Reverse the supplementation order to derive a safe cutoff for the essential score.
+    for (int64_t i = 0; i < vec_non_essential_dim_count_; ++i) {
+      single_essential_score_cutoffs_.at(i) = cutoff;
+      const double max_score = vec_range_max_scores_.at(vec_sorted_iter_idxes_.at(i));
+      double next_cutoff = cutoff - max_score;
+      // Pruning at next_cutoff is safe only if adding the bound cannot exceed cutoff.
+      if (next_cutoff + max_score > cutoff) {
+        next_cutoff = std::nextafter(next_cutoff, -INFINITY);
+      }
+      cutoff = next_cutoff;
+    }
+    single_essential_score_cutoff_ = cutoff;
+    single_essential_cutoff_min_score_ = min_competitive_score_;
+  }
+  return single_essential_score_cutoff_;
+}
+
+int ObDASBMMOp::evaluate_single_essential_batch(
+    const ObDASRowID &batch_end_id, bool &is_batch_valid)
 {
   int ret = OB_SUCCESS;
-  const uint64_t *active_words = doc_score_accumulator_.get_bitset_words();
-  const int64_t capacity = doc_score_accumulator_.get_capacity();
-  const int64_t word_cnt = das_bitset_helper::word_count(capacity);
-  const uint64_t start_id = doc_score_accumulator_.get_start_id();
-  bool iter_end = false;
-  for (int64_t word_idx = 0; OB_SUCC(ret) && !iter_end && word_idx < word_cnt; ++word_idx) {
-    const int64_t word_base = word_idx * das_bitset_helper::WORD_BITS;
-    uint64_t active = das_bitset_helper::mask_window_tail(
-        active_words[word_idx], word_base, capacity);
-    while (OB_SUCC(ret) && !iter_end && 0 != active) {
-      const int64_t bit_idx = das_bitset_helper::lowest_set_bit(active);
-      active = das_bitset_helper::clear_lowest_set_bit(active);
-      const uint64_t candidate_doc_id = start_id
-          + static_cast<uint64_t>(word_base + bit_idx);
-      ObDASRowID candidate_id;
-      ObDASRowID curr_id;
-      double score = 0.0;
-      candidate_id.set_uint64(candidate_doc_id);
-      if (OB_FAIL(iter.advance_to_id(candidate_id))) {
-        if (OB_ITER_END == ret) {
-          ret = OB_SUCCESS;
-          iter_end = true;
-        } else {
-          LOG_WARN("failed to seek non-essential dim to active candidate",
-              K(ret), K(candidate_id));
+  is_batch_valid = false;
+  const int64_t essential_idx = vec_non_essential_dim_count_;
+  ObDAATMergeIter *iter = merge_iters_.at(vec_sorted_iter_idxes_.at(essential_idx));
+  // Allocate only when a window first qualifies. Unique IDs cannot exceed the window capacity.
+  if (0 == sparse_candidate_buffer_.get_capacity()
+      && OB_FAIL(sparse_candidate_buffer_.init(doc_score_accumulator_.get_capacity(), *iter_allocator_))) {
+    LOG_WARN("failed to init single essential candidate buffer", K(ret));
+  } else {
+    LOG_TRACE("[BMM SINGLE ESSENTIAL] enter compact batch",
+        K(batch_end_id), K_(vec_non_essential_dim_count), K_(min_competitive_score));
+    const double min_required_score = get_single_essential_score_cutoff();
+    SingleEssentialCandidateSink sink{sparse_candidate_buffer_, min_required_score};
+    if (OB_FAIL(iter->drain_until(batch_end_id, sink))) {
+      LOG_WARN("failed to collect single essential candidates", K(ret), K(batch_end_id));
+    }
+    if (OB_FAIL(ret)) {
+    } else if (!sparse_candidate_buffer_.has_alive()) {
+    } else if (OB_FAIL(score_sparse_candidates(true))) {
+      LOG_WARN("failed to supplement single essential candidates", K(ret));
+    } else {
+      is_batch_valid = sparse_candidate_buffer_.has_alive();
+    }
+  }
+  return ret;
+}
+
+int ObDASBMMOp::score_compact_candidates(
+    ObDAATMergeIter &iter, const uint64_t *doc_ids, const int64_t count,
+    const bool use_sparse_buffer)
+{
+  int ret = OB_SUCCESS;
+  if (count > 0) {
+    double scores[BMM_ACTIVE_PROBE_MAX_COUNT] = {};
+    bool matched[BMM_ACTIVE_PROBE_MAX_COUNT] = {};
+    if (OB_FAIL(iter.probe_sorted_candidates(doc_ids, count, scores, matched))) {
+      LOG_WARN("failed to probe compact NE candidates", K(ret), K(count));
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+        if (matched[i] && OB_FAIL(use_sparse_buffer
+            ? sparse_candidate_buffer_.add_score(i, scores[i])
+            : doc_score_accumulator_.add_existing_dim(doc_ids[i], scores[i]))) {
+          LOG_WARN("failed to add NE candidate score", K(ret), K(doc_ids[i]));
         }
-      } else if (OB_FAIL(iter.get_curr_id(curr_id))) {
-        LOG_WARN("failed to get non-essential dim rowid", K(ret), K(candidate_id));
-      } else if (curr_id.get_uint64() != candidate_doc_id) {
-        // This dimension does not contain the active candidate.
-      } else if (OB_FAIL(iter.load_curr_score(score))) {
-        LOG_WARN("failed to load non-essential candidate score", K(ret), K(candidate_id));
-      } else if (OB_FAIL(doc_score_accumulator_.add_existing_dim(candidate_doc_id, score))) {
-        LOG_WARN("failed to add non-essential candidate score", K(ret), K(candidate_id));
       }
     }
   }
@@ -2530,6 +2784,9 @@ int ObDASBMMOp::evaluate_non_essential_batch(
 {
   int ret = OB_SUCCESS;
   is_batch_valid = true;
+  bool use_compact_candidates = false;
+  uint64_t compact_doc_ids[BMM_ACTIVE_PROBE_MAX_COUNT];
+  int64_t compact_count = 0;
   // Reverse iteration: process from highest block-max non-essential dim to lowest.
   // High-score dims are evaluated first, so the remaining block-max sum (from
   // unevaluated low-score dims) shrinks fast, giving a tight per-doc filter
@@ -2543,6 +2800,10 @@ int ObDASBMMOp::evaluate_non_essential_batch(
   }
   double remaining_block_max_score =
       (vec_non_essential_dim_count_ > 0 ? non_ess_block_max_score_suffix_sums_.at(0) : 0.0);
+  // NE supplementation only removes candidates. Reuse the narrowed bounds across
+  // dimensions; these locals are reset for each new candidate batch.
+  uint64_t active_first_id = doc_score_accumulator_.get_start_id();
+  uint64_t active_last_id = batch_end_id.is_max() ? UINT64_MAX : batch_end_id.get_uint64();
   for (int64_t i = vec_non_essential_dim_count_ - 1;
       OB_SUCC(ret) && is_batch_valid && i >= 0;
       --i) {
@@ -2561,12 +2822,28 @@ int ObDASBMMOp::evaluate_non_essential_batch(
       is_batch_valid = false;
     } else {
       const bool probe_score_op = score_op_probe_allowed_.at(iter_idx)
-          && doc_score_accumulator_.get_active_count(BMM_ACTIVE_PROBE_MAX_COUNT) <= BMM_ACTIVE_PROBE_MAX_COUNT;
-      if (probe_score_op) {
-        if (OB_FAIL(score_active_candidates(*iter))) {
-          LOG_WARN("failed to score sparse active candidates", K(ret), K(iter_idx));
+          && (use_compact_candidates ? compact_count
+              : doc_score_accumulator_.get_active_count(BMM_ACTIVE_PROBE_MAX_COUNT)) <= BMM_ACTIVE_PROBE_MAX_COUNT;
+      // Collect compact IDs once per batch and reuse them across non-essential dims.
+      if (!use_compact_candidates && probe_score_op) {
+        if (OB_FAIL(doc_score_accumulator_.collect_active_doc_ids(
+            compact_doc_ids, BMM_ACTIVE_PROBE_MAX_COUNT, compact_count))) {
+          LOG_WARN("failed to collect compact NE candidates", K(ret), K(iter_idx));
+        } else {
+          use_compact_candidates = true;
         }
-      } else if (OB_FAIL(iter->drain_until_active(batch_end_id, doc_score_accumulator_))) {
+      }
+      if (OB_FAIL(ret)) {
+      } else if (probe_score_op) {
+        if (OB_FAIL(score_compact_candidates(*iter, compact_doc_ids, compact_count, false))) {
+          LOG_WARN("failed to score sparse active candidates",
+              K(ret), K(iter_idx), K(use_compact_candidates));
+        }
+      } else if (!doc_score_accumulator_.get_active_range(
+          active_first_id, active_last_id, active_first_id, active_last_id)) {
+        is_batch_valid = false;
+      } else if (OB_FAIL(iter->drain_until_active(
+          active_first_id, active_last_id, doc_score_accumulator_))) {
         LOG_WARN("failed to drain active iter until boundary", K(ret), K(iter_idx));
       }
       // Remove the dim we just evaluated from the remaining block-max budget.
@@ -2578,7 +2855,9 @@ int ObDASBMMOp::evaluate_non_essential_batch(
       if (OB_SUCC(ret) && remaining_block_max_score >= 0) {
         const double min_required = min_competitive_score_ - remaining_block_max_score;
         if (min_required > 0) {
-          if (OB_FAIL(doc_score_accumulator_.filter_below_score(min_required))) {
+          if (OB_FAIL(use_compact_candidates
+              ? doc_score_accumulator_.filter_scored_candidates(compact_doc_ids, compact_count, min_required)
+              : doc_score_accumulator_.filter_below_score(min_required))) {
             LOG_WARN("failed to filter below score", K(ret), K(min_required));
           }
         }
@@ -2610,11 +2889,11 @@ int ObDASBMMOp::build_filter_bitset(
         ? static_cast<ObDASBitmapOp *>(filter_op_) : nullptr;
     if (!is_filter_driven_optional()
         && OB_NOT_NULL(bitmap_filter)
-        && bitmap_filter->is_filter_bitmap_view()) {
+        && bitmap_filter->can_copy_filter_words()) {
       if (OB_FAIL(bitmap_filter->drain_into_filter_bitset(
               batch_start_id, batch_end_id, capacity,
               filter_words, curr_filter_id_, filter_end_))) {
-        LOG_WARN("failed to copy provider bitmap into BMM filter bitset",
+        LOG_WARN("failed to copy ready bitmap into BMM filter bitset",
                  K(ret), K(batch_start_id), K(batch_end_id));
       }
     } else {
@@ -2695,41 +2974,38 @@ int ObDASBMMOp::align_essential_iters_to_target(
   // probed separately and repositioned by the next compute_vec_boundary_at.
   for (int64_t i = vec_non_essential_dim_count_; OB_SUCC(ret) && i < dim_cnt; ++i) {
     ObDAATMergeIter *iter = merge_iters_[vec_sorted_iter_idxes_[i]];
-    ObDASRowID curr_id;
+    ObDASRowID curr_rowid;
+    uint64_t curr_id = 0;
+    bool iter_end = false;
     if (OB_ISNULL(iter)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected null essential iter", K(ret), K(i), K_(vec_non_essential_dim_count));
-    } else if (iter->iter_end()) {
+    } else if (FALSE_IT(iter_end = iter->iter_end())) {
+    } else if (iter_end) {
       // skip: a single exhausted essential dim does not end the query.
-    } else if (OB_FAIL(iter->get_curr_id(curr_id))) {
+    } else if (OB_FAIL(iter->get_curr_id(curr_rowid))) {
       LOG_WARN("failed to get curr id", K(ret), K(i));
-    } else if (curr_id.get_uint64() < target_uint64) {
-      // Lagging behind the filter target: advance once.
-      if (OB_FAIL(iter->advance_to_id(target))) {
-        if (OB_ITER_END != ret) {
-          LOG_WARN("failed to advance essential iter to target", K(ret), K(i), K(target));
-        } else {
-          ret = OB_SUCCESS;
-        }
-      } else if (OB_FAIL(iter->get_curr_id(curr_id))) {
-        LOG_WARN("failed to re-get curr id", K(ret), K(i));
-      } else if (OB_UNLIKELY(curr_id.get_uint64() < target_uint64)) {
+    } else {
+      curr_id = curr_rowid.get_uint64();
+    }
+
+    if (OB_SUCC(ret) && !iter_end && curr_id < target_uint64) {
+      if (OB_FAIL(iter->advance_to_uint64(target_uint64, curr_id, iter_end))) {
+        LOG_WARN("failed to advance essential iter to target", K(ret), K(i), K(target));
+      } else if (!iter_end && OB_UNLIKELY(curr_id < target_uint64)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected essential curr id still behind target", K(ret),
             K(curr_id), K(target), K(i));
       }
     }
 
-    if (OB_SUCC(ret) && !iter->iter_end()) {
+    if (OB_SUCC(ret) && !iter_end) {
       has_alive = true;
-      if (!has_min) {
-        min_id = curr_id;
+      if (!has_min || curr_id < min_id.get_uint64()) {
+        min_id.set_uint64(curr_id);
         has_min = true;
-      } else if (curr_id.get_uint64() < min_id.get_uint64()) {
-        min_id = curr_id;
       }
-
-      if (curr_id.get_uint64() == target_uint64) {
+      if (curr_id == target_uint64) {
         // Exact intersection at target: accumulate this clause's score (SUM semantics,
         // matching merge_one_row's update_score aggregation).
         double curr_score = 0.0;
@@ -2799,6 +3075,114 @@ int ObDASBMMOp::find_leapfrog_candidate(
   return ret;
 }
 
+bool ObDASBMMOp::can_batch_filter_essential() const
+{
+  return enable_filter_essential_batch_ && enable_vec_merge_ && !query_optional_
+      && FilterMergeMode::SPARSE_SEEK == filter_merge_mode_
+      && ObDASBMMBuildOptions::FilterMode::ORDERED == filter_mode_
+      && DAS_ROWID_TYPE_UINT64 == get_rowid_type() && !search_ctx_.is_logical_table()
+      && nullptr != filter_op_
+      && vec_sorted_iter_idxes_.count() - vec_non_essential_dim_count_ >= 2
+      && !vec_boundary_id_.is_min();
+}
+
+int ObDASBMMOp::collect_filter_essential_candidates()
+{
+  int ret = OB_SUCCESS;
+  sparse_candidate_buffer_.reuse();
+  if (OB_UNLIKELY(sparse_candidate_buffer_.get_capacity() <= 0)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid filter batch candidate capacity", K(ret));
+  }
+  bool stop = false;
+  bool use_rowwise = false;
+  while (OB_SUCC(ret) && !stop && !sparse_candidate_buffer_.is_full()) {
+    if (filter_end_) {
+      ret = sparse_candidate_buffer_.is_empty() ? OB_ITER_END : OB_SUCCESS;
+      stop = true;
+    } else if (curr_filter_id_.is_min() && OB_FAIL(next_filter_rowid(curr_filter_id_))) {
+      LOG_WARN_IGNORE_ITER_END(ret, "failed to initialize ordered filter cursor", K(ret));
+    } else if (!vec_boundary_id_.is_max()
+        && curr_filter_id_.get_uint64() > vec_boundary_id_.get_uint64()) {
+      if (!sparse_candidate_buffer_.is_empty()) {
+        stop = true;
+      } else if (OB_FAIL(compute_vec_boundary())) {
+        LOG_WARN_IGNORE_ITER_END(ret, "failed to restore filter batch window", K(ret));
+      } else if (!can_batch_filter_essential()) {
+        use_rowwise = true;
+        stop = true;
+      }
+    } else {
+      const int64_t capacity = std::min(blocksstable::ObInvSSTablePostingIter::MAX_SORTED_PROBE_COUNT,
+          sparse_candidate_buffer_.get_capacity() - sparse_candidate_buffer_.get_count());
+      uint64_t ids[blocksstable::ObInvSSTablePostingIter::MAX_SORTED_PROBE_COUNT];
+      double scores[blocksstable::ObInvSSTablePostingIter::MAX_SORTED_PROBE_COUNT] = {};
+      bool matched[blocksstable::ObInvSSTablePostingIter::MAX_SORTED_PROBE_COUNT] = {};
+      int64_t count = 1;
+      ids[0] = curr_filter_id_.get_uint64();
+      if (capacity > 1) {
+        int64_t following_count = 0;
+        ObDASRowID next_id;
+        double ignored_score = 0.0;
+        if (OB_FAIL(filter_op_->drain_until(vec_boundary_id_, capacity - 1,
+            ids + 1, nullptr, following_count, next_id, ignored_score))) {
+          LOG_WARN("failed to drain ordered filter batch", K(ret), K_(vec_boundary_id));
+        } else {
+          count += following_count;
+          if (following_count < capacity - 1) {
+            if (next_id.is_max()) {
+              filter_end_ = true;
+              curr_filter_id_ = next_id;
+            } else if (OB_UNLIKELY(!next_id.is_normal() || vec_boundary_id_.is_max()
+                || next_id.get_uint64() <= vec_boundary_id_.get_uint64())) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("invalid filter batch lookahead", K(ret), K(next_id), K_(vec_boundary_id));
+            } else {
+              curr_filter_id_ = next_id;
+            }
+          }
+        }
+      }
+      if (OB_SUCC(ret) && count == capacity && OB_FAIL(next_filter_rowid(curr_filter_id_))) {
+        if (OB_ITER_END == ret) {
+          ret = OB_SUCCESS;
+        } else {
+          LOG_WARN("failed to advance after full filter batch", K(ret));
+        }
+      }
+      // Transpose traversal, retaining the original per-document E addition order.
+      for (int64_t i = vec_non_essential_dim_count_;
+          OB_SUCC(ret) && i < vec_sorted_iter_idxes_.count(); ++i) {
+        ObDAATMergeIter *iter = merge_iters_[vec_sorted_iter_idxes_[i]];
+        if (OB_ISNULL(iter)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected null filter batch essential iterator", K(ret), K(i));
+        } else if (iter->iter_end()) {
+          // No contribution from this dimension.
+        } else if (OB_FAIL(iter->probe_sorted_candidates(ids, count, scores, matched))) {
+          LOG_WARN("failed to probe filter batch essential ids", K(ret), K(i));
+        }
+      }
+      for (int64_t c = 0; OB_SUCC(ret) && c < count; ++c) {
+        if (matched[c] && scores[c] + vec_non_essential_dim_max_score_ > min_competitive_score_
+            && OB_FAIL(sparse_candidate_buffer_.append(ids[c], scores[c]))) {
+          LOG_WARN("failed to append filter batch candidate", K(ret), K(c));
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && use_rowwise && OB_FAIL(collect_leapfrog_candidates())) {
+    LOG_WARN_IGNORE_ITER_END(ret, "failed to collect sparse candidates", K(ret));
+  }
+  return ret;
+}
+
+int ObDASBMMOp::collect_sparse_candidates()
+{
+  return can_batch_filter_essential()
+      ? collect_filter_essential_candidates() : collect_leapfrog_candidates();
+}
+
 int ObDASBMMOp::collect_leapfrog_candidates()
 {
   int ret = OB_SUCCESS;
@@ -2859,12 +3243,9 @@ int ObDASBMMOp::collect_leapfrog_candidates()
   return ret;
 }
 
-int ObDASBMMOp::score_leapfrog_candidates()
+int ObDASBMMOp::score_sparse_candidates(const bool allow_batch_drain)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(sparse_candidate_buffer_.is_empty())) {
-    // nothing to probe
-  }
   // Reverse iteration over range-local non-essential dims (highest upper bound first) so
   // the remaining score budget shrinks fast and prunes more candidates early.
   double remaining_max_score =
@@ -2881,6 +3262,18 @@ int ObDASBMMOp::score_leapfrog_candidates()
     if (OB_ISNULL(iter)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected null iter", K(ret), K(iter_idx));
+    } else if (!iter->iter_end() && allow_batch_drain
+        && !(score_op_probe_allowed_.at(iter_idx)
+            && sparse_candidate_buffer_.get_count() <= BMM_ACTIVE_PROBE_MAX_COUNT)) {
+      if (OB_FAIL(iter->score_candidates(sparse_candidate_buffer_))) {
+        LOG_WARN("failed to drain non-essential dim into candidates", K(ret), K(iter_idx));
+      }
+    } else if (!iter->iter_end() && allow_batch_drain) {
+      // Single-essential collection and pruning keep every candidate slot alive.
+      if (OB_FAIL(score_compact_candidates(*iter, sparse_candidate_buffer_.get_doc_ids(),
+          sparse_candidate_buffer_.get_count(), true))) {
+        LOG_WARN("failed to probe single essential candidates", K(ret), K(iter_idx));
+      }
     } else if (!iter->iter_end()) {
       // Score alive candidates in ascending doc id order (monotonic advance_to).
       bool dim_exhausted = false;
@@ -2923,8 +3316,12 @@ int ObDASBMMOp::score_leapfrog_candidates()
       if (remaining_max_score < 0) {
         remaining_max_score = 0.0;
       }
-      const double min_required_score = min_competitive_score_ - remaining_max_score;
-      if (OB_FAIL(sparse_candidate_buffer_.prune_below(min_required_score))) {
+      const double min_required_score = allow_batch_drain
+          ? single_essential_score_cutoffs_.at(i)
+          : min_competitive_score_ - remaining_max_score;
+      if (OB_FAIL(allow_batch_drain
+          ? sparse_candidate_buffer_.prune_and_compact(min_required_score)
+          : sparse_candidate_buffer_.prune_below(min_required_score))) {
         LOG_WARN("failed to prune sparse candidates", K(ret), K(min_required_score));
       }
     }

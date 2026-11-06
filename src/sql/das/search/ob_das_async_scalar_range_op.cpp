@@ -284,7 +284,8 @@ void ObDASAsyncScalarRangeOp::close_range_iter()
     range_iter_allocator_.free(range_iter_);
     range_iter_ = nullptr;
   }
-  range_iter_allocator_.reuse();
+  range_iter_allocator_.reset();
+  range_scan_param_.allocator_ = &range_iter_allocator_;
 }
 
 int ObDASAsyncScalarRangeOp::get_bitmap_input_range(

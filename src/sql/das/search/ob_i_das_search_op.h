@@ -432,6 +432,10 @@ public:
   */
   OB_INLINE int close();
 
+  // Release an inactive subtree's scan resources, preserving its rescan state.
+  // Resource-owning operators override this; composite operators forward to children.
+  virtual void release_scan_resources();
+
   /*
    * Advances to the next rowid that is greater than or equal to the target rowid.
    * @in param target: The target rowid to advance to.
@@ -546,10 +550,11 @@ public:
       int64_t &count,
       ObDASRowID &next_id_after,
       double &next_score_after);
-  // Position at the accumulator window start, consume every row through boundary,
-  // and add scores directly to candidates that are still active.
+  // Position at range_start and consume uint64 RowIDs through the inclusive range_end.
+  // Add scores only to active candidates; UINT64_MAX includes the last possible ID.
   int drain_until_active(
-      const ObDASRowID &boundary,
+      const uint64_t range_start,
+      const uint64_t range_end,
       DocScoreAccumulator &accumulator);
   /*
    * Drains every matching uint64 RowID in inclusive [range_start, range_end]
@@ -576,12 +581,37 @@ public:
       ret = do_direct_drain_rowids(
           range_start, range_end, consumer, next_id_after);
     } else {
+      class ProfileConsumer : public ObDASRowIDBatchConsumer
+      {
+      public:
+        explicit ProfileConsumer(ObDASRowIDBatchConsumer &consumer)
+          : consumer_(consumer), count_(0) {}
+        int consume(const uint64_t *rowids, const int64_t count) override
+        {
+          int ret = OB_SUCCESS;
+          if (OB_FAIL(consumer_.consume(rowids, count))) {
+            LOG_WARN("failed to consume direct rowid batch", K(ret), K(count));
+          } else {
+            count_ += count;
+          }
+          return ret;
+        }
+        int64_t get_count() const { return count_; }
+      private:
+        ObDASRowIDBatchConsumer &consumer_;
+        int64_t count_;
+      } profile_consumer(consumer);
       common::ObProfileSwitcher switcher(profile_);
       common::ScopedTimer total_timer(common::ObMetricId::HS_TOTAL_TIME);
       common::ScopedTimer timer(common::ObMetricId::HS_NEXT_ROWIDS_TIME);
       INC_METRIC_VAL(common::ObMetricId::HS_NEXT_ROWIDS_COUNT, 1);
-      ret = do_direct_drain_rowids(
-          range_start, range_end, consumer, next_id_after);
+      if (OB_FAIL(do_direct_drain_rowids(
+          range_start, range_end, profile_consumer, next_id_after))) {
+        LOG_WARN("failed to direct drain rowids with profile", KR(ret), K(range_start), K(range_end));
+      } else {
+        // Count emitted rows, including duplicates; lookahead is counted when emitted.
+        INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, profile_consumer.get_count());
+      }
     }
     if (OB_FAIL(ret)) {
       LOG_WARN("failed to direct drain rowids", KR(ret), K(range_start),
@@ -656,7 +686,8 @@ protected:
       ObDASRowID &next_id_after,
       double &next_score_after);
   virtual int do_drain_until_active(
-      const ObDASRowID &boundary,
+      const uint64_t range_start,
+      const uint64_t range_end,
       DocScoreAccumulator &accumulator,
       int64_t &count);
   virtual int do_direct_drain_rowids(

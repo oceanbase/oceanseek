@@ -114,6 +114,45 @@ int SparseCandidateBuffer::append(const uint64_t doc_id, const double initial_sc
   return ret;
 }
 
+int SparseCandidateBuffer::append_competitive_batch(
+    const uint64_t *doc_ids, const double *scores, const int64_t count,
+    const double min_required_score)
+{
+  int ret = OB_SUCCESS;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("sparse candidate buffer not init", K(ret));
+  } else if (OB_UNLIKELY(count < 0 || -1 != cursor_
+      || (count > 0 && (nullptr == doc_ids || nullptr == scores)))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid competitive candidate batch", K(ret), K(count), K_(cursor));
+  } else if (OB_UNLIKELY(count > capacity_ - count_)) {
+    ret = OB_SIZE_OVERFLOW;
+    LOG_WARN("candidate batch exceeds capacity", K(ret), K(count), K_(count), K_(capacity));
+  } else if (OB_UNLIKELY(count > 0 && count_ > 0 && doc_ids[0] <= doc_ids_.at(count_ - 1))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("candidate batch is not after collected ids", K(ret), K(doc_ids[0]), K_(count));
+  } else {
+    uint64_t *out_ids = doc_ids_.get_data();
+    double *out_scores = scores_.get_data();
+    int64_t write_pos = count_;
+    for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+      if (i > 0 && doc_ids[i - 1] >= doc_ids[i]) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("candidate batch doc ids are not strictly increasing",
+            K(ret), K(i), K(count), "prev_doc_id", doc_ids[i - 1], "doc_id", doc_ids[i]);
+      } else if (scores[i] > min_required_score) {
+        out_ids[write_pos] = doc_ids[i];
+        out_scores[write_pos] = scores[i];
+        alive_bits_->set(write_pos++);
+      }
+    }
+    alive_count_ += write_pos - count_;
+    count_ = write_pos;
+  }
+  return ret;
+}
+
 bool SparseCandidateBuffer::get_doc_id(const int64_t idx, uint64_t &doc_id) const
 {
   bool alive = false;
@@ -156,6 +195,35 @@ int SparseCandidateBuffer::prune_below(const double min_required_score)
         --alive_count_;
       }
     }
+  }
+  return ret;
+}
+
+int SparseCandidateBuffer::prune_and_compact(const double min_required_score)
+{
+  int ret = OB_SUCCESS;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("sparse candidate buffer not init", K(ret));
+  } else if (OB_UNLIKELY(-1 != cursor_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("cannot compact after output has started", K(ret), K_(cursor));
+  } else {
+    int64_t kept = 0;
+    for (int64_t i = 0; i < count_; ++i) {
+      if (alive_bits_->at(i) && scores_.at(i) > min_required_score) {
+        if (kept != i) {
+          doc_ids_.at(kept) = doc_ids_.at(i);
+          scores_.at(kept) = scores_.at(i);
+          alive_bits_->set(kept);
+        }
+        ++kept;
+      }
+    }
+    for (int64_t i = kept; i < count_; ++i) {
+      alive_bits_->unset(i);
+    }
+    count_ = alive_count_ = kept;
   }
   return ret;
 }

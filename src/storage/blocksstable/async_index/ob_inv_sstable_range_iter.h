@@ -269,7 +269,7 @@ private:
   ObFIFOAllocator data_io_allocator_;           // backs posting_data_handle_ IO buffers
   ObInvSSTableDocIdPrefetcher doc_id_prefetcher_;
   storage::ObMicroBlockDataHandle posting_data_handle_;
-  ObInvIdxMicroBlockReader posting_micro_reader_;
+  ObFlatCacheReader posting_micro_reader_;
   ObMicroBlockData curr_posting_micro_block_;
   MicroBlockLocator curr_posting_micro_locator_;
   bool curr_posting_block_loaded_;

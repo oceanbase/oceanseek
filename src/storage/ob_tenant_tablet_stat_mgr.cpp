@@ -7,6 +7,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "ob_tenant_tablet_stat_mgr.h"
+#include "storage/access/ob_async_inv_iterator_pool.h"
 #include "share/schema/ob_tenant_schema_service.h"
 #include "observer/ob_server.h"
 
@@ -1305,6 +1306,11 @@ void ObTenantTabletStatMgr::TabletStatUpdater::runTimerTask()
   ObGlobalIteratorPool *global_iter_pool = MTL(ObGlobalIteratorPool*);
   if (nullptr != global_iter_pool && global_iter_pool->is_valid()) {
     global_iter_pool->wash();
+  }
+
+  ObAsyncInvIteratorPool *inv_pool = MTL(ObAsyncInvIteratorPool *);
+  if (nullptr != inv_pool && inv_pool->is_valid()) {
+    inv_pool->wash();
   }
 
   int64_t interval_step = 0;

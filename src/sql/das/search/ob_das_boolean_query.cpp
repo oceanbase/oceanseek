@@ -2040,7 +2040,7 @@ int ObDASBooleanQueryRtDef::prepare_bmm_input(
   } else if (has_bmm_options) {
     if (OB_FAIL(static_cast<ObDASScalarRtDef *>(single_clause)->generate_op(
         lead_cost, search_ctx,
-        ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN == bmm_options.filter_mode_, filter_op))) {
+        ObDASBMMBuildOptions::FilterMode::ORDERED != bmm_options.filter_mode_, filter_op))) {
       LOG_WARN("failed to generate BMM filter", K(ret));
     }
   } else if (1 == filter_clauses.count()) {

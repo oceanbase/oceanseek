@@ -11,6 +11,7 @@
 #include "storage/blocksstable/async_index/ob_inv_idx_micro_block_struct.h"
 #include "storage/meta_mem/ob_tablet_handle.h"
 #include "storage/ob_i_table.h"
+#include "sql/das/search/ob_das_bm25_batch_kernel.h"
 #include "sql/engine/expr/ob_expr_bm25.h"
 
 namespace oceanbase
@@ -20,53 +21,99 @@ namespace blocksstable
 using namespace common;
 using namespace storage;
 
-class ObInvSSTablePostingIter::ObRangeMaxScoreVisitor final
+class ObInvSSTablePostingIter::ObRangeMaxScoreSpanVisitor final
 {
 public:
-  ObRangeMaxScoreVisitor(
+  ObRangeMaxScoreSpanVisitor(
       const ObInvSSTablePostingIter &posting_iter,
-      const uint64_t first_id,
-      double &candidate_max_score,
-      bool &score_available)
+      const bool reuse_current_score,
+      double &candidate_max_score)
     : posting_iter_(posting_iter),
-      first_id_(first_id),
       candidate_max_score_(candidate_max_score),
-      score_available_(score_available),
-      is_current_block_(true)
+      first_span_(true),
+      reuse_current_score_(reuse_current_score)
   {}
 
-  int operator()(const ObPostingBlockMeta &block_meta, bool &stop)
+  int operator()(const ObPostingFrontierSpan &span)
   {
     int ret = OB_SUCCESS;
-    stop = false;
-    if (block_meta.max_id_ >= first_id_) {
-      if (OB_UNLIKELY(!block_meta.block_max_.has_max_score())) {
-        score_available_ = false;
-        stop = true;
-      } else if (is_current_block_) {
-        // 复用定位当前 block 时已经计算出的分数。
+    const ObInvIdxBM25ParamPair *pairs = span.pairs_;
+    int64_t pair_count = span.pair_count_;
+    if (first_span_ && reuse_current_score_) {
+      // Reuse requires a valid cache for an intersecting current block, whose
+      // frontier must be the prefix of the first span.
+      const int64_t current_pair_count = posting_iter_.curr_meta_.block_max_.pair_count_;
+      if (OB_UNLIKELY(pairs != posting_iter_.curr_meta_.block_max_.pairs_
+          || pair_count < current_pair_count)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("current block frontier is not the first span prefix", K(ret),
+            KP(pairs), KP(posting_iter_.curr_meta_.block_max_.pairs_),
+            K(pair_count), K(current_pair_count));
+      } else {
         candidate_max_score_ = std::max(
             candidate_max_score_, posting_iter_.curr_block_max_score_);
-      } else {
-        // 当前区间内每个后续 block 的 frontier 最多计算一次。
-        for (int64_t i = 0; i < block_meta.block_max_.pair_count_; ++i) {
-          const ObInvIdxBM25ParamPair &pair = block_meta.block_max_.pairs_[i];
-          candidate_max_score_ = std::max(candidate_max_score_,
-              posting_iter_.calc_bm25_score(pair.token_freq_, pair.doc_length_));
-        }
+        pairs += current_pair_count;
+        pair_count -= current_pair_count;
       }
     }
-    is_current_block_ = false;
+    first_span_ = false;
+    if (OB_SUCC(ret) && pair_count > 0) {
+      candidate_max_score_ = posting_iter_.bm25_frontier_kernels_.max_score(
+          pairs, pair_count, posting_iter_.bm25_calc_params_, candidate_max_score_);
+    }
     return ret;
   }
 
 private:
   const ObInvSSTablePostingIter &posting_iter_;
-  uint64_t first_id_;
   double &candidate_max_score_;
-  bool &score_available_;
-  bool is_current_block_;
+  bool first_span_;
+  bool reuse_current_score_;
 };
+
+void ObInvPostingTableCache::reset()
+{
+  table_handle_.reset();
+  tablet_handle_.reset();
+  range_.reset();
+}
+
+const ObTableHandleV2 *ObInvPostingTableCache::find(
+    const ObTabletHandle &tablet_handle,
+    const ObNewVersionRange &range) const
+{
+  const ObTableHandleV2 *handle = nullptr;
+  if (tablet_handle.is_valid() && tablet_handle_.is_valid() && table_handle_.is_valid()
+      && range.is_valid()
+      && tablet_handle.get_obj() == tablet_handle_.get_obj()
+      && range == range_) {
+    handle = &table_handle_;
+  }
+  return handle;
+}
+
+int ObInvPostingTableCache::store(
+    const ObTabletHandle &tablet_handle,
+    const ObNewVersionRange &range,
+    const ObTableHandleV2 &table_handle)
+{
+  int ret = OB_SUCCESS;
+  reset();
+  if (OB_UNLIKELY(!tablet_handle.is_valid() || !table_handle.is_valid()
+      || !range.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid posting table cache binding", K(ret), K(range));
+  } else if (OB_FAIL(tablet_handle_.assign(tablet_handle))) {
+    LOG_WARN("failed to pin posting cache tablet", K(ret));
+  } else {
+    table_handle_ = table_handle;
+    range_ = range;
+  }
+  if (OB_FAIL(ret)) {
+    reset();
+  }
+  return ret;
+}
 
 ObInvSSTablePostingIter::ObInvSSTablePostingIter()
   : sstable_(nullptr),
@@ -75,6 +122,7 @@ ObInvSSTablePostingIter::ObInvSSTablePostingIter()
     total_doc_cnt_(0),
     avg_doc_length_(0.0),
     bm25_calc_params_(),
+    bm25_frontier_kernels_(),
     has_relevance_params_(false),
     tablet_handle_(),
     table_handle_(),
@@ -86,6 +134,8 @@ ObInvSSTablePostingIter::ObInvSSTablePostingIter()
     need_load_value_micro_block_(true),
     posting_micro_reader_(),
     posting_block_data_(),
+    legacy_relevance_buf_(nullptr),
+    legacy_doc_ids_buf_(nullptr),
     posting_value_micro_reader_(),
     posting_value_block_reader_(),
     curr_id_datum_(),
@@ -97,6 +147,7 @@ ObInvSSTablePostingIter::ObInvSSTablePostingIter()
     curr_row_idx_(-1),
     curr_relevance_materialized_(false),
     curr_block_max_score_(0.0),
+    curr_block_max_score_valid_(false),
     frontier_min_id_(0),
     min_doc_id_(0),
     max_doc_id_(UINT64_MAX),
@@ -121,7 +172,7 @@ void ObInvSSTablePostingIter::reset()
   posting_value_micro_reader_.reuse();
   curr_value_micro_block_.reset();
   posting_block_data_.reset();
-  posting_micro_reader_.reuse();
+  posting_micro_reader_.reset();
   curr_data_micro_block_.reset();
   scanner_.reset();
   need_load_micro_block_ = true;
@@ -129,13 +180,22 @@ void ObInvSSTablePostingIter::reset()
   curr_meta_.reset();
   reset_row_cursor();
   sstable_ = nullptr;
+  if (nullptr != legacy_relevance_buf_ && nullptr != allocator_) {
+    allocator_->free(legacy_relevance_buf_);
+  }
+  legacy_relevance_buf_ = nullptr;
+  if (nullptr != legacy_doc_ids_buf_ && nullptr != allocator_) {
+    allocator_->free(legacy_doc_ids_buf_);
+  }
+  legacy_doc_ids_buf_ = nullptr;
   allocator_ = nullptr;
   doc_freq_ = 0;
   total_doc_cnt_ = 0;
   avg_doc_length_ = 0.0;
   bm25_calc_params_.reset();
+  bm25_frontier_kernels_ = {};
   has_relevance_params_ = false;
-  curr_block_max_score_ = 0.0;
+  invalidate_current_block_max_score();
   frontier_min_id_ = 0;
   min_doc_id_ = 0;
   max_doc_id_ = UINT64_MAX;
@@ -164,6 +224,7 @@ void ObInvSSTablePostingIter::reset_row_cursor()
 
 void ObInvSSTablePostingIter::reset_loaded_block()
 {
+  invalidate_current_block_max_score();
   // Drop logical posting / value block views only.
   // Leaf micros (data + value) stay cached when need_load_*_micro_block_ remains false
   // (same leaf hosts multiple logical blocks) — value lifecycle aligns with data.
@@ -211,8 +272,7 @@ int ObInvSSTablePostingIter::open(
     need_posting_value_ = param.need_posting_value_;
     min_doc_id_ = param.min_doc_id_;
     max_doc_id_ = param.max_doc_id_;
-    // Precompute scoring constants (block-max path uses score_multiplier = 1.0) before
-    // is_opened_ / the first load_current_block_meta(), which needs them via calc_bm25_score().
+    // Block-max scoring uses score_multiplier = 1.0; precompute its constants before opening.
     // Search indexes have no BM25 relevance params; skip precomputation to avoid the
     // avg_doc_length_ > 0 requirement in init_precomputed_params().
     if (has_relevance_params_) {
@@ -220,6 +280,8 @@ int ObInvSSTablePostingIter::open(
           sql::ObExprBM25::query_token_weight(doc_freq_, total_doc_cnt_),
           avg_doc_length_, 1.0 /*score_multiplier*/, bm25_calc_params_))) {
         LOG_WARN("failed to init bm25 precomputed params", K(ret), K_(doc_freq), K_(total_doc_cnt), K_(avg_doc_length));
+      } else {
+        bm25_frontier_kernels_ = sql::get_bm25_frontier_max_kernels();
       }
     }
     if (OB_SUCC(ret)) {
@@ -375,42 +437,178 @@ int ObInvSSTablePostingIter::position_drain_start(int64_t &start_idx)
 }
 
 int ObInvSSTablePostingIter::drain_until(
-    const uint64_t boundary,
-    const int64_t max_count,
-    const uint64_t *&doc_ids,
-    const uint64_t *&token_freqs,
-    const uint64_t *&doc_lengths,
-    int64_t &count)
+    const uint64_t boundary, const int64_t max_count,
+    const uint64_t *&doc_ids, const uint64_t *&token_freqs,
+    const uint64_t *&doc_lengths, int64_t &count)
 {
-  return drain_until_impl(
-      boundary, max_count, doc_ids, token_freqs, doc_lengths, count, false);
+  return drain_until_legacy(boundary, max_count, doc_ids, token_freqs, doc_lengths, count, false);
 }
 
 int ObInvSSTablePostingIter::drain_until_from_current(
-    const uint64_t boundary,
-    const int64_t max_count,
-    const uint64_t *&doc_ids,
-    const uint64_t *&token_freqs,
-    const uint64_t *&doc_lengths,
-    int64_t &count)
+    const uint64_t boundary, const int64_t max_count,
+    const uint64_t *&doc_ids, const uint64_t *&token_freqs,
+    const uint64_t *&doc_lengths, int64_t &count)
 {
-  return drain_until_impl(
-      boundary, max_count, doc_ids, token_freqs, doc_lengths, count, true);
+  return drain_until_legacy(boundary, max_count, doc_ids, token_freqs, doc_lengths, count, true);
+}
+
+int ObInvSSTablePostingIter::drain_until_legacy(
+    const uint64_t boundary, const int64_t max_count,
+    const uint64_t *&doc_ids, const uint64_t *&token_freqs,
+    const uint64_t *&doc_lengths, int64_t &count, const bool include_current)
+{
+  int ret = OB_SUCCESS;
+  ObPostingDocIdView view;
+  ObPostingRelevanceView relevance;
+  doc_ids = nullptr;
+  token_freqs = nullptr;
+  doc_lengths = nullptr;
+  if (OB_FAIL(drain_until_impl(boundary, max_count, view, relevance, count, include_current))) {
+    LOG_WARN("failed to project posting batch", K(ret), K(boundary), K(max_count), K(include_current));
+  } else if (OB_FAIL(export_legacy_doc_ids(view, count, doc_ids))) {
+    LOG_WARN("failed to export legacy doc IDs", K(ret), K(count));
+  } else if (OB_FAIL(export_legacy_relevance(relevance, count, token_freqs, doc_lengths))) {
+    LOG_WARN("failed to export legacy relevance", K(ret), K(count));
+  }
+  if (OB_FAIL(ret)) {
+    doc_ids = nullptr;
+    token_freqs = nullptr;
+    doc_lengths = nullptr;
+    count = 0;
+  }
+  return ret;
+}
+
+int ObInvSSTablePostingIter::drain_until_typed(
+    const uint64_t boundary, const int64_t max_count,
+    ObPostingDocIdView &doc_ids, ObPostingRelevanceView &relevance, int64_t &count)
+{
+  return drain_until_impl(boundary, max_count, doc_ids, relevance, count, false);
+}
+
+int ObInvSSTablePostingIter::drain_until_typed_run(
+    const uint64_t boundary, const int64_t max_count,
+    ObPostingDocIdView &doc_ids, ObPostingRelevanceView &relevance,
+    int64_t &count, bool &finished, const bool include_current)
+{
+  int ret = OB_SUCCESS;
+  finished = false;
+  if (OB_FAIL(drain_until_impl(boundary, max_count, doc_ids, relevance, count, include_current))) {
+    LOG_WARN("failed to project typed posting run", K(ret), K(boundary), K(max_count), K(include_current));
+  } else if (0 == count) {
+    finished = true;
+  } else {
+    const int64_t next_idx = curr_row_idx_ + 1;
+    if (next_idx >= curr_meta_.doc_count_) {
+      // 后继行需要跨逻辑块定位，暂不探测，保持 finished=false。
+      // 调用方消费本批视图后再次调用，由正常读取流程判断是否到达边界或 EOF。
+    } else {
+      const uint64_t next_id = posting_block_data_.doc_id_at(next_idx);
+      if (next_id > MIN(boundary, max_doc_id_)) {
+        if (next_id > max_doc_id_) {
+          is_end_ = true;
+          reset_row_cursor();
+          finished = true;
+        } else if (OB_FAIL(materialize_doc_id(next_idx))) {
+          LOG_WARN("failed to position known in-block lookahead", K(ret), K(next_idx));
+        } else {
+          // 仅更新当前行位置，不切换逻辑块或微块引用，本批列视图仍然有效。
+          finished = true;
+        }
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+    doc_ids.reset();
+    relevance.reset();
+    count = 0;
+    finished = false;
+  }
+  return ret;
+}
+
+int ObInvSSTablePostingIter::export_legacy_doc_ids(
+    const ObPostingDocIdView &view, const int64_t count, const uint64_t *&doc_ids)
+{
+  int ret = OB_SUCCESS;
+  doc_ids = nullptr;
+  if (count <= 0) {
+  } else if (!view.is_uint32()) {
+    doc_ids = view.get_uint64();
+  } else if (count > DEFAULT_POSTING_BLOCK_CAPACITY || nullptr == allocator_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid legacy doc id projection", K(ret), K(count), KP_(allocator));
+  } else {
+    if (nullptr == legacy_doc_ids_buf_) {
+      legacy_doc_ids_buf_ = static_cast<uint64_t *>(allocator_->alloc(
+          DEFAULT_POSTING_BLOCK_CAPACITY * sizeof(uint64_t)));
+      if (nullptr == legacy_doc_ids_buf_) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate legacy doc id scratch", K(ret),
+            "size", DEFAULT_POSTING_BLOCK_CAPACITY * sizeof(uint64_t));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      const uint32_t *source = view.get_uint32();
+      for (int64_t i = 0; i < count; ++i) { legacy_doc_ids_buf_[i] = source[i]; }
+      doc_ids = legacy_doc_ids_buf_;
+    }
+  }
+  return ret;
+}
+
+int ObInvSSTablePostingIter::export_legacy_relevance(
+    const ObPostingRelevanceView &relevance,
+    const int64_t count,
+    const uint64_t *&token_freqs,
+    const uint64_t *&doc_lengths)
+{
+  int ret = OB_SUCCESS;
+  token_freqs = nullptr;
+  doc_lengths = nullptr;
+  if (count <= 0 || !relevance.has_relevance_params()) {
+  } else if (!relevance.is_uint32()) {
+    token_freqs = relevance.get_token_freqs64();
+    doc_lengths = relevance.get_doc_lengths64();
+  } else if (OB_UNLIKELY(count > DEFAULT_POSTING_BLOCK_CAPACITY || nullptr == allocator_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid legacy relevance projection", K(ret), K(count), KP_(allocator));
+  } else {
+    if (nullptr == legacy_relevance_buf_) {
+      legacy_relevance_buf_ = static_cast<uint64_t *>(allocator_->alloc(
+          2 * DEFAULT_POSTING_BLOCK_CAPACITY * sizeof(uint64_t)));
+      if (nullptr == legacy_relevance_buf_) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate legacy relevance scratch", K(ret));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      uint64_t *frequencies = legacy_relevance_buf_;
+      uint64_t *lengths = legacy_relevance_buf_ + DEFAULT_POSTING_BLOCK_CAPACITY;
+      const uint32_t *source_frequencies = relevance.get_token_freqs32();
+      const uint32_t *source_lengths = relevance.get_doc_lengths32();
+      for (int64_t i = 0; i < count; ++i) {
+        frequencies[i] = source_frequencies[i];
+        lengths[i] = source_lengths[i];
+      }
+      token_freqs = frequencies;
+      doc_lengths = lengths;
+    }
+  }
+  return ret;
 }
 
 int ObInvSSTablePostingIter::drain_until_impl(
     const uint64_t boundary,
     const int64_t max_count,
-    const uint64_t *&doc_ids,
-    const uint64_t *&token_freqs,
-    const uint64_t *&doc_lengths,
+    ObPostingDocIdView &doc_ids,
+    ObPostingRelevanceView &relevance,
     int64_t &count,
     const bool include_current)
 {
   int ret = OB_SUCCESS;
-  doc_ids = nullptr;
-  token_freqs = nullptr;
-  doc_lengths = nullptr;
+  doc_ids.reset();
+  relevance.reset();
   count = 0;
   int64_t start_idx = include_current ? curr_row_idx_ : 0;
   const uint64_t range_boundary = MIN(boundary, max_doc_id_);
@@ -433,29 +631,27 @@ int ObInvSSTablePostingIter::drain_until_impl(
     LOG_WARN("failed to position drain start", K(ret), K(boundary));
   } else if (is_end_) {
     // move_to_next_block hit EOF while positioning: count == 0 && is_end().
-  } else if (posting_block_data_.get_doc_ids()[start_idx] > max_doc_id_) {
+  } else if (posting_block_data_.doc_id_at(start_idx) > max_doc_id_) {
     is_end_ = true;
     reset_row_cursor();
   } else {
-    const uint64_t *ids = posting_block_data_.get_doc_ids();
     // 计算当前 posting block 从起始位置到末尾的剩余行数。
     const int64_t remaining = curr_meta_.doc_count_ - start_idx;
     // 按调用方容量截取本次 drain 最多可返回的 capped slice。
     const int64_t capped_count = MIN(remaining, max_count);
     int64_t boundary_end_idx = start_idx;
-    if (ids[start_idx] > range_boundary) {
+    if (posting_block_data_.doc_id_at(start_idx) > range_boundary) {
       // capped slice 首行已越过 boundary，本次不返回任何行。
-    } else if (ids[start_idx + capped_count - 1] <= range_boundary) {
+    } else if (posting_block_data_.doc_id_at(start_idx + capped_count - 1) <= range_boundary) {
       // capped slice 末行仍在 boundary 内，直接返回整个 slice。
       boundary_end_idx = start_idx + capped_count;
-    } else {
-      // boundary 切入 capped slice，仅在该 slice 内执行标准 upper-bound。
-      const uint64_t *upper = std::upper_bound(
-          ids + start_idx, ids + start_idx + capped_count, range_boundary);
-      boundary_end_idx = static_cast<int64_t>(upper - ids);
+    } else if (OB_FAIL(posting_block_data_.upper_bound(
+        range_boundary, start_idx, start_idx + capped_count, boundary_end_idx))) {
+      LOG_WARN("failed to find posting boundary", K(ret), K(start_idx), K(capped_count));
     }
     const int64_t available = boundary_end_idx - start_idx;
-    if (available <= 0) {
+    if (OB_FAIL(ret)) {
+    } else if (available <= 0) {
       // 仅定位 boundary lookahead 行，不读取该行的相关性列。
       if (OB_FAIL(materialize_doc_id(start_idx))) {
         LOG_WARN("failed to position boundary lookahead row", K(ret), K(start_idx));
@@ -463,17 +659,23 @@ int ObInvSSTablePostingIter::drain_until_impl(
     } else {
       const int64_t take = available;
       // Project direct pointers into the decoded block; no copy.
-      doc_ids = ids + start_idx;
-      if (posting_block_data_.has_relevance_params()) {
-        token_freqs = posting_block_data_.get_token_freqs() + start_idx;
-        doc_lengths = posting_block_data_.get_doc_lengths() + start_idx;
+      if (OB_FAIL(posting_block_data_.get_doc_id_view(start_idx, doc_ids))) {
+        LOG_WARN("failed to project typed doc IDs", K(ret), K(start_idx), K(take));
+      } else if (OB_FAIL(posting_block_data_.get_relevance_view(start_idx, relevance))) {
+        LOG_WARN("failed to project typed relevance", K(ret), K(start_idx), K(take));
+      } else {
+        count = take;
       }
-      count = take;
       // 仅把 cursor 定位到本批最后一行，批量投影已经直接提供相关性列，无需重复读取。
-      if (OB_FAIL(materialize_doc_id(start_idx + take - 1))) {
+      if (FAILEDx(materialize_doc_id(start_idx + take - 1))) {
         LOG_WARN("failed to position last projected row", K(ret), K(start_idx), K(take));
       }
     }
+  }
+  if (OB_FAIL(ret)) {
+    doc_ids.reset();
+    relevance.reset();
+    count = 0;
   }
   return ret;
 }
@@ -515,6 +717,10 @@ int ObInvSSTablePostingIter::locate_target(
     bool block_changed = false;
     reset_loaded_block();
     if (OB_FAIL(scanner_.advance_to(target_doc_id, true /*inclusive*/, block_changed))) {
+      // A physical-row change may already have released the old pin.
+      if (block_changed) {
+        curr_meta_.reset();
+      }
       if (OB_UNLIKELY(OB_ITER_END != ret)) {
         LOG_WARN("failed to advance scanner", K(ret), K(target_doc_id));
       }
@@ -583,24 +789,48 @@ int ObInvSSTablePostingIter::advance_to_id(const ObDatum &target)
 {
   int ret = OB_SUCCESS;
   uint64_t target_doc_id = 0;
+  uint64_t curr_doc_id = 0;
   if (OB_UNLIKELY(!is_opened_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else if (OB_FAIL(decode_target_doc_id(target, target_doc_id))) {
     LOG_WARN("failed to decode target doc id", K(ret));
-    // Same frontier guard as advance_to(): the seek target must not move the
-    // iterator below the already advanced scan frontier.
-  } else if (FALSE_IT(target_doc_id = MAX(target_doc_id, MAX(min_doc_id_, frontier_min_id_)))) {
-  } else if (target_doc_id > max_doc_id_) {
+  } else if (OB_FAIL(advance_to_id(target_doc_id, curr_doc_id))) {
+    LOG_WARN_IGNORE_ITER_END(ret, "failed to advance to decoded doc id", K(ret), K(target_doc_id));
+  }
+  return ret;
+}
+
+int ObInvSSTablePostingIter::advance_to_id(
+    const uint64_t target_doc_id,
+    uint64_t &curr_doc_id)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_opened_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("posting iter not opened", K(ret));
+  } else if (OB_FAIL(advance_to_id_impl(target_doc_id))) {
+    LOG_WARN_IGNORE_ITER_END(ret, "failed to advance to doc id", K(ret), K(target_doc_id));
+  } else {
+    curr_doc_id = curr_id_storage_;
+  }
+  return ret;
+}
+
+int ObInvSSTablePostingIter::advance_to_id_impl(const uint64_t target_doc_id)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t seek_doc_id = MAX(target_doc_id, MAX(min_doc_id_, frontier_min_id_));
+  if (seek_doc_id > max_doc_id_) {
     ret = OB_ITER_END;
   } else if (is_end_) {
     ret = OB_ITER_END;
-  } else if (!in_shallow_status_ && nullptr != curr_id_ && target_doc_id <= curr_id_storage_) {
+  } else if (!in_shallow_status_ && nullptr != curr_id_ && seek_doc_id <= curr_id_storage_) {
     // The current doc id already satisfies the target.
   } else {
     int64_t target_idx = 0;
-    if (OB_FAIL(locate_target(target_doc_id, target_idx))) {
-      LOG_WARN_IGNORE_ITER_END(ret, "failed to locate target", K(ret), K(target_doc_id));
+    if (OB_FAIL(locate_target(seek_doc_id, target_idx))) {
+      LOG_WARN_IGNORE_ITER_END(ret, "failed to locate target", K(ret), K(seek_doc_id));
     } else if (OB_FAIL(materialize_doc_id(target_idx))) {
       LOG_WARN("failed to materialize advanced doc id", K(ret), K(target_idx));
     }
@@ -611,6 +841,125 @@ int ObInvSSTablePostingIter::advance_to_id(const ObDatum &target)
   if (OB_ITER_END == ret) {
     is_end_ = true;
     reset_row_cursor();
+  }
+  return ret;
+}
+
+int ObInvSSTablePostingIter::probe_local_block_group(
+    const uint64_t *ids, const int64_t count,
+    uint64_t *token_freqs, uint64_t *doc_lengths,
+    uint64_t &matches, int64_t &consumed)
+{
+  int ret = OB_SUCCESS;
+  matches = 0;
+  consumed = 0;
+  if (count >= 8 && curr_block_loaded_ && !in_shallow_status_
+      && curr_row_idx_ >= 0 && curr_row_idx_ < curr_meta_.doc_count_
+      && posting_block_data_.has_relevance_params()
+      && curr_meta_.max_id_ <= max_doc_id_
+      && ids[0] > curr_id_storage_ && ids[7] <= curr_meta_.max_id_) {
+    const int64_t end = std::upper_bound(ids + 8, ids + count, curr_meta_.max_id_) - ids;
+    ObPostingRelevanceView relevance;
+    if (OB_FAIL(posting_block_data_.get_relevance_view(0, relevance))) {
+      LOG_WARN("failed to project local probe relevance", K(ret));
+    }
+    int64_t row_idx = curr_row_idx_;
+    uint64_t head = curr_id_storage_;
+    bool final_matched = false;
+    for (int64_t c = 0; OB_SUCC(ret) && c < end; ++c) {
+      if (ids[c] > head) {
+        if (OB_FAIL(posting_block_data_.lower_bound(
+            ids[c], row_idx + 1, curr_meta_.doc_count_, row_idx))) {
+          LOG_WARN("failed to locate local sorted probe id", K(ret), K(c));
+        } else {
+          head = posting_block_data_.doc_id_at(row_idx);
+          final_matched = false;
+        }
+      }
+      if (OB_SUCC(ret) && head == ids[c]) {
+        if (relevance.is_uint32()) {
+          token_freqs[c] = relevance.get_token_freqs32()[row_idx];
+          doc_lengths[c] = relevance.get_doc_lengths32()[row_idx];
+        } else {
+          token_freqs[c] = relevance.get_token_freqs64()[row_idx];
+          doc_lengths[c] = relevance.get_doc_lengths64()[row_idx];
+        }
+        matches |= uint64_t(1) << c;
+        final_matched = true;
+      } else if (OB_SUCC(ret) && c + 1 < end && ids[c + 1] < head) {
+        c = head > ids[end - 1] ? end - 1
+            : std::lower_bound(ids + c + 2, ids + end, head) - ids - 1;
+      }
+    }
+    // Commit the final head and lazy relevance state after copying all matches.
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(materialize_doc_id(row_idx))) {
+        LOG_WARN("failed to commit local sorted probe head", K(ret), K(row_idx));
+      } else if (final_matched && OB_FAIL(materialize_curr_relevance())) {
+        LOG_WARN("failed to commit local sorted probe relevance", K(ret));
+      } else {
+        consumed = end;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObInvSSTablePostingIter::probe_sorted_ids(
+    const uint64_t *ids, const int64_t count,
+    uint64_t *token_freqs, uint64_t *doc_lengths,
+    uint64_t &matches, uint64_t &last_id)
+{
+  int ret = OB_SUCCESS;
+  matches = 0;
+  if (OB_UNLIKELY(!can_probe_sorted_ids())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("posting cursor cannot probe sorted ids", K(ret));
+  } else if (OB_ISNULL(ids) || OB_ISNULL(token_freqs) || OB_ISNULL(doc_lengths)
+      || OB_UNLIKELY(count <= 0 || count > MAX_SORTED_PROBE_COUNT)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid sorted posting probe arguments", K(ret), K(count));
+  } else {
+    last_id = curr_id_storage_;
+    for (int64_t c = 0; OB_SUCC(ret) && !is_end_ && c < count; ++c) {
+      uint64_t group_matches = 0;
+      int64_t consumed = 0;
+      if (count - c >= 8 && ids[c + 7] <= curr_meta_.max_id_
+          && OB_FAIL(probe_local_block_group(ids + c, count - c,
+              token_freqs + c, doc_lengths + c, group_matches, consumed))) {
+        LOG_WARN("failed to probe local sorted group", K(ret), K(c));
+      } else if (consumed > 0) {
+        matches |= group_matches << c;
+        last_id = curr_id_storage_;
+        c += consumed - 1;
+      } else {
+        if (OB_FAIL(advance_to_id_impl(ids[c]))) {
+          if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
+          } else {
+            LOG_WARN("failed to advance to sorted probe id", K(ret), K(c), K(ids[c]));
+          }
+        } else {
+          last_id = curr_id_storage_;
+        }
+        if (OB_FAIL(ret) || is_end_) {
+        } else if (curr_id_storage_ == ids[c]) {
+          int64_t token_freq = 0;
+          int64_t doc_length = 0;
+          if (OB_FAIL(load_curr_bm25_param(token_freq, doc_length))) {
+            LOG_WARN("failed to load sorted probe relevance", K(ret), K(c));
+          } else {
+            token_freqs[c] = static_cast<uint64_t>(token_freq);
+            doc_lengths[c] = static_cast<uint64_t>(doc_length);
+            matches |= uint64_t(1) << c;
+          }
+        } else if (c + 1 < count && ids[c + 1] < curr_id_storage_) {
+          c = curr_id_storage_ > ids[count - 1]
+              ? count - 1
+              : std::lower_bound(ids + c + 2, ids + count, curr_id_storage_) - ids - 1;
+        }
+      }
+    }
   }
   return ret;
 }
@@ -642,6 +991,11 @@ int ObInvSSTablePostingIter::advance_shallow(const ObDatum &target, const bool i
       ret = OB_ITER_END;
     } else if (!covered_by_curr_block) {
       if (OB_FAIL(scanner_.advance_to(target_doc_id, target_inclusive, block_changed))) {
+        // A physical-row change may already have released the old pin.
+        if (block_changed) {
+          curr_meta_.reset();
+          invalidate_current_block_max_score();
+        }
         if (OB_UNLIKELY(OB_ITER_END != ret)) {
           LOG_WARN("failed to shallow advance scanner", K(ret), K(target_doc_id));
         }
@@ -745,12 +1099,6 @@ int ObInvSSTablePostingIter::load_curr_bm25_param(
   return ret;
 }
 
-double ObInvSSTablePostingIter::calc_bm25_score(
-    const uint64_t token_freq, const uint64_t doc_length) const
-{
-  return sql::ObExprBM25::eval_with_precomputed_params(token_freq, doc_length, bm25_calc_params_);
-}
-
 int ObInvSSTablePostingIter::get_curr_phrase_block_max_ranking(double &max_ranking) const
 {
   int ret = OB_SUCCESS;
@@ -780,7 +1128,7 @@ int ObInvSSTablePostingIter::get_curr_phrase_block_max_ranking(double &max_ranki
 }
 
 int ObInvSSTablePostingIter::get_block_max_tuple(
-    uint64_t &min_id, uint64_t &max_id, double &max_score) const
+    uint64_t &min_id, uint64_t &max_id, double &max_score)
 {
   int ret = OB_SUCCESS;
   min_id = 0;
@@ -791,6 +1139,9 @@ int ObInvSSTablePostingIter::get_block_max_tuple(
     LOG_WARN("posting iter not opened", K(ret));
   } else if (is_end_) {
     ret = OB_ITER_END;
+  } else if (OB_UNLIKELY(!curr_meta_.is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("current posting block meta is invalid", K(ret), K_(curr_meta));
   } else {
     min_id = MAX(MAX(frontier_min_id_, curr_meta_.min_id_), min_doc_id_);
     max_id = MIN(curr_meta_.max_id_, max_doc_id_);
@@ -801,7 +1152,7 @@ int ObInvSSTablePostingIter::get_block_max_tuple(
       // substitute its own conservative bound. min_id/max_id stay populated.
       ret = OB_NOT_SUPPORTED;
     } else {
-      max_score = curr_block_max_score_;
+      max_score = get_current_block_max_score();
     }
   }
   return ret;
@@ -817,6 +1168,7 @@ int ObInvSSTablePostingIter::get_range_max_score(
 {
   int ret = OB_SUCCESS;
   can_calc = false;
+  bool cached_meta_reusable = false;
   if (OB_UNLIKELY(!is_opened_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
@@ -824,26 +1176,42 @@ int ObInvSSTablePostingIter::get_range_max_score(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid posting range", K(ret), K(start_id), K(start_inclusive), K(end_id));
   } else if (OB_UNLIKELY(!has_relevance_params_)) {
-    // 不包含 BM25 metadata 的搜索索引由调用方使用保守上界回退。
   } else if (is_end_) {
     max_score = 0.0;
+    can_calc = true;
+  } else if (OB_FAIL(scanner_.check_cached_range_meta(curr_meta_,
+      start_inclusive ? start_id : start_id + 1, end_id, cached_meta_reusable))) {
+    invalidate_current_block_max_score();
+    if (OB_ITER_END == ret) {
+      ret = OB_ERR_UNEXPECTED;
+    }
+    LOG_WARN("failed to check cached range metadata", K(ret));
+  } else if (cached_meta_reusable && curr_meta_.min_id_ > end_id) {
+    max_score = 0.0;
+    can_calc = true;
+  } else if (cached_meta_reusable && curr_block_max_score_valid_
+      && curr_meta_.block_max_.has_max_score() && curr_meta_.max_id_ >= end_id) {
+    max_score = std::max(0.0, curr_block_max_score_);
     can_calc = true;
   } else {
     const uint64_t first_id = start_inclusive ? start_id : start_id + 1;
     double candidate_max_score = 0.0;
     bool score_available = true;
     bool range_covered = false;
-    // visitor 只累计区间内 block 的 BM25 上界，metadata 有效性、顺序和覆盖由 scanner 保证。
-    ObFunction<int(const ObPostingBlockMeta &, bool &)> visitor(
-        ObRangeMaxScoreVisitor(*this, first_id, candidate_max_score, score_available));
-    if (OB_FAIL(scanner_.visit_prefetched_block_meta(end_id, visitor, range_covered))) {
-      if (OB_UNLIKELY(OB_ITER_END == ret)) {
+    const bool reuse_current_score = cached_meta_reusable && curr_block_max_score_valid_
+        && curr_meta_.max_id_ >= first_id && curr_meta_.min_id_ <= end_id
+        && curr_meta_.block_max_.has_max_score();
+    ObFunction<int(const ObPostingFrontierSpan &)> span_visitor(
+        ObRangeMaxScoreSpanVisitor(*this, reuse_current_score, candidate_max_score));
+    if (OB_FAIL(scanner_.visit_prefetched_frontier_spans(
+        first_id, end_id, span_visitor, range_covered, score_available))) {
+      LOG_WARN("failed to visit posting frontier spans", K(ret), K(first_id), K(end_id));
+    }
+    if (OB_FAIL(ret)) {
+      if (OB_ITER_END == ret) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected end of prefetched posting block metadata",
-            K(ret), K(start_id), K(start_inclusive), K(end_id));
-      } else {
-        LOG_WARN("failed to visit prefetched posting block meta", K(ret), K(end_id));
       }
+      LOG_WARN("failed to evaluate posting frontier range", K(ret), K(start_id), K(end_id));
     } else if (score_available && range_covered) {
       max_score = candidate_max_score;
       can_calc = true;
@@ -972,30 +1340,42 @@ int ObInvSSTablePostingIter::decode_target_doc_id(
   return ret;
 }
 
+void ObInvSSTablePostingIter::assign_current_block_meta(const ObPostingBlockMeta &meta)
+{
+  // A new pin/image can have the same maximum DocID. Never use only max_id as
+  // the identity of a lazily evaluated bound.
+  invalidate_current_block_max_score();
+  curr_meta_ = meta;
+}
+
+double ObInvSSTablePostingIter::get_current_block_max_score()
+{
+  if (!curr_block_max_score_valid_) {
+    const ObPostingBlockMaxScore &block_max = curr_meta_.block_max_;
+    curr_block_max_score_ = bm25_frontier_kernels_.max_score(
+        block_max.pairs_, block_max.pair_count_, bm25_calc_params_, 0.0);
+    curr_block_max_score_valid_ = true;
+  }
+  return curr_block_max_score_;
+}
+
 int ObInvSSTablePostingIter::load_current_block_meta()
 {
   int ret = OB_SUCCESS;
-  const bool had_valid_meta = curr_meta_.is_valid();
-  const uint64_t prev_max_id = curr_meta_.max_id_;
-  curr_meta_.reset();
-  if (OB_FAIL(scanner_.get_cur_block_meta(curr_meta_))) {
+  ObPostingBlockMeta meta;
+  if (OB_FAIL(scanner_.get_cur_block_meta(meta))) {
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
       LOG_WARN("failed to get current block meta", K(ret));
     }
-  } else if (OB_UNLIKELY(!curr_meta_.is_valid())) {
+  } else if (OB_UNLIKELY(!meta.is_valid())) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("invalid current posting block meta", K(ret), K_(curr_meta));
-  } else if (!had_valid_meta || prev_max_id != curr_meta_.max_id_) {
-    // block switched
-    curr_block_max_score_ = 0.0;
-    const ObPostingBlockMaxScore &block_max = curr_meta_.block_max_;
-    for (int64_t i = 0; i < block_max.pair_count_; ++i) {
-      const ObInvIdxBM25ParamPair &pair = block_max.pairs_[i];
-      const double score = calc_bm25_score(pair.token_freq_, pair.doc_length_);
-      if (score > curr_block_max_score_) {
-        curr_block_max_score_ = score;
-      }
-    }
+    LOG_WARN("invalid current posting block meta", K(ret), K(meta));
+  } else {
+    assign_current_block_meta(meta);
+  }
+  if (OB_FAIL(ret)) {
+    curr_meta_.reset();
+    invalidate_current_block_max_score();
   }
   return ret;
 }
@@ -1016,7 +1396,7 @@ int ObInvSSTablePostingIter::load_current_block()
     LOG_WARN("invalid posting data micro block", K(ret));
   } else if (FALSE_IT(posting_block_data_.reset())) {
   } else if (need_load_micro_block_
-      && OB_FAIL(posting_micro_reader_.init_flat_cache(
+      && OB_FAIL(posting_micro_reader_.init(
          curr_data_micro_block_.get_buf(),
          curr_data_micro_block_.get_buf_size()))) {
     LOG_WARN("failed to init posting data micro block reader", K(ret), K(curr_data_micro_block_));
@@ -1045,7 +1425,7 @@ int ObInvSSTablePostingIter::materialize_doc_id(const int64_t row_idx)
     LOG_WARN("row idx out of range", K(ret), K(row_idx), K_(curr_meta));
   } else {
     // 直接从已解码 doc-id 连续数组读取目标行，并建立当前 datum 指针。
-    curr_id_storage_ = posting_block_data_.get_doc_ids()[row_idx];
+    curr_id_storage_ = posting_block_data_.doc_id_at(row_idx);
     curr_id_datum_.ptr_ = reinterpret_cast<const char *>(&curr_id_storage_);
     curr_id_datum_.set_uint(curr_id_storage_);
     curr_id_ = &curr_id_datum_;
@@ -1100,6 +1480,10 @@ int ObInvSSTablePostingIter::move_to_next_block()
   bool block_changed = false;
   reset_loaded_block();
   if (OB_FAIL(scanner_.next_block(block_changed))) {
+    // A physical-row change may already have released the old pin.
+    if (block_changed) {
+      curr_meta_.reset();
+    }
     if (OB_UNLIKELY(OB_ITER_END != ret)) {
       LOG_WARN("failed to advance to next posting block", K(ret));
     }

@@ -7,6 +7,7 @@
 
 
 #include "ob_multi_tenant.h"
+#include "storage/access/ob_async_inv_iterator_pool.h"
 #include "observer/ob_server.h"
 #include "ob_tenant.h"
 #include "rpc/obmysql/ob_sql_nio_server.h"
@@ -644,6 +645,7 @@ int ObMultiTenant::init(ObAddr myaddr,
     MTL_BIND2(common::sqlclient::ObTenantDblinkKeeper::mtl_new, common::sqlclient::ObTenantDblinkKeeper::mtl_init, nullptr, nullptr, nullptr, common::sqlclient::ObTenantDblinkKeeper::mtl_destroy);
 #endif
     MTL_BIND2(mtl_new_default, storage::ObTenantBackupDestInfoMgr::mtl_init, mtl_start_default, mtl_stop_default, mtl_wait_default, mtl_destroy_default);
+    MTL_BIND2(mtl_new_default, ObAsyncInvIteratorPool::mtl_init, nullptr, mtl_stop_default, nullptr, ObAsyncInvIteratorPool::mtl_destroy);
     MTL_BIND2(mtl_new_default, ObGlobalIteratorPool::mtl_init, nullptr, nullptr, nullptr, ObGlobalIteratorPool::mtl_destroy);
 #ifdef OB_BUILD_AUDIT_SECURITY
     MTL_BIND2(mtl_new_default, ObAuditLogger::mtl_init, ObAuditLogger::mtl_start, ObAuditLogger::mtl_stop, ObAuditLogger::mtl_wait, mtl_destroy_default);

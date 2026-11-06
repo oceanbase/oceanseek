@@ -268,6 +268,17 @@ int ObDASMatchPhraseOp::prepare_token_stats()
   return ret;
 }
 
+void ObDASMatchPhraseOp::close_posting_iters()
+{
+  if (use_async_index_) {
+    for (int64_t i = 0; i < async_helpers_.count(); ++i) {
+      if (OB_NOT_NULL(async_helpers_[i])) {
+        async_helpers_[i]->reuse();
+      }
+    }
+  }
+}
+
 int ObDASMatchPhraseOp::do_close()
 {
   int ret = OB_SUCCESS;

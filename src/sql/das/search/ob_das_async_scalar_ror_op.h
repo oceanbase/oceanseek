@@ -12,6 +12,7 @@
 #include "sql/das/search/ob_das_scalar_define.h"
 #include "share/search_index/ob_search_index_nested_key_list.h"
 #include "storage/access/ob_table_read_info.h"
+#include "storage/access/ob_async_inv_iterator_pool.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_posting_iter.h"
 
 namespace oceanbase
@@ -67,6 +68,7 @@ private:
 class ObDASAsyncScalarRorOp : public ObIDASSearchOp
 {
 public:
+
   ObDASAsyncScalarRorOp(ObDASSearchCtx &search_ctx)
     : ObIDASSearchOp(search_ctx),
       arena_allocator_(common::ObMemAttr(MTL_ID(), "DASAsyncScalar")),
@@ -87,6 +89,7 @@ public:
       tsc_service_(nullptr),
       query_flag_(),
       posting_iter_(nullptr),
+      posting_entry_(nullptr),
       posting_scan_param_(),
       nested_key_list_reader_(),
       curr_nested_key_(),
@@ -103,6 +106,9 @@ public:
   virtual ~ObDASAsyncScalarRorOp() {}
   int get_bitmap_input_range(bool &available, uint64_t &lo, uint64_t &hi,
                              int64_t &estimated_count) override;
+
+  void close_posting_iter();
+  void release_scan_resources() override { close_posting_iter(); }
 
   bool supports_direct_rowid_drain() const override
   {
@@ -142,7 +148,6 @@ private:
   int init_term_key();
   int init_posting_scan_param();
   int open_posting_iter_from_tablet();
-  void close_posting_iter();
   void reset_leaf_runtime_state();
   int position_nested_key(const common::ObDatum *target_nested_key);
   int advance_to_next_nested_posting();
@@ -175,6 +180,7 @@ private:
   storage::ObAccessService *tsc_service_;
   common::ObQueryFlag query_flag_;
   blocksstable::ObInvSSTablePostingIter *posting_iter_;
+  blocksstable::ObInvPostingIterEntry *posting_entry_;
   blocksstable::ObInvPostingScanParam posting_scan_param_;
   share::ObSearchIndexNestedKeyListReader nested_key_list_reader_;
   common::ObDatum curr_nested_key_;

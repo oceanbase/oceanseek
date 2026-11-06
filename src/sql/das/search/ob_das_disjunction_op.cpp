@@ -302,14 +302,20 @@ int ObDASDisjunctionOp::init_merge_iters(const ObDASDisjunctionOpParam &op_param
     LOG_WARN("failed to prepare allocate merge iters", K(ret));
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < op_param.get_optional_ops()->count(); ++i) {
-      ObDAATMergeIter *merge_iter = OB_NEWx(ObDAATMergeIter, &iter_allocator);
-      if (OB_ISNULL(merge_iter)) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("failed to allocate memory for merge iter", K(ret));
-      } else if (OB_FAIL(merge_iter->init(i, *op_param.get_optional_ops()->at(i)))) {
-        LOG_WARN("failed to init merge iter", K(ret));
+      ObIDASSearchOp *optional_op = op_param.get_optional_ops()->at(i);
+      if (OB_ISNULL(optional_op)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected nullptr optional op", K(ret), K(i));
       } else {
-        merge_iters_[i] = merge_iter;
+        ObDAATMergeIter *merge_iter = OB_NEWx(ObDAATMergeIter, &iter_allocator);
+        if (OB_ISNULL(merge_iter)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("failed to allocate memory for merge iter", K(ret));
+        } else if (OB_FAIL(merge_iter->init(i, *optional_op))) {
+          LOG_WARN("failed to init merge iter", K(ret));
+        } else {
+          merge_iters_[i] = merge_iter;
+        }
       }
     }
   }

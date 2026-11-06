@@ -4,9 +4,11 @@
  */
 
 #define USING_LOG_PREFIX SQL_DAS
+#include <algorithm>
 #include "ob_daat_merge_iter.h"
 #include "sql/das/search/ob_das_async_token_op.h"
 #include "sql/das/search/ob_das_doc_score_accumulator.h"
+#include "sql/das/search/ob_das_sparse_candidate_buffer.h"
 
 namespace oceanbase
 {
@@ -24,8 +26,10 @@ ObDAATMergeIter::ObDAATMergeIter()
     max_score_calculated_(false),
     in_shallow_status_(false),
     iter_end_(false),
+    async_token_op_(nullptr),
     is_inited_(false)
 {
+  curr_id_.set_min();
 }
 
 int ObDAATMergeIter::init(const int64_t iter_idx, ObIDASSearchOp &op)
@@ -41,6 +45,9 @@ int ObDAATMergeIter::init(const int64_t iter_idx, ObIDASSearchOp &op)
     curr_score_materialized_ = false;
     in_shallow_status_ = false;
     iter_end_ = false;
+    async_token_op_ = DAS_SEARCH_OP_ASYNC_TOKEN == op.get_op_type()
+        ? static_cast<ObDASAsyncTokenOp *>(&op)
+        : nullptr;
     is_inited_ = true;
   }
   return ret;
@@ -49,6 +56,7 @@ int ObDAATMergeIter::init(const int64_t iter_idx, ObIDASSearchOp &op)
 void ObDAATMergeIter::reuse()
 {
   curr_id_.reset();
+  curr_id_.set_min();
   curr_score_ = 0.0;
   curr_score_materialized_ = false;
   curr_block_max_info_ = nullptr;
@@ -133,6 +141,127 @@ int ObDAATMergeIter::advance_to_id(const ObDASRowID &target)
   } else {
     in_shallow_status_ = false;
     curr_score_materialized_ = true;
+  }
+  return ret;
+}
+
+int ObDAATMergeIter::advance_to_uint64(
+    const uint64_t target,
+    uint64_t &curr_id,
+    bool &iter_end)
+{
+  int ret = OB_SUCCESS;
+  iter_end = iter_end_;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not init", K(ret));
+  } else if (iter_end_) {
+    // keep successful EOF in the typed hot-path contract
+  } else if (OB_NOT_NULL(async_token_op_)) {
+    curr_score_materialized_ = false;
+    if (OB_FAIL(async_token_op_->advance_to_id_uint64(target, curr_id))) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        LOG_WARN("failed to advance to uint64 id", K(ret), K(target));
+      } else {
+        ret = OB_SUCCESS;
+        iter_end_ = true;
+      }
+    } else {
+      curr_id_.set_uint64(curr_id);
+      in_shallow_status_ = false;
+    }
+  } else {
+    ObDASRowID target_id;
+    target_id.set_uint64(target);
+    if (OB_FAIL(advance_to_id(target_id))) {
+      if (OB_UNLIKELY(OB_ITER_END != ret)) {
+        LOG_WARN("failed to advance fallback to uint64 id", K(ret), K(target));
+      } else {
+        ret = OB_SUCCESS;
+      }
+    } else {
+      curr_id = curr_id_.get_uint64();
+    }
+  }
+  if (OB_SUCC(ret)) {
+    iter_end = iter_end_;
+  }
+  return ret;
+}
+
+int ObDAATMergeIter::probe_sorted_candidates(
+    const uint64_t *ids, const int64_t count, double *scores, bool *matched)
+{
+  int ret = OB_SUCCESS;
+  uint64_t curr = 0;
+  bool iter_end = false;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not init", K(ret));
+  } else if (OB_ISNULL(ids) || OB_ISNULL(scores) || OB_ISNULL(matched)
+      || OB_UNLIKELY(count <= 0 || count > blocksstable::ObInvSSTablePostingIter::MAX_SORTED_PROBE_COUNT)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid sorted candidate tile", K(ret), K(count));
+  } else if (!iter_end_ && (in_shallow_status_ || !curr_id_.is_normal())) {
+    if (OB_FAIL(advance_to_uint64(ids[0], curr, iter_end))) {
+      LOG_WARN("failed to position sorted candidate probe", K(ret), K(ids[0]));
+    } else if (!iter_end && OB_UNLIKELY(curr < ids[0])) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("sorted candidate head behind target", K(ret), K(curr), K(ids[0]));
+    }
+  }
+  if (OB_FAIL(ret) || iter_end_) {
+  } else if (count >= 8 && nullptr != async_token_op_
+      && async_token_op_->can_probe_sorted_ids()) {
+    int64_t first = curr_id_.get_uint64() <= ids[0] ? 0
+        : std::lower_bound(ids, ids + count, curr_id_.get_uint64()) - ids;
+    if (first < count && ids[first] == curr_id_.get_uint64()) {
+      double score = 0.0;
+      if (OB_FAIL(load_curr_score(score))) {
+        LOG_WARN("failed to load sorted tile cached head", K(ret));
+      } else {
+        scores[first] += score;
+        matched[first] = true;
+        ++first;
+      }
+    }
+    if (OB_SUCC(ret) && first < count
+        && OB_FAIL(async_token_op_->probe_sorted_ids(
+            ids + first, count - first, scores + first, matched + first,
+            curr_id_, curr_score_, curr_score_materialized_, iter_end_))) {
+      LOG_WARN("failed to probe sorted candidate tile", K(ret));
+    }
+  } else {
+    curr = curr_id_.get_uint64();
+    int64_t c = 0;
+    while (OB_SUCC(ret) && !iter_end_ && c < count) {
+      if (curr < ids[c]) {
+        if (OB_FAIL(advance_to_uint64(ids[c], curr, iter_end))) {
+          LOG_WARN("failed to seek sorted candidate", K(ret), K(c), K(ids[c]));
+        } else if (!iter_end && OB_UNLIKELY(curr < ids[c])) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("sorted candidate head behind target", K(ret), K(curr), K(ids[c]));
+        }
+      }
+      if (OB_FAIL(ret) || iter_end_) {
+      } else if (curr > ids[c]) {
+        ++c;
+        if (c < count && ids[c] < curr) {
+          c = curr > ids[count - 1]
+              ? count
+              : std::lower_bound(ids + c + 1, ids + count, curr) - ids;
+        }
+      } else {
+        double score = 0.0;
+        if (OB_FAIL(load_curr_score(score))) {
+          LOG_WARN("failed to load sorted candidate score", K(ret), K(c));
+        } else {
+          scores[c] += score;
+          matched[c] = true;
+          ++c;
+        }
+      }
+    }
   }
   return ret;
 }
@@ -282,23 +411,11 @@ int ObDAATMergeIter::get_range_max_score(
   return ret;
 }
 
-int ObDAATMergeIter::drain_until(
+int ObDAATMergeIter::drain_into_accumulator(
     const ObDASRowID &boundary_id, DocScoreAccumulator &doc_score_acc)
 {
   int ret = OB_SUCCESS;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("not init", K(ret));
-  } else if (iter_end_) {
-    // nothing to drain
-  } else if (OB_UNLIKELY(in_shallow_status_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected iter status, can not drain batch after shallow advance",
-        K(ret), K_(in_shallow_status));
-  } else if (OB_UNLIKELY(!curr_score_materialized_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("curr score is not materialized", K(ret));
-  } else if (!doc_score_acc.has_filter_mask()
+  if (!doc_score_acc.has_filter_mask()
       && DAS_SEARCH_OP_ASYNC_TOKEN == op_->get_op_type()) {
     if (OB_UNLIKELY(!curr_id_.is_normal() || !boundary_id.is_normal())) {
       ret = OB_INVALID_ARGUMENT;
@@ -315,22 +432,78 @@ int ObDAATMergeIter::drain_until(
         iter_end_ = next_id.is_max();
         curr_id_ = next_id;
         curr_score_ = next_score;
-        curr_score_materialized_ = !iter_end_;
       }
     }
   } else if (OB_FAIL(drain_search_op_until(
       *op_, curr_id_, curr_score_, iter_end_, boundary_id, doc_score_acc))) {
     LOG_WARN("failed to drain search op until boundary", K(ret));
-  } else if (iter_end_) {
-    curr_score_materialized_ = false;
+  }
+  return ret;
+}
+
+int ObDAATMergeIter::score_candidates(SparseCandidateBuffer &candidates)
+{
+  int ret = OB_SUCCESS;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("merge iterator not initialized", K(ret));
+  } else if (iter_end_ || candidates.is_empty()) {
+  } else if (OB_NOT_NULL(async_token_op_)) {
+    if (OB_FAIL(async_token_op_->score_candidates(
+        candidates, curr_id_, curr_score_))) {
+      LOG_WARN("failed to drain token into candidates", K(ret));
+    } else {
+      iter_end_ = curr_id_.is_max();
+      in_shallow_status_ = false;
+      curr_score_materialized_ = !iter_end_;
+    }
   } else {
-    curr_score_materialized_ = true;
+    // Other score operators use the existing scored batch protocol.
+    struct CandidateScoreSink
+    {
+      SparseCandidateBuffer &candidates_;
+      int64_t slot_;
+      int add_dim(const uint64_t id, const double score)
+      {
+        return add_dim_batch(&id, &score, 1);
+      }
+      int add_dim_batch(const uint64_t *ids, const double *scores, const int64_t count)
+      {
+        int64_t scored_count = 0;
+        struct ArrayScoreAt
+        {
+          const double *scores_;
+          OB_INLINE double operator()(const int64_t i) const
+          {
+            return scores_[i];
+          }
+        };
+        const ArrayScoreAt scorer{scores};
+        return candidates_.add_scored_dim_batch(ids, count, scorer, slot_, scored_count);
+      }
+    };
+    const uint64_t *candidate_ids = candidates.get_doc_ids();
+    ObDASRowID start_id;
+    ObDASRowID end_id;
+    start_id.set_uint64(candidate_ids[0]);
+    end_id.set_uint64(candidate_ids[candidates.get_count() - 1]);
+    CandidateScoreSink sink{candidates, 0};
+    if (OB_FAIL(advance_to(start_id))) {
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("failed to position candidate drain", K(ret), K(start_id));
+      }
+    } else if (OB_FAIL(drain_until(end_id, sink))) {
+      LOG_WARN("failed to drain scores into candidates", K(ret), K(end_id));
+    }
   }
   return ret;
 }
 
 int ObDAATMergeIter::drain_until_active(
-    const ObDASRowID &boundary_id, DocScoreAccumulator &doc_score_acc)
+    const uint64_t range_start,
+    const uint64_t range_end, DocScoreAccumulator &doc_score_acc)
 {
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
@@ -338,8 +511,11 @@ int ObDAATMergeIter::drain_until_active(
     LOG_WARN("not init", K(ret));
   } else if (iter_end_) {
     // nothing to drain
-  } else if (OB_FAIL(op_->drain_until_active(boundary_id, doc_score_acc))) {
+  } else if (OB_FAIL(op_->drain_until_active(range_start, range_end, doc_score_acc))) {
     LOG_WARN("failed to drain active rows until boundary", K(ret));
+  } else {
+    curr_id_.set_min();
+    curr_score_materialized_ = false;
   }
   return ret;
 }

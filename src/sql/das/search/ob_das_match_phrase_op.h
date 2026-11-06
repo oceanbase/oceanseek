@@ -96,6 +96,11 @@ class ObDASMatchPhraseOp : public ObIDASSearchOp
 public:
   ObDASMatchPhraseOp(ObDASSearchCtx &search_ctx);
   virtual ~ObDASMatchPhraseOp() {}
+  // Release async posting resources but retain helpers for rescan; sync mode is unchanged.
+  void close_posting_iters();
+  void release_scan_resources() override { close_posting_iters(); }
+  // True if any async helper currently owns a pooled Entry.
+
 
 private:
   int do_init(const ObIDASSearchOpParam &op_param) override;

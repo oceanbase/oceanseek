@@ -4,80 +4,20 @@
  */
 
 #define USING_LOG_PREFIX SQL_DAS
+#include <algorithm>
 #include "ob_das_async_token_op.h"
 #include "sql/das/search/ob_das_async_index_query_ctx.h"
 #include "sql/das/search/ob_das_doc_score_accumulator.h"
+#include "sql/das/search/ob_das_bm25_batch_kernel.h"
+#include "sql/das/search/ob_das_sparse_candidate_buffer.h"
 #include "sql/das/search/ob_das_async_segment_merge_op.h"
 #include "sql/das/search/ob_das_scalar_define.h"
 #include "storage/tx_storage/ob_access_service.h"
-#include "common/ob_target_specific.h"
-
-#if OB_USE_MULTITARGET_CODE
-#include <immintrin.h>
-#endif
 
 namespace oceanbase
 {
 namespace sql
 {
-
-static OB_INLINE void eval_bm25_batch4_scalar(
-    const uint64_t *token_freqs,
-    const uint64_t *doc_lengths,
-    const ObBM25PrecomputedParams &params,
-    double *scores)
-{
-  for (int64_t i = 0; i < 4; ++i) {
-    scores[i] = ObExprBM25::eval_with_precomputed_params(
-        token_freqs[i], doc_lengths[i], params);
-  }
-}
-
-#if OB_USE_MULTITARGET_CODE
-OB_DECLARE_AVX512_SPECIFIC_CODE(
-static void eval_bm25_batch4_avx512(
-    const uint64_t *token_freqs,
-    const uint64_t *doc_lengths,
-    const ObBM25PrecomputedParams &params,
-    double *scores)
-{
-  alignas(64) double tf_values[8] = {
-      static_cast<double>(token_freqs[0]), static_cast<double>(token_freqs[1]),
-      static_cast<double>(token_freqs[2]), static_cast<double>(token_freqs[3]),
-      0.0, 0.0, 0.0, 0.0};
-  alignas(64) double dl_values[8] = {
-      static_cast<double>(doc_lengths[0]), static_cast<double>(doc_lengths[1]),
-      static_cast<double>(doc_lengths[2]), static_cast<double>(doc_lengths[3]),
-      0.0, 0.0, 0.0, 0.0};
-  const __m512d tf = _mm512_load_pd(tf_values);
-  const __m512d dl = _mm512_load_pd(dl_values);
-  __m512d denom = _mm512_add_pd(tf, _mm512_set1_pd(params.denom_bias_));
-  denom = _mm512_add_pd(
-      denom, _mm512_mul_pd(_mm512_set1_pd(params.doc_len_scale_), dl));
-  __m512d result = _mm512_mul_pd(
-      _mm512_set1_pd(params.query_weight_), _mm512_div_pd(tf, denom));
-  result = _mm512_mul_pd(result, _mm512_set1_pd(params.score_multiplier_));
-  _mm512_mask_storeu_pd(scores, 0x0F, result);
-}
-)
-#endif
-
-static OB_INLINE void eval_bm25_batch4(
-    const uint64_t *token_freqs,
-    const uint64_t *doc_lengths,
-    const ObBM25PrecomputedParams &params,
-    double *scores)
-{
-#if OB_USE_MULTITARGET_CODE
-  if (common::is_arch_supported(common::ObTargetArch::AVX512)) {
-    specific::avx512::eval_bm25_batch4_avx512(token_freqs, doc_lengths, params, scores);
-  } else {
-    eval_bm25_batch4_scalar(token_freqs, doc_lengths, params, scores);
-  }
-#else
-  eval_bm25_batch4_scalar(token_freqs, doc_lengths, params, scores);
-#endif
-}
 
 ObDASAsyncTokenOpParam::ObDASAsyncTokenOpParam()
   : ObIDASSearchOpParam(DAS_SEARCH_OP_ASYNC_TOKEN),
@@ -118,6 +58,7 @@ ObDASAsyncTokenOp::ObDASAsyncTokenOp(ObDASSearchCtx &search_ctx)
     tsc_service_(nullptr),
     query_flag_(),
     posting_iter_(nullptr),
+    posting_entry_(nullptr),
     posting_scan_param_(),
     term_datums_(nullptr),
     term_key_(),
@@ -127,6 +68,9 @@ ObDASAsyncTokenOp::ObDASAsyncTokenOp(ObDASSearchCtx &search_ctx)
     dim_max_score_(0.0),
     token_boost_(0.0),
     bm25_calc_params_(),
+    bm25_score_kernels_(),
+    bm25_expansion_kernels_(),
+    bm25_existing_kernels_(),
     estimated_work_row_count_(-1),
     inv_idx_scan_param_inited_(false),
     is_inited_(false)
@@ -380,6 +324,10 @@ int ObDASAsyncTokenOp::init_dim_max_score(double &max_score)
       query_token_weight_, posting_scan_param_.avg_doc_length_, token_boost_, bm25_calc_params_))) {
     LOG_WARN("failed to init bm25 precomputed params", K(ret),
         K_(query_token_weight), K(posting_scan_param_.avg_doc_length_), K_(token_boost));
+  } else {
+    bm25_score_kernels_ = get_bm25_score_kernels();
+    bm25_expansion_kernels_ = get_bm25_accumulation_kernels<false>();
+    bm25_existing_kernels_ = get_bm25_accumulation_kernels<true>();
   }
   return ret;
 }
@@ -405,25 +353,29 @@ int ObDASAsyncTokenOp::open_posting_iter_from_tablet()
                     inv_idx_tablet_id_, pinned_tablet_handle))) {
     LOG_WARN("failed to get pinned async index tablet handle", K(ret),
              K_(inv_idx_tablet_id));
-  } else if (OB_FAIL(tsc_service_->async_index_posting_scan(
-      search_ctx_.get_ls_id(),
-      pinned_tablet_handle,
-      version_range_,
-      inv_idx_scan_param_,
-      posting_scan_param_,
-      posting_iter_))) {
-    LOG_WARN("failed to async index posting scan", K(ret), K_(inv_idx_tablet_id), K_(version_range));
+  } else if (OB_FAIL(search_ctx_.prepare_posting_scan(
+      !use_injected_tsc_service, posting_iter_allocator_,
+      posting_scan_param_, posting_entry_))) {
+    LOG_WARN("failed to acquire token posting entry", K(ret));
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(tsc_service_->async_index_posting_scan(
+        search_ctx_.get_ls_id(), pinned_tablet_handle, version_range_,
+        inv_idx_scan_param_, posting_scan_param_, posting_iter_))) {
+      LOG_WARN("failed to async index posting scan", K(ret),
+          K_(inv_idx_tablet_id), K_(version_range));
+    }
+  }
+  if (OB_FAIL(ret)) {
+    close_posting_iter();
   }
   return ret;
 }
 
 void ObDASAsyncTokenOp::close_posting_iter()
 {
-  if (nullptr != posting_iter_) {
-    posting_iter_->~ObInvSSTablePostingIter();
-    posting_iter_allocator_.free(posting_iter_);
-    posting_iter_ = nullptr;
-  }
+  search_ctx_.close_posting_scan(
+      posting_scan_param_, posting_iter_allocator_, posting_entry_, posting_iter_);
   // free() on arena is a no-op; reset() returns pages so SQL mem-leak check is clean.
   posting_iter_allocator_.reset();
 }
@@ -523,22 +475,26 @@ int ObDASAsyncTokenOp::do_drain_until(
   } else {
     // is_max boundary means "no upper bound": drain the whole posting list.
     const uint64_t boundary_u64 = boundary.is_max() ? UINT64_MAX : boundary.get_uint64();
+    const BM25ScoreKernels &score_kernels = bm25_score_kernels_;
     bool done = false;
     while (OB_SUCC(ret) && count < capacity && !done) {
-      const uint64_t *doc_ids = nullptr;
-      const uint64_t *token_freqs = nullptr;
-      const uint64_t *doc_lengths = nullptr;
+      blocksstable::ObPostingDocIdView doc_ids;
+      blocksstable::ObPostingRelevanceView relevance;
       int64_t n = 0;
-      if (OB_FAIL(posting_iter_->drain_until(
-          boundary_u64, capacity - count, doc_ids, token_freqs, doc_lengths, n))) {
+      if (OB_FAIL(posting_iter_->drain_until_typed(
+          boundary_u64, capacity - count, doc_ids, relevance, n))) {
         LOG_WARN("failed to drain posting iter", K(ret), K(boundary_u64), K(capacity), K(count));
       } else if (n > 0) {
         // Copy the doc ids for the downstream sink; score the run in place from the
         // projected token_freq/doc_length columns via the shared BM25 batch kernel.
-        MEMCPY(out_ids + count, doc_ids, n * sizeof(uint64_t));
+        if (doc_ids.is_uint32()) {
+          const uint32_t *ids = doc_ids.get_uint32();
+          for (int64_t i = 0; i < n; ++i) { out_ids[count + i] = ids[i]; }
+        } else {
+          MEMCPY(out_ids + count, doc_ids.get_uint64(), n * sizeof(uint64_t));
+        }
         if (nullptr != out_scores) {
-          ObExprBM25::eval_batch_with_precomputed_params(
-              token_freqs, doc_lengths, n, bm25_calc_params_, out_scores + count);
+          score_kernels.score(relevance, n, bm25_calc_params_, out_scores + count);
         }
         count += n;
       } else if (posting_iter_->is_end()) {
@@ -614,58 +570,213 @@ int ObDASAsyncTokenOp::do_drain_until_accumulated(
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else {
-    static constexpr int64_t DRAIN_BATCH_SIZE = 256;
+    static constexpr int64_t DRAIN_BATCH_SIZE = 1024;
     const uint64_t boundary_u64 = boundary.is_max() ? UINT64_MAX : boundary.get_uint64();
+    const BM25AccumulationKernels<false> &kernels = bm25_expansion_kernels_;
     bool done = false;
     while (OB_SUCC(ret) && !done) {
-      const uint64_t *doc_ids = nullptr;
-      const uint64_t *token_freqs = nullptr;
-      const uint64_t *doc_lengths = nullptr;
+      blocksstable::ObPostingDocIdView doc_ids;
+      blocksstable::ObPostingRelevanceView relevance;
       int64_t n = 0;
-      if (OB_FAIL(posting_iter_->drain_until(
-          boundary_u64, DRAIN_BATCH_SIZE, doc_ids, token_freqs, doc_lengths, n))) {
+      bool finished = false;
+      if (OB_FAIL(posting_iter_->drain_until_typed_run(
+          boundary_u64, DRAIN_BATCH_SIZE, doc_ids, relevance, n, finished))) {
         LOG_WARN("failed to drain posting iter into accumulator", K(ret), K(boundary_u64));
+      } else if (n > 0) {
+        int64_t matched = 0;
+        if (OB_FAIL(accumulator.add_scored_dim_batch_fused(
+                doc_ids, relevance, n, bm25_calc_params_, kernels, matched))) {
+          LOG_WARN("failed to accumulate scored posting batch", K(ret), K(n));
+        } else if (OB_LIKELY(nullptr == profile_)) {
+          count += matched;
+        } else {
+          for (int64_t i = 0; i < n; ++i) {
+            if (is_new_profile_output_row(doc_ids.at(i))) {
+              ++count;
+            }
+          }
+        }
+      }
+      // A positive run may already have a same-pin lookahead. Consume its views
+      // above before materializing that lookahead's score or making another call.
+      if (OB_SUCC(ret) && finished) {
+        if (posting_iter_->is_end()) {
+          next_id_after.set_max();
+          done = true;
+        } else if (OB_FAIL(fetch_curr_on_demand(next_id_after, next_score_after))) {
+          LOG_WARN("failed to fetch row after accumulated drain boundary", K(ret));
+        } else {
+          if (!is_scoring_) {
+            next_score_after = 0.0;
+          }
+          done = true;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDASAsyncTokenOp::score_candidates(
+    SparseCandidateBuffer &candidates, ObDASRowID &next_id_after, double &next_score_after)
+{
+  int ret = OB_SUCCESS;
+  int64_t count = 0;
+  if (OB_LIKELY(nullptr == profile_)) {
+    if (OB_FAIL(do_drain_into_candidates(candidates, count, next_id_after, next_score_after))) {
+      LOG_WARN("failed to drain into compact candidates", K(ret));
+    }
+  } else {
+    common::ObProfileSwitcher switcher(profile_);
+    common::ScopedTimer total_timer(common::ObMetricId::HS_TOTAL_TIME);
+    common::ScopedTimer timer(common::ObMetricId::HS_NEXT_ROWIDS_TIME);
+    INC_METRIC_VAL(common::ObMetricId::HS_NEXT_ROWIDS_COUNT, 1);
+    if (OB_FAIL(do_drain_into_candidates(candidates, count, next_id_after, next_score_after))) {
+      LOG_WARN("failed to drain into compact candidates", K(ret));
+    } else {
+      INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, count);
+    }
+  }
+  return ret;
+}
+
+int ObDASAsyncTokenOp::do_drain_into_candidates(
+    SparseCandidateBuffer &candidates, int64_t &count,
+    ObDASRowID &next_id_after, double &next_score_after)
+{
+  int ret = OB_SUCCESS;
+  count = 0;
+  next_id_after.set_max();
+  next_score_after = 0.0;
+  if (is_empty_segment_) {
+  } else if (OB_ISNULL(posting_iter_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("posting iterator not opened", K(ret));
+  } else if (OB_UNLIKELY(candidates.is_empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("empty candidate drain", K(ret));
+  } else {
+    const uint64_t *candidate_ids = candidates.get_doc_ids();
+    const int64_t candidate_count = candidates.get_count();
+    const uint64_t boundary = candidate_ids[candidate_count - 1];
+    const uint64_t start_id = candidate_ids[0];
+    uint64_t curr_id = 0;
+    bool done = false;
+    bool first_run = true;
+    int64_t slot = 0;
+    int64_t profile_count = 0;
+    if (OB_FAIL(posting_iter_->advance_to_id(start_id, curr_id))) {
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+        done = true;
+      } else {
+        LOG_WARN("failed to position posting candidate drain", K(ret), K(start_id));
+      }
+    }
+    while (OB_SUCC(ret) && !done) {
+      blocksstable::ObPostingDocIdView doc_ids;
+      blocksstable::ObPostingRelevanceView relevance;
+      int64_t n = 0;
+      bool finished = false;
+      if (OB_FAIL(posting_iter_->drain_until_typed_run(
+          boundary, DAS_SEARCH_ROWID_DRAIN_BATCH_SIZE, doc_ids, relevance, n, finished, first_run))) {
+        LOG_WARN("failed to drain typed posting run into candidates", K(ret), K(boundary));
       } else if (n > 0) {
         struct BM25ScoreAt
         {
-          const uint64_t *token_freqs_;
-          const uint64_t *doc_lengths_;
+          const blocksstable::ObPostingRelevanceView &relevance_;
           const ObBM25PrecomputedParams &params_;
-
+          const bool is_scoring_;
+          const blocksstable::ObPostingDocIdView &doc_ids_;
+          ObDASAsyncTokenOp *profile_op_;
+          int64_t &profile_count_;
           OB_INLINE double operator()(const int64_t i) const
           {
-            return ObExprBM25::eval_with_precomputed_params(
-                token_freqs_[i], doc_lengths_[i], params_);
-          }
-
-          OB_INLINE void eval_batch(
-              const int64_t start,
-              const int64_t batch_count,
-              double *scores) const
-          {
-            static_assert(4 == DocScoreAccumulator::SCORE_BATCH_SIZE,
-                "eval_bm25_batch4 must match the accumulator score batch size");
-            OB_ASSERT(DocScoreAccumulator::SCORE_BATCH_SIZE == batch_count);
-            eval_bm25_batch4(
-                token_freqs_ + start, doc_lengths_ + start, params_, scores);
+            double score = 0.0;
+            if (is_scoring_) {
+              score = relevance_.is_uint32()
+                  ? ObExprBM25::eval_with_precomputed_params(
+                      relevance_.get_token_freqs32()[i], relevance_.get_doc_lengths32()[i], params_)
+                  : ObExprBM25::eval_with_precomputed_params(
+                      relevance_.get_token_freqs64()[i], relevance_.get_doc_lengths64()[i], params_);
+            }
+            if (nullptr != profile_op_ && profile_op_->is_new_profile_output_row(doc_ids_.at(i))) {
+              ++profile_count_;
+            }
+            return score;
           }
         };
-        const BM25ScoreAt scorer{token_freqs, doc_lengths, bm25_calc_params_};
-        if (OB_FAIL(accumulator.add_scored_dim_batch(doc_ids, n, scorer))) {
-          LOG_WARN("failed to accumulate scored posting batch", K(ret), K(n));
-        } else {
-          count += n;
+        const BM25ScoreAt scorer{relevance, bm25_calc_params_, is_scoring_, doc_ids,
+            nullptr == profile_ ? nullptr : this, profile_count};
+        if (OB_FAIL(doc_ids.is_uint32()
+            ? candidates.add_scored_dim_batch(doc_ids.get_uint32(), n, scorer, slot, count)
+            : candidates.add_scored_dim_batch(doc_ids.get_uint64(), n, scorer, slot, count))) {
+          LOG_WARN("failed to supplement compact candidate batch", K(ret), K(n));
         }
-      } else if (posting_iter_->is_end()) {
-        next_id_after.set_max();
+      }
+      // Consume the borrowed views before materializing a same-block lookahead.
+      if (OB_SUCC(ret) && finished) {
         done = true;
-      } else if (OB_FAIL(fetch_curr_on_demand(next_id_after, next_score_after))) {
-        LOG_WARN("failed to fetch row after accumulated drain boundary", K(ret));
+        if (!posting_iter_->is_end()
+            && OB_FAIL(fetch_curr_on_demand(next_id_after, next_score_after))) {
+          LOG_WARN("failed to fetch candidate drain lookahead", K(ret));
+        }
+      }
+      first_run = false;
+    }
+    if (!is_scoring_) {
+      next_score_after = 0.0;
+    }
+    if (nullptr != profile_) {
+      count = profile_count;
+    }
+  }
+  return ret;
+}
+
+int ObDASAsyncTokenOp::get_active_posting_prefix_count(
+    const blocksstable::ObPostingDocIdView &doc_ids, const int64_t posting_count,
+    const DocScoreAccumulator &accumulator, int64_t &scoring_count) const
+{
+  int ret = OB_SUCCESS;
+  scoring_count = 0;
+  const uint64_t window_start_id = accumulator.get_start_id();
+  const int64_t window_capacity = accumulator.get_capacity();
+  if (posting_count <= 0) {
+  } else if (OB_UNLIKELY(!doc_ids.is_valid() || !accumulator.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid active posting run", K(ret), K(posting_count));
+  } else if (OB_UNLIKELY(doc_ids.at(0) < window_start_id
+      || doc_ids.at(posting_count - 1) - window_start_id >= static_cast<uint64_t>(window_capacity))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("active posting run is outside accumulator window", K(ret), K(posting_count),
+        K(doc_ids.at(0)), K(doc_ids.at(posting_count - 1)), K(window_start_id), K(window_capacity));
+  } else {
+    const uint64_t *words = accumulator.get_bitset_words();
+    const int64_t first_offset = static_cast<int64_t>(doc_ids.at(0) - window_start_id);
+    const int64_t end_offset = static_cast<int64_t>(doc_ids.at(posting_count - 1) - window_start_id);
+    const int64_t first_word = das_bitset_helper::word_index(first_offset);
+    int64_t last_word = das_bitset_helper::word_index(end_offset);
+    uint64_t word = words[last_word] & das_bitset_helper::low_bits_mask(
+        das_bitset_helper::bit_index(end_offset) + 1);
+    while (0 == word && last_word > first_word) {
+      word = words[--last_word];
+    }
+    if (last_word == first_word) {
+      word = das_bitset_helper::clear_bits_below(word, das_bitset_helper::bit_index(first_offset));
+    }
+    if (0 != word) {
+      const int64_t last_active_offset = last_word * das_bitset_helper::WORD_BITS
+          + das_bitset_helper::highest_set_bit(word);
+      const uint64_t last_active_id = window_start_id + last_active_offset;
+      if (last_active_offset == end_offset) {
+        scoring_count = posting_count;
+      } else if (doc_ids.is_uint32()) {
+        const uint32_t *ids = doc_ids.get_uint32();
+        scoring_count = std::upper_bound(ids, ids + posting_count, last_active_id) - ids;
       } else {
-        if (!is_scoring_) {
-          next_score_after = 0.0;
-        }
-        done = true;
+        const uint64_t *ids = doc_ids.get_uint64();
+        scoring_count = std::upper_bound(ids, ids + posting_count, last_active_id) - ids;
       }
     }
   }
@@ -673,7 +784,8 @@ int ObDASAsyncTokenOp::do_drain_until_accumulated(
 }
 
 int ObDASAsyncTokenOp::do_drain_until_active(
-    const ObDASRowID &boundary,
+    const uint64_t range_start,
+    const uint64_t range_end,
     DocScoreAccumulator &accumulator,
     int64_t &count)
 {
@@ -684,62 +796,59 @@ int ObDASAsyncTokenOp::do_drain_until_active(
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else {
-    const uint64_t boundary_u64 = boundary.is_max() ? UINT64_MAX : boundary.get_uint64();
-    const uint64_t active_start_id = accumulator.get_start_id();
     const int64_t active_capacity = accumulator.get_capacity();
-    const uint64_t *active_words = accumulator.get_bitset_words();
+    const BM25AccumulationKernels<true> &kernels = bm25_existing_kernels_;
     bool done = false;
     bool first_run = true;
     ObDASRowID start_id;
     common::ObDatum start_datum;
-    start_id.set_uint64(active_start_id);
+    // Keep the accumulator base for bitmap offsets; only narrow this iterator's drain.
+    start_id.set_uint64(range_start);
     // Position by doc id only. The first BM25 score is computed together with the
     // projected run instead of being materialized by the scalar advance path.
     if (OB_FAIL(search_ctx_.get_datum_from_rowid(start_id, start_datum))) {
-      LOG_WARN("failed to get datum from active start id", K(ret), K(active_start_id));
+      LOG_WARN("failed to get datum from active start id", K(ret), K(range_start));
     } else if (OB_FAIL(posting_iter_->advance_to_id(start_datum))) {
       if (OB_LIKELY(OB_ITER_END == ret)) {
         ret = OB_SUCCESS;
         done = true;
       } else {
-        LOG_WARN("failed to position posting iter for active drain", K(ret), K(active_start_id));
+        LOG_WARN("failed to position posting iter for active drain", K(ret), K(range_start));
       }
     }
     while (OB_SUCC(ret) && !done) {
-      const uint64_t *doc_ids = nullptr;
-      const uint64_t *token_freqs = nullptr;
-      const uint64_t *doc_lengths = nullptr;
-      int64_t n = 0;
-      int drain_ret = OB_SUCCESS;
-      if (first_run) {
-        drain_ret = posting_iter_->drain_until_from_current(
-            boundary_u64, active_capacity, doc_ids, token_freqs, doc_lengths, n);
-      } else {
-        drain_ret = posting_iter_->drain_until(
-            boundary_u64, active_capacity, doc_ids, token_freqs, doc_lengths, n);
-      }
-      if (OB_UNLIKELY(OB_SUCCESS != drain_ret)) {
-        ret = drain_ret;
+      blocksstable::ObPostingDocIdView doc_ids;
+      blocksstable::ObPostingRelevanceView relevance;
+      int64_t posting_count = 0;
+      int64_t scoring_count = 0;
+      int64_t matched = 0;
+      bool finished = false;
+      if (OB_FAIL(posting_iter_->drain_until_typed_run(
+          range_end, active_capacity, doc_ids, relevance, posting_count, finished, first_run))) {
         LOG_WARN("failed to drain posting iter with active mask", K(ret),
-            K(boundary_u64), K(active_capacity), K(count));
-      } else if (n > 0) {
-        for (int64_t i = 0; OB_SUCC(ret) && i < n; ++i) {
-          const uint64_t doc_id = doc_ids[i];
-          if (doc_id >= active_start_id
-              && doc_id - active_start_id < static_cast<uint64_t>(active_capacity)) {
-            const uint64_t offset = doc_id - active_start_id;
-            if (0 != (active_words[offset >> 6] & (1ULL << (offset & 63)))) {
-              const double score = ObExprBM25::eval_with_precomputed_params(
-                  token_freqs[i], doc_lengths[i], bm25_calc_params_);
-              if (OB_FAIL(accumulator.add_existing_dim(doc_id, score))) {
-                LOG_WARN("failed to add active token score", K(ret), K(doc_id));
-              } else if (OB_LIKELY(nullptr == profile_) || is_new_profile_output_row(doc_id)) {
-                ++count;
-              }
-            }
+            K(range_end), K(active_capacity), K(count));
+      } else if (posting_count <= 0) {
+        done = true;
+      } else if (OB_FAIL(get_active_posting_prefix_count(doc_ids, posting_count, accumulator, scoring_count))) {
+        LOG_WARN("failed to clip active posting run", K(ret), K(posting_count));
+      } else if (scoring_count > 0 && OB_FAIL(accumulator.add_scored_dim_batch_fused(
+          doc_ids, relevance, scoring_count, bm25_calc_params_, kernels, matched))) {
+        LOG_WARN("failed to accumulate active posting batch", K(ret), K(scoring_count));
+      } else if (OB_LIKELY(nullptr == profile_)) {
+        count += matched;
+      } else {
+        const uint64_t start_id = accumulator.get_start_id();
+        const uint64_t *active_words = accumulator.get_bitset_words();
+        for (int64_t i = 0; i < scoring_count; ++i) {
+          const uint64_t doc_id = doc_ids.at(i);
+          const uint64_t offset = doc_id - start_id;
+          if (0 != (active_words[offset >> 6] & (1ULL << (offset & 63)))
+              && is_new_profile_output_row(doc_id)) {
+            ++count;
           }
         }
-      } else {
+      }
+      if (OB_SUCC(ret) && finished) {
         done = true;
       }
       first_run = false;
@@ -795,6 +904,118 @@ int ObDASAsyncTokenOp::do_advance_to_id(
     LOG_WARN("failed to get cur id from posting iter", K(ret));
   } else {
     curr_id.set_uint64(id_datum->get_uint64());
+  }
+  return ret;
+}
+
+int ObDASAsyncTokenOp::advance_to_id_uint64(
+    const uint64_t target,
+    uint64_t &curr_id)
+{
+  int ret = OB_SUCCESS;
+  if (OB_LIKELY(nullptr == profile_)) {
+    ret = do_advance_to_id_uint64(target, curr_id);
+  } else {
+    common::ObProfileSwitcher switcher(profile_);
+    common::ScopedTimer total_timer(common::ObMetricId::HS_TOTAL_TIME);
+    common::ScopedTimer timer(common::ObMetricId::HS_ADVANCE_TIME);
+    INC_METRIC_VAL(common::ObMetricId::HS_ADVANCE_COUNT, 1);
+    ret = do_advance_to_id_uint64(target, curr_id);
+    if (OB_SUCC(ret) && is_new_profile_output_row(curr_id)) {
+      INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, 1);
+    }
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN_IGNORE_ITER_END(ret, "failed to advance to uint64 id impl", KR(ret), K(target));
+  }
+  return ret;
+}
+
+int ObDASAsyncTokenOp::do_advance_to_id_uint64(
+    const uint64_t target,
+    uint64_t &curr_id)
+{
+  int ret = OB_SUCCESS;
+  if (is_empty_segment_) {
+    ret = OB_ITER_END;
+  } else if (OB_ISNULL(posting_iter_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("posting iter not opened", K(ret));
+  } else if (OB_FAIL(posting_iter_->advance_to_id(target, curr_id))) {
+    if (OB_UNLIKELY(OB_ITER_END != ret)) {
+      LOG_WARN("failed to advance posting iter to uint64 id", K(ret), K(target));
+    }
+  }
+  return ret;
+}
+
+int ObDASAsyncTokenOp::probe_sorted_ids(
+    const uint64_t *ids, const int64_t count, double *scores, bool *matched,
+    ObDASRowID &last_id, double &last_score, bool &score_materialized, bool &iter_end)
+{
+  int ret = OB_SUCCESS;
+  int64_t matched_count = 0;
+  if (OB_LIKELY(nullptr == profile_)) {
+    if (OB_FAIL(do_probe_sorted_ids(ids, count, scores, matched,
+        last_id, last_score, score_materialized, iter_end, matched_count))) {
+      LOG_WARN("failed to probe sorted token ids", K(ret), K(count));
+    }
+  } else {
+    common::ObProfileSwitcher switcher(profile_);
+    common::ScopedTimer total_timer(common::ObMetricId::HS_TOTAL_TIME);
+    common::ScopedTimer timer(common::ObMetricId::HS_ADVANCE_TIME);
+    INC_METRIC_VAL(common::ObMetricId::HS_ADVANCE_COUNT, 1);
+    if (OB_FAIL(do_probe_sorted_ids(ids, count, scores, matched,
+        last_id, last_score, score_materialized, iter_end, matched_count))) {
+      LOG_WARN("failed to probe sorted token ids", K(ret), K(count));
+    } else {
+      INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, matched_count);
+    }
+  }
+  return ret;
+}
+
+int ObDASAsyncTokenOp::do_probe_sorted_ids(
+    const uint64_t *ids, const int64_t count, double *scores, bool *matched,
+    ObDASRowID &last_id, double &last_score, bool &score_materialized, bool &iter_end,
+    int64_t &matched_count)
+{
+  int ret = OB_SUCCESS;
+  matched_count = 0;
+  if (OB_UNLIKELY(!can_probe_sorted_ids())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("async token cannot probe sorted ids", K(ret));
+  } else if (OB_ISNULL(ids) || OB_ISNULL(scores) || OB_ISNULL(matched)
+      || OB_UNLIKELY(count <= 0 || count > blocksstable::ObInvSSTablePostingIter::MAX_SORTED_PROBE_COUNT)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid sorted token probe arguments", K(ret), K(count));
+  } else {
+    uint64_t token_freqs[blocksstable::ObInvSSTablePostingIter::MAX_SORTED_PROBE_COUNT];
+    uint64_t doc_lengths[blocksstable::ObInvSSTablePostingIter::MAX_SORTED_PROBE_COUNT];
+    uint64_t match_bits = 0;
+    uint64_t final_id = 0;
+    if (OB_FAIL(posting_iter_->probe_sorted_ids(
+        ids, count, token_freqs, doc_lengths, match_bits, final_id))) {
+      LOG_WARN("failed to probe sorted posting ids", K(ret));
+    } else {
+      int64_t last_match = -1;
+      while (match_bits != 0) {
+        const int64_t c = __builtin_ctzll(match_bits);
+        match_bits &= match_bits - 1;
+        const double score = ObExprBM25::eval_with_precomputed_params(
+            token_freqs[c], doc_lengths[c], bm25_calc_params_);
+        scores[c] += score;
+        matched[c] = true; // A zero score still denotes membership.
+        if (OB_LIKELY(nullptr == profile_) || is_new_profile_output_row(ids[c])) {
+          ++matched_count;
+        }
+        last_score = score;
+        last_match = c;
+      }
+      last_id.set_uint64(final_id);
+      iter_end = posting_iter_->is_end();
+      score_materialized = !iter_end && last_match >= 0 && ids[last_match] == final_id;
+    }
   }
   return ret;
 }
@@ -862,7 +1083,9 @@ int ObDASAsyncTokenOp::do_calc_max_score(double &threshold)
     ret = OB_NOT_INIT;
     LOG_WARN("posting iter not opened", K(ret));
   } else {
-    threshold += dim_max_score_ * token_boost_;
+    // Round the product before the sum to avoid FMA under Clang's default contraction.
+    const double boosted_max_score = dim_max_score_ * token_boost_;
+    threshold += boosted_max_score;
   }
   return ret;
 }
@@ -889,16 +1112,15 @@ int ObDASAsyncTokenOp::do_calc_range_max_score(
     // 起点必须为普通 RowID，终点仅允许普通 RowID 或 MAX 哨兵。
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid range max boundary", K(ret), K(start_id), K(end_id));
-  } else if (OB_FAIL(posting_iter_->get_range_max_score(
-      start_id.get_uint64(), start_inclusive,
-      // 将 MAX RowID 哨兵转换为存储层使用的最大 uint64 doc_id。
-      end_id.is_max() ? UINT64_MAX : end_id.get_uint64(), max_score, can_calc))) {
-    // 迭代结束错误直接透传，其余错误额外记录查询边界。
-    LOG_WARN_IGNORE_ITER_END(ret, "failed to get posting range max score", K(ret),
-        K(start_id), K(start_inclusive), K(end_id));
-  } else if (can_calc) {
-    // 将存储层返回的原始 token 上界乘以 boost，转换为 SQL scorer 使用的分数上界。
-    max_score *= token_boost_;
+  } else {
+    const uint64_t end = end_id.is_max() ? UINT64_MAX : end_id.get_uint64();
+    if (OB_FAIL(posting_iter_->get_range_max_score(
+        start_id.get_uint64(), start_inclusive, end, max_score, can_calc))) {
+      LOG_WARN_IGNORE_ITER_END(ret, "failed to get posting range max score", K(ret),
+          K(start_id), K(start_inclusive), K(end_id));
+    } else if (can_calc) {
+      max_score *= token_boost_;
+    }
   }
   return ret;
 }
@@ -917,6 +1139,9 @@ int ObDASAsyncTokenOp::do_rescan()
     // Drop the previous segment's scoring constants; re-inited by init_dim_max_score()
     // below (non-lazy) or by a later do_rescan_segment() (lazy).
     bm25_calc_params_.reset();
+    bm25_score_kernels_ = {};
+    bm25_expansion_kernels_ = {};
+    bm25_existing_kernels_ = {};
     if (OB_FAIL(init_inv_idx_scan_param())) {
       LOG_WARN("failed to init inv idx scan param on rescan", K(ret));
     } else if (direct_bind_ && OB_FAIL(search_ctx_.resolve_direct_async_index_segment(
@@ -962,6 +1187,9 @@ int ObDASAsyncTokenOp::do_rescan_segment(const common::ObNewVersionRange &range)
     close_posting_iter();
     version_range_ = range;
     bm25_calc_params_.reset();
+    bm25_score_kernels_ = {};
+    bm25_expansion_kernels_ = {};
+    bm25_existing_kernels_ = {};
     if (OB_FAIL(init_posting_scan_param())) {
       LOG_WARN("failed to init posting scan param on segment switch", K(ret));
     } else if (OB_FAIL(fill_async_bm25_param(posting_scan_param_))) {
@@ -999,6 +1227,9 @@ int ObDASAsyncTokenOp::do_close()
   query_token_.reset();
   query_token_weight_ = 0.0;
   bm25_calc_params_.reset();
+  bm25_score_kernels_ = {};
+  bm25_expansion_kernels_ = {};
+  bm25_existing_kernels_ = {};
   estimated_work_row_count_ = -1;
   arena_allocator_.reset();
   is_inited_ = false;

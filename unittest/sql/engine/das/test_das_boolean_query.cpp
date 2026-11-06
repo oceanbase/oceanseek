@@ -5318,8 +5318,6 @@ TEST_F(ObDASBooleanQueryTest, disjunction_op_open_not_init)
   EXPECT_EQ(OB_NOT_INIT, disjunction_op.open());
 }
 
-// Test: DisjunctionOp open with nullptr child should return error
-// Verifies error handling when a child op is nullptr during open()
 TEST_F(ObDASBooleanQueryTest, disjunction_op_open_nullptr_child)
 {
   SearchCtxSetup ctx_setup(allocator_);
@@ -5327,8 +5325,8 @@ TEST_F(ObDASBooleanQueryTest, disjunction_op_open_nullptr_child)
   ObArray<ObIDASSearchOp *> ops;
   ops.push_back(nullptr);
   ObDASDisjunctionOpParam param(ops, 1, false, ObDASSearchCost(10));
-  ASSERT_EQ(OB_SUCCESS, disjunction_op.init(param));
-  EXPECT_EQ(OB_ERR_UNEXPECTED, disjunction_op.open());
+  EXPECT_EQ(OB_ERR_UNEXPECTED, disjunction_op.init(param));
+  EXPECT_EQ(OB_NOT_INIT, disjunction_op.open());
 }
 
 // Test: DisjunctionOp open with child->open() failure
@@ -5356,8 +5354,6 @@ TEST_F(ObDASBooleanQueryTest, disjunction_op_rescan_not_init)
   EXPECT_EQ(OB_NOT_INIT, disjunction_op.rescan());
 }
 
-// Test: DisjunctionOp rescan with nullptr child
-// Verifies that open() detects nullptr child before rescan() can be called
 TEST_F(ObDASBooleanQueryTest, disjunction_op_rescan_nullptr_child)
 {
   SearchCtxSetup ctx_setup(allocator_);
@@ -5367,9 +5363,8 @@ TEST_F(ObDASBooleanQueryTest, disjunction_op_rescan_nullptr_child)
   ops.push_back(mock_op);
   ops.push_back(nullptr);
   ObDASDisjunctionOpParam param(ops, 1, false, ObDASSearchCost(10));
-  ASSERT_EQ(OB_SUCCESS, disjunction_op.init(param));
-  // open() should fail when it encounters nullptr child
-  EXPECT_EQ(OB_ERR_UNEXPECTED, disjunction_op.open());
+  EXPECT_EQ(OB_ERR_UNEXPECTED, disjunction_op.init(param));
+  EXPECT_EQ(OB_NOT_INIT, disjunction_op.rescan());
 }
 
 // Test: DisjunctionOp rescan with child->rescan() failure

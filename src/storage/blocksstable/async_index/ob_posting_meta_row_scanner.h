@@ -14,6 +14,23 @@ namespace oceanbase
 namespace blocksstable
 {
 
+// Borrowed, contiguous frontier pairs from one metadata row. No posting data
+// or query-dependent cache is materialized; the owning leaf pin must stay alive.
+struct ObPostingFrontierSpan
+{
+  ObPostingFrontierSpan()
+    : pairs_(nullptr), pair_count_(0), visited_block_count_(0), first_min_id_(0),
+      last_max_id_(0), range_covered_(false), score_available_(true) {}
+  // Frontier fields are validated only for entries intersecting the request.
+  const ObInvIdxBM25ParamPair *pairs_;
+  int64_t pair_count_;
+  int64_t visited_block_count_;
+  uint64_t first_min_id_;
+  uint64_t last_max_id_;
+  bool range_covered_;
+  bool score_available_;
+};
+
 // Parses the agg data of one (data micro block M, term T) leaf index row and
 // iterates its posting blocks at block-meta granularity. The agg data buffer is
 // produced by ObInvIdxAggDataEncoder and carried on the index row; it is borrowed
@@ -43,8 +60,17 @@ public:
   }
   // Read block metadata by index without changing the forward cursor.
   int get_block_meta_at(const int64_t block_idx, ObPostingBlockMeta &meta) const;
+  // Validate intersecting metadata entries and borrow their contiguous frontier.
+  // Non-contiguous slices within this row are invalid metadata.
+  int get_frontier_span(const int64_t start_block_idx, const uint64_t first_id,
+      const uint64_t end_id, ObPostingFrontierSpan &span) const;
   // Return the first and last physical block_idx from the already parsed agg row.
   int get_block_idx_range(int64_t &first_block_idx, int64_t &last_block_idx) const;
+  // Match the current entry against a pinned row without advancing the cursor.
+  // Only intersecting frontiers are checked; a cache miss returns OB_SUCCESS.
+  int match_cached_block_meta(const char *agg_buf, const int64_t agg_size,
+      const ObPostingBlockMeta &cached, const uint64_t first_id,
+      const uint64_t end_id, bool &matched) const;
   // Advance the cursor to the next posting block; OB_ITER_END when exhausted.
   int next_block();
   // Forward-only advance based on current scan state. Search in
@@ -58,6 +84,11 @@ public:
   TO_STRING_KV(K_(is_opened), K_(has_max_score), K_(cur_idx), K_(frontier_pool_size), KP_(header));
 
 private:
+  static int parse_agg_data(const char *agg_buf, const int64_t agg_size,
+      const ObInvIdxAggDataHeader *&header, const ObInvIdxAggDataEntry *&entries,
+      const char *&frontier_pool, int64_t &frontier_pool_size);
+  int get_block_frontier(const ObInvIdxAggDataEntry &entry, ObPostingBlockMaxScore &frontier) const;
+
   struct ObPostingMetaMaxDocIdLess
   {
     bool operator()(const ObInvIdxAggDataEntry &entry, const uint64_t target) const

@@ -96,10 +96,8 @@ public:
       const double score_multiplier,
       ObBM25PrecomputedParams &params);
 
-  // Scalar fast path: score one document with a single division. Keeps the
-  // query_weight * tf_score * score_multiplier multiplication order so the row score and
-  // the block-max upper bound share the same floating-point rounding. This is the single
-  // shared kernel used by scalar, batch, and block-max paths.
+  // Shared scalar kernel for document scores and block-max bounds.
+  // SIMD kernels must follow the same operation order.
   static OB_INLINE double eval_with_precomputed_params(
       const uint64_t token_freq,
       const uint64_t doc_length,
@@ -107,31 +105,13 @@ public:
   {
     OB_ASSERT(params.is_inited_);
     const double tf = static_cast<double>(token_freq);
-    const double denom = tf + params.denom_bias_ + params.doc_len_scale_ * static_cast<double>(doc_length);
-    return params.query_weight_ * (tf / denom) * params.score_multiplier_;
+    const double biased_tf = tf + params.denom_bias_;
+    // Separate statements avoid FMA under Clang's default contraction, even after inlining.
+    const double scaled_dl = params.doc_len_scale_ * static_cast<double>(doc_length);
+    const double denom = biased_tf + scaled_dl;
+    return (params.query_weight_ * (tf / denom)) * params.score_multiplier_;
   }
 
-  // Batch fast path: contiguous SoA inputs -> contiguous scores. Delegates to the scalar
-  // kernel so batch and scalar results are bit-identical.
-  //
-  // __restrict contract: over [0, count) the three arrays must not overlap, and during
-  // execution their elements must not be accessed or mutated through any other alias.
-  // Violating this is undefined behavior (restrict is a compile-time optimization hint,
-  // not a runtime check). Current call sites satisfy it: token_freqs / doc_lengths are two
-  // read-only columns of a posting block, scores is a distinct downstream double buffer.
-  static void eval_batch_with_precomputed_params(
-      const uint64_t *__restrict token_freqs,
-      const uint64_t *__restrict doc_lengths,
-      const int64_t count,
-      const ObBM25PrecomputedParams &params,
-      double *__restrict scores)
-  {
-    OB_ASSERT(count >= 0);
-    OB_ASSERT(count <= 0 || (nullptr != token_freqs && nullptr != doc_lengths && nullptr != scores));
-    for (int64_t i = 0; i < count; ++i) {
-      scores[i] = eval_with_precomputed_params(token_freqs[i], doc_lengths[i], params);
-    }
-  }
   static double doc_phrase_weight(const double phrase_freq, const double norm_len);
   static double query_token_weight(const int64_t doc_freq, const int64_t doc_cnt);
   static double max_term_bm25_score(const int64_t doc_freq, const int64_t doc_cnt)

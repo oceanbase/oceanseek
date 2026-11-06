@@ -51,11 +51,6 @@ public:
       const int64_t end_idx,
       int64_t &target_idx) const;
 
-  // Batch decode the entire posting block into ObPostingBlockData (contiguous uint64 columns).
-  // @param [in] out_alloc allocator for output column arrays
-  // @param [out] out decoded column arrays, valid until out_alloc is reset
-  int decode_to_block_data(common::ObIAllocator &out_alloc, ObPostingBlockData &out);
-
   // reuse the decoder to read next block
   void reuse();
   void reset();

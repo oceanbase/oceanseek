@@ -599,19 +599,20 @@ int ObIDASSearchOp::do_drain_until(
 }
 
 int ObIDASSearchOp::drain_until_active(
-    const ObDASRowID &boundary,
+    const uint64_t range_start,
+    const uint64_t range_end,
     DocScoreAccumulator &accumulator)
 {
   int ret = OB_SUCCESS;
   int64_t count = 0;
-  if (OB_UNLIKELY(!accumulator.is_valid() || boundary.is_min())) {
+  if (OB_UNLIKELY(!accumulator.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid active drain arguments", K(ret), K(accumulator), K(boundary));
+    LOG_WARN("invalid active drain arguments", K(ret), K(accumulator), K(range_start), K(range_end));
   } else if (OB_UNLIKELY(DAS_ROWID_TYPE_UINT64 != get_rowid_type())) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("active drain only supports uint64 rowid type", K(ret), K(get_rowid_type()));
   } else if (OB_LIKELY(nullptr == profile_)) {
-    if (OB_FAIL(do_drain_until_active(boundary, accumulator, count))) {
+    if (OB_FAIL(do_drain_until_active(range_start, range_end, accumulator, count))) {
       LOG_WARN("failed to drain active candidates", KR(ret));
     }
   } else {
@@ -619,7 +620,7 @@ int ObIDASSearchOp::drain_until_active(
     common::ScopedTimer total_timer(common::ObMetricId::HS_TOTAL_TIME);
     common::ScopedTimer timer(common::ObMetricId::HS_NEXT_ROWIDS_TIME);
     INC_METRIC_VAL(common::ObMetricId::HS_NEXT_ROWIDS_COUNT, 1);
-    if (OB_FAIL(do_drain_until_active(boundary, accumulator, count))) {
+    if (OB_FAIL(do_drain_until_active(range_start, range_end, accumulator, count))) {
       LOG_WARN("failed to drain active candidates", KR(ret));
     } else {
       INC_METRIC_VAL(common::ObMetricId::HS_OUTPUT_ROW_COUNT, count);
@@ -633,7 +634,8 @@ int ObIDASSearchOp::drain_until_active(
 }
 
 int ObIDASSearchOp::do_drain_until_active(
-    const ObDASRowID &boundary,
+    const uint64_t range_start,
+    const uint64_t range_end,
     DocScoreAccumulator &accumulator,
     int64_t &count)
 {
@@ -646,8 +648,8 @@ int ObIDASSearchOp::do_drain_until_active(
   ObDASRowID curr_id;
   ObDASRowID start_id;
   double curr_score = 0.0;
-  start_id.set_uint64(active_start_id);
-  // The generic fallback positions itself from the accumulator window. Async token
+  start_id.set_uint64(range_start);
+  // The generic fallback positions itself at the caller's active range start. Async token
   // overrides this method so its first row can stay on the batch scoring path.
   if (OB_FAIL(do_advance_to(start_id, curr_id, curr_score))) {
     if (OB_LIKELY(OB_ITER_END == ret)) {
@@ -658,13 +660,10 @@ int ObIDASSearchOp::do_drain_until_active(
     }
   }
   while (OB_SUCC(ret) && !drained) {
-    int cmp_ret = 0;
-    if (OB_FAIL(compare_rowid(curr_id, boundary, cmp_ret))) {
-      LOG_WARN("failed to compare rowid in active drain", K(ret));
-    } else if (cmp_ret > 0) {
+    const uint64_t doc_id = curr_id.get_uint64();
+    if (doc_id > range_end) {
       drained = true;
     } else {
-      const uint64_t doc_id = curr_id.get_uint64();
       if (doc_id >= active_start_id
           && doc_id - active_start_id < static_cast<uint64_t>(active_capacity)) {
         const uint64_t offset = doc_id - active_start_id;
@@ -824,6 +823,15 @@ int ObIDASSearchOp::open_profile()
     }
   }
   return ret;
+}
+
+void ObIDASSearchOp::release_scan_resources()
+{
+  for (int64_t i = 0; i < children_cnt_; ++i) {
+    if (nullptr != children_[i]) {
+      children_[i]->release_scan_resources();
+    }
+  }
 }
 
 void ObIDASSearchOp::close_profile()

@@ -4,6 +4,8 @@
  */
 
 #include <gtest/gtest.h>
+#include <memory>
+#include "common/ob_target_specific.h"
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -22,6 +24,9 @@
 #include "sql/das/search/ob_das_search_context.h"
 #include "sql/das/search/ob_das_async_token_op.h"
 #include "sql/das/search/ob_das_bmm_op.h"
+#include "sql/das/search/ob_das_bitmap_op.h"
+#include "sql/das/search/ob_das_scalar_define.h"
+#include "share/vector/ob_fixed_length_vector.h"
 #include "sql/das/search/ob_das_topk_collect_op.h"
 #include "sql/das/search/ob_das_doc_score_accumulator.h"
 #include "sql/das/search/ob_daat_merge_iter.h"
@@ -32,6 +37,8 @@
 #include "mittest/mtlenv/storage/async_index/test_das_async_index_binding.h"
 #undef private
 #undef protected
+
+#include "sql/das/search/ob_das_bm25_batch_kernel.h"
 
 namespace oceanbase
 {
@@ -130,8 +137,27 @@ uint64_t get_profile_metric(
   return value;
 }
 
-// Reference score via the exact single-division kernel the op / storage now use. This is
-// the bit-for-bit oracle for op fast-path outputs (ASSERT_DOUBLE_EQ against it is exact).
+double reference_bm25_score(
+    const uint64_t token_freq, const uint64_t doc_length,
+    const sql::ObBM25PrecomputedParams &params)
+{
+  const double tf = static_cast<double>(token_freq);
+  volatile double biased_tf = tf + params.denom_bias_;
+  volatile double scaled_dl = params.doc_len_scale_ * static_cast<double>(doc_length);
+  volatile double denom = biased_tf + scaled_dl;
+  volatile double weighted = params.query_weight_ * (tf / denom);
+  volatile double result = weighted * params.score_multiplier_;
+  return result;
+}
+
+OB_NOINLINE double scalar_bm25_score(
+    const uint64_t token_freq, const uint64_t doc_length,
+    const sql::ObBM25PrecomputedParams &params)
+{
+  return sql::ObExprBM25::eval_with_precomputed_params(token_freq, doc_length, params);
+}
+
+// Volatile intermediates preserve each rounding step independently of the production kernel.
 inline double fast_ref_score(
     const uint64_t token_freq, const uint64_t doc_length,
     const int64_t doc_freq, const int64_t doc_cnt,
@@ -141,7 +167,7 @@ inline double fast_ref_score(
   const double query_weight = sql::ObExprBM25::query_token_weight(doc_freq, doc_cnt);
   EXPECT_EQ(OB_SUCCESS,
       sql::ObExprBM25::init_precomputed_params(query_weight, avg_doc_length, boost, params));
-  return sql::ObExprBM25::eval_with_precomputed_params(token_freq, doc_length, params);
+  return reference_bm25_score(token_freq, doc_length, params);
 }
 
 // Dual-tolerance closeness between the fast single-division score and the canonical
@@ -219,11 +245,260 @@ private:
   bool old_value_;
   bool is_valid_;
 };
+
 } // namespace
+
+// Standalone bitmap construction uses the public batch-input contract. The
+// source deliberately emits descending IDs and duplicates; Bitmap owns the
+// materialization and must rebuild it on rescan.
+struct NativeTileSourceParam : public sql::ObIDASSearchOpParam
+{
+  NativeTileSourceParam() : sql::ObIDASSearchOpParam(sql::DAS_SEARCH_OP_DUMMY) {}
+  int get_children_ops(common::ObIArray<sql::ObIDASSearchOp *> &children) const override
+  { UNUSED(children); return OB_SUCCESS; }
+};
+
+class NativeTileBitmapSource : public sql::ObIDASSearchOp
+{
+public:
+  NativeTileBitmapSource(sql::ObDASSearchCtx &ctx,
+      const std::vector<uint64_t> &rows, uint64_t *frame)
+    : sql::ObIDASSearchOp(ctx), rows_(rows), frame_(frame), pos_(0) {}
+  const common::ObIArray<sql::ObExpr *> *get_rowid_output_exprs() const override
+  { return &search_ctx_.get_rowid_exprs(); }
+private:
+  int do_init(const sql::ObIDASSearchOpParam &param) override
+  { UNUSED(param); return OB_SUCCESS; }
+  int do_open() override { pos_ = 0; return OB_SUCCESS; }
+  int do_rescan() override { pos_ = 0; return OB_SUCCESS; }
+  int do_close() override { pos_ = 0; return OB_SUCCESS; }
+  int do_advance_to(const ObDASRowID &target, ObDASRowID &id, double &score) override
+  { UNUSED(target); UNUSED(id); UNUSED(score); return OB_NOT_SUPPORTED; }
+  int do_next_rowid(ObDASRowID &id, double &score) override
+  { UNUSED(id); UNUSED(score); return OB_NOT_SUPPORTED; }
+  int do_next_rowids(int64_t capacity, int64_t &count) override
+  {
+    count = std::min(std::min(capacity, int64_t(256)),
+        static_cast<int64_t>(rows_.size()) - pos_);
+    for (int64_t i = 0; i < count; ++i) frame_[i] = rows_[pos_++];
+    return count == 0 ? OB_ITER_END : OB_SUCCESS;
+  }
+  const std::vector<uint64_t> &rows_;
+  uint64_t *frame_;
+  int64_t pos_;
+};
+
+class CountingNativeTileToken : public sql::ObDASAsyncTokenOp
+{
+public:
+  explicit CountingNativeTileToken(sql::ObDASSearchCtx &ctx)
+    : sql::ObDASAsyncTokenOp(ctx), loads_(0) {}
+  int64_t loads_;
+private:
+  int do_load_curr_score(double &score) override
+  {
+    ++loads_;
+    return sql::ObDASAsyncTokenOp::do_load_curr_score(score);
+  }
+};
+
+class CountingNativeTileBitmap : public sql::ObDASBitmapOp
+{
+public:
+  explicit CountingNativeTileBitmap(sql::ObDASSearchCtx &ctx) : sql::ObDASBitmapOp(ctx) {}
+  int64_t next_count_ = 0;
+  int64_t advance_count_ = 0;
+  int64_t drain_count_ = 0;
+  int drain_error_ = OB_SUCCESS;
+private:
+  int do_next_rowid(ObDASRowID &id, double &score) override
+  {
+    ++next_count_;
+    return sql::ObDASBitmapOp::do_next_rowid(id, score);
+  }
+  int do_advance_to(const ObDASRowID &target, ObDASRowID &id, double &score) override
+  {
+    ++advance_count_;
+    return sql::ObDASBitmapOp::do_advance_to(target, id, score);
+  }
+  int do_drain_until(const ObDASRowID &boundary, int64_t capacity,
+      uint64_t *ids, double *scores, int64_t &count,
+      ObDASRowID &next, double &next_score) override
+  {
+    ++drain_count_;
+    return OB_SUCCESS != drain_error_ ? drain_error_
+        : sql::ObDASBitmapOp::do_drain_until(boundary, capacity, ids, scores, count, next, next_score);
+  }
+};
+
+struct NativeTileRun
+{
+  std::vector<std::pair<uint64_t, uint64_t>> rows_;
+  int64_t loads_ = 0;
+  int64_t filter_next_ = 0;
+  int64_t filter_advance_ = 0;
+  int64_t filter_drain_ = 0;
+};
 
 class TestDASAsyncTokenOp : public TestInvIdxSSTablePrepare
 {
 public:
+  void build_native_tile_fixture(ObInvSSTable &sstable, ObTableReadInfo &read_info)
+  {
+    std::vector<RealBMMPostingRow> rows;
+    const uint64_t universe = 65536;
+    for (int pattern = 0; pattern < 2; ++pattern) {
+      for (int d = 0; d < 4; ++d) {
+        const uint64_t stride = pattern == 0 ? 3 + 2 * d : 97 + 30 * d;
+        for (uint64_t id = (19 * d + pattern) % stride; id < universe; id += stride) {
+          const bool high = (id / 2048) % 8 == 0;
+          const uint64_t tf = pattern == 0 ? (high ? 24 : 1) : 1 + (17 * id + d) % 23;
+          const uint64_t dl = pattern == 0 ? (high ? 32 : 512) : 1 + (37 * id + 53 * d) % 4093;
+          rows.emplace_back(10 + 10 * pattern + d, id, tf, dl);
+        }
+      }
+    }
+    build_multi_term_sstable(rows, sstable);
+    ASSERT_FALSE(HasFatalFailure());
+    build_rowkey_read_info(table_schema_, allocator_, read_info);
+  }
+
+  void run_native_tile_case(const int shape, const int64_t topk_limit,
+      const bool enabled, const bool profiled, const int sweeps,
+      const ObTableReadInfo &read_info, ObInvSSTable &sstable, NativeTileRun &result)
+  {
+    const uint64_t universe = 65536;
+    const int pattern = shape / 3;
+    const uint64_t filter_steps[] = {97, 997, 2115};
+    const uint64_t filter_step = filter_steps[shape % 3];
+    ObArenaAllocator ca("BlockBoundCtx");
+    common::ObOpProfile<common::ObMetric> profile(common::ObProfileId::PHY_TABLE_SCAN, &ca);
+    common::ObProfileSwitcher switcher(profiled ? &profile : nullptr);
+    AsyncTokCtx ctx(ca);
+    sql::ObExecContext exec_ctx(ca);
+    sql::ObEvalCtx eval_ctx(exec_ctx);
+    eval_ctx.max_batch_size_ = 256;
+    sql::ObExpr rowid_expr;
+    sql::ExprFixedArray rowid_exprs(ca), output(ca);
+    OK(rowid_exprs.init(1));
+    OK(rowid_exprs.push_back(&rowid_expr));
+    ctx.search_ctx_.eval_ctx_ = &eval_ctx;
+    ctx.search_ctx_.rowid_exprs_ = &rowid_exprs;
+    ctx.search_ctx_.scopes_[sql::DAS_SCOPE_BASE].rowid_exprs_ = &rowid_exprs;
+    ctx.search_ctx_.output_ = &output;
+    ctx.search_ctx_.table_row_count_ = sql::ObDASSearchCost(universe);
+    std::vector<uint64_t> filters;
+    for (uint64_t id = 1; id < universe; id += filter_step) filters.push_back(id);
+    std::vector<uint64_t> input_rows;
+    for (auto it = filters.rbegin(); it != filters.rend(); ++it) {
+      input_rows.push_back(*it);
+      if (input_rows.size() % 31 == 0) input_rows.push_back(*it);
+    }
+    uint64_t frame[256] = {};
+    char **frames = static_cast<char **>(ca.alloc(sizeof(char *)));
+    ASSERT_NE(nullptr, frames);
+    frames[0] = static_cast<char *>(ca.alloc(sizeof(sql::VectorHeader)));
+    ASSERT_NE(nullptr, frames[0]);
+    exec_ctx.frames_ = frames;
+    eval_ctx.frames_ = frames;
+    void *null_buf = ca.alloc(sql::ObBitVector::memory_size(256));
+    ASSERT_NE(nullptr, null_buf);
+    sql::ObBitVector *nulls = reinterpret_cast<sql::ObBitVector *>(null_buf);
+    nulls->init(256);
+    sql::VectorHeader *header = new (frames[0]) sql::VectorHeader();
+    header->set_format(common::VEC_FIXED);
+    new (header->vector_buf_) common::ObFixedLengthVector<uint64_t,
+        common::VectorBasicOp<common::VEC_TC_UINTEGER>>(
+            reinterpret_cast<char *>(frame), nulls);
+    rowid_expr.frame_idx_ = 0;
+    rowid_expr.vector_header_off_ = 0;
+    NativeTileBitmapSource source(ctx.search_ctx_, input_rows, frame);
+    NativeTileSourceParam source_param;
+    OK(source.init(source_param));
+    sql::ObDASScalarScanCtDef scalar_ctdef(ca);
+    sql::ObDASScalarScanRtDef scalar_rtdef;
+    scalar_rtdef.ctdef_ = &scalar_ctdef;
+    CountingNativeTileBitmap filter(ctx.search_ctx_);
+    sql::ObDASBitmapOpParam filter_param(&source, &scalar_ctdef, &scalar_rtdef);
+    OK(filter.init(filter_param));
+    ASSERT_FALSE(filter.is_filter_bitmap_view());
+    std::vector<std::unique_ptr<sql::ObDASIRScanCtDef>> ctdefs;
+    std::vector<std::unique_ptr<sql::ObDASIRScanRtDef>> rtdefs;
+    std::vector<CountingNativeTileToken *> tokens;
+    common::ObSEArray<sql::ObIDASSearchOp *, 4> ops;
+    for (int d = 0; d < 4; ++d) {
+      ctdefs.emplace_back(new sql::ObDASIRScanCtDef(ca));
+      rtdefs.emplace_back(new sql::ObDASIRScanRtDef());
+      char term_buf[32] = {0};
+      format_term(10 + 10 * pattern + d, term_buf, sizeof(term_buf));
+      const ObString term(static_cast<int32_t>(strlen(term_buf)), term_buf);
+      const uint64_t stride = pattern == 0 ? 3 + 2 * d : 97 + 30 * d;
+      const uint64_t first = (19 * d + pattern) % stride;
+      const int64_t df = (universe - 1 - first) / stride + 1;
+      CountingNativeTileToken *op = nullptr;
+      create_and_inject_single(ctx, *ctdefs.back(), *rtdefs.back(), term, 1.0,
+          universe, df, read_info, sstable, op, 100.0, true, d == 0);
+      ASSERT_FALSE(HasFatalFailure());
+      if (d > 0) {
+        OK(ctx.search_ctx_.get_bm25_param_cache().set_token_doc_cnt(
+            common::ObTabletID(TABLET_ID), term, df));
+      }
+      tokens.push_back(op);
+      OK(ops.push_back(op));
+    }
+    sql::ObDASBMMBuildOptions options;
+    options.lead_cost_ = sql::ObDASSearchCost(1);
+    options.filter_cost_ = sql::ObDASSearchCost(filters.size());
+    sql::ObDASBMMOpParam param(ops, &filter, ca, options);
+    param.set_is_scoring(true);
+    sql::ObDASBMMOp bmm(ctx.search_ctx_);
+    ctx.search_ctx_.set_generating_topk_limit(topk_limit);
+    OK(bmm.init(param));
+    ctx.search_ctx_.set_generating_topk_limit(-1);
+    ASSERT_EQ(sql::ObDASBMMOp::FilterMergeMode::SPARSE_SEEK, bmm.filter_merge_mode_);
+    ASSERT_EQ(shape % 3 != 2, bmm.enable_filter_essential_batch_);
+    if (!enabled) {
+      bmm.enable_filter_essential_batch_ = false;
+    }
+    ASSERT_EQ(256, bmm.sparse_candidate_buffer_.get_capacity());
+    sql::ObDASTopKCollectOp topk(ctx.search_ctx_);
+    sql::ObDASTopKCollectOpParam tp;
+    tp.set_is_scoring(true);
+    tp.child_ = &bmm;
+    tp.limit_ = topk_limit;
+    tp.dynamic_pruning_enabled_ = true;
+    OK(topk.init(tp));
+    OK(topk.open());
+    ASSERT_TRUE(filter.owns_bitmap_);
+    ASSERT_FALSE(filter.bitmap_built_);
+    for (int sweep = 0; sweep < sweeps; ++sweep) {
+      if (sweep > 0) OK(topk.rescan());
+      ObDASRowID id;
+      double score = 0.0;
+      int ret = OB_SUCCESS;
+      int count = 0;
+      while (OB_SUCCESS == (ret = topk.next_rowid(id, score))) {
+        uint64_t bits = 0;
+        MEMCPY(&bits, &score, sizeof(bits));
+        result.rows_.emplace_back(id.get_uint64(), bits);
+        ASSERT_LE(++count, topk_limit);
+      }
+      ASSERT_EQ(OB_ITER_END, ret);
+    }
+    for (auto *token : tokens) {
+      result.loads_ += token->loads_;
+    }
+    result.filter_next_ = filter.next_count_;
+    result.filter_advance_ = filter.advance_count_;
+    result.filter_drain_ = filter.drain_count_;
+    ASSERT_TRUE(filter.bitmap_built_);
+    ASSERT_EQ(filters.size(), filter.bitmap_->cardinality());
+    OK(topk.close());
+    OK(bmm.close());
+    for (auto *token : tokens) OK(token->close());
+  }
+
+  void check_typed_cache_all_drain_paths(const uint64_t start_id, const bool wide_relevance);
   // Build an ObInvSSTable holding exactly one term whose posting list is
   // doc_id(i) = start + i*OP_STRIDE for i in [0, doc_cnt). token_freq=1, doc_length=100.
   void build_single_term_sstable(
@@ -306,7 +581,8 @@ public:
       const int64_t term_seq,
       const common::ObIArray<uint64_t> &token_freqs,
       const common::ObIArray<uint64_t> &doc_lengths,
-      ObInvSSTable &inv_sstable)
+      ObInvSSTable &inv_sstable,
+      const int64_t forced_micro_rows = 0)
   {
     ASSERT_GT(doc_cnt, 0);
     ASSERT_EQ(doc_cnt, token_freqs.count());
@@ -344,6 +620,10 @@ public:
       OK(make_inv_idx_row(row, inv_idx_row_desc_, mv_col_cnt_, term_str, doc_id,
           token_freqs.at(i), doc_lengths.at(i), pos_list));
       OK(writer.append_row(row));
+      if (forced_micro_rows > 0 && 0 == (i + 1) % forced_micro_rows) {
+        OK(writer.flush_logical_block());
+        OK(writer.flush_micro_block_pair());
+      }
       if (0 == i) {
         min_doc_id = doc_id;
       }
@@ -431,6 +711,7 @@ public:
   // service or a real tablet (the access-service path is covered by the estimate_row_count
   // direct tests + the ObTableEstimator branch). cached_doc_freq is the token doc frequency
   // the op should read back; avg is clamped to DEFAULT by the op.
+  template<class NativeOp>
   void create_and_inject_single(
       AsyncTokCtx &ctx,
       sql::ObDASIRScanCtDef &ir_ctdef,
@@ -441,7 +722,7 @@ public:
       const int64_t cached_doc_freq,
       const ObTableReadInfo &read_info,
       ObInvSSTable &inv_sstable,
-      sql::ObDASAsyncTokenOp *&op,
+      NativeOp *&op,
       const double cached_avg = sql::ObExprBM25::DEFAULT_AVG_DOC_TOKEN_CNT,
       const bool direct_bind = true,
       const bool prefill_cache = true,
@@ -1735,7 +2016,9 @@ TEST_F(TestDASAsyncTokenOp, calc_max_score_conservative)
 
   double threshold = 1.0;
   OK(op->calc_max_score(threshold));
-  ASSERT_DOUBLE_EQ(1.0 + op->dim_max_score_ * token_boost, threshold);
+  volatile double boosted_dim_max = op->dim_max_score_ * token_boost;
+  const double expected_threshold = 1.0 + boosted_dim_max;
+  ASSERT_EQ(0, MEMCMP(&expected_threshold, &threshold, sizeof(threshold)));
 
   ObDASRowID rid;
   double score = 0.0;
@@ -1744,6 +2027,40 @@ TEST_F(TestDASAsyncTokenOp, calc_max_score_conservative)
     ASSERT_LE(score, op->dim_max_score_ * token_boost);
   }
   ASSERT_EQ(OB_ITER_END, ret);
+  OK(op->close());
+}
+
+TEST_F(TestDASAsyncTokenOp, calc_max_score_preserves_separate_rounding)
+{
+  ObInvSSTable sstable;
+  build_single_term_sstable(OP_START, 1, OP_TERM_SEQ, sstable);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  ObArenaAllocator alloc("MaxScoreRound");
+  AsyncTokCtx ctx(alloc);
+  sql::ObDASIRScanCtDef ctdef(alloc);
+  sql::ObDASIRScanRtDef rtdef;
+  char term_buf[32] = {};
+  format_term(OP_TERM_SEQ, term_buf, sizeof(term_buf));
+  const ObString token(static_cast<int32_t>(strlen(term_buf)), term_buf);
+  volatile double initial_threshold = 3.0;
+  volatile double dim_max_score = 5.0;
+  volatile double token_boost = std::nextafter(1.0, 2.0);
+  sql::ObDASAsyncTokenOp *op = nullptr;
+  create_and_inject_single(ctx, ctdef, rtdef, token, token_boost,
+      1, 1, read_info, sstable, op);
+  OK(op->open());
+  op->dim_max_score_ = dim_max_score;
+
+  // Separate rounding gives 8.0; fusion rounds one ULP higher.
+  volatile double product = op->dim_max_score_ * op->token_boost_;
+  const double expected = initial_threshold + product;
+  ASSERT_EQ(8.0, expected);
+  const double fused = std::fma(op->dim_max_score_, op->token_boost_, initial_threshold);
+  ASSERT_GT(fused, expected);
+  double threshold = initial_threshold;
+  OK(op->calc_max_score(threshold));
+  EXPECT_EQ(0, MEMCMP(&expected, &threshold, sizeof(threshold)));
   OK(op->close());
 }
 
@@ -1854,7 +2171,205 @@ TEST_F(TestDASAsyncTokenOp, drain_heterogeneous_params)
       OP_DOC_CNT, OP_DOC_CNT, 64, expect_doc(OP_START, 500));
 }
 
-// Non-unit token_boost and non-default avg_doc_length both flow into the scores.
+// Exercise all four physical DocId/Relevance width combinations through real
+// cache values, including vector bodies, tails, score-only and both fused modes.
+void TestDASAsyncTokenOp::check_typed_cache_all_drain_paths(
+    const uint64_t start_id, const bool wide_relevance)
+{
+  constexpr int64_t DOC_COUNT = 777;
+  const uint64_t extreme_length = UINT32_MAX + (wide_relevance ? 1ULL : 0ULL);
+  common::ObArray<uint64_t> token_freqs;
+  common::ObArray<uint64_t> doc_lengths;
+  for (int64_t i = 0; i < DOC_COUNT; ++i) {
+    // Frontier pairs are uint32. Put a valid dominating pair first in every
+    // logical block so large dominated lengths can exercise the uint64 column.
+    const bool dominating = wide_relevance && 0 == i % DEFAULT_POSTING_BLOCK_CAPACITY;
+    OK(token_freqs.push_back(dominating || i % 7 == 0
+        ? UINT32_MAX : 1 + static_cast<uint64_t>(i % 13)));
+    OK(doc_lengths.push_back(dominating ? 1
+        : (i % 5 == 0 ? extreme_length : 60 + static_cast<uint64_t>(i % 29))));
+  }
+  ObInvSSTable inv_sstable;
+  build_single_term_sstable_per_doc(start_id, DOC_COUNT, OP_TERM_SEQ,
+      token_freqs, doc_lengths, inv_sstable);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  char term_buf[32] = {0};
+  format_term(OP_TERM_SEQ, term_buf, sizeof(term_buf));
+  const common::ObString query_token(static_cast<int32_t>(strlen(term_buf)), term_buf);
+  const uint64_t last_id = expect_doc(start_id, DOC_COUNT - 1);
+  for (const int64_t capacity : {7, 8, 9, 256, 257, 1024}) {
+    std::vector<uint64_t> expected_ids;
+    std::vector<uint64_t> actual_ids;
+    std::vector<double> expected_scores;
+    std::vector<double> actual_scores;
+    bool expected_end = false;
+    bool actual_end = false;
+    uint64_t expected_next = 0;
+    uint64_t actual_next = 0;
+    double expected_next_score = 0.0;
+    double actual_next_score = 0.0;
+    run_oracle(inv_sstable, read_info, query_token, 1.7, DOC_COUNT, DOC_COUNT,
+        last_id + 1, 0, sql::ObExprBM25::DEFAULT_AVG_DOC_TOKEN_CNT,
+        expected_ids, expected_scores, expected_end, expected_next, expected_next_score);
+    run_drain(inv_sstable, read_info, query_token, 1.7, DOC_COUNT, DOC_COUNT,
+        capacity, last_id + 1, true, 0, sql::ObExprBM25::DEFAULT_AVG_DOC_TOKEN_CNT,
+        actual_ids, actual_scores, actual_end, actual_next, actual_next_score);
+    EXPECT_EQ(expected_end, actual_end);
+    ASSERT_EQ(expected_ids.size(), actual_ids.size());
+    ASSERT_EQ(expected_scores.size(), actual_scores.size());
+    for (size_t i = 0; i < actual_ids.size(); ++i) {
+      EXPECT_EQ(expected_ids[i], actual_ids[i]);
+      EXPECT_EQ(0, MEMCMP(&expected_scores[i], &actual_scores[i], sizeof(double)));
+    }
+  }
+  for (const bool active_only : {false, true}) {
+    ObArenaAllocator ctx_alloc("CompactDrain");
+    AsyncTokCtx ctx(ctx_alloc);
+    sql::ObDASIRScanCtDef ctdef(ctx_alloc);
+    sql::ObDASIRScanRtDef rtdef;
+    sql::ObDASAsyncTokenOp *op = nullptr;
+    create_and_inject_single(ctx, ctdef, rtdef, query_token, 1.7, DOC_COUNT,
+        DOC_COUNT, read_info, inv_sstable, op);
+    OK(op->open());
+    ObDASRowID probe_id;
+    double probe_score = 0.0;
+    OK(op->next_rowid(probe_id, probe_score));
+    blocksstable::ObPostingDocIdView doc_id_view;
+    blocksstable::ObPostingRelevanceView relevance_view;
+    OK(op->posting_iter_->posting_block_data_.get_doc_id_view(0, doc_id_view));
+    OK(op->posting_iter_->posting_block_data_.get_relevance_view(0, relevance_view));
+    EXPECT_EQ(!wide_relevance, relevance_view.is_uint32());
+    EXPECT_EQ(start_id <= UINT32_MAX, doc_id_view.is_uint32());
+    OK(op->rescan());
+    sql::DocScoreAccumulator accumulator;
+    OK(accumulator.init(last_id - start_id + 1, ctx_alloc));
+    uint64_t max_id = 0;
+    OK(accumulator.reuse_with_start_id(start_id, max_id));
+    for (int64_t i = 0; i < DOC_COUNT; i += 3) {
+      OK(accumulator.add_dim(expect_doc(start_id, i), 0.5));
+    }
+    ObDASRowID boundary;
+    boundary.set_uint64(last_id);
+    int64_t count = 0;
+    if (active_only) {
+      OK(op->do_drain_until_active(
+          accumulator.get_start_id(), boundary.get_uint64(), accumulator, count));
+      EXPECT_EQ((DOC_COUNT + 2) / 3, count);
+    } else {
+      ObDASRowID next_id;
+      double next_score = 0.0;
+      OK(op->do_drain_until_accumulated(boundary, accumulator, count, next_id, next_score));
+      EXPECT_EQ(DOC_COUNT, count);
+      EXPECT_TRUE(next_id.is_max());
+    }
+    EXPECT_EQ(nullptr, op->posting_iter_->legacy_relevance_buf_);
+    EXPECT_EQ(nullptr, op->posting_iter_->legacy_doc_ids_buf_);
+    double expected_max = 0.0;
+    for (int64_t i = 0; i < DOC_COUNT; ++i) {
+      double actual = 0.0;
+      OK(accumulator.get_score(expect_doc(start_id, i), actual));
+      const bool present = !active_only || 0 == i % 3;
+      double expected = present ? fast_ref_score(token_freqs.at(i), doc_lengths.at(i),
+          DOC_COUNT, DOC_COUNT, sql::ObExprBM25::DEFAULT_AVG_DOC_TOKEN_CNT, 1.7) : 0.0;
+      if (0 == i % 3) { expected = 0.5 + expected; }
+      EXPECT_EQ(0, MEMCMP(&expected, &actual, sizeof(double))) << i;
+      expected_max = MAX(expected_max, expected);
+    }
+    EXPECT_EQ(0, MEMCMP(&expected_max, &accumulator.max_score_, sizeof(double)));
+    OK(op->close());
+  }
+  // Compact NE scoring must consume typed storage views without legacy scratch.
+  for (const bool cached_current : {false, true}) {
+    SCOPED_TRACE(::testing::Message() << "cached_current=" << cached_current);
+    ObArenaAllocator ctx_alloc("CandidateDrain");
+    AsyncTokCtx ctx(ctx_alloc);
+    sql::ObDASIRScanCtDef ctdef(ctx_alloc);
+    sql::ObDASIRScanRtDef rtdef;
+    sql::ObDASAsyncTokenOp *op = nullptr;
+    create_and_inject_single(ctx, ctdef, rtdef, query_token, 1.7, DOC_COUNT,
+        DOC_COUNT, read_info, inv_sstable, op);
+    OK(op->open());
+    sql::ObDAATMergeIter iter;
+    OK(iter.init(0, *op));
+    if (cached_current) { OK(iter.next()); }
+    sql::SparseCandidateBuffer candidates;
+    OK(candidates.init(DOC_COUNT + 1, ctx_alloc));
+    const int64_t ends[] = {300, 600, DOC_COUNT - 1};
+    for (int64_t window = 0; window < ARRAYSIZEOF(ends); ++window) {
+      SCOPED_TRACE(window);
+      candidates.reuse();
+      std::vector<uint64_t> expected_ids;
+      std::vector<double> expected_scores;
+      const int64_t first = window == 0 ? 0 : ends[window - 1] + 1;
+      const int64_t last = ends[window];
+      for (int64_t i = first; i <= last; ++i) {
+        if (i == first || i % 3 == 0) {
+          const uint64_t id = expect_doc(start_id, i);
+          OK(candidates.append(id, 0.5));
+          expected_ids.push_back(id);
+          expected_scores.push_back(0.5 + fast_ref_score(token_freqs.at(i),
+              doc_lengths.at(i), DOC_COUNT, DOC_COUNT,
+              sql::ObExprBM25::DEFAULT_AVG_DOC_TOKEN_CNT, 1.7));
+          if (i < last) {
+            OK(candidates.append(id + 1, 0.5));
+            expected_ids.push_back(id + 1);
+            expected_scores.push_back(0.5);
+          }
+        }
+      }
+      if (window == ARRAYSIZEOF(ends) - 1) {
+        OK(candidates.append(last_id + 1, 0.5));
+        expected_ids.push_back(last_id + 1);
+        expected_scores.push_back(0.5);
+      }
+      OK(iter.score_candidates(candidates));
+      EXPECT_EQ(nullptr, op->posting_iter_->legacy_relevance_buf_);
+      EXPECT_EQ(nullptr, op->posting_iter_->legacy_doc_ids_buf_);
+      for (size_t i = 0; i < expected_ids.size(); ++i) {
+        uint64_t id = 0;
+        double score = 0.0;
+        OK(candidates.next(0.0, id, score));
+        EXPECT_EQ(expected_ids[i], id);
+        EXPECT_EQ(0, MEMCMP(&expected_scores[i], &score, sizeof(score))) << i;
+      }
+      uint64_t id = 0;
+      double score = 0.0;
+      EXPECT_EQ(OB_ITER_END, candidates.next(0.0, id, score));
+      if (window < ARRAYSIZEOF(ends) - 1) {
+        EXPECT_FALSE(iter.iter_end());
+        ObDASRowID next_id;
+        OK(iter.get_curr_id(next_id));
+        EXPECT_EQ(expect_doc(start_id, last + 1), next_id.get_uint64());
+      } else {
+        EXPECT_TRUE(iter.iter_end());
+        EXPECT_TRUE(op->posting_iter_->is_end());
+      }
+    }
+    OK(op->close());
+  }
+}
+
+TEST_F(TestDASAsyncTokenOp, compact_uint32_extremes_all_drain_paths)
+{
+  check_typed_cache_all_drain_paths(OP_START, false);
+}
+
+TEST_F(TestDASAsyncTokenOp, typed_doc32_rel64_all_drain_paths)
+{
+  check_typed_cache_all_drain_paths(OP_START, true);
+}
+
+TEST_F(TestDASAsyncTokenOp, typed_doc64_rel32_all_drain_paths)
+{
+  check_typed_cache_all_drain_paths(UINT32_MAX + 1024ULL, false);
+}
+
+TEST_F(TestDASAsyncTokenOp, typed_doc64_rel64_all_drain_paths)
+{
+  check_typed_cache_all_drain_paths(UINT32_MAX + 1024ULL, true);
+}
+
 TEST_F(TestDASAsyncTokenOp, drain_token_boost_and_nondefault_avg)
 {
   ObInvSSTable inv_sstable;
@@ -2021,10 +2536,12 @@ TEST_F(TestDASAsyncTokenOp, accumulated_merge_drain_matches_bm25_across_boundari
   for (int64_t i = 0; i < OP_DOC_CNT; i += 2) {
     mask->set(expect_doc(OP_START, i) - OP_START);
   }
-  for (const bool filtered : {false, true}) {
-    for (const int64_t first_count : {0, 1, 255, 256, 257, 513, 1000}) {
+  for (const int mode : {0, 1, 2}) {
+    const bool filtered = 1 == mode;
+    const bool seeded = 2 == mode;
+    for (const int64_t first_count : {0, 1, 7, 8, 9, 15, 16, 17, 255, 256, 257, 513, 1000}) {
       SCOPED_TRACE(::testing::Message() << "filtered=" << filtered
-          << " first_count=" << first_count);
+          << " seeded=" << seeded << " first_count=" << first_count);
       OK(op->rescan());
       iter.reuse();
       OK(iter.next());
@@ -2034,6 +2551,15 @@ TEST_F(TestDASAsyncTokenOp, accumulated_merge_drain_matches_bm25_across_boundari
         accumulator.set_filter_mask(mask);
       } else {
         accumulator.clear_filter_mask();
+      }
+      // Mixed new/existing lanes must not read stale scores at absent offsets.
+      // Multiple posting IDs also share one presence word, exercising OR conflicts.
+      for (int64_t i = 0; i < OP_DOC_CNT; ++i) {
+        const uint64_t id = expect_doc(OP_START, i);
+        accumulator.scores_.at(id - OP_START) = std::numeric_limits<double>::quiet_NaN();
+        if (seeded && 0 == i % 3) {
+          OK(accumulator.add_dim(id, (i + 1) * 0.125));
+        }
       }
       ObDASRowID boundary;
       boundary.set_uint64(first_count == 0 ? OP_START - 1 : expect_doc(OP_START, first_count - 1));
@@ -2055,6 +2581,7 @@ TEST_F(TestDASAsyncTokenOp, accumulated_merge_drain_matches_bm25_across_boundari
       OK(iter.drain_until(boundary, accumulator));
       EXPECT_TRUE(iter.iter_end());
       EXPECT_FALSE(iter.curr_score_materialized_);
+      double expected_max = 0.0;
       for (int64_t i = 0; i < OP_DOC_CNT; ++i) {
         const uint64_t id = expect_doc(OP_START, i);
         const bool present = !filtered || i % 2 == 0;
@@ -2062,21 +2589,34 @@ TEST_F(TestDASAsyncTokenOp, accumulated_merge_drain_matches_bm25_across_boundari
         if (present) {
           double score = 0.0;
           OK(accumulator.get_score(id, score));
-          const double expected = fast_ref_score(token_freqs.at(i),
+          double expected = fast_ref_score(token_freqs.at(i),
               doc_lengths.at(i), OP_DOC_CNT, OP_DOC_CNT,
               sql::ObExprBM25::DEFAULT_AVG_DOC_TOKEN_CNT, 1.7);
+          if (seeded && 0 == i % 3) {
+            expected = (i + 1) * 0.125 + expected;
+          }
+          expected_max = MAX(expected_max, expected);
           EXPECT_EQ(0, MEMCMP(&expected, &score, sizeof(double)));
         }
       }
+      EXPECT_EQ(0, MEMCMP(&expected_max, &accumulator.max_score_, sizeof(double)));
     }
   }
   OK(op->close());
 }
 
+
 TEST_F(TestDASAsyncTokenOp, active_drain_bitmap_boundaries)
 {
   ObInvSSTable inv_sstable;
-  build_single_term_sstable(OP_START, OP_DOC_CNT, OP_TERM_SEQ, inv_sstable);
+  common::ObArray<uint64_t> token_freqs;
+  common::ObArray<uint64_t> doc_lengths;
+  for (int64_t i = 0; i < OP_DOC_CNT; ++i) {
+    OK(token_freqs.push_back(1 + static_cast<uint64_t>(i % 11)));
+    OK(doc_lengths.push_back(80 + static_cast<uint64_t>(i % 29)));
+  }
+  build_single_term_sstable_per_doc(OP_START, OP_DOC_CNT, OP_TERM_SEQ,
+      token_freqs, doc_lengths, inv_sstable);
   ObTableReadInfo read_info;
   build_rowkey_read_info(table_schema_, allocator_, read_info);
   char term_buf[32] = {0};
@@ -2118,6 +2658,8 @@ TEST_F(TestDASAsyncTokenOp, active_drain_bitmap_boundaries)
       active_flags[active_indexes[i]] = 1;
     }
     for (int64_t i = 0; i < OP_DOC_CNT; ++i) {
+      accumulator.scores_.at(expect_doc(OP_START, i) - active_start) =
+          std::numeric_limits<double>::quiet_NaN();
       if (active_flags[i]) {
         OK(accumulator.add_dim(expect_doc(OP_START, i), INITIAL_SCORE));
       }
@@ -2125,14 +2667,19 @@ TEST_F(TestDASAsyncTokenOp, active_drain_bitmap_boundaries)
 
     ObDASRowID boundary;
     boundary.set_uint64(expect_doc(OP_START, boundary_index));
-    OK(op->drain_until_active(boundary, accumulator));
+    OK(op->drain_until_active(accumulator.get_start_id(), boundary.get_uint64(), accumulator));
 
-    const double bm25_score = fast_ref_score(1, 100, OP_DOC_CNT, OP_DOC_CNT,
-        sql::ObExprBM25::DEFAULT_AVG_DOC_TOKEN_CNT, 1.7);
+    const auto expected_bm25 = [&](const int64_t i) {
+      return fast_ref_score(token_freqs.at(i), doc_lengths.at(i), OP_DOC_CNT, OP_DOC_CNT,
+          sql::ObExprBM25::DEFAULT_AVG_DOC_TOKEN_CNT, 1.7);
+    };
     for (int64_t i = 0; i <= boundary_index; ++i) {
       double score = 0.0;
       OK(accumulator.get_score(expect_doc(OP_START, i), score));
-      EXPECT_DOUBLE_EQ(active_flags[i] ? INITIAL_SCORE + bm25_score : 0.0, score);
+      const double expected = active_flags[i] ? INITIAL_SCORE + expected_bm25(i) : 0.0;
+      EXPECT_EQ(0, MEMCMP(&expected, &score, sizeof(double)));
+      EXPECT_EQ(0 != active_flags[i],
+          accumulator.bitset_->exist(expect_doc(OP_START, i) - active_start));
     }
     if (boundary_index + 1 < OP_DOC_CNT) {
       ObDASRowID next_target;
@@ -2141,7 +2688,7 @@ TEST_F(TestDASAsyncTokenOp, active_drain_bitmap_boundaries)
       next_target.set_uint64(expect_doc(OP_START, boundary_index + 1));
       OK(op->advance_to(next_target, next_id, next_score));
       EXPECT_EQ(next_target.get_uint64(), next_id.get_uint64());
-      EXPECT_DOUBLE_EQ(bm25_score, next_score);
+      EXPECT_DOUBLE_EQ(expected_bm25(boundary_index + 1), next_score);
     } else {
       ObDASRowID end_id;
       double end_score = 0.0;
@@ -2150,11 +2697,17 @@ TEST_F(TestDASAsyncTokenOp, active_drain_bitmap_boundaries)
     OK(op->close());
   };
 
+  for (const int64_t boundary_index : {6, 7, 8, 14, 15, 16}) {
+    run_case({}, true, boundary_index);
+  }
+  run_case({7, 8, 15, 16, 31, 32, 63, 64, 129}, false, 130);
   run_case({}, false, 130);
   run_case({0}, false, 130);
   run_case({31, 32, 63, 64, 129}, false, 130);
   run_case({}, true, 130);
   run_case({}, true, OP_DOC_CNT - 1);
+  run_case({OP_DOC_CNT - 1}, false, OP_DOC_CNT - 1);
+  run_case({0, OP_DOC_CNT - 1}, false, OP_DOC_CNT - 1);
 }
 
 // An absent active start is rounded up to the next posting row, which is then included.
@@ -2192,7 +2745,7 @@ TEST_F(TestDASAsyncTokenOp, active_drain_starts_at_absent_id)
 
   ObDASRowID boundary;
   boundary.set_uint64(expect_doc(OP_START, 130));
-  OK(op->drain_until_active(boundary, accumulator));
+  OK(op->drain_until_active(accumulator.get_start_id(), boundary.get_uint64(), accumulator));
 
   const double bm25_score = fast_ref_score(1, 100, OP_DOC_CNT, OP_DOC_CNT,
       sql::ObExprBM25::DEFAULT_AVG_DOC_TOKEN_CNT, 1.7);
@@ -2227,7 +2780,7 @@ TEST_F(TestDASAsyncTokenOp, active_drain_starts_at_absent_id)
   OK(end_accumulator.init(16, end_ctx_alloc));
   OK(end_accumulator.reuse_with_start_id(beyond_start, max_id));
   boundary.set_uint64(beyond_start);
-  OK(end_op->drain_until_active(boundary, end_accumulator));
+  OK(end_op->drain_until_active(end_accumulator.get_start_id(), boundary.get_uint64(), end_accumulator));
   EXPECT_TRUE(end_accumulator.is_empty());
   ObDASRowID end_id;
   double end_score = 0.0;
@@ -2248,10 +2801,12 @@ TEST_F(TestDASAsyncTokenOp, active_drain_matches_fallback_without_reviving_prune
   format_term(OP_TERM_SEQ, term_buf, sizeof(term_buf));
   const common::ObString query_token(static_cast<int32_t>(strlen(term_buf)), term_buf);
   const uint64_t active_start = OP_START;
-  const int64_t active_capacity = 401;
-  const int64_t kept_indexes[] = {0, 31, 63, 129, 130, 150};
+  const int64_t active_capacity = 1801;
+  // Start after the bitmap base, leave two interior posting blocks empty, and keep
+  // one candidate beyond the narrowed boundary to check it receives no score.
+  const int64_t kept_indexes[] = {11, 31, 63, 129, 130, 800, 900};
   const int64_t pruned_indexes[] = {32, 64};
-  const int64_t boundary_index = 130;
+  const int64_t boundary_index = 800;
 
   auto run_path = [&](const bool use_async_batch,
                       std::vector<double> &scores,
@@ -2279,12 +2834,18 @@ TEST_F(TestDASAsyncTokenOp, active_drain_matches_fallback_without_reviving_prune
     }
     OK(accumulator.filter_below_score(1.0));
 
-    ObDASRowID boundary;
-    boundary.set_uint64(expect_doc(OP_START, boundary_index));
-    if (use_async_batch) {
-      OK(op->do_drain_until_active(boundary, accumulator, drained_count));
-    } else {
-      OK(op->ObIDASSearchOp::do_drain_until_active(boundary, accumulator, drained_count));
+    uint64_t first_active = accumulator.get_start_id();
+    uint64_t last_active = expect_doc(OP_START, boundary_index);
+    drained_count = 0;
+    if (accumulator.get_active_range(first_active, last_active, first_active, last_active)) {
+      EXPECT_GT(first_active, accumulator.get_start_id());
+      EXPECT_EQ(expect_doc(OP_START, boundary_index), last_active);
+      if (use_async_batch) {
+        OK(op->do_drain_until_active(first_active, last_active, accumulator, drained_count));
+      } else {
+        OK(op->ObIDASSearchOp::do_drain_until_active(
+            first_active, last_active, accumulator, drained_count));
+      }
     }
     scores.clear();
     for (int64_t idx : kept_indexes) {
@@ -2297,6 +2858,10 @@ TEST_F(TestDASAsyncTokenOp, active_drain_matches_fallback_without_reviving_prune
       OK(accumulator.get_score(expect_doc(OP_START, idx), score));
       ASSERT_DOUBLE_EQ(0.0, score) << "pruned index " << idx;
     }
+    // Local tail clipping must not stop the outer drain before the narrowed boundary.
+    ObDASRowID cursor_id;
+    OK(op->fetch_curr_id(cursor_id));
+    EXPECT_EQ(expect_doc(OP_START, boundary_index + 1), cursor_id.get_uint64());
     ObDASRowID next_target;
     ObDASRowID advanced_id;
     double advanced_score = 0.0;
@@ -2315,11 +2880,12 @@ TEST_F(TestDASAsyncTokenOp, active_drain_matches_fallback_without_reviving_prune
   run_path(true, batch_scores, batch_count, batch_next_id);
   run_path(false, fallback_scores, fallback_count, fallback_next_id);
   ASSERT_EQ(fallback_count, batch_count);
-  ASSERT_EQ(5, batch_count);
+  ASSERT_EQ(6, batch_count);
   ASSERT_EQ(fallback_scores.size(), batch_scores.size());
   for (size_t i = 0; i < batch_scores.size(); ++i) {
     ASSERT_DOUBLE_EQ(fallback_scores[i], batch_scores[i]) << "candidate " << i;
   }
+  EXPECT_DOUBLE_EQ(2.0, batch_scores.back());
   ASSERT_EQ(fallback_next_id, batch_next_id);
   ASSERT_EQ(expect_doc(OP_START, boundary_index + 1), batch_next_id);
 }
@@ -2370,7 +2936,7 @@ TEST_F(TestDASAsyncTokenOp, profiled_active_drain_counts_each_row_once)
 
   ObDASRowID boundary;
   boundary.set_uint64(second_id);
-  OK(op->drain_until_active(boundary, accumulator));
+  OK(op->drain_until_active(accumulator.get_start_id(), boundary.get_uint64(), accumulator));
   EXPECT_EQ(2, get_profile_metric(profile, common::ObMetricId::HS_OUTPUT_ROW_COUNT));
   EXPECT_TRUE(op->has_last_profile_output_rowid_);
   EXPECT_EQ(second_id, op->last_profile_output_rowid_);
@@ -2398,6 +2964,33 @@ TEST_F(TestDASAsyncTokenOp, profiled_active_drain_counts_each_row_once)
   OK(op->advance_to_id(target, rowid));
   EXPECT_EQ(fifth_id, rowid.get_uint64());
   EXPECT_EQ(5, get_profile_metric(profile, common::ObMetricId::HS_OUTPUT_ROW_COUNT));
+  uint64_t typed_id = 0;
+  OK(op->advance_to_id_uint64(fifth_id, typed_id));
+  EXPECT_EQ(fifth_id, typed_id);
+  EXPECT_EQ(5, get_profile_metric(profile, common::ObMetricId::HS_OUTPUT_ROW_COUNT));
+
+  const uint64_t probe_ids[] = {fifth_id, expect_doc(OP_START, 5), expect_doc(OP_START, 6)};
+  double probe_scores[3] = {0.0, 0.0, 0.0};
+  bool probe_matches[3] = {false, false, false};
+  bool materialized = false;
+  bool iter_end = false;
+  OK(op->probe_sorted_ids(probe_ids, 3, probe_scores, probe_matches,
+      rowid, score, materialized, iter_end));
+  EXPECT_TRUE(probe_matches[0]);
+  EXPECT_TRUE(probe_matches[1]);
+  EXPECT_TRUE(probe_matches[2]);
+  EXPECT_EQ(7, get_profile_metric(profile, common::ObMetricId::HS_OUTPUT_ROW_COUNT));
+
+  sql::SparseCandidateBuffer candidates;
+  OK(candidates.init(4, ctx_alloc));
+  OK(candidates.append(probe_ids[2], 0.5));
+  OK(candidates.append(expect_doc(OP_START, 8), 0.5));
+  OK(op->score_candidates(candidates, rowid, score));
+  EXPECT_EQ(8, get_profile_metric(profile, common::ObMetricId::HS_OUTPUT_ROW_COUNT));
+  OK(op->advance_to_id_uint64(expect_doc(OP_START, 9), typed_id));
+  EXPECT_EQ(9, get_profile_metric(profile, common::ObMetricId::HS_OUTPUT_ROW_COUNT));
+  EXPECT_EQ(OB_ITER_END, op->advance_to_id_uint64(expect_doc(OP_START, OP_DOC_CNT), typed_id));
+  EXPECT_EQ(9, get_profile_metric(profile, common::ObMetricId::HS_OUTPUT_ROW_COUNT));
   OK(op->close());
 }
 
@@ -2471,6 +3064,600 @@ TEST_F(TestDASAsyncTokenOp, drain_scores_match_canonical_bm25)
 // BM25 precomputed-params unit / differential / block-max-safety tests.
 // ============================================================================
 
+TEST_F(TestDASAsyncTokenOp, native_tile_topk_work)
+{
+  BMMVectorizedConfigGuard guard;
+  ASSERT_TRUE(guard.is_valid());
+  ObInvSSTable sstable;
+  ObTableReadInfo read_info;
+  build_native_tile_fixture(sstable, read_info);
+  ASSERT_FALSE(HasFatalFailure());
+  const int64_t topk_limits[] = {1, 10, 100, 1000};
+  for (int64_t topk_limit : topk_limits) {
+    for (int shape = 0; shape < 6; ++shape) {
+      SCOPED_TRACE(::testing::Message() << "topk=" << topk_limit << " shape=" << shape);
+      NativeTileRun a, b, profiled;
+      run_native_tile_case(
+          shape, topk_limit, false, false, 2, read_info, sstable, a);
+      ASSERT_FALSE(HasFatalFailure());
+      run_native_tile_case(
+          shape, topk_limit, true, false, 2, read_info, sstable, b);
+      ASSERT_FALSE(HasFatalFailure());
+      EXPECT_EQ(a.rows_, b.rows_);
+      EXPECT_EQ(0, a.filter_drain_);
+      if (shape % 3 != 2) {
+        EXPECT_GT(b.filter_drain_, 0);
+      } else {
+        EXPECT_EQ(0, b.filter_drain_);
+      }
+      run_native_tile_case(
+          shape, topk_limit, true, true, 2, read_info, sstable, profiled);
+      ASSERT_FALSE(HasFatalFailure());
+      EXPECT_EQ(b.rows_, profiled.rows_);
+      printf("NATIVE_TILE_WORK {\"shape\":%d,\"topk\":%ld,\"a_loads\":%ld,\"b_loads\":%ld,\"a_filter_next\":%ld,\"a_filter_advance\":%ld,\"a_filter_drain\":%ld,\"b_filter_next\":%ld,\"b_filter_advance\":%ld,\"b_filter_drain\":%ld,\"same\":%s}\n",
+          shape, topk_limit, a.loads_, b.loads_, a.filter_next_, a.filter_advance_,
+          a.filter_drain_, b.filter_next_, b.filter_advance_, b.filter_drain_,
+          a.rows_ == b.rows_ ? "true" : "false");
+    }
+  }
+}
+
+TEST_F(TestDASAsyncTokenOp, sorted_candidate_bulk_exact_state_and_interface_work)
+{
+  for (uint64_t doc_base : {uint64_t(0), uint64_t(UINT32_MAX) + 1}) {
+    for (bool wide_relevance : {false, true}) {
+      SCOPED_TRACE(::testing::Message() << "doc_base=" << doc_base
+          << " wide_relevance=" << wide_relevance);
+      const uint64_t start_id = doc_base + OP_START;
+      const uint64_t relevance_base = wide_relevance ? uint64_t(UINT32_MAX) + 1 : 0;
+      common::ObArray<uint64_t> tfs;
+      common::ObArray<uint64_t> dls;
+      for (int64_t i = 0; i < OP_DOC_CNT; ++i) {
+        // A uint32 dominating pair keeps wide lengths out of each block's frontier.
+        const bool dominating = wide_relevance && 0 == i % DEFAULT_POSTING_BLOCK_CAPACITY;
+        OK(tfs.push_back(dominating ? UINT32_MAX : 1 + i % 29));
+        OK(dls.push_back(dominating ? 1 : 1 + (37 * i) % 4093 + relevance_base));
+      }
+      ObInvSSTable sstable;
+      build_single_term_sstable_per_doc(start_id, OP_DOC_CNT, OP_TERM_SEQ, tfs, dls, sstable);
+      ASSERT_FALSE(HasFatalFailure());
+      ObTableReadInfo read_info;
+      build_rowkey_read_info(table_schema_, allocator_, read_info);
+      char term_buf[32] = {};
+      format_term(OP_TERM_SEQ, term_buf, sizeof(term_buf));
+      const ObString term(static_cast<int32_t>(strlen(term_buf)), term_buf);
+      // Negative initial values select an unpositioned (-1) or shallow (-2) head.
+      struct Case { int64_t initial; uint64_t first; uint64_t stride; int64_t count; bool clipped; };
+      const Case cases[] = {
+        {0, 0, 1, 64, false}, {0, 0, 2, 64, false}, {0, 1, 2, 64, false},
+        {0, 2, 2, 64, false}, {100, 0, 1, 64, false}, {31, 0, 1, 64, false},
+        {0, 450, 7, 64, false}, {250, 500, 17, 64, false},
+        {900, 1900, 7, 64, false}, {0, 1800, 5, 64, true},
+        {0, 0, 1, 7, false}, {0, 0, 1, 8, false}, {0, 0, 1, 63, false},
+        {999, 1999, 1, 64, false}, {500, 1000, 1, 1, false},
+        {0, 1936, 1, 64, false}, {0, 0, 7, 64, true},
+        {210, 425, 2, 64, false}, {210, 424, 2, 64, false},
+        {240, 482, 1, 64, false}, {0, 3, 2, 8, false},
+        {0, 2, 2, 8, false}, {850, 1703, 1, 64, true},
+        {-1, 0, 1, 1, false}, {-1, 0, 1, 7, false}, {-1, 0, 1, 8, false},
+        {-1, 0, 1, 63, false}, {-1, 0, 1, 64, false},
+        {-2, 0, 1, 1, false}, {-2, 0, 1, 8, false}, {-2, 0, 1, 64, false},
+        {-1, 2050, 1, 8, false}, {-2, 2050, 1, 8, false}
+      };
+      struct Snapshot {
+        std::vector<uint64_t> values;
+        int64_t advances = 0;
+        int64_t loads = 0;
+        int64_t wrapper_calls = 0;
+      };
+      auto run = [&](const Case &cfg, const bool id_only, const bool zero_score,
+          const bool enabled, const bool profiled, Snapshot &out) {
+        ObArenaAllocator ca("SortedProbe");
+        AsyncTokCtx ctx(ca);
+        sql::ObDASIRScanCtDef ctdef(ca);
+        sql::ObDASIRScanRtDef rtdef;
+        CountingNativeTileToken *op = nullptr;
+        create_and_inject_single(ctx, ctdef, rtdef, term, 1.7, OP_DOC_CNT * 4,
+            OP_DOC_CNT, read_info, sstable, op, 127.0);
+        ASSERT_FALSE(HasFatalFailure());
+        OK(op->open());
+        common::ObOpProfile<common::ObMetric> profile(common::ObProfileId::PHY_TABLE_SCAN, &ca);
+        sql::ObDAATMergeIter iter;
+        OK(iter.init(0, *op));
+        auto bits = [](const double score) {
+          uint64_t value = 0;
+          MEMCPY(&value, &score, sizeof(value));
+          return value;
+        };
+        auto advance_count = [&]() -> int64_t {
+          const auto *metric = profile.get_metric(common::ObMetricId::HS_ADVANCE_COUNT);
+          return nullptr == metric ? 0 : metric->value();
+        };
+        for (int repeat = 0; repeat < 2; ++repeat) {
+          if (repeat != 0) OK(op->rescan());
+          op->profile_ = profiled ? &profile : nullptr;
+          if (cfg.clipped) {
+            op->posting_iter_->min_doc_id_ = doc_base + 51;
+            op->posting_iter_->max_doc_id_ = doc_base + 1869;
+          }
+          if (zero_score) op->bm25_calc_params_.query_weight_ = 0.0;
+          iter.reuse();
+          if (cfg.initial >= 0) {
+            OK(iter.next());
+            ObPostingDocIdView doc_view;
+            ObPostingRelevanceView relevance_view;
+            OK(op->posting_iter_->posting_block_data_.get_doc_id_view(0, doc_view));
+            OK(op->posting_iter_->posting_block_data_.get_relevance_view(0, relevance_view));
+            EXPECT_EQ(doc_base == 0, doc_view.is_uint32());
+            EXPECT_EQ(!wide_relevance, relevance_view.is_uint32());
+            ObDASRowID start;
+            start.set_uint64(expect_doc(start_id, cfg.initial));
+            if (id_only) OK(iter.advance_to_id(start));
+            else OK(iter.advance_to(start));
+          } else if (cfg.initial == -2) {
+            ObDASRowID target;
+            target.set_uint64(doc_base);
+            OK(iter.advance_shallow(target, true));
+          }
+          uint64_t ids[64];
+          double scores[64];
+          bool matched[64];
+          for (int64_t c = 0; c < cfg.count; ++c) {
+            ids[c] = doc_base + cfg.first + c * cfg.stride;
+            scores[c] = 1.0 / (1 + c % 7);
+            matched[c] = c % 5 == 0;
+          }
+          const int64_t advances_before = advance_count();
+          const int64_t loads_before = op->loads_;
+          if (enabled) {
+            OK(iter.probe_sorted_candidates(ids, cfg.count, scores, matched));
+            ++out.wrapper_calls;
+          } else {
+            // Scalar reference uses the public ID-only and lazy-score lifecycle.
+            for (int64_t c = 0; c < cfg.count && !iter.iter_end(); ++c) {
+              ObDASRowID current;
+              OK(iter.get_curr_id(current));
+              if (iter.in_shallow_status() || !current.is_normal()
+                  || current.get_uint64() < ids[c]) {
+                ObDASRowID target;
+                target.set_uint64(ids[c]);
+                const int rc = iter.advance_to_id(target);
+                ASSERT_TRUE(rc == OB_SUCCESS || rc == OB_ITER_END);
+                if (rc == OB_ITER_END) break;
+                OK(iter.get_curr_id(current));
+              }
+              if (current.get_uint64() == ids[c]) {
+                double score = 0.0;
+                OK(iter.load_curr_score(score));
+                scores[c] += score;
+                matched[c] = true;
+              }
+            }
+          }
+          out.advances += advance_count() - advances_before;
+          out.loads += op->loads_ - loads_before;
+          for (int64_t c = 0; c < cfg.count; ++c) {
+            out.values.push_back(bits(scores[c]));
+            out.values.push_back(matched[c]);
+          }
+          out.values.push_back(iter.curr_id_.get_uint64());
+          out.values.push_back(bits(iter.curr_score_));
+          out.values.push_back(iter.curr_score_materialized_);
+          out.values.push_back(iter.iter_end());
+          out.values.push_back(iter.in_shallow_status());
+          out.values.push_back(op->posting_iter_->curr_relevance_materialized_);
+          const int next_ret = iter.next();
+          ASSERT_TRUE(next_ret == OB_SUCCESS || next_ret == OB_ITER_END);
+          out.values.push_back(next_ret);
+          if (next_ret == OB_SUCCESS) {
+            out.values.push_back(iter.curr_id_.get_uint64());
+            out.values.push_back(bits(iter.curr_score_));
+          }
+        }
+        OK(op->close());
+      };
+      int shape = 0;
+      for (const Case &cfg : cases) {
+        for (bool id_only : {false, true}) for (bool zero_score : {false, true}) {
+          SCOPED_TRACE(::testing::Message() << "shape=" << shape << " id_only=" << id_only
+              << " zero_score=" << zero_score);
+          Snapshot a, b, scalar_profiled, bulk_profiled;
+          run(cfg, id_only, zero_score, false, false, a);
+          ASSERT_FALSE(HasFatalFailure());
+          run(cfg, id_only, zero_score, true, false, b);
+          ASSERT_FALSE(HasFatalFailure());
+          EXPECT_EQ(a.values, b.values);
+          run(cfg, id_only, zero_score, false, true, scalar_profiled);
+          ASSERT_FALSE(HasFatalFailure());
+          run(cfg, id_only, zero_score, true, true, bulk_profiled);
+          ASSERT_FALSE(HasFatalFailure());
+          EXPECT_EQ(a.values, scalar_profiled.values);
+          EXPECT_EQ(b.values, bulk_profiled.values);
+          EXPECT_LE(bulk_profiled.advances, scalar_profiled.advances);
+          EXPECT_LE(bulk_profiled.loads, scalar_profiled.loads);
+          if (cfg.initial == 0 && cfg.first == OP_START && cfg.stride == OP_STRIDE
+              && cfg.count == 64 && !cfg.clipped) {
+            EXPECT_LT(bulk_profiled.advances, scalar_profiled.advances);
+            EXPECT_LT(bulk_profiled.loads, scalar_profiled.loads);
+          }
+          printf("BULK_INTERFACE_WORK {\"shape\":%d,\"id_only\":%s,\"zero_score\":%s,\"a_scalar_advances\":%ld,\"b_scalar_advances\":%ld,\"a_scalar_loads\":%ld,\"b_scalar_loads\":%ld,\"wrapper_calls\":%ld,\"same\":%s}\n",
+              shape, id_only ? "true" : "false", zero_score ? "true" : "false",
+              scalar_profiled.advances, bulk_profiled.advances,
+              scalar_profiled.loads, bulk_profiled.loads, bulk_profiled.wrapper_calls,
+              a.values == b.values ? "true" : "false");
+        }
+        ++shape;
+      }
+    }
+  }
+}
+
+TEST_F(TestDASAsyncTokenOp, sorted_candidate_probe_propagates_bulk_error)
+{
+  ObInvSSTable sstable;
+  build_single_term_sstable(OP_START, OP_DOC_CNT, OP_TERM_SEQ, sstable);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  ObArenaAllocator ca("ProbeError");
+  AsyncTokCtx ctx(ca);
+  sql::ObDASIRScanCtDef ctdef(ca);
+  sql::ObDASIRScanRtDef rtdef;
+  char term_buf[32] = {};
+  format_term(OP_TERM_SEQ, term_buf, sizeof(term_buf));
+  const ObString term(static_cast<int32_t>(strlen(term_buf)), term_buf);
+  sql::ObDASAsyncTokenOp *op = nullptr;
+  create_and_inject_single(ctx, ctdef, rtdef, term, 1.0,
+      OP_DOC_CNT, OP_DOC_CNT, read_info, sstable, op);
+  ASSERT_FALSE(HasFatalFailure());
+  OK(op->open());
+  sql::ObDAATMergeIter iter;
+  OK(iter.init(0, *op));
+  OK(iter.next());
+  ASSERT_TRUE(op->can_probe_sorted_ids());
+  uint64_t ids[8];
+  double scores[8] = {};
+  bool matched[8] = {};
+  for (int64_t i = 0; i < ARRAYSIZEOF(ids); ++i) ids[i] = expect_doc(OP_START, i + 1);
+  // Leave the cursor eligible for bulk probing but invalidate the decoded projection.
+  op->posting_iter_->posting_block_data_.reset();
+  ASSERT_TRUE(op->can_probe_sorted_ids());
+  EXPECT_EQ(OB_INVALID_ARGUMENT, iter.probe_sorted_candidates(ids, ARRAYSIZEOF(ids), scores, matched));
+  for (int64_t i = 0; i < ARRAYSIZEOF(ids); ++i) {
+    EXPECT_DOUBLE_EQ(0.0, scores[i]);
+    EXPECT_FALSE(matched[i]);
+  }
+  OK(op->close());
+}
+
+TEST_F(TestDASAsyncTokenOp, local_block_group_projection_and_commit)
+{
+  for (uint64_t doc_base : {uint64_t(0), uint64_t(UINT32_MAX) + 1}) {
+    for (bool wide_relevance : {false, true}) {
+      SCOPED_TRACE(::testing::Message() << "doc_base=" << doc_base
+          << " wide_relevance=" << wide_relevance);
+      const uint64_t start_id = doc_base + OP_START;
+      const uint64_t relevance_base = wide_relevance ? uint64_t(UINT32_MAX) + 1 : 0;
+      common::ObArray<uint64_t> tfs;
+      common::ObArray<uint64_t> dls;
+      for (int64_t i = 0; i < OP_DOC_CNT; ++i) {
+        // A uint32 dominating pair keeps wide lengths out of each block's frontier.
+        const bool dominating = wide_relevance && 0 == i % DEFAULT_POSTING_BLOCK_CAPACITY;
+        OK(tfs.push_back(dominating ? UINT32_MAX : 1 + i % 29));
+        OK(dls.push_back(dominating ? 1 : 1 + (37 * i) % 4093 + relevance_base));
+      }
+      ObInvSSTable sstable;
+      build_single_term_sstable_per_doc(start_id, OP_DOC_CNT, OP_TERM_SEQ, tfs, dls, sstable);
+      ASSERT_FALSE(HasFatalFailure());
+      ObTableReadInfo read_info;
+      build_rowkey_read_info(table_schema_, allocator_, read_info);
+      char term_buf[32] = {};
+      format_term(OP_TERM_SEQ, term_buf, sizeof(term_buf));
+      const ObString term(static_cast<int32_t>(strlen(term_buf)), term_buf);
+      struct Case { int64_t initial; uint64_t first; uint64_t stride; int64_t count; bool clipped; };
+      const Case cases[] = {
+        {0, 3, 2, 64, false}, {0, 2, 2, 64, false}, {0, 2, 1, 64, false},
+        {0, 3, 2, 1, false}, {0, 3, 2, 7, false}, {0, 3, 2, 8, false},
+        {0, 2, 2, 8, false}, {0, 1, 1, 64, false}, {31, 0, 1, 64, false},
+        {210, 425, 2, 64, false}, {210, 424, 2, 64, false},
+        {240, 482, 1, 64, false}, {250, 502, 1, 64, false},
+        {255, 512, 1, 64, false}, {500, 1003, 7, 64, false},
+        {900, 1803, 2, 64, false}, {998, 1998, 1, 8, false},
+        {0, 53, 2, 64, true}, {850, 1703, 1, 64, true},
+        {0, 3, 23, 64, false}, {0, 2, 37, 64, false}
+      };
+      struct Snapshot {
+        std::vector<uint64_t> values;
+        int64_t selected = 0;
+        int64_t scalar_moves = 0;
+        int64_t consumed = 0;
+      };
+      auto run = [&](const Case &cfg, bool id_only, bool enabled, Snapshot &out) {
+        ObArenaAllocator ca("LocalProbe");
+        AsyncTokCtx ctx(ca);
+        sql::ObDASIRScanCtDef ctdef(ca);
+        sql::ObDASIRScanRtDef rtdef;
+        sql::ObDASAsyncTokenOp *op = nullptr;
+        create_and_inject_single(ctx, ctdef, rtdef, term, 1.7, OP_DOC_CNT * 4,
+            OP_DOC_CNT, read_info, sstable, op, 127.0);
+        ASSERT_FALSE(HasFatalFailure());
+        OK(op->open());
+        sql::ObDAATMergeIter iter;
+        OK(iter.init(0, *op));
+        for (int repeat = 0; repeat < 2; ++repeat) {
+          if (repeat != 0) OK(op->rescan());
+          auto &posting = *op->posting_iter_;
+          if (cfg.clipped) {
+            posting.min_doc_id_ = doc_base + 51;
+            posting.max_doc_id_ = doc_base + 1869;
+          }
+          iter.reuse();
+          OK(iter.next());
+          ObPostingDocIdView doc_view;
+          ObPostingRelevanceView relevance_view;
+          OK(op->posting_iter_->posting_block_data_.get_doc_id_view(0, doc_view));
+          OK(op->posting_iter_->posting_block_data_.get_relevance_view(0, relevance_view));
+          EXPECT_EQ(doc_base == 0, doc_view.is_uint32());
+          EXPECT_EQ(!wide_relevance, relevance_view.is_uint32());
+          ObDASRowID start;
+          start.set_uint64(expect_doc(start_id, cfg.initial));
+          if (id_only) OK(iter.advance_to_id(start));
+          else OK(iter.advance_to(start));
+          uint64_t ids[64];
+          uint64_t result_tfs[64];
+          uint64_t result_dls[64];
+          for (int64_t i = 0; i < 64; ++i) {
+            ids[i] = doc_base + cfg.first + i * cfg.stride;
+            result_tfs[i] = UINT64_MAX;
+            result_dls[i] = UINT64_MAX;
+          }
+          // Independent linear prefix discovery; the scalar cursor is the oracle.
+          int64_t expected = 0;
+          while (expected < cfg.count && ids[expected] <= posting.curr_meta_.max_id_) ++expected;
+          if (expected < 8 || ids[0] <= posting.curr_id_storage_
+              || posting.curr_meta_.max_id_ > posting.max_doc_id_) expected = 0;
+          uint64_t matches = 0;
+          int64_t consumed = 0;
+          if (enabled) {
+            OK(posting.probe_local_block_group(ids, cfg.count,
+                result_tfs, result_dls, matches, consumed));
+            EXPECT_EQ(expected, consumed);
+          } else {
+            consumed = expected;
+            for (int64_t i = 0; i < consumed; ++i) {
+              if (ids[i] > posting.curr_id_storage_) {
+                ObDatum target(reinterpret_cast<const char *>(ids + i), sizeof(ids[i]), false);
+                OK(posting.advance_to_id(target));
+                ++out.scalar_moves;
+              }
+              if (ids[i] == posting.curr_id_storage_) {
+                int64_t tf = 0;
+                int64_t dl = 0;
+                OK(posting.load_curr_bm25_param(tf, dl));
+                result_tfs[i] = static_cast<uint64_t>(tf);
+                result_dls[i] = static_cast<uint64_t>(dl);
+                matches |= uint64_t(1) << i;
+              }
+            }
+          }
+          out.selected += consumed > 0;
+          out.consumed += consumed;
+          out.values.push_back(matches);
+          for (int64_t i = 0; i < 64; ++i) {
+            out.values.push_back(result_tfs[i]);
+            out.values.push_back(result_dls[i]);
+          }
+          auto capture = [&]() {
+            out.values.push_back(posting.curr_id_storage_);
+            out.values.push_back(posting.curr_row_idx_);
+            out.values.push_back(posting.curr_token_freq_);
+            out.values.push_back(posting.curr_doc_length_);
+            out.values.push_back(posting.curr_relevance_materialized_);
+            out.values.push_back(posting.frontier_min_id_);
+            out.values.push_back(posting.is_end_);
+            out.values.push_back(posting.in_shallow_status_);
+            if (!posting.is_end_) {
+              const ObDatum *datum = nullptr;
+              OK(posting.get_cur_id(datum));
+              ASSERT_NE(nullptr, datum);
+              out.values.push_back(datum->get_uint64());
+            }
+          };
+          capture();
+          const int next_ret = posting.next();
+          ASSERT_TRUE(next_ret == OB_SUCCESS || next_ret == OB_ITER_END);
+          out.values.push_back(next_ret);
+          capture();
+        }
+        OK(op->close());
+      };
+      int64_t improved = 0;
+      int64_t selected = 0;
+      int64_t moves = 0;
+      int shape = 0;
+      for (const Case &cfg : cases) {
+        for (bool id_only : {false, true}) {
+          SCOPED_TRACE(::testing::Message() << "shape=" << shape << " id_only=" << id_only);
+          Snapshot a, b;
+          run(cfg, id_only, false, a);
+          ASSERT_FALSE(HasFatalFailure());
+          run(cfg, id_only, true, b);
+          ASSERT_FALSE(HasFatalFailure());
+          EXPECT_EQ(a.values, b.values);
+          EXPECT_EQ(a.selected, b.selected);
+          EXPECT_EQ(a.consumed, b.consumed);
+          // Each successful functional helper call commits one final DocID.
+          EXPECT_GE(a.scalar_moves, b.selected);
+          improved += a.scalar_moves > b.selected;
+          selected += b.selected;
+          moves += a.scalar_moves;
+          printf("LOCAL_GROUP_WORK {\"shape\":%d,\"id_only\":%s,\"selected_groups\":%ld,\"consumed\":%ld,\"scalar_cursor_moves\":%ld,\"source_bound_group_commits\":%ld,\"same\":%s}\n",
+              shape, id_only ? "true" : "false", b.selected, b.consumed,
+              a.scalar_moves, b.selected, a.values == b.values ? "true" : "false");
+        }
+        ++shape;
+      }
+      EXPECT_GT(improved, 0);
+      EXPECT_GT(selected, 0);
+      EXPECT_LT(selected, moves);
+    }
+  }
+}
+
+TEST_F(TestDASAsyncTokenOp, sorted_candidate_bulk_preserves_rounding)
+{
+  constexpr int64_t DOC_COUNT = 16;
+  common::ObArray<uint64_t> tfs;
+  common::ObArray<uint64_t> dls;
+  for (int64_t i = 0; i < DOC_COUNT; ++i) {
+    OK(tfs.push_back(1));
+    OK(dls.push_back(6));
+  }
+  ObInvSSTable sstable;
+  build_single_term_sstable_per_doc(OP_START, DOC_COUNT, OP_TERM_SEQ, tfs, dls, sstable);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  ObArenaAllocator ca("ProbeRounding");
+  AsyncTokCtx ctx(ca);
+  sql::ObDASIRScanCtDef ctdef(ca);
+  sql::ObDASIRScanRtDef rtdef;
+  char term_buf[32] = {};
+  format_term(OP_TERM_SEQ, term_buf, sizeof(term_buf));
+  const ObString term(static_cast<int32_t>(strlen(term_buf)), term_buf);
+  sql::ObDASAsyncTokenOp *op = nullptr;
+  create_and_inject_single(ctx, ctdef, rtdef, term, 1.0,
+      DOC_COUNT, DOC_COUNT, read_info, sstable, op, 3.0);
+  ASSERT_FALSE(HasFatalFailure());
+  OK(op->open());
+  OK(sql::ObExprBM25::init_precomputed_params(1.0, 3.0, 1.0, op->bm25_calc_params_));
+  sql::ObDAATMergeIter iter;
+  OK(iter.init(0, *op));
+  OK(iter.next());
+  uint64_t ids[8];
+  double scores[8] = {};
+  bool matched[8] = {};
+  for (int64_t i = 0; i < 8; ++i) ids[i] = expect_doc(OP_START, i + 1);
+  OK(iter.probe_sorted_candidates(ids, 8, scores, matched));
+  const double expected = reference_bm25_score(1, 6, op->bm25_calc_params_);
+  ASSERT_EQ(0.32258064516129037, expected);
+  for (int64_t i = 0; i < 8; ++i) {
+    EXPECT_TRUE(matched[i]);
+    EXPECT_EQ(0, MEMCMP(&expected, scores + i, sizeof(expected)));
+  }
+  EXPECT_TRUE(iter.curr_score_materialized_);
+  EXPECT_EQ(0, MEMCMP(&expected, &iter.curr_score_, sizeof(expected)));
+  OK(op->close());
+}
+
+TEST_F(TestDASAsyncTokenOp, scalar_and_block_max_callers_preserve_scalar_rounding)
+{
+  constexpr int64_t DOC_COUNT = 2 * DEFAULT_POSTING_BLOCK_CAPACITY + 9;
+  common::ObArray<uint64_t> tfs;
+  common::ObArray<uint64_t> dls;
+  for (int64_t i = 0; i < DOC_COUNT; ++i) {
+    OK(tfs.push_back(1));
+    OK(dls.push_back(i < DEFAULT_POSTING_BLOCK_CAPACITY ? 12 : 6));
+  }
+  ObInvSSTable sstable;
+  build_single_term_sstable_per_doc(OP_START, DOC_COUNT, OP_TERM_SEQ, tfs, dls, sstable);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  ObArenaAllocator alloc("BM25Rounding");
+  AsyncTokCtx ctx(alloc);
+  sql::ObDASIRScanCtDef ctdef(alloc);
+  sql::ObDASIRScanRtDef rtdef;
+  char term_buf[32] = {};
+  format_term(OP_TERM_SEQ, term_buf, sizeof(term_buf));
+  const ObString token(static_cast<int32_t>(strlen(term_buf)), term_buf);
+  sql::ObDASAsyncTokenOp *op = nullptr;
+  volatile double avg_doc_length = 3.0;
+  create_and_inject_single(ctx, ctdef, rtdef, token, 1.0,
+      DOC_COUNT, DOC_COUNT, read_info, sstable, op, avg_doc_length);
+  OK(op->open());
+
+  // Unit query weight exposes the rounding boundary independently of IDF.
+  OK(sql::ObExprBM25::init_precomputed_params(1.0, avg_doc_length, 1.0, op->bm25_calc_params_));
+  ObInvSSTablePostingIter *iter = op->posting_iter_;
+  ASSERT_NE(nullptr, iter);
+  iter->bm25_calc_params_ = op->bm25_calc_params_;
+  const ObPostingBlockMeta first_meta = iter->curr_meta_;
+  iter->curr_meta_.reset();
+  iter->assign_current_block_meta(first_meta);
+  const double first_expected = reference_bm25_score(1, 12, op->bm25_calc_params_);
+  const double expected = reference_bm25_score(1, 6, op->bm25_calc_params_);
+  ASSERT_EQ(0.32258064516129037, expected);
+  ASSERT_LT(first_expected, expected);
+  uint64_t min_id = 0;
+  uint64_t max_id = 0;
+  double block_max = 0;
+  OK(iter->get_block_max_tuple(min_id, max_id, block_max));
+  EXPECT_EQ(0, MEMCMP(&first_expected, &block_max, sizeof(block_max)));
+
+  // A larger score in a later block forces the range visitor to evaluate its frontier.
+  const int64_t saved_meta_idx = iter->scanner_.meta_row_scanner_.cur_idx_;
+  double range_max = 0;
+  bool can_calc = false;
+  OK(iter->get_range_max_score(OP_START, true, expect_doc(OP_START, DOC_COUNT - 1),
+      range_max, can_calc));
+  ASSERT_TRUE(can_calc);
+  EXPECT_EQ(0, MEMCMP(&expected, &range_max, sizeof(range_max)));
+  EXPECT_EQ(saved_meta_idx, iter->scanner_.meta_row_scanner_.cur_idx_);
+
+  ObDASRowID target;
+  target.set_uint64(expect_doc(OP_START, DEFAULT_POSTING_BLOCK_CAPACITY));
+  ObDASRowID current_id;
+  OK(op->do_advance_to_id(target, current_id));
+  ASSERT_EQ(target.get_uint64(), current_id.get_uint64());
+  for (const common::ObTargetArch arch : {common::ObTargetArch::Default,
+      common::ObTargetArch::AVX512, common::ObTargetArch::NEON}) {
+    SCOPED_TRACE(arch);
+    sql::BM25ScoreKernels score_kernels;
+    const int ret = sql::get_bm25_score_kernels_for_arch(arch, score_kernels);
+    if (OB_NOT_SUPPORTED == ret) {
+      continue;
+    }
+    ASSERT_EQ(OB_SUCCESS, ret);
+    op->bm25_score_kernels_ = score_kernels;
+    OK(sql::get_bm25_frontier_max_kernels_for_arch(arch, iter->bm25_frontier_kernels_));
+    iter->invalidate_current_block_max_score();
+    double score = 0;
+    OK(op->fetch_curr_on_demand(current_id, score));
+    EXPECT_EQ(0, MEMCMP(&expected, &score, sizeof(score)));
+    OK(op->fetch_curr(current_id, score));
+    EXPECT_EQ(0, MEMCMP(&expected, &score, sizeof(score)));
+    OK(op->do_load_curr_score(score));
+    EXPECT_EQ(0, MEMCMP(&expected, &score, sizeof(score)));
+    OK(iter->get_block_max_tuple(min_id, max_id, block_max));
+    EXPECT_EQ(0, MEMCMP(&expected, &block_max, sizeof(block_max)));
+    double per_arch_range_max = 0;
+    OK(iter->get_range_max_score(target.get_uint64(), true, expect_doc(OP_START, DOC_COUNT - 1),
+        per_arch_range_max, can_calc));
+    ASSERT_TRUE(can_calc);
+    EXPECT_EQ(0, MEMCMP(&expected, &per_arch_range_max, sizeof(per_arch_range_max)));
+  }
+
+  ObPostingDocIdView ids;
+  ObPostingRelevanceView relevance;
+  int64_t count = 0;
+  bool finished = false;
+  OK(iter->drain_until_typed_run(UINT64_MAX, 9, ids, relevance, count, finished, true));
+  ASSERT_EQ(9, count);
+  sql::BM25ScoreKernels scalar;
+  OK(sql::get_bm25_score_kernels_for_arch(common::ObTargetArch::Default, scalar));
+  for (const sql::BM25ScoreKernels kernels : {scalar, sql::get_bm25_score_kernels()}) {
+    double scores[9] = {};
+    kernels.score(relevance, count, op->bm25_calc_params_, scores);
+    for (int64_t i = 0; i < count; ++i) {
+      EXPECT_EQ(0, MEMCMP(&expected, scores + i, sizeof(expected)));
+      EXPECT_LE(scores[i], block_max);
+      EXPECT_LE(scores[i], range_max);
+    }
+  }
+  OK(op->close());
+  EXPECT_FALSE(op->bm25_score_kernels_.is_valid());
+  EXPECT_FALSE(op->bm25_expansion_kernels_.is_valid());
+  EXPECT_FALSE(op->bm25_existing_kernels_.is_valid());
+}
+
 // init_precomputed_params fills the constants exactly once; rejects illegal inputs;
 // reset and repeated init behave correctly; scalar kernel handles boundary inputs.
 TEST_F(TestDASAsyncTokenOp, bm25_precompute_params_unit)
@@ -2513,17 +3700,17 @@ TEST_F(TestDASAsyncTokenOp, bm25_precompute_params_unit)
   ASSERT_DOUBLE_EQ(1.2 * 0.75 / 40.0, p.doc_len_scale_);
 
   // Boundary scoring: tf=0 -> exactly 0; tf/dl extremes stay finite and non-negative.
-  ASSERT_DOUBLE_EQ(0.0, ObExprBM25::eval_with_precomputed_params(0, 100, p));
-  ASSERT_DOUBLE_EQ(0.0, ObExprBM25::eval_with_precomputed_params(0, 0, p));
-  const double s_dl0 = ObExprBM25::eval_with_precomputed_params(3, 0, p);
+  ASSERT_DOUBLE_EQ(0.0, scalar_bm25_score(0, 100, p));
+  ASSERT_DOUBLE_EQ(0.0, scalar_bm25_score(0, 0, p));
+  const double s_dl0 = scalar_bm25_score(3, 0, p);
   ASSERT_GE(s_dl0, 0.0);
   ASSERT_TRUE(std::isfinite(s_dl0));
-  const double s_big = ObExprBM25::eval_with_precomputed_params(1000000, 1, p);
+  const double s_big = scalar_bm25_score(1000000, 1, p);
   ASSERT_GE(s_big, 0.0);
   ASSERT_TRUE(std::isfinite(s_big));
   // tf == avg boundary and dl far above avg both finite.
-  ASSERT_TRUE(std::isfinite(ObExprBM25::eval_with_precomputed_params(40, 40, p)));
-  ASSERT_TRUE(std::isfinite(ObExprBM25::eval_with_precomputed_params(1, 1000000, p)));
+  ASSERT_TRUE(std::isfinite(scalar_bm25_score(40, 40, p)));
+  ASSERT_TRUE(std::isfinite(scalar_bm25_score(1, 1000000, p)));
 }
 
 // Fixed-seed differential test: the fast single-division kernel matches the canonical
@@ -2558,7 +3745,7 @@ TEST_F(TestDASAsyncTokenOp, bm25_random_differential)
     ObBM25PrecomputedParams p;
     ASSERT_EQ(OB_SUCCESS, ObExprBM25::init_precomputed_params(
         ObExprBM25::query_token_weight(df, total), avg, boost, p));
-    const double fast = ObExprBM25::eval_with_precomputed_params(tf, dl, p);
+    const double fast = scalar_bm25_score(tf, dl, p);
     const double canonical = ObExprBM25::eval(
         static_cast<int64_t>(tf), static_cast<int64_t>(dl), df, total, avg) * boost;
 
@@ -2574,6 +3761,7 @@ TEST_F(TestDASAsyncTokenOp, bm25_random_differential)
   }
 
   // Part 2: scalar vs batch, bit-for-bit (shared params per batch).
+  const sql::BM25ScoreKernels score_kernels = sql::get_bm25_score_kernels();
   for (int64_t round = 0; round < 500; ++round) {
     const int64_t total = total_dist(rng);
     std::uniform_int_distribution<int64_t> df_dist(0, total);
@@ -2592,9 +3780,9 @@ TEST_F(TestDASAsyncTokenOp, bm25_random_differential)
       dlv[i] = dl_dist(rng);
     }
     std::vector<double> bscores(cnt, -1.0);
-    ObExprBM25::eval_batch_with_precomputed_params(tfv.data(), dlv.data(), cnt, p, bscores.data());
+    score_kernels.score(tfv.data(), dlv.data(), cnt, p, bscores.data());
     for (int64_t i = 0; i < cnt; ++i) {
-      const double scalar = ObExprBM25::eval_with_precomputed_params(tfv[i], dlv[i], p);
+      const double scalar = scalar_bm25_score(tfv[i], dlv[i], p);
       ASSERT_EQ(scalar, bscores[i])  // exact bit equality required
           << "scalar/batch mismatch round=" << round << " i=" << i;
     }
@@ -2700,6 +3888,10 @@ TEST_F(TestDASAsyncTokenOp, bm25_params_reinit_on_rescan_segment)
   const common::ObNewVersionRange &range = ctx.binding_.get_version_range();
   OK(op->rescan_segment(range));
   ASSERT_TRUE(op->bm25_calc_params_.is_inited_);
+  ASSERT_TRUE(op->bm25_score_kernels_.is_valid());
+  ASSERT_TRUE(op->bm25_expansion_kernels_.is_valid());
+  ASSERT_TRUE(op->bm25_existing_kernels_.is_valid());
+  ASSERT_TRUE(op->posting_iter_->bm25_frontier_kernels_.is_valid());
   const int64_t df = op->posting_scan_param_.doc_freq_;
   const int64_t total = op->posting_scan_param_.total_doc_cnt_;
   const double avg = op->posting_scan_param_.avg_doc_length_;
@@ -2713,9 +3905,17 @@ TEST_F(TestDASAsyncTokenOp, bm25_params_reinit_on_rescan_segment)
   // Corrupt the cached constants to emulate stale per-segment state.
   op->bm25_calc_params_.doc_len_scale_ = 999999.0;
   op->bm25_calc_params_.query_weight_ = -1.0;
+  op->bm25_score_kernels_ = {};
+  op->bm25_expansion_kernels_ = {};
+  op->bm25_existing_kernels_ = {};
+  op->posting_iter_->bm25_frontier_kernels_ = {};
 
   OK(op->rescan_segment(range));
   ASSERT_TRUE(op->bm25_calc_params_.is_inited_);
+  ASSERT_TRUE(op->bm25_score_kernels_.is_valid());
+  ASSERT_TRUE(op->bm25_expansion_kernels_.is_valid());
+  ASSERT_TRUE(op->bm25_existing_kernels_.is_valid());
+  ASSERT_TRUE(op->posting_iter_->bm25_frontier_kernels_.is_valid());
   const double avg2 = op->posting_scan_param_.avg_doc_length_;
 
   ObDASRowID rid2;
@@ -2728,11 +3928,231 @@ TEST_F(TestDASAsyncTokenOp, bm25_params_reinit_on_rescan_segment)
   OK(op->close());
 }
 
+// A physical micro may host several terms whose DocIDs restart. Draining must
+// stop at the current term even when the caller has room for more rows.
+TEST_F(TestDASAsyncTokenOp, typed_drain_same_physical_micro_keeps_term_isolation)
+{
+  const int64_t rows_per_term = 700;
+  const uint64_t starts[] = {100001, 1, 50001};
+  std::vector<RealBMMPostingRow> rows;
+  for (int64_t term = 1; term <= 3; ++term) {
+    for (int64_t i = 0; i < rows_per_term; ++i) {
+      rows.push_back(RealBMMPostingRow(term, starts[term - 1] + 2 * i,
+          1 + i % 7, 50 + i % 13));
+    }
+  }
+  ObInvSSTable sstable;
+  build_multi_term_sstable(rows, sstable);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  char term_buf[32] = {0};
+  format_term(2, term_buf, sizeof(term_buf));
+  const common::ObString query_token(static_cast<int32_t>(strlen(term_buf)), term_buf);
+  ObArenaAllocator ctx_alloc("MicroDrain");
+  AsyncTokCtx ctx(ctx_alloc);
+  sql::ObDASIRScanCtDef ctdef(ctx_alloc);
+  sql::ObDASIRScanRtDef rtdef;
+  sql::ObDASAsyncTokenOp *op = nullptr;
+  create_and_inject_single(ctx, ctdef, rtdef, query_token, 1.7,
+      10000, rows_per_term, read_info, sstable, op);
+  OK(op->open());
+  ASSERT_NE(nullptr, op->posting_iter_);
+  OK(op->posting_iter_->load_current_block());
+  int64_t first_block_idx = -1;
+  int64_t last_block_idx = -1;
+  OK(op->posting_iter_->scanner_.meta_row_scanner_.get_block_idx_range(
+      first_block_idx, last_block_idx));
+  const int64_t physical_blocks = op->posting_iter_->posting_micro_reader_.get_block_count();
+  blocksstable::ObPostingBlockData first_block;
+  OK(op->posting_iter_->posting_micro_reader_.get_posting_block_data(0, first_block));
+  ASSERT_EQ(3, last_block_idx - first_block_idx + 1);
+  ASSERT_GT(first_block_idx, 0);
+  ASSERT_GT(physical_blocks, last_block_idx + 1);
+  ASSERT_GT(first_block.doc_id_at(0), op->posting_iter_->curr_meta_.min_id_);
+
+  ObDASRowID boundary;
+  boundary.set_uint64(UINT64_MAX);
+  ObDASRowID next_id;
+  double next_score = 0;
+  uint64_t ids[1024];
+  double scores[1024];
+  common::ObOpProfile<common::ObMetric> profile(common::ObProfileId::PHY_TABLE_SCAN, &ctx_alloc);
+  op->profile_ = &profile;
+  int64_t n = 0;
+  int64_t total = 0;
+  for (int call = 0; call < 2; ++call) {
+    OK(op->drain_until(boundary, 400, ids + total, scores + total, n, next_id, next_score));
+    ASSERT_EQ(0 == call ? 400 : 300, n);
+    total += n;
+    ASSERT_EQ(1 == call, op->posting_iter_->is_end());
+  }
+  ASSERT_EQ(rows_per_term, total);
+  ASSERT_TRUE(next_id.is_max());
+  for (int64_t i = 0; i < total; ++i) {
+    ASSERT_EQ(1u + 2 * i, ids[i]);
+    const double expected = fast_ref_score(1 + i % 7, 50 + i % 13,
+        op->posting_scan_param_.doc_freq_, op->posting_scan_param_.total_doc_cnt_,
+        op->posting_scan_param_.avg_doc_length_, 1.7);
+    ASSERT_EQ(0, MEMCMP(&expected, scores + i, sizeof(double)));
+  }
+  op->profile_ = nullptr; // the test owns this stack profile
+  OK(op->close());
+
+  // Full-capacity returns, a boundary at a logical block's first row, and scalar
+  // prefix interleaving must keep the public next_rowid lookahead contract.
+  for (const int64_t capacity : {257, 1024}) {
+    for (const uint64_t last : {uint64_t(513), UINT64_MAX}) {
+      std::vector<uint64_t> expected_ids, actual_ids;
+      std::vector<double> expected_scores, actual_scores;
+      bool expected_end = false, actual_end = false;
+      uint64_t expected_next = 0, actual_next = 0;
+      double expected_next_score = 0, actual_next_score = 0;
+      run_oracle(sstable, read_info, query_token, 1.7, 10000, rows_per_term,
+          last, 201, sql::ObExprBM25::DEFAULT_AVG_DOC_TOKEN_CNT,
+          expected_ids, expected_scores, expected_end, expected_next, expected_next_score);
+      run_drain(sstable, read_info, query_token, 1.7, 10000, rows_per_term,
+          capacity, last, true, 201, sql::ObExprBM25::DEFAULT_AVG_DOC_TOKEN_CNT,
+          actual_ids, actual_scores, actual_end, actual_next, actual_next_score);
+      ASSERT_EQ(expected_ids, actual_ids);
+      ASSERT_EQ(expected_scores.size(), actual_scores.size());
+      ASSERT_EQ(0, MEMCMP(expected_scores.data(), actual_scores.data(),
+          expected_scores.size() * sizeof(double)));
+      ASSERT_EQ(expected_end, actual_end);
+      if (!expected_end) {
+        ASSERT_EQ(expected_next, actual_next);
+        ASSERT_EQ(0, MEMCMP(&expected_next_score, &actual_next_score, sizeof(double)));
+      }
+    }
+  }
+}
+
+// Keep the real merge-head protocol for E and the existing-only dense NE path.
+// Both consume positive-count terminal runs without dropping/doubling the next
+// window's first posting. One context creates only one token parameter-cache entry.
+TEST_F(TestDASAsyncTokenOp, typed_run_finished_accumulated_and_active_windows)
+{
+  constexpr int64_t DOC_COUNT = 1536;
+  common::ObArray<uint64_t> tfs;
+  common::ObArray<uint64_t> dls;
+  for (int64_t i = 0; i < DOC_COUNT; ++i) {
+    OK(tfs.push_back(1 + i % 7));
+    OK(dls.push_back(50 + i % 13));
+  }
+  ObInvSSTable sstable;
+  build_single_term_sstable_per_doc(OP_START, DOC_COUNT, OP_TERM_SEQ,
+      tfs, dls, sstable, 1024);
+  ObTableReadInfo read_info;
+  build_rowkey_read_info(table_schema_, allocator_, read_info);
+  char term_buf[32] = {};
+  format_term(OP_TERM_SEQ, term_buf, sizeof(term_buf));
+  const ObString token(static_cast<int32_t>(strlen(term_buf)), term_buf);
+  for (const bool active : {false, true}) {
+    SCOPED_TRACE(::testing::Message() << "active=" << active);
+    ObArenaAllocator alloc("FinishedRun");
+    AsyncTokCtx ctx(alloc);
+    sql::ObDASIRScanCtDef ctdef(alloc);
+    sql::ObDASIRScanRtDef rtdef;
+    sql::ObDASAsyncTokenOp *op = nullptr;
+    create_and_inject_single(ctx, ctdef, rtdef, token, 1.7,
+        DOC_COUNT, DOC_COUNT, read_info, sstable, op, 250.0);
+    OK(op->open());
+    // Without terminal status, draining this boundary needs a final empty batch.
+    int64_t reference_rows = 0;
+    int64_t reference_calls = 0;
+    while (true) {
+      ++reference_calls;
+      ObPostingDocIdView ids;
+      ObPostingRelevanceView relevance;
+      int64_t count = 0;
+      OK(op->posting_iter_->drain_until_typed(expect_doc(OP_START, 600),
+          1024, ids, relevance, count));
+      if (0 == count) { break; }
+      for (int64_t i = 0; i < count; ++i) {
+        ASSERT_EQ(expect_doc(OP_START, reference_rows + i), ids.at(i));
+      }
+      reference_rows += count;
+    }
+    ASSERT_EQ(601, reference_rows);
+    ASSERT_EQ(4, reference_calls);
+    const ObDatum *reference_id = nullptr;
+    OK(op->posting_iter_->get_cur_id(reference_id));
+    ASSERT_EQ(expect_doc(OP_START, 601), reference_id->get_uint64());
+    OK(op->rescan());
+
+    sql::DocScoreAccumulator accumulator;
+    OK(accumulator.init(2 * DOC_COUNT, alloc));
+    double seed = 0.125;
+    uint64_t max_id = 0;
+    OK(accumulator.reuse_with_start_id(OP_START, max_id));
+    const int64_t candidate_stride = 3;
+    if (active) {
+      for (int64_t i = 0; i < DOC_COUNT; i += candidate_stride) {
+        OK(accumulator.add_dim(expect_doc(OP_START, i), seed));
+      }
+    }
+    sql::ObDAATMergeIter merge;
+    OK(merge.init(0, *op));
+    if (!active) { OK(merge.next()); }
+    const int64_t ends[] = {600, 1200, DOC_COUNT - 1};
+    for (int64_t window = 0; window < ARRAYSIZEOF(ends); ++window) {
+      const int64_t last = ends[window];
+      ObDASRowID boundary;
+      boundary.set_uint64(window == 2 ? max_id : expect_doc(OP_START, last));
+      if (active) {
+        int64_t count = 0;
+        const int64_t first = 0 == window ? 0 : ends[window - 1] + 1;
+        OK(op->do_drain_until_active(
+            expect_doc(OP_START, first), boundary.get_uint64(), accumulator, count));
+        int64_t expected_count = 0;
+        for (int64_t i = first; i <= last; ++i) { expected_count += i % candidate_stride == 0; }
+        ASSERT_EQ(expected_count, count);
+      } else {
+        OK(merge.drain_until(boundary, accumulator));
+      }
+      for (int64_t i = 0; i < DOC_COUNT; ++i) {
+        double actual = 0;
+        OK(accumulator.get_score(expect_doc(OP_START, i), actual));
+        const bool present = !active || i % candidate_stride == 0;
+        double expected = active && present ? seed : 0.0;
+        if (present && i <= last) {
+          expected += reference_bm25_score(tfs.at(i), dls.at(i), op->bm25_calc_params_);
+        }
+        ASSERT_EQ(0, MEMCMP(&expected, &actual, sizeof(actual))) << i;
+      }
+      // A row-only lookahead must leave the current block bound unevaluated.
+      ASSERT_FALSE(op->posting_iter_->curr_block_max_score_valid_);
+      if (window < 2) {
+        ASSERT_FALSE(op->posting_iter_->is_end());
+        const ObDatum *id = nullptr;
+        OK(op->posting_iter_->get_cur_id(id));
+        ASSERT_EQ(expect_doc(OP_START, last + 1), id->get_uint64());
+        if (!active) {
+          ObDASRowID merged_id;
+          double merged_score = 0;
+          OK(merge.get_curr_id(merged_id));
+          OK(merge.get_curr_score(merged_score));
+          ASSERT_EQ(expect_doc(OP_START, last + 1), merged_id.get_uint64());
+          const double expected = reference_bm25_score(tfs.at(last + 1), dls.at(last + 1), op->bm25_calc_params_);
+          ASSERT_EQ(0, MEMCMP(&expected, &merged_score, sizeof(expected)));
+        }
+      } else {
+        ASSERT_TRUE(op->posting_iter_->is_end());
+        if (!active) { ASSERT_TRUE(merge.iter_end()); }
+        // The physical tail is deliberately unknown; true EOF still uses the
+        // old terminal empty run and never releases a pin before scoring it.
+      }
+    }
+    OK(op->close());
+  }
+
+}
+
 } // namespace unittest
 } // namespace oceanbase
 
 int main(int argc, char **argv)
 {
+  oceanbase::common::init_arches();
   system("rm -f test_das_async_token_op.log*");
   OB_LOGGER.set_file_name("test_das_async_token_op.log", true, true);
   OB_LOGGER.set_log_level("INFO");

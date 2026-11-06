@@ -55,14 +55,16 @@ public:
   int next_block(bool &block_changed);
   // Meta of the posting block at the current cursor. Valid until the next next_block()/advance_to().
   int get_cur_block_meta(ObPostingBlockMeta &posting_meta);
-  // Visit block metadata in order from the current scanner cursor without advancing it.
-  // The visitor may set stop to terminate early. Block meta and frontier data borrow the pinned
-  // aggregate buffer and must not be retained. range_covered is true only when valid row coverage
-  // and strictly ordered block metadata reach end_id or the end of the term.
-  int visit_prefetched_block_meta(
-      const uint64_t end_id,
-      const common::ObFunction<int(const ObPostingBlockMeta &, bool &)> &visitor,
-      bool &range_covered);
+  // Read-only O(1) identity check. OB_SUCCESS with reusable=false requires normal
+  // range parsing; errors reject the range without scoring or moving cursors.
+  int check_cached_range_meta(const ObPostingBlockMeta &cached,
+      const uint64_t first_id, const uint64_t end_id, bool &reusable) const;
+  // Batch the range frontier into one callback per pinned metadata row.
+  // Does not advance the cursor; each row's intersecting slices must be contiguous.
+  int visit_prefetched_frontier_spans(
+      const uint64_t first_id, const uint64_t end_id,
+      const common::ObFunction<int(const ObPostingFrontierSpan &)> &visitor,
+      bool &range_covered, bool &score_available);
   // Get current posting micro block for read. Calling
   // this marks read demand and turns on adaptive prefetch of subsequent data blocks.
   int get_cur_micro_block(ObMicroBlockData &data_block);
@@ -148,21 +150,6 @@ private:
   bool validate_leaf_pin_ref(const DataPrefetchItem &item) const;
   // Reopen the single meta_row_scanner_ on the current read item's agg buffer.
   int open_cur_read_item_meta();
-  // Visit the complete prefetched window, validate block ordering and range coverage,
-  // and invoke the business visitor.
-  int visit_prefetched_meta_rows(
-      const uint64_t end_id,
-      const int64_t prefetched_row_count,
-      const common::ObFunction<int(const ObPostingBlockMeta &, bool &)> &visitor,
-      bool &range_covered) const;
-  // Visit one pinned metadata row and validate aggregate metadata coverage at row end.
-  template <typename Visitor>
-  int visit_prefetched_meta_row(
-      const int64_t row_offset,
-      const int64_t start_block_idx,
-      ObPostingMetaRowScanner &meta_scanner,
-      Visitor &visitor,
-      bool &stop) const;
   // Borrow one pinned metadata row without moving scanner cursors or issuing data IO.
   int get_prefetched_meta_row(
       const int64_t row_offset,

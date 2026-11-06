@@ -31,6 +31,7 @@ approx_count_distinct_precision
 arbitration_degradation_policy
 arbitration_timeout
 archive_lag_target
+async_inverted_index_iter_cache_max_size
 async_ps_cursor_max_count
 audit_log_buffer_size
 audit_log_compression

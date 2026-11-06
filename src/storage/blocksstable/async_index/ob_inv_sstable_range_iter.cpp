@@ -193,7 +193,7 @@ void ObInvSSTableRangeIter::reset()
   prefetched_last_block_idx_ = -1;
   posting_block_data_.reset();
   posting_value_block_reader_.reuse();
-  posting_micro_reader_.reuse();
+  posting_micro_reader_.reset();
   posting_value_micro_reader_.reuse();
   curr_posting_micro_block_.reset();
   curr_value_micro_block_.reset();
@@ -782,7 +782,7 @@ int ObInvSSTableRangeIter::open_posting_micro_reader(
   if (OB_UNLIKELY(!curr_posting_micro_block_.is_valid())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid posting data micro block", K(ret), K_(curr_posting_micro_block));
-  } else if (OB_FAIL(posting_micro_reader_.init_flat_cache(
+  } else if (OB_FAIL(posting_micro_reader_.init(
       curr_posting_micro_block_.get_buf(), curr_posting_micro_block_.get_buf_size()))) {
     LOG_WARN("failed to init posting micro block reader", K(ret), K_(curr_posting_micro_block));
   } else {
@@ -1025,7 +1025,7 @@ void ObInvSSTableRangeIter::reset_prepared_doc_id_batch()
   prepared_doc_count_ = 0;
   next_doc_offset_ = 0;
   posting_block_data_.reset();
-  posting_micro_reader_.reuse();
+  posting_micro_reader_.reset();
   curr_posting_micro_block_.reset();
   posting_data_handle_.reset();
   curr_posting_micro_locator_.reset();

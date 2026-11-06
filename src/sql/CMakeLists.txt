@@ -155,6 +155,8 @@ ob_set_subtarget(ob_sql das
   das/search/ob_das_query_string_query.cpp
   das/search/ob_daat_merge_iter.cpp
   das/search/ob_das_doc_score_accumulator.cpp
+  das/search/ob_das_doc_score_accumulator_fused.cpp
+  das/search/ob_das_bm25_batch_kernel.cpp
   das/search/ob_das_sparse_candidate_buffer.cpp
   das/search/ob_disjunctive_daat_merger.cpp
   das/search/ob_das_bmw_op.cpp

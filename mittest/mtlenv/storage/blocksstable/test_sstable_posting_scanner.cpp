@@ -152,8 +152,8 @@ TEST_F(TestInvIdxSSTablePrepare, scan_single_term_data_block)
     ASSERT_TRUE(data_block.is_valid());
 
     // Locate the posting block addressed by the meta's locator in FlatCache.
-    ObInvIdxMicroBlockReader payload_reader;
-    OK(payload_reader.init_flat_cache(data_block.get_buf(), data_block.get_buf_size()));
+    ObFlatCacheReader payload_reader;
+    OK(payload_reader.init(data_block.get_buf(), data_block.get_buf_size()));
     ObPostingBlockData block_data;
     OK(payload_reader.get_posting_block_data(meta.locator_.block_idx_, block_data));
     ASSERT_TRUE(block_data.is_valid());
@@ -314,8 +314,8 @@ TEST_F(TestInvIdxSSTablePrepare, scan_single_term_data_block_raw_io_only)
   const auto &item = scanner.cur_data_item();
   ASSERT_EQ(storage::ObSSTableMicroBlockState::IN_BLOCK_IO, item.data_handle_.block_state_);
 
-  ObInvIdxMicroBlockReader payload_reader;
-  OK(payload_reader.init_flat_cache(data_block.get_buf(), data_block.get_buf_size()));
+  ObFlatCacheReader payload_reader;
+  OK(payload_reader.init(data_block.get_buf(), data_block.get_buf_size()));
   ObPostingBlockData block_data;
   OK(payload_reader.get_posting_block_data(meta.locator_.block_idx_, block_data));
   ASSERT_TRUE(block_data.is_valid());
@@ -363,8 +363,8 @@ TEST_F(TestInvIdxSSTablePrepare, scan_single_term_data_block_cache_hit)
     const auto &item = scanner.cur_data_item();
     ASSERT_EQ(storage::ObSSTableMicroBlockState::IN_BLOCK_CACHE, item.data_handle_.block_state_);
 
-    ObInvIdxMicroBlockReader payload_reader;
-    OK(payload_reader.init_flat_cache(data_block.get_buf(), data_block.get_buf_size()));
+    ObFlatCacheReader payload_reader;
+    OK(payload_reader.init(data_block.get_buf(), data_block.get_buf_size()));
     ObPostingBlockData block_data;
     OK(payload_reader.get_posting_block_data(meta.locator_.block_idx_, block_data));
     ASSERT_TRUE(block_data.is_valid());
@@ -719,8 +719,8 @@ TEST_F(TestInvIdxSSTablePrepare, get_cur_micro_block_cold_read_after_open)
   }
 
   // Decode the first posting block and cross-check against the reported meta.
-  ObInvIdxMicroBlockReader payload_reader;
-  OK(payload_reader.init_flat_cache(data_block.get_buf(), data_block.get_buf_size()));
+  ObFlatCacheReader payload_reader;
+  OK(payload_reader.init(data_block.get_buf(), data_block.get_buf_size()));
   ObPostingBlockData block_data;
   OK(payload_reader.get_posting_block_data(meta.locator_.block_idx_, block_data));
   ASSERT_TRUE(block_data.is_valid());

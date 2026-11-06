@@ -41,6 +41,7 @@ public:
   explicit ObDASAsyncSegmentGroupMergeOp(ObDASSearchCtx &search_ctx)
     : ObIDASSearchOp(search_ctx),
       child_opened_(),
+      child_prepared_(),
       active_group_cnt_(0),
       current_group_idx_(0),
       threshold_cached_(false),
@@ -77,10 +78,12 @@ private:
   int do_calc_max_score(double &threshold) override;
 
   int load_current_partition_groups();
-  int reset_children_for_partition(const bool open_children);
+  int reset_children_for_partition();
+  int ensure_child_ready(const int64_t group_idx);
 
 private:
-  common::ObSEArray<bool, 4> child_opened_;
+  common::ObSEArray<bool, 4> child_opened_; // Opened at least once during this plan's lifetime.
+  common::ObSEArray<bool, 4> child_prepared_; // Prepared by open/rescan and threshold setup for the current partition scan.
   int64_t active_group_cnt_;
   int64_t current_group_idx_;
   bool threshold_cached_;

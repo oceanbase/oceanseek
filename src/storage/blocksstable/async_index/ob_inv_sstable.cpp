@@ -94,6 +94,12 @@ int ObInvSSTable::scan_posting(
   if (OB_UNLIKELY(!param.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid posting scan param", K(ret), K(param));
+  } else if (OB_NOT_NULL(param.reusable_iter_)) {
+    if (OB_FAIL(param.reusable_iter_->open(param, rowkey_read_info, *this))) {
+      LOG_WARN("failed to open caller-owned posting iterator", K(ret));
+    } else {
+      iter = param.reusable_iter_;
+    }
   } else if (OB_ISNULL(buf = param.allocator_->alloc(sizeof(ObInvSSTablePostingIter)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to allocate posting iterator", K(ret));

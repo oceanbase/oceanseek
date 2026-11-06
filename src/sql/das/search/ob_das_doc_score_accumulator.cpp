@@ -240,6 +240,47 @@ int DocScoreAccumulator::get_score(const uint64_t doc_id, double &score) const
   return ret;
 }
 
+bool DocScoreAccumulator::get_active_range(
+    const uint64_t range_start, const uint64_t boundary,
+    uint64_t &first_id, uint64_t &last_id) const
+{
+  OB_ASSERT(is_valid());
+  bool found = false;
+  const uint64_t lower = MAX(range_start, start_id_);
+  if (!is_empty_ && boundary >= lower
+      && lower - start_id_ < static_cast<uint64_t>(capacity_)) {
+    // Subtract before adding to avoid overflow for windows near UINT64_MAX.
+    const int64_t last_offset = static_cast<int64_t>(
+        MIN(boundary - start_id_, static_cast<uint64_t>(capacity_ - 1)));
+    const int64_t last_word = das_bitset_helper::word_index(last_offset);
+    const uint64_t *words = get_bitset_words();
+    const uint64_t tail_word = words[last_word] & das_bitset_helper::low_bits_mask(
+        das_bitset_helper::bit_index(last_offset) + 1);
+    const int64_t first_offset = static_cast<int64_t>(lower - start_id_);
+    int64_t first_word = das_bitset_helper::word_index(first_offset);
+    uint64_t word = das_bitset_helper::clear_bits_below(
+        first_word == last_word ? tail_word : words[first_word],
+        das_bitset_helper::bit_index(first_offset));
+    while (0 == word && first_word < last_word) {
+      ++first_word;
+      word = first_word == last_word ? tail_word : words[first_word];
+    }
+    if (0 != word) {
+      first_id = start_id_ + first_word * das_bitset_helper::WORD_BITS
+          + das_bitset_helper::lowest_set_bit(word);
+      int64_t end_word = last_word;
+      word = tail_word;
+      while (0 == word && end_word > first_word) {
+        word = words[--end_word];
+      }
+      last_id = start_id_ + (end_word * das_bitset_helper::WORD_BITS
+          + das_bitset_helper::WORD_BITS - 1 - __builtin_clzll(word));
+      found = true;
+    }
+  }
+  return found;
+}
+
 int DocScoreAccumulator::filter_below_score(const double min_required_score)
 {
   int ret = OB_SUCCESS;
@@ -276,6 +317,65 @@ int DocScoreAccumulator::filter_below_score(const double min_required_score)
       bitset_words[word_idx] = kept_word;
     }
     is_empty_ = (max_score_ == 0.0);
+  }
+  return ret;
+}
+
+int DocScoreAccumulator::collect_active_doc_ids(
+    uint64_t *doc_ids, const int64_t doc_id_capacity, int64_t &count) const
+{
+  int ret = OB_SUCCESS;
+  count = 0;
+  if (!is_valid() || nullptr == doc_ids || doc_id_capacity <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid active doc id buffer", K(ret), KP(doc_ids), K(doc_id_capacity), K_(is_inited));
+  } else {
+    const uint64_t *words = get_bitset_words();
+    for (int64_t w = 0; OB_SUCC(ret) && w < das_bitset_helper::word_count(capacity_); ++w) {
+      const int64_t base = w * das_bitset_helper::WORD_BITS;
+      // Ignore padding bits beyond the accumulator window in the last word.
+      uint64_t bits = das_bitset_helper::mask_window_tail(words[w], base, capacity_);
+      while (OB_SUCC(ret) && bits != 0) {
+        const int64_t offset = base + das_bitset_helper::lowest_set_bit(bits);
+        bits = das_bitset_helper::clear_lowest_set_bit(bits);
+        if (count >= doc_id_capacity) {
+          ret = OB_SIZE_OVERFLOW;
+          LOG_WARN("active doc ids exceed buffer capacity", K(ret), K(doc_id_capacity));
+        } else {
+          doc_ids[count++] = start_id_ + offset;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int DocScoreAccumulator::filter_scored_candidates(
+    uint64_t *doc_ids, int64_t &count, const double min_required_score)
+{
+  int ret = OB_SUCCESS;
+  if (!is_valid() || count < 0 || (count > 0 && nullptr == doc_ids)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid directly scored candidates", K(ret), KP(doc_ids), K(count), K_(is_inited));
+  } else {
+    int64_t kept = 0;
+    max_score_ = 0.0;
+    uint64_t *words = bitset_->reinterpret_data<uint64_t>();
+    const double *scores = scores_.get_data();
+    for (int64_t i = 0; i < count; ++i) {
+      const uint64_t doc_id = doc_ids[i];
+      const int64_t offset = static_cast<int64_t>(doc_id - start_id_);
+      if (scores[offset] > min_required_score) {
+        // Pack surviving IDs at the front without changing their order.
+        doc_ids[kept++] = doc_id;
+        max_score_ = MAX(max_score_, scores[offset]);
+      } else {
+        // Clear presence without modifying the stored score.
+        words[das_bitset_helper::word_index(offset)] &= ~das_bitset_helper::offset_mask(offset);
+      }
+    }
+    count = kept;
+    is_empty_ = (kept == 0);
   }
   return ret;
 }

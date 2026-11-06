@@ -3645,6 +3645,11 @@ DEF_BOOL(_enable_custom_dict_table, OB_TENANT_PARAMETER, "False",
 DEF_BOOL(_enable_async_index, OB_TENANT_PARAMETER, "False",
          "Controls whether asynchronous index is supported in the current tenant.",
          ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+DEF_CAP(async_inverted_index_iter_cache_max_size, OB_TENANT_PARAMETER, "64M", "[0B,1G]",
+        "Memory budget shared by all supported asynchronous inverted index iterator types in the tenant-wide cache, "
+        "including idle and leased entries but excluding operator-owned scan memory. "
+        "Zero disables caching; a positive value enables reuse across queries. Active scans may temporarily exceed the limit.",
+        ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_BOOL(_enable_async_index_refresh, OB_TENANT_PARAMETER, "True",
         "Controls whether asynchronous index refresh is enabled in the current tenant.",
         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));

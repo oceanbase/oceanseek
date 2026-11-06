@@ -183,7 +183,8 @@ void check_token_profile(const ObDASSearchOpType type, const bool enabled)
   ASSERT_EQ(OB_SUCCESS, accumulator.reuse_with_start_id(10, max_id));
   ASSERT_EQ(OB_SUCCESS, accumulator.add_dim(10, 100.0));
   boundary.set_uint64(10);
-  ASSERT_EQ(OB_SUCCESS, op.drain_until_active(boundary, accumulator));
+  ASSERT_EQ(OB_SUCCESS, op.drain_until_active(
+      accumulator.get_start_id(), boundary.get_uint64(), accumulator));
   expect_outputs(5);
   ASSERT_EQ(OB_SUCCESS, accumulator.get_score(10, score));
   EXPECT_DOUBLE_EQ(101.0, score);

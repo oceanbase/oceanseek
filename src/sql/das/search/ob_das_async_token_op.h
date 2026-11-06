@@ -7,9 +7,11 @@
 #define OCEANBASE_SQL_OB_DAS_ASYNC_TOKEN_OP_H_
 
 #include "sql/das/search/ob_i_das_search_op.h"
+#include "sql/das/search/ob_das_bm25_batch_kernel.h"
 #include "sql/das/ob_das_ir_define.h"
 #include "sql/engine/expr/ob_expr_bm25.h"
 #include "storage/access/ob_table_read_info.h"
+#include "storage/access/ob_async_inv_iterator_pool.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_posting_iter.h"
 #include "storage/retrieval/ob_inv_idx_param_estimator.h"
 
@@ -21,6 +23,7 @@ class ObAccessService;
 }
 namespace sql
 {
+class SparseCandidateBuffer;
 
 // Operator and parameters for single token retrieval on one async inverted index segment.
 struct ObDASAsyncTokenOpParam : public ObIDASSearchOpParam
@@ -58,8 +61,23 @@ public:
 class ObDASAsyncTokenOp : public ObIDASSearchOp
 {
 public:
+
   explicit ObDASAsyncTokenOp(ObDASSearchCtx &search_ctx);
   virtual ~ObDASAsyncTokenOp() {}
+
+  void close_posting_iter();
+  void release_scan_resources() override { close_posting_iter(); }
+
+  bool can_probe_sorted_ids() const
+  {
+    return is_scoring_ && DAS_ROWID_TYPE_UINT64 == get_rowid_type()
+        && nullptr != posting_iter_ && posting_iter_->can_probe_sorted_ids();
+  }
+  // Add one dimension to existing candidate partial sums in their original order.
+  // The caller handles its cached head before passing strictly greater IDs here.
+  int probe_sorted_ids(const uint64_t *ids, const int64_t count,
+      double *scores, bool *matched, ObDASRowID &last_id,
+      double &last_score, bool &score_materialized, bool &iter_end);
 
   // Consume next rows through the inclusive boundary into an unmasked accumulator.
   // The caller owns the current row. On success, next_id_after is the first row
@@ -69,6 +87,10 @@ public:
       DocScoreAccumulator &accumulator,
       ObDASRowID &next_id_after,
       double &next_score_after);
+  int advance_to_id_uint64(const uint64_t target, uint64_t &curr_id);
+  // Intersect posting runs with compact candidates before computing their scores.
+  int score_candidates(SparseCandidateBuffer &candidates,
+      ObDASRowID &next_id_after, double &next_score_after);
 
 private:
   int do_init(const ObIDASSearchOpParam &op_param) override;
@@ -78,6 +100,10 @@ private:
   int do_rescan_segment(const common::ObNewVersionRange &range) override;
   int do_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score) override;
   int do_advance_to_id(const ObDASRowID &target, ObDASRowID &curr_id) override;
+  int do_advance_to_id_uint64(const uint64_t target, uint64_t &curr_id);
+  int do_probe_sorted_ids(const uint64_t *ids, const int64_t count,
+      double *scores, bool *matched, ObDASRowID &last_id,
+      double &last_score, bool &score_materialized, bool &iter_end, int64_t &matched_count);
   int do_next_rowid(ObDASRowID &next_id, double &score) override;
   int do_load_curr_score(double &score) override;
   int do_advance_shallow(const ObDASRowID &target,
@@ -107,11 +133,18 @@ private:
                                int64_t &count,
                                ObDASRowID &next_id_after,
                                double &next_score_after);
-  int do_drain_until_active(const ObDASRowID &boundary,
+  int do_drain_until_active(const uint64_t range_start,
+                            const uint64_t range_end,
                             DocScoreAccumulator &accumulator,
                             int64_t &count) override;
+  int do_drain_into_candidates(SparseCandidateBuffer &candidates, int64_t &count,
+      ObDASRowID &next_id_after, double &next_score_after);
 
 private:
+  // Trim only the scoring prefix; the accumulator, drain cursor and finished state are unchanged.
+  int get_active_posting_prefix_count(const blocksstable::ObPostingDocIdView &doc_ids,
+                                     const int64_t posting_count,
+                                     const DocScoreAccumulator &accumulator, int64_t &scoring_count) const;
   int init_term_key(const common::ObString &query_token);
   int init_posting_scan_param();
   int init_inv_idx_scan_param();
@@ -123,7 +156,6 @@ private:
   // Open the single-segment posting iter via the access service's async_index_posting_scan.
   // Tests pre-inject tsc_service_ with a mock to avoid a real tablet.
   int open_posting_iter_from_tablet();
-  void close_posting_iter();
   int fetch_curr_id(ObDASRowID &curr_id);
   int fetch_curr(ObDASRowID &curr_id, double &score);
   int fetch_curr_on_demand(ObDASRowID &curr_id, double &score);
@@ -144,6 +176,7 @@ private:
   storage::ObAccessService *tsc_service_;
   common::ObQueryFlag query_flag_;
   blocksstable::ObInvSSTablePostingIter *posting_iter_;
+  blocksstable::ObInvPostingIterEntry *posting_entry_;
   blocksstable::ObInvPostingScanParam posting_scan_param_;
   blocksstable::ObStorageDatum *term_datums_;
   blocksstable::ObDatumRowkey term_key_;
@@ -153,6 +186,9 @@ private:
   double dim_max_score_;
   double token_boost_;
   ObBM25PrecomputedParams bm25_calc_params_;
+  BM25ScoreKernels bm25_score_kernels_;
+  BM25AccumulationKernels<false> bm25_expansion_kernels_;
+  BM25AccumulationKernels<true> bm25_existing_kernels_;
   int64_t estimated_work_row_count_;
   bool inv_idx_scan_param_inited_;
   bool is_inited_;

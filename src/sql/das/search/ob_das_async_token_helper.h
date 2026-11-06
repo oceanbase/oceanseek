@@ -10,6 +10,7 @@
 #include "sql/das/ob_das_ir_define.h"
 #include "sql/engine/expr/ob_expr_bm25.h"
 #include "storage/access/ob_table_read_info.h"
+#include "storage/access/ob_async_inv_iterator_pool.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_posting_iter.h"
 #include "storage/retrieval/ob_block_max_iter.h"
 #include "storage/retrieval/ob_inv_idx_param_estimator.h"
@@ -58,6 +59,7 @@ struct ObDASAsyncTokenHelperParam
 class ObDASAsyncTokenHelper final
 {
 public:
+
   explicit ObDASAsyncTokenHelper(ObDASSearchCtx &search_ctx);
   ~ObDASAsyncTokenHelper();
   TO_STRING_EMPTY();
@@ -118,6 +120,7 @@ private:
   storage::ObAccessService *tsc_service_;
   common::ObQueryFlag query_flag_;
   blocksstable::ObInvSSTablePostingIter *posting_iter_;
+  blocksstable::ObInvPostingIterEntry *posting_entry_;
   blocksstable::ObInvPostingScanParam posting_scan_param_;
   blocksstable::ObStorageDatum *term_datums_;
   blocksstable::ObDatumRowkey term_key_;

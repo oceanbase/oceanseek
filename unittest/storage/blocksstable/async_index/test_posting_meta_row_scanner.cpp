@@ -115,6 +115,198 @@ TEST_F(PostingMetaRowScannerTest, test_not_inited)
   ASSERT_EQ(OB_NOT_INIT, scanner.advance_to(1, beyond));
 }
 
+TEST_F(PostingMetaRowScannerTest, cached_meta_matches_row_local_cursor_and_fields)
+{
+  common::ObArenaAllocator allocator(common::ObModIds::TEST);
+  char *buf = nullptr;
+  int64_t size = 0;
+  build_agg(allocator, 4096, 2048, buf, size);
+  ObInvIdxAggDataEntry *entries = reinterpret_cast<ObInvIdxAggDataEntry *>(
+      buf + sizeof(ObInvIdxAggDataHeader));
+  for (int64_t i = 0; i < 3; ++i) {
+    entries[i].block_idx_ = static_cast<uint16_t>(10 + i);
+  }
+  ObPostingMetaRowScanner scanner;
+  ASSERT_EQ(OB_SUCCESS, scanner.init(true));
+  ASSERT_EQ(OB_SUCCESS, scanner.open(buf, size));
+  ObPostingBlockMeta cached;
+  ASSERT_EQ(OB_SUCCESS, scanner.get_cur_block_meta(cached));
+  EXPECT_EQ(0, cached.idx_);
+  EXPECT_EQ(10, cached.locator_.block_idx_);
+  bool matched = false;
+  ASSERT_EQ(OB_SUCCESS, scanner.match_cached_block_meta(buf, size, cached, 10, 50, matched));
+  EXPECT_TRUE(matched);
+  for (int field = 0; field < 10; ++field) {
+    ObPostingBlockMeta other = cached;
+    switch (field) {
+      case 0: ++other.idx_; break;
+      case 1: ++other.min_id_; break;
+      case 2: ++other.max_id_; break;
+      case 3: ++other.doc_count_; break;
+      case 4: ++other.locator_.block_idx_; break;
+      case 5: ++other.locator_.value_micro_offset_; break;
+      case 6: ++other.locator_.value_micro_size_; break;
+      case 7: ++other.block_max_.pair_count_; break;
+      case 8: ++other.block_max_.pairs_; break;
+      case 9: other.reset(); break;
+    }
+    matched = true;
+    ASSERT_EQ(OB_SUCCESS, scanner.match_cached_block_meta(buf, size, other, 10, 50, matched));
+    EXPECT_FALSE(matched) << field;
+    EXPECT_EQ(0, scanner.get_cur_block_idx());
+  }
+  ASSERT_EQ(OB_SUCCESS, scanner.next_block());
+  ASSERT_EQ(OB_SUCCESS, scanner.match_cached_block_meta(buf, size, cached, 110, 150, matched));
+  EXPECT_FALSE(matched);
+  ASSERT_EQ(OB_SUCCESS, scanner.get_cur_block_meta(cached));
+  ASSERT_EQ(OB_SUCCESS, scanner.match_cached_block_meta(buf, size, cached, 110, 150, matched));
+  EXPECT_TRUE(matched);
+  EXPECT_EQ(1, scanner.get_cur_block_idx());
+  EXPECT_EQ(11, cached.locator_.block_idx_);
+}
+
+TEST_F(PostingMetaRowScannerTest, cached_meta_clears_match_after_eof_reuse_and_rebind)
+{
+  common::ObArenaAllocator allocator(common::ObModIds::TEST);
+  char *buf = nullptr;
+  int64_t size = 0;
+  build_agg(allocator, 4096, 2048, buf, size);
+  ObPostingMetaRowScanner scanner;
+  ObPostingBlockMeta cached;
+  bool matched = true;
+  EXPECT_EQ(OB_NOT_INIT, scanner.match_cached_block_meta(buf, size, cached, 10, 50, matched));
+  EXPECT_FALSE(matched);
+  ASSERT_EQ(OB_SUCCESS, scanner.init(true));
+  matched = true;
+  EXPECT_EQ(OB_NOT_INIT, scanner.match_cached_block_meta(buf, size, cached, 10, 50, matched));
+  EXPECT_FALSE(matched);
+  ASSERT_EQ(OB_SUCCESS, scanner.open(buf, size));
+  ASSERT_EQ(OB_SUCCESS, scanner.get_cur_block_meta(cached));
+  char *other_buf = nullptr;
+  int64_t other_size = 0;
+  build_agg(allocator, 4096, 2048, other_buf, other_size);
+  matched = true;
+  ASSERT_EQ(OB_SUCCESS, scanner.match_cached_block_meta(other_buf, other_size, cached, 10, 50, matched));
+  EXPECT_FALSE(matched);
+  EXPECT_EQ(0, scanner.get_cur_block_idx());
+  ObInvIdxAggDataHeader *other_header = reinterpret_cast<ObInvIdxAggDataHeader *>(other_buf);
+  ++other_header->version_;
+  matched = true;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, scanner.match_cached_block_meta(other_buf, other_size, cached, 10, 50, matched));
+  EXPECT_FALSE(matched);
+  --other_header->version_;
+  ASSERT_EQ(OB_SUCCESS, scanner.open(other_buf, other_size));
+  ASSERT_EQ(OB_SUCCESS, scanner.match_cached_block_meta(other_buf, other_size, cached, 10, 50, matched));
+  EXPECT_FALSE(matched);
+  ASSERT_EQ(OB_SUCCESS, scanner.get_cur_block_meta(cached));
+  ASSERT_EQ(OB_SUCCESS, scanner.match_cached_block_meta(other_buf, other_size, cached, 10, 50, matched));
+  EXPECT_TRUE(matched);
+  bool beyond = false;
+  ASSERT_EQ(OB_SUCCESS, scanner.advance_to(UINT64_MAX, beyond));
+  EXPECT_TRUE(beyond);
+  matched = true;
+  EXPECT_EQ(OB_ITER_END, scanner.match_cached_block_meta(other_buf, other_size, cached, 10, 50, matched));
+  EXPECT_FALSE(matched);
+  scanner.reuse();
+  matched = true;
+  EXPECT_EQ(OB_NOT_INIT, scanner.match_cached_block_meta(other_buf, other_size, cached, 10, 50, matched));
+  EXPECT_FALSE(matched);
+  scanner.reset();
+  matched = true;
+  EXPECT_EQ(OB_NOT_INIT, scanner.match_cached_block_meta(other_buf, other_size, cached, 10, 50, matched));
+  EXPECT_FALSE(matched);
+}
+
+TEST_F(PostingMetaRowScannerTest, cached_meta_revalidates_layout_before_matching)
+{
+  common::ObArenaAllocator allocator(common::ObModIds::TEST);
+  char *buf = nullptr;
+  int64_t size = 0;
+  build_agg(allocator, 4096, 2048, buf, size);
+  ObPostingMetaRowScanner scanner;
+  ASSERT_EQ(OB_SUCCESS, scanner.init(true));
+  ASSERT_EQ(OB_SUCCESS, scanner.open(buf, size));
+  ObPostingBlockMeta cached;
+  ASSERT_EQ(OB_SUCCESS, scanner.get_cur_block_meta(cached));
+  bool matched = true;
+  EXPECT_EQ(OB_INVALID_ARGUMENT, scanner.match_cached_block_meta(nullptr, size, cached, 10, 50, matched));
+  EXPECT_FALSE(matched);
+  matched = true;
+  EXPECT_EQ(OB_INVALID_ARGUMENT, scanner.match_cached_block_meta(buf, 0, cached, 10, 50, matched));
+  EXPECT_FALSE(matched);
+  matched = true;
+  EXPECT_EQ(OB_INVALID_ARGUMENT, scanner.match_cached_block_meta(buf, size, cached, 51, 50, matched));
+  EXPECT_FALSE(matched);
+  ObInvIdxAggDataHeader *header = reinterpret_cast<ObInvIdxAggDataHeader *>(buf);
+  const ObInvIdxAggDataHeader original = *header;
+  for (int field = 0; field < 5; ++field) {
+    switch (field) {
+      case 0: ++header->version_; break;
+      case 1: header->logical_block_count_ = 0; break;
+      case 2: header->total_size_ = sizeof(ObInvIdxAggDataHeader); break;
+      case 3: header->total_size_ = size + 1; break;
+      case 4: --header->total_size_; break;
+    }
+    matched = true;
+    EXPECT_EQ(OB_ERR_UNEXPECTED, scanner.match_cached_block_meta(buf, size, cached, 10, 50, matched)) << field;
+    EXPECT_FALSE(matched);
+    ObPostingMetaRowScanner fresh;
+    ASSERT_EQ(OB_SUCCESS, fresh.init(true));
+    EXPECT_EQ(OB_ERR_UNEXPECTED, fresh.open(buf, size)) << field;
+    *header = original;
+  }
+  --header->logical_block_count_;
+  header->total_size_ -= sizeof(ObInvIdxAggDataEntry);
+  matched = true;
+  ASSERT_EQ(OB_SUCCESS, scanner.match_cached_block_meta(buf, size, cached, 10, 50, matched));
+  EXPECT_FALSE(matched);
+  *header = original;
+  ASSERT_EQ(OB_SUCCESS, scanner.match_cached_block_meta(buf, size, cached, 10, 50, matched));
+  EXPECT_TRUE(matched);
+  EXPECT_EQ(0, scanner.get_cur_block_idx());
+}
+
+TEST_F(PostingMetaRowScannerTest, cached_meta_only_checks_intersecting_frontier)
+{
+  common::ObArenaAllocator allocator(common::ObModIds::TEST);
+  char *buf = nullptr;
+  int64_t size = 0;
+  build_agg(allocator, 4096, 2048, buf, size);
+  ObPostingMetaRowScanner scanner;
+  ASSERT_EQ(OB_SUCCESS, scanner.init(true));
+  ASSERT_EQ(OB_SUCCESS, scanner.open(buf, size));
+  ObPostingBlockMeta cached;
+  ASSERT_EQ(OB_SUCCESS, scanner.get_cur_block_meta(cached));
+  ObInvIdxAggDataEntry *entries = reinterpret_cast<ObInvIdxAggDataEntry *>(
+      buf + sizeof(ObInvIdxAggDataHeader));
+  const ObInvIdxAggDataEntry original = entries[0];
+  entries[0].frontier_offset_ = UINT16_MAX;
+  entries[2].frontier_offset_ = UINT16_MAX;
+  bool matched = false;
+  ASSERT_EQ(OB_SUCCESS, scanner.match_cached_block_meta(buf, size, cached, 0, 9, matched));
+  EXPECT_TRUE(matched);
+  ASSERT_EQ(OB_SUCCESS, scanner.match_cached_block_meta(buf, size, cached, 110, 150, matched));
+  EXPECT_TRUE(matched);
+  ObPostingFrontierSpan span;
+  ASSERT_EQ(OB_SUCCESS, scanner.get_frontier_span(0, 110, 150, span));
+  EXPECT_TRUE(span.score_available_);
+  EXPECT_EQ(2, span.pair_count_);
+  matched = true;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, scanner.match_cached_block_meta(buf, size, cached, 10, 50, matched));
+  EXPECT_FALSE(matched);
+  entries[0] = original;
+  ASSERT_EQ(OB_SUCCESS, scanner.match_cached_block_meta(buf, size, cached, 10, 50, matched));
+  EXPECT_TRUE(matched);
+  entries[0].frontier_count_ = 0;
+  ASSERT_EQ(OB_SUCCESS, scanner.match_cached_block_meta(buf, size, cached, 10, 50, matched));
+  EXPECT_FALSE(matched);
+  ASSERT_EQ(OB_SUCCESS, scanner.get_cur_block_meta(cached));
+  EXPECT_FALSE(cached.block_max_.has_max_score());
+  ASSERT_EQ(OB_SUCCESS, scanner.match_cached_block_meta(buf, size, cached, 10, 50, matched));
+  EXPECT_TRUE(matched);
+  EXPECT_EQ(0, scanner.get_cur_block_idx());
+}
+
 TEST_F(PostingMetaRowScannerTest, test_iterate_with_max_score)
 {
   common::ObArenaAllocator allocator(common::ObModIds::TEST);
@@ -554,6 +746,111 @@ TEST_F(PostingMetaRowScannerTest, test_reset_then_reinit)
   ObPostingBlockMeta meta;
   ASSERT_EQ(OB_SUCCESS, scanner.get_cur_block_meta(meta));
   EXPECT_FALSE(meta.block_max_.has_max_score());
+}
+
+TEST_F(PostingMetaRowScannerTest, frontier_span_preserves_closed_range_and_cursor)
+{
+  ObArenaAllocator allocator;
+  char *buf = nullptr;
+  int64_t size = 0;
+  build_agg(allocator, 0, 0, buf, size);
+  ObPostingMetaRowScanner scanner;
+  ASSERT_EQ(OB_SUCCESS, scanner.init(true));
+  ASSERT_EQ(OB_SUCCESS, scanner.open(buf, size));
+  ObPostingFrontierSpan span;
+  ASSERT_EQ(OB_SUCCESS, scanner.get_frontier_span(0, 10, 149, span));
+  EXPECT_TRUE(span.range_covered_);
+  EXPECT_TRUE(span.score_available_);
+  EXPECT_EQ(3, span.pair_count_);
+  EXPECT_EQ(2, span.visited_block_count_);
+  EXPECT_EQ(1, span.pairs_[0].token_freq_);
+  EXPECT_EQ(12, span.pairs_[2].token_freq_);
+  ASSERT_EQ(OB_SUCCESS, scanner.get_frontier_span(0, 51, 209, span));
+  EXPECT_TRUE(span.range_covered_);
+  EXPECT_EQ(2, span.pair_count_);
+  EXPECT_EQ(11, span.pairs_[0].token_freq_);
+  ASSERT_EQ(OB_SUCCESS, scanner.get_frontier_span(0, 151, 209, span));
+  EXPECT_TRUE(span.range_covered_);
+  EXPECT_EQ(0, span.pair_count_);
+  EXPECT_EQ(nullptr, span.pairs_);
+  ASSERT_EQ(OB_SUCCESS, scanner.get_frontier_span(1, 110, 250, span));
+  EXPECT_EQ(5, span.pair_count_);
+  EXPECT_TRUE(span.range_covered_);
+  EXPECT_EQ(0, scanner.get_cur_block_idx());
+  ASSERT_EQ(OB_SUCCESS, scanner.get_frontier_span(0, 10, UINT64_MAX, span));
+  EXPECT_FALSE(span.range_covered_); // only the outer scanner can certify term EOF
+  EXPECT_EQ(6, span.pair_count_);
+  EXPECT_EQ(250, span.last_max_id_);
+  EXPECT_EQ(OB_INVALID_ARGUMENT, scanner.get_frontier_span(0, 251, 250, span));
+  EXPECT_EQ(nullptr, span.pairs_);
+  ObInvIdxAggDataEntry *entries = const_cast<ObInvIdxAggDataEntry *>(scanner.entries_);
+  entries[2].min_doc_id_ = UINT64_MAX - 1;
+  entries[2].max_doc_id_ = UINT64_MAX;
+  ASSERT_EQ(OB_SUCCESS, scanner.get_frontier_span(0, UINT64_MAX, UINT64_MAX, span));
+  EXPECT_TRUE(span.range_covered_);
+  EXPECT_EQ(3, span.pair_count_);
+  EXPECT_EQ(UINT64_MAX, span.last_max_id_);
+}
+
+TEST_F(PostingMetaRowScannerTest, frontier_span_rejects_gaps_overlaps_and_reverse_offsets)
+{
+  ObArenaAllocator allocator;
+  char *buf = nullptr;
+  int64_t size = 0;
+  build_agg(allocator, 0, 0, buf, size);
+  ObPostingMetaRowScanner scanner;
+  ASSERT_EQ(OB_SUCCESS, scanner.init(true));
+  ASSERT_EQ(OB_SUCCESS, scanner.open(buf, size));
+  ObInvIdxAggDataEntry *entries = const_cast<ObInvIdxAggDataEntry *>(scanner.entries_);
+  const int64_t indices[] = {1, 2, 2};
+  const uint16_t offsets[] = {2 * sizeof(ObInvIdxBM25ParamPair), 2 * sizeof(ObInvIdxBM25ParamPair), 0};
+  const uint64_t first_ids[] = {10, 10, 110};
+  for (int64_t i = 0; i < ARRAYSIZEOF(indices); ++i) {
+    SCOPED_TRACE(i);
+    const uint16_t original_offset = entries[indices[i]].frontier_offset_;
+    entries[indices[i]].frontier_offset_ = offsets[i];
+    ObPostingFrontierSpan span;
+    EXPECT_EQ(OB_ERR_UNEXPECTED, scanner.get_frontier_span(0, first_ids[i], 250, span));
+    EXPECT_EQ(nullptr, span.pairs_);
+    EXPECT_EQ(0, scanner.get_cur_block_idx());
+    entries[indices[i]].frontier_offset_ = original_offset;
+    ASSERT_EQ(OB_SUCCESS, scanner.get_frontier_span(0, first_ids[i], 250, span));
+    EXPECT_TRUE(span.range_covered_);
+    EXPECT_TRUE(span.score_available_);
+  }
+}
+
+TEST_F(PostingMetaRowScannerTest, frontier_span_missing_discontiguous_and_corrupt_entries)
+{
+  ObArenaAllocator allocator;
+  char *buf = nullptr;
+  int64_t size = 0;
+  build_agg(allocator, 0, 0, buf, size);
+  ObPostingMetaRowScanner scanner;
+  ASSERT_EQ(OB_SUCCESS, scanner.init(true));
+  ASSERT_EQ(OB_SUCCESS, scanner.open(buf, size));
+  ObInvIdxAggDataEntry *entries = const_cast<ObInvIdxAggDataEntry *>(scanner.entries_);
+  const ObInvIdxAggDataEntry original = entries[1];
+  ObPostingFrontierSpan span;
+  entries[1].frontier_count_ = 0;
+  ASSERT_EQ(OB_SUCCESS, scanner.get_frontier_span(0, 10, 250, span));
+  EXPECT_FALSE(span.score_available_);
+  entries[1] = original;
+  entries[1].frontier_offset_ = 0;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, scanner.get_frontier_span(0, 10, 250, span));
+  entries[1] = original;
+  entries[1].frontier_offset_ = UINT16_MAX;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, scanner.get_frontier_span(0, 10, 250, span));
+  entries[1] = original;
+  entries[1].min_doc_id_ = entries[0].max_doc_id_;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, scanner.get_frontier_span(0, 10, 250, span));
+  entries[1] = original;
+  entries[1].doc_count_ = 0;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, scanner.get_frontier_span(0, 10, 250, span));
+  entries[1] = original;
+  scanner.has_max_score_ = false;
+  ASSERT_EQ(OB_SUCCESS, scanner.get_frontier_span(0, 10, 250, span));
+  EXPECT_FALSE(span.score_available_);
 }
 
 } // namespace blocksstable

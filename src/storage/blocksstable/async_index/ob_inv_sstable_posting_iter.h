@@ -17,6 +17,7 @@
 #include "storage/meta_mem/ob_tablet_handle.h"
 #include "storage/ob_i_table.h"
 #include "sql/engine/expr/ob_expr_bm25.h"
+#include "sql/das/search/ob_das_bm25_batch_kernel.h"
 
 namespace oceanbase
 {
@@ -28,6 +29,29 @@ class ObTableHandleV2;
 }
 namespace blocksstable
 {
+class ObInvSSTablePostingIter;
+
+// One worker-owned slot, populated only after normal snapshot visibility checks.
+// Each partition's read snapshot is fixed for the owning query context's lifetime.
+// The tablet pin is required even when the table handle borrows tablet-owned metadata.
+class ObInvPostingTableCache final
+{
+public:
+  ObInvPostingTableCache() : tablet_handle_(), table_handle_(), range_() {}
+  ~ObInvPostingTableCache() { reset(); }
+  const storage::ObTableHandleV2 *find(
+      const storage::ObTabletHandle &tablet_handle,
+      const common::ObNewVersionRange &range) const;
+  int store(const storage::ObTabletHandle &tablet_handle,
+            const common::ObNewVersionRange &range,
+            const storage::ObTableHandleV2 &table_handle);
+  void reset();
+private:
+  storage::ObTabletHandle tablet_handle_;
+  storage::ObTableHandleV2 table_handle_;
+  common::ObNewVersionRange range_;
+  DISALLOW_COPY_AND_ASSIGN(ObInvPostingTableCache);
+};
 
 struct ObInvPostingScanParam
 {
@@ -38,6 +62,8 @@ struct ObInvPostingScanParam
     tablet_id_.reset();
     query_flag_ = common::ObQueryFlag();
     allocator_ = nullptr;
+    reusable_iter_ = nullptr;
+    table_cache_ = nullptr;
     has_relevance_params_ = false;
     doc_freq_ = 0;
     total_doc_cnt_ = 0;
@@ -68,6 +94,9 @@ struct ObInvPostingScanParam
   common::ObTabletID tablet_id_;
   common::ObQueryFlag query_flag_;
   common::ObIAllocator *allocator_;
+  // Optional caller-owned iterator; scan_posting must not destroy or free it.
+  ObInvSSTablePostingIter *reusable_iter_;
+  ObInvPostingTableCache *table_cache_; // Borrowed from the query-local SearchCtx.
   bool has_relevance_params_;
   uint64_t doc_freq_;
   uint64_t total_doc_cnt_;
@@ -146,12 +175,13 @@ public:
   /// Whether the iterator has been exhausted.
   bool is_end() const { return is_end_; }
 
-  /// Batch drain (zero-copy projection): expose direct pointers to the next contiguous
-  /// run of posting rows whose doc_id <= boundary, starting after the current cursor and
-  /// confined to a single decoded block. No data is copied; the caller (async token op)
-  /// reads token_freq/doc_length in place for BM25 and copies only doc_ids it needs downstream.
+  /// Legacy uint64 batch drain: compact doc IDs and relevance columns are
+  /// widened into iterator-owned scratch.
+  /// Expose pointers to the next contiguous
+  /// run of posting rows whose doc_id <= boundary, starting after the current cursor
+  /// and confined to a single decoded block.
   ///
-  /// The returned pointers reference the cached block buffer and are valid only until the
+  /// The returned pointers reference the cached block or iterator scratch and are valid until the
   /// next drain_until()/drain_until_from_current()/next()/advance_*() call.
   /// Never returns OB_ITER_END for normal EOF; the terminal condition is carried by count:
   ///   count > 0               a batch is projected; call again for more rows <= boundary
@@ -165,9 +195,9 @@ public:
   /// only doc-id/index availability; load_curr_bm25_param() materializes relevance lazily.
   /// @param boundary   inclusive upper bound doc_id
   /// @param max_count  > 0; upper bound on the projected run length (caller's remaining room)
-  /// @param [out] doc_ids       pointer into the block; [0, count)
-  /// @param [out] token_freqs   pointer into the block, or nullptr in the absence of relevance params
-  /// @param [out] doc_lengths   pointer into the block, or nullptr in the absence of relevance params
+  /// @param [out] doc_ids       pointer into the block or scratch; [0, count)
+  /// @param [out] token_freqs   pointer into the block or scratch, or nullptr without relevance params
+  /// @param [out] doc_lengths   pointer into the block or scratch, or nullptr without relevance params
   /// @param [out] count         number of projected rows, all <= boundary
   int drain_until(
       const uint64_t boundary,
@@ -177,7 +207,7 @@ public:
       const uint64_t *&doc_lengths,
       int64_t &count);
 
-  /// Same zero-copy projection as drain_until(), but includes the current row. Position
+  /// Same legacy projection as drain_until(), but includes the current row. Position
   /// the iterator with advance_to() or advance_to_id(); only doc-id/index availability
   /// is required, and relevance is projected through token_freqs/doc_lengths.
   int drain_until_from_current(
@@ -188,6 +218,19 @@ public:
       const uint64_t *&doc_lengths,
       int64_t &count);
 
+  // Typed zero-copy projection within one logical block, with the same cursor
+  // and count semantics as drain_until(). Consume views before the next iterator call.
+  int drain_until_typed(const uint64_t boundary, const int64_t max_count,
+      ObPostingDocIdView &doc_ids, ObPostingRelevanceView &relevance, int64_t &count);
+  // Opt-in terminal status for a fully typed run. On success, finished means
+  // no further row belongs to this boundary: the cursor is already at its
+  // lookahead row, or is_end() is true. count may still be positive. Those views
+  // remain valid because finishing never advances a logical block or data pin.
+  // Unknown block tails retain the original extra-drain contract (finished=false).
+  // A caller must consume the returned view before any further iterator call.
+  int drain_until_typed_run(const uint64_t boundary, const int64_t max_count,
+      ObPostingDocIdView &doc_ids, ObPostingRelevanceView &relevance,
+      int64_t &count, bool &finished, const bool include_current = false);
   /// Get the current doc_id as a datum reference.
   /// Invalid in shallow status; caller must copy if retaining across next().
   int get_cur_id(const common::ObDatum *&id_datum) const;
@@ -197,6 +240,21 @@ public:
   /// Skip forward to the first doc_id >= target and materialize the doc id only.
   /// Relevance params are not decoded until load_curr_bm25_param() is called.
   int advance_to_id(const common::ObDatum &target);
+  int advance_to_id(const uint64_t target_doc_id, uint64_t &curr_doc_id);
+  // One bit per candidate in the uint64_t match bitmap.
+  static constexpr int64_t MAX_SORTED_PROBE_COUNT = 64;
+
+  bool can_probe_sorted_ids() const
+  {
+    return is_opened_ && !is_end_ && !in_shallow_status_
+        && nullptr != curr_id_ && has_relevance_params_;
+  }
+  // Probe up to MAX_SORTED_PROBE_COUNT strictly increasing physical IDs. Copy relevance only for
+  // matches; no block-owned pointers escape. EOF is successful with is_end().
+  // last_id retains the last valid head even when the final seek reaches EOF.
+  int probe_sorted_ids(const uint64_t *ids, const int64_t count,
+      uint64_t *token_freqs, uint64_t *doc_lengths,
+      uint64_t &matches, uint64_t &last_id);
   /// Shallow advance: skip to the posting block that may contain target.
   /// Sets in_shallow_status_ = true; callers must use advance_to() or
   /// advance_to_id() to materialize a row before row-level iteration. Shallow
@@ -212,9 +270,7 @@ public:
   int get_curr_bm25_param(int64_t &token_freq, int64_t &doc_length) const;
   /// Materialize BM25 scoring parameters for the current row on demand.
   int load_curr_bm25_param(int64_t &token_freq, int64_t &doc_length);
-  // BM25 score for a (token_freq, doc_length) pair using the scan params.
-  double calc_bm25_score(const uint64_t token_freq, const uint64_t doc_length) const;
-  int get_block_max_tuple(uint64_t &min_id, uint64_t &max_id, double &max_score) const;
+  int get_block_max_tuple(uint64_t &min_id, uint64_t &max_id, double &max_score);
   // Phrase block-max ranking: max_i f_m[i] / length_normalizer(L_m[i], avg_doc_length).
   // Valid after advance_shallow(); matches sync ObBlockMaxScoreCalc match_phrase_mode.
   int get_curr_phrase_block_max_ranking(double &max_ranking) const;
@@ -240,11 +296,17 @@ public:
                K_(need_load_micro_block), K_(need_load_value_micro_block), K_(curr_meta));
 
 private:
-  class ObRangeMaxScoreVisitor;
+  class ObRangeMaxScoreSpanVisitor;
   // Validate target datum is a uint64 doc_id and extract it.
   int decode_target_doc_id(const common::ObDatum &target, uint64_t &target_doc_id) const;
   // Load curr_meta_ from the scanner's current posting block.
   int load_current_block_meta();
+  void assign_current_block_meta(const ObPostingBlockMeta &meta);
+  // Called only after the existing metadata / frontier availability checks.
+  // Does not move any row cursor or request posting data.
+  double get_current_block_max_score();
+  void invalidate_current_block_max_score()
+  { curr_block_max_score_valid_ = false; curr_block_max_score_ = 0.0; }
   // Fetch current posting data micro block, strip the physical header, locate the
   // logical posting block by curr_meta_.locator_.block_idx_, and init the decoder.
   int load_current_block();
@@ -255,6 +317,13 @@ private:
   int validate_posting_value_row_state();
   // Locate the first row whose doc_id is not less than target. Does not materialize the row.
   int locate_target(const uint64_t target_doc_id, int64_t &target_idx);
+  // Advance an opened iterator within its DocID bounds; clear the row cursor on EOF.
+  int advance_to_id_impl(const uint64_t target_doc_id);
+  // Consume a sorted prefix in an already decoded complete physical block.
+  // A zero consumed count leaves the cursor and projection arrays unchanged.
+  int probe_local_block_group(const uint64_t *ids, const int64_t count,
+      uint64_t *token_freqs, uint64_t *doc_lengths,
+      uint64_t &matches, int64_t &consumed);
   // Decode doc_id for row_idx and update the row cursor without relevance params.
   int materialize_doc_id(const int64_t row_idx);
   // Decode relevance params for curr_row_idx_ if present and not materialized.
@@ -266,15 +335,25 @@ private:
   // returns OB_SUCCESS (caller checks is_end_). Used by drain_until to avoid a first-row
   // materialization.
   int position_drain_start(int64_t &start_idx);
+  int drain_until_legacy(
+      const uint64_t boundary, const int64_t max_count,
+      const uint64_t *&doc_ids, const uint64_t *&token_freqs,
+      const uint64_t *&doc_lengths, int64_t &count, const bool include_current);
   // Shared projection implementation for the next-row and current-row entry points.
   int drain_until_impl(
       const uint64_t boundary,
       const int64_t max_count,
-      const uint64_t *&doc_ids,
-      const uint64_t *&token_freqs,
-      const uint64_t *&doc_lengths,
+      ObPostingDocIdView &doc_ids,
+      ObPostingRelevanceView &relevance,
       int64_t &count,
       const bool include_current);
+  int export_legacy_doc_ids(
+      const ObPostingDocIdView &view, const int64_t count, const uint64_t *&doc_ids);
+  int export_legacy_relevance(
+      const ObPostingRelevanceView &relevance,
+      const int64_t count,
+      const uint64_t *&token_freqs,
+      const uint64_t *&doc_lengths);
   // Advance the scanner to the next posting block; OB_ITER_END when exhausted.
   int move_to_next_block();
   // Drop the current posting / logical-value block view.
@@ -295,6 +374,7 @@ private:
   // once when opening the iterator so block-max scoring uses the same single-division
   // kernel as the SQL-layer document scoring.
   sql::ObBM25PrecomputedParams bm25_calc_params_;
+  sql::BM25FrontierMaxKernels bm25_frontier_kernels_;
   // Whether the bound SSTable carries BM25 relevance params (token_freq / doc_length).
   // Copied from sstable.get_inv_meta().get_stats().has_relevance_params_ at open time. When false,
   // BM25 scoring and block-max frontier computation are skipped (search index path).
@@ -310,8 +390,10 @@ private:
   bool need_load_micro_block_;
   // Parallel to need_load_micro_block_ for the paired posting value leaf micro.
   bool need_load_value_micro_block_;
-  ObInvIdxMicroBlockReader posting_micro_reader_;
+  ObFlatCacheReader posting_micro_reader_;
   ObPostingBlockData posting_block_data_;
+  uint64_t *legacy_relevance_buf_;
+  uint64_t *legacy_doc_ids_buf_; // lazily allocated only by the uint64 compatibility API
   ObInvIdxMicroBlockReader posting_value_micro_reader_;
   ObPostingValueBlockReader posting_value_block_reader_;
   common::ObDatum curr_id_datum_;
@@ -322,8 +404,11 @@ private:
   int64_t curr_doc_length_;
   int64_t curr_row_idx_;
   bool curr_relevance_materialized_;
-  // BM25 upper bound computed once when positioning on a new posting block.
+  // Bound for the current immutable metadata image, evaluated only on demand.
+  // Row-only movement within that block retains the value; metadata/pin changes
+  // invalidate it. Zero is a valid bound and is not an invalid-state sentinel.
   double curr_block_max_score_;
+  bool curr_block_max_score_valid_;
   // Monotonically non-decreasing scan frontier: the lower bound of doc ids this iterator can still emit
   uint64_t frontier_min_id_;
   uint64_t min_doc_id_;

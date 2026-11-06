@@ -11,6 +11,7 @@
 #include "lib/checksum/ob_crc64.h"
 #include "storage/blocksstable/async_index/ob_inv_idx_micro_block_writer.h"
 #include "storage/blocksstable/async_index/ob_inv_idx_micro_block_reader.h"
+#include "storage/blocksstable/async_index/ob_posting_block_struct.h"
 
 #include <gtest/gtest.h>
 
@@ -315,17 +316,17 @@ TEST_F(InvIdxDataMicroBlockReaderTest, test_flat_cache_reader)
   int64_t size = 0;
   build_flat_cache_micro_block(allocator, buf, size);
 
-  ObInvIdxMicroBlockReader reader;
+  ObInvIdxMicroBlockReader encoded_reader;
   ASSERT_EQ(OB_ERR_UNEXPECTED,
-      reader.init(buf, size, false /*is_posting_value*/));
-  ASSERT_EQ(OB_SUCCESS,
-      reader.init_flat_cache(buf, size));
+      encoded_reader.init(buf, size, false /*is_posting_value*/));
+  ObFlatCacheReader reader;
+  ASSERT_EQ(OB_SUCCESS, reader.init(buf, size));
   ASSERT_EQ(3, reader.get_block_count());
   ObPostingBlockData block_data;
   ASSERT_EQ(OB_SUCCESS, reader.get_posting_block_data(1, block_data));
   ASSERT_EQ(2, block_data.get_row_count());
-  EXPECT_EQ(11, block_data.get_doc_ids()[0]);
-  EXPECT_EQ(13, block_data.get_doc_ids()[1]);
+  EXPECT_EQ(11, block_data.doc_id_at(0));
+  EXPECT_EQ(13, block_data.doc_id_at(1));
 
   const uint64_t *doc_ids = nullptr;
   int64_t doc_count = 0;
@@ -335,19 +336,26 @@ TEST_F(InvIdxDataMicroBlockReaderTest, test_flat_cache_reader)
   EXPECT_EQ(7, doc_ids[0]);
   EXPECT_EQ(23, doc_ids[5]);
 
-  const char *block_buf = nullptr;
-  int64_t block_size = 0;
-  EXPECT_EQ(OB_NOT_SUPPORTED, reader.get_payload(0, block_buf, block_size));
-
   ObMicroBlockHeader *micro_header = reinterpret_cast<ObMicroBlockHeader *>(buf);
   ObFlatCacheHeader *flat_cache_header = reinterpret_cast<ObFlatCacheHeader *>(buf + micro_header->header_size_);
   flat_cache_header->format_version_ = 0xFF;
   EXPECT_EQ(OB_ERR_UNEXPECTED,
-      reader.init_flat_cache(buf, size));
+      reader.init(buf, size));
+  for (uint8_t old_version = 3; old_version < ObFlatCacheHeader::FORMAT_VERSION; ++old_version) {
+    flat_cache_header->format_version_ = old_version;
+    EXPECT_EQ(OB_ERR_UNEXPECTED, reader.init(buf, size));
+  }
   flat_cache_header->format_version_ = ObFlatCacheHeader::FORMAT_VERSION;
+  for (const uint16_t width : {0, 2, 4, 16}) {
+    flat_cache_header->doc_id_width_ = width;
+    // Even uint32 is invalid for this doc-only SEARCH micro.
+    EXPECT_EQ(OB_ERR_UNEXPECTED, reader.init(buf, size));
+  }
+  flat_cache_header->doc_id_width_ = sizeof(uint64_t);
+  ASSERT_EQ(OB_SUCCESS, reader.init(buf, size));
   flat_cache_header->column_count_ = ObPostingBlockHeader::POSTING_COL_CNT_WITH_RELEVANCE_PARAMS;
   EXPECT_EQ(OB_ERR_UNEXPECTED,
-      reader.init_flat_cache(buf, size));
+      reader.init(buf, size));
 }
 
 TEST_F(InvIdxDataMicroBlockReaderTest, test_flat_cache_rejects_invalid_frame_and_layout)
@@ -394,7 +402,7 @@ TEST_F(InvIdxDataMicroBlockReaderTest, test_flat_cache_rejects_invalid_frame_and
         --input_size;
         break;
       case InvalidKind::FLAT_HEADER:
-        flat_header->reserved32_ = 1;
+        flat_header->relevance_width_ = 1;
         break;
       case InvalidKind::FLAT_LAYOUT:
         --flat_header->block_count_;
@@ -407,9 +415,9 @@ TEST_F(InvIdxDataMicroBlockReaderTest, test_flat_cache_rejects_invalid_frame_and
         break;
       }
     }
-    ObInvIdxMicroBlockReader reader;
+    ObFlatCacheReader reader;
     EXPECT_EQ(OB_ERR_UNEXPECTED,
-        reader.init_flat_cache(input_buf, input_size));
+        reader.init(input_buf, input_size));
   };
   expect_rejected(InvalidKind::ROW_STORE);
   expect_rejected(InvalidKind::MICRO_TYPE);
@@ -427,9 +435,9 @@ TEST_F(InvIdxDataMicroBlockReaderTest, test_flat_cache_rejects_invalid_access_in
   char *buf = nullptr;
   int64_t size = 0;
   build_flat_cache_micro_block(allocator, buf, size);
-  ObInvIdxMicroBlockReader reader;
+  ObFlatCacheReader reader;
   ASSERT_EQ(OB_SUCCESS,
-      reader.init_flat_cache(buf, size));
+      reader.init(buf, size));
   ObPostingBlockData block_data;
   const auto expect_invalid_block = [&](const int64_t block_idx) {
     ASSERT_EQ(OB_SUCCESS, reader.get_posting_block_data(0, block_data));
@@ -455,11 +463,14 @@ TEST_F(InvIdxDataMicroBlockReaderTest, test_flat_cache_rejects_invalid_access_in
 
 TEST_F(InvIdxDataMicroBlockReaderTest, test_flat_cache_uninitialized_access_resets_outputs)
 {
-  ObInvIdxMicroBlockReader reader;
+  ObFlatCacheReader reader;
   uint64_t dummy_doc_id = 7;
   ObPostingBlockData block_data;
-  block_data.doc_count_ = 1;
-  block_data.doc_ids_ = &dummy_doc_id;
+  ObPostingDocIdView ids;
+  ids.values_ = &dummy_doc_id;
+  ids.width_ = sizeof(uint64_t);
+  ObPostingRelevanceView relevance;
+  ASSERT_EQ(OB_SUCCESS, block_data.assign(1, ids, relevance));
   EXPECT_EQ(OB_NOT_INIT, reader.get_posting_block_data(0, block_data));
   EXPECT_EQ(0, block_data.get_row_count());
   EXPECT_EQ(nullptr, block_data.get_doc_ids());

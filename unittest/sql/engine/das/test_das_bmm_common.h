@@ -592,13 +592,15 @@ protected:
   }
 
   int do_drain_until_active(
-      const ObDASRowID &boundary,
+      const uint64_t range_start,
+      const uint64_t range_end,
       DocScoreAccumulator &accumulator,
       int64_t &count) override
   {
     int ret = record_call(ScriptedBMMCallType::ACTIVE_DRAIN, counters_.active_drain_);
-    if (OB_SUCCESS == ret) {
-      ret = ObIDASSearchOp::do_drain_until_active(boundary, accumulator, count);
+    if (OB_SUCC(ret) && OB_FAIL(ObIDASSearchOp::do_drain_until_active(
+        range_start, range_end, accumulator, count))) {
+      LOG_WARN("failed to drain scripted active rows", K(ret), K(range_start), K(range_end));
     }
     return ret;
   }

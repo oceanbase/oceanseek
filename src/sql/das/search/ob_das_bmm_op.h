@@ -47,7 +47,7 @@ public:
   {
     return nullptr != score_ops_
         && nullptr != iter_allocator_
-        && (ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN == build_options_.filter_mode_
+        && (ObDASBMMBuildOptions::FilterMode::ORDERED != build_options_.filter_mode_
             ? (build_options_.has_explicit_vectorized_merge_
                 && build_options_.enable_vectorized_merge_ && !query_optional()
                 && nullptr != filter_op_ && filter_op_->supports_direct_rowid_drain())
@@ -120,8 +120,10 @@ private:
   bool has_filter() const { return nullptr != filter_op_; }
   bool can_seek_filter_for_vec_handoff() const
   {
-    return has_filter() && ObDASBMMBuildOptions::FilterMode::ORDERED == filter_mode_
-        && filter_op_->can_enumerate_rowids();
+    return has_filter()
+        && ((ObDASBMMBuildOptions::FilterMode::ORDERED == filter_mode_
+             && filter_op_->can_enumerate_rowids())
+            || ObDASBMMBuildOptions::FilterMode::DIRECT_DRAIN_AFTER_ESSENTIAL == filter_mode_);
   }
   bool is_filter_driven_optional() const
   {
@@ -195,7 +197,12 @@ private:
   int build_vec_non_essential_suffix_sums();
   // Advance essential dimensions to the candidate start rowid and rebuild the merger.
   int rebuild_vec_essential_merger(const ObDASRowID &min_id);
+  // Cache and order essential heads once per dense batch, preserving DAAT score order.
+  int prepare_vec_essential_batch(ObDASRowID &start_id);
   int evaluate_essential_batch(const ObDASRowID &batch_end_id, bool &is_batch_valid);
+  // Cache candidate admission and per-dimension pruning cutoffs for the current window and threshold.
+  double get_single_essential_score_cutoff();
+  int evaluate_single_essential_batch(const ObDASRowID &batch_end_id, bool &is_batch_valid);
   // Prepare filter for a vectorized batch. Filter-empty or exhausted batches
   // are reported via need_evaluate_batch=false and handled by the state machine.
   int prepare_filter_for_vectorized_batch(
@@ -206,9 +213,13 @@ private:
       const ObDASRowID &batch_start_id,
       ObDASRowID &batch_end_id,
       bool &need_evaluate_batch);
+  // Intersect the bitmap without checking partial scores.
+  int apply_bitmap_filter_to_batch(const ObDASRowID &batch_end_id);
   int apply_filter_to_scored_batch();
   // Probe a sparse active candidate set against one non-essential dimension.
-  int score_active_candidates(ObDAATMergeIter &iter);
+  // Sparse-buffer IDs must be its compact, all-alive slots; otherwise score the accumulator.
+  int score_compact_candidates(ObDAATMergeIter &iter, const uint64_t *doc_ids,
+      const int64_t count, const bool use_sparse_buffer);
   int evaluate_non_essential_batch(
       const ObDASRowID &batch_end_id,
       bool &is_batch_valid);
@@ -244,9 +255,15 @@ private:
   // dim-max upper bound beats min_competitive_score_. Boundary crossing / buffer full stops
   // the fill. Returns OB_ITER_END only when the scan is exhausted with an empty buffer.
   int collect_leapfrog_candidates();
+  // Select ordered filter batching before entering the row-wise collector.
+  int collect_sparse_candidates();
+  // Batch ordered filter IDs while retaining the sparse per-document E addition order.
+  bool can_batch_filter_essential() const;
+  int collect_filter_essential_candidates();
   // Score alive candidates dim by dim (highest dim-max first) and prune candidates that
   // cannot beat min_competitive_score_ with the remaining dim-max budget.
-  int score_leapfrog_candidates();
+  // Batch drains compact between dimensions; leapfrog keeps its per-candidate probes.
+  int score_sparse_candidates(const bool allow_batch_drain);
 private:
   enum SearchStatus {
     FIND_NEXT_PIVOT,
@@ -270,6 +287,15 @@ private:
   ObFixedArray<int64_t, ObIAllocator> sorted_iter_idxes_;
   // 按照上述分数上界从小到大保存迭代器下标，用于划分 non-essential 和 essential 维度。
   ObFixedArray<int64_t, ObIAllocator> vec_sorted_iter_idxes_;
+  struct EssentialHead
+  {
+    uint64_t doc_id_;
+    int64_t iter_idx_;
+    TO_STRING_KV(K_(doc_id), K_(iter_idx));
+  };
+  // Batch-local dense heads; iterator lookahead stays valid between window rebuilds.
+  ObFixedArray<EssentialHead, ObIAllocator> vec_essential_heads_;
+  int64_t vec_essential_head_count_;
   // 记录每个迭代器在当前向量化区间内的分数上界，Range Max 不可用时记录全局上界。
   ObFixedArray<double, ObIAllocator> vec_range_max_scores_;
   // Max scores indexed by merge iterator index, refreshed before each sort.
@@ -289,6 +315,11 @@ private:
   ObDASRowID curr_filter_id_;
   SearchStatus status_;
   ObFixedArray<double, ObIAllocator> non_ess_block_max_score_suffix_sums_;
+  double single_essential_score_cutoff_;
+  // Slot i is the safe cutoff after dimension i, with dimensions [0, i) still unscored.
+  ObFixedArray<double, ObIAllocator> single_essential_score_cutoffs_;
+  // A negative score invalidates the cached cutoff for the current window.
+  double single_essential_cutoff_min_score_;
   // Pre-allocated bitmask for every path that may execute a dense window, including
   // query-optional whose preselected scoring mode is SPARSE_SEEK.
   ObBitVector *filter_bitset_;
@@ -297,6 +328,8 @@ private:
   DocScoreAccumulator doc_score_accumulator_;
   DocScoreIter doc_score_iter_;
   ObDASRowID vec_boundary_id_;
+  // Frozen from the Top-K generation context and retained across rescans.
+  int64_t vec_min_boundary_size_;
   bool enable_vec_merge_;
   ObDASBMMBuildOptions::FilterMode filter_mode_;
   bool query_optional_;
@@ -317,6 +350,7 @@ private:
   // Within candidate-filter mode, medium-density filters may seek sparse active
   // candidates; very dense filters keep the sequential posting drain.
   bool use_active_candidate_probe_;
+  bool enable_filter_essential_batch_;
   // Preselected scoring-driven filter merge mode. Filter-driven query-optional execution
   // always uses a dense window regardless of this value.
   FilterMergeMode filter_merge_mode_;

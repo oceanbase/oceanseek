@@ -9,6 +9,7 @@
 #include "sql/das/search/ob_das_scalar_scan_op.h"
 #include "share/search_index/ob_search_index_nested_key_list.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_range_iter.h"
+#include "storage/access/ob_async_inv_iterator_pool.h"
 
 namespace oceanbase
 {
@@ -132,6 +133,7 @@ private:
   // On storage EOF: open the next SQL range, or return OB_ITER_END when exhausted.
   int advance_range_on_iter_end();
   void close_range_iter();
+  void release_scan_resources() override { close_range_iter(); }
   void reset_nested_cursor();
   bool has_current_range() const
   {

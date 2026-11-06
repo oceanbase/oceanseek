@@ -6,11 +6,16 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include <gtest/gtest.h>
+#include <algorithm>
+#define private public
+#include "storage/blocksstable/async_index/ob_posting_block_struct.h"
+#undef private
 #include "lib/allocator/page_arena.h"
 #include "lib/checksum/ob_crc64.h"
 #include "lib/compress/ob_compressor.h"
 #include "lib/compress/ob_compressor_pool.h"
 #include "lib/container/ob_se_array.h"
+#include "common/ob_target_specific.h"
 #include "common/ob_version_def.h"
 #include "share/schema/ob_table_param.h"
 #include "storage/blocksstable/async_index/ob_inv_idx_micro_block_transformer.h"
@@ -18,7 +23,6 @@
 #include "storage/blocksstable/async_index/ob_inv_idx_micro_block_struct.h"
 #include "storage/blocksstable/async_index/ob_posting_block_decoder.h"
 #include "storage/blocksstable/async_index/ob_posting_block_encoder.h"
-#include "storage/blocksstable/async_index/ob_posting_block_struct.h"
 #include "storage/blocksstable/ob_macro_block_reader.h"
 #include "storage/blocksstable/ob_micro_block_header.h"
 
@@ -652,6 +656,12 @@ TEST_F(ObInvIdxMicroBlockTransformerTest, transform_buf_too_small)
   char *small_buf = static_cast<char *>(allocator_.alloc(need - 1));
   ASSERT_NE(nullptr, small_buf);
   EXPECT_EQ(OB_BUF_NOT_ENOUGH, transformer.transform(small_buf, need - 1));
+  int64_t repeated_size = 0;
+  ASSERT_EQ(OB_SUCCESS, transformer.get_buf_size(repeated_size));
+  EXPECT_EQ(need, repeated_size);
+  char *output = static_cast<char *>(allocator_.alloc(need));
+  ASSERT_NE(nullptr, output);
+  EXPECT_EQ(OB_SUCCESS, transformer.transform(output, need));
 }
 
 // 1.8 reset_clears_state: reset() returns the transformer to not-init.
@@ -673,6 +683,136 @@ TEST_F(ObInvIdxMicroBlockTransformerTest, reset_clears_state)
   EXPECT_EQ(OB_SUCCESS, transformer.get_buf_size(need));
   transformer.reset();
   EXPECT_EQ(OB_NOT_INIT, transformer.get_buf_size(need));
+}
+
+TEST_F(ObInvIdxMicroBlockTransformerTest, layout_plan_reuse_and_reset)
+{
+  struct LayoutCase
+  {
+    bool with_relevance_;
+    uint64_t start_id_;
+    uint64_t token_freq_;
+    uint32_t doc_id_width_;
+    uint32_t relevance_width_;
+  };
+  const LayoutCase cases[] = {
+      {true, UINT32_MAX - 2ULL, 1, 4, 4},
+      {true, UINT32_MAX - 1ULL, 1, 8, 4},
+      {true, 1, UINT32_MAX - 2ULL, 4, 8},
+      {true, UINT32_MAX - 1ULL, UINT32_MAX - 2ULL, 8, 8},
+      {false, 1, 0, 8, 0},
+      {true, 1, 1, 4, 4}};
+  ObInvIdxMicroBlockTransformer transformer;
+  const ObInvIdxMicroBlockTransformer &const_transformer = transformer;
+  ObMicroBlockDesMeta des_meta;
+  ObMacroBlockReader macro_reader;
+  for (const LayoutCase &test : cases) {
+    SCOPED_TRACE(::testing::Message() << "start=" << test.start_id_
+        << "relevance_width=" << test.relevance_width_);
+    uint64_t doc_ids[] = {test.start_id_, test.start_id_ + 1, test.start_id_ + 2};
+    uint64_t tfs[] = {test.token_freq_, test.token_freq_ + 1, test.token_freq_ + 2};
+    uint64_t dls[] = {10, 20, 30};
+    LogicalBlockSpec specs[] = {{1, doc_ids, tfs, dls}, {2, doc_ids + 1, tfs + 1, dls + 1}};
+    char *encoded_buf = nullptr;
+    int64_t encoded_size = 0;
+    ASSERT_EQ(OB_SUCCESS, build_encoded_posting_micro_block(
+        allocator_, encoder_, ctx_, col_descs_, test.with_relevance_, specs, 2, encoded_buf, encoded_size));
+    ObMicroBlockHeader header;
+    ASSERT_EQ(OB_SUCCESS, deserialize_micro_block_header(encoded_buf, encoded_size, header));
+    ASSERT_EQ(OB_SUCCESS, transformer.init(
+        header, encoded_buf, encoded_size, des_meta, macro_reader, allocator_));
+    int64_t size = 0;
+    int64_t repeated_size = 0;
+    ASSERT_EQ(OB_SUCCESS, const_transformer.get_buf_size(size));
+    ASSERT_EQ(OB_SUCCESS, const_transformer.get_buf_size(repeated_size));
+    EXPECT_EQ(size, repeated_size);
+    char *first = static_cast<char *>(allocator_.alloc(size));
+    char *second = static_cast<char *>(allocator_.alloc(size));
+    ASSERT_NE(nullptr, first);
+    ASSERT_NE(nullptr, second);
+    ASSERT_EQ(OB_SUCCESS, transformer.transform(first, size));
+    ASSERT_EQ(OB_SUCCESS, transformer.transform(second, size));
+    EXPECT_EQ(0, MEMCMP(first, second, size));
+    ASSERT_EQ(OB_SUCCESS, const_transformer.get_buf_size(repeated_size));
+    EXPECT_EQ(size, repeated_size);
+
+    ObFlatCacheReader reader;
+    ASSERT_EQ(OB_SUCCESS, reader.init(first, size));
+    ASSERT_EQ(2, reader.get_block_count());
+    for (int64_t block_idx = 0; block_idx < 2; ++block_idx) {
+      ObPostingBlockData block;
+      ObPostingDocIdView ids;
+      ObPostingRelevanceView relevance;
+      ASSERT_EQ(OB_SUCCESS, reader.get_posting_block_data(block_idx, block));
+      ASSERT_EQ(OB_SUCCESS, block.get_doc_id_view(0, ids));
+      ASSERT_EQ(OB_SUCCESS, block.get_relevance_view(0, relevance));
+      EXPECT_EQ(test.doc_id_width_, ids.width_);
+      EXPECT_EQ(test.relevance_width_, relevance.width_);
+      ASSERT_EQ(0 == block_idx ? 1 : 2, block.get_row_count());
+      for (int64_t row = 0; row < block.get_row_count(); ++row) {
+        EXPECT_EQ(doc_ids[block_idx + row], ids.at(row));
+        if (test.with_relevance_) {
+          uint64_t tf = 0;
+          uint64_t dl = 0;
+          ASSERT_EQ(OB_SUCCESS, block.get_relevance_params(row, tf, dl));
+          EXPECT_EQ(tfs[block_idx + row], tf);
+          EXPECT_EQ(dls[block_idx + row], dl);
+        }
+      }
+    }
+
+    transformer.reset();
+    ASSERT_EQ(OB_NOT_INIT, transformer.get_buf_size(repeated_size));
+    EXPECT_EQ(0, repeated_size);
+    ASSERT_EQ(OB_SUCCESS, transformer.init(
+        header, encoded_buf, encoded_size, des_meta, macro_reader, allocator_));
+    // Direct transformation must prepare the same layout without a sizing call.
+    ASSERT_EQ(OB_SUCCESS, transformer.transform(second, size));
+    EXPECT_EQ(0, MEMCMP(first, second, size));
+    transformer.reset();
+  }
+}
+
+TEST_F(ObInvIdxMicroBlockTransformerTest, cached_layout_keeps_write_overflow_checks)
+{
+  uint64_t doc_ids[] = {UINT32_MAX - 1ULL, UINT32_MAX};
+  uint64_t tfs[] = {1, 2};
+  uint64_t dls[] = {10, 20};
+  LogicalBlockSpec spec = {2, doc_ids, tfs, dls};
+  char *encoded_buf = nullptr;
+  int64_t encoded_size = 0;
+  ASSERT_EQ(OB_SUCCESS, build_encoded_posting_micro_block(
+      allocator_, encoder_, ctx_, col_descs_, true, &spec, 1, encoded_buf, encoded_size));
+  ObInvIdxMicroBlockReader encoded_reader;
+  const char *logical_block = nullptr;
+  int64_t logical_size = 0;
+  ASSERT_EQ(OB_SUCCESS, encoded_reader.init(encoded_buf, encoded_size, false));
+  ASSERT_EQ(OB_SUCCESS, encoded_reader.get_payload(0, logical_block, logical_size));
+  ObPostingColumnMeta *metas = reinterpret_cast<ObPostingColumnMeta *>(
+      const_cast<char *>(logical_block) + sizeof(ObPostingBlockHeader));
+  ObMicroBlockHeader header;
+  ObMicroBlockDesMeta des_meta;
+  ObMacroBlockReader macro_reader;
+  ObInvIdxMicroBlockTransformer transformer;
+  ASSERT_EQ(OB_SUCCESS, deserialize_micro_block_header(encoded_buf, encoded_size, header));
+  ASSERT_EQ(OB_SUCCESS, transformer.init(
+      header, encoded_buf, encoded_size, des_meta, macro_reader, allocator_));
+  int64_t size = 0;
+  ASSERT_EQ(OB_SUCCESS, transformer.get_buf_size(size));
+  char *output = static_cast<char *>(allocator_.alloc(size));
+  ASSERT_NE(nullptr, output);
+  for (int64_t col = 0; col < 3; ++col) {
+    // Inject an out-of-width value after planning to exercise the write guard.
+    const uint32_t saved_base = metas[col].base_value_;
+    metas[col].base_value_ = UINT32_MAX;
+    const int ret = transformer.transform(output, size);
+    metas[col].base_value_ = saved_base;
+    EXPECT_EQ(OB_SIZE_OVERFLOW, ret) << col;
+    int64_t repeated_size = 0;
+    ASSERT_EQ(OB_SUCCESS, transformer.get_buf_size(repeated_size));
+    EXPECT_EQ(size, repeated_size);
+    ASSERT_EQ(OB_SUCCESS, transformer.transform(output, size));
+  }
 }
 
 // =============================================================================
@@ -900,6 +1040,60 @@ static int build_and_open_single_view(
   return ret;
 }
 
+template <typename DocId>
+static void assert_posting_upper_bound(const DocId *doc_ids, const int64_t row_cnt)
+{
+  ObPostingDocIdView view;
+  view.values_ = doc_ids;
+  view.width_ = sizeof(DocId);
+  ObPostingBlockData data;
+  ASSERT_EQ(OB_SUCCESS, data.assign(row_cnt, view, ObPostingRelevanceView()));
+  for (int64_t end = 1; end <= row_cnt; ++end) {
+    for (int64_t start = 0; start < end; ++start) {
+      for (int64_t i = 0; i < row_cnt; ++i) {
+        const uint64_t value = doc_ids[i];
+        const uint64_t targets[] = {value, value > 0 ? value - 1 : 0,
+            value < UINT64_MAX ? value + 1 : UINT64_MAX, UINT64_MAX};
+        for (const uint64_t target : targets) {
+          const int64_t expected = std::upper_bound(doc_ids + start, doc_ids + end, target) - doc_ids;
+          int64_t idx = -1;
+          ASSERT_EQ(OB_SUCCESS, data.upper_bound(target, start, end, idx));
+          ASSERT_EQ(expected, idx) << "target=" << target << ", start=" << start << ", end=" << end;
+        }
+      }
+    }
+  }
+  int64_t idx = -1;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, data.upper_bound(0, -1, row_cnt, idx));
+  ASSERT_EQ(0, idx);
+  ASSERT_EQ(OB_INVALID_ARGUMENT, data.upper_bound(0, 0, row_cnt + 1, idx));
+  ASSERT_EQ(OB_INVALID_ARGUMENT, data.upper_bound(0, row_cnt, row_cnt, idx));
+  ASSERT_EQ(OB_INVALID_ARGUMENT, data.upper_bound(0, 2, 1, idx));
+}
+
+TEST(ObPostingBlockDataTest, upper_bound_uint32)
+{
+  uint32_t doc_ids[37];
+  for (int64_t i = 0; i < 34; ++i) {
+    doc_ids[i] = i / 3 * 5;
+  }
+  doc_ids[34] = UINT32_MAX - 1;
+  doc_ids[35] = doc_ids[36] = UINT32_MAX;
+  assert_posting_upper_bound(doc_ids, ARRAYSIZEOF(doc_ids));
+}
+
+TEST(ObPostingBlockDataTest, upper_bound_uint64)
+{
+  uint64_t doc_ids[37];
+  doc_ids[0] = 0;
+  for (int64_t i = 1; i < 34; ++i) {
+    doc_ids[i] = static_cast<uint64_t>(UINT32_MAX) + i / 3;
+  }
+  doc_ids[34] = UINT64_MAX - 1;
+  doc_ids[35] = doc_ids[36] = UINT64_MAX;
+  assert_posting_upper_bound(doc_ids, ARRAYSIZEOF(doc_ids));
+}
+
 TEST(ObPostingBlockDataTest, lower_bound_window_boundaries)
 {
   uint64_t doc_ids[27];
@@ -907,8 +1101,11 @@ TEST(ObPostingBlockDataTest, lower_bound_window_boundaries)
     doc_ids[i] = static_cast<uint64_t>((i + 1) * 10);
   }
   ObPostingBlockData block_data;
-  block_data.doc_count_ = 27;
-  block_data.doc_ids_ = doc_ids;
+  ObPostingDocIdView ids;
+  ids.values_ = doc_ids;
+  ids.width_ = sizeof(uint64_t);
+  ObPostingRelevanceView relevance;
+  ASSERT_EQ(OB_SUCCESS, block_data.assign(27, ids, relevance));
 
   struct SearchCase
   {
@@ -951,8 +1148,12 @@ TEST(ObPostingBlockDataTest, lower_bound_unsigned_doc_ids)
       high_bit, high_bit + 10, high_bit + 20, high_bit + 30,
       high_bit + 40, UINT64_MAX};
   ObPostingBlockData block_data;
-  block_data.doc_count_ = static_cast<int64_t>(sizeof(doc_ids) / sizeof(doc_ids[0]));
-  block_data.doc_ids_ = doc_ids;
+  ObPostingDocIdView ids;
+  ids.values_ = doc_ids;
+  ids.width_ = sizeof(uint64_t);
+  ObPostingRelevanceView relevance;
+  ASSERT_EQ(OB_SUCCESS, block_data.assign(
+      static_cast<int64_t>(sizeof(doc_ids) / sizeof(doc_ids[0])), ids, relevance));
   int64_t idx = -1;
 
   ASSERT_EQ(OB_SUCCESS, block_data.lower_bound(high_bit, 0, 9, idx));
@@ -1054,19 +1255,6 @@ TEST_F(ObInvIdxMicroBlockTransformerTest, view_out_of_range_access)
   EXPECT_EQ(OB_INVALID_ARGUMENT, view.get_relevance_params(0, tf, dl));
 }
 
-// 4.8 init_invalid_block_size: view init with a buffer too small -> OB_INVALID_ARGUMENT.
-TEST_F(ObInvIdxMicroBlockTransformerTest, init_invalid_block_size)
-{
-  uint64_t doc_ids[5] = {10, 20, 30, 40, 50};
-  ObPostingBlockData view;
-  ASSERT_EQ(OB_SUCCESS, build_and_open_single_view(allocator_, encoder_, ctx_, col_descs_,
-      false, 5, doc_ids, nullptr, nullptr, view));
-  char tiny[4] = {0};
-  ObPostingBlockData bad_view;
-  EXPECT_EQ(OB_INVALID_ARGUMENT, bad_view.init(tiny, sizeof(tiny)));
-  EXPECT_EQ(OB_INVALID_ARGUMENT, bad_view.init(nullptr, 0));
-}
-
 // =============================================================================
 // Group 5 — Alignment and self-relative correctness (deep_copy equivalence)
 // =============================================================================
@@ -1102,11 +1290,16 @@ TEST_F(ObInvIdxMicroBlockTransformerTest, eight_byte_alignment)
   for (int64_t b = 0; b < block_count; ++b) {
     ObPostingBlockData view;
     ASSERT_EQ(OB_SUCCESS, reader.get_posting_block_data(b, view));
-    // each column pointer must be 8B-aligned
-    EXPECT_EQ(0, reinterpret_cast<uintptr_t>(view.doc_ids_) % sizeof(uint64_t));
+    ObPostingDocIdView doc_ids;
+    ASSERT_EQ(OB_SUCCESS, view.get_doc_id_view(0, doc_ids));
+    ASSERT_TRUE(doc_ids.is_valid());
+    EXPECT_EQ(0, reinterpret_cast<uintptr_t>(doc_ids.values_) % doc_ids.width_);
     if (view.has_relevance_params()) {
-      EXPECT_EQ(0, reinterpret_cast<uintptr_t>(view.token_freqs_) % sizeof(uint64_t));
-      EXPECT_EQ(0, reinterpret_cast<uintptr_t>(view.doc_lengths_) % sizeof(uint64_t));
+      ObPostingRelevanceView relevance;
+      ASSERT_EQ(OB_SUCCESS, view.get_relevance_view(0, relevance));
+      ASSERT_TRUE(relevance.has_relevance_params());
+      EXPECT_EQ(0, reinterpret_cast<uintptr_t>(relevance.token_freqs_) % relevance.width_);
+      EXPECT_EQ(0, reinterpret_cast<uintptr_t>(relevance.doc_lengths_) % relevance.width_);
     }
   }
 }
@@ -1350,9 +1543,9 @@ TEST_F(ObInvIdxMicroBlockTransformerTest, flat_cache_handles_small_and_multi_blo
   ASSERT_EQ(OB_SUCCESS, reader.get_posting_block_data(1, second_view));
   ASSERT_EQ(1, first_view.get_row_count());
   ASSERT_EQ(3, second_view.get_row_count());
-  EXPECT_EQ(7, first_view.get_doc_ids()[0]);
-  EXPECT_EQ(11, second_view.get_doc_ids()[0]);
-  EXPECT_EQ(17, second_view.get_doc_ids()[2]);
+  EXPECT_EQ(7, first_view.doc_id_at(0));
+  EXPECT_EQ(11, second_view.doc_id_at(0));
+  EXPECT_EQ(17, second_view.doc_id_at(2));
   const uint64_t *all_doc_ids = nullptr;
   int64_t all_doc_count = 0;
   ASSERT_EQ(OB_SUCCESS, reader.get_doc_id_view(0, 1, all_doc_ids, all_doc_count));
@@ -1394,15 +1587,291 @@ TEST_F(ObInvIdxMicroBlockTransformerTest, flat_cache_flattens_relevance_columns)
   ASSERT_EQ(OB_SUCCESS, reader.get_posting_block_data(1, block_data));
   ASSERT_TRUE(block_data.has_relevance_params());
   ASSERT_EQ(2, block_data.get_row_count());
+  const ObFlatCacheHeader *flat_header = reinterpret_cast<const ObFlatCacheHeader *>(
+      transformed_buf + micro_header.header_size_);
+  ASSERT_EQ(sizeof(uint32_t), static_cast<uint32_t>(flat_header->relevance_width_));
+  EXPECT_EQ(micro_header.header_size_ + sizeof(ObFlatCacheHeader)
+      + 2 * sizeof(ObFlatCacheBlockDesc) + 3 * 12 + 4, transformed_size);
+  ASSERT_EQ(sizeof(uint32_t), static_cast<uint16_t>(flat_header->doc_id_width_));
+  ASSERT_EQ(2, reader.get_block_count());
+  ObPostingBlockData first_block;
+  ASSERT_EQ(OB_SUCCESS, reader.get_posting_block_data(0, first_block));
+  ASSERT_EQ(1, first_block.get_row_count());
+  ObPostingDocIdView compact_ids;
+  ASSERT_EQ(OB_SUCCESS, first_block.get_doc_id_view(0, compact_ids));
+  ASSERT_TRUE(compact_ids.is_uint32());
+  EXPECT_EQ(3, compact_ids.at(0));
+  ASSERT_EQ(OB_SUCCESS, block_data.get_doc_id_view(0, compact_ids));
+  ASSERT_TRUE(compact_ids.is_uint32());
+  EXPECT_EQ(15, compact_ids.at(1));
+  const uint64_t *legacy_ids = reinterpret_cast<const uint64_t *>(1);
+  int64_t legacy_count = -1;
+  EXPECT_EQ(OB_NOT_SUPPORTED, reader.get_doc_id_view(0, 1, legacy_ids, legacy_count));
+  EXPECT_EQ(nullptr, legacy_ids);
+  EXPECT_EQ(0, legacy_count);
+  ObPostingRelevanceView relevance;
+  ASSERT_EQ(OB_SUCCESS, block_data.get_relevance_view(1, relevance));
+  ASSERT_TRUE(relevance.is_uint32());
+  ObPostingRelevanceView base_relevance;
+  ASSERT_EQ(OB_SUCCESS, block_data.get_relevance_view(0, base_relevance));
+  EXPECT_EQ(base_relevance.get_token_freqs32() + 1, relevance.get_token_freqs32());
+  EXPECT_EQ(base_relevance.get_doc_lengths32() + 1, relevance.get_doc_lengths32());
+  EXPECT_EQ(nullptr, relevance.get_token_freqs64());
+  EXPECT_EQ(4, relevance.get_token_freqs32()[0]);
+  EXPECT_EQ(40, relevance.get_doc_lengths32()[0]);
+  EXPECT_EQ(OB_INVALID_ARGUMENT, block_data.get_relevance_view(2, relevance));
+  EXPECT_FALSE(relevance.has_relevance_params());
   for (int64_t i = 0; i < block_data.get_row_count(); ++i) {
     uint64_t actual_token_freq = 0;
     uint64_t actual_doc_length = 0;
-    EXPECT_EQ(doc_ids[i + 1], block_data.get_doc_ids()[i]);
+    EXPECT_EQ(doc_ids[i + 1], block_data.doc_id_at(i));
     ASSERT_EQ(OB_SUCCESS, block_data.get_relevance_params(
         i, actual_token_freq, actual_doc_length));
     EXPECT_EQ(token_freqs[i + 1], actual_token_freq);
     EXPECT_EQ(doc_lengths[i + 1], actual_doc_length);
   }
+  // Reassigning uint64 columns must clear the previous uint32 pointers.
+  ObPostingDocIdView ids64;
+  ids64.values_ = doc_ids + 1;
+  ids64.width_ = sizeof(uint64_t);
+  ObPostingRelevanceView relevance64;
+  relevance64.token_freqs_ = token_freqs + 1;
+  relevance64.doc_lengths_ = doc_lengths + 1;
+  relevance64.width_ = sizeof(uint64_t);
+  ASSERT_EQ(OB_SUCCESS, block_data.assign(2, ids64, relevance64));
+  ObPostingDocIdView decoded_ids;
+  ASSERT_EQ(OB_SUCCESS, block_data.get_doc_id_view(0, decoded_ids));
+  EXPECT_FALSE(decoded_ids.is_uint32());
+  ASSERT_EQ(OB_SUCCESS, block_data.get_relevance_view(0, relevance));
+  EXPECT_FALSE(relevance.is_uint32());
+  ASSERT_NE(nullptr, relevance.get_token_freqs64());
+  EXPECT_EQ(2, relevance.get_token_freqs64()[0]);
+}
+
+// A single unsafe column forces uint64 for every logical block in this micro.
+// The normal writer's BM25 frontier is uint32, so mutate a valid packed delta
+// after encoding to exercise a legal uint64 decoder input above UINT32_MAX.
+TEST_F(ObInvIdxMicroBlockTransformerTest, flat_cache_relevance_uint64_fallback)
+{
+  uint64_t doc_ids[3] = {1, 3, 5};
+  uint64_t token_freqs[3] = {1, UINT32_MAX - 1ULL, UINT32_MAX};
+  uint64_t doc_lengths[3] = {20, 30, 40};
+  LogicalBlockSpec specs[2] = {
+      {1, doc_ids, token_freqs, doc_lengths},
+      {2, doc_ids + 1, token_freqs + 1, doc_lengths + 1}};
+  char *encoded_buf = nullptr;
+  int64_t encoded_size = 0;
+  ASSERT_EQ(OB_SUCCESS, build_encoded_posting_micro_block(
+      allocator_, encoder_, ctx_, col_descs_, true, specs, 2, encoded_buf, encoded_size));
+  ObInvIdxMicroBlockReader encoded_reader;
+  const char *logical_block = nullptr;
+  int64_t logical_size = 0;
+  ASSERT_EQ(OB_SUCCESS, encoded_reader.init(encoded_buf, encoded_size, false));
+  ASSERT_EQ(OB_SUCCESS, encoded_reader.get_payload(1, logical_block, logical_size));
+  const ObPostingColumnMeta *metas = reinterpret_cast<const ObPostingColumnMeta *>(
+      logical_block + sizeof(ObPostingBlockHeader));
+  const ObPostingColumnMeta &tf_meta = metas[POSTING_TOKEN_FREQ_COL_IDX];
+  ASSERT_EQ(ObPostingColEncodingType::PACKED_BASE, tf_meta.encoding_type_);
+  ASSERT_EQ(1, static_cast<int>(tf_meta.packed_width_));
+  ASSERT_EQ(UINT32_MAX - 1U, static_cast<uint32_t>(tf_meta.base_value_));
+  const_cast<char *>(logical_block)[tf_meta.offset_ + 1] = 2;
+  int64_t transformed_size = 0;
+  char *transformed_buf = nullptr;
+  ASSERT_EQ(OB_SUCCESS, verify_transformed_matches_oracle(
+      allocator_, decoder_, encoded_buf, encoded_size, true, transformed_size, transformed_buf));
+  ObMicroBlockHeader micro_header;
+  ASSERT_EQ(OB_SUCCESS, deserialize_micro_block_header(transformed_buf, transformed_size, micro_header));
+  const ObFlatCacheHeader *flat_header = reinterpret_cast<const ObFlatCacheHeader *>(
+      transformed_buf + micro_header.header_size_);
+  ASSERT_EQ(sizeof(uint64_t), static_cast<uint32_t>(flat_header->relevance_width_));
+  EXPECT_EQ(micro_header.header_size_ + sizeof(ObFlatCacheHeader)
+      + 2 * sizeof(ObFlatCacheBlockDesc) + 3 * 20 + 4, transformed_size);
+  ObFlatCacheReader reader;
+  ASSERT_EQ(OB_SUCCESS, reader.init(transformed_buf, transformed_size));
+  ObPostingBlockData block;
+  ObPostingRelevanceView relevance;
+  ASSERT_EQ(OB_SUCCESS, reader.get_posting_block_data(0, block));
+  ASSERT_EQ(OB_SUCCESS, block.get_relevance_view(0, relevance));
+  EXPECT_FALSE(relevance.is_uint32());
+  ASSERT_NE(nullptr, relevance.get_token_freqs64());
+  EXPECT_EQ(1, relevance.get_token_freqs64()[0]);
+  ASSERT_EQ(OB_SUCCESS, reader.get_posting_block_data(1, block));
+  ASSERT_EQ(OB_SUCCESS, block.get_relevance_view(1, relevance));
+  EXPECT_EQ(UINT32_MAX + 1ULL, relevance.get_token_freqs64()[0]);
+  EXPECT_EQ(40, relevance.get_doc_lengths64()[0]);
+  EXPECT_FALSE(relevance.is_uint32());
+}
+
+TEST_F(ObInvIdxMicroBlockTransformerTest, flat_cache_rejects_invalid_column_metadata)
+{
+  uint64_t doc_ids[2] = {1, 3};
+  uint64_t token_freqs[2] = {2, 4};
+  uint64_t doc_lengths[2] = {20, 40};
+  LogicalBlockSpec spec = {2, doc_ids, token_freqs, doc_lengths};
+  char *encoded_buf = nullptr;
+  int64_t encoded_size = 0;
+  ASSERT_EQ(OB_SUCCESS, build_encoded_posting_micro_block(
+      allocator_, encoder_, ctx_, col_descs_, true, &spec, 1, encoded_buf, encoded_size));
+  ObInvIdxMicroBlockReader encoded_reader;
+  const char *logical_block = nullptr;
+  int64_t logical_size = 0;
+  ASSERT_EQ(OB_SUCCESS, encoded_reader.init(encoded_buf, encoded_size, false));
+  ASSERT_EQ(OB_SUCCESS, encoded_reader.get_payload(0, logical_block, logical_size));
+  ObPostingColumnMeta *metas = reinterpret_cast<ObPostingColumnMeta *>(
+      const_cast<char *>(logical_block) + sizeof(ObPostingBlockHeader));
+  ObMicroBlockHeader micro_header;
+  ObMicroBlockDesMeta des_meta;
+  ObMacroBlockReader macro_reader;
+  ObInvIdxMicroBlockTransformer transformer;
+  ASSERT_EQ(OB_SUCCESS, deserialize_micro_block_header(encoded_buf, encoded_size, micro_header));
+  ASSERT_EQ(OB_SUCCESS, transformer.init(
+      micro_header, encoded_buf, encoded_size, des_meta, macro_reader, allocator_));
+  const ObPostingColumnMeta saved = metas[POSTING_TOKEN_FREQ_COL_IDX];
+  int64_t transformed_size = 123;
+  metas[POSTING_TOKEN_FREQ_COL_IDX].packed_width_ = 3;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, transformer.get_buf_size(transformed_size));
+  EXPECT_EQ(0, transformed_size);
+  metas[POSTING_TOKEN_FREQ_COL_IDX] = saved;
+  metas[POSTING_TOKEN_FREQ_COL_IDX].offset_ = static_cast<uint16_t>(logical_size);
+  EXPECT_EQ(OB_ERR_UNEXPECTED, transformer.get_buf_size(transformed_size));
+  EXPECT_EQ(0, transformed_size);
+  metas[POSTING_TOKEN_FREQ_COL_IDX] = saved;
+  metas[POSTING_TOKEN_FREQ_COL_IDX].offset_ = metas[POSTING_DOC_ID_COL_IDX].offset_;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, transformer.get_buf_size(transformed_size));
+  EXPECT_EQ(0, transformed_size);
+  metas[POSTING_TOKEN_FREQ_COL_IDX] = saved;
+  ASSERT_EQ(OB_SUCCESS, transformer.get_buf_size(transformed_size));
+  char *transformed_buf = static_cast<char *>(allocator_.alloc(transformed_size));
+  ASSERT_NE(nullptr, transformed_buf);
+  ASSERT_EQ(OB_SUCCESS, transformer.transform(transformed_buf, transformed_size));
+  ObFlatCacheReader reader;
+  ASSERT_EQ(OB_SUCCESS, reader.init(transformed_buf, transformed_size));
+  ObPostingBlockData block;
+  ASSERT_EQ(OB_SUCCESS, reader.get_posting_block_data(0, block));
+  EXPECT_EQ(doc_ids[1], block.doc_id_at(1));
+}
+
+TEST(ObPostingBlockDataTest, compact_doc_id_lower_bound_uint32_edges)
+{
+  uint32_t values[33];
+  for (int64_t i = 0; i < 33; ++i) { values[i] = UINT32_MAX - 64 + 2 * i; }
+  ObPostingBlockData block;
+  ObPostingDocIdView ids;
+  ids.values_ = values;
+  ids.width_ = sizeof(uint32_t);
+  ObPostingRelevanceView relevance;
+  ASSERT_EQ(OB_SUCCESS, block.assign(33, ids, relevance));
+  const uint64_t targets[] = {0, UINT32_MAX - 64ULL, UINT32_MAX - 35ULL,
+      UINT32_MAX - 32ULL, UINT32_MAX, UINT32_MAX + 1ULL, UINT64_MAX};
+  const int64_t ends[] = {1, 15, 16, 17, 31, 32, 33};
+  for (const int64_t end : ends) {
+    for (const uint64_t target : targets) {
+      const uint32_t *expected = std::lower_bound(values, values + end, target);
+      int64_t idx = -1;
+      const int ret = block.lower_bound(target, 0, end, idx);
+      EXPECT_EQ(expected == values + end ? OB_BEYOND_THE_RANGE : OB_SUCCESS, ret);
+      if (OB_SUCCESS == ret) { EXPECT_EQ(expected - values, idx); }
+    }
+  }
+}
+
+TEST_F(ObInvIdxMicroBlockTransformerTest, flat_cache_doc_id_packed_base_last_delta)
+{
+  uint64_t first_doc_ids[] = {1, 65537};
+  uint64_t second_doc_ids[] = {UINT32_MAX - 1ULL, UINT32_MAX};
+  uint64_t token_freqs[] = {1, 2, 3, 4};
+  uint64_t doc_lengths[] = {10, 20, 30, 40};
+  LogicalBlockSpec specs[2] = {
+      {2, first_doc_ids, token_freqs, doc_lengths},
+      {2, second_doc_ids, token_freqs + 2, doc_lengths + 2}};
+  char *encoded_buf = nullptr;
+  int64_t encoded_size = 0;
+  ASSERT_EQ(OB_SUCCESS, build_encoded_posting_micro_block(
+      allocator_, encoder_, ctx_, col_descs_, true, specs, 2, encoded_buf, encoded_size));
+
+  ObInvIdxMicroBlockReader encoded_reader;
+  ASSERT_EQ(OB_SUCCESS, encoded_reader.init(encoded_buf, encoded_size, false));
+  const char *encoded_block = nullptr;
+  int64_t block_size = 0;
+  ASSERT_EQ(OB_SUCCESS, encoded_reader.get_payload(0, encoded_block, block_size));
+  const ObPostingColumnMeta *metas = reinterpret_cast<const ObPostingColumnMeta *>(
+      encoded_block + sizeof(ObPostingBlockHeader));
+  EXPECT_EQ(ObPostingColEncodingType::PACKED_BASE, metas[POSTING_DOC_ID_COL_IDX].encoding_type_);
+  EXPECT_EQ(4, metas[POSTING_DOC_ID_COL_IDX].packed_width_);
+  EXPECT_EQ(1U, metas[POSTING_DOC_ID_COL_IDX].base_value_);
+  ASSERT_EQ(OB_SUCCESS, encoded_reader.get_payload(1, encoded_block, block_size));
+  metas = reinterpret_cast<const ObPostingColumnMeta *>(
+      encoded_block + sizeof(ObPostingBlockHeader));
+  EXPECT_EQ(ObPostingColEncodingType::PACKED_BASE, metas[POSTING_DOC_ID_COL_IDX].encoding_type_);
+  EXPECT_EQ(1, metas[POSTING_DOC_ID_COL_IDX].packed_width_);
+  EXPECT_EQ(UINT32_MAX - 1U, metas[POSTING_DOC_ID_COL_IDX].base_value_);
+
+  char *transformed_buf = nullptr;
+  int64_t transformed_size = 0;
+  ASSERT_EQ(OB_SUCCESS, verify_transformed_matches_oracle(
+      allocator_, decoder_, encoded_buf, encoded_size, true, transformed_size, transformed_buf));
+  ObMicroBlockHeader micro_header;
+  ASSERT_EQ(OB_SUCCESS, deserialize_micro_block_header(
+      transformed_buf, transformed_size, micro_header));
+  const ObFlatCacheHeader *flat_header = reinterpret_cast<const ObFlatCacheHeader *>(
+      transformed_buf + micro_header.header_size_);
+  EXPECT_EQ(sizeof(uint32_t), flat_header->doc_id_width_);
+  ObFlatCacheReader reader;
+  ASSERT_EQ(OB_SUCCESS, reader.init(transformed_buf, transformed_size));
+  ASSERT_EQ(2, reader.get_block_count());
+  ObPostingBlockData block;
+  ASSERT_EQ(OB_SUCCESS, reader.get_posting_block_data(0, block));
+  ObPostingDocIdView ids;
+  ASSERT_EQ(OB_SUCCESS, block.get_doc_id_view(0, ids));
+  ASSERT_TRUE(ids.is_uint32());
+  ASSERT_EQ(2, block.get_row_count());
+  EXPECT_EQ(first_doc_ids[0], ids.at(0));
+  EXPECT_EQ(first_doc_ids[1], ids.at(1));
+  ASSERT_EQ(OB_SUCCESS, reader.get_posting_block_data(1, block));
+  ASSERT_EQ(OB_SUCCESS, block.get_doc_id_view(0, ids));
+  ASSERT_TRUE(ids.is_uint32());
+  ASSERT_EQ(2, block.get_row_count());
+  EXPECT_EQ(second_doc_ids[0], ids.at(0));
+  EXPECT_EQ(second_doc_ids[1], ids.at(1));
+}
+
+TEST_F(ObInvIdxMicroBlockTransformerTest, flat_cache_doc_id_uint64_fallback)
+{
+  uint64_t doc_ids[] = {7, UINT32_MAX - 1ULL, UINT32_MAX + 1ULL};
+  uint64_t tfs[] = {1, 2, 3};
+  uint64_t dls[] = {20, 30, 40};
+  LogicalBlockSpec specs[2] = {{1, doc_ids, tfs, dls}, {2, doc_ids + 1, tfs + 1, dls + 1}};
+  char *encoded_buf = nullptr;
+  int64_t encoded_size = 0;
+  ASSERT_EQ(OB_SUCCESS, build_encoded_posting_micro_block(
+      allocator_, encoder_, ctx_, col_descs_, true, specs, 2, encoded_buf, encoded_size));
+  char *transformed_buf = nullptr;
+  int64_t transformed_size = 0;
+  ASSERT_EQ(OB_SUCCESS, verify_transformed_matches_oracle(
+      allocator_, decoder_, encoded_buf, encoded_size, true, transformed_size, transformed_buf));
+  ObFlatCacheReader reader;
+  ASSERT_EQ(OB_SUCCESS, reader.init(transformed_buf, transformed_size));
+  ASSERT_EQ(2, reader.get_block_count());
+  ObPostingBlockData block;
+  ASSERT_EQ(OB_SUCCESS, reader.get_posting_block_data(0, block));
+  ObPostingDocIdView ids;
+  ASSERT_EQ(OB_SUCCESS, block.get_doc_id_view(0, ids));
+  EXPECT_FALSE(ids.is_uint32());
+  ASSERT_EQ(1, block.get_row_count());
+  EXPECT_EQ(7, ids.at(0));
+  ASSERT_EQ(OB_SUCCESS, reader.get_posting_block_data(1, block));
+  ASSERT_EQ(2, block.get_row_count());
+  ObPostingDocIdView block_ids;
+  ObPostingRelevanceView block_relevance;
+  ASSERT_EQ(OB_SUCCESS, block.get_doc_id_view(0, block_ids));
+  ASSERT_EQ(OB_SUCCESS, block.get_relevance_view(0, block_relevance));
+  EXPECT_FALSE(block_ids.is_uint32());
+  EXPECT_EQ(UINT32_MAX - 1ULL, block_ids.at(0));
+  EXPECT_EQ(UINT32_MAX + 1ULL, block_ids.at(1));
+  EXPECT_TRUE(block_relevance.is_uint32());
+  int64_t idx = -1;
+  ASSERT_EQ(OB_SUCCESS, block.lower_bound(UINT32_MAX, 0, 2, idx));
+  EXPECT_EQ(1, idx);
 }
 
 } // end namespace blocksstable
@@ -1410,6 +1879,7 @@ TEST_F(ObInvIdxMicroBlockTransformerTest, flat_cache_flattens_relevance_columns)
 
 int main(int argc, char **argv)
 {
+  oceanbase::common::init_arches();
   system("rm -f test_inv_idx_micro_block_transformer.log*");
   testing::InitGoogleTest(&argc, argv);
   oceanbase::lib::set_memory_limit(40UL << 30);

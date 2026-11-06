@@ -16,27 +16,12 @@ ObInvIdxMicroBlockReader::ObInvIdxMicroBlockReader()
     payload_size_(0),
     header_(nullptr),
     offsets_(nullptr),
-    flat_cache_reader_(),
     is_inited_(false)
 {
 }
 
 ObInvIdxMicroBlockReader::~ObInvIdxMicroBlockReader()
 {
-}
-
-int ObInvIdxMicroBlockReader::init_flat_cache(
-    const char *micro_block_buf,
-    const int64_t micro_block_size)
-{
-  int ret = OB_SUCCESS;
-  reuse();
-  if (OB_FAIL(flat_cache_reader_.init(micro_block_buf, micro_block_size))) {
-    LOG_WARN("failed to init FlatCache value", K(ret), K(micro_block_size));
-  } else {
-    is_inited_ = true;
-  }
-  return ret;
 }
 
 int ObInvIdxMicroBlockReader::init(
@@ -131,8 +116,8 @@ int ObInvIdxMicroBlockReader::get_payload(
     ret = OB_NOT_INIT;
     LOG_WARN("inv idx data micro block reader not inited", K(ret));
   } else if (OB_ISNULL(header_)) {
-    ret = OB_NOT_SUPPORTED;
-    LOG_WARN("FlatCache layout has no per-block payload", K(ret), K(block_idx));
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("inverted index payload header is null", K(ret), K(block_idx));
   } else if (OB_UNLIKELY(block_idx < 0 || block_idx >= header_->block_count_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("block idx out of range", K(ret), K(block_idx), K(header_->block_count_));
@@ -156,55 +141,9 @@ int ObInvIdxMicroBlockReader::get_payload(
   return ret;
 }
 
-int ObInvIdxMicroBlockReader::get_posting_block_data(
-    const int64_t block_idx,
-    ObPostingBlockData &block_data) const
-{
-  int ret = OB_SUCCESS;
-  block_data.reset();
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("inv idx data micro block reader not inited", K(ret));
-  } else if (OB_NOT_NULL(header_)) {
-    ret = OB_NOT_SUPPORTED;
-    LOG_WARN("encoded posting block is not a cache value", K(ret), K(block_idx));
-  } else if (OB_FAIL(flat_cache_reader_.get_posting_block_data(block_idx, block_data))) {
-    LOG_WARN("failed to get FlatCache block", K(ret), K(block_idx));
-  }
-  return ret;
-}
-
-int ObInvIdxMicroBlockReader::get_doc_id_view(
-    const int64_t first_block_idx,
-    const int64_t last_block_idx,
-    const uint64_t *&doc_ids,
-    int64_t &doc_count) const
-{
-  int ret = OB_SUCCESS;
-  doc_ids = nullptr;
-  doc_count = 0;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("inv idx data micro block reader not inited", K(ret));
-  } else if (OB_NOT_NULL(header_)) {
-    ret = OB_NOT_SUPPORTED;
-    LOG_WARN("encoded posting block has no contiguous doc-id view", K(ret),
-             K(first_block_idx), K(last_block_idx));
-  } else if (OB_FAIL(flat_cache_reader_.get_doc_id_view(
-             first_block_idx, last_block_idx, doc_ids, doc_count))) {
-    LOG_WARN("failed to get FlatCache doc-id view", K(ret),
-             K(first_block_idx), K(last_block_idx));
-  }
-  return ret;
-}
-
 int64_t ObInvIdxMicroBlockReader::get_block_count() const
 {
-  return !is_inited_
-         ? 0
-         : OB_NOT_NULL(header_)
-           ? header_->block_count_
-           : flat_cache_reader_.get_block_count();
+  return is_inited_ && OB_NOT_NULL(header_) ? header_->block_count_ : 0;
 }
 
 void ObInvIdxMicroBlockReader::reuse()
@@ -213,7 +152,6 @@ void ObInvIdxMicroBlockReader::reuse()
   payload_size_ = 0;
   header_ = nullptr;
   offsets_ = nullptr;
-  flat_cache_reader_.reset();
   is_inited_ = false;
 }
 

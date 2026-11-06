@@ -27,11 +27,17 @@
 #include "sql/das/search/ob_das_search_utils.h"
 #include "sql/das/search/ob_das_filter_bitmap_provider.h"
 #include "storage/retrieval/ob_inv_idx_param_cache.h"
+#include "storage/access/ob_async_inv_iterator_pool.h"
+#include "storage/blocksstable/async_index/ob_inv_sstable_posting_iter.h"
 #include "lib/oblog/ob_log_module.h"
 #include "share/logical_table/ob_logical_table_define.h"
 
 namespace oceanbase
 {
+namespace storage
+{
+class ObAsyncInvIteratorPool;
+}
 namespace sql
 {
 
@@ -120,7 +126,10 @@ public:
       async_group_slot_(-1),
       async_direct_bind_(false),
       generating_group_filter_domain_(false),
-      filter_bitmap_providers_()
+      filter_bitmap_providers_(),
+      inv_iter_pool_(nullptr),
+      enable_inv_iter_pool_(false),
+      posting_table_cache_()
   { }
 
   ~ObDASSearchCtx() { reset(); }
@@ -168,6 +177,14 @@ public:
   { return nullptr != eval_ctx_ && nullptr != rowid_exprs_ && nullptr != output_ && nullptr != mock_skip_ && table_row_count_.is_valid(); }
   OB_INLINE int64_t max_batch_size() const { return eval_ctx_->max_batch_size_; }
   OB_INLINE storage::ObInvIdxParamCache &get_bm25_param_cache() { return bm25_param_cache_; }
+  // A null Entry means that the caller must use its original allocation path.
+  int acquire_posting_entry(blocksstable::ObInvPostingIterEntry *&entry);
+  int prepare_posting_scan(const bool use_pool, common::ObIAllocator &scan_allocator,
+      blocksstable::ObInvPostingScanParam &param, blocksstable::ObInvPostingIterEntry *&entry);
+  void close_posting_scan(blocksstable::ObInvPostingScanParam &param,
+      common::ObIAllocator &scan_allocator, blocksstable::ObInvPostingIterEntry *&entry,
+      blocksstable::ObInvSSTablePostingIter *&iter);
+  blocksstable::ObInvPostingTableCache &get_posting_table_cache() { return posting_table_cache_; }
   OB_INLINE RowMeta &get_rowid_meta() { return rowid_meta_; }
   OB_INLINE const transaction::ObTxReadSnapshot *get_snapshot() const { return snapshot_; }
   OB_INLINE const common::ObIArray<ObExpr *> &get_rowid_exprs() const { return *rowid_exprs_; }
@@ -440,6 +457,10 @@ private:
   // isolated by group_slot. Provider ordinals remain deterministic across
   // Fusion parallel RtDef clones and are used for shared-bitmap injection.
   ObSEArray<ObDASFilterBitmapProvider *, 4> filter_bitmap_providers_;
+  // Holds one pool reference until reset(); there is no query-local Entry cache.
+  storage::ObAsyncInvIteratorPool *inv_iter_pool_;
+  bool enable_inv_iter_pool_;
+  blocksstable::ObInvPostingTableCache posting_table_cache_;
 
 private:
   struct EstimateScanInput
@@ -538,6 +559,7 @@ private:
                                           int64_t col_idx);
 
   static const RowIDFuncs all_rowid_funcs_[DAS_ROWID_TYPE_MAX];
+  DISALLOW_COPY_AND_ASSIGN(ObDASSearchCtx);
 };
 
 // Temporary binding guard used during tree construction. Restores bindings on scope exit

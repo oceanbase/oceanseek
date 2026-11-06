@@ -36,6 +36,19 @@ static int64_t count_less_than_target_avx512(
 )
 #endif
 
+#if OB_USE_MULTITARGET_CODE
+OB_DECLARE_AVX512_SPECIFIC_CODE(
+static int64_t count_less_than_target_uint32_avx512(
+    const uint32_t *doc_ids, const uint32_t target)
+{
+  const __m512i values = _mm512_loadu_si512(reinterpret_cast<const void *>(doc_ids));
+  const __m512i target_vec = _mm512_set1_epi32(static_cast<int32_t>(target));
+  const __mmask16 less_mask = _mm512_cmp_epu32_mask(values, target_vec, _MM_CMPINT_LT);
+  return static_cast<int64_t>(__builtin_popcount(static_cast<unsigned int>(less_mask)));
+}
+)
+#endif
+
 #if OB_ARM_USE_MULTITARGET_CODE
 OB_DECLARE_NEON_SPECIFIC_CODE(
 static int64_t count_less_than_target_neon(
@@ -52,21 +65,36 @@ static int64_t count_less_than_target_neon(
 )
 #endif
 
+#if OB_ARM_USE_MULTITARGET_CODE
+OB_DECLARE_NEON_SPECIFIC_CODE(
+static int64_t count_less_than_target_uint32_neon(
+    const uint32_t *doc_ids, const uint32_t target)
+{
+  const uint32x4_t target_vec = vdupq_n_u32(target);
+  uint32x4_t counts = vshrq_n_u32(vcltq_u32(vld1q_u32(doc_ids), target_vec), 31);
+  counts = vaddq_u32(counts, vshrq_n_u32(vcltq_u32(vld1q_u32(doc_ids + 4), target_vec), 31));
+  counts = vaddq_u32(counts, vshrq_n_u32(vcltq_u32(vld1q_u32(doc_ids + 8), target_vec), 31));
+  counts = vaddq_u32(counts, vshrq_n_u32(vcltq_u32(vld1q_u32(doc_ids + 12), target_vec), 31));
+  return static_cast<int64_t>(vaddvq_u32(counts));
+}
+)
+#endif
+
 ObFlatCacheReader::ObFlatCacheReader()
   : header_(nullptr),
     descs_(nullptr),
-    doc_ids_(nullptr),
-    token_freqs_(nullptr),
-    doc_lengths_(nullptr)
+    doc_ids_(),
+    relevance_(),
+    row_count_(0)
 {}
 
 void ObFlatCacheReader::reset()
 {
   header_ = nullptr;
   descs_ = nullptr;
-  doc_ids_ = nullptr;
-  token_freqs_ = nullptr;
-  doc_lengths_ = nullptr;
+  doc_ids_.reset();
+  relevance_.reset();
+  row_count_ = 0;
 }
 
 int ObFlatCacheReader::init(
@@ -98,9 +126,11 @@ int ObFlatCacheReader::init(
     const int64_t payload_size = micro_header.data_length_;
     const ObFlatCacheHeader *header = reinterpret_cast<const ObFlatCacheHeader *>(payload);
     const uint64_t base = reinterpret_cast<uintptr_t>(payload);
-    const uint64_t doc_ids_offset = sizeof(ObFlatCacheHeader) + static_cast<uint64_t>(header->block_count_) * sizeof(ObFlatCacheBlockDesc);
-    const uint64_t column_bytes = static_cast<uint64_t>(micro_header.row_count_) * sizeof(uint64_t);
-    const uint64_t expected_size = doc_ids_offset + column_bytes * header->column_count_;
+    const uint64_t doc_ids_offset = ObFlatCacheHeader::doc_ids_offset(header->block_count_);
+    const uint64_t relevance_offset = ObFlatCacheHeader::relevance_offset(
+        header->block_count_, micro_header.row_count_, header->doc_id_width_);
+    const uint64_t expected_size = ObFlatCacheHeader::payload_size(
+        header->block_count_, micro_header.row_count_, header->doc_id_width_, header->relevance_width_);
     const bool layout_valid = header->is_valid()
                               && 0 == base % sizeof(uint64_t)
                               && expected_size == static_cast<uint64_t>(payload_size);
@@ -109,12 +139,47 @@ int ObFlatCacheReader::init(
       STORAGE_LOG(WARN, "invalid posting micro block cache layout", K(ret), K(payload_size), KPC(header));
     } else {
       header_ = header;
+      row_count_ = micro_header.row_count_;
       descs_ = reinterpret_cast<const ObFlatCacheBlockDesc *>(payload + sizeof(ObFlatCacheHeader));
-      doc_ids_ = reinterpret_cast<const uint64_t *>(payload + doc_ids_offset);
+      doc_ids_.values_ = payload + doc_ids_offset;
+      doc_ids_.width_ = header->doc_id_width_;
       if (header->has_relevance_params()) {
-        token_freqs_ = doc_ids_ + micro_header.row_count_;
-        doc_lengths_ = token_freqs_ + micro_header.row_count_;
+        relevance_.token_freqs_ = payload + relevance_offset;
+        relevance_.doc_lengths_ = payload + relevance_offset
+            + static_cast<uint64_t>(micro_header.row_count_) * header->relevance_width_;
+        relevance_.width_ = header->relevance_width_;
       }
+    }
+  }
+  return ret;
+}
+
+int ObFlatCacheReader::assign_columns(
+    const int64_t start_idx, const int64_t doc_count, ObPostingBlockData &block_data) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(nullptr == header_ || start_idx < 0 || doc_count <= 0
+      || start_idx > row_count_ || doc_count > row_count_ - start_idx)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    ObPostingDocIdView ids = doc_ids_;
+    if (ids.is_uint32()) {
+      ids.values_ = doc_ids_.get_uint32() + start_idx;
+    } else {
+      ids.values_ = doc_ids_.get_uint64() + start_idx;
+    }
+    ObPostingRelevanceView relevance = relevance_;
+    if (relevance.has_relevance_params()) {
+      if (relevance.is_uint32()) {
+        relevance.token_freqs_ = relevance_.get_token_freqs32() + start_idx;
+        relevance.doc_lengths_ = relevance_.get_doc_lengths32() + start_idx;
+      } else {
+        relevance.token_freqs_ = relevance_.get_token_freqs64() + start_idx;
+        relevance.doc_lengths_ = relevance_.get_doc_lengths64() + start_idx;
+      }
+    }
+    if (OB_FAIL(block_data.assign(doc_count, ids, relevance))) {
+      STORAGE_LOG(WARN, "failed to bind posting columns", K(ret), K(start_idx), K(doc_count));
     }
   }
   return ret;
@@ -140,8 +205,13 @@ int ObFlatCacheReader::get_doc_id_view(
     const ObFlatCacheBlockDesc &first = descs_[first_block_idx];
     const ObFlatCacheBlockDesc &last = descs_[last_block_idx];
     const uint64_t end = static_cast<uint64_t>(last.doc_offset_) + last.doc_count_;
-    doc_ids = doc_ids_ + first.doc_offset_;
-    doc_count = static_cast<int64_t>(end - first.doc_offset_);
+    const uint64_t *flat_doc_ids = doc_ids_.get_uint64();
+    if (nullptr == flat_doc_ids) {
+      ret = OB_NOT_SUPPORTED;
+    } else {
+      doc_ids = flat_doc_ids + first.doc_offset_;
+      doc_count = static_cast<int64_t>(end - first.doc_offset_);
+    }
   }
   return ret;
 }
@@ -160,44 +230,68 @@ int ObFlatCacheReader::get_posting_block_data(
     STORAGE_LOG(WARN, "posting micro block index is invalid", K(ret), K(block_idx), K(header_->block_count_));
   } else {
     const ObFlatCacheBlockDesc &desc = descs_[block_idx];
-    block_data.doc_count_ = desc.doc_count_;
-    block_data.doc_ids_ = doc_ids_ + desc.doc_offset_;
-    block_data.token_freqs_ = OB_NOT_NULL(token_freqs_) ? token_freqs_ + desc.doc_offset_ : nullptr;
-    block_data.doc_lengths_ = OB_NOT_NULL(doc_lengths_) ? doc_lengths_ + desc.doc_offset_ : nullptr;
+    if (OB_FAIL(assign_columns(desc.doc_offset_, desc.doc_count_, block_data))) {
+      STORAGE_LOG(WARN, "failed to assign posting block columns", K(ret), K(block_idx));
+    }
   }
   return ret;
 }
 
-int ObPostingBlockData::init(const char *block_buf, const int64_t block_size)
+int ObPostingBlockData::assign(
+    const int64_t doc_count, const ObPostingDocIdView &doc_ids,
+    const ObPostingRelevanceView &relevance)
 {
   int ret = OB_SUCCESS;
-  doc_count_ = 0;
-  doc_ids_ = nullptr;
-  token_freqs_ = nullptr;
-  doc_lengths_ = nullptr;
-  const ObPostingBlockHeader *header = reinterpret_cast<const ObPostingBlockHeader *>(block_buf);
-  if (OB_ISNULL(block_buf) || OB_UNLIKELY(block_size < HEADER_SIZE)) {
+  reset();
+  const bool has_relevance = relevance.has_relevance_params();
+  if (OB_UNLIKELY(doc_count <= 0 || !doc_ids.is_valid()
+      || (nullptr == relevance.token_freqs_) != (nullptr == relevance.doc_lengths_)
+      || (has_relevance
+          ? (sizeof(uint32_t) != relevance.width_ && sizeof(uint64_t) != relevance.width_)
+          : 0 != relevance.width_))) {
     ret = OB_INVALID_ARGUMENT;
-    STORAGE_LOG(WARN, "invalid decoded posting block buffer", K(ret), KP(block_buf), K(block_size));
-  } else if (OB_UNLIKELY(!header->is_valid())) {
-    ret = OB_INVALID_ARGUMENT;
-    STORAGE_LOG(WARN, "invalid decoded posting block header", K(ret), KPC(header));
   } else {
-    const int64_t row_count = header->row_count_;
-    const int64_t col_cnt = header->get_column_count();
-    const int64_t expected_size = HEADER_SIZE + col_cnt * row_count * COL_WIDTH;
-    if (OB_UNLIKELY(block_size < expected_size)) {
-      ret = OB_INVALID_ARGUMENT;
-      STORAGE_LOG(WARN, "decoded posting block buffer too small", K(ret), K(block_size),
-          K(expected_size), K(row_count), K(col_cnt));
+    doc_count_ = doc_count;
+    doc_ids_ = doc_ids;
+    relevance_ = relevance;
+  }
+  return ret;
+}
+
+int ObPostingBlockData::get_doc_id_view(
+    const int64_t start_idx, ObPostingDocIdView &view) const
+{
+  int ret = OB_SUCCESS;
+  view.reset();
+  if (OB_UNLIKELY(!is_valid() || start_idx < 0 || start_idx >= doc_count_)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    view = doc_ids_;
+    if (view.is_uint32()) {
+      view.values_ = doc_ids_.get_uint32() + start_idx;
     } else {
-      const uint64_t *columns = reinterpret_cast<const uint64_t *>(block_buf + HEADER_SIZE);
-      doc_count_ = row_count;
-      doc_ids_ = columns;
-      if (header->has_relevance_params_) {
-        token_freqs_ = doc_ids_ + row_count;
-        doc_lengths_ = token_freqs_ + row_count;
-      }
+      view.values_ = doc_ids_.get_uint64() + start_idx;
+    }
+  }
+  return ret;
+}
+
+int ObPostingBlockData::get_relevance_view(
+    const int64_t start_idx, ObPostingRelevanceView &view) const
+{
+  int ret = OB_SUCCESS;
+  view.reset();
+  if (OB_UNLIKELY(!is_valid() || start_idx < 0 || start_idx >= doc_count_)) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "invalid relevance projection", K(ret), K(start_idx), K_(doc_count));
+  } else if (relevance_.has_relevance_params()) {
+    view = relevance_;
+    if (view.is_uint32()) {
+      view.token_freqs_ = relevance_.get_token_freqs32() + start_idx;
+      view.doc_lengths_ = relevance_.get_doc_lengths32() + start_idx;
+    } else {
+      view.token_freqs_ = relevance_.get_token_freqs64() + start_idx;
+      view.doc_lengths_ = relevance_.get_doc_lengths64() + start_idx;
     }
   }
   return ret;
@@ -210,7 +304,7 @@ int ObPostingBlockData::get_doc_id(const int64_t idx, uint64_t &doc_id) const
     ret = OB_INVALID_ARGUMENT;
     STORAGE_LOG(WARN, "invalid doc_id access", K(ret), KPC(this), K(idx));
   } else {
-    doc_id = doc_ids_[idx];
+    doc_id = doc_id_at(idx);
   }
   return ret;
 }
@@ -225,8 +319,30 @@ int ObPostingBlockData::get_relevance_params(
     ret = OB_INVALID_ARGUMENT;
     STORAGE_LOG(WARN, "invalid relevance params access", K(ret), KPC(this), K(idx));
   } else {
-    token_freq = token_freqs_[idx];
-    doc_length = doc_lengths_[idx];
+    if (relevance_.is_uint32()) {
+      token_freq = relevance_.get_token_freqs32()[idx];
+      doc_length = relevance_.get_doc_lengths32()[idx];
+    } else {
+      token_freq = relevance_.get_token_freqs64()[idx];
+      doc_length = relevance_.get_doc_lengths64()[idx];
+    }
+  }
+  return ret;
+}
+
+int ObPostingBlockData::upper_bound(
+    const uint64_t target, const int64_t start, const int64_t end, int64_t &idx) const
+{
+  int ret = OB_SUCCESS;
+  idx = 0;
+  // Search with target + 1 only when the last DocID exceeds target, preventing overflow.
+  if (OB_UNLIKELY(!is_valid() || start < 0 || end <= start || end > doc_count_)) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "invalid upper_bound range", K(ret), K(start), K(end), K_(doc_count));
+  } else if (target >= doc_id_at(end - 1)) {
+    idx = end;
+  } else if (OB_FAIL(lower_bound(target + 1, start, end, idx))) {
+    STORAGE_LOG(WARN, "failed to locate posting upper bound", K(ret), K(target), K(start), K(end));
   }
   return ret;
 }
@@ -239,26 +355,55 @@ int ObPostingBlockData::lower_bound(
 {
   int ret = OB_SUCCESS;
   idx = 0;
+  const uint32_t *doc_ids32 = doc_ids_.get_uint32();
+  const uint64_t *doc_ids = doc_ids_.get_uint64();
   if (OB_UNLIKELY(!is_valid() || start < 0 || end <= start || end > doc_count_)) {
     ret = OB_INVALID_ARGUMENT;
     STORAGE_LOG(WARN, "invalid lower_bound range", K(ret), KPC(this), K(start), K(end));
+  } else if (nullptr != doc_ids32) {
+    if (target > UINT32_MAX) {
+      idx = end;
+      ret = OB_BEYOND_THE_RANGE;
+    } else {
+      static constexpr int64_t WINDOW_WIDTH = 16;
+      int64_t pos_idx = start;
+      while (pos_idx + WINDOW_WIDTH < end && doc_ids32[pos_idx + WINDOW_WIDTH] < target) {
+        pos_idx += WINDOW_WIDTH + 1;
+      }
+#if OB_USE_MULTITARGET_CODE
+      if (pos_idx + WINDOW_WIDTH <= end && common::is_arch_supported(common::ObTargetArch::AVX512)) {
+        pos_idx += specific::avx512::count_less_than_target_uint32_avx512(
+            doc_ids32 + pos_idx, static_cast<uint32_t>(target));
+      } else
+#elif OB_ARM_USE_MULTITARGET_CODE
+      if (pos_idx + WINDOW_WIDTH <= end && common::is_arch_supported(common::ObTargetArch::NEON)) {
+        pos_idx += specific::neon::count_less_than_target_uint32_neon(
+            doc_ids32 + pos_idx, static_cast<uint32_t>(target));
+      } else
+#endif
+      {
+        while (pos_idx < end && doc_ids32[pos_idx] < target) { ++pos_idx; }
+      }
+      idx = pos_idx;
+      if (idx >= end) { ret = OB_BEYOND_THE_RANGE; }
+    }
   } else {
     static constexpr int64_t WINDOW_WIDTH = 8;
     int64_t pos_idx = start;
-    while (pos_idx + WINDOW_WIDTH < end && doc_ids_[pos_idx + WINDOW_WIDTH] < target) {
+    while (pos_idx + WINDOW_WIDTH < end && doc_ids[pos_idx + WINDOW_WIDTH] < target) {
       pos_idx += WINDOW_WIDTH + 1;
     }
 #if OB_USE_MULTITARGET_CODE
     if (pos_idx + WINDOW_WIDTH < end && common::is_arch_supported(common::ObTargetArch::AVX512)) {
-      pos_idx += specific::avx512::count_less_than_target_avx512(doc_ids_ + pos_idx, target);
+      pos_idx += specific::avx512::count_less_than_target_avx512(doc_ids + pos_idx, target);
     } else
 #elif OB_ARM_USE_MULTITARGET_CODE
     if (pos_idx + WINDOW_WIDTH < end && common::is_arch_supported(common::ObTargetArch::NEON)) {
-      pos_idx += specific::neon::count_less_than_target_neon(doc_ids_ + pos_idx, target);
+      pos_idx += specific::neon::count_less_than_target_neon(doc_ids + pos_idx, target);
     } else
 #endif
     {
-      while (pos_idx < end && doc_ids_[pos_idx] < target) {
+      while (pos_idx < end && doc_ids[pos_idx] < target) {
         ++pos_idx;
       }
     }

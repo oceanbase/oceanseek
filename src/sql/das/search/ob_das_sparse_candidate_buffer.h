@@ -47,18 +47,50 @@ public:
 
   // Append one candidate and mark it alive. doc_id must be greater than the last candidate.
   int append(const uint64_t doc_id, const double initial_score);
+  // Input IDs are strictly increasing; reserve room for the entire input batch.
+  // Keep rows whose partial scores exceed min_required_score.
+  int append_competitive_batch(const uint64_t *doc_ids, const double *scores,
+      const int64_t count, const double min_required_score);
 
   // Return the doc_id at a candidate slot. The return value is false when the buffer is
   // not initialized, the slot is out of range, or the candidate has been pruned. Callers
   // normally iterate slots from zero to get_count() - 1 and skip false results.
   bool get_doc_id(const int64_t idx, uint64_t &doc_id) const;
 
+  // Raw IDs; prune_below leaves dead slots, while prune_and_compact removes them.
+  OB_INLINE const uint64_t *get_doc_ids() const { return doc_ids_.get_data(); }
+
   // Add a dimension score to an existing alive candidate slot.
   int add_score(const int64_t idx, const double score);
+
+  // Match sorted uint32/uint64 postings without widening; slot persists across batches.
+  // Evaluate the scorer only for matches and append their count to scored_count.
+  template <typename DocIdT, typename Scorer>
+  OB_INLINE int add_scored_dim_batch(const DocIdT *doc_ids, const int64_t count,
+      const Scorer &scorer, int64_t &slot, int64_t &scored_count)
+  {
+    int ret = OB_SUCCESS;
+    const uint64_t *candidate_ids = get_doc_ids();
+    for (int64_t i = 0; OB_SUCC(ret) && i < count && slot < count_; ++i) {
+      while (slot < count_ && candidate_ids[slot] < doc_ids[i]) {
+        ++slot;
+      }
+      if (slot >= count_ || candidate_ids[slot] != doc_ids[i]) {
+      } else if (OB_FAIL(add_score(slot, scorer(i)))) {
+        LOG_WARN("failed to supplement compact candidate", K(ret), K(slot), K(doc_ids[i]));
+      } else {
+        ++slot;
+        ++scored_count;
+      }
+    }
+    return ret;
+  }
 
   // Mark alive candidates whose accumulated score is not greater than min_required_score
   // as pruned. Comparison semantics match an output predicate of score > min_score.
   int prune_below(const double min_required_score);
+  // Before output starts, remove pruned slots and preserve the surviving ID order.
+  int prune_and_compact(const double min_required_score);
 
   // Advance to and return the first candidate whose doc_id is not less than target and
   // whose score is greater than min_score. The cursor never moves backward and remains

@@ -15,59 +15,6 @@ namespace oceanbase
 namespace blocksstable
 {
 
-namespace
-{
-
-class ObOrderedPostingBlockMetaVisitor final
-{
-public:
-  ObOrderedPostingBlockMetaVisitor(
-      const uint64_t end_id,
-      const common::ObFunction<int(const ObPostingBlockMeta &, bool &)> &visitor)
-    : end_id_(end_id),
-      visitor_(visitor),
-      range_covered_(false),
-      has_previous_block_(false),
-      previous_max_id_(0)
-  {}
-
-  int operator()(const ObPostingBlockMeta &block_meta, bool &stop)
-  {
-    int ret = OB_SUCCESS;
-    stop = false;
-    if (OB_UNLIKELY(has_previous_block_ && block_meta.min_id_ <= previous_max_id_)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("prefetched posting block metadata is not strictly ordered",
-          K(ret), K_(previous_max_id), K(block_meta));
-    } else {
-      has_previous_block_ = true;
-      previous_max_id_ = block_meta.max_id_;
-      if (block_meta.min_id_ > end_id_) {
-        range_covered_ = true;
-        stop = true;
-      } else if (OB_FAIL(visitor_(block_meta, stop))) {
-        LOG_WARN("failed to visit ordered posting block meta", K(ret), K(block_meta));
-      }
-      if (OB_SUCC(ret) && block_meta.max_id_ >= end_id_) {
-        range_covered_ = true;
-        stop = true;
-      }
-    }
-    return ret;
-  }
-
-  bool is_range_covered() const { return range_covered_; }
-
-private:
-  uint64_t end_id_;
-  const common::ObFunction<int(const ObPostingBlockMeta &, bool &)> &visitor_;
-  bool range_covered_;
-  bool has_previous_block_;
-  uint64_t previous_max_id_;
-};
-
-} // namespace
-
 ObSSTablePostingScanner::ObSSTablePostingScanner()
   : data_io_allocator_(),
     sstable_index_scanner_(),
@@ -269,6 +216,36 @@ int ObSSTablePostingScanner::next_block(bool &block_changed)
   return ret;
 }
 
+int ObSSTablePostingScanner::check_cached_range_meta(
+    const ObPostingBlockMeta &cached, const uint64_t first_id,
+    const uint64_t end_id, bool &reusable) const
+{
+  int ret = OB_SUCCESS;
+  const char *agg = nullptr;
+  int64_t agg_size = 0;
+  uint64_t row_max_id = 0;
+  reusable = false;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("posting scanner not initialized", K(ret), K(first_id), K(end_id));
+  } else if (scan_iter_end_) {
+    ret = OB_ITER_END;
+  } else if (OB_UNLIKELY(!posting_index_block_opened_ || !has_read_item())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("no current metadata cursor for cached range check", K(ret),
+        K_(posting_index_block_opened), K_(data_read_idx), K_(data_prefetch_idx),
+        K(first_id), K(end_id));
+  } else if (OB_FAIL(get_prefetched_meta_row(0, agg, agg_size, row_max_id))) {
+    LOG_WARN("failed to borrow current metadata row", K(ret));
+  } else if (OB_FAIL(meta_row_scanner_.match_cached_block_meta(
+      agg, agg_size, cached, first_id, end_id, reusable))) {
+    LOG_WARN("failed to check cached block metadata", K(ret));
+  } else if (reusable && cached.max_id_ > row_max_id) {
+    reusable = false;
+  }
+  return ret;
+}
+
 int ObSSTablePostingScanner::get_cur_block_meta(ObPostingBlockMeta &posting_meta)
 {
   int ret = OB_SUCCESS;
@@ -286,146 +263,70 @@ int ObSSTablePostingScanner::get_cur_block_meta(ObPostingBlockMeta &posting_meta
   return ret;
 }
 
-// 遍历单条已固定的 metadata row，并在到达 row 末尾时校验 agg metadata 的覆盖范围。
-template <typename Visitor>
-int ObSSTablePostingScanner::visit_prefetched_meta_row(
-    const int64_t row_offset,
-    const int64_t start_block_idx,
-    ObPostingMetaRowScanner &meta_scanner,
-    Visitor &visitor,
-    bool &stop) const
+int ObSSTablePostingScanner::visit_prefetched_frontier_spans(
+    const uint64_t first_id, const uint64_t end_id,
+    const common::ObFunction<int(const ObPostingFrontierSpan &)> &visitor,
+    bool &range_covered, bool &score_available)
 {
   int ret = OB_SUCCESS;
-  const char *agg_buf = nullptr;
-  int64_t agg_size = 0;
-  uint64_t row_max_doc_id = 0;
-  bool row_has_block = false;
-  uint64_t row_last_max_id = 0;
-  int64_t block_idx = start_block_idx;
-  // 清理上一条 row 的借用视图，再打开当前预取 row 的 agg buffer。
-  meta_scanner.reuse();
-  if (OB_FAIL(get_prefetched_meta_row(
-      row_offset, agg_buf, agg_size, row_max_doc_id))) {
-    LOG_WARN("failed to get prefetched metadata row", K(ret), K(row_offset));
-  } else if (OB_FAIL(meta_scanner.open(agg_buf, agg_size))) {
-    LOG_WARN("failed to open prefetched metadata row", K(ret), K(row_offset));
-  }
-  // 按结构下标读取当前 row 的 block metadata，并将每个有效 block 交给 visitor。
-  while (OB_SUCC(ret) && !stop) {
-    ObPostingBlockMeta block_meta;
-    if (OB_FAIL(meta_scanner.get_block_meta_at(block_idx, block_meta))) {
-      if (OB_UNLIKELY(OB_ITER_END != ret)) {
-        LOG_WARN("failed to get prefetched posting block meta",
-            K(ret), K(row_offset), K(block_idx));
-      } else {
-        ret = OB_SUCCESS;
-        if (OB_UNLIKELY(!row_has_block || row_last_max_id != row_max_doc_id)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("prefetched posting block metadata does not cover index row",
-              K(ret), K(row_offset), K(start_block_idx), K(row_has_block),
-              K(row_last_max_id), K(row_max_doc_id));
-        } else {
-          break;
-        }
-      }
-    } else if (OB_UNLIKELY(!block_meta.is_valid())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("invalid prefetched posting block meta",
-          K(ret), K(row_offset), K(block_idx), K(block_meta));
-    } else if (OB_FAIL(visitor(block_meta, stop))) {
-      // visitor 不得保留 block_meta 中借用的 frontier 指针。
-      LOG_WARN("failed to visit prefetched posting block meta",
-          K(ret), K(row_offset), K(block_idx));
-    } else {
-      row_has_block = true;
-      row_last_max_id = block_meta.max_id_;
-      ++block_idx;
-    }
-  }
-  return ret;
-}
-
-// 遍历完整的预取窗口，校验 block 顺序和区间覆盖，并调用业务 visitor。
-int ObSSTablePostingScanner::visit_prefetched_meta_rows(
-    const uint64_t end_id,
-    const int64_t prefetched_row_count,
-    const common::ObFunction<int(const ObPostingBlockMeta &, bool &)> &visitor,
-    bool &range_covered) const
-{
-  int ret = OB_SUCCESS;
-  const int64_t current_block_idx = meta_row_scanner_.get_cur_block_idx();
-  ObPostingMetaRowScanner meta_scanner;
-  ObOrderedPostingBlockMetaVisitor ordered_visitor(end_id, visitor);
-  bool stop = false;
-  if (OB_UNLIKELY(current_block_idx < 0)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("invalid current posting block cursor", K(ret), K(current_block_idx));
-  } else if (OB_FAIL(meta_scanner.init(true /* 解析 block max frontier */))) {
-    LOG_WARN("failed to init prefetched metadata row scanner", K(ret));
-  } else {
-    // 逐行遍历已经固定的 metadata，直到发生错误、visitor 要求停止或窗口耗尽。
-    for (int64_t row_offset = 0;
-        OB_SUCC(ret) && !stop && row_offset < prefetched_row_count;
-        ++row_offset) {
-      // 首行从主 scanner 当前 block 开始，后续行从第一个 block 开始。
-      const int64_t start_block_idx = 0 == row_offset ? current_block_idx : 0;
-      if (OB_FAIL(visit_prefetched_meta_row(
-          row_offset, start_block_idx, meta_scanner, ordered_visitor, stop))) {
-        LOG_WARN("failed to visit prefetched metadata row",
-            K(ret), K(row_offset), K(start_block_idx));
-      }
-    }
-    if (OB_SUCC(ret) && ordered_visitor.is_range_covered()) {
-      range_covered = true;
-    } else if (OB_SUCC(ret) && !stop && idx_iter_end_) {
-      // 完整的 term 末尾窗口可以闭合一个越过最后一条 posting 的区间。
-      range_covered = true;
-    }
-  }
-  return ret;
-}
-
-// 遍历当前读游标之后已固定的 posting block metadata，且不推进主 scanner 游标。
-int ObSSTablePostingScanner::visit_prefetched_block_meta(
-    const uint64_t end_id,
-    const common::ObFunction<int(const ObPostingBlockMeta &, bool &)> &visitor,
-    bool &range_covered)
-{
-  int ret = OB_SUCCESS;
-  // 默认预取窗口未完整覆盖目标边界，仅在确认覆盖 end_id 或到达 term 末尾后置为 true。
   range_covered = false;
+  score_available = true;
   if (IS_NOT_INIT) {
-    // scanner 尚未初始化时不能访问预取窗口。
     ret = OB_NOT_INIT;
-    LOG_WARN("not inited", K(ret));
-  } else if (OB_UNLIKELY(scan_iter_end_)) {
-    // 当前逻辑游标之后已无可遍历的 posting metadata。
+    LOG_WARN("posting scanner not initialized", K(ret), K(first_id), K(end_id));
+  } else if (scan_iter_end_) {
     ret = OB_ITER_END;
   } else if (OB_UNLIKELY(!posting_index_block_opened_ || !has_read_item())) {
-    // scanner 必须持有已打开的当前 metadata row 及对应预取项。
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("no current metadata cursor", K(ret), K_(posting_index_block_opened),
-        K_(data_read_idx), K_(data_prefetch_idx));
-  } else if (OB_UNLIKELY(!visitor.is_valid())) {
-    // visitor 必须有效，避免调用空回调。
+    LOG_WARN("no current metadata cursor for frontier spans", K(ret),
+        K_(posting_index_block_opened), K_(data_read_idx), K_(data_prefetch_idx),
+        K(first_id), K(end_id));
+  } else if (OB_UNLIKELY(!visitor.is_valid() || first_id > end_id)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid prefetched block meta visitor", K(ret), K(visitor));
+    LOG_WARN("invalid frontier span visitor or range", K(ret), K(visitor), K(first_id), K(end_id));
+  } else if (OB_FAIL(ensure_meta_lookahead(end_id))) {
+    LOG_WARN_IGNORE_ITER_END(ret, "failed to prepare frontier span lookahead", K(ret), K(end_id));
   } else {
-    // 在不移动逻辑读游标的情况下，将 metadata 预取窗口扩展至目标边界。
-    if (OB_FAIL(ensure_meta_lookahead(end_id))) {
-      LOG_WARN_IGNORE_ITER_END(ret, "failed to prepare metadata lookahead", K(ret), K(end_id));
-    } else {
-      // 获取从当前读游标开始仍由预取 ring 固定的 metadata row 数量。
-      const int64_t prefetched_row_count = get_prefetched_meta_row_count();
-      if (prefetched_row_count > 0) {
-        const DataPrefetchItem &last_item =
-            data_ring_[(data_prefetch_idx_ - 1) % DATA_RING_CAP];
-        // 最后一条预取 row 覆盖 end_id 或索引扫描已到 term 末尾时，窗口具备完整覆盖能力。
-        const bool window_complete = last_item.max_doc_id_ >= end_id || idx_iter_end_;
-        if (window_complete && OB_FAIL(visit_prefetched_meta_rows(
-            end_id, prefetched_row_count, visitor, range_covered))) {
-          LOG_WARN("failed to visit prefetched metadata rows", K(ret), K(end_id));
+    const int64_t row_count = get_prefetched_meta_row_count();
+    if (row_count > 0
+        && (data_ring_[(data_prefetch_idx_ - 1) % DATA_RING_CAP].max_doc_id_ >= end_id || idx_iter_end_)) {
+      ObPostingMetaRowScanner meta_scanner;
+      uint64_t previous_max_id = 0;
+      bool has_previous = false;
+      if (OB_FAIL(meta_scanner.init(true))) {
+        LOG_WARN("failed to init frontier span metadata scanner", K(ret));
+      }
+      for (int64_t row = 0; OB_SUCC(ret) && !range_covered && score_available && row < row_count; ++row) {
+        const char *agg_buf = nullptr;
+        int64_t agg_size = 0;
+        uint64_t row_max_id = 0;
+        ObPostingFrontierSpan span;
+        const int64_t start_block = 0 == row ? meta_row_scanner_.get_cur_block_idx() : 0;
+        meta_scanner.reuse();
+        if (OB_FAIL(get_prefetched_meta_row(row, agg_buf, agg_size, row_max_id))) {
+          LOG_WARN("failed to borrow frontier metadata row", K(ret), K(row));
+        } else if (OB_FAIL(meta_scanner.open(agg_buf, agg_size))) {
+          LOG_WARN("failed to open frontier metadata row", K(ret), K(row));
+        } else if (OB_FAIL(meta_scanner.get_frontier_span(start_block, first_id, end_id, span))) {
+          LOG_WARN("failed to extract frontier span", K(ret), K(row), K(start_block));
+        } else if (OB_UNLIKELY(span.visited_block_count_ <= 0
+            || (has_previous && span.first_min_id_ <= previous_max_id)
+            || (!span.range_covered_ && span.score_available_ && span.last_max_id_ != row_max_id))) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid frontier span row coverage", K(ret), K(row), K(row_max_id),
+              K(span.first_min_id_), K(span.last_max_id_), K(previous_max_id));
+        } else {
+          previous_max_id = span.last_max_id_;
+          has_previous = true;
+          range_covered = span.range_covered_;
+          score_available = span.score_available_;
+          if (score_available && OB_FAIL(visitor(span))) {
+            LOG_WARN("failed to score frontier span", K(ret), K(row), K(span.pair_count_));
+          }
         }
+      }
+      if (OB_SUCC(ret) && score_available && !range_covered && idx_iter_end_) {
+        range_covered = true;
       }
     }
   }

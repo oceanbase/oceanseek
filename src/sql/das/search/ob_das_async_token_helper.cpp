@@ -31,6 +31,7 @@ ObDASAsyncTokenHelper::ObDASAsyncTokenHelper(ObDASSearchCtx &search_ctx)
     tsc_service_(nullptr),
     query_flag_(),
     posting_iter_(nullptr),
+    posting_entry_(nullptr),
     posting_scan_param_(),
     term_datums_(nullptr),
     term_key_(),
@@ -215,25 +216,29 @@ int ObDASAsyncTokenHelper::open_posting_iter_from_tablet()
                     inv_idx_tablet_id_, pinned_tablet_handle))) {
     LOG_WARN("failed to get pinned async index tablet handle", K(ret),
              K_(inv_idx_tablet_id));
-  } else if (OB_FAIL(tsc_service_->async_index_posting_scan(
-      search_ctx_.get_ls_id(),
-      pinned_tablet_handle,
-      version_range_,
-      inv_idx_scan_param_,
-      posting_scan_param_,
-      posting_iter_))) {
-    LOG_WARN("failed to async index posting scan", K(ret), K_(inv_idx_tablet_id), K_(version_range));
+  } else if (OB_FAIL(search_ctx_.prepare_posting_scan(
+      !use_injected_tsc_service, posting_iter_allocator_,
+      posting_scan_param_, posting_entry_))) {
+    LOG_WARN("failed to acquire phrase posting entry", K(ret));
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(tsc_service_->async_index_posting_scan(
+        search_ctx_.get_ls_id(), pinned_tablet_handle, version_range_,
+        inv_idx_scan_param_, posting_scan_param_, posting_iter_))) {
+      LOG_WARN("failed to async index posting scan", K(ret),
+          K_(inv_idx_tablet_id), K_(version_range));
+    }
+  }
+  if (OB_FAIL(ret)) {
+    close_posting_iter();
   }
   return ret;
 }
 
 void ObDASAsyncTokenHelper::close_posting_iter()
 {
-  if (nullptr != posting_iter_) {
-    posting_iter_->~ObInvSSTablePostingIter();
-    posting_iter_allocator_.free(posting_iter_);
-    posting_iter_ = nullptr;
-  }
+  search_ctx_.close_posting_scan(
+      posting_scan_param_, posting_iter_allocator_, posting_entry_, posting_iter_);
   // free() on arena is a no-op; reset() returns pages so SQL mem-leak check is clean.
   posting_iter_allocator_.reset();
 }

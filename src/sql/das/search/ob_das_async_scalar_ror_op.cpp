@@ -756,10 +756,21 @@ int ObDASAsyncScalarRorOp::open_posting_iter_from_tablet()
                     inv_idx_tablet_id_, pinned_tablet_handle))) {
     LOG_WARN("failed to get pinned async scalar index tablet handle", K(ret),
              K_(inv_idx_tablet_id));
-  } else if (OB_FAIL(tsc_service_->async_index_posting_scan(
-      search_ctx_.get_ls_id(), pinned_tablet_handle, version_range_,
-      inv_idx_scan_param_, posting_scan_param_, posting_iter_))) {
-    LOG_WARN("failed to open async scalar posting scan", K(ret), K_(inv_idx_tablet_id), K_(version_range));
+  } else if (OB_FAIL(search_ctx_.prepare_posting_scan(
+      true /* use_pool */, posting_iter_allocator_,
+      posting_scan_param_, posting_entry_))) {
+    LOG_WARN("failed to acquire scalar posting entry", K(ret));
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(tsc_service_->async_index_posting_scan(
+        search_ctx_.get_ls_id(), pinned_tablet_handle, version_range_,
+        inv_idx_scan_param_, posting_scan_param_, posting_iter_))) {
+      LOG_WARN("failed to open async scalar posting scan", K(ret),
+          K_(inv_idx_tablet_id), K_(version_range));
+    }
+  }
+  if (OB_FAIL(ret)) {
+    close_posting_iter();
   }
   return ret;
 }
@@ -768,12 +779,9 @@ void ObDASAsyncScalarRorOp::close_posting_iter()
 {
   nested_key_list_reader_.reset();
   curr_nested_key_.reset();
-  if (nullptr != posting_iter_) {
-    posting_iter_->~ObInvSSTablePostingIter();
-    posting_iter_allocator_.free(posting_iter_);
-    posting_iter_ = nullptr;
-  }
-  posting_iter_allocator_.reuse();
+  search_ctx_.close_posting_scan(
+      posting_scan_param_, posting_iter_allocator_, posting_entry_, posting_iter_);
+  posting_iter_allocator_.reset();
 }
 
 void ObDASAsyncScalarRorOp::reset_leaf_runtime_state()

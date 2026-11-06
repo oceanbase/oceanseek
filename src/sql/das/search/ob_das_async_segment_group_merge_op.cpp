@@ -39,10 +39,13 @@ int ObDASAsyncSegmentGroupMergeOp::do_init(const ObIDASSearchOpParam &op_param)
   for (int64_t i = 0; OB_SUCC(ret) && i < param.get_group_op_cnt(); ++i) {
     if (OB_FAIL(child_opened_.push_back(false))) {
       LOG_WARN("failed to initialize async group child state", K(ret), K(i));
+    } else if (OB_FAIL(child_prepared_.push_back(false))) {
+      LOG_WARN("failed to initialize async group scan state", K(ret), K(i));
     }
   }
   if (OB_FAIL(ret)) {
     child_opened_.reset();
+    child_prepared_.reset();
   }
   return ret;
 }
@@ -66,46 +69,65 @@ int ObDASAsyncSegmentGroupMergeOp::load_current_partition_groups()
   return ret;
 }
 
-int ObDASAsyncSegmentGroupMergeOp::reset_children_for_partition(
-    const bool open_children)
+int ObDASAsyncSegmentGroupMergeOp::reset_children_for_partition()
 {
   int ret = OB_SUCCESS;
   active_group_cnt_ = 0;
   current_group_idx_ = 0;
   iter_end_ = false;
+  for (int64_t i = 0; i < child_prepared_.count(); ++i) {
+    if (child_opened_.at(i)) {
+      children_[i]->release_scan_resources();
+    }
+    child_prepared_.at(i) = false;
+  }
   if (OB_FAIL(load_current_partition_groups())) {
     LOG_WARN("failed to load current async segment groups", K(ret));
   }
-  for (int64_t i = 0; OB_SUCC(ret) && i < active_group_cnt_; ++i) {
-    if (OB_ISNULL(children_[i])) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("null async segment group child", K(ret), K(i));
-    } else if (!child_opened_.at(i) && OB_FAIL(children_[i]->open())) {
-      LOG_WARN("failed to open async segment group child", K(ret), K(i));
-    } else if (!child_opened_.at(i)) {
-      child_opened_.at(i) = true;
-    } else if (!open_children && OB_FAIL(children_[i]->rescan())) {
-      LOG_WARN("failed to rescan async segment group child", K(ret), K(i));
-    } else if (open_children) {
-      ret = OB_INIT_TWICE;
-      LOG_WARN("async segment group child was opened before parent open", K(ret), K(i));
+  return ret;
+}
+
+int ObDASAsyncSegmentGroupMergeOp::ensure_child_ready(const int64_t group_idx)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(group_idx < 0 || group_idx >= active_group_cnt_)
+      || OB_ISNULL(children_[group_idx])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async group child", K(ret), K(group_idx), K_(active_group_cnt));
+  } else if (!child_prepared_.at(group_idx)) {
+    if (!child_opened_.at(group_idx)) {
+      if (OB_FAIL(children_[group_idx]->open())) {
+        LOG_WARN("failed to lazily open async group", K(ret), K(group_idx));
+      } else {
+        child_opened_.at(group_idx) = true;
+      }
+    } else if (OB_FAIL(children_[group_idx]->rescan())) {
+      LOG_WARN("failed to lazily rescan async group", K(ret), K(group_idx));
     }
     if (OB_SUCC(ret) && threshold_cached_ && is_scoring_
-        && OB_FAIL(children_[i]->set_min_competitive_score(cached_threshold_))) {
-      LOG_WARN("failed to restore async group threshold", K(ret), K(i),
-               K_(cached_threshold));
+        && OB_FAIL(children_[group_idx]->set_min_competitive_score(cached_threshold_))) {
+      LOG_WARN("failed to apply cached group threshold", K(ret), K(group_idx));
+    }
+    if (OB_SUCC(ret)) {
+      child_prepared_.at(group_idx) = true;
     }
   }
   return ret;
 }
 
+
 int ObDASAsyncSegmentGroupMergeOp::do_open()
 {
   int ret = OB_SUCCESS;
-  threshold_cached_ = false;
-  cached_threshold_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
-  if (OB_FAIL(reset_children_for_partition(true))) {
-    LOG_WARN("failed to open async segment group merge", K(ret));
+  if (active_group_cnt_ > 0) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("async group merge is already open", K(ret));
+  } else {
+    threshold_cached_ = false;
+    cached_threshold_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
+    if (OB_FAIL(reset_children_for_partition())) {
+      LOG_WARN("failed to open async segment group merge", K(ret));
+    }
   }
   return ret;
 }
@@ -115,7 +137,7 @@ int ObDASAsyncSegmentGroupMergeOp::do_rescan()
   int ret = OB_SUCCESS;
   threshold_cached_ = false;
   cached_threshold_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
-  if (OB_FAIL(reset_children_for_partition(false))) {
+  if (OB_FAIL(reset_children_for_partition())) {
     LOG_WARN("failed to rescan async segment group merge", K(ret));
   }
   return ret;
@@ -129,6 +151,7 @@ int ObDASAsyncSegmentGroupMergeOp::do_close()
   cached_threshold_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
   iter_end_ = false;
   child_opened_.reset();
+  child_prepared_.reset();
   return OB_SUCCESS;
 }
 
@@ -146,9 +169,12 @@ int ObDASAsyncSegmentGroupMergeOp::do_next_rowid(
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("null current async segment group child", K(ret),
                K_(current_group_idx));
+    } else if (OB_FAIL(ensure_child_ready(current_group_idx_))) {
+      LOG_WARN("failed to prepare current async group", K(ret), K_(current_group_idx));
     } else if (OB_FAIL(child->next_rowid(next_id, score))) {
       if (OB_ITER_END == ret) {
         ret = OB_SUCCESS;
+        child->release_scan_resources();
         ++current_group_idx_;
       } else {
         LOG_WARN("failed to get row from async segment group child",
@@ -198,6 +224,8 @@ int ObDASAsyncSegmentGroupMergeOp::do_drain_until(
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("null current async segment group child", K(ret),
                  K_(current_group_idx));
+      } else if (OB_FAIL(ensure_child_ready(current_group_idx_))) {
+        LOG_WARN("failed to prepare batch async group", K(ret), K_(current_group_idx));
       } else if (OB_FAIL(child->drain_until(
           boundary, remaining_capacity, out_ids + count,
           nullptr == out_scores ? nullptr : out_scores + count,
@@ -209,6 +237,7 @@ int ObDASAsyncSegmentGroupMergeOp::do_drain_until(
         if (child_count == remaining_capacity) {
           // A full batch has no lookahead contract. Continue on the next call.
         } else if (child_next_id.is_max()) {
+          child->release_scan_resources();
           ++current_group_idx_;
         } else {
           ret = OB_ERR_UNEXPECTED;
@@ -262,7 +291,8 @@ int ObDASAsyncSegmentGroupMergeOp::do_set_min_competitive_score(
         if (OB_ISNULL(children_[i])) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("null async segment group child", K(ret), K(i));
-        } else if (OB_FAIL(children_[i]->set_min_competitive_score(threshold))) {
+        } else if (child_prepared_.at(i) && i >= current_group_idx_
+                   && OB_FAIL(children_[i]->set_min_competitive_score(threshold))) {
           LOG_WARN("failed to forward threshold to async segment group child",
                    K(ret), K(i), K(threshold));
         }
@@ -276,11 +306,14 @@ int ObDASAsyncSegmentGroupMergeOp::do_calc_max_score(double &threshold)
 {
   int ret = OB_SUCCESS;
   threshold = 0.0;
-  for (int64_t i = 0; OB_SUCC(ret) && i < active_group_cnt_; ++i) {
+  // Exhausted groups have returned their posting iterators and cannot add scores.
+  for (int64_t i = current_group_idx_; OB_SUCC(ret) && i < active_group_cnt_; ++i) {
     double child_max_score = 0.0;
     if (OB_ISNULL(children_[i])) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("null async segment group child", K(ret), K(i));
+    } else if (OB_FAIL(ensure_child_ready(i))) {
+      LOG_WARN("failed to prepare async group max score", K(ret), K(i));
     } else if (OB_FAIL(children_[i]->calc_max_score(child_max_score))) {
       LOG_WARN("failed to calculate async segment group max score", K(ret), K(i));
     } else {

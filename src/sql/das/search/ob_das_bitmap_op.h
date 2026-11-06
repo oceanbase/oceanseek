@@ -251,7 +251,10 @@ public:
   // Fill the final provider bitmap only from an exclusive, unread range source.
   int try_fill_provider_bitmap(ObFastBitmap &bitmap, bool &used_direct_build);
   OB_INLINE bool is_filter_bitmap_view() const { return OB_NOT_NULL(provider_); }
-  // Fast path for BMM filter windows. It copies provider bitmap words directly
+  OB_INLINE bool can_copy_filter_words() const
+  { return !is_scoring_ && DAS_ROWID_TYPE_UINT64 == get_rowid_type()
+        && (is_filter_bitmap_view() || bitmap_built_); }
+  // Fast path for BMM filter windows. It copies ready bitmap words directly
   // into the BMM-local bitset and advances curr_id to the first hit after
   // batch_end_id, avoiding Bitmap -> RowID -> Bitmap conversion.
   int drain_into_filter_bitset(

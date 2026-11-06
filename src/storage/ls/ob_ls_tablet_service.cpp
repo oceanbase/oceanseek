@@ -10870,6 +10870,7 @@ int ObLSTabletService::async_index_posting_scan(
   ObTableHandleV2 table_handle;
   ObSSTable *sstable = nullptr;
   ObInvSSTable *inv_sstable = nullptr;
+  const ObTableHandleV2 *cached_handle = nullptr;
   // 逻辑 base version 只用于选择优先查找的物理表类型。
   // 当前首次 COMPLETE 刷新可能生成 base_version 为 INITIAL_VERSION 的
   // IncMajor；首选 Major 未命中时会继续查找 IncMajor。
@@ -10886,15 +10887,30 @@ int ObLSTabletService::async_index_posting_scan(
     LOG_WARN("invalid posting scan args", K(ret), K(version_range), K(scan_param.tablet_id_),
         "tablet_handle_id", tablet_handle.is_valid() ? tablet_handle.get_obj()->get_tablet_id() : ObTabletID(),
         K(posting_param));
-  } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_sstable(
-      preferred_table_type, version_range, table_handle))) {
-    LOG_WARN("failed to get inv table", K(ret), K(preferred_table_type), K(version_range));
+  } else {
+    // The query fixes each partition's snapshot; match the pinned tablet and range.
+    if (nullptr != posting_param.table_cache_) {
+      cached_handle = posting_param.table_cache_->find(
+          tablet_handle, version_range);
+    }
+    if (nullptr != cached_handle) {
+      table_handle = *cached_handle;
+    } else if (OB_FAIL(tablet_handle.get_obj()->get_async_index_sstable(
+        preferred_table_type, version_range, table_handle))) {
+      LOG_WARN("failed to get inv table", K(ret), K(preferred_table_type), K(version_range));
+    }
+  }
+  if (OB_FAIL(ret)) {
   } else if (OB_FAIL(table_handle.get_sstable(sstable))) {
     LOG_WARN("failed to get sstable from table handle", K(ret), K(table_handle));
   } else if (OB_ISNULL(sstable) || OB_UNLIKELY(!sstable->is_inv_sstable())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected non-inv sstable", K(ret), KP(sstable), K(preferred_table_type), K(version_range));
   } else if (OB_FALSE_IT(inv_sstable = static_cast<ObInvSSTable *>(sstable))) {
+  } else if (nullptr == cached_handle && nullptr != posting_param.table_cache_
+      && OB_FAIL(posting_param.table_cache_->store(
+          tablet_handle, version_range, table_handle))) {
+    LOG_WARN("failed to retain visible posting SSTable", K(ret), K(version_range));
   } else if (OB_FAIL(inv_sstable->scan_posting(
       posting_param, tablet_handle.get_obj()->get_rowkey_read_info(), iter))) {
     LOG_WARN("failed to scan posting on inv sstable", K(ret), K(preferred_table_type), K(version_range), K(posting_param));
@@ -10905,8 +10921,11 @@ int ObLSTabletService::async_index_posting_scan(
     LOG_WARN("failed to set table handles on posting iter", K(ret), K(preferred_table_type), K(version_range), K(table_handle));
   }
   if (OB_FAIL(ret) && OB_NOT_NULL(iter) && OB_NOT_NULL(posting_param.allocator_)) {
-    iter->~ObInvSSTablePostingIter();
-    posting_param.allocator_->free(iter);
+    // The caller returns a pooled Entry even if table-handle binding fails.
+    if (iter != posting_param.reusable_iter_) {
+      iter->~ObInvSSTablePostingIter();
+      posting_param.allocator_->free(iter);
+    }
     iter = nullptr;
   }
   return ret;
