@@ -77,7 +77,8 @@ public :
     } else {
       str = reinterpret_cast<const ObString *>(&elem);
       for (int i = 0; i < length_ && pos < 0; i++) {
-        if ((*this)[i].compare(*str) == 0) {
+        // NULL and empty strings can have the same offsets; consult the bitmap first.
+        if (!this->is_null(i) && (*this)[i].compare(*str) == 0) {
           pos = i;
         }
       }

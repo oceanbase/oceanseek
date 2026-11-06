@@ -33,6 +33,23 @@ TEST_F(TestAIDecisionUtils, openai_decisions_require_the_openai_provider)
   }
 }
 
+TEST_F(TestAIDecisionUtils, rejects_unsupported_header_model_types)
+{
+  const share::EndpointType::TYPE unsupported[] = {
+    share::EndpointType::INVALID_TYPE,
+    share::EndpointType::SPARSE_EMBEDDING,
+    share::EndpointType::MAX_TYPE
+  };
+  ObArenaAllocator allocator;
+  for (int64_t i = 0; i < ARRAYSIZEOF(unsupported); ++i) {
+    ObArray<ObString> headers;
+    EXPECT_EQ(OB_NOT_SUPPORTED, ObAIFuncUtils::get_header(allocator, unsupported[i],
+        ObString::make_string("OPENAI"), ObString::make_string("fictional-key"),
+        ObString::make_string("model"), nullptr, headers));
+    EXPECT_EQ(0, headers.count());
+  }
+}
+
 TEST_F(TestAIDecisionUtils, forwards_openai_options_without_overriding_request_fields)
 {
   ObArenaAllocator allocator;
