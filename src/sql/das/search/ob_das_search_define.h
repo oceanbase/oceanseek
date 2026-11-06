@@ -451,7 +451,9 @@ public:
       track_score_(true),
       fusion_iter_exec_mode_(ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS),
       is_single_partition_(false),
-      rerank_window_size_expr_(nullptr)
+      rerank_window_size_expr_(nullptr),
+      shard_doc_expr_(nullptr),
+      has_search_after_(false)
   {}
   ~ObDASFusionCtDef() {}
   INHERIT_TO_STRING_KV("ObDASFusionCtDef", ObDASAttachCtDef, K(search_index_), K(has_search_subquery_), K(has_vector_subquery_), K(rowid_exprs_), K(score_exprs_), K(rank_exprs_), K(weight_exprs_), KPC_(size_expr), KPC_(offset_expr), KPC_(rank_window_size_expr), KPC_(rank_constant_expr), KPC_(min_score_expr), K(fusion_method_), K(is_single_partition_));
@@ -541,6 +543,8 @@ public:
   ObFusionIterExecMode fusion_iter_exec_mode_;
   bool is_single_partition_;
   ObExpr *rerank_window_size_expr_;
+  ObExpr *shard_doc_expr_; // DAS-produced tablet ID and heap increment, carried through lookup for pagination.
+  bool has_search_after_; // Keep all matching rows until TableScan applies search_after after lookup.
 };
 
 struct ObDASFusionRtDef : ObDASAttachRtDef
