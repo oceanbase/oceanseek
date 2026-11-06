@@ -74,7 +74,8 @@ private:
       const share::SCN &safe_meta_scn,
       const common::ObIArray<share::SCN> &reserved_meta_scns,
       const share::SCN &ckpt_ss_checkpoint_scn,
-      common::hash::ObHashMap<share::ObLSID, share::SCN> &ls_ss_checkpoint_scn_map);
+      common::hash::ObHashMap<share::ObLSID, share::SCN> &ls_ss_checkpoint_scn_map,
+      common::ObIArray<share::ObLSID> &recyclable_deleted_ls_ids);
   int study_tablet_meta_scn_(
       const share::SCN &snapshot_meta_scn,
       const common::hash::ObHashMap<share::ObLSID, share::SCN> &ls_ss_checkpoint_scn_map,

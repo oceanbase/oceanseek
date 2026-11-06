@@ -13,17 +13,29 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstring>
+#include <initializer_list>
 #include <mutex>
 #include <thread>
 #include <unistd.h>
 #define private public
 #define protected public
 
+#include "storage/incremental/ob_shared_meta_service.h"
+#include "storage/incremental/share/ob_ss_diagnose_mgr.h"
+#include "storage/incremental/ss_meta_ctrl/ob_ss_meta_ctrl_table_operator.h"
+#include "storage/ss_garbage_collector/shared_gc_task/ob_shared_gc_task_table_iterator.h"
+#include "storage/ss_garbage_collector/task/ob_ss_mark_sweep_gc_gen_task.h"
+#include "storage/incremental/atomic_protocol/ob_atomic_protocol_util.h"
+#include "storage/incremental/ssmeta/ob_ss_meta_base_operator.h"
+#include "storage/incremental/ssmeta/ob_ss_meta_iter_wrapper.h"
+#include "storage/blocksstable/ob_storage_object_type.h"
 #include "storage/ss_garbage_collector/dag/ob_ss_gc_dag_util.h"
 #include "storage/ss_garbage_collector/dag/ob_ss_ls_meta_gc_dag.h"
 #include "storage/ss_garbage_collector/shared_gc_task/ob_shared_gc_task_table_operator.h"
 #include "storage/ss_garbage_collector/task/ob_ss_ls_meta_gc_task.h"
 #include "lib/time/ob_time_utility.h"
+#include "lib/utility/ob_defer.h"
+#include "lib/utility/utility.h"
 #include "storage/compaction/ob_compaction_diagnose.h"
 #include "simple_server/env/ob_simple_cluster_test_base.h"
 
@@ -457,6 +469,8 @@ public:
       remove_ret_(OB_SUCCESS),
       finish_ret_(OB_SUCCESS),
       add_tablet_(false),
+      is_mark_deleted_(false),
+      mark_deleted_meta_scn_(),
       cold_(false),
       omit_replay_info_(false),
       use_real_finish_(false),
@@ -521,15 +535,19 @@ protected:
   virtual int get_ls_meta_checkpoint_scn_(
       const ObSSLSMetaGCDagCtx &ctx,
       const SCN &ls_meta_scn,
-      SCN &ls_ss_checkpoint_scn) override
+      SCN &ls_ss_checkpoint_scn,
+      bool &is_mark_deleted) override
   {
     UNUSED(ctx);
+    is_mark_deleted = false;
     ++query_call_count_;
     int ret = queried_meta_scns_.push_back(ls_meta_scn);
     if (OB_SUCCESS == ret) {
       ret = query_ret_;
     }
     if (OB_SUCCESS == ret) {
+      is_mark_deleted = is_mark_deleted_
+          || (mark_deleted_meta_scn_.is_valid() && mark_deleted_meta_scn_ == ls_meta_scn);
       ls_ss_checkpoint_scn = unsafe_meta_scn_.is_valid()
           && unsafe_meta_scn_ == ls_meta_scn
           ? unsafe_checkpoint_scn_ : checkpoint_scn_;
@@ -577,6 +595,8 @@ public:
   int remove_ret_;
   int finish_ret_;
   bool add_tablet_;
+  bool is_mark_deleted_;
+  SCN mark_deleted_meta_scn_;
   bool cold_;
   bool omit_replay_info_;
   bool use_real_finish_;
@@ -1605,6 +1625,402 @@ TEST_F(TestSSLSMetaGCTask, ls_meta_gc_prepare_groups_and_publishes_snapshot)
   delete_ls_meta_gc_task_if_exist(third_key, sql_proxy());
 }
 
+class LSMetaGCSnapshotSqlProxy final : public ObMySQLProxy
+{
+public:
+  LSMetaGCSnapshotSqlProxy(const ObLSID &ls_id, const ObSharedGCTaskKey &task_key)
+    : original_(GCTX.sql_proxy_), injected_(false), enabled_(true),
+      owner_(std::this_thread::get_id()), ls_id_(ls_id), task_key_(task_key)
+  {
+    assign(*original_);
+    meta_type_.type_val_ = static_cast<int64_t>(ObSSMetaTypeEnum::TABLET_META);
+  }
+  void cleanup()
+  {
+    restore();
+    if (!meta_key_.empty()) {
+      ObSSMetaBaseOperator op;
+      int64_t affected_rows = 0;
+      EXPECT_EQ(OB_SUCCESS, op.init(*original_, OB_ALL_SHARED_META_TNAME));
+      EXPECT_EQ(OB_SUCCESS, op.delete_row(OB_SYS_TENANT_ID, ls_id_, meta_type_,
+          meta_key_.string(), false, affected_rows));
+      meta_key_.reset();
+    }
+  }
+  void restore()
+  {
+    enabled_ = false;
+    if (GCTX.sql_proxy_ == this) { GCTX.sql_proxy_ = original_; }
+  }
+  using ObMySQLProxy::read;
+  int read(ReadResult &result, const uint64_t tenant_id, const char *sql,
+      const int32_t group_id) override
+  {
+    int ret = OB_SUCCESS;
+    if (owner_ == std::this_thread::get_id() && enabled_ && !injected_
+        && nullptr != strstr(sql, "__all_shared_gc_task")) {
+      injected_ = true;
+      ret = inject_rows_();
+    }
+    return OB_SUCCESS == ret ? original_->read(result, tenant_id, sql, group_id) : ret;
+  }
+
+  ObMySQLProxy *original_;
+  SCN before_inject_scn_;
+  SCN tablet_meta_scn_;
+  SCN task_meta_scn_;
+  bool injected_;
+
+private:
+  int inject_rows_()
+  {
+    int ret = ObAtomicProtocolUtil::get_gts(OB_SYS_TENANT_ID, before_inject_scn_);
+    const int64_t deadline = ObTimeUtility::current_time() + 10 * 1000 * 1000L;
+    // GTS may be cached. Require T > this barrier, which is already at least the old Prepare S.
+    while (OB_SUCC(ret)
+        && (!tablet_meta_scn_.is_valid() || tablet_meta_scn_ <= before_inject_scn_)) {
+      if (ObTimeUtility::current_time() >= deadline) {
+        ret = OB_TIMEOUT;
+      } else {
+        ret = ObAtomicProtocolUtil::get_gts(OB_SYS_TENANT_ID, 1000 * 1000L, tablet_meta_scn_);
+      }
+    }
+    ObSSMetaBaseOperator op;
+    ObArenaAllocator allocator("LSMetaSnapRows");
+    ObSharedGCTask task;
+    int64_t affected_rows = 0;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(meta_key_.append_fmt("tablet/2569001/0/meta/scn%020lu.T%d",
+        tablet_meta_scn_.get_val_for_inner_table_field(),
+        static_cast<int>(blocksstable::ObStorageObjectType::SHARED_TABLET_META)))) {
+    } else if (OB_FAIL(op.init(*original_, OB_ALL_SHARED_META_TNAME))) {
+    } else if (OB_FAIL(op.insert_row(OB_SYS_TENANT_ID, ls_id_, meta_type_, meta_key_.string(),
+        ObString::make_string("unused by key-only iterator"), affected_rows))) {
+    } else if (OB_FAIL(ObAtomicProtocolUtil::get_gts(OB_SYS_TENANT_ID, task_meta_scn_))) {
+    } else if (OB_FAIL(build_ls_meta_gc_task(
+        allocator, task_key_.task_id_, ls_id_, task_meta_scn_, task))) {
+    } else {
+      ret = ObSharedGCTaskTableOperator::insert_task(task, *original_);
+    }
+    return ret;
+  }
+
+  bool enabled_;
+  const std::thread::id owner_;
+  const ObLSID ls_id_;
+  const ObSharedGCTaskKey task_key_;
+  ObSSMetaType meta_type_;
+  ObSqlString meta_key_;
+};
+
+TEST_F(TestSSLSMetaGCTask, ls_meta_gc_prepare_snapshot_covers_tasks_collected_during_scan)
+{
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(OB_SYS_TENANT_ID));
+  const ObLSID ls_id(2691);
+  const ObSharedGCTaskKey task_key(OB_SYS_TENANT_ID, ObSharedGCTaskType::LS_META_GC, 0, 998501);
+  delete_ls_meta_gc_task_if_exist(task_key, sql_proxy());
+  ScopedLSMetaGCTaskRowsCleanup task_cleanup(task_key, sql_proxy());
+  ObArenaAllocator dag_allocator("LSMetaSnapDag");
+  ObSSLSMetaGCDag dag;
+  ObSSLSMetaGCDagParam param;
+  ASSERT_EQ(OB_SUCCESS, dag.basic_init(dag_allocator));
+  ASSERT_EQ(OB_SUCCESS, param.init(OB_SYS_TENANT_ID));
+  ASSERT_EQ(OB_SUCCESS, dag.init_by_param(&param));
+  ASSERT_EQ(OB_SUCCESS, dag.create_first_task());
+  ObSSLSMetaGCPrepareTask *prepare_task = find_ls_meta_gc_prepare_task(dag);
+  ASSERT_NE(nullptr, prepare_task);
+  // Background readers may retain the proxy after GCTX is restored; keep it alive until exit.
+  static auto &proxy = *new LSMetaGCSnapshotSqlProxy(ls_id, task_key);
+  DEFER(proxy.cleanup());
+  GCTX.sql_proxy_ = &proxy;
+  const int prepare_ret = prepare_task->process();
+  proxy.restore();
+  ASSERT_EQ(OB_SUCCESS, prepare_ret);
+  ASSERT_TRUE(proxy.injected_);
+  ASSERT_GT(proxy.tablet_meta_scn_, proxy.before_inject_scn_);
+  ASSERT_GE(proxy.task_meta_scn_, proxy.tablet_meta_scn_);
+  ObSSLSMetaGCDagCtx *ctx = dag.get_ctx();
+  ASSERT_NE(nullptr, ctx);
+  ASSERT_TRUE(ctx->map_iter_inited_);
+  ObArray<ObSharedGCTask> *tasks = nullptr;
+  ASSERT_EQ(OB_SUCCESS, ctx->ls_meta_gc_tasks_map_.get_refactored(ls_id, tasks));
+  ASSERT_NE(nullptr, tasks);
+  ASSERT_EQ(1, tasks->count());
+  ObSharedGCLSMetaInfo info;
+  ASSERT_EQ(OB_SUCCESS, info.from_value(tasks->at(0).value_));
+  ASSERT_EQ(proxy.task_meta_scn_, info.meta_scn_);
+
+  // The tablet exists, but a snapshot taken before the task scan cannot see it.
+  ObSSMetaTabletKey key;
+  ObSSMetaTabletKeyIterator old_iter;
+  ASSERT_EQ(OB_SUCCESS, old_iter.init(sql_proxy(), OB_SYS_TENANT_ID, ls_id,
+      proxy.before_inject_scn_, false /* skip_mark_delete */));
+  ASSERT_EQ(OB_ITER_END, old_iter.get_next(key));
+  // Exercise the same real iterator and snapshot used by the executor's existence check.
+  ObSSMetaTabletKeyIterator iter;
+  ASSERT_EQ(OB_SUCCESS, iter.init(sql_proxy(), OB_SYS_TENANT_ID, ls_id,
+      ctx->cur_gts_, false /* skip_mark_delete */));
+  ASSERT_EQ(OB_SUCCESS, iter.get_next(key));
+  ASSERT_EQ(ObTabletID(2569001), key.tablet_id_);
+  ASSERT_EQ(proxy.tablet_meta_scn_, key.meta_scn_);
+  ASSERT_EQ(OB_ITER_END, iter.get_next(key));
+  ASSERT_GE(ctx->cur_gts_, proxy.task_meta_scn_);
+}
+
+// Use the real metadata service in the normal-mode SimpleServer without starting SS workers.
+class ScopedLSMetaGCGeneratorRows final
+{
+public:
+  ScopedLSMetaGCGeneratorRows(ObISQLClient &client, const ObLSID &ls_id)
+    : client_(client), ls_id_(ls_id), allocator_("LSMetaGenRows"),
+      original_tenant_(ObTenantEnv::get_tenant()), tenant_context_(OB_SYS_TENANT_ID)
+  {
+    tenant_context_ = *original_tenant_;
+    tenant_context_.set(&meta_service_);
+    tenant_context_.set(&diagnose_mgr_);
+    ObTenantEnv::set_tenant(&tenant_context_);
+  }
+  ~ScopedLSMetaGCGeneratorRows()
+  {
+    ObArray<ObSharedGCTask> tasks;
+    EXPECT_EQ(OB_SUCCESS, get_tasks(tasks));
+    for (int64_t i = 0; i < tasks.count(); ++i) {
+      EXPECT_EQ(OB_SUCCESS, ObSharedGCTaskTableOperator::delete_task(tasks.at(i).key_, client_));
+    }
+    ObSSMetaBaseOperator op;
+    ObSSMetaType type;
+    type.type_val_ = static_cast<int64_t>(ObSSMetaTypeEnum::LS_META);
+    ObSqlString prefix;
+    int64_t affected_rows = 0;
+    EXPECT_EQ(OB_SUCCESS, prefix.assign_fmt("ls/%ld/meta/", ls_id_.id()));
+    EXPECT_EQ(OB_SUCCESS, op.init(client_, OB_ALL_SHARED_META_TNAME));
+    EXPECT_EQ(OB_SUCCESS, op.delete_row(OB_SYS_TENANT_ID, ls_id_, type,
+        prefix.string(), true, affected_rows));
+    if (!lock_key_.empty()) {
+      ObSSMetaCtrlTableOperator ctrl;
+      EXPECT_EQ(OB_SUCCESS, ctrl.init(client_, 10 * 1000 * 1000L));
+      EXPECT_EQ(OB_SUCCESS, ctrl.delete_row(OB_SYS_TENANT_ID, ls_id_,
+          blocksstable::ObStorageObjectType::SHARED_LS_LOCK, lock_key_, false, affected_rows));
+    }
+    meta_service_.destroy();
+    diagnose_mgr_.destroy();
+    ObTenantEnv::set_tenant(original_tenant_);
+  }
+  void init(const int64_t terminal_version = 200)
+  {
+    ASSERT_FALSE(GCTX.is_shared_storage_mode());
+    ASSERT_EQ(OB_SUCCESS, diagnose_mgr_.init());
+    ASSERT_EQ(OB_SUCCESS, meta_service_.init());
+    ObSSMetaCtrlKey key(blocksstable::ObStorageObjectType::SHARED_LS_LOCK, ls_id_.id(), 0, 0);
+    char key_buf[SSMETA_PATH_MAX_LEN];
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, key.serialize_meta_key(key_buf, sizeof(key_buf), pos));
+    ASSERT_EQ(OB_SUCCESS, ob_write_string(allocator_, ObString(pos, key_buf), lock_key_));
+    ObSSMetaCtrlLockRowValue value;
+    value.op_id_ = 1;
+    value.meta_scn_ = make_ls_meta_gc_scn(terminal_version);
+    value.is_mark_deleted_ = true;
+    value.deleted_scn_ = make_ls_meta_gc_scn(50);
+    value.last_major_snapshot_ = 0;
+    ASSERT_TRUE(value.is_valid());
+    char value_buf[4096];
+    pos = 0;
+    ASSERT_EQ(OB_SUCCESS, value.serialize(value_buf, sizeof(value_buf), pos));
+    ObSSMetaCtrlTableOperator ctrl;
+    int64_t affected_rows = 0;
+    ASSERT_EQ(OB_SUCCESS, ctrl.init(client_, 10 * 1000 * 1000L));
+    ASSERT_EQ(OB_SUCCESS, ctrl.insert_row(OB_SYS_TENANT_ID, ls_id_, key.type_,
+        lock_key_, ObString(pos, value_buf), affected_rows));
+  }
+  void add_version(const int64_t version, const bool marked, const bool corrupt = false)
+  {
+    ObDefaultSSMetaValue<ObSSLSMeta> value;
+    value.head_info_.mark_delete_ = marked;
+    value.head_info_.update_reason_ = ObMetaUpdateReason::UPDATE_LS_GC_STATE;
+    value.meta_value_.ss_checkpoint_scn_ = make_ls_meta_gc_scn(version);
+    const int64_t size = value.get_serialize_size();
+    char *buf = static_cast<char *>(allocator_.alloc(size));
+    ASSERT_NE(nullptr, buf);
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, value.serialize(buf, size, pos));
+    ObSqlString key;
+    ASSERT_EQ(OB_SUCCESS, key.assign_fmt("ls/%ld/meta/scn%020ld.T%d", ls_id_.id(), version,
+        static_cast<int>(blocksstable::ObStorageObjectType::SHARED_LS_META)));
+    ObSSMetaType type;
+    type.type_val_ = static_cast<int64_t>(ObSSMetaTypeEnum::LS_META);
+    ObSSMetaBaseOperator op;
+    int64_t affected_rows = 0;
+    ASSERT_EQ(OB_SUCCESS, op.init(client_, OB_ALL_SHARED_META_TNAME));
+    ASSERT_EQ(OB_SUCCESS, op.insert_row(OB_SYS_TENANT_ID, ls_id_, type, key.string(),
+        corrupt ? ObString::make_string("bad") : ObString(pos, buf), affected_rows));
+  }
+  int generate(const int64_t snapshot, const int64_t safe,
+      std::initializer_list<int64_t> reservations)
+  {
+    volatile bool stopped = false;
+    ObSSMarkSweepGCGenTask task(stopped);
+    ObArray<SCN> reserved;
+    int ret = task.init(OB_SYS_TENANT_ID);
+    for (const int64_t scn : reservations) {
+      if (OB_SUCC(ret)) { ret = reserved.push_back(make_ls_meta_gc_scn(scn)); }
+    }
+    return OB_SUCCESS == ret ? task.generate_ls_meta_gc_task_(
+        make_ls_meta_gc_scn(snapshot), make_ls_meta_gc_scn(safe), reserved) : ret;
+  }
+  void assert_versions(std::initializer_list<int64_t> versions)
+  {
+    ObArray<ObSharedGCTask> tasks;
+    ASSERT_EQ(OB_SUCCESS, get_tasks(tasks));
+    ASSERT_EQ(versions.size(), tasks.count());
+    int64_t i = 0;
+    for (const int64_t version : versions) {
+      ObSharedGCLSMetaInfo info;
+      ASSERT_EQ(OB_SUCCESS, info.from_value(tasks.at(i++).value_));
+      EXPECT_EQ(make_ls_meta_gc_scn(version), info.meta_scn_);
+    }
+  }
+private:
+  int get_tasks(ObIArray<ObSharedGCTask> &tasks)
+  {
+    ObSharedGCTaskLSMetaIterator iter;
+    int ret = iter.init(OB_SYS_TENANT_ID, client_);
+    tasks.reset();
+    ObSharedGCTask task;
+    while (OB_SUCC(ret) && OB_SUCC(ret = iter.get_next(allocator_, task))) {
+      ObSharedGCLSMetaInfo info;
+      if (OB_FAIL(info.from_value(task.value_))) {
+      } else if (info.ls_id_ == ls_id_) {
+        ret = tasks.push_back(task);
+      }
+    }
+    return OB_ITER_END == ret ? OB_SUCCESS : ret;
+  }
+  ObISQLClient &client_;
+  const ObLSID ls_id_;
+  ObArenaAllocator allocator_;
+  ObString lock_key_;
+  ObTenantBase *original_tenant_;
+  ObTenantBase tenant_context_;
+  ObSSMetaService meta_service_;
+  ObSSDiagnoseInfoMgr diagnose_mgr_;
+};
+
+TEST_F(TestSSLSMetaGCTask, ls_meta_gc_generator_final_version_at_reservation_boundary)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(OB_SYS_TENANT_ID));
+  ScopedLSMetaGCGeneratorRows rows(sql_proxy(), ObLSID(2791));
+  ASSERT_NO_FATAL_FAILURE(rows.init());
+  ASSERT_NO_FATAL_FAILURE(rows.add_version(100, false));
+  ASSERT_NO_FATAL_FAILURE(rows.add_version(200, true));
+  ASSERT_EQ(OB_SUCCESS, rows.generate(300, 300, {150}));
+  ASSERT_NO_FATAL_FAILURE(rows.assert_versions({}));
+  ASSERT_EQ(OB_SUCCESS, rows.generate(300, 300, {300}));
+  ASSERT_NO_FATAL_FAILURE(rows.assert_versions({100, 200}));
+}
+
+TEST_F(TestSSLSMetaGCTask, ls_meta_gc_generator_preserves_live_snapshot_version)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(OB_SYS_TENANT_ID));
+  ScopedLSMetaGCGeneratorRows rows(sql_proxy(), ObLSID(2792));
+  ASSERT_NO_FATAL_FAILURE(rows.init(400));
+  ASSERT_NO_FATAL_FAILURE(rows.add_version(100, false));
+  ASSERT_NO_FATAL_FAILURE(rows.add_version(200, false));
+  ASSERT_NO_FATAL_FAILURE(rows.add_version(400, true));
+  // The lock is deleted, but the last version visible at snapshot 300 is still live.
+  ASSERT_EQ(OB_SUCCESS, rows.generate(300, 300, {300}));
+  ASSERT_NO_FATAL_FAILURE(rows.assert_versions({100}));
+  // With no reservation, min_meta_scn is 300; retain_latest must still preserve version 200.
+  ASSERT_EQ(OB_SUCCESS, rows.generate(300, 300, {}));
+  ASSERT_NO_FATAL_FAILURE(rows.assert_versions({100}));
+}
+
+TEST_F(TestSSLSMetaGCTask, ls_meta_gc_generator_deduplicates_old_tasks_and_adds_final_version)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(OB_SYS_TENANT_ID));
+  ScopedLSMetaGCGeneratorRows rows(sql_proxy(), ObLSID(2793));
+  ASSERT_NO_FATAL_FAILURE(rows.init());
+  ASSERT_NO_FATAL_FAILURE(rows.add_version(100, false));
+  ASSERT_NO_FATAL_FAILURE(rows.add_version(200, true));
+  ASSERT_EQ(OB_SUCCESS, rows.generate(300, 150, {300}));
+  ASSERT_NO_FATAL_FAILURE(rows.assert_versions({100}));
+  ASSERT_EQ(OB_SUCCESS, rows.generate(300, 300, {300}));
+  ASSERT_NO_FATAL_FAILURE(rows.assert_versions({100, 200}));
+  ASSERT_EQ(OB_SUCCESS, rows.generate(300, 300, {300}));
+  ASSERT_NO_FATAL_FAILURE(rows.assert_versions({100, 200}));
+}
+
+TEST_F(TestSSLSMetaGCTask, ls_meta_gc_generator_propagates_exact_version_read_error)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(OB_SYS_TENANT_ID));
+  ScopedLSMetaGCGeneratorRows rows(sql_proxy(), ObLSID(2794));
+  ASSERT_NO_FATAL_FAILURE(rows.init());
+  ASSERT_NO_FATAL_FAILURE(rows.add_version(100, false));
+  ASSERT_NO_FATAL_FAILURE(rows.add_version(200, true, true /* corrupt */));
+  ObDefaultSSMetaValue<ObSSLSMeta> value;
+  int64_t pos = 0;
+  const int expected_ret = value.deserialize("bad", 3, pos);
+  ASSERT_NE(OB_SUCCESS, expected_ret);
+  ASSERT_EQ(expected_ret, rows.generate(300, 300, {300}));
+  ASSERT_NO_FATAL_FAILURE(rows.assert_versions({}));
+}
+
+TEST_F(TestSSLSMetaGCTask, mark_sweep_deleted_ls_cache_respects_snapshot_and_gc_bounds)
+{
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(OB_SYS_TENANT_ID));
+  const ObLSID ls_id(2795);
+  ScopedLSMetaGCGeneratorRows rows(sql_proxy(), ls_id);
+  ASSERT_NO_FATAL_FAILURE(rows.init(400));
+  ASSERT_NO_FATAL_FAILURE(rows.add_version(100, false));
+  ASSERT_NO_FATAL_FAILURE(rows.add_version(200, false));
+  ASSERT_NO_FATAL_FAILURE(rows.add_version(400, true));
+
+  ObSSMarkSweepGCGenTask task(task_stopped_);
+  ASSERT_EQ(OB_SUCCESS, task.init(OB_SYS_TENANT_ID));
+  common::hash::ObHashMap<ObLSID, SCN> checkpoint_map;
+  ASSERT_EQ(OB_SUCCESS, checkpoint_map.create(4, "DeletedLSCkpt"));
+  ObArray<ObLSID> recyclable_deleted_ls_ids;
+  struct DeletedLSCase
+  {
+    const char *name_;
+    int64_t snapshot_;
+    int64_t safe_;
+    int64_t reservation_;
+    bool expected_recyclable_;
+    int64_t expected_checkpoint_;
+  };
+  const DeletedLSCase cases[] = {
+    {"live_snapshot_with_deleted_lock", 300, 500, 500, false, 200},
+    {"safe_before_delete", 500, 300, 500, false, 400},
+    {"reservation_before_delete", 500, 500, 300, false, 200},
+    {"reservation_before_first_version", 500, 500, 50, false, 100},
+    {"bounds_at_delete", 500, 400, 400, true, 400},
+    {"bounds_after_delete", 500, 500, 500, true, 400},
+    {"no_reservation", 500, 500, 0, true, 400},
+    {"old_snapshot_clears_cached_terminal_state", 300, 500, 500, false, 200},
+  };
+  for (const DeletedLSCase &test_case : cases) {
+    SCOPED_TRACE(test_case.name_);
+    ObArray<SCN> reserved;
+    if (test_case.reservation_ > 0) {
+      ASSERT_EQ(OB_SUCCESS, reserved.push_back(make_ls_meta_gc_scn(test_case.reservation_)));
+    }
+    ASSERT_EQ(OB_SUCCESS, task.get_all_ls_ss_checkpoint_scn_(
+        make_ls_meta_gc_scn(test_case.snapshot_), make_ls_meta_gc_scn(test_case.safe_),
+        reserved, SCN() /*no external checkpoint*/, checkpoint_map, recyclable_deleted_ls_ids));
+    EXPECT_EQ(test_case.expected_recyclable_, has_exist_in_array(recyclable_deleted_ls_ids, ls_id));
+    SCN checkpoint_scn;
+    ASSERT_EQ(OB_SUCCESS, checkpoint_map.get_refactored(ls_id, checkpoint_scn));
+    EXPECT_EQ(make_ls_meta_gc_scn(test_case.expected_checkpoint_), checkpoint_scn);
+  }
+  ASSERT_EQ(OB_SUCCESS, checkpoint_map.destroy());
+}
+
 TEST_F(TestSSLSMetaGCTask, ls_meta_gc_prepare_stops_before_side_effect)
 {
   ObTenantSwitchGuard tenant_guard;
@@ -2082,9 +2498,14 @@ TEST_F(TestSSLSMetaGCTask,
   ASSERT_EQ(OB_SUCCESS, alloc_scripted_ls_meta_gc_executor(
       dag, ls_id, *gc_tasks, executor));
   ASSERT_NE(nullptr, executor);
+  executor->add_tablet_ = true;
+  executor->tablet_info_ = ObSSGCTabletBaseInfo(
+      ObTabletID(2501001), make_ls_meta_gc_scn(251001));
+  executor->replayed_scn_ = make_ls_meta_gc_scn(2);
   executor->checkpoint_scn_ = make_ls_meta_gc_scn(1);
   ASSERT_EQ(OB_SUCCESS, executor->process());
 
+  ASSERT_EQ(1, executor->replay_call_count_);
   ASSERT_EQ(4, executor->query_call_count_);
   ASSERT_EQ(4, executor->remove_call_count_);
   ASSERT_EQ(4, executor->finish_call_count_);
@@ -2217,6 +2638,110 @@ TEST_F(TestSSLSMetaGCTask,
   ASSERT_EQ(0, ctx->get_failed_ls_count());
 }
 
+TEST_F(TestSSLSMetaGCTask, ls_meta_gc_terminal_version_waits_for_shared_tablets)
+{
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(OB_SYS_TENANT_ID));
+  const char *scenarios[] = {"replayed", "cold", "missing_replay_info"};
+  for (int64_t i = 0; i < ARRAYSIZEOF(scenarios); ++i) {
+    SCOPED_TRACE(scenarios[i]);
+    ObArenaAllocator dag_allocator("LSMetaTerminal");
+    ObSSLSMetaGCDag dag;
+    ObSSLSMetaGCDagCtx *ctx = nullptr;
+    ASSERT_EQ(OB_SUCCESS, init_ls_meta_gc_executor_test_dag(dag_allocator, dag, ctx));
+    ASSERT_NE(nullptr, ctx);
+    const ObLSID ls_id(2551 + i);
+    ObArray<ObSharedGCTask> *gc_tasks = nullptr;
+    ASSERT_EQ(OB_SUCCESS, add_ls_meta_gc_task_group(*ctx, ls_id, 997001 + i, gc_tasks));
+    ASSERT_NE(nullptr, gc_tasks);
+    publish_ls_meta_gc_task_map(*ctx);
+    ScriptedSSLSMetaGCExecutorTask *executor = nullptr;
+    ASSERT_EQ(OB_SUCCESS, alloc_scripted_ls_meta_gc_executor(dag, ls_id, *gc_tasks, executor));
+    ASSERT_NE(nullptr, executor);
+    executor->is_mark_deleted_ = true;
+    executor->replay_ret_ = OB_TRANS_TIMEOUT; // Replay progress must not be queried here.
+    executor->add_tablet_ = true;
+    executor->tablet_info_ = ObSSGCTabletBaseInfo(
+        ObTabletID(2551001 + i), make_ls_meta_gc_scn(255001));
+    executor->checkpoint_scn_ = make_ls_meta_gc_scn(100);
+    executor->replayed_scn_ = make_ls_meta_gc_scn(0 == i ? 200 : 50);
+    executor->cold_ = 1 == i;
+    executor->omit_replay_info_ = 2 == i;
+    ASSERT_EQ(OB_SUCCESS, executor->process());
+    // Replay progress, cold state and missing replay info cannot bypass the
+    // shared tablet existence check for the final mark-delete version.
+    ASSERT_EQ(0, executor->replay_call_count_);
+    ASSERT_EQ(1, executor->query_call_count_);
+    ASSERT_EQ(0, executor->remove_call_count_);
+    ASSERT_EQ(0, executor->finish_call_count_);
+    ASSERT_EQ(0, ctx->get_deleted_ls_meta_version_count());
+    ASSERT_EQ(0, ctx->get_finished_gc_task_count());
+    ASSERT_EQ(OB_SUCCESS, ctx->get_first_error_code());
+    ASSERT_EQ(0, ctx->get_failed_ls_count());
+
+    // Retrying the blocked task must not build an unused replay map either.
+    ASSERT_EQ(OB_SUCCESS, executor->process());
+    ASSERT_EQ(0, executor->replay_call_count_);
+    ASSERT_EQ(2, executor->query_call_count_);
+    ASSERT_EQ(0, executor->remove_call_count_);
+    ASSERT_EQ(0, executor->finish_call_count_);
+    ASSERT_EQ(OB_SUCCESS, ctx->get_first_error_code());
+
+    // The retained task becomes executable after the shared tablets disappear.
+    executor->add_tablet_ = false;
+    ASSERT_EQ(OB_SUCCESS, executor->process());
+    ASSERT_EQ(3, executor->tablet_call_count_);
+    ASSERT_EQ(0, executor->replay_call_count_);
+    ASSERT_EQ(3, executor->query_call_count_);
+    ASSERT_EQ(1, executor->remove_call_count_);
+    ASSERT_EQ(1, executor->finish_call_count_);
+    ASSERT_EQ(1, ctx->get_deleted_ls_meta_version_count());
+    ASSERT_EQ(1, ctx->get_finished_gc_task_count());
+    ASSERT_EQ(OB_SUCCESS, ctx->get_first_error_code());
+    ASSERT_EQ(0, ctx->get_failed_ls_count());
+  }
+}
+
+TEST_F(TestSSLSMetaGCTask, ls_meta_gc_executor_reuses_replay_map_before_blocked_final_version)
+{
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(OB_SYS_TENANT_ID));
+  ObArenaAllocator dag_allocator("LSMetaMixed");
+  ObSSLSMetaGCDag dag;
+  ObSSLSMetaGCDagCtx *ctx = nullptr;
+  ASSERT_EQ(OB_SUCCESS, init_ls_meta_gc_executor_test_dag(dag_allocator, dag, ctx));
+  ASSERT_NE(nullptr, ctx);
+  const ObLSID ls_id(2561);
+  ObArray<ObSharedGCTask> *gc_tasks = nullptr;
+  ASSERT_EQ(OB_SUCCESS, add_ls_meta_gc_task_group(*ctx, ls_id, 997101, gc_tasks));
+  ASSERT_NE(nullptr, gc_tasks);
+  gc_tasks->reset();
+  for (int64_t i = 0; i < 3; ++i) {
+    ASSERT_EQ(OB_SUCCESS, append_ls_meta_gc_task(
+        *ctx, *gc_tasks, ls_id, 997101 + i, make_ls_meta_gc_scn((i + 1) * 100)));
+  }
+  publish_ls_meta_gc_task_map(*ctx);
+  ScriptedSSLSMetaGCExecutorTask *executor = nullptr;
+  ASSERT_EQ(OB_SUCCESS, alloc_scripted_ls_meta_gc_executor(dag, ls_id, *gc_tasks, executor));
+  ASSERT_NE(nullptr, executor);
+  executor->add_tablet_ = true;
+  executor->tablet_info_ = ObSSGCTabletBaseInfo(ObTabletID(2561001), make_ls_meta_gc_scn(256001));
+  executor->checkpoint_scn_ = make_ls_meta_gc_scn(100);
+  executor->replayed_scn_ = make_ls_meta_gc_scn(200);
+  executor->mark_deleted_meta_scn_ = make_ls_meta_gc_scn(300);
+  ASSERT_EQ(OB_SUCCESS, executor->process());
+  ASSERT_EQ(1, executor->replay_call_count_);
+  ASSERT_EQ(3, executor->query_call_count_);
+  ASSERT_EQ(2, executor->remove_call_count_);
+  ASSERT_EQ(2, executor->finish_call_count_);
+  ASSERT_EQ(997101, executor->finished_task_ids_.at(0));
+  ASSERT_EQ(997102, executor->finished_task_ids_.at(1));
+  ASSERT_EQ(2, ctx->get_deleted_ls_meta_version_count());
+  ASSERT_EQ(2, ctx->get_finished_gc_task_count());
+  ASSERT_EQ(OB_SUCCESS, ctx->get_first_error_code());
+  ASSERT_EQ(0, ctx->get_failed_ls_count());
+}
+
 TEST_F(TestSSLSMetaGCTask, ls_meta_gc_executor_absorbs_business_errors_per_ls)
 {
   ObTenantSwitchGuard tenant_guard;
@@ -2264,7 +2789,9 @@ TEST_F(TestSSLSMetaGCTask, ls_meta_gc_executor_absorbs_business_errors_per_ls)
   ASSERT_EQ(2, ctx->get_deleted_ls_meta_version_count());
   ASSERT_EQ(1, ctx->get_finished_gc_task_count());
   ASSERT_EQ(0, executors[0]->query_call_count_);
-  ASSERT_EQ(0, executors[1]->query_call_count_);
+  ASSERT_EQ(1, executors[1]->query_call_count_);
+  ASSERT_EQ(1, executors[1]->replay_call_count_);
+  ASSERT_EQ(0, executors[1]->remove_call_count_);
   ASSERT_EQ(1, executors[2]->query_call_count_);
   ASSERT_EQ(0, executors[2]->remove_call_count_);
   ASSERT_EQ(0, executors[3]->finish_call_count_);

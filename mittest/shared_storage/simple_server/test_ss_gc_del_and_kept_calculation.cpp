@@ -497,7 +497,8 @@ TEST_F(TestSSGCDelAndKeptCalculation, final_min_reuses_committed_kept_meta_scn)
   ASSERT_EQ(V2, loaded_kept_meta_scn);
   ObSSGetDelKeptMetaScnParam param(gc_tablet,
       tablet_meta_scn, loaded_kept_meta_scn, safe_meta_scn,
-      invalid_mark_delete_meta_scn, reserved_meta_scns, all_meta_scns, checkpoint_map);
+      invalid_mark_delete_meta_scn, reserved_meta_scns, all_meta_scns, checkpoint_map,
+      false /*ls_can_del_all*/);
 
   ObSEArray<share::SCN, 4> del_meta_scns;
   ObSEArray<share::SCN, 4> kept_meta_scns;
@@ -695,7 +696,8 @@ TEST_F(TestSSGCDelAndKeptCalculation, all_versions_deleted_advances_kept_meta_sc
       min_tablet_meta_scn /*走 Lock Row 位点*/,
       loaded_kept_meta_scn, big /*safe_meta_scn*/,
       V3 /*mark_delete_meta_scn*/, ctx.reserved_meta_scns_, all_meta_scns,
-      ctx.ls_ss_checkpoint_scn_map_);
+      ctx.ls_ss_checkpoint_scn_map_,
+      false /*ls_can_del_all*/);
   ObSEArray<share::SCN, 4> next_del_meta_scns;
   ObSEArray<share::SCN, 4> next_kept_meta_scns;
   OK(task.get_del_and_kept_meta_scns_simply_(
@@ -710,7 +712,8 @@ TEST_F(TestSSGCDelAndKeptCalculation, all_versions_deleted_advances_kept_meta_sc
   ObSSGetDelKeptMetaScnParam invalid_floor_param(gc_tablet,
       min_tablet_meta_scn, invalid_terminal_kept_meta_scn,
       big /*safe_meta_scn*/, V3 /*mark_delete_meta_scn*/, reserved_meta_scns,
-      all_meta_scns, ctx.ls_ss_checkpoint_scn_map_);
+      all_meta_scns, ctx.ls_ss_checkpoint_scn_map_,
+      false /*ls_can_del_all*/);
   ObSEArray<share::SCN, 4> invalid_floor_del_meta_scns;
   ObSEArray<share::SCN, 4> invalid_floor_kept_meta_scns;
   ASSERT_EQ(OB_ERR_UNEXPECTED, task.get_del_and_kept_meta_scns_simply_(
@@ -732,7 +735,8 @@ TEST_F(TestSSGCDelAndKeptCalculation, all_versions_deleted_advances_kept_meta_sc
   ObSSGetDelKeptMetaScnParam no_mark_delete_param(gc_tablet,
       big /*tablet_meta_scn*/, loaded_kept_meta_scn, big /*safe_meta_scn*/,
       invalid_mark_delete_meta_scn, reserved_meta_scns, all_meta_scns,
-      ctx.ls_ss_checkpoint_scn_map_);
+      ctx.ls_ss_checkpoint_scn_map_,
+      false /*ls_can_del_all*/);
   ObSEArray<share::SCN, 4> no_mark_del;
   ObSEArray<share::SCN, 4> no_mark_kept;
   OK(task.get_del_and_kept_meta_scns_simply_(no_mark_delete_param, no_mark_del, no_mark_kept));
@@ -763,8 +767,8 @@ TEST_F(TestSSGCDelAndKeptCalculation, all_versions_deleted_advances_kept_meta_sc
 }
 
 // Covers ObSSMarkSweepSortTask::get_del_and_kept_meta_scns_simply_ Rule 3:
-// a version below min_meta_scn (and not the force-kept last one) is deleted
-// iff its tablet max_replayed_scn < ls_ss_checkpoint_scn.
+// A candidate version is deleted below the LS checkpoint, or at equality
+// when both the deleted LS and tablet satisfy all reclamation bounds.
 TEST_F(TestSSGCDelAndKeptCalculation, rule3_max_replayed_scn_vs_ls_ss_checkpoint_scn)
 {
   LOG_INFO("[TEST CASE BEGIN] rule3_max_replayed_scn_vs_ls_ss_checkpoint_scn");
@@ -825,7 +829,8 @@ TEST_F(TestSSGCDelAndKeptCalculation, rule3_max_replayed_scn_vs_ls_ss_checkpoint
       big /*tablet_meta_scn*/, share::SCN::min_scn() /*unused prefetched kept_meta_scn*/,
       big /*safe_meta_scn*/,
       invalid_mark_delete_meta_scn /*not mark-deleted*/,
-      reserved_meta_scns, all_meta_scns, ckpt_map);
+      reserved_meta_scns, all_meta_scns, ckpt_map,
+      false /*ls_can_del_all*/);
 
   ObSSMarkSweepSortTask task;
   ObSEArray<share::SCN, 4> del_meta_scns;
@@ -907,7 +912,8 @@ TEST_F(TestSSGCDelAndKeptCalculation, rule3_max_replayed_scn_vs_ls_ss_checkpoint
         V3 /*tablet_meta_scn*/, share::SCN::min_scn() /*unused prefetched kept_meta_scn*/,
         big /*safe_meta_scn*/,
         V3 /*mark_delete_meta_scn == min_meta_scn*/,
-        reserved_meta_scns, all_meta_scns, ckpt_map);
+        reserved_meta_scns, all_meta_scns, ckpt_map,
+        false /*ls_can_del_all*/);
     OK(task.get_del_and_kept_meta_scns_simply_(
         param2, del2, kept2));
     LOG_INFO("mark_deleted can_del_all done", K(del2), K(kept2), K(V1), K(V2), K(V3));
@@ -940,7 +946,8 @@ TEST_F(TestSSGCDelAndKeptCalculation, rule3_max_replayed_scn_vs_ls_ss_checkpoint
         V3 /*tablet_meta_scn*/, share::SCN::min_scn() /*unused prefetched kept_meta_scn*/,
         big /*safe_meta_scn*/,
         V3 /*mark_delete_meta_scn > min_meta_scn(V2)*/,
-        reserved4, all_meta_scns, big_ckpt_map);
+        reserved4, all_meta_scns, big_ckpt_map,
+        false /*ls_can_del_all*/);
     OK(task.get_del_and_kept_meta_scns_simply_(
         param4, del4, kept4));
     LOG_INFO("mark_deleted reserved_pins done", K(del4), K(kept4), K(V1), K(V2), K(V3));
@@ -952,6 +959,61 @@ TEST_F(TestSSGCDelAndKeptCalculation, rule3_max_replayed_scn_vs_ls_ss_checkpoint
     ASSERT_EQ(V2, kept4.at(0));
     ASSERT_EQ(V3, kept4.at(1));
     OK(big_ckpt_map.destroy());
+  }
+  {
+    // V2/V3 replay to 3000. Exercise equality without changing the stored versions.
+    struct CheckpointCase
+    {
+      const char *name_;
+      share::SCN checkpoint_scn_;
+      share::SCN safe_meta_scn_;
+      share::SCN mark_delete_meta_scn_;
+      share::SCN reserved_meta_scn_;
+      bool ls_can_del_all_;
+      int64_t expected_del_count_;
+    };
+    const share::SCN no_reservation;
+    const CheckpointCase cases[] = {
+      {"live_ls", large_rep, big, V3, no_reservation, false, 1},
+      {"unmarked_tablet", large_rep, big, invalid_mark_delete_meta_scn, no_reservation, true, 1},
+      {"reservation_before_delete", large_rep, big, V3, V2, true, 1},
+      {"safe_before_delete", large_rep, V2, V3, no_reservation, true, 1},
+      {"terminal_equal", large_rep, big, V3, no_reservation, true, 3},
+      {"reservation_at_delete", large_rep, big, V3, V3, true, 3},
+      {"replayed_beyond_checkpoint", ckpt, big, V3, no_reservation, true, 1},
+    };
+    common::hash::ObHashMap<ObLSID, share::SCN> boundary_ckpt_map;
+    OK(boundary_ckpt_map.create(4, "BoundaryCkpt"));
+    for (const CheckpointCase &test_case : cases) {
+      SCOPED_TRACE(test_case.name_);
+      OK(boundary_ckpt_map.reuse());
+      OK(boundary_ckpt_map.set_refactored(ls_id, test_case.checkpoint_scn_));
+      ObSEArray<share::SCN, 4> boundary_reserved;
+      if (test_case.reserved_meta_scn_.is_valid()) {
+        OK(boundary_reserved.push_back(test_case.reserved_meta_scn_));
+      }
+      const ObSSGetDelKeptMetaScnParam boundary_param(gc_tablet,
+          V3 /*tablet_meta_scn*/, marked_kept_meta_scn, test_case.safe_meta_scn_,
+          test_case.mark_delete_meta_scn_, boundary_reserved, all_meta_scns,
+          boundary_ckpt_map, test_case.ls_can_del_all_);
+      ObSEArray<share::SCN, 4> boundary_del;
+      ObSEArray<share::SCN, 4> boundary_kept;
+      OK(task.get_del_and_kept_meta_scns_simply_(boundary_param, boundary_del, boundary_kept));
+      ASSERT_EQ(test_case.expected_del_count_, boundary_del.count());
+      ASSERT_EQ(all_meta_scns.count() - test_case.expected_del_count_, boundary_kept.count());
+      for (int64_t i = 0; i < boundary_del.count(); ++i) {
+        ASSERT_EQ(all_meta_scns.at(i), boundary_del.at(i));
+      }
+      for (int64_t i = 0; i < boundary_kept.count(); ++i) {
+        ASSERT_EQ(all_meta_scns.at(test_case.expected_del_count_ + i), boundary_kept.at(i));
+      }
+      if (boundary_kept.empty()) {
+        share::SCN terminal_kept_meta_scn;
+        OK(task.calc_kept_meta_scn_(boundary_param, boundary_del, boundary_kept, terminal_kept_meta_scn));
+        ASSERT_EQ(share::SCN::plus(V3, 1), terminal_kept_meta_scn);
+      }
+    }
+    OK(boundary_ckpt_map.destroy());
   }
   {
     // Same but ckpt advanced beyond all replayed scns -> everything is deletable,
@@ -968,7 +1030,8 @@ TEST_F(TestSSGCDelAndKeptCalculation, rule3_max_replayed_scn_vs_ls_ss_checkpoint
         V3 /*tablet_meta_scn*/, share::SCN::min_scn() /*unused prefetched kept_meta_scn*/,
         big /*safe_meta_scn*/,
         V3 /*mark_delete_meta_scn == min_meta_scn*/,
-        reserved_meta_scns, all_meta_scns, big_ckpt_map);
+        reserved_meta_scns, all_meta_scns, big_ckpt_map,
+        false /*ls_can_del_all*/);
     OK(task.get_del_and_kept_meta_scns_simply_(
         param3, del3, kept3));
     LOG_INFO("mark_deleted all_del done", K(del3), K(kept3), K(V1), K(V2), K(V3));
