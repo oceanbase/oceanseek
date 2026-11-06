@@ -417,6 +417,7 @@ def_table_schema(
       ('operation_type', 'int'),
       ('ddl_stmt_str', 'longtext'),
       ('exec_tenant_id', 'int', 'false', '1'),
+      ('catalog_name', 'varchar:OB_MAX_CATALOG_NAME_LENGTH', 'true')
     ],
 
 )
@@ -9658,6 +9659,11 @@ all_ai_gateway_def = dict(
 
 def_table_schema(**all_ai_gateway_def)
 def_table_schema(**gen_history_table_def(614, all_ai_gateway_def))
+
+# 615: __all_catalog_database_priv
+# 616: __all_catalog_database_priv_history
+# 617: __all_catalog_table_priv
+# 618: __all_catalog_table_priv_history
 
 # 余留位置（此行之前占位）
 # 本区域占位建议：采用真实表名进行占位
@@ -19268,6 +19274,11 @@ def_table_schema(
     ('REFERENCED_COLUMN_NAME', 'varchar:128', 'true'),
   ],
 )
+
+# 12632: __all_virtual_catalog_database_priv
+# 12633: __all_virtual_catalog_database_priv_history
+# 12634: __all_virtual_catalog_table_priv
+# 12635: __all_virtual_catalog_table_priv_history
 
 # 余留位置（此行之前占位）
 # 本区域占位建议：采用真实表名进行占位
@@ -85295,6 +85306,9 @@ def_sys_index_table(
   index_using_type = 'USING_BTREE',
   index_type = 'INDEX_TYPE_UNIQUE_LOCAL',
   keywords = all_def_keywords['__all_ai_gateway'])
+
+# 101135: idx_catalog_database_priv_catalog_name
+# 101136: idx_catalog_table_priv_catalog_name
 
 # 余留位置（此行之前占位）
 # 索引表占位建议：基于基表（数据表）表名来占位，其他方式包括：索引名（index_name）、索引表表名

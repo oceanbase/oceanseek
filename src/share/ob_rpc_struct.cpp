@@ -5872,7 +5872,8 @@ OB_SERIALIZE_MEMBER((ObRevokeDBArg, ObDDLArg),
                     tenant_id_,
                     user_id_,
                     db_,
-                    priv_set_);
+                    priv_set_,
+                    catalog_);
 
 int ObRevokeTableArg::assign(const ObRevokeTableArg &other)
 {
@@ -5889,6 +5890,7 @@ int ObRevokeTableArg::assign(const ObRevokeTableArg &other)
   revoke_all_ora_ = other.revoke_all_ora_;
   grantor_ = other.grantor_;
   grantor_host_ = other.grantor_host_;
+  catalog_ = other.catalog_;
   if (OB_FAIL(ObDDLArg::assign(other))) {
     LOG_WARN("fail to assign ddl arg", K(ret));
   } else if (OB_FAIL(obj_priv_array_.assign(other.obj_priv_array_))) {
@@ -5931,7 +5933,8 @@ OB_SERIALIZE_MEMBER((ObRevokeTableArg, ObDDLArg),
                     ref_col_ids_,
                     column_names_priv_,
                     grantor_,
-                    grantor_host_);
+                    grantor_host_,
+                    catalog_);
 
 bool ObRevokeRoutineArg::is_valid() const
 {

@@ -6975,11 +6975,12 @@ struct ObRevokeDBArg : public ObDDLArg
 
 public:
   ObRevokeDBArg() : ObDDLArg(), tenant_id_(common::OB_INVALID_ID), user_id_(common::OB_INVALID_ID),
-                         priv_set_(0)
+                         priv_set_(0), catalog_()
   { }
   bool is_valid() const;
   TO_STRING_KV(K_(tenant_id),
                K_(user_id),
+               K_(catalog),
                K_(db),
                "priv_set", share::schema::ObPrintPrivSet(priv_set_));
 
@@ -6987,6 +6988,7 @@ public:
   uint64_t user_id_;
   common::ObString db_;
   ObPrivSet priv_set_;
+  common::ObString catalog_;
 };
 
 struct ObRevokeTableArg : public ObDDLArg
@@ -6999,7 +7001,7 @@ public:
                             obj_type_(common::OB_INVALID_ID), grantor_id_(common::OB_INVALID_ID),
                             obj_priv_array_(), revoke_all_ora_(false), sel_col_ids_(), ins_col_ids_(),
                             upd_col_ids_(), ref_col_ids_(), column_names_priv_(),
-                            grantor_(), grantor_host_()
+                            grantor_(), grantor_host_(), catalog_()
   { }
 
   int assign(const ObRevokeTableArg& other);
@@ -7007,6 +7009,7 @@ public:
 
   TO_STRING_KV(K_(tenant_id),
                K_(user_id),
+               K_(catalog),
                K_(db),
                K_(table),
                "priv_set", share::schema::ObPrintPrivSet(priv_set_),
@@ -7037,6 +7040,7 @@ public:
   common::ObSEArray<std::pair<ObString, ObPrivType>, 4> column_names_priv_;
   common::ObString grantor_;
   common::ObString grantor_host_;
+  common::ObString catalog_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObRevokeTableArg);
 };

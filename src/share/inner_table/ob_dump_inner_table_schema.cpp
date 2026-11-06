@@ -325,6 +325,7 @@ int ObInnerTableSchemaDumper::get_all_ddl_operation_info_(const ObIArray<schema:
       OZ (dml.add_column("operation_type", op_type));
       OZ (dml.add_column("ddl_stmt_str", ""));
       OZ (dml.add_function_call("exec_tenant_id", "effective_tenant_id()"));
+      OZ (dml.add_column("catalog_name", ""));
       const int64_t line_end = __LINE__;
       if (OB_SUCC(ret) && table->get_table_id() == OB_ALL_DDL_OPERATION_TID &&
           table->get_column_count() != line_end - line_begin - 1) {
