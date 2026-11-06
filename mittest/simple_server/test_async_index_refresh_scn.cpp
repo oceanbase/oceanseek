@@ -35,6 +35,8 @@
 #include "share/ob_ddl_sim_point.h"
 #include "share/tablet/ob_tablet_to_ls_operator.h"
 #include "rootserver/ddl_task/ob_table_redefinition_task.h"
+#include "rootserver/ddl_task/ob_fts_index_build_task.h"
+#include "rootserver/ddl_task/ob_index_build_task.h"
 
 namespace oceanbase
 {
@@ -106,6 +108,7 @@ public:
 
 #ifdef ERRSIM
   void check_first_online_index_snapshot(const bool use_alter);
+  void check_index_refresh_task_recovery(const bool async_fts);
   void check_offline_refresh_recovery(const int phase);
   void check_offline_refresh_route(const uint64_t version, const bool with_async_index);
   void read_offline_versions(const uint64_t table_id, ObIArray<int64_t> &physical,
@@ -796,6 +799,153 @@ void ObAsyncIndexRefreshScnTest::read_offline_versions(
           OB_SUCCESS == mds_ret ? commit_scn.get_val_for_tx() : 0));
     }
   }
+}
+
+// Recreate the task from its persisted record while its original executor is paused.
+// This covers task recovery, not an actual observer restart or RS election.
+void ObAsyncIndexRefreshScnTest::check_index_refresh_task_recovery(const bool async_fts)
+{
+  using namespace rootserver;
+  auto &proxy = get_curr_simple_server().get_sql_proxy2();
+  const auto sys_sql = [&](const char *sql) {
+    int64_t affected = 0;
+    return exec_write_sql_sys(sql, affected);
+  };
+  ASSERT_EQ(OB_SUCCESS, exe_sql("drop table if exists t_index_refresh_recovery"));
+  ASSERT_EQ(OB_SUCCESS, exe_sql(
+      "create table t_index_refresh_recovery (id int primary key, body varchar(256), "
+      "async fulltext index anchor_idx(body)) organization heap "
+      "async_index_params='ASYNC_REFRESH_INTERVAL=-1'"));
+  DEFER(EXPECT_EQ(OB_SUCCESS, exe_sql("drop table if exists t_index_refresh_recovery")));
+  int64_t table_id = 0;
+  ObSqlString sql;
+  ASSERT_EQ(OB_SUCCESS, sql.assign_fmt(
+      "select table_id as val from oceanbase.__all_virtual_table where tenant_id=%lu "
+      "and table_name='t_index_refresh_recovery' and data_table_id=0", tenant_id_));
+  ASSERT_EQ(OB_SUCCESS, SimpleServerHelper::select_int64(proxy, sql.ptr(), table_id));
+
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(tenant_id_));
+  ObAsyncIndexService *service = MTL(ObAsyncIndexService *);
+  ASSERT_NE(nullptr, service);
+  auto &refresher = service->get_refresher();
+  ASSERT_EQ(OB_SUCCESS, TG_CANCEL_R(refresher.tg_id_, refresher.timer_task_));
+  DEFER(EXPECT_EQ(OB_SUCCESS, TG_SCHEDULE(refresher.tg_id_, refresher.timer_task_,
+      ObTenantAsyncIndexRefresher::SCHEDULE_PERIOD_US, true)));
+  ASSERT_EQ(OB_SUCCESS, TG_INVOKE(refresher.tg_id_, wait_task, refresher.timer_task_));
+  ASSERT_EQ(OB_SUCCESS, exe_sql("insert into t_index_refresh_recovery values (1, 'recovery token')"));
+  ObSEArray<uint64_t, 4> old_index_ids;
+  ASSERT_EQ(OB_SUCCESS, ObAsyncIndexRefreshUtil::collect_async_index_table_ids(
+      tenant_id_, table_id, old_index_ids, true));
+  ASSERT_EQ(2, old_index_ids.count()); // Anchor index and shared delete index.
+
+  const int64_t previous_timeout = static_cast<int64_t>(GCONF.debug_sync_timeout);
+  std::thread ddl_thread;
+  std::atomic<int> ddl_ret(OB_EAGAIN);
+  std::atomic<bool> ddl_done(false);
+  DEFER({
+    EXPECT_EQ(OB_SUCCESS, sys_sql("set ob_global_debug_sync='now signal index_recovery_resume'"));
+    EXPECT_EQ(OB_SUCCESS, sys_sql("set ob_global_debug_sync='reset'"));
+    if (ddl_thread.joinable()) { ddl_thread.join(); }
+    ObSqlString restore;
+    if (OB_SUCCESS == restore.assign_fmt(
+        "alter system set debug_sync_timeout='%ldus'", previous_timeout)) {
+      EXPECT_EQ(OB_SUCCESS, sys_sql(restore.ptr()));
+    }
+  });
+  ASSERT_EQ(OB_SUCCESS, sys_sql("alter system set debug_sync_timeout='120s'"));
+  const int64_t config_deadline = ObTimeUtility::current_time() + 10_s;
+  while (120_s != static_cast<int64_t>(GCONF.debug_sync_timeout)
+         && ObTimeUtility::current_time() < config_deadline) {
+    ob_usleep(10 * 1000);
+  }
+  ASSERT_EQ(120_s, static_cast<int64_t>(GCONF.debug_sync_timeout));
+  ASSERT_EQ(OB_SUCCESS, sys_sql("set ob_global_debug_sync='reset'"));
+  ASSERT_EQ(OB_SUCCESS, sys_sql("set ob_global_debug_sync="
+      "'BEFORE_ASYNC_INDEX_DDL_PUBLISH signal index_recovery_paused "
+      "wait_for index_recovery_resume execute 1'"));
+  ddl_thread = std::thread([&]() {
+    ddl_ret.store(exe_sql(async_fts
+        ? "create async fulltext index new_idx on t_index_refresh_recovery(body)"
+        : "create index normal_idx on t_index_refresh_recovery(body)"));
+    ddl_done.store(true);
+  });
+  ObMalloc sync_allocator;
+  ObDSSessionActions actions;
+  ASSERT_EQ(OB_SUCCESS, actions.init(1024, sync_allocator));
+  const int64_t wait_start = ObTimeUtility::current_time();
+  ASSERT_EQ(OB_SUCCESS, GDS.add_debug_sync(
+      "now wait_for index_recovery_paused timeout 120000000 execute 1", false, actions));
+  ASSERT_LT(ObTimeUtility::current_time() - wait_start, 110_s);
+  ASSERT_FALSE(ddl_done.load());
+
+  ObArenaAllocator allocator;
+  ObSEArray<ObDDLTaskRecord, 4> records;
+  ASSERT_EQ(OB_SUCCESS, ObDDLTaskRecordOperator::get_ddl_task_record_by_table_id(
+      tenant_id_, table_id, *GCTX.sql_proxy_, allocator, records));
+  const ObDDLTaskRecord *record = nullptr;
+  for (int64_t i = 0; i < records.count(); ++i) {
+    if (records.at(i).parent_task_id_ == 0
+        && records.at(i).task_status_ == ObDDLTaskStatus::TRIGGER_ASYNC_INDEX_REFRESH) {
+      ASSERT_EQ(nullptr, record);
+      record = &records.at(i);
+    }
+  }
+  ASSERT_NE(nullptr, record);
+  ObSEArray<int64_t, 4> published_before;
+  for (int64_t i = 0; i < old_index_ids.count(); ++i) {
+    ObTabletID tablet_id;
+    ObLSID ls_id;
+    ASSERT_EQ(OB_SUCCESS, get_tablet_and_ls_id_by_table_id(proxy, old_index_ids.at(i), tablet_id, ls_id));
+    ObTabletHandle tablet;
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ls_id, tablet_id, tablet));
+    int64_t published = 0;
+    ASSERT_EQ(OB_SUCCESS, tablet.get_obj()->get_async_index_refresh_start_version(published, false));
+    ASSERT_EQ(OB_SUCCESS, published_before.push_back(published));
+  }
+  if (async_fts) {
+    ObFtsIndexBuildTask recovered;
+    ASSERT_EQ(OB_SUCCESS, recovered.init(*record));
+    ASSERT_FALSE(recovered.async_index_publish_refresh_target_.is_prepared());
+    ASSERT_EQ(OB_SUCCESS, recovered.trigger_async_index_refresh());
+    ASSERT_EQ(ObDDLTaskStatus::TAKE_EFFECT, recovered.get_task_status());
+  } else {
+    ObIndexBuildTask recovered;
+    ASSERT_EQ(OB_SUCCESS, recovered.init(*record));
+    ASSERT_FALSE(recovered.async_index_publish_refresh_target_.is_prepared());
+    ASSERT_EQ(OB_SUCCESS, recovered.trigger_async_index_refresh());
+    ASSERT_EQ(ObDDLTaskStatus::TAKE_EFFECT, recovered.get_task_status());
+  }
+  // Check before releasing the original executor: only the recovered task can
+  // have advanced the old index, even though the persisted legacy list is empty.
+  for (int64_t i = 0; i < old_index_ids.count(); ++i) {
+    ObTabletID tablet_id;
+    ObLSID ls_id;
+    ASSERT_EQ(OB_SUCCESS, get_tablet_and_ls_id_by_table_id(proxy, old_index_ids.at(i), tablet_id, ls_id));
+    ObTabletHandle tablet;
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ls_id, tablet_id, tablet));
+    int64_t published = 0;
+    ASSERT_EQ(OB_SUCCESS, tablet.get_obj()->get_async_index_refresh_start_version(published, false));
+    ASSERT_GT(published, published_before.at(i));
+  }
+  ASSERT_EQ(OB_SUCCESS, sys_sql("set ob_global_debug_sync='now signal index_recovery_resume'"));
+  ddl_thread.join();
+  ASSERT_EQ(OB_SUCCESS, ddl_ret.load());
+  int64_t count = 0;
+  ASSERT_EQ(OB_SUCCESS, SimpleServerHelper::select_int64(proxy,
+      "select count(*) as val from hybrid_search(TABLE t_index_refresh_recovery, "
+      "'{\"query\":{\"match\":{\"body\":\"recovery\"}}}')", count));
+  ASSERT_EQ(1, count);
+}
+
+TEST_F(ObAsyncIndexRefreshScnTest, async_fts_refresh_recollects_indexes_after_task_recovery)
+{
+  ASSERT_NO_FATAL_FAILURE(check_index_refresh_task_recovery(true));
+}
+
+TEST_F(ObAsyncIndexRefreshScnTest, normal_index_refresh_recollects_indexes_after_task_recovery)
+{
+  ASSERT_NO_FATAL_FAILURE(check_index_refresh_task_recovery(false));
 }
 
 // phase 0: R 已落盘但未刷新；1: 一个分区暂停、其他分区完成；2: swap 已提交但任务尚未转 SUCCESS；3: 消息保存持续失败。

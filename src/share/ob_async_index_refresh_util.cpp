@@ -879,6 +879,7 @@ int ObAsyncIndexDDLRefreshTarget::refresh(
     reset();
   }
   if (OB_SUCC(ret) && !is_prepared()) {
+    DEBUG_SYNC(BEFORE_ASYNC_INDEX_DDL_PUBLISH);
     SCN candidate = specified_scn;
     if (OB_FAIL(publish_op.prepare(need_publish))) {
       if (OB_EAGAIN != ret || REACH_TIME_INTERVAL(1000L * 1000L)) {

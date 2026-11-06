@@ -1672,8 +1672,10 @@ int ObFtsIndexBuildTask::trigger_async_index_refresh()
     ret = OB_OP_NOT_ALLOW;
     LOG_WARN("[ASYNC_INDEX] refresh not allowed, async index refresh is disabled",
         K(ret), K(tenant_id_), K(object_id_), K(target_object_id_));
-  } else if (OB_FAIL(refresh_index_ids.assign(existing_async_index_table_ids_))) {
-    LOG_WARN("[ASYNC_INDEX] fail to assign existing index ids", K(ret));
+  } else if (OB_FAIL(share::ObAsyncIndexRefreshUtil::collect_async_index_table_ids(
+      tenant_id_, object_id_, refresh_index_ids, true /*retry_on_missing_search_schema*/))) {
+    LOG_WARN("[ASYNC_INDEX] fail to collect existing indexes before publish",
+        K(ret), K_(tenant_id), K_(task_id), K_(object_id));
   } else {
     // The new data index and the shared delete index may still be UNAVAILABLE,
     // so schema-based collection cannot discover them. Add them explicitly and
