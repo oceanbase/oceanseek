@@ -10,6 +10,7 @@
  * - Task 3: Partition aggregation (test_hash_build, test_partition_sort_order, etc.)
  * - Task 4: Memory sort specialization (test_memory_only_sort)
  * - Comprehensive partition sort tests with various data volumes and configurations
+ * - Regression coverage for encode sortkey + addon during external merge
  */
 
 #include <gtest/gtest.h>
@@ -843,19 +844,202 @@ TEST_F(PartitionSortOpTest, EncodeSortkeyAddonHashCollision)
   data.push_back({std::string("a"),  2, 31, 121, 221, 321});
 
   const char *order_by = "pk ASC, pk2 ASC, sk ASC";
-  OpTestResult result = SortTestSpec()
-      .table("t", "pk varchar(100), pk2 int, sk int, val1 int, val2 int, val3 int")
+  SortTestSpec spec;
+  spec.table("t", "pk varchar(100), pk2 int, sk int, val1 int, val2 int, val3 int")
       .select("pk, pk2, sk, val1, val2, val3")
       .with_partition_sort(2)
       .with_encode_sortkey(true)
       .with_addon(true)
       .order_by(order_by)
-      .with_data(data)
-      .run(engine_);
+      .with_data(data);
+
+  ASSERT_TRUE(spec.effective_encode_sortkey());
+  OpTestResult result = spec.run(engine_);
+  ASSERT_EQ(OB_SUCCESS, result.get_ret_code());
+  EXPECT_TRUE(result.verify_unordered(data));
 
   EXPECT_EQ(8, result.row_count());
   EXPECT_TRUE(verify_partition_sort_result_from_order(
       result, order_by, {"pk", "pk2", "sk", "val1", "val2", "val3"}, 2));
+}
+
+// One partition key and two addon sort keys used to produce cmp_range [2, 2),
+// causing has_order_by to skip even the in-memory encoded sort.
+TEST_F(PartitionSortOpTest, EncodeSortkeyAddonInMemoryMultiColumn)
+{
+  // The fixture forces addon storage; stay within the mock's 128-byte string buffer.
+  const std::string payload(64, 'x');
+  const std::vector<TestRow> data = {
+      {1, 1, 3, 2, payload}, {2, 2, 1, 2, payload},
+      {3, 1, 1, 2, payload}, {4, 2, 3, 2, payload},
+      {5, 1, 3, 1, payload}, {6, 2, 2, 1, payload},
+      {7, 1, 1, 1, payload}, {8, 2, 1, 1, payload},
+      {9, 1, 2, 1, payload}, {10, 2, 3, 1, payload},
+      {11, 1, 2, 2, payload}, {12, 2, 2, 2, payload}
+  };
+  const char *order_by = "pk ASC, sk1 DESC, sk2 ASC";
+  for (const bool enable_encode : {false, true}) {
+    SCOPED_TRACE(enable_encode ? "encoded sort" : "non-encoded control");
+    SortTestSpec spec;
+    spec.table("t", "id int, pk int, sk1 int, sk2 int, payload varchar(64)")
+        .select("id, pk, sk1, sk2, payload")
+        .with_partition_sort(1)
+        .with_encode_sortkey(enable_encode)
+        .with_addon(true)
+        .with_batch_size(64)
+        .with_sql_operator_dump(false)
+        .order_by(order_by)
+        .with_data(data);
+
+    ASSERT_EQ(enable_encode, spec.effective_encode_sortkey());
+    OpTestResult result = spec.run(engine_);
+    ASSERT_EQ(OB_SUCCESS, result.get_ret_code());
+    EXPECT_TRUE(result.verify_unordered(data));
+
+    EXPECT_EQ(static_cast<int64_t>(data.size()), result.row_count());
+    EXPECT_TRUE(verify_partition_sort_result_from_order(
+        result, order_by, {"id", "pk", "sk1", "sk2", "payload"}, 1));
+  }
+}
+
+// TC17: Encode sortkey + addon + multiple chunks.
+// Force a dump before each subsequent input batch so the final result is read
+// through the external merge comparator.  The comparator must compare the
+// partition prefix from sk_row and the per-partition suffix from addon_row.
+TEST_F(PartitionSortOpTest, EncodeSortkeyAddonExternalMerge)
+{
+  const std::vector<TestRow> data = {
+      {3, 4, 304, 3004, 4004}, {1, 3, 103, 1003, 2003},
+      {2, 2, 202, 2002, 3002}, {3, 1, 301, 3001, 4001},
+      {1, 5, 105, 1005, 2005}, {2, 4, 204, 2004, 3004},
+      {3, 3, 303, 3003, 4003}, {1, 1, 101, 1001, 2001},
+      {2, 5, 205, 2005, 3005}, {3, 2, 302, 3002, 4002},
+      {1, 4, 104, 1004, 2004}, {2, 1, 201, 2001, 3001}
+  };
+  const char *order_by = "pk ASC, sk ASC";
+  SortTestSpec spec;
+  spec.table("t", "pk int, sk int, val int, payload1 int, payload2 int")
+      .select("pk, sk, val, payload1, payload2")
+      .with_partition_sort(1)
+      .with_encode_sortkey(true)
+      .with_addon(true)
+      .with_batch_size(2)
+      .with_sql_operator_dump(true)
+      .with_tracepoints({OB_TP("EN_SORT_IMPL_FORCE_DO_DUMP", -1, 0, 1)})
+      .order_by(order_by)
+      .with_data(data);
+
+  ASSERT_TRUE(spec.effective_encode_sortkey());
+  OpTestResult result = spec.run(engine_);
+  ASSERT_EQ(OB_SUCCESS, result.get_ret_code());
+  EXPECT_TRUE(result.verify_unordered(data));
+
+  EXPECT_EQ(static_cast<int64_t>(data.size()), result.row_count());
+  EXPECT_TRUE(verify_partition_sort_result_from_order(
+      result, order_by, {"pk", "sk", "val", "payload1", "payload2"}, 1));
+}
+
+// TC18: Hash-colliding partitions must remain distinct after external merge.
+// This combines the HashNodeComparer regression with the DISABLE-state merge
+// path: NULL and empty-string partition keys share a hash in this test setup,
+// while their addon sort-key rows must still be compared safely.
+TEST_F(PartitionSortOpTest, EncodeSortkeyAddonHashCollisionExternalMerge)
+{
+  const std::vector<TestRow> data = {
+      {TestValue::null(), 4, 14, 104, 204}, {std::string(""), 3, 23, 103, 203},
+      {std::string("a"), 2, 32, 102, 202}, {TestValue::null(), 1, 11, 101, 201},
+      {std::string(""), 4, 24, 104, 204}, {std::string("a"), 4, 34, 104, 204},
+      {TestValue::null(), 3, 13, 103, 203}, {std::string(""), 1, 21, 101, 201},
+      {std::string("a"), 1, 31, 101, 201}, {TestValue::null(), 2, 12, 102, 202},
+      {std::string(""), 2, 22, 102, 202}, {std::string("a"), 3, 33, 103, 203}
+  };
+  const char *order_by = "pk ASC, sk ASC";
+  SortTestSpec spec;
+  spec.table("t", "pk varchar(100), sk int, val int, payload1 int, payload2 int")
+      .select("pk, sk, val, payload1, payload2")
+      .with_partition_sort(1)
+      .with_encode_sortkey(true)
+      .with_addon(true)
+      .with_batch_size(2)
+      .with_sql_operator_dump(true)
+      .with_tracepoints({OB_TP("EN_SORT_IMPL_FORCE_DO_DUMP", -1, 0, 1)})
+      .order_by(order_by)
+      .with_data(data);
+
+  ASSERT_TRUE(spec.effective_encode_sortkey());
+  OpTestResult result = spec.run(engine_);
+  ASSERT_EQ(OB_SUCCESS, result.get_ret_code());
+  EXPECT_TRUE(result.verify_unordered(data));
+
+  EXPECT_EQ(static_cast<int64_t>(data.size()), result.row_count());
+  EXPECT_TRUE(verify_partition_sort_result_from_order(
+      result, order_by, {"pk", "sk", "val", "payload1", "payload2"}, 1));
+}
+
+// TC19: Two partition columns and two suffix keys exercise field indexes on
+// both sides of the split, including mixed sort directions, during merge.
+TEST_F(PartitionSortOpTest, EncodeSortkeyAddonMultiColumnExternalMerge)
+{
+  const std::vector<TestRow> data = {
+      {"b", 2, 2, 3, 2203, 1}, {"a", 1, 1, 2, 1102, 2},
+      {"b", 1, 1, 1, 2101, 3}, {"a", 1, 2, 1, 1201, 4},
+      {"b", 2, 1, 1, 2201, 5}, {"a", 2, 2, 2, 2202, 6},
+      {"b", 1, 2, 2, 2102, 7}, {"a", 2, 1, 3, 2103, 8},
+      {"b", 2, 2, 1, 2201, 9}, {"a", 1, 1, 1, 1101, 10},
+      {"b", 1, 1, 3, 2103, 11}, {"a", 2, 2, 1, 2201, 12}
+  };
+  const char *order_by = "pk1 ASC, pk2 ASC, sk1 DESC, sk2 ASC";
+  SortTestSpec spec;
+  spec.table("t", "pk1 varchar(100), pk2 int, sk1 int, sk2 int, val int, payload int")
+      .select("pk1, pk2, sk1, sk2, val, payload")
+      .with_partition_sort(2)
+      .with_encode_sortkey(true)
+      .with_addon(true)
+      .with_batch_size(2)
+      .with_sql_operator_dump(true)
+      .with_tracepoints({OB_TP("EN_SORT_IMPL_FORCE_DO_DUMP", -1, 0, 1)})
+      .order_by(order_by)
+      .with_data(data);
+
+  ASSERT_TRUE(spec.effective_encode_sortkey());
+  OpTestResult result = spec.run(engine_);
+  ASSERT_EQ(OB_SUCCESS, result.get_ret_code());
+  EXPECT_TRUE(result.verify_unordered(data));
+
+  EXPECT_EQ(static_cast<int64_t>(data.size()), result.row_count());
+  EXPECT_TRUE(verify_partition_sort_result_from_order(
+      result, order_by, {"pk1", "pk2", "sk1", "sk2", "val", "payload"}, 2));
+}
+
+// LakeBase does not assign chunk indexes for stable sorting. Equal keys in
+// different chunks must preserve every row without requiring an input tie order.
+TEST_F(PartitionSortOpTest, EncodeSortkeyAddonEqualKeysExternalMerge)
+{
+  const std::vector<TestRow> data = {
+      {1, 1, 7, 101}, {2, 2, 7, 202},
+      {3, 1, 7, 103}, {4, 2, 7, 204},
+      {5, 2, 7, 205}, {6, 1, 7, 106},
+      {7, 2, 7, 207}, {8, 1, 7, 108}
+  };
+  const char *order_by = "pk ASC, sk ASC";
+  SortTestSpec spec;
+  spec.table("t", "id int, pk int, sk int, payload int")
+      .select("id, pk, sk, payload")
+      .with_partition_sort(1)
+      .with_encode_sortkey(true)
+      .with_addon(true)
+      .with_batch_size(2)
+      .with_sql_operator_dump(true)
+      .with_tracepoints({OB_TP("EN_SORT_IMPL_FORCE_DO_DUMP", -1, 0, 1)})
+      .order_by(order_by)
+      .with_data(data);
+
+  ASSERT_TRUE(spec.effective_encode_sortkey());
+  OpTestResult result = spec.run(engine_);
+  ASSERT_EQ(OB_SUCCESS, result.get_ret_code());
+  EXPECT_TRUE(result.verify_unordered(data));
+  EXPECT_TRUE(verify_partition_sort_result_from_order(
+      result, order_by, {"id", "pk", "sk", "payload"}, 1));
 }
 
 }  // namespace sql

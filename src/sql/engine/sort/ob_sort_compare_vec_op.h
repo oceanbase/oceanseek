@@ -161,6 +161,41 @@ protected:
   int compare(const Store_Row *r, ObEvalCtx &eval_ctx, const RowMeta *row_meta);
 };
 
+// Partition encode + addon keeps hash/partition keys in sk_row and ordering keys
+// in addon_row. Keep that comparison separate from the ordinary row comparators.
+template <typename Compare, typename Store_Row>
+class PartitionSortComparer
+{
+public:
+  using SortVecOpChunk = ObSortVecOpChunk<Store_Row, true>;
+  explicit PartitionSortComparer(Compare &compare)
+    : compare_(compare), sk_exprs_(nullptr), sk_collations_(nullptr), part_cnt_(0)
+  {}
+  int init(const ObIArray<ObExpr *> *sk_exprs,
+           const ObIArray<ObSortFieldCollation> *sk_collations, const int64_t part_cnt);
+  void reset()
+  {
+    sk_exprs_ = nullptr;
+    sk_collations_ = nullptr;
+    part_cnt_ = 0;
+  }
+  int get_error_code()
+  {
+    return compare_.get_error_code();
+  }
+  bool operator()(const Store_Row *l, const Store_Row *r);
+  bool operator()(Store_Row **l, Store_Row **r);
+  bool operator()(const SortVecOpChunk *l, const SortVecOpChunk *r);
+
+private:
+  int compare_partition_sort_rows(const Store_Row *l, const Store_Row *r);
+
+  Compare &compare_;
+  const ObIArray<ObExpr *> *sk_exprs_;
+  const ObIArray<ObSortFieldCollation> *sk_collations_;
+  int64_t part_cnt_;
+};
+
 // for sort / topn sort, sort key only has one column, no addon column
 template <typename Store_Row, bool has_addon, bool is_basic_cmp, bool is_topn_sort = false>
 class SingleColCompare : public CompareBase

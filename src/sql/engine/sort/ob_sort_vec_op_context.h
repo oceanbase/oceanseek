@@ -20,6 +20,10 @@ struct ObSortVecOpContext
     exec_ctx_(nullptr), op_(nullptr), prefix_pos_(0), part_cnt_(0), topn_cnt_(INT64_MAX),
     sort_row_cnt_(nullptr), flag_(0), compress_type_(NONE_COMPRESSOR), est_rows_(0)
   {}
+  bool has_partition_encode_addon_layout() const
+  {
+    return part_cnt_ > 0 && enable_encode_sortkey_ && has_addon_;
+  }
   TO_STRING_KV(K_(tenant_id), KP_(sk_exprs), KP_(addon_exprs), KP_(sk_collations),
                KP_(base_sk_collations), KP_(addon_collations), K_(prefix_pos), K_(part_cnt),
                K_(topn_cnt), KP_(sort_row_cnt), K_(flag), K_(compress_type), K_(est_rows));

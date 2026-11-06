@@ -156,6 +156,12 @@ int ObSortVecOpProvider::init_sort_impl(ObSortVecOpContext &ctx, ObISortVecOpImp
   has_addon_ = ctx.has_addon_;
   if (OB_FAIL(decide_sort_key_type(ctx))) {
     LOG_WARN("failed to decide sort key type", K(ret));
+  } else if (ctx.has_partition_encode_addon_layout()) {
+    using StoreRow = ObSortKeyStore<true>;
+    using PartSortImpl = ObSortVecOpImpl<GeneralCompare<StoreRow, true>, StoreRow, true, true>;
+    if (OB_FAIL(alloc_sort_impl_instance<PartSortImpl>(ctx, sort_op_impl))) {
+      LOG_WARN("failed to alloc partition sort impl instance", K(ret));
+    }
   } else if (SORT_TYPE_GENERAL == sort_type_) {
     if (SK_TYPE_TOPN == sort_key_type_) {
       INIT_SORT_IMPL_INSTANCE(SORT_TYPE_GENERAL, SK_TYPE_TOPN, has_addon_);

@@ -173,6 +173,189 @@ int GeneralCompare<Store_Row, has_addon>::compare(const Store_Row *r, ObEvalCtx 
   return cmp;
 }
 
+template <typename Compare, typename Store_Row>
+int PartitionSortComparer<Compare, Store_Row>::init(
+    const ObIArray<ObExpr *> *sk_exprs,
+    const ObIArray<ObSortFieldCollation> *sk_collations, const int64_t part_cnt)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(sk_exprs) || OB_ISNULL(sk_collations)
+      || OB_ISNULL(compare_.sk_row_meta_) || OB_ISNULL(compare_.addon_row_meta_)
+      || OB_ISNULL(compare_.cmp_sk_exprs_) || OB_ISNULL(compare_.cmp_sort_collations_)
+      || OB_UNLIKELY(part_cnt <= 0)
+      || OB_UNLIKELY(sk_collations->count() < part_cnt + 1)
+      || OB_UNLIKELY(compare_.cmp_funcs_.count() != compare_.cmp_sort_collations_->count())) {
+    ret = OB_INVALID_ARGUMENT;
+    SQL_ENG_LOG(WARN, "invalid partition sort compare arguments", K(ret), KP(sk_exprs),
+                KP(sk_collations), K(part_cnt));
+  } else {
+    sk_exprs_ = sk_exprs;
+    sk_collations_ = sk_collations;
+    part_cnt_ = part_cnt;
+  }
+  return ret;
+}
+
+template <typename Compare, typename Store_Row>
+bool PartitionSortComparer<Compare, Store_Row>::operator()(const Store_Row *l,
+                                                           const Store_Row *r)
+{
+  bool less = false;
+  int &ret = compare_.ret_;
+  if (OB_UNLIKELY(OB_SUCCESS != ret)) {
+  } else if (OB_FAIL(compare_.fast_check_status())) {
+    SQL_ENG_LOG(WARN, "fast check failed", K(ret));
+  } else {
+    less = compare_partition_sort_rows(l, r) > 0;
+  }
+  return less;
+}
+
+template <typename Compare, typename Store_Row>
+bool PartitionSortComparer<Compare, Store_Row>::operator()(Store_Row **l, Store_Row **r)
+{
+  bool less = false;
+  int &ret = compare_.ret_;
+  if (OB_UNLIKELY(OB_SUCCESS != ret)) {
+  } else if (OB_ISNULL(l) || OB_ISNULL(r)) {
+    ret = OB_INVALID_ARGUMENT;
+    SQL_ENG_LOG(WARN, "invalid argument", K(ret), KP(l), KP(r));
+  } else {
+    // Reverse the row comparison for the merge heap.
+    less = (*this)(*r, *l);
+  }
+  return less;
+}
+
+template <typename Compare, typename Store_Row>
+bool PartitionSortComparer<Compare, Store_Row>::operator()(const SortVecOpChunk *l,
+                                                           const SortVecOpChunk *r)
+{
+  bool less = false;
+  int &ret = compare_.ret_;
+  if (OB_UNLIKELY(OB_SUCCESS != ret)) {
+  } else if (OB_ISNULL(l) || OB_ISNULL(r)) {
+    ret = OB_INVALID_ARGUMENT;
+    SQL_ENG_LOG(WARN, "invalid argument", K(ret), KP(l), KP(r));
+  } else {
+    // Reverse the row comparison for the merge heap, matching GeneralCompare.
+    less = (*this)(r->sk_row_, l->sk_row_);
+  }
+  return less;
+}
+
+template <typename Compare, typename Store_Row>
+int PartitionSortComparer<Compare, Store_Row>::compare_partition_sort_rows(
+    const Store_Row *l, const Store_Row *r)
+{
+  int &ret = compare_.ret_;
+  int cmp = 0;
+  if (OB_ISNULL(l) || OB_ISNULL(r) || OB_ISNULL(sk_exprs_)
+      || OB_ISNULL(sk_collations_) || OB_ISNULL(compare_.sk_row_meta_)
+      || OB_UNLIKELY(part_cnt_ <= 0)
+      || OB_UNLIKELY(sk_collations_->count() < part_cnt_ + 1)) {
+    ret = OB_INVALID_ARGUMENT;
+    SQL_ENG_LOG(WARN, "invalid partition sort compare arguments", K(ret), KP(l), KP(r),
+                KP(sk_exprs_), KP(sk_collations_), KP(compare_.sk_row_meta_),
+                K(part_cnt_));
+  } else {
+    ObLength l_len = 0;
+    ObLength r_len = 0;
+    bool l_null = false;
+    bool r_null = false;
+    const char *l_data = nullptr;
+    const char *r_data = nullptr;
+    for (int64_t i = 0; 0 == cmp && OB_SUCC(ret) && i <= part_cnt_; ++i) {
+      const ObSortFieldCollation &sort_collation = sk_collations_->at(i);
+      const uint32_t field_idx = sort_collation.field_idx_;
+      if (OB_UNLIKELY(field_idx >= sk_exprs_->count())) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_ENG_LOG(WARN, "partition sort field index is invalid", K(ret), K(field_idx),
+                    K(sk_exprs_->count()), K(i));
+      } else {
+        const ObExpr *e = sk_exprs_->at(field_idx);
+        if (OB_ISNULL(e) || OB_ISNULL(e->basic_funcs_)) {
+          ret = OB_ERR_UNEXPECTED;
+          SQL_ENG_LOG(WARN, "partition sort expression is invalid", K(ret), KP(e), K(field_idx));
+        } else {
+          l_null = l->is_null(field_idx);
+          r_null = r->is_null(field_idx);
+          l->get_cell_payload(*compare_.sk_row_meta_, field_idx, l_data, l_len);
+          r->get_cell_payload(*compare_.sk_row_meta_, field_idx, r_data, r_len);
+          const NullSafeRowCmpFunc cmp_func = NULL_FIRST == sort_collation.null_pos_
+                                                  ? e->basic_funcs_->row_null_first_cmp_
+                                                  : e->basic_funcs_->row_null_last_cmp_;
+          if (OB_UNLIKELY(nullptr == cmp_func)) {
+            ret = OB_ERR_UNEXPECTED;
+            SQL_ENG_LOG(WARN, "partition sort compare function is null", K(ret), K(field_idx));
+          } else if (OB_FAIL(cmp_func(e->obj_meta_, e->obj_meta_, l_data, l_len, l_null,
+                                      r_data, r_len, r_null, cmp))) {
+            SQL_ENG_LOG(WARN, "failed to compare partition sort prefix", K(ret), K(field_idx));
+          } else {
+            // A positive result means the left row precedes the right row.
+            // Hash order is always ascending, matching HashNodeComparer.
+            cmp = (i == 0 || sort_collation.is_ascending_) ? -cmp : cmp;
+          }
+        }
+      }
+    }
+
+    if (OB_SUCC(ret) && 0 == cmp) {
+      const Store_Row *l_addon = nullptr;
+      const Store_Row *r_addon = nullptr;
+      if (OB_ISNULL(compare_.cmp_sort_collations_)) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_ENG_LOG(WARN, "addon compare collations are null", K(ret));
+      } else if (0 == compare_.cmp_sort_collations_->count()) {
+        // No per-partition order-by columns remain in the addon row.
+      } else if (OB_ISNULL(compare_.addon_row_meta_)) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_ENG_LOG(WARN, "addon row metadata is null", K(ret));
+      } else if (OB_ISNULL(l_addon = l->get_addon_ptr(*compare_.sk_row_meta_))
+                 || OB_ISNULL(r_addon = r->get_addon_ptr(*compare_.sk_row_meta_))) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_ENG_LOG(WARN, "addon row is null in partition sort compare", K(ret), KP(l_addon), KP(r_addon));
+      } else if (OB_ISNULL(compare_.cmp_sk_exprs_)) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_ENG_LOG(WARN, "addon compare expressions are null", K(ret));
+      } else {
+        for (int64_t i = 0; 0 == cmp && OB_SUCC(ret) && i < compare_.cmp_sort_collations_->count(); ++i) {
+          const ObSortFieldCollation &sort_collation = compare_.cmp_sort_collations_->at(i);
+          const uint32_t field_idx = sort_collation.field_idx_;
+          if (OB_UNLIKELY(field_idx >= compare_.cmp_sk_exprs_->count())
+              || OB_UNLIKELY(i >= compare_.cmp_funcs_.count())) {
+            ret = OB_ERR_UNEXPECTED;
+            SQL_ENG_LOG(WARN, "addon sort field index is invalid", K(ret), K(field_idx),
+                        K(compare_.cmp_sk_exprs_->count()), K(i), K(compare_.cmp_funcs_.count()));
+          } else {
+            const ObExpr *e = compare_.cmp_sk_exprs_->at(field_idx);
+            if (OB_ISNULL(e)) {
+              ret = OB_ERR_UNEXPECTED;
+              SQL_ENG_LOG(WARN, "addon sort expression is null", K(ret), K(field_idx));
+            } else {
+              l_null = l_addon->is_null(field_idx);
+              r_null = r_addon->is_null(field_idx);
+              l_addon->get_cell_payload(*compare_.addon_row_meta_, field_idx, l_data, l_len);
+              r_addon->get_cell_payload(*compare_.addon_row_meta_, field_idx, r_data, r_len);
+              const NullSafeRowCmpFunc cmp_func = compare_.cmp_funcs_.at(i);
+              if (OB_UNLIKELY(nullptr == cmp_func)) {
+                ret = OB_ERR_UNEXPECTED;
+                SQL_ENG_LOG(WARN, "addon sort compare function is null", K(ret), K(i));
+              } else if (OB_FAIL(cmp_func(e->obj_meta_, e->obj_meta_, l_data, l_len, l_null,
+                                          r_data, r_len, r_null, cmp))) {
+                SQL_ENG_LOG(WARN, "failed to compare partition sort addon", K(ret), K(i));
+              } else {
+                cmp = sort_collation.is_ascending_ ? -cmp : cmp;
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return cmp;
+}
+
 template <typename Store_Row, bool has_addon, bool is_basic_cmp, bool is_topn_sort>
 int SingleColCompare<Store_Row, has_addon, is_basic_cmp, is_topn_sort>::init_cmp_func(const ObIArray<ObExpr *> &cmp_sk_exprs)
 {

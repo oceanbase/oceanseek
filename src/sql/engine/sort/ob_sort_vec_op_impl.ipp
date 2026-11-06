@@ -8,8 +8,8 @@ namespace oceanbase
 namespace sql
 {
 /**************************** start ObSortVecOpImpl ************************************/
-template <typename Compare, typename Store_Row, bool has_addon>
-void ObSortVecOpImpl<Compare, Store_Row, has_addon>::reset()
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+void ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::reset()
 {
   reuse();
   all_exprs_.reset();
@@ -21,6 +21,9 @@ void ObSortVecOpImpl<Compare, Store_Row, has_addon>::reset()
   sorted_ = false;
   got_first_row_ = false;
   comp_.reset();
+  if constexpr (use_partition_compare) {
+    merge_comp_.reset();
+  }
   part_cnt_ = 0;
   topn_cnt_ = INT64_MAX;
   outputted_rows_cnt_ = 0;
@@ -106,8 +109,8 @@ void ObSortVecOpImpl<Compare, Store_Row, has_addon>::reset()
   fixed_sort_key_len_ = 0;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-void ObSortVecOpImpl<Compare, Store_Row, has_addon>::reuse()
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+void ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::reuse()
 {
   sorted_ = false;
   quick_sort_array_.reuse();
@@ -115,7 +118,7 @@ void ObSortVecOpImpl<Compare, Store_Row, has_addon>::reuse()
   inmem_row_size_ = 0;
   mem_check_interval_mask_ = 1;
   row_idx_ = 0;
-  next_stored_row_func_ = &ObSortVecOpImpl<Compare, Store_Row, has_addon>::array_next_stored_row;
+  next_stored_row_func_ = &ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::array_next_stored_row;
   ties_array_pos_ = 0;
   if (0 != ties_array_.count()) {
     for (int64_t i = 0; i < ties_array_.count(); ++i) {
@@ -161,8 +164,8 @@ void ObSortVecOpImpl<Compare, Store_Row, has_addon>::reuse()
   }
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::init_vec_ptrs(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::init_vec_ptrs(
   const common::ObIArray<ObExpr *> &exprs,
   common::ObFixedArray<ObIVector *, common::ObIAllocator> &vec_ptrs, ObEvalCtx *eval_ctx)
 {
@@ -179,8 +182,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::init_vec_ptrs(
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::init_temp_row_store(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::init_temp_row_store(
   const common::ObIArray<ObExpr *> &exprs, const int64_t mem_limit, const int64_t batch_size,
   const bool need_callback, const bool enable_dump, const int64_t extra_size, ObCompressorType compress_type,
   ObTempRowStore &row_store)
@@ -204,8 +207,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::init_temp_row_store(
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::init_sort_temp_row_store(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::init_sort_temp_row_store(
   const int64_t batch_size)
 {
   int ret = OB_SUCCESS;
@@ -224,8 +227,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::init_sort_temp_row_store(
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::init_eager_topn_filter(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::init_eager_topn_filter(
     const common::ObIArray<Store_Row *> *dumped_rows,
     const int64_t max_batch_size) {
   int ret = OB_SUCCESS;
@@ -248,8 +251,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::init_eager_topn_filter(
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::merge_sk_addon_exprs(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::merge_sk_addon_exprs(
   const common::ObIArray<ObExpr *> *sk_exprs, const common::ObIArray<ObExpr *> *addon_exprs)
 {
   int ret = OB_SUCCESS;
@@ -265,13 +268,32 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::merge_sk_addon_exprs(
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::init(ObSortVecOpContext &ctx)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::init_merge_comparer()
+{
+  int ret = OB_SUCCESS;
+  if constexpr (use_partition_compare) {
+    ret = merge_comp_.init(sk_exprs_, sk_collations_, part_cnt_);
+  }
+  return ret;
+}
+
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::init(ObSortVecOpContext &ctx)
 {
   int ret = OB_SUCCESS;
   if (is_inited()) {
     ret = OB_INIT_TWICE;
     SQL_ENG_LOG(WARN, "init twice", K(ret));
+  } else if (OB_UNLIKELY(use_partition_compare != ctx.has_partition_encode_addon_layout())) {
+    ret = OB_INVALID_ARGUMENT;
+    SQL_ENG_LOG(WARN, "sort comparer does not match the row layout", K(ret),
+                K(use_partition_compare), K(ctx.part_cnt_), K(ctx.flag_));
+  } else if (OB_UNLIKELY(use_partition_compare)
+             && (OB_UNLIKELY(ctx.prefix_pos_ > 0) || OB_UNLIKELY(ctx.topn_cnt_ != INT64_MAX))) {
+    ret = OB_INVALID_ARGUMENT;
+    SQL_ENG_LOG(WARN, "partition encode comparison requires full partition sort", K(ret),
+                K(ctx.prefix_pos_), K(ctx.topn_cnt_));
   } else {
     local_merge_sort_ = ctx.in_local_order_;
     need_rewind_ = ctx.need_rewind_;
@@ -311,6 +333,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::init(ObSortVecOpContext &ctx
                                   cmp_sort_collations_, ctx.exec_ctx_,
                                   ctx.enable_encode_sortkey_ && !(ctx.part_cnt_ > 0)))) {
       SQL_ENG_LOG(WARN, "failed to init compare functions", K(ret));
+    } else if (OB_FAIL(init_merge_comparer())) {
+      SQL_ENG_LOG(WARN, "failed to init merge comparer", K(ret));
     } else if (is_topn_sort()
                && OB_ISNULL(topn_heap_ = OB_NEWx(TopnHeap, (&mem_context_->get_malloc_allocator()),
                                                  comp_, &mem_context_->get_malloc_allocator()))) {
@@ -423,8 +447,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::init(ObSortVecOpContext &ctx
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::init_fixed_key_sort()
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::init_fixed_key_sort()
 {
   int ret = OB_SUCCESS;
   if (enable_encode_sortkey_) {
@@ -460,8 +484,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::init_fixed_key_sort()
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::init_partition_topn_sort(ObSortVecOpContext &ctx)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::init_partition_topn_sort(ObSortVecOpContext &ctx)
 {
   int ret = OB_SUCCESS;
   if (nullptr == part_topn_sort_strategy_) {
@@ -483,15 +507,15 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::init_partition_topn_sort(ObS
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_batch(const ObBatchRows &input_brs,
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::add_batch(const ObBatchRows &input_brs,
                                                               bool &sort_need_dump)
 {
   return add_batch(input_brs, 0, sort_need_dump, nullptr);
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_batch(const ObBatchRows &input_brs,
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::add_batch(const ObBatchRows &input_brs,
                                                               const int64_t start_pos,
                                                               int64_t *append_row_count)
 {
@@ -539,8 +563,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_batch(const ObBatchRows 
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_batch(const ObBatchRows &input_brs,
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::add_batch(const ObBatchRows &input_brs,
                                                               const uint16_t selector[],
                                                               const int64_t size)
 {
@@ -566,8 +590,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_batch(const ObBatchRows 
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_stored_row(const ObCompactRow *store_row)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::add_stored_row(const ObCompactRow *store_row)
 {
   int ret = OB_SUCCESS;
   ObCompactRow *sk_store_row = nullptr;
@@ -580,8 +604,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_stored_row(const ObCompa
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_stored_row(const ObCompactRow *sk_row,
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::add_stored_row(const ObCompactRow *sk_row,
                                                                    const ObCompactRow *addon_row)
 {
   int ret = OB_SUCCESS;
@@ -601,8 +625,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_stored_row(const ObCompa
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_batch_stored_row(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::add_batch_stored_row(
   int64_t &row_size, const ObCompactRow **sk_stored_rows, const ObCompactRow **addon_stored_rows)
 {
   int ret = OB_SUCCESS;
@@ -627,12 +651,12 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_batch_stored_row(
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::after_add_row(Store_Row *sr)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::after_add_row(Store_Row *sr)
 {
   int ret = OB_SUCCESS;
   if (local_merge_sort_ && rows_->count() > 0 && nullptr != rows_->at(rows_->count() - 1)) {
-    const bool less = comp_(sr, rows_->at(rows_->count() - 1));
+    const bool less = merge_comp_(sr, rows_->at(rows_->count() - 1));
     if (OB_SUCCESS != comp_.ret_) {
       ret = comp_.ret_;
       SQL_ENG_LOG(WARN, "compare failed", K(ret));
@@ -652,8 +676,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::after_add_row(Store_Row *sr)
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::build_row(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::build_row(
   const common::ObIArray<ObExpr *> &exprs, const RowMeta &row_meta, const int64_t row_size,
   ObEvalCtx &ctx, ObCompactRow *&stored_row)
 {
@@ -671,8 +695,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::build_row(
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_quick_sort_batch(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::add_quick_sort_batch(
   const ObBatchRows &input_brs, const int64_t start_pos /* 0 */, int64_t *append_row_count)
 {
   int ret = OB_SUCCESS;
@@ -694,8 +718,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_quick_sort_batch(
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_quick_sort_batch(const uint16_t selector[],
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::add_quick_sort_batch(const uint16_t selector[],
                                                                          const int64_t row_size)
 {
   int ret = OB_SUCCESS;
@@ -714,8 +738,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_quick_sort_batch(const u
 }
 
 // copy exprs values to topn heap top row.
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::copy_to_topn_row(Store_Row *&new_row)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::copy_to_topn_row(Store_Row *&new_row)
 {
   int ret = OB_SUCCESS;
   Store_Row *top_row = topn_heap_->top();
@@ -729,8 +753,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::copy_to_topn_row(Store_Row *
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::adjust_topn_heap(const Store_Row *&store_row)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::adjust_topn_heap(const Store_Row *&store_row)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(topn_heap_->top())) {
@@ -764,8 +788,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::adjust_topn_heap(const Store
 //                  2. if previous heap.top = new heap.top, add previous
 //                  heap.top to ties_array_
 //                     else reset ties_array_.
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::adjust_topn_heap_with_ties(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::adjust_topn_heap_with_ties(
   const Store_Row *&store_row)
 {
   int ret = OB_SUCCESS;
@@ -830,8 +854,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::adjust_topn_heap_with_ties(
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::copy_to_row(Store_Row *&sk_row)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::copy_to_row(Store_Row *&sk_row)
 {
   int ret = OB_SUCCESS;
   Store_Row *addon_row = nullptr;
@@ -872,8 +896,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::copy_to_row(Store_Row *&sk_r
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::generate_last_ties_row(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::generate_last_ties_row(
   const Store_Row *orign_row)
 {
   int ret = OB_SUCCESS;
@@ -898,8 +922,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::generate_last_ties_row(
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::get_next_batch_stored_rows(int64_t max_cnt,
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::get_next_batch_stored_rows(int64_t max_cnt,
                                                                                int64_t &read_rows)
 {
   int ret = OB_SUCCESS;
@@ -940,8 +964,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::get_next_batch_stored_rows(i
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::attach_rows(const ObExprPtrIArray &exprs,
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::attach_rows(const ObExprPtrIArray &exprs,
                                                                 ObEvalCtx &ctx,
                                                                 const RowMeta &row_meta,
                                                                 const ObCompactRow **srows,
@@ -965,8 +989,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::attach_rows(const ObExprPtrI
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::attach_rows(const int64_t read_rows)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::attach_rows(const int64_t read_rows)
 {
   int ret = OB_SUCCESS;
   if (!is_separate_encode_sk()
@@ -982,8 +1006,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::attach_rows(const int64_t re
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_sort_batch_row(const ObBatchRows &input_brs,
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::add_sort_batch_row(const ObBatchRows &input_brs,
                                                                        const int64_t start_pos,
                                                                        int64_t &append_row_count)
 {
@@ -1001,8 +1025,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_sort_batch_row(const ObB
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_sort_batch_row(const uint16_t selector[],
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::add_sort_batch_row(const uint16_t selector[],
                                                                        const int64_t row_size)
 {
   int ret = OB_SUCCESS;
@@ -1018,8 +1042,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_sort_batch_row(const uin
 
 // copy exprs values to row.
 // if row space is enough reuse the space, else use the alloc get new space.
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::copy_to_row(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::copy_to_row(
   const common::ObIArray<ObExpr *> &exprs, const RowMeta &row_meta, bool is_sort_key, Store_Row *&row)
 {
   int ret = OB_SUCCESS;
@@ -1078,8 +1102,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::copy_to_row(
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_heap_sort_row(const Store_Row *&store_row)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::add_heap_sort_row(const Store_Row *&store_row)
 {
   int ret = OB_SUCCESS;
   if (topn_heap_->count() == topn_cnt_ - outputted_rows_cnt_) {
@@ -1112,8 +1136,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_heap_sort_row(const Stor
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::batch_eval_vector(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::batch_eval_vector(
   const common::ObIArray<ObExpr *> &exprs, const ObBatchRows &input_brs)
 {
   int ret = OB_SUCCESS;
@@ -1126,8 +1150,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::batch_eval_vector(
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::load_data_to_comp(const ObBatchRows &input_brs)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::load_data_to_comp(const ObBatchRows &input_brs)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(batch_eval_vector(all_exprs_, input_brs))) {
@@ -1140,8 +1164,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::load_data_to_comp(const ObBa
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_heap_sort_batch(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::add_heap_sort_batch(
   const ObBatchRows &input_brs, const int64_t start_pos /* 0 */, int64_t *append_row_count,
   bool need_load_data)
 {
@@ -1180,8 +1204,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_heap_sort_batch(
 // if less than heap size or replace heap top, store row is new row
 // otherwise, store row will not change as last result obtained.
 // here, strored_rows_ only used to fetch prev_row in prefix sort batch.
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_heap_sort_batch(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::add_heap_sort_batch(
   const ObBatchRows &input_brs, const uint16_t selector[], const int64_t size)
 {
   int ret = OB_SUCCESS;
@@ -1217,8 +1241,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_heap_sort_batch(
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::update_max_available_mem_size_periodically()
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::update_max_available_mem_size_periodically()
 {
   int ret = OB_SUCCESS;
   if (!got_first_row_) {
@@ -1233,8 +1257,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::update_max_available_mem_siz
   }
   return ret;
 }
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::eager_topn_filter(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::eager_topn_filter(
     common::ObIArray<Store_Row *> *sorted_dumped_rows) {
   int ret = OB_SUCCESS;
   if (is_topn_sort() && is_topn_filter_enabled()) {
@@ -1249,8 +1273,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::eager_topn_filter(
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::eager_topn_filter_update(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::eager_topn_filter_update(
     const common::ObIArray<Store_Row *> *sorted_dumped_rows) {
   int ret = OB_SUCCESS;
   if (topn_filter_->is_by_pass()) {
@@ -1284,8 +1308,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::eager_topn_filter_update(
 //       然后继续，和之前逻辑一样
 //       所以这里会导致最开始dump的partition one-pass内存较少，后面倍数cache
 //       size关系的one-pass更大
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::preprocess_dump(bool &dumped)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::preprocess_dump(bool &dumped)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(sort_resource_mgr_.preprocess_dump(dumped))) {
@@ -1300,8 +1324,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::preprocess_dump(bool &dumped
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::imms_heap_next(const Store_Row *&sk_row)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::imms_heap_next(const Store_Row *&sk_row)
 {
   Store_Row **sr = nullptr;
   const auto f = [](Store_Row **&r, bool &is_end) {
@@ -1317,8 +1341,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::imms_heap_next(const Store_R
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-void ObSortVecOpImpl<Compare, Store_Row, has_addon>::set_blk_holder(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+void ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::set_blk_holder(
   ObTempRowStore::BlockHolder *blk_holder)
 {
   DLIST_FOREACH_NORET(chunk, sort_chunks_)
@@ -1328,8 +1352,8 @@ void ObSortVecOpImpl<Compare, Store_Row, has_addon>::set_blk_holder(
   }
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::sort_inmem_data()
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::sort_inmem_data()
 {
   int ret = OB_SUCCESS;
   const int64_t curr_time = ObTimeUtility::fast_current_time();
@@ -1365,7 +1389,7 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::sort_inmem_data()
     }
     if (OB_SUCC(ret) && need_imms()) {
       if (nullptr == imms_heap_) {
-        if (OB_ISNULL(imms_heap_ = OB_NEWx(IMMSHeap, (&mem_context_->get_malloc_allocator()), comp_,
+        if (OB_ISNULL(imms_heap_ = OB_NEWx(IMMSHeap, (&mem_context_->get_malloc_allocator()), merge_comp_,
                                            &mem_context_->get_malloc_allocator()))) {
           ret = OB_ALLOCATE_MEMORY_FAILED;
           SQL_ENG_LOG(WARN, "allocate memory failed", K(ret));
@@ -1412,8 +1436,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::sort_inmem_data()
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::do_dump()
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::do_dump()
 {
   int ret = OB_SUCCESS;
   if (!is_inited()) {
@@ -1514,8 +1538,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::do_dump()
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::before_add_row()
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::before_add_row()
 {
   int ret = OB_SUCCESS;
   int64_t sort_force_dump_rows = -EVENT_CALL(EventTable::EN_SORT_IMPL_FORCE_DO_DUMP);
@@ -1579,8 +1603,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::before_add_row()
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::build_ems_heap(int64_t &merge_ways)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::build_ems_heap(int64_t &merge_ways)
 {
   int ret = OB_SUCCESS;
   if (!is_inited()) {
@@ -1594,7 +1618,7 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::build_ems_heap(int64_t &merg
   } else if (OB_ISNULL(external_sorter_)) {
     if (OB_ISNULL(external_sorter_ = OB_NEWx(ExternalMergeSorter, (&mem_context_->get_malloc_allocator()),
                                             mem_context_->get_malloc_allocator(),
-                                            comp_))) {
+                                            merge_comp_))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       SQL_ENG_LOG(WARN, "allocate memory failed", K(ret));
     }
@@ -1611,9 +1635,9 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::build_ems_heap(int64_t &merg
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
 template <typename Heap, typename NextFunc, typename Item>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::heap_next(Heap &heap, const NextFunc &func,
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::heap_next(Heap &heap, const NextFunc &func,
                                                               Item &item)
 {
   int ret = OB_SUCCESS;
@@ -1653,8 +1677,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::heap_next(Heap &heap, const 
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::rewind()
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::rewind()
 {
   int ret = OB_SUCCESS;
   if (!is_inited()) {
@@ -1671,7 +1695,7 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::rewind()
     if (is_topn_sort()) {
       outputted_rows_cnt_ = 0;
     }
-    if (&ObSortVecOpImpl<Compare, Store_Row, has_addon>::array_next_stored_row
+    if (&ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::array_next_stored_row
         == next_stored_row_func_) {
       row_idx_ = 0;
     } else {
@@ -1683,21 +1707,21 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::rewind()
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::imms_heap_next_stored_row(const Store_Row *&sr)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::imms_heap_next_stored_row(const Store_Row *&sr)
 {
   return imms_heap_next(sr);
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::ems_heap_next_stored_row(const Store_Row *&sr)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::ems_heap_next_stored_row(const Store_Row *&sr)
 {
   const Store_Row *addon_row = nullptr;
   return external_sorter_->get_next_row(sr, addon_row);
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::sort()
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::sort()
 {
   int ret = OB_SUCCESS;
   bool dumped = false;
@@ -1714,19 +1738,19 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::sort()
           if (use_partition_topn_sort_) {
             part_topn_sort_strategy_->reset_row_idx();
             next_stored_row_func_ =
-              &ObSortVecOpImpl<Compare, Store_Row, has_addon>::part_topn_next_stored_row;
+              &ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::part_topn_next_stored_row;
           } else {
             row_idx_ = 0;
             next_stored_row_func_ =
-              &ObSortVecOpImpl<Compare, Store_Row, has_addon>::array_next_stored_row;
+              &ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::array_next_stored_row;
           }
         } else {
           next_stored_row_func_ =
-            &ObSortVecOpImpl<Compare, Store_Row, has_addon>::imms_heap_next_stored_row;
+            &ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::imms_heap_next_stored_row;
         }
       }
     } else if (OB_FAIL(sort_resource_mgr_.get_sql_mem_processor().extend_max_memory_size(&mem_context_->get_malloc_allocator(),
-                                                                 std::bind(&ObSortVecOpImpl<Compare, Store_Row, has_addon>::need_dump, this),
+                                                                 std::bind(&ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::need_dump, this),
                                                                   dumped, sort_resource_mgr_.get_total_used_size()))) {
       SQL_ENG_LOG(WARN, "failed to extend memory size", K(ret));
     } else if (OB_FAIL(do_dump())) {
@@ -1744,7 +1768,7 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::sort()
     } else {
       set_blk_holder(&blk_holder_);
       next_stored_row_func_ =
-        &ObSortVecOpImpl<Compare, Store_Row, has_addon>::array_next_dump_stored_row;
+        &ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::array_next_dump_stored_row;
     }
   } else if (sort_chunks_.get_size() >= 2) {
     // reset partition topn sort before ems sort
@@ -1810,8 +1834,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::sort()
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::array_next_stored_row(const Store_Row *&sk_row)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::array_next_stored_row(const Store_Row *&sk_row)
 {
   int ret = OB_SUCCESS;
   if (row_idx_ >= rows_->count() && ties_array_pos_ >= ties_array_.count()) {
@@ -1826,8 +1850,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::array_next_stored_row(const 
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::part_topn_next_stored_row(const Store_Row *&sk_row)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::part_topn_next_stored_row(const Store_Row *&sk_row)
 {
   int ret = OB_SUCCESS;
   if (OB_FAIL(part_topn_sort_strategy_->part_topn_next_stored_row(sk_row))) {
@@ -1838,8 +1862,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::part_topn_next_stored_row(co
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::array_next_dump_stored_row(
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::array_next_dump_stored_row(
   const Store_Row *&sk_row)
 {
   int ret = OB_SUCCESS;
@@ -1854,8 +1878,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::array_next_dump_stored_row(
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::adjust_topn_read_rows(Store_Row **stored_rows,
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::adjust_topn_read_rows(Store_Row **stored_rows,
                                                                           int64_t &read_cnt)
 {
   int ret = OB_SUCCESS;
@@ -1900,8 +1924,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::adjust_topn_read_rows(Store_
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::get_next_batch(const int64_t max_cnt,
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::get_next_batch(const int64_t max_cnt,
                                                                    int64_t &read_rows)
 {
   int ret = OB_SUCCESS;
@@ -1917,8 +1941,8 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::get_next_batch(const int64_t
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_sort_chunk(const int64_t level, SortVecOpChunk *&chunk)
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::add_sort_chunk(const int64_t level, SortVecOpChunk *&chunk)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(!is_inited())) {
@@ -1945,9 +1969,9 @@ int ObSortVecOpImpl<Compare, Store_Row, has_addon>::add_sort_chunk(const int64_t
   return ret;
 }
 
-template <typename Compare, typename Store_Row, bool has_addon>
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
 template <typename Input>
-int ObSortVecOpImpl<Compare, Store_Row, has_addon>::build_chunk(const int64_t level, Input &input)
+int ObSortVecOpImpl<Compare, Store_Row, has_addon, use_partition_compare>::build_chunk(const int64_t level, Input &input)
 {
   // Check if the object is properly initialized
   int ret = OB_SUCCESS;

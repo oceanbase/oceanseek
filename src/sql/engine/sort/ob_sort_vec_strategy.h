@@ -31,7 +31,8 @@ namespace sql
 {
 
 // Forward declarations to avoid heavy includes
-template <typename Compare, typename Store_Row, bool has_addon>
+template <typename Compare, typename Store_Row, bool has_addon,
+          bool use_partition_compare = false>
 class ObSortVecOpImpl;
 
 struct RowMeta;
@@ -242,6 +243,7 @@ public:
     allocator_(allocator),
     page_allocator_("PartSortBucket", MTL_ID(), ObCtxIds::WORK_AREA),
     enable_encode_sortkey_(enable_encode_sortkey),
+    sort_keys_in_addon_(enable_encode_sortkey && has_addon),
     is_fixed_key_sort_enabled_(is_fixed_key_sort_enabled),
     fixed_key_len_(fixed_key_len)
 
@@ -372,6 +374,8 @@ private:
   ObIAllocator &allocator_;
   common::ModulePageAllocator page_allocator_;
   bool enable_encode_sortkey_;
+  // The row layout remains unchanged when encoded sorting falls back.
+  const bool sort_keys_in_addon_;
   bool is_fixed_key_sort_enabled_;
   int64_t fixed_key_len_;
 private:
@@ -529,7 +533,9 @@ int ObPartitionSortStrategy<Compare, Store_Row, has_addon>::sort_inmem_data(cons
     comp_.set_cmp_range(0, part_cnt_ + hash_expr_cnt);
     lib::ob_sort(&bucket_nodes.at(0), &bucket_nodes.at(0) + bucket_part_cnt,
                  HashNodeComparer(comp_, sk_exprs_, sk_collations_, part_cnt_, row_meta_));
-    comp_.set_cmp_range(part_cnt_ + hash_expr_cnt, comp_.get_cnt());
+    const int64_t order_cmp_start = sort_keys_in_addon_
+                                      ? 0 : part_cnt_ + hash_expr_cnt;
+    comp_.set_cmp_range(order_cmp_start, comp_.get_cnt());
     bool has_order_by = comp_.cmp_start_ != comp_.cmp_end_;
     for (int64_t i = 0; OB_SUCC(ret) && i < bucket_part_cnt; ++i) {
       int64_t rows_last = rows_idx;
@@ -539,7 +545,7 @@ int ObPartitionSortStrategy<Compare, Store_Row, has_addon>::sort_inmem_data(cons
         part_node = part_node->part_row_next_;
       }
       if (has_order_by && rows_idx - rows_last > 1) {
-        comp_.set_cmp_range(part_cnt_ + hash_expr_cnt, comp_.get_cnt());
+        comp_.set_cmp_range(order_cmp_start, comp_.get_cnt());
         if (enable_encode_sortkey_) {
           if (is_fixed_key_sort_enabled_) {
             if (OB_FAIL(do_fixed_key_sort(rows_last, rows_idx - rows_last, rows))) {

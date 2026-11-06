@@ -69,15 +69,14 @@
  
    // ===== Pre-expression-generation hook =====
  
-   // Mirror CG (ob_static_engine_cg.cpp:2861-2864): partition / topn / topk sort
-   // all force encode sortkey off
-   // (`part_cnt > 0 || topn_expr != null || topk_limit_expr != null
-   //   -> enable_encode_sortkey_opt = false`).
-   // Guard the framework so a partition+encode or topn+encode request can never
-   // build a spec that CG would never produce.
+   // Mirror CG (ob_static_engine_cg.cpp:2936-2943): topn/topk sort disables
+   // encode sortkey, while partition sort enables it from 4.6.1 onward.
+   // Keep the test spec aligned with the production cluster-version gate so
+   // partition-sort regressions can exercise the encode + addon layout.
    bool effective_encode_sortkey() const
    {
-     return enable_encode_sortkey_ && !is_topn_sort_;
+     return enable_encode_sortkey_ && !is_topn_sort_
+            && (part_cnt_ == 0 || GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_6_1_0);
    }
  
    /**
@@ -207,8 +206,8 @@
      uint32_t field_idx = 0;
      uint32_t addon_field_idx = 0;
      // encode_start_key boundary in order_items index space (matches prepare_raw_exprs).
-     // part_cnt_ > 0 implies effective_encode_sortkey()==false, so in the encode path
-     // there is no hash item and this reduces to prefix_pos_ (or 0 for full sort).
+     // When partition encode sortkey is enabled, the hash item is included before
+     // the partition keys, so the encoded suffix starts after part_cnt_ + 1 items.
      const int64_t encode_start_key =
          prefix_pos_ > 0 ? prefix_pos_ : (part_cnt_ > 0 ? part_cnt_ + 1 : 0);
      const bool encode_separately = effective_encode_sortkey() && has_addon_;

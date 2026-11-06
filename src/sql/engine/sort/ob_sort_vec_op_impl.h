@@ -29,6 +29,8 @@
 #include "sql/engine/sort/ob_sort_chunk_builder.h"
 #include "sql/engine/sort/ob_external_merge_sorter.h"
 
+#include <functional>
+
 namespace oceanbase {
 namespace sql {
 #define SK_RC_DOWNCAST_P(row) const_cast<Store_Row *>(row)
@@ -39,11 +41,28 @@ namespace sql {
 #define SK_UPCAST_CONST_PP(store_row)                                                              \
   const_cast<const ObCompactRow **>(reinterpret_cast<ObCompactRow **>(store_row))
 
-// Vectorization 2.0 sort implementation class
+// Ordinary merge comparison reuses comp_; the partition specialization owns
+// a comparer that reads partition keys and addon keys from their respective rows.
+template <typename Compare, typename Store_Row, bool use_partition_compare>
+struct SortMergeCompareTraits
+{
+  using Comparer = Compare;
+  using Storage = Compare &;
+};
 
-template <typename Compare, typename Store_Row, bool has_addon>
+template <typename Compare, typename Store_Row>
+struct SortMergeCompareTraits<Compare, Store_Row, true>
+{
+  using Comparer = PartitionSortComparer<Compare, Store_Row>;
+  using Storage = Comparer;
+};
+
+// Vectorization 2.0 sort implementation class
+template <typename Compare, typename Store_Row, bool has_addon, bool use_partition_compare>
 class ObSortVecOpImpl : public ObISortVecOpImpl
 {
+  static_assert(!use_partition_compare || has_addon,
+                "partition encode comparison requires addon rows");
   using SortVecOpChunk = ObSortVecOpChunk<Store_Row, has_addon>;
 
 public:
@@ -55,7 +74,7 @@ public:
     addon_collations_(nullptr), cmp_sort_collations_(nullptr), sk_row_meta_(nullptr),
     addon_row_meta_(nullptr), sk_exprs_(nullptr), addon_exprs_(nullptr), cmp_sk_exprs_(nullptr),
     all_exprs_(allocator_), sk_vec_ptrs_(allocator_), addon_vec_ptrs_(allocator_),
-    eval_ctx_(nullptr), comp_(allocator_), store_mgr_(allocator_), sort_resource_mgr_(op_monitor_info, &mem_context, profile_type, store_mgr_),
+    eval_ctx_(nullptr), comp_(allocator_), merge_comp_(comp_), store_mgr_(allocator_), sort_resource_mgr_(op_monitor_info, &mem_context, profile_type, store_mgr_),
     inmem_row_size_(0), mem_check_interval_mask_(1), row_idx_(0), quick_sort_array_(),
     heap_iter_begin_(false), imms_heap_(nullptr), external_sorter_(nullptr),
     next_stored_row_func_(&ObSortVecOpImpl::array_next_stored_row), exec_ctx_(nullptr),
@@ -108,6 +127,7 @@ public:
                           ObTempRowStore &row_store);
   int init_sort_temp_row_store(const int64_t batch_size);
   int init_store_row_factory();
+  int init_merge_comparer();
   int init_eager_topn_filter(const common::ObIArray<Store_Row *> *dumped_rows, const int64_t max_batch_size);
   int add_batch(const ObBatchRows &input_brs, const int64_t start_pos, int64_t *append_row_count);
   int add_batch(const ObBatchRows &input_brs, const int64_t start_pos, bool &sort_need_dump,
@@ -288,8 +308,10 @@ protected:
   static const int64_t EXTEND_MULTIPLE = 2;
   static const int64_t MAX_MERGE_WAYS = 256;
   static const int64_t INMEMORY_MERGE_SORT_WARN_WAYS = 10000;
-  typedef common::ObBinaryHeap<Store_Row **, Compare, 16> IMMSHeap;
-  typedef ObExternalMergeSorter<Compare, Store_Row, has_addon> ExternalMergeSorter;
+  using MergeCompareTraits = SortMergeCompareTraits<Compare, Store_Row, use_partition_compare>;
+  using MergeComparer = typename MergeCompareTraits::Comparer;
+  typedef common::ObBinaryHeap<Store_Row **, MergeComparer, 16> IMMSHeap;
+  typedef ObExternalMergeSorter<MergeComparer, Store_Row, has_addon> ExternalMergeSorter;
   typedef common::ObBinaryHeap<Store_Row *, Compare> TopnHeap;
 
   union
@@ -323,6 +345,7 @@ protected:
   common::ObFixedArray<ObIVector *, common::ObIAllocator> addon_vec_ptrs_;
   ObEvalCtx *eval_ctx_;
   Compare comp_;
+  typename MergeCompareTraits::Storage merge_comp_;
   ObSortRowStoreMgr<Store_Row, has_addon> store_mgr_;
   ObSQLSortResourceManager<Compare, Store_Row, has_addon> sort_resource_mgr_;
   int64_t inmem_row_size_;
