@@ -2027,8 +2027,10 @@ int ObInnerSQLConnection::nonblock_get_leader(
     const int64_t retry_interval_us = 200 * 1000; // 200ms
     do {
       ret = OB_SUCCESS;
-      tmp_abs_timeout_us = ObTimeUtility::current_time() + GCONF.location_cache_refresh_sql_timeout;
-      if (THIS_WORKER.is_timeout()) {
+      const int64_t now = ObTimeUtility::current_time();
+      // Location retries must not outlive the SQL timeout while schema refresh holds its lock.
+      tmp_abs_timeout_us = min(abs_timeout_us, now + GCONF.location_cache_refresh_sql_timeout);
+      if (now >= abs_timeout_us || THIS_WORKER.is_timeout()) {
         ret = OB_TIMEOUT;
         LOG_WARN("already timeout", K(ret), K(THIS_WORKER.get_timeout_ts()));
       } else if (OB_TMP_FAIL(GSCHEMASERVICE.check_if_tenant_has_been_dropped(tenant_id,
