@@ -8330,7 +8330,7 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_commit_replay_before_historical_c
       SCN selected_meta_scn;
       const ObSSTable *selected = nullptr;
       ObTabletSSLinkIncMajorTask import_lookup(ctx.ls_id_, tablet_id, wide_snapshot,
-          import_tx, import_seq);
+          import_tx, import_seq, SCN::min_scn() /*ddl_checkpoint_scn*/);
       ASSERT_EQ(OB_SUCCESS, import_lookup.find_target_inc_major_(reorgan_scn,
           lookup_allocator, selected_tablet, selected_meta_scn, selected_store, selected));
       ASSERT_NE(nullptr, selected);
@@ -8352,7 +8352,8 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_commit_replay_before_historical_c
     ObDDLIncMajorCommitReplayExecutor replay;
     ASSERT_EQ(OB_SUCCESS, replay.init(ls_handle.get_ls(), tablet_id, commit_scn,
         import_tx, import_seq, wide_snapshot, data_version,
-        false /*rollback*/, false /*co_sstable*/, original_buffer, original->get_start_scn()));
+        false /*rollback*/, false /*co_sstable*/, original_buffer, original->get_start_scn(),
+        false /*need_check_ddl_checkpoint*/));
     ASSERT_EQ(OB_SUCCESS, replay.do_replay_(local));
     const ObSSTable *replayed_tables[] = {wide};
     ASSERT_NO_FATAL_FAILURE(link_helper.check_state(
@@ -8377,7 +8378,8 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_commit_replay_before_historical_c
     ObDDLIncMajorCommitReplayExecutor later_replay;
     ASSERT_EQ(OB_SUCCESS, later_replay.init(ls_handle.get_ls(), tablet_id, later_commit,
         transaction::ObTransID(102), transaction::ObTxSEQ(202, 0), later_snapshot, data_version,
-        false, false, later_buffer, later->get_start_scn()));
+        false, false, later_buffer, later->get_start_scn(),
+        false /*need_check_ddl_checkpoint*/));
     ASSERT_EQ(OB_SUCCESS, later_replay.do_replay_(local));
     ObTabletSSLinkMajorTask older(ctx.ls_id_, tablet_id, narrow_snapshot,
         base, INC_MAJOR_MERGE, false /*prewarm*/, false /*need_report*/);

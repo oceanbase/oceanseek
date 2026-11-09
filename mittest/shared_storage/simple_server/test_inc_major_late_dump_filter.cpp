@@ -154,6 +154,12 @@ static int build_late_dump_sstable(ObArenaAllocator &allocator, const ObTabletID
 
 class TestIncMajorLateDumpFilter : public TestSharedMetaService
 {
+public:
+  // CTest runs both executables concurrently in the same working directory.
+  TestIncMajorLateDumpFilter()
+    : TestSharedMetaService("test_inc_major_late_dump_filter")
+  {}
+
 protected:
   void SetUp() override
   {
