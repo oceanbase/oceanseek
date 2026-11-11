@@ -511,7 +511,14 @@ struct SeRowkeyItem
   ObDatum *datums_;
   int64_t cnt_;
 };
-typedef common::hash::ObHashSet<ObRowkey, common::hash::NoPthreadDefendMode> SeRowkeyDistCtx;
+typedef common::hash::ObHashSet<ObRowkey,
+    common::hash::NoPthreadDefendMode,
+    common::hash::hash_func<ObRowkey>,
+    common::hash::equal_to<ObRowkey>,
+    common::hash::SimpleAllocer<common::hash::HashSetTypes<ObRowkey>::AllocType>,
+    common::hash::NormalPointer,
+    common::ObMalloc,
+    2> SeRowkeyDistCtx;
 
 //dml base compile info definition
 struct ObDMLBaseCtDef
