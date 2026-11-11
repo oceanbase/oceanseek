@@ -223,7 +223,6 @@ int ObVecMemSyncTask::process_one_tablet(
   } else if (OB_FAIL(mgr->get_adapter_inst_guard(tablet_id, new_adpt_guard))) {
     LOG_WARN("memdata sync fail to get adapter instance", KR(ret), K(ls_id_), K(tablet_id));
   }
-
   // Update adapter statistics (a not-complete skip is neither a success nor a failure)
   if (skipped_not_complete) {
   } else if (OB_SUCC(ret)) {

@@ -9,6 +9,7 @@
 #include "share/vector_index/ob_vector_index_async_task.h"
 #include "share/vector_index/ob_vector_index_async_task_util.h"
 #include "share/vector_index/ob_vector_index_i_task_executor.h"
+#include "share/vector_index/ob_vector_index_merge_policy.h"
 
 namespace oceanbase 
 {
@@ -40,11 +41,12 @@ public:
   ObVecIdxMergeTask() :
     ObVecIndexAsyncTask(ObMemAttr(MTL_ID(), "VecMergTask")),
     no_need_replace_adaptor_(false),
-    can_merge_from_base_(false),
     merge_from_base_(false),
-    pre_alloc_size_(0)
+    pre_alloc_size_(0),
+    merge_deleted_vids_(&allocator_, MTL_ID()),
+    merge_deleted_vids_valid_(false)
   {}
-  virtual ~ObVecIdxMergeTask() {}
+  virtual ~ObVecIdxMergeTask() { merge_deleted_vids_.reset_bitmap(); }
   int do_work() override;
 
 private:
@@ -58,7 +60,7 @@ private:
       ObPluginVectorIndexAdaptor &adaptor,
       const ObVectorIndexParam &target_param,
       bool &equal);
-  int prepare_alter_param_full_merge(ObPluginVectorIndexAdaptor &adaptor);
+  // Check eligibility and retain the source snapshot/plan before executing a merge.
   int check_and_merge(ObPluginVectorIndexAdapterGuard &adpt_guard);
   int execute_merge();
   int execute_exchange();
@@ -66,12 +68,15 @@ private:
       transaction::ObTxDesc *tx_desc,
       transaction::ObTxReadSnapshot &snapshot,
       const uint64_t timeout_us);
-  int prepare_merge_segment(const ObVecIdxSnapshotDataHandle& old_snap_data);
+  // Materialize the checked plan; preserve ALTER admission and reserve memory for ordinary merges.
+  int prepare_merge_segment();
   int update_task_merge_segments_info();
-  int update_task_result_segments_info(const ObVectorIndexSegmentMeta *new_meta);
+  int update_task_result_segments_info();
   int calculate_max_merge_vec_cnt(int64_t &max_merge_vec_cnt, int64_t incr_count);
   int build_filter_clause(const ObTableSchema &data_table_schema, const ObTableSchema &snapshot_table_schema);
   int merge_bitmap(ObPluginVectorIndexAdaptor *adaptor);
+  int collect_merge_deleted_vids();
+  int filter_reclaimed_vids();
   int execute_insert(
       const uint64_t data_schema_version,
       const bool is_user_hidden_table,
@@ -101,9 +106,7 @@ private:
       const ObVectorIndexMeta &old_meta);
   int refresh_adaptor();
   int check_and_wait_write();
-  int check_delta_table_empty(ObPluginVectorIndexAdaptor *adapter,
-      const share::SCN &check_scn,
-      bool &is_empty);
+  int prepare_async_merge_input();
 
 private:
   int64_t min_vid_ {INT64_MAX};
@@ -111,10 +114,15 @@ private:
   // rowkey for scan range
   ObArray<ObObj> rowkey_objs_;
   ObSEArray<const ObVectorIndexSegmentMeta *, 10> merge_segments_;
+  ObVectorIndexMeta merge_source_meta_; // Own keys and graph references through publication.
+  ObVecMergePlan merge_plan_;
+  ObVecMergePolicyInput merge_policy_input_; // Statistics from the retained execution snapshot.
+  ObVecMergeConfig merge_config_;
   bool no_need_replace_adaptor_;
-  bool can_merge_from_base_;
   bool merge_from_base_;
   int64_t pre_alloc_size_;
+  ObVectorIndexRoaringBitMap merge_deleted_vids_;
+  bool merge_deleted_vids_valid_;
 
   DISALLOW_COPY_AND_ASSIGN(ObVecIdxMergeTask);
 };

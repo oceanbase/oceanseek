@@ -6,6 +6,8 @@
 #define USING_LOG_PREFIX SHARE
 
 #include "ob_vector_index_aux_table_handler.h"
+#include "lib/roaringbitmap/ob_roaringbitmap.h"
+#include "lib/utility/ob_sort.h"
 #include "share/vector_index/ob_plugin_vector_index_utils.h"
 #include "share/vector_index/ob_plugin_vector_index_adaptor.h"
 #include "share/vector_index/ob_vector_index_util.h"
@@ -23,6 +25,7 @@
 
 ERRSIM_POINT_DEF(ERRSIM_VEC_META_RETRY_SNAPSHOT, "Inject a snapshot error when retrying vector metadata writes");
 ERRSIM_POINT_DEF(ERRSIM_VEC_META_WRITE, "Inject an error before writing vector metadata");
+ERRSIM_POINT_DEF(ERRSIM_VEC_BITMAP_PRUNE_AFTER_WRITE, "Fail after a bitmap row update before root publication");
 
 namespace oceanbase
 {
@@ -285,42 +288,6 @@ int ObVectorIndexDeltaTableHandler::init(
   } else {
     inc_table_schema_version_ = delta_table_schema->get_schema_version();
     vbitmap_table_schema_version_ = index_table_schema->get_schema_version();
-  }
-  return ret;
-}
-
-int ObVectorIndexDeltaTableHandler::check_delta_table_empty(bool &is_empty)
-{
-  int ret = OB_SUCCESS;
-  is_empty = false;
-  if (OB_ISNULL(delta_table_iter_) || OB_ISNULL(index_table_iter_)) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("delta table handler not inited for empty check", K(ret), KP_(delta_table_iter), KP_(index_table_iter));
-  } else {
-    ObTableScanIterator *delta_scan_iter = static_cast<ObTableScanIterator *>(delta_table_iter_);
-    ObTableScanIterator *index_scan_iter = static_cast<ObTableScanIterator *>(index_table_iter_);
-    blocksstable::ObDatumRow *datum_row = nullptr;
-    if (OB_FAIL(delta_scan_iter->get_next_row(datum_row))) {
-      if (OB_ITER_END == ret) {
-        ret = OB_SUCCESS;
-        if (OB_FAIL(index_scan_iter->get_next_row(datum_row))) {
-          if (OB_ITER_END == ret) {
-            ret = OB_SUCCESS;
-            is_empty = true;
-            LOG_INFO("[VECTOR INDEX MERGE] delta and index-id tables empty at init read scn",
-                K(is_empty), K_(ls_id), K_(tenant_id), K_(inc_index_tablet_id), K_(vbitmap_tablet_id));
-          } else {
-            LOG_WARN("get_next_row from index-id table failed", K(ret));
-          }
-        } else {
-          LOG_INFO("[VECTOR INDEX MERGE] index-id table has rows, not empty", K_(ls_id), K_(tenant_id));
-        }
-      } else {
-        LOG_WARN("get_next_row from delta table failed", K(ret));
-      }
-    } else {
-      LOG_INFO("[VECTOR INDEX MERGE] delta table has rows, not empty", K_(ls_id), K_(tenant_id));
-    }
   }
   return ret;
 }
@@ -641,7 +608,7 @@ int ObVectorIndexSnapTableHandler::prepare_insert_iter(
       if (block.is_meta_block()) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("block should not be meta block", K(ret), K(block), K(row_id));
-      } else if (OB_FAIL(ObVectorIndexSegmentMeta::get_segment_persist_key(index_type, snapshot_tablet_id_, snapshot_version, row_id, allocator_, key))) {
+      } else if (OB_FAIL(block.get_key(index_type, snapshot_tablet_id_, snapshot_version, row_id, allocator_, key))) {
         LOG_WARN("generate segment persist key fail", K(ret), K(snapshot_tablet_id_), K(snapshot_version));
       } else if (key.empty()) {
         ret = OB_ERR_UNEXPECTED;
@@ -979,6 +946,9 @@ int ObVectorIndexSnapTableHandler::inner_insertup_meta_row(
       LOG_WARN("fail to read old meta", K(ret));
     } else if (OB_FAIL(prepare_meta_for_update(new_meta, old_meta, snapshot_version))) {
       LOG_WARN("init new meta fail", K(ret));
+    } else if (OB_FALSE_IT(new_meta.last_bitmap_update_scn_ = old_meta.last_bitmap_update_scn_)) {
+    } else if (OB_FAIL(before_write_meta(adaptor, tx_desc, snapshot, old_meta, new_meta, timeout_ts))) {
+      LOG_WARN("update segment bitmaps before root failed", K(ret));
     } else if (OB_FAIL(resolve_snap_meta_ref(
         old_meta, row_exist, new_meta, need_delete_old_snap_meta))) {
       LOG_WARN("resolve snap_meta_ref fail", K(ret));
@@ -1403,6 +1373,169 @@ int ObVectorIndexSnapTableHandler::erase_snap_meta_child_lob(
   return ret;
 }
 
+int ObVectorIndexSnapTableHandler::update_segment_bitmap_row(
+    ObPluginVectorIndexAdaptor *adaptor, transaction::ObTxDesc *tx_desc,
+    transaction::ObTxReadSnapshot &snapshot, const ObVectorIndexSegmentMeta &segment_meta,
+    const ObVectorIndexRoaringBitMap &removable_vids, int64_t timeout_ts, bool &changed)
+{
+  int ret = OB_SUCCESS;
+  changed = false;
+  if (!segment_meta.has_segment_meta_row_) { return ret; }
+  lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(tenant_id_, "VIBitmap"));
+  ObArenaAllocator allocator("VIBitmapPrune", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id_);
+  ObVectorIndexSegmentMeta bitmap;
+  ObNewRowIterator *iter = nullptr;
+  schema::ObTableParam table_param(allocator);
+  storage::ObTableScanParam scan_param;
+  blocksstable::ObDatumRow old_row;
+  blocksstable::ObDatumRow new_row;
+  bool found = false;
+  ObString blob;
+  int64_t pos = 0;
+  const sql::ObDatumMeta blob_meta(ObLongTextType, CS_TYPE_BINARY, -1);
+  if (OB_FAIL(old_row.init(get_dml_column_cnt()))) {
+    LOG_WARN("init bitmap row failed", K(ret));
+  } else if (OB_FAIL(scan_and_lock_meta_row(allocator, adaptor, tx_desc, snapshot,
+      iter, table_param, scan_param, segment_meta.start_key_, timeout_ts, old_row, found,
+      true /* read_own_writes */))) {
+    LOG_WARN("lock segment bitmap failed", K(ret), K(segment_meta));
+  } else if (!found) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("segment bitmap row missing", K(ret), K(segment_meta));
+  } else if (OB_FALSE_IT(blob = old_row.storage_datums_[vector_data_col_idx_].get_string())) {
+  } else if (OB_FAIL(sql::ObTextStringHelper::read_real_string_data_with_copy(
+      allocator, old_row.storage_datums_[vector_data_col_idx_], blob_meta, blob))) {
+    LOG_WARN("read segment bitmap LOB failed", K(ret));
+  } else if (OB_FAIL(ObVectorIndexSegment::create_bitmap_only(bitmap.segment_handle_, tenant_id_, allocator))) {
+    LOG_WARN("create temporary bitmap failed", K(ret));
+  } else if (OB_FAIL(bitmap.segment_handle_->deserialize_meta(blob.ptr(), blob.length(), pos, bitmap.vbitmap_))) {
+    LOG_WARN("deserialize segment bitmap failed", K(ret));
+  } else if (OB_ISNULL(bitmap.vbitmap_) || OB_ISNULL(bitmap.vbitmap_->delete_bitmap_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    const uint64_t before = roaring64_bitmap_get_cardinality(bitmap.vbitmap_->delete_bitmap_);
+    auto *insert_bitmap = bitmap.vbitmap_->insert_bitmap_;
+    const uint64_t insert_before = OB_NOT_NULL(insert_bitmap)
+        ? roaring64_bitmap_get_cardinality(insert_bitmap) : 0;
+    ROARING_TRY_CATCH(roaring64_bitmap_andnot_inplace(
+        bitmap.vbitmap_->delete_bitmap_, removable_vids.delete_bitmap_));
+    // Reclaimed VIDs must also leave visibility INSERT, including INSERT-only rows.
+    if (OB_SUCC(ret) && OB_NOT_NULL(insert_bitmap)) {
+      ROARING_TRY_CATCH(roaring64_bitmap_andnot_inplace(
+          insert_bitmap, removable_vids.delete_bitmap_));
+    }
+    const uint64_t insert_after = OB_NOT_NULL(insert_bitmap)
+        ? roaring64_bitmap_get_cardinality(insert_bitmap) : 0;
+    if (OB_SUCC(ret) && (before != roaring64_bitmap_get_cardinality(bitmap.vbitmap_->delete_bitmap_)
+        || insert_before != insert_after)) {
+      const int64_t size = bitmap.segment_handle_->get_serialize_meta_size(bitmap.vbitmap_);
+      char *buf = nullptr;
+      ObString data;
+      pos = 0;
+      if (OB_UNLIKELY(size < 0)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to get pruned segment bitmap serialize size", K(ret), K(size));
+      } else if (OB_UNLIKELY(size == 0)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid pruned segment bitmap serialize size", K(ret), K(size));
+      } else if (OB_ISNULL(buf = static_cast<char *>(allocator.alloc(size)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("allocate pruned segment bitmap buffer failed", K(ret), K(size));
+      } else if (OB_FAIL(bitmap.segment_handle_->serialize_meta(buf, size, pos, bitmap.vbitmap_))) {
+        LOG_WARN("serialize pruned segment bitmap failed", K(ret));
+      } else if (OB_FAIL(build_snap_meta_child_data(
+          allocator, adaptor, tx_desc, snapshot, buf, size, timeout_ts, data))) {
+        LOG_WARN("build pruned bitmap LOB failed", K(ret));
+      } else if (OB_FAIL(new_row.init(get_dml_column_cnt()))
+          || OB_FAIL(new_row.deep_copy(old_row, allocator))) {
+        LOG_WARN("prepare bitmap update row failed", K(ret));
+      } else {
+        new_row.storage_datums_[vector_data_col_idx_].set_string(data);
+        new_row.storage_datums_[vector_data_col_idx_].set_lob();
+        if (OB_FAIL(erase_snap_meta_child_lob(adaptor, tx_desc, snapshot, old_row, timeout_ts))) {
+          LOG_WARN("erase old bitmap LOB failed", K(ret));
+        } else if (OB_FAIL(update_meta_data_row(tx_desc, snapshot, old_row, new_row, timeout_ts))) {
+          LOG_WARN("update pruned bitmap row failed", K(ret));
+        } else {
+          changed = true;
+          LOG_INFO("pruned merge bitmap row", K(segment_meta), K(before),
+              "after", roaring64_bitmap_get_cardinality(bitmap.vbitmap_->delete_bitmap_),
+              K(insert_before), K(insert_after), "bitmap_scn", snapshot.version());
+        }
+      }
+    }
+  }
+  if (OB_NOT_NULL(iter)) {
+    int tmp_ret = MTL(ObAccessService *)->revert_scan_iter(iter);
+    if (OB_SUCCESS != tmp_ret) { LOG_WARN("revert bitmap scan failed", K(tmp_ret)); }
+  }
+  return ret;
+}
+
+int ObVecIdxSnapTableSegMergeOp::before_write_meta(ObPluginVectorIndexAdaptor *adaptor,
+    transaction::ObTxDesc *tx_desc, transaction::ObTxReadSnapshot &snapshot,
+    const ObVectorIndexMeta &old_meta, ObVectorIndexMeta &new_meta, int64_t timeout_ts)
+{
+  int ret = OB_SUCCESS;
+  // insertup_meta_row has inherited the old watermark. Advance it atomically
+  // with the new graphs/root, including pure inserts with no deletion candidates.
+  if (insert_bitmap_pruned_) {
+    new_meta.last_bitmap_update_scn_ = OB_MAX(new_meta.last_bitmap_update_scn_,
+        snapshot.version().get_val_for_sql());
+  }
+  if (OB_ISNULL(expected_meta_) || OB_ISNULL(removable_vids_)
+      || OB_ISNULL(removable_vids_->delete_bitmap_)
+      || roaring64_bitmap_is_empty(removable_vids_->delete_bitmap_)) {
+    return ret;
+  }
+  bool matches = old_meta.segment_count() == expected_meta_->segment_count()
+      && old_meta.last_bitmap_update_scn_ == expected_meta_->last_bitmap_update_scn_;
+  for (int64_t i = 0; matches && i < old_meta.segment_count(); ++i) {
+    const auto &actual = old_meta.flat_seg_meta_at(i);
+    matches = false;
+    // Migration may install segments in a different order; compare segment identities.
+    for (int64_t j = 0; !matches && j < expected_meta_->segment_count(); ++j) {
+      const auto &expected = expected_meta_->flat_seg_meta_at(j);
+      matches = actual.start_key_ == expected.start_key_ && actual.end_key_ == expected.end_key_
+          && actual.scn_ == expected.scn_ && actual.seg_type_ == expected.seg_type_
+          && actual.bitmap_scn_ == expected.bitmap_scn_;
+    }
+  }
+  if (!matches) {
+    LOG_INFO("skip bitmap pruning after source layout changed", K(old_meta), KPC(expected_meta_));
+  } else {
+    // All publishers lock root first; visit bitmap rows in key order within that lock.
+    ObSEArray<ObVectorIndexSegmentMeta *, 8> segments;
+    for (int64_t i = 0; OB_SUCC(ret) && i < new_meta.segment_count(); ++i) {
+      auto &meta = i < new_meta.bases_.count() ? new_meta.bases_.at(i)
+          : new_meta.incrs_.at(i - new_meta.bases_.count());
+      if (OB_FAIL(segments.push_back(&meta))) { LOG_WARN("collect bitmap rows failed", K(ret)); }
+    }
+    struct SegmentStartKeyLess
+    {
+      bool operator()(const ObVectorIndexSegmentMeta *a,
+          const ObVectorIndexSegmentMeta *b) const
+      {
+        return a->start_key_.compare(b->start_key_) < 0;
+      }
+    };
+    lib::ob_sort(segments.begin(), segments.end(), SegmentStartKeyLess());
+    for (int64_t i = 0; OB_SUCC(ret) && i < segments.count(); ++i) {
+      auto &meta = *segments.at(i);
+      bool changed = false;
+      if (OB_FAIL(update_segment_bitmap_row(adaptor, tx_desc, snapshot, meta,
+          *removable_vids_, timeout_ts, changed))) {
+        LOG_WARN("prune merge bitmap failed", K(ret), K(meta));
+      } else if (changed) {
+        meta.bitmap_scn_ = snapshot.version().get_val_for_sql();
+        new_meta.last_bitmap_update_scn_ = meta.bitmap_scn_;
+        ret = ERRSIM_VEC_BITMAP_PRUNE_AFTER_WRITE;
+      }
+    }
+  }
+  return ret;
+}
+
 int ObVectorIndexSnapTableHandler::write_snap_meta_child_row(
     ObIAllocator &allocator,
     ObPluginVectorIndexAdaptor *adaptor,
@@ -1435,15 +1568,15 @@ int ObVectorIndexSnapTableHandler::write_snap_meta_child_row(
     blocksstable::ObDatumRow new_row;
     const ObVectorIndexSnapMetaHeader snap_meta_header;
     const int64_t serde_size = ObVectorIndexSnapMetaHeader::HEAD_LEN + bridge_meta.get_serialize_size()
-        + (bridge_segment.is_valid() ? bridge_segment->get_serialize_meta_size() : 0);
+        + (bridge_segment.is_valid() ? bridge_segment->get_serialize_meta_size(bridge_meta.vbitmap_) : 0);
     char *serde_buf = nullptr;
     int64_t pos = 0;
     if (bridge_meta.seg_type_ != ObVectorIndexSegmentType::SNAP_META_BRIDGE
         || bridge_meta.scn_ <= 0
         || !bridge_segment.is_valid()
-        || OB_ISNULL(bridge_segment->get_vbitmap())
-        || OB_ISNULL(bridge_segment->get_vbitmap()->insert_bitmap_)
-        || OB_ISNULL(bridge_segment->get_vbitmap()->delete_bitmap_)) {
+        || OB_ISNULL(bridge_meta.vbitmap_)
+        || OB_ISNULL(bridge_meta.vbitmap_->insert_bitmap_)
+        || OB_ISNULL(bridge_meta.vbitmap_->delete_bitmap_)) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid snap_meta bridge child data", K(ret), K(bridge_meta), K(bridge_segment));
     } else if (OB_ISNULL(serde_buf = static_cast<char *>(allocator.alloc(serde_size)))) {
@@ -1455,7 +1588,7 @@ int ObVectorIndexSnapTableHandler::write_snap_meta_child_row(
     } else if (OB_FALSE_IT(pos += ObVectorIndexSnapMetaHeader::HEAD_LEN)) {
     } else if (OB_FAIL(bridge_meta.serialize(serde_buf, serde_size, pos))) {
       LOG_WARN("serialize snap_meta bridge meta fail", K(ret), K(bridge_meta));
-    } else if (OB_FAIL(bridge_segment->serialize_meta(serde_buf, serde_size, pos))) {
+    } else if (OB_FAIL(bridge_segment->serialize_meta(serde_buf, serde_size, pos, bridge_meta.vbitmap_))) {
       LOG_WARN("serialize snap_meta bridge bitmap fail", K(ret), K(bridge_segment));
     } else if (pos != serde_size) {
       ret = OB_ERR_UNEXPECTED;
@@ -1614,7 +1747,8 @@ int ObVectorIndexSnapTableHandler::scan_and_lock_meta_row(
     const ObString &meta_key,
     const int64_t timeout_ts,
     blocksstable::ObDatumRow &old_row,
-    bool &row_exist)
+    bool &row_exist,
+    const bool read_own_writes)
 {
   int ret = OB_SUCCESS;
   ObTableScanIterator *table_scan_iter = nullptr;
@@ -1623,7 +1757,8 @@ int ObVectorIndexSnapTableHandler::scan_and_lock_meta_row(
   if (OB_FAIL(ObPluginVectorIndexUtils::open_segment_data_iter(
       adaptor, allocator, ls_id_, snapshot_tablet_id_,
       meta_key, meta_key, snapshot.version(),
-      snap_scan_param, snap_table_param, snap_data_iter))) {
+      snap_scan_param, snap_table_param, snap_data_iter,
+      read_own_writes ? tx_desc : nullptr, read_own_writes ? &snapshot : nullptr))) {
     LOG_WARN("fail to open meta row point read iter", K(ret), K(meta_key));
   } else if (OB_ISNULL(table_scan_iter = static_cast<ObTableScanIterator *>(snap_data_iter))) {
     ret = OB_ERR_UNEXPECTED;
@@ -1734,10 +1869,10 @@ int ObVecIdxSnapTableSegAddOp::prepare_meta_for_update(ObVectorIndexMeta &new_me
   return ret;
 }
 
-int ObVecIdxSnapTableSegMergeOp::preprea_meta(ObVectorIndexSegmentMeta *seg_meta, ObIArray<const ObVectorIndexSegmentMeta *> &merge_segments)
+int ObVecIdxSnapTableSegMergeOp::preprea_meta(const ObIArray<ObVectorIndexSegmentMeta> &seg_metas, ObIArray<const ObVectorIndexSegmentMeta *> &merge_segments)
 {
   int ret = OB_SUCCESS;
-  new_seg_meta_ = seg_meta;
+  new_seg_metas_ = &seg_metas;
   merge_segments_ = &merge_segments;
   return ret;
 }
@@ -1752,66 +1887,111 @@ int ObVecIdxSnapTableSegMergeOp::prepare_meta_for_insert(ObVectorIndexMeta &new_
 int ObVecIdxSnapTableSegMergeOp::prepare_meta_for_update(ObVectorIndexMeta &new_meta, const ObVectorIndexMeta &old_meta, const int64_t snapshot_version)
 {
   int ret = OB_SUCCESS;
-  int64_t real_delete_cnt = 0;
+  int64_t matched = 0;
+  int64_t previous = -1;
+  bool inserted = false;
   new_meta.header_.scn_ = snapshot_version;
   new_meta.is_persistent_ = true;
   new_meta.bases_.reset();
   new_meta.incrs_.reset();
-  for (int64_t i = 0; OB_SUCC(ret) && i < old_meta.bases_.count(); ++i) {
-    const ObVectorIndexSegmentMeta &old_seg_meta = old_meta.bases_.at(i);
-    bool should_delete = false;
-    for (int64_t j = 0; OB_SUCC(ret) && j < merge_segments_->count() && !should_delete; ++j) {
-      if (0 == merge_segments_->at(j)->start_key_.compare(old_seg_meta.start_key_)) {
-        should_delete = true;
-        ++real_delete_cnt;
-      }
-    }
-    if (!should_delete && OB_FAIL(new_meta.bases_.push_back(old_seg_meta))) {
-      LOG_WARN("push back seg meta to bases fail", K(ret), K(old_seg_meta), K(new_meta));
-    }
+  new_meta.clear_snap_meta_ref();
+  if (OB_ISNULL(merge_segments_) || merge_segments_->empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("merge publication has no source segments", K(ret), KP(merge_segments_));
+  } else if (OB_ISNULL(new_seg_metas_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("merge publication result metadata is null", K(ret));
   }
-  for (int64_t i = 0; OB_SUCC(ret) && i < old_meta.incrs_.count(); ++i) {
-    const ObVectorIndexSegmentMeta &old_seg_meta = old_meta.incrs_.at(i);
-    bool should_delete = false;
-    for (int64_t j = 0; OB_SUCC(ret) && j < merge_segments_->count() && !should_delete; ++j) {
-      if (0 == merge_segments_->at(j)->start_key_.compare(old_seg_meta.start_key_)) {
-        should_delete = true;
-        ++real_delete_cnt;
+  for (int64_t i = 0; OB_SUCC(ret) && i < new_seg_metas_->count(); ++i) {
+    const ObVectorIndexSegmentMeta &output = new_seg_metas_->at(i);
+    if ((new_seg_metas_->count() > 1 && output.seg_type_ != ObVectorIndexSegmentType::BASE)
+        || output.start_key_.empty() || output.start_key_.compare(output.end_key_) > 0) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid merge output metadata", K(ret), K(i), K(output), K(new_seg_metas_->count()));
+    } else if (OB_FAIL(check_segment_start_key_exist(old_meta, output))) {
+      LOG_WARN("merge output key conflicts with existing segment", K(ret), K(i), K(output));
+    }
+    for (int64_t j = 0; OB_SUCC(ret) && j < old_meta.segment_count(); ++j) {
+      const ObVectorIndexSegmentMeta &old = old_meta.flat_seg_meta_at(j);
+      if (output.start_key_.compare(old.end_key_) <= 0
+          && old.start_key_.compare(output.end_key_) <= 0) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("merge output range conflicts with existing segment", K(ret), K(output), K(old));
       }
     }
-    if (!should_delete && OB_FAIL(new_meta.incrs_.push_back(old_seg_meta))) {
-      LOG_WARN("push back seg meta to incrs fail", K(ret), K(old_seg_meta), K(new_meta));
-    }
-  }
-  if (OB_SUCC(ret)) {
-    if (real_delete_cnt != merge_segments_->count()) {
-      ret =  OB_CANCELED;
-      LOG_WARN("may be conflict with other task, need cancal", K(old_meta), K(real_delete_cnt), K(merge_segments_->count()));
-    } else if (OB_ISNULL(new_seg_meta_)) {
-      LOG_INFO("new_seg_meta is empty, so skip push", KPC_(new_seg_meta), K(new_meta));
-    } else if (OB_FAIL(check_segment_start_key_exist(new_meta, *new_seg_meta_))) {
-      LOG_WARN("segment start_key conflict", K(ret), KPC_(new_seg_meta), K(new_meta));
-    } else if (ObVectorIndexSegmentType::BASE == new_seg_meta_->seg_type_) {
-      if (OB_FAIL(new_meta.bases_.push_back(*new_seg_meta_))) {
-        LOG_WARN("push back new seg meta to bases fail", K(ret), KPC_(new_seg_meta), K(new_meta));
-      }
-    } else {
-      if (OB_FAIL(new_meta.incrs_.push_back(*new_seg_meta_))) {
-        LOG_WARN("push back new seg meta to incrs fail", K(ret), KPC_(new_seg_meta), K(new_meta));
+    for (int64_t j = 0; OB_SUCC(ret) && j < i; ++j) {
+      const ObVectorIndexSegmentMeta &other = new_seg_metas_->at(j);
+      if (output.start_key_.compare(other.end_key_) <= 0
+          && other.start_key_.compare(output.end_key_) <= 0) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("merge output ranges overlap", K(ret), K(i), K(j), K(output), K(other));
       }
     }
   }
-  if (OB_SUCC(ret)
+  for (int pass = 0; OB_SUCC(ret) && pass < 2; ++pass) {
+    const ObIArray<ObVectorIndexSegmentMeta> &sources = pass == 0 ? old_meta.bases_ : old_meta.incrs_;
+    ObIArray<ObVectorIndexSegmentMeta> &outputs = pass == 0 ? new_meta.bases_ : new_meta.incrs_;
+    const bool output_here = !new_seg_metas_->empty()
+        && ((new_seg_metas_->at(0).seg_type_ == ObVectorIndexSegmentType::BASE) == (pass == 0));
+    for (int64_t i = 0; OB_SUCC(ret) && i < sources.count(); ++i) {
+      const ObVectorIndexSegmentMeta &source = sources.at(i);
+      bool selected = false;
+      for (int64_t j = 0; OB_SUCC(ret) && !selected && j < merge_segments_->count(); ++j) {
+        const ObVectorIndexSegmentMeta *expected = merge_segments_->at(j);
+        if (OB_ISNULL(expected)) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_WARN("merge publication source metadata is null", K(ret), K(j));
+        } else if (expected->start_key_ == source.start_key_) {
+          const int64_t position = (pass == 0 ? 0 : old_meta.bases_.count()) + i;
+          if (j != matched || (previous >= 0 && position != previous + 1)
+              || expected->end_key_ != source.end_key_ || expected->scn_ != source.scn_
+              || expected->seg_type_ != source.seg_type_) {
+            ret = OB_CANCELED;
+            LOG_WARN("merge sources changed before publication", K(ret), K(j), K(matched),
+                K(previous), K(position), KPC(expected), K(source));
+          } else {
+            selected = true;
+            ++matched;
+            previous = position;
+          }
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (selected && output_here && !inserted) {
+        for (int64_t j = 0; OB_SUCC(ret) && j < new_seg_metas_->count(); ++j) {
+          if (OB_FAIL(outputs.push_back(new_seg_metas_->at(j)))) {
+            LOG_WARN("insert merge result at source position failed", K(ret), K(j));
+          }
+        }
+        inserted = OB_SUCC(ret);
+      } else if (!selected && OB_FAIL(outputs.push_back(source))) {
+        LOG_WARN("retain unselected segment failed", K(ret));
+      }
+    }
+    // Incr prefixes can become a new Base without replacing an existing Base.
+    if (OB_SUCC(ret) && output_here && !inserted) {
+      for (int64_t j = 0; OB_SUCC(ret) && j < new_seg_metas_->count(); ++j) {
+        if (OB_FAIL(outputs.push_back(new_seg_metas_->at(j)))) {
+          LOG_WARN("append merge result failed", K(ret), K(j));
+        }
+      }
+      inserted = OB_SUCC(ret);
+    }
+  }
+  if (OB_SUCC(ret) && matched != merge_segments_->count()) {
+    ret = OB_CANCELED;
+    LOG_WARN("merge source was replaced", K(ret), K(matched), K(merge_segments_->count()));
+  }
+  if (OB_SUCC(ret) && new_meta.bases_.count() == 1 && old_meta.bases_.count() == 1
       && OB_ISNULL(bridge_meta_) && OB_ISNULL(bridge_segment_)
-      && new_meta.max_base_scn() > 0
-      && new_meta.max_base_scn() == old_meta.max_base_scn()
+      && new_meta.bases_.at(0).start_key_ == old_meta.bases_.at(0).start_key_
       && old_meta.has_snap_meta_ref()) {
     new_meta.set_snap_meta_ref();
   }
   if (OB_SUCC(ret) && !new_meta.is_valid()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("new meta is not valid after merge", K(ret), K(new_meta), K(old_meta));
-  } else { 
+  } else if (OB_SUCC(ret)) {
     LOG_INFO("prepare meta for merge success", K(new_meta), K(old_meta));
   }
   return ret;

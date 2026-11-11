@@ -1413,11 +1413,11 @@ private:
 struct ObVecIdxSnapshotBlockData
 {
   ObVecIdxSnapshotBlockData():
-    is_meta_(false), data_()
+    is_meta_(false), data_(), key_()
   {}
 
   ObVecIdxSnapshotBlockData(const bool is_meta, const ObString &data):
-    is_meta_(is_meta), data_(data)
+    is_meta_(is_meta), data_(data), key_()
   {}
 
   bool is_meta_block() const { return is_meta_; }
@@ -1425,12 +1425,16 @@ struct ObVecIdxSnapshotBlockData
       const int64_t snapshot_version, const int64_t row_id, ObIAllocator &allocator, ObString &key) const;
   const ObString& get_data() const { return data_; }
   ObString& get_data() { return data_; }
+  const ObString &get_persist_key() const { return key_; }
+  void set_persist_key(const ObString &key) { key_ = key; }
 
   TO_STRING_KV(K_(is_meta), "data_length", data_.length(), KP(data_.ptr()));
 
 private:
   bool is_meta_;
   ObString data_;
+  // Optional DDL key owned by the serialization allocator. Independent of output order.
+  ObString key_;
 };
 
 class ObVecIdxSnapshotDataWriteCtx final

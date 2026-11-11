@@ -57,7 +57,7 @@ public:
   static int resolve_vec_idx_segment_for_migration(
       share::ObPluginVectorIndexAdaptor *adaptor,
       const int64_t segment_idx,
-      share::ObVectorIndexSegmentHandle &out_handle);
+      share::ObVectorIndexSegmentMeta &out_meta);
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObVectorIndexMigrationUtil);

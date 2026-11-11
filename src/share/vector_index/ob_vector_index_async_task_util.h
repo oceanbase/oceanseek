@@ -1038,7 +1038,7 @@ protected:
       const uint64_t tenant_id,
       const share::ObLSID &ls_id,
       common::ObAddr &leader_addr);
-  int try_reuse_segments_from_old_adapter();
+  int try_reuse_segments_from_old_adapter(const SCN &read_scn);
   bool check_snapshot_table_available(ObPluginVectorIndexAdaptor &adaptor);
   bool check_task_satisfied_memory_limited(ObPluginVectorIndexAdaptor &adaptor);
   bool check_new_adapter_exist(const int64_t task_id);
@@ -1371,6 +1371,13 @@ public:
       ObVecIndexAsyncTaskCtx *task_ctx,
       int64_t &estimate_mem,
       ObPluginVectorIndexAdaptor *adapter = nullptr);
+  // Estimate an already selected plan. No triggering, selection or segment access.
+  static int estimate_merge_memory(
+      ObVecIndexAsyncTaskCtx *task_ctx,
+      const struct ObVecMergePolicyInput &input,
+      const struct ObVecMergePlan &plan,
+      int64_t &estimate_mem,
+      ObPluginVectorIndexAdaptor *adapter = nullptr);
   // Estimate Merge rows from persisted segments. ALTER full rebuild includes every Base;
   // normal Merge includes Base only when its existing threshold policy requires it.
   static int get_merge_task_vec_cnt(
@@ -1400,6 +1407,9 @@ public:
   static bool disallow_cancel_task(const ObVecIndexAsyncTaskCtx *task_ctx);
 
 private:
+  static int estimate_task_memory_by_row_count_(
+      ObVecIndexAsyncTaskCtx *task_ctx, int64_t row_count, int64_t &estimate_mem,
+      ObPluginVectorIndexAdaptor *adapter);
   static int kill_mysql_session_for_tenant(
       common::ObMySQLProxy &proxy,
       const uint64_t tenant_id,

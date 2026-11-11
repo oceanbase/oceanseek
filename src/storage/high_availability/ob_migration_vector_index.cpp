@@ -509,17 +509,8 @@ int ObVectorIndexAdaptorMigrationDag::set_vec_index_meta(const share::ObVectorIn
 {
   int ret = OB_SUCCESS;
   vec_index_meta_.release();
-  vec_index_meta_.header_ = meta.header_;
-  vec_index_meta_.flags_ = meta.flags_;
-  for (int64_t i = 0; OB_SUCC(ret) && i < meta.bases_.count(); ++i) {
-    if (OB_FAIL(vec_index_meta_.add_base_seg_meta(meta.bases_.at(i)))) {
-      LOG_WARN("[MIG VEC] failed to add base seg meta", K(ret), K(i));
-    }
-  }
-  for (int64_t i = 0; OB_SUCC(ret) && i < meta.incrs_.count(); ++i) {
-    if (OB_FAIL(vec_index_meta_.add_incr_seg_meta(meta.incrs_.at(i)))) {
-      LOG_WARN("[MIG VEC] failed to add incr seg meta", K(ret), K(i));
-    }
+  if (OB_FAIL(vec_index_meta_.assign(meta))) {
+    LOG_WARN("[MIG VEC] failed to assign vector index meta", K(ret));
   }
   return ret;
 }
@@ -1921,6 +1912,7 @@ int ObVecIndexSegmentCopyTask::migrate_vec_index_segment_()
   share::ObPluginVectorIndexAdapterGuard adaptor_guard;
   share::ObPluginVectorIndexAdaptor *adaptor = nullptr;
   share::ObVectorIndexSegmentHandle dest_segment_handle;
+  share::ObVectorIndexSegmentMeta dest_segment_meta;
   int64_t deser_buf_size = 0;
   ObArenaAllocator deser_alloc("VIMigDeser");
 
@@ -1970,7 +1962,10 @@ int ObVecIndexSegmentCopyTask::migrate_vec_index_segment_()
     }
 
     if (OB_FAIL(ret) || skip_while_adaptor_deleted) {
-    } else if (OB_FAIL(read_and_deserialize_meta_(fetch_handle_, deser_buf_size, deser_alloc, dest_segment_handle))) {
+    } else if (OB_FAIL(dest_segment_meta.assign(vec_index_meta.flat_seg_meta_at(segment_idx_)))) {
+      LOG_WARN("[MIG VEC] copy destination segment meta failed", K(ret), K_(segment_idx));
+    } else if (OB_FAIL(read_and_deserialize_meta_(fetch_handle_, deser_buf_size, deser_alloc,
+        dest_segment_handle, dest_segment_meta.vbitmap_))) {
       LOG_WARN("[MIG VEC] read and deserialize meta failed", K(ret));
     } else if (OB_FAIL(stream_deserialize_vsag_(fetch_handle_, deser_buf_size, deser_alloc,
                    dest_segment_handle, segment_idx_))) {
@@ -1978,8 +1973,8 @@ int ObVecIndexSegmentCopyTask::migrate_vec_index_segment_()
     } else if (OB_FAIL(dest_segment_handle->immutable_optimize())) {
       LOG_WARN("[MIG VEC] immutable optimize failed after deserialize", K(ret), K_(segment_idx));
     } else if (OB_FAIL(adaptor->install_migrated_segment_handle(
-                   segment_idx_, vec_index_meta.flat_seg_meta_at(segment_idx_),
-                   dest_segment_handle, get_adaptor_dag_()->get_meta_header(),
+                   segment_idx_, dest_segment_meta,
+                   dest_segment_handle, vec_index_meta,
                    adaptor_meta.has_complete_,
                    segment_idx_ + 1 == get_adaptor_dag_()->get_total_segment_count()))) {
       LOG_WARN("[MIG VEC] install migrated segment failed", K(ret), K_(segment_idx));
@@ -2234,7 +2229,8 @@ int ObVecIndexSegmentCopyTask::read_and_deserialize_meta_(
     ObVecIdxSegFetchDriverHandle &handle,
     int64_t buf_size,
     common::ObIAllocator &alloc,
-    share::ObVectorIndexSegmentHandle &dest_segment_handle)
+    share::ObVectorIndexSegmentHandle &dest_segment_handle,
+    share::ObVectorIndexRoaringBitMap *&vbitmap)
 {
   int ret = OB_SUCCESS;
   share::ObVectorIndexSegment *seg = dest_segment_handle.get();
@@ -2277,7 +2273,7 @@ int ObVecIndexSegmentCopyTask::read_and_deserialize_meta_(
 
       if (OB_SUCC(ret)) {
         int64_t deserialize_pos = 0;
-        if (OB_FAIL(seg->deserialize_meta(accumulator.meta_buf(), accumulator.meta_size(), deserialize_pos))) {
+        if (OB_FAIL(seg->deserialize_meta(accumulator.meta_buf(), accumulator.meta_size(), deserialize_pos, vbitmap))) {
           LOG_WARN("[MIG VEC] failed to deserialize meta", K(ret), "meta_size", accumulator.meta_size(), K(deserialize_pos));
         } else if (deserialize_pos != accumulator.meta_size()) {
           ret = OB_ERR_UNEXPECTED;

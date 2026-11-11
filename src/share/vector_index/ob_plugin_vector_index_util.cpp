@@ -17,6 +17,16 @@ namespace oceanbase
 {
 namespace share
 {
+using ObVectorMergeVidSet = common::hash::ObHashSet<
+    int64_t,
+    common::hash::NoPthreadDefendMode,
+    common::hash::hash_func<int64_t>,
+    common::hash::equal_to<int64_t>,
+    common::hash::SimpleAllocer<common::hash::HashSetTypes<int64_t>::AllocType>,
+    common::hash::NormalPointer,
+    common::ObMalloc,
+    2>;
+
 int ObVectorQueryRowkeyIterator::init(int64_t total, ObIArray<common::ObRowkey> *rowkeys)
 {
   INIT_SUCC(ret);
@@ -449,6 +459,7 @@ int ObVectorVerifyRowIterator::add_row(
 }
 
 int ObPluginVectorIndexHelper::driect_merge_delta_and_snap_vids(
+                                                                       const uint64_t tenant_id,
                                                                        const ObVsagQueryResultArray &results, 
                                                                        int64_t &actual_cnt,
                                                                        int64_t *&vids_result,
@@ -475,8 +486,10 @@ int ObPluginVectorIndexHelper::driect_merge_delta_and_snap_vids(
     actual_cnt = res_num;
   } else {
     const int64_t hashset_size = 32;
-    common::hash::ObHashSet<int64_t, common::hash::NoPthreadDefendMode> vid_hash_set;
-    if (OB_FAIL(vid_hash_set.create(hashset_size))){
+    ObVectorMergeVidSet vid_hash_set;
+    const common::ObMemAttr bucket_attr(tenant_id, "VecMergeBkt");
+    const common::ObMemAttr node_attr(tenant_id, "VecMergeNode");
+    if (OB_FAIL(vid_hash_set.create(hashset_size, bucket_attr, node_attr))) {
       LOG_WARN("fail to create vid hashset id set failed", KR(ret), K(hashset_size));
     } else {
       for (int64_t i = 0; OB_SUCC(ret) && i < results.count(); ++i) {
@@ -514,6 +527,7 @@ int ObPluginVectorIndexHelper::driect_merge_delta_and_snap_vids(
 }
 
 int ObPluginVectorIndexHelper::sort_merge_delta_and_snap_vids(
+                                                         const uint64_t tenant_id,
                                                          ObVsagQueryResultArray& results,
                                                          const int64_t total, 
                                                          int64_t &actual_cnt,
@@ -541,8 +555,10 @@ int ObPluginVectorIndexHelper::sort_merge_delta_and_snap_vids(
     actual_cnt = res_num;
   } else {
     const int64_t hashset_size = 32;
-    common::hash::ObHashSet<int64_t, common::hash::NoPthreadDefendMode> vid_hash_set;
-    if (OB_FAIL(vid_hash_set.create(hashset_size))) {
+    ObVectorMergeVidSet vid_hash_set;
+    const common::ObMemAttr bucket_attr(tenant_id, "VecMergeBkt");
+    const common::ObMemAttr node_attr(tenant_id, "VecMergeNode");
+    if (OB_FAIL(vid_hash_set.create(hashset_size, bucket_attr, node_attr))) {
       LOG_WARN("fail to create vid hashset id set failed", KR(ret), K(hashset_size));
     } else {
       int64_t min_dist_idx = -1;

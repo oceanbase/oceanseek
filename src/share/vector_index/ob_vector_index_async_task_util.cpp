@@ -7,6 +7,7 @@
 #define USING_LOG_PREFIX SHARE
 
 #include "ob_vector_index_async_task_util.h"
+#include "ob_vector_index_merge_policy.h"
 #include "share/vector_index/ob_vec_index_priority_queue_manager.h"
 #include "share/vector_index/ob_vec_idx_async_task_scheduler.h"
 #include "share/vector_index/ob_plugin_vector_index_util.h"
@@ -7310,9 +7311,9 @@ int ObVecIndexAsyncTask::delete_incr_table_data(ObPluginVectorIndexAdaptor &adap
   return ret;
 }
 
-int ObVecIndexAsyncTask::try_reuse_segments_from_old_adapter()
+int ObVecIndexAsyncTask::try_reuse_segments_from_old_adapter(const SCN &read_scn)
 {
-  return ObPluginVectorIndexUtils::try_reuse_segments_from_old_adapter(new_adapter_, old_adapter_);
+  return ObPluginVectorIndexUtils::try_reuse_segments_from_old_adapter(new_adapter_, old_adapter_, ls_id_, read_scn);
 }
 
 int64_t ObVecIndexAsyncTaskCtx::task_memory_hold()
@@ -8019,8 +8020,6 @@ int ObVecIndexAsyncTaskUtil::estimate_task_memory(
     const uint64_t index_table_id = task_ctx->task_status_.table_id_;
     const ObTabletID &index_tablet_id = task_ctx->task_status_.tablet_id_;
     int64_t row_count = 0;
-    ObSchemaGetterGuard schema_guard;
-    const ObTableSchema *index_schema = nullptr;
 
     if (OB_INVALID_ID == tenant_id || OB_INVALID_ID == index_table_id || !index_tablet_id.is_valid()) {
       ret = OB_INVALID_ARGUMENT;
@@ -8053,26 +8052,8 @@ int ObVecIndexAsyncTaskUtil::estimate_task_memory(
         LOG_WARN("fail to get row count from partitions", K(ret), K(tenant_id), K(index_table_id));
       }
     }
-    uint64_t schema_table_id_for_estimate = index_table_id;
-    if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(
-                   tenant_id, schema_guard))) {
-      LOG_WARN("fail to get schema guard", K(ret), K(tenant_id));
-    } else if (OB_NOT_NULL(adapter)) {
-      schema_table_id_for_estimate = adapter->get_snapshot_table_id();
-    } else if (OB_FAIL(get_snapshot_table_id(
-                   schema_guard, tenant_id, index_table_id, schema_table_id_for_estimate))) {
-      LOG_WARN("fail to resolve snapshot table id for memory estimate", K(ret), K(index_table_id));
-    }
-    if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, schema_table_id_for_estimate, index_schema))) {
-      LOG_WARN("fail to get index table schema", K(ret), K(tenant_id), K(schema_table_id_for_estimate));
-    } else if (OB_ISNULL(index_schema)) {
-      ret = OB_TABLE_NOT_EXIST;
-      LOG_WARN("index table schema is null", K(ret), K(schema_table_id_for_estimate));
-    } else if (OB_FAIL(ObVectorIndexUtil::estimate_vector_memory_used(
-                   schema_guard, *index_schema, tenant_id, row_count, estimate_mem))) {
-      LOG_WARN("fail to estimate vector memory used", K(ret), K(row_count));
+    if (OB_SUCC(ret)) {
+      ret = estimate_task_memory_by_row_count_(task_ctx, row_count, estimate_mem, adapter);
     }
     // Note: for an aggregated mem sync task this estimates only the representative tablet
     // unless the caller passes a per-tablet adapter. The real per-tablet estimates (and their
@@ -8081,6 +8062,62 @@ int ObVecIndexAsyncTaskUtil::estimate_task_memory(
     // multiply) and mem sync's estimate is statistics only (mem sync is not memory-limited;
     // see need_mem_limit()).
   }
+  return ret;
+}
+
+int ObVecIndexAsyncTaskUtil::estimate_task_memory_by_row_count_(
+    ObVecIndexAsyncTaskCtx *task_ctx, int64_t row_count, int64_t &estimate_mem,
+    ObPluginVectorIndexAdaptor *adapter)
+{
+  int ret = OB_SUCCESS;
+  estimate_mem = 0;
+  const uint64_t tenant_id = task_ctx->task_status_.tenant_id_;
+  const uint64_t index_table_id = task_ctx->task_status_.table_id_;
+  ObSchemaGetterGuard schema_guard;
+  const ObTableSchema *index_schema = nullptr;
+  uint64_t schema_table_id_for_estimate = index_table_id;
+  if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(
+                 tenant_id, schema_guard))) {
+    LOG_WARN("fail to get schema guard", K(ret), K(tenant_id));
+  } else if (OB_NOT_NULL(adapter)) {
+    schema_table_id_for_estimate = adapter->get_snapshot_table_id();
+  } else if (OB_FAIL(get_snapshot_table_id(
+                 schema_guard, tenant_id, index_table_id, schema_table_id_for_estimate))) {
+    LOG_WARN("fail to resolve snapshot table id for memory estimate", K(ret), K(index_table_id));
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id, schema_table_id_for_estimate, index_schema))) {
+    LOG_WARN("fail to get index table schema", K(ret), K(tenant_id), K(schema_table_id_for_estimate));
+  } else if (OB_ISNULL(index_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+    LOG_WARN("index table schema is null", K(ret), K(schema_table_id_for_estimate));
+  } else if (OB_FAIL(ObVectorIndexUtil::estimate_vector_memory_used(
+                 schema_guard, *index_schema, tenant_id, row_count, estimate_mem))) {
+    LOG_WARN("fail to estimate vector memory used", K(ret), K(row_count));
+  }
+  return ret;
+}
+
+int ObVecIndexAsyncTaskUtil::estimate_merge_memory(
+    ObVecIndexAsyncTaskCtx *task_ctx, const ObVecMergePolicyInput &input,
+    const ObVecMergePlan &plan, int64_t &estimate_mem,
+    ObPluginVectorIndexAdaptor *adapter)
+{
+  int ret = OB_SUCCESS;
+  estimate_mem = 0;
+  int64_t row_count = 0;
+  if (OB_ISNULL(task_ctx)
+      || task_ctx->task_status_.task_type_ != OB_VECTOR_ASYNC_INDEX_MERGE
+      || task_ctx->task_status_.tenant_id_ == OB_INVALID_ID
+      || task_ctx->task_status_.table_id_ == OB_INVALID_ID
+      || !task_ctx->task_status_.tablet_id_.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(plan.get_vector_count(input, row_count))) {
+    LOG_WARN("get merge plan vector count failed", K(ret), K(plan));
+  } else if (row_count > 0) {
+    ret = estimate_task_memory_by_row_count_(task_ctx, row_count, estimate_mem, adapter);
+  }
+  if (OB_FAIL(ret)) { estimate_mem = 0; }
   return ret;
 }
 

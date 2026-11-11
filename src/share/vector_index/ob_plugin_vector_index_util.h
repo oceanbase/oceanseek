@@ -214,12 +214,14 @@ class ObPluginVectorIndexHelper final
 {
 public:
   static int driect_merge_delta_and_snap_vids(
+                                              const uint64_t tenant_id,
                                               const ObVsagQueryResultArray &results,
                                               int64_t &actual_cnt,
                                               int64_t *&vids_result,
                                               float *&float_result,
                                               ObVecExtraInfoPtr &extra_info_result);
   static int sort_merge_delta_and_snap_vids(
+                                            const uint64_t tenant_id,
                                             ObVsagQueryResultArray &results,
                                             const int64_t total, 
                                             int64_t &actual_cnt,

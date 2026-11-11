@@ -69,19 +69,19 @@ static int push_chunk_(VecMigSerializeCbParam &p,
 
 // Serialize segment meta and push it as chunks through the source sliding window.
 static int push_meta_chunks_(VecMigSerializeCbParam &p,
-                             share::ObVectorIndexSegmentHandle &seg_handle,
+                             const share::ObVectorIndexSegmentMeta &seg_meta,
                              common::ObIAllocator &alloc)
 {
   int ret = OB_SUCCESS;
   int64_t meta_size = 0;
-  share::ObVectorIndexSegment *seg = nullptr;
-  if (!seg_handle.is_valid()) {
+  const share::ObVectorIndexSegment *seg = nullptr;
+  if (!seg_meta.segment_handle_.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[VEC MIG] invalid segment handle in push_meta_chunks_", K(ret));
-  } else if (OB_ISNULL(seg = seg_handle.get())) {
+  } else if (OB_ISNULL(seg = seg_meta.segment_handle_.get())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[VEC MIG] null segment in push_meta_chunks_", K(ret), KP(seg));
-  } else if (OB_FALSE_IT(meta_size = seg->get_serialize_meta_size())) {
+  } else if (OB_FALSE_IT(meta_size = seg->get_serialize_meta_size(seg_meta.vbitmap_))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[VEC MIG] non-positive meta size", K(ret), K(meta_size));
   } else if (OB_UNLIKELY(meta_size <= 0)) {
@@ -94,7 +94,7 @@ static int push_meta_chunks_(VecMigSerializeCbParam &p,
       LOG_WARN("[VEC MIG] failed to alloc meta buf", K(ret), K(meta_size));
     } else {
       int64_t pos = 0;
-      if (OB_FAIL(seg->serialize_meta(meta_buf, meta_size, pos))) {
+      if (OB_FAIL(seg->serialize_meta(meta_buf, meta_size, pos, seg_meta.vbitmap_))) {
         LOG_WARN("[VEC MIG] segment serialize_meta fail", K(ret), K(meta_size));
       } else {
         ObVecIdxMigMetaChunkHeader header;
@@ -525,7 +525,7 @@ int ObMigrationVectorIndexProcessor::set_adaptor_from_guard(
 int ObVectorIndexMigrationUtil::resolve_vec_idx_segment_for_migration(
     share::ObPluginVectorIndexAdaptor *adaptor,
     const int64_t segment_idx,
-    share::ObVectorIndexSegmentHandle &out_handle)
+    share::ObVectorIndexSegmentMeta &out_meta)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(adaptor)) {
@@ -555,14 +555,14 @@ int ObVectorIndexMigrationUtil::resolve_vec_idx_segment_for_migration(
           if (!meta->segment_handle_.is_valid()) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("[VEC MIG] snap segment handle is invalid", K(ret), K(segment_idx));
-          } else {
-            out_handle = meta->segment_handle_;
+          } else if (OB_FAIL(out_meta.assign(*meta))) {
+            LOG_WARN("[VEC MIG] copy segment meta failed", K(ret), K(segment_idx));
           }
         }
       }
     }
   }
-  if (OB_SUCC(ret) && !out_handle.is_valid()) {
+  if (OB_SUCC(ret) && !out_meta.segment_handle_.is_valid()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("[VEC MIG] segment handle is invalid", K(ret), K(segment_idx));
   }
@@ -640,20 +640,20 @@ int ObMigrationVectorIndexProcessor::do_serialize()
               KP(cb_param.slot_chunk_), K(cb_param.processor_id_),
               K(cb_param.header_tenant_id_), K(cb_param.ls_id_));
         } else {
-          share::ObVectorIndexSegmentHandle segment_handle;
+          share::ObVectorIndexSegmentMeta segment_meta;
           if (OB_FAIL(ObVectorIndexMigrationUtil::resolve_vec_idx_segment_for_migration(
-                  adaptor, segment_idx_, segment_handle))) {
+                  adaptor, segment_idx_, segment_meta))) {
             LOG_WARN("[VEC MIG] failed to resolve segment for migration", K(ret), K(processor_id_),
                 K(segment_idx_));
-          } else if (!segment_handle.is_valid()) {
+          } else if (!segment_meta.segment_handle_.is_valid()) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("[VEC MIG] segment handle is invalid", K(ret), K(processor_id_), K(segment_idx_));
-          } else if (OB_FAIL(push_meta_chunks_(cb_param, segment_handle, alloc))) {
+          } else if (OB_FAIL(push_meta_chunks_(cb_param, segment_meta, alloc))) {
             LOG_WARN("[VEC MIG] failed to emit meta chunks", K(ret), K(processor_id_),
                 K(segment_idx_));
           } else {
             LOG_INFO("[VEC MIG] begin segment serialization", K(processor_id_), K(segment_idx_), K(data_tablet_id_));
-            if (OB_FAIL(serializer.serialize(segment_handle.get(), cb_param, serialize_cb,
+            if (OB_FAIL(serializer.serialize(segment_meta.segment_handle_.get(), cb_param, serialize_cb,
                     adaptor->get_tenant_id(), vsag_cap))) {
               LOG_WARN("[VEC MIG] failed to serialize segment", K(ret), K(processor_id_), K(segment_idx_));
             }

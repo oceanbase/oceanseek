@@ -183,7 +183,7 @@ int ObVectorIndexSerializer::serialize_meta(ObVectorIndexSegment *segment, ObOSt
   if (OB_ISNULL(segment)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("segment is null", K(ret));
-  } else if (OB_UNLIKELY((serde_size = segment->get_serialize_meta_size()) < 0)) {
+  } else if (OB_UNLIKELY((serde_size = segment->get_serialize_meta_size(static_cast<ObHNSWSerializeCallback::CbParam &>(cb_param).vbitmap_)) < 0)) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to get segment meta serialize size", K(ret), K(serde_size), KPC(segment));
   } else if (OB_UNLIKELY(serde_size == 0)) {
@@ -192,7 +192,8 @@ int ObVectorIndexSerializer::serialize_meta(ObVectorIndexSegment *segment, ObOSt
   } else if (OB_ISNULL(serde_buf = reinterpret_cast<char*>(allocator_.alloc(serde_size)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("alloc memory fail", K(ret), K(serde_size));
-  } else if (OB_FAIL(segment->serialize_meta(serde_buf, serde_size, pos))) {
+  } else if (OB_FAIL(segment->serialize_meta(serde_buf, serde_size, pos,
+      static_cast<ObHNSWSerializeCallback::CbParam &>(cb_param).vbitmap_))) {
     LOG_WARN("serialize meta fail", K(ret), K(serde_size), KP(serde_buf), KPC(segment));
   } else if (OB_FAIL(cb(serde_buf, pos, cb_param))) {
     LOG_WARN("failed to do callback", K(ret), K(serde_size), K(pos));
@@ -492,7 +493,7 @@ int ObHNSWDeserializeCallback::operator()(char*& data, const int64_t data_size, 
               } else if (! seg_meta->has_segment_meta_row_) { // skip if no segment meta row
               } else if (OB_FAIL(str_iter->get_full_data(real_data))) {
                 LOG_WARN("get full data fail", K(ret));
-              } else if (OB_FAIL(seg_meta->segment_handle_->deserialize_meta(real_data.ptr(), real_data.length(), pos))) {
+              } else if (OB_FAIL(seg_meta->segment_handle_->deserialize_meta(real_data.ptr(), real_data.length(), pos, seg_meta->vbitmap_))) {
                 LOG_WARN("deserialize meta fail", K(ret), K(real_data.length()), K(pos));
               } else {
                 str_iter->~ObTextStringIter();
@@ -564,6 +565,7 @@ int ObHNSWDeserializeCallback::operator()(char*& data, const int64_t data_size, 
 int ObHNSWSerializeCallback::operator()(const char *data, const int64_t data_size, share::ObOStreamBuf::CbParam &cb_param)
 {
   int ret = OB_SUCCESS;
+  ObArenaAllocator lob_src_allocator("VISerdeLob", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
   ObString src_data(data_size, data);
   ObString src_lob_str;
   ObHNSWSerializeCallback::CbParam &param = static_cast<ObHNSWSerializeCallback::CbParam&>(cb_param);
@@ -571,7 +573,7 @@ int ObHNSWSerializeCallback::operator()(const char *data, const int64_t data_siz
   if (OB_ISNULL(data)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid data", KR(ret), KP(data));
-  } else if (OB_FAIL(ObLobManager::fill_lob_header(*param.allocator_, src_data, src_lob_str))) {
+  } else if (OB_FAIL(ObLobManager::fill_lob_header(lob_src_allocator, src_data, src_lob_str))) {
     LOG_WARN("failed to fill lob header", KR(ret), K(src_data));
   } else {
     ObLobLocatorV2 src_lob(src_lob_str.ptr(), src_lob_str.length());
@@ -606,7 +608,13 @@ int ObHNSWSerializeCallback::operator()(const char *data, const int64_t data_siz
     } else if (OB_FAIL(lob_mngr->insert_before(insert_ctx, outrow))) {
       LOG_WARN("prepare lob insert failed", KR(ret), K(insert_ctx));
     } else if (!outrow) {
-      insert_ctx.dest_loc_ = src_lob;
+      // The inrow result must outlive the callback's source buffer.
+      ObString inrow_lob_str;
+      if (OB_FAIL(ob_write_string(*param.allocator_, src_lob_str, inrow_lob_str))) {
+        LOG_WARN("failed to copy inrow lob", KR(ret));
+      } else {
+        insert_ctx.dest_loc_ = ObLobLocatorV2(inrow_lob_str);
+      }
     } else if (OB_FAIL(lob_mngr->insert(insert_ctx))) {
       LOG_WARN("insert outrow lob failed", KR(ret), K(insert_ctx));
     } 

@@ -63,20 +63,21 @@ bool are_same_persisted_segments(
 }
 
 /**
- * Check whether a newly loaded snapshot contains a new Freeze result.
+ * Check whether newly loaded incremental segments introduce a visibility boundary.
  *
  * @param old_segments Segments already known by the previous adaptor.
  * @param new_segments Segments loaded by the new adaptor.
- * @return True when new_segments contains a new FREEZE_PERSIST range.
+ * @return True when new_segments contains a new FREEZE_PERSIST or INCR_BASE range.
  */
-bool has_new_freeze_persist_segment(
+bool has_new_visibility_segment(
     const common::ObIArray<ObVectorIndexSegmentMeta> &old_segments,
     const common::ObIArray<ObVectorIndexSegmentMeta> &new_segments)
 {
   bool has_new_segment = false;
   for (int64_t i = 0; !has_new_segment && i < new_segments.count(); ++i) {
     const ObVectorIndexSegmentMeta &new_segment = new_segments.at(i);
-    if (ObVectorIndexSegmentType::FREEZE_PERSIST == new_segment.seg_type_) {
+    if (ObVectorIndexSegmentType::FREEZE_PERSIST == new_segment.seg_type_
+        || ObVectorIndexSegmentType::INCR_BASE == new_segment.seg_type_) {
       bool found = false;
       for (int64_t j = 0; !found && j < old_segments.count(); ++j) {
         found = is_same_persisted_segment(old_segments.at(j), new_segment);
@@ -1128,9 +1129,6 @@ int ObPluginVectorIndexUtils::refresh_async_query_scn(
   } else if (!adapter->get_snap_data().is_valid()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("snapshot data is invalid", K(ret), KPC(adapter));
-  } else if (adapter->get_snap_data()->meta_.bases_.count() > 1) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected BASE count", K(ret), KPC(adapter));
   } else if (OB_FAIL(ObMultiVersionSchemaService::get_instance()
                          .get_tenant_schema_guard(adapter->get_tenant_id(), schema_guard))) {
     LOG_WARN("failed to get tenant schema guard", K(ret), KPC(adapter));
@@ -1424,7 +1422,7 @@ int ObPluginVectorIndexUtils::try_sync_snapshot_memdata(ObLSID &ls_id,
           ObArenaAllocator tmp_allocator("VectorAdaptor", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
           if (OB_FAIL(new_adapter->deserialize_snap_meta(row_key))) {
             LOG_WARN("deserialize snap meta fail", K(ret));
-          } else if (OB_FAIL(try_reuse_segments_from_old_adapter(new_adapter, old_adapter))) {
+          } else if (OB_FAIL(try_reuse_segments_from_old_adapter(new_adapter, old_adapter, ls_id, target_scn))) {
             LOG_WARN("try reuse segments from old adapter fail", K(ret));
           } else if (OB_FAIL(new_adapter->get_snap_data()->load_persist_segments(new_adapter, tmp_allocator, ls_id, target_scn, ctx))) {
             LOG_WARN("load persist segments fail", K(ret));
@@ -1480,7 +1478,7 @@ int ObPluginVectorIndexUtils::try_sync_snapshot_memdata(ObLSID &ls_id,
           old_snap->meta_.bases_, new_snap->meta_.bases_);
       if (!need_to_refresh) {
         // check if the incr segments are the same
-        need_to_refresh = has_new_freeze_persist_segment(
+        need_to_refresh = has_new_visibility_segment(
           old_snap->meta_.incrs_, new_snap->meta_.incrs_);
       }
     }
@@ -1490,7 +1488,7 @@ int ObPluginVectorIndexUtils::try_sync_snapshot_memdata(ObLSID &ls_id,
     }
   }
   // INCR_MERGE only reorganizes existing visibility and inherits the old barrier.
-  // A new BASE or FREEZE_PERSIST segment introduces a new visibility boundary.
+  // A new BASE, INCR_BASE or FREEZE_PERSIST introduces a new visibility boundary.
   if (OB_SUCC(ret) && OB_NOT_NULL(adapter) && adapter->get_snap_has_complete()
       && need_to_refresh
       && OB_FAIL(refresh_async_query_scn(ls_id, adapter))) {
@@ -1531,6 +1529,7 @@ int ObPluginVectorIndexUtils::find_segment_in_old_meta(
     const ObVectorIndexMeta &old_meta)
 {
   int ret = OB_SUCCESS;
+  const ObVectorIndexSegmentMeta *reused_meta = nullptr;
   bool found = false;
   for (int64_t i = 0; OB_SUCC(ret) && i < old_meta.incrs_.count() && !found; ++i) {
     const ObVectorIndexSegmentMeta &old_seg_meta = old_meta.incrs_.at(i);
@@ -1538,6 +1537,7 @@ int ObPluginVectorIndexUtils::find_segment_in_old_meta(
       new_seg_meta.segment_handle_ = old_seg_meta.segment_handle_;
       new_seg_meta.blocks_cnt_ = old_seg_meta.blocks_cnt_;
       found = true;
+      reused_meta = &old_seg_meta;
       LOG_INFO("find segment in old adapter incrs", K(new_seg_meta), K(old_seg_meta));
     }
   }
@@ -1547,15 +1547,20 @@ int ObPluginVectorIndexUtils::find_segment_in_old_meta(
       new_seg_meta.segment_handle_ = old_seg_meta.segment_handle_;
       new_seg_meta.blocks_cnt_ = old_seg_meta.blocks_cnt_;
       found = true;
+      reused_meta = &old_seg_meta;
       LOG_INFO("find segment in old adapter bases", K(new_seg_meta), K(old_seg_meta));
     }
+  }
+  if (OB_NOT_NULL(reused_meta)) {
+    new_seg_meta.set_vbitmap(reused_meta->vbitmap_);
+    new_seg_meta.bitmap_scn_ = reused_meta->bitmap_scn_;
   }
   return ret;
 }
 
 int ObPluginVectorIndexUtils::try_reuse_segments_from_old_adapter(
     ObPluginVectorIndexAdaptor *new_adapter,
-    ObPluginVectorIndexAdaptor *old_adapter)
+    ObPluginVectorIndexAdaptor *old_adapter, const ObLSID &ls_id, const SCN &read_scn)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(new_adapter) || OB_ISNULL(old_adapter)) {
@@ -1568,22 +1573,39 @@ int ObPluginVectorIndexUtils::try_reuse_segments_from_old_adapter(
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("snap data is invalid", K(ret), K(new_snap), K(old_snap));
     } else {
-      TCRLockGuard snap_mem_lock_guard(old_snap->mem_data_rwlock_);
+      ObVectorIndexMeta old_meta;
+      {
+        TCRLockGuard snap_mem_lock_guard(old_snap->mem_data_rwlock_);
+        if (OB_FAIL(old_meta.assign(old_snap->meta_))) {
+          LOG_WARN("copy old snapshot metadata failed", K(ret));
+        }
+      }
       ObVectorIndexMeta &new_meta = new_snap->meta_;
-      const ObVectorIndexMeta &old_meta = old_snap->meta_;
       for (int64_t i = 0; OB_SUCC(ret) && i < new_meta.incrs_.count(); ++i) {
         ObVectorIndexSegmentMeta &new_seg_meta = new_meta.incrs_.at(i);
         if (!new_seg_meta.segment_handle_.is_valid()) {
+          const int64_t bitmap_scn = new_seg_meta.bitmap_scn_;
           if (OB_FAIL(find_segment_in_old_meta(new_seg_meta, old_meta))) {
             LOG_WARN("find segment in old adapter fail", K(ret), K(i), K(new_seg_meta.start_key_));
+          } else if (new_seg_meta.bitmap_scn_ != bitmap_scn
+              && OB_FAIL(load_segment_bitmap(new_adapter, ls_id, read_scn, new_seg_meta))) {
+            LOG_WARN("reload reused segment bitmap failed", K(ret), K(new_seg_meta));
+          } else {
+            new_seg_meta.bitmap_scn_ = bitmap_scn;
           }
         }
       }
       for (int64_t i = 0; OB_SUCC(ret) && i < new_meta.bases_.count(); ++i) {
         ObVectorIndexSegmentMeta &new_seg_meta = new_meta.bases_.at(i);
         if (!new_seg_meta.segment_handle_.is_valid()) {
+          const int64_t bitmap_scn = new_seg_meta.bitmap_scn_;
           if (OB_FAIL(find_segment_in_old_meta(new_seg_meta, old_meta))) {
             LOG_WARN("find segment in old adapter fail", K(ret), K(i), K(new_seg_meta.start_key_));
+          } else if (new_seg_meta.bitmap_scn_ != bitmap_scn
+              && OB_FAIL(load_segment_bitmap(new_adapter, ls_id, read_scn, new_seg_meta))) {
+            LOG_WARN("reload reused segment bitmap failed", K(ret), K(new_seg_meta));
+          } else {
+            new_seg_meta.bitmap_scn_ = bitmap_scn;
           }
         }
       }
@@ -1864,14 +1886,52 @@ struct BoundedRefreshBuildContext {
 
 static int deserialize_segment_bitmap(const ObString &blob,
                                ObIAllocator &allocator,
-                               ObVectorIndexSegmentHandle &out_segment)
+                               ObVectorIndexSegmentMeta &out_meta)
 {
   int ret = OB_SUCCESS;
   int64_t pos = 0;
-  if (OB_FAIL(ObVectorIndexSegment::create_bitmap_only(out_segment, MTL_ID(), allocator))) {
+  if (OB_FAIL(ObVectorIndexSegment::create_bitmap_only(out_meta.segment_handle_, MTL_ID(), allocator))) {
     LOG_WARN("create bitmap-only segment fail", K(ret));
-  } else if (OB_FAIL(out_segment->deserialize_meta(blob.ptr(), blob.length(), pos))) {
+  } else if (OB_FAIL(out_meta.segment_handle_->deserialize_meta(blob.ptr(), blob.length(), pos, out_meta.vbitmap_))) {
     LOG_WARN("deserialize segment meta fail", K(ret));
+  }
+  return ret;
+}
+
+ERRSIM_POINT_DEF(ERRSIM_VEC_LOAD_SEGMENT_BITMAP, "Fail a reused graph bitmap read before publication");
+
+int ObPluginVectorIndexUtils::load_segment_bitmap(ObPluginVectorIndexAdaptor *adaptor,
+    const ObLSID &ls_id, const SCN &read_scn, ObVectorIndexSegmentMeta &seg_meta)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator("VIBitmapLoad", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+  ObVectorIndexSegmentMeta bitmap;
+  ObString key;
+  ObString blob;
+  bool found = false;
+  if (OB_ISNULL(adaptor) || !seg_meta.segment_handle_.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (!seg_meta.has_segment_meta_row_) {
+    if (OB_NOT_NULL(seg_meta.vbitmap_)) {
+      ret = OB_ERR_UNEXPECTED;
+    }
+  } else if (OB_FAIL(ERRSIM_VEC_LOAD_SEGMENT_BITMAP)) {
+    LOG_WARN("injected segment bitmap load failure", K(ret), K(seg_meta));
+  } else if (OB_FAIL(read_snap_table_blob(adaptor, ls_id, read_scn,
+      seg_meta.start_key_, allocator, found, key, blob))) {
+    LOG_WARN("read segment bitmap failed", K(ret), K(seg_meta));
+  } else if (!found || key != seg_meta.start_key_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("segment bitmap row missing", K(ret), K(seg_meta), K(key));
+  } else if (OB_FAIL(deserialize_segment_bitmap(blob, *adaptor->get_allocator(), bitmap))) {
+    LOG_WARN("deserialize segment bitmap failed", K(ret), K(seg_meta));
+  } else if (OB_ISNULL(bitmap.vbitmap_) || OB_ISNULL(bitmap.vbitmap_->insert_bitmap_)
+      || OB_ISNULL(bitmap.vbitmap_->delete_bitmap_)) {
+    ret = OB_ERR_UNEXPECTED;
+  }
+  if (OB_SUCC(ret)) {
+    seg_meta.set_vbitmap(bitmap.vbitmap_);
+    LOG_INFO("loaded segment bitmap without graph blocks", K(seg_meta), K(read_scn));
   }
   return ret;
 }
@@ -1991,7 +2051,7 @@ static int fold_incr_segment_bitmaps(BoundedRefreshBuildContext &ctx,
         LOG_DEBUG("[VEC_INDEX][BOUNDED_READ] coverage not provable",
             "reason", "unexpected segment meta key", K(seg.start_key_), K(actual_key));
       } else {
-        ObVectorIndexSegmentHandle bitmap_segment;
+        ObVectorIndexSegmentMeta bitmap_segment;
         const int deserialize_ret = deserialize_segment_bitmap(
             seg_blob, ctx.tmp_allocator_, bitmap_segment);
         if (OB_ALLOCATE_MEMORY_FAILED == deserialize_ret) {
@@ -2005,7 +2065,7 @@ static int fold_incr_segment_bitmaps(BoundedRefreshBuildContext &ctx,
           LOG_INFO("[VEC_INDEX][BOUNDED_READ] coverage not provable",
               "reason", "invalid persisted segment bitmap", K(deserialize_ret), K(seg.start_key_));
         } else {
-          const ObVectorIndexRoaringBitMap *seg_bitmap = bitmap_segment->get_vbitmap();
+          const ObVectorIndexRoaringBitMap *seg_bitmap = bitmap_segment.vbitmap_;
           if (OB_ISNULL(seg_bitmap)) {
             // No segment vbitmap: coverage is not provable.
             coverage_ok = false;
@@ -2058,7 +2118,7 @@ static int build_bounded_overlay(BoundedRefreshBuildContext &ctx,
       coverage_ok = false;
     } else {
       const ObVectorIndexRoaringBitMap *bridge_bitmap =
-          bridge_segment.is_valid() ? bridge_segment->get_vbitmap() : nullptr;
+          bridge_meta.vbitmap_;
       ObVecIdxVBitmapDataHandle vbitmap_handle = ctx.adapter_->get_vbitmap_data();
       int64_t vbitmap_scn_val = 0;
       if (vbitmap_handle.is_valid()) {
@@ -2211,7 +2271,15 @@ int ObPluginVectorIndexUtils::try_online_bounded_refresh(
             "reason", "current meta row absent");
       } else {
         const int64_t cur_base_scn = current_meta.max_base_scn();
-        if (existing_active && existing_overlay->matches_identity(meta_scn, entry_generation)) {
+        int64_t loaded_bitmap_update_scn = 0;
+        {
+          const auto &snap_data = adapter->get_snap_data();
+          TCRLockGuard guard(snap_data->mem_data_rwlock_);
+          loaded_bitmap_update_scn = snap_data->meta_.last_bitmap_update_scn_;
+        }
+        if (current_meta.last_bitmap_update_scn_ != loaded_bitmap_update_scn) {
+          result = ObVectorBoundedRefreshResult::NOT_COVERED;
+        } else if (existing_active && existing_overlay->matches_identity(meta_scn, entry_generation)) {
           result = ObVectorBoundedRefreshResult::ALREADY_COVERED;
           LOG_DEBUG("[VEC_INDEX][BOUNDED_READ] overlay already covered",
               K(meta_scn), K(loaded_base), K(cur_base_scn), K(query_target_scn_val));
@@ -2318,6 +2386,13 @@ int ObPluginVectorIndexUtils::refresh_memdata(ObLSID &ls_id,
       } else if (OB_FAIL(refresh_adp_from_table(
                      ls_id, new_adapter, true, target_scn, allocator, ctx, mem_sync_tablet_id))) {
         LOG_WARN("failed to refresh adapter from table", K(ret), KPC(adapter));
+      } else if (new_adapter->is_ready_complete()) {
+        int tmp_ret = OB_SUCCESS;
+        if (OB_TMP_FAIL(new_adapter->refresh_segment_delete_counts(ctx, mem_sync_tablet_id))) {
+          LOG_WARN("refresh segment delete counts failed", K(tmp_ret), KPC(new_adapter));
+        }
+        CHECK_TASK_CANCELLED(ret, ctx);
+        CHECK_MEM_SYNC_TABLET_CANCELLED(ret, ctx, mem_sync_tablet_id);
       }
       if (adapter != new_adapter && OB_NOT_NULL(new_adapter)) {
         bool has_replace = false;
@@ -2542,7 +2617,8 @@ int ObPluginVectorIndexUtils::open_segment_data_iter(
     const share::SCN &target_scn,
     ObTableScanParam &scan_param,
     ObTableParam &table_param,
-    common::ObNewRowIterator *&iter)
+    common::ObNewRowIterator *&iter,
+    transaction::ObTxDesc *tx_desc, const transaction::ObTxReadSnapshot *tx_snapshot)
 {
   int ret = OB_SUCCESS;
   ObAccessService *oas = MTL(ObAccessService*);
@@ -2616,8 +2692,18 @@ int ObPluginVectorIndexUtils::open_segment_data_iter(
       if (OB_FAIL(ret)) {
       } else if (OB_FAIL(scan_param.key_ranges_.push_back(range))) {
         LOG_WARN("failed to push key range.", K(ret), K(scan_param), K(range));
-      } else if (OB_FAIL(oas->table_scan(scan_param, iter))) {
-        LOG_WARN("do table scan falied.", K(ret), K(scan_param));
+      } else if (OB_NOT_NULL(tx_snapshot) && OB_FAIL(scan_param.snapshot_.assign(*tx_snapshot))) {
+        LOG_WARN("assign transactional segment read snapshot failed", K(ret));
+      } else {
+        if (OB_NOT_NULL(tx_desc)) {
+          scan_param.trans_desc_ = tx_desc;
+          scan_param.tx_id_ = tx_desc->get_tx_id();
+          scan_param.tx_seq_base_ = tx_desc->get_seq_base();
+          scan_param.scan_flag_.read_latest_ = true;
+        }
+        if (OB_FAIL(oas->table_scan(scan_param, iter))) {
+          LOG_WARN("do table scan falied.", K(ret), K(scan_param));
+        }
       }
       if (OB_NOT_NULL(buf)) {
         allocator.free(buf);

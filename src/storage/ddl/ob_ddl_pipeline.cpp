@@ -1159,7 +1159,7 @@ int ObHNSWIndexAppendBufferOperator::append_row(
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected nullptr", K(ret), KP(adapter), K(tablet_context->vector_index_ctx_));
     } else if (OB_FAIL(adapter->add_snap_index(reinterpret_cast<float *>(vec_str.ptr()),
-                                                      &vec_vid, extra_obj, extra_column_count, 1, &vec_length))) {
+        &vec_vid, extra_obj, extra_column_count, 1, &vec_length, !is_vec_tablet_rebuild))) {
       LOG_WARN("fail to build index to adaptor", K(ret), KPC(this));
     } else {
       LOG_DEBUG("[vec index debug] add into snap index success", K(tablet_id_), K(vec_vid), K(vec_str));

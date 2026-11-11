@@ -79,7 +79,6 @@ public:
       transaction::ObTxDesc *tx_desc, const int64_t timeout,
       const share::SCN& frozen_scn, const ObVectorIndexRoaringBitMap *bitmap,
       ObVecIndexAsyncTaskCtx *task_ctx = nullptr);
-  int check_delta_table_empty(bool &is_empty);
 
 private:
   int prepare_dml_param(
@@ -270,7 +269,8 @@ private:
       const ObString &meta_key,
       const int64_t timeout_ts,
       blocksstable::ObDatumRow &old_row,
-      bool &row_exist);
+      bool &row_exist,
+      const bool read_own_writes = false);
   int lock_row(
       transaction::ObTxDesc *tx_desc,
       transaction::ObTxReadSnapshot &snapshot,
@@ -285,6 +285,13 @@ private:
       const uint64_t timeout);
 
 protected:
+  virtual int before_write_meta(ObPluginVectorIndexAdaptor *adaptor,
+      transaction::ObTxDesc *tx_desc, transaction::ObTxReadSnapshot &snapshot,
+      const ObVectorIndexMeta &old_meta, ObVectorIndexMeta &new_meta, int64_t timeout_ts) { return OB_SUCCESS; }
+  int update_segment_bitmap_row(ObPluginVectorIndexAdaptor *adaptor,
+      transaction::ObTxDesc *tx_desc, transaction::ObTxReadSnapshot &snapshot,
+      const ObVectorIndexSegmentMeta &segment_meta, const ObVectorIndexRoaringBitMap &removable_vids,
+      int64_t timeout_ts, bool &changed);
   virtual int prepare_meta_for_insert(ObVectorIndexMeta &new_meta, const int64_t snapshot_version) { return OB_NOT_SUPPORTED; }
   virtual int prepare_meta_for_update(ObVectorIndexMeta &new_meta, const ObVectorIndexMeta &old_meta, const int64_t snapshot_version) { return OB_NOT_SUPPORTED; }
   virtual const ObVectorIndexSegmentMeta *get_meta_bridge_meta() const { return nullptr; }
@@ -349,13 +356,17 @@ class ObVecIdxSnapTableSegMergeOp : public ObVectorIndexSnapTableHandler
 public:
   ObVecIdxSnapTableSegMergeOp(const uint64_t tenant_id):
     ObVectorIndexSnapTableHandler(tenant_id),
-    new_seg_meta_(nullptr),
+    new_seg_metas_(nullptr),
     merge_segments_(nullptr),
     bridge_meta_(nullptr),
-    bridge_segment_(nullptr)
+    bridge_segment_(nullptr), expected_meta_(nullptr), removable_vids_(nullptr)
   {}
   virtual ~ObVecIdxSnapTableSegMergeOp() = default;
-  int preprea_meta(ObVectorIndexSegmentMeta *seg_meta, ObIArray<const ObVectorIndexSegmentMeta *> &merge_segments);
+  int preprea_meta(const ObIArray<ObVectorIndexSegmentMeta> &seg_metas, ObIArray<const ObVectorIndexSegmentMeta *> &merge_segments);
+  void set_bitmap_prune_plan(const ObVectorIndexMeta *expected_meta,
+      const ObVectorIndexRoaringBitMap *removable_vids)
+  { expected_meta_ = expected_meta; removable_vids_ = removable_vids; }
+  void set_insert_bitmap_pruned(const bool pruned) { insert_bitmap_pruned_ = pruned; }
   // Bridge is owned by the caller and must outlive insertup_meta_row.
   void set_meta_bridge(const ObVectorIndexSegmentMeta *bridge_meta,
                        const ObVectorIndexSegmentHandle *bridge_segment)
@@ -366,14 +377,20 @@ public:
 protected:
   int prepare_meta_for_insert(ObVectorIndexMeta &new_meta, const int64_t snapshot_version);
   int prepare_meta_for_update(ObVectorIndexMeta &new_meta, const ObVectorIndexMeta &old_meta, const int64_t snapshot_version); 
+  int before_write_meta(ObPluginVectorIndexAdaptor *adaptor,
+      transaction::ObTxDesc *tx_desc, transaction::ObTxReadSnapshot &snapshot,
+      const ObVectorIndexMeta &old_meta, ObVectorIndexMeta &new_meta, int64_t timeout_ts) override;
   const ObVectorIndexSegmentMeta *get_meta_bridge_meta() const override { return bridge_meta_; }
   const ObVectorIndexSegmentHandle *get_meta_bridge_segment() const override { return bridge_segment_; }
 
 public:
-  ObVectorIndexSegmentMeta *new_seg_meta_;
+  const ObIArray<ObVectorIndexSegmentMeta> *new_seg_metas_;
   ObIArray<const ObVectorIndexSegmentMeta *> *merge_segments_;
   const ObVectorIndexSegmentMeta *bridge_meta_;
   const ObVectorIndexSegmentHandle *bridge_segment_;
+  const ObVectorIndexMeta *expected_meta_;
+  const ObVectorIndexRoaringBitMap *removable_vids_;
+  bool insert_bitmap_pruned_ = false;
 };
 
 class ObVecIdxSnapTableSegReplaceOp : public ObVectorIndexSnapTableHandler

@@ -197,9 +197,14 @@ public:
                                   const share::SCN &target_scn,
                                   ObTableScanParam &scan_param,
                                   ObTableParam &table_param,
-                                  common::ObNewRowIterator *&iter);
+                                  common::ObNewRowIterator *&iter,
+                                  transaction::ObTxDesc *tx_desc = nullptr,
+                                  const transaction::ObTxReadSnapshot *tx_snapshot = nullptr);
   static int try_reuse_segments_from_old_adapter(ObPluginVectorIndexAdaptor *new_adapter,
-                                                 ObPluginVectorIndexAdaptor *old_adapter);
+                                                 ObPluginVectorIndexAdaptor *old_adapter,
+                                                 const ObLSID &ls_id, const SCN &read_scn);
+  static int load_segment_bitmap(ObPluginVectorIndexAdaptor *adaptor,
+      const ObLSID &ls_id, const SCN &read_scn, ObVectorIndexSegmentMeta &seg_meta);
   static int get_snap_index_visible_row_iter(ObAccessService *tsc_service,
                                             ObLSID &ls_id,
                                             ObPluginVectorIndexAdaptor *adapter,

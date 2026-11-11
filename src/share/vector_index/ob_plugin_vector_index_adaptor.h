@@ -883,7 +883,9 @@ public:
                                         int64_t row_count);
   int add_extra_valid_vid(ObVectorQueryAdaptorResultContext *ctx, int64_t vid);
   int add_extra_valid_vid_without_malloc_guard(ObVectorQueryAdaptorResultContext *ctx, int64_t vid);
-  int add_snap_index(float *vectors, int64_t *vids, ObVecExtraInfoObj *extra_objs, int64_t extra_column_count, int num, uint32_t *lens = nullptr);
+  int add_snap_index(float *vectors, int64_t *vids, ObVecExtraInfoObj *extra_objs,
+      int64_t extra_column_count, int num, uint32_t *lens = nullptr,
+      bool enable_multi_segment = false);
   // Query Processor first
   int check_delta_buffer_table_readnext_status(ObVectorQueryAdaptorResultContext *ctx,
                                                common::ObNewRowIterator *row_iter,
@@ -955,7 +957,17 @@ public:
   int check_need_freeze(const int64_t freeze_threshold, bool &need_freeze);
   int check_can_freeze(ObLSID ls_id, const int64_t freeze_threshold, bool &can_freeze,
                        const bool force_rotate_active = false);
-  int check_need_merge(const int64_t merge_base_percentage, bool &need_merge);
+  int check_need_merge(const int64_t merge_base_percentage, bool &need_merge,
+      struct ObVecMergePolicyInput &input, struct ObVecMergePlan &plan);
+  // Union persisted, active and frozen deletes to refresh the shared graph caches.
+  // Return OB_EAGAIN if the snapshot or segment handles are not ready.
+  // Preserve existing counts if collection fails or the task is cancelled.
+  int refresh_segment_delete_counts(ObVecIndexAsyncTaskCtx *task_ctx = nullptr,
+      const common::ObTabletID &mem_sync_tablet_id = common::ObTabletID());
+  // Read cached statistics only; full merge needs source metadata/readiness only.
+  int prepare_merge_policy_input(ObVectorIndexMeta &source_meta,
+      struct ObVecMergePolicyInput &input, struct ObVecMergeConfig &config,
+      const bool is_full_merge = false);
   int check_need_alter_param_merge(const ObVectorIndexParam &target, bool &need_merge);
   int freeze_active_segment(
       const ObLSID &ls_id,
@@ -989,6 +1001,7 @@ public:
   int init_mem_data(ObVectorIndexRecordType type, ObVectorIndexAlgorithmType enforce_type = VIAT_MAX);
   int init_snap_data_without_lock(ObVectorIndexAlgorithmType enforce_type = VIAT_MAX);
   int check_snap_index();
+  int enable_merge_multi_segment(const int64_t max_vectors);
   bool is_mem_data_init_atomic(ObVectorIndexRecordType type);
   int try_init_mem_data(ObVectorIndexRecordType type, ObVectorIndexAlgorithmType enforce_type = VIAT_MAX) {
     int ret = OB_SUCCESS;
@@ -1175,7 +1188,8 @@ public:
   // snap init
   bool is_snap_inited() const { return snap_data_.is_valid() && snap_data_->is_inited(); }
   int init_snap_data_for_build(const bool is_init_bitmap);
-  int init_snap_data_for_build(ObVectorIndexParam *param, const bool is_buffer_mode);
+  int init_snap_data_for_build(ObVectorIndexParam *param, const bool is_buffer_mode,
+      const bool enable_multi_segment = false);
   bool is_sanp_builder_inited() const
   {
     return is_snap_inited() && OB_NOT_NULL(snap_data_->builder_) && snap_data_->builder_->is_inited();
@@ -1222,7 +1236,7 @@ public:
       const int64_t segment_idx,
       const ObVectorIndexSegmentMeta &src_seg_meta,
       ObVectorIndexSegmentHandle &segment_handle,
-      const ObVectorIndexMetaHeader &meta_header,
+      const ObVectorIndexMeta &source_meta,
       bool has_complete,
       bool is_last_segment);
   // Migration dest: on DAG retry, wipe whatever segments were installed by a
@@ -1258,6 +1272,16 @@ public:
               K_(identity_ts), K_(mig_state), K_(skip_merge_sched));
 
 private:
+  int inner_add_snap_index(float *vectors, int64_t *vids, char *extra_info_buf,
+      int num, uint32_t *lens, uint32_t *dims, float *vals);
+  int create_snap_builder(ObVectorIndexParam &param, const bool is_buffer_mode,
+      ObVectorIndexSegmentBuilder *&builder);
+  int finish_snap_builder(ObVectorIndexSegmentBuilder &builder);
+  int get_builder_vector_count(ObVectorIndexSegmentBuilder &builder, int64_t &count);
+  int switch_snap_builder();
+  int seal_snap_builder();
+  int inner_serialize_snapshot(ObHNSWSerializeCallback::CbParam &param);
+  int serialize_multi_snapshot(ObHNSWSerializeCallback::CbParam &param);
   bool has_bounded_read_base() const
   {
     return is_snap_inited() && get_bounded_read_base_scn() > 0;

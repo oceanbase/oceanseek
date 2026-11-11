@@ -6,8 +6,10 @@
 #define USING_LOG_PREFIX SHARE
 
 #include "ob_plugin_vector_index_adaptor.h"
+#include "ob_vector_index_merge_policy.h"
 #include "common/ob_timeout_ctx.h"
 #include "lib/worker.h"
+#include "lib/utility/ob_sort.h"
 #include "storage/ob_storage_rpc.h"
 #include "storage/access/ob_table_scan_iterator.h"
 #include "share/ob_debug_sync.h"
@@ -1294,10 +1296,10 @@ int ObPluginVectorIndexAdaptor::fill_mem_context_detail_info(char *buf, int64_t 
 int ObPluginVectorIndexAdaptor::fill_vector_index_all_segments(common::ObIArray<ObVectorSegmentInfo> &segment_infos)
 {
   int ret = OB_SUCCESS;
-  // Make sure this function only fills HNSW segment info; non-HNSW types do not maintain
-  // segment metadata in the same way, so return directly.
-  if (!ObVectorIndexUtil::is_hnsw_index_type(type_)) {
-    LOG_INFO("not hnsw index type", K(type_));
+  // HNSW and SINDI use the same segment metadata and handles.
+  if (!ObVectorIndexUtil::is_hnsw_index_type(type_)
+      && !ObVectorIndexUtil::is_ipivf_index_type(type_)) {
+    LOG_INFO("index type does not expose segment info", K(type_));
   } else if (OB_FAIL(do_fill_vector_index_all_segments(segment_infos))) {
     LOG_WARN("failed to fill vector index all segments", K(ret));
   }
@@ -1365,16 +1367,118 @@ int ObPluginVectorIndexAdaptor::do_fill_vector_index_all_segments(common::ObIArr
 {
   int ret = OB_SUCCESS;
   segment_infos.reset();
-  
+
   // Fill common fields for all segments
   int64_t data_table_id = data_table_id_;
   int64_t data_tablet_id = data_tablet_id_.id();
   int64_t vbitmap_tablet_id = vbitmap_tablet_id_.id();
   int64_t inc_index_tablet_id = inc_tablet_id_.id();
   int64_t snapshot_index_tablet_id = snapshot_tablet_id_.id();
-  
+
+  // Match merge-policy order: Base segments followed by Incr segments.
+  if (OB_SUCC(ret) && snap_data_.is_valid() && snap_data_->is_inited()) {
+    TCRLockGuard lock_guard(snap_data_->mem_data_rwlock_);
+    for (int64_t i = 0; OB_SUCC(ret) && i < snap_data_->meta_.segment_count(); ++i) {
+      const ObVectorIndexSegmentMeta &seg_meta = snap_data_->meta_.flat_seg_meta_at(i);
+      ObVectorSegmentInfo seg_info;
+      seg_info.reset();
+
+      seg_info.data_table_id_ = data_table_id;
+      seg_info.data_tablet_id_ = data_tablet_id;
+      seg_info.vbitmap_tablet_id_ = vbitmap_tablet_id;
+      seg_info.inc_index_tablet_id_ = inc_index_tablet_id;
+      seg_info.snapshot_index_tablet_id_ = snapshot_index_tablet_id;
+
+      seg_info.segment_type_ = seg_meta.seg_type_;
+      seg_info.index_type_ = seg_meta.index_type_;
+      seg_info.scn_ = seg_meta.scn_;
+      seg_info.block_count_ = seg_meta.blocks_cnt_;
+      seg_info.segment_state_ = ObVectorIndexSegmentState::PERSISTED;
+      if (OB_FAIL(seg_info.set_segment_params(seg_meta.get_index_param()))) {
+        LOG_WARN("failed to set persisted segment params", K(ret), K(i));
+      }
+
+      // Fill segment handle information
+      ObVectorIndexSegmentHandle seg_handle = seg_meta.segment_handle_;
+      if (OB_FAIL(ret)) {
+      } else if (seg_handle.is_valid()) {
+        int64_t vec_cnt = 0;
+        int64_t min_vid = INT64_MAX;
+        int64_t max_vid = 0;
+        if (OB_FAIL(seg_handle->get_index_number(vec_cnt))) {
+          LOG_WARN("failed to get segment index number", K(ret), K(i));
+        } else {
+          seg_handle->get_read_bound_vid(max_vid, min_vid);
+          seg_info.vector_cnt_ = vec_cnt;
+          seg_info.min_vid_ = min_vid;
+          seg_info.max_vid_ = max_vid;
+          seg_info.mem_used_ = seg_handle->get_mem_used();
+          seg_info.ref_cnt_ = seg_handle->get_ref();
+        }
+      } else {
+        seg_info.vector_cnt_ = -1;
+        seg_info.mem_used_ = 0;
+        seg_info.ref_cnt_ = 0;
+        seg_info.min_vid_ = 0;
+        seg_info.max_vid_ = 0;
+      }
+
+      if (OB_SUCC(ret) && OB_FAIL(segment_infos.push_back(seg_info))) {
+        LOG_WARN("failed to push back persisted segment info", K(ret), K(i));
+      }
+    }
+  }
+
+  // Fill frozen segment (frozen_data_)
+  if (OB_SUCC(ret) && has_frozen()) {
+    TCRLockGuard lock_guard(frozen_data_->mem_data_rwlock_);
+    ObVectorSegmentInfo seg_info;
+    seg_info.reset();
+    seg_info.data_table_id_ = data_table_id;
+    seg_info.data_tablet_id_ = data_tablet_id;
+    seg_info.vbitmap_tablet_id_ = vbitmap_tablet_id;
+    seg_info.inc_index_tablet_id_ = inc_index_tablet_id;
+    seg_info.snapshot_index_tablet_id_ = snapshot_index_tablet_id;
+    seg_info.block_count_ = 0; // Frozen segment not persisted yet
+    seg_info.segment_type_ = ObVectorIndexSegmentType::IN_MEMORY;
+    seg_info.segment_state_ = ObVectorIndexSegmentState::FROZEN; // TODO: consider fill info here or set in metadata
+    seg_info.scn_ = frozen_data_->frozen_scn_.get_val_for_inner_table_field();
+
+    ObVectorIndexSegmentHandle frozen_handle = frozen_data_->segment_handle_;
+    if (frozen_handle.is_valid()) {
+      seg_info.index_type_ = frozen_handle->get_index_type();
+
+      int64_t vec_cnt = 0;
+      int64_t min_vid = INT64_MAX;
+      int64_t max_vid = 0;
+      if (OB_FAIL(seg_info.set_segment_params(frozen_handle->get_index_param()))) {
+        LOG_WARN("failed to set frozen segment params", K(ret));
+      } else if (OB_FAIL(frozen_handle->get_index_number(vec_cnt))) {
+        LOG_WARN("failed to get frozen index number", K(ret));
+      } else {
+        frozen_handle->get_read_bound_vid(max_vid, min_vid);
+        seg_info.vector_cnt_ = vec_cnt;
+        seg_info.min_vid_ = min_vid;
+        seg_info.max_vid_ = max_vid;
+        seg_info.mem_used_ = frozen_handle->get_mem_used();
+        seg_info.ref_cnt_ = frozen_handle->get_ref();
+      }
+    } else {
+      seg_info.index_type_ = ObVectorIndexAlgorithmType::VIAT_MAX;
+      seg_info.vector_cnt_ = -1;
+      seg_info.mem_used_ = 0;
+      seg_info.ref_cnt_ = 0;
+      seg_info.min_vid_ = 0;
+      seg_info.max_vid_ = 0;
+    }
+
+    if (OB_SUCC(ret) && OB_FAIL(segment_infos.push_back(seg_info))) {
+      LOG_WARN("failed to push back frozen segment info", K(ret));
+    }
+  }
+
   // Fill active segment (incr_data_)
-  if (incr_data_.is_valid() && incr_data_->is_inited()) {
+  if (OB_SUCC(ret) && incr_data_.is_valid() && incr_data_->is_inited()) {
     TCRLockGuard lock_guard(incr_data_->mem_data_rwlock_);
     ObVectorSegmentInfo seg_info;
     seg_info.reset();
@@ -1388,7 +1492,7 @@ int ObPluginVectorIndexAdaptor::do_fill_vector_index_all_segments(common::ObIArr
     seg_info.index_type_ = get_incr_index_type();
     seg_info.segment_state_ = ObVectorIndexSegmentState::ACTIVE;
     seg_info.scn_ = incr_data_->scn_.get_val_for_inner_table_field(); // TODO: consider either use now or zero
-    
+
     ObVectorIndexSegmentHandle incr_handle = incr_data_->segment_handle_;
     if (incr_handle.is_valid()) {
       int64_t vec_cnt = 0;
@@ -1413,161 +1517,9 @@ int ObPluginVectorIndexAdaptor::do_fill_vector_index_all_segments(common::ObIArr
       seg_info.min_vid_ = 0;
       seg_info.max_vid_ = 0;
     }
-    
+
     if (OB_SUCC(ret) && OB_FAIL(segment_infos.push_back(seg_info))) {
       LOG_WARN("failed to push back active segment info", K(ret));
-    }
-  }
-  
-  // Fill frozen segment (frozen_data_)
-  if (OB_SUCC(ret) && has_frozen()) {
-    TCRLockGuard lock_guard(frozen_data_->mem_data_rwlock_);
-    ObVectorSegmentInfo seg_info;
-    seg_info.reset();
-    seg_info.data_table_id_ = data_table_id;
-    seg_info.data_tablet_id_ = data_tablet_id;
-    seg_info.vbitmap_tablet_id_ = vbitmap_tablet_id;
-    seg_info.inc_index_tablet_id_ = inc_index_tablet_id;
-    seg_info.snapshot_index_tablet_id_ = snapshot_index_tablet_id;
-    seg_info.block_count_ = 0; // Frozen segment not persisted yet
-    seg_info.segment_type_ = ObVectorIndexSegmentType::IN_MEMORY;
-    seg_info.segment_state_ = ObVectorIndexSegmentState::FROZEN; // TODO: consider fill info here or set in metadata
-    seg_info.scn_ = frozen_data_->frozen_scn_.get_val_for_inner_table_field();
-    
-    ObVectorIndexSegmentHandle frozen_handle = frozen_data_->segment_handle_;
-    if (frozen_handle.is_valid()) {
-      seg_info.index_type_ = frozen_handle->get_index_type();
-      
-      int64_t vec_cnt = 0;
-      int64_t min_vid = INT64_MAX;
-      int64_t max_vid = 0;
-      if (OB_FAIL(seg_info.set_segment_params(frozen_handle->get_index_param()))) {
-        LOG_WARN("failed to set frozen segment params", K(ret));
-      } else if (OB_FAIL(frozen_handle->get_index_number(vec_cnt))) {
-        LOG_WARN("failed to get frozen index number", K(ret));
-      } else {
-        frozen_handle->get_read_bound_vid(max_vid, min_vid);
-        seg_info.vector_cnt_ = vec_cnt;
-        seg_info.min_vid_ = min_vid;
-        seg_info.max_vid_ = max_vid;
-        seg_info.mem_used_ = frozen_handle->get_mem_used();
-        seg_info.ref_cnt_ = frozen_handle->get_ref();
-      }
-    } else {
-      seg_info.index_type_ = ObVectorIndexAlgorithmType::VIAT_MAX;
-      seg_info.vector_cnt_ = -1;
-      seg_info.mem_used_ = 0;
-      seg_info.ref_cnt_ = 0;
-      seg_info.min_vid_ = 0;
-      seg_info.max_vid_ = 0;
-    }
-    
-    if (OB_SUCC(ret) && OB_FAIL(segment_infos.push_back(seg_info))) {
-      LOG_WARN("failed to push back frozen segment info", K(ret));
-    }
-  }
-  
-  // Fill snapshot segments (incrs_ and bases_ in snap_data_)
-  if (OB_SUCC(ret) && snap_data_.is_valid() && snap_data_->is_inited()) {
-    TCRLockGuard lock_guard(snap_data_->mem_data_rwlock_);
-    // Fill incrs segments
-    for (int64_t i = 0; OB_SUCC(ret) && i < snap_data_->meta_.incrs_.count(); ++i) {
-      const ObVectorIndexSegmentMeta &seg_meta = snap_data_->meta_.incrs_.at(i);
-      ObVectorSegmentInfo seg_info;
-      seg_info.reset();
-      
-      seg_info.data_table_id_ = data_table_id;
-      seg_info.data_tablet_id_ = data_tablet_id;
-      seg_info.vbitmap_tablet_id_ = vbitmap_tablet_id;
-      seg_info.inc_index_tablet_id_ = inc_index_tablet_id;
-      seg_info.snapshot_index_tablet_id_ = snapshot_index_tablet_id;
-      
-      seg_info.segment_type_ = seg_meta.seg_type_;
-      seg_info.index_type_ = seg_meta.index_type_;
-      seg_info.scn_ = seg_meta.scn_;
-      seg_info.block_count_ = seg_meta.blocks_cnt_;
-      seg_info.segment_state_ = ObVectorIndexSegmentState::PERSISTED;
-      if (OB_FAIL(seg_info.set_segment_params(seg_meta.get_index_param()))) {
-        LOG_WARN("failed to set persisted incr segment params", K(ret), K(i));
-      }
-      
-      // Fill segment handle information
-      ObVectorIndexSegmentHandle seg_handle = seg_meta.segment_handle_;
-      if (seg_handle.is_valid()) {
-        int64_t vec_cnt = 0;
-        int64_t min_vid = INT64_MAX;
-        int64_t max_vid = 0;
-        if (OB_FAIL(seg_handle->get_index_number(vec_cnt))) {
-          LOG_WARN("failed to get segment index number", K(ret), K(i));
-        } else {
-          seg_handle->get_read_bound_vid(max_vid, min_vid);
-          seg_info.vector_cnt_ = vec_cnt;
-          seg_info.min_vid_ = min_vid;
-          seg_info.max_vid_ = max_vid;
-          seg_info.mem_used_ = seg_handle->get_mem_used();
-          seg_info.ref_cnt_ = seg_handle->get_ref();
-        }
-      } else {
-        seg_info.vector_cnt_ = -1;
-        seg_info.mem_used_ = 0;
-        seg_info.ref_cnt_ = 0;
-        seg_info.min_vid_ = 0;
-        seg_info.max_vid_ = 0;
-      }
-      
-      if (OB_SUCC(ret) && OB_FAIL(segment_infos.push_back(seg_info))) {
-        LOG_WARN("failed to push back incr segment info", K(ret), K(i));
-      }
-    }
-    
-    // Fill bases segments
-    for (int64_t i = 0; OB_SUCC(ret) && i < snap_data_->meta_.bases_.count(); ++i) {
-      const ObVectorIndexSegmentMeta &seg_meta = snap_data_->meta_.bases_.at(i);
-      ObVectorSegmentInfo seg_info;
-      seg_info.reset();
-      
-      seg_info.data_table_id_ = data_table_id;
-      seg_info.data_tablet_id_ = data_tablet_id;
-      seg_info.vbitmap_tablet_id_ = vbitmap_tablet_id;
-      seg_info.inc_index_tablet_id_ = inc_index_tablet_id;
-      seg_info.snapshot_index_tablet_id_ = snapshot_index_tablet_id;
-      
-      seg_info.segment_type_ = seg_meta.seg_type_;
-      seg_info.index_type_ = seg_meta.index_type_;
-      seg_info.scn_ = seg_meta.scn_;
-      seg_info.block_count_ = seg_meta.blocks_cnt_;
-      seg_info.segment_state_ = ObVectorIndexSegmentState::PERSISTED;
-      if (OB_FAIL(seg_info.set_segment_params(seg_meta.get_index_param()))) {
-        LOG_WARN("failed to set persisted base segment params", K(ret), K(i));
-      }
-      
-      // Fill segment handle information
-      ObVectorIndexSegmentHandle seg_handle = seg_meta.segment_handle_;
-      if (seg_handle.is_valid()) {
-        int64_t vec_cnt = 0;
-        int64_t min_vid = INT64_MAX;
-        int64_t max_vid = 0;
-        if (OB_FAIL(seg_handle->get_index_number(vec_cnt))) {
-          LOG_WARN("failed to get segment index number", K(ret), K(i));
-        } else {
-          seg_handle->get_read_bound_vid(max_vid, min_vid);
-          seg_info.vector_cnt_ = vec_cnt;
-          seg_info.min_vid_ = min_vid;
-          seg_info.max_vid_ = max_vid;
-          seg_info.mem_used_ = seg_handle->get_mem_used();
-          seg_info.ref_cnt_ = seg_handle->get_ref();
-        }
-      } else {
-        seg_info.vector_cnt_ = -1;
-        seg_info.mem_used_ = 0;
-        seg_info.ref_cnt_ = 0;
-        seg_info.min_vid_ = 0;
-        seg_info.max_vid_ = 0;
-      }
-      
-      if (OB_SUCC(ret) && OB_FAIL(segment_infos.push_back(seg_info))) {
-        LOG_WARN("failed to push back base segment info", K(ret), K(i));
-      }
     }
   }
 
@@ -1589,7 +1541,7 @@ int ObPluginVectorIndexAdaptor::do_fill_vector_index_all_segments(common::ObIArr
       LOG_WARN("failed to push back empty index segment info", K(ret));
     }
   }
-  
+
   return ret;
 }
 
@@ -1666,7 +1618,7 @@ int ObPluginVectorIndexAdaptor::install_migrated_segment_handle(
     const int64_t segment_idx,
     const ObVectorIndexSegmentMeta &src_seg_meta,
     ObVectorIndexSegmentHandle &segment_handle,
-    const ObVectorIndexMetaHeader &meta_header,
+    const ObVectorIndexMeta &source_meta,
     bool has_complete,
     bool is_last_segment)
 {
@@ -1695,7 +1647,8 @@ int ObPluginVectorIndexAdaptor::install_migrated_segment_handle(
       snap_data_->meta_.is_persistent_ = false;
       if (!snap_data_->is_inited()) {
         snap_data_->set_inited();
-        snap_data_->meta_.header_ = meta_header;
+        snap_data_->meta_.header_ = source_meta.header_;
+        snap_data_->meta_.last_bitmap_update_scn_ = source_meta.last_bitmap_update_scn_;
       }
       if (has_complete && is_last_segment) {
         set_snap_data_has_complete();
@@ -1732,6 +1685,7 @@ int ObPluginVectorIndexAdaptor::clear_migrated_segments()
       snap_data_->meta_.incrs_.reset();
       snap_data_->meta_.is_persistent_ = false;
       snap_data_->meta_.header_.reset();
+      snap_data_->meta_.last_bitmap_update_scn_ = 0;
       snap_data_->has_complete_ = false;
       ATOMIC_STORE(&snap_data_->is_init_, false);
       LOG_INFO("cleared migrated segments on retry",
@@ -2553,26 +2507,422 @@ int ObPluginVectorIndexAdaptor::parse_sparse_vector(char *data, int num, uint32_
   return ret;
 }
 
+// Caller supplies num VIDs and num * dim dense floats (or the corresponding sparse byte lengths).
+// complete_lock_ keeps the current builder alive throughout each batch append.
+int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids,
+    ObVecExtraInfoObj *extra_objs, int64_t extra_column_count, int num,
+    uint32_t *sparse_byte_lens, bool enable_multi_segment)
+{
+  int ret = OB_SUCCESS;
+  ObVectorIndexParam *param = nullptr;
+  ObArenaAllocator tmp_allocator("VectorAdaptor", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id_);
+  uint32_t *lens = nullptr;
+  uint32_t *dims = nullptr;
+  float *vals = nullptr;
+  char *extra_info_buf = nullptr;
+  if (! snap_data_.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get null snap data", K(ret), K(snap_data_));
+  } else if (OB_FAIL(check_tablet_valid(VIRT_SNAP))) {
+    LOG_WARN("check tablet id invalid.", K(ret));
+  } else if (OB_ISNULL(param = static_cast<ObVectorIndexParam*>(algo_data_))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("failed to get param.", K(ret));
+  } else if (param->type_ != VIAT_HNSW && param->type_ != VIAT_HGRAPH
+      && param->type_ != VIAT_IPIVF && param->type_ != VIAT_HNSW_SQ
+      && param->type_ != VIAT_HNSW_BQ && param->type_ != VIAT_IPIVF_SQ) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("not support index type", K(ret), K(param->type_), KP(param));
+  } else if (OB_FAIL(init_snap_data_for_build(param,
+      param->type_ == VIAT_HNSW_SQ || param->type_ == VIAT_HNSW_BQ
+          || param->type_ == VIAT_IPIVF_SQ, enable_multi_segment))) {
+    LOG_WARN("initialize snapshot builder failed", K(ret));
+  }
+  if (OB_SUCC(ret) && ATOMIC_LOAD(&snap_data_->enable_multi_segment_)
+      && (num < 0 || (num > 0 && (OB_ISNULL(vectors) || OB_ISNULL(vids))))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid snapshot input", K(ret), K(num), KP(vectors), KP(vids));
+  }
+  // Prepare batch-local data once, before taking complete_lock_.
+  if (OB_SUCC(ret) && num != 0 && OB_NOT_NULL(vectors) && OB_NOT_NULL(vids)) {
+    if (is_sparse_vector_index_type()
+        && OB_FAIL(parse_sparse_vector(reinterpret_cast<char *>(vectors), num,
+            sparse_byte_lens, &tmp_allocator, &lens, &dims, &vals))) {
+      LOG_WARN("failed to parse sparse vector", K(ret));
+    } else if (OB_NOT_NULL(extra_objs) && extra_column_count > 0
+        && param->extra_info_actual_size_ > 0
+        && OB_FAIL(ObVecExtraInfo::extra_infos_to_buf(tmp_allocator, extra_objs,
+            extra_column_count, param->extra_info_actual_size_, num, extra_info_buf))) {
+      LOG_WARN("failed to encode extra info", K(ret), K(param->extra_info_actual_size_));
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (!ATOMIC_LOAD(&snap_data_->enable_multi_segment_)) {
+    TCRLockGuard guard(snap_data_->complete_lock_);
+    if (OB_FAIL(inner_add_snap_index(vectors, vids, extra_info_buf, num, lens, dims, vals))) {
+      LOG_WARN("append snapshot index failed", K(ret));
+    }
+  } else if (num > 0) {
+    bool appended = false;
+    while (OB_SUCC(ret) && !appended) {
+      bool need_switch = false;
+      {
+        TCRLockGuard guard(snap_data_->complete_lock_);
+        if (OB_ISNULL(snap_data_->builder_) || ATOMIC_LOAD(&snap_data_->need_switch_segment_)) {
+          need_switch = true;
+        } else if (OB_FAIL(inner_add_snap_index(vectors, vids, extra_info_buf, num, lens, dims, vals))) {
+          LOG_WARN("append snapshot segment failed", K(ret));
+        } else {
+          appended = true;
+          int64_t count = 0;
+          if (OB_FAIL(get_builder_vector_count(*snap_data_->builder_, count))) {
+            LOG_WARN("count snapshot segment failed", K(ret));
+          } else if (count >= snap_data_->segment_max_vectors_) {
+            ATOMIC_STORE(&snap_data_->need_switch_segment_, true);
+            need_switch = true;
+          }
+        }
+      }
+      if (OB_SUCC(ret) && need_switch && OB_FAIL(switch_snap_builder())) {
+        LOG_WARN("switch snapshot builder failed", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexAdaptor::enable_merge_multi_segment(const int64_t max_vectors)
+{
+  int ret = OB_SUCCESS;
+  uint64_t version = 0;
+  if (!snap_data_.is_valid() || max_vectors <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid merge multi segment arguments", K(ret), K(snap_data_), K(max_vectors));
+  } else if (created_by_tablet_rebuild_) {
+    LOG_INFO("keep single merge result for unsupported build", K(tenant_id_), K(type_),
+        K(created_by_tablet_rebuild_), K(max_vectors));
+  } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id_, version))) {
+    LOG_WARN("get merge data version failed", K(ret), K(tenant_id_));
+  } else if (version < DATA_VERSION_4_6_3_1) {
+    LOG_INFO("keep single merge result for old data version", K(tenant_id_), K(version), K(max_vectors));
+  } else {
+    // Called after merge_bitmap succeeds and before the inner SQL starts writing.
+    TCWLockGuard guard(snap_data_->complete_lock_);
+    snap_data_->segment_max_vectors_ = max_vectors;
+    ATOMIC_STORE(&snap_data_->enable_multi_segment_, true);
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexAdaptor::create_snap_builder(ObVectorIndexParam &param,
+    const bool is_buffer_mode, ObVectorIndexSegmentBuilder *&builder)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(get_allocator())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("snapshot allocator is null", K(ret));
+  } else if (OB_ISNULL(builder = OB_NEWx(ObVectorIndexSegmentBuilder, get_allocator()))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("allocate snapshot builder failed", K(ret));
+  } else if (is_buffer_mode) {
+    ret = builder->init_vec_buffer(tenant_id_, *get_allocator(), is_sparse_vector_index_type());
+  } else {
+    ret = ObVectorIndexSegment::create(builder->segment_handle_, tenant_id_, *get_allocator(),
+        param, ObVectorIndexUtil::get_physical_build_type(param.type_, param.support_duplicate_),
+        param.m_, this);
+  }
+  if (OB_SUCC(ret) && created_by_segment_merge_ && snap_data_->enable_multi_segment_) {
+    const ObVectorIndexSegmentBuilder *first = snap_data_->sealed_builders_.empty() ? nullptr
+        : snap_data_->sealed_builders_.at(0);
+    if (OB_ISNULL(first)) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_WARN("first sealed merge builder is missing", K(ret), K(tenant_id_), K(snap_data_));
+    } else if (OB_FAIL(builder->merge_source_seg_handles_.assign(first->merge_source_seg_handles_))) {
+      LOG_WARN("copy merge source handles failed", K(ret));
+    } else if (OB_FALSE_IT(builder->need_vid_check_ = first->need_vid_check_)) {
+    } else if (OB_FALSE_IT(builder->vid_bound_ = first->vid_bound_)) {
+    } else if (OB_ISNULL(first->ibitmap_) && OB_ISNULL(first->vbitmap_)
+        && (!first->segment_handle_.is_valid()
+            || OB_ISNULL(first->segment_handle_->ibitmap_))) {
+      // Full BASE merges omit bitmaps in every output, including split segments.
+      // Serialization transfers ibitmap to the graph; vbitmap stays in the builder.
+    } else if (OB_ISNULL(builder->ibitmap_ = OB_NEWx(ObVectorIndexRoaringBitMap,
+        get_allocator(), get_allocator(), tenant_id_))
+        || OB_ISNULL(builder->vbitmap_ = OB_NEWx(ObVectorIndexRoaringBitMap,
+            get_allocator(), get_allocator(), tenant_id_))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("allocate merge result bitmaps failed", K(ret), K(tenant_id_),
+          KP(builder->ibitmap_), KP(builder->vbitmap_));
+    } else if (OB_FAIL(builder->ibitmap_->init(true, false))) {
+      LOG_WARN("init merge result ibitmap failed", K(ret));
+    } else if (OB_FAIL(builder->vbitmap_->init(true, true))) {
+      LOG_WARN("init merge result vbitmap failed", K(ret));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    builder->seg_type_ = ObVectorIndexSegmentType::BASE;
+    builder->set_inited();
+  } else if (OB_NOT_NULL(builder)) {
+    LOG_WARN("initialize snapshot builder failed", K(ret));
+    builder->free(*get_allocator());
+    builder->~ObVectorIndexSegmentBuilder();
+    get_allocator()->free(builder);
+    builder = nullptr;
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexAdaptor::get_builder_vector_count(
+    ObVectorIndexSegmentBuilder &builder, int64_t &count)
+{
+  int ret = OB_SUCCESS;
+  count = 0;
+  if (!snap_data_.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("snapshot is null", K(ret));
+  } else {
+    // Caller holds complete_lock_. Serialize counting with the buffer-to-graph transition.
+    TCWLockGuard guard(snap_data_->mem_data_rwlock_);
+    if (builder.segment_handle_.is_valid()) {
+      if (OB_FAIL(builder.segment_handle_->get_index_number(count))) {
+        LOG_WARN("get snapshot vector count failed", K(ret));
+      }
+    } else if (OB_NOT_NULL(builder.vid_array_)) {
+      count = builder.vid_array_->count();
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexAdaptor::finish_snap_builder(ObVectorIndexSegmentBuilder &builder)
+{
+  int ret = OB_SUCCESS;
+  ObVectorIndexParam *param = static_cast<ObVectorIndexParam *>(algo_data_);
+  if (!snap_data_.is_valid() || OB_ISNULL(param)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid snapshot build context", K(ret), K(snap_data_), KP(param));
+  } else {
+    // Caller holds complete_lock_ exclusively; never acquire it recursively.
+    TCWLockGuard guard(snap_data_->mem_data_rwlock_);
+    if (!builder.segment_handle_.is_valid() && !builder.is_empty_buffer()) {
+      if (is_sparse_vector_index_type()) {
+        ret = builder.create_and_add_sparse_index_from_arrays(
+            tenant_id_, *get_allocator(), *param, VIAT_IPIVF, this);
+      } else {
+        ret = builder.create_and_add(tenant_id_, *get_allocator(), *param,
+            VIAT_HGRAPH, param->m_, this);
+      }
+    }
+    if (OB_FAIL(ret)) {
+      LOG_WARN("finish snapshot buffer failed", K(ret));
+    } else {
+      builder.free_vec_buf_data(*get_allocator());
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexAdaptor::seal_snap_builder()
+{
+  int ret = OB_SUCCESS;
+  // Caller holds complete_lock_ exclusively. Transfer ownership only after push_back succeeds.
+  if (!snap_data_.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("snapshot is null", K(ret));
+  } else if (OB_ISNULL(snap_data_->builder_)) {
+  } else if (OB_FAIL(finish_snap_builder(*snap_data_->builder_))) {
+    LOG_WARN("finish DDL segment failed", K(ret));
+  } else {
+    int64_t count = 0;
+    int64_t min_vid = INT64_MAX;
+    int64_t max_vid = 0;
+    if (OB_FAIL(get_builder_vector_count(*snap_data_->builder_, count))) {
+      LOG_WARN("count completed DDL segment failed", K(ret));
+    } else if (count == 0 && !(created_by_segment_merge_
+        && snap_data_->enable_multi_segment_ && snap_data_->sealed_builders_.empty())) {
+      snap_data_->builder_->free(*get_allocator());
+      snap_data_->builder_->~ObVectorIndexSegmentBuilder();
+      get_allocator()->free(snap_data_->builder_);
+      snap_data_->builder_ = nullptr;
+    } else {
+      // Only an entirely empty merge retains the first builder and its tombstones.
+      ObVectorIndexSegmentBuilder &builder = *snap_data_->builder_;
+      if (count == 0) {
+        min_vid = max_vid = 0;
+        if (!builder.segment_handle_.is_valid()) {
+          ObVectorIndexParam *param = static_cast<ObVectorIndexParam *>(algo_data_);
+          ret = ObVectorIndexSegment::create(builder.segment_handle_, tenant_id_,
+              *get_allocator(), *param, VIAT_HGRAPH, param->m_, this);
+        }
+      } else {
+        ret = builder.segment_handle_->get_vid_bound(min_vid, max_vid);
+      }
+      if (OB_FAIL(ret)) {
+        LOG_WARN("finish sealed segment failed", K(ret));
+      } else if (OB_FAIL(snap_data_->sealed_builders_.push_back(snap_data_->builder_))) {
+        LOG_WARN("save sealed builder failed", K(ret));
+      } else {
+        builder.segment_handle_->set_read_vid_bound(ObVidBound(min_vid, max_vid));
+        snap_data_->builder_ = nullptr;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ATOMIC_STORE(&snap_data_->need_switch_segment_, false);
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexAdaptor::switch_snap_builder()
+{
+  int ret = OB_SUCCESS;
+  ObVectorIndexParam *param = static_cast<ObVectorIndexParam *>(algo_data_);
+  if (!snap_data_.is_valid() || OB_ISNULL(param)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid snapshot build context", K(ret), K(snap_data_), KP(param));
+  } else {
+    TCWLockGuard guard(snap_data_->complete_lock_);
+    if (ATOMIC_LOAD(&snap_data_->need_switch_segment_) && OB_FAIL(seal_snap_builder())) {
+      LOG_WARN("seal snapshot builder failed", K(ret));
+    } else if (OB_ISNULL(snap_data_->builder_)) {
+      if (snap_data_->sealed_builders_.empty()) {
+        // A rescan after build_finished must release the previous result before rebuilding.
+        TCWLockGuard meta_guard(snap_data_->mem_data_rwlock_);
+        snap_data_->meta_.release();
+        snap_data_->has_complete_ = false;
+      }
+      ObVectorIndexSegmentBuilder *next = nullptr;
+      const bool buffered = param->type_ == VIAT_HNSW_SQ || param->type_ == VIAT_HNSW_BQ
+          || param->type_ == VIAT_IPIVF_SQ;
+      if (OB_FAIL(create_snap_builder(*param, buffered, next))) {
+        LOG_WARN("create next snapshot builder failed", K(ret));
+      } else {
+        snap_data_->builder_ = next;
+        snap_data_->set_inited();
+      }
+    }
+  }
+  return ret;
+}
+
+ERRSIM_POINT_DEF(ERRSIM_VEC_DDL_MULTI_SNAPSHOT);
+int ObPluginVectorIndexAdaptor::serialize_multi_snapshot(ObHNSWSerializeCallback::CbParam &param)
+{
+  int ret = OB_SUCCESS;
+  ObVecIdxSnapshotDataWriteCtx *ctx = static_cast<ObVecIdxSnapshotDataWriteCtx *>(param.vctx_);
+  ObVectorIndexMeta result;
+  const bool merge = created_by_segment_merge_;
+  const int64_t data_offset = merge ? 0 : 1;
+  if (!snap_data_.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("snapshot is null", K(ret));
+  } else if (OB_ISNULL(ctx) || OB_ISNULL(param.allocator_) || (param.is_vec_tablet_rebuild_ && !merge)
+      || (merge && !param.is_vec_tablet_rebuild_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid multi snapshot serialization context", K(ret), K(param));
+  } else {
+    TCWLockGuard guard(snap_data_->complete_lock_);
+    if (OB_FAIL(seal_snap_builder())) {
+      LOG_WARN("seal final DDL builder failed", K(ret));
+    } else if (snap_data_->sealed_builders_.empty()) {
+      ret = OB_NOT_INIT; // Existing DDL callers treat the empty index as success.
+      LOG_INFO("snapshot has no vectors", K(ret));
+    } else if (!param.is_valid()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid snapshot serialization parameters", K(ret), K(param));
+    } else if (!ctx->vals_.empty()) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_WARN("snapshot output is not empty", K(ret), K(ctx->vals_.count()));
+    } else if (OB_FAIL(EVENT_CALL(ERRSIM_VEC_DDL_MULTI_SNAPSHOT, tenant_id_))) {
+      LOG_WARN("inject DDL multi snapshot serialization failure", K(ret), KP(this),
+          K(tenant_id_), "sealed_count", snap_data_->sealed_builders_.count());
+    } else if (!merge && OB_FAIL(ctx->vals_.push_back(ObVecIdxSnapshotBlockData(true, ObString())))) {
+      LOG_WARN("reserve root meta failed", K(ret));
+    } else {
+      // Prune all output VIDs before serializing the first builder's visibility.
+      for (int64_t i = 0; OB_SUCC(ret) && merge
+          && i < snap_data_->sealed_builders_.count(); ++i) {
+        if (OB_FAIL(snap_data_->sealed_builders_.at(0)->prune_insert_bitmap(
+            *snap_data_->sealed_builders_.at(i)))) {
+          LOG_WARN("prune multi-segment insert bitmap failed", K(ret), K(i));
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < snap_data_->sealed_builders_.count(); ++i) {
+        ObVectorIndexSegmentBuilder &builder = *snap_data_->sealed_builders_.at(i);
+        const int64_t first = ctx->vals_.count() - data_offset;
+        param.need_serde_meta_ = false;
+        CHECK_TASK_CANCELLED(ret, param.task_ctx_);
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(builder.serialize(tenant_id_, param, false/*prune_insert*/))) {
+          LOG_WARN("serialize DDL segment failed", K(ret), K(i));
+        } else {
+          const int64_t count = ctx->vals_.count() - data_offset - first;
+          const ObVectorIndexAlgorithmType type = builder.segment_handle_->get_index_type();
+          for (int64_t j = 0; OB_SUCC(ret) && j < count; ++j) {
+            ObString key;
+            if (OB_FAIL(ObVectorIndexSegmentMeta::get_segment_persist_key(type,
+                param.tablet_id_, param.snapshot_version_, first + j, *param.allocator_, key))) {
+              LOG_WARN("build DDL block key failed", K(ret));
+            } else {
+              // The output allocator owns the key for the lifetime of the DDL iterator.
+              ctx->vals_.at(first + j + data_offset).set_persist_key(key);
+            }
+          }
+          if (OB_SUCC(ret) && OB_FAIL(snap_data_->append_base_meta(result, builder,
+              param.tablet_id_, param.snapshot_version_, first, count, index_param_))) {
+            LOG_WARN("append DDL base meta failed", K(ret), K(i));
+          }
+        }
+      }
+      result.is_persistent_ = true;
+      if (OB_FAIL(ret)) {
+      } else if (!merge && OB_FAIL(result.serialize(*param.allocator_, ctx->vals_.at(0).get_data()))) {
+        LOG_WARN("serialize DDL root meta failed", K(ret));
+      } else {
+        // Keep root first; sort data blocks by their immutable keys, not their
+        // position. SQ/BQ and fallback HGRAPH prefixes have different ordering.
+        struct SnapshotBlockKeyLess
+        {
+          bool operator()(const ObVecIdxSnapshotBlockData &a,
+              const ObVecIdxSnapshotBlockData &b) const
+          {
+            return a.get_persist_key().compare(b.get_persist_key()) < 0;
+          }
+        };
+        lib::ob_sort(ctx->vals_.begin() + data_offset, ctx->vals_.end(), SnapshotBlockKeyLess());
+        TCWLockGuard meta_guard(snap_data_->mem_data_rwlock_);
+        if (OB_FAIL(snap_data_->meta_.assign(result))) {
+          LOG_WARN("publish DDL in-memory meta failed", K(ret));
+        } else if (OB_FAIL(snap_data_->build_finished(*get_allocator()))) {
+          LOG_WARN("finish DDL build failed", K(ret));
+        } else {
+          LOG_INFO("DDL multi segment serialization finished", K(param.tablet_id_),
+              K(param.snapshot_version_), K(snap_data_->meta_), K(snap_data_->last_res_seg_info_));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 /**************************************************************************
 * Note:
 *  The number of vids must be equal to num;
 *  There cannot be null pointers in vectors;
 *  The number of floats in vectors must be equal to num * dim;
 
-*  If you want to verify the above content in the add_snap_index interface, you need to traverse vectors and vids. 
-   In the scenario where a large amount of data is written, there will be a lot of unnecessary performance consumption, 
+*  If you want to verify the above content in the inner_add_snap_index interface, you need to traverse vectors and vids.
+   In the scenario where a large amount of data is written, there will be a lot of unnecessary performance consumption,
    so the caller needs to ensure this.
 **************************************************************************/
-int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, ObVecExtraInfoObj *extra_objs, int64_t extra_column_count, int num, uint32_t *sparse_byte_lens /* nullptr */)
+// Caller initializes the builder and holds complete_lock_ for the entire batch.
+int ObPluginVectorIndexAdaptor::inner_add_snap_index(float *vectors, int64_t *vids,
+    char *extra_info_buf, int num, uint32_t *lens, uint32_t *dims, float *vals)
 {
   INIT_SUCC(ret);
   int64_t dim = 0;
   ObVectorIndexParam *param = nullptr;
   ObVectorIndexSegmentBuilder *segment_builder = nullptr;
-  uint32_t *lens = nullptr;
-  uint32_t *dims = nullptr;
-  float *vals = nullptr;
-  ObArenaAllocator tmp_allocator("VectorAdaptor", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id_);
   if (! snap_data_.is_valid()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get null snap data", K(ret), K(snap_data_));
@@ -2583,31 +2933,21 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
     LOG_WARN("failed to get param.", K(ret));
   } else if (OB_FALSE_IT(dim = param->dim_)) {
   } else {
+    // add_snap_index holds complete_lock_ through both duplicate checks and writes.
+    const ObIArray<ObVectorIndexSegmentBuilder *> *sealed_builders =
+        snap_data_->enable_multi_segment_ ? &snap_data_->sealed_builders_ : nullptr;
     if (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW ||
         param->type_ == ObVectorIndexAlgorithmType::VIAT_HGRAPH ||
         param->type_ == ObVectorIndexAlgorithmType::VIAT_IPIVF) {
-      if (OB_FAIL(init_snap_data_for_build(param, false/*is_buffer_mode*/))) {
-        LOG_WARN("init snap index failed.", K(ret));
-      } else if (num == 0 || OB_ISNULL(vectors)) {
+      if (num == 0 || OB_ISNULL(vectors)) {
         // do nothing
       } else if (OB_ISNULL(vids)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("get invalid data.", K(ret));
       } else {
-        if (is_sparse_vector_index_type()) {
-          parse_sparse_vector((char*)vectors, num, sparse_byte_lens, &tmp_allocator, &lens, &dims, &vals);
-        }
-
-        char* extra_info_buf = nullptr;
-        if (OB_NOT_NULL(extra_objs) && extra_column_count > 0 && param->extra_info_actual_size_ > 0 &&
-            OB_FAIL(ObVecExtraInfo::extra_infos_to_buf(tmp_allocator, extra_objs, extra_column_count,
-                                                       param->extra_info_actual_size_, num, extra_info_buf))) {
-          LOG_WARN("failed to encode extra info.", K(ret), K(param->extra_info_actual_size_));
-        } else {
+        {
           lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(tenant_id_, "VIndexVsagADP"));
           lib::ObLightBacktraceGuard light_backtrace_guard(false);
-          // avoid concurrent with serialize_snapshot
-          TCRLockGuard snap_complete_lock_guard(snap_data_->complete_lock_);
           if (OB_ISNULL(segment_builder = snap_data_->builder_)) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("segment builder is null", K(ret), K(snap_data_));
@@ -2615,40 +2955,26 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("segment builder is not inited now, may be build finished", K(ret), KP(this), KPC(segment_builder));
           } else if (!is_sparse_vector_index_type()) {
-            if (OB_FAIL(segment_builder->add_index(vectors, vids, dim, extra_info_buf, num, param->extra_info_actual_size_))) {
+            if (OB_FAIL(segment_builder->add_index(vectors, vids, dim, extra_info_buf, num, param->extra_info_actual_size_, sealed_builders))) {
               LOG_WARN("failed to add index.", K(ret), K(dim), K(num));
             }
           } else {
-            if (OB_FAIL(segment_builder->add_index(lens, dims, vals, vids, num, extra_info_buf, param->extra_info_actual_size_))) {
+            if (OB_FAIL(segment_builder->add_index(lens, dims, vals, vids, num, extra_info_buf, param->extra_info_actual_size_, sealed_builders))) {
               LOG_WARN("failed to add index.", K(ret), K(dim), K(num));
             }
           }
         }
       }
-    } else if (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW_SQ 
+    } else if (param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW_SQ
         || param->type_ == ObVectorIndexAlgorithmType::VIAT_HNSW_BQ
         || param->type_ == ObVectorIndexAlgorithmType::VIAT_IPIVF_SQ) {
-      if (OB_FAIL(init_snap_data_for_build(param, true/*is_buffer_mode*/))) {
-        LOG_WARN("init snap index failed.", K(ret));
-      } else if (num == 0 || OB_ISNULL(vectors)) {
+      if (num == 0 || OB_ISNULL(vectors)) {
         // do nothing
       } else if (OB_ISNULL(vids)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("get invalid data.", K(ret));
       } else {
-        if (is_sparse_vector_index_type()) {
-          if (OB_FAIL(parse_sparse_vector((char*)vectors, num, sparse_byte_lens, &tmp_allocator, &lens, &dims, &vals))) {
-            LOG_WARN("failed to parse sparse vector.", K(ret));
-          }
-        }
-        char *extra_info_buf = nullptr;
-        if (OB_SUCC(ret) && OB_NOT_NULL(extra_objs) && extra_column_count > 0 && param->extra_info_actual_size_ > 0 && 
-            OB_FAIL(ObVecExtraInfo::extra_infos_to_buf(tmp_allocator, extra_objs, extra_column_count,
-                                                       param->extra_info_actual_size_, num, extra_info_buf))) {
-          LOG_WARN("failed to encode extra info.", K(ret), K(param->extra_info_actual_size_));
-        } else {
-          // avoid concurrent with serialize_snapshot
-          TCRLockGuard snap_complete_lock_guard(snap_data_->complete_lock_);
+        {
           if (OB_ISNULL(segment_builder = snap_data_->builder_)) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("segment builder is null", K(ret), K(snap_data_));
@@ -2658,11 +2984,11 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
           } else if (ATOMIC_LOAD(&segment_builder->has_build_)) {
             // directly write into index
             if (!is_sparse_vector_index_type()) {
-              if (OB_FAIL(segment_builder->add_index(vectors, vids, dim, extra_info_buf, num, param->extra_info_actual_size_))) {
+              if (OB_FAIL(segment_builder->add_index(vectors, vids, dim, extra_info_buf, num, param->extra_info_actual_size_, sealed_builders))) {
                 LOG_WARN("failed to add index.", K(ret), K(dim), K(num));
               }
             } else {
-              if (OB_FAIL(segment_builder->add_index(lens, dims, vals, vids, num, extra_info_buf, param->extra_info_actual_size_))) {
+              if (OB_FAIL(segment_builder->add_index(lens, dims, vals, vids, num, extra_info_buf, param->extra_info_actual_size_, sealed_builders))) {
                 LOG_WARN("failed to add index.", K(ret), K(dim), K(num));
               }
             }
@@ -2670,12 +2996,16 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
             TCWLockGuard lock_guard(snap_data_->mem_data_rwlock_);
             DEBUG_SYNC(BEFORE_BUILD_SNAP_INDEX);
             if (! segment_builder->has_build_) {
-              if (!is_sparse_vector_index_type()) {
-                if (OB_FAIL(segment_builder->add_to_buffer(vectors, vids, dim, extra_info_buf, num, param->extra_info_actual_size_))) {
+              // Finalizing a quantized tail frees its buffer; a DDL rescan needs it again.
+              if (snap_data_->enable_multi_segment_ && OB_FAIL(segment_builder->init_vec_buffer(
+                  tenant_id_, *get_allocator(), is_sparse_vector_index_type()))) {
+                LOG_WARN("restore DDL snapshot buffer failed", K(ret));
+              } else if (!is_sparse_vector_index_type()) {
+                if (OB_FAIL(segment_builder->add_to_buffer(vectors, vids, dim, extra_info_buf, num, param->extra_info_actual_size_, sealed_builders))) {
                   LOG_WARN("add vector to buffer fail", K(ret), KP(this), KPC(segment_builder));
                 }
               } else {
-                if (OB_FAIL(segment_builder->add_to_buffer(lens, dims, vals, vids, extra_info_buf, num, param->extra_info_actual_size_))) {
+                if (OB_FAIL(segment_builder->add_to_buffer(lens, dims, vals, vids, extra_info_buf, num, param->extra_info_actual_size_, sealed_builders))) {
                   LOG_WARN("failed to add index.", K(ret), K(dim), K(num));
                 }
               }
@@ -2687,19 +3017,19 @@ int ObPluginVectorIndexAdaptor::add_snap_index(float *vectors, int64_t *vids, Ob
                   this))) {
                 LOG_WARN("build_if_need fail", K(ret), KP(this), KPC(segment_builder));
               }
-            } else { 
-              /* In a multithreading scenario, it is possible for threads a and b to simultaneously acquire a lock_guard. 
-                 If thread a acquires the lock_guard and creates an index (i.e., snap_data_->segment_ != null), 
-                 then when thread b waits for thread a to release the lock_guard, it will find that snap_data_->segment_ != null. 
+            } else {
+              /* In a multithreading scenario, it is possible for threads a and b to simultaneously acquire a lock_guard.
+                 If thread a acquires the lock_guard and creates an index (i.e., snap_data_->segment_ != null),
+                 then when thread b waits for thread a to release the lock_guard, it will find that snap_data_->segment_ != null.
                  At this point, thread a should call add_index to write the data; otherwise, the data will be lost. */
               lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(tenant_id_, "VIndexVsagADP"));
               lib::ObLightBacktraceGuard light_backtrace_guard(false);
               if (!is_sparse_vector_index_type()) {
-                if (OB_FAIL(segment_builder->add_index(vectors, vids, dim, extra_info_buf, num, param->extra_info_actual_size_))) {
+                if (OB_FAIL(segment_builder->add_index(vectors, vids, dim, extra_info_buf, num, param->extra_info_actual_size_, sealed_builders))) {
                   LOG_WARN("failed to add index.", K(ret), K(dim), K(num));
                 }
               } else {
-                if (OB_FAIL(segment_builder->add_index(lens, dims, vals, vids, num, extra_info_buf, param->extra_info_actual_size_))) {
+                if (OB_FAIL(segment_builder->add_index(lens, dims, vals, vids, num, extra_info_buf, param->extra_info_actual_size_, sealed_builders))) {
                   LOG_WARN("failed to add index.", K(ret), K(dim), K(num));
                 }
               }
@@ -2786,7 +3116,6 @@ int ObPluginVectorIndexAdaptor::check_if_need_optimize()
     if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id_, tenant_data_version))) {
       LOG_WARN("failed to get tenant data version", K(ret), K(tenant_id_));
     } else if (tenant_config.is_valid() && (tenant_data_version >= DATA_VERSION_4_5_1_0) &&
-      ! is_hybrid_index() && ! is_sparse_vector_index_type() &&
       OB_FALSE_IT(use_new_check = ObPluginVectorIndexHelper::enable_persist_vector_index_incremental(tenant_id_))) {
       // do nothing
     } else if (use_new_check) {
@@ -3167,8 +3496,11 @@ int ObPluginVectorIndexAdaptor::check_snap_index()
   } else if (! snap_data_->is_inited()) {
     LOG_INFO("snap data is not init, it's empty table", KPC(this));
   } else if (OB_ISNULL(segment_builder = snap_data_->builder_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("segment builder is null", K(ret), K(snap_data_));
+    // Multi-segment builds may have already sealed the last builder.
+    if (!ATOMIC_LOAD(&snap_data_->enable_multi_segment_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("segment builder is null", K(ret), K(snap_data_));
+    }
   } else if (! segment_builder->has_build_) {
     TCWLockGuard lock_guard(snap_data_->complete_lock_);
     TCWLockGuard mem_data_lock_guard(snap_data_->mem_data_rwlock_);
@@ -4500,17 +4832,31 @@ int ObPluginVectorIndexAdaptor::prepare_delta_mem_data(roaring::api::roaring64_b
 int ObPluginVectorIndexAdaptor::serialize_snapshot(ObHNSWSerializeCallback::CbParam &param, const bool skip_for_merge)
 {
   int ret = OB_SUCCESS;
+  DEBUG_SYNC(BEFORE_VEC_INDEX_SERIALIZE);
+  if (!snap_data_.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("snapshot is null", K(ret));
+  } else if (skip_for_merge && created_by_segment_merge_) {
+    ret = OB_NOT_INIT; // The merge task serializes explicitly after its DDL pipeline finishes.
+    LOG_INFO("skip serialize snapshot by merge task", KPC(this));
+  } else if (ATOMIC_LOAD(&snap_data_->enable_multi_segment_)) {
+    ret = serialize_multi_snapshot(param);
+  } else {
+    ret = inner_serialize_snapshot(param);
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexAdaptor::inner_serialize_snapshot(ObHNSWSerializeCallback::CbParam &param)
+{
+  int ret = OB_SUCCESS;
   ObVectorIndexParam *index_param = nullptr;
   uint64_t tenant_data_version = 0;
   int64_t vec_cnt = 0;
   int64_t min_vid = INT64_MAX;
   int64_t max_vid = 0;
   ObVecIdxSnapshotDataWriteCtx *vctx = reinterpret_cast<ObVecIdxSnapshotDataWriteCtx*>(param.vctx_);
-  DEBUG_SYNC(BEFORE_VEC_INDEX_SERIALIZE);
-  if (skip_for_merge && created_by_segment_merge_) {
-    ret = OB_NOT_INIT; // compact ddl pipeline behavior
-    LOG_INFO("skip serialize snapshot by merge task", KPC(this));
-  } else if (!snap_data_->is_inited()) {
+  if (!snap_data_->is_inited()) {
     ret = OB_NOT_INIT;
     LOG_WARN("snap index is not init", K(ret));
   } else if (OB_ISNULL(snap_data_->builder_)) {
@@ -4522,7 +4868,8 @@ int ObPluginVectorIndexAdaptor::serialize_snapshot(ObHNSWSerializeCallback::CbPa
   } else {
     // add lock here to avoid concurrent serialize snapshot
     TCWLockGuard lock_guard(snap_data_->complete_lock_);
-    if ((snap_data_->builder_->seg_type_ == ObVectorIndexSegmentType::INCR_MERGE
+    if ((created_by_segment_merge_
+            || snap_data_->builder_->seg_type_ == ObVectorIndexSegmentType::INCR_MERGE
             || snap_data_->builder_->seg_type_ == ObVectorIndexSegmentType::VSAG_MERGE)
         && snap_data_->builder_->add_cnt_ == 0) {
       // store vbitmap for empty merge result
@@ -4656,7 +5003,7 @@ int ObPluginVectorIndexAdaptor::merge_and_generate_bitmap(ObVectorQueryAdaptorRe
   } else if (!ctx->is_overlay_active()
              && !is_mem_data_init_atomic(VIRT_BITMAP)
              && !has_frozen()
-             && (!is_snap_inited() || snap_data_->meta_.incrs_.count() == 0)) {
+             && (!is_snap_inited() || snap_data_->meta_.segment_count() == 0)) {
     lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(tenant_id_, "VIBitmapADPP"));
     ibitmap = ctx->bitmaps_->insert_bitmap_;
     dbitmap = ctx->bitmaps_->delete_bitmap_;
@@ -4691,17 +5038,19 @@ int ObPluginVectorIndexAdaptor::merge_and_generate_bitmap(ObVectorQueryAdaptorRe
     }
 
     if (is_snap_inited()) {
-      for (int64_t i = 0; OB_SUCC(ret) && i < snap_data_->meta_.incrs_.count(); ++i) {
-        const ObVectorIndexSegmentMeta &seg_meta = snap_data_->meta_.incrs_.at(i);
-        if (! seg_meta.segment_handle_.is_valid()) {
+      TCRLockGuard guard(snap_data_->mem_data_rwlock_);
+      for (int64_t i = 0; OB_SUCC(ret) && i < snap_data_->meta_.segment_count(); ++i) {
+        const ObVectorIndexSegmentMeta &seg_meta = snap_data_->meta_.flat_seg_meta_at(i);
+        const ObVectorIndexRoaringBitMap *bitmap = seg_meta.vbitmap_;
+        if (!seg_meta.segment_handle_.is_valid()) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("segment handle is invalid", K(ret), K(i), K(seg_meta), KPC(this));
-        } else if (OB_NOT_NULL(seg_meta.segment_handle_->vbitmap_)) {
-          if (OB_SUCC(ret) && OB_NOT_NULL(seg_meta.segment_handle_->vbitmap_->insert_bitmap_)) {
-            ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(ibitmap, seg_meta.segment_handle_->vbitmap_->insert_bitmap_));
+        } else if (OB_NOT_NULL(bitmap)) {
+          if (OB_SUCC(ret) && OB_NOT_NULL(bitmap->insert_bitmap_)) {
+            ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(ibitmap, bitmap->insert_bitmap_));
           }
-          if (OB_SUCC(ret) && OB_NOT_NULL(seg_meta.segment_handle_->vbitmap_->delete_bitmap_)) {
-            ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(dbitmap, seg_meta.segment_handle_->vbitmap_->delete_bitmap_));
+          if (OB_SUCC(ret) && OB_NOT_NULL(bitmap->delete_bitmap_)) {
+            ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(dbitmap, bitmap->delete_bitmap_));
           }
         }
       }
@@ -5032,6 +5381,12 @@ int ObPluginVectorIndexAdaptor::vsag_query_vids(ObVectorQueryAdaptorResultContex
       if (! seg_meta.segment_handle_.is_valid()) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("segment handle is invalid", K(ret), K(i), K(seg_meta), KPC(this));
+      } else if (seg_meta.seg_type_ == ObVectorIndexSegmentType::INCR_BASE) {
+        if (OB_FAIL(ctx->add_segment_querier(
+            seg_meta.segment_handle_, false/*is_incr*/, false/*is_active*/,
+            base_filter, is_pre_filter))) {
+          LOG_WARN("add incr base segment querier fail", K(ret));
+        }
       } else if (seg_meta.seg_type_ == ObVectorIndexSegmentType::INCR_MERGE) {
         // An INCR_MERGE may physically contain a VID newer than an async query's
         // published snapshot. Using dFilter can return that VID and make the old
@@ -5135,11 +5490,11 @@ int ObPluginVectorIndexAdaptor::vsag_query_vids(ObVectorQueryAdaptorResultContex
     if (OB_FAIL(ret)) {
     } else if (index_type == VIAT_HNSW_BQ) {
       if (OB_FAIL(ObPluginVectorIndexHelper::driect_merge_delta_and_snap_vids(
-              result_list, actual_res_cnt, merge_vids, merge_distance, merge_extra_info_ptr))) {
+              tenant_id_, result_list, actual_res_cnt, merge_vids, merge_distance, merge_extra_info_ptr))) {
         LOG_WARN("failed to merge delta and snap vids.", K(ret));
       }
     } else if (OB_FAIL(ObPluginVectorIndexHelper::sort_merge_delta_and_snap_vids(
-        result_list, max_res_cnt, actual_res_cnt, merge_vids, merge_distance, merge_extra_info_ptr))) {
+        tenant_id_, result_list, max_res_cnt, actual_res_cnt, merge_vids, merge_distance, merge_extra_info_ptr))) {
       LOG_WARN("failed to merge delta and snap vids.", K(ret));
     }
 
@@ -5280,7 +5635,7 @@ int ObPluginVectorIndexAdaptor::query_next_result(ObVectorQueryAdaptorResultCont
       }
       
       if (OB_FAIL(ret)) {
-      } else if (OB_FAIL(ObPluginVectorIndexHelper::sort_merge_delta_and_snap_vids(result_list, 
+      } else if (OB_FAIL(ObPluginVectorIndexHelper::sort_merge_delta_and_snap_vids(tenant_id_, result_list,
                                                                               query_cond->query_limit_, 
                                                                               actual_res_cnt, 
                                                                               merge_vids, merge_distance, merge_extra_info_ptr))) {
@@ -6157,15 +6512,6 @@ int ObPluginVectorIndexAdaptor::print_adapter_info(char *buf, int64_t buf_len, i
         const ObVectorIndexSegmentHandle incr_segment_handle = incr_data_->segment_handle_;
         if (incr_segment_handle.is_valid()) {
           incr_segment_handle->get_read_bound_vid(incr_max_vid, incr_min_vid);
-          ObVectorIndexRoaringBitMap *vbitmap = incr_segment_handle->vbitmap_;
-          if (OB_NOT_NULL(vbitmap)) {
-            if (OB_NOT_NULL(vbitmap->insert_bitmap_)) {
-              ROARING_TRY_CATCH(incr_bitmap_insert_cnt = roaring64_bitmap_get_cardinality(vbitmap->insert_bitmap_));
-            }
-            if (OB_NOT_NULL(vbitmap->delete_bitmap_)) {
-              ROARING_TRY_CATCH(incr_bitmap_delete_cnt = roaring64_bitmap_get_cardinality(vbitmap->delete_bitmap_));
-            }
-          }
         }
       }
     }
@@ -6353,15 +6699,15 @@ int ObPluginVectorIndexAdaptor::get_snap_vbitmap_cnt_safe(int64_t &insert_count,
   delete_count = 0;
   if (OB_SUCC(ret) && is_snap_inited()) {
     TCRLockGuard lock_guard(snap_data_->mem_data_rwlock_);
-    for (int64_t i = 0; i < snap_data_->meta_.incrs_.count(); ++i) {
-      const ObVectorIndexSegmentMeta &seg_meta = snap_data_->meta_.incrs_.at(i);
+    for (int64_t i = 0; i < snap_data_->meta_.segment_count(); ++i) {
+      const ObVectorIndexSegmentMeta &seg_meta = snap_data_->meta_.flat_seg_meta_at(i);
       const ObVectorIndexSegmentHandle &segment_handle = seg_meta.segment_handle_;
-      if (segment_handle.is_valid() && OB_NOT_NULL(segment_handle->vbitmap_)) {
-        if (OB_NOT_NULL(segment_handle->vbitmap_->delete_bitmap_)) {
-          delete_count += roaring64_bitmap_get_cardinality(segment_handle->vbitmap_->delete_bitmap_);
+      if (segment_handle.is_valid() && OB_NOT_NULL(seg_meta.vbitmap_)) {
+        if (OB_NOT_NULL(seg_meta.vbitmap_->delete_bitmap_)) {
+          delete_count += roaring64_bitmap_get_cardinality(seg_meta.vbitmap_->delete_bitmap_);
         }
-        if (OB_NOT_NULL(segment_handle->vbitmap_->insert_bitmap_)) {
-          insert_count += roaring64_bitmap_get_cardinality(segment_handle->vbitmap_->insert_bitmap_);
+        if (OB_NOT_NULL(seg_meta.vbitmap_->insert_bitmap_)) {
+          insert_count += roaring64_bitmap_get_cardinality(seg_meta.vbitmap_->insert_bitmap_);
         }
       }
     }
@@ -6904,22 +7250,47 @@ int ObPluginVectorIndexAdaptor::init_snap_data_for_build(const bool is_init_bitm
 
 int ObPluginVectorIndexAdaptor::init_snap_data_for_build(
     ObVectorIndexParam *param,
-    const bool is_buffer_mode)
+    const bool is_buffer_mode,
+    const bool enable_multi_segment)
 {
   int ret = OB_SUCCESS;
   if (! snap_data_.is_valid() || OB_ISNULL(param)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("mem data is null", K(ret), K(snap_data_), KP(param));
-  } else if (is_sanp_builder_inited()) {
-    LOG_DEBUG("mem data is already inited, no need to init", K(snap_data_), K(lbt()));
-    // ddl will retry, in this case, builder is not null, but buffer is empty
-    // init_vec_buffer will double check again, so call it once no matter what
-    if (is_buffer_mode && OB_FAIL(snap_data_->builder_->init_vec_buffer(
-        tenant_id_, *get_allocator(), is_sparse_vector_index_type()))) {
-      LOG_WARN("init buffer mode snap data fail", K(ret));
+  } else {
+    if (enable_multi_segment && !ATOMIC_LOAD(&snap_data_->enable_multi_segment_)
+        && !created_by_tablet_rebuild_) {
+      TCWLockGuard guard(snap_data_->complete_lock_);
+      if (!snap_data_->enable_multi_segment_ && !is_sanp_builder_inited()) {
+        uint64_t data_version = 0;
+        omt::ObTenantConfigGuard config(TENANT_CONF(tenant_id_));
+        if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id_, data_version))) {
+          LOG_WARN("get snapshot build data version failed", K(ret), K(tenant_id_));
+        } else if (data_version < DATA_VERSION_4_6_3_1) {
+          // Keep the existing single-builder initialization below.
+        } else if (!config.is_valid()) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("tenant configuration is invalid", K(ret), K(tenant_id_));
+        } else {
+          // Publish the mode and capacity; switch_snap_builder creates the first builder on demand.
+          snap_data_->segment_max_vectors_ = config->vector_index_segment_max_vectors;
+          ATOMIC_STORE(&snap_data_->enable_multi_segment_, true);
+        }
+      }
     }
-  } else if (OB_FAIL(inner_init_snap_builder(param, is_buffer_mode))) {
-    LOG_WARN("failed to init snap builder", K(ret));
+    if (OB_SUCC(ret) && !ATOMIC_LOAD(&snap_data_->enable_multi_segment_)) {
+      if (is_sanp_builder_inited()) {
+        LOG_DEBUG("mem data is already inited, no need to init", K(snap_data_), K(lbt()));
+        // ddl will retry, in this case, builder is not null, but buffer is empty
+        // init_vec_buffer will double check again, so call it once no matter what
+        if (is_buffer_mode && OB_FAIL(snap_data_->builder_->init_vec_buffer(
+            tenant_id_, *get_allocator(), is_sparse_vector_index_type()))) {
+          LOG_WARN("init buffer mode snap data fail", K(ret));
+        }
+      } else if (OB_FAIL(inner_init_snap_builder(param, is_buffer_mode))) {
+        LOG_WARN("failed to init snap builder", K(ret));
+      }
+    }
   }
   return ret;
 }
@@ -6979,6 +7350,7 @@ int ObPluginVectorIndexAdaptor::check_need_freeze(const int64_t freeze_threshold
   int64_t vec_cnt = 0;
   need_freeze = false;
   int64_t amplification_factor = 1;
+  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id_));
   if (! incr_data_.is_valid()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("incr_data_ is null", K(ret), KP(this));
@@ -6995,10 +7367,15 @@ int ObPluginVectorIndexAdaptor::check_need_freeze(const int64_t freeze_threshold
   } else if (! incr_data_->segment_handle_.is_valid()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("incr segment is null", KR(ret), KP(this), K_(incr_data));
-  } else if (snap_data_.is_valid() && snap_data_->meta_.segment_count() >= OB_VECTOR_INDEX_MAX_SEGMENT_CNT) {
-    LOG_WARN("too many segments, temporarily suspend freezing", K(incr_data_), K(snap_data_));
+  } else if (!tenant_config.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("tenant configuration is invalid for freeze", K(ret), K(tenant_id_));
   } else if (OB_FAIL(incr_data_->segment_handle_->get_index_number(vec_cnt))) {
     LOG_WARN("failed to get index number.", K(ret), K(incr_data_));
+  } else if (vec_cnt > tenant_config->vector_index_segment_max_vectors) {
+    need_freeze = true;
+    LOG_INFO("trigger freeze by active segment vector count", K(vec_cnt),
+        "segment_max_vectors", tenant_config->vector_index_segment_max_vectors.get_value());
   } else if (OB_FALSE_IT(active_segment_mem = incr_data_->segment_handle_->get_mem_hold())) {
   // 如果超过3个, 说明合并慢了, 此时需要减缓冻结
   } else if (snap_data_.is_valid() && snap_data_->meta_.incrs_.count() > 3 && OB_FALSE_IT(amplification_factor = snap_data_->meta_.incrs_.count() - 3)) {
@@ -7130,26 +7507,210 @@ int ObPluginVectorIndexAdaptor::check_can_freeze(
   return ret;
 }
 
-int ObPluginVectorIndexAdaptor::check_need_merge(const int64_t merge_base_percentage, bool &need_merge)
+int ObPluginVectorIndexAdaptor::refresh_segment_delete_counts(
+    ObVecIndexAsyncTaskCtx *task_ctx, const common::ObTabletID &mem_sync_tablet_id)
+{
+  int ret = OB_SUCCESS;
+  int64_t loop_cnt = 0;
+  ObVecIdxSnapshotDataHandle snap = snap_data_;
+  ObVectorIndexMeta source;
+  ObSEArray<int64_t, 8> counts;
+  CHECK_TASK_CANCELLED(ret, task_ctx);
+  CHECK_MEM_SYNC_TABLET_CANCELLED(ret, task_ctx, mem_sync_tablet_id);
+  if (OB_FAIL(ret)) {
+  } else if (!snap.is_valid()) {
+    ret = OB_EAGAIN;
+  } else {
+    TCRLockGuard guard(snap->mem_data_rwlock_);
+    if (!snap->is_inited() || !snap->has_complete_) {
+      ret = OB_EAGAIN;
+    } else if (OB_FAIL(source.assign(snap->meta_))) {
+      LOG_WARN("copy merge source metadata failed", K(ret), K(tenant_id_));
+    }
+  }
+  lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(tenant_id_, "VIBMergeStats"));
+  ObVectorIndexRoaringBitMap deleted(get_allocator(), tenant_id_);
+  if (OB_SUCC(ret) && OB_FAIL(deleted.init(false, true))) {
+    LOG_WARN("initialize merge delete bitmap failed", K(ret));
+  }
+
+  // Union persisted, active and frozen deletes before counting graph members.
+  for (int64_t i = 0; OB_SUCC(ret) && i < source.segment_count(); ++i) {
+    CHECK_TASK_CANCELLED(ret, task_ctx);
+    CHECK_MEM_SYNC_TABLET_CANCELLED(ret, task_ctx, mem_sync_tablet_id);
+    const ObVectorIndexSegmentMeta &meta = source.flat_seg_meta_at(i);
+    if (OB_FAIL(ret)) {
+    } else if (!meta.segment_handle_.is_valid() || !meta.segment_handle_->is_inited()) {
+      ret = OB_EAGAIN;
+    } else if (OB_FAIL(counts.push_back(0))) {
+      LOG_WARN("allocate segment delete count failed", K(ret), K(i));
+    } else if (OB_NOT_NULL(meta.vbitmap_) && OB_NOT_NULL(meta.vbitmap_->delete_bitmap_)) {
+      ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(deleted.delete_bitmap_, meta.vbitmap_->delete_bitmap_));
+      if (OB_FAIL(ret)) {
+        LOG_WARN("collect persisted deletes failed", K(ret), K(i));
+      }
+    }
+  }
+  ObVecIdxVBitmapDataHandle bitmaps[2];
+  if (OB_SUCC(ret)) {
+    if (frozen_data_.is_valid()) {
+      TCRLockGuard guard(frozen_data_->mem_data_rwlock_);
+      bitmaps[0] = vbitmap_data_;
+      if (frozen_data_->has_frozen()) {
+        bitmaps[1] = frozen_data_->vbitmap_;
+      }
+    } else {
+      bitmaps[0] = vbitmap_data_;
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < 2; ++i) {
+    if (!bitmaps[i].is_valid()
+        || (i == 1 && bitmaps[1].get() == bitmaps[0].get())) {
+      continue;
+    }
+    TCRLockGuard guard(bitmaps[i]->bitmap_rwlock_);
+    if (OB_NOT_NULL(bitmaps[i]->bitmap_) && OB_NOT_NULL(bitmaps[i]->bitmap_->delete_bitmap_)) {
+      ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(deleted.delete_bitmap_, bitmaps[i]->bitmap_->delete_bitmap_));
+    }
+    if (OB_FAIL(ret)) {
+      LOG_WARN("collect memory deletes failed", K(ret), K(i));
+    }
+  }
+
+  // Seek to each graph range; membership checks exclude holes and unrelated VIDs.
+  for (int64_t i = 0; OB_SUCC(ret) && i < source.segment_count(); ++i) {
+    CHECK_TASK_CANCELLED(ret, task_ctx);
+    CHECK_MEM_SYNC_TABLET_CANCELLED(ret, task_ctx, mem_sync_tablet_id);
+    const ObVectorIndexSegmentHandle &handle = source.flat_seg_meta_at(i).segment_handle_;
+    int64_t vector_count = 0;
+    int64_t min_vid = 0;
+    int64_t max_vid = 0;
+    roaring::api::roaring64_iterator_t *iter = nullptr;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(handle->get_index_number(vector_count))) {
+      LOG_WARN("read merge source count failed", K(ret), K(i));
+    } else if (vector_count == 0 || roaring64_bitmap_is_empty(deleted.delete_bitmap_)) {
+      continue;
+    } else if (OB_FAIL(handle->get_vid_bound(min_vid, max_vid))) {
+      LOG_WARN("read merge source VID range failed", K(ret), K(i));
+    } else {
+      bool has_value = false;
+      ROARING_TRY_CATCH(iter = roaring64_iterator_create(deleted.delete_bitmap_));
+      if (OB_SUCC(ret) && OB_ISNULL(iter)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+      }
+      if (OB_SUCC(ret)) {
+        ROARING_TRY_CATCH(has_value = roaring64_iterator_move_equalorlarger(
+            iter, static_cast<uint64_t>(min_vid)));
+      }
+      while (OB_SUCC(ret) && has_value) {
+        const uint64_t vid = roaring64_iterator_value(iter);
+        bool exists = false;
+        if (vid > static_cast<uint64_t>(max_vid)) {
+          break;
+        } else if (OB_FAIL(handle->check_id_exist(vid, exists))) {
+          LOG_WARN("count deleted source members failed", K(ret), K(i), K(vid));
+        } else if (exists) {
+          ++counts.at(i);
+        }
+        has_value = roaring64_iterator_advance(iter);
+        CHECK_TASK_CANCELLED_IN_PROCESS_WITH_TABLET(ret, loop_cnt, 20, task_ctx, mem_sync_tablet_id);
+      }
+    }
+    if (OB_NOT_NULL(iter)) {
+      roaring64_iterator_free(iter);
+    }
+  }
+  deleted.reset_bitmap();
+
+  // Publish to the captured graphs; source keeps them alive if metadata changes.
+  CHECK_TASK_CANCELLED(ret, task_ctx);
+  CHECK_MEM_SYNC_TABLET_CANCELLED(ret, task_ctx, mem_sync_tablet_id);
+  if (OB_SUCC(ret)) {
+    TCWLockGuard guard(snap->mem_data_rwlock_);
+    const ObVectorIndexMeta &current = snap->meta_;
+    if (snap.get() != snap_data_.get()
+        || !snap->is_inited() || !snap->has_complete_
+        || current.bases_.count() != source.bases_.count()
+        || current.incrs_.count() != source.incrs_.count()
+        || current.scn() != source.scn()) {
+      ret = OB_EAGAIN;
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < source.segment_count(); ++i) {
+      const ObVectorIndexSegmentMeta &segment = source.flat_seg_meta_at(i);
+      segment.segment_handle_->set_deleted_vector_count(counts.at(i));
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexAdaptor::prepare_merge_policy_input(ObVectorIndexMeta &source_meta,
+    ObVecMergePolicyInput &input, ObVecMergeConfig &config,
+    const bool is_full_merge)
+{
+  int ret = OB_SUCCESS;
+  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id_));
+  input.segments_.reuse();
+  input.deleted_vid_count_ = 0;
+  if (!tenant_config.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("tenant configuration is invalid for merge", K(ret), K(tenant_id_));
+  } else if (!snap_data_.is_valid() || !snap_data_->is_inited()) {
+    ret = OB_EAGAIN;
+    LOG_TRACE("merge snapshot is not ready", K(ret), K(tenant_id_), K(snap_data_));
+  } else {
+    config.max_vectors_ = tenant_config->vector_index_segment_max_vectors;
+    config.merge_factor_ = tenant_config->vector_index_merge_segment_threshold;
+    config.delete_percentage_ = tenant_config->vector_index_delete_purge_threshold;
+    TCRLockGuard guard(snap_data_->mem_data_rwlock_);
+    if (OB_FAIL(source_meta.assign(snap_data_->meta_))) {
+      LOG_WARN("copy merge source metadata failed", K(ret), K(tenant_id_));
+    }
+  }
+  input.base_count_ = source_meta.bases_.count();
+  for (int64_t i = 0; OB_SUCC(ret) && i < source_meta.segment_count(); ++i) {
+    const ObVectorIndexSegmentMeta &meta = source_meta.flat_seg_meta_at(i);
+    ObVecSegmentMergeInfo info;
+    info.scn_ = meta.scn_;
+    info.seg_type_ = meta.seg_type_;
+    info.readable_ = meta.segment_handle_.is_valid() && meta.segment_handle_->is_inited();
+    if (!is_full_merge && info.readable_) {
+      if (OB_FAIL(meta.segment_handle_->get_index_number(info.vector_count_))) {
+        LOG_WARN("read merge source count failed", K(ret), K(i));
+      } else {
+        info.deleted_vector_count_ = meta.segment_handle_->get_deleted_vector_count();
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(input.segments_.push_back(info))) {
+      LOG_WARN("save merge source status failed", K(ret), K(i));
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexAdaptor::check_need_merge(const int64_t merge_base_percentage,
+    bool &need_merge, ObVecMergePolicyInput &input, ObVecMergePlan &plan)
 {
   int ret = OB_SUCCESS;
   need_merge = false;
+  plan = ObVecMergePlan();
   if (ERRSIM_VEC_DISABLE_MERGE != OB_SUCCESS) {
     LOG_INFO("[VECTOR INDEX MERGE] disabled by errsim");
-  } else if (! snap_data_.is_valid() || ! snap_data_->is_inited()) {
+  } else if (!snap_data_.is_valid() || !snap_data_->is_inited()) {
     LOG_TRACE("snap is not init, so no need merge", K(ret), KPC(this));
-  } else if (! snap_data_->has_complete_) {
+  } else if (!snap_data_->has_complete_) {
     LOG_INFO("snap data is not loaded, can not merge", KPC(this));
-  } else if (snap_data_->meta_.segment_count() <= 1) {
-    LOG_WARN("too few segments, no need merge", K(ret), KPC(this));
-  } else if (snap_data_->meta_.incrs_.count() < 2
-      && ! snap_data_->check_incr_mem_over_percentage(merge_base_percentage)) {
-    LOG_TRACE("[VECTOR INDEX MERGE] incrs is too small, so no need merge", K(ret), KPC(this));
   } else if (is_in_opt_task()) {
-    LOG_TRACE("[VECTOR INDEX MERGE] rebuild task is doing, so no need merge", K(ret), KPC(this));
+    LOG_TRACE("[VECTOR INDEX MERGE] rebuild task is doing, so no need merge", KPC(this));
   } else {
-    need_merge = true;
-    LOG_INFO("current vector index need merge", KPC(this));
+    ObVecMergeConfig config;
+    ObVectorIndexMeta source_meta;
+    if (OB_FAIL(prepare_merge_policy_input(source_meta, input, config))) {
+      LOG_WARN("prepare cached merge statistics failed", K(ret));
+    } else if (OB_FAIL(ObVectorIndexMergePolicy(config).check_need_merge_task(
+        input, need_merge, plan))) {
+      if (ret == OB_EAGAIN) { ret = OB_SUCCESS; }
+    }
   }
   return ret;
 }
@@ -7519,8 +8080,8 @@ int ObPluginVectorIndexAdaptor::get_full_incr_bitmap(roaring::api::roaring64_bit
     ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(bitmap, frozen_bitmap));
   }
   if (OB_SUCC(ret) && is_snap_inited()) {
-    for (int64_t i = 0; OB_SUCC(ret) && i < snap_data_->meta_.incrs_.count(); ++i) {
-      const ObVectorIndexSegmentMeta &seg_meta = snap_data_->meta_.incrs_.at(i);
+    for (int64_t i = 0; OB_SUCC(ret) && i < snap_data_->meta_.segment_count(); ++i) {
+      const ObVectorIndexSegmentMeta &seg_meta = snap_data_->meta_.flat_seg_meta_at(i);
       const ObVectorIndexSegmentHandle segment_handle = seg_meta.segment_handle_;
       if (! segment_handle.is_valid()) {
         ret = OB_ERR_UNEXPECTED;
@@ -7535,7 +8096,10 @@ int ObPluginVectorIndexAdaptor::get_full_incr_bitmap(roaring::api::roaring64_bit
         } else {
           ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(bitmap, segment_handle->ibitmap_->insert_bitmap_));
         }
-      } else if (ObVectorIndexSegmentType::INCR_MERGE == seg_meta.seg_type_) {
+      } else if (ObVectorIndexSegmentType::INCR_MERGE == seg_meta.seg_type_
+          || ObVectorIndexSegmentType::INCR_BASE == seg_meta.seg_type_
+          || ObVectorIndexSegmentType::BASE == seg_meta.seg_type_
+          || ObVectorIndexSegmentType::EMPTY == seg_meta.seg_type_) {
         if (OB_NOT_NULL(segment_handle->ibitmap_)
             && OB_NOT_NULL(segment_handle->ibitmap_->insert_bitmap_)) {
           ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(bitmap, segment_handle->ibitmap_->insert_bitmap_));
@@ -7573,13 +8137,14 @@ int ObPluginVectorIndexAdaptor::check_vbitmap_is_subset(roaring::api::roaring64_
     }
 
     if (is_subset && is_snap_inited()) {
-      for (int64_t i = 0; OB_SUCC(ret) && is_subset && i < snap_data_->meta_.incrs_.count(); ++i) {
-        const ObVectorIndexSegmentMeta &seg_meta = snap_data_->meta_.incrs_.at(i);
+      TCRLockGuard lock_guard(snap_data_->mem_data_rwlock_);
+      for (int64_t i = 0; OB_SUCC(ret) && is_subset && i < snap_data_->meta_.segment_count(); ++i) {
+        const ObVectorIndexSegmentMeta &seg_meta = snap_data_->meta_.flat_seg_meta_at(i);
         const ObVectorIndexSegmentHandle segment_handle = seg_meta.segment_handle_;
         if (segment_handle.is_valid()
-            && OB_NOT_NULL(segment_handle->vbitmap_)
-            && OB_NOT_NULL(segment_handle->vbitmap_->insert_bitmap_)) {
-          is_subset = roaring64_bitmap_is_subset(segment_handle->vbitmap_->insert_bitmap_, delta_bitmap);
+            && OB_NOT_NULL(seg_meta.vbitmap_)
+            && OB_NOT_NULL(seg_meta.vbitmap_->insert_bitmap_)) {
+          is_subset = roaring64_bitmap_is_subset(seg_meta.vbitmap_->insert_bitmap_, delta_bitmap);
         }
       }
     }

@@ -14,6 +14,7 @@
 #include "share/allocator/ob_tenant_vector_allocator.h"
 #include "share/ob_ddl_common.h"
 #include "storage/ls/ob_ls.h"
+#include "storage/async_index/ob_async_index_service.h"
 #include "storage/lob/common/ob_lob_util.h"
 
 namespace oceanbase
@@ -42,9 +43,9 @@ bool ObVecIdxMergeTaskExecutor::check_operation_allow()
   } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id_, tenant_data_version))) {
     bret = false;
     LOG_WARN("get tenant data version failed", K(ret));
-  } else if (tenant_data_version < DATA_VERSION_4_5_1_0) {
+  } else if (tenant_data_version < DATA_VERSION_4_6_3_1) {
     bret = false;
-    LOG_DEBUG("vector index async task can not work with data version less than 4_5_0_0", K(tenant_data_version));
+    LOG_DEBUG("vector index merge task requires data version 4_6_3_1", K(tenant_data_version));
   } else if (OB_FAIL(ObPluginVectorIndexHelper::get_merge_base_percentage(tenant_id_, merge_base_percentage_))) {
     LOG_WARN("failed to get merge base percentage", K(ret), K(tenant_id_));
   }
@@ -169,13 +170,13 @@ int ObVecIdxMergeTaskExecutor::load_task(
         char *task_ctx_buf = nullptr;
         ObVecIndexAsyncTaskCtx* task_ctx = nullptr;
         bool need_merge = false;
+        ObVecMergePolicyInput estimate_input;
+        ObVecMergePlan estimate_plan;
         bool schema_active = false;
         if (! adapter->is_complete()) {
           LOG_TRACE("adapter not complete, no need merge", K(ret), KPC(adapter));
         } else if (!adapter->is_ready_complete()) {
           LOG_TRACE("adapter is not complete, no need merge", K(ret), KPC(adapter));
-        } else if (adapter->is_sparse_vector_index_type()) {
-          LOG_TRACE("adapter is sparse vector index, no need merge", K(ret), KPC(adapter));
         } else if (OB_HASH_EXIST == dropping_index_ids.exist_refactored(adapter->get_inc_table_id())) {
           if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
             LOG_WARN("[VEC_DDL_SKIP] skip merge generation for dropping index",
@@ -186,7 +187,7 @@ int ObVecIdxMergeTaskExecutor::load_task(
           }
         } else if (adapter->is_skip_merge_sched()) {
           LOG_TRACE("incr bitmap incomplete and delta table not empty, skip merge sched until adaptor replaced", K(ret), KPC(adapter));
-        } else if (OB_FAIL(adapter->check_need_merge(merge_base_percentage_, need_merge))) {
+        } else if (OB_FAIL(adapter->check_need_merge(merge_base_percentage_, need_merge, estimate_input, estimate_plan))) {
           LOG_WARN("failed to check need merge", K(ret), KPC(adapter));
         } else if (!need_merge) {
           LOG_TRACE("vector index is not need to merge", K(ret), KPC(adapter));
@@ -233,13 +234,16 @@ int ObVecIdxMergeTaskExecutor::load_task(
           task_ctx->task_status_.trace_id_ = new_trace_id;
           task_ctx->allocator_.set_tenant_id(tenant_id_);
           task_ctx->task_status_.inc_tablet_id_ = adapter->get_inc_tablet_id();
-          int64_t est_mem = 0;
+          // Coarse admission here; the worker reserves its actual selected sources.
+          int64_t estimate_mem = 0;
           int tmp_ret = OB_SUCCESS;
-          if (OB_TMP_FAIL(ObVecIndexAsyncTaskUtil::estimate_task_memory(task_ctx, est_mem, adapter))) {
-            LOG_WARN("fail to estimate merge task memory", K(tmp_ret), K(tablet_id));
+          if (OB_TMP_FAIL(ObVecIndexAsyncTaskUtil::estimate_merge_memory(task_ctx,
+                  estimate_input, estimate_plan, estimate_mem, adapter))) {
+            LOG_WARN("estimate merge plan memory failed", K(tmp_ret),
+                K(tablet_id), K(estimate_plan));
           } else {
-            task_ctx->task_status_.task_info_.task_estimate_memory_ = est_mem;
-          } 
+            task_ctx->task_status_.task_info_.task_estimate_memory_ = estimate_mem;
+          }
           if (OB_FAIL(ret)) {
           } else if (OB_FAIL(try_add_task_ctx_for_adapter(
                        *index_ls_mgr, adapter_tablet_id, adapter, task_ctx, inc_new_task))) {
@@ -247,6 +251,24 @@ int ObVecIdxMergeTaskExecutor::load_task(
           } else if (FALSE_IT(task_ctx_in_map = inc_new_task)) {
           } else if (inc_new_task && OB_FAIL(task_ctx_array.push_back(task_ctx))) {
             LOG_WARN("fail to push back task status", K(ret), K(task_ctx));
+          } else if (!inc_new_task && OB_SUCCESS == tmp_ret) {
+            // Reuse this round's cached estimate for an existing waiting AUTO merge.
+            ObVecIndexAsyncTaskCtx *waiting_ctx = nullptr;
+            ObVecIndexAsyncTaskKey key(tablet_id, OB_VECTOR_ASYNC_INDEX_MERGE);
+            common::ObSpinLockGuard map_guard(index_ls_mgr->task_ctx_lock_);
+            if (OB_TMP_FAIL(task_opt.get_async_task_map().get_refactored(key, waiting_ctx))) {
+              LOG_WARN("get waiting merge task failed", K(tmp_ret), K(key));
+            } else if (OB_ISNULL(waiting_ctx)) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("waiting merge task is null", K(ret), K(key));
+            } else {
+              common::ObSpinLockGuard ctx_guard(waiting_ctx->lock_);
+              if (!waiting_ctx->in_thread_pool_
+                  && waiting_ctx->task_status_.status_ == OB_VECTOR_ASYNC_TASK_PREPARE
+                  && waiting_ctx->task_status_.trigger_type_ == OB_VEC_TRIGGER_AUTO) {
+                waiting_ctx->task_status_.task_info_.task_estimate_memory_ = estimate_mem;
+              }
+            }
           }
         }
         if (OB_NOT_NULL(task_ctx) && (!OB_SUCC(ret) || !inc_new_task)) { // release memory when fail
@@ -297,7 +319,15 @@ int ObVecIdxMergeTask::do_work()
     ret = OB_ERR_NULL_VALUE;
     LOG_WARN("get invalid vector index ls mgr", KR(ret), K(tenant_id_), K(ls_id_));
   } else if (ctx_->task_status_.task_type_ == OB_VECTOR_ASYNC_INDEX_MERGE) {
-    if (OB_FAIL(process_merge())) {
+    // Manual and resumed tasks may bypass executor admission checks.
+    uint64_t tenant_data_version = 0;
+    if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id_, tenant_data_version))) {
+      LOG_WARN("get tenant data version before merge failed", K(ret), K(tenant_id_));
+    } else if (tenant_data_version < DATA_VERSION_4_6_3_1) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("vector index merge requires data version 4_6_3_1",
+          K(ret), K(tenant_id_), K(tenant_data_version), KPC(ctx_));
+    } else if (OB_FAIL(process_merge())) {
       LOG_WARN("fail to process merge", K(ret), KPC(ctx_));
     }
   } else {
@@ -325,37 +355,6 @@ bool ObVecIdxMergeTask::is_alter_param_child() const
       && ctx_->task_status_.task_info_.alter_param_info_.is_child_valid();
 }
 
-struct ObVIMergeSortItem {
-  ObVIMergeSortItem():
-    vid_bound_(), vec_cnt_(0), mem_size_(0), scn_(0), seg_meta_(nullptr), has_quantization_(false)
-  {}
-
-  TO_STRING_KV(K_(vid_bound), K_(vec_cnt), K_(mem_size), K_(scn), KP_(seg_meta), K_(has_quantization))
-
-  ObVidBound vid_bound_;
-  int64_t vec_cnt_;
-  int64_t mem_size_;
-  int64_t scn_;
-  const ObVectorIndexSegmentMeta *seg_meta_;
-  bool has_quantization_;  // whether this segment has quantization
-};
-
-struct ObVIMergeSortItemCompartor
-{
-  bool operator()(const ObVIMergeSortItem &lhs, const ObVIMergeSortItem &rhs) const
-  {
-    bool res = false;
-    if (lhs.vid_bound_.min_vid_ < rhs.vid_bound_.min_vid_) {
-      res = true;
-    } else if (lhs.vid_bound_.min_vid_ > rhs.vid_bound_.min_vid_) {
-      res = false;
-    } else {
-      res = lhs.scn_ < rhs.scn_;
-    }
-    return res;
-  }
-};
-
 int extract_segment_scn(const ObVectorIndexSegmentMeta &seg_meta, ObString &scn_str)
 {
   int ret = OB_SUCCESS;
@@ -369,195 +368,103 @@ int extract_segment_scn(const ObVectorIndexSegmentMeta &seg_meta, ObString &scn_
   return ret;
 }
 
-int ObVecIdxMergeTask::prepare_merge_segment(const ObVecIdxSnapshotDataHandle& old_snap_data)
+int ObVecIdxMergeTask::prepare_async_merge_input()
 {
   int ret = OB_SUCCESS;
-  ObSharedMemAllocMgr *shared_mem_mgr = MTL(ObSharedMemAllocMgr*);
-  ObTenantVectorAllocator& vector_allocator = shared_mem_mgr->vector_allocator();
-  const int64_t base_count = old_snap_data->meta_.bases_.count();
-  const int64_t incr_count = old_snap_data->meta_.incrs_.count();
-  int64_t total_incr_mem = 0;
-  int64_t total_base_mem = 0;
-  int64_t total_incr_vec_cnt = 0;
-  int64_t total_base_vec_cnt = 0;
-  bool start_from_base = false;
-  int64_t merge_start_idx = -1;
-  int64_t merge_end_idx = -1;
-  int64_t merge_seg_cnt = 0;
+  ObSchemaGetterGuard schema_guard;
+  const ObTableSchema *data_schema = nullptr;
+  storage::ObAsyncIndexService *service = MTL(storage::ObAsyncIndexService *);
+  SCN published_scn;
+  bool has_target = false;
+  merge_policy_input_.has_async_index_ = false;
+  merge_policy_input_.async_published_scn_ = 0;
+  if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(tenant_id_, schema_guard))) {
+    LOG_WARN("get merge schema guard failed", K(ret));
+  } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id_, old_adapter_->get_data_table_id(), data_schema))) {
+    LOG_WARN("get merge data schema failed", K(ret));
+  } else if (OB_ISNULL(data_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+    LOG_WARN("merge data schema is null", K(ret));
+  } else if (!data_schema->has_async_index()) {
+  } else if (OB_ISNULL(service)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("async index service is null", K(ret));
+  } else {
+    merge_policy_input_.has_async_index_ = true;
+    if (OB_FAIL(service->get_refresher().get_dep_provider().get_partition_min_async_published_scn(
+        tenant_id_, ctx_->get_ls(), old_adapter_->get_data_table_id(),
+        old_adapter_->get_data_tablet_id(), has_target, published_scn))) {
+      LOG_WARN("get merge async published scn failed", K(ret));
+    } else if (has_target) {
+      merge_policy_input_.async_published_scn_ = published_scn.get_val_for_inner_table_field();
+    }
+    // A building target can become available with an older publication point.
+    // Keep whitelists until all async targets have completed publication.
+    const ObIArray<ObAuxTableMetaInfo> &indexes = data_schema->get_simple_index_infos();
+    for (int64_t i = 0; OB_SUCC(ret) && i < indexes.count(); ++i) {
+      const ObTableSchema *index_schema = nullptr;
+      if (!schema::is_async_index(indexes.at(i).index_type_)) {
+      } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id_, indexes.at(i).table_id_, index_schema))) {
+        LOG_WARN("get async merge target schema failed", K(ret));
+      } else if (OB_ISNULL(index_schema)) {
+        ret = OB_SCHEMA_EAGAIN;
+        LOG_WARN("async merge target schema is missing", K(ret));
+      } else if (index_schema->get_index_status() != INDEX_STATUS_AVAILABLE) {
+        merge_policy_input_.async_published_scn_ = 0;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObVecIdxMergeTask::prepare_merge_segment()
+{
+  int ret = OB_SUCCESS;
+  const int64_t base_count = merge_source_meta_.bases_.count();
+  const bool reserve_memory = !is_alter_param_child();
   int64_t merge_mem = 0;
-  int64_t merge_vec_cnt = 0;
-  int64_t avail_merge_mem = vector_allocator.get_left_pre_alloc_size();
-  ObSEArray<ObVIMergeSortItem, 10> items;
-  for (int64_t i = 0; OB_SUCC(ret) && i < incr_count; ++i) {
-    ObVIMergeSortItem item;
-    const ObVectorIndexSegmentMeta &seg_meta = old_snap_data->meta_.incrs_.at(i);
-    item.seg_meta_ = &seg_meta;
-    item.has_quantization_ = seg_meta.has_quantization();
-    item.scn_ = seg_meta.scn_;
-    if (! seg_meta.segment_handle_.is_valid()) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("segment is invalid", K(ret), K(i), K(seg_meta), K(old_snap_data));
-    } else if (OB_FAIL(seg_meta.segment_handle_->get_vid_bound(item.vid_bound_.min_vid_, item.vid_bound_.max_vid_))) {
-      LOG_WARN("get vid bound fail", K(ret), K(seg_meta));
-    } else if (OB_FAIL(seg_meta.segment_handle_->get_index_number(item.vec_cnt_))) {
-      LOG_WARN("get index number fail", K(ret), K(seg_meta));
-    } else if (OB_FALSE_IT(item.mem_size_ = seg_meta.segment_handle_->get_mem_hold())) {
-    } else if (OB_FAIL(items.push_back(item))) {
-      LOG_WARN("push back item fail", K(ret), K(item), K(seg_meta));
-    } else {
-      total_incr_mem += item.mem_size_;
-      total_incr_vec_cnt += item.vec_cnt_;
-    }
-  }
-  for (int64_t i = 0; OB_SUCC(ret) && i < base_count; ++i) {
-    const ObVectorIndexSegmentMeta &seg_meta = old_snap_data->meta_.bases_.at(i);
-    int64_t vec_cnt = 0;
-    if (! seg_meta.segment_handle_.is_valid()) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("segment is invalid", K(ret), K(i), K(seg_meta), K(old_snap_data));
-    } else if (OB_FAIL(seg_meta.segment_handle_->get_index_number(vec_cnt))) {
-      LOG_WARN("get index number fail", K(ret), K(seg_meta));
-    } else {
-      total_base_mem += seg_meta.segment_handle_->get_mem_hold();
-      total_base_vec_cnt += vec_cnt;
-    }
-  }
-  if (OB_FAIL(ret)) {
-  } else if (incr_count != items.count()) {
+  merge_segments_.reuse();
+  min_vid_ = INT64_MAX;
+  max_vid_ = 0;
+  filter_sql_str_.reset();
+  if (merge_plan_.begin_ < 0 || merge_plan_.end_ <= merge_plan_.begin_
+      || merge_plan_.end_ > merge_source_meta_.segment_count()) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("incr count is not equal to items count", K(ret), K(incr_count), K(items.count()));
-  } else if (incr_count <= 0) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("not incr segment", K(ret), K(old_snap_data), K(incr_count));
-  } else if (1 == incr_count ||  (can_merge_from_base_ && 0 == base_count)) {
-    if (! can_merge_from_base_) {
-      ret = OB_EAGAIN;
-      LOG_WARN("incr bitmap is not complete, need to wait", K(ret), K(old_snap_data));
-    } else {
-      if (incr_count > 1) {
-        lib::ob_sort(items.begin(), items.end(), ObVIMergeSortItemCompartor());
-        LOG_INFO("sort items for merge from base without in-memory base", K(items.count()), K(incr_count));
-      }
-      if (OB_SUCC(ret)) {
-        merge_start_idx = 0;
-        merge_end_idx = incr_count;
-        merge_seg_cnt = base_count + incr_count;
-        merge_vec_cnt = total_base_vec_cnt + total_incr_vec_cnt;
-        merge_mem = total_base_mem + total_incr_mem;
-        start_from_base = true;
-      }
-    }
-    LOG_INFO("merge from base", K(ret), K(incr_count), K(base_count), K(merge_seg_cnt),
-        K(merge_vec_cnt), K(total_base_vec_cnt), K(total_incr_vec_cnt),
-        K(merge_mem), K(total_base_mem), K(total_incr_mem),
-        K(start_from_base), K(merge_start_idx), K(merge_end_idx));
+    LOG_WARN("invalid checked merge plan", K(ret), K(merge_plan_), K(merge_source_meta_));
   } else {
-    // merge all incr when multiple incr segments
-    lib::ob_sort(items.begin(), items.end(), ObVIMergeSortItemCompartor());
-    LOG_INFO("sort items", K(items.count()), K(base_count), K(incr_count));
-    merge_start_idx = 0;
-    merge_end_idx = incr_count;
-    merge_seg_cnt = incr_count;
-    merge_vec_cnt = total_incr_vec_cnt;
-    merge_mem = total_incr_mem;
-    LOG_INFO("merge incr segments", K(incr_count), K(base_count), K(merge_seg_cnt),
-        K(merge_vec_cnt), K(total_base_vec_cnt), K(total_incr_vec_cnt),
-        K(merge_mem), K(total_base_mem), K(total_incr_mem),
-        K(start_from_base), K(merge_start_idx), K(merge_end_idx));
-  }
-  LOG_INFO("prepare merge info", 
-      K(ret), K(avail_merge_mem), K(incr_count), K(base_count), K(merge_seg_cnt), 
-      K(merge_vec_cnt), K(total_base_vec_cnt), K(total_incr_vec_cnt),
-      K(merge_mem), K(total_base_mem), K(total_incr_mem),
-      K(start_from_base), K(merge_start_idx), K(merge_end_idx));
-
-  if (OB_FAIL(ret)) {
-  } else if (merge_start_idx < 0) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("failed to find merge starting point", K(ret), K(items.count()), K(merge_start_idx));
-  } else if (merge_seg_cnt < 2) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("no enough segmetn for merge", K(ret), K(items.count()), K(merge_seg_cnt));
-  } else if (OB_FAIL(vector_allocator.pre_alloc(merge_mem))) {
-    LOG_WARN("fail to pre alloc", K(ret), K(merge_mem));
-  } else if (OB_FALSE_IT(pre_alloc_size_ = merge_mem)) {
-  } else {
-    if (start_from_base && merge_start_idx != 0) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("not merge from incr start", K(ret), K(start_from_base), K(merge_start_idx));
-    } else if (start_from_base) {
-      merge_from_base_ = true;
-      for (int64_t i = 0; OB_SUCC(ret) && i < base_count; ++i) {
-        const ObVectorIndexSegmentMeta &seg_meta = old_snap_data->meta_.bases_.at(i);
-        if (OB_FAIL(merge_segments_.push_back(&seg_meta))) {
-          LOG_WARN("push segment fail", K(ret), K(i), K(seg_meta));
-        }
+    merge_from_base_ = merge_plan_.output_base_;
+    for (int64_t i = merge_plan_.begin_; OB_SUCC(ret) && i < merge_plan_.end_; ++i) {
+      const ObVectorIndexSegmentMeta &meta = i < base_count ? merge_source_meta_.bases_.at(i)
+          : merge_source_meta_.incrs_.at(i - base_count);
+      if (!meta.segment_handle_.is_valid() || !meta.segment_handle_->is_inited()
+          || meta.scn_ > ctx_->task_status_.target_scn_.get_val_for_inner_table_field()) {
+        ret = OB_EAGAIN;
+        LOG_INFO("merge source is not ready for target snapshot", K(ret), K(i), K(meta),
+            "target_scn", ctx_->task_status_.target_scn_);
+      } else if (OB_FAIL(merge_segments_.push_back(&meta))) {
+        LOG_WARN("save merge source failed", K(ret), K(i));
       }
     }
-    for (int64_t i = merge_start_idx; OB_SUCC(ret) && i < merge_end_idx; ++i) {
-      const ObVIMergeSortItem &cur_item = items.at(i);
-      if (OB_FAIL(merge_segments_.push_back(cur_item.seg_meta_))) {
-        LOG_WARN("push segment fail", K(ret), K(i), K(cur_item));
-      }
+    if (OB_SUCC(ret) && reserve_memory
+        && OB_FAIL(ObVecIndexAsyncTaskUtil::estimate_merge_memory(ctx_,
+            merge_policy_input_, merge_plan_, merge_mem, old_adapter_))) {
+      LOG_WARN("estimate execution merge plan memory failed", K(ret), K(merge_plan_));
     }
-    if (OB_SUCC(ret) && 0 == base_count && ! merge_from_base_) {
-      roaring::api::roaring64_bitmap_t *merged_vbitmap = nullptr;
-      roaring::api::roaring64_bitmap_t *merged_ibitmap = nullptr;
+    if (OB_SUCC(ret) && reserve_memory) {
+      // Same model as load-time admission, using the actual execution window.
+      // ALTER retains its existing estimate and scheduler admission.
       {
-        lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(tenant_id_, "VIMergeBmap"));
-        ROARING_TRY_CATCH(merged_vbitmap = roaring::api::roaring64_bitmap_create());
-        ROARING_TRY_CATCH(merged_ibitmap = roaring::api::roaring64_bitmap_create());
+        common::ObSpinLockGuard guard(ctx_->lock_);
+        ctx_->task_status_.task_info_.task_estimate_memory_ = merge_mem;
       }
-      if (OB_FAIL(ret)) {
-      } else if (OB_ISNULL(merged_vbitmap) || OB_ISNULL(merged_ibitmap)) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("failed to create merged bitmap", K(ret), K(tenant_id_), KP(merged_vbitmap), KP(merged_ibitmap));
+      if (OB_FAIL(MTL(ObSharedMemAllocMgr*)->vector_allocator().pre_alloc(merge_mem))) {
+        LOG_WARN("reserve selected merge memory failed", K(ret), K(merge_mem), K(merge_plan_));
       } else {
-        for (int64_t i = 0; OB_SUCC(ret) && i < merge_segments_.count(); ++i) {
-          const ObVectorIndexSegmentMeta *seg_meta = merge_segments_.at(i);
-          const ObVectorIndexSegmentHandle &handle = seg_meta->segment_handle_;
-          if (! handle.is_valid()) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("segment handle is invalid", K(ret), K(i), KPC(seg_meta));
-          } else if (OB_NOT_NULL(handle->vbitmap_)) {
-            if (OB_NOT_NULL(handle->vbitmap_->insert_bitmap_)) {
-              ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(merged_vbitmap, handle->vbitmap_->insert_bitmap_));
-            }
-          }
-          if (OB_SUCC(ret) && OB_NOT_NULL(handle->ibitmap_)) {
-            if (OB_NOT_NULL(handle->ibitmap_->insert_bitmap_)) {
-              ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(merged_ibitmap, handle->ibitmap_->insert_bitmap_));
-            }
-          }
-        }
-      }
-
-      if (OB_SUCC(ret)) {
-        // delete semantic is already applied to ibitmap.insert_bitmap_,
-        // so diff only needs to compare merged insert sets.
-        lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(tenant_id_, "VIMergeBmap"));
-        uint64_t diff_cnt = roaring64_bitmap_xor_cardinality(merged_ibitmap, merged_vbitmap);
-        if (0 == diff_cnt) {
-          merge_from_base_ = true;
-          LOG_INFO("diff is empty, merge from base", K(ret), K(diff_cnt));
-        } else {
-          LOG_INFO("diff is not empty, merge from incr", K(ret), K(diff_cnt));
-        }
-      }
-
-      if (OB_NOT_NULL(merged_vbitmap)) {
-        lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(tenant_id_, "VIMergeBmap"));
-        roaring64_bitmap_free(merged_vbitmap);
-        merged_vbitmap = nullptr;
-      }
-      if (OB_NOT_NULL(merged_ibitmap)) {
-        lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(tenant_id_, "VIMergeBmap"));
-        roaring64_bitmap_free(merged_ibitmap);
-        merged_ibitmap = nullptr;
+        pre_alloc_size_ = merge_mem;
       }
     }
   }
-  LOG_INFO("merge segments prepared", K(ret), K(avail_merge_mem), K(can_merge_from_base_), K(merge_from_base_), K(merge_segments_.count()), K(merge_segments_));
+  LOG_INFO("merge plan prepared", K(ret), K(merge_plan_), K(merge_mem));
   return ret;
 }
 
@@ -573,29 +480,40 @@ int ObVecIdxMergeTask::update_task_merge_segments_info() {
       LOG_WARN("push_back merge_segments fail", K(ret), K(seg_info));
     }
   }
+  if (OB_SUCC(ret)) {
+    // Publish selected sources before the long-running merge. Do not overwrite
+    // a concurrent cancellation or fail the merge if this observability write fails.
+    ObSEArray<int64_t, 1> expected_running;
+    int tmp_ret = OB_SUCCESS;
+    if (OB_TMP_FAIL(expected_running.push_back(ObVecIndexAsyncTaskStatus::OB_VECTOR_ASYNC_TASK_RUNNING))) {
+      LOG_WARN("fail to prepare merge task info update", K(tmp_ret));
+    } else if (OB_TMP_FAIL(ObVecIndexAsyncTaskUtil::update_status_and_ret_code_if_match(
+                   ctx_, expected_running))) {
+      LOG_WARN("fail to publish merge task segment info", K(tmp_ret), KPC(ctx_));
+    }
+  }
   return ret;
 }
 
-int ObVecIdxMergeTask::update_task_result_segments_info(const ObVectorIndexSegmentMeta *new_meta) {
+int ObVecIdxMergeTask::update_task_result_segments_info()
+{
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(new_meta)) {
-    LOG_INFO("new_meta is null, so skip update task result segments info", K(ret));
-  } else {
-    const ObVecIdxSnapshotDataHandle& new_snap = new_adapter_->get_snap_data();
-    if (new_snap->meta_.bases_.count() == 1) {
-      ObVecIndexTaskSegInfo res_seg;
-      if (OB_FAIL(ObVecIndexAsyncTaskUtil::seg_meta_to_task_seg_info(*new_meta, ctx_->allocator_, res_seg))) {
-        LOG_WARN("seg_meta_to_task_seg_info res_seg fail", K(ret), K(new_snap));
+  const ObVecIdxSnapshotDataHandle &snap = new_adapter_->get_snap_data();
+  ctx_->task_status_.task_info_.res_segs_.reuse();
+  for (int64_t i = 0; OB_SUCC(ret) && i < snap->meta_.bases_.count(); ++i) {
+    ObVecIndexTaskSegInfo info;
+    if (OB_FAIL(ObVecIndexAsyncTaskUtil::seg_meta_to_task_seg_info(
+        snap->meta_.bases_.at(i), ctx_->allocator_, info))) {
+      LOG_WARN("get result segment info failed", K(ret), K(i));
+    } else {
+      if (info.vector_cnt_ < 0 && snap->meta_.bases_.count() == 1) {
+        info.vector_cnt_ = snap->last_res_seg_info_.vector_cnt_;
+        info.mem_used_ = snap->last_res_seg_info_.mem_used_;
+        info.min_vid_ = snap->last_res_seg_info_.min_vid_;
+        info.max_vid_ = snap->last_res_seg_info_.max_vid_;
       }
-      if (OB_SUCC(ret) && res_seg.vector_cnt_ < 0) {
-        // use last_res_seg_info_ from build_finished() when segment_handle_ may be invalid in same build_finished()
-        res_seg.vector_cnt_ = new_snap->last_res_seg_info_.vector_cnt_;
-        res_seg.mem_used_ = new_snap->last_res_seg_info_.mem_used_;
-        res_seg.min_vid_ = new_snap->last_res_seg_info_.min_vid_;
-        res_seg.max_vid_ = new_snap->last_res_seg_info_.max_vid_;
-        if (OB_FAIL(ctx_->task_status_.task_info_.res_segs_.push_back(res_seg))) {
-          LOG_WARN("push_back result_segments fail", K(ret), K(res_seg));
-        }
+      if (OB_FAIL(ctx_->task_status_.task_info_.res_segs_.push_back(info))) {
+        LOG_WARN("save result segment info failed", K(ret), K(i));
       }
     }
   }
@@ -698,19 +616,131 @@ int ObVecIdxMergeTask::build_filter_clause(const ObTableSchema &data_table_schem
   return ret;
 }
 
+int ObVecIdxMergeTask::collect_merge_deleted_vids()
+{
+  int ret = OB_SUCCESS;
+  lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(tenant_id_, "VIBitmap"));
+  merge_deleted_vids_valid_ = false;
+  merge_deleted_vids_.reset_bitmap();
+  ObVectorIndexRoaringBitMap deleted(&allocator_, tenant_id_);
+  roaring::api::roaring64_iterator_t *iter = nullptr;
+  if (OB_FAIL(deleted.init(false, true)) || OB_FAIL(merge_deleted_vids_.init(false, true))) {
+    LOG_WARN("allocate merge deletion candidates failed", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < merge_source_meta_.segment_count(); ++i) {
+    const auto &meta = merge_source_meta_.flat_seg_meta_at(i);
+    const ObVectorIndexRoaringBitMap *bitmap = meta.vbitmap_;
+    if (!meta.segment_handle_.is_valid() || !meta.segment_handle_->is_inited()) {
+      ret = OB_NOT_INIT;
+    } else if (OB_NOT_NULL(bitmap) && OB_NOT_NULL(bitmap->delete_bitmap_)) {
+      ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(deleted.delete_bitmap_, bitmap->delete_bitmap_));
+      if (OB_FAIL(ret)) {
+        LOG_WARN("collect persistent deletion candidates failed", K(ret), K(meta));
+      }
+    }
+  }
+  ObVecIdxVBitmapDataHandle bitmaps[2];
+  if (OB_SUCC(ret)) {
+    const auto &frozen = old_adapter_->get_frozen_data();
+    if (frozen.is_valid()) {
+      TCRLockGuard guard(frozen->mem_data_rwlock_);
+      bitmaps[0] = old_adapter_->get_vbitmap_data();
+      if (frozen->has_frozen()) { bitmaps[1] = frozen->vbitmap_; }
+    } else {
+      bitmaps[0] = old_adapter_->get_vbitmap_data();
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < 2; ++i) {
+    if (bitmaps[i].is_valid()) {
+      TCRLockGuard guard(bitmaps[i]->bitmap_rwlock_);
+      if (OB_NOT_NULL(bitmaps[i]->bitmap_) && OB_NOT_NULL(bitmaps[i]->bitmap_->delete_bitmap_)) {
+        ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(deleted.delete_bitmap_, bitmaps[i]->bitmap_->delete_bitmap_));
+      }
+      if (OB_FAIL(ret)) {
+        LOG_WARN("collect in-memory deletion candidates failed", K(ret));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ROARING_TRY_CATCH(iter = roaring64_iterator_create(deleted.delete_bitmap_));
+    if (OB_SUCC(ret) && OB_ISNULL(iter)) { ret = OB_ALLOCATE_MEMORY_FAILED; }
+  }
+  while (OB_SUCC(ret) && roaring64_iterator_has_value(iter)) {
+    CHECK_TASK_CANCELLED(ret, ctx_);
+    const uint64_t vid = roaring64_iterator_value(iter);
+    bool selected = false;
+    bool retained = false;
+    for (int64_t i = merge_plan_.begin_; OB_SUCC(ret) && !selected && i < merge_plan_.end_; ++i) {
+      ret = merge_source_meta_.flat_seg_meta_at(i).segment_handle_->check_id_exist(vid, selected);
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && selected && !retained
+        && i < merge_source_meta_.segment_count(); ++i) {
+      if (i < merge_plan_.begin_ || i >= merge_plan_.end_) {
+        ret = merge_source_meta_.flat_seg_meta_at(i).segment_handle_->check_id_exist(vid, retained);
+      }
+    }
+    if (OB_SUCC(ret) && selected && !retained) {
+      ROARING_TRY_CATCH(roaring64_bitmap_add(merge_deleted_vids_.delete_bitmap_, vid));
+    }
+    roaring64_iterator_advance(iter);
+  }
+  if (OB_NOT_NULL(iter)) { roaring64_iterator_free(iter); }
+  deleted.reset_bitmap();
+  if (OB_SUCC(ret)) {
+    merge_deleted_vids_valid_ = true;
+    LOG_INFO("collected merge deleted VIDs", K(merge_plan_),
+        "candidate_count", roaring64_bitmap_get_cardinality(merge_deleted_vids_.delete_bitmap_));
+  } else {
+    merge_deleted_vids_.reset_bitmap();
+    if (ret == OB_ALLOCATE_MEMORY_FAILED || ret == OB_NOT_INIT || ret == OB_EAGAIN) {
+      LOG_INFO("skip optional merge bitmap pruning", K(ret));
+      ret = OB_SUCCESS;
+    }
+  }
+  return ret;
+}
+
+int ObVecIdxMergeTask::filter_reclaimed_vids()
+{
+  int ret = OB_SUCCESS;
+  lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(tenant_id_, "VIBitmap"));
+  const auto &outputs = new_adapter_->get_snap_data()->meta_;
+  for (int64_t i = 0; OB_SUCC(ret) && merge_deleted_vids_valid_ && i < outputs.segment_count(); ++i) {
+    const auto &handle = outputs.flat_seg_meta_at(i).segment_handle_;
+    if (!handle.is_valid()) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_ISNULL(handle->ibitmap_) || OB_ISNULL(handle->ibitmap_->insert_bitmap_)) {
+      merge_deleted_vids_valid_ = false;
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && merge_deleted_vids_valid_ && i < outputs.segment_count(); ++i) {
+    CHECK_TASK_CANCELLED(ret, ctx_);
+    if (OB_SUCC(ret)) {
+      ROARING_TRY_CATCH(roaring64_bitmap_andnot_inplace(merge_deleted_vids_.delete_bitmap_,
+          outputs.flat_seg_meta_at(i).segment_handle_->ibitmap_->insert_bitmap_));
+    }
+  }
+  if (OB_SUCC(ret) && merge_deleted_vids_valid_) {
+    LOG_INFO("filtered reclaimed merge VIDs",
+        "reclaimed_count", roaring64_bitmap_get_cardinality(merge_deleted_vids_.delete_bitmap_));
+  }
+  return ret;
+}
+
 int ObVecIdxMergeTask::merge_bitmap(ObPluginVectorIndexAdaptor *adaptor)
 {
   int ret = OB_SUCCESS;
   ObVectorIndexSegmentBuilder* segment_builder = nullptr;
   ObVectorIndexRoaringBitMap *ibitmap = nullptr;
   ObVectorIndexRoaringBitMap *vbitmap = nullptr;
+  bool need_bitmap = merge_plan_.strategy_ != ObVecMergePlan::FULL_MERGE;
   if (OB_ISNULL(adaptor)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("adaptor is null", K(ret));
   } else if (merge_segments_.empty()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("merge_segments is empty", K(ret));
-  } else if (OB_FAIL(adaptor->init_snap_data_for_build(! merge_from_base_))) {
+  } else if (OB_FAIL(adaptor->init_snap_data_for_build(need_bitmap))) {
     LOG_WARN("init segment builder fail", K(ret), KPC(adaptor));
   } else if (OB_ISNULL(segment_builder = adaptor->get_snap_data()->builder_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -733,9 +763,9 @@ int ObVecIdxMergeTask::merge_bitmap(ObPluginVectorIndexAdaptor *adaptor)
     }
   }
   if (OB_FAIL(ret)) {
-  } else if (merge_from_base_) {
-    LOG_INFO("is merge from base, so no need to merge bitmap", KPC(segment_builder));
-  } else if (OB_FALSE_IT(segment_builder->seg_type_ = ObVectorIndexSegmentType::INCR_MERGE)) {
+  } else if (OB_FALSE_IT(segment_builder->seg_type_ = merge_plan_.output_type_)) {
+  } else if (!need_bitmap) {
+    LOG_INFO("full BASE merge does not need output bitmaps", K(merge_plan_));
   } else if (OB_ISNULL(ibitmap = segment_builder->ibitmap_) || OB_ISNULL(vbitmap = segment_builder->vbitmap_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ibitmap or vbitmap is null", K(ret), KP(ibitmap), KP(vbitmap));
@@ -749,16 +779,16 @@ int ObVecIdxMergeTask::merge_bitmap(ObPluginVectorIndexAdaptor *adaptor)
     lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(tenant_id_, "VIBitmap"));
     for (int64_t i = 0; OB_SUCC(ret) && i < merge_segments_.count(); ++i) {
       const ObVectorIndexSegmentMeta *seg_meta = merge_segments_.at(i);
-      const ObVectorIndexSegmentHandle &handle = seg_meta->segment_handle_;
-      if (! handle.is_valid()) {
+      const ObVectorIndexRoaringBitMap *bitmap = seg_meta->vbitmap_;
+      if (!seg_meta->segment_handle_.is_valid()) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("segment handle is invalid", K(ret), K(i), KPC(seg_meta));
-      } else if (OB_SUCC(ret) && OB_NOT_NULL(handle->vbitmap_)) {
-        if (OB_NOT_NULL(handle->vbitmap_->insert_bitmap_)) {
-          ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(vbitmap->insert_bitmap_, handle->vbitmap_->insert_bitmap_));
+      } else if (OB_SUCC(ret) && OB_NOT_NULL(bitmap)) {
+        if (OB_NOT_NULL(bitmap->insert_bitmap_)) {
+          ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(vbitmap->insert_bitmap_, bitmap->insert_bitmap_));
         }
-        if (OB_SUCC(ret) && OB_NOT_NULL(handle->vbitmap_->delete_bitmap_)) {
-          ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(vbitmap->delete_bitmap_, handle->vbitmap_->delete_bitmap_));
+        if (OB_SUCC(ret) && OB_NOT_NULL(bitmap->delete_bitmap_)) {
+          ROARING_TRY_CATCH(roaring64_bitmap_or_inplace(vbitmap->delete_bitmap_, bitmap->delete_bitmap_));
         }
       }
     }
@@ -828,31 +858,10 @@ int ObVecIdxMergeTask::process_merge()
     LOG_INFO("[VECTOR INDEX MERGE] process merge success", K(ret), KP(adpt_guard.get_adatper()));
   }
 
-  return ret;
-}
-
-int ObVecIdxMergeTask::check_delta_table_empty(
-    ObPluginVectorIndexAdaptor *adapter,
-    const share::SCN &check_scn,
-    bool &is_empty)
-{
-  int ret = OB_SUCCESS;
-  is_empty = false;
-  if (OB_ISNULL(adapter)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("adapter is null", K(ret));
-  } else if (!adapter->is_inc_tablet_valid() || !adapter->is_vbitmap_tablet_valid()) {
-    LOG_TRACE("[VECTOR INDEX MERGE] skip delta table empty check, tablet invalid", KPC(adapter));
-  } else {
-    ObVectorIndexDeltaTableHandler delta_handler(adapter->get_tenant_id());
-    if (OB_FAIL(delta_handler.init(adapter, ls_id_, adapter->get_data_table_id(),
-            adapter->get_inc_table_id(), adapter->get_vbitmap_table_id(),
-            adapter->get_inc_tablet_id(), adapter->get_vbitmap_tablet_id(), check_scn))) {
-      LOG_WARN("init delta table handler for merge check failed", K(ret), KPC(adapter));
-    } else if (OB_FAIL(delta_handler.check_delta_table_empty(is_empty))) {
-      LOG_WARN("check_delta_table_empty failed", K(ret), KPC(adapter));
-    }
-  }
+  // Segment allocators belong to the source adaptor protected by adpt_guard.
+  merge_segments_.reuse();
+  merge_source_meta_.release();
+  merge_policy_input_.segments_.reuse();
   return ret;
 }
 
@@ -879,47 +888,6 @@ int ObVecIdxMergeTask::check_active_segment_param(
     } else if (OB_FAIL(ObVectorIndexUtil::check_build_params_equal(
         incr_data->segment_handle_->get_index_param(), target_param, equal))) {
       LOG_WARN("failed to compare active segment param", K(ret), KPC(&adaptor));
-    }
-  }
-  return ret;
-}
-
-int ObVecIdxMergeTask::prepare_alter_param_full_merge(ObPluginVectorIndexAdaptor &adaptor)
-{
-  int ret = OB_SUCCESS;
-  merge_segments_.reset();
-  merge_from_base_ = true;
-  min_vid_ = INT64_MAX;
-  max_vid_ = 0;
-  filter_sql_str_.reset();
-  const ObVecIdxSnapshotDataHandle &snap_data = adaptor.get_snap_data();
-  if (!snap_data.is_valid() || !snap_data->is_inited()) {
-    LOG_INFO("snapshot data is not init, no need to merge", K(ret), KPC(&adaptor));
-  } else {
-    TCRLockGuard lock_guard(snap_data->mem_data_rwlock_);
-    for (int64_t i = 0; OB_SUCC(ret) && i < snap_data->meta_.bases_.count(); ++i) {
-      if (OB_FAIL(merge_segments_.push_back(&snap_data->meta_.bases_.at(i)))) {
-        LOG_WARN("failed to add base segment", K(ret), K(i));
-      }
-    }
-    for (int64_t i = 0; OB_SUCC(ret) && i < snap_data->meta_.incrs_.count(); ++i) {
-      if (OB_FAIL(merge_segments_.push_back(&snap_data->meta_.incrs_.at(i)))) {
-        LOG_WARN("failed to add incr segment", K(ret), K(i));
-      }
-    }
-    for (int64_t i = 0; OB_SUCC(ret) && i < merge_segments_.count(); ++i) {
-      int64_t seg_min_vid = INT64_MAX;
-      int64_t seg_max_vid = 0;
-      if (!merge_segments_.at(i)->segment_handle_.is_valid()) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("merge segment is invalid", K(ret), K(i), KPC(merge_segments_.at(i)));
-      } else if (OB_FAIL(merge_segments_.at(i)->segment_handle_->get_vid_bound(
-          seg_min_vid, seg_max_vid))) {
-        LOG_WARN("failed to get segment vid bound", K(ret), K(i));
-      } else {
-        min_vid_ = std::min(min_vid_, seg_min_vid);
-        max_vid_ = std::max(max_vid_, seg_max_vid);
-      }
     }
   }
   return ret;
@@ -953,12 +921,6 @@ int ObVecIdxMergeTask::prepare_alter_param_merge(
     LOG_WARN("failed to check alter param merge", K(ret), KPC(&current_adaptor));
   } else if (!need_alter_param_merge) {
     LOG_INFO("alter param merge is already complete", KPC(ctx_));
-  } else if (OB_FAIL(prepare_alter_param_full_merge(current_adaptor))) {
-    LOG_WARN("failed to prepare alter param full merge", K(ret), KPC(ctx_));
-  } else if (merge_segments_.empty()) {
-    ret = OB_EAGAIN;
-    LOG_INFO("no persistent segment for alter param merge, wait for freeze convergence",
-             KR(ret), KPC(&current_adaptor));
   }
   return ret;
 }
@@ -999,40 +961,37 @@ int ObVecIdxMergeTask::check_and_merge(ObPluginVectorIndexAdapterGuard &adpt_gua
   }
   CHECK_TASK_CANCELLED(ret, ctx_);
   if (OB_FAIL(ret)) {
-  } else if (is_alter_param) {
-    // skip check_need_merge
-  } else if (!is_alter_param && OB_FAIL(adpt_guard.get_adatper()->check_need_merge(1/*merge_base_percentage*/, need_merge))) {
-    LOG_WARN("check need merge", K(ret), KPC(adpt_guard.get_adatper()));
-  } else if (need_merge) {
-    ObPluginVectorIndexAdaptor *adapter = adpt_guard.get_adatper();
-    const ObVecIdxSnapshotDataHandle &snap_data = adapter->get_snap_data();
-    bool delta_table_empty = false;
-    if (snap_data.is_valid() && snap_data->is_inited()) {
-      if (snap_data->check_incr_can_merge_base()) {
-        can_merge_from_base_ = true;
-      } else if (snap_data->meta_.incrs_.count() != 1 && snap_data->meta_.bases_.count() > 0) {
-      } else if (! ctx_->task_status_.target_scn_.is_valid()) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("target scn is not valid", K(ret), K(ctx_->task_status_.target_scn_), KPC(adapter));
-      } else if (OB_FAIL(check_delta_table_empty(adapter, ctx_->task_status_.target_scn_, delta_table_empty))) {
-        LOG_WARN("check delta table empty failed", K(ret), K(ctx_->task_status_.target_scn_), KPC(adapter));
-      } else if (delta_table_empty) {
-        can_merge_from_base_ = true;
-        LOG_INFO("[VECTOR INDEX MERGE] incr bitmap incomplete but delta table empty, can merge from base", KPC(adapter));
-      } else if (snap_data->meta_.incrs_.count() <= 1) {
-        need_merge = false;
-        adapter->set_skip_merge_sched();
-        LOG_INFO("[VECTOR INDEX MERGE] incr bitmap incomplete but delta table not empty, need to wait", KPC(adapter));
+  } else if (is_alter_param && !need_alter_param_merge) {
+  } else {
+    const ObVecIndexAsyncTaskTriggerType trigger = static_cast<ObVecIndexAsyncTaskTriggerType>(
+        ctx_->task_status_.trigger_type_);
+    const bool is_full_merge = trigger == OB_VEC_TRIGGER_ALTER_INDEX_PARAM;
+    // Retain one source snapshot and plan for both full and ordinary merges.
+    int tmp_ret = OB_SUCCESS;
+    if (!is_full_merge && OB_TMP_FAIL(old_adapter_->refresh_segment_delete_counts(ctx_))) {
+      LOG_WARN("refresh segment delete counts failed", K(tmp_ret));
+    }
+    CHECK_TASK_CANCELLED(ret, ctx_);
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(old_adapter_->prepare_merge_policy_input(
+        merge_source_meta_, merge_policy_input_, merge_config_, is_full_merge))) {
+      LOG_WARN("prepare merge policy input failed", K(ret));
+    } else if (!is_alter_param && OB_FAIL(prepare_async_merge_input())) {
+      LOG_WARN("prepare async merge visibility failed", K(ret));
+    } else if (OB_FAIL(ObVectorIndexMergePolicy(merge_config_).find_merge_segments(merge_policy_input_,
+        trigger, merge_plan_))) {
+      if (ret == OB_NO_NEED_MERGE) {
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("check merge plan failed", K(ret));
       }
+    } else {
+      need_merge = true;
     }
   }
   if (OB_FAIL(ret)) {
-  } else if (is_alter_param && !need_alter_param_merge) {
-    LOG_INFO("alter param merge is not needed, skip merge", KPC(ctx_));
-  } else if (!is_alter_param && !need_merge) {
-    ret = OB_EAGAIN;
-    LOG_WARN("snapshot data actually is not need to merge in task execution, so retry",
-             K(ret), KPC(adpt_guard.get_adatper()));
+  } else if (!need_merge) {
+    LOG_INFO("merge recheck has no plan, finish task", KPC(ctx_));
   } else if (OB_FAIL(execute_merge())) {
     LOG_WARN("merge incr fail", K(ret), KPC(ctx_));
   } else {
@@ -1047,6 +1006,14 @@ int ObVecIdxMergeTask::check_and_merge(ObPluginVectorIndexAdapterGuard &adpt_gua
                K(new_adapter->get_data_table_id()));
     } else if (OB_FAIL(execute_exchange())) {
       LOG_WARN("execute exchange fail", K(ret), KPC(ctx_));
+    } else {
+      ObPluginVectorIndexAdapterGuard current;
+      int tmp_ret = OB_SUCCESS;
+      if (OB_TMP_FAIL(vec_idx_mgr_->get_adapter_inst_guard(ctx_->task_status_.inc_tablet_id_, current))) {
+        LOG_WARN("get current adapter failed", K(tmp_ret));
+      } else if (OB_TMP_FAIL(current.get_adatper()->refresh_segment_delete_counts(ctx_))) {
+        LOG_WARN("refresh segment delete counts failed", K(tmp_ret));
+      }
     }
   }
 
@@ -1080,13 +1047,12 @@ int ObVecIdxMergeTask::execute_merge()
   int ret = OB_SUCCESS;
   const int64_t data_table_id = new_adapter_->get_data_table_id();
   const int64_t snapshot_table_id = new_adapter_->get_snapshot_table_id();
-  const ObVecIdxSnapshotDataHandle& old_snap_data = old_adapter_->get_snap_data();
   uint64_t data_schema_version = 0;
   bool is_user_hidden_table = false;
   bool is_need_padding = false;
   ObString partition_names;
-  if (!is_alter_param_child() && OB_FAIL(prepare_merge_segment(old_snap_data))) {
-    LOG_WARN("prepare merge segment fail", K(ret), K(old_snap_data));
+  if (OB_FAIL(prepare_merge_segment())) {
+    LOG_WARN("prepare merge segment fail", K(ret));
   } else if (OB_FAIL(update_task_merge_segments_info())) {
     LOG_WARN("prepare task segment info fail", K(ret));
   } else if (data_table_id == OB_INVALID_ID || snapshot_table_id == OB_INVALID_ID) {
@@ -1126,8 +1092,15 @@ int ObVecIdxMergeTask::execute_merge()
       }
     }
     if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(collect_merge_deleted_vids())) {
+      LOG_WARN("collect merge deleted VIDs failed", K(ret));
     } else if (OB_FAIL(merge_bitmap(new_adapter_))) {
       LOG_WARN("merge bitmap fail", K(ret));
+    } else if (merge_plan_.output_type_ == ObVectorIndexSegmentType::BASE
+        && (merge_plan_.strategy_ == ObVecMergePlan::MANUAL_MERGE
+            || merge_plan_.strategy_ == ObVecMergePlan::FULL_MERGE)
+        && OB_FAIL(new_adapter_->enable_merge_multi_segment(merge_config_.max_vectors_))) {
+      LOG_WARN("enable merge multi segment failed", K(ret));
     } else if (OB_FAIL(execute_insert(data_schema_version, is_user_hidden_table, is_need_padding, partition_names))) {
       LOG_WARN("fail to execute insert", K(ret), KPC(ctx_));
     }
@@ -1175,6 +1148,15 @@ int ObVecIdxMergeTask::serialize_and_insert_snap_index(
       LOG_WARN("get lob store column idx fail", K(ret));
     } else if (OB_FAIL(new_adapter_->serialize_snapshot(param, false/*skip_for_merge*/))) {
       LOG_WARN("serialize snapshot fail", K(ret));
+    } else if (new_adapter_->get_snap_data()->meta_.bases_.empty()
+        || (!new_adapter_->get_snap_data()->enable_multi_segment_
+            && new_adapter_->get_snap_data()->meta_.bases_.count() != 1)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid serialized merge result count", K(ret),
+          "multi_segment", new_adapter_->get_snap_data()->enable_multi_segment_,
+          "base_count", new_adapter_->get_snap_data()->meta_.bases_.count());
+    } else if (OB_FALSE_IT(new_adapter_->get_snap_data()->meta_.bases_.at(0).seg_type_ =
+        merge_plan_.output_type_)) {
     } else if (OB_FALSE_IT(index_type = new_adapter_->get_snap_index_type())) {
     } else if (OB_FAIL(snap_table_handler.insert_segment_data(
         write_ctx.vals_, tx_desc, snapshot, snapshot_version, index_type, timeout_us, ctx_))) {
@@ -1210,9 +1192,12 @@ int ObVecIdxMergeTask::execute_exchange()
       LOG_INFO("merge task canceled before serialize snapshot", K(ret), KPC(ctx_));
     } else if (OB_FAIL(serialize_and_insert_snap_index(tx_desc, snapshot, timeout_us))) {
       LOG_WARN("fail to serialize and insert snap index", K(ret), K(new_snap));
-    } else if (new_snap->meta_.bases_.count() > 1 || new_snap->meta_.incrs_.count() != 0) {
+    } else if ((!new_snap->enable_multi_segment_ && new_snap->meta_.bases_.count() > 1)
+        || new_snap->meta_.incrs_.count() != 0) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("new snap is incorrect", K(ret), K(new_snap));
+    } else if (merge_deleted_vids_valid_ && OB_FAIL(filter_reclaimed_vids())) {
+      LOG_WARN("filter reclaimed VIDs failed", K(ret));
     } else if (OB_FAIL(clean_snap_index_rows(tx_desc, snapshot, timeout_us))) {
       LOG_WARN("fail to delete inc index rows", K(ret), K(ctx_));
     }
@@ -1225,7 +1210,10 @@ int ObVecIdxMergeTask::execute_exchange()
     ObVectorIndexSegmentHandle bridge_segment;
     bool has_bridge = false;
     if (OB_FAIL(ret)) {
-    } else if (merge_from_base_ && ObVectorIndexSegmentMeta::is_snap_meta_supported(tenant_id_)) {
+    } else if (is_alter_param_child() && merge_from_base_
+        && new_snap->meta_.bases_.count() == 1
+        && old_adapter_->get_snap_data()->meta_.bases_.count() == 1
+        && ObVectorIndexSegmentMeta::is_snap_meta_supported(tenant_id_)) {
       bool has_base_seg = false;
       for (int64_t i = 0; OB_SUCC(ret) && i < merge_segments_.count(); ++i) {
         const ObVectorIndexSegmentMeta *seg_meta = merge_segments_.at(i);
@@ -1247,11 +1235,11 @@ int ObVecIdxMergeTask::execute_exchange()
         if (OB_FAIL(ObVectorIndexSegment::create_bitmap_only(
             bridge_segment, tenant_id_, snap_meta_allocator))) {
           LOG_WARN("create snap_meta bridge segment fail", K(ret));
-        } else if (OB_ISNULL(bridge_segment->vbitmap_ = OB_NEWx(
+        } else if (OB_ISNULL(bridge_meta.vbitmap_ = OB_NEWx(
             ObVectorIndexRoaringBitMap, &snap_meta_allocator, &snap_meta_allocator, tenant_id_))) {
           ret = OB_ALLOCATE_MEMORY_FAILED;
           LOG_WARN("alloc snap_meta bridge vbitmap fail", K(ret));
-        } else if (OB_FAIL(bridge_segment->vbitmap_->init(true/*insert*/, true/*delete*/))) {
+        } else if (OB_FAIL(bridge_meta.vbitmap_->init(true/*insert*/, true/*delete*/))) {
           LOG_WARN("init snap_meta bridge vbitmap fail", K(ret));
         }
         for (int64_t i = 0; OB_SUCC(ret) && i < merge_segments_.count(); ++i) {
@@ -1269,15 +1257,16 @@ int ObVecIdxMergeTask::execute_exchange()
               bridge_meta.blocks_cnt_ = 1;
             }
           } else if (seg_meta->segment_handle_.is_valid()) {
-            if (OB_NOT_NULL(seg_meta->segment_handle_->vbitmap_)) {
+            const ObVectorIndexRoaringBitMap *bitmap = seg_meta->vbitmap_;
+            if (OB_NOT_NULL(bitmap)) {
               has_bridge_bitmap = true;
-              if (OB_NOT_NULL(seg_meta->segment_handle_->vbitmap_->insert_bitmap_)) {
+              if (OB_NOT_NULL(bitmap->insert_bitmap_)) {
                 ROARING_TRY_CATCH(roaring::api::roaring64_bitmap_or_inplace(
-                    bridge_segment->vbitmap_->insert_bitmap_, seg_meta->segment_handle_->vbitmap_->insert_bitmap_));
+                    bridge_meta.vbitmap_->insert_bitmap_, bitmap->insert_bitmap_));
               }
-              if (OB_SUCC(ret) && OB_NOT_NULL(seg_meta->segment_handle_->vbitmap_->delete_bitmap_)) {
+              if (OB_SUCC(ret) && OB_NOT_NULL(bitmap->delete_bitmap_)) {
                 ROARING_TRY_CATCH(roaring::api::roaring64_bitmap_or_inplace(
-                    bridge_segment->vbitmap_->delete_bitmap_, seg_meta->segment_handle_->vbitmap_->delete_bitmap_));
+                    bridge_meta.vbitmap_->delete_bitmap_, bitmap->delete_bitmap_));
               }
             }
           }
@@ -1286,13 +1275,14 @@ int ObVecIdxMergeTask::execute_exchange()
         } else if (bridge_meta.seg_type_ != ObVectorIndexSegmentType::SNAP_META_BRIDGE
             || bridge_meta.scn_ <= 0
             || !bridge_segment.is_valid()
-            || OB_ISNULL(bridge_segment->get_vbitmap())
+            || OB_ISNULL(bridge_meta.vbitmap_)
             || !has_bridge_bitmap) {
           // Bridge is optional; merge can still advance without it.
           LOG_INFO("[VECTOR INDEX MERGE] bridge not buildable, skip snap_meta bridge",
               K(bridge_meta), K(has_bridge_bitmap));
         } else {
           has_bridge = true;
+          bridge_meta.bitmap_scn_ = new_snap->meta_.scn();
           LOG_INFO("[VECTOR INDEX MERGE] built snap_meta bridge for child row",
               K(bridge_meta), K(bridge_segment));
         }
@@ -1499,15 +1489,17 @@ int ObVecIdxMergeTask::update_meta(
   int ret = OB_SUCCESS;
   int tmp_ret = OB_SUCCESS;
   ObVecIdxSnapTableSegMergeOp snap_table_handler(new_adapter_->get_tenant_id());
-  const int64_t base_count = new_snap->meta_.bases_.count();
-  ObVectorIndexSegmentMeta *new_seg_meta = base_count > 0 ? &new_snap->meta_.bases_.at(0) : nullptr;
   if (OB_FAIL(snap_table_handler.init(ls_id_, new_adapter_->get_data_table_id(), new_adapter_->get_snapshot_table_id(), new_adapter_->get_snap_tablet_id()))) {
     LOG_WARN("init snap table handler fail", K(ret));
-  } else if (OB_FAIL(snap_table_handler.preprea_meta(new_seg_meta, merge_segments_))) {
+  } else if (OB_FAIL(snap_table_handler.preprea_meta(new_snap->meta_.bases_, merge_segments_))) {
     LOG_WARN("prepare meta fail", K(ret));
   } else {
     // Let insertup_meta_row write the child row and root reference in one transaction.
     snap_table_handler.set_meta_bridge(bridge_meta, bridge_segment);
+    snap_table_handler.set_insert_bitmap_pruned(new_snap->insert_bitmap_pruned_);
+    if (merge_deleted_vids_valid_) {
+      snap_table_handler.set_bitmap_prune_plan(&merge_source_meta_, &merge_deleted_vids_);
+    }
     if (OB_FAIL(snap_table_handler.insertup_meta_row(new_adapter_, tx_desc, timeout_us))) {
       LOG_WARN("insertup_meta_row fail", K(ret));
     } else {
@@ -1515,7 +1507,7 @@ int ObVecIdxMergeTask::update_meta(
     }
   }
 
-  if (OB_SUCC(ret) && OB_TMP_FAIL(update_task_result_segments_info(new_seg_meta))) {
+  if (OB_SUCC(ret) && OB_TMP_FAIL(update_task_result_segments_info())) {
     // The observability should not alter the execution flow. So update task info here
     LOG_WARN("upadte task result segments info fail", K(tmp_ret));
   }
@@ -1640,7 +1632,7 @@ int ObVecIdxMergeTask::refresh_adaptor()
       } else if (OB_FALSE_IT(new_adapter_->get_snap_data()->free_memdata_resource_with_lock(new_adapter_->get_allocator(), new_adapter_->get_tenant_id()))) {
       } else if (OB_FAIL(new_adapter_->deserialize_snap_meta(meta_data))) {
         LOG_WARN("deserialize snap meta fail", K(ret), K(meta_scn), K(meta_data.length()));
-      } else if (OB_FAIL(try_reuse_segments_from_old_adapter())) {
+      } else if (OB_FAIL(try_reuse_segments_from_old_adapter(current_scn))) {
         LOG_WARN("try reuse segments from old adapter fail", K(ret));
       } else if (OB_FAIL(new_adapter_->get_snap_data()->load_persist_segments(new_adapter_, allocator_, ls_id_,
           current_scn, ctx_))) {
@@ -1657,10 +1649,10 @@ int ObVecIdxMergeTask::refresh_adaptor()
           LOG_INFO("snap data is load by other, so no need to refresh", KPC(new_adapter_), KPC(latest_adpt_guard.get_adatper()));
         } else if (OB_FAIL(new_adapter_->merge_incr_data(latest_adpt_guard.get_adatper()))){
           LOG_WARN("partial vector index adapter not valid", K(ret), KP(latest_adpt_guard.get_adatper()), KPC(this));
-        } else if (merge_from_base_
+        } else if ((merge_from_base_ || merge_plan_.output_type_ == ObVectorIndexSegmentType::INCR_BASE)
                    && OB_FAIL(ObPluginVectorIndexUtils::refresh_async_query_scn(
                           ls_id_, new_adapter_))) {
-          LOG_WARN("failed to set async query barrier for new BASE", K(ret));
+          LOG_WARN("failed to set async query barrier for merged segment", K(ret));
         } else if (OB_FAIL(new_adapter_->set_replace_scn(current_scn))) {
           LOG_WARN("failed to set replace scn", K(ret), K(current_scn));
         } else if (OB_FAIL(vec_idx_mgr_->replace_old_adapter(new_adapter_))) {

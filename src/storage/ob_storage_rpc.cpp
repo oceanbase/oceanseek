@@ -5157,17 +5157,8 @@ int ObFetchVectorIndexSegmentMetasP::process()
             // bases_/incrs_ are mutated under snap_data_->mem_data_rwlock_ (write lock).
             TCRLockGuard lock_guard(snap_data->mem_data_rwlock_);
             const share::ObVectorIndexMeta &meta = snap_data->meta_;
-            res.vec_index_meta_.header_ = meta.header_;
-            res.vec_index_meta_.flags_ = meta.flags_;
-            for (int64_t i = 0; OB_SUCC(ret) && i < meta.bases_.count(); ++i) {
-              if (OB_FAIL(res.vec_index_meta_.add_base_seg_meta(meta.bases_.at(i)))) {
-                LOG_WARN("failed to add base seg meta to res", K(ret), K(i));
-              }
-            }
-            for (int64_t i = 0; OB_SUCC(ret) && i < meta.incrs_.count(); ++i) {
-              if (OB_FAIL(res.vec_index_meta_.add_incr_seg_meta(meta.incrs_.at(i)))) {
-                LOG_WARN("failed to add incr seg meta to res", K(ret), K(i));
-              }
+            if (OB_FAIL(res.vec_index_meta_.assign(meta))) {
+              LOG_WARN("failed to assign vector index meta to res", K(ret));
             }
           }
           if (OB_SUCC(ret)) {

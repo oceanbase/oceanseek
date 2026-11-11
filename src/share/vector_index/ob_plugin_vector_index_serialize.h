@@ -19,6 +19,7 @@ namespace share
 {
 struct ObVecIndexAsyncTaskCtx;
 class ObVectorIndexSegment;
+class ObVectorIndexRoaringBitMap;
 class ObVectorIndexSegmentHandle;
 class ObVectorIndexMeta;
 class ObVectorIndexSegmentMeta;
@@ -192,7 +193,7 @@ public:
   struct CbParam : public ObOStreamBuf::CbParam {
     CbParam()
       : vctx_(nullptr), allocator_(nullptr), tmp_allocator_(nullptr), tx_desc_(nullptr), snapshot_(nullptr),
-        timeout_(0), lob_inrow_threshold_(0), tablet_id_(), snapshot_version_(), need_serde_meta_(false),
+        timeout_(0), lob_inrow_threshold_(0), tablet_id_(), snapshot_version_(), need_serde_meta_(false), vbitmap_(nullptr),
         is_vec_tablet_rebuild_(false), loop_cnt_(0), task_ctx_(nullptr)
     {}
     virtual ~CbParam() {}
@@ -221,6 +222,7 @@ public:
     ObTabletID tablet_id_;
     int64_t snapshot_version_;
     bool need_serde_meta_;
+    const ObVectorIndexRoaringBitMap *vbitmap_; // Borrowed for this serialization call.
     bool is_vec_tablet_rebuild_;
     int64_t loop_cnt_;
     ObVecIndexAsyncTaskCtx *task_ctx_;

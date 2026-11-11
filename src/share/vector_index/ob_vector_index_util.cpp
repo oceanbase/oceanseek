@@ -5670,7 +5670,9 @@ int ObVecIdxSnapshotBlockData::get_key(const ObVectorIndexAlgorithmType index_ty
     const int64_t snapshot_version, const int64_t row_id, ObIAllocator &allocator, ObString &key) const
 {
   int ret = OB_SUCCESS;
-  if (is_meta_) {
+  if (!key_.empty()) {
+    key = key_;
+  } else if (is_meta_) {
     if (OB_FAIL(ObVectorIndexSegmentMeta::get_vector_index_meta_key(allocator, tablet_id, key))) {
       LOG_WARN("fail to build vec meta key str", K(ret), K(index_type));
     }

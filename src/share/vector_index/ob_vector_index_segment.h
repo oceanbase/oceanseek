@@ -72,7 +72,9 @@ private:
 
 struct ObVectorIndexMetaHeader
 {
-  static const int8_t CURRENT_VERSION = 1;
+  static const int8_t VERSION_V1 = 1;
+  static const int8_t VERSION_V2 = 2;
+  static const int8_t CURRENT_VERSION = VERSION_V2;
   static const int64_t HEAD_LEN = sizeof(int64_t) + sizeof(int64_t);
 
   ObVectorIndexMetaHeader():
@@ -150,6 +152,19 @@ enum class ObVectorIndexSegmentType : uint16_t
   EMPTY,
   VSAG_MERGE,
   SNAP_META_BRIDGE,
+  // 存放在 incrs_ 中的持久化段，查询使用与 BASE 相同的过滤方式，
+  // 不再依赖异步查询的 insert 白名单。因此可以从可见性 insert bitmap
+  // 中移除已经进入输出图的 VID，同时保留图外条目和物理图成员 bitmap。
+  //
+  // 存在异步索引时，不含 BASE 的合并/重建窗口，在所有源段均为
+  // INCR_MERGE/INCR_BASE，且满足 0 < 源段 SCN <= 最小异步发布水位时，
+  // 可以生成 INCR_BASE。FREEZE_PERSIST 的冻结 SCN 不能作为事务提交
+  // SCN 的上界，需要先重建为 INCR_MERGE，再等待发布水位覆盖新段 SCN。
+  //
+  // 包含 BASE 的安全窗口、FULL 合并，以及满足安全回收条件的超大 MANUAL 合并输出 BASE。
+  // 不安全的 MANUAL 保留 INCR_MERGE 白名单。移除异步索引后，已有 INCR_BASE 参与的
+  // 普通纯增量合并仍保留该类型；其他窗口沿用原有类型判断规则。
+  // 仅推进发布水位不会触发单个 INCR_MERGE 自动晋升为 INCR_BASE。
   INCR_BASE = 9,
   MAX
 };
@@ -208,13 +223,14 @@ public:
     end_key_(),
     index_param_(),
     blocks_cnt_(0),
-    segment_handle_()
+    segment_handle_(), bitmap_scn_(0), vbitmap_(nullptr)
   {}
   ObVectorIndexSegmentMeta(const ObVectorIndexSegmentMeta &other);
   ObVectorIndexSegmentMeta &operator=(const ObVectorIndexSegmentMeta &other);
   int assign(const ObVectorIndexSegmentMeta &other);
 
-  ~ObVectorIndexSegmentMeta() {}
+  ~ObVectorIndexSegmentMeta();
+  void set_vbitmap(ObVectorIndexRoaringBitMap *bitmap);
 
   void release();
   bool has_quantization() const { return VIAT_HNSW_SQ == index_type_ || VIAT_HNSW_BQ == index_type_; }
@@ -223,7 +239,7 @@ public:
   const ObString &get_index_param() const { return index_param_; }
 
   TO_STRING_KV(K_(seg_type), K_(index_type), K_(has_segment_meta_row), K_(reserved),
-      K_(scn), K_(blocks_cnt), K_(index_param), K_(segment_handle));
+      K_(scn), K_(bitmap_scn), K_(blocks_cnt), K_(index_param), K_(segment_handle));
 
 public:
   ObVectorIndexSegmentType seg_type_;
@@ -243,6 +259,10 @@ public:
   // ObVidBound vid_bound_; TODO
 
   ObVectorIndexSegmentHandle segment_handle_;
+  // Persisted bitmap version: build SCN initially, update snapshot SCN on content changes.
+  // Zero is retained for legacy metadata and segments without a bitmap.
+  int64_t bitmap_scn_;
+  ObVectorIndexRoaringBitMap *vbitmap_; // Immutable once published; owned by this metadata reference.
   char start_key_buf_[OB_VECTOR_INDEX_SNAPSHOT_KEY_LENGTH] = {0};
   char end_key_buf_[OB_VECTOR_INDEX_SNAPSHOT_KEY_LENGTH] = {0};
   char index_param_buf_[OB_MAX_INDEX_PARAMS_LENGTH] = {0};
@@ -269,7 +289,8 @@ public:
     header_(),
     flags_(0),
     bases_(OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator("VIBases", MTL_ID())),
-    incrs_(OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator("VIIncrs", MTL_ID()))
+    incrs_(OB_MALLOC_NORMAL_BLOCK_SIZE, ModulePageAllocator("VIIncrs", MTL_ID())),
+    last_bitmap_update_scn_(0)
   {}
   ~ObVectorIndexMeta() {}
 
@@ -313,9 +334,10 @@ public:
     return idx < base_cnt ? bases_.at(idx) : incrs_.at(idx - base_cnt);
   }
 
-  TO_STRING_KV(K_(header), K_(is_persistent), K_(reserved), K_(bases), K_(incrs));
+  TO_STRING_KV(K_(header), K_(is_persistent), K_(reserved), K_(bases), K_(incrs), K_(last_bitmap_update_scn));
 
 private:
+  int8_t get_serialize_version() const;
   int deserialize_seg_metas(const char *buf, const int64_t data_len, int64_t &pos);
   int copy_base_seg_metas(const ObVectorIndexMeta &other) { return bases_.assign(other.bases_); }
 
@@ -330,6 +352,7 @@ public:
   };
   ObSEArray<ObVectorIndexSegmentMeta, 1> bases_;
   ObSEArray<ObVectorIndexSegmentMeta, 1> incrs_;
+  int64_t last_bitmap_update_scn_;
 };
 
 struct ObVectorIndexSegmentHeader
@@ -403,7 +426,7 @@ struct ObVectorIndexRoaringBitMap
 public:
   ObVectorIndexRoaringBitMap(ObIAllocator *allocator, const uint64_t tenant_id) :
     allocator_(allocator), tenant_id_(tenant_id),
-    insert_bitmap_(nullptr), delete_bitmap_(nullptr) {}
+    insert_bitmap_(nullptr), delete_bitmap_(nullptr), ref_cnt_(1) {}
 
   int init(const bool is_init_ibitmap, const bool is_init_dbitmap);
 
@@ -411,6 +434,7 @@ public:
   void reset_bitmap();
 
   static void destroy(ObVectorIndexRoaringBitMap *segment);
+  void inc_ref() { ATOMIC_INC(&ref_cnt_); }
 
   TO_STRING_KV(KP(this), KP_(allocator), K_(tenant_id), KP_(insert_bitmap), KP_(delete_bitmap));
 
@@ -419,6 +443,8 @@ public:
   TCRWLock rwlock_{ObLatchIds::VECTOR_BITMAP_LOCK};
   roaring::api::roaring64_bitmap_t *insert_bitmap_;
   roaring::api::roaring64_bitmap_t *delete_bitmap_;
+private:
+  int64_t ref_cnt_; // Memory ownership only; excluded from serialization.
 };
 
 class ObVectorIndexSegment
@@ -444,8 +470,9 @@ public:
 public:
   ObVectorIndexSegment(ObIAllocator *allocator):
     index_(nullptr), is_inited_(false), is_base_(false), ref_cnt_(0), write_ref_cnt_(0),
+    deleted_vector_count_(0),
     allocator_(allocator), mem_ctx_(nullptr), vid_bound_(),
-    ibitmap_(nullptr), vbitmap_(nullptr)
+    ibitmap_(nullptr)
   {
     ATOMIC_INC(&instacnce_cnt_);
   }
@@ -501,6 +528,8 @@ public:
   // TODO mark const
   ObVectorIndexAlgorithmType get_index_type() const { return static_cast<ObVectorIndexAlgorithmType>(obvectorutil::get_index_type(const_cast<void*>(index_))); }
   int get_index_number(int64_t &size) const { return obvectorutil::get_index_number(const_cast<void*>(index_), size); }
+  int64_t get_deleted_vector_count() const { return ATOMIC_LOAD(&deleted_vector_count_); }
+  void set_deleted_vector_count(const int64_t count) { ATOMIC_STORE(&deleted_vector_count_, count); }
   int get_vid_bound(int64_t &min_vid, int64_t &max_vid) const { return obvectorutil::get_vid_bound(const_cast<void*>(index_), min_vid, max_vid); }
   void get_read_bound_vid(int64_t &max_vid, int64_t &min_vid) const { vid_bound_.get_bound_vid(max_vid, min_vid); }
   void set_read_vid_bound(ObVidBound other) { vid_bound_.set_vid_bound(other); }
@@ -522,10 +551,11 @@ public:
   int set_index_param(const ObString &index_param) { return index_param_.assign(index_param); }
   ObString get_index_param() const { return index_param_.str(); }
 
-  int64_t get_serialize_meta_size() const;
-  int serialize_meta(char *buf, const int64_t buf_len, int64_t &pos) const;
-  int deserialize_meta(const char *buf, const int64_t data_len, int64_t &pos);
-  const ObVectorIndexRoaringBitMap *get_vbitmap() const { return vbitmap_; }
+  int64_t get_serialize_meta_size(const ObVectorIndexRoaringBitMap *vbitmap) const;
+  int serialize_meta(char *buf, const int64_t buf_len, int64_t &pos,
+      const ObVectorIndexRoaringBitMap *vbitmap) const;
+  int deserialize_meta(const char *buf, const int64_t data_len, int64_t &pos,
+      ObVectorIndexRoaringBitMap *&vbitmap);
 
   int serialize(const uint64_t tenant_id, ObHNSWSerializeCallback::CbParam &param);
   int serialize(
@@ -545,7 +575,7 @@ public:
 public:
   TO_STRING_KV(KP(this), K_(is_inited), K_(is_base), K_(ref_cnt), K_(write_ref_cnt),
     KP_(allocator), KP_(mem_ctx), KP_(index), K_(vid_bound), K_(index_param),
-    KPC_(ibitmap), KPC_(vbitmap));
+    KPC_(ibitmap));
 
 private:
   // must keep as first member, avoid null pointer check failure
@@ -554,6 +584,8 @@ private:
   bool is_base_;
   int64_t ref_cnt_;
   int64_t write_ref_cnt_;
+  // Approximate runtime count shared by all holders of this graph; not serialized.
+  int64_t deleted_vector_count_;
   uint64_t tenant_id_;
   ObIAllocator *allocator_;
   ObVsagMemContext* mem_ctx_;
@@ -561,7 +593,6 @@ private:
   ObVectorIndexParamString index_param_;
 public:
   ObVectorIndexRoaringBitMap *ibitmap_;
-  ObVectorIndexRoaringBitMap *vbitmap_;
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObVectorIndexSegment);
@@ -845,6 +876,7 @@ public:
     has_build_(false),
     need_vid_check_(false),
     build_finished_(false),
+    insert_bitmap_pruned_(false),
     segment_handle_(),
     vid_array_(nullptr),
     vec_array_(nullptr),
@@ -870,8 +902,10 @@ public:
   void free(ObIAllocator &allocator);
   void free_vec_buf_data(ObIAllocator &allocator);
   int init_vec_buffer(const uint64_t tenant_id, ObIAllocator &allocator, const bool is_sparse_vector);
-  int add_to_buffer(float* vecs, int64_t* ids, int dim, char *extra_info, int size, const int64_t &extra_info_actual_size);
-  int add_to_buffer(uint32_t *lens, uint32_t *dims, float *vals, int64_t* ids, char *extra_info, int size, const int64_t &extra_info_actual_size);
+  int add_to_buffer(float* vecs, int64_t* ids, int dim, char *extra_info, int size, const int64_t &extra_info_actual_size,
+      const ObIArray<ObVectorIndexSegmentBuilder *> *sealed_builders = nullptr);
+  int add_to_buffer(uint32_t *lens, uint32_t *dims, float *vals, int64_t* ids, char *extra_info, int size, const int64_t &extra_info_actual_size,
+      const ObIArray<ObVectorIndexSegmentBuilder *> *sealed_builders = nullptr);
   bool is_empty_buffer() const  { return OB_ISNULL(vid_array_) || vid_array_->count() == 0;}
   int create_and_build(
       const uint64_t tenant_id,
@@ -908,10 +942,16 @@ public:
     return ! has_build_ && OB_NOT_NULL(vid_array_) && vid_array_->count() > VEC_INDEX_HNSW_BUILD_COUNT_THRESHOLD ;
   }
 
-  int check_vid_range(const int64_t vid, bool &has_skip_vid);
-  int serialize(const uint64_t tenant_id, ObHNSWSerializeCallback::CbParam &param);
-  int add_index(float* vecs, int64_t* ids, int dim, char *extra_info, int size, int64_t extra_info_actual_size = 0);
-  int add_index(uint32_t *lens, uint32_t *dims, float *vals, int64_t *ids, int size, char *extra_infos, int64_t extra_info_actual_size = 0);
+  // The caller keeps sealed builders alive and unchanged throughout checking and appending.
+  int check_vid_range(const int64_t vid, bool &has_skip_vid,
+      const ObIArray<ObVectorIndexSegmentBuilder *> *sealed_builders = nullptr);
+  int prune_insert_bitmap(const ObVectorIndexSegmentBuilder &output);
+  int serialize(const uint64_t tenant_id, ObHNSWSerializeCallback::CbParam &param,
+      const bool prune_insert = true);
+  int add_index(float* vecs, int64_t* ids, int dim, char *extra_info, int size, int64_t extra_info_actual_size = 0,
+      const ObIArray<ObVectorIndexSegmentBuilder *> *sealed_builders = nullptr);
+  int add_index(uint32_t *lens, uint32_t *dims, float *vals, int64_t *ids, int size, char *extra_infos, int64_t extra_info_actual_size = 0,
+      const ObIArray<ObVectorIndexSegmentBuilder *> *sealed_builders = nullptr);
 
   TO_STRING_KV(KP(this), K_(is_inited), K_(seg_type), K_(has_build), K_(need_vid_check), K_(build_finished),
       K_(segment_handle), KP_(vid_array), KP_(vec_array), KP_(extra_info_buf),
@@ -924,6 +964,7 @@ public:
   bool has_build_;
   bool need_vid_check_;
   bool build_finished_;
+  bool insert_bitmap_pruned_;
   TCRWLock mem_data_rwlock_{ObLatchIds::VECTOR_MEM_DATA};
   ObVectorIndexSegmentHandle segment_handle_;
   ObVecIdxVidArray *vid_array_;
@@ -978,6 +1019,9 @@ public:
       meta_(),
       vid_bound_()
   {
+    // Snapshot metadata and sealed builders can outlive a SQL execution.
+    meta_.bases_.set_attr(SET_IGNORE_MEM_VERSION(ObMemAttr(MTL_ID(), "VIBases")));
+    sealed_builders_.set_attr(SET_IGNORE_MEM_VERSION(ObMemAttr(MTL_ID(), "VIBuilders")));
     ATOMIC_INC(&instacnce_cnt_);
   }
   ~ObVecIdxSnapshotData();
@@ -990,13 +1034,15 @@ public:
       const int64_t blocks_cnt,
       const ObString &index_param);
   int build_finished(ObIAllocator &allocator);
+  int append_base_meta(ObVectorIndexMeta &meta, ObVectorIndexSegmentBuilder &builder,
+      const ObTabletID &tablet_id, const int64_t snapshot_version,
+      const int64_t first_block, const int64_t block_count, const ObString &index_param);
     
   int get_snap_index_row_cnt(int64_t &count) const;
   ObVectorIndexAlgorithmType get_snap_index_type() const;
   int64_t get_snap_mem_hold() const;
   int64_t get_snap_mem_used() const;
   bool check_incr_mem_over_percentage(const int64_t incr_memory_percentage) const;
-  bool check_incr_can_merge_base() const;
   void get_read_bound_vid(int64_t &max_vid, int64_t &min_vid) { vid_bound_.get_bound_vid(max_vid, min_vid); }
 
   void free_memdata_resource(ObIAllocator *allocator, const uint64_t tenant_id);
@@ -1014,6 +1060,7 @@ public:
       const uint64_t tenant_id, ObPluginVectorIndexAdaptor *adaptor, ObHNSWDeserializeCallback::CbParam &param);
 
 private:
+  void free_builders(ObIAllocator &allocator);
   int get_snap_vid_bound(int64_t &min_vid, int64_t &max_vid);
   int load_segment(ObPluginVectorIndexAdaptor *adaptor,
       ObIAllocator &allocator, const uint64_t tenant_id, const ObLSID& ls_id, const ObTabletID &tablet_id,
@@ -1033,6 +1080,13 @@ public:
   ObVectorIndexMeta meta_;
   ObVidBound vid_bound_;
   ObVecIndexBuildSegInfo last_res_seg_info_;
+  // Builder ownership changes under complete_lock_; parallel appenders set the switch
+  // flag atomically while holding its read side. Metadata retains graphs after completion.
+  ObSEArray<ObVectorIndexSegmentBuilder *, 4> sealed_builders_;
+  bool enable_multi_segment_ = false;
+  int64_t segment_max_vectors_ = 0;
+  bool need_switch_segment_ = false;
+  bool insert_bitmap_pruned_ = false; // Build-local; survives freeing sealed builders.
 };
 typedef ObVectorIndexMemDataHandle<ObVecIdxSnapshotData> ObVecIdxSnapshotDataHandle;
 
@@ -1102,7 +1156,8 @@ struct ObVectorIndexSegQueryHandler
       dim_(0),
       sparse_lens_(nullptr),
       sparse_dims_(nullptr),
-      sparse_vals_(nullptr) {}
+      sparse_vals_(nullptr),
+      total_vector_count_(-1) {}
 
   int knn_search(ObVsagQueryResult &result, int segment_cnt = 0);
 
@@ -1126,6 +1181,7 @@ struct ObVectorIndexSegQueryHandler
   uint32_t *sparse_lens_;
   uint32_t *sparse_dims_;
   float *sparse_vals_;
+  int64_t total_vector_count_; // -1: not sampled; 0: use original parameters.
 };
 
 }  // namespace share

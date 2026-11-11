@@ -9,3 +9,4 @@ storage_unittest(test_vector_index_background_timestamp test_vector_index_backgr
 
 add_subdirectory(storage)
 add_subdirectory(tablelock)
+add_subdirectory(vector_index)

@@ -3635,6 +3635,17 @@ DEF_INT(ob_vector_index_merge_trigger_percentage, OB_TENANT_PARAMETER, "20", "[0
         "Maximum ratio of Incremental Segment memory usage to total partition index. "
         "When this value is exceeded, the system will automatically trigger a merge operation with the base segment.",
         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE))
+DEF_INT(vector_index_segment_max_vectors, OB_TENANT_PARAMETER, "10000000", "[1, 50000000]",
+        "Sets the maximum number of vectors in a vector index segment.",
+        ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+DEF_INT(vector_index_merge_segment_threshold, OB_TENANT_PARAMETER, "2", "[2, 20]",
+        "Sets the minimum number of candidate segments required for vector index merging.",
+        ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+DEF_INT(vector_index_delete_purge_threshold, OB_TENANT_PARAMETER, "20", "[1, 100]",
+        "The deleted-vector percentage threshold for space reclamation. "
+        "Reaching or exceeding this threshold satisfies the deletion-ratio "
+        "condition for scheduling a vector index rebuild.",
+        ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_STR_WITH_CHECKER(system_protected_tenant_parameters, OB_CLUSTER_PARAMETER, "",
   common::ObConfigCommaSeparatedStringChecker,
   "tenant parameters that are not allowed to be modified by regular users, "

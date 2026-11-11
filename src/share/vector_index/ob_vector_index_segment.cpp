@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX SHARE
 
 #include "ob_vector_index_segment.h"
+#include <cmath>
 #include "share/ob_cluster_version.h"
 #include "lib/roaringbitmap/ob_roaringbitmap.h"
 #include "lib/utility/ob_tracepoint.h"
@@ -19,6 +20,7 @@
 
 ERRSIM_POINT_DEF(ERRSIM_VEC_ENABLE_SEARCH_TIMEOUT_MS, "When set, add timeout_ms to VSAG search param to limit search time.");
 ERRSIM_POINT_DEF(ERRSIM_VEC_ENABLE_SEGMENT_EF_REDUCTION, "When set, reduce ef_search proportionally across segments to improve QPS in multi-segment searches.");
+ERRSIM_POINT_DEF(ERRSIM_VEC_ENABLE_SIZE_WEIGHTED_EF, "When set, allocate ef_search by HNSW segment size for supported scan paths, retaining query_limit. Disabled when segment ef reduction is enabled.");
 
 namespace oceanbase
 {
@@ -34,24 +36,94 @@ int64_t ObVectorIndexSegmentBuilder::instacnce_cnt_ = 0;
 int64_t ObVecIdxSnapshotData::instacnce_cnt_ = 0;
 int64_t ObVecIdxFrozenData::instacnce_cnt_ = 0;
 
-// Compute actual per-segment ef_search and query_limit when segment ef-reduction is active.
-// When ERRSIM_VEC_ENABLE_SEGMENT_EF_REDUCTION is not set, returns original values unchanged.
-static void calc_segment_ef_params(const ObVectorQueryConditions *query_cond,
-                                   int segment_cnt,
-                                   int64_t &actual_ef_search,
-                                   int64_t &actual_query_limit)
+// Compute per-segment search parameters without changing the shared query conditions.
+// Size-weighted policy (ERRSIM_VEC_ENABLE_SIZE_WEIGHTED_EF):
+//   Q   = query_limit_ (internal candidate count, not necessarily SQL LIMIT)
+//   E   = max(requested ef_search, Q)
+//   N_i = vector_count of the current segment; N = sum of all segment counts
+//   p_i = min(1, N_i / N)
+//   K   = EF_EXPAND_FACTOR
+//   B_i = floor(max(1, E * p_i + K * sqrt(E * p_i * (1 - p_i))))
+//   ef_i = max(Q, min(E, B_i)); topk_i = Q
+// The square-root term adds headroom to the size-proportional budget. Clamping to
+// [Q, E] keeps ef at least the requested candidate count and at most the original
+// effective budget; it does not guarantee recall. Existing VSAG caps still apply.
+// Cache N once per round before the first actual search. Require at least two
+// nonempty HNSW-family segments; invalid counts or overflow disable this policy
+// for the round. N_i is read before each segment search, so cap p_i at 1 if an
+// active segment grows after N was sampled.
+// The legacy segment-count policy takes precedence if enabled when N is sampled.
+// Once size weighting is selected, do not stack the legacy policy in later segments.
+// Otherwise preserve the legacy policy, or the original parameters if it is off.
+void calc_segment_ef_params(ObVectorIndexSegQueryHandler &handler,
+                           const common::ObIArray<ObVectorIndexSegmentQuerier *> &segments,
+                           int segment_cnt,
+                           int64_t vector_count,
+                           int64_t &actual_ef_search,
+                           int64_t &actual_query_limit)
 {
-  const int eff_seg = (segment_cnt > 1 && ERRSIM_VEC_ENABLE_SEGMENT_EF_REDUCTION != OB_SUCCESS)
-                      ? segment_cnt : 1;
-  if (eff_seg > 1) {
-    // Distribute query_limit evenly across segments, then apply 2.5x empirical headroom factor.
-    int64_t q = (query_cond->query_limit_ + eff_seg - 1) / eff_seg;
-    q = q * 5 / 2;
-    actual_ef_search  = MAX(q, query_cond->ef_search_ / eff_seg);
-    actual_query_limit = q;
-  } else {
-    actual_ef_search  = query_cond->ef_search_;
+  // Scale the extra EF budget above the size-proportional allocation.
+  constexpr double EF_EXPAND_FACTOR = 16.0;
+  const ObVectorQueryConditions *query_cond = handler.query_cond_;
+  int64_t &total_vector_count = handler.total_vector_count_;
+  if (total_vector_count < 0) {
+    total_vector_count = 0;
+    if (!handler.is_sparse_vector_
+        && segments.count() > 1
+        && ERRSIM_VEC_ENABLE_SIZE_WEIGHTED_EF != OB_SUCCESS
+        && ERRSIM_VEC_ENABLE_SEGMENT_EF_REDUCTION == OB_SUCCESS) {
+      int ret = OB_SUCCESS;
+      int64_t total = 0;
+      int64_t nonempty = 0;
+      for (int64_t i = 0; OB_SUCC(ret) && i < segments.count(); ++i) {
+        const ObVectorIndexSegmentQuerier *querier = segments.at(i);
+        int64_t count = 0;
+        if (OB_ISNULL(querier) || !querier->handle_.is_valid()
+            || !ObVectorIndexUtil::is_hnsw_index_type(querier->handle_->get_index_type())) {
+          ret = OB_NOT_SUPPORTED;
+        } else if (OB_FAIL(querier->handle_->get_index_number(count))) {
+          LOG_WARN("failed to read segment size, use original search parameters", KR(ret), K(i));
+        } else if (count < 0) {
+          ret = OB_INVALID_ARGUMENT;
+        } else if (count > INT64_MAX - total) {
+          ret = OB_SIZE_OVERFLOW;
+        } else {
+          total += count;
+          nonempty += count > 0 ? 1 : 0;
+        }
+      }
+      if (OB_SUCC(ret) && nonempty > 1) {
+        total_vector_count = total;
+      } else {
+        LOG_TRACE("skip size weighted segment ef", KR(ret), K(nonempty));
+      }
+    }
+  }
+  if (total_vector_count > 0) {
+    const int64_t ef = MAX(query_cond->ef_search_, static_cast<int64_t>(query_cond->query_limit_));
+    // An active segment may grow after the total was sampled.
+    const double p = MIN(1.0, static_cast<double>(vector_count) / static_cast<double>(total_vector_count));
+    const double mean = ef * p;
+    const double budget = std::floor(MAX(1.0,
+        mean + EF_EXPAND_FACTOR * std::sqrt(mean * (1.0 - p))));
     actual_query_limit = query_cond->query_limit_;
+    // Clamp before converting: double(INT64_MAX) rounds up to 2^63.
+    actual_ef_search = budget >= static_cast<double>(ef)
+        ? ef : MAX(actual_query_limit, static_cast<int64_t>(budget));
+  } else {
+    const int eff_seg = (segment_cnt > 1 && ERRSIM_VEC_ENABLE_SEGMENT_EF_REDUCTION != OB_SUCCESS)
+                        ? segment_cnt : 1;
+    if (eff_seg > 1) {
+      // Legacy policy: q = floor(5 * ceil(Q / segment_cnt) / 2),
+      // ef_i = max(q, floor(requested ef_search / segment_cnt)), topk_i = q.
+      int64_t q = (query_cond->query_limit_ + eff_seg - 1) / eff_seg;
+      q = q * 5 / 2;
+      actual_ef_search = MAX(q, query_cond->ef_search_ / eff_seg);
+      actual_query_limit = q;
+    } else {
+      actual_ef_search = query_cond->ef_search_;
+      actual_query_limit = query_cond->query_limit_;
+    }
   }
 }
 
@@ -125,6 +197,20 @@ int ObVectorIndexSegmentHandle::set_segment(ObVectorIndexSegment *segment)
     release_segment(old_segment);
   }
   return ret;
+}
+
+ObVectorIndexSegmentMeta::~ObVectorIndexSegmentMeta()
+{
+  ObVectorIndexRoaringBitMap::destroy(vbitmap_);
+}
+
+void ObVectorIndexSegmentMeta::set_vbitmap(ObVectorIndexRoaringBitMap *bitmap)
+{
+  if (vbitmap_ != bitmap) {
+    if (OB_NOT_NULL(bitmap)) { bitmap->inc_ref(); }
+    ObVectorIndexRoaringBitMap::destroy(vbitmap_);
+    vbitmap_ = bitmap;
+  }
 }
 
 int ObVectorIndexSegmentMeta::get_vector_index_meta_key(ObIAllocator &allocator, const ObTabletID &tablet_id, ObString &key)
@@ -220,6 +306,7 @@ int ObVectorIndexSegmentMeta::prepare_new_segment_meta(
     seg_meta.start_key_ = start_key;
     seg_meta.end_key_ = end_key;
     seg_meta.has_segment_meta_row_ = nullptr != bitmap;
+    seg_meta.bitmap_scn_ = seg_meta.has_segment_meta_row_ ? snapshot_version : 0;
   }
   return ret;
 }
@@ -254,6 +341,8 @@ int ObVectorIndexSegmentMeta::assign(const ObVectorIndexSegmentMeta &other)
     scn_ = other.scn_;
     blocks_cnt_ = other.blocks_cnt_;
     segment_handle_ = other.segment_handle_;
+    bitmap_scn_ = other.bitmap_scn_;
+    set_vbitmap(other.vbitmap_);
     if (other.start_key_.empty() && other.end_key_.empty()) {
       MEMSET(start_key_buf_, 0, OB_VECTOR_INDEX_SNAPSHOT_KEY_LENGTH);
       MEMSET(end_key_buf_, 0, OB_VECTOR_INDEX_SNAPSHOT_KEY_LENGTH);
@@ -320,6 +409,8 @@ void ObVectorIndexSegmentMeta::release()
   seg_type_ = ObVectorIndexSegmentType::INVALID;
   index_type_ = ObVectorIndexAlgorithmType::VIAT_MAX;
   segment_handle_.reset();
+  set_vbitmap(nullptr);
+  bitmap_scn_ = 0;
   scn_ = 0;
   blocks_cnt_ = 0;
   start_key_.reset();
@@ -342,6 +433,7 @@ OB_DEF_SERIALIZE_SIZE(ObVectorIndexSegmentMeta)
   OB_UNIS_ADD_LEN(end_key_);
   OB_UNIS_ADD_LEN(blocks_cnt_);
   OB_UNIS_ADD_LEN(index_param_);
+  OB_UNIS_ADD_LEN(bitmap_scn_);
   return len;
 }
 
@@ -356,6 +448,7 @@ OB_DEF_SERIALIZE(ObVectorIndexSegmentMeta)
   OB_UNIS_ENCODE(end_key_);
   OB_UNIS_ENCODE(blocks_cnt_);
   OB_UNIS_ENCODE(index_param_);
+  OB_UNIS_ENCODE(bitmap_scn_);
   return ret;
 }
 
@@ -374,6 +467,11 @@ OB_DEF_DESERIALIZE(ObVectorIndexSegmentMeta)
   OB_UNIS_DECODE(blocks_cnt_);
   if (OB_SUCC(ret) && pos < data_len) {
     OB_UNIS_DECODE(index_param);
+  }
+  bitmap_scn_ = 0;
+  set_vbitmap(nullptr);
+  if (OB_SUCC(ret) && pos < data_len) {
+    OB_UNIS_DECODE(bitmap_scn_);
   }
   if (OB_FAIL(ret)) {
   } else {
@@ -418,6 +516,19 @@ int ObVectorIndexMeta::get_meta_scn(const ObString& meta_data, int64_t &scn)
   return ret;
 }
 
+int8_t ObVectorIndexMeta::get_serialize_version() const
+{
+  int ret = OB_SUCCESS;
+  int8_t version = ObVectorIndexMetaHeader::VERSION_V1;
+  uint64_t data_version = 0;
+  if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), data_version))) {
+    LOG_WARN("get tenant data version failed", K(ret));
+  } else if (data_version >= DATA_VERSION_4_6_3_1) {
+    version = ObVectorIndexMetaHeader::VERSION_V2;
+  }
+  return version;
+}
+
 int64_t ObVectorIndexMeta::get_serialize_size() const
 {
   int64_t len = 0;
@@ -425,12 +536,18 @@ int64_t ObVectorIndexMeta::get_serialize_size() const
   OB_UNIS_ADD_LEN(flags_);
   OB_UNIS_ADD_LEN_ARRAY(bases_, bases_.count());
   OB_UNIS_ADD_LEN_ARRAY(incrs_, incrs_.count());
+  if (get_serialize_version() == ObVectorIndexMetaHeader::VERSION_V2) {
+    len += serialization::encoded_length_i64(0); // V2 total metadata length field.
+    OB_UNIS_ADD_LEN(last_bitmap_update_scn_);
+  }
   return len;
 }
 
 int ObVectorIndexMeta::serialize(char *buf, const int64_t buf_len, int64_t &pos) const
 {
   int ret = OB_SUCCESS;
+  ObVectorIndexMetaHeader header = header_;
+  header.version_ = get_serialize_version();
   if (! is_persistent_) {
     ret = OB_SERIALIZE_ERROR;
     LOG_WARN("meta is not persistent", K(ret), KPC(this));
@@ -438,18 +555,29 @@ int ObVectorIndexMeta::serialize(char *buf, const int64_t buf_len, int64_t &pos)
     ret = OB_SERIALIZE_ERROR;
     LOG_WARN("no enough buffer", K(ret), K(buf_len), K(pos));
   } else {
-    MEMCPY(buf + pos, reinterpret_cast<const char*>(&header_), ObVectorIndexMetaHeader::HEAD_LEN);
+    MEMCPY(buf + pos, reinterpret_cast<const char*>(&header), ObVectorIndexMetaHeader::HEAD_LEN);
     pos += ObVectorIndexMetaHeader::HEAD_LEN;
   }
   OB_UNIS_ENCODE(flags_);
   OB_UNIS_ENCODE_ARRAY(bases_, bases_.count());
   OB_UNIS_ENCODE_ARRAY(incrs_, incrs_.count());
+  // V2: header | flags | bases | incrs | total length | last_bitmap_update_scn | future fields.
+  // The total length includes the header and the length field itself.
+  if (OB_SUCC(ret) && header.version_ == ObVectorIndexMetaHeader::VERSION_V2) {
+    const int64_t serialize_size = get_serialize_size();
+    if (OB_FAIL(serialization::encode_i64(buf, buf_len, pos, serialize_size))) {
+      LOG_WARN("encode root metadata length failed", K(ret), K(buf_len), K(serialize_size));
+    }
+    OB_UNIS_ENCODE(last_bitmap_update_scn_);
+  }
   return ret;
 }
 
 int ObVectorIndexMeta::deserialize(const char *buf, const int64_t data_len, int64_t &pos)
 {
   int ret = OB_SUCCESS;
+  const int64_t start_pos = pos;
+  last_bitmap_update_scn_ = 0;
   if (data_len - pos < ObVectorIndexMetaHeader::HEAD_LEN) {
     ret = OB_DESERIALIZE_ERROR;
     LOG_WARN("no enough data", K(ret), K(data_len), K(pos));                           
@@ -461,6 +589,24 @@ int ObVectorIndexMeta::deserialize(const char *buf, const int64_t data_len, int6
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(deserialize_seg_metas(buf, data_len, pos))) {
     LOG_WARN("deserialize seg metas fail", K(ret), K(data_len), K(pos));
+  } else if (header_.version_ == ObVectorIndexMetaHeader::VERSION_V2) {
+    int64_t serialize_size = 0;
+    if (OB_FAIL(serialization::decode_i64(buf, data_len, pos, &serialize_size))) {
+      LOG_WARN("decode root metadata length failed", K(ret), K(data_len), K(pos));
+    } else if (serialize_size < pos - start_pos || serialize_size > data_len - start_pos) {
+      ret = OB_DESERIALIZE_ERROR;
+      LOG_WARN("invalid root metadata length", K(ret), K(serialize_size), K(data_len), K(start_pos), K(pos));
+    } else {
+      const int64_t end_pos = start_pos + serialize_size;
+      if (OB_FAIL(serialization::decode(buf, end_pos, pos, last_bitmap_update_scn_))) {
+        LOG_WARN("decode bitmap update SCN failed", K(ret), K(end_pos), K(pos));
+      } else {
+        // Append compatible fields here, decoding only while pos < end_pos and
+        // passing end_pos as the buffer limit. Default fields absent from older data.
+        // Skip unknown fields and leave the next RPC field at its correct position.
+        pos = end_pos;
+      }
+    }
   }
   return ret;
 }
@@ -523,6 +669,7 @@ int ObVectorIndexMeta::assign(const ObVectorIndexMeta& other)
   int ret = OB_SUCCESS;
   header_ = other.header_;
   flags_ = other.flags_;
+  last_bitmap_update_scn_ = other.last_bitmap_update_scn_;
   if (OB_FAIL(bases_.assign(other.bases_))) {
     LOG_WARN("assign base fail", K(ret));
   } else if (OB_FAIL(incrs_.assign(other.incrs_))) {
@@ -535,6 +682,7 @@ void ObVectorIndexMeta::release()
 {
   header_.reset();
   flags_ = 0;
+  last_bitmap_update_scn_ = 0;
   for (int64_t i = 0; i < incrs_.count(); ++i) {
     ObVectorIndexSegmentMeta &seg_meta = incrs_.at(i);
     seg_meta.release();
@@ -591,7 +739,6 @@ int ObVectorIndexMeta::prepare_new_index_meta(
     LOG_WARN("prepare new segment meta fail", K(ret));
   } else if (OB_FAIL(meta.assign(old_meta))) {
     LOG_WARN("copy meta fail", K(ret), K(old_meta));
-  } else if (OB_FALSE_IT(meta.header_.version_ = 1)) {
   } else if (OB_FALSE_IT(meta.header_.scn_ = snapshot_version)) {
   } else if (OB_FAIL(meta.incrs_.push_back(seg_meta))) {
     LOG_WARN("push back seg meta fail", K(ret), K(index_type), K(snapshot_version));
@@ -771,11 +918,10 @@ void ObVectorIndexSegment::reset()
 
   ObVectorIndexRoaringBitMap::destroy(ibitmap_);
   ibitmap_ = nullptr;
-  ObVectorIndexRoaringBitMap::destroy(vbitmap_);
-  vbitmap_ = nullptr;
 
   index_param_.reset();
   is_base_ = false;
+  set_deleted_vector_count(0);
   ref_cnt_ = 0;
   tenant_id_ = OB_INVALID_TENANT_ID;
   allocator_ = nullptr;
@@ -795,7 +941,7 @@ int ObVectorIndexSegment::check_id_exist(const int64_t vid, bool &exist) const
   return ret;
 }
 
-int64_t ObVectorIndexSegment::get_serialize_meta_size() const
+int64_t ObVectorIndexSegment::get_serialize_meta_size(const ObVectorIndexRoaringBitMap *vbitmap) const
 {
   int64_t len = ObVectorIndexSegmentHeader::HEAD_LEN;
   bool has_ibitmap = nullptr != ibitmap_;
@@ -810,13 +956,13 @@ int64_t ObVectorIndexSegment::get_serialize_meta_size() const
     }
   }
   if (len >= 0) {
-    bool has_vbitmap = nullptr != vbitmap_;
+    bool has_vbitmap = nullptr != vbitmap;
     OB_UNIS_ADD_LEN(has_vbitmap);
     if (has_vbitmap) {
-      const int64_t bitmap_size = vbitmap_->get_serialize_size();
+      const int64_t bitmap_size = vbitmap->get_serialize_size();
       if (OB_UNLIKELY(bitmap_size < 0)) {
         len = -1;
-        LOG_WARN_RET(OB_ALLOCATE_MEMORY_FAILED, "failed to get vbitmap serialize size", KP(vbitmap_));
+        LOG_WARN_RET(OB_ALLOCATE_MEMORY_FAILED, "failed to get vbitmap serialize size", KP(vbitmap));
       } else {
         len += bitmap_size;
       }
@@ -825,7 +971,8 @@ int64_t ObVectorIndexSegment::get_serialize_meta_size() const
   return len;
 }
 
-int ObVectorIndexSegment::serialize_meta(char *buf, const int64_t buf_len, int64_t &pos) const
+int ObVectorIndexSegment::serialize_meta(char *buf, const int64_t buf_len, int64_t &pos,
+    const ObVectorIndexRoaringBitMap *vbitmap) const
 {
   int ret = OB_SUCCESS;
   int64_t len = 0;
@@ -843,15 +990,16 @@ int ObVectorIndexSegment::serialize_meta(char *buf, const int64_t buf_len, int64
   if (has_ibitmap) {
     OB_UNIS_ENCODE(*ibitmap_);
   }
-  bool has_vbitmap = nullptr != vbitmap_;
+  bool has_vbitmap = nullptr != vbitmap;
   OB_UNIS_ENCODE(has_vbitmap);
   if (has_vbitmap) {
-    OB_UNIS_ENCODE(*vbitmap_);
+    OB_UNIS_ENCODE(*vbitmap);
   }
   return ret;
 }
 
-int ObVectorIndexSegment::deserialize_meta(const char *buf, const int64_t data_len, int64_t &pos)
+int ObVectorIndexSegment::deserialize_meta(const char *buf, const int64_t data_len, int64_t &pos,
+    ObVectorIndexRoaringBitMap *&vbitmap)
 {
   int ret = OB_SUCCESS;
   if (data_len - pos < ObVectorIndexSegmentHeader::HEAD_LEN) {
@@ -892,21 +1040,21 @@ int ObVectorIndexSegment::deserialize_meta(const char *buf, const int64_t data_l
   bool has_vbitmap = false;
   OB_UNIS_DECODE(has_vbitmap);
   if (has_vbitmap) {
-    if (OB_NOT_NULL(vbitmap_)) {
+    if (OB_NOT_NULL(vbitmap)) {
       ret = OB_DESERIALIZE_ERROR;
       LOG_WARN("vbitmap has been created", K(ret), K(data_len), K(pos));       
-    } else if (OB_ISNULL(vbitmap_ = OB_NEWx(ObVectorIndexRoaringBitMap, allocator_, allocator_, tenant_id_))) {
+    } else if (OB_ISNULL(vbitmap = OB_NEWx(ObVectorIndexRoaringBitMap, allocator_, allocator_, tenant_id_))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("failed to create vbitmap", K(ret), "size", sizeof(ObVectorIndexRoaringBitMap));
     } else {
-      OB_UNIS_DECODE(*vbitmap_);
-      if (OB_NOT_NULL(vbitmap_->insert_bitmap_)) {
-        int64_t vi_cnt = roaring64_bitmap_get_cardinality(vbitmap_->insert_bitmap_);
-        int64_t vi_min_vid = roaring64_bitmap_minimum(vbitmap_->insert_bitmap_);
-        int64_t vi_max_vid = roaring64_bitmap_maximum(vbitmap_->insert_bitmap_);
-        LOG_INFO("deserialize vbitmap success", KP(this), KPC(vbitmap_), K(vi_cnt), K(vi_min_vid), K(vi_max_vid));
+      OB_UNIS_DECODE(*vbitmap);
+      if (OB_NOT_NULL(vbitmap->insert_bitmap_)) {
+        int64_t vi_cnt = roaring64_bitmap_get_cardinality(vbitmap->insert_bitmap_);
+        int64_t vi_min_vid = roaring64_bitmap_minimum(vbitmap->insert_bitmap_);
+        int64_t vi_max_vid = roaring64_bitmap_maximum(vbitmap->insert_bitmap_);
+        LOG_INFO("deserialize vbitmap success", KP(this), KPC(vbitmap), K(vi_cnt), K(vi_min_vid), K(vi_max_vid));
       } else {
-        LOG_INFO("deserialize vbitmap success", KP(this), KPC(vbitmap_));
+        LOG_INFO("deserialize vbitmap success", KP(this), KPC(vbitmap));
       }
     }
   }
@@ -916,9 +1064,10 @@ int ObVectorIndexSegment::deserialize_meta(const char *buf, const int64_t data_l
 int ObVectorIndexSegment::serialize(const uint64_t tenant_id, ObHNSWSerializeCallback::CbParam &param)
 {
   int ret = OB_SUCCESS;
+  ObArenaAllocator serialize_allocator("VISerde", OB_MALLOC_MIDDLE_BLOCK_SIZE, tenant_id);
   ObHNSWSerializeCallback callback;
   ObOStreamBuf::Callback cb = callback;
-  ObVectorIndexSerializer index_seri(*param.allocator_);
+  ObVectorIndexSerializer index_seri(serialize_allocator);
   int64_t vec_cnt = 0;
   if (OB_FAIL(get_index_number(vec_cnt))) {
     LOG_WARN("failed to get snap index number.", K(ret));
@@ -953,7 +1102,7 @@ int ObVectorIndexSegment::serialize(
   param.tx_desc_ = tx_desc;
   param.need_serde_meta_ = nullptr != ibitmap_;
   param.task_ctx_ = task_ctx;
-  vbitmap_ = vbitmap;
+  param.vbitmap_ = vbitmap;
   int64_t index_size = 0;
   if (OB_FAIL(get_index_number(index_size))) {
     LOG_WARN("failed to get snap index number.", K(ret));
@@ -967,7 +1116,6 @@ int ObVectorIndexSegment::serialize(
   } else if (OB_FAIL(serialize(tenant_id, param))) {
     LOG_WARN("serialize index failed.", K(ret));
   }
-  vbitmap_ = nullptr;
   return ret;
 }
 
@@ -1011,7 +1159,7 @@ void ObVectorIndexRoaringBitMap::reset_bitmap()
 
 void ObVectorIndexRoaringBitMap::destroy(ObVectorIndexRoaringBitMap *bitmap)
 {
-  if (OB_NOT_NULL(bitmap)) {
+  if (OB_NOT_NULL(bitmap) && 0 == ATOMIC_SAF(&bitmap->ref_cnt_, 1)) {
     ObIAllocator *allocator = bitmap->allocator_;
     if (OB_NOT_NULL(bitmap->insert_bitmap_)) {
       lib::ObMallocHookAttrGuard malloc_guard(lib::ObMemAttr(bitmap->tenant_id_, "VIBitmap"));
@@ -1295,11 +1443,11 @@ int ObVectorIndexSegmentMeta::deserialize_snap_meta_bridge(
   } else if (OB_FAIL(ObVectorIndexSegment::create_bitmap_only(
       bridge_segment, tenant_id, allocator))) {
     LOG_WARN("create snap_meta bridge segment fail", K(ret), K(bridge_meta));
-  } else if (OB_FAIL(bridge_segment->deserialize_meta(data.ptr(), data.length(), pos))) {
+  } else if (OB_FAIL(bridge_segment->deserialize_meta(data.ptr(), data.length(), pos, bridge_meta.vbitmap_))) {
     LOG_WARN("deserialize snap_meta bridge bitmap fail", K(ret), K(data.length()), K(pos));
-  } else if (OB_ISNULL(bridge_segment->get_vbitmap())
-      || OB_ISNULL(bridge_segment->get_vbitmap()->insert_bitmap_)
-      || OB_ISNULL(bridge_segment->get_vbitmap()->delete_bitmap_)) {
+  } else if (OB_ISNULL(bridge_meta.vbitmap_)
+      || OB_ISNULL(bridge_meta.vbitmap_->insert_bitmap_)
+      || OB_ISNULL(bridge_meta.vbitmap_->delete_bitmap_)) {
     ret = OB_DESERIALIZE_ERROR;
     LOG_WARN("snap_meta bridge has incomplete vbitmap", K(ret), K(bridge_meta));
   } else if (pos != data.length()) {
@@ -1379,6 +1527,7 @@ void ObVectorIndexSegmentBuilder::free(ObIAllocator &allocator)
   has_build_ = false;
   need_vid_check_ = false;
   build_finished_ = false;
+  insert_bitmap_pruned_ = false;
   is_inited_ = false;
   for (int64_t i = 0; i < merge_source_seg_handles_.count(); ++i) {
     merge_source_seg_handles_.at(i).reset();
@@ -1481,7 +1630,8 @@ int ObVectorIndexSegmentBuilder::init_vec_buffer(
   return ret;
 }
 
-int ObVectorIndexSegmentBuilder::add_to_buffer(float* vectors, int64_t* vids, int dim, char *extra_info_buf, int num, const int64_t &extra_info_actual_size)
+int ObVectorIndexSegmentBuilder::add_to_buffer(float* vectors, int64_t* vids, int dim, char *extra_info_buf, int num, const int64_t &extra_info_actual_size,
+    const ObIArray<ObVectorIndexSegmentBuilder *> *sealed_builders)
 {
   int ret = OB_SUCCESS;
   bool has_skip_vid = false;
@@ -1494,7 +1644,7 @@ int ObVectorIndexSegmentBuilder::add_to_buffer(float* vectors, int64_t* vids, in
     for (int i = 0; i < num && OB_SUCC(ret); ++i) {
       bool has_skip_vid = false;
       const int64_t vid = vids[i];
-      if (OB_FAIL(check_vid_range(vid, has_skip_vid))) {
+      if (OB_FAIL(check_vid_range(vid, has_skip_vid, sealed_builders))) {
         LOG_WARN("check vid range fail", K(ret), KP(vids), K(num));
       } else if (has_skip_vid) {
         ++skip_cnt;
@@ -1524,7 +1674,8 @@ int ObVectorIndexSegmentBuilder::add_to_buffer(float* vectors, int64_t* vids, in
   return ret;
 }
 
-int ObVectorIndexSegmentBuilder::add_to_buffer(uint32_t *lens, uint32_t *dims, float *vals, int64_t* vids, char *extra_info_buf, int num, const int64_t &extra_info_actual_size)
+int ObVectorIndexSegmentBuilder::add_to_buffer(uint32_t *lens, uint32_t *dims, float *vals, int64_t* vids, char *extra_info_buf, int num, const int64_t &extra_info_actual_size,
+    const ObIArray<ObVectorIndexSegmentBuilder *> *sealed_builders)
 {
   int ret = OB_SUCCESS;
   bool has_skip_vid = false;
@@ -1541,7 +1692,7 @@ int ObVectorIndexSegmentBuilder::add_to_buffer(uint32_t *lens, uint32_t *dims, f
     for (int i = 0; i < num && OB_SUCC(ret); ++i) {
       bool has_skip_vid = false;
       const int64_t vid = vids[i];
-      if (OB_FAIL(check_vid_range(vid, has_skip_vid))) {
+      if (OB_FAIL(check_vid_range(vid, has_skip_vid, sealed_builders))) {
         LOG_WARN("check vid range fail", K(ret), KP(vids), K(num));
       } else if (has_skip_vid) {
         ++skip_cnt;
@@ -1754,25 +1905,58 @@ int ObVectorIndexSegmentBuilder::create_and_add_sparse_index_from_arrays(
   return ret;
 }
 
-int ObVectorIndexSegmentBuilder::serialize(const uint64_t tenant_id, ObHNSWSerializeCallback::CbParam &param)
+int ObVectorIndexSegmentBuilder::prune_insert_bitmap(const ObVectorIndexSegmentBuilder &output)
+{
+  int ret = OB_SUCCESS;
+  // Successful serialization transfers ibitmap ownership to the graph.
+  const ObVectorIndexRoaringBitMap *physical = OB_NOT_NULL(output.ibitmap_)
+      ? output.ibitmap_ : (output.segment_handle_.is_valid() ? output.segment_handle_->ibitmap_ : nullptr);
+  if (seg_type_ == ObVectorIndexSegmentType::INCR_MERGE) {
+    // Async queries still require this segment's insert whitelist.
+  } else if (OB_ISNULL(vbitmap_)) {
+    // Full BASE merge outputs do not carry bitmaps.
+  } else if (OB_ISNULL(vbitmap_->insert_bitmap_) || OB_ISNULL(physical)
+      || OB_ISNULL(physical->insert_bitmap_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("merge output bitmap is missing", K(ret), KP(vbitmap_), KP(physical));
+  } else {
+    lib::ObMallocHookAttrGuard guard(lib::ObMemAttr(vbitmap_->tenant_id_, "VIBitmap"));
+    // Record the removal before mutation, and retain it across serialization retries.
+    ROARING_TRY_CATCH(insert_bitmap_pruned_ |= roaring::api::roaring64_bitmap_intersect(
+        vbitmap_->insert_bitmap_, physical->insert_bitmap_));
+    if (OB_SUCC(ret)) {
+      ROARING_TRY_CATCH(roaring::api::roaring64_bitmap_andnot_inplace(
+          vbitmap_->insert_bitmap_, physical->insert_bitmap_));
+    }
+  }
+  return ret;
+}
+
+int ObVectorIndexSegmentBuilder::serialize(const uint64_t tenant_id,
+    ObHNSWSerializeCallback::CbParam &param, const bool prune_insert)
 {
   int ret = OB_SUCCESS;
   if (nullptr != vbitmap_) {
-    if (nullptr == ibitmap_) {
+    if (OB_ISNULL(ibitmap_) && OB_ISNULL(segment_handle_->ibitmap_)) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("ibitmap is not null", K(ret));
-    } else {
+      LOG_WARN("ibitmap is null", K(ret));
+    } else if (OB_NOT_NULL(ibitmap_)) {
       segment_handle_->ibitmap_ = ibitmap_;
-      segment_handle_->vbitmap_ = vbitmap_;
-      param.need_serde_meta_ = true;
     }
   }
-  if (OB_SUCC(ret) && OB_FAIL(segment_handle_->serialize(tenant_id, param))) {
-    LOG_WARN("serialize segment fail", K(ret));
+  if (OB_SUCC(ret) && prune_insert && OB_FAIL(prune_insert_bitmap(*this))) {
+    LOG_WARN("prune merge output insert bitmap failed", K(ret));
+  }
+  if (OB_SUCC(ret)) {
+    // The builder owns visibility until the completed metadata takes a reference.
+    param.vbitmap_ = vbitmap_;
+    param.need_serde_meta_ = nullptr != vbitmap_;
+    if (OB_FAIL(segment_handle_->serialize(tenant_id, param))) {
+      LOG_WARN("serialize segment fail", K(ret));
+    }
   }
   if (OB_SUCC(ret)) {
     ibitmap_ = nullptr;
-    vbitmap_ = nullptr;
 
     int64_t ibitmap_insert = 0;
     int64_t ibitmap_delete = 0;
@@ -1796,15 +1980,15 @@ int ObVectorIndexSegmentBuilder::serialize(const uint64_t tenant_id, ObHNSWSeria
       ibitmap_delete_min_vid = roaring64_bitmap_minimum(segment_handle_->ibitmap_->delete_bitmap_);
       ibitmap_delete_max_vid = roaring64_bitmap_maximum(segment_handle_->ibitmap_->delete_bitmap_);
     }
-    if (OB_NOT_NULL(segment_handle_->vbitmap_) && OB_NOT_NULL(segment_handle_->vbitmap_->insert_bitmap_)) {
-      vbitmap_insert = roaring64_bitmap_get_cardinality(segment_handle_->vbitmap_->insert_bitmap_);
-      vbitmap_insert_min_vid = roaring64_bitmap_minimum(segment_handle_->vbitmap_->insert_bitmap_);
-      vbitmap_insert_max_vid = roaring64_bitmap_maximum(segment_handle_->vbitmap_->insert_bitmap_);
+    if (OB_NOT_NULL(vbitmap_) && OB_NOT_NULL(vbitmap_->insert_bitmap_)) {
+      vbitmap_insert = roaring64_bitmap_get_cardinality(vbitmap_->insert_bitmap_);
+      vbitmap_insert_min_vid = roaring64_bitmap_minimum(vbitmap_->insert_bitmap_);
+      vbitmap_insert_max_vid = roaring64_bitmap_maximum(vbitmap_->insert_bitmap_);
     }
-    if (OB_NOT_NULL(segment_handle_->vbitmap_) && OB_NOT_NULL(segment_handle_->vbitmap_->delete_bitmap_)) {
-      vbitmap_delete = roaring64_bitmap_get_cardinality(segment_handle_->vbitmap_->delete_bitmap_);
-      vbitmap_delete_min_vid = roaring64_bitmap_minimum(segment_handle_->vbitmap_->delete_bitmap_);
-      vbitmap_delete_max_vid = roaring64_bitmap_maximum(segment_handle_->vbitmap_->delete_bitmap_);
+    if (OB_NOT_NULL(vbitmap_) && OB_NOT_NULL(vbitmap_->delete_bitmap_)) {
+      vbitmap_delete = roaring64_bitmap_get_cardinality(vbitmap_->delete_bitmap_);
+      vbitmap_delete_min_vid = roaring64_bitmap_minimum(vbitmap_->delete_bitmap_);
+      vbitmap_delete_max_vid = roaring64_bitmap_maximum(vbitmap_->delete_bitmap_);
     }
     LOG_INFO("serialize segment success", K(ret),
       K(ibitmap_insert), K(ibitmap_insert_min_vid), K(ibitmap_insert_max_vid),
@@ -1813,18 +1997,40 @@ int ObVectorIndexSegmentBuilder::serialize(const uint64_t tenant_id, ObHNSWSeria
       K(vbitmap_delete), K(vbitmap_delete_min_vid), K(vbitmap_delete_max_vid),
       KPC(this));
   } else {
-    segment_handle_->ibitmap_ = nullptr;
-    segment_handle_->vbitmap_ = nullptr;
+    if (OB_NOT_NULL(ibitmap_)) { segment_handle_->ibitmap_ = nullptr; }
   }
   return ret;
 }
 
-int ObVectorIndexSegmentBuilder::check_vid_range(const int64_t vid, bool &has_skip_vid)
+int ObVectorIndexSegmentBuilder::check_vid_range(const int64_t vid, bool &has_skip_vid,
+    const ObIArray<ObVectorIndexSegmentBuilder *> *sealed_builders)
 {
   int ret = OB_SUCCESS;
   has_skip_vid = false;
   ++total_cnt_;
-  if (! need_vid_check_) { // skip check
+  // DDL retries retain sealed output segments. Filter their VIDs before the
+  // normal merge-source inclusion check, including when need_vid_check_ is false.
+  for (int64_t i = 0; OB_SUCC(ret) && !has_skip_vid && nullptr != sealed_builders
+      && i < sealed_builders->count(); ++i) {
+    const ObVectorIndexSegmentBuilder *sealed = sealed_builders->at(i);
+    if (OB_ISNULL(sealed) || sealed == this || !sealed->segment_handle_.is_valid()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid sealed DDL builder", K(ret), K(i), KP(sealed));
+    } else {
+      int64_t min_vid = INT64_MAX;
+      int64_t max_vid = 0;
+      sealed->segment_handle_->get_read_bound_vid(max_vid, min_vid);
+      // Sealing caches the immutable bounds. A range hit still needs an exact lookup.
+      if ((min_vid > max_vid || (vid >= min_vid && vid <= max_vid))
+          && OB_FAIL(sealed->segment_handle_->check_id_exist(vid, has_skip_vid))) {
+        LOG_WARN("check sealed DDL VID failed", K(ret), K(vid), K(i));
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (has_skip_vid) {
+    ++skip_cnt_;
+  } else if (! need_vid_check_) { // skip check
     ++add_cnt_;
   } else if (! vid_bound_.is_valid()) {
     ret = OB_ERR_UNEXPECTED;
@@ -1877,14 +2083,15 @@ int ObVectorIndexSegmentBuilder::check_vid_range(const int64_t vid, bool &has_sk
   return ret;
 }
 
-int ObVectorIndexSegmentBuilder::add_index(float* vecs, int64_t* ids, int dim, char *extra_info, int size, int64_t extra_info_actual_size)
+int ObVectorIndexSegmentBuilder::add_index(float* vecs, int64_t* ids, int dim, char *extra_info, int size, int64_t extra_info_actual_size,
+    const ObIArray<ObVectorIndexSegmentBuilder *> *sealed_builders)
 {
   int ret = OB_SUCCESS;
   char *curr_extra_info = nullptr;
   for (int i = 0; i < size && OB_SUCC(ret); ++i) {
     bool has_skip_vid = false;
     const int64_t vid = ids[i];
-    if (OB_FAIL(check_vid_range(vid, has_skip_vid))) {
+    if (OB_FAIL(check_vid_range(vid, has_skip_vid, sealed_builders))) {
       LOG_WARN("check vid range fail", K(ret), KP(ids), K(size));
     } else if (has_skip_vid) {
     } else {
@@ -1902,7 +2109,8 @@ int ObVectorIndexSegmentBuilder::add_index(float* vecs, int64_t* ids, int dim, c
   return ret;
 }
 
-int ObVectorIndexSegmentBuilder::add_index(uint32_t *lens, uint32_t *dims, float *vals, int64_t *ids, int size, char *extra_infos, int64_t extra_info_actual_size)
+int ObVectorIndexSegmentBuilder::add_index(uint32_t *lens, uint32_t *dims, float *vals, int64_t *ids, int size, char *extra_infos, int64_t extra_info_actual_size,
+    const ObIArray<ObVectorIndexSegmentBuilder *> *sealed_builders)
 {
   int ret = OB_SUCCESS;
   uint32_t curr_offset = 0;
@@ -1910,7 +2118,7 @@ int ObVectorIndexSegmentBuilder::add_index(uint32_t *lens, uint32_t *dims, float
   for (int i = 0; i < size && OB_SUCC(ret); ++i) {
     bool has_skip_vid = false;
     const int64_t vid = ids[i];
-    if (OB_FAIL(check_vid_range(vid, has_skip_vid))) {
+    if (OB_FAIL(check_vid_range(vid, has_skip_vid, sealed_builders))) {
       LOG_WARN("check vid range fail", K(ret), KP(ids), K(size));
     } else if (has_skip_vid) {
       curr_offset += lens[i];
@@ -1930,15 +2138,73 @@ int ObVectorIndexSegmentBuilder::add_index(uint32_t *lens, uint32_t *dims, float
   return ret;
 }
 
+void ObVecIdxSnapshotData::free_builders(ObIAllocator &allocator)
+{
+  for (int64_t i = 0; i < sealed_builders_.count(); ++i) {
+    ObVectorIndexSegmentBuilder *builder = sealed_builders_.at(i);
+    builder->free(allocator);
+    builder->~ObVectorIndexSegmentBuilder();
+    allocator.free(builder);
+  }
+  sealed_builders_.reset();
+  if (OB_NOT_NULL(builder_)) {
+    builder_->free(allocator);
+    builder_->~ObVectorIndexSegmentBuilder();
+    allocator.free(builder_);
+    builder_ = nullptr;
+  }
+}
+
+int ObVecIdxSnapshotData::append_base_meta(ObVectorIndexMeta &meta,
+    ObVectorIndexSegmentBuilder &builder, const ObTabletID &tablet_id,
+    const int64_t snapshot_version, const int64_t first_block,
+    const int64_t block_count, const ObString &index_param)
+{
+  int ret = OB_SUCCESS;
+  ObVectorIndexSegmentMeta segment;
+  if (!builder.segment_handle_.is_valid() || first_block < 0 || block_count <= 0
+      || first_block > INT64_MAX - block_count || snapshot_version <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid base metadata input", K(ret), K(first_block), K(block_count),
+        K(snapshot_version));
+  } else {
+    segment.index_type_ = builder.segment_handle_->get_index_type();
+    if (OB_FAIL(ObVectorIndexSegmentMeta::get_segment_persist_key(segment.index_type_,
+        tablet_id, snapshot_version, first_block, segment.start_key_buf_,
+        sizeof(segment.start_key_buf_), segment.start_key_))) {
+      LOG_WARN("build DDL start key failed", K(ret));
+    } else if (OB_FAIL(ObVectorIndexSegmentMeta::get_segment_persist_key(segment.index_type_,
+        tablet_id, snapshot_version, first_block + block_count - 1, segment.end_key_buf_,
+        sizeof(segment.end_key_buf_), segment.end_key_))) {
+      LOG_WARN("build DDL end key failed", K(ret));
+    } else if (OB_FAIL(segment.set_index_param(index_param))) {
+      LOG_WARN("set DDL segment parameters failed", K(ret));
+    } else {
+      segment.seg_type_ = ObVectorIndexSegmentType::BASE;
+      segment.scn_ = snapshot_version;
+      segment.blocks_cnt_ = block_count;
+      segment.segment_handle_ = builder.segment_handle_;
+      segment.segment_handle_->set_is_base();
+      segment.set_vbitmap(builder.vbitmap_);
+      segment.has_segment_meta_row_ = segment.vbitmap_ != nullptr;
+      segment.bitmap_scn_ = segment.has_segment_meta_row_ ? snapshot_version : 0;
+      meta.header_.scn_ = snapshot_version;
+      if (OB_FAIL(meta.bases_.push_back(segment))) {
+        LOG_WARN("append DDL base failed", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
 void ObVecIdxSnapshotData::free_memdata_resource(ObIAllocator *allocator, const uint64_t tenant_id)
 {
   LOG_INFO("free snap memdata", KPC(this), K(allocator), K(lbt()));
-  if (OB_NOT_NULL(builder_)) {
-    builder_->free(*allocator);
-    builder_->~ObVectorIndexSegmentBuilder();
-    allocator->free(builder_);
-    builder_ = nullptr;
-  }
+  free_builders(*allocator);
+  enable_multi_segment_ = false;
+  segment_max_vectors_ = 0;
+  need_switch_segment_ = false;
+  insert_bitmap_pruned_ = false;
   meta_.release();
   is_init_ = false;
 }
@@ -1961,10 +2227,12 @@ int ObVecIdxSnapshotData::free_segment_memory()
   for (int64_t i = 0; i < meta_.incrs_.count(); ++i) {
     ObVectorIndexSegmentMeta &seg_meta = meta_.incrs_.at(i);
     seg_meta.segment_handle_.reset();
+    seg_meta.set_vbitmap(nullptr);
   }
   for (int64_t i = 0; i < meta_.bases_.count(); ++i) {
     ObVectorIndexSegmentMeta &seg_meta = meta_.bases_.at(i);
     seg_meta.segment_handle_.reset();
+    seg_meta.set_vbitmap(nullptr);
   }
   has_complete_ = false;
   return ret;
@@ -2063,47 +2331,11 @@ bool ObVecIdxSnapshotData::check_incr_mem_over_percentage(const int64_t incr_mem
   return base_hold > 0 && incr_memory_percentage > 0 && incr_hold * 100 > incr_memory_percentage * (incr_hold + base_hold);
 }
 
-bool ObVecIdxSnapshotData::check_incr_can_merge_base() const
-{
-  bool can_merge = false;
-  if (meta_.incrs_.count() == 1) {
-    const ObVectorIndexSegmentMeta &seg_meta = meta_.incrs_.at(0);
-    const ObVectorIndexSegmentHandle &handle = seg_meta.segment_handle_;
-    if (! handle.is_valid()) {
-      LOG_INFO("segment handle is not load, so can not merge", KP(this), K(seg_meta));
-    } else {
-      uint64_t diff_cnt = 0;
-      const bool has_vbitmap = (OB_NOT_NULL(handle->vbitmap_) && OB_NOT_NULL(handle->vbitmap_->insert_bitmap_));
-      const bool has_ibitmap = (OB_NOT_NULL(handle->ibitmap_) && OB_NOT_NULL(handle->ibitmap_->insert_bitmap_));
-      roaring::api::roaring64_bitmap_t *vbitmap = nullptr;
-      roaring::api::roaring64_bitmap_t *ibitmap = nullptr;
-      if (has_vbitmap && has_ibitmap) {
-        vbitmap = handle->vbitmap_->insert_bitmap_;
-        ibitmap = handle->ibitmap_->insert_bitmap_;
-        diff_cnt = roaring64_bitmap_xor_cardinality(ibitmap, vbitmap);
-      } else if (has_vbitmap) {
-        vbitmap = handle->vbitmap_->insert_bitmap_;
-        diff_cnt = roaring64_bitmap_get_cardinality(vbitmap);
-      } else if (has_ibitmap) {
-        ibitmap = handle->ibitmap_->insert_bitmap_;
-        diff_cnt = roaring64_bitmap_get_cardinality(ibitmap);
-      }
-      if (0 == diff_cnt) {
-        can_merge = true;
-        LOG_INFO("diff is empty, merge from base", KP(this), K(diff_cnt));
-      } else {
-        LOG_INFO("diff is not empty, need to wait", KP(this), K(diff_cnt));
-      }
-    }
-  }
-  return can_merge;
-}
-
 ObVectorIndexAlgorithmType ObVecIdxSnapshotData::get_snap_index_type() const
 {
   ObVectorIndexAlgorithmType index_type = VIAT_MAX;
-  if (meta_.bases_.count() > 0) {
-    const ObVectorIndexSegmentHandle segment_handle = meta_.bases_.at(0).segment_handle_;
+  for (int64_t i = 0; index_type == VIAT_MAX && i < meta_.segment_count(); ++i) {
+    const ObVectorIndexSegmentHandle segment_handle = meta_.flat_seg_meta_at(i).segment_handle_;
     if (segment_handle.is_valid()) {
       index_type = segment_handle->get_index_type();
     }
@@ -2177,7 +2409,9 @@ int ObVecIdxSnapshotData::build_meta(
     seg_meta.scn_ = snapshot_version;
     seg_meta.blocks_cnt_ = blocks_cnt;
     seg_meta.segment_handle_ = builder_->segment_handle_;
-    seg_meta.has_segment_meta_row_ = seg_meta.segment_handle_->vbitmap_ != nullptr;
+    seg_meta.set_vbitmap(builder_->vbitmap_);
+    seg_meta.has_segment_meta_row_ = seg_meta.vbitmap_ != nullptr;
+    seg_meta.bitmap_scn_ = seg_meta.has_segment_meta_row_ ? snapshot_version : 0;
     meta_.header_.scn_ = snapshot_version;
     if (OB_FAIL(meta_.bases_.push_back(seg_meta))) {
       LOG_WARN("push back seg meta fail", K(ret), K(seg_meta));
@@ -2194,7 +2428,48 @@ int ObVecIdxSnapshotData::build_meta(
 int ObVecIdxSnapshotData::build_finished(ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
-  if (! meta_.is_valid()) {
+  // Capture both single- and multi-output reclamation before builders are freed.
+  insert_bitmap_pruned_ |= OB_NOT_NULL(builder_) && builder_->insert_bitmap_pruned_;
+  for (int64_t i = 0; i < sealed_builders_.count(); ++i) {
+    insert_bitmap_pruned_ |= OB_NOT_NULL(sealed_builders_.at(i))
+        && sealed_builders_.at(i)->insert_bitmap_pruned_;
+  }
+  if (enable_multi_segment_) {
+    ObVecIndexBuildSegInfo info;
+    info.min_vid_ = INT64_MAX;
+    if (!meta_.is_valid() || meta_.bases_.count() != sealed_builders_.count()
+        || OB_NOT_NULL(builder_)) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_WARN("snapshot metadata does not match sealed builders", K(ret), KPC(this));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < meta_.bases_.count(); ++i) {
+      ObVectorIndexSegmentHandle &handle = meta_.bases_.at(i).segment_handle_;
+      int64_t count = 0;
+      int64_t min_vid = 0;
+      int64_t max_vid = 0;
+      if (!handle.is_valid() || OB_ISNULL(sealed_builders_.at(i))
+          || handle.get() != sealed_builders_.at(i)->segment_handle_.get()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("snapshot segment does not match sealed builder", K(ret), K(i));
+      } else if (OB_FAIL(handle->get_index_number(count))) {
+        LOG_WARN("get completed DDL segment count failed", K(ret));
+      } else if (count > 0 && OB_FAIL(handle->get_vid_bound(min_vid, max_vid))) {
+        LOG_WARN("get completed DDL VID range failed", K(ret));
+      } else {
+        handle->set_read_vid_bound(ObVidBound(min_vid, max_vid));
+        info.vector_cnt_ += count;
+        info.mem_used_ += handle->get_mem_used();
+        info.min_vid_ = MIN(info.min_vid_, min_vid);
+        info.max_vid_ = MAX(info.max_vid_, max_vid);
+      }
+    }
+    if (OB_SUCC(ret)) {
+      last_res_seg_info_ = info;
+      vid_bound_.set_vid_bound(info.max_vid_, info.min_vid_);
+      free_builders(allocator);
+      has_complete_ = true;
+    }
+  } else if (! meta_.is_valid()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("meta is not valid, so can not finish", K(ret), K(meta_));
   } else if (OB_ISNULL(builder_)) {
@@ -2232,12 +2507,12 @@ int ObVecIdxSnapshotData::immutable_optimize_snap()
   int ret = OB_SUCCESS;
   if (meta_.bases_.count() == 0) {
     LOG_INFO("empty snap, so donot optimize", K(meta_));
-  } else if (meta_.bases_.count() != 1) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("snap count is not expected", K(meta_));
-  } else if (meta_.bases_.at(0).segment_handle_.is_valid()
-      && OB_FAIL(meta_.bases_.at(0).segment_handle_->immutable_optimize())) {
-    LOG_WARN("immutable_optimize fail", K(ret), K(meta_));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < meta_.bases_.count(); ++i) {
+    if (meta_.bases_.at(i).segment_handle_.is_valid()
+        && OB_FAIL(meta_.bases_.at(i).segment_handle_->immutable_optimize())) {
+      LOG_WARN("immutable_optimize fail", K(ret), K(i), K(meta_));
+    }
   }
   return ret;
 }
@@ -2322,6 +2597,7 @@ int ObVecIdxSnapshotData::load_segment(ObIAllocator &allocator, ObPluginVectorIn
   }
   if (OB_FAIL(ret)) {
     seg_meta.segment_handle_.reset();
+    seg_meta.set_vbitmap(nullptr);
   }
   return ret;
 }
@@ -2361,6 +2637,7 @@ int ObVecIdxSnapshotData::load_segment(ObPluginVectorIndexAdaptor *adaptor,
 
   if (OB_FAIL(ret)) {
     seg_meta.segment_handle_.reset();
+    seg_meta.set_vbitmap(nullptr);
   }
   if (OB_NOT_NULL(snap_data_iter)) {
     int tmp_ret = MTL(ObAccessService*)->revert_scan_iter(snap_data_iter);
@@ -2563,14 +2840,17 @@ int ObVectorIndexSegQueryHandler::knn_search(ObVsagQueryResult &result, int segm
     result.mem_ctx_ = segment_querier_->handle_->mem_ctx_;
     int64_t actual_ef_search = 0;
     int64_t actual_query_limit = 0;
-    calc_segment_ef_params(query_cond_, segment_cnt, actual_ef_search, actual_query_limit);
+    calc_segment_ef_params(*this, ctx_->segments_, segment_cnt, vec_cnt, actual_ef_search, actual_query_limit);
 
     const float timeout_ms = calc_vsag_search_timeout_ms(
         query_cond_->ef_search_, static_cast<double>(selectivity_), segment_cnt);
 
     LOG_TRACE("multi-segment knn_search ef_search adjust",
       K(segment_cnt), K(query_cond_->ef_search_), K(actual_ef_search),
-      K(actual_query_limit), K(timeout_ms), K(selectivity_));
+      K(query_cond_->query_limit_), K(actual_query_limit), K(vec_cnt),
+      K_(total_vector_count), "size_weighted_ef", total_vector_count_ > 0,
+      KP(segment_querier_->handle_.get()),
+      K(timeout_ms), K(selectivity_));
     if (! query_cond_->is_post_with_filter_) {
       if (is_sparse_vector_) {
         ObCostGuard incr_cost_guard(this, "sparse_pre", query_cond_->ob_sparse_drop_ratio_search_, query_cond_->query_limit_);

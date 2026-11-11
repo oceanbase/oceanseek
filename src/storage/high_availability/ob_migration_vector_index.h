@@ -328,7 +328,8 @@ private:
       ObVecIdxSegFetchDriverHandle &handle,
       int64_t buf_size,
       common::ObIAllocator &alloc,
-      share::ObVectorIndexSegmentHandle &dest_segment_handle);
+      share::ObVectorIndexSegmentHandle &dest_segment_handle,
+      share::ObVectorIndexRoaringBitMap *&vbitmap);
   int stream_deserialize_vsag_(
       ObVecIdxSegFetchDriverHandle &handle,
       int64_t buf_size,

@@ -78,6 +78,7 @@ int ObVecIdxFreezeTaskExecutor::load_triggered_task(const ObVecIndexTaskStatus &
 int ObVecIdxFreezeTaskExecutor::load_task(uint64_t &task_trace_base_num)
 {
   int ret = OB_SUCCESS;
+  uint64_t tenant_data_version = 0;
   ObSchemaGetterGuard schema_guard;
   ObVecIndexSchemaChecker schema_checker(tenant_id_, schema_guard);
   ObPluginVectorIndexMgr *index_ls_mgr = nullptr;
@@ -86,6 +87,8 @@ int ObVecIdxFreezeTaskExecutor::load_task(uint64_t &task_trace_base_num)
     ret = OB_NOT_INIT;
     LOG_WARN("vector async task not init", KR(ret));
   } else if (!check_operation_allow()) { // skip
+  } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id_, tenant_data_version))) {
+    LOG_WARN("get tenant data version failed", K(ret), K(tenant_id_));
   } else if (OB_FAIL(get_index_ls_mgr(index_ls_mgr))) { // skip
     LOG_WARN("fail to get index ls mgr", K(ret), K(tenant_id_), K(ls_handle_));
   } else if (OB_NOT_NULL(index_ls_mgr) && index_ls_mgr->get_async_task_opt().is_stop()) {
@@ -149,8 +152,9 @@ int ObVecIdxFreezeTaskExecutor::load_task(uint64_t &task_trace_base_num)
           LOG_TRACE("adapter not complete, no need freeze", K(ret), KPC(adapter));
         } else if (!adapter->is_ready_complete()) {
           LOG_INFO("adapter is not complete, no need freeze", K(ret), KPC(adapter));
-        } else if (adapter->is_sparse_vector_index_type()) {
-          LOG_TRACE("adapter is sparse vector index, no need merge", K(ret), KPC(adapter));
+        } else if (adapter->is_sparse_vector_index_type() && tenant_data_version < DATA_VERSION_4_6_3_1) {
+          // Enable sparse automatic freeze only after the tenant upgrade completes.
+          LOG_INFO("sparse freeze requires data version 4_6_3_1", K(tenant_data_version));
         } else if (OB_HASH_EXIST == dropping_index_ids.exist_refactored(adapter->get_inc_table_id())) {
           if (REACH_TIME_INTERVAL(10 * 1000 * 1000)) {
             LOG_WARN("[VEC_DDL_SKIP] skip freeze generation for dropping index",
@@ -412,6 +416,7 @@ int ObVecIdxFreezeTask::try_handle_empty_frozen_segment_(
 int ObVecIdxFreezeTask::process_freeze()
 {
   int ret = OB_SUCCESS;
+  uint64_t tenant_data_version = 0;
   ObPluginVectorIndexAdapterGuard adpt_guard;
   ObPluginVectorIndexService *vector_index_service = MTL(ObPluginVectorIndexService *);
   LOG_TRACE("[VECTOR INDEX FREEZE] start process_freeze", K(ret), K(ctx_->task_status_), K(ls_id_));
@@ -434,6 +439,14 @@ int ObVecIdxFreezeTask::process_freeze()
   } else if (OB_ISNULL(adpt_guard.get_adatper())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("fail to get vector index adapter", KR(ret), KPC(ctx_));
+  } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id_, tenant_data_version))) {
+    LOG_WARN("get tenant data version before sparse freeze failed", K(ret), K(tenant_id_));
+  } else if (adpt_guard.get_adatper()->is_sparse_vector_index_type()
+      && tenant_data_version < DATA_VERSION_4_6_3_1) {
+    // Manual and resumed tasks may bypass executor admission checks.
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("sparse vector index freeze requires data version 4_6_3_1",
+        K(ret), K(tenant_id_), K(tenant_data_version), KPC(ctx_));
   } else if (!adpt_guard.get_adatper()->is_complete()) {
     ret = OB_EAGAIN;
     LOG_INFO("adapter not complete, need wait", K(ret), KP(adpt_guard.get_adatper()));
@@ -619,6 +632,13 @@ int ObVecIdxFreezeTask::do_check_and_freeze(ObPluginVectorIndexAdapterGuard &adp
         } else {
           frozen_data->set_frozen_finish();
           LOG_INFO("active segment freeze and persist success");
+          ObPluginVectorIndexAdapterGuard current;
+          int tmp_ret = OB_SUCCESS;
+          if (OB_TMP_FAIL(vec_idx_mgr_->get_adapter_inst_guard(adaptor->get_inc_tablet_id(), current))) {
+            LOG_WARN("get current adapter failed", K(tmp_ret));
+          } else if (OB_TMP_FAIL(current.get_adatper()->refresh_segment_delete_counts(ctx_))) {
+            LOG_WARN("refresh segment delete counts failed", K(tmp_ret));
+          }
         }
         break;
       }
@@ -822,7 +842,7 @@ int ObVecIdxFreezeTask::refresh_adaptor(
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(new_adapter->deserialize_snap_meta(meta_data))) {
       LOG_WARN("deserialize snap meta fail", K(ret), K(meta_scn), K(meta_data.length()));
-    } else if (OB_FAIL(try_reuse_segments_from_old_adapter())) {
+    } else if (OB_FAIL(try_reuse_segments_from_old_adapter(current_scn))) {
       LOG_WARN("try reuse segments from old adapter fail", K(ret));
     } else if (OB_FAIL(new_adapter->get_snap_data()->load_persist_segments(new_adapter, allocator_, ls_id_,
         current_scn, ctx_))) {

@@ -1,0 +1,2 @@
+storage_unittest(test_vector_index_multi_segment test_vector_index_multi_segment.cpp)
+target_include_directories(test_vector_index_multi_segment PRIVATE ${CMAKE_SOURCE_DIR}/unittest/storage)

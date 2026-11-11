@@ -239,7 +239,8 @@ int TestVectorIndexBase::check_segment_meta_row(ObPluginVectorIndexAdaptor *adap
       LOG_WARN("read real string data fail", K(ret));
     } else if (OB_FAIL(adaptor->create_snap_segment(seg_meta.index_type_, seg_meta))) {
       LOG_WARN("init seg data fail", K(ret), K(seg_meta));
-    } else if (seg_meta.segment_handle_->deserialize_meta(real_data.ptr(), real_data.length(), pos)) {
+    } else if (OB_FAIL(seg_meta.segment_handle_->deserialize_meta(
+        real_data.ptr(), real_data.length(), pos, seg_meta.vbitmap_))) {
       LOG_WARN("deserialize meta fail", K(ret), K(real_data.length()), K(pos));
     } else if (OB_ISNULL(seg_meta.segment_handle_->ibitmap_)) {
       ret = OB_ERR_UNEXPECTED;
@@ -250,21 +251,21 @@ int TestVectorIndexBase::check_segment_meta_row(ObPluginVectorIndexAdaptor *adap
     } else if (OB_NOT_NULL(seg_meta.segment_handle_->ibitmap_->delete_bitmap_)) {
       ret = OB_ERR_UNEXPECTED;
       LOGI("segment delete bitmap is not null", K(ret)); 
-    } else if (OB_ISNULL(seg_meta.segment_handle_->vbitmap_)) {
+    } else if (OB_ISNULL(seg_meta.vbitmap_)) {
       ret = OB_ERR_UNEXPECTED;
       LOGI("segment ibitmap is null", K(ret));
-    } else if (OB_ISNULL(seg_meta.segment_handle_->vbitmap_->insert_bitmap_)) {
+    } else if (OB_ISNULL(seg_meta.vbitmap_->insert_bitmap_)) {
       ret = OB_ERR_UNEXPECTED;
       LOGI("segment insert bitmap is null", K(ret));
-    } else if (OB_ISNULL(seg_meta.segment_handle_->vbitmap_->delete_bitmap_)) {
+    } else if (OB_ISNULL(seg_meta.vbitmap_->delete_bitmap_)) {
       ret = OB_ERR_UNEXPECTED;
       LOGI("segment delete bitmap is not null", K(ret)); 
     } else {
       int64_t ii_cnt = roaring64_bitmap_get_cardinality(seg_meta.segment_handle_->ibitmap_->insert_bitmap_);
-      int64_t vi_cnt = roaring64_bitmap_get_cardinality(seg_meta.segment_handle_->vbitmap_->insert_bitmap_);
-      int64_t vd_cnt = roaring64_bitmap_get_cardinality(seg_meta.segment_handle_->vbitmap_->delete_bitmap_);
+      int64_t vi_cnt = roaring64_bitmap_get_cardinality(seg_meta.vbitmap_->insert_bitmap_);
+      int64_t vd_cnt = roaring64_bitmap_get_cardinality(seg_meta.vbitmap_->delete_bitmap_);
       const bool is_subset = roaring64_bitmap_is_subset(
-          seg_meta.segment_handle_->vbitmap_->insert_bitmap_,
+          seg_meta.vbitmap_->insert_bitmap_,
           seg_meta.segment_handle_->ibitmap_->insert_bitmap_);
 
       LOG_INFO("seg_meta info", K(seg_meta), K(ii_cnt), K(vi_cnt), K(vd_cnt), K(is_subset));
