@@ -11531,6 +11531,9 @@ int ObDDLService::check_new_column_for_index(
         copy_index_column_schema.reset();
         if (OB_FAIL(copy_index_column_schema.assign(new_column_schema))) {
           LOG_WARN("fail to assign column schema", KR(ret), K(new_column_schema));
+        } else if (index_table_schema->is_search_def_index()
+                   && OB_FAIL(copy_index_column_schema.set_comment(origin_idx_column_schema->get_comment_str()))) {
+          LOG_WARN("failed to preserve search index column config", K(ret));
         } else {
           copy_index_column_schema.set_rowkey_position(origin_idx_column_schema->get_rowkey_position());
           copy_index_column_schema.set_index_position(origin_idx_column_schema->get_index_position());
@@ -11637,6 +11640,10 @@ int ObDDLService::alter_table_update_aux_column(
           // exist such column in aux schema
           if (OB_FAIL(new_aux_column_schema.assign(new_column_schema))) {
             LOG_WARN("fail to assign column", KR(ret), K(new_column_schema));
+          } else if (aux_table_schema->is_search_def_index()
+                     && OB_FAIL(new_aux_column_schema.set_comment(origin_column_schema->get_comment_str()))) {
+            // Search-def column comments hold WITH(...) config, independent of base column comments.
+            LOG_WARN("failed to preserve search index column config", K(ret));
           } else {
             new_aux_column_schema.set_table_id(aux_table_schema->get_table_id());
             new_aux_column_schema.set_autoincrement(false);
@@ -40803,6 +40810,9 @@ int ObDDLService::check_new_columns_for_index(ObIArray<ObTableSchema> &idx_schem
         ObColumnSchemaV2 copy_index_column_schema;
         if (OB_FAIL(copy_index_column_schema.assign(new_column_schemas.at(j)))) {
           LOG_WARN("fail to assign column", KR(ret), K(new_column_schemas.at(j)));
+        } else if (index_table_schema->is_search_def_index()
+                   && OB_FAIL(copy_index_column_schema.set_comment(orig_idx_col_schema->get_comment_str()))) {
+          LOG_WARN("failed to preserve search index column config", K(ret));
         } else {
           copy_index_column_schema.set_rowkey_position(orig_idx_col_schema->get_rowkey_position());
           copy_index_column_schema.set_index_position(orig_idx_col_schema->get_index_position());
