@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL_DAS
 #include "ob_das_conjunction_op.h"
+#include <cmath>
 #include "sql/das/ob_das_def_reg.h"
 #include "storage/tx_storage/ob_access_service.h"
 #include "sql/das/search/ob_das_search_context.h"
@@ -73,8 +74,48 @@ int ObDASConjunctionOp::classify_children()
     }
     last_idx_ = 0;
   }
+  if (OB_SUCC(ret) && OB_FAIL(init_fixed_score_bound())) {
+    LOG_WARN("failed to initialize conjunction fixed score bound", KR(ret));
+  }
   LOG_TRACE("classify children", KR(ret), K(driver_ops_.count()), K(probe_ops_.count()),
     K(children_cnt_), K(has_probe_child_));
+  return ret;
+}
+
+int ObDASConjunctionOp::init_fixed_score_bound()
+{
+  int ret = OB_SUCCESS;
+  const double MAX_EXACT_INTEGER_SCORE = 9007199254740992.0; // 2^53
+  double max_score = 0.0;
+  bool known = is_scoring_ && driver_ops_.count() > 1;
+  is_fixed_score_ = false;
+  fixed_score_bound_ = INVALID_FIXED_SCORE_BOUND;
+  // The builder only permits non-scoring probes; only drivers contribute scores.
+  for (int64_t i = 0; OB_SUCC(ret) && known && i < driver_ops_.count(); ++i) {
+    ObIDASSearchOp *op = driver_ops_.at(i);
+    double child_score = 0.0;
+    if (OB_ISNULL(op)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null conjunction child", KR(ret), K(i));
+    } else if (ScoreCapability::ARRAY == op->get_score_capability()) {
+      known = false;
+    } else {
+      child_score = op->get_constant_score();
+      // Nonnegative integer partial sums up to 2^53 are exact in every driver order.
+      // shortcut: fractional boosts are not optimized; revisit with a linear-time safe bound.
+      if (!std::isfinite(child_score) || child_score < 0.0
+          || std::floor(child_score) != child_score
+          || child_score > MAX_EXACT_INTEGER_SCORE - max_score) {
+        known = false;
+      } else {
+        max_score += child_score;
+      }
+    }
+  }
+  if (OB_SUCC(ret) && known) {
+    fixed_score_bound_ = max_score;
+    is_fixed_score_ = true;
+  }
   return ret;
 }
 
@@ -101,6 +142,8 @@ int ObDASConjunctionOp::do_open()
 int ObDASConjunctionOp::do_rescan_segment(const common::ObNewVersionRange &range)
 {
   int ret = OB_SUCCESS;
+  is_fixed_score_ = false;
+  fixed_score_bound_ = INVALID_FIXED_SCORE_BOUND;
   for (int i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
     if (OB_ISNULL(children_[i])) {
       ret = OB_ERR_UNEXPECTED;
@@ -111,6 +154,9 @@ int ObDASConjunctionOp::do_rescan_segment(const common::ObNewVersionRange &range
   }
   if (OB_SUCC(ret)) {
     last_idx_ = 0;
+    if (OB_FAIL(init_fixed_score_bound())) {
+      LOG_WARN("failed to refresh conjunction fixed score bound", KR(ret));
+    }
   }
   return ret;
 }
@@ -118,6 +164,8 @@ int ObDASConjunctionOp::do_rescan_segment(const common::ObNewVersionRange &range
 int ObDASConjunctionOp::do_rescan()
 {
   int ret = OB_SUCCESS;
+  is_fixed_score_ = false;
+  fixed_score_bound_ = INVALID_FIXED_SCORE_BOUND;
   for (int i = 0; OB_SUCC(ret) && i < children_cnt_; ++i) {
     ObIDASSearchOp *op = children_[i];
     if (OB_ISNULL(op)) {
@@ -140,6 +188,8 @@ int ObDASConjunctionOp::do_close()
   int ret = OB_SUCCESS;
   last_idx_ = 0;
   has_probe_child_ = false;
+  is_fixed_score_ = false;
+  fixed_score_bound_ = INVALID_FIXED_SCORE_BOUND;
   probe_ops_.reset();
   driver_ops_.reset();
   return ret;
@@ -155,6 +205,9 @@ int ObDASConjunctionOp::do_advance_to(const ObDASRowID &target, ObDASRowID &curr
   if (OB_UNLIKELY(last_idx_ >= driver_ops_.count() || OB_ISNULL(op = driver_ops_.at(last_idx_)))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null op", KR(ret), K(last_idx_), K(driver_ops_.count()));
+  } else if (has_fixed_score_bound() && cannot_compete_with_score(fixed_score_bound_)) {
+    curr_id.set_max();
+    ret = OB_ITER_END;
   } else if (OB_FAIL(op->advance_to(target, init_target, score))) {
     LOG_WARN_IGNORE_ITER_END(ret, "failed to advance to", KR(ret));
   } else if (OB_FAIL(inner_advance_to(init_target, curr_id, score))) {
@@ -309,6 +362,9 @@ int ObDASConjunctionOp::do_next_rowid(ObDASRowID &next_id, double &score)
   if (OB_UNLIKELY(last_idx_ >= driver_ops_.count() || OB_ISNULL(op = driver_ops_.at(last_idx_)))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null op", KR(ret), K(last_idx_));
+  } else if (has_fixed_score_bound() && cannot_compete_with_score(fixed_score_bound_)) {
+    next_id.set_max();
+    ret = OB_ITER_END;
   } else if (OB_FAIL(op->next_rowid(init_target, score))) {
     LOG_WARN_IGNORE_ITER_END(ret, "failed to next rowid", KR(ret), K(last_idx_));
   } else if (OB_FAIL(inner_advance_to(init_target, next_id, score))) {
@@ -330,6 +386,10 @@ int ObDASConjunctionOp::do_advance_shallow(
   ObDASRowID candidate_target = target;
   double max_score = 0.0;
   int cmp = 0;
+  if (has_fixed_score_bound() && cannot_compete_with_score(fixed_score_bound_)) {
+    max_score_tuple = nullptr;
+    ret = OB_ITER_END;
+  }
   while (OB_SUCC(ret)) {
     max_score = 0.0;
     maximum_min_id.set_min();
@@ -373,6 +433,17 @@ int ObDASConjunctionOp::do_advance_shallow(
   if (OB_SUCC(ret)) {
     max_score_tuple_.set(maximum_min_id, minimal_max_id, max_score);
     max_score_tuple = &max_score_tuple_;
+  }
+  return ret;
+}
+
+int ObDASConjunctionOp::do_calc_max_score(double &threshold)
+{
+  int ret = OB_SUCCESS;
+  if (has_fixed_score_bound()) {
+    threshold = fixed_score_bound_;
+  } else if (OB_FAIL(ObIDASSearchOp::do_calc_max_score(threshold))) {
+    LOG_WARN("failed to calculate conjunction max score", KR(ret));
   }
   return ret;
 }

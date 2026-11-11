@@ -67,7 +67,7 @@ protected:
   ObDSLFullTextQuery(ObEsQueryItem query_type, ObEsQueryItem outer_query_type, ObDSLQuery *parent_query)
     : ObDSLQuery(query_type, outer_query_type, parent_query) {}
   virtual int inner_deep_copy(ObIRawExprCopier &expr_copier, ObDSLFullTextQuery &dst) const;
-  ObConstRawExpr *query_;
+  ObRawExpr *query_;
 };
 
 class ObDSLMatchQuery final : public ObDSLFullTextQuery

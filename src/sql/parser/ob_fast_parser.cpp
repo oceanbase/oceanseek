@@ -5,6 +5,10 @@
 
 #define USING_LOG_PREFIX SQL_PARSER
 #include "ob_fast_parser.h"
+#ifndef SQL_PARSER_COMPILATION
+// The standalone proxy parser does not link the hybrid-search SQL module.
+#include "sql/hybrid_search/ob_hybrid_search_plan_cache.h"
+#endif
 #include "sql/udr/ob_udr_struct.h"
 #include "share/ob_define.h"
 #include "lib/ash/ob_active_session_guard.h"
@@ -3165,6 +3169,19 @@ int ObFastParserMysql::parse_next_token()
         break;
       }
     } // end switch
+#ifndef SQL_PARSER_COMPILATION
+    if (OB_SUCC(ret) && hybrid_search_token_handler_ != nullptr
+        && hybrid_search_token_handler_->need_process_token(raw_sql_.ptr(cur_token_begin_pos_),
+            raw_sql_.cur_pos_ - cur_token_begin_pos_, NORMAL_TOKEN == cur_token_type_)) {
+      OZ(hybrid_search_token_handler_->process_token(
+          ObString(raw_sql_.cur_pos_ - cur_token_begin_pos_, raw_sql_.ptr(cur_token_begin_pos_)),
+          cur_token_begin_pos_, no_param_sql_len_ + cur_token_begin_pos_ - copy_begin_pos_,
+          NORMAL_TOKEN == cur_token_type_, PARAM_TOKEN == cur_token_type_,
+          IGNORE_TOKEN == cur_token_type_,
+          OB_ISNULL(tail_param_node_) ? nullptr : tail_param_node_->node_,
+          param_num_ - (PARAM_TOKEN == cur_token_type_ ? 1 : 0)));
+    }
+#endif
     if (is_format_) {
       OZ (process_format_token());
     } else {

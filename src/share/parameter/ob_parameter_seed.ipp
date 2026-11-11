@@ -1074,6 +1074,13 @@ DEF_TIME(_ob_trans_rpc_timeout, OB_CLUSTER_PARAMETER, "3s", "[0s, 3600s]",
 DEF_BOOL(enable_early_lock_release, OB_TENANT_PARAMETER, "True",
          "enable early lock release",
          ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+DEF_BOOL(_enable_hybrid_search_plan_cache, OB_TENANT_PARAMETER, "False",
+         "Specifies whether to enable plan caching for HYBRID_SEARCH queries. "
+         "When set to True, eligible queries can reuse cached execution plans. "
+         "When set to False, HYBRID_SEARCH queries are compiled for each execution "
+         "without reusing or adding cached plans. "
+         "This parameter does not affect plan caching for ordinary SQL queries.",
+         ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_BOOL(_enable_hybrid_search_parallel_execution, OB_TENANT_PARAMETER, "True",
          "specifies whether to enable parallel execution for hybrid search queries, "
          "including multi-path parallelism and intra-query-path range parallelism. "

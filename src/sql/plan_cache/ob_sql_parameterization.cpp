@@ -7,6 +7,7 @@
 #include "ob_sql_parameterization.h"
 #include "lib/json/ob_json_print_utils.h"
 #include "sql/resolver/ob_resolver_utils.h"
+#include "sql/hybrid_search/ob_hybrid_search_plan_cache.h"
 
 using namespace oceanbase;
 using namespace sql;
@@ -1164,7 +1165,7 @@ int ObSqlParameterization::parameterize_syntax_tree(common::ObIAllocator &alloca
   }
 
   // is_from_pl: used for identify whether to use the PL SQL parameterization logic
-  const bool is_from_pl = ((PC_PL_MODE == pc_ctx.mode_) && is_execute_mode(mode) 
+  const bool is_from_pl = ((PC_PL_MODE == pc_ctx.mode_) && is_execute_mode(mode)
                               && sql_info.enable_pl_sql_parameterize_);
 
   if (OB_FAIL(ret)) {
@@ -1195,6 +1196,9 @@ int ObSqlParameterization::parameterize_syntax_tree(common::ObIAllocator &alloca
     }
   }
 
+  ObHybridDslRequestInfo *hybrid_request = pc_ctx.fp_result_.hybrid_dsl_request_;
+  const bool has_hybrid_params = hybrid_request != nullptr && hybrid_request->has_parameters();
+
   if (OB_FAIL(ret)) {
     // do nothing
   } else if (FALSE_IT(reserved_cnt = pc_ctx.fp_result_.raw_params_.count())) {
@@ -1203,6 +1207,9 @@ int ObSqlParameterization::parameterize_syntax_tree(common::ObIAllocator &alloca
              || OB_FAIL(sql_info.param_charset_type_.reserve(reserved_cnt))
              || OB_FAIL(sql_info.fixed_param_idx_.reserve(reserved_cnt)))) {
     LOG_WARN("failed to reserve array", K(ret));
+  } else if (has_hybrid_params) {
+    OZ(ObHybridSearchPlanCache::transform_sql_params(allocator, pc_ctx, tree, sql_info,
+        params, fix_param_store, is_transform_outline));
   } else if (OB_FAIL(transform_syntax_tree(allocator,
                                       *session,
                                       (PS_EXECUTE_MODE == mode || (PL_EXECUTE_MODE == mode && !is_from_pl)) ?
@@ -1219,7 +1226,8 @@ int ObSqlParameterization::parameterize_syntax_tree(common::ObIAllocator &alloca
     if (OB_NOT_SUPPORTED != ret) {
       SQL_PC_LOG(WARN, "fail to normal parameterized parser tree", K(ret));
     }
-  } else {
+  }
+  if (OB_SUCC(ret)) {
     need_parameterized = (!(PC_PS_MODE == pc_ctx.mode_ || (PC_PL_MODE == pc_ctx.mode_ && !is_from_pl))
                           || (is_prepare_mode(mode) && sql_info.ps_need_parameterized_));
     if (!is_prepare_mode(mode)) {
@@ -1264,7 +1272,7 @@ int ObSqlParameterization::parameterize_syntax_tree(common::ObIAllocator &alloca
         LOG_WARN("failed to add bitset members", K(ret));
       }
     }
-  } 
+  }
   else if (is_execute_mode(mode) && PC_PL_MODE != pc_ctx.mode_) {
     if (OB_FAIL(gen_ps_not_param_var(sql_info.ps_not_param_offsets_, params, pc_ctx))) {
       SQL_PC_LOG(WARN, "fail to gen ps not param var", K(ret));
@@ -1274,9 +1282,12 @@ int ObSqlParameterization::parameterize_syntax_tree(common::ObIAllocator &alloca
       SQL_PC_LOG(WARN, "fail to construct no check type params", K(ret));
     }
   } else if (need_parameterized) {
-    if (OB_FAIL(check_and_generate_param_info(pc_ctx.fp_result_.raw_params_,
-                                              sql_info,
-                                              special_params))) {
+    if (has_hybrid_params) {
+      ret = ObHybridSearchPlanCache::check_sql_param_info(pc_ctx, sql_info, special_params);
+    } else {
+      ret = check_and_generate_param_info(pc_ctx.fp_result_.raw_params_, sql_info, special_params);
+    }
+    if (OB_FAIL(ret)) {
       if (OB_NOT_SUPPORTED != ret) {
         SQL_PC_LOG(WARN, "fail to check and generate param info", K(ret));
       } else if (sql_info.need_check_fp_) {
@@ -1284,12 +1295,17 @@ int ObSqlParameterization::parameterize_syntax_tree(common::ObIAllocator &alloca
       } else {
         // do nothing
       }
+    } else if (has_hybrid_params
+               && OB_FAIL(ObHybridSearchPlanCache::append_dsl_params(pc_ctx, sql_info, params, special_params))) {
+      LOG_WARN("failed to append DSL input parameters", K(ret));
     } else if (OB_FAIL(gen_special_param_info(sql_info, pc_ctx))) {
       SQL_PC_LOG(WARN, "fail to gen special param info", K(ret));
     } else {
       // do nothing
     }
-    if (OB_SUCC(ret)) {
+    if (OB_SUCC(ret) && has_hybrid_params) {
+      OZ(ObHybridSearchPlanCache::construct_sql(allocator, pc_ctx, sql_info, fp_ctx, special_params));
+    } else if (OB_SUCC(ret)) {
       int32_t pos = 0;
       ObString con_str;
       int64_t len = pc_ctx.raw_sql_.length();
@@ -1310,10 +1326,15 @@ int ObSqlParameterization::parameterize_syntax_tree(common::ObIAllocator &alloca
         SQL_PC_LOG(WARN, "fail to transform_neg_param", K(ret));
       } else {
         pc_ctx.sql_ctx_.spm_ctx_.bl_key_.constructed_sql_.assign_ptr(buf, pos);
-        pc_ctx.ps_need_parameterized_ = sql_info.ps_need_parameterized_;
-        pc_ctx.normal_parse_const_cnt_ = sql_info.total_;
       }
     }
+    if (OB_SUCC(ret)) {
+      pc_ctx.ps_need_parameterized_ = sql_info.ps_need_parameterized_;
+      pc_ctx.normal_parse_const_cnt_ = sql_info.total_;
+    }
+  }
+  if (OB_FAIL(ret) && has_hybrid_params) {
+    hybrid_request->reset_compile();
   }
   return ret;
 }
@@ -1936,6 +1957,10 @@ int ObSqlParameterization::fast_parser(ObIAllocator &allocator,
   ParamList *p_list = NULL;
   bool is_call_procedure = false;
   bool is_contain_select = (sql.length() > 6 && 0 == STRNCASECMP(sql.ptr(), "select", 6));
+  fp_result.hybrid_dsl_request_ = nullptr;
+  if (fp_ctx.hybrid_search_token_handler_ != nullptr) {
+    fp_ctx.hybrid_search_token_handler_->reset();
+  }
   if (!is_contain_select && (!need_fast_parser(sql)
     || (ObParser::is_pl_stmt(sql, nullptr, &is_call_procedure) && !is_call_procedure))) {
     (void)fp_result.pc_key_.name_.assign_ptr(sql.ptr(), sql.length());
@@ -2000,6 +2025,9 @@ int ObSqlParameterization::fast_parser(ObIAllocator &allocator,
         } else { /*do nothing*/}
       }
     }
+  }
+  if (OB_SUCC(ret) && fp_ctx.hybrid_search_token_handler_ != nullptr) {
+    OZ(fp_ctx.hybrid_search_token_handler_->finish_parse(allocator, fp_ctx, fp_result));
   }
   return ret;
 }

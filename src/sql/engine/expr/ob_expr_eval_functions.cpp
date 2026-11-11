@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "sql/hybrid_search/ob_expr_dsl_param_value.h"
 #include "ob_expr_atan.h"
 #include "ob_expr_atan2.h"
 #include "ob_expr_eval_functions.h"
@@ -1533,7 +1534,7 @@ ObExprRandCanonical::calc_random_expr_canonical,                    /* 890 */
   ObExprLobMeta::eval_lob_meta,                                      /* 928 */
   ObExprResultScan::eval_result_scan,                                 /* 929 */
   ObExprAIDecide::eval_ai_decide,                                     /* 930 */
-  NULL, // ObExprDslParamValue::eval_value,                            /* 931 */
+  ObExprDslParamValue::eval_value,                                   /* 931 */
   ObExprHybridUniqueShardDoc::eval_unique_shard_doc,                  /* 932 */
   ObExprHybridSearchSortValues::eval_sort_values,                     /* 933 */
   ObExprMergeValueEqual::eval_merge_value_equal,                      /* 934 */

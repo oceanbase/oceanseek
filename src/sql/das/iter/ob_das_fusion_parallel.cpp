@@ -684,6 +684,14 @@ int ObDASFusionTaskExecEnv::create_fusion_child_exec_ctx(ObExecContext &src_exec
   } else {
     // phy_plan pointer is not serialized, restore it from src to keep frame info accessible
     child_exec_ctx->reference_my_plan(src_exec_ctx.get_physical_plan_ctx()->get_phy_plan());
+    // Deserialization restores ParamStore but normally leaves its datum frames
+    // uninitialized. Parameter expressions read those frames directly; zeroed
+    // frames would turn this request's query text/vector into an empty value.
+    // Build private frames from the child's deserialized parameters before
+    // allocating its evaluation context.
+    if (OB_FAIL(child_exec_ctx->get_physical_plan_ctx()->init_datum_param_store())) {
+      LOG_WARN("failed to initialize fusion child parameter frames", KR(ret));
+    }
   }
   return ret;
 }

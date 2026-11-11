@@ -45,6 +45,13 @@ public:
   ObDASConjunctionOp(ObDASSearchCtx &search_ctx)
       : ObIDASSearchOp(search_ctx) {}
   virtual ~ObDASConjunctionOp() {}
+  ScoreCapability get_score_capability() const override
+  {
+    return !is_scoring_ ? ScoreCapability::NONE
+        : (is_fixed_score_ ? ScoreCapability::CONSTANT : ScoreCapability::ARRAY);
+  }
+  double get_constant_score() const override
+  { return is_scoring_ ? fixed_score_bound_ : 0.0; }
 
   bool can_enumerate_rowids() const override
   {
@@ -73,18 +80,27 @@ private:
                          const bool inclusive,
                          const MaxScoreTuple *&max_score_tuple) override;
   int do_set_min_competitive_score(const double &threshold) override;
+  int do_calc_max_score(double &threshold) override;
 
 private:
   int inner_advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score);
   // Splits children into driver_ops_ and probe_ops_ based on is_probe_mode().
   // Called from do_open / do_rescan so the conjunction can coordinate probe-capable children.
   int classify_children();
+  int init_fixed_score_bound();
+  bool has_fixed_score_bound() const { return fixed_score_bound_ >= 0.0; }
   int advance_driver_ops_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score);
   int inner_advance_to_with_probe(const ObDASRowID &target, ObDASRowID &curr_id, double &score);
 
 private:
+  static constexpr double INVALID_FIXED_SCORE_BOUND = -1.0;
   int64_t last_idx_ = 0;
   bool has_probe_child_ = false;
+  // True only when nonnegative integer driver scores have an exact sum <= 2^53.
+  bool is_fixed_score_ = false;
+  // Valid bounds are finite and nonnegative; the sentinel also means no cached bound.
+  // Rebuilt after child rescans; accepted sums are independent of driver order.
+  double fixed_score_bound_ = INVALID_FIXED_SCORE_BOUND;
   // Probe-capable children; the driver is never in this list.
   ObSEArray<ObIDASSearchOp *, 4> probe_ops_;
   ObSEArray<ObIDASSearchOp *, 4> driver_ops_;

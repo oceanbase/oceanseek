@@ -313,6 +313,8 @@ public:
   TO_STRING_KV(K_(start_pos), K_(end_pos), K_(column_name_list));
 };
 
+class ObHybridDslRequestInfo;
+
 struct ObResolverParams
 {
   ObResolverParams()
@@ -324,6 +326,7 @@ struct ObResolverParams
        query_ctx_(NULL),
        global_hint_(inner_allocator_),
        param_list_(NULL),
+       hybrid_dsl_request_(nullptr),
        select_item_param_infos_(NULL),
        prepare_param_count_(0),
        external_param_info_(),
@@ -395,6 +398,7 @@ public:
   ObQueryCtx *query_ctx_;
   ObGlobalHint global_hint_;
   const ParamStore *param_list_;
+  ObHybridDslRequestInfo *hybrid_dsl_request_;
   const SelectItemParamInfoArray *select_item_param_infos_;
   int64_t prepare_param_count_;
   ExternalParams external_param_info_;

@@ -16,6 +16,7 @@ namespace oceanbase
 namespace sql
 {
 class ObDSLFullTextQuery;
+class ObHybridDslRequestInfo;
 struct ObDSLFullTextMultiFieldQueryParam;
 class ObSelectStmt;
 class ObStmtExprVisitor;
@@ -423,6 +424,7 @@ public :
     schema_checker_(params.schema_checker_),
     session_info_(params.session_info_),
     params_(params),
+    dsl_request_(nullptr),
     table_schema_(table_schema),
     stmt_(stmt),
     table_item_(table_item),
@@ -443,6 +445,14 @@ public :
   }
 
   int resolve(const ParseNode &parse_tree);
+  int check_dsl_params();
+  int convert_dsl_param(const common::ObIJsonBase &node,
+      const ObRawExprResType &target, const common::ObObjType field_type,
+      const common::ObObjParam &value, ObRawExpr *&expr);
+  int create_dsl_param_expr(common::ObIJsonBase &node, ObRawExpr *&expr);
+  int bind_dsl_param(common::ObIJsonBase &node, ObRawExpr *&expr,
+      const common::ObObjType field_type = common::ObNullType);
+
   /** @brief Whether a hybrid statement needs SQL LIMIT in addition to its DSL. */
   static bool should_print_sql_limit(const ObDMLStmt &stmt);
   /** @brief Whether a hybrid statement needs SQL ORDER BY in addition to its DSL. */
@@ -666,7 +676,8 @@ private :
   int resolve_query_string(ObIJsonBase &req_node, ObDSLQuery *&query, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type);
   int resolve_query_string_fields(ObIJsonBase &req_node, ObIArray<ObColumnRefRawExpr*> &fields, ObIArray<ObConstRawExpr*> &field_boosts, bool &compatible);
   int resolve_query_string_operator(ObIJsonBase &req_node, ObMatchOperator &opr);
-  int resolve_query_string_query(ObIJsonBase &req_node, ObConstRawExpr *&query_expr, ObCollationType collation_type);
+  int resolve_query_string_query(ObIJsonBase &req_node, ObRawExpr *&query_expr,
+      ObCollationType collation_type);
   int resolve_query_string_type(ObIJsonBase &req_node, ObMatchFieldsType &type);
   int resolve_range(ObIJsonBase &req_node, ObDSLQuery *&query, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type);
   int resolve_rank(ObIJsonBase &req_node);
@@ -769,6 +780,7 @@ private :
   ObSchemaChecker *schema_checker_;
   ObSQLSessionInfo *session_info_;
   ObResolverParams &params_;
+  ObHybridDslRequestInfo *dsl_request_;
   const ObTableSchema *table_schema_;
   ObDMLStmt *stmt_;
   TableItem &table_item_;

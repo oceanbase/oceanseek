@@ -6,7 +6,11 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "lib/timezone/ob_time_convert.h"
 #include "sql/engine/ob_exec_context.h"
+#include "sql/engine/ob_physical_plan_ctx.h"
 #include "sql/hybrid_search/ob_hybrid_search_dsl_resolver.h"
+#include "sql/hybrid_search/ob_hybrid_search_plan_cache.h"
+#include "sql/hybrid_search/ob_hybrid_search_dsl_parameterizer.h"
+#include "sql/hybrid_search/ob_expr_dsl_param_value.h"
 #include "sql/hybrid_search/ob_fulltext_search_query.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "sql/resolver/dml/ob_stmt_expr_visitor.h"
@@ -1455,23 +1459,65 @@ int ObDSLResolver::build_field_expr_with_path(ObColumnRefRawExpr *col_expr, cons
 int ObDSLResolver::build_json_contains_scalar_expr(ObRawExpr *target_expr, ObIJsonBase &json_node, ObRawExpr *&expr)
 {
   int ret = OB_SUCCESS;
-  ObRawExprFactory *expr_factory = params_.expr_factory_;
-  ObJsonBuffer j_buf(allocator_);
-  ObString candidate_str;
-  ObConstRawExpr *candidate_expr = nullptr;
-  if (OB_FAIL(print_json_node(json_node, j_buf))) {
-    LOG_WARN("fail to build json_contains candidate text from dsl json node", K(ret));
-  } else if (OB_FAIL(j_buf.get_result_string(candidate_str))) {
-    LOG_WARN("fail to get json candidate string", K(ret));
-  } else if (OB_FAIL(ObRawExprUtils::build_const_string_expr(*expr_factory,
-                                                             ObVarcharType,
-                                                             candidate_str,
-                                                             CS_TYPE_UTF8MB4_BIN,
-                                                             candidate_expr))) {
-    LOG_WARN("fail to build const string expr for json_contains candidate", K(ret));
-  } else if (OB_FAIL(ObRawExprUtils::build_json_contains_expr(*expr_factory, *session_info_, target_expr, candidate_expr, expr))) {
-    LOG_WARN("fail to build json_contains expr", K(ret));
+  ObRawExprFactory &factory = *params_.expr_factory_;
+  ObRawExpr *candidate = nullptr;
+  const ObJsonNodeType type = json_node.json_type();
+  if (type == ObJsonNodeType::J_STRING || type == ObJsonNodeType::J_BOOLEAN
+      || json_node.is_json_number(type)) {
+    OZ(create_dsl_param_expr(json_node, candidate));
   }
+  if (OB_FAIL(ret)) {
+  } else if (candidate == nullptr) {
+    // Keep the original serialized JSON literal when no DSL parameter is bound
+    // (including a disabled cache switch and unsupported parameterization).
+    // JSON strings are already UTF8; do not resolve them as connection literals.
+    ObJsonBuffer buffer(allocator_);
+    ObString text;
+    ObConstRawExpr *literal = nullptr;
+    OZ(print_json_node(json_node, buffer));
+    OZ(buffer.get_result_string(text));
+    OZ(ObRawExprUtils::build_const_string_expr(factory, ObVarcharType, text,
+        CS_TYPE_UTF8MB4_BIN, literal));
+    candidate = literal;
+  } else if (type == ObJsonNodeType::J_STRING) {
+    // JSON decoding produces UTF8 bytes, but ordinary SQL parameter restoration
+    // labels them with the connection charset. Reinterpret only this JSON
+    // candidate through binary, then UTF8; a direct charset cast would transcode
+    // already-decoded bytes. Keep other DSL literals' existing charset semantics.
+    if (ObCharset::charset_type_by_coll(candidate->get_collation_type()) != CHARSET_UTF8MB4) {
+      const ObCollationType collations[] = {CS_TYPE_BINARY, CS_TYPE_UTF8MB4_BIN};
+      for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(collations); ++i) {
+        ObRawExprResType text_type = candidate->get_result_type();
+        ObSysFunRawExpr *cast = nullptr;
+        text_type.set_collation_type(collations[i]);
+        text_type.set_length(OB_MAX_VARCHAR_LENGTH);
+        OZ(ObRawExprUtils::create_cast_expr(factory, candidate, text_type, cast, session_info_));
+        if (OB_SUCC(ret)) {
+          candidate = cast;
+        }
+      }
+    }
+    ObSysFunRawExpr *quoted = nullptr;
+    OZ(factory.create_raw_expr(T_FUN_SYS_JSON_QUOTE, quoted));
+    if (OB_SUCC(ret)) {
+      quoted->set_func_name(N_JSON_QUOTE);
+      OZ(quoted->init_param_exprs(1));
+      OZ(quoted->add_param_expr(candidate));
+      candidate = quoted;
+    }
+  } else {
+    ObRawExprResType json_type;
+    ObSysFunRawExpr *cast = nullptr;
+    json_type.set_type(ObJsonType);
+    json_type.set_collation_type(CS_TYPE_UTF8MB4_BIN);
+    json_type.set_collation_level(CS_LEVEL_COERCIBLE);
+    json_type.set_length(ObAccuracy::DDL_DEFAULT_ACCURACY[ObJsonType].get_length());
+    OZ(ObRawExprUtils::create_cast_expr(factory, candidate, json_type, cast, session_info_));
+    if (OB_SUCC(ret)) {
+      candidate = cast;
+    }
+  }
+  OZ(ObRawExprUtils::build_json_contains_expr(factory, *session_info_, target_expr, candidate, expr));
   return ret;
 }
 
@@ -2716,6 +2762,196 @@ int ObDSLResolver::resolve_array_overlaps(ObIJsonBase &req_node, ObDSLQuery *&qu
   return resolve_array_expr(req_node, query, parent_query, outer_query_type, QUERY_ITEM_ARRAY_OVERLAPS);
 }
 
+int ObDSLResolver::convert_dsl_param(const ObIJsonBase &node,
+    const ObRawExprResType &target, const ObObjType field_type,
+    const ObObjParam &value, ObRawExpr *&expr)
+{
+  int ret = OB_SUCCESS;
+  int64_t mode = 0;
+  if (OB_ISNULL(expr) || OB_ISNULL(params_.expr_factory_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("missing DSL parameter expression", K(ret), KP(expr), KP(params_.expr_factory_));
+  } else {
+    ObRawExprFactory &factory = *params_.expr_factory_;
+    if (target.get_type() == ObTinyIntType && node.json_type() == ObJsonNodeType::J_STRING) {
+      mode = ObExprDslParamValue::BOOLEAN;
+    } else if (field_type == ObFloatType
+               && (target.get_type() == ObFloatType || target.get_type() == ObDoubleType)) {
+      // Only numeric inputs are narrowed by the array DSL resolver.
+      // Strings retain the ordinary SQL array-comparison conversion.
+      mode = target.get_type() == ObFloatType
+          ? ObExprDslParamValue::ARRAY_FLOAT_NARROW : ObExprDslParamValue::ARRAY_FLOAT;
+      // Preserve the literal resolver's FLOAT result so array comparisons keep
+      // the indexed column unchanged. Out-of-range inputs need a DOUBLE plan;
+      // let the existing PlanSet expression constraints guard this type choice.
+      ObConstRawExpr *check_mode = nullptr;
+      ObSysFunRawExpr *in_range = nullptr;
+      if (OB_ISNULL(params_.query_ctx_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("missing query context for DSL float constraint", K(ret));
+      } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(factory, ObIntType,
+          ObExprDslParamValue::ARRAY_FLOAT_IN_RANGE, check_mode))) {
+        LOG_WARN("failed to build DSL float constraint mode", K(ret));
+      } else if (OB_FAIL(factory.create_raw_expr(T_FUN_SYS_DSL_PARAM_VALUE, in_range))) {
+        LOG_WARN("failed to create DSL float constraint", K(ret));
+      } else {
+        in_range->set_func_name(ObString("DSL_PARAM_VALUE"));
+        OZ(in_range->set_param_exprs(expr, check_mode));
+        OZ(in_range->formalize(session_info_));
+        if (OB_SUCC(ret)) {
+          const ObExprConstraint constraint(in_range, target.get_type() == ObFloatType
+              ? PRE_CALC_RESULT_TRUE : PRE_CALC_RESULT_FALSE);
+          OZ(add_var_to_array_no_dup(params_.query_ctx_->all_expr_constraints_, constraint));
+        }
+      }
+    } else if (ob_is_string_type(target.get_type()) && value.is_string_type()
+               && target.get_collation_type() != value.get_collation_type()) {
+      mode = ObExprDslParamValue::TEXT_COLLATION_BASE + target.get_collation_type();
+    }
+    if (OB_FAIL(ret)) {
+    } else if (ob_is_string_type(target.get_type()) && value.is_boolean()) {
+      ObConstRawExpr *true_text = nullptr;
+      ObConstRawExpr *false_text = nullptr;
+      ObRawExpr *converted = nullptr;
+      OZ(ObRawExprUtils::build_const_string_expr(factory, ObVarcharType,
+          ObString("true"), target.get_collation_type(), true_text));
+      OZ(ObRawExprUtils::build_const_string_expr(factory, ObVarcharType,
+          ObString("false"), target.get_collation_type(), false_text));
+      OZ(ObRawExprUtils::build_case_when_expr(factory, expr, true_text, false_text, converted));
+      if (OB_SUCC(ret)) {
+        expr = converted;
+      }
+    } else if (mode != 0) {
+      ObConstRawExpr *kind = nullptr;
+      ObSysFunRawExpr *convert = nullptr;
+      OZ(ObRawExprUtils::build_const_int_expr(factory, ObIntType, mode, kind));
+      OZ(factory.create_raw_expr(T_FUN_SYS_DSL_PARAM_VALUE, convert));
+      if (OB_SUCC(ret)) {
+        convert->set_func_name(ObString("DSL_PARAM_VALUE"));
+        OZ(convert->set_param_exprs(expr, kind));
+        if (OB_SUCC(ret) && (mode == ObExprDslParamValue::BOOLEAN
+                            || mode >= ObExprDslParamValue::TEXT_COLLATION_BASE)) {
+          // The literal resolver validates these inputs even if rewrite removes
+          // the query. Keep that validation on cache hits through PlanSet;
+          // NOT_NULL accepts both boolean values without fixing the first one.
+          if (OB_ISNULL(params_.query_ctx_)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("missing query context for DSL conversion constraint", K(ret));
+          } else if (OB_FAIL(convert->formalize(session_info_))) {
+            LOG_WARN("failed to formalize DSL conversion constraint", K(ret));
+          } else {
+            const ObExprConstraint constraint(convert, PRE_CALC_RESULT_NOT_NULL);
+            OZ(add_var_to_array_no_dup(params_.query_ctx_->all_expr_constraints_, constraint));
+          }
+        }
+        if (OB_SUCC(ret)) {
+          expr = convert;
+        }
+      }
+    } else if (target.get_type() != value.get_type()) {
+      ObSysFunRawExpr *cast = nullptr;
+      OZ(ObRawExprUtils::create_cast_expr(factory, expr, target, cast, session_info_));
+      if (OB_SUCC(ret)) {
+        expr = cast;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDSLResolver::create_dsl_param_expr(ObIJsonBase &node, ObRawExpr *&expr)
+{
+  int ret = OB_SUCCESS;
+  expr = nullptr;
+  ObHybridDslRequestInfo *request = dsl_request_;
+  if (OB_NOT_NULL(request) && request->is_params_ready()) {
+    int64_t dsl_idx = -1;
+    int64_t raw_idx = -1;
+    int64_t param_idx = -1;
+    if (OB_ISNULL(request->get_raw_params()) || OB_ISNULL(request->get_param_store())
+        || OB_ISNULL(params_.expr_factory_) || params_.param_list_ != request->get_param_store()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid DSL compilation input", K(ret));
+    } else {
+      OZ(request->find_dsl_param_idx(node, dsl_idx));
+    }
+    if (OB_FAIL(ret)) {
+    } else if (dsl_idx < 0) {
+      // Fixed DSL options do not occupy execution parameter slots.
+    } else if (OB_FAIL(request->get_dsl_raw_param_idx(dsl_idx, *request->get_raw_params(), raw_idx))) {
+    } else if (OB_FAIL(request->get_dsl_exec_param_idx(dsl_idx, request->get_sql_param_count(), param_idx))) {
+    } else if (param_idx >= params_.param_list_->count()
+               || OB_ISNULL(request->get_raw_params()->at(raw_idx))
+               || OB_ISNULL(request->get_raw_params()->at(raw_idx)->node_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid DSL execution parameter", K(ret), K(dsl_idx), K(param_idx));
+    } else {
+      ObRawExprFactory &factory = *params_.expr_factory_;
+      const ObObjParam &value = params_.param_list_->at(param_idx);
+      ObConstRawExpr *param = nullptr;
+      OZ(factory.create_raw_expr(T_QUESTIONMARK, param));
+      CK(OB_NOT_NULL(param));
+      if (OB_SUCC(ret)) {
+        ObObjParam index_value;
+        index_value.set_unknown(param_idx);
+        index_value.set_param_meta();
+        // Keep the slot index in value_ and the input literal in param_.
+        param->set_value(index_value);
+        param->set_meta_type(value.get_meta());
+        param->set_accuracy(value.get_accuracy());
+        param->set_is_literal_bool(value.is_boolean());
+        OZ(param->extract_info());
+        if (OB_SUCC(ret)) {
+          param->set_obj_param(value);
+          expr = param;
+          OZ(request->mark_param_resolved(dsl_idx));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDSLResolver::bind_dsl_param(ObIJsonBase &node, ObRawExpr *&expr, const ObObjType field_type)
+{
+  int ret = OB_SUCCESS;
+  ObRawExpr *param = nullptr;
+  OZ(create_dsl_param_expr(node, param));
+  if (OB_SUCC(ret) && param != nullptr) {
+    if (OB_ISNULL(expr) || !expr->is_const_raw_expr()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid DSL literal expression", K(ret), KP(expr));
+    } else {
+      const ObRawExprResType target = expr->get_result_type();
+      const int64_t param_idx = static_cast<ObConstRawExpr *>(param)->get_value().get_unknown();
+      const ObObjParam &value = params_.param_list_->at(param_idx);
+      OZ(convert_dsl_param(node, target, field_type, value, param));
+      if (OB_SUCC(ret)) {
+        expr = param;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDSLResolver::check_dsl_params()
+{
+  int ret = OB_SUCCESS;
+  ObHybridDslRequestInfo *request = dsl_request_;
+  if (request != nullptr && request->is_params_ready()) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < request->get_dsl_param_count(); ++i) {
+      if (!request->get_resolved_param_idxs().has_member(i)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("DSL input was not referenced by an expression", K(ret), K(i));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      request->set_params_bound(true);
+    }
+  }
+  return ret;
+}
+
 int ObDSLResolver::resolve(const ParseNode &parse_tree)
 {
   int ret = OB_SUCCESS;
@@ -2724,15 +2960,27 @@ int ObDSLResolver::resolve(const ParseNode &parse_tree)
   ObIJsonBase *after_node = nullptr;
   const char *syntaxerr = nullptr;
   uint64_t err_offset = 0;
-  const uint32_t parse_flag = ObJsonParser::JSN_UNIQUE_FLAG;
   ObString req_str;
   ParseNode *raw_text = parse_tree.children_[0];
+  ObHybridDslRequestInfo *request =
+      ObHybridSearchPlanCache::get_request(params_.hybrid_dsl_request_);
+  // View expansion inherits resolver parameters but parses a separate SQL tree.
+  // Its DSL must not borrow the outer query snapshot or parameter slots.
+  dsl_request_ = request != nullptr && request->is_carrier_node(parse_tree) ? request : nullptr;
   if (OB_FAIL(init_resolver())) {
     LOG_WARN("fail to init resolver", K(ret));
+  } else if (dsl_request_ != nullptr) {
+    req_str = dsl_request_->get_dsl_snapshot();
+    j_node = static_cast<ObJsonNode *>(dsl_request_->get_json_root());
   } else if (OB_FAIL(get_json_string_from_node(raw_text, req_str))) {
     LOG_WARN("failed to get json string from node", K(ret));
-  } else if (OB_FAIL(ObJsonParser::parse_json_text(allocator_, req_str.ptr(), req_str.length(), syntaxerr, &err_offset, j_node, parse_flag))) {
+  } else if (OB_FAIL(ObHybridSearchDslParameterizer::parse_json(
+      *allocator_, req_str, j_node, syntaxerr, err_offset))) {
     LOG_WARN("failed to parse array text", K(ret), K(req_str), KCSTRING(syntaxerr), K(err_offset));
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(j_node)) {
+    ret = OB_ERR_UNEXPECTED;
   } else if (j_node->json_type() != ObJsonNodeType::J_OBJECT || j_node->element_count() == 0) {
     ret = OB_INVALID_ARGUMENT;
     LOG_USER_ERROR(OB_INVALID_ARGUMENT, "invalid search param, empty dsl");
@@ -2817,6 +3065,8 @@ int ObDSLResolver::resolve(const ParseNode &parse_tree)
     LOG_WARN("fail to inject agg stmt rewrites", K(ret));
   } else if (OB_FAIL(collect_exprs())) {
     LOG_WARN("fail to collect exprs", K(ret));
+  } else if (OB_FAIL(check_dsl_params())) {
+    LOG_WARN("incomplete DSL parameter expressions", K(ret));
   } else if (OB_FAIL(formalize_exprs())) {
     LOG_WARN("fail to formalize exprs", K(ret));
   }
@@ -3655,12 +3905,14 @@ int ObDSLResolver::resolve_match(ObIJsonBase &req_node, ObDSLQuery *&query, ObDS
                      ObString(query_node->get_data_length(), query_node->get_data()),
                      collation_type, query_expr))) {
     LOG_WARN("fail to construct string expr", K(ret));
+  } else if (OB_FAIL(bind_dsl_param(*query_node, query_expr, col_expr->get_data_type()))) {
+    LOG_WARN("failed to bind fulltext parameter", K(ret));
   } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(*expr_factory, ObIntType, static_cast<int64_t>(match_operator), operator_expr))) {
     LOG_WARN("fail to build const int expr for operator", K(ret));
   } else if (OB_FAIL(ObDSLMatchQuery::create(outer_query_type, parent_query, *allocator_, match_query))) {
     LOG_WARN("fail to create match query", K(ret));
   } else {
-    match_query->query_ = static_cast<ObConstRawExpr*>(query_expr);
+    match_query->query_ = query_expr;
     match_query->boost_ = setup_boost(boost_expr);
     match_query->field_ = col_expr;
     match_query->minimum_should_match_ = min_should_match_expr;
@@ -3746,13 +3998,15 @@ int ObDSLResolver::resolve_match_phrase(ObIJsonBase &req_node,
   } else if (OB_FALSE_IT(collation_type = col_expr->get_collation_type())) {
   } else if (OB_FAIL(resolve_query_string_expr(ObString(query_node->get_data_length(), query_node->get_data()), collation_type, query_expr))) {
     LOG_WARN("fail to construct string expr", K(ret));
+  } else if (OB_FAIL(bind_dsl_param(*query_node, query_expr, col_expr->get_data_type()))) {
+    LOG_WARN("failed to bind fulltext parameter", K(ret));
   } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(*expr_factory, ObIntType, slop, slop_expr))) {
     LOG_WARN("fail to build const int expr for slop", K(ret));
   } else if (OB_FAIL(ObDSLMatchPhraseQuery::create(outer_query_type, parent_query, *allocator_, match_phrase_query))) {
     LOG_WARN("fail to create match phrase query", K(ret));
   } else {
     match_phrase_query->field_ = col_expr;
-    match_phrase_query->query_ = static_cast<ObConstRawExpr*>(query_expr);
+    match_phrase_query->query_ = query_expr;
     match_phrase_query->boost_ = setup_boost(boost_expr);
     match_phrase_query->slop_ = slop_expr;
     query = match_phrase_query;
@@ -4201,9 +4455,22 @@ int ObDSLResolver::resolve_const(ObIJsonBase &req_node,
   } else if (target_type == ObJsonNodeType::J_BOOLEAN) {
     can_cast = (json_type == ObJsonNodeType::J_BOOLEAN || json_type == ObJsonNodeType::J_STRING);
   }
-  if (!can_cast) {
+  ObRawExpr *input_param = nullptr;
+  if (can_cast && ((target_type == json_type
+                   && (json_type == ObJsonNodeType::J_STRING
+                       || json_type == ObJsonNodeType::J_INT
+                       || json_type == ObJsonNodeType::J_UINT
+                       || json_type == ObJsonNodeType::J_BOOLEAN
+                       || (json_type == ObJsonNodeType::J_DOUBLE && array_base_type != ObFloatType)))
+                  || (target_type == ObJsonNodeType::J_STRING && json_type == ObJsonNodeType::J_ARRAY))) {
+    OZ(create_dsl_param_expr(req_node, input_param));
+  }
+  if (OB_FAIL(ret)) {
+  } else if (!can_cast) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("unsupported conversion from source type to target type", K(ret), K(json_type), K(target_type));
+  } else if (input_param != nullptr) {
+    expr = input_param;
   } else if (target_type == ObJsonNodeType::J_STRING ||
              target_type == ObJsonNodeType::J_OBJECT) {
     ObString str_val;
@@ -4306,6 +4573,9 @@ int ObDSLResolver::resolve_const(ObIJsonBase &req_node,
     } else if (OB_FAIL(ObRawExprUtils::build_const_bool_expr(expr_factory, expr, b_value))) {
       LOG_WARN("fail to create const bool expr", K(ret));
     }
+  }
+  if (OB_SUCC(ret) && input_param == nullptr) {
+    OZ(bind_dsl_param(req_node, expr, array_base_type == ObMaxType ? ObNullType : array_base_type));
   }
   return ret;
 }
@@ -5369,7 +5639,7 @@ int ObDSLResolver::resolve_multi_match(ObIJsonBase &req_node, ObDSLQuery *&query
     LOG_WARN("fail to resolve multi fields query param", K(ret));
   }
 
-  ObConstRawExpr *query_expr = nullptr;
+  ObRawExpr *query_expr = nullptr;
   ObConstRawExpr *boost_expr = nullptr;
   for (int64_t i = 0; OB_SUCC(ret) && i < req_node.element_count(); i++) {
     ObString key;
@@ -5665,7 +5935,7 @@ int ObDSLResolver::resolve_query_string(ObIJsonBase &req_node, ObDSLQuery *&quer
     LOG_WARN("fail to resolve multi fields query param", K(ret));
   }
 
-  ObConstRawExpr *query_expr = nullptr;
+  ObRawExpr *query_expr = nullptr;
   ObConstRawExpr *boost_expr = nullptr;
   for (int64_t i = 0; OB_SUCC(ret) && i < req_node.element_count(); i++) {
     ObString key;
@@ -5805,7 +6075,8 @@ int ObDSLResolver::resolve_query_string_operator(ObIJsonBase &req_node, ObMatchO
   return ret;
 }
 
-int ObDSLResolver::resolve_query_string_query(ObIJsonBase &req_node, ObConstRawExpr *&query_expr, ObCollationType collation_type)
+int ObDSLResolver::resolve_query_string_query(ObIJsonBase &req_node, ObRawExpr *&query_expr,
+    ObCollationType collation_type)
 {
   int ret = OB_SUCCESS;
   ObRawExpr *expr = nullptr;
@@ -5815,8 +6086,10 @@ int ObDSLResolver::resolve_query_string_query(ObIJsonBase &req_node, ObConstRawE
     LOG_WARN("multi_match.query or query_string.query should be string", K(ret), K(req_node.json_type()));
   } else if (OB_FAIL(resolve_query_string_expr(ObString(req_node.get_data_length(), req_node.get_data()), collation_type, expr))) {
     LOG_WARN("fail to construct string expr", K(ret));
+  } else if (OB_FAIL(bind_dsl_param(req_node, expr))) {
+    LOG_WARN("failed to bind query string parameter", K(ret));
   } else {
-    query_expr = static_cast<ObConstRawExpr*>(expr);
+    query_expr = expr;
   }
   return ret;
 }
@@ -6756,98 +7029,59 @@ int ObDSLResolver::resolve_terms(ObIJsonBase &req_node, ObDSLQuery *&query, ObDS
 }
 
 int ObDSLResolver::resolve_terms_value(ObIJsonBase &node, ObColumnRefRawExpr *col_expr,
-                                       ObEsQueryItem query_type, ObObjType array_base_type, ObRawExpr *&expr)
+    ObEsQueryItem query_type, ObObjType array_base_type, ObRawExpr *&expr)
 {
   int ret = OB_SUCCESS;
-  const ObObjType target_type = array_base_type == ObMaxType ? col_expr->get_result_type().get_type() : array_base_type;
+  const ObObjType target_type = array_base_type == ObMaxType
+      ? col_expr->get_result_type().get_type() : array_base_type;
   const ObJsonNodeType json_type = resolve_type_mapping(node.json_type(), col_expr, query_type, array_base_type);
   expr = nullptr;
   if (!ob_is_integer_type(target_type) || json_type == ObJsonNodeType::J_BOOLEAN) {
     if (OB_FAIL(resolve_const(node, expr, json_type, query_type, array_base_type))) {
       LOG_WARN("failed to resolve terms constant", K(ret));
     }
-  } else if (!ObIJsonBase::is_json_number_type(node.json_type()) && node.json_type() != ObJsonNodeType::J_STRING) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "terms query: expected a number or numeric string for an integer field");
-    LOG_WARN("invalid terms value type for integer field", K(ret), K(target_type), K(node.json_type()));
-  } else if (node.json_type() == ObJsonNodeType::J_DOUBLE &&
-             (isnan(node.get_double()) || isinf(node.get_double()))) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "terms query: numeric values for an integer field must be finite");
-    LOG_WARN("non-finite terms value for integer field", K(ret), K(target_type), K(node.get_double()));
-  } else if (node.json_type() == ObJsonNodeType::J_DOUBLE && trunc(node.get_double()) != node.get_double()) {
-    // Fractional candidates cannot match an integer field. Keep validating subsequent candidates.
   } else {
-    // Parse numeric strings as NUMBER, not double: BIGINT boundaries must retain all digits.
-    number::ObNumber value;
-    ObConstRawExpr *constant = nullptr;
-    int64_t int_value = 0;
-    uint64_t uint_value = 0;
-    bool has_fraction = false;
-    if (node.json_type() == ObJsonNodeType::J_STRING) {
-      double parsed_double = 0;
-      // Validate the complete string first; NUMBER alone accepts sign-only strings in MySQL mode.
-      // Use double for syntax/fraction checks, never to construct the integer constant.
-      if (OB_FAIL(node.to_double(parsed_double))) {
-        LOG_WARN("invalid numeric string in terms", K(ret));
-      } else if (isnan(parsed_double) || isinf(parsed_double)) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("non-finite numeric string in terms", K(ret), K(target_type), K(parsed_double));
-      } else if (trunc(parsed_double) != parsed_double) {
-        // Do not let NUMBER underflow turn a small fractional string into an integer zero.
-        has_fraction = true;
-      } else if (parsed_double == 0) {
-        // Syntax is already validated. A nonzero significand rounded to double zero
-        // denotes underflow, in either scientific or ordinary decimal notation.
-        const char *data = node.get_data();
-        for (uint64_t i = 0; !has_fraction && i < node.get_data_length(); ++i) {
-          if (data[i] == 'e' || data[i] == 'E') {
-            break;
-          }
-          has_fraction = data[i] >= '1' && data[i] <= '9';
-        }
-        if (!has_fraction) {
-          value.set_zero();
-        }
-      } else if (OB_FAIL(value.from_sci_opt(node.get_data(), node.get_data_length(), *allocator_))) {
-        LOG_WARN("failed to parse numeric terms string", K(ret));
-      }
-    } else if (node.json_type() == ObJsonNodeType::J_DOUBLE) {
-      if (OB_FAIL(trunc_json_float_to_int(node, ob_is_uint_tc(target_type), int_value, uint_value))) {
-        LOG_WARN("integer terms value out of range", K(ret));
-      } else if (ob_is_uint_tc(target_type)) {
-        ret = value.from(uint_value, *allocator_);
+    ObObj value;
+    ObRawExpr *param = nullptr;
+    ObRawExprFactory &factory = *params_.expr_factory_;
+    if (OB_FAIL(ObExprDslParamValue::convert_integer_terms(*allocator_, node, target_type, value))) {
+      LOG_WARN("failed to convert integer terms value", K(ret), K(target_type));
+    } else if (OB_FAIL(create_dsl_param_expr(node, param))) {
+      LOG_WARN("failed to bind integer terms parameter", K(ret));
+    } else if (OB_NOT_NULL(param)) {
+      ObConstRawExpr *mode = nullptr;
+      ObSysFunRawExpr *convert = nullptr;
+      if (OB_ISNULL(params_.query_ctx_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("missing query context for integer terms constraint", K(ret));
+      } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(factory, ObIntType,
+          ObExprDslParamValue::INTEGER_TERMS_BASE + target_type, mode))) {
+        LOG_WARN("failed to build integer terms conversion mode", K(ret));
+      } else if (OB_FAIL(factory.create_raw_expr(T_FUN_SYS_DSL_PARAM_VALUE, convert))) {
+        LOG_WARN("failed to create integer terms conversion", K(ret));
       } else {
-        ret = value.from(int_value, *allocator_);
+        convert->set_func_name(ObString("DSL_PARAM_VALUE"));
+        OZ(convert->set_param_exprs(param, mode));
+        OZ(convert->formalize(session_info_));
+        if (OB_SUCC(ret)) {
+          // Fractional candidates are omitted from IN/ARRAY, not replaced with NULL.
+          // Guard that choice through PlanSet even when rewrite removes the query.
+          // A changed choice must recompile; retained candidates read current values.
+          const ObExprConstraint constraint(convert, value.is_null()
+              ? PRE_CALC_RESULT_NULL : PRE_CALC_RESULT_NOT_NULL);
+          OZ(add_var_to_array_no_dup(params_.query_ctx_->all_expr_constraints_, constraint));
+          if (!value.is_null()) {
+            expr = convert;
+          }
+        }
       }
-    } else if (OB_FAIL(node.to_number(allocator_, value))) {
-      LOG_WARN("failed to parse integer terms value", K(ret), K(target_type));
-    }
-    if (OB_FAIL(ret)) {
-      LOG_WARN("failed to convert integer terms value", K(ret), K(target_type), K(node.json_type()));
-      if (ret != OB_ALLOCATE_MEMORY_FAILED) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "terms query: invalid numeric value or value out of range for the integer field");
+    } else if (!value.is_null()) {
+      ObConstRawExpr *constant = nullptr;
+      if (ob_is_uint_tc(target_type)) {
+        OZ(ObRawExprUtils::build_const_uint_expr(factory, target_type, value.get_uint64(), constant));
+      } else {
+        OZ(ObRawExprUtils::build_const_int_expr(factory, target_type, value.get_int(), constant));
       }
-    } else if (has_fraction || !value.is_integer()) {
-      // A null output denotes a valid, non-matching fractional candidate.
-    } else if (ob_is_uint_tc(target_type)) {
-      if (!value.is_valid_uint64(uint_value) || uint_value > UINT_MAX_VAL[target_type]) {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "terms query: value is out of range for the unsigned integer field");
-        LOG_WARN("terms value out of unsigned integer range", K(ret), K(target_type), K(value), K(uint_value));
-      } else if (OB_FAIL(ObRawExprUtils::build_const_uint_expr(*params_.expr_factory_, target_type, uint_value, constant))) {
-        LOG_WARN("failed to build unsigned terms value", K(ret));
-      }
-    } else if (!value.is_valid_int64(int_value) || int_value < INT_MIN_VAL[target_type]
-               || int_value > INT_MAX_VAL[target_type]) {
-      ret = OB_INVALID_ARGUMENT;
-      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "terms query: value is out of range for the integer field");
-      LOG_WARN("terms value out of integer range", K(ret), K(target_type), K(value), K(int_value));
-    } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(*params_.expr_factory_, target_type, int_value, constant))) {
-      LOG_WARN("failed to build integer terms value", K(ret));
-    }
-    if (OB_SUCC(ret)) {
       expr = constant;
     }
   }

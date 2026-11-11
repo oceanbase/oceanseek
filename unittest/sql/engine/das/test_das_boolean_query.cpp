@@ -5,6 +5,7 @@
 #define USING_LOG_PREFIX SQL_DAS
 
 #include <algorithm>
+#include <limits>
 #include <gtest/gtest.h>
 #define private public
 #define protected public
@@ -20,6 +21,9 @@
 #include "sql/engine/ob_exec_context.h"
 #include "sql/engine/expr/ob_expr.h"
 #include "sql/das/search/ob_das_conjunction_op.h"
+#include "sql/das/search/ob_das_scalar_index_ror_op.h"
+#include "sql/das/search/ob_das_async_scalar_ror_op.h"
+#include "sql/das/search/ob_das_disjunction_filter_op.h"
 #include "sql/das/search/ob_das_disjunction_op.h"
 #include "sql/das/search/ob_das_bmw_op.h"
 #include "sql/das/search/ob_das_bmm_op.h"
@@ -213,6 +217,19 @@ private:
   int next_rowid_error_;
   int64_t open_count_;
   int64_t rescan_count_;
+};
+
+class MockConstantSearchOp : public MockSearchOp
+{
+public:
+  MockConstantSearchOp(ObDASSearchCtx &ctx, double score)
+      : MockSearchOp(ctx, {1, 2, 3}, {score, score, score}), score_(score) {}
+  ScoreCapability get_score_capability() const override
+  { return is_scoring_ ? ScoreCapability::CONSTANT : ScoreCapability::NONE; }
+  double get_constant_score() const override { return is_scoring_ ? score_ : 0.0; }
+  int do_rescan_segment(const ObNewVersionRange &) override { return do_rescan(); }
+private:
+  double score_;
 };
 
 class MockShallowSearchOp : public MockSearchOp
@@ -1008,6 +1025,229 @@ protected:
   std::vector<ObIDASSearchRtDef*> should_clauses_;
   std::vector<ObIDASSearchRtDef*> must_not_clauses_;
 };
+
+TEST_F(ObDASBooleanQueryTest, fixed_score_concrete_operator_capabilities)
+{
+  SearchCtxSetup ctx_setup(allocator_);
+  ObDASScalarIndexROROp scalar(ctx_setup.search_ctx_);
+  ObDASAsyncScalarRorOp async_scalar(ctx_setup.search_ctx_);
+  ObDASDisjunctionFilterOp disjunction(ctx_setup.search_ctx_);
+  ObDASBitmapOp bitmap(ctx_setup.search_ctx_);
+  using Capability = ObIDASSearchOp::ScoreCapability;
+  scalar.is_scoring_ = async_scalar.is_scoring_ = true;
+  EXPECT_EQ(Capability::ARRAY, scalar.get_score_capability());
+  EXPECT_EQ(Capability::ARRAY, async_scalar.get_score_capability());
+  ObDASScalarScanRtDef rtdef;
+  scalar.scalar_rtdef_ = async_scalar.scalar_rtdef_ = &rtdef;
+  ObIDASSearchOp *ops[] = {&scalar, &async_scalar, &disjunction, &bitmap};
+  for (double score : {0.0, 1.5}) {
+    rtdef.set_boost_weight(score);
+    disjunction.match_score_ = score;
+    bitmap.boost_weight_ = score;
+    for (ObIDASSearchOp *op : ops) {
+      op->is_scoring_ = true;
+      EXPECT_EQ(Capability::CONSTANT, op->get_score_capability());
+      EXPECT_EQ(score, op->get_constant_score());
+      op->is_scoring_ = false;
+      EXPECT_EQ(Capability::NONE, op->get_score_capability());
+      EXPECT_EQ(0.0, op->get_constant_score());
+    }
+  }
+}
+
+TEST_F(ObDASBooleanQueryTest, fixed_score_zero_threshold_and_reset)
+{
+  SearchCtxSetup ctx_setup(allocator_);
+  for (bool scoring : {false, true}) {
+    MockConstantSearchOp op(ctx_setup.search_ctx_, 0.0);
+    MockSearchOpParam param;
+    param.set_is_scoring(scoring);
+    ASSERT_EQ(OB_SUCCESS, op.init(param));
+    ASSERT_EQ(OB_SUCCESS, op.open());
+    EXPECT_DOUBLE_EQ(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, op.min_competitive_score_);
+    EXPECT_EQ(OB_INVALID_ARGUMENT,
+              op.set_min_competitive_score(std::numeric_limits<double>::quiet_NaN()));
+    EXPECT_FALSE(op.has_competitive_score_);
+    EXPECT_DOUBLE_EQ(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE, op.min_competitive_score_);
+    // A negative propagated cutoff must not discard a matching zero-score row.
+    ASSERT_EQ(OB_SUCCESS, op.set_min_competitive_score(-1.0));
+    EXPECT_TRUE(op.has_competitive_score_);
+    ObDASRowID id;
+    double score = -1.0;
+    ASSERT_EQ(OB_SUCCESS, op.next_rowid(id, score));
+    EXPECT_EQ(1, id.get_uint64());
+    ASSERT_EQ(OB_SUCCESS, op.set_min_competitive_score(0.0));
+    EXPECT_EQ(OB_ITER_END, op.next_rowid(id, score));
+    EXPECT_TRUE(id.is_max());
+    EXPECT_DOUBLE_EQ(0.0, score);
+    ASSERT_EQ(OB_SUCCESS, op.rescan());
+    ASSERT_EQ(OB_SUCCESS, op.next_rowid(id, score));
+    EXPECT_EQ(1, id.get_uint64());
+    ASSERT_EQ(OB_SUCCESS, op.set_min_competitive_score(0.0));
+    ObNewVersionRange range;
+    ASSERT_EQ(OB_SUCCESS, op.rescan_segment(range));
+    ASSERT_EQ(OB_SUCCESS, op.next_rowid(id, score));
+    EXPECT_EQ(1, id.get_uint64());
+    ASSERT_EQ(OB_SUCCESS, op.set_min_competitive_score(0.0));
+    ASSERT_EQ(OB_SUCCESS, op.close());
+    EXPECT_FALSE(op.has_competitive_score_);
+  }
+}
+
+TEST_F(ObDASBooleanQueryTest, fixed_score_stops_before_reading)
+{
+  SearchCtxSetup ctx_setup(allocator_);
+  MockConstantSearchOp op(ctx_setup.search_ctx_, 2.0);
+  MockSearchOpParam param;
+  param.set_is_scoring(true);
+  ASSERT_EQ(OB_SUCCESS, op.init(param));
+  ASSERT_EQ(OB_SUCCESS, op.open());
+  ASSERT_EQ(OB_SUCCESS, op.set_min_competitive_score(1.0));
+  ObDASRowID id;
+  double score = 0.0;
+  ASSERT_EQ(OB_SUCCESS, op.next_rowid(id, score));
+  EXPECT_DOUBLE_EQ(2.0, score);
+  ASSERT_EQ(OB_SUCCESS, op.set_min_competitive_score(2.0));
+  op.set_next_rowid_error(OB_ERR_UNEXPECTED);
+  op.set_advance_to_error(OB_ERR_UNEXPECTED);
+  EXPECT_EQ(OB_ITER_END, op.next_rowid(id, score));
+  EXPECT_TRUE(id.is_max());
+  ObDASRowID target;
+  target.set_uint64(2);
+  EXPECT_EQ(OB_ITER_END, op.advance_to(target, id, score));
+  EXPECT_TRUE(id.is_max());
+  int64_t count = 99;
+  EXPECT_EQ(OB_ITER_END, op.next_rowids(16, count));
+  EXPECT_EQ(0, count);
+  const MaxScoreTuple *tuple = nullptr;
+  EXPECT_EQ(OB_ITER_END, op.advance_shallow(target, true, tuple));
+  EXPECT_EQ(nullptr, tuple);
+  uint64_t out_ids[2] = {};
+  EXPECT_EQ(OB_SUCCESS, op.drain_until(target, 2, out_ids, nullptr, count, id, score));
+  EXPECT_EQ(0, count);
+  EXPECT_TRUE(id.is_max());
+  EXPECT_DOUBLE_EQ(0.0, score);
+  EXPECT_EQ(OB_INVALID_ARGUMENT, op.set_min_competitive_score(1.0));
+  ASSERT_EQ(OB_SUCCESS, op.close());
+}
+
+TEST_F(ObDASBooleanQueryTest, fixed_score_conjunction_exact_integer_bound)
+{
+  SearchCtxSetup ctx_setup(allocator_);
+  for (double last_score : {0.0, 2.0, 9007199254740990.0}) {
+    MockConstantSearchOp first(ctx_setup.search_ctx_, 1.0);
+    MockConstantSearchOp second(ctx_setup.search_ctx_, 1.0);
+    MockConstantSearchOp third(ctx_setup.search_ctx_, last_score);
+    MockSearchOpParam child_param;
+    child_param.set_is_scoring(true);
+    ObArray<ObIDASSearchOp *> children;
+    for (ObIDASSearchOp *child : {&first, &second, &third}) {
+      ASSERT_EQ(OB_SUCCESS, child->init(child_param));
+      ASSERT_EQ(OB_SUCCESS, children.push_back(child));
+    }
+    ObDASConjunctionOp op(ctx_setup.search_ctx_);
+    ObDASConjunctionOpParam param(children);
+    param.set_is_scoring(true);
+    ASSERT_EQ(OB_SUCCESS, op.init(param));
+    ASSERT_EQ(OB_SUCCESS, op.open());
+    const double bound = last_score + 2.0;
+    EXPECT_EQ(bound, op.fixed_score_bound_);
+    EXPECT_TRUE(op.is_fixed_score_);
+    ASSERT_EQ(OB_SUCCESS, op.set_min_competitive_score(last_score));
+    ObDASRowID id;
+    double score = 0.0;
+    ASSERT_EQ(OB_SUCCESS, op.next_rowid(id, score));
+    EXPECT_EQ(1, id.get_uint64());
+    EXPECT_EQ(bound, score);
+    ASSERT_EQ(OB_SUCCESS, op.set_min_competitive_score(bound));
+    EXPECT_FALSE(first.has_competitive_score_);
+    EXPECT_FALSE(second.has_competitive_score_);
+    EXPECT_FALSE(third.has_competitive_score_);
+    if (2.0 == last_score) {
+      first.set_advance_to_error(OB_ERR_UNEXPECTED);
+      first.set_next_rowid_error(OB_ERR_UNEXPECTED);
+    }
+    EXPECT_EQ(OB_ITER_END, op.next_rowid(id, score));
+    EXPECT_TRUE(id.is_max());
+    // Lifecycle and read-bypass checks only need the ordinary integer case.
+    if (2.0 == last_score) {
+      first.set_advance_to_error(OB_SUCCESS);
+      first.set_next_rowid_error(OB_SUCCESS);
+      ASSERT_EQ(OB_SUCCESS, op.rescan());
+      ASSERT_EQ(OB_SUCCESS, op.next_rowid(id, score));
+      EXPECT_EQ(1, id.get_uint64());
+      ASSERT_EQ(OB_SUCCESS, op.set_min_competitive_score(bound));
+      ObNewVersionRange range;
+      ASSERT_EQ(OB_SUCCESS, op.rescan_segment(range));
+      EXPECT_EQ(bound, op.fixed_score_bound_);
+      ASSERT_EQ(OB_SUCCESS, op.next_rowid(id, score));
+    }
+    ASSERT_EQ(OB_SUCCESS, op.close());
+  }
+}
+
+TEST_F(ObDASBooleanQueryTest, fixed_score_conjunction_unsupported_sum_falls_back)
+{
+  SearchCtxSetup ctx_setup(allocator_);
+  // Include 2^53 + 1: checking the sum after addition would miss its rounding.
+  for (double child_score : {0.5, 9007199254740991.0,
+                            -1.0, std::numeric_limits<double>::infinity(),
+                            std::numeric_limits<double>::quiet_NaN()}) {
+    MockConstantSearchOp first(ctx_setup.search_ctx_, 1.0);
+    MockConstantSearchOp second(ctx_setup.search_ctx_, 1.0);
+    MockConstantSearchOp third(ctx_setup.search_ctx_, child_score);
+    MockSearchOpParam child_param;
+    child_param.set_is_scoring(true);
+    ObArray<ObIDASSearchOp *> children;
+    for (ObIDASSearchOp *child : {&first, &second, &third}) {
+      ASSERT_EQ(OB_SUCCESS, child->init(child_param));
+      ASSERT_EQ(OB_SUCCESS, children.push_back(child));
+    }
+    ObDASConjunctionOp op(ctx_setup.search_ctx_);
+    ObDASConjunctionOpParam param(children);
+    param.set_is_scoring(true);
+    ASSERT_EQ(OB_SUCCESS, op.init(param));
+    ASSERT_EQ(OB_SUCCESS, op.open());
+    EXPECT_FALSE(op.has_fixed_score_bound());
+    EXPECT_FALSE(op.is_fixed_score_);
+    EXPECT_EQ(ObIDASSearchOp::ScoreCapability::ARRAY, op.get_score_capability());
+    ASSERT_EQ(OB_SUCCESS, op.set_min_competitive_score(100.0));
+    ObDASRowID id;
+    double score = 0.0;
+    ASSERT_EQ(OB_SUCCESS, op.next_rowid(id, score));
+    EXPECT_EQ(1, id.get_uint64());
+    ASSERT_EQ(OB_SUCCESS, op.close());
+  }
+}
+
+TEST_F(ObDASBooleanQueryTest, fixed_score_variable_driver_falls_back)
+{
+  SearchCtxSetup ctx_setup(allocator_);
+  MockConstantSearchOp fixed(ctx_setup.search_ctx_, 1.0);
+  MockSearchOp variable(ctx_setup.search_ctx_, {1, 2}, {2.0, 3.0});
+  MockSearchOpParam child_param;
+  child_param.set_is_scoring(true);
+  ASSERT_EQ(OB_SUCCESS, fixed.init(child_param));
+  ASSERT_EQ(OB_SUCCESS, variable.init(child_param));
+  ObArray<ObIDASSearchOp *> children;
+  ASSERT_EQ(OB_SUCCESS, children.push_back(&fixed));
+  ASSERT_EQ(OB_SUCCESS, children.push_back(&variable));
+  ObDASConjunctionOp op(ctx_setup.search_ctx_);
+  ObDASConjunctionOpParam param(children);
+  param.set_is_scoring(true);
+  ASSERT_EQ(OB_SUCCESS, op.init(param));
+  ASSERT_EQ(OB_SUCCESS, op.open());
+  EXPECT_FALSE(op.has_fixed_score_bound());
+  EXPECT_EQ(ObIDASSearchOp::ScoreCapability::ARRAY, op.get_score_capability());
+  ASSERT_EQ(OB_SUCCESS, op.set_min_competitive_score(3.0));
+  ObDASRowID id;
+  double score = 0.0;
+  ObDASRowID target;
+  target.set_uint64(2);
+  ASSERT_EQ(OB_SUCCESS, op.advance_to(target, id, score));
+  EXPECT_DOUBLE_EQ(4.0, score);
+  ASSERT_EQ(OB_SUCCESS, op.close());
+}
 
 TEST_F(ObDASBooleanQueryTest, streaming_ror_requires_single_search_segment_and_serial_plan)
 {

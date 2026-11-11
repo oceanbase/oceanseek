@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL_PC
 #include "sql/plan_cache/ob_pcv_set.h"
+#include "sql/hybrid_search/ob_hybrid_search_plan_cache.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::share::schema;
@@ -105,6 +106,9 @@ int ObPCVSet::inner_get_cache_obj(ObILibCacheCtx &ctx,
       LOG_WARN("param num is not equal", K_(normal_parse_const_cnt),
                "parameterized_params_count", pc_ctx.fp_result_.parameterized_params_.count());
     }
+  } else if (OB_NOT_NULL(pc_ctx.fp_result_.hybrid_dsl_request_)
+             && pc_ctx.fp_result_.hybrid_dsl_request_->has_parameters()) {
+    OZ(ObHybridSearchPlanCache::check_raw_param_count(pc_ctx.fp_result_, normal_parse_const_cnt_));
   } else {
     if (normal_parse_const_cnt_ != pc_ctx.fp_result_.raw_params_.count()) {
       ret = OB_ERR_UNEXPECTED;

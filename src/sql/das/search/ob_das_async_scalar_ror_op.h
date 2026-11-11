@@ -106,6 +106,13 @@ public:
   virtual ~ObDASAsyncScalarRorOp() {}
   int get_bitmap_input_range(bool &available, uint64_t &lo, uint64_t &hi,
                              int64_t &estimated_count) override;
+  ScoreCapability get_score_capability() const override
+  {
+    return !is_scoring_ ? ScoreCapability::NONE
+        : (nullptr != scalar_rtdef_ ? ScoreCapability::CONSTANT : ScoreCapability::ARRAY);
+  }
+  double get_constant_score() const override
+  { return is_scoring_ && nullptr != scalar_rtdef_ ? scalar_rtdef_->get_boost_weight() : 0.0; }
 
   void close_posting_iter();
   void release_scan_resources() override { close_posting_iter(); }

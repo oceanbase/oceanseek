@@ -110,7 +110,7 @@ int ObDSLFullTextQuery::inner_deep_copy(ObIRawExprCopier &expr_copier, ObDSLFull
   } else if (OB_FAIL(expr_copier.copy(boost_, boost_expr))) {
     LOG_WARN("fail to copy boost expr", K(ret));
   } else {
-    dst.query_ = static_cast<ObConstRawExpr*>(query_expr);
+    dst.query_ = query_expr;
     dst.boost_ = static_cast<ObConstRawExpr*>(boost_expr);
   }
   return ret;

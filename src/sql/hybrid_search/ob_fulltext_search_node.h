@@ -98,7 +98,7 @@ public:
 public:
   QueryType query_type_;
   uint64_t doc_id_idx_tid_;
-  ObConstRawExpr *query_text_;
+  ObRawExpr *query_text_;
   ObRawExpr *score_project_expr_;
   // async fulltext index members
   bool is_async_;

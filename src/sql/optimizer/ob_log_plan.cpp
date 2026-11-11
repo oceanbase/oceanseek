@@ -8036,12 +8036,15 @@ int ObLogPlan::create_hybrid_fusion_plan(ObLogicalOperator *&top)
       } else {
         ObExchangeInfo exch_info;
         ObTablePartitionInfo *part_info = tsc->get_table_partition_info();
-        const int64_t partition_cnt = part_info->get_phy_tbl_location_info().get_partition_cnt();
-        bool is_distributed = tsc->is_distributed();
-        bool use_das = tsc->use_das();
-        const bool is_single_partition = !is_distributed && (!use_das || 1 == partition_cnt);
-        bool need_fusion = !is_single_partition || fusion_node->has_rerank();
-        bool need_px = (!use_das) && is_distributed;
+        const bool is_part_table = part_info->get_part_level() != share::schema::PARTITION_LEVEL_ZERO;
+        const bool is_distributed = tsc->is_distributed();
+        const bool use_das = tsc->use_das();
+        // DAS recalculates partitions for each execution of a cached plan. Keep global fusion
+        // for partitioned tables even if the current parameters prune to one partition, and
+        // let the lower fusion iter collect candidates without applying final pagination.
+        const bool is_single_partition = !is_distributed && !(use_das && is_part_table);
+        const bool need_fusion = !is_single_partition || fusion_node->has_rerank();
+        const bool need_px = (!use_das) && is_distributed;
         fusion_node->set_is_single_partition(is_single_partition);
         if (need_fusion) {
           if (need_px && OB_FAIL(allocate_exchange_as_top(top, exch_info))) {

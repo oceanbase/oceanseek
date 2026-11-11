@@ -85,6 +85,10 @@ public:
       match_score_(0.0)
   {}
 
+  ScoreCapability get_score_capability() const override
+  { return is_scoring_ ? ScoreCapability::CONSTANT : ScoreCapability::NONE; }
+  double get_constant_score() const override { return is_scoring_ ? match_score_ : 0.0; }
+
   bool can_enumerate_rowids() const override
   {
     // minimum_should_match=0 means "match the caller's candidate". There is

@@ -479,6 +479,7 @@ int ObIDASSearchOp::do_set_min_competitive_score(const double &threshold)
     LOG_WARN("invalid threshold", K(ret), K(threshold), K_(min_competitive_score));
   } else {
     min_competitive_score_ = threshold;
+    has_competitive_score_ = true;
   }
   return ret;
 }
@@ -611,6 +612,8 @@ int ObIDASSearchOp::drain_until_active(
   } else if (OB_UNLIKELY(DAS_ROWID_TYPE_UINT64 != get_rowid_type())) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("active drain only supports uint64 rowid type", K(ret), K(get_rowid_type()));
+  } else if (cannot_compete_with_fixed_score()) {
+    // No remaining row can contribute to the competitive result stream.
   } else if (OB_LIKELY(nullptr == profile_)) {
     if (OB_FAIL(do_drain_until_active(range_start, range_end, accumulator, count))) {
       LOG_WARN("failed to drain active candidates", KR(ret));

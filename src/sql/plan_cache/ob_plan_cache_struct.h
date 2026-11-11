@@ -33,6 +33,7 @@ class ObString;
 namespace sql
 {
 class ObPhysicalPlan;
+class ObHybridDslRequestInfo;
 
 typedef common::ObSEArray<ObString, 1, common::ModulePageAllocator, true> TmpTableNameArray;
 
@@ -233,6 +234,7 @@ public:
     : inner_alloc_("FastParserRes"),
       parameterized_params_(&inner_alloc_),
       cache_params_(NULL),
+      hybrid_dsl_request_(nullptr),
       values_token_pos_(0)
   {
     reset_question_mark_ctx();
@@ -241,6 +243,8 @@ public:
   common::ObSEArray<ObPCParam *, 16> raw_params_;
   common::ObFixedArray<const common::ObObjParam *, common::ObIAllocator> parameterized_params_;
   ParamStore *cache_params_;
+  // Hybrid-search request state, borrowed from the statement allocator.
+  ObHybridDslRequestInfo *hybrid_dsl_request_;
   ObQuestionMarkCtx question_mark_ctx_;
   int64_t values_token_pos_; // for insert values
   common::ObSEArray<ObValuesTokenPos, 4> values_tokens_; // for values table
@@ -251,6 +255,7 @@ public:
     raw_params_.reuse();
     parameterized_params_.reuse();
     cache_params_ = NULL;
+    hybrid_dsl_request_ = nullptr;
     values_token_pos_ = 0;
     values_tokens_.reset();
     array_params_.reuse();
@@ -271,6 +276,7 @@ public:
     pc_key_ = other.pc_key_;
     parameterized_params_.set_allocator(&inner_alloc_);
     cache_params_ = other.cache_params_;
+    hybrid_dsl_request_ = other.hybrid_dsl_request_;
     question_mark_ctx_ = other.question_mark_ctx_;
     if (OB_FAIL(raw_params_.assign(other.raw_params_))) {
       SQL_PC_LOG(WARN, "failed to assign fix array", K(ret));
@@ -284,7 +290,7 @@ public:
     return ret;
   }
   TO_STRING_KV(K(pc_key_), K(raw_params_), K(parameterized_params_), K(cache_params_), K(values_token_pos_),
-               K(values_tokens_), K(array_params_));
+               K(values_tokens_), K(array_params_), KP_(hybrid_dsl_request));
 };
 
 enum WayToGenPlan {

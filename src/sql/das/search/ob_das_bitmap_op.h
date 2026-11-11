@@ -242,6 +242,9 @@ public:
     boost_weight_(0.0)
   { }
   virtual ~ObDASBitmapOp() {}
+  ScoreCapability get_score_capability() const override
+  { return is_scoring_ ? ScoreCapability::CONSTANT : ScoreCapability::NONE; }
+  double get_constant_score() const override { return is_scoring_ ? boost_weight_ : 0.0; }
   int get_bitmap_input_range(bool &available, uint64_t &lo, uint64_t &hi,
                              int64_t &estimated_count) override;
 

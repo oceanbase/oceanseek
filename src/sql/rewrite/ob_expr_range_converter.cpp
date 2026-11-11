@@ -5046,6 +5046,8 @@ int ObExprRangeConverter::convert_dsl_multi_value_range(const ObRawExpr &expr,
     // Reserve two array markers and the scalar type; do not truncate path keys.
     can_extract = false;
   }
+  // The DSL resolver supplies scalar literal/parameter endpoints and constant
+  // inclusion flags. Evaluate them through the ordinary SQL parameter path.
   for (int64_t i = 1; OB_SUCC(ret) && can_extract && i < 5; ++i) {
     const ObRawExpr *arg = expr.get_param_expr(i);
     const ObRawExpr *literal = ObRawExprUtils::skip_inner_added_expr(arg);
@@ -5053,10 +5055,6 @@ int ObExprRangeConverter::convert_dsl_multi_value_range(const ObRawExpr &expr,
     if (OB_ISNULL(arg) || OB_ISNULL(literal)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected null range argument", K(ret), K(i));
-    } else if (!literal->is_immutable_const_expr()) {
-      // DSL endpoints/flags are literals. Keep mutable internal arguments as filters:
-      // nullness, inclusion and type must not be frozen into a cached range.
-      can_extract = false;
     } else if (OB_FAIL(get_calculable_expr_val(arg, value, can_extract))) {
       LOG_WARN("failed to evaluate range argument", K(ret), K(i));
     } else if (!can_extract) {
@@ -5106,7 +5104,19 @@ int ObExprRangeConverter::convert_dsl_multi_value_range(const ObRawExpr &expr,
   }
   if (OB_FAIL(ret)) {
   } else if (can_extract && (has_bound[0] || has_bound[1])) {
-    if (OB_FAIL(fill_dsl_multi_value_range_node(*column_expr, expr, has_bound, inclusive,
+    for (int64_t i = 1; OB_SUCC(ret) && i <= 2; ++i) {
+      const ObRawExpr *arg = expr.get_param_expr(i);
+      const ObRawExpr *literal = ObRawExprUtils::skip_inner_added_expr(arg);
+      if (!literal->is_immutable_const_expr()
+          && ob_is_string_type(arg->get_result_type().get_type())) {
+        // Reused string bounds must still fit the search-index value encoding.
+        if (OB_FAIL(ObSearchIndexQueryRangeUtils::add_string_type_length_constraint(ctx_, arg))) {
+          LOG_WARN("failed to add DSL range string length constraint", K(ret));
+        }
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(fill_dsl_multi_value_range_node(*column_expr, expr, has_bound, inclusive,
                                                 range_type, range_node))) {
       LOG_WARN("failed to build DSL multi-value range node", K(ret));
     } else {

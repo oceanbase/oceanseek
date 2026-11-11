@@ -1307,6 +1307,9 @@ ob_set_subtarget(ob_sql executor
 ob_set_subtarget(ob_sql hybrid_search
   hybrid_search/ob_fulltext_search_node.cpp
   hybrid_search/ob_fulltext_search_query.cpp
+  hybrid_search/ob_hybrid_search_dsl_parameterizer.cpp
+  hybrid_search/ob_hybrid_search_plan_cache.cpp
+  hybrid_search/ob_expr_dsl_param_value.cpp
   hybrid_search/ob_hybrid_search_dsl_resolver.cpp
   hybrid_search/ob_hybrid_search_node.cpp
 )

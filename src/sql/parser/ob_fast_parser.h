@@ -19,6 +19,8 @@ namespace oceanbase
 {
 namespace sql
 {
+class ObHybridSearchTokenHandler;
+
 struct FPContext
 {
 public:
@@ -28,14 +30,16 @@ public:
 	ObSQLMode sql_mode_;
 	QuestionMarkDefNameCtx *def_name_ctx_;
   bool is_format_;
-  bool question_mark_by_order_; 
+  bool question_mark_by_order_;
+  ObHybridSearchTokenHandler *hybrid_search_token_handler_;
 	FPContext()
 		: enable_batched_multi_stmt_(false),
 			is_udr_mode_(false),
 			sql_mode_(0),
 			def_name_ctx_(nullptr),
       is_format_(false),
-      question_mark_by_order_(false)
+      question_mark_by_order_(false),
+      hybrid_search_token_handler_(nullptr)
 	{}
 	FPContext(ObCharsets4Parser charsets4parser)
 		: enable_batched_multi_stmt_(false),
@@ -44,7 +48,8 @@ public:
 			sql_mode_(0),
 			def_name_ctx_(nullptr),
       is_format_(false),
-      question_mark_by_order_(false)
+      question_mark_by_order_(false),
+      hybrid_search_token_handler_(nullptr)
 	{}
 };
 
@@ -753,7 +758,8 @@ public:
 		common::ObIAllocator &allocator,
 		const FPContext fp_ctx)
 		: ObFastParserBase(allocator, fp_ctx),
-			sql_mode_(fp_ctx.sql_mode_)
+      sql_mode_(fp_ctx.sql_mode_),
+      hybrid_search_token_handler_(fp_ctx.hybrid_search_token_handler_)
 	{
 		is_oracle_mode_ = false;
 		set_callback_func(
@@ -765,6 +771,7 @@ public:
 	ObIArray<ObValuesTokenPos> &get_values_tokens() { return values_tokens_; }
 private:
 	ObSQLMode sql_mode_;
+  ObHybridSearchTokenHandler *hybrid_search_token_handler_;
 	int parse_next_token();
 	int process_identifier(bool is_number_begin);
 	/** 

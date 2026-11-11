@@ -22,6 +22,7 @@ int ObResolverParams::assign(const ObResolverParams &other)
   session_info_ = other.session_info_;
   query_ctx_ = other.query_ctx_;
   param_list_ = other.param_list_;
+  hybrid_dsl_request_ = other.hybrid_dsl_request_;
   select_item_param_infos_ = other.select_item_param_infos_;
   prepare_param_count_ = other.prepare_param_count_;
   sql_proxy_ = other.sql_proxy_;

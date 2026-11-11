@@ -32,6 +32,13 @@ public:
       rowid_output_exprs_()
   { }
   virtual ~ObDASScalarROROp() {}
+  ScoreCapability get_score_capability() const override
+  {
+    return !is_scoring_ ? ScoreCapability::NONE
+        : (nullptr != scalar_rtdef_ ? ScoreCapability::CONSTANT : ScoreCapability::ARRAY);
+  }
+  double get_constant_score() const override
+  { return is_scoring_ && nullptr != scalar_rtdef_ ? scalar_rtdef_->get_boost_weight() : 0.0; }
 
 protected:
   int do_open() override;

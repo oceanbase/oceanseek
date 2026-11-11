@@ -4,6 +4,7 @@
  */
 
 #define USING_LOG_PREFIX SQL_ENG
+#include "sql/hybrid_search/ob_expr_dsl_param_value.h"
 #include "ob_expr_operator_factory.h"
 #include "sql/engine/expr/ob_expr_substring_index.h"
 #include "sql/engine/expr/ob_expr_strcmp.h"
@@ -1399,6 +1400,7 @@ void ObExprOperatorFactory::register_expr_operators()
     REG_OP(ObExprLobIdToString, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprLobSeqIdToString, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprDslMultiValueRange, SHORT_CIRCUIT_EVALUATION);
+    REG_OP(ObExprDslParamValue, EAGER_EVALUATION);
     REG_OP(ObExprHybridUniqueShardDoc, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprHybridSearchSortValues, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprMergeValueEqual, SHORT_CIRCUIT_EVALUATION);

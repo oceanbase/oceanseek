@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL
 #include "sql/ob_sql.h"
+#include "sql/hybrid_search/ob_hybrid_search_plan_cache.h"
 #include "lib/json/ob_json_print_utils.h"
 #include "lib/profile/ob_perf_event.h"
 #include "share/ob_truncated_string.h"
@@ -3315,6 +3316,8 @@ int ObSql::generate_stmt(ParseResult &parse_result,
     resolver_ctx.is_dbms_sql_ = context.is_dbms_sql_;
     resolver_ctx.statement_id_ = context.statement_id_;
     resolver_ctx.param_list_ = &plan_ctx->get_param_store();
+    resolver_ctx.hybrid_dsl_request_ =
+        OB_ISNULL(pc_ctx) ? nullptr : pc_ctx->fp_result_.hybrid_dsl_request_;
     resolver_ctx.sql_proxy_ = GCTX.sql_proxy_;
     resolver_ctx.is_from_pl_ = context.is_from_pl_;
   }
@@ -5436,7 +5439,8 @@ int ObSql::need_add_plan(const ObPlanCacheCtx &pc_ctx,
     LOG_WARN("unexpected null ptr", K(ret), KP(result.get_exec_context().get_stmt_factory()));
   } else if (result.get_exec_context().get_stmt_factory()->get_query_ctx()->has_dblink()) {
     need_add_plan = false;
-  } else if (result.get_exec_context().get_stmt_factory()->get_query_ctx()->has_hybrid_search()) {
+  } else if (result.get_exec_context().get_stmt_factory()->get_query_ctx()->has_hybrid_search()
+             && !ObHybridSearchPlanCache::can_add_plan(pc_ctx.fp_result_)) {
     need_add_plan = false;
   } else if (result.get_exec_context().get_stmt_factory()->get_query_ctx()
       ->has_dynamic_partition_tier()) {
@@ -5805,6 +5809,10 @@ int ObSql::handle_parser(const ObString &sql,
   int64_t parser_mem_usage = 0;
   ObPhysicalPlanCtx *pctx = exec_ctx.get_physical_plan_ctx();
   const ObSqlCtx *sql_ctx = exec_ctx.get_sql_ctx();
+  if (OB_NOT_NULL(pc_ctx.fp_result_.hybrid_dsl_request_)
+      && pc_ctx.fp_result_.hybrid_dsl_request_->has_parameters()) {
+    ObHybridSearchPlanCache::prepare_parse(pc_ctx, sql, add_plan_to_pc, is_enable_transform_tree);
+  }
   if (OB_ISNULL(pc_ctx.sql_ctx_.session_info_) || OB_ISNULL(pctx)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid argument", K(ret), KP(pctx), KP(pc_ctx.sql_ctx_.session_info_));

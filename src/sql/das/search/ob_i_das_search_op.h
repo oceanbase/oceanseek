@@ -341,6 +341,7 @@ public:
       children_(nullptr),
       children_cnt_(0),
       min_competitive_score_(DAS_SEARCH_INITIAL_COMPETITIVE_SCORE),
+      has_competitive_score_(false),
       is_scoring_(true),
       profile_(nullptr),
       last_profile_output_rowid_(0),
@@ -376,6 +377,14 @@ public:
   OB_INLINE sql::ObBitVector &mock_skip() { return *search_ctx_.mock_skip_; }
   OB_INLINE ObDASSearchOpType get_op_type() const { return op_type_; }
   int prepare_parallel_work_estimate();
+  // NONE contributes zero; CONSTANT shares one exact value across all output rows.
+  // ARRAY requires per-row scores, not necessarily different values for every row.
+  enum class ScoreCapability { NONE, CONSTANT, ARRAY };
+  virtual ScoreCapability get_score_capability() const
+  { return is_scoring_ ? ScoreCapability::ARRAY : ScoreCapability::NONE; }
+  // Read only for NONE or CONSTANT; an upper bound is not an exact constant.
+  // NONE must return zero, including when a scoring operator is used as a filter.
+  virtual double get_constant_score() const { return 0.0; }
   ObDASSearchWorkEstimate get_parallel_work_estimate() const
   {
     ObDASSearchWorkEstimate estimate;
@@ -499,7 +508,8 @@ public:
   /*
    * Sets the minimum competitive score for dynamic pruning.
    * @in param threshold: The minimum competitive score.
-   * Recursively pass the threshold to children operators by default.
+   * Competitive scores must strictly exceed threshold. The default stores it
+   * locally; composite operators must translate it before forwarding to children.
    */
   OB_INLINE int set_min_competitive_score(const double &threshold);
 
@@ -577,6 +587,8 @@ public:
     next_id_after.set_max();
     if (OB_UNLIKELY(range_start > range_end)) {
       ret = OB_INVALID_ARGUMENT;
+    } else if (cannot_compete_with_fixed_score()) {
+      // Preserve the empty drain contract without invoking the consumer.
     } else if (OB_LIKELY(nullptr == profile_)) {
       ret = do_direct_drain_rowids(
           range_start, range_end, consumer, next_id_after);
@@ -764,6 +776,18 @@ protected:
     has_last_profile_output_rowid_ = false;
   }
 
+  // Public row-fetch and drain entry points enforce this before invoking do_*.
+  // Internal fallbacks share that check; derived ops only need additional bounds.
+  bool cannot_compete_with_fixed_score() const
+  {
+    return has_competitive_score_
+        && ScoreCapability::ARRAY != get_score_capability()
+        && get_constant_score() <= min_competitive_score_;
+  }
+  bool cannot_compete_with_score(const double score) const
+  {
+    return has_competitive_score_ && score <= min_competitive_score_;
+  }
   ObDASSearchCtx &search_ctx_;
   ObDASSearchOpType op_type_;
   int64_t op_id_;
@@ -772,6 +796,7 @@ protected:
   ObIDASSearchOp **children_;
   int64_t children_cnt_;
   double min_competitive_score_;
+  bool has_competitive_score_; // A zero threshold is distinct from no threshold.
   bool is_scoring_;
   common::ObOpProfile<common::ObMetric> *profile_;
   uint64_t last_profile_output_rowid_;
@@ -820,6 +845,7 @@ OB_INLINE int ObIDASSearchOp::close()
   op_id_ = OB_INVALID_ID;
   max_score_tuple_.reset();
   min_competitive_score_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
+  has_competitive_score_ = false;
   if (OB_NOT_NULL(children_)) {
     ctx_allocator().free(children_);
     children_ = nullptr;
@@ -845,6 +871,7 @@ OB_INLINE int ObIDASSearchOp::rescan()
       INC_METRIC_VAL(common::ObMetricId::HS_SAME_OP_SCAN_TIMES, 1);
     }
     min_competitive_score_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
+    has_competitive_score_ = false;
     if (OB_FAIL(do_rescan())) {
       LOG_WARN("failed to rescan impl", KR(ret));
     }
@@ -858,6 +885,7 @@ OB_INLINE int ObIDASSearchOp::rescan_segment(const common::ObNewVersionRange &ra
   reset_profile_output_row();
   common::ObProfileSwitcher switcher(profile_);
   min_competitive_score_ = DAS_SEARCH_INITIAL_COMPETITIVE_SCORE;
+  has_competitive_score_ = false;
   if (OB_FAIL(do_rescan_segment(range))) {
     LOG_WARN("failed to rescan segment impl", KR(ret));
   }
@@ -869,7 +897,11 @@ OB_INLINE int ObIDASSearchOp::rescan_segment(const common::ObNewVersionRange &ra
 OB_INLINE int ObIDASSearchOp::advance_to(const ObDASRowID &target, ObDASRowID &curr_id, double &score)
 {
   int ret = OB_SUCCESS;
-  if (OB_LIKELY(nullptr == profile_)) {
+  if (cannot_compete_with_fixed_score()) {
+    curr_id.set_max();
+    score = 0.0;
+    ret = OB_ITER_END;
+  } else if (OB_LIKELY(nullptr == profile_)) {
     ret = do_advance_to(target, curr_id, score);
   } else {
     common::ObProfileSwitcher switcher(profile_);
@@ -895,6 +927,9 @@ OB_INLINE int ObIDASSearchOp::advance_to_id(const ObDASRowID &target, ObDASRowID
   if (OB_UNLIKELY(!can_advance_to_id())) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("advance to id is not supported", K(ret), K(target));
+  } else if (cannot_compete_with_fixed_score()) {
+    curr_id.set_max();
+    ret = OB_ITER_END;
   } else {
     if (OB_LIKELY(nullptr == profile_)) {
       ret = do_advance_to_id(target, curr_id);
@@ -943,7 +978,11 @@ OB_INLINE int ObIDASSearchOp::load_curr_score(double &score)
 OB_INLINE int ObIDASSearchOp::next_rowid(ObDASRowID &next_id, double &score)
 {
   int ret = OB_SUCCESS;
-  if (OB_LIKELY(nullptr == profile_)) {
+  if (cannot_compete_with_fixed_score()) {
+    next_id.set_max();
+    score = 0.0;
+    ret = OB_ITER_END;
+  } else if (OB_LIKELY(nullptr == profile_)) {
     ret = do_next_rowid(next_id, score);
   } else {
     common::ObProfileSwitcher switcher(profile_);
@@ -966,7 +1005,10 @@ OB_INLINE int ObIDASSearchOp::next_rowid(ObDASRowID &next_id, double &score)
 OB_INLINE int ObIDASSearchOp::advance_shallow(const ObDASRowID &target, const bool inclusive, const MaxScoreTuple *&max_score_tuple)
 {
   int ret = OB_SUCCESS;
-  if (OB_LIKELY(nullptr == profile_)) {
+  if (cannot_compete_with_fixed_score()) {
+    max_score_tuple = nullptr;
+    ret = OB_ITER_END;
+  } else if (OB_LIKELY(nullptr == profile_)) {
     ret = do_advance_shallow(target, inclusive, max_score_tuple);
   } else {
     common::ObProfileSwitcher switcher(profile_);
@@ -987,7 +1029,10 @@ OB_INLINE int ObIDASSearchOp::advance_shallow(const ObDASRowID &target, const bo
 OB_INLINE int ObIDASSearchOp::next_rowids(int64_t capacity, int64_t &count)
 {
   int ret = OB_SUCCESS;
-  if (OB_LIKELY(nullptr == profile_)) {
+  if (cannot_compete_with_fixed_score()) {
+    count = 0;
+    ret = OB_ITER_END;
+  } else if (OB_LIKELY(nullptr == profile_)) {
     ret = do_next_rowids(capacity, count);
   } else {
     common::ObProfileSwitcher switcher(profile_);
@@ -1005,7 +1050,10 @@ OB_INLINE int ObIDASSearchOp::next_rowids(int64_t capacity, int64_t &count)
 OB_INLINE int ObIDASSearchOp::set_min_competitive_score(const double &threshold)
 {
   int ret = OB_SUCCESS;
-  if (OB_LIKELY(nullptr == profile_)) {
+  if (!is_scoring_ && DAS_SEARCH_OP_MAX != op_type_) {
+    // The output is constant zero; consume its cutoff here, not in filter children.
+    ret = ObIDASSearchOp::do_set_min_competitive_score(threshold);
+  } else if (OB_LIKELY(nullptr == profile_)) {
     ret = do_set_min_competitive_score(threshold);
   } else {
     common::ObProfileSwitcher switcher(profile_);
@@ -1113,6 +1161,10 @@ OB_INLINE int ObIDASSearchOp::drain_until_impl(
   } else if (OB_UNLIKELY(DAS_ROWID_TYPE_UINT64 != get_rowid_type())) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("drain_until only supports uint64 rowid type", K(ret), K(get_rowid_type()));
+  } else if (cannot_compete_with_fixed_score()) {
+    count = 0;
+    next_id_after.set_max();
+    next_score_after = 0.0;
   } else if (OB_FAIL(do_drain_until(
       boundary, capacity, out_ids, out_scores, count, next_id_after, next_score_after))) {
     LOG_WARN("failed to drain_until impl", KR(ret));

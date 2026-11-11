@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL_PC
 #include "ob_plan_cache.h"
+#include "sql/hybrid_search/ob_hybrid_search_plan_cache.h"
 #include "share/ob_truncated_string.h"
 #include "lib/rc/ob_rc.h"
 #include "sql/plan_cache/ob_plan_cache_callback.h"
@@ -738,7 +739,10 @@ int ObPlanCache::construct_fast_parser_result(common::ObIAllocator &allocator,
       ObString first_truncated_sql;
       int64_t batch_count = 0;
       bool is_insert_values = false;
-      if (OB_FAIL(ObSqlParameterization::fast_parser(allocator,
+      ObHybridSearchTokenHandler hybrid_handler;
+      if (OB_FAIL(ObHybridSearchPlanCache::init_fast_parser(hybrid_handler, pc_ctx, fp_ctx))) {
+        LOG_WARN("failed to initialize hybrid search parameterization", K(ret));
+      } else if (OB_FAIL(ObSqlParameterization::fast_parser(allocator,
                                                     fp_ctx,
                                                     raw_sql,
                                                     fp_result))) {
@@ -782,6 +786,11 @@ int ObPlanCache::construct_fast_parser_result(common::ObIAllocator &allocator,
           LOG_WARN("failed to check fold params valid", K(ret));
         }
       }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (fp_result.hybrid_dsl_request_ != nullptr && !fp_result.hybrid_dsl_request_->can_cache()) {
+      pc_ctx.should_add_plan_ = false;
     }
   }
   return ret;
@@ -1125,24 +1134,29 @@ int ObPlanCache::add_plan_cache(ObILibCacheCtx &ctx,
     SQL_PC_LOG(WARN, "invalid cache obj", K(ret));
   } else {
     ObPlanCacheCtx &pc_ctx = static_cast<ObPlanCacheCtx&>(ctx);
-    pc_ctx.key_ = &(pc_ctx.fp_result_.pc_key_);
-    int tmp_ret = OB_SUCCESS;
-    if (pc_ctx.regenerating_expired_plan_
-        && OB_SUCCESS != (tmp_ret = remove_cache_node(pc_ctx.key_))) {
-      SQL_PC_LOG(WARN, "fail to remove lib cache node for expired plan", K(tmp_ret));
-    }
-    do {
-      if (OB_FAIL(add_cache_obj(ctx, pc_ctx.key_, cache_obj)) && OB_OLD_SCHEMA_VERSION == ret) {
-        SQL_PC_LOG(INFO, "table or view in plan cache value is old", K(ret));
+    if (OB_NOT_NULL(pc_ctx.fp_result_.hybrid_dsl_request_)
+        && !pc_ctx.fp_result_.hybrid_dsl_request_->can_cache()) {
+      ret = OB_NOT_SUPPORTED;
+    } else {
+      pc_ctx.key_ = &(pc_ctx.fp_result_.pc_key_);
+      int tmp_ret = OB_SUCCESS;
+      if (pc_ctx.regenerating_expired_plan_
+          && OB_SUCCESS != (tmp_ret = remove_cache_node(pc_ctx.key_))) {
+        SQL_PC_LOG(WARN, "fail to remove lib cache node for expired plan", K(tmp_ret));
       }
-      if (ctx.need_destroy_node_) {
-        SQL_PC_LOG(INFO, "The cache node needs to be evict due to an invalid state", K(ret));
-        if (OB_SUCCESS != (tmp_ret = remove_cache_node(pc_ctx.key_))) {
-          ret = tmp_ret;
-          SQL_PC_LOG(WARN, "fail to remove lib cache node", K(ret));
+      do {
+        if (OB_FAIL(add_cache_obj(ctx, pc_ctx.key_, cache_obj)) && OB_OLD_SCHEMA_VERSION == ret) {
+          SQL_PC_LOG(INFO, "table or view in plan cache value is old", K(ret));
         }
-      }
-    } while (OB_OLD_SCHEMA_VERSION == ret && pc_ctx.need_retry_add_plan());
+        if (ctx.need_destroy_node_) {
+          SQL_PC_LOG(INFO, "The cache node needs to be evict due to an invalid state", K(ret));
+          if (OB_SUCCESS != (tmp_ret = remove_cache_node(pc_ctx.key_))) {
+            ret = tmp_ret;
+            SQL_PC_LOG(WARN, "fail to remove lib cache node", K(ret));
+          }
+        }
+      } while (OB_OLD_SCHEMA_VERSION == ret && pc_ctx.need_retry_add_plan());
+    }
   }
   return ret;
 }
@@ -1153,7 +1167,11 @@ int ObPlanCache::get_plan_cache(ObILibCacheCtx &ctx,
   int ret = OB_SUCCESS;
   ObPlanCacheCtx &pc_ctx = static_cast<ObPlanCacheCtx&>(ctx);
   pc_ctx.key_ = &(pc_ctx.fp_result_.pc_key_);
-  if (OB_FAIL(get_cache_obj(ctx, pc_ctx.key_, guard))) {
+  if (OB_NOT_NULL(pc_ctx.fp_result_.hybrid_dsl_request_)
+      && !pc_ctx.fp_result_.hybrid_dsl_request_->can_cache()) {
+    pc_ctx.should_add_plan_ = false;
+    ret = OB_SQL_PC_NOT_EXIST;
+  } else if (OB_FAIL(get_cache_obj(ctx, pc_ctx.key_, guard))) {
     SQL_PC_LOG(TRACE, "failed to get plan", K(ret), K(pc_ctx.key_));
   }
   // check the returned error code and whether the plan has expired
