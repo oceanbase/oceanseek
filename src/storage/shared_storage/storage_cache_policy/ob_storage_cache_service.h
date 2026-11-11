@@ -352,12 +352,14 @@ private:
       ObSchemaGetterGuard &schema_guard,
       const ObStorageCachePolicyRefreshType &refresh_type,
       ObScpLiteScanCtx &ctx);
-  int scan_scp_lite_partitions_(
+  int collect_scp_lite_part_rows_(
       ObSchemaGetterGuard &schema_guard,
+      const bool is_subpart,
+      ObScpLiteScanCtx &ctx);
+  int handle_scp_lite_partitions_(
       const ObStorageCachePolicyRefreshType &refresh_type,
       ObScpLiteScanCtx &ctx);
-  int scan_scp_lite_subpartitions_(
-      ObSchemaGetterGuard &schema_guard,
+  int handle_scp_lite_subpartitions_(
       const ObStorageCachePolicyRefreshType &refresh_type,
       ObScpLiteScanCtx &ctx);
   void handle_scp_lite_part_row_error_(
