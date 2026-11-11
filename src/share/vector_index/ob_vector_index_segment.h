@@ -150,6 +150,7 @@ enum class ObVectorIndexSegmentType : uint16_t
   EMPTY,
   VSAG_MERGE,
   SNAP_META_BRIDGE,
+  INCR_BASE = 9,
   MAX
 };
 
