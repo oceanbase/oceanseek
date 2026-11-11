@@ -11,6 +11,7 @@
 #include <orc/Reader.hh>
 
 #include "sql/engine/table/ob_external_table_access_service.h"
+#include "sql/optimizer/file_prune/ob_lake_table_fwd.h"
 #include "sql/engine/table/ob_external_table_pushdown_filter.h"
 #include "sql/engine/table/ob_external_file_access.h"
 #include "sql/engine/basic/ob_arrow_basic.h"
@@ -30,6 +31,8 @@ public:
   {}
   virtual ~ObOrcMinMaxIter();
 
+  bool can_handle_task(const ObIExtTblScanTask *task) const override
+  { return can_handle_file_task(task, ObExternalFileFormat::ORC_FORMAT); }
   int init(const storage::ObTableScanParam *scan_param) override;
   int get_next_rows(int64_t &count, int64_t capacity) override;
   int get_next_row() override { return common::OB_NOT_SUPPORTED; }
@@ -38,9 +41,12 @@ public:
     return common::OB_ERR_UNEXPECTED;
   }
   virtual void reset() override;
+  int64_t get_next_task_idx() const override { return state_.task_idx_; }
+  int set_next_task_idx(int64_t idx) override { state_.task_idx_ = idx; return OB_SUCCESS; }
 
 private:
-  int next_file();
+  // Stop before consuming another partition once an aggregate has started.
+  int next_file(const ObFileScanTask *partition_task = nullptr);
   int create_file_reader(const ObString &data_path, const int64_t file_size);
   int compute_orc_column_id(ObExpr *file_col_expr, int64_t &orc_col_id);
   int build_type_name_id_map(const orc::Type *type, common::ObIArray<ObString> &col_names);

@@ -39,17 +39,20 @@ struct ObPluginSplitDesc
 {
 public:
   ObPluginSplitDesc()
-      : plugin_task_json_(), file_url_(), file_size_(0), part_id_(OB_INVALID_PARTITION_ID),
-        record_count_(0), reader_type_(ObPluginReaderType::INVALID) {}
-  TO_STRING_KV(K_(plugin_task_json), K_(file_url), K_(file_size), K_(part_id),
-               K_(record_count), K_(reader_type));
+      : plugin_task_json_(), file_url_(), file_size_(0), cache_version_(0), part_id_(OB_INVALID_PARTITION_ID),
+        record_count_(0), reader_type_(ObExternalFileFormat::INVALID_FORMAT) {}
+  TO_STRING_KV(K_(plugin_task_json), K_(file_url), K_(file_size), K_(cache_version), K_(part_id),
+               K_(record_count), K_(reader_type), K_(assigned_file_bytes));
 
   ObString plugin_task_json_;          // Empty for OB file tasks
   ObString file_url_;                  // Empty for plugin-reader tasks
   int64_t file_size_;
+  int64_t cache_version_;              // OB file-content token; 0 retains storage stat
   int64_t part_id_;
   int64_t record_count_;               // Plugin estimate (0 unknown); OB file exact row count
-  ObPluginReaderType reader_type_;
+  ObExternalFileFormat::FormatType reader_type_;
+  // Planned data-file bytes, validated non-negative; -1 is unset. Not a scheduling weight.
+  int64_t assigned_file_bytes_ = -1;
 };
 
 /// Produces the complete scan-task transport for a plugin lake table.
@@ -103,7 +106,7 @@ private:
   int append_scan_task_splits(
       const share::ObExtScanTask &task,
       int64_t part_id,
-      ObPluginReaderType reader_type,
+      ObExternalFileFormat::FormatType reader_type,
       const share::ObExtFileScanDescriptor *ob_file_scan,
       common::ObIArray<ObPluginSplitDesc *> &splits);
   int build_plugin_splits(
@@ -112,12 +115,15 @@ private:
       const common::ObIArray<uint64_t> &partition_col_ids,
       const common::ObIArray<ObRawExpr *> &partition_filter_exprs,
       const common::ObString &predicate_json,
+      const common::ObString &partition_filter_json,
       common::ObIArray<ObPluginSplitDesc *> &splits);
   common::ObString table_uri_;
   common::ObString access_info_;
   share::ObLakeTableFormat plugin_format_ = share::ObLakeTableFormat::INVALID;
   const ext_plugin::ObExtTableMetadata *ext_metadata_;
   common::ObSEArray<ObRawExpr *, 4> filter_exprs_;
+  common::ObString normalized_partition_ranges_json_;
+  common::ObSEArray<ObRawExpr *, 4> normalized_partition_range_exprs_;
   common::ObSEArray<uint64_t, 4> proven_part_column_ids_;
   common::ObSEArray<ObRawExpr *, 4> proven_part_filter_exprs_;
   share::ObExternalTablePartInfoArray partition_infos_;

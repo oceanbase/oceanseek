@@ -153,6 +153,7 @@ bool validate_ob_file_scan(const ObJsonNode *ob_file_scan,
         const ObJsonNode *path = find_member(file, OB_EXT_K_OB_FILE_SCAN_PATH);
         const ObJsonNode *byte_size = find_member(file, OB_EXT_K_OB_FILE_SCAN_BYTE_SIZE);
         const ObJsonNode *row_count = find_member(file, OB_EXT_K_ROW_COUNT);
+        const ObJsonNode *cache_version = find_member(file, OB_EXT_K_OB_FILE_SCAN_CACHE_VERSION);
         valid = OB_NOT_NULL(file) && ObJsonNodeType::J_OBJECT == file->json_type()
             && OB_NOT_NULL(path) && ObJsonNodeType::J_STRING == path->json_type()
             && path->get_data_length() > 0 && OB_NOT_NULL(byte_size)
@@ -161,7 +162,11 @@ bool validate_ob_file_scan(const ObJsonNode *ob_file_scan,
             && byte_size->get_int() >= 0 && OB_NOT_NULL(row_count)
             && (ObJsonNodeType::J_INT == row_count->json_type()
                 || ObJsonNodeType::J_UINT == row_count->json_type())
-            && row_count->get_int() >= 0;
+            && row_count->get_int() >= 0
+            && (OB_ISNULL(cache_version)
+                || ((ObJsonNodeType::J_INT == cache_version->json_type()
+                     || ObJsonNodeType::J_UINT == cache_version->json_type())
+                    && cache_version->get_int() > 0));
       }
     }
   }
@@ -221,20 +226,34 @@ int parse_scan_tasks_json(ObIAllocator &alloc, const char *json, int64_t len,
           int32_t i = 0;
           for (uint64_t idx = 0; OB_SUCC(ret) && idx < n; ++idx, ++i) {
             const ObJsonNode *it = array_at(sp, idx);
+            const ObJsonNode *byte_size = find_member(it, OB_EXT_K_BYTE_SIZE);
+            const ObString plugin_split = member_str(it, OB_EXT_K_PLUGIN_SPLIT);
             new (&splits[i]) ObExtScanTask();
             splits[i].row_count = member_int(it, OB_EXT_K_ROW_COUNT, -1);
-            splits[i].byte_size = member_int(it, OB_EXT_K_BYTE_SIZE, -1);
             // STRICT: plugin_split is required — reader_open_task cannot proceed
             // without it (it carries the format-private split bytes).
-            const ObString plugin_split = member_str(it, OB_EXT_K_PLUGIN_SPLIT);
             if (plugin_split.empty()) {
               ret = OB_INVALID_ARGUMENT;
               LOG_WARN("scan task missing required 'plugin_split'", K(ret), K(i));
-            } else if (OB_FAIL(serialize_node(
-                           alloc, it, splits[i].task_json, splits[i].task_json_len))) {
-              LOG_WARN("serialize scan task failed", K(ret), K(i));
+            } else if (OB_ISNULL(byte_size)
+                       || (ObJsonNodeType::J_INT != byte_size->json_type()
+                           && ObJsonNodeType::J_UINT != byte_size->json_type())
+                       || (ObJsonNodeType::J_INT == byte_size->json_type()
+                           && byte_size->get_int() < 0)
+                       || (ObJsonNodeType::J_UINT == byte_size->json_type()
+                           && byte_size->get_uint() > static_cast<uint64_t>(INT64_MAX))) {
+              ret = OB_INVALID_DATA;
+              LOG_WARN("scan task requires a non-negative int64 'byte_size'", K(ret), K(i));
             } else {
-              (void)warn_unknown_task_keys(it);
+              splits[i].byte_size = ObJsonNodeType::J_INT == byte_size->json_type()
+                  ? byte_size->get_int()
+                  : static_cast<int64_t>(byte_size->get_uint());
+              if (OB_FAIL(serialize_node(
+                      alloc, it, splits[i].task_json, splits[i].task_json_len))) {
+                LOG_WARN("serialize scan task failed", K(ret), K(i));
+              } else {
+                (void)warn_unknown_task_keys(it);
+              }
             }
           }
           if (OB_SUCC(ret)) {
@@ -372,6 +391,7 @@ int ObExtFileScanDescriptor::parse(
           new (&descriptor->files_[i]) ObExtFileScanEntry();
           descriptor->files_[i].byte_size_ = member_int(file, OB_EXT_K_OB_FILE_SCAN_BYTE_SIZE, -1);
           descriptor->files_[i].row_count_ = member_int(file, OB_EXT_K_ROW_COUNT, -1);
+          descriptor->files_[i].cache_version_ = member_int(file, OB_EXT_K_OB_FILE_SCAN_CACHE_VERSION, 0);
           if (OB_FAIL(copy_json_string(
                   alloc,
                   find_member(file, OB_EXT_K_OB_FILE_SCAN_PATH),

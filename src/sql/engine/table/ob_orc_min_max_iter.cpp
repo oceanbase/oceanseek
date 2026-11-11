@@ -232,25 +232,36 @@ int ObOrcMinMaxIter::build_iceberg_id_to_type_map(const orc::Type *type)
   return ret;
 }
 
-int ObOrcMinMaxIter::next_file()
+int ObOrcMinMaxIter::next_file(const ObFileScanTask *partition_task)
 {
   int ret = OB_SUCCESS;
   ObEvalCtx &eval_ctx = scan_param_->op_->get_eval_ctx();
   ObString location = scan_param_->external_file_location_;
-  int64_t task_idx = 0;
+  int64_t task_idx = -1;
   int64_t file_size = -1;
   ObFileScanTask *scan_task = nullptr;
 
   do {
     ret = OB_SUCCESS;
-    reader_.reset();
-    name_to_id_.reuse();
-    iceberg_id_to_type_.reuse();
-    if (data_access_driver_.is_opened()) {
-      data_access_driver_.close();
+    // Recheck after every skipped file, before advancing the shared cursor or
+    // replacing the partition values needed to output the current aggregate.
+    if (OB_NOT_NULL(partition_task)) {
+      if (OB_FAIL(peek_next_task_idx_for_reader(state_.task_idx_, task_idx))) {
+      } else if (partition_task->part_id_ != scan_param_->scan_tasks_.at(task_idx)->part_id_) {
+        ret = OB_ITER_END;
+      }
     }
-    if ((task_idx = state_.file_idx_++) >= scan_param_->scan_tasks_.count()) {
-      ret = OB_ITER_END;
+    if (OB_SUCC(ret)) {
+      reader_.reset();
+      name_to_id_.reuse();
+      iceberg_id_to_type_.reuse();
+      if (data_access_driver_.is_opened()) {
+        data_access_driver_.close();
+      }
+      ret = go_next_task_idx(state_, task_idx);
+    }
+    if (OB_FAIL(ret)) {
+      // EOF ends this reader's currently permitted tasks; other errors propagate.
     } else {
       file_size = -1;
       int64_t modify_time = 0;
@@ -464,38 +475,16 @@ int ObOrcMinMaxIter::collect_partition_aggregate()
   }
   bool first_file = true;
   const ObFileScanTask *current_task = nullptr;
-  int64_t cur_part_id = 0;
-  int64_t file_cnt = 0;
   while (OB_SUCC(ret)) {
-    if (!first_file) {
-      int64_t next_idx = state_.file_idx_;
-      if (next_idx >= scan_param_->scan_tasks_.count()) {
-        break;
-      }
-      ObFileScanTask *next_task
-          = static_cast<ObFileScanTask *>(scan_param_->scan_tasks_.at(next_idx));
-      if (OB_ISNULL(current_task) || OB_ISNULL(next_task)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("get null scan task", K(ret), K(next_idx), KP(current_task), KP(next_task));
-      } else if (current_task->part_id_ != next_task->part_id_) {
-        LOG_TRACE("partition boundary hit, stop collecting",
-                  K(cur_part_id),
-                  K(next_task->part_id_),
-                  K(file_cnt),
-                  K(next_idx));
-        break;
-      }
-    }
-    if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(next_file())) {
-      if (OB_ITER_END != ret) {
+    if (OB_FAIL(next_file(current_task))) {
+      if (!is_task_boundary(ret)) {
         LOG_WARN("failed to open next file", K(ret));
       }
     } else {
       if (first_file) {
-        // next_file() 对每个尝试的任务都会推进 file_idx_，并可能跳过空文件或不存在的文件；
-        // 成功返回后，file_idx_ - 1 才是本次实际打开的任务。
-        const int64_t current_idx = state_.file_idx_ - 1;
+        // next_file() 对每个尝试的任务都会推进 task_idx_，并可能跳过空文件或不存在的文件；
+        // 成功返回后，task_idx_ - 1 才是本次实际打开的任务。
+        const int64_t current_idx = state_.task_idx_ - 1;
         if (OB_UNLIKELY(current_idx < 0 || current_idx >= scan_param_->scan_tasks_.count())) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("get unexpected current file index", K(ret), K(current_idx));
@@ -504,19 +493,18 @@ int ObOrcMinMaxIter::collect_partition_aggregate()
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("get null current scan task", K(ret), K(current_idx));
         } else {
-          cur_part_id = state_.part_id_;
           first_file = false;
         }
-      }
-      if (OB_SUCC(ret)) {
-        ++file_cnt;
       }
       if (OB_SUCC(ret) && OB_FAIL(collect_file_meta_statistics())) {
         LOG_WARN("failed to collect file meta statistics", K(ret), K(state_.cur_file_url_));
       }
     }
   }
-  if (OB_ITER_END == ret) {
+  // Deliver the collected partition without consuming the next partition's or
+  // reader's task. The next fetch resumes at the unchanged shared cursor.
+  // Without a collected file there is no partition result to deliver.
+  if (!first_file && is_task_boundary(ret)) {
     ret = OB_SUCCESS;
   }
   return ret;
@@ -535,16 +523,19 @@ int ObOrcMinMaxIter::collect_aggregate_from_files()
   for (int64_t i = 0; OB_SUCC(ret) && i < agg_exprs->count(); ++i) {
     agg_res_datums_.at(i).set_null();
   }
+  bool collected = false;
   while (OB_SUCC(ret)) {
     if (OB_FAIL(next_file())) {
-      if (OB_ITER_END != ret) {
+      if (!is_task_boundary(ret)) {
         LOG_WARN("failed to open next file", K(ret));
       }
     } else if (OB_FAIL(collect_file_meta_statistics())) {
       LOG_WARN("failed to collect file meta statistics", K(ret), K(state_.cur_file_url_));
+    } else {
+      collected = true;
     }
   }
-  if (OB_ITER_END == ret) {
+  if (OB_ITER_END == ret || (OB_NOT_THE_OBJECT == ret && collected)) {
     ret = OB_SUCCESS;
   }
   return ret;
@@ -610,8 +601,8 @@ int ObOrcMinMaxIter::collect_file_meta_statistics()
           } else {
             int64_t orc_col_id = -1;
             const ObObj *partition_value = nullptr;
-            if (OB_FAIL(get_iceberg_identity_partition_value(file_col_expr->extra_,
-                                                             state_,
+            if (use_iceberg_manifest_partition_value() && OB_FAIL(ObIcebergScanTask::get_identity_partition_value(file_col_expr->extra_,
+                                                             state_.part_list_val_,
                                                              partition_value))) {
               LOG_WARN("failed to get iceberg identity partition value", K(ret), K(agg_idx));
             } else if (OB_NOT_NULL(partition_value)) {
@@ -951,25 +942,36 @@ int ObOrcMinMaxIter::get_next_rows(int64_t &count, int64_t capacity)
 {
   int ret = OB_SUCCESS;
   int64_t read_count = 0;
-  UNUSED(capacity);
   ObMallocHookAttrGuard guard(mem_attr_);
-  if (state_.file_idx_ >= scan_param_->scan_tasks_.count()) {
-    ret = OB_ITER_END;
-  } else if (need_partition_info_) {
-    if (OB_FAIL(collect_partition_aggregate())) {
-      LOG_WARN("failed to collect partition aggregate", K(ret));
+  count = 0;
+  int64_t next_idx = -1;
+  if (capacity <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(peek_next_task_idx_for_reader(state_.task_idx_, next_idx))) {
+    if (!is_task_boundary(ret)) {
+      LOG_WARN("find aggregate task failed", K(ret));
+    }
+  } else {
+    scan_param_->op_->clear_evaluated_flag();
+    if (need_partition_info_) {
+      if (OB_FAIL(collect_partition_aggregate())) {
+        if (!is_task_boundary(ret)) {
+          LOG_WARN("failed to collect partition aggregate", K(ret));
+        }
+      } else if (OB_FAIL(output_aggregate_result(read_count))) {
+        LOG_WARN("failed to output aggregate result", K(ret));
+      } else {
+        count = read_count;
+      }
+    } else if (OB_FAIL(collect_aggregate_from_files())) {
+      if (!is_task_boundary(ret)) {
+        LOG_WARN("failed to collect aggregate from files", K(ret));
+      }
     } else if (OB_FAIL(output_aggregate_result(read_count))) {
       LOG_WARN("failed to output aggregate result", K(ret));
     } else {
       count = read_count;
     }
-  } else if (OB_FAIL(collect_aggregate_from_files())) {
-    LOG_WARN("failed to collect aggregate from files", K(ret));
-  } else if (OB_FAIL(output_aggregate_result(read_count))) {
-    LOG_WARN("failed to output aggregate result", K(ret));
-  } else {
-    state_.file_idx_ = scan_param_->scan_tasks_.count();
-    count = read_count;
   }
   return ret;
 }

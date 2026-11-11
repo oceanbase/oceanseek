@@ -313,8 +313,8 @@ int ObCSVTableRowIterator::open_next_file()
     int64_t start_line = 0;
     int64_t end_line = 0;
     int64_t task_idx = 0;
-    task_idx = state_.file_idx_++;
-    if (state_.file_idx_ == 1) {
+    task_idx = state_.task_idx_++;
+    if (state_.task_idx_ == 1) {
       // Skip to handle first file
     } else {
       LOG_TRACE("print lastest csv file state infos", K(ret), K(state_));

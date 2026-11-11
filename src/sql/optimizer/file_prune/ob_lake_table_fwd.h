@@ -11,9 +11,18 @@
 #include "share/catalog/ob_catalog_properties.h"
 #include "sql/resolver/ob_sql_array.h"
 #include "sql/table_format/iceberg/ob_iceberg_type_fwd.h"
+#include "sql/engine/cmd/ob_load_data_parser.h"
 
 namespace oceanbase
 {
+namespace common
+{
+class ObNewRow;
+}
+namespace share
+{
+class ObExternalTablePartInfoArray;
+}
 namespace sql
 {
 namespace iceberg
@@ -86,14 +95,6 @@ enum class LakeFileType
   // the download session, first_lineno_/last_lineno_ carry the row range and
   // first_split_idx_/last_split_idx_ the split range (left-closed right-open).
   ODPS = 4
-};
-
-enum class ObPluginReaderType : int8_t
-{
-  INVALID = 0,
-  PLUGIN = 1,
-  OB_PARQUET = 2,
-  OB_ORC = 3
 };
 
 /// Map the schema-level lake table format to the scan-task file type.
@@ -205,22 +206,29 @@ public:
     plugin_task_json_(),
     file_url_(),
     file_size_(0),
+    cache_version_(0),
     part_id_(OB_INVALID_PARTITION_ID),
     record_count_(0),
-    reader_type_(ObPluginReaderType::INVALID),
+    reader_type_(ObExternalFileFormat::INVALID_FORMAT),
     allocator_(allocator)
   {}
   virtual int assign(const ObIOptLakeTableFile &other) override;
   virtual void reset() override;
-  VIRTUAL_TO_STRING_KV(K_(type), K_(plugin_task_json), K_(file_url), K_(file_size),
-                       K_(part_id), K_(record_count), K_(reader_type));
+  VIRTUAL_TO_STRING_KV(K_(type), K_(plugin_task_json), K_(file_url),
+                       K_(file_size), K_(cache_version), K_(part_id), K_(record_count),
+                       K_(reader_type), K_(assigned_file_bytes));
 
-  ObString plugin_task_json_;          // Empty for OB file tasks
-  ObString file_url_;                  // Empty for plugin-reader tasks
+  ObString plugin_task_json_; // Empty for OB file tasks
+  ObString file_url_;         // Empty for plugin-reader tasks
   int64_t file_size_;
+  int64_t cache_version_;              // OB file-content token; 0 retains storage stat
   int64_t part_id_;
-  int64_t record_count_;               // Plugin estimate (0 unknown); OB file exact row count
-  ObPluginReaderType reader_type_;
+  int64_t record_count_; // Plugin estimate (0 unknown); OB file exact row count
+  ObExternalFileFormat::FormatType reader_type_;
+  // Planned data-file bytes, validated non-negative; -1 is unset. Not a
+  // scheduling weight.
+  int64_t assigned_file_bytes_ = -1;
+
   common::ObIAllocator &allocator_;
 };
 
@@ -301,6 +309,7 @@ public:
 
   VIRTUAL_TO_STRING_KV(K_(file_url), K_(part_id), K_(first_lineno), K_(last_lineno));
   virtual bool is_direct_load_stream_scan_task() const { return false; }
+  virtual LakeFileType get_file_type() const { return LakeFileType::INVALID; }
 
 public:
   ObString file_url_; // 在 ObFileScanTask 中序列化
@@ -327,7 +336,7 @@ public:
     record_count_(0)
   {}
   virtual ~ObFileScanTask() {}
-  virtual LakeFileType get_file_type() const { return type_; }
+  LakeFileType get_file_type() const override { return type_; }
   virtual int init_with_opt_lake_table_file(ObIAllocator &allocator, 
                                            const ObIOptLakeTableFile &opt_table_file) = 0;
   /// Adapts the granule's (file_id, part_id) identity onto the task read
@@ -369,6 +378,11 @@ public:
   virtual int init_with_opt_lake_table_file(ObIAllocator &allocator, 
                                            const ObIOptLakeTableFile &opt_table_file) override;
   virtual void assign_granule_identity(const int64_t file_id, const uint64_t part_id) override;
+  int get_partition_row(const share::ObExternalTablePartInfoArray *partition_infos,
+                        const common::ObNewRow *&partition_row) const;
+  static int get_identity_partition_value(const int64_t source_field_id,
+                                          const common::ObNewRow &partition_row,
+                                          const common::ObObj *&partition_value);
 
   VIRTUAL_TO_STRING_KV(K_(file_url),
                        K_(type),
@@ -430,7 +444,7 @@ public:
   explicit ObPluginScanTask()
   : ObFileScanTask(LakeFileType::EXT_PLUGIN),
     plugin_task_json_(),
-    reader_type_(ObPluginReaderType::INVALID)
+    reader_type_(ObExternalFileFormat::INVALID_FORMAT)
   {}
   virtual ~ObPluginScanTask() {}
   virtual int init_with_opt_lake_table_file(ObIAllocator &allocator,
@@ -443,11 +457,13 @@ public:
 
   VIRTUAL_TO_STRING_KV(K_(file_url), K_(type), K_(file_size), K_(modification_time),
                       K_(file_id), K_(part_id), K_(content_digest), K_(record_count),
-                      K_(plugin_task_json), K_(reader_type));
+                      K_(plugin_task_json), K_(reader_type), K_(assigned_file_bytes));
 
   ObString plugin_task_json_;  // Empty for OB file tasks
-  ObPluginReaderType reader_type_;
+  ObExternalFileFormat::FormatType reader_type_;
+  // Planned data-file bytes, validated non-negative; -1 is unset. Not a scheduling weight.
   int64_t assigned_file_bytes_ = -1;
+
 private:
   DISALLOW_COPY_AND_ASSIGN(ObPluginScanTask);
   int assign(const ObPluginScanTask &other);

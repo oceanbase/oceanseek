@@ -84,27 +84,51 @@ static const char *const OB_EXT_K_PARTITION_VALUES = "partition_values";
 // scan task: reserved generic fields (OB reads row_count/byte_size today; the
 // rest OB learns to exploit incrementally). All are known keys — the strict
 // unknown-key WARN must not fire on them.
-// Scan task uses []; OB file scan uses [{"path","byte_size","row_count"}].
+// Scan task uses []; OB file scan uses [{"path","byte_size","row_count",...}].
 static const char *const OB_EXT_K_FILES       = "files";
 static const char *const OB_EXT_K_MIN_MAX     = "min_max";   // scan task: {"<col_idx>":["lo","hi"]}
 static const char *const OB_EXT_K_SPLITTABLE  = "splittable";// scan task
-// Plan-atomic OB file-reader command carried by a scan task. Absence selects
-// the plugin reader; a valid descriptor selects OB Parquet/ORC execution.
+// OB file-reader command qualified atomically per original split. Absence selects
+// the plugin reader; a valid v1 descriptor selects OB Parquet/ORC execution.
+// All files in one descriptor use one physical format and contain no delete rows.
+// PK tables additionally require Parquet and known zero delete counts; their
+// internal PK columns are not projected. OB maps requested business columns by
+// name, case-insensitively.
 static const char *const OB_EXT_K_OB_FILE_SCAN           = "ob_file_scan";
 static const char *const OB_EXT_K_OB_FILE_SCAN_VERSION   = "version";
 static const char *const OB_EXT_K_OB_FILE_SCAN_FORMAT    = "file_format";
 static const char *const OB_EXT_K_OB_FILE_SCAN_PATH      = "path";
 static const char *const OB_EXT_K_OB_FILE_SCAN_BYTE_SIZE = "byte_size";
+// Optional positive int64 file-content version. Absence retains storage stat.
+static const char *const OB_EXT_K_OB_FILE_SCAN_CACHE_VERSION = "cache_version";
 // read_projection (OB->plugin): {"field_ids":[..]} (null/absent -> read all).
 static const char *const OB_EXT_K_FIELD_IDS   = "field_ids";
 
 // Predicate-tree JSON (OB->plugin), shared by predicate_json and
 // partition_filter_json. See the protocol comment in ob_external_table_plugin.h
 // for the grammar.
-static const char *const OB_EXT_K_KIND    = "kind";     // lit/col/cmp/in/not_in/is_null/is_not_null/and/or/not
+static const char *const OB_EXT_K_KIND    = "kind";     // lit/col/cmp/in/not_in/is_null/is_not_null/and/or/not/expr
 static const char *const OB_EXT_K_OP      = "op";       // cmp: eq/ne/lt/le/gt/ge
+static const char *const OB_EXT_K_OP_ID   = "op_id";    // expr: OB operator id, advisory
+static const char *const OB_EXT_K_RESULT_TYPE_ID = "result_type_id"; // planning expr/col/lit: OB result type id; optional at reader time
+static const char *const OB_EXT_K_COMPARE_COLLATION = "compare_collation"; // expr: binary string comparison
 static const char *const OB_EXT_K_COL_IDX = "col_idx"; // col node: column field_id (informational)
+static const char *const OB_EXT_K_COLLATION = "collation"; // col node: effective comparison collation for string predicates
 static const char *const OB_EXT_K_VALUE   = "value";    // lit node: value as string
+// Optional partition_filter_json root from ObPreRangeGraph:
+// {"kind":"range_set","columns":[{"name":"p","ext_type":"DATE",
+//   "ranges":[{"lower":"1994-01-01","lower_inclusive":true,
+//              "upper":"1995-01-01","upper_inclusive":false}]}]}
+// Ranges within a column are ORed; columns are ANDed. Missing endpoint means
+// unbounded, and its inclusive flag must also be absent. A plugin must apply
+// every range exactly before reporting partition_filter_applied; otherwise it
+// must reject this kind and let OB keep its residual predicate.
+static const char *const OB_EXT_KIND_RANGE_SET = "range_set";
+static const char *const OB_EXT_K_RANGES = "ranges";
+static const char *const OB_EXT_K_LOWER = "lower";
+static const char *const OB_EXT_K_UPPER = "upper";
+static const char *const OB_EXT_K_LOWER_INCLUSIVE = "lower_inclusive";
+static const char *const OB_EXT_K_UPPER_INCLUSIVE = "upper_inclusive";
 
 // Recognize-context JSON (OB->plugin, catalog format detection). Passed to the
 // optional recognize_table slot so each format owns its own detection rules.

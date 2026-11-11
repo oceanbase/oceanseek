@@ -12,12 +12,28 @@
 #include "sql/engine/table/ob_external_data_page_cache.h"
 #include "sql/engine/table/ob_external_file_access.h"
 
+#include <parquet/properties.h>
+
 namespace oceanbase
 {
 namespace sql
 {
 
-ObParquetPageMgr::ObParquetPageMgr() : data_page_cache_(ObExternalDataPageCache::get_instance())
+parquet::PageReadMode ObParquetPageMgr::PageReadModeCallback::operator()() const
+{
+  parquet::PageReadMode mode = parquet::PageReadMode::DISABLED;
+  if (page_mgr_->is_with_offset_index_enabled_()) {
+    mode = parquet::PageReadMode::WITH_OFFSET_INDEX;
+  } else if (page_mgr_->is_without_offset_index_cache_enabled_()) {
+    mode = parquet::PageReadMode::WITHOUT_OFFSET_INDEX;
+  }
+  return mode;
+}
+
+ObParquetPageMgr::ObParquetPageMgr()
+    : file_path_(), file_content_digest_(), file_size_(-1), file_modify_time_(-1),
+      data_page_cache_(ObExternalDataPageCache::get_instance()), metrics_(),
+      row_group_read_mode_(RowGroupReadMode::DISABLED), without_offset_index_windows_()
 {
   pages_.set_allocator(&allocator_);
   page_buffers_.set_allocator(&allocator_);
@@ -40,6 +56,8 @@ int ObParquetPageMgr::init(int64_t hole_size_limit,
   // range_size_limit_ = range_size_limit;
   range_size_limit_ = 2 * 1024 * 1024; // 目前测试下来 2MB 效果最好
   prefetch_size_ = 8 * range_size_limit_;
+  without_offset_index_window_size_ = 8 * 1024 * 1024;
+  without_offset_index_prefetch_size_ = 16 * 1024 * 1024;
   enable_disk_cache_ = enable_disk_cache;
   timeout_ts_ = timeout_ts;
   return ret;
@@ -58,7 +76,15 @@ int ObParquetPageMgr::open(const ObExternalFileUrlInfo &file_url_info)
     file_content_digest_ = file_url_info.get_content_digest();
     file_size_ = file_url_info.get_file_size();
     file_modify_time_ = file_url_info.get_modify_time();
-    OZ(file_reader_.open(file_url_info, file_cache_options));
+    if (OB_FAIL(file_reader_.open(file_url_info, file_cache_options))) {
+      LOG_WARN("failed to open parquet file reader", K(ret));
+    } else if (OB_FAIL(
+                   without_offset_index_windows_.create(16,
+                                                        ObMemAttr(MTL_ID(), "ParquetWindows")))) {
+      LOG_WARN("failed to create parquet window map", K(ret));
+    } else {
+      is_opened_ = true;
+    }
   }
 
   return ret;
@@ -68,15 +94,17 @@ int ObParquetPageMgr::open(const ObExternalFileUrlInfo &file_url_info)
 int ObParquetPageMgr::reset()
 {
   int ret = OB_SUCCESS;
+  is_opened_ = false;
+  row_group_read_mode_ = RowGroupReadMode::DISABLED;
+  without_offset_index_windows_.destroy();
+  file_path_.reset();
+  file_content_digest_.reset();
+  file_size_ = -1;
+  file_modify_time_ = -1;
   if (OB_FAIL(clear_all_pages())) {
     LOG_WARN("failed to clear all pages", K(ret));
   } else if (OB_FAIL(file_reader_.reset())) {
     LOG_WARN("failed to reset file reader", K(ret));
-  } else {
-    file_path_.reset();
-    file_content_digest_.reset();
-    file_size_ = -1;
-    file_modify_time_ = -1;
   }
   return ret;
 }
@@ -98,7 +126,7 @@ int ObParquetPageMgr::clear_all_pages()
   return ret;
 }
 
-int ObParquetPageMgr::init_with_new_row_group(
+int ObParquetPageMgr::init_pages_with_offset_index(
     const ObIArray<std::pair<int64_t, int64_t>> &selected_pages)
 {
   int ret = OB_SUCCESS;
@@ -159,9 +187,9 @@ int ObParquetPageMgr::init_with_new_row_group(
   return ret;
 }
 
-int ObParquetPageMgr::cache_page_by_offset(int64_t page_offset,
-                                           bool is_decompressed,
-                                           const std::shared_ptr<arrow::Buffer> &page_buffer)
+int ObParquetPageMgr::cache_page_with_offset_index_(int64_t page_offset,
+                                                    bool is_decompressed,
+                                                    const std::shared_ptr<arrow::Buffer> &page_buffer)
 {
   int ret = OB_SUCCESS;
   int64_t page_idx = -1;
@@ -179,15 +207,12 @@ int ObParquetPageMgr::cache_page_by_idx(int64_t page_idx,
 {
   int ret = OB_SUCCESS;
   const ObParquetPage &page = pages_.at(page_idx);
-  const ObExternalDataPageCacheKey &cache_key = create_page_cache_key_(page.offset_);
-  const ObExternalDataPageCacheValue cache_value(const_cast<char *>(page_buffer->data_as<char>()),
-                                                 page_buffer->size(),
-                                                 is_decompressed);
-  data_page_cache_.try_put_page_to_cache(cache_key, cache_value);
+  put_page_to_cache_(
+      page.offset_, page_buffer->data_as<char>(), page_buffer->size(), is_decompressed);
   return ret;
 }
 
-int ObParquetPageMgr::release_page_by_offset(int64_t page_offset)
+int ObParquetPageMgr::release_page_with_offset_index_(int64_t page_offset)
 {
   int ret = OB_SUCCESS;
   int64_t page_idx = -1;
@@ -202,6 +227,8 @@ int ObParquetPageMgr::release_page_by_offset(int64_t page_offset)
 int ObParquetPageMgr::release_page_by_idx(int64_t page_idx)
 {
   int ret = OB_SUCCESS;
+  // The unified Parquet iterator owns one PageReader per physical column. Once that reader
+  // advances, no eager/project peer can consume the previous page again.
   if (OB_UNLIKELY(page_idx < 0 || page_idx >= pages_.count())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid page idx", K(page_idx));
@@ -228,13 +255,8 @@ int ObParquetPageMgr::release_page_by_idx(int64_t page_idx)
           LOG_WARN("failed to wait", K(page_idx));
         }
         // 即使 wait failed 了，也需要继续释放内存。
-        ObCoalescedBuffer *coalesced_buffer = buffer_slice->coalesced_buffer_;
         buffer_slice->~ObParquetPageBufferSlice();
-        allocator_.free(buffer_slice); // 目前此处 allocator 不会真的放内存
-        if (coalesced_buffer->ref_counts_ <= 0) {
-          // 当 CoalescedBuffer 上面的引用计数清零，释放其内存
-          OB_DELETEx(ObCoalescedBuffer, &allocator_, coalesced_buffer);
-        }
+        allocator_.free(buffer_slice);
       } else if ((cached_buffer = dynamic_cast<ObParquetCachedPageBuffer *>(page_buffer))
                  != nullptr) {
         cached_buffer->~ObParquetCachedPageBuffer();
@@ -253,10 +275,10 @@ int ObParquetPageMgr::release_page_by_idx(int64_t page_idx)
   return ret;
 }
 
-int ObParquetPageMgr::read_page(int64_t page_offset,
-                                std::shared_ptr<arrow::Buffer> &page_buffer,
-                                bool &has_mem_cached,
-                                bool &has_decompressed)
+int ObParquetPageMgr::read_page_with_offset_index_(int64_t page_offset,
+                                                   std::shared_ptr<arrow::Buffer> &page_buffer,
+                                                   bool &has_mem_cached,
+                                                   bool &has_decompressed)
 {
   int ret = OB_SUCCESS;
   int64_t page_idx = -1;
@@ -299,9 +321,10 @@ int ObParquetPageMgr::read_page(int64_t page_offset,
 
 // 检查当前 page_offset 是否已经被 selected 了，如果当前 page_offset 经过 page-index 已经被过滤了，
 // 直接返回下一个被 selected 的 page start offset
-int ObParquetPageMgr::check_page_selected(int64_t page_offset,
-                                          bool &is_selected,
-                                          std::optional<int64_t> &next_page_offset) const
+int ObParquetPageMgr::check_page_selected_with_offset_index(
+    int64_t page_offset,
+    bool &is_selected,
+    std::optional<int64_t> &next_page_offset) const
 {
   int ret = OB_SUCCESS;
   const ObFixedArray<ObParquetPage, ObIAllocator>::const_iterator iter
@@ -366,7 +389,7 @@ int ObParquetPageMgr::find_page_idx_(int64_t offset, int64_t &page_idx) const
   return ret;
 }
 
-int ObParquetPageMgr::try_to_prefetch_by_offset(int64_t page_offset)
+int ObParquetPageMgr::prefetch_page_with_offset_index(int64_t page_offset)
 {
   int ret = OB_SUCCESS;
   int64_t page_idx = -1;
@@ -496,10 +519,9 @@ int ObParquetPageMgr::try_pin_page_from_mem_cache_(int64_t page_idx)
 {
   int ret = OB_SUCCESS;
   const ObParquetPage &page = pages_.at(page_idx);
-  const ObExternalDataPageCacheKey &cache_key = create_page_cache_key_(page.offset_);
 
   ObExternalDataPageCacheValueHandle value_handle;
-  if (OB_FAIL(data_page_cache_.get_page(cache_key, value_handle))) {
+  if (OB_FAIL(get_page_from_cache_(page.offset_, value_handle))) {
     if (ret == OB_ENTRY_NOT_EXIST) {
       metrics_.cached_page_miss_count_++;
       metrics_.cached_page_miss_size_ += page.length_;
@@ -510,12 +532,16 @@ int ObParquetPageMgr::try_pin_page_from_mem_cache_(int64_t page_idx)
     // cache hit
     metrics_.cached_page_hit_count_++;
     metrics_.cached_page_hit_size_ += page.length_;
+    std::shared_ptr<arrow::Buffer> buffer;
     ObParquetCachedPageBuffer *cached_page_buffer = NULL;
-    if (OB_ISNULL(cached_page_buffer = OB_NEWx(ObParquetCachedPageBuffer, &allocator_))) {
+    if (OB_FAIL(ObParquetCacheBackedArrowBuffer::create(value_handle, buffer))) {
+      LOG_WARN("failed to create cached parquet buffer", K(ret));
+    } else if (OB_ISNULL(cached_page_buffer = OB_NEWx(ObParquetCachedPageBuffer,
+                                                      &allocator_,
+                                                      std::move(buffer),
+                                                      value_handle.value_->is_decompressed()))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("failed to allocate memory");
-    } else if (OB_FAIL(cached_page_buffer->cache_handle_.assign(value_handle))) {
-      LOG_WARN("failed to assign cache handle");
     } else {
       page_buffers_[page_idx] = cached_page_buffer;
       pages_[page_idx].status_ = ObParquetPageStatus::LOADED;
@@ -527,28 +553,11 @@ int ObParquetPageMgr::try_pin_page_from_mem_cache_(int64_t page_idx)
 int ObParquetPageMgr::load_pages_from_storage_(const CoalescedReadRange &coalesced_read_range)
 {
   int ret = OB_SUCCESS;
-  ObCoalescedBuffer *coalesced_buffer = OB_NEWx(ObCoalescedBuffer,
-                                                &allocator_,
-                                                file_size_,
-                                                coalesced_read_range.offset_,
-                                                coalesced_read_range.length_);
-  if (OB_ISNULL(coalesced_buffer)) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("failed to allocate memory");
-  } else if (OB_FAIL(coalesced_buffer->alloc_buffer())) {
-    LOG_WARN("failed to allocate memory for coalesced buffer");
-  } else {
-    const int64_t io_timeout_ms = MAX(0, (timeout_ts_ - ObTimeUtility::current_time()) / 1000);
-    ObExternalReadInfo read_info(coalesced_buffer->offset_,
-                                 coalesced_buffer->buf_,
-                                 coalesced_buffer->length_,
-                                 io_timeout_ms);
-    if (OB_FAIL(file_reader_.async_read(read_info, coalesced_buffer->io_handle_))) {
-      LOG_WARN("fail to async read file");
-    } else {
-      metrics_.async_io_count_++;
-      metrics_.async_io_size_ += coalesced_buffer->length_;
-    }
+  std::shared_ptr<ObCoalescedBuffer> coalesced_buffer;
+  if (OB_FAIL(submit_read_(coalesced_read_range.offset_,
+                           coalesced_read_range.length_,
+                           coalesced_buffer))) {
+    LOG_WARN("failed to submit coalesced read", K(ret));
   }
 
   if (OB_SUCC(ret)) {
@@ -572,22 +581,7 @@ int ObParquetPageMgr::load_pages_from_storage_(const CoalescedReadRange &coalesc
       } else {
         pages_[page_idx].status_ = ObParquetPageStatus::LOADED;
         page_buffers_[page_idx] = page_slice;
-        coalesced_buffer->ref_counts_++;
       }
-    }
-  }
-
-  if (OB_FAIL(ret)) {
-    if (OB_NOT_NULL(coalesced_buffer)) {
-      // 需要 wait() 才能释放，因为底下会拆 IO，可能部分 IO 成功，部分 IO 失败。
-      // 这时候你需要 wait 成功的 IO 完成，才能释放 buffer
-      int tmp_ret = OB_SUCCESS;
-      if (OB_TMP_FAIL(coalesced_buffer->wait(metrics_))) {
-        LOG_WARN("failed to io wait");
-      }
-      OB_DELETEx(ObCoalescedBuffer,
-                 &allocator_,
-                 coalesced_buffer); // 显示调用其析构函数，释放 buffer 内存
     }
   }
 
@@ -660,18 +654,334 @@ int ObParquetPageMgr::coalesce_pages_(const ObIArray<int64_t> &unloaded_page_ind
   return ret;
 }
 
-ObExternalDataPageCacheKey ObParquetPageMgr::create_page_cache_key_(int64_t page_offset) const
+void ObParquetPageMgr::register_reader_callbacks(parquet::ReaderProperties &read_properties)
 {
-  return ObExternalDataPageCacheKey(
-      file_path_.ptr(),
-      file_path_.length(),
-      file_content_digest_.ptr(),
-      file_content_digest_.size(),
-      file_modify_time_,
-      // page_size 这里传和 page_offset 一样的值，用于通过 cache 校验，此参数这里没用
-      page_offset,
-      page_offset,
-      MTL_ID());
+  const PageReadModeCallback page_read_mode_callback(this);
+  read_properties.set_page_read_mode_func(page_read_mode_callback);
+
+  const WithOffsetIndexCallbacks with_offset_index_callbacks(this);
+  read_properties.set_with_offset_index_read_page_func(with_offset_index_callbacks);
+  read_properties.set_with_offset_index_release_page_func(with_offset_index_callbacks);
+  read_properties.set_with_offset_index_cache_page_func(with_offset_index_callbacks);
+  read_properties.set_with_offset_index_check_page_selected_func(with_offset_index_callbacks);
+
+  const WithoutOffsetIndexCallbacks without_offset_index_callbacks(this);
+  read_properties.set_without_offset_index_read_range_func(without_offset_index_callbacks);
+  read_properties.set_without_offset_index_cache_lookup_func(without_offset_index_callbacks);
+  read_properties.set_without_offset_index_cache_insert_func(without_offset_index_callbacks);
+  read_properties.set_without_offset_index_cache_hit_func(without_offset_index_callbacks);
+}
+
+void ObParquetPageMgr::configure_row_group_read_mode(const bool has_complete_offset_index)
+{
+  if (without_offset_index_windows_.created()) {
+    without_offset_index_windows_.clear();
+  }
+  if (!is_opened_) {
+    row_group_read_mode_ = RowGroupReadMode::DISABLED;
+  } else if (has_complete_offset_index) {
+    row_group_read_mode_ = RowGroupReadMode::WITH_OFFSET_INDEX;
+  } else {
+    row_group_read_mode_ = RowGroupReadMode::WITHOUT_OFFSET_INDEX;
+  }
+}
+
+bool ObParquetPageMgr::is_direct_read_enabled() const
+{
+  return RowGroupReadMode::DISABLED != row_group_read_mode_;
+}
+
+bool ObParquetPageMgr::is_with_offset_index_enabled_() const
+{
+  return RowGroupReadMode::WITH_OFFSET_INDEX == row_group_read_mode_;
+}
+
+bool ObParquetPageMgr::is_without_offset_index_cache_enabled_() const
+{
+  return RowGroupReadMode::WITHOUT_OFFSET_INDEX == row_group_read_mode_;
+}
+
+int ObParquetPageMgr::get_page_from_cache_(const int64_t page_offset,
+                                           ObExternalDataPageCacheValueHandle &value_handle)
+{
+  return data_page_cache_.get_page(create_page_cache_key_(page_offset), value_handle);
+}
+
+void ObParquetPageMgr::put_page_to_cache_(const int64_t page_offset,
+                                          const char *buffer,
+                                          const int64_t buffer_size,
+                                          const bool is_decompressed)
+{
+  const ObExternalDataPageCacheValue cache_value(const_cast<char *>(buffer),
+                                                 buffer_size,
+                                                 is_decompressed);
+  data_page_cache_.try_put_page_to_cache(create_page_cache_key_(page_offset), cache_value);
+}
+
+ObExternalDataPageCacheKey ObParquetPageMgr::create_page_cache_key_(const int64_t page_offset) const
+{
+  return ObExternalDataPageCacheKey(file_path_.ptr(),
+                                    file_path_.length(),
+                                    file_content_digest_.ptr(),
+                                    file_content_digest_.length(),
+                                    file_modify_time_,
+                                    // Key marker for Parquet pages; raw blocks use at least 4 KiB.
+                                    1,
+                                    page_offset,
+                                    MTL_ID());
+}
+
+int ObParquetPageMgr::submit_read_(const int64_t offset,
+                                   const int64_t length,
+                                   std::shared_ptr<ObCoalescedBuffer> &buffer)
+{
+  int ret = OB_SUCCESS;
+  buffer.reset();
+  if (OB_UNLIKELY(offset < 0 || length <= 0 || offset >= file_size_
+                  || length > file_size_ - offset)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid parquet read range", K(ret), K(offset), K(length), K_(file_size));
+  } else {
+    try {
+      std::shared_ptr<ObCoalescedBuffer> pending
+          = std::make_shared<ObCoalescedBuffer>(file_size_, offset, length);
+      if (OB_FAIL(pending->alloc_buffer())) {
+        LOG_WARN("failed to allocate read buffer", K(ret));
+      } else {
+        const int64_t io_timeout_ms = MAX(0, (timeout_ts_ - ObTimeUtility::current_time()) / 1000);
+        ObExternalReadInfo read_info(offset, pending->buf_, length, io_timeout_ms);
+        if (OB_FAIL(file_reader_.async_read(read_info, pending->io_handle_))) {
+          LOG_WARN("failed to submit parquet read", K(ret), K(offset), K(length));
+        } else {
+          ++metrics_.async_io_count_;
+          metrics_.async_io_size_ += length;
+          buffer = std::move(pending);
+        }
+      }
+    } catch (const std::bad_alloc &) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate parquet read state", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObParquetPageMgr::create_without_offset_index_windows_(const int64_t column_end_offset,
+                                                           WithoutOffsetIndexWindows *&windows)
+{
+  int ret = OB_SUCCESS;
+  windows = nullptr;
+  const WithoutOffsetIndexWindows empty_windows;
+  if (OB_FAIL(without_offset_index_windows_.set_refactored(column_end_offset, empty_windows))) {
+    LOG_WARN("failed to insert parquet column windows", K(ret), K(column_end_offset));
+  } else if (OB_ISNULL(windows = without_offset_index_windows_.get(column_end_offset))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("parquet column windows not found", K(ret), K(column_end_offset));
+  } else {
+    windows->set_attr(ObMemAttr(MTL_ID(), "ParquetWindows"));
+  }
+  return ret;
+}
+
+int ObParquetPageMgr::prefetch_column_without_offset_index(const int64_t offset,
+                                                           const int64_t column_end_offset)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(offset < 0 || offset >= column_end_offset || column_end_offset > file_size_)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    WithoutOffsetIndexWindows *windows = without_offset_index_windows_.get(column_end_offset);
+    if (OB_NOT_NULL(windows) && !windows->empty()) {
+      // Two logical columns can refer to the same physical column.
+    } else {
+      ObExternalDataPageCacheValueHandle cache_handle;
+      const int cache_ret = get_page_from_cache_(offset, cache_handle);
+      if (OB_ENTRY_NOT_EXIST == cache_ret) {
+        if (OB_ISNULL(windows)
+            && OB_FAIL(create_without_offset_index_windows_(column_end_offset, windows))) {
+          LOG_WARN("failed to create initial parquet window", K(ret));
+        } else {
+          try {
+            std::shared_ptr<ObCoalescedBuffer> window;
+            if (OB_FAIL(
+                    submit_read_(offset,
+                                 MIN(without_offset_index_window_size_, column_end_offset - offset),
+                                 window))) {
+              LOG_WARN("failed to prefetch parquet column", K(ret), K(offset));
+            } else if (OB_FAIL(windows->push_back(WithoutOffsetIndexWindow(window)))) {
+              LOG_WARN("failed to retain initial parquet window", K(ret));
+            }
+          } catch (const std::bad_alloc &) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+          }
+        }
+      }
+      // A cache lookup error only disables speculative IO; normal reads still handle the miss.
+    }
+  }
+  return ret;
+}
+
+int ObParquetPageMgr::read_without_offset_index_range_(const int64_t offset,
+                                                       const int64_t length,
+                                                       const int64_t column_end_offset,
+                                                       std::shared_ptr<arrow::Buffer> &buffer)
+{
+  int ret = OB_SUCCESS;
+  buffer.reset();
+  WithoutOffsetIndexWindows *column_windows = nullptr;
+  if (OB_UNLIKELY(offset < 0 || length <= 0 || column_end_offset > file_size_
+                  || offset >= column_end_offset || length > column_end_offset - offset)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid parquet range", K(ret), K(offset), K(length), K(column_end_offset));
+  } else if (OB_ISNULL(column_windows = without_offset_index_windows_.get(column_end_offset))
+             && OB_FAIL(create_without_offset_index_windows_(column_end_offset, column_windows))) {
+    LOG_WARN("failed to create parquet column windows", K(ret), K(column_end_offset));
+  } else {
+    try {
+      WithoutOffsetIndexWindows &windows = *column_windows;
+      // Returned Arrow buffers keep removed windows alive.
+      while (OB_SUCC(ret) && !windows.empty() && windows.at(0).buffer_->end() <= offset) {
+        if (OB_FAIL(windows.remove(0))) {
+          LOG_WARN("failed to remove consumed parquet window", K(ret));
+        }
+      }
+      if (!windows.empty() && windows.at(0).buffer_->offset_ > offset) {
+        // Reload if a request moves backwards.
+        windows.reuse();
+      }
+      const int64_t request_end = offset + length;
+      const int64_t prefetch_end
+          = offset + MIN(MAX(length, without_offset_index_prefetch_size_),
+                         column_end_offset - offset);
+      int64_t next_offset
+          = windows.empty() ? offset : windows.at(windows.count() - 1).buffer_->end();
+      // Submit the prefetch windows before waiting.
+      while (OB_SUCC(ret) && next_offset < prefetch_end) {
+        std::shared_ptr<ObCoalescedBuffer> window;
+        if (OB_FAIL(submit_read_(next_offset,
+                                 MIN(without_offset_index_window_size_,
+                                     column_end_offset - next_offset),
+                                 window))) {
+          LOG_WARN("failed to read without-OffsetIndex window", K(ret));
+        } else if (OB_FAIL(windows.push_back(WithoutOffsetIndexWindow(window)))) {
+          LOG_WARN("failed to append parquet window", K(ret));
+        } else {
+          next_offset = window->end();
+        }
+      }
+      if (OB_SUCC(ret) && windows.at(0).buffer_->end() >= request_end) {
+        const std::shared_ptr<ObCoalescedBuffer> &window = windows.at(0).buffer_;
+        if (OB_FAIL(ObCoalescedBuffer::slice(window,
+                                             offset - window->offset_,
+                                             window->end() - offset,
+                                             metrics_,
+                                             buffer))) {
+          LOG_WARN("failed to slice parquet range", K(ret));
+        }
+      } else if (OB_SUCC(ret)) {
+        // Arrow needs a contiguous buffer when a request crosses windows.
+        std::shared_ptr<ObCoalescedBuffer> joined
+            = std::make_shared<ObCoalescedBuffer>(file_size_, offset, length);
+        joined->has_waited_ = true; // This buffer is filled below, never submitted to IO.
+        if (OB_FAIL(joined->alloc_buffer())) {
+          LOG_WARN("failed to allocate spanning page", K(ret), K(length));
+        } else {
+          int64_t copied = 0;
+          for (int64_t i = 0; i < windows.count(); ++i) {
+            const std::shared_ptr<ObCoalescedBuffer> &window = windows.at(i).buffer_;
+            if (OB_FAIL(ret) || copied == length) {
+              break;
+            } else if (OB_FAIL(window->wait(metrics_))) {
+              LOG_WARN("failed to wait for spanning page", K(ret));
+            } else {
+              const int64_t start = offset + copied;
+              const int64_t part_size = MIN(length - copied, window->end() - start);
+              MEMCPY(joined->buf_ + copied, window->buf_ + start - window->offset_, part_size);
+              copied += part_size;
+            }
+          }
+          if (OB_SUCC(ret)) {
+            if (OB_FAIL(ObCoalescedBuffer::slice(joined, 0, length, metrics_, buffer))) {
+              LOG_WARN("failed to slice spanning page", K(ret));
+            }
+          }
+        }
+      }
+    } catch (const std::exception &e) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate parquet range state", K(ret), "Info", e.what());
+    }
+  }
+  return ret;
+}
+
+int ObParquetPageMgr::lookup_without_offset_index_cache_(
+    const int64_t page_offset,
+    std::shared_ptr<arrow::Buffer> &page_buffer,
+    bool &cache_hit,
+    bool &is_decompressed)
+{
+  int ret = OB_SUCCESS;
+  cache_hit = false;
+  page_buffer.reset();
+  is_decompressed = false;
+  if (OB_UNLIKELY(page_offset < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    ObExternalDataPageCacheValueHandle value_handle;
+    if (OB_FAIL(get_page_from_cache_(page_offset, value_handle))) {
+      if (OB_ENTRY_NOT_EXIST == ret) {
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("failed to look up without-OffsetIndex page cache", K(ret), K(page_offset));
+      }
+    } else if (OB_FAIL(ObParquetCacheBackedArrowBuffer::create(value_handle, page_buffer))) {
+      LOG_WARN("failed to create cached parquet buffer", K(ret), K(page_offset));
+    } else {
+      cache_hit = true;
+      is_decompressed = value_handle.value_->is_decompressed();
+    }
+  }
+  return ret;
+}
+
+int ObParquetPageMgr::insert_without_offset_index_cache_(
+    const int64_t page_offset,
+    const int64_t physical_page_size,
+    const bool is_decompressed,
+    const std::shared_ptr<arrow::Buffer> &page_buffer)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(page_offset < 0 || physical_page_size <= 0 || OB_ISNULL(page_buffer.get())
+                  || page_buffer->size() <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid without-OffsetIndex parquet page cache insert",
+             K(ret),
+             K(page_offset),
+             K(physical_page_size),
+             KP(page_buffer.get()));
+  } else {
+    put_page_to_cache_(
+        page_offset, page_buffer->data_as<char>(), page_buffer->size(), is_decompressed);
+    ++metrics_.cached_page_miss_count_;
+    metrics_.cached_page_miss_size_ += physical_page_size;
+  }
+  return ret;
+}
+
+void ObParquetPageMgr::notify_without_offset_index_cache_hit_(const int64_t page_offset,
+                                                              const int64_t physical_page_size)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(page_offset < 0 || physical_page_size <= 0)) {
+    LOG_WARN("invalid without-OffsetIndex parquet page cache hit",
+             K(page_offset),
+             K(physical_page_size));
+  } else {
+    ++metrics_.cached_page_hit_count_;
+    metrics_.cached_page_hit_size_ += physical_page_size;
+  }
 }
 
 } // namespace sql

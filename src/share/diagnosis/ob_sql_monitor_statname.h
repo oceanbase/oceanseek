@@ -373,6 +373,13 @@ SQL_MONITOR_STATNAME_DEF(VEC_IVF_SEGMENT_TOTAL_TIME, metric::Unit::TIME_NS, "seg
 SQL_MONITOR_STATNAME_DEF(VEC_IVF_SEGMENT_RETURN_ROWS_COUNT, metric::Unit::INT, "segment return rows count", "successful segment result rows before common filtering", M_SUM, metric::Level::STANDARD)
 
 //end
+SQL_MONITOR_STATNAME_DEF(EXT_PLUGIN_ASSIGNED_TASKS, metric::Unit::INT, "Assigned Tasks", "Assigned Tasks", M_SUM, metric::Level::CRITICAL)
+SQL_MONITOR_STATNAME_DEF(EXT_PLUGIN_ASSIGNED_FILE_BYTES, metric::Unit::BYTES, "Assigned File Bytes", "Assigned File Bytes", M_SUM, metric::Level::CRITICAL)
+SQL_MONITOR_STATNAME_DEF(EXT_PLUGIN_OPENED_TASKS, metric::Unit::INT, "Opened Tasks", "Opened Tasks", M_SUM, metric::Level::CRITICAL)
+SQL_MONITOR_STATNAME_DEF(EXT_PLUGIN_COMPLETED_TASKS, metric::Unit::INT, "Completed Tasks", "Completed Tasks", M_SUM, metric::Level::CRITICAL)
+SQL_MONITOR_STATNAME_DEF(EXT_PLUGIN_OUTPUT_ROWS, metric::Unit::INT, "Output Rows", "Output Rows", M_SUM, metric::Level::CRITICAL)
+SQL_MONITOR_STATNAME_DEF(EXT_PLUGIN_INIT_TIME, metric::Unit::TIME_NS, "Init Time", "Init Time", M_SUM | E_MAX, metric::Level::CRITICAL)
+SQL_MONITOR_STATNAME_DEF(EXT_PLUGIN_READ_TIME, metric::Unit::TIME_NS, "Read Time", "Read Time", M_SUM | E_MAX, metric::Level::CRITICAL)
 SQL_MONITOR_STATNAME_DEF(MONITOR_STATNAME_END, metric::Unit::INVALID, "monitor end", "monitor stat name end", E_MIN | E_MAX, metric::Level::AD_HOC)
 #endif
 

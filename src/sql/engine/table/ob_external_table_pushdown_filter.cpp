@@ -869,7 +869,8 @@ int ObExternalTablePushdownFilter::generate_lazy_exprs(const ObIArray<std::pair<
       }
       if (!is_found) {
         ret = OB_SEARCH_NOT_FOUND;
-        LOG_WARN("get lazy filter", K(ret));
+        LOG_WARN("get lazy filter", K(ret), K(i), K(mapping_col_ids),
+                 K(column_sel_mask), "expr_type", column_exprs.at(i)->type_);
       }
     }
   }

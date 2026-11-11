@@ -14,6 +14,7 @@
 #include "sql/optimizer/ob_lake_table_partition_info.h"
 #include "sql/optimizer/file_prune/ob_hive_file_pruner.h"
 #include "sql/hybrid_search/ob_hybrid_search_node.h"
+#include "sql/engine/basic/ob_pushdown_filter.h"
 
 using namespace oceanbase::sql;
 using namespace oceanbase::common;
@@ -1225,31 +1226,21 @@ int ObLogTableScan::extract_pushdown_filters(ObIArray<ObRawExpr*> &nonpushdown_f
         } else {
           need_dup_filter = false;
         }
-      } else if (ObExternalFileFormat::CPP_PLUGIN_FORMAT == external_table_type) {
-        // C++ .so plugin (LAKE_PLUGIN): keep the storage filter on the plugin row
-        // iterator instead of duplicating it into spec.filters_.
-        // The pushdown-able predicates stay in scan_pushdown_filters -> pd_storage_filters_;
-        // ObExtTablePluginRowIterator converts them to a predicate JSON handed to the plugin's
-        // reader_create (-> SetPredicate) for optional reader pruning. The iterator
-        // still evaluates the complete pd_storage_filters_ tree as the OB backstop.
-        // external_pushdown_filters (the legacy JNI string mechanism) is left empty: the
-        // CPP plugin path uses the JSON predicate, not it.
+      } else if (ObExternalFileFormat::CPP_PLUGIN_FORMAT == external_table_type
+                 || (get_plan()->get_optimizer_context().get_min_cluster_version()
+                         >= CLUSTER_VERSION_4_4_1_0
+                     && (ObExternalFileFormat::PARQUET_FORMAT == external_table_type
+                         || ObExternalFileFormat::ORC_FORMAT == external_table_type))) {
+        // These iterators evaluate op_filters_ when there is no storage filter
+        // tree. Keep their expression checks identical.
         need_dup_filter = false;
-      } else if (get_plan()->get_optimizer_context().get_min_cluster_version()
-                 >= CLUSTER_VERSION_4_4_1_0) {
-        if (external_table_type == ObExternalFileFormat::FormatType::PARQUET_FORMAT ||
-            external_table_type == ObExternalFileFormat::FormatType::ORC_FORMAT) {
-          // todo 后续要支持 iceberg(不同 datafile 类型的时候)，这里需要重新考虑
-          need_dup_filter = false;
-          // for iceberg, parquet and orc, we need to check if the filter need to be duplicated
-          int64_t file_column_count = 0;
-          for (int64_t i = 0; OB_SUCC(ret) && !need_dup_filter && i < filters.count(); ++i) {
-            if (OB_FAIL(check_ext_filter_need_duplicate(filters.at(i), file_column_count, need_dup_filter))) {
-              LOG_WARN("failed to check ext filter need duplicate", K(ret));
-            }
+        int64_t file_column_count = 0;
+        for (int64_t i = 0; OB_SUCC(ret) && !need_dup_filter && i < filters.count(); ++i) {
+          if (OB_FAIL(check_ext_filter_need_duplicate(filters.at(i), file_column_count, need_dup_filter))) {
+            LOG_WARN("failed to check ext filter need duplicate", K(ret));
           }
-          LOG_TRACE("check ext filter need duplicate done", K(ret), K(need_dup_filter));
         }
+        LOG_TRACE("check ext filter need duplicate done", K(ret), K(need_dup_filter));
       }
       if (OB_SUCC(ret) && need_dup_filter) {
         // for external table, all filters are duplicate in no pushdown

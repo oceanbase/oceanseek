@@ -10,6 +10,7 @@
 
 #include "share/ob_i_tablet_scan.h"
 #include "lib/file/ob_file.h"
+#include "lib/container/ob_bitmap.h"
 #include "common/row/ob_row_iterator.h"
 #include "storage/access/ob_dml_param.h"
 #include "common/storage/ob_io_device.h"
@@ -20,6 +21,7 @@
 #include "lib/roaringbitmap/ob_roaringbitmap.h"
 #include "sql/engine/basic/ob_lake_table_reader_profile.h"
 #include "sql/engine/expr/ob_expr_get_path.h"
+#include "sql/optimizer/file_prune/ob_lake_table_fwd.h"
 
 namespace oceanbase
 {
@@ -37,6 +39,7 @@ class ObExternalTablePartInfoArray;
 
 namespace sql {
 struct ObFileScanTask;
+class ObExternalTableRowIterator;
 class ObExprRegexpSessionVariables;
 class ObDecompressor;
 class ObIcebergDeleteBitmapBuilder;
@@ -136,13 +139,13 @@ class ObExternalIteratorState
 {
 public:
   ObExternalIteratorState()
-      : file_idx_(0), part_id_(0), cur_file_id_(0), cur_line_number_(0), cur_file_url_(),
+      : task_idx_(0), part_id_(0), cur_file_id_(0), cur_line_number_(0), cur_file_url_(),
         part_list_val_(), batch_first_row_line_num_(0), is_delete_file_loaded_(false)
   {
   }
 
   virtual void reuse() {
-    file_idx_ = 0;
+    task_idx_ = 0;
     part_id_ = 0;
     cur_file_id_ = 0;
     cur_line_number_ = 0;
@@ -152,7 +155,7 @@ public:
     is_delete_file_loaded_ = false;
   }
   DECLARE_VIRTUAL_TO_STRING;
-  int64_t file_idx_;
+  int64_t task_idx_; // Index of the next task to claim.
   int64_t part_id_;
   int64_t cur_file_id_;
   int64_t cur_line_number_;
@@ -160,6 +163,22 @@ public:
   ObNewRow part_list_val_;
   int64_t batch_first_row_line_num_;
   bool is_delete_file_loaded_;
+};
+
+// Per-reader initialization of pushed-down filter values.
+class ObExternalTableFilterEvalInitializer
+{
+public:
+  ObExternalTableFilterEvalInitializer() : filter_eval_inited_(false) {}
+  void reset() { filter_eval_inited_ = false; }
+  int ensure_filter_eval_inited_once(ObPushdownFilterExecutor *filter,
+                                    const storage::ObTableScanParam *scan_param);
+  bool is_filter_eval_inited() const { return filter_eval_inited_; }
+  void set_filter_eval_inited(bool initialized) { filter_eval_inited_ = initialized; }
+
+private:
+  int init_filter_evaluated_datums(ObPushdownFilterExecutor *filter);
+  bool filter_eval_inited_;
 };
 
 struct ObExternalTableAccessOptions
@@ -237,15 +256,30 @@ struct ObColumnDefaultValue {
 class ObExternalTableRowIterator : public common::ObNewRowIterator, public ObDiagnosisInfoProvider {
 public:
   friend class ObExternalTablePushdownFilter;
-  ObExternalTableRowIterator() :
-    scan_param_(nullptr), line_number_expr_(NULL), file_id_expr_(NULL), file_name_expr_(NULL),
-    delete_bitmap_(nullptr), delete_bitmap_builder_(nullptr), reader_profile_(),
-    need_partition_info_(false), file_column_exprs_(allocator_), mapping_column_ids_(allocator_),
-    file_meta_column_exprs_(allocator_), column_need_conv_(allocator_),
-    is_agg_pushdown_(false)
-  {}
+  friend class ObLakeTableRowIterDispatcher;
+  ObExternalTableRowIterator()
+      : scan_param_(nullptr), line_number_expr_(NULL), file_id_expr_(NULL),
+        file_name_expr_(NULL), delete_bitmap_(nullptr),
+        delete_bitmap_builder_(nullptr), reader_profile_(),
+        need_partition_info_(false), file_column_exprs_(allocator_),
+        mapping_column_ids_(allocator_), file_meta_column_exprs_(allocator_),
+        column_need_conv_(allocator_), is_agg_pushdown_(false), op_filter_result_(allocator_) {}
+  virtual bool can_handle_task(const ObIExtTblScanTask *task) const { return nullptr != task; }
+  virtual ObExternalTableFilterEvalInitializer *get_filter_eval_initializer() { return nullptr; }
+  virtual int64_t get_next_task_idx() const { return -1; }
+  virtual int set_next_task_idx(const int64_t task_idx) { UNUSED(task_idx); return OB_NOT_SUPPORTED; }
   virtual int init(const storage::ObTableScanParam *scan_param);
-  ~ObExternalTableRowIterator();
+  // Virtual (inherited from ObNewRowIterator): explicit destructor calls
+  // (e.g. revert_scan_iter, dispatcher reader teardown) dispatch to the
+  // most-derived iterator destructor.
+  virtual ~ObExternalTableRowIterator();
+
+  static bool is_task_boundary(const int ret) {
+    return OB_ITER_END == ret || OB_NOT_THE_OBJECT == ret;
+  }
+
+  // -1 means this reader does not expose pre-residual consumption.
+  virtual int64_t get_read_rows() const { return -1; }
 
   static const std::string ICEBERG_ID_KEY;
 
@@ -254,7 +288,20 @@ public:
                                ObIVector *vec);
 
 protected:
+  int peek_next_task_idx(const int64_t next_idx, int64_t &task_idx) const;
+  int peek_next_task_idx_for_reader(const int64_t next_idx, int64_t &task_idx) const;
+  int go_next_task_idx(ObExternalIteratorState &state, int64_t &task_idx);
   int init_exprs(const storage::ObTableScanParam *scan_param);
+  // Evaluate the ordinary scan expressions after all accessed columns are materialized.
+  // Used when codegen did not construct pd_storage_filters_. The bitmap is reused.
+  int calc_op_filters(const int64_t count, ObBitVector &skip,
+                       const common::ObBitmap *&result);
+  int reorder_expr_vector(ObExpr *expr,
+                          ObEvalCtx &ctx,
+                          const common::ObBitmap &bitmap,
+                          const int64_t read_count,
+                          const int64_t real_count);
+  int reorder_output(const common::ObBitmap &bitmap, ObEvalCtx &ctx, int64_t &read_count);
   int gen_ip_port(common::ObIAllocator &allocator);
   int calc_file_partition_list_value(const int64_t part_id,
                                      common::ObIAllocator &allocator,
@@ -267,11 +314,6 @@ protected:
   int prepare_file_partition_info(const ObFileScanTask *scan_task,
                                   common::ObIAllocator &allocator,
                                   ObExternalIteratorState &state);
-  int fill_iceberg_file_partition_value(const ObFileScanTask *scan_task,
-                                        ObExternalIteratorState &state);
-  int get_iceberg_identity_partition_value(const int64_t source_field_id,
-                                           const ObExternalIteratorState &state,
-                                           const common::ObObj *&partition_value) const;
   static int load_partition_value_to_expr(ObExpr *expr,
                                           ObEvalCtx &eval_ctx,
                                           const common::ObObj &partition_value);
@@ -321,7 +363,7 @@ protected:
     return share::is_lake_external_table(scan_param_->lake_table_format_);
   }
 
-  int init_for_iceberg(ObExternalTableAccessOptions *options);
+  int init_delete_bitmap(ObExternalTableAccessOptions *options);
   int init_default_batch(ExprFixedArray &file_column_exprs);
   int build_delete_bitmap(const ObString &data_file_path, const int64_t task_idx);
   static int compact_selected_rows(const common::ObBitmap &selection,
@@ -342,6 +384,8 @@ protected:
                                 ObIArray<std::pair<uint64_t, uint64_t>> &mapping_column_ids);
   bool is_aggregate_pushdown_mode() const { return is_agg_pushdown_; }
 protected:
+  bool can_handle_file_task(const ObIExtTblScanTask *task,
+                            ObExternalFileFormat::FormatType format) const;
   const storage::ObTableScanParam *scan_param_;
   //external table column exprs
   common::ObSEArray<ObExpr*, 16> column_exprs_;
@@ -363,7 +407,62 @@ protected:
   common::ObFixedArray<bool, ObIAllocator> column_need_conv_;
   bool is_agg_pushdown_;
 private:
-  ObArenaAllocator allocator_; // used by delete map now
+  ObArenaAllocator allocator_;
+  common::ObBitmap op_filter_result_;
+};
+
+// Readers claim tasks in order and synchronize the cursor on handoff.
+// Only OB_NOT_THE_OBJECT changes readers. File/batch progress stays inside each reader.
+// DAS resets before replacing tasks, then calls rescan to prepare the new
+// assignment. get_next_rows only reads from already initialized readers.
+class ObLakeTableRowIterDispatcher : public ObExternalTableRowIterator {
+public:
+  ObLakeTableRowIterDispatcher();
+  virtual ~ObLakeTableRowIterDispatcher();
+  virtual int init(const storage::ObTableScanParam *scan_param) override;
+  int rescan();
+  virtual int get_next_row(common::ObNewRow *& /*row*/) override {
+    return OB_NOT_SUPPORTED;
+  }
+  virtual int get_next_row() override { return OB_NOT_SUPPORTED; }
+  virtual int get_next_rows(int64_t &count, const int64_t capacity) override;
+  virtual void reset() override;
+
+protected:
+  virtual int create_task_reader(const ObExternalFileFormat::FormatType reader_type,
+                                 common::ObIAllocator &allocator,
+                                 ObExternalTableRowIterator *&reader);
+
+private:
+  static constexpr int64_t PLUGIN_READER_IDX = 0;
+  static constexpr int64_t PARQUET_READER_IDX = 1;
+  static constexpr int64_t ORC_READER_IDX = 2;
+  static constexpr int64_t READER_COUNT = 3;
+  struct CachedReader {
+    CachedReader() : allocator_("LakeTblReader") {}
+    common::ObArenaAllocator allocator_;
+    ObExternalTableRowIterator *iter_ = nullptr;
+    bool used_in_scan_ = false;
+  };
+  int prepare_scan();
+  int select_next_reader();
+  int validate_scan_tasks();
+  int get_cached_reader(ObExternalFileFormat::FormatType type, CachedReader *&reader);
+  void destroy_cached_reader(CachedReader &reader);
+  void register_assignment_metrics();
+  void publish_reader_metrics(const CachedReader &reader);
+  const storage::ObTableScanParam *shared_scan_param_;
+  CachedReader readers_[READER_COUNT];
+  CachedReader *current_reader_ = nullptr;
+  bool scan_prepared_ = false;
+  bool iter_end_ = false;
+  // Init time is published during preparation. Read counters are published
+  // at handoff/EOF or reset/release after an error; publishing preserves buffers.
+  int64_t reader_rows_ = 0;
+  int64_t reader_init_us_ = 0;
+  int64_t reader_read_us_ = 0;
+  ObOpProfile<ObMetric> *metrics_profile_ = nullptr;
+  DISALLOW_COPY_AND_ASSIGN(ObLakeTableRowIterDispatcher);
 };
 
 class ObExternalTableAccessService : public common::ObITabletScan
@@ -376,6 +475,7 @@ public:
   virtual int revert_scan_iter(ObNewRowIterator *iter) override;
 
 private:
+  friend class ObLakeTableRowIterDispatcher;
   static bool is_ext_min_max_agg_scan(const storage::ObTableScanParam &scan_param);
 
   DISALLOW_COPY_AND_ASSIGN(ObExternalTableAccessService);

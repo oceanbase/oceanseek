@@ -387,7 +387,9 @@ int ObSchemaPrinter::print_external_table_file_info(const ObTableSchema &table_s
       default: {
         // Plugin tables: a value in the plugin-placeholder range identifies the
         // plugin; resolve its slot to the resident plugin's format name via the
-        // registry. Print nothing if the plugin .so is not loaded.
+        // registry. Fail the print if the plugin .so is not loaded: the USING
+        // clause carries the table's plugin identity, a DDL without it would
+        // silently recreate a non-plugin table.
         const share::ObLakeTableFormat format = table_schema.get_lake_table_format();
         if (share::is_lake_plugin_table(format)) {
           const share::ObPluginSlot slot =
@@ -397,7 +399,8 @@ int ObSchemaPrinter::print_external_table_file_info(const ObTableSchema &table_s
           const char *format_name = nullptr;
           if (OB_ISNULL(api) || OB_ISNULL(api->format_name)
               || OB_ISNULL(format_name = api->format_name())) {
-            SHARE_SCHEMA_LOG(WARN, "ext plugin not loaded for format", K(format), K(slot));
+            ret = OB_ERR_PLUGIN_IS_NOT_LOADED;
+            SHARE_SCHEMA_LOG(WARN, "ext plugin not loaded for format", K(ret), K(format), K(slot));
           } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, "\nUSING %s\n",
                                              format_name))) {
             SHARE_SCHEMA_LOG(WARN, "fail to print using plugin", K(ret), K(slot));

@@ -17,6 +17,7 @@
 #include "share/rc/ob_tenant_base.h"
 #include "sql/engine/basic/ob_arrow_data_loader.h"
 #include "sql/engine/basic/ob_pushdown_filter.h"
+#include "sql/engine/ob_exec_context.h"
 #include "sql/engine/expr/ob_expr_get_path.h"
 
 #include <arrow/api.h>
@@ -72,7 +73,6 @@ ObExtTablePluginRowIterator::ObExtTablePluginRowIterator()
       column_index_map_(),
       column_loaders_(),
       bit_vector_cache_(nullptr),
-      filter_eval_inited_(false),
       reader_predicate_built_(false),
       reader_predicate_json_(),
       allocator_(lib::ObMemAttr(MTL_ID(), "ExtRowIter"))
@@ -87,7 +87,6 @@ ObExtTablePluginRowIterator::~ObExtTablePluginRowIterator()
 int ObExtTablePluginRowIterator::init(const storage::ObTableScanParam *scan_param)
 {
   int ret = OB_SUCCESS;
-  filter_eval_inited_ = false;
   reader_predicate_built_ = false;
   reader_predicate_json_.reset();
   reader_projection_json_.reset();
@@ -273,13 +272,11 @@ int ObExtTablePluginRowIterator::build_reader_predicate_json()
   reader_predicate_json_.reset();
   ObPushdownFilterExecutor *filter = scan_param_->pd_storage_filters_;
   if (OB_NOT_NULL(filter)) {
-    if (OB_FAIL(ensure_filter_eval_inited_once(filter))) {
+    if (OB_FAIL(filter_eval_initializer_.ensure_filter_eval_inited_once(filter, scan_param_))) {
       LOG_WARN("failed to init runtime predicate datums", K(ret));
     } else {
-      // Predicate JSON for the plugin reader is optional. CPP_PLUGIN leaves
-      // need_dup_filter=false, so this tree is not copied into spec.filters_;
-      // get_next_rows always runs calc_filters on the complete
-      // pd_storage_filters_ tree.
+      // Predicate JSON for the plugin reader is optional. Whenever the
+      // storage filter tree exists, get_next_rows evaluates it completely.
       // A partial/failed conversion only loses reader-side pruning.
       const int build_ret = ext_predicate::build_predicate_json_from_pushdown_filter(
           allocator_, filter, reader_file_column_ids_, reader_file_column_names_,
@@ -338,6 +335,7 @@ int ObExtTablePluginRowIterator::build_projection_json(const common::ObIArray<ui
 int ObExtTablePluginRowIterator::open_next_task()
 {
   int ret = OB_SUCCESS;
+  int64_t task_idx = -1;
   // Release the current batch before closing the task: its Arrow buffers use
   // reader-owned memory, so the BatchReader must outlive the ArrowArray.
   cur_record_batch_.reset();
@@ -353,25 +351,22 @@ int ObExtTablePluginRowIterator::open_next_task()
       || OB_ISNULL(reader_task_state_) || OB_ISNULL(scan_param_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("ext reader not initialized", K(ret));
-  } else if (state_.file_idx_ >= scan_param_->scan_tasks_.count()) {
-    if (scan_active_ && OB_NOT_NULL(api_->reader_close_scan)) {
-      api_->reader_close_scan(reader_worker_state_, reader_scan_state_);
-      scan_active_ = false;
-    }
-    ret = OB_ITER_END;
-  } else if (!reader_predicate_built_ && OB_FAIL(build_reader_predicate_json())) {
-    // Build only when a reader is actually needed. reset()/rescan does not call
-    // init(), so the first task of each scan also refreshes execution parameters.
-    LOG_WARN("failed to prepare plugin reader predicate", K(ret));
+  } else if (OB_FAIL(go_next_task_idx(state_, task_idx))) {
+    // Retain scan/TableRead at EOF; real reset and close_ext release it.
   } else {
     // SDK tasks keep the root task JSON produced by ObExtFilePruner. Native
     // tasks are routed to the Parquet/ORC iterator before reaching this class.
-    ObIExtTblScanTask *base_task = scan_param_->scan_tasks_.at(state_.file_idx_);
-    ObPluginScanTask *scan_task = dynamic_cast<ObPluginScanTask *>(base_task);
+    ObIExtTblScanTask *base_task = scan_param_->scan_tasks_.at(task_idx);
+    ObPluginScanTask *scan_task = OB_NOT_NULL(base_task) && LakeFileType::EXT_PLUGIN == base_task->get_file_type()
+        ? static_cast<ObPluginScanTask *>(base_task) : nullptr;
     if (OB_ISNULL(scan_task)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("scan task is not an ObPluginScanTask (expected task_json)",
-               K(ret), K(state_.file_idx_));
+               K(ret), K(task_idx));
+    } else if (!reader_predicate_built_ &&
+               OB_FAIL(build_reader_predicate_json())) {
+      // A real rescan refreshes execution parameters without repeating init().
+      LOG_WARN("failed to prepare plugin reader predicate", K(ret));
     } else {
       if (!scan_active_) {
         // The predicate is the only scan-scope input.
@@ -381,7 +376,7 @@ int ObExtTablePluginRowIterator::open_next_task()
             reader_worker_state_, reader_scan_state_, predicate_cstr);
         if (rc_scan != OB_SUCCESS) {
           ret = rc_scan;
-          LOG_WARN("plugin reader_open_scan failed", K(ret), K(state_.file_idx_));
+          LOG_WARN("plugin reader_open_scan failed", K(ret), K(task_idx));
         } else {
           scan_active_ = true;
         }
@@ -403,22 +398,16 @@ int ObExtTablePluginRowIterator::open_next_task()
           rows);
       if (rc2 != OB_SUCCESS) {
         ret = rc2;
-        LOG_WARN("plugin reader_open_task failed", K(ret), K(state_.file_idx_));
+        LOG_WARN("plugin reader_open_task failed", K(ret), K(task_idx));
       } else {
         has_open_task_ = true;
-        state_.part_id_ = scan_task->part_id_;
-        if (0 == state_.part_id_) {
-          state_.part_list_val_.reset();
-        } else if (OB_FAIL(calc_file_part_list_value_by_array(
-                       state_.part_id_, allocator_, scan_param_->partition_infos_,
-                       state_.part_list_val_))) {
-          LOG_WARN("load plugin task partition row failed", K(ret), K(state_.file_idx_),
+        if (OB_FAIL(prepare_file_partition_info(scan_task, allocator_, state_))) {
+          LOG_WARN("load plugin task partition row failed", K(ret), K(task_idx),
                    K(state_.part_id_));
         }
         if (OB_SUCC(ret)) {
-          state_.file_idx_++;
           state_.cur_file_url_ = scan_param_->external_file_location_;
-          state_.cur_line_number_ = 0;
+          state_.cur_file_id_ = scan_task->file_id_;
         }
       }
     }
@@ -430,11 +419,11 @@ int ObExtTablePluginRowIterator::fetch_next_batch()
 {
   int ret = OB_SUCCESS;
   bool has_load_batch = false;
-  // NEVER let a zero-row successful batch escape this function: the caller
-  // chain (ObOperator::get_next_batch's "all-filtered -> continue" loop) treats
-  // a 0-row OB_SUCCESS batch as "pull again" and spins forever. EOF therefore
-  // advances to the next task INSIDE this loop; only OB_ITER_END (all tasks
-  // exhausted) or a real error leaves without rows.
+  // Return a nonempty batch, an error, or OB_ITER_END after all tasks finish.
+  // An empty batch requests another read from the same task; task EOF must
+  // close that task and open the next one here. Retrying an exhausted reader
+  // without advancing tasks would make no progress, regardless of which layer
+  // owns the retry loop.
   while (OB_SUCC(ret) && !has_load_batch) {
     if (!has_open_task_) {
       if (OB_FAIL(open_next_task())) {
@@ -514,6 +503,7 @@ int ObExtTablePluginRowIterator::import_current_arrow_batch(struct ArrowArray *a
           cur_record_batch_ =
               arrow::RecordBatch::Make(schema, struct_array->length(), struct_array->fields());
           cur_batch_row_count_ = cur_record_batch_->num_rows();
+          read_rows_ += cur_batch_row_count_;
         }
       }
     }
@@ -634,16 +624,16 @@ int ObExtTablePluginRowIterator::get_next_rows(int64_t &count, int64_t capacity)
   ObPushdownFilterExecutor *filter = scan_param_->pd_storage_filters_;
 
   if (capacity <= 0) {
+    ret = OB_INVALID_ARGUMENT;
   } else {
-    // Keep pulling until at least one row survives (a batch may be emptied by
-    // the residual filters) or the scan ends/errors. NEVER return a zero-row
-    // OB_SUCCESS batch from here: ObOperator::get_next_batch treats
-    // size_ == skipped (0 == 0) as "all filtered -> continue" and spins
-    // forever (this is the original design's "no caller-visible 0-row" rule).
+    // Keep the iterator's nonempty-batch contract after residual filtering.
+    // ObOperator can retry an empty successful batch, but that alone does not
+    // advance this reader. Always consume rows_to_read below, even when every
+    // row is filtered, and let fetch_next_batch handle task exhaustion.
     while (OB_SUCC(ret) && 0 == count) {
       if (cur_batch_row_idx_ >= cur_batch_row_count_) {
         if (OB_FAIL(fetch_next_batch())) {
-          if (OB_ITER_END != ret) {
+          if (!is_task_boundary(ret)) {
             LOG_WARN("failed to fetch next batch", K(ret));
           }
         }
@@ -691,11 +681,10 @@ int ObExtTablePluginRowIterator::get_next_rows(int64_t &count, int64_t capacity)
           } else if (OB_FAIL(calc_exprs_for_rowid(read_count, state_))) {
             LOG_WARN("failed to calc row id exprs", K(ret));
           } else if (OB_NOT_NULL(filter)) {
-            // CPP_PLUGIN does not duplicate this tree into spec.filters_. Evaluate
-            // it here unconditionally as the OB correctness backstop; plugin
+            // Evaluate the storage tree here as the OB correctness backstop; plugin
             // SetPredicate remains an independent reader-side optimization.
             const common::ObBitmap *filter_result = nullptr;
-            if (OB_FAIL(ensure_filter_eval_inited_once(filter))) {
+            if (OB_FAIL(filter_eval_initializer_.ensure_filter_eval_inited_once(filter, scan_param_))) {
               LOG_WARN("failed to init filter evaluated datums once", K(ret));
             } else if (OB_FAIL(calc_filters(read_count, filter, nullptr))) {
               LOG_WARN("failed to calc ext plugin filters", K(ret));
@@ -704,6 +693,15 @@ int ObExtTablePluginRowIterator::get_next_rows(int64_t &count, int64_t capacity)
               LOG_WARN("unexpected null filter result", K(ret));
             } else if (OB_FAIL(reorder_output(*filter_result, eval_ctx, read_count))) {
               LOG_WARN("failed to reorder filtered output", K(ret));
+            }
+          } else if (scan_param_->ext_enable_late_materialization_
+                     && OB_NOT_NULL(scan_param_->op_filters_)
+                     && !scan_param_->op_filters_->empty()) {
+            const common::ObBitmap *filter_result = nullptr;
+            if (OB_FAIL(calc_op_filters(read_count, *bit_vector_cache_, filter_result))) {
+              LOG_WARN("failed to evaluate plugin scan expressions", K(ret));
+            } else if (OB_FAIL(reorder_output(*filter_result, eval_ctx, read_count))) {
+              LOG_WARN("failed to reorder plugin expression filter output", K(ret));
             }
           }
           if (OB_SUCC(ret)) {
@@ -722,6 +720,8 @@ int ObExtTablePluginRowIterator::project_output_columns(const int64_t read_count
   int ret = OB_SUCCESS;
   ObEvalCtx &eval_ctx = scan_param_->op_->get_eval_ctx();
   const ExprFixedArray &column_conv_exprs = *(scan_param_->ext_column_dependent_exprs_);
+  const bool pad_char = lib::is_oracle_mode()
+      || is_pad_char_to_full_length(eval_ctx.exec_ctx_.get_my_session()->get_sql_mode());
   for (int64_t i = 0; OB_SUCC(ret) && i < column_exprs_.count(); ++i) {
     // A non-output column can still be referenced by pd_storage_filters_.
     // Project all conversion-needed columns so residual filter evaluation sees
@@ -730,6 +730,10 @@ int ObExtTablePluginRowIterator::project_output_columns(const int64_t read_count
       if (OB_FAIL(project_column(eval_ctx, column_conv_exprs.at(i), column_exprs_.at(i), read_count))) {
         LOG_WARN("failed to project output column", K(ret), K(i));
       }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(normalize_external_char_column(
+        *column_exprs_.at(i), eval_ctx, read_count, pad_char))) {
+      LOG_WARN("failed to normalize plugin CHAR column", K(ret), K(i));
     }
   }
   return ret;
@@ -798,67 +802,6 @@ int ObExtTablePluginRowIterator::project_column(ObEvalCtx &eval_ctx, const ObExp
   return ret;
 }
 
-int ObExtTablePluginRowIterator::init_filter_evaluated_datums(ObPushdownFilterExecutor *curr_filter)
-{
-  int ret = OB_SUCCESS;
-  bool filter_valid = true;
-  if (OB_ISNULL(curr_filter)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected null filter", K(ret));
-  } else if (curr_filter->is_filter_node()) {
-    if (curr_filter->is_filter_black_node()) {
-      if (OB_FAIL(curr_filter->init_evaluated_datums(filter_valid))) {
-        LOG_WARN("failed to init evaluated datums", K(ret));
-      } else if (!filter_valid) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("filter is invalid", K(ret), K(curr_filter->is_logic_op_node()));
-      }
-    } else if (curr_filter->is_filter_white_node()) {
-      ObWhiteFilterExecutor *white_filter = static_cast<ObWhiteFilterExecutor *>(curr_filter);
-      ObWhiteFilterOperatorType op_type = white_filter->get_op_type();
-      if (WHITE_OP_IN == op_type) {
-        if (OB_FAIL(white_filter->init_in_eval_datums(filter_valid))) {
-          LOG_WARN("failed to init in filter evaluated datums", K(ret));
-        }
-      } else if (OB_FAIL(white_filter->init_compare_eval_datums(filter_valid))) {
-        LOG_WARN("failed to init compare filter evaluated datums", K(ret));
-      }
-      if (OB_FAIL(ret)) {
-      } else if (!filter_valid) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("filter is invalid", K(ret), K(curr_filter->is_logic_op_node()));
-      }
-    } else {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("filter is invalid", K(ret), K(curr_filter->is_logic_op_node()));
-    }
-  } else if (curr_filter->is_logic_op_node()) {
-    sql::ObPushdownFilterExecutor **children = curr_filter->get_childs();
-    for (uint32_t i = 0; OB_SUCC(ret) && i < curr_filter->get_child_count(); ++i) {
-      if (OB_ISNULL(children[i])) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected null child filter", K(ret), K(i));
-      } else if (OB_FAIL(init_filter_evaluated_datums(children[i]))) {
-        LOG_WARN("failed to init child filter evaluated datums", K(ret), K(i), KP(children[i]));
-      }
-    }
-  }
-  return ret;
-}
-
-int ObExtTablePluginRowIterator::ensure_filter_eval_inited_once(ObPushdownFilterExecutor *root_filter)
-{
-  int ret = OB_SUCCESS;
-  if (OB_ISNULL(root_filter)) {
-  } else if (filter_eval_inited_) {
-  } else if (OB_FAIL(init_filter_evaluated_datums(root_filter))) {
-    LOG_WARN("failed to init filter evaluated datums", K(ret));
-  } else {
-    filter_eval_inited_ = true;
-  }
-  return ret;
-}
-
 int ObExtTablePluginRowIterator::calc_filters(const int64_t count,
                                         ObPushdownFilterExecutor *curr_filter,
                                         ObPushdownFilterExecutor *parent_filter)
@@ -918,127 +861,6 @@ int ObExtTablePluginRowIterator::calc_filters(const int64_t count,
   return ret;
 }
 
-int ObExtTablePluginRowIterator::reorder_expr_vector(ObExpr *expr,
-                                               ObEvalCtx &ctx,
-                                               const common::ObBitmap &bitmap,
-                                               const int64_t read_count,
-                                               const int64_t real_count)
-{
-  int ret = OB_SUCCESS;
-  if (OB_ISNULL(expr)) {
-  } else if (!expr->get_eval_info(ctx).is_evaluated(ctx)) {
-  } else {
-    ObIVector *vec = expr->get_vector(ctx);
-    if (OB_ISNULL(vec)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected null vector when reorder ext output", K(ret), KPC(expr));
-    } else {
-      switch (vec->get_format()) {
-        case VEC_FIXED: {
-          ObFixedLengthBase *fix_vec = static_cast<ObFixedLengthBase *>(vec);
-          ObBitVector *nulls = fix_vec->get_nulls();
-          int64_t project_count = 0;
-          for (int64_t i = 0; i < read_count; ++i) {
-            if (bitmap[i]) {
-              if (nulls->at(i)) {
-                nulls->set(project_count);
-              } else {
-                nulls->unset(project_count);
-                if (project_count != i) {
-                  MEMCPY(fix_vec->get_data() + fix_vec->get_length() * project_count,
-                         fix_vec->get_data() + fix_vec->get_length() * i,
-                         fix_vec->get_length());
-                }
-              }
-              ++project_count;
-            }
-          }
-          if (OB_UNLIKELY(project_count != real_count)) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("unexpected filtered row count", K(ret), K(project_count), K(real_count));
-          }
-          break;
-        }
-        case VEC_DISCRETE: {
-          ObDiscreteBase *dis_vec = static_cast<ObDiscreteBase *>(vec);
-          ObBitVector *nulls = dis_vec->get_nulls();
-          int64_t project_count = 0;
-          for (int64_t i = 0; i < read_count; ++i) {
-            if (bitmap[i]) {
-              if (nulls->at(i)) {
-                nulls->set(project_count);
-              } else {
-                nulls->unset(project_count);
-                if (project_count != i) {
-                  dis_vec->get_lens()[project_count] = dis_vec->get_lens()[i];
-                  dis_vec->get_ptrs()[project_count] = dis_vec->get_ptrs()[i];
-                }
-              }
-              ++project_count;
-            }
-          }
-          if (OB_UNLIKELY(project_count != real_count)) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("unexpected filtered row count", K(ret), K(project_count), K(real_count));
-          }
-          break;
-        }
-        case VEC_UNIFORM: {
-          ObUniformBase *uni_vec = static_cast<ObUniformBase *>(vec);
-          int64_t project_count = 0;
-          for (int64_t i = 0; i < read_count; ++i) {
-            if (bitmap[i]) {
-              uni_vec->get_datums()[project_count++] = uni_vec->get_datums()[i];
-            }
-          }
-          if (OB_UNLIKELY(project_count != real_count)) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("unexpected filtered row count", K(ret), K(project_count), K(real_count));
-          }
-          break;
-        }
-        case VEC_UNIFORM_CONST: {
-          break;
-        }
-        default: {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("unexpected vector format when reorder ext output", K(ret), K(vec->get_format()));
-          break;
-        }
-      }
-    }
-  }
-  return ret;
-}
-
-int ObExtTablePluginRowIterator::reorder_output(const common::ObBitmap &bitmap,
-                                          ObEvalCtx &ctx,
-                                          int64_t &read_count)
-{
-  int ret = OB_SUCCESS;
-  const int64_t real_count = bitmap.popcnt();
-  if (OB_UNLIKELY(real_count > read_count)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected filter bitmap popcnt", K(ret), K(real_count), K(read_count));
-  } else if (real_count < read_count) {
-    for (int64_t i = 0; OB_SUCC(ret) && i < column_exprs_.count(); ++i) {
-      if (OB_FAIL(reorder_expr_vector(column_exprs_.at(i), ctx, bitmap, read_count, real_count))) {
-        LOG_WARN("failed to reorder column expr vector", K(ret), K(i));
-      }
-    }
-    if (OB_SUCC(ret) && OB_FAIL(reorder_expr_vector(file_id_expr_, ctx, bitmap, read_count, real_count))) {
-      LOG_WARN("failed to reorder file id vector", K(ret));
-    }
-    if (OB_SUCC(ret) && OB_FAIL(reorder_expr_vector(line_number_expr_, ctx, bitmap, read_count, real_count))) {
-      LOG_WARN("failed to reorder line number vector", K(ret));
-    }
-    if (OB_SUCC(ret)) {
-      read_count = real_count;
-    }
-  }
-  return ret;
-}
-
 int ObExtTablePluginRowIterator::reset_column_mapping()
 {
   int ret = OB_SUCCESS;
@@ -1056,10 +878,10 @@ int ObExtTablePluginRowIterator::reset_column_mapping()
 
 void ObExtTablePluginRowIterator::reset()
 {
+  read_rows_ = 0;
   cur_record_batch_ = nullptr;
   cur_batch_row_idx_ = 0;
   cur_batch_row_count_ = 0;
-  filter_eval_inited_ = false;
   reader_predicate_built_ = false;
   reader_predicate_json_.reset();
   reader_projection_json_.reset();
@@ -1075,6 +897,7 @@ void ObExtTablePluginRowIterator::reset()
   scan_active_ = false;
   (void)reset_column_mapping();
   state_.reuse();
+  filter_eval_initializer_.reset();
   // Drop the instance-scoped stat cache so each (re)scan starts from fresh
   // storage metadata; the cache only needs to be valid within one scan.
   host_ctx_.default_fs.reset_stat_cache();

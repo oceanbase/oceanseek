@@ -46,6 +46,7 @@ struct ObExtFileScanEntry
   common::ObString file_path_;
   int64_t byte_size_ = -1;
   int64_t row_count_ = -1;  // unset until the descriptor supplies an exact non-negative value
+  int64_t cache_version_ = 0;  // absent: collect file attributes from storage
 };
 
 struct ObExtTaskPartitionValue
@@ -96,14 +97,14 @@ struct ObExtFileScanDescriptor
 /// One scan task parsed from the scan-tasks JSON. `task_json`/`task_json_len`
 /// point at the
 /// single task's JSON text (re-serialized into the allocator) that OB later
-/// hands to `reader_create` as `task_json`. row_count/byte_size are the generic
-/// fields OB uses for scheduling (-1 = unknown).
+/// hands to `reader_create` as `task_json`. row_count may be unknown (-1).
+/// byte_size is the required non-negative int64 planned data-file size.
 struct ObExtScanTask
 {
   const char *task_json = nullptr;   // single-task JSON text, allocator-owned
   int32_t task_json_len = 0;
   int64_t row_count = -1;
-  int64_t byte_size = -1;
+  int64_t byte_size = -1;  // unset until validated during parsing
 };
 
 /// All scan tasks of a scan (parse output of plan_create's JSON).

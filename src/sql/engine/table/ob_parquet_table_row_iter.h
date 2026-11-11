@@ -22,6 +22,7 @@
 #include "share/backup/ob_backup_struct.h"
 #include "sql/engine/basic/ob_arrow_basic.h"
 #include "sql/engine/table/ob_external_table_access_service.h"
+#include "sql/optimizer/file_prune/ob_lake_table_fwd.h"
 #include "sql/engine/table/ob_external_table_pushdown_filter.h"
 #include "sql/engine/table/ob_parquet_dict_filter.h"
 #include "sql/engine/table/parquet/ob_parquet_page_mgr.h"
@@ -171,7 +172,9 @@ struct SkipPageCallback
     // several consecutive pages. Account for the whole jump, not only its first page.
     bool is_selected = false;
     std::optional<int64_t> next_page_offset;
-    if (OB_FAIL(page_mgr_.check_page_selected(skip_page_offset, is_selected, next_page_offset))
+    if (OB_FAIL(page_mgr_.check_page_selected_with_offset_index(skip_page_offset,
+                                                                is_selected,
+                                                                next_page_offset))
         || is_selected) {
       throw parquet::ParquetException("invalid skipped page selection");
     }
@@ -271,7 +274,6 @@ public:
     reader_metrics_(),
     column_index_type_(sql::ColumnIndexType::NAME),
     is_col_name_case_sensitive_(false),
-    filter_eval_inited_(false),
     dict_filter_pushdown_(nullptr),
     sample_cumulative_block_offset_(0),
     sample_actual_seed_(0),
@@ -281,6 +283,8 @@ public:
     fast_sample_active_(false) {}
   virtual ~ObParquetTableRowIterator();
 
+  bool can_handle_task(const ObIExtTblScanTask *task) const override
+  { return can_handle_file_task(task, ObExternalFileFormat::PARQUET_FORMAT); }
   int init(const storage::ObTableScanParam *scan_param) override;
   int init_read_props();
   int get_next_row() override;
@@ -293,6 +297,9 @@ public:
   }
 
   virtual void reset() override;
+  ObExternalTableFilterEvalInitializer *get_filter_eval_initializer() override { return &filter_eval_initializer_; }
+  int64_t get_next_task_idx() const override { return state_.task_idx_; }
+  int set_next_task_idx(int64_t idx) override { state_.task_idx_ = idx; return OB_SUCCESS; }
 
   static int read_min_max_datum(const std::string &min_val, const std::string &max_val,
                          const parquet::Type::type physical_type, const parquet::LogicalType* log_type,
@@ -705,7 +712,8 @@ private:
   static int to_numeric_hive(const char *str, const int32_t length, char *buf, const int64_t data_len,
                              const ObDatumMeta &meta, common::ObIAllocator &alloc, blocksstable::ObStorageDatum &datum);
   int pre_buffer(std::shared_ptr<parquet::RowGroupReader> rg_reader);
-  int prepare_parquet_page_mgr();
+  int prepare_page_mgr_with_offset_index();
+  int prefetch_columns_without_offset_index(std::shared_ptr<parquet::RowGroupReader> rg_reader);
   int compute_column_id_by_index_type(int index, int &file_col_id, const bool is_collection_column);
   int pre_buffer(ObFilePreBuffer &file_prebuffer,
                  ObFilePreBuffer::ColumnRangeSlicesList &column_range_slice_list);
@@ -776,24 +784,14 @@ private:
   int calc_column_convert_expr(const int64_t read_count,
                                const int64_t column_expr_idx,
                                ObEvalCtx &eval_ctx);
-  int init_filter_evaluated_datums(ObPushdownFilterExecutor *curr_filter);
-  int ensure_filter_eval_inited_once(ObPushdownFilterExecutor *root_filter);
   int calc_file_meta_column(const int64_t read_count, ObEvalCtx &eval_ctx);
   int calc_meta_column_convert(const int64_t read_count, ObEvalCtx &eval_ctx);
-  static bool is_contain_field_id(std::shared_ptr<parquet::FileMetaData> file_meta);  
+  static bool is_contain_field_id(std::shared_ptr<parquet::FileMetaData> file_meta);
   // 根据字典编码检查结果，动态更新 load_funcs_
   int update_load_funcs_for_dict_optimization();
   int collect_dict_filter_executors(ObPushdownFilterExecutor *filter);
 
-  bool is_enable_rg_parquet_page_mgr() const;
-  // Functor for checking if page manager is enabled
-  struct IsEnablePageMgrFunctor {
-    ObParquetTableRowIterator* iter;
-    
-    bool operator()() const {
-      return iter->is_enable_rg_parquet_page_mgr();
-    }
-  };
+  bool is_with_offset_index_read_enabled() const;
 
   // block sample / fast sample helpers
   int alloc_page_range_arrays();
@@ -836,6 +834,7 @@ private:
 
 private:
   ObParquetIteratorState state_;
+  ObExternalTableFilterEvalInitializer filter_eval_initializer_;
   lib::ObMemAttr mem_attr_;
   ObArenaAllocator allocator_;
   ObArenaAllocator str_res_mem_;
@@ -887,7 +886,6 @@ private:
   ObLakeTableParquetReaderMetrics reader_metrics_;
   sql::ColumnIndexType column_index_type_;
   bool is_col_name_case_sensitive_;
-  bool filter_eval_inited_;
   ObParquetDictFilterPushdown *dict_filter_pushdown_;  // 字典优化模块
   // block sample state (single-column sampling only)
   int64_t sample_cumulative_block_offset_;

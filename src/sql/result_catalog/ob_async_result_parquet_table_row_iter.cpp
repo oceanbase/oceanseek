@@ -148,7 +148,7 @@ void ObAsyncResultParquetTableRowIterator::reset()
 int ObAsyncResultParquetTableRowIterator::next_file()
 {
   int ret = OB_SUCCESS;
-  const int64_t task_idx = state_.file_idx_++;
+  const int64_t task_idx = state_.task_idx_++;
   row_group_reader_.reset();
   for (int64_t i = 0; i < column_readers_.count(); ++i) {
     column_readers_.at(i).reset();

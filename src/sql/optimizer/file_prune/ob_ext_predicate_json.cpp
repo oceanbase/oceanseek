@@ -13,9 +13,12 @@
 #include "sql/engine/ob_exec_context.h"
 #include "sql/ob_sql_utils.h"
 #include "sql/optimizer/ob_optimizer_util.h"
+#include "sql/resolver/dml/ob_dml_stmt.h"
 #include "sql/resolver/expr/ob_raw_expr.h"
+#include "sql/rewrite/ob_query_range_define.h"
 #include "plugin/v2/include/ob_external_table_plugin.h"  // OB_EXT_K_* + grammar
 #include "common/object/ob_object.h"  // OB_APP_MIN_COLUMN_ID, ObObj
+#include "lib/charset/ob_charset.h"
 
 namespace oceanbase
 {
@@ -138,7 +141,7 @@ int obj_to_lit_value(common::ObSqlString &out, const common::ObObj &obj)
 // partition column (a non-partition col disqualifies the subtree from
 // partition_filter).
 int emit_col(const EmitCtx &ctx, const ObColumnRefRawExpr &col, bool &partition_eligible,
-             common::ObSqlString &out)
+             common::ObSqlString &out, const ObCollationType cmp_collation = CS_TYPE_INVALID)
 {
   int ret = OB_SUCCESS;
   if (!is_partition_col(ctx, col)) { partition_eligible = false; }
@@ -148,8 +151,13 @@ int emit_col(const EmitCtx &ctx, const ObColumnRefRawExpr &col, bool &partition_
                              OB_EXT_K_KIND, OB_EXT_K_COL_IDX,
                              static_cast<long>(field_id), OB_EXT_K_NAME))) {
   } else if (OB_FAIL(json_escape(out, col.get_column_name()))) {
+  } else if (col.get_result_type().is_string_type() && cmp_collation != CS_TYPE_INVALID) {
+    ret = out.append_fmt("\",\"%s\":%d,\"%s\":\"%s\"}", OB_EXT_K_RESULT_TYPE_ID,
+                         static_cast<int>(col.get_data_type()), OB_EXT_K_COLLATION,
+                         ObCharset::collation_name(cmp_collation));
   } else {
-    ret = out.append("\"}");
+    ret = out.append_fmt("\",\"%s\":%d}", OB_EXT_K_RESULT_TYPE_ID,
+                         static_cast<int>(col.get_data_type()));
   }
   return ret;
 }
@@ -168,9 +176,37 @@ int emit_lit(const EmitCtx &ctx, const ObRawExpr *const_expr, common::ObSqlStrin
   } else if (OB_FAIL(obj_to_lit_value(out, obj))) {
     ret = OB_ERR_UNEXPECTED;
   } else {
-    ret = out.append("\"}");
+    ret = out.append_fmt("\",\"%s\":%d}", OB_EXT_K_RESULT_TYPE_ID,
+                         static_cast<int>(const_expr->get_data_type()));
   }
   return ret;
+}
+
+// A raw comparison does not expose its calculation collation directly. For
+// string operands in the same charset, the stronger coercibility determines
+// the comparison collation; equal-strength disagreements remain unproven.
+ObCollationType common_string_collation(const ObRawExpr *left, const ObRawExpr *right)
+{
+  ObCollationType collation = CS_TYPE_INVALID;
+  if (OB_NOT_NULL(left) && OB_NOT_NULL(right)
+      && left->get_result_type().is_string_type()
+      && right->get_result_type().is_string_type()) {
+    const ObRawExprResType &lhs = left->get_result_type();
+    const ObRawExprResType &rhs = right->get_result_type();
+    if (lhs.get_collation_type() == rhs.get_collation_type()) {
+      collation = lhs.get_collation_type();
+    } else if (ObCharset::charset_type_by_coll(lhs.get_collation_type())
+               == ObCharset::charset_type_by_coll(rhs.get_collation_type())
+               && lhs.get_collation_level() != CS_LEVEL_INVALID
+               && rhs.get_collation_level() != CS_LEVEL_INVALID) {
+      if (lhs.get_collation_level() < rhs.get_collation_level()) {
+        collation = lhs.get_collation_type();
+      } else if (rhs.get_collation_level() < lhs.get_collation_level()) {
+        collation = rhs.get_collation_type();
+      }
+    }
+  }
+  return collation;
 }
 
 // Normalize a comparison op when the col/const sides are reversed (e.g. `5 > col`
@@ -190,8 +226,7 @@ ObItemType normalize_cmp_op(ObItemType op, bool reversed)
 const char *cmp_op_name(ObItemType op)
 {
   switch (op) {
-    case T_OP_EQ:
-    case T_OP_NSEQ: return "eq";
+    case T_OP_EQ:   return "eq";
     case T_OP_NE:   return "ne";
     case T_OP_LT:   return "lt";
     case T_OP_LE:   return "le";
@@ -205,17 +240,18 @@ const char *cmp_op_name(ObItemType op)
 // `partition_eligible` is set. OB_SUCCESS + `ok=false` => not convertible
 // (skip). Error => abort.
 int emit_node(const EmitCtx &ctx, const ObRawExpr *e, bool &partition_eligible,
-              bool &ok, common::ObSqlString &out)
+              bool &ok, common::ObSqlString &out, const int64_t depth = 0)
 {
   int ret = OB_SUCCESS;
   ok = false;
   partition_eligible = true;
   if (OB_ISNULL(e)) {
+  } else if (depth >= 64) {
+    ret = OB_SIZE_OVERFLOW;
   } else {
     const ObItemType type = e->get_expr_type();
     switch (type) {
       case T_OP_EQ:
-      case T_OP_NSEQ:
       case T_OP_LT:
       case T_OP_LE:
       case T_OP_GT:
@@ -242,11 +278,13 @@ int emit_node(const EmitCtx &ctx, const ObRawExpr *e, bool &partition_eligible,
           if (OB_SUCC(ret) && col != nullptr && const_expr != nullptr) {
             const ObItemType op = normalize_cmp_op(type, reversed);
             const char *opn = cmp_op_name(op);
+            const ObCollationType cmp_collation = common_string_collation(left, right);
             if (opn != nullptr
                 && OB_FAIL(out.append_fmt("{\"%s\":\"cmp\",\"%s\":\"%s\",\"%s\":[",
                                           OB_EXT_K_KIND, OB_EXT_K_OP, opn,
                                           OB_EXT_K_CHILDREN))) {
-            } else if (OB_FAIL(emit_col(ctx, *col, partition_eligible, out))) {
+            } else if (OB_FAIL(emit_col(ctx, *col, partition_eligible, out,
+                                        cmp_collation))) {
             } else if (OB_FAIL(out.append(","))) {
             } else if (OB_FAIL(emit_lit(ctx, const_expr, out))) {
               ret = OB_SUCCESS;  // non-foldable const -> skip this cmp
@@ -261,24 +299,38 @@ int emit_node(const EmitCtx &ctx, const ObRawExpr *e, bool &partition_eligible,
       case T_OP_BTW: {
         const ObOpRawExpr *op_expr = static_cast<const ObOpRawExpr *>(e);
         const ObColumnRefRawExpr *col = nullptr;
+        ObCollationType cmp_collation = CS_TYPE_INVALID;
         if (OB_ISNULL(op_expr) || op_expr->get_param_count() != 3) {
         } else if (OB_FAIL(get_column_ref(op_expr->get_param_expr(0), col))) {
           LOG_WARN("get between col ref failed", K(ret), KPC(e));
-        } else if (OB_ISNULL(col)) {
+        }
+        if (OB_SUCC(ret) && OB_NOT_NULL(col)) {
+          cmp_collation = common_string_collation(
+              op_expr->get_param_expr(0), op_expr->get_param_expr(1));
+          if (cmp_collation != common_string_collation(
+                  op_expr->get_param_expr(0), op_expr->get_param_expr(2))) {
+            cmp_collation = CS_TYPE_INVALID;
+          }
+        }
+        if (OB_FAIL(ret) || OB_ISNULL(col)) {
         } else if (OB_FAIL(out.append_fmt(
                        "{\"%s\":\"and\",\"%s\":[{\"%s\":\"cmp\",\"%s\":\"ge\",\"%s\":[",
                        OB_EXT_K_KIND, OB_EXT_K_CHILDREN, OB_EXT_K_KIND, OB_EXT_K_OP,
                        OB_EXT_K_CHILDREN))) {
-        } else if (OB_FAIL(emit_col(ctx, *col, partition_eligible, out))) {
+        } else if (OB_FAIL(emit_col(ctx, *col, partition_eligible, out,
+                                    cmp_collation))) {
         } else if (OB_FAIL(out.append(","))) {
         } else if (OB_FAIL(emit_lit(ctx, op_expr->get_param_expr(1), out))) {
+          // The generic fallback below resets this incomplete compact JSON.
           ret = OB_SUCCESS;
         } else if (OB_FAIL(out.append_fmt(
                        "]},{\"%s\":\"cmp\",\"%s\":\"le\",\"%s\":[",
                        OB_EXT_K_KIND, OB_EXT_K_OP, OB_EXT_K_CHILDREN))) {
-        } else if (OB_FAIL(emit_col(ctx, *col, partition_eligible, out))) {
+        } else if (OB_FAIL(emit_col(ctx, *col, partition_eligible, out,
+                                    cmp_collation))) {
         } else if (OB_FAIL(out.append(","))) {
         } else if (OB_FAIL(emit_lit(ctx, op_expr->get_param_expr(2), out))) {
+          // The generic fallback below resets this incomplete compact JSON.
           ret = OB_SUCCESS;
         } else if (OB_FAIL(out.append("]}]}"))) {
         } else {
@@ -301,9 +353,20 @@ int emit_node(const EmitCtx &ctx, const ObRawExpr *e, bool &partition_eligible,
           } else {
             const ObOpRawExpr *row_expr = static_cast<const ObOpRawExpr *>(right);
             const char *kind = (T_OP_IN == type) ? "in" : "not_in";
+            ObCollationType cmp_collation = CS_TYPE_INVALID;
+            if (row_expr->get_param_count() > 0) {
+              cmp_collation = common_string_collation(left, row_expr->get_param_expr(0));
+              for (int64_t i = 1; i < row_expr->get_param_count(); ++i) {
+                if (cmp_collation != common_string_collation(left, row_expr->get_param_expr(i))) {
+                  cmp_collation = CS_TYPE_INVALID;
+                  break;
+                }
+              }
+            }
             if (OB_FAIL(out.append_fmt("{\"%s\":\"%s\",\"%s\":[", OB_EXT_K_KIND, kind,
                                        OB_EXT_K_CHILDREN))) {
-            } else if (OB_FAIL(emit_col(ctx, *col, partition_eligible, out))) {
+            } else if (OB_FAIL(emit_col(ctx, *col, partition_eligible, out,
+                                        cmp_collation))) {
             } else {
               bool all_lit_ok = true;
               for (int64_t i = 0; OB_SUCC(ret) && all_lit_ok
@@ -352,49 +415,15 @@ int emit_node(const EmitCtx &ctx, const ObRawExpr *e, bool &partition_eligible,
         }
         break;
       }
-      case T_OP_AND: {
-        const ObOpRawExpr *op_expr = static_cast<const ObOpRawExpr *>(e);
-        bool any_ok = false;
-        bool all_part_eligible = true;
-        if (OB_FAIL(out.append_fmt("{\"%s\":\"and\",\"%s\":[", OB_EXT_K_KIND, OB_EXT_K_CHILDREN))) {
-        } else {
-          for (int64_t i = 0; OB_SUCC(ret) && i < op_expr->get_param_count(); ++i) {
-            bool child_ok = false;
-            bool child_part = true;
-            common::ObSqlString child_json;
-            if (OB_FAIL(emit_node(ctx, op_expr->get_param_expr(i), child_part, child_ok,
-                                 child_json))) {
-              LOG_WARN("emit and-child failed", K(ret), K(i));
-            } else if (!child_ok) {
-              // Skip non-convertible conjunct: emitting a weaker AND is safe for
-              // predicate pushdown, but the original expr cannot be proven exact.
-              all_part_eligible = false;
-            } else {
-              if (any_ok && OB_FAIL(out.append(","))) {}
-              if (OB_SUCC(ret) && OB_FAIL(out.append(child_json.string()))) {
-              } else {
-                any_ok = true;
-                if (!child_part) { all_part_eligible = false; }
-              }
-            }
-          }
-          if (OB_SUCC(ret)) {
-            if (!any_ok) {
-              ok = false;  // nothing convertible
-            } else if (OB_FAIL(out.append("]}"))) {
-            } else {
-              ok = true;
-              partition_eligible = all_part_eligible;
-            }
-          }
-        }
-        break;
-      }
+      case T_OP_AND:
       case T_OP_OR: {
         const ObOpRawExpr *op_expr = static_cast<const ObOpRawExpr *>(e);
+        const char *logical_op = type == T_OP_AND ? "and" : "or";
         bool all_ok = true;
         bool all_part_eligible = true;
-        if (OB_FAIL(out.append_fmt("{\"%s\":\"or\",\"%s\":[", OB_EXT_K_KIND, OB_EXT_K_CHILDREN))) {
+        int64_t emitted_count = 0;
+        if (OB_FAIL(out.append_fmt("{\"%s\":\"%s\",\"%s\":[", OB_EXT_K_KIND,
+                                   logical_op, OB_EXT_K_CHILDREN))) {
         } else {
           for (int64_t i = 0; OB_SUCC(ret) && all_ok
                               && i < op_expr->get_param_count(); ++i) {
@@ -402,19 +431,22 @@ int emit_node(const EmitCtx &ctx, const ObRawExpr *e, bool &partition_eligible,
             bool child_part = true;
             common::ObSqlString child_json;
             if (OB_FAIL(emit_node(ctx, op_expr->get_param_expr(i), child_part, child_ok,
-                                 child_json))) {
-              LOG_WARN("emit or-child failed", K(ret), K(i));
+                                 child_json, depth + 1))) {
+              LOG_WARN("emit compound-child failed", K(ret), K(i));
             } else if (!child_ok) {
-              all_ok = false;  // can't emit partial OR — drop the whole OR
+              // Preserve the complete tree. A plugin, not OB, decides whether
+              // a child may be omitted from a pushed predicate.
+              all_ok = false;
             } else {
-              if (i > 0 && OB_FAIL(out.append(","))) {}
+              if (emitted_count > 0 && OB_FAIL(out.append(","))) {}
               if (OB_SUCC(ret) && OB_FAIL(out.append(child_json.string()))) {
               } else {
+                ++emitted_count;
                 if (!child_part) { all_part_eligible = false; }
               }
             }
           }
-          if (OB_SUCC(ret) && all_ok && op_expr->get_param_count() > 0) {
+          if (OB_SUCC(ret) && all_ok && emitted_count > 0) {
             if (OB_FAIL(out.append("]}"))) {
             } else {
               ok = true;
@@ -432,7 +464,7 @@ int emit_node(const EmitCtx &ctx, const ObRawExpr *e, bool &partition_eligible,
           bool child_part = true;
           common::ObSqlString child_json;
           if (OB_FAIL(emit_node(ctx, op_expr->get_param_expr(0), child_part, child_ok,
-                               child_json))) {
+                               child_json, depth + 1))) {
           } else if (!child_ok) {
           } else if (OB_FAIL(out.append_fmt("{\"%s\":\"not\",\"%s\":[", OB_EXT_K_KIND,
                                               OB_EXT_K_CHILDREN))) {
@@ -446,8 +478,90 @@ int emit_node(const EmitCtx &ctx, const ObRawExpr *e, bool &partition_eligible,
         break;
       }
       default:
-        // not convertible (functions, col-vs-col, etc.) — skip
+        // Generic expression encoding below preserves operators which do not
+        // match the compact col/literal predicate grammar.
         break;
+    }
+    if (OB_SUCC(ret) && !ok) {
+      out.reset();
+      if (e->is_column_ref_expr()) {
+        ret = emit_col(ctx, *static_cast<const ObColumnRefRawExpr *>(e),
+                       partition_eligible, out);
+        ok = OB_SUCC(ret);
+      } else if (e->is_const_raw_expr()) {
+        common::ObObj value;
+        bool valid = false;
+        if (OB_FAIL(fold_const(ctx, e, value, valid))) {
+          LOG_WARN("fold generic literal failed", K(ret));
+        } else if (valid && !value.is_null()) {
+          if (OB_FAIL(emit_lit(ctx, e, out))) {
+            LOG_WARN("emit generic literal failed", K(ret));
+          } else {
+            ok = true;
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret) && !ok) {
+      out.reset();
+      partition_eligible = true;
+      // A dynamic parameter has no value at planning time. Keep its position
+      // in the tree so plugins cannot mistake the surrounding expression for
+      // a complete supported predicate. TODO: add bound-parameter transport
+      // before plugins may evaluate such nodes themselves.
+      const char *op_name = get_type_name(type);
+      if (OB_FAIL(out.append_fmt("{\"%s\":\"expr\",\"%s\":\"", OB_EXT_K_KIND,
+                                 OB_EXT_K_OP))) {
+      } else if (OB_FAIL(json_escape(out, op_name, STRLEN(op_name)))) {
+      } else if (OB_FAIL(out.append_fmt(
+                     "\",\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%d,\"%s\":%s",
+                     OB_EXT_K_OP_ID, static_cast<int>(type),
+                     OB_EXT_K_RESULT_TYPE_ID, static_cast<int>(e->get_data_type()),
+                     OB_EXT_K_PRECISION, static_cast<int>(e->get_accuracy().get_precision()),
+                     OB_EXT_K_SCALE, static_cast<int>(e->get_accuracy().get_scale()),
+                     OB_EXT_K_NULLABLE, e->is_not_null_for_read() ? "false" : "true"))) {
+      } else {
+        if (e->is_sys_func_expr()) {
+          const common::ObString &function_name =
+              static_cast<const ObSysFunRawExpr *>(e)->get_func_name();
+          if (OB_FAIL(out.append_fmt(",\"%s\":\"", OB_EXT_K_NAME))) {
+          } else if (OB_FAIL(json_escape(out, function_name))) {
+          } else if (OB_FAIL(out.append("\""))) {
+          }
+        }
+        const ObCollationType comparison_collation = e->get_param_count() == 2
+            ? common_string_collation(e->get_param_expr(0), e->get_param_expr(1))
+            : CS_TYPE_INVALID;
+        if (OB_FAIL(ret)) {
+        } else if (comparison_collation != CS_TYPE_INVALID
+            && OB_FAIL(out.append_fmt(",\"%s\":\"%s\"",
+                                      OB_EXT_K_COMPARE_COLLATION,
+                                      ObCharset::collation_name(comparison_collation)))) {
+        } else if (OB_FAIL(out.append_fmt(",\"%s\":[", OB_EXT_K_CHILDREN))) {
+        } else {
+          bool children_complete = true;
+          for (int64_t i = 0; OB_SUCC(ret) && children_complete
+                              && i < e->get_param_count(); ++i) {
+            bool child_ok = false;
+            bool child_part = true;
+            common::ObSqlString child_json;
+            if (OB_FAIL(emit_node(ctx, e->get_param_expr(i), child_part, child_ok,
+                                  child_json, depth + 1))) {
+              LOG_WARN("emit generic child failed", K(ret), K(i));
+            } else if (!child_ok) {
+              children_complete = false;
+            } else if (i > 0 && OB_FAIL(out.append(","))) {
+            } else if (OB_FAIL(out.append(child_json.string()))) {
+            } else if (!child_part) {
+              partition_eligible = false;
+            }
+          }
+          if (OB_SUCC(ret) && children_complete && OB_FAIL(out.append("]}"))) {
+          } else if (OB_SUCC(ret) && children_complete) {
+            ok = true;
+          }
+        }
+      }
     }
   }
   return ret;
@@ -495,7 +609,8 @@ bool find_runtime_column(const RuntimeEmitCtx &ctx,
 int emit_runtime_col(const RuntimeEmitCtx &ctx,
                      const uint64_t column_id,
                      bool &ok,
-                     common::ObSqlString &out)
+                     common::ObSqlString &out,
+                     const ObObjMeta *cmp_meta = nullptr)
 {
   int ret = OB_SUCCESS;
   ok = false;
@@ -508,9 +623,17 @@ int emit_runtime_col(const RuntimeEmitCtx &ctx,
                                     static_cast<long>(column_id - OB_APP_MIN_COLUMN_ID),
                                     OB_EXT_K_NAME))) {
   } else if (OB_FAIL(json_escape(out, column_name))) {
-  } else if (OB_FAIL(out.append("\"}"))) {
   } else {
-    ok = true;
+    if (OB_NOT_NULL(cmp_meta) && cmp_meta->is_string_type()
+        && cmp_meta->get_collation_type() != CS_TYPE_INVALID) {
+      ret = out.append_fmt("\",\"%s\":\"%s\"}", OB_EXT_K_COLLATION,
+                           ObCharset::collation_name(cmp_meta->get_collation_type()));
+    } else {
+      ret = out.append("\"}");
+    }
+    if (OB_SUCC(ret)) {
+      ok = true;
+    }
   }
   return ret;
 }
@@ -577,7 +700,8 @@ int emit_runtime_cmp(const RuntimeEmitCtx &ctx,
   common::ObSqlString col_json;
   common::ObSqlString lit_json;
   if (OB_ISNULL(op_name)) {
-  } else if (OB_FAIL(emit_runtime_col(ctx, column_id, col_ok, col_json))) {
+  } else if (OB_FAIL(emit_runtime_col(ctx, column_id, col_ok, col_json,
+                                      &filter.get_col_obj_meta()))) {
   } else if (!col_ok) {
   } else if (OB_FAIL(emit_runtime_lit(filter, datum_idx, lit_ok, lit_json))) {
   } else if (!lit_ok) {
@@ -649,7 +773,8 @@ int emit_runtime_white_filter(const RuntimeEmitCtx &ctx,
       common::ObSEArray<common::ObSqlString, 8> lit_jsons;
       if (datums.empty()) {
         // Do not rely on plugins accepting an empty IN list.
-      } else if (OB_FAIL(emit_runtime_col(ctx, column_id, col_ok, col_json))) {
+      } else if (OB_FAIL(emit_runtime_col(ctx, column_id, col_ok, col_json,
+                                          &filter.get_col_obj_meta()))) {
       } else if (!col_ok) {
       } else if (OB_FAIL(lit_jsons.reserve(datums.count()))) {
       } else {
@@ -768,6 +893,59 @@ int copy_out(common::ObIAllocator &alloc, const common::ObSqlString &s, common::
   return ret;
 }
 
+const char *partition_range_type_name(const common::ObObjType type)
+{
+  switch (type) {
+    case common::ObTinyIntType: return "TINYINT";
+    case common::ObSmallIntType: return "SMALLINT";
+    case common::ObInt32Type: return "INT";
+    case common::ObIntType: return "BIGINT";
+    case common::ObDateType: return "DATE";
+    default: return nullptr;
+  }
+}
+
+// Every emitted interval has at least one finite endpoint. NULL-containing and
+// whole/false ranges stay with OB until the protocol has explicit representations
+// for them. On unsupported input, `usable` becomes false and the whole column
+// candidate is discarded; it must never become a partial planning proof.
+int append_partition_interval(const common::ObNewRange &range,
+                              const common::ObObjType column_type,
+                              common::ObSqlString &out, bool &usable)
+{
+  int ret = OB_SUCCESS;
+  usable = false;
+  if (range.is_false_range() || range.is_whole_range()
+      || range.get_start_key().get_obj_cnt() != 1
+      || range.get_end_key().get_obj_cnt() != 1) {
+  } else {
+    const common::ObObj &lo = range.get_start_key().get_obj_ptr()[0];
+    const common::ObObj &hi = range.get_end_key().get_obj_ptr()[0];
+    const bool has_lo = !lo.is_min_value();
+    const bool has_hi = !hi.is_max_value();
+    if ((!has_lo && !has_hi) || lo.is_null() || hi.is_null()
+        || (has_lo && lo.get_type() != column_type)
+        || (has_hi && hi.get_type() != column_type)) {
+    } else if (OB_FAIL(out.append("{"))) {
+    } else if (has_lo && OB_FAIL(out.append_fmt("\"%s\":\"", OB_EXT_K_LOWER))) {
+    } else if (has_lo && OB_FAIL(obj_to_lit_value(out, lo))) {
+    } else if (has_lo && OB_FAIL(out.append_fmt("\",\"%s\":%s",
+                                                 OB_EXT_K_LOWER_INCLUSIVE,
+                                                 range.border_flag_.inclusive_start() ? "true" : "false"))) {
+    } else if (has_hi && has_lo && OB_FAIL(out.append(","))) {
+    } else if (has_hi && OB_FAIL(out.append_fmt("\"%s\":\"", OB_EXT_K_UPPER))) {
+    } else if (has_hi && OB_FAIL(obj_to_lit_value(out, hi))) {
+    } else if (has_hi && OB_FAIL(out.append_fmt("\",\"%s\":%s",
+                                                 OB_EXT_K_UPPER_INCLUSIVE,
+                                                 range.border_flag_.inclusive_end() ? "true" : "false"))) {
+    } else if (OB_FAIL(out.append("}"))) {
+    } else {
+      usable = true;
+    }
+  }
+  return ret;
+}
+
 } // namespace
 
 int build_predicate_json_from_raw_expr(common::ObIAllocator &alloc,
@@ -799,9 +977,11 @@ int build_predicate_json_from_raw_expr(common::ObIAllocator &alloc,
         // non-convertible — OB's own pipeline filters it.
       } else if (OB_FAIL(parts.push_back(node))) {
         LOG_WARN("push back predicate part failed", K(ret));
-      } else if (part_eligible && OB_FAIL(partition_parts.push_back(node))) {
+      } else if (part_eligible && !f->has_flag(CNT_DYNAMIC_PARAM)
+                 && OB_FAIL(partition_parts.push_back(node))) {
         LOG_WARN("push back partition predicate part failed", K(ret));
-      } else if (part_eligible && OB_FAIL(out_partition_filter_exprs.push_back(f))) {
+      } else if (part_eligible && !f->has_flag(CNT_DYNAMIC_PARAM)
+                 && OB_FAIL(out_partition_filter_exprs.push_back(f))) {
         LOG_WARN("push back partition predicate expr failed", K(ret));
       }
     }
@@ -826,6 +1006,140 @@ int build_predicate_json_from_raw_expr(common::ObIAllocator &alloc,
     out_predicate_json.reset();
     out_partition_filter_json.reset();
     out_partition_filter_exprs.reset();
+  }
+  return ret;
+}
+
+int build_partition_range_json(common::ObIAllocator &alloc,
+                               const ObDMLStmt &stmt,
+                               ObExecContext *exec_ctx,
+                               uint64_t table_id,
+                               const common::ObIArray<ObRawExpr *> &filters,
+                               const common::ObIArray<uint64_t> &partition_col_ids,
+                               common::ObString &out_json,
+                               common::ObIArray<ObRawExpr *> &out_precise_exprs)
+{
+  int ret = OB_SUCCESS;
+  out_json.reset();
+  out_precise_exprs.reset();
+  common::ObSqlString columns_json;
+  int64_t emitted_columns = 0;
+  if (exec_ctx == nullptr || exec_ctx->get_my_session() == nullptr) {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < partition_col_ids.count(); ++i) {
+    const uint64_t col_id = partition_col_ids.at(i);
+    ColumnItem *item = stmt.get_column_item_by_id(table_id, col_id);
+    if (item == nullptr || item->expr_ == nullptr) { continue; }
+    const common::ObObjType col_type = item->expr_->get_data_type();
+    const char *type_name = partition_range_type_name(col_type);
+    if (type_name == nullptr) { continue; }
+
+    common::ObArenaAllocator tmp_alloc("ExtPreRange");
+    common::ObSEArray<ColumnItem, 1> range_columns;
+    common::ObSEArray<ObRawExpr *, 4> precise_exprs;
+    common::ObSEArray<uint64_t, 1> one_col_id;
+    if (OB_FAIL(range_columns.push_back(*item)) || OB_FAIL(one_col_id.push_back(col_id))) {
+      LOG_WARN("failed to prepare partition range column", K(ret));
+    } else {
+      ObPreRangeGraph graph(tmp_alloc);
+      if (OB_FAIL(graph.preliminary_extract_query_range(range_columns, filters, exec_ctx,
+                                                       nullptr, nullptr, false, true))) {
+        LOG_WARN("failed to extract plugin partition range", K(ret), K(col_id));
+      } else {
+        EmitCtx emit_ctx = {alloc, exec_ctx, one_col_id};
+        const common::ObIArray<ObRawExpr *> &graph_exprs = graph.get_range_exprs();
+        for (int64_t j = 0; OB_SUCC(ret) && j < graph_exprs.count(); ++j) {
+          ObRawExpr *expr = graph_exprs.at(j);
+          bool partition_eligible = true;
+          bool ok = false;
+          common::ObSqlString ignored;
+          // Retain only original filter pointers. Graph-created expressions
+          // live in tmp_alloc and cannot be used as optimizer proof handles.
+          if (expr == nullptr || !ObOptimizerUtil::find_item(filters, expr)
+              || expr->has_flag(CNT_DYNAMIC_PARAM)) {
+          } else if (OB_FAIL(emit_node(emit_ctx, expr, partition_eligible, ok, ignored))) {
+            LOG_WARN("failed to inspect exact partition expr", K(ret));
+          } else if (ok && partition_eligible && OB_FAIL(precise_exprs.push_back(expr))) {
+            LOG_WARN("failed to collect exact partition expr", K(ret));
+          }
+        }
+      }
+    }
+    if (OB_FAIL(ret) || precise_exprs.empty()) { continue; }
+
+    ObPreRangeGraph exact_graph(tmp_alloc);
+    ObQueryRangeArray ranges;
+    bool all_single = false;
+    const common::ObDataTypeCastParams dtc_params =
+        ObBasicSessionInfo::create_dtc_params(exec_ctx->get_my_session());
+    if (OB_FAIL(exact_graph.preliminary_extract_query_range(range_columns, precise_exprs,
+                                                            exec_ctx, nullptr, nullptr,
+                                                            false, true))) {
+      LOG_WARN("failed to extract exact plugin partition ranges", K(ret));
+    } else if (OB_FAIL(exact_graph.get_tablet_ranges(tmp_alloc, *exec_ctx, ranges,
+                                                   all_single, dtc_params))) {
+      LOG_WARN("failed to materialize exact plugin partition ranges", K(ret));
+    }
+    if (OB_FAIL(ret) || ranges.empty() || ranges.count() > 256) { continue; }
+    // Only an exact range representation may prove a predicate redundant.
+    // Recheck after rebuilding the graph: a later range conversion must not
+    // silently turn one of the selected filters into an approximation.
+    bool exact = exact_graph.get_unprecise_range_exprs().empty();
+    const common::ObIArray<ObRawExpr *> &materialized_exprs = exact_graph.get_range_exprs();
+    for (int64_t j = 0; exact && j < precise_exprs.count(); ++j) {
+      exact = ObOptimizerUtil::find_item(materialized_exprs, precise_exprs.at(j));
+    }
+    if (!exact) { continue; }
+
+    common::ObSqlString range_json;
+    bool usable = true;
+    if (OB_FAIL(range_json.append_fmt("{\"%s\":\"", OB_EXT_K_NAME))) {
+    } else if (OB_FAIL(json_escape(range_json, item->expr_->get_column_name()))) {
+    } else if (OB_FAIL(range_json.append_fmt("\",\"%s\":\"%s\",\"%s\":[",
+                                              OB_EXT_K_EXT_TYPE, type_name, OB_EXT_K_RANGES))) {
+    }
+    for (int64_t j = 0; OB_SUCC(ret) && usable && j < ranges.count(); ++j) {
+      bool interval_usable = false;
+      if (j > 0 && OB_FAIL(range_json.append(","))) {
+      } else if (ranges.at(j) == nullptr) {
+        usable = false;
+      } else if (OB_FAIL(append_partition_interval(*ranges.at(j), col_type,
+                                                   range_json, interval_usable))) {
+        LOG_WARN("failed to encode plugin partition interval", K(ret));
+      } else if (!interval_usable) {
+        usable = false;
+      }
+    }
+    if (OB_SUCC(ret) && usable && OB_FAIL(range_json.append("]}"))) {
+    }
+    if (OB_SUCC(ret) && usable) {
+      if (emitted_columns > 0 && OB_FAIL(columns_json.append(","))) {
+      } else if (OB_FAIL(columns_json.append(range_json.ptr(), range_json.length()))) {
+      } else {
+        ++emitted_columns;
+        for (int64_t j = 0; OB_SUCC(ret) && j < precise_exprs.count(); ++j) {
+          ObRawExpr *expr = precise_exprs.at(j);
+          if (!ObOptimizerUtil::find_item(out_precise_exprs, expr)
+              && OB_FAIL(out_precise_exprs.push_back(expr))) {
+            LOG_WARN("failed to retain exact partition expr", K(ret));
+          }
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && emitted_columns > 0) {
+    common::ObSqlString doc;
+    if (OB_FAIL(doc.append_fmt("{\"%s\":\"%s\",\"%s\":[",
+                               OB_EXT_K_KIND, OB_EXT_KIND_RANGE_SET, OB_EXT_K_COLUMNS))) {
+    } else if (OB_FAIL(doc.append(columns_json.ptr(), columns_json.length()))) {
+    } else if (OB_FAIL(doc.append("]}"))) {
+    } else if (OB_FAIL(copy_out(alloc, doc, out_json))) {
+    }
+  }
+  if (OB_FAIL(ret)) {
+    out_json.reset();
+    out_precise_exprs.reset();
   }
   return ret;
 }

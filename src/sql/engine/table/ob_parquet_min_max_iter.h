@@ -26,6 +26,8 @@ public:
   {}
   virtual ~ObParquetMinMaxIter();
 
+  bool can_handle_task(const ObIExtTblScanTask *task) const override
+  { return can_handle_file_task(task, ObExternalFileFormat::PARQUET_FORMAT); }
   int init(const storage::ObTableScanParam *scan_param) override;
   int get_next_rows(int64_t &count, int64_t capacity) override;
   int get_next_row() override { return common::OB_NOT_SUPPORTED; }
@@ -34,9 +36,12 @@ public:
     return common::OB_ERR_UNEXPECTED;
   }
   virtual void reset() override;
+  int64_t get_next_task_idx() const override { return state_.task_idx_; }
+  int set_next_task_idx(int64_t idx) override { state_.task_idx_ = idx; return OB_SUCCESS; }
 
 private:
-  int next_file();
+  // Stop before consuming another partition once an aggregate has started.
+  int next_file(const ObFileScanTask *partition_task = nullptr);
   int create_file_reader(const ObString &data_path,
                          const ObString file_content_digest,
                          const int64_t file_size,

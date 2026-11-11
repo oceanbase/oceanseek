@@ -112,6 +112,24 @@ protected:
     ASSERT_NE(nullptr, loader_);
   }
 
+  void prepare_char_expr(const VectorFormat format = VEC_DISCRETE,
+                         const ObObjType type = ObCharType,
+                         const ObCollationType collation = CS_TYPE_UTF8MB4_0900_BIN)
+  {
+    FixedGenExprMaker<std::string> maker(BATCH_SIZE, {}, VEC_DISCRETE);
+    static_cast<ExprMaker *>(&maker)->set_frame_idx(0);
+    eval_ctx_.frames_[0] = static_cast<char *>(allocator_.alloc(maker.frame_mem_size()));
+    ASSERT_NE(nullptr, eval_ctx_.frames_[0]);
+    MEMSET(eval_ctx_.frames_[0], 0, maker.frame_mem_size());
+    maker.make(expr_, eval_ctx_);
+    expr_.obj_meta_.set_type(type);
+    expr_.obj_meta_.set_collation_type(collation);
+    expr_.datum_meta_.cs_type_ = collation;
+    expr_.max_length_ = 3;
+    reset_loader(*arrow::utf8(), type, VEC_TC_STRING);
+    ASSERT_EQ(OB_SUCCESS, expr_.init_vector_for_write(eval_ctx_, format, BATCH_SIZE));
+  }
+
   template <typename DecimalBuilder>
   std::shared_ptr<arrow::Array> make_decimal_array(
       const std::shared_ptr<arrow::DataType> &arrow_type,
@@ -418,11 +436,68 @@ TEST_F(TestArrowDataLoader, decimal_layout_mismatch_uses_conversion_path)
   EXPECT_EQ(12345, *reinterpret_cast<const int64_t *>(out_vec->get_payload(0)));
 }
 
+TEST_F(TestArrowDataLoader, char_read_padding_and_trim)
+{
+  const std::vector<std::string> input = {
+      "a", "a ", "a  ", "中", "中 ", "", "   ", " a", "a\t", std::string("a\0", 2)};
+  const std::vector<std::string> padded = {
+      "a  ", "a  ", "a  ", "中  ", "中  ", "   ", "   ", " a ", "a\t ", std::string("a\0 ", 3)};
+  const std::vector<std::string> trimmed = {
+      "a", "a", "a", "中", "中", "", "", " a", "a\t", std::string("a\0", 2)};
+  arrow::StringBuilder builder;
+  for (const auto &value : input) {
+    ASSERT_TRUE(builder.Append(value).ok());
+  }
+  ASSERT_TRUE(builder.AppendNull().ok());
+  std::shared_ptr<arrow::Array> array;
+  ASSERT_TRUE(builder.Finish(&array).ok());
+  for (const auto format : {VEC_DISCRETE, VEC_UNIFORM}) {
+    prepare_char_expr(format);
+    for (const bool pad : {true, false, true}) {
+      ASSERT_EQ(OB_SUCCESS, loader_->load(*array, eval_ctx_, &expr_));
+      ObIVector *vec = expr_.get_vector(eval_ctx_);
+      const char *full_value = vec->get_string(2).ptr();
+      ASSERT_EQ(OB_SUCCESS, normalize_external_char_column(expr_, eval_ctx_, array->length(), pad));
+      for (int64_t i = 0; i < input.size(); ++i) {
+        const ObString value = vec->get_string(i);
+        EXPECT_EQ((pad ? padded : trimmed)[i], std::string(value.ptr(), value.length()));
+      }
+      EXPECT_TRUE(vec->is_null(input.size()));
+      EXPECT_EQ(full_value, vec->get_string(2).ptr());
+      if (pad) {
+        EXPECT_EQ(expr_.get_str_res_mem(eval_ctx_, 3, 0), vec->get_string(0).ptr());
+      }
+    }
+  }
+}
+
+TEST_F(TestArrowDataLoader, char_constant_and_other_string_types)
+{
+  prepare_char_expr(VEC_UNIFORM_CONST);
+  ObIVector *vec = expr_.get_vector(eval_ctx_);
+  vec->set_string(0, "中", 3);
+  ASSERT_EQ(OB_SUCCESS, normalize_external_char_column(expr_, eval_ctx_, BATCH_SIZE, true));
+  EXPECT_EQ(ObString::make_string("中  "), vec->get_string(0));
+  ASSERT_EQ(OB_SUCCESS, normalize_external_char_column(expr_, eval_ctx_, BATCH_SIZE, false));
+  EXPECT_EQ(ObString::make_string("中"), vec->get_string(0));
+  for (const auto type : {ObCharType, ObVarcharType}) {
+    prepare_char_expr(VEC_DISCRETE, type,
+                      type == ObCharType ? CS_TYPE_BINARY : CS_TYPE_UTF8MB4_0900_BIN);
+    vec = expr_.get_vector(eval_ctx_);
+    vec->set_string(0, "a ", 2);
+    for (const bool pad : {true, false}) {
+      ASSERT_EQ(OB_SUCCESS, normalize_external_char_column(expr_, eval_ctx_, 1, pad));
+      EXPECT_EQ(ObString::make_string("a "), vec->get_string(0));
+    }
+  }
+}
+
 } // namespace sql
 } // namespace oceanbase
 
 int main(int argc, char **argv)
 {
+  (void)oceanbase::common::ObCharset::init_charset();
   (void)oceanbase::ObPreProcessSysVars::init_sys_var();
   (void)oceanbase::sql::init_sql_factories();
   ::testing::InitGoogleTest(&argc, argv);

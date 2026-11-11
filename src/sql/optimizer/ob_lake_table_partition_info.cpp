@@ -1695,6 +1695,8 @@ int ObLakeTablePartitionInfo::add_table_file_for_plugin(ObCandiTabletLoc &tablet
       LOG_WARN("failed to copy plugin file url", K(ret));
     } else {
       plugin_file->file_size_ = split_desc->file_size_;
+      plugin_file->assigned_file_bytes_ = split_desc->assigned_file_bytes_;
+      plugin_file->cache_version_ = split_desc->cache_version_;
       plugin_file->part_id_ = split_desc->part_id_;
       plugin_file->record_count_ = split_desc->record_count_;
       plugin_file->reader_type_ = split_desc->reader_type_;

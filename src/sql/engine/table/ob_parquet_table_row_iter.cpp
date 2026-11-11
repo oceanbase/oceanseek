@@ -12,6 +12,7 @@
 #include "sql/engine/basic/ob_arrow_basic.h"
 #include "sql/engine/expr/ob_array_expr_utils.h"
 #include "sql/engine/expr/ob_datum_cast.h"
+#include "sql/engine/expr/ob_expr_column_conv.h"
 #include "sql/engine/table/ob_external_table_pushdown_filter.h"
 #include "sql/engine/expr/ob_array_expr_utils.h"
 #include "sql/resolver/dml/ob_dml_resolver.h"
@@ -66,7 +67,6 @@ ObParquetTableRowIterator::~ObParquetTableRowIterator()
   }
   batch_state_.destroy();
   malloc_allocator_.reset();
-  // reader_profile_.dump_metrics(); // avoid to many logs
   reader_profile_.update_profile();
   parquet_page_mgr_.reset();
   LOG_TRACE("print stat", K(stat_), K(mode_));
@@ -76,7 +76,6 @@ int ObParquetTableRowIterator::init(const storage::ObTableScanParam *scan_param)
 {
   int ret = OB_SUCCESS;
   ObEvalCtx &eval_ctx = scan_param->op_->get_eval_ctx();
-  filter_eval_inited_ = false;
   mem_attr_ = ObMemAttr(MTL_ID(), "ParquetRowIter");
   allocator_.set_attr(mem_attr_);
   str_res_mem_.set_attr(mem_attr_);
@@ -140,6 +139,39 @@ int ObParquetTableRowIterator::init(const storage::ObTableScanParam *scan_param)
   need_apply_pushdown_filter_ = scan_param->ext_enable_late_materialization_
                                 && nullptr != scan_param->pd_storage_filters_;
   mode_ = FilterCalcMode::FORCE_LAZY_CALC;
+  eager_output_indices_.reuse();
+  common::ObSEArray<bool, 16> physical_output_mask;
+  if (OB_SUCC(ret) && need_apply_pushdown_filter_) {
+    OZ(physical_output_mask.assign(column_sel_mask_));
+    for (int64_t i = 0; OB_SUCC(ret) && i < physical_output_mask.count(); ++i) {
+      if (physical_output_mask.at(i)) {
+        bool has_mapping = false;
+        for (int64_t j = 0; OB_SUCC(ret) && !has_mapping && j < mapping_column_ids_.count(); ++j) {
+          has_mapping = mapping_column_ids_.at(j).second == i;
+        }
+        if (!has_mapping) {
+          ObExpr *source = scan_param->ext_column_dependent_exprs_->at(i);
+          if (nullptr != source && T_FUN_COLUMN_CONV == source->type_
+              && (ObExprColumnConv::PARAMS_COUNT_WITHOUT_COLUMN_INFO == source->arg_cnt_
+                  || ObExprColumnConv::PARAMS_COUNT_WITH_COLUMN_INFO == source->arg_cnt_)
+              && nullptr != source->args_) {
+            source = source->args_[ObExprColumnConv::VALUE_EXPR];
+          }
+          // Only registered metadata supplied by the Parquet filler has no physical reader.
+          // Keep other missing mappings visible to generate_lazy_exprs() and its fallback.
+          if (nullptr != source
+              && (T_PSEUDO_PARTITION_LIST_COL == source->type_
+                  || T_PSEUDO_EXTERNAL_FILE_URL == source->type_)
+              && has_exist_in_array(file_meta_column_exprs_, source)) {
+            OZ(eager_output_indices_.push_back(i));
+            if (OB_SUCC(ret)) {
+              physical_output_mask.at(i) = false;
+            }
+          }
+        }
+      }
+    }
+  }
   if (OB_SUCC(ret)) {
     if (!need_apply_pushdown_filter_) {
       // Full materialization is the default path.
@@ -157,7 +189,7 @@ int ObParquetTableRowIterator::init(const storage::ObTableScanParam *scan_param)
     } else if (FALSE_IT(lib::ob_sort(eager_columns_.begin(), eager_columns_.end()))) {
     } else if (OB_FAIL(ObExternalTablePushdownFilter::generate_lazy_exprs(mapping_column_ids_,
                                                                           column_exprs_,
-                                                                          column_sel_mask_))) {
+                                                                          physical_output_mask))) {
       if (OB_SEARCH_NOT_FOUND != ret) {
         LOG_WARN("failed to gather lazy exprs", K(ret));
       } else {
@@ -169,7 +201,6 @@ int ObParquetTableRowIterator::init(const storage::ObTableScanParam *scan_param)
     }
 
     if (OB_SUCC(ret)) {
-      eager_output_indices_.reuse();
       for (int64_t eager_idx = 0;
            OB_SUCC(ret) && use_late_materialization() && eager_idx < eager_columns_.count();
            ++eager_idx) {
@@ -231,7 +262,7 @@ int ObParquetTableRowIterator::init(const storage::ObTableScanParam *scan_param)
 
   OZ(ObExternalTableRowIterator::init_default_batch(file_column_exprs_));
   if (is_iceberg_lake_table()) {
-    OZ(ObExternalTableRowIterator::init_for_iceberg(&options_));
+    OZ(ObExternalTableRowIterator::init_delete_bitmap(&options_));
   }
 
   if (OB_SUCC(ret) && OB_ISNULL(bit_vector_cache_)) {
@@ -296,18 +327,7 @@ int ObParquetTableRowIterator::init_read_props()
   read_props_.enable_buffered_stream();
 
   if (options_.enable_parquet_page_cache_) {
-    IsEnablePageMgrFunctor is_enable_page_mgr_functor{this};
-    PageMgrReadPageFunctor page_mgr_read_page_functor{&parquet_page_mgr_};
-    PageMgrReleasePageFunctor page_mgr_release_page_functor{&parquet_page_mgr_};
-    PageMgrCachePageFunctor page_mgr_cache_page_functor{&parquet_page_mgr_};
-    PageMgrCheckPageSelectedFunctor page_mgr_check_page_selected_functor{&parquet_page_mgr_};
-
-    read_props_.set_is_enable_page_mgr_func(is_enable_page_mgr_functor);
-    read_props_.set_page_mgr_read_page_func(page_mgr_read_page_functor);
-    read_props_.set_page_mgr_release_page_func(page_mgr_release_page_functor);
-    read_props_.set_page_mgr_cache_page_func(page_mgr_cache_page_functor);
-    read_props_.set_page_mgr_check_page_selected_func(page_mgr_check_page_selected_functor);
-    read_props_.set_is_eager_access(false);
+    parquet_page_mgr_.register_reader_callbacks(read_props_);
   }
   return ret;
 }
@@ -439,7 +459,7 @@ int ObParquetTableRowIterator::next_file()
   int ret = OB_SUCCESS;
   ObEvalCtx &eval_ctx = scan_param_->op_->get_eval_ctx();
   ObString location = scan_param_->external_file_location_;
-  int64_t task_idx = 0;
+  int64_t task_idx = -1;
   int64_t file_size = -1;
   arrow::Status status = arrow::Status::OK();
   bool is_count_aggr = file_column_exprs_.count() == 0;
@@ -452,8 +472,8 @@ int ObParquetTableRowIterator::next_file()
     file_meta_.reset();
     file_reader_.reset();
     status = arrow::Status::OK();
-    if ((task_idx = state_.file_idx_++) >= scan_param_->scan_tasks_.count()) {
-      ret = OB_ITER_END;
+    if (OB_FAIL(go_next_task_idx(state_, task_idx))) {
+      // OB_NOT_THE_OBJECT leaves the shared cursor unchanged; EOF exhausts the stream.
     }
     if (OB_FAIL(ret)) {
     } else {
@@ -571,8 +591,8 @@ int ObParquetTableRowIterator::next_file()
         // Resolve this for every file because an evolved spec may use identity for the column
         // while another spec does not. A manifest hit bypasses the physical Parquet column;
         // a miss preserves the original physical-column/default-value fallback.
-        if (OB_FAIL(get_iceberg_identity_partition_value(
-                file_column_exprs_.at(i)->extra_, state_, partition_value))) {
+        if (use_iceberg_manifest_partition_value() && OB_FAIL(ObIcebergScanTask::get_identity_partition_value(
+                file_column_exprs_.at(i)->extra_, state_.part_list_val_, partition_value))) {
           LOG_WARN("failed to get iceberg identity partition value", K(ret), K(i));
         } else {
           identity_partition_values_.at(i) = partition_value;
@@ -652,7 +672,7 @@ int ObParquetTableRowIterator::next_file()
       LOG_WARN("failed to prepare allocate column metas");
     } else if (OB_FAIL(column_ids.prepare_allocate(mapping_column_ids_.count()))) {
       LOG_WARN("failed to prepare allocate column ids");
-    } 
+    }
     for (int64_t i = 0; OB_SUCC(ret) && i < mapping_column_ids_.count(); ++i) {
       column_ids.at(i) = mapping_column_ids_.at(i).first;
       if (OB_INVALID_ID == mapping_column_ids_.at(i).first) {
@@ -684,7 +704,7 @@ int ObParquetTableRowIterator::next_row_group()
   while (OB_SUCC(ret) && !find_row_group) {
     while (OB_SUCC(ret) && state_.cur_row_group_idx_ > state_.end_row_group_idx_) {
       if (OB_FAIL(next_file())) {
-        if (OB_ITER_END != ret) {
+        if (!is_task_boundary(ret)) {
           LOG_WARN("fail to next row group", K(ret));
         }
       }
@@ -696,7 +716,7 @@ int ObParquetTableRowIterator::next_row_group()
       }
       bool is_count_aggr = file_column_exprs_.count() == 0;
       if (is_iceberg_lake_table() && is_count_aggr) {
-        int64_t task_idx = state_.file_idx_ - 1;
+        int64_t task_idx = state_.task_idx_ - 1;
         ObIcebergScanTask *iceberg_scan_task =
           static_cast<ObIcebergScanTask *>(scan_param_->scan_tasks_.at(task_idx));
         if (OB_ISNULL(iceberg_scan_task)) {
@@ -708,7 +728,7 @@ int ObParquetTableRowIterator::next_row_group()
           LOG_WARN("failed to read position delete", K(ret));
         } else {
           state_.cur_row_group_row_count_ = iceberg_scan_task->record_count_;
-          state_.cur_row_group_row_count_ -= 
+          state_.cur_row_group_row_count_ -=
             iceberg_scan_task->delete_files_.count() > 0 ? delete_bitmap_->get_cardinality() : 0;
           state_.is_delete_file_loaded_ = true;
           state_.logical_read_row_count_ = 0;
@@ -763,7 +783,7 @@ int ObParquetTableRowIterator::next_row_group()
           } else if (is_iceberg_lake_table() && !state_.is_delete_file_loaded_) {
             // TODO: Skip the selected Parquet row group before column/page preparation when
             // delete_bitmap_ covers all of its rows.
-            if (OB_FAIL(build_delete_bitmap(state_.cur_file_url_, state_.file_idx_ - 1))) {
+            if (OB_FAIL(build_delete_bitmap(state_.cur_file_url_, state_.task_idx_ - 1))) {
               LOG_WARN("failed to read position delete", K(ret));
             } else {
               state_.is_delete_file_loaded_ = true;
@@ -774,16 +794,16 @@ int ObParquetTableRowIterator::next_row_group()
             LOG_WARN("failed to prepare bitmap", K(ret));
           } else if (OB_FAIL(prepare_page_index(cur_row_group, rg_reader))) {
             LOG_WARN("failed to prepare page index", K(ret));
-          } else if (options_.enable_prebuffer_) {
-            if (is_enable_rg_parquet_page_mgr()) {
-              if (OB_FAIL(prepare_parquet_page_mgr())) {
-                LOG_WARN("failed to prepare parquet page mgr");
+          } else if (parquet_page_mgr_.is_direct_read_enabled()) {
+            if (is_with_offset_index_read_enabled()) {
+              if (OB_FAIL(prepare_page_mgr_with_offset_index())) {
+                LOG_WARN("failed to prepare PageMgr with OffsetIndex");
               }
-            } else {
-              if (OB_FAIL(pre_buffer(rg_reader))) {
-                LOG_WARN("failed to pre buffer", K(ret));
-              }
+            } else if (OB_FAIL(prefetch_columns_without_offset_index(rg_reader))) {
+              LOG_WARN("failed to prefetch columns without OffsetIndex", K(ret));
             }
+          } else if (options_.enable_prebuffer_ && OB_FAIL(pre_buffer(rg_reader))) {
+            LOG_WARN("failed to pre buffer", K(ret));
           }
         }
       }
@@ -958,7 +978,7 @@ int ObParquetTableRowIterator::DataLoader::get_column_idx_by_node(
 {
   int ret = OB_SUCCESS;
   int column_idx = -1;
-  if (node_to_column_idx.empty()) { 
+  if (node_to_column_idx.empty()) {
     for (int i = 0; OB_SUCC(ret) && i < file_metadata->num_columns(); i++) {
       const ::parquet::schema::Node *root_node =
         file_metadata->schema()->Column(i)->schema_node().get();
@@ -1119,7 +1139,7 @@ ObParquetTableRowIterator::DataLoader::select_load_function(
       func = NULL;
     }
   } else if ((no_log_type || log_type->is_string() || log_type->is_enum() || log_type->is_JSON())
-             && (ob_is_string_type(datum_type.type_) || ObRawType == datum_type.type_ 
+             && (ob_is_string_type(datum_type.type_) || ObRawType == datum_type.type_
                || ob_is_large_text(datum_type.type_) || (lib::is_mysql_mode() && ob_is_json(datum_type.type_)))) {
     //convert parquet enum/string to string vector
     if (parquet::Type::BYTE_ARRAY == phy_type) {
@@ -2767,7 +2787,7 @@ int ObParquetTableRowIterator::DataLoader::recursively_load_parquet_col_to_attr(
                       attrs[attrs_idx]->get_str_res_mem(eval_ctx_, sizeof(uint8_t) * levels_count));
     uint32_t *values = reinterpret_cast<uint32_t *>(
                       attrs[attrs_idx + 1]->get_str_res_mem(eval_ctx_, values_size));
-    
+
     bool set_innermost_value = max_def_level == record_reader_->descr()->max_definition_level();
     if (OB_ISNULL(nulls) || OB_ISNULL(values)) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -3061,7 +3081,7 @@ int ObParquetTableRowIterator::DataLoader::load_map()
   ObEvalCtx::TempAllocGuard tmp_alloc_g(eval_ctx_);
   ObArenaAllocator &allocator = tmp_alloc_g.get_allocator();
   ObArrayWrap<uint32_t> key_offsets;
-  
+
   CK (0 < collection_readers_->count());
   CK (VEC_DISCRETE == array_vec->get_format());
 
@@ -3097,12 +3117,15 @@ int ObParquetTableRowIterator::DataLoader::load_map()
 int ObParquetTableRowIterator::get_next_rows(int64_t &count, int64_t capacity)
 {
   int ret = OB_SUCCESS;
+  count = 0;
   ObEvalCtx &eval_ctx = scan_param_->op_->get_eval_ctx();
   BatchReadState &batch = batch_state_;
   ObMallocHookAttrGuard guard(mem_attr_);
 
-  if (OB_FAIL(read_next_batch(capacity, eval_ctx, batch))) {
-    if (OB_ITER_END != ret) {
+  if (capacity <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(read_next_batch(capacity, eval_ctx, batch))) {
+    if (!is_task_boundary(ret)) {
       LOG_WARN("failed to read next batch", K(ret));
     }
   }
@@ -3110,7 +3133,7 @@ int ObParquetTableRowIterator::get_next_rows(int64_t &count, int64_t capacity)
     count = batch.row_count_;
     reader_metrics_.read_rows_count_ += batch.row_count_;
     stat_.projected_lazy_cnt_ = reader_metrics_.read_rows_count_;
-  } else if (OB_UNLIKELY(OB_ITER_END != ret)) {
+  } else if (OB_UNLIKELY(!is_task_boundary(ret))) {
     LOG_WARN("fail to get next rows from parquet file", K(ret), K(state_));
   }
   return ret;
@@ -3123,8 +3146,8 @@ int ObParquetTableRowIterator::get_next_row()
 }
 
 void ObParquetTableRowIterator::reset() {
-  // reset state_ to initial values for rescan
   state_.reuse();
+  filter_eval_initializer_.reset();
   file_prebuffer_.destroy();
   page_skip_ranges_.destroy();
   page_selected_read_ranges_.destroy();
@@ -3134,7 +3157,6 @@ void ObParquetTableRowIterator::reset() {
     rg_bitmap_ = nullptr;
   }
   batch_state_.reuse();
-  filter_eval_inited_ = false;
   parquet_page_mgr_.reset();
   sample_cumulative_block_offset_ = 0;
 }
@@ -3609,7 +3631,7 @@ int ObParquetTableRowIterator::ParquetMinMaxFilterParamBuilder::build(const int3
     if (stat->HasMinMax()) {
       if (OB_FAIL(ObParquetTableRowIterator::read_min_max_datum(min_val, max_val,
                                             parquet_type, log_type,
-                                            column_meta, sort_order, 
+                                            column_meta, sort_order,
                                             row_iter_->scan_param_->op_->get_eval_ctx(),
                                             param.min_datum_, param.max_datum_, tmp_alloc_))) {
         LOG_WARN("failed to read min/max value", K(ret));
@@ -3698,7 +3720,10 @@ int ObParquetTableRowIterator::ParquetPageMinMaxFilterParamBuilder::next_range(c
     }
     std::shared_ptr<parquet::OffsetIndex> offset_index
                             = rg_page_index_reader_->GetOffsetIndex(column_id);
-    if (++page_id_ >= offset_index->page_locations().size()) {
+    if (nullptr == offset_index) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("failed to get offset index", K(ret), K(column_id));
+    } else if (++page_id_ >= offset_index->page_locations().size()) {
       ret = OB_ITER_END;
       LOG_TRACE("no range left", K(ret), K(page_id_),
                                  K(offset_index->page_locations().size()));
@@ -3787,7 +3812,45 @@ int ObParquetTableRowIterator::pre_buffer(std::shared_ptr<parquet::RowGroupReade
   return ret;
 }
 
-int ObParquetTableRowIterator::prepare_parquet_page_mgr()
+int ObParquetTableRowIterator::prefetch_columns_without_offset_index(
+    std::shared_ptr<parquet::RowGroupReader> rg_reader)
+{
+  int ret = OB_SUCCESS;
+  arrow::Status status = arrow::Status::OK();
+  BEGIN_CATCH_EXCEPTIONS
+  // Submit filtering columns first, then projected columns, without waiting for IO.
+  for (int64_t pass = 0; OB_SUCC(ret) && pass < 2; ++pass) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < column_indexs_.count(); ++i) {
+      bool is_eager = !use_late_materialization();
+      for (int64_t j = 0; !is_eager && j < eager_columns_.count(); ++j) {
+        is_eager = i == eager_columns_.at(j);
+      }
+      if (column_indexs_.at(i) >= 0 && is_eager == (pass == 0)) {
+        std::unique_ptr<parquet::ColumnChunkMetaData> metadata
+            = rg_reader->metadata()->ColumnChunk(column_indexs_.at(i));
+        int64_t offset = metadata->data_page_offset();
+        if (metadata->has_dictionary_page() && metadata->dictionary_page_offset() > 0
+            && metadata->dictionary_page_offset() < offset) {
+          offset = metadata->dictionary_page_offset();
+        }
+        const int64_t length = metadata->total_compressed_size();
+        if (length > 0) {
+          if (OB_UNLIKELY(offset < 0 || offset > INT64_MAX - length)) {
+            ret = OB_INVALID_ARGUMENT;
+          } else if (OB_FAIL(
+                         parquet_page_mgr_.prefetch_column_without_offset_index(offset,
+                                                                                offset + length))) {
+            LOG_WARN("failed to prefetch parquet column", K(ret), K(offset), K(length));
+          }
+        }
+      }
+    }
+  }
+  END_CATCH_EXCEPTIONS
+  return ret;
+}
+
+int ObParquetTableRowIterator::prepare_page_mgr_with_offset_index()
 {
   int ret = OB_SUCCESS;
   // 收集每个 column 被选中的 page 的 ReadRange
@@ -3837,20 +3900,20 @@ int ObParquetTableRowIterator::prepare_parquet_page_mgr()
 
   if (OB_SUCC(ret)) {
     if (!selected_page_read_ranges.empty()) {
-      if (OB_FAIL(parquet_page_mgr_.init_with_new_row_group(selected_page_read_ranges))) {
-        LOG_WARN("failed to init parquet page mgr", K(ret));
+      if (OB_FAIL(parquet_page_mgr_.init_pages_with_offset_index(selected_page_read_ranges))) {
+        LOG_WARN("failed to init pages with OffsetIndex", K(ret));
       } else {
         // 按照物理 offset 顺序，依次触发每一个列的第一个 page 的 offset
         lib::ob_sort(each_eager_column_first_page_offsets.begin(), each_eager_column_first_page_offsets.end());
         for (int64_t i = 0; OB_SUCC(ret) && i < each_eager_column_first_page_offsets.count(); i++) {
-          if (OB_FAIL(parquet_page_mgr_.try_to_prefetch_by_offset(each_eager_column_first_page_offsets[i]))) {
+          if (OB_FAIL(parquet_page_mgr_.prefetch_page_with_offset_index(each_eager_column_first_page_offsets[i]))) {
             LOG_WARN("failed to prefetch eager page", K(i));
           }
         }
 
         lib::ob_sort(each_column_first_page_offsets.begin(), each_column_first_page_offsets.end());
         for (int64_t i = 0; OB_SUCC(ret) && i < each_column_first_page_offsets.count(); i++) {
-          if (OB_FAIL(parquet_page_mgr_.try_to_prefetch_by_offset(each_column_first_page_offsets[i]))) {
+          if (OB_FAIL(parquet_page_mgr_.prefetch_page_with_offset_index(each_column_first_page_offsets[i]))) {
             LOG_WARN("failed to prefetch page", K(ret), K(i));
           }
         }
@@ -4055,74 +4118,6 @@ int ObParquetTableRowIterator::compact_read_plan(const ReadPlan &plan,
     LOG_WARN("failed to compact parquet read plan", K(ret), K(read_count));
   } else if (nullptr != plan.compaction_rows() && only_lazy_file_columns) {
     ++stat_.selection_lazy_decode_batch_cnt_;
-  }
-  return ret;
-}
-
-int ObParquetTableRowIterator::init_filter_evaluated_datums(ObPushdownFilterExecutor *curr_filter)
-{
-  int ret = OB_SUCCESS;
-  bool filter_valid = true;
-  bool is_stack_overflow = false;
-  if (OB_FAIL(check_stack_overflow(is_stack_overflow))) {
-    LOG_WARN("failed to check stack overflow", K(ret));
-  } else if (is_stack_overflow) {
-    ret = OB_SIZE_OVERFLOW;
-    LOG_WARN("too deep recursive", K(ret), K(is_stack_overflow));
-  } else if (OB_ISNULL(curr_filter)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("unexpected null filter", K(ret));
-  } else if (curr_filter->is_filter_node()) {
-    if (curr_filter->is_filter_black_node()) {
-      if (OB_FAIL(curr_filter->init_evaluated_datums(filter_valid))) {
-        LOG_WARN("failed to init eval datum", K(ret));
-      } else if (!filter_valid) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("filter is invalid", K(ret), K(curr_filter->is_logic_op_node()));
-      }
-    } else if (curr_filter->is_filter_white_node()) {
-      ObWhiteFilterExecutor *white_filter = static_cast<ObWhiteFilterExecutor *>(curr_filter);
-      ObWhiteFilterOperatorType op_type = white_filter->get_op_type();
-      if (WHITE_OP_IN == op_type) {
-        if (OB_FAIL(white_filter->init_in_eval_datums(filter_valid))) {
-          LOG_WARN("failed to init eval datum", K(ret));
-        }
-      } else if (OB_FAIL(white_filter->init_compare_eval_datums(filter_valid))) {
-        LOG_WARN("failed to init eval datum", K(ret));
-      }
-
-      if (OB_FAIL(ret)) {
-      } else if (!filter_valid) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("filter is invalid", K(ret), K(curr_filter->is_logic_op_node()));
-      }
-    } else {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("filter is invalid", K(ret), K(curr_filter->is_logic_op_node()));
-    }
-  } else if (curr_filter->is_logic_op_node()) {
-    sql::ObPushdownFilterExecutor **children = curr_filter->get_childs();
-    for (uint32_t i = 0; OB_SUCC(ret) && i < curr_filter->get_child_count(); ++i) {
-      if (OB_ISNULL(children[i])) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("Unexpected null child filter", K(ret), K(i));
-      } else if (OB_FAIL(init_filter_evaluated_datums(children[i]))) {
-        LOG_WARN("failed to init child eval datum", K(ret), K(i), KP(children[i]));
-      }
-    }
-  }
-  return ret;
-}
-
-int ObParquetTableRowIterator::ensure_filter_eval_inited_once(ObPushdownFilterExecutor *root_filter)
-{
-  int ret = OB_SUCCESS;
-  if (OB_ISNULL(root_filter)) {
-  } else if (filter_eval_inited_) {
-  } else if (OB_FAIL(init_filter_evaluated_datums(root_filter))) {
-    LOG_WARN("failed to init filter evaluated datums", K(ret));
-  } else {
-    filter_eval_inited_ = true;
   }
   return ret;
 }
@@ -5242,12 +5237,33 @@ int ObParquetTableRowIterator::prepare_page_index(const int64_t cur_row_group,
                                                   std::shared_ptr<parquet::RowGroupReader> rg_reader)
 {
   int ret = OB_SUCCESS;
+  rg_page_index_reader_.reset();
   try {
     if (nullptr == page_index_reader_ ) {
       LOG_TRACE("do not have page index reader", K(cur_row_group));
     } else if (nullptr == (rg_page_index_reader_ = page_index_reader_->RowGroup(cur_row_group))) {
       LOG_TRACE("do not have page index reader", K(cur_row_group),
                                   K(state_.cur_row_group_idx_), K(state_.end_row_group_idx_));
+    } else {
+      // OffsetIndex is optional per ColumnChunk, so a row group can contain both indexed and
+      // non-indexed selected columns. The current PageMgr needs exact page ranges for every
+      // physical column; if any selected column has no OffsetIndex, the entire row group uses the
+      // WITHOUT_OFFSET_INDEX path. A finer-grained design could follow StarRocks: keep the base
+      // reader for columns without an index and decorate indexed columns with
+      // StoredColumnReaderWithIndex.
+      bool has_physical_column = false;
+      bool all_columns_have_offset_index = true;
+      for (int64_t i = 0; all_columns_have_offset_index && i < column_indexs_.count(); ++i) {
+        const int64_t column_idx = column_indexs_.at(i);
+        if (column_idx >= 0) {
+          has_physical_column = true;
+          all_columns_have_offset_index
+              = nullptr != rg_page_index_reader_->GetOffsetIndex(column_idx);
+        }
+      }
+      if (!has_physical_column || !all_columns_have_offset_index) {
+        rg_page_index_reader_.reset();
+      }
     }
   } catch(const std::exception& e) {
     ret = OB_ERR_UNEXPECTED;
@@ -5257,6 +5273,7 @@ int ObParquetTableRowIterator::prepare_page_index(const int64_t cur_row_group,
     LOG_WARN("unexpected index", K(ret), K(cur_row_group));
   }
   if (OB_SUCC(ret)) {
+    parquet_page_mgr_.configure_row_group_read_mode(nullptr != rg_page_index_reader_);
     const bool is_block_sample = scan_param_->sample_info_.is_block_sample();
     const int64_t rg_num_rows = file_meta_->RowGroup(cur_row_group)->num_rows();
     int64_t sample_sel_rows = 0;
@@ -5296,8 +5313,8 @@ int ObParquetTableRowIterator::prepare_page_index(const int64_t cur_row_group,
         for (int i = 0; OB_SUCC(ret) && i < column_indexs_.count(); i++) {
           if (column_indexs_.at(i) >= 0) {
             std::unique_ptr<parquet::PageReader> page_reader
-                = rg_reader->GetColumnPageReader(column_indexs_.at(i));
-            if (is_enable_rg_parquet_page_mgr()) {
+                          = rg_reader->GetColumnPageReader(column_indexs_.at(i));
+            if (is_with_offset_index_read_enabled()) {
               SkipPageCallback skip_page_callback(cur_col_id_,
                                                   state_.read_row_counts_,
                                                   all_column_page_locations_,
@@ -5440,11 +5457,11 @@ int ObParquetTableRowIterator::update_load_funcs_for_dict_optimization()
   return ret;
 }
 
-bool ObParquetTableRowIterator::is_enable_rg_parquet_page_mgr() const
+bool ObParquetTableRowIterator::is_with_offset_index_read_enabled() const
 {
-  // A row group can use the page manager only when page cache and page index are both available.
-  // The unified reader stack consumes each physical column once, so eager/lazy phases do not
-  // require an additional duplicate-read check here.
+  // The WithOffsetIndex path requires page cache plus complete OffsetIndex coverage. The unified
+  // reader stack consumes each physical column once, so eager/lazy phases need no extra
+  // duplicate-read check here.
   return options_.enable_parquet_page_cache_ && (page_index_reader_ != NULL)
          && (rg_page_index_reader_ != NULL);
 }
@@ -5537,8 +5554,17 @@ int ObParquetTableRowIterator::calc_column_convert(const int64_t read_count,
                  K(mapping_column_ids_.count()));
       } else {
         const int64_t column_expr_idx = mapping_column_ids_.at(file_column_idx).second;
-        OZ(calc_column_convert_expr(read_count, column_expr_idx, eval_ctx));
+        if (ColumnConvertScope::EAGER_COLUMNS != scope
+            || column_expr_idx < 0 || column_expr_idx >= column_sel_mask_.count()
+            || !column_sel_mask_.at(column_expr_idx)) {
+          OZ(calc_column_convert_expr(read_count, column_expr_idx, eval_ctx));
+        }
       }
+    }
+    // Convert all eager outputs, including metadata, before filtering and compaction.
+    for (int64_t i = 0; OB_SUCC(ret) && ColumnConvertScope::EAGER_COLUMNS == scope
+                        && i < eager_output_indices_.count(); ++i) {
+      OZ(calc_column_convert_expr(read_count, eager_output_indices_.at(i), eval_ctx));
     }
     if (OB_SUCC(ret) && scope == ColumnConvertScope::EAGER_COLUMNS
         && OB_FAIL(calc_meta_column_convert(read_count, eval_ctx))) {
@@ -5557,7 +5583,7 @@ int ObParquetTableRowIterator::read_source_batch(
   int ret = OB_SUCCESS;
   if (state_.logical_read_row_count_ >= state_.cur_row_group_row_count_) {
     if (OB_FAIL(next_row_group())) {
-      if (OB_ITER_END != ret) {
+      if (!is_task_boundary(ret)) {
         LOG_WARN("fail to next row group", K(ret));
       }
     }
@@ -5603,7 +5629,7 @@ int ObParquetTableRowIterator::read_next_batch(const int64_t capacity,
       use_late = reads_projected_columns && use_late_materialization();
       // 1. Read the raw source batch.
       if (OB_FAIL(read_source_batch(capacity, use_late, batch))) {
-        if (OB_ITER_END != ret) {
+        if (!is_task_boundary(ret)) {
           LOG_WARN("failed to read parquet source batch", K(ret));
         }
       } else if (batch.row_count_ > 0) {
@@ -5640,7 +5666,7 @@ int ObParquetTableRowIterator::read_next_batch(const int64_t capacity,
   return ret;
 }
 
-// Materialize filter-visible expressions, evaluate the filter tree, and apply its selection.
+// Materialize filter-visible expressions, evaluate the filter, and apply its selection.
 int ObParquetTableRowIterator::materialize_and_filter_rows(
     BatchReadState &batch,
     ObEvalCtx &eval_ctx,
@@ -5670,13 +5696,19 @@ int ObParquetTableRowIterator::materialize_and_filter_rows(
   } else if (OB_FAIL(calc_exprs_for_rowid(batch.row_count_, state_))) {
     LOG_WARN("failed to calc parquet rowid expressions", K(ret));
   } else if (OB_NOT_NULL(filter)) {
-    if (OB_FAIL(ensure_filter_eval_inited_once(filter))) {
+    if (OB_FAIL(filter_eval_initializer_.ensure_filter_eval_inited_once(filter, scan_param_))) {
       LOG_WARN("failed to init parquet filter evaluated datums once", K(ret));
     } else if (OB_FAIL(calc_filters(batch.row_count_, filter, nullptr))) {
       LOG_WARN("failed to evaluate parquet filters", K(ret));
     } else if (OB_ISNULL(filter_selection = filter->get_result())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected null parquet filter result", K(ret));
+    }
+  } else if (OB_ISNULL(scan_param_->pd_storage_filters_)
+             && scan_param_->ext_enable_late_materialization_
+             && OB_NOT_NULL(scan_param_->op_filters_) && !scan_param_->op_filters_->empty()) {
+    if (OB_FAIL(calc_op_filters(batch.row_count_, *bit_vector_cache_, filter_selection))) {
+      LOG_WARN("failed to evaluate parquet scan expressions", K(ret));
     }
   }
   if (OB_FAIL(ret)) {
@@ -6430,10 +6462,6 @@ DEF_TO_STRING(ObParquetIteratorState)
 {
   int64_t pos = 0;
   J_OBJ_START();
-  J_NAME("ob_external_iterator_state");
-  J_COLON();
-  pos += ObExternalIteratorState::to_string(buf + pos, buf_len - pos);
-  J_COMMA();
   J_KV(K_(row_group_idx), K_(cur_row_group_idx), K_(end_row_group_idx), K_(cur_row_group_row_count));
   J_OBJ_END();
   return pos;

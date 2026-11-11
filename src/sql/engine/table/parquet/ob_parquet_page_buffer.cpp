@@ -71,9 +71,68 @@ int ObCoalescedBuffer::wait(ObLakeTableParquetPageMgrMetrics &metrics)
   return ret;
 }
 
+int ObCoalescedBuffer::slice(const std::shared_ptr<ObCoalescedBuffer> &owner,
+                             const int64_t offset,
+                             const int64_t length,
+                             ObLakeTableParquetPageMgrMetrics &metrics,
+                             std::shared_ptr<arrow::Buffer> &buffer)
+{
+  int ret = OB_SUCCESS;
+  buffer.reset();
+  if (OB_UNLIKELY(!owner || nullptr == owner->buf_ || offset < 0 || length <= 0
+                  || offset >= owner->length_ || length > owner->length_ - offset)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid parquet buffer slice", K(ret), K(offset), K(length));
+  } else if (OB_FAIL(owner->wait(metrics))) {
+    LOG_WARN("failed to wait for parquet buffer", K(ret));
+  } else {
+    try {
+      buffer = std::make_shared<ObParquetReadBuffer>(owner, offset, length);
+    } catch (const std::bad_alloc &) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate parquet slice", K(ret));
+    }
+  }
+  return ret;
+}
+
 int64_t ObCoalescedBuffer::end() const
 {
   return offset_ + length_;
+}
+
+int ObParquetCacheBackedArrowBuffer::create(const ObExternalDataPageCacheValueHandle &cache_handle,
+                                            std::shared_ptr<arrow::Buffer> &buffer)
+{
+  int ret = OB_SUCCESS;
+  buffer.reset();
+  ObExternalDataPageCacheValue *value = cache_handle.value_;
+  if (OB_ISNULL(value) || OB_UNLIKELY(!value->is_valid())) {
+    ret = OB_INVALID_DATA;
+    LOG_WARN("invalid parquet page cache value", K(ret));
+  } else {
+    try {
+      std::shared_ptr<ObParquetCacheBackedArrowBuffer> cached_buffer
+          = std::make_shared<ObParquetCacheBackedArrowBuffer>(
+              reinterpret_cast<const uint8_t *>(value->get_buffer()),
+              value->get_valid_data_size());
+      if (OB_FAIL(cached_buffer->cache_handle_.assign(cache_handle))) {
+        LOG_WARN("failed to pin parquet page cache value", K(ret));
+      } else {
+        buffer = std::move(cached_buffer);
+      }
+    } catch (const std::bad_alloc &) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate cached parquet buffer", K(ret));
+    }
+  }
+  return ret;
+}
+
+ObParquetCachedPageBuffer::ObParquetCachedPageBuffer(std::shared_ptr<arrow::Buffer> buffer,
+                                                     bool is_decompressed)
+    : buffer_(std::move(buffer)), is_decompressed_(is_decompressed)
+{
 }
 
 int ObParquetCachedPageBuffer::get_arrow_buffer(ObLakeTableParquetPageMgrMetrics &metrics,
@@ -83,57 +142,34 @@ int ObParquetCachedPageBuffer::get_arrow_buffer(ObLakeTableParquetPageMgrMetrics
 {
   UNUSED(metrics);
   int ret = OB_SUCCESS;
-  ObExternalDataPageCacheValue *value = cache_handle_.value_;
-  if (OB_ISNULL(value)) {
+  buffer.reset();
+  is_cache_hit = false;
+  is_decompressed = false;
+  if (OB_ISNULL(buffer_.get())) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("cached data is null");
-  } else if (OB_UNLIKELY(!value->is_valid())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("cached data is invalid");
+    LOG_WARN("cached parquet buffer is null", K(ret));
   } else {
+    buffer = buffer_;
     is_cache_hit = true;
-    is_decompressed = value->is_decompressed();
-    buffer = std::make_shared<arrow::Buffer>(reinterpret_cast<uint8_t *>(value->get_buffer()),
-                                             value->get_valid_data_size());
+    is_decompressed = is_decompressed_;
   }
   return ret;
 }
 
 ObParquetPageBufferSlice::ObParquetPageBufferSlice(
-    ObCoalescedBuffer *coalesced_buffer,
+    std::shared_ptr<ObCoalescedBuffer> coalesced_buffer,
     int64_t offset,
     int64_t length)
-    : coalesced_buffer_(coalesced_buffer), offset_(offset), length_(length)
+    : coalesced_buffer_(std::move(coalesced_buffer)), offset_(offset), length_(length)
 {
-}
-
-ObParquetPageBufferSlice::~ObParquetPageBufferSlice()
-{
-  if (OB_NOT_NULL(coalesced_buffer_)) {
-    coalesced_buffer_->ref_counts_--;
-  }
 }
 
 int ObParquetPageBufferSlice::get_arrow_buffer(ObLakeTableParquetPageMgrMetrics &metrics,
   std::shared_ptr<arrow::Buffer> &buffer, bool &is_cache_hit, bool &is_decompressed)
 {
-  int ret = OB_SUCCESS;
-  if (OB_ISNULL(coalesced_buffer_) || OB_ISNULL(coalesced_buffer_->buf_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("coalesced buffer is null");
-  } else if (OB_UNLIKELY((offset_ + length_) > coalesced_buffer_->length_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("invalid offset/length", K(offset_), K(length_));
-  } else if (OB_FAIL(coalesced_buffer_->wait(metrics))) {
-    LOG_WARN("coalesced buffer wait failed", K(ret));
-  } else {
-    is_cache_hit = false;
-    is_decompressed = false;
-    buffer = std::make_shared<arrow::Buffer>(
-        reinterpret_cast<uint8_t *>(coalesced_buffer_->buf_ + offset_),
-        length_);
-  }
-  return ret;
+  is_cache_hit = false;
+  is_decompressed = false;
+  return ObCoalescedBuffer::slice(coalesced_buffer_, offset_, length_, metrics, buffer);
 }
 
 } // namespace sql

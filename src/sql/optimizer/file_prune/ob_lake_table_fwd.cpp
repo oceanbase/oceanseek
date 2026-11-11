@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL_OPT
 #include "ob_lake_table_fwd.h"
+#include "share/external_table/ob_external_table_part_info.h"
 #include "sql/table_format/iceberg/ob_iceberg_utils.h"
 #include "sql/table_format/iceberg/spec/manifest.h"
 
@@ -238,6 +239,8 @@ int ObOptPluginFile::assign(const ObIOptLakeTableFile &other)
       LOG_WARN("failed to copy plugin file url", K(ret));
     } else {
       file_size_ = plugin_file.file_size_;
+      assigned_file_bytes_ = plugin_file.assigned_file_bytes_;
+      cache_version_ = plugin_file.cache_version_;
       part_id_ = plugin_file.part_id_;
       record_count_ = plugin_file.record_count_;
       reader_type_ = plugin_file.reader_type_;
@@ -249,12 +252,14 @@ int ObOptPluginFile::assign(const ObIOptLakeTableFile &other)
 void ObOptPluginFile::reset()
 {
   ObIOptLakeTableFile::reset();
+  assigned_file_bytes_ = -1;
   plugin_task_json_.reset();
   file_url_.reset();
   file_size_ = 0;
+  cache_version_ = 0;
   part_id_ = OB_INVALID_PARTITION_ID;
   record_count_ = 0;
-  reader_type_ = ObPluginReaderType::INVALID;
+  reader_type_ = ObExternalFileFormat::INVALID_FORMAT;
 }
 
 int ObOptOdpsFile::assign(const ObIOptLakeTableFile &other)
@@ -344,6 +349,51 @@ void ObIcebergScanTask::assign_granule_identity(const int64_t file_id, const uin
   }
 }
 
+int ObIcebergScanTask::get_partition_row(const share::ObExternalTablePartInfoArray *partition_infos,
+                                        const ObNewRow *&partition_row) const
+{
+  int ret = OB_SUCCESS;
+  partition_row = nullptr;
+  if (OB_ISNULL(partition_infos)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("partition array is null", K(ret));
+  } else if (partition_infos->count() == 0) {
+    // An empty array represents an unpartitioned table.
+  } else if (OB_UNLIKELY(part_id_ < 0 || part_id_ >= partition_infos->count())
+             || OB_UNLIKELY(partition_infos->at(part_id_).part_id_ != part_id_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid iceberg partition info", K(ret), K_(part_id), KP(partition_infos));
+  } else {
+    partition_row = &partition_infos->at(part_id_).list_row_value_;
+  }
+  return ret;
+}
+
+int ObIcebergScanTask::get_identity_partition_value(const int64_t source_field_id,
+                                                    const ObNewRow &partition_row,
+                                                    const ObObj *&partition_value)
+{
+  int ret = OB_SUCCESS;
+  partition_value = nullptr;
+  if (OB_UNLIKELY(partition_row.get_count() % 2 != 0)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid iceberg identity partition row", K(ret), K(partition_row.get_count()));
+  } else {
+    for (int64_t i = 0;
+         OB_SUCC(ret) && OB_ISNULL(partition_value) && i < partition_row.get_count();
+         i += 2) {
+      const ObObj &source_id = partition_row.get_cell(i);
+      if (OB_UNLIKELY(!source_id.is_int32())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid iceberg identity source id", K(ret), K(source_id), K(i));
+      } else if (source_field_id == source_id.get_int32()) {
+        partition_value = &partition_row.get_cell(i + 1);
+      }
+    }
+  }
+  return ret;
+}
+
 int ObIcebergScanTask::init_with_opt_lake_table_file(ObIAllocator &allocator,
                                                     const ObIOptLakeTableFile &opt_table_file)
 {
@@ -406,12 +456,84 @@ int ObHiveScanTask::init_with_opt_lake_table_file(ObIAllocator &allocator,
   return ret;
 }
 
-OB_SERIALIZE_MEMBER((ObPluginScanTask, ObFileScanTask),
-                    part_id_,
-                    plugin_task_json_,
-                    record_count_,
-                    reader_type_,
-                    assigned_file_bytes_);
+// Keep the reader values already used in serialized plugin tasks. FormatType
+// uses different numbers, so encoding it directly would change the wire format.
+static int plugin_reader_type_to_wire(const ObExternalFileFormat::FormatType reader_type,
+                                      int32_t &wire_type)
+{
+  int ret = OB_SUCCESS;
+  wire_type = 0;
+  if (ObExternalFileFormat::INVALID_FORMAT == reader_type) {
+    wire_type = 0;
+  } else if (ObExternalFileFormat::CPP_PLUGIN_SDK_FORMAT == reader_type) {
+    wire_type = 1;
+  } else if (ObExternalFileFormat::PARQUET_FORMAT == reader_type) {
+    wire_type = 2;
+  } else if (ObExternalFileFormat::ORC_FORMAT == reader_type) {
+    wire_type = 3;
+  } else {
+    ret = OB_INVALID_DATA;
+    LOG_WARN("unsupported plugin reader format", K(ret), K(reader_type));
+  }
+  return ret;
+}
+
+static int plugin_reader_type_from_wire(const int32_t wire_type,
+                                        ObExternalFileFormat::FormatType &reader_type)
+{
+  int ret = OB_SUCCESS;
+  if (0 == wire_type) {
+    reader_type = ObExternalFileFormat::INVALID_FORMAT;
+  } else if (1 == wire_type) {
+    reader_type = ObExternalFileFormat::CPP_PLUGIN_SDK_FORMAT;
+  } else if (2 == wire_type) {
+    reader_type = ObExternalFileFormat::PARQUET_FORMAT;
+  } else if (3 == wire_type) {
+    reader_type = ObExternalFileFormat::ORC_FORMAT;
+  } else {
+    ret = OB_INVALID_DATA;
+    LOG_WARN("invalid serialized plugin reader type", K(ret), K(wire_type));
+  }
+  return ret;
+}
+
+OB_DEF_SERIALIZE(ObPluginScanTask)
+{
+  int ret = ObFileScanTask::serialize(buf, buf_len, pos);
+  int32_t wire_type = 0;
+  LST_DO_CODE(OB_UNIS_ENCODE, part_id_, plugin_task_json_, record_count_);
+  if (OB_SUCC(ret) && OB_FAIL(plugin_reader_type_to_wire(reader_type_, wire_type))) {
+    LOG_WARN("failed to encode plugin reader type", K(ret), K_(reader_type));
+  }
+  LST_DO_CODE(OB_UNIS_ENCODE, wire_type, assigned_file_bytes_);
+  return ret;
+}
+
+OB_DEF_DESERIALIZE(ObPluginScanTask)
+{
+  int ret = ObFileScanTask::deserialize(buf, data_len, pos);
+  int32_t wire_type = 0;
+  LST_DO_CODE(OB_UNIS_DECODE, part_id_, plugin_task_json_, record_count_);
+  if (OB_SUCC(ret) && pos < data_len) {
+    OB_UNIS_DECODE(wire_type);
+    if (OB_SUCC(ret) && OB_FAIL(plugin_reader_type_from_wire(wire_type, reader_type_))) {
+      LOG_WARN("failed to decode plugin reader type", K(ret), K(wire_type));
+    }
+  }
+  LST_DO_CODE(OB_UNIS_DECODE, assigned_file_bytes_);
+  return ret;
+}
+
+OB_DEF_SERIALIZE_SIZE(ObPluginScanTask)
+{
+  int64_t len = ObFileScanTask::get_serialize_size();
+  int32_t wire_type = 0;
+  const int ret = plugin_reader_type_to_wire(reader_type_, wire_type);
+  UNUSED(ret);
+  LST_DO_CODE(OB_UNIS_ADD_LEN, part_id_, plugin_task_json_, record_count_,
+              wire_type, assigned_file_bytes_);
+  return len;
+}
 
 int ObPluginScanTask::init_with_opt_lake_table_file(ObIAllocator &allocator,
                                                     const ObIOptLakeTableFile &opt_table_file)
@@ -428,12 +550,16 @@ int ObPluginScanTask::init_with_opt_lake_table_file(ObIAllocator &allocator,
       LOG_WARN("failed to write plugin file url");
     } else {
       file_size_ = opt_plugin_file.file_size_;
+      assigned_file_bytes_ = opt_plugin_file.assigned_file_bytes_;
+      // The base task already serializes this cache-key component for PX.
+      // Like Iceberg's manifest token, it need not be an actual file mtime.
+      modification_time_ = opt_plugin_file.cache_version_;
       part_id_ = opt_plugin_file.part_id_;
       reader_type_ = opt_plugin_file.reader_type_;
       // The per-file count has already been consumed by the optimizer. A positive
       // runtime record_count_ enables the Parquet/ORC metadata COUNT(*) shortcut,
       // which remains disabled for plugin OB-file scans.
-      record_count_ = ObPluginReaderType::PLUGIN == reader_type_
+      record_count_ = ObExternalFileFormat::CPP_PLUGIN_SDK_FORMAT == reader_type_
           ? opt_plugin_file.record_count_ : -1;
     }
   }

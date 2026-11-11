@@ -201,8 +201,8 @@ int ObOrcTableRowIterator::prepare_read_orc_file(ObEvalCtx &eval_ctx)
   for (int64_t i = 0; OB_SUCC(ret) && i < file_column_exprs_.count(); i++) {
     int64_t orc_col_id = -1;
     const ObObj *partition_value = nullptr;
-    if (OB_FAIL(get_iceberg_identity_partition_value(file_column_exprs_.at(i)->extra_,
-                                                     state_,
+    if (use_iceberg_manifest_partition_value() && OB_FAIL(ObIcebergScanTask::get_identity_partition_value(file_column_exprs_.at(i)->extra_,
+                                                     state_.part_list_val_,
                                                      partition_value))) {
       LOG_WARN("failed to get iceberg identity partition value", K(ret), K(i));
     } else if (OB_ISNULL(partition_value)) {
@@ -412,10 +412,14 @@ int ObOrcTableRowIterator::init(const storage::ObTableScanParam *scan_param)
       }
     }
     OZ (ObExternalTableRowIterator::init(scan_param));
-    OZ (ObExternalTablePushdownFilter::init(scan_param->pd_storage_filters_,
-                                            scan_param->ext_tbl_filter_pd_level_,
-                                            scan_param->column_ids_,
-                                            eval_ctx));
+    // CPP_PLUGIN_FORMAT keeps ORC pushdown at 0 without changing shared parameters.
+    OZ(ObExternalTablePushdownFilter::init(
+        scan_param->pd_storage_filters_,
+        ObExternalFileFormat::CPP_PLUGIN_FORMAT == scan_param->external_file_format_.format_type_
+            ? 0
+            : scan_param->ext_tbl_filter_pd_level_,
+        scan_param->column_ids_,
+        eval_ctx));
     LOG_INFO("orc init", K(scan_param->pd_storage_flag_));
     OZ (reader_profile_.register_metrics(&reader_metrics_, READER_METRICS_LABEL));
     OZ (data_access_driver_.register_io_metrics(reader_profile_, IO_METRICS_LABEL));
@@ -448,7 +452,7 @@ int ObOrcTableRowIterator::init(const storage::ObTableScanParam *scan_param)
 
     OZ(ObExternalTableRowIterator::init_default_batch(file_column_exprs_));
     if (is_iceberg_lake_table()) {
-      OZ(ObExternalTableRowIterator::init_for_iceberg(&options_));
+      OZ(ObExternalTableRowIterator::init_delete_bitmap(&options_));
     }
 
     if (OB_SUCC(ret) && file_column_exprs_.count() > 0) {
@@ -596,7 +600,7 @@ int ObOrcTableRowIterator::next_row_range()
   if (OB_UNLIKELY(!state_.next_row_range())) { // move to next range
     // all ranges of the current stripe have been visited, and it need to move to the next stripe
     if (OB_FAIL(next_stripe())) {
-      if (OB_ITER_END != ret) {
+      if (!is_task_boundary(ret)) {
         LOG_WARN("fail to next stripe", K(ret));
       }
     } else if (OB_UNLIKELY(!state_.has_row_range())) {
@@ -639,7 +643,7 @@ int ObOrcTableRowIterator::next_stripe()
       do {
         // all stripes in the orc file have been read, found next file which has stripe to read.
         if (OB_FAIL(next_file())) {
-          if (OB_ITER_END != ret) {
+          if (!is_task_boundary(ret)) {
             LOG_WARN("fail to get next stripe", K(ret));
           }
         }
@@ -661,10 +665,10 @@ int ObOrcTableRowIterator::select_row_ranges(const int64_t stripe_idx)
 {
   int ret = OB_SUCCESS;
   ObFileScanTask *scan_task =
-    static_cast<ObFileScanTask *>(scan_param_->scan_tasks_.at(state_.file_idx_ - 1));
+    static_cast<ObFileScanTask *>(scan_param_->scan_tasks_.at(state_.task_idx_ - 1));
   if (OB_ISNULL(scan_task)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("get null scan task", K(ret), K(state_.file_idx_ - 1));
+    LOG_WARN("get null scan task", K(ret), K(state_.task_idx_ - 1));
   } else if (OB_UNLIKELY(!reader_ && (scan_task->record_count_ <= 0 || !is_count_aggr_))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null reader", K(ret));
@@ -915,7 +919,7 @@ int ObOrcTableRowIterator::next_file()
     // init all meta
     ObEvalCtx &eval_ctx = scan_param_->op_->get_eval_ctx();
     ObString location = scan_param_->external_file_location_;
-    int64_t task_idx = 0;
+    int64_t task_idx = -1;
     int64_t file_size = -1;
     if (data_access_driver_.is_opened()) {
       data_access_driver_.close();
@@ -923,8 +927,8 @@ int ObOrcTableRowIterator::next_file()
     ObFileScanTask *scan_task = nullptr;
 
     do {
-      if ((task_idx = state_.file_idx_++) >= scan_param_->scan_tasks_.count()) {
-        ret = OB_ITER_END;
+      if (OB_FAIL(go_next_task_idx(state_, task_idx))) {
+        // OB_NOT_THE_OBJECT leaves the shared cursor unchanged; EOF exhausts the stream.
       }
       if (OB_FAIL(ret)) {
       } else {
@@ -1046,7 +1050,7 @@ int ObOrcTableRowIterator::next_file()
           state_.cur_stripe_idx_ = 0;
           state_.end_stripe_idx_ = 0;
           if (is_iceberg_lake_table()) {
-            OZ (build_delete_bitmap(state_.cur_file_url_, state_.file_idx_ - 1));
+            OZ (build_delete_bitmap(state_.cur_file_url_, state_.task_idx_ - 1));
           }
         } else if (OB_FAIL(create_row_readers())) {
           LOG_WARN("fail to create row readers", K(ret));
@@ -1079,7 +1083,7 @@ int ObOrcTableRowIterator::next_file()
           } else if (OB_UNLIKELY(!state_.has_stripe())) {
             // no stripe after filter
           } else if (is_iceberg_lake_table() &&
-                    OB_FAIL(build_delete_bitmap(state_.cur_file_url_, state_.file_idx_ - 1))) {
+                    OB_FAIL(build_delete_bitmap(state_.cur_file_url_, state_.task_idx_ - 1))) {
             LOG_WARN("fail to build delete bitmap", K(ret));
           } else if (OB_NOT_NULL(scan_param_) && !scan_param_->sample_info_.is_no_sample()) {
             if (scan_param_->sample_info_.is_block_sample()) {
@@ -1169,8 +1173,8 @@ int ObOrcTableRowIterator::check_need_read_orc_column(const int64_t column_idx,
   } else if (OB_UNLIKELY(column_idx < 0 || column_idx >= file_column_exprs_.count())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid file column index", K(ret), K(column_idx), K(file_column_exprs_.count()));
-  } else if (OB_FAIL(get_iceberg_identity_partition_value(file_column_exprs_.at(column_idx)->extra_,
-                                                          state_,
+  } else if (use_iceberg_manifest_partition_value() && OB_FAIL(ObIcebergScanTask::get_identity_partition_value(file_column_exprs_.at(column_idx)->extra_,
+                                                          state_.part_list_val_,
                                                           partition_value))) {
     LOG_WARN("failed to get iceberg identity partition value", K(ret), K(column_idx));
   } else {
@@ -2830,17 +2834,29 @@ ObOrcTableRowIterator::make_external_table_access_options(stmt::StmtType stmt_ty
 int ObOrcTableRowIterator::get_next_rows(int64_t &count, int64_t capacity)
 {
   int ret = OB_SUCCESS;
+  count = 0;
   ObEvalCtx &eval_ctx = scan_param_->op_->get_eval_ctx();
   const ExprFixedArray &column_conv_exprs = *(scan_param_->ext_column_dependent_exprs_);
+  const bool need_op_filters = OB_ISNULL(scan_param_->pd_storage_filters_)
+      && scan_param_->ext_enable_late_materialization_
+      && OB_NOT_NULL(scan_param_->op_filters_) && !scan_param_->op_filters_->empty();
   int64_t read_count = 0;
   ObMallocHookAttrGuard guard(mem_attr_);
-  {
+  if (capacity <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(filter_eval_initializer_.ensure_filter_eval_inited_once(scan_param_->pd_storage_filters_, scan_param_))) {
+    LOG_WARN("initialize shared filter failed", K(ret));
+  }
+  while (OB_SUCC(ret) && read_count == 0) {
+    // All output paths, including metadata-only and a partially drained sector,
+    // must start a fresh expression batch after another reader ran.
+    scan_param_->op_->clear_evaluated_flag();
     if (OB_NOT_NULL(sector_reader_) && !sector_reader_->is_finished()) {
       // sector reader is still not finished, project rows from sector bitmap,
       // no need to move to next range.
     } else if (OB_UNLIKELY(!state_.has_rows_in_row_range())) {
       if (OB_FAIL(next_row_range())) {
-        if (OB_ITER_END != ret) {
+        if (!is_task_boundary(ret)) {
           LOG_WARN("fail to next row group", K(ret));
         }
       } else if (OB_UNLIKELY(!state_.has_rows_in_row_range()) && !is_count_aggr_) {
@@ -2874,11 +2890,25 @@ int ObOrcTableRowIterator::get_next_rows(int64_t &count, int64_t capacity)
       for (int64_t i = 0; OB_SUCC(ret) && i < column_exprs_.count(); i++) {
         //column_conv_exprs is 1-1 mapped to column_exprs
         //calc gen column exprs
-        if (column_sel_mask_.at(i) && column_need_conv_.at(i)) {
+        // Residual filters also need columns that are not returned by TableScan.
+        if ((column_sel_mask_.at(i) || need_op_filters) && column_need_conv_.at(i)) {
           OZ (project_column(eval_ctx, column_conv_exprs.at(i), column_exprs_.at(i), read_count));
         }
       }
       OZ (calc_exprs_for_rowid(read_count, state_));
+      if (OB_SUCC(ret) && need_op_filters) {
+        // next_batch (or the metadata-only path) has already advanced the input
+        // position. Compact only the output, after conversion and rowid generation.
+        const common::ObBitmap *filter_result = nullptr;
+        if (OB_FAIL(calc_op_filters(read_count, *bit_vector_cache_, filter_result))) {
+          LOG_WARN("failed to evaluate orc scan expressions", K(ret));
+        } else if (OB_FAIL(reorder_output(*filter_result, eval_ctx, read_count))) {
+          LOG_WARN("failed to reorder orc expression filter output", K(ret));
+        }
+      }
+    }
+    if (OB_SUCC(ret) && read_count == 0) {
+      ret = THIS_WORKER.check_status();
     }
   }
   if (OB_SUCC(ret)) {
@@ -4358,8 +4388,12 @@ int ObOrcTableRowIterator::get_next_row()
 }
 
 void ObOrcTableRowIterator::reset() {
-  // reset state_ to initial values for rescan
   state_.reuse();
+  filter_eval_initializer_.reset();
+  if (nullptr != inner_sector_reader_) {
+    inner_sector_reader_->reset();
+  }
+  sector_reader_ = nullptr;
   file_prebuffer_.destroy();
 }
 

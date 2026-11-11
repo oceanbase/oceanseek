@@ -13,6 +13,7 @@
 #include "common/storage/ob_io_device.h"
 #include "share/backup/ob_backup_struct.h"
 #include "sql/engine/table/ob_external_table_access_service.h"
+#include "sql/optimizer/file_prune/ob_lake_table_fwd.h"
 #include "sql/engine/table/ob_external_table_pushdown_filter.h"
 #include "sql/engine/table/ob_external_file_access.h"
 #include <orc/OrcFile.hh>
@@ -152,7 +153,7 @@ namespace sql {
       return cur_range_row_count_ - cur_range_read_row_count_;
     }
 
-    DECLARE_VIRTUAL_TO_STRING;
+    DECLARE_TO_STRING;
     int64_t cur_stripe_idx_;
     int64_t end_stripe_idx_;
     int64_t next_stripe_first_row_id_;
@@ -315,6 +316,8 @@ namespace sql {
       }
     }
 
+    bool can_handle_task(const ObIExtTblScanTask *task) const override
+    { return can_handle_file_task(task, ObExternalFileFormat::ORC_FORMAT); }
     int init(const storage::ObTableScanParam *scan_param) override;
     virtual int get_next_row(ObNewRow *&row) override
     {
@@ -325,6 +328,9 @@ namespace sql {
     int get_next_row() override;
     int get_next_rows(int64_t &count, int64_t capacity) override;
     virtual void reset() override;
+    ObExternalTableFilterEvalInitializer *get_filter_eval_initializer() override { return &filter_eval_initializer_; }
+    int64_t get_next_task_idx() const override { return state_.task_idx_; }
+    int set_next_task_idx(int64_t idx) override { state_.task_idx_ = idx; return OB_SUCCESS; }
 private:
   // load vec data from orc file to expr mem
   struct DataLoader {
@@ -467,6 +473,11 @@ private:
     int init(ObOrcTableRowIterator *orc_row_iter);
 
     int next(int64_t &count, int64_t capacity);
+
+    void reset() {
+      reset_sector_state();
+      bitmap_.reuse();
+    }
 
     OB_INLINE bool is_finished() const
     {
@@ -611,6 +622,7 @@ private:
     bool is_contain_attribute_key(const orc::Type *type);
   private:
     ObOrcIteratorState state_;
+    ObExternalTableFilterEvalInitializer filter_eval_initializer_;
     lib::ObMemAttr mem_attr_;
     ObArenaAllocator allocator_;
     ObOrcMemPool orc_alloc_;

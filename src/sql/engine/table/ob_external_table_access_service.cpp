@@ -30,6 +30,7 @@
 #include "sql/engine/table/ob_ext_table_java_plugin_row_iter.h"
 #include "sql/engine/expr/ob_expr_regexp_context.h"
 #include "sql/optimizer/file_prune/ob_lake_table_fwd.h"
+#include "share/ob_cluster_version.h"     // GET_MIN_CLUSTER_VERSION / CLUSTER_CURRENT_VERSION
 #include "share/config/ob_server_config.h"
 #include "sql/engine/table/ob_iceberg_delete_bitmap_builder.h"
 #include "sql/engine/table/ob_kafka_table_row_iter.h"
@@ -542,6 +543,559 @@ bool ObExternalTableAccessService::is_ext_min_max_agg_scan(
   return bret;
 }
 
+int ObExternalTableRowIterator::peek_next_task_idx(const int64_t next_idx, int64_t &task_idx) const
+{
+  int ret = OB_SUCCESS;
+  task_idx = -1;
+  if (OB_ISNULL(scan_param_)) {
+    ret = OB_NOT_INIT;
+  } else if (next_idx < 0) {
+    ret = OB_ERR_UNEXPECTED;
+  } else {
+    int64_t candidate = next_idx;
+    while (OB_SUCC(ret) && task_idx < 0 && candidate < scan_param_->scan_tasks_.count()) {
+      const ObIExtTblScanTask *task = scan_param_->scan_tasks_.at(candidate);
+      if (OB_ISNULL(task)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (task->file_url_.compare_equal(ObExternalTableUtils::dummy_file_name())) {
+        ++candidate;
+      } else {
+        task_idx = candidate;
+      }
+    }
+    if (OB_SUCC(ret) && task_idx < 0) {
+      ret = OB_ITER_END;
+    }
+  }
+  return ret;
+}
+
+int ObExternalTableRowIterator::peek_next_task_idx_for_reader(const int64_t next_idx, int64_t &task_idx) const
+{
+  int ret = peek_next_task_idx(next_idx, task_idx);
+  if (OB_SUCC(ret) && !can_handle_task(scan_param_->scan_tasks_.at(task_idx))) {
+    task_idx = -1;
+    ret = OB_NOT_THE_OBJECT;
+  }
+  return ret;
+}
+
+bool ObExternalTableRowIterator::can_handle_file_task(
+    const ObIExtTblScanTask *task, ObExternalFileFormat::FormatType format) const
+{
+  bool can_handle = false;
+  if (nullptr != task) {
+    const LakeFileType type = task->get_file_type();
+    if (LakeFileType::EXT_PLUGIN == type) {
+      can_handle = ObExternalFileFormat::INVALID_FORMAT != format
+                   && format == static_cast<const ObPluginScanTask *>(task)->reader_type_;
+    } else if (LakeFileType::ICEBERG == type) {
+      const iceberg::DataFileFormat file_format = static_cast<const ObIcebergScanTask *>(task)->file_format_;
+      can_handle = (ObExternalFileFormat::PARQUET_FORMAT == format && iceberg::DataFileFormat::PARQUET == file_format)
+                   || (ObExternalFileFormat::ORC_FORMAT == format && iceberg::DataFileFormat::ORC == file_format);
+    } else if (ObExternalFileFormat::CPP_PLUGIN_SDK_FORMAT != format && nullptr != scan_param_) {
+      can_handle = format == scan_param_->external_file_format_.format_type_;
+    }
+  }
+  return can_handle;
+}
+
+int ObExternalTableRowIterator::go_next_task_idx(ObExternalIteratorState &state, int64_t &task_idx)
+{
+  int ret = peek_next_task_idx_for_reader(state.task_idx_, task_idx);
+  if (OB_SUCC(ret)) {
+    // Keep partition values when consecutive tasks use the same partition.
+    state.cur_file_id_ = 0;
+    state.cur_line_number_ = 0;
+    state.cur_file_url_.reset();
+    state.batch_first_row_line_num_ = 0;
+    state.is_delete_file_loaded_ = false;
+    state.task_idx_ = task_idx + 1;
+  }
+  return ret;
+}
+
+int ObExternalTableFilterEvalInitializer::init_filter_evaluated_datums(ObPushdownFilterExecutor *curr_filter)
+{
+  int ret = OB_SUCCESS;
+  bool filter_valid = true;
+  bool is_stack_overflow = false;
+  if (OB_FAIL(check_stack_overflow(is_stack_overflow))) {
+    LOG_WARN("failed to check stack overflow", K(ret));
+  } else if (is_stack_overflow) {
+    ret = OB_SIZE_OVERFLOW;
+    LOG_WARN("too deep recursive", K(ret), K(is_stack_overflow));
+  } else if (OB_ISNULL(curr_filter)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null filter", K(ret));
+  } else if (curr_filter->is_filter_node()) {
+    if (curr_filter->is_filter_black_node()) {
+      if (OB_FAIL(curr_filter->init_evaluated_datums(filter_valid))) {
+        LOG_WARN("failed to init eval datum", K(ret));
+      } else if (!filter_valid) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("filter is invalid", K(ret), K(curr_filter->is_logic_op_node()));
+      }
+    } else if (curr_filter->is_filter_white_node()) {
+      ObWhiteFilterExecutor *white_filter = static_cast<ObWhiteFilterExecutor *>(curr_filter);
+      ObWhiteFilterOperatorType op_type = white_filter->get_op_type();
+      if (WHITE_OP_IN == op_type) {
+        if (OB_FAIL(white_filter->init_in_eval_datums(filter_valid))) {
+          LOG_WARN("failed to init eval datum", K(ret));
+        }
+      } else if (OB_FAIL(white_filter->init_compare_eval_datums(filter_valid))) {
+        LOG_WARN("failed to init eval datum", K(ret));
+      }
+
+      if (OB_FAIL(ret)) {
+      } else if (!filter_valid) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("filter is invalid", K(ret), K(curr_filter->is_logic_op_node()));
+      }
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("filter is invalid", K(ret), K(curr_filter->is_logic_op_node()));
+    }
+  } else if (curr_filter->is_logic_op_node()) {
+    sql::ObPushdownFilterExecutor **children = curr_filter->get_childs();
+    for (uint32_t i = 0; OB_SUCC(ret) && i < curr_filter->get_child_count(); ++i) {
+      if (OB_ISNULL(children[i])) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("Unexpected null child filter", K(ret), K(i));
+      } else if (OB_FAIL(init_filter_evaluated_datums(children[i]))) {
+        LOG_WARN("failed to init child eval datum", K(ret), K(i), KP(children[i]));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObExternalTableFilterEvalInitializer::ensure_filter_eval_inited_once(
+    ObPushdownFilterExecutor *root_filter, const storage::ObTableScanParam *scan_param)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(root_filter)) {
+  } else if (OB_ISNULL(scan_param)) {
+    ret = OB_NOT_INIT;
+  } else if (filter_eval_inited_) {
+  } else if (OB_FAIL(init_filter_evaluated_datums(root_filter))) {
+    LOG_WARN("failed to init filter evaluated datums", K(ret));
+  } else {
+    filter_eval_inited_ = true;
+  }
+  return ret;
+}
+
+ObLakeTableRowIterDispatcher::ObLakeTableRowIterDispatcher()
+    : shared_scan_param_(nullptr) {}
+
+ObLakeTableRowIterDispatcher::~ObLakeTableRowIterDispatcher() {
+  if (OB_NOT_NULL(current_reader_)) {
+    publish_reader_metrics(*current_reader_);
+  }
+  for (CachedReader &reader : readers_) {
+    if (OB_NOT_NULL(reader.iter_)) {
+      reader.iter_->~ObExternalTableRowIterator();
+      reader.iter_ = nullptr;
+    }
+  }
+  // All iterators die before their object arenas and borrowed plan
+  // dependencies.
+}
+
+int ObLakeTableRowIterDispatcher::init(
+    const storage::ObTableScanParam *scan_param) {
+  int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(shared_scan_param_)) {
+    ret = OB_INIT_TWICE;
+  } else if (OB_ISNULL(scan_param) || scan_param->scan_tasks_.empty() ||
+             (ObExternalFileFormat::CPP_PLUGIN_FORMAT != scan_param->external_file_format_.format_type_
+              && !share::is_iceberg_lake_table(scan_param->lake_table_format_))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid external table dispatcher scan param", K(ret), KP(scan_param));
+  } else if (ObExternalFileFormat::CPP_PLUGIN_FORMAT == scan_param->external_file_format_.format_type_
+             && OB_UNLIKELY(GET_MIN_CLUSTER_VERSION() < CLUSTER_CURRENT_VERSION)) {
+    // Reject plugin external table scans while the cluster is in a mixed
+    // rolling-upgrade state.
+    ret = OB_OP_NOT_ALLOW;
+    LOG_USER_ERROR(OB_OP_NOT_ALLOW, "query plugin external table during rolling upgrade");
+    LOG_WARN("plugin external table query is not allowed during rolling upgrade",
+             K(ret), "min_cluster_version", GET_MIN_CLUSTER_VERSION(),
+             "current_version", CLUSTER_CURRENT_VERSION);
+  } else {
+    scan_param_ = scan_param;
+    shared_scan_param_ = scan_param;
+    if (OB_FAIL(prepare_scan())) {
+      LOG_WARN("prepare external table scan failed", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObLakeTableRowIterDispatcher::validate_scan_tasks() {
+  int ret = OB_SUCCESS;
+  const bool is_plugin = ObExternalFileFormat::CPP_PLUGIN_FORMAT == shared_scan_param_->external_file_format_.format_type_;
+  const LakeFileType expected = is_plugin ? LakeFileType::EXT_PLUGIN : LakeFileType::ICEBERG;
+  for (int64_t i = 0;
+       OB_SUCC(ret) && i < shared_scan_param_->scan_tasks_.count(); ++i) {
+    const ObIExtTblScanTask *task = shared_scan_param_->scan_tasks_.at(i);
+    CachedReader *reader = nullptr;
+    ObExternalFileFormat::FormatType type = ObExternalFileFormat::INVALID_FORMAT;
+    if (OB_ISNULL(task)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (!task->file_url_.compare_equal(ObExternalTableUtils::dummy_file_name())) {
+      if (expected != task->get_file_type()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected task type", K(ret), K(expected), KPC(task));
+      } else if (is_plugin) {
+        type = static_cast<const ObPluginScanTask *>(task)->reader_type_;
+      } else {
+        const iceberg::DataFileFormat file_format = static_cast<const ObIcebergScanTask *>(task)->file_format_;
+        if (iceberg::DataFileFormat::PARQUET == file_format) {
+          type = ObExternalFileFormat::PARQUET_FORMAT;
+        } else if (iceberg::DataFileFormat::ORC == file_format) {
+          type = ObExternalFileFormat::ORC_FORMAT;
+        } else {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("unsupported iceberg file format", K(ret), K(file_format));
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(get_cached_reader(type, reader))) {
+        LOG_WARN("invalid task reader type", K(ret), K(type));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObLakeTableRowIterDispatcher::get_cached_reader(
+    ObExternalFileFormat::FormatType type, CachedReader *&reader)
+{
+  int ret = OB_SUCCESS;
+  reader = nullptr;
+  int64_t idx = -1;
+  if (ObExternalFileFormat::CPP_PLUGIN_SDK_FORMAT == type) {
+    idx = PLUGIN_READER_IDX;
+  } else if (ObExternalFileFormat::PARQUET_FORMAT == type) {
+    idx = PARQUET_READER_IDX;
+  } else if (ObExternalFileFormat::ORC_FORMAT == type) {
+    idx = ORC_READER_IDX;
+  } else {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid cached reader format", K(ret), K(type));
+  }
+  if (OB_SUCC(ret)) {
+    reader = &readers_[idx];
+  }
+  return ret;
+}
+
+void ObLakeTableRowIterDispatcher::register_assignment_metrics() {
+  metrics_profile_ = get_current_profile();
+  if (OB_NOT_NULL(metrics_profile_)) {
+    int64_t tasks[2] = {0, 0};
+    uint64_t bytes[2] = {0, 0};
+    for (int64_t i = 0; i < shared_scan_param_->scan_tasks_.count(); ++i) {
+      const ObIExtTblScanTask *task = shared_scan_param_->scan_tasks_.at(i);
+      if (OB_NOT_NULL(task) && !task->file_url_.compare_equal(
+                                   ObExternalTableUtils::dummy_file_name())) {
+        const ObPluginScanTask *plugin_task = static_cast<const ObPluginScanTask *>(task);
+        const int idx =
+            ObExternalFileFormat::CPP_PLUGIN_SDK_FORMAT == plugin_task->reader_type_ ? 1 : 0;
+        ++tasks[idx];
+        // Planning validates non-negative data-file sizes before assignment.
+        bytes[idx] += plugin_task->assigned_file_bytes_;
+      }
+    }
+    for (int i = 0; i < 2; ++i) {
+      int ret = OB_SUCCESS;
+      ObProfileSwitcher switcher(0 == i ? ObProfileId::EXT_PLUGIN_OB_READER
+                                        : ObProfileId::EXT_PLUGIN_SDK_READER);
+      INC_METRIC_VAL(ObMetricId::EXT_PLUGIN_ASSIGNED_TASKS, tasks[i]);
+      // Absence on an idle worker must not remove another worker's metrics
+      // during merge.
+      if (tasks[i] > 0) {
+        INC_METRIC_VAL(ObMetricId::EXT_PLUGIN_ASSIGNED_FILE_BYTES, bytes[i]);
+        INC_METRIC_VAL(ObMetricId::EXT_PLUGIN_OUTPUT_ROWS, 0);
+        INC_METRIC_VAL(ObMetricId::EXT_PLUGIN_INIT_TIME, 0);
+        INC_METRIC_VAL(ObMetricId::EXT_PLUGIN_READ_TIME, 0);
+      }
+    }
+  }
+}
+
+void ObLakeTableRowIterDispatcher::publish_reader_metrics(
+    const CachedReader &reader) {
+  // Dispatcher observes assignment sizes, reader output and create/read time.
+  // Physical task opens/completions are intentionally not inferred or
+  // registered.
+  if (OB_NOT_NULL(metrics_profile_)) {
+    int ret = OB_SUCCESS;
+    ObProfileSwitcher scan_switcher(metrics_profile_);
+    ObProfileSwitcher switcher(&reader == &readers_[0]
+                                   ? ObProfileId::EXT_PLUGIN_SDK_READER
+                                   : ObProfileId::EXT_PLUGIN_OB_READER);
+    INC_METRIC_VAL(ObMetricId::EXT_PLUGIN_OUTPUT_ROWS, reader_rows_);
+    INC_METRIC_VAL(ObMetricId::EXT_PLUGIN_INIT_TIME, reader_init_us_ * 1000);
+    INC_METRIC_VAL(ObMetricId::EXT_PLUGIN_READ_TIME, reader_read_us_ * 1000);
+  }
+  reader_rows_ = reader_init_us_ = reader_read_us_ = 0;
+}
+
+void ObLakeTableRowIterDispatcher::destroy_cached_reader(CachedReader &reader) {
+  if (OB_NOT_NULL(reader.iter_)) {
+    reader.iter_->~ObExternalTableRowIterator();
+    reader.iter_ = nullptr;
+  }
+  reader.used_in_scan_ = false;
+  reader.allocator_.reuse();
+}
+
+void ObLakeTableRowIterDispatcher::reset() {
+  if (OB_NOT_NULL(current_reader_)) {
+    publish_reader_metrics(*current_reader_);
+  }
+  // Reset before DAS replaces the borrowed tasks. Consecutive resets are
+  // idempotent.
+  for (CachedReader &reader : readers_) {
+    if (reader.used_in_scan_) {
+      reader.iter_->reset();
+      reader.used_in_scan_ = false;
+    }
+  }
+  current_reader_ = nullptr;
+  scan_prepared_ = iter_end_ = false;
+  metrics_profile_ = nullptr;
+}
+
+int ObLakeTableRowIterDispatcher::rescan()
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(shared_scan_param_)) {
+    ret = OB_NOT_INIT;
+  } else {
+    reset();
+    // DAS has installed the new tasks before table_rescan. Preparation errors
+    // belong to this lifecycle entry, never to the first get_next_rows call.
+    if (OB_FAIL(prepare_scan())) {
+      LOG_WARN("prepare external table scan failed", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObLakeTableRowIterDispatcher::prepare_scan()
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(validate_scan_tasks())) {
+    LOG_WARN("invalid external table assignment", K(ret));
+  } else if (ObExternalFileFormat::CPP_PLUGIN_FORMAT == shared_scan_param_->external_file_format_.format_type_) {
+    register_assignment_metrics();
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < shared_scan_param_->scan_tasks_.count(); ++i) {
+    const ObIExtTblScanTask *task = shared_scan_param_->scan_tasks_.at(i);
+    if (!task->file_url_.compare_equal(ObExternalTableUtils::dummy_file_name())) {
+      CachedReader *cached_reader = nullptr;
+      ObExternalFileFormat::FormatType type = ObExternalFileFormat::INVALID_FORMAT;
+      if (LakeFileType::EXT_PLUGIN == task->get_file_type()) {
+        type = static_cast<const ObPluginScanTask *>(task)->reader_type_;
+      } else if (LakeFileType::ICEBERG == task->get_file_type()) {
+        const iceberg::DataFileFormat file_format = static_cast<const ObIcebergScanTask *>(task)->file_format_;
+        if (iceberg::DataFileFormat::PARQUET == file_format) {
+          type = ObExternalFileFormat::PARQUET_FORMAT;
+        } else if (iceberg::DataFileFormat::ORC == file_format) {
+          type = ObExternalFileFormat::ORC_FORMAT;
+        } else {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("unsupported iceberg file format", K(ret), K(file_format));
+        }
+      } else {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected task type", K(ret), KPC(task));
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(get_cached_reader(type, cached_reader))) {
+        LOG_WARN("get cached reader failed", K(ret));
+      } else {
+        CachedReader &reader = *cached_reader;
+        if (OB_ISNULL(reader.iter_)) {
+          reader.allocator_.set_tenant_id(shared_scan_param_->tenant_id_);
+          const int64_t start = OB_ISNULL(metrics_profile_) ? 0 : ObTimeUtility::current_time();
+          if (OB_FAIL(create_task_reader(type, reader.allocator_, reader.iter_))) {
+            LOG_WARN("create external table reader failed", K(ret));
+          } else if (OB_ISNULL(reader.iter_)) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(reader.iter_->init(shared_scan_param_))) {
+            LOG_WARN("initialize external table reader failed", K(ret));
+          }
+          if (OB_NOT_NULL(metrics_profile_)) {
+            reader_init_us_ += ObTimeUtility::current_time() - start;
+          }
+          publish_reader_metrics(reader);
+          if (OB_FAIL(ret)) {
+            destroy_cached_reader(reader);
+          }
+        }
+        if (OB_SUCC(ret)) {
+          reader.used_in_scan_ = true;
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_ITER_END == (ret = select_next_reader())) {
+      iter_end_ = true;
+      ret = OB_SUCCESS;
+    }
+    scan_prepared_ = OB_SUCC(ret);
+  }
+  return ret;
+}
+
+int ObLakeTableRowIterDispatcher::select_next_reader()
+{
+  int64_t task_idx = -1;
+  const int64_t next_idx = OB_NOT_NULL(current_reader_) ? current_reader_->iter_->get_next_task_idx() : 0;
+  int ret = peek_next_task_idx(next_idx, task_idx);
+  if (OB_SUCC(ret)) {
+    const ObIExtTblScanTask *task = shared_scan_param_->scan_tasks_.at(task_idx);
+    CachedReader *reader = nullptr;
+    ObExternalFileFormat::FormatType type = ObExternalFileFormat::INVALID_FORMAT;
+    if (LakeFileType::EXT_PLUGIN == task->get_file_type()) {
+      type = static_cast<const ObPluginScanTask *>(task)->reader_type_;
+    } else if (LakeFileType::ICEBERG == task->get_file_type()) {
+      const iceberg::DataFileFormat file_format = static_cast<const ObIcebergScanTask *>(task)->file_format_;
+      if (iceberg::DataFileFormat::PARQUET == file_format) {
+        type = ObExternalFileFormat::PARQUET_FORMAT;
+      } else if (iceberg::DataFileFormat::ORC == file_format) {
+        type = ObExternalFileFormat::ORC_FORMAT;
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("unsupported iceberg file format", K(ret), K(file_format));
+      }
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected task type", K(ret), KPC(task));
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(get_cached_reader(type, reader))) {
+      LOG_WARN("get next cached reader failed", K(ret));
+    } else if (OB_ISNULL(reader->iter_)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else if (OB_FAIL(reader->iter_->set_next_task_idx(next_idx))) {
+      LOG_WARN("failed to synchronize reader task cursor", K(ret), K(next_idx));
+    } else {
+      bool filter_eval_inited = false;
+      for (int64_t i = 0; !filter_eval_inited && i < ARRAYSIZEOF(readers_); ++i) {
+        if (readers_[i].used_in_scan_ && OB_NOT_NULL(readers_[i].iter_)) {
+          ObExternalTableFilterEvalInitializer *filter = readers_[i].iter_->get_filter_eval_initializer();
+          filter_eval_inited = OB_NOT_NULL(filter) && filter->is_filter_eval_inited();
+        }
+      }
+      ObExternalTableFilterEvalInitializer *target_filter = reader->iter_->get_filter_eval_initializer();
+      if (OB_NOT_NULL(target_filter)) {
+        target_filter->set_filter_eval_inited(filter_eval_inited);
+      }
+      current_reader_ = reader;
+    }
+  }
+  return ret;
+}
+
+int ObLakeTableRowIterDispatcher::get_next_rows(int64_t &count, const int64_t capacity)
+{
+  int ret = OB_SUCCESS;
+  count = 0;
+  if (OB_ISNULL(shared_scan_param_) || !scan_prepared_) {
+    ret = OB_NOT_INIT;
+  } else if (capacity <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+  }
+  while (OB_SUCC(ret) && 0 == count) {
+    if (iter_end_) {
+      ret = OB_ITER_END;
+    } else if (OB_FAIL(THIS_WORKER.check_status())) {
+    } else {
+      const int64_t start = OB_ISNULL(metrics_profile_) ? 0 : ObTimeUtility::current_time();
+      ret = current_reader_->iter_->get_next_rows(count, capacity);
+      if (OB_NOT_NULL(metrics_profile_)) {
+        reader_read_us_ += ObTimeUtility::current_time() - start;
+      }
+      if (OB_NOT_THE_OBJECT == ret) {
+        if (OB_UNLIKELY(count != 0)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else {
+          publish_reader_metrics(*current_reader_);
+          ret = select_next_reader(); // Read-only routing: the reader owns task advancement.
+        }
+      } else if (OB_SUCCESS == ret || OB_ITER_END == ret) {
+        reader_rows_ += count;
+        if (OB_ITER_END == ret) {
+          iter_end_ = true;
+          publish_reader_metrics(*current_reader_);
+          // Keep the final batch alive and return EOF on the following call.
+          ret = count > 0 ? OB_SUCCESS : OB_ITER_END;
+        }
+        // Empty success retries this SAME reader. It has advanced input, not
+        // necessarily finished its task. Only OB_NOT_THE_OBJECT permits a switch.
+      }
+    }
+  }
+  if (OB_SUCCESS != ret && OB_ITER_END != ret) {
+    LOG_WARN("external table dispatcher fetch failed", K(ret), K(capacity));
+  }
+  return ret;
+}
+
+int ObLakeTableRowIterDispatcher::create_task_reader(
+    const ObExternalFileFormat::FormatType reader_type, ObIAllocator &allocator,
+    ObExternalTableRowIterator *&reader) {
+  int ret = OB_SUCCESS;
+  reader = nullptr;
+  const bool is_min_max = reader_type != ObExternalFileFormat::CPP_PLUGIN_SDK_FORMAT &&
+               ObExternalTableAccessService::is_ext_min_max_agg_scan(
+                   *shared_scan_param_);
+  switch (reader_type) {
+  case ObExternalFileFormat::CPP_PLUGIN_SDK_FORMAT: {
+    reader = OB_NEWx(ext_plugin::ObExtTablePluginRowIterator, &allocator);
+    EVENT_INC(ObStatEventIds::EXT_PLUGIN_READER_SCAN_COUNT);
+    break;
+  }
+  case ObExternalFileFormat::PARQUET_FORMAT: {
+    if (is_min_max) {
+      reader = OB_NEWx(ObParquetMinMaxIter, &allocator);
+    } else {
+      reader = OB_NEWx(ObParquetTableRowIterator, &allocator);
+    }
+    if (ObExternalFileFormat::CPP_PLUGIN_FORMAT == shared_scan_param_->external_file_format_.format_type_) {
+      EVENT_INC(ObStatEventIds::EXT_PLUGIN_OB_PARQUET_SCAN_COUNT);
+    }
+    break;
+  }
+  case ObExternalFileFormat::ORC_FORMAT: {
+    if (is_min_max) {
+      reader = OB_NEWx(ObOrcMinMaxIter, &allocator);
+    } else {
+      reader = OB_NEWx(ObOrcTableRowIterator, &allocator);
+    }
+    if (ObExternalFileFormat::CPP_PLUGIN_FORMAT == shared_scan_param_->external_file_format_.format_type_) {
+      EVENT_INC(ObStatEventIds::EXT_PLUGIN_OB_ORC_SCAN_COUNT);
+    }
+    break;
+  }
+  default: {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid fixed plugin reader type", K(ret), K(reader_type));
+    break;
+  }
+  }
+  if (OB_SUCC(ret) && OB_ISNULL(reader)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("allocate plugin task reader failed", K(ret));
+  }
+  return ret;
+}
+
 int ObExternalTableAccessService::table_scan(
     ObVTableScanParam &param,
     ObNewRowIterator *&result)
@@ -568,7 +1122,12 @@ int ObExternalTableAccessService::table_scan(
   } else {
     ObString file_path = scan_param.scan_tasks_.at(0)->file_url_;
     // ODPS外表会在每个SQC中加一个DUMMY_FILE，因此ODPS_FORMAT遇到DUMMY_FILE依然要用ObODPSTableRowIterator处理
-    if (param.external_file_format_.format_type_ != ObExternalFileFormat::ODPS_FORMAT &&
+    if (ObExternalFileFormat::CPP_PLUGIN_FORMAT == param.external_file_format_.format_type_) {
+      if (OB_ISNULL(row_iter = OB_NEWx(ObLakeTableRowIterDispatcher, scan_param.allocator_))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("allocate plugin dispatcher failed", K(ret));
+      }
+    } else if (param.external_file_format_.format_type_ != ObExternalFileFormat::ODPS_FORMAT &&
         file_path.compare_equal(ObExternalTableUtils::dummy_file_name())) {
       if (OB_ISNULL(row_iter = OB_NEWx(ObDummyTableRowIterator, (scan_param.allocator_)))) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
@@ -587,38 +1146,6 @@ int ObExternalTableAccessService::table_scan(
           ret = OB_NOT_SUPPORTED;
           LOG_WARN("unsupported iceberg file format", K(file_format), K(ret));
           format_type = ObExternalFileFormat::INVALID_FORMAT;
-        }
-      }
-
-      if (OB_SUCC(ret) && ObExternalFileFormat::CPP_PLUGIN_FORMAT == format_type) {
-        const ObPluginScanTask *plugin_task
-            = static_cast<const ObPluginScanTask *>(scan_param.scan_tasks_.at(0));
-        if (ObPluginReaderType::PLUGIN == plugin_task->reader_type_) {
-          format_type = ObExternalFileFormat::CPP_PLUGIN_FORMAT;
-        } else if (ObPluginReaderType::OB_PARQUET == plugin_task->reader_type_) {
-          format_type = ObExternalFileFormat::PARQUET_FORMAT;
-          scan_param.external_file_format_.parquet_format_.column_index_type_
-              = ColumnIndexType::NAME;
-          scan_param.external_file_format_.parquet_format_.column_name_case_sensitive_ = false;
-        } else if (ObPluginReaderType::OB_ORC == plugin_task->reader_type_) {
-          format_type = ObExternalFileFormat::ORC_FORMAT;
-          scan_param.external_file_format_.orc_format_.column_index_type_ = ColumnIndexType::NAME;
-          scan_param.external_file_format_.orc_format_.column_name_case_sensitive_ = false;
-        } else {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("unexpected plugin reader type", K(ret), K(plugin_task->reader_type_));
-        }
-      }
-
-      if (OB_SUCC(ret)
-          && ObExternalFileFormat::CPP_PLUGIN_FORMAT
-                 == param.external_file_format_.format_type_) {
-        if (ObExternalFileFormat::CPP_PLUGIN_FORMAT == format_type) {
-          EVENT_INC(ObStatEventIds::EXT_PLUGIN_READER_SCAN_COUNT);
-        } else if (ObExternalFileFormat::PARQUET_FORMAT == format_type) {
-          EVENT_INC(ObStatEventIds::EXT_PLUGIN_OB_PARQUET_SCAN_COUNT);
-        } else if (ObExternalFileFormat::ORC_FORMAT == format_type) {
-          EVENT_INC(ObStatEventIds::EXT_PLUGIN_OB_ORC_SCAN_COUNT);
         }
       }
 
@@ -704,16 +1231,6 @@ int ObExternalTableAccessService::table_scan(
             LOG_WARN("alloc memory failed", KR(ret));
           }
           break;
-        case ObExternalFileFormat::CPP_PLUGIN_FORMAT: {
-          // cpp .so plugin-backed formats: the generic row iterator drives the plugin
-          // vtable (plan_create / reader_create / reader_next_batch). If the plugin
-          // .so is not loaded, init returns OB_NOT_SUPPORTED.
-          if (OB_ISNULL(row_iter = OB_NEWx(ext_plugin::ObExtTablePluginRowIterator, (scan_param.allocator_)))) {
-            ret = OB_ALLOCATE_MEMORY_FAILED;
-            LOG_WARN("alloc memory failed for ext row iterator", K(ret));
-          }
-          break;
-        }
         default:
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("unexpected format", K(ret), "format", param.external_file_format_.format_type_);
@@ -753,9 +1270,15 @@ int ObExternalTableAccessService::table_rescan(ObVTableScanParam &param, ObNewRo
       case ObExternalFileFormat::CSV_FORMAT:
       case ObExternalFileFormat::PARQUET_FORMAT:
       case ObExternalFileFormat::ORC_FORMAT:
-      case ObExternalFileFormat::KAFKA_FORMAT:
-      case ObExternalFileFormat::CPP_PLUGIN_FORMAT: {
+      case ObExternalFileFormat::KAFKA_FORMAT: {
         result->reset();
+        break;
+      }
+      case ObExternalFileFormat::CPP_PLUGIN_FORMAT: {
+        ObLakeTableRowIterDispatcher *iter = static_cast<ObLakeTableRowIterDispatcher *>(result);
+        if (OB_FAIL(iter->rescan())) {
+          LOG_WARN("failed to rescan external table dispatcher", K(ret));
+        }
         break;
       }
       case ObExternalFileFormat::DIRECT_LOAD_STREAM_FORMAT: {
@@ -813,9 +1336,15 @@ int ObExternalTableAccessService::revert_scan_iter(ObNewRowIterator *iter)
 
 int ObExternalTableRowIterator::init(const ObTableScanParam *scan_param)
 {
-   scan_param_ = scan_param;
-   is_agg_pushdown_ = ObStoragePushdownFlag(scan_param->pd_storage_flag_).is_aggregate_pushdown();
-   return init_exprs(scan_param);
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(scan_param)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    scan_param_ = scan_param;
+    is_agg_pushdown_ = ObStoragePushdownFlag(scan_param->pd_storage_flag_).is_aggregate_pushdown();
+    ret = init_exprs(scan_param);
+  }
+  return ret;
 }
 
 int ObExternalTableRowIterator::gen_ip_port(ObIAllocator &allocator)
@@ -946,7 +1475,7 @@ int ObExternalTableRowIterator::fill_file_partition_expr(ObExpr *expr,
   int64_t loc_idx = OB_INVALID_INDEX;
   const ObObj *partition_value = nullptr;
   if (use_manifest_partition_value) {
-    if (OB_FAIL(get_iceberg_identity_partition_value(expr->extra_, state, partition_value))) {
+    if (OB_FAIL(ObIcebergScanTask::get_identity_partition_value(expr->extra_, state.part_list_val_, partition_value))) {
       LOG_WARN("failed to get iceberg identity partition value", K(ret), K(expr->extra_));
     } else if (OB_ISNULL(partition_value)) {
       ret = OB_ERR_UNEXPECTED;
@@ -977,62 +1506,51 @@ int ObExternalTableRowIterator::fill_file_partition_expr(ObExpr *expr,
   return ret;
 }
 
-int ObExternalTableRowIterator::fill_iceberg_file_partition_value(const ObFileScanTask *scan_task,
-                                                                  ObExternalIteratorState &state)
-{
-  int ret = OB_SUCCESS;
-  if (OB_ISNULL(scan_task)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("get null iceberg scan task", K(ret));
-  } else if (LakeFileType::ICEBERG != scan_task->get_file_type()) {
-    if (!is_dummy_file(scan_task->file_url_)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected non-iceberg scan task", K(ret), K(scan_task->get_file_type()));
-    } else {
-      state.part_id_ = OB_INVALID_INDEX_INT64;
-      state.part_list_val_.reset();
-    }
-  } else {
-    const ObIcebergScanTask *iceberg_scan_task = static_cast<const ObIcebergScanTask *>(scan_task);
-    // scan task 只携带稠密 part_id，实际 Identity 值从 scan_param 的共享数组获取。
-    const share::ObExternalTablePartInfoArray *partition_infos = scan_param_->partition_infos_;
-    if (OB_ISNULL(partition_infos)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("partition array is null", K(ret));
-    } else if (state.part_id_ != iceberg_scan_task->part_id_
-               || state.part_list_val_.get_count() == 0) {
-      if (partition_infos->count() == 0) {
-        state.part_list_val_.reset();
-        state.part_id_ = iceberg_scan_task->part_id_;
-      } else if (OB_UNLIKELY(iceberg_scan_task->part_id_ < 0
-                             || iceberg_scan_task->part_id_ >= partition_infos->count())
-                 || OB_UNLIKELY(partition_infos->at(iceberg_scan_task->part_id_).part_id_
-                                != iceberg_scan_task->part_id_)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("invalid iceberg partition info",
-                 K(ret),
-                 K(iceberg_scan_task->part_id_),
-                 KP(partition_infos));
-      } else {
-        state.part_list_val_ = partition_infos->at(iceberg_scan_task->part_id_).list_row_value_;
-        state.part_id_ = iceberg_scan_task->part_id_;
-      }
-    }
-  }
-  return ret;
-}
-
 int ObExternalTableRowIterator::prepare_file_partition_info(const ObFileScanTask *scan_task,
                                                             ObIAllocator &allocator,
                                                             ObExternalIteratorState &state)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(scan_task)) {
+  if (OB_ISNULL(scan_task) || OB_ISNULL(scan_param_)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("get null scan task", K(ret));
+    LOG_WARN("get null scan task or scan param", K(ret), KP(scan_task), KP_(scan_param));
+  } else if (share::is_lake_plugin_table(scan_param_->lake_table_format_)
+             && ObExternalFileFormat::CPP_PLUGIN_FORMAT == scan_param_->external_file_format_.format_type_
+             && LakeFileType::EXT_PLUGIN == scan_task->get_file_type()
+             && ObExternalFileFormat::CPP_PLUGIN_SDK_FORMAT
+                    == static_cast<const ObPluginScanTask *>(scan_task)->reader_type_) {
+    state.part_id_ = scan_task->part_id_;
+    if (0 == state.part_id_) {
+      state.part_list_val_.reset();
+    } else if (OB_FAIL(calc_file_part_list_value_by_array(
+                   state.part_id_, allocator, scan_param_->partition_infos_, state.part_list_val_))) {
+      LOG_WARN("failed to load plugin task partition row", K(ret), K(state.part_id_));
+    }
   } else if (use_iceberg_manifest_partition_value()) {
-    if (OB_FAIL(fill_iceberg_file_partition_value(scan_task, state))) {
-      LOG_WARN("failed to fill iceberg file partition value", K(ret));
+    if (LakeFileType::ICEBERG != scan_task->get_file_type()) {
+      if (!is_dummy_file(scan_task->file_url_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected non-iceberg scan task", K(ret), K(scan_task->get_file_type()));
+      } else {
+        state.part_id_ = OB_INVALID_INDEX_INT64;
+        state.part_list_val_.reset();
+      }
+    } else if (OB_ISNULL(scan_param_->partition_infos_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("partition array is null", K(ret));
+    } else if (state.part_id_ != scan_task->part_id_ || state.part_list_val_.get_count() == 0) {
+      const ObIcebergScanTask *iceberg_task = static_cast<const ObIcebergScanTask *>(scan_task);
+      const ObNewRow *partition_row = nullptr;
+      if (OB_FAIL(iceberg_task->get_partition_row(scan_param_->partition_infos_, partition_row))) {
+        LOG_WARN("failed to get iceberg partition row", K(ret), K(scan_task->part_id_));
+      } else {
+        if (OB_ISNULL(partition_row)) {
+          state.part_list_val_.reset();
+        } else {
+          state.part_list_val_ = *partition_row;
+        }
+        state.part_id_ = scan_task->part_id_;
+      }
     }
   } else if (!need_partition_info_) {
     // do nothing
@@ -1052,33 +1570,6 @@ int ObExternalTableRowIterator::prepare_file_partition_info(const ObFileScanTask
                                                       allocator,
                                                       state.part_list_val_))) {
       LOG_WARN("failed to calculate partition value from table schema", K(ret));
-    }
-  }
-  return ret;
-}
-
-int ObExternalTableRowIterator::get_iceberg_identity_partition_value(
-    const int64_t source_field_id,
-    const ObExternalIteratorState &state,
-    const ObObj *&partition_value) const
-{
-  int ret = OB_SUCCESS;
-  partition_value = nullptr;
-  if (!use_iceberg_manifest_partition_value()) {
-  } else if (OB_UNLIKELY(state.part_list_val_.get_count() % 2 != 0)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("invalid iceberg identity partition row", K(ret), K(state.part_list_val_.get_count()));
-  } else {
-    for (int64_t i = 0;
-         OB_SUCC(ret) && OB_ISNULL(partition_value) && i < state.part_list_val_.get_count();
-         i += 2) {
-      const ObObj &source_id = state.part_list_val_.get_cell(i);
-      if (OB_UNLIKELY(!source_id.is_int32())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("invalid iceberg identity source id", K(ret), K(source_id), K(i));
-      } else if (source_field_id == source_id.get_int32()) {
-        partition_value = &state.part_list_val_.get_cell(i + 1);
-      }
     }
   }
   return ret;
@@ -1110,6 +1601,192 @@ int ObExternalTableRowIterator::load_partition_value_to_expr(ObExpr *expr,
     } else {
       CK(OB_NOT_NULL(datums[0].ptr_));
       OZ(datums[0].from_obj(partition_value));
+    }
+  }
+  return ret;
+}
+
+int ObExternalTableRowIterator::calc_op_filters(const int64_t count,
+                                                ObBitVector &skip,
+                                                const ObBitmap *&result)
+{
+  int ret = OB_SUCCESS;
+  result = nullptr;
+  if (OB_ISNULL(scan_param_) || OB_ISNULL(scan_param_->op_)
+      || OB_UNLIKELY(count <= 0 || count > scan_param_->op_->get_batch_size())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid external filter batch", K(ret), K(count));
+  } else if (OB_FAIL(op_filter_result_.is_inited()
+                         ? op_filter_result_.reserve(count)
+                         : op_filter_result_.init(count))) {
+    LOG_WARN("failed to prepare external filter bitmap", K(ret), K(count));
+  } else {
+    ObEvalCtx &eval_ctx = scan_param_->op_->get_eval_ctx();
+    skip.init(count);
+    op_filter_result_.reuse();
+    if (OB_NOT_NULL(scan_param_->op_filters_)) {
+      if (scan_param_->op_->enable_rich_format_) {
+        const ObExprPtrIArray &filters = *scan_param_->op_filters_;
+        for (int64_t i = 0; OB_SUCC(ret) && i < filters.count()
+                           && !skip.is_all_true(count); ++i) {
+          ObExpr *expr = filters.at(i);
+          if (OB_ISNULL(expr)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected null external filter", K(ret), K(i));
+          } else if (OB_FAIL(expr->eval_vector(eval_ctx, skip, count, skip.is_all_false(count)))) {
+            LOG_WARN("failed to evaluate external filter", K(ret), K(i));
+          } else {
+            ObIVector *vec = expr->get_vector(eval_ctx);
+            for (int64_t row = 0; row < count; ++row) {
+              // SQL WHERE keeps TRUE only; both NULL and zero are rejected.
+              if (!skip.at(row) && !vec->is_true(row)) {
+                skip.set(row);
+              }
+            }
+          }
+        }
+      } else {
+        bool all_filtered = false;
+        bool all_active = true;
+        if (OB_FAIL(ObOperator::filter_batch_rows(eval_ctx, *scan_param_->op_filters_,
+                                                 skip, count, all_filtered, all_active))) {
+          LOG_WARN("failed to evaluate external batch filters", K(ret));
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      skip.bit_not(count);
+      if (OB_FAIL(op_filter_result_.from_bits_mask(
+              0, count, reinterpret_cast<uint8_t *>(skip.data_)))) {
+        LOG_WARN("failed to copy external filter selection", K(ret));
+      } else {
+        result = &op_filter_result_;
+      }
+    }
+    // Compaction changes row positions. Recompute calculated expressions against
+    // the compacted columns, including expressions shared with the SELECT list.
+    scan_param_->op_->clear_evaluated_flag();
+    skip.init(count);
+  }
+  return ret;
+}
+
+int ObExternalTableRowIterator::reorder_expr_vector(ObExpr *expr,
+                                               ObEvalCtx &ctx,
+                                               const common::ObBitmap &bitmap,
+                                               const int64_t read_count,
+                                               const int64_t real_count)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(expr)) {
+  } else if (!expr->get_eval_info(ctx).is_evaluated(ctx)) {
+  } else {
+    ObIVector *vec = expr->get_vector(ctx);
+    if (OB_ISNULL(vec)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null vector when reorder ext output", K(ret), KPC(expr));
+    } else {
+      switch (vec->get_format()) {
+        case VEC_FIXED: {
+          ObFixedLengthBase *fix_vec = static_cast<ObFixedLengthBase *>(vec);
+          ObBitVector *nulls = fix_vec->get_nulls();
+          int64_t project_count = 0;
+          for (int64_t i = 0; i < read_count; ++i) {
+            if (bitmap[i]) {
+              if (nulls->at(i)) {
+                nulls->set(project_count);
+              } else {
+                nulls->unset(project_count);
+                if (project_count != i) {
+                  MEMCPY(fix_vec->get_data() + fix_vec->get_length() * project_count,
+                         fix_vec->get_data() + fix_vec->get_length() * i,
+                         fix_vec->get_length());
+                }
+              }
+              ++project_count;
+            }
+          }
+          if (OB_UNLIKELY(project_count != real_count)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected filtered row count", K(ret), K(project_count), K(real_count));
+          }
+          break;
+        }
+        case VEC_DISCRETE: {
+          ObDiscreteBase *dis_vec = static_cast<ObDiscreteBase *>(vec);
+          ObBitVector *nulls = dis_vec->get_nulls();
+          int64_t project_count = 0;
+          for (int64_t i = 0; i < read_count; ++i) {
+            if (bitmap[i]) {
+              if (nulls->at(i)) {
+                nulls->set(project_count);
+              } else {
+                nulls->unset(project_count);
+                if (project_count != i) {
+                  dis_vec->get_lens()[project_count] = dis_vec->get_lens()[i];
+                  dis_vec->get_ptrs()[project_count] = dis_vec->get_ptrs()[i];
+                }
+              }
+              ++project_count;
+            }
+          }
+          if (OB_UNLIKELY(project_count != real_count)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected filtered row count", K(ret), K(project_count), K(real_count));
+          }
+          break;
+        }
+        case VEC_UNIFORM: {
+          ObUniformBase *uni_vec = static_cast<ObUniformBase *>(vec);
+          int64_t project_count = 0;
+          for (int64_t i = 0; i < read_count; ++i) {
+            if (bitmap[i]) {
+              uni_vec->get_datums()[project_count++] = uni_vec->get_datums()[i];
+            }
+          }
+          if (OB_UNLIKELY(project_count != real_count)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected filtered row count", K(ret), K(project_count), K(real_count));
+          }
+          break;
+        }
+        case VEC_UNIFORM_CONST: {
+          break;
+        }
+        default: {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected vector format when reorder ext output", K(ret), K(vec->get_format()));
+          break;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObExternalTableRowIterator::reorder_output(const common::ObBitmap &bitmap,
+                                          ObEvalCtx &ctx,
+                                          int64_t &read_count)
+{
+  int ret = OB_SUCCESS;
+  const int64_t real_count = bitmap.popcnt();
+  if (OB_UNLIKELY(real_count > read_count)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected filter bitmap popcnt", K(ret), K(real_count), K(read_count));
+  } else if (real_count < read_count) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < column_exprs_.count(); ++i) {
+      if (OB_FAIL(reorder_expr_vector(column_exprs_.at(i), ctx, bitmap, read_count, real_count))) {
+        LOG_WARN("failed to reorder column expr vector", K(ret), K(i));
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(reorder_expr_vector(file_id_expr_, ctx, bitmap, read_count, real_count))) {
+      LOG_WARN("failed to reorder file id vector", K(ret));
+    }
+    if (OB_SUCC(ret) && OB_FAIL(reorder_expr_vector(line_number_expr_, ctx, bitmap, read_count, real_count))) {
+      LOG_WARN("failed to reorder line number vector", K(ret));
+    }
+    if (OB_SUCC(ret)) {
+      read_count = real_count;
     }
   }
   return ret;
@@ -1396,7 +2073,7 @@ int ObExternalTableRowIterator::init_default_batch(ExprFixedArray &file_column_e
   return ret;
 }
 
-int ObExternalTableRowIterator::init_for_iceberg(ObExternalTableAccessOptions *options)
+int ObExternalTableRowIterator::init_delete_bitmap(ObExternalTableAccessOptions *options)
 {
   int ret = OB_SUCCESS;
 
@@ -1512,7 +2189,7 @@ DEF_TO_STRING(ObExternalIteratorState)
 {
   int64_t pos = 0;
   J_OBJ_START();
-  J_KV(K_(file_idx),
+  J_KV(K_(task_idx),
        K_(part_id),
        K_(cur_file_id),
        K_(cur_line_number),

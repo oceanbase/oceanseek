@@ -82,23 +82,38 @@
 ///   use those constants, not bare string literals, so a typo is a compile error
 ///   at the single definition. Unknown keys are NOT silently ignored: OB logs a
 ///   loud WARN and required keys missing/type-mismatched cause a hard error.)
-///   predicate / partition_filter (OB->plugin), expression tree:
+///   predicate (OB->plugin) and legacy partition_filter, expression tree:
 ///     {"kind":"cmp","op":"eq",
 ///      "children":[{"kind":"col","col_idx":N,"name":".."},
 ///                  {"kind":"lit","value":".."}]}
-///     kinds: lit/col/cmp/in/not_in/is_null/is_not_null/and/or/not.
+///     kinds: lit/col/cmp/in/not_in/is_null/is_not_null/and/or/not/expr.
 ///       col: "col_idx" = the column's field_id (informational); "name" is the
 ///            column name the plugin resolves to its schema field index/type.
+///            String comparisons also carry "collation", the effective OB
+///            comparison collation. Missing/unknown collation is not proof that
+///            a plugin's string comparison is compatible.
 ///       lit: "value" is the literal as a string; the plugin converts it to the
 ///            field type of the sibling col (resolved by name).
 ///       cmp: binary, children=[col, lit], op in eq/ne/lt/le/gt/ge.
 ///       in/not_in: children=[col, lit, lit, ...].
 ///       is_null/is_not_null: children=[col].
 ///       and/or: children=[pred, ...]; not: children=[pred].
+///       expr: generic typed OB expression, e.g. eq(abs(col(x)),lit(2)):
+///         {"kind":"expr","op":"T_OP_EQ","op_id":...,"result_type_id":...,
+///          "precision":...,"scale":...,"nullable":true,"children":[
+///            {"kind":"expr","op":"T_OP_ABS","op_id":...,"children":[...]},
+///            {"kind":"lit","value":"2","result_type_id":...}]}
+///         op_id is advisory and plugin-specific recognition must be explicit.
+///         Plugins reject nodes they do not understand; OB keeps its residual.
+///   partition_filter may instead use a range_set root. It contains typed,
+///   normalized per-column intervals from ObPreRangeGraph; see the grammar in
+///   ob_external_table_protocol.h. A plugin reports partition_filter_applied
+///   only after applying every emitted interval with matching schema types.
 ///     ops: eq/ne/lt/le/gt/ge. NULL or "" root = no pushdown.
-///   predicate is the complete convertible scan predicate. partition_filter is an
+///   predicate preserves the representable OB expression tree; a plugin may
+///   weaken it for scanning, while OB keeps its residual. partition_filter is an
 ///   exact partition-only candidate built from the same raw expressions. A plugin
-///   that fully converts that candidate reports top-level
+///   that fully converts and exactly applies that candidate reports top-level
 ///   partition_filter_applied=true in the plan result; missing, false, or a
 ///   non-boolean value means no planning proof. This proof is only for partition
 ///   residual elision and does not report reader predicate acceptance.
@@ -112,8 +127,11 @@
 ///                                    {"field_id":M,"value":null}],
 ///                "ob_file_scan":{"version":1,"file_format":"parquet",
 ///                                "files":[{"path":"..","byte_size":N,
-///                                           "row_count":N}]},
+///                                           "row_count":N,"cache_version":V}]},
 ///                "plugin_split":".."}]}
+///   Every task must supply byte_size as a non-negative int64 data-file size.
+///   Missing, negative, non-integer, or out-of-range sizes are hard plan errors.
+///   This is a planned file size, not runtime IO bytes; row_count may remain unknown.
 ///   Producers emit partition_values for every task. For a partitioned table it
 ///   must contain exactly one schema-ordered entry per partition key; every file
 ///   represented by the task must belong to that tuple. Missing or invalid metadata
@@ -126,6 +144,15 @@
 ///   requires a non-empty files array whose entries have a non-empty path,
 ///   non-negative size, and exact non-negative row_count. A present invalid
 ///   descriptor, mixed presence, or mixed formats is a hard plan error.
+///   Each file may additionally carry cache_version, a positive int64 opaque
+///   file-content token, not necessarily a storage modification timestamp. The
+///   producer guarantees that the same path and token identify the same bytes
+///   and size throughout cache reuse. With this token OB may skip storage stat
+///   and content-digest queries, using the declared size and token instead.
+///   Prefer a token stable across snapshots that retain the same immutable file.
+///   Omit it when that guarantee cannot be made: absence preserves storage stat;
+///   a present invalid value is a hard plan error. Older consumers may ignore
+///   this optional field and keep their existing stat path.
 ///   statistics (plugin->OB):
 ///     {"table":{"row_count":N,"byte_size":N},
 ///      "columns":[{"col_idx":N,"row_count":N,"null_count":N,"ndv":N,
@@ -176,7 +203,9 @@ extern "C" {
 // Bumped on incompatible changes to the vtable layout / entry contract. With the
 // control plane now JSON, ordinary schema/predicate/stat/split evolution does NOT
 // require a bump. The plugin returns NULL for a mismatched version.
-#define OB_EXT_TABLE_PLUGIN_ABI_VERSION 2
+// v3: predicate expr nodes require polarity-safe rejection of unknown leaves;
+// older v2 plugins can prune incorrectly under NOT when a child is unsupported.
+#define OB_EXT_TABLE_PLUGIN_ABI_VERSION 3
 
 // =============================================================================
 // The PROTOCOL plane lives in ob_external_table_protocol.h (included by bare
@@ -307,7 +336,7 @@ struct ObExtTablePluginApi {
   // needs (each task's JSON object is what OB later hands to reader_open_task), then
   // releases the buffer via tasks_destroy below. As with schema, the plugin owns
   // the release.
-  // partition_filter / predicate are OB-built predicate-tree JSON, valid only for
+  // partition_filter / predicate are OB-built JSON, valid only for
   // the call (NULL or "" = no pushdown). Planning proof for partition_filter is
   // reported by partition_filter_applied; it is not a reader-acceptance signal.
   // catalog_context from load_schema is

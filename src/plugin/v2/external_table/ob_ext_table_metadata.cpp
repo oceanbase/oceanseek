@@ -21,6 +21,7 @@
 #include "lib/allocator/page_arena.h"
 #include "share/rc/ob_tenant_base.h"
 
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -130,7 +131,9 @@ int ObExtTableMetadata::load_ext_schema_()
       // runs in oracle mode.
       const bool is_oracle = lib::is_oracle_mode();
       const ObCharsetType cs_type = ObCharsetType::CHARSET_UTF8MB4;
-      const ObCollationType collation = ObCollationType::CS_TYPE_UTF8MB4_BIN;
+      // Third-party formats compare strings byte-wise without ignoring trailing spaces.
+      // utf8mb4_bin is PAD SPACE in OB, while utf8mb4_0900_bin is NO PAD.
+      const ObCollationType collation = ObCollationType::CS_TYPE_UTF8MB4_0900_BIN;
       // Collect partition keys in schema order for predicate splitting and
       // runtime partition-tuple binding.
       ObSEArray<ObString, 4> partition_key_names;
@@ -240,6 +243,14 @@ int ObExtTableMetadata::setup_columns_(ObTableSchema &table_schema)
         LOG_WARN("parsed column is null", K(ret), K(i));
         continue;
       }
+      // set_basic_column_properties() fills in the server default charset and
+      // collation.  External lake schemas already carry the intended string
+      // semantics (Paimon uses UTF8MB4_0900_BIN, and binary columns use CHARSET_BINARY),
+      // so remember them before the resolver overwrites them and restore them
+      // below.  This keeps the generic plugin path consistent with Iceberg.
+      const bool preserve_string_charset = col->is_string_type();
+      const ObCharsetType source_charset = col->get_charset_type();
+      const ObCollationType source_collation = col->get_collation_type();
       // The parser carried the raw format-internal field id in column_id; finalize
       // it to OB's scheme (field id + OB_APP_MIN_COLUMN_ID).
       const uint64_t field_id = col->get_column_id();
@@ -269,6 +280,10 @@ int ObExtTableMetadata::setup_columns_(ObTableSchema &table_schema)
       } else if (OB_FAIL(ObDMLResolver::set_basic_column_properties(*col, prop_str.string()))) {
         LOG_WARN("failed to set basic column properties", K(ret), K(i));
       } else {
+        if (preserve_string_charset) {
+          col->set_charset_type(source_charset);
+          col->set_collation_type(source_collation);
+        }
         col->set_table_id(table_id_);
         if (OB_FAIL(table_schema.add_column(*col))) {
           LOG_WARN("failed to add column", K(ret), K(i));

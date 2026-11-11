@@ -25,6 +25,11 @@ class ObEvalCtx;
 class ObExpr;
 struct ObDatumMeta;
 
+// Apply host CHAR read semantics after projection and before residual filters.
+// Full-length values remain zero-copy; padding uses reusable expression buffers.
+int normalize_external_char_column(ObExpr &expr, ObEvalCtx &eval_ctx,
+                                   const int64_t count, const bool pad_to_full_length);
+
 /**
  * A shared loader that writes an arrow::Array into an OceanBase expression
  * vector. Callers must initialize the destination vector before load().

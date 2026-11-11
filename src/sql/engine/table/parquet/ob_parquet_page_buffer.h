@@ -24,16 +24,50 @@ public:
   int alloc_buffer();
   int64_t end() const;
   int wait(ObLakeTableParquetPageMgrMetrics &metrics);
+  // The returned Arrow slice keeps its allocation alive after PageMgr releases it.
+  static int slice(const std::shared_ptr<ObCoalescedBuffer> &owner,
+                   int64_t offset,
+                   int64_t length,
+                   ObLakeTableParquetPageMgrMetrics &metrics,
+                   std::shared_ptr<arrow::Buffer> &buffer);
   char *buf_ = NULL;
   int64_t file_size_;
   int64_t offset_;
   int64_t length_;
   bool has_waited_ = false;  // 判断数据是否已经被 wait 过了，即 buf 是否已经被填充完毕
-  int64_t ref_counts_ = 0; // 被多少个 ObParquetPageBufferSlice 引用
   ObExternalFileReadHandle io_handle_;
 
 private:
   common::ObMalloc alloc_;
+};
+
+class ObParquetReadBuffer final : public arrow::Buffer
+{
+public:
+  ObParquetReadBuffer(std::shared_ptr<ObCoalescedBuffer> owner, int64_t offset, int64_t length)
+      : arrow::Buffer(reinterpret_cast<const uint8_t *>(owner->buf_) + offset, length),
+        owner_(std::move(owner))
+  {
+  }
+
+private:
+  std::shared_ptr<ObCoalescedBuffer> owner_;
+};
+
+// Keep cached data pinned for as long as Arrow holds the returned buffer.
+class ObParquetCacheBackedArrowBuffer final : public arrow::Buffer
+{
+public:
+  ObParquetCacheBackedArrowBuffer(const uint8_t *data, const int64_t size)
+      : arrow::Buffer(data, size), cache_handle_()
+  {
+  }
+
+  static int create(const ObExternalDataPageCacheValueHandle &cache_handle,
+                    std::shared_ptr<arrow::Buffer> &buffer);
+
+private:
+  ObExternalDataPageCacheValueHandle cache_handle_;
 };
 
 class ObParquetPageBufferBase
@@ -51,26 +85,31 @@ public:
 class ObParquetCachedPageBuffer final : public ObParquetPageBufferBase
 {
 public:
-  ObParquetCachedPageBuffer() = default;
+  ObParquetCachedPageBuffer(std::shared_ptr<arrow::Buffer> buffer, bool is_decompressed);
   virtual ~ObParquetCachedPageBuffer() = default;
   int get_arrow_buffer(ObLakeTableParquetPageMgrMetrics &metrics,
                        std::shared_ptr<arrow::Buffer> &buffer,
                        bool &is_cache_hit,
                        bool &is_decompressed);
-  ObExternalDataPageCacheValueHandle cache_handle_;
+
+private:
+  std::shared_ptr<arrow::Buffer> buffer_;
+  bool is_decompressed_;
 };
 
 class ObParquetPageBufferSlice final : public ObParquetPageBufferBase
 {
 public:
-  ObParquetPageBufferSlice(ObCoalescedBuffer *coalesced_buffer, int64_t offset, int64_t length);
-  virtual ~ObParquetPageBufferSlice();
+  ObParquetPageBufferSlice(std::shared_ptr<ObCoalescedBuffer> coalesced_buffer,
+                           int64_t offset,
+                           int64_t length);
+  virtual ~ObParquetPageBufferSlice() = default;
   int get_arrow_buffer(ObLakeTableParquetPageMgrMetrics &metrics,
                        std::shared_ptr<arrow::Buffer> &buffer,
                        bool &is_cache_hit,
                        bool &is_decompressed);
 
-  ObCoalescedBuffer *coalesced_buffer_;
+  std::shared_ptr<ObCoalescedBuffer> coalesced_buffer_;
   int64_t offset_; // offset_ in coalesced_buffer_
   int64_t length_; // length_ in coalesced_buffer_
 };

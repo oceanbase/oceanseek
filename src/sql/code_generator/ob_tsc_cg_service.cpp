@@ -1381,6 +1381,7 @@ int ObTscCgService::generate_ext_tbl_filter_pd_level(const ObLogTableScan &op,
                                                     format_type))) {
       LOG_WARN("fail to get external table format", K(ret));
     } else if (ObExternalFileFormat::PARQUET_FORMAT == format_type ||
+               ObExternalFileFormat::CPP_PLUGIN_FORMAT == format_type ||
                ObExternalFileFormat::ORC_FORMAT == format_type) {
       need_pd_level = true;
     }
@@ -1391,7 +1392,8 @@ int ObTscCgService::generate_ext_tbl_filter_pd_level(const ObLogTableScan &op,
       log_plan->get_optimizer_context().get_session_info()->get_effective_tenant_id();
     omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
     if (tenant_config.is_valid()) {
-      if (ObExternalFileFormat::PARQUET_FORMAT == format_type) {
+      if (ObExternalFileFormat::PARQUET_FORMAT == format_type
+          || ObExternalFileFormat::CPP_PLUGIN_FORMAT == format_type) {
         pd_level = tenant_config->_parquet_filter_pushdown_level;
       } else if (ObExternalFileFormat::ORC_FORMAT == format_type) {
         pd_level = tenant_config->_orc_filter_pushdown_level;
@@ -1405,7 +1407,8 @@ int ObTscCgService::generate_ext_tbl_filter_pd_level(const ObLogTableScan &op,
         &(log_plan->get_stmt()->get_query_ctx()->get_global_hint().opt_params_);
       ObObj pd_level_val;
       ObOptParamHint::OptParamType param_type = ObOptParamHint::OptParamType::INVALID_OPT_PARAM_TYPE;
-      if (ObExternalFileFormat::PARQUET_FORMAT == format_type) {
+      if (ObExternalFileFormat::PARQUET_FORMAT == format_type
+          || ObExternalFileFormat::CPP_PLUGIN_FORMAT == format_type) {
         param_type = ObOptParamHint::OptParamType::PARQUET_FILTER_PUSHDOWN_LEVEL;
       } else if (ObExternalFileFormat::ORC_FORMAT == format_type) {
         param_type = ObOptParamHint::OptParamType::ORC_FILTER_PUSHDOWN_LEVEL;

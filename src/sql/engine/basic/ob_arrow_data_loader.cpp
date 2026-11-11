@@ -54,6 +54,66 @@ using arrow::UInt16Type;
 using arrow::UInt32Type;
 using arrow::UInt64Type;
 
+int normalize_external_char_column(ObExpr &expr, ObEvalCtx &eval_ctx,
+                                   const int64_t count, const bool pad_to_full_length)
+{
+  int ret = OB_SUCCESS;
+  const ObCollationType cs_type = expr.datum_meta_.cs_type_;
+  if (!expr.obj_meta_.is_fixed_len_char_type() || CS_TYPE_BINARY == cs_type || count == 0) {
+    // BINARY values do not have character-space padding semantics.
+  } else if (count < 0 || expr.max_length_ <= 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid CHAR column length", K(ret), K(count), K(expr.max_length_));
+  } else if (VEC_CONTINUOUS == expr.get_format(eval_ctx)
+             && OB_FAIL(expr.cast_to_uniform(count, eval_ctx))) {
+    LOG_WARN("failed to materialize CHAR vector", K(ret));
+  } else {
+    ObIVector *vec = expr.get_vector(eval_ctx);
+    const int64_t row_count = VEC_UNIFORM_CONST == expr.get_format(eval_ctx) ? 1 : count;
+    const ObString space = ObCharset::is_cs_nonascii(cs_type)
+        ? ObCharsetUtils::get_const_str(cs_type, ' ') : ObString::make_string(" ");
+    const bool byte_length = is_oracle_byte_length(
+        lib::is_oracle_mode(), expr.datum_meta_.length_semantics_);
+    for (int64_t i = 0; OB_SUCC(ret) && i < row_count; ++i) {
+      if (!vec->is_null(i)) {
+        const ObString value = vec->get_string(i);
+        if (!pad_to_full_length) {
+          // Native CHAR storage omits trailing character spaces. Preserve
+          // leading spaces, tabs, NULs and other whitespace, without copying.
+          const int64_t length = ObCharset::strlen_byte_no_sp(cs_type, value.ptr(), value.length());
+          vec->set_string(i, value.ptr(), length);
+        } else {
+          const int64_t length = byte_length ? value.length()
+              : ObCharset::strlen_char(cs_type, value.ptr(), value.length());
+          if (length < expr.max_length_) {
+            const int64_t padding_bytes = byte_length
+                ? (expr.max_length_ - length) / space.length() * space.length()
+                : (expr.max_length_ - length) * space.length();
+            const int64_t result_length = value.length() + padding_bytes;
+            char *buf = expr.get_str_res_mem(eval_ctx, result_length, i);
+            if (OB_ISNULL(buf)) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+              LOG_WARN("failed to allocate CHAR padding buffer", K(ret), K(result_length));
+            } else {
+              MEMMOVE(buf, value.ptr(), value.length());
+              if (1 == space.length()) {
+                MEMSET(buf + value.length(), space[0], padding_bytes);
+              } else {
+                for (int64_t pos = value.length(); pos + space.length() <= result_length;
+                     pos += space.length()) {
+                  MEMCPY(buf + pos, space.ptr(), space.length());
+                }
+              }
+              vec->set_string(i, buf, result_length);
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
 int ObArrowDataLoaderFactory::select_loader(ObIAllocator &allocator,
                                             const DataType &arrow_type,
                                             const ObDatumMeta &datum_type,
