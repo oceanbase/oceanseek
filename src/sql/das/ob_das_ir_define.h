@@ -7,6 +7,7 @@
 #define OB_DAS_IR_DEFINE_H_
 
 #include "ob_das_attach_define.h"
+#include "sql/das/search/ob_das_search_index_text_info.h"
 
 namespace oceanbase
 {
@@ -74,7 +75,8 @@ public:
       mode_flag_(NATURAL_LANGUAGE_MODE),
       flags_(0),
       field_boost_expr_(nullptr),
-      logical_stats_filter_exprs_(alloc) {}
+      logical_stats_filter_exprs_(alloc),
+      search_index_fulltext_info_(&alloc) {}
   bool need_calc_relevance() const { return nullptr != relevance_expr_; }
   bool need_proj_relevance_score() const { return nullptr != relevance_proj_col_; }
   bool need_fwd_idx_agg() const { return has_fwd_agg_ && need_calc_relevance(); }
@@ -219,7 +221,8 @@ public:
                        K_(block_max_spec),
                        K_(mode_flag),
                        KPC_(field_boost_expr),
-                       "logical_stats_filter_cnt", logical_stats_filter_exprs_.count());
+                       "logical_stats_filter_cnt", logical_stats_filter_exprs_.count(),
+                       K_(search_index_fulltext_info));
 
   ObExpr *search_text_;
   ObExpr *inv_scan_domain_id_col_;
@@ -254,6 +257,7 @@ public:
   };
   ObExpr *field_boost_expr_; // for es match sql expr only
   sql::ExprFixedArray logical_stats_filter_exprs_;
+  ObDASSearchIndexTextInfo search_index_fulltext_info_;
 };
 
 struct ObDASIRScanRtDef : ObDASAttachRtDef

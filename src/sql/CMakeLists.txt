@@ -123,6 +123,7 @@ ob_set_subtarget(ob_sql das
   das/iter/ob_das_fusion_iter.cpp
   das/iter/ob_das_profile_iter.cpp
   das/search/ob_das_search_define.cpp
+  das/search/ob_das_search_index_text_info.cpp
   das/search/ob_das_search_context.cpp
   das/search/ob_das_logical_bm25_stats_provider.cpp
   das/search/ob_i_das_search_op.cpp
