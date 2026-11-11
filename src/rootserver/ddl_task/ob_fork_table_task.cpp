@@ -806,6 +806,9 @@ int ObForkTableTask::cleanup_impl()
       lock_arg.lock_mode_ = transaction::tablelock::EXCLUSIVE;
       lock_arg.op_type_ = transaction::tablelock::ObTableLockOpType::IN_TRANS_COMMON_LOCK;
       lock_arg.timeout_us_ = ctx.get_timeout();
+      // Queue cleanup even when lock priority is disabled, so new DDL shared locks cannot starve it.
+      lock_arg.lock_priority_ = transaction::tablelock::ObTableLockPriority::NORMAL;
+      lock_arg.force_use_priority_ = true;
       if (OB_FAIL(transaction::tablelock::ObInnerConnectionLockUtil::lock_obj(tenant_id_, lock_arg, conn))) {
         LOG_WARN("[ForkTable] lock tenant failed", KR(ret), K(tenant_id_));
       } else if (OB_FAIL(storage::ObDDLLock::unlock_for_fork_table(

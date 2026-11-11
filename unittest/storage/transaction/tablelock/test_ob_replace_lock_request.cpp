@@ -146,6 +146,29 @@ bool replace_req_is_equal(const ObReplaceLockRequest &req1, const ObReplaceLockR
   return is_equal && unlock_req_is_equal(*(req1.unlock_req_), *(req2.unlock_req_));
 }
 
+TEST(ObLockObjsRequest, test_assign_preserves_non_default_priority)
+{
+  ObLockObjRequest src;
+  src.obj_type_ = ObLockOBJType::OBJ_TYPE_TENANT;
+  src.obj_id_ = 1001;
+  src.owner_id_.set_default();
+  src.lock_mode_ = EXCLUSIVE;
+  src.op_type_ = IN_TRANS_COMMON_LOCK;
+  src.timeout_us_ = 1000 * 1000;
+  src.lock_priority_ = ObTableLockPriority::HIGH1;
+  src.force_use_priority_ = true;
+  ASSERT_TRUE(src.is_valid());
+
+  ObLockObjsRequest dst;
+  ASSERT_NE(src.lock_priority_, dst.lock_priority_);
+  ASSERT_NE(src.force_use_priority_, dst.force_use_priority_);
+  ASSERT_EQ(OB_SUCCESS, dst.assign(src));
+  ASSERT_TRUE(dst.is_valid());
+  ASSERT_EQ(1, dst.objs_.count());
+  EXPECT_EQ(src.lock_priority_, dst.lock_priority_);
+  EXPECT_EQ(src.force_use_priority_, dst.force_use_priority_);
+}
+
 TEST(ObReplaceLockRequest, test_replace_table_lock)
 {
   INIT_SUCC(ret);

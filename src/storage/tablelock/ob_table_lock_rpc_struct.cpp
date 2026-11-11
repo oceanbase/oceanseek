@@ -531,6 +531,8 @@ int ObLockObjsRequest::assign(const ObLockObjRequest &arg)
   op_type_ = arg.op_type_;
   timeout_us_ = arg.timeout_us_;
   is_from_sql_ = arg.is_from_sql_;
+  lock_priority_ = arg.lock_priority_;
+  force_use_priority_ = arg.force_use_priority_;
   if (OB_FAIL(lock_id.set(arg.obj_type_, arg.obj_id_))) {
     LOG_WARN("set lock_id failed", K(ret), K(arg));
   } else if (OB_FAIL(objs_.push_back(lock_id))) {
