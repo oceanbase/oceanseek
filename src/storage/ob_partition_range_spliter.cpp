@@ -8,6 +8,7 @@
 #include "access/ob_multiple_scan_merge.h"
 #include "blocksstable/ob_micro_block_row_scanner.h"
 #include "storage/access/ob_index_block_tree_traverser.h"
+#include "observer/omt/ob_tenant_config_mgr.h"
 
 #define USING_LOG_PREFIX STORAGE
 
@@ -1675,14 +1676,15 @@ int ObPartitionMultiRangeSpliter::estimate_ranges_info(const ObIArray<ObStoreRan
 
     // TODO(menglan): adapt now sql implement
     constexpr int64_t ONE_TASK_ROW_COUNT = 32768;
-    if (GCTX.is_shared_storage_mode()) {
-      total_size = max(total_size,
-                       total_macro_block_count * OB_DEFAULT_MACRO_BLOCK_SIZE + memtable_total_size);
-    } else {
+    omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID()));
+    if (tenant_config.is_valid() && tenant_config->_enable_split_ranges_by_row_count) {
       total_size
           = max(total_size,
                 max(total_macro_block_count * OB_DEFAULT_MACRO_BLOCK_SIZE + memtable_total_size,
                     (total_row_count / ONE_TASK_ROW_COUNT + 1) * OB_DEFAULT_MACRO_BLOCK_SIZE));
+    } else {
+      total_size = max(total_size,
+                       total_macro_block_count * OB_DEFAULT_MACRO_BLOCK_SIZE + memtable_total_size);
     }
 
     LOG_TRACE("Finish estimate ranges info",

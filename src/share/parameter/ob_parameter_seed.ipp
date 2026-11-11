@@ -3534,6 +3534,9 @@ DEF_DBL(px_target_workers_per_cpu, OB_TENANT_PARAMETER, "8", "[0,)",
         "Target number of parallel threads per CPU quota for tenant."
         "The default value is 8. Range: [0,)",
         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+DEF_BOOL(_enable_split_ranges_by_row_count, OB_TENANT_PARAMETER, "False",
+         "Specifies whether to take row count into account when splitting ranges.",
+         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_BOOL(_enable_external_table_bloom_filter, OB_TENANT_PARAMETER, "True",
          "Enable reading bloom filter from external tables.",
          ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
