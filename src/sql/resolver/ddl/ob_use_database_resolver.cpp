@@ -6,6 +6,8 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ddl/ob_use_database_resolver.h"
 
+#include "share/catalog/ob_unified_catalog_utils.h"
+#include "sql/ob_uc_catalog_context.h"
 #include "sql/resolver/ddl/ob_use_database_stmt.h"
 
 
@@ -62,22 +64,50 @@ int ObUseDatabaseResolver::resolve(const ParseNode &parse_tree)
       } else {
         CK (OB_NOT_NULL(schema_checker_));
         CK (OB_NOT_NULL(schema_checker_->get_sql_schema_guard()));
-        OZ (ObSQLUtils::cvt_db_name_to_org(*schema_checker_->get_sql_schema_guard(),
-                                           session_info_,
-                                           catalog_id,
-                                           db_name,
-                                           allocator_));
+        if (is_uc_remote_catalog(catalog_id)) {
+          OZ (cvt_uc_db_name_to_org(*schema_checker_->get_sql_schema_guard(),
+                                    *params_.uc_catalog_ctx_,
+                                    session_info_,
+                                    catalog_id,
+                                    db_name,
+                                    allocator_));
+        } else {
+          OZ (ObSQLUtils::cvt_db_name_to_org(*schema_checker_->get_sql_schema_guard(),
+                                             session_info_,
+                                             catalog_id,
+                                             db_name,
+                                             allocator_));
+        }
         use_database_stmt->set_db_name(db_name);
         uint64_t tenant_id = session_info_->get_effective_tenant_id();
         share::schema::ObSessionPrivInfo session_priv;
         uint64_t database_id = OB_INVALID_ID;
+        bool need_local_db_access = false;
         const share::schema::ObDatabaseSchema *db_schema = NULL;
         if (OB_FAIL(session_info_->get_session_priv_info(session_priv))) {
           LOG_WARN("faile to get session priv info", K(ret));
-        } else if (OB_FAIL(schema_checker_->get_database_id(tenant_id, catalog_id, db_name, database_id))) {
+        } else if (OB_FAIL(resolve_catalog_database_id(tenant_id, catalog_id, db_name, database_id))) {
           LOG_USER_ERROR(OB_ERR_BAD_DATABASE, db_name.length(), db_name.ptr());
           LOG_WARN("invalid database name. ", K(catalog_id), K(db_name));
-        } else if (OB_FAIL(schema_checker_->check_db_access(session_priv, session_info_->get_enable_role_array(), catalog_id, db_name))) {
+        } else if (is_uc_remote_catalog(catalog_id)
+                   && OB_FAIL(share::ObUnifiedCatalogUtils::validate_database(
+                       tenant_id,
+                       params_.uc_catalog_ctx_->get_access_token(),
+                       params_.uc_catalog_ctx_->get_remote_catalog_name(),
+                       db_name,
+                       *schema_checker_->get_schema_guard(),
+                       *allocator_,
+                       need_local_db_access))) {
+          LOG_WARN("failed to validate Unified Catalog database",
+                   K(ret),
+                   K(catalog_id),
+                   K(db_name));
+        } else if ((!is_uc_remote_catalog(catalog_id) || need_local_db_access)
+                   && OB_FAIL(schema_checker_->check_db_access(
+                       session_priv,
+                       session_info_->get_enable_role_array(),
+                       need_local_db_access ? OB_INTERNAL_CATALOG_ID : catalog_id,
+                       db_name))) {
           SQL_ENG_LOG(WARN, "fail to check user privilege", K(db_name), K(ret));
           if (params_.disable_privilege_check_ == PRIV_CHECK_FLAG_DISABLE) {
             LOG_WARN("db access privilege check is disabled");
@@ -85,6 +115,9 @@ int ObUseDatabaseResolver::resolve(const ParseNode &parse_tree)
           }
         }
         if (OB_SUCC(ret)) {
+          if (is_uc_remote_catalog(catalog_id) && !need_local_db_access) {
+            session_priv.db_priv_set_ = 0;
+          }
           if (OB_FAIL(schema_checker_->get_database_schema(tenant_id, database_id, db_schema))) {
             LOG_WARN("failed to get db schema", K(ret), K(database_id));
           } else {

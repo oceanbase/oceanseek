@@ -1750,6 +1750,8 @@ public:
   int get_compatibility_version(uint64_t &compat_version) const;
   int get_security_version(uint64_t &security_version) const;
   uint64_t get_current_default_catalog() const;
+  bool is_uc_or_ext_catalog_id() const;
+  bool is_uc_or_ext_catalog_id(const uint64_t catalog_id) const;
   int check_feature_enable(const share::ObCompatFeatureType feature_type, bool &is_enable) const;
   void trace_all_sys_vars() const;
   void reuse_labels() { labels_.reuse(); }

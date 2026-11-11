@@ -33,6 +33,9 @@ ObPhysicalPlan::ObPhysicalPlan(MemoryContext &mem_context /* = CURRENT_CONTEXT *
     autoinc_params_(allocator_),
     stmt_need_privs_(allocator_),
     stmt_ora_need_privs_(allocator_),
+    uc_table_read_privs_(allocator_),
+    uc_catalog_configured_(false),
+    uc_sync_target_(),
     audit_units_(allocator_),
     vars_(allocator_),
     sql_expression_factory_(allocator_),
@@ -167,6 +170,9 @@ void ObPhysicalPlan::reset()
   autoinc_params_.reset();
   stmt_need_privs_.reset();
   stmt_ora_need_privs_.reset();
+  uc_table_read_privs_.reset();
+  uc_catalog_configured_ = false;
+  uc_sync_target_.reset();
   audit_units_.reset();
   vars_.reset();
   sql_expression_factory_.destroy();
@@ -454,6 +460,32 @@ int ObPhysicalPlan::set_stmt_need_privs(const ObStmtNeedPrivs& stmt_need_privs)
   stmt_need_privs_.reset();
   if (OB_FAIL(stmt_need_privs_.deep_copy(stmt_need_privs, allocator_))) {
     LOG_WARN("Failed to deep copy ObStmtNeedPrivs", K_(stmt_need_privs));
+  }
+  return ret;
+}
+
+int ObPhysicalPlan::set_uc_table_read_privs(const ObStmtNeedPrivs &read_privs,
+                                            const bool uc_configured,
+                                            const ObString &sync_target)
+{
+  int ret = OB_SUCCESS;
+  uc_table_read_privs_.reset();
+  uc_sync_target_.reset();
+  uc_catalog_configured_ = uc_configured;
+  if (OB_FAIL(uc_table_read_privs_.need_privs_.reserve(read_privs.need_privs_.count()))) {
+    LOG_WARN("failed to reserve UC table read privileges", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < read_privs.need_privs_.count(); ++i) {
+    ObNeedPriv need_priv;
+    if (OB_FAIL(need_priv.deep_copy(read_privs.need_privs_.at(i), allocator_))) {
+      LOG_WARN("failed to copy UC table read privilege", K(ret));
+    } else if (OB_FAIL(uc_table_read_privs_.need_privs_.push_back(need_priv))) {
+      LOG_WARN("failed to save UC table read privilege", K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && uc_configured
+      && OB_FAIL(ob_write_string(allocator_, sync_target, uc_sync_target_))) {
+    LOG_WARN("failed to copy UC routing target", K(ret));
   }
   return ret;
 }

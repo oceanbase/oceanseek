@@ -76,6 +76,7 @@ int ObResolverParams::assign(const ObResolverParams &other)
   is_returning_ = other.is_returning_;
   is_in_view_ = other.is_in_view_;
   is_htable_ = other.is_htable_;
+  uc_catalog_ctx_ = other.uc_catalog_ctx_;
 
   if (OB_FAIL(global_hint_.assign(other.global_hint_))) {
     LOG_WARN("fail to assign global hint", K(ret));

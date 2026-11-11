@@ -1108,8 +1108,12 @@ int ObSQLUtils::get_synced_catalog_id(share::schema::ObSchemaGetterGuard &schema
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid tenant config", K(ret), K(tenant_id));
   } else {
+    const char *unified_config = tenant_config->unified_catalog_config.str();
     const char *sync_target = tenant_config->catalog_sync_target.str();
-    if (NULL == sync_target || '\0' == sync_target[0]) {
+    if (NULL != unified_config && '\0' != unified_config[0]) {
+      // In Unified Catalog mode catalog_sync_target names a remote Unified Catalog,
+      // not a local external Catalog schema.
+    } else if (NULL == sync_target || '\0' == sync_target[0]) {
       // no sync target configured
     } else {
       ObString catalog_name(sync_target);

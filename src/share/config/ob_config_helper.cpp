@@ -5,6 +5,8 @@
 #define USING_LOG_PREFIX SHARE
 
 #include "ob_config_helper.h"
+#include "share/catalog/ob_unified_catalog_config.h"
+#include "lib/allocator/page_arena.h"
 #include "share/ob_resource_limit.h"
 #include "share/vector_index/ob_vector_index_async_task_util.h"
 #include "src/observer/ob_server.h"
@@ -24,6 +26,17 @@ using namespace plugin;
 
 namespace common
 {
+
+bool ObConfigUnifiedCatalogChecker::check(const ObConfigItem &t) const
+{
+  bool valid = '\0' == t.str()[0];
+  if (!valid && GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_6_3_1) {
+    ObArenaAllocator allocator("UnifiedConfig");
+    share::ObUnifiedCatalogConfig config;
+    valid = OB_SUCCESS == config.parse(ObString(t.str()), allocator);
+  }
+  return valid;
+}
 
 bool ObConfigIpChecker::check(const ObConfigItem &t) const
 {

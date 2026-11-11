@@ -30,7 +30,7 @@ int ObDropOutlineResolver::resolve(const ParseNode &parse_tree)
   } else if (OB_ISNULL(params_.session_info_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("session info is NULL");
-  } else if (OB_UNLIKELY(is_external_catalog_id(session_info_->get_current_default_catalog()))) {
+  } else if (OB_UNLIKELY(session_info_->is_uc_or_ext_catalog_id())) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "drop outline in catalog is");
   } else if (OB_ISNULL(drop_outline_stmt = create_stmt<ObDropOutlineStmt>())) {

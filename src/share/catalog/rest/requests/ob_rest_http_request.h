@@ -39,9 +39,12 @@ class ObRestHttpRequest
 {
 public:
   explicit ObRestHttpRequest(common::ObIAllocator &allocator)
-    : method_(HTTP_METHOD_INVALID), url_(),
+    : method_(HTTP_METHOD_INVALID), url_(), base_url_(),
       query_param_map_(), header_map_(),
       content_type_(), body_(),
+      connect_timeout_ms_(0),
+      request_timeout_ms_(0),
+      follow_redirects_(true),
       allocator_(allocator)
   {
   }
@@ -51,6 +54,8 @@ public:
 
   int set_url(const ObString &url) { return ob_write_string(allocator_, url, url_, true /*c_style*/); }
   const ObString &get_url() const { return url_; }
+  int set_base_url(const ObString &base_url) { return ob_write_string(allocator_, base_url, base_url_, true /*c_style*/); }
+  const ObString &get_base_url() const { return base_url_; }
   int get_concat_url(ObString &concat_url) const;
 
   int add_query_param(const ObString &name, const ObString &value);
@@ -75,6 +80,15 @@ public:
 
   int set_body(const ObString &body) { return ob_write_string(allocator_, body, body_); }
   const ObString &get_body() const { return body_; }
+
+  void set_connect_timeout_ms(const int64_t timeout_ms) { connect_timeout_ms_ = timeout_ms; }
+  int64_t get_connect_timeout_ms() const { return connect_timeout_ms_; }
+  void set_request_timeout_ms(const int64_t timeout_ms) { request_timeout_ms_ = timeout_ms; }
+  int64_t get_request_timeout_ms() const { return request_timeout_ms_; }
+  void set_follow_redirects(const bool follow_redirects) {
+    follow_redirects_ = follow_redirects;
+  }
+  bool get_follow_redirects() const { return follow_redirects_; }
   TO_STRING_KV(K_(method), K_(url),  
                K_(content_type), 
                K_(body));
@@ -82,10 +96,14 @@ public:
 private:
   ObRestHttpMethod method_;
   ObString url_;
+  ObString base_url_;
   common::hash::ObHashMap<common::ObString, common::ObString> query_param_map_;
   common::hash::ObHashMap<common::ObString, common::ObString> header_map_;
   ObString content_type_;
   ObString body_;
+  int64_t connect_timeout_ms_;
+  int64_t request_timeout_ms_;
+  bool follow_redirects_;
   common::ObIAllocator &allocator_;
   static constexpr int64_t DEFAULT_MAP_BUCKET_NUM = 4;
 private:

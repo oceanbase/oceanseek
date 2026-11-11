@@ -379,6 +379,7 @@ trx_2pc_retry_interval
 ttl_duty_time
 ttl_thread_score
 undo_retention
+unified_catalog_config
 unit_gc_wait_time
 user_block_cache_priority
 user_row_cache_priority

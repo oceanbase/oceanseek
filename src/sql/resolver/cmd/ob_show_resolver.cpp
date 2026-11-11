@@ -14,6 +14,11 @@
 #include "share/catalog/ob_catalog_utils.h"
 #include "share/external_table/ob_external_table_utils.h"
 #include "sql/result_catalog/ob_result_scan_catalog.h"
+#include "share/catalog/ob_unified_catalog.h"
+#include "share/catalog/ob_unified_catalog_config.h"
+#include "share/catalog/ob_unified_catalog_client.h"
+#include "share/config/ob_server_config.h"
+#include "lib/utility/ob_print_utils.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::share;
@@ -258,7 +263,9 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
           } else if (OB_UNLIKELY(OB_INVALID_ID == show_db_id)) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("database id is invalid", K(ret), K(show_db_id));
-          } else if (OB_FAIL(check_db_access_for_show_sql(catalog_id, show_resv_ctx, session_priv, enable_role_id_array))) {
+          } else if (!is_uc_remote_catalog(catalog_id)
+                     && OB_FAIL(check_db_access_for_show_sql(
+                            catalog_id, show_resv_ctx, session_priv, enable_role_id_array))) {
             LOG_WARN("check db access for show sql failed", K(ret));
           } else {
             /* (parse_tree.children_[2]->value_)&1        ->  FULL
@@ -390,17 +397,28 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
               ObString catalog_name;
               catalog_name.assign_ptr(from_node->str_value_, static_cast<ObString::obstr_size_t>(from_node->str_len_));
               ObSchemaGetterGuard *schema_guard = schema_checker_->get_schema_guard();
-              if (OB_FAIL(schema_checker_->get_catalog_id_name(real_tenant_id, catalog_name, catalog_id))) {
+              if (OB_FAIL(share::ObUnifiedCatalog::is_configured(real_tenant_id)
+                              ? resolve_read_catalog_name(real_tenant_id, catalog_name, catalog_id)
+                              : schema_checker_->get_catalog_id_name(real_tenant_id, catalog_name, catalog_id))) {
                 LOG_WARN("failed to get catalog schema", K(ret));
               } else if (catalog_id == OB_INTERNAL_CATALOG_ID) {
                 // do nothing
-              } else if (OB_FAIL(schema_guard->check_catalog_access(session_priv, enable_role_id_array, catalog_name))) {
+              } else if (!is_uc_remote_catalog(catalog_id)
+                         && OB_FAIL(schema_guard->check_catalog_access(session_priv,
+                                                                       enable_role_id_array,
+                                                                       catalog_name))) {
                 LOG_WARN("failed to check catalog access", K(ret));
+              }
+            } else if (share::ObUnifiedCatalog::is_configured(real_tenant_id)
+                       && session_info_->is_uc_or_ext_catalog_id(catalog_id)) {
+              ObString catalog_name;
+              if (OB_FAIL(resolve_catalog_node(NULL, catalog_id, catalog_name))) {
+                LOG_WARN("failed to resolve selected UC Catalog", K(ret));
               }
             }
             if (OB_SUCC(ret)
                 && !show_db_status
-                && !is_external_catalog_id(catalog_id)
+                && !session_info_->is_uc_or_ext_catalog_id(catalog_id)
                 && NULL == from_node) {
               if (OB_ISNULL(session_info_)) {
                 ret = OB_ERR_UNEXPECTED;
@@ -439,7 +457,7 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
                     K(condition_node->children_[1]));
               } else {
                 if (show_db_status) {
-                  if (is_external_catalog_id(catalog_id)) {
+                  if (session_info_->is_uc_or_ext_catalog_id(catalog_id)) {
                     ret = OB_NOT_SUPPORTED;
                     LOG_USER_ERROR(OB_NOT_SUPPORTED, "show database status like in catalog is");
                   } else {
@@ -450,7 +468,7 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
                     GEN_SQL_STEP_2(ObShowSqlSet::SHOW_DATABASES_STATUS_LIKE, OB_SYS_DATABASE_NAME, OB_TENANT_VIRTUAL_DATABASE_STATUS_TNAME);
                   }
                 } else {
-                  if (is_external_catalog_id(catalog_id)) {
+                  if (session_info_->is_uc_or_ext_catalog_id(catalog_id)) {
                     GEN_SQL_STEP_1(ObShowSqlSet::SHOW_CATALOG_DATABASES_LIKE,
                                    static_cast<ObString::obstr_size_t>(
                                    show_resv_ctx.condition_node_->children_[0]->str_len_), // cast int64_t to obstr_size_t
@@ -505,7 +523,7 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
               }
             } else {
               if (show_db_status) {
-                if (is_external_catalog_id(catalog_id)) {
+                if (session_info_->is_uc_or_ext_catalog_id(catalog_id)) {
                   ret = OB_NOT_SUPPORTED;
                   LOG_USER_ERROR(OB_NOT_SUPPORTED, "show database status in catalog is");
                 } else {
@@ -513,7 +531,7 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
                   GEN_SQL_STEP_2(ObShowSqlSet::SHOW_DATABASES_STATUS, OB_SYS_DATABASE_NAME, OB_TENANT_VIRTUAL_DATABASE_STATUS_TNAME);
                 }
               } else {
-                if (is_external_catalog_id(catalog_id)) {
+                if (session_info_->is_uc_or_ext_catalog_id(catalog_id)) {
                   GEN_SQL_STEP_1(ObShowSqlSet::SHOW_CATALOG_DATABASES);
                   GEN_SQL_STEP_2(ObShowSqlSet::SHOW_CATALOG_DATABASES,
                                  OB_SYS_DATABASE_NAME,
@@ -693,7 +711,7 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
       }
       case T_SHOW_CREATE_DATABASE: {
         [&] {
-          if (is_external_catalog_id(catalog_id)) {
+          if (session_info_->is_uc_or_ext_catalog_id(catalog_id)) {
             ret = OB_NOT_SUPPORTED;
             LOG_USER_ERROR(OB_NOT_SUPPORTED, "show create database in catalog is");
           } else if (is_oracle_mode) {
@@ -788,6 +806,9 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
                 } else { }//do nothing
               }
             } else if (OB_SUCC(ret) && !is_result_scan_show
+                       && is_uc_remote_catalog(show_catalog_id)) {
+              allow_show = true;
+            } else if (OB_SUCC(ret) && !is_result_scan_show
                        && OB_FAIL(schema_checker_->check_table_show(
                               session_priv, enable_role_id_array, catalog_id, show_db_name,
                               show_table_name, allow_show))) {
@@ -818,7 +839,7 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
       }
       case T_SHOW_CHECK_TABLE:
       {
-        if (is_external_catalog_id(catalog_id)) {
+        if (session_info_->is_uc_or_ext_catalog_id(catalog_id)) {
           ret = OB_NOT_SUPPORTED;
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "show check table in catalog is");
         } else if (OB_FAIL(resolve_show_check_table(parse_tree, show_resv_ctx, select_sql))) {
@@ -926,7 +947,7 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
       }
       case T_SHOW_CREATE_TRIGGER: {
         [&] {
-          if (is_external_catalog_id(catalog_id)) {
+          if (session_info_->is_uc_or_ext_catalog_id(catalog_id)) {
             ret = OB_NOT_SUPPORTED;
             LOG_USER_ERROR(OB_NOT_SUPPORTED, "show create trigger in catalog is");
           } else if (OB_UNLIKELY(parse_tree.num_child_ != 1 || NULL == parse_tree.children_)) {
@@ -1001,7 +1022,7 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
                                                 T_SHOW_INDEXES, real_tenant_id, show_catalog_id, show_db_name, show_db_id,
                                                 show_table_name, show_table_id, is_view, synonym_checker))) {
               LOG_WARN("fail to resolve show from table", K(ret));
-            } else if (is_external_catalog_id(show_catalog_id)) {
+            } else if (session_info_->is_uc_or_ext_catalog_id(show_catalog_id)) {
               ret = OB_NOT_SUPPORTED;
               LOG_USER_ERROR(OB_NOT_SUPPORTED, "show indexes in catalog is");
             } else if (!is_oracle_mode) {
@@ -1268,7 +1289,7 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
       }
       case T_SHOW_TABLE_STATUS: {
         [&] {
-          if (is_external_catalog_id(catalog_id)) {
+          if (session_info_->is_uc_or_ext_catalog_id(catalog_id)) {
             ret = OB_NOT_SUPPORTED;
             LOG_USER_ERROR(OB_NOT_SUPPORTED, "show table status in catalog is");
           } else if (OB_UNLIKELY(parse_tree.num_child_ != 2 || NULL == parse_tree.children_)) {
@@ -1323,7 +1344,7 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
       case T_SHOW_PROCEDURE_STATUS: //fallthrough
       case T_SHOW_FUNCTION_STATUS: {
         [&] {
-          if (is_external_catalog_id(catalog_id)) {
+          if (session_info_->is_uc_or_ext_catalog_id(catalog_id)) {
             ret = OB_NOT_SUPPORTED;
             LOG_USER_ERROR(OB_NOT_SUPPORTED, "show procedure/function status in catalog is");
           } else if (is_oracle_mode) {
@@ -1368,7 +1389,7 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
       }
       case T_SHOW_TRIGGERS: {
         [&] {
-          if (is_external_catalog_id(catalog_id)) {
+          if (session_info_->is_uc_or_ext_catalog_id(catalog_id)) {
             ret = OB_NOT_SUPPORTED;
             LOG_USER_ERROR(OB_NOT_SUPPORTED, "show triggers in catalog is");
           } else if (is_oracle_mode) {
@@ -1867,7 +1888,7 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
         break;
       }
       case T_SHOW_SEQUENCES: {
-        if (is_external_catalog_id(catalog_id)) {
+        if (session_info_->is_uc_or_ext_catalog_id(catalog_id)) {
           ret = OB_NOT_SUPPORTED;
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "show sequence in catalog is");
         } else if (is_oracle_mode) {
@@ -2074,11 +2095,32 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
         } else {
           show_resv_ctx.stmt_type_ = stmt::T_SHOW_CATALOGS;
           uint64_t tenant_id = is_oracle_mode ? session_info_->get_effective_tenant_id() : sql_tenant_id;
-          GEN_SQL_STEP_1(ObShowSqlSet::SHOW_CATALOGS);
-          GEN_SQL_STEP_2(ObShowSqlSet::SHOW_CATALOGS,
-                         REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME),
-                         REAL_NAME(OB_ALL_CATALOG_TNAME, OB_ALL_VIRTUAL_CATALOG_REAL_AGENT_ORA_TNAME),
-                         tenant_id);
+          const bool uc_configured = ObUnifiedCatalog::is_configured(real_tenant_id);
+          ObString access_token;
+          if (uc_configured
+              && OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR__UNIFIED_CATALOG_TOKEN, access_token))) {
+            LOG_WARN("failed to get UC session token", K(ret));
+          } else if (uc_configured && !access_token.empty()) {
+            if (is_oracle_mode) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_USER_ERROR(OB_NOT_SUPPORTED, "SHOW CATALOGS in UC Oracle mode is");
+            } else {
+              GEN_SQL_STEP_1(ObShowSqlSet::SHOW_CATALOGS);
+              GEN_SQL_STEP_2(ObShowSqlSet::SHOW_CATALOGS,
+                             REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME),
+                             REAL_NAME(OB_ALL_CATALOG_TNAME, OB_ALL_VIRTUAL_CATALOG_REAL_AGENT_ORA_TNAME),
+                             tenant_id);
+              if (OB_SUCC(ret) && OB_FAIL(resolve_show_uc_catalogs(select_sql))) {
+                LOG_WARN("failed to resolve accessible UC Catalogs", K(ret));
+              }
+            }
+          } else {
+            GEN_SQL_STEP_1(ObShowSqlSet::SHOW_CATALOGS);
+            GEN_SQL_STEP_2(ObShowSqlSet::SHOW_CATALOGS,
+                           REAL_NAME(OB_SYS_DATABASE_NAME, OB_ORA_SYS_SCHEMA_NAME),
+                           REAL_NAME(OB_ALL_CATALOG_TNAME, OB_ALL_VIRTUAL_CATALOG_REAL_AGENT_ORA_TNAME),
+                           tenant_id);
+          }
         }
         break;
       }
@@ -2100,8 +2142,13 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
                                   static_cast<ObString::obstr_size_t>(parse_tree.children_[0]->str_len_));
           ObSchemaGetterGuard *schema_guard = schema_checker_->get_schema_guard();
           uint64_t catalog_id = OB_INVALID_ID;
-          if (OB_FAIL(schema_checker_->get_catalog_id_name(real_tenant_id, catalog_name, catalog_id))) {
+          if (OB_FAIL(share::ObUnifiedCatalog::is_configured(real_tenant_id)
+                          ? resolve_read_catalog_name(real_tenant_id, catalog_name, catalog_id)
+                          : schema_checker_->get_catalog_id_name(real_tenant_id, catalog_name, catalog_id))) {
             LOG_WARN("failed to get catalog schema", K(ret));
+          } else if (is_uc_remote_catalog(catalog_id)) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "SHOW CREATE CATALOG for a UC Catalog is");
           } else if (catalog_id == OB_INTERNAL_CATALOG_ID) {
             // do nothing
           } else if (OB_FAIL(schema_guard->check_catalog_access(session_priv, enable_role_id_array, catalog_name))) {
@@ -2403,6 +2450,64 @@ int ObShowResolver::resolve(const ParseNode &parse_tree)
       } else if (OB_FAIL(select_stmt->formalize_stmt(session_info_))) {
         LOG_WARN("pull select stmt all expr relation ids failed", K(ret));
       }
+    }
+  }
+  return ret;
+}
+
+int ObShowResolver::resolve_show_uc_catalogs(ObString &select_sql)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = session_info_->get_effective_tenant_id();
+  ObUnifiedCatalogConfig config;
+  ObUnifiedCatalogClient client(*allocator_);
+  ObString access_token;
+  ObSEArray<ObString, 8> catalog_names;
+  ObNameCaseMode case_mode = OB_NAME_CASE_INVALID;
+  ObSqlString catalog_sql;
+  if (OB_FAIL(config.load(tenant_id, *allocator_))) {
+    LOG_WARN("failed to load Unified Catalog configuration", K(ret), K(tenant_id));
+  } else if (OB_FAIL(ObUnifiedCatalog::get_session_token(*session_info_, *allocator_, access_token))) {
+    LOG_WARN("failed to get Unified Catalog session token", K(ret));
+  } else if (OB_FAIL(client.init_connection(config, access_token,
+                                            static_cast<uint64_t>(GCONF.cluster_id), tenant_id))) {
+    LOG_WARN("failed to initialize Unified Catalog connection", K(ret));
+  } else if (OB_FAIL(client.reader().list_accessible_catalog_names(catalog_names))) {
+    LOG_WARN("failed to list accessible Unified Catalogs", K(ret));
+  } else if (OB_FAIL(session_info_->get_name_case_mode(case_mode))) {
+    LOG_WARN("failed to get name case mode", K(ret));
+  } else if (OB_FAIL(catalog_sql.append_fmt("SELECT `Catalog` FROM ((%.*s)",
+                                            static_cast<int>(select_sql.length()),
+                                            select_sql.ptr()))) {
+    LOG_WARN("failed to initialize UC Catalog result SQL", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < catalog_names.count(); ++i) {
+    const ObCatalogSchema *local_schema = NULL;
+    ObCStringHelper helper;
+    const char *hex_name = NULL;
+    if (ObCatalogUtils::is_internal_catalog_name(catalog_names.at(i), case_mode)) {
+      ret = OB_OP_NOT_ALLOW;
+      LOG_USER_ERROR(OB_OP_NOT_ALLOW, "Unified Catalog name conflicts with local Catalog");
+      LOG_WARN("Unified Catalog name conflicts with internal Catalog", K(ret), K(catalog_names.at(i)));
+    } else if (OB_FAIL(schema_checker_->get_schema_guard()->get_catalog_schema_by_name(
+                   tenant_id, catalog_names.at(i), local_schema))) {
+      LOG_WARN("failed to check local Catalog name", K(ret), K(i));
+    } else if (OB_NOT_NULL(local_schema) && is_external_catalog_id(local_schema->get_catalog_id())) {
+      ret = OB_OP_NOT_ALLOW;
+      LOG_USER_ERROR(OB_OP_NOT_ALLOW, "Unified Catalog name conflicts with local Catalog");
+      LOG_WARN("Unified Catalog name conflicts with local Catalog", K(ret), K(catalog_names.at(i)));
+    } else if (OB_FAIL(helper.convert(ObHexStringWrap(catalog_names.at(i)), hex_name))) {
+      LOG_WARN("failed to encode UC Catalog name", K(ret));
+    } else if (OB_FAIL(catalog_sql.append_fmt(
+                   " UNION ALL SELECT CONVERT(X'%s' USING utf8mb4)", hex_name))) {
+      LOG_WARN("failed to append UC Catalog result SQL", K(ret));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(catalog_sql.append(") uc_catalogs ORDER BY `Catalog` asc"))) {
+      LOG_WARN("failed to finish UC Catalog result SQL", K(ret));
+    } else if (OB_FAIL(ob_write_string(*allocator_, catalog_sql.string(), select_sql))) {
+      LOG_WARN("failed to copy UC Catalog result SQL", K(ret));
     }
   }
   return ret;
@@ -2803,9 +2908,17 @@ int ObShowResolver::get_database_info_with_catalog(uint64_t &catalog_id,
       if (OB_NOT_NULL(catalog_name_node)) {
         ObString catalog_name;
         catalog_name.assign_ptr(catalog_name_node->str_value_, static_cast<ObString::obstr_size_t>(catalog_name_node->str_len_));
-        if (OB_FAIL(schema_checker_->get_catalog_id_name(real_tenant_id, catalog_name, catalog_id))) {
+        if (OB_FAIL(share::ObUnifiedCatalog::is_configured(real_tenant_id)
+                        ? resolve_read_catalog_name(real_tenant_id, catalog_name, catalog_id)
+                        : schema_checker_->get_catalog_id_name(real_tenant_id, catalog_name, catalog_id))) {
           LOG_WARN("failed to get catalog schema", K(ret));
         } 
+      } else if (share::ObUnifiedCatalog::is_configured(real_tenant_id)
+                 && session_info_->is_uc_or_ext_catalog_id(catalog_id)) {
+        ObString catalog_name;
+        if (OB_FAIL(resolve_catalog_node(NULL, catalog_id, catalog_name))) {
+          LOG_WARN("failed to resolve selected UC Catalog", K(ret));
+        }
       }
 
       if (OB_FAIL(ret)) {
@@ -2824,7 +2937,13 @@ int ObShowResolver::get_database_info_with_catalog(uint64_t &catalog_id,
       LOG_WARN("no database selected");
     } else {
       show_resv_ctx.show_database_name_ = session_database_name;
-      if (OB_FAIL(schema_checker_->get_database_id(real_tenant_id, catalog_id, session_database_name, show_db_id))) {
+      ObString catalog_name;
+      if (share::ObUnifiedCatalog::is_configured(real_tenant_id)
+          && session_info_->is_uc_or_ext_catalog_id(catalog_id)
+          && OB_FAIL(resolve_catalog_node(NULL, catalog_id, catalog_name))) {
+        LOG_WARN("failed to resolve selected UC Catalog", K(ret));
+      } else if (OB_FAIL(resolve_catalog_database_id(
+                     real_tenant_id, catalog_id, session_database_name, show_db_id))) {
         LOG_WARN("fail to get database_id", K(ret), K(catalog_id), K(session_database_name), K(real_tenant_id));
       }
     }
@@ -3083,12 +3202,22 @@ int ObShowResolver::resolve_show_from_table(const ParseNode *from_table_node,
         if (show_table_name.empty()) {
           ret = OB_WRONG_TABLE_NAME;
           LOG_WARN("table name is empty", K(ret));
-        } else if (OB_FAIL(resolve_show_from_database(*from_database_clause_node->children_[0],
-                                                      real_tenant_id,
-                                                      show_catalog_id,
-                                                      show_database_id,
-                                                      show_database_name))) {
-          LOG_WARN("fail to resolve show from database", K(ret), K(real_tenant_id));
+        } else {
+          if (share::ObUnifiedCatalog::is_configured(real_tenant_id)
+              && session_info_->is_uc_or_ext_catalog_id(show_catalog_id)) {
+            ObString catalog_name;
+            if (OB_FAIL(resolve_catalog_node(NULL, show_catalog_id, catalog_name))) {
+              LOG_WARN("failed to resolve selected UC Catalog", K(ret));
+            }
+          }
+          if (OB_SUCC(ret)
+              && OB_FAIL(resolve_show_from_database(*from_database_clause_node->children_[0],
+                                                    real_tenant_id,
+                                                    show_catalog_id,
+                                                    show_database_id,
+                                                    show_database_name))) {
+            LOG_WARN("fail to resolve show from database", K(ret), K(real_tenant_id));
+          }
         }
       }
     }
@@ -3100,16 +3229,34 @@ int ObShowResolver::resolve_show_from_table(const ParseNode *from_table_node,
       org_session_id = schema_checker_->get_schema_mgr()->get_session_id();
       schema_checker_->get_schema_mgr()->set_session_id(0);
     }
+    const bool is_uc_catalog = is_uc_remote_catalog(show_catalog_id);
+    ObSqlSchemaGuard *sql_schema_guard = is_uc_catalog
+                                         ? schema_checker_->get_sql_schema_guard()
+                                         : NULL;
     if (OB_FAIL(ret)) {
       // do nothing
-    } else if (OB_FAIL(schema_checker_->get_table_schema(real_tenant_id,
-                                                         show_catalog_id,
-                                                         show_database_id,
-                                                         show_table_name,
-                                                         is_index,
-                                                         false, /*cte_table_fisrt false*/
-                                                         false/*is_hidden*/,
-                                                         table_schema))) {
+    } else if (is_uc_catalog && OB_ISNULL(sql_schema_guard)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("SQL schema guard is null", K(ret));
+    } else if (is_uc_catalog
+               && OB_FAIL(sql_schema_guard->get_uc_table_schema(*params_.uc_catalog_ctx_,
+                                                                real_tenant_id,
+                                                                show_catalog_id,
+                                                                show_database_id,
+                                                                show_database_name,
+                                                                show_table_name,
+                                                                table_schema))) {
+      LOG_WARN("get table schema failed", K(ret),
+               K(real_tenant_id), K(show_catalog_id), K(show_database_id), K(show_table_name));
+    } else if (!is_uc_catalog
+               && OB_FAIL(schema_checker_->get_table_schema(real_tenant_id,
+                                                            show_catalog_id,
+                                                            show_database_id,
+                                                            show_table_name,
+                                                            is_index,
+                                                            false, /*cte_table_fisrt false*/
+                                                            false/*is_hidden*/,
+                                                            table_schema))) {
       LOG_WARN("get table schema failed", K(ret),
                K(real_tenant_id), K(show_catalog_id), K(show_database_id), K(show_table_name));
     } else if (OB_UNLIKELY(NULL == table_schema)) {
@@ -3388,6 +3535,13 @@ int ObShowResolver::parse_and_resolve_select_sql(const ObString &select_sql)
           LOG_WARN("set session variable failed", K(ret));
         } else if (OB_FAIL(ObSelectResolver::resolve(*select_stmt_node))) {
           LOG_WARN("resolve select in view definition failed", K(ret), K(select_stmt_node));
+          if (share::ObUnifiedCatalog::is_configured(session_info_->get_effective_tenant_id())) {
+            const int tmp_ret = session_info_->update_sys_variable(
+                ObSysVarClassType::SYS_VAR__CURRENT_DEFAULT_CATALOG, previous_catalog_id_obj);
+            if (OB_SUCCESS != tmp_ret) {
+              LOG_WARN("reset session variable failed", K(tmp_ret));
+            }
+          }
         } else if (OB_FAIL(session_info_->update_sys_variable(ObSysVarClassType::SYS_VAR__CURRENT_DEFAULT_CATALOG, previous_catalog_id_obj))) {
           LOG_WARN("reset session variable failed", K(ret));
         }

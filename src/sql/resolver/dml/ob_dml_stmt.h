@@ -231,6 +231,7 @@ struct TableItem
     cte_type_ = CTEType::NOT_CTE;
     type_ = BASE_TABLE;
     is_view_table_ = false;
+    is_uc_table_ = false;
     for_update_ = false;
     for_update_wait_us_ = -1;
     skip_locked_ = false;
@@ -419,6 +420,7 @@ struct TableItem
   bool is_system_table_;
   bool is_index_table_; //just for index table resolver
   bool is_view_table_; //for VIEW privilege check
+  bool is_uc_table_;
   bool is_recursive_union_fake_table_; //mark whether this table is a tmp fake table for resolve the recursive cte table
   share::schema::ObTableType table_type_;
   CTEType cte_type_;

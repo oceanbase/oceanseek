@@ -18,6 +18,7 @@
 #include "lib/stat/ob_diagnostic_info_container.h"
 #include "observer/ob_server.h"
 #include "share/catalog/ob_catalog_utils.h"
+#include "share/catalog/ob_unified_catalog.h"
 #include "sql/optimizer/ob_route_policy.h"
 #include "lib/number/ob_number_v2.h"
 #include "sql/engine/cmd/ob_variable_set_executor.h"
@@ -1036,7 +1037,7 @@ int ObBasicSessionInfo::update_database_variables(ObSchemaGetterGuard *schema_gu
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid schema guard is NULL", K(ret));
   } else {
-    if ('\0' == thread_data_.database_name_[0] || is_external_catalog_id(get_current_default_catalog())) {
+    if ('\0' == thread_data_.database_name_[0] || is_uc_or_ext_catalog_id()) {
       // no default database
       ObObj val;
       if (OB_FAIL(get_sys_variable(SYS_VAR_CHARACTER_SET_SERVER, val))) {
@@ -7200,6 +7201,17 @@ int ObBasicSessionInfo::get_compatibility_version(uint64_t &compat_version) cons
 uint64_t ObBasicSessionInfo::get_current_default_catalog() const
 {
   return sys_vars_cache_.get_current_default_catalog();
+}
+
+bool ObBasicSessionInfo::is_uc_or_ext_catalog_id() const
+{
+  return is_uc_or_ext_catalog_id(get_current_default_catalog());
+}
+
+bool ObBasicSessionInfo::is_uc_or_ext_catalog_id(const uint64_t catalog_id) const
+{
+  return is_external_catalog_id(catalog_id)
+         || share::ObUnifiedCatalog::is_child_catalog_id(get_effective_tenant_id(), catalog_id);
 }
 
 int ObBasicSessionInfo::get_security_version(uint64_t &security_version) const

@@ -1683,6 +1683,9 @@ int ObSelectResolver::set_for_update_mysql(ObSelectStmt &stmt, const int64_t wai
     if (OB_ISNULL(table_item = stmt.get_table_item(idx))) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("Table item is NULL", K(ret));
+    } else if (table_item->is_uc_table_) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "UC locking read is");
     } else if (table_item->is_basic_table()) {
       table_item->for_update_ = true;
       table_item->for_update_wait_us_ = wait_us;

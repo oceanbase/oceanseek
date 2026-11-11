@@ -16,6 +16,7 @@ namespace sql {
 struct ObSqlCtx;
 struct ObDmlTableInfo;
 class ObStmt;
+struct TableItem;
 
 typedef int (*ObGetStmtNeedPrivsFunc) (const share::schema::ObSessionPrivInfo &session_priv,
                                        const ObStmt *basic_stmt,
@@ -24,6 +25,19 @@ typedef int (*ObGetStmtNeedPrivsFunc) (const share::schema::ObSessionPrivInfo &s
 typedef int (*ObGetStmtOraNeedPrivsFunc) (const share::schema::ObSessionPrivInfo &session_priv,
                                           const ObStmt *basic_stmt,
                                           common::ObIArray<share::schema::ObOraNeedPriv> &need_privs);
+
+struct ObUcTableReadAccessContext
+{
+  explicit ObUcTableReadAccessContext(common::ObIAllocator &allocator)
+    : table_read_privs_(allocator),
+      catalog_configured_(false),
+      sync_target_()
+  {}
+
+  share::schema::ObStmtNeedPrivs table_read_privs_;
+  bool catalog_configured_;
+  common::ObString sync_target_;
+};
 
 class ObPrivilegeCheck {
 public:
@@ -44,6 +58,13 @@ public:
                                  const ObStmt *basic_stmt,
                                  share::schema::ObStmtNeedPrivs &stmt_need_privs,
                                  share::schema::ObStmtOraNeedPrivs &stmt_ora_need_privs);
+
+  static int prepare_uc_table_read_access(const ObSqlCtx &ctx,
+                                          const ObStmt *basic_stmt,
+                                          ObUcTableReadAccessContext &uc_read_ctx);
+
+  static int check_uc_table_read_access(const ObSqlCtx &ctx,
+                                        const share::schema::ObStmtNeedPrivs &table_read_privs);
 
   static int check_ora_privilege(const ObSqlCtx &ctx,
                                  const share::schema::ObStmtOraNeedPrivs &stmt_ora_need_priv);
@@ -103,6 +124,20 @@ public:
                                  ObPrivSet priv_set,
                                  bool &has_priv);
 private:
+  struct UcReadStmtContext {
+    const ObStmt *stmt_;
+    const TableItem *write_target_;
+    TO_STRING_KV(KP_(stmt), KP_(write_target));
+  };
+  static int collect_uc_table_read_privs(
+      const ObStmt *basic_stmt,
+      const TableItem *write_target,
+      common::ObIArray<UcReadStmtContext> &visited_stmts,
+      common::ObIArray<share::schema::ObNeedPriv> &table_read_privs);
+  static int add_uc_table_read_priv(
+      const TableItem &table_item,
+      common::ObIArray<share::schema::ObNeedPriv> &table_read_privs);
+
    ///Extract priv info needed by a single stmt, may be sub-query.
    ///called by recursive_stmt_need_priv
    ///@param ctx[in]               sql ctx

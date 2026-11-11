@@ -1,6 +1,6 @@
 /**
- * Copyright (C) 2026 OceanBase
- * 本文件包含机密及专有信息，未经授权不得使用或披露。
+ * Copyright (c) 2026 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #define USING_LOG_PREFIX SQL_ENG
@@ -8,6 +8,8 @@
 
 #include "observer/ob_server_struct.h"
 #include "share/schema/ob_schema_getter_guard.h"
+#include "share/catalog/ob_unified_catalog.h"
+#include "sql/session/ob_sql_session_info.h"
 #include "sql/engine/cmd/ob_catalog_sync_helper.h"
 #include "sql/engine/ob_exec_context.h"
 #include "sql/resolver/ddl/ob_sync_catalog_stmt.h"
@@ -21,10 +23,15 @@ namespace sql
 int ObSyncCatalogExecutor::execute(ObExecContext &ctx, ObSyncCatalogStmt &stmt)
 {
   int ret = OB_SUCCESS;
+  ObString uc_access_token;
   ObSchemaGetterGuard schema_guard;
   const ObTableSchema *table_schema = nullptr;
-  UNUSED(ctx);
-  if (OB_ISNULL(GCTX.schema_service_)) {
+  if (OB_NOT_NULL(ctx.get_my_session())
+      && share::ObUnifiedCatalog::is_configured(ctx.get_my_session()->get_effective_tenant_id())
+      && OB_FAIL(share::ObUnifiedCatalog::get_session_token(
+          *ctx.get_my_session(), ctx.get_allocator(), uc_access_token))) {
+    LOG_WARN("failed to get Unified Catalog execution token", K(ret));
+  } else if (OB_ISNULL(GCTX.schema_service_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("schema service is null", K(ret));
   } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(stmt.get_tenant_id(),
@@ -42,7 +49,9 @@ int ObSyncCatalogExecutor::execute(ObExecContext &ctx, ObSyncCatalogStmt &stmt)
       ret = OB_TABLE_NOT_EXIST;
       LOG_WARN("table does not exist", K(ret), K(stmt.get_table_id()));
     } else if (OB_FAIL(ObCatalogSyncHelper::sync_table(stmt.get_tenant_id(),
+                                                       uc_access_token,
                                                        stmt.get_catalog_id(),
+                                                       stmt.get_catalog_name(),
                                                        schema_guard,
                                                        stmt.get_database_name(),
                                                        *table_schema))) {
@@ -53,7 +62,9 @@ int ObSyncCatalogExecutor::execute(ObExecContext &ctx, ObSyncCatalogStmt &stmt)
     }
   } else if (ObSyncCatalogStmt::DATABASE_SCOPE == stmt.get_sync_scope()) {
     if (OB_FAIL(ObCatalogSyncHelper::sync_database(stmt.get_tenant_id(),
+                                                   uc_access_token,
                                                    stmt.get_catalog_id(),
+                                                   stmt.get_catalog_name(),
                                                    schema_guard,
                                                    stmt.get_database_id(),
                                                    stmt.get_database_name()))) {
@@ -61,7 +72,9 @@ int ObSyncCatalogExecutor::execute(ObExecContext &ctx, ObSyncCatalogStmt &stmt)
     }
   } else if (ObSyncCatalogStmt::CATALOG_SCOPE == stmt.get_sync_scope()) {
     if (OB_FAIL(ObCatalogSyncHelper::sync_catalog(stmt.get_tenant_id(),
+                                                  uc_access_token,
                                                   stmt.get_catalog_id(),
+                                                  stmt.get_catalog_name(),
                                                   schema_guard))) {
       LOG_WARN("failed to sync full catalog", K(ret), K(stmt.get_catalog_name()));
     }

@@ -25,6 +25,8 @@ int ObBaseRestClient::init(const ObRestCatalogProperties &properties)
     LOG_WARN("failed to write uri", K(ret), K(properties.uri_));
   } else if (OB_FAIL(do_init(properties))) {
     LOG_WARN("failed to init client", K(ret));
+    allocator_->free(uri_.ptr());
+    uri_.reset();
   } else {
     is_inited_ = true;
   }

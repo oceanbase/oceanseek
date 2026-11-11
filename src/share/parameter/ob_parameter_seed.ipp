@@ -3010,8 +3010,15 @@ DEF_BOOL(_enable_filesystem_catalog, OB_CLUSTER_PARAMETER, "False",
          "Enable or disable filesystem catalog",
          ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_STR(catalog_sync_target, OB_TENANT_PARAMETER, "",
-        "The name of the external catalog to sync with. Empty means no sync.",
+        "The synchronization destination. It names the local HMS catalog when "
+        "unified_catalog_config is empty, or the remote Unified Catalog otherwise. "
+        "Empty means no synchronization target.",
         ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+DEF_STR_WITH_CHECKER(unified_catalog_config, OB_TENANT_PARAMETER, "",
+                     common::ObConfigUnifiedCatalogChecker,
+                     "Unified Catalog connection settings as JSON with endpoint and realm. "
+                     "Empty disables Unified Catalog.",
+                     ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_CAP(_parquet_row_group_prebuffer_size, OB_CLUSTER_PARAMETER, "0M", "[0M,)",
         "the parquet prefetch maximum row group size. Range: [0, +∞)",
         ObParameterAttr(Section::SSTABLE, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));

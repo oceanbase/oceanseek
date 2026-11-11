@@ -90,7 +90,8 @@ public:
                                      bool is_oracle_sys_view = false,
                                      char **dblink_name_ptr = NULL,
                                      int32_t *dblink_name_len = NULL,
-                                     bool *has_dblink_node = NULL);
+                                     bool *has_dblink_node = NULL,
+                                     uint64_t *resolved_catalog_id = NULL);
 
   int resolve_table_relation_node(const ParseNode *node,
                                 common::ObString &table_name,
@@ -201,10 +202,52 @@ public:
 
   int check_table_name_equal(const ObString &name1, const ObString &name2, bool &equal);
 protected:
+  bool is_uc_remote_catalog(const uint64_t catalog_id) const;
+  static int cvt_uc_db_name_to_org(ObSqlSchemaGuard &sql_schema_guard,
+                                   const ObUcCatalogContext &uc_catalog_ctx,
+                                   const ObSQLSessionInfo *session,
+                                   const uint64_t catalog_id,
+                                   common::ObString &db_name,
+                                   ObIAllocator *allocator);
+  int resolve_catalog_database_id(const uint64_t tenant_id,
+                                  const uint64_t catalog_id,
+                                  const common::ObString &database_name,
+                                  uint64_t &database_id);
   int normalize_table_or_database_names(common::ObString &name);
   int resolve_catalog_node(const ParseNode *catalog_node, uint64_t &catalog_id, common::ObString &catalog_name);
+  int resolve_read_catalog_name(const uint64_t tenant_id,
+                                common::ObString &catalog_name,
+                                uint64_t &catalog_id);
 
 private:
+  enum class ObSyncTargetReadRoute
+  {
+    INVALID,
+    INTERNAL_CATALOG,
+    UNIFIED_CATALOG
+  };
+  int resolve_selected_catalog_identity(const uint64_t tenant_id,
+                                        uint64_t &catalog_id,
+                                        common::ObString &catalog_name,
+                                        common::ObString &access_token,
+                                        bool &is_remote_uc_catalog);
+  int bind_selected_uc_catalog(const common::ObString &access_token,
+                               const common::ObString &catalog_name,
+                               const uint64_t catalog_id);
+  int resolve_table_reference_catalog_node(const ParseNode *catalog_node,
+                                           uint64_t &catalog_id,
+                                           common::ObString &catalog_name);
+  int resolve_table_catalog_node(const ParseNode *catalog_node,
+                                 const ParseNode &relation_node,
+                                 uint64_t &catalog_id,
+                                 common::ObString &catalog_name);
+  int resolve_sync_target_read_route(const uint64_t tenant_id,
+                                     const common::ObString &catalog_name,
+                                     const ParseNode &relation_node,
+                                     const common::ObNameCaseMode case_mode,
+                                     ObSyncTargetReadRoute &route);
+  static bool is_sync_target(const uint64_t tenant_id,
+                              const common::ObString &catalog_name);
   // disallow copy
   DISALLOW_COPY_AND_ASSIGN(ObStmtResolver);
   bool is_catalog_supported_stmt_(share::ObCatalogProperties::CatalogType catalog_type);

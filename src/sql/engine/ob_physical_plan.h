@@ -312,6 +312,12 @@ public:
   { return stmt_ora_need_privs_; }
   int set_stmt_need_privs(const share::schema::ObStmtNeedPrivs& stmt_need_privs);
   int set_stmt_ora_need_privs(const share::schema::ObStmtOraNeedPrivs& stmt_need_privs);
+  const share::schema::ObStmtNeedPrivs &get_uc_table_read_privs() const { return uc_table_read_privs_; }
+  bool is_uc_catalog_configured() const { return uc_catalog_configured_; }
+  const common::ObString &get_uc_sync_target() const { return uc_sync_target_; }
+  int set_uc_table_read_privs(const share::schema::ObStmtNeedPrivs &read_privs,
+                              const bool uc_configured,
+                              const common::ObString &sync_target);
   inline const common::ObIArray<ObAuditUnit> &get_audit_units() const
   { return audit_units_; }
   int set_audit_units(const common::ObIArray<ObAuditUnit>& audit_units);
@@ -658,6 +664,10 @@ private:
   // for privilege check
   share::schema::ObStmtNeedPrivs stmt_need_privs_;
   share::schema::ObStmtOraNeedPrivs stmt_ora_need_privs_;
+  // Local permission-cache metadata; remote execution is authorized by the coordinator.
+  share::schema::ObStmtNeedPrivs uc_table_read_privs_;
+  bool uc_catalog_configured_;
+  common::ObString uc_sync_target_;
   // for security audit
   common::ObFixedArray<ObAuditUnit, common::ObIAllocator> audit_units_;
   // 涉及到的系统变量和用户变量

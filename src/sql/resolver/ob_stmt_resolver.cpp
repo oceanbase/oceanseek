@@ -6,7 +6,15 @@
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ob_stmt_resolver.h"
 
+#include "observer/omt/ob_tenant_config_mgr.h"
 #include "share/catalog/ob_catalog_utils.h"
+#include "share/catalog/ob_unified_catalog.h"
+#include "share/catalog/ob_unified_catalog_schema_codec.h"
+#include "share/catalog/ob_unified_catalog_utils.h"
+#include "share/schema/ob_schema_struct.h"
+#include "sql/ob_sql_context.h"
+#include "sql/ob_uc_catalog_context.h"
+#include "sql/table_format/unified/ob_unified_catalog_metadata_provider.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "lib/string/ob_sql_string.h"
 #include "lib/utility/ob_tracepoint.h"
@@ -17,6 +25,81 @@ using namespace common;
 using namespace share::schema;
 namespace sql
 {
+
+bool ObStmtResolver::is_uc_remote_catalog(const uint64_t catalog_id) const
+{
+  return OB_NOT_NULL(params_.uc_catalog_ctx_)
+         && params_.uc_catalog_ctx_->is_remote_catalog(catalog_id);
+}
+
+int ObStmtResolver::cvt_uc_db_name_to_org(sql::ObSqlSchemaGuard &sql_schema_guard,
+                                          const ObUcCatalogContext &uc_catalog_ctx,
+                                          const ObSQLSessionInfo *session,
+                                          const uint64_t catalog_id,
+                                          common::ObString &db_name,
+                                          ObIAllocator *allocator)
+{
+  int ret = OB_SUCCESS;
+  const ObDatabaseSchema *database_schema = NULL;
+  uint64_t tenant_id = OB_INVALID_TENANT_ID;
+  if (OB_ISNULL(session) || !uc_catalog_ctx.is_remote_catalog(catalog_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid UC database name request", K(ret), K(catalog_id));
+  } else if (OB_FALSE_IT(tenant_id = session->get_effective_tenant_id())) {
+  } else if (OB_FAIL(sql_schema_guard.get_uc_catalog_database_schema(uc_catalog_ctx,
+                                                                     tenant_id,
+                                                                     catalog_id,
+                                                                     db_name,
+                                                                     database_schema))) {
+    LOG_WARN("fail to get UC database schema", K(ret), K(tenant_id), K(catalog_id), K(db_name));
+  } else if (OB_ISNULL(database_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null", K(ret));
+  } else {
+    db_name = database_schema->get_database_name();
+    if (OB_NOT_NULL(allocator)) {
+      OZ(ob_write_string(*allocator, db_name, db_name));
+    }
+  }
+  return ret;
+}
+
+int ObStmtResolver::resolve_catalog_database_id(const uint64_t tenant_id,
+                                                const uint64_t catalog_id,
+                                                const ObString &database_name,
+                                                uint64_t &database_id)
+{
+  int ret = OB_SUCCESS;
+  if (is_uc_remote_catalog(catalog_id)) {
+    ObSqlSchemaGuard *sql_schema_guard = schema_checker_->get_sql_schema_guard();
+    const ObDatabaseSchema *database_schema = NULL;
+    if (OB_ISNULL(sql_schema_guard)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("SQL schema guard is null", K(ret));
+    } else {
+      database_id = OB_INVALID_ID;
+      if (OB_FAIL(sql_schema_guard->get_uc_catalog_database_schema(
+              *params_.uc_catalog_ctx_,
+              tenant_id,
+              catalog_id,
+              database_name,
+              database_schema))) {
+        LOG_WARN("failed to get UC database schema", K(ret));
+        LOG_WARN("failed to get UC database ID", K(ret), K(tenant_id), K(catalog_id), K(database_name));
+      } else if (OB_ISNULL(database_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("UC database schema must not be null", K(ret));
+        LOG_WARN("failed to get UC database ID", K(ret), K(tenant_id), K(catalog_id), K(database_name));
+      } else {
+        database_id = database_schema->get_database_id();
+      }
+    }
+  } else if (OB_FAIL(schema_checker_->get_database_id(
+                 tenant_id, catalog_id, database_name, database_id))) {
+    LOG_WARN("failed to get database ID", K(ret), K(tenant_id), K(catalog_id), K(database_name));
+  }
+  return ret;
+}
 
 uint64_t ObStmtResolver::generate_table_id()
 {
@@ -199,6 +282,7 @@ int ObStmtResolver::resolve_db_and_catalog_info(const ParseNode *node,
   int ret = OB_SUCCESS;
   ParseNode *db_node = NULL;
   ParseNode *catalog_node = NULL;
+  ObSqlSchemaGuard *sql_schema_guard = schema_checker_->get_sql_schema_guard();
   catalog_id = OB_INTERNAL_CATALOG_ID;
   if(node->num_child_ == 4 && OB_NOT_NULL(node->children_[3])){
     catalog_node = node->children_[3];
@@ -209,9 +293,34 @@ int ObStmtResolver::resolve_db_and_catalog_info(const ParseNode *node,
   }
   if (OB_FAIL(ret)) {
     // do nothing
-  } else if (OB_FAIL(resolve_catalog_node(catalog_node, catalog_id, catalog_name))) {
+  } else if (OB_NOT_NULL(catalog_node) && params_.is_from_show_resolver_
+             && share::ObUnifiedCatalog::is_configured(session_info_->get_effective_tenant_id())) {
+    catalog_name.assign_ptr(catalog_node->str_value_,
+                            static_cast<ObString::obstr_size_t>(catalog_node->str_len_));
+    if (OB_FAIL(resolve_read_catalog_name(session_info_->get_effective_tenant_id(),
+                                          catalog_name,
+                                          catalog_id))) {
+      LOG_WARN("failed to resolve UC Catalog", K(ret), K(catalog_name));
+    }
+  } else if (is_org || params_.is_resolve_fake_cte_table_) {
+    if (OB_FAIL(resolve_table_reference_catalog_node(catalog_node,
+                                                     catalog_id,
+                                                     catalog_name))) {
+      LOG_WARN("fail to resolve catalog node", K(ret), K(catalog_id), K(catalog_name));
+    }
+  } else if (OB_FAIL(resolve_table_catalog_node(catalog_node,
+                                                *node,
+                                                catalog_id,
+                                                catalog_name))) {
     LOG_WARN("fail to resolve catalog node", K(ret), K(catalog_id), K(catalog_name));
-  } else if (OB_UNLIKELY(is_external_catalog_id(catalog_id))) {
+  } else if (is_uc_remote_catalog(catalog_id)
+             && !params_.is_from_show_resolver_
+             && (OB_ISNULL(get_basic_stmt()) || !get_basic_stmt()->is_select_stmt())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "UC table operation is");
+  } else if (OB_UNLIKELY(
+                 is_external_catalog_id(catalog_id)
+                 && !is_uc_remote_catalog(catalog_id))) {
     share::ObCatalogProperties::CatalogType catalog_type = share::ObCatalogProperties::CatalogType::INVALID_TYPE;
     const ObCatalogSchema *catalog_schema = nullptr;
     uint64_t tenant_id = session_info_->get_effective_tenant_id();
@@ -240,7 +349,15 @@ int ObStmtResolver::resolve_db_and_catalog_info(const ParseNode *node,
     if(OB_FAIL(normalize_and_validate_name(db_name, type))){
       LOG_WARN("fail to normalize and validate database name", K(ret), K(db_name));
     } else {
-      if (is_external_catalog_id(catalog_id)) {
+      if (is_uc_remote_catalog(catalog_id)) {
+        CK(OB_NOT_NULL(sql_schema_guard));
+        OZ(cvt_uc_db_name_to_org(*sql_schema_guard,
+                                 *params_.uc_catalog_ctx_,
+                                 session_info_,
+                                 catalog_id,
+                                 db_name,
+                                 allocator_));
+      } else if (is_external_catalog_id(catalog_id)) {
         CK(OB_NOT_NULL(schema_checker_->get_sql_schema_guard()));
         OZ(ObSQLUtils::cvt_db_name_to_org(*schema_checker_->get_sql_schema_guard(),
                                           session_info_,
@@ -296,7 +413,12 @@ int ObStmtResolver::resolve_index_info_particularly(common::ObString &table_name
   const bool is_hidden = session_info_->is_table_name_hidden();
   const bool is_built_in_index = true;
   ObNameType type = ObNameType::NAME_TYPE_TABLE;
-  if (OB_FAIL(schema_checker_->check_table_exists(tenant_id, db_name, table_name, true, is_hidden, is_index_table, catalog_id))) {
+  if (is_uc_remote_catalog(catalog_id)) {
+    if (OB_FAIL(normalize_and_validate_name(table_name, type, stmt_type, false))) {
+      LOG_WARN("fail to check and convert table name", K(ret), K(table_name), K(stmt_type), K(is_index_table));
+    }
+  } else if (OB_FAIL(schema_checker_->check_table_exists(
+                 tenant_id, db_name, table_name, true, is_hidden, is_index_table, catalog_id))) {
     LOG_WARN("fail to check and convert table name", K(tenant_id), K(db_name), K(table_name), K(ret));
   } else if (!is_index_table && // check again
       OB_FAIL(schema_checker_->check_table_exists(tenant_id, db_name, table_name, true, is_hidden, is_index_table, is_built_in_index))) {
@@ -323,7 +445,8 @@ int ObStmtResolver::resolve_table_relation_node_v2(const ParseNode *node,
                                                    bool is_oracle_sys_view,
                                                    char **dblink_name_ptr,
                                                    int32_t *dblink_name_len,
-                                                   bool *has_dblink_node)
+                                                   bool *has_dblink_node,
+                                                   uint64_t *resolved_catalog_id)
 {
   int ret = OB_SUCCESS;
   is_db_explicit = false;
@@ -349,6 +472,9 @@ int ObStmtResolver::resolve_table_relation_node_v2(const ParseNode *node,
       ret = tmp_ret;
       LOG_WARN("fail to resolve table name", K(ret), K(table_name));
     }
+  }
+  if (OB_SUCC(ret) && OB_NOT_NULL(resolved_catalog_id)) {
+    *resolved_catalog_id = catalog_id;
   }
   return ret;
 }
@@ -580,6 +706,11 @@ int ObStmtResolver::resolve_catalog_node(const ParseNode *catalog_node, uint64_t
     if (share::ObCatalogUtils::is_internal_catalog_name(catalog_node_str, case_mode)) {
       catalog_id = OB_INTERNAL_CATALOG_ID;
       catalog_name = is_oracle_mode() ? OB_INTERNAL_CATALOG_NAME_UPPER : OB_INTERNAL_CATALOG_NAME;
+    } else if (share::ObUnifiedCatalog::is_configured(tenant_id)) {
+      catalog_name = catalog_node_str;
+      if (OB_FAIL(resolve_read_catalog_name(tenant_id, catalog_name, catalog_id))) {
+        LOG_WARN("failed to resolve UC Catalog", K(ret), K(catalog_name));
+      }
     } else {
       if (OB_FAIL(schema_checker_->get_schema_guard()->get_catalog_schema_by_name(tenant_id, catalog_node_str, catalog_schema))) {
         LOG_WARN("failed to get catalog schema by name", K(ret), K(tenant_id), K(catalog_node_str));
@@ -593,21 +724,471 @@ int ObStmtResolver::resolve_catalog_node(const ParseNode *catalog_node, uint64_t
         catalog_id = catalog_schema->get_catalog_id();
       }
     }
-  } else if (is_external_catalog_id(catalog_id)) {
+  } else if (is_external_catalog_id(catalog_id)
+             || share::ObUnifiedCatalog::is_child_catalog_id(tenant_id, catalog_id)) {
     // if catalog ParseNode is null, deduce catalog from session's catalog_id
     // catalog is not explict specific, use catalog_id from session
     if (OB_FAIL(schema_checker_->get_schema_guard()->get_catalog_schema_by_id(tenant_id, catalog_id, catalog_schema))) {
       LOG_WARN("failed to get catalog schema by name", K(ret), K(tenant_id), K(catalog_id));
     } else if (OB_ISNULL(catalog_schema)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_USER_ERROR(OB_ERR_UNEXPECTED, "current session's catalog is not existed");
+      ObString access_token;
+      if (share::ObUnifiedCatalog::is_child_catalog_id(tenant_id, catalog_id)
+          && OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR__UNIFIED_CATALOG_TOKEN,
+                                                     access_token))) {
+        LOG_WARN("failed to get UC session token", K(ret));
+      } else if (access_token.empty()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_USER_ERROR(OB_ERR_UNEXPECTED, "current session's catalog is not existed");
+      } else {
+        const uint64_t selected_child_catalog_id = catalog_id;
+        if (OB_FAIL(share::ObUnifiedCatalogUtils::resolve_catalog_name(
+                tenant_id,
+                access_token,
+                selected_child_catalog_id,
+                *schema_checker_->get_schema_guard(),
+                *allocator_,
+                catalog_name))) {
+          LOG_WARN("failed to resolve selected UC Catalog name",
+                   K(ret),
+                   K(selected_child_catalog_id));
+        } else if (OB_FAIL(resolve_read_catalog_name(tenant_id, catalog_name, catalog_id))) {
+          LOG_WARN("failed to resolve selected UC Catalog", K(ret), K(catalog_name));
+        } else if (catalog_id != selected_child_catalog_id
+                   && !share::ObCatalogUtils::is_internal_catalog_name(catalog_name, case_mode)) {
+          ret = OB_STATE_NOT_MATCH;
+          LOG_WARN("selected UC Catalog ID changed",
+                   K(ret),
+                   K(selected_child_catalog_id),
+                   K(catalog_id));
+        }
+      }
     } else if (OB_FAIL(ob_write_string(*allocator_, catalog_schema->get_catalog_name(), catalog_name))) {
       // use catalog name from CatalogSchema and deep copy it
       LOG_WARN("deep copy catalog_name failed", K(ret));
+    } else if (share::ObUnifiedCatalog::is_configured(tenant_id)
+               && (params_.is_from_show_resolver_ || OB_ISNULL(get_basic_stmt())
+                   || !get_basic_stmt()->is_select_stmt())
+               && OB_FAIL(resolve_read_catalog_name(tenant_id, catalog_name, catalog_id))) {
+      LOG_WARN("failed to resolve selected Catalog", K(ret), K(catalog_name));
     }
   } else {
     // do nothing
     // use INTERNAL_CATALOG_ID and INTERNAL_CATALOG_NAME
+  }
+  return ret;
+}
+
+bool ObStmtResolver::is_sync_target(const uint64_t tenant_id,
+                                       const ObString &catalog_name)
+{
+  bool is_target = false;
+  omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
+  if (tenant_config.is_valid() && share::ObUnifiedCatalog::is_configured(tenant_id)) {
+    const char *target = tenant_config->catalog_sync_target.str();
+    is_target = OB_NOT_NULL(target) && '\0' != target[0]
+                && catalog_name == ObString(target);
+  }
+  return is_target;
+}
+
+int ObStmtResolver::resolve_selected_catalog_identity(const uint64_t tenant_id,
+                                                      uint64_t &catalog_id,
+                                                      ObString &catalog_name,
+                                                      ObString &access_token,
+                                                      bool &is_remote_uc_catalog)
+{
+  int ret = OB_SUCCESS;
+  const ObCatalogSchema *catalog_schema = NULL;
+  is_remote_uc_catalog = false;
+  access_token.reset();
+  catalog_id = session_info_->get_current_default_catalog();
+  catalog_name = is_oracle_mode() ? OB_INTERNAL_CATALOG_NAME_UPPER : OB_INTERNAL_CATALOG_NAME;
+  if (is_external_catalog_id(catalog_id)
+      || share::ObUnifiedCatalog::is_child_catalog_id(tenant_id, catalog_id)) {
+    if (OB_FAIL(schema_checker_->get_schema_guard()->get_catalog_schema_by_id(
+            tenant_id, catalog_id, catalog_schema))) {
+      LOG_WARN("failed to get selected Catalog schema", K(ret), K(tenant_id), K(catalog_id));
+    } else if (OB_NOT_NULL(catalog_schema)) {
+      if (OB_FAIL(ob_write_string(*allocator_, catalog_schema->get_catalog_name(), catalog_name))) {
+        LOG_WARN("failed to copy selected Catalog name", K(ret), K(catalog_id));
+      }
+    } else {
+      if (share::ObUnifiedCatalog::is_child_catalog_id(tenant_id, catalog_id)
+          && OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR__UNIFIED_CATALOG_TOKEN,
+                                                     access_token))) {
+        LOG_WARN("failed to get UC session token", K(ret));
+      } else if (access_token.empty()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_USER_ERROR(OB_ERR_UNEXPECTED, "current session's catalog is not existed");
+      } else if (OB_FAIL(share::ObUnifiedCatalogUtils::resolve_catalog_name(
+                     tenant_id,
+                     access_token,
+                     catalog_id,
+                     *schema_checker_->get_schema_guard(),
+                     *allocator_,
+                     catalog_name))) {
+        LOG_WARN("failed to resolve selected UC Catalog name",
+                 K(ret),
+                 K(tenant_id),
+                 K(catalog_id));
+      } else {
+        is_remote_uc_catalog = true;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObStmtResolver::bind_selected_uc_catalog(const ObString &access_token,
+                                             const ObString &catalog_name,
+                                             const uint64_t catalog_id)
+{
+  int ret = OB_SUCCESS;
+  if (is_oracle_mode()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "UC Catalog in Oracle mode is");
+  } else if (OB_ISNULL(params_.uc_catalog_ctx_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("UC Catalog context is not initialized", K(ret));
+  } else if (OB_FAIL(params_.uc_catalog_ctx_->set_remote_catalog(*allocator_,
+                                                                  access_token,
+                                                                  catalog_name,
+                                                                  catalog_id))) {
+    LOG_WARN("failed to save selected UC Catalog context", K(ret), K(catalog_name));
+  }
+  return ret;
+}
+
+// Original-name and fake CTE paths do not probe a Unified Catalog table type.
+int ObStmtResolver::resolve_table_reference_catalog_node(const ParseNode *catalog_node,
+                                                         uint64_t &catalog_id,
+                                                         ObString &catalog_name)
+{
+  int ret = OB_SUCCESS;
+  uint64_t tenant_id = OB_INVALID_TENANT_ID;
+  ObNameCaseMode case_mode = OB_NAME_CASE_INVALID;
+  ObString selected_access_token;
+  bool is_selected_remote_uc_catalog = false;
+  const bool is_explicit_catalog = OB_NOT_NULL(catalog_node);
+  if (OB_UNLIKELY(NULL == session_info_ || NULL == allocator_ || NULL == schema_checker_
+                  || NULL == schema_checker_->get_schema_guard())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret));
+  } else if (OB_FALSE_IT(tenant_id = session_info_->get_effective_tenant_id())) {
+  } else if (params_.is_from_show_resolver_ || OB_ISNULL(get_basic_stmt())
+             || !get_basic_stmt()->is_select_stmt()) {
+    if (OB_FAIL(resolve_catalog_node(catalog_node, catalog_id, catalog_name))) {
+      LOG_WARN("failed to resolve table reference Catalog", K(ret), K(catalog_name));
+    }
+  } else if (OB_FAIL(session_info_->get_name_case_mode(case_mode))) {
+    LOG_WARN("failed to get name case mode", K(ret));
+  } else {
+    if (is_explicit_catalog) {
+      catalog_name.assign_ptr(catalog_node->str_value_,
+                              static_cast<ObString::obstr_size_t>(catalog_node->str_len_));
+    } else if (OB_FAIL(resolve_selected_catalog_identity(tenant_id,
+                                                         catalog_id,
+                                                         catalog_name,
+                                                         selected_access_token,
+                                                         is_selected_remote_uc_catalog))) {
+      LOG_WARN("failed to resolve selected Catalog identity", K(ret), K(catalog_id));
+    }
+    if (OB_SUCC(ret)) {
+      const bool is_explicit_non_internal_catalog = is_explicit_catalog
+                                                    && !share::ObCatalogUtils::is_internal_catalog_name(
+                                                        catalog_name, case_mode);
+      if ((is_explicit_non_internal_catalog || is_selected_remote_uc_catalog)
+          && is_sync_target(tenant_id, catalog_name)) {
+        catalog_id = OB_INTERNAL_CATALOG_ID;
+        catalog_name = is_oracle_mode() ? OB_INTERNAL_CATALOG_NAME_UPPER : OB_INTERNAL_CATALOG_NAME;
+      } else if (is_explicit_catalog
+                 && OB_FAIL(resolve_catalog_node(catalog_node, catalog_id, catalog_name))) {
+        LOG_WARN("failed to resolve table reference Catalog", K(ret), K(catalog_name));
+      } else if (is_selected_remote_uc_catalog
+                 && OB_FAIL(bind_selected_uc_catalog(selected_access_token,
+                                                     catalog_name,
+                                                     catalog_id))) {
+        LOG_WARN("failed to bind selected UC Catalog", K(ret), K(catalog_name));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObStmtResolver::resolve_table_catalog_node(const ParseNode *catalog_node,
+                                               const ParseNode &relation_node,
+                                               uint64_t &catalog_id,
+                                               ObString &catalog_name)
+{
+  int ret = OB_SUCCESS;
+  uint64_t tenant_id = OB_INVALID_TENANT_ID;
+  ObNameCaseMode case_mode = OB_NAME_CASE_INVALID;
+  ObSyncTargetReadRoute route = ObSyncTargetReadRoute::INVALID;
+  ObString selected_access_token;
+  bool is_selected_remote_uc_catalog = false;
+  const bool is_explicit_catalog = OB_NOT_NULL(catalog_node);
+  if (OB_UNLIKELY(NULL == session_info_ || NULL == allocator_ || NULL == schema_checker_
+                  || NULL == schema_checker_->get_schema_guard())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", K(ret));
+  } else if (OB_FALSE_IT(tenant_id = session_info_->get_effective_tenant_id())) {
+  } else if (params_.is_from_show_resolver_ || OB_ISNULL(get_basic_stmt())
+             || !get_basic_stmt()->is_select_stmt()) {
+    if (OB_FAIL(resolve_catalog_node(catalog_node, catalog_id, catalog_name))) {
+      LOG_WARN("failed to resolve table Catalog", K(ret), K(catalog_name));
+    }
+  } else if (OB_FAIL(session_info_->get_name_case_mode(case_mode))) {
+    LOG_WARN("failed to get name case mode", K(ret));
+  } else {
+    if (is_explicit_catalog) {
+      catalog_name.assign_ptr(catalog_node->str_value_,
+                              static_cast<ObString::obstr_size_t>(catalog_node->str_len_));
+    } else if (OB_FAIL(resolve_selected_catalog_identity(tenant_id,
+                                                         catalog_id,
+                                                         catalog_name,
+                                                         selected_access_token,
+                                                         is_selected_remote_uc_catalog))) {
+      LOG_WARN("failed to resolve selected Catalog identity", K(ret), K(catalog_id));
+    }
+    if (OB_SUCC(ret)) {
+      const bool is_explicit_non_internal_catalog = is_explicit_catalog
+                                                    && !share::ObCatalogUtils::is_internal_catalog_name(
+                                                        catalog_name, case_mode);
+      const bool is_sync_target_catalog = (is_explicit_non_internal_catalog
+                                           || is_selected_remote_uc_catalog)
+                                          && is_sync_target(tenant_id, catalog_name);
+      if (!is_sync_target_catalog) {
+        if (is_explicit_catalog
+            && OB_FAIL(resolve_catalog_node(catalog_node, catalog_id, catalog_name))) {
+          LOG_WARN("failed to resolve table Catalog", K(ret), K(catalog_name));
+        } else if (is_selected_remote_uc_catalog
+                   && OB_FAIL(bind_selected_uc_catalog(selected_access_token,
+                                                       catalog_name,
+                                                       catalog_id))) {
+          LOG_WARN("failed to bind selected UC Catalog", K(ret), K(catalog_name));
+        }
+      } else if (OB_FAIL(resolve_sync_target_read_route(tenant_id,
+                                                        catalog_name,
+                                                        relation_node,
+                                                        case_mode,
+                                                        route))) {
+        LOG_WARN("failed to resolve sync target query route",
+                 K(ret),
+                 K(tenant_id),
+                 K(catalog_name));
+      } else if (ObSyncTargetReadRoute::INTERNAL_CATALOG == route) {
+        catalog_id = OB_INTERNAL_CATALOG_ID;
+        catalog_name = is_oracle_mode() ? OB_INTERNAL_CATALOG_NAME_UPPER : OB_INTERNAL_CATALOG_NAME;
+      } else if (ObSyncTargetReadRoute::UNIFIED_CATALOG == route) {
+        if (is_explicit_catalog) {
+          if (OB_FAIL(resolve_read_catalog_name(tenant_id, catalog_name, catalog_id))) {
+            LOG_WARN("failed to resolve UC Catalog", K(ret), K(catalog_name));
+          } else if (!is_uc_remote_catalog(catalog_id)) {
+            ret = OB_STATE_NOT_MATCH;
+            LOG_WARN("sync target query did not resolve to a UC Catalog",
+                     K(ret),
+                     K(tenant_id),
+                     K(catalog_name),
+                     K(catalog_id));
+          }
+        } else if (OB_FAIL(bind_selected_uc_catalog(selected_access_token,
+                                                    catalog_name,
+                                                    catalog_id))) {
+          LOG_WARN("failed to bind selected UC Catalog", K(ret), K(catalog_name));
+        }
+      } else {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid sync target query route", K(ret), K(tenant_id), K(catalog_name));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObStmtResolver::resolve_sync_target_read_route(const uint64_t tenant_id,
+                                                   const ObString &catalog_name,
+                                                   const ParseNode &relation_node,
+                                                   const ObNameCaseMode case_mode,
+                                                   ObSyncTargetReadRoute &route)
+{
+  int ret = OB_SUCCESS;
+  if (is_oracle_mode() || (session_info_->is_inner() && !session_info_->is_user_session())) {
+    route = ObSyncTargetReadRoute::INTERNAL_CATALOG;
+  } else {
+    ObString access_token;
+    if (OB_FAIL(
+            session_info_->get_sys_variable(share::SYS_VAR__UNIFIED_CATALOG_TOKEN, access_token))) {
+      LOG_WARN("failed to get sync target query token", K(ret), K(tenant_id), K(catalog_name));
+    } else if (access_token.empty()) {
+      route = ObSyncTargetReadRoute::INTERNAL_CATALOG;
+    } else {
+      ObString db_name = session_info_->get_database_name();
+      ObString table_name;
+      if (relation_node.num_child_ >= 1 && OB_NOT_NULL(relation_node.children_[0])) {
+        const ParseNode *db_node = relation_node.children_[0];
+        db_name.assign_ptr(db_node->str_value_, static_cast<int32_t>(db_node->str_len_));
+        if (OB_FAIL(normalize_and_validate_name(db_name, ObNameType::NAME_TYPE_DATABASE))) {
+          LOG_WARN("failed to resolve sync target query database",
+                   K(ret),
+                   K(catalog_name),
+                   K(db_name));
+        }
+      }
+      if (OB_SUCC(ret)) {
+        if (db_name.empty()) {
+          route = ObSyncTargetReadRoute::INTERNAL_CATALOG;
+        } else if (OB_FAIL(resolve_tablename_info(&relation_node, table_name))) {
+          if (OB_ERR_TOO_LONG_IDENT == ret
+              || ((session_info_->get_ddl_info().is_ddl()
+                   || session_info_->get_ddl_info().is_dummy_ddl_for_inner_visibility())
+                  && OB_WRONG_TABLE_NAME == ret)) {
+            // Preserve the existing local index-name retry.
+            ret = OB_SUCCESS;
+            route = ObSyncTargetReadRoute::INTERNAL_CATALOG;
+          } else {
+            LOG_WARN("failed to resolve sync target query table",
+                     K(ret),
+                     K(catalog_name),
+                     K(db_name),
+                     K(table_name));
+          }
+        } else {
+          uint64_t system_database_id = OB_INVALID_ID;
+          bool is_system_table = false;
+          if (0 == db_name.case_compare(OB_SYS_DATABASE_NAME)) {
+            system_database_id = OB_SYS_DATABASE_ID;
+          } else if (0 == db_name.case_compare(OB_INFORMATION_SCHEMA_NAME)) {
+            system_database_id = OB_INFORMATION_SCHEMA_ID;
+          } else if (ObCharset::case_mode_equal(case_mode,
+                                                db_name,
+                                                ObString::make_string(OB_MYSQL_SCHEMA_NAME))) {
+            system_database_id = OB_MYSQL_SCHEMA_ID;
+          }
+          if (OB_INVALID_ID != system_database_id
+              && OB_FAIL(ObSysTableChecker::is_sys_table_name(tenant_id,
+                                                              system_database_id,
+                                                              table_name,
+                                                              is_system_table))) {
+            LOG_WARN("failed to identify native system table",
+                     K(ret),
+                     K(tenant_id),
+                     K(catalog_name),
+                     K(db_name),
+                     K(table_name));
+          } else if (is_system_table) {
+            route = ObSyncTargetReadRoute::INTERNAL_CATALOG;
+          } else {
+            share::ObUnifiedCatalogQueryTableKind query_table_kind;
+            if (OB_FAIL(ObUnifiedCatalogMetadataProvider::classify_query_table(tenant_id,
+                                                                               access_token,
+                                                                               catalog_name,
+                                                                               db_name,
+                                                                               table_name,
+                                                                               *allocator_,
+                                                                               query_table_kind))) {
+              if (OB_HTTP_NOT_FOUND == ret) {
+                // Local indexes, synonyms, and auxiliary tables need not have UC entries.
+                ret = OB_SUCCESS;
+                route = ObSyncTargetReadRoute::INTERNAL_CATALOG;
+              } else {
+                LOG_WARN("failed to identify sync target query table",
+                         K(ret),
+                         K(tenant_id),
+                         K(catalog_name),
+                         K(db_name),
+                         K(table_name));
+              }
+            } else if (share::ObUnifiedCatalogQueryTableKind::LOCAL_OB == query_table_kind) {
+              route = ObSyncTargetReadRoute::INTERNAL_CATALOG;
+            } else if (share::ObUnifiedCatalogQueryTableKind::ICEBERG == query_table_kind) {
+              route = ObSyncTargetReadRoute::UNIFIED_CATALOG;
+            } else if (share::ObUnifiedCatalogQueryTableKind::NON_LOCAL_OB == query_table_kind) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_WARN("non-local UC native OB table query is not supported",
+                       K(ret),
+                       K(tenant_id),
+                       K(catalog_name),
+                       K(db_name),
+                       K(table_name));
+            } else {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_WARN("invalid UC query table kind",
+                       K(ret),
+                       K(tenant_id),
+                       K(catalog_name),
+                       K(db_name),
+                       K(table_name));
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObStmtResolver::resolve_read_catalog_name(const uint64_t tenant_id,
+                                              ObString &catalog_name,
+                                              uint64_t &catalog_id)
+{
+  int ret = OB_SUCCESS;
+  catalog_id = OB_INVALID_ID;
+  ObNameCaseMode case_mode = OB_NAME_CASE_INVALID;
+  ObString access_token;
+  if (OB_ISNULL(schema_checker_) || OB_ISNULL(session_info_) || OB_ISNULL(allocator_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("read Catalog resolver is not initialized", K(ret));
+  } else if (!share::ObUnifiedCatalog::is_configured(tenant_id)) {
+    if (OB_FAIL(schema_checker_
+                    ->get_catalog_id_name(tenant_id, catalog_name, catalog_id, allocator_))) {
+      LOG_WARN("failed to resolve local Catalog", K(ret), K(catalog_name));
+    }
+  } else if (OB_FAIL(session_info_->get_name_case_mode(case_mode))) {
+    LOG_WARN("failed to get name case mode", K(ret));
+  } else if (share::ObCatalogUtils::is_internal_catalog_name(catalog_name, case_mode)) {
+    catalog_id = OB_INTERNAL_CATALOG_ID;
+  } else if (OB_FAIL(session_info_->get_sys_variable(share::SYS_VAR__UNIFIED_CATALOG_TOKEN, access_token))) {
+    LOG_WARN("failed to get UC session token", K(ret));
+  } else if (access_token.empty()) {
+    if (OB_FAIL(schema_checker_->get_catalog_id_name(tenant_id, catalog_name, catalog_id, allocator_))) {
+      LOG_WARN("failed to resolve local Catalog", K(ret), K(catalog_name));
+    }
+  } else if (is_oracle_mode()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "UC Catalog in Oracle mode is");
+  } else {
+    share::schema::ObSchemaGetterGuard *schema_guard = schema_checker_->get_schema_guard();
+    if (OB_ISNULL(schema_guard)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("schema guard is missing for UC Catalog resolution", K(ret));
+    } else if (OB_NOT_NULL(params_.uc_catalog_ctx_)
+               && params_.uc_catalog_ctx_->matches_identity(access_token, catalog_name)) {
+      catalog_id = params_.uc_catalog_ctx_->get_child_catalog_id();
+    } else if (OB_FAIL(share::ObUnifiedCatalogUtils::resolve_catalog_id(tenant_id,
+                                                                        access_token,
+                                                                        catalog_name,
+                                                                        *schema_guard,
+                                                                        *allocator_,
+                                                                        catalog_id))) {
+      if (OB_CATALOG_NOT_EXIST == ret) {
+        if (OB_FAIL(schema_checker_->get_catalog_id_name(tenant_id, catalog_name, catalog_id, allocator_))) {
+          LOG_WARN("failed to resolve local Catalog", K(ret), K(catalog_name));
+        }
+      } else {
+        if (OB_OP_NOT_ALLOW == ret) {
+          LOG_USER_ERROR(OB_OP_NOT_ALLOW, "Unified Catalog name conflicts with local Catalog");
+        }
+        LOG_WARN("failed to resolve remote UC Catalog", K(ret), K(catalog_name));
+      }
+    } else if (OB_ISNULL(params_.uc_catalog_ctx_)) {
+      ret = OB_NOT_INIT;
+      LOG_WARN("UC Catalog context is not initialized", K(ret));
+    } else if (OB_FAIL(params_.uc_catalog_ctx_->set_remote_catalog(*allocator_,
+                                                                   access_token,
+                                                                   catalog_name,
+                                                                   catalog_id))) {
+      LOG_WARN("failed to save remote UC Catalog context", K(ret), K(catalog_name));
+    }
   }
   return ret;
 }
@@ -716,7 +1297,7 @@ int ObStmtResolver::resolve_database_factor(const ParseNode *node,
   } else if (FALSE_IT(db_name.assign_ptr(const_cast<char*>(node->str_value_),
                                   static_cast<int32_t>(node->str_len_)))) {
     // won't be here
-  } else if (OB_FAIL(schema_checker_->get_database_id(tenant_id, catalog_id, db_name, database_id))) {
+  } else if (OB_FAIL(resolve_catalog_database_id(tenant_id, catalog_id, db_name, database_id))) {
     LOG_USER_ERROR(OB_ERR_BAD_DATABASE, db_name.length(), db_name.ptr());
   }
   return ret;

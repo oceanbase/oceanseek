@@ -7,10 +7,12 @@
 
 #include "lib/string/ob_string.h"
 #include "share/catalog/ob_cached_catalog_meta_getter.h"
+#include "share/catalog/ob_unified_catalog.h"
 #include "share/external_table/ob_external_object_ctx.h"
 #include "share/schema/ob_schema_lite_scan.h"
 #include "share/schema/ob_schema_utils.h"
 #include "sql/ob_sql_utils.h"
+#include "sql/table_format/unified/ob_unified_catalog_metadata_provider.h"
 #include "sql/session/ob_sql_session_info.h"
 
 using namespace oceanbase::common;
@@ -264,6 +266,7 @@ void ObTenantShowTables::reset()
   tenant_id_ = OB_INVALID_ID;
   database_id_ = OB_INVALID_ID;
   catalog_id_ = OB_INTERNAL_CATALOG_ID;
+  is_uc_catalog_ = false;
   table_schemas_.reset();
   catalog_table_schemas_.reset();
   table_schema_idx_ = 0;
@@ -384,7 +387,7 @@ int ObTenantShowTables::inner_get_next_row()
               if (!type_filtered && OB_NOT_NULL(catalog_schema)
                   && skip_show_table_schema_(*catalog_schema)) {
                 is_allow = false;
-              } else {
+              } else if (!is_uc_catalog_) {
                 priv_info.reset();
                 if (OB_FAIL(session_->get_session_priv_info(priv_info))) {
                   SERVER_LOG(WARN, "fail to get session priv info", K(ret));
@@ -432,9 +435,23 @@ int ObTenantShowTables::fetch_catalog_table_schemas_(const uint64_t tenant_id,
   } else {
     catalog_id_ = external_object->catalog_id;
     database_name = external_object->database_name;
-    ObCachedCatalogMetaGetter ob_catalog_meta_getter{*schema_guard_, *allocator_};
-    if (OB_FAIL(ob_catalog_meta_getter.list_table_names(tenant_id, catalog_id_, database_name, case_mode, tbl_names))) {
-      SERVER_LOG(WARN, "list_table_names failed", K(ret), K(tenant_id), K(catalog_id_), K(database_name));
+    is_uc_catalog_ = uc_catalog_ctx_.is_remote_catalog(catalog_id_);
+    if (is_uc_catalog_) {
+      if (OB_FAIL(sql::ObUnifiedCatalogMetadataProvider::list_table_names(
+              tenant_id,
+              uc_catalog_ctx_.get_access_token(),
+              uc_catalog_ctx_.get_remote_catalog_name(),
+              database_name,
+              case_mode,
+              *allocator_,
+              tbl_names))) {
+        SERVER_LOG(WARN, "failed to list UC Tables", K(ret), K(database_name));
+      }
+    } else {
+      ObCachedCatalogMetaGetter ob_catalog_meta_getter{*schema_guard_, *allocator_};
+      if (OB_FAIL(ob_catalog_meta_getter.list_table_names(tenant_id, catalog_id_, database_name, case_mode, tbl_names))) {
+        SERVER_LOG(WARN, "list_table_names failed", K(ret), K(tenant_id), K(catalog_id_), K(database_name));
+      }
     }
   }
 
@@ -442,7 +459,8 @@ int ObTenantShowTables::fetch_catalog_table_schemas_(const uint64_t tenant_id,
     share::schema::ObSimpleTableSchemaV2 table_schema;
     table_schema.set_database_id(database_id);
     table_schema.set_table_name(tbl_names.at(i));
-    table_schema.set_table_type(ObTableType::EXTERNAL_TABLE);
+    table_schema.set_table_type(is_uc_catalog_ ? ObTableType::USER_TABLE
+                                               : ObTableType::EXTERNAL_TABLE);
 
     share::schema::ObSimpleTableSchemaV2 *allocated_schema = NULL;
     if (OB_FAIL(ObSchemaUtils::alloc_schema(*allocator_, table_schema, allocated_schema))) {

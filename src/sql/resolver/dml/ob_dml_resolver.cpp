@@ -44,6 +44,7 @@
 #include "share/external_table/ob_external_table_file_mgr.h"
 #include "share/catalog/ob_catalog_utils.h"
 #include "share/catalog/ob_catalog_properties.h"
+#include "share/catalog/ob_unified_catalog.h"
 #include "sql/resolver/dcl/ob_dcl_resolver.h"
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
 #include "sql/ob_sql_mock_schema_utils.h"
@@ -8637,6 +8638,7 @@ int ObDMLResolver::resolve_base_or_alias_table_item_normal(const uint64_t tenant
   const ObTableSchema *tschema = NULL;
   const ObTableSchema *lob_owner_schema = NULL;
   bool is_lob_aux_direct_select = false;
+  bool is_uc_select = false;
   if (OB_ISNULL(stmt) || OB_ISNULL(schema_checker_) || OB_ISNULL(session_info_) || OB_ISNULL(allocator_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("resolver isn't init", K(stmt), K_(schema_checker), K_(session_info), K_(allocator));
@@ -8655,8 +8657,32 @@ int ObDMLResolver::resolve_base_or_alias_table_item_normal(const uint64_t tenant
     item->database_name_ = db_name;
     bool select_index_enabled = false;
     const bool is_hidden = session_info_->is_table_name_hidden();
+    ObSqlSchemaGuard *sql_schema_guard = schema_checker_->get_sql_schema_guard();
+    is_uc_select = stmt->is_select_stmt() && is_uc_remote_catalog(catalog_id);
     if (OB_FAIL(session_info_->is_select_index_enabled(select_index_enabled))) {
       LOG_WARN("get select index status failed", K(ret));
+    } else if (is_uc_select) {
+      if (lib::is_oracle_mode()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "UC table query in Oracle mode is");
+      } else {
+        const ObTimeTravelInfo *uc_time_travel_info =
+            OB_NOT_NULL(time_travel_info) && ObTimeTravelInfo::TimeTravelType::NONE != time_travel_info->type_
+                ? time_travel_info : NULL;
+        if (OB_ISNULL(sql_schema_guard)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("SQL schema guard is null", K(ret));
+        } else if (OB_FAIL(sql_schema_guard->get_uc_query_table_schema(*params_.uc_catalog_ctx_,
+                                                                       tenant_id,
+                                                                       catalog_id,
+                                                                       database_id,
+                                                                       db_name,
+                                                                       tbl_name,
+                                                                       tschema,
+                                                                       uc_time_travel_info))) {
+          LOG_WARN("get uc query table schema failed", K(ret));
+        }
+      }
     } else if (OB_FAIL(schema_checker_->get_table_schema(tenant_id,
                                                          catalog_id,
                                                          database_id,
@@ -8864,6 +8890,7 @@ int ObDMLResolver::resolve_base_or_alias_table_item_normal(const uint64_t tenant
           }
         }
       } else {
+        item->is_uc_table_ = is_uc_select;
         item->ref_id_ = tschema->get_table_id();
         item->table_id_ = generate_table_id();
         item->table_name_ = tbl_name;
@@ -13284,16 +13311,25 @@ int ObDMLResolver::resolve_table_relation_factor_normal(const ParseNode *node,
   ObString out_table_name;
   synonym_db_name.reset();
   bool is_public_synonym = false;
-  if (OB_FAIL(resolve_table_relation_node_v2(node, table_name, db_name, catalog_name, is_db_explicit))) {
+  const bool use_resolved_catalog_id = !params_.is_from_show_resolver_
+                                      && OB_NOT_NULL(get_basic_stmt())
+                                      && get_basic_stmt()->is_select_stmt()
+                                      && ObUnifiedCatalog::is_configured(tenant_id);
+  if (OB_FAIL(resolve_table_relation_node_v2(node, table_name, db_name, catalog_name,
+                                             is_db_explicit, false, false, NULL, NULL, NULL,
+                                             use_resolved_catalog_id ? &catalog_id : NULL))) {
     LOG_WARN("failed to resolve table relation node!", K(ret));
   } else if (params_.is_resolve_fake_cte_table_) {
+    catalog_id = OB_INTERNAL_CATALOG_ID;
     database_id = OB_CTE_DATABASE_ID;
   } else if (FALSE_IT(orig_name.assign_ptr(table_name.ptr(), table_name.length()))) {
   } else if (FALSE_IT(synonym_db_name.assign_ptr(db_name.ptr(), db_name.length()))) {
-  } else if (!ObCatalogUtils::is_internal_catalog_name(catalog_name)
-             && OB_FAIL(schema_checker_->get_catalog_id_name(tenant_id, catalog_name, catalog_id, allocator_))) {
+  } else if (!use_resolved_catalog_id && !ObCatalogUtils::is_internal_catalog_name(catalog_name)
+             && OB_FAIL(ObUnifiedCatalog::is_configured(tenant_id)
+                            ? resolve_read_catalog_name(tenant_id, catalog_name, catalog_id)
+                            : schema_checker_->get_catalog_id_name(tenant_id, catalog_name, catalog_id, allocator_))) {
     LOG_WARN("catalog not existed", K(ret), K(tenant_id), K(catalog_name));
-  } else if (OB_FAIL(schema_checker_->get_database_id(tenant_id, catalog_id, db_name, database_id))) {
+  } else if (OB_FAIL(resolve_catalog_database_id(tenant_id, catalog_id, db_name, database_id))) {
     if (OB_SCHEMA_EAGAIN != ret) {
       ret = OB_ERR_BAD_DATABASE;
       LOG_WARN("Invalid database name, database not exist", K(db_name), K(tenant_id), K(ret));
@@ -13301,14 +13337,15 @@ int ObDMLResolver::resolve_table_relation_factor_normal(const ParseNode *node,
   } else if (lib::is_oracle_mode() && 0 == db_name.case_compare(OB_SYS_DATABASE_NAME)) {
     ret = OB_ERR_BAD_DATABASE;
     LOG_WARN("Invalid database name, cannot access oceanbase db on Oracle tenant", K(db_name), K(tenant_id), K(ret));
-  } else if (OB_FAIL(resolve_table_relation_recursively(tenant_id,
-                                                        catalog_id,
-                                                        database_id,
-                                                        table_name,
-                                                        db_name,
-                                                        synonym_checker,
-                                                        is_db_explicit,
-                                                        is_public_synonym))) {
+  } else if (!is_uc_remote_catalog(catalog_id)
+             && OB_FAIL(resolve_table_relation_recursively(tenant_id,
+                                                           catalog_id,
+                                                           database_id,
+                                                           table_name,
+                                                           db_name,
+                                                           synonym_checker,
+                                                           is_db_explicit,
+                                                           is_public_synonym))) {
     if (OB_TABLE_NOT_EXIST == ret) {
       if (synonym_checker.has_synonym()) {
         if (is_public_synonym) {

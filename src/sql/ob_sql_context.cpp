@@ -5,8 +5,13 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "ob_sql_context.h"
+#include "sql/ob_uc_catalog_context.h"
 
 #include "share/catalog/ob_cached_catalog_meta_getter.h"
+#include "sql/table_format/unified/ob_unified_catalog_metadata_provider.h"
+#include "sql/table_format/iceberg/ob_iceberg_table_metadata.h"
+#include "share/catalog/ob_unified_catalog.h"
+#include "share/catalog/ob_unified_catalog_utils.h"
 #include "share/external_table/ob_external_object_ctx.h"
 #include "share/schema/ob_iceberg_table_schema.h"
 #include "sql/optimizer/ob_log_plan.h"
@@ -325,6 +330,37 @@ void ObSqlSchemaGuard::reset()
   allocator_.set_attr(ObMemAttr(MTL_ID(), "SqlSchemaGuard", ObCtxIds::DEFAULT_CTX_ID));
 }
 
+int ObUcCatalogContext::set_remote_catalog(ObIAllocator &allocator,
+                                           const ObString &access_token,
+                                           const ObString &remote_catalog_name,
+                                           const uint64_t child_catalog_id)
+{
+  int ret = OB_SUCCESS;
+  ObString copied_access_token;
+  ObString copied_remote_catalog_name;
+  if (OB_INVALID_ID == child_catalog_id
+      || remote_catalog_name.empty()
+      || access_token.empty()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid UC remote Catalog context", K(ret));
+  } else if (matches_identity(access_token, remote_catalog_name)
+             && child_catalog_id_ == child_catalog_id) {
+    // do nothing
+  } else if (has_remote_catalog()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("multiple UC Catalogs or identities in one statement are not supported", K(ret));
+  } else if (OB_FAIL(ob_write_string(allocator, remote_catalog_name, copied_remote_catalog_name))) {
+    LOG_WARN("failed to store UC remote Catalog name", K(ret));
+  } else if (OB_FAIL(ob_write_string(allocator, access_token, copied_access_token))) {
+    LOG_WARN("failed to store UC statement token", K(ret));
+  } else {
+    access_token_ = copied_access_token;
+    remote_catalog_name_ = copied_remote_catalog_name;
+    child_catalog_id_ = child_catalog_id;
+  }
+  return ret;
+}
+
 TableItem *ObSqlSchemaGuard::get_table_item_by_ref_id(const ObDMLStmt *stmt, uint64_t ref_table_id)
 {
   TableItem *table_item = NULL;
@@ -596,6 +632,148 @@ int ObSqlSchemaGuard::recover_schema_from_external_objects(const ObIArray<share:
   return ret;
 }
 
+int ObSqlSchemaGuard::recover_schema_from_external_object(
+    const share::ObExternalObject &external_object,
+    const ObBasicSessionInfo *session,
+    ObUcCatalogContext &uc_catalog_ctx)
+{
+  int ret = OB_SUCCESS;
+  bool is_uc_object = false;
+  if (share::ObUnifiedCatalog::is_configured(external_object.tenant_id)) {
+    const ObCatalogSchema *local_catalog_schema = NULL;
+    ObString access_token;
+    uint64_t child_catalog_id = OB_INVALID_ID;
+    ObString remote_catalog_name;
+    if (OB_ISNULL(schema_guard_) || OB_ISNULL(session)) {
+      ret = OB_NOT_INIT;
+      LOG_WARN("schema guard is not initialized", K(ret));
+    } else if (OB_FAIL(schema_guard_->get_catalog_schema_by_id(external_object.tenant_id,
+                                                               external_object.catalog_id,
+                                                               local_catalog_schema))) {
+      LOG_WARN("failed to get local Catalog schema", K(ret));
+    } else if (OB_ISNULL(local_catalog_schema)
+               && OB_FAIL(session->get_sys_variable(share::SYS_VAR__UNIFIED_CATALOG_TOKEN,
+                                                    access_token))) {
+      LOG_WARN("failed to get UC token for external object", K(ret));
+    } else if (OB_ISNULL(local_catalog_schema) && !access_token.empty()) {
+      is_uc_object = true;
+      if (uc_catalog_ctx.has_remote_catalog()) {
+        if (!uc_catalog_ctx.is_remote_catalog(external_object.catalog_id)) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("multiple UC Catalogs in one metadata statement are not supported", K(ret));
+        }
+      } else if (OB_FAIL(share::ObUnifiedCatalogUtils::resolve_catalog_name(
+                     external_object.tenant_id,
+                     access_token,
+                     external_object.catalog_id,
+                     *schema_guard_,
+                     allocator_,
+                     remote_catalog_name))) {
+        LOG_WARN("failed to resolve UC Catalog name for external object", K(ret));
+      } else if (OB_FAIL(share::ObUnifiedCatalogUtils::resolve_catalog_id(external_object.tenant_id,
+                                                                          access_token,
+                                                                          remote_catalog_name,
+                                                                          *schema_guard_,
+                                                                          allocator_,
+                                                                          child_catalog_id))) {
+        LOG_WARN("failed to restore UC remote Catalog ID", K(ret), K(remote_catalog_name));
+      } else if (child_catalog_id != external_object.catalog_id) {
+        ret = OB_STATE_NOT_MATCH;
+        LOG_WARN("UC external object Catalog ID changed", K(ret), K(child_catalog_id));
+      } else if (OB_FAIL(uc_catalog_ctx.set_remote_catalog(allocator_,
+                                                           access_token,
+                                                           remote_catalog_name,
+                                                           child_catalog_id))) {
+        LOG_WARN("failed to restore UC remote Catalog identity", K(ret));
+      }
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (!is_uc_object) {
+      if (OB_FAIL(recover_schema_from_external_object(external_object))) {
+        LOG_WARN("failed to recover external object schema", K(ret));
+      }
+    } else {
+      switch (external_object.type) {
+        case share::ObExternalObjectType::TABLE_SCHEMA: {
+          const ObDatabaseSchema *database_schema = NULL;
+          const ObTableSchema *table_schema = NULL;
+          if (OB_FAIL(get_database_schema(external_object.tenant_id,
+                                          external_object.database_id,
+                                          database_schema))) {
+            LOG_WARN("failed to get UC database schema", K(ret));
+          } else if (OB_ISNULL(database_schema)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("UC database schema is null", K(ret));
+          } else if (OB_FAIL(get_uc_table_schema(uc_catalog_ctx,
+                                                 external_object.tenant_id,
+                                                 external_object.catalog_id,
+                                                 external_object.database_id,
+                                                 database_schema->get_database_name(),
+                                                 external_object.table_name,
+                                                 table_schema))) {
+            LOG_WARN("failed to get UC table schema", K(ret));
+          } else if (OB_ISNULL(table_schema)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("UC table schema is null", K(ret));
+          } else {
+            ObTableSchema *non_const_table_schema = const_cast<ObTableSchema *>(table_schema);
+            non_const_table_schema->set_table_id(external_object.table_id);
+          }
+          break;
+        }
+        case share::ObExternalObjectType::DATABASE_SCHEMA: {
+          const ObDatabaseSchema *database_schema = NULL;
+          if (OB_FAIL(get_uc_catalog_database_schema(uc_catalog_ctx,
+                                                     external_object.tenant_id,
+                                                     external_object.catalog_id,
+                                                     external_object.database_name,
+                                                     database_schema))) {
+            LOG_WARN("failed to get UC database schema", K(ret));
+          } else if (OB_ISNULL(database_schema)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("UC database schema is null", K(ret));
+          } else {
+            ObDatabaseSchema *non_const_database_schema =
+                const_cast<ObDatabaseSchema *>(database_schema);
+            non_const_database_schema->set_database_id(external_object.database_id);
+          }
+          break;
+        }
+        default: {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected", K(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSqlSchemaGuard::recover_schema_from_external_objects(
+    const ObIArray<share::ObExternalObject> &external_objects,
+    const ObBasicSessionInfo *session,
+    ObUcCatalogContext &uc_catalog_ctx)
+{
+  int ret = OB_SUCCESS;
+  // recover mocked database schema first, because mocked table schema rely on database schema
+  for (int64_t i = 0; OB_SUCC(ret) && i < external_objects.count(); i++) {
+    const share::ObExternalObject &external_object = external_objects.at(i);
+    if (external_object.type == share::ObExternalObjectType::DATABASE_SCHEMA) {
+      OZ(recover_schema_from_external_object(external_object, session, uc_catalog_ctx));
+    }
+  }
+
+  for (int64_t i = 0; OB_SUCC(ret) && i < external_objects.count(); i++) {
+    const share::ObExternalObject &external_object = external_objects.at(i);
+    if (external_object.type == share::ObExternalObjectType::TABLE_SCHEMA) {
+      OZ(recover_schema_from_external_object(external_object, session, uc_catalog_ctx));
+    }
+  }
+  return ret;
+}
+
 int ObSqlSchemaGuard::get_table_schema(uint64_t table_id,
                                       uint64_t ref_table_id,
                                       const ObDMLStmt *stmt,
@@ -724,6 +902,58 @@ int ObSqlSchemaGuard::get_database_schema(const uint64_t database_id,
   return ret;
 }
 
+int ObSqlSchemaGuard::get_uc_catalog_database_schema(
+    const ObUcCatalogContext &uc_catalog_ctx,
+    const uint64_t tenant_id,
+    const uint64_t catalog_id,
+    const ObString &database_name,
+    const ObDatabaseSchema *&database_schema)
+{
+  int ret = OB_SUCCESS;
+  ObNameCaseMode case_mode = OB_NAME_CASE_INVALID;
+  database_schema = NULL;
+  if (OB_ISNULL(schema_guard_) || !uc_catalog_ctx.is_remote_catalog(catalog_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid UC database schema request", K(ret), K(catalog_id));
+  } else if (OB_FAIL(schema_guard_->get_tenant_name_case_mode(tenant_id, case_mode))) {
+    LOG_WARN("failed to get UC database case mode", K(ret));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && OB_ISNULL(database_schema)
+                                && i < mocked_database_schemas_.count(); ++i) {
+      const ObDatabaseSchema *candidate = mocked_database_schemas_.at(i);
+      if (OB_NOT_NULL(candidate)
+          && tenant_id == candidate->get_tenant_id()
+          && catalog_id == candidate->get_catalog_id()
+          && ObCharset::case_mode_equal(
+                 case_mode, database_name, candidate->get_database_name())) {
+        database_schema = candidate;
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && OB_ISNULL(database_schema)) {
+    ObArenaAllocator tmp_allocator(ObMemAttr(tenant_id, ObModIds::OB_MODULE_PAGE_ALLOCATOR));
+    ObDatabaseSchema *tmp_schema = NULL;
+    if (OB_FAIL(ObUnifiedCatalogMetadataProvider::fetch_database_schema(
+            tenant_id,
+            uc_catalog_ctx.get_access_token(),
+            catalog_id,
+            uc_catalog_ctx.get_remote_catalog_name(),
+            database_name,
+            get_next_mocked_schema_id(),
+            case_mode,
+            tmp_allocator,
+            tmp_schema))) {
+      LOG_WARN("failed to fetch UC namespace schema", K(ret));
+    } else if (OB_FAIL(add_mocked_database_schema(*tmp_schema))) {
+      LOG_WARN("failed to add UC database schema", K(ret));
+    } else {
+      database_schema = mocked_database_schemas_.at(mocked_database_schemas_.count() - 1);
+    }
+  }
+  return ret;
+}
+
 int ObSqlSchemaGuard::get_catalog_database_schema(const uint64_t tenant_id,
                                                   const uint64_t catalog_id,
                                                   const ObString &database_name,
@@ -790,6 +1020,165 @@ int ObSqlSchemaGuard::get_catalog_database_id(const uint64_t tenant_id,
     LOG_WARN("database schema must not be null", K(ret));
   } else {
     database_id = schema->get_database_id();
+  }
+  return ret;
+}
+
+int ObSqlSchemaGuard::validate_uc_table_request(const ObUcCatalogContext &uc_catalog_ctx,
+                                                const uint64_t tenant_id,
+                                                const uint64_t catalog_id,
+                                                const uint64_t database_id,
+                                                const ObString &database_name,
+                                                const ObString &table_name,
+                                                const share::ObTimeTravelInfo *time_travel_info,
+                                                ObNameCaseMode &case_mode)
+{
+  int ret = OB_SUCCESS;
+  const ObDatabaseSchema *database_schema = NULL;
+  case_mode = OB_NAME_CASE_INVALID;
+  if (OB_ISNULL(schema_guard_) || database_name.empty() || table_name.empty()
+      || !is_external_object_id(database_id)
+      || !uc_catalog_ctx.is_remote_catalog(catalog_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid UC table schema request", K(ret));
+  } else if (OB_NOT_NULL(time_travel_info)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("UC table time travel is not supported", K(ret));
+  } else if (OB_FAIL(schema_guard_->get_tenant_name_case_mode(tenant_id, case_mode))) {
+    LOG_WARN("failed to get UC table case mode", K(ret));
+  } else if (OB_FAIL(get_database_schema(tenant_id, database_id, database_schema))) {
+    LOG_WARN("failed to get UC database schema", K(ret), K(database_id));
+  } else if (OB_ISNULL(database_schema)
+             || database_schema->get_catalog_id() != catalog_id
+             || !ObCharset::case_mode_equal(case_mode,
+                                            database_name,
+                                            database_schema->get_database_name())) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("UC database identity mismatch", K(ret), K(database_id));
+  }
+  return ret;
+}
+
+int ObSqlSchemaGuard::get_uc_query_table_schema(const ObUcCatalogContext &uc_catalog_ctx,
+                                                const uint64_t tenant_id,
+                                                const uint64_t catalog_id,
+                                                const uint64_t database_id,
+                                                const ObString &database_name,
+                                                const ObString &table_name,
+                                                const ObTableSchema *&table_schema,
+                                                const share::ObTimeTravelInfo *time_travel_info)
+{
+  using iceberg::ObIcebergTableMetadata;
+  int ret = OB_SUCCESS;
+  ObNameCaseMode case_mode = OB_NAME_CASE_INVALID;
+  table_schema = NULL;
+  if (OB_FAIL(validate_uc_table_request(uc_catalog_ctx, tenant_id, catalog_id, database_id, database_name,
+                                        table_name, time_travel_info, case_mode))) {
+    LOG_WARN("failed to validate UC query table request", K(ret), K(table_name));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && OB_ISNULL(table_schema) && i < table_schemas_.count(); ++i) {
+    const ObTableSchema *candidate = table_schemas_.at(i);
+    if (OB_NOT_NULL(candidate) && candidate->get_tenant_id() == tenant_id
+        && candidate->get_catalog_id() == catalog_id
+        && candidate->get_database_id() == database_id
+        && ObCharset::case_mode_equal(case_mode, table_name, candidate->get_table_name())) {
+      for (int64_t j = 0; OB_ISNULL(table_schema) && j < lake_table_metadatas_.count(); ++j) {
+        if (OB_NOT_NULL(lake_table_metadatas_.at(j))
+            && candidate->get_table_id() == lake_table_metadatas_.at(j)->table_id_) {
+          table_schema = candidate;
+        }
+      }
+    }
+  }
+  if (OB_SUCC(ret) && OB_ISNULL(table_schema)) {
+    ObArenaAllocator tmp_allocator(ObMemAttr(tenant_id, ObModIds::OB_MODULE_PAGE_ALLOCATOR));
+    ObTableSchema *tmp_schema = NULL;
+    ObIcebergTableMetadata *iceberg_metadata = NULL;
+    if (OB_FAIL(ObUnifiedCatalogMetadataProvider::fetch_query_table_schema(
+            tenant_id, uc_catalog_ctx.get_access_token(), catalog_id,
+            uc_catalog_ctx.get_remote_catalog_name(), database_name, table_name,
+            database_id, get_next_mocked_schema_id(), case_mode, tmp_allocator,
+            tmp_schema, iceberg_metadata))) {
+      LOG_WARN("failed to fetch UC query table schema", K(ret), K(table_name));
+    } else if (OB_FAIL(add_mocked_table_schema(tmp_schema))) {
+      LOG_WARN("failed to add UC query table schema", K(ret), K(table_name));
+    } else {
+      const ObTableSchema *cached_schema = table_schemas_.at(table_schemas_.count() - 1);
+      if (OB_NOT_NULL(iceberg_metadata)) {
+        ObIcebergTableMetadata *cached_metadata = OB_NEWx(ObIcebergTableMetadata, &allocator_, allocator_);
+        if (OB_ISNULL(cached_metadata)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("failed to allocate UC Iceberg metadata", K(ret), K(table_name));
+        } else if (OB_FAIL(cached_metadata->assign(*iceberg_metadata))) {
+          LOG_WARN("failed to retain UC Iceberg metadata", K(ret), K(table_name));
+        } else if (OB_FAIL(lake_table_metadatas_.push_back(cached_metadata))) {
+          LOG_WARN("failed to save UC Iceberg metadata", K(ret), K(table_name));
+        }
+        if (OB_SUCCESS != ret && OB_NOT_NULL(cached_metadata)) {
+          OB_DELETEx(ObIcebergTableMetadata, &allocator_, cached_metadata);
+        }
+      } else {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("UC query source is missing", K(ret), K(table_name));
+      }
+      if (OB_SUCCESS != ret) {
+        table_schemas_.pop_back();
+      } else {
+        table_schema = cached_schema;
+      }
+    }
+    if (OB_NOT_NULL(tmp_schema)) {
+      OB_DELETEx(ObTableSchema, &tmp_allocator, tmp_schema);
+    }
+    if (OB_NOT_NULL(iceberg_metadata)) {
+      OB_DELETEx(ObIcebergTableMetadata, &tmp_allocator, iceberg_metadata);
+    }
+  }
+  return ret;
+}
+
+int ObSqlSchemaGuard::get_uc_table_schema(const ObUcCatalogContext &uc_catalog_ctx,
+                                          const uint64_t tenant_id,
+                                          const uint64_t catalog_id,
+                                          const uint64_t database_id,
+                                          const ObString &database_name,
+                                          const ObString &table_name,
+                                          const ObTableSchema *&table_schema,
+                                          const share::ObTimeTravelInfo *time_travel_info)
+{
+  int ret = OB_SUCCESS;
+  ObNameCaseMode case_mode = OB_NAME_CASE_INVALID;
+  table_schema = NULL;
+  if (OB_FAIL(validate_uc_table_request(uc_catalog_ctx, tenant_id, catalog_id, database_id, database_name,
+                                        table_name, time_travel_info, case_mode))) {
+    LOG_WARN("failed to validate UC table request", K(ret), K(table_name));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && OB_ISNULL(table_schema) && i < table_schemas_.count(); ++i) {
+    const ObTableSchema *candidate = table_schemas_.at(i);
+    if (OB_NOT_NULL(candidate) && candidate->get_tenant_id() == tenant_id
+        && candidate->get_catalog_id() == catalog_id
+        && candidate->get_database_id() == database_id
+        && ObCharset::case_mode_equal(case_mode, table_name, candidate->get_table_name())) {
+      table_schema = candidate;
+    }
+  }
+  if (OB_SUCC(ret) && OB_ISNULL(table_schema)) {
+    ObArenaAllocator tmp_allocator(ObMemAttr(tenant_id, ObModIds::OB_MODULE_PAGE_ALLOCATOR));
+    ObTableSchema *tmp_schema = NULL;
+    if (OB_FAIL(ObUnifiedCatalogMetadataProvider::fetch_table_schema(
+            tenant_id, uc_catalog_ctx.get_access_token(), catalog_id,
+            uc_catalog_ctx.get_remote_catalog_name(), database_name, table_name,
+            database_id, get_next_mocked_schema_id(), case_mode, tmp_allocator,
+            tmp_schema))) {
+      LOG_WARN("failed to fetch UC table schema", K(ret), K(table_name));
+    } else if (OB_FAIL(add_mocked_table_schema(tmp_schema))) {
+      LOG_WARN("failed to add UC table schema", K(ret), K(table_name));
+    } else {
+      table_schema = table_schemas_.at(table_schemas_.count() - 1);
+    }
+    if (OB_NOT_NULL(tmp_schema)) {
+      OB_DELETEx(ObTableSchema, &tmp_allocator, tmp_schema);
+    }
   }
   return ret;
 }

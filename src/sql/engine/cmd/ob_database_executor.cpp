@@ -5,7 +5,9 @@
 
 #include "sql/engine/cmd/ob_database_executor.h"
 #include "sql/engine/cmd/ob_ddl_executor_util.h"
+#include "sql/engine/cmd/ob_catalog_sync.h"
 #include "sql/engine/cmd/ob_catalog_sync_helper.h"
+#include "share/catalog/ob_unified_catalog.h"
 #include "share/schema/ob_schema_scan_iterator.h"
 #include "share/schema/ob_schema_lite_scan.h"
 #include "sql/resolver/ddl/ob_create_database_stmt.h"
@@ -354,9 +356,20 @@ int ObCreateDatabaseExecutor::execute(ObExecContext &ctx, ObCreateDatabaseStmt &
   const obrpc::ObCreateDatabaseArg &create_database_arg = stmt.get_create_database_arg();
   obrpc::ObCreateDatabaseArg &tmp_arg = const_cast<obrpc::ObCreateDatabaseArg&>(create_database_arg);
   const uint64_t tenant_id = create_database_arg.database_schema_.get_tenant_id();
+  const bool is_unified_catalog = ObUnifiedCatalog::is_configured(tenant_id);
   ObString first_stmt;
   obrpc::UInt64 database_id(0);
-  if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
+  ObCatalogSync catalog_sync(ctx.get_allocator());
+  ObCatalogSyncOperationHandle catalog_sync_operation;
+  ObCatalogSyncPrepareResult catalog_sync_prepare_result;
+  ObCatalogSyncDDLResult catalog_sync_ddl_result;
+  bool local_ddl_attempted = false;
+  bool local_ddl_rejected_existing = false;
+  if (OB_FAIL(catalog_sync.get_create_database_operator(
+                 ctx, create_database_arg, catalog_sync_operation))) {
+    SQL_ENG_LOG(WARN, "failed to get create database catalog sync operation",
+                K(ret), K(tenant_id), K(is_unified_catalog));
+  } else if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
      SQL_ENG_LOG(WARN, "fail to get first stmt" , K(ret));
   } else {
     tmp_arg.ddl_stmt_str_ = first_stmt;
@@ -373,33 +386,50 @@ int ObCreateDatabaseExecutor::execute(ObExecContext &ctx, ObCreateDatabaseStmt &
     ret = OB_ERR_UNEXPECTED;
     SQL_ENG_LOG(WARN, "fail to get physical plan ctx", K(ret), K(ctx), K(common_rpc_proxy));
   } else {
-    //为什么create database的协议需要返回database_id，暂时没有用上。
-    if (ObCatalogSyncHelper::is_sync_enabled(tenant_id)) {
-      ObSchemaGetterGuard schema_guard;
-      if (OB_ISNULL(GCTX.schema_service_)) {
-        ret = OB_ERR_UNEXPECTED;
-        SQL_ENG_LOG(WARN, "schema_service is null", KR(ret));
-      } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(tenant_id, schema_guard))) {
-        SQL_ENG_LOG(WARN, "fail to get tenant schema guard for create database sync",
-                    KR(ret), K(tenant_id));
-      } else if (OB_FAIL(ObCatalogSyncHelper::sync_create_database(
-                     tenant_id,
-                     schema_guard,
-                     create_database_arg.database_schema_.get_database_name_str()))) {
-        if (OB_ERR_ALREADY_EXISTS == ret) {
-          ret = OB_SUCCESS;
-        } else {
-          SQL_ENG_LOG(WARN, "failed to sync create database to HMS",
-                      KR(ret),
-                      K(tenant_id),
-                      K(create_database_arg.database_schema_.get_database_name_str()));
-        }
-      }
+    if (catalog_sync_operation.is_valid()
+        && OB_FAIL(catalog_sync_operation->prepare(catalog_sync_prepare_result))) {
+      SQL_ENG_LOG(WARN, "failed to prepare create database catalog sync",
+                  K(ret), K(tenant_id), K(is_unified_catalog));
+    } else if (!catalog_sync_operation.is_valid()
+               && !ObUnifiedCatalog::is_configured(tenant_id)
+               && ObCatalogSyncHelper::is_sync_enabled(tenant_id)
+               && OB_FAIL(catalog_sync_operation.get_deferred_ret())) {
+      SQL_ENG_LOG(WARN, "failed to initialize create database catalog sync operation",
+                  K(ret), K(tenant_id));
     }
     if (OB_FAIL(ret)) {
       // do nothing
-    } else if (OB_FAIL(common_rpc_proxy->create_database(create_database_arg, database_id))) {
-      SQL_ENG_LOG(WARN, "rpc proxy create table failed", K(ret));
+    } else {
+      local_ddl_attempted = true;
+      if (OB_FAIL(common_rpc_proxy->create_database(create_database_arg, database_id))) {
+        SQL_ENG_LOG(WARN, "rpc proxy create table failed", K(ret));
+      }
+      local_ddl_rejected_existing = OB_DATABASE_EXIST == ret;
+    }
+    if (catalog_sync_operation.is_valid()) {
+      catalog_sync_ddl_result.ddl_ret_ = ret;
+      catalog_sync_ddl_result.object_id_ = static_cast<uint64_t>(database_id);
+      if (!local_ddl_attempted) {
+        catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_NOT_STARTED;
+      } else if (OB_SUCC(ret)) {
+        catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_SUCCEEDED;
+      } else if (local_ddl_rejected_existing) {
+        catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_REJECTED;
+      } else {
+        catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_UNKNOWN;
+      }
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(catalog_sync_operation->complete(catalog_sync_ddl_result))) {
+          SQL_ENG_LOG(WARN, "failed to complete create database catalog sync",
+                      K(ret), K(tenant_id), K(is_unified_catalog));
+        }
+      } else {
+        int tmp_ret = OB_SUCCESS;
+        if (OB_TMP_FAIL(catalog_sync_operation->complete(catalog_sync_ddl_result))) {
+          SQL_ENG_LOG(WARN, "failed to complete create database catalog sync after local failure",
+                      KR(ret), KR(tmp_ret), K(tenant_id), K(is_unified_catalog));
+        }
+      }
     }
     if (OB_SUCC(ret)) {
       ctx.get_physical_plan_ctx()->set_affected_rows(1);
@@ -639,8 +669,19 @@ int ObDropDatabaseExecutor::execute(ObExecContext &ctx, ObDropDatabaseStmt &stmt
   const obrpc::ObDropDatabaseArg &drop_database_arg = stmt.get_drop_database_arg();
   obrpc::ObDropDatabaseArg &tmp_arg = const_cast<obrpc::ObDropDatabaseArg&>(drop_database_arg);
   ObString first_stmt;
-  uint64_t database_id = 0;
-  if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
+  uint64_t database_id = OB_INVALID_ID;
+  ObCatalogSync catalog_sync(ctx.get_allocator());
+  ObCatalogSyncAuthContext catalog_sync_context;
+  ObCatalogSyncOperationHandle catalog_sync_operation;
+  ObCatalogSyncPrepareResult catalog_sync_prepare_result;
+  ObCatalogSyncDDLResult catalog_sync_ddl_result;
+  bool local_ddl_attempted = false;
+  bool catalog_sync_complete_called = false;
+  if (OB_FAIL(catalog_sync.prepare_drop_database_context(
+          ctx, drop_database_arg, catalog_sync_context))) {
+    SQL_ENG_LOG(WARN, "failed to prepare drop database catalog sync context",
+                K(ret));
+  } else if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
      SQL_ENG_LOG(WARN, "fail to get first stmt" , K(ret));
   } else {
     tmp_arg.ddl_stmt_str_ = first_stmt;
@@ -662,27 +703,33 @@ int ObDropDatabaseExecutor::execute(ObExecContext &ctx, ObDropDatabaseStmt &stmt
         ? lib::Worker::CompatMode::ORACLE : lib::Worker::CompatMode::MYSQL;
     const uint64_t tenant_id = drop_database_arg.tenant_id_;
     const ObString &database_name = drop_database_arg.database_name_;
-    if (ObCatalogSyncHelper::is_sync_enabled(tenant_id)) {
-      ObSchemaGetterGuard schema_guard;
-      if (OB_ISNULL(GCTX.schema_service_)) {
-        ret = OB_ERR_UNEXPECTED;
-        SQL_ENG_LOG(WARN, "schema_service is null", KR(ret));
-      } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(tenant_id, schema_guard))) {
-        SQL_ENG_LOG(WARN, "fail to get tenant schema guard for drop database check",
-                    KR(ret), K(tenant_id));
-      } else if (OB_FAIL(ObCatalogSyncHelper::check_drop_database_with_remote_tables(
-                     tenant_id, schema_guard, database_name))) {
-        SQL_ENG_LOG(WARN, "failed to check remote tables before drop database",
-                    KR(ret), K(tenant_id), K(database_name));
-      }
+    const bool is_unified_catalog = ObUnifiedCatalog::is_configured(tenant_id);
+    if (OB_FAIL(catalog_sync.get_drop_database_operator(
+            catalog_sync_context, drop_database_arg, catalog_sync_operation))) {
+      SQL_ENG_LOG(WARN, "failed to get drop database catalog sync operation",
+                  K(ret), K(tenant_id), K(is_unified_catalog));
+    } else if (catalog_sync_operation.is_valid()
+               && OB_FAIL(catalog_sync_operation->prepare(catalog_sync_prepare_result))) {
+      SQL_ENG_LOG(WARN, "failed to prepare drop database catalog sync",
+                  K(ret), K(tenant_id), K(is_unified_catalog));
+    } else if (!catalog_sync_operation.is_valid()
+               && ObCatalogSyncHelper::is_sync_enabled(tenant_id)
+               && OB_FAIL(catalog_sync_operation.get_deferred_ret())) {
+      SQL_ENG_LOG(WARN, "failed to initialize drop database catalog sync operation",
+                  K(ret), K(tenant_id), K(is_unified_catalog));
     }
+    database_id = catalog_sync_prepare_result.source_object_id_;
     if (OB_SUCC(ret) && !drop_database_arg.to_recyclebin_) {
+      local_ddl_attempted = true;
       if (OB_FAIL(non_atomic_drop_table_in_database(tenant_id, database_name, *common_rpc_proxy))) {
         SQL_ENG_LOG(WARN, "fail to drop table non atomic in database", KR(ret), K(tenant_id), K(database_name));
       }
     }
     // after non_atomic_drop_table_in_database
     // not supported parallel drop table type and outline etc will be dropped by drop database
+    if (OB_SUCC(ret)) {
+      local_ddl_attempted = true;
+    }
     if (FAILEDx(common_rpc_proxy->drop_database(drop_database_arg, drop_database_res))) {
       SQL_ENG_LOG(WARN, "rpc proxy drop table failed",
                   "timeout", THIS_WORKER.get_timeout_remain(), K(ret));
@@ -690,17 +737,22 @@ int ObDropDatabaseExecutor::execute(ObExecContext &ctx, ObDropDatabaseStmt &stmt
       ret = OB_ERR_UNEXPECTED;
       SQL_ENG_LOG(WARN, "fail to get physical plan ctx", K(ret), K(ctx));
     } else {
-      if (ObCatalogSyncHelper::is_sync_enabled(tenant_id)) {
-        ObSchemaGetterGuard schema_guard;
-        if (OB_ISNULL(GCTX.schema_service_)) {
-          ret = OB_ERR_UNEXPECTED;
-          SQL_ENG_LOG(WARN, "schema_service is null", KR(ret));
-        } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(tenant_id, schema_guard))) {
-          SQL_ENG_LOG(WARN, "fail to get tenant schema guard for drop database sync",
-                      KR(ret), K(tenant_id));
-        } else if (OB_FAIL(ObCatalogSyncHelper::sync_drop_database(tenant_id, schema_guard, database_name))) {
-          SQL_ENG_LOG(WARN, "failed to sync drop database to HMS",
-                      KR(ret), K(tenant_id), K(database_name));
+      if (catalog_sync_operation.is_active()) {
+        catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_SUCCEEDED;
+        catalog_sync_ddl_result.ddl_ret_ = ret;
+        catalog_sync_ddl_result.object_id_ = database_id;
+        if (catalog_sync_operation.is_valid()) {
+          catalog_sync_complete_called = true;
+          if (OB_FAIL(catalog_sync_operation->complete(catalog_sync_ddl_result))) {
+            SQL_ENG_LOG(WARN, "failed to complete drop database catalog sync",
+                        K(ret), K(tenant_id), K(is_unified_catalog));
+          }
+        } else if (ObCatalogSyncHelper::is_sync_enabled(tenant_id)) {
+          catalog_sync_complete_called = true;
+          if (OB_FAIL(catalog_sync_operation.get_deferred_ret())) {
+            SQL_ENG_LOG(WARN, "failed to initialize drop database catalog sync operation",
+                        K(ret), K(tenant_id), K(is_unified_catalog));
+          }
         }
       }
       if (OB_SUCC(ret)) {
@@ -724,6 +776,27 @@ int ObDropDatabaseExecutor::execute(ObExecContext &ctx, ObDropDatabaseStmt &stmt
       }
       if (OB_SUCC(ret)) {
         ctx.get_physical_plan_ctx()->set_affected_rows(drop_database_res.affected_row_);
+      }
+    }
+    if (!catalog_sync_complete_called
+        && (catalog_sync_operation.is_valid()
+            || (catalog_sync_operation.is_active()
+                && ObCatalogSyncHelper::is_sync_enabled(tenant_id)))) {
+      catalog_sync_ddl_result.state_ = local_ddl_attempted
+                                       ? CATALOG_SYNC_DDL_UNKNOWN
+                                       : CATALOG_SYNC_DDL_NOT_STARTED;
+      catalog_sync_ddl_result.ddl_ret_ = ret;
+      catalog_sync_ddl_result.object_id_ = database_id;
+      int tmp_ret = OB_SUCCESS;
+      if (catalog_sync_operation.is_valid()) {
+        if (OB_TMP_FAIL(catalog_sync_operation->complete(catalog_sync_ddl_result))) {
+          SQL_ENG_LOG(WARN, "failed to complete drop database catalog sync after local failure",
+                      KR(ret), KR(tmp_ret), K(tenant_id), K(is_unified_catalog));
+        }
+      } else if (ObCatalogSyncHelper::is_sync_enabled(tenant_id)
+                 && OB_TMP_FAIL(catalog_sync_operation.get_deferred_ret())) {
+        SQL_ENG_LOG(WARN, "failed to initialize drop database catalog sync operation",
+                    KR(ret), KR(tmp_ret), K(tenant_id), K(is_unified_catalog));
       }
     }
   }

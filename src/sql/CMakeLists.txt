@@ -419,6 +419,15 @@ ob_set_subtarget(ob_sql engine_cmd
   engine/cmd/ob_olap_async_job_executor.cpp
   engine/cmd/ob_catalog_executor.cpp
   engine/cmd/ob_sync_catalog_executor.cpp
+  engine/cmd/ob_catalog_sync.cpp
+  engine/cmd/ob_catalog_sync_alter_table_operation.cpp
+  engine/cmd/ob_catalog_sync_create_table_as_select_operation.cpp
+  engine/cmd/ob_catalog_sync_create_table_like_operation.cpp
+  engine/cmd/ob_catalog_sync_create_table_operation.cpp
+  engine/cmd/ob_catalog_sync_database_operation.cpp
+  engine/cmd/ob_catalog_sync_drop_table_operation.cpp
+  engine/cmd/ob_catalog_sync_flashback_table_operation.cpp
+  engine/cmd/ob_catalog_sync_rename_table_operation.cpp
   engine/cmd/ob_catalog_sync_helper.cpp
   engine/cmd/ob_trigger_storage_cache_executor.cpp
   engine/cmd/ob_sys_dispatch_call_executor.cpp
@@ -1848,6 +1857,12 @@ add_definitions(-D_GLIBCXX_USE_CXX11_ABI=0)
 
 ob_set_subtarget(ob_sql hive
   table_format/hive/ob_hive_table_metadata.cpp
+)
+
+ob_set_subtarget(ob_sql unified_catalog
+  table_format/unified/ob_unified_catalog_metadata_provider.cpp
+  table_format/unified/ob_unified_catalog_schema_converter.cpp
+  table_format/unified/ob_unified_catalog_table_codec.cpp
 )
 
 ob_set_subtarget(ob_sql odps

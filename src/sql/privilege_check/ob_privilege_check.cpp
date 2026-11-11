@@ -55,6 +55,10 @@
 #include "sql/resolver/cmd/ob_location_utils_stmt.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "sql/resolver/cmd/ob_merge_table_stmt.h"
+#include "observer/omt/ob_tenant_config_mgr.h"
+#include "share/catalog/ob_unified_catalog.h"
+#include "sql/table_format/unified/ob_unified_catalog_metadata_provider.h"
+#include "sql/rewrite/ob_transform_utils.h"
 
 namespace oceanbase {
 using namespace share;
@@ -1556,7 +1560,9 @@ int get_dml_stmt_need_privs(
             if (OB_SUCC(ret)) {
               // Index columns map to the owner table, but LOB auxiliary columns do not; require owner-table SELECT.
               if (lib::is_mysql_mode() && !share::schema::is_aux_lob_table(table_item->table_type_)) {
-                if (OB_FAIL(add_col_priv_to_need_priv(basic_stmt, *table_item, session_priv, need_privs))) {
+                // The native Iceberg delegation request enforces the UC data permission.
+                if (!table_item->is_uc_table_
+                    && OB_FAIL(add_col_priv_to_need_priv(basic_stmt, *table_item, session_priv, need_privs))) {
                   LOG_WARN("add col id array to need priv failed", K(ret));
                 }
               } else {
@@ -4008,6 +4014,231 @@ int ObPrivilegeCheck::check_read_only(const ObSqlCtx &ctx,
         OB_FAIL(ctx.schema_guard_->verify_read_only(ctx.session_info_->get_effective_tenant_id(),
                                                     stmt_need_privs))) {
       LOG_WARN("database or table is read only, cannot execute this stmt", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObPrivilegeCheck::add_uc_table_read_priv(
+    const TableItem &table_item,
+    ObIArray<ObNeedPriv> &table_read_privs)
+{
+  int ret = OB_SUCCESS;
+  bool found = false;
+  for (int64_t i = 0; !found && i < table_read_privs.count(); ++i) {
+    const ObNeedPriv &need_priv = table_read_privs.at(i);
+    found = need_priv.catalog_ == table_item.catalog_name_
+        && need_priv.db_ == table_item.database_name_
+        && need_priv.table_ == table_item.table_name_;
+  }
+  if (!found) {
+    ObNeedPriv need_priv;
+    need_priv.catalog_ = table_item.catalog_name_;
+    need_priv.db_ = table_item.database_name_;
+    need_priv.table_ = table_item.table_name_;
+    need_priv.priv_level_ = OB_PRIV_TABLE_LEVEL;
+    need_priv.priv_set_ = OB_PRIV_SELECT;
+    if (OB_FAIL(table_read_privs.push_back(need_priv))) {
+      LOG_WARN("failed to collect UC table read privilege", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObPrivilegeCheck::collect_uc_table_read_privs(
+    const ObStmt *basic_stmt,
+    const TableItem *write_target,
+    ObIArray<UcReadStmtContext> &visited_stmts,
+    ObIArray<ObNeedPriv> &table_read_privs)
+{
+  int ret = OB_SUCCESS;
+  // A shared stmt can be reached with different actual write targets or as a read.
+  bool visited = false;
+  for (int64_t i = 0; !visited && i < visited_stmts.count(); ++i) {
+    visited = visited_stmts.at(i).stmt_ == basic_stmt
+        && visited_stmts.at(i).write_target_ == write_target;
+  }
+  if (OB_ISNULL(basic_stmt)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("stmt is null", K(ret));
+  } else if (!visited) {
+    const UcReadStmtContext stmt_context = {basic_stmt, write_target};
+    if (OB_FAIL(visited_stmts.push_back(stmt_context))) {
+      LOG_WARN("failed to record UC read privilege stmt", K(ret));
+    } else if (basic_stmt->is_explain_stmt()) {
+      const ObStmt *query_stmt =
+          static_cast<const ObExplainStmt *>(basic_stmt)->get_explain_query_stmt();
+      if (OB_FAIL(SMART_CALL(collect_uc_table_read_privs(
+                     query_stmt, write_target, visited_stmts, table_read_privs)))) {
+        LOG_WARN("failed to collect explained UC table reads", K(ret));
+      }
+    } else if (stmt::T_CREATE_TABLE == basic_stmt->get_stmt_type()) {
+      const ObCreateTableStmt *create_stmt = static_cast<const ObCreateTableStmt *>(basic_stmt);
+      if (!create_stmt->is_view_table() && OB_NOT_NULL(create_stmt->get_sub_select())
+          && OB_FAIL(SMART_CALL(collect_uc_table_read_privs(
+                         create_stmt->get_sub_select(), NULL, visited_stmts, table_read_privs)))) {
+        LOG_WARN("failed to collect CTAS UC table reads", K(ret));
+      }
+    } else if (stmt::T_VARIABLE_SET == basic_stmt->get_stmt_type()) {
+      const ObVariableSetStmt *variable_stmt = static_cast<const ObVariableSetStmt *>(basic_stmt);
+      const ObIArray<ObVariableSetStmt::VariableSetNode> &variables = variable_stmt->get_variable_nodes();
+      for (int64_t i = 0; OB_SUCC(ret) && i < variables.count(); ++i) {
+        ObSEArray<ObQueryRefRawExpr *, 4> query_refs;
+        if (OB_NOT_NULL(variables.at(i).value_expr_)
+            && OB_FAIL(ObTransformUtils::extract_query_ref_expr(variables.at(i).value_expr_, query_refs))) {
+          LOG_WARN("failed to extract SET UC read subqueries", K(ret));
+        }
+        for (int64_t j = 0; OB_SUCC(ret) && j < query_refs.count(); ++j) {
+          if (OB_ISNULL(query_refs.at(j))) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("SET UC read query reference is null", K(ret));
+          } else if (OB_FAIL(SMART_CALL(collect_uc_table_read_privs(
+                                 query_refs.at(j)->get_ref_stmt(), NULL, visited_stmts, table_read_privs)))) {
+            LOG_WARN("failed to collect SET UC table reads", K(ret));
+          }
+        }
+      }
+    } else if (basic_stmt->is_dml_stmt() && !basic_stmt->is_show_stmt()
+        && !(basic_stmt->is_select_stmt()
+            && static_cast<const ObSelectStmt *>(basic_stmt)->is_from_show_stmt())) {
+      const ObDMLStmt *dml_stmt = static_cast<const ObDMLStmt *>(basic_stmt);
+      for (int64_t i = 0; OB_SUCC(ret) && i < dml_stmt->get_table_size(); ++i) {
+        const TableItem *table_item = dml_stmt->get_table_item(i);
+        bool is_dml_target = table_item == write_target;
+        if (OB_ISNULL(table_item)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("table item is null", K(ret));
+        } else if (!is_dml_target && basic_stmt->is_dml_write_stmt()
+            && OB_FAIL(static_cast<const ObDelUpdStmt *>(basic_stmt)->has_dml_table_info(
+                           table_item->table_id_, is_dml_target))) {
+          LOG_WARN("failed to check UC read write target", K(ret));
+        } else if (!is_dml_target
+            && table_item->is_basic_table() && !table_item->is_view_table_
+            && !table_item->is_uc_table_
+            && !table_item->is_external_table()
+            && (!table_item->is_system_table_ || table_item->is_index_table_
+                || OB_INVALID_ID != table_item->mview_id_)
+            && !is_inner_table(table_item->ref_id_)) {
+          if (OB_FAIL(add_uc_table_read_priv(*table_item, table_read_privs))) {
+            LOG_WARN("failed to collect UC table read", K(ret));
+          }
+        }
+        if (OB_SUCC(ret)
+            && (table_item->is_generated_table() || table_item->is_lateral_table()
+                || (table_item->is_temp_table() && OB_NOT_NULL(table_item->ref_query_)))
+            && !(is_dml_target && basic_stmt->is_insert_stmt())
+            && OB_FAIL(SMART_CALL(collect_uc_table_read_privs(
+                           table_item->ref_query_, is_dml_target ? table_item->view_base_item_ : NULL,
+                           visited_stmts, table_read_privs)))) {
+          LOG_WARN("failed to collect UC table reference reads", K(ret));
+        }
+      }
+      if (OB_SUCC(ret) && basic_stmt->is_select_stmt()) {
+        const ObIArray<ObSelectStmt *> &set_queries =
+            static_cast<const ObSelectStmt *>(basic_stmt)->get_set_query();
+        for (int64_t i = 0; OB_SUCC(ret) && i < set_queries.count(); ++i) {
+          if (OB_FAIL(SMART_CALL(collect_uc_table_read_privs(
+                          set_queries.at(i), NULL, visited_stmts, table_read_privs)))) {
+            LOG_WARN("failed to collect UC set query reads", K(ret));
+          }
+        }
+      }
+      for (int64_t i = 0; OB_SUCC(ret) && i < dml_stmt->get_subquery_expr_size(); ++i) {
+        const ObQueryRefRawExpr *query_ref = dml_stmt->get_subquery_exprs().at(i);
+        if (OB_ISNULL(query_ref) || OB_ISNULL(query_ref->get_ref_stmt())) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("UC read query reference is null", K(ret));
+        } else if (OB_FAIL(SMART_CALL(collect_uc_table_read_privs(
+                               query_ref->get_ref_stmt(), NULL, visited_stmts, table_read_privs)))) {
+          LOG_WARN("failed to collect UC subquery reads", K(ret));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObPrivilegeCheck::check_uc_table_read_access(
+    const ObSqlCtx &ctx,
+    const ObStmtNeedPrivs &table_read_privs)
+{
+  int ret = OB_SUCCESS;
+  if (table_read_privs.need_privs_.count() > 0 && OB_NOT_NULL(ctx.session_info_)
+      && (!ctx.session_info_->is_inner() || ctx.session_info_->is_user_session())
+      && !ctx.is_remote_sql_
+      && ObUnifiedCatalog::is_configured(ctx.session_info_->get_effective_tenant_id())) {
+    const uint64_t tenant_id = ctx.session_info_->get_effective_tenant_id();
+    ObArenaAllocator allocator("UnifiedCatalog", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id);
+    ObString access_token;
+    ObString sync_target;
+    if (OB_FAIL(ObUnifiedCatalog::get_session_token(
+                   *ctx.session_info_, allocator, access_token))) {
+      LOG_WARN("failed to get UC read session token", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < table_read_privs.need_privs_.count(); ++i) {
+      const ObNeedPriv &need_priv = table_read_privs.need_privs_.at(i);
+      ObString catalog_name = need_priv.catalog_;
+      if (0 == catalog_name.case_compare(OB_INTERNAL_CATALOG_NAME)) {
+        if (sync_target.empty() && OB_FAIL(ObUnifiedCatalog::resolve_target(
+                                              tenant_id, allocator, sync_target))) {
+          LOG_WARN("failed to resolve UC read authorization Catalog", K(ret));
+        } else {
+          catalog_name = sync_target;
+        }
+      }
+      if (OB_SUCC(ret)
+          && OB_FAIL(ObUnifiedCatalogMetadataProvider::check_table_read_access(
+                         tenant_id, access_token, catalog_name, need_priv.db_,
+                         need_priv.table_, allocator))) {
+        LOG_WARN("failed to check UC table read access", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObPrivilegeCheck::prepare_uc_table_read_access(
+    const ObSqlCtx &ctx,
+    const ObStmt *basic_stmt,
+    ObUcTableReadAccessContext &uc_read_ctx)
+{
+  int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(basic_stmt)) {
+    ObQueryCtx *query_ctx = basic_stmt->get_query_ctx();
+    ObSEArray<UcReadStmtContext, 8> visited_stmts;
+    ObSEArray<ObNeedPriv, 8> table_read_privs;
+    const bool uc_configured = OB_NOT_NULL(ctx.session_info_)
+        && ObUnifiedCatalog::is_configured(ctx.session_info_->get_effective_tenant_id());
+    const bool check_uc_access = uc_configured && !ctx.is_remote_sql_
+        && (!ctx.session_info_->is_inner() || ctx.session_info_->is_user_session());
+    if (OB_FAIL(collect_uc_table_read_privs(basic_stmt, NULL, visited_stmts, table_read_privs))) {
+      LOG_WARN("failed to collect UC table read privileges", K(ret));
+    } else if (OB_ISNULL(query_ctx)) {
+      if (check_uc_access && table_read_privs.count() > 0) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("UC read query context is missing", K(ret));
+      }
+    } else {
+      uc_read_ctx.catalog_configured_ = uc_configured;
+      if (OB_FAIL(uc_read_ctx.table_read_privs_.need_privs_.assign(table_read_privs))) {
+        LOG_WARN("failed to assign UC table read privileges", K(ret));
+      } else if (check_uc_access) {
+        omt::ObTenantConfigGuard tenant_config(
+            TENANT_CONF(ctx.session_info_->get_effective_tenant_id()));
+        ObIAllocator *allocator = uc_read_ctx.table_read_privs_.need_privs_.get_allocator();
+        if (!tenant_config.is_valid() || OB_ISNULL(allocator)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid UC read configuration snapshot", K(ret));
+        } else if (OB_FAIL(ob_write_string(*allocator,
+                            ObString(tenant_config->catalog_sync_target.str()),
+                            uc_read_ctx.sync_target_))) {
+          LOG_WARN("failed to copy UC read Catalog target", K(ret));
+        }
+      }
+      if (OB_SUCC(ret)
+          && OB_FAIL(check_uc_table_read_access(ctx, uc_read_ctx.table_read_privs_))) {
+        LOG_WARN("failed to check UC table read access", K(ret));
+      }
     }
   }
   return ret;

@@ -44,6 +44,7 @@ void ObVirtualTableIterator::reset()
   reset_convert_ctx();
   allocator_ = NULL;
   session_ = NULL;
+  uc_catalog_ctx_.reset();
   sql_schema_guard_.reset();
   pd_cols_project_.reset();
   fill_column_ids_ = &output_column_ids_;
@@ -633,7 +634,10 @@ int ObVirtualTableIterator::init_sql_schema_guard_()
     // don't do anything
     // ignore ret
   } else if (OB_FALSE_IT(sql_schema_guard_.set_schema_guard(schema_guard_))) {
-  } else if (OB_FAIL(sql_schema_guard_.recover_schema_from_external_objects(scan_param_->external_object_ctx_->get_external_objects()))) {
+  } else if (OB_FAIL(sql_schema_guard_.recover_schema_from_external_objects(
+                 scan_param_->external_object_ctx_->get_external_objects(),
+                 session_,
+                 uc_catalog_ctx_))) {
     LOG_WARN("recover external objects failed", K(ret));
   }
   return ret;

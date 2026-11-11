@@ -1,12 +1,14 @@
 /**
- * Copyright (C) 2026 OceanBase
- * 本文件包含机密及专有信息，未经授权不得使用或披露。
+ * Copyright (c) 2026 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #define USING_LOG_PREFIX SQL_RESV
 #include "sql/resolver/ddl/ob_sync_catalog_resolver.h"
 
 #include "share/catalog/ob_catalog_properties.h"
+#include "share/catalog/ob_unified_catalog.h"
+#include "share/catalog/ob_unified_catalog_utils.h"
 #include "sql/resolver/ddl/ob_sync_catalog_stmt.h"
 #include "sql/ob_sql_utils.h"
 
@@ -39,8 +41,10 @@ int ObSyncCatalogResolver::resolve(const ParseNode &parse_tree)
     LOG_WARN("failed to create catalog sync statement", K(ret));
   } else {
     stmt_ = stmt;
+    const bool is_catalog_scope = OB_ISNULL(scope_node->children_[0])
+                                  && OB_ISNULL(scope_node->children_[1]);
     stmt->set_tenant_id(session_info_->get_effective_tenant_id());
-    if (OB_ISNULL(scope_node->children_[0]) && OB_ISNULL(scope_node->children_[1])) {
+    if (is_catalog_scope) {
       stmt->set_sync_scope(ObSyncCatalogStmt::CATALOG_SCOPE);
     } else if (OB_NOT_NULL(scope_node->children_[0])
                && OB_ISNULL(scope_node->children_[1])) {
@@ -77,9 +81,25 @@ int ObSyncCatalogResolver::resolve_sync_target(ObSyncCatalogStmt &stmt)
   ObSchemaGetterGuard *schema_guard = nullptr;
   ObSessionPrivInfo session_priv;
   const uint64_t tenant_id = session_info_->get_effective_tenant_id();
+  const bool unified_mode = share::ObUnifiedCatalog::is_configured(tenant_id);
   if (OB_ISNULL(schema_guard = schema_checker_->get_schema_guard())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("schema guard is null", K(ret));
+  } else if (unified_mode) {
+    ObString access_token;
+    if (OB_FAIL(ObUnifiedCatalog::get_session_token(*session_info_, *allocator_, access_token))) {
+      LOG_WARN("failed to get Unified Catalog sync token", K(ret));
+    } else if (OB_FAIL(ObUnifiedCatalog::resolve_target(
+                   tenant_id, *allocator_, copied_catalog_name))) {
+      LOG_WARN("failed to resolve Unified Catalog sync target", K(ret), K(tenant_id));
+    } else if (OB_FAIL(share::ObUnifiedCatalogUtils::resolve_catalog_id(tenant_id,
+                                                                        access_token,
+                                                                        copied_catalog_name,
+                                                                        *schema_guard,
+                                                                        *allocator_,
+                                                                        catalog_id))) {
+      LOG_WARN("failed to resolve Unified Catalog sync identity", K(ret));
+    }
   } else if (OB_FAIL(ObSQLUtils::get_synced_catalog_id(*schema_guard, tenant_id, catalog_id))) {
     LOG_WARN("failed to get configured catalog sync target", K(ret), K(tenant_id));
   } else if (OB_INVALID_ID == catalog_id) {
@@ -103,6 +123,9 @@ int ObSyncCatalogResolver::resolve_sync_target(ObSyncCatalogStmt &stmt)
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "catalog sync target other than HMS catalog");
   }
   if (OB_FAIL(ret)) {
+  } else if (unified_mode) {
+    stmt.set_catalog_id(catalog_id);
+    stmt.set_catalog_name(copied_catalog_name);
   } else if (OB_FAIL(session_info_->get_session_priv_info(session_priv))) {
     LOG_WARN("failed to get session privilege", K(ret));
   } else if (OB_FAIL(schema_guard->check_catalog_access(session_priv,

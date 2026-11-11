@@ -107,6 +107,7 @@ private:
   int process_select_type(
       ObSelectStmt *select_stmt, stmt::StmtType stmt_type, const ParseNode &parse_tree);
   virtual int resolve_column_ref_expr(const ObQualifiedName &q_name, ObRawExpr *&real_ref_expr);
+  int resolve_show_uc_catalogs(common::ObString &select_sql);
   int resolve_show_check_table(const ParseNode &parse_tree,
                                ObShowResolverContext &show_resv_ctx,
                                ObString &select_sql);

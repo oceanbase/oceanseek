@@ -8,9 +8,11 @@
 
 #include "share/catalog/ob_catalog_properties.h"
 #include "share/catalog/ob_catalog_utils.h"
+#include "share/catalog/ob_unified_catalog.h"
 #include "share/ob_rpc_struct.h"
 #include "share/schema/ob_schema_service.h"
 #include "share/schema/ob_schema_struct.h"
+#include "sql/ob_sql_context.h"
 #include "sql/resolver/ddl/ob_catalog_stmt.h"
 #include "share/ob_license_utils.h"
 
@@ -119,6 +121,26 @@ int ObCatalogResolver::resolve_create_catalog(const ParseNode &parse_tree, obrpc
   }
   OZ(resolve_catalog_name(*name_node, arg));
   OZ(resolve_catalog_properties(*properties_node, arg));
+  if (OB_SUCC(ret)
+      && share::ObUnifiedCatalog::is_configured(session_info_->get_effective_tenant_id())) {
+    ObString access_token;
+    bool catalog_exists = false;
+    if (OB_FAIL(share::ObUnifiedCatalog::get_session_token(*session_info_,
+                                                           *allocator_,
+                                                           access_token))) {
+      LOG_WARN("failed to get Unified Catalog session token", K(ret));
+    } else if (OB_FAIL(
+                   share::ObUnifiedCatalog::catalog_exists(session_info_->get_effective_tenant_id(),
+                                                           access_token,
+                                                           arg.schema_.get_catalog_name_str(),
+                                                           *allocator_,
+                                                           catalog_exists))) {
+      LOG_WARN("failed to check Unified Catalog name", K(ret));
+    } else if (catalog_exists) {
+      ret = OB_OP_NOT_ALLOW;
+      LOG_USER_ERROR(OB_OP_NOT_ALLOW, "local Catalog name conflicts with Unified Catalog");
+    }
+  }
   return ret;
 }
 
@@ -170,13 +192,27 @@ int ObCatalogResolver::resolve_set_catalog(const ParseNode &parse_tree, obrpc::O
   OZ(resolve_catalog_name(*name_node, arg));
   if (arg.schema_.get_catalog_id() != OB_INTERNAL_CATALOG_ID) {
     catalog_name = arg.schema_.get_catalog_name_str();
-    OZ(schema_checker_->get_catalog_id_name(session_info_->get_effective_tenant_id(),
-                                            catalog_name,
-                                            catalog_id));
-    OX(arg.schema_.set_catalog_id(catalog_id));
-    OZ(arg.schema_.set_catalog_name(catalog_name));
-    OZ(session_info_->get_session_priv_info(session_priv));
-    OZ(schema_guard->check_catalog_access(session_priv, session_info_->get_enable_role_array(), catalog_name));
+    if (share::ObUnifiedCatalog::is_configured(session_info_->get_effective_tenant_id())) {
+      OZ(resolve_read_catalog_name(session_info_->get_effective_tenant_id(),
+                                   catalog_name, catalog_id));
+      OX(arg.schema_.set_catalog_id(catalog_id));
+      if (OB_SUCC(ret)
+          && !is_uc_remote_catalog(catalog_id)) {
+        OZ(arg.schema_.set_catalog_name(catalog_name));
+        OZ(session_info_->get_session_priv_info(session_priv));
+        OZ(schema_guard->check_catalog_access(session_priv,
+                                              session_info_->get_enable_role_array(),
+                                              catalog_name));
+      }
+    } else {
+      OZ(schema_checker_->get_catalog_id_name(session_info_->get_effective_tenant_id(),
+                                              catalog_name,
+                                              catalog_id));
+      OX(arg.schema_.set_catalog_id(catalog_id));
+      OZ(arg.schema_.set_catalog_name(catalog_name));
+      OZ(session_info_->get_session_priv_info(session_priv));
+      OZ(schema_guard->check_catalog_access(session_priv, session_info_->get_enable_role_array(), catalog_name));
+    }
   }
   return ret;
 }
@@ -198,6 +234,8 @@ int ObCatalogResolver::resolve_catalog_name(const ParseNode &name_node, obrpc::O
   } else if (OB_FAIL(session_info_->get_name_case_mode(case_mode))) {
     LOG_WARN("failed to get name case mode", K(ret));
   } else if (is_mysql_mode() && OB_LOWERCASE_AND_INSENSITIVE == case_mode
+             && !(stmt::T_SET_CATALOG == stmt_->stmt_type_
+                  && share::ObUnifiedCatalog::is_configured(session_info_->get_effective_tenant_id()))
              && OB_FAIL(ObCharset::tolower(cs_type, catalog_name, catalog_name, *allocator_))) {
     LOG_WARN("failed to lower string", K(ret));
   } else if (OB_FAIL(arg.schema_.set_catalog_name(catalog_name))) {

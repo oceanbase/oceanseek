@@ -29,7 +29,7 @@ int ObDropTableResolver::resolve(const ParseNode &parse_tree)
                 MAX_NODE != parse_tree.num_child_ || OB_ISNULL(parse_tree.children_)) {
     ret = OB_ERR_UNEXPECTED;
     SQL_RESV_LOG(WARN, "invalid parse tree!", K(ret));
-  } else if (is_external_catalog_id(session_info_->get_current_default_catalog())) {
+  } else if (session_info_->is_uc_or_ext_catalog_id()) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "drop table in catalog is");
   } else if (OB_ISNULL(drop_table_stmt = create_stmt<ObDropTableStmt>())) {

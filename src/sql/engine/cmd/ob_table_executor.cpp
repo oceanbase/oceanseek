@@ -7,7 +7,9 @@
 #include "sql/engine/cmd/ob_table_executor.h"
 #include "sql/engine/cmd/ob_index_executor.h"
 #include "sql/engine/cmd/ob_ddl_executor_util.h"
+#include "sql/engine/cmd/ob_catalog_sync.h"
 #include "sql/engine/cmd/ob_catalog_sync_helper.h"
+#include "share/catalog/ob_unified_catalog.h"
 #include "sql/resolver/ddl/ob_create_table_stmt.h"
 #include "sql/resolver/ddl/ob_alter_table_stmt.h"
 #include "sql/resolver/ddl/ob_drop_table_stmt.h"
@@ -368,6 +370,21 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
                                         obrpc::ObCommonRpcProxy *common_rpc_proxy)
 {
   int ret = OB_SUCCESS;
+  ObString create_table_name;
+  ObCatalogSync catalog_sync(ctx.get_allocator());
+  ObCatalogSyncOperationHandle catalog_sync_operation;
+  ObCatalogSyncPrepareResult catalog_sync_prepare_result;
+  const uint64_t catalog_sync_tenant_id = stmt.get_create_table_arg().schema_.get_tenant_id();
+  const bool catalog_sync_unified_catalog = ObUnifiedCatalog::is_configured(catalog_sync_tenant_id);
+  if (OB_FAIL(catalog_sync.get_create_table_as_select_operator(
+          ctx, stmt, catalog_sync_operation))) {
+    LOG_WARN("failed to get create table as select catalog sync operation", KR(ret),
+             K(catalog_sync_tenant_id), K(catalog_sync_unified_catalog));
+  } else if (catalog_sync_operation.is_valid()
+             && OB_FAIL(catalog_sync_operation->prepare(catalog_sync_prepare_result))) {
+    LOG_WARN("failed to prepare create table as select catalog sync operation", KR(ret),
+             K(catalog_sync_tenant_id), K(catalog_sync_unified_catalog));
+  }
   ObString cur_query;
   int64_t affected_rows = 0;
   ObMySQLProxy *sql_proxy = ctx.get_sql_proxy();
@@ -379,14 +396,12 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
   HEAP_VAR(obrpc::ObAlterTableArg, alter_table_arg) {
     obrpc::ObDropTableArg drop_table_arg;
     obrpc::ObTableItem table_item;
-    ObString create_table_name;
     ObSqlString ins_sql;
     const observer::ObGlobalContext &gctx = observer::ObServer::get_instance().get_gctx();
     obrpc::ObCreateTableRes create_table_res;
     obrpc::ObCreateTableArg &create_table_arg = stmt.get_create_table_arg();
     create_table_arg.is_inner_ = my_session->is_inner();
     bool need_clean = true;
-    bool sync_placeholder_created = false;
     bool is_async_select_query = false;
     CK(OB_NOT_NULL(sql_proxy),
       OB_NOT_NULL(my_session),
@@ -402,7 +417,6 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
     uint64_t data_version = 0;
     uint64_t tenant_id = create_table_arg.schema_.get_tenant_id();
     bool is_direct_load = false;
-    const bool sync_enabled = ObCatalogSyncHelper::is_sync_enabled(tenant_id);
     if (OB_SUCC(ret)) {
       ObInnerSQLConnectionPool *pool = static_cast<observer::ObInnerSQLConnectionPool*>(sql_proxy->get_pool());
       if (OB_ISNULL(pool)) {
@@ -584,6 +598,8 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
               }
             } else {
               finish = true;
+              drop_table_arg.tables_.at(0).table_name_
+                  = alter_table_arg.alter_table_schema_.get_table_name_str();
             }
           }
           if (OB_SUCC(ret) && res.schema_version_ != OB_INVALID_VERSION) {
@@ -594,61 +610,20 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
             }
           }
         }
-        if (OB_SUCC(ret) && sync_enabled) {
-          ObSchemaGetterGuard sync_schema_guard;
-          const ObTableSchema *sync_table_schema = NULL;
-          if (OB_FAIL(
-                  gctx.schema_service_->get_tenant_schema_guard(tenant_id, sync_schema_guard))) {
-            LOG_WARN("failed to get tenant schema guard for ctas create table sync",
-                     KR(ret),
-                     K(tenant_id));
-          } else if (OB_FAIL(sync_schema_guard.get_table_schema(tenant_id,
-                                                                stmt.get_database_name(),
-                                                                create_table_name,
-                                                                false,
-                                                                sync_table_schema))) {
-            LOG_WARN("failed to get final ctas table schema for sync",
-                     KR(ret),
-                     K(tenant_id),
-                     K(stmt.get_database_name()),
-                     K(create_table_name));
-          } else if (OB_ISNULL(sync_table_schema)) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("final ctas table schema is null",
-                     KR(ret),
-                     K(tenant_id),
-                     K(stmt.get_database_name()),
-                     K(create_table_name));
-          } else if (OB_FAIL(ObCatalogSyncHelper::sync_create_table(tenant_id,
-                                                                    sync_schema_guard,
-                                                                    stmt.get_database_name(),
-                                                                    *sync_table_schema))) {
-            if (OB_ERR_ALREADY_EXISTS == ret && create_table_arg.if_not_exist_) {
-              LOG_INFO("HMS table already exists, tolerate sync create for ctas if not exists",
-                       K(tenant_id),
-                       K(stmt.get_database_name()),
-                       K(create_table_name));
-              ret = OB_SUCCESS;
-              sync_placeholder_created = true;
-            } else {
-              LOG_WARN("failed to sync ctas create table to HMS",
-                       KR(ret),
-                       K(tenant_id),
-                       K(stmt.get_database_name()),
-                       K(create_table_name));
+        if (OB_SUCC(ret) && catalog_sync_operation.is_active()) {
+          if (catalog_sync_operation.is_valid()) {
+            ObCatalogSyncDDLResult catalog_sync_ddl_result;
+            catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_SUCCEEDED;
+            catalog_sync_ddl_result.ddl_ret_ = ret;
+            catalog_sync_ddl_result.object_id_ = alter_table_arg.alter_table_schema_.get_table_id();
+            if (OB_FAIL(catalog_sync_operation->complete(catalog_sync_ddl_result))) {
+              LOG_WARN("failed to complete create table as select catalog sync operation",
+                       KR(ret), K(tenant_id), K(catalog_sync_unified_catalog));
             }
-          } else {
-            sync_placeholder_created = true;
-            if (sync_table_schema->is_partitioned_table()
-                && OB_FAIL(ObCatalogSyncHelper::reconcile_partitions(
-                       tenant_id,
-                       sync_schema_guard,
-                       stmt.get_database_name(),
-                       *sync_table_schema))) {
-              LOG_WARN("failed to reconcile ctas partitions in HMS",
-                       K(ret), K(tenant_id), K(stmt.get_database_name()),
-                       K(create_table_name));
-            }
+          } else if (ObCatalogSyncHelper::is_sync_enabled(tenant_id)
+                     && OB_FAIL(catalog_sync_operation.get_deferred_ret())) {
+            LOG_WARN("failed to allocate create table as select catalog sync operation",
+                     KR(ret), K(tenant_id), K(catalog_sync_unified_catalog));
           }
         }
 
@@ -659,31 +634,20 @@ int ObCreateTableExecutor::execute_ctas(ObExecContext &ctx,
             obrpc::ObDDLRes res;
             drop_table_arg.compat_mode_ = ORACLE_MODE == my_session->get_compatibility_mode() ?
               lib::Worker::CompatMode::ORACLE : lib::Worker::CompatMode::MYSQL;
-            if (OB_SUCCESS != (tmp_ret = common_rpc_proxy->drop_table(drop_table_arg, res))) {
-              LOG_WARN("failed to drop table", K(drop_table_arg), K(ret));
+            if (OB_TMP_FAIL(common_rpc_proxy->drop_table(drop_table_arg, res))) {
+              LOG_WARN("failed to drop CTAS table during OceanBase cleanup",
+                       KR(tmp_ret),
+                       K(drop_table_arg),
+                       K(ret));
             } else {
               LOG_INFO("table is created and dropped due to error ", K(ret));
-            }
-          }
-          if (sync_enabled && sync_placeholder_created) {
-            ObSchemaGetterGuard sync_schema_guard;
-            int tmp_ret = OB_SUCCESS;
-            if (OB_SUCCESS
-                != (tmp_ret = gctx.schema_service_->get_tenant_schema_guard(tenant_id,
-                                                                            sync_schema_guard))) {
-              LOG_WARN("failed to get tenant schema guard for ctas drop table sync",
-                       KR(tmp_ret),
-                       K(tenant_id));
-            } else if (OB_SUCCESS
-                       != (tmp_ret = ObCatalogSyncHelper::sync_drop_table(tenant_id,
-                                                                          sync_schema_guard,
-                                                                          stmt.get_database_name(),
-                                                                          create_table_name))) {
-              LOG_WARN("failed to cleanup HMS placeholder for ctas failure",
-                       KR(tmp_ret),
-                       K(tenant_id),
-                       K(stmt.get_database_name()),
-                       K(create_table_name));
+              if (catalog_sync_operation.is_valid()
+                  && OB_TMP_FAIL(catalog_sync_operation->compensate(ret))) {
+                LOG_WARN("failed to compensate create table as select catalog sync operation",
+                         KR(tmp_ret),
+                         K(ret),
+                         K(tenant_id));
+              }
             }
           }
         } else {
@@ -734,7 +698,13 @@ int ObCreateTableExecutor::execute(ObExecContext &ctx, ObCreateTableStmt &stmt)
   ObSQLSessionInfo *my_session = ctx.get_my_session();
   uint64_t tenant_id = table_schema.get_tenant_id();
   uint64_t data_version = 0;
-  if (OB_ISNULL(my_session)) {
+  ObCatalogSync catalog_sync(ctx.get_allocator());
+  ObCatalogSyncAuthContext catalog_sync_context;
+  if (OB_FAIL(catalog_sync.prepare_create_table_context(
+          ctx, create_table_arg, catalog_sync_context))) {
+    LOG_WARN("failed to prepare create table catalog sync context",
+             KR(ret), K(tenant_id));
+  } else if (OB_ISNULL(my_session)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("session is null", K(ret));
   } else if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
@@ -824,39 +794,33 @@ int ObCreateTableExecutor::execute(ObExecContext &ctx, ObCreateTableStmt &stmt)
         is_parallel_create = tenant_config.is_valid()
                              && tenant_config->_enable_parallel_table_creation;
       }
-      if (OB_SUCC(ret) && ObCatalogSyncHelper::is_sync_enabled(tenant_id)
-          && table_schema.is_user_table()) {
-        ObSchemaGetterGuard sync_schema_guard;
-        if (OB_ISNULL(GCTX.schema_service_)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("schema service is null", KR(ret), K(tenant_id));
-        } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(tenant_id,
-                                                                         sync_schema_guard))) {
-          LOG_WARN("failed to get tenant schema guard for create table sync",
-                   KR(ret),
-                   K(tenant_id));
-        } else if (OB_FAIL(ObCatalogSyncHelper::sync_create_table(tenant_id,
-                                                                  sync_schema_guard,
-                                                                  stmt.get_database_name(),
-                                                                  table_schema))) {
-          if (OB_ERR_ALREADY_EXISTS == ret && create_table_arg.if_not_exist_) {
-            LOG_INFO(
-                "HMS table already exists, tolerate sync create for create table if not exists",
-                K(tenant_id),
-                K(stmt.get_database_name()),
-                K(table_schema.get_table_name_str()));
-            ret = OB_SUCCESS;
-          } else {
-            LOG_WARN("failed to sync create table to HMS before local create",
-                     KR(ret),
-                     K(tenant_id),
-                     K(table_schema.get_table_name_str()));
-          }
+      ObCatalogSyncOperationHandle catalog_sync_operation;
+      ObCatalogSyncPrepareResult catalog_sync_prepare_result;
+      ObCatalogSyncDDLResult catalog_sync_ddl_result;
+      bool local_ddl_attempted = false;
+      bool local_ddl_rejected_existing = false;
+      const bool catalog_sync_unified_catalog = ObUnifiedCatalog::is_configured(tenant_id);
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(catalog_sync.get_create_table_operator(catalog_sync_context,
+                                                           stmt.get_database_name(),
+                                                           create_table_arg,
+                                                           catalog_sync_operation))) {
+          LOG_WARN("failed to get create table catalog sync operation",
+                   KR(ret), K(tenant_id), K(catalog_sync_unified_catalog));
+        }
+      }
+      if (OB_SUCC(ret) && catalog_sync_operation.is_valid()) {
+        if (OB_FAIL(catalog_sync_operation->prepare(catalog_sync_prepare_result))) {
+          LOG_WARN("failed to prepare create table catalog sync",
+                   KR(ret), K(tenant_id), K(catalog_sync_unified_catalog));
         }
       }
       if (OB_FAIL(ret)) {
         // do nothing
+      } else if (catalog_sync_prepare_result.skip_local_ddl_) {
+        res.do_nothing_ = true;
       } else {
+        local_ddl_attempted = true;
         if (!is_parallel_create && !((data_version >= MOCK_DATA_VERSION_4_2_5_3
                                       && data_version < DATA_VERSION_4_3_0_0)
                                      || (data_version >= MOCK_DATA_VERSION_4_4_2_0
@@ -873,6 +837,7 @@ int ObCreateTableExecutor::execute(ObExecContext &ctx, ObCreateTableStmt &stmt)
             LOG_WARN("fail to execute parallel ddl", KR(ret), K(create_table_arg), K(res));
           }
         }
+        local_ddl_rejected_existing = OB_ERR_TABLE_EXIST == ret;
       }
       if (OB_SUCC(ret)) {
         if (create_table_arg.schema_.is_materialized_view()) {
@@ -891,60 +856,32 @@ int ObCreateTableExecutor::execute(ObExecContext &ctx, ObCreateTableStmt &stmt)
           }
         }
       }
-      // Sync the initial physical partitions of a partitioned table to HMS.
-      // This must run AFTER the local create RPC succeeds: physical part_id /
-      // sub_part_id are only allocated on the RootServer inside the create RPC,
-      // so we re-fetch the materialized schema before syncing.
-      if (OB_SUCC(ret) && ObCatalogSyncHelper::is_sync_enabled(tenant_id)
-          && table_schema.is_user_table() && table_schema.is_partitioned_table()
-          && !res.do_nothing_) {
-        ObSchemaGetterGuard sync_part_schema_guard;
-        const ObTableSchema *created_table_schema = NULL;
-        const ObDatabaseSchema *created_db_schema = NULL;
-        if (OB_ISNULL(GCTX.schema_service_)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("schema service is null", KR(ret), K(tenant_id));
-        } else if (OB_FAIL(GCTX.schema_service_->async_refresh_schema(tenant_id,
-                                                                      res.schema_version_))) {
-          LOG_WARN("failed to async refresh schema for initial partition sync",
-                   KR(ret),
-                   K(tenant_id),
-                   K(res.schema_version_));
-        } else if (OB_FAIL(GCTX.schema_service_->get_tenant_schema_guard(tenant_id,
-                                                                         sync_part_schema_guard))) {
-          LOG_WARN("failed to get tenant schema guard for initial partition sync",
-                   KR(ret),
-                   K(tenant_id));
-        } else if (OB_FAIL(sync_part_schema_guard.get_table_schema(tenant_id,
-                                                                   res.table_id_,
-                                                                   created_table_schema))) {
-          LOG_WARN("failed to get created table schema for initial partition sync",
-                   KR(ret),
-                   K(tenant_id),
-                   K(res.table_id_));
-        } else if (OB_ISNULL(created_table_schema)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("created table schema is null", KR(ret), K(tenant_id), K(res.table_id_));
-        } else if (OB_FAIL(sync_part_schema_guard.get_database_schema(
-                       tenant_id,
-                       created_table_schema->get_database_id(),
-                       created_db_schema))) {
-          LOG_WARN("failed to get database schema for initial partition sync",
-                   KR(ret),
-                   K(tenant_id));
-        } else if (OB_ISNULL(created_db_schema)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("created database schema is null", KR(ret), K(tenant_id));
-        } else if (OB_FAIL(ObCatalogSyncHelper::reconcile_partitions(
-                       tenant_id,
-                       sync_part_schema_guard,
-                       created_db_schema->get_database_name_str(),
-                       *created_table_schema))) {
-          LOG_WARN("failed to reconcile created table partitions in HMS",
-                   KR(ret),
-                   K(tenant_id),
-                   K(created_db_schema->get_database_name_str()),
-                   K(created_table_schema->get_table_name_str()));
+      if (catalog_sync_operation.is_valid()) {
+        catalog_sync_ddl_result.ddl_ret_ = ret;
+        catalog_sync_ddl_result.object_id_ = res.table_id_;
+        catalog_sync_ddl_result.schema_version_ = res.schema_version_;
+        if (catalog_sync_prepare_result.skip_local_ddl_ || res.do_nothing_) {
+          catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_NOOP;
+        } else if (!local_ddl_attempted) {
+          catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_NOT_STARTED;
+        } else if (OB_SUCC(ret)) {
+          catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_SUCCEEDED;
+        } else if (local_ddl_rejected_existing) {
+          catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_REJECTED;
+        } else {
+          catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_UNKNOWN;
+        }
+        if (OB_SUCC(ret)) {
+          if (OB_FAIL(catalog_sync_operation->complete(catalog_sync_ddl_result))) {
+            LOG_WARN("failed to complete create table catalog sync",
+                     KR(ret), K(tenant_id), K(catalog_sync_unified_catalog));
+          }
+        } else {
+          int tmp_ret = OB_SUCCESS;
+          if (OB_TMP_FAIL(catalog_sync_operation->complete(catalog_sync_ddl_result))) {
+            LOG_WARN("failed to complete create table catalog sync after local failure",
+                     KR(ret), KR(tmp_ret), K(tenant_id), K(catalog_sync_unified_catalog));
+          }
         }
       }
 
@@ -1418,9 +1355,23 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
   ObTaskExecutorCtx *task_exec_ctx = NULL;
   obrpc::ObCommonRpcProxy *common_rpc_proxy = NULL;
   obrpc::ObAlterTableArg &alter_table_arg = stmt.get_alter_table_arg();
+  const int64_t tenant_id = alter_table_arg.alter_table_schema_.get_tenant_id();
   obrpc::ObExchangePartitionArg &exchange_partition_arg = stmt.get_exchange_partition_arg();
   LOG_DEBUG("start of alter table execute", K(alter_table_arg));
   ObString first_stmt;
+  ObCatalogSync catalog_sync(ctx.get_allocator());
+  ObCatalogSyncOperationHandle catalog_sync_operation;
+  ObCatalogSyncPrepareResult catalog_sync_prepare_result;
+  const bool catalog_sync_unified_catalog = ObUnifiedCatalog::is_configured(tenant_id);
+  if (OB_FAIL(catalog_sync.get_alter_table_operator(
+          ctx, alter_table_arg, catalog_sync_operation))) {
+    LOG_WARN("failed to get alter table catalog sync operation",
+             KR(ret), K(tenant_id), K(catalog_sync_unified_catalog));
+  } else if (catalog_sync_operation.is_valid()
+             && OB_FAIL(catalog_sync_operation->prepare(catalog_sync_prepare_result))) {
+    LOG_WARN("failed to prepare alter table catalog sync",
+             KR(ret), K(tenant_id), K(catalog_sync_unified_catalog));
+  }
   OZ (stmt.get_first_stmt(first_stmt));
   OV (OB_NOT_NULL(task_exec_ctx = GET_TASK_EXECUTOR_CTX(ctx)), OB_NOT_INIT);
   OZ (task_exec_ctx->get_common_rpc(common_rpc_proxy));
@@ -1449,7 +1400,6 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
     bool need_check = false;
     bool need_modify_notnull_validate = false;
     bool is_oracle_mode = false;
-    const int64_t tenant_id = alter_table_arg.alter_table_schema_.get_tenant_id();
     ObArenaAllocator allocator(ObModIds::OB_SQL_EXECUTOR);
     if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
       LOG_WARN("get first statement failed", K(ret));
@@ -1659,132 +1609,21 @@ int ObAlterTableExecutor::execute(ObExecContext &ctx, ObAlterTableStmt &stmt)
         }
       }
     }
-    if (OB_SUCC(ret) && ObCatalogSyncHelper::is_sync_enabled(tenant_id)) {
-      ObSchemaGetterGuard sync_schema_guard;
-      const ObTableSchema *sync_table_schema = NULL;
-      const ObDatabaseSchema *sync_db_schema = NULL;
-      const uint64_t sync_table_id = OB_INVALID_ID == alter_table_arg.table_id_
-          ? alter_table_arg.alter_table_schema_.get_table_id()
-          : alter_table_arg.table_id_;
-      // Make sure the local schema guard catches up with this DDL's schema
-      // version, otherwise the lookup below may see a stale schema.
-      if (OB_INVALID_VERSION != res.schema_version_ && OB_NOT_NULL(my_session)
-          && OB_NOT_NULL(common_rpc_proxy)) {
-        ObTimeoutCtx timeout_ctx;
-        if (OB_FAIL(timeout_ctx.set_timeout(common_rpc_proxy->get_timeout()))) {
-          LOG_WARN("failed to set timeout for catalog sync", KR(ret), K(tenant_id));
-        } else if (OB_FAIL(ObSchemaUtils::try_check_parallel_ddl_schema_in_sync(
-                       timeout_ctx, my_session, tenant_id, res.schema_version_,
-                       true /*skip_consensus*/))) {
-          LOG_WARN("failed to wait schema in sync for catalog sync",
-                   KR(ret), K(tenant_id), K(res.schema_version_), K(sync_table_id));
+    if (OB_SUCC(ret) && catalog_sync_operation.is_active()) {
+      if (catalog_sync_operation.is_valid()) {
+        ObCatalogSyncDDLResult catalog_sync_ddl_result;
+        catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_SUCCEEDED;
+        catalog_sync_ddl_result.ddl_ret_ = ret;
+        catalog_sync_ddl_result.schema_version_ = res.schema_version_;
+        catalog_sync_ddl_result.schema_sync_timeout_us_ = common_rpc_proxy->get_timeout();
+        if (OB_FAIL(catalog_sync_operation->complete(catalog_sync_ddl_result))) {
+          LOG_WARN("failed to complete alter table catalog sync",
+                   KR(ret), K(tenant_id), K(catalog_sync_unified_catalog));
         }
-      }
-      if (OB_FAIL(ret)) {
-      } else if (OB_ISNULL(GCTX.schema_service_)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("schema service is null", KR(ret));
-      } else if (OB_FAIL(
-                     GCTX.schema_service_->get_tenant_schema_guard(tenant_id, sync_schema_guard))) {
-        LOG_WARN("failed to get tenant schema guard for alter table sync", KR(ret), K(tenant_id));
-      } else if (OB_FAIL(sync_schema_guard.get_table_schema(tenant_id,
-                                                            sync_table_id,
-                                                            sync_table_schema))) {
-        LOG_WARN("failed to get table schema for alter table sync",
-                 KR(ret),
-                 K(tenant_id),
-                 K(sync_table_id));
-      } else if (OB_ISNULL(sync_table_schema)
-                 // Offline DDL rebuilds the table under a new table id and
-                 // recycles the original one, so lookup by the old id may miss.
-                 // Fall back to the final database/table name in the arg.
-                 && OB_FAIL(sync_schema_guard.get_table_schema(
-                     tenant_id,
-                     alter_table_arg.alter_table_schema_.get_database_name(),
-                     alter_table_arg.alter_table_schema_.get_table_name_str(),
-                     false /*is_index*/,
-                     sync_table_schema))) {
-        LOG_WARN("failed to get table schema for alter table sync by name",
-                 KR(ret),
-                 K(tenant_id),
-                 K(sync_table_id),
-                 "database_name",
-                 alter_table_arg.alter_table_schema_.get_database_name(),
-                 "table_name",
-                 alter_table_arg.alter_table_schema_.get_table_name_str());
-      } else if (OB_ISNULL(sync_table_schema)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("sync table schema is null", KR(ret), K(tenant_id), K(sync_table_id));
-      } else if (sync_table_schema->is_index_table() || sync_table_schema->is_aux_table()) {
-        // do nothing
-      } else if (OB_FAIL(sync_schema_guard.get_database_schema(tenant_id,
-                                                               sync_table_schema->get_database_id(),
-                                                               sync_db_schema))) {
-        LOG_WARN("failed to get database schema for alter table sync", KR(ret), K(tenant_id));
-      } else if (OB_NOT_NULL(sync_db_schema)) {
-        const ObString &new_table_name = sync_table_schema->get_table_name_str();
-        const ObString &origin_table_name
-            = alter_table_arg.alter_table_schema_.get_origin_table_name();
-        const ObString &new_database_name = sync_db_schema->get_database_name_str();
-        const ObString &origin_database_name
-            = alter_table_arg.alter_table_schema_.get_origin_database_name().empty()
-                  ? new_database_name
-                  : alter_table_arg.alter_table_schema_.get_origin_database_name();
-        const bool is_rename
-            = !origin_table_name.empty() && 0 != origin_table_name.case_compare(new_table_name);
-        if (is_rename) {
-          if (OB_FAIL(ObCatalogSyncHelper::sync_drop_table(tenant_id,
-                                                           sync_schema_guard,
-                                                           origin_database_name,
-                                                           origin_table_name))) {
-            LOG_WARN("failed to sync drop old table for rename",
-                     KR(ret),
-                     K(tenant_id),
-                     K(origin_database_name),
-                     K(origin_table_name),
-                     K(new_table_name));
-          } else if (OB_FAIL(ObCatalogSyncHelper::sync_create_table(tenant_id,
-                                                                    sync_schema_guard,
-                                                                    new_database_name,
-                                                                    *sync_table_schema))) {
-            LOG_WARN("failed to sync create new table for rename",
-                     KR(ret),
-                     K(tenant_id),
-                     K(new_database_name),
-                     K(new_table_name),
-                     K(origin_table_name));
-          } else if (sync_table_schema->is_partitioned_table()
-                     && OB_FAIL(ObCatalogSyncHelper::reconcile_partitions(
-                            tenant_id,
-                            sync_schema_guard,
-                            new_database_name,
-                            *sync_table_schema))) {
-            LOG_WARN("failed to sync initial partitions after table rename",
-                     KR(ret),
-                     K(tenant_id),
-                     K(new_database_name),
-                     K(new_table_name),
-                     K(origin_table_name));
-          }
-        } else if (OB_FAIL(ObCatalogSyncHelper::sync_alter_table(tenant_id,
-                                                                 sync_schema_guard,
-                                                                 new_database_name,
-                                                                 *sync_table_schema))) {
-          LOG_WARN("failed to sync alter table to HMS",
-                   KR(ret),
-                   K(tenant_id),
-                   K(new_database_name),
-                   K(new_table_name));
-        } else if (ObCatalogSyncHelper::need_reconcile_partitions(alter_table_arg)
-                   && OB_FAIL(ObCatalogSyncHelper::reconcile_partitions(
-                       tenant_id,
-                       sync_schema_guard,
-                       new_database_name,
-                       *sync_table_schema))) {
-          LOG_WARN("failed to reconcile altered table partitions in HMS",
-                   KR(ret), K(tenant_id), K(new_database_name), K(new_table_name),
-                   K(alter_table_arg.alter_part_type_));
-        }
+      } else if (ObCatalogSyncHelper::is_sync_enabled(tenant_id)
+                 && OB_FAIL(catalog_sync_operation.get_deferred_ret())) {
+        LOG_WARN("failed to initialize alter table catalog sync operation",
+                 KR(ret), K(tenant_id), K(catalog_sync_unified_catalog));
       }
     }
     char table_info_buffer[256];
@@ -2637,7 +2476,13 @@ int ObDropTableExecutor::execute(ObExecContext &ctx, ObDropTableStmt &stmt)
   int64_t foreign_key_checks = 0;
   uint64_t data_version = 0;
   const uint64_t tenant_id = drop_table_arg.tenant_id_;
+  const bool catalog_sync_unified_catalog = ObUnifiedCatalog::is_configured(tenant_id);
   const ObTableType table_type = drop_table_arg.table_type_;
+  ObCatalogSync catalog_sync(ctx.get_allocator());
+  ObCatalogSyncOperationHandle catalog_sync_operation;
+  ObCatalogSyncPrepareResult catalog_sync_prepare_result;
+  ObCatalogSyncDDLResult catalog_sync_ddl_result;
+  bool local_ddl_attempted = false;
   if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
     LOG_WARN("get first statement failed", KR(ret));
   } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, data_version))) {
@@ -2665,6 +2510,10 @@ int ObDropTableExecutor::execute(ObExecContext &ctx, ObDropTableStmt &stmt)
     } else if (FALSE_IT(tmp_arg.foreign_key_checks_ = is_oracle_mode() || (is_mysql_mode() && foreign_key_checks))) {
     } else if (FALSE_IT(tmp_arg.compat_mode_ = ORACLE_MODE == my_session->get_compatibility_mode() ?
         lib::Worker::CompatMode::ORACLE : lib::Worker::CompatMode::MYSQL)) {
+    } else if (OB_FAIL(catalog_sync.get_drop_table_operator(
+                   *my_session, drop_table_arg, catalog_sync_operation))) {
+      LOG_WARN("failed to get drop table catalog sync operation",
+               KR(ret), K(tenant_id), K(catalog_sync_unified_catalog));
     } else {
       bool is_parallel_drop = false;
       if (!((data_version >= MOCK_DATA_VERSION_4_2_5_1 && data_version < DATA_VERSION_4_3_0_0)
@@ -2675,6 +2524,11 @@ int ObDropTableExecutor::execute(ObExecContext &ctx, ObDropTableStmt &stmt)
         is_parallel_drop = false;
       } else if (OB_FAIL(ObParallelDDLControlMode::is_parallel_ddl_enable(ObParallelDDLControlMode::DROP_TABLE, tenant_id, is_parallel_drop))) {
         LOG_WARN("fail to check whether parallel drop table enable", KR(ret), K(tenant_id));
+      }
+      if (OB_SUCC(ret) && catalog_sync_operation.is_valid()
+          && OB_FAIL(catalog_sync_operation->prepare(catalog_sync_prepare_result))) {
+        LOG_WARN("failed to prepare drop table catalog sync",
+                 KR(ret), K(tenant_id), K(catalog_sync_unified_catalog));
       }
       if (OB_SUCC(ret) && lib::Worker::CompatMode::ORACLE == tmp_arg.compat_mode_ ) {
         ARRAY_FOREACH(drop_table_arg.tables_, idx) {
@@ -2693,6 +2547,7 @@ int ObDropTableExecutor::execute(ObExecContext &ctx, ObDropTableStmt &stmt)
           tmp_arg.is_parallel_ = true;
           if (OB_FAIL(ctx.set_timeout(common_rpc_proxy->get_timeout()))) {
             LOG_WARN("fail to set timeout ctx", KR(ret));
+          } else if (FALSE_IT(local_ddl_attempted = true)) {
           } else if (OB_FAIL(common_rpc_proxy->parallel_drop_table(drop_table_arg, res))) {
             LOG_WARN("rpc proxy parallel drop table failed", KR(ret), "dst", common_rpc_proxy->get_server());
           } else {
@@ -2719,6 +2574,7 @@ int ObDropTableExecutor::execute(ObExecContext &ctx, ObDropTableStmt &stmt)
           }
         } else {
           obrpc::ObDDLRes res;
+          local_ddl_attempted = true;
           if (OB_FAIL(common_rpc_proxy->drop_table(drop_table_arg, res))) {
             LOG_WARN("rpc proxy drop table failed", KR(ret), "dst", common_rpc_proxy->get_server());
           } else if (res.is_valid() && OB_FAIL(ObDDLExecutorUtil::wait_ddl_retry_task_finish(res.tenant_id_, res.task_id_, *my_session, common_rpc_proxy, affected_rows))) {
@@ -2736,16 +2592,43 @@ int ObDropTableExecutor::execute(ObExecContext &ctx, ObDropTableStmt &stmt)
           SQL_ENG_LOG(INFO, "finish drop table execute.", KR(ret), "ddl_event_info", ObDDLEventInfo());
         }
       }
-      if (ObCatalogSyncHelper::is_sync_enabled(tenant_id)) {
-        if (OB_SUCC(ret)) {
-          // internal drop succeeded: mirror it to the HMS placeholder, surface sync errors
-          ret = ObCatalogSyncHelper::sync_drop_tables(tenant_id, drop_table_arg.tables_);
+      if (catalog_sync_operation.is_active()) {
+        catalog_sync_ddl_result.ddl_ret_ = ret;
+        if (!local_ddl_attempted) {
+          catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_NOT_STARTED;
+        } else if (OB_SUCC(ret)) {
+          catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_SUCCEEDED;
         } else if (OB_ERR_BAD_TABLE == ret) {
-          // internal table already gone: still clean the diverged HMS orphan, but keep the
-          // original 1051 for the client (re-dropping a missing table stays 1051)
-          int tmp_ret = ObCatalogSyncHelper::sync_drop_tables(tenant_id, drop_table_arg.tables_);
-          if (OB_SUCCESS != tmp_ret) {
-            LOG_WARN("failed to clean HMS placeholder for a missing table", KR(tmp_ret), "drop_ret", ret);
+          catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_REJECTED;
+        } else {
+          catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_UNKNOWN;
+        }
+        if (OB_SUCC(ret)) {
+          if (catalog_sync_operation.is_valid()) {
+            if (OB_FAIL(catalog_sync_operation->complete(catalog_sync_ddl_result))) {
+              LOG_WARN("failed to complete drop table catalog sync",
+                       KR(ret), K(tenant_id), K(catalog_sync_unified_catalog));
+            }
+          } else if (OB_FAIL(catalog_sync_operation.get_deferred_ret())) {
+            LOG_WARN("failed to initialize drop table catalog sync operation",
+                     KR(ret),
+                     K(tenant_id));
+          }
+        } else {
+          int tmp_ret = OB_SUCCESS;
+          if (catalog_sync_operation.is_valid()) {
+            if (OB_TMP_FAIL(catalog_sync_operation->complete(catalog_sync_ddl_result))) {
+              LOG_WARN("failed to complete drop table catalog sync after local failure",
+                       KR(ret),
+                       KR(tmp_ret),
+                       K(tenant_id),
+                       K(catalog_sync_unified_catalog));
+            }
+          } else if (OB_TMP_FAIL(catalog_sync_operation.get_deferred_ret())) {
+            LOG_WARN("failed to initialize drop table catalog sync operation",
+                     KR(ret),
+                     KR(tmp_ret),
+                     K(tenant_id));
           }
         }
       }
@@ -2771,34 +2654,65 @@ int ObRenameTableExecutor::execute(ObExecContext &ctx, ObRenameTableStmt &stmt)
   int ret = OB_SUCCESS;
   const obrpc::ObRenameTableArg &rename_table_arg = stmt.get_rename_table_arg();
   const uint64_t tenant_id = rename_table_arg.tenant_id_;
-  const bool sync_enabled = ObCatalogSyncHelper::is_sync_enabled(tenant_id);
+  const bool is_unified_catalog = ObUnifiedCatalog::is_configured(tenant_id);
   ObTaskExecutorCtx *task_exec_ctx = NULL;
   obrpc::ObCommonRpcProxy *common_rpc_proxy = NULL;
-  bool remote_renamed = false;
-  if (OB_ISNULL(task_exec_ctx = GET_TASK_EXECUTOR_CTX(ctx))) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("get task executor context failed");
-  } else if (OB_FAIL(task_exec_ctx->get_common_rpc(common_rpc_proxy))) {
-    LOG_WARN("get common rpc proxy failed", K(ret));
-  } else if (OB_ISNULL(common_rpc_proxy)){
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("common rpc proxy should not be null", K(ret));
-  } else if (sync_enabled
-             && OB_FAIL(ObCatalogSyncHelper::sync_rename_table_before(
-                            tenant_id, rename_table_arg, remote_renamed))) {
-    LOG_WARN("failed to sync rename table before local rename", K(ret));
-  } else if (OB_FAIL(common_rpc_proxy->rename_table(rename_table_arg))) {
-    LOG_WARN("rpc proxy rename table failed", K(ret));
-    if (remote_renamed) {
-      const int local_ret = ret;
-      if (OB_FAIL(ObCatalogSyncHelper::sync_rename_table_rollback(tenant_id, rename_table_arg))) {
-        // remote renamed but rollback failed: HMS and local schema inconsistent, need manual repair
-        LOG_WARN("failed to rollback remote rename after local rename failure",
-                 K(ret),
-                 K(tenant_id),
-                 K(rename_table_arg));
+  ObCatalogSync catalog_sync(ctx.get_allocator());
+  ObCatalogSyncOperationHandle catalog_sync_operation;
+  ObCatalogSyncPrepareResult catalog_sync_prepare_result;
+  ObCatalogSyncDDLResult catalog_sync_ddl_result;
+  bool local_ddl_attempted = false;
+  if (OB_FAIL(catalog_sync.get_rename_table_operator(
+          rename_table_arg, catalog_sync_operation))) {
+    LOG_WARN("failed to get rename table catalog sync operation",
+             KR(ret), K(tenant_id), K(is_unified_catalog));
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_ISNULL(task_exec_ctx = GET_TASK_EXECUTOR_CTX(ctx))) {
+      ret = OB_NOT_INIT;
+      LOG_WARN("get task executor context failed");
+    } else if (OB_FAIL(task_exec_ctx->get_common_rpc(common_rpc_proxy))) {
+      LOG_WARN("get common rpc proxy failed", K(ret));
+    } else if (OB_ISNULL(common_rpc_proxy)){
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("common rpc proxy should not be null", K(ret));
+    } else if (!catalog_sync_operation.is_valid()
+               && OB_FAIL(catalog_sync_operation.get_deferred_ret())) {
+      LOG_WARN("failed to initialize rename table catalog sync operation",
+               KR(ret), K(tenant_id));
+    } else if (catalog_sync_operation.is_valid()
+               && OB_FAIL(catalog_sync_operation->prepare(catalog_sync_prepare_result))) {
+      LOG_WARN("failed to prepare rename table catalog sync",
+               KR(ret), K(tenant_id), K(is_unified_catalog));
+    } else {
+      local_ddl_attempted = true;
+      if (OB_FAIL(common_rpc_proxy->rename_table(rename_table_arg))) {
+        LOG_WARN("rpc proxy rename table failed", K(ret));
       }
-      ret = local_ret;
+    }
+  }
+  if (catalog_sync_operation.is_valid() && local_ddl_attempted) {
+    catalog_sync_ddl_result.ddl_ret_ = ret;
+    if (OB_SUCC(ret)) {
+      catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_SUCCEEDED;
+    } else if (OB_RPC_SEND_ERROR == ret || OB_RPC_POST_ERROR == ret) {
+      catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_NOT_STARTED;
+    } else if (OB_ERR_TABLE_EXIST == ret) {
+      catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_REJECTED;
+    } else {
+      catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_UNKNOWN;
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(catalog_sync_operation->complete(catalog_sync_ddl_result))) {
+        LOG_WARN("failed to complete rename table catalog sync",
+                 KR(ret), K(tenant_id), K(is_unified_catalog));
+      }
+    } else {
+      int tmp_ret = OB_SUCCESS;
+      if (OB_TMP_FAIL(catalog_sync_operation->complete(catalog_sync_ddl_result))) {
+        LOG_WARN("failed to complete rename table catalog sync after local failure",
+                 KR(ret), KR(tmp_ret), K(tenant_id), K(is_unified_catalog));
+      }
     }
   }
   return ret;
@@ -3101,11 +3015,23 @@ ObCreateTableLikeExecutor::~ObCreateTableLikeExecutor()
 int ObCreateTableLikeExecutor::execute(ObExecContext &ctx, ObCreateTableLikeStmt &stmt)
 {
   int ret = OB_SUCCESS;
+  ObCatalogSync catalog_sync(ctx.get_allocator());
+  ObCatalogSyncOperationHandle catalog_sync_operation;
+  ObCatalogSyncPrepareResult catalog_sync_prepare_result;
   const obrpc::ObCreateTableLikeArg &create_table_like_arg = stmt.get_create_table_like_arg();
   obrpc::ObCreateTableLikeArg &tmp_arg = const_cast<obrpc::ObCreateTableLikeArg&>(create_table_like_arg);
   ObString first_stmt;
   ObSQLSessionInfo *my_session = ctx.get_my_session();
-  if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
+  const bool is_unified_catalog = ObUnifiedCatalog::is_configured(create_table_like_arg.tenant_id_);
+  if (OB_FAIL(catalog_sync.get_create_table_like_operator(
+          ctx, create_table_like_arg, catalog_sync_operation))) {
+    LOG_WARN("failed to get create table like catalog sync operation",
+             KR(ret), K(create_table_like_arg.tenant_id_), K(is_unified_catalog));
+  } else if (catalog_sync_operation.is_valid()
+             && OB_FAIL(catalog_sync_operation->prepare(catalog_sync_prepare_result))) {
+    LOG_WARN("failed to prepare create table like catalog sync",
+             KR(ret), K(create_table_like_arg.tenant_id_), K(is_unified_catalog));
+  } else if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
     LOG_WARN("get first statement failed", K(ret));
   } else if (OB_ISNULL(my_session)) {
     ret = OB_ERR_UNEXPECTED;
@@ -3147,72 +3073,20 @@ int ObCreateTableLikeExecutor::execute(ObExecContext &ctx, ObCreateTableLikeStmt
         LOG_WARN("rpc proxy create table like failed", K(ret));
       }
     }
-    // Sync the newly created table to the external catalog (e.g. HMS) after the
-    // local table has been created. Unlike plain CREATE TABLE (whose arg carries
-    // the full schema and thus syncs before the local create), the LIKE arg only
-    // holds names, so we fetch the resulting table schema (like CTAS does) and
-    // sync it. The local create is a single atomic RootService DDL transaction,
-    // and sync does not go through RootService, so on sync failure we simply
-    // return the error without rolling back the local table (matching plain
-    // CREATE TABLE behavior).
-    if (OB_SUCC(ret) && ObCatalogSyncHelper::is_sync_enabled(tmp_arg.tenant_id_)) {
-      const uint64_t tenant_id = tmp_arg.tenant_id_;
-      ObSchemaGetterGuard sync_schema_guard;
-      const ObTableSchema *sync_table_schema = NULL;
-      if (OB_ISNULL(GCTX.schema_service_)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("schema service is null", KR(ret), K(tenant_id));
-      } else if (OB_FAIL(
-                     GCTX.schema_service_->get_tenant_schema_guard(tenant_id, sync_schema_guard))) {
-        LOG_WARN("failed to get tenant schema guard for create table like sync",
-                 KR(ret),
-                 K(tenant_id));
-      } else if (OB_FAIL(sync_schema_guard.get_table_schema(tenant_id,
-                                                            stmt.get_new_db_name(),
-                                                            stmt.get_new_table_name(),
-                                                            false,
-                                                            sync_table_schema))) {
-        LOG_WARN("failed to get created table like schema for sync",
-                 KR(ret),
-                 K(tenant_id),
-                 K(stmt.get_new_db_name()),
-                 K(stmt.get_new_table_name()));
-      } else if (OB_ISNULL(sync_table_schema)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("created table like schema is null",
-                 KR(ret),
-                 K(tenant_id),
-                 K(stmt.get_new_db_name()),
-                 K(stmt.get_new_table_name()));
-      } else if (!sync_table_schema->is_user_table()) {
-        // Only user tables are synced to the external catalog.
-      } else if (OB_FAIL(ObCatalogSyncHelper::sync_create_table(tenant_id,
-                                                                sync_schema_guard,
-                                                                stmt.get_new_db_name(),
-                                                                *sync_table_schema))) {
-        if (OB_ERR_ALREADY_EXISTS == ret && tmp_arg.if_not_exist_) {
-          LOG_INFO("HMS table already exists, tolerate sync create for create table like "
-                   "if not exists",
-                   K(tenant_id),
-                   K(stmt.get_new_db_name()),
-                   K(stmt.get_new_table_name()));
-          ret = OB_SUCCESS;
-        } else {
-          LOG_WARN("failed to sync create table like to HMS",
-                   KR(ret),
-                   K(tenant_id),
-                   K(stmt.get_new_db_name()),
-                   K(stmt.get_new_table_name()));
+    if (OB_SUCC(ret) && catalog_sync_operation.is_active()) {
+      if (catalog_sync_operation.is_valid()) {
+        ObCatalogSyncDDLResult catalog_sync_ddl_result;
+        catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_SUCCEEDED;
+        catalog_sync_ddl_result.ddl_ret_ = ret;
+        if (OB_FAIL(catalog_sync_operation->complete(catalog_sync_ddl_result))) {
+          LOG_WARN("failed to complete create table like catalog sync",
+                   KR(ret), K(tmp_arg.tenant_id_), K(is_unified_catalog));
         }
-      } else if (sync_table_schema->is_partitioned_table()
-                 && OB_FAIL(ObCatalogSyncHelper::reconcile_partitions(
-                     tenant_id,
-                     sync_schema_guard,
-                     stmt.get_new_db_name(),
-                     *sync_table_schema))) {
-        LOG_WARN("failed to reconcile create table like partitions in HMS",
-                 KR(ret), K(tenant_id), K(stmt.get_new_db_name()),
-                 K(stmt.get_new_table_name()));
+      } else if (USER_TABLE == tmp_arg.table_type_
+                 && ObCatalogSyncHelper::is_sync_enabled(tmp_arg.tenant_id_)
+                 && OB_FAIL(catalog_sync_operation.get_deferred_ret())) {
+        LOG_WARN("failed to initialize create table like catalog sync operation",
+                 KR(ret), K(tmp_arg.tenant_id_), K(is_unified_catalog));
       }
     }
   }
@@ -3261,10 +3135,16 @@ int ObFlashBackTableFromRecyclebinExecutor::execute(ObExecContext &ctx, ObFlashB
   const obrpc::ObFlashBackTableFromRecyclebinArg &flashback_table_arg = stmt.get_flashback_table_arg();
   obrpc::ObFlashBackTableFromRecyclebinArg &tmp_arg = const_cast<obrpc::ObFlashBackTableFromRecyclebinArg&>(flashback_table_arg);
   const uint64_t tenant_id = flashback_table_arg.tenant_id_;
-  const bool sync_enabled = ObCatalogSyncHelper::is_sync_enabled(tenant_id);
-  uint64_t recycle_table_id = OB_INVALID_ID;
+  const bool is_unified_catalog = ObUnifiedCatalog::is_configured(tenant_id);
   ObString first_stmt;
-  if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
+  ObCatalogSync catalog_sync(ctx.get_allocator());
+  ObCatalogSyncOperationHandle catalog_sync_operation;
+  ObCatalogSyncPrepareResult catalog_sync_prepare_result;
+  if (OB_FAIL(catalog_sync.get_flashback_table_operator(
+          flashback_table_arg, catalog_sync_operation))) {
+    LOG_WARN("failed to get flashback table catalog sync operation",
+             KR(ret), K(tenant_id), K(is_unified_catalog));
+  } else if (OB_FAIL(stmt.get_first_stmt(first_stmt))) {
     LOG_WARN("get first statement failed", K(ret));
   } else {
     tmp_arg.ddl_stmt_str_ = first_stmt;
@@ -3279,21 +3159,27 @@ int ObFlashBackTableFromRecyclebinExecutor::execute(ObExecContext &ctx, ObFlashB
     } else if (OB_ISNULL(common_rpc_proxy)){
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("common rpc proxy should not be null", K(ret));
-    } else if (sync_enabled
-               && OB_FAIL(ObCatalogSyncHelper::prepare_flashback_table_sync(tenant_id,
-                                                                            flashback_table_arg,
-                                                                            recycle_table_id))) {
-      LOG_WARN("failed to prepare flashback table sync",
-               KR(ret),
-               K(tenant_id),
-               K(flashback_table_arg.origin_table_name_));
+    } else if (!catalog_sync_operation.is_valid()
+               && OB_FAIL(catalog_sync_operation.get_deferred_ret())) {
+      LOG_WARN("failed to initialize flashback table catalog sync operation",
+               KR(ret), K(tenant_id));
+    } else if (catalog_sync_operation.is_valid()
+               && OB_FAIL(catalog_sync_operation->prepare(
+                   catalog_sync_prepare_result))) {
+      LOG_WARN("failed to prepare flashback table catalog sync",
+               KR(ret), K(tenant_id), K(flashback_table_arg.origin_table_name_));
     } else if (OB_FAIL(common_rpc_proxy->flashback_table_from_recyclebin(flashback_table_arg))) {
       LOG_WARN("rpc proxy flashback table failed", K(ret));
-    } else if (sync_enabled
-               && OB_FAIL(ObCatalogSyncHelper::sync_flashback_table(tenant_id,
-                                                                    flashback_table_arg,
-                                                                    recycle_table_id))) {
-      LOG_WARN("failed to sync flashback table", KR(ret), K(tenant_id), K(recycle_table_id));
+    } else if (catalog_sync_operation.is_active()) {
+      if (catalog_sync_operation.is_valid()) {
+        ObCatalogSyncDDLResult catalog_sync_ddl_result;
+        catalog_sync_ddl_result.state_ = CATALOG_SYNC_DDL_SUCCEEDED;
+        catalog_sync_ddl_result.ddl_ret_ = ret;
+        if (OB_FAIL(catalog_sync_operation->complete(catalog_sync_ddl_result))) {
+          LOG_WARN("failed to complete flashback table catalog sync",
+                   KR(ret), K(tenant_id), K(is_unified_catalog));
+        }
+      }
     }
   }
   return ret;

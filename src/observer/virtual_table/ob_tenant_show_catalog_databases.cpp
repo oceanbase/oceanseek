@@ -9,6 +9,9 @@
 #include "common/ob_range.h"
 #include "lib/container/ob_se_array.h"
 #include "share/catalog/ob_cached_catalog_meta_getter.h"
+#include "share/catalog/ob_unified_catalog.h"
+#include "share/catalog/ob_unified_catalog_utils.h"
+#include "sql/table_format/unified/ob_unified_catalog_metadata_provider.h"
 #include "sql/session/ob_sql_session_info.h"
 
 namespace oceanbase
@@ -20,6 +23,7 @@ void ObTenantShowCatalogDatabases::reset()
 {
   catalog_id_ = OB_INVALID_ID;
   tenant_id_ = OB_INVALID_ID;
+  is_uc_catalog_ = false;
   ObVirtualTableIterator::reset();
 }
 
@@ -54,14 +58,30 @@ int ObTenantShowCatalogDatabases::inner_open()
     }
   }
 
-  if (OB_SUCC(ret)) {
+  if (OB_SUCC(ret)
+      && share::ObUnifiedCatalog::is_child_catalog_id(tenant_id_, catalog_id_)) {
+    const ObCatalogSchema *catalog_schema = NULL;
+    ObString access_token;
+    if (OB_FAIL(schema_guard_->get_catalog_schema_by_id(tenant_id_, catalog_id_, catalog_schema))) {
+      LOG_WARN("fail to get catalog schema", K(ret));
+    } else if (OB_ISNULL(catalog_schema)
+               && share::ObUnifiedCatalog::is_child_catalog_id(tenant_id_, catalog_id_)
+               && OB_FAIL(session_->get_sys_variable(share::SYS_VAR__UNIFIED_CATALOG_TOKEN, access_token))) {
+      LOG_WARN("failed to get UC session token", K(ret));
+    } else {
+      is_uc_catalog_ = OB_ISNULL(catalog_schema) && !access_token.empty()
+                       && share::ObUnifiedCatalog::is_child_catalog_id(tenant_id_, catalog_id_);
+    }
+  }
+
+  if (OB_SUCC(ret) && !is_uc_catalog_) {
     if (OB_UNLIKELY(!is_external_catalog_id(catalog_id_))) {
       ret = OB_NOT_SUPPORTED;
       LOG_USER_ERROR(OB_NOT_SUPPORTED, "show tables from non external catalog");
     }
   }
 
-  if (OB_SUCC(ret)) {
+  if (OB_SUCC(ret) && !is_uc_catalog_) {
     // check catalog is existed first
     // then check privilege
     const ObCatalogSchema *catalog_schema = NULL;
@@ -116,9 +136,31 @@ int ObTenantShowCatalogDatabases::fill_scanner()
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("cur row cell is NULL", K(ret));
   } else {
-    share::ObCachedCatalogMetaGetter ob_catalog_meta_getter{*schema_guard_, *allocator_};
-    if (OB_FAIL(ob_catalog_meta_getter.list_namespace_names(tenant_id_, catalog_id_, db_names))) {
-      LOG_WARN("list_namespace_names failed", K(ret), K(tenant_id_), K(catalog_id_));
+    if (is_uc_catalog_) {
+      ObString access_token;
+      ObString remote_catalog_name;
+      if (OB_FAIL(share::ObUnifiedCatalog::get_session_token(*session_, *allocator_, access_token))) {
+        LOG_WARN("failed to get UC session token", K(ret));
+      } else if (OB_FAIL(share::ObUnifiedCatalogUtils::resolve_catalog_name(tenant_id_,
+                                                                            access_token,
+                                                                            catalog_id_,
+                                                                            *schema_guard_,
+                                                                            *allocator_,
+                                                                            remote_catalog_name))) {
+        LOG_WARN("failed to resolve selected UC Catalog name", K(ret), K(catalog_id_));
+      } else if (OB_FAIL(sql::ObUnifiedCatalogMetadataProvider::list_namespace_names(
+                     tenant_id_,
+                     access_token,
+                     remote_catalog_name,
+                     *allocator_,
+                     db_names))) {
+        LOG_WARN("failed to list UC namespace names", K(ret), K(catalog_id_));
+      }
+    } else {
+      share::ObCachedCatalogMetaGetter ob_catalog_meta_getter{*schema_guard_, *allocator_};
+      if (OB_FAIL(ob_catalog_meta_getter.list_namespace_names(tenant_id_, catalog_id_, db_names))) {
+        LOG_WARN("list_namespace_names failed", K(ret), K(tenant_id_), K(catalog_id_));
+      }
     }
   }
 

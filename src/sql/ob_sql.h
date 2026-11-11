@@ -51,6 +51,7 @@ struct ObStmtPrepareResult;
 struct ObPCResourceMapRule;
 class ObSPIService;
 class ObIVirtualTableIteratorFactory;
+struct ObUcTableReadAccessContext;
 struct ObSqlCtx;
 class ObResultSet;
 class ObLogPlan;
@@ -366,7 +367,8 @@ private:
                     ObResultSet &result,
                     ObStmt *&basic_stmt,
                     ParseResult *outline_parse_result = NULL,
-                    ObOutlineState *outline_state = NULL);
+                    ObOutlineState *outline_state = NULL,
+                    bool *add_plan_to_pc = NULL);
 
   // Generate Physical Plan for given syntax tree
   // called by handle_text_query
@@ -384,7 +386,8 @@ private:
                              const bool is_begin_commit_stmt,
                              const PlanCacheMode mode,
                              ParseResult *outline_parse_result = NULL,
-                             ObOutlineState *outline_state = NULL);
+                             ObOutlineState *outline_state = NULL,
+                             bool *add_plan_to_pc = NULL);
 
   int generate_plan(ParseResult &parse_result,
                     ObPlanCacheCtx *pc_ctx,
@@ -393,7 +396,8 @@ private:
                     const PlanCacheMode mode,
                     ObStmt *basic_stmt,
                     ObStmtNeedPrivs &stmt_need_privs,
-                    ObStmtOraNeedPrivs &stmt_ora_need_privs);
+                    ObStmtOraNeedPrivs &stmt_ora_need_privs,
+                    const ObUcTableReadAccessContext &uc_read_ctx);
 
   int generate_stmt_with_reconstruct_sql(ObDMLStmt* &stmt, 
                                         ObPlanCacheCtx *pc_ctx, 
@@ -409,7 +413,8 @@ private:
                            share::schema::ObStmtOraNeedPrivs &stmt_ora_need_privs,
                            common::ObIArray<ObAuditUnit> &audit_units,
                            ObLogPlan *logical_plan,
-                           ObPhysicalPlan *&phy_plan);
+                           ObPhysicalPlan *&phy_plan,
+                           const ObUcTableReadAccessContext *uc_read_ctx = NULL);
 
   int prepare_outline_for_phy_plan(ObLogPlan *logical_plan,
                                    ObPhysicalPlan *phy_plan);
@@ -531,6 +536,8 @@ private:
                    ObResultSet &result,
                    bool is_enable_pc,
                    bool &add_plan_to_pc);
+  static bool is_uc_read_plan_current(const ObSQLSessionInfo &session,
+                                      const ObPhysicalPlan &plan);
   typedef hash::ObHashMap<uint64_t, ObPlanCache*> PlanCacheMap;
   friend class ::test::TestOptimizerUtils;
 

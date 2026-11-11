@@ -17,6 +17,18 @@ namespace oceanbase
 namespace share
 {
 
+struct ObCurlRestClient::WriteContext
+{
+  WriteContext(ObSqlString &body, const int64_t max_response_body_size)
+      : body_(body), max_response_body_size_(max_response_body_size), size_overflow_(false)
+  {
+  }
+
+  ObSqlString &body_;
+  const int64_t max_response_body_size_;
+  bool size_overflow_;
+};
+
 static CURLcode ssl_ctx_callback(CURL *curl, void *ssl_ctx, void *userptr)
 {
   UNUSED(curl);
@@ -97,17 +109,34 @@ int ObCurlRestClient::do_reuse()
 int ObCurlRestClient::execute(const ObRestHttpRequest &request, ObRestHttpResponse &response)
 {
   int ret = OB_SUCCESS;
+  if (OB_FAIL(execute(request, response, 0))) {
+    LOG_WARN("failed to execute REST request", KR(ret), K(request.get_url()));
+  }
+  return ret;
+}
+
+int ObCurlRestClient::execute(const ObRestHttpRequest &request,
+                              ObRestHttpResponse &response,
+                              const int64_t max_response_body_size)
+{
+  int ret = OB_SUCCESS;
+  WriteContext write_context(response.body_, max_response_body_size);
   if (!is_inited_) {
     ret = OB_NOT_INIT;
     LOG_WARN("curl client not initialized", K(ret));
-  } else if (OB_FAIL(set_curl_options(request, response))) {
+  } else if (OB_FAIL(set_curl_options(request, write_context))) {
     LOG_WARN("failed to set curl options", K(ret));
   } else {
     CURLcode cc = CURLE_OK;
     long http_code = 0;
     char *content_type = nullptr;
     if (CURLE_OK != (cc = curl_easy_perform(curl_))) {
-      ret = OB_CURL_ERROR;
+      if ((CURLE_FILESIZE_EXCEEDED == cc && max_response_body_size > 0)
+          || (CURLE_WRITE_ERROR == cc && write_context.size_overflow_)) {
+        ret = OB_SIZE_OVERFLOW;
+      } else {
+        ret = OB_CURL_ERROR;
+      }
       LOG_WARN("curl perform failed", K(ret), K(cc),K(request.get_url()));
     } else if (CURLE_OK != (cc = curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &http_code))) {
       ret = OB_CURL_ERROR;
@@ -165,7 +194,8 @@ void ObCurlRestClient::cleanup_curl()
   }
 }
 
-int ObCurlRestClient::set_curl_options(const ObRestHttpRequest &request, ObRestHttpResponse &response)
+int ObCurlRestClient::set_curl_options(const ObRestHttpRequest &request,
+                                       WriteContext &write_context)
 {
   int ret = OB_SUCCESS;
   if (nullptr == curl_) {
@@ -175,17 +205,69 @@ int ObCurlRestClient::set_curl_options(const ObRestHttpRequest &request, ObRestH
     CURLcode cc = CURLE_OK;
     ObString req_url;
     ObSqlString concat_url;
+    const ObString &base_url = request.get_base_url().empty() ? uri_ : request.get_base_url();
 
     // url
     if (OB_FAIL(request.get_concat_url(req_url))) {
       LOG_WARN("failed to get concat url", K(ret));
-    } else if (OB_FAIL(concat_url.append(uri_))) {
+    } else if (OB_FAIL(concat_url.append(base_url))) {
       LOG_WARN("failed to append uri", K(ret));
     } else if (OB_FAIL(concat_url.append(req_url))) {
       LOG_WARN("failed to append req url", K(ret));
     } else if (CURLE_OK != (cc = curl_easy_setopt(curl_, CURLOPT_URL, concat_url.ptr()))) {
       ret = OB_CURL_ERROR;
       LOG_WARN("failed to set URL", K(ret), K(cc), K(concat_url));
+    }
+
+    if (OB_SUCC(ret) && !request.get_base_url().empty()
+        && base_url.prefix_match(ObRestCatalogProperties::HTTPS_PREFIX)) {
+      if (CURLE_OK != (cc = curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, 1L))
+          || CURLE_OK != (cc = curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYHOST, 2L))
+          || CURLE_OK != (cc = curl_easy_setopt(curl_, CURLOPT_SSL_CTX_FUNCTION, ssl_ctx_callback))
+          || CURLE_OK != (cc = curl_easy_setopt(curl_, CURLOPT_SSL_CTX_DATA, OB_SSL_REST_CA_FILE))) {
+        ret = OB_CURL_ERROR;
+        LOG_WARN("failed to configure request HTTPS verification", K(ret), K(cc));
+      }
+    }
+
+    // Apply request-scoped transport options. Non-positive timeout values
+    // leave the current Curl settings unchanged.
+    if (OB_SUCC(ret) && !request.get_base_url().empty()) {
+      const int64_t connect_timeout_ms = request.get_connect_timeout_ms();
+      const int64_t request_timeout_ms = request.get_request_timeout_ms();
+      const int64_t follow_redirects = request.get_follow_redirects() ? 1L : 0L;
+      if (connect_timeout_ms > 0
+          && CURLE_OK != (cc = curl_easy_setopt(curl_,
+                                                CURLOPT_CONNECTTIMEOUT_MS,
+                                                connect_timeout_ms))) {
+        ret = OB_CURL_ERROR;
+        LOG_WARN("failed to set connect timeout", K(ret), K(cc), K(connect_timeout_ms));
+      } else if (request_timeout_ms > 0
+                 && CURLE_OK != (cc = curl_easy_setopt(curl_,
+                                                       CURLOPT_TIMEOUT_MS,
+                                                       request_timeout_ms))) {
+        ret = OB_CURL_ERROR;
+        LOG_WARN("failed to set request timeout", K(ret), K(cc), K(request_timeout_ms));
+      } else if (CURLE_OK != (cc = curl_easy_setopt(curl_,
+                                                    CURLOPT_FOLLOWLOCATION,
+                                                    follow_redirects))) {
+        ret = OB_CURL_ERROR;
+        LOG_WARN("failed to set redirect policy", K(ret), K(cc), K(follow_redirects));
+      }
+    }
+
+    if (OB_SUCC(ret)) {
+      if (CURLE_OK
+          != (cc = curl_easy_setopt(curl_,
+                                    CURLOPT_MAXFILESIZE_LARGE,
+                                    static_cast<curl_off_t>(write_context.max_response_body_size_)))) {
+        ret = OB_CURL_ERROR;
+        LOG_WARN("failed to set maximum response body size",
+                 K(ret),
+                 K(cc),
+                 K(write_context.max_response_body_size_),
+                 K(request.get_url()));
+      }
     }
 
     // http method
@@ -221,7 +303,15 @@ int ObCurlRestClient::set_curl_options(const ObRestHttpRequest &request, ObRestH
           break;
         }
         case HTTP_METHOD_GET: {
-          // do nothing
+          if (!request.get_base_url().empty()) {
+            if (CURLE_OK != (cc = curl_easy_setopt(curl_, CURLOPT_CUSTOMREQUEST, nullptr))) {
+              ret = OB_CURL_ERROR;
+              LOG_WARN("failed to reset CUSTOMREQUEST", K(ret), K(cc), K(concat_url));
+            } else if (CURLE_OK != (cc = curl_easy_setopt(curl_, CURLOPT_HTTPGET, 1L))) {
+              ret = OB_CURL_ERROR;
+              LOG_WARN("failed to set HTTPGET", K(ret), K(cc), K(concat_url));
+            }
+          }
           break;
         }
         default: {
@@ -234,8 +324,9 @@ int ObCurlRestClient::set_curl_options(const ObRestHttpRequest &request, ObRestH
 
     // body
     ObString body = request.get_body();
-    if (OB_SUCC(ret) && !body.empty()) {
-      if (CURLE_OK != (cc = curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, body.ptr()))) {
+    // Empty POST requests must replace the body retained by a reused Curl handle.
+    if (OB_SUCC(ret) && (!body.empty() || HTTP_METHOD_POST == request.get_method())) {
+      if (CURLE_OK != (cc = curl_easy_setopt(curl_, CURLOPT_POSTFIELDS, body.empty() ? "" : body.ptr()))) {
         ret = OB_CURL_ERROR;
         LOG_WARN("failed to set POSTFIELDS", K(ret), K(cc), K(concat_url));
       } else if (CURLE_OK != (cc = curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE, body.length()))) {
@@ -293,7 +384,7 @@ int ObCurlRestClient::set_curl_options(const ObRestHttpRequest &request, ObRestH
     } else if (CURLE_OK != (cc = curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, ObCurlRestClient::write_callback))) {
       ret = OB_CURL_ERROR;
       LOG_WARN("failed to set WRITEFUNCTION", K(ret), K(cc), K(concat_url));
-    } else if (CURLE_OK != (cc = curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &response.body_))) {
+    } else if (CURLE_OK != (cc = curl_easy_setopt(curl_, CURLOPT_WRITEDATA, &write_context))) {
       ret = OB_CURL_ERROR;
       LOG_WARN("failed to set WRITEDATA", K(ret), K(cc), K(concat_url));
     }
@@ -304,14 +395,39 @@ int ObCurlRestClient::set_curl_options(const ObRestHttpRequest &request, ObRestH
 size_t ObCurlRestClient::write_callback(void *contents, size_t size, size_t nmemb, void *buffer)
 {
   int ret = OB_SUCCESS;
-  size_t total_size = size * nmemb;
+  const bool chunk_size_overflow =
+      0 != size && nmemb > static_cast<size_t>(INT64_MAX) / size;
+  const size_t total_size = chunk_size_overflow ? 0 : size * nmemb;
+  WriteContext *write_context = static_cast<WriteContext *>(buffer);
   if (OB_ISNULL(contents) || OB_ISNULL(buffer)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument for curl_write_callback", K(ret), K(contents), K(size), K(nmemb), K(buffer));
+  } else if (OB_UNLIKELY(chunk_size_overflow)) {
+    ret = OB_SIZE_OVERFLOW;
+    write_context->size_overflow_ = true;
+    LOG_WARN("curl response chunk size overflow", K(ret), K(size), K(nmemb));
   } else if (total_size > 0) {
-    ObSqlString &result = *static_cast<ObSqlString*>(buffer);
-    if (OB_FAIL(result.append(static_cast<const char*>(contents), total_size))) {
-      LOG_WARN("failed to append to result", K(ret), K(result), K(contents), K(total_size));
+    const int64_t current_size = write_context->body_.length();
+    const int64_t max_response_body_size = write_context->max_response_body_size_;
+    if (OB_UNLIKELY(current_size < 0
+                    || total_size > static_cast<size_t>(INT64_MAX - current_size))
+        || (max_response_body_size > 0
+            && (current_size > max_response_body_size
+                || total_size > static_cast<size_t>(max_response_body_size - current_size)))) {
+      ret = OB_SIZE_OVERFLOW;
+      write_context->size_overflow_ = true;
+      LOG_WARN("curl response body exceeds size limit",
+               K(ret),
+               K(current_size),
+               K(total_size),
+               K(max_response_body_size));
+    } else if (OB_FAIL(write_context->body_.append(static_cast<const char *>(contents),
+                                                   static_cast<int64_t>(total_size)))) {
+      LOG_WARN("failed to append to result",
+               K(ret),
+               K(write_context->body_),
+               K(contents),
+               K(total_size));
     }
   }
   return OB_SUCC(ret) ? total_size : 0;

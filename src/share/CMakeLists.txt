@@ -792,6 +792,16 @@ ob_set_subtarget(ob_share catalog
   catalog/ob_catalog_utils.cpp
   catalog/ob_catalog_location_schema_provider.cpp
   catalog/ob_lake_format_deducer.cpp
+  catalog/ob_unified_catalog_namespace_codec.cpp
+  catalog/ob_unified_catalog_partition_spec_codec.cpp
+  catalog/ob_unified_catalog_partition_sync_codec.cpp
+  catalog/ob_unified_catalog_partition_sync.cpp
+  catalog/ob_unified_catalog_schema_codec.cpp
+  catalog/ob_unified_catalog_client.cpp
+  catalog/ob_unified_catalog_resource_paths.cpp
+  catalog/ob_unified_catalog.cpp
+  catalog/ob_unified_catalog_utils.cpp
+  catalog/ob_unified_catalog_config.cpp
   catalog/odps/ob_odps_catalog_utils.cpp
   catalog/odps/ob_odps_catalog.cpp
   catalog/filesystem/ob_filesystem_catalog.cpp
@@ -812,6 +822,7 @@ ob_set_subtarget(ob_share catalog
   catalog/hive/ob_iceberg_catalog_stat_helper.cpp
   catalog/hive/ob_hive_catalog_stat_helper.cpp
   catalog/rest/ob_rest_catalog.cpp
+  catalog/rest/client/ob_catalog_client_pool.cpp
   catalog/rest/client/ob_base_rest_client.cpp
   catalog/rest/client/ob_curl_rest_client.cpp
   catalog/rest/requests/ob_rest_http_request.cpp

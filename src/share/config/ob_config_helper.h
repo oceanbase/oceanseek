@@ -37,6 +37,16 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObConfigChecker);
 };
 
+class ObConfigUnifiedCatalogChecker : public ObConfigChecker
+{
+public:
+  ObConfigUnifiedCatalogChecker() {}
+  virtual ~ObConfigUnifiedCatalogChecker() {}
+  virtual bool check(const ObConfigItem &t) const override;
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObConfigUnifiedCatalogChecker);
+};
+
 class ObConfigAlwaysTrue
   : public ObConfigChecker
 {

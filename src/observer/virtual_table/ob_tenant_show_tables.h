@@ -68,6 +68,7 @@ private:
   uint64_t tenant_id_;
   uint64_t database_id_;
   uint64_t catalog_id_;
+  bool is_uc_catalog_ = false;
   common::ObString database_name_;
   // normal db: open 过滤后只存紧凑记录；synced remotes / external catalog：alloc_schema 挂 catalog 数组
   common::ObSEArray<ObShowTableItem, 128> table_schemas_;

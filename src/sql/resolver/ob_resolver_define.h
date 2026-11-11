@@ -25,6 +25,8 @@ namespace oceanbase
 {
 namespace sql
 {
+class ObUcCatalogContext;
+
 enum ObStmtScope
 {
   /*
@@ -384,7 +386,8 @@ struct ObResolverParams
        is_in_view_(false),
        is_htable_(false),
        disable_shared_expr_(false),
-       is_from_pl_(false)
+       is_from_pl_(false),
+       uc_catalog_ctx_(NULL)
   {}
   int assign(const ObResolverParams &other);
   bool is_force_trace_log() { return force_trace_log_; }
@@ -465,6 +468,7 @@ public:
   bool is_htable_;
   bool disable_shared_expr_;
   bool is_from_pl_;
+  ObUcCatalogContext *uc_catalog_ctx_;
 };
 struct FunctionInfo {
   char name_[OB_MAX_FUNC_EXPR_LENGTH];

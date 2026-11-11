@@ -6,10 +6,12 @@
 #define USING_LOG_PREFIX SQL
 #include "sql/ob_sql.h"
 #include "sql/hybrid_search/ob_hybrid_search_plan_cache.h"
+#include "sql/ob_uc_catalog_context.h"
 #include "lib/json/ob_json_print_utils.h"
 #include "lib/profile/ob_perf_event.h"
 #include "share/ob_truncated_string.h"
 #include "sql/plan_cache/ob_ps_cache.h"
+#include "share/catalog/ob_unified_catalog.h"
 #include "sql/plan_cache/ob_pcv_set.h"
 #include "sql/ob_sql_init.h"
 #include "sql/resolver/cmd/ob_help_stmt.h"
@@ -3197,12 +3199,14 @@ int ObSql::generate_stmt(ParseResult &parse_result,
                          ObResultSet &result,
                          ObStmt *&stmt,
                          ParseResult *outline_parse_result,
-                         ObOutlineState *outline_state)
+                         ObOutlineState *outline_state,
+                         bool *add_plan_to_pc)
 {
   int ret = OB_SUCCESS;
   FLTSpanGuard(resolve);
   ObMemPerfGuard mem_perf_guard("resolve");
   uint64_t session_id = 0;
+  ObUcCatalogContext uc_catalog_ctx;
   ObResolverParams resolver_ctx;
   ObPhysicalPlanCtx *plan_ctx = NULL;
   ObSchemaChecker *schema_checker = NULL;
@@ -3251,6 +3255,7 @@ int ObSql::generate_stmt(ParseResult &parse_result,
     resolver_ctx.schema_checker_ = schema_checker;
     resolver_ctx.secondary_namespace_ = context.secondary_namespace_;
     resolver_ctx.session_info_ = context.session_info_;
+    resolver_ctx.uc_catalog_ctx_ = &uc_catalog_ctx;
     resolver_ctx.expr_factory_ = result.get_exec_context().get_expr_factory();
     resolver_ctx.stmt_factory_ = result.get_exec_context().get_stmt_factory();
     resolver_ctx.cur_sql_ = context.cur_sql_;
@@ -3360,6 +3365,9 @@ int ObSql::generate_stmt(ParseResult &parse_result,
         ret = resolver.resolve(ObResolver::IS_NOT_PREPARED_STMT, tmp_node, stmt);
       } else {
         ret = resolver.resolve(ObResolver::IS_NOT_PREPARED_STMT, *parse_result.result_tree_->children_[0], stmt);
+      }
+      if (OB_SUCC(ret) && OB_NOT_NULL(add_plan_to_pc) && uc_catalog_ctx.has_remote_catalog()) {
+        *add_plan_to_pc = false;
       }
       
       //check if current sql is using expected resource group
@@ -3509,7 +3517,8 @@ int ObSql::generate_physical_plan(ParseResult &parse_result,
                                   const bool is_begin_commit_stmt,
                                   const PlanCacheMode mode,
                                   ParseResult *outline_parse_result /* null */,
-                                  ObOutlineState *outline_state /* null */ )
+                                  ObOutlineState *outline_state /* null */,
+                                  bool *add_plan_to_pc /* null */)
 {
   int ret = OB_SUCCESS;
   bool is_valid = true;
@@ -3517,6 +3526,7 @@ int ObSql::generate_physical_plan(ParseResult &parse_result,
   ObIAllocator &allocator = result.get_mem_pool();
   ObStmtNeedPrivs stmt_need_privs;
   ObStmtOraNeedPrivs stmt_ora_need_privs;
+  ObUcTableReadAccessContext uc_read_ctx(allocator);
   stmt_need_privs.need_privs_.set_allocator(&allocator);
   stmt_ora_need_privs.need_privs_.set_allocator(&allocator);
   _LOG_DEBUG("start to generate physical plan for query.(query = %.*s)",
@@ -3533,12 +3543,20 @@ int ObSql::generate_physical_plan(ParseResult &parse_result,
                                    result,
                                    basic_stmt,
                                    outline_parse_result,
-                                   outline_state))) {
+                                   outline_state,
+                                   add_plan_to_pc))) {
     LOG_WARN("Failed to generate stmt", K(ret), K(result.get_exec_context().need_disconnect()));
   } else if (OB_ISNULL(basic_stmt)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("Generate stmt success, but stmt is NULL", K(ret));
     // begin/commit 语句不需要检查privilege
+  } else if (!is_begin_commit_stmt
+          && OB_NOT_NULL(sql_ctx.session_info_)
+          && ObUnifiedCatalog::is_configured(sql_ctx.session_info_->get_effective_tenant_id())
+          && OB_FAIL(ObPrivilegeCheck::prepare_uc_table_read_access(sql_ctx,
+                                                                    basic_stmt,
+                                                                    uc_read_ctx))) {
+    LOG_WARN("failed to prepare UC table read access", K(ret), K(*basic_stmt));
   } else if (!is_begin_commit_stmt
           && OB_FAIL(ObPrivilegeCheck::check_privilege_new(sql_ctx,
                                                            basic_stmt,
@@ -3568,7 +3586,7 @@ int ObSql::generate_physical_plan(ParseResult &parse_result,
              mode == PC_PS_MODE, pc_ctx->fp_result_.parameterized_params_, pc_ctx->sql_ctx_.format_sql_id_, CclRuleContainsInfo::DATABASE_AND_TABLE, &parse_result, basic_stmt))) {
       LOG_WARN("fail to match ccl rule", K(ret));
     } else if (OB_FAIL(generate_plan(parse_result, pc_ctx, sql_ctx, result, mode, basic_stmt,
-                                     stmt_need_privs, stmt_ora_need_privs))) {
+                                     stmt_need_privs, stmt_ora_need_privs, uc_read_ctx))) {
       LOG_WARN("failed to generate plan", K(ret));
     }
   } else if (stmt::T_EXECUTE == basic_stmt->get_stmt_type() &&
@@ -3618,7 +3636,8 @@ int ObSql::generate_plan(ParseResult &parse_result,
                         const PlanCacheMode mode,
                         ObStmt *basic_stmt,
                         ObStmtNeedPrivs &stmt_need_privs,
-                        ObStmtOraNeedPrivs &stmt_ora_need_privs)
+                        ObStmtOraNeedPrivs &stmt_ora_need_privs,
+                        const ObUcTableReadAccessContext &uc_read_ctx)
 {
   int ret = OB_SUCCESS;
   uint64_t aggregate_setting = 0;
@@ -3796,7 +3815,8 @@ int ObSql::generate_plan(ParseResult &parse_result,
                                      stmt_need_privs, 
                                      stmt_ora_need_privs,
                                      audit_units,
-                                     logical_plan, phy_plan))) { //gen phy plan
+                                     logical_plan, phy_plan,
+                                     &uc_read_ctx))) { //gen phy plan
       LOG_WARN("Failed to genenrate phy plan", K(ret));
     } else if (OB_FAIL(prepare_outline_for_phy_plan(logical_plan, 
                                                     phy_plan))) {
@@ -4187,7 +4207,8 @@ int ObSql::code_generate(
     ObStmtOraNeedPrivs &stmt_ora_need_privs,
     ObIArray<ObAuditUnit> &audit_units,
     ObLogPlan *logical_plan,
-    ObPhysicalPlan *&phy_plan)
+    ObPhysicalPlan *&phy_plan,
+    const ObUcTableReadAccessContext *uc_read_ctx)
 {
   int ret = OB_SUCCESS;
   FLTSpanGuard(code_generate);
@@ -4352,6 +4373,12 @@ int ObSql::code_generate(
           LOG_WARN("Failed to deep copy", K(ret), K(stmt_need_privs));
         } else if (OB_FAIL(phy_plan->set_stmt_ora_need_privs(stmt_ora_need_privs))) {
           LOG_WARN("Failed to deep copy", K(ret), K(stmt_ora_need_privs));
+        } else if (OB_NOT_NULL(uc_read_ctx) && uc_read_ctx->catalog_configured_
+                   && OB_FAIL(phy_plan->set_uc_table_read_privs(
+                               uc_read_ctx->table_read_privs_,
+                               uc_read_ctx->catalog_configured_,
+                               uc_read_ctx->sync_target_))) {
+          LOG_WARN("failed to copy UC table read privileges", K(ret));
         }
       }
       if (OB_SUCC(ret)) {
@@ -4520,6 +4547,23 @@ int ObSql::pc_get_plan_and_fill_result(ObPlanCacheCtx &pc_ctx,
   return ret;
 }
 
+bool ObSql::is_uc_read_plan_current(const ObSQLSessionInfo &session,
+                                    const ObPhysicalPlan &plan)
+{
+  bool is_current = true;
+  if (!session.is_inner() || session.is_user_session()) {
+    const uint64_t tenant_id = session.get_effective_tenant_id();
+    const bool uc_configured = share::ObUnifiedCatalog::is_configured(tenant_id);
+    is_current = uc_configured == plan.is_uc_catalog_configured();
+    if (is_current && uc_configured) {
+      omt::ObTenantConfigGuard tenant_config(TENANT_CONF(tenant_id));
+      is_current = tenant_config.is_valid()
+          && plan.get_uc_sync_target() == ObString(tenant_config->catalog_sync_target.str());
+    }
+  }
+  return is_current;
+}
+
 int ObSql::pc_get_plan(ObPlanCacheCtx &pc_ctx,
                        ObCacheObjGuard& guard,
                        int &get_plan_err,
@@ -4533,6 +4577,9 @@ int ObSql::pc_get_plan(ObPlanCacheCtx &pc_ctx,
   if (OB_ISNULL(session) || OB_ISNULL(plan_cache = session->get_plan_cache())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("Invalid plan cache", K(ret), K(session), K(plan_cache));
+  } else if (share::ObUnifiedCatalog::is_child_catalog_id(
+                 session->get_effective_tenant_id(), session->get_current_default_catalog())) {
+    get_plan_err = OB_SQL_PC_NOT_EXIST;
   } else if (OB_FAIL(execute_get_plan(*plan_cache, pc_ctx, guard))) {
     if (OB_EAGAIN == ret
         || OB_REACH_MAX_CONCURRENT_NUM == ret
@@ -4554,6 +4601,23 @@ int ObSql::pc_get_plan(ObPlanCacheCtx &pc_ctx,
         ret = OB_SUCCESS; //get plan出错, 覆盖错误码, 确保因plan cache的错误不影响正常执行路径
       }
     }
+  } else if (!pc_ctx.sql_ctx_.is_remote_sql_ && OB_NOT_NULL(guard.get_cache_obj())
+             && !is_uc_read_plan_current(
+                    *session, *static_cast<ObPhysicalPlan *>(guard.get_cache_obj()))) {
+    ObPlanCacheKey key = pc_ctx.fp_result_.pc_key_;
+    if (PC_PS_MODE == pc_ctx.mode_ || PC_PL_MODE == pc_ctx.mode_) {
+      key.name_ = pc_ctx.raw_sql_;
+      if (0 != key.key_id_) {
+        key.key_id_ = OB_INVALID_ID;
+      }
+    }
+    if (OB_FAIL(plan_cache->remove_cache_node(&key))) {
+      LOG_WARN("failed to remove cached plan after UC routing change", K(ret));
+    } else if (OB_FAIL(guard.force_early_release(plan_cache))) {
+      LOG_WARN("failed to release cached plan after UC routing change", K(ret));
+    } else {
+      get_plan_err = OB_SQL_PC_NOT_EXIST;
+    }
   } else { //get plan 成功
     plan_cache->inc_hit_and_access_cnt();
     ObPhysicalPlan* plan = static_cast<ObPhysicalPlan*>(guard.get_cache_obj());
@@ -4566,7 +4630,11 @@ int ObSql::pc_get_plan(ObPlanCacheCtx &pc_ctx,
       //FIXME qianfu NG_TRACE_EXT(set_need_disconnect, OB_ID(need_disconnect), false);
       pc_ctx.sql_ctx_.plan_cache_hit_ = true;
       if (OB_SUCC(ret) && !pc_ctx.sql_ctx_.is_remote_sql_) {
-        if (OB_FAIL(ObPrivilegeCheck::check_read_only(pc_ctx.sql_ctx_, plan->get_stmt_type(), false,
+        if (plan->is_uc_catalog_configured()
+            && OB_FAIL(ObPrivilegeCheck::check_uc_table_read_access(
+                        pc_ctx.sql_ctx_, plan->get_uc_table_read_privs()))) {
+          LOG_WARN("failed to check cached UC table read access", K(ret));
+        } else if (OB_FAIL(ObPrivilegeCheck::check_read_only(pc_ctx.sql_ctx_, plan->get_stmt_type(), false,
                                                       plan->get_stmt_need_privs()))) {
           LOG_WARN("database or table is read only, cannot execute this stmt");
         } else if (!ObSchemaChecker::is_ora_priv_check()) {
@@ -5661,7 +5729,8 @@ OB_NOINLINE int ObSql::handle_physical_plan(const ObString &trimed_stmt,
                                             pc_ctx.is_begin_commit_stmt(),
                                             mode,
                                             &outline_parse_result,
-                                            &outline_state))) {
+                                            &outline_state,
+                                            &add_plan_to_pc))) {
     ret = deal_generate_physical_plan_error(result.get_exec_context(), pc_ctx, ret);
   } else if (OB_FALSE_IT(backup_recovery_guard.recovery())) {
   } else if (OB_FAIL(try_get_plan(pc_ctx, result, use_plan_cache, add_plan_to_pc))) {

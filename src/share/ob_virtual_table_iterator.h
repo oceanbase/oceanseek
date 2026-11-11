@@ -12,6 +12,7 @@
 #include "share/object/ob_obj_cast.h"
 #include "share/schema/ob_column_schema.h"
 #include "sql/ob_sql_context.h"
+#include "sql/ob_uc_catalog_context.h"
 
 namespace oceanbase
 {
@@ -58,7 +59,8 @@ public:
       convert_row_(),
       need_convert_(false),
       scan_param_(NULL),
-      try_check_tick_(0)
+      try_check_tick_(0),
+      uc_catalog_ctx_()
     {}
   virtual ~ObVirtualTableIterator() {}
   virtual void reset();
@@ -182,6 +184,8 @@ private:
   common::ObSEArray<const share::schema::ObColumnSchemaV2 *, 16> cols_schema_;
   const ObVTableScanParam *scan_param_;
   uint64_t try_check_tick_; //for check status
+protected:
+  sql::ObUcCatalogContext uc_catalog_ctx_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObVirtualTableIterator);
 };

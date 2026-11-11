@@ -8,6 +8,8 @@
 #include "observer/mysql/obmp_init_db.h"
 
 #include "share/catalog/ob_catalog_utils.h"
+#include "share/catalog/ob_unified_catalog.h"
+#include "share/catalog/ob_unified_catalog_utils.h"
 #include "src/sql/monitor/flt/ob_flt_control_info_mgr.h"
 
 using namespace oceanbase::rpc;
@@ -216,7 +218,15 @@ int ObMPInitDB::do_process(sql::ObSQLSessionInfo *session)
   int sret = OB_SUCCESS;
   share::schema::ObSessionPrivInfo session_priv;
   ObSchemaGetterGuard schema_guard;
+  const bool is_uc_configured
+      = OB_NOT_NULL(session)
+        && share::ObUnifiedCatalog::is_configured(session->get_effective_tenant_id());
+  ObNameCaseMode case_mode = OB_NAME_CASE_INVALID;
+  ObString access_token;
+  ObString remote_catalog_name;
   uint64_t catalog_id = OB_INTERNAL_CATALOG_ID;
+  bool is_uc_catalog = false;
+  bool need_local_db_access = false;
   // used to get catalog database schema
   ObSqlSchemaGuard sql_schema_guard;
 
@@ -229,13 +239,56 @@ int ObMPInitDB::do_process(sql::ObSQLSessionInfo *session)
     ret = OB_ERR_NO_DB_PRIVILEGE;
     LOG_WARN("can only access oceanbase database when tenant changed", K(ret));
   } else if (OB_FALSE_IT(sql_schema_guard.set_schema_guard(&schema_guard))) {
-  } else if (OB_FAIL(get_catalog_id_(*session, schema_guard, catalog_id))) {
+  } else if (is_uc_configured && OB_FAIL(session->get_name_case_mode(case_mode))) {
+    LOG_WARN("fail to get name case", K(ret));
+  } else if (is_uc_configured
+             && OB_FAIL(
+                 session->get_sys_variable(share::SYS_VAR__UNIFIED_CATALOG_TOKEN, access_token))) {
+    LOG_WARN("failed to get Unified Catalog session token", K(ret));
+  } else if (is_uc_configured
+             && OB_FAIL(share::ObUnifiedCatalogUtils::try_resolve_catalog(
+                 session->get_effective_tenant_id(),
+                 access_token,
+                 catalog_name_,
+                 session->get_current_default_catalog(),
+                 case_mode,
+                 schema_guard,
+                 THIS_WORKER.get_allocator(),
+                 catalog_id,
+                 remote_catalog_name,
+                 is_uc_catalog))) {
+    LOG_WARN("failed to resolve Unified Catalog", K(ret), K_(catalog_name));
+  } else if (is_uc_catalog && ORACLE_MODE == session->get_compatibility_mode()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "UC Catalog in Oracle mode is");
+  } else if (!is_uc_catalog && OB_FAIL(get_catalog_id_(*session, schema_guard, catalog_id))) {
     LOG_WARN("failed to get catalog id", K(ret));
   } else if (OB_FAIL(session->get_session_priv_info(session_priv))) {
     LOG_WARN("fail to get session priv info", K(ret));
-  } else if (OB_FAIL(ObSQLUtils::cvt_db_name_to_org(sql_schema_guard, session, catalog_id, db_name_, NULL /*allocator*/))) {
+  } else if (is_uc_catalog
+             && OB_FAIL(
+                 share::ObUnifiedCatalogUtils::validate_database(session->get_effective_tenant_id(),
+                                                                 access_token,
+                                                                 remote_catalog_name,
+                                                                 db_name_,
+                                                                 schema_guard,
+                                                                 THIS_WORKER.get_allocator(),
+                                                                 need_local_db_access))) {
+    LOG_WARN("failed to validate Unified Catalog database", K(ret), K(catalog_id), K_(db_name));
+  } else if ((!is_uc_catalog || need_local_db_access)
+             && OB_FAIL(ObSQLUtils::cvt_db_name_to_org(sql_schema_guard,
+                                                       session,
+                                                       need_local_db_access ? OB_INTERNAL_CATALOG_ID
+                                                                            : catalog_id,
+                                                       db_name_,
+                                                       NULL /*allocator*/))) {
     LOG_WARN("fail to cvt db name to original", K(catalog_id), K(db_name_), K(ret));
-  } else if (OB_FAIL(schema_guard.check_db_access(session_priv, session->get_enable_role_array(), catalog_id, db_name_))) {
+  } else if ((!is_uc_catalog || need_local_db_access)
+             && OB_FAIL(schema_guard.check_db_access(session_priv,
+                                                     session->get_enable_role_array(),
+                                                     need_local_db_access ? OB_INTERNAL_CATALOG_ID
+                                                                          : catalog_id,
+                                                     db_name_))) {
     LOG_WARN("fail to check db access.", K(catalog_id), K_(db_name), K(ret));
     if (OB_ERR_NO_DB_SELECTED == ret) {
       sret = OB_ERR_BAD_DATABASE; // 将错误码抛出让外层重试
@@ -243,6 +296,9 @@ int ObMPInitDB::do_process(sql::ObSQLSessionInfo *session)
       sret = ret; // 保险起见，也抛出
     }
   } else {
+    if (is_uc_catalog && !need_local_db_access) {
+      session_priv.db_priv_set_ = 0;
+    }
     // for external catalog, we will assign mocked db_id
     uint64_t db_id = is_internal_catalog_id(catalog_id) ? OB_INVALID_ID : OB_MIN_EXTERNAL_OBJECT_ID + 1;
     session->set_db_priv_set(session_priv.db_priv_set_);

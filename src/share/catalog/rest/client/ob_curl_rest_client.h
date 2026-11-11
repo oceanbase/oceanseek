@@ -30,8 +30,12 @@ public:
   }
 
   virtual int execute(const ObRestHttpRequest &request, ObRestHttpResponse &response) override;
+  int execute(const ObRestHttpRequest &request,
+              ObRestHttpResponse &response,
+              const int64_t max_response_body_size);
 
 private:
+  struct WriteContext;
   CURL *curl_;
   struct curl_slist *header_list_;
   
@@ -40,7 +44,8 @@ private:
   virtual int do_reuse() override;
   int init_curl();
   void cleanup_curl();
-  int set_curl_options(const ObRestHttpRequest &request, ObRestHttpResponse &response);
+  int set_curl_options(const ObRestHttpRequest &request,
+                       WriteContext &write_context);
   static size_t write_callback(void *contents, size_t size, size_t nmemb, void *userp);
 };
 

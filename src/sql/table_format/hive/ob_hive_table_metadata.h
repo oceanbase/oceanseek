@@ -139,6 +139,12 @@ public:
                        const ObString &location_object_sub_path,
                        const Apache::Hadoop::Hive::SQLAllTableConstraints *hms_constraints = nullptr);
 
+  // Shared OB native type decoder for HMS placeholders and Unified Catalog OB Generic Tables.
+  static int setup_ob_native_column_type(const ObString &field_type,
+                                         const bool is_oracle_mode,
+                                         ObIAllocator &alloc,
+                                         share::schema::ObColumnSchemaV2 &column_schema);
+
   template <typename PartValsArrayType>
   static int calculate_part_val_from_string_impl(const share::schema::ObTableSchema &table_schema,
                                                  const bool &is_part_table,
@@ -279,10 +285,6 @@ private:
   static int parse_ob_enum_set_values(const ObString &type_str,
                                       ObIAllocator &alloc,
                                       ObIArray<ObString> &values);
-  static int setup_ob_native_column_type(const ObString &field_type,
-                                         const bool is_oracle_mode,
-                                         ObIAllocator &alloc,
-                                         share::schema::ObColumnSchemaV2 &column_schema);
 
 private:
   share::schema::ObTableSchema table_schema_;

@@ -61,6 +61,7 @@ typedef common::ObFixedArray<LocationConstraint, common::ObIAllocator> ObPlanLoc
 typedef ObSqlArray<int64_t> ObPwjConstraint;
 typedef common::ObFixedArray<int64_t, common::ObIAllocator> ObPlanPwjConstraint;
 class ObShardingInfo;
+class ObUcCatalogContext;
 
 struct ObPCResourceMapRule
 {
@@ -428,6 +429,8 @@ private:
   DISALLOW_COPY_AND_ASSIGN(ObQueryRetryInfo);
 };
 
+class ObBasicSessionInfo;
+
 class ObSqlSchemaGuard
 {
 public:
@@ -475,6 +478,11 @@ public:
                        bool is_link = false);
   int get_database_schema(const uint64_t database_id,
                           const ObDatabaseSchema *&database_schema);
+  int get_uc_catalog_database_schema(const ObUcCatalogContext &uc_catalog_ctx,
+                                     const uint64_t tenant_id,
+                                     const uint64_t catalog_id,
+                                     const ObString &database_name,
+                                     const ObDatabaseSchema *&database_schema);
   int get_catalog_database_schema(const uint64_t tenant_id,
                                   const uint64_t catalog_id,
                                   const ObString &database_name,
@@ -483,6 +491,22 @@ public:
                               const uint64_t catalog_id,
                               const ObString &database_name,
                               uint64_t &database_id);
+  int get_uc_query_table_schema(const ObUcCatalogContext &uc_catalog_ctx,
+                                const uint64_t tenant_id,
+                                const uint64_t catalog_id,
+                                const uint64_t database_id,
+                                const ObString &database_name,
+                                const ObString &table_name,
+                                const share::schema::ObTableSchema *&table_schema,
+                                const share::ObTimeTravelInfo *time_travel_info = NULL);
+  int get_uc_table_schema(const ObUcCatalogContext &uc_catalog_ctx,
+                          const uint64_t tenant_id,
+                          const uint64_t catalog_id,
+                          const uint64_t database_id,
+                          const ObString &database_name,
+                          const ObString &table_name,
+                          const share::schema::ObTableSchema *&table_schema,
+                          const share::ObTimeTravelInfo *time_travel_info = NULL);
   int get_catalog_table_schema(const uint64_t tenant_id,
                                const uint64_t catalog_id,
                                const uint64_t database_id,
@@ -545,6 +569,12 @@ public:
   int add_mocked_database_schema(const share::schema::ObDatabaseSchema &database_schema);
   int recover_schema_from_external_object(const share::ObExternalObject &external_object);
   int recover_schema_from_external_objects(const ObIArray<share::ObExternalObject> &external_objects);
+  int recover_schema_from_external_object(const share::ObExternalObject &external_object,
+                                          const ObBasicSessionInfo *session,
+                                          ObUcCatalogContext &uc_catalog_ctx);
+  int recover_schema_from_external_objects(const ObIArray<share::ObExternalObject> &external_objects,
+                                           const ObBasicSessionInfo *session,
+                                           ObUcCatalogContext &uc_catalog_ctx);
   common::ObIArray<const share::schema::ObDatabaseSchema *> &get_mocked_database_schemas();
   common::ObIArray<const share::schema::ObTableSchema *> &get_mocked_table_schemas();
   bool check_is_under_oracle12c(uint64_t dblink_id);
@@ -562,6 +592,14 @@ public:
   static bool is_link_table(const ObDMLStmt *stmt, uint64_t table_id);
 
 private:
+  int validate_uc_table_request(const ObUcCatalogContext &uc_catalog_ctx,
+                                const uint64_t tenant_id,
+                                const uint64_t catalog_id,
+                                const uint64_t database_id,
+                                const ObString &database_name,
+                                const ObString &table_name,
+                                const share::ObTimeTravelInfo *time_travel_info,
+                                ObNameCaseMode &case_mode);
   share::schema::ObSchemaGetterGuard *schema_guard_;
   // Non-owning statement session; schema-only guards leave this unset.
   const ObSQLSessionInfo *session_info_;

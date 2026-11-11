@@ -8,6 +8,9 @@
 #include "sql/engine/ob_physical_plan_ctx.h"
 #include "lib/oblog/ob_log_module.h"
 #include "sql/engine/ob_exec_context.h"
+#include "lib/allocator/page_arena.h"
+#include "share/catalog/ob_unified_catalog.h"
+#include "share/catalog/ob_unified_catalog_utils.h"
 
 using namespace oceanbase::common;
 using namespace oceanbase::sql;
@@ -41,7 +44,6 @@ int ObExprCurrentCatalog::calc_result_type0(ObExprResType &type, ObExprTypeCtx &
 int ObExprCurrentCatalog::eval_current_catalog(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum)
 {
   int ret = OB_SUCCESS;
-  UNUSED(expr);
   const ObSQLSessionInfo *session_info = NULL;
   ObSchemaGetterGuard schema_guard;
   uint64_t tenant_id = OB_INVALID_ID;
@@ -69,6 +71,31 @@ int ObExprCurrentCatalog::eval_current_catalog(const ObExpr &expr, ObEvalCtx &ct
         LOG_WARN("failed to get user info", K(ret), K(tenant_id), K(catalog_id));
       } else if (OB_ISNULL(catalog_schema)) {
         expr_datum.set_null();
+        if (share::ObUnifiedCatalog::is_child_catalog_id(tenant_id, catalog_id)) {
+          ObString access_token;
+          if (OB_FAIL(session_info->get_sys_variable(share::SYS_VAR__UNIFIED_CATALOG_TOKEN,
+                                                     access_token))) {
+            LOG_WARN("failed to get UC session token", K(ret));
+          } else if (!access_token.empty()) {
+            ObArenaAllocator allocator("CurrentCatalog", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id);
+            ObString catalog_name;
+            char *buffer = NULL;
+            if (OB_FAIL(share::ObUnifiedCatalogUtils::resolve_catalog_name(tenant_id,
+                                                                           access_token,
+                                                                           catalog_id,
+                                                                           schema_guard,
+                                                                           allocator,
+                                                                           catalog_name))) {
+              LOG_WARN("failed to resolve selected UC Catalog name", K(ret), K(catalog_id));
+            } else if (OB_ISNULL(buffer = expr.get_str_res_mem(ctx, catalog_name.length()))) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+              LOG_WARN("failed to allocate Catalog name", K(ret));
+            } else {
+              MEMCPY(buffer, catalog_name.ptr(), catalog_name.length());
+              expr_datum.set_string(buffer, catalog_name.length());
+            }
+          }
+        }
       } else {
         expr_datum.set_string(catalog_schema->get_catalog_name_str());
       }

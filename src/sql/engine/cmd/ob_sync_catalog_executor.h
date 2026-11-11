@@ -1,6 +1,6 @@
 /**
- * Copyright (C) 2026 OceanBase
- * 本文件包含机密及专有信息，未经授权不得使用或披露。
+ * Copyright (c) 2026 OceanBase
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #ifndef OCEANBASE_SQL_ENGINE_CMD_OB_SYNC_CATALOG_EXECUTOR_H_

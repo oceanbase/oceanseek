@@ -72,7 +72,8 @@ int ObTableColumns::inner_get_next_row(ObNewRow *&row)
           && is_restrict_access_virtual_table(table_schema->get_table_id())) {
         ret = OB_TABLE_NOT_EXIST;
         LOG_WARN("fail to get table schema", K(ret), K(show_table_id));
-      } else if (!lib::is_oracle_mode()) {
+      } else if (!uc_catalog_ctx_.is_remote_catalog(table_schema->get_catalog_id())
+                 && !lib::is_oracle_mode()) {
         ObStmtNeedPrivs stmt_need_privs;
         stmt_need_privs.need_privs_.set_allocator(allocator_);
         ObSessionPrivInfo session_priv;
@@ -1235,10 +1236,12 @@ int ObTableColumns::resolve_view_definition(
         LOG_WARN("parse view definition failed", K(select_sql), K(ret));
       } else {
         ObSchemaChecker schema_checker;
+        ObUcCatalogContext uc_catalog_ctx;
         ObResolverParams resolver_ctx;
         resolver_ctx.allocator_ = allocator;
         resolver_ctx.schema_checker_ = &schema_checker;
         resolver_ctx.session_info_ = const_cast<ObSQLSessionInfo*>(session);
+        resolver_ctx.uc_catalog_ctx_ = &uc_catalog_ctx;
         resolver_ctx.expr_factory_ = &expr_factory;
         resolver_ctx.stmt_factory_ = &stmt_factory;
         resolver_ctx.sql_proxy_ = GCTX.sql_proxy_;
