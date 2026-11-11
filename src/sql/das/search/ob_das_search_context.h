@@ -129,7 +129,8 @@ public:
       filter_bitmap_providers_(),
       inv_iter_pool_(nullptr),
       enable_inv_iter_pool_(false),
-      posting_table_cache_()
+      posting_table_cache_(),
+      fusion_ctdef_(nullptr)
   { }
 
   ~ObDASSearchCtx() { reset(); }
@@ -194,6 +195,22 @@ public:
   { return root_das_task_.get_scan_param().tablet_id_; }
   virtual ObEvalCtx *get_eval_ctx() override { return eval_ctx_; }
   bool is_serial_fusion_plan() const;
+  /** @brief Bind the Fusion definition that owns this task's pagination metadata. */
+  void set_fusion_ctdef(const ObDASFusionCtDef *ctdef) { fusion_ctdef_ = ctdef; }
+  /** @brief Whether TableScan must apply search_after after the main-table lookup. */
+  bool has_search_after() const { return fusion_ctdef_ != nullptr && fusion_ctdef_->has_search_after_; }
+  /** @brief Whether DAS must supply __shard_doc for SQL sorting or __sort output. */
+  bool has_shard_doc() const { return fusion_ctdef_ != nullptr && fusion_ctdef_->shard_doc_expr_ != nullptr; }
+  /**
+   * @brief Projects __shard_doc into one row of the sort expression vector.
+   * @param[in] increment Document increment paired with the current partition's main tablet ID.
+   * @param[in] index Output row position; position zero initializes the vector for this batch.
+   * @param[in] count Number of rows in the output batch.
+   * @return OB_SUCCESS, including when no __shard_doc key is required; an error for invalid state or allocation failure.
+   */
+  int project_shard_doc(uint64_t increment, int64_t index, int64_t count);
+  /** @brief Return the sync task's main tablet or the bound async partition's main tablet. */
+  common::ObTabletID get_main_tablet_id() const;
   OB_INLINE const share::ObLSID &get_ls_id() const { return ls_id_; }
   OB_INLINE void set_ls_id(const share::ObLSID &ls_id) { ls_id_ = ls_id; }
   void reset();
@@ -461,6 +478,7 @@ private:
   storage::ObAsyncInvIteratorPool *inv_iter_pool_;
   bool enable_inv_iter_pool_;
   blocksstable::ObInvPostingTableCache posting_table_cache_;
+  const ObDASFusionCtDef *fusion_ctdef_; // Borrowed pagination metadata; owned by the DAS task's plan.
 
 private:
   struct EstimateScanInput

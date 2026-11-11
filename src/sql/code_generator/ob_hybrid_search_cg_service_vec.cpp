@@ -254,6 +254,7 @@ int ObHybridSearchCgService::generate_ctdef(ObLogTableScan &op, const ObFusionNo
       fusion_ctdef = new_fusion_ctdef;
     }
   }
+
   return ret;
 }
 

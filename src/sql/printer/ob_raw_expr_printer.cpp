@@ -3858,6 +3858,24 @@ int ObRawExprPrinter::print(ObSysFunRawExpr *expr)
         }
         break;
       }
+      case T_FUN_SYS_HYBRID_SEARCH_SORT_VALUES: {
+        const ObHybridSearchSortValuesRawExpr &sort_expr =
+            *static_cast<const ObHybridSearchSortValuesRawExpr *>(expr);
+        if (sort_expr.has_source_table()) {
+          // Preserve the source qualifier when printing an outer reference in a child query.
+          if (!sort_expr.get_source_database_name().empty()) {
+            PRINT_IDENT_WITH_QUOT(sort_expr.get_source_database_name());
+            DATA_PRINTF(".");
+          }
+          PRINT_IDENT_WITH_QUOT(sort_expr.get_source_table_name());
+          DATA_PRINTF(".");
+          PRINT_IDENT_WITH_QUOT(ObString::make_string("__sort"));
+        } else {
+          DATA_PRINTF("%.*s", LEN_AND_PTR(func_name));
+          OZ(inner_print_fun_params(*expr));
+        }
+        break;
+      }
       default: {
         DATA_PRINTF("%.*s", LEN_AND_PTR(func_name));
         OZ(inner_print_fun_params(*expr));

@@ -16,11 +16,53 @@
 #include "storage/access/ob_async_inv_iterator_pool.h"
 #include "share/logical_table/ob_logical_table_range_builder.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
+#include "sql/engine/expr/ob_expr_hybrid_search_sort.h"
 
 namespace oceanbase
 {
 namespace sql
 {
+
+ObTabletID ObDASSearchCtx::get_main_tablet_id() const
+{
+  if (!is_async_index_query()) {
+    return get_root_tablet_id();
+  }
+  return current_async_partition_ == nullptr ? ObTabletID() : current_async_partition_->main_tablet_id_;
+}
+
+int ObDASSearchCtx::project_shard_doc(uint64_t increment, int64_t index, int64_t count)
+{
+  int ret = OB_SUCCESS;
+  const ObTabletID main_tablet_id = get_main_tablet_id();
+  if (!has_shard_doc()) {
+  } else if (index < 0 || index >= count || !main_tablet_id.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid hybrid sort shard document projection state", K(ret), K(index), K(count),
+             K(main_tablet_id));
+  } else {
+    ObExpr *expr = fusion_ctdef_->shard_doc_expr_;
+    ObEvalCtx::BatchInfoScopeGuard guard(*eval_ctx_);
+    guard.set_batch_size(count);
+    guard.set_batch_idx(index);
+    if (index == 0 && OB_FAIL(expr->init_vector_for_write(*eval_ctx_, expr->get_default_res_format(), count))) {
+      LOG_WARN("failed to initialize hybrid sort __shard_doc vector", K(ret), K(count), K(main_tablet_id));
+    } else {
+      char *text = nullptr;
+      if (OB_ISNULL(text = expr->get_str_res_mem(*eval_ctx_, 32))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate hybrid sort shard document value", K(ret), K(index), K(count),
+                 "value_length", 32, K(main_tablet_id));
+      } else if (OB_FAIL(ObExprHybridUniqueShardDoc::encode_shard_doc(main_tablet_id.id(), increment, text))) {
+        LOG_WARN("failed to encode hybrid sort __shard_doc", K(ret), K(index), K(count), K(main_tablet_id));
+      } else {
+        expr->get_vector(*eval_ctx_)->set_string(index, text, 32);
+        expr->set_evaluated_projected(*eval_ctx_);
+      }
+    }
+  }
+  return ret;
+}
 
 bool ObDASSearchCtx::is_serial_fusion_plan() const
 {
@@ -34,6 +76,7 @@ bool ObDASSearchCtx::is_serial_fusion_plan() const
 
 void ObDASSearchCtx::reset()
 {
+  fusion_ctdef_ = nullptr;
   for (int64_t i = 0; i < op_store_.count(); ++i) {
     if (OB_NOT_NULL(op_store_.at(i))) {
       op_store_.at(i)->close();

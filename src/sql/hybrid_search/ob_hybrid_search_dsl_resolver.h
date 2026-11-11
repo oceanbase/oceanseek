@@ -18,6 +18,8 @@ namespace sql
 class ObDSLFullTextQuery;
 struct ObDSLFullTextMultiFieldQueryParam;
 class ObSelectStmt;
+class ObStmtExprVisitor;
+class ObSysFunRawExpr;
 class ObWinFunRawExpr;
 class ObAggFunRawExpr;
 struct TableItem;
@@ -297,16 +299,18 @@ struct ObDSLSortItem
   };
 
   ObDSLSortItem()
-    : field_expr_(nullptr), is_asc_(true), missing_mode_(MissingMode::NONE),
-      missing_literal_(nullptr), is_score_sort_(false) {}
+    : field_expr_(nullptr), output_expr_(nullptr), is_asc_(true), missing_mode_(MissingMode::NONE),
+      missing_literal_(nullptr), is_score_sort_(false), is_unique_shard_doc_(false) {}
   ~ObDSLSortItem() {}
 
-  ObRawExpr *field_expr_;         // `__score` sort uses the final score expr
+  ObRawExpr *field_expr_;         // Effective sort key, including a literal missing replacement. For JSON like COALESCE(NULLIF(expr, JSON null), missing_literal).
+  ObRawExpr *output_expr_;        // Normalized value before missing replacement, used by __sort. For JSON like NULLIF(expr, JSON null).
   bool is_asc_;
   MissingMode missing_mode_;      // NONE/FIRST/LAST/LITERAL for DSL missing handling
   ObConstRawExpr *missing_literal_; // used when missing_mode_ == LITERAL
   bool is_score_sort_;
-  TO_STRING_KV(K(field_expr_), K(is_asc_), K(missing_mode_), K(missing_literal_), K(is_score_sort_));
+  bool is_unique_shard_doc_; // Identifies __shard_doc, built from the main-table tablet and hidden increment.
+  TO_STRING_KV(K(field_expr_), K(output_expr_), K(is_asc_), K(missing_mode_), K(missing_literal_), K(is_score_sort_));
 };
 
 struct ObDSLCollapseInfo {
@@ -362,6 +366,12 @@ struct ObDSLQueryInfo
   bool has_dsl_collapse() const { return nullptr != collapse_info_.field_; }
   bool has_dsl_rank() const { return rank_info_.has_rank_; }
   bool has_dsl_sort() const { return !sort_items_.empty(); }
+  /** @brief Whether search_after values have been resolved. */
+  bool has_search_after() const { return !search_after_values_.empty(); }
+  /** @brief Whether sort contains __shard_doc. */
+  bool has_unique_shard_doc() const;
+  /** @brief Whether missing replaces SQL NULL with a specified value. */
+  bool has_literal_sort_missing() const;
 
   ObSEArray<ObDSLQuery*, 4, ModulePageAllocator, true> queries_;
   ObRawExpr *from_;
@@ -370,11 +380,17 @@ struct ObDSLQueryInfo
   ObRawExpr *one_const_expr_;
   ObRawExpr *query_top_level_boost_;
   ObDSLRankInfo rank_info_;
+  // Main-table physical rowkey columns from schema.get_rowkey_column_ids(). For ordinary HEAP tables
+  // this is [__pk_increment], independent of the columns in the user's separately indexed PRIMARY KEY.
   ObSEArray<ObColumnRefRawExpr*, 4, ModulePageAllocator, true> rowkey_cols_;
   ObSEArray<ObColumnRefRawExpr*, 4, ModulePageAllocator, true> dsl_cols;
   ObSEArray<ObOpPseudoColumnRawExpr*, 4, ModulePageAllocator, true> score_cols_;
   ObSEArray<ObRawExpr*, 4, ModulePageAllocator, true> dsl_exprs_;
   ObSEArray<ObDSLSortItem, 4, ModulePageAllocator, true> sort_items_;
+  // search_after constants in sort_items_ order, including __shard_doc.
+  ObSEArray<ObRawExpr *, 4, ModulePageAllocator, true> search_after_values_;
+  // JSON columns needed to evaluate sort keys after lookup.
+  ObSEArray<ObRawExpr *, 4, ModulePageAllocator, true> sort_lookup_base_columns_;
   ObString raw_dsl_param_str_;
   bool is_top_k_query_;
   ObDSLResultMode result_mode_;
@@ -427,8 +443,21 @@ public :
   }
 
   int resolve(const ParseNode &parse_tree);
+  /** @brief Whether a hybrid statement needs SQL LIMIT in addition to its DSL. */
+  static bool should_print_sql_limit(const ObDMLStmt &stmt);
+  /** @brief Whether a hybrid statement needs SQL ORDER BY in addition to its DSL. */
+  static bool should_print_order_iterms(const ObSelectStmt &stmt);
+  /** @brief Visit one hybrid table's sort and search_after expressions during statement rewrites. */
+  static int iterate_sort_exprs(ObDSLQueryInfo &info, ObStmtExprVisitor &visitor);
+  /** @brief Append __shard_doc ASC to DSL sort and SQL ORDER BY if absent. */
+  static int append_shard_doc_sort_item_if_absent(
+      ObDSLQueryInfo &info, ObSelectStmt &stmt,
+      const TableItem &table, ObRawExprFactory &factory,
+      ObSQLSessionInfo &session);
 
-  // Unified entry point for resolving hybrid_search pseudo columns (__score, aggs buckets, etc.).
+  /**
+   * @brief Resolve hybrid_search pseudo columns (__score, __sort and aggregation buckets).
+   */
   static int resolve_hybrid_search_pseudo_column_ref_expr(
       TableItem &table_item,
       const ObQualifiedName &q_name,
@@ -438,6 +467,10 @@ public :
       ObRawExpr *&real_ref_expr);
 
 private:
+  /** @brief Check hybrid sort/search_after table support and query restrictions. */
+  static int check_hybrid_sort_support(ObResolverParams &params, ObSelectStmt *select_stmt);
+  /** @brief Require a heap table with a physical increment key. */
+  static int check_hybrid_sort_table_support(const ObTableSchema *table_schema);
   static int resolve_hybrid_search_score_column_ref_expr(
       const TableItem &table_item,
       const ObQualifiedName &q_name,
@@ -481,7 +514,8 @@ public:
       ObDMLStmt &stmt,
       common::ObIArray<SelectItem> &target_list);
 
-  static int check_hybrid_search_stmt(ObSelectStmt *select_stmt);
+  /** @brief Check the resolved SELECT for unsupported hybrid-search usage. */
+  static int check_hybrid_search_stmt(ObResolverParams &params, ObSelectStmt *select_stmt);
   static int register_collapse_exprs(ObSelectStmt *select_stmt);
 
   // FROM is resolved before SELECT in MySQL mode, so aggregate items are missing during dsl resolve().
@@ -652,7 +686,10 @@ private :
   int build_sort_missing_string_literal(ObIJsonBase &missing_node, ObDSLSortItem &dsl_sort_item);
   int build_sort_missing_temporal_literal(ObIJsonBase &missing_node, ObDSLSortItem &dsl_sort_item);
   int build_sort_expr(const ObDSLSortItem &dsl_sort_item, ObRawExpr *&sort_expr);
-  int add_sort_order_item(ObSelectStmt &select_stmt, const ObDSLSortItem &dsl_sort_item);
+  /** @brief Add the sort expression, including missing handling, to DSL sort and SQL ORDER BY. */
+  int add_sort_order_item(ObSelectStmt &select_stmt, ObDSLSortItem &dsl_sort_item);
+  /** @brief Normalize a top-level JSON null to SQL NULL without changing other JSON values. */
+  int normalize_json_sort_expr(ObRawExpr *&expr);
   int resolve_slop(ObIJsonBase &req_node, int32_t &slop);
   int resolve_term(ObIJsonBase &req_node, ObDSLQuery *&query, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type);
   int resolve_terms(ObIJsonBase &req_node, ObDSLQuery *&query, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type);
@@ -661,6 +698,14 @@ private :
   int resolve_exists(ObIJsonBase &req_node, ObDSLQuery *&query, ObDSLQuery *parent_query, ObEsQueryItem outer_query_type);
   int resolve_weighted_sum(ObIJsonBase &req_node);
   int resolve_sort(ObIJsonBase &req_node);
+  /** @brief Check __shard_doc sort items and resolve search_after when supplied. */
+  int finalize_sort_and_resolve_search_after(ObIJsonBase *after_node);
+  /** @brief Convert search_after values to constants of the corresponding sort types. */
+  int resolve_search_after(ObIJsonBase &after);
+  /** @brief Build a JSON constant, preserving JSON null and the original value type. */
+  int build_json_sort_constant(ObIJsonBase &value, ObConstRawExpr *&expr);
+  /** @brief Build __shard_doc from the main-table tablet ID and __pk_increment. */
+  int build_unique_shard_doc_expr(ObRawExpr *&expr);
   int init_result_mode_and_track_score();
   static void set_track_score(ObDSLQueryInfo *dsl_query_info);
   int setup_top_level_score(ObDSLQuery *query);

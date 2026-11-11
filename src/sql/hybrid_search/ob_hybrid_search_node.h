@@ -15,6 +15,7 @@ namespace oceanbase
 namespace sql
 {
 class ObFullTextQueryNode;
+class ObRawExprReplacer;
 
 class ObAsyncIndexDeleteInfo
 {
@@ -118,15 +119,31 @@ public:
   ObScalarQueryNode *merged_probe_scalar_node_;
 };
 
+/**
+ * @brief Carry one effective DSL sort key and its runtime source into fusion planning.
+ *
+ * __score and __shard_doc keys need dedicated execution inputs; ordinary keys are evaluated from
+ * their expressions. ORDER BY direction includes the requested placement of missing values.
+ */
+struct ObFusionSortItem
+{
+  OrderItem order_item_; // Effective expression and direction, including NULL ordering.
+  bool is_score_sort_ = false; // Source this key from the final search score.
+  bool is_unique_shard_doc_ = false; // Source this key from the base-table tablet and hidden increment.
+  TO_STRING_KV(K_(order_item), K_(is_score_sort), K_(is_unique_shard_doc));
+};
+
 class ObFusionNode : public ObHybridSearchNodeBase
 {
 public:
   ObFusionNode(common::ObIAllocator &allocator) : ObHybridSearchNodeBase(allocator), method_(ObFusionMethod::WEIGHT_SUM),
     from_(nullptr), size_(nullptr), min_score_(nullptr), window_size_(nullptr), rank_const_(nullptr),
-    rowkey_cols_(allocator), score_cols_(allocator), weight_cols_(allocator), path_top_k_limit_(allocator),
+    rowkey_cols_(allocator), score_cols_(allocator), weight_cols_(allocator),
+    path_top_k_limit_(allocator), sort_lookup_access_exprs_(allocator),
     contains_vec_node_(false), search_index_(-1), has_search_subquery_(false), has_vector_subquery_(false),
     is_top_k_query_(true), has_hybrid_fusion_op_(false), query_dop_(0), track_score_(true),
-    fusion_iter_exec_mode_(ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS), is_single_partition_(true)
+    fusion_iter_exec_mode_(ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS), is_single_partition_(true),
+    sort_items_(allocator), search_after_values_(allocator)
     { node_type_ = INDEX_MERGE_HYBRID_FUSION_SEARCH; }
   virtual ~ObFusionNode() {}
   virtual inline bool contains_vector_node() const { return contains_vec_node_; }
@@ -135,6 +152,20 @@ public:
   bool has_rerank() const { return rerank_info_.has_rerank(); }
   void set_is_single_partition(bool v) { is_single_partition_ = v; }
   bool get_is_single_partition() const { return is_single_partition_; }
+  /** @brief Whether this query has search_after values. */
+  bool has_after() const { return !search_after_values_.empty(); }
+  /** @brief Whether the sort list contains __shard_doc. */
+  bool has_unique_shard_doc() const;
+  /** @brief Return the scan-produced __shard_doc expression, or nullptr when absent. */
+  ObRawExpr *get_shard_doc_expr() const;
+  /** @brief Replace lookup, sort and search_after expressions and refresh changed expression types. */
+  int replace_sort_exprs(ObRawExprReplacer &replacer, ObSQLSessionInfo *session);
+  /** @brief Collect sort keys, search_after values and lookup columns without duplicates. */
+  int collect_sort_calc_exprs(ObIArray<ObRawExpr *> &exprs) const;
+  /** @brief Check the query path, collect lookup columns and build the search_after filter. */
+  int prepare_sort_after(const ObSelectStmt &stmt, const ObDSLQueryInfo &info,
+                         ObRawExprFactory &factory, ObSQLSessionInfo &session,
+                         ObRawExpr *&after_filter);
 
   ObFusionMethod method_;
   ObRawExpr *from_;
@@ -146,6 +177,8 @@ public:
   ObSqlArray<ObRawExpr*> score_cols_;
   ObSqlArray<ObRawExpr*> weight_cols_;
   ObSqlArray<ObRawExpr*> path_top_k_limit_;
+  // Columns needed to calculate sort values, such as doc for sort=doc.price.
+  ObSqlArray<ObRawExpr *> sort_lookup_access_exprs_;
   bool contains_vec_node_;
   int64_t search_index_;
   bool has_search_subquery_;
@@ -157,6 +190,8 @@ public:
   ObFusionIterExecMode fusion_iter_exec_mode_;
   bool is_single_partition_;  // true when non-partitioned table: DAS fusion iter already did fusion
   ObDSLRerankInfo rerank_info_;
+  ObSqlArray<ObFusionSortItem> sort_items_; // Sort expressions and their order.
+  ObSqlArray<ObRawExpr *> search_after_values_; // search_after values in sort order.
 };
 
 class ObScalarQueryNode : public ObHybridSearchNodeBase

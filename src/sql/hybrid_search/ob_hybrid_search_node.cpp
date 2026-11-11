@@ -19,6 +19,7 @@
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "sql/ob_sql_utils.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
+#include "sql/resolver/expr/ob_raw_expr_replacer.h"
 #include "sql/optimizer/ob_log_table_scan.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
 
@@ -569,6 +570,26 @@ int ObHybridSearchGenerator::init_fusion_node(const ObDSLQueryInfo *query_info, 
   if (OB_SUCC(ret)) {
     if (OB_FAIL(init_fusion_iter_exec_mode(query_info, fusion_node))) {
       LOG_WARN("failed to init fusion iter exec mode", K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && (query_info->has_unique_shard_doc() || query_info->has_search_after()
+                      || !query_info->sort_lookup_base_columns_.empty())) {
+    // Preserve SQL ORDER BY expressions, directions and NULL placement for the search_after filter.
+    for (int64_t i = 0; OB_SUCC(ret) && i < query_info->sort_items_.count(); ++i) {
+      const ObDSLSortItem &item = query_info->sort_items_.at(i);
+      ObFusionSortItem out;
+      const bool null_first = item.missing_mode_ == ObDSLSortItem::MissingMode::FIRST;
+      out.order_item_ = OrderItem(item.field_expr_, null_first
+          ? (item.is_asc_ ? NULLS_FIRST_ASC : NULLS_FIRST_DESC)
+          : (item.is_asc_ ? NULLS_LAST_ASC : NULLS_LAST_DESC));
+      out.is_score_sort_ = item.is_score_sort_;
+      out.is_unique_shard_doc_ = item.is_unique_shard_doc_;
+      if (OB_FAIL(fusion_node->sort_items_.push_back(out))) {
+        LOG_WARN("failed to append fusion sort item", K(ret), K(i), K(query_info->sort_items_.count()));
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(fusion_node->search_after_values_.assign(query_info->search_after_values_))) {
+      LOG_WARN("failed to assign fusion search_after expressions", K(ret), K(query_info->search_after_values_.count()));
     }
   }
   if (OB_SUCC(ret)) {
@@ -2528,6 +2549,258 @@ int ObHybridSearchNodeBase::print_blank_space(char *buf, int64_t buf_len, int64_
   for (int i = 0; i < n && OB_SUCC(ret); i++) {
     if (OB_FAIL(BUF_PRINTF(" "))) {
       LOG_WARN("BUF_PRINTF fails", K(ret));
+    }
+  }
+  return ret;
+}
+
+namespace oceanbase
+{
+namespace sql
+{
+namespace
+{
+/** @brief Replace one sort expression and refresh its type only when replacement occurs. */
+int replace_hybrid_sort_expr(ObRawExprReplacer &replacer, ObSQLSessionInfo *session,
+                              ObRawExpr *&expr)
+{
+  int ret = OB_SUCCESS;
+  if (!replacer.empty()) {
+    if (OB_FAIL(replacer.replace(expr))) {
+      LOG_WARN("failed to replace hybrid sort expression", K(ret));
+    } else if (replacer.get_replace_happened()) {
+      if (OB_ISNULL(session)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("session is null", K(ret));
+      } else if (OB_FAIL(expr->formalize(session))) {
+        LOG_WARN("failed to formalize replaced hybrid sort expression", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+/** @brief Build a comparison or AND/OR node for the search_after filter. */
+int hybrid_after_binary(ObRawExprFactory &factory, ObItemType type,
+                         ObRawExpr *left, ObRawExpr *right, ObRawExpr *&out)
+{
+  int ret = OB_SUCCESS;
+  ObOpRawExpr *expr = nullptr;
+  if (OB_FAIL(factory.create_raw_expr(type, expr))) {
+    LOG_WARN("failed to create search_after operator expression", K(ret), K(type));
+  } else if (OB_FAIL(expr->set_param_exprs(left, right))) {
+    LOG_WARN("failed to set search_after operator arguments", K(ret), K(type), KP(left), KP(right));
+  } else {
+    out = expr;
+  }
+  return ret;
+}
+
+/**
+ * @brief Keep rows after search_after using the requested sort order and NULL placement.
+ * For non-NULL keys (price ASC, stock DESC): price > p OR (price <=> p AND stock < s).
+ */
+int build_hybrid_after_filter(ObRawExprFactory &factory, const ObFusionNode &node,
+                              ObRawExpr *&filter)
+{
+  int ret = OB_SUCCESS;
+  ObConstRawExpr *no = nullptr;
+  // Each sort field must have one search_after value.
+  if (node.search_after_values_.count() != node.sort_items_.count()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("hybrid search_after and sort item counts differ", K(ret), K(node.search_after_values_.count()),
+             K(node.sort_items_.count()));
+  } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(factory, ObIntType, 0, no))) {
+    LOG_WARN("failed to build search_after false condition", K(ret));
+  } else {
+    // Start with FALSE: a row equal to the previous page's last row on every key must be excluded.
+    filter = no;
+  }
+  // A field decides the order; equal fields continue with the remaining keys.
+  for (int64_t i = node.sort_items_.count() - 1; OB_SUCC(ret) && i >= 0; --i) {
+    const OrderItem &item = node.sort_items_.at(i).order_item_;
+    ObRawExpr *value = item.expr_;
+    ObRawExpr *after = node.search_after_values_.at(i);
+    ObRawExpr *equal = nullptr;
+    ObRawExpr *comparison = nullptr;
+    ObRawExpr *value_null = nullptr;
+    ObRawExpr *value_not_null = nullptr;
+    ObRawExpr *after_null = nullptr;
+    ObRawExpr *after_not_null = nullptr;
+    ObRawExpr *nonnull = nullptr;
+    ObRawExpr *strict = nullptr;
+    ObRawExpr *null_after = nullptr;
+    ObRawExpr *same_prefix = nullptr;
+    // Use <=> for equal prefixes and >/< for ASC/DESC. Handle NULL placement separately
+    // so NULL comparisons do not turn the filter into SQL UNKNOWN.
+    if (OB_FAIL(hybrid_after_binary(factory, T_OP_NSEQ, value, after, equal))) {
+      LOG_WARN("failed to build search_after null-safe equality", K(ret), K(i));
+    } else if (OB_FAIL(hybrid_after_binary(factory, item.is_ascending() ? T_OP_GT : T_OP_LT, value, after, comparison))) {
+      LOG_WARN("failed to build search_after value comparison", K(ret), K(i), K(item.is_ascending()));
+    } else if (OB_FAIL(ObRawExprUtils::build_is_not_null_expr(factory, value, false, value_null))) {
+      LOG_WARN("failed to build sort key IS NULL check", K(ret), K(i));
+    } else if (OB_FAIL(ObRawExprUtils::build_is_not_null_expr(factory, value, true, value_not_null))) {
+      LOG_WARN("failed to build sort key IS NOT NULL check", K(ret), K(i));
+    } else if (OB_FAIL(ObRawExprUtils::build_is_not_null_expr(factory, after, false, after_null))) {
+      LOG_WARN("failed to build search_after IS NULL check", K(ret), K(i));
+    } else if (OB_FAIL(ObRawExprUtils::build_is_not_null_expr(factory, after, true, after_not_null))) {
+      LOG_WARN("failed to build search_after IS NOT NULL check", K(ret), K(i));
+    } else if (OB_FAIL(hybrid_after_binary(factory, T_OP_AND, value_not_null, after_not_null, nonnull))) {
+      LOG_WARN("failed to combine search_after non-null checks", K(ret), K(i));
+    } else if (OB_FAIL(hybrid_after_binary(factory, T_OP_AND, nonnull, comparison, strict))) {
+      LOG_WARN("failed to guard search_after comparison against NULL", K(ret), K(i));
+    } else if (OB_FAIL(hybrid_after_binary(factory, T_OP_AND,
+      item.is_null_first() ? after_null : value_null,
+      item.is_null_first() ? value_not_null : after_not_null, null_after))) {
+      LOG_WARN("failed to build search_after NULL ordering condition", K(ret), K(i), K(item.is_null_first()));
+    } else if (OB_FAIL(hybrid_after_binary(factory, T_OP_OR, strict, null_after, strict))) {
+      LOG_WARN("failed to combine search_after value and NULL ordering", K(ret), K(i));
+    } else if (OB_FAIL(hybrid_after_binary(factory, T_OP_AND, equal, filter, same_prefix))) {
+      LOG_WARN("failed to build search_after equal-prefix condition", K(ret), K(i));
+    } else if (OB_FAIL(hybrid_after_binary(factory, T_OP_OR, strict, same_prefix, filter))) {
+      LOG_WARN("failed to combine search_after field conditions", K(ret), K(i));
+    }
+  }
+  return ret;
+}
+
+
+/** @brief Check whether the chosen query path uses async indexes. */
+int inspect_hybrid_sort_query(const ObIndexMergeNode *node, bool &has_async_index)
+{
+  int ret = OB_SUCCESS;
+  if (node == nullptr || !node->is_hybrid_search_node()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid hybrid sort query node", K(ret), KP(node));
+  } else {
+    const ObHybridSearchNodeBase *search = static_cast<const ObHybridSearchNodeBase *>(node);
+    // Async-index access carries the information needed to filter deleted rows.
+    has_async_index |= search->get_async_delete_info() != nullptr;
+    for (int64_t i = 0; OB_SUCC(ret) && i < node->children_.count(); ++i) {
+      if (OB_FAIL(SMART_CALL(inspect_hybrid_sort_query(
+          node->children_.at(i), has_async_index)))) {
+        LOG_WARN("failed to inspect hybrid sort query child", K(ret), K(node->node_type_), K(i));
+      }
+    }
+    // Bool clauses may not have been copied into children_ yet.
+    if (OB_SUCC(ret) && node->children_.empty() && node->node_type_ == INDEX_MERGE_HYBRID_BOOLEAN_QUERY) {
+      const ObBooleanQueryNode *boolean = static_cast<const ObBooleanQueryNode *>(node);
+      const ObIArray<ObIndexMergeNode *> *clauses[] = {
+        &boolean->must_nodes_, &boolean->should_nodes_, &boolean->filter_nodes_, &boolean->must_not_nodes_};
+      for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(clauses); ++i) {
+        for (int64_t j = 0; OB_SUCC(ret) && j < clauses[i]->count(); ++j) {
+          if (OB_FAIL(SMART_CALL(inspect_hybrid_sort_query(
+              clauses[i]->at(j), has_async_index)))) {
+            LOG_WARN("failed to inspect hybrid sort Boolean clause", K(ret), "clause_group", i, "clause_index", j);
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+} // namespace
+} // namespace sql
+} // namespace oceanbase
+
+int ObFusionNode::prepare_sort_after(const ObSelectStmt &stmt, const ObDSLQueryInfo &info,
+                                    ObRawExprFactory &factory, ObSQLSessionInfo &session,
+                                    ObRawExpr *&after_filter)
+{
+  int ret = OB_SUCCESS;
+  bool has_async_index = false;
+  after_filter = nullptr;
+  if (OB_FAIL(inspect_hybrid_sort_query(this, has_async_index))) {
+    LOG_WARN("failed to inspect hybrid sort query", K(ret));
+  } else if ((has_after() || has_unique_shard_doc() || !info.sort_lookup_base_columns_.empty())
+             && (children_.count() != 1 || has_vector_subquery_
+                 || has_hybrid_fusion_op_ || has_rerank()
+                 || (!has_after() && stmt.has_group_by()))) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_DEBUG("candidate query path does not support hybrid cursor sorting", K(ret), K(has_async_index),
+              K(children_.count()), K_(has_vector_subquery), K_(has_hybrid_fusion_op), K(has_rerank()));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < sort_items_.count(); ++i) {
+      const ObFusionSortItem &item = sort_items_.at(i);
+      if (!item.is_score_sort_ && !item.is_unique_shard_doc_) {
+        // For sort=doc.price, lookup must provide doc even when SELECT omits it.
+        ObSEArray<ObRawExpr *, 4> columns;
+        if (OB_FAIL(ObRawExprUtils::extract_column_exprs(item.order_item_.expr_, columns, false, false))) {
+          LOG_WARN("failed to extract hybrid sort lookup columns", K(ret), K(i));
+        } else if (OB_FAIL(append_array_no_dup(sort_lookup_access_exprs_, columns))) {
+          LOG_WARN("failed to append hybrid sort lookup columns", K(ret), K(i), K(columns.count()));
+        }
+      }
+    }
+    if (OB_SUCC(ret) && has_after()) {
+      // TableScan filters rows after lookup, before SQL sorting and LIMIT.
+      if (OB_FAIL(build_hybrid_after_filter(factory, *this, after_filter))) {
+        LOG_WARN("failed to build search_after filter", K(ret), K(sort_items_.count()));
+      } else if (OB_FAIL(after_filter->formalize(&session))) {
+        LOG_WARN("failed to formalize search_after filter", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+bool ObFusionNode::has_unique_shard_doc() const
+{
+  bool found = false;
+  for (int64_t i = 0; !found && i < sort_items_.count(); ++i) {
+    found = sort_items_.at(i).is_unique_shard_doc_;
+  }
+  return found;
+}
+
+ObRawExpr *ObFusionNode::get_shard_doc_expr() const
+{
+  ObRawExpr *expr = nullptr;
+  for (int64_t i = 0; OB_ISNULL(expr) && i < sort_items_.count(); ++i) {
+    if (sort_items_.at(i).is_unique_shard_doc_) {
+      expr = sort_items_.at(i).order_item_.expr_;
+    }
+  }
+  return expr;
+}
+
+int ObFusionNode::replace_sort_exprs(ObRawExprReplacer &replacer, ObSQLSessionInfo *session)
+{
+  int ret = OB_SUCCESS;
+  if (!replacer.empty()) {
+    for (int64_t i = 0; OB_SUCC(ret) && i < sort_lookup_access_exprs_.count(); ++i) {
+      if (OB_FAIL(replace_hybrid_sort_expr(replacer, session, sort_lookup_access_exprs_.at(i)))) {
+        LOG_WARN("failed to replace hybrid sort lookup column", K(ret), K(i));
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < sort_items_.count(); ++i) {
+      if (OB_FAIL(replace_hybrid_sort_expr(replacer, session, sort_items_.at(i).order_item_.expr_))) {
+        LOG_WARN("failed to replace hybrid sort key expression", K(ret), K(i));
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < search_after_values_.count(); ++i) {
+      if (OB_FAIL(replace_hybrid_sort_expr(replacer, session, search_after_values_.at(i)))) {
+        LOG_WARN("failed to replace hybrid search_after expression", K(ret), K(i));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObFusionNode::collect_sort_calc_exprs(ObIArray<ObRawExpr *> &exprs) const
+{
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < sort_items_.count(); ++i) {
+    if (OB_FAIL(add_var_to_array_no_dup(exprs, sort_items_.at(i).order_item_.expr_))) {
+      LOG_WARN("failed to collect hybrid sort expression", K(ret), K(i));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(append_array_no_dup(exprs, search_after_values_))) {
+      LOG_WARN("failed to collect hybrid search_after expressions", K(ret), K(search_after_values_.count()));
+    } else if (OB_FAIL(append_array_no_dup(exprs, sort_lookup_access_exprs_))) {
+      LOG_WARN("failed to collect hybrid sort lookup columns", K(ret));
     }
   }
   return ret;

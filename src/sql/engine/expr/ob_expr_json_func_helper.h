@@ -386,7 +386,7 @@ public:
   @return Returns OB_SUCCESS on success, error code otherwise.
   */
   static int get_json_val(const ObExpr &expr, ObEvalCtx &ctx,
-                          common::ObIAllocator *allocator, uint16_t index,
+                          common::ObIAllocator *allocator, uint32_t index,
                           ObIJsonBase*& j_base, bool to_bin = false, bool format_json = false, 
                           uint32_t parse_flag = ObJsonParser::JSN_RELAXED_FLAG);
   static int get_const_json_schema(const common::ObObj &data, const char* func_name, 

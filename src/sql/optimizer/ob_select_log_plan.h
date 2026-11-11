@@ -582,6 +582,8 @@ private:
      *  @retval otherwise, failed to generate the top operators of plan tree
      */
   int allocate_plan_top();
+  /** @brief Prepare DSL sort/search_after and retain supported candidate plans. */
+  int candi_prepare_hybrid_sort();
   /**
    * 处理select子句里的子查询，生成SubPlan
    * @param

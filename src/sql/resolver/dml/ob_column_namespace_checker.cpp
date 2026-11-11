@@ -740,7 +740,8 @@ bool ObColumnNamespaceChecker::is_hybrid_search_pseudo_column(const TableItem &t
 {
   bool is_pseudo = false;
   if (table_item.is_hybrid_search_table()) {
-    if (0 == col_name.case_compare(OB_HYBRID_SEARCH_SCORE_COLUMN_NAME)) {
+    if (0 == col_name.case_compare(OB_HYBRID_SEARCH_SCORE_COLUMN_NAME)
+        || 0 == col_name.case_compare("__sort")) {
       is_pseudo = true;
     } else if (OB_NOT_NULL(table_item.dsl_query_)) {
       for (int64_t ai = 0; !is_pseudo && ai < table_item.dsl_query_->agg_items_.count(); ++ai) {

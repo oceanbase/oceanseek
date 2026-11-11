@@ -23,6 +23,7 @@ namespace oceanbase
 namespace sql
 {
 class Path;
+class ObFusionNode;
 template<typename R, typename C>
 class PlanVisitor;
 
@@ -925,6 +926,8 @@ public:
   int set_index_table_scan_filters(ObIndexMergeNode *node, bool is_intersect_child);
   int collect_hybrid_search_exprs(const AccessPath *path);
   int get_hybrid_search_exprs(ObIArray<ObRawExpr *> &all_exprs);
+  /** @brief Get this scan's ObFusionNode; return nullptr for other scans. */
+  ObFusionNode *get_hybrid_sort_node() const;
   int get_hybrid_search_index_name_list(ObIArray<ObString> &name_list);
   int prepare_vector_node_access_exprs();
   int add_rerank_field_access_expr();

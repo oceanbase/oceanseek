@@ -365,6 +365,29 @@ static int setup_lt_boolean_query_ctdef_layout_(const ObLogTableScan &op,
   return ret;
 }
 
+// DAS supplies the complete __shard_doc value. It is an SQL filter input;
+// its tablet and hidden-key arguments are not evaluated again after lookup.
+int extract_hybrid_after_inputs(ObRawExpr *expr, const ObRawExpr *shard_doc_expr,
+                                ObIArray<ObRawExpr *> &inputs)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(expr) || OB_ISNULL(shard_doc_expr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null hybrid search_after input expression", K(ret), KP(expr), KP(shard_doc_expr));
+  } else if (expr == shard_doc_expr || T_REF_COLUMN == expr->get_expr_type()) {
+    if (OB_FAIL(add_var_to_array_no_dup(inputs, expr))) {
+      LOG_WARN("failed to append hybrid search_after input", K(ret), KP(expr));
+    }
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < expr->get_param_count(); ++i) {
+      if (OB_FAIL(SMART_CALL(extract_hybrid_after_inputs(expr->get_param_expr(i), shard_doc_expr, inputs)))) {
+        LOG_WARN("failed to extract hybrid search_after input", K(ret), K(i));
+      }
+    }
+  }
+  return ret;
+}
+
 } // anonymous namespace
 
 int ObHybridSearchCgService::find_logical_table_implicit_pk_scalar_node_(
@@ -544,6 +567,10 @@ int ObHybridSearchCgService::generate_hybrid_search_ctdef(ObLogTableScan &op,
     } else if (search_ctdef->op_type_ == DAS_OP_FUSION_QUERY
         && OB_FAIL(try_alloc_topk_collect_ctdef(static_cast<ObDASFusionCtDef*>(search_ctdef)))) {
       LOG_WARN("failed to try alloc topk collect ctdef", K(ret));
+    } else if (search_ctdef->op_type_ == DAS_OP_FUSION_QUERY
+        && OB_FAIL(generate_search_after_ctdef(*static_cast<ObFusionNode *>(root),
+                                               *static_cast<ObDASFusionCtDef *>(search_ctdef)))) {
+      LOG_WARN("failed to generate hybrid search_after definition", K(ret));
     } else if (!op.get_index_back()) {
       ObArray<ObRawExpr *> non_pushdown_filters;
       ObArray<ObRawExpr *> lookup_pushdown_filters;
@@ -2068,7 +2095,7 @@ int ObHybridSearchCgService::synthesize_parent_domain_must_not_required(ObLogTab
 {
   int ret = OB_SUCCESS;
   // After generate_final_lookup_ctdef, root_ctdef is TableLookup/IndexProjLookup.
-  // Walk: Lookup → children_[0] (Fusion) → children_[search_idx] → BooleanQuery.
+  // Walk through Fusion and its optional sort child to the original query.
   // Extract the data-table scan from Lookup for use as clone template.
   const ObDASScanCtDef *data_scan = nullptr;
   ObDASBaseCtDef *bool_root = nullptr;
@@ -2084,10 +2111,7 @@ int ObHybridSearchCgService::synthesize_parent_domain_must_not_required(ObLogTab
       ObDASBaseCtDef *rowkey_scan = root_ctdef->children_[0];
       if (rowkey_scan->op_type_ == DAS_OP_FUSION_QUERY) {
         const ObDASFusionCtDef *fusion = static_cast<const ObDASFusionCtDef *>(rowkey_scan);
-        int64_t sidx = fusion->get_search_idx();
-        if (sidx >= 0 && sidx < fusion->children_cnt_) {
-          bool_root = fusion->children_[sidx];
-        }
+        bool_root = const_cast<ObIDASSearchCtDef *>(fusion->get_search_ctdef());
       } else if (rowkey_scan->op_type_ == DAS_OP_BOOLEAN_QUERY) {
         bool_root = rowkey_scan;
       }
@@ -2853,6 +2877,22 @@ int ObHybridSearchCgService::generate_final_lookup_ctdef(ObLogTableScan &op,
           static_cast<ObDASAttachCtDef &>(search_ctdef).result_output_))) {
         LOG_WARN("failed to assign index scan project column exprs", K(ret));
       }
+      if (OB_SUCC(ret) && OB_NOT_NULL(fusion_ctdef->shard_doc_expr_)) {
+        ObExpr *shard_doc_expr = fusion_ctdef->shard_doc_expr_;
+        ObSEArray<ObExpr *, 8> projection_exprs;
+        if (OB_FAIL(projection_exprs.assign(index_proj_lookup_ctdef->index_scan_proj_exprs_))) {
+          LOG_WARN("failed to copy index projection for hybrid pagination", K(ret));
+        } else if (OB_FAIL(add_var_to_array_no_dup(projection_exprs, shard_doc_expr))) {
+          LOG_WARN("failed to append __shard_doc to index projection", K(ret), KP(shard_doc_expr));
+        } else {
+          // The original fixed array was sized for row IDs and scores. Reallocate it before
+          // carrying the additional __shard_doc value through the final main-table lookup.
+          index_proj_lookup_ctdef->index_scan_proj_exprs_.reset();
+          if (OB_FAIL(index_proj_lookup_ctdef->index_scan_proj_exprs_.assign(projection_exprs))) {
+            LOG_WARN("failed to set index projection for hybrid pagination", K(ret));
+          }
+        }
+      }
       if (OB_SUCC(ret) && OB_FAIL(append_array_no_dup(result_outputs, index_proj_lookup_ctdef->index_scan_proj_exprs_))) {
         LOG_WARN("failed to append final result outputs", K(ret));
       }
@@ -2874,6 +2914,7 @@ int ObHybridSearchCgService::generate_main_scan_ctdef(ObLogTableScan &op, ObDASS
   int ret = OB_SUCCESS;
   ObDASScanCtDef *scan_ctdef = nullptr;
   ObSqlSchemaGuard *schema_guard = nullptr;
+  const ObFusionNode *fusion = op.get_hybrid_sort_node();
   if (OB_ISNULL(cg_.phy_plan_) || OB_ISNULL(cg_.opt_ctx_) || OB_ISNULL(schema_guard = cg_.opt_ctx_->get_sql_schema_guard())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected nullptr", K(ret), K(cg_.phy_plan_), K(cg_.opt_ctx_), K(schema_guard));
@@ -2927,6 +2968,10 @@ int ObHybridSearchCgService::generate_main_scan_ctdef(ObLogTableScan &op, ObDASS
       ObArray<uint64_t> output_column_ids;
       if (OB_FAIL(output_exprs.assign(op.get_output_exprs()))) {
         LOG_WARN("failed to assign output exprs", K(ret));
+      } else if (OB_NOT_NULL(fusion)
+                 && OB_FAIL(append_array_no_dup(output_exprs, fusion->sort_lookup_access_exprs_))) {
+        LOG_WARN("failed to append sort lookup columns to main scan output", K(ret),
+                 K(fusion->sort_lookup_access_exprs_.count()));
       } else if (OB_FAIL(append_array_no_dup(output_exprs, non_pushdown_filters))) {
         LOG_WARN("failed to append filter exprs to output exprs", K(ret));
       } else if (OB_FAIL(ObRawExprUtils::extract_column_exprs(output_exprs, output_column_exprs, true))) {
@@ -3037,6 +3082,97 @@ int ObHybridSearchCgService::generate_main_scan_ctdef(ObLogTableScan &op, ObDASS
     if (OB_SUCC(ret) && OB_NOT_NULL(scan_ctdef)) {
       main_scan_ctdef = scan_ctdef;
       main_scan_ctdef->is_get_ = true;
+    }
+  }
+  return ret;
+}
+
+int ObHybridSearchCgService::generate_search_after_ctdef(const ObFusionNode &node,
+                                                        ObDASFusionCtDef &fusion)
+{
+  int ret = OB_SUCCESS;
+  fusion.has_search_after_ = node.has_after();
+  for (int64_t i = 0; OB_SUCC(ret) && i < node.sort_items_.count(); ++i) {
+    const ObFusionSortItem &item = node.sort_items_.at(i);
+    if (item.is_unique_shard_doc_) {
+      if (OB_ISNULL(item.order_item_.expr_) || OB_NOT_NULL(fusion.shard_doc_expr_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid hybrid __shard_doc expression", K(ret), K(i),
+                 KP(item.order_item_.expr_), KP(fusion.shard_doc_expr_));
+      } else if (OB_FAIL(cg_.mark_expr_self_produced(item.order_item_.expr_))) {
+        // DAS supplies the complete identifier while the source tablet is known.
+        // SQL must not evaluate the hidden-key inputs after rows from different tablets are mixed.
+        LOG_WARN("failed to mark hybrid __shard_doc as scan-produced", K(ret), K(i));
+      } else if (OB_FAIL(cg_.generate_rt_expr(*item.order_item_.expr_, fusion.shard_doc_expr_))) {
+        LOG_WARN("failed to generate hybrid __shard_doc expression", K(ret), K(i));
+      }
+    }
+  }
+  if (OB_SUCC(ret) && OB_NOT_NULL(fusion.shard_doc_expr_)) {
+    ObSEArray<ObExpr *, 8> output;
+    if (OB_FAIL(output.assign(fusion.result_output_))) {
+      LOG_WARN("failed to copy fusion output for hybrid pagination", K(ret));
+    } else if (OB_FAIL(add_var_to_array_no_dup(output, fusion.shard_doc_expr_))) {
+      LOG_WARN("failed to append hybrid __shard_doc output", K(ret));
+    } else {
+      // Reallocate the fixed array so it can carry the extra identifier through final lookup.
+      fusion.result_output_.reset();
+      if (OB_FAIL(fusion.result_output_.assign(output))) {
+        LOG_WARN("failed to set fusion output for hybrid pagination", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObHybridSearchCgService::extract_dsl_nonpushdown_filters(
+    const ObLogTableScan &op, ObIArray<ObRawExpr *> &filters)
+{
+  int ret = OB_SUCCESS;
+  const ObFusionNode *fusion = op.get_hybrid_sort_node();
+  const ObIArray<ObRawExpr *> &filter_exprs = op.get_filter_exprs();
+  if (OB_NOT_NULL(fusion) && fusion->has_after()) {
+    if (OB_FAIL(filters.assign(filter_exprs))) {
+      LOG_WARN("failed to assign hybrid filters after lookup", K(ret), K(filter_exprs.count()));
+    }
+  } else if (!filter_exprs.empty()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("dsl query should not have additional filters", K(ret), K(op.get_ref_table_id()));
+  }
+  return ret;
+}
+
+int ObHybridSearchCgService::extract_filter_input_exprs(
+    const ObLogTableScan &op, const ObIArray<ObRawExpr *> &filters, ObIArray<ObRawExpr *> &inputs)
+{
+  int ret = OB_SUCCESS;
+  const ObFusionNode *node = op.get_hybrid_sort_node();
+  if (OB_ISNULL(node) || !node->has_after()) {
+    if (OB_FAIL(ObRawExprUtils::extract_column_exprs(filters, inputs))) {
+      LOG_WARN("failed to extract hybrid filter columns", K(ret));
+    }
+  } else {
+    const ObRawExpr *shard_doc_expr = nullptr;
+    for (int64_t i = 0; OB_SUCC(ret) && i < node->sort_items_.count(); ++i) {
+      const ObFusionSortItem &item = node->sort_items_.at(i);
+      if (item.is_unique_shard_doc_) {
+        if (OB_ISNULL(item.order_item_.expr_) || OB_NOT_NULL(shard_doc_expr)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid hybrid search_after shard expression", K(ret), K(i),
+                   KP(item.order_item_.expr_), KP(shard_doc_expr));
+        } else {
+          shard_doc_expr = item.order_item_.expr_;
+        }
+      }
+    }
+    if (OB_SUCC(ret) && OB_ISNULL(shard_doc_expr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("hybrid search_after has no shard expression", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < filters.count(); ++i) {
+      if (OB_FAIL(extract_hybrid_after_inputs(filters.at(i), shard_doc_expr, inputs))) {
+        LOG_WARN("failed to extract hybrid search_after filter inputs", K(ret), K(i));
+      }
     }
   }
   return ret;
@@ -4696,17 +4832,18 @@ int ObHybridSearchCgService::prepare_main_scan_access_ctdef(ObLogTableScan &op,
   common::ObTableID ref_table_id = op.get_real_ref_table_id();
   ObArray<ObRawExpr *> filters;
   ObArray<ObRawExpr *> access_exprs;
+  const ObIArray<ObRawExpr *> &filter_exprs = op.get_filter_exprs();
   const bool is_dsl_query = is_dsl_query_path(op.get_access_path());
+  const ObFusionNode *fusion = op.get_hybrid_sort_node();
   scan_ctdef.ref_table_id_ = ref_table_id;
   if (OB_ISNULL(cg_.opt_ctx_) || OB_ISNULL(schema_guard = cg_.opt_ctx_->get_sql_schema_guard())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected nullptr", K(ret), K(cg_.opt_ctx_), K(schema_guard));
   } else if (is_dsl_query) {
-    if (!op.get_filter_exprs().empty()) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("dsl query should not have additional filters", K(ret), K(ref_table_id));
+    if (OB_FAIL(extract_dsl_nonpushdown_filters(op, non_pushdown_filters))) {
+      LOG_WARN("failed to extract DSL filters after lookup", K(ret), K(ref_table_id));
     }
-  } else if (OB_FAIL(filters.assign(op.get_filter_exprs()))) {
+  } else if (OB_FAIL(filters.assign(filter_exprs))) {
     LOG_WARN("failed to assign filters", K(ret));
   } else if (OB_FAIL(op.extract_nonpushdown_filters(
                  filters, non_pushdown_filters, lookup_pushdown_filters))) {
@@ -4717,6 +4854,10 @@ int ObHybridSearchCgService::prepare_main_scan_access_ctdef(ObLogTableScan &op,
     ObArray<ObRawExpr *> filter_columns;
     if (OB_FAIL(access_exprs.assign(op.get_access_exprs()))) {
       LOG_WARN("failed to assign access exprs", K(ret));
+    } else if (OB_NOT_NULL(fusion)
+               && OB_FAIL(append_array_no_dup(access_exprs, fusion->sort_lookup_access_exprs_))) {
+      LOG_WARN("failed to append hybrid sort lookup columns", K(ret), K(ref_table_id),
+               K(fusion->sort_lookup_access_exprs_.count()));
     } else if (OB_FAIL(ObRawExprUtils::extract_column_exprs(filters, filter_columns))) {
       LOG_WARN("failed to extract filter columns", K(ret));
     } else if (OB_FAIL(append_array_no_dup(access_exprs, filter_columns))) {

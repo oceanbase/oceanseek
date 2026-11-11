@@ -54,6 +54,7 @@ int ObRawExprFactory::create_raw_expr<ObSysFunRawExpr>(ObItemType expr_type, ObS
 {
   int ret = OB_SUCCESS;
   switch (expr_type) {
+    GENERATE_CASE(T_FUN_SYS_HYBRID_SEARCH_SORT_VALUES, ObHybridSearchSortValuesRawExpr);
     GENERATE_CASE(T_FUN_SYS_SEQ_NEXTVAL, ObSequenceRawExpr);
     GENERATE_CASE(T_FUN_NORMAL_UDF, ObNormalDllUdfRawExpr);
     GENERATE_CASE(T_FUN_PL_COLLECTION_CONSTRUCT, ObCollectionConstructRawExpr);
@@ -1115,7 +1116,8 @@ int ObRawExpr::is_const_inherit_expr(bool &is_const_inherit,
       || T_FUN_SYS_RELEASE_ALL_LOCKS == type_
       || T_FUN_ES_MATCH == type_
       || T_FUN_CK_RAND_CANONICAL == type_
-      || T_HYBRID_SEARCH_SCORE == type_) {
+      || T_HYBRID_SEARCH_SCORE == type_
+      || T_HYBRID_SEARCH_TABLET == type_) {
      is_const_inherit = false;
   }
   if (is_const_inherit && T_OP_GET_USER_VAR == type_) {
@@ -5239,6 +5241,62 @@ int ObSysFunRawExpr::get_type_demotion_name(char *buf, int64_t buf_len, int64_t 
     LOG_WARN("fail to BUF_PRINTF", K(ret));
   } else if (OB_FAIL(get_cast_type_name(buf, buf_len, pos))) {
     LOG_WARN("fail to get_cast_type_name", K(ret));
+  }
+  return ret;
+}
+
+int ObHybridSearchSortValuesRawExpr::assign(const ObRawExpr &other)
+{
+  int ret = OB_SUCCESS;
+  if (this != &other) {
+    if (OB_FAIL(ObSysFunRawExpr::assign(other))) {
+      LOG_WARN("failed to assign hybrid sort values expression", K(ret));
+    } else {
+      const ObHybridSearchSortValuesRawExpr &src =
+          static_cast<const ObHybridSearchSortValuesRawExpr &>(other);
+      source_database_name_ = src.source_database_name_;
+      source_table_name_ = src.source_table_name_;
+    }
+  }
+  return ret;
+}
+
+int ObHybridSearchSortValuesRawExpr::inner_deep_copy(ObIRawExprCopier &copier)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(ObSysFunRawExpr::inner_deep_copy(copier))) {
+    LOG_WARN("failed to copy hybrid sort values expression", K(ret));
+  } else if (copier.deep_copy_attributes()) {
+    if (OB_ISNULL(inner_alloc_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null expression allocator", K(ret));
+    } else if (OB_FAIL(ob_write_string(*inner_alloc_, source_database_name_, source_database_name_))) {
+      LOG_WARN("failed to copy hybrid sort source database", K(ret));
+    } else if (OB_FAIL(ob_write_string(*inner_alloc_, source_table_name_, source_table_name_))) {
+      LOG_WARN("failed to copy hybrid sort source table", K(ret));
+    }
+  }
+  return ret;
+}
+
+void ObHybridSearchSortValuesRawExpr::reset()
+{
+  ObSysFunRawExpr::reset();
+  source_database_name_.reset();
+  source_table_name_.reset();
+}
+
+int ObHybridSearchSortValuesRawExpr::set_source_table(const ObString &database_name,
+                                                     const ObString &table_name)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(inner_alloc_) || table_name.empty()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid hybrid sort source table", K(ret), KP(inner_alloc_), K(table_name));
+  } else if (OB_FAIL(ob_write_string(*inner_alloc_, database_name, source_database_name_))) {
+    LOG_WARN("failed to copy hybrid sort source database", K(ret));
+  } else if (OB_FAIL(ob_write_string(*inner_alloc_, table_name, source_table_name_))) {
+    LOG_WARN("failed to copy hybrid sort source table", K(ret));
   }
   return ret;
 }

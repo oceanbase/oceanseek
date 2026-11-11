@@ -9,12 +9,18 @@
 #include "sql/hybrid_search/ob_hybrid_search_dsl_resolver.h"
 #include "sql/hybrid_search/ob_fulltext_search_query.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
+#include "sql/resolver/dml/ob_stmt_expr_visitor.h"
 #include "share/search_index/ob_search_index_config_filter.h"
 #include "lib/json_type/ob_json_path.h"
 #include "lib/utility/ob_fast_convert.h"
 #include "sql/rewrite/ob_expand_aggregate_utils.h"
 #include "share/vector_index/ob_vector_index_util.h"
 #include "share/search_index/ob_search_index_encoder.h"
+#include "lib/json_type/ob_json_parse.h"
+#include "lib/encode/ob_base64_encode.h"
+#include "sql/engine/expr/ob_expr_hybrid_search_sort.h"
+#include "sql/engine/expr/ob_expr_json_func_helper.h"
+#include "share/object/ob_obj_cast_util.h"
 
 namespace oceanbase
 {
@@ -23,6 +29,478 @@ namespace sql
 
 const ObString ObDSLResolver::FTS_SCORE_NAME("__fts_score");
 const ObString ObDSLResolver::VS_SCORE_PREFIX("__vs_score_");
+
+bool ObDSLQueryInfo::has_unique_shard_doc() const
+{
+  bool found = false;
+  for (int64_t i = 0; !found && i < sort_items_.count(); ++i) {
+    found = sort_items_.at(i).is_unique_shard_doc_;
+  }
+  return found;
+}
+
+bool ObDSLQueryInfo::has_literal_sort_missing() const
+{
+  bool found = false;
+  for (int64_t i = 0; !found && i < sort_items_.count(); ++i) {
+    found = sort_items_.at(i).missing_mode_ == ObDSLSortItem::MissingMode::LITERAL;
+  }
+  return found;
+}
+
+bool ObDSLResolver::should_print_sql_limit(const ObDMLStmt &stmt)
+{
+  bool print_sql_limit = true;
+  for (int64_t i = 0; print_sql_limit && i < stmt.get_table_size(); ++i) {
+    const TableItem *table = stmt.get_table_item(i);
+    if (OB_NOT_NULL(table) && table->is_hybrid_search_table()
+        && table->dsl_query_->has_unique_shard_doc()) {
+      const ObDSLQueryInfo &info = *table->dsl_query_;
+      if (stmt.get_limit_expr() == info.size_
+          && (stmt.get_offset_expr() == info.from_
+              || (OB_ISNULL(stmt.get_offset_expr()) && OB_NOT_NULL(info.from_)
+                  && info.from_->is_const_expr()
+                  && static_cast<ObConstRawExpr *>(info.from_)->get_value().is_int()
+                  && static_cast<ObConstRawExpr *>(info.from_)->get_value().get_int() <= 0))) {
+        print_sql_limit = false;
+      }
+    }
+  }
+  return print_sql_limit;
+}
+
+bool ObDSLResolver::should_print_order_iterms(const ObSelectStmt &stmt)
+{
+  bool print_order_items = true;
+  const int64_t order_item_size = stmt.get_order_item_size();
+  for (int64_t i = 0; print_order_items && order_item_size > 0 && i < stmt.get_table_size(); ++i) {
+    const TableItem *table = stmt.get_table_item(i);
+    if (OB_NOT_NULL(table) && table->is_hybrid_search_table()
+        && table->dsl_query_->has_unique_shard_doc()) {
+      const ObIArray<ObDSLSortItem> &sort_items = table->dsl_query_->sort_items_;
+      bool matches = order_item_size == sort_items.count();
+      for (int64_t j = 0; matches && j < order_item_size; ++j) {
+        const ObDSLSortItem &item = sort_items.at(j);
+        const ObOrderDirection direction = item.missing_mode_ == ObDSLSortItem::MissingMode::FIRST
+            ? (item.is_asc_ ? NULLS_FIRST_ASC : NULLS_FIRST_DESC)
+            : (item.is_asc_ ? NULLS_LAST_ASC : NULLS_LAST_DESC);
+        matches = stmt.get_order_item(j).expr_ == item.field_expr_
+            && stmt.get_order_item(j).order_type_ == direction;
+      }
+      if (matches) {
+        // The DSL restores these sort expressions without printing their hidden inputs.
+        print_order_items = false;
+      }
+    }
+  }
+  return print_order_items;
+}
+
+int ObDSLResolver::iterate_sort_exprs(ObDSLQueryInfo &info, ObStmtExprVisitor &visitor)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(visitor.visit(info.search_after_values_, SCOPE_FROM))) {
+    LOG_WARN("failed to visit hybrid search after expressions", K(ret));
+  } else if (OB_FAIL(visitor.visit(info.sort_lookup_base_columns_, SCOPE_FROM))) {
+    LOG_WARN("failed to visit hybrid sort base columns", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < info.sort_items_.count(); ++i) {
+    if (OB_FAIL(visitor.visit(info.sort_items_.at(i).field_expr_, SCOPE_FROM))) {
+      LOG_WARN("failed to visit hybrid sort expression", K(ret), K(i));
+    } else if (OB_FAIL(visitor.visit(info.sort_items_.at(i).output_expr_, SCOPE_FROM))) {
+      LOG_WARN("failed to visit hybrid sort output expression", K(ret), K(i));
+    } else if (OB_NOT_NULL(info.sort_items_.at(i).missing_literal_)
+               && OB_FAIL(visitor.visit(info.sort_items_.at(i).missing_literal_, SCOPE_FROM))) {
+      LOG_WARN("failed to visit hybrid sort missing literal", K(ret), K(i));
+    }
+  }
+  return ret;
+}
+
+namespace
+{
+/**
+ * @brief Build __shard_doc from the main-table tablet ID and __pk_increment.
+ * A user-defined PRIMARY KEY does not supply this value.
+ */
+int make_hybrid_shard_doc(ObDSLQueryInfo &info, const TableItem &table, ObDMLStmt &stmt,
+                          ObRawExprFactory &factory, ObSQLSessionInfo &session, ObRawExpr *&out)
+{
+  int ret = OB_SUCCESS;
+  ObColumnRefRawExpr *increment = nullptr;
+  ObOpPseudoColumnRawExpr *tablet = nullptr;
+  ObSysFunRawExpr *shard_doc_expr = nullptr;
+  ObRawExprResType input_type;
+  input_type.set_uint64();
+  if (info.rowkey_cols_.count() != 1
+      || OB_ISNULL(increment = info.rowkey_cols_.at(0))
+      || increment->get_column_id() != OB_HIDDEN_PK_INCREMENT_COLUMN_ID) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "hybrid cursor requires a heap table with __pk_increment");
+    LOG_WARN("unsupported physical rowkey for hybrid cursor", K(ret), K(table.table_id_),
+             K(info.rowkey_cols_.count()));
+  } else if (OB_FAIL(increment->add_relation_id(stmt.get_table_bit_index(table.table_id_)))) {
+    // __sort exposes the hidden physical key as an expression dependency. Derived-table
+    // statistics need its owning table, but the key must remain hidden from SQL name lookup.
+    LOG_WARN("failed to add hybrid sort physical rowkey relation id", K(ret));
+  } else if (OB_FAIL(increment->formalize(&session))) {
+    LOG_WARN("failed to formalize hybrid cursor rowkey", K(ret), K(increment->get_column_id()));
+  } else if (increment->get_data_type() != ObUInt64Type) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected hybrid cursor increment type", K(ret), K(increment->get_data_type()));
+  } else if (OB_FAIL(ObRawExprUtils::build_op_pseudo_column_expr(factory,
+                 T_HYBRID_SEARCH_TABLET, "__hybrid_main_tablet", input_type, tablet))) {
+    LOG_WARN("failed to build hybrid __shard_doc tablet expression", K(ret));
+  } else if (OB_FAIL(tablet->add_relation_id(stmt.get_table_bit_index(table.table_id_)))) {
+    LOG_WARN("failed to add hybrid __shard_doc relation id", K(ret));
+  } else if (OB_FAIL(factory.create_raw_expr(T_FUN_SYS_HYBRID_UNIQUE_SHARD_DOC, shard_doc_expr))) {
+    LOG_WARN("failed to create __shard_doc expression", K(ret));
+  } else if (OB_FAIL(shard_doc_expr->set_param_exprs(tablet, increment))) {
+    LOG_WARN("failed to set __shard_doc arguments", K(ret));
+  } else {
+    shard_doc_expr->set_func_name(ObString::make_string("hybrid_unique_shard_doc"));
+    if (OB_FAIL(shard_doc_expr->formalize(&session))) {
+      LOG_WARN("failed to formalize __shard_doc expression", K(ret));
+    } else {
+      out = shard_doc_expr;
+    }
+  }
+  return ret;
+}
+
+/**
+ * @brief Check the search_after query shape: one non-KNN query without rank, collapse, or aggregation.
+ */
+bool is_supported_search_after_query(const ObDSLQueryInfo &info)
+{
+  return info.queries_.count() == 1 && OB_NOT_NULL(info.queries_.at(0))
+      && info.queries_.at(0)->query_type_ != QUERY_ITEM_KNN
+      && !info.has_dsl_rank() && nullptr == info.rank_info_.rerank_info_
+      && !info.has_dsl_collapse() && !info.has_dsl_aggs();
+}
+
+} // namespace
+
+int ObDSLResolver::append_shard_doc_sort_item_if_absent(
+    ObDSLQueryInfo &info, ObSelectStmt &stmt,
+    const TableItem &table, ObRawExprFactory &factory,
+    ObSQLSessionInfo &session)
+{
+  int ret = OB_SUCCESS;
+  if (!info.has_unique_shard_doc()) {
+    ObDSLSortItem item;
+    item.is_unique_shard_doc_ = true;
+    if (OB_FAIL(make_hybrid_shard_doc(info, table, stmt, factory, session, item.field_expr_))) {
+      LOG_WARN("failed to build hybrid __shard_doc", K(ret));
+    } else if (OB_FALSE_IT(item.output_expr_ = item.field_expr_)) {
+    } else if (OB_FAIL(info.sort_items_.push_back(item))) {
+      LOG_WARN("failed to append hybrid sort item", K(ret));
+    } else {
+      OrderItem order_item(item.field_expr_, NULLS_LAST_ASC);
+      if (OB_FAIL(stmt.add_order_item(order_item))) {
+        LOG_WARN("failed to append hybrid cursor order item", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDSLResolver::build_unique_shard_doc_expr(ObRawExpr *&expr)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(make_hybrid_shard_doc(*dsl_query_info_, table_item_, *stmt_,
+                                    *params_.expr_factory_, *session_info_, expr))) {
+    LOG_WARN("failed to build hybrid __shard_doc expression", K(ret));
+  }
+  return ret;
+}
+
+int ObDSLResolver::check_hybrid_sort_table_support(const ObTableSchema *table_schema)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(table_schema)
+      || !table_schema->is_heap_organized_table()
+      || OB_ISNULL(table_schema->get_column_schema(OB_HIDDEN_PK_INCREMENT_COLUMN_ID))) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("unsupported table layout for hybrid cursor", K(ret), KP(table_schema));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "hybrid JSON sort, __shard_doc or search_after on this table");
+  }
+  return ret;
+}
+
+int ObDSLResolver::finalize_sort_and_resolve_search_after(ObIJsonBase *after_node)
+{
+  int ret = OB_SUCCESS;
+  ObDSLQueryInfo &info = *dsl_query_info_;
+  ObSelectStmt &stmt = *static_cast<ObSelectStmt *>(stmt_);
+  int64_t shard_doc_count = 0;
+  for (int64_t i = 0; i < info.sort_items_.count(); ++i) {
+    shard_doc_count += info.sort_items_.at(i).is_unique_shard_doc_ ? 1 : 0;
+  }
+  if (shard_doc_count > 1) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "duplicate __shard_doc sort item");
+    LOG_WARN("duplicate hybrid cursor identity sort items", K(ret), K(shard_doc_count),
+             K(info.sort_items_.count()));
+  } else if (after_node != nullptr) {
+    if (!info.has_dsl_sort()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "search_after requires an explicit sort; use __shard_doc when no business sort is needed");
+      LOG_WARN("search_after has no explicit sort", K(ret), K(info.sort_items_.count()));
+    } else if (OB_FAIL(append_shard_doc_sort_item_if_absent(
+                 info, stmt, table_item_, *params_.expr_factory_, *session_info_))) {
+      LOG_WARN("failed to append hybrid __shard_doc", K(ret));
+    } else {
+      // Resolve sort expression types before casting the cursor values.
+      for (int64_t i = 0; OB_SUCC(ret) && i < info.sort_items_.count(); ++i) {
+        ObRawExpr *sort_expr = info.sort_items_.at(i).field_expr_;
+        if (OB_ISNULL(sort_expr)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("search_after sort expression is null", K(ret), K(i));
+        } else if (OB_FAIL(sort_expr->formalize(session_info_))) {
+          LOG_WARN("failed to formalize search_after sort expression", K(ret), K(i));
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(resolve_search_after(*after_node))) {
+        LOG_WARN("failed to resolve hybrid search after values", K(ret));
+      }
+    }
+  } else if (shard_doc_count > 0) {
+    // Table support is checked once in check_hybrid_search_stmt().
+    if (!is_supported_search_after_query(info)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "__shard_doc with fusion or aggregation");
+      LOG_WARN("unsupported query shape for hybrid cursor identity", K(ret), K(info.queries_.count()),
+               "first_query_type", info.queries_.count() > 0 && info.queries_.at(0) != nullptr
+                   ? info.queries_.at(0)->query_type_ : QUERY_ITEM_UNKNOWN,
+               "has_rerank", info.rank_info_.rerank_info_ != nullptr,
+               K(info.has_dsl_rank()), K(info.has_dsl_collapse()), K(info.has_dsl_aggs()));
+    }
+  }
+  return ret;
+}
+
+int ObDSLResolver::check_hybrid_sort_support(ObResolverParams &params, ObSelectStmt *select_stmt)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(select_stmt) || OB_ISNULL(params.schema_checker_) || OB_ISNULL(params.session_info_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid resolver context for hybrid sort support check", K(ret), KP(select_stmt),
+             KP(params.schema_checker_), KP(params.session_info_));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && select_stmt->is_hybrid_search()
+       && i < select_stmt->get_table_size(); ++i) {
+    const TableItem *table = select_stmt->get_table_item(i);
+    if (OB_ISNULL(table)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("hybrid search table is null", K(ret), K(i));
+    } else if (!table->is_hybrid_search_table()) {
+      // Only inspect this query block's hybrid tables, not the contents of derived tables.
+    } else if (OB_ISNULL(table->dsl_query_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("hybrid search DSL information is null", K(ret), K(i));
+    } else {
+      const ObDSLQueryInfo &info = *table->dsl_query_;
+      int64_t offset = 0;
+      if (OB_ISNULL(info.from_) || !info.from_->is_const_expr()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("hybrid sort offset expression is missing or not constant", K(ret), KP(info.from_));
+      } else if (OB_FAIL(static_cast<ObConstRawExpr *>(info.from_)->get_value().get_int(offset))) {
+        LOG_WARN("failed to read hybrid sort offset", K(ret));
+      } else if (info.has_search_after()) {
+        if (offset != 0 && offset != -1) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "search_after requires from=0 or -1");
+          LOG_WARN("invalid search_after offset", K(ret), K(offset));
+        } else if (!is_supported_search_after_query(info)) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "search_after requires one non-KNN query without rank, rerank, collapse or aggs");
+          LOG_WARN("unsupported query shape for search_after", K(ret), K(i), K(info.queries_.count()),
+                   "first_query_type", info.queries_.count() > 0 && info.queries_.at(0) != nullptr
+                       ? info.queries_.at(0)->query_type_ : QUERY_ITEM_UNKNOWN,
+                   "has_rerank", info.rank_info_.rerank_info_ != nullptr,
+                   K(info.has_dsl_rank()), K(info.has_dsl_collapse()), K(info.has_dsl_aggs()));
+        } else if (info.has_literal_sort_missing()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "search_after with a literal missing value");
+          LOG_WARN("literal missing value is not supported with search_after", K(ret), K(i));
+        } else if (select_stmt->has_distinct()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "search_after with DISTINCT");
+          LOG_WARN("distinct is not supported with search_after", K(ret), K(i));
+        } else if (select_stmt->has_group_by()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "search_after with GROUP BY or SQL aggregation");
+          LOG_WARN("group by or aggregation is not supported with search_after", K(ret), K(i));
+        } else if (select_stmt->has_having()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "search_after with HAVING");
+          LOG_WARN("having is not supported with search_after", K(ret), K(i));
+        } else if (select_stmt->has_window_function() || select_stmt->has_window_function_filter()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "search_after with SQL window functions");
+          LOG_WARN("window functions are not supported with search_after", K(ret), K(i));
+        }
+        if (OB_SUCC(ret) && offset == -1) {
+          static_cast<ObConstRawExpr *>(info.from_)->get_value().set_int(0);
+        }
+      } else if (offset < 0) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "from, from value should be a non-negative integer");
+        LOG_WARN("negative hybrid search offset without search_after", K(ret), K(offset));
+      }
+      if (OB_SUCC(ret) && (info.has_search_after() || info.has_unique_shard_doc()
+                          || !info.sort_lookup_base_columns_.empty())) {
+        // Check the table once, even when several JSON sort fields and __shard_doc are requested together.
+        const ObTableSchema *schema = nullptr;
+        if (OB_FAIL(params.schema_checker_->get_table_schema(
+                        params.session_info_->get_effective_tenant_id(), table->ref_id_, schema))) {
+          LOG_WARN("failed to get hybrid sort table schema", K(ret), K(table->ref_id_));
+        } else if (OB_ISNULL(schema)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("hybrid sort table schema is null", K(ret), K(table->ref_id_));
+        } else if (OB_FAIL(check_hybrid_sort_table_support(schema))) {
+          LOG_WARN("failed to check hybrid sort table support", K(ret), K(table->ref_id_));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDSLResolver::build_json_sort_constant(ObIJsonBase &value, ObConstRawExpr *&expr)
+{
+  int ret = OB_SUCCESS;
+  ObString binary;
+  ObObj obj;
+  if (OB_FAIL(value.get_raw_binary(binary, allocator_))) {
+    LOG_WARN("failed to serialize hybrid sort JSON value", K(ret), K(value.json_type()));
+  } else {
+    obj.set_json_value(ObJsonType, binary.ptr(), binary.length());
+    // SQL JSON constants need a LOB header. Keep the binary value to preserve decimal precision.
+    if (OB_FAIL(ObTextStringResult::ob_convert_obj_temporay_lob(obj, *allocator_))) {
+      LOG_WARN("failed to add LOB header to hybrid JSON constant", K(ret), K(value.json_type()));
+    } else if (OB_FAIL(ObRawExprUtils::build_const_obj_expr(*params_.expr_factory_, obj, expr))) {
+      LOG_WARN("failed to build hybrid JSON constant", K(ret), K(value.json_type()));
+    }
+  }
+  return ret;
+}
+
+int ObDSLResolver::resolve_search_after(ObIJsonBase &after)
+{
+  int ret = OB_SUCCESS;
+  ObDSLQueryInfo &info = *dsl_query_info_;
+  if (after.json_type() != ObJsonNodeType::J_ARRAY) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "search_after must be a JSON array");
+    LOG_WARN("search_after is not a JSON array", K(ret), K(after.json_type()));
+  } else if (!info.has_unique_shard_doc()) {
+    // finalize_sort_and_resolve_search_after must append the identity before resolving cursor values.
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("search_after sort is missing __shard_doc after finalization", K(ret), K(info.sort_items_.count()));
+  } else if (after.element_count() == 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "search_after must not be an empty JSON array");
+    LOG_WARN("search_after array is empty", K(ret));
+  } else if (after.element_count() != info.sort_items_.count()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                  "search_after value count must match sort, including __shard_doc");
+    LOG_WARN("search_after value count does not match sort, including __shard_doc", K(ret), K(after.element_count()),
+             K(info.sort_items_.count()));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < info.sort_items_.count(); ++i) {
+    const ObDSLSortItem &item = info.sort_items_.at(i);
+    const ObRawExprResType &type = item.field_expr_->get_result_type();
+    ObIJsonBase *value = nullptr;
+    ObConstRawExpr *constant = nullptr;
+    ObSysFunRawExpr *typed = nullptr;
+    if (OB_FAIL(after.get_array_element(i, value))) {
+      LOG_WARN("failed to get search_after value", K(ret), K(i));
+    } else if (OB_ISNULL(value)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("search_after element is null", K(ret), K(i));
+    } else if (item.is_score_sort_ && value->json_type() == ObJsonNodeType::J_NULL) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "search_after value for __score must not be null");
+      LOG_WARN("null search_after value for __score", K(ret), K(i));
+    } else if (item.is_unique_shard_doc_) {
+      ObString normalized;
+      if (value->json_type() != ObJsonNodeType::J_STRING) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("__shard_doc must be a JSON string", K(ret), K(i), K(value->json_type()));
+      } else if (OB_FAIL(ObExprHybridUniqueShardDoc::normalize_shard_doc(*allocator_,
+                         ObString(value->get_data_length(), value->get_data()), normalized))) {
+        LOG_WARN("failed to normalize __shard_doc", K(ret), K(i));
+      } else if (OB_FAIL(ObRawExprUtils::build_const_string_expr(*params_.expr_factory_,
+                         ObVarcharType, normalized, CS_TYPE_BINARY, constant))) {
+        LOG_WARN("failed to build __shard_doc constant", K(ret), K(i));
+      }
+    } else if (value->json_type() == ObJsonNodeType::J_NULL) {
+      // JSON null and SQL NULL share the same sort key and bare null cursor value.
+      ObObj null_value;
+      null_value.set_null();
+      if (OB_FAIL(ObRawExprUtils::build_const_obj_expr(*params_.expr_factory_, null_value, constant))) {
+        LOG_WARN("failed to build null search_after constant", K(ret), K(i));
+      }
+    } else if (type.is_json()) {
+      // Use the DSL JSON value directly: a string such as "10" remains a string.
+      if (OB_FAIL(build_json_sort_constant(*value, constant))) {
+        LOG_WARN("failed to build JSON search_after constant", K(ret), K(i));
+      }
+    } else if (value->json_type() == ObJsonNodeType::J_STRING) {
+      // Remove JSON quotes before the public CAST handles the target charset and type.
+      ObString text(value->get_data_length(), value->get_data());
+      ObCollationType source_collation = CS_TYPE_UTF8MB4_BIN;
+      ObString opaque_prefix;
+      if (type.get_type() == ObVarcharType && type.get_collation_type() == CS_TYPE_BINARY) {
+        opaque_prefix = ObString::make_string("base64:type15:");
+      } else if (type.get_type() == ObBitType) {
+        opaque_prefix = ObString::make_string("base64:type16:");
+      }
+      if (!opaque_prefix.empty() && text.prefix_match(opaque_prefix)) {
+        // JSON_ARRAY prints binary values with this prefix. Recover the original bytes
+        // only for the matching SQL type; ordinary text must keep its literal contents.
+        const ObString payload(text.length() - opaque_prefix.length(), text.ptr() + opaque_prefix.length());
+        const int64_t capacity = MAX(1, ObBase64Encoder::needed_decoded_length(payload.length()));
+        char *buffer = nullptr;
+        int64_t length = 0;
+        if (OB_ISNULL(buffer = static_cast<char *>(allocator_->alloc(capacity)))) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("failed to allocate binary search_after value", K(ret), K(capacity));
+        } else if (OB_FAIL(ObBase64Encoder::decode(payload.ptr(), payload.length(),
+                           reinterpret_cast<uint8_t *>(buffer), capacity, length))) {
+          LOG_WARN("failed to decode binary search_after value", K(ret), K(i));
+        } else {
+          text.assign_ptr(buffer, length);
+          source_collation = CS_TYPE_BINARY;
+        }
+      }
+      if (OB_SUCC(ret) && OB_FAIL(ObRawExprUtils::build_const_string_expr(*params_.expr_factory_,
+                           ObVarcharType, text, source_collation, constant))) {
+        LOG_WARN("failed to build string search_after constant", K(ret), K(i));
+      }
+    } else if (OB_FAIL(build_json_sort_constant(*value, constant))) {
+      LOG_WARN("failed to build search_after source constant", K(ret), K(i));
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(constant)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("search_after constant is missing", K(ret), K(i));
+      } else if (OB_FAIL(constant->formalize(session_info_))) {
+        LOG_WARN("failed to formalize search_after constant", K(ret), K(i));
+      } else if (OB_FAIL(ObRawExprUtils::create_cast_expr(*params_.expr_factory_, constant, type,
+                                                        typed, session_info_))) {
+        // Public CAST applies the sort type's accuracy, charset and session conversion rules.
+        LOG_WARN("failed to cast search_after value to sort type", K(ret), K(i), K(type));
+      } else if (OB_FAIL(info.search_after_values_.push_back(typed))) {
+        LOG_WARN("failed to append search_after expression", K(ret), K(i));
+      }
+    }
+  }
+  return ret;
+}
 
 int ObDSLQueryInfo::deep_copy_sort_items(const ObDSLQueryInfo &src, ObIRawExprCopier &expr_copier)
 {
@@ -33,12 +511,15 @@ int ObDSLQueryInfo::deep_copy_sort_items(const ObDSLQueryInfo &src, ObIRawExprCo
     ObRawExpr *copied_missing_literal = nullptr;
     if (OB_FAIL(expr_copier.copy(src_sort_item.field_expr_, dst_sort_item.field_expr_))) {
       LOG_WARN("failed to copy sort field expr", K(ret), K(i));
+    } else if (OB_FAIL(expr_copier.copy(src_sort_item.output_expr_, dst_sort_item.output_expr_))) {
+      LOG_WARN("failed to copy sort output expr", K(ret), K(i));
     } else if (OB_FALSE_IT(dst_sort_item.is_asc_ = src_sort_item.is_asc_)) {
     } else if (OB_FALSE_IT(dst_sort_item.missing_mode_ = src_sort_item.missing_mode_)) {
     } else if (OB_FAIL(expr_copier.copy(static_cast<ObRawExpr *>(src_sort_item.missing_literal_), copied_missing_literal))) {
       LOG_WARN("failed to copy sort missing literal", K(ret), K(i));
     } else if (OB_FALSE_IT(dst_sort_item.missing_literal_ = static_cast<ObConstRawExpr *>(copied_missing_literal))) {
     } else if (OB_FALSE_IT(dst_sort_item.is_score_sort_ = src_sort_item.is_score_sort_)) {
+    } else if (OB_FALSE_IT(dst_sort_item.is_unique_shard_doc_ = src_sort_item.is_unique_shard_doc_)) {
     } else if (OB_FAIL(sort_items_.push_back(dst_sort_item))) {
       LOG_WARN("failed to push back sort item", K(ret), K(i));
     }
@@ -99,6 +580,68 @@ int ObDSLResolver::resolve_hybrid_search_pseudo_column_ref_expr(
   } else if (0 == q_name.col_name_.case_compare(OB_HYBRID_SEARCH_SCORE_COLUMN_NAME)) {
     if (OB_FAIL(resolve_hybrid_search_score_column_ref_expr(table_item, q_name, stmt, real_ref_expr))) {
       LOG_WARN("failed to resolve hybrid search score column", K(ret), K(q_name));
+    }
+  } else if (0 == q_name.col_name_.case_compare("__sort")) {
+    ObDSLQueryInfo *info = table_item.dsl_query_;
+    ObHybridSearchSortValuesRawExpr *output = nullptr;
+    if (OB_ISNULL(info) || OB_ISNULL(session_info) || !stmt.is_select_stmt()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid resolver context for hybrid sort output", K(ret), KP(info), KP(session_info),
+               K(stmt.is_select_stmt()));
+    } else if (!info->has_search_after() && !is_supported_search_after_query(*info)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("unsupported query for hybrid sort output", K(ret), K(info->queries_.count()));
+    } else {
+      ObSelectStmt &select_stmt = static_cast<ObSelectStmt &>(stmt);
+      // Projection only exposes the selected sort values; it does not introduce
+      // an implicit order. Paging without a business sort uses sort:["__shard_doc"].
+      if (!info->has_dsl_sort()) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "__sort requires an explicit sort");
+        LOG_WARN("hybrid sort output requires an explicit sort", K(ret), K(info->sort_items_.count()));
+      } else if (!select_stmt.has_distinct() && !info->has_literal_sort_missing()) {
+        if (OB_FAIL(append_shard_doc_sort_item_if_absent(*info, select_stmt, table_item, expr_factory, *session_info))) {
+          LOG_WARN("failed to append hybrid __shard_doc", K(ret));
+        }
+      }
+      if (OB_FAIL(ret)) {
+      } else if (OB_FAIL(expr_factory.create_raw_expr(T_FUN_SYS_HYBRID_SEARCH_SORT_VALUES, output))) {
+        LOG_WARN("failed to create __sort output expression", K(ret));
+      } else if (OB_FAIL(output->set_source_table(
+                     table_item.alias_name_.empty() ? table_item.get_object_db_name() : ObString(),
+                     table_item.get_object_name()))) {
+        LOG_WARN("failed to set __sort source table", K(ret), K(table_item.table_id_));
+      } else {
+        // ORDER BY price, __shard_doc -> hybrid_search_sort_values(price, shard_doc_expr).
+        // Row (price=10, __shard_doc="0000000000001b590000000000000067")
+        //   -> __sort=[10,"0000000000001b590000000000000067"], reusable as search_after.
+        output->set_func_name(ObString::make_string("hybrid_search_sort_values"));
+        const ObIArray<OrderItem> &order_items = select_stmt.get_order_items();
+        if (order_items.count() < info->sort_items_.count()) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("hybrid sort output has insufficient SQL order items", K(ret),
+                   K(order_items.count()), K(info->sort_items_.count()));
+        } else if (OB_FAIL(output->init_param_exprs(info->sort_items_.count()))) {
+          LOG_WARN("failed to initialize hybrid sort output arguments", K(ret), K(info->sort_items_.count()));
+        }
+        // Reserve one argument per output sort value before appending to the fixed-capacity array.
+        for (int64_t i = 0; OB_SUCC(ret) && i < info->sort_items_.count(); ++i) {
+          // A missing replacement affects ordering, while __sort preserves the normalized value.
+          ObRawExpr *output_expr = info->sort_items_.at(i).output_expr_;
+          if (OB_ISNULL(output_expr)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("hybrid sort output argument is null", K(ret), K(i));
+          } else if (OB_FAIL(output->add_param_expr(output_expr))) {
+            LOG_WARN("failed to append hybrid cursor output argument", K(ret), K(i));
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(output->formalize(session_info))) {
+          LOG_WARN("failed to formalize __sort output expression", K(ret), K(info->sort_items_.count()));
+        } else {
+          real_ref_expr = output;
+        }
+      }
     }
   } else if (OB_FAIL(resolve_hybrid_search_aggs_bucket_column_ref_expr(table_item, q_name, stmt,
                                                                        expr_factory, session_info, real_ref_expr))) {
@@ -356,6 +899,10 @@ int ObDSLQueryInfo::deep_copy(const ObDSLQueryInfo& src, ObIRawExprCopier &expr_
     LOG_WARN("failed to copy dsl exprs", K(ret));
   } else if (OB_FAIL(deep_copy_sort_items(src, expr_copier))) {
     LOG_WARN("failed to deep copy sort items", K(ret));
+  } else if (OB_FAIL(expr_copier.copy(src.search_after_values_, search_after_values_))) {
+    LOG_WARN("failed to copy hybrid cursor boundary", K(ret));
+  } else if (OB_FAIL(expr_copier.copy(src.sort_lookup_base_columns_, sort_lookup_base_columns_))) {
+    LOG_WARN("failed to copy hybrid sort base columns", K(ret));
   } else if (OB_FALSE_IT(rank_info_.method_ = src.rank_info_.method_)) {
   } else if (OB_FALSE_IT(rank_info_.has_rank_ = src.rank_info_.has_rank_)) {
   } else if (OB_FAIL(expr_copier.copy(src.rank_info_.window_size_, rank_info_.window_size_))) {
@@ -1916,6 +2463,12 @@ int ObDSLResolver::init_resolver()
   } else if (OB_ISNULL(table_schema_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("table_schema_ is null", K(ret));
+  } else if (OB_NOT_NULL(table_schema_->get_column_schema(ObString::make_string("__score")))
+             || OB_NOT_NULL(table_schema_->get_column_schema(ObString::make_string("__sort")))
+             || OB_NOT_NULL(table_schema_->get_column_schema(ObString::make_string("__shard_doc")))) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "hybrid_search with a physical cursor/score reserved column");
+    LOG_WARN("hybrid search table contains a reserved physical column", K(ret), K(table_schema_->get_table_id()));
   } else if (OB_ISNULL(stmt_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("stmt_ is null", K(ret));
@@ -2168,11 +2721,12 @@ int ObDSLResolver::resolve(const ParseNode &parse_tree)
   int ret = OB_SUCCESS;
   ObJsonNode *j_node = nullptr;
   ObIJsonBase *dsl_sort_node = nullptr;
+  ObIJsonBase *after_node = nullptr;
   const char *syntaxerr = nullptr;
   uint64_t err_offset = 0;
+  const uint32_t parse_flag = ObJsonParser::JSN_UNIQUE_FLAG;
   ObString req_str;
   ParseNode *raw_text = parse_tree.children_[0];
-  uint32_t parse_flag = ObJsonParser::JSN_UNIQUE_FLAG;
   if (OB_FAIL(init_resolver())) {
     LOG_WARN("fail to init resolver", K(ret));
   } else if (OB_FAIL(get_json_string_from_node(raw_text, req_str))) {
@@ -2213,6 +2767,8 @@ int ObDSLResolver::resolve(const ParseNode &parse_tree)
         // do nothing
       } else if (key.case_compare("sort") == 0) {
         dsl_sort_node = req_node;
+      } else if (key.case_compare("search_after") == 0) {
+        after_node = req_node;
       } else if (key.case_compare("collapse") == 0) {
         if (OB_FAIL(resolve_collapse(*req_node))) {
           LOG_WARN("fail to resolve collapse", K(ret), K(i));
@@ -2236,6 +2792,11 @@ int ObDSLResolver::resolve(const ParseNode &parse_tree)
       ret = OB_INVALID_ARGUMENT;
       LOG_USER_ERROR(OB_INVALID_ARGUMENT, "invalid search param, must contain at least one query");
       LOG_WARN("invalid search param, must contain at least one query", K(ret));
+    } else if (OB_ISNULL(after_node)
+               && static_cast<ObConstRawExpr *>(dsl_query_info_->from_)->get_value().get_int() < 0) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "from, from value should be a non-negative integer");
+      LOG_WARN("negative hybrid search offset without search_after", K(ret), KPC(dsl_query_info_->from_));
     }
   }
 
@@ -2248,6 +2809,8 @@ int ObDSLResolver::resolve(const ParseNode &parse_tree)
     LOG_WARN("fail to construct score columns", K(ret));
   } else if (OB_NOT_NULL(dsl_sort_node) && OB_FAIL(resolve_sort(*dsl_sort_node))) {
     LOG_WARN("fail to resolve dsl sort", K(ret));
+  } else if (OB_FAIL(finalize_sort_and_resolve_search_after(after_node))) {
+    LOG_WARN("failed to resolve hybrid cursor sort", K(ret));
   } else if (dsl_query_info_->has_dsl_collapse() && OB_FAIL(inject_collapse_stmt_rewrites())) {
     LOG_WARN("fail to inject collapse stmt rewrites", K(ret));
   } else if (dsl_query_info_->has_dsl_aggs() && OB_FAIL(inject_agg_stmt_rewrites())) {
@@ -2411,7 +2974,11 @@ int ObDSLResolver::resolve_sort_options(ObIJsonBase *field_opts, ObDSLSortItem &
         }
       } else if (key.case_compare("missing") == 0) {
         ObJsonNodeType json_type = val->json_type();
-        if (json_type == ObJsonNodeType::J_NULL) {
+        if (dsl_sort_item.is_unique_shard_doc_) {
+          ret = OB_INVALID_ARGUMENT;
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT, "missing is not valid for __shard_doc");
+          LOG_WARN("hybrid cursor identity does not accept a missing option", K(ret), K(i), K(json_type));
+        } else if (json_type == ObJsonNodeType::J_NULL) {
           // "missing": null means no special handling, skip
         } else if (json_type == ObJsonNodeType::J_STRING) {
           ObString missing_str = ObString(val->get_data_length(), val->get_data());
@@ -2550,7 +3117,9 @@ int ObDSLResolver::resolve_sort_missing_literal(ObIJsonBase &missing_node, ObDSL
 {
   int ret = OB_SUCCESS;
   dsl_sort_item.missing_literal_ = nullptr;
-  if (OB_ISNULL(dsl_sort_item.field_expr_)) {
+  const ObRawExprResType *sort_type = OB_ISNULL(dsl_sort_item.field_expr_)
+      ? nullptr : &dsl_sort_item.field_expr_->get_result_type();
+  if (OB_ISNULL(sort_type)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("sort field expr is null", K(ret));
   } else if (dsl_sort_item.is_score_sort_) {
@@ -2560,12 +3129,13 @@ int ObDSLResolver::resolve_sort_missing_literal(ObIJsonBase &missing_node, ObDSL
     } else {
       dsl_sort_item.missing_literal_ = static_cast<ObConstRawExpr *>(expr);
     }
-  } else if (!dsl_sort_item.field_expr_->is_column_ref_expr()) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("sort missing literal only supports user columns", K(ret));
+  } else if (sort_type->is_json()) {
+    if (OB_FAIL(build_json_sort_constant(missing_node, dsl_sort_item.missing_literal_))) {
+      LOG_WARN("failed to build hybrid JSON sort constant", K(ret));
+    }
   } else {
-    const ObColumnRefRawExpr *col_expr = static_cast<const ObColumnRefRawExpr *>(dsl_sort_item.field_expr_);
-    const ObObjType col_type = col_expr->get_result_type().get_type();
+    // Use the sort expression type, including COALESCE used for literal missing.
+    const ObObjType col_type = sort_type->get_type();
     const ObObjTypeClass tc = ob_obj_type_class(col_type);
     ObConstRawExpr *lit = nullptr;
     if (ObStringTC == tc) {
@@ -2659,14 +3229,64 @@ int ObDSLResolver::resolve_sort_field(ObString field_name,
                                       ObDSLSortItem &dsl_sort_item)
 {
   int ret = OB_SUCCESS;
+  bool is_json_path = false;
+  const char *dot_pos = field_name.find('.');
+  if (OB_NOT_NULL(dot_pos) && dot_pos != field_name.ptr()) {
+    ObString base_name(dot_pos - field_name.ptr(), field_name.ptr());
+    ObColumnRefRawExpr *base_expr = nullptr;
+    bool exists = false;
+    // Prefer a JSON base column; otherwise resolve the complete name as an ordinary column.
+    if (OB_FAIL(has_user_column_name(base_name, exists, &base_expr))) {
+      LOG_WARN("failed to lookup sort base column", K(ret), K(base_name));
+    } else if (exists) {
+      is_json_path = base_expr->get_result_type().is_json();
+    }
+  }
   dsl_sort_item.is_score_sort_ = (0 == field_name.case_compare(OB_HYBRID_SEARCH_SCORE_COLUMN_NAME));
   dsl_sort_item.is_asc_ = !dsl_sort_item.is_score_sort_;
-  if (dsl_sort_item.is_score_sort_) {
+  if (OB_FAIL(ret)) {
+  } else if (field_name.case_compare("__sort") == 0) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT, "__sort is an output column, not a sort field");
+    LOG_WARN("hybrid sort output cannot be used as a sort field", K(ret));
+  } else if (field_name.case_compare("__shard_doc") == 0) {
+    dsl_sort_item.is_unique_shard_doc_ = true;
+    if (OB_FAIL(build_unique_shard_doc_expr(dsl_sort_item.field_expr_))) {
+      LOG_WARN("failed to build hybrid __shard_doc expression", K(ret));
+    }
+  } else if (dsl_sort_item.is_score_sort_) {
     if (dsl_query_info_->score_cols_.empty()) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("score columns not available for __score sort", K(ret));
     } else {
       dsl_sort_item.field_expr_ = dsl_query_info_->score_cols_.at(dsl_query_info_->score_cols_.count() - 1);
+    }
+  } else if (is_json_path) {
+    ObColumnRefRawExpr *base = nullptr;
+    ObString path;
+    ObRawExpr *extract = nullptr;
+    if (OB_FAIL(get_field_expr_and_path(field_name, base, path))) {
+      LOG_WARN("failed to resolve hybrid sort JSON field and path", K(ret));
+    } else {
+      ObJsonPath parsed(path, allocator_);
+      parsed.is_mysql_ = true;
+      if (OB_FAIL(parsed.parse_path())) {
+        LOG_WARN("failed to parse hybrid sort JSON path", K(ret), K(path.length()));
+      } else if (parsed.can_match_many()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "multi-value JSON sort path");
+        LOG_WARN("multi-value JSON path is not supported for hybrid sorting", K(ret), K(path.length()));
+      } else if (OB_FAIL(build_json_extract_expr(base, path, extract))) {
+        LOG_WARN("failed to build hybrid sort JSON extraction expression", K(ret));
+      } else if (OB_FAIL(extract->formalize(session_info_))) {
+        LOG_WARN("failed to formalize hybrid sort JSON extraction expression", K(ret));
+      } else if (OB_FAIL(add_var_to_array_no_dup(dsl_query_info_->sort_lookup_base_columns_,
+                                                static_cast<ObRawExpr *>(base)))) {
+        LOG_WARN("failed to register JSON sort base column", K(ret), KP(base));
+      } else {
+        // add_sort_order_item normalizes the extracted JSON value before applying missing.
+        dsl_sort_item.field_expr_ = extract;
+      }
     }
   } else {
     ObColumnRefRawExpr *col_expr = nullptr;
@@ -2679,7 +3299,6 @@ int ObDSLResolver::resolve_sort_field(ObString field_name,
       LOG_WARN("fail to resolve sort field", K(ret), K(field_name));
     } else if (validate_sort_type
                && (col_expr->get_result_type().is_lob()
-                   || col_expr->get_result_type().is_json()
                    || col_expr->get_result_type().is_geometry()
                    || col_expr->get_result_type().is_roaringbitmap()
                    || col_expr->get_result_type().is_collection_sql_type()
@@ -2699,20 +3318,61 @@ int ObDSLResolver::resolve_sort_field(ObString field_name,
         LOG_WARN("sort on domain index column not supported", K(ret), K(field_name));
       } else if (validate_sort_type
                  && (col_expr->get_result_type().is_lob()
-                     || col_expr->get_result_type().is_json()
                      || col_expr->get_result_type().is_geometry())) {
         ret = OB_NOT_SUPPORTED;
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "sort by text/json/geometry column type");
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "sort by text/geometry column type");
         LOG_WARN("unsupported sort column type", K(ret), K(field_name));
       } else {
-        dsl_sort_item.field_expr_ = col_expr;
+        // Register the JSON column needed to evaluate the sort expression after lookup.
+        if (validate_sort_type && col_expr->get_result_type().is_json()
+            && OB_FAIL(add_var_to_array_no_dup(dsl_query_info_->sort_lookup_base_columns_,
+                                               static_cast<ObRawExpr *>(col_expr)))) {
+          LOG_WARN("failed to register JSON column for hybrid sort options", K(ret), KP(col_expr));
+        } else {
+          dsl_sort_item.field_expr_ = col_expr;
+        }
       }
     }
   }
   return ret;
 }
 
-int ObDSLResolver::add_sort_order_item(ObSelectStmt &select_stmt, const ObDSLSortItem &dsl_sort_item)
+int ObDSLResolver::normalize_json_sort_expr(ObRawExpr *&expr)
+{
+  int ret = OB_SUCCESS;
+  ObRawExprFactory &factory = *params_.expr_factory_;
+  ObConstRawExpr *null_text = nullptr;
+  ObSysFunRawExpr *json_null = nullptr;
+  ObSysFunRawExpr *normalized = nullptr;
+  if (OB_ISNULL(expr) || !expr->get_result_type().is_json()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid JSON sort expression", K(ret), KP(expr));
+  } else if (OB_FAIL(ObRawExprUtils::build_const_string_expr(factory, ObVarcharType,
+                         ObString::make_string("null"), CS_TYPE_UTF8MB4_BIN, null_text))) {
+    LOG_WARN("failed to build JSON null text", K(ret));
+  } else if (OB_FAIL(null_text->formalize(session_info_))) {
+    LOG_WARN("failed to formalize JSON null text", K(ret));
+  } else if (OB_FAIL(ObRawExprUtils::create_cast_expr(factory, null_text,
+                         expr->get_result_type(), json_null, session_info_))) {
+    LOG_WARN("failed to cast JSON null", K(ret));
+  } else if (OB_FAIL(json_null->clear_flag(IS_INNER_ADDED_EXPR))) {
+    // Keep CAST('null' AS JSON) when CTAS prints and resolves the sort expression again.
+    LOG_WARN("failed to preserve explicit JSON null cast", K(ret));
+  } else if (OB_FAIL(factory.create_raw_expr(T_FUN_SYS_NULLIF, normalized))) {
+    LOG_WARN("failed to create JSON sort normalization", K(ret));
+  } else if (OB_FALSE_IT(normalized->set_func_name(N_NULLIF))) {
+  } else if (OB_FAIL(normalized->set_param_exprs(expr, json_null))) {
+    LOG_WARN("failed to set JSON sort normalization arguments", K(ret));
+  } else if (OB_FAIL(normalized->formalize(session_info_))) {
+    LOG_WARN("failed to formalize JSON sort normalization", K(ret));
+  } else {
+    // Only a top-level JSON null becomes SQL NULL; other JSON values retain their types.
+    expr = normalized;
+  }
+  return ret;
+}
+
+int ObDSLResolver::add_sort_order_item(ObSelectStmt &select_stmt, ObDSLSortItem &dsl_sort_item)
 {
   int ret = OB_SUCCESS;
   ObRawExprFactory *expr_factory = params_.expr_factory_;
@@ -2720,15 +3380,22 @@ int ObDSLResolver::add_sort_order_item(ObSelectStmt &select_stmt, const ObDSLSor
   if (OB_ISNULL(sort_expr)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("sort expr is null", K(ret), K(dsl_sort_item));
-  } else if (dsl_sort_item.missing_mode_ == ObDSLSortItem::MissingMode::LITERAL
-             && !dsl_sort_item.is_score_sort_) {
+  } else if (sort_expr->get_result_type().is_json()
+             && OB_FAIL(normalize_json_sort_expr(sort_expr))) {
+    LOG_WARN("failed to normalize JSON sort expression", K(ret));
+  }
+  if (OB_SUCC(ret)) {
+    dsl_sort_item.output_expr_ = sort_expr;
+  }
+  if (OB_SUCC(ret) && dsl_sort_item.missing_mode_ == ObDSLSortItem::MissingMode::LITERAL
+      && !dsl_sort_item.is_score_sort_) {
     ObSysFunRawExpr *coalesce_expr = nullptr;
     if (OB_ISNULL(dsl_sort_item.missing_literal_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("missing literal is null", K(ret), K(dsl_sort_item));
     } else if (OB_FAIL(expr_factory->create_raw_expr(T_FUN_SYS_COALESCE, coalesce_expr))) {
       LOG_WARN("fail to create coalesce expr", K(ret));
-    } else if (OB_FAIL(coalesce_expr->set_param_exprs(dsl_sort_item.field_expr_,
+    } else if (OB_FAIL(coalesce_expr->set_param_exprs(sort_expr,
                                                       static_cast<ObRawExpr *>(dsl_sort_item.missing_literal_)))) {
       LOG_WARN("fail to set coalesce params", K(ret));
     } else {
@@ -2738,6 +3405,8 @@ int ObDSLResolver::add_sort_order_item(ObSelectStmt &select_stmt, const ObDSLSor
   }
   if (OB_SUCC(ret)) {
     ObOrderDirection direction = NULLS_LAST_ASC;
+    // SQL sorting and after comparisons use the same effective key.
+    dsl_sort_item.field_expr_ = sort_expr;
     if (dsl_sort_item.missing_mode_ == ObDSLSortItem::MissingMode::FIRST) {
       direction = dsl_sort_item.is_asc_ ? NULLS_FIRST_ASC : NULLS_FIRST_DESC;
     } else {
@@ -3879,11 +4548,13 @@ int ObDSLResolver::resolve_default_params(ObIJsonBase &req_node)
       }
     }
     if (OB_SUCC(ret)) {
-      if (size_value + from_value > SIZE_VALUE_MAX) {
+      // search_after accepts -1 as an unset offset; resolve() rejects it without a cursor.
+      const int64_t effective_offset = MAX(from_value, 0);
+      if (size_value + effective_offset > SIZE_VALUE_MAX) {
         ret = OB_INVALID_CONFIG;
         LOG_USER_ERROR(OB_INVALID_CONFIG,
                         "hybrid search DSL: from + size must be in range [0, 10000]");
-        LOG_WARN("from+size out of range", K(ret), K(from_value), K(size_value), K(from_value + size_value));
+        LOG_WARN("from+size out of range", K(ret), K(from_value), K(size_value), K(effective_offset));
       }
     }
   }
@@ -3954,10 +4625,10 @@ int ObDSLResolver::resolve_from(ObIJsonBase &req_node)
     ObConstRawExpr *from_const = static_cast<ObConstRawExpr *>(from_expr);
     if (OB_FAIL(from_const->get_value().get_int(from_value))) {
       LOG_WARN("fail to get int value from from expr", K(ret));
-    } else if (from_value < 0) {
+    } else if (from_value < -1) {
       ret = OB_INVALID_ARGUMENT;
-      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "from, from value should be a non-negative integer");
-      LOG_WARN("from value should be a non-negative integer", K(ret), K(from_value));
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "from, expected -1 or a non-negative integer");
+      LOG_WARN("from value is below the unset-offset sentinel", K(ret), K(from_value));
     } else if (from_value > SIZE_VALUE_MAX) {
       ret = OB_INVALID_CONFIG;
       LOG_USER_ERROR(OB_INVALID_CONFIG,
@@ -6290,10 +6961,14 @@ int ObDSLResolver::set_default_rank_window_size()
     LOG_WARN("failed to get size const value", K(ret));
   } else if (OB_FAIL(static_cast<ObConstRawExpr *>(dsl_query_info_->from_)->get_value().get_int(from_val))) {
     LOG_WARN("failed to get from const value", K(ret));
-  } else if (OB_FAIL(ObRawExprUtils::build_const_int_expr(*expr_factory, ObIntType, size_val + from_val, sum_expr))) {
-    LOG_WARN("failed to build size+from const expr", K(ret));
   } else {
-    dsl_query_info_->rank_info_.window_size_ = sum_expr;
+    // Do not subtract the unset-offset sentinel from the default window size.
+    const int64_t effective_offset = MAX(from_val, 0);
+    if (OB_FAIL(ObRawExprUtils::build_const_int_expr(*expr_factory, ObIntType, size_val + effective_offset, sum_expr))) {
+      LOG_WARN("failed to build default rank window size", K(ret), K(size_val), K(effective_offset));
+    } else {
+      dsl_query_info_->rank_info_.window_size_ = sum_expr;
+    }
   }
   return ret;
 }
@@ -7083,7 +7758,7 @@ int ObDSLResolver::check_hybrid_search_cardinality_agg(ObSelectStmt *select_stmt
   return ret;
 }
 
-int ObDSLResolver::check_hybrid_search_stmt(ObSelectStmt *select_stmt)
+int ObDSLResolver::check_hybrid_search_stmt(ObResolverParams &params, ObSelectStmt *select_stmt)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(select_stmt)) {
@@ -7091,6 +7766,8 @@ int ObDSLResolver::check_hybrid_search_stmt(ObSelectStmt *select_stmt)
     LOG_WARN("get unexpected null", K(ret));
   } else if (!select_stmt->is_hybrid_search()) {
     // do nothing
+  } else if (OB_FAIL(check_hybrid_sort_support(params, select_stmt))) {
+    LOG_WARN("failed to check search_after support", K(ret));
   } else if (OB_FAIL(refresh_result_modes(select_stmt))) {
     LOG_WARN("failed to refresh hybrid search result modes", K(ret));
   } else if (OB_FAIL(check_hybrid_search_clause_compat(select_stmt))) {

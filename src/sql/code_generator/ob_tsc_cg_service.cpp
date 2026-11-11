@@ -1056,19 +1056,19 @@ int ObTscCgService::generate_tsc_filter(const ObLogTableScan &op, ObTableScanSpe
   if (OB_FAIL(ret)) {
   } else if (op.is_hybrid_search()) {
     const bool is_dsl_query = is_dsl_query_path(op.get_access_path());
+    const ObIArray<ObRawExpr *> &filter_exprs = op.get_filter_exprs();
     ObDASBaseCtDef *attach_ctdef = spec.tsc_ctdef_.attach_spec_.attach_ctdef_;
     if (OB_ISNULL(attach_ctdef)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected nullptr attach ctdef", K(ret));
     } else if (is_dsl_query) {
-      if (!op.get_filter_exprs().empty()) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("dsl query should not have additional filters", K(ret), K(op.get_ref_table_id()));
+      if (OB_FAIL(ObHybridSearchCgService::extract_dsl_nonpushdown_filters(op, nonpushdown_filters))) {
+        LOG_WARN("failed to extract DSL filters after lookup", K(ret), K(op.get_ref_table_id()));
       }
     } else if (ObDASOpType::DAS_OP_INDEX_PROJ_LOOKUP == attach_ctdef->op_type_) {
       ret = OB_INVALID_ARGUMENT;
       LOG_WARN("invalid index proj lookup ctdef in hybrid search with SQL query", K(ret));
-    } else if (OB_FAIL(op.extract_nonpushdown_filters(op.get_filter_exprs(), nonpushdown_filters, lookup_pushdown_filters))) {
+    } else if (OB_FAIL(op.extract_nonpushdown_filters(filter_exprs, nonpushdown_filters, lookup_pushdown_filters))) {
       LOG_WARN("failed to extract non pushdown filters", K(ret));
     } else {
       // Only prepare nonpushdown filters for SQL query, lookup pushdown filters are handled in @generate_main_scan_ctdef.
@@ -1272,7 +1272,10 @@ int ObTscCgService::generate_tsc_filter(const ObLogTableScan &op, ObTableScanSpe
       LOG_WARN("failed to assign nonpushdown filters", K(ret));
     } else if (OB_FAIL(filter_out_match_exprs(filters_without_match))) {
       LOG_WARN("failed to filter out match exprs", K(ret));
-    } else if (OB_FAIL(ObRawExprUtils::extract_column_exprs(filters_without_match, filter_column_raw_exprs))) {
+    } else if (OB_FAIL(op.is_hybrid_search()
+        ? ObHybridSearchCgService::extract_filter_input_exprs(
+            op, filters_without_match, filter_column_raw_exprs)
+        : ObRawExprUtils::extract_column_exprs(filters_without_match, filter_column_raw_exprs))) {
       LOG_WARN("failed to extract column exprs from nonpushdown filters", K(ret));
     } else if (OB_FAIL(cg_.generate_rt_exprs(filter_column_raw_exprs, filter_column_exprs))) {
       LOG_WARN("failed to generate rt exprs", K(ret));

@@ -1380,7 +1380,11 @@ int ObSelectResolver::resolve_normal_query(const ParseNode &parse_tree)
 
   if (OB_SUCC(ret) && has_top_limit_) {
     has_top_limit_ = false;
-    select_stmt->set_has_top_limit(NULL != parse_tree.children_[PARSE_SELECT_LIMIT]);
+    // A hybrid-search DSL size may already have supplied this query's LIMIT without a SQL LIMIT node.
+    // Mark it here too, so SQL_CALC_FOUND_ROWS reports all matches before that limit. The outer guard
+    // keeps a derived table's DSL limit from overwriting the outer query's FOUND_ROWS count.
+    select_stmt->set_has_top_limit(NULL != parse_tree.children_[PARSE_SELECT_LIMIT]
+        || (select_stmt->is_hybrid_search() && select_stmt->has_limit()));
   }
 
   //bug:
@@ -1498,7 +1502,8 @@ int ObSelectResolver::resolve_normal_query(const ParseNode &parse_tree)
   if (OB_SUCC(ret)) {
     if (OB_FAIL(check_audit_log_stmt(select_stmt))) {
       LOG_WARN("failed to check audit log stmt");
-    } else if (select_stmt->is_hybrid_search() && OB_FAIL(ObDSLResolver::check_hybrid_search_stmt(select_stmt))) {
+    } else if (select_stmt->is_hybrid_search()
+               && OB_FAIL(ObDSLResolver::check_hybrid_search_stmt(params_, select_stmt))) {
       LOG_WARN("failed to check hybrid search dsl stmt", K(ret));
     }
   }

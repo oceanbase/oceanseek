@@ -17,6 +17,7 @@ target_sources(test_ai_decision_utils PRIVATE test_ai_decide_vector.cpp ../basic
 ob_unittest(ob_expr_ai_prompt_test)
 ob_unittest(test_expr_vec_ivf_center_id_deferred)
 sql_unittest(test_expr_serialize_compat)
+sql_unittest(test_hybrid_search_cursor_expr)
 sql_unittest(ob_expr_extract_fast_path_test)
 sql_unittest(test_expr_trim_avx)
 sql_unittest(test_expr_trim_neon)

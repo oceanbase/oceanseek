@@ -286,6 +286,15 @@ int ObDASSearchDriverIter::project_rowid_and_score_to_expr(
       } else if (OB_NOT_NULL(score_vec)) {
         score_vec->set_double(i, scores_.at(idx));
       }
+      if (OB_SUCC(ret) && search_ctx_->has_shard_doc()) {
+        if (search_ctx_->get_rowid_type() != DAS_ROWID_TYPE_UINT64) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unsupported hybrid search rowid type for __shard_doc", K(ret), K(i), K(count),
+                   "rowid_type", search_ctx_->get_rowid_type());
+        } else if (OB_FAIL(search_ctx_->project_shard_doc(row_ids_.at(idx).get_uint64(), i, count))) {
+          LOG_WARN("failed to project hybrid search __shard_doc", K(ret), K(i), K(count));
+        }
+      }
     }
     if (FAILEDx(set_rowid_and_score_evaluated_projected())) {
       LOG_WARN("failed to set rowid and score evaluated projected", K(ret));
@@ -376,6 +385,9 @@ int ObDASSearchDriverIter::init_search_type()
     search_type_ = DAS_SEARCH_TYPE_POST_FILTER;
   } else if (ObVecFilterMode::VEC_FILTER_MODE_EXPR_FILTER == vec_filter_mode_) {
     search_type_ = DAS_SEARCH_TYPE_EXPR_FILTER;
+  } else if (search_ctx_->has_search_after()) {
+    // SQL needs every matching document before applying the previous page's boundary.
+    search_type_ = DAS_SEARCH_TYPE_COMPLETE_DOCS;
   } else if (OB_NOT_NULL(score_expr_) && top_k_limit_param_.is_valid()) {
     search_type_ = DAS_SEARCH_TYPE_TOP_SCORES;
   } else if (top_k_limit_param_.is_valid()) {

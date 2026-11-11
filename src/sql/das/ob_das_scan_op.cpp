@@ -914,6 +914,7 @@ int ObDASScanOp::create_das_search_context()
     fusion_ctdef->result_output_,
     true /* use dynamic pruning */))) {
     LOG_WARN("failed to init search ctx", K(ret));
+  } else if (FALSE_IT(search_ctx->set_fusion_ctdef(fusion_ctdef))) {
   } else if (fusion_ctdef->has_nested_paths() &&
              OB_FAIL(search_ctx->register_nested_scope(&fusion_ctdef->nested_rowid_exprs_))) {
     LOG_WARN("failed to register nested scope", K(ret));

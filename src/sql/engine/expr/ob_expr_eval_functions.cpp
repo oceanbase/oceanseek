@@ -497,6 +497,7 @@
 #include "ob_expr_get_routine_param_type_str.h"
 #include "ob_expr_image_type.h"
 #include "ob_expr_dsl_multi_value_range.h"
+#include "ob_expr_hybrid_search_sort.h"
 
 namespace oceanbase
 {
@@ -1530,8 +1531,9 @@ ObExprRandCanonical::calc_random_expr_canonical,                    /* 890 */
   ObExprResultScan::eval_result_scan,                                 /* 929 */
   ObExprAIDecide::eval_ai_decide,                                     /* 930 */
   NULL, // ObExprDslParamValue::eval_value,                            /* 931 */
+  ObExprHybridUniqueShardDoc::eval_unique_shard_doc,                  /* 932 */
+  ObExprHybridSearchSortValues::eval_sort_values,                     /* 933 */
 };
-
 static ObExpr::EvalBatchFunc g_expr_eval_batch_functions[] = {
   expr_default_eval_batch_func,                                       /* 0 */
   ObExprUtil::eval_batch_stack_overflow_check,                        /* 1 */

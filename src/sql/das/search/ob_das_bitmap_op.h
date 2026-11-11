@@ -254,7 +254,7 @@ public:
   OB_INLINE bool can_copy_filter_words() const
   { return !is_scoring_ && DAS_ROWID_TYPE_UINT64 == get_rowid_type()
         && (is_filter_bitmap_view() || bitmap_built_); }
-  // Fast path for BMM filter windows. It copies ready bitmap words directly
+  // Fast path for BMM filter windows. It copies provider bitmap words directly
   // into the BMM-local bitset and advances curr_id to the first hit after
   // batch_end_id, avoiding Bitmap -> RowID -> Bitmap conversion.
   int drain_into_filter_bitset(

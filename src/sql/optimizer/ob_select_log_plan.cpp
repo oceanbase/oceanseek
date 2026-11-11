@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL_OPT
 #include "ob_select_log_plan.h"
+#include "sql/hybrid_search/ob_hybrid_search_node.h"
 #include "sql/rewrite/ob_transform_utils.h"
 #include "sql/optimizer/ob_log_table_scan.h"
 #include "sql/optimizer/ob_log_join.h"
@@ -5941,6 +5942,118 @@ int ObSelectLogPlan::generate_raw_plan_for_plain_select()
   return ret;
 }
 
+/** @brief Attach hybrid sort lookup columns and the SQL search_after filter to one scan. */
+static int prepare_hybrid_sort_scan(ObLogTableScan &scan)
+{
+  int ret = OB_SUCCESS;
+  ObFusionNode *node = scan.get_hybrid_sort_node();
+  const ObDMLStmt *dml_stmt = scan.get_stmt();
+  const TableItem *table = dml_stmt->get_table_item_by_id(scan.get_table_id());
+  if (OB_ISNULL(node) || OB_ISNULL(table) || !table->is_hybrid_search_table()
+      || node->sort_items_.empty()) {
+    // This scan has no hybrid sort to prepare.
+  } else {
+    const ObSelectStmt &stmt = *static_cast<const ObSelectStmt *>(dml_stmt);
+    ObOptimizerContext &opt_ctx = scan.get_plan()->get_optimizer_context();
+    ObRawExpr *after_filter = nullptr;
+    if (OB_FAIL(node->prepare_sort_after(stmt, *table->dsl_query_, opt_ctx.get_expr_factory(),
+                                       *opt_ctx.get_session_info(), after_filter))) {
+      LOG_WARN("failed to prepare hybrid sort and search_after", K(ret));
+    } else if (OB_FAIL(append_array_no_dup(scan.get_access_exprs(), node->sort_lookup_access_exprs_))) {
+      LOG_WARN("failed to append hybrid sort lookup columns", K(ret));
+    } else if (OB_NOT_NULL(after_filter)) {
+      if (OB_FAIL(scan.get_filter_exprs().push_back(after_filter))) {
+        LOG_WARN("failed to append search_after filter", K(ret));
+      } else if (OB_FAIL(scan.get_filter_before_index_flags().push_back(false))) {
+        LOG_WARN("failed to mark search_after filter for evaluation after lookup", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
+/**
+ * @brief Prepare sort and search_after for hybrid scans in this plan.
+ * @return OB_NOT_SUPPORTED if this plan cannot execute the requested sort or search_after.
+ */
+static int prepare_hybrid_sort_tree(ObLogicalOperator *op)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(op)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null plan node while preparing hybrid sort", K(ret));
+  } else if (op->get_type() == log_op_def::LOG_TABLE_SCAN) {
+    ObLogTableScan *scan = static_cast<ObLogTableScan *>(op);
+    if (scan->is_hybrid_search() && OB_FAIL(prepare_hybrid_sort_scan(*scan))) {
+      if (ret == OB_NOT_SUPPORTED) {
+        LOG_DEBUG("hybrid cursor scan path is not supported", K(ret));
+      } else {
+        LOG_WARN("failed to prepare hybrid sort and search_after", K(ret), K(scan->get_table_id()));
+      }
+    }
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < op->get_num_of_child(); ++i) {
+      if (OB_FAIL(SMART_CALL(prepare_hybrid_sort_tree(op->get_child(i))))) {
+        if (ret == OB_NOT_SUPPORTED) {
+          LOG_DEBUG("hybrid cursor child path is not supported", K(ret), K(i));
+        } else {
+          LOG_WARN("failed to prepare hybrid sort execution tree", K(ret), K(i));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSelectLogPlan::candi_prepare_hybrid_sort()
+{
+  int ret = OB_SUCCESS;
+  const ObSelectStmt *select_stmt = get_stmt();
+  bool has_dsl_sort = false;
+  if (OB_ISNULL(select_stmt)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null statement", K(ret));
+  } else if (select_stmt->is_hybrid_search()) {
+    // Only prepare candidates when this query block has DSL sort.
+    for (int64_t i = 0; OB_SUCC(ret) && !has_dsl_sort && i < select_stmt->get_table_size(); ++i) {
+      const TableItem *table = select_stmt->get_table_item(i);
+      if (OB_ISNULL(table)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get unexpected null table item", K(ret), K(i));
+      } else if (table->is_hybrid_search_table()) {
+        has_dsl_sort = table->dsl_query_->has_dsl_sort();
+      }
+    }
+  }
+  if (OB_SUCC(ret) && has_dsl_sort) {
+    // Prepare sort/search_after and discard unsupported candidate plans.
+    ObSEArray<CandidatePlan, 4> supported;
+    for (int64_t i = 0; OB_SUCC(ret) && i < candidates_.candidate_plans_.count(); ++i) {
+      CandidatePlan &candidate = candidates_.candidate_plans_.at(i);
+      if (OB_FAIL(prepare_hybrid_sort_tree(candidate.plan_tree_))) {
+        if (ret == OB_NOT_SUPPORTED) {
+          LOG_DEBUG("skip unsupported hybrid cursor candidate", K(ret), K(i));
+          ret = OB_SUCCESS;
+        } else {
+          LOG_WARN("failed to prepare hybrid sort candidate", K(ret), K(i));
+        }
+      } else if (OB_FAIL(supported.push_back(candidate))) {
+        LOG_WARN("failed to append supported hybrid sort candidate", K(ret), K(i));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (supported.empty()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "hybrid cursor on the available query paths");
+      LOG_WARN("no candidate plan supports the hybrid cursor request", K(ret),
+               K(candidates_.candidate_plans_.count()));
+    } else if (OB_FAIL(init_candidate_plans(supported))) {
+      LOG_WARN("failed to initialize supported hybrid sort plans", K(ret));
+    }
+  }
+  return ret;
+}
+
 int ObSelectLogPlan::allocate_plan_top()
 {
   int ret = OB_SUCCESS;
@@ -5969,6 +6082,8 @@ int ObSelectLogPlan::allocate_plan_top()
     if (OB_SUCC(ret) && optimizer_context_.get_query_ctx()->has_hybrid_search()) {
       if (OB_FAIL(candi_allocate_hybrid_fusion())) {
         LOG_WARN("failed to allocate hybrid fusion operator", K(ret));
+      } else if (OB_FAIL(candi_prepare_hybrid_sort())) {
+        LOG_WARN("failed to prepare hybrid sort candidate plans", K(ret));
       } else {
         LOG_TRACE("succeed to allocate hybrid fusion operator",
             K(candidates_.candidate_plans_.count()));

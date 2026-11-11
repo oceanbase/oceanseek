@@ -4883,7 +4883,14 @@ int ObDASIterUtils::create_search_driver_iter(common::ObIAllocator &alloc,
     search_ctx->reset();
     LOG_WARN("failed to generate search operator", K(ret));
   } else {
-    ObDASSearchDriverIterParam param(*search_ctx, op, top_k_limit_param, score_expr, vec_filter_mode);
+    ObLimitParam effective_limit = top_k_limit_param;
+    // SQL applies search_after after main-table lookup. Do not truncate matching rows before
+    // that filter, since the rows following the previous page may lie beyond a score-based prefix.
+    if (vec_filter_mode == ObVecFilterMode::VEC_FILTER_MODE_INVALID && search_ctx->has_search_after()) {
+      effective_limit.limit_ = -1;
+      effective_limit.offset_ = 0;
+    }
+    ObDASSearchDriverIterParam param(*search_ctx, op, effective_limit, score_expr, vec_filter_mode);
     if (OB_FAIL(create_das_iter(alloc, param, iter))) {
       LOG_WARN("failed to create search iter", K(ret));
     } else {

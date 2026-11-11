@@ -101,6 +101,16 @@ public:
                                   ObDASBaseCtDef &search_ctdef,
                                   ObDASBaseCtDef *&root_ctdef);
   int generate_main_scan_ctdef(ObLogTableScan &op, ObDASScanCtDef *&main_scan_ctdef);
+  /** @brief Carry __shard_doc and the search_after flag through DAS lookup. */
+  int generate_search_after_ctdef(const ObFusionNode &node, ObDASFusionCtDef &fusion);
+  /** @brief Return DSL search_after filters for evaluation after lookup. */
+  static int extract_dsl_nonpushdown_filters(const ObLogTableScan &op,
+                                             ObIArray<ObRawExpr *> &filters);
+  /** @brief Collect filter inputs, treating DAS-produced __shard_doc as one value. */
+  static int extract_filter_input_exprs(const ObLogTableScan &op,
+                                        const ObIArray<ObRawExpr *> &filters,
+                                        ObIArray<ObRawExpr *> &inputs);
+  /** @brief Prepare lookup columns and keep search_after filtering above lookup. */
   int prepare_main_scan_access_ctdef(ObLogTableScan &op,
                                      ObDASScanCtDef &scan_ctdef,
                                      ObIArray<ObRawExpr *> &non_pushdown_filters,

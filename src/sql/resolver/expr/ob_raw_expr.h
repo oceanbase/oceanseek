@@ -4240,6 +4240,30 @@ inline const common::ObString &ObSysFunRawExpr::get_func_name() const
   return func_name_;
 }
 
+/** @brief Sort-value expression retaining its source qualifier for SQL reconstruction. */
+class ObHybridSearchSortValuesRawExpr : public ObSysFunRawExpr
+{
+public:
+  ObHybridSearchSortValuesRawExpr(common::ObIAllocator &alloc)
+      : ObSysFunRawExpr(alloc), source_database_name_(), source_table_name_() {}
+  ObHybridSearchSortValuesRawExpr()
+      : ObSysFunRawExpr(), source_database_name_(), source_table_name_() {}
+  virtual ~ObHybridSearchSortValuesRawExpr() = default;
+  int assign(const ObRawExpr &other) override;
+  int inner_deep_copy(ObIRawExprCopier &copier) override;
+  void reset() override;
+  /** @brief Copy the resolved SQL qualifier; aliases have an empty database name. */
+  int set_source_table(const common::ObString &database_name, const common::ObString &table_name);
+  bool has_source_table() const { return !source_table_name_.empty(); }
+  const common::ObString &get_source_database_name() const { return source_database_name_; }
+  const common::ObString &get_source_table_name() const { return source_table_name_; }
+private:
+  // Printing metadata only; the inherited parameters supply the cursor's values.
+  common::ObString source_database_name_;
+  common::ObString source_table_name_;
+  DISALLOW_COPY_AND_ASSIGN(ObHybridSearchSortValuesRawExpr);
+};
+
 class ObSequenceRawExpr : public ObSysFunRawExpr
 {
 public:

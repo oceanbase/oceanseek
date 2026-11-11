@@ -1009,6 +1009,8 @@ T_FUN_SYS_SEARCH_INDEX_INNER_PATH = 1943,
   T_FUN_SYS_EXTERNAL_LOB = 1962,
   T_FUN_SYS_LOB_META = 1963,
   T_FUN_SYS_DSL_PARAM_VALUE = 1964, // Reserved for hybrid search plan cache.
+  T_FUN_SYS_HYBRID_UNIQUE_SHARD_DOC = 1965, // For hybrid search to build __shard_doc from the main table's tablet ID and __pk_increment.
+  T_FUN_SYS_HYBRID_SEARCH_SORT_VALUES = 1966, // For hybrid search to put this row's sort values into the __sort JSON array.
 
   ///< @note add new sys function type before this line
   T_FUN_SYS_END = 2000,
@@ -3118,6 +3120,7 @@ T_FUN_SYS_SEARCH_INDEX_INNER_PATH = 1943,
   T_SEARCH_INDEX_VALUE = 5010,
   T_SEARCH_INDEX_TYPE = 5011,
   T_SEARCH_INDEX_OPTION_LIST = 5012,
+  T_HYBRID_SEARCH_TABLET = 5013, // The main table's tablet ID, used for hybrid search to build __shard_doc.
 
   T_MAX //Attention: add a new type before T_MAX
 } ObItemType;

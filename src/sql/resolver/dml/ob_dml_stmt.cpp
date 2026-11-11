@@ -1039,6 +1039,15 @@ int ObDMLStmt::iterate_stmt_expr(ObStmtExprVisitor &visitor)
     } else { /*do nothing*/ }
   }
 
+  for (int64_t i = 0; OB_SUCC(ret) && i < table_items_.count(); ++i) {
+    TableItem *table = table_items_.at(i);
+    if (OB_NOT_NULL(table) && table->is_hybrid_search_table()) {
+      if (OB_FAIL(ObDSLResolver::iterate_sort_exprs(*table->dsl_query_, visitor))) {
+        LOG_WARN("failed to visit hybrid sort and search_after expressions", K(ret), K(i));
+      }
+    }
+  }
+
   for (int64_t i = 0; OB_SUCC(ret) && i < joined_tables_.count(); i++) {
     if (OB_FAIL(iterate_joined_table_expr(joined_tables_.at(i), visitor))) {
       LOG_WARN("failed to iterate joined table expr", K(ret));

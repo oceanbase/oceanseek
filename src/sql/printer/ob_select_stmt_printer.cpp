@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL
 #include "sql/printer/ob_select_stmt_printer.h"
+#include "sql/hybrid_search/ob_hybrid_search_dsl_resolver.h"
 namespace oceanbase
 {
 using namespace common;
@@ -207,6 +208,7 @@ int ObSelectStmtPrinter::print_recursive_union_stmt()
 int ObSelectStmtPrinter::print_basic_stmt()
 {
   int ret = OB_SUCCESS;
+  bool print_sql_limit = stmt_->is_hybrid_search() ? ObDSLResolver::should_print_sql_limit(*stmt_) : true;
   if (OB_ISNULL(stmt_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("stmt_ should not be NULL", K(ret));
@@ -228,7 +230,7 @@ int ObSelectStmtPrinter::print_basic_stmt()
     LOG_WARN("fail to print order by", K(ret), K(*stmt_));
   } else if (OB_FAIL(print_approx())) {
     LOG_WARN("fail to print order by", K(ret), K(*stmt_));
-  } else if (OB_FAIL(print_limit())) {
+  } else if (print_sql_limit && OB_FAIL(print_limit())) {
     LOG_WARN("fail to print limit", K(ret), K(*stmt_));
   } else if (OB_FAIL(print_vector_index_query_param())) {
     LOG_WARN("fail to print vector index query params", K(ret), K(*stmt_));
@@ -641,7 +643,9 @@ int ObSelectStmtPrinter::print_order_by()
     const ObSelectStmt *select_stmt = static_cast<const ObSelectStmt*>(stmt_);
     ObArenaAllocator alloc;
     ObConstRawExpr expr(alloc);
-    int64_t order_item_size = select_stmt->get_order_item_size();
+    bool print_order_items = !select_stmt->is_hybrid_search()
+        || ObDSLResolver::should_print_order_iterms(*select_stmt);
+    int64_t order_item_size = print_order_items ? select_stmt->get_order_item_size() : 0;
     if (order_item_size > 0) {
       if (select_stmt->is_order_siblings()) {
         DATA_PRINTF(" order siblings by");

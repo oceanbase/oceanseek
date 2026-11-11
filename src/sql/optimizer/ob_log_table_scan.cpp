@@ -433,6 +433,15 @@ int ObLogTableScan::allocate_expr_post(ObAllocExprContext &ctx)
     }
   }
 
+  // DAS supplies __shard_doc before rows from different tablets are combined.
+  const ObFusionNode *sort_node = nullptr;
+  ObRawExpr *shard_doc_expr = nullptr;
+  if (OB_SUCC(ret) && OB_NOT_NULL(sort_node = get_hybrid_sort_node())
+      && OB_NOT_NULL(shard_doc_expr = sort_node->get_shard_doc_expr())
+      && OB_FAIL(mark_expr_produced(shard_doc_expr, branch_id_, id_, ctx))) {
+    LOG_WARN("failed to mark hybrid __shard_doc as produced", K(ret));
+  }
+
   if (OB_SUCC(ret)) {
     // match against relevance expr will be calculated in storage
     ObSEArray<ObRawExpr *, 8> tmp_exprs;
@@ -1021,7 +1030,12 @@ int ObLogTableScan::has_nonpushdown_filter(bool &has_npd_filter)
   ObArray<ObRawExpr*> nonpushdown_filters;
   ObArray<ObRawExpr*> scan_pushdown_filters;
   ObArray<ObRawExpr*> lookup_pushdown_filters;
-  if (OB_FAIL(extract_pushdown_filters(nonpushdown_filters,
+  // search_after runs after lookup. Applying LIMIT first could leave a short page
+  // when this filter removes rows, so keep LIMIT above TableScan.
+  const ObFusionNode *sort_node = nullptr;
+  if (OB_NOT_NULL(sort_node = get_hybrid_sort_node()) && sort_node->has_after()) {
+    has_npd_filter = true;
+  } else if (OB_FAIL(extract_pushdown_filters(nonpushdown_filters,
                                        scan_pushdown_filters,
                                        lookup_pushdown_filters,
                                        nullptr /* ext_enable_late_materialization */,
@@ -3138,6 +3152,13 @@ int ObLogTableScan::inner_replace_op_exprs(ObRawExprReplacer &replacer)
   } else if (calc_part_id_expr_ != NULL &&
              OB_FAIL(replace_expr_action(replacer, calc_part_id_expr_))) {
     LOG_WARN("failed to replace calc part id expr", K(ret));
+  }
+  if (OB_SUCC(ret) && is_hybrid_search()) {
+    ObFusionNode *fusion = get_hybrid_sort_node();
+    if (OB_NOT_NULL(fusion) && !replacer.empty() && OB_FAIL(fusion->replace_sort_exprs(
+            replacer, get_plan()->get_optimizer_context().get_session_info()))) {
+      LOG_WARN("failed to replace hybrid sort expressions", K(ret));
+    }
   }
   return ret;
 }
@@ -7407,14 +7428,32 @@ int ObLogTableScan::add_rerank_field_access_expr()
   return ret;
 }
 
+ObFusionNode *ObLogTableScan::get_hybrid_sort_node() const
+{
+  ObFusionNode *node = nullptr;
+  if (is_hybrid_search() && OB_NOT_NULL(access_path_) && access_path_->is_index_merge_path()) {
+    const IndexMergePath *path = static_cast<const IndexMergePath *>(access_path_);
+    if (OB_NOT_NULL(path->root_) && path->root_->node_type_ == INDEX_MERGE_HYBRID_FUSION_SEARCH) {
+      node = static_cast<ObFusionNode *>(path->root_);
+    }
+  }
+  return node;
+}
+
 int ObLogTableScan::get_hybrid_search_exprs(ObIArray<ObRawExpr *> &all_exprs)
 {
   int ret = OB_SUCCESS;
+  const ObFusionNode *fusion = get_hybrid_sort_node();
+  // Register sort/search_after expressions and lookup columns for code generation.
   if (OB_FAIL(append_array_no_dup(all_exprs, hybrid_search_exprs_))) {
     LOG_WARN("failed to add param expr", K(ret));
   } else if (OB_FAIL(append_array_no_dup(all_exprs, hybrid_search_scores_))) {
     LOG_WARN("failed to add param expr", K(ret));
-  } 
+  } else if (OB_NOT_NULL(fusion)) {
+    if (OB_FAIL(fusion->collect_sort_calc_exprs(all_exprs))) {
+      LOG_WARN("failed to collect hybrid sort calculation expressions", K(ret));
+    }
+  }
 
   return ret;
 }

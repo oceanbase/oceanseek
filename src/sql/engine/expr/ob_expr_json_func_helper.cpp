@@ -908,7 +908,7 @@ void ObJsonExprHelper::get_accuracy_from_expr(const ObExpr &expr, ObAccuracy &ac
 }
 
 int ObJsonExprHelper::get_json_val(const ObExpr &expr, ObEvalCtx &ctx,
-                                   common::ObIAllocator *allocator, uint16_t index,
+                                   common::ObIAllocator *allocator, uint32_t index,
                                    ObIJsonBase*& j_base, bool to_bin, bool format_json,
                                    uint32_t parse_flag)
 {

@@ -18,7 +18,10 @@
 #define OBDEV_SRC_SQL_DAS_SEARCH_OB_DAS_SEARCH_DEFINE_H_
 
 #include <limits>
+#include "lib/container/ob_se_array.h"
+#include "share/datum/ob_datum.h"
 #include "sql/das/ob_das_attach_define.h"
+#include "sql/das/ob_das_scan_op.h"
 #include "share/hybrid_search/ob_query_parse.h"
 
 namespace oceanbase
@@ -417,11 +420,12 @@ private:
   bool allow_probe_;
 };
 
-/*
- * Support multi-path vector hybrid search, where all other non-vector queries will be
- * processed via a search operator tree. Fusion CtDef/RtDef is used to merge the results of these
- * query paths and perform reranking.
-*/
+/**
+ * @brief Defines Fusion across hybrid query paths and the ordering of its results.
+ *
+ * Non-vector queries are processed through search operator trees. Fusion combines their results with
+ * vector query paths and carries reranking, field-sort and pagination metadata to execution.
+ */
 struct ObDASFusionCtDef : ObDASAttachCtDef
 {
   OB_UNIS_VERSION(1);
@@ -457,6 +461,9 @@ public:
   {}
   ~ObDASFusionCtDef() {}
   INHERIT_TO_STRING_KV("ObDASFusionCtDef", ObDASAttachCtDef, K(search_index_), K(has_search_subquery_), K(has_vector_subquery_), K(rowid_exprs_), K(score_exprs_), K(rank_exprs_), K(weight_exprs_), KPC_(size_expr), KPC_(offset_expr), KPC_(rank_window_size_expr), KPC_(rank_constant_expr), KPC_(min_score_expr), K(fusion_method_), K(is_single_partition_));
+  // Remote search tasks need the expression and frame metadata to write __shard_doc.
+  bool has_expr() const override { return shard_doc_expr_ != nullptr; }
+  bool has_pdfilter_or_calc_expr() const override { return shard_doc_expr_ != nullptr; }
   
   int init(
     int64_t search_index,
@@ -500,7 +507,6 @@ public:
   OB_INLINE bool has_nested_paths() const { return has_nested_paths_; }
   OB_INLINE void set_has_nested_paths(bool v) { has_nested_paths_ = v; }
   OB_INLINE bool need_topk() const { return need_search_score() && nullptr != size_expr_ && nullptr != offset_expr_ && fusion_iter_exec_mode_ == ObFusionIterExecMode::SCORE_TOP_K_QUERY_HITS; }
-
   OB_INLINE int64_t get_search_idx() const { return search_index_; }
   OB_INLINE void set_search_index(int64_t index) { search_index_ = index; }
 
@@ -555,7 +561,6 @@ public:
     : ObDASAttachRtDef(DAS_OP_FUSION_QUERY)
   {}
   ~ObDASFusionRtDef() {}
-
   ObIDASSearchRtDef *get_search_rtdef()
   {
     ObIDASSearchRtDef *search_rtdef = nullptr;

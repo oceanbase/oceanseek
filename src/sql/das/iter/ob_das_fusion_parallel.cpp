@@ -854,6 +854,8 @@ int ObDASFusionTaskExecEnv::create_fusion_child_search_ctx(common::ObIAllocator 
       child_search_ctx->docid_range_lo_ = src_search_ctx_->docid_range_lo_;
       child_search_ctx->docid_range_hi_ = src_search_ctx_->docid_range_hi_;
       child_search_ctx->has_docid_range_ = src_search_ctx_->has_docid_range_;
+      // Each worker must preserve the SQL search_after requirement and project __shard_doc.
+      child_search_ctx->set_fusion_ctdef(fusion_ctdef_);
     }
   }
   return ret;

@@ -1680,6 +1680,12 @@ int ObDASFusionIter::set_rowkeys_batch_non_rich_format<uint64_t>(int64_t start_i
             } else {
               uint64_t rowkey_val = doc.get_uint64_rowkey();
               rowkey_datums[i].set_uint(rowkey_val);
+              // SQL pagination uses this matching row's physical key after main-table lookup.
+              if (search_ctx_ != nullptr && search_ctx_->has_shard_doc()) {
+                if (OB_FAIL(search_ctx_->project_shard_doc(rowkey_val, i, batch_size))) {
+                  LOG_WARN("failed to project hybrid search __shard_doc", K(ret));
+                }
+              }
             }
           }
         }
@@ -1782,6 +1788,12 @@ int ObDASFusionIter::set_rowkeys_batch_rich_format<uint64_t>(int64_t start_idx,
             } else {
               uint64_t rowkey_val = doc.get_uint64_rowkey();
               rowkey_vec->set_uint(i, rowkey_val);
+              // SQL pagination uses this matching row's physical key after main-table lookup.
+              if (search_ctx_ != nullptr && search_ctx_->has_shard_doc()) {
+                if (OB_FAIL(search_ctx_->project_shard_doc(rowkey_val, i, batch_size))) {
+                  LOG_WARN("failed to project hybrid search __shard_doc", K(ret));
+                }
+              }
             }
           }
         }
@@ -2002,6 +2014,9 @@ int ObDASFusionIter::set_rowkey_and_score_to_exprs(int64_t doc_idx)
         LOG_WARN("failed to set rowkey to exprs", K(ret));
       } else if (OB_FAIL(set_score_to_expr(doc))) {
         LOG_WARN("failed to set score to expr", K(ret));
+      } else if (search_ctx_ != nullptr && search_ctx_->has_shard_doc()
+                 && OB_FAIL(search_ctx_->project_shard_doc(doc.get_uint64_rowkey(), 0, 1))) {
+        LOG_WARN("failed to project hybrid search __shard_doc", K(ret));
       }
     } else {
       if (OB_FAIL(set_rowkey_to_exprs(doc.rowkey_union_.rowkey_, rowkey_exprs))) {
