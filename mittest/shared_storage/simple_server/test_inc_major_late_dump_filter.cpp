@@ -154,6 +154,12 @@ static int build_late_dump_sstable(ObArenaAllocator &allocator, const ObTabletID
 
 class TestIncMajorLateDumpFilter : public TestSharedMetaService
 {
+public:
+  // Keep a separate data directory when CTest runs these fixtures concurrently.
+  TestIncMajorLateDumpFilter()
+    : TestSharedMetaService("test_inc_major_late_dump_filter")
+  {}
+
 protected:
   void SetUp() override
   {
