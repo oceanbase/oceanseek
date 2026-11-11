@@ -34,7 +34,7 @@ TEST(TestObArchiveOverwrite, oss_push_log)
   ASSERT_EQ(OB_SUCCESS, ObDeviceManager::get_instance().init_devices_env());
   EXPECT_EQ(0, ObIOManager::get_instance().init(test_memory));
   char *data = (char*)ob_malloc(total_size, "ArchiveTest");
-  string path = "oss://antsys-oceanbasebackup/test_archive/test_archive_overwrite/" + to_string(rand_num) + "?host=cn-hangzhou-alipay-b.oss-cdn.aliyun-inc.com&access_id=LTAI4Fdwx9iFgZso4CqyHPs7&" + "access_" + "key=ER51kMn" + "lmu3zXwcxczJ" + "MbYzJIgrY9O";
+  string path = "oss://antsys-oceanbasebackup/test_archive/test_archive_overwrite/" + to_string(rand_num) + "?host=cn-hangzhou-alipay-b.oss-cdn.aliyun-inc.com";
 
   EXPECT_EQ(false, NULL == data);
 
