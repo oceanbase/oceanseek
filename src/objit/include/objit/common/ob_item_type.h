@@ -1008,6 +1008,7 @@ T_FUN_SYS_SEARCH_INDEX_INNER_PATH = 1943,
   T_FUN_SYS_DSL_MULTI_VALUE_RANGE = 1961,
   T_FUN_SYS_EXTERNAL_LOB = 1962,
   T_FUN_SYS_LOB_META = 1963,
+  T_FUN_SYS_DSL_PARAM_VALUE = 1964, // Reserved for hybrid search plan cache.
 
   ///< @note add new sys function type before this line
   T_FUN_SYS_END = 2000,

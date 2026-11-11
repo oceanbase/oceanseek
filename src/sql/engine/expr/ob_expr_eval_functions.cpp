@@ -1528,6 +1528,7 @@ ObExprRandCanonical::calc_random_expr_canonical,                    /* 890 */
   NULL, // ObExprLobMeta::eval_lob_meta,                               /* 928 */
   NULL, // ObExprResultScan::eval_result_scan,                         /* 929 */
   ObExprAIDecide::eval_ai_decide,                                     /* 930 */
+  NULL, // ObExprDslParamValue::eval_value,                            /* 931 */
 };
 
 static ObExpr::EvalBatchFunc g_expr_eval_batch_functions[] = {
