@@ -13,6 +13,7 @@
 #include "storage/incremental/share/ob_shared_ls_meta.h"
 #include "storage/incremental/ssmeta/ob_ss_meta_define.h"
 #include "share/backup/ob_archive_struct.h"
+#include "share/ls/ob_ls_operator.h"
 #include "storage/blocksstable/ob_ss_obj_util.h"
 
 namespace oceanbase
@@ -1191,12 +1192,14 @@ int ObSSBackupUtils::get_macro_block_backup_path(
 }
 
 int ObSSBackupUtils::calc_start_replay_scn(
+    common::ObISQLClient &sql_client,
     const share::ObBackupSetTaskAttr &set_task_attr,
     const storage::ObBackupSSLSMetaInfosDesc &ls_meta_infos, 
     const share::ObTenantArchiveRoundAttr &round_attr,
     share::SCN &start_replay_scn)
 {
   int ret = OB_SUCCESS;
+  const uint64_t tenant_id = set_task_attr.tenant_id_;
   SCN tmp_start_replay_scn = set_task_attr.start_scn_;
   ARRAY_FOREACH_X(ls_meta_infos.ls_metas_, i, cnt, OB_SUCC(ret)) {
     const ObBackupSSLSMetaInfo &backup_ls_meta = ls_meta_infos.ls_metas_.at(i);
@@ -1218,7 +1221,31 @@ int ObSSBackupUtils::calc_start_replay_scn(
       if (OB_FAIL(ss_ls_meta.get_palf_meta(palf_meta))) {
         LOG_WARN("failed to get palf meta", K(ret));
       } else {
-        tmp_start_replay_scn = SCN::min(tmp_start_replay_scn, palf_meta.prev_log_info_.scn_);
+        const palf::LogInfo &prev_log_info = palf_meta.prev_log_info_;
+        SCN ls_lower_bound = prev_log_info.scn_;
+        // Block-aligned LSN 0 yields a default predecessor in SS. No log predates LS creation,
+        // so create_scn is a safe replay lower bound.
+        if (0 == prev_log_info.log_id_
+            && palf::LSN(palf::PALF_INITIAL_LSN_VAL) == prev_log_info.lsn_
+            && prev_log_info.scn_.is_min()) {
+          const share::ObLSID &ls_id = ss_ls_meta.ls_id_;
+          share::ObLSAttr ls_attr;
+          share::ObLSAttrOperator ls_attr_operator(tenant_id, &sql_client);
+          if (OB_FAIL(ls_attr_operator.get_ls_attr(ls_id, false /*for_update*/, sql_client,
+              ls_attr, false /*only_existing_ls*/))) {
+            LOG_WARN("failed to get ls create scn for default palf base info",
+                K(ret), K(tenant_id), K(ls_id), K(palf_meta));
+          } else if (!ls_attr.get_create_scn().is_valid_and_not_min()) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("invalid ls create scn for default palf base info",
+                K(ret), K(tenant_id), K(ls_id), K(ls_attr));
+          } else {
+            ls_lower_bound = ls_attr.get_create_scn();
+          }
+        }
+        if (OB_SUCC(ret)) {
+          tmp_start_replay_scn = SCN::min(tmp_start_replay_scn, ls_lower_bound);
+        }
       }
     }
   }

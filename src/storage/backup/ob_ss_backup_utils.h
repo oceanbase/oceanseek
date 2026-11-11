@@ -6,6 +6,7 @@
 #ifndef OCEANBASE_STORAGE_BACKUP_SS_BACKUP_UTILS_H_
 #define OCEANBASE_STORAGE_BACKUP_SS_BACKUP_UTILS_H_
 
+#include "lib/mysqlclient/ob_isql_client.h"
 #include "storage/tablet/ob_tablet_meta.h"
 #include "storage/blocksstable/index_block/ob_sstable_meta_info.h"
 #include "storage/blocksstable/ob_sstable.h"
@@ -271,6 +272,7 @@ public:
     const share::ObBackupPath &backup_set_dir_path,
     share::ObBackupPath &backup_path);
   static int calc_start_replay_scn(
+    common::ObISQLClient &sql_client,
     const share::ObBackupSetTaskAttr &set_task_attr,
     const storage::ObBackupSSLSMetaInfosDesc &ls_meta_infos,
     const share::ObTenantArchiveRoundAttr &round_attr,
