@@ -125,6 +125,7 @@ struct ObMicroBlockData
     DDL_MERGE_INDEX_BLOCK,
     INV_IDX_POSTING_BLOCK,
     IVF_FASTSCAN_BLOCK,
+    IVF_QUANTIZED_ROW_BLOCK,
     MAX_TYPE
   };
 public:
