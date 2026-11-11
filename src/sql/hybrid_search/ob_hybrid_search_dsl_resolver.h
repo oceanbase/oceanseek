@@ -485,7 +485,8 @@ public:
   static int register_collapse_exprs(ObSelectStmt *select_stmt);
 
   // FROM is resolved before SELECT in MySQL mode, so aggregate items are missing during dsl resolve().
-  // Call after select list is resolved to set COUNT_AGG / track_score for scalar count(*).
+  // Refresh result mode and this DSL's SELECT score dependencies before setting track_score.
+  // Aggregates may still need score output (including aliases and expression references).
   static int refresh_result_mode_after_select_resolved(const ObSelectStmt *select_stmt, ObDSLQueryInfo *dsl_query_info);
   // for a column expr in scalar filter, whether it could be merged can be easily checked,
   // but for other exprs, we need to check if it is in the whitelist

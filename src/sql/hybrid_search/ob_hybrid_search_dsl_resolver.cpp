@@ -2752,7 +2752,8 @@ void ObDSLResolver::set_track_score(ObDSLQueryInfo *dsl_query_info)
 {
   dsl_query_info->track_score_ =
       (dsl_query_info->result_mode_ != ObDSLResultMode::COUNT_AGG
-       && dsl_query_info->result_mode_ != ObDSLResultMode::BUCKET_AGG);
+       && dsl_query_info->result_mode_ != ObDSLResultMode::BUCKET_AGG)
+      || dsl_query_info->output_score_;
 }
 
 int ObDSLResolver::refresh_output_score_after_select_resolved(const ObSelectStmt *select_stmt,
@@ -2764,10 +2765,25 @@ int ObDSLResolver::refresh_output_score_after_select_resolved(const ObSelectStmt
     LOG_WARN("unexpected null", K(ret), KP(select_stmt), KP(dsl_query_info));
   } else {
     dsl_query_info->output_score_ = false;
-    for (int64_t i = 0; !dsl_query_info->output_score_ && i < select_stmt->get_select_item_size(); ++i) {
-      const SelectItem &select_item = select_stmt->get_select_item(i);
-      dsl_query_info->output_score_ =
-          (0 == select_item.expr_name_.case_compare(OB_HYBRID_SEARCH_SCORE_COLUMN_NAME));
+    // Resolve against this DSL's final score object, not SELECT names (which may be
+    // aliases or ordinary columns). find_expr follows expression parameters only,
+    // not a subquery's ref_stmt, so other query blocks do not contribute a score.
+    ObOpPseudoColumnRawExpr *score_expr = nullptr;
+    for (int64_t i = 0; OB_SUCC(ret) && OB_ISNULL(score_expr) && i < dsl_query_info->score_cols_.count(); ++i) {
+      ObOpPseudoColumnRawExpr *tmp = dsl_query_info->score_cols_.at(i);
+      if (OB_ISNULL(tmp) || OB_ISNULL(tmp->get_name())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("hybrid search score expr is null or has no name", K(ret), K(i));
+      } else if (0 == ObString::make_string(tmp->get_name()).case_compare(OB_HYBRID_SEARCH_SCORE_COLUMN_NAME)) {
+        score_expr = tmp;
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && OB_NOT_NULL(score_expr) && !dsl_query_info->output_score_
+                       && i < select_stmt->get_select_item_size(); ++i) {
+      if (OB_FAIL(ObRawExprUtils::find_expr(select_stmt->get_select_item(i).expr_, score_expr,
+                                          dsl_query_info->output_score_))) {
+        LOG_WARN("failed to find hybrid search score dependency", K(ret), K(i));
+      }
     }
   }
   return ret;
@@ -2798,8 +2814,9 @@ int ObDSLResolver::init_result_mode_and_track_score()
     }
   }
   if (OB_SUCC(ret)) {
-    set_track_score(dsl_query_info_);
+    // SELECT and score columns are not resolved yet. Never reuse old demand.
     dsl_query_info_->output_score_ = false;
+    set_track_score(dsl_query_info_);
   }
   return ret;
 }
@@ -2830,12 +2847,12 @@ int ObDSLResolver::refresh_result_mode_after_select_resolved(const ObSelectStmt 
         dsl_query_info->result_mode_ = ObDSLResultMode::COUNT_AGG;
       }
     }
-    if (OB_SUCC(ret)) {
-      set_track_score(dsl_query_info);
-    }
     if (OB_SUCC(ret)
         && OB_FAIL(refresh_output_score_after_select_resolved(select_stmt, dsl_query_info))) {
       LOG_WARN("failed to refresh output score after select resolved", K(ret));
+    }
+    if (OB_SUCC(ret)) {
+      set_track_score(dsl_query_info);
     }
   }
   return ret;
@@ -7031,9 +7048,10 @@ int ObDSLResolver::ignore_count_star_dsl_rewrites(ObSelectStmt &select_stmt,
       dsl_query_info.collapse_info_.qualify_expr_ = nullptr;
       dsl_query_info.agg_items_.reset();
       dsl_query_info.result_mode_ = ObDSLResultMode::COUNT_AGG;
-      set_track_score(&dsl_query_info);
       if (OB_FAIL(refresh_output_score_after_select_resolved(&select_stmt, &dsl_query_info))) {
         LOG_WARN("failed to refresh output score after count(*) rewrites", K(ret));
+      } else {
+        set_track_score(&dsl_query_info);
       }
     }
   }
