@@ -9372,78 +9372,18 @@ int ObTablet::replay_set_tablet_status(
   return ret;
 }
 
-int ObTablet::check_schema_version_with_cache(const int64_t schema_version)
+int ObTablet::check_schema_version_with_cache(const int64_t schema_version, const int64_t abs_timeout_ts)
 {
   int ret = OB_SUCCESS;
-  const ObTabletID &tablet_id = get_tablet_meta().tablet_id_;
-  bool r_valid = false;
+  ObDDLInfoCache ddl_info;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not inited", K(ret), K_(is_inited));
-  } else {
-    {
-      SpinRLockGuard guard(mds_cache_lock_);
-      if (ddl_data_cache_.is_valid()) {
-        if (OB_FAIL(check_schema_version(ddl_data_cache_, schema_version))) {
-          LOG_WARN("fail to check schema version", K(ret));
-        }
-        r_valid = true;
-      }
-    }
-
-    if (OB_SUCC(ret) && !r_valid) {
-      SpinWLockGuard guard(mds_cache_lock_);
-      if (ddl_data_cache_.is_valid()) {
-        if (OB_FAIL(check_schema_version(ddl_data_cache_, schema_version))) {
-          LOG_WARN("fail to check schema version", K(ret));
-        }
-      } else {
-        ObTabletBindingMdsUserData tmp_ddl_data;
-        ObDDLInfoCache tmp_ddl_data_cache;
-        ObDDLInfoCache *candidate_cache = nullptr;
-        mds::MdsWriter unused_writer;
-        mds::TwoPhaseCommitState trans_stat;
-        share::SCN unused_trans_version;
-        if (OB_FAIL(get_latest_binding_info(tmp_ddl_data, unused_writer, trans_stat, unused_trans_version))) {
-          if (OB_EMPTY_RESULT == ret) {
-            trans_stat = mds::TwoPhaseCommitState::ON_COMMIT;
-            tmp_ddl_data.set_default_value(); // use default value
-            ret = OB_SUCCESS;
-          } else {
-            LOG_WARN("failed to get latest ddl data", KR(ret));
-          }
-        }
-
-        if (OB_FAIL(ret)) {
-        } else if (mds::TwoPhaseCommitState::ON_COMMIT == trans_stat) {
-          // already get valid tmp_ddl_data
-        } else if (OB_FAIL(get_ddl_data(tmp_ddl_data))) {
-          LOG_WARN("failed to get snapshot", KR(ret));
-        }
-
-        if (OB_SUCC(ret)) {
-          // only enable cache without any on going transaction during the write lock
-          if (mds::TwoPhaseCommitState::ON_COMMIT == trans_stat) {
-            ddl_data_cache_.set_value(tmp_ddl_data);
-            candidate_cache = &ddl_data_cache_;
-            LOG_INFO("refresh ddl data cache", K(ret), K(tablet_meta_.ls_id_), K(tablet_id), K(ddl_data_cache_));
-          } else {
-            tmp_ddl_data_cache.set_value(tmp_ddl_data);
-            candidate_cache = &tmp_ddl_data_cache;
-          }
-
-          if (OB_FAIL(ret)) {
-          } else if (OB_ISNULL(candidate_cache)) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("ddl data cache is null", K(ret), KP(candidate_cache), K(tablet_meta_.ls_id_), K(tablet_id));
-          } else if (OB_FAIL(check_schema_version(*candidate_cache, schema_version))) {
-            LOG_WARN("fail to check schema version", K(ret), K(tablet_meta_.ls_id_), K(tablet_id));
-          }
-        }
-      }
-    }
+  } else if (OB_FAIL(get_ddl_data_with_cache_(abs_timeout_ts, ddl_info, nullptr/*is_writable_for_dml*/))) {
+    LOG_WARN("failed to get ddl data with cache", K(ret), K(tablet_meta_.ls_id_), K(tablet_meta_.tablet_id_), K(abs_timeout_ts));
+  } else if (OB_FAIL(check_schema_version(ddl_info, schema_version))) {
+    LOG_WARN("fail to check schema version", K(ret), K(tablet_meta_.ls_id_), K(tablet_meta_.tablet_id_));
   }
-
   return ret;
 }
 
@@ -9460,86 +9400,24 @@ int ObTablet::check_schema_version_with_cache(const int64_t schema_version)
 int ObTablet::check_snapshot_readable_with_cache(
     const int64_t snapshot_version,
     const int64_t schema_version,
-    const int64_t timeout,
+    const int64_t abs_timeout_ts,
     bool &need_split_dst_table)
 {
   int ret = OB_SUCCESS;
   const ObLSID &ls_id = tablet_meta_.ls_id_;
   const ObTabletID &tablet_id = tablet_meta_.tablet_id_;
-  bool r_valid = false;
+  ObDDLInfoCache ddl_info;
+  bool is_writable_for_dml = false;
   need_split_dst_table = true;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not inited", K(ret), K_(is_inited));
-  } else {
-    {
-      SpinRLockGuard guard(mds_cache_lock_);
-      if (tablet_status_cache_.is_valid()) {
-        if (tablet_status_cache_.get_tablet_status().is_writable_for_dml()) {
-          need_split_dst_table = false;
-        }
-      }
-      if (ddl_data_cache_.is_valid()) {
-        if (OB_FAIL(check_snapshot_readable(ddl_data_cache_, snapshot_version, schema_version))) {
-          LOG_WARN("fail to check schema version", K(ret));
-        }
-        r_valid = true;
-      }
-    }
-
-    if (OB_SUCC(ret) && !r_valid) {
-      SpinWLockGuard guard(mds_cache_lock_);
-      if (ddl_data_cache_.is_valid()) {
-        if (OB_FAIL(check_snapshot_readable(ddl_data_cache_, snapshot_version, schema_version))) {
-          LOG_WARN("fail to check snapshot version", K(ret));
-        }
-      } else {
-        ObTabletBindingMdsUserData tmp_ddl_data;
-        ObDDLInfoCache tmp_ddl_data_cache;
-        ObDDLInfoCache *candidate_cache = nullptr;
-        mds::MdsWriter unused_writer;
-        mds::TwoPhaseCommitState trans_stat;
-        share::SCN unused_trans_version;
-        if (OB_FAIL(ObITabletMdsInterface::get_latest_ddl_data(tmp_ddl_data, unused_writer, trans_stat, unused_trans_version))) {
-          if (OB_EMPTY_RESULT == ret) {
-            trans_stat = mds::TwoPhaseCommitState::ON_COMMIT;
-            tmp_ddl_data.set_default_value(); // use default value
-            ret = OB_SUCCESS;
-          } else {
-            LOG_WARN("failed to get latest ddl data", KR(ret));
-          }
-        }
-
-        if (OB_FAIL(ret)) {
-        } else if (mds::TwoPhaseCommitState::ON_COMMIT == trans_stat) {
-          // already get valid tmp_ddl_data
-        } else if (OB_FAIL(get_ddl_data(tmp_ddl_data))) {
-          LOG_WARN("failed to get snapshot", KR(ret));
-        }
-
-        if (OB_SUCC(ret)) {
-          // only enable cache without any on going transaction during the write lock
-          if (mds::TwoPhaseCommitState::ON_COMMIT == trans_stat) {
-            ddl_data_cache_.set_value(tmp_ddl_data);
-            candidate_cache = &ddl_data_cache_;
-            LOG_INFO("refresh ddl data cache", K(ret), K(ls_id), K(tablet_id), K(ddl_data_cache_));
-          } else {
-            tmp_ddl_data_cache.set_value(tmp_ddl_data);
-            candidate_cache = &tmp_ddl_data_cache;
-          }
-
-          if (OB_FAIL(ret)) {
-          } else if (OB_ISNULL(candidate_cache)) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("ddl data cache is null", K(ret), KP(candidate_cache), K(ls_id), K(tablet_id));
-          } else if (OB_FAIL(check_snapshot_readable(*candidate_cache, snapshot_version, schema_version))) {
-            LOG_WARN("fail to check snapshot version", K(ret), K(ls_id), K(tablet_id), K(snapshot_version), K(schema_version));
-          }
-        }
-      }
-    }
+  } else if (OB_FAIL(get_ddl_data_with_cache_(abs_timeout_ts, ddl_info, &is_writable_for_dml))) {
+    LOG_WARN("failed to get ddl data with cache", K(ret), K(ls_id), K(tablet_id), K(abs_timeout_ts));
+  } else if (FALSE_IT(need_split_dst_table = !is_writable_for_dml)) {
+  } else if (OB_FAIL(check_snapshot_readable(ddl_info, snapshot_version, schema_version))) {
+    LOG_WARN("fail to check snapshot version", K(ret), K(ls_id), K(tablet_id), K(snapshot_version), K(schema_version));
   }
-
   return ret;
 }
 
@@ -10997,6 +10875,88 @@ int ObTablet::get_mds_table_for_write_(ObLSHandle &ls_handle, ObMdsTable *&mds_t
   } else if (OB_ISNULL(mds_table = ls->get_mds_table())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("mds table is null", KR(ret), K(tablet_meta_.ls_id_));
+  }
+  return ret;
+}
+
+int ObTablet::get_ddl_data_with_cache_(
+    const int64_t abs_timeout_ts,
+    ObDDLInfoCache &ddl_info,
+    bool *is_writable_for_dml)
+{
+  int ret = OB_SUCCESS;
+  const ObLSID &ls_id = tablet_meta_.ls_id_;
+  const ObTabletID &tablet_id = tablet_meta_.tablet_id_;
+  bool hit_cache = false;
+  uint32_t invalidation_count = 0;
+  {
+    SpinRLockGuard guard(mds_cache_lock_);
+    if (nullptr != is_writable_for_dml) {
+      *is_writable_for_dml = tablet_status_cache_.is_valid()
+          && tablet_status_cache_.get_tablet_status().is_writable_for_dml();
+    }
+    if (ddl_data_cache_.is_valid()) {
+      ddl_info.set_value(ddl_data_cache_.is_redefined(),
+                         ddl_data_cache_.get_schema_version(),
+                         ddl_data_cache_.get_snapshot_version());
+      hit_cache = true;
+    } else {
+      invalidation_count = ddl_data_cache_.get_invalidation_count();
+    }
+  }
+
+  if (!hit_cache) {
+    // Read MDS outside mds_cache_lock_; recalculate the budget after the latest read.
+    ObTabletBindingMdsUserData tmp_ddl_data;
+    bool can_cache = false;
+    mds::MdsWriter unused_writer;
+    mds::TwoPhaseCommitState trans_stat = mds::TwoPhaseCommitState::ON_COMMIT;
+    share::SCN unused_trans_version;
+    if (OB_FAIL(ObITabletMdsInterface::get_latest_ddl_data(
+        tmp_ddl_data, unused_writer, trans_stat, unused_trans_version))) {
+      if (OB_EMPTY_RESULT == ret) {
+        trans_stat = mds::TwoPhaseCommitState::ON_COMMIT;
+        tmp_ddl_data.set_default_value(); // use default value
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("failed to get latest ddl data", KR(ret), K(ls_id), K(tablet_id));
+      }
+    }
+
+    if (OB_FAIL(ret)) {
+    } else if (mds::TwoPhaseCommitState::ON_COMMIT == trans_stat) {
+      // already get valid tmp_ddl_data
+      can_cache = true;
+    } else {
+      const int64_t now = ObTimeUtility::current_time();
+      if (OB_UNLIKELY(abs_timeout_ts <= now)) {
+        ret = OB_TIMEOUT;
+        LOG_WARN("ddl data read timeout", KR(ret), K(ls_id), K(tablet_id), K(abs_timeout_ts), K(now));
+      } else {
+        const int64_t timeout = abs_timeout_ts - now;
+        if (OB_FAIL(ObITabletMdsInterface::get_ddl_data(
+                share::SCN::max_scn(), tmp_ddl_data, timeout))) {
+          LOG_WARN("failed to get committed ddl data", KR(ret), K(ls_id), K(tablet_id), K(timeout));
+        }
+      }
+    }
+
+    if (OB_SUCC(ret)) {
+      SpinWLockGuard guard(mds_cache_lock_);
+      if (ddl_data_cache_.is_valid()) {
+        // another thread refreshed the cache while we were reading MDS
+        ddl_info.set_value(ddl_data_cache_.is_redefined(),
+                           ddl_data_cache_.get_schema_version(),
+                           ddl_data_cache_.get_snapshot_version());
+      } else {
+        // Cache only if no transaction was in flight and no invalidation occurred during the read.
+        if (can_cache && invalidation_count == ddl_data_cache_.get_invalidation_count()) {
+          ddl_data_cache_.set_value(tmp_ddl_data);
+          LOG_INFO("refresh ddl data cache", K(ret), K(ls_id), K(tablet_id), K(ddl_data_cache_));
+        }
+        ddl_info.set_value(tmp_ddl_data);
+      }
+    }
   }
   return ret;
 }

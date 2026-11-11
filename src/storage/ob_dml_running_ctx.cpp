@@ -335,8 +335,9 @@ int ObDMLRunningCtx::check_schema_version(
     LOG_WARN("table version mismatch", K(ret), K(table_id), K(table_version), K(table_schema->get_schema_version()));
   }
   if (OB_SUCC(ret)) {
-    if (OB_FAIL(tablet_handle.get_obj()->check_schema_version_with_cache(table_version))) {
-      LOG_WARN("failed to check schema version", K(ret), K(table_version));
+    // Preserve the statement deadline until the committed binding read.
+    if (OB_FAIL(tablet_handle.get_obj()->check_schema_version_with_cache(table_version, dml_param_.timeout_))) {
+      LOG_WARN("failed to check schema version", K(ret), K(table_version), "dml_param_timeout", dml_param_.timeout_);
     }
   }
   return ret;

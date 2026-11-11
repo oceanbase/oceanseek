@@ -80,6 +80,7 @@ public:
   bool is_redefined() const { return redefined_; }
   int64_t get_schema_version() const { return schema_version_; }
   int64_t get_snapshot_version() const { return snapshot_version_; }
+  uint32_t get_invalidation_count() const { return invalidation_count_; }
 
   void reset();
 
@@ -92,9 +93,12 @@ public:
 public:
   TO_STRING_KV(K_(redefined),
                K_(schema_version),
-               K_(snapshot_version));
+               K_(snapshot_version),
+               K_(invalidation_count));
 private:
   bool redefined_;
+  // Protected by ObTablet::mds_cache_lock_; fits in padding to preserve sizeof.
+  uint32_t invalidation_count_;
   int64_t schema_version_;
   int64_t snapshot_version_;
 };

@@ -49,6 +49,7 @@ void ObTabletStatusCache::reset()
 
 ObDDLInfoCache::ObDDLInfoCache()
   : redefined_(false),
+    invalidation_count_(0),
     schema_version_(INT64_MAX),
     snapshot_version_(INT64_MAX)
 {
@@ -73,6 +74,8 @@ void ObDDLInfoCache::set_value(const ObTabletBindingMdsUserData &user_data)
 
 void ObDDLInfoCache::reset()
 {
+  // Even an invalid cache may have a reader preparing to populate it.
+  ++invalidation_count_;
   redefined_ = false;
   schema_version_ = INT64_MAX;
   snapshot_version_ = INT64_MAX;

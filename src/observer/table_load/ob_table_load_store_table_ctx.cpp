@@ -401,9 +401,14 @@ int ObTableLoadStoreDataTableCtx::check_tablet(const ObLSID &ls_id,
                                                tablet_handle,
                                                ObMDSGetTabletMode::READ_ALL_COMMITED))) {
     LOG_WARN("fail to ddl get tablet", KR(ret), K(tablet_id));
-  } else if (OB_FAIL(
-             tablet_handle.get_obj()->check_schema_version_with_cache(schema_version))) {
-    LOG_WARN("fail to check schema version with cache", KR(ret), K(schema_version));
+  } else {
+    // Use the worker deadline, or start a default budget for this background path.
+    const int64_t abs_timeout_ts = THIS_WORKER.is_timeout_ts_valid()
+        ? THIS_WORKER.get_timeout_ts()
+        : ObTimeUtility::current_time() + ObTabletCommon::DEFAULT_GET_TABLET_DURATION_US;
+    if (OB_FAIL(tablet_handle.get_obj()->check_schema_version_with_cache(schema_version, abs_timeout_ts))) {
+      LOG_WARN("fail to check schema version with cache", KR(ret), K(schema_version), K(abs_timeout_ts));
+    }
   }
   return ret;
 }

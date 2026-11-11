@@ -823,11 +823,12 @@ public:
 
   int check_new_mds_with_cache(const int64_t snapshot_version);
   int check_tablet_status_for_read_all_committed();
-  int check_schema_version_with_cache(const int64_t schema_version);
+  // abs_timeout_ts: caller's absolute deadline(us) for the committed MDS read.
+  int check_schema_version_with_cache(const int64_t schema_version, const int64_t abs_timeout_ts);
   int check_snapshot_readable_with_cache(
       const int64_t snapshot_version,
       const int64_t schema_version,
-      const int64_t timeout,
+      const int64_t abs_timeout_ts,
       bool &need_split_dst_table);
   int set_tablet_status(
       const ObTabletCreateDeleteMdsUserData &tablet_status,
@@ -921,6 +922,11 @@ protected:// for MDS use
 private:
   int get_async_index_membership_(
       ObAsyncIndexMembershipCache &membership, const bool use_cache) const;
+  // abs_timeout_ts is the caller's deadline(us); optional DML status shares the cache read lock.
+  int get_ddl_data_with_cache_(
+      const int64_t abs_timeout_ts,
+      ObDDLInfoCache &ddl_info,
+      bool *is_writable_for_dml);
   int check_tablet_schema_mismatch(
       const ObTablet &old_tablet,
       const ObStorageSchema &storage_schema,

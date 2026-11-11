@@ -532,6 +532,87 @@ TEST_F(TestMdsTableScan, aux_tablet_info)
   ASSERT_EQ(9527, read_data.snapshot_version_);
 }
 
+TEST_F(TestMdsTableScan, binding_read_with_infinite_deadline)
+{
+  const common::ObTabletID tablet_id(ObTimeUtility::fast_current_time() % 10000000000000);
+  ObTabletHandle tablet_handle;
+  ASSERT_EQ(OB_SUCCESS, create_tablet(tablet_id, tablet_handle));
+  ObTablet *tablet = tablet_handle.get_obj();
+  ASSERT_NE(nullptr, tablet);
+
+  ObLSHandle ls_handle;
+  ASSERT_EQ(OB_SUCCESS, MTL(ObLSService*)->get_ls(LS_ID, ls_handle, ObLSGetMod::STORAGE_MOD));
+  ObTabletBindingMdsUserData write_data;
+  write_data.data_tablet_id_ = 100;
+  write_data.hidden_tablet_id_ = 101;
+  write_data.snapshot_version_ = 9527;
+  const share::SCN commit_scn = share::SCN::plus(share::SCN::min_scn(), 120);
+  ASSERT_EQ(OB_SUCCESS, ut_replay_ddl_info_for_test(
+      *ls_handle.get_ls(), tablet_id, write_data, commit_scn, transaction::ObTransID(456)));
+
+  // Model an infinite scan deadline converted to a relative budget before the MDS read.
+  const int64_t remaining_timeout = INT64_MAX - ObTimeUtility::current_time();
+  ob_usleep(1);
+  const int64_t timeouts[] = {1_s, remaining_timeout, INT64_MAX};
+  for (const int64_t timeout : timeouts) {
+    SCOPED_TRACE(timeout);
+    ObTabletBindingMdsUserData read_data;
+    ASSERT_EQ(OB_SUCCESS, tablet->ObITabletMdsInterface::get_ddl_data(
+        share::SCN::max_scn(), read_data, timeout));
+    EXPECT_EQ(write_data.data_tablet_id_, read_data.data_tablet_id_);
+    EXPECT_EQ(write_data.hidden_tablet_id_, read_data.hidden_tablet_id_);
+    EXPECT_EQ(write_data.snapshot_version_, read_data.snapshot_version_);
+  }
+}
+
+TEST_F(TestMdsTableScan, binding_cache_read_with_statement_deadline)
+{
+  const common::ObTabletID tablet_id(ObTimeUtility::fast_current_time() % 10000000000000);
+  ObTabletHandle tablet_handle;
+  ASSERT_EQ(OB_SUCCESS, create_tablet(tablet_id, tablet_handle));
+  ObTablet *tablet = tablet_handle.get_obj();
+  ASSERT_NE(nullptr, tablet);
+
+  ObLSHandle ls_handle;
+  ASSERT_EQ(OB_SUCCESS, MTL(ObLSService*)->get_ls(LS_ID, ls_handle, ObLSGetMod::STORAGE_MOD));
+  ObTabletBindingMdsUserData write_data;
+  write_data.schema_version_ = 100;
+  write_data.snapshot_version_ = 100;
+  const share::SCN commit_scn = share::SCN::plus(share::SCN::min_scn(), 120);
+  ASSERT_EQ(OB_SUCCESS, ut_replay_ddl_info_for_test(
+      *ls_handle.get_ls(), tablet_id, write_data, commit_scn, transaction::ObTransID(457)));
+
+  UtMdsTxScope scope(*ls_handle.get_ls());
+  ASSERT_EQ(OB_SUCCESS, scope.begin(tablet_id));
+  mds::MdsCtx ctx{mds::MdsWriter(scope.tx_desc()->tx_id_)};
+  scope.bind_to_mds_ctx(ctx);
+  write_data.schema_version_ = 101;
+  ASSERT_EQ(OB_SUCCESS, tablet->set_ddl_info(write_data, ctx, 0));
+
+  ObTabletBindingMdsUserData latest_data;
+  mds::MdsWriter writer;
+  mds::TwoPhaseCommitState trans_stat;
+  share::SCN trans_version;
+  ASSERT_EQ(OB_SUCCESS, tablet->get_latest_ddl_data(latest_data, writer, trans_stat, trans_version));
+  ASSERT_NE(mds::TwoPhaseCommitState::ON_COMMIT, trans_stat);
+  ASSERT_FALSE(tablet->ddl_data_cache_.is_valid());
+
+  const int64_t expired_deadline = ObTimeUtility::current_time() - 1;
+  bool need_split_dst_table = true;
+  EXPECT_EQ(OB_TIMEOUT, tablet->check_schema_version_with_cache(100, expired_deadline));
+  EXPECT_EQ(OB_TIMEOUT, tablet->check_snapshot_readable_with_cache(
+      100, 100, expired_deadline, need_split_dst_table));
+
+  // An unprepared writer can be skipped; both reads must still see committed schema 100.
+  EXPECT_EQ(OB_SUCCESS, tablet->check_schema_version_with_cache(
+      100, ObTimeUtility::current_time() + 1_s));
+  EXPECT_EQ(OB_SUCCESS, tablet->check_snapshot_readable_with_cache(
+      100, 100, INT64_MAX, need_split_dst_table));
+  EXPECT_FALSE(tablet->ddl_data_cache_.is_valid());
+  ASSERT_EQ(OB_SUCCESS, ut_finish_mds_tx_commit(ctx, *scope.mem_ctx(),
+      share::SCN::plus(commit_scn, 100)));
+}
+
 TEST_F(TestMdsTableScan, medium_info)
 {
   int ret = OB_SUCCESS;

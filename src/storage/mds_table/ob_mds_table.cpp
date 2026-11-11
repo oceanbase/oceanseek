@@ -1117,7 +1117,9 @@ int ObMdsTable::setup_single_merge_for_read_(
   const ObRowkeyReadInfo *rowkey_read_info = schema.get_rowkey_read_info();
   share::SCN effective_read_snapshot;
   bool is_follower = false;
-  const int64_t abs_timeout = read_arg.timeout_us_ + ObTimeUtility::current_time();
+  const int64_t now = ObTimeUtility::current_time();
+  const int64_t abs_timeout = now > INT64_MAX - read_arg.timeout_us_
+      ? INT64_MAX : now + read_arg.timeout_us_;
   if (OB_ISNULL(ls_tablet_svr = ls_->get_tablet_svr())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ls tablet service is null", K(ret), KP(ls_));
