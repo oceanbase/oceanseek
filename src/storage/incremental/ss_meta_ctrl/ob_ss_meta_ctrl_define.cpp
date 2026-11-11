@@ -704,6 +704,7 @@ static const char *ss_meta_object_type_strs[] = {
   "MAJOR",
   "NONE_MAJOR",
   "INC_MAJOR",
+  "NON_IDEM_MAJOR",
 };
 STATIC_ASSERT(static_cast<int64_t>(ObSSMetaCtrlObjectInfo::TYPE::MAX)
         == ARRAYSIZEOF(ss_meta_object_type_strs),

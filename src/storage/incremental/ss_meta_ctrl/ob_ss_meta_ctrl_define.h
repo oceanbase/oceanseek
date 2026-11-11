@@ -244,6 +244,7 @@ public:
     MAJOR = 2,
     NONE_MAJOR = 3,
     INC_MAJOR = 4, // 仅用于 inc-major compaction 场景。
+    NON_IDEM_MAJOR = 5, // Major objects use op_id to distinguish build attempts.
     MAX,
   };
   static const char *get_str(const TYPE type);
