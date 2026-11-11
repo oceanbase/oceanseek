@@ -6,9 +6,9 @@ include(cmake/Env.cmake)
 set(OB_BUILD_VERSION "4.6.3.0")
 
 if(OB_BUILD_OPENSOURCE)
-  project("OceanBase_CE"
+  project("OceanBase_AI_CE"
     VERSION ${OB_BUILD_VERSION}
-    DESCRIPTION "OceanBase distributed database system"
+    DESCRIPTION "OceanBase AI Community Edition"
     HOMEPAGE_URL "https://open.oceanbase.com/"
     LANGUAGES CXX C ASM)
   message(STATUS "open source build enabled")

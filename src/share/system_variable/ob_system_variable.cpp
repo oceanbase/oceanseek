@@ -52,7 +52,7 @@ ObSpecialSysVarValues::ObSpecialSysVarValues()
 #ifdef OB_BUILD_CLOSE_MODULES
                                      "OceanBase 4.6.0.0 AI %s (r%s) (Built %s %s)",
 #else
-                                     "OceanBase_CE %s (r%s) (Built %s %s)",
+                                     "OceanBase_AI_CE %s (r%s) (Built %s %s)",
 
 #endif
                                      PACKAGE_VERSION, build_version(),

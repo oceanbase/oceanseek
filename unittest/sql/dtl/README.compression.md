@@ -1,7 +1,5 @@
 # DTL compression configuration and tests
 
-Task: [2026091000118965827](https://project.alipay.com/project/W24001004732/P26001026476/workitemDetail?openWorkItemId=2026091000118965827&status=status).
-
 ## Configuration contract
 
 `dtl_compress_func` is a dynamic tenant parameter, defaulting to `lz4_1.0`.
