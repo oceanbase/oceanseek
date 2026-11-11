@@ -443,6 +443,10 @@ ob_set_subtarget(ob_sql engine_connector
   engine/connector/ob_odps_catalog_jni_agent.cpp
   engine/connector/ob_odps_jni_reader.cpp
   engine/connector/ob_odps_jni_writer.cpp
+  engine/connector/ob_odps_table_writer.cpp
+  engine/connector/ob_odps_upload_session_mgr.cpp
+  engine/connector/ob_odps_cpp_upload_session_mgr.cpp
+  engine/connector/ob_odps_jni_upload_session_mgr.cpp
 )
 
 ob_set_subtarget(ob_sql engine_dml

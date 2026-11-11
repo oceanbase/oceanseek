@@ -96,7 +96,11 @@ ObPrivMgr::ObPrivMgr()
     obj_priv_map_(SET_USE_500(ObModIds::OB_SCHEMA_PRIV_OBJ_PRIV_MAP, ObCtxIds::SCHEMA_SERVICE)),
     obj_mysql_privs_(0, NULL, SET_USE_500("PRIV_OBJ_MYSQL", ObCtxIds::SCHEMA_SERVICE)),
     obj_mysql_priv_map_(SET_USE_500("PRIV_OBJ_MYSQL", ObCtxIds::SCHEMA_SERVICE)),
-    sys_privs_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_PRIV_SYS_PRIVS, ObCtxIds::SCHEMA_SERVICE))
+    sys_privs_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_PRIV_SYS_PRIVS, ObCtxIds::SCHEMA_SERVICE)),
+    catalog_database_privs_(0, NULL, SET_USE_500("PRIV_CATALOG_DB", ObCtxIds::SCHEMA_SERVICE)),
+    catalog_database_priv_map_(SET_USE_500("PRIV_CATALOG_DB", ObCtxIds::SCHEMA_SERVICE)),
+    catalog_table_privs_(0, NULL, SET_USE_500("PRIV_CATALOG_TB", ObCtxIds::SCHEMA_SERVICE)),
+    catalog_table_priv_map_(SET_USE_500("PRIV_CATALOG_TB", ObCtxIds::SCHEMA_SERVICE))
 {
   static_assert(ARRAYSIZEOF(ObPrivMgr::priv_names_) == OB_PRIV_MAX_SHIFT_PLUS_ONE,
                 "incomplete array priv_names_");
@@ -119,6 +123,10 @@ ObPrivMgr::ObPrivMgr(ObIAllocator &allocator)
     sys_privs_(0, NULL, SET_USE_500(ObModIds::OB_SCHEMA_PRIV_SYS_PRIVS, ObCtxIds::SCHEMA_SERVICE)),
     catalog_privs_(0, NULL, SET_USE_500("PRIV_CATALOG", ObCtxIds::SCHEMA_SERVICE)),
     catalog_priv_map_(SET_USE_500("PRIV_CATALOG", ObCtxIds::SCHEMA_SERVICE)),
+    catalog_database_privs_(0, NULL, SET_USE_500("PRIV_CATALOG_DB", ObCtxIds::SCHEMA_SERVICE)),
+    catalog_database_priv_map_(SET_USE_500("PRIV_CATALOG_DB", ObCtxIds::SCHEMA_SERVICE)),
+    catalog_table_privs_(0, NULL, SET_USE_500("PRIV_CATALOG_TB", ObCtxIds::SCHEMA_SERVICE)),
+    catalog_table_priv_map_(SET_USE_500("PRIV_CATALOG_TB", ObCtxIds::SCHEMA_SERVICE)),
     sensitive_rule_privs_(0, NULL, SET_USE_500("PRIV_SENS_RULE", ObCtxIds::SCHEMA_SERVICE)),
     sensitive_rule_priv_map_(SET_USE_500("PRI_SENSRUL_MAP", ObCtxIds::SCHEMA_SERVICE))
 {}
@@ -139,6 +147,10 @@ int ObPrivMgr::init()
     LOG_WARN("init obj priv map failed", K(ret));
   } else if (OB_FAIL(catalog_priv_map_.init())) {
     LOG_WARN("init catalog priv map failed", K(ret));
+  } else if (OB_FAIL(catalog_database_priv_map_.init())) {
+    LOG_WARN("init catalog database priv map failed", K(ret));
+  } else if (OB_FAIL(catalog_table_priv_map_.init())) {
+    LOG_WARN("init catalog table priv map failed", K(ret));
   } else if (OB_FAIL(obj_mysql_priv_map_.init())) {
     LOG_WARN("init obj mysql priv map failed", K(ret));
   } else if (OB_FAIL(sensitive_rule_priv_map_.init())) {
@@ -163,6 +175,10 @@ void ObPrivMgr::reset()
   column_privs_sort_by_id_.clear();
   catalog_privs_.clear();
   catalog_priv_map_.clear();
+  catalog_database_privs_.clear();
+  catalog_database_priv_map_.clear();
+  catalog_table_privs_.clear();
+  catalog_table_priv_map_.clear();
   obj_mysql_privs_.clear();
   obj_mysql_priv_map_.clear();
   sensitive_rule_privs_.clear();
@@ -193,6 +209,10 @@ int ObPrivMgr::assign(const ObPrivMgr &other)
     ASSIGN_FIELD(column_privs_sort_by_id_);
     ASSIGN_FIELD(catalog_privs_);
     ASSIGN_FIELD(catalog_priv_map_);
+    ASSIGN_FIELD(catalog_database_privs_);
+    ASSIGN_FIELD(catalog_database_priv_map_);
+    ASSIGN_FIELD(catalog_table_privs_);
+    ASSIGN_FIELD(catalog_table_priv_map_);
     ASSIGN_FIELD(obj_mysql_privs_);
     ASSIGN_FIELD(obj_mysql_priv_map_);
     ASSIGN_FIELD(sensitive_rule_privs_);
@@ -277,6 +297,26 @@ int ObPrivMgr::deep_copy(const ObPrivMgr &other)
         LOG_WARN("NULL ptr", K(catalog_priv), K(ret));
       } else if (OB_FAIL(add_catalog_priv(*catalog_priv))) {
         LOG_WARN("add catalog priv failed", K(*catalog_priv), K(ret));
+      }
+    }
+    for (CatalogDatabasePrivIter iter = other.catalog_database_privs_.begin();
+         OB_SUCC(ret) && iter != other.catalog_database_privs_.end(); ++iter) {
+      ObCatalogDatabasePriv *catalog_database_priv = *iter;
+      if (OB_ISNULL(catalog_database_priv)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("NULL ptr", K(catalog_database_priv), K(ret));
+      } else if (OB_FAIL(add_catalog_database_priv(*catalog_database_priv))) {
+        LOG_WARN("add catalog database priv failed", K(*catalog_database_priv), K(ret));
+      }
+    }
+    for (CatalogTablePrivIter iter = other.catalog_table_privs_.begin();
+         OB_SUCC(ret) && iter != other.catalog_table_privs_.end(); ++iter) {
+      ObCatalogTablePriv *catalog_table_priv = *iter;
+      if (OB_ISNULL(catalog_table_priv)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("NULL ptr", K(catalog_table_priv), K(ret));
+      } else if (OB_FAIL(add_catalog_table_priv(*catalog_table_priv))) {
+        LOG_WARN("add catalog table priv failed", K(*catalog_table_priv), K(ret));
       }
     }
     for (ObjMysqlPrivIter iter = other.obj_mysql_privs_.begin();
@@ -2110,6 +2150,26 @@ void ObPrivMgr::dump() const
     }
   }
 
+  for (CatalogDatabasePrivIter iter = catalog_database_privs_.begin();
+       iter != catalog_database_privs_.end(); ++iter) {
+    const ObCatalogDatabasePriv *catalog_database_priv = *iter;
+    if (NULL == catalog_database_priv) {
+      LOG_INFO("NULL ptr", K(catalog_database_priv));
+    } else {
+      LOG_INFO("CatalogDatabasePriv", K(*catalog_database_priv));
+    }
+  }
+
+  for (CatalogTablePrivIter iter = catalog_table_privs_.begin();
+       iter != catalog_table_privs_.end(); ++iter) {
+    const ObCatalogTablePriv *catalog_table_priv = *iter;
+    if (NULL == catalog_table_priv) {
+      LOG_INFO("NULL ptr", K(catalog_table_priv));
+    } else {
+      LOG_INFO("CatalogTablePriv", K(*catalog_table_priv));
+    }
+  }
+
   for (ObjMysqlPrivIter iter = obj_mysql_privs_.begin();
       iter != obj_mysql_privs_.end(); ++iter) {
     const ObObjMysqlPriv *obj_mysql_priv = *iter;
@@ -2369,6 +2429,314 @@ int ObPrivMgr::del_catalog_priv(const ObCatalogPrivSortKey &catalog_priv_key)
     LOG_WARN("catalog priv is non-consistent between map and vector",
              "catalog_privs vector count", catalog_privs_.count(),
              "catalog_privs map size", catalog_priv_map_.item_count());
+  }
+  return ret;
+}
+
+int ObPrivMgr::get_catalog_database_priv(
+    const ObCatalogDatabasePrivSortKey &catalog_database_priv_key,
+    const ObCatalogDatabasePriv *&catalog_database_priv) const
+{
+  int ret = OB_SUCCESS;
+  catalog_database_priv = NULL;
+  ObCatalogDatabasePriv *tmp_catalog_database_priv = NULL;
+  int hash_ret = catalog_database_priv_map_.get_refactored(
+      catalog_database_priv_key, tmp_catalog_database_priv);
+  if (OB_SUCCESS == hash_ret) {
+    if (OB_ISNULL(tmp_catalog_database_priv)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get catalog database priv return NULL", K(catalog_database_priv_key));
+    } else {
+      catalog_database_priv = tmp_catalog_database_priv;
+    }
+  } else if (OB_HASH_NOT_EXIST != hash_ret) {
+    ret = hash_ret;
+    LOG_WARN("failed to get catalog database priv", K(ret));
+  }
+  return ret;
+}
+
+int ObPrivMgr::get_catalog_database_priv_set(
+    const ObCatalogDatabasePrivSortKey &catalog_database_priv_key,
+    ObPrivSet &priv_set) const
+{
+  int ret = OB_SUCCESS;
+  priv_set = OB_PRIV_SET_EMPTY;
+  const ObCatalogDatabasePriv *catalog_database_priv = NULL;
+  if (OB_FAIL(get_catalog_database_priv(catalog_database_priv_key, catalog_database_priv))) {
+    LOG_WARN("get catalog database priv failed", K(ret), K(catalog_database_priv_key));
+  } else if (NULL != catalog_database_priv) {
+    priv_set = catalog_database_priv->get_priv_set();
+  }
+  return ret;
+}
+
+int ObPrivMgr::get_catalog_database_privs_in_user(
+    const uint64_t tenant_id,
+    const uint64_t user_id,
+    ObIArray<const ObCatalogDatabasePriv *> &catalog_database_privs) const
+{
+  int ret = OB_SUCCESS;
+  catalog_database_privs.reset();
+  ObTenantUserId tenant_user_id(tenant_id, user_id);
+  ConstCatalogDatabasePrivIter begin = catalog_database_privs_.lower_bound(
+      tenant_user_id, ObCatalogDatabasePriv::cmp_tenant_user_id);
+  bool is_stop = false;
+  for (ConstCatalogDatabasePrivIter iter = begin;
+       OB_SUCC(ret) && iter != catalog_database_privs_.end() && !is_stop; ++iter) {
+    const ObCatalogDatabasePriv *catalog_database_priv = NULL;
+    if (OB_ISNULL(catalog_database_priv = *iter)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("null ptr", K(ret), K(catalog_database_priv));
+    } else if (tenant_id != catalog_database_priv->get_tenant_id()
+               || user_id != catalog_database_priv->get_user_id()) {
+      is_stop = true;
+    } else if (OB_FAIL(catalog_database_privs.push_back(catalog_database_priv))) {
+      LOG_WARN("push back catalog database priv failed", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObPrivMgr::add_catalog_database_privs(
+    const common::ObIArray<ObCatalogDatabasePriv> &catalog_database_privs)
+{
+  int ret = OB_SUCCESS;
+  FOREACH_CNT_X(catalog_database_priv, catalog_database_privs, OB_SUCC(ret)) {
+    if (OB_FAIL(add_catalog_database_priv(*catalog_database_priv))) {
+      LOG_WARN("add catalog database priv failed", K(ret), K(*catalog_database_priv));
+    }
+  }
+  return ret;
+}
+
+int ObPrivMgr::del_catalog_database_privs(
+    const common::ObIArray<ObCatalogDatabasePrivSortKey> &catalog_database_priv_keys)
+{
+  int ret = OB_SUCCESS;
+  FOREACH_CNT_X(catalog_database_priv_key, catalog_database_priv_keys, OB_SUCC(ret)) {
+    if (OB_FAIL(del_catalog_database_priv(*catalog_database_priv_key))) {
+      LOG_WARN("del catalog database priv failed", K(ret), K(*catalog_database_priv_key));
+    }
+  }
+  return ret;
+}
+
+int ObPrivMgr::add_catalog_database_priv(const ObCatalogDatabasePriv &catalog_database_priv)
+{
+  int ret = OB_SUCCESS;
+  ObCatalogDatabasePriv *new_catalog_database_priv = NULL;
+  CatalogDatabasePrivIter iter = NULL;
+  ObCatalogDatabasePriv *replaced_catalog_database_priv = NULL;
+  if (OB_FAIL(ObSchemaUtils::alloc_schema(
+          allocator_, catalog_database_priv, new_catalog_database_priv))) {
+    LOG_WARN("alloc schema failed", K(ret));
+  } else if (OB_ISNULL(new_catalog_database_priv)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null ptr", K(ret), K(new_catalog_database_priv));
+  } else if (OB_FAIL(catalog_database_privs_.replace(
+                 new_catalog_database_priv,
+                 iter,
+                 ObCatalogDatabasePriv::cmp,
+                 ObCatalogDatabasePriv::equal,
+                 replaced_catalog_database_priv))) {
+    LOG_WARN("failed to put catalog database priv into vector", K(ret));
+  } else {
+    int hash_ret = catalog_database_priv_map_.set_refactored(
+        new_catalog_database_priv->get_sort_key(), new_catalog_database_priv, 1);
+    if (OB_SUCCESS != hash_ret && OB_HASH_EXIST != hash_ret) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("failed to build catalog database priv hashmap",
+               "catalog_database_priv_key", new_catalog_database_priv->get_sort_key(),
+               K(ret), K(hash_ret));
+    }
+  }
+  if (catalog_database_privs_.count() != catalog_database_priv_map_.item_count()) {
+    LOG_WARN("catalog database priv is non-consistent between map and vector",
+             "catalog_database_privs vector count", catalog_database_privs_.count(),
+             "catalog_database_privs map size", catalog_database_priv_map_.item_count());
+  }
+  return ret;
+}
+
+int ObPrivMgr::del_catalog_database_priv(
+    const ObCatalogDatabasePrivSortKey &catalog_database_priv_key)
+{
+  int ret = OB_SUCCESS;
+  ObCatalogDatabasePriv *catalog_database_priv = NULL;
+  if (OB_FAIL(catalog_database_privs_.remove_if(
+          catalog_database_priv_key,
+          ObCatalogDatabasePriv::cmp_sort_key,
+          ObCatalogDatabasePriv::equal_sort_key,
+          catalog_database_priv))) {
+    LOG_WARN("failed to remove catalog database priv", K(catalog_database_priv_key), K(ret));
+  } else if (OB_ISNULL(catalog_database_priv)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("removed catalog database priv return null", K(catalog_database_priv));
+  } else {
+    int hash_ret = catalog_database_priv_map_.erase_refactored(catalog_database_priv_key);
+    if (OB_SUCCESS != hash_ret) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("failed to delete catalog database priv from map", K(ret), K(hash_ret));
+    }
+  }
+  if (catalog_database_privs_.count() != catalog_database_priv_map_.item_count()) {
+    LOG_WARN("catalog database priv is non-consistent between map and vector",
+             "catalog_database_privs vector count", catalog_database_privs_.count(),
+             "catalog_database_privs map size", catalog_database_priv_map_.item_count());
+  }
+  return ret;
+}
+
+int ObPrivMgr::get_catalog_table_priv(
+    const ObCatalogTablePrivSortKey &catalog_table_priv_key,
+    const ObCatalogTablePriv *&catalog_table_priv) const
+{
+  int ret = OB_SUCCESS;
+  catalog_table_priv = NULL;
+  ObCatalogTablePriv *tmp_catalog_table_priv = NULL;
+  int hash_ret = catalog_table_priv_map_.get_refactored(
+      catalog_table_priv_key, tmp_catalog_table_priv);
+  if (OB_SUCCESS == hash_ret) {
+    if (OB_ISNULL(tmp_catalog_table_priv)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get catalog table priv return NULL", K(catalog_table_priv_key));
+    } else {
+      catalog_table_priv = tmp_catalog_table_priv;
+    }
+  } else if (OB_HASH_NOT_EXIST != hash_ret) {
+    ret = hash_ret;
+    LOG_WARN("failed to get catalog table priv", K(ret));
+  }
+  return ret;
+}
+
+int ObPrivMgr::get_catalog_table_priv_set(
+    const ObCatalogTablePrivSortKey &catalog_table_priv_key,
+    ObPrivSet &priv_set) const
+{
+  int ret = OB_SUCCESS;
+  priv_set = OB_PRIV_SET_EMPTY;
+  const ObCatalogTablePriv *catalog_table_priv = NULL;
+  if (OB_FAIL(get_catalog_table_priv(catalog_table_priv_key, catalog_table_priv))) {
+    LOG_WARN("get catalog table priv failed", K(ret), K(catalog_table_priv_key));
+  } else if (NULL != catalog_table_priv) {
+    priv_set = catalog_table_priv->get_priv_set();
+  }
+  return ret;
+}
+
+int ObPrivMgr::get_catalog_table_privs_in_user(
+    const uint64_t tenant_id,
+    const uint64_t user_id,
+    ObIArray<const ObCatalogTablePriv *> &catalog_table_privs) const
+{
+  int ret = OB_SUCCESS;
+  catalog_table_privs.reset();
+  ObTenantUserId tenant_user_id(tenant_id, user_id);
+  ConstCatalogTablePrivIter begin = catalog_table_privs_.lower_bound(
+      tenant_user_id, ObCatalogTablePriv::cmp_tenant_user_id);
+  bool is_stop = false;
+  for (ConstCatalogTablePrivIter iter = begin;
+       OB_SUCC(ret) && iter != catalog_table_privs_.end() && !is_stop; ++iter) {
+    const ObCatalogTablePriv *catalog_table_priv = NULL;
+    if (OB_ISNULL(catalog_table_priv = *iter)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("null ptr", K(ret), K(catalog_table_priv));
+    } else if (tenant_id != catalog_table_priv->get_tenant_id()
+               || user_id != catalog_table_priv->get_user_id()) {
+      is_stop = true;
+    } else if (OB_FAIL(catalog_table_privs.push_back(catalog_table_priv))) {
+      LOG_WARN("push back catalog table priv failed", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObPrivMgr::add_catalog_table_privs(
+    const common::ObIArray<ObCatalogTablePriv> &catalog_table_privs)
+{
+  int ret = OB_SUCCESS;
+  FOREACH_CNT_X(catalog_table_priv, catalog_table_privs, OB_SUCC(ret)) {
+    if (OB_FAIL(add_catalog_table_priv(*catalog_table_priv))) {
+      LOG_WARN("add catalog table priv failed", K(ret), K(*catalog_table_priv));
+    }
+  }
+  return ret;
+}
+
+int ObPrivMgr::del_catalog_table_privs(
+    const common::ObIArray<ObCatalogTablePrivSortKey> &catalog_table_priv_keys)
+{
+  int ret = OB_SUCCESS;
+  FOREACH_CNT_X(catalog_table_priv_key, catalog_table_priv_keys, OB_SUCC(ret)) {
+    if (OB_FAIL(del_catalog_table_priv(*catalog_table_priv_key))) {
+      LOG_WARN("del catalog table priv failed", K(ret), K(*catalog_table_priv_key));
+    }
+  }
+  return ret;
+}
+
+int ObPrivMgr::add_catalog_table_priv(const ObCatalogTablePriv &catalog_table_priv)
+{
+  int ret = OB_SUCCESS;
+  ObCatalogTablePriv *new_catalog_table_priv = NULL;
+  CatalogTablePrivIter iter = NULL;
+  ObCatalogTablePriv *replaced_catalog_table_priv = NULL;
+  if (OB_FAIL(ObSchemaUtils::alloc_schema(allocator_, catalog_table_priv, new_catalog_table_priv))) {
+    LOG_WARN("alloc schema failed", K(ret));
+  } else if (OB_ISNULL(new_catalog_table_priv)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null ptr", K(ret), K(new_catalog_table_priv));
+  } else if (OB_FAIL(catalog_table_privs_.replace(
+                 new_catalog_table_priv,
+                 iter,
+                 ObCatalogTablePriv::cmp,
+                 ObCatalogTablePriv::equal,
+                 replaced_catalog_table_priv))) {
+    LOG_WARN("failed to put catalog table priv into vector", K(ret));
+  } else {
+    int hash_ret = catalog_table_priv_map_.set_refactored(
+        new_catalog_table_priv->get_sort_key(), new_catalog_table_priv, 1);
+    if (OB_SUCCESS != hash_ret && OB_HASH_EXIST != hash_ret) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("failed to build catalog table priv hashmap",
+               "catalog_table_priv_key", new_catalog_table_priv->get_sort_key(),
+               K(ret), K(hash_ret));
+    }
+  }
+  if (catalog_table_privs_.count() != catalog_table_priv_map_.item_count()) {
+    LOG_WARN("catalog table priv is non-consistent between map and vector",
+             "catalog_table_privs vector count", catalog_table_privs_.count(),
+             "catalog_table_privs map size", catalog_table_priv_map_.item_count());
+  }
+  return ret;
+}
+
+int ObPrivMgr::del_catalog_table_priv(const ObCatalogTablePrivSortKey &catalog_table_priv_key)
+{
+  int ret = OB_SUCCESS;
+  ObCatalogTablePriv *catalog_table_priv = NULL;
+  if (OB_FAIL(catalog_table_privs_.remove_if(
+          catalog_table_priv_key,
+          ObCatalogTablePriv::cmp_sort_key,
+          ObCatalogTablePriv::equal_sort_key,
+          catalog_table_priv))) {
+    LOG_WARN("failed to remove catalog table priv", K(catalog_table_priv_key), K(ret));
+  } else if (OB_ISNULL(catalog_table_priv)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("removed catalog table priv return null", K(catalog_table_priv));
+  } else {
+    int hash_ret = catalog_table_priv_map_.erase_refactored(catalog_table_priv_key);
+    if (OB_SUCCESS != hash_ret) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("failed to delete catalog table priv from map", K(ret), K(hash_ret));
+    }
+  }
+  if (catalog_table_privs_.count() != catalog_table_priv_map_.item_count()) {
+    LOG_WARN("catalog table priv is non-consistent between map and vector",
+             "catalog_table_privs vector count", catalog_table_privs_.count(),
+             "catalog_table_privs map size", catalog_table_priv_map_.item_count());
   }
   return ret;
 }

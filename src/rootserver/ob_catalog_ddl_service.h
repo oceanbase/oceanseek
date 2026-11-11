@@ -30,6 +30,15 @@ public:
                            const bool grant,
                            share::schema::ObSchemaGetterGuard &schema_guard);
   int revoke_catalog(const ObRevokeCatalogArg &arg);
+  int grant_revoke_catalog_object(const uint64_t tenant_id,
+                                  const uint64_t user_id,
+                                  const ObString &user_name,
+                                  const ObString &host_name,
+                                  const ObNeedPriv &need_priv,
+                                  const bool grant,
+                                  share::schema::ObSchemaGetterGuard &schema_guard);
+  int revoke_catalog_database(const ObRevokeDBArg &arg);
+  int revoke_catalog_table(const ObRevokeTableArg &arg);
 private:
   ObDDLService *ddl_service_;
 };

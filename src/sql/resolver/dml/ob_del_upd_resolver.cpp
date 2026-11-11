@@ -4214,7 +4214,8 @@ int ObDelUpdResolver::resolve_insert_values(const ParseNode *node,
                                                                                      column_id))) {
                 ret = OB_ERR_UNEXPECTED;
                 LOG_WARN("get column item by id failed", K(table_info.table_id_), K(column_id));
-              } else  if (column_expr->is_generated_column()) {
+              } else if (column_expr->is_generated_column()
+                         && schema::EXTERNAL_TABLE != table_item->table_type_) {
                 //values中对应的生成列出现了default关键字，我们统一将default替换成生成列对应的表达式
                 //下面的统一处理逻辑会为values中的column进行替换
                 if (OB_FAIL(copy_schema_expr(*params_.expr_factory_,
@@ -4396,10 +4397,10 @@ int ObDelUpdResolver::build_row_for_empty_brackets(ObArray<ObRawExpr*> &value_ro
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("fail to get column item", K(column_id));
       } else if (OB_UNLIKELY(item->expr_->is_generated_column())) {
-        if (OB_FAIL(copy_schema_expr(*params_.expr_factory_,
-                                     item->expr_->get_dependant_expr(),
-                                     expr))) {
-          LOG_WARN("copy generated column dependant expr failed", K(ret));
+        // External generated columns describe the input file. Their write
+        // default is NULL, rather than an external scan pseudo column.
+        if (OB_FAIL(utils.resolve_default_expr(*item, expr, T_INSERT_SCOPE))) {
+          LOG_WARN("resolve generated column default failed", K(ret));
         } else if (expr->has_flag(CNT_COLUMN)) {
           if (OB_FAIL(replace_column_ref(&value_row, expr))) {
             LOG_WARN("replace column reference failed", K(ret));

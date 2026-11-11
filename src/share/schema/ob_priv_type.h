@@ -183,6 +183,9 @@ enum OB_PRIV_SHIFT
    OB_PRIV_EXECUTE | OB_PRIV_ALTER_ROUTINE | OB_PRIV_CREATE_ROUTINE |         \
    OB_PRIV_REFERENCES | OB_PRIV_TRIGGER)
 
+#define OB_PRIV_CATALOG_DB_TABLE_ACC \
+  (OB_PRIV_SELECT | OB_PRIV_INSERT)
+
 #define OB_PRIV_DB_ACC                                                        \
   (OB_PRIV_ALTER | OB_PRIV_CREATE | OB_PRIV_DELETE |                          \
    OB_PRIV_DROP | OB_PRIV_INSERT | OB_PRIV_UPDATE | OB_PRIV_SELECT |          \

@@ -113,9 +113,12 @@ int ObDDLSqlService::gen_ddl_operation_dml(
     share::ObDMLSqlSplicer &ddl_operation_dml)
 {
   int ret = OB_SUCCESS;
+  uint64_t data_version = 0;
   if (OB_UNLIKELY(!schema_operation.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("schema_operation is invalid", K(schema_operation), K(ret));
+  } else if (OB_FAIL(GET_MIN_DATA_VERSION(sql_tenant_id, data_version))) {
+    LOG_WARN("failed to get tenant data version", KR(ret), K(sql_tenant_id));
   } else if (OB_FAIL(ddl_operation_dml.add_column("schema_version", schema_operation.schema_version_))) {
     LOG_WARN("failed to add column schema_version", KR(ret), K(schema_operation));
   } else if (OB_FAIL(ddl_operation_dml.add_column("tenant_id",
@@ -146,6 +149,10 @@ int ObDDLSqlService::gen_ddl_operation_dml(
   } else if (OB_FAIL(ddl_operation_dml.add_column("ddl_stmt_str",
           ObHexEscapeSqlStr(schema_operation.ddl_stmt_str_?:"")))) {
     LOG_WARN("failed to add column ddl_stmt_str", KR(ret), K(schema_operation));
+  } else if (data_version >= DATA_VERSION_4_6_3_1
+             && OB_FAIL(ddl_operation_dml.add_column("catalog_name",
+                 ObHexEscapeSqlStr(schema_operation.catalog_name_?:"")))) {
+    LOG_WARN("failed to add column catalog_name", KR(ret), K(schema_operation));
   } else if (OB_FAIL(ddl_operation_dml.add_gmt_modified())) {
     LOG_WARN("failed to add column gmt_modified", KR(ret), K(schema_operation));
   } else if (OB_FAIL(ddl_operation_dml.finish_row())) {

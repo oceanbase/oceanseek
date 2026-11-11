@@ -196,6 +196,163 @@ OB_DEF_SERIALIZE_SIZE(ObCatalogPriv)
   return len;
 }
 
+ObCatalogDatabasePriv &ObCatalogDatabasePriv::operator=(const ObCatalogDatabasePriv &other)
+{
+  if (this != &other) {
+    reset();
+    int ret = OB_SUCCESS;
+    error_ret_ = other.error_ret_;
+    if (OB_FAIL(ObPriv::assign(other))) {
+      LOG_WARN("assign failed", K(ret));
+    } else if (OB_FAIL(deep_copy_str(other.catalog_, catalog_))) {
+      LOG_WARN("failed to deep copy catalog", K(ret));
+    } else if (OB_FAIL(deep_copy_str(other.database_, database_))) {
+      LOG_WARN("failed to deep copy database", K(ret));
+    }
+    if (OB_FAIL(ret)) {
+      error_ret_ = ret;
+    }
+  }
+  return *this;
+}
+
+bool ObCatalogDatabasePriv::is_valid() const
+{
+  return ObSchema::is_valid() && ObPriv::is_valid()
+      && !catalog_.empty() && !database_.empty();
+}
+
+void ObCatalogDatabasePriv::reset()
+{
+  catalog_.reset();
+  database_.reset();
+  ObSchema::reset();
+  ObPriv::reset();
+}
+
+int64_t ObCatalogDatabasePriv::get_convert_size() const
+{
+  int64_t convert_size = ObPriv::get_convert_size();
+  convert_size += sizeof(ObCatalogDatabasePriv) - sizeof(ObPriv);
+  convert_size += catalog_.length() + 1;
+  convert_size += database_.length() + 1;
+  return convert_size;
+}
+
+OB_DEF_SERIALIZE(ObCatalogDatabasePriv)
+{
+  int ret = OB_SUCCESS;
+  BASE_SER((, ObPriv));
+  LST_DO_CODE(OB_UNIS_ENCODE, catalog_, database_);
+  return ret;
+}
+
+OB_DEF_DESERIALIZE(ObCatalogDatabasePriv)
+{
+  int ret = OB_SUCCESS;
+  ObString catalog;
+  ObString database;
+  BASE_DESER((, ObPriv));
+  LST_DO_CODE(OB_UNIS_DECODE, catalog, database);
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to deserialize data", K(ret));
+  } else if (OB_FAIL(deep_copy_str(catalog, catalog_))) {
+    LOG_WARN("failed to deep copy catalog", K(catalog), K(ret));
+  } else if (OB_FAIL(deep_copy_str(database, database_))) {
+    LOG_WARN("failed to deep copy database", K(database), K(ret));
+  }
+  return ret;
+}
+
+OB_DEF_SERIALIZE_SIZE(ObCatalogDatabasePriv)
+{
+  int64_t len = ObPriv::get_serialize_size();
+  LST_DO_CODE(OB_UNIS_ADD_LEN, catalog_, database_);
+  return len;
+}
+
+ObCatalogTablePriv &ObCatalogTablePriv::operator=(const ObCatalogTablePriv &other)
+{
+  if (this != &other) {
+    reset();
+    int ret = OB_SUCCESS;
+    error_ret_ = other.error_ret_;
+    if (OB_FAIL(ObPriv::assign(other))) {
+      LOG_WARN("assign failed", K(ret));
+    } else if (OB_FAIL(deep_copy_str(other.catalog_, catalog_))) {
+      LOG_WARN("failed to deep copy catalog", K(ret));
+    } else if (OB_FAIL(deep_copy_str(other.database_, database_))) {
+      LOG_WARN("failed to deep copy database", K(ret));
+    } else if (OB_FAIL(deep_copy_str(other.table_, table_))) {
+      LOG_WARN("failed to deep copy table", K(ret));
+    }
+    if (OB_FAIL(ret)) {
+      error_ret_ = ret;
+    }
+  }
+  return *this;
+}
+
+bool ObCatalogTablePriv::is_valid() const
+{
+  return ObSchema::is_valid() && ObPriv::is_valid()
+      && !catalog_.empty() && !database_.empty() && !table_.empty();
+}
+
+void ObCatalogTablePriv::reset()
+{
+  catalog_.reset();
+  database_.reset();
+  table_.reset();
+  ObSchema::reset();
+  ObPriv::reset();
+}
+
+int64_t ObCatalogTablePriv::get_convert_size() const
+{
+  int64_t convert_size = ObPriv::get_convert_size();
+  convert_size += sizeof(ObCatalogTablePriv) - sizeof(ObPriv);
+  convert_size += catalog_.length() + 1;
+  convert_size += database_.length() + 1;
+  convert_size += table_.length() + 1;
+  return convert_size;
+}
+
+OB_DEF_SERIALIZE(ObCatalogTablePriv)
+{
+  int ret = OB_SUCCESS;
+  BASE_SER((, ObPriv));
+  LST_DO_CODE(OB_UNIS_ENCODE, catalog_, database_, table_);
+  return ret;
+}
+
+OB_DEF_DESERIALIZE(ObCatalogTablePriv)
+{
+  int ret = OB_SUCCESS;
+  ObString catalog;
+  ObString database;
+  ObString table;
+  BASE_DESER((, ObPriv));
+  LST_DO_CODE(OB_UNIS_DECODE, catalog, database, table);
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to deserialize data", K(ret));
+  } else if (OB_FAIL(deep_copy_str(catalog, catalog_))) {
+    LOG_WARN("failed to deep copy catalog", K(catalog), K(ret));
+  } else if (OB_FAIL(deep_copy_str(database, database_))) {
+    LOG_WARN("failed to deep copy database", K(database), K(ret));
+  } else if (OB_FAIL(deep_copy_str(table, table_))) {
+    LOG_WARN("failed to deep copy table", K(table), K(ret));
+  }
+  return ret;
+}
+
+OB_DEF_SERIALIZE_SIZE(ObCatalogTablePriv)
+{
+  int64_t len = ObPriv::get_serialize_size();
+  LST_DO_CODE(OB_UNIS_ADD_LEN, catalog_, database_, table_);
+  return len;
+}
+
 } //namespace schema
 } //namespace share
 } //namespace oceanbase

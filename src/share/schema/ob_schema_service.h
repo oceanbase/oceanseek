@@ -439,6 +439,8 @@ IS_DDL_TYPE(TENANT, tenant)
 IS_DDL_TYPE(DATABASE, database)
 IS_DDL_TYPE(USER, user)
 IS_DDL_TYPE(CATALOG_PRIV, catalog_priv)
+IS_DDL_TYPE(CATALOG_DATABASE_PRIV, catalog_database_priv)
+IS_DDL_TYPE(CATALOG_TABLE_PRIV, catalog_table_priv)
 IS_DDL_TYPE(DB_PRIV, db_priv)
 IS_DDL_TYPE(TABLE_PRIV, table_priv)
 IS_DDL_TYPE(ROUTINE_PRIV, routine_priv)
@@ -547,7 +549,7 @@ public:
     common::ObString context_name_;
     common::ObString mock_fk_parent_table_name_;
     common::ObString routine_name_;
-    common::ObString catalog_name_;
+    common::ObString legacy_catalog_name_;
     common::ObString obj_name_;
     common::ObString external_resource_name_;
     common::ObString ai_model_name_;
@@ -556,6 +558,7 @@ public:
     common::ObString ai_gateway_name_;
     common::ObString java_policy_name_;
   };
+  common::ObString catalog_name_;
   ObSchemaOperationType op_type_;
   common::ObString ddl_stmt_str_;
   bool operator <(const ObSchemaOperation &rv) const { return schema_version_ < rv.schema_version_; }
@@ -1031,6 +1034,8 @@ public:
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(database, ObSimpleDatabaseSchema);
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(tablegroup, ObSimpleTablegroupSchema);
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(catalog_priv, ObCatalogPriv);
+  GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(catalog_database_priv, ObCatalogDatabasePriv);
+  GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(catalog_table_priv, ObCatalogTablePriv);
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(sensitive_rule_priv, ObSensitiveRulePriv);
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(db_priv, ObDBPriv);
   GET_ALL_SCHEMA_FUNC_DECLARE_PURE_VIRTUAL(table_priv, ObTablePriv);
@@ -1182,6 +1187,8 @@ public:
   GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(tablegroup, ObSimpleTablegroupSchema);
   GET_BATCH_SCHEMAS_WITH_ALLOCATOR_FUNC_DECLARE_PURE_VIRTUAL(table, ObSimpleTableSchemaV2);
   GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(catalog_priv, ObCatalogPriv);
+  GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(catalog_database_priv, ObCatalogDatabasePriv);
+  GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(catalog_table_priv, ObCatalogTablePriv);
   GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(db_priv, ObDBPriv);
   GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(table_priv, ObTablePriv);
   GET_BATCH_SCHEMAS_FUNC_DECLARE_PURE_VIRTUAL(routine_priv, ObRoutinePriv);

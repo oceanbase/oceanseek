@@ -749,38 +749,14 @@ int ObPxSubCoord::setup_op_input(ObExecContext &ctx,
       // do nothing
     } else if (OB_FAIL(external_properties.odps_format_.decrypt())) {
       LOG_WARN("failed to decrypt odps format", K(ret));
-    }  else {
-      if (!external_properties.odps_format_.use_odps_jni_connector_) {
-#if defined (OB_BUILD_CPP_ODPS)
-        ObOdpsPartitionUploaderMgr &odps_mgr = sqc_ctx.gi_pump_.get_odps_uploader_mgr();
-        if (OB_FAIL(odps_mgr.init_uploader(
-                external_properties.odps_format_,
-                select_into_spec->external_partition_.str_,
-                select_into_spec->is_overwrite_, sqc.get_task_count()))) {
-          LOG_WARN("failed to init odps uploader", K(ret));
-        }
-#else
-        ret = OB_NOT_SUPPORTED;
-        LOG_WARN("not support odps cpp connector", K(ret));
-#endif
-      } else {
-#if defined (OB_BUILD_JNI_ODPS)
-        // 对于同一个分区有多个task，这些task共用一个session
-        ObOdpsPartitionJNIUploaderMgr &odps_mgr =
-            sqc_ctx.gi_pump_.get_odps_jni_uploader_mgr();
-        if (OB_FAIL(odps_mgr.init_writer_params_in_px(
-                external_properties.odps_format_,
-                select_into_spec->external_partition_.str_,
-                select_into_spec->is_overwrite_, sqc.get_task_count()))) {
-          LOG_WARN("failed to init odps jni uploader", K(ret));
-        }
-#else
-        ret = OB_NOT_SUPPORTED;
-        LOG_WARN("not support odps jni connector", K(ret));
-#endif
-      }
+    } else if (OB_FAIL(sqc_ctx.gi_pump_.init_odps_upload_session(
+                   ctx.get_allocator(), external_properties.odps_format_,
+                   select_into_spec->external_partition_.str_,
+                   select_into_spec->is_overwrite_, sqc.get_task_count()))) {
+      LOG_WARN("failed to initialize ODPS upload session", K(ret));
     }
   }
+
   if (OB_SUCC(ret)) {
     if (OB_FAIL(root.register_to_datahub(ctx))) {
       LOG_WARN("fail register op to datahub", K(ret));

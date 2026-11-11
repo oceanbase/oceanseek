@@ -358,6 +358,7 @@ int ObRevokeExecutor::revoke_db(obrpc::ObCommonRpcProxy *rpc_proxy, ObRevokeStmt
     obrpc::ObRevokeDBArg &arg = static_cast<obrpc::ObRevokeDBArg &>(stmt.get_ddl_arg());
     arg.tenant_id_ = stmt.get_tenant_id();
     arg.priv_set_ = stmt.get_priv_set();
+    arg.catalog_ = stmt.get_catalog_name();
     arg.db_ = stmt.get_database_name();
     const ObIArray<uint64_t> &user_ids = stmt.get_users();
     if (0 == user_ids.count()) {
@@ -393,6 +394,7 @@ int ObRevokeExecutor::revoke_table(obrpc::ObCommonRpcProxy *rpc_proxy,
     obrpc::ObRevokeTableArg &arg = static_cast<obrpc::ObRevokeTableArg &>(stmt.get_ddl_arg());
     arg.tenant_id_ = stmt.get_tenant_id();
     arg.priv_set_ = stmt.get_priv_set();
+    arg.catalog_ = stmt.get_catalog_name();
     arg.db_ = stmt.get_database_name();
     arg.table_ = stmt.get_table_name();
     arg.obj_id_ = stmt.get_object_id();

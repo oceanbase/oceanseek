@@ -2901,6 +2901,91 @@ int ObSchemaGetterGuard::get_catalog_priv_with_user_id(const uint64_t tenant_id,
   return ret;
 }
 
+int ObSchemaGetterGuard::get_catalog_database_priv_set(
+    const ObCatalogDatabasePrivSortKey &catalog_database_priv_key,
+    ObPrivSet &priv_set)
+{
+  int ret = OB_SUCCESS;
+  const ObSchemaMgr *mgr = NULL;
+  const uint64_t tenant_id = catalog_database_priv_key.tenant_id_;
+  if (OB_FAIL(check_tenant_schema_guard(tenant_id))) {
+    LOG_WARN("fail to check tenant schema guard", KR(ret), K(tenant_id), K_(tenant_id));
+  } else if (OB_FAIL(check_lazy_guard(tenant_id, mgr))) {
+    LOG_WARN("fail to check lazy guard", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(mgr->priv_mgr_.get_catalog_database_priv_set(
+                 catalog_database_priv_key, priv_set))) {
+    LOG_WARN("fail to get catalog database priv set", KR(ret), K(catalog_database_priv_key));
+  }
+  return ret;
+}
+
+int ObSchemaGetterGuard::get_catalog_database_priv_with_user_id(
+    const uint64_t tenant_id,
+    const uint64_t user_id,
+    ObIArray<const ObCatalogDatabasePriv *> &catalog_database_privs)
+{
+  int ret = OB_SUCCESS;
+  const ObSchemaMgr *mgr = NULL;
+  catalog_database_privs.reset();
+  if (!check_inner_stat()) {
+    ret = OB_INNER_STAT_ERROR;
+    LOG_WARN("inner stat error", KR(ret));
+  } else if (OB_INVALID_ID == tenant_id || OB_INVALID_ID == user_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments", K(tenant_id), K(user_id));
+  } else if (OB_FAIL(check_tenant_schema_guard(tenant_id))) {
+    LOG_WARN("fail to check tenant schema guard", KR(ret), K(tenant_id), K_(tenant_id));
+  } else if (OB_FAIL(check_lazy_guard(tenant_id, mgr))) {
+    LOG_WARN("fail to check lazy guard", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(mgr->priv_mgr_.get_catalog_database_privs_in_user(
+                 tenant_id, user_id, catalog_database_privs))) {
+    LOG_WARN("get catalog database priv with user_id failed", KR(ret), K(tenant_id), K(user_id));
+  }
+  return ret;
+}
+
+int ObSchemaGetterGuard::get_catalog_table_priv_set(
+    const ObCatalogTablePrivSortKey &catalog_table_priv_key,
+    ObPrivSet &priv_set)
+{
+  int ret = OB_SUCCESS;
+  const ObSchemaMgr *mgr = NULL;
+  const uint64_t tenant_id = catalog_table_priv_key.tenant_id_;
+  if (OB_FAIL(check_tenant_schema_guard(tenant_id))) {
+    LOG_WARN("fail to check tenant schema guard", KR(ret), K(tenant_id), K_(tenant_id));
+  } else if (OB_FAIL(check_lazy_guard(tenant_id, mgr))) {
+    LOG_WARN("fail to check lazy guard", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(mgr->priv_mgr_.get_catalog_table_priv_set(catalog_table_priv_key, priv_set))) {
+    LOG_WARN("fail to get catalog table priv set", KR(ret), K(catalog_table_priv_key));
+  }
+  return ret;
+}
+
+int ObSchemaGetterGuard::get_catalog_table_priv_with_user_id(
+    const uint64_t tenant_id,
+    const uint64_t user_id,
+    ObIArray<const ObCatalogTablePriv *> &catalog_table_privs)
+{
+  int ret = OB_SUCCESS;
+  const ObSchemaMgr *mgr = NULL;
+  catalog_table_privs.reset();
+  if (!check_inner_stat()) {
+    ret = OB_INNER_STAT_ERROR;
+    LOG_WARN("inner stat error", KR(ret));
+  } else if (OB_INVALID_ID == tenant_id || OB_INVALID_ID == user_id) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments", K(tenant_id), K(user_id));
+  } else if (OB_FAIL(check_tenant_schema_guard(tenant_id))) {
+    LOG_WARN("fail to check tenant schema guard", KR(ret), K(tenant_id), K_(tenant_id));
+  } else if (OB_FAIL(check_lazy_guard(tenant_id, mgr))) {
+    LOG_WARN("fail to check lazy guard", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(mgr->priv_mgr_.get_catalog_table_privs_in_user(
+                 tenant_id, user_id, catalog_table_privs))) {
+    LOG_WARN("get catalog table priv with user_id failed", KR(ret), K(tenant_id), K(user_id));
+  }
+  return ret;
+}
+
 int ObSchemaGetterGuard::get_db_priv_with_user_id(const uint64_t tenant_id,
                                                   const uint64_t user_id,
                                                   ObIArray<const ObDBPriv *> &db_privs)

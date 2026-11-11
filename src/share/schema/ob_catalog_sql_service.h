@@ -46,6 +46,18 @@ public:
                            const int64_t new_schema_version,
                            const ObString &ddl_stmt_str,
                            ObISQLClient &sql_client);
+  int grant_revoke_catalog_database(
+      const ObCatalogDatabasePrivSortKey &catalog_database_priv_key,
+      const ObPrivSet priv_set,
+      const int64_t new_schema_version,
+      const ObString &ddl_stmt_str,
+      ObISQLClient &sql_client);
+  int grant_revoke_catalog_table(
+      const ObCatalogTablePrivSortKey &catalog_table_priv_key,
+      const ObPrivSet priv_set,
+      const int64_t new_schema_version,
+      const ObString &ddl_stmt_str,
+      ObISQLClient &sql_client);
 
 private:
   int gen_sql(common::ObSqlString &sql,
@@ -55,6 +67,16 @@ private:
                            const ObCatalogPrivSortKey &catalog_priv_key,
                            const ObPrivSet &priv_set,
                            share::ObDMLSqlSplicer &dml);
+  int gen_catalog_database_priv_dml(
+      const uint64_t exec_tenant_id,
+      const ObCatalogDatabasePrivSortKey &catalog_database_priv_key,
+      const ObPrivSet priv_set,
+      share::ObDMLSqlSplicer &dml);
+  int gen_catalog_table_priv_dml(
+      const uint64_t exec_tenant_id,
+      const ObCatalogTablePrivSortKey &catalog_table_priv_key,
+      const ObPrivSet priv_set,
+      share::ObDMLSqlSplicer &dml);
 
 private:
   DISALLOW_COPY_AND_ASSIGN(ObCatalogSqlService);

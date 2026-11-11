@@ -581,6 +581,95 @@ int ObSchemaChecker::get_catalog_id_name(const uint64_t tenant_id,
   return ret;
 }
 
+int ObSchemaChecker::get_catalog_database_id_name(const uint64_t tenant_id,
+                                                  const uint64_t catalog_id,
+                                                  common::ObString &database_name,
+                                                  uint64_t &database_id,
+                                                  ObIAllocator *allocator,
+                                                  bool allow_not_exist) const
+{
+  int ret = OB_SUCCESS;
+  database_id = OB_INVALID_ID;
+  const ObDatabaseSchema *database_schema = NULL;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("schema checker is not inited", K(is_inited_), K(ret));
+  } else if (OB_ISNULL(sql_schema_mgr_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null", K(ret));
+  } else if (OB_UNLIKELY(OB_INVALID_ID == tenant_id
+                         || !is_external_catalog_id(catalog_id)
+                         || database_name.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments", K(ret), K(tenant_id), K(catalog_id), K(database_name));
+  } else if (OB_FAIL(sql_schema_mgr_->get_catalog_database_schema(
+                 tenant_id, catalog_id, database_name, database_schema))) {
+    if (allow_not_exist && OB_ERR_BAD_DATABASE == ret) {
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("failed to get catalog database schema",
+               K(ret), K(tenant_id), K(catalog_id), K(database_name));
+    }
+  } else if (OB_ISNULL(database_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("catalog database schema is null",
+             K(ret), K(tenant_id), K(catalog_id), K(database_name));
+  } else {
+    database_id = database_schema->get_database_id();
+    database_name = database_schema->get_database_name_str();
+    if (allocator != NULL && OB_FAIL(ob_write_string(*allocator, database_name, database_name))) {
+      LOG_WARN("failed to deep copy catalog database name", K(ret), K(database_name));
+    }
+  }
+  return ret;
+}
+
+int ObSchemaChecker::get_catalog_table_id_name(const uint64_t tenant_id,
+                                               const uint64_t catalog_id,
+                                               const uint64_t database_id,
+                                               common::ObString &table_name,
+                                               uint64_t &table_id,
+                                               ObIAllocator *allocator,
+                                               bool allow_not_exist) const
+{
+  int ret = OB_SUCCESS;
+  table_id = OB_INVALID_ID;
+  const ObTableSchema *table_schema = NULL;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("schema checker is not inited", K(is_inited_), K(ret));
+  } else if (OB_ISNULL(sql_schema_mgr_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null", K(ret));
+  } else if (OB_UNLIKELY(OB_INVALID_ID == tenant_id
+                         || !is_external_catalog_id(catalog_id)
+                         || OB_INVALID_ID == database_id
+                         || table_name.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments",
+             K(ret), K(tenant_id), K(catalog_id), K(database_id), K(table_name));
+  } else if (OB_FAIL(sql_schema_mgr_->get_catalog_table_schema(
+                 tenant_id, catalog_id, database_id, table_name, table_schema))) {
+    if (allow_not_exist && OB_TABLE_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("failed to get catalog table schema",
+               K(ret), K(tenant_id), K(catalog_id), K(database_id), K(table_name));
+    }
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("catalog table schema is null",
+             K(ret), K(tenant_id), K(catalog_id), K(database_id), K(table_name));
+  } else {
+    table_id = table_schema->get_table_id();
+    table_name = table_schema->get_table_name_str();
+    if (allocator != NULL && OB_FAIL(ob_write_string(*allocator, table_name, table_name))) {
+      LOG_WARN("failed to deep copy catalog table name", K(ret), K(table_name));
+    }
+  }
+  return ret;
+}
+
 int ObSchemaChecker::get_sensitive_rule_schema_count(const uint64_t tenant_id, int64_t &count) const
 {
   int ret = OB_SUCCESS;

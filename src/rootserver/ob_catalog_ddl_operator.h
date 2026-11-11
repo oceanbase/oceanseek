@@ -47,6 +47,18 @@ public:
                            const bool grant,
                            const common::ObString &ddl_stmt_str,
                            common::ObMySQLTransaction &trans);
+  int grant_revoke_catalog_database(
+      const ObCatalogDatabasePrivSortKey &catalog_database_priv_key,
+      const ObPrivSet priv_set,
+      const bool grant,
+      const common::ObString &ddl_stmt_str,
+      common::ObMySQLTransaction &trans);
+  int grant_revoke_catalog_table(
+      const ObCatalogTablePrivSortKey &catalog_table_priv_key,
+      const ObPrivSet priv_set,
+      const bool grant,
+      const common::ObString &ddl_stmt_str,
+      common::ObMySQLTransaction &trans);
 private:
   share::schema::ObMultiVersionSchemaService &schema_service_;
   common::ObMySQLProxy &sql_proxy_;

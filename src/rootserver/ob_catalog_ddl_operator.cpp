@@ -137,7 +137,7 @@ int ObCatalogDDLOperator::grant_or_revoke_after_ddl(ObCatalogSchema &schema,
   if (OB_SUCC(ret) && ddl_type == OB_DDL_CREATE_CATALOG) {
     if (lib::Worker::CompatMode::MYSQL == compat_mode) {
       ObCatalogPrivSortKey catalog_priv_key(tenant_id, user_id, schema.get_catalog_name_str());
-      ObPrivSet priv_set = OB_PRIV_USE_CATALOG;
+      ObPrivSet priv_set = OB_PRIV_USE_CATALOG | OB_PRIV_CATALOG_DB_TABLE_ACC;
       OZ(grant_revoke_catalog(catalog_priv_key, priv_set, true, ObString(), trans));
     } else {
       ObObjPrivSortKey obj_priv_key(tenant_id, schema.get_catalog_id(),
@@ -216,6 +216,108 @@ int ObCatalogDDLOperator::grant_revoke_catalog(const ObCatalogPrivSortKey &catal
         LOG_WARN("apply catalog failed", K(ret));
       }
     }
+  }
+  return ret;
+}
+
+int ObCatalogDDLOperator::grant_revoke_catalog_database(
+    const ObCatalogDatabasePrivSortKey &key,
+    const ObPrivSet priv_set,
+    const bool grant,
+    const ObString &ddl_stmt_str,
+    ObMySQLTransaction &trans)
+{
+  int ret = OB_SUCCESS;
+  ObSchemaGetterGuard schema_guard;
+  ObSchemaService *schema_sql_service = NULL;
+  const ObCatalogSchema *catalog_schema = NULL;
+  int64_t new_schema_version = OB_INVALID_VERSION;
+  ObPrivSet old_priv = OB_PRIV_SET_EMPTY;
+  ObPrivSet new_priv = OB_PRIV_SET_EMPTY;
+  if (!key.is_valid() || key.catalog_.empty() || key.database_.empty()
+      || OB_PRIV_SET_EMPTY == priv_set) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid catalog database privilege arguments", K(ret), K(key), K(priv_set));
+  } else if (OB_ISNULL(schema_sql_service = schema_service_.get_schema_service())) {
+    ret = OB_ERR_SYS;
+    LOG_ERROR("schema sql service must not be null", K(ret));
+  } else if (OB_FAIL(schema_service_.get_tenant_schema_guard(key.tenant_id_, schema_guard))) {
+    LOG_WARN("failed to get schema guard", K(ret), K(key));
+  } else if (OB_FAIL(schema_guard.get_catalog_schema_by_name(
+                 key.tenant_id_, key.catalog_, catalog_schema))) {
+    LOG_WARN("failed to get catalog schema", K(ret), K(key));
+  } else if (grant && OB_ISNULL(catalog_schema)) {
+    ret = OB_ERR_BAD_DATABASE;
+    LOG_WARN("catalog does not exist", K(ret), K(key));
+  } else if (OB_FAIL(schema_guard.get_catalog_database_priv_set(key, old_priv))) {
+    LOG_WARN("failed to get catalog database privilege", K(ret), K(key));
+  } else if (!grant && OB_PRIV_SET_EMPTY == old_priv) {
+    ret = OB_ERR_NO_GRANT;
+    LOG_WARN("no catalog database grant to revoke", K(ret), K(key));
+  } else if (FALSE_IT(new_priv = grant ? (old_priv | priv_set) : (old_priv & (~priv_set)))) {
+  } else if (new_priv == old_priv) {
+    // Idempotent GRANT or a partial REVOKE that changes nothing.
+  } else if (OB_FAIL(schema_service_.gen_new_schema_version(
+                 key.tenant_id_, new_schema_version))) {
+    LOG_WARN("failed to generate schema version", K(ret), K(key));
+  } else if (OB_FAIL(schema_sql_service->get_catalog_sql_service()
+                 .grant_revoke_catalog_database(key,
+                                                new_priv,
+                                                new_schema_version,
+                                                ddl_stmt_str,
+                                                trans))) {
+    LOG_WARN("failed to write catalog database privilege", K(ret), K(key));
+  }
+  return ret;
+}
+
+int ObCatalogDDLOperator::grant_revoke_catalog_table(
+    const ObCatalogTablePrivSortKey &key,
+    const ObPrivSet priv_set,
+    const bool grant,
+    const ObString &ddl_stmt_str,
+    ObMySQLTransaction &trans)
+{
+  int ret = OB_SUCCESS;
+  ObSchemaGetterGuard schema_guard;
+  ObSchemaService *schema_sql_service = NULL;
+  const ObCatalogSchema *catalog_schema = NULL;
+  int64_t new_schema_version = OB_INVALID_VERSION;
+  ObPrivSet old_priv = OB_PRIV_SET_EMPTY;
+  ObPrivSet new_priv = OB_PRIV_SET_EMPTY;
+  if (!key.is_valid() || key.catalog_.empty() || key.database_.empty() || key.table_.empty()
+      || OB_PRIV_SET_EMPTY == priv_set) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid catalog table privilege arguments", K(ret), K(key), K(priv_set));
+  } else if (OB_ISNULL(schema_sql_service = schema_service_.get_schema_service())) {
+    ret = OB_ERR_SYS;
+    LOG_ERROR("schema sql service must not be null", K(ret));
+  } else if (OB_FAIL(schema_service_.get_tenant_schema_guard(key.tenant_id_, schema_guard))) {
+    LOG_WARN("failed to get schema guard", K(ret), K(key));
+  } else if (OB_FAIL(schema_guard.get_catalog_schema_by_name(
+                 key.tenant_id_, key.catalog_, catalog_schema))) {
+    LOG_WARN("failed to get catalog schema", K(ret), K(key));
+  } else if (grant && OB_ISNULL(catalog_schema)) {
+    ret = OB_ERR_BAD_DATABASE;
+    LOG_WARN("catalog does not exist", K(ret), K(key));
+  } else if (OB_FAIL(schema_guard.get_catalog_table_priv_set(key, old_priv))) {
+    LOG_WARN("failed to get catalog table privilege", K(ret), K(key));
+  } else if (!grant && OB_PRIV_SET_EMPTY == old_priv) {
+    ret = OB_ERR_NO_GRANT;
+    LOG_WARN("no catalog table grant to revoke", K(ret), K(key));
+  } else if (FALSE_IT(new_priv = grant ? (old_priv | priv_set) : (old_priv & (~priv_set)))) {
+  } else if (new_priv == old_priv) {
+    // Idempotent GRANT or a partial REVOKE that changes nothing.
+  } else if (OB_FAIL(schema_service_.gen_new_schema_version(
+                 key.tenant_id_, new_schema_version))) {
+    LOG_WARN("failed to generate schema version", K(ret), K(key));
+  } else if (OB_FAIL(schema_sql_service->get_catalog_sql_service()
+                 .grant_revoke_catalog_table(key,
+                                             new_priv,
+                                             new_schema_version,
+                                             ddl_stmt_str,
+                                             trans))) {
+    LOG_WARN("failed to write catalog table privilege", K(ret), K(key));
   }
   return ret;
 }

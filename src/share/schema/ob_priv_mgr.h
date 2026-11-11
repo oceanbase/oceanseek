@@ -137,6 +137,8 @@ class ObPrivMgr
   typedef common::ObSortedVector<ObObjPriv *>ObjPrivInfos;
   typedef common::ObSortedVector<ObSysPriv *>SysPrivInfos;
   typedef common::ObSortedVector<ObCatalogPriv *> CatalogPrivInfos;
+  typedef common::ObSortedVector<ObCatalogDatabasePriv *> CatalogDatabasePrivInfos;
+  typedef common::ObSortedVector<ObCatalogTablePriv *> CatalogTablePrivInfos;
   typedef common::ObSortedVector<ObObjMysqlPriv *> ObjMysqlPrivInfos;
   typedef common::ObSortedVector<ObSensitiveRulePriv *> SensitiveRulePrivInfos;
   typedef common::hash::ObPointerHashMap<ObTablePrivSortKey, ObTablePriv *, ObGetTablePrivKeyV3, 128> TablePrivMap;
@@ -144,6 +146,10 @@ class ObPrivMgr
   typedef common::hash::ObPointerHashMap<ObColumnPrivSortKey, ObColumnPriv *, ObGetColumnPrivKeyV3, 128> ColumnPrivMap;
   typedef common::hash::ObPointerHashMap<ObObjPrivSortKey, ObObjPriv *, ObGetObjPrivKey, 128> ObjPrivMap;
   typedef common::hash::ObPointerHashMap<ObCatalogPrivSortKey, ObCatalogPriv *, ObGetCatalogPrivKey, 128> CatalogPrivMap;
+  typedef common::hash::ObPointerHashMap<ObCatalogDatabasePrivSortKey, ObCatalogDatabasePriv *,
+      ObGetCatalogDatabasePrivKey, 128> CatalogDatabasePrivMap;
+  typedef common::hash::ObPointerHashMap<ObCatalogTablePrivSortKey, ObCatalogTablePriv *,
+      ObGetCatalogTablePrivKey, 128> CatalogTablePrivMap;
   typedef common::hash::ObPointerHashMap<ObObjMysqlPrivSortKey, ObObjMysqlPriv *, ObGetObjMysqlPrivKey, 128> ObjMysqlPrivMap;
   typedef common::hash::ObPointerHashMap<ObSensitiveRulePrivSortKey, ObSensitiveRulePriv *, ObGetSensitiveRulePrivKey, 128> SensitiveRulePrivMap;
   typedef DBPrivInfos::iterator DBPrivIter;
@@ -161,6 +167,10 @@ class ObPrivMgr
   typedef ObjPrivInfos::const_iterator ConstObjPrivIter;
   typedef CatalogPrivInfos::iterator CatalogPrivIter;
   typedef CatalogPrivInfos::const_iterator ConstCatalogPrivIter;
+  typedef CatalogDatabasePrivInfos::iterator CatalogDatabasePrivIter;
+  typedef CatalogDatabasePrivInfos::const_iterator ConstCatalogDatabasePrivIter;
+  typedef CatalogTablePrivInfos::iterator CatalogTablePrivIter;
+  typedef CatalogTablePrivInfos::const_iterator ConstCatalogTablePrivIter;
   typedef ObjMysqlPrivInfos::iterator ObjMysqlPrivIter;
   typedef ObjMysqlPrivInfos::const_iterator ConstObjMysqlPrivIter;
   typedef SensitiveRulePrivInfos::iterator SensitiveRulePrivIter;
@@ -287,7 +297,37 @@ public:
                            ObPrivSet &priv_set) const;
   int get_catalog_privs_in_user(const uint64_t tenant_id,
                                 const uint64_t user_id,
-                                common::ObIArray<const ObCatalogPriv *> &catalog_privs) const;    
+                                common::ObIArray<const ObCatalogPriv *> &catalog_privs) const;
+  // catalog database priv
+  int add_catalog_database_privs(
+      const common::ObIArray<ObCatalogDatabasePriv> &catalog_database_privs);
+  int del_catalog_database_privs(
+      const common::ObIArray<ObCatalogDatabasePrivSortKey> &catalog_database_priv_keys);
+  int add_catalog_database_priv(const ObCatalogDatabasePriv &catalog_database_priv);
+  int del_catalog_database_priv(const ObCatalogDatabasePrivSortKey &catalog_database_priv_key);
+  int get_catalog_database_priv(const ObCatalogDatabasePrivSortKey &catalog_database_priv_key,
+                                const ObCatalogDatabasePriv *&catalog_database_priv) const;
+  int get_catalog_database_priv_set(
+      const ObCatalogDatabasePrivSortKey &catalog_database_priv_key,
+      ObPrivSet &priv_set) const;
+  int get_catalog_database_privs_in_user(
+      const uint64_t tenant_id,
+      const uint64_t user_id,
+      common::ObIArray<const ObCatalogDatabasePriv *> &catalog_database_privs) const;
+  // catalog table priv
+  int add_catalog_table_privs(const common::ObIArray<ObCatalogTablePriv> &catalog_table_privs);
+  int del_catalog_table_privs(
+      const common::ObIArray<ObCatalogTablePrivSortKey> &catalog_table_priv_keys);
+  int add_catalog_table_priv(const ObCatalogTablePriv &catalog_table_priv);
+  int del_catalog_table_priv(const ObCatalogTablePrivSortKey &catalog_table_priv_key);
+  int get_catalog_table_priv(const ObCatalogTablePrivSortKey &catalog_table_priv_key,
+                             const ObCatalogTablePriv *&catalog_table_priv) const;
+  int get_catalog_table_priv_set(const ObCatalogTablePrivSortKey &catalog_table_priv_key,
+                                 ObPrivSet &priv_set) const;
+  int get_catalog_table_privs_in_user(
+      const uint64_t tenant_id,
+      const uint64_t user_id,
+      common::ObIArray<const ObCatalogTablePriv *> &catalog_table_privs) const;
   // obj mysql priv
   int add_obj_mysql_privs(const common::ObIArray<ObObjMysqlPriv> &obj_mysql_privs);
   int del_obj_mysql_privs(const common::ObIArray<ObObjMysqlPrivSortKey> &obj_mysql_priv_keys);
@@ -386,6 +426,10 @@ private:
   SysPrivInfos sys_privs_;
   CatalogPrivInfos catalog_privs_;
   CatalogPrivMap catalog_priv_map_;
+  CatalogDatabasePrivInfos catalog_database_privs_;
+  CatalogDatabasePrivMap catalog_database_priv_map_;
+  CatalogTablePrivInfos catalog_table_privs_;
+  CatalogTablePrivMap catalog_table_priv_map_;
   SensitiveRulePrivInfos sensitive_rule_privs_;
   SensitiveRulePrivMap sensitive_rule_priv_map_;
   static const char *priv_names_[];

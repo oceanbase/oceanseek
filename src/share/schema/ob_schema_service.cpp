@@ -29,6 +29,7 @@ ObSchemaOperation::ObSchemaOperation()
       tablegroup_id_(0),
       table_id_(0),
       table_name_(""),
+      catalog_name_(""),
       op_type_(OB_INVALID_DDL_OP),
       ddl_stmt_str_("")
 {
@@ -50,6 +51,7 @@ void ObSchemaOperation::reset()
   tablegroup_id_ = 0;
   table_id_ = 0;
   table_name_.reset();
+  catalog_name_.reset();
   op_type_ = OB_INVALID_DDL_OP;
   ddl_stmt_str_.reset();
 }
@@ -66,6 +68,7 @@ ObSchemaOperation& ObSchemaOperation::operator=(const ObSchemaOperation &other)
     tablegroup_id_ = other.tablegroup_id_;
     table_id_ = other.table_id_;
     table_name_ = other.table_name_;
+    catalog_name_ = other.catalog_name_;
     op_type_ = other.op_type_;
     ddl_stmt_str_ = other.ddl_stmt_str_;
   }
@@ -125,7 +128,8 @@ int64_t ObSchemaOperation::to_string(char *buf, const int64_t buf_len) const
        K_(outline_id), K_(udf_name), K_(sequence_id),
        K_(tablespace_id), K_(profile_id), K_(audit_id),
        K_(grantee_id), K_(grantor_id),
-       K_(ddl_stmt_str), K_(dblink_id), K_(directory_id), K_(catalog_id), K_(catalog_name));
+       K_(ddl_stmt_str), K_(dblink_id), K_(directory_id), K_(catalog_id),
+       K_(legacy_catalog_name), K_(catalog_name));
   return pos;
 }
 

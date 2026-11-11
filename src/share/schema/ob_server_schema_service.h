@@ -128,7 +128,7 @@ struct SchemaKey
     common::ObString tablespace_name_;
     common::ObString context_namespace_;
     common::ObString mock_fk_parent_table_namespace_;
-    common::ObString catalog_name_;
+    common::ObString legacy_catalog_name_;
     common::ObString obj_name_;
     common::ObString ai_model_name_;
     common::ObString sensitive_rule_name_;
@@ -136,6 +136,10 @@ struct SchemaKey
   int64_t schema_version_;
   uint64_t col_id_;
   uint64_t obj_type_;
+  // legacy_catalog_name_ shares storage with table_name_ for the released
+  // catalog privilege operation format. Database/table privilege keys need
+  // both names, so keep an independent catalog name for the new format.
+  common::ObString catalog_name_;
 
   TO_STRING_KV(K_(tenant_id),
                K_(user_id),
@@ -183,6 +187,7 @@ struct SchemaKey
                K_(client_user_id),
                K_(proxy_user_id),
                K_(catalog_id),
+               K_(legacy_catalog_name),
                K_(catalog_name),
                K_(external_resource_id),
                K_(ai_model_id),
@@ -200,7 +205,8 @@ struct SchemaKey
       table_name_(),
       schema_version_(common::OB_INVALID_VERSION),
       col_id_(common::OB_INVALID_ID),
-      obj_type_(common::OB_INVALID_ID)
+      obj_type_(common::OB_INVALID_ID),
+      catalog_name_()
   {}
   static bool cmp_with_tenant_id(const SchemaKey &a, const SchemaKey &b)
   {
@@ -365,7 +371,17 @@ struct SchemaKey
   }
   ObCatalogPrivSortKey get_catalog_priv_key() const
   {
-    return ObCatalogPrivSortKey(tenant_id_, user_id_, catalog_name_);
+    return ObCatalogPrivSortKey(tenant_id_, user_id_, legacy_catalog_name_);
+  }
+  ObCatalogDatabasePrivSortKey get_catalog_database_priv_key() const
+  {
+    return ObCatalogDatabasePrivSortKey(
+        tenant_id_, user_id_, catalog_name_, database_name_);
+  }
+  ObCatalogTablePrivSortKey get_catalog_table_priv_key() const
+  {
+    return ObCatalogTablePrivSortKey(
+        tenant_id_, user_id_, catalog_name_, database_name_, table_name_);
   }
   ObTenantExternalResourceId get_external_resource_key() const
   {
@@ -578,8 +594,8 @@ public:
       hash_code = common::murmurhash(&schema_key.user_id_,
                                      sizeof(schema_key.user_id_),
                                      hash_code);
-      hash_code = common::murmurhash(schema_key.catalog_name_.ptr(),
-                                     schema_key.catalog_name_.length(),
+      hash_code = common::murmurhash(schema_key.legacy_catalog_name_.ptr(),
+                                     schema_key.legacy_catalog_name_.length(),
                                      hash_code);
       return OB_SUCCESS;
     }
@@ -590,7 +606,49 @@ public:
     {
       return a.tenant_id_ == b.tenant_id_ &&
           a.user_id_ == b.user_id_ &&
-          a.catalog_name_ == b.catalog_name_;
+          a.legacy_catalog_name_ == b.legacy_catalog_name_;
+    }
+  };
+
+  struct catalog_database_priv_key_hash_func
+  {
+    int operator()(const SchemaKey &key, uint64_t &hash_code) const
+    {
+      hash_code = common::murmurhash(&key.tenant_id_, sizeof(key.tenant_id_), 0);
+      hash_code = common::murmurhash(&key.user_id_, sizeof(key.user_id_), hash_code);
+      hash_code = key.catalog_name_.hash(hash_code);
+      hash_code = key.database_name_.hash(hash_code);
+      return OB_SUCCESS;
+    }
+  };
+  struct catalog_database_priv_key_equal_to
+  {
+    bool operator()(const SchemaKey &a, const SchemaKey &b) const
+    {
+      return a.tenant_id_ == b.tenant_id_ && a.user_id_ == b.user_id_
+          && a.catalog_name_ == b.catalog_name_
+          && a.database_name_ == b.database_name_;
+    }
+  };
+  struct catalog_table_priv_key_hash_func
+  {
+    int operator()(const SchemaKey &key, uint64_t &hash_code) const
+    {
+      hash_code = common::murmurhash(&key.tenant_id_, sizeof(key.tenant_id_), 0);
+      hash_code = common::murmurhash(&key.user_id_, sizeof(key.user_id_), hash_code);
+      hash_code = key.catalog_name_.hash(hash_code);
+      hash_code = key.database_name_.hash(hash_code);
+      hash_code = key.table_name_.hash(hash_code);
+      return OB_SUCCESS;
+    }
+  };
+  struct catalog_table_priv_key_equal_to
+  {
+    bool operator()(const SchemaKey &a, const SchemaKey &b) const
+    {
+      return a.tenant_id_ == b.tenant_id_ && a.user_id_ == b.user_id_
+          && a.catalog_name_ == b.catalog_name_
+          && a.database_name_ == b.database_name_ && a.table_name_ == b.table_name_;
     }
   };
 
@@ -950,6 +1008,12 @@ public:
       obj_priv_hash_func, obj_priv_equal_to> ObjPrivKeys;
   typedef common::hash::ObHashSet<SchemaKey, common::hash::NoPthreadDefendMode,
       obj_mysql_priv_hash_func, obj_mysql_priv_equal_to> ObjMysqlPrivKeys;
+  typedef common::hash::ObHashSet<SchemaKey, common::hash::NoPthreadDefendMode,
+      catalog_database_priv_key_hash_func,
+      catalog_database_priv_key_equal_to> CatalogDatabasePrivKeys;
+  typedef common::hash::ObHashSet<SchemaKey, common::hash::NoPthreadDefendMode,
+      catalog_table_priv_key_hash_func,
+      catalog_table_priv_key_equal_to> CatalogTablePrivKeys;
 
   struct AllSchemaKeys
   {
@@ -1080,6 +1144,10 @@ public:
     CatalogKeys del_catalog_keys_;
     CatalogPrivKeys new_catalog_priv_keys_;
     CatalogPrivKeys del_catalog_priv_keys_;
+    CatalogDatabasePrivKeys new_catalog_database_priv_keys_;
+    CatalogDatabasePrivKeys del_catalog_database_priv_keys_;
+    CatalogTablePrivKeys new_catalog_table_priv_keys_;
+    CatalogTablePrivKeys del_catalog_table_priv_keys_;
 
     // external resource
     ExternalResourceKeys new_external_resource_keys_;
@@ -1136,6 +1204,8 @@ public:
     common::ObArray<ObSimpleUserSchema> simple_user_schemas_;
     common::ObArray<ObDbLinkSchema> simple_dblink_schemas_;
     common::ObArray<ObCatalogPriv> simple_catalog_priv_schemas_;
+    common::ObArray<ObCatalogDatabasePriv> simple_catalog_database_priv_schemas_;
+    common::ObArray<ObCatalogTablePriv> simple_catalog_table_priv_schemas_;
     common::ObArray<ObDBPriv> simple_db_priv_schemas_;
     common::ObArray<ObTablePriv> simple_table_priv_schemas_;
     common::ObArray<ObRoutinePriv> simple_routine_priv_schemas_;
@@ -1339,6 +1409,8 @@ private:
   GET_INCREMENT_SCHEMA_KEY_FUNC_DECLARE(table);
   GET_INCREMENT_SCHEMA_KEY_FUNC_DECLARE(outline);
   GET_INCREMENT_SCHEMA_KEY_FUNC_DECLARE(catalog_priv);
+  GET_INCREMENT_SCHEMA_KEY_FUNC_DECLARE(catalog_database_priv);
+  GET_INCREMENT_SCHEMA_KEY_FUNC_DECLARE(catalog_table_priv);
   GET_INCREMENT_SCHEMA_KEY_FUNC_DECLARE(db_priv);
   GET_INCREMENT_SCHEMA_KEY_FUNC_DECLARE(table_priv);
   GET_INCREMENT_SCHEMA_KEY_FUNC_DECLARE(routine_priv);
@@ -1399,6 +1471,8 @@ private:
   APPLY_SCHEMA_TO_CACHE(package, ObPackageMgr);
   APPLY_SCHEMA_TO_CACHE(trigger, ObTriggerMgr);
   APPLY_SCHEMA_TO_CACHE(catalog_priv, ObPrivMgr);
+  APPLY_SCHEMA_TO_CACHE(catalog_database_priv, ObPrivMgr);
+  APPLY_SCHEMA_TO_CACHE(catalog_table_priv, ObPrivMgr);
   APPLY_SCHEMA_TO_CACHE(db_priv, ObPrivMgr);
   APPLY_SCHEMA_TO_CACHE(table_priv, ObPrivMgr);
   APPLY_SCHEMA_TO_CACHE(routine_priv, ObPrivMgr);

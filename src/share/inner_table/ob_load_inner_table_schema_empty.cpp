@@ -167,7 +167,7 @@ const uint64_t INNER_TABLE_ALL_DDL_OPERATION_TABLE_IDS[] = {
 };
 const uint64_t INNER_TABLE_ALL_DDL_OPERATION_CHECKSUMS[] = {
 };
-const char * INNER_TABLE_ALL_DDL_OPERATION_HEADER = "gmt_create,gmt_modified,tenant_id,user_id,database_id,database_name,tablegroup_id,table_id,table_name,operation_type,ddl_stmt_str,exec_tenant_id";
+const char * INNER_TABLE_ALL_DDL_OPERATION_HEADER = "gmt_create,gmt_modified,tenant_id,user_id,database_id,database_name,tablegroup_id,table_id,table_name,operation_type,ddl_stmt_str,exec_tenant_id,catalog_name";
 static_assert(ARRAYSIZEOF(INNER_TABLE_ALL_DDL_OPERATION_ROWS) == ARRAYSIZEOF(INNER_TABLE_ALL_DDL_OPERATION_TABLE_IDS), "ALL_DDL_OPERATION header and table_ids length is not equal");
 static_assert(ARRAYSIZEOF(INNER_TABLE_ALL_DDL_OPERATION_ROWS) == ARRAYSIZEOF(INNER_TABLE_ALL_DDL_OPERATION_CHECKSUMS), "ALL_DDL_OPERATION header and table_ids length is not equal");
 const ObLoadInnerTableSchemaInfo ALL_DDL_OPERATION_LOAD_INFO(

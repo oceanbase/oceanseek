@@ -75,6 +75,8 @@ public:
       const ObSQLSessionInfo *session, 
       const ParseNode *node,
       const common::ObString &session_db,
+      const uint64_t current_catalog_id,
+      const common::ObString &current_catalog,
       common::ObString &db,
       common::ObString &table,
       share::schema::ObPrivLevel &grant_level,
@@ -400,7 +402,40 @@ int ObGrantResolver::resolve_priv_object(const ParseNode *priv_object_node,
   } else if (priv_object_node != NULL) {
     if (priv_object_node->value_ == 1) {
       const share::schema::ObTableSchema *table_schema = NULL;
-      if (OB_FAIL(schema_checker->get_table_schema(tenant_id, db, table, false, table_schema))) {
+      if (!catalog.empty()) {
+        uint64_t catalog_id = OB_INVALID_ID;
+        uint64_t database_id = OB_INVALID_ID;
+        uint64_t table_id = OB_INVALID_ID;
+        object_type = ObObjectType::TABLE;
+        if (OB_FAIL(schema_checker->get_catalog_id_name(
+                tenant_id, catalog, catalog_id, allocator, !is_grant))) {
+          LOG_WARN("failed to get catalog id", K(ret), K(catalog));
+        } else if (OB_INVALID_ID == catalog_id && !is_grant) {
+          // Revoking a privilege remains possible after the remote object was removed.
+        } else if (OB_UNLIKELY(!is_external_catalog_id(catalog_id))) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("catalog table privilege is only supported for external catalog",
+                   K(ret), K(catalog), K(catalog_id));
+          LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                         is_grant ? "grant privilege on table in internal catalog"
+                                  : "revoke privilege on table in internal catalog");
+        } else if (OB_FAIL(schema_checker->get_catalog_database_id_name(
+                       tenant_id, catalog_id, db, database_id, allocator, !is_grant))) {
+          LOG_WARN("failed to get catalog database", K(ret), K(catalog), K(db));
+        } else if (OB_INVALID_ID == database_id && !is_grant) {
+          // Revoking a privilege remains possible after the remote database was removed.
+        } else if (OB_FAIL(schema_checker->get_catalog_table_id_name(
+                       tenant_id, catalog_id, database_id, table, table_id, allocator, !is_grant))) {
+          LOG_WARN("failed to get catalog table", K(ret), K(catalog), K(db), K(table));
+        } else if (OB_INVALID_ID == table_id && !is_grant) {
+          // Revoking a privilege remains possible after the remote table was removed.
+        }
+        if (OB_SUCC(ret)) {
+          grant_stmt->set_catalog_name(catalog);
+          grant_stmt->set_database_name(db);
+          grant_stmt->set_table_name(table);
+        }
+      } else if (OB_FAIL(schema_checker->get_table_schema(tenant_id, db, table, false, table_schema))) {
         LOG_WARN("get table schema failed", K(ret));
         if (OB_TABLE_NOT_EXIST == ret && !is_grant) {
           ret = OB_SUCCESS;
@@ -434,8 +469,41 @@ int ObGrantResolver::resolve_priv_object(const ParseNode *priv_object_node,
       object_type = ObObjectType::CATALOG;
       if (OB_FAIL(schema_checker->get_catalog_id_name(tenant_id, catalog, object_id, allocator, !is_grant))) {
         LOG_WARN("failed to get catalog id", K(ret));
+      } else if (OB_INVALID_ID != object_id && OB_UNLIKELY(!is_external_catalog_id(object_id))) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("catalog privilege is only supported for external catalog",
+                 K(ret), K(catalog), K(object_id));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                       is_grant ? "grant privilege on internal catalog"
+                                : "revoke privilege on internal catalog");
       } else {
         grant_stmt->set_catalog_name(catalog);
+      }
+    } else if (priv_object_node->value_ == 9) {
+      uint64_t catalog_id = OB_INVALID_ID;
+      uint64_t database_id = OB_INVALID_ID;
+      if (OB_FAIL(schema_checker->get_catalog_id_name(
+              tenant_id, catalog, catalog_id, allocator, !is_grant))) {
+        LOG_WARN("failed to get catalog id", K(ret), K(catalog));
+      } else if (OB_INVALID_ID == catalog_id && !is_grant) {
+        // Revoking a privilege remains possible after the remote object was removed.
+      } else if (OB_UNLIKELY(!is_external_catalog_id(catalog_id))) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("catalog database privilege is only supported for external catalog",
+                 K(ret), K(catalog), K(catalog_id));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                       is_grant ? "grant privilege on database in internal catalog"
+                                : "revoke privilege on database in internal catalog");
+      } else if (OB_FAIL(schema_checker->get_catalog_database_id_name(
+                     tenant_id, catalog_id, db, database_id, allocator, !is_grant))) {
+        LOG_WARN("failed to get catalog database", K(ret), K(catalog), K(db));
+      } else if (OB_INVALID_ID == database_id && !is_grant) {
+        // Revoking a privilege remains possible after the remote database was removed.
+      }
+      if (OB_SUCC(ret)) {
+        object_type = ObObjectType::MAX_TYPE;
+        grant_stmt->set_catalog_name(catalog);
+        grant_stmt->set_database_name(db);
       }
     } else if (priv_object_node->value_ == 5) {
       object_type = ObObjectType::LOCATION;

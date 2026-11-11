@@ -224,6 +224,287 @@ struct ObGetCatalogPrivKey<ObCatalogPrivSortKey, ObCatalogPriv *>
   }
 };
 
+struct ObCatalogDatabasePrivSortKey
+{
+  ObCatalogDatabasePrivSortKey()
+      : tenant_id_(common::OB_INVALID_ID), user_id_(common::OB_INVALID_ID)
+  {}
+  ObCatalogDatabasePrivSortKey(const uint64_t tenant_id,
+                               const uint64_t user_id,
+                               const common::ObString &catalog,
+                               const common::ObString &database)
+      : tenant_id_(tenant_id), user_id_(user_id), catalog_(catalog), database_(database)
+  {}
+  bool operator==(const ObCatalogDatabasePrivSortKey &rhs) const
+  {
+    return tenant_id_ == rhs.tenant_id_ && user_id_ == rhs.user_id_
+           && catalog_ == rhs.catalog_ && database_ == rhs.database_;
+  }
+  bool operator!=(const ObCatalogDatabasePrivSortKey &rhs) const
+  {
+    return !(*this == rhs);
+  }
+  bool operator<(const ObCatalogDatabasePrivSortKey &rhs) const
+  {
+    bool bret = tenant_id_ < rhs.tenant_id_;
+    if (!bret && tenant_id_ == rhs.tenant_id_) {
+      bret = user_id_ < rhs.user_id_;
+      if (!bret && user_id_ == rhs.user_id_) {
+        bret = catalog_ < rhs.catalog_;
+        if (!bret && catalog_ == rhs.catalog_) {
+          bret = database_ < rhs.database_;
+        }
+      }
+    }
+    return bret;
+  }
+  uint64_t hash() const
+  {
+    uint64_t hash_ret = common::murmurhash(&tenant_id_, sizeof(tenant_id_), 0);
+    hash_ret = common::murmurhash(&user_id_, sizeof(user_id_), hash_ret);
+    hash_ret = common::murmurhash(catalog_.ptr(), catalog_.length(), hash_ret);
+    hash_ret = common::murmurhash(database_.ptr(), database_.length(), hash_ret);
+    return hash_ret;
+  }
+  bool is_valid() const
+  {
+    return tenant_id_ != common::OB_INVALID_ID && user_id_ != common::OB_INVALID_ID;
+  }
+  int deep_copy(const ObCatalogDatabasePrivSortKey &src, common::ObIAllocator &allocator)
+  {
+    int ret = OB_SUCCESS;
+    tenant_id_ = src.tenant_id_;
+    user_id_ = src.user_id_;
+    if (OB_FAIL(common::ob_write_string(allocator, src.catalog_, catalog_))) {
+      SHARE_SCHEMA_LOG(WARN, "failed to deep copy catalog", KR(ret), K(src.catalog_));
+    } else if (OB_FAIL(common::ob_write_string(allocator, src.database_, database_))) {
+      SHARE_SCHEMA_LOG(WARN, "failed to deep copy database", KR(ret), K(src.database_));
+    }
+    return ret;
+  }
+
+  TO_STRING_KV(K_(tenant_id), K_(user_id), K_(catalog), K_(database));
+  uint64_t tenant_id_;
+  uint64_t user_id_;
+  common::ObString catalog_;
+  common::ObString database_;
+};
+
+class ObCatalogDatabasePriv : public ObSchema, public ObPriv
+{
+  OB_UNIS_VERSION(1);
+
+public:
+  ObCatalogDatabasePriv() : ObSchema(), ObPriv() {}
+  explicit ObCatalogDatabasePriv(common::ObIAllocator *allocator)
+      : ObSchema(allocator), ObPriv(allocator)
+  {}
+  ObCatalogDatabasePriv(const ObCatalogDatabasePriv &other)
+      : ObSchema(), ObPriv()
+  { *this = other; }
+  virtual ~ObCatalogDatabasePriv() {}
+
+  ObCatalogDatabasePriv &operator=(const ObCatalogDatabasePriv &other);
+
+  ObCatalogDatabasePrivSortKey get_sort_key() const
+  { return ObCatalogDatabasePrivSortKey(tenant_id_, user_id_, catalog_, database_); }
+  static bool cmp(const ObCatalogDatabasePriv *lhs, const ObCatalogDatabasePriv *rhs)
+  { return NULL != lhs && NULL != rhs ? lhs->get_sort_key() < rhs->get_sort_key() : false; }
+  static bool cmp_sort_key(const ObCatalogDatabasePriv *lhs,
+                           const ObCatalogDatabasePrivSortKey &sort_key)
+  { return NULL != lhs ? lhs->get_sort_key() < sort_key : false; }
+  static bool equal(const ObCatalogDatabasePriv *lhs, const ObCatalogDatabasePriv *rhs)
+  { return NULL != lhs && NULL != rhs ? lhs->get_sort_key() == rhs->get_sort_key() : false; }
+  static bool equal_sort_key(const ObCatalogDatabasePriv *lhs,
+                             const ObCatalogDatabasePrivSortKey &sort_key)
+  { return NULL != lhs ? lhs->get_sort_key() == sort_key : false; }
+
+  int set_catalog_name(const char *catalog) { return deep_copy_str(catalog, catalog_); }
+  int set_catalog_name(const common::ObString &catalog) { return deep_copy_str(catalog, catalog_); }
+  int set_database_name(const char *database) { return deep_copy_str(database, database_); }
+  int set_database_name(const common::ObString &database) { return deep_copy_str(database, database_); }
+
+  const char *get_catalog_name() const { return extract_str(catalog_); }
+  const common::ObString &get_catalog_name_str() const { return catalog_; }
+  const char *get_database_name() const { return extract_str(database_); }
+  const common::ObString &get_database_name_str() const { return database_; }
+
+  virtual bool is_valid() const;
+  virtual void reset();
+  int64_t get_convert_size() const;
+  TO_STRING_KV(K_(tenant_id), K_(user_id), K_(catalog), K_(database),
+               "privileges", ObPrintPrivSet(priv_set_));
+
+private:
+  common::ObString catalog_;
+  common::ObString database_;
+};
+
+template<class T, class V>
+struct ObGetCatalogDatabasePrivKey
+{
+  void operator()(const T &t, const V &v) const
+  {
+    UNUSED(t);
+    UNUSED(v);
+  }
+};
+template<>
+struct ObGetCatalogDatabasePrivKey<ObCatalogDatabasePrivSortKey, ObCatalogDatabasePriv *>
+{
+  ObCatalogDatabasePrivSortKey operator()(const ObCatalogDatabasePriv *catalog_database_priv) const
+  {
+    ObCatalogDatabasePrivSortKey key;
+    return NULL != catalog_database_priv ? catalog_database_priv->get_sort_key() : key;
+  }
+};
+
+struct ObCatalogTablePrivSortKey
+{
+  ObCatalogTablePrivSortKey()
+      : tenant_id_(common::OB_INVALID_ID), user_id_(common::OB_INVALID_ID)
+  {}
+  ObCatalogTablePrivSortKey(const uint64_t tenant_id,
+                            const uint64_t user_id,
+                            const common::ObString &catalog,
+                            const common::ObString &database,
+                            const common::ObString &table)
+      : tenant_id_(tenant_id), user_id_(user_id), catalog_(catalog), database_(database), table_(table)
+  {}
+  bool operator==(const ObCatalogTablePrivSortKey &rhs) const
+  {
+    return tenant_id_ == rhs.tenant_id_ && user_id_ == rhs.user_id_
+           && catalog_ == rhs.catalog_ && database_ == rhs.database_ && table_ == rhs.table_;
+  }
+  bool operator!=(const ObCatalogTablePrivSortKey &rhs) const
+  {
+    return !(*this == rhs);
+  }
+  bool operator<(const ObCatalogTablePrivSortKey &rhs) const
+  {
+    bool bret = tenant_id_ < rhs.tenant_id_;
+    if (!bret && tenant_id_ == rhs.tenant_id_) {
+      bret = user_id_ < rhs.user_id_;
+      if (!bret && user_id_ == rhs.user_id_) {
+        bret = catalog_ < rhs.catalog_;
+        if (!bret && catalog_ == rhs.catalog_) {
+          bret = database_ < rhs.database_;
+          if (!bret && database_ == rhs.database_) {
+            bret = table_ < rhs.table_;
+          }
+        }
+      }
+    }
+    return bret;
+  }
+  uint64_t hash() const
+  {
+    uint64_t hash_ret = common::murmurhash(&tenant_id_, sizeof(tenant_id_), 0);
+    hash_ret = common::murmurhash(&user_id_, sizeof(user_id_), hash_ret);
+    hash_ret = common::murmurhash(catalog_.ptr(), catalog_.length(), hash_ret);
+    hash_ret = common::murmurhash(database_.ptr(), database_.length(), hash_ret);
+    hash_ret = common::murmurhash(table_.ptr(), table_.length(), hash_ret);
+    return hash_ret;
+  }
+  bool is_valid() const
+  {
+    return tenant_id_ != common::OB_INVALID_ID && user_id_ != common::OB_INVALID_ID;
+  }
+  int deep_copy(const ObCatalogTablePrivSortKey &src, common::ObIAllocator &allocator)
+  {
+    int ret = OB_SUCCESS;
+    tenant_id_ = src.tenant_id_;
+    user_id_ = src.user_id_;
+    if (OB_FAIL(common::ob_write_string(allocator, src.catalog_, catalog_))) {
+      SHARE_SCHEMA_LOG(WARN, "failed to deep copy catalog", KR(ret), K(src.catalog_));
+    } else if (OB_FAIL(common::ob_write_string(allocator, src.database_, database_))) {
+      SHARE_SCHEMA_LOG(WARN, "failed to deep copy database", KR(ret), K(src.database_));
+    } else if (OB_FAIL(common::ob_write_string(allocator, src.table_, table_))) {
+      SHARE_SCHEMA_LOG(WARN, "failed to deep copy table", KR(ret), K(src.table_));
+    }
+    return ret;
+  }
+
+  TO_STRING_KV(K_(tenant_id), K_(user_id), K_(catalog), K_(database), K_(table));
+  uint64_t tenant_id_;
+  uint64_t user_id_;
+  common::ObString catalog_;
+  common::ObString database_;
+  common::ObString table_;
+};
+
+class ObCatalogTablePriv : public ObSchema, public ObPriv
+{
+  OB_UNIS_VERSION(1);
+
+public:
+  ObCatalogTablePriv() : ObSchema(), ObPriv() {}
+  explicit ObCatalogTablePriv(common::ObIAllocator *allocator)
+      : ObSchema(allocator), ObPriv(allocator)
+  {}
+  ObCatalogTablePriv(const ObCatalogTablePriv &other)
+      : ObSchema(), ObPriv()
+  { *this = other; }
+  virtual ~ObCatalogTablePriv() {}
+
+  ObCatalogTablePriv &operator=(const ObCatalogTablePriv &other);
+
+  ObCatalogTablePrivSortKey get_sort_key() const
+  { return ObCatalogTablePrivSortKey(tenant_id_, user_id_, catalog_, database_, table_); }
+  static bool cmp(const ObCatalogTablePriv *lhs, const ObCatalogTablePriv *rhs)
+  { return NULL != lhs && NULL != rhs ? lhs->get_sort_key() < rhs->get_sort_key() : false; }
+  static bool cmp_sort_key(const ObCatalogTablePriv *lhs, const ObCatalogTablePrivSortKey &sort_key)
+  { return NULL != lhs ? lhs->get_sort_key() < sort_key : false; }
+  static bool equal(const ObCatalogTablePriv *lhs, const ObCatalogTablePriv *rhs)
+  { return NULL != lhs && NULL != rhs ? lhs->get_sort_key() == rhs->get_sort_key() : false; }
+  static bool equal_sort_key(const ObCatalogTablePriv *lhs, const ObCatalogTablePrivSortKey &sort_key)
+  { return NULL != lhs ? lhs->get_sort_key() == sort_key : false; }
+
+  int set_catalog_name(const char *catalog) { return deep_copy_str(catalog, catalog_); }
+  int set_catalog_name(const common::ObString &catalog) { return deep_copy_str(catalog, catalog_); }
+  int set_database_name(const char *database) { return deep_copy_str(database, database_); }
+  int set_database_name(const common::ObString &database) { return deep_copy_str(database, database_); }
+  int set_table_name(const char *table) { return deep_copy_str(table, table_); }
+  int set_table_name(const common::ObString &table) { return deep_copy_str(table, table_); }
+
+  const char *get_catalog_name() const { return extract_str(catalog_); }
+  const common::ObString &get_catalog_name_str() const { return catalog_; }
+  const char *get_database_name() const { return extract_str(database_); }
+  const common::ObString &get_database_name_str() const { return database_; }
+  const char *get_table_name() const { return extract_str(table_); }
+  const common::ObString &get_table_name_str() const { return table_; }
+
+  virtual bool is_valid() const;
+  virtual void reset();
+  int64_t get_convert_size() const;
+  TO_STRING_KV(K_(tenant_id), K_(user_id), K_(catalog), K_(database), K_(table),
+               "privileges", ObPrintPrivSet(priv_set_));
+
+private:
+  common::ObString catalog_;
+  common::ObString database_;
+  common::ObString table_;
+};
+
+template<class T, class V>
+struct ObGetCatalogTablePrivKey
+{
+  void operator()(const T &t, const V &v) const
+  {
+    UNUSED(t);
+    UNUSED(v);
+  }
+};
+template<>
+struct ObGetCatalogTablePrivKey<ObCatalogTablePrivSortKey, ObCatalogTablePriv *>
+{
+  ObCatalogTablePrivSortKey operator()(const ObCatalogTablePriv *catalog_table_priv) const
+  {
+    ObCatalogTablePrivSortKey key;
+    return NULL != catalog_table_priv ? catalog_table_priv->get_sort_key() : key;
+  }
+};
+
 }//namespace schema
 }//namespace share
 }//namespace oceanbase

@@ -20346,6 +20346,11 @@ TABLE
   malloc_terminal_node($$, result->malloc_pool_, T_PRIV_OBJECT);
   $$->value_ = 8;
 }
+| DATABASE
+{
+  malloc_terminal_node($$, result->malloc_pool_, T_PRIV_OBJECT);
+  $$->value_ = 9;
+}
 ;
 
 priv_level:
@@ -20381,6 +20386,15 @@ priv_level:
   ParseNode* db_node = $1->children_[0];
   ParseNode* tb_node = $1->children_[1];
   malloc_non_terminal_node($$, result->malloc_pool_, T_PRIV_LEVEL, 2, db_node, tb_node);
+}
+| relation_name '.' relation_name '.' relation_name
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_PRIV_LEVEL, 3, $1, $3, $5);
+}
+| id_dot_id_dot_id
+{
+  malloc_non_terminal_node($$, result->malloc_pool_, T_PRIV_LEVEL, 3,
+                           $1->children_[0], $1->children_[1], $1->children_[2]);
 }
 ;
 

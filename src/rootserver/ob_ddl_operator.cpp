@@ -7727,6 +7727,60 @@ int ObDDLOperator::drop_db_table_privs(
       }
     }
   }
+  // delete catalog database privileges of this user
+  if (OB_SUCC(ret)) {
+    ObArray<const ObCatalogDatabasePriv *> catalog_database_privs;
+    if (OB_FAIL(schema_guard.get_catalog_database_priv_with_user_id(
+            tenant_id, user_id, catalog_database_privs))) {
+      LOG_WARN("get catalog database privileges of user failed", K(ret), K(tenant_id), K(user_id));
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < catalog_database_privs.count(); ++i) {
+        const ObCatalogDatabasePriv *priv = catalog_database_privs.at(i);
+        int64_t new_schema_version = OB_INVALID_VERSION;
+        if (OB_ISNULL(priv)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("catalog database privilege is null", K(ret));
+        } else if (OB_FAIL(schema_service_.gen_new_schema_version(
+                       tenant_id, new_schema_version))) {
+          LOG_WARN("generate schema version failed", K(ret), K(tenant_id));
+        } else if (OB_FAIL(schema_sql_service->get_catalog_sql_service()
+                       .grant_revoke_catalog_database(priv->get_sort_key(),
+                                                      OB_PRIV_SET_EMPTY,
+                                                      new_schema_version,
+                                                      ObString(),
+                                                      trans))) {
+          LOG_WARN("delete catalog database privilege failed", K(ret), KPC(priv));
+        }
+      }
+    }
+  }
+  // delete catalog table privileges of this user
+  if (OB_SUCC(ret)) {
+    ObArray<const ObCatalogTablePriv *> catalog_table_privs;
+    if (OB_FAIL(schema_guard.get_catalog_table_priv_with_user_id(
+            tenant_id, user_id, catalog_table_privs))) {
+      LOG_WARN("get catalog table privileges of user failed", K(ret), K(tenant_id), K(user_id));
+    } else {
+      for (int64_t i = 0; OB_SUCC(ret) && i < catalog_table_privs.count(); ++i) {
+        const ObCatalogTablePriv *priv = catalog_table_privs.at(i);
+        int64_t new_schema_version = OB_INVALID_VERSION;
+        if (OB_ISNULL(priv)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("catalog table privilege is null", K(ret));
+        } else if (OB_FAIL(schema_service_.gen_new_schema_version(
+                       tenant_id, new_schema_version))) {
+          LOG_WARN("generate schema version failed", K(ret), K(tenant_id));
+        } else if (OB_FAIL(schema_sql_service->get_catalog_sql_service()
+                       .grant_revoke_catalog_table(priv->get_sort_key(),
+                                                   OB_PRIV_SET_EMPTY,
+                                                   new_schema_version,
+                                                   ObString(),
+                                                   trans))) {
+          LOG_WARN("delete catalog table privilege failed", K(ret), KPC(priv));
+        }
+      }
+    }
+  }
   // delete sensitive rule privileges of this user
   if (OB_SUCC(ret)) {
     ObArray<const ObSensitiveRulePriv *> sensitive_rule_privs;

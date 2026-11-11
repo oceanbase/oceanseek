@@ -2188,9 +2188,8 @@ int ObInsertLogPlan::prepare_external_table_info_for_insert(const ObTableSchema 
       || OB_ISNULL(sql_schema_guard = get_optimizer_context().get_sql_schema_guard())
       || OB_ISNULL(session_info = get_optimizer_context().get_session_info())
       || OB_ISNULL(get_optimizer_context().get_query_ctx())
-      || stmt->get_table_items().count() != 2
-      || OB_ISNULL(stmt->get_table_item(0))
-      || OB_ISNULL(stmt->get_table_item(1))) {
+      || stmt->get_table_items().empty()
+      || OB_ISNULL(stmt->get_table_item(0))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null ptr", K(ret), K(stmt), K(sql_schema_guard), K(session_info));
   } else if (OB_FAIL(sql_schema_guard->get_table_schema(session_info->get_effective_tenant_id(),
@@ -2253,8 +2252,8 @@ int ObInsertLogPlan::allocate_select_into_as_top_for_insert(ObLogicalOperator *&
   if (OB_ISNULL(old_top) || OB_ISNULL(stmt)
       || OB_ISNULL(sql_schema_guard = get_optimizer_context().get_sql_schema_guard())
       || OB_ISNULL(session_info = get_optimizer_context().get_session_info())
-      || stmt->get_table_items().count() != 2
-      || OB_ISNULL(stmt->get_table_item(0)) || OB_ISNULL(stmt->get_table_item(1))) {
+      || stmt->get_table_items().empty()
+      || OB_ISNULL(stmt->get_table_item(0))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("Get unexpected null", K(ret), K(old_top), K(sql_schema_guard), K(session_info), K(stmt));
   } else if (OB_ISNULL(select_into = static_cast<ObLogSelectInto *>(

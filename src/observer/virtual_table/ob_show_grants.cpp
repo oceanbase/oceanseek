@@ -68,6 +68,8 @@ int ObShowGrants::add_priv_map_recursively(uint64_t user_id, PRIV_MAP &priv_map,
     SERVER_LOG(WARN, "User not exist", K(ret), K_(tenant_id));
   } else {
     ObArray<const ObCatalogPriv *> catalog_priv_array;
+    ObArray<const ObCatalogDatabasePriv *> catalog_database_priv_array;
+    ObArray<const ObCatalogTablePriv *> catalog_table_priv_array;
     ObArray<const ObDBPriv *> db_priv_array;
     ObArray<const ObTablePriv *> table_priv_array;
     ObArray<const ObColumnPriv *> column_priv_array;
@@ -76,6 +78,10 @@ int ObShowGrants::add_priv_map_recursively(uint64_t user_id, PRIV_MAP &priv_map,
     ObArray<const ObSensitiveRulePriv *> sensitive_rule_priv_array;
 
     OZ (schema_guard_->get_catalog_priv_with_user_id(tenant_id_, user_id, catalog_priv_array));
+    OZ (schema_guard_->get_catalog_database_priv_with_user_id(
+            tenant_id_, user_id, catalog_database_priv_array));
+    OZ (schema_guard_->get_catalog_table_priv_with_user_id(
+            tenant_id_, user_id, catalog_table_priv_array));
     OZ (schema_guard_->get_db_priv_with_user_id(tenant_id_, user_id, db_priv_array));
     OZ (schema_guard_->get_table_priv_with_user_id(tenant_id_, user_id, table_priv_array));
     OZ (schema_guard_->get_column_priv_with_user_id(tenant_id_, user_id, column_priv_array));
@@ -94,6 +100,25 @@ int ObShowGrants::add_priv_map_recursively(uint64_t user_id, PRIV_MAP &priv_map,
       PrivKey priv_key;
       priv_key.catalog_name_ = catalog_priv_array.at(i)->get_catalog_name_str();
       OZ (add_priv_map(priv_map, priv_key, catalog_priv_array.at(i)->get_priv_set()));
+    }
+
+    //catalog database level
+    for (int i = 0; OB_SUCC(ret) && i < catalog_database_priv_array.count(); i++) {
+      PrivKey priv_key;
+      priv_key.catalog_name_ = catalog_database_priv_array.at(i)->get_catalog_name_str();
+      priv_key.db_name_ = catalog_database_priv_array.at(i)->get_database_name_str();
+      OZ (add_priv_map(priv_map,
+                       priv_key,
+                       catalog_database_priv_array.at(i)->get_priv_set()));
+    }
+
+    //catalog table level
+    for (int i = 0; OB_SUCC(ret) && i < catalog_table_priv_array.count(); i++) {
+      PrivKey priv_key;
+      priv_key.catalog_name_ = catalog_table_priv_array.at(i)->get_catalog_name_str();
+      priv_key.db_name_ = catalog_table_priv_array.at(i)->get_database_name_str();
+      priv_key.table_name_ = catalog_table_priv_array.at(i)->get_table_name_str();
+      OZ (add_priv_map(priv_map, priv_key, catalog_table_priv_array.at(i)->get_priv_set()));
     }
 
     //db_level
@@ -262,6 +287,7 @@ int ObShowGrants::inner_get_next_row(common::ObNewRow *&row)
               pos = 0;
               have_priv.priv_level_ = OB_PRIV_USER_LEVEL;
               have_priv.priv_set_ = privs;
+              have_priv.catalog_.reset();
 
               OZ (get_grants_string(buf, PRIV_BUF_LENGTH, pos, have_priv, user_name, host_name));
               OX (result.assign_ptr(buf, static_cast<int32_t>(pos)));
@@ -312,6 +338,7 @@ int ObShowGrants::inner_get_next_row(common::ObNewRow *&row)
               have_priv.priv_level_ = OB_PRIV_DB_LEVEL;
               have_priv.priv_set_ = privs;
               have_priv.db_ = priv_key.db_name_;
+              have_priv.catalog_ = priv_key.catalog_name_;
 
               OZ (get_grants_string(buf, PRIV_BUF_LENGTH, pos, have_priv, user_name, host_name));
               OX (result.assign_ptr(buf, static_cast<int32_t>(pos)));
@@ -337,7 +364,9 @@ int ObShowGrants::inner_get_next_row(common::ObNewRow *&row)
             if (OB_FAIL(priv_key_value_set.push_back(priv_key_array.at(i)))) {
               LOG_WARN("push back failed", K(ret));
             } else if (i + 1 < priv_key_array.count()) {
-              if (priv_key_array.at(i).first.db_name_ != priv_key_array.at(i + 1).first.db_name_ 
+              if (priv_key_array.at(i).first.catalog_name_
+                      != priv_key_array.at(i + 1).first.catalog_name_
+                 || priv_key_array.at(i).first.db_name_ != priv_key_array.at(i + 1).first.db_name_
                  || priv_key_array.at(i).first.table_name_ != priv_key_array.at(i + 1).first.table_name_) {
                 need_print = true;
               }
@@ -351,6 +380,7 @@ int ObShowGrants::inner_get_next_row(common::ObNewRow *&row)
                 have_priv.priv_set_ = 0;
                 have_priv.db_ = priv_key_value_set.at(0).first.db_name_;
                 have_priv.table_ = priv_key_value_set.at(0).first.table_name_;
+                have_priv.catalog_ = priv_key_value_set.at(0).first.catalog_name_;
                 have_priv.obj_type_ = priv_key_value_set.at(0).first.obj_type_;
                 if (priv_key_value_set.at(0).first.column_name_.empty()) {
                   have_priv.priv_set_ = priv_key_value_set.at(0).second;
@@ -382,6 +412,7 @@ int ObShowGrants::inner_get_next_row(common::ObNewRow *&row)
               have_priv.db_ = priv_key.db_name_;
               have_priv.table_ = priv_key.table_name_;
               have_priv.obj_type_ = priv_key.obj_type_;
+              have_priv.catalog_.reset();
 
               OZ (get_grants_string(buf, PRIV_BUF_LENGTH, pos, have_priv, user_name, host_name));
               OX (result.assign_ptr(buf, static_cast<int32_t>(pos)));
@@ -1159,13 +1190,26 @@ int ObShowGrants::priv_level_printf(
       SERVER_LOG(WARN, "Fill privs to buffer failed", K(ret));
     }
   } else if (OB_PRIV_DB_LEVEL == have_priv.priv_level_) {
-    if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+    if (!have_priv.catalog_.empty()
+        && OB_FAIL(databuff_printf(buf, buf_len, pos,
+                                   " ON DATABASE `%.*s`.`%.*s`",
+                                   have_priv.catalog_.length(), have_priv.catalog_.ptr(),
+                                   have_priv.db_.length(), have_priv.db_.ptr()))) {
+      SERVER_LOG(WARN, "Fill catalog database privilege level failed", K(ret));
+    } else if (have_priv.catalog_.empty() && OB_FAIL(databuff_printf(buf, buf_len, pos,
                                 lib::is_oracle_mode() ? " ON \"%.*s\".*" : " ON `%.*s`.*",
                                 have_priv.db_.length(), have_priv.db_.ptr()))) {
       SERVER_LOG(WARN, "Fill privs to buffer failed", K(ret));
     }
   } else if (OB_PRIV_TABLE_LEVEL == have_priv.priv_level_) {
-    if (OB_FAIL(databuff_printf(buf, buf_len, pos,
+    if (!have_priv.catalog_.empty()
+        && OB_FAIL(databuff_printf(buf, buf_len, pos,
+                                   " ON TABLE `%.*s`.`%.*s`.`%.*s`",
+                                   have_priv.catalog_.length(), have_priv.catalog_.ptr(),
+                                   have_priv.db_.length(), have_priv.db_.ptr(),
+                                   have_priv.table_.length(), have_priv.table_.ptr()))) {
+      SERVER_LOG(WARN, "Fill catalog table privilege level failed", K(ret));
+    } else if (have_priv.catalog_.empty() && OB_FAIL(databuff_printf(buf, buf_len, pos,
                                 lib::is_oracle_mode() ? " ON \"%.*s\".\"%.*s\"" : 
                                                           " ON `%.*s`.`%.*s`",
                                 have_priv.db_.length(), have_priv.db_.ptr(),

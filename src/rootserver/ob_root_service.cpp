@@ -6328,6 +6328,11 @@ int ObRootService::revoke_database(const ObRevokeDBArg &arg)
   } else if (!arg.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arg", K(arg), K(ret));
+  } else if (!arg.catalog_.empty()) {
+    ObCatalogDDLService catalog_ddl_service(&ddl_service_);
+    if (OB_FAIL(catalog_ddl_service.revoke_catalog_database(arg))) {
+      LOG_WARN("revoke catalog database privilege failed", K(ret), K(arg));
+    }
   } else {
     ObOriginalDBKey db_key(arg.tenant_id_, arg.user_id_, arg.db_);
     if (OB_FAIL(ddl_service_.revoke_database(db_key, arg.priv_set_))) {
@@ -6347,6 +6352,11 @@ int ObRootService::revoke_table(const ObRevokeTableArg &arg)
   } else if (!arg.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid arg", K(arg), K(ret));
+  } else if (!arg.catalog_.empty()) {
+    ObCatalogDDLService catalog_ddl_service(&ddl_service_);
+    if (OB_FAIL(catalog_ddl_service.revoke_catalog_table(arg))) {
+      LOG_WARN("revoke catalog table privilege failed", K(ret), K(arg));
+    }
   } else if (OB_FAIL(ObCompatModeGetter::get_tenant_mode(arg.tenant_id_, mode))) {
     LOG_WARN("fail to get tenant mode", K(ret));
   } else if (lib::Worker::CompatMode::ORACLE == mode) {

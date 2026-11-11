@@ -84,6 +84,10 @@ public:
                                   const bool is_grant,
                                   common::ObSqlString &sql_string,
                                   const bool is_oracle_mode);
+  static int gen_catalog_object_priv_sql(const obrpc::ObAccountArg &account,
+                                         const share::schema::ObNeedPriv &need_priv,
+                                         const bool is_grant,
+                                         common::ObSqlString &sql_string);
   static int gen_sensitive_rule_priv_sql(const obrpc::ObAccountArg &account,
                                          const share::schema::ObNeedPriv &need_priv,
                                          const bool is_grant,

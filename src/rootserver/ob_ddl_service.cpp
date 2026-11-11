@@ -35307,34 +35307,49 @@ int ObDDLService::grant_priv_to_user(const uint64_t tenant_id,
         break;
       }
       case OB_PRIV_DB_LEVEL: {
-        ObOriginalDBKey db_key(tenant_id, user_id, need_priv.db_);
-        if (OB_FAIL(ObDDLSqlGenerator::gen_db_priv_sql(ObAccountArg(user_name, host_name), need_priv,
+        if (!need_priv.catalog_.empty()) {
+          ObCatalogDDLService catalog_ddl_service(this);
+          if (OB_FAIL(catalog_ddl_service.grant_revoke_catalog_object(
+                  tenant_id, user_id, user_name, host_name, need_priv, true, schema_guard))) {
+            LOG_WARN("grant catalog database privilege failed", K(ret), K(need_priv));
+          }
+        } else {
+          ObOriginalDBKey db_key(tenant_id, user_id, need_priv.db_);
+          if (OB_FAIL(ObDDLSqlGenerator::gen_db_priv_sql(ObAccountArg(user_name, host_name), need_priv,
                                                        true, ddl_stmt_str, is_oracle_mode))) {
-          LOG_WARN("gen_db_priv sql failed", K(need_priv), K(user_name), K(ret));
-        } else if (FALSE_IT(ddl_sql = ddl_stmt_str.string())) {
-        } else if (OB_FAIL(grant_database(db_key, need_priv.priv_set_, &ddl_sql, schema_guard))) {
-          LOG_WARN("Grant database error", KR(ret), K(db_key), K(ddl_sql), K(need_priv));
+            LOG_WARN("gen_db_priv sql failed", K(need_priv), K(user_name), K(ret));
+          } else if (FALSE_IT(ddl_sql = ddl_stmt_str.string())) {
+          } else if (OB_FAIL(grant_database(db_key, need_priv.priv_set_, &ddl_sql, schema_guard))) {
+            LOG_WARN("Grant database error", KR(ret), K(db_key), K(ddl_sql), K(need_priv));
+          }
         }
         break;
       }
       case OB_PRIV_TABLE_LEVEL: {
-        ObTablePrivSortKey table_key(tenant_id, user_id, need_priv.db_, need_priv.table_);
-        if (!is_oracle_mode
-            && OB_FAIL(ObDDLSqlGenerator::gen_table_priv_sql(ObAccountArg(user_name, host_name),
+        if (!need_priv.catalog_.empty()) {
+          ObCatalogDDLService catalog_ddl_service(this);
+          if (OB_FAIL(catalog_ddl_service.grant_revoke_catalog_object(
+                  tenant_id, user_id, user_name, host_name, need_priv, true, schema_guard))) {
+            LOG_WARN("grant catalog table privilege failed", K(ret), K(need_priv));
+          }
+        } else {
+          ObTablePrivSortKey table_key(tenant_id, user_id, need_priv.db_, need_priv.table_);
+          if (!is_oracle_mode
+              && OB_FAIL(ObDDLSqlGenerator::gen_table_priv_sql(ObAccountArg(user_name, host_name),
                                                              need_priv,
                                                              true,
                                                              ddl_stmt_str))) {
-          LOG_WARN("gen_table_priv sql failed", K(need_priv), K(ret));
-        } else if (is_oracle_mode
-                   && OB_FAIL(ObDDLSqlGenerator::gen_table_priv_sql_ora(ObAccountArg(user_name, host_name),
+            LOG_WARN("gen_table_priv sql failed", K(need_priv), K(ret));
+          } else if (is_oracle_mode
+                     && OB_FAIL(ObDDLSqlGenerator::gen_table_priv_sql_ora(ObAccountArg(user_name, host_name),
                                                                         table_key,
                                                                         false,
                                                                         obj_priv_array,
                                                                         true,
                                                                         ddl_stmt_str))) {
-          LOG_WARN("gen_table_priv sql failed", K(need_priv), K(ret));
-        } else if (FALSE_IT(ddl_sql = ddl_stmt_str.string())) {
-        } else if (OB_FAIL(grant_table(table_key,
+            LOG_WARN("gen_table_priv sql failed", K(need_priv), K(ret));
+          } else if (FALSE_IT(ddl_sql = ddl_stmt_str.string())) {
+          } else if (OB_FAIL(grant_table(table_key,
                                        need_priv.priv_set_,
                                        &ddl_sql,
                                        obj_priv_array,
@@ -35343,7 +35358,8 @@ int ObDDLService::grant_priv_to_user(const uint64_t tenant_id,
                                        schema_guard,
                                        grantor,
                                        grantor_host))) {
-          LOG_WARN("Grant table error", K(ret));
+            LOG_WARN("Grant table error", K(ret));
+          }
         }
         break;
       }

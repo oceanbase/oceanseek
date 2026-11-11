@@ -452,6 +452,10 @@ void ObServerSchemaService::AllSchemaKeys::reset()
   del_catalog_keys_.clear();
   new_catalog_priv_keys_.clear();
   del_catalog_priv_keys_.clear();
+  new_catalog_database_priv_keys_.clear();
+  del_catalog_database_priv_keys_.clear();
+  new_catalog_table_priv_keys_.clear();
+  del_catalog_table_priv_keys_.clear();
   new_external_resource_keys_.clear();
   del_external_resource_keys_.clear();
   new_ai_model_keys_.clear();
@@ -638,6 +642,14 @@ int ObServerSchemaService::AllSchemaKeys::create(int64_t bucket_size)
     LOG_WARN("failed to create add_catalog_priv_keys hashset", K(bucket_size), K(ret));
   } else if (OB_FAIL(del_catalog_priv_keys_.create(bucket_size))) {
     LOG_WARN("failed to create del_catalog_priv_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(new_catalog_database_priv_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create new_catalog_database_priv_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(del_catalog_database_priv_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create del_catalog_database_priv_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(new_catalog_table_priv_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create new_catalog_table_priv_keys hashset", K(bucket_size), K(ret));
+  } else if (OB_FAIL(del_catalog_table_priv_keys_.create(bucket_size))) {
+    LOG_WARN("failed to create del_catalog_table_priv_keys hashset", K(bucket_size), K(ret));
   } else if (OB_FAIL(new_external_resource_keys_.create(bucket_size))) {
     LOG_WARN("failed to create new_external_resource_keys hashset", K(bucket_size), K(ret));
   } else if (OB_FAIL(del_external_resource_keys_.create(bucket_size))) {
@@ -801,6 +813,14 @@ int ObServerSchemaService::del_tenant_operation(
   } else if (OB_FAIL(del_operation(tenant_id,
              new_flag ? schema_keys.new_catalog_priv_keys_ : schema_keys.del_catalog_priv_keys_))) {
     LOG_WARN("fail to del catalog_priv operation", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(del_operation(tenant_id,
+             new_flag ? schema_keys.new_catalog_database_priv_keys_
+                      : schema_keys.del_catalog_database_priv_keys_))) {
+    LOG_WARN("fail to del catalog_database_priv operation", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(del_operation(tenant_id,
+             new_flag ? schema_keys.new_catalog_table_priv_keys_
+                      : schema_keys.del_catalog_table_priv_keys_))) {
+    LOG_WARN("fail to del catalog_table_priv operation", KR(ret), K(tenant_id));
   } else if (OB_FAIL(del_operation(tenant_id,
              new_flag ? schema_keys.new_external_resource_keys_ : schema_keys.del_external_resource_keys_))) {
     LOG_WARN("fail to del external_resource operation", KR(ret), K(tenant_id));
@@ -4451,13 +4471,13 @@ int ObServerSchemaService::get_increment_catalog_priv_keys(
   } else {
     const uint64_t tenant_id = schema_operation.tenant_id_;
     const uint64_t user_id = schema_operation.user_id_;
-    const ObString &catalog_name = schema_operation.catalog_name_;
+    const ObString &catalog_name = schema_operation.legacy_catalog_name_;
     const int64_t schema_version = schema_operation.schema_version_;
     int hash_ret = OB_SUCCESS;
     SchemaKey schema_key;
     schema_key.tenant_id_ = tenant_id;
     schema_key.user_id_ = user_id;
-    schema_key.catalog_name_ = catalog_name;
+    schema_key.legacy_catalog_name_ = catalog_name;
     schema_key.schema_version_ = schema_version;
     if (OB_DDL_DEL_CATALOG_PRIV == schema_operation.op_type_) { //delete
       hash_ret = schema_keys.new_catalog_priv_keys_.erase_refactored(schema_key);
@@ -4502,12 +4522,12 @@ int ObServerSchemaService::get_increment_catalog_priv_keys_reversely(
   } else {
     const uint64_t tenant_id = schema_operation.tenant_id_;
     const uint64_t user_id = schema_operation.user_id_;
-    const ObString &catalog_name = schema_operation.catalog_name_;
+    const ObString &catalog_name = schema_operation.legacy_catalog_name_;
     const int64_t schema_version = schema_operation.schema_version_;
     SchemaKey schema_key;
     schema_key.tenant_id_ = tenant_id;
     schema_key.user_id_ = user_id;
-    schema_key.catalog_name_ = catalog_name;
+    schema_key.legacy_catalog_name_ = catalog_name;
     schema_key.schema_version_ = schema_version;
     bool is_delete = (OB_DDL_GRANT_REVOKE_CATALOG == schema_operation.op_type_);
     bool is_exist = false;
@@ -4524,6 +4544,168 @@ int ObServerSchemaService::get_increment_catalog_priv_keys_reversely(
           schema_keys.new_catalog_priv_keys_, is_delete, is_exist))) {
         LOG_WARN("replay operation failed", KR(ret));
       }
+    }
+  }
+  return ret;
+}
+
+int ObServerSchemaService::get_increment_catalog_database_priv_keys(
+    const ObSchemaMgr &schema_mgr,
+    const ObSchemaOperation &operation,
+    AllSchemaKeys &schema_keys)
+{
+  int ret = OB_SUCCESS;
+  SchemaKey key;
+  if (!is_catalog_database_priv_operation(operation.op_type_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid catalog database privilege operation", K(ret), K(operation));
+  } else if (operation.catalog_name_.empty()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("catalog name is empty", K(ret), K(operation));
+  } else {
+    key.tenant_id_ = operation.tenant_id_;
+    key.user_id_ = operation.user_id_;
+    key.catalog_name_ = operation.catalog_name_;
+    key.database_name_ = operation.database_name_;
+    key.schema_version_ = operation.schema_version_;
+    if (OB_DDL_DEL_CATALOG_DATABASE_PRIV == operation.op_type_) {
+      int hash_ret = schema_keys.new_catalog_database_priv_keys_.erase_refactored(key);
+      if (OB_SUCCESS != hash_ret && OB_HASH_NOT_EXIST != hash_ret) {
+        ret = hash_ret;
+        LOG_WARN("erase new catalog database privilege key failed", K(ret), K(key));
+      } else {
+        const ObCatalogDatabasePriv *priv = NULL;
+        if (OB_FAIL(schema_mgr.priv_mgr_.get_catalog_database_priv(
+                key.get_catalog_database_priv_key(), priv))) {
+          LOG_WARN("get catalog database privilege failed", K(ret), K(key));
+        } else if (OB_NOT_NULL(priv)
+                   && OB_SUCCESS != (hash_ret =
+                       schema_keys.del_catalog_database_priv_keys_.set_refactored_1(key, 1))) {
+          ret = hash_ret;
+          LOG_WARN("add deleted catalog database privilege key failed", K(ret), K(key));
+        }
+      }
+    } else {
+      const int hash_ret = schema_keys.new_catalog_database_priv_keys_.set_refactored_1(key, 1);
+      if (OB_SUCCESS != hash_ret) {
+        ret = hash_ret;
+        LOG_WARN("add new catalog database privilege key failed", K(ret), K(key));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObServerSchemaService::get_increment_catalog_database_priv_keys_reversely(
+    const ObSchemaMgr &schema_mgr,
+    const ObSchemaOperation &operation,
+    AllSchemaKeys &schema_keys)
+{
+  int ret = OB_SUCCESS;
+  SchemaKey key;
+  if (!is_catalog_database_priv_operation(operation.op_type_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (operation.catalog_name_.empty()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("catalog name is empty", K(ret), K(operation));
+  } else {
+    key.tenant_id_ = operation.tenant_id_;
+    key.user_id_ = operation.user_id_;
+    key.catalog_name_ = operation.catalog_name_;
+    key.database_name_ = operation.database_name_;
+    key.schema_version_ = operation.schema_version_;
+    const ObCatalogDatabasePriv *priv = NULL;
+    if (OB_FAIL(schema_mgr.priv_mgr_.get_catalog_database_priv(
+            key.get_catalog_database_priv_key(), priv))) {
+      LOG_WARN("get catalog database privilege failed", K(ret), K(key));
+    } else if (OB_FAIL(REPLAY_OP(key,
+                                schema_keys.del_catalog_database_priv_keys_,
+                                schema_keys.new_catalog_database_priv_keys_,
+                                OB_DDL_GRANT_REVOKE_CATALOG_DATABASE_PRIV == operation.op_type_,
+                                OB_NOT_NULL(priv)))) {
+      LOG_WARN("reverse replay catalog database privilege failed", K(ret), K(key));
+    }
+  }
+  return ret;
+}
+
+int ObServerSchemaService::get_increment_catalog_table_priv_keys(
+    const ObSchemaMgr &schema_mgr,
+    const ObSchemaOperation &operation,
+    AllSchemaKeys &schema_keys)
+{
+  int ret = OB_SUCCESS;
+  SchemaKey key;
+  if (!is_catalog_table_priv_operation(operation.op_type_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid catalog table privilege operation", K(ret), K(operation));
+  } else if (operation.catalog_name_.empty()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("catalog name is empty", K(ret), K(operation));
+  } else {
+    key.tenant_id_ = operation.tenant_id_;
+    key.user_id_ = operation.user_id_;
+    key.catalog_name_ = operation.catalog_name_;
+    key.database_name_ = operation.database_name_;
+    key.table_name_ = operation.table_name_;
+    key.schema_version_ = operation.schema_version_;
+    if (OB_DDL_DEL_CATALOG_TABLE_PRIV == operation.op_type_) {
+      int hash_ret = schema_keys.new_catalog_table_priv_keys_.erase_refactored(key);
+      if (OB_SUCCESS != hash_ret && OB_HASH_NOT_EXIST != hash_ret) {
+        ret = hash_ret;
+        LOG_WARN("erase new catalog table privilege key failed", K(ret), K(key));
+      } else {
+        const ObCatalogTablePriv *priv = NULL;
+        if (OB_FAIL(schema_mgr.priv_mgr_.get_catalog_table_priv(
+                key.get_catalog_table_priv_key(), priv))) {
+          LOG_WARN("get catalog table privilege failed", K(ret), K(key));
+        } else if (OB_NOT_NULL(priv)
+                   && OB_SUCCESS != (hash_ret =
+                       schema_keys.del_catalog_table_priv_keys_.set_refactored_1(key, 1))) {
+          ret = hash_ret;
+          LOG_WARN("add deleted catalog table privilege key failed", K(ret), K(key));
+        }
+      }
+    } else {
+      const int hash_ret = schema_keys.new_catalog_table_priv_keys_.set_refactored_1(key, 1);
+      if (OB_SUCCESS != hash_ret) {
+        ret = hash_ret;
+        LOG_WARN("add new catalog table privilege key failed", K(ret), K(key));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObServerSchemaService::get_increment_catalog_table_priv_keys_reversely(
+    const ObSchemaMgr &schema_mgr,
+    const ObSchemaOperation &operation,
+    AllSchemaKeys &schema_keys)
+{
+  int ret = OB_SUCCESS;
+  SchemaKey key;
+  if (!is_catalog_table_priv_operation(operation.op_type_)) {
+    ret = OB_ERR_UNEXPECTED;
+  } else if (operation.catalog_name_.empty()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("catalog name is empty", K(ret), K(operation));
+  } else {
+    key.tenant_id_ = operation.tenant_id_;
+    key.user_id_ = operation.user_id_;
+    key.catalog_name_ = operation.catalog_name_;
+    key.database_name_ = operation.database_name_;
+    key.table_name_ = operation.table_name_;
+    key.schema_version_ = operation.schema_version_;
+    const ObCatalogTablePriv *priv = NULL;
+    if (OB_FAIL(schema_mgr.priv_mgr_.get_catalog_table_priv(
+            key.get_catalog_table_priv_key(), priv))) {
+      LOG_WARN("get catalog table privilege failed", K(ret), K(key));
+    } else if (OB_FAIL(REPLAY_OP(key,
+                                schema_keys.del_catalog_table_priv_keys_,
+                                schema_keys.new_catalog_table_priv_keys_,
+                                OB_DDL_GRANT_REVOKE_CATALOG_TABLE_PRIV == operation.op_type_,
+                                OB_NOT_NULL(priv)))) {
+      LOG_WARN("reverse replay catalog table privilege failed", K(ret), K(key));
     }
   }
   return ret;
@@ -5260,6 +5442,8 @@ int ObServerSchemaService::fetch_increment_schemas(
   GET_BATCH_SCHEMAS(package, ObSimplePackageSchema, PackageKeys);
   GET_BATCH_SCHEMAS(trigger, ObSimpleTriggerSchema, TriggerKeys);
   GET_BATCH_SCHEMAS(catalog_priv, ObCatalogPriv, CatalogPrivKeys);
+  GET_BATCH_SCHEMAS(catalog_database_priv, ObCatalogDatabasePriv, CatalogDatabasePrivKeys);
+  GET_BATCH_SCHEMAS(catalog_table_priv, ObCatalogTablePriv, CatalogTablePrivKeys);
   GET_BATCH_SCHEMAS(db_priv, ObDBPriv, DBPrivKeys);
   GET_BATCH_SCHEMAS(table_priv, ObTablePriv, TablePrivKeys);
   GET_BATCH_SCHEMAS(routine_priv, ObRoutinePriv, RoutinePrivKeys);
@@ -5379,6 +5563,12 @@ int ObServerSchemaService::apply_increment_schema_to_cache(
   } else if (OB_FAIL(apply_catalog_priv_schema_to_cache(
              tenant_id, all_keys, simple_incre_schemas, schema_mgr.priv_mgr_))) {
     LOG_WARN("fail to apply catalog_priv schema to cache", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(apply_catalog_database_priv_schema_to_cache(
+             tenant_id, all_keys, simple_incre_schemas, schema_mgr.priv_mgr_))) {
+    LOG_WARN("fail to apply catalog_database_priv schema to cache", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(apply_catalog_table_priv_schema_to_cache(
+             tenant_id, all_keys, simple_incre_schemas, schema_mgr.priv_mgr_))) {
+    LOG_WARN("fail to apply catalog_table_priv schema to cache", KR(ret), K(tenant_id));
   } else if (OB_FAIL(apply_db_priv_schema_to_cache(
              tenant_id, all_keys, simple_incre_schemas, schema_mgr.priv_mgr_))) {
     LOG_WARN("fail to apply db_priv schema to cache", KR(ret), K(tenant_id));
@@ -5648,6 +5838,8 @@ APPLY_SCHEMA_TO_CACHE_IMPL(ObRoutineMgr, routine, ObSimpleRoutineSchema, Routine
 APPLY_SCHEMA_TO_CACHE_IMPL(ObPackageMgr, package, ObSimplePackageSchema, PackageKeys);
 APPLY_SCHEMA_TO_CACHE_IMPL(ObTriggerMgr, trigger, ObSimpleTriggerSchema, TriggerKeys);
 APPLY_SCHEMA_TO_CACHE_IMPL(ObPrivMgr, catalog_priv, ObCatalogPriv, CatalogPrivKeys);
+APPLY_SCHEMA_TO_CACHE_IMPL(ObPrivMgr, catalog_database_priv, ObCatalogDatabasePriv, CatalogDatabasePrivKeys);
+APPLY_SCHEMA_TO_CACHE_IMPL(ObPrivMgr, catalog_table_priv, ObCatalogTablePriv, CatalogTablePrivKeys);
 APPLY_SCHEMA_TO_CACHE_IMPL(ObPrivMgr, db_priv, ObDBPriv, DBPrivKeys);
 APPLY_SCHEMA_TO_CACHE_IMPL(ObPrivMgr, table_priv, ObTablePriv, TablePrivKeys);
 APPLY_SCHEMA_TO_CACHE_IMPL(ObPrivMgr, routine_priv, ObRoutinePriv, RoutinePrivKeys);
@@ -6158,6 +6350,16 @@ int ObServerSchemaService::replay_log(
           if (OB_FAIL(get_increment_catalog_priv_keys(schema_mgr, schema_operation, schema_keys))) {
             LOG_WARN("fail to get increment catalog id", K(ret));
           }
+        } else if (is_catalog_database_priv_operation(schema_operation.op_type_)) {
+          if (OB_FAIL(get_increment_catalog_database_priv_keys(
+                  schema_mgr, schema_operation, schema_keys))) {
+            LOG_WARN("fail to get increment catalog database privilege key", K(ret));
+          }
+        } else if (is_catalog_table_priv_operation(schema_operation.op_type_)) {
+          if (OB_FAIL(get_increment_catalog_table_priv_keys(
+                  schema_mgr, schema_operation, schema_keys))) {
+            LOG_WARN("fail to get increment catalog table privilege key", K(ret));
+          }
         } else if (schema_operation.op_type_ > OB_DDL_EXTERNAL_RESOURCE_OPERATION_BEGIN &&
             schema_operation.op_type_ < OB_DDL_EXTERNAL_RESOURCE_OPERATION_END) {
           if (OB_FAIL(get_increment_external_resource_keys(schema_mgr, schema_operation, schema_keys))) {
@@ -6420,6 +6622,16 @@ int ObServerSchemaService::replay_log_reversely(
                  && schema_operation.op_type_ < OB_DDL_CATALOG_PRIV_OPERATION_END) {
         if (OB_FAIL(get_increment_catalog_priv_keys_reversely(schema_mgr, schema_operation, schema_keys))) {
           LOG_WARN("fail to get increment catalog keys reversely", KR(ret));
+        }
+      } else if (is_catalog_database_priv_operation(schema_operation.op_type_)) {
+        if (OB_FAIL(get_increment_catalog_database_priv_keys_reversely(
+                schema_mgr, schema_operation, schema_keys))) {
+          LOG_WARN("fail to reverse catalog database privilege key", KR(ret));
+        }
+      } else if (is_catalog_table_priv_operation(schema_operation.op_type_)) {
+        if (OB_FAIL(get_increment_catalog_table_priv_keys_reversely(
+                schema_mgr, schema_operation, schema_keys))) {
+          LOG_WARN("fail to reverse catalog table privilege key", KR(ret));
         }
       } else if (schema_operation.op_type_ > OB_DDL_EXTERNAL_RESOURCE_OPERATION_BEGIN &&
                  schema_operation.op_type_ < OB_DDL_EXTERNAL_RESOURCE_OPERATION_END) {
@@ -7852,6 +8064,8 @@ int ObServerSchemaService::refresh_tenant_full_normal_schema(
       INIT_ARRAY(ObSimplePackageSchema, simple_packages);
       INIT_ARRAY(ObSimpleTriggerSchema, simple_triggers);
       INIT_ARRAY(ObCatalogPriv, catalog_privs);
+      INIT_ARRAY(ObCatalogDatabasePriv, catalog_database_privs);
+      INIT_ARRAY(ObCatalogTablePriv, catalog_table_privs);
       INIT_ARRAY(ObDBPriv, db_privs);
       INIT_ARRAY(ObSysPriv, sys_privs);
       INIT_ARRAY(ObTablePriv, table_privs);
@@ -8064,6 +8278,40 @@ int ObServerSchemaService::refresh_tenant_full_normal_schema(
           LOG_WARN("get all catalog priv failed", K(ret), K(schema_version), K(tenant_id));
         }
       }
+
+      if (OB_SUCC(ret)) {
+        const ObSimpleTableSchemaV2 *tmp_table = NULL;
+        if (OB_FAIL(schema_mgr_for_cache->get_table_schema(
+                tenant_id, OB_ALL_CATALOG_DATABASE_PRIVILEGE_HISTORY_TID, tmp_table))) {
+          LOG_WARN("fail to get catalog database priv history table schema", KR(ret), K(tenant_id));
+        } else if (OB_ISNULL(tmp_table)) {
+          // For compatibility with tenants created before the inner table was introduced.
+        } else if (OB_FAIL(schema_service_->get_all_catalog_database_privs(
+                       sql_client,
+                       schema_status,
+                       schema_version,
+                       tenant_id,
+                       catalog_database_privs))) {
+          LOG_WARN("get all catalog database priv failed", K(ret), K(schema_version), K(tenant_id));
+        }
+      }
+
+      if (OB_SUCC(ret)) {
+        const ObSimpleTableSchemaV2 *tmp_table = NULL;
+        if (OB_FAIL(schema_mgr_for_cache->get_table_schema(
+                tenant_id, OB_ALL_CATALOG_TABLE_PRIVILEGE_HISTORY_TID, tmp_table))) {
+          LOG_WARN("fail to get catalog table priv history table schema", KR(ret), K(tenant_id));
+        } else if (OB_ISNULL(tmp_table)) {
+          // For compatibility with tenants created before the inner table was introduced.
+        } else if (OB_FAIL(schema_service_->get_all_catalog_table_privs(
+                       sql_client,
+                       schema_status,
+                       schema_version,
+                       tenant_id,
+                       catalog_table_privs))) {
+          LOG_WARN("get all catalog table priv failed", K(ret), K(schema_version), K(tenant_id));
+        }
+      }
       
       if (OB_SUCC(ret)) {
         const ObSimpleTableSchemaV2 *tmp_table = NULL;
@@ -8211,6 +8459,12 @@ int ObServerSchemaService::refresh_tenant_full_normal_schema(
         LOG_WARN("add trigger failed", K(ret));
       } else if (OB_FAIL(schema_mgr_for_cache->priv_mgr_.add_catalog_privs(catalog_privs))) {
         LOG_WARN("add catalog privs failed", K(ret));
+      } else if (OB_FAIL(schema_mgr_for_cache->priv_mgr_.add_catalog_database_privs(
+                     catalog_database_privs))) {
+        LOG_WARN("add catalog database privs failed", K(ret));
+      } else if (OB_FAIL(schema_mgr_for_cache->priv_mgr_.add_catalog_table_privs(
+                     catalog_table_privs))) {
+        LOG_WARN("add catalog table privs failed", K(ret));
       } else if (OB_FAIL(schema_mgr_for_cache->priv_mgr_.add_db_privs(db_privs))) {
         LOG_WARN("add db privs failed", K(ret));
       } else if (OB_FAIL(schema_mgr_for_cache->priv_mgr_.add_table_privs(table_privs))) {
@@ -8321,6 +8575,8 @@ int ObServerSchemaService::refresh_tenant_full_normal_schema(
                "rls_contexts", simple_rls_contexts.count(),
                "catalogs", simple_catalogs.count(),
                "catalog_privs", catalog_privs.count(),
+               "catalog_database_privs", catalog_database_privs.count(),
+               "catalog_table_privs", catalog_table_privs.count(),
                "ccl_rules", simple_ccl_rules.count(),
                "sensitive_rules", simple_sensitive_rules.count(),
                "sensitive_rule_privs", sensitive_rule_privs.count(),

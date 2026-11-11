@@ -414,6 +414,8 @@ public:
   RETRIEVE_SCHEMA_FUNC_DECLARE(tablegroup);
   RETRIEVE_SCHEMA_FUNC_DECLARE(outline);
   RETRIEVE_SCHEMA_FUNC_DECLARE(catalog_priv);
+  RETRIEVE_SCHEMA_FUNC_DECLARE(catalog_database_priv);
+  RETRIEVE_SCHEMA_FUNC_DECLARE(catalog_table_priv);
   RETRIEVE_SCHEMA_FUNC_DECLARE(db_priv);
   RETRIEVE_SCHEMA_FUNC_DECLARE(table_priv);
   RETRIEVE_SCHEMA_FUNC_DECLARE(routine_priv);
@@ -559,6 +561,8 @@ public:
   FILL_SCHEMA_FUNC_DECLARE(tablegroup, ObTablegroupSchema);
   FILL_SCHEMA_FUNC_DECLARE(outline, ObOutlineInfo);
   FILL_SCHEMA_FUNC_DECLARE(catalog_priv, ObCatalogPriv);
+  FILL_SCHEMA_FUNC_DECLARE(catalog_database_priv, ObCatalogDatabasePriv);
+  FILL_SCHEMA_FUNC_DECLARE(catalog_table_priv, ObCatalogTablePriv);
   FILL_SCHEMA_FUNC_DECLARE(sensitive_rule_priv, ObSensitiveRulePriv);
   FILL_SCHEMA_FUNC_DECLARE(db_priv, ObDBPriv);
   FILL_SCHEMA_FUNC_DECLARE(table_priv, ObTablePriv);

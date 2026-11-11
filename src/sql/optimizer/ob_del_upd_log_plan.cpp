@@ -2444,6 +2444,9 @@ int ObDelUpdLogPlan::build_logical_table_meta_(IndexDMLInfo &primary_dml_info)
   if (OB_ISNULL(schema_guard = optimizer_context_.get_schema_guard())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("schema guard is null", K(ret));
+  } else if (is_external_object_id(ref_table_id)) {
+    // External catalog tables (e.g. ODPS) use mocked schemas kept only in
+    // ObSqlSchemaGuard; they can never be logical tables, skip.
   } else if (OB_FAIL(schema_guard->get_table_schema(tenant_id, ref_table_id, table_schema))) {
     LOG_WARN("get table schema failed", K(ret), K(ref_table_id));
   } else if (OB_ISNULL(table_schema)) {

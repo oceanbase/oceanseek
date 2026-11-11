@@ -2312,6 +2312,57 @@ int ObSchemaRetrieveUtils::fill_catalog_priv_schema(
 }
 
 template<typename T>
+int ObSchemaRetrieveUtils::fill_catalog_database_priv_schema(
+    const uint64_t tenant_id,
+    T &result,
+    ObCatalogDatabasePriv &catalog_database_priv,
+    bool &is_deleted)
+{
+  int ret = common::OB_SUCCESS;
+  catalog_database_priv.reset();
+  is_deleted = false;
+
+  catalog_database_priv.set_tenant_id(tenant_id);
+  EXTRACT_INT_FIELD_TO_CLASS_MYSQL_WITH_TENANT_ID(
+      result, user_id, catalog_database_priv, tenant_id);
+  EXTRACT_VARCHAR_FIELD_TO_CLASS_MYSQL(result, catalog_name, catalog_database_priv);
+  EXTRACT_VARCHAR_FIELD_TO_CLASS_MYSQL(result, database_name, catalog_database_priv);
+  EXTRACT_INT_FIELD_MYSQL(result, "is_deleted", is_deleted, bool);
+  if (!is_deleted) {
+    EXTRACT_INT_FIELD_TO_CLASS_MYSQL(result, priv_set, catalog_database_priv, int64_t);
+    EXTRACT_INT_FIELD_TO_CLASS_MYSQL(result, schema_version, catalog_database_priv, int64_t);
+  }
+
+  return ret;
+}
+
+template<typename T>
+int ObSchemaRetrieveUtils::fill_catalog_table_priv_schema(
+    const uint64_t tenant_id,
+    T &result,
+    ObCatalogTablePriv &catalog_table_priv,
+    bool &is_deleted)
+{
+  int ret = common::OB_SUCCESS;
+  catalog_table_priv.reset();
+  is_deleted = false;
+
+  catalog_table_priv.set_tenant_id(tenant_id);
+  EXTRACT_INT_FIELD_TO_CLASS_MYSQL_WITH_TENANT_ID(
+      result, user_id, catalog_table_priv, tenant_id);
+  EXTRACT_VARCHAR_FIELD_TO_CLASS_MYSQL(result, catalog_name, catalog_table_priv);
+  EXTRACT_VARCHAR_FIELD_TO_CLASS_MYSQL(result, database_name, catalog_table_priv);
+  EXTRACT_VARCHAR_FIELD_TO_CLASS_MYSQL(result, table_name, catalog_table_priv);
+  EXTRACT_INT_FIELD_MYSQL(result, "is_deleted", is_deleted, bool);
+  if (!is_deleted) {
+    EXTRACT_INT_FIELD_TO_CLASS_MYSQL(result, priv_set, catalog_table_priv, int64_t);
+    EXTRACT_INT_FIELD_TO_CLASS_MYSQL(result, schema_version, catalog_table_priv, int64_t);
+  }
+
+  return ret;
+}
+
+template<typename T>
 int ObSchemaRetrieveUtils::fill_sensitive_rule_priv_schema(
     const uint64_t tenant_id, T &result, ObSensitiveRulePriv &sensitive_rule_priv, bool &is_deleted)
 {
@@ -3300,6 +3351,13 @@ int ObSchemaRetrieveUtils::fill_schema_operation(
   if (OB_SUCC(ret)) {
     schema_operations.write_string(str_val, &schema_operation.table_name_);
   }
+  ObString default_catalog_name;
+  EXTRACT_VARCHAR_FIELD_MYSQL_WITH_DEFAULT_VALUE(
+      result, "catalog_name", str_val,
+      true /* skip_null_error */, true /* ignore_column_error */, default_catalog_name);
+  if (OB_SUCC(ret)) {
+    schema_operations.write_string(str_val, &schema_operation.catalog_name_);
+  }
 
   if (OB_SUCC(ret)) {
     schema_operation.op_type_ = operation_type;
@@ -3942,6 +4000,88 @@ int ObSchemaRetrieveUtils::retrieve_catalog_priv_schema(
   }
   if (ret != common::OB_ITER_END) {
     SHARE_SCHEMA_LOG(WARN, "failed to get catalog privileges. iter quit", K(ret));
+  } else {
+    ret = common::OB_SUCCESS;
+  }
+  return ret;
+}
+
+template<typename T, typename S>
+int ObSchemaRetrieveUtils::retrieve_catalog_database_priv_schema(
+    const uint64_t tenant_id,
+    T &result,
+    ObIArray<S> &catalog_database_priv_array)
+{
+  int ret = common::OB_SUCCESS;
+  ObArenaAllocator allocator(ObModIds::OB_TEMP_VARIABLES);
+  ObArenaAllocator tmp_allocator(ObModIds::OB_TEMP_VARIABLES);
+  S catalog_database_priv(&allocator);
+  ObCatalogDatabasePrivSortKey previous_sort_key;
+  while (OB_SUCCESS == ret && common::OB_SUCCESS == (ret = result.next())) {
+    bool is_deleted = false;
+    catalog_database_priv.reset();
+    allocator.reuse();
+    if (OB_FAIL(fill_catalog_database_priv_schema(
+            tenant_id, result, catalog_database_priv, is_deleted))) {
+      SHARE_SCHEMA_LOG(WARN, "failed to fill catalog database privileges", K(ret));
+    } else if (catalog_database_priv.get_sort_key() == previous_sort_key) {
+      // Keep only the newest history row for the same privilege key.
+    } else if (is_deleted) {
+      SHARE_SCHEMA_LOG(TRACE, "catalog database priv is deleted", K(catalog_database_priv));
+    } else if (OB_FAIL(catalog_database_priv_array.push_back(catalog_database_priv))) {
+      SHARE_SCHEMA_LOG(WARN, "failed to push back catalog database priv", K(ret));
+    }
+    if (OB_SUCC(ret)) {
+      tmp_allocator.reuse();
+      if (OB_FAIL(previous_sort_key.deep_copy(
+              catalog_database_priv.get_sort_key(), tmp_allocator))) {
+        SHARE_SCHEMA_LOG(WARN, "deep copy catalog database priv key failed", KR(ret));
+      }
+    }
+  }
+  if (common::OB_ITER_END != ret) {
+    SHARE_SCHEMA_LOG(WARN, "failed to get catalog database privileges", K(ret));
+  } else {
+    ret = common::OB_SUCCESS;
+  }
+  return ret;
+}
+
+template<typename T, typename S>
+int ObSchemaRetrieveUtils::retrieve_catalog_table_priv_schema(
+    const uint64_t tenant_id,
+    T &result,
+    ObIArray<S> &catalog_table_priv_array)
+{
+  int ret = common::OB_SUCCESS;
+  ObArenaAllocator allocator(ObModIds::OB_TEMP_VARIABLES);
+  ObArenaAllocator tmp_allocator(ObModIds::OB_TEMP_VARIABLES);
+  S catalog_table_priv(&allocator);
+  ObCatalogTablePrivSortKey previous_sort_key;
+  while (OB_SUCCESS == ret && common::OB_SUCCESS == (ret = result.next())) {
+    bool is_deleted = false;
+    catalog_table_priv.reset();
+    allocator.reuse();
+    if (OB_FAIL(fill_catalog_table_priv_schema(
+            tenant_id, result, catalog_table_priv, is_deleted))) {
+      SHARE_SCHEMA_LOG(WARN, "failed to fill catalog table privileges", K(ret));
+    } else if (catalog_table_priv.get_sort_key() == previous_sort_key) {
+      // Keep only the newest history row for the same privilege key.
+    } else if (is_deleted) {
+      SHARE_SCHEMA_LOG(TRACE, "catalog table priv is deleted", K(catalog_table_priv));
+    } else if (OB_FAIL(catalog_table_priv_array.push_back(catalog_table_priv))) {
+      SHARE_SCHEMA_LOG(WARN, "failed to push back catalog table priv", K(ret));
+    }
+    if (OB_SUCC(ret)) {
+      tmp_allocator.reuse();
+      if (OB_FAIL(previous_sort_key.deep_copy(
+              catalog_table_priv.get_sort_key(), tmp_allocator))) {
+        SHARE_SCHEMA_LOG(WARN, "deep copy catalog table priv key failed", KR(ret));
+      }
+    }
+  }
+  if (common::OB_ITER_END != ret) {
+    SHARE_SCHEMA_LOG(WARN, "failed to get catalog table privileges", K(ret));
   } else {
     ret = common::OB_SUCCESS;
   }

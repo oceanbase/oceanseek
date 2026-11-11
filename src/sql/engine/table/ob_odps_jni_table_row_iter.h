@@ -13,7 +13,6 @@
 #include "sql/engine/expr/ob_expr.h"
 #include "sql/engine/table/ob_external_table_access_service.h"
 #include "sql/engine/connector/ob_odps_jni_reader.h"
-#include "sql/engine/connector/ob_odps_jni_writer.h"
 #include "share/external_table/ob_external_table_file_mgr.h"
 #include "sql/engine/table/ob_odps_table_utils.h"
 
@@ -528,94 +527,6 @@ private:
       const common::ObIArray<ObOdpsPredColumnInfo> &pred_col_infos,
       int64_t parallel, ObODPSJNITableRowIterator &odps_driver);
 
-};
-
-class ObOdpsPartitionJNIUploaderMgr {
-public:
-  struct OdpsUploader {
-    OdpsUploader() : writer_ptr(nullptr)
-    {}
-
-    JNIWriterPtr writer_ptr;
-  };
-
-  ObOdpsPartitionJNIUploaderMgr()
-      : inited_(false),
-        ref_(0),
-        block_num_(0),
-        init_parallel_(0),
-        need_commit_(true),
-        write_arena_alloc_("IntoOdps", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
-        session_holder_ptr_(nullptr),
-        lock_(common::ObLatchIds::OB_ODPS_PARTITION_JNI_UPLOADER_MGR_LOCK)
-  {}
-
-  ~ObOdpsPartitionJNIUploaderMgr()
-  {
-    if (OB_NOT_NULL(session_holder_ptr_.get())) {
-      (void)session_holder_ptr_->do_close();
-      session_holder_ptr_.reset();
-    }
-  }
-
-  inline int64_t inc_ref()
-  {
-    return ATOMIC_FAA(&ref_, 1);
-  }
-  inline int64_t dec_ref()
-  {
-    return ATOMIC_SAF(&ref_, 1);
-  }
-  inline int64_t inc_block()
-  {
-    return ATOMIC_FAA(&block_num_, 1);
-  }
-  inline int64_t block_num()
-  {
-    return block_num_;
-  }
-  inline void set_fail()
-  {
-    ATOMIC_STORE(&need_commit_, false);
-  }
-
-  inline bool could_commit()
-  {
-    return ATOMIC_LOAD(&need_commit_);
-  }
-
-  static int create_writer_params_map(ObIAllocator &alloc, const sql::ObODPSGeneralFormat &odps_format,
-      const ObString &external_partition, bool is_overwrite, common::hash::ObHashMap<ObString, ObString> &params_map);
-
-  int init_writer_params_in_px(
-      sql::ObODPSGeneralFormat &odps_format, const ObString &external_partition, bool is_overwrite, int64_t parallel);
-
-  int get_odps_uploader_in_px(int task_id, const common::ObFixedArray<ObExpr *, common::ObIAllocator> &select_exprs,
-      OdpsUploader &odps_uploader);
-
-  void release_hold_session();
-  
-  int commit_session(int64_t num_block);
-  int append_block_id(long block_id);
-
-  int reset();
-
-private:
-  bool inited_;
-  int64_t ref_;
-  int64_t block_num_;
-  int64_t init_parallel_;
-  bool need_commit_;
-  common::ObArenaAllocator write_arena_alloc_;  // construct first and descruct last
-  ObString sid_;
-  common::hash::ObHashMap<ObString, ObString> odps_params_map_;
-  static const int64_t MAX_PARAMS_SIZE = 16;
-  JNIWriterPtr session_holder_ptr_;
-  lib::ObMutex lock_;
-
-private:
-  int get_writer_sid(
-      ObIAllocator &alloc, const common::hash::ObHashMap<ObString, ObString> &odps_params_map, ObString &sid);
 };
 
 }  // namespace sql

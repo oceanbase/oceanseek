@@ -229,6 +229,8 @@ public:
   GET_ALL_SCHEMA_WITH_ALLOCATOR_FUNC_DECLARE(table, ObSimpleTableSchemaV2);
   GET_ALL_SCHEMA_FUNC_DECLARE(tablegroup, ObSimpleTablegroupSchema);
   GET_ALL_SCHEMA_FUNC_DECLARE(catalog_priv, ObCatalogPriv);
+  GET_ALL_SCHEMA_FUNC_DECLARE(catalog_database_priv, ObCatalogDatabasePriv);
+  GET_ALL_SCHEMA_FUNC_DECLARE(catalog_table_priv, ObCatalogTablePriv);
   GET_ALL_SCHEMA_FUNC_DECLARE(db_priv, ObDBPriv);
   GET_ALL_SCHEMA_FUNC_DECLARE(table_priv, ObTablePriv);
   GET_ALL_SCHEMA_FUNC_DECLARE(routine_priv, ObRoutinePriv);
@@ -395,6 +397,8 @@ public:
   GET_BATCH_SCHEMAS_FUNC_DECLARE(tablegroup, ObSimpleTablegroupSchema);
   GET_BATCH_SCHEMAS_WITH_ALLOCATOR_FUNC_DECLARE(table, ObSimpleTableSchemaV2);
   GET_BATCH_SCHEMAS_FUNC_DECLARE(catalog_priv, ObCatalogPriv);
+  GET_BATCH_SCHEMAS_FUNC_DECLARE(catalog_database_priv, ObCatalogDatabasePriv);
+  GET_BATCH_SCHEMAS_FUNC_DECLARE(catalog_table_priv, ObCatalogTablePriv);
   GET_BATCH_SCHEMAS_FUNC_DECLARE(db_priv, ObDBPriv);
   GET_BATCH_SCHEMAS_FUNC_DECLARE(table_priv, ObTablePriv);
   GET_BATCH_SCHEMAS_FUNC_DECLARE(routine_priv, ObRoutinePriv);
@@ -501,6 +505,8 @@ public:
   FETCH_SCHEMAS_WITH_ALLOCATOR_FUNC_DECLARE(table, ObSimpleTableSchemaV2);
   FETCH_SCHEMAS_FUNC_DECLARE(tablegroup, ObSimpleTablegroupSchema);
   FETCH_SCHEMAS_FUNC_DECLARE(catalog_priv, ObCatalogPriv);
+  FETCH_SCHEMAS_FUNC_DECLARE(catalog_database_priv, ObCatalogDatabasePriv);
+  FETCH_SCHEMAS_FUNC_DECLARE(catalog_table_priv, ObCatalogTablePriv);
   FETCH_SCHEMAS_FUNC_DECLARE(db_priv, ObDBPriv);
   FETCH_SCHEMAS_FUNC_DECLARE(table_priv, ObTablePriv);
   FETCH_SCHEMAS_FUNC_DECLARE(routine_priv, ObRoutinePriv);

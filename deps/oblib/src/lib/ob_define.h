@@ -314,6 +314,7 @@ const int64_t OB_MAX_DATABASE_NAME_BINARY_LENGTH = 2048; // Should be OB_MAX_DAT
 const int64_t OB_MAX_DATABASE_NAME_BUF_LENGTH = OB_MAX_DATABASE_NAME_LENGTH + 1;
 const int64_t OB_MAX_CATALOG_NAME_LENGTH = 128;
 const int64_t OB_MAX_CATALOG_NAME_BINARY_LENGTH = 2048;
+const int64_t OB_MAX_CATALOG_OBJECT_NAME_BINARY_LENGTH = 7000;
 const int64_t OB_MAX_TABLEGROUP_NAME_LENGTH = 128; // OB code logic is greater than or equal to an error, so modify it to 65
 const int64_t OB_MAX_ALIAS_NAME_LENGTH = 255;// Compatible with mysql, 255 visible characters. Plus 256 bytes at the end of 0
 const int64_t OB_MAX_CONSTRAINT_NAME_LENGTH_ORACLE = 128;  // Compatible with Oracle, error is reported when the logic is greater than

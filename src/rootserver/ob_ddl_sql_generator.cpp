@@ -1070,6 +1070,64 @@ int ObDDLSqlGenerator::gen_catalog_priv_sql(const obrpc::ObAccountArg &account,
   return ret;
 }
 
+int ObDDLSqlGenerator::gen_catalog_object_priv_sql(const ObAccountArg &account,
+                                                   const ObNeedPriv &need_priv,
+                                                   const bool is_grant,
+                                                   ObSqlString &sql_string)
+{
+  int ret = OB_SUCCESS;
+  ObSqlString priv_string;
+  const bool is_database = OB_PRIV_DB_LEVEL == need_priv.priv_level_;
+  const bool is_table = OB_PRIV_TABLE_LEVEL == need_priv.priv_level_;
+  const char *action = is_grant ? "GRANT" : "REVOKE";
+  const char *direction = is_grant ? "TO" : "FROM";
+  const ObPrivSet ddl_priv_set =
+      is_grant ? need_priv.priv_set_ & ~OB_PRIV_GRANT : need_priv.priv_set_;
+  if (!account.is_valid() || need_priv.catalog_.empty() || need_priv.db_.empty()
+      || (!is_database && !is_table) || (is_table && need_priv.table_.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid catalog object privilege arguments", K(ret), K(account), K(need_priv));
+  } else if (need_priv.priv_set_ == OB_PRIV_SET_EMPTY
+             || (need_priv.priv_set_ & (~(OB_PRIV_CATALOG_DB_TABLE_ACC | OB_PRIV_GRANT)))) {
+    ret = OB_ILLEGAL_GRANT_FOR_TABLE;
+    LOG_WARN("only SELECT and INSERT privileges are supported on catalog database or table",
+             K(ret), "priv_type", ObPrintPrivSet(need_priv.priv_set_));
+  } else if (is_grant && !(need_priv.priv_set_ & OB_PRIV_CATALOG_DB_TABLE_ACC)) {
+    ret = OB_ILLEGAL_GRANT_FOR_TABLE;
+    LOG_WARN("SELECT or INSERT is required when granting catalog database or table privilege",
+             K(ret), "priv_type", ObPrintPrivSet(need_priv.priv_set_));
+  } else if (OB_FAIL(priv_to_name(ddl_priv_set, priv_string))) {
+    LOG_WARN("convert privilege to name failed", K(ret));
+  } else if (is_database
+             && OB_FAIL(sql_string.append_fmt(
+                    "%s %.*s ON DATABASE `%.*s`.`%.*s` %s `%.*s`@`%.*s`",
+                    action,
+                    priv_string.length(), priv_string.ptr(),
+                    need_priv.catalog_.length(), need_priv.catalog_.ptr(),
+                    need_priv.db_.length(), need_priv.db_.ptr(),
+                    direction,
+                    account.user_name_.length(), account.user_name_.ptr(),
+                    account.host_name_.length(), account.host_name_.ptr()))) {
+    LOG_WARN("append catalog database privilege sql failed", K(ret));
+  } else if (is_table
+             && OB_FAIL(sql_string.append_fmt(
+                    "%s %.*s ON TABLE `%.*s`.`%.*s`.`%.*s` %s `%.*s`@`%.*s`",
+                    action,
+                    priv_string.length(), priv_string.ptr(),
+                    need_priv.catalog_.length(), need_priv.catalog_.ptr(),
+                    need_priv.db_.length(), need_priv.db_.ptr(),
+                    need_priv.table_.length(), need_priv.table_.ptr(),
+                    direction,
+                    account.user_name_.length(), account.user_name_.ptr(),
+                    account.host_name_.length(), account.host_name_.ptr()))) {
+    LOG_WARN("append catalog table privilege sql failed", K(ret));
+  } else if (is_grant && (need_priv.priv_set_ & OB_PRIV_GRANT)
+             && OB_FAIL(sql_string.append(" WITH GRANT OPTION"))) {
+    LOG_WARN("append grant option failed", K(ret));
+  }
+  return ret;
+}
+
 int ObDDLSqlGenerator::gen_db_priv_sql(const obrpc::ObAccountArg &account,
                                        const ObNeedPriv &need_priv,
                                        const bool is_grant,

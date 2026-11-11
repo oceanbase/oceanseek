@@ -392,6 +392,10 @@ select 0xffffffffff & table_id, table_name, table_type, database_id, part_num fr
 612	__all_ai_model_profile	0	201001	1
 613	__all_ai_gateway	0	201001	1
 614	__all_ai_gateway_history	0	201001	1
+615	__all_catalog_database_privilege	0	201001	1
+616	__all_catalog_database_privilege_history	0	201001	1
+617	__all_catalog_table_privilege	0	201001	1
+618	__all_catalog_table_privilege_history	0	201001	1
 10001	__tenant_virtual_all_table	2	201001	1
 10002	__tenant_virtual_table_column	2	201001	1
 10003	__tenant_virtual_table_index	2	201001	1
@@ -994,6 +998,10 @@ select 0xffffffffff & table_id, table_name, table_type, database_id, part_num fr
 12628	__all_virtual_ai_gateway_endpoint_stat	2	201001	1
 12629	__all_virtual_tablet_macro_cache_stat	2	201001	1
 12631	__all_virtual_key_column_usage	2	201001	1
+12632	__all_virtual_catalog_database_privilege	2	201001	1
+12633	__all_virtual_catalog_database_privilege_history	2	201001	1
+12634	__all_virtual_catalog_table_privilege	2	201001	1
+12635	__all_virtual_catalog_table_privilege_history	2	201001	1
 20001	GV$OB_PLAN_CACHE_STAT	1	201001	1
 20002	GV$OB_PLAN_CACHE_PLAN_STAT	1	201001	1
 20003	SCHEMATA	1	201002	1

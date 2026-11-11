@@ -205,6 +205,20 @@ int ObInsertResolver::resolve_insert_clause(const ParseNode &node)
         K(insert_into), K(values_node), K(ret));
   } else if (OB_FAIL(resolve_insert_field(*insert_into, table_item))) {
     LOG_WARN("failed to resolve insert filed", K(ret));
+  } else if (schema::EXTERNAL_TABLE == table_item->table_type_
+             && NULL != node.children_[DUPLICATE_NODE]) {
+    // insert up on external tables is unsupported. reject it before resolving
+    // the update assignments, otherwise resolution of catalog table columns
+    // (marked as generated in mocked lake schemas) fails with a misleading
+    // generated-column error instead of OB_NOT_SUPPORTED.
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("not support insert into external table with update", K(ret));
+    if (OB_NOT_NULL(table_item->ext_table_def_)
+        && share::is_odps_lake_table(table_item->ext_table_def_->lake_table_format_)) {
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "insert into ODPS external table with replace, ignore, returning, update");
+    } else {
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "insert into external table with replace, ignore, returning, update");
+    }
   } else if (OB_FAIL(check_direct_load_stream_append_form(node, *values_node))) {
     LOG_WARN("failed to check direct load stream append form", K(ret));
   } else if (OB_FAIL(get_label_se_columns(insert_stmt->get_insert_table_info(), label_se_columns))) {
@@ -1455,11 +1469,21 @@ int ObInsertResolver::check_insert_into_external_table()
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("not support to insert into external table during updating", K(ret));
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "insert into external table during updating");
-  } else if (!insert_stmt->value_from_select() || insert_stmt->is_replace()
-             || insert_stmt->is_ignore() || insert_stmt->is_returning()
+  } else if (insert_stmt->is_replace() || insert_stmt->is_ignore() || insert_stmt->is_returning()
              || insert_stmt->is_insert_up()) {
     ret = OB_NOT_SUPPORTED;
-    LOG_WARN("not support insert into external table with values, replace, ignore, returning, update", K(ret));
+    LOG_WARN("not support insert into external table with replace, ignore, returning, update", K(ret));
+    if (OB_NOT_NULL(table->ext_table_def_)
+        && share::is_odps_lake_table(table->ext_table_def_->lake_table_format_)) {
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "insert into ODPS external table with replace, ignore, returning, update");
+    } else {
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "insert into external table with values, replace, ignore, returning, update");
+    }
+  } else if (!insert_stmt->value_from_select()
+             && (OB_ISNULL(table->ext_table_def_)
+                 || !share::is_odps_lake_table(table->ext_table_def_->lake_table_format_))) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("not support insert values into non-ODPS external table", K(ret));
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "insert into external table with values, replace, ignore, returning, update");
   }
   return ret;

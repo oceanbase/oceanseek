@@ -295,12 +295,180 @@ int ObCatalogSqlService::grant_revoke_catalog(const ObCatalogPrivSortKey &catalo
     ObSchemaOperation priv_operation;
     priv_operation.tenant_id_ = catalog_priv_key.tenant_id_;
     priv_operation.user_id_ = catalog_priv_key.user_id_;
-    priv_operation.catalog_name_ = catalog_priv_key.catalog_;
+    priv_operation.legacy_catalog_name_ = catalog_priv_key.catalog_;
     priv_operation.op_type_ = (is_deleted ? OB_DDL_DEL_CATALOG_PRIV : OB_DDL_GRANT_REVOKE_CATALOG);
     priv_operation.schema_version_ = new_schema_version;
     priv_operation.ddl_stmt_str_ = ddl_stmt_str;
     if (OB_FAIL(log_operation(priv_operation, sql_client))) {
       LOG_WARN("failed to log operation", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObCatalogSqlService::gen_catalog_database_priv_dml(
+    const uint64_t exec_tenant_id,
+    const ObCatalogDatabasePrivSortKey &key,
+    const ObPrivSet priv_set,
+    ObDMLSqlSplicer &dml)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(dml.add_pk_column("tenant_id", ObSchemaUtils::get_extract_tenant_id(
+                                             exec_tenant_id, key.tenant_id_)))
+      || OB_FAIL(dml.add_pk_column("user_id", ObSchemaUtils::get_extract_schema_id(
+                                              exec_tenant_id, key.user_id_)))
+      || OB_FAIL(dml.add_pk_column("catalog_name", ObHexEscapeSqlStr(key.catalog_)))
+      || OB_FAIL(dml.add_pk_column("database_name", ObHexEscapeSqlStr(key.database_)))
+      || OB_FAIL(dml.add_column("priv_set", priv_set))
+      || OB_FAIL(dml.add_gmt_modified())) {
+    LOG_WARN("add catalog database privilege column failed", K(ret), K(key));
+  }
+  return ret;
+}
+
+int ObCatalogSqlService::grant_revoke_catalog_database(
+    const ObCatalogDatabasePrivSortKey &key,
+    const ObPrivSet priv_set,
+    const int64_t new_schema_version,
+    const ObString &ddl_stmt_str,
+    ObISQLClient &sql_client)
+{
+  int ret = OB_SUCCESS;
+  const bool is_deleted = OB_PRIV_SET_EMPTY == priv_set;
+  const uint64_t exec_tenant_id = ObSchemaUtils::get_exec_tenant_id(key.tenant_id_);
+  int64_t affected_rows = 0;
+  ObDMLExecHelper exec(sql_client, exec_tenant_id);
+  ObDMLSqlSplicer dml;
+  if (!key.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid catalog database privilege arguments", K(ret), K(key));
+  } else if (OB_FAIL(gen_catalog_database_priv_dml(exec_tenant_id, key, priv_set, dml))) {
+    LOG_WARN("generate catalog database privilege dml failed", K(ret), K(key));
+  }
+  if (OB_SUCC(ret)) {
+    if (is_deleted) {
+      if (OB_FAIL(exec.exec_delete(OB_ALL_CATALOG_DATABASE_PRIVILEGE_TNAME, dml, affected_rows))) {
+        LOG_WARN("delete catalog database privilege failed", K(ret), K(key));
+      }
+    } else if (OB_FAIL(exec.exec_replace(
+                   OB_ALL_CATALOG_DATABASE_PRIVILEGE_TNAME, dml, affected_rows))) {
+      LOG_WARN("replace catalog database privilege failed", K(ret), K(key));
+    }
+    if (OB_FAIL(ret)) {
+    } else if (!is_single_row(affected_rows) && !is_double_row(affected_rows)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected affected rows", K(ret), K(affected_rows));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(dml.add_pk_column("schema_version", new_schema_version))
+        || OB_FAIL(dml.add_column("is_deleted", is_deleted))) {
+      LOG_WARN("add catalog database privilege history column failed", K(ret));
+    } else if (OB_FAIL(exec.exec_replace(
+                   OB_ALL_CATALOG_DATABASE_PRIVILEGE_HISTORY_TNAME, dml, affected_rows))) {
+      LOG_WARN("write catalog database privilege history failed", K(ret), K(key));
+    } else if (!is_single_row(affected_rows)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected history affected rows", K(ret), K(affected_rows));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ObSchemaOperation operation;
+    operation.tenant_id_ = key.tenant_id_;
+    operation.user_id_ = key.user_id_;
+    operation.catalog_name_ = key.catalog_;
+    operation.database_name_ = key.database_;
+    operation.op_type_ = is_deleted ? OB_DDL_DEL_CATALOG_DATABASE_PRIV
+                                    : OB_DDL_GRANT_REVOKE_CATALOG_DATABASE_PRIV;
+    operation.schema_version_ = new_schema_version;
+    operation.ddl_stmt_str_ = ddl_stmt_str;
+    if (OB_FAIL(log_operation(operation, sql_client))) {
+      LOG_WARN("log catalog database privilege operation failed", K(ret), K(operation));
+    }
+  }
+  return ret;
+}
+
+int ObCatalogSqlService::gen_catalog_table_priv_dml(
+    const uint64_t exec_tenant_id,
+    const ObCatalogTablePrivSortKey &key,
+    const ObPrivSet priv_set,
+    ObDMLSqlSplicer &dml)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(dml.add_pk_column("tenant_id", ObSchemaUtils::get_extract_tenant_id(
+                                             exec_tenant_id, key.tenant_id_)))
+      || OB_FAIL(dml.add_pk_column("user_id", ObSchemaUtils::get_extract_schema_id(
+                                              exec_tenant_id, key.user_id_)))
+      || OB_FAIL(dml.add_pk_column("catalog_name", ObHexEscapeSqlStr(key.catalog_)))
+      || OB_FAIL(dml.add_pk_column("database_name", ObHexEscapeSqlStr(key.database_)))
+      || OB_FAIL(dml.add_pk_column("table_name", ObHexEscapeSqlStr(key.table_)))
+      || OB_FAIL(dml.add_column("priv_set", priv_set))
+      || OB_FAIL(dml.add_gmt_modified())) {
+    LOG_WARN("add catalog table privilege column failed", K(ret), K(key));
+  }
+  return ret;
+}
+
+int ObCatalogSqlService::grant_revoke_catalog_table(
+    const ObCatalogTablePrivSortKey &key,
+    const ObPrivSet priv_set,
+    const int64_t new_schema_version,
+    const ObString &ddl_stmt_str,
+    ObISQLClient &sql_client)
+{
+  int ret = OB_SUCCESS;
+  const bool is_deleted = OB_PRIV_SET_EMPTY == priv_set;
+  const uint64_t exec_tenant_id = ObSchemaUtils::get_exec_tenant_id(key.tenant_id_);
+  int64_t affected_rows = 0;
+  ObDMLExecHelper exec(sql_client, exec_tenant_id);
+  ObDMLSqlSplicer dml;
+  if (!key.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid catalog table privilege arguments", K(ret), K(key));
+  } else if (OB_FAIL(gen_catalog_table_priv_dml(exec_tenant_id, key, priv_set, dml))) {
+    LOG_WARN("generate catalog table privilege dml failed", K(ret), K(key));
+  }
+  if (OB_SUCC(ret)) {
+    if (is_deleted) {
+      if (OB_FAIL(exec.exec_delete(OB_ALL_CATALOG_TABLE_PRIVILEGE_TNAME, dml, affected_rows))) {
+        LOG_WARN("delete catalog table privilege failed", K(ret), K(key));
+      }
+    } else if (OB_FAIL(exec.exec_replace(
+                   OB_ALL_CATALOG_TABLE_PRIVILEGE_TNAME, dml, affected_rows))) {
+      LOG_WARN("replace catalog table privilege failed", K(ret), K(key));
+    }
+    if (OB_FAIL(ret)) {
+    } else if (!is_single_row(affected_rows) && !is_double_row(affected_rows)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected affected rows", K(ret), K(affected_rows));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(dml.add_pk_column("schema_version", new_schema_version))
+        || OB_FAIL(dml.add_column("is_deleted", is_deleted))) {
+      LOG_WARN("add catalog table privilege history column failed", K(ret));
+    } else if (OB_FAIL(exec.exec_replace(
+                   OB_ALL_CATALOG_TABLE_PRIVILEGE_HISTORY_TNAME, dml, affected_rows))) {
+      LOG_WARN("write catalog table privilege history failed", K(ret), K(key));
+    } else if (!is_single_row(affected_rows)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected history affected rows", K(ret), K(affected_rows));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    ObSchemaOperation operation;
+    operation.tenant_id_ = key.tenant_id_;
+    operation.user_id_ = key.user_id_;
+    operation.catalog_name_ = key.catalog_;
+    operation.database_name_ = key.database_;
+    operation.table_name_ = key.table_;
+    operation.op_type_ = is_deleted ? OB_DDL_DEL_CATALOG_TABLE_PRIV
+                                    : OB_DDL_GRANT_REVOKE_CATALOG_TABLE_PRIV;
+    operation.schema_version_ = new_schema_version;
+    operation.ddl_stmt_str_ = ddl_stmt_str;
+    if (OB_FAIL(log_operation(operation, sql_client))) {
+      LOG_WARN("log catalog table privilege operation failed", K(ret), K(operation));
     }
   }
   return ret;

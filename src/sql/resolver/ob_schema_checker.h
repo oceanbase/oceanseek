@@ -166,6 +166,19 @@ public:
                           uint64_t &catalog_id,
                           ObIAllocator *allocator = NULL,
                           bool allow_not_exist = false) const;
+  int get_catalog_database_id_name(const uint64_t tenant_id,
+                                   const uint64_t catalog_id,
+                                   common::ObString &database_name,
+                                   uint64_t &database_id,
+                                   ObIAllocator *allocator = NULL,
+                                   bool allow_not_exist = false) const;
+  int get_catalog_table_id_name(const uint64_t tenant_id,
+                                const uint64_t catalog_id,
+                                const uint64_t database_id,
+                                common::ObString &table_name,
+                                uint64_t &table_id,
+                                ObIAllocator *allocator = NULL,
+                                bool allow_not_exist = false) const;
   int get_sensitive_rule_schema_count(const uint64_t tenant_id, int64_t &count) const;
   int get_sensitive_rule_id_name(const uint64_t tenant_id,
                                  common::ObString &sensitive_rule_name,

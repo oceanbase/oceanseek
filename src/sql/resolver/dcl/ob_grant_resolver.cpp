@@ -1283,16 +1283,24 @@ int ObGrantResolver::resolve_mysql(const ParseNode &parse_tree)
           ObString db = ObString::make_string("");
           ObString table = ObString::make_string("");
           ObString catalog = ObString::make_string("");
+          ObString current_catalog = ObString::make_string("");
           ObString sensitive_rule = ObString::make_string("");
+          uint64_t current_catalog_id = OB_INVALID_ID;
           if (priv_object_node != NULL
               && OB_FAIL(resolve_priv_level_with_object_type(session_info_,
                                                              priv_object_node,
                                                              grant_level))) {
             LOG_WARN("failed to resolve priv level with object", K(ret));
+          } else if (priv_object_node != NULL
+                     && (1 == priv_object_node->value_ || 9 == priv_object_node->value_)
+                     && OB_FAIL(resolve_catalog_node(NULL, current_catalog_id, current_catalog))) {
+            LOG_WARN("failed to resolve current catalog", K(ret));
           } else if (OB_FAIL(resolve_priv_level(params_.schema_checker_->get_schema_guard(),
                                                 session_info_,
                                                 priv_level_node,
                                                 params_.session_info_->get_database_name(),
+                                                current_catalog_id,
+                                                current_catalog,
                                                 db,
                                                 table,
                                                 grant_level,
@@ -1305,16 +1313,29 @@ int ObGrantResolver::resolve_mysql(const ParseNode &parse_tree)
             grant_stmt->set_grant_level(grant_level);
           }
 
-          if (OB_SUCC(ret) 
-              && grant_level != OB_PRIV_CATALOG_LEVEL
-              && grant_level != OB_PRIV_SENSITIVE_RULE_LEVEL
-              && grant_level != OB_PRIV_OBJECT_LEVEL) {
+          if (OB_FAIL(ret)) {
+          } else if (grant_level != OB_PRIV_CATALOG_LEVEL
+                     && grant_level != OB_PRIV_SENSITIVE_RULE_LEVEL
+                     && grant_level != OB_PRIV_OBJECT_LEVEL
+                     && catalog.empty()) {
             if (OB_FAIL(check_and_convert_name(db, table))) {
               LOG_WARN("Check and convert name error", K(db), K(table), K(ret));
             } else if (OB_FAIL(grant_stmt->set_database_name(db))) {
               LOG_WARN("Failed to set database_name to grant_stmt", K(ret));
             } else if (OB_FAIL(grant_stmt->set_table_name(table))) {
               LOG_WARN("Failed to set table_name to grant_stmt", K(ret));
+            }
+          } else if (!catalog.empty()) {
+            if (!table.empty()
+                && OB_FAIL(normalize_and_validate_name(table, ObNameType::NAME_TYPE_TABLE))) {
+              LOG_WARN("Failed to normalize and validate catalog table name", K(ret), K(table));
+            } else {
+              grant_stmt->set_catalog_name(catalog);
+              if (OB_FAIL(grant_stmt->set_database_name(db))) {
+                LOG_WARN("Failed to set database_name to grant_stmt", K(ret));
+              } else if (OB_FAIL(grant_stmt->set_table_name(table))) {
+                LOG_WARN("Failed to set table_name to grant_stmt", K(ret));
+              }
             }
           }
 
@@ -1343,6 +1364,20 @@ int ObGrantResolver::resolve_mysql(const ParseNode &parse_tree)
                                                                                       params_.session_info_,
                                                                                       *allocator_))) {
             LOG_WARN("Resolve priv set error", K(ret));
+          } else if (!grant_stmt->get_catalog_name().empty()
+                     && (OB_PRIV_DB_LEVEL == grant_level
+                         || OB_PRIV_TABLE_LEVEL == grant_level)
+                     && (priv_set == OB_PRIV_SET_EMPTY
+                         || !(priv_set & OB_PRIV_CATALOG_DB_TABLE_ACC)
+                         || (priv_set & (~(OB_PRIV_CATALOG_DB_TABLE_ACC | OB_PRIV_GRANT))))) {
+            ret = OB_ILLEGAL_GRANT_FOR_TABLE;
+            LOG_WARN("only SELECT and INSERT privileges are supported on catalog database or table",
+                     K(ret), "priv_type", ObPrintPrivSet(priv_set),
+                     "catalog", grant_stmt->get_catalog_name(),
+                     "database", grant_stmt->get_database_name(),
+                     "table", grant_stmt->get_table_name());
+            LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                           "privileges other than SELECT and INSERT on catalog database or table");
           } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, compat_version))) {
             LOG_WARN("fail to get data version", K(tenant_id));
           } else if (!sql::ObSQLUtils::is_data_version_ge_422_or_431(compat_version)
@@ -1444,7 +1479,8 @@ int ObGrantResolver::resolve_mysql(const ParseNode &parse_tree)
 
         //check whether table exist.If table no exist, priv set should contain create priv.
         if (OB_SUCC(ret)) {
-          if (OB_PRIV_TABLE_LEVEL == grant_level) { //need check if table exist
+          if (OB_PRIV_TABLE_LEVEL == grant_level
+              && grant_stmt->get_catalog_name().empty()) { //need check if local table exist
             bool exist = false;
             const bool is_index = false;
             const ObString &db = grant_stmt->get_database_name();
@@ -1655,6 +1691,14 @@ int ObGrantResolver::resolve_priv_level_with_object_type(const ObSQLSessionInfo 
       } else {
         grant_level = OB_PRIV_OBJECT_LEVEL;
       }
+    } else if (priv_object_node->value_ == 9) {
+      if (compat_version < DATA_VERSION_4_6_3_1) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("grant on catalog database is not supported below DATA_VERSION_4_6_3_1", K(ret));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "grant privilege on catalog database in this version");
+      } else {
+        grant_level = OB_PRIV_DB_LEVEL;
+      }
     } else {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected obj type", K(ret), K(priv_object_node->value_));
@@ -1663,14 +1707,13 @@ int ObGrantResolver::resolve_priv_level_with_object_type(const ObSQLSessionInfo 
   return ret;
 }
 
-//0 == priv_level_node->num_child_ -> grant priv on * to user
-//0 == priv_level_node->num_child_ -> grant priv on table to user
-//2 == priv_level_node->num_child_ -> grant priv on db.table to user
 int ObGrantResolver::resolve_priv_level(
     ObSchemaGetterGuard *guard,
     const ObSQLSessionInfo *session,
     const ParseNode *node,
     const ObString &session_db,
+    const uint64_t current_catalog_id,
+    const ObString &current_catalog,
     ObString &db,
     ObString &table,
     ObPrivLevel &grant_level,
@@ -1682,6 +1725,8 @@ int ObGrantResolver::resolve_priv_level(
   int ret = OB_SUCCESS;
   const bool is_ai_obj = (priv_object_node != NULL
       && (priv_object_node->value_ == 7 || priv_object_node->value_ == 8));
+  const bool is_catalog_database = (priv_object_node != NULL && priv_object_node->value_ == 9);
+  const bool is_explicit_table = (priv_object_node != NULL && priv_object_node->value_ == 1);
   bool is_grant_routine = (grant_level == OB_PRIV_ROUTINE_LEVEL);
   bool is_grant_object = (grant_level == OB_PRIV_OBJECT_LEVEL);
   if (OB_ISNULL(node)) {
@@ -1693,6 +1738,80 @@ int ObGrantResolver::resolve_priv_level(
       LOG_WARN("sql_parser error", K(ret));
     } else {
       catalog.assign_ptr(node->str_value_, static_cast<const int32_t>(node->str_len_));
+    }
+  } else if (is_catalog_database) {
+    const bool is_full_name = T_PRIV_LEVEL == node->type_ && 2 == node->num_child_
+        && OB_NOT_NULL(node->children_[0]) && OB_NOT_NULL(node->children_[1])
+        && T_IDENT == node->children_[0]->type_ && T_IDENT == node->children_[1]->type_;
+    const bool is_short_name = 0 == node->num_child_ && T_IDENT == node->type_;
+    if (!is_full_name && !is_short_name) {
+      ret = OB_ERR_PARSE_SQL;
+      LOG_WARN("catalog database privilege requires database or catalog.database", K(ret));
+    } else if (is_full_name) {
+      catalog.assign_ptr(node->children_[0]->str_value_,
+                         static_cast<const int32_t>(node->children_[0]->str_len_));
+      db.assign_ptr(node->children_[1]->str_value_,
+                    static_cast<const int32_t>(node->children_[1]->str_len_));
+    } else if (OB_UNLIKELY(!is_external_catalog_id(current_catalog_id))) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("database privilege is only supported for external catalog",
+               K(ret), K(current_catalog_id));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "database privilege in internal catalog");
+    } else {
+      catalog = current_catalog;
+      db.assign_ptr(node->str_value_, static_cast<const int32_t>(node->str_len_));
+    }
+    if (OB_SUCC(ret)) {
+      grant_level = OB_PRIV_DB_LEVEL;
+    }
+  } else if (is_explicit_table) {
+    uint64_t compat_version = 0;
+    const bool is_full_name = T_PRIV_LEVEL == node->type_ && 3 == node->num_child_
+        && OB_NOT_NULL(node->children_[0]) && OB_NOT_NULL(node->children_[1])
+        && OB_NOT_NULL(node->children_[2]) && T_IDENT == node->children_[0]->type_
+        && T_IDENT == node->children_[1]->type_ && T_IDENT == node->children_[2]->type_;
+    const bool is_db_table = T_PRIV_LEVEL == node->type_ && 2 == node->num_child_
+        && OB_NOT_NULL(node->children_[0]) && OB_NOT_NULL(node->children_[1])
+        && T_IDENT == node->children_[0]->type_ && T_IDENT == node->children_[1]->type_;
+    const bool is_table = 0 == node->num_child_ && T_IDENT == node->type_;
+    if (!is_full_name && !is_db_table && !is_table) {
+      ret = OB_ERR_PARSE_SQL;
+      LOG_WARN("invalid catalog table privilege name", K(ret));
+    } else if (OB_FAIL(GET_MIN_DATA_VERSION(session->get_effective_tenant_id(), compat_version))) {
+      LOG_WARN("failed to get min data version", K(ret));
+    } else if (compat_version < DATA_VERSION_4_6_3_1) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("grant on catalog table is not supported below DATA_VERSION_4_6_3_1", K(ret));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "grant privilege on catalog table in this version");
+    } else if (is_full_name) {
+      catalog.assign_ptr(node->children_[0]->str_value_,
+                         static_cast<const int32_t>(node->children_[0]->str_len_));
+      db.assign_ptr(node->children_[1]->str_value_,
+                    static_cast<const int32_t>(node->children_[1]->str_len_));
+      table.assign_ptr(node->children_[2]->str_value_,
+                       static_cast<const int32_t>(node->children_[2]->str_len_));
+    } else if (OB_UNLIKELY(!is_external_catalog_id(current_catalog_id))) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("table privilege is only supported for external catalog",
+               K(ret), K(current_catalog_id));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "table privilege in internal catalog");
+    } else {
+      catalog = current_catalog;
+      if (is_db_table) {
+        db.assign_ptr(node->children_[0]->str_value_,
+                      static_cast<const int32_t>(node->children_[0]->str_len_));
+        table.assign_ptr(node->children_[1]->str_value_,
+                         static_cast<const int32_t>(node->children_[1]->str_len_));
+      } else if (session_db.empty()) {
+        ret = OB_ERR_NO_DB_SELECTED;
+        LOG_WARN("no database selected", K(ret));
+      } else {
+        db = session_db;
+        table.assign_ptr(node->str_value_, static_cast<const int32_t>(node->str_len_));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      grant_level = OB_PRIV_TABLE_LEVEL;
     }
   } else if (OB_PRIV_SENSITIVE_RULE_LEVEL == grant_level) {
     sensitive_rule = ObString::make_string("");

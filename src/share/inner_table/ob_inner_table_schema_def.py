@@ -9660,10 +9660,46 @@ all_ai_gateway_def = dict(
 def_table_schema(**all_ai_gateway_def)
 def_table_schema(**gen_history_table_def(614, all_ai_gateway_def))
 
-# 615: __all_catalog_database_priv
-# 616: __all_catalog_database_priv_history
-# 617: __all_catalog_table_priv
-# 618: __all_catalog_table_priv_history
+all_catalog_database_priv_def = dict(
+    owner = 'cjl476581',
+    table_name     = '__all_catalog_database_privilege',
+    table_id       = '615',
+    table_type     = 'SYSTEM_TABLE',
+    gm_columns     = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+        ('tenant_id', 'int'),
+        ('user_id', 'int'),
+        ('catalog_name', 'varbinary:OB_MAX_CATALOG_NAME_BINARY_LENGTH'),
+        ('database_name', 'varbinary:OB_MAX_CATALOG_OBJECT_NAME_BINARY_LENGTH')
+    ],
+    normal_columns = [
+        ('priv_set', 'int', 'false', '0'),
+    ],
+    in_tenant_space = True,
+)
+def_table_schema(**all_catalog_database_priv_def)
+def_table_schema(**gen_history_table_def(616, all_catalog_database_priv_def))
+
+all_catalog_table_priv_def = dict(
+    owner = 'cjl476581',
+    table_name     = '__all_catalog_table_privilege',
+    table_id       = '617',
+    table_type     = 'SYSTEM_TABLE',
+    gm_columns     = ['gmt_create', 'gmt_modified'],
+    rowkey_columns = [
+        ('tenant_id', 'int'),
+        ('user_id', 'int'),
+        ('catalog_name', 'varbinary:OB_MAX_CATALOG_NAME_BINARY_LENGTH'),
+        ('database_name', 'varbinary:OB_MAX_CATALOG_OBJECT_NAME_BINARY_LENGTH'),
+        ('table_name', 'varbinary:OB_MAX_CATALOG_OBJECT_NAME_BINARY_LENGTH')
+    ],
+    normal_columns = [
+        ('priv_set', 'int', 'false', '0'),
+    ],
+    in_tenant_space = True,
+)
+def_table_schema(**all_catalog_table_priv_def)
+def_table_schema(**gen_history_table_def(618, all_catalog_table_priv_def))
 
 # 余留位置（此行之前占位）
 # 本区域占位建议：采用真实表名进行占位
@@ -19275,10 +19311,25 @@ def_table_schema(
   ],
 )
 
-# 12632: __all_virtual_catalog_database_priv
-# 12633: __all_virtual_catalog_database_priv_history
-# 12634: __all_virtual_catalog_table_priv
-# 12635: __all_virtual_catalog_table_priv_history
+def_table_schema(**gen_iterate_virtual_table_def(
+  table_id = '12632',
+  table_name = '__all_virtual_catalog_database_privilege',
+  keywords = all_def_keywords['__all_catalog_database_privilege']))
+
+def_table_schema(**gen_iterate_virtual_table_def(
+  table_id = '12633',
+  table_name = '__all_virtual_catalog_database_privilege_history',
+  keywords = all_def_keywords['__all_catalog_database_privilege_history']))
+
+def_table_schema(**gen_iterate_virtual_table_def(
+  table_id = '12634',
+  table_name = '__all_virtual_catalog_table_privilege',
+  keywords = all_def_keywords['__all_catalog_table_privilege']))
+
+def_table_schema(**gen_iterate_virtual_table_def(
+  table_id = '12635',
+  table_name = '__all_virtual_catalog_table_privilege_history',
+  keywords = all_def_keywords['__all_catalog_table_privilege_history']))
 
 # 12636: __all_virtual_local_active_tx
 # 12637: __all_virtual_local_log_stat
@@ -85324,8 +85375,21 @@ def_sys_index_table(
   index_type = 'INDEX_TYPE_UNIQUE_LOCAL',
   keywords = all_def_keywords['__all_ai_gateway'])
 
-# 101135: idx_catalog_database_priv_catalog_name
-# 101136: idx_catalog_table_priv_catalog_name
+def_sys_index_table(
+  index_name = 'idx_catalog_database_privilege_catalog_name',
+  index_table_id = 101135,
+  index_columns = ['catalog_name', 'database_name'],
+  index_using_type = 'USING_BTREE',
+  index_type = 'INDEX_TYPE_NORMAL_LOCAL',
+  keywords = all_def_keywords['__all_catalog_database_privilege'])
+
+def_sys_index_table(
+  index_name = 'idx_catalog_table_privilege_catalog_name',
+  index_table_id = 101136,
+  index_columns = ['catalog_name', 'database_name', 'table_name'],
+  index_using_type = 'USING_BTREE',
+  index_type = 'INDEX_TYPE_NORMAL_LOCAL',
+  keywords = all_def_keywords['__all_catalog_table_privilege'])
 
 # 余留位置（此行之前占位）
 # 索引表占位建议：基于基表（数据表）表名来占位，其他方式包括：索引名（index_name）、索引表表名

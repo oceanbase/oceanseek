@@ -460,7 +460,6 @@ int ObStaticEngineCG::postorder_generate_op(ObLogicalOperator &op,
     if (!select_into_spec->external_properties_.str_.empty()) {
       // select into是一个dml算子，它本身没有实现向量化，那它的rich
       // format就是false
-      bool use_odps_jni_connector = GCONF._use_odps_jni_connector;
       ObExternalFileFormat::FormatType format_type =
           ObExternalFileFormat::INVALID_FORMAT;
       if (OB_FAIL(ObSQLUtils::get_external_table_type(
@@ -473,7 +472,11 @@ int ObStaticEngineCG::postorder_generate_op(ObLogicalOperator &op,
                  "_enable_rich_vector_format=true",
                  K(ret));
       } else if (ObExternalFileFormat::ODPS_FORMAT == format_type) {
-        if (use_odps_jni_connector && !phy_plan_->get_use_rich_format()) {
+        ObExternalFileFormat format;
+        if (OB_FAIL(format.load_from_string(select_into_spec->external_properties_.str_,
+                                            phy_plan_->get_allocator()))) {
+          LOG_WARN("failed to load ODPS write format", K(ret));
+        } else if (format.odps_format_.use_odps_jni_connector_ && !phy_plan_->get_use_rich_format()) {
           ret = OB_NOT_SUPPORTED;
           LOG_WARN("not support odps format in not rich format in java mode, please "
                    "_enable_rich_vector_format=true",
@@ -10041,7 +10044,10 @@ int ObStaticEngineCG::generate_spec(ObLogSelectInto &op, ObSelectIntoSpec &spec,
   }
   if (OB_SUCC(ret) && lake_table_metadata != NULL) {
     spec.lake_table_format_ = lake_table_metadata->get_format_type();
-    if (OB_FAIL(plan_ctx->set_lake_table_metadata(lake_table_metadata))) {
+    // ODPS commits its upload session in the SELECT INTO operator. Only
+    // Iceberg needs metadata in the plan context for the catalog commit.
+    if (share::is_iceberg_lake_table(spec.lake_table_format_)
+        && OB_FAIL(plan_ctx->set_lake_table_metadata(lake_table_metadata))) {
       LOG_WARN("failed to set lake table metadata", K(ret));
     }
   }

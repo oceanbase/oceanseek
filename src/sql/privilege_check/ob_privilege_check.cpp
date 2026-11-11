@@ -53,6 +53,7 @@
 #include "sql/optimizer/ob_optimizer_util.h"
 #include "sql/resolver/cmd/ob_event_stmt.h"
 #include "sql/resolver/cmd/ob_location_utils_stmt.h"
+#include "share/catalog/ob_catalog_utils.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "sql/resolver/cmd/ob_merge_table_stmt.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
@@ -508,10 +509,11 @@ int add_col_priv_to_need_priv(
   need_priv.is_sys_table_ = table_item.is_system_table_;
   need_priv.is_for_update_ = table_item.for_update_;
   need_priv.priv_level_ = OB_PRIV_TABLE_LEVEL;
-  if (need_priv.catalog_ != OB_INTERNAL_CATALOG_NAME) {
-    need_priv.priv_level_ = OB_PRIV_CATALOG_LEVEL;
-    need_priv.priv_set_ = OB_PRIV_USE_CATALOG;
-    ADD_NEED_PRIV(need_priv);
+  if (!ObCatalogUtils::is_internal_catalog_name(need_priv.catalog_)) {
+    ObNeedPriv catalog_need_priv("", "", OB_PRIV_CATALOG_LEVEL,
+                                 OB_PRIV_USE_CATALOG, false, false,
+                                 OB_PRIV_CHECK_ALL, need_priv.catalog_);
+    ADD_NEED_PRIV(catalog_need_priv);
   }
   const uint64_t table_id = table_item.table_id_;
   visitor.set_relation_scope();
@@ -1482,8 +1484,8 @@ int get_dml_stmt_need_privs(
             need_priv.is_sys_table_ = table_item->is_system_table_;
             need_priv.is_for_update_ = table_item->for_update_;
             need_priv.priv_level_ = OB_PRIV_TABLE_LEVEL;
-            if ((is_mysql_mode() && need_priv.catalog_ != OB_INTERNAL_CATALOG_NAME)
-                || (is_oracle_mode() && need_priv.catalog_ != OB_INTERNAL_CATALOG_NAME_UPPER)) {
+            if (is_oracle_mode()
+                && need_priv.catalog_ != OB_INTERNAL_CATALOG_NAME_UPPER) {
               need_priv.priv_level_ = OB_PRIV_CATALOG_LEVEL;
               priv_set |= OB_PRIV_USE_CATALOG;
             }

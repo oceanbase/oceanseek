@@ -12,6 +12,7 @@
 #include "share/ob_zone_merge_info.h"
 #include "share/ob_all_server_tracer.h"
 #include "rootserver/ob_objpriv_mysql_schema_history_recycler.h"
+#include "rootserver/ob_catalog_priv_schema_history_recycler.h"
 
 namespace oceanbase
 {
@@ -931,6 +932,16 @@ int ObSchemaHistoryRecycler::try_recycle_schema_history(
                          catalog_id);
     ret = OB_SUCCESS; // overwrite ret
 
+    // --------------------------- catalog privilege -----------------------------------------
+    RECYCLE_CUSTOM_SCHEMA(ObCatalogDatabasePrivRecycleSchemaExecutor,
+                          catalog_database_priv,
+                          OB_ALL_CATALOG_DATABASE_PRIVILEGE_HISTORY_TNAME);
+    ret = OB_SUCCESS; // overwrite ret
+    RECYCLE_CUSTOM_SCHEMA(ObCatalogTablePrivRecycleSchemaExecutor,
+                          catalog_table_priv,
+                          OB_ALL_CATALOG_TABLE_PRIVILEGE_HISTORY_TNAME);
+    ret = OB_SUCCESS; // overwrite ret
+
     // --------------------------- external_resource ---------------------------------------------------
     RECYCLE_FIRST_SCHEMA(RECYCLE_AND_COMPRESS, external_resource, OB_ALL_EXTERNAL_RESOURCE_HISTORY_TNAME,
                          resource_id);
@@ -1452,6 +1463,10 @@ DEFINE_FILL_SCHEMA_HISTORY_MAP(ObThirdRecycleSchemaExecutor, ObThirdSchemaKey);
 DEFINE_FILL_SCHEMA_HISTORY_MAP(ObSystemVariableRecycleSchemaExecutor, ObSystemVariableSchemaKey);
 DEFINE_FILL_SCHEMA_HISTORY_MAP(ObObjectPrivRecycleSchemaExecutor, ObObjectPrivSchemaKey);
 DEFINE_FILL_SCHEMA_HISTORY_MAP(ObObjectPrivMysqlRecycleSchemaExecutor, ObObjectPrivMysqlSchemaKey);
+DEFINE_FILL_SCHEMA_HISTORY_MAP(ObCatalogDatabasePrivRecycleSchemaExecutor,
+                               ObCatalogDatabasePrivSchemaKey);
+DEFINE_FILL_SCHEMA_HISTORY_MAP(ObCatalogTablePrivRecycleSchemaExecutor,
+                               ObCatalogTablePrivSchemaKey);
 #undef DEFINE_FILL_SCHEMA_HISTORY_MAP
 
 #define DEFINE_FILL_SCHEMA_HISTORY_KEY(EXECUTOR, KEY) \
@@ -1466,6 +1481,10 @@ DEFINE_FILL_SCHEMA_HISTORY_KEY(ObSecondRecycleSchemaExecutor, ObSecondSchemaKey)
 DEFINE_FILL_SCHEMA_HISTORY_KEY(ObThirdRecycleSchemaExecutor, ObThirdSchemaKey);
 DEFINE_FILL_SCHEMA_HISTORY_KEY(ObObjectPrivRecycleSchemaExecutor, ObObjectPrivSchemaKey);
 DEFINE_FILL_SCHEMA_HISTORY_KEY(ObObjectPrivMysqlRecycleSchemaExecutor, ObObjectPrivMysqlSchemaKey);
+DEFINE_FILL_SCHEMA_HISTORY_KEY(ObCatalogDatabasePrivRecycleSchemaExecutor,
+                               ObCatalogDatabasePrivSchemaKey);
+DEFINE_FILL_SCHEMA_HISTORY_KEY(ObCatalogTablePrivRecycleSchemaExecutor,
+                               ObCatalogTablePrivSchemaKey);
 #undef DEFINE_FILL_SCHEMA_HISTORY_KEY
 
 #define DEFINE_FILL_SCHEMA_HISTORY_FUNC(EXECUTOR, KEY) \
@@ -1509,6 +1528,10 @@ DEFINE_FILL_SCHEMA_HISTORY_FUNC(ObThirdRecycleSchemaExecutor, ObThirdSchemaKey);
 DEFINE_FILL_SCHEMA_HISTORY_FUNC(ObSystemVariableRecycleSchemaExecutor, ObSystemVariableSchemaKey);
 DEFINE_FILL_SCHEMA_HISTORY_FUNC(ObObjectPrivRecycleSchemaExecutor, ObObjectPrivSchemaKey);
 DEFINE_FILL_SCHEMA_HISTORY_FUNC(ObObjectPrivMysqlRecycleSchemaExecutor, ObObjectPrivMysqlSchemaKey);
+DEFINE_FILL_SCHEMA_HISTORY_FUNC(ObCatalogDatabasePrivRecycleSchemaExecutor,
+                                ObCatalogDatabasePrivSchemaKey);
+DEFINE_FILL_SCHEMA_HISTORY_FUNC(ObCatalogTablePrivRecycleSchemaExecutor,
+                                ObCatalogTablePrivSchemaKey);
 #undef DEFINE_FILL_SCHEMA_HISTORY_FUNC
 
 #define DEFINE_RECYCLE_SCHEMA_HISTORY(EXECUTOR, KEY) \
@@ -1564,6 +1587,10 @@ DEFINE_RECYCLE_SCHEMA_HISTORY(ObSecondRecycleSchemaExecutor, ObSecondSchemaKey);
 DEFINE_RECYCLE_SCHEMA_HISTORY(ObThirdRecycleSchemaExecutor, ObThirdSchemaKey);
 DEFINE_RECYCLE_SCHEMA_HISTORY(ObObjectPrivRecycleSchemaExecutor, ObObjectPrivSchemaKey);
 DEFINE_RECYCLE_SCHEMA_HISTORY(ObObjectPrivMysqlRecycleSchemaExecutor, ObObjectPrivMysqlSchemaKey);
+DEFINE_RECYCLE_SCHEMA_HISTORY(ObCatalogDatabasePrivRecycleSchemaExecutor,
+                              ObCatalogDatabasePrivSchemaKey);
+DEFINE_RECYCLE_SCHEMA_HISTORY(ObCatalogTablePrivRecycleSchemaExecutor,
+                              ObCatalogTablePrivSchemaKey);
 #undef DEFINE_RECYCLE_SCHEMA_HISTORY
 
 int ObRecycleSchemaExecutor::gen_batch_recycle_schema_history_sql(
@@ -1622,6 +1649,10 @@ DEFINE_BATCH_RECYCLE_SCHEMA_HISTORY(ObSecondRecycleSchemaExecutor, ObSecondSchem
 DEFINE_BATCH_RECYCLE_SCHEMA_HISTORY(ObThirdRecycleSchemaExecutor, ObThirdSchemaKey);
 DEFINE_BATCH_RECYCLE_SCHEMA_HISTORY(ObObjectPrivRecycleSchemaExecutor, ObObjectPrivSchemaKey);
 DEFINE_BATCH_RECYCLE_SCHEMA_HISTORY(ObObjectPrivMysqlRecycleSchemaExecutor, ObObjectPrivMysqlSchemaKey);
+DEFINE_BATCH_RECYCLE_SCHEMA_HISTORY(ObCatalogDatabasePrivRecycleSchemaExecutor,
+                                    ObCatalogDatabasePrivSchemaKey);
+DEFINE_BATCH_RECYCLE_SCHEMA_HISTORY(ObCatalogTablePrivRecycleSchemaExecutor,
+                                    ObCatalogTablePrivSchemaKey);
 #undef DEFINE_BATCH_RECYCLE_SCHEMA_HISTORY
 
 int ObRecycleSchemaExecutor::gen_batch_compress_schema_history_sql(
@@ -1723,6 +1754,12 @@ DEFINE_COMPRESS_SCHEMA_HISTORY(ObObjectPrivRecycleSchemaExecutor,
 DEFINE_COMPRESS_SCHEMA_HISTORY(ObObjectPrivMysqlRecycleSchemaExecutor,
                                ObObjectPrivMysqlSchemaKey,
                                ObObjectPrivMysqlCompressSchemaInfo);
+DEFINE_COMPRESS_SCHEMA_HISTORY(ObCatalogDatabasePrivRecycleSchemaExecutor,
+                               ObCatalogDatabasePrivSchemaKey,
+                               ObCatalogDatabasePrivCompressSchemaInfo);
+DEFINE_COMPRESS_SCHEMA_HISTORY(ObCatalogTablePrivRecycleSchemaExecutor,
+                               ObCatalogTablePrivSchemaKey,
+                               ObCatalogTablePrivCompressSchemaInfo);
 #undef DEFINE_COMPRESS_SCHEMA_HISTORY
 
 #define BATCH_COMPRESS_SCHEMA_HISTORY(EXECUTOR, INFO) \
@@ -1749,6 +1786,10 @@ BATCH_COMPRESS_SCHEMA_HISTORY(ObRecycleSchemaExecutor, ObFirstCompressSchemaInfo
 BATCH_COMPRESS_SCHEMA_HISTORY(ObSystemVariableRecycleSchemaExecutor, ObSystemVariableCompressSchemaInfo);
 BATCH_COMPRESS_SCHEMA_HISTORY(ObObjectPrivRecycleSchemaExecutor, ObObjectPrivCompressSchemaInfo);
 BATCH_COMPRESS_SCHEMA_HISTORY(ObObjectPrivMysqlRecycleSchemaExecutor, ObObjectPrivMysqlCompressSchemaInfo);
+BATCH_COMPRESS_SCHEMA_HISTORY(ObCatalogDatabasePrivRecycleSchemaExecutor,
+                              ObCatalogDatabasePrivCompressSchemaInfo);
+BATCH_COMPRESS_SCHEMA_HISTORY(ObCatalogTablePrivRecycleSchemaExecutor,
+                              ObCatalogTablePrivCompressSchemaInfo);
 #undef BATCH_COMPRESS_SCHEMA_HISTORY
 
 ObSecondRecycleSchemaExecutor::ObSecondRecycleSchemaExecutor(

@@ -33,6 +33,8 @@ namespace sql
 
 class ObTableModifySpec;
 class ObPxSqcMeta;
+class ObOdpsUploadSessionMgr;
+struct ObODPSGeneralFormat;
 
 class ObGranulePumpArgs
 {
@@ -418,6 +420,8 @@ public:
   fetch_task_ret_(OB_SUCCESS),
   finished_cnt_(0),
   use_odps_jni_connector_(false),
+  odps_upload_session_mgr_(nullptr),
+  odps_upload_allocator_(nullptr),
   external_task_runners_() {
     external_task_runners_.set_attr(common::ObMemAttr(MTL_ID(), MEM_ATTR_EXT_TASK_GEN));
   }
@@ -554,18 +558,17 @@ public:
   ObOdpsPartitionDownloaderMgr &get_odps_downloader_mgr() {
     return odps_partition_downloader_mgr_;
   }
-  ObOdpsPartitionUploaderMgr &get_odps_uploader_mgr() {
-    return odps_partition_uploader_mgr_;
-  }
 #endif
 #ifdef OB_BUILD_JNI_ODPS
   ObOdpsPartitionJNIDownloaderMgr &get_odps_jni_scanner_mgr() {
     return odps_partition_jni_scanner_mgr_;
   }
-  ObOdpsPartitionJNIUploaderMgr &get_odps_jni_uploader_mgr() {
-    return odps_jni_uploader_mgr_;
-  }
 #endif
+  int init_odps_upload_session(common::ObIAllocator &allocator,
+                               const ObODPSGeneralFormat &format,
+                               const common::ObString &partition,
+                               bool overwrite, int64_t task_count);
+  ObOdpsUploadSessionMgr *get_odps_upload_session_mgr() { return odps_upload_session_mgr_; }
   int init_external_odps_table_downloader(ObGranulePumpArgs &args);
   int create_and_add_runner(int64_t tsc_op_id,
                             ObExecContext &exec_ctx, 
@@ -581,12 +584,12 @@ public:
 private:
 #ifdef OB_BUILD_CPP_ODPS
   ObOdpsPartitionDownloaderMgr odps_partition_downloader_mgr_;
-  ObOdpsPartitionUploaderMgr odps_partition_uploader_mgr_;
 #endif
 #ifdef OB_BUILD_JNI_ODPS
   ObOdpsPartitionJNIDownloaderMgr odps_partition_jni_scanner_mgr_;
-  ObOdpsPartitionJNIUploaderMgr odps_jni_uploader_mgr_;
 #endif
+  ObOdpsUploadSessionMgr *odps_upload_session_mgr_;
+  common::ObIAllocator *odps_upload_allocator_;
   common::ObArray<GITaskGenRunner *> external_task_runners_;
 };
 

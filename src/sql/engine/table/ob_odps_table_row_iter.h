@@ -321,52 +321,6 @@ private:
   common::ObArenaAllocator arena_alloc_;
  };
 
-class ObOdpsPartitionUploaderMgr
-{
-public:
-  typedef common::hash::ObHashMap<int64_t, int64_t, common::hash::SpinReadWriteDefendMode> OdpsMgrMap;
-  ObOdpsPartitionUploaderMgr() :  need_commit_(true), inited_(false), ref_(0) {}
-  struct OdpsUploader {
-    OdpsUploader() : upload_(NULL), record_writer_(NULL) {}
-    ~OdpsUploader() {
-      upload_.reset();
-      record_writer_.reset();
-    }
-    apsara::odps::sdk::IUploadPtr upload_;
-    apsara::odps::sdk::IRecordWriterPtr record_writer_;
-  };
-  int init_uploader(const sql::ObODPSGeneralFormat &odps_format,
-                    const ObString &external_partition,
-                    bool is_overwrite,
-                    int64_t parallel);
-  static int create_upload_session(const sql::ObODPSGeneralFormat &odps_format,
-                                   const ObString &external_partition,
-                                   bool is_overwrite,
-                                   apsara::odps::sdk::IUploadPtr &upload);
-  int get_odps_uploader(int64_t block_id,
-                        apsara::odps::sdk::IUploadPtr &upload,
-                        apsara::odps::sdk::IRecordWriterPtr &record_writer);
-  inline int64_t inc_ref()
-  {
-    return ATOMIC_FAA(&ref_, 1);
-  }
-  inline int64_t dec_ref()
-  {
-    return ATOMIC_SAF(&ref_, 1);
-  }
-  inline void set_fail()
-  {
-    ATOMIC_STORE(&need_commit_, false);
-  }
-  int commit_upload();
-  int reset();
-  bool need_commit_;
-private:
-  bool inited_;
-  int64_t ref_;
-  OdpsMgrMap odps_mgr_map_;
-  common::ObArenaAllocator arena_alloc_;
-};
 
 } // sql
 } // oceanbase

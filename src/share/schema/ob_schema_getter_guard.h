@@ -680,6 +680,19 @@ public:
   int get_catalog_priv_with_user_id(const uint64_t tenant_id,
                                     const uint64_t user_id,
                                     common::ObIArray<const ObCatalogPriv *> &catalog_privs);
+  int get_catalog_database_priv_set(
+      const ObCatalogDatabasePrivSortKey &catalog_database_priv_key,
+      ObPrivSet &priv_set);
+  int get_catalog_database_priv_with_user_id(
+      const uint64_t tenant_id,
+      const uint64_t user_id,
+      common::ObIArray<const ObCatalogDatabasePriv *> &catalog_database_privs);
+  int get_catalog_table_priv_set(const ObCatalogTablePrivSortKey &catalog_table_priv_key,
+                                 ObPrivSet &priv_set);
+  int get_catalog_table_priv_with_user_id(
+      const uint64_t tenant_id,
+      const uint64_t user_id,
+      common::ObIArray<const ObCatalogTablePriv *> &catalog_table_privs);
   int get_sensitive_rule_priv_set(const ObSensitiveRulePrivSortKey &sensitive_rule_priv_key,
                                   ObPrivSet &priv_set);
   int get_sensitive_rule_priv_with_user_id(const uint64_t tenant_id,
@@ -1453,6 +1466,12 @@ private:
                          const common::ObIArray<uint64_t> &enable_role_id_array,
                          const ObNeedPriv &need_priv,
                          ObPrivSet &user_catalog_priv_set);
+  int check_catalog_table_priv(const ObSessionPrivInfo &session_priv,
+                               const common::ObIArray<uint64_t> &enable_role_id_array,
+                               const ObNeedPriv &need_priv);
+  int check_catalog_database_priv(const ObSessionPrivInfo &session_priv,
+                                  const common::ObIArray<uint64_t> &enable_role_id_array,
+                                  const ObNeedPriv &need_priv);
   int check_sensitive_rule_priv(const ObSessionPrivInfo &session_priv,
                                 const common::ObIArray<uint64_t> &enable_role_id_array,
                                 const ObNeedPriv &need_priv);

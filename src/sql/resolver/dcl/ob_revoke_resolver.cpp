@@ -345,17 +345,25 @@ int ObRevokeResolver::resolve_mysql(const ParseNode &parse_tree)
             ObString db = ObString::make_string("");
             ObString table = ObString::make_string("");
             ObString catalog = ObString::make_string("");
+            ObString current_catalog = ObString::make_string("");
             ObString sensitive_rule = ObString::make_string("");
+            uint64_t current_catalog_id = OB_INVALID_ID;
             if (priv_object_node != NULL
                 && OB_FAIL(ObGrantResolver::resolve_priv_level_with_object_type(session_info_,
                                                                                 priv_object_node,
                                                                                 grant_level))) {
               LOG_WARN("failed to resolve priv level with object", K(ret));
+            } else if (priv_object_node != NULL
+                       && (1 == priv_object_node->value_ || 9 == priv_object_node->value_)
+                       && OB_FAIL(resolve_catalog_node(NULL, current_catalog_id, current_catalog))) {
+              LOG_WARN("failed to resolve current catalog", K(ret));
             } else if (OB_FAIL(ObGrantResolver::resolve_priv_level(
                         params_.schema_checker_->get_schema_guard(),
                         session_info_,
                         priv_level_node,
-                        params_.session_info_->get_database_name(), 
+                        params_.session_info_->get_database_name(),
+                        current_catalog_id,
+                        current_catalog,
                         db,
                         table,
                         grant_level,
@@ -370,16 +378,31 @@ int ObRevokeResolver::resolve_mysql(const ParseNode &parse_tree)
 
             const bool is_ai_obj = (priv_object_node != NULL
                 && (priv_object_node->value_ == 7 || priv_object_node->value_ == 8));
-            if (OB_SUCC(ret)
-                && grant_level != OB_PRIV_CATALOG_LEVEL
-                && grant_level != OB_PRIV_SENSITIVE_RULE_LEVEL
-                && !is_ai_obj) {
+
+            if (OB_FAIL(ret)) {
+            } else if (grant_level != OB_PRIV_CATALOG_LEVEL
+                       && grant_level != OB_PRIV_CATALOG_LEVEL
+                       && grant_level != OB_PRIV_SENSITIVE_RULE_LEVEL
+                       && !is_ai_obj
+                       && catalog.empty()) {
               if (OB_FAIL(check_and_convert_name(db, table))) {
                 LOG_WARN("Check and convert name error", K(db), K(table), K(ret));
               } else if (OB_FAIL(revoke_stmt->set_database_name(db))) {
                 LOG_WARN("Failed to set database_name to revoke_stmt", K(ret));
               } else if (OB_FAIL(revoke_stmt->set_table_name(table))) {
                 LOG_WARN("Failed to set table_name to revoke_stmt", K(ret));
+              }
+            } else if (!catalog.empty()) {
+              if (!table.empty()
+                  && OB_FAIL(normalize_and_validate_name(table, ObNameType::NAME_TYPE_TABLE))) {
+                LOG_WARN("Failed to normalize and validate catalog table name", K(ret), K(table));
+              } else {
+                revoke_stmt->set_catalog_name(catalog);
+                if (OB_FAIL(revoke_stmt->set_database_name(db))) {
+                  LOG_WARN("Failed to set database_name to revoke_stmt", K(ret));
+                } else if (OB_FAIL(revoke_stmt->set_table_name(table))) {
+                  LOG_WARN("Failed to set table_name to revoke_stmt", K(ret));
+                }
               }
             }
             if (OB_SUCC(ret) && OB_FAIL(ObGrantResolver::resolve_priv_object(priv_object_node,
@@ -533,7 +556,19 @@ int ObRevokeResolver::resolve_mysql(const ParseNode &parse_tree)
           }
           if (OB_FAIL(ret)) {
           } else {
-            revoke_stmt->set_priv_set(priv_set);
+            if (!revoke_stmt->get_catalog_name().empty()
+                && (OB_PRIV_DB_LEVEL == revoke_stmt->get_grant_level()
+                    || OB_PRIV_TABLE_LEVEL == revoke_stmt->get_grant_level())
+                && (priv_set == OB_PRIV_SET_EMPTY
+                    || (priv_set & (~(OB_PRIV_CATALOG_DB_TABLE_ACC | OB_PRIV_GRANT))))) {
+              ret = OB_ILLEGAL_GRANT_FOR_TABLE;
+              LOG_WARN("only SELECT and INSERT privileges are supported on catalog database or table",
+                       K(ret), "priv_type", ObPrintPrivSet(priv_set));
+              LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                             "privileges other than SELECT and INSERT on catalog database or table");
+            } else {
+              revoke_stmt->set_priv_set(priv_set);
+            }
           }
         }
 

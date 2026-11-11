@@ -549,6 +549,7 @@ public:
                                                    share::ObCatalogProperties::CatalogType catalog_type)
   {
     bool is_insert_supported = (catalog_type == share::ObCatalogProperties::CatalogType::HMS_TYPE
+                                || catalog_type == share::ObCatalogProperties::CatalogType::ODPS_TYPE
                                 || catalog_type == share::ObCatalogProperties::CatalogType::FILESYSTEM_TYPE);
     return stmt_type == stmt::T_SELECT
            || (stmt_type == stmt::T_INSERT && is_insert_supported)

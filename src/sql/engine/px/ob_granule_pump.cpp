@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX SQL_EXE
 
 #include "ob_granule_pump.h"
+#include "sql/engine/connector/ob_odps_upload_session_mgr.h"
 #include "ob_external_table_granule_handler.h"
 #include "share/catalog/ob_external_catalog.h"
 #include "sql/result_catalog/ob_async_result_granule_splitter.h"
@@ -1017,8 +1018,38 @@ int ObGranulePump::check_can_randomize(ObGranulePumpArgs &args, bool &can_random
   return ret;
 }
 
+int ObGranulePump::init_odps_upload_session(common::ObIAllocator &allocator,
+                                           const ObODPSGeneralFormat &format,
+                                           const ObString &partition,
+                                           bool overwrite, int64_t task_count)
+{
+  int ret = OB_SUCCESS;
+  if (OB_NOT_NULL(odps_upload_session_mgr_)) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("ODPS upload session already initialized", K(ret));
+  } else if (OB_FAIL(ObOdpsUploadSessionMgr::create(
+                 allocator, format.use_odps_jni_connector_, odps_upload_session_mgr_))) {
+    LOG_WARN("failed to create ODPS upload session manager", K(ret));
+  } else {
+    odps_upload_allocator_ = &allocator;
+    if (OB_FAIL(odps_upload_session_mgr_->init(format, partition, overwrite, task_count))) {
+      LOG_WARN("failed to initialize ODPS upload session manager", K(ret));
+      OB_DELETEx(ObOdpsUploadSessionMgr, odps_upload_allocator_, odps_upload_session_mgr_);
+      odps_upload_session_mgr_ = nullptr;
+      odps_upload_allocator_ = nullptr;
+    }
+  }
+  return ret;
+}
+
 void ObGranulePump::destroy()
 {
+  // Destruction only releases the session; it must never commit unfinished tasks.
+  if (OB_NOT_NULL(odps_upload_session_mgr_)) {
+    OB_DELETEx(ObOdpsUploadSessionMgr, odps_upload_allocator_, odps_upload_session_mgr_);
+    odps_upload_session_mgr_ = nullptr;
+    odps_upload_allocator_ = nullptr;
+  }
   gi_task_array_map_.reset();
   has_ordered_result_scan_ = false;
   // no pump_version added rescan no sample scan
