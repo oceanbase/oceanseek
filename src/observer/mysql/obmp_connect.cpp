@@ -2529,7 +2529,7 @@ int ObMPConnect::set_client_version(ObSMConnection &conn)
     char buff[OB_MAX_VERSION_LENGTH];
     memset(buff, 0, OB_MAX_VERSION_LENGTH);
     int64_t cur_item = 0;
-    for (int64_t i = 0; cur_item != VERSION_ITEM && i < length; ++i) {
+    for (int64_t i = 0; cur_item != VERSION_ITEM && i < length && i < OB_MAX_VERSION_LENGTH - 1; ++i) {
       if (client_version_str[i] == '.') {
         ++cur_item;
       }
