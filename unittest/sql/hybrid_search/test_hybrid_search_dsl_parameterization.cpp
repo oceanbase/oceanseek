@@ -207,7 +207,7 @@ TEST_F(TestHybridDslParameterization, token_handler_reset_between_requests)
   const char *inputs[] = {
     R"SQL(SELECT id FROM HYBRID_SEARCH(TABLE docs, )SQL"
     R"SQL('{"query":{"term":{"category":"tech"}}}'))SQL",
-    "SELECT /*! HYBRID_SEARCH(TABLE docs, @dsl) */ 1",
+    "SELECT id FROM /*! HYBRID_SEARCH(TABLE docs, @dsl) */",
     "SELECT 'hybrid_search', 42",
     R"SQL(SELECT id FROM HYBRID_SEARCH(TABLE docs, )SQL"
     R"SQL('{"query":{"term":{"category":"news"}}}'))SQL",
@@ -223,8 +223,7 @@ TEST_F(TestHybridDslParameterization, token_handler_reset_between_requests)
         allocator_, context, ObString::make_string(inputs[i]), results[i])) << inputs[i];
   }
   ASSERT_NE(nullptr, ObHybridSearchPlanCache::get_request(results[0]));
-  ASSERT_NE(nullptr, results[1].hybrid_dsl_request_);
-  EXPECT_FALSE(results[1].hybrid_dsl_request_->can_cache());
+  EXPECT_EQ(nullptr, results[1].hybrid_dsl_request_);
   EXPECT_EQ(nullptr, results[2].hybrid_dsl_request_);
   EXPECT_EQ(2, results[2].raw_params_.count());
   ASSERT_NE(nullptr, ObHybridSearchPlanCache::get_request(results[3]));
@@ -474,10 +473,11 @@ TEST_F(TestHybridDslParameterization, user_variable_is_a_request_snapshot)
 TEST_F(TestHybridDslParameterization, executable_comment_fallback)
 {
   ObFastParserResult comment;
-  ASSERT_EQ(OB_SUCCESS, parse(
-      "SELECT /*! HYBRID_SEARCH(TABLE docs, @dsl) */ 1", comment));
-  EXPECT_FALSE((comment.hybrid_dsl_request_ == nullptr
-      || comment.hybrid_dsl_request_->can_cache()));
+  const char *sql = "SELECT id FROM /*! HYBRID_SEARCH(TABLE docs, @dsl) */";
+  ASSERT_EQ(OB_SUCCESS, parse(sql, comment));
+  EXPECT_EQ(nullptr, comment.hybrid_dsl_request_);
+  EXPECT_EQ(ObString::make_string(sql), comment.pc_key_.name_);
+  EXPECT_FALSE(ObHybridSearchPlanCache::can_add_plan(comment));
   ObFastParserResult ordinary;
   ASSERT_EQ(OB_SUCCESS, parse(
       "SELECT /*! SQL_NO_CACHE */ 1", ordinary));

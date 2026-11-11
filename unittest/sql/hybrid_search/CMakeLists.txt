@@ -1,0 +1,1 @@
+sql_unittest(test_hybrid_search_dsl_parameterization)

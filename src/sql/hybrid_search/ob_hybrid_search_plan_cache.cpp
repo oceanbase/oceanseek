@@ -35,19 +35,14 @@ int ObHybridSearchTokenHandler::process_token(const ObString &raw_token,
 {
   int ret = OB_SUCCESS;
   const ObString token = raw_token.trim();
-  static const int64_t HYBRID_SEARCH_NAME_LENGTH = sizeof("hybrid_search") - 1;
   if (HYBRID_UNSUPPORTED == state_) {
     // An unsupported carrier stays on the full parsing path.
   } else if (token.length() >= 3 && 0 == MEMCMP(token.ptr(), "/*!", 3)) {
-    // Executable comments may hide another carrier and have no inner lexer tokens.
+    // Keep executable comments opaque: their identifiers and strings do not establish a carrier.
+    // A call hidden entirely in a comment is resolved by the full parser; need_add_plan()
+    // rejects it without bound DSL parameters. A carrier found outside still needs fallback
+    // because the comment may contain SQL that the fast lexer cannot inspect.
     has_executable_comment_ = true;
-    for (int64_t i = 3; !source_.present_
-         && i + HYBRID_SEARCH_NAME_LENGTH <= token.length(); ++i) {
-      if (('h' == token.ptr()[i] || 'H' == token.ptr()[i])
-          && 0 == STRNCASECMP(token.ptr() + i, "hybrid_search", HYBRID_SEARCH_NAME_LENGTH)) {
-        source_.present_ = true;
-      }
-    }
     if (source_.present_) {
       reject_carrier(DSL_FALLBACK_EXECUTABLE_COMMENT);
     }
