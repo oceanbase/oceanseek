@@ -29,6 +29,7 @@ namespace oceanbase
 {
 namespace storage
 {
+class ObLS;
 struct ObMigrationVectorIndexAdaptorMeta;
 }
 namespace share
@@ -957,8 +958,10 @@ public:
   int check_need_freeze(const int64_t freeze_threshold, bool &need_freeze);
   int check_can_freeze(ObLSID ls_id, const int64_t freeze_threshold, bool &can_freeze,
                        const bool force_rotate_active = false);
-  int check_need_merge(const int64_t merge_base_percentage, bool &need_merge,
+  int check_need_merge(storage::ObLS *ls, const int64_t merge_base_percentage, bool &need_merge,
       struct ObVecMergePolicyInput &input, struct ObVecMergePlan &plan);
+  // Shared async visibility input for scheduling and execution.
+  int prepare_async_merge_input(storage::ObLS *ls, struct ObVecMergePolicyInput &input);
   // Union persisted, active and frozen deletes to refresh the shared graph caches.
   // Return OB_EAGAIN if the snapshot or segment handles are not ready.
   // Preserve existing counts if collection fails or the task is cancelled.

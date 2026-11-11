@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX SHARE
 
 #include "ob_plugin_vector_index_adaptor.h"
+#include "storage/async_index/ob_async_index_service.h"
 #include "ob_vector_index_merge_policy.h"
 #include "common/ob_timeout_ctx.h"
 #include "lib/worker.h"
@@ -7688,7 +7689,57 @@ int ObPluginVectorIndexAdaptor::prepare_merge_policy_input(ObVectorIndexMeta &so
   return ret;
 }
 
-int ObPluginVectorIndexAdaptor::check_need_merge(const int64_t merge_base_percentage,
+int ObPluginVectorIndexAdaptor::prepare_async_merge_input(
+    storage::ObLS *ls, ObVecMergePolicyInput &input)
+{
+  int ret = OB_SUCCESS;
+  ObSchemaGetterGuard schema_guard;
+  const ObTableSchema *data_schema = nullptr;
+  storage::ObAsyncIndexService *service = MTL(storage::ObAsyncIndexService *);
+  SCN published_scn;
+  bool has_target = false;
+  input.has_async_index_ = false;
+  input.async_published_scn_ = 0;
+  if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(tenant_id_, schema_guard))) {
+    LOG_WARN("get merge schema guard failed", K(ret));
+  } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id_, get_data_table_id(), data_schema))) {
+    LOG_WARN("get merge data schema failed", K(ret));
+  } else if (OB_ISNULL(data_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+    LOG_WARN("merge data schema is null", K(ret));
+  } else if (!data_schema->has_async_index()) {
+  } else if (OB_ISNULL(service)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("async index service is null", K(ret));
+  } else {
+    input.has_async_index_ = true;
+    if (OB_FAIL(service->get_refresher().get_dep_provider().get_partition_min_async_published_scn(
+        tenant_id_, ls, get_data_table_id(),
+        get_data_tablet_id(), has_target, published_scn))) {
+      LOG_WARN("get merge async published scn failed", K(ret));
+    } else if (has_target) {
+      input.async_published_scn_ = published_scn.get_val_for_inner_table_field();
+    }
+    // A building target can become available with an older publication point.
+    // Keep whitelists until all async targets have completed publication.
+    const ObIArray<ObAuxTableMetaInfo> &indexes = data_schema->get_simple_index_infos();
+    for (int64_t i = 0; OB_SUCC(ret) && i < indexes.count(); ++i) {
+      const ObTableSchema *index_schema = nullptr;
+      if (!schema::is_async_index(indexes.at(i).index_type_)) {
+      } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id_, indexes.at(i).table_id_, index_schema))) {
+        LOG_WARN("get async merge target schema failed", K(ret));
+      } else if (OB_ISNULL(index_schema)) {
+        ret = OB_SCHEMA_EAGAIN;
+        LOG_WARN("async merge target schema is missing", K(ret));
+      } else if (index_schema->get_index_status() != INDEX_STATUS_AVAILABLE) {
+        input.async_published_scn_ = 0;
+      }
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexAdaptor::check_need_merge(storage::ObLS *ls, const int64_t merge_base_percentage,
     bool &need_merge, ObVecMergePolicyInput &input, ObVecMergePlan &plan)
 {
   int ret = OB_SUCCESS;
@@ -7705,8 +7756,29 @@ int ObPluginVectorIndexAdaptor::check_need_merge(const int64_t merge_base_percen
   } else {
     ObVecMergeConfig config;
     ObVectorIndexMeta source_meta;
+    ObVecMergePlan candidate_plan;
+    bool has_candidate = false;
+    // Probe without async visibility constraints before fetching publication state.
+    // Keep the candidate separate: only the visibility recheck may admit a task.
+    input.has_async_index_ = false;
+    input.async_published_scn_ = 0;
     if (OB_FAIL(prepare_merge_policy_input(source_meta, input, config))) {
       LOG_WARN("prepare cached merge statistics failed", K(ret));
+    } else if (OB_FAIL(ObVectorIndexMergePolicy(config).check_need_merge_task(
+        input, has_candidate, candidate_plan))) {
+      if (ret == OB_EAGAIN) { ret = OB_SUCCESS; }
+    } else if (!has_candidate) {
+      // No candidate window; skip the async publication lookup.
+    } else if (OB_FAIL(prepare_async_merge_input(ls, input))) {
+      // Skip only this adapter when publication/schema/tablet state is transient.
+      // need_merge stays false: never fall back to admission without async input.
+      if (ret == OB_EAGAIN || ret == OB_SCHEMA_EAGAIN || ret == OB_TABLE_NOT_EXIST
+          || ret == OB_TABLET_NOT_EXIST || ret == OB_TABLET_TRANSFER_SEQ_NOT_MATCH) {
+        LOG_INFO("merge visibility is not ready", K(ret), KPC(this));
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("prepare merge admission visibility failed", K(ret), KPC(this));
+      }
     } else if (OB_FAIL(ObVectorIndexMergePolicy(config).check_need_merge_task(
         input, need_merge, plan))) {
       if (ret == OB_EAGAIN) { ret = OB_SUCCESS; }

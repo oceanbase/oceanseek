@@ -106,7 +106,6 @@ private:
       const ObVectorIndexMeta &old_meta);
   int refresh_adaptor();
   int check_and_wait_write();
-  int prepare_async_merge_input();
 
 private:
   int64_t min_vid_ {INT64_MAX};

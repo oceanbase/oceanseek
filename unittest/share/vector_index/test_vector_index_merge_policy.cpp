@@ -809,7 +809,7 @@ TEST(TestVectorIndexMergePolicy, MergePreservesBaseRole)
         EXPECT_EQ(Type::BASE, plan.output_type_);
         EXPECT_TRUE(plan.output_base_);
         input.async_published_scn_ = 99;
-        EXPECT_EQ(has_async ? OB_NO_NEED_MERGE : OB_SUCCESS,
+        EXPECT_EQ(has_async && tail_type == Type::INCR_MERGE ? OB_NO_NEED_MERGE : OB_SUCCESS,
             ObVectorIndexMergePolicy(config).find_merge_segments(input, AUTO, plan));
       }
     }
@@ -838,17 +838,19 @@ TEST(TestVectorIndexMergePolicy, AsyncFreezeRebuildMakesProgress)
         info.seg_type_ = type;
         info.readable_ = true;
         info.vector_count_ = 30;
-        info.scn_ = type == Type::FREEZE_PERSIST ? 300 : 100;
+        info.scn_ = type == Type::FREEZE_PERSIST ? 300 : 200;
         if (type == Type::FREEZE_PERSIST) { freeze = input.segments_.count(); }
         ASSERT_EQ(OB_SUCCESS, input.segments_.push_back(info));
       }
       ObVecMergePlan plan;
       bool need_task = false;
-      // Production coarse scheduling has no async context, but still creates a task.
-      ASSERT_EQ(OB_SUCCESS, policy.check_need_merge_task(input, need_task, plan));
-      EXPECT_TRUE(need_task);
       input.has_async_index_ = true;
       input.async_published_scn_ = 100;
+      // Scheduling sees the same async constraints and admits the FREEZE rebuild.
+      ASSERT_EQ(OB_SUCCESS, policy.check_need_merge_task(input, need_task, plan));
+      EXPECT_TRUE(need_task);
+      EXPECT_EQ(ObVecMergePlan::FREEZE_REBUILD, plan.strategy_);
+      EXPECT_EQ(freeze, plan.begin_);
       ASSERT_EQ(OB_SUCCESS, policy.find_merge_segments(input, trigger, plan));
       EXPECT_EQ(ObVecMergePlan::FREEZE_REBUILD, plan.strategy_);
       EXPECT_EQ(freeze, plan.begin_);
@@ -893,7 +895,7 @@ TEST(TestVectorIndexMergePolicy, AsyncFreezeRebuildPreservesWindowConstraints)
     {80, 5, 3, INT64_MAX, 100, true, OB_NO_NEED_MERGE}, // Not idle yet.
     {70, 70, 2, 0, 100, true, OB_NO_NEED_MERGE}, // Over capacity.
     {30, 30, 2, 0, 0, true, OB_NO_NEED_MERGE}, // No publication point.
-    {30, 30, 2, 0, 99, true, OB_NO_NEED_MERGE}, // Pruned source is not covered.
+    {30, 30, 2, 0, 99, true, OB_SUCCESS}, // Pruned source inherits visibility.
     {30, 30, 2, 0, 100, false, OB_EAGAIN}, // Unreadable FREEZE.
   };
   for (const auto &c : cases) {
@@ -952,10 +954,13 @@ TEST(TestVectorIndexMergePolicy, AsyncPublicationBoundaries)
     {Type::INCR_MERGE, 0, 100, OB_SUCCESS, Type::INCR_MERGE},
     {Type::FREEZE_PERSIST, 99, 100, OB_SUCCESS, Type::INCR_MERGE},
     {Type::INCR_BASE, 100, 0, OB_NO_NEED_MERGE, Type::INVALID},
-    {Type::INCR_BASE, 100, 99, OB_NO_NEED_MERGE, Type::INVALID},
+    {Type::INCR_BASE, 100, 99, OB_SUCCESS, Type::INCR_BASE},
     {Type::INCR_BASE, 100, 100, OB_SUCCESS, Type::INCR_BASE},
-    {Type::BASE, 100, 99, OB_NO_NEED_MERGE, Type::INVALID},
+    {Type::BASE, 100, 99, OB_SUCCESS, Type::BASE},
     {Type::BASE, 100, 100, OB_SUCCESS, Type::BASE},
+    {Type::BASE, 100, 0, OB_NO_NEED_MERGE, Type::INVALID},
+    {Type::BASE, 0, 100, OB_NO_NEED_MERGE, Type::INVALID},
+    {Type::INCR_BASE, 0, 100, OB_NO_NEED_MERGE, Type::INVALID},
   };
   ObVecMergeConfig config;
   config.max_vectors_ = 100;
@@ -987,6 +992,157 @@ TEST(TestVectorIndexMergePolicy, AsyncPublicationBoundaries)
   }
 }
 
+TEST(TestVectorIndexMergePolicy, AsyncMixedWindowRetainsSafePrefix)
+{
+  using Type = ObVectorIndexSegmentType;
+  for (const int64_t base_count : {0, 1, 2}) {
+    for (const int64_t size : {30, 50}) {
+      for (const Type tail : {Type::INCR_MERGE, Type::FREEZE_PERSIST}) {
+        SCOPED_TRACE(::testing::Message() << "bases=" << base_count << " size=" << size
+            << " tail=" << static_cast<int>(tail));
+        ObVecMergeConfig config;
+        config.max_vectors_ = 100;
+        ObVectorIndexMergePolicy policy(config);
+        ObVecMergePolicyInput input;
+        input.base_count_ = base_count;
+        input.has_async_index_ = true;
+        input.async_published_scn_ = 100;
+        ObVecSegmentMergeInfo info;
+        info.readable_ = true;
+        info.scn_ = 200;
+        info.vector_count_ = size;
+        for (int64_t i = 0; i < 2; ++i) {
+          info.seg_type_ = i < base_count ? Type::BASE : Type::INCR_BASE;
+          ASSERT_EQ(OB_SUCCESS, input.segments_.push_back(info));
+        }
+        info.seg_type_ = tail;
+        info.scn_ = 100;
+        info.vector_count_ = size == 30 ? 30 : 10;
+        ASSERT_EQ(OB_SUCCESS, input.segments_.push_back(info));
+        ObVecMergePlan plan;
+        ASSERT_EQ(OB_SUCCESS, policy.find_merge_segments(input, AUTO, plan));
+        EXPECT_EQ(size == 30 ? TIERED : TARGET, plan.strategy_);
+        EXPECT_EQ(0, plan.begin_);
+        EXPECT_EQ(tail == Type::INCR_MERGE ? 3 : 2, plan.end_);
+        EXPECT_EQ(base_count > 0 ? Type::BASE : Type::INCR_BASE, plan.output_type_);
+        if (tail == Type::INCR_MERGE) {
+          input.segments_.at(2).scn_ = 101;
+          ASSERT_EQ(OB_SUCCESS, policy.find_merge_segments(input, AUTO, plan));
+          EXPECT_EQ(0, plan.begin_);
+          EXPECT_EQ(2, plan.end_); // An unpublished tail must not discard the safe prefix.
+          input.async_published_scn_ = 101;
+          ASSERT_EQ(OB_SUCCESS, policy.find_merge_segments(input, AUTO, plan));
+          EXPECT_EQ(3, plan.end_); // No need to wait for the BASE build SCN of 200.
+        }
+      }
+    }
+  }
+}
+
+TEST(TestVectorIndexMergePolicy, AsyncPureBaseResidualAndManual)
+{
+  using Type = ObVectorIndexSegmentType;
+  ObVecMergeConfig config;
+  config.max_vectors_ = 100;
+  config.merge_factor_ = 3;
+  config.idle_us_ = INT64_MAX;
+  ObVecMergePolicyInput input;
+  input.has_async_index_ = true;
+  input.async_published_scn_ = 100;
+  ObVecSegmentMergeInfo info;
+  info.readable_ = true;
+  info.scn_ = 200;
+  info.seg_type_ = Type::INCR_BASE;
+  info.vector_count_ = 80;
+  ASSERT_EQ(OB_SUCCESS, input.segments_.push_back(info));
+  info.vector_count_ = 5;
+  ASSERT_EQ(OB_SUCCESS, input.segments_.push_back(info));
+  ObVecMergePlan plan;
+  ASSERT_EQ(OB_SUCCESS, ObVectorIndexMergePolicy(config).find_merge_segments(input, COMPACT, plan));
+  EXPECT_EQ(MANUAL, plan.strategy_);
+  EXPECT_EQ(Type::INCR_BASE, plan.output_type_);
+  config.idle_us_ = 0;
+  ASSERT_EQ(OB_SUCCESS, ObVectorIndexMergePolicy(config).find_merge_segments(input, AUTO, plan));
+  EXPECT_EQ(IDLE, plan.strategy_);
+  EXPECT_EQ(0, plan.begin_);
+  EXPECT_EQ(2, plan.end_);
+  EXPECT_EQ(Type::INCR_BASE, plan.output_type_);
+  config.idle_us_ = INT64_MAX;
+  input.segments_.at(0).vector_count_ = 150;
+  input.segments_.at(1).vector_count_ = 150;
+  ASSERT_EQ(OB_SUCCESS, ObVectorIndexMergePolicy(config).find_merge_segments(input, COMPACT, plan));
+  EXPECT_EQ(MANUAL, plan.strategy_);
+  EXPECT_EQ(Type::BASE, plan.output_type_); // Preserve the existing oversized output rule.
+}
+
+TEST(TestVectorIndexMergePolicy, AsyncMixedWindowAdmissionAndExecution)
+{
+  using Type = ObVectorIndexSegmentType;
+  for (const Type base_type : {Type::BASE, Type::INCR_BASE}) {
+    for (const int64_t size : {30, 60}) {
+      for (const int64_t published : {0, 100}) {
+        for (const int64_t merge_scn : {0, 90, 100, 101}) {
+          SCOPED_TRACE(::testing::Message() << "base=" << static_cast<int>(base_type)
+              << " size=" << size << " P=" << published << " merge_scn=" << merge_scn);
+          ObVecMergeConfig config;
+          config.max_vectors_ = 100;
+          ObVectorIndexMergePolicy policy(config);
+          ObVecMergePolicyInput input;
+          input.has_async_index_ = true;
+          input.async_published_scn_ = published;
+          input.base_count_ = base_type == Type::BASE ? 1 : 0;
+          ObVecSegmentMergeInfo info;
+          info.readable_ = true;
+          info.scn_ = 200;
+          info.vector_count_ = size;
+          info.seg_type_ = base_type;
+          ASSERT_EQ(OB_SUCCESS, input.segments_.push_back(info));
+          info.seg_type_ = Type::INCR_MERGE;
+          info.scn_ = merge_scn;
+          ASSERT_EQ(OB_SUCCESS, input.segments_.push_back(info));
+          const bool eligible = published > 0 && merge_scn > 0 && merge_scn <= published;
+          for (int64_t round = 0; round < 3; ++round) {
+            bool need_task = true;
+            ObVecMergePlan scheduled;
+            ASSERT_EQ(OB_SUCCESS, policy.check_need_merge_task(input, need_task, scheduled));
+            EXPECT_EQ(eligible, need_task);
+            ObVecMergePlan executed;
+            ASSERT_EQ(eligible ? OB_SUCCESS : OB_NO_NEED_MERGE,
+                policy.find_merge_segments(input, AUTO, executed));
+            EXPECT_EQ(scheduled.strategy_, executed.strategy_);
+            EXPECT_EQ(scheduled.begin_, executed.begin_);
+            EXPECT_EQ(scheduled.end_, executed.end_);
+            EXPECT_EQ(scheduled.output_type_, executed.output_type_);
+            if (eligible) {
+              EXPECT_EQ(size == 30 ? TIERED : TARGET, executed.strategy_);
+              EXPECT_EQ(0, executed.begin_);
+              EXPECT_EQ(2, executed.end_);
+              EXPECT_EQ(base_type, executed.output_type_);
+            } else {
+              EXPECT_EQ(-1, scheduled.begin_);
+              EXPECT_EQ(Type::INVALID, scheduled.output_type_);
+            }
+          }
+          // Advancing publication admits the blocked window without waiting for BASE SCN=200.
+          if (published == 100 && merge_scn == 101) {
+            input.async_published_scn_ = 101;
+            bool need_task = false;
+            ObVecMergePlan scheduled;
+            ObVecMergePlan executed;
+            ASSERT_EQ(OB_SUCCESS, policy.check_need_merge_task(input, need_task, scheduled));
+            EXPECT_TRUE(need_task);
+            ASSERT_EQ(OB_SUCCESS, policy.find_merge_segments(input, AUTO, executed));
+            EXPECT_EQ(scheduled.strategy_, executed.strategy_);
+            EXPECT_EQ(0, executed.begin_);
+            EXPECT_EQ(2, executed.end_);
+            EXPECT_EQ(base_type, executed.output_type_);
+          }
+        }
+      }
+    }
+  }
+}
+
 TEST(TestVectorIndexMergePolicy, AsyncDeleteAndFallbackReclamation)
 {
   using Type = ObVectorIndexSegmentType;
@@ -999,7 +1155,7 @@ TEST(TestVectorIndexMergePolicy, AsyncDeleteAndFallbackReclamation)
   input.async_published_scn_ = 100;
   ObVecSegmentMergeInfo info;
   info.seg_type_ = Type::INCR_BASE;
-  info.scn_ = 100;
+  info.scn_ = 200;
   info.vector_count_ = 100;
   info.deleted_vector_count_ = 100;
   info.readable_ = true;
@@ -1009,11 +1165,13 @@ TEST(TestVectorIndexMergePolicy, AsyncDeleteAndFallbackReclamation)
   EXPECT_EQ(DELETE, plan.strategy_);
   EXPECT_EQ(Type::INCR_BASE, plan.output_type_); // Empty output retains its visibility role.
   input.async_published_scn_ = 99;
-  EXPECT_EQ(OB_NO_NEED_MERGE, ObVectorIndexMergePolicy(config).find_merge_segments(input, COMPACT, plan));
+  ASSERT_EQ(OB_SUCCESS, ObVectorIndexMergePolicy(config).find_merge_segments(input, COMPACT, plan));
+  EXPECT_EQ(DELETE, plan.strategy_);
+  EXPECT_EQ(Type::INCR_BASE, plan.output_type_);
   input.deleted_vid_count_ = 100;
   bool need_task = true;
   ASSERT_EQ(OB_SUCCESS, ObVectorIndexMergePolicy(config).check_need_merge_task(input, need_task, plan));
-  EXPECT_FALSE(need_task); // Delete reclamation must wait for async publication.
+  EXPECT_TRUE(need_task); // Pure BASE rebuild inherits visibility despite a newer build SCN.
   input.async_published_scn_ = 100;
   input.segments_.at(0).deleted_vector_count_ = 0;
   ASSERT_EQ(OB_SUCCESS, ObVectorIndexMergePolicy(config).check_need_merge_task(input, need_task, plan));
@@ -1027,6 +1185,7 @@ TEST(TestVectorIndexMergePolicy, AsyncDeleteAndFallbackReclamation)
   input.segments_.at(0).vector_count_ = 80;
   input.segments_.at(0).deleted_vector_count_ = 0;
   info.seg_type_ = Type::INCR_MERGE;
+  info.scn_ = 100;
   info.vector_count_ = 5;
   info.deleted_vector_count_ = 0;
   ASSERT_EQ(OB_SUCCESS, input.segments_.push_back(info));

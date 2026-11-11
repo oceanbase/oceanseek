@@ -76,10 +76,13 @@ bool ObVectorIndexMergePolicy::can_reclaim_insert_(const ObVecMergePolicyInput &
       // Probe only: the actual plan rebuilds one FREEZE and retains its insert bitmap.
       continue;
     }
-    can_reclaim = info.scn_ > 0 && info.scn_ <= input.async_published_scn_
+    // BASE sources already have query-safe visibility. Only INCR_MERGE needs
+    // publication to cover its build snapshot before dropping the insert whitelist.
+    can_reclaim = info.scn_ > 0 && input.async_published_scn_ > 0
         && (info.seg_type_ == ObVectorIndexSegmentType::BASE
-            || info.seg_type_ == ObVectorIndexSegmentType::INCR_MERGE
-            || info.seg_type_ == ObVectorIndexSegmentType::INCR_BASE);
+            || info.seg_type_ == ObVectorIndexSegmentType::INCR_BASE
+            || (info.seg_type_ == ObVectorIndexSegmentType::INCR_MERGE
+                && info.scn_ <= input.async_published_scn_));
   }
   return can_reclaim;
 }

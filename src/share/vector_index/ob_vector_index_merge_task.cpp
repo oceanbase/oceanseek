@@ -14,7 +14,6 @@
 #include "share/allocator/ob_tenant_vector_allocator.h"
 #include "share/ob_ddl_common.h"
 #include "storage/ls/ob_ls.h"
-#include "storage/async_index/ob_async_index_service.h"
 #include "storage/lob/common/ob_lob_util.h"
 
 namespace oceanbase
@@ -187,7 +186,7 @@ int ObVecIdxMergeTaskExecutor::load_task(
           }
         } else if (adapter->is_skip_merge_sched()) {
           LOG_TRACE("incr bitmap incomplete and delta table not empty, skip merge sched until adaptor replaced", K(ret), KPC(adapter));
-        } else if (OB_FAIL(adapter->check_need_merge(merge_base_percentage_, need_merge, estimate_input, estimate_plan))) {
+        } else if (OB_FAIL(adapter->check_need_merge(ls, merge_base_percentage_, need_merge, estimate_input, estimate_plan))) {
           LOG_WARN("failed to check need merge", K(ret), KPC(adapter));
         } else if (!need_merge) {
           LOG_TRACE("vector index is not need to merge", K(ret), KPC(adapter));
@@ -364,55 +363,6 @@ int extract_segment_scn(const ObVectorIndexSegmentMeta &seg_meta, ObString &scn_
   if (scn_str.empty()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("scn is empty", K(ret), K(seg_meta));
-  }
-  return ret;
-}
-
-int ObVecIdxMergeTask::prepare_async_merge_input()
-{
-  int ret = OB_SUCCESS;
-  ObSchemaGetterGuard schema_guard;
-  const ObTableSchema *data_schema = nullptr;
-  storage::ObAsyncIndexService *service = MTL(storage::ObAsyncIndexService *);
-  SCN published_scn;
-  bool has_target = false;
-  merge_policy_input_.has_async_index_ = false;
-  merge_policy_input_.async_published_scn_ = 0;
-  if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(tenant_id_, schema_guard))) {
-    LOG_WARN("get merge schema guard failed", K(ret));
-  } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id_, old_adapter_->get_data_table_id(), data_schema))) {
-    LOG_WARN("get merge data schema failed", K(ret));
-  } else if (OB_ISNULL(data_schema)) {
-    ret = OB_TABLE_NOT_EXIST;
-    LOG_WARN("merge data schema is null", K(ret));
-  } else if (!data_schema->has_async_index()) {
-  } else if (OB_ISNULL(service)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("async index service is null", K(ret));
-  } else {
-    merge_policy_input_.has_async_index_ = true;
-    if (OB_FAIL(service->get_refresher().get_dep_provider().get_partition_min_async_published_scn(
-        tenant_id_, ctx_->get_ls(), old_adapter_->get_data_table_id(),
-        old_adapter_->get_data_tablet_id(), has_target, published_scn))) {
-      LOG_WARN("get merge async published scn failed", K(ret));
-    } else if (has_target) {
-      merge_policy_input_.async_published_scn_ = published_scn.get_val_for_inner_table_field();
-    }
-    // A building target can become available with an older publication point.
-    // Keep whitelists until all async targets have completed publication.
-    const ObIArray<ObAuxTableMetaInfo> &indexes = data_schema->get_simple_index_infos();
-    for (int64_t i = 0; OB_SUCC(ret) && i < indexes.count(); ++i) {
-      const ObTableSchema *index_schema = nullptr;
-      if (!schema::is_async_index(indexes.at(i).index_type_)) {
-      } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id_, indexes.at(i).table_id_, index_schema))) {
-        LOG_WARN("get async merge target schema failed", K(ret));
-      } else if (OB_ISNULL(index_schema)) {
-        ret = OB_SCHEMA_EAGAIN;
-        LOG_WARN("async merge target schema is missing", K(ret));
-      } else if (index_schema->get_index_status() != INDEX_STATUS_AVAILABLE) {
-        merge_policy_input_.async_published_scn_ = 0;
-      }
-    }
   }
   return ret;
 }
@@ -976,7 +926,7 @@ int ObVecIdxMergeTask::check_and_merge(ObPluginVectorIndexAdapterGuard &adpt_gua
     } else if (OB_FAIL(old_adapter_->prepare_merge_policy_input(
         merge_source_meta_, merge_policy_input_, merge_config_, is_full_merge))) {
       LOG_WARN("prepare merge policy input failed", K(ret));
-    } else if (!is_alter_param && OB_FAIL(prepare_async_merge_input())) {
+    } else if (!is_alter_param && OB_FAIL(old_adapter_->prepare_async_merge_input(ctx_->get_ls(), merge_policy_input_))) {
       LOG_WARN("prepare async merge visibility failed", K(ret));
     } else if (OB_FAIL(ObVectorIndexMergePolicy(merge_config_).find_merge_segments(merge_policy_input_,
         trigger, merge_plan_))) {
