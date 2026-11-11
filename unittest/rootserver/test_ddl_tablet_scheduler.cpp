@@ -19,6 +19,15 @@
 #include "share/ob_ddl_common.h"
 #define private public
 #define protected public
+#include "share/ls/ob_ls_table_operator.h"
+#include "share/ob_rs_mgr.h"
+#include "share/location_cache/ob_location_service.h"
+#include "observer/omt/ob_multi_tenant.h"
+#include "observer/omt/ob_tenant.h"
+#include "rootserver/ddl_task/ob_index_build_task.h"
+#include "rootserver/ddl_task/ob_ddl_scheduler.h"
+#include "rootserver/ob_ddl_service_launcher.h"
+#include "rootserver/ob_root_service.h"
 #include "rootserver/ddl_task/ob_ddl_tablet_scheduler.h"
 #include "rootserver/ob_ddl_service_launcher.h"
 #include "share/ob_get_compat_mode.h"
@@ -812,6 +821,500 @@ TEST_F(TestDDLTabletScheduler, session_query_failure_preserves_pending_ls)
   connection_.session_ret_ = OB_SUCCESS;
   ASSERT_EQ(OB_EAGAIN, next_batch());
   EXPECT_EQ(OB_ITER_END, next_batch());
+}
+
+class DDLMessageResult : public ObMySQLResultImpl
+{
+public:
+  DDLMessageResult(ObMySQLStatement &statement, const ObString &message,
+                   const int64_t execution_id)
+    : ObMySQLResultImpl(statement), message_(message), execution_id_(execution_id), pos_(-1) {}
+  using ObMySQLResultImpl::get_int;
+  using ObMySQLResultImpl::get_uint;
+  using ObMySQLResultImpl::get_varchar;
+  int next() override { return ++pos_ == 0 ? OB_SUCCESS : OB_ITER_END; }
+  int get_int(const char *column, int64_t &value) const override
+  {
+    int ret = OB_SUCCESS;
+    if (0 == strcmp(column, "execution_id")) {
+      value = execution_id_;
+    } else if (0 == strcmp(column, "status")) {
+      value = REDEFINITION;
+    } else if (0 == strcmp(column, "ret_code")) {
+      value = OB_SUCCESS;
+    } else if (0 == strcmp(column, "free_size")) {
+      value = 1L << 40;
+    } else {
+      ret = OB_ERR_COLUMN_NOT_FOUND;
+    }
+    return ret;
+  }
+  int get_uint(const char *column, uint64_t &value) const override
+  {
+    EXPECT_STREQ("snapshot_version", column);
+    value = 1000;
+    return OB_SUCCESS;
+  }
+  int get_varchar(const char *column, ObString &value) const override
+  {
+    EXPECT_STREQ("message_unhex", column);
+    value = message_;
+    return OB_SUCCESS;
+  }
+private:
+  ObString message_;
+  int64_t execution_id_;
+  int64_t pos_;
+};
+
+class DDLMessageResultHandler : public ObISQLResultHandler
+{
+public:
+  DDLMessageResultHandler(const ObString &message, const int64_t execution_id)
+    : result_(statement_, message, execution_id) {}
+  ObMySQLResult *mysql_result() override { return &result_; }
+private:
+  ObMySQLStatement statement_;
+  DDLMessageResult result_;
+};
+
+class DDLMessageConnection : public DDLQueryConnection
+{
+public:
+  DDLMessageConnection()
+    : execution_id_(0), staged_execution_id_(0), message_writes_(0), message_commits_(0), rollbacks_(0),
+      fail_message_write_(false), fail_commit_(false), fail_rollback_(false),
+      message_transaction_(false) {}
+  using DDLQueryConnection::execute_read;
+  using DDLQueryConnection::execute_write;
+  int execute_read(const uint64_t tenant_id, const ObString &sql,
+                   ObISQLClient::ReadResult &result, bool is_user_sql,
+                   const ObAddr *sql_exec_addr) override
+  {
+    int ret = OB_SUCCESS;
+    const std::string text(sql.ptr(), sql.length());
+    if (text.find("__all_ddl_task_status") != std::string::npos
+        || text.find("__all_virtual_disk_stat") != std::string::npos) {
+      ObString message(static_cast<int32_t>(message_.size()), message_.data());
+      DDLMessageResultHandler *handler = nullptr;
+      ret = result.create_handler(handler, message, execution_id_);
+    } else {
+      ret = DDLQueryConnection::execute_read(tenant_id, sql, result, is_user_sql, sql_exec_addr);
+    }
+    return ret;
+  }
+  int execute_write(const uint64_t tenant_id, const ObString &sql, int64_t &affected_rows,
+                    bool is_user_sql, const ObAddr *sql_exec_addr) override
+  {
+    int ret = OB_SUCCESS;
+    EXPECT_EQ(TEST_TENANT_ID, tenant_id);
+    const std::string text(sql.ptr(), sql.length());
+    const size_t execution_pos = text.find("SET execution_id=");
+    const size_t message_pos = text.find("SET message=\"");
+    affected_rows = 0;
+    if (execution_pos != std::string::npos) {
+      if (1 != sscanf(text.c_str() + execution_pos, "SET execution_id=%ld",
+                      &staged_execution_id_)) {
+        ret = OB_INVALID_ARGUMENT;
+      }
+    } else if (message_pos != std::string::npos) {
+      ++message_writes_;
+      message_transaction_ = true;
+      if (fail_message_write_) {
+        fail_message_write_ = false;
+        ret = OB_TRANS_TIMEOUT;
+      } else {
+        const size_t begin = message_pos + strlen("SET message=\"");
+        const size_t end = text.find('"', begin);
+        if (end == std::string::npos || 0 != (end - begin) % 2) {
+          ret = OB_INVALID_ARGUMENT;
+        } else {
+          staged_message_.resize((end - begin) / 2 + 1);
+          int64_t pos = 0;
+          ret = hex_to_cstr(text.data() + begin, end - begin, &staged_message_[0],
+                            staged_message_.size(), pos);
+          staged_message_.resize((end - begin) / 2);
+        }
+      }
+    } else {
+      ADD_FAILURE() << "Unexpected write: " << text;
+      ret = OB_NOT_SUPPORTED;
+    }
+    if (OB_SUCC(ret)) {
+      affected_rows = 1;
+    }
+    return ret;
+  }
+  int start_transaction(const uint64_t &tenant_id, bool with_snapshot) override
+  {
+    EXPECT_EQ(TEST_TENANT_ID, tenant_id);
+    staged_execution_id_ = execution_id_;
+    staged_message_ = message_;
+    message_transaction_ = false;
+    return OB_SUCCESS;
+  }
+  int commit() override
+  {
+    message_commits_ += message_transaction_ ? 1 : 0;
+    int callback_ret = OB_SUCCESS;
+    if (fail_commit_ && message_transaction_) {
+      fail_commit_ = false;
+      callback_ret = OB_TIMEOUT;
+    } else {
+      execution_id_ = staged_execution_id_;
+      message_ = staged_message_;
+    }
+    return callback_ret;
+  }
+  int rollback() override
+  {
+    ++rollbacks_;
+    staged_execution_id_ = execution_id_;
+    staged_message_ = message_;
+    int callback_ret = OB_SUCCESS;
+    if (fail_rollback_) {
+      fail_rollback_ = false;
+      callback_ret = OB_EAGAIN;
+    }
+    return callback_ret;
+  }
+  std::string message_;
+  std::string staged_message_;
+  int64_t execution_id_;
+  int64_t staged_execution_id_;
+  int64_t message_writes_;
+  int64_t message_commits_;
+  int64_t rollbacks_;
+  bool fail_message_write_;
+  bool fail_commit_;
+  bool fail_rollback_;
+  bool message_transaction_;
+};
+
+// Replace only the asynchronous queue boundary; all scheduling and submission code stays real.
+class DDLSubmissionGroup : public lib::ITG
+{
+public:
+  DDLSubmissionGroup() : calls_(0), accepted_(0), fail_next_(false), execution_id_(-1) {}
+  int thread_cnt() override { return 0; }
+  int set_thread_cnt(int64_t) override { return OB_NOT_SUPPORTED; }
+  int start() override { return OB_SUCCESS; }
+  void stop() override {}
+  void wait() override {}
+  int push_task(ObAsyncTask &async_task) override
+  {
+    int callback_ret = OB_SUCCESS;
+    ++calls_;
+    ObIndexSSTableBuildTask &task = static_cast<ObIndexSSTableBuildTask &>(async_task);
+    EXPECT_EQ(TEST_TENANT_ID, task.tenant_id_);
+    EXPECT_TRUE(task.is_partitioned_local_index_task_);
+    EXPECT_EQ(ObLSID(1001), task.addition_info_.ls_id_);
+    if (fail_next_) {
+      fail_next_ = false;
+      callback_ret = OB_EAGAIN;
+    } else if (OB_SUCCESS != (callback_ret = tablets_.assign(task.addition_info_.partition_ids_))) {
+    } else {
+      execution_id_ = task.execution_id_;
+      ++accepted_;
+    }
+    return callback_ret;
+  }
+  int64_t calls_;
+  int64_t accepted_;
+  bool fail_next_;
+  int64_t execution_id_;
+  ObArray<ObTabletID> tablets_;
+};
+
+class TestDDLIndexMessageFailure : public TestDDLTabletScheduler
+{
+public:
+  TestDDLIndexMessageFailure()
+    : message_pool_(message_connection_), old_location_service_(nullptr),
+      sys_tenant_(OB_SYS_TENANT_ID, 0, 1, cgroup_ctrl_), old_tenant_(nullptr),
+      old_omt_(nullptr), old_service_started_(false), submission_tg_id_(-1) {}
+  void SetUp() override
+  {
+    old_location_service_ = GCTX.location_service_;
+    old_tenant_ = ObTenantEnv::get_tenant();
+    old_omt_ = GCTX.omt_;
+    old_service_started_ = ObDDLServiceLauncher::is_ddl_service_started_;
+    TestDDLTabletScheduler::SetUp();
+    // Keep a valid tenant schema snapshot for initial submission and retry.
+    ASSERT_EQ(OB_SUCCESS, ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(
+        TEST_TENANT_ID, schema_guard_, OB_INVALID_VERSION, OB_INVALID_VERSION,
+        ObMultiVersionSchemaService::RefreshSchemaMode::NORMAL));
+    ASSERT_EQ(OB_SUCCESS, message_proxy_.init(&message_pool_));
+    GCTX.sql_proxy_ = &message_proxy_;
+    task_.tenant_id_ = TEST_TENANT_ID;
+    task_.task_id_ = 1602690;
+    task_.task_type_ = DDL_CREATE_PARTITIONED_LOCAL_INDEX;
+    task_.task_status_ = REDEFINITION;
+    task_.task_version_ = ObIndexBuildTask::OB_INDEX_BUILD_TASK_VERSION;
+    task_.data_format_version_ = DATA_VERSION_4_3_3_0;
+    task_.is_inited_ = true;
+    task_.is_retryable_ddl_ = true;
+    task_.root_service_ = &root_service_;
+    task_.create_index_arg_.tenant_id_ = TEST_TENANT_ID;
+    task_.create_index_arg_.index_schema_.set_tenant_id(TEST_TENANT_ID);
+    task_.create_index_arg_.is_partition_local_ddl_ = true;
+    ObDDLTabletScheduler &scheduler = task_.tablet_scheduler_;
+    scheduler.tenant_id_ = TEST_TENANT_ID;
+    scheduler.task_id_ = task_.task_id_;
+    scheduler.table_id_ = INDEX_TABLE_ID;
+    scheduler.ref_data_table_id_ = DATA_TABLE_ID;
+    scheduler.parallelism_ = 2;
+    scheduler.snapshot_version_ = 1000;
+    scheduler.is_inited_ = true;
+    ASSERT_EQ(OB_SUCCESS, scheduler.all_ls_to_tablets_map_.create(8, "TestDDLSched",
+        ObModIds::OB_HASH_NODE, OB_SERVER_TENANT_ID, ObCtxIds::DEFAULT_CTX_ID));
+    ASSERT_EQ(OB_SUCCESS, scheduler.running_ls_to_tablets_map_.create(8, "TestDDLSched",
+        ObModIds::OB_HASH_NODE, OB_SERVER_TENANT_ID, ObCtxIds::DEFAULT_CTX_ID));
+    ASSERT_EQ(OB_SUCCESS, scheduler.running_ls_to_execution_id_.create(8, "TestDDLSched",
+        ObModIds::OB_HASH_NODE, OB_SERVER_TENANT_ID, ObCtxIds::DEFAULT_CTX_ID));
+    ASSERT_EQ(OB_SUCCESS, scheduler.ls_location_map_.create(8, "TestDDLSched",
+        ObModIds::OB_HASH_NODE, OB_SERVER_TENANT_ID, ObCtxIds::DEFAULT_CTX_ID));
+    ASSERT_EQ(OB_SUCCESS, scheduler.tablet_id_to_data_size_.create(8, "TestDDLSched",
+        ObModIds::OB_HASH_NODE, OB_SERVER_TENANT_ID, ObCtxIds::DEFAULT_CTX_ID));
+    ASSERT_EQ(OB_SUCCESS, scheduler.tablet_id_to_data_row_cnt_.create(8, "TestDDLSched",
+        ObModIds::OB_HASH_NODE, OB_SERVER_TENANT_ID, ObCtxIds::DEFAULT_CTX_ID));
+    ASSERT_EQ(OB_SUCCESS, scheduler.tablet_scheduled_times_statistic_.create(8, "TestDDLSched",
+        ObModIds::OB_HASH_NODE, OB_SERVER_TENANT_ID, ObCtxIds::DEFAULT_CTX_ID));
+    ASSERT_EQ(OB_SUCCESS, scheduler.tablet_id_to_execution_id_map_.create(8, "TestDDLSched",
+        ObModIds::OB_HASH_NODE, OB_SERVER_TENANT_ID, ObCtxIds::DEFAULT_CTX_ID));
+    for (int64_t i = 0; i < LS_COUNT; ++i) {
+      ASSERT_EQ(OB_SUCCESS, tablets_.push_back(ObTabletID(FIRST_TABLET_ID + i)));
+      ASSERT_EQ(OB_SUCCESS,
+          scheduler.tablet_id_to_data_size_.set_refactored(FIRST_TABLET_ID + i + 100, 1,
+              0, 0, 0, static_cast<void *>(nullptr)));
+      ASSERT_EQ(OB_SUCCESS,
+          scheduler.tablet_id_to_data_row_cnt_.set_refactored(FIRST_TABLET_ID + i + 100, 1,
+              0, 0, 0, static_cast<void *>(nullptr)));
+    }
+    ASSERT_EQ(OB_SUCCESS, scheduler.all_ls_to_tablets_map_.set_refactored(
+        ObLSID(1001), tablets_, 0, 0, 0, static_cast<void *>(nullptr)));
+    const ObAddr leader(ObAddr::IPV4, "127.0.0.1", 2882);
+    ASSERT_EQ(OB_SUCCESS, scheduler.ls_location_map_.set_refactored(
+        ObLSID(1001), leader, 0, 0, 0, static_cast<void *>(nullptr)));
+    ASSERT_NO_FATAL_FAILURE(init_location_cache(leader));
+    ASSERT_NO_FATAL_FAILURE(save_message());
+    ASSERT_NO_FATAL_FAILURE(init_submission_group());
+  }
+  void TearDown() override
+  {
+    // Detach the stack-owned queue before the builder and tenant release their resources.
+    if (submission_tg_id_ >= 0) {
+      TG_MGR.tgs_[submission_tg_id_] = nullptr;
+      TG_MGR.free_tg_id(submission_tg_id_);
+      ddl_scheduler_.ddl_builder_.tg_id_ = -1;
+    }
+    root_service_.inited_ = false;
+    omt_.tenants_.clear();
+    sys_tenant_.set(static_cast<ObDDLScheduler *>(nullptr));
+    ObTenantEnv::set_tenant(old_tenant_);
+    GCTX.omt_ = old_omt_;
+    ObDDLServiceLauncher::is_ddl_service_started_ = old_service_started_;
+    GCTX.location_service_ = old_location_service_;
+    TestDDLTabletScheduler::TearDown();
+  }
+  void init_submission_group()
+  {
+    // Use the real RootService, SYS-tenant dispatch and builder, without worker threads or SQL RPC.
+    ASSERT_EQ(OB_SUCCESS, omt_.tenants_.push_back(&sys_tenant_));
+    sys_tenant_.set(&ddl_scheduler_);
+    ObTenantEnv::set_tenant(&sys_tenant_);
+    GCTX.omt_ = &omt_;
+    ObDDLServiceLauncher::is_ddl_service_started_ = true;
+    root_service_.inited_ = true;
+    submission_tg_id_ = TG_MGR.alloc_tg_id(lib::TGDefIDs::END);
+    ASSERT_GE(submission_tg_id_, 0);
+    TG_MGR.tgs_[submission_tg_id_] = &submission_group_;
+    ddl_scheduler_.ddl_builder_.tg_id_ = submission_tg_id_;
+    ddl_scheduler_.ddl_builder_.is_thread_started_ = true;
+    ddl_scheduler_.ddl_builder_.is_stopped_ = false;
+  }
+  void init_location_cache(const ObAddr &leader)
+  {
+    ObLSLocationService &service = location_service_.ls_location_service_;
+    ASSERT_EQ(OB_SUCCESS, service.inner_cache_.init());
+    service.lst_ = &ls_table_;
+    service.schema_service_ = &ObMultiVersionSchemaService::get_instance();
+    service.rs_mgr_ = &rs_mgr_;
+    service.srv_rpc_proxy_ = &rpc_proxy_;
+    service.inited_ = true;
+    location_service_.inited_ = true;
+    const int64_t ls_ids[] = {ObLSID::SYS_LS_ID, 1001};
+    for (const int64_t ls_id : ls_ids) {
+      ObLSLocation location;
+      ObLSReplicaLocation replica;
+      replica.set_server(leader);
+      replica.set_role(LEADER);
+      replica.set_sql_port(2881);
+      replica.set_replica_type(REPLICA_TYPE_FULL);
+      replica.set_proposal_id(1);
+      ASSERT_EQ(OB_SUCCESS, location.init(GCONF.cluster_id, TEST_TENANT_ID, ObLSID(ls_id),
+          ObTimeUtility::current_time()));
+      ASSERT_EQ(OB_SUCCESS, location.add_replica_location(replica));
+      ASSERT_EQ(OB_SUCCESS, service.inner_cache_.update(false, location.get_cache_key(), location));
+    }
+    GCTX.location_service_ = &location_service_;
+  }
+  void save_message()
+  {
+    message_connection_.message_.resize(task_.get_serialize_param_size());
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, task_.serialize_params_to_message(&message_connection_.message_[0],
+        message_connection_.message_.size(), pos));
+    message_connection_.message_.resize(pos);
+  }
+  void expect_retry_candidate()
+  {
+    ObDDLTabletScheduler &scheduler = task_.tablet_scheduler_;
+    EXPECT_EQ(0, scheduler.running_ls_to_tablets_map_.size());
+    EXPECT_EQ(1, scheduler.all_ls_to_tablets_map_.size());
+    EXPECT_EQ(0, scheduler.running_task_ls_ids_before_.count());
+    bool need_send = false;
+    ASSERT_EQ(OB_SUCCESS, scheduler.determine_if_need_to_send_new_task(need_send));
+    ASSERT_TRUE(need_send);
+    ObArray<ObTabletID> pending;
+    ObLSID ls_id;
+    ObAddr leader;
+    ASSERT_EQ(OB_SUCCESS, scheduler.get_to_be_scheduled_tablets(ls_id, leader, pending));
+    EXPECT_EQ(ObLSID(1001), ls_id);
+    ASSERT_EQ(tablets_.count(), pending.count());
+    for (int64_t i = 0; i < tablets_.count(); ++i) {
+      EXPECT_EQ(tablets_.at(i), pending.at(i));
+    }
+  }
+  void expect_submitted_batch()
+  {
+    ObDDLTabletScheduler &scheduler = task_.tablet_scheduler_;
+    EXPECT_TRUE(task_.is_sstable_complete_task_submitted_);
+    EXPECT_EQ(1, submission_group_.accepted_);
+    ObArray<ObTabletID> running;
+    ASSERT_EQ(OB_SUCCESS,
+        scheduler.running_ls_to_tablets_map_.get_refactored(ObLSID(1001), running, 0));
+    ASSERT_EQ(tablets_.count(), running.count());
+    ASSERT_EQ(tablets_.count(), submission_group_.tablets_.count());
+    for (int64_t i = 0; i < tablets_.count(); ++i) {
+      EXPECT_EQ(tablets_.at(i), running.at(i));
+      EXPECT_EQ(tablets_.at(i), submission_group_.tablets_.at(i));
+    }
+    EXPECT_EQ(1, scheduler.all_ls_to_tablets_map_.size());
+    int64_t execution_id = -1;
+    ASSERT_EQ(OB_SUCCESS,
+        scheduler.running_ls_to_execution_id_.get_refactored(ObLSID(1001), execution_id, 0));
+    EXPECT_EQ(execution_id, submission_group_.execution_id_);
+  }
+  void retry_submission()
+  {
+    bool finished = false;
+    ASSERT_EQ(OB_SUCCESS,
+        task_.wait_and_send_single_partition_replica_task(finished, schema_guard_));
+    EXPECT_FALSE(finished);
+    ASSERT_NO_FATAL_FAILURE(expect_submitted_batch());
+  }
+  ObSchemaGetterGuard schema_guard_;
+  ObIndexBuildTask task_;
+  ObArray<ObTabletID> tablets_;
+  DDLMessageConnection message_connection_;
+  DDLQueryPool message_pool_;
+  ObMySQLProxy message_proxy_;
+  ObLocationService location_service_;
+  ObLocationService *old_location_service_;
+  ObLSTableOperator ls_table_;
+  ObRsMgr rs_mgr_;
+  obrpc::ObSrvRpcProxy rpc_proxy_;
+  ObCgroupCtrl cgroup_ctrl_;
+  omt::ObTenant sys_tenant_;
+  omt::ObMultiTenant omt_;
+  ObDDLScheduler ddl_scheduler_;
+  ObRootService root_service_;
+  DDLSubmissionGroup submission_group_;
+  ObTenantBase *old_tenant_;
+  omt::ObMultiTenant *old_omt_;
+  bool old_service_started_;
+  int submission_tg_id_;
+};
+
+// A real message write failure must preserve the error and all pending tablets before retry.
+TEST_F(TestDDLIndexMessageFailure, message_write_failure_releases_batch_and_retries)
+{
+  message_connection_.fail_message_write_ = true;
+  const std::string old_message = message_connection_.message_;
+  bool finished = false;
+  ASSERT_EQ(OB_TRANS_TIMEOUT,
+      task_.wait_and_send_single_partition_replica_task(finished, schema_guard_));
+  EXPECT_FALSE(finished);
+  EXPECT_FALSE(task_.is_sstable_complete_task_submitted_);
+  EXPECT_EQ(0, submission_group_.calls_);
+  EXPECT_EQ(1, message_connection_.message_writes_);
+  EXPECT_EQ(1, message_connection_.rollbacks_);
+  EXPECT_EQ(old_message, message_connection_.message_);
+  ASSERT_NO_FATAL_FAILURE(expect_retry_candidate());
+  ASSERT_NO_FATAL_FAILURE(retry_submission());
+  EXPECT_EQ(2, message_connection_.message_writes_);
+}
+
+// COMMIT failure reaches the same cleanup even when message UPDATE itself succeeded.
+TEST_F(TestDDLIndexMessageFailure, message_commit_failure_releases_batch_and_retries)
+{
+  message_connection_.fail_commit_ = true;
+  bool finished = false;
+  ASSERT_EQ(OB_TIMEOUT, task_.wait_and_send_single_partition_replica_task(finished, schema_guard_));
+  EXPECT_FALSE(finished);
+  EXPECT_FALSE(task_.is_sstable_complete_task_submitted_);
+  EXPECT_EQ(1, message_connection_.message_writes_);
+  EXPECT_EQ(1, message_connection_.message_commits_);
+  EXPECT_EQ(0, submission_group_.calls_);
+  ASSERT_NO_FATAL_FAILURE(expect_retry_candidate());
+  ASSERT_NO_FATAL_FAILURE(retry_submission());
+}
+
+// A failed ROLLBACK must not replace the original message error or strand running tablets.
+TEST_F(TestDDLIndexMessageFailure, rollback_failure_preserves_message_error)
+{
+  message_connection_.fail_message_write_ = true;
+  message_connection_.fail_rollback_ = true;
+  bool finished = false;
+  ASSERT_EQ(OB_TRANS_TIMEOUT,
+      task_.wait_and_send_single_partition_replica_task(finished, schema_guard_));
+  EXPECT_FALSE(finished);
+  EXPECT_FALSE(task_.is_sstable_complete_task_submitted_);
+  EXPECT_EQ(1, message_connection_.rollbacks_);
+  EXPECT_EQ(0, submission_group_.calls_);
+  ASSERT_NO_FATAL_FAILURE(expect_retry_candidate());
+  ASSERT_NO_FATAL_FAILURE(retry_submission());
+}
+
+// A retryable rejection at the real builder's queue boundary releases the unsubmitted batch.
+TEST_F(TestDDLIndexMessageFailure, submission_eagain_releases_batch_and_retries)
+{
+  submission_group_.fail_next_ = true;
+  EXPECT_TRUE(task_.is_error_need_retry(OB_EAGAIN));
+  bool finished = false;
+  ASSERT_EQ(OB_EAGAIN, task_.wait_and_send_single_partition_replica_task(finished, schema_guard_));
+  EXPECT_FALSE(finished);
+  EXPECT_FALSE(task_.is_sstable_complete_task_submitted_);
+  EXPECT_EQ(1, message_connection_.message_commits_);
+  EXPECT_EQ(1, submission_group_.calls_);
+  EXPECT_EQ(0, submission_group_.accepted_);
+  ASSERT_NO_FATAL_FAILURE(expect_retry_candidate());
+  ASSERT_NO_FATAL_FAILURE(retry_submission());
+  EXPECT_EQ(2, submission_group_.calls_);
+}
+
+// Successful queue acceptance retains running ownership until the completion callback.
+TEST_F(TestDDLIndexMessageFailure, successful_submission_retains_running)
+{
+  ASSERT_NO_FATAL_FAILURE(retry_submission());
+  EXPECT_EQ(1, submission_group_.calls_);
+  EXPECT_EQ(1, message_connection_.message_commits_);
+  ObDDLTabletScheduler &scheduler = task_.tablet_scheduler_;
+  ASSERT_EQ(OB_SUCCESS, scheduler.confirm_batch_tablets_status(
+      submission_group_.execution_id_, true, ObLSID(1001), tablets_));
+  EXPECT_EQ(0, scheduler.running_ls_to_tablets_map_.size());
+  EXPECT_EQ(0, scheduler.all_ls_to_tablets_map_.size());
 }
 
 } // namespace rootserver
