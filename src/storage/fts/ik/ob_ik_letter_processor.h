@@ -22,6 +22,11 @@ public:
                  const char *ch,
                  const uint8_t char_len,
                  const ObFTCharUtil::CharType type) override;
+  bool has_pending_token() const override
+  {
+    return -1 != english_start_ || -1 != arabic_start_ || -1 != mix_start_;
+  }
+
   void reuse() override
   {
     reset_english_state();

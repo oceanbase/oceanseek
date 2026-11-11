@@ -10,6 +10,7 @@
 #include "lib/allocator/page_arena.h"
 #include "lib/charset/ob_charset.h"
 #include "lib/ob_errno.h"
+#include "lib/worker.h"
 #include "share/ob_tenant_mem_limit_getter.h"
 #include "share/inner_table/ob_inner_table_schema_constants.h"
 #include "lib/allocator/ob_allocator.h"
@@ -35,6 +36,7 @@
 #include "storage/fts/ik/ob_ik_char_util.h"
 #include "storage/fts/ik/ob_ik_token.h"
 #define private public
+#include "storage/fts/ik/ob_ik_arbitrator.h"
 #include "storage/fts/ob_ik_ft_parser.h"
 #undef private
 #include "lib/string/ob_sql_string.h"
@@ -50,7 +52,9 @@
 #include <ostream>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <unistd.h>
+#include <utility>
 #include <vector>
 
 #define USING_LOG_PREFIX STORAGE_FTS
@@ -806,6 +810,525 @@ TEST_F(FTParserTest, IK_LLT)
                                        u8"个人",
                                        u8"1.2立方米"};
     ik_test(test_str, sizeof(test_str), true, expect);
+  }
+}
+
+TEST_F(FTParserTest, ik_batch_boundary)
+{
+  ObArenaAllocator cache_alloc(ObModIds::TEST);
+  TestFTDictCacheLoaderExec cache_loader;
+  ObFTCacheRangeContainer range_container(cache_alloc);
+  const ObFTDictDesc dict_descs[] = {
+      {CHARSET_UTF8MB4, CS_TYPE_UTF8MB4_BIN, OB_FT_DICT_IK_UTF8_TID,
+          ObString(ObFTSLiteral::FT_DEFAULT_IK_DICT_UTF8_TABLE)},
+      {CHARSET_UTF8MB4, CS_TYPE_UTF8MB4_BIN, OB_FT_STOPWORD_IK_UTF8_TID,
+          ObString(ObFTSLiteral::FT_DEFAULT_IK_STOPWORD_UTF8_TABLE)},
+      {CHARSET_UTF8MB4, CS_TYPE_UTF8MB4_BIN, OB_FT_QUANTIFIER_IK_UTF8_TID,
+          ObString(ObFTSLiteral::FT_DEFAULT_IK_QUANTIFIER_UTF8_TABLE)}};
+  for (const auto &desc : dict_descs) {
+    ASSERT_EQ(OB_SUCCESS, cache_loader.load_cache(desc, range_container));
+    range_container.reset();
+  }
+
+  using Token = std::tuple<std::string, int64_t, int64_t>;
+  const int64_t paddings[] = {0, 252, 253, 254, 255, 256, 257,
+      509, 510, 511, 512, 513, 514, 515, 766, 767, 768, 769, 770, 771, 772};
+  const char *prefixes[] = {"", u8"日志："};
+  const char *endings[] = {"", " ;tail"};
+  std::vector<std::string> suffixes = {"ORA-00001", "ABC-12345", "123-456", "ABC.DEF",
+      "ABC_12345", "ABC#12345", "ABC&12345", "ABC+12345", "ABC@12345", "123,456",
+      "123.456", u8"ＡＢＣ－１２３４５", u8"3.14立方米", u8"中华人民共和国",
+      "ORA-00001 ;ORA-00001 ;ORA-00001"};
+  std::string long_mixed;
+  for (int i = 0; i < 40; ++i) {
+    long_mixed += "ABC-123-";
+  }
+  suffixes.push_back(long_mixed + "XYZ");
+  std::string alternating_mixed;
+  for (int i = 0; i < 40; ++i) {
+    alternating_mixed += "1,2-";
+  }
+  suffixes.push_back(alternating_mixed);
+
+  for (bool smart : {true, false}) {
+    SCOPED_TRACE(::testing::Message() << "smart=" << smart);
+    ObArenaAllocator allocator(ObModIds::TEST);
+    ObCharsetInfo cs = {};
+    cs.name = OB_UTF8MB4_BIN;
+    const std::string initial_text = "ORA-00001";
+    ObFTParserParam param;
+    param.cs_ = &cs;
+    param.metadata_alloc_ = &allocator;
+    param.scratch_alloc_ = &allocator;
+    param.fulltext_ = initial_text.c_str();
+    param.ft_length_ = initial_text.size();
+    param.parser_version_ = 1;
+    param.ik_param_.mode_ = smart ? ObFTIKParam::Mode::SMART : ObFTIKParam::Mode::MAX_WORD;
+    param.ik_param_.main_dict_id_ = OB_FT_DICT_IK_UTF8_TID;
+    param.ik_param_.main_dict_name_ = ObString(ObFTSLiteral::FT_DEFAULT_IK_DICT_UTF8_TABLE);
+    param.ik_param_.stopword_dict_id_ = OB_FT_STOPWORD_IK_UTF8_TID;
+    param.ik_param_.stopword_dict_name_ = ObString(ObFTSLiteral::FT_DEFAULT_IK_STOPWORD_UTF8_TABLE);
+    param.ik_param_.quan_dict_id_ = OB_FT_QUANTIFIER_IK_UTF8_TID;
+    param.ik_param_.quan_dict_name_ = ObString(ObFTSLiteral::FT_DEFAULT_IK_QUANTIFIER_UTF8_TABLE);
+    ObIKFTParser parser(allocator);
+    ASSERT_EQ(OB_SUCCESS, parser.init(param));
+
+    auto collect_tokens = [&](const std::string &text, std::vector<Token> &tokens) {
+      ASSERT_EQ(OB_SUCCESS, parser.reuse_parser(text.c_str(), text.size()));
+      tokens.clear();
+      const char *word = nullptr;
+      int64_t word_len = 0;
+      int64_t char_cnt = 0;
+      int64_t word_freq = 0;
+      int ret = OB_SUCCESS;
+      while (OB_SUCCESS == (ret = parser.get_next_token(word, word_len, char_cnt, word_freq))) {
+        ASSERT_EQ(1, word_freq);
+        const int64_t offset = word - text.c_str();
+        ASSERT_GE(offset, 0);
+        ASSERT_LE(offset + word_len, static_cast<int64_t>(text.size()));
+        tokens.emplace_back(std::string(word, word_len), offset, char_cnt);
+      }
+      ASSERT_EQ(OB_ITER_END, ret);
+    };
+
+    std::vector<Token> initial_tokens;
+    ASSERT_NO_FATAL_FAILURE(collect_tokens(initial_text, initial_tokens));
+    std::vector<Token> expected_initial = {Token("ORA-00001", 0, 9)};
+    if (!smart) {
+      expected_initial.emplace_back("ORA", 0, 3);
+      expected_initial.emplace_back("00001", 4, 5);
+    }
+    ASSERT_EQ(expected_initial, initial_tokens);
+
+    for (const auto &suffix : suffixes) {
+      for (const char *prefix : prefixes) {
+        for (const char *ending : endings) {
+          const std::string unpadded = prefix + suffix + ending;
+          SCOPED_TRACE(unpadded);
+          std::vector<Token> baseline;
+          ASSERT_NO_FATAL_FAILURE(collect_tokens(unpadded, baseline));
+          ASSERT_FALSE(baseline.empty());
+          for (int64_t padding : paddings) {
+            SCOPED_TRACE(::testing::Message() << "padding=" << padding);
+            const std::string text = std::string(padding, ' ') + unpadded;
+            std::vector<Token> actual;
+            ASSERT_NO_FATAL_FAILURE(collect_tokens(text, actual));
+            std::vector<Token> expected = baseline;
+            for (auto &token : expected) {
+              std::get<1>(token) += padding;
+            }
+            ASSERT_EQ(expected, actual);
+          }
+        }
+      }
+    }
+  }
+}
+
+TEST_F(FTParserTest, ik_hard_batch_boundary)
+{
+  constexpr int64_t hard_limit = 4096;
+  {
+    ObArenaAllocator allocator(ObModIds::TEST);
+    std::string text;
+    for (int64_t i = 0; i < hard_limit / 4; ++i) {
+      text += u8"Aé中😀";
+    }
+    const int64_t boundary = text.size();
+    text += "BC";
+    TokenizeContext ctx(allocator);
+    ASSERT_EQ(OB_SUCCESS, ctx.init(CS_TYPE_UTF8MB4_BIN, text.c_str(), text.size(), true));
+    for (int64_t i = 0; i < hard_limit; ++i) {
+      EXPECT_EQ(i == hard_limit - 1, ctx.is_batch_last());
+      EXPECT_FALSE(ctx.is_last());
+      ASSERT_EQ(OB_SUCCESS, ctx.step_next());
+    }
+    EXPECT_EQ(boundary, ctx.get_cursor());
+    EXPECT_EQ(static_cast<int64_t>(text.size()), ctx.fulltext_len());
+    ASSERT_EQ(OB_SUCCESS, ctx.reset_resource());
+    EXPECT_FALSE(ctx.is_batch_last());
+    EXPECT_FALSE(ctx.is_last());
+    ASSERT_EQ(OB_SUCCESS, ctx.step_next());
+    EXPECT_TRUE(ctx.is_batch_last());
+    EXPECT_TRUE(ctx.is_last());
+    EXPECT_EQ(OB_ITER_END, ctx.step_next());
+  }
+
+  ObArenaAllocator cache_alloc(ObModIds::TEST);
+  TestFTDictCacheLoaderExec cache_loader;
+  ObFTCacheRangeContainer range_container(cache_alloc);
+  const ObFTDictDesc dict_descs[] = {
+      {CHARSET_UTF8MB4, CS_TYPE_UTF8MB4_BIN, OB_FT_DICT_IK_UTF8_TID,
+          ObString(ObFTSLiteral::FT_DEFAULT_IK_DICT_UTF8_TABLE)},
+      {CHARSET_UTF8MB4, CS_TYPE_UTF8MB4_BIN, OB_FT_STOPWORD_IK_UTF8_TID,
+          ObString(ObFTSLiteral::FT_DEFAULT_IK_STOPWORD_UTF8_TABLE)},
+      {CHARSET_UTF8MB4, CS_TYPE_UTF8MB4_BIN, OB_FT_QUANTIFIER_IK_UTF8_TID,
+          ObString(ObFTSLiteral::FT_DEFAULT_IK_QUANTIFIER_UTF8_TABLE)}};
+  for (const auto &desc : dict_descs) {
+    ASSERT_EQ(OB_SUCCESS, cache_loader.load_cache(desc, range_container));
+    range_container.reset();
+  }
+
+  using Token = std::tuple<std::string, int64_t, int64_t>;
+  for (bool smart : {true, false}) {
+    SCOPED_TRACE(::testing::Message() << "smart=" << smart);
+    ObArenaAllocator allocator(ObModIds::TEST);
+    ObCharsetInfo cs = {};
+    cs.name = OB_UTF8MB4_BIN;
+    const std::string initial_text = "ORA-00001";
+    ObFTParserParam param;
+    param.cs_ = &cs;
+    param.metadata_alloc_ = &allocator;
+    param.scratch_alloc_ = &allocator;
+    param.fulltext_ = initial_text.c_str();
+    param.ft_length_ = initial_text.size();
+    param.parser_version_ = 1;
+    param.ik_param_.mode_ = smart ? ObFTIKParam::Mode::SMART : ObFTIKParam::Mode::MAX_WORD;
+    param.ik_param_.main_dict_id_ = OB_FT_DICT_IK_UTF8_TID;
+    param.ik_param_.main_dict_name_ = ObString(ObFTSLiteral::FT_DEFAULT_IK_DICT_UTF8_TABLE);
+    param.ik_param_.stopword_dict_id_ = OB_FT_STOPWORD_IK_UTF8_TID;
+    param.ik_param_.stopword_dict_name_ = ObString(ObFTSLiteral::FT_DEFAULT_IK_STOPWORD_UTF8_TABLE);
+    param.ik_param_.quan_dict_id_ = OB_FT_QUANTIFIER_IK_UTF8_TID;
+    param.ik_param_.quan_dict_name_ = ObString(ObFTSLiteral::FT_DEFAULT_IK_QUANTIFIER_UTF8_TABLE);
+    ObIKFTParser parser(allocator);
+    ASSERT_EQ(OB_SUCCESS, parser.init(param));
+
+    auto collect_tokens = [&](const std::string &text, std::vector<Token> &tokens,
+                              std::vector<int64_t> &batch_ends) {
+      ASSERT_EQ(OB_SUCCESS, parser.reuse_parser(text.c_str(), text.size()));
+      tokens.clear();
+      batch_ends.clear();
+      while (!parser.ctx_->iter_end()) {
+        const int64_t begin = parser.ctx_->get_cursor();
+        ASSERT_EQ(OB_SUCCESS, parser.process_next_batch());
+        const int64_t end = parser.ctx_->get_cursor();
+        ASSERT_GT(end, begin);
+        ASSERT_EQ(static_cast<int64_t>(text.size()), parser.ctx_->fulltext_len());
+        int error = 0;
+        const size_t valid_len = parser.ctx_->well_formed_len_fn()(
+            parser.ctx_->get_cs(), text.data() + begin, text.data() + end, hard_limit, &error);
+        ASSERT_EQ(0, error);
+        ASSERT_EQ(static_cast<size_t>(end - begin), valid_len);
+        ASSERT_LE(ObCharset::strlen_char(CS_TYPE_UTF8MB4_BIN,
+                                         text.data() + begin, end - begin), hard_limit);
+        ASSERT_FALSE(parser.has_pending_token());
+        batch_ends.push_back(end);
+        const char *word = nullptr;
+        int64_t word_len = 0;
+        int64_t offset = 0;
+        int64_t char_cnt = 0;
+        int ret = OB_SUCCESS;
+        while (OB_SUCCESS == (ret = parser.ctx_->get_next_token(word, word_len, offset, char_cnt))) {
+          ASSERT_GE(offset, begin);
+          ASSERT_GT(word_len, 0);
+          ASSERT_LE(offset + word_len, end);
+          error = 0;
+          const size_t token_valid_len = parser.ctx_->well_formed_len_fn()(
+              parser.ctx_->get_cs(), word + offset, word + offset + word_len, hard_limit, &error);
+          ASSERT_EQ(0, error);
+          ASSERT_EQ(static_cast<size_t>(word_len), token_valid_len);
+          ASSERT_EQ(char_cnt, ObCharset::strlen_char(CS_TYPE_UTF8MB4_BIN, word + offset, word_len));
+          tokens.emplace_back(std::string(word + offset, word_len), offset, char_cnt);
+        }
+        ASSERT_EQ(OB_ITER_END, ret);
+      }
+    };
+
+    auto verify_chunks = [&](const std::vector<std::string> &chunks) {
+      std::string text;
+      std::vector<int64_t> expected_ends;
+      for (const auto &chunk : chunks) {
+        text += chunk;
+        expected_ends.push_back(text.size());
+      }
+      SCOPED_TRACE(::testing::Message() << "bytes=" << text.size()
+                                      << ", batches=" << chunks.size());
+      std::vector<Token> actual;
+      std::vector<int64_t> actual_ends;
+      ASSERT_NO_FATAL_FAILURE(collect_tokens(text, actual, actual_ends));
+      ASSERT_EQ(expected_ends, actual_ends);
+      std::vector<Token> expected;
+      int64_t offset = 0;
+      for (const auto &chunk : chunks) {
+        std::vector<Token> chunk_tokens;
+        std::vector<int64_t> chunk_ends;
+        ASSERT_NO_FATAL_FAILURE(collect_tokens(chunk, chunk_tokens, chunk_ends));
+        for (auto &token : chunk_tokens) {
+          std::get<1>(token) += offset;
+          expected.push_back(token);
+        }
+        offset += chunk.size();
+      }
+      EXPECT_EQ(expected, actual);
+    };
+
+    const char *units[] = {"A", "7", u8"Ａ", u8"一"};
+    const int64_t lengths[] = {hard_limit - 1, hard_limit, hard_limit + 1,
+        2 * hard_limit, 2 * hard_limit + 1};
+    for (const char *unit : units) {
+      for (int64_t length : lengths) {
+        SCOPED_TRACE(::testing::Message() << "unit=" << unit << ", codepoints=" << length);
+        std::vector<std::string> chunks(1);
+        for (int64_t i = 0; i < length; ++i) {
+          if (i > 0 && i % hard_limit == 0) {
+            chunks.emplace_back();
+          }
+          chunks.back() += unit;
+        }
+        ASSERT_NO_FATAL_FAILURE(verify_chunks(chunks));
+      }
+    }
+
+    for (const char *unit : {u8"é", u8"中", u8"😀"}) {
+      SCOPED_TRACE(unit);
+      ASSERT_NO_FATAL_FAILURE(verify_chunks({std::string(hard_limit - 1, 'A') + unit,
+                                            "ORA-00001"}));
+      ASSERT_NO_FATAL_FAILURE(verify_chunks({std::string(hard_limit, 'A'),
+                                            std::string(unit) + "ORA-00001"}));
+      ASSERT_NO_FATAL_FAILURE(verify_chunks({std::string(unit) + std::string(hard_limit - 1, 'A'),
+                                            "ORA-00001"}));
+    }
+
+    for (const char *unit : {"ABC-", "1,2-", "7,", "7."}) {
+      const std::string pattern(unit);
+      const int64_t repetitions = 2 * hard_limit / static_cast<int64_t>(pattern.size()) + 1;
+      std::string text;
+      for (int64_t i = 0; i < repetitions; ++i) {
+        text += pattern;
+      }
+      ASSERT_NO_FATAL_FAILURE(verify_chunks({text.substr(0, hard_limit),
+                                            text.substr(hard_limit, hard_limit),
+                                            text.substr(2 * hard_limit)}));
+    }
+
+    const std::string chinese_word = u8"中华人民共和国";
+    for (int64_t prefix_chars : {1, 3, 6}) {
+      ASSERT_NO_FATAL_FAILURE(verify_chunks({
+          std::string(hard_limit - prefix_chars, 'A') + chinese_word.substr(0, 3 * prefix_chars),
+          chinese_word.substr(3 * prefix_chars) + "TAIL"}));
+    }
+    ASSERT_NO_FATAL_FAILURE(verify_chunks({std::string(hard_limit - 5, 'A') + u8"3.14立",
+                                          u8"方米TAIL"}));
+    ASSERT_NO_FATAL_FAILURE(verify_chunks({std::string(hard_limit - 2, 'A') + u8"十二",
+                                          u8"三个人TAIL"}));
+    ASSERT_NO_FATAL_FAILURE(verify_chunks({std::string(hard_limit - 3, 'A') + "ORA",
+                                          "-00001"}));
+    ASSERT_NO_FATAL_FAILURE(verify_chunks({std::string(300, 'A') + " ",
+                                          std::string(hard_limit, 'B'), "C"}));
+
+    std::vector<Token> actual;
+    std::vector<int64_t> batch_ends;
+    ASSERT_NO_FATAL_FAILURE(collect_tokens(initial_text, actual, batch_ends));
+    std::vector<Token> expected = {Token("ORA-00001", 0, 9)};
+    if (!smart) {
+      expected.emplace_back("ORA", 0, 3);
+      expected.emplace_back("00001", 4, 5);
+    }
+    EXPECT_EQ(expected, actual);
+  }
+}
+
+TEST_F(FTParserTest, ik_smart_arbitration)
+{
+  using Range = std::pair<int64_t, int64_t>;
+  auto arbitrate = [](const std::string &text, const std::vector<Range> &ranges,
+                     const std::vector<Range> &expected) {
+    ObArenaAllocator allocator(ObModIds::TEST);
+    TokenizeContext ctx(allocator);
+    ASSERT_EQ(OB_SUCCESS, ctx.init(CS_TYPE_UTF8MB4_BIN, text.c_str(), text.size(), true));
+    ObIKTokenChain chain(allocator);
+    for (size_t i = 0; i < ranges.size(); ++i) {
+      ObIKToken token;
+      token.ptr_ = text.c_str();
+      token.offset_ = ranges[i].first;
+      token.length_ = ranges[i].second - ranges[i].first;
+      token.char_cnt_ = token.length_;
+      token.type_ = i == 0 ? ObIKTokenType::IK_MIX_TOKEN : ObIKTokenType::IK_ENGLISH_TOKEN;
+      bool added = false;
+      ASSERT_EQ(OB_SUCCESS, chain.add_token_if_conflict(token, added));
+      ASSERT_TRUE(added);
+    }
+    ObIKArbitrator arbitrator;
+    ObIKTokenChain *best = nullptr;
+    ASSERT_EQ(OB_SUCCESS, arbitrator.optimize(ctx, &chain, chain.list().tokens().begin(),
+                                             chain.offset_len(), best));
+    ASSERT_NE(nullptr, best);
+    std::vector<Range> actual;
+    for (const auto &token : best->list().tokens()) {
+      actual.emplace_back(token.offset_, token.offset_ + token.length_);
+    }
+    EXPECT_EQ(expected, actual);
+    OB_DELETEx(ObIKTokenChain, &arbitrator.alloc_, best);
+  };
+
+  for (int64_t repetitions : {1024, 2048, 4096, 8192}) {
+    SCOPED_TRACE(::testing::Message() << "repetitions=" << repetitions);
+    const std::string prefix = u8"日志：";
+    std::string text = prefix;
+    for (int64_t i = 0; i < repetitions; ++i) {
+      text += "ABC-";
+    }
+    const int64_t start = prefix.size();
+    std::vector<Range> ranges = {{start, static_cast<int64_t>(text.size())}};
+    for (int64_t i = 0; i < repetitions; ++i) {
+      ranges.emplace_back(start + 4 * i, start + 4 * i + 3);
+    }
+    ASSERT_NO_FATAL_FAILURE(arbitrate(text, ranges, {{start, static_cast<int64_t>(text.size())}}));
+
+    const int64_t text_end = text.size();
+    std::vector<Range> mixed_ranges = ranges;
+    mixed_ranges.front().second += 3;
+    mixed_ranges.emplace_back(text_end, text_end + 7);
+    mixed_ranges.emplace_back(text_end + 4, text_end + 7);
+    ASSERT_NO_FATAL_FAILURE(arbitrate(text + "123,456", mixed_ranges,
+                                     {{start, text_end + 3}, {text_end + 4, text_end + 7}}));
+
+    std::string alternating_text;
+    for (int64_t i = 0; i < repetitions; ++i) {
+      alternating_text += "1,2-";
+    }
+    std::vector<Range> alternating_ranges = {{0, 1}};
+    std::vector<Range> greedy_ranges;
+    for (int64_t i = 0; i < repetitions; ++i) {
+      alternating_ranges.emplace_back(4 * i, 4 * i + 3);
+      alternating_ranges.emplace_back(4 * i + 2,
+          std::min(4 * i + 5, static_cast<int64_t>(alternating_text.size())));
+      greedy_ranges.emplace_back(4 * i, 4 * i + 3);
+    }
+    ASSERT_NO_FATAL_FAILURE(arbitrate(alternating_text, alternating_ranges, greedy_ranges));
+  }
+
+  const int64_t threshold = ObIKArbitrator::MAX_BACKTRACK_TOKEN_COUNT;
+  for (int64_t token_count : {threshold - 1, threshold, threshold + 1}) {
+    SCOPED_TRACE(::testing::Message() << "token_count=" << token_count);
+    std::vector<Range> ranges = {{0, 100}, {1, 101}};
+    for (int64_t i = 2; i < token_count; ++i) {
+      ranges.emplace_back(i, i + 1);
+    }
+    const std::vector<Range> expected = token_count <= threshold
+        ? std::vector<Range>{{1, 101}} : std::vector<Range>{{0, 100}};
+    ASSERT_NO_FATAL_FAILURE(arbitrate(std::string(101, 'A'), ranges, expected));
+  }
+
+  // Equal coverage prefers the single token.
+  ASSERT_NO_FATAL_FAILURE(arbitrate("ABCDEF", {{0, 6}, {0, 3}, {3, 6}}, {{0, 6}}));
+  // A partial single-token path still needs backtracking to resolve the tie.
+  ASSERT_NO_FATAL_FAILURE(arbitrate("ABCDEF", {{0, 4}, {2, 6}}, {{2, 6}}));
+  // A token starting at the path end remains eligible during backtracking.
+  ASSERT_NO_FATAL_FAILURE(arbitrate("ABCDEF", {{0, 2}, {1, 4}, {2, 5}, {4, 6}},
+                                   {{1, 4}, {4, 6}}));
+  // Full coverage with multiple tokens still needs backtracking to reduce the count.
+  ASSERT_NO_FATAL_FAILURE(arbitrate("ABCDEFGHIJ", {{0, 4}, {0, 2}, {2, 10}, {4, 6}, {6, 10}},
+                                   {{0, 2}, {2, 10}}));
+}
+
+TEST_F(FTParserTest, ik_status_check)
+{
+  class InterruptWorker : public lib::Worker
+  {
+  public:
+    InterruptWorker() : saved_worker_(lib::Worker::self_), check_count_(0)
+    {
+      lib::Worker::set_worker_to_thread_local(this);
+    }
+    ~InterruptWorker() override
+    {
+      lib::Worker::set_worker_to_thread_local(saved_worker_);
+    }
+    int check_status() override
+    {
+      ++check_count_;
+      return OB_TIMEOUT;
+    }
+    int64_t check_count() const { return check_count_; }
+  private:
+    lib::Worker *saved_worker_;
+    int64_t check_count_;
+  };
+
+  const std::string text(2048, ' ');
+  {
+    const std::string scan_text(text.size(), 'A');
+    ObArenaAllocator allocator(ObModIds::TEST);
+    ObIKFTParser parser(allocator);
+    ObFTParserParam param;
+    param.fulltext_ = scan_text.c_str();
+    param.ft_length_ = scan_text.size();
+    param.ik_param_.mode_ = ObFTIKParam::Mode::SMART;
+    parser.coll_type_ = CS_TYPE_UTF8MB4_BIN;
+    ASSERT_EQ(OB_SUCCESS, parser.init_ctx(param));
+    InterruptWorker worker;
+    EXPECT_EQ(OB_TIMEOUT, parser.process_next_batch());
+    EXPECT_EQ(1, worker.check_count());
+    EXPECT_FALSE(parser.ctx_->iter_end());
+    EXPECT_TRUE(parser.ctx_->is_results_exhaust());
+  }
+
+  for (bool build_chains : {true, false}) {
+    SCOPED_TRACE(::testing::Message() << "build_chains=" << build_chains);
+    ObArenaAllocator allocator(ObModIds::TEST);
+    TokenizeContext ctx(allocator);
+    ASSERT_EQ(OB_SUCCESS, ctx.init(CS_TYPE_UTF8MB4_BIN, text.c_str(), text.size(), true));
+    ObIKTokenChain chain(allocator);
+    for (int64_t i = 0; i < 1024; ++i) {
+      ObIKToken token;
+      token.ptr_ = text.c_str();
+      token.offset_ = i;
+      token.length_ = 2;
+      token.char_cnt_ = 2;
+      token.type_ = ObIKTokenType::IK_MIX_TOKEN;
+      bool added = false;
+      ASSERT_EQ(OB_SUCCESS, chain.add_token_if_conflict(token, added));
+      ASSERT_TRUE(added);
+      ASSERT_EQ(OB_SUCCESS, ctx.add_token(token.ptr_, token.offset_, token.length_,
+                                         token.char_cnt_, token.type_));
+    }
+    ObIKArbitrator arbitrator;
+    ASSERT_EQ(OB_SUCCESS, arbitrator.prepare());
+    ObIKTokenChain *best = nullptr;
+    InterruptWorker worker;
+    if (build_chains) {
+      EXPECT_EQ(OB_TIMEOUT, arbitrator.process(ctx));
+    } else {
+      EXPECT_EQ(OB_TIMEOUT, arbitrator.optimize(ctx, &chain, chain.list().tokens().begin(),
+                                               chain.offset_len(), best));
+      EXPECT_EQ(nullptr, best);
+    }
+    EXPECT_EQ(1, worker.check_count());
+    EXPECT_TRUE(ctx.is_results_exhaust());
+  }
+
+  for (bool with_chain : {false, true}) {
+    SCOPED_TRACE(::testing::Message() << "with_chain=" << with_chain);
+    ObArenaAllocator allocator(ObModIds::TEST);
+    TokenizeContext ctx(allocator);
+    const std::string output_text = "A" + text + "B";
+    ASSERT_EQ(OB_SUCCESS, ctx.init(CS_TYPE_UTF8MB4_BIN,
+                                  output_text.c_str(), output_text.size(), true));
+    int ret = OB_SUCCESS;
+    while (OB_SUCCESS == (ret = ctx.step_next())) {}
+    ASSERT_EQ(OB_ITER_END, ret);
+    ObIKArbitrator arbitrator;
+    ASSERT_EQ(OB_SUCCESS, arbitrator.prepare());
+    ObIKTokenChain chain(allocator);
+    if (with_chain) {
+      for (int64_t offset : {int64_t(0), static_cast<int64_t>(output_text.size() - 1)}) {
+        ObIKToken token;
+        token.ptr_ = output_text.c_str();
+        token.offset_ = offset;
+        token.length_ = 1;
+        token.char_cnt_ = 1;
+        token.type_ = ObIKTokenType::IK_ENGLISH_TOKEN;
+        bool added = false;
+        ASSERT_EQ(OB_SUCCESS, chain.add_token_if_no_conflict(token, added));
+        ASSERT_TRUE(added);
+      }
+      ASSERT_EQ(OB_SUCCESS, arbitrator.add_chain(&chain));
+    }
+    InterruptWorker worker;
+    EXPECT_EQ(OB_TIMEOUT, arbitrator.output_result(ctx));
+    EXPECT_EQ(1, worker.check_count());
+    EXPECT_EQ(with_chain ? 1 : 0, ctx.get_results().count());
   }
 }
 

@@ -62,12 +62,12 @@ int ObIKQuantifierProcessor::process_CN_number(TokenizeContext &ctx,
   }
 
   if (OB_SUCC(ret)) {
-    if (ctx.is_last() && (start_ != -1 && end_ != -1)) {
+    if (ctx.is_batch_last() && (start_ != -1 && end_ != -1)) {
       if (OB_FAIL(output_num_token(ctx))) {
         LOG_WARN("Failed to output number token", K(ret));
       }
     }
-    if (ctx.is_last()) {
+    if (ctx.is_batch_last()) {
       reset();
     }
   } else {
@@ -151,7 +151,7 @@ int ObIKQuantifierProcessor::process_CN_count(TokenizeContext &ctx,
 
     if (OB_FAIL(ret)) {
       // already logged
-    } else if (ctx.is_last()) {
+    } else if (ctx.is_batch_last()) {
       count_hits_.clear();
     } else {
     }

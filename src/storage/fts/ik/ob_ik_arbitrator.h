@@ -30,16 +30,19 @@ public:
   int prepare();
 
 private:
+  static constexpr int64_t MAX_BACKTRACK_TOKEN_COUNT = 50;
+
   int add_chain(ObIKTokenChain *chain);
 
   int optimize(TokenizeContext &ctx,
                ObIKTokenChain *option,
                ObFTLightSortList::CellIter iter,
-               int64_t fulltext_len,
+               int64_t chain_span,
                ObIKTokenChain *&best);
 
-  int try_add_next_words(ObIKTokenChain *chain,
-    ObFTLightSortList::CellIter iter,
+  int try_add_next_words(TokenizeContext &ctx,
+                         ObIKTokenChain *chain,
+                         ObFTLightSortList::CellIter iter,
                          ObIKTokenChain *option,
                          bool need_conflict,
                          ObList<ObFTLightSortList::CellIter, ObIAllocator> &conflict_stack);

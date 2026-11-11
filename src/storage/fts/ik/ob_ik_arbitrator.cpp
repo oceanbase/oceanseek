@@ -36,7 +36,9 @@ int ObIKArbitrator::process(TokenizeContext &ctx)
     while (OB_SUCC(ret) && !tokens.empty()) {
       ObIKToken token = tokens.get_first();
       bool is_add = false;
-      if (OB_FAIL(tokens.pop_front())) {
+      if (OB_FAIL(ctx.check_status())) {
+        LOG_WARN("Worker interrupted while building IK conflict chains", K(ret));
+      } else if (OB_FAIL(tokens.pop_front())) {
         LOG_WARN("pop_front failed", K(ret));
       } else if (OB_FAIL(chain_need_arbitrate->add_token_if_conflict(token, is_add))) {
         LOG_WARN("add token if conflict failed", K(ret));
@@ -123,12 +125,18 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
                                                         type))) {
       LOG_WARN("Failed to classify first valid char", K(ret));
     } else if (ObFTCharUtil::CharType::USELESS == type) {
-      current += char_len; // ignore useless char
+      if (OB_FAIL(ctx.check_status())) {
+        LOG_WARN("Worker interrupted during IK result output", K(ret));
+      } else {
+        current += char_len; // ignore useless char
+      }
     } else if (OB_FAIL(chains_.get_refactored(current, chain)) && OB_HASH_NOT_EXIST != ret) {
       LOG_WARN("Failed to find in chain map", K(ret));
     } else if (OB_HASH_NOT_EXIST == ret) {
       ret = OB_SUCCESS;
-      if (!keep_single()) {
+      if (OB_FAIL(ctx.check_status())) {
+        LOG_WARN("Worker interrupted during IK result output", K(ret));
+      } else if (!keep_single()) {
         // ignore single token
       } else {
         // output single token
@@ -157,18 +165,24 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
           }
         }
       }
-      current += char_len;
+      if (OB_SUCC(ret)) {
+        current += char_len;
+      }
     } else {
       for (ObList<ObIKToken, ObIAllocator>::const_iterator iter = chain->list().tokens().begin();
            OB_SUCC(ret) && iter != chain->list().tokens().end();
            iter++) {
         const ObIKToken &token = *iter;
-        if (!keep_single()) {
+        if (OB_FAIL(ctx.check_status())) {
+          LOG_WARN("Worker interrupted while outputting IK chain tokens", K(ret));
+        } else if (!keep_single()) {
           current = token.offset_;
         } else {
           // output single-token between two token
           while (OB_SUCC(ret) && current < token.offset_) {
-            if (OB_FAIL(ObFTCharUtil::classify_first_valid_char(ctx.get_cs_type(),
+            if (OB_FAIL(ctx.check_status())) {
+              LOG_WARN("Worker interrupted while outputting IK single characters", K(ret));
+            } else if (OB_FAIL(ObFTCharUtil::classify_first_valid_char(ctx.get_cs_type(),
                                                                 ctx.fulltext() + current,
                                                                 ctx.fulltext_len() - current,
                                                                 ctx.well_formed_len_fn(),
@@ -211,15 +225,10 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
         if (OB_FAIL(ret)) {
         } else if (OB_FAIL(ctx.get_results().push_back(token))) {
           LOG_WARN("Failed to add token to ctx result", K(ret));
-        } else
-          // output the token
+        } else {
           current = token.offset_ + token.length_;
+        }
       }
-    }
-    if (OB_FAIL(ret)) {
-      break;
-    } else {
-      // pass
     }
   }
 
@@ -229,31 +238,39 @@ int ObIKArbitrator::output_result(TokenizeContext &ctx)
 int ObIKArbitrator::optimize(TokenizeContext &ctx,
                              ObIKTokenChain *chain,
                              ObFTLightSortList::CellIter iter,
-                             int64_t fulltext_len,
+                             int64_t chain_span,
                              ObIKTokenChain *&best)
 {
   int ret = OB_SUCCESS;
 
   ObIKTokenChain *option = nullptr;
   ObList<ObFTLightSortList::CellIter, ObIAllocator> conflict_stack(alloc_);
+  const bool need_backtrack = nullptr != chain
+      && chain->list().tokens().size() <= MAX_BACKTRACK_TOKEN_COUNT;
 
   if (OB_ISNULL(option = OB_NEWx(ObIKTokenChain, &alloc_, alloc_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("alloc memory failed");
-  } else if (OB_FAIL(try_add_next_words(chain, iter, option, true, conflict_stack))) {
+  } else if (OB_FAIL(try_add_next_words(ctx, chain, iter, option, need_backtrack, conflict_stack))) {
     LOG_WARN("Failed to add chain and record conflict token.", K(ret));
+  } else if (!need_backtrack) {
+    best = option;
+    option = nullptr;
   } else if (OB_ISNULL(best = OB_NEWx(ObIKTokenChain, &alloc_, alloc_))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("Alloc memory failed");
   } else if (OB_FAIL(best->copy(option))) {
     LOG_WARN("Copy best option failed", K(ret));
   } else {
-    while (OB_SUCC(ret) && !conflict_stack.empty()) {
+    // A single token covering the chain is optimal by coverage and token count.
+    while (OB_SUCC(ret) && !conflict_stack.empty()
+        && (best->payload() != chain_span || best->list().tokens().size() != 1)) {
       ObFTLightSortList::CellIter iter = conflict_stack.get_last();
-      conflict_stack.pop_back();
-      if (OB_FAIL(remove_conflict(*iter, option))) {
+      if (OB_FAIL(conflict_stack.pop_back())) {
+        LOG_WARN("Failed to pop IK conflict candidate", K(ret));
+      } else if (OB_FAIL(remove_conflict(*iter, option))) {
         LOG_WARN("Failed to remove conflict", K(ret));
-      } else if (OB_FAIL(try_add_next_words(chain, iter, option, false, conflict_stack))) {
+      } else if (OB_FAIL(try_add_next_words(ctx, chain, iter, option, false, conflict_stack))) {
         LOG_WARN("Failed to add next words", K(ret));
       } else if (option->better_than(*best)) {
         OB_DELETEx(ObIKTokenChain, &alloc_, best);
@@ -280,26 +297,34 @@ int ObIKArbitrator::optimize(TokenizeContext &ctx,
   return ret;
 }
 
-int ObIKArbitrator::try_add_next_words(ObIKTokenChain *chain,
+int ObIKArbitrator::try_add_next_words(TokenizeContext &ctx,
+                                       ObIKTokenChain *chain,
                                        ObFTLightSortList::CellIter iter,
                                        ObIKTokenChain *option,
                                        bool need_conflict,
                                        ObList<ObFTLightSortList::CellIter, ObIAllocator> &conflict_stack)
 {
   int ret = OB_SUCCESS;
+  int64_t last_token_start = 0;
   if (OB_ISNULL(chain) || OB_ISNULL(option)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("iter is null", K(ret));
+  } else if (!need_conflict && !chain->list().is_empty()) {
+    last_token_start = chain->list().tokens().get_last().offset_;
   }
 
   while (OB_SUCC(ret) && iter != chain->list().tokens().end()) {
     bool is_add = false;
-    if (OB_FAIL(option->add_token_if_no_conflict(*iter, is_add))) {
+    if (OB_FAIL(ctx.check_status())) {
+      LOG_WARN("Worker interrupted during IK candidate scanning", K(ret));
+    } else if (OB_FAIL(option->add_token_if_no_conflict(*iter, is_add))) {
       LOG_WARN("Failed to add token", K(ret));
     } else if (!is_add && need_conflict && OB_FAIL(conflict_stack.push_back(iter))) {
       LOG_WARN("push_back failed", K(ret));
+    } else if (is_add && !need_conflict && option->max_offset() > last_token_start) {
+      // All remaining candidates start inside the selected path.
+      iter = chain->list().tokens().end();
     } else {
-      // no add or push back over
       iter++;
     }
   }

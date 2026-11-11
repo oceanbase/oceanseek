@@ -12,6 +12,7 @@
 #include "lib/ob_errno.h"
 #include "lib/oblog/ob_log_module.h"
 #include "lib/utility/ob_macro_utils.h"
+#include "lib/worker.h"
 #include "storage/fts/ik/ob_ik_arbitrator.h"
 #include "storage/fts/ik/ob_ik_char_util.h"
 #include "storage/fts/ik/ob_ik_token.h"
@@ -43,7 +44,7 @@ TokenizeContext::TokenizeContext(ObIAllocator &allocator)
     : coll_type_(CS_TYPE_INVALID), fulltext_(nullptr), fulltext_len_(0), cursor_(0),
       next_char_len_(0), handle_size_(0), is_smart_(false), token_list_(allocator),
       results_(allocator), result_idx_(0), cs_(nullptr), well_formed_len_(nullptr),
-      cs_type_(CHARSET_INVALID), buffer_start_cursor_(0)
+      cs_type_(CHARSET_INVALID), buffer_start_cursor_(0), status_check_count_(0)
 {
 }
 
@@ -89,6 +90,7 @@ int TokenizeContext::reuse_context(const char *fulltext, int64_t fulltext_len)
   fulltext_len_ = fulltext_len;
   cursor_ = 0;
   buffer_start_cursor_ = 0;
+  status_check_count_ = 0;
   if (OB_FAIL(reset_resource())) {
     LOG_WARN("Failed to reset resource", K(ret));
   } else if (OB_FAIL(prepare_next_char())) {
@@ -165,6 +167,17 @@ int TokenizeContext::step_next()
   return ret;
 }
 
+int TokenizeContext::check_worker_status()
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(THIS_WORKER.check_status())) {
+    LOG_WARN("Worker interrupted during IK tokenization", K(ret));
+  } else {
+    status_check_count_ = 0;
+  }
+  return ret;
+}
+
 ObCollationType TokenizeContext::collation() const { return coll_type_; }
 
 int64_t TokenizeContext::get_end_cursor() const { return cursor_ + next_char_len_; }
@@ -176,6 +189,12 @@ int64_t TokenizeContext::fulltext_len() const { return fulltext_len_; }
 int64_t TokenizeContext::get_cursor() const { return cursor_; }
 
 bool TokenizeContext::is_last() const { return cursor_ + next_char_len_ >= fulltext_len_; }
+
+bool TokenizeContext::is_batch_last() const
+{
+  // handle_size_ excludes the current code point until step_next().
+  return is_last() || handle_size_ >= MAX_BATCH_CODEPOINT_COUNT - 1;
+}
 
 bool TokenizeContext::iter_end() const { return cursor_ >= fulltext_len_; }
 

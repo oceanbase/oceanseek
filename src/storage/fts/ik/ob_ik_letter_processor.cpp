@@ -67,7 +67,7 @@ int ObIKLetterProcessor::process_english_letter(TokenizeContext &ctx,
   }
 
   if (OB_SUCC(ret)) {
-    if (ctx.is_last() && (-1 != english_start_ && -1 != english_end_)) {
+    if (ctx.is_batch_last() && (-1 != english_start_ && -1 != english_end_)) {
       if (OB_FAIL(ctx.add_token(ctx.fulltext(),
                                 english_start_,
                                 english_end_ - english_start_,
@@ -126,7 +126,7 @@ int ObIKLetterProcessor::process_arabic_letter(TokenizeContext &ctx,
   }
 
   if (OB_SUCC(ret)) {
-    if (ctx.is_last() && (arabic_start_ != -1 && arabic_end_ != -1)) {
+    if (ctx.is_batch_last() && (arabic_start_ != -1 && arabic_end_ != -1)) {
       if (is_connector) {
         arabic_connect_cnt_ = 0;
       }
@@ -187,7 +187,7 @@ int ObIKLetterProcessor::process_mix_letter(TokenizeContext &ctx,
   }
 
   if (OB_SUCC(ret)) {
-    if (ctx.is_last() && (mix_start_ != -1 && mix_end_ != -1)) {
+    if (ctx.is_batch_last() && (mix_start_ != -1 && mix_end_ != -1)) {
       if (OB_FAIL(ctx.add_token(ctx.fulltext(),
                                 mix_start_,
                                 mix_end_ - mix_start_,

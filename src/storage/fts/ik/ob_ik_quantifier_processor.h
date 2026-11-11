@@ -29,6 +29,8 @@ public:
                  const uint8_t char_len,
                  const ObFTCharUtil::CharType type);
 
+  bool has_pending_token() const override { return -1 != start_ || !count_hits_.empty(); }
+
   void reuse() override
   {
     count_hits_.clear();

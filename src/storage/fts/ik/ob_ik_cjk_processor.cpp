@@ -78,7 +78,7 @@ int ObIKCJKProcessor::do_process(TokenizeContext &ctx,
   }
 
   if (OB_SUCC(ret)) {
-    if (ctx.is_last()) {
+    if (ctx.is_batch_last()) {
       hits_.clear();
     }
   } else {
