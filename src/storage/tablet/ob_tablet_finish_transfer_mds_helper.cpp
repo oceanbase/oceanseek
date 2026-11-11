@@ -21,6 +21,7 @@ namespace storage
 {
 
 ERRSIM_POINT_DEF(EN_TRANSFER_DIAGNOSE_FINISH_REPLAY_FAILED);
+ERRSIM_POINT_DEF(EN_BLOCK_FINISH_TRANSFER_IN_REPLAY);
 
 int ObTabletFinishTransferUtil::check_transfer_table_replaced(
     ObTabletHandle &tablet_handle,
@@ -1163,6 +1164,18 @@ int ObTabletFinishTransferInHelper::on_replay(
   } else if (!tx_finish_transfer_in_info.is_valid()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tx finish transfer in info is unexpected", K(ret), K(tx_finish_transfer_in_info));
+#ifdef ERRSIM
+  } else if (MTL_ID() == GCONF.errsim_tenant_id
+             && tx_finish_transfer_in_info.dest_ls_id_.id() == GCONF.errsim_migration_ls_id
+             && OB_FAIL(EN_BLOCK_FINISH_TRANSFER_IN_REPLAY)) {
+    if (REACH_THREAD_TIME_INTERVAL(10_s)) {
+      SERVER_EVENT_ADD("storage_ha", "block_finish_transfer_in_replay",
+                      "tenant_id", MTL_ID(),
+                      "ls_id", tx_finish_transfer_in_info.dest_ls_id_.id(),
+                      "scn", scn.get_val_for_inner_table_field());
+      LOG_INFO("block finish transfer in replay", K(ret), K(scn), K(tx_finish_transfer_in_info));
+    }
+#endif
   } else if (CLICK_FAIL(on_replay_success_(scn, tx_finish_transfer_in_info, ctx))) {
     diagnose_result_msg = share::ObStorageHACostItemName::ON_REPLAY_SUCCESS;
     LOG_WARN("failed to do on_replay_success_", K(ret), K(tx_finish_transfer_in_info));

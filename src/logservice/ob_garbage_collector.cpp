@@ -8,6 +8,7 @@
 #include "ob_switch_leader_adapter.h"
 #include "archiveservice/ob_archive_service.h"
 #include "rpc/obrpc/ob_rpc_net_handler.h"
+#include "observer/ob_server_event_history_table_operator.h"
 #include "storage/tx/ob_ts_mgr.h"
 #include "share/ls/ob_ls_life_manager.h"
 #include "rootserver/ob_tenant_info_loader.h" // ObTenantInfoLoader
@@ -18,6 +19,7 @@
 #ifdef OB_BUILD_SHARED_STORAGE
 #include "storage/incremental/ob_shared_meta_service.h"
 #endif
+#include "storage/ss_garbage_collector/ob_ss_gc_util.h"
 #include "storage/high_availability/ob_tenant_startup_status.h"
 
 namespace oceanbase
@@ -29,6 +31,8 @@ using namespace storage;
 using namespace palf;
 namespace logservice
 {
+ERRSIM_POINT_DEF(EN_PAUSE_SHARED_LS_MARK_DELETED_GC);
+
 class ObGarbageCollector::InsertLSFunctor
 {
 public:
@@ -1612,6 +1616,10 @@ void ObGarbageCollector::run1()
         gc_candidates.reset();
         (void)gc_check_ls_status_(gc_candidates);
         (void)execute_gc_(gc_candidates);
+        gc_candidates.reset();
+        // Let normal LS GC remove __all_ls_status before collecting shared-deleted replicas.
+        (void)gc_check_ls_mark_deleted_(gc_candidates);
+        (void)execute_gc_(gc_candidates);
         seq_++;
       }
     } else {
@@ -2112,6 +2120,101 @@ int ObGarbageCollector::gc_check_ls_status_(storage::ObLS &ls,
   return ret;
 }
 
+int ObGarbageCollector::gc_check_ls_mark_deleted_(ObGCCandidateArray &gc_candidates)
+{
+  int ret = OB_SUCCESS;
+  const int64_t begin_time_us = ObTimeUtility::current_time();
+  ObLSIterator *iter = nullptr;
+  common::ObSharedGuard<ObLSIterator> guard;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    CLOG_LOG(WARN, "ObGarbageCollector is not inited", KR(ret));
+  } else if (OB_FAIL(ls_service_->get_ls_iter(guard, ObLSGetMod::OBSERVER_MOD))) {
+    CLOG_LOG(WARN, "get ls iterator failed", KR(ret));
+  } else if (OB_ISNULL(iter = guard.get_ptr())) {
+    ret = OB_ERR_UNEXPECTED;
+    CLOG_LOG(ERROR, "ls iterator is null", KR(ret));
+  } else {
+    ObLS *ls = nullptr;
+    while (OB_SUCC(ret)) {
+      int tmp_ret = OB_SUCCESS;
+      if (OB_FAIL(iter->get_next(ls))) {
+        if (OB_ITER_END != ret) {
+          CLOG_LOG(WARN, "get next ls failed", KR(ret));
+        }
+      } else if (OB_ISNULL(ls)) {
+        ret = OB_ERR_UNEXPECTED;
+        CLOG_LOG(ERROR, "ls is null", KR(ret));
+      } else if (OB_TMP_FAIL(inner_check_ss_ls_mark_deleted_(*ls, gc_candidates))) {
+        CLOG_LOG(WARN, "check shared ls deletion failed", KR(tmp_ret), "ls_id", ls->get_ls_id());
+      }
+    }
+    if (OB_ITER_END == ret) {
+      ret = OB_SUCCESS;
+    }
+  }
+  CLOG_LOG(INFO, "gc_check_ls_mark_deleted_ cost time", KR(ret),
+           "time_us", ObTimeUtility::current_time() - begin_time_us);
+  return ret;
+}
+
+int ObGarbageCollector::inner_check_ss_ls_mark_deleted_(
+    ObLS &ls,
+    ObGCCandidateArray &gc_candidates)
+{
+  int ret = OB_SUCCESS;
+  int tmp_ret = OB_SUCCESS;
+  const ObLSID ls_id = ls.get_ls_id();
+  share::ObLSStatus ls_status = OB_LS_NORMAL;
+  ObMigrationStatus migration_status;
+  SCN deleted_scn;
+  bool allow_gc = false;
+  if (!ls.is_create_committed()) {
+    CLOG_LOG(INFO, "ls creation is not committed, skip shared deletion check", K(ls_id));
+  } else if (OB_FAIL(ls.get_migration_status(migration_status))) {
+    CLOG_LOG(WARN, "get migration status failed", KR(ret), K(ls_id));
+  } else if (ObMigrationStatusHelper::check_is_running_migration(migration_status)) {
+    CLOG_LOG(INFO, "ls is migrating, skip shared deletion check", K(ls_id), K(migration_status));
+  } else if (OB_SUCCESS == (tmp_ret = get_ls_status_from_table(ls_id, ls_status))) {
+    // WAIT_GC precedes deletion of __all_ls_status. Keep its last replica alive
+    // until the normal GC state machine has removed that entry.
+  } else if (OB_ENTRY_NOT_EXIST != tmp_ret) {
+    ret = tmp_ret;
+    CLOG_LOG(WARN, "get ls status failed when checking shared deletion", KR(ret), K(ls_id));
+  } else if (OB_FAIL(ObSSGCUtil::get_ls_deleted_scn(MTL_ID(), ls_id, deleted_scn))) {
+    // A missing row or a failed read is not proof that this LS has been retired.
+    CLOG_LOG(WARN, "get shared ls deletion state failed", KR(ret), K(ls_id));
+  } else if (!deleted_scn.is_valid()) {
+  } else if (OB_FAIL(ObMigrationStatusHelper::check_ls_allow_gc(ls_id, migration_status, allow_gc))) {
+    CLOG_LOG(WARN, "check ls allowed to gc failed", KR(ret), K(ls_id), K(migration_status));
+  } else if (!allow_gc) {
+    CLOG_LOG(INFO, "shared ls is deleted but local ls is dependent", K(ls_id), K(migration_status));
+#ifdef ERRSIM
+  } else if (MTL_ID() == GCONF.errsim_tenant_id
+             && ls_id.id() == GCONF.errsim_migration_ls_id
+             && OB_FAIL(EN_PAUSE_SHARED_LS_MARK_DELETED_GC)) {
+    SERVER_EVENT_ADD("ls_gc", "shared_mark_deleted_gc_paused",
+                    "tenant_id", MTL_ID(), "ls_id", ls_id.id(),
+                    "deleted_scn", deleted_scn.get_val_for_inner_table_field(),
+                    "migration_status", static_cast<int64_t>(migration_status));
+    CLOG_LOG(INFO, "pause shared mark deleted ls gc", KR(ret), K(ls_id), K(deleted_scn));
+#endif
+  } else {
+    // The LS lock row is marked deleted atomically with the terminal WAIT_GC update.
+    // A lagging local replica need not replay tablet deletions or wait for LS_META GC.
+    GCCandidate candidate;
+    candidate.ls_id_ = ls_id;
+    candidate.ls_status_ = LSStatus::LS_NEED_GC;
+    candidate.gc_reason_ = GCReason::SHARED_LS_MARK_DELETED;
+    if (OB_FAIL(gc_candidates.push_back(candidate))) {
+      CLOG_LOG(WARN, "push gc candidate failed", KR(ret), K(candidate));
+    } else {
+      CLOG_LOG(INFO, "shared ls is mark deleted, gc local replica", K(candidate), K(deleted_scn));
+    }
+  }
+  return ret;
+}
+
 void ObGarbageCollector::execute_gc_(ObGCCandidateArray &gc_candidates)
 {
   int ret = OB_SUCCESS;
@@ -2146,7 +2249,8 @@ void ObGarbageCollector::execute_gc_(ObGCCandidateArray &gc_candidates)
       CLOG_LOG(ERROR, "gc_handler is NULL", K(tmp_ret), K(id));
     } else if (is_need_gc_ls_status_(ls_status)) {
       //this replica  may not be able to synchornize complete logs
-      if (GCReason::LS_STATUS_ENTRY_NOT_EXIST == gc_reason) {
+      if (GCReason::LS_STATUS_ENTRY_NOT_EXIST == gc_reason
+          || GCReason::SHARED_LS_MARK_DELETED == gc_reason) {
         SCN offline_scn;
         if (OB_SUCCESS != (tmp_ret = (ls->get_offline_scn(offline_scn)))) {
           CLOG_LOG(ERROR, "get_offline_scn failed", K(id));

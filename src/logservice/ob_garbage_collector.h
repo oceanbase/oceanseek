@@ -161,7 +161,8 @@ public:
     NOT_IN_LEADER_MEMBER_LIST = 1,  //不在成员列表中
     LS_STATUS_ENTRY_NOT_EXIST = 2,  //日志流状态表已删除该日志流
     MIGRATION_FAILED = 3,           //迁移复制相关场景失败的日志流
-    MAX_GC_REASON = 4,
+    SHARED_LS_MARK_DELETED = 4,    //共享日志流已完成标删
+    MAX_GC_REASON = 5,
   };
 
   struct GCCandidate
@@ -215,6 +216,9 @@ private:
   int check_if_tenant_is_creating_(const uint64_t tenant_id,
                                         bool &is_creating);
   int delete_ls_status_(const share::ObLSID &id);
+  // 共享日志流标删相关
+  int gc_check_ls_mark_deleted_(ObGCCandidateArray &gc_candidates);
+  int inner_check_ss_ls_mark_deleted_(storage::ObLS &ls, ObGCCandidateArray &gc_candidates);
   void execute_gc_(ObGCCandidateArray &gc_candidates);
 #ifdef OB_BUILD_SHARED_STORAGE
   int check_tablet_gc_(
