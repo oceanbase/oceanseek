@@ -754,6 +754,53 @@ int ObDelUpdLogPlan::compute_exchange_info_for_pdml_insert(const ObShardingInfo 
     LOG_WARN("failed to get pdml parallel degree", K(ret));
   } else {
     exch_info.server_cnt_ = exch_info.server_list_.count();
+    // 统一由工具接口计算逻辑主键或公共唯一键。
+    ObArray<uint64_t> dist_column_ids;
+    bool can_use_random = false;
+    bool need_hidden_pk = false;
+    const share::schema::ObTableSchema *table_schema = NULL;
+    // insert-up 模式下表示目标表存在用户主键或 local unique。
+    bool has_logical_uniq_index = false;
+    const bool is_insert_up = get_stmt()->is_insert_stmt()
+        && static_cast<const ObInsertStmt *>(get_stmt())->is_insert_up();
+    const bool is_split_update = get_stmt()->is_update_stmt()
+        && is_pdml_update_split;
+    const bool need_dist_columns = !is_index_maintenance
+        && (get_stmt()->is_insert_stmt() || is_split_update)
+        && (!get_optimizer_context().is_online_ddl()
+            || get_optimizer_context().is_heap_table_ddl());
+    if (need_dist_columns) {
+      ObSchemaGetterGuard *schema_guard = NULL;
+      if (OB_ISNULL(schema_guard = get_optimizer_context().get_schema_guard())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("get unexpected null schema guard", K(ret));
+      } else if (OB_FAIL(schema_guard->get_table_schema(
+                         session->get_effective_tenant_id(),
+                         index_dml_info.ref_table_id_,
+                         table_schema))) {
+        LOG_WARN("failed to get table schema", K(ret),
+                 K(index_dml_info.ref_table_id_));
+      } else if (OB_ISNULL(table_schema)) {
+        ret = OB_TABLE_NOT_EXIST;
+        LOG_WARN("table schema is null", K(ret),
+                 K(index_dml_info.ref_table_id_));
+      } else if (OB_FAIL(ObOptimizerUtil::get_pdml_insert_dist_columns(
+                             *schema_guard,
+                             *table_schema,
+                             is_insert_up,
+                             dist_column_ids,
+                             has_logical_uniq_index))) {
+        LOG_WARN("failed to get pdml insert dist columns",
+                 K(ret), K(index_dml_info.ref_table_id_));
+      }
+    }
+    if (OB_SUCC(ret) && NULL != table_schema) {
+      need_hidden_pk = table_schema->is_table_with_hidden_pk_column();
+    }
+    // insert-up 仅无用户唯一键时可 RANDOM；普通 heap insert 保持 master 行为。
+    can_use_random = get_optimizer_context().is_pdml_heap_table()
+                                   && !is_index_maintenance
+                                   && (!is_insert_up || !has_logical_uniq_index);
     share::schema::ObPartitionLevel part_level = target_sharding.get_part_level();
     if (share::schema::PARTITION_LEVEL_ZERO != part_level) {
       exch_info.repartition_ref_table_id_ = index_dml_info.ref_table_id_;
@@ -768,10 +815,10 @@ int ObDelUpdLogPlan::compute_exchange_info_for_pdml_insert(const ObShardingInfo 
     
     if (share::schema::PARTITION_LEVEL_ONE == part_level) {
       exch_info.repartition_type_ = OB_REPARTITION_ONE_SIDE_ONE_LEVEL;
-      if ((!get_stmt()->is_merge_stmt() || 
+      if ((!get_stmt()->is_merge_stmt() ||
            !static_cast<const ObMergeStmt*>(get_stmt())->has_update_clause()) &&
            ((get_optimizer_context().is_online_ddl() && get_optimizer_context().is_heap_table_ddl())
-           || (get_optimizer_context().is_pdml_heap_table() && !is_index_maintenance))) {
+           || can_use_random)) {
         exch_info.dist_method_ = ObPQDistributeMethod::PARTITION_RANDOM;
       } else if (get_optimizer_context().is_online_ddl() && session->get_ddl_info().is_partition_local_ddl()) {
         exch_info.dist_method_ = ObPQDistributeMethod::NONE;
@@ -783,10 +830,10 @@ int ObDelUpdLogPlan::compute_exchange_info_for_pdml_insert(const ObShardingInfo 
       }
     } else if (share::schema::PARTITION_LEVEL_TWO == part_level) {
       exch_info.repartition_type_ = OB_REPARTITION_ONE_SIDE_TWO_LEVEL;
-      if ((!get_stmt()->is_merge_stmt() || 
+      if ((!get_stmt()->is_merge_stmt() ||
            !static_cast<const ObMergeStmt*>(get_stmt())->has_update_clause()) &&
            ((get_optimizer_context().is_online_ddl() && get_optimizer_context().is_heap_table_ddl())
-           || (get_optimizer_context().is_pdml_heap_table() && !is_index_maintenance))) {
+           || can_use_random)) {
         exch_info.dist_method_ = ObPQDistributeMethod::PARTITION_RANDOM;
       } else if (get_optimizer_context().is_online_ddl() && session->get_ddl_info().is_partition_local_ddl()) {
         exch_info.dist_method_ = ObPQDistributeMethod::NONE;
@@ -798,10 +845,10 @@ int ObDelUpdLogPlan::compute_exchange_info_for_pdml_insert(const ObShardingInfo 
       }
     } else if (share::schema::PARTITION_LEVEL_ZERO == part_level) {
       exch_info.repartition_type_ = OB_REPARTITION_NO_REPARTITION;
-      if ((!get_stmt()->is_merge_stmt() || 
+      if ((!get_stmt()->is_merge_stmt() ||
            !static_cast<const ObMergeStmt*>(get_stmt())->has_update_clause()) &&
           ((get_optimizer_context().is_online_ddl() && get_optimizer_context().is_heap_table_ddl())
-           || (get_optimizer_context().is_pdml_heap_table() && !is_index_maintenance))) {
+          || can_use_random)) {
         exch_info.dist_method_ = ObPQDistributeMethod::RANDOM;
       } else if (get_optimizer_context().is_online_ddl() && session->get_ddl_info().is_partition_local_ddl()) {
         exch_info.dist_method_ = ObPQDistributeMethod::NONE;
@@ -851,7 +898,9 @@ int ObDelUpdLogPlan::compute_exchange_info_for_pdml_insert(const ObShardingInfo 
         }
       } else {
         if (OB_FAIL(compute_hash_dist_exprs_for_pdml_insert(exch_info,
-                                                            index_dml_info))) {
+                                                            index_dml_info,
+                                                            dist_column_ids,
+                                                            need_hidden_pk))) {
           LOG_WARN("failed to compute hash dist for pdml insert", K(ret));
         } else { /*do nothing*/ }
       }
@@ -986,68 +1035,41 @@ int ObDelUpdLogPlan::build_merge_stmt_repartition_hash_key(const IndexDMLInfo &i
 }
 
 int ObDelUpdLogPlan::compute_hash_dist_exprs_for_pdml_insert(ObExchangeInfo &exch_info,
-                                                             const IndexDMLInfo &dml_info)
+                                                             const IndexDMLInfo &dml_info,
+                                                             const ObIArray<uint64_t> &dist_column_ids,
+                                                             bool need_hidden_pk)
 {
   int ret = OB_SUCCESS;
   const ObDMLStmt *stmt;
   ObSEArray<ObRawExpr *, 8> rowkey_exprs;
-  bool use_logic_pk = false;
-  ObArray<uint64_t> logic_pk_ids;
-  ObSQLSessionInfo *session = NULL;
-  share::schema::ObSchemaGetterGuard *schema_guard = NULL;
-  const share::schema::ObTableSchema *table_schema = NULL;
-  if (OB_ISNULL(stmt = get_stmt()) || OB_ISNULL(session = get_optimizer_context().get_session_info()) ||
-      OB_ISNULL(schema_guard = get_optimizer_context().get_schema_guard()) ||
+  if (OB_ISNULL(stmt = get_stmt()) ||
       OB_UNLIKELY(dml_info.get_real_uk_cnt() > dml_info.column_convert_exprs_.count())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected error", K(dml_info.get_real_uk_cnt()),
              K(dml_info.column_convert_exprs_.count()), K(ret));
   } else {
-    // 当目标表为带逻辑主键的堆表时，优先使用逻辑主键列进行哈希分发，
-    // 避免使用物理 rowkey（隐藏列）导致同一逻辑主键无法落在同一 worker。
-    if (!stmt->is_merge_stmt()) {
-      if (OB_FAIL(schema_guard->get_table_schema(session->get_effective_tenant_id(),
-                                                 dml_info.ref_table_id_,
-                                                 table_schema))) {
-        LOG_WARN("failed to get table schema", K(ret), K(dml_info.ref_table_id_));
-      } else if (OB_ISNULL(table_schema)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("get unexpected null table schema", K(ret), K(dml_info.ref_table_id_));
-      } else {
-        bool has_logic_pk = false;
-        if (OB_FAIL(table_schema->is_table_with_logic_pk(*schema_guard, has_logic_pk))) {
-          LOG_WARN("failed to check logic pk", K(ret), K(dml_info.ref_table_id_));
-        } else if (has_logic_pk && table_schema->is_heap_organized_table()) {
-          if (OB_FAIL(table_schema->get_logic_pk_column_ids(schema_guard, logic_pk_ids))) {
-            LOG_WARN("failed to get logic pk column ids", K(ret), K(dml_info.ref_table_id_));
-          } else if (OB_UNLIKELY(logic_pk_ids.empty())) {
-            ret = OB_ERR_UNEXPECTED;
-            LOG_WARN("logic pk column ids is empty", K(ret), K(dml_info.ref_table_id_));
-          } else {
-            use_logic_pk = true;
-          }
-        }
-      }
-    }
-
-    if (OB_FAIL(ret)) {
-    } else if (use_logic_pk) {
-      // 根据逻辑主键列 ID 在 column_convert_exprs_ 中定位对应的转换表达式
-      for (int64_t i = 0; OB_SUCC(ret) && i < logic_pk_ids.count(); ++i) {
-        const uint64_t pk_id = logic_pk_ids.at(i);
+    if (!dist_column_ids.empty()) {
+      // 统一按工具层产出的逻辑主键或公共唯一键 HASH。
+      for (int64_t i = 0; OB_SUCC(ret) && i < dist_column_ids.count(); ++i) {
+        const uint64_t column_id = dist_column_ids.at(i);
         bool found = false;
         for (int64_t j = 0; OB_SUCC(ret) && j < dml_info.column_exprs_.count(); ++j) {
           ObColumnRefRawExpr *col_expr = dml_info.column_exprs_.at(j);
           if (OB_ISNULL(col_expr)) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("get unexpected null column expr", K(ret), K(j));
-          } else if (col_expr->get_column_id() == pk_id) {
+          } else if (OB_FAIL(ObTransformUtils::get_base_column(stmt, col_expr))) {
+            LOG_WARN("failed to get base column for pdml dist", K(ret), K(j));
+          } else if (OB_ISNULL(col_expr)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("get unexpected null base column", K(ret), K(j));
+          } else if (col_expr->get_column_id() == column_id) {
             if (OB_UNLIKELY(j >= dml_info.column_convert_exprs_.count())) {
               ret = OB_ERR_UNEXPECTED;
-              LOG_WARN("convert expr not found for logic pk", K(ret), K(j), K(pk_id),
+              LOG_WARN("convert expr not found for pdml dist column", K(ret), K(j), K(column_id),
                        K(dml_info.column_convert_exprs_.count()));
             } else if (OB_FAIL(rowkey_exprs.push_back(dml_info.column_convert_exprs_.at(j)))) {
-              LOG_WARN("failed to push back logic pk expr", K(ret), K(pk_id));
+              LOG_WARN("failed to push back pdml dist expr", K(ret), K(column_id));
             } else {
               found = true;
             }
@@ -1056,14 +1078,11 @@ int ObDelUpdLogPlan::compute_hash_dist_exprs_for_pdml_insert(ObExchangeInfo &exc
         }
         if (OB_SUCC(ret) && !found) {
           ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("logic pk column not found in dml info", K(ret), K(pk_id));
+          LOG_WARN("pdml dist column not found in dml info", K(ret), K(column_id));
         }
       }
-      // For heap tables with logical primary key, also need to set hidden_pk_expr_
-      // to ensure exchange passes it to the upper INSERT operator.
-      // This is needed for both partitioned and non-partitioned tables in PDML scenario.
-      // We use hidden_pk_expr_ instead of hash_dist_exprs_ to avoid affecting hash calculation.
-      if (OB_SUCC(ret)) {
+      // 隐藏主键/隐藏 clustering key 只负责物理行定位，不参与逻辑唯一键 HASH，但需要随 exchange 传给上层 DML。
+      if (OB_SUCC(ret) && need_hidden_pk) {
         for (int64_t i = 0; i < dml_info.column_convert_exprs_.count(); ++i) {
           ObRawExpr *expr = dml_info.column_convert_exprs_.at(i);
           if (OB_NOT_NULL(expr) &&

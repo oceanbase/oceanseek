@@ -11,6 +11,8 @@
 #include "share/ob_order_perserving_encoder.h"
 #include "sql/rewrite/ob_predicate_deduce.h"
 #include "sql/optimizer/ob_log_join.h"
+#include "share/schema/ob_schema_getter_guard.h"
+#include "share/schema/ob_table_schema.h"
 
 using namespace oceanbase;
 using namespace sql;
@@ -18,6 +20,208 @@ using namespace oceanbase::common;
 using namespace oceanbase::share::schema;
 using namespace oceanbase::share;
 
+
+// local unique 作为 PDML 分发键时，必须能完整映射到主表用户列。
+static int is_pdml_local_unique_index_valid(
+    const share::schema::ObTableSchema &table_schema,
+    const share::schema::ObTableSchema &index_schema,
+    bool &is_valid)
+{
+  int ret = OB_SUCCESS;
+  const ObIndexInfo &index_info = index_schema.get_index_info();
+  is_valid = 0 < index_info.get_size();
+  for (int64_t i = 0; OB_SUCC(ret) && is_valid && i < index_info.get_size(); ++i) {
+    const ObIndexColumn *index_column = index_info.get_column(i);
+    const ObColumnSchemaV2 *data_column_schema = NULL;
+    if (OB_ISNULL(index_column)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("index column is null", K(ret), K(i), K(index_schema.get_table_id()));
+    } else if (OB_ISNULL(data_column_schema =
+        table_schema.get_column_schema(index_column->column_id_))) {
+      is_valid = false;
+    } else if (data_column_schema->is_prefix_column()
+               || data_column_schema->is_prefix_index_column()
+               || data_column_schema->is_shadow_column()
+               || data_column_schema->is_hidden()
+               || data_column_schema->is_generated_column()) {
+      // 前缀/函数等索引使用隐藏或生成列承载，不能代表完整用户列值参与 HASH。
+      is_valid = false;
+    }
+  }
+  return ret;
+}
+
+// 收集 PDML 可用的用户逻辑唯一键，供 HASH 分发和 RANDOM 判断复用。
+static int collect_pdml_insert_unique_columns(
+    share::schema::ObSchemaGetterGuard &schema_guard,
+    const share::schema::ObTableSchema &table_schema,
+    bool use_common_unique,
+    common::ObIArray<common::ObSEArray<uint64_t, 8>> &unique_column_ids)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t tenant_id = table_schema.get_tenant_id();
+  const uint64_t table_id = table_schema.get_table_id();
+  const common::ObIArray<share::schema::ObAuxTableMetaInfo> &index_infos =
+      table_schema.get_simple_index_infos();
+  // 逻辑主键列非空时才作为用户唯一键参与统计。
+  ObSEArray<uint64_t, 8> logic_pk_ids;
+  if (use_common_unique || table_schema.is_heap_organized_table()) {
+    if (OB_FAIL(table_schema.get_logic_pk_column_ids(&schema_guard, logic_pk_ids))) {
+      LOG_WARN("failed to get logic pk column ids", K(ret), K(table_id));
+    } else if (!logic_pk_ids.empty()
+               && OB_FAIL(unique_column_ids.push_back(logic_pk_ids))) {
+      LOG_WARN("failed to push back logic pk column ids", K(ret), K(table_id));
+    }
+  }
+  if (OB_SUCC(ret) && !use_common_unique) {
+    return ret;
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < index_infos.count(); ++i) {
+    const share::schema::ObTableSchema *index_schema = NULL;
+    if (INDEX_TYPE_UNIQUE_LOCAL != index_infos.at(i).index_type_) {
+      // 非 local unique 不参与 PDML HASH key 统计。
+    } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id,
+                                                     index_infos.at(i).table_id_,
+                                                     index_schema))) {
+      LOG_WARN("failed to get index schema", K(ret), K(index_infos.at(i).table_id_));
+    } else if (OB_ISNULL(index_schema)) {
+      ret = OB_TABLE_NOT_EXIST;
+      LOG_WARN("index schema is null", K(ret), K(index_infos.at(i).table_id_));
+    } else if (index_schema->is_final_invalid_index()) {
+      // 失效索引不参与逻辑唯一约束统计。
+    } else {
+      bool is_local_unique_index_valid = false;
+      if (OB_FAIL(is_pdml_local_unique_index_valid(table_schema,
+                                                    *index_schema,
+                                                    is_local_unique_index_valid))) {
+        LOG_WARN("failed to check local unique index", K(ret), K(table_id));
+      } else if (is_local_unique_index_valid) {
+        const ObIndexInfo &index_info = index_schema->get_index_info();
+        ObSEArray<uint64_t, 8> index_column_ids;
+        for (int64_t j = 0; OB_SUCC(ret) && j < index_info.get_size(); ++j) {
+          const ObIndexColumn *index_column = index_info.get_column(j);
+          if (OB_ISNULL(index_column)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("index column is null", K(ret), K(j), K(index_schema->get_table_id()));
+          } else if (OB_FAIL(index_column_ids.push_back(index_column->column_id_))) {
+            LOG_WARN("failed to push back index column id",
+                     K(ret), K(index_column->column_id_));
+          }
+        }
+        if (OB_SUCC(ret) && OB_FAIL(unique_column_ids.push_back(index_column_ids))) {
+          LOG_WARN("failed to push back index column ids", K(ret), K(table_id));
+        }
+      } else if (OB_FAIL(unique_column_ids.push_back(ObSEArray<uint64_t, 8>()))) {
+        // prefix unique（如 uk_c(c(2))）不能用完整列 HASH，但仍需标记存在唯一约束。
+        // 空列组阻止误选 HASH，也使 has_logical_uniq_index 阻止 RANDOM。
+        LOG_WARN("failed to push back empty unique column ids", K(ret), K(table_id));
+      }
+    }
+  }
+  return ret;
+}
+
+// 多唯一键时选择自身唯一且被所有唯一键包含的列组。
+static int get_complete_common_unique_columns(
+    const common::ObIArray<common::ObSEArray<uint64_t, 8>> &unique_column_ids,
+    common::ObIArray<uint64_t> &dist_column_ids)
+{
+  int ret = OB_SUCCESS;
+  bool found_common_unique_key = false;
+  for (int64_t i = 0; OB_SUCC(ret) && !found_common_unique_key
+         && i < unique_column_ids.count(); ++i) {
+    const ObIArray<uint64_t> &candidate_ids = unique_column_ids.at(i);
+    found_common_unique_key = !candidate_ids.empty();
+    for (int64_t j = 0; found_common_unique_key && j < unique_column_ids.count(); ++j) {
+      const ObIArray<uint64_t> &other_ids = unique_column_ids.at(j);
+      if (j != i) {
+        for (int64_t k = 0; found_common_unique_key && k < candidate_ids.count(); ++k) {
+          found_common_unique_key = has_exist_in_array(other_ids, candidate_ids.at(k));
+        }
+      }
+    }
+    if (found_common_unique_key && OB_FAIL(dist_column_ids.assign(candidate_ids))) {
+      LOG_WARN("failed to assign common unique column ids", K(ret), K(candidate_ids));
+    }
+  }
+  return ret;
+}
+
+// 普通 heap insert 返回逻辑主键；insert-up 返回公共唯一键。
+int ObOptimizerUtil::get_pdml_insert_dist_columns(
+    share::schema::ObSchemaGetterGuard &schema_guard,
+    const share::schema::ObTableSchema &table_schema,
+    bool use_common_unique,
+    common::ObIArray<uint64_t> &dist_column_ids,
+    bool &has_logical_uniq_index)
+{
+  int ret = OB_SUCCESS;
+  const uint64_t table_id = table_schema.get_table_id();
+  ObSEArray<ObSEArray<uint64_t, 8>, 8> unique_column_ids;
+  dist_column_ids.reuse();
+  has_logical_uniq_index = false;
+  if (OB_FAIL(collect_pdml_insert_unique_columns(schema_guard,
+                                                 table_schema,
+                                                 use_common_unique,
+                                                 unique_column_ids))) {
+    LOG_WARN("failed to collect pdml unique columns", K(ret), K(table_id));
+  } else if (!use_common_unique) {
+    // 普通 heap insert 固定按逻辑主键 HASH，避免受其他唯一键影响。
+    has_logical_uniq_index = !unique_column_ids.empty();
+    if (has_logical_uniq_index
+        && OB_FAIL(dist_column_ids.assign(unique_column_ids.at(0)))) {
+      LOG_WARN("failed to assign logic pk column ids", K(ret), K(table_id));
+    }
+  } else if (OB_FAIL(get_complete_common_unique_columns(unique_column_ids,
+                                                        dist_column_ids))) {
+    LOG_WARN("failed to get complete common unique columns", K(ret), K(table_id));
+  } else {
+    has_logical_uniq_index = !unique_column_ids.empty();
+  }
+  LOG_TRACE("get pdml insert dist columns", K(ret), K(table_id), K(dist_column_ids),
+            K(has_logical_uniq_index));
+  return ret;
+}
+
+
+// 仅放行可证明保持原键值的赋值，不改动实际执行的 assignment 表达式。
+int ObOptimizerUtil::check_insert_up_identity_assignment(const ObInsertStmt &stmt,
+                                                         ObColumnRefRawExpr &base_column,
+                                                         ObRawExpr *value_expr,
+                                                         bool &is_identity)
+{
+  int ret = OB_SUCCESS;
+  is_identity = false;
+  ObRawExpr *previous_expr = NULL;
+  if (OB_ISNULL(value_expr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null assignment expr", K(ret));
+  }
+  // resolver 可能添加多层 COLUMN_CONV/CAST，只剥离已证明无损的包装。
+  while (OB_SUCC(ret) && previous_expr != value_expr) {
+    previous_expr = value_expr;
+    if (OB_FAIL(ObTransformUtils::split_lossless_convert_or_cast(value_expr))) {
+      LOG_WARN("failed to split lossless assignment conversion", K(ret));
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(value_expr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("get unexpected null unwrapped assignment expr", K(ret));
+  } else if (value_expr->is_column_ref_expr()) {
+    ObColumnRefRawExpr *value_column = static_cast<ObColumnRefRawExpr *>(value_expr);
+    // 同名或同 ID 的源表列不是目标列；视图两侧需递归映射到基表。
+    if (OB_FAIL(ObTransformUtils::get_base_column(&stmt, value_column))) {
+      LOG_WARN("failed to get assignment base column", K(ret));
+    } else if (OB_ISNULL(value_column)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("get unexpected null assignment base column", K(ret));
+    } else {
+      is_identity = base_column.same_as(*value_column);
+    }
+  }
+  return ret;
+}
 
 int MergeKeyInfo::assign(MergeKeyInfo &other)
 {

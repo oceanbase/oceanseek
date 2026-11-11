@@ -15,6 +15,19 @@
 
 namespace oceanbase
 {
+namespace share
+{
+namespace schema
+{
+class ObSchemaGetterGuard;
+class ObTableSchema;
+}
+}
+
+}
+
+namespace oceanbase
+{
 namespace sql
 {
 
@@ -70,6 +83,18 @@ class ObTableMetaInfo;
 class ObOptimizerUtil
 {
 public:
+  static int get_pdml_insert_dist_columns(
+      share::schema::ObSchemaGetterGuard &schema_guard,
+      const share::schema::ObTableSchema &table_schema,
+      bool use_common_unique,
+      common::ObIArray<uint64_t> &dist_column_ids,
+      bool &has_logical_uniq_index);
+
+  static int check_insert_up_identity_assignment(const ObInsertStmt &stmt,
+                                                  ObColumnRefRawExpr &base_column,
+                                                  ObRawExpr *value_expr,
+                                                  bool &is_identity);
+
   static int is_prefix_ordering(const ObIArray<OrderItem> &first,
                                 const ObIArray<OrderItem> &second,
                                 const EqualSets &equal_sets,

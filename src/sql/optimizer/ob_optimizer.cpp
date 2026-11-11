@@ -5,9 +5,11 @@
 
 #define USING_LOG_PREFIX SQL_OPT
 #include "ob_optimizer.h"
+#include "sql/optimizer/ob_optimizer_util.h"
 #include "sql/optimizer/ob_explain_note.h"
 #include "sql/optimizer/ob_select_log_plan.h"
 #include "sql/resolver/dml/ob_merge_stmt.h"
+#include "sql/rewrite/ob_transform_utils.h"
 #include "sql/optimizer/ob_opt_cost_model_parameter.h"
 #include "src/share/stat/ob_opt_stat_manager.h"
 #include "src/sql/engine/px/ob_dfo_scheduler.h"
@@ -624,10 +626,9 @@ int ObOptimizer::check_pdml_supported_feature(const ObDelUpdStmt &pdml_stmt,
 
 // disable pdml insert on duplicate in following scenario:
 /*
- * 1. insert into heap table.
- * 2. exist gis/string/lob/array/generated column.
- * 3. exist unique or global or fulltext/spatial/vector/multivalue index 
- * 4. update unique key when conflict
+ * 1. exist gis/json/array/roaringbitmap/generated column.
+ * 2. exist unsupported index or logical unique keys have no common unique subset.
+ * 3. update rowkey or unique key when conflict.
 */
 int ObOptimizer::check_pdml_insert_up_enabled(const ObDelUpdStmt &pdml_stmt,
                                               const ObSQLSessionInfo &session,
@@ -649,31 +650,35 @@ int ObOptimizer::check_pdml_insert_up_enabled(const ObDelUpdStmt &pdml_stmt,
       is_use_pdml = false;
       LOG_TRACE("disable pdml insert up");
     } else {
-      const share::schema::ObTableSchema *table_schema = NULL;
       const ObInsertStmt &insert_stmt = static_cast<const ObInsertStmt &>(pdml_stmt);
       uint64_t ref_table_id = insert_stmt.get_insert_table_info().ref_table_id_;
       share::schema::ObSchemaGetterGuard *schema_guard = ctx_.get_schema_guard();
+      const share::schema::ObTableSchema *table_schema = NULL;
+      // PDML 冲突检测需要 key HASH 或 RANDOM 之一能安全聚合冲突行。
+      ObSEArray<uint64_t, 8> dist_column_ids;
+      // has_logical_uniq_index 表示目标表存在用户主键或 local unique。
+      bool has_logical_uniq_index = false;
       if (OB_ISNULL(schema_guard)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("schema guard is null", K(ret));
       } else if (OB_INVALID_ID == ref_table_id) {
         is_use_pdml = false;
         // do nothing.
-      } else if (OB_FAIL(schema_guard->get_table_schema(session.get_effective_tenant_id(),
-                  ref_table_id, table_schema))) {
+      } else if (OB_FAIL(schema_guard->get_table_schema(
+                     session.get_effective_tenant_id(), ref_table_id,
+                     table_schema))) {
         LOG_WARN("get table schema failed", K(ret));
-      } else if (table_schema->is_heap_organized_table()) {
-        // 1. insert into heap table.
-        is_use_pdml = false;
+      } else if (OB_ISNULL(table_schema)) {
+        ret = OB_TABLE_NOT_EXIST;
+        LOG_WARN("table schema is null", K(ret), K(ref_table_id));
       } else {
-        // 2. exist gis/lob/json/array/roaringbitmap/generated column.
-        for (ObTableSchema::const_column_iterator col_iter = table_schema->column_begin();
+        // 1. exist gis/json/array/roaringbitmap/generated column.
+        for (ObTableSchema::const_column_iterator col_iter =
+                 table_schema->column_begin();
              NULL != col_iter && col_iter != table_schema->column_end();
              col_iter++) {
           ObObjType data_type = (*col_iter)->get_data_type();
           if (ob_is_geometry(data_type)
-              || (*col_iter)->is_string_lob()
-              || ob_is_text_tc(data_type)
               || ob_is_json(data_type)
               || ob_is_collection_sql_type(data_type)
               || ob_is_roaringbitmap(data_type)
@@ -690,29 +695,64 @@ int ObOptimizer::check_pdml_insert_up_enabled(const ObDelUpdStmt &pdml_stmt,
                 session.get_effective_tenant_id(), ref_table_id, index_meta_infos))) {
           LOG_WARN("get unique index ids failed", K(ret), K(ref_table_id));
         } else {
-          // 3. exist unique or global or fulltext/spatial/vector/multivalue index
-          for (int64_t i = 0; i < index_meta_infos.count() && OB_SUCC(ret); i++) {
-            const ObAuxTableMetaInfo &index_meta = index_meta_infos.at(i);
-            if (ObSimpleTableSchemaV2::is_unique_index(index_meta.index_type_)
-                || ObSimpleTableSchemaV2::is_global_index_table(index_meta.index_type_)
-                || ObSimpleTableSchemaV2::is_domain_index(index_meta.index_type_)) {
+          // unique/global/domain 默认禁止，只放行 PDML 新支持的两类唯一键。
+          for (int64_t i = 0; i < index_meta_infos.count() && OB_SUCC(ret); ++i) {
+            const ObIndexType index_type = index_meta_infos.at(i).index_type_;
+            const bool is_unsupported_unique_index =
+                ObSimpleTableSchemaV2::is_unique_index(index_type)
+                && INDEX_TYPE_UNIQUE_LOCAL != index_type
+                && INDEX_TYPE_HEAP_ORGANIZED_TABLE_PRIMARY != index_type;
+            if (is_unsupported_unique_index
+                || ObSimpleTableSchemaV2::is_global_index_table(index_type)
+                || ObSimpleTableSchemaV2::is_domain_index(index_type)) {
               is_use_pdml = false;
               break;
             }
           }
-          if (OB_FAIL(ret) || !is_use_pdml) {
-          } else {
-            // 4. update unique key when conflict
-            const ObIArray<ObAssignment> &assignments = insert_stmt.get_table_assignments();
-            for (int64_t i = 0; i < assignments.count() && OB_SUCC(ret); i++) {
-              const ObColumnRefRawExpr *col_expr = assignments.at(i).column_expr_;
-              if (OB_ISNULL(col_expr)) {
-                ret = OB_ERR_UNEXPECTED;
-                LOG_WARN("column ref raw expr is null");
-              } else if (col_expr->is_rowkey_column() || col_expr->is_unique_key_column()) {
-                is_use_pdml = false;
-                break;
-              }
+        }
+      }
+      if (OB_FAIL(ret) || !is_use_pdml) {
+      } else if (OB_FAIL(ObOptimizerUtil::get_pdml_insert_dist_columns(
+                  *schema_guard,
+                  *table_schema,
+                  true,
+                  dist_column_ids,
+                  has_logical_uniq_index))) {
+        LOG_WARN("failed to get pdml insert dist columns", K(ret), K(ref_table_id));
+      } else if (dist_column_ids.empty() && has_logical_uniq_index) {
+        is_use_pdml = false;
+      } else {
+        // 3. update rowkey or unique key when conflict.
+        const ObIArray<ObAssignment> &assignments = insert_stmt.get_table_assignments();
+        for (int64_t i = 0; i < assignments.count() && OB_SUCC(ret); i++) {
+          ObColumnRefRawExpr *base_col_expr = assignments.at(i).column_expr_;
+          bool is_identity = false;
+          if (OB_ISNULL(base_col_expr)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("column ref raw expr is null");
+          } else if (OB_FAIL(ObTransformUtils::get_base_column(&insert_stmt,
+                                                               base_col_expr))) {
+            LOG_WARN("failed to get base column", K(ret));
+          } else if (OB_ISNULL(base_col_expr)) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("get unexpected null base column", K(ret));
+          } else if (base_col_expr->is_rowkey_column()
+                     || has_exist_in_array(dist_column_ids,
+                                           base_col_expr->get_column_id())) {
+            // 自赋值检查只用于证明 PDML 安全性，失败时保守回退。
+            const int identity_check_ret =
+                ObOptimizerUtil::check_insert_up_identity_assignment(insert_stmt,
+                                                                     *base_col_expr,
+                                                                     assignments.at(i).expr_,
+                                                                     is_identity);
+            if (OB_SUCCESS != identity_check_ret) {
+              LOG_TRACE("disable pdml insert up because identity assignment check failed",
+                        K(identity_check_ret), K(i));
+            }
+            // 无法完成证明或确定不是自赋值，都不继续使用 PDML。
+            if (OB_SUCCESS != identity_check_ret || !is_identity) {
+              is_use_pdml = false;
+              break;
             }
           }
         }

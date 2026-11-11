@@ -539,7 +539,7 @@ struct ObExchangeInfo
   int64_t server_cnt_;
   common::ObSEArray<common::ObAddr, 4> server_list_;
   bool is_ordered_agg_;
-  // Hidden primary key expression for PDML heap table insert scenario.
+  // Hidden primary key expression for PDML insert scenario.
   // Needs to be passed through exchange but not used for hash calculation.
   ObRawExpr *hidden_pk_expr_;
   // for pkey hash: use scatter channel or use default affinitied channel

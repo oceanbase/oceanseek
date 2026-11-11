@@ -82,7 +82,9 @@ public:
                                             ObIArray<ObRawExpr*> &case_when_exprs);
 
   int compute_hash_dist_exprs_for_pdml_insert(ObExchangeInfo &exch_info,
-                                              const IndexDMLInfo &index_dml_info);
+                                              const IndexDMLInfo &index_dml_info,
+                                              const ObIArray<uint64_t> &dist_column_ids,
+                                              bool need_hidden_pk);
 
   int build_merge_stmt_hash_dist_exprs(const IndexDMLInfo &index_dml_info,
                                        ObIArray<ObRawExpr*> &rowkey_exprs);

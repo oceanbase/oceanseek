@@ -669,7 +669,7 @@ int ObLogExchange::get_op_exprs(ObIArray<ObRawExpr*> &all_exprs)
         } else { /*do nothing*/ }
       }
     }
-    // Add hidden pk expression for PDML heap table insert
+    // PDML insert 的隐藏主键/隐藏 clustering key 随 exchange 传给上层 DML。
     if (OB_SUCC(ret) && nullptr != hidden_pk_expr_ &&
         OB_FAIL(all_exprs.push_back(hidden_pk_expr_))) {
       LOG_WARN("failed to push back hidden pk expr", K(ret));

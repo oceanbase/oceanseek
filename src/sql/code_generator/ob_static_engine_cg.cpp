@@ -4041,6 +4041,7 @@ int ObStaticEngineCG::generate_spec(ObLogInsert &op, ObTableInsertUpSpec &spec, 
     spec.gi_above_ = op.is_gi_above() && !spec.use_dist_das_;
     phy_plan_->set_ignore(op.is_ignore());
     spec.is_pdml_ = op.is_pdml();
+    phy_plan_->set_use_pdml(spec.is_pdml_);
     spec.plan_->set_das_dop(op.get_das_dop());
     spec.das_dop_ = op.get_das_dop();
 
