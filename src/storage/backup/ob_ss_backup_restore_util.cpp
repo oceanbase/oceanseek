@@ -116,11 +116,11 @@ int ObSSBackupRestoreUtil::read_ss_macro_block(const share::ObBackupDest &backup
   char path[length] = {0};
   int64_t buf_size = OB_DEFAULT_MACRO_BLOCK_SIZE;
   ObBackupIoAdapter util;
-  const bool can_retry_with_actual_size = macro_id.is_shared_tablet_sub_meta_in_table();
+  const bool can_retry_with_actual_size = ObSSBackupUtils::need_backup_common_header(macro_id);
   buffer.assign(nullptr, 0, 0);
-  // 恢复路径只组装一次backup_path；先按默认大小读取，避免每次读取前都先get_file_length，减少get_file_length调用次数。
-  // 仅在buffer不足（OB_BUF_NOT_ENOUGH）时，才认为是tiered表数据行太大导致的，获取实际长度后再重试一次；
-  // 其他错误（如对象不存在、权限错误）原样向上返回，不做无谓重试。
+  // Build the backup path once and try the default buffer size to avoid an extra file-length lookup.
+  // Tiered metadata with a backup header may exceed this buffer;
+  // retry once with the actual file size. Propagate other errors without retrying.
   if (OB_FAIL(ObBackupPathUtil::get_backup_set_dir_path(backup_set_dest, backup_path))) {
     LOG_WARN("failed to get backup set dir path", K(ret), K(backup_set_dest));
   } else if (OB_FAIL(ObSSBackupUtils::get_macro_block_relative_path(macro_id, path, length))) {
@@ -131,7 +131,7 @@ int ObSSBackupRestoreUtil::read_ss_macro_block(const share::ObBackupDest &backup
                  backup_set_dest.get_storage_info(), mod, buf_size,
                  allocator, buffer))) {
     if (OB_BUF_NOT_ENOUGH == ret && can_retry_with_actual_size) {
-      // tiered表的子元数据可能超过一个宏块大小，buffer不足时按实际文件长度重试一次。
+      // Read oversized tiered metadata using its actual backup file length.
       int tmp_ret = OB_SUCCESS;
       if (OB_TMP_FAIL(util.get_file_length(backup_path.get_obstr(), backup_set_dest.get_storage_info(), buf_size))) {
         LOG_WARN("failed to get macro block file length", K(tmp_ret), K(backup_path));

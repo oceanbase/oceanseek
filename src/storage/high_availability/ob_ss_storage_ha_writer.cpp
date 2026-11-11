@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 #include "ob_ss_storage_ha_writer.h"
 #include "storage/backup/ob_ss_backup_utils.h"
+#include "storage/lob/store/ob_lob_outtable_io.h"
 
 namespace oceanbase
 {
@@ -102,6 +103,11 @@ int ObCopySSMacroBlockRestoreWriter::process()
         } else {
           LOG_WARN("fail to get next macro block", K(ret));
         }
+      } else if (ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO == macro_block_id.storage_object_type()) {
+        // Preserve the original object ID and exact byte length; LOB data has no SSTable header.
+        if (OB_FAIL(ObLobOutTableIO::write(macro_block_id, ObString(macro_data.length(), macro_data.data())))) {
+          LOG_WARN("failed to restore lob object", K(ret), K(macro_block_id));
+        }
       } else if (!macro_block_id.is_shared_tablet_sub_meta_in_table()
                  && OB_FAIL(check_macro_block_(macro_data))) {
         LOG_WARN("fail to check macro block, fatal error", K(ret), K(macro_data));
@@ -110,7 +116,8 @@ int ObCopySSMacroBlockRestoreWriter::process()
         LOG_WARN("fail to set macro write info", K(ret), K(macro_block_id));
       } else if (OB_FAIL(write_macro_block_(opt, write_info, cur_handle, macro_data))) {
         LOG_WARN("fail to write macro data", K(ret), K(opt), K(macro_block_id));
-      } else {
+      }
+      if (OB_SUCC(ret)) {
         ObTaskController::get().allow_next_syslog();
         ++write_count;
         write_size += macro_data.capacity();

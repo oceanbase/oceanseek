@@ -1363,8 +1363,8 @@ int ObSSBackupUtils::unwrap_backup_common_header(
       ret = OB_INVALID_DATA;
       LOG_WARN("backup common header data_length exceeds buffer size",
                K(ret), K(block_id), K(*header), K(data_buf_size), K(macro_data.length()));
-    } else if (OB_FAIL(header->check_header_checksum())) {
-      LOG_WARN("backup common header checksum error", K(ret), K(block_id), K(*header));
+    } else if (OB_FAIL(header->check_valid())) {
+      LOG_WARN("invalid backup common header", K(ret), K(block_id), K(*header));
     } else if (OB_FAIL(header->check_data_checksum(macro_data.data() + header_size,
                                                      header->data_zlength_))) {
       LOG_WARN("backup common header data checksum error", K(ret), K(block_id), K(*header));

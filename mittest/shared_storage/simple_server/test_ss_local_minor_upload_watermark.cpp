@@ -15,14 +15,27 @@
 #define UNITTEST
 
 #include <cstdlib>
+#include "lib/literals/ob_literals.h"
 
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/access/ob_lob_column_iterator.h"
+#include "storage/backup/ob_ss_backup_utils.h"
+#include "storage/incremental/ssmeta/ob_ss_meta_iter_wrapper.h"
+#include "storage/blocksstable/ob_object_manager.h"
 #include "storage/blocksstable/ob_macro_block_writer.h"
 #include "storage/blocksstable/ob_sstable_private_object_cleaner.h"
 #include "storage/blocksstable/index_block/ob_index_block_builder.h"
 #include "share/inner_table/ob_inner_table_schema.h"
+#include "storage/lob/store/ob_lob_outtable_io.h"
+#include "storage/lob/store/ob_lob_store_common.h"
 #include "storage/lob/store/ob_outtable_lob_control_operator.h"
+#include "storage/high_availability/ob_ss_storage_ha_writer.h"
+#include "storage/shared_storage/ob_file_manager.h"
+#include "storage/shared_storage/ob_remote_io_adapter.h"
+#include "storage/shared_storage/ob_ss_object_access_util.h"
+#include "share/backup/ob_backup_connectivity.h"
+#include "share/backup/ob_backup_io_adapter.h"
+#include "share/scheduler/ob_sys_task_stat.h"
 #include "share/inner_table/user_table/ob_user_table_schema.h"
 #include "share/schema/ob_schema_getter_guard.h"
 #include "share/tablet/ob_tablet_to_ls_operator.h"
@@ -31,7 +44,9 @@
 #include "storage/tablet/ob_tablet_create_delete_helper.h"
 #include "storage/tablet/ob_tablet_create_sstable_param.h"
 #include "storage/tablet/ob_tablet_obj_load_helper.h"
+#include "storage/tablet/ob_tablet_macro_info_iterator.h"
 #include "lib/utility/ob_defer.h"
+#include "lib/restore/ob_object_storage_base.h"
 #include "src/storage/incremental/ob_shared_meta_service.h"
 #include "src/storage/shared_storage/ob_dir_manager.h"
 #include "sensitive_test/object_storage/object_storage_authorization_info.h"
@@ -1005,6 +1020,267 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_columns_real_ctrl_history)
   ASSERT_FALSE(HasFatalFailure());
 }
 
+static void verify_lob_physical_backup_restore(
+    const ObTablet &tablet, const blocksstable::MacroBlockId &object_id,
+    const ObLSID &ls_id, const int64_t object_size)
+{
+  using namespace blocksstable;
+  using namespace share;
+  const uint64_t tenant_id = MTL_ID();
+  ObObjectStorageTenantGuard storage_guard(tenant_id, 60 * 1000 * 1000L);
+  ObArenaAllocator allocator(ObMemAttr(tenant_id, "LobBackupTest"));
+  char *source = static_cast<char *>(allocator.alloc(object_size));
+  ASSERT_NE(nullptr, source);
+  MEMSET(source, 'L', object_size);
+  source[0] = 'A';
+  source[object_size - 1] = 'Z';
+  DEFER({
+    const int cleanup_ret = ObObjectManager::delete_object(object_id, 0 /*ls_epoch*/);
+    EXPECT_TRUE(OB_SUCCESS == cleanup_ret || OB_OBJECT_NOT_EXIST == cleanup_ret);
+  });
+  // Collection uses Meta.byte_len even while the referenced object does not exist.
+  ObSEArray<ObTabletBlockInfo, 1> blocks;
+  ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletMacroIDIterator::collect_lob_blocks_(tablet, blocks));
+  ASSERT_EQ(1, blocks.count()); // Only the OUTTABLE data row supplies an object reference.
+  for (int64_t i = 0; i < blocks.count(); ++i) {
+    ASSERT_EQ(object_id, blocks.at(i).macro_id());
+    ASSERT_EQ(object_size, blocks.at(i).occupy_size());
+  }
+  // The task generator deduplicates candidates; copy this object once.
+  ObSSHAMacroBlockInfo macro_info;
+  macro_info.ls_id_ = ls_id;
+  macro_info.macro_block_id_ = blocks.at(0).macro_id();
+  macro_info.occupy_size_ = blocks.at(0).occupy_size();
+  ObSSHAMacroBlockBatch macro_batch;
+  ASSERT_EQ(OB_SUCCESS, macro_batch.add_one(macro_info));
+
+  ObBackupDest backup_dest;
+  ASSERT_EQ(OB_SUCCESS, backup_dest.set(shared_storage_info));
+  ObBackupSetDesc backup_set_desc;
+  backup_set_desc.backup_set_id_ = 2026102914;
+  backup_set_desc.backup_type_.type_ = ObBackupType::FULL_BACKUP;
+  ObBackupDest backup_set_dest;
+  ASSERT_EQ(OB_SUCCESS, ObBackupPathUtil::construct_backup_set_dest(
+      backup_dest, backup_set_desc, backup_set_dest));
+  const int64_t dest_id = 1;
+  const ObStorageIdMod backup_mod(dest_id, ObStorageUsedMod::STORAGE_USED_BACKUP);
+  ObBackupIOInfo io_info;
+  io_info.max_iops_ = backup_set_dest.get_storage_info()->max_iops_;
+  io_info.max_bandwidth_ = backup_set_dest.get_storage_info()->max_bandwidth_;
+  ASSERT_EQ(OB_SUCCESS, ObBackupStorageInfoOperator::insert_backup_storage_info(
+      *GCTX.sql_proxy_, tenant_id, backup_set_dest, ObBackupDestType::DEST_TYPE_RESTORE_DATA,
+      dest_id, io_info, false /*can_update*/));
+  DEFER({
+    EXPECT_EQ(OB_SUCCESS, ObBackupStorageInfoOperator::remove_backup_storage_info(
+        *GCTX.sql_proxy_, tenant_id, backup_set_dest));
+  });
+  ObDagId dag_id;
+  dag_id.init(GCTX.self_addr());
+  ObSysTaskStat task;
+  task.start_time_ = ObTimeUtility::current_time();
+  task.task_id_ = dag_id;
+  task.task_type_ = SS_HA_MACRO_COPY_TASK;
+  task.tenant_id_ = tenant_id;
+  ASSERT_EQ(OB_SUCCESS, SYS_TASK_STATUS_MGR.add_task(task));
+  DEFER({ EXPECT_EQ(OB_SUCCESS, SYS_TASK_STATUS_MGR.del_task(dag_id)); });
+  ObBackupPath backup_set_dir;
+  ObBackupPath backup_path;
+  ASSERT_EQ(OB_SUCCESS, ObBackupPathUtil::get_backup_set_dir_path(backup_set_dest, backup_set_dir));
+  ASSERT_EQ(OB_SUCCESS, backup::ObSSBackupUtils::get_macro_block_backup_path(
+      object_id, backup_set_dir, backup_path));
+  DEFER({
+    const int cleanup_ret = ObBackupIoAdapter::del_file(
+        backup_path.get_obstr(), backup_set_dest.get_storage_info());
+    EXPECT_TRUE(OB_SUCCESS == cleanup_ret || OB_OBJECT_NOT_EXIST == cleanup_ret);
+  });
+
+  // The scheduling stage handles the wait; copying a missing LOB returns the error directly.
+  ObCopySSMacroBlockBackupReader missing_reader;
+  ASSERT_EQ(OB_SUCCESS, missing_reader.init(backup_dest, backup_set_desc, backup_mod, macro_batch));
+  ObBufferReader missing_data;
+  MacroBlockId missing_id;
+  ASSERT_EQ(OB_OBJECT_NOT_EXIST, missing_reader.get_next_macro_block(allocator, missing_data, missing_id));
+  // This direct object write generates no LOB redo; the Meta SSTable is isolated from the live LS.
+  ASSERT_EQ(OB_SUCCESS, ObLobOutTableIO::write(object_id, ObString(object_size, source)));
+  ObCopySSMacroBlockBackupReader backup_reader;
+  ASSERT_EQ(OB_SUCCESS, backup_reader.init(backup_dest, backup_set_desc, backup_mod, macro_batch));
+  ObCopySSMacroBlockBackupWriter backup_writer;
+  ASSERT_EQ(OB_SUCCESS, backup_writer.init(
+      tenant_id, dag_id, backup_dest, backup_set_desc, backup_mod, &backup_reader));
+  ASSERT_EQ(OB_SUCCESS, backup_writer.process());
+  ASSERT_EQ(object_size, backup_reader.get_data_size());
+  int64_t backup_size = 0;
+  ASSERT_EQ(OB_SUCCESS, ObBackupIoAdapter::get_file_length(
+      backup_path.get_obstr(), backup_set_dest.get_storage_info(), backup_size));
+  ASSERT_EQ(object_size, backup_size);
+  // LOB backup files contain the source bytes directly, without an extra header.
+  char *backup_bytes = static_cast<char *>(allocator.alloc(object_size));
+  ASSERT_NE(nullptr, backup_bytes);
+  int64_t backup_read_size = 0;
+  ASSERT_EQ(OB_SUCCESS, ObBackupIoAdapter::read_single_file(
+      backup_path.get_obstr(), backup_set_dest.get_storage_info(),
+      backup_bytes, object_size, backup_read_size, backup_mod));
+  ASSERT_EQ(object_size, backup_read_size);
+  ASSERT_EQ(0, MEMCMP(source, backup_bytes, object_size));
+
+  // Remove both the source object and its local cache before restoring from the backup file.
+  ASSERT_EQ(OB_SUCCESS, ObObjectManager::delete_object(object_id, 0 /*ls_epoch*/));
+  bool exists = true;
+  ASSERT_EQ(OB_SUCCESS, ObRemoteIoAdapter::is_exist(tenant_id, object_id, GCONF.observer_id, exists));
+  ASSERT_FALSE(exists);
+  ObCopySSMacroBlockRestoreReader restore_reader;
+  ASSERT_EQ(OB_SUCCESS, restore_reader.init(tenant_id, backup_set_dest, macro_batch));
+  ObCopySSMacroBlockRestoreWriter restore_writer;
+  ASSERT_EQ(OB_SUCCESS, restore_writer.init(tenant_id, ls_id, dag_id, &restore_reader));
+  // A full 2 MiB LOB object fits the default restore buffer without an extra header.
+  ASSERT_EQ(OB_SUCCESS, restore_writer.process());
+  ASSERT_EQ(object_size, restore_reader.get_data_size());
+  ASSERT_EQ(OB_SUCCESS, ObRemoteIoAdapter::is_exist(tenant_id, object_id, GCONF.observer_id, exists));
+  ASSERT_TRUE(exists);
+
+  // Read the restored remote bytes directly so an old cache entry cannot satisfy the assertion.
+  ObBaseFileManager *file_manager = nullptr;
+  ASSERT_EQ(OB_SUCCESS, ObSSObjectAccessUtil::get_file_manager(tenant_id, file_manager));
+  ASSERT_NE(nullptr, file_manager);
+  ObBackupDest storage_dest;
+  ASSERT_EQ(OB_SUCCESS, file_manager->get_storage_dest(storage_dest));
+  ObPathContext object_path;
+  ASSERT_EQ(OB_SUCCESS, object_path.set_file_ctx(object_id, 0, false /*is_local_cache*/, GCONF.observer_id));
+  // Check the complete remote file length, including any unexpected trailing padding.
+  int64_t restored_file_size = 0;
+  ASSERT_EQ(OB_SUCCESS, ObBackupIoAdapter::get_file_length(
+      ObString::make_string(object_path.get_path()), storage_dest.get_storage_info(), restored_file_size));
+  ASSERT_EQ(object_size, restored_file_size);
+  char *restored = static_cast<char *>(allocator.alloc(object_size));
+  ASSERT_NE(nullptr, restored);
+  int64_t restored_size = 0;
+  ASSERT_EQ(OB_SUCCESS, ObBackupIoAdapter::read_single_file(
+      ObString::make_string(object_path.get_path()), storage_dest.get_storage_info(),
+      restored, object_size, restored_size, ObStorageIdMod::get_default_id_mod()));
+  ASSERT_EQ(object_size, restored_size);
+  ASSERT_EQ(0, MEMCMP(source, restored, object_size));
+}
+
+TEST_F(ObSSLocalMinorWatermarkTest, lob_ctrl_does_not_collect_objects)
+{
+  using namespace blocksstable;
+  using namespace share::schema;
+  share::ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(OB_SYS_TENANT_ID));
+  ObSchemaGetterGuard guard;
+  const ObTableSchema *control_schema = nullptr;
+  ASSERT_EQ(OB_SUCCESS, GCTX.schema_service_->get_tenant_schema_guard(OB_SYS_TENANT_ID, guard));
+  ASSERT_EQ(OB_SUCCESS, guard.get_table_schema(OB_SYS_TENANT_ID,
+      ObString::make_string("oceanbase"), ObString::make_string(share::OB_ALL_OUTTABLE_LOB_CONTROL_TNAME),
+      false, control_schema));
+  ASSERT_NE(nullptr, control_schema);
+  ObArray<ObTabletID> tablet_ids;
+  ObArray<share::ObLSID> ls_ids;
+  ASSERT_EQ(OB_SUCCESS, control_schema->get_tablet_ids(tablet_ids));
+  ASSERT_EQ(1, tablet_ids.count());
+  ASSERT_EQ(OB_SUCCESS, share::ObTabletToLSTableOperator::batch_get_ls(
+      get_curr_simple_server().get_observer().get_mysql_proxy(), OB_SYS_TENANT_ID, tablet_ids, ls_ids));
+  const ObTabletID tablet_id = tablet_ids.at(0);
+  MacroBlockId object_id;
+  object_id.set_storage_object_type(static_cast<uint64_t>(ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO));
+  object_id.set_location(ObMacroBlockIdLocation::OBJECT_STORAGE);
+  object_id.set_second_id(2026103001);
+  object_id.set_third_id(tablet_id.id());
+  object_id.set_fourth_id(INT64_MAX - 1);
+  object_id.set_fifth_id(0);
+  ASSERT_TRUE(object_id.is_valid());
+
+  ObArenaAllocator allocator("LobCtrlBackup");
+  ObTableSchema table_schema;
+  ASSERT_EQ(OB_SUCCESS, table_schema.assign(*control_schema));
+  table_schema.set_row_store_type(FLAT_ROW_STORE);
+  ASSERT_EQ(OB_SUCCESS, table_schema.set_compress_func_name("none"));
+  ObStorageSchema storage_schema;
+  ASSERT_EQ(OB_SUCCESS, storage_schema.init(allocator, table_schema, lib::Worker::CompatMode::MYSQL));
+  ASSERT_EQ(2, storage_schema.get_rowkey_column_num());
+  ASSERT_EQ(5, storage_schema.get_column_count());
+  ObWholeDataStoreDesc data_desc;
+  share::SCN end_scn;
+  ASSERT_EQ(OB_SUCCESS, end_scn.convert_for_tx(200));
+  ASSERT_EQ(OB_SUCCESS, data_desc.init(false, table_schema, ls_ids.at(0), tablet_id,
+      MINOR_MERGE, 200, DATA_CURRENT_VERSION, false, 0, 0, share::SCN::min_scn(), end_scn,
+      nullptr, 0, EXEC_MODE_LOCAL));
+  ObSSTableIndexBuilder builder(false);
+  data_desc.get_desc().sstable_index_builder_ = &builder;
+  ObWholeDataStoreDesc index_desc;
+  ASSERT_EQ(OB_SUCCESS, index_desc.gen_index_store_desc(data_desc.get_desc()));
+  ASSERT_EQ(OB_SUCCESS, builder.init(index_desc.get_desc()));
+  ObSSTablePrivateObjectCleaner cleaner;
+  ObMacroBlockWriter writer;
+  ObMacroDataSeq sequence(0);
+  sequence.set_data_block();
+  ObMacroSeqParam sequence_param;
+  sequence_param.seq_type_ = ObMacroSeqParam::SEQ_TYPE_INC;
+  sequence_param.start_ = sequence.macro_data_seq_ + 2000;
+  ObPreWarmerParam prewarm(MEM_PRE_WARM);
+  ASSERT_EQ(OB_SUCCESS, writer.open(data_desc.get_desc(), 0, sequence_param, prewarm, cleaner));
+  ObDatumRow input;
+  ASSERT_EQ(OB_SUCCESS, input.init(allocator, 7));
+  char object_buf[128];
+  int64_t object_len = 0;
+  ASSERT_EQ(OB_SUCCESS, object_id.serialize(object_buf, sizeof(object_buf), object_len));
+  const int64_t statuses[] = {OUTTABLE_LOB_CONTROL_DOING, OUTTABLE_LOB_CONTROL_FAIL,
+                            OUTTABLE_LOB_CONTROL_COMPLETE};
+  for (int64_t i = 0; i < 4; ++i) {
+    input.row_flag_.set_flag(i == 3 ? DF_DELETE : DF_INSERT);
+    input.mvcc_row_flag_.reset();
+    input.mvcc_row_flag_.set_first_multi_version_row(true);
+    input.mvcc_row_flag_.set_last_multi_version_row(true);
+    input.mvcc_row_flag_.set_compacted_multi_version_row(true);
+    input.storage_datums_[0].set_string(object_buf, object_len); // macro_id
+    input.storage_datums_[1].set_uint(i); // hash
+    input.storage_datums_[2].set_int(-100); // hidden transaction version
+    input.storage_datums_[3].set_int(0); // hidden SQL sequence
+    if (i == 3) {
+      for (int64_t j = 4; j < 7; ++j) { input.storage_datums_[j].set_nop(); }
+    } else {
+      input.storage_datums_[4].set_int(statuses[i]);
+      input.storage_datums_[5].set_int(100);
+      input.storage_datums_[6].set_null(); // info is unrelated to object collection.
+    }
+    ASSERT_EQ(OB_SUCCESS, writer.append_row(input));
+  }
+  ASSERT_EQ(OB_SUCCESS, writer.close());
+  ObSSTableMergeRes res;
+  ASSERT_EQ(OB_SUCCESS, builder.close(res));
+  ObTabletCreateSSTableParam param;
+  ASSERT_EQ(OB_SUCCESS, param.init_for_empty_major_sstable(tablet_id, storage_schema, 200, -1, false, false));
+  ASSERT_EQ(OB_SUCCESS, param.inner_init_with_merge_res(res));
+  param.nested_size_ = res.nested_size_;
+  param.nested_offset_ = res.nested_offset_;
+  param.max_merged_trans_version_ = res.max_merged_trans_version_;
+  param.min_merged_trans_version_ = res.min_merged_trans_version_;
+  param.table_key_.table_type_ = ObITable::MINOR_SSTABLE;
+  ASSERT_EQ(OB_SUCCESS, param.table_key_.scn_range_.start_scn_.convert_for_tx(1));
+  param.table_key_.scn_range_.end_scn_ = end_scn;
+  param.filled_tx_scn_ = end_scn;
+  param.rec_scn_ = param.table_key_.scn_range_.start_scn_;
+  ObTableHandleV2 file_handle;
+  ASSERT_EQ(OB_SUCCESS, ObTabletCreateDeleteHelper::create_sstable(param, allocator, file_handle));
+  ObTabletTableStore store;
+  ObTablet isolated;
+  DEFER({ isolated.storage_schema_addr_.ptr_ = nullptr; isolated.table_store_addr_.ptr_ = nullptr; });
+  store.is_inited_ = true;
+  isolated.is_inited_ = true;
+  isolated.storage_schema_addr_.ptr_ = &storage_schema;
+  isolated.table_store_addr_.ptr_ = &store;
+  ObSEArray<ObITable *, 1> one_file;
+  ASSERT_EQ(OB_SUCCESS, one_file.push_back(file_handle.get_table()));
+  ASSERT_EQ(OB_SUCCESS, store.minor_tables_.init(allocator, one_file));
+  // Even an existing object recorded in Ctrl is not an additional backup candidate.
+  ObObjectStorageTenantGuard storage_guard(MTL_ID(), 60 * 1000 * 1000L);
+  DEFER({ EXPECT_EQ(OB_SUCCESS, ObObjectManager::delete_object(object_id, 0 /*ls_epoch*/)); });
+  ASSERT_EQ(OB_SUCCESS, ObLobOutTableIO::write(object_id, ObString::make_string("ctrl_only")));
+  ObSEArray<ObTabletBlockInfo, 1> blocks;
+  ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletMacroIDIterator::collect_lob_blocks_(isolated, blocks));
+  ASSERT_TRUE(blocks.empty());
+}
+
 // LOB-COL-M011, M012: independent real-file tests, even if SQL history testing fails.
 TEST_F(ObSSLocalMinorWatermarkTest, lob_columns_meta_file_layouts)
 {
@@ -1026,7 +1302,14 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_columns_meta_file_layouts)
   ASSERT_EQ(OB_SUCCESS, share::ObTabletToLSTableOperator::batch_get_ls(
       get_curr_simple_server().get_observer().get_mysql_proxy(), OB_SYS_TENANT_ID, tablet_ids, ls_ids));
   const ObTabletID tablet_id = tablet_ids.at(0);
-  const MacroBlockId object_a(MacroBlockId::DEFAULT_FIRST_ID, 2026101804, 0, 0, 0);
+  MacroBlockId object_a;
+  object_a.set_storage_object_type(static_cast<uint64_t>(ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO));
+  object_a.set_location(ObMacroBlockIdLocation::OBJECT_STORAGE);
+  object_a.set_second_id(2026101804);
+  object_a.set_third_id(tablet_id.id());
+  object_a.set_fourth_id(INT64_MAX - 1);
+  object_a.set_fifth_id(0);
+  ASSERT_TRUE(object_a.is_valid());
   // M011: write real Meta-layout SSTables with the existing writer. This tests file reading,
   // not SQL LOB allocation or compaction policy. The files are never installed in the live LS.
   const ObRowStoreType layouts[] = {FLAT_ROW_STORE, ENCODING_ROW_STORE};
@@ -1034,7 +1317,10 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_columns_meta_file_layouts)
   for (const auto layout : layouts) {
     for (const auto merge : merges) {
       SCOPED_TRACE(testing::Message() << "Meta layout=" << layout << " merge=" << merge);
-      const auto verify_layout = [&]() {
+      const auto verify_layout = [&](const int64_t object_size) {
+        // Use a fresh LOB object ID for each fixture: deleting files does not clear
+        // the in-memory macro cache or cancel pending cache persistence.
+        object_a.set_fourth_id(object_a.fourth_id() - 1);
         ObArenaAllocator allocator("LobGCFileTest");
         ObTableSchema meta_table_schema;
         ASSERT_EQ(OB_SUCCESS, share::ObInnerTableSchema::all_tenant_profile_aux_lob_meta_schema(meta_table_schema));
@@ -1063,7 +1349,9 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_columns_meta_file_layouts)
         sequence.set_data_block();
         ObMacroSeqParam sequence_param;
         sequence_param.seq_type_ = ObMacroSeqParam::SEQ_TYPE_INC;
-        sequence_param.start_ = sequence.macro_data_seq_ + 1000 + layout * 100 + merge * 10;
+        // Use distinct SSTable object IDs for the two object-size fixtures.
+        sequence_param.start_ = sequence.macro_data_seq_ + 1000 + layout * 100 + merge * 10
+            + (OB_DEFAULT_MACRO_BLOCK_SIZE == object_size ? 0 : 1000);
         ObPreWarmerParam prewarm(MEM_PRE_WARM);
         ASSERT_EQ(OB_SUCCESS, writer.open(data_desc.get_desc(), 0, sequence_param, prewarm, cleaner));
         ObDatumRow input;
@@ -1071,26 +1359,37 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_columns_meta_file_layouts)
         char object_buf[128];
         int64_t object_len = 0;
         ASSERT_EQ(OB_SUCCESS, object_a.serialize(object_buf, sizeof(object_buf), object_len));
-        const int64_t physical_rows = is_minor ? 4 : 3;
+        ObString lob_infos[3];
+        for (int64_t i = 0; i < 3; ++i) {
+          ObLobMetaExtraInfo extra_info;
+          extra_info.extra_info_type_ = i == 2
+              ? ObLobMetaExtraInfo::LOB_META_SUMMARY : ObLobMetaExtraInfo::LOB_DATA;
+          if (i == 1) { extra_info.lob_chunk_type_.set_in_table(); }
+          else { extra_info.lob_chunk_type_.set_out_table(); }
+          ASSERT_EQ(OB_SUCCESS, extra_info.serialize(allocator, lob_infos[i]));
+        }
+        const int64_t physical_rows = is_minor ? 5 : 4;
         for (int64_t i = 0; i < physical_rows; ++i) {
           const bool deletion = is_minor && i == 0;
-          const bool key_a = is_minor ? i < 2 : i == 0;
+          const int64_t data_idx = is_minor ? MAX(0, i - 1) : i;
+          const char *lob_ids[] = {"A", "B", "C", "D"};
           input.row_flag_.set_flag(deletion ? DF_DELETE : DF_INSERT);
           input.mvcc_row_flag_.reset();
           input.mvcc_row_flag_.set_first_multi_version_row(!is_minor || i >= 2);
           input.mvcc_row_flag_.set_last_multi_version_row(!is_minor || i != 0);
           input.mvcc_row_flag_.set_compacted_multi_version_row(true);
           input.storage_datums_[0].set_int(0); // lob_col_idx
-          input.storage_datums_[1].set_string(key_a ? "A" : (i == physical_rows - 1 ? "C" : "B"), 1); // lob_id
+          input.storage_datums_[1].set_string(lob_ids[data_idx], 1); // lob_id
           input.storage_datums_[2].set_string("1", 1); // seq_id
           input.storage_datums_[3].set_int(-100 + i); // hidden transaction version
           input.storage_datums_[4].set_int(0); // hidden SQL sequence
-          input.storage_datums_[5].set_uint(10);
+          input.storage_datums_[5].set_uint(object_size);
           input.storage_datums_[6].set_uint(10);
-          input.storage_datums_[7].set_null();
+          if (data_idx == 3) { input.storage_datums_[7].set_null(); } // Legacy IN_TABLE.
+          else { input.storage_datums_[7].set_string(lob_infos[data_idx]); }
           input.storage_datums_[8].set_string(object_buf, object_len);
-          if (i == physical_rows - 1) { input.storage_datums_[8].set_null(); }
-          else if (!key_a) { input.storage_datums_[8].set_string("", 0); }
+          if (data_idx >= 2) { input.storage_datums_[8].set_null(); }
+          else if (data_idx == 1) { input.storage_datums_[8].set_string("", 0); }
           if (deletion) {
             for (int64_t j = 5; j < 9; ++j) { input.storage_datums_[j].set_nop(); }
           }
@@ -1142,7 +1441,7 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_columns_meta_file_layouts)
           int ret = OB_SUCCESS;
           while (OB_SUCCESS == (ret = meta_iter.get_next_row(output))) {
             ASSERT_EQ(1, output->count_);
-            if (count == 2) {
+            if (count >= 2) {
               ASSERT_TRUE(output->storage_datums_[0].is_null());
             } else if (count == 1) {
               ASSERT_EQ(0, output->storage_datums_[0].len_);
@@ -1155,8 +1454,7 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_columns_meta_file_layouts)
           }
           ASSERT_EQ(OB_ITER_END, ret);
           ASSERT_EQ(nullptr, output);
-          // Preserve binary, empty and NULL; skip the all-NOP DELETE projection.
-          ASSERT_EQ(3, count);
+          ASSERT_EQ(4, count); // Preserve binary, empty and NULL values; skip the absent DELETE value.
         }
         // M012: DELETE keeps the key but has NOP for lob_block_id; reject this partial-NOP row.
         if (is_minor) {
@@ -1169,8 +1467,13 @@ TEST_F(ObSSLocalMinorWatermarkTest, lob_columns_meta_file_layouts)
           ASSERT_EQ(OB_ERR_UNEXPECTED, meta_iter.get_next_row(output));
           ASSERT_EQ(nullptr, output);
         }
+        ASSERT_NO_FATAL_FAILURE(verify_lob_physical_backup_restore(isolated, object_a, ls_ids.at(0), object_size));
       };
-      verify_layout();
+      const int64_t object_sizes[] = {OB_DEFAULT_MACRO_BLOCK_SIZE, 8193};
+      for (const int64_t object_size : object_sizes) {
+        SCOPED_TRACE(testing::Message() << "object_size=" << object_size);
+        verify_layout(object_size);
+      }
     }
   }
 }

@@ -8,12 +8,16 @@
 #include "storage/incremental/ssmeta/ob_ss_meta_iter_wrapper.h"
 #include "storage/incremental/ssmeta/ob_ss_meta_info_util.h"
 #include "lib/utility/utility.h"
+#include "storage/access/ob_lob_column_iterator.h"
 #include "storage/blocksstable/ob_macro_block_id.h"
 #include "storage/blocksstable/ob_sstable.h"
 #include "storage/blocksstable/ob_storage_object_type.h"
 #include "storage/blocksstable/index_block/ob_sstable_meta_info.h"
 #include "storage/incremental/ssmeta/ob_ss_tablet_meta_define.h"
+#include "storage/lob/store/ob_lob_outtable_io.h"
+#include "storage/lob/store/ob_lob_store_common.h"
 #include "storage/meta_mem/ob_meta_obj_struct.h"
+#include "storage/ob_storage_schema.h"
 #include "storage/tablet/ob_tablet.h"
 #include "storage/tablet/ob_table_store_util.h"
 
@@ -1390,16 +1394,16 @@ int ObSSMetaTabletMacroIDIterator::init(
   return ret;
 }
 
-// 路径 b：反序列化 tablet 后，遍历所有 sstable，从每个 sstable 的
-// ObSSTableMacroInfo 中收集 data/other/linked block ID。
-// 需要有效的 MTL 租户上下文（sstable->get_meta() 可能触发共享存储 IO）。
+// Scan all SSTables in the loaded tablet and collect data/other/linked block IDs
+// from each ObSSTableMacroInfo.
+// Requires a valid MTL tenant context; sstable->get_meta() may perform shared storage IO.
 int ObSSMetaTabletMacroIDIterator::collect_blocks_from_sstables_(
-    const ObTabletID &tablet_id,
-    const bool fill_occupy_size,
     ObTablet &tablet,
+    const bool fill_occupy_size,
     ObIArray<ObTabletBlockInfo> &out_blocks)
 {
   int ret = OB_SUCCESS;
+  const ObTabletID tablet_id = tablet.get_tablet_id();
   ObTabletMemberWrapper<ObTabletTableStore> table_store_wrapper;
   ObTableStoreIterator sstable_iter;
   if (OB_FAIL(tablet.fetch_table_store_with_prewarm(table_store_wrapper))) {
@@ -1529,11 +1533,11 @@ int ObSSMetaTabletMacroIDIterator::collect_blocks_from_sstables_(
   return ret;
 }
 
-// 路径 a：直接从 __all_shared_meta 的 meta_value 中解析内联的 ObTabletMacroInfo。
-// 在 v2 持久化路径下，该 macro_info 仅包含 shared_meta 管理块
-// （sstable meta 对象地址、table_store 地址、storage_schema 地址等），
-// 不包含 sstable 内部的数据宏块。不需要额外 IO。
-int ObSSMetaTabletMacroIDIterator::collect_inline_shared_meta_blocks_(
+// Parse ObTabletMacroInfo directly from the meta_value stored in __all_shared_meta.
+// In the v2 persistence path, it only records metadata objects referenced by the tablet
+// (SSTable meta, table store, storage schema, etc.), excluding SSTable data blocks.
+// No additional IO is required.
+int ObSSMetaTabletMacroIDIterator::collect_blocks_from_tablet_macro_info_(
     ObArenaAllocator &allocator,
     const ObString &meta_value,
     ObIArray<ObTabletBlockInfo> &out_blocks)
@@ -1623,13 +1627,13 @@ int ObSSMetaTabletMacroIDIterator::collect_blocks_from_tablet_meta_value(
 {
   int ret = OB_SUCCESS;
 
-  // 路径 a) 收集 inline shared_meta 管理块（sstable 地址、table_store 地址等）
-  if (OB_FAIL(collect_inline_shared_meta_blocks_(allocator, meta_value, out_blocks))) {
-    LOG_WARN("failed to collect inline shared_meta blocks", K(ret));
+  // Collect blocks recorded in ObTabletMacroInfo (SSTable meta, table store, etc.).
+  if (OB_FAIL(collect_blocks_from_tablet_macro_info_(allocator, meta_value, out_blocks))) {
+    LOG_WARN("failed to collect blocks from tablet macro info", K(ret));
   }
 
-  // 路径 b) 反序列化完整 tablet，遍历 sstable 收集数据/元数据宏块。
-  // 失败必须上抛，避免生成"成功但缺块"的不完整结果。
+  // Deserialize the tablet and scan its SSTables for data/metadata blocks.
+  // Propagate errors to avoid returning an incomplete block list as a success.
   if (OB_SUCC(ret)) {
     ObTabletHandle tablet_handle;
     if (OB_FAIL(ObSSMetaInfoUtil::build_tablet_handle(ls_id, tablet_id, reorganize_scn,
@@ -1638,10 +1642,116 @@ int ObSSMetaTabletMacroIDIterator::collect_blocks_from_tablet_meta_value(
     } else if (!tablet_handle.is_valid() || OB_ISNULL(tablet_handle.get_obj())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid tablet handle after deserialize", K(ret), K(ls_id), K(tablet_id));
-    } else if (OB_FAIL(collect_blocks_from_sstables_(tablet_id, fill_occupy_size,
-                   *tablet_handle.get_obj(), out_blocks))) {
+    } else if (OB_FAIL(collect_blocks_from_sstables_(
+                   *tablet_handle.get_obj(), fill_occupy_size, out_blocks))) {
       LOG_WARN("failed to collect blocks from sstables", K(ret), K(ls_id), K(tablet_id));
     }
+  }
+  return ret;
+}
+
+int ObSSMetaTabletMacroIDIterator::collect_lob_blocks_(
+    const ObTablet &tablet, ObIArray<ObTabletBlockInfo> &block_infos)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "BackupLobCols"));
+  ObStorageSchema *schema = nullptr;
+  if (OB_FAIL(tablet.load_storage_schema(allocator, schema))) {
+    LOG_WARN("failed to load backup tablet schema", K(ret));
+  } else if (schema->is_aux_lob_meta_table()) {
+    // Ctrl and Meta SSTable blocks are already collected by collect_blocks_from_sstables_().
+    // Only OUTTABLE data rows in Meta supply additional LOB object references.
+    share::schema::ObColDesc column;
+    column.col_type_.set_varchar();
+    column.col_type_.set_collation_type(CS_TYPE_BINARY);
+    ObSEArray<share::schema::ObColDesc, 3> columns;
+    const uint64_t column_ids[] = {ObLobMetaUtil::LOB_INFO_COL_ID,
+        ObLobMetaUtil::LOB_BLOCK_ID_COL_ID, ObLobMetaUtil::BYTE_LEN_COL_ID};
+    for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(column_ids); ++i) {
+      if (ObLobMetaUtil::BYTE_LEN_COL_ID == column_ids[i]) {
+        column.col_type_.set_uint64();
+      }
+      column.col_id_ = OB_APP_MIN_COLUMN_ID + column_ids[i];
+      if (OB_FAIL(columns.push_back(column))) {
+        LOG_WARN("failed to append lob column", K(ret), K(column));
+      }
+    }
+    ObLobColumnIterator iter;
+    if (OB_FAIL(ret)) {
+      LOG_WARN("failed to prepare backup lob columns", K(ret));
+    } else if (OB_FAIL(iter.init(tablet, columns, false /*skip_uncommitted*/))) {
+      LOG_WARN("failed to initialize lob column iterator", K(ret));
+    } else {
+      ObArenaAllocator row_allocator(ObMemAttr(MTL_ID(), "BackupLobInfo"));
+      const blocksstable::ObDatumRow *row = nullptr;
+      while (OB_SUCC(ret)) {
+        if (OB_FAIL(iter.get_next_row(row))) {
+          if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
+            break;
+          }
+          LOG_WARN("failed to read lob column", K(ret));
+        } else {
+          row_allocator.reuse();
+          const blocksstable::ObStorageDatum &info_datum = row->storage_datums_[0];
+          const blocksstable::ObStorageDatum &datum = row->storage_datums_[1];
+          ObLobMetaExtraInfo extra_info;
+          blocksstable::MacroBlockId macro_id;
+          const blocksstable::ObStorageDatum &size_datum = row->storage_datums_[2];
+          // TODO(xunyuan): Move row-type filtering and object-ID decoding into dedicated Meta/Ctrl iterators,
+          // so callers no longer need to request or parse lob_info.
+          if (info_datum.is_null() && datum.is_null()) {
+            // Legacy IN_TABLE rows have neither extra info nor an object reference.
+          } else if (info_datum.is_null()) {
+            ret = OB_INVALID_DATA;
+            LOG_WARN("missing lob info for object reference", K(ret));
+          } else if (OB_FAIL(extra_info.deserialize(row_allocator, info_datum.get_string()))) {
+            LOG_WARN("failed to deserialize lob info", K(ret));
+          } else if (ObLobMetaExtraInfo::LOB_DATA != extra_info.extra_info_type_
+                     || !extra_info.lob_chunk_type_.out_table()) {
+            // Backup only collects OUTTABLE data references; leave other row types out of validation.
+          } else if (datum.is_null() || datum.get_string().empty()) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("outtable lob data row has no macro id", K(ret));
+          } else if (OB_FAIL(ObLobOutTableIO::deserialize_macro_id(datum.get_string(), macro_id))) {
+            LOG_WARN("invalid lob object reference", K(ret));
+          } else if (OB_UNLIKELY(datum.len_ != macro_id.get_serialize_size())) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("unexpected outtable lob macro id length", K(ret), K(datum.len_), K(macro_id));
+          } else if (OB_FAIL(block_infos.push_back(ObTabletBlockInfo(
+              macro_id, ObTabletMacroType::SHARED_DATA_BLOCK, static_cast<int64_t>(size_datum.get_uint()))))) {
+            LOG_WARN("failed to append lob object", K(ret), K(macro_id));
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObSSMetaTabletMacroIDIterator::collect_backup_blocks_from_tablet_meta_value(
+    ObArenaAllocator &allocator,
+    const ObLSID &ls_id,
+    const ObTabletID &tablet_id,
+    const SCN &reorganize_scn,
+    const ObString &meta_value,
+    ObIArray<ObTabletBlockInfo> &out_blocks)
+{
+  int ret = OB_SUCCESS;
+  ObTabletHandle tablet_handle;
+  if (OB_FAIL(collect_blocks_from_tablet_macro_info_(allocator, meta_value, out_blocks))) {
+    LOG_WARN("failed to collect blocks from tablet macro info", K(ret), K(ls_id), K(tablet_id));
+  } else if (OB_FAIL(ObSSMetaInfoUtil::build_tablet_handle(
+          ls_id, tablet_id, reorganize_scn, meta_value, allocator, tablet_handle))) {
+    LOG_WARN("failed to build tablet handle", K(ret), K(ls_id), K(tablet_id));
+  } else if (!tablet_handle.is_valid() || OB_ISNULL(tablet_handle.get_obj())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid tablet handle after deserialize", K(ret), K(ls_id), K(tablet_id));
+  } else if (OB_FAIL(collect_blocks_from_sstables_(
+          *tablet_handle.get_obj(), true /*fill_occupy_size*/, out_blocks))) {
+    LOG_WARN("failed to collect blocks from sstables", K(ret), K(ls_id), K(tablet_id));
+  } else if (OB_FAIL(collect_lob_blocks_(*tablet_handle.get_obj(), out_blocks))) {
+    LOG_WARN("failed to collect lob objects", K(ret), K(ls_id), K(tablet_id));
   }
   return ret;
 }

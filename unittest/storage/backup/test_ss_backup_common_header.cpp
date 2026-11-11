@@ -188,6 +188,35 @@ TEST_F(TestSSBackupCommonHeader, test_unwrap_corrupted_header)
   ASSERT_EQ(OB_CHECKSUM_ERROR, ret);
 }
 
+// A length change can preserve the header checksum while truncating restored data.
+TEST_F(TestSSBackupCommonHeader, test_unwrap_length_checksum_collision)
+{
+  ObArenaAllocator allocator;
+  MacroBlockId block_id;
+  const int64_t data_len = 1024 * 1024;
+  char *buf = static_cast<char *>(allocator.alloc(data_len));
+  ASSERT_NE(nullptr, buf);
+  MEMSET(buf, 'L', data_len);
+  ObBufferReader macro_data(buf, data_len, data_len);
+  ObBufferReader wrapped_data;
+  ASSERT_EQ(OB_SUCCESS, ObSSBackupUtils::wrap_with_backup_common_header(
+      block_id, macro_data, allocator, wrapped_data));
+
+  const char *wrapped_buf = wrapped_data.data();
+  const int64_t wrapped_len = wrapped_data.length();
+  ObBackupCommonHeader *header = reinterpret_cast<ObBackupCommonHeader *>(
+      const_cast<char *>(wrapped_buf));
+  // 1 MiB and 16 have the same folded header checksum; do not recompute it.
+  header->data_length_ = 16;
+  ASSERT_EQ(data_len, header->data_zlength_);
+  ASSERT_EQ(OB_SUCCESS, header->check_header_checksum());
+  ASSERT_EQ(OB_SUCCESS, header->check_data_checksum(
+      wrapped_buf + sizeof(ObBackupCommonHeader), header->data_zlength_));
+  ASSERT_NE(OB_SUCCESS, ObSSBackupUtils::unwrap_backup_common_header(block_id, wrapped_data));
+  ASSERT_EQ(wrapped_buf, wrapped_data.data());
+  ASSERT_EQ(wrapped_len, wrapped_data.length());
+}
+
 // Test unwrap with corrupted data checksum
 TEST_F(TestSSBackupCommonHeader, test_unwrap_corrupted_data)
 {
@@ -219,6 +248,19 @@ TEST_F(TestSSBackupCommonHeader, test_unwrap_corrupted_data)
 TEST_F(TestSSBackupCommonHeader, test_need_backup_common_header_stub)
 {
   MacroBlockId block_id;
+  ASSERT_FALSE(ObSSBackupUtils::need_backup_common_header(block_id));
+}
+
+TEST_F(TestSSBackupCommonHeader, test_outtable_lob_needs_no_backup_header)
+{
+  MacroBlockId block_id;
+  block_id.set_id_mode(static_cast<uint64_t>(ObMacroBlockIdMode::ID_MODE_SHARE));
+  block_id.set_storage_object_type(static_cast<uint64_t>(ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO));
+  block_id.set_location(ObMacroBlockIdLocation::OBJECT_STORAGE);
+  block_id.set_second_id(1);
+  block_id.set_third_id(1001);
+  block_id.set_fourth_id(2002);
+  ASSERT_TRUE(block_id.is_valid());
   ASSERT_FALSE(ObSSBackupUtils::need_backup_common_header(block_id));
 }
 

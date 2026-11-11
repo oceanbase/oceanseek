@@ -473,12 +473,12 @@ public:
            const ObTabletMacroType target_type = ObTabletMacroType::MAX,
            const bool skip_mark_delete = false);
   int get_next(ObTabletBlockInfo &block_info);
-  // 复用入口：对单个 tablet meta 版本的 raw meta_value 收集宏块（不查 __all_shared_meta）。
-  // 收集 inline shared_meta 管理块 + 反序列化 tablet 后逐 sstable 的数据/元数据宏块。
-  // 收集全量（不按 type 过滤、不跨版本去重），调用方自行过滤/去重。
-  // fill_occupy_size=true 时从 sstable meta 按 data macro 数分摊补 DATA 块 occupy_size。
-  // 路径 b 失败必须上抛，避免生成"成功但缺块"的不完整结果。
-  // 需在有效的 MTL 租户上下文中调用（sstable->get_meta() 可能触发共享存储 IO）。
+  // Collect blocks from a single tablet meta_value without querying __all_shared_meta.
+  // Include blocks recorded in ObTabletMacroInfo and data/metadata blocks from each SSTable.
+  // The caller handles type filtering and deduplication across versions.
+  // When fill_occupy_size is true, populate DATA block occupy_size from SSTable metadata.
+  // Propagate all errors to avoid returning an incomplete block list as a success.
+  // Requires a valid MTL tenant context; sstable->get_meta() may perform shared storage IO.
   static int collect_blocks_from_tablet_meta_value(
       common::ObArenaAllocator &allocator,
       const share::ObLSID &ls_id,
@@ -487,18 +487,34 @@ public:
       const common::ObString &meta_value,
       const bool fill_occupy_size,
       common::ObIArray<ObTabletBlockInfo> &out_blocks);
+  // Collect the backup block list, including OUTTABLE LOB objects referenced by LOB Meta.
+  // Populate occupy_size and hold the same tablet throughout SSTable and LOB collection.
+  // Requires a valid MTL tenant context; the caller handles deduplication.
+  static int collect_backup_blocks_from_tablet_meta_value(
+      common::ObArenaAllocator &allocator,
+      const share::ObLSID &ls_id,
+      const common::ObTabletID &tablet_id,
+      const share::SCN &reorganize_scn,
+      const common::ObString &meta_value,
+      common::ObIArray<ObTabletBlockInfo> &out_blocks);
   INHERIT_TO_STRING_KV("ObSSMetaIterator", ObSSMetaIterator,
                        K_(is_inited), K_(target_type), K_(iter_end), K_(cur_version_idx));
 private:
+  // Append blocks recorded in TabletMeta's ObTabletMacroInfo (SSTable meta, table store, storage schema, etc.).
+  static int collect_blocks_from_tablet_macro_info_(
+      common::ObArenaAllocator &allocator,
+      const common::ObString &meta_value,
+      common::ObIArray<ObTabletBlockInfo> &out_blocks);
+  // Append data/metadata blocks from the loaded tablet's SSTables.
+  // The caller holds the tablet and provides a valid MTL tenant context.
+  static int collect_blocks_from_sstables_(
+      ObTablet &tablet,
+      const bool fill_occupy_size,
+      common::ObIArray<ObTabletBlockInfo> &out_blocks);
+  static int collect_lob_blocks_(const ObTablet &tablet,
+      common::ObIArray<ObTabletBlockInfo> &out_blocks);
   int load_next_version_blocks_();
   int collect_blocks_from_tablet_(const common::ObString &meta_value);
-  static int collect_blocks_from_sstables_(const common::ObTabletID &tablet_id,
-                                           const bool fill_occupy_size,
-                                           ObTablet &tablet,
-                                           common::ObIArray<ObTabletBlockInfo> &out_blocks);
-  static int collect_inline_shared_meta_blocks_(common::ObArenaAllocator &allocator,
-                                                const common::ObString &meta_value,
-                                                common::ObIArray<ObTabletBlockInfo> &out_blocks);
   void reset_current_version_();
 private:
   typedef common::hash::ObHashSet<blocksstable::MacroBlockId,

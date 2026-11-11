@@ -208,7 +208,7 @@ public:
   int64_t get_data_size() const override { return data_size_; }
 private:
   int read_macro_block_(
-      const blocksstable::MacroBlockId &block_id,
+      const ObSSHAMacroBlockInfo &macro_block_info,
       common::ObIAllocator &allocator,
       blocksstable::ObStorageObjectHandle &object_handle);
   int check_macro_block_(

@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE
 #include "storage/high_availability/ob_ss_storage_ha_reader.h"
+#include "lib/literals/ob_literals.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "observer/ob_server_event_history_table_operator.h"
 #include "share/backup/ob_backup_connectivity.h"
@@ -472,7 +473,7 @@ int ObCopySSMacroBlockBackupReader::get_next_macro_block(
         ret = OB_INVALID_DATA;
         LOG_WARN("invalid tiered metadata", K(ret), K(macro_block_id), K(macro_data));
       }
-    } else if (OB_FAIL(read_macro_block_(macro_block_id, allocator, object_handle))) {
+    } else if (OB_FAIL(read_macro_block_(macro_block_info, allocator, object_handle))) {
       LOG_WARN("failed to read macro block", K(ret), K(macro_block_id));
     } else if (OB_FAIL(check_macro_block_(macro_block_id, object_handle))) {
       LOG_WARN("failed to check macro block", K(ret), K(macro_block_id));
@@ -490,21 +491,27 @@ int ObCopySSMacroBlockBackupReader::get_next_macro_block(
 
 //TODO(yanfeng.yyy): use async write to optimize performance
 int ObCopySSMacroBlockBackupReader::read_macro_block_(
-    const blocksstable::MacroBlockId &block_id,
+    const ObSSHAMacroBlockInfo &macro_block_info,
     common::ObIAllocator &allocator,
     blocksstable::ObStorageObjectHandle &object_handle)
 {
   int ret = OB_SUCCESS;
   char *buf = nullptr;
+  const blocksstable::MacroBlockId &block_id = macro_block_info.macro_block_id_;
+  const bool is_lob = ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO == block_id.storage_object_type();
   blocksstable::ObStorageObjectReadInfo read_info;
   read_info.macro_block_id_ = block_id;
   read_info.offset_ = 0;
-  read_info.size_ = OB_DEFAULT_MACRO_BLOCK_SIZE;
+  // LOB tasks carry the exact object length collected before scheduling.
+  read_info.size_ = is_lob ? macro_block_info.occupy_size_ : OB_DEFAULT_MACRO_BLOCK_SIZE;
   read_info.io_desc_.set_wait_event(ObWaitEventIds::OBJECT_STORAGE_READ);
   read_info.io_desc_.set_sys_module_id(ObIOModule::BACKUP_READER_IO);
   read_info.io_timeout_ms_ = std::max(GCONF._data_storage_io_timeout / 1000, DEFAULT_IO_WAIT_TIME_MS);
   read_info.mtl_tenant_id_ = MTL_ID();
-  if (OB_ISNULL(buf = static_cast<char *>(allocator.alloc(read_info.size_)))) {
+  if (OB_UNLIKELY(read_info.size_ <= 0)) {
+    ret = OB_INVALID_DATA;
+    LOG_WARN("invalid lob object size", K(ret), K(block_id), K(read_info));
+  } else if (OB_ISNULL(buf = static_cast<char *>(allocator.alloc(read_info.size_)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to alloc mem for read buf", KR(ret), K_(read_info.size));
   } else if (OB_FALSE_IT(read_info.buf_ = buf)) {
@@ -513,6 +520,9 @@ int ObCopySSMacroBlockBackupReader::read_macro_block_(
   } else if (OB_UNLIKELY(object_handle.get_data_size() <= 0)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("object data size less than 0", K(ret));
+  } else if (is_lob && OB_UNLIKELY(object_handle.get_data_size() != read_info.size_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected lob object data size", K(ret), K(block_id), K(read_info), K(object_handle));
   }
   
   if (OB_FAIL(ret) && OB_NOT_NULL(buf)) {
@@ -527,8 +537,9 @@ int ObCopySSMacroBlockBackupReader::check_macro_block_(
 {
   int ret = OB_SUCCESS;
   blocksstable::ObSSTableMacroBlockChecker checker;
-  if (block_id.is_shared_tablet_sub_meta_in_table()) {
-    // do not use sstable macro block checker
+  if (block_id.is_shared_tablet_sub_meta_in_table()
+      || ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO == block_id.storage_object_type()) {
+    // Tiered metadata and LOB data have no SSTable macro block header.
   } else if (OB_FAIL(checker.check(object_handle.get_buffer(), object_handle.get_data_size()))) {
     LOG_ERROR("failed to check macro block", K(ret), K(block_id), K(object_handle));
   }

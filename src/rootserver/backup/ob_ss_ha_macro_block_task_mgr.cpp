@@ -15,6 +15,7 @@
 #include "rootserver/backup/ob_backup_schedule_task.h"
 #include "share/backup/ob_backup_data_table_operator.h"
 #include "lib/utility/ob_tracepoint.h"
+#include "lib/literals/ob_literals.h"
 #include "observer/ob_server_event_history_table_operator.h"
 
 namespace oceanbase
@@ -209,8 +210,18 @@ int ObSSHAMacroBlockTaskMgr::process_init_stage_()
     LOG_WARN("errsim: backup init stage failed", K(ret));
   } else if (OB_FAIL(init_stage_write_macro_block_list_())) {
     LOG_WARN("failed to write macro block list in init stage", K(ret));
-  } else if (OB_FAIL(init_stage_advance_status_())) {
-    LOG_WARN("failed to advance status in init stage", K(ret));
+  } else {
+    if (task_type_.is_backup()) {
+      // LOB Meta can become visible before its object upload finishes.
+      // Wait 10 seconds once before scheduling copies to give pending uploads time to finish.
+      // Wait after writing the macro block list so a leader change during the wait is
+      // checked by status advancement without writing the list again on the old leader.
+      // TODO(xunyuan): Remove this wait once LOB objects exist before their Meta rows become visible.
+      ob_usleep(10_s);
+    }
+    if (OB_FAIL(init_stage_advance_status_())) {
+      LOG_WARN("failed to advance status in init stage", K(ret));
+    }
   }
 
   if (OB_FAIL(ret) && !ObBackupUtils::is_need_retry_error(ret)) {
