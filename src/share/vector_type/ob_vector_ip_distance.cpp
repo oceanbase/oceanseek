@@ -42,8 +42,12 @@ template<>
 int ObVectorIpDistance<uint8_t>::ip_distance_func(const uint8_t *a, const uint8_t *b, const int64_t len, double &distance)
 {
   int ret = OB_SUCCESS;
+  double sum = 0;
   for (int64_t i = 0; OB_SUCC(ret) && i < len; ++i) {
-    distance += a[i] * b[i];
+    sum += (a[i] * b[i]);
+  }
+  if (OB_SUCC(ret)) {
+    distance = sum;
   }
   return ret;
 }
