@@ -70,11 +70,11 @@
  * 28. empty_async_search_major_carries_scalar_and_nested_meta
  *     验证内联及后建的标量/嵌套 search index，其空 Major 正确保留索引类型、nested 标志和 doc-id 元数据。
  * 29. empty_async_fts_inc_major_copies_match_and_phrase_inv_meta
- *     非空 refresh 后再做空 refresh，验证 MATCH/PHRASE 空 IncMajor 继承正确元数据并具有空文档范围。
+ *     非空 refresh 后再做空 refresh，验证发布水位推进且 MATCH/PHRASE 原有表与元数据保留。
  * 30. empty_async_search_inc_major_copies_scalar_and_nested_meta
- *     非空 refresh 后再做空 refresh，验证标量/嵌套 search index 的空 IncMajor 继承对应元数据。
+ *     非空 refresh 后再做空 refresh，验证发布水位推进且标量/嵌套 search index 元数据保留。
  * 31. zero_postings_async_fts_inc_major_keeps_inv_meta
- *     refresh 只有零倒排项的文档，验证生成的空 IncMajor 仍保留全文索引元数据和空文档范围。
+ *     refresh 只有零倒排项的文档，验证发布水位推进、不安装空 IncMajor，且原有空 Major 元数据保留。
  * 32. async_index_compaction_schedule_and_execute
  *     单索引完整 Medium/Major 流程：选范围、注册 medium、执行 DAG，检查合并后的行内容及宏块复用。
  * 33. async_index_compaction_execute_with_nonempty_delete_index
@@ -95,6 +95,10 @@
  *     执行并行 IncMajor DAG，检查输出行与输入快照一致，并在合并历史中确认存在整宏块复用。
  * 40. async_index_inc_major_merge_execute
  *     单索引执行非空 IncMajor DAG，验证输出版本区间、行数和文档范围，且不错误推进 base Major。
+ * 40a. async_index_commit_replay_before_historical_compaction_link
+ *     commit 回放先安装结果，完成当前 LINK 后再验证旧 LINK；检查同/不同物理键下数据保留及完成水位保护。
+ * 40b. async_index_major_link_rechecks_completed_snapshot
+ *     Major/Medium LINK 在外层检查后落后于新 Major，验证锁内拒绝旧及相同快照，重试不再安装。
  * 41. async_index_inc_major_same_end_scn_logic_ids
  *     两轮 IncMajor 保持相同 end_scn，验证复用与新写块仅靠合并代次区分同号逻辑 ID。
  * 42. async_index_inc_major_compaction_schedule_and_execute
@@ -125,6 +129,14 @@
 #include <memory>
 #include "test_async_index_compaction_common.h"
 #include "storage/compaction_v2/ob_ss_major_merge_ctx.h"
+#include "observer/report/ob_tablet_table_updater.h"
+#include "storage/compaction_v2/ob_ss_link_inc_major_task.h"
+#include "storage/compaction_v2/ob_ss_link_major_task.h"
+#include "storage/incremental/ob_shared_meta_service.h"
+#include "storage/async_index/ob_async_index_segment_group.h"
+#include "storage/ddl/ob_ddl_replay_executor.h"
+#include "storage/ddl/ob_inc_ddl_merge_task_utils.h"
+#include "storage/ddl/ob_inc_ddl_merge_helper.h"
 #include "storage/async_index/ob_async_index_trigger.h"
 #include "storage/async_index/ob_async_index_retention_helper.h"
 #include "rootserver/freeze/ob_major_merge_progress_checker.h"
@@ -504,6 +516,41 @@ void ObAsyncIndexCompactionTest::resolve_search_index_tablet_ctx(
   LOG_INFO("resolve async search data tablet", K(table_name), K(ls_id), K(tablet_id));
 }
 
+// These fixtures install committed tables directly. Publish their logical
+// refresh watermarks explicitly before asking the production scheduling policy.
+void publish_mock_async_index_inputs(
+    ObAsyncIndexCompactionTest &test,
+    const MultiAsyncIndexTabletCtx &ctx,
+    ObLSHandle &ls_handle)
+{
+  int64_t common_snapshot = INT64_MAX;
+  for (int64_t i = 0; i < ctx.fts_index_tablet_ids_.count(); ++i) {
+    ObTabletHandle handle;
+    int64_t physical_snapshot = 0;
+    ASSERT_EQ(OB_SUCCESS, test.get_tablet_handle(ctx.ls_id_, ctx.fts_index_tablet_ids_.at(i), handle));
+    ASSERT_EQ(OB_SUCCESS, handle.get_obj()->get_async_index_max_published_version(physical_snapshot));
+    ASSERT_GT(physical_snapshot, 0);
+    ASSERT_EQ(OB_SUCCESS, test.publish_async_index_version(
+        ls_handle, ctx.fts_index_tablet_ids_.at(i), physical_snapshot));
+    common_snapshot = MIN(common_snapshot, physical_snapshot);
+  }
+  ASSERT_LT(common_snapshot, INT64_MAX);
+  ObTabletHandle delete_handle;
+  int64_t delete_physical = 0;
+  ASSERT_EQ(OB_SUCCESS, test.get_tablet_handle(ctx.ls_id_, ctx.delete_index_tablet_id_, delete_handle));
+  ASSERT_EQ(OB_SUCCESS, delete_handle.get_obj()->get_async_index_max_published_version(delete_physical));
+  if (delete_physical < common_snapshot) {
+    ASSERT_EQ(OB_SUCCESS, test.add_empty_data_major_to_tablet(
+        ls_handle, ctx.delete_index_tablet_id_, common_snapshot));
+  }
+  ASSERT_EQ(OB_SUCCESS, test.publish_async_index_version(
+      ls_handle, ctx.delete_index_tablet_id_, common_snapshot));
+  int64_t actual_common = 0;
+  ASSERT_EQ(OB_SUCCESS, test.calc_common_published_snapshot(*ls_handle.get_ls(),
+      ctx.fts_index_tablet_ids_, ctx.delete_index_tablet_id_, actual_common));
+  ASSERT_EQ(common_snapshot, actual_common);
+}
+
 void ObAsyncIndexCompactionTest::prepare_async_index_merge_candidate(
     MultiAsyncIndexTabletCtx &ctx,
     ObLSHandle &ls_handle,
@@ -531,7 +578,7 @@ void ObAsyncIndexCompactionTest::prepare_async_index_merge_candidate(
   ASSERT_EQ(1, index_tablet_ids.count());
   ASSERT_EQ(fts_index_tablet_id, index_tablet_ids.at(0));
   ASSERT_EQ(ctx.delete_index_tablet_id_, delete_index_tablet_id);
-  ASSERT_NO_FATAL_FAILURE(prepare_delete_index_publish_for_merge(ctx, ls_handle));
+  ASSERT_NO_FATAL_FAILURE(publish_mock_async_index_inputs(*this, ctx, ls_handle));
   ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicy::choose_async_index_merge_range(
       *ls_handle.get_ls(), *data_tablet_handle.get_obj(), index_tablet_ids,
       delete_index_tablet_id, ObAdaptiveMergePolicy::NONE, async_index_params, merge_version_range));
@@ -825,6 +872,59 @@ int ObAsyncIndexCompactionTest::wait_inv_inc_major_meta_since_min_start(
   return ret;
 }
 
+// Empty refresh is a publication event: it must advance the committed logical
+// watermark without installing an empty SSTable or replacing existing inputs.
+void verify_empty_refresh_publication(
+    ObAsyncIndexCompactionTest &test,
+    const char *table_name,
+    const ObLSID &ls_id,
+    const ObTabletID &tablet_id)
+{
+  ObTabletHandle before;
+  ObTabletMemberWrapper<ObTabletTableStore> before_store;
+  ASSERT_EQ(OB_SUCCESS, test.get_tablet_handle(ls_id, tablet_id, before));
+  ASSERT_EQ(OB_SUCCESS, before.get_obj()->fetch_table_store(before_store));
+  const ObSSTableArray &before_tables = before_store.get_member()->get_inc_major_sstables();
+  int64_t physical_snapshot = 0;
+  ASSERT_EQ(OB_SUCCESS, before.get_obj()->get_async_index_max_published_version(physical_snapshot));
+  int64_t previous_published = 0;
+  const int64_t initial_deadline = ObTimeUtility::current_time() + 30L * 1000 * 1000;
+  do {
+    ASSERT_EQ(OB_SUCCESS, before.get_obj()->get_latest_async_index_published_version(previous_published));
+    if (before_tables.count() > 0 && previous_published < physical_snapshot) {
+      ob_usleep(10 * 1000);
+    } else {
+      break;
+    }
+  } while (ObTimeUtility::current_time() < initial_deadline);
+  if (before_tables.count() > 0) {
+    ASSERT_GE(previous_published, physical_snapshot);
+  }
+  ObSqlString sql;
+  ASSERT_EQ(OB_SUCCESS, sql.assign_fmt("call dbms_async_index.refresh('%s')", table_name));
+  ASSERT_EQ(OB_SUCCESS, exe_sql(sql.ptr()));
+  ObTabletHandle after;
+  int64_t published = previous_published;
+  const int64_t deadline = ObTimeUtility::current_time() + 30L * 1000 * 1000;
+  while (published <= previous_published && ObTimeUtility::current_time() < deadline) {
+    ASSERT_EQ(OB_SUCCESS, test.get_tablet_handle(ls_id, tablet_id, after));
+    ASSERT_EQ(OB_SUCCESS, after.get_obj()->get_latest_async_index_published_version(published));
+    if (published <= previous_published) {
+      ob_usleep(10 * 1000);
+    }
+  }
+  ASSERT_GT(published, previous_published);
+  ObTabletMemberWrapper<ObTabletTableStore> after_store;
+  ASSERT_EQ(OB_SUCCESS, after.get_obj()->fetch_table_store(after_store));
+  const ObSSTableArray &after_tables = after_store.get_member()->get_inc_major_sstables();
+  ASSERT_EQ(before_tables.count(), after_tables.count());
+  for (int64_t i = 0; i < before_tables.count(); ++i) {
+    ASSERT_EQ(before_tables.at(i)->get_key(), after_tables.at(i)->get_key());
+  }
+  ASSERT_EQ(before.get_obj()->get_last_major_snapshot_version(), after.get_obj()->get_last_major_snapshot_version());
+  ASSERT_EQ(before.get_obj()->get_last_inc_major_snapshot_version(), after.get_obj()->get_last_inc_major_snapshot_version());
+}
+
 void ObAsyncIndexCompactionTest::verify_empty_fts_inc_copies_inv_meta(
     const char *table_name, const bool has_position_list)
 {
@@ -832,9 +932,9 @@ void ObAsyncIndexCompactionTest::verify_empty_fts_inc_copies_inv_meta(
   ObSqlString insert_sql;
   ObSqlString refresh_sql;
   ObInvSSTableMeta nonempty_inv_meta;
-  ObInvSSTableMeta empty_inv_meta;
+  ObInvSSTableMeta retained_inv_meta;
   SCN nonempty_end_scn;
-  SCN empty_end_scn;
+  SCN retained_end_scn;
   ObObjMeta expected_doc_meta;
   expected_doc_meta.set_uint64();
 
@@ -849,26 +949,27 @@ void ObAsyncIndexCompactionTest::verify_empty_fts_inc_copies_inv_meta(
       nonempty_inv_meta, nonempty_end_scn));
   ASSERT_GT(nonempty_inv_meta.get_stats().total_doc_length_, 0);
 
-  OK(exe_sql(refresh_sql.ptr()));
-  OK(wait_inv_inc_major_meta_since_min_start(
-      ctx.ls_id_, ctx.fts_index_tablet_ids_.at(0), true/*expect_empty*/,
-      nonempty_end_scn, empty_inv_meta, empty_end_scn));
-  ASSERT_TRUE(empty_end_scn > nonempty_end_scn);
-  ASSERT_TRUE(empty_inv_meta.is_valid());
-  ASSERT_EQ(INV_IDX_TYPE_FTS, empty_inv_meta.get_stats().index_type_);
-  ASSERT_TRUE(empty_inv_meta.get_stats().has_relevance_params_);
-  ASSERT_EQ(has_position_list, empty_inv_meta.get_stats().has_position_list_);
-  ASSERT_FALSE(empty_inv_meta.get_stats().has_nested_key_);
-  ASSERT_EQ(expected_doc_meta, empty_inv_meta.get_stats().doc_id_obj_meta_);
-  ASSERT_EQ(nonempty_inv_meta.get_stats().index_type_, empty_inv_meta.get_stats().index_type_);
-  ASSERT_EQ(nonempty_inv_meta.get_stats().has_relevance_params_, empty_inv_meta.get_stats().has_relevance_params_);
-  ASSERT_EQ(nonempty_inv_meta.get_stats().has_position_list_, empty_inv_meta.get_stats().has_position_list_);
-  ASSERT_EQ(nonempty_inv_meta.get_stats().has_nested_key_, empty_inv_meta.get_stats().has_nested_key_);
-  ASSERT_EQ(nonempty_inv_meta.get_stats().doc_id_obj_meta_, empty_inv_meta.get_stats().doc_id_obj_meta_);
-  ASSERT_TRUE(empty_inv_meta.get_stats().is_empty_range());
-  ASSERT_EQ(UINT64_MAX, empty_inv_meta.get_stats().min_doc_id_);
-  ASSERT_EQ(0, empty_inv_meta.get_stats().max_doc_id_);
-  ASSERT_EQ(0, empty_inv_meta.get_stats().total_doc_length_);
+  ASSERT_NO_FATAL_FAILURE(verify_empty_refresh_publication(*this, table_name,
+      ctx.ls_id_, ctx.fts_index_tablet_ids_.at(0)));
+  bool found = false;
+  ASSERT_EQ(OB_SUCCESS, find_inv_inc_major_meta(
+      ctx.ls_id_, ctx.fts_index_tablet_ids_.at(0), false /*expect_empty*/, retained_inv_meta, retained_end_scn, found));
+  ASSERT_TRUE(found);
+  ASSERT_EQ(nonempty_end_scn, retained_end_scn);
+  ASSERT_TRUE(retained_inv_meta.is_valid());
+  ASSERT_EQ(INV_IDX_TYPE_FTS, retained_inv_meta.get_stats().index_type_);
+  ASSERT_TRUE(retained_inv_meta.get_stats().has_relevance_params_);
+  ASSERT_EQ(has_position_list, retained_inv_meta.get_stats().has_position_list_);
+  ASSERT_FALSE(retained_inv_meta.get_stats().has_nested_key_);
+  ASSERT_EQ(expected_doc_meta, retained_inv_meta.get_stats().doc_id_obj_meta_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().index_type_, retained_inv_meta.get_stats().index_type_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().has_relevance_params_, retained_inv_meta.get_stats().has_relevance_params_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().has_position_list_, retained_inv_meta.get_stats().has_position_list_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().has_nested_key_, retained_inv_meta.get_stats().has_nested_key_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().doc_id_obj_meta_, retained_inv_meta.get_stats().doc_id_obj_meta_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().min_doc_id_, retained_inv_meta.get_stats().min_doc_id_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().max_doc_id_, retained_inv_meta.get_stats().max_doc_id_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().total_doc_length_, retained_inv_meta.get_stats().total_doc_length_);
 }
 
 void ObAsyncIndexCompactionTest::verify_empty_search_inc_copies_inv_meta(
@@ -879,9 +980,9 @@ void ObAsyncIndexCompactionTest::verify_empty_search_inc_copies_inv_meta(
   ObSqlString insert_sql;
   ObSqlString refresh_sql;
   ObInvSSTableMeta nonempty_inv_meta;
-  ObInvSSTableMeta empty_inv_meta;
+  ObInvSSTableMeta retained_inv_meta;
   SCN nonempty_end_scn;
-  SCN empty_end_scn;
+  SCN retained_end_scn;
   ObObjMeta expected_doc_meta;
   expected_doc_meta.set_uint64();
   resolve_search_index_tablet_ctx(table_name, ls_id, tablet_id);
@@ -899,26 +1000,27 @@ void ObAsyncIndexCompactionTest::verify_empty_search_inc_copies_inv_meta(
   OK(wait_inv_inc_major_meta(
       ls_id, tablet_id, false/*expect_empty*/, nonempty_inv_meta, nonempty_end_scn));
 
-  OK(exe_sql(refresh_sql.ptr()));
-  OK(wait_inv_inc_major_meta_since_min_start(
-      ls_id, tablet_id, true/*expect_empty*/, nonempty_end_scn,
-      empty_inv_meta, empty_end_scn));
-  ASSERT_TRUE(empty_end_scn > nonempty_end_scn);
-  ASSERT_TRUE(empty_inv_meta.is_valid());
-  ASSERT_EQ(INV_IDX_TYPE_SEARCH, empty_inv_meta.get_stats().index_type_);
-  ASSERT_FALSE(empty_inv_meta.get_stats().has_relevance_params_);
-  ASSERT_FALSE(empty_inv_meta.get_stats().has_position_list_);
-  ASSERT_EQ(has_nested_key, empty_inv_meta.get_stats().has_nested_key_);
-  ASSERT_EQ(expected_doc_meta, empty_inv_meta.get_stats().doc_id_obj_meta_);
-  ASSERT_EQ(nonempty_inv_meta.get_stats().index_type_, empty_inv_meta.get_stats().index_type_);
-  ASSERT_EQ(nonempty_inv_meta.get_stats().has_relevance_params_, empty_inv_meta.get_stats().has_relevance_params_);
-  ASSERT_EQ(nonempty_inv_meta.get_stats().has_position_list_, empty_inv_meta.get_stats().has_position_list_);
-  ASSERT_EQ(nonempty_inv_meta.get_stats().has_nested_key_, empty_inv_meta.get_stats().has_nested_key_);
-  ASSERT_EQ(nonempty_inv_meta.get_stats().doc_id_obj_meta_, empty_inv_meta.get_stats().doc_id_obj_meta_);
-  ASSERT_TRUE(empty_inv_meta.get_stats().is_empty_range());
-  ASSERT_EQ(UINT64_MAX, empty_inv_meta.get_stats().min_doc_id_);
-  ASSERT_EQ(0, empty_inv_meta.get_stats().max_doc_id_);
-  ASSERT_EQ(0, empty_inv_meta.get_stats().total_doc_length_);
+  ASSERT_NO_FATAL_FAILURE(verify_empty_refresh_publication(*this, table_name,
+      ls_id, tablet_id));
+  bool found = false;
+  ASSERT_EQ(OB_SUCCESS, find_inv_inc_major_meta(
+      ls_id, tablet_id, false /*expect_empty*/, retained_inv_meta, retained_end_scn, found));
+  ASSERT_TRUE(found);
+  ASSERT_EQ(nonempty_end_scn, retained_end_scn);
+  ASSERT_TRUE(retained_inv_meta.is_valid());
+  ASSERT_EQ(INV_IDX_TYPE_SEARCH, retained_inv_meta.get_stats().index_type_);
+  ASSERT_FALSE(retained_inv_meta.get_stats().has_relevance_params_);
+  ASSERT_FALSE(retained_inv_meta.get_stats().has_position_list_);
+  ASSERT_EQ(has_nested_key, retained_inv_meta.get_stats().has_nested_key_);
+  ASSERT_EQ(expected_doc_meta, retained_inv_meta.get_stats().doc_id_obj_meta_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().index_type_, retained_inv_meta.get_stats().index_type_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().has_relevance_params_, retained_inv_meta.get_stats().has_relevance_params_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().has_position_list_, retained_inv_meta.get_stats().has_position_list_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().has_nested_key_, retained_inv_meta.get_stats().has_nested_key_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().doc_id_obj_meta_, retained_inv_meta.get_stats().doc_id_obj_meta_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().min_doc_id_, retained_inv_meta.get_stats().min_doc_id_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().max_doc_id_, retained_inv_meta.get_stats().max_doc_id_);
+  ASSERT_EQ(nonempty_inv_meta.get_stats().total_doc_length_, retained_inv_meta.get_stats().total_doc_length_);
 }
 
 int ObAsyncIndexCompactionTest::wait_ls_weak_read_ts(ObLS &ls, const int64_t target_ts_ns)
@@ -1023,7 +1125,7 @@ int ObAsyncIndexCompactionTest::add_delete_inc_major_to_tablet(
       LOG_WARN("failed to convert delete inc major commit version", KR(ret),
           K(tablet_id), K(commit_version));
     } else {
-      compaction::ObUncommitTxDesc tx_desc(100, 200);
+      compaction::ObUncommitTxDesc tx_desc(100, transaction::ObTxSEQ(200, 0).cast_to_int());
       create_param.uncommit_tx_info_.reuse();
       if (OB_FAIL(create_param.uncommit_tx_info_.push_back(tx_desc))) {
         LOG_WARN("failed to push uncommit tx desc", KR(ret));
@@ -1179,12 +1281,7 @@ void ObAsyncIndexCompactionTest::run_build_async_index_medium_info_with_merge_ta
   ASSERT_EQ(OB_SUCCESS, ObMediumCompactionScheduleFunc::get_async_index_tablet_ids(
       *data_handle.get_obj(), index_tablet_ids, delete_index_tablet_id, async_index_params));
 
-  // Installing mock SSTables does not advance the committed refresh watermark.
-  const int64_t published_snapshot = mock_major_snapshot + DEFAULT_INC_MAJOR_CNT * DEFAULT_INC_MAJOR_STEP;
-  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(ls_handle, fts_tablet_id, published_snapshot));
-  ASSERT_NO_FATAL_FAILURE(prepare_delete_index_publish_for_merge(ctx, ls_handle));
-  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
-      ls_handle, ctx.delete_index_tablet_id_, published_snapshot));
+  ASSERT_NO_FATAL_FAILURE(publish_mock_async_index_inputs(*this, ctx, ls_handle));
 
   int64_t common_published_snapshot = 0;
   ASSERT_EQ(OB_SUCCESS, calc_common_published_snapshot(
@@ -1398,7 +1495,7 @@ int ObAsyncIndexCompactionTest::build_inv_sstable_param_for_merge(
       param.occupy_size_ = MAX(occupy_size, 1L);
       param.original_size_ = param.occupy_size_;
       param.rec_scn_ = SCN::plus(param.table_key_.get_start_scn(), 1);
-      compaction::ObUncommitTxDesc tx_desc(100, 200);
+      compaction::ObUncommitTxDesc tx_desc(100, transaction::ObTxSEQ(200, 0).cast_to_int());
       param.uncommit_tx_info_.reuse();
       if (OB_FAIL(param.uncommit_tx_info_.push_back(tx_desc))) {
         LOG_WARN("failed to push uncommit tx desc", KR(ret));
@@ -1480,12 +1577,11 @@ int ObAsyncIndexCompactionTest::add_empty_inv_inc_major_to_tablet(
               tablet_handle.get_obj()->get_tablet_meta().transfer_info_.transfer_seq_, true)))) {
         LOG_WARN("failed to init ha info", KR(ret), K(tablet_id));
       } else if (OB_FAIL(param.init_with_compaction_info(ObCompactionTableStoreParam(
-                        ObMergeType::INC_MAJOR_MERGE, sstable->get_end_scn(), false,
+                        ObMergeType::MAJOR_MERGE, sstable->get_end_scn(), false,
                         tablet_handle.get_obj()->has_merged_with_mds_info())))) {
         LOG_WARN("failed to init compaction info", KR(ret), K(tablet_id));
       } else {
-        // init_with_compaction_info() 为 INC_MAJOR_MERGE 设置 COMPACTION；但该辅助函数
-        // 直接安装预构造的已提交表，没有对应的 Compaction 输入，因此改为 LINK。
+        // Install a refresh input without advancing completed IncMajor progress.
         param.inc_major_sstable_action_ = ObIncMajorSSTableAction::LINK;
         if (OB_FAIL(ls->update_tablet_table_store(tablet_id, param, new_tablet_handle))) {
           LOG_WARN("failed to update tablet table store", KR(ret), K(tablet_id));
@@ -1557,7 +1653,7 @@ int ObAsyncIndexCompactionTest::build_non_empty_inv_sstable_param_for_merge(
       param.occupy_size_ = MAX(res.occupy_size_, 1L);
       param.original_size_ = param.occupy_size_;
       param.rec_scn_ = SCN::plus(param.table_key_.get_start_scn(), 1);
-      compaction::ObUncommitTxDesc tx_desc(100, 200);
+      compaction::ObUncommitTxDesc tx_desc(100, transaction::ObTxSEQ(200, 0).cast_to_int());
       param.uncommit_tx_info_.reuse();
       if (OB_FAIL(param.uncommit_tx_info_.push_back(tx_desc))) {
         LOG_WARN("failed to push uncommit tx desc", KR(ret));
@@ -1608,12 +1704,8 @@ int ObAsyncIndexCompactionTest::add_non_empty_inv_sstable_to_tablet(
   } else if (OB_FAIL(create_inv_sstable_from_param(create_param, table_handle, sstable))) {
     LOG_WARN("failed to create non-empty inv sstable", KR(ret), K(tablet_id), K(merge_type));
   } else {
-    const ObMergeType compaction_merge_type = is_inc_major_merge(merge_type)
-        ? ObMergeType::INC_MAJOR_MERGE
-        : ObMergeType::MAJOR_MERGE;
-    update_param.snapshot_version_ = is_inc_major_merge(merge_type)
-        ? snapshot_version
-        : tablet_handle.get_obj()->get_snapshot_version();
+    // Match compaction LINK: the update carries the installed table's target snapshot.
+    update_param.snapshot_version_ = snapshot_version;
     update_param.multi_version_start_ = tablet_handle.get_obj()->get_multi_version_start();
     update_param.storage_schema_ = schema_on_tablet;
     update_param.rebuild_seq_ = ls->get_rebuild_seq();
@@ -1624,12 +1716,12 @@ int ObAsyncIndexCompactionTest::add_non_empty_inv_sstable_to_tablet(
             tablet_handle.get_obj()->get_tablet_meta().transfer_info_.transfer_seq_, true)))) {
       LOG_WARN("failed to init ha info", KR(ret), K(tablet_id));
     } else if (OB_FAIL(update_param.init_with_compaction_info(ObCompactionTableStoreParam(
-                      compaction_merge_type, sstable->get_end_scn(), false,
+                      ObMergeType::MAJOR_MERGE, sstable->get_end_scn(), false,
                       tablet_handle.get_obj()->has_merged_with_mds_info())))) {
       LOG_WARN("failed to init compaction info", KR(ret), K(tablet_id));
     } else {
       if (is_inc_major_merge(merge_type)) {
-        // 该辅助函数安装预构造的 Inc Major，不是提交 Table Store 中已有的表。
+        // Installing a prepared input must not mark its compaction complete.
         update_param.inc_major_sstable_action_ = ObIncMajorSSTableAction::LINK;
       }
       if (OB_FAIL(ls->update_tablet_table_store(tablet_id, update_param, new_tablet_handle))) {
@@ -2269,6 +2361,10 @@ void ObAsyncIndexCompactionTest::run_scalar_tablets_keep_async_published_snapsho
 
   ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(
       ls_handle, ctx.fts_index_tablet_ids_.at(0), published_snapshot));
+  // Checkpoint maintenance still runs while refresh execution is disabled.
+  // Publish the installed inputs so it cannot reinsert the old publication
+  // floor ahead of the checkpoint whose GC protection this test verifies.
+  ASSERT_NO_FATAL_FAILURE(publish_mock_async_index_inputs(*this, ctx, ls_handle));
 
   ObTabletAsyncIndexRefreshInfo refresh_info;
   refresh_info.set_has_async_index(true);
@@ -2422,7 +2518,7 @@ void ObAsyncIndexCompactionTest::run_async_index_compaction_execute(
   ASSERT_EQ(fts_index_cnt, index_tablet_ids.count());
   ASSERT_EQ(ctx.delete_index_tablet_id_, delete_index_tablet_id);
 
-  ASSERT_NO_FATAL_FAILURE(prepare_delete_index_publish_for_merge(ctx, ls_handle));
+  ASSERT_NO_FATAL_FAILURE(publish_mock_async_index_inputs(*this, ctx, ls_handle));
 
   int64_t common_published_snapshot = 0;
   ASSERT_EQ(OB_SUCCESS, calc_common_published_snapshot(
@@ -2876,8 +2972,7 @@ void ObAsyncIndexCompactionTest::run_async_index_inc_major_compaction_schedule_a
       ls_handle, delete_index_tablet_id,
       calc_schedule_snapshot_version(mock_major_snapshot),
       0 /*row_count*/, INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL));
-  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
-      ls_handle, delete_index_tablet_id, calc_schedule_snapshot_version(mock_major_snapshot)));
+  ASSERT_NO_FATAL_FAILURE(publish_mock_async_index_inputs(*this, ctx, ls_handle));
 
   ObNewVersionRange merge_version_range;
   ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicy::choose_async_index_merge_range(
@@ -3189,12 +3284,16 @@ void ObAsyncIndexCompactionTest::schedule_and_execute_medium_major_merge(
   ASSERT_EQ(fts_index_cnt, index_tablet_ids.count());
   ASSERT_EQ(ctx.delete_index_tablet_id_, delete_index_tablet_id);
 
+  ASSERT_NO_FATAL_FAILURE(publish_mock_async_index_inputs(*this, ctx, ls_handle));
   int64_t ordinary_published_snapshot = 0;
   ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicyHelper::calc_schedule_snapshot_version(
       *ls_handle.get_ls(), index_tablet_ids, ordinary_published_snapshot));
-  ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(
-      ls_handle, delete_index_tablet_id, ordinary_published_snapshot,
-      0 /*row_count*/, INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL));
+  // Publication already installed the deletion Major needed by this round.
+  ObTabletHandle delete_tablet_handle;
+  ASSERT_EQ(OB_SUCCESS, get_tablet_handle(
+      ctx.ls_id_, delete_index_tablet_id, delete_tablet_handle));
+  ASSERT_GE(delete_tablet_handle.get_obj()->get_last_major_snapshot_version(),
+      ordinary_published_snapshot);
 
   ObNewVersionRange merge_version_range;
   ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicy::choose_async_index_merge_range(
@@ -3241,6 +3340,41 @@ void ObAsyncIndexCompactionTest::schedule_and_execute_medium_major_merge(
     ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(fts_index_tablet_id, reload_fts_handle));
     ASSERT_EQ(merge_version_range.snapshot_version_,
               reload_fts_handle.get_obj()->get_last_major_snapshot_version());
+
+    // A finished DAG still needs replica/checksum reporting and medium-checker
+    // confirmation before another round can be scheduled. The checker drops
+    // unfinished items; normally MediumLoop reports/re-enqueues them. Drive that
+    // protocol explicitly here while background major scheduling is paused.
+    observer::ObTabletTableUpdater *updater = MTL(observer::ObTabletTableUpdater *);
+    ObTenantMediumChecker *checker = MTL(ObTenantMediumChecker *);
+    ASSERT_NE(nullptr, updater);
+    ASSERT_NE(nullptr, checker);
+    ObSEArray<observer::ObTabletTableUpdateTask, 1> report_tasks;
+    ASSERT_EQ(OB_SUCCESS, report_tasks.push_back(observer::ObTabletTableUpdateTask(
+        ctx.ls_id_, fts_index_tablet_id, ObTimeUtility::current_time())));
+    bool stopped = false;
+    bool round_finished = false;
+    ObArenaAllocator check_allocator(ObMemAttr(MTL_ID(), "TestMedFinish"));
+    const int64_t check_deadline = ObTimeUtility::current_time() + 60L * 1000 * 1000;
+    while (!round_finished && ObTimeUtility::current_time() < check_deadline) {
+      check_allocator.reuse();
+      const ObMediumCompactionInfoList *completed_list = nullptr;
+      ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(fts_index_tablet_id, reload_fts_handle));
+      ASSERT_EQ(OB_SUCCESS, reload_fts_handle.get_obj()->read_medium_info_list(check_allocator, completed_list));
+      ASSERT_NE(nullptr, completed_list);
+      round_finished = completed_list->could_schedule_next_round(
+          reload_fts_handle.get_obj()->get_last_major_snapshot_version(),
+          reload_fts_handle.get_obj()->get_last_inc_major_snapshot_version());
+      if (!round_finished) {
+        ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet_svr()->update_tablet_report_status(
+            fts_index_tablet_id));
+        ASSERT_EQ(OB_SUCCESS, updater->batch_process_tasks(report_tasks, stopped));
+        ASSERT_EQ(OB_SUCCESS, checker->add_tablet_ls(
+            fts_index_tablet_id, ctx.ls_id_, merge_version_range.snapshot_version_));
+        ob_usleep(1000 * 1000);
+      }
+    }
+    ASSERT_TRUE(round_finished) << "medium checker has not confirmed the completed round";
   }
 }
 
@@ -3312,12 +3446,38 @@ void ObAsyncIndexCompactionTest::execute_inc_major_merge_round(
     int64_t inc_major_cnt_after = 0;
     ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(fts_index_tablet_id, reload_fts_handle));
     ASSERT_EQ(OB_SUCCESS, get_tablet_inc_major_cnt(*reload_fts_handle.get_obj(), inc_major_cnt_after));
-    ASSERT_GT(inc_major_cnt_after, inc_major_cnt_before);
+    ASSERT_EQ(inc_major_cnt_before - input_table_cnt + 1, inc_major_cnt_after);
+    ObTabletMemberWrapper<ObTabletTableStore> merged_store;
+    ASSERT_EQ(OB_SUCCESS, reload_fts_handle.get_obj()->fetch_table_store(merged_store));
+    const ObSSTableArray &merged_tables = merged_store.get_member()->get_inc_major_sstables();
+    int64_t merged_result_count = 0;
+    for (int64_t table_idx = 0; table_idx < merged_tables.count(); ++table_idx) {
+      ObNewVersionRange range;
+      ASSERT_EQ(OB_SUCCESS, merged_tables.at(table_idx)->get_async_index_version_range(range));
+      if (range.base_version_ == merge_base_snapshot && range.snapshot_version_ == merge_snapshot) {
+        ObSSTableMetaHandle merged_meta;
+        ASSERT_EQ(OB_SUCCESS, merged_tables.at(table_idx)->get_meta(merged_meta));
+        ASSERT_EQ(0, merged_meta.get_sstable_meta().get_create_snapshot_version());
+        ++merged_result_count;
+      }
+    }
+    // Only the selected window collapses to one result; unrelated tables stay.
+    ASSERT_EQ(1, merged_result_count);
     ASSERT_EQ(expected_last_major_snapshot,
               reload_fts_handle.get_obj()->get_last_major_snapshot_version());
-    ASSERT_EQ(OB_NO_NEED_MERGE, resolve_inc_major_merge_snapshot(
+    // Selection accepts a single nonempty table in the requested window. The
+    // completed progress, rather than that selector's return code, prevents
+    // the scheduler from executing the same compaction again.
+    ASSERT_EQ(merge_snapshot, reload_fts_handle.get_obj()->get_last_inc_major_snapshot_version());
+    int64_t selected_snapshot = 0;
+    int64_t selected_base = 0;
+    int64_t selected_count = 0;
+    ASSERT_EQ(OB_SUCCESS, resolve_inc_major_merge_snapshot(
         *ls_handle.get_ls(), *reload_fts_handle.get_obj(),
-        merge_snapshot, merge_base_snapshot, input_table_cnt));
+        selected_snapshot, selected_base, selected_count));
+    ASSERT_EQ(1, selected_count);
+    ASSERT_EQ(merge_snapshot, selected_snapshot);
+    ASSERT_EQ(merge_base_snapshot, selected_base);
   }
 }
 
@@ -3351,7 +3511,7 @@ void ObAsyncIndexCompactionTest::run_async_index_alternating_medium_inc_major_me
 
   // Phase 1: first medium major merge.
   int64_t first_medium_merge_snapshot = 0;
-  schedule_and_execute_medium_major_merge(ls_handle, ctx, first_medium_merge_snapshot);
+  ASSERT_NO_FATAL_FAILURE(schedule_and_execute_medium_major_merge(ls_handle, ctx, first_medium_merge_snapshot));
   ASSERT_EQ(first_medium_merge_snapshot, calc_schedule_snapshot_version(mock_major_snapshot));
 
   // Phase 2-3: add small inc majors and trigger first inc major merge.
@@ -3365,7 +3525,7 @@ void ObAsyncIndexCompactionTest::run_async_index_alternating_medium_inc_major_me
   // Phase 6-7: add enough small inc majors and trigger second medium major merge.
   add_small_inc_major_batch(ls_handle, ctx, MEDIUM_TRIGGER_INC_MAJOR_BATCH_CNT, next_doc_id);
   int64_t second_medium_merge_snapshot = 0;
-  schedule_and_execute_medium_major_merge(ls_handle, ctx, second_medium_merge_snapshot);
+  ASSERT_NO_FATAL_FAILURE(schedule_and_execute_medium_major_merge(ls_handle, ctx, second_medium_merge_snapshot));
   ASSERT_GT(second_medium_merge_snapshot, first_medium_merge_snapshot);
 
   for (int64_t i = 0; i < fts_index_cnt; ++i) {
@@ -3450,6 +3610,13 @@ void ObAsyncIndexCompactionTest::trigger_async_index_sstable_gc(
 
   ObTenantTabletScheduler *scheduler = MTL(ObTenantTabletScheduler *);
   ASSERT_NE(nullptr, scheduler);
+  // Manual GC uses the same iterator as SSTableGCTask. Cancel future runs and
+  // drain the current run before scanning; restore the timer on assertion exits.
+  ObTenantTabletSchedulerTaskMgr &timer = scheduler->timer_task_mgr_;
+  ASSERT_EQ(OB_SUCCESS, TG_CANCEL_TASK_R(timer.sstable_gc_tg_id_, timer.sstable_gc_task_));
+  DEFER(EXPECT_EQ(OB_SUCCESS, TG_SCHEDULE(timer.sstable_gc_tg_id_,
+      timer.sstable_gc_task_, timer.SSTABLE_GC_INTERVAL, true /*repeat*/)));
+  ASSERT_EQ(OB_SUCCESS, TG_INVOKE(timer.sstable_gc_tg_id_, wait_task, timer.sstable_gc_task_));
   ASSERT_EQ(OB_SUCCESS, scheduler->update_upper_trans_version_and_gc_sstable());
 }
 
@@ -3661,6 +3828,10 @@ TEST_F(ObAsyncIndexCompactionTest, tenant_major_schedules_at_common_published_sn
       delete_index_handle.get_obj()->get_async_index_max_published_version(
           delete_published_snapshot));
   ASSERT_EQ(common_published_snapshot, delete_published_snapshot);
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(ls_handle, fts_tablet_id,
+      ordinary_published_snapshot));
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(ls_handle, ctx.delete_index_tablet_id_,
+      common_published_snapshot));
 
   ObAsyncIndexDepProvider provider;
   ObTabletAsyncIndexRefreshInfo refresh_info;
@@ -3775,6 +3946,10 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_merge_waits_for_delete_publish)
   merge_ctx.static_param_.ls_handle_ = ls_handle;
   merge_ctx.static_param_.schema_ = storage_schema;
   merge_ctx.static_param_.version_range_.snapshot_version_ = merge_snapshot;
+  merge_ctx.static_param_.merge_version_range_.base_version_ =
+      index_tablet_handle.get_obj()->get_last_major_snapshot_version();
+  ASSERT_GE(merge_ctx.get_read_base_version(), 0);
+  ASSERT_LE(merge_ctx.get_read_base_version(), merge_snapshot);
   ASSERT_EQ(OB_NEED_RETRY, merge_ctx.prepare_deletion_bitmap());
   ASSERT_EQ(ctx.delete_index_tablet_id_, merge_ctx.delete_index_tablet_id_);
 
@@ -3857,12 +4032,17 @@ TEST_F(ObAsyncIndexCompactionTest, tenant_major_keeps_finished_data_tablet_sched
 
   uint64_t data_version = 0;
   int32_t private_transfer_epoch = -1;
+  int64_t private_meta_version = 0;
+  ObTenantMetaMemMgr *meta_mem_mgr = MTL(ObTenantMetaMemMgr *);
+  ASSERT_NE(nullptr, meta_mem_mgr);
   ASSERT_EQ(OB_SUCCESS, GET_MIN_DATA_VERSION(MTL_ID(), data_version));
   ASSERT_EQ(OB_SUCCESS, data_tablet_handle.get_obj()->get_private_transfer_epoch(
       private_transfer_epoch));
+  ASSERT_EQ(OB_SUCCESS, meta_mem_mgr->alloc_tablet_meta_version(
+      ObTabletMapKey(ctx.ls_id_, ctx.data_tablet_id_), private_meta_version));
   const ObTabletPersisterParam persist_param(
       data_version, ctx.ls_id_, ls_handle.get_ls()->get_ls_epoch(),
-      ctx.data_tablet_id_, private_transfer_epoch, 0,
+      ctx.data_tablet_id_, private_transfer_epoch, private_meta_version,
       data_tablet_handle.get_obj()->get_reorganization_scn());
   // DDL 新建的 Tablet 可能仍由 allocator 持有，不能直接使用
   // copy_from_old_tablet()。显式持久化并转换为 object pool 中的副本，
@@ -3939,7 +4119,7 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_user_request_force_merge)
   share::schema::ObAsyncIndexParams async_index_params;
   ASSERT_EQ(OB_SUCCESS, ObMediumCompactionScheduleFunc::get_async_index_tablet_ids(
       *data_tablet_handle.get_obj(), index_tablet_ids, delete_index_tablet_id, async_index_params));
-  ASSERT_NO_FATAL_FAILURE(prepare_delete_index_publish_for_merge(ctx, ls_handle));
+  ASSERT_NO_FATAL_FAILURE(publish_mock_async_index_inputs(*this, ctx, ls_handle));
 
   int64_t common_published_snapshot = 0;
   ASSERT_EQ(OB_SUCCESS, calc_common_published_snapshot(
@@ -4204,6 +4384,62 @@ TEST_F(ObAsyncIndexCompactionTest, deletion_empty_major_creation_cold_scans)
   }
 }
 
+// Store the future deletion in a separate committed refresh interval so both
+// the logical table ranges and the MVCC row versions describe the same state.
+void add_boundary_delete_inc_major(
+    ObLSHandle &ls_handle,
+    const ObTabletID &tablet_id,
+    const int64_t base_version,
+    const int64_t snapshot_version,
+    const uint64_t doc_id,
+    const int64_t row_version,
+    ObArenaAllocator &allocator)
+{
+  ObTabletMergeDagParam dag_param;
+  ObTabletMergeCtx merge_ctx(dag_param, allocator);
+  ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(tablet_id, merge_ctx.tablet_handle_));
+  ObStorageSchema *schema = nullptr;
+  ASSERT_EQ(OB_SUCCESS, merge_ctx.tablet_handle_.get_obj()->load_storage_schema(allocator, schema));
+  DEFER(ObTabletObjLoadHelper::free(allocator, schema));
+  ASSERT_EQ(OB_SUCCESS, prepare_data_merge_context(ls_handle, tablet_id, *schema,
+      MAJOR_MERGE, snapshot_version, 0 /*base_version*/, merge_ctx));
+  ObSSTableMergeRes res;
+  ASSERT_EQ(OB_SUCCESS, build_non_empty_delete_index_merge_res(ls_handle,
+      tablet_id, *schema, snapshot_version, &doc_id, 1, allocator, res, row_version));
+  ObTabletCreateSSTableParam create_param;
+  ASSERT_EQ(OB_SUCCESS, create_param.init_for_merge(merge_ctx, res, nullptr /*cg_schema*/, 0 /*cg_idx*/));
+  // Reuse the row-store data metadata and describe the committed refresh import
+  // with its physical CLOG key and separate logical refresh window.
+  create_param.table_key_.table_type_ = ObITable::TableType::INC_MAJOR_SSTABLE;
+  create_param.table_key_.version_range_.reset();
+  ASSERT_EQ(OB_SUCCESS, create_param.table_key_.scn_range_.start_scn_.convert_for_tx(base_version));
+  ASSERT_EQ(OB_SUCCESS, create_param.table_key_.scn_range_.end_scn_.convert_for_tx(snapshot_version + 1));
+  ASSERT_EQ(OB_SUCCESS, create_param.set_min_merged_trans_version_with_check(base_version));
+  create_param.max_merged_trans_version_ = snapshot_version;
+  create_param.filled_tx_scn_ = create_param.table_key_.get_end_scn();
+  create_param.rec_scn_ = SCN::plus(create_param.table_key_.get_start_scn(), 1);
+  create_param.create_snapshot_version_ = snapshot_version;
+  create_param.upper_trans_version_ = snapshot_version;
+  const ObUncommitTxDesc tx_desc(102, transaction::ObTxSEQ(202, 0).cast_to_int());
+  ASSERT_EQ(OB_SUCCESS, create_param.uncommit_tx_info_.push_back(tx_desc));
+  create_param.uncommit_tx_info_.set_info_status_record_seq();
+  ObTableHandleV2 table_handle;
+  ASSERT_EQ(OB_SUCCESS, ObTabletCreateDeleteHelper::create_sstable<ObSSTable>(
+      create_param, allocator, table_handle));
+  ObSSTable *sstable = nullptr;
+  ASSERT_EQ(OB_SUCCESS, table_handle.get_sstable(sstable));
+  ASSERT_TRUE(sstable->is_inc_major_sstable());
+  ObUpdateTableStoreParam update(snapshot_version,
+      merge_ctx.tablet_handle_.get_obj()->get_multi_version_start(), schema,
+      ls_handle.get_ls()->get_rebuild_seq(), sstable, false /*allow_duplicate*/);
+  update.inc_major_sstable_action_ = ObIncMajorSSTableAction::LINK;
+  ASSERT_EQ(OB_SUCCESS, update.init_with_compaction_info(ObCompactionTableStoreParam(
+      MEDIUM_MERGE, SCN::min_scn(), false /*need_report*/,
+      merge_ctx.tablet_handle_.get_obj()->has_merged_with_mds_info())));
+  ObTabletHandle updated;
+  ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->update_tablet_table_store(tablet_id, update, updated));
+}
+
 TEST_F(ObAsyncIndexCompactionTest, async_read_boundary_bitmap_filter_and_cache)
 {
   share::ObTenantSwitchGuard tguard;
@@ -4233,12 +4469,16 @@ TEST_F(ObAsyncIndexCompactionTest, async_read_boundary_bitmap_filter_and_cache)
   ASSERT_EQ(OB_SUCCESS, add_inc_major_to_tablet(
       ls_handle, ctx.fts_index_tablet_ids_.at(0), expected_r, latest, 1000 /*occupy_size*/));
   ASSERT_TRUE(has_major_sstable_at_snapshot(ctx.ls_id_, ctx.fts_index_tablet_ids_.at(0), expected_r));
-  const uint64_t doc_ids[] = {2, 4, 6};
-  const int64_t row_snapshots[] = {expected_r - 1, expected_r, expected_r + 1};
+  const uint64_t doc_ids[] = {2, 4};
+  const int64_t row_snapshots[] = {expected_r - 1, expected_r};
   int64_t actual_mvs = 0;
   ASSERT_EQ(OB_SUCCESS, add_non_empty_delete_index_major_via_merge_ctx(
-      ls_handle, ctx.delete_index_tablet_id_, latest, base, doc_ids, ARRAYSIZEOF(doc_ids),
-      allocator_, actual_mvs, 0 /*use row_snapshots*/, row_snapshots));
+      ls_handle, ctx.delete_index_tablet_id_, expected_r, base, doc_ids, ARRAYSIZEOF(doc_ids),
+      allocator_, actual_mvs, 0 /*use row_snapshots*/, row_snapshots, nullptr /*no GC plan*/));
+  ASSERT_NO_FATAL_FAILURE(add_boundary_delete_inc_major(ls_handle,
+      ctx.delete_index_tablet_id_, expected_r, latest, 6 /*doc_id*/, expected_r + 1, allocator_));
+  // The deletion Major ends at R. The later IncMajor crosses the SQL snapshot
+  // and contains doc 6, which must be excluded from the bitmap at R.
   ObTabletAsyncIndexRefreshInfo info;
   info.set_has_async_index(true);
   ASSERT_EQ(OB_SUCCESS, info.append_refresh_snapshot(latest));
@@ -4331,7 +4571,7 @@ TEST_F(ObAsyncIndexCompactionTest, merge_bitmap_snapshot_bounds_and_cache_isolat
   int64_t actual_mvs = 0;
   ASSERT_EQ(OB_SUCCESS, add_non_empty_delete_index_major_via_merge_ctx(
       ls, ctx.delete_index_tablet_id_, physical_snapshot, base, doc_ids, ARRAYSIZEOF(doc_ids),
-      allocator_, actual_mvs, 0, row_snapshots));
+      allocator_, actual_mvs, 0, row_snapshots, nullptr /*no GC plan*/));
   ASSERT_EQ(OB_SUCCESS, publish_async_index_version(ls, ctx.delete_index_tablet_id_, physical_snapshot));
 
   // Populate the query cache first. A Major must not reuse this full bitmap.
@@ -4612,7 +4852,7 @@ TEST_F(ObAsyncIndexCompactionTest, deletion_bitmap_survives_mvs_advance)
       DELETE_INDEX_MERGE_DOC_IDS,
       DELETE_INDEX_MERGE_DOC_ID_CNT,
       allocator_,
-      setup_multi_version_start, keep_snapshot /*preserve deletion row versions*/));
+      setup_multi_version_start, keep_snapshot /*preserve deletion row versions*/, nullptr, nullptr));
   ASSERT_EQ(keep_snapshot, setup_multi_version_start);
 
   ObTabletAsyncIndexRefreshInfo refresh_info;
@@ -4648,6 +4888,21 @@ TEST_F(ObAsyncIndexCompactionTest, deletion_bitmap_survives_mvs_advance)
           deletion_kept_snapshot));
   ASSERT_EQ(deletion_latest_snapshot, deletion_kept_snapshot);
 
+  // Deletion GC is fixed by Medium planning; execution does not recalculate it.
+  ObStorageSchema *delete_schema = nullptr;
+  ASSERT_EQ(OB_SUCCESS, before_delete_handle.get_obj()->load_storage_schema(allocator_, delete_schema));
+  DEFER(ObTabletObjLoadHelper::free(allocator_, delete_schema));
+  ObMediumCompactionInfo medium_info(allocator_);
+  medium_info.data_version_ = DATA_CURRENT_VERSION;
+  ASSERT_EQ(OB_SUCCESS, medium_info.storage_schema_.init(allocator_, *delete_schema));
+  ObMediumCompactionInfoList medium_list;
+  ObMediumCompactionScheduleFunc schedule_func(
+      *ls_handle.get_ls(), SCN::min_scn(), medium_list, nullptr);
+  ASSERT_EQ(OB_SUCCESS, schedule_func.init_tablet_handle(before_delete_handle));
+  ASSERT_EQ(OB_SUCCESS, schedule_func.fill_deletion_gc_scn(medium_info));
+  ASSERT_TRUE(medium_info.contain_mds_filter_info_);
+  ASSERT_EQ(oldest_index_snapshot, medium_info.mds_filter_info_.get_mlog_purge_scn());
+
   int64_t actual_multi_version_start = 0;
   ASSERT_EQ(OB_SUCCESS, add_non_empty_delete_index_major_via_merge_ctx(
       ls_handle,
@@ -4657,7 +4912,8 @@ TEST_F(ObAsyncIndexCompactionTest, deletion_bitmap_survives_mvs_advance)
       DELETE_INDEX_MERGE_DOC_IDS,
       DELETE_INDEX_MERGE_DOC_ID_CNT,
       allocator_,
-      actual_multi_version_start, 0 /*use merge snapshot*/, row_snapshots));
+      actual_multi_version_start, 0 /*use row_snapshots*/, row_snapshots,
+      &medium_info.mds_filter_info_));
   ASSERT_EQ(OB_SUCCESS, wait_ls_weak_read_ts(*ls_handle.get_ls(), merge_snapshot));
 
   ObTabletHandle after_delete_handle;
@@ -4806,7 +5062,7 @@ TEST_F(ObAsyncIndexCompactionTest, deletion_tablet_keep_inc_major_base_version_z
       DELETE_INDEX_MERGE_DOC_IDS,
       DELETE_INDEX_MERGE_DOC_ID_CNT,
       allocator_,
-      setup_multi_version_start, 0 /*use row_snapshots*/, row_snapshots));
+      setup_multi_version_start, 0 /*use row_snapshots*/, row_snapshots, nullptr /*no GC plan*/));
   ASSERT_EQ(keep_snapshot, setup_multi_version_start);
 
   // Verify the records and old majors before advancing deletion MVS.
@@ -4826,7 +5082,7 @@ TEST_F(ObAsyncIndexCompactionTest, deletion_tablet_keep_inc_major_base_version_z
       DELETE_INDEX_MERGE_DOC_IDS,
       DELETE_INDEX_MERGE_DOC_ID_CNT,
       allocator_,
-      actual_multi_version_start, 0 /*use row_snapshots*/, row_snapshots))
+      actual_multi_version_start, 0 /*use row_snapshots*/, row_snapshots, nullptr /*no GC plan*/))
       << "base_version=0 must be accepted as a valid sibling retention bound";
   ASSERT_EQ(OB_SUCCESS, wait_ls_weak_read_ts(*ls_handle.get_ls(), merge_snapshot));
 
@@ -4910,7 +5166,7 @@ TEST_F(ObAsyncIndexCompactionTest, finished_async_index_wakeup_new_medium_round)
   share::schema::ObAsyncIndexParams async_index_params;
   ASSERT_EQ(OB_SUCCESS, ObMediumCompactionScheduleFunc::get_async_index_tablet_ids(
       *data_tablet_handle.get_obj(), index_tablet_ids, delete_index_tablet_id, async_index_params));
-  ASSERT_NO_FATAL_FAILURE(prepare_delete_index_publish_for_merge(ctx, ls_handle));
+  ASSERT_NO_FATAL_FAILURE(publish_mock_async_index_inputs(*this, ctx, ls_handle));
 
   ObNewVersionRange merge_version_range;
   ASSERT_EQ(OB_SUCCESS, ObAsyncIndexMergePolicy::choose_async_index_merge_range(
@@ -5960,23 +6216,14 @@ TEST_F(ObAsyncIndexCompactionTest, zero_postings_async_fts_inc_major_keeps_inv_m
   ObSqlString sql;
   OK(sql.assign_fmt("insert into %s values (1, '')", table_name));
   OK(exe_sql(sql.ptr()));
-  OK(sql.assign_fmt("call dbms_async_index.refresh('%s')", table_name));
-  OK(exe_sql(sql.ptr()));
-
-  ObInvSSTableMeta inv_meta;
-  SCN inc_end_scn;
-  OK(wait_inv_inc_major_meta(
-      ctx.ls_id_, ctx.fts_index_tablet_ids_.at(0), true/*expect_empty*/,
-      inv_meta, inc_end_scn));
-  ASSERT_TRUE(inv_meta.is_valid());
-  ASSERT_EQ(INV_IDX_TYPE_FTS, inv_meta.get_stats().index_type_);
-  ASSERT_TRUE(inv_meta.get_stats().has_relevance_params_);
-  ASSERT_TRUE(inv_meta.get_stats().has_position_list_);
-  ASSERT_FALSE(inv_meta.get_stats().has_nested_key_);
-  ASSERT_EQ(ObUInt64Type, inv_meta.get_stats().doc_id_obj_meta_.get_type());
-  ASSERT_EQ(UINT64_MAX, inv_meta.get_stats().min_doc_id_);
-  ASSERT_EQ(0, inv_meta.get_stats().max_doc_id_);
-  ASSERT_EQ(0, inv_meta.get_stats().total_doc_length_);
+  ASSERT_NO_FATAL_FAILURE(verify_empty_refresh_publication(*this, table_name,
+      ctx.ls_id_, ctx.fts_index_tablet_ids_.at(0)));
+  ASSERT_EQ(OB_SUCCESS, get_tablet_handle(
+      ctx.ls_id_, ctx.fts_index_tablet_ids_.at(0), tablet_handle));
+  ASSERT_EQ(OB_SUCCESS, get_tablet_inc_major_cnt(*tablet_handle.get_obj(), inc_major_cnt));
+  ASSERT_EQ(0, inc_major_cnt);
+  ASSERT_NO_FATAL_FAILURE(verify_empty_fts_inv_major_on_tablet(
+      ctx.ls_id_, ctx.fts_index_tablet_ids_.at(0), true /*has_position_list*/));
 
   OK(exe_sql("drop table if exists t_async_fts_zero_postings_inc"));
 }
@@ -7039,7 +7286,7 @@ TEST_F(ObAsyncIndexSnapshotTest, major_medium_fixed_parameters)
   ASSERT_NO_FATAL_FAILURE(roundtrip_medium(generated, medium));
   uint64_t current_data_version = 0;
   ASSERT_EQ(OB_SUCCESS, GET_MIN_DATA_VERSION(MTL_ID(), current_data_version));
-  medium.data_version_ = DATA_VERSION_4_6_3_0;
+  medium.data_version_ = DATA_VERSION_4_6_2_2;
   ASSERT_GT(current_data_version, medium.data_version_);
   {
     omt::ObTenantConfigGuard config(TENANT_CONF(MTL_ID()));
@@ -7170,7 +7417,7 @@ TEST_F(ObAsyncIndexSnapshotTest, unpublished_major_retry_after_old_deletion_remo
     ASSERT_EQ(OB_SUCCESS, add_non_empty_delete_index_major_via_merge_ctx(
         ls_, tablets_.delete_index_tablet_id_, deletion_snapshot, base_,
         doc_ids + attempt, ARRAYSIZEOF(doc_ids) - attempt, allocator_, actual_mvs,
-        0, row_snapshots + attempt));
+        0, row_snapshots + attempt, nullptr /*no GC plan*/));
     ASSERT_EQ(OB_SUCCESS, publish_async_index_version(
         ls_, tablets_.delete_index_tablet_id_, deletion_snapshot));
     if (attempt > 0) {
@@ -7852,9 +8099,450 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_inc_major_merge_execute)
   ASSERT_NO_FATAL_FAILURE(run_async_index_inc_major_merge_execute(ctx));
 }
 
+// Shared publication and state assertions for the stale LINK regression.
+class AsyncIndexLinkTestHelper
+{
+public:
+  AsyncIndexLinkTestHelper(ObAsyncIndexCompactionTest &test, ObLSHandle &ls_handle,
+      ObTabletHandle &tablet_handle, ObStorageSchema &schema)
+    : test_(test), ls_handle_(ls_handle), tablet_handle_(tablet_handle), schema_(schema)
+  {}
+
+  void publish_shared(const ObSSTable *table, const ObMergeType merge_type)
+  {
+    ASSERT_NE(nullptr, table);
+    ASSERT_TRUE(tablet_handle_.is_valid());
+    ObSSMetaService *meta_service = MTL(ObSSMetaService *);
+    ASSERT_NE(nullptr, meta_service);
+    ObUpdateTableStoreParam param(table->get_snapshot_version(), ObVersionRange::MIN_VERSION,
+        &schema_, ls_handle_.get_ls()->get_rebuild_seq(), table, true /*allow_duplicate*/);
+    ASSERT_EQ(OB_SUCCESS, param.init_with_compaction_info(ObCompactionTableStoreParam(
+        merge_type, SCN::min_scn(), false /*need_report*/,
+        tablet_handle_.get_obj()->has_merged_with_mds_info())));
+    if (table->is_inc_major_type_sstable()) {
+      param.inc_major_sstable_action_ = ObIncMajorSSTableAction::LINK;
+    }
+    ObArray<ObSSMetaCtrlKeyInfo> ctrl_keys;
+    ASSERT_EQ(OB_SUCCESS, meta_service->update_tablet_table_store(
+        ls_handle_.get_ls()->get_ls_id(), tablet_handle_.get_obj()->get_tablet_id(),
+        tablet_handle_.get_obj()->get_reorganization_scn(),
+        is_inc_major_merge(merge_type) || is_major_merge_type(merge_type)
+            ? ObMetaUpdateReason::TABLET_COMPACT_ADD_DATA_MAJOR_SSTABLE
+            : ObMetaUpdateReason::TABLET_ADD_DATA_INC_MAJOR_SSTABLE,
+        param, ctrl_keys, false /*check_lease*/));
+  }
+
+  void check_state(const int64_t expected_count, const int64_t expected_published,
+      const int64_t expected_progress, const int64_t expected_major,
+      const ObSSTable *const *expected_tables)
+  {
+    ASSERT_TRUE(tablet_handle_.is_valid());
+    const ObTabletID tablet_id = tablet_handle_.get_obj()->get_tablet_id();
+    ASSERT_EQ(OB_SUCCESS, test_.get_tablet_handle(
+        ls_handle_.get_ls()->get_ls_id(), tablet_id, tablet_handle_));
+    ObTabletMemberWrapper<ObTabletTableStore> store;
+    ASSERT_EQ(OB_SUCCESS, tablet_handle_.get_obj()->fetch_table_store(store));
+    ASSERT_NE(nullptr, store.get_member());
+    ASSERT_TRUE(store.get_member()->is_ready_for_read_);
+    const ObSSTableArray &tables = store.get_member()->get_inc_major_sstables();
+    ASSERT_EQ(expected_count, tables.count());
+    if (nullptr != expected_tables) {
+      for (int64_t i = 0; i < tables.count(); ++i) {
+        ASSERT_NE(nullptr, expected_tables[i]);
+        EXPECT_EQ(expected_tables[i]->get_key(), tables.at(i)->get_key());
+        ObNewVersionRange range;
+        ObNewVersionRange expected_range;
+        ASSERT_EQ(OB_SUCCESS, tables.at(i)->get_async_index_version_range(range));
+        ASSERT_EQ(OB_SUCCESS, expected_tables[i]->get_async_index_version_range(expected_range));
+        EXPECT_EQ(expected_range.base_version_, range.base_version_);
+        EXPECT_EQ(expected_range.snapshot_version_, range.snapshot_version_);
+      }
+    }
+    int64_t published = 0;
+    ASSERT_EQ(OB_SUCCESS, tablet_handle_.get_obj()->get_async_index_max_published_version(published));
+    ASSERT_EQ(expected_published, published);
+    ASSERT_EQ(expected_progress, tablet_handle_.get_obj()->get_last_inc_major_snapshot_version());
+    ASSERT_EQ(expected_major, tablet_handle_.get_obj()->get_last_major_snapshot_version());
+    ASSERT_EQ(OB_SUCCESS, store.get_member()->check_continuous(true /*is_async_index*/));
+  }
+
+private:
+  ObAsyncIndexCompactionTest &test_;
+  ObLSHandle &ls_handle_;
+  ObTabletHandle &tablet_handle_;
+  ObStorageSchema &schema_;
+};
+
+TEST_F(ObAsyncIndexCompactionTest, async_index_major_link_rechecks_completed_snapshot)
+{
+  share::ObTenantSwitchGuard tguard;
+  OK(tguard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_NO_FATAL_FAILURE(exe_prepare_sql());
+  for (const ObMergeType merge_type : {MAJOR_MERGE, MEDIUM_MERGE}) {
+    SCOPED_TRACE(merge_type);
+    const char *table_name = is_major_merge(merge_type)
+        ? "t_async_fts_stale_major_link" : "t_async_fts_stale_medium_link";
+    ASSERT_NO_FATAL_FAILURE(create_async_fts_table(table_name));
+    MultiAsyncIndexTabletCtx ctx;
+    ASSERT_NO_FATAL_FAILURE(resolve_multi_async_index_tablet_ctx(table_name, ctx));
+    ASSERT_EQ(1, ctx.fts_index_tablet_ids_.count());
+    const ObTabletID &tablet_id = ctx.fts_index_tablet_ids_.at(0);
+    const int64_t base = get_mock_major_snapshot(ctx);
+    const int64_t older_snapshot = base + DEFAULT_INC_MAJOR_STEP;
+    const int64_t newer_snapshot = older_snapshot + DEFAULT_INC_MAJOR_STEP;
+    ObLSHandle ls_handle;
+    ObTabletHandle selected_tablet;
+    ASSERT_EQ(OB_SUCCESS, get_ls_handle(ctx.ls_id_, ls_handle));
+    ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(ls_handle, tablet_id, base));
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, tablet_id, selected_tablet));
+    ASSERT_LT(selected_tablet.get_obj()->get_last_major_snapshot_version(), older_snapshot);
+
+    ObInvSSTable *older_table = nullptr;
+    ObInvSSTable *newer_table = nullptr;
+    ObTableHandleV2 older_handle;
+    ObTableHandleV2 newer_handle;
+    ASSERT_EQ(OB_SUCCESS, mock_major_sstable(tablet_id, older_snapshot, older_table));
+    ASSERT_EQ(OB_SUCCESS, older_handle.set_sstable(older_table, &allocator_));
+    ASSERT_EQ(OB_SUCCESS, mock_major_sstable(tablet_id, newer_snapshot, newer_table));
+    ASSERT_EQ(OB_SUCCESS, newer_handle.set_sstable(newer_table, &allocator_));
+    ObTabletSSLinkMajorTask older(ctx.ls_id_, tablet_id, older_snapshot,
+        0 /*merge_base_version*/, merge_type, false /*prewarm*/, false /*need_report*/);
+    ObTabletSSLinkMajorTask newer(ctx.ls_id_, tablet_id, newer_snapshot,
+        0 /*merge_base_version*/, merge_type, false /*prewarm*/, false /*need_report*/);
+    ObArenaAllocator link_allocator(ObMemAttr(MTL_ID(), "StaleMajorLink"));
+    // Both tasks passed the outer snapshot check. Install the newer result
+    // first, then resume the older task with its retained pre-update tablet.
+    ASSERT_EQ(OB_SUCCESS, newer.do_link_(ls_handle, selected_tablet,
+        *selected_tablet.get_obj(), *newer_table, SCN::base_scn(), link_allocator));
+    ObTabletHandle completed;
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, tablet_id, completed));
+    ASSERT_EQ(newer_snapshot, completed.get_obj()->get_last_major_snapshot_version());
+    ASSERT_EQ(OB_EAGAIN, older.do_link_(ls_handle, selected_tablet,
+        *selected_tablet.get_obj(), *older_table, SCN::base_scn(), link_allocator));
+    ASSERT_EQ(OB_EAGAIN, newer.do_link_(ls_handle, selected_tablet,
+        *selected_tablet.get_obj(), *newer_table, SCN::base_scn(), link_allocator));
+    ASSERT_EQ(OB_SUCCESS, older.process());
+    ASSERT_EQ(OB_SUCCESS, newer.process());
+    ObTabletHandle after_retry;
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, tablet_id, after_retry));
+    ASSERT_EQ(completed.get_obj(), after_retry.get_obj());
+    ASSERT_EQ(newer_snapshot, after_retry.get_obj()->get_last_major_snapshot_version());
+  }
+}
+
+// Reproduce issue 2026101900119902942 without relying on concurrent scheduling.
+// Commit replay uses the latest Shared result without the original import's
+// history; the older compaction LINK still looks up its exact historical row.
+// The writer has published P=(A,B], then M=(A,C]; M retains import C's identity.
+// The replay/recovery chain uses process() to select its result. The final
+// concurrency check resumes an already-selected stale LINK at installation.
+TEST_F(ObAsyncIndexCompactionTest, async_index_commit_replay_before_historical_compaction_link)
+{
+  share::ObTenantSwitchGuard tguard;
+  OK(tguard.switch_to(run_ctx_.tenant_id_));
+  ASSERT_NO_FATAL_FAILURE(exe_prepare_sql());
+  for (const bool same_physical_key : {false, true}) {
+    const char *table_name = same_physical_key
+        ? "t_async_fts_replay_same_key" : "t_async_fts_replay_history_link";
+    ASSERT_NO_FATAL_FAILURE(create_async_fts_table(table_name));
+    MultiAsyncIndexTabletCtx ctx;
+    ASSERT_NO_FATAL_FAILURE(resolve_multi_async_index_tablet_ctx(table_name, ctx));
+    ASSERT_EQ(1, ctx.fts_index_tablet_ids_.count());
+    const ObTabletID &tablet_id = ctx.fts_index_tablet_ids_.at(0);
+    const int64_t base = get_mock_major_snapshot(ctx);
+    const int64_t narrow_snapshot = base + DEFAULT_INC_MAJOR_STEP;
+    const int64_t wide_snapshot = narrow_snapshot + DEFAULT_INC_MAJOR_STEP;
+    ObLSHandle ls_handle;
+    ObTabletHandle local;
+    ASSERT_EQ(OB_SUCCESS, get_ls_handle(ctx.ls_id_, ls_handle));
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, tablet_id, local));
+    ObSSMetaService *meta_service = MTL(ObSSMetaService *);
+    ASSERT_NE(nullptr, meta_service);
+    const SCN reorgan_scn = local.get_obj()->get_reorganization_scn();
+    ASSERT_EQ(OB_SUCCESS, meta_service->create_tablet(
+        ctx.ls_id_, tablet_id, reorgan_scn, false /*check_lease*/));
+    ASSERT_EQ(OB_SUCCESS, add_major_to_tablet(ls_handle, tablet_id, base));
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, tablet_id, local));
+    ObStorageSchema *schema = nullptr;
+    ASSERT_EQ(OB_SUCCESS, local.get_obj()->load_storage_schema(allocator_, schema));
+    DEFER(ObTabletObjLoadHelper::free(allocator_, schema));
+
+    ObSSTable *narrow = nullptr;
+    ObSSTable *wide = nullptr;
+    ObSSTable *original = nullptr;
+    ObTableHandleV2 original_handle;
+    ObTableHandleV2 narrow_handle;
+    ObTableHandleV2 wide_handle;
+    ASSERT_EQ(OB_SUCCESS, mock_inc_major_sstable(tablet_id, base, narrow_snapshot,
+        DEFAULT_SEG_SIZE, narrow, true /*committed*/));
+    ASSERT_EQ(OB_SUCCESS, narrow_handle.set_sstable(narrow, &allocator_));
+    // P has no index rows. M contains the same real rows as the trailing import,
+    // so selecting M must preserve readable data as well as logical coverage.
+    ObTabletMergeDagParam wide_param;
+    ObTabletMergeCtx wide_ctx(wide_param, allocator_);
+    ObTabletCreateSSTableParam create_wide;
+    ASSERT_EQ(OB_SUCCESS, build_non_empty_inv_sstable_param_for_merge(
+        ls_handle, tablet_id, *schema, INC_MAJOR_MERGE, wide_snapshot, base,
+        NON_EMPTY_INV_ROWS_PER_SEGMENT, 1001, false, wide_ctx, create_wide));
+    ASSERT_EQ(OB_SUCCESS, create_wide.table_key_.scn_range_.start_scn_.convert_for_tx(base));
+    create_wide.rec_scn_ = SCN::plus(create_wide.table_key_.get_start_scn(), 1);
+    ObInvSSTable *wide_inv = nullptr;
+    ASSERT_EQ(OB_SUCCESS, create_inv_sstable_from_param(create_wide, wide_handle, wide_inv));
+    wide = wide_inv;
+    ObTabletMergeDagParam import_param;
+    ObTabletMergeCtx import_ctx(import_param, allocator_);
+    ObTabletCreateSSTableParam create_import;
+    ASSERT_EQ(OB_SUCCESS, build_non_empty_inv_sstable_param_for_merge(
+        ls_handle, tablet_id, *schema, INC_MAJOR_MERGE, wide_snapshot, narrow_snapshot,
+        NON_EMPTY_INV_ROWS_PER_SEGMENT, 1001, false, import_ctx, create_import));
+    if (same_physical_key) {
+      create_import.table_key_.scn_range_ = wide->get_key().scn_range_;
+      create_import.rec_scn_ = SCN::plus(create_import.table_key_.get_start_scn(), 1);
+    }
+    ObInvSSTable *original_inv = nullptr;
+    ASSERT_EQ(OB_SUCCESS, create_inv_sstable_from_param(create_import, original_handle, original_inv));
+    original = original_inv;
+    ASSERT_EQ(same_physical_key, original->get_key() == wide->get_key());
+    // Use the real ObTxSEQ encoding for the replayed import and its result.
+    original->meta_->uncommit_tx_info_.tx_infos_[0].sql_seq_ =
+        transaction::ObTxSEQ(200, 0).cast_to_int();
+    wide->meta_->uncommit_tx_info_.tx_infos_[0].sql_seq_ =
+        transaction::ObTxSEQ(200, 0).cast_to_int();
+    // P and M inherit different imports, as in the incident. M keeps 100/200.
+    narrow->meta_->uncommit_tx_info_.tx_infos_[0].tx_id_ = 101;
+    narrow->meta_->uncommit_tx_info_.tx_infos_[0].sql_seq_ = transaction::ObTxSEQ(201, 0).cast_to_int();
+    transaction::ObTransID import_tx;
+    transaction::ObTxSEQ import_seq;
+    ASSERT_EQ(OB_SUCCESS, ObIncMajorTxHelper::get_trans_id_and_seq_no(*wide, import_tx, import_seq));
+    ASSERT_EQ(transaction::ObTransID(100), import_tx);
+    ASSERT_EQ(transaction::ObTxSEQ(200, 0), import_seq);
+
+    AsyncIndexLinkTestHelper link_helper(*this, ls_handle, local, *schema);
+    ObTabletMemberWrapper<ObTabletTableStore> local_store;
+    ASSERT_EQ(OB_SUCCESS, local.get_obj()->fetch_table_store(local_store));
+    const ObSSTableArray &majors = local_store.get_member()->get_major_sstables();
+    ASSERT_GT(majors.count(), 0);
+    ASSERT_NO_FATAL_FAILURE(link_helper.publish_shared(majors.at(majors.count() - 1), MAJOR_MERGE));
+    ASSERT_NO_FATAL_FAILURE(link_helper.publish_shared(narrow, INC_MAJOR_MERGE));
+    SCN narrow_meta_scn;
+    ASSERT_EQ(OB_SUCCESS, meta_service->get_tablet_latest_version(
+        ctx.ls_id_, tablet_id, reorgan_scn, narrow_meta_scn));
+    // Do not publish the original import: no historical Shared row can supply
+    // it. Replay must use M, including when both SSTables share a physical key.
+    ASSERT_NO_FATAL_FAILURE(link_helper.publish_shared(wide, INC_MAJOR_MERGE));
+    ObTabletHandle shared;
+    SCN wide_meta_scn;
+    ASSERT_EQ(OB_SUCCESS, meta_service->get_tablet(ctx.ls_id_, tablet_id,
+        reorgan_scn, allocator_, shared, wide_meta_scn));
+    ASSERT_GT(wide_meta_scn, narrow_meta_scn);
+    ObTabletMemberWrapper<ObTabletTableStore> shared_store;
+    ASSERT_EQ(OB_SUCCESS, shared.get_obj()->fetch_table_store(shared_store));
+    ASSERT_EQ(1, shared_store.get_member()->get_inc_major_sstables().count());
+    ASSERT_EQ(wide->get_key(), shared_store.get_member()->get_inc_major_sstables().at(0)->get_key());
+    {
+      ObArenaAllocator lookup_allocator(ObMemAttr(MTL_ID(), "LatestIncLink"));
+      ObTabletHandle selected_tablet;
+      ObTabletMemberWrapper<ObTabletTableStore> selected_store;
+      SCN selected_meta_scn;
+      const ObSSTable *selected = nullptr;
+      ObTabletSSLinkIncMajorTask import_lookup(ctx.ls_id_, tablet_id, wide_snapshot,
+          import_tx, import_seq, local.get_obj()->get_ddl_checkpoint_scn());
+      ASSERT_EQ(OB_SUCCESS, import_lookup.find_target_inc_major_(reorgan_scn,
+          lookup_allocator, selected_tablet, selected_meta_scn, selected_store, selected));
+      ASSERT_NE(nullptr, selected);
+      ASSERT_EQ(wide_meta_scn, selected_meta_scn);
+      ASSERT_EQ(wide->get_key(), selected->get_key());
+      ASSERT_EQ(base, selected->get_async_index_base_version());
+      ASSERT_EQ(wide_snapshot, selected->get_async_index_snapshot_version());
+    }
+
+    const int64_t initial_progress = local.get_obj()->get_last_inc_major_snapshot_version();
+    ASSERT_NO_FATAL_FAILURE(link_helper.check_state(0, base, initial_progress, base, nullptr));
+    uint64_t data_version = 0;
+    ASSERT_EQ(OB_SUCCESS, GET_MIN_DATA_VERSION(MTL_ID(), data_version));
+    SCN commit_scn;
+    ASSERT_EQ(OB_SUCCESS, commit_scn.convert_for_tx(wide_snapshot + DEFAULT_INC_MAJOR_STEP));
+    ObString original_buffer;
+    ASSERT_EQ(OB_SUCCESS, ObIncDDLMergeTaskUtils::serialize_inc_major_to_string(
+        allocator_, original, data_version, original_buffer));
+    // This ordering regression replays legacy END logs without checkpoint filtering.
+    ObDDLIncMajorCommitReplayExecutor replay;
+    ASSERT_EQ(OB_SUCCESS, replay.init(ls_handle.get_ls(), tablet_id, commit_scn,
+        import_tx, import_seq, wide_snapshot, data_version,
+        false /*rollback*/, false /*co_sstable*/, original_buffer, original->get_start_scn(),
+        false /*need_check_ddl_checkpoint*/));
+    ASSERT_EQ(OB_SUCCESS, replay.do_replay_(local));
+    const ObSSTable *replayed_tables[] = {wide};
+    ASSERT_NO_FATAL_FAILURE(link_helper.check_state(
+        1, wide_snapshot, initial_progress, base, replayed_tables));
+    // Publish and replay a later, independent transaction while compaction
+    // LINK is delayed. The rows from (B,C] must remain readable through M.
+    const int64_t later_snapshot = wide_snapshot + DEFAULT_INC_MAJOR_STEP;
+    ObSSTable *later = nullptr;
+    ObTableHandleV2 later_handle;
+    ASSERT_EQ(OB_SUCCESS, mock_inc_major_sstable(tablet_id, wide_snapshot, later_snapshot,
+        DEFAULT_SEG_SIZE, later, true /*committed*/));
+    ASSERT_EQ(OB_SUCCESS, later_handle.set_sstable(later, &allocator_));
+    later->meta_->basic_meta_.create_snapshot_version_ = later_snapshot;
+    later->meta_->uncommit_tx_info_.tx_infos_[0].tx_id_ = 102;
+    later->meta_->uncommit_tx_info_.tx_infos_[0].sql_seq_ = transaction::ObTxSEQ(202, 0).cast_to_int();
+    ASSERT_NO_FATAL_FAILURE(link_helper.publish_shared(later, MEDIUM_MERGE));
+    ObString later_buffer;
+    ASSERT_EQ(OB_SUCCESS, ObIncDDLMergeTaskUtils::serialize_inc_major_to_string(
+        allocator_, later, data_version, later_buffer));
+    SCN later_commit;
+    ASSERT_EQ(OB_SUCCESS, later_commit.convert_for_tx(later_snapshot + DEFAULT_INC_MAJOR_STEP));
+    ObDDLIncMajorCommitReplayExecutor later_replay;
+    ASSERT_EQ(OB_SUCCESS, later_replay.init(ls_handle.get_ls(), tablet_id, later_commit,
+        transaction::ObTransID(102), transaction::ObTxSEQ(202, 0), later_snapshot, data_version,
+        false /*rollback*/, false /*co_sstable*/, later_buffer, later->get_start_scn(),
+        false /*need_check_ddl_checkpoint*/));
+    ASSERT_EQ(OB_SUCCESS, later_replay.do_replay_(local));
+    ObTabletSSLinkMajorTask older(ctx.ls_id_, tablet_id, narrow_snapshot,
+        base, INC_MAJOR_MERGE, false /*prewarm*/, false /*need_report*/);
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, tablet_id, local));
+    ObTabletMemberWrapper<ObTabletTableStore> query_store;
+    ASSERT_EQ(OB_SUCCESS, local.get_obj()->fetch_table_store(query_store));
+    ObSEArray<ObNewVersionRange, 8> query_ranges;
+    ASSERT_EQ(OB_SUCCESS, query_store.get_member()->get_async_index_sstable_version_ranges(
+        *local.get_obj(), query_ranges));
+    ObAsyncIndexSegmentGroupCtx query_ctx;
+    ASSERT_EQ(OB_SUCCESS, query_ctx.add_index_tablet_version_ranges(local, query_ranges));
+    ObSEArray<ObNewVersionRange, 1> delete_ranges;
+    ObNewVersionRange delete_range;
+    delete_range.base_version_ = 0;
+    delete_range.snapshot_version_ = later_snapshot;
+    ASSERT_EQ(OB_SUCCESS, delete_ranges.push_back(delete_range));
+    ASSERT_EQ(OB_SUCCESS, query_ctx.set_delete_table_version_ranges(delete_ranges, later_snapshot));
+    ASSERT_EQ(OB_SUCCESS, query_ctx.calc_query_version_ranges(SCN::max_scn()));
+    ASSERT_EQ(later_snapshot, query_ctx.get_async_index_read_snapshot().get_val_for_tx());
+    bool covering_result_visible = false;
+    for (int64_t i = 0; i < query_ranges.count(); ++i) {
+      covering_result_visible |= query_ranges.at(i).base_version_ == base
+          && query_ranges.at(i).snapshot_version_ == wide_snapshot;
+    }
+    ASSERT_TRUE(covering_result_visible) << "replayed compaction result must remain visible";
+    ASSERT_EQ(2, query_store.get_member()->get_inc_major_sstables().count());
+    ASSERT_EQ(initial_progress, local.get_obj()->get_last_inc_major_snapshot_version());
+    InvMergeIterReadInfo read_info;
+    ObInvIdxRowDesc row_desc;
+    bool has_pos_list = false;
+    ASSERT_EQ(OB_SUCCESS, init_inv_merge_iter_read_info_for_tablet(
+        *local.get_obj(), allocator_, read_info, row_desc, has_pos_list));
+    ObSEArray<InvIdxRowSnapshot, 64> actual_rows;
+    ObSEArray<InvIdxRowSnapshot, 64> expected_rows;
+    ASSERT_EQ(OB_SUCCESS, collect_inv_rows_from_sstable(
+        *original_inv, read_info, row_desc, has_pos_list, allocator_, expected_rows));
+    ASSERT_GT(expected_rows.count(), 0);
+    const ObSSTableArray &query_tables = query_store.get_member()->get_inc_major_sstables();
+    for (int64_t i = 0; i < query_tables.count(); ++i) {
+      if (query_tables.at(i)->get_async_index_snapshot_version() == wide_snapshot) {
+        ASSERT_EQ(OB_SUCCESS, collect_inv_rows_from_sstable(
+            *static_cast<ObInvSSTable *>(query_tables.at(i)), read_info, row_desc,
+            has_pos_list, allocator_, actual_rows));
+      }
+    }
+    ASSERT_EQ(expected_rows.count(), actual_rows.count());
+    sort_inv_row_snapshots(expected_rows);
+    sort_inv_row_snapshots(actual_rows);
+    ASSERT_NO_FATAL_FAILURE(verify_inv_row_snapshots_equal(expected_rows, actual_rows));
+    ObTabletSSLinkMajorTask newer(ctx.ls_id_, tablet_id, wide_snapshot,
+        base, INC_MAJOR_MERGE, false /*prewarm*/, false /*need_report*/);
+    ObTabletHandle stale_link_tablet;
+    ASSERT_EQ(OB_SUCCESS, stale_link_tablet.assign(local));
+    // Replay already installed M with this exact range, but did not complete
+    // compaction LINK. Linking that result must advance the watermark.
+    ASSERT_LT(local.get_obj()->get_last_inc_major_snapshot_version(), wide_snapshot);
+    ASSERT_EQ(OB_SUCCESS, newer.process());
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, tablet_id, local));
+    ObTabletMemberWrapper<ObTabletTableStore> finished_store;
+    ASSERT_EQ(OB_SUCCESS, local.get_obj()->fetch_table_store(finished_store));
+    ASSERT_EQ(2, finished_store.get_member()->get_inc_major_sstables().count());
+    ASSERT_EQ(wide_snapshot, local.get_obj()->get_last_inc_major_snapshot_version());
+    ASSERT_EQ(OB_SUCCESS, finished_store.get_member()->check_continuous(true));
+    ASSERT_EQ(OB_SUCCESS, replay.do_replay_(local));
+    ASSERT_EQ(OB_SUCCESS, older.process());
+    ASSERT_EQ(OB_SUCCESS, newer.process());
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, tablet_id, local));
+    ASSERT_EQ(wide_snapshot, local.get_obj()->get_last_inc_major_snapshot_version());
+
+    // Q1 selected narrow before Q2 installed wide. Resume below process()'s
+    // unlocked progress check, using Q1's retained tablet and selected result.
+    // The real tablet-service write lock must expose Q2's current TableStore.
+    ObArenaAllocator stale_link_allocator(ObMemAttr(MTL_ID(), "StaleIncLink"));
+    ASSERT_EQ(OB_EAGAIN, older.do_link_(ls_handle, stale_link_tablet,
+        *shared.get_obj(), *narrow, narrow_meta_scn, stale_link_allocator));
+    // An equal completed snapshot is outdated too; retry through process()
+    // observes the current watermark and exits without another installation.
+    ASSERT_EQ(OB_EAGAIN, newer.do_link_(ls_handle, stale_link_tablet,
+        *shared.get_obj(), *wide, wide_meta_scn, stale_link_allocator));
+    ASSERT_EQ(OB_SUCCESS, older.process());
+    ASSERT_EQ(OB_SUCCESS, newer.process());
+    ASSERT_EQ(OB_SUCCESS, get_tablet_handle(ctx.ls_id_, tablet_id, local));
+    ASSERT_EQ(wide_snapshot, local.get_obj()->get_last_inc_major_snapshot_version());
+    ObTabletMemberWrapper<ObTabletTableStore> after_stale_link;
+    ASSERT_EQ(OB_SUCCESS, local.get_obj()->fetch_table_store(after_stale_link));
+    ASSERT_EQ(2, after_stale_link.get_member()->get_inc_major_sstables().count());
+    ASSERT_EQ(OB_SUCCESS, after_stale_link.get_member()->check_continuous(true));
+    ASSERT_EQ(wide->get_key(),
+        after_stale_link.get_member()->get_inc_major_sstables().at(0)->get_key());
+    ASSERT_EQ(later->get_key(),
+        after_stale_link.get_member()->get_inc_major_sstables().at(1)->get_key());
+  }
+}
+
 // Exercise the production sequence allocation through two real IncMajor DAGs.
 // A | B | D are adjacent version ranges, but A's keys overlap only the tail of
 // B+D. Merge B+D -> C, then A+C: the end SCN stays fixed while the generation grows.
+// Read both identities from persisted macro metadata, not writer counters.
+void collect_inc_major_macro_ids(
+    ObLSHandle &ls_handle,
+    const ObTabletID &tablet_id,
+    ObIAllocator &allocator,
+    const int64_t expected_base,
+    const int64_t expected_snapshot,
+    ObIArray<MacroBlockId> &physical_ids,
+    ObIArray<ObLogicMacroBlockId> &logic_ids,
+    SCN &end_scn,
+    int16_t &sstable_seq)
+{
+  ObTabletHandle current_handle;
+  ObTabletMemberWrapper<ObTabletTableStore> store;
+  ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(tablet_id, current_handle));
+  ASSERT_EQ(OB_SUCCESS, current_handle.get_obj()->fetch_table_store(store));
+  ObInvSSTable *merged = nullptr;
+  const ObSSTableArray &tables = store.get_member()->get_inc_major_sstables();
+  for (int64_t i = 0; i < tables.count(); ++i) {
+    ObNewVersionRange range;
+    ASSERT_EQ(OB_SUCCESS, tables.at(i)->get_async_index_version_range(range));
+    if (range.base_version_ == expected_base && range.snapshot_version_ == expected_snapshot) {
+      ASSERT_EQ(nullptr, merged);
+      ASSERT_TRUE(tables.at(i)->is_inv_sstable());
+      merged = static_cast<ObInvSSTable *>(tables.at(i));
+    }
+  }
+  ASSERT_NE(nullptr, merged);
+  ObSSTableMetaHandle meta;
+  ASSERT_EQ(OB_SUCCESS, merged->get_meta(meta));
+  sstable_seq = meta.get_sstable_meta().get_sstable_seq();
+  end_scn = merged->get_end_scn();
+  ObDatumRange range;
+  range.set_whole_range();
+  ObInvIndexBlockMacroIterator iter;
+  ASSERT_EQ(OB_SUCCESS, iter.open(
+      *merged, range, current_handle.get_obj()->get_rowkey_read_info(), allocator));
+  int tmp_ret = OB_SUCCESS;
+  ObMacroBlockDesc desc;
+  while (OB_SUCCESS == (tmp_ret = iter.get_next_macro_block(desc))) {
+    ASSERT_NE(nullptr, desc.macro_meta_);
+    ASSERT_EQ(OB_SUCCESS, physical_ids.push_back(desc.macro_meta_->get_macro_id()));
+    ASSERT_EQ(OB_SUCCESS, logic_ids.push_back(desc.macro_meta_->val_.logic_id_));
+    ASSERT_TRUE(logic_ids.at(logic_ids.count() - 1).is_valid());
+  }
+  ASSERT_EQ(OB_ITER_END, tmp_ret);
+  ASSERT_EQ(merged->get_data_macro_block_count(), logic_ids.count());
+}
+
 TEST_F(ObAsyncIndexCompactionTest, async_index_inc_major_same_end_scn_logic_ids)
 {
   share::ObTenantSwitchGuard tguard;
@@ -7875,6 +8563,7 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_inc_major_same_end_scn_logic_ids)
   const int64_t left_end = base + DEFAULT_INC_MAJOR_STEP;
   const int64_t middle_end = left_end + DEFAULT_INC_MAJOR_STEP;
   const int64_t right_end = middle_end + DEFAULT_INC_MAJOR_STEP;
+  const int64_t second_snapshot = right_end + DEFAULT_INC_MAJOR_STEP;
   const int64_t rows_per_right_segment = PARALLEL_FIRST_INC_MAJOR_ROW_CNT;
   const int64_t left_rows = rows_per_right_segment / 4;
   const uint64_t first_doc_id = 1000;
@@ -7899,53 +8588,12 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_inc_major_same_end_scn_logic_ids)
       ls_handle, tablet_id, *schema, INC_MAJOR_MERGE, middle_end, right_end,
       rows_per_right_segment, first_doc_id + 2, false, 3));
   ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(tablet_id, tablet_handle));
+  ASSERT_LT(tablet_handle.get_obj()->get_last_inc_major_snapshot_version(), right_end);
   ObSEArray<InvIdxRowSnapshot, 64> expected_rows;
   ASSERT_EQ(OB_SUCCESS, collect_inv_rows_from_async_index_merge_inputs(
-      *ls_handle.get_ls(), *tablet_handle.get_obj(), right_end,
+      *ls_handle.get_ls(), *tablet_handle.get_obj(), second_snapshot,
       allocator_, expected_rows, false /*include_base_major*/));
   ASSERT_EQ(2 * rows_per_right_segment + left_rows, expected_rows.count());
-
-  // Copy both identities from persisted macro metadata, not from writer counters.
-  auto collect_blocks = [&](const int64_t expected_base,
-                            ObIArray<MacroBlockId> &physical_ids,
-                            ObIArray<ObLogicMacroBlockId> &logic_ids,
-                            SCN &end_scn, int16_t &sstable_seq) {
-    ObTabletHandle current_handle;
-    ObTabletMemberWrapper<ObTabletTableStore> store;
-    ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(tablet_id, current_handle));
-    ASSERT_EQ(OB_SUCCESS, current_handle.get_obj()->fetch_table_store(store));
-    ObInvSSTable *merged = nullptr;
-    const ObSSTableArray &tables = store.get_member()->get_inc_major_sstables();
-    for (int64_t i = 0; i < tables.count(); ++i) {
-      ObNewVersionRange range;
-      ASSERT_EQ(OB_SUCCESS, tables.at(i)->get_async_index_version_range(range));
-      if (range.base_version_ == expected_base && range.snapshot_version_ == right_end) {
-        ASSERT_EQ(nullptr, merged);
-        ASSERT_TRUE(tables.at(i)->is_inv_sstable());
-        merged = static_cast<ObInvSSTable *>(tables.at(i));
-      }
-    }
-    ASSERT_NE(nullptr, merged);
-    ObSSTableMetaHandle meta;
-    ASSERT_EQ(OB_SUCCESS, merged->get_meta(meta));
-    sstable_seq = meta.get_sstable_meta().get_sstable_seq();
-    end_scn = merged->get_end_scn();
-    ObDatumRange range;
-    range.set_whole_range();
-    ObInvIndexBlockMacroIterator iter;
-    ASSERT_EQ(OB_SUCCESS, iter.open(
-        *merged, range, current_handle.get_obj()->get_rowkey_read_info(), allocator_));
-    int ret = OB_SUCCESS;
-    ObMacroBlockDesc desc;
-    while (OB_SUCCESS == (ret = iter.get_next_macro_block(desc))) {
-      ASSERT_NE(nullptr, desc.macro_meta_);
-      ASSERT_EQ(OB_SUCCESS, physical_ids.push_back(desc.macro_meta_->get_macro_id()));
-      ASSERT_EQ(OB_SUCCESS, logic_ids.push_back(desc.macro_meta_->val_.logic_id_));
-      ASSERT_TRUE(logic_ids.at(logic_ids.count() - 1).is_valid());
-    }
-    ASSERT_EQ(OB_ITER_END, ret);
-    ASSERT_EQ(merged->get_data_macro_block_count(), logic_ids.count());
-  };
 
   ASSERT_NO_FATAL_FAILURE(ensure_ls_reserved_snapshot_ready(ctx.ls_id_));
   ASSERT_EQ(OB_SUCCESS, execute_async_index_merge_via_scheduler(
@@ -7954,8 +8602,9 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_inc_major_same_end_scn_logic_ids)
   ObSEArray<ObLogicMacroBlockId, 16> first_logic_ids;
   SCN first_end_scn;
   int16_t first_seq = -1;
-  ASSERT_NO_FATAL_FAILURE(collect_blocks(
-      left_end, first_physical_ids, first_logic_ids, first_end_scn, first_seq));
+  ASSERT_NO_FATAL_FAILURE(collect_inc_major_macro_ids(
+      ls_handle, tablet_id, allocator_, left_end, right_end,
+      first_physical_ids, first_logic_ids, first_end_scn, first_seq));
   ASSERT_EQ(1, first_seq);
   ASSERT_GT(first_logic_ids.count(), 1);
   int64_t first_written_count = 0;
@@ -7969,15 +8618,24 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_inc_major_same_end_scn_logic_ids)
   }
   ASSERT_GT(first_written_count, 1) << "first merge must write multiple new macro blocks";
 
+  // Model an empty refresh: publication advances without a new physical table.
+  // A+C therefore retain the same end SCN and C remains the last input, while
+  // the new logical snapshot allows the second compaction to advance progress.
+  ASSERT_EQ(OB_SUCCESS, publish_async_index_version(ls_handle, tablet_id, second_snapshot));
   ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(tablet_id, tablet_handle));
+  ASSERT_EQ(right_end, tablet_handle.get_obj()->get_last_inc_major_snapshot_version());
+  int64_t input_table_count = 0;
+  ASSERT_EQ(OB_SUCCESS, get_tablet_inc_major_cnt(*tablet_handle.get_obj(), input_table_count));
+  ASSERT_EQ(2, input_table_count);
   ASSERT_EQ(OB_SUCCESS, execute_async_index_merge_via_scheduler(
-      ls_handle, tablet_handle, INC_MAJOR_MERGE, right_end, base));
+      ls_handle, tablet_handle, INC_MAJOR_MERGE, second_snapshot, base));
   ObSEArray<MacroBlockId, 16> second_physical_ids;
   ObSEArray<ObLogicMacroBlockId, 16> second_logic_ids;
   SCN second_end_scn;
   int16_t second_seq = -1;
-  ASSERT_NO_FATAL_FAILURE(collect_blocks(
-      base, second_physical_ids, second_logic_ids, second_end_scn, second_seq));
+  ASSERT_NO_FATAL_FAILURE(collect_inc_major_macro_ids(
+      ls_handle, tablet_id, allocator_, base, second_snapshot,
+      second_physical_ids, second_logic_ids, second_end_scn, second_seq));
   ASSERT_EQ(first_end_scn, second_end_scn);
   ASSERT_EQ(first_seq + 1, second_seq);
 
@@ -8026,7 +8684,7 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_inc_major_same_end_scn_logic_ids)
   ASSERT_TRUE(same_local_seq_pair)
       << "must exercise equal end SCN and local sequence, distinguished only by SSTable generation";
   ASSERT_NO_FATAL_FAILURE(verify_merged_inv_rows_match_snapshot(
-      ctx.ls_id_, tablet_id, right_end, expected_rows, ObITable::INC_INV_INDEX_SSTABLE));
+      ctx.ls_id_, tablet_id, second_snapshot, expected_rows, ObITable::INC_INV_INDEX_SSTABLE));
 }
 
 TEST_F(ObAsyncIndexCompactionTest, async_index_inc_major_compaction_schedule_and_execute)

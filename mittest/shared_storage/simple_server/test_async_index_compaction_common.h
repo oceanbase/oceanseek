@@ -64,6 +64,7 @@
 #include "storage/ob_i_store.h"
 #include "share/schema/ob_tenant_schema_service.h"
 #include "lib/time/ob_time_utility.h"
+#include "lib/utility/ob_sort.h"
 #include "storage/async_index/ob_async_index_define.h"
 #include "storage/async_index/ob_async_index_segment_group.h"
 #include "rootserver/freeze/ob_major_freeze_helper.h"
@@ -389,16 +390,15 @@ int append_inv_row_snapshot(
   return ret;
 }
 
+bool less_inv_row_snapshots(const InvIdxRowSnapshot &lhs, const InvIdxRowSnapshot &rhs)
+{
+  return cmp_inv_row_snapshots(lhs, rhs) < 0;
+}
+
 void sort_inv_row_snapshots(ObIArray<InvIdxRowSnapshot> &rows)
 {
-  for (int64_t i = 0; i < rows.count(); ++i) {
-    for (int64_t j = i + 1; j < rows.count(); ++j) {
-      if (cmp_inv_row_snapshots(rows.at(i), rows.at(j)) > 0) {
-        InvIdxRowSnapshot tmp = rows.at(i);
-        rows.at(i) = rows.at(j);
-        rows.at(j) = tmp;
-      }
-    }
+  if (rows.count() > 1) {
+    lib::ob_sort(rows.get_data(), rows.get_data() + rows.count(), less_inv_row_snapshots);
   }
 }
 
@@ -1220,8 +1220,9 @@ int add_non_empty_delete_index_major_via_merge_ctx(
     const int64_t doc_id_cnt,
     ObArenaAllocator &allocator,
     int64_t &actual_multi_version_start,
-    const int64_t row_snapshot_version = 0,
-    const int64_t *row_snapshots = nullptr)
+    const int64_t row_snapshot_version,
+    const int64_t *row_snapshots,
+    const ObMdsFilterInfo *mds_filter_info)
 {
   int ret = OB_SUCCESS;
   ObTabletHandle new_tablet_handle;
@@ -1249,7 +1250,11 @@ int add_non_empty_delete_index_major_via_merge_ctx(
     merge_context.static_param_.ls_rebuild_seq_ = ls->get_rebuild_seq();
     merge_context.static_param_.version_range_.multi_version_start_ = multi_version_start;
     merge_context.static_param_.merge_version_range_.multi_version_start_ = multi_version_start;
-    if (OB_FAIL(merge_context.prepare_compaction_filter())) {
+    // Direct merge contexts must receive the filter boundary fixed by the Medium plan.
+    if (nullptr != mds_filter_info && OB_FAIL(merge_context.filter_ctx_.mds_filter_info_.assign(
+        allocator, *mds_filter_info))) {
+      LOG_WARN("failed to assign planned delete index filter info", KR(ret), K(tablet_id));
+    } else if (OB_FAIL(merge_context.prepare_compaction_filter())) {
       LOG_WARN("failed to prepare delete index compaction filter", KR(ret), K(tablet_id));
     } else if (OB_FAIL(build_non_empty_delete_index_merge_res(
         ls_handle, tablet_id, *storage_schema, snapshot_version,
