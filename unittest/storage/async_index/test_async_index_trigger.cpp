@@ -1927,6 +1927,8 @@ TEST_F(TestAsyncIndexTrigger, refresh_retry_policy_preserves_manual_and_ddl_boun
   }
   EXPECT_FALSE(ObAsyncIndexRefreshUtil::is_refresh_retry_error(OB_TIMEOUT, ASYNC_REFRESH_TYPE_MANUAL));
   EXPECT_TRUE(ObAsyncIndexRefreshUtil::is_refresh_retry_error(
+      OB_GET_LOCATION_TIME_OUT, ASYNC_REFRESH_TYPE_MANUAL));
+  EXPECT_TRUE(ObAsyncIndexRefreshUtil::is_refresh_retry_error(
       OB_INVALID_QUERY_TIMESTAMP, ASYNC_REFRESH_TYPE_MANUAL));
   for (const auto type : {ASYNC_REFRESH_TYPE_CREATE_INDEX, ASYNC_REFRESH_TYPE_OFFLINE_DDL}) {
     EXPECT_TRUE(ObAsyncIndexRefreshUtil::is_refresh_retry_error(OB_TIMEOUT, type));
@@ -2302,6 +2304,85 @@ TEST_F(TestAsyncIndexTrigger, async_refresh_no_callback_failure_preserves_partit
   }
   EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED, result);
   EXPECT_FALSE(has_pending);
+}
+
+TEST_F(TestAsyncIndexTrigger, manual_refresh_location_timeout_preserves_progress_for_outer_retry)
+{
+  RefreshRpcTestWorker worker;
+  RefreshRpcWorkerGuard worker_guard(worker);
+  obrpc::ObSrvRpcProxy transport;
+  ObLocationService location;
+  ObAsyncIndexRefreshProgress progress;
+  ObAddr server;
+  ASSERT_TRUE(server.set_ip_addr("127.0.0.1", 2882));
+  {
+    RefreshTestDispatcher proxy(transport, location, progress);
+    ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, 3));
+    const int results[] = {OB_SUCCESS, OB_GET_LOCATION_TIME_OUT, OB_EAGAIN};
+    for (int64_t i = 0; i < 3; ++i) {
+      ASSERT_EQ(OB_SUCCESS, proxy.post_partition(server, 1000000, i));
+      proxy.callback_->result_.ret_code_ = results[i];
+      ASSERT_EQ(OB_SUCCESS, proxy.callback_->process());
+      proxy.retry_states_.at(i).deadline_ = ObTimeUtility::current_time() + 1000000;
+    }
+    ASSERT_EQ(OB_SUCCESS, proxy.collect_results());
+    bool has_pending = false;
+    int64_t sleep_us = 0;
+    // The location timeout must not terminate another partition's EAGAIN retry.
+    EXPECT_EQ(OB_SUCCESS, proxy.prepare_retry(0, OB_SUCCESS, has_pending, sleep_us));
+    EXPECT_TRUE(has_pending);
+    EXPECT_TRUE(progress.is_success(0));
+    EXPECT_FALSE(progress.is_success(1));
+    EXPECT_FALSE(proxy.retry_states_.at(1).pending_);
+    EXPECT_EQ(OB_GET_LOCATION_TIME_OUT, proxy.retry_states_.at(1).result_);
+    EXPECT_TRUE(proxy.retry_states_.at(2).pending_);
+    EXPECT_EQ(5000, proxy.args_.at(1).target_refresh_scn_);
+  }
+  // The outer manual retry reconstructs the dispatcher with the same progress.
+  RefreshTestDispatcher retry(transport, location, progress);
+  ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(retry, 3));
+  retry.args_.at(1).ls_id_ = ObLSID(2001);
+  ASSERT_EQ(OB_SUCCESS, progress.prepare(retry.args_, retry.memory_tenant_id_));
+  EXPECT_TRUE(progress.is_success(0));
+  for (int64_t i = 1; i < 3; ++i) {
+    EXPECT_FALSE(progress.is_success(i));
+    EXPECT_EQ(5000, retry.args_.at(i).target_refresh_scn_);
+    ASSERT_EQ(OB_SUCCESS, retry.post_partition(server, 1000000, i));
+    ASSERT_EQ(OB_SUCCESS, retry.callback_->process());
+  }
+  ASSERT_EQ(OB_SUCCESS, retry.collect_results());
+  for (int64_t i = 0; i < 3; ++i) {
+    EXPECT_TRUE(progress.is_success(i));
+  }
+  // All targets are complete; execute must skip dispatching them again.
+  EXPECT_EQ(OB_SUCCESS, retry.execute());
+  EXPECT_EQ(0, retry.rpc_count_);
+  EXPECT_EQ(3, retry.skipped_count_);
+}
+
+TEST_F(TestAsyncIndexTrigger, manual_refresh_location_timeout_does_not_mask_terminal_error)
+{
+  for (const int64_t failed_partition : {0, 1}) {
+    SCOPED_TRACE(failed_partition);
+    obrpc::ObSrvRpcProxy transport;
+    ObLocationService location;
+    ObAsyncIndexRefreshProgress progress;
+    RefreshTestDispatcher proxy(transport, location, progress);
+    ASSERT_NO_FATAL_FAILURE(init_refresh_test_dispatcher(proxy, 2));
+    for (int64_t i = 0; i < 2; ++i) {
+      proxy.retry_states_.at(i).result_ = i == failed_partition
+          ? OB_INVALID_ARGUMENT : OB_GET_LOCATION_TIME_OUT;
+    }
+    bool has_pending = true;
+    int64_t sleep_us = 0;
+    int ret = proxy.prepare_retry(0, OB_SUCCESS, has_pending, sleep_us);
+    EXPECT_EQ(OB_INVALID_ARGUMENT, ret);
+    EXPECT_FALSE(has_pending);
+    for (int64_t i = 0; i < 2; ++i) {
+      ret = record_refresh_error(proxy.retry_states_.at(i).result_, ASYNC_REFRESH_TYPE_MANUAL, ret);
+    }
+    EXPECT_EQ(OB_INVALID_ARGUMENT, ret);
+  }
 }
 
 TEST_F(TestAsyncIndexTrigger, async_refresh_cancel_stops_remaining_partition_dispatch)

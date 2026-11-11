@@ -154,9 +154,12 @@ bool ObAsyncIndexRefreshUtil::is_refresh_retry_error(const int ret, const int8_t
 {
   bool retry = false;
   if (storage::ASYNC_REFRESH_TYPE_MANUAL == refresh_type) {
+    // A location lookup can time out during a topology change, including the
+    // refresh object's lock lookup. Retry with the original target and progress.
     retry = OB_OLD_SCHEMA_VERSION == ret || OB_SCHEMA_EAGAIN == ret
         || OB_DDL_SCHEMA_VERSION_NOT_MATCH == ret || OB_NEED_RETRY == ret
         || OB_INVALID_QUERY_TIMESTAMP == ret || OB_TASK_EXPIRED == ret
+        || OB_GET_LOCATION_TIME_OUT == ret
         || is_master_changed_error(ret) || is_partition_change_error(ret)
         || is_ddl_stmt_packet_retry_err(ret);
   } else if (storage::ASYNC_REFRESH_TYPE_CREATE_INDEX == refresh_type
