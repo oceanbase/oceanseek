@@ -167,6 +167,7 @@ int ObDirectLoadDagInsertTableRowIterator::inner_get_next_row(ObDatumRow *&resul
           if (OB_FAIL(row_iter->get_hide_pk_interval()->next_value(pk_seq))) {
             LOG_WARN("fail to get next pk seq", KR(ret));
           } else {
+            datum_row2->storage_datums_[0].reuse();
             datum_row2->storage_datums_[0].set_int(pk_seq);
           }
         } else {
