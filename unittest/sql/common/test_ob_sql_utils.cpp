@@ -8,6 +8,7 @@
 #define protected public
 #include "storage/tx/ob_trans_define_v4.h"
 #undef protected
+#include <string>
 #include "sql/ob_sql_utils.h"
 #include "sql/ob_sql_context.h"
 #include "sql/engine/ob_exec_context.h"
@@ -285,6 +286,47 @@ TEST_F(ObSQLUtilsTest, outtable_lob_control_owner_rejects_branches_and_reset_con
     EXPECT_FALSE(ObSQLUtils::is_outtable_lob_control_owner_sql(&child_ctx));
   }
   session.get_tx_desc() = nullptr;
+}
+
+TEST_F(ObSQLUtilsTest, make_field_name_utf8_boundary)
+{
+  ObArenaAllocator allocator(common::ObModIds::TEST, common::OB_MALLOC_NORMAL_BLOCK_SIZE);
+  struct TestCase {
+    const char *leading_;
+    int64_t prefix_len_;
+    const char *tail_;
+    int64_t expected_len_;
+  };
+  const TestCase cases[] = {
+    // Every possible split inside a 2/3/4-byte UTF-8 character.
+    {"", 254, "\xc3\xa9suffix", 254},
+    {"", 254, "\xe5\x8f\xb7suffix", 254},
+    {"", 253, "\xe5\x8f\xb7suffix", 253},
+    {"", 254, "\xf0\x9f\x98\x80suffix", 254},
+    {"", 253, "\xf0\x9f\x98\x80suffix", 253},
+    {"", 252, "\xf0\x9f\x98\x80suffix", 252},
+    // A complete character ending exactly at the byte limit must be kept.
+    {"", 253, "\xc3\xa9suffix", 255},
+    {"", 252, "\xe5\x8f\xb7suffix", 255},
+    {"", 251, "\xf0\x9f\x98\x80suffix", 255},
+    // Exercise the copy branch after stripping leading whitespace.
+    {" \t\r\n", 253, "\xe5\x8f\xb7suffix", 253},
+    // Inputs below or exactly at the limit must remain intact.
+    {"", 251, "\xe5\x8f\xb7", 254},
+    {"", 252, "\xe5\x8f\xb7", 255},
+  };
+  for (const TestCase &test_case : cases) {
+    const std::string leading(test_case.leading_);
+    const std::string value = std::string(test_case.prefix_len_, 'a') + test_case.tail_;
+    const std::string input = leading + value;
+    SCOPED_TRACE(::testing::Message() << "leading bytes=" << leading.length()
+                                    << ", prefix bytes=" << test_case.prefix_len_
+                                    << ", tail=" << test_case.tail_);
+    ObString name;
+    ASSERT_EQ(OB_SUCCESS, ObSQLUtils::make_field_name(input.data(), input.length(),
+              CS_TYPE_UTF8MB4_GENERAL_CI, &allocator, name));
+    ASSERT_EQ(value.substr(0, test_case.expected_len_), std::string(name.ptr(), name.length()));
+  }
 }
 
 }

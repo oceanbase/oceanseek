@@ -1975,7 +1975,13 @@ int ObSQLUtils::make_field_name(const char *src,
       new_length--;
     }
 
-    int64_t final_len = min(new_length, OB_MAX_ALIAS_NAME_LENGTH);
+    int64_t final_len = new_length;
+    if (new_length > OB_MAX_ALIAS_NAME_LENGTH) {
+      int64_t char_len = 0;
+      // Keep the same byte limit, but don't cut a multibyte character in half.
+      final_len = ObCharset::max_bytes_charpos(cs_type, new_start, new_length,
+                                             OB_MAX_ALIAS_NAME_LENGTH, char_len);
+    }
     if (new_length == len) {
       name.assign_ptr(src, static_cast<int32_t>(final_len));
     } else {

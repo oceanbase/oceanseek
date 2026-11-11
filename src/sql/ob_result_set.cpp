@@ -2308,7 +2308,12 @@ int ObResultSet::make_final_field_name(char *buf, int64_t len, common::ObString 
       buf++;
       len--;
     }
-    len = len < MAX_COLUMN_CHAR_LENGTH ? len : MAX_COLUMN_CHAR_LENGTH;
+    if (len > MAX_COLUMN_CHAR_LENGTH) {
+      int64_t char_len = 0;
+      // After rebuilding the column name from parameters, keep the same byte limit
+      // without cutting a multibyte character in half.
+      len = ObCharset::max_bytes_charpos(cs_type, buf, len, MAX_COLUMN_CHAR_LENGTH, char_len);
+    }
     field_name.assign(buf, static_cast<int32_t>(len));
   }
   return ret;
