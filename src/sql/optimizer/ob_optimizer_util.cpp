@@ -8026,7 +8026,10 @@ int ObOptimizerUtil::pushdown_filter_into_subquery(const ObDMLStmt &parent_stmt,
   bool has_rownum = false;
   bool has_rollup = false;
   can_pushdown = false;
-  if (subquery.is_set_stmt()) {
+  if (subquery.is_hybrid_search()) {
+    // 外部条件必须在完整 DSL 结果（含 Top-K/分页）之上执行。
+    // 继续走尾部 remain_filters 回收，不能提前返回丢失条件。
+  } else if (subquery.is_set_stmt()) {
     if (subquery.is_recursive_union() || subquery.has_limit()) {
       //do nothing
     } else if (OB_FAIL(check_pushdown_filter(parent_stmt,
@@ -10215,7 +10218,9 @@ int ObOptimizerUtil::pushdown_join_filter_into_subquery(const ObDMLStmt &parent_
   bool has_rownum = false;
   bool has_rollup = false;
   can_pushdown = false;
-  if (subquery.is_set_stmt()) {
+  if (subquery.is_hybrid_search()) {
+    // Join Filter 同样不能越过当前显式混搜块的完整 DSL 结果边界。
+  } else if (subquery.is_set_stmt()) {
     if (subquery.is_recursive_union() || subquery.has_limit()) {
       //do nothing
     } else if (OB_FAIL(check_pushdown_join_filter_quals(parent_stmt,
