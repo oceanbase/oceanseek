@@ -1773,7 +1773,8 @@ int ObObj::build_not_strict_default_value(
 int ObObj::deep_copy(const ObObj &src, char *buf, const int64_t size, int64_t &pos)
 {
   int ret = OB_SUCCESS;
-  if (ob_is_string_type(src.get_type()) || ob_is_json(src.get_type()) || ob_is_geometry(src.get_type()) || ob_is_roaringbitmap(src.get_type())) {
+  if (ob_is_string_type(src.get_type()) || ob_is_json(src.get_type()) || ob_is_geometry(src.get_type())
+      || ob_is_roaringbitmap(src.get_type()) || ob_is_variant(src.get_type())) {
     ObString src_str = src.get_string();
     if (OB_UNLIKELY(size < (pos + src_str.length()))) {
       ret = OB_BUF_NOT_ENOUGH;
@@ -1861,6 +1862,7 @@ void* ObObj::get_deep_copy_obj_ptr()
       || ob_is_json(this->get_type())
       || ob_is_geometry(this->get_type())
       || ob_is_roaringbitmap(this->get_type())
+      || ob_is_variant(this->get_type())
       || ob_is_user_defined_sql_type(this->get_type())
       || ob_is_collection_sql_type(this->get_type())) {
     // val_len_ == 0 is empty string, and it may point to unexpected address
@@ -2303,6 +2305,7 @@ ObObjTypeFuncs OBJ_FUNCS[ObMaxType] =
   DEF_FUNC_ENTRY(ObMySQLDateTimeType), // 53, mysql datetime
   DEF_FUNC_ENTRY(ObRoaringBitmapType), // 54, roaringbitmap
   DEF_FUNC_ENTRY(ObExtendBLobType),    // 55, extend blob
+  DEF_FUNC_ENTRY(ObVariantType),       // 56, variant
 
 };
 static_assert(sizeof(OBJ_FUNCS) / sizeof(OBJ_FUNCS[0]) == ObMaxType, "Not enough initializer");

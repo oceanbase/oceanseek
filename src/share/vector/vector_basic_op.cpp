@@ -158,6 +158,10 @@ static HashFuncTypeForTc get_hashfunc_by_tc_impl(VecValueTypeClass tc)
     res_func = VecTCHashCalc<VEC_TC_ROARINGBITMAP, HashMethod, true>::hash;
     break;
   }
+  case (VEC_TC_VARIANT) : {
+    res_func = VecTCHashCalc<VEC_TC_VARIANT, HashMethod, true>::hash;
+    break;
+  }
   case (MAX_VEC_TC) : {
     res_func = VecTCHashCalc<MAX_VEC_TC, HashMethod, true>::hash;
     break;
@@ -327,6 +331,10 @@ NullHashFuncTypeForTc get_null_hashfunc_by_tc(VecValueTypeClass tc)
   }
   case (VEC_TC_ROARINGBITMAP) : {
     res_func = VectorBasicOp<VEC_TC_ROARINGBITMAP>::null_hash<ObMurmurHash, true>;
+    break;
+  }
+  case (VEC_TC_VARIANT) : {
+    res_func = VectorBasicOp<VEC_TC_VARIANT>::null_hash<ObMurmurHash, true>;
     break;
   }
   case (MAX_VEC_TC) : {

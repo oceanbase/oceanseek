@@ -3829,6 +3829,11 @@ DEF_CS_FUNCS(ObMySQLDateTimeType, datetime, int64_t, int64_t); // reuse get_date
 DEF_DATETIME_PRINT_FUNCS(ObMySQLDateTimeType, mysql_datetime, mdatetime);
 DEF_SERIALIZE_FUNCS(ObMySQLDateTimeType, datetime, int64_t); // reuse get_date for mysql_date type
 
+// ObVariantType=56
+DEF_HEX_STRING_PRINT_FUNCS(ObVariantType);
+DEF_STRING_CS_FUNCS(ObVariantType);
+DEF_TEXT_SERIALIZE_FUNCS(ObVariantType, string, ObString);
+
 }
 }
 

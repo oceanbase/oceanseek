@@ -136,6 +136,7 @@ const static double comparison_params_normal[ObMaxTC+1] = {
   NORMAL_CMP_INT_COST,            // mysql date
   NORMAL_CMP_INT_COST,            // mysql datetime
   NORMAL_CMP_CHAR_COST,           // roaringbitmap
+  NORMAL_CMP_LOB_COST,                                       // variant
 };
 
 const static double hash_params_normal[ObMaxTC+1] = {
@@ -169,6 +170,7 @@ const static double hash_params_normal[ObMaxTC+1] = {
   NORMAL_HASH_INT_COST,            // mysql date
   NORMAL_HASH_INT_COST,            // mysql datetime
   NORMAL_HASH_CHAR_COST,           // roaringbitmap
+  NORMAL_HASH_CHAR_COST,                                     // variant
 };
 
 const static double project_params_normal[2][2][ObMaxTC+1] = {
@@ -201,6 +203,10 @@ const static double project_params_normal[2][2][ObMaxTC+1] = {
       NORMAL_ROW_STORE_PROJECT_COLUMN_SEQ_INT_COST,            // user defined type
       NORMAL_ROW_STORE_PROJECT_COLUMN_SEQ_NUMBER_COST,         // ObDecimalIntTC
       NORMAL_ROW_STORE_PROJECT_COLUMN_SEQ_LOB_COST,            // collection sql type
+      0,                                                     // mysql date
+      0,                                                     // mysql datetime
+      0,                                                     // roaringbitmap
+      NORMAL_ROW_STORE_PROJECT_COLUMN_SEQ_LOB_COST,          // variant
     },
     {// row store random access
       NORMAL_ROW_STORE_PROJECT_COLUMN_RND_INT_COST,            // null
@@ -230,6 +236,10 @@ const static double project_params_normal[2][2][ObMaxTC+1] = {
       NORMAL_ROW_STORE_PROJECT_COLUMN_RND_INT_COST,            // user defined type
       NORMAL_ROW_STORE_PROJECT_COLUMN_RND_NUMBER_COST,         // ObDecimalIntTC
       NORMAL_ROW_STORE_PROJECT_COLUMN_RND_LOB_COST,            // collection sql type
+      0,                                                     // mysql date
+      0,                                                     // mysql datetime
+      0,                                                     // roaringbitmap
+      NORMAL_ROW_STORE_PROJECT_COLUMN_RND_LOB_COST,          // variant
     }
   },
   {
@@ -261,6 +271,10 @@ const static double project_params_normal[2][2][ObMaxTC+1] = {
       NORMAL_COLUMN_STORE_PROJECT_COLUMN_SEQ_INT_COST,            // user defined type
       NORMAL_COLUMN_STORE_PROJECT_COLUMN_SEQ_NUMBER_COST,         // ObDecimalIntTC
       NORMAL_COLUMN_STORE_PROJECT_COLUMN_SEQ_LOB_COST,            // collection sql type
+      0,                                                     // mysql date
+      0,                                                     // mysql datetime
+      0,                                                     // roaringbitmap
+      NORMAL_COLUMN_STORE_PROJECT_COLUMN_SEQ_LOB_COST,       // variant
     },
     {// column store random access
       NORMAL_COLUMN_STORE_PROJECT_COLUMN_RND_INT_COST,            // null
@@ -290,6 +304,10 @@ const static double project_params_normal[2][2][ObMaxTC+1] = {
       NORMAL_COLUMN_STORE_PROJECT_COLUMN_RND_INT_COST,            // user defined type
       NORMAL_COLUMN_STORE_PROJECT_COLUMN_RND_NUMBER_COST,         // ObDecimalIntTC
       NORMAL_COLUMN_STORE_PROJECT_COLUMN_RND_LOB_COST,            // collection sql type
+      0,                                                     // mysql date
+      0,                                                     // mysql datetime
+      0,                                                     // roaringbitmap
+      NORMAL_COLUMN_STORE_PROJECT_COLUMN_RND_LOB_COST,       // variant
     }
   }
 };

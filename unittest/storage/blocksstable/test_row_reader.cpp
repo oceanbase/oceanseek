@@ -40,10 +40,10 @@ public:
   // Every ObObjType from ObTinyIntType to ObHexStringType inclusive.
   // Skip ObNullType and ObExtendType because for external usage, a column type
   // can't be NULL or NOP.
-  ObObjType not_test_type[13] = {
+  ObObjType not_test_type[14] = {
       ObNullType, ObExtendType, ObUnknownType, ObEnumInnerType, ObSetInnerType,
       ObNumberFloatType, ObURowIDType, ObLobType, ObUserDefinedSQLType, ObDecimalIntType,
-      ObCollectionSQLType, ObMySQLDateType, ObMySQLDateTimeType};
+      ObCollectionSQLType, ObMySQLDateType, ObMySQLDateTimeType, ObVariantType};
   static const int64_t column_num = ObMaxType - sizeof(not_test_type) / sizeof(ObObjType);
 public:
   TestNewRowReader()

@@ -40,6 +40,15 @@ struct VecTCHashCalc {
 };
 
 template<typename HashMethod, bool hash_v2>
+struct VecTCHashCalc<VEC_TC_VARIANT, HashMethod, hash_v2>
+{
+  OB_INLINE static int hash(HASH_ARG_LIST)
+  {
+    return OB_NOT_SUPPORTED;
+  }
+};
+
+template<typename HashMethod, bool hash_v2>
 struct VecTCHashCalc<VEC_TC_FIXED_DOUBLE, HashMethod, hash_v2> {
   OB_INLINE static int hash(HASH_ARG_LIST) {
     double d_val = *reinterpret_cast<const double *>(data);
@@ -836,6 +845,18 @@ struct VecTCCmpCalc<VEC_TC_ROWID, VEC_TC_ROWID> : public VecCmpCalcBase
     const ObURowIDData r_data(r_len, reinterpret_cast<const uint8_t *>(r_v));
     cmp_ret = l_data.compare(r_data);
     return OB_SUCCESS;
+  }
+};
+
+template<>
+struct VecTCCmpCalc<VEC_TC_VARIANT, VEC_TC_VARIANT> : public VecCmpCalcBase
+{
+  static const constexpr bool defined_ = false;
+  OB_INLINE static int cmp_ws(CMP_ARG_LIST, bool /*end_with_space*/)
+  { return cmp(l_meta, r_meta, l_v, l_len, r_v, r_len, cmp_ret); }
+  OB_INLINE static int cmp(CMP_ARG_LIST)
+  {
+    return OB_NOT_SUPPORTED;
   }
 };
 

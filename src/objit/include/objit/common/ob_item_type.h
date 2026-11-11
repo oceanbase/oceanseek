@@ -77,6 +77,7 @@ typedef enum ObItemType
   T_COLLECTION  = 51,
   T_ROARINGBITMAP = 54,
   T_EXTBLOB = 55,
+  T_VARIANT = 56,
 
   T_IEEE754_NAN = 61,
   T_IEEE754_INFINITE = 62,

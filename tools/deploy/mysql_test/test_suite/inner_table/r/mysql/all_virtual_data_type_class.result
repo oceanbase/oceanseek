@@ -30,6 +30,7 @@ data_type_class	data_type_class_str
 27	MYSQL_DATE
 28	MYSQL_DATETIME
 29	ROARINGBITMAP
+30	VARIANT
 select data_type_class, data_type_class_str from __all_virtual_data_type_class;
 data_type_class	data_type_class_str
 0	NULL
@@ -61,6 +62,7 @@ data_type_class	data_type_class_str
 27	MYSQL_DATE
 28	MYSQL_DATETIME
 29	ROARINGBITMAP
+30	VARIANT
 select * from __all_virtual_data_type_class where data_type_class = 10;
 data_type_class	data_type_class_str
 10	STRING
@@ -120,6 +122,7 @@ MYSQL_DATE	MYSQL_DATE
 MYSQL_DATETIME	MYSQL_DATETIME
 ROARINGBITMAP	ROARINGBITMAP
 EXTBLOB	TEXT
+VARIANT	VARIANT
 show create table __all_virtual_data_type_class;
 Table	Create Table
 __all_virtual_data_type_class	CREATE TABLE `__all_virtual_data_type_class` (

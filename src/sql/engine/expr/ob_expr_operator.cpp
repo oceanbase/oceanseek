@@ -1900,6 +1900,7 @@ ObObjType ObExprOperator::enumset_calc_types_[2 /*use_subschema*/][ObMaxTC] =
     ObVarcharType, /*ObMySQLDateTC*/
     ObVarcharType, /*ObMySQLDateTimeTC*/
     ObVarcharType, /*ObRoaringBitmapTC*/
+    ObMaxType, /*ObVariantTC*/
   },
   {
     ObUInt64Type,/*ObNullTC*/
@@ -1932,6 +1933,7 @@ ObObjType ObExprOperator::enumset_calc_types_[2 /*use_subschema*/][ObMaxTC] =
     ObMySQLDateType, /*ObMySQLDateTC*/
     ObMySQLDateTimeType, /*ObMySQLDateTimeTC*/
     ObVarcharType, /*ObRoaringBitmapTC*/
+    ObMaxType, /*ObVariantTC*/
   },
 };
 ////////////////////////////////////////////////////////////////

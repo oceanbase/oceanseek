@@ -438,6 +438,7 @@ struct ObDynReserveBuf
            || common::ObUserDefinedSQLTC == tc
            || common::ObCollectionSQLTC == tc
            || common::ObRoaringBitmapTC == tc
+           || common::ObVariantTC == tc
            || common::ObEnumSetInnerTC == tc;
   }
 

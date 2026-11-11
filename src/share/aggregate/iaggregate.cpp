@@ -196,6 +196,7 @@ static const int32_t reserved_sizes[] = {
   string_reserved_size,                 // roaringbitmap
   RTSIZE(VEC_TC_MYSQL_DATE),            // mysql date
   RTSIZE(VEC_TC_MYSQL_DATETIME),        // mysql datetime
+  string_reserved_size,                 // variant
 };
 static_assert(sizeof(reserved_sizes) / sizeof(reserved_sizes[0]) == MAX_VEC_TC, "");
 

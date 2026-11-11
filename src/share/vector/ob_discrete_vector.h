@@ -54,6 +54,7 @@ extern template class ObDiscreteVector<VectorBasicOp<VEC_TC_GEO>>;
 extern template class ObDiscreteVector<VectorBasicOp<VEC_TC_UDT>>;
 extern template class ObDiscreteVector<VectorBasicOp<VEC_TC_COLLECTION>>;
 extern template class ObDiscreteVector<VectorBasicOp<VEC_TC_ROARINGBITMAP>>;
+extern template class ObDiscreteVector<VectorBasicOp<VEC_TC_VARIANT>>;
 } // end namespace common
 } // end namespace oceanbase
 #endif // OCEANBASE_SHARE_VECTOR_OB_DISCRETE_VECTOR_H_

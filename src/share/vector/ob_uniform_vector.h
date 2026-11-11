@@ -81,6 +81,7 @@ extern template class ObUniformVector<true, VectorBasicOp<VEC_TC_COLLECTION>>;
 extern template class ObUniformVector<true, VectorBasicOp<VEC_TC_MYSQL_DATETIME>>;
 extern template class ObUniformVector<true, VectorBasicOp<VEC_TC_MYSQL_DATE>>;
 extern template class ObUniformVector<true, VectorBasicOp<VEC_TC_ROARINGBITMAP>>;
+extern template class ObUniformVector<true, VectorBasicOp<VEC_TC_VARIANT>>;
 
 } // end namespace common
 } // end namespace oceanbase

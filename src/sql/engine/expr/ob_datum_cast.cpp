@@ -15060,6 +15060,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*int -> XXX*/
@@ -15093,6 +15094,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*uint -> XXX*/
@@ -15126,6 +15128,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*float -> XXX*/
@@ -15159,6 +15162,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*double -> XXX*/
@@ -15192,6 +15196,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*number -> XXX*/
@@ -15225,6 +15230,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*datetime -> XXX*/
@@ -15258,6 +15264,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*date -> XXX*/
@@ -15291,6 +15298,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*time -> XXX*/
@@ -15324,6 +15332,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*year -> XXX*/
@@ -15357,6 +15366,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*string -> XXX*/
@@ -15390,6 +15400,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*extend -> XXX*/
@@ -15423,6 +15434,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*unknown -> XXX*/
@@ -15456,6 +15468,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*text -> XXX*/
@@ -15488,6 +15501,8 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*bit -> XXX*/
@@ -15521,6 +15536,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*enum -> XXX*/
@@ -15554,6 +15570,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*enumset_inner -> XXX*/
@@ -15587,6 +15604,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*otimestamp -> XXX*/
@@ -15620,6 +15638,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*raw -> XXX*/
@@ -15653,6 +15672,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*interval -> XXX*/
@@ -15686,6 +15706,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /* rowid -> XXX */
@@ -15719,6 +15740,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*lob -> XXX*/
@@ -15752,6 +15774,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*json -> XXX*/
@@ -15785,6 +15808,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*geometry -> XXX*/
@@ -15818,6 +15842,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*udt -> XXX*/
@@ -15851,6 +15876,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*decimalint -> XXX*/
@@ -15884,6 +15910,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*collection -> XXX*/
@@ -15917,6 +15944,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*mysql date*/
@@ -15950,6 +15978,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*mysql datetime*/
@@ -15983,6 +16012,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*roaringbitmap -> XXX*/
@@ -16016,6 +16046,41 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
+  },
+  {
+    /*variant -> XXX*/
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
   },
 };
 
@@ -16055,6 +16120,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_eval_arg,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*int -> XXX*/
@@ -16088,6 +16154,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*uint -> XXX*/
@@ -16121,6 +16188,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*float -> XXX*/
@@ -16154,6 +16222,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*double -> XXX*/
@@ -16187,6 +16256,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*number -> XXX*/
@@ -16220,6 +16290,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*datetime -> XXX*/
@@ -16253,6 +16324,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*date -> XXX*/
@@ -16286,6 +16358,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*time -> XXX*/
@@ -16319,6 +16392,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*year -> XXX*/
@@ -16352,6 +16426,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*string -> XXX*/
@@ -16385,6 +16460,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*extend -> XXX*/
@@ -16418,6 +16494,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*unknown -> XXX*/
@@ -16451,6 +16528,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*text -> XXX*/
@@ -16484,6 +16562,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*bit -> XXX*/
@@ -16517,6 +16596,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*enum -> XXX*/
@@ -16550,6 +16630,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*enumset_inner -> XXX*/
@@ -16583,6 +16664,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*otimestamp -> XXX*/
@@ -16616,6 +16698,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*raw -> XXX*/
@@ -16649,6 +16732,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*interval -> XXX*/
@@ -16682,6 +16766,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*rowid -> XXX*/
@@ -16715,6 +16800,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*lob -> XXX*/
@@ -16748,6 +16834,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*json -> XXX*/
@@ -16781,6 +16868,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*geometry -> XXX*/
@@ -16814,6 +16902,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*udt -> XXX*/
@@ -16847,6 +16936,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*decimalint -> XXX*/
@@ -16880,6 +16970,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*collection -> XXX*/
@@ -16913,6 +17004,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*mysql date*/
@@ -16946,6 +17038,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*mysql datetime*/
@@ -16979,6 +17072,75 @@ ObExpr::EvalFunc OB_DATUM_CAST_ORACLE_EXPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
+  },
+  {
+    /*roaringbitmap -> XXX*/
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+  },
+  {
+    /*variant -> XXX*/
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
   },
 };
 
@@ -17016,6 +17178,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_eval_arg,/*mysql date*/
     cast_eval_arg,/*mysql datetime*/
     cast_eval_arg,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*int -> XXX*/
@@ -17049,6 +17212,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     int_mdate,/*mysql date*/
     int_mdatetime,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*uint -> XXX*/
@@ -17082,6 +17246,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     uint_mdate,/*mysql date*/
     uint_mdatetime,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*float -> XXX*/
@@ -17115,6 +17280,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     float_mdate,/*mysql date*/
     float_mdatetime,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*double -> XXX*/
@@ -17148,6 +17314,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     double_mdate,/*mysql date*/
     double_mdatetime,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*number -> XXX*/
@@ -17181,6 +17348,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     number_mdate,/*mysql date*/
     number_mdatetime,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*datetime -> XXX*/
@@ -17214,6 +17382,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     datetime_mdate,/*mysql date*/
     datetime_mdatetime,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*date -> XXX*/
@@ -17247,6 +17416,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     date_mdate,/*mysql date*/
     date_mdatetime,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*time -> XXX*/
@@ -17280,6 +17450,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     time_mdate,/*mysql date*/
     time_mdatetime,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*year -> XXX*/
@@ -17313,6 +17484,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     year_mdate,/*mysql date*/
     year_mdatetime,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*string -> XXX*/
@@ -17346,6 +17518,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     string_mdate,/*mysql date*/
     string_mdatetime,/*mysql datetime*/
     string_roaringbitmap,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*extend -> XXX*/
@@ -17379,6 +17552,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*unknown -> XXX*/
@@ -17412,6 +17586,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     unknown_other,/*mysql date*/
     unknown_other,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*text -> XXX*/
@@ -17445,6 +17620,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     text_mdate,/*mysql date*/
     text_mdatetime,/*mysql datetime*/
     string_roaringbitmap,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*bit -> XXX*/
@@ -17478,6 +17654,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     bit_mdate,/*mysql date*/
     bit_mdatetime,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*enumset -> XXX*/
@@ -17511,6 +17688,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     enumset_mdate,/*mysql date*/
     enumset_mdatetime,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*enumset_inner -> XXX*/
@@ -17544,6 +17722,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     enumset_inner_mdate,/*mysql date*/
     enumset_inner_mdatetime,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*otimestamp -> XXX*/
@@ -17577,6 +17756,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*raw -> XXX*/
@@ -17610,6 +17790,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*interval -> XXX*/
@@ -17643,6 +17824,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*rowid -> XXX*/
@@ -17676,6 +17858,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*lob -> XXX*/
@@ -17709,6 +17892,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*json -> XXX*/
@@ -17742,6 +17926,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     json_mdate,/*mysql date*/
     json_mdatetime,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*geometry -> XXX*/
@@ -17775,6 +17960,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     geometry_mdate,/*mysql date*/
     geometry_mdatetime,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*udt -> XXX*/
@@ -17808,6 +17994,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_expected,/*mysql date*/
     cast_not_expected,/*mysql datetime*/
     cast_not_expected,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*decimalint -> XXX*/
@@ -17841,6 +18028,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     decimalint_mdate,/*mysql date*/
     decimalint_mdatetime,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*collection -> XXX*/
@@ -17874,6 +18062,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_support,/*mysql date*/
     cast_not_support,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*mysql date -> XXX*/
@@ -17907,6 +18096,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_eval_arg,/*mysql date*/
     mdate_mdatetime,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*mysql datetime -> XXX*/
@@ -17940,6 +18130,7 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     mdatetime_mdate,/*mysql date*/
     cast_eval_arg,/*mysql datetime*/
     cast_not_support,/*roaringbitmap*/
+    cast_not_support,/*variant*/
   },
   {
     /*roaringbitmap -> XXX*/
@@ -17973,6 +18164,41 @@ ObExpr::EvalFunc OB_DATUM_CAST_MYSQL_IMPLICIT[ObMaxTC][ObMaxTC] =
     cast_not_support,/*mysql date*/
     cast_not_support,/*mysql datetime*/
     roaringbitmap_roaringbitmap,/*roaringbitmap*/
+    cast_not_support,/*variant*/
+  },
+  {
+    /*variant -> XXX*/
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
+    cast_not_support,
   },
 };
 
@@ -18127,6 +18353,11 @@ ObExpr::EvalEnumSetFunc OB_DATUM_CAST_MYSQL_ENUMSET_IMPLICIT[ObMaxTC][2] =
     /*ObRoaringBitmapTC -> enum_or_set*/
     cast_not_support_enum_set,/*enum*/
     cast_not_support_enum_set,/*set*/
+  },
+  {
+    /*variant -> enum_or_set*/
+    cast_not_support_enum_set,
+    cast_not_support_enum_set,
   },
 };
 

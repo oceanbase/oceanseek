@@ -122,6 +122,7 @@ DEFINE_CONTINUOUS_VECTOR(GeoContVec, VEC_TC_GEO);
 DEFINE_CONTINUOUS_VECTOR(UdtContVec, VEC_TC_UDT);
 DEFINE_CONTINUOUS_VECTOR(CollContVec, VEC_TC_COLLECTION);
 DEFINE_CONTINUOUS_VECTOR(RoaringBitmapContVec, VEC_TC_ROARINGBITMAP);
+DEFINE_CONTINUOUS_VECTOR(VariantContVec, VEC_TC_VARIANT);
 #undef DEFINE_CONTINUOUS_VECTOR
 
 constexpr bool is_continuous_vec(const VecValueTypeClass tc)
@@ -137,7 +138,8 @@ constexpr bool is_continuous_vec(const VecValueTypeClass tc)
          || tc == VEC_TC_GEO
          || tc == VEC_TC_UDT
          || tc == VEC_TC_COLLECTION
-         || tc == VEC_TC_ROARINGBITMAP);
+         || tc == VEC_TC_ROARINGBITMAP
+         || tc == VEC_TC_VARIANT);
 }
 
 #define DEFINE_DISCRETE_VECTOR(vector_name, vec_tc) \
@@ -154,6 +156,7 @@ DEFINE_DISCRETE_VECTOR(GeoDiscVec, VEC_TC_GEO);
 DEFINE_DISCRETE_VECTOR(UdtDiscVec, VEC_TC_UDT);
 DEFINE_DISCRETE_VECTOR(CollDiscVec, VEC_TC_COLLECTION);
 DEFINE_DISCRETE_VECTOR(RoaringBitmapDiscVec, VEC_TC_ROARINGBITMAP);
+DEFINE_DISCRETE_VECTOR(VariantDiscVec, VEC_TC_VARIANT);
 #undef DEFINE_DISCRETE_VECTOR
 
 constexpr bool is_discrete_vec(const VecValueTypeClass vec_tc)
@@ -169,7 +172,8 @@ constexpr bool is_discrete_vec(const VecValueTypeClass vec_tc)
           || vec_tc == VEC_TC_GEO
           || vec_tc == VEC_TC_UDT
           || vec_tc == VEC_TC_COLLECTION
-          || vec_tc == VEC_TC_ROARINGBITMAP);
+          || vec_tc == VEC_TC_ROARINGBITMAP
+          || vec_tc == VEC_TC_VARIANT);
 }
 
 #define DEFINE_UNIFORM_VECTOR(vector_name, vec_tc) \
@@ -210,6 +214,7 @@ DEFINE_UNIFORM_VECTOR(CollUniVec, VEC_TC_COLLECTION);
 DEFINE_UNIFORM_VECTOR(MySQLDateTimeUniVec, VEC_TC_MYSQL_DATETIME);
 DEFINE_UNIFORM_VECTOR(MySQLDateUniVec, VEC_TC_MYSQL_DATE);
 DEFINE_UNIFORM_VECTOR(RoaringBitmapUniVec, VEC_TC_ROARINGBITMAP);
+DEFINE_UNIFORM_VECTOR(VariantUniVec, VEC_TC_VARIANT);
 #undef DEFINE_UNIFORM_VECTOR
 
 constexpr bool is_uniform_vec(const VecValueTypeClass tc)
@@ -255,6 +260,7 @@ DEFINE_UNIFORM_CONST_VECTOR(CollUniCVec, VEC_TC_COLLECTION);
 DEFINE_UNIFORM_CONST_VECTOR(MySQLDateTimeUniCVec, VEC_TC_MYSQL_DATETIME);
 DEFINE_UNIFORM_CONST_VECTOR(MySQLDateUniCVec, VEC_TC_MYSQL_DATE);
 DEFINE_UNIFORM_CONST_VECTOR(RoaringBitmapUniCVec, VEC_TC_ROARINGBITMAP);
+DEFINE_UNIFORM_CONST_VECTOR(VariantUniCVec, VEC_TC_VARIANT);
 #undef DEFINE_UNIFORM_CONST_VECTOR
 
 }

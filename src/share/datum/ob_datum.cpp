@@ -72,6 +72,7 @@ ObObjDatumMapType ObDatum::get_obj_datum_map_type(const ObObjType type)
     OBJ_DATUM_8BYTE_DATA,     // ObMySQLDateTimeType
     OBJ_DATUM_STRING,         // ObRoaringBitmapType
     OBJ_DATUM_STRING,         // ObExtendBLobType
+    OBJ_DATUM_STRING,         // ObVariantType
   };
   static_assert(sizeof(maps) / sizeof(maps[0]) == ObMaxType,
       "new added type should extend this map");

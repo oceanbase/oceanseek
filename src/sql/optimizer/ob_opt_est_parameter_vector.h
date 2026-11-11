@@ -134,6 +134,7 @@ const static double comparison_params_vector[ObMaxTC+1] = {
   VECTOR_CMP_INT_COST,            // mysql date
   VECTOR_CMP_INT_COST,            // mysql datetime
   VECTOR_CMP_CHAR_COST,           // roaringbitmap
+  VECTOR_CMP_LOB_COST,                                       // variant
 };
 
 const static double hash_params_vector[ObMaxTC+1] = {
@@ -167,6 +168,7 @@ const static double hash_params_vector[ObMaxTC+1] = {
   VECTOR_HASH_INT_COST,            // mysql date
   VECTOR_HASH_INT_COST,            // mysql datetime
   VECTOR_HASH_CHAR_COST,           // roaringbitmap
+  VECTOR_HASH_CHAR_COST,                                     // variant
 };
 
 const static double project_params_vector[2][2][ObMaxTC+1] = {
@@ -199,6 +201,10 @@ const static double project_params_vector[2][2][ObMaxTC+1] = {
       VECTOR_ROW_STORE_PROJECT_COLUMN_SEQ_INT_COST,            // user defined type
       VECTOR_ROW_STORE_PROJECT_COLUMN_SEQ_NUMBER_COST,         // ObDecimalIntTC
       VECTOR_ROW_STORE_PROJECT_COLUMN_SEQ_LOB_COST,            // collection sql type
+      0,                                                     // mysql date
+      0,                                                     // mysql datetime
+      0,                                                     // roaringbitmap
+      VECTOR_ROW_STORE_PROJECT_COLUMN_SEQ_LOB_COST,          // variant
     },
     {// row store random access
       VECTOR_ROW_STORE_PROJECT_COLUMN_RND_INT_COST,            // null
@@ -228,6 +234,10 @@ const static double project_params_vector[2][2][ObMaxTC+1] = {
       VECTOR_ROW_STORE_PROJECT_COLUMN_RND_INT_COST,            // user defined type
       VECTOR_ROW_STORE_PROJECT_COLUMN_RND_NUMBER_COST,         // ObDecimalIntTC
       VECTOR_ROW_STORE_PROJECT_COLUMN_RND_LOB_COST,            // collection sql type
+      0,                                                     // mysql date
+      0,                                                     // mysql datetime
+      0,                                                     // roaringbitmap
+      VECTOR_ROW_STORE_PROJECT_COLUMN_RND_LOB_COST,          // variant
     }
   },
   {
@@ -259,6 +269,10 @@ const static double project_params_vector[2][2][ObMaxTC+1] = {
       VECTOR_COLUMN_STORE_PROJECT_COLUMN_SEQ_INT_COST,            // user defined type
       VECTOR_COLUMN_STORE_PROJECT_COLUMN_SEQ_NUMBER_COST,         // ObDecimalIntTC
       VECTOR_COLUMN_STORE_PROJECT_COLUMN_SEQ_LOB_COST,            // collection sql type
+      0,                                                     // mysql date
+      0,                                                     // mysql datetime
+      0,                                                     // roaringbitmap
+      VECTOR_COLUMN_STORE_PROJECT_COLUMN_SEQ_LOB_COST,       // variant
     },
     {// column store random access
       VECTOR_COLUMN_STORE_PROJECT_COLUMN_RND_INT_COST,            // null
@@ -288,6 +302,10 @@ const static double project_params_vector[2][2][ObMaxTC+1] = {
       VECTOR_COLUMN_STORE_PROJECT_COLUMN_RND_INT_COST,            // user defined type
       VECTOR_COLUMN_STORE_PROJECT_COLUMN_RND_NUMBER_COST,         // ObDecimalIntTC
       VECTOR_COLUMN_STORE_PROJECT_COLUMN_RND_LOB_COST,            // collection sql type
+      0,                                                     // mysql date
+      0,                                                     // mysql datetime
+      0,                                                     // roaringbitmap
+      VECTOR_COLUMN_STORE_PROJECT_COLUMN_RND_LOB_COST,       // variant
     }
   }
 };

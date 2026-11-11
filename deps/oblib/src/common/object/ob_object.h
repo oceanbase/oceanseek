@@ -341,7 +341,8 @@ public:
            || ob_is_json_tc(get_type())
            || ob_is_geometry_tc(get_type())
            || ob_is_roaringbitmap_tc(get_type())
-           || ob_is_collection_sql_type(get_type()); }
+           || ob_is_collection_sql_type(get_type())
+           || ob_is_variant(get_type()); }
   OB_INLINE bool is_lob() const { return ob_is_text_tc(get_type()); }
 
   OB_INLINE bool is_json() const { return type_ == static_cast<uint8_t>(ObJsonType); }
@@ -3327,6 +3328,7 @@ inline bool ObObj::need_deep_copy()const
             || ob_is_json(meta_.get_type())
             || ob_is_geometry(meta_.get_type())
             || ob_is_roaringbitmap(meta_.get_type())
+            || ob_is_variant(meta_.get_type())
             || ob_is_raw(meta_.get_type())
             || ob_is_user_defined_sql_type(meta_.get_type())
             || ob_is_collection_sql_type(meta_.get_type())
@@ -3966,7 +3968,7 @@ inline const void *ObObj::get_data_ptr() const
   const void *ret = NULL;
   if (ob_is_string_type(get_type()) || ob_is_raw(get_type()) || ob_is_rowid_tc(get_type()) || ob_is_json(get_type())
       || ob_is_geometry(get_type()) || ob_is_user_defined_sql_type(get_type()) || ob_is_collection_sql_type(get_type())
-      || ob_is_roaringbitmap(get_type())) {
+      || ob_is_roaringbitmap(get_type()) || ob_is_variant(get_type())) {
     ret = const_cast<char *>(v_.string_);
   } else if (ob_is_number_tc(get_type())) {
     ret = const_cast<uint32_t *>(v_.nmb_digits_);
@@ -3984,7 +3986,7 @@ inline void ObObj::set_data_ptr(void *data_ptr)
 {
   if (ob_is_string_type(get_type()) || ob_is_raw(get_type()) || ob_is_rowid_tc(get_type()) || ob_is_json(get_type())
       || ob_is_geometry(get_type()) || ob_is_user_defined_sql_type(get_type()) || ob_is_collection_sql_type(get_type())
-      || ob_is_roaringbitmap(get_type())) {
+      || ob_is_roaringbitmap(get_type()) || ob_is_variant(get_type())) {
     v_.string_ = static_cast<char*>(data_ptr);
   } else if (ob_is_number_tc(get_type())) {
     v_.nmb_digits_ = static_cast<uint32_t*>(data_ptr);
@@ -4045,6 +4047,7 @@ inline int64_t ObObj::get_data_length() const
       ob_is_json(get_type()) ||
       ob_is_geometry(get_type()) ||
       ob_is_roaringbitmap(get_type()) ||
+      ob_is_variant(get_type()) ||
       ob_is_user_defined_sql_type(get_type()) ||
       ob_is_collection_sql_type(get_type())) {
     ret = val_len_;
@@ -4615,7 +4618,7 @@ OB_INLINE int64_t ObObj::get_deep_copy_size() const
   int64_t ret = 0;
   if (is_string_type() || is_raw() || ob_is_rowid_tc(get_type()) || is_lob_locator() || is_json()
       || is_geometry() || is_user_defined_sql_type() || ob_is_decimal_int(get_type())|| is_collection_sql_type()
-      || is_roaringbitmap()) {
+      || is_roaringbitmap() || ob_is_variant(get_type())) {
     ret += val_len_;
   } else if (ob_is_number_tc(get_type())) {
     ret += (sizeof(uint32_t) * nmb_desc_.len_);

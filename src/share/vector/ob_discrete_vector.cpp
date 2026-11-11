@@ -213,5 +213,6 @@ template class ObDiscreteVector<VectorBasicOp<VEC_TC_GEO>>;
 template class ObDiscreteVector<VectorBasicOp<VEC_TC_UDT>>;
 template class ObDiscreteVector<VectorBasicOp<VEC_TC_COLLECTION>>;
 template class ObDiscreteVector<VectorBasicOp<VEC_TC_ROARINGBITMAP>>;
+template class ObDiscreteVector<VectorBasicOp<VEC_TC_VARIANT>>;
 } // end namespace common
 } // end namespace oceanbase

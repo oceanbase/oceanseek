@@ -747,7 +747,8 @@ static bool is_fixed_length_storage(ObObjType type) {
       || ObGeometryTC == tc
       || ObUserDefinedSQLTC == tc
       || ObDecimalIntTC == tc
-      || ObRoaringBitmapTC == tc) {
+      || ObRoaringBitmapTC == tc
+      || ObVariantTC == tc) {
     is_fixed = false;
   }
   return is_fixed;
@@ -770,6 +771,7 @@ static bool is_fixed_length(ObObjType type) {
       || ObUserDefinedSQLTC == tc
       || ObDecimalIntTC == tc
       || ObRoaringBitmapTC == tc
+      || ObVariantTC == tc
       || ObCollectionSQLTC == tc) {
     is_fixed = false;
   }

@@ -832,6 +832,19 @@ struct DatumHashCalculator : public DefHashMethod<T>
   }
 };
 
+template <typename T>
+struct DatumHashCalculator<ObVariantType, T> : public DefHashMethod<T>
+{
+  static int calc_datum_hash(const ObDatum &, const uint64_t, uint64_t &)
+  {
+    return OB_NOT_SUPPORTED;
+  }
+  static int calc_datum_hash_v2(const ObDatum &, const uint64_t, uint64_t &)
+  {
+    return OB_NOT_SUPPORTED;
+  }
+};
+
 #define DEF_DATUM_TIMESTAMP_HASH_FUNCS(OBJTYPE, TYPE, DESC, VTYPE)              \
   template <typename T>                                                         \
   struct DatumHashCalculator<OBJTYPE, T> : public DefHashMethod<T>              \

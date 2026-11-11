@@ -79,6 +79,7 @@ static const obmysql::EMySQLFieldType ob_type_to_mysql_type[ObMaxType] =
   obmysql::EMySQLFieldType::MYSQL_TYPE_NOT_DEFINED,                       /* ObMySQLDateTimeType */
   obmysql::EMySQLFieldType::MYSQL_TYPE_BLOB,                              /* ObRoaringBitmapType */
   obmysql::EMySQLFieldType::MYSQL_TYPE_LONG_BLOB,                         /* ObExtendBLobType */
+  obmysql::EMySQLFieldType::MYSQL_TYPE_BLOB,                              /* ObVariantType */
   /* ObMaxType */
 };
 
@@ -540,6 +541,7 @@ const ObBindParamEncode::EncodeFunc ObBindParamEncode::encode_map_[ObMaxType + 1
   ObBindParamEncode::encode_not_supported,           // ObMySQLDateTimeType
   ObBindParamEncode::encode_not_supported,           // ObRoaringBitmapType
   ObBindParamEncode::encode_not_supported,           // ObExtendBLobType
+  ObBindParamEncode::encode_not_supported,           // ObVariantType
   ObBindParamEncode::encode_not_supported            // ObMaxType
 };
 
@@ -964,6 +966,7 @@ const ObBindParamDecode::DecodeFunc ObBindParamDecode::decode_map_[ObMaxType + 1
   ObBindParamDecode::decode_not_supported,           // ObMySQLDateTimeType
   ObBindParamDecode::decode_not_supported,           // ObRoaringBitmapType
   ObBindParamDecode::decode_not_supported,           // ObExtendBLobType
+  ObBindParamDecode::decode_not_supported,           // ObVariantType
   ObBindParamDecode::decode_not_supported            // ObMaxType
 };
 

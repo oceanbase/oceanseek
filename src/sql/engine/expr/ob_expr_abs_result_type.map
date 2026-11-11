@@ -56,6 +56,7 @@ static constexpr ObObjType ABS_RESULT_TYPE[ObMaxType] =
     ObDoubleType,   /* ObMySQLDateTimeType */
     ObMaxType,      /* ObRoaringBitmapType  */
     ObMaxType,      /* ObExtendBLobType */
+    ObMaxType,      /* ObVariantType */
 };
 
 
@@ -117,6 +118,7 @@ static constexpr ObObjType ABS_RESULT_TYPE_ORACLE[ObMaxType] =
     ObMaxType,      /* ObMySQLDateTimeType */
     ObMaxType,      /* ObRoaringBitmapType  */
     ObMaxType,      /* ObExtendBLobType */
+    ObMaxType,      /* ObVariantType */
 };
 
 static_assert(is_array_fully_initialized(ABS_RESULT_TYPE_ORACLE), "ABS_RESULT_TYPE_ORACLE is partially initlized");

@@ -85,6 +85,7 @@ static const ObMySQLTypeMap type_maps_[ObMaxType] =
   {EMySQLFieldType::MYSQL_TYPE_DATETIME,  BINARY_FLAG, 0}, /* ObMySQLDateTimeType */
   {EMySQLFieldType::MYSQL_TYPE_BLOB,       BLOB_FLAG, 0},                         /* ObRoaringBitmapType */
   {EMySQLFieldType::MYSQL_TYPE_LONG_BLOB,  BLOB_FLAG, 0},                         /* ObExtendBLobType */
+  {EMySQLFieldType::MYSQL_TYPE_BLOB,       BLOB_FLAG | BINARY_FLAG, 0},           /* ObVariantType */
   /* ObMaxType */
 };
 
@@ -187,6 +188,7 @@ int ObSMUtils::cell_str(
       // lob locator也会按varchar方式进行encode, 客户端往server端传输数据时,
       // 也是将lob locator按varchar传输, 先编码LobLocator length, 然后再编码整个lob Locator
       case ObLobTC:
+      case ObVariantTC:
       case ObRoaringBitmapTC: {
         ret = ObMySQLUtil::varchar_cell_str(buf, len, obj.get_string(), is_oracle_raw, pos);
         break;

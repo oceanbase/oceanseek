@@ -22,7 +22,7 @@ int ObExprUDFUtils::inner_vec_to_obj(ObIVector *in_vec, ObObj &obj, const ObObjM
 {
   int ret = OB_SUCCESS;
 
-  STATIC_ASSERT(ObMaxType == 56, "check if has new objtype and should adapt udf vectorization");
+  STATIC_ASSERT(ObMaxType == 57, "check if has new objtype and should adapt udf vectorization");
 
   ARG_VEC *arg_vec = static_cast<ARG_VEC *>(in_vec);
   if (arg_vec->is_null(batch_idx)) {
@@ -60,6 +60,7 @@ int ObExprUDFUtils::inner_vec_to_obj(ObIVector *in_vec, ObObj &obj, const ObObjM
         case ObLobType:
         case ObJsonType:
         case ObGeometryType:
+        case ObVariantType:
         case ObRoaringBitmapType: {
           ObString tmp  = arg_vec->get_string(batch_idx);
           obj.set_string(meta.get_type(), tmp);
@@ -213,6 +214,7 @@ int ObExprUDFUtils::inner_obj_to_vec(ObIVector *in_vec,
     case ObUserDefinedSQLType:
     case ObCollectionSQLType:
     case ObRoaringBitmapType:
+    case ObVariantType:
     case ObLobType: {
       const ObString tmp = res.get_string();
       char *buf = expr.get_str_res_mem(eval_ctx, tmp.length());
@@ -433,6 +435,7 @@ case VecType: \
       HANDLE_VEC_TC_VEC2OBJ(VEC_TC_DEC_INT512)
       HANDLE_VEC_TC_VEC2OBJ(VEC_TC_COLLECTION)
       HANDLE_VEC_TC_VEC2OBJ(VEC_TC_ROARINGBITMAP)
+      HANDLE_VEC_TC_VEC2OBJ(VEC_TC_VARIANT)
       HANDLE_VEC_TC_VEC2OBJ(VEC_TC_MYSQL_DATE)
       HANDLE_VEC_TC_VEC2OBJ(VEC_TC_MYSQL_DATETIME)
       default : {
@@ -513,6 +516,7 @@ int ObExprUDFUtils::transfer_obj_to_vec(ObObj& result,
     HANDLE_VEC_TC_OBJ2VEC(ObMySQLDateType, VEC_TC_MYSQL_DATE);
     HANDLE_VEC_TC_OBJ2VEC(ObMySQLDateTimeType, VEC_TC_MYSQL_DATETIME);
     HANDLE_VEC_TC_OBJ2VEC(ObRoaringBitmapType, VEC_TC_ROARINGBITMAP);
+    HANDLE_VEC_TC_OBJ2VEC(ObVariantType, VEC_TC_VARIANT);
 
     case ObUDoubleType:
     case ObDoubleType: {

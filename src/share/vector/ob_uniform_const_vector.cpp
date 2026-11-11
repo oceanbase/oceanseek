@@ -50,5 +50,6 @@ template class ObUniformVector<false, VectorBasicOp<VEC_TC_COLLECTION>>;
 template class ObUniformVector<false, VectorBasicOp<VEC_TC_MYSQL_DATETIME>>;
 template class ObUniformVector<false, VectorBasicOp<VEC_TC_MYSQL_DATE>>;
 template class ObUniformVector<false, VectorBasicOp<VEC_TC_ROARINGBITMAP>>;
+template class ObUniformVector<false, VectorBasicOp<VEC_TC_VARIANT>>;
 } // end common
 } // end
