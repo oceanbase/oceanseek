@@ -105,8 +105,8 @@ int ObExprArrowStream::cg_expr(ObExprCGCtx &expr_cg_ctx,
 }
 
 int ObExprArrowStream::eval_sentinel(const ObExpr &expr,
-                                      ObEvalCtx &ctx,
-                                      ObDatum &res_datum)
+                                     ObEvalCtx &ctx,
+                                     ObDatum &res_datum)
 {
 #ifndef OB_BUILD_OBSERVER_FLIGHT_SQL
   UNUSED(expr);

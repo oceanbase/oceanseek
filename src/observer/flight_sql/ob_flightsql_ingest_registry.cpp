@@ -340,7 +340,9 @@ void ObFlightSqlIngestRegistry::remove(const std::string &ingest_id)
   LOG_TRACE("[FlightSQL] ingest entry removed", "ingest_id", ingest_id.c_str());
 }
 
-int ObFlightSqlIngestRegistry::abort(const std::string &ingest_id)
+int ObFlightSqlIngestRegistry::abort(
+    uint64_t tenant_id,
+    const std::string &ingest_id)
 {
   int ret = OB_SUCCESS;
   std::shared_ptr<ObFlightSqlIngestEntry> entry;
@@ -349,6 +351,13 @@ int ObFlightSqlIngestRegistry::abort(const std::string &ingest_id)
     std::unordered_map<std::string, std::shared_ptr<ObFlightSqlIngestEntry>>::iterator it =
         entries_.find(ingest_id);
     if (it == entries_.end()) { return OB_ENTRY_NOT_EXIST; }
+    if (tenant_id != it->second->tenant_id) {
+      ret = OB_ERR_NO_PRIVILEGE;
+      LOG_WARN("[FlightSQL] abort: tenant does not own ingest entry",
+               K(ret), K(tenant_id), "owner_tenant_id", it->second->tenant_id,
+               "ingest_id", ingest_id.c_str());
+      return ret;
+    }
     entry = it->second;
   }
   {

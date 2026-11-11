@@ -46,6 +46,34 @@ bool flight_sql_is_arrow_collection_type(const arrow::Type::type type_id)
       || type_id == arrow::Type::MAP;
 }
 
+void flight_sql_adjust_prepared_scalar_desc(const arrow::Type::type type_id,
+                                            const bool is_oracle_mode,
+                                            sql::ObArrowStreamColDesc &middle_desc)
+{
+  if (is_oracle_mode
+      && (type_id == arrow::Type::STRING
+          || type_id == arrow::Type::LARGE_STRING)) {
+    // Oracle SQL equality rejects CLOB operands. Bind prepared text,
+    // including NULL, as VARCHAR and reject values beyond its byte limit.
+    middle_desc.ob_type = common::ObVarcharType;
+    middle_desc.accuracy = common::ObAccuracy::DDL_DEFAULT_ACCURACY2[
+        ORACLE_MODE][common::ObVarcharType];
+    middle_desc.accuracy.set_length(common::OB_MAX_ORACLE_VARCHAR_LENGTH);
+    middle_desc.accuracy.set_length_semantics(common::LS_BYTE);
+  } else if (is_oracle_mode
+             && (type_id == arrow::Type::BINARY
+                 || type_id == arrow::Type::LARGE_BINARY
+                 || type_id == arrow::Type::FIXED_SIZE_BINARY)) {
+    // Arrow binary parameters are raw payloads, never legacy ObLobLocator
+    // envelopes. Match native MYSQL_TYPE_ORA_BLOB binding by materializing a
+    // temporary in-row LOB instead of tagging payload bytes as ObLobType.
+    middle_desc.ob_type = common::ObLongTextType;
+    middle_desc.accuracy = common::ObAccuracy::DDL_DEFAULT_ACCURACY2[
+        ORACLE_MODE][common::ObLongTextType];
+    middle_desc.cs_type = common::CS_TYPE_BINARY;
+  }
+}
+
 bool flight_sql_has_arrow_extension_metadata(const arrow::Field &arrow_field)
 {
   bool has_extension = false;
@@ -55,8 +83,16 @@ bool flight_sql_has_arrow_extension_metadata(const arrow::Field &arrow_field)
       // An Arrow C Data importer can expose an unregistered extension as its
       // storage type while preserving this standard field metadata. Prepared
       // parameters must not silently bind that storage value as a supported
-      // OceanBase scalar.
+      // OceanBase scalar or collection element.
       has_extension = metadata->key(i) == "ARROW:extension:name";
+    }
+  }
+  if (!has_extension && arrow_field.type()) {
+    for (const auto &child : arrow_field.type()->fields()) {
+      if (child && flight_sql_has_arrow_extension_metadata(*child)) {
+        has_extension = true;
+        break;
+      }
     }
   }
   return has_extension;
@@ -120,10 +156,9 @@ int flight_sql_set_lob_param(const char *data,
                              common::ObObjParam &param)
 {
   int ret = OB_SUCCESS;
-  if (middle_desc.ob_type != common::ObLongTextType
-      && middle_desc.ob_type != common::ObLobType) {
+  if (middle_desc.ob_type != common::ObLongTextType) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("[FlightSQL] variable-width parameter has a non-LOB middle descriptor", K(ret),
+    LOG_WARN("[FlightSQL] variable-width parameter is not a temporary LOB", K(ret),
              K(middle_desc.ob_type));
   } else if (OB_UNLIKELY(length < 0
                          || length > common::OB_MAX_LONGTEXT_LENGTH_WITHOUT_LOB_HEADER)) {
@@ -134,15 +169,12 @@ int flight_sql_set_lob_param(const char *data,
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("[FlightSQL] Arrow LOB parameter has a null data pointer", K(ret), K(length));
   } else {
-    sql::ObTextStringObObjResult result(middle_desc.ob_type, nullptr, &param);
-    if (OB_FAIL(result.init(length, &allocator))) {
-      LOG_WARN("[FlightSQL] failed to initialize prepared temporary LOB", K(ret), K(length),
-               "lob_type", middle_desc.ob_type);
-    } else if (OB_FAIL(result.append(data == nullptr ? "" : data, length))) {
-      LOG_WARN("[FlightSQL] failed to materialize prepared temporary LOB", K(ret), K(length),
-               "lob_type", middle_desc.ob_type);
+    const common::ObString payload(static_cast<int32_t>(length),
+                                   data == nullptr ? "" : data);
+    if (OB_FAIL(sql::ObTextStringHelper::pack_to_disk_inrow_lob(
+            allocator, payload, common::ObLongTextType, param))) {
+      LOG_WARN("[FlightSQL] failed to pack prepared temporary LOB", K(ret), K(length));
     } else {
-      result.set_result();
       param.set_collation_type(middle_desc.cs_type);
       param.set_collation_level(common::CS_LEVEL_COERCIBLE);
     }
@@ -291,12 +323,21 @@ int flight_sql_set_decimal_param(const arrow::Array &array,
         // The bounds check above makes this representation-only narrowing lossless.
         middle_value.truncate(middle_int_bytes);
       }
-      param.set_decimal_int(middle_value.get_int_bytes(),
-                            static_cast<common::ObScale>(scale),
-                            const_cast<common::ObDecimalInt *>(
-                                middle_value.get_decimal_int()));
-      param.set_precision(static_cast<common::ObPrecision>(precision));
-      param.set_scale(static_cast<common::ObScale>(scale));
+      const int32_t int_bytes = middle_value.get_int_bytes();
+      common::ObDecimalInt *owned_value = static_cast<common::ObDecimalInt *>(
+          allocator.alloc(int_bytes));
+      if (OB_ISNULL(owned_value)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("[FlightSQL] failed to own decimal parameter payload", K(ret),
+                 K(precision), K(scale), K(int_bytes));
+      } else {
+        // ObObj borrows this pointer. Copy before the local builder expires;
+        // convert_cell() performs its final deep copy only after we return.
+        MEMCPY(owned_value, middle_value.get_decimal_int(), int_bytes);
+        param.set_decimal_int(int_bytes, static_cast<common::ObScale>(scale), owned_value);
+        param.set_precision(static_cast<common::ObPrecision>(precision));
+        param.set_scale(static_cast<common::ObScale>(scale));
+      }
     }
   }
   return ret;
@@ -691,17 +732,8 @@ int flight_sql_convert_cell(const arrow::Field &arrow_field,
                K(row_idx), "field_name", arrow_field.name().c_str(),
                "arrow_type", array.type()->ToString().c_str());
     } else {
-      if (session.is_oracle_mode
-          && (array.type_id() == arrow::Type::STRING
-              || array.type_id() == arrow::Type::LARGE_STRING)) {
-        // Oracle SQL equality rejects CLOB operands. Bind prepared text,
-        // including NULL, as VARCHAR and reject values beyond its byte limit.
-        middle_desc.ob_type = common::ObVarcharType;
-        middle_desc.accuracy = common::ObAccuracy::DDL_DEFAULT_ACCURACY2[
-            ORACLE_MODE][common::ObVarcharType];
-        middle_desc.accuracy.set_length(common::OB_MAX_ORACLE_VARCHAR_LENGTH);
-        middle_desc.accuracy.set_length_semantics(common::LS_BYTE);
-      }
+      flight_sql_adjust_prepared_scalar_desc(
+          array.type_id(), session.is_oracle_mode, middle_desc);
       if (OB_FAIL(flight_sql_convert_scalar_param(
               array, row_idx, middle_desc, allocator, converted_param))) {
         LOG_WARN("[FlightSQL] failed to materialize prepared scalar middle value", K(ret),
@@ -742,6 +774,9 @@ int flight_sql_validate_field(const arrow::Field &arrow_field,
       LOG_WARN("[FlightSQL] prepared field has no supported middle descriptor", K(ret),
                "field_name", arrow_field.name().c_str(),
                "arrow_type", arrow_field.type()->ToString().c_str());
+    } else {
+      flight_sql_adjust_prepared_scalar_desc(
+          arrow_field.type()->id(), is_oracle_mode, middle_desc);
     }
   }
   return ret;

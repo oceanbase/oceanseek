@@ -22,6 +22,7 @@
 #include "sql/session/ob_sql_session_mgr.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "observer/flight_sql/ob_flightsql_stream_registry.h"
+#include "observer/flight_sql/ob_flightsql_request_cancel.h"
 
 namespace oceanbase
 {
@@ -89,7 +90,12 @@ struct ObFlightSqlSession
   // V1 ingest state: session-scoped Arrow stream registry and monotonic stream ID counter.
   ObArrowStreamRegistry stream_registry;
   std::atomic<uint64_t> next_stream_id_{1};
+  bool closing_{false};  // protected by mutex; fences DoPut admission after CloseSession
+  bool doput_cancel_pending_{false};  // cancellation before request publication
   bool doput_active_{false};  // protected by mutex; only one DoPut per Flight session
+  // Published only for the admitted DoPut, and retired before its query guard
+  // is released. Protected by mutex; CancelQuery retains a shared handle.
+  std::shared_ptr<ObFlightSqlRequestCancellation> active_doput_cancellation;
 
   // Prepared DML state is separate from the general session mutex because
   // prepare/execute can compile or run SQL while holding this lock.  The
@@ -123,17 +129,23 @@ struct ObFlightSqlSessionDeleter
 // own query_mutex_ (try_lock_query / unlock_query).
 // If another query is already running, acquired() returns false and the
 // caller must reject with OB_EAGAIN.
+// already_locked borrows a query guard held by the caller for the whole RPC;
+// it must remain locked until this guard and all native execution are gone.
 struct ObSessionQueryGuard
 {
-  explicit ObSessionQueryGuard(ObFlightSqlSession &session) : session_(session)
+  explicit ObSessionQueryGuard(ObFlightSqlSession &session,
+                               const bool already_locked = false)
+      : session_(session)
   {
     if (OB_NOT_NULL(session_.ob_session)) {
-      acquired_ = (OB_SUCCESS == session_.ob_session->try_lock_query());
+      acquired_ = already_locked
+          || (OB_SUCCESS == session_.ob_session->try_lock_query());
+      owns_lock_ = acquired_ && !already_locked;
     }
   }
   ~ObSessionQueryGuard()
   {
-    if (acquired_) {
+    if (owns_lock_) {
       (void)session_.ob_session->unlock_query();
     }
   }
@@ -142,6 +154,7 @@ struct ObSessionQueryGuard
 private:
   ObFlightSqlSession &session_;
   bool acquired_{false};
+  bool owns_lock_{false};
   DISALLOW_COPY_AND_ASSIGN(ObSessionQueryGuard);
 };
 
@@ -153,8 +166,9 @@ struct ObSessionDoPutGuard
   explicit ObSessionDoPutGuard(ObFlightSqlSession &session) : session_(session)
   {
     std::lock_guard<std::mutex> guard(session_.mutex);
-    if (!session_.doput_active_) {
+    if (!session_.closing_ && !session_.doput_active_) {
       session_.doput_active_ = true;
+      session_.doput_cancel_pending_ = false;
       acquired_ = true;
     }
   }
@@ -163,6 +177,7 @@ struct ObSessionDoPutGuard
     if (acquired_) {
       std::lock_guard<std::mutex> guard(session_.mutex);
       session_.doput_active_ = false;
+      session_.doput_cancel_pending_ = false;
     }
   }
   bool acquired() const { return acquired_; }

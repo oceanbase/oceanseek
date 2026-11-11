@@ -188,9 +188,10 @@ ObFlightSqlSession::~ObFlightSqlSession()
       ingest_id_to_abort = last_ingest_id;
     }
     if (!ingest_id_to_abort.empty()) {
-      (void)observer::ObFlightSqlIngestRegistry::instance().abort(ingest_id_to_abort);
       (void)observer::ObFlightSqlIngestRegistry::instance().abort(
-          ingest_id_to_abort + ":stream");
+          tenant_id, ingest_id_to_abort);
+      (void)observer::ObFlightSqlIngestRegistry::instance().abort(
+          tenant_id, ingest_id_to_abort + ":stream");
       LOG_TRACE("[FlightSQL] ~ObFlightSqlSession: auto-aborted pending ingest",
                 "session_id", session_id.c_str(),
                 "ingest_id", ingest_id_to_abort.c_str());

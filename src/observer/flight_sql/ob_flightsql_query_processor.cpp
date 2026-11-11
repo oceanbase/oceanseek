@@ -1619,7 +1619,8 @@ static bool is_flight_sql_doget_stmt(const stmt::StmtType stmt_type)
 
 int ObFlightSqlQueryProcessor::prepare(ObFlightSqlSession &session,
                                        const common::ObString &sql,
-                                       const PrepareMode mode)
+                                       const PrepareMode mode,
+                                       const bool query_already_locked)
 {
   int ret = OB_SUCCESS;
   arrow_schema_.reset();
@@ -1643,7 +1644,7 @@ int ObFlightSqlQueryProcessor::prepare(ObFlightSqlSession &session,
     return ret;
   }
 
-  ObSessionQueryGuard query_guard(session);
+  ObSessionQueryGuard query_guard(session, query_already_locked);
   if (!query_guard.acquired()) {
     ret = OB_EAGAIN;
     LOG_WARN("[FlightSQL] prepare: concurrent query on same session rejected — "
@@ -1948,7 +1949,8 @@ int ObFlightSqlQueryProcessor::execute_prepared_update(
     const common::ObString &sql,
     const bool sensitive_sql,
     const char *audit_request_name,
-    int64_t &failed_column)
+    int64_t &failed_column,
+    const ObFlightSqlRequestCancellation *cancellation)
 {
   int ret = OB_SUCCESS;
   failed_column = -1;
@@ -2020,6 +2022,12 @@ int ObFlightSqlQueryProcessor::execute_prepared_update(
       ? common::ObString(OB_MASKED_STR) : sql;
   ObFlightSqlPreparedStateScope state_scope(
       session, display_sql, obmysql::ObMySQLCmd::COM_STMT_EXECUTE);
+  // QUERY_ACTIVE above can replace a query-killed state from cancellation
+  // between parameter rows. Keep the request cancellation sticky across rows
+  // and check after publishing the new native execution state.
+  if (OB_NOT_NULL(cancellation) && cancellation->is_cancelled()) {
+    return OB_CANCELED;
+  }
   lib::ContextParam ctx_param;
   ctx_param.set_mem_attr(session.tenant_id, "FlightSQLPS")
            .set_properties(lib::USE_TL_PAGE_OPTIONAL);
@@ -2542,7 +2550,9 @@ int ObFlightSqlQueryProcessor::open_query(ObFlightSqlSession &session,
 
 int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
                                        const common::ObString &sql,
-                                       const char *audit_request_name)
+                                       const char *audit_request_name,
+                                       const bool query_already_locked,
+                                       const ObFlightSqlRequestCancellation *cancellation)
 {
   int ret = OB_SUCCESS;
   arrow_schema_.reset();
@@ -2576,7 +2586,7 @@ int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
     return ret;
   }
 
-  ObSessionQueryGuard query_guard(session);
+  ObSessionQueryGuard query_guard(session, query_already_locked);
   if (!query_guard.acquired()) {
     ret = OB_EAGAIN;
     LOG_WARN("[FlightSQL] execute: concurrent query on same session rejected — "
@@ -2632,6 +2642,10 @@ int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
       }
     }
   } flight_exec_state_guard_(session.ob_session, flight_session_tag_);
+
+  if (OB_NOT_NULL(cancellation) && cancellation->is_cancelled()) {
+    return OB_CANCELED;
+  }
 
   // gRPC threads have no per-request memory context set up by the tenant scheduler,
   // so THIS_WORKER.get_sql_arena_allocator() falls back to the process-global ROOT_CONTEXT
