@@ -1331,6 +1331,64 @@ TEST_F(TestAsyncVectorParentCleanup, deferred_snapshot_cleanup_rejects_query_err
 }
 } // namespace parent_cleanup_test
 
+TEST_F(TestAsyncVectorBuildTiming, new_tasks_inherit_scheduling_parameters)
+{
+  for (const int64_t parallelism : {1L, 4L, 8L}) {
+    for (const int64_t arg_parallelism : {0L, parallelism}) {
+      SCOPED_TRACE(parallelism);
+      SCOPED_TRACE(arg_parallelism);
+      arg_.parallelism_ = arg_parallelism;
+      const int64_t arg_consumer_group = 0 == arg_parallelism ? 0 : 7;
+      arg_.consumer_group_id_ = arg_consumer_group;
+      ObAsyncVectorIndexBuildTask task;
+      ASSERT_SUCC(task.init(1001, 7001, &data_schema_, &index_schema_, 4001,
+          parallelism, 0, 7, 0, arg_, DATA_VERSION_4_6_3_1, 100, true));
+      ASSERT_EQ(parallelism, task.parallelism_);
+      ASSERT_EQ(parallelism, task.create_index_arg_.parallelism_);
+      ASSERT_EQ(7, task.consumer_group_id_);
+      ASSERT_EQ(7, task.create_index_arg_.consumer_group_id_);
+      ASSERT_EQ(arg_consumer_group, arg_.consumer_group_id_);
+      ASSERT_EQ(arg_parallelism, arg_.parallelism_);
+      ObArenaAllocator allocator("AsyncVecPar");
+      obrpc::ObCreateIndexArg delete_arg;
+      ASSERT_SUCC(task.construct_async_delete_arg(allocator, delete_arg));
+      ASSERT_EQ(parallelism, delete_arg.parallelism_);
+      ASSERT_EQ(7, delete_arg.consumer_group_id_);
+    }
+  }
+}
+
+TEST_F(TestAsyncVectorBuildTiming, recovered_tasks_inherit_scheduling_parameters)
+{
+  for (const int64_t parallelism : {1L, 4L, 8L}) {
+    for (const int64_t arg_parallelism : {0L, 2L, parallelism}) {
+      SCOPED_TRACE(parallelism);
+      SCOPED_TRACE(arg_parallelism);
+      ObAsyncVectorIndexBuildTask original;
+      ASSERT_SUCC(original.init(1001, 7001, &data_schema_, &index_schema_, 4001,
+          parallelism, 0, 7, 0, arg_, DATA_VERSION_4_6_3_1, 100, true));
+      // Encode the inconsistent arguments that an old ALTER task could persist.
+      original.create_index_arg_.parallelism_ = arg_parallelism;
+      original.create_index_arg_.consumer_group_id_ = 0;
+      ObAddr addr;
+      ASSERT_TRUE(addr.set_ip_addr("127.0.0.1", 2882));
+      ObCurTraceId::TraceId trace_id;
+      trace_id.init(addr);
+      ASSERT_SUCC(original.set_trace_id(trace_id));
+      ObArenaAllocator allocator("AsyncVecPar");
+      ObDDLTaskRecord record;
+      ASSERT_SUCC(original.convert_to_record(record, allocator));
+      ASSERT_TRUE(record.is_valid());
+      ObAsyncVectorIndexBuildTask recovered;
+      ASSERT_SUCC(recovered.init(record));
+      ASSERT_EQ(parallelism, recovered.parallelism_);
+      ASSERT_EQ(parallelism, recovered.create_index_arg_.parallelism_);
+      ASSERT_EQ(7, recovered.consumer_group_id_);
+      ASSERT_EQ(7, recovered.create_index_arg_.consumer_group_id_);
+    }
+  }
+}
+
 TEST_F(TestAsyncVectorBuildTiming, new_task_starts_execution_clock)
 {
   ObAsyncVectorIndexBuildTask task;

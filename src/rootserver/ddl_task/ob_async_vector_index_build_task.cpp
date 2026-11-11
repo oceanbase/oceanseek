@@ -114,6 +114,8 @@ int ObAsyncVectorIndexBuildTask::init(
     dst_tenant_id_ = tenant_id;
     dst_schema_version_ = schema_version;
     create_index_arg_.exec_tenant_id_ = tenant_id;
+    create_index_arg_.parallelism_ = parallelism_;
+    create_index_arg_.consumer_group_id_ = consumer_group_id_;
     start_time_ = ObTimeUtility::current_time();
     set_gmt_create(ObTimeUtility::current_time());
     if (OB_FAIL(init_ddl_task_monitor_info(target_object_id_))) {
@@ -1643,6 +1645,9 @@ int ObAsyncVectorIndexBuildTask::deserialize_params_from_message(
                    allocator_, tmp_arg, create_index_arg_))) {
       LOG_WARN("fail to copy deserialized create index arg", K(ret));
     } else {
+      // Persisted ALTER tasks may have omitted the nested scheduling parameters.
+      create_index_arg_.parallelism_ = parallelism_;
+      create_index_arg_.consumer_group_id_ = consumer_group_id_;
       LST_DO_CODE(OB_UNIS_DECODE,
           shared_async_delete_table_id_, baseline_submitted, baseline_task_id_,
           drop_submitted, drop_task_id_, retryable);
