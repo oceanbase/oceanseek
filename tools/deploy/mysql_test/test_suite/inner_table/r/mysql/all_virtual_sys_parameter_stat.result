@@ -561,6 +561,7 @@ _enable_shared_mark_sweep_gc_diagnose
 _enable_simple_schema_on_demand
 _enable_skip_index
 _enable_spf_batch_rescan
+_enable_split_ranges_by_row_count
 _enable_sql_audit_filter_pushdown
 _enable_sql_audit_query_sql
 _enable_sql_ccl_rule
