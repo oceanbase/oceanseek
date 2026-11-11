@@ -15,6 +15,7 @@
 #include "lib/string/ob_sql_string.h"
 #include "common/object/ob_obj_funcs.h"
 #include "lib/geo/ob_s2adapter.h"
+#include "lib/json_type/ob_json_tree.h"
 
 using namespace oceanbase;
 using namespace oceanbase::common;
@@ -30,6 +31,197 @@ int __attribute__((weak)) ob_obj_read_lob_data(ObIAllocator &allocator, const co
   return ret;
 }
 }
+}
+
+static int get_json_uint_value(
+    const ObIJsonBase *node,
+    const char *field_name,
+    uint64_t &value)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(node)
+      || OB_UNLIKELY(ObJsonNodeType::J_INT != node->json_type()
+      && ObJsonNodeType::J_UINT != node->json_type())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid unsigned integer json node", KR(ret), K(field_name), KP(node));
+  } else if (OB_UNLIKELY(ObJsonNodeType::J_INT == node->json_type() && node->get_int() < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("negative unsigned integer json value", KR(ret), K(field_name), "value", node->get_int());
+  } else {
+    value = (ObJsonNodeType::J_INT == node->json_type()) ? static_cast<uint64_t>(node->get_int())
+                                                         : node->get_uint();
+  }
+  return ret;
+}
+
+int ObExternalBlobInfo::serialize(ObIAllocator &allocator, ObJsonObject &json_obj) const
+{
+  int ret = OB_SUCCESS;
+  ObJsonString external_lob_url(url_.ptr(), url_.length());
+  ObJsonString external_lob_etag(etag_.empty() ? "" : etag_.ptr(), etag_.length());
+  ObJsonUint external_lob_offset(offset_);
+  ObJsonUint external_lob_length(length_);
+  ObJsonBoolean external_lob_has_length(has_length_);
+  ObJsonUint external_lob_kind(static_cast<uint64_t>(kind_));
+  const ObJsonObjectPair fields[] = {
+    ObJsonObjectPair("external_lob_url", &external_lob_url),
+    ObJsonObjectPair("external_lob_etag", &external_lob_etag),
+    ObJsonObjectPair("external_lob_offset", &external_lob_offset),
+    ObJsonObjectPair("external_lob_length", &external_lob_length),
+    ObJsonObjectPair("external_lob_has_length", &external_lob_has_length),
+    ObJsonObjectPair("external_lob_kind", &external_lob_kind)
+  };
+  if (OB_UNLIKELY(!is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid external lob info to serialize", KR(ret), KPC(this));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(fields); ++i) {
+    // add() keeps node pointers, so clone nodes before the local values go out of scope.
+    ObJsonNode *node = fields[i].get_value()->clone(&allocator);
+    if (OB_ISNULL(node)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to clone external lob json node", KR(ret), K(fields[i].get_key()));
+    } else if (OB_FAIL(json_obj.add(fields[i].get_key(), node))) {
+      LOG_WARN("failed to add external lob json field", KR(ret), K(fields[i].get_key()));
+    }
+  }
+  return ret;
+}
+
+int ObExternalBlobInfo::deserialize(const ObJsonObject &json_root)
+{
+  int ret = OB_SUCCESS;
+  ObIJsonBase *offset_node = nullptr;
+  ObIJsonBase *length_node = nullptr;
+  ObIJsonBase *kind_node = nullptr;
+  ObIJsonBase *url_node = nullptr;
+  // etag is optional; json_root.get_value returns nullptr when the value is absent.
+  ObIJsonBase *etag_node = json_root.get_value("external_lob_etag");
+  ObIJsonBase *has_length_node = json_root.get_value("external_lob_has_length"); // length=null
+  bool has_length = true;
+  uint64_t offset = 0;
+  uint64_t length = 0;
+  uint64_t kind = static_cast<uint64_t>(common::ObExternalBlobKind::MAX);
+  if (OB_FAIL(json_root.get_object_value("external_lob_url", url_node))) {
+    LOG_WARN("failed to get external lob url", KR(ret));
+  } else if (OB_FAIL(json_root.get_object_value("external_lob_offset", offset_node))) {
+    LOG_WARN("failed to get external lob offset", KR(ret));
+  } else if (OB_FAIL(json_root.get_object_value("external_lob_length", length_node))) {
+    LOG_WARN("failed to get external lob length", KR(ret));
+  } else if (OB_FAIL(json_root.get_object_value("external_lob_kind", kind_node))) {
+    LOG_WARN("failed to get external lob kind", KR(ret));
+  } else if (OB_ISNULL(url_node)
+             || OB_UNLIKELY(ObJsonNodeType::J_STRING != url_node->json_type())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid external lob url json node", KR(ret), KP(url_node));
+  } else if (OB_NOT_NULL(etag_node)
+             && OB_UNLIKELY(ObJsonNodeType::J_STRING != etag_node->json_type()
+             || etag_node->get_data_length() >= common::OB_ETAG_CAPACITY)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid external lob etag json node", KR(ret), KP(etag_node));
+  } else if (OB_FAIL(get_json_uint_value(offset_node, "external_lob_offset", offset))) {
+  } else if (OB_FAIL(get_json_uint_value(length_node, "external_lob_length", length))) {
+  } else if (OB_FAIL(get_json_uint_value(kind_node, "external_lob_kind", kind))) {
+  } else if (OB_ISNULL(has_length_node)
+             || OB_UNLIKELY(ObJsonNodeType::J_BOOLEAN != has_length_node->json_type())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid external lob has_length node", KR(ret));
+  } else if (OB_UNLIKELY(kind >= static_cast<uint64_t>(common::ObExternalBlobKind::MAX))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid external lob kind", KR(ret), K(kind));
+  } else if (OB_UNLIKELY(common::OB_MAX_URI_LENGTH <= url_node->get_data_length()
+                        || 0 == url_node->get_data_length())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid external lob url length", KR(ret), "length", url_node->get_data_length());
+  } else {
+    has_length = has_length_node->get_boolean();
+    const ObString url(static_cast<int32_t>(url_node->get_data_length()), url_node->get_data());
+    ObString etag = ObString::make_string("");
+    // Treat missing ETag in old summaries as unspecified.
+    if (OB_NOT_NULL(etag_node)) {
+      int32_t etag_length = static_cast<int32_t>(etag_node->get_data_length());
+      etag.assign_ptr(etag_node->get_data(), etag_length);
+    }
+    if (OB_UNLIKELY(url.empty()
+                    || common::OB_MAX_URI_LENGTH <= url.length()
+                    || OB_NOT_NULL(MEMCHR(url.ptr(), '\0', url.length()))
+                    || (has_length && 0 == length)
+                    || (has_length ? UINT64_MAX - length < offset : 0 != offset || 0 != length)
+                    || common::ObExternalBlobKind::REFERENCE !=
+                       static_cast<common::ObExternalBlobKind>(kind))) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid persisted external lob arguments", KR(ret), K(url), K(offset), K(length), K(kind));
+    } else if (OB_UNLIKELY(!etag.empty() && OB_NOT_NULL(MEMCHR(etag.ptr(), '\0', etag.length())))) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("external lob etag contains NULL", KR(ret));
+    } else {
+      // Borrow JSON nodes; after full summary validation, deep-copy to the caller's allocator.
+      url_ = url;
+      etag_ = etag;
+      offset_ = offset;
+      length_ = length;
+      has_length_ = has_length;
+      kind_ = static_cast<common::ObExternalBlobKind>(kind);
+    }
+  }
+  return ret;
+}
+
+int ObExternalBlobInfo::deep_copy(ObIAllocator &allocator, const ObExternalBlobInfo &src)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!src.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "invalid external lob info to copy", K(ret), K(src.url_.length()),
+                                                          K(src.etag_.length()), K(src.kind_));
+  } else {
+    offset_ = src.offset_;
+    length_ = src.length_;
+    kind_ = src.kind_;
+    has_length_ = src.has_length_;
+    if (OB_FAIL(ob_write_string(allocator, src.url_, url_))) {
+      COMMON_LOG(WARN, "failed to copy external lob URL", K(ret), K(src.url_.length()), K(src.etag_.length()));
+    } else if (OB_FAIL(ob_write_string(allocator, src.etag_, etag_))) {
+      COMMON_LOG(WARN, "failed to copy external lob ETag", K(ret), K(src.url_.length()), K(src.etag_.length()));
+    }
+  }
+  return ret;
+}
+
+bool ObExternalBlobInfo::is_equal(ObExternalBlobInfo& another){
+  const bool is_equal = this->offset_ == another.offset_
+                        && this->length_ == another.length_
+                        && this->has_length_ == another.has_length_
+                        && this->kind_ == another.kind_
+                        && this->url_ == another.url_
+                        && this->etag_ == another.etag_;
+  return is_equal;
+}
+
+void ObExternalBlobInfoLayout::assign(const ObExternalBlobInfo &info)
+{
+  // The caller has validated the descriptor and reserved space for the URL and ETag.
+  url_length_ = info.url_.length();
+  etag_length_ = info.etag_.length();
+  offset_ = info.offset_;
+  length_ = info.length_;
+  kind_ = info.kind_;
+  has_length_ = info.has_length_;
+  version_ = 1;
+  MEMCPY(buffer_, info.url_.ptr(), url_length_);
+  if (etag_length_ > 0) {
+    MEMCPY(buffer_ + url_length_, info.etag_.ptr(), etag_length_);
+  }
+}
+
+void ObExternalBlobInfoLayout::get_info(ObExternalBlobInfo &info) const
+{
+  info.url_.assign_ptr(buffer_, url_length_);
+  info.etag_.assign_ptr(buffer_ + url_length_, etag_length_);
+  info.offset_ = offset_;
+  info.length_ = length_;
+  info.kind_ = kind_;
+  info.has_length_ = has_length_;
 }
 
 //==================== ObLobId ====================
@@ -92,9 +284,8 @@ void ObLobId::reset()
 
 bool ObLobId::is_valid() const
 {
-  return get_column_idx() > 0
-         && get_tablet_id() > 0
-         && get_auto_inc_id() > 0;
+  // Heap-table LOBs reuse hidden row IDs, which can be zero after DDL.
+  return get_column_idx() > 0 && get_tablet_id() > 0;
 }
 
 uint64_t ObLobId::hash() const
@@ -362,6 +553,20 @@ DEF_TO_STRING(ObLobLocatorV2)
             J_COMMA();
             J_KV(K(*retry_info));
           }
+          if (buf_len > pos && extern_header->is_external_lob_
+              && offset + MEM_LOB_EXTERN_EXTERNAL_HEADER_LEN <= size_) {
+            ObExternalBlobInfoLayout *external_lob_info =
+                                      reinterpret_cast<ObExternalBlobInfoLayout *>(ptr_ + offset);
+            if (external_lob_info->is_valid() && external_lob_info->get_size() <= size_ - offset) {
+              ObExternalBlobInfo info;
+              external_lob_info->get_info(info);
+              if (info.is_valid()) {
+                J_COMMA();
+                J_KV(K(info));
+              }
+            }
+            offset += external_lob_info->get_size();
+          }
           if (buf_len > pos && extern_header->has_read_snapshot_
               && size_ >= offset + sizeof(ObMemLobReadSnapshot)) {
             ObMemLobReadSnapshot *read_snapshot = reinterpret_cast<ObMemLobReadSnapshot *>(ptr_ + offset);
@@ -371,7 +576,8 @@ DEF_TO_STRING(ObLobLocatorV2)
               J_KV(K(*read_snapshot));
             }
           }
-          if (buf_len > pos && extern_header->has_row_key_) {
+          if (buf_len > pos && extern_header->has_row_key_
+              && offset + extern_header->rowkey_size_ <= size_) {
             ObString rowkey_str(MIN(extern_header->rowkey_size_, buf_len - pos), ptr_ + offset);
             offset += extern_header->rowkey_size_;
             J_COMMA();
@@ -385,7 +591,7 @@ DEF_TO_STRING(ObLobLocatorV2)
           J_COMMA(); 
           J_KV("disk_locator", disk_locator);
         }
-        if (buf_len > pos && mem_lob_common->has_payload()) {
+        if (buf_len > pos && mem_lob_common->has_payload() && offset <= size_) {
           ObString payload_str(MIN(size_ - offset, buf_len - pos), ptr_ + offset);
           J_COMMA();
           J_KV("payload", payload_str);
@@ -417,6 +623,8 @@ int ObLobLocatorV2:: get_mem_locator(ObMemLobCommon *&mem_loc) const
 int ObLobLocatorV2::get_extern_header(ObMemLobExternHeader *&extern_header) const
 {
   int ret = OB_SUCCESS;
+  extern_header = nullptr;
+  const uint64_t header_size = MEM_LOB_COMMON_HEADER_LEN + MEM_LOB_EXTERN_HEADER_LEN;
   ObMemLobCommon *mem_loc = get_mem_lob_common();
   if (OB_ISNULL(mem_loc)) {
     ret = OB_INVALID_ARGUMENT;
@@ -424,8 +632,16 @@ int ObLobLocatorV2::get_extern_header(ObMemLobExternHeader *&extern_header) cons
   } else if (!mem_loc->has_extern()) {
     ret = OB_ERR_NULL_VALUE;
     COMMON_LOG(WARN, "lob locator does not have extern header", K(ret), KPC(this));
+  } else if (OB_UNLIKELY(size_ < header_size)) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "truncated lob extern header", K(ret), K(size_), K(header_size));
   } else {
     extern_header = reinterpret_cast<ObMemLobExternHeader *>(mem_loc->buffer_);
+    if (OB_UNLIKELY(header_size + extern_header->body_size_ > size_)) {
+      ret = OB_INVALID_ARGUMENT;
+      COMMON_LOG(WARN, "truncated lob extern body", K(ret), K(size_), K(header_size), K(extern_header->body_size_));
+      extern_header = nullptr;
+    }
   }
   return ret;
 }
@@ -449,6 +665,7 @@ int ObLobLocatorV2::get_rowkey(ObString &rowkey_str) const
 int ObLobLocatorV2::get_disk_locator(ObLobCommon *&disk_loc) const
 {
   int ret = OB_SUCCESS;
+  disk_loc = nullptr;
   if (OB_UNLIKELY(size_ == 0 || OB_ISNULL(ptr_))) {
     ret = OB_ERR_NULL_VALUE;
     COMMON_LOG(WARN, "Lob: try to get disk locator without lob header", K(ret));
@@ -459,6 +676,11 @@ int ObLobLocatorV2::get_disk_locator(ObLobCommon *&disk_loc) const
     if (OB_ISNULL(mem_loc)) {
       ret = OB_INVALID_ARGUMENT;
       COMMON_LOG(WARN, "failed to get mem lob common", K(ret), KPC(this));
+    } else if (OB_UNLIKELY(mem_loc->is_external_temp())) {
+      // A temporary External LOB has only a descriptor; its end is not a Disk locator.
+      ret = OB_ERR_NULL_VALUE;
+      COMMON_LOG(WARN, "A temporary External LOB has only a descriptor without disk locator",
+                 K(ret), K(size_), K(mem_loc->type_));
     } else if (mem_loc->has_extern()) {
       char *extern_header = mem_loc->buffer_;
       disk_loc = reinterpret_cast<ObLobCommon *>(extern_header + sizeof(ObMemLobExternHeader) + reinterpret_cast<ObMemLobExternHeader *>(extern_header)->body_size_);
@@ -492,7 +714,7 @@ int ObLobLocatorV2::get_disk_locator(ObString &disc_loc_buff) const
 int ObLobLocatorV2::get_lob_id(ObString &lob_id) const
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(size_ < sizeof(ObLobCommon) + sizeof(ObLobId) || !is_outrow_disk_lob_locator())) {
+  if (OB_UNLIKELY(size_ < sizeof(ObLobCommon) + sizeof(ObLobId) || !is_outline_disk_lob_locator())) {
     ret = OB_INVALID_ARGUMENT;
     COMMON_LOG(WARN, "invalid outrow disk lob locator", K(ret), KP_(ptr), K_(size));
   } else {
@@ -603,6 +825,27 @@ bool ObLobLocatorV2::is_empty_lob() const
   return (ret == OB_SUCCESS ? bret : false);
 }
 
+bool ObLobLocatorV2::has_extern_header() const
+{
+  bool bret = false;
+  if (OB_NOT_NULL(ptr_) && size_ >= MEM_LOB_COMMON_HEADER_LEN + MEM_LOB_EXTERN_HEADER_LEN) {
+    const ObMemLobCommon *mem_lob = reinterpret_cast<const ObMemLobCommon *>(ptr_);
+    bret = mem_lob->lob_common_.is_valid() && mem_lob->lob_common_.is_mem_loc_
+           && mem_lob->has_extern();
+  }
+  return bret;
+}
+
+bool ObLobLocatorV2::is_mem_external_lob() const
+{
+  bool bret = false;
+  ObMemLobExternHeader *extern_header = nullptr;
+  if (has_extern_header() && OB_SUCCESS == get_extern_header(extern_header)) {
+    bret = extern_header->is_external_lob();
+  }
+  return bret;
+}
+
 int ObLobLocatorV2::get_append_delta(const ObMemLobExternHeader *&extern_header,
                                      ObString &data) const
 {
@@ -631,6 +874,7 @@ int ObLobLocatorV2::get_append_delta(const ObMemLobExternHeader *&extern_header,
         || extern_header->has_retry_info_
         || extern_header->has_read_snapshot_
         || extern_header->has_row_key_
+        || extern_header->is_external_lob_
         || 0 != extern_header->reserved_
         || 0 != extern_header->rowkey_size_
         || 0 != extern_header->reserved2_) {
@@ -716,27 +960,104 @@ int ObLobLocatorV2::get_retry_info(ObMemLobRetryInfo *&retry_info) const
   return ret;
 }
 
+int ObLobLocatorV2::get_external_lob_info_layout_(ObExternalBlobInfoLayout *&layout) const
+{
+  int ret = OB_SUCCESS;
+  layout = nullptr;
+  ObMemLobExternHeader *extern_header = nullptr;
+  if (OB_UNLIKELY(!is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "invalid lob locator", K(ret), KP(ptr_), K(size_));
+  } else if (OB_FAIL(get_extern_header(extern_header))) {
+    COMMON_LOG(WARN, "failed to get extern header", K(ret), KP(ptr_), K(size_));
+  } else if (OB_UNLIKELY(!extern_header->is_external_lob())) {
+    ret = OB_ERR_NULL_VALUE;
+    COMMON_LOG(WARN, "lob locator does not have external lob info", K(ret), K(size_), K(extern_header->body_size_));
+  } else {
+    uint64_t info_offset = 0;
+    if (extern_header->has_location_info_) {
+      info_offset += sizeof(ObMemLobLocationInfo);
+    }
+    if (extern_header->has_retry_info_) {
+      info_offset += sizeof(ObMemLobRetryInfo);
+    }
+    if (OB_UNLIKELY(CS_TYPE_BINARY != extern_header->cs_type_
+        || info_offset + MEM_LOB_EXTERN_EXTERNAL_HEADER_LEN > extern_header->body_size_)) {
+      ret = OB_INVALID_ARGUMENT;
+      COMMON_LOG(WARN, "invalid external lob info layout", K(ret),
+                 K(info_offset), K(extern_header->body_size_), K(extern_header->cs_type_));
+    } else {
+      layout = reinterpret_cast<ObExternalBlobInfoLayout *>(extern_header->buffer_ + info_offset);
+      const int64_t available_size = extern_header->body_size_ - info_offset;
+      if (OB_UNLIKELY(!layout->is_valid() || layout->get_size() > available_size)) {
+        ret = OB_INVALID_ARGUMENT;
+        COMMON_LOG(WARN, "invalid external lob info", K(ret),
+                   K(available_size), K(layout->get_size()), K(layout->version_));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObLobLocatorV2::get_external_lob_info(ObExternalBlobInfo &info) const
+{
+  int ret = OB_SUCCESS;
+  ObExternalBlobInfoLayout *layout = nullptr;
+  info = ObExternalBlobInfo();
+  if (OB_FAIL(get_external_lob_info_layout_(layout))) {
+    COMMON_LOG(WARN, "failed to get external lob layout", KR(ret), KP(ptr_), K(size_));
+  } else {
+    layout->get_info(info);
+  }
+  return ret;
+}
+
 int ObLobLocatorV2::get_read_snapshot_data(ObString &read_snapshot_data) const
 {
   int ret = OB_SUCCESS;
   ObMemLobExternHeader *extern_header = nullptr;
   read_snapshot_data.reset();
-  if (OB_FAIL(get_extern_header(extern_header))) {
+  if (OB_UNLIKELY(!is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "invalid lob snapshot layout", K(ret), KP(ptr_), K(size_));
+  } else if (OB_FAIL(get_extern_header(extern_header))) {
     COMMON_LOG(WARN, "failed to get extern header", K(ret), KPC(this));
   } else if (!extern_header->has_read_snapshot_) {
     ret = OB_INVALID_ARGUMENT;
     COMMON_LOG(WARN, "lob locator does not have read snapshot", K(ret), KPC(this));
   } else {
-    char *cur_ptr = extern_header->buffer_;
+    uint64_t snapshot_offset = 0;
     if (extern_header->has_location_info_) {
-      cur_ptr += sizeof(ObMemLobLocationInfo);
+      snapshot_offset += sizeof(ObMemLobLocationInfo);
     }
     if (extern_header->has_retry_info_) {
-      cur_ptr += sizeof(ObMemLobRetryInfo);
+      snapshot_offset += sizeof(ObMemLobRetryInfo);
     }
-    ObMemLobReadSnapshot *read_snapshot = reinterpret_cast<ObMemLobReadSnapshot *>(cur_ptr);
-    if (read_snapshot->size_ > 0) {
-      read_snapshot_data.assign_ptr(read_snapshot->buffer_, read_snapshot->size_);
+    if (extern_header->is_external_lob_) {
+      ObExternalBlobInfoLayout *layout = nullptr;
+      if (OB_FAIL(get_external_lob_info_layout_(layout))) {
+        COMMON_LOG(WARN, "failed to get external lob layout", K(ret), K(snapshot_offset), K(extern_header->body_size_));
+      } else {
+        snapshot_offset += layout->get_size();
+      }
+    }
+
+    if (OB_FAIL(ret)) {
+    } else if (OB_UNLIKELY(snapshot_offset + sizeof(ObMemLobReadSnapshot) >
+                           extern_header->body_size_)) {
+      ret = OB_INVALID_ARGUMENT;
+      COMMON_LOG(WARN, "truncated lob read snapshot header", K(ret), K(snapshot_offset), K(extern_header->body_size_));
+    } else {
+      const ObMemLobReadSnapshot *read_snapshot =
+          reinterpret_cast<const ObMemLobReadSnapshot *>(extern_header->buffer_ + snapshot_offset);
+      if (OB_UNLIKELY(snapshot_offset + sizeof(*read_snapshot) + read_snapshot->size_ >
+                      extern_header->body_size_)) {
+        ret = OB_INVALID_ARGUMENT;
+        COMMON_LOG(WARN, "truncated lob read snapshot data", K(ret),
+                   K(snapshot_offset), K(read_snapshot->size_), K(extern_header->body_size_));
+      } else if (read_snapshot->size_ > 0) {
+        read_snapshot_data.assign_ptr(read_snapshot->buffer_, read_snapshot->size_);
+      }
     }
   }
   return ret;
@@ -1345,6 +1666,7 @@ int ObObj::build_not_strict_default_value(
     case ObTextType:
     case ObMediumTextType:
     case ObLongTextType:
+    case ObExtendBLobType:
     case ObGeometryType:{
         ObString null_str;
         set_string(data_type, null_str);
@@ -1854,6 +2176,7 @@ int ObObj::apply(const ObObj &mutation)
                       && ObNullType != mut_type
                       && org_type != mut_type
                       && !(ObLongTextType == org_type && ObLobType == mut_type)
+                      && !(ObExtendBLobType == org_type && ObLobType == mut_type)
                       && !(ObJsonType == org_type && ObLobType == mut_type)
                       && !(ObGeometryType == org_type && ObLobType == mut_type)
                       && !(ObRoaringBitmapType == org_type && ObLobType == mut_type)))) {
@@ -1979,8 +2302,10 @@ ObObjTypeFuncs OBJ_FUNCS[ObMaxType] =
   DEF_FUNC_ENTRY(ObMySQLDateType),     // 52, mysql date
   DEF_FUNC_ENTRY(ObMySQLDateTimeType), // 53, mysql datetime
   DEF_FUNC_ENTRY(ObRoaringBitmapType), // 54, roaringbitmap
+  DEF_FUNC_ENTRY(ObExtendBLobType),    // 55, extend blob
 
 };
+static_assert(sizeof(OBJ_FUNCS) / sizeof(OBJ_FUNCS[0]) == ObMaxType, "Not enough initializer");
 
 ob_obj_hash ObObjUtil::get_murmurhash_v3(ObObjType type)
 {

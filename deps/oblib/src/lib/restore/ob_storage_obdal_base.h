@@ -180,6 +180,7 @@ public:
   virtual void reset() override;
   virtual int open(const ObString &uri,
            ObObjectStorageInfo *storage_info, const bool head_meta = true) override;
+  int set_if_match_etag(const char *etag);
   virtual int pread(char *buf, const int64_t buf_size, const int64_t offset, int64_t &read_size) override;
   virtual int close() override;
   virtual int64_t get_length() const override { return file_length_; }
@@ -188,6 +189,8 @@ public:
 protected:
   bool is_opened_;
   bool has_meta_;
+  bool has_if_match_etag_;
+  ObString if_match_etag_;
   int64_t file_length_;
   opendal_reader *opendal_reader_;
   DISALLOW_COPY_AND_ASSIGN(ObStorageObDalReader);

@@ -41,6 +41,7 @@ struct ObStorageDatum;
 namespace storage
 {
 class ObStoreCtxGuard;
+struct ObOuttableLobControlKey;
 //
 // Project storage output row to expression array, the core project logic is:
 //
@@ -291,7 +292,9 @@ struct ObDMLBaseParam
         data_row_for_lob_(nullptr),
         is_main_table_in_fts_ddl_(false),
         ctx_(),
-        vec_index_acquire_ctxs_(nullptr)
+        vec_index_acquire_ctxs_(nullptr),
+        outtable_lob_control_keys_(nullptr),
+        allow_outtable_lob_(false)
   {
   }
 
@@ -331,6 +334,8 @@ struct ObDMLBaseParam
   bool is_main_table_in_fts_ddl_; // whether the main table is in fts ddl when dml is executed
   ObDMLLogicTableCtx ctx_;
   common::ObIArray<share::ObVectorIndexAcquireCtx> *vec_index_acquire_ctxs_; // vector index auxiliary table info array for adaptor lookup (one per vector index)
+  common::ObIArray<ObOuttableLobControlKey> *outtable_lob_control_keys_;
+  bool allow_outtable_lob_;
   bool is_valid() const { return (timeout_ > 0 && schema_version_ >= 0) && nullptr != store_ctx_guard_; }
   DECLARE_TO_STRING;
 };

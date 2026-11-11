@@ -99,7 +99,6 @@ private:
   int extend_seq_buf();
   int empty();
 private:
-
   ObIAllocator *allocator_;
   ObString seq_id_;
 
@@ -115,12 +114,9 @@ private:
   uint32_t dig_len_;
   uint32_t dig_cap_;
 
-private:
-  static const uint32_t SEQ_PER_UNIT_BUF_SIZE = 16;
-
 public:
-  static const uint32_t LOB_SEQ_DIGIT_DEFAULT_LEN = 1024;
-  static const uint32_t LOB_SEQ_DEFAULT_SEQ_BUF_LEN = 1024 * 8;
+  static const uint32_t LOB_SEQ_DIGIT_DEFAULT_LEN = 8;
+  static const uint32_t LOB_SEQ_DEFAULT_SEQ_BUF_LEN = 8 * 8;
 };
 
 } // storage

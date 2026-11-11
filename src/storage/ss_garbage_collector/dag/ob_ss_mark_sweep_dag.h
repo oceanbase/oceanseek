@@ -18,6 +18,7 @@
 #include "storage/ss_garbage_collector/dag/ob_ss_gc_dag_base.h"
 #include "storage/garbage_collector/ob_mark_sweep_pipeline.h"
 #include "storage/ss_garbage_collector/ob_ss_mark_sweep_diag_mgr.h"
+#include "storage/ss_garbage_collector/user_data_gc_dag_task/ob_ss_outtable_lob_user_gc_define.h"
 
 namespace oceanbase
 {
@@ -253,6 +254,8 @@ public:
   void reset();
   bool is_valid() const;
   int append_tablet_del_meta_scn_info(const ObTabletDelMetaScnInfo &info);
+  int append_lob_ctrl_scan_file(const ObSSLobCtrlGCScanFile &file);
+  int append_lob_ctrl_merge_file(const ObSSLobCtrlGCScanFile &file);
   // mark_delete_meta_scn is invalid if the tablet is not mark-deleted.
   int get_mark_delete_meta_scn(const ObSSGCTablet &gc_tablet,
                                share::SCN &mark_delete_meta_scn) const;
@@ -266,7 +269,9 @@ public:
       K_(file_buf_size), K_(round_id), K_(progress), "del_meta_scn_info_cnt",
       tablet_del_meta_scn_infos_.count(), "mark_deleted_tablet_cnt", mark_deleted_tablets_.size(),
       "ls_ss_checkpoint_cnt", ls_ss_checkpoint_scn_map_.size(),
-      "tablet_kept_meta_scn_cnt", tablet_kept_meta_scn_map_.size());
+      "tablet_kept_meta_scn_cnt", tablet_kept_meta_scn_map_.size(), K_(min_outtable_data_scn),
+      "lob_meta_scan_input_cnt", lob_meta_scan_inputs_.count(),
+      "lob_ctrl_scan_input_cnt", lob_ctrl_scan_inputs_.count());
 
 public:
   ObMarkSweepPipeline pipeline_;
@@ -274,6 +279,22 @@ public:
   ObSSGCTabletWithMetaScnArray tablet_with_meta_scn_arr_;
   share::SCN snapshot_meta_scn_;
   share::SCN safe_meta_scn_;
+  // 所选 LOB Meta/Ctrl 保留版本的最小事务检查点；max_scn 表示尚无可用位点。
+  share::SCN min_outtable_data_scn_;
+  // 输入准备完成后冻结；各扫描 Task 只读取自己的索引范围。
+  ObSSGCTabletWithMetaScnArray lob_meta_scan_inputs_;
+  // Frozen shared versions of current LOB Ctrl data-table partitions; no index tablets.
+  ObSSGCTabletWithMetaScnArray lob_ctrl_scan_inputs_;
+  // 用户 GC 的引用文件与系统 GC 的对象文件分开管理。
+  ObMarkSweepPipeline lob_meta_pipeline_;
+  // 管理器晚于所有文件句柄释放；完整行校验值仅保存在本轮临时文件中。
+  ObMarkSweepTmpFileMgr lob_ctrl_scan_file_mgr_;
+  common::ObSpinLock lob_ctrl_scan_file_lock_;
+  common::ObSEArray<ObSSLobCtrlGCScanFile, 16> lob_ctrl_scan_files_;
+  common::ObSEArray<ObSSLobCtrlGCScanFile, 16> lob_ctrl_merge_inputs_;
+  common::ObSEArray<ObSSLobCtrlGCScanFile, 16> lob_ctrl_merge_outputs_;
+  ObSSLobCtrlGCScanFile lob_ctrl_merged_file_;
+  ObSSLobCtrlGCScanFile lob_ctrl_diff_file_;
   common::ObSEArray<share::SCN, 8> reserved_meta_scns_;
   // mark-deleted tablet -> meta_scn of its mark-delete tablet meta version
   common::hash::ObHashMap<ObSSGCTablet, share::SCN> mark_deleted_tablets_;
@@ -353,7 +374,7 @@ public:
 
 
 // ====================================================================================
-// Input bundle for ObSSMarkSweepSortTask::get_del_and_kept_meta_scns_simply_.
+// 系统 GC 与用户数据 GC 共用的 TabletMeta 版本划分输入。
 // ====================================================================================
 struct ObSSGetDelKeptMetaScnParam
 {
@@ -402,6 +423,14 @@ public:
 // Per-tenant deduplicated via hash() / operator==.
 //
 //   PrepareTask
+//      ↓
+//   OuttableGCTask（用户 GC 唯一入口，动态创建后续扫描与归并任务）
+//      ↓
+//   LobMetaGCScanTask[0..N]（并行批次，全部结束后才能开始归并）
+//      ↓
+//   MergeStart → MergePassCtrl/Batch → MergeComplete（LOB Meta 保留引用管线）
+//      ↓
+//   LobCtrlGCScanTask[0..N]（并行批次，全部结束后才能进入系统 GC）
 //      ↓
 //   SortTask[0] ─(generate_next_task)─→ SortTask[1] ─→ ... ─→ SortTask[N]
 //      ↓  (every SortTask carries MergeStartTask as a child)
@@ -480,6 +509,30 @@ public:
 
 protected:
   int get_ctx(ObSSMarkSweepCtx *&ctx) const;
+  int get_all_meta_scns_(const ObSSGCTablet &gc_tablet,
+                         const share::SCN &snapshot_meta_scn,
+                         common::ObIArray<share::SCN> &all_meta_scns);
+  // MIN3 未给出回收边界时，改用 PrepareTask 冻结的 Lock Row 保留位点作为边界。
+  int calc_recycle_boundary_from_lock_row_(const ObSSGetDelKeptMetaScnParam &param,
+                                           share::SCN &min_meta_scn,
+                                           bool &can_del_all);
+  // 回收边界取自 MIN(tablet_meta_scn, safe_meta_scn, real_min_reserved_meta_scn)。
+  int calc_recycle_boundary_from_constraints_(const ObSSGetDelKeptMetaScnParam &param,
+                                              const share::SCN &min_meta_scn,
+                                              bool &can_del_all);
+  int get_del_and_kept_meta_scns_simply_(const ObSSGetDelKeptMetaScnParam &param,
+                                         common::ObIArray<share::SCN> &del_meta_scns,
+                                         common::ObIArray<share::SCN> &kept_meta_scns);
+  // max_replayed_scn >= LS 共享检查点的版本仍须保留。
+  int check_if_replayed_scn_exceed_checkpoint_scn_(
+      const ObSSGCTablet &gc_tablet,
+      const share::SCN &cur_meta_scn,
+      const common::hash::ObHashMap<share::ObLSID, share::SCN> &ls_ss_checkpoint_scn_map,
+      const bool can_recycle_equal_checkpoint,
+      bool &is_exceed);
+
+  int64_t meta_scn_scan_cost_us_;
+  int64_t replayed_scn_check_cost_us_;
 
   DISALLOW_COPY_AND_ASSIGN(ObSSMarkSweepBaseTask);
 };
@@ -614,35 +667,12 @@ private:
   };
 
 private:
-  int get_all_meta_scns_(const ObSSGCTablet &gc_tablet,
-                         const share::SCN &snapshot_meta_scn,
-                         common::ObIArray<share::SCN> &all_meta_scns);
   int get_del_and_kept_meta_scns_(const share::SCN &tablet_meta_scn,
                                   const share::SCN &safe_meta_scn,
                                   const common::ObIArray<share::SCN> &reserved_meta_scns,
                                   const common::ObIArray<share::SCN> &all_meta_scns,
                                   common::ObIArray<share::SCN> &del_meta_scns,
                                   common::ObIArray<share::SCN> &kept_meta_scns);
-  // MIN3 未给出回收边界时，改用 PrepareTask 冻结的 Lock Row 保留位点作为边界。
-  int calc_recycle_boundary_from_lock_row_(const ObSSGetDelKeptMetaScnParam &param,
-                                           share::SCN &min_meta_scn,
-                                           bool &can_del_all);
-  // 回收边界取自 MIN(tablet_meta_scn, safe_meta_scn, real_min_reserved_meta_scn)。
-  int calc_recycle_boundary_from_constraints_(const ObSSGetDelKeptMetaScnParam &param,
-                                              const share::SCN &min_meta_scn,
-                                              bool &can_del_all);
-  int get_del_and_kept_meta_scns_simply_(const ObSSGetDelKeptMetaScnParam &param,
-                                         common::ObIArray<share::SCN> &del_meta_scns,
-                                         common::ObIArray<share::SCN> &kept_meta_scns);
-  // 判断 gc_tablet 在 cur_meta_scn 这个版本下的 max_replayed_scn 是否 >= 其所在 ls 的
-  // ss_checkpoint_scn. Allow equality only when both the deleted LS and tablet satisfy GC bounds.
-  // is_exceed=true keeps this version; false allows it to be deleted.
-  int check_if_replayed_scn_exceed_checkpoint_scn_(
-      const ObSSGCTablet &gc_tablet,
-      const share::SCN &cur_meta_scn,
-      const common::hash::ObHashMap<share::ObLSID, share::SCN> &ls_ss_checkpoint_scn_map,
-      const bool can_recycle_equal_checkpoint,
-      bool &is_exceed);
   int process_one_tablet_(ObSSMarkSweepCtx &ctx,
                           const ObSSGCTabletWithMetaScn &tablet_with_meta_scn,
                           const share::SCN &tablet_kept_meta_scn,
@@ -697,8 +727,6 @@ private:
   int64_t end_tablet_idx_;
   common::ObArray<ObSSPersistKeptMetaScnItem> kept_meta_scn_persist_items_;
   // Single-task counters; reset once per process(), not between tablet retries.
-  int64_t meta_scn_scan_cost_us_;
-  int64_t replayed_scn_check_cost_us_;
   int64_t macro_iter_and_sorter_cost_us_;
   int64_t sorter_cost_us_;
   DISALLOW_COPY_AND_ASSIGN(ObSSMarkSweepSortTask);
@@ -706,48 +734,33 @@ private:
 
 
 // ====================================================================================
-// Multi-pass merge subgraph.
-//
-//   MergeStartTask
-//     calls pipeline.prepare_merge() to seed both group mergers, then spawns
-//     two MergePassCtrlTasks (one per group). It is the single static parent of
-//     the dynamically-grown pass_ctrl/batch chain.
-//
-//   MergePassCtrlTask
-//     One per group, allocated by MergeStartTask or by the previous-round pass ctrl task.
-//     On process(): calls merger.prepare_next_pass(); if get_input_count() <= 1,
-//     finalizes the group (caller has wired merge_complete as a child); otherwise
-//     allocates the first MergeBatchTask of this round + the next-round pass ctrl task,
-//     wiring batch[0] -> next_pass_ctrl. Subsequent batches are spawned by
-//     MergeBatchTask::generate_next_task() (chain pattern).
-//
-//   MergeBatchTask
-//     Calls merger.batch_merge(start, end). Each batch is independent and
-//     concurrently appends one merged file to merger.next_inputs_.
-//
-//   MergeCompleteTask
-//     Called once both DEL and KEPT side pass ctrl tasks reach their terminal round.
-//     Calls pipeline.complete_merge() (= init_diff_iter + clear file lists).
+// 多轮归并子图。MergeStartTask 准备指定 Pipeline 并创建各组首轮控制任务，
+// MergePassCtrlTask 在输入超过一个文件时创建本轮批任务和下一轮控制任务。
+// 批任务并行输出归并文件，各轮控制任务持续保护 MergeCompleteTask 的依赖。
+// 系统 GC 管线处理 DEL/KEPT 并初始化差集；LOB Meta 管线仅归并 KEPT 引用。
 // ====================================================================================
 class ObSSMarkSweepMergeStartTask : public ObSSMarkSweepBaseTask
 {
 public:
   ObSSMarkSweepMergeStartTask();
   virtual ~ObSSMarkSweepMergeStartTask() = default;
-  int init(ObSSMarkSweepMergeCompleteTask *merge_complete_task);
+  int init(
+      ObSSMarkSweepMergeCompleteTask *merge_complete_task,
+      ObMarkSweepPipeline *pipeline);
   virtual int process() override;
   VIRTUAL_TO_STRING_KV("task", "ObSSMarkSweepMergeStartTask", KP(this), KP_(merge_complete_task));
 
 private:
-  // Allocate the first pass ctrl task for `group`, wire its incoming/outgoing edges,
-  // and add it to the dag. If the group already has <= 1 input file, the first pass
-  // ctrl task is itself the terminal pass ctrl task, so merge_complete is wired as its child.
+  int process_lob_meta_pipeline_();
+  int process_system_gc_pipeline_();
+  // 创建指定组的首轮控制任务，并挂接前驱和归并完成任务。
   int create_pass_ctrl_task_(ObMarkSweepGroupType group);
 
 private:
   bool is_inited_;
   // Carried as a member for wiring the terminal-round pass ctrl -> merge_complete edge.
   ObSSMarkSweepMergeCompleteTask *merge_complete_task_;
+  ObMarkSweepPipeline *pipeline_;
   DISALLOW_COPY_AND_ASSIGN(ObSSMarkSweepMergeStartTask);
 };
 
@@ -757,17 +770,26 @@ class ObSSMarkSweepMergePassCtrlTask : public ObSSMarkSweepBaseTask
 public:
   ObSSMarkSweepMergePassCtrlTask();
   virtual ~ObSSMarkSweepMergePassCtrlTask() = default;
-  // pass_idx: 0     -- this is the first-pass pass ctrl task of a group
-  //   (cur_inputs_ has already been populated by MergeStartTask::prepare_merge; no prepare_next_pass needed);
-  // pass_idx: >0    -- subsequent passes (must call prepare_next_pass to
-  //   promote the previous batch output from next_inputs_ into cur_inputs_).
+  // 首轮输入已由 prepare_merge 准备；后续轮次需要提升上一轮的输出。
   int init(const ObMarkSweepGroupType group,
            const int64_t pass_idx,
-           ObSSMarkSweepMergeCompleteTask *merge_complete_task);
+           ObSSMarkSweepMergeCompleteTask *merge_complete_task,
+           ObMarkSweepPipeline *pipeline);
   virtual int process() override;
   ObMarkSweepGroupType get_group() const { return group_; }
   VIRTUAL_TO_STRING_KV("task", "ObSSMarkSweepMergePassCtrlTask", KP(this), K_(group),
       K_(pass_idx), KP_(merge_complete_task));
+
+private:
+  int process_lob_meta_pipeline_(
+      ObSSMarkSweepCtx &ctx,
+      const int64_t input_cnt);
+  int process_system_gc_pipeline_(
+      ObSSMarkSweepCtx &ctx,
+      const int64_t input_cnt);
+  int create_next_pass_tasks_(
+      ObSSMarkSweepCtx &ctx,
+      const int64_t input_cnt);
 
 private:
   bool is_inited_;
@@ -775,6 +797,7 @@ private:
   int64_t pass_idx_;
   // Carried as a member for wiring the terminal-round pass ctrl task -> merge_complete edge.
   ObSSMarkSweepMergeCompleteTask *merge_complete_task_;
+  ObMarkSweepPipeline *pipeline_;
   DISALLOW_COPY_AND_ASSIGN(ObSSMarkSweepMergePassCtrlTask);
 };
 
@@ -787,7 +810,8 @@ public:
   int init(const ObMarkSweepGroupType group,
            const int64_t batch_idx,
            const int64_t total_batch_count,
-           const int64_t pass_idx);
+           const int64_t pass_idx,
+           ObMarkSweepPipeline *pipeline);
   virtual int generate_next_task(share::ObITask *&next_task) override;
   virtual int process() override;
   VIRTUAL_TO_STRING_KV("task", "ObSSMarkSweepMergeBatchTask", KP(this),
@@ -823,6 +847,7 @@ private:
   int64_t total_batch_count_;
   // The merge pass this batch belongs to; carried for per-pass cost statistics.
   int64_t pass_idx_;
+  ObMarkSweepPipeline *pipeline_;
   DISALLOW_COPY_AND_ASSIGN(ObSSMarkSweepMergeBatchTask);
 };
 
@@ -832,13 +857,16 @@ class ObSSMarkSweepMergeCompleteTask : public ObSSMarkSweepBaseTask
 public:
   ObSSMarkSweepMergeCompleteTask();
   virtual ~ObSSMarkSweepMergeCompleteTask() = default;
-  int init();
+  int init(ObMarkSweepPipeline *pipeline);
   virtual int process() override;
   VIRTUAL_TO_STRING_KV("task", "ObSSMarkSweepMergeCompleteTask", KP(this));
 
 private:
-  struct CompleteMergeFn {
-    CompleteMergeFn(ObSSMarkSweepMergeCompleteTask &task, ObSSMarkSweepCtx &ctx);
+  int process_lob_meta_pipeline_(ObSSMarkSweepCtx &ctx);
+  int process_system_gc_pipeline_(ObSSMarkSweepCtx &ctx, int64_t &retry_cnt);
+
+  struct CompleteSystemMergeFn {
+    CompleteSystemMergeFn(ObSSMarkSweepMergeCompleteTask &task, ObSSMarkSweepCtx &ctx);
     int operator()();
 
     ObSSMarkSweepMergeCompleteTask &task_;
@@ -847,6 +875,7 @@ private:
 
 private:
   bool is_inited_;
+  ObMarkSweepPipeline *pipeline_;
   DISALLOW_COPY_AND_ASSIGN(ObSSMarkSweepMergeCompleteTask);
 };
 

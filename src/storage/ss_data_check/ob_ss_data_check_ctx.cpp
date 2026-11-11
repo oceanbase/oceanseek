@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/ss_data_check/ob_ss_data_check_ctx.h"
+#include "share/ob_cluster_version.h"
 
 namespace oceanbase
 {
@@ -19,6 +20,7 @@ ObSSDataCheckCtx::ObSSDataCheckCtx()
     tenant_id_(OB_INVALID_ID),
     snapshot_meta_scn_(),
     check_mode_(ObSSDataCheckMode::MAX),
+    enable_lob_meta_scan_(false),
     memory_limit_(0),
     file_buf_size_(0),
     io_expire_timestamp_(0),
@@ -87,6 +89,8 @@ int ObSSDataCheckCtx::init(
       tenant_id_ = tenant_id;
       snapshot_meta_scn_ = snapshot_meta_scn;
       check_mode_ = check_mode;
+      // Freeze the LOB reference policy for every Expected row in this round.
+      enable_lob_meta_scan_ = (GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_6_3_1);
       memory_limit_ = memory_limit;
       file_buf_size_ = file_buf_size;
       io_expire_timestamp_ = io_expire_timestamp;
@@ -348,6 +352,7 @@ void ObSSDataCheckCtx::reset_()
   tenant_id_ = OB_INVALID_ID;
   snapshot_meta_scn_.reset();
   check_mode_ = ObSSDataCheckMode::MAX;
+  enable_lob_meta_scan_ = false;
   memory_limit_ = 0;
   file_buf_size_ = 0;
   io_expire_timestamp_ = 0;
@@ -384,6 +389,12 @@ ObSSDataCheckMode ObSSDataCheckCtx::get_check_mode() const
 {
   ObSpinLockGuard guard(lock_);
   return check_mode_;
+}
+
+bool ObSSDataCheckCtx::is_lob_meta_scan_enabled() const
+{
+  ObSpinLockGuard guard(lock_);
+  return enable_lob_meta_scan_;
 }
 
 int64_t ObSSDataCheckCtx::get_memory_limit() const

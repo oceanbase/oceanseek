@@ -64,7 +64,7 @@ private:
   int call_create_normal_tenant_(ObParallelCreateNormalTenantProxy &proxy);
 
   int wait_ls_leader_(const uint64_t tenant_id, const share::ObLSID &ls_id, const bool force_renew = false);
-  int wait_meta_tenant_user_ls_leader_(const uint64_t meta_tenant_id);
+  int wait_tenant_user_ls_leader_(const uint64_t tenant_id);
   // Same filter as ObNewTableTabletAllocator::get_available_ls; ready when at least one eligible ls has leader.
   int check_has_available_ls_for_tablet_alloc_(const uint64_t tenant_id, bool &ready);
   int do_check_can_create_user_ls_(const uint64_t tenant_id, bool &can_create);
@@ -75,6 +75,7 @@ private:
 
   int finish_create_tenant_(const int ret_code);
   int create_user_table_for_meta_tenant_(const uint64_t tenant_id);
+  int create_user_table_for_user_tenant_(const uint64_t tenant_id);
   int create_meta_tenant_ss_meta_tablegroup_(const uint64_t meta_tenant_id);
   int insert_shared_meta_reserved_info_(const uint64_t user_tenant_id);
   static int apply_user_table_schema_defs_(const uint64_t tenant_id,

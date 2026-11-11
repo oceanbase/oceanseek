@@ -12009,8 +12009,7 @@
     "publish_version": "4.6.3.1",
     "info_cn": "新建表默认使用的 lob_intable_threshold 存储格式阈值，单位为 Byte。",
     "background_cn": "",
-    "ref_url": "",
-    "placeholder": true
+    "ref_url": ""
   },
   "_unified_catalog_token": {
     "id": 10768,

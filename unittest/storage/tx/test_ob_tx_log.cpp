@@ -5,6 +5,7 @@
 
 #define OB_TX_LOG_TEST
 #include <gtest/gtest.h>
+#include "storage/blocksstable/ob_storage_object_type.h"
 #define private public
 #include "storage/tx/ob_tx_log.h"
 #include "lib/allocator/page_arena.h"
@@ -1036,6 +1037,59 @@ TEST_F(TestObTxLog, test_start_working_log)
   EXPECT_EQ(header2.tx_id_, fake_tx_id);
   EXPECT_EQ(header2.cluster_version_, header.cluster_version_);
   EXPECT_EQ(header2.log_entry_no_, header.log_entry_no_);
+}
+
+TEST_F(TestObTxLog, lob_outtable_data_log)
+{
+  blocksstable::MacroBlockId macro_id;
+  macro_id.set_version_v1();
+  macro_id.set_id_mode(
+      static_cast<uint64_t>(blocksstable::ObMacroBlockIdMode::ID_MODE_SHARE));
+  macro_id.set_storage_object_type(static_cast<uint64_t>(
+      blocksstable::ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO));
+  macro_id.set_location(blocksstable::ObMacroBlockIdLocation::OBJECT_STORAGE);
+  macro_id.set_second_id(100);
+  macro_id.set_third_id(200);
+  macro_id.set_fourth_id(300);
+  macro_id.set_fifth_id(0);
+  const uint64_t lob_aux_table_id = 50001;
+  const ObTxSEQ lob_operation_seq_no(100, 0);
+  ObString seq_id("outtable seq id");
+  ObLobId lob_id;
+  lob_id.assign(1, 200, 300);
+  ObString data("outtable lob data");
+  ObString empty_data;
+  for (int mode = 0; mode < 2; ++mode) {
+    const bool is_logging = mode == 0;
+    const ObString &expected_data = is_logging ? data : empty_data;
+    ObTxLobOutTableDataLog::ConstructArg fill_arg(
+        lob_aux_table_id, lob_operation_seq_no, seq_id, lob_id, macro_id, is_logging, expected_data);
+    ObTxLobOutTableDataLog fill_log(fill_arg);
+    const int64_t serialize_size = fill_log.get_serialize_size();
+    char *buf = static_cast<char *>(ob_malloc(serialize_size, "OutTableLog"));
+    ASSERT_NE(nullptr, buf);
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS, fill_log.serialize(buf, serialize_size, pos));
+    ASSERT_EQ(serialize_size, pos);
+
+    ObTxLobOutTableDataLog::ConstructArg replay_arg;
+    ObTxLobOutTableDataLog replay_log(replay_arg);
+    pos = 0;
+    ASSERT_EQ(OB_SUCCESS, replay_log.deserialize(buf, serialize_size, pos));
+    ASSERT_EQ(serialize_size, pos);
+    EXPECT_EQ(lob_aux_table_id, replay_log.get_lob_aux_table_id());
+    EXPECT_EQ(lob_operation_seq_no, replay_log.get_lob_operation_seq_no());
+    EXPECT_EQ(seq_id, replay_log.get_seq_id());
+    EXPECT_EQ(lob_id, replay_log.get_lob_id());
+    EXPECT_EQ(macro_id, replay_log.get_macro_id());
+    EXPECT_EQ(expected_data, replay_log.get_data());
+    EXPECT_EQ(is_logging, replay_log.is_logging());
+    EXPECT_TRUE(ObTxLogTypeChecker::is_valid_log(
+        ObTxLogType::TX_LOB_OUTTABLE_DATA_LOG));
+    EXPECT_TRUE(ObTxLogTypeChecker::is_data_log(
+        ObTxLogType::TX_LOB_OUTTABLE_DATA_LOG));
+    ob_free(buf);
+  }
 }
 
 TEST_F(TestObTxLog, test_tx_block_header_serialize)

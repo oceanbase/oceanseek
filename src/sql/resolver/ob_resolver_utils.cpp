@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL_RESV
 
+#include "share/ob_cluster_version.h"
 #include <parquet/arrow/schema.h>
 #include <orc/Writer.hh>
 
@@ -7188,6 +7189,10 @@ int ObResolverUtils::resolve_data_type(const ParseNode &type_node,
     ret = OB_ERR_ILLEGAL_TYPE;
     SQL_RESV_LOG(WARN, "Unsupport data type of column definiton",
                         K(ident_name), K((type_node.type_)), K(ret));
+  } else if (OB_UNLIKELY(ObExtendBLobType == static_cast<ObObjType>(type_node.type_)
+             && GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_6_3_1)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "EXTBLOB before cluster version 4.6.3.1");
   } else {
   data_type.set_obj_type(static_cast<ObObjType>(type_node.type_));
   int32_t length = type_node.int32_values_[0];

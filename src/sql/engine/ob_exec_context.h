@@ -27,6 +27,7 @@
 #include "sql/plan_cache/ob_adaptive_auto_dop.h"
 #include "sql/engine/ob_diagnosis_manager.h"
 #include "sql/optimizer/file_prune/ob_lake_table_file_map.h"
+#include "storage/lob/store/ob_lob_persistent_reader_cache.h"
 
 #define GET_PHY_PLAN_CTX(ctx) ((ctx).get_physical_plan_ctx())
 #define GET_MY_SESSION(ctx) ((ctx).get_my_session())
@@ -159,6 +160,22 @@ private:
 
 class ObIExtraStatusCheck;
 struct ObTempExprBackupCtx;
+class ObExecContext;
+
+// Bind at exec context construction; resolve LOCATION using the current session on access.
+class ObSqlExternalAccessProvider final : public storage::ObExternalAccessProvider
+{
+public:
+  explicit ObSqlExternalAccessProvider(ObExecContext &exec_ctx)
+    : exec_ctx_(exec_ctx)
+  {}
+
+  virtual int get_access_info(const common::ObString &url,
+      common::ObObjectStorageInfo &access_info) override;
+
+private:
+  ObExecContext &exec_ctx_;
+};
 
 // ObExecContext可以序列化，但不能反序列化；
 // 而ObDesExecContext不能序列化，但可以反序列化；
@@ -239,6 +256,14 @@ public:
    * @brief get session info, for trans control
    */
   inline ObSQLSessionInfo *get_my_session() const;
+  void set_outtable_lob_control_owned_tx(transaction::ObTxDesc *tx_desc)
+  {
+    outtable_lob_control_owned_tx_ = tx_desc;
+  }
+  transaction::ObTxDesc *get_outtable_lob_control_owned_tx() const
+  {
+    return outtable_lob_control_owned_tx_;
+  }
   //get the parent execute context in nested sql
   ObExecContext *get_parent_ctx() { return parent_ctx_; }
   int64_t get_nested_level() const { return nested_level_; }
@@ -595,6 +620,10 @@ public:
   int64_t get_autoinc_range_interval() { return autoinc_range_interval_; }
 
   int get_lob_access_ctx(ObLobAccessCtx *&lob_access_ctx);
+  storage::ObExternalAccessProvider &get_external_access_provider()
+  {
+    return external_lob_access_provider_;
+  }
   AutoDopHashMap& get_auto_dop_map() { return auto_dop_map_; }
   void set_force_gen_local_plan() { force_local_plan_ = true; }
   bool is_force_gen_local_plan() const { return force_local_plan_; }
@@ -687,6 +716,8 @@ protected:
   ObExprOperatorCtx **expr_op_ctx_store_;
   ObTaskExecutorCtx task_executor_ctx_;
   ObSQLSessionInfo *my_session_;
+  // Local proof of transaction ownership; never serialize it to remote or PX workers.
+  transaction::ObTxDesc *outtable_lob_control_owned_tx_;
   common::ObMySQLProxy *sql_proxy_;
   ObExecStatCollector exec_stat_collector_;
   ObStmtFactory *stmt_factory_;
@@ -824,6 +855,7 @@ protected:
 
   //---------------
 
+  ObSqlExternalAccessProvider external_lob_access_provider_;
   ObLobAccessCtx *lob_access_ctx_;
   AutoDopHashMap auto_dop_map_;
   bool force_local_plan_;

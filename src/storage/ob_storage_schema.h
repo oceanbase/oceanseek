@@ -376,6 +376,10 @@ public:
 
   inline bool is_aux_lob_meta_table() const { return share::schema::is_aux_lob_meta_table(table_type_); }
   inline bool is_aux_lob_piece_table() const { return share::schema::is_aux_lob_piece_table(table_type_); }
+  inline bool is_aux_outtable_lob_control_table() const
+  {
+    return share::schema::is_aux_outtable_lob_control_table(table_type_);
+  }
   OB_INLINE bool is_user_hidden_table() const { return share::schema::TABLE_STATE_IS_HIDDEN_MASK & table_mode_.state_flag_; }
   OB_INLINE bool is_cs_replica_compat() const { return is_cs_replica_compat_; }
   OB_INLINE bool get_enable_macro_block_bloom_filter() const override { return enable_macro_block_bloom_filter_; }

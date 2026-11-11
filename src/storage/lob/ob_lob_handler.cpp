@@ -3,22 +3,27 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include <algorithm>
-
 #include "lib/allocator/page_arena.h"
 #include "storage/lob/store/ob_lob_store_common.h"
 #define USING_LOG_PREFIX STORAGE
 #include "lib/ob_errno.h"
 #include "lib/utility/ob_macro_utils.h"
+#include "share/ob_tablet_autoincrement_service.h"
+#include "share/backup/ob_backup_struct.h"
 #include "storage/lob/common/ob_lob_context.h"
 #include "storage/lob/common/ob_lob_seq.h"
 #include "storage/lob/common/ob_lob_util.h"
 #include "storage/lob/ob_lob_manager.h"
 #include "storage/lob/store/ob_lob_meta.h"
+#include "storage/lob/store/ob_lob_outtable_io.h"
+#include "storage/lob/store/ob_lob_persistent_appender.h"
 #include "ob_lob_handler.h"
 #include "storage/lob/store/ob_lob_persistent_iterator.h"
 #include "storage/lob/access/ob_lob_retry.h"
 #include "storage/lob/access/ob_lob_iterator.h"
+#include "share/ob_cluster_version.h"
+#include "share/ob_server_struct.h"
+#include "storage/tx_storage/ob_access_service.h"
 
 namespace oceanbase
 {
@@ -50,10 +55,7 @@ int ObLobQueryBaseHandler::execute()
     if (OB_FAIL(do_execute())) {
       LOG_WARN("do_execute fail, check need rerty", KR(ret), K(retry_cnt), K(read_ctx_));
       is_continue = false;
-      if (read_ctx_.no_need_retry_) {
-        LOG_INFO("no need retry", K(ret), K(is_continue), K(retry_cnt), K(read_ctx_));
-        is_continue = false;
-      } else if (OB_TMP_FAIL(ObLobRetryUtil::check_need_retry(read_ctx_, ret, retry_cnt, is_continue))) {
+      if (OB_TMP_FAIL(ObLobRetryUtil::check_need_retry(read_ctx_, ret, retry_cnt, is_continue))) {
         LOG_WARN("check_need_retry fail", K(tmp_ret), K(ret), K(is_continue), K(retry_cnt), K(read_ctx_));
         // check fail, do not retry
         is_continue = false;
@@ -92,17 +94,99 @@ int ObLobQueryIterHandler::do_execute()
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("handler not init", K(ret));
-  } else if (OB_ISNULL(result_ = OB_NEW(ObLobOutRowQueryIter, ObMemAttr(MTL_ID(), "LobQueryIter")))) {
-    ret = OB_ALLOCATE_MEMORY_FAILED;
-    LOG_WARN("alloc lob meta scan iterator fail", K(ret));
-  } else if (OB_FAIL(result_->open(read_ctx_, lob_meta_mngr_))) {
-    LOG_WARN("open lob query iter failed", K(ret), K(read_ctx_));
+  } else if (OB_UNLIKELY(!read_ctx_.src_loc_.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("failed to check source lob locator", KR(ret), K(read_ctx_.tablet_id_),
+             "locator_size", read_ctx_.src_loc_.size_);
+  } else if (!read_ctx_.src_loc_.is_mem_external_lob()) {
+    if (OB_FAIL(set_as_outrow_lob_iter_(result_))){
+      LOG_WARN("failed when set_as_outrow_lob_iter_", K(ret), KPC(&read_ctx_));
+    }
+  } else if (OB_UNLIKELY(GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_6_3_1)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_USER_ERROR(OB_ERR_UNEXPECTED, "External LOB before cluster version 4.6.3.1");
+  } else if (read_ctx_.src_loc_.is_mem_external_lob()){
+    if (OB_FAIL(set_as_external_lob_iter_(result_))){
+      LOG_WARN("failed when set_as_external_lob_iter_", K(ret), KPC(&read_ctx_));
+    }
   }
 
   if (OB_FAIL(ret) && OB_NOT_NULL(result_)) {
     result_->reset();
-    OB_DELETE(ObLobOutRowQueryIter, "unused", result_);
+    OB_DELETE(ObLobQueryIter, "unused", result_);
     result_ = nullptr;
+  }
+  return ret;
+}
+
+int ObLobQueryIterHandler::set_as_external_lob_iter_(ObLobQueryIter *&result)
+{
+  int ret = OB_SUCCESS;
+  // Mem already carries the External descriptor; summary only provides the persisted identity.
+  ObLobMetaInfo summary;
+  ObExternalBlobInfo read_info;
+  ObLobManager *lob_mgr = MTL(ObLobManager *);
+  uint64_t tablet_id = 0;
+  uint64_t external_lob_seq_id = 0;
+  share::ObBackupStorageInfo access_info;
+  ObExternalLobQueryIter *external_iter = nullptr;
+  if (OB_ISNULL(lob_mgr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("lob manager is null for external lob query", KR(ret), K(read_ctx_.tenant_id_), K(read_ctx_.tablet_id_));
+  } else if (OB_ISNULL(read_ctx_.access_ctx_)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "reading external LOB without SQL access context");
+    LOG_WARN("external lob access provider is unavailable", KR(ret), K(read_ctx_.tablet_id_),
+                                                            KP(read_ctx_.access_ctx_));
+  } else if (OB_FAIL(lob_mgr->get_lob_summary_info(read_ctx_, summary))) {
+    LOG_WARN("failed to read lob summary", KR(ret), K(read_ctx_.tablet_id_), K(read_ctx_.store_column_idx_));
+  } else if (OB_FAIL(lob_mgr->get_byte_length(read_ctx_, read_ctx_.byte_size_))) {
+    LOG_WARN("failed to get external lob read length", KR(ret));
+  } else if (OB_FAIL(read_ctx_.src_loc_.get_external_lob_info(read_info))) {
+    LOG_WARN("failed to get external lob read descriptor from memory locator", KR(ret), K(read_ctx_.tablet_id_),
+              "locator_size", read_ctx_.src_loc_.size_);
+  } else if (OB_FAIL(read_ctx_.access_ctx_->get_external_access_info(read_info.url_,
+                                                                     access_info))) {
+    LOG_WARN("failed to resolve external lob access info", KR(ret), K(read_ctx_.tablet_id_),
+             "url_length", read_info.url_.length());
+  } else if (OB_FAIL(ObLobMetaUtil::deserialize_external_lob_block_id(summary.lob_block_id_,
+                                                                      tablet_id,
+                                                                      external_lob_seq_id))) {
+    LOG_WARN("failed to deserialize external lob identity", KR(ret));
+  } else if (OB_ISNULL(external_iter = OB_NEW(ObExternalLobQueryIter,
+                                              ObMemAttr(MTL_ID(),"ExternalLobIter")))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate external lob query iterator", KR(ret), K(tablet_id), K(external_lob_seq_id),
+             "alloc_size", sizeof(ObExternalLobQueryIter));
+  } else if (OB_FAIL(external_iter->open(read_ctx_, read_info, tablet_id,
+                                         external_lob_seq_id, access_info))) {
+    LOG_WARN("failed to open external lob iterator", KR(ret), K(tablet_id), K(external_lob_seq_id));
+  } else {
+    // Transfer ownership to the caller only after open succeeds; free it here on failure.
+    result = external_iter;
+  }
+  if (OB_FAIL(ret) && OB_NOT_NULL(external_iter)) {
+    OB_DELETE(ObExternalLobQueryIter, "unused", external_iter);
+  }
+  return ret;
+}
+
+int ObLobQueryIterHandler::set_as_outrow_lob_iter_(ObLobQueryIter *&result)
+{
+  int ret = OB_SUCCESS;
+  ObLobOutRowQueryIter *outrow_iter = nullptr;
+  if (OB_ISNULL(outrow_iter = OB_NEW(
+      ObLobOutRowQueryIter, ObMemAttr(MTL_ID(), "LobQueryIter")))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("alloc lob meta scan iterator fail", K(ret));
+  } else if (OB_FAIL(outrow_iter->open(read_ctx_, lob_meta_mngr_))) {
+    LOG_WARN("open lob query iter failed", K(ret), K(read_ctx_));
+  } else {
+    // Transfer ownership to the caller only after open succeeds; free it here on failure.
+    result = outrow_iter;
+  }
+  if (OB_FAIL(ret) && OB_NOT_NULL(outrow_iter)) {
+    OB_DELETE(ObLobOutRowQueryIter, "unused", outrow_iter);
   }
   return ret;
 }
@@ -126,12 +210,18 @@ int ObLobQueryDataHandler::do_execute()
     ret = OB_NOT_INIT;
     LOG_WARN("handler not init", K(ret));
   } else {
-    ObLobOutRowQueryIter iter;
-    if (OB_FAIL(iter.open(read_ctx_, lob_meta_mngr_))) {
-      LOG_WARN("failed to open outrow query iter", K(ret), K(read_ctx_));
+    ObLobQueryIterHandler handler(read_ctx_);
+    ObLobQueryIter *iter = nullptr;
+    if (OB_FAIL(handler.init(lob_meta_mngr_))) {
+      LOG_WARN("failed to initialize lob query iterator", KR(ret));
+    } else if (OB_FAIL(handler.execute())) {
+      LOG_WARN("failed to open lob query iterator", KR(ret), K(read_ctx_.tablet_id_), K(read_ctx_.len_));
+    } else if (OB_ISNULL(iter = handler.result_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("lob query iterator is null", KR(ret), K(read_ctx_.tablet_id_), K(read_ctx_.len_));
     } else {
       while (OB_SUCC(ret) && result_.remain() > 0) {
-        if (OB_FAIL(iter.get_next_row(result_))) {
+        if (OB_FAIL(iter->get_next_row(result_))) {
           if (OB_ITER_END != ret) {
             LOG_WARN("failed to get next row", K(ret), K(read_ctx_));
           }
@@ -141,7 +231,11 @@ int ObLobQueryDataHandler::do_execute()
         ret = OB_SUCCESS;
       }
     }
-    iter.reset();
+    if (OB_NOT_NULL(iter)) {
+      iter->reset();
+      OB_DELETE(ObLobQueryIter, "unused", iter);
+      handler.result_ = nullptr;
+    }
   }
 
   if (OB_FAIL(ret)) {
@@ -213,11 +307,34 @@ int ObLobQueryInfoHandler::do_execute()
 }
 
 //==================== ObLobInserter ====================
+ObLobInserter::ObLobInserter()
+  : is_inited_(false),
+    ctx_(nullptr),
+    meta_mgr_(nullptr),
+    piece_mgr_(nullptr),
+    lob_id_(),
+    metas_(),
+    source_byte_len_(0),
+    is_logging_(true)
+{
+  metas_.set_attr(ObMemAttr(MTL_ID(), "LobMetas"));
+  reset();
+}
+
+ObLobInserter::~ObLobInserter()
+{
+  reset();
+}
+
 void ObLobInserter::reset()
 {
-  ctx_ = nullptr;
-  meta_mgr_ = nullptr;
+  is_logging_ = true;
+  source_byte_len_ = 0;
+  metas_.reset();
+  lob_id_.reset();
   piece_mgr_ = nullptr;
+  meta_mgr_ = nullptr;
+  ctx_ = nullptr;
   is_inited_ = false;
 }
 
@@ -231,9 +348,10 @@ int ObLobInserter::init(
     ret = OB_INIT_TWICE;
     LOG_WARN("init twice", KR(ret), K(is_inited_));
   } else if (OB_ISNULL(ctx) || OB_ISNULL(meta_mgr) || OB_ISNULL(piece_mgr)) {
-    // TODO fengyun param.is_valid()
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), KPC(ctx), KPC(meta_mgr), KPC(piece_mgr));
+  } else if (OB_FAIL(ObLobOutTableIO::enable_outtable_clog(ctx->tenant_id_, is_logging_))) {
+    LOG_WARN("failed to check whether to write outtable lob clog", KR(ret), KPC(this));
   } else {
     is_inited_ = true;
     ctx_ = ctx;
@@ -247,57 +365,66 @@ int ObLobInserter::insert()
 {
   int ret = OB_SUCCESS;
   ObLobDiskLocatorWrapper dest_wrapper;
-  ObLobId lob_id;
   ObLobQueryIter *query_iter = nullptr;
-  uint64_t source_byte_len = 0;
+  bool is_outtable = false;
+  ObLobMetaExtraInfo source_extra_info;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", KR(ret));
   } else if (OB_FAIL(dest_wrapper.init(ctx_->dest_loc_.ptr_, ctx_->dest_loc_.size_))) {
     LOG_WARN("failed to init dest locator wrapper", KR(ret), KPC(this));
-  } else if (OB_FAIL(dest_wrapper.get_lob_id(lob_id))) {
+  } else if (OB_FAIL(dest_wrapper.get_lob_id(lob_id_))) {
     LOG_WARN("failed to get lob id from dest locator", KR(ret), KPC(this));
-  } else if (OB_FAIL(open_src_lob_query_(query_iter, source_byte_len))) {
+  } else if (OB_FAIL(get_source_lob_extra_info_(source_extra_info))) {
+    LOG_WARN("failed to get source lob extra info", KR(ret));
+  } else if (source_extra_info.is_external_lob()) {
+    ctx_->dml_op_ = ObLobDmlOp::INSERT;
+    ctx_->insert_lob_seq_no_ = dest_wrapper.get_seq_no();
+    if (OB_FAIL(insert_external_lob_(lob_id_, source_extra_info.external_lob_info_))) {
+      LOG_WARN("failed to insert external lob", KR(ret), K(lob_id_));
+    }
+  } else if (OB_FAIL(open_src_lob_query_(query_iter))) {
     LOG_WARN("failed to open source lob query", KR(ret), KPC(this));
   } else {
-    // insert 采用流式写入的方式，当输入是 outrow lob 时，流式写入可避免完整加载 lob 的内存压力
-    // 采用边 load 边写入的方式，内存常驻的仅有单个分片的大小。
-    // 流式写入步骤：
-    // 1. 先写 Piece 表，写入过程中维护每个分片的 byte length 和 char length
-    // 2. 再写 meta 表
-    ObArray<ObLobMetaInfo> metas;
     ObLobWriteStats write_stats;
-    ObLobInTablePieceInsertIter piece_insert_iter;
     ObLobMetaTableBatchInsertIter meta_insert_iter;
-    metas.set_attr(ObMemAttr(MTL_ID(), "LobMetas"));
+    metas_.reset();
     // 设置 lob 辅助表的 dml 操作符号，以及所用的 seq_no
     ctx_->dml_op_ = ObLobDmlOp::INSERT;
     ctx_->insert_lob_seq_no_ = dest_wrapper.get_seq_no();
+    if (OB_FAIL(ObLobUtil::check_write_outtable(*ctx_, source_byte_len_, is_outtable))) {
+      LOG_WARN("failed to check whether to write outtable lob", KR(ret), K(source_byte_len_));
+    } else if (is_outtable) {
+      if (OB_FAIL(insert_outtable_piece_(query_iter, write_stats))) {
+        LOG_WARN("failed to insert outtable lob pieces", KR(ret), KPC(this));
+      }
+    } else {
+      if (OB_FAIL(insert_outrow_piece_(query_iter, write_stats))) {
+        LOG_WARN("failed to insert outrow lob pieces", KR(ret), KPC(this));
+      }
+    }
 
-    if (OB_FAIL(piece_insert_iter.init(query_iter, &ctx_->own_allocator_, ctx_->get_chunk_size(),
-                           ctx_->store_column_idx_, lob_id, &metas, &write_stats))) {
-      LOG_WARN("failed to initialize piece insert iterator", KR(ret), KPC(this));
-    } else if (OB_FAIL(piece_mgr_->batch_insert(*ctx_, piece_insert_iter))) {
-      LOG_WARN("failed to batch insert piece info", KR(ret), KPC(this));
-    } else if (OB_UNLIKELY(!piece_insert_iter.is_end())) {
+    if (OB_FAIL(ret)) {
+    } else if (OB_UNLIKELY(write_stats.byte_len_ != source_byte_len_
+                       || write_stats.chunk_count_ != static_cast<uint64_t>(metas_.count()))) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("piece insert did not consume source iterator", KR(ret), K(piece_insert_iter), KPC(this));
-    } else if (OB_UNLIKELY(write_stats.byte_len_ != source_byte_len
-                           || write_stats.chunk_count_ != static_cast<uint64_t>(metas.count()))) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("lob stream statistics do not match source", KR(ret), K(source_byte_len),
-               K(write_stats), "meta_count", metas.count(), KPC(this));
+      LOG_WARN("lob stream statistics do not match source", KR(ret), K(source_byte_len_),
+               K(write_stats), "meta_count", metas_.count(), K(is_outtable), KPC(this));
     }
 
     if (FAILEDx(write_meta_summary_(
-        lob_id, write_stats.byte_len_, write_stats.char_len_,
-        write_stats.chunk_count_))) {
-      LOG_WARN("failed to write meta summary row", KR(ret), K(lob_id),
+        lob_id_, write_stats.byte_len_, write_stats.char_len_,
+        write_stats.chunk_count_, is_outtable))) {
+      LOG_WARN("failed to write meta summary row", KR(ret), K(lob_id_),
                K(write_stats), KPC(this));
-    } else if (OB_FAIL(meta_insert_iter.init(&metas))) {
+    } else if (OB_FAIL(meta_insert_iter.init(&metas_))) {
       LOG_WARN("failed to initialize meta insert iterator", KR(ret), KPC(this));
     } else if (OB_FAIL(meta_mgr_->batch_insert(*ctx_, meta_insert_iter))) {
       LOG_WARN("failed to batch insert meta info", KR(ret), KPC(this));
+    }
+
+    if (OB_SUCC(ret) && is_outtable) {
+      ret = write_outtable_clog_();
     }
   }
   if (OB_NOT_NULL(query_iter)) {
@@ -307,16 +434,89 @@ int ObLobInserter::insert()
   return ret;
 }
 
-int ObLobInserter::open_src_lob_query_(
-    ObLobQueryIter *&query_iter,
-    uint64_t &source_byte_len)
+int ObLobInserter::write_outtable_clog_()
+{
+  int ret = OB_SUCCESS;
+  ObLobQueryIter *query_iter = nullptr;
+  if (is_logging_) {
+    if (OB_FAIL(open_src_lob_query_(query_iter))) {
+      LOG_WARN("failed to open source lob query", KR(ret), KPC(this));
+    }
+  }
+
+  if (FAILEDx(ObLobOutTableIO::write_clog(*ctx_, query_iter, metas_, is_logging_))) {
+    LOG_WARN("failed to write outtable lob clog", KR(ret), K(lob_id_), K(metas_.count()), KPC(this));
+  }
+
+  if (OB_NOT_NULL(query_iter)) {
+    query_iter->reset();
+    OB_DELETE(ObLobQueryIter, "unused", query_iter);
+    query_iter = nullptr;
+  }
+  return ret;
+}
+
+int ObLobInserter::insert_outrow_piece_(
+    ObLobQueryIter *input_iter,
+    ObLobWriteStats &write_stats)
+{
+  int ret = OB_SUCCESS;
+  ObLobInTablePieceInsertIter piece_insert_iter;
+  if (OB_FAIL(piece_insert_iter.init(input_iter, &ctx_->own_allocator_, ctx_->get_chunk_size(false/*is_outtable*/),
+              ctx_->store_column_idx_, lob_id_, &metas_, &write_stats))) {
+    LOG_WARN("failed to initialize piece insert iterator", KR(ret), KPC(this));
+  } else if (OB_FAIL(piece_mgr_->batch_insert(*ctx_, piece_insert_iter))) {
+    LOG_WARN("failed to batch insert piece info", KR(ret), KPC(this));
+  } else if (OB_UNLIKELY(!piece_insert_iter.is_end())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("piece insert did not consume source iterator", KR(ret),
+             K(piece_insert_iter), KPC(this));
+  }
+  return ret;
+}
+
+int ObLobInserter::insert_outtable_piece_(
+    ObLobQueryIter *input_iter,
+    ObLobWriteStats &write_stats)
+{
+  int ret = OB_SUCCESS;
+  ObLobOutTableInsertIter outtable_write_iter;
+  const int64_t chunk_size = ctx_->get_chunk_size(true/*is_outtable*/);
+  int64_t mbmaxlen = 0;
+  int64_t chunk_count = 0;
+
+  // There may be not enough space in the chunk to store the last character,
+  // so we need to calculate the chunk count based on the worst case
+  if (OB_FAIL(ObCharset::get_mbmaxlen_by_coll(ctx_->coll_type_, mbmaxlen))) {
+    LOG_WARN("failed to get max character length", KR(ret), K(ctx_->coll_type_));
+  } else {
+    const uint64_t min_chunk_size = static_cast<uint64_t>(chunk_size - mbmaxlen + 1);
+    chunk_count = (source_byte_len_ + min_chunk_size - 1) / min_chunk_size;
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(ObLobUtil::refresh_lob_tablet_id(*ctx_))) {
+    LOG_WARN("failed to prepare lob tablet id for outtable insert", KR(ret), KPC(ctx_));
+
+  } else if (OB_FAIL(outtable_write_iter.init(ctx_, input_iter, &ctx_->own_allocator_, chunk_size, chunk_count,
+                     ctx_->store_column_idx_, lob_id_, &metas_, &write_stats))) {
+    LOG_WARN("failed to initialize outtable insert iterator", KR(ret), KPC(this));
+  } else if (OB_FAIL(outtable_write_iter.write_all())) {
+    LOG_WARN("failed to write outtable lob objects", KR(ret), KPC(this));
+  } else if (OB_UNLIKELY(!outtable_write_iter.is_end())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("outtable insert did not consume source iterator", KR(ret), K(outtable_write_iter), KPC(this));
+  }
+  return ret;
+}
+
+int ObLobInserter::open_src_lob_query_(ObLobQueryIter *&query_iter)
 {
   int ret = OB_SUCCESS;
   ObLobManager *lob_mgr = MTL(ObLobManager*);
   ObLobReadContext read_ctx;
   
   query_iter = nullptr;
-  source_byte_len = 0;
   if (OB_ISNULL(lob_mgr)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("lob manager is null", KR(ret));
@@ -332,7 +532,7 @@ int ObLobInserter::open_src_lob_query_(
   } else if (OB_FAIL(lob_mgr->query(read_ctx, query_iter))) {
     LOG_WARN("failed to open source lob iterator", KR(ret), K(read_ctx));
   } else {
-    source_byte_len = read_ctx.byte_size_;
+    source_byte_len_ = read_ctx.byte_size_;
   }
   return ret;
 }
@@ -341,7 +541,8 @@ int ObLobInserter::write_meta_summary_(
     const ObLobId &lob_id,
     const uint64_t total_byte_len,
     const uint64_t total_char_len,
-    const uint64_t chunk_count)
+    const uint64_t chunk_count,
+    const bool is_outtable)
 {
   int ret = OB_SUCCESS;
   ObLobMetaInfo summary;
@@ -360,7 +561,11 @@ int ObLobInserter::write_meta_summary_(
     ObLobMetaExtraInfo lob_extra_info;
     lob_extra_info.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
     lob_extra_info.chunk_count_ = chunk_count;
-    lob_extra_info.lob_chunk_type_.set_in_table();
+    if (is_outtable) {
+      lob_extra_info.lob_chunk_type_.set_out_table();
+    } else {
+      lob_extra_info.lob_chunk_type_.set_in_table();
+    }
     lob_extra_info.last_write_type_ = ObLobLastWriteType::INSERT;
     if (OB_FAIL(lob_extra_info.serialize(allocator, summary.lob_extra_info_))) {
       LOG_WARN("failed to serialize lob_extra_info", KR(ret), K(lob_extra_info), KPC(this));
@@ -371,12 +576,137 @@ int ObLobInserter::write_meta_summary_(
   return ret;
 }
 
+int ObLobInserter::get_source_lob_extra_info_(ObLobMetaExtraInfo &extra_info)
+{
+  int ret = OB_SUCCESS;
+  ObLobLocatorV2 &source = ctx_->src_loc_;
+  extra_info.reset();
+  if (0 == source.size_) {
+    // Empty LOBs have no source summary.
+  } else if (OB_UNLIKELY(!source.is_valid() || source.is_outline_disk_lob_locator())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid source lob locator", KR(ret), K(source.size_), K(ctx_->tablet_id_));
+  } else if (source.has_inrow_data()) {
+    // Inrow data uses the existing Internal write path.
+  } else if (source.is_external_temp_lob()) {
+    ObExternalBlobInfo source_info;
+    // Temporary External has no summary; read its reference descriptor from Mem.
+    if (OB_FAIL(source.get_external_lob_info(source_info))) {
+      LOG_WARN("failed to get temporary external lob info", KR(ret), K(source.size_), K(ctx_->tablet_id_));
+    } else if (OB_FAIL(extra_info.set_external_lob_info(ctx_->own_allocator_, source_info))) {
+      LOG_WARN("failed to copy temporary external lob info", KR(ret));
+    }
+  } else if (!source.is_persist_lob()) {
+    // Ordinary temporary LOBs use the existing read path without querying persisted summary.
+  } else if (GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_6_3_1) {
+    // Ordinary LOB copies in mixed versions use the old read path with no extra summary query.
+    if (OB_UNLIKELY(source.is_mem_external_lob())) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "External LOB before cluster version 4.6.3.1");
+    }
+  } else {
+    ObLobReadContext read_ctx;
+    ObLobManager *lob_mgr = MTL(ObLobManager*);
+    // Persisted copies use summary across tablets/nodes without reading remote objects.
+    if (OB_ISNULL(lob_mgr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("lob manager is null", KR(ret), K(ctx_->tenant_id_), K(ctx_->tablet_id_));
+    } else if (OB_FAIL(read_ctx.build(source, ctx_->own_allocator_, 0, UINT64_MAX,
+                                      ctx_->tx_desc_))) {
+      LOG_WARN("failed to build source summary context", KR(ret));
+    } else if (OB_FAIL(lob_mgr->get_meta_summary_extra_info(read_ctx, extra_info))) {
+      LOG_WARN("failed to read source lob summary", KR(ret), K(read_ctx.tablet_id_), K(read_ctx.store_column_idx_));
+    }
+  }
+  return ret;
+}
+
+int ObLobInserter::insert_external_lob_(const ObLobId &lob_id, const ObExternalBlobInfo &source_info)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(ObExternalBlobKind::MAX <= source_info.kind_)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "insert an UNDEFINED kind external LOB");
+    LOG_WARN("unsupported external lob kind for insert", KR(ret), K(lob_id), K(source_info.kind_));
+  } else if (OB_FAIL(write_external_lob_meta_summary_(lob_id, source_info))) {
+    LOG_WARN("failed to write external lob summary", KR(ret), K(lob_id));
+  }
+  return ret;
+}
+
+int ObLobInserter::write_external_lob_meta_summary_(
+    const ObLobId &lob_id, const ObExternalBlobInfo &external_info)
+{
+  int ret = OB_SUCCESS;
+  ObLobMetaInfo summary;
+  ObLobMetaExtraInfo lob_extra_info;
+  // seq_id is only used to write summary, so it is always 0 and the buffer is large enough.
+  char seq_id_buf[ObLobSeqId::LOB_SEQ_ID_MIN_LEN];
+  ObString seq_id(sizeof(seq_id_buf), seq_id_buf);
+  uint64_t external_lob_seq_id = 0;
+
+  ObArenaAllocator &allocator = ctx_->own_allocator_;
+  // summary stores logical length (declared for External); binary chars equal bytes.
+  // Store undeclared length as 0; extra_info.has_length indicates whether length was declared.
+  summary.byte_len_ = external_info.length_;
+  summary.char_len_ = external_info.length_;
+  lob_extra_info.chunk_count_ = 0;
+
+  // Each insert gets a new identity, including persisted reference copies; never reuse the source.
+  // TODO by renhe: fetch_tablet_inc_id may alloc tablet_inc_id from splited new tablet_id,
+  //                instead of insert_ctx.lob_meta_tablet_id_.id()
+  if (OB_UNLIKELY(GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_6_3_1)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "writing External LOB before cluster version 4.6.3.1");
+  } else if (OB_FAIL(lob_extra_info.set_external_lob_info(allocator, external_info))) {
+    LOG_WARN("failed to set external lob summary", KR(ret), K(lob_id));
+  } else if (OB_FAIL(ObLobUtil::fetch_tablet_inc_id(*ctx_, external_lob_seq_id))) {
+    LOG_WARN("failed to allocate external lob sequence", KR(ret), K(ctx_->lob_meta_tablet_id_), K(lob_id));
+  } else if (OB_FAIL(ObLobMetaUtil::serialize_external_lob_block_id(allocator,
+                                                              ctx_->lob_meta_tablet_id_.id(),
+                                                              external_lob_seq_id,
+                                                              summary.lob_block_id_))) {
+    LOG_WARN("failed to serialize external lob identity", KR(ret),
+             K(ctx_->lob_meta_tablet_id_), K(external_lob_seq_id), K(lob_id));
+  } else if (OB_FAIL(ObLobSeqId::get_seq_id(0, seq_id))) {
+    LOG_WARN("failed to build seq_id 0", KR(ret), K(lob_id), K(ctx_->tablet_id_));
+  } else {
+    summary.lob_col_idx_ = ctx_->store_column_idx_;
+    summary.lob_id_ = lob_id;
+    summary.seq_id_ = seq_id;
+    lob_extra_info.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
+    lob_extra_info.last_write_type_ = ObLobLastWriteType::INSERT;
+    if (OB_FAIL(lob_extra_info.serialize(allocator, summary.lob_extra_info_))) {
+      LOG_WARN("failed to serialize external lob extra info", KR(ret), K(lob_id), K(external_lob_seq_id));
+    } else if (OB_FAIL(meta_mgr_->insert(*ctx_, summary))) {
+      LOG_WARN("failed to write external lob summary row", KR(ret), K(lob_id), K(ctx_->tablet_id_),
+                                                           K(external_lob_seq_id));
+    }
+  }
+  return ret;
+}
+
+//==================== ObLobAppender ====================
+ObLobAppender::ObLobAppender()
+  : is_inited_(false),
+    ctx_(nullptr),
+    meta_mgr_(nullptr),
+    piece_mgr_(nullptr)
+{
+  reset();
+}
+
+ObLobAppender::~ObLobAppender()
+{
+  reset();
+}
+
 void ObLobAppender::reset()
 {
-  is_inited_ = false;
-  ctx_ = nullptr;
-  meta_mgr_ = nullptr;
   piece_mgr_ = nullptr;
+  meta_mgr_ = nullptr;
+  ctx_ = nullptr;
+  is_inited_ = false;
 }
 
 int ObLobAppender::init(
@@ -391,8 +721,6 @@ int ObLobAppender::init(
   } else if (OB_ISNULL(ctx) || OB_ISNULL(meta_mgr) || OB_ISNULL(piece_mgr)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid lob appender argument", KR(ret), KPC(ctx), KPC(meta_mgr), KPC(piece_mgr));
-  } else if (OB_FAIL(ctx->build_read_context(read_ctx_))) {
-    LOG_WARN("failed to build append read context", KR(ret), KPC(ctx));
   } else {
     ctx_ = ctx;
     meta_mgr_ = meta_mgr;
@@ -402,323 +730,164 @@ int ObLobAppender::init(
   return ret;
 }
 
-int ObLobAppender::read_old_summary_(
-    const ObLobId &lob_id,
-    ObLobMetaInfo &summary,
-    ObLobMetaInfo &last_meta,
-    uint64_t &chunk_count)
+int ObLobAppender::set_next_seq_id_(
+    const bool old_is_inrow,
+    const ObLobMetaInfo &last_meta)
 {
   int ret = OB_SUCCESS;
-  ObLobMetaExtraInfo extra_info;
-  bool found_last_meta = false;
-  chunk_count = 0;
-  if (OB_FAIL(meta_mgr_->get_meta_summary_info(read_ctx_, summary))) {
-    LOG_WARN("failed to read old lob summary", KR(ret), K(lob_id), KPC(ctx_));
-  } else if (OB_UNLIKELY(summary.lob_id_ != lob_id)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("old lob summary has unexpected lob id", KR(ret), K(lob_id), K(summary));
-  } else if (OB_FAIL(extra_info.deserialize(summary.lob_extra_info_))) {
-    LOG_WARN("failed to deserialize old lob summary", KR(ret), K(summary));
-  } else if (OB_UNLIKELY(extra_info.extra_info_type_ != ObLobMetaExtraInfo::LOB_META_SUMMARY)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("invalid old lob summary type", KR(ret), K(extra_info), K(summary));
-  } else if (FALSE_IT(chunk_count = extra_info.chunk_count_)) {
-  } else if (OB_FAIL(meta_mgr_->get_last_meta_info(read_ctx_, last_meta, found_last_meta))) {
-    LOG_WARN("failed to read last lob meta before append", KR(ret), K(lob_id));
-  } else if (OB_UNLIKELY(!found_last_meta || 0 == chunk_count)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("out-row lob has no data meta before append",
-             KR(ret), K(found_last_meta), K(chunk_count), K(summary));
-  } else if (OB_UNLIKELY(last_meta.lob_id_ != lob_id
-                         || last_meta.lob_col_idx_ != ctx_->store_column_idx_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("last lob meta does not match append target",
-             KR(ret), K(lob_id), K(last_meta), KPC(ctx_));
+  ObString next_seq_id;
+  char first_seq_buf[ObLobSeqId::LOB_SEQ_ID_MIN_LEN];
+  ObString first_seq_id(sizeof(first_seq_buf), first_seq_buf);
+  ObArenaAllocator seq_allocator("LobAppendSeq", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+  if (old_is_inrow) {
+    if (OB_FAIL(ObLobSeqId::get_seq_id(1, first_seq_id))) {
+      LOG_WARN("failed to build first lob data seq id", KR(ret));
+    } else {
+      next_seq_id = first_seq_id;
+    }
+  } else if (ctx_->update_first_) {
+    next_seq_id = last_meta.seq_id_;
+  } else {
+    ObLobSeqIdGenerator seq_id_gen(last_meta.seq_id_, &seq_allocator);
+    if (OB_FAIL(seq_id_gen.get_next_seq_id(next_seq_id))) {
+      LOG_WARN("failed to build next lob data seq id", KR(ret), K(last_meta));
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(ob_write_string(ctx_->own_allocator_, next_seq_id, ctx_->next_seq_id_))) {
+    LOG_WARN("failed to copy next lob data seq id", KR(ret), K(next_seq_id));
   }
   return ret;
 }
 
-bool ObLobAppender::is_piece_consistent_with_meta_(
-    const ObLobPieceInfo &piece,
-    const ObLobMetaInfo &meta)
-{
-  const int64_t piece_byte_len = piece.lob_data_.length();
-  return piece.lob_col_idx_ == meta.lob_col_idx_
-      && piece.lob_id_ == meta.lob_id_
-      && piece.seq_id_ == meta.seq_id_
-      && piece_byte_len >= 0
-      && static_cast<uint64_t>(piece_byte_len) == meta.byte_len_;
-}
-
-int ObLobAppender::try_fill_last_piece_(
-    ObLobMetaInfo &last_meta,
-    const ObString &append_data,
-    uint64_t &consumed_byte_len,
-    uint64_t &consumed_char_len)
+int ObLobAppender::prepare_append_context_(
+    ObLobMetaInfo &summary_info,
+    ObLobMetaInfo &last_meta_info,
+    bool &is_outtable)
 {
   int ret = OB_SUCCESS;
-  ObLobPieceInfo old_piece;
-  ObLobPieceInfo new_piece;
-  ObLobMetaInfo new_meta;
-  bool found_piece = false;
-  consumed_byte_len = 0;
-  consumed_char_len = 0;
-  const int64_t chunk_size = ctx_->get_chunk_size();
-  if (OB_UNLIKELY(last_meta.byte_len_ > static_cast<uint64_t>(chunk_size))) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("last lob meta exceeds chunk size", KR(ret), K(last_meta), K(chunk_size));
-  } else if (last_meta.byte_len_ == static_cast<uint64_t>(chunk_size)) {
-    // 最后一个数据分片已写满，调用方会将全部追加数据作为新分片插入。
-  } else if (OB_FAIL(piece_mgr_->get_piece_info(read_ctx_, last_meta.seq_id_,
-                                                old_piece, found_piece))) {
-    LOG_WARN("failed to read last lob piece", KR(ret), K(last_meta), KPC(ctx_));
-  } else if (OB_UNLIKELY(!found_piece
-                         || !is_piece_consistent_with_meta_(old_piece,
-                                                            last_meta))) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("last lob piece does not match its meta",
-             KR(ret), K(found_piece), K(old_piece), K(last_meta));
+  const bool old_is_inrow = ctx_->old_loc_.is_inrow();
+  uint64_t old_byte_len = 0;
+  uint64_t old_char_len = 0;
+  uint64_t old_chunk_count = 0;
+  ObLobMetaExtraInfo summary_extra_info;
+  ObLobReadContext read_ctx;
+  ObString append_data;
+  ObString old_inrow_data;
+  uint64_t append_byte_len = 0;
+  uint64_t append_char_len = 0;
+  summary_info.reset();
+  last_meta_info.reset();
+  is_outtable = false;
+  ctx_->update_first_ = false;
+
+  if (OB_FAIL(parse_append_data_(append_data))) {
+    LOG_WARN("failed to parse append data", KR(ret), KPC(this));
   } else {
-    const int64_t tail_capacity = chunk_size - old_piece.lob_data_.length();
-    const int64_t max_append_bytes = std::min(tail_capacity,
-                                               static_cast<int64_t>(append_data.length()));
-    int64_t append_char_len = 0;
-    const uint64_t append_byte_len = ObCharset::max_bytes_charpos(
-        ctx_->coll_type_, append_data.ptr(), append_data.length(),
-        max_append_bytes, append_char_len);
-    if (OB_UNLIKELY(append_byte_len > static_cast<uint64_t>(max_append_bytes)
-                    || append_char_len < 0)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("invalid append prefix for last lob piece", KR(ret),
-               K(append_byte_len), K(append_char_len), K(max_append_bytes));
-    } else if (0 == append_byte_len) {
-      // 剩余空间无法容纳下一个完整的多字节字符。
-    } else {
-      const int64_t combined_len = old_piece.lob_data_.length()
-                                   + static_cast<int64_t>(append_byte_len);
-      char *combined_buf = static_cast<char *>(ctx_->own_allocator_.alloc(combined_len));
-      if (OB_ISNULL(combined_buf)) {
-        ret = OB_ALLOCATE_MEMORY_FAILED;
-        LOG_WARN("failed to allocate last lob piece buffer", KR(ret), K(combined_len));
+    // Calculate the post-append length and determine the storage type.
+    if (old_is_inrow) {
+      if (OB_FAIL(ctx_->old_loc_.get_inrow_data(old_inrow_data))) {
+        LOG_WARN("failed to get inrow data", KR(ret), KPC(this));
       } else {
-        MEMCPY(combined_buf, old_piece.lob_data_.ptr(), old_piece.lob_data_.length());
-        MEMCPY(combined_buf + old_piece.lob_data_.length(),
-               append_data.ptr(), append_byte_len);
-        new_piece.lob_col_idx_ = old_piece.lob_col_idx_;
-        new_piece.lob_id_ = old_piece.lob_id_;
-        new_piece.seq_id_ = old_piece.seq_id_;
-        new_piece.lob_data_.assign_ptr(combined_buf, combined_len);
-        new_meta = last_meta;
-        new_meta.byte_len_ = static_cast<uint64_t>(combined_len);
-        new_meta.char_len_ += static_cast<uint64_t>(append_char_len);
-        if (OB_FAIL(piece_mgr_->update(*ctx_, old_piece, new_piece))) {
-          LOG_WARN("failed to update last lob piece", KR(ret), K(old_piece), K(new_piece));
-        } else if (OB_FAIL(OB_E(
-                       EventTable::ERRSIM_LOB_APPEND_AFTER_TAIL_PIECE_UPDATE) OB_SUCCESS)) {
-          LOG_WARN("injected failure after updating last lob piece", KR(ret),
-                   K(old_piece), K(new_piece));
-        } else if (OB_FAIL(meta_mgr_->update(*ctx_, last_meta, new_meta))) {
-          LOG_WARN("failed to update last lob meta", KR(ret), K(last_meta), K(new_meta));
-        } else if (OB_FAIL(OB_E(
-                       EventTable::ERRSIM_LOB_APPEND_AFTER_TAIL_META_UPDATE) OB_SUCCESS)) {
-          LOG_WARN("injected failure after updating last lob meta", KR(ret),
-                   K(last_meta), K(new_meta));
-        } else {
-          last_meta.byte_len_ = new_meta.byte_len_;
-          last_meta.char_len_ = new_meta.char_len_;
-          consumed_byte_len = append_byte_len;
-          consumed_char_len = static_cast<uint64_t>(append_char_len);
-        }
+        old_byte_len = old_inrow_data.length();
+        old_char_len = ObCharset::strlen_char(ctx_->coll_type_, old_inrow_data.ptr(), old_inrow_data.length());
+      }
+    } else {
+      if (OB_FAIL(ctx_->build_read_context(read_ctx))) {
+        LOG_WARN("failed to build append read context", KR(ret), KPC(this));
+      } else if (FALSE_IT(read_ctx.allocator_ = &ctx_->own_allocator_)) {
+      } else if (OB_FAIL(meta_mgr_->get_meta_summary_info(read_ctx, summary_info))) {
+        LOG_WARN("failed to read old lob summary", KR(ret), KPC(this));
+      } else if (OB_FAIL(summary_extra_info.deserialize(ctx_->own_allocator_,
+                                                        summary_info.lob_extra_info_))) {
+        LOG_WARN("failed to deserialize old lob summary", KR(ret), KPC(this), K(summary_info));
+      } else if (OB_UNLIKELY(summary_extra_info.is_external_lob())) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "appending an external LOB");
+        LOG_WARN("appending an external LOB is not supported", KR(ret), KPC(this), K(summary_info));
+      } else if (OB_FAIL(meta_mgr_->get_last_meta_info(read_ctx, last_meta_info))) {
+        LOG_WARN("failed to read last lob meta before append", KR(ret), KPC(this));
+      } else if (OB_UNLIKELY(summary_extra_info.extra_info_type_ != ObLobMetaExtraInfo::LOB_META_SUMMARY
+                             || 0 == summary_extra_info.chunk_count_
+                             || summary_info.byte_len_ < last_meta_info.byte_len_
+                             || summary_info.char_len_ < last_meta_info.char_len_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid lob meta before append", KR(ret), K(summary_info), K(summary_extra_info),
+                 K(last_meta_info));
+      } else {
+        old_byte_len = summary_info.byte_len_;
+        old_char_len = summary_info.char_len_;
+        old_chunk_count = summary_extra_info.chunk_count_;
+        is_outtable = summary_extra_info.lob_chunk_type_.out_table();
       }
     }
   }
-  return ret;
-}
 
-int ObLobAppender::write_meta_summary_(
-    const ObLobId &lob_id,
-    const bool old_is_outrow,
-    ObLobMetaInfo &old_summary,
-    const uint64_t total_byte_len,
-    const uint64_t total_char_len,
-    const uint64_t chunk_count)
-{
-  int ret = OB_SUCCESS;
-  ObLobMetaInfo new_summary;
-  char seq_id_buf[ObLobSeqId::LOB_SEQ_ID_MIN_LEN];
-  ObString seq_id(sizeof(seq_id_buf), seq_id_buf);
-  ObLobMetaExtraInfo extra_info;
-  if (OB_FAIL(ObLobSeqId::get_summary_seq_id(seq_id))) {
-    LOG_WARN("failed to build lob summary seq id", KR(ret));
+  // Ensure the post-append length does not exceed the limit.
+  if (OB_FAIL(ret)) {
+  } else if (FALSE_IT(append_byte_len = append_data.length())) {
+  } else if (FALSE_IT(append_char_len = ObCharset::strlen_char(ctx_->coll_type_, append_data.ptr(), append_data.length()))) {
+  } else if (OB_UNLIKELY(append_byte_len > ObLobManager::LOB_WRITEAPPEND_MAX_BYTE_LEN
+             || old_byte_len > ObLobManager::LOB_WRITEAPPEND_MAX_BYTE_LEN - append_byte_len)) {
+    ret = OB_SIZE_OVERFLOW;
+    LOG_WARN("accumulated lob byte length exceeds LOB_WRITEAPPEND limit", KR(ret), K(old_byte_len), K(append_byte_len));
+  } else if (OB_UNLIKELY(append_char_len == 0 || append_byte_len == 0)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("append data is empty", KR(ret), K(append_byte_len), K(append_char_len));
   } else {
-    new_summary.lob_col_idx_ = ctx_->store_column_idx_;
-    new_summary.lob_id_ = lob_id;
-    new_summary.seq_id_ = seq_id;
-    new_summary.byte_len_ = total_byte_len;
-    new_summary.char_len_ = total_char_len;
-    extra_info.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
-    extra_info.chunk_count_ = chunk_count;
-    extra_info.last_write_type_ = ObLobLastWriteType::APPEND;
-    // 暂时只支持行内和行外两种类型，不支持外部存储类型。
-    extra_info.lob_chunk_type_.set_in_table();
-    if (OB_FAIL(extra_info.serialize(ctx_->own_allocator_, new_summary.lob_extra_info_))) {
-      LOG_WARN("failed to serialize appended lob summary", KR(ret), K(extra_info));
-    } else if (old_is_outrow
-               && OB_FAIL(meta_mgr_->update(*ctx_, old_summary, new_summary))) {
-      LOG_WARN("failed to update appended lob summary", KR(ret), K(old_summary), K(new_summary));
-    } else if (!old_is_outrow
-               && OB_FAIL(meta_mgr_->insert(*ctx_, new_summary))) {
-      LOG_WARN("failed to insert appended lob summary", KR(ret), K(new_summary));
+    ctx_->total_byte_length_ = old_byte_len + append_byte_len;
+    ctx_->total_char_length_ = old_char_len + append_char_len;
+  }
+
+
+  if (OB_FAIL(ret)) {
+  } else if (old_is_inrow) {
+    if (OB_FAIL(ObLobUtil::check_write_outtable(*ctx_, ctx_->total_byte_length_, is_outtable))) {
+      LOG_WARN("failed to check whether append writes outtable lob", KR(ret), K(ctx_->total_byte_length_));
     }
+  } else {
+    // Append to the tail chunk first when it has enough room for at least one character.
+    const int64_t chunk_size = ctx_->get_chunk_size(is_outtable);
+    if (last_meta_info.byte_len_ < static_cast<uint64_t>(chunk_size)) {
+      const int64_t remain_size = chunk_size - static_cast<int64_t>(last_meta_info.byte_len_);
+      const int64_t max_append_size = OB_MIN(remain_size, append_data.length());
+      int64_t append_prefix_char_len = 0;
+      const uint64_t append_prefix_byte_len = ObCharset::max_bytes_charpos(
+          ctx_->coll_type_, append_data.ptr(), append_data.length(),
+          max_append_size, append_prefix_char_len);
+      ctx_->update_first_ = append_prefix_byte_len > 0;
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (!ctx_->old_loc_.is_inrow()) {
+    ctx_->cur_byte_length_ = old_byte_len;
+    ctx_->cur_char_length_ = old_char_len;
+    ctx_->cur_chunk_count_ = old_chunk_count;
+
+    if (ctx_->update_first_) {
+      ctx_->cur_byte_length_ -= last_meta_info.byte_len_;
+      ctx_->cur_char_length_ -= last_meta_info.char_len_;
+      ctx_->cur_chunk_count_ --;
+    }
+  }
+
+  if (OB_SUCC(ret) && OB_FAIL(set_next_seq_id_(old_is_inrow, last_meta_info))) {
+    LOG_WARN("failed to prepare next lob data seq id", KR(ret), K(last_meta_info));
   }
   return ret;
 }
 
-int ObLobAppender::parse_append_data_(
-    ObString &append_data,
-    uint64_t &append_char_len)
+int ObLobAppender::parse_append_data_(ObString &append_data)
 {
   int ret = OB_SUCCESS;
   const ObMemLobExternHeader *extern_header = nullptr;
-  append_char_len = 0;
   if (OB_FAIL(ctx_->delta_loc_.get_append_delta(extern_header, append_data))) {
     LOG_WARN("failed to parse append delta", KR(ret), KPC(ctx_));
   } else if (OB_UNLIKELY(append_data.empty())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("append delta is empty", KR(ret), KPC(ctx_));
-  } else {
-    const int64_t char_len = ObCharset::strlen_char(
-        ctx_->coll_type_, append_data.ptr(), append_data.length());
-    if (OB_UNLIKELY(char_len <= 0)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("failed to calculate append character length",
-               KR(ret), K(char_len), K(append_data.length()), KPC(ctx_));
-    } else {
-      append_char_len = static_cast<uint64_t>(char_len);
-    }
-  }
-  return ret;
-}
-
-int ObLobAppender::calculate_total_length_(
-    const uint64_t old_byte_len,
-    const uint64_t old_char_len,
-    const uint64_t append_byte_len,
-    const uint64_t append_char_len,
-    uint64_t &total_byte_len,
-    uint64_t &total_char_len)
-{
-  int ret = OB_SUCCESS;
-  total_byte_len = 0;
-  total_char_len = 0;
-  if (OB_UNLIKELY(old_byte_len > ObLobManager::LOB_WRITEAPPEND_MAX_BYTE_LEN
-                  || append_byte_len
-                         > ObLobManager::LOB_WRITEAPPEND_MAX_BYTE_LEN - old_byte_len)) {
-    ret = OB_SIZE_OVERFLOW;
-    LOG_WARN("accumulated lob byte length exceeds LOB_WRITEAPPEND limit",
-             KR(ret), K(old_byte_len), K(append_byte_len),
-             "max_byte_len", ObLobManager::LOB_WRITEAPPEND_MAX_BYTE_LEN);
-  } else {
-    total_byte_len = old_byte_len + append_byte_len;
-    total_char_len = old_char_len + append_char_len;
-  }
-  return ret;
-}
-
-int ObLobAppender::prepare_remaining_append_data_(
-    const ObString &append_data,
-    const uint64_t append_char_len,
-    const uint64_t consumed_byte_len,
-    const uint64_t consumed_char_len,
-    ObString &remaining_append_data)
-{
-  int ret = OB_SUCCESS;
-  remaining_append_data.reset();
-  if (OB_UNLIKELY(consumed_byte_len
-                      > static_cast<uint64_t>(append_data.length())
-                  || consumed_char_len > append_char_len)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("invalid consumed append prefix length", KR(ret),
-             K(consumed_byte_len), K(consumed_char_len),
-             K(append_data.length()), K(append_char_len));
-  } else {
-    const int64_t consumed_byte_offset =
-        static_cast<int64_t>(consumed_byte_len);
-    remaining_append_data.assign_ptr(
-        append_data.ptr() + consumed_byte_offset,
-        append_data.length() - consumed_byte_offset);
-  }
-  return ret;
-}
-
-int ObLobAppender::write_new_chunks_(
-    const ObLobId &lob_id,
-    const ObString &old_inrow_data,
-    const ObString &remaining_append_data,
-    const ObString &start_seq_id,
-    ObLobWriteStats &write_stats)
-{
-  int ret = OB_SUCCESS;
-  ObArray<ObLobMetaInfo> metas;
-  ObLobAppendSourceIter source_iter;
-  ObLobInTablePieceInsertIter piece_insert_iter;
-  ObLobMetaTableBatchInsertIter meta_insert_iter;
-  metas.set_attr(ObMemAttr(MTL_ID(), "LobAppendMetas"));
-  if (remaining_append_data.empty()) {
-    // 最后一个数据分片已容纳全部追加数据。
-  } else if (OB_FAIL(source_iter.open(&ctx_->own_allocator_, old_inrow_data,
-                                      remaining_append_data, ctx_->coll_type_))) {
-    LOG_WARN("failed to open append source iterator", KR(ret), KPC(ctx_));
-  } else if (OB_FAIL(piece_insert_iter.init(&source_iter, &ctx_->own_allocator_,
-                                            ctx_->get_chunk_size(),
-                                            ctx_->store_column_idx_, lob_id,
-                                            &metas, &write_stats))) {
-    LOG_WARN("failed to initialize append piece iterator", KR(ret), KPC(ctx_));
-  } else if (OB_FAIL(piece_insert_iter.set_start_seq_id(start_seq_id))) {
-    LOG_WARN("failed to set append start seq id", KR(ret), K(start_seq_id));
-  } else if (OB_FAIL(piece_mgr_->batch_insert(*ctx_, piece_insert_iter))) {
-    LOG_WARN("failed to insert appended lob pieces", KR(ret), KPC(ctx_));
-  } else if (OB_UNLIKELY(!piece_insert_iter.is_end())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("append piece iterator did not consume source",
-             KR(ret), K(piece_insert_iter));
-  } else if (OB_FAIL(OB_E(
-                 EventTable::ERRSIM_LOB_APPEND_AFTER_PIECE_BATCH_INSERT) OB_SUCCESS)) {
-    LOG_WARN("injected failure after inserting appended lob pieces",
-             KR(ret), KPC(ctx_));
-  } else if (OB_FAIL(meta_insert_iter.init(&metas))) {
-    LOG_WARN("failed to initialize appended meta iterator", KR(ret));
-  } else if (OB_FAIL(meta_mgr_->batch_insert(*ctx_, meta_insert_iter))) {
-    LOG_WARN("failed to insert appended lob meta rows", KR(ret), KPC(ctx_));
-  } else if (OB_FAIL(OB_E(
-                 EventTable::ERRSIM_LOB_APPEND_AFTER_META_BATCH_INSERT) OB_SUCCESS)) {
-    LOG_WARN("injected failure after inserting appended lob metas",
-             KR(ret), KPC(ctx_));
-  } else if (OB_UNLIKELY(write_stats.chunk_count_
-                         != static_cast<uint64_t>(metas.count()))) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("append meta count does not match chunk count",
-             KR(ret), K(write_stats), K(metas.count()));
-  }
-  return ret;
-}
-
-int ObLobAppender::validate_write_stats_(
-    const ObLobWriteStats &write_stats,
-    const uint64_t expected_byte_len,
-    const uint64_t expected_char_len,
-    const uint64_t old_chunk_count,
-    uint64_t &total_chunk_count)
-{
-  int ret = OB_SUCCESS;
-  total_chunk_count = 0;
-  if (OB_UNLIKELY(write_stats.byte_len_ != expected_byte_len
-                  || write_stats.char_len_ != expected_char_len)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("append write statistics mismatch", KR(ret), K(write_stats),
-             K(expected_byte_len), K(expected_char_len));
-  } else {
-    total_chunk_count = old_chunk_count + write_stats.chunk_count_;
   }
   return ret;
 }
@@ -726,119 +895,38 @@ int ObLobAppender::validate_write_stats_(
 int ObLobAppender::append()
 {
   int ret = OB_SUCCESS;
-  ObString append_data;
-  ObString old_inrow_data;
   ObLobDiskLocatorWrapper dest_wrapper;
-  ObLobId lob_id;
-  ObLobMetaInfo old_summary;
-  ObLobMetaInfo last_meta;
-  uint64_t old_chunk_count = 0;
-  const bool old_is_outrow = OB_NOT_NULL(ctx_) && ctx_->old_loc_.is_outrow_disk_lob_locator();
-  uint64_t old_byte_len = 0;
-  uint64_t old_char_len = 0;
-  uint64_t append_char_len = 0;
-  uint64_t total_byte_len = 0;
-  uint64_t total_char_len = 0;
+  ObLobMetaInfo summary_info;
+  ObLobMetaInfo last_meta_info;
+  bool is_outtable = false;
+  ObLobInTablePersistentAppender intable_appender;
+  ObLobOutTablePersistentAppender outtable_appender;
+  ObLobPersistentAppender *persistent_appender = nullptr;
+
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-    LOG_WARN("lob appender is not initialized", KR(ret));
-  } else if (OB_FAIL(parse_append_data_(append_data, append_char_len))) {
-    LOG_WARN("failed to prepare append data", KR(ret), KPC(ctx_));
-  }
-
-  if (OB_FAIL(ret)) {
+    LOG_WARN("lob appender is not initialized", KR(ret), KPC(this));
   } else if (OB_FAIL(dest_wrapper.init(ctx_->dest_loc_.ptr_, ctx_->dest_loc_.size_))) {
     LOG_WARN("failed to initialize append destination", KR(ret), KPC(ctx_));
-  } else if (OB_FAIL(dest_wrapper.get_lob_id(lob_id))) {
+  } else if (OB_FAIL(dest_wrapper.get_lob_id(ctx_->lob_id_))) {
     LOG_WARN("failed to get append lob id", KR(ret), K(dest_wrapper));
-  } else if (old_is_outrow) {
-    if (OB_FAIL(read_old_summary_(lob_id, old_summary, last_meta, old_chunk_count))) {
-      LOG_WARN("failed to read summary before append", KR(ret), K(lob_id));
-    } else {
-      old_byte_len = old_summary.byte_len_;
-      old_char_len = old_summary.char_len_;
-    }
-  } else if (OB_FAIL(ctx_->old_loc_.get_inrow_data(old_inrow_data))) {
-    LOG_WARN("failed to get old inrow data before append", KR(ret), KPC(ctx_));
+  } else if (FALSE_IT(ctx_->insert_lob_seq_no_ = dest_wrapper.get_seq_no())) {
+  } else if (FALSE_IT(ctx_->update_lob_seq_no_ = dest_wrapper.get_seq_no())) {
+  } else if (OB_FAIL(prepare_append_context_(
+                 summary_info, last_meta_info, is_outtable))) {
+    LOG_WARN("failed to prepare lob append context", KR(ret), KPC(this));
+  } else if (is_outtable) {
+    persistent_appender = &outtable_appender;
   } else {
-    old_byte_len = old_inrow_data.length();
-    old_char_len = ObCharset::strlen_char(ctx_->coll_type_, old_inrow_data.ptr(), old_inrow_data.length());
-  }
-  if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(calculate_total_length_(
-                 old_byte_len, old_char_len, static_cast<uint64_t>(append_data.length()),
-                 append_char_len, total_byte_len, total_char_len))) {
-    LOG_WARN("failed to calculate appended lob length",
-             KR(ret), K(old_byte_len), K(old_char_len), K(append_data.length()),
-             K(append_char_len));
-  } else {
-    ctx_->byte_size_ = total_byte_len;
-  }
-
-  ObLobWriteStats write_stats;
-  // start_seq_buf 仅用于行内场景，行外场景直接通过 ObString 赋值。
-  char start_seq_buf[ObLobSeqId::LOB_SEQ_ID_MIN_LEN];
-  ObString start_seq_id;
-  ObString remaining_append_data;
-  uint64_t tail_consumed_byte_len = 0;
-  uint64_t tail_consumed_char_len = 0;
-  if (OB_FAIL(ret)) {
-  } else {
-    ctx_->dml_op_ = ObLobDmlOp::UPDATE; // 在 write_new_chunks_ 前切换为 ObLobDmlOp::INSERT
-    ctx_->insert_lob_seq_no_ = dest_wrapper.get_seq_no();
-    ctx_->update_lob_seq_no_ = dest_wrapper.get_seq_no();
-    if (old_is_outrow) {
-      start_seq_id = last_meta.seq_id_;
-      if (OB_FAIL(try_fill_last_piece_(last_meta, append_data, tail_consumed_byte_len,
-                                      tail_consumed_char_len))) {
-        LOG_WARN("failed to fill last lob piece before append", KR(ret), K(last_meta));
-      }
-    } else {
-      start_seq_id.assign_ptr(start_seq_buf, sizeof(start_seq_buf));
-      if (OB_FAIL(ObLobSeqId::get_seq_id(0, start_seq_id))) {
-        LOG_WARN("failed to build initial append seq id", KR(ret));
-      }
-    }
+    persistent_appender = &intable_appender;
   }
 
   if (OB_FAIL(ret)) {
-  } else if (FALSE_IT(ctx_->dml_op_ = ObLobDmlOp::INSERT)) {
-  } else if (OB_FAIL(prepare_remaining_append_data_(
-                 append_data, append_char_len, tail_consumed_byte_len,
-                 tail_consumed_char_len, remaining_append_data))) {
-    LOG_WARN("failed to prepare remaining append data", KR(ret), KPC(ctx_));
-  } else if (OB_FAIL(write_new_chunks_(lob_id, old_inrow_data,
-                                       remaining_append_data, start_seq_id, write_stats))) {
-    LOG_WARN("failed to write new append chunks", KR(ret), K(lob_id), KPC(ctx_));
-  }
-
-  uint64_t total_chunk_count = 0;
-  const uint64_t expected_insert_byte_len = old_is_outrow
-      ? static_cast<uint64_t>(remaining_append_data.length())
-      : static_cast<uint64_t>(old_inrow_data.length())
-            + static_cast<uint64_t>(append_data.length());
-  const uint64_t expected_insert_char_len = old_is_outrow
-      ? append_char_len - tail_consumed_char_len : old_char_len + append_char_len;
-  if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(validate_write_stats_(
-                 write_stats, expected_insert_byte_len, expected_insert_char_len,
-                 old_chunk_count, total_chunk_count))) {
-    LOG_WARN("failed to validate append write statistics",
-             KR(ret), K(write_stats), K(old_chunk_count));
-  }
-
-  if (OB_FAIL(ret)) {
-  } else if (FALSE_IT(ctx_->dml_op_ = old_is_outrow     // 旧 LOB 为行外格式时，只需更新元信息摘要
-                                          ? ObLobDmlOp::UPDATE
-                                          : ObLobDmlOp::INSERT)) {
-  } else if (OB_FAIL(write_meta_summary_(lob_id, old_is_outrow, old_summary,
-                                         total_byte_len, total_char_len, total_chunk_count))) {
-    LOG_WARN("failed to write appended lob summary", KR(ret), K(write_stats),
-             K(total_byte_len), K(total_char_len), K(total_chunk_count));
-  } else if (OB_FAIL(OB_E(
-                 EventTable::ERRSIM_LOB_APPEND_AFTER_SUMMARY_UPDATE) OB_SUCCESS)) {
-    LOG_WARN("injected failure after updating appended lob summary", KR(ret),
-             K(total_byte_len), K(total_char_len), K(total_chunk_count), KPC(ctx_));
+  } else if (OB_FAIL(persistent_appender->init(ctx_, meta_mgr_, piece_mgr_, summary_info, last_meta_info))) {
+    LOG_WARN("failed to initialize persistent lob appender",
+             KR(ret), K(is_outtable), KPC(ctx_));
+  } else if (OB_FAIL(persistent_appender->append())) {
+    LOG_WARN("failed to persist lob append", KR(ret), K(is_outtable), KPC(ctx_));
   }
   return ret;
 }

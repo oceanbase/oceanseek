@@ -97,8 +97,6 @@ private:
   int collect_tablet_row_(
       const ObSSRawMetaRow &row,
       const share::SCN &snapshot_meta_scn,
-      common::ObArenaAllocator &tablet_allocator,
-      common::ObIArray<ObTabletBlockInfo> &block_infos,
       ObSSDataCheckExpectedSorter &sorter,
       ObSSDataCheckCtx &ctx);
   static bool is_checkable_object_(

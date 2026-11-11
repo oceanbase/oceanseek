@@ -92,7 +92,7 @@ bool ObLobDataExtInfoLog::is_valid() const
       && (OB_SUCCESS == ObLobSeqId::get_summary_seq_id(summary_seq_id))
       && seq_id.is_valid()
       && (seq_id.compare(summary_seq_id) > 0)
-      && !lob_data_.empty();
+      && (is_logging_ ? !lob_data_.empty() : lob_data_.empty());
 }
 
 //==================== ObExtInfoCallback ====================

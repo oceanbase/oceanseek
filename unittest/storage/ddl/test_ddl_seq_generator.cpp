@@ -6,11 +6,14 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include <gmock/gmock.h>
+#include <string>
 #define private public
 #include "storage/ddl/ob_ddl_seq_generator.h"
 #include "storage/ddl/ob_lob_macro_block_writer.h"
 #include "storage/ddl/ob_macro_meta_store_manager.h"
 #include "storage/blocksstable/index_block/ob_macro_meta_temp_store.h"
+#include "storage/lob/ob_lob_manager.h"
+#include "storage/ob_storage_schema.h"
 
 #define ASSERT_SUCC(expr) ASSERT_EQ(common::OB_SUCCESS, (expr))
 #define ASSERT_FAIL(expr) ASSERT_NE(common::OB_SUCCESS, (expr))
@@ -237,6 +240,192 @@ TEST(ddl_seq_generator, lob_aux_run_state_range_and_order)
   run_state.reset(102, 100);
   lob_id.assign(lob_col_idx, 200001, 101);
   ASSERT_EQ(OB_ERR_UNEXPECTED, run_state.check_and_record(lob_id, lob_col_idx));
+}
+
+class TestExternalLobSequence : public ::testing::Test
+{
+protected:
+  void init_writer(ObLobMacroBlockWriter &writer, const int64_t slice_idx,
+                   const int64_t slice_count)
+  {
+    ObWriteMacroParam param;
+    param.ls_id_ = share::ObLSID(1);
+    param.tablet_id_ = ObTabletID(2002);
+    param.lob_meta_tablet_id_ = ObTabletID(3003);
+    param.lob_piece_tablet_id_ = ObTabletID(4004);
+    param.tenant_data_version_ = DATA_CURRENT_VERSION;
+    param.schema_version_ = 1;
+    param.snapshot_version_ = 10;
+    param.task_id_ = 1;
+    param.slice_idx_ = slice_idx;
+    param.slice_count_ = slice_count;
+    param.direct_load_type_ = ObDirectLoadType::SS_IDEM_DIRECT_LOAD_DDL;
+    param.ddl_table_schema_.lob_meta_storage_schema_ = &lob_schema_;
+    param.ddl_table_schema_.lob_piece_storage_schema_ = &lob_schema_;
+    ASSERT_SUCC(param.ddl_table_schema_.column_items_.prepare_allocate(6));
+    ASSERT_SUCC(param.ddl_table_schema_.lob_column_idxs_.push_back(2));
+    ASSERT_SUCC(param.ddl_table_schema_.lob_column_idxs_.push_back(5));
+    param.ddl_table_schema_.column_items_.at(2).col_type_.set_type(ObExtendBLobType);
+    param.ddl_table_schema_.column_items_.at(5).col_type_.set_type(ObExtendBLobType);
+    ASSERT_SUCC(writer.init(param, param.tablet_id_));
+  }
+
+  ObStorageSchema lob_schema_;
+};
+
+TEST_F(TestExternalLobSequence, replay_same_slice)
+{
+  ObLobMacroBlockWriter writer;
+  ObLobMacroBlockWriter retry_writer;
+  ASSERT_NO_FATAL_FAILURE(init_writer(writer, 1, 3));
+  ASSERT_NO_FATAL_FAILURE(init_writer(retry_writer, 1, 3));
+  ASSERT_EQ(0U, writer.lob_id_cache_.count());
+  ASSERT_SUCC(writer.switch_lob_id_cache());
+  ASSERT_SUCC(retry_writer.switch_lob_id_cache());
+  ASSERT_EQ(writer.lob_meta_tablet_id_, writer.lob_id_cache_.tablet_id_);
+  for (int64_t i = 0; i < 16; ++i) {
+    uint64_t lob_id = 0;
+    uint64_t retry_lob_id = 0;
+    uint64_t seq_id = 0;
+    uint64_t retry_seq_id = 0;
+    ASSERT_SUCC(writer.lob_id_cache_.next_value(lob_id));
+    ASSERT_SUCC(retry_writer.lob_id_cache_.next_value(retry_lob_id));
+    ASSERT_SUCC(writer.lob_id_cache_.next_value(seq_id));
+    ASSERT_SUCC(retry_writer.lob_id_cache_.next_value(retry_seq_id));
+    ASSERT_EQ(lob_id, retry_lob_id);
+    ASSERT_NE(lob_id, seq_id);
+    ASSERT_EQ(100001U + 2 * i, seq_id);
+    ASSERT_EQ(seq_id, retry_seq_id);
+    uint64_t cache_value = 0;
+    uint64_t retry_cache_value = 0;
+    ASSERT_SUCC(writer.lob_id_cache_.get_value(cache_value));
+    ASSERT_SUCC(retry_writer.lob_id_cache_.get_value(retry_cache_value));
+    ASSERT_EQ(100003U + 2 * i, cache_value + 1);
+    ASSERT_EQ(cache_value + 1, retry_cache_value + 1);
+  }
+  ASSERT_GT(writer.lob_id_cache_.remain_count(), 0U);
+  ASSERT_EQ(writer.lob_id_generator_.get_current(), retry_writer.lob_id_generator_.get_current());
+}
+
+TEST_F(TestExternalLobSequence, slice_intervals_and_watermark_at_boundary)
+{
+  ObLobMacroBlockWriter first_slice;
+  ObLobMacroBlockWriter second_slice;
+  ASSERT_NO_FATAL_FAILURE(init_writer(first_slice, 0, 2));
+  ASSERT_NO_FATAL_FAILURE(init_writer(second_slice, 1, 2));
+  ASSERT_SUCC(first_slice.switch_lob_id_cache());
+  ASSERT_SUCC(second_slice.switch_lob_id_cache());
+  uint64_t first_seq = 0;
+  uint64_t second_seq = 0;
+  ASSERT_EQ(99999U, first_slice.lob_id_cache_.count());
+  ASSERT_EQ(100000U, second_slice.lob_id_cache_.count());
+  for (uint64_t i = 1; i < 100000; ++i) {
+    ASSERT_SUCC(first_slice.lob_id_cache_.next_value(first_seq));
+    ASSERT_EQ(i, first_seq);
+  }
+  for (uint64_t i = 100000; i < 200000; ++i) {
+    ASSERT_SUCC(second_slice.lob_id_cache_.next_value(second_seq));
+    ASSERT_EQ(i, second_seq);
+    ASSERT_LT(first_seq, second_seq);
+  }
+  // get_value() clamps an exhausted cache to its end; the watermark must advance past it.
+  ASSERT_EQ(0U, first_slice.lob_id_cache_.remain_count());
+  ASSERT_EQ(0U, second_slice.lob_id_cache_.remain_count());
+  uint64_t first_cache_value = 0;
+  uint64_t second_cache_value = 0;
+  ASSERT_SUCC(first_slice.lob_id_cache_.get_value(first_cache_value));
+  ASSERT_SUCC(second_slice.lob_id_cache_.get_value(second_cache_value));
+  ASSERT_EQ(100000U, first_cache_value + 1);
+  ASSERT_EQ(200000U, second_cache_value + 1);
+  ASSERT_SUCC(first_slice.switch_lob_id_cache());
+  ASSERT_SUCC(second_slice.switch_lob_id_cache());
+  ASSERT_SUCC(first_slice.lob_id_cache_.next_value(first_seq));
+  ASSERT_SUCC(second_slice.lob_id_cache_.next_value(second_seq));
+  ASSERT_EQ(200000U, first_seq);
+  ASSERT_EQ(300000U, second_seq);
+  ASSERT_SUCC(first_slice.lob_id_cache_.get_value(first_cache_value));
+  ASSERT_SUCC(second_slice.lob_id_cache_.get_value(second_cache_value));
+  const uint64_t first_watermark = first_cache_value + 1;
+  const uint64_t second_watermark = second_cache_value + 1;
+  ASSERT_EQ(200002U, first_watermark);
+  ASSERT_EQ(300002U, second_watermark);
+  ASSERT_GT(first_watermark, first_seq + 1);
+  ASSERT_GT(second_watermark, second_seq + 1);
+}
+
+TEST_F(TestExternalLobSequence, replay_preserves_external_summary_row_bytes)
+{
+  ObArenaAllocator source_allocator;
+  ObExternalBlobInfo info;
+  info.url_ = ObString::make_string("s3://bucket/object");
+  info.etag_ = ObString::make_string("object-etag");
+  info.offset_ = 3;
+  info.length_ = 17;
+  info.has_length_ = true;
+  info.kind_ = ObExternalBlobKind::REFERENCE;
+  ObMemLobLocatorBuilder builder;
+  oceanbase::common::ObLobLocatorV2 source_locator;
+  ASSERT_SUCC(builder.init(source_allocator));
+  ASSERT_SUCC(builder.set_external_lob_info(info));
+  ASSERT_SUCC(builder.build(source_locator));
+
+  ObLobManager lob_manager(OB_SYS_TENANT_ID);
+  ObLobReadContext read_ctx;
+  ASSERT_SUCC(read_ctx.build(source_locator, source_allocator, 0, UINT64_MAX));
+  read_ctx.coll_type_ = CS_TYPE_BINARY;
+  read_ctx.byte_size_ = info.length_;
+  ObLobSourceReadCtx source_ctx;
+  source_ctx.read_ctx_ = &read_ctx;
+  source_ctx.lob_manager_ = &lob_manager;
+  source_ctx.source_byte_len_ = info.length_;
+  std::string summary_rows[3];
+  for (int64_t attempt = 0; attempt < 3; ++attempt) {
+    ObLobMacroBlockWriter writer;
+    ASSERT_NO_FATAL_FAILURE(init_writer(writer, 2 == attempt ? 1 : 0, 2));
+    ObArenaAllocator locator_allocator;
+    ObArenaAllocator result_allocator;
+    ObLobTargetWriteCtx target_ctx;
+    target_ctx.locator_allocator_ = &locator_allocator;
+    target_ctx.result_allocator_ = &result_allocator;
+    target_ctx.coll_type_ = CS_TYPE_BINARY;
+    target_ctx.lob_col_idx_ = 2;
+    uint64_t auto_inc_id = 0;
+    ASSERT_SUCC(writer.switch_lob_id_cache());
+    ASSERT_SUCC(writer.lob_id_cache_.next_value(auto_inc_id));
+    target_ctx.lob_id_.assign(target_ctx.lob_col_idx_, writer.lob_meta_tablet_id_.id(), auto_inc_id);
+    target_ctx.lob_meta_tablet_id_ = writer.lob_meta_tablet_id_;
+    ASSERT_SUCC(writer.lob_id_cache_.next_value(target_ctx.external_lob_seq_id_));
+    ASSERT_NE(auto_inc_id, target_ctx.external_lob_seq_id_);
+
+    ObLobWriteIter write_iter;
+    ObLobWriteResult result;
+    ASSERT_SUCC(write_iter.open(source_ctx, target_ctx));
+    ASSERT_SUCC(write_iter.get_next_row(result));
+    ASSERT_TRUE(result.is_meta_summary());
+    ASSERT_EQ(target_ctx.lob_id_, result.meta_info_.lob_id_);
+    ASSERT_EQ(info.length_, result.meta_info_.byte_len_);
+    uint64_t tablet_id = 0;
+    uint64_t seq_id = 0;
+    ASSERT_SUCC(ObLobMetaUtil::deserialize_external_lob_block_id(
+        result.meta_info_.lob_block_id_, tablet_id, seq_id));
+    ASSERT_EQ(writer.lob_meta_tablet_id_.id(), tablet_id);
+    ASSERT_NE(writer.tablet_id_.id(), tablet_id);
+    ASSERT_EQ(target_ctx.external_lob_seq_id_, seq_id);
+
+    blocksstable::ObDatumRow row;
+    ASSERT_SUCC(row.init(ObLobMetaInfo::COLUMN_CNT));
+    ASSERT_SUCC(ObLobMetaUtil::transform_from_info_to_row(result.meta_info_, &row, false));
+    const int64_t serialized_size = row.get_serialize_size();
+    ASSERT_GT(serialized_size, 0);
+    summary_rows[attempt].resize(serialized_size);
+    int64_t pos = 0;
+    ASSERT_SUCC(row.serialize(&summary_rows[attempt][0], serialized_size, pos));
+    ASSERT_EQ(serialized_size, pos);
+    ASSERT_EQ(OB_ITER_END, write_iter.get_next_row(result));
+    ASSERT_TRUE(write_iter.is_finished());
+  }
+  ASSERT_EQ(summary_rows[0], summary_rows[1]);
+  ASSERT_NE(summary_rows[0], summary_rows[2]);
 }
 
 TEST(ddl_seq_generator, lob_macro_meta_store_sort_and_overlap_guard)

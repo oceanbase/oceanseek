@@ -247,6 +247,17 @@ int ObTxReplayExecutor::replay_tx_log_(const ObTxLogType log_type)
     }
     break;
   }
+  case ObTxLogType::TX_LOB_OUTTABLE_DATA_LOG: {
+    ObTxLobOutTableDataLog::ReplayArg replay_arg;
+    replay_arg.part_log_no_ = tx_part_log_no_;
+    ObTxLobOutTableDataLog::ConstructArg construct_arg;
+    ObTxCtxLogOperator<ObTxLobOutTableDataLog> log_op(
+        ctx_, &log_block_, &construct_arg, replay_arg, log_ts_ns_, lsn_);
+    if (OB_FAIL(log_op(ObTxLogOpType::REPLAY))) {
+      TRANS_LOG(WARN, "[Replay Tx] replay lob outtable data log error", KR(ret));
+    }
+    break;
+  }
   case ObTxLogType::TX_RECORD_LOG: {
     if (OB_FAIL(replay_record_())) {
       TRANS_LOG(WARN, "[Replay Tx] replay record log error", KR(ret));

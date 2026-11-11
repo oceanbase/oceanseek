@@ -15,6 +15,7 @@
 #include "observer/ob_server_event_history_table_operator.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/tablet/ob_tablet_medium_info_reader.h"
+#include "storage/tablet/ob_tablet_obj_load_helper.h"
 #include "storage/direct_load/ob_inc_major_ddl_aggregate_sstable.h"
 #ifdef OB_BUILD_SHARED_STORAGE
 #include "storage/incremental/ob_ss_minor_compaction.h"
@@ -69,15 +70,13 @@ static int get_ss_uploaded_ckpt_scn_for_local_minor(
   const ObTabletID &tablet_id = tablet.get_tablet_meta().tablet_id_;
   const int64_t sstable_cnt = tablet.get_minor_table_count();
 
-  if (!GCTX.is_shared_storage_mode()
-      || tablet_id.is_ls_inner_tablet()
-      || sstable_cnt >= ObPartitionMergePolicy::OB_EMERGENCY_TABLE_CNT) {
-    // 非 SS、内部 tablet、SSTable 数量超限都不比较上传水位。
+  if (!GCTX.is_shared_storage_mode() || tablet_id.is_ls_inner_tablet()) {
+    // Non-SS environments and LS inner tablets do not check the uploaded checkpoint.
   } else {
     int tmp_ret = OB_SUCCESS;
     ObArenaAllocator tmp_allocator(lib::ObMemAttr(MTL_ID(), "SSMinorCkpt"));
-    bool skip_uploaded_ckpt_check = false;
-    if (tablet.get_tablet_meta().has_transfer_table()) {
+    bool skip_uploaded_ckpt_check = sstable_cnt >= ObPartitionMergePolicy::OB_EMERGENCY_TABLE_CNT;
+    if (OB_SUCC(ret) && !skip_uploaded_ckpt_check && tablet.get_tablet_meta().has_transfer_table()) {
       const ObTabletTransferInfo &transfer_info = tablet.get_tablet_meta().transfer_info_;
       ObTabletHandle ss_src_tablet_handle;
       if (OB_TMP_FAIL(MTL(ObSSMetaService*)->get_tablet(transfer_info.ls_id_,
@@ -95,14 +94,24 @@ static int get_ss_uploaded_ckpt_scn_for_local_minor(
       } else {
         const ObTablet &ss_src_tablet = *ss_src_tablet_handle.get_obj();
         const int64_t src_ss_minor_sstable_cnt = ss_src_tablet.get_minor_table_count();
-        skip_uploaded_ckpt_check =
-            src_ss_minor_sstable_cnt + sstable_cnt
+        skip_uploaded_ckpt_check = src_ss_minor_sstable_cnt + sstable_cnt
             >= ObPartitionMergePolicy::OB_EMERGENCY_TABLE_CNT;
-        LOG_TRACE("check whether transfer tablet local minor should skip uploaded ckpt",
+        LOG_TRACE("check emergency table count for transfer tablet local minor",
             K(skip_uploaded_ckpt_check), "local_minor_cnt", sstable_cnt,
             K(src_ss_minor_sstable_cnt),
             K(tablet_id));
       }
+    }
+    // Load schema only when considering skipping the checkpoint check to avoid overhead on non-emergency paths.
+    if (OB_SUCC(ret) && skip_uploaded_ckpt_check) {
+      ObStorageSchema *storage_schema = nullptr;
+      if (OB_FAIL(tablet.load_storage_schema(tmp_allocator, storage_schema))) {
+        LOG_WARN("failed to load schema for local minor", K(ret), K(tablet_id));
+      } else {
+        const bool is_lob_control_table = storage_schema->is_aux_outtable_lob_control_table();
+        skip_uploaded_ckpt_check = !is_lob_control_table;
+      }
+      ObTabletObjLoadHelper::free(tmp_allocator, storage_schema);
     }
     if (OB_SUCC(ret) && !skip_uploaded_ckpt_check) {
       ObTabletHandle ss_tablet_handle;

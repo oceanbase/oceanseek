@@ -6,6 +6,7 @@
 #ifndef __OCEANBASE_SQL_ENGINE_PX_DFO_H__
 #define __OCEANBASE_SQL_ENGINE_PX_DFO_H__
 
+#include "lib/allocator/ob_malloc.h"
 #include "share/interrupt/ob_global_interrupt_call.h"
 #include "lib/utility/ob_serialization_helper.h"
 #include "lib/queue/ob_lighty_queue.h"
@@ -28,6 +29,7 @@
 #include "lib/string/ob_strings.h"
 #include "share/external_table/ob_external_table_file_mgr.h"
 #include "share/detect/ob_detect_callback.h"
+#include "storage/lob/common/ob_outtable_lob_control_key.h"
 namespace oceanbase
 {
 
@@ -989,13 +991,15 @@ public:
       ssstore_read_row_count_(0),
       px_worker_execute_start_schema_version_(0),
       px_worker_prepare_cost_(0),
-      dispatch_task_cost_(0)
+      dispatch_task_cost_(0),
+      outtable_lob_control_keys_(nullptr)
   {
     allocator_.set_tenant_id(MTL_ID());
     allocator_.set_label("PxTaskArena");
   }
-  ~ObPxTask() = default;
-  ObPxTask (const ObPxTask &other) {
+  ~ObPxTask();
+  ObPxTask(const ObPxTask &other) : ObPxTask()
+  {
     *this = other;
   }
   ObPxTask &operator=(const ObPxTask &other)
@@ -1029,9 +1033,15 @@ public:
     px_worker_execute_start_schema_version_ = other.px_worker_execute_start_schema_version_;
     px_worker_prepare_cost_ = other.px_worker_prepare_cost_;
     dispatch_task_cost_ = other.dispatch_task_cost_;
+    if (this != &other) {
+      // Worker output belongs to the SQC-owned task, not its dispatch copies.
+      common::ob_delete(outtable_lob_control_keys_);
+    }
     return *this;
   }
 public:
+  int append_outtable_lob_control_keys(
+      const common::ObIArray<storage::ObOuttableLobControlKey> &keys);
   TO_STRING_KV(K_(qc_id),
                K_(dfo_id),
                K_(sqc_id),
@@ -1154,6 +1164,8 @@ public:
   int64_t px_worker_prepare_cost_;
   int64_t dispatch_task_cost_;
   ObArenaAllocator allocator_;
+  // Runtime output only; each worker allocates independently of the shared SQC allocator.
+  common::ObArray<storage::ObOuttableLobControlKey> *outtable_lob_control_keys_;
 };
 
 class ObPxRpcInitTaskArgs

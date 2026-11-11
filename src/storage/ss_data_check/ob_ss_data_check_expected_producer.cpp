@@ -10,6 +10,7 @@
 #include "storage/blocksstable/ob_ss_obj_util.h"
 #include "storage/incremental/ob_shared_meta_service.h"
 #include "storage/incremental/ssmeta/ob_ss_meta_info_util.h"
+#include "storage/ss_data_check/ob_ss_data_check_macro_id_iterator.h"
 
 namespace oceanbase
 {
@@ -413,19 +414,16 @@ int ObSSDataCheckExpectedCollectTask::collect_expected_(
 int ObSSDataCheckExpectedCollectTask::collect_tablet_row_(
     const ObSSRawMetaRow &row,
     const SCN &snapshot_meta_scn,
-    ObArenaAllocator &tablet_allocator,
-    ObIArray<ObTabletBlockInfo> &block_infos,
     ObSSDataCheckExpectedSorter &sorter,
     ObSSDataCheckCtx &ctx)
 {
   int ret = OB_SUCCESS;
-  int expand_ret = OB_SUCCESS;
   ObLSID parsed_ls_id;
   ObTabletID tablet_id;
   SCN reorganize_scn;
   SCN meta_scn;
-  tablet_allocator.reuse();
-  block_infos.reuse();
+  ObSSDataCheckMacroIDIterator macro_id_iter;
+  int expand_ret = OB_SUCCESS;
   if (OB_FAIL(ObSSMetaInfoUtil::parse_tablet_meta_key(
       row.meta_key_, parsed_ls_id, tablet_id, reorganize_scn, meta_scn))) {
     LOG_WARN("failed to parse expected tablet batch key", KR(ret), K(row));
@@ -438,36 +436,58 @@ int ObSSDataCheckExpectedCollectTask::collect_tablet_row_(
   } else if (OB_FAIL(check_collect_available_(ctx))) {
     LOG_WARN("expected tablet row expansion has been stopped",
         KR(ret), K(row));
-  } else if (OB_SUCCESS != (expand_ret =
-      ObSSMetaTabletMacroIDIterator::collect_blocks_from_tablet_meta_value(
-          tablet_allocator, row.ls_id_, tablet_id, reorganize_scn,
-          row.meta_value_, false /*fill_occupy_size*/, block_infos))
-      && OB_OBJECT_NOT_EXIST != expand_ret) {
-    ret = expand_ret;
-    LOG_WARN("failed to expand expected tablet batch row", KR(ret), K(row));
-  } else if (OB_OBJECT_NOT_EXIST == expand_ret) {
-    // inline 管理对象已经完整写入 block_infos，保留这些已知引用交给 LIST
-    // 精确确认；后续对象未完整展开，不能据此发布 HEALTH。
-    LOG_WARN("expected tablet dependency does not exist",
-        KR(expand_ret), K(row), "known_block_count", block_infos.count());
+  } else if (OB_SUCCESS != (expand_ret = macro_id_iter.init(
+      ObSSGCTablet(row.ls_id_, tablet_id, reorganize_scn), row.meta_value_,
+      ctx.is_lob_meta_scan_enabled()))) {
+    if (OB_OBJECT_NOT_EXIST != expand_ret) {
+      ret = expand_ret;
+    }
+    LOG_WARN("failed to initialize expected tablet macro iterator", KR(expand_ret), K(row));
   }
 
-  for (int64_t i = 0; OB_SUCC(ret) && i < block_infos.count(); ++i) {
-    const MacroBlockId &macro_id = block_infos.at(i).macro_id();
-    if (!is_checkable_object_(macro_id)) {
-      // TABLE、CONTROL、private 和可重建 prewarm 对象不属于本轮 S3 数据检查。
+  // Ctrl DOING may commit before PUT; collect OutTable candidates from committed LOB Meta rows.
+  MacroBlockId macro_id;
+  const ObIArray<ObTabletBlockInfo> &known_blocks = macro_id_iter.get_known_block_infos();
+  int64_t known_block_idx = 0;
+  while (OB_SUCC(ret)) {
+    if (OB_FAIL(check_collect_available_(ctx))) {
+      LOG_WARN("expected tablet expansion has been stopped", KR(ret), K(row));
     } else {
-      ObSSDataCheckExpectedItem expected_item;
-      if (OB_FAIL(expected_item.init(macro_id, row.ls_id_, tablet_id, reorganize_scn, meta_scn))) {
-        LOG_WARN("failed to build expected item from tablet batch", KR(ret), K(row), K(macro_id));
-      } else if (OB_FAIL(sorter.add_item(expected_item))) {
-        LOG_WARN("failed to sort expected item from tablet batch", KR(ret), K(expected_item));
+      if (OB_OBJECT_NOT_EXIST == expand_ret) {
+        // A failed init cannot be iterated; retain its known references for exact-version rechecks.
+        if (known_block_idx < known_blocks.count()) {
+          macro_id = known_blocks.at(known_block_idx++).macro_id();
+        } else {
+          ret = OB_ITER_END;
+        }
+      } else {
+        ret = macro_id_iter.get_next(macro_id);
+      }
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+        break;
+      } else if (OB_OBJECT_NOT_EXIST == ret) {
+        LOG_WARN("expected tablet dependency does not exist", KR(ret), K(row));
+        expand_ret = ret;
+        ret = OB_SUCCESS;
+        break;
+      } else if (OB_FAIL(ret)) {
+        LOG_WARN("failed to expand expected tablet batch row", KR(ret), K(row));
+      } else if (!is_checkable_object_(macro_id)) {
+        // TABLE, CONTROL, private and rebuildable prewarm objects are outside this check.
+      } else {
+        ObSSDataCheckExpectedItem expected_item;
+        if (OB_FAIL(expected_item.init(
+            macro_id, row.ls_id_, tablet_id, reorganize_scn, meta_scn))) {
+          LOG_WARN("failed to build expected item from tablet batch", KR(ret), K(row), K(macro_id));
+        } else if (OB_FAIL(sorter.add_item(expected_item))) {
+          LOG_WARN("failed to sort expected item from tablet batch", KR(ret), K(expected_item));
+        }
       }
     }
   }
   if (OB_FAIL(ret)) {
-  } else if (OB_OBJECT_NOT_EXIST == expand_ret
-      && OB_FAIL(ctx.record_incomplete_expected())) {
+  } else if (OB_OBJECT_NOT_EXIST == expand_ret && OB_FAIL(ctx.record_incomplete_expected())) {
     LOG_WARN("failed to record incomplete Expected", KR(ret), K(row));
   }
   return ret;
@@ -483,11 +503,8 @@ int ObSSDataCheckExpectedCollectTask::collect_expected_from_shared_meta_(
   const SCN snapshot_meta_scn = ctx.get_snapshot_meta_scn();
   const ObSSDataCheckMode check_mode = ctx.get_check_mode();
   ObArenaAllocator batch_allocator("DCExpBatch", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id);
-  ObArenaAllocator tablet_allocator("DCExpTablet", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id);
   ObSEArray<ObSSRawMetaRow, COLLECT_ARRAY_CAPACITY> rows;
-  ObSEArray<ObTabletBlockInfo, COLLECT_ARRAY_CAPACITY> block_infos;
   rows.set_attr(ObMemAttr(tenant_id, "DCExpBatch"));
-  block_infos.set_attr(ObMemAttr(tenant_id, "DCExpBlock"));
   if (OB_ISNULL(shared_meta_source_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("shared meta expected collect source is null", KR(ret));
@@ -513,8 +530,7 @@ int ObSSDataCheckExpectedCollectTask::collect_expected_from_shared_meta_(
           if (OB_FAIL(check_collect_available_(ctx))) {
             LOG_INFO("expected collect worker has been stopped",
                 KR(ret), K_(worker_idx), K(i));
-          } else if (OB_FAIL(collect_tablet_row_(rows.at(i), snapshot_meta_scn,
-              tablet_allocator, block_infos, sorter, ctx))) {
+          } else if (OB_FAIL(collect_tablet_row_(rows.at(i), snapshot_meta_scn, sorter, ctx))) {
             LOG_WARN("failed to collect expected tablet batch row",
                 KR(ret), K_(worker_idx), K(i), K(rows.at(i)));
           }

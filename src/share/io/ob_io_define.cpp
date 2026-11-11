@@ -1280,7 +1280,8 @@ ObIORequest::ObIORequest()
     fd_(),
     trace_id_(),
     part_id_(-1),
-    uri_cstr_(nullptr)
+    uri_cstr_(nullptr),
+    stat_buf_(nullptr)
 {
 
 }
@@ -1774,7 +1775,17 @@ int ObIORequest::recycle_buffer()
       if (nullptr == io_result_->user_data_buf_) {
         // do nothing，无需memcpy，也不能free io buffer
       } else if (!is_canceled() && nullptr != get_io_data_buf()) {
-        MEMCPY(io_result_->user_data_buf_, get_io_data_buf(), get_data_size());
+        const ObIOReadMode read_mode = io_result_->flag_.get_read_mode();
+        if (io_result_->flag_.is_read()
+            && (ObIOReadMode::STAT == read_mode || ObIOReadMode::ADAPTIVE_STAT == read_mode)) {
+          ObIODFileStat &statbuf = *reinterpret_cast<ObIODFileStat *>(io_result_->user_data_buf_);
+          const ObIODFileStat &source = *reinterpret_cast<const ObIODFileStat *>(get_io_data_buf());
+          if (OB_FAIL(statbuf.assign(source))) {
+            LOG_WARN("failed to copy stat IO result", KR(ret), K(source.size_));
+          }
+        } else {
+          MEMCPY(io_result_->user_data_buf_, get_io_data_buf(), get_data_size());
+        }
         free_io_buffer();
       }
     }
@@ -1879,8 +1890,33 @@ bool ObIORequest::can_callback() const
   return nullptr != io_result_ && nullptr != get_callback() && nullptr != raw_buf_;
 }
 
+int ObIORequest::prepare_stat_buffer(ObIODFileStat *&statbuf)
+{
+  int ret = OB_SUCCESS;
+  statbuf = nullptr;
+  if (OB_ISNULL(stat_buf_)) {
+    char *io_buf = calc_io_buf();
+    if (OB_ISNULL(io_buf)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("stat IO buffer is null", KR(ret), KPC(this));
+    } else {
+      stat_buf_ = new (io_buf) ObIODFileStat(tenant_id_);
+    }
+  } else {
+    stat_buf_->reset();
+  }
+  if (OB_SUCC(ret)) {
+    statbuf = stat_buf_;
+  }
+  return ret;
+}
+
 void ObIORequest::free_io_buffer()
 {
+  if (OB_NOT_NULL(stat_buf_)) {
+    stat_buf_->~ObIODFileStat();
+    stat_buf_ = nullptr;
+  }
   if (nullptr != raw_buf_ && nullptr != tenant_io_mgr_.get_ptr()) {
     tenant_io_mgr_.get_ptr()->io_mem_stats_.dec(*this);
     tenant_io_mgr_.get_ptr()->io_allocator_.free(raw_buf_);

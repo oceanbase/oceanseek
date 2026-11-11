@@ -55,6 +55,7 @@ static constexpr ObObjType ROUND_RESULT_TYPE[ObMaxType] =
     ObDoubleType,      /* ObMySQLDateType */
     ObDoubleType,      /* ObMySQLDateTimeType */
     ObMaxType,         /* ObRoaringBitmapType */
+    ObMaxType,         /* ObExtendBLobType */
 };
 
 static_assert(is_array_fully_initialized(ROUND_RESULT_TYPE), "ROUND_RESULT_TYPE is partially initlized");

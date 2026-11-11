@@ -11,6 +11,7 @@
 #include "share/inner_table/user_table/ob_user_table_schema.h"
 #include "share/schema/ob_schema_getter_guard.h"
 #include "share/schema/ob_multi_version_schema_service.h"
+#include "share/ob_cluster_version.h"
 #include "share/ob_get_compat_mode.h"
 #include "share/ob_rpc_struct.h"
 #include "common/ob_timeout_ctx.h"
@@ -236,10 +237,15 @@ int ObUserTableSchemaApplier::build_builtin_table_schema_(
     table_schema.set_database_id(database_id);
     if (OB_FAIL(entry.create_schema_(table_schema))) {
       LOG_WARN("create builtin table schema failed", KR(ret), K(tenant_id), "table", entry.table_name_);
-    } else if (!table_schema.get_tablegroup_name().empty()) {
-      ObString tablegroup_name = table_schema.get_tablegroup_name();
-      if (OB_FAIL(table_schema.set_tablegroup_name(tablegroup_name))) {
-        LOG_WARN("set tablegroup name failed", KR(ret), K(tenant_id), K(tablegroup_name));
+    } else {
+      if (is_sys_tenant(tenant_id) && table_schema.is_aux_outtable_lob_control_table()) {
+        table_schema.get_part_option().set_part_num(1);
+      }
+      if (!table_schema.get_tablegroup_name().empty()) {
+        ObString tablegroup_name = table_schema.get_tablegroup_name();
+        if (OB_FAIL(table_schema.set_tablegroup_name(tablegroup_name))) {
+          LOG_WARN("set tablegroup name failed", KR(ret), K(tenant_id), K(tablegroup_name));
+        }
       }
     }
   }
@@ -291,6 +297,50 @@ int ObUserTableSchemaApplier::check_and_get_column_diff_(
         LOG_WARN("push modify column failed", KR(ret));
       }
     }
+  }
+  return ret;
+}
+
+int ObUserTableSchemaApplier::check_outtable_lob_control_schema_(
+    const ObTableSchema &exist_schema,
+    const ObTableSchema &expect_schema) const
+{
+  int ret = OB_SUCCESS;
+  bool schema_match = exist_schema.is_aux_outtable_lob_control_table()
+      && expect_schema.is_aux_outtable_lob_control_table()
+      && exist_schema.get_column_count() == expect_schema.get_column_count()
+      && exist_schema.get_rowkey_column_num() == expect_schema.get_rowkey_column_num()
+      && exist_schema.get_part_level() == expect_schema.get_part_level()
+      && exist_schema.get_part_option().get_part_func_type()
+          == expect_schema.get_part_option().get_part_func_type()
+      && exist_schema.get_part_option().get_part_num()
+          == expect_schema.get_part_option().get_part_num()
+      && 0 == exist_schema.get_part_option().get_part_func_expr_str().case_compare(
+          expect_schema.get_part_option().get_part_func_expr_str());
+  for (int64_t i = 0; OB_SUCC(ret) && schema_match && i < expect_schema.get_column_count(); ++i) {
+    const ObColumnSchemaV2 *expect_column = expect_schema.get_column_schema_by_idx(i);
+    const ObColumnSchemaV2 *exist_column = NULL;
+    bool column_match = false;
+    if (OB_ISNULL(expect_column)) {
+      schema_match = false;
+    } else {
+      exist_column = exist_schema.get_column_schema(expect_column->get_column_name());
+      if (OB_ISNULL(exist_column)) {
+        schema_match = false;
+      } else if (OB_FAIL(column_schema_equal_(*expect_column, *exist_column, column_match))) {
+        LOG_WARN("compare outtable LOB control column failed", KR(ret), KPC(expect_column),
+            KPC(exist_column));
+      } else {
+        schema_match = column_match
+            && exist_column->get_collation_type() == expect_column->get_collation_type()
+            && exist_column->get_rowkey_position() == expect_column->get_rowkey_position()
+            && exist_column->get_tbl_part_key_pos() == expect_column->get_tbl_part_key_pos();
+      }
+    }
+  }
+  if (OB_SUCC(ret) && !schema_match) {
+    ret = OB_SCHEMA_ERROR;
+    LOG_WARN("outtable lob control table schema mismatch", KR(ret), K(exist_schema), K(expect_schema));
   }
   return ret;
 }
@@ -356,6 +406,7 @@ int ObUserTableSchemaApplier::execute_parallel_create_table_(
   obrpc::ObCreateTableRes res;
   common::ObAddr rs_addr;
   arg.exec_tenant_id_ = tenant_id;
+  arg.if_not_exist_ = table_schema.is_aux_outtable_lob_control_table();
   arg.is_inner_ = true;
   arg.is_parallel_ = true;
   if (OB_FAIL(check_inner_stat_())) {
@@ -365,6 +416,25 @@ int ObUserTableSchemaApplier::execute_parallel_create_table_(
     LOG_WARN("rs mgr or rs rpc proxy is null", KR(ret), KP(GCTX.rs_mgr_), KP(GCTX.rs_rpc_proxy_));
   } else if (OB_FAIL(arg.schema_.assign(table_schema))) {
     LOG_WARN("assign table schema failed", KR(ret), K(tenant_id), K(database_name));
+  } else {
+    const ObUserTableBuiltinLocalIndexEntry *entries =
+        get_user_table_builtin_local_index_entries();
+    const int64_t cnt = get_user_table_builtin_local_index_count();
+    for (int64_t i = 0; OB_SUCC(ret) && i < cnt; ++i) {
+      if (0 == table_schema.get_table_name_str().case_compare(ObString(entries[i].table_name_))) {
+        obrpc::ObCreateIndexArg index_arg;
+        if (OB_FAIL(build_builtin_local_index_arg_(tenant_id, database_name, table_schema,
+                entries[i], index_arg))) {
+          LOG_WARN("build builtin local index arg failed", KR(ret), K(tenant_id),
+              "table", table_schema.get_table_name_str(), "index", entries[i].index_name_);
+        } else if (OB_FAIL(arg.index_arg_list_.push_back(index_arg))) {
+          LOG_WARN("push builtin local index arg failed", KR(ret), K(tenant_id),
+              "table", table_schema.get_table_name_str(), "index", entries[i].index_name_);
+        }
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
   } else if (OB_FAIL(GCTX.rs_mgr_->get_master_root_server(rs_addr))) {
     LOG_WARN("get rs leader failed", KR(ret));
   } else {
@@ -388,6 +458,179 @@ int ObUserTableSchemaApplier::execute_parallel_create_table_(
     if (OB_SUCC(ret)) {
       FLOG_INFO("[USER_TABLE_DEF] parallel create table success", K(tenant_id), K(database_name),
           "table", table_schema.get_table_name_str(), K(res), K(rs_addr));
+    }
+  }
+  return ret;
+}
+
+int ObUserTableSchemaApplier::build_builtin_local_index_arg_(
+    const uint64_t tenant_id,
+    const ObString &database_name,
+    const ObTableSchema &table_schema,
+    const ObUserTableBuiltinLocalIndexEntry &entry,
+    obrpc::ObCreateIndexArg &arg) const
+{
+  int ret = OB_SUCCESS;
+  arg.reset();
+  if (!is_valid_tenant_id(tenant_id) || database_name.empty()
+      || OB_ISNULL(entry.table_name_) || OB_ISNULL(entry.index_name_)
+      || OB_ISNULL(entry.column_names_) || entry.column_count_ <= 0
+      || entry.store_column_count_ < 0
+      || (entry.store_column_count_ > 0 && OB_ISNULL(entry.store_column_names_))
+      || 0 != table_schema.get_table_name_str().case_compare(ObString(entry.table_name_))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid builtin local index entry", KR(ret), K(tenant_id), K(database_name),
+        "table", table_schema.get_table_name_str(), KP(entry.table_name_),
+        KP(entry.index_name_), K(entry.column_count_), K(entry.store_column_count_));
+  } else {
+    arg.exec_tenant_id_ = tenant_id;
+    arg.tenant_id_ = tenant_id;
+    arg.database_name_ = database_name;
+    arg.table_name_ = table_schema.get_table_name_str();
+    arg.index_name_ = ObString(entry.index_name_);
+    arg.index_type_ = INDEX_TYPE_NORMAL_LOCAL;
+    arg.index_option_.reset();
+    arg.index_option_.block_size_ = table_schema.get_block_size();
+    arg.index_option_.index_status_ = INDEX_STATUS_AVAILABLE;
+    arg.if_not_exist_ = true;
+    arg.is_inner_ = true;
+    arg.is_parallel_ = true;
+    arg.is_index_scope_specified_ = true;
+    for (int64_t i = 0; OB_SUCC(ret) && i < entry.column_count_; ++i) {
+      obrpc::ObColumnSortItem column;
+      if (OB_ISNULL(entry.column_names_[i])) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("builtin local index column is null", KR(ret), K(i), "index", entry.index_name_);
+      } else {
+        column.column_name_ = ObString(entry.column_names_[i]);
+        if (OB_FAIL(arg.index_columns_.push_back(column))) {
+          LOG_WARN("push builtin local index column failed", KR(ret), K(i),
+              "index", entry.index_name_);
+        }
+      }
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < entry.store_column_count_; ++i) {
+      if (OB_ISNULL(entry.store_column_names_[i])) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("builtin local index store column is null", KR(ret), K(i),
+            "index", entry.index_name_);
+      } else if (OB_FAIL(arg.store_columns_.push_back(ObString(entry.store_column_names_[i])))) {
+        LOG_WARN("push builtin local index store column failed", KR(ret), K(i),
+            "index", entry.index_name_);
+      }
+    }
+    if (OB_SUCC(ret) && !arg.is_valid()) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("built local index arg is invalid", KR(ret), K(arg));
+    }
+  }
+  return ret;
+}
+
+int ObUserTableSchemaApplier::check_builtin_local_index_(
+    ObSchemaGetterGuard &guard,
+    const ObTableSchema &table_schema,
+    const ObUserTableBuiltinLocalIndexEntry &entry,
+    bool &exists) const
+{
+  int ret = OB_SUCCESS;
+  exists = false;
+  if (OB_ISNULL(entry.index_name_) || OB_ISNULL(entry.column_names_)
+      || entry.column_count_ <= 0 || entry.store_column_count_ < 0
+      || (entry.store_column_count_ > 0 && OB_ISNULL(entry.store_column_names_))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid builtin local index entry", KR(ret), KP(entry.index_name_),
+        KP(entry.column_names_), K(entry.column_count_), K(entry.store_column_count_));
+  } else {
+    const ObIArray<ObAuxTableMetaInfo> &index_infos = table_schema.get_simple_index_infos();
+    for (int64_t i = 0; OB_SUCC(ret) && !exists && i < index_infos.count(); ++i) {
+      const ObTableSchema *index_schema = NULL;
+      ObString index_name;
+      if (OB_FAIL(guard.get_table_schema(table_schema.get_tenant_id(),
+              index_infos.at(i).table_id_, index_schema))) {
+        LOG_WARN("get index schema failed", KR(ret), K(table_schema.get_tenant_id()),
+            "index_table_id", index_infos.at(i).table_id_);
+      } else if (OB_ISNULL(index_schema)) {
+        ret = OB_SCHEMA_ERROR;
+        LOG_WARN("index schema not found", KR(ret), K(table_schema.get_tenant_id()),
+            "index_table_id", index_infos.at(i).table_id_);
+      } else if (OB_FAIL(index_schema->get_index_name(index_name))) {
+        LOG_WARN("get original index name failed", KR(ret), KPC(index_schema));
+      } else if (0 != index_name.case_compare(ObString(entry.index_name_))) {
+        // Other local index on the same table.
+      } else {
+        exists = true;
+        const ObIndexInfo &index_info = index_schema->get_index_info();
+        bool schema_match = table_schema.get_table_id() == index_schema->get_data_table_id()
+            && INDEX_TYPE_NORMAL_LOCAL == index_schema->get_index_type()
+            && INDEX_STATUS_AVAILABLE == index_schema->get_index_status()
+            && index_schema->is_index_visible()
+            && entry.column_count_ == index_info.get_size();
+        for (int64_t j = 0; schema_match && j < entry.column_count_; ++j) {
+          const ObRowkeyColumn *index_column = index_info.get_column(j);
+          const ObColumnSchemaV2 *column_schema = NULL;
+          if (OB_ISNULL(index_column)
+              || OB_ISNULL(column_schema = index_schema->get_column_schema(index_column->column_id_))
+              || OB_ISNULL(entry.column_names_[j])
+              || 0 != column_schema->get_column_name_str().case_compare(
+                  ObString(entry.column_names_[j]))) {
+            schema_match = false;
+          }
+        }
+        int64_t store_column_count = 0;
+        for (ObTableSchema::const_column_iterator iter = index_schema->column_begin();
+             schema_match && iter != index_schema->column_end(); ++iter) {
+          if (OB_NOT_NULL(*iter) && (*iter)->is_user_specified_storing_column()) {
+            ++store_column_count;
+          }
+        }
+        schema_match = schema_match && store_column_count == entry.store_column_count_;
+        for (int64_t j = 0; schema_match && j < entry.store_column_count_; ++j) {
+          const ObColumnSchemaV2 *store_column = index_schema->get_column_schema(
+              ObString(entry.store_column_names_[j]));
+          if (OB_ISNULL(store_column) || !store_column->is_user_specified_storing_column()) {
+            schema_match = false;
+          }
+        }
+        if (!schema_match) {
+          ret = OB_SCHEMA_ERROR;
+          LOG_WARN("builtin local index schema mismatch", KR(ret), K(table_schema),
+              KPC(index_schema), "expected_index", entry.index_name_);
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObUserTableSchemaApplier::check_builtin_local_indexes_(
+    const uint64_t tenant_id,
+    ObSchemaGetterGuard &guard,
+    const ObTableSchema &table_schema) const
+{
+  int ret = OB_SUCCESS;
+  const ObUserTableBuiltinLocalIndexEntry *entries = get_user_table_builtin_local_index_entries();
+  const int64_t cnt = get_user_table_builtin_local_index_count();
+  if (OB_ISNULL(entries) && cnt > 0) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("builtin local index entries are null", KR(ret), K(cnt));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < cnt; ++i) {
+    if (0 != table_schema.get_table_name_str().case_compare(ObString(entries[i].table_name_))) {
+      // Local index for another builtin table.
+    } else {
+      bool exists = false;
+      if (OB_FAIL(check_builtin_local_index_(guard, table_schema, entries[i], exists))) {
+        LOG_WARN("check builtin local index failed", KR(ret), K(tenant_id),
+            "table", table_schema.get_table_name_str(), "index", entries[i].index_name_);
+      } else if (!exists) {
+        ret = OB_SCHEMA_ERROR;
+        LOG_WARN("builtin local index not found", KR(ret), K(tenant_id),
+            "table", table_schema.get_table_name_str(), "index", entries[i].index_name_);
+      } else {
+        FLOG_INFO("[USER_TABLE_DEF] builtin local index schema match", K(tenant_id),
+            "table", table_schema.get_table_name_str(), "index", entries[i].index_name_);
+      }
     }
   }
   return ret;
@@ -437,11 +680,29 @@ int ObUserTableSchemaApplier::apply_one_builtin_table_(
     LOG_WARN("check table exists failed", KR(ret), K(database_name), K(table_name));
   } else if (!exists) {
     HEAP_VAR(ObTableSchema, expect_schema) {
+      ObSchemaGetterGuard new_guard;
+      bool created_table_exists = false;
+      const ObTableSchema *created_schema = NULL;
       if (OB_FAIL(build_builtin_table_schema_(tenant_id, database_id, entry, expect_schema))) {
         LOG_WARN("build builtin table schema failed", KR(ret), K(database_name), K(table_name));
       } else if (OB_FAIL(execute_parallel_create_table_(tenant_id, database_name, expect_schema,
               force_local))) {
         LOG_WARN("execute parallel create table failed", KR(ret), K(database_name), K(table_name));
+      } else if (expect_schema.is_aux_outtable_lob_control_table()) {
+        if (OB_FAIL(ObDDLService::get_tenant_schema_guard_with_version_in_inner_table(
+                tenant_id, new_guard))) {
+          LOG_WARN("refresh schema guard after create table failed", KR(ret), K(tenant_id), K(table_name));
+        } else if (OB_FAIL(check_table_exists_(new_guard, tenant_id, database_id,
+                table_name, created_table_exists, created_schema))) {
+          LOG_WARN("check created table failed", KR(ret), K(tenant_id), K(table_name));
+        } else if (!created_table_exists || OB_ISNULL(created_schema)) {
+          ret = OB_SCHEMA_ERROR;
+          LOG_WARN("created builtin table not found", KR(ret), K(tenant_id), K(table_name));
+        } else if (OB_FAIL(check_outtable_lob_control_schema_(*created_schema, expect_schema))) {
+          LOG_WARN("created outtable lob control schema mismatch", KR(ret), K(tenant_id));
+        } else if (OB_FAIL(check_builtin_local_indexes_(tenant_id, new_guard, *created_schema))) {
+          LOG_WARN("check created table local indexes failed", KR(ret), K(tenant_id), K(table_name));
+        }
       }
     }
   } else {
@@ -454,6 +715,9 @@ int ObUserTableSchemaApplier::apply_one_builtin_table_(
         LOG_WARN("exist schema is null", KR(ret), K(database_name), K(table_name));
       } else if (OB_FAIL(build_builtin_table_schema_(tenant_id, database_id, entry, expect_schema))) {
         LOG_WARN("build builtin table schema failed", KR(ret), K(database_name), K(table_name));
+      } else if (expect_schema.is_aux_outtable_lob_control_table()
+          && OB_FAIL(check_outtable_lob_control_schema_(*exist_schema, expect_schema))) {
+        LOG_WARN("outtable lob control schema mismatch", KR(ret), K(tenant_id), K(table_name));
       } else if (OB_FAIL(check_and_get_column_diff_(*exist_schema, expect_schema,
               add_columns, modify_columns))) {
         LOG_WARN("get column diff failed", KR(ret), K(database_name), K(table_name));
@@ -465,23 +729,40 @@ int ObUserTableSchemaApplier::apply_one_builtin_table_(
       } else if (OB_FAIL(execute_ddl_sql_(tenant_id, ddl_sql.string()))) {
         LOG_WARN("execute alter ddl failed", KR(ret), K(database_name), K(table_name), K(ddl_sql));
       }
+      if (OB_SUCC(ret) && expect_schema.is_aux_outtable_lob_control_table()
+          && OB_FAIL(check_builtin_local_indexes_(tenant_id, guard, *exist_schema))) {
+        LOG_WARN("check builtin local indexes failed", KR(ret), K(tenant_id), K(table_name));
+      }
     }
   }
   return ret;
+}
+
+bool ObUserTableSchemaApplier::should_apply_builtin_table_(
+    const uint64_t tenant_id,
+    const ObUserTableBuiltinSchemaEntry &entry) const
+{
+  return is_sys_tenant(tenant_id)
+      || is_meta_tenant(tenant_id)
+      || (is_user_tenant(tenant_id)
+          && OB_NOT_NULL(entry.table_name_)
+          && 0 == ObString(entry.table_name_).case_compare(OB_ALL_OUTTABLE_LOB_CONTROL_TNAME));
 }
 
 int ObUserTableSchemaApplier::apply_builtin_user_table_schemas(const uint64_t tenant_id,
                                                                const bool force_local)
 {
   int ret = OB_SUCCESS;
+  int64_t applied_table_cnt = 0;
   ObSchemaGetterGuard schema_guard;
   const ObUserTableBuiltinSchemaEntry *entries = get_user_table_builtin_schema_entries();
   const int64_t cnt = get_user_table_builtin_schema_count();
   if (OB_FAIL(check_inner_stat_())) {
     LOG_WARN("not init", KR(ret));
-  } else if (OB_INVALID_ID == tenant_id || (!is_sys_tenant(tenant_id) && !is_meta_tenant(tenant_id))) {
+  } else if (OB_INVALID_ID == tenant_id
+      || (!is_sys_tenant(tenant_id) && !is_meta_tenant(tenant_id) && !is_user_tenant(tenant_id))) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("only support apply builtin user table schemas in sys/meta tenant", KR(ret), K(tenant_id));
+    LOG_WARN("invalid tenant for builtin user table schemas", KR(ret), K(tenant_id));
   } else if (OB_ISNULL(entries) || cnt <= 0) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("builtin user table schema empty", KR(ret), KP(entries), K(cnt));
@@ -490,13 +771,27 @@ int ObUserTableSchemaApplier::apply_builtin_user_table_schemas(const uint64_t te
     LOG_WARN("get schema guard from inner table failed", KR(ret), K(tenant_id));
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < cnt; ++i) {
-      if (OB_FAIL(apply_one_builtin_table_(tenant_id, schema_guard, entries[i], force_local))) {
-        LOG_WARN("apply one builtin table failed", KR(ret), K(tenant_id), "idx", i,
-            "table", entries[i].table_name_);
+      // TODO (muwei.ym): replace CLUSTER_VERSION_4_6_2_1 with
+      // CLUSTER_VERSION_4_6_3_1 after it is defined.
+      if (!should_apply_builtin_table_(tenant_id, entries[i])) {
+        // This builtin table does not belong to the current tenant type.
+      } else if (!GCTX.in_bootstrap_
+          && OB_NOT_NULL(entries[i].table_name_)
+          && 0 == ObString(entries[i].table_name_).case_compare(
+              OB_ALL_OUTTABLE_LOB_CONTROL_TNAME)
+          && GET_MIN_CLUSTER_VERSION() < CLUSTER_VERSION_4_6_2_1) {
+        FLOG_INFO("[USER_TABLE_DEF] skip outtable LOB control before cluster version ready",
+            K(tenant_id), KCV(GET_MIN_CLUSTER_VERSION()));
+      } else {
+        ++applied_table_cnt;
+        if (OB_FAIL(apply_one_builtin_table_(tenant_id, schema_guard, entries[i], force_local))) {
+          LOG_WARN("apply one builtin table failed", KR(ret), K(tenant_id), "idx", i,
+              "table", entries[i].table_name_);
+        }
       }
     }
   }
-  FLOG_INFO("[USER_TABLE_DEF] apply finished", KR(ret), K(tenant_id), "table_cnt", cnt);
+  FLOG_INFO("[USER_TABLE_DEF] apply finished", KR(ret), K(tenant_id), K(applied_table_cnt));
   return ret;
 }
 

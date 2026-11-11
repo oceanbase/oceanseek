@@ -410,6 +410,23 @@ protected:
   virtual bool need_add_macro_cache(const blocksstable::MacroBlockId &macro_id) override;
 };
 
+// L2 uses offsets within the piece; remote reads add the object offset from the macro block ID.
+class ObSSExternalLobReader : public ObSSBaseReader
+{
+public:
+  ObSSExternalLobReader() : read_info_(nullptr) {}
+  int init(const blocksstable::ObStorageObjectReadInfo *read_info);
+protected:
+  virtual int get_read_device_and_fd(const blocksstable::MacroBlockId &macro_id,
+      const int64_t ls_epoch_id, common::ObIOInfo &io_info) override;
+  virtual bool is_read_macro_block_kvcache() const override { return false; }
+  virtual bool is_read_macro_cache() const override { return true; }
+  virtual bool need_adjust_read_size(const int64_t offset, const int64_t size) const override
+  { UNUSED(offset); UNUSED(size); return true; }
+private:
+  const blocksstable::ObStorageObjectReadInfo *read_info_;
+};
+
 class ObSSExternalFileReader : public ObSSBaseReader
 {
 public:

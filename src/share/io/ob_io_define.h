@@ -713,6 +713,7 @@ public:
   int try_alloc_buf_until_timeout(char *&io_buf);
   bool can_callback() const;
   void free_io_buffer();
+  int prepare_stat_buffer(ObIODFileStat *&statbuf);
   void inc_ref(const char *msg = nullptr);
   void dec_ref(const char *msg = nullptr);
   bool is_canceled() const;
@@ -767,6 +768,7 @@ protected:
   ObCurTraceId::TraceId trace_id_;
   int64_t part_id_;   // multipart upload's part id
   char *uri_cstr_;
+  ObIODFileStat *stat_buf_; // Constructed in the IO buffer and destroyed before freeing it.
 };
 
 typedef common::ObDList<ObIORequest> IOReqList;

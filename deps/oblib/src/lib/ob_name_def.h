@@ -462,6 +462,8 @@
 #define N_DBMS_LOB_CONVERTTOBLOB "dbms_lob_converttoblob"
 #define N_DBMS_LOB_CAST_CLOB_TO_BLOB "dbms_lob_cast_clob_to_blob"
 #define N_LOB_APPENDWRITE "lob_writeappend"
+#define N_EXTERNAL_LOB "external_lob"
+#define N_LOB_META "lob_meta"
 #define N_DBMS_LOB_CONVERT_CLOB_CHARSET "dbms_lob_convert_clob_charset"
 #define N_IP2INT "ip2int"
 #define N_INT2IP "int2ip"

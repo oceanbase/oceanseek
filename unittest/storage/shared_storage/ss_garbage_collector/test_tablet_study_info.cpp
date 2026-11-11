@@ -11,6 +11,7 @@
 #include "lib/time/ob_time_utility.h"
 #include "lib/utility/ob_sort.h"
 #include "lib/utility/utility.h"
+#include "share/inner_table/ob_inner_table_schema.h"
 #include "share/ob_thread_pool.h"
 #include "share/rc/ob_tenant_base.h"
 #define protected public
@@ -111,7 +112,7 @@ protected:
   {
     return service_.check_and_update_local_tablet_study_info(
         gc_tablet,
-        ObSSGCTabletStudyInfo(make_scn(minor_delta), major_snapshot),
+        ObSSGCTabletStudyInfo(make_scn(minor_delta), major_snapshot, SCN::max_scn(), INT64_MAX),
         ls_epoch);
   }
 
@@ -577,9 +578,10 @@ TEST_F(TestTabletStudyInfo, check_and_update)
 TEST_F(TestTabletStudyInfo, check_and_update_independent_high_watermarks)
 {
   const ObSSGCTablet gc_tablet = make_tablet(1);
-  const ObSSGCTabletStudyInfo invalid_study_info(SCN::min_scn(), 10);
-  const ObSSGCTabletStudyInfo no_minor_study_info(SCN::max_scn(), 20);
-  const ObSSGCTabletStudyInfo regressed_major_study_info(SCN::max_scn(), 10);
+  const ObSSGCTabletStudyInfo invalid_study_info(SCN::min_scn(), 10, SCN::max_scn(), INT64_MAX);
+  const ObSSGCTabletStudyInfo no_minor_study_info(SCN::max_scn(), 20, SCN::max_scn(), INT64_MAX);
+  const ObSSGCTabletStudyInfo regressed_major_study_info(
+      SCN::max_scn(), 10, SCN::max_scn(), INT64_MAX);
   ASSERT_EQ(OB_SUCCESS,
       set_current_tablet(gc_tablet, gc_tablet.transfer_scn_, false /* 非空壳 */));
   ASSERT_EQ(OB_INVALID_ARGUMENT,
@@ -603,8 +605,8 @@ TEST_F(TestTabletStudyInfo, zero_major_snapshot_does_not_update_high_watermark)
 {
   const ObSSGCTablet gc_tablet = make_tablet(1);
   const ObSSGCTablet no_dependency_tablet = make_tablet(2);
-  const ObSSGCTabletStudyInfo no_minor_dependency(SCN::max_scn(), 0);
-  const ObSSGCTabletStudyInfo physical_dependency(make_scn(120), 0);
+  const ObSSGCTabletStudyInfo no_minor_dependency(SCN::max_scn(), 0, SCN::max_scn(), INT64_MAX);
+  const ObSSGCTabletStudyInfo physical_dependency(make_scn(120), 0, SCN::max_scn(), INT64_MAX);
   ASSERT_EQ(OB_SUCCESS,
       service_.check_and_update_local_tablet_study_info(
           no_dependency_tablet, no_minor_dependency, TEST_LS_EPOCH));
@@ -662,7 +664,7 @@ TEST_F(TestTabletStudyInfo, newer_epoch_exact_erase_removes_old_ctx)
   const ObSSGCTablet transferred_tablet = make_tablet(2);
   const ObSSGCTablet other_ls_tablet(
       ObLSID(1002), ObTabletID(200002), make_scn(1));
-  const ObSSGCTabletStudyInfo transferred_study_info(make_scn(90), 9);
+  const ObSSGCTabletStudyInfo transferred_study_info(make_scn(90), 9, SCN::max_scn(), INT64_MAX);
   ASSERT_EQ(OB_SUCCESS,
       set_current_tablet(gc_tablet, gc_tablet.transfer_scn_, false /* 非空壳 */));
   ASSERT_EQ(OB_SUCCESS, check_and_update_study_info(gc_tablet, 100, 10));
@@ -690,7 +692,8 @@ TEST_F(TestTabletStudyInfo, ls_epoch_switch_resets_study_info)
   const ObSSGCTablet old_generation_tablet = make_tablet(2);
   const ObSSGCTablet other_ls_tablet(
       ObLSID(1002), ObTabletID(200002), make_scn(1));
-  const ObSSGCTabletStudyInfo old_generation_study_info(make_scn(90), 9);
+  const ObSSGCTabletStudyInfo old_generation_study_info(
+      make_scn(90), 9, SCN::max_scn(), INT64_MAX);
   ObSSGCTabletStudyInfo no_finite_study_info;
   no_finite_study_info.set_to_max();
   ASSERT_EQ(OB_SUCCESS, set_current_tablet(
@@ -798,7 +801,7 @@ TEST_F(TestTabletStudyInfo, higher_generation_keeps_study_info)
 
   ASSERT_EQ(OB_SUCCESS,
       study_processor.handle_tablet_exist_(
-          tablet_handle, gc_tablet, TEST_LS_EPOCH, study_results));
+          SCN::max_scn(), tablet_handle, gc_tablet, TEST_LS_EPOCH, study_results));
   expect_max_result(study_results);
   expect_study_info(gc_tablet, 100, 10);
 }
@@ -828,7 +831,7 @@ TEST_F(TestTabletStudyInfo, transfer_table_does_not_cache_until_refresh)
   for (int64_t i = 0; i < 2; ++i) {
     study_results.reuse();
     ASSERT_EQ(OB_SUCCESS, study_processor.handle_tablet_exist_(
-        before_refresh, gc_tablet, TEST_LS_EPOCH, study_results));
+        SCN::max_scn(), before_refresh, gc_tablet, TEST_LS_EPOCH, study_results));
     expect_min_result(study_results);
     expect_study_info_not_exist(gc_tablet);
     EXPECT_EQ(0, get_ls_study_info_ctx_count());
@@ -842,10 +845,17 @@ TEST_F(TestTabletStudyInfo, transfer_table_does_not_cache_until_refresh)
   after_refresh.get_obj()->tablet_meta_.min_minor_meta_scn_ = make_scn(100); // L < H
   after_refresh.get_obj()->tablet_meta_.min_inc_major_meta_scn_.set_max();
   after_refresh.get_obj()->table_store_cache_.min_major_snapshot_ = 10;
+  ObArenaAllocator schema_allocator;
+  share::schema::ObTableSchema table_schema;
+  ObStorageSchema storage_schema;
+  ASSERT_EQ(OB_SUCCESS, share::ObInnerTableSchema::all_tenant_profile_schema(table_schema));
+  ASSERT_EQ(OB_SUCCESS, storage_schema.init(schema_allocator, table_schema, lib::Worker::CompatMode::MYSQL));
+  after_refresh.get_obj()->storage_schema_addr_.ptr_ = &storage_schema;
+  DEFER({ after_refresh.get_obj()->storage_schema_addr_.ptr_ = nullptr; });
   ptr_handle.get_tablet_pointer()->set_obj(after_refresh);
   study_results.reuse();
   ASSERT_EQ(OB_SUCCESS, study_processor.handle_tablet_exist_(
-      after_refresh, gc_tablet, TEST_LS_EPOCH, study_results));
+      SCN::max_scn(), after_refresh, gc_tablet, TEST_LS_EPOCH, study_results));
   ASSERT_EQ(1, study_results.count());
   EXPECT_EQ(make_scn(100), study_results.at(0).study_info_.min_dep_meta_scn_);
   EXPECT_EQ(10, study_results.at(0).study_info_.min_major_snapshot_);
@@ -867,7 +877,7 @@ TEST_F(TestTabletStudyInfo, transfer_table_keeps_existing_study_info)
   tablet_handle.get_obj()->tablet_meta_.min_minor_meta_scn_ = make_scn(100);
 
   ASSERT_EQ(OB_SUCCESS, study_processor.handle_tablet_exist_(
-      tablet_handle, gc_tablet, TEST_LS_EPOCH, study_results));
+      SCN::max_scn(), tablet_handle, gc_tablet, TEST_LS_EPOCH, study_results));
   expect_min_result(study_results);
   expect_study_info(gc_tablet, 200, 20);
 }
@@ -881,11 +891,11 @@ TEST_F(TestTabletStudyInfo, transfer_table_preserves_reorganization_scn_checks)
   tablet_handle.get_obj()->tablet_meta_.transfer_info_.has_transfer_table_ = true;
 
   ASSERT_EQ(OB_SUCCESS, study_processor.handle_tablet_exist_(
-      tablet_handle, make_tablet(1), TEST_LS_EPOCH, study_results));
+      SCN::max_scn(), tablet_handle, make_tablet(1), TEST_LS_EPOCH, study_results));
   expect_max_result(study_results);
   study_results.reuse();
   ASSERT_EQ(OB_SUCCESS, study_processor.handle_tablet_exist_(
-      tablet_handle, make_tablet(3), TEST_LS_EPOCH, study_results));
+      SCN::max_scn(), tablet_handle, make_tablet(3), TEST_LS_EPOCH, study_results));
   expect_min_result(study_results);
   EXPECT_EQ(0, get_ls_study_info_ctx_count());
 }
@@ -903,7 +913,7 @@ TEST_F(TestTabletStudyInfo, tablet_missing_before_scan_returns_not_exist)
     study_results.reuse();
     ASSERT_EQ(OB_ENTRY_NOT_EXIST,
         study_processor.handle_tablet_exist_(
-            tablet_handle, gc_tablet, TEST_LS_EPOCH, study_results));
+            SCN::max_scn(), tablet_handle, gc_tablet, TEST_LS_EPOCH, study_results));
     EXPECT_EQ(0, study_results.count());
   }
 }
@@ -969,7 +979,7 @@ TEST_F(TestTabletStudyInfo, cleanup_keeps_uncertain_state)
 {
   const ObSSGCTablet current_tablet = make_tablet(1);
   const ObSSGCTablet requested_tablet = make_tablet(2);
-  const ObSSGCTabletStudyInfo study_info(make_scn(100), 10);
+  const ObSSGCTabletStudyInfo study_info(make_scn(100), 10, SCN::max_scn(), INT64_MAX);
   ASSERT_EQ(OB_SUCCESS,
       set_current_tablet(current_tablet, current_tablet.transfer_scn_, false /* 非空壳 */));
   ASSERT_EQ(OB_SUCCESS, check_and_update_study_info(current_tablet, 100, 10));
@@ -1022,8 +1032,9 @@ TEST_F(TestTabletStudyInfo, update_study_info_without_t3m_final_check)
 {
   const ObSSGCTablet current_tablet = make_tablet(1);
   const ObSSGCTablet requested_tablet = make_tablet(2);
-  const ObSSGCTabletStudyInfo study_info(make_scn(100), 10);
-  const ObSSGCTabletStudyInfo no_minor_study_info(SCN::max_scn(), INT64_MAX);
+  const ObSSGCTabletStudyInfo study_info(make_scn(100), 10, SCN::max_scn(), INT64_MAX);
+  const ObSSGCTabletStudyInfo no_minor_study_info(
+      SCN::max_scn(), INT64_MAX, SCN::max_scn(), INT64_MAX);
   ASSERT_EQ(OB_SUCCESS,
       set_current_tablet(current_tablet, current_tablet.transfer_scn_, true /* 空壳 */));
   EXPECT_EQ(OB_SUCCESS,
@@ -1052,7 +1063,7 @@ TEST_F(TestTabletStudyInfo, DISABLED_cleanup_with_concurrent_study_perf)
   int64_t cleanup_cost_us = 0;
   int64_t overlap_study_cnt = 0;
   const ObSSGCTablet gc_tablet = make_perf_tablet(0);
-  const ObSSGCTabletStudyInfo study_info(make_scn(100), 10);
+  const ObSSGCTabletStudyInfo study_info(make_scn(100), 10, SCN::max_scn(), INT64_MAX);
   ObTabletStudyCleanupPerfWorker worker(tenant_base_, service_, gc_tablet, study_info);
   ObArray<int64_t> &baseline_latencies = worker.get_baseline_latencies();
   ObArray<int64_t> &study_latencies = worker.get_study_latencies();

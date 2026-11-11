@@ -317,7 +317,7 @@ TEST_F(TestCDCLobSummaryCompatibility, parser_accepts_historical_invalid_type_su
   uint64_t char_len = 0;
   ObLobMetaExtraInfo extra_info;
   ASSERT_EQ(OB_SUCCESS, ObCDCLobAuxTableParser::decode_summary_value(
-      cache_value, byte_len, char_len, extra_info));
+      allocator, cache_value, byte_len, char_len, extra_info));
   EXPECT_EQ(8U, byte_len);
   EXPECT_EQ(8U, char_len);
   EXPECT_EQ(ObLobMetaExtraInfo::LOB_META_SUMMARY, extra_info.extra_info_type_);
@@ -326,9 +326,7 @@ TEST_F(TestCDCLobSummaryCompatibility, parser_accepts_historical_invalid_type_su
   EXPECT_EQ(ObLobLastWriteType::INSERT, extra_info.last_write_type_);
 }
 
-// 验证当前尚未支持的 OUT_TABLE Summary 仍返回 OB_NOT_SUPPORTED，
-// 且失败时不会发布 Summary，也不会残留 seq_id 或缓存值。
-TEST_F(TestCDCLobSummaryCompatibility, parser_rejects_out_table_summary)
+TEST_F(TestCDCLobSummaryCompatibility, parser_accepts_out_table_summary)
 {
   const char *extra_info_json =
       "{\"extra_info_type\":1,\"lob_chunk_type\":\"OUT_TABLE\","
@@ -340,11 +338,20 @@ TEST_F(TestCDCLobSummaryCompatibility, parser_rejects_out_table_summary)
   ObLobId lob_id;
   ObString seq_id = ObString::make_string("stale-seq-id");
   ObString cache_value = ObString::make_string("stale-cache-value");
-  EXPECT_EQ(OB_NOT_SUPPORTED, ObCDCLobAuxTableParser::parse_lob_aux_table_row(
+  ASSERT_EQ(OB_SUCCESS, ObCDCLobAuxTableParser::parse_lob_aux_table_row(
       ObCDCLobAuxTableType::META, cols_, allocator, need_publish, lob_id, seq_id, cache_value));
-  EXPECT_FALSE(need_publish);
-  EXPECT_TRUE(seq_id.empty());
-  EXPECT_TRUE(cache_value.empty());
+  EXPECT_TRUE(need_publish);
+  EXPECT_TRUE(expected_lob_id_ == lob_id);
+  EXPECT_EQ(0, expected_summary_seq_id_.compare(seq_id));
+  uint64_t byte_len = 0;
+  uint64_t char_len = 0;
+  ObLobMetaExtraInfo extra_info;
+  ASSERT_EQ(OB_SUCCESS, ObCDCLobAuxTableParser::decode_summary_value(
+      allocator, cache_value, byte_len, char_len, extra_info));
+  EXPECT_EQ(8U, byte_len);
+  EXPECT_EQ(8U, char_len);
+  EXPECT_EQ(2U, extra_info.chunk_count_);
+  EXPECT_TRUE(extra_info.lob_chunk_type_.out_table());
 }
 
 // 通过真实 ObCDCLobDataMerger 同步拼接路径验证历史 INVALID_TYPE 和当前 IN_TABLE Summary 都会放行，
@@ -390,7 +397,8 @@ TEST_F(TestCDCLobSummaryCompatibility, merger_keeps_invalid_type_summary_bounds)
 int main(int argc, char **argv)
 {
   oceanbase::common::ObLogger &logger = oceanbase::common::ObLogger::get_logger();
-  logger.set_file_name("test_cdc_lob_summary_compatibility.cpp.log", true);
+  system("rm -f ./test_cdc_lob_summary_compatibility.log*");
+  logger.set_file_name("test_cdc_lob_summary_compatibility.log", true);
   logger.set_log_level(OB_LOG_LEVEL_INFO);
   testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

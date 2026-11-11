@@ -19,6 +19,16 @@ namespace schema
 class ObTableSchema;
 }
 
+struct ObUserTableBuiltinLocalIndexEntry
+{
+  const char *table_name_;
+  const char *index_name_;
+  const char *const *column_names_;
+  int64_t column_count_;
+  const char *const *store_column_names_;
+  int64_t store_column_count_;
+};
+
 struct ObUserTableBuiltinSchemaEntry
 {
   const char *database_name_;
@@ -28,18 +38,26 @@ struct ObUserTableBuiltinSchemaEntry
 
 OB_INLINE int64_t get_user_table_builtin_schema_count()
 {
-  return 3;
+  return 4;
 }
 
 const ObUserTableBuiltinSchemaEntry *get_user_table_builtin_schema_entries();
 
+OB_INLINE int64_t get_user_table_builtin_local_index_count()
+{
+  return 2;
+}
+
+const ObUserTableBuiltinLocalIndexEntry *get_user_table_builtin_local_index_entries();
+
 static const char META_TENANT_BUILTIN_USER_TABLEGROUP_NAME[] = "ss_meta";
 static const char SYS_TENANT_BUILTIN_USER_TABLEGROUP_NAME[] = "ss_meta";
 
-// Builtin SS Meta user table names (see user_table_schema_def).
+// Builtin user table names (see user_table_schema_def).
 const char *const OB_ALL_SHARED_META_TNAME = "__all_shared_meta";
 const char *const OB_ALL_SHARED_META_CONTROL_TNAME = "__all_shared_meta_control";
 const char *const OB_ALL_SHARED_TIERED_META_TNAME = "__all_shared_tiered_meta";
+const char *const OB_ALL_OUTTABLE_LOB_CONTROL_TNAME = "__all_outtable_lob_control";
 
 // Sys/meta tenant builtin SS Meta user tables (see user_table_schema_def).
 bool is_shared_builtin_user_table(const uint64_t tenant_id, const common::ObString &table_name);
@@ -47,6 +65,7 @@ bool is_shared_builtin_user_table(const uint64_t tenant_id, const common::ObStri
 int all_shared_meta_schema(share::schema::ObTableSchema &table_schema);
 int all_shared_meta_control_schema(share::schema::ObTableSchema &table_schema);
 int all_shared_tiered_meta_schema(share::schema::ObTableSchema &table_schema);
+int all_outtable_lob_control_schema(share::schema::ObTableSchema &table_schema);
 
 } // namespace share
 } // namespace oceanbase

@@ -31,6 +31,7 @@ using share::OB_INVALID_DEST_ID;
 #include "mittest/simple_server/env/ob_simple_cluster_test_base.h"
 #include "observer/ob_server_event_history_table_operator.h"
 #include "sensitive_test/object_storage/object_storage_authorization_info.h"
+#include "share/ob_cluster_version.h"
 #include "share/rc/ob_tenant_base.h"
 #include "storage/blocksstable/ob_storage_cache_suite.h"
 #include "storage/blocksstable/ob_ss_obj_util.h"
@@ -43,6 +44,7 @@ using share::OB_INVALID_DEST_ID;
 #include "storage/ss_data_check/ob_ss_data_check_dag.h"
 #include "storage/ss_data_check/ob_ss_data_check_expected_producer.h"
 #include "storage/ss_data_check/ob_ss_data_check_meta_ref_checker.h"
+#include "storage/ss_data_check/ob_ss_data_check_macro_id_iterator.h"
 #include "storage/tablet/ob_sstablet_persister.h"
 #include "storage/tmp_file/ob_tmp_file_manager.h"
 #include "storage/tx_storage/ob_ls_service.h"
@@ -217,6 +219,7 @@ public:
       const uint64_t tenant_id,
       const SCN &snapshot_meta_scn,
       const ObTabletID &target_tablet_id,
+      ObIArray<MacroBlockId> &known_blocks,
       int &expand_ret);
   int evict_shared_object_caches_(
       const uint64_t tenant_id,
@@ -468,17 +471,14 @@ int TestSSDataCheckE2E::inspect_expected_snapshot_(
     ObSSDataCheckExpectedSnapshotStat &stat)
 {
   int ret = OB_SUCCESS;
+  const bool scan_lob_meta = (GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_6_3_1);
   bool source_end = false;
   ObSSDataCheckSharedMetaExpectedSource source;
   ObArenaAllocator batch_allocator(
       "DCE2EBatch", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id);
-  ObArenaAllocator tablet_allocator(
-      "DCE2ETablet", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id);
   ObSEArray<ObSSRawMetaRow, 16> rows;
-  ObSEArray<ObTabletBlockInfo, 64> block_infos;
   DataCheckNeverStopChecker stop_checker;
   rows.set_attr(ObMemAttr(tenant_id, "DCE2ERows"));
-  block_infos.set_attr(ObMemAttr(tenant_id, "DCE2EBlocks"));
   stat.reset();
 
   if (OB_FAIL(source.open(
@@ -504,22 +504,43 @@ int TestSSDataCheckE2E::inspect_expected_snapshot_(
       SCN reorganize_scn;
       SCN meta_scn;
       const ObSSRawMetaRow &row = rows.at(i);
-      tablet_allocator.reuse();
-      block_infos.reuse();
+      ObSSDataCheckMacroIDIterator iterator;
+      int init_ret = OB_SUCCESS;
+      int64_t known_block_idx = 0;
       if (OB_FAIL(ObSSMetaInfoUtil::parse_tablet_meta_key(
           row.meta_key_, parsed_ls_id, tablet_id,
           reorganize_scn, meta_scn))) {
         LOG_WARN("failed to parse shared meta tablet key", KR(ret), K(row));
-      } else if (OB_FAIL(
-          ObSSMetaTabletMacroIDIterator::collect_blocks_from_tablet_meta_value(
-              tablet_allocator, row.ls_id_, tablet_id, reorganize_scn,
-              row.meta_value_, false /*fill_occupy_size*/, block_infos))) {
-        LOG_WARN("failed to expand shared meta tablet value", KR(ret), K(row));
-      } else if (tablet_id == target_tablet_id) {
+      } else if (OB_SUCCESS != (init_ret = iterator.init(
+          ObSSGCTablet(row.ls_id_, tablet_id, reorganize_scn), row.meta_value_, scan_lob_meta))) {
+        LOG_WARN("failed to initialize shared meta macro iterator", KR(init_ret), K(row));
+        if (OB_OBJECT_NOT_EXIST != init_ret) {
+          ret = init_ret;
+        }
+      }
+      if (OB_SUCC(ret) && tablet_id == target_tablet_id) {
         ++stat.target_version_count_;
       }
-      for (int64_t j = 0; OB_SUCC(ret) && j < block_infos.count(); ++j) {
-        const MacroBlockId &candidate = block_infos.at(j).macro_id();
+      const ObIArray<ObTabletBlockInfo> &known_blocks = iterator.get_known_block_infos();
+      while (OB_SUCC(ret)) {
+        MacroBlockId candidate;
+        if (OB_OBJECT_NOT_EXIST == init_ret) {
+          // Inspect the known prefix, but preserve the incomplete-expansion error at the end.
+          if (known_block_idx < known_blocks.count()) {
+            candidate = known_blocks.at(known_block_idx++).macro_id();
+          } else {
+            ret = init_ret;
+            break;
+          }
+        } else if (OB_FAIL(iterator.get_next(candidate))) {
+          if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
+          } else {
+            // Keep the known prefix, but never treat incomplete expansion as ready.
+            LOG_WARN("failed to expand shared meta tablet value", KR(ret), K(row));
+          }
+          break;
+        }
         if (candidate.is_in_object_storage()
             && SSObjUtil::is_shared(candidate)
             && (SSObjUtil::is_macro(candidate)
@@ -676,9 +697,11 @@ int TestSSDataCheckE2E::get_tablet_expand_ret_(
     const uint64_t tenant_id,
     const SCN &snapshot_meta_scn,
     const ObTabletID &target_tablet_id,
+    ObIArray<MacroBlockId> &known_blocks,
     int &expand_ret)
 {
   int ret = OB_SUCCESS;
+  const bool scan_lob_meta = (GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_6_3_1);
   ObArenaAllocator allocator(
       "DCE2EExpand", OB_MALLOC_NORMAL_BLOCK_SIZE, tenant_id);
   ObSSRawMetaRow row;
@@ -686,9 +709,9 @@ int TestSSDataCheckE2E::get_tablet_expand_ret_(
   ObTabletID tablet_id;
   SCN reorganize_scn;
   SCN meta_scn;
-  ObSEArray<ObTabletBlockInfo, 64> block_infos;
+  ObSSDataCheckMacroIDIterator iterator;
   expand_ret = OB_SUCCESS;
-  block_infos.set_attr(ObMemAttr(tenant_id, "DCE2EExpand"));
+  known_blocks.reuse();
   if (OB_FAIL(get_target_tablet_row_(
       tenant_id, snapshot_meta_scn, target_tablet_id, allocator, row))) {
     LOG_WARN("failed to get expansion source row", KR(ret),
@@ -697,10 +720,30 @@ int TestSSDataCheckE2E::get_tablet_expand_ret_(
       row.meta_key_, parsed_ls_id, tablet_id, reorganize_scn, meta_scn))) {
     LOG_WARN("failed to parse expansion source row", KR(ret), K(row));
   } else {
-    expand_ret =
-        ObSSMetaTabletMacroIDIterator::collect_blocks_from_tablet_meta_value(
-            allocator, row.ls_id_, tablet_id, reorganize_scn,
-            row.meta_value_, false /*fill_occupy_size*/, block_infos);
+    expand_ret = iterator.init(
+        ObSSGCTablet(row.ls_id_, tablet_id, reorganize_scn), row.meta_value_, scan_lob_meta);
+    MacroBlockId macro_id;
+    const ObIArray<ObTabletBlockInfo> &blocks = iterator.get_known_block_infos();
+    for (int64_t i = 0; OB_SUCC(ret) && i < blocks.count(); ++i) {
+      if (OB_FAIL(known_blocks.push_back(blocks.at(i).macro_id()))) {
+        LOG_WARN("failed to save known tablet block", KR(ret), K(row));
+      }
+    }
+    if (OB_FAIL(ret)) {
+    } else if (OB_SUCCESS != expand_ret) {
+      const int next_ret = iterator.get_next(macro_id);
+      if (OB_NOT_INIT != next_ret || macro_id.is_valid()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("failed initialization must reject iteration", KR(ret), K(next_ret), K(macro_id));
+      }
+    } else {
+      while (OB_SUCCESS == expand_ret) {
+        expand_ret = iterator.get_next(macro_id);
+      }
+      if (OB_ITER_END == expand_ret) {
+        expand_ret = OB_SUCCESS;
+      }
+    }
   }
   return ret;
 }
@@ -1485,10 +1528,12 @@ TEST_F(TestSSDataCheckE2E,
       tenant_id, inline_table_store_item.get_macro_id(),
       inline_table_store_addr));
   int inline_expand_ret = OB_SUCCESS;
+  ObSEArray<MacroBlockId, 16> inline_known_blocks;
   ASSERT_EQ(OB_SUCCESS, get_tablet_expand_ret_(
       tenant_id, snapshot_meta_scn,
-      inline_target_tablet_id, inline_expand_ret));
+      inline_target_tablet_id, inline_known_blocks, inline_expand_ret));
   ASSERT_EQ(OB_OBJECT_NOT_EXIST, inline_expand_ret);
+  ASSERT_TRUE(has_exist_in_array(inline_known_blocks, inline_table_store_item.get_macro_id()));
   ASSERT_EQ(OB_SUCCESS, meta_ref_checker.check_reference_exist(
       inline_table_store_item, reference_exist));
   ASSERT_TRUE(reference_exist);

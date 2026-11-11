@@ -15,6 +15,7 @@
 #include "storage/lob/common/ob_lob_seq.h"
 #include "storage/lob/common/ob_lob_context.h"
 #include "storage/lob/store/ob_lob_persistent_adaptor.h"
+#include "storage/lob/store/ob_lob_outtable_io.h"
 #include "storage/lob/access/ob_lob_remote.h"
 
 namespace oceanbase
@@ -92,7 +93,7 @@ class ObLobChunkScanIter
 {
 public:
   ObLobChunkScanIter();
-  ~ObLobChunkScanIter() { reset(); }
+  ~ObLobChunkScanIter();
   void reset();
   int open(ObLobReadContext &read_ctx, ObPersistentLobAdaptor *adaptor);
   int get_next_chunk(ObLobChunk &chunk);
@@ -103,8 +104,10 @@ private:
   int prepare_piece_iter_();
   // Open the piece scan with two seq_id range endpoints
   int open_piece_iter_(const ObString &lower_seq_id, const ObString &upper_seq_id);
-  // slice piece data by meta_result.st_/len_ into chunk
-  int fill_chunk_(const ObLobMetaScanResult &meta_result, const ObLobPieceInfo &piece, ObLobChunk &chunk);
+  int read_in_table_data(const ObLobMetaScanResult &meta_result, ObString &data);
+  int read_outtable_data(const ObLobMetaScanResult &meta_result, ObString &data);
+  // Slice the current chunk using meta_result.st_ and meta_result.len_.
+  int fill_chunk_(const ObLobMetaScanResult &meta_result, const ObString &data, ObLobChunk &chunk);
 private:
   bool is_opened_;
   bool piece_opened_;
@@ -113,6 +116,7 @@ private:
   ObCollationType coll_type_;
   ObPersistentLobAdaptor *adaptor_;
   ObArenaAllocator allocator_;
+  ObLobOutTableChunkReader outtable_reader_;
   ObLobReadContext *read_ctx_;
   ObLobMetaScanIter meta_iter_;
   ObLobPieceTableIter *piece_iter_;
@@ -190,7 +194,7 @@ struct ObLobTargetWriteCtx
   ObLobTargetWriteCtx()
     : locator_allocator_(nullptr), result_allocator_(nullptr),
       coll_type_(CS_TYPE_INVALID), lob_col_idx_(OB_INVALID_INDEX_INT64),
-      lob_id_(), seq_no_()
+      lob_id_(), seq_no_(), lob_meta_tablet_id_(), external_lob_seq_id_(0)
   {}
   bool is_valid() const
   {
@@ -203,7 +207,8 @@ struct ObLobTargetWriteCtx
         && lob_id_.get_column_idx() == static_cast<uint64_t>(lob_col_idx_);
   }
   TO_STRING_KV(KP_(locator_allocator), KP_(result_allocator), K_(coll_type),
-               K_(lob_col_idx), K_(lob_id), K_(seq_no));
+               K_(lob_col_idx), K_(lob_id), K_(seq_no), K_(lob_meta_tablet_id),
+               K_(external_lob_seq_id));
 
   // locator 的生命周期必须覆盖目标主表 datum。
   ObIAllocator *locator_allocator_;
@@ -213,6 +218,9 @@ struct ObLobTargetWriteCtx
   int64_t lob_col_idx_;
   ObLobId lob_id_;
   transaction::ObTxSEQ seq_no_;
+  common::ObTabletID lob_meta_tablet_id_;
+  // External sequences consume a separate value from the target LOB ID cache.
+  uint64_t external_lob_seq_id_;
 };
 
 // 一个 ObLobWriteIter 只处理一个目标 out-row LOB。
@@ -246,6 +254,7 @@ public:
 
 private:
   int open_source_(const ObLobSourceReadCtx &source_ctx);
+  int open_external_(const ObLobSourceReadCtx &source_ctx, const ObLobTargetWriteCtx &target_ctx);
   int build_pending_locator_(const ObLobTargetWriteCtx &target_ctx);
   int get_next_piece_(ObLobWriteResult &result);
   int build_chunk_write_result_(ObLobChunk &chunk, ObLobWriteResult &result);

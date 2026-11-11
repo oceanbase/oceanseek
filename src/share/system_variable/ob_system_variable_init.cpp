@@ -11714,16 +11714,31 @@ static struct VarsInit{
     }();
 
     [&] (){
-      ObSysVars[850].default_value_ = "" ;
-      ObSysVars[850].info_ = "Access token for Unified Catalog requests in the current session" ;
-      ObSysVars[850].name_ = "_unified_catalog_token" ;
-      ObSysVars[850].data_type_ = ObVarcharType ;
-      ObSysVars[850].flags_ = ObSysVarFlag::SESSION_SCOPE | ObSysVarFlag::INVISIBLE | ObSysVarFlag::MYSQL_ONLY ;
-      ObSysVars[850].id_ = SYS_VAR__UNIFIED_CATALOG_TOKEN ;
+      ObSysVars[850].default_value_ = "2097152" ;
+      ObSysVars[850].info_ = "Default lob_intable_threshold in newly created tables, in bytes." ;
+      ObSysVars[850].name_ = "ob_default_lob_intable_threshold" ;
+      ObSysVars[850].data_type_ = ObIntType ;
+      ObSysVars[850].min_val_ = "0" ;
+      ObSysVars[850].max_val_ = "9223372036854775807" ;
+      ObSysVars[850].flags_ = ObSysVarFlag::GLOBAL_SCOPE | ObSysVarFlag::SESSION_SCOPE | ObSysVarFlag::MYSQL_ONLY ;
+      ObSysVars[850].id_ = SYS_VAR_OB_DEFAULT_LOB_INTABLE_THRESHOLD ;
+      cur_max_var_id = MAX(cur_max_var_id, static_cast<int64_t>(SYS_VAR_OB_DEFAULT_LOB_INTABLE_THRESHOLD)) ;
+      ObSysVarsIdToArrayIdx[SYS_VAR_OB_DEFAULT_LOB_INTABLE_THRESHOLD] = 850 ;
+      ObSysVars[850].base_value_ = "2097152" ;
+    ObSysVars[850].alias_ = "OB_SV_DEFAULT_LOB_INTABLE_THRESHOLD" ;
+    }();
+
+    [&] (){
+      ObSysVars[851].default_value_ = "" ;
+      ObSysVars[851].info_ = "Access token for Unified Catalog requests in the current session" ;
+      ObSysVars[851].name_ = "_unified_catalog_token" ;
+      ObSysVars[851].data_type_ = ObVarcharType ;
+      ObSysVars[851].flags_ = ObSysVarFlag::SESSION_SCOPE | ObSysVarFlag::INVISIBLE | ObSysVarFlag::MYSQL_ONLY ;
+      ObSysVars[851].id_ = SYS_VAR__UNIFIED_CATALOG_TOKEN ;
       cur_max_var_id = MAX(cur_max_var_id, static_cast<int64_t>(SYS_VAR__UNIFIED_CATALOG_TOKEN)) ;
-      ObSysVarsIdToArrayIdx[SYS_VAR__UNIFIED_CATALOG_TOKEN] = 850 ;
-      ObSysVars[850].base_value_ = "" ;
-    ObSysVars[850].alias_ = "OB_SV__UNIFIED_CATALOG_TOKEN" ;
+      ObSysVarsIdToArrayIdx[SYS_VAR__UNIFIED_CATALOG_TOKEN] = 851 ;
+      ObSysVars[851].base_value_ = "" ;
+    ObSysVars[851].alias_ = "OB_SV__UNIFIED_CATALOG_TOKEN" ;
     }();
 
     if (cur_max_var_id >= ObSysVarFactory::OB_MAX_SYS_VAR_ID) { 
@@ -11732,7 +11747,7 @@ static struct VarsInit{
   }
 }vars_init;
 
-static int64_t var_amount = 851;
+static int64_t var_amount = 852;
 
 int64_t ObSysVariables::get_all_sys_var_count(){ return ObSysVarFactory::ALL_SYS_VARS_COUNT;}
 ObSysVarClassType ObSysVariables::get_sys_var_id(int64_t i){ return ObSysVars[i].id_;}

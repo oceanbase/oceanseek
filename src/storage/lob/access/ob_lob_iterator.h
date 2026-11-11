@@ -8,8 +8,10 @@
 
 #include "lib/alloc/alloc_struct.h"
 #include "lib/allocator/page_arena.h"
+#include "lib/restore/ob_storage_info.h"
 #include "lib/string/ob_string.h"
 #include "lib/charset/ob_charset.h"
+#include "storage/blocksstable/ob_storage_object_handle.h"
 #include "storage/lob/common/ob_lob_context.h"
 #include "storage/lob/store/ob_lob_meta.h"
 #include "storage/lob/store/ob_lob_aux_manager.h"
@@ -17,6 +19,11 @@
 
 namespace oceanbase
 {
+namespace common
+{
+class ObObjectStorageInfo;
+}
+
 namespace storage
 {
 
@@ -54,6 +61,12 @@ protected:
                            const ObCollationType cs_type,
                            const int64_t byte_length,
                            int64_t &aligned_byte_length);
+  // Compute both byte and character lengths while splitting chunks sequentially to avoid rescanning.
+  static int align_forward_chunk_(const ObString &data,
+                                  const ObCollationType cs_type,
+                                  const int64_t byte_length,
+                                  int64_t &aligned_byte_length,
+                                  int64_t &aligned_char_length);
   // @brief 使用 data 填充 buffer，data 若有剩余，则保存在 remain_data 里面
   // @param buffer[out]，需要提前分配好内存，拷贝的输出
   // @param data[in]，输入数据
@@ -64,6 +77,8 @@ protected:
   virtual int get_next_chunk_impl_(ObLobChunk &chunk, const int64_t chunk_size) = 0;
 
 protected:
+  static constexpr int64_t OB_MIN_CHUNK_SIZE = 1024; // 1K
+  static constexpr int64_t OB_MAX_CHUNK_SIZE = 2L * 1024 * 1024; // 2M
   ObCollationType cs_type_;
   bool is_reverse_;
   bool is_end_;
@@ -161,8 +176,8 @@ private:
 
 private:
   common::ObIAllocator *allocator_;
-  // 迭代器按顺序消费两个缓冲区。当前追加路径中，first_buffer_ 保存旧的行内 LOB 数据
-  // （旧 LOB 为行外格式时为空），second_buffer_ 保存新增数据。
+  // The iterator consumes two buffers in order. first_buffer_ stores old in-row data or a partially filled
+  // tail chunk, while second_buffer_ stores the appended data.
   ObString first_buffer_;
   ObString second_buffer_;
   int64_t first_buffer_pos_;
@@ -171,6 +186,64 @@ private:
   ObString buffer_;
 
   DISALLOW_COPY_AND_ASSIGN(ObLobAppendSourceIter);
+};
+
+// Compute pieces and IDs in the declared remote range; do not allocate or materialize macroblocks.
+class ObExternalLobMacroIterator
+{
+public:
+  static constexpr uint64_t PIECE_SIZE = 2UL * 1024 * 1024;
+  static constexpr uint64_t MAX_PIECE_COUNT = 64UL * 1024;
+
+  ObExternalLobMacroIterator() { reset(); }
+  int init(uint64_t tablet_id, uint64_t seq_id, uint64_t offset, uint64_t length);
+  int get_next(blocksstable::MacroBlockId &macro_id);
+  void reset();
+
+private:
+  uint64_t tablet_id_;
+  uint64_t seq_id_;
+  uint64_t next_offset_;
+  uint64_t end_offset_;
+  bool is_inited_;
+};
+
+// External and Internal outrow use separate readers; results are always raw binary data.
+class ObExternalLobQueryIter final : public ObLobQueryIter
+{
+public:
+  ObExternalLobQueryIter();
+  virtual ~ObExternalLobQueryIter() { reset(); }
+  int open(const ObLobReadContext &read_ctx,
+           const common::ObExternalBlobInfo &external_info,
+           uint64_t tablet_id,
+           uint64_t seq_id,
+           const common::ObObjectStorageInfo &access_info);
+  virtual int get_next_row(common::ObString &buffer) override;
+  virtual void reset() override;
+
+private:
+  int get_next_block(ObString &block_data);
+  int check_etag_still_match();
+  virtual int get_next_chunk_impl_(ObLobChunk &chunk, int64_t chunk_size) override;
+
+private:
+  ObArenaAllocator allocator_;
+  common::ObExternalBlobInfo external_info_;
+  ObExternalLobMacroIterator piece_iter_;
+  common::ObObjectStorageInfo access_info_;
+  blocksstable::ObStorageObjectHandle io_handle_;
+  uint64_t tenant_id_;
+  uint64_t read_start_;
+  uint64_t read_end_;
+  uint64_t read_pos_;
+  int64_t timeout_us_;
+  char *io_buffer_;
+  common::ObString remaining_data_;
+  common::ObString buffer_;
+  bool reached_eof_;
+
+  DISALLOW_COPY_AND_ASSIGN(ObExternalLobQueryIter);
 };
 
 }  // storage

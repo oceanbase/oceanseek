@@ -143,6 +143,7 @@ int ObExprCast::get_cast_string_len(ObExprResType &type1,
     case ObTextType:
     case ObMediumTextType:
     case ObLongTextType:
+    case ObExtendBLobType:
     case ObVarcharType:
     case ObCharType:
     case ObHexStringType:

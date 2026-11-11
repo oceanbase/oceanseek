@@ -6158,6 +6158,7 @@ int ObLSTabletService::process_lob_before_update(
             } else if (new_datum.is_null() ||
                        new_datum.is_nop_value() ||
                        new_lob.is_full_temp_lob() ||
+                       new_lob.is_external_temp_lob() || // Replace new External refs normally.
                        new_lob.is_persist_lob() ||
                        (new_lob.is_lob_disk_locator() && new_lob.has_inrow_data())) {
               if (OB_FAIL(ObLobTabletDmlHelper::update_before(
@@ -7133,7 +7134,8 @@ int ObLSTabletService::delete_lob_tablet_rows(
       if (column.col_type_.is_lob_storage()) {
         blocksstable::ObStorageDatum &datum = datum_row.storage_datums_[i];
         ObLobDeleteContext del_ctx;
-        if (OB_FAIL(ObLobTabletDmlHelper::delete_lob_col(run_ctx, datum_row, i, datum, del_ctx))) {
+        if (OB_FAIL(ObLobTabletDmlHelper::delete_lob_col(run_ctx, datum_row, i, datum, del_ctx,
+            run_ctx.get_delete_old_row_log_column_idxs()))) {
           LOG_WARN("[STORAGE_LOB]failed to erase lob col.", K(ret), K(i), K(datum_row));
         }
       }
@@ -10032,12 +10034,9 @@ int ObLSTabletService::process_lob_after_update(
     blocksstable::ObDatumRow *new_datum_rows)
 {
   int ret = OB_SUCCESS;
-  uint64_t lob_meta_table_id = OB_INVALID_ID;
-  uint64_t lob_piece_table_id = OB_INVALID_ID;
-  for (int64_t i = 0;
-      OB_SUCC(ret) && (i < run_ctx.lob_dml_ctx_.insert_task_count());
-      ++i) {
-    const ObLobDmlTask &task = run_ctx.lob_dml_ctx_.insert_task_array_.at(i);
+  ObLobTabletDmlCtx &lob_dml_ctx = run_ctx.lob_dml_ctx_;
+  for (int64_t i = 0; OB_SUCC(ret) && (i < lob_dml_ctx.insert_task_count()); ++i) {
+    const ObLobDmlTask &task = lob_dml_ctx.insert_task_array_.at(i);
     if (task.col_idx_ >= run_ctx.col_descs_->count() || task.row_idx_ >= row_count) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("col idx or row idx is invalid", K(ret), K(task), KPC(run_ctx.col_descs_));
@@ -10059,17 +10058,14 @@ int ObLSTabletService::process_lob_after_update(
     }
   }
 
-  if (OB_SUCC(ret) && !run_ctx.lob_dml_ctx_.ext_info_log_task_empty()
+  if (OB_SUCC(ret) && !lob_dml_ctx.ext_info_log_task_empty()
       && OB_FAIL(ObLobUtil::get_lob_aux_table_ids(
-          run_ctx, lob_meta_table_id, lob_piece_table_id))) {
+          run_ctx, lob_dml_ctx.lob_meta_table_id_, lob_dml_ctx.lob_piece_table_id_))) {
     LOG_WARN("get lob auxiliary table ids for ext info log failed", KR(ret),
-        K(lob_meta_table_id), K(lob_piece_table_id));
+        K(lob_dml_ctx.lob_meta_table_id_), K(lob_dml_ctx.lob_piece_table_id_));
   }
-  for (int64_t i = 0;
-      OB_SUCC(ret) && (i < run_ctx.lob_dml_ctx_.ext_info_log_task_count());
-      ++i) {
-    const ObLobExtInfoLogTask &task =
-        run_ctx.lob_dml_ctx_.ext_info_log_task_array_.at(i);
+  for (int64_t i = 0; OB_SUCC(ret) && (i < lob_dml_ctx.ext_info_log_task_count()); ++i) {
+    const ObLobExtInfoLogTask &task = lob_dml_ctx.ext_info_log_task_array_.at(i);
     if (OB_UNLIKELY(!task.is_valid()
         || (task.col_idx_ < 0)
         || (task.row_idx_ < 0)
@@ -10077,15 +10073,16 @@ int ObLSTabletService::process_lob_after_update(
         || (task.row_idx_ >= row_count))) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid lob ext info log task", KR(ret), K(i), K(task), K(row_count));
-    } else if (OB_FAIL(ObLobTabletDmlHelper::register_lob_ext_info_log(
-        run_ctx, old_datum_rows[task.row_idx_], task,
-        lob_meta_table_id, lob_piece_table_id))) {
+    } else if (OB_FAIL(ObLobTabletDmlHelper::try_register_lob_ext_info_log(
+        run_ctx, old_datum_rows[task.row_idx_], task.col_idx_, task.lob_operation_seq_no_, false/*is_delete*/,
+        lob_dml_ctx.lob_meta_table_id_, lob_dml_ctx.lob_piece_table_id_,
+        nullptr/*old_row_log_column_idxs*/))) {
       LOG_WARN("register lob ext info log failed", KR(ret), K(i), K(task),
-          K(lob_meta_table_id), K(lob_piece_table_id));
+          K(lob_dml_ctx.lob_meta_table_id_), K(lob_dml_ctx.lob_piece_table_id_));
     }
   }
   if (OB_SUCC(ret)) {
-    run_ctx.lob_dml_ctx_.reuse();
+    lob_dml_ctx.reuse();
   }
   return ret;
 }

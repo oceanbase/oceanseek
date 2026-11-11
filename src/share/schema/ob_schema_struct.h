@@ -368,6 +368,7 @@ bool is_index_table(const ObTableType table_type);
 bool is_aux_lob_meta_table(const ObTableType table_type);
 bool is_aux_lob_piece_table(const ObTableType table_type);
 bool is_aux_lob_table(const ObTableType table_type);
+bool is_aux_outtable_lob_control_table(const ObTableType table_type);
 bool is_mlog_table(const ObTableType table_type);
 
 const int64_t OB_MLOG_TABLE_CNT = 1;

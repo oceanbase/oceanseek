@@ -18,6 +18,7 @@
 #include "storage/blocksstable/ob_object_manager.h"
 #include "storage/ss_garbage_collector/ob_ss_gc_define.h"
 #include "storage/garbage_collector/ob_mark_sweep_pipeline.h"
+#include "storage/ss_garbage_collector/user_data_gc_dag_task/ob_ss_outtable_lob_user_gc_define.h"
 
 namespace oceanbase
 {
@@ -179,6 +180,28 @@ public:
   common::ObArray<share::SCN> meta_scns_;
 };
 
+struct ObSSLobMetaGCDiagRows final
+{
+public:
+  ObSSLobMetaGCDiagRows();
+  ~ObSSLobMetaGCDiagRows() { reset(); }
+  void reset() { macro_ids_.reset(); }
+  TO_STRING_KV("macro_cnt", macro_ids_.count());
+public:
+  common::ObArray<blocksstable::MacroBlockId> macro_ids_;
+};
+
+struct ObSSLobCtrlGCDiagRows final
+{
+public:
+  ObSSLobCtrlGCDiagRows();
+  ~ObSSLobCtrlGCDiagRows() { reset(); }
+  void reset() { rows_.reset(); }
+  TO_STRING_KV("row_cnt", rows_.count());
+public:
+  common::ObArray<ObSSOuttableLobCtrlCandidate> rows_;
+};
+
 // Raw Study watermarks from one compute node; not the GC-merged values.
 struct ObSSMarkSweepDiagStudyNode final
 {
@@ -236,7 +259,7 @@ class ObSSMarkSweepDiagMgr final
 {
 public:
   static const int64_t GROUP_CNT = 2; // DEL / KEPT
-  static const int64_t TYPE_CNT = 3;  // MACROS / TABLET_META_SCNS / STUDY_RESULTS
+  static const int64_t TYPE_CNT = static_cast<int64_t>(ObSSMarkSweepDiagFileType::MAX);
   static const int64_t DEFAULT_BUCKET_CNT = 100;
 
 public:
@@ -270,6 +293,18 @@ public:
   int write_tablet_meta_scns(const ObMarkSweepGroupType group,
                              const ObSSGCTablet &tablet,
                              const common::ObIArray<share::SCN> &meta_scns);
+  int write_lob_meta_kept(
+      const common::ObIArray<blocksstable::MacroBlockId> &macro_ids);
+  int write_lob_meta_kept_file(
+      const ObSortedFileInfo &file,
+      const int64_t file_buf_size);
+  int write_lob_ctrl_rows(
+      const ObSSMarkSweepDiagFileType type,
+      const common::ObIArray<ObSSOuttableLobCtrlCandidate> &rows);
+  int write_lob_ctrl_file(
+      const ObSSMarkSweepDiagFileType type,
+      const ObSSLobCtrlGCScanFile &file,
+      const int64_t file_buf_size);
   int write_tablets_study_results(
       const int64_t bucket,
       const char *buf,
@@ -295,6 +330,11 @@ public:
                                   ObSSMarkSweepDiagTabletMacros &out);
   static int decode_meta_scns_record(const common::ObString &rec,
                                      ObSSMarkSweepTabletMetaScns &out);
+  static int decode_lob_meta_kept_record(const common::ObString &rec,
+                                         ObSSLobMetaGCDiagRows &out);
+  static int decode_lob_ctrl_record(const common::ObString &rec,
+                                    ObSSLobCtrlGCDiagRows &out);
+  static bool is_lob_ctrl_type(const ObSSMarkSweepDiagFileType type);
   static int get_study_record_size(
       const ObSSGCTablet &tablet,
       const common::ObIArray<ObSSMarkSweepDiagStudyNode> &study_results,
@@ -404,12 +444,24 @@ private:
                          const ObSSMarkSweepDiagFileType type,
                          const int64_t bucket) const;
   int64_t calc_bucket_(const ObSSGCTablet &tablet) const;
+  int64_t calc_lob_bucket_(const blocksstable::MacroBlockId &macro_id) const;
   // serialize one record (tablet + items) and append it to its bucket diag_file under the lock.
   int write_record_(const ObMarkSweepGroupType group,
                     const ObSSMarkSweepDiagFileType type,
                     const ObSSGCTablet &tablet,
                     const char *buf,
                     const int64_t len);
+  int write_record_(const ObSSMarkSweepDiagFileType type,
+                    const int64_t bucket,
+                    const char *buf,
+                    const int64_t len);
+  int write_lob_meta_kept_record_(
+      const int64_t bucket,
+      const common::ObIArray<blocksstable::MacroBlockId> &macro_ids);
+  int write_lob_ctrl_record_(
+      const ObSSMarkSweepDiagFileType type,
+      const int64_t bucket,
+      const common::ObIArray<ObSSOuttableLobCtrlCandidate> &rows);
   int ensure_open_(const ObMarkSweepGroupType group,
                    const ObSSMarkSweepDiagFileType type,
                    const int64_t bucket,

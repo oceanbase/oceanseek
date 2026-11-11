@@ -492,7 +492,8 @@ int ObAllBalanceGroupBuilder::scan_bg_lite_tables_(ObBgLiteBuildCtx &ctx)
       LOG_WARN("exist_refactored failed", KR(ret), K(tmp_ret), KPC(lite_row));
     } else if (!(lite_row->is_user_table()
                  || ObSimpleTableSchemaV2::is_global_index_table(lite_row->index_type_)
-                 || lite_row->is_tmp_table())) {
+                 || lite_row->is_tmp_table()
+                 || (!is_sys_tenant(tenant_id_) && is_aux_outtable_lob_control_table(lite_row->table_type_)))) {
       // align need_balance_table()
     } else if (PARTITION_LEVEL_ZERO == lite_row->part_level_) {
       // table_name_ is deep-copied into the schema's allocator. External allocator

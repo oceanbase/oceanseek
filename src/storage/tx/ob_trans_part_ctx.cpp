@@ -12030,5 +12030,44 @@ int ObPartTransCtx::check_replay_incomplete_when_callback_accumulated(const int1
   return ret;
 }
 
+int ObPartTransCtx::submit_lob_outtable_data_log(
+    const uint64_t lob_aux_table_id,
+    const ObTxSEQ &lob_operation_seq_no,
+    const ObString &seq_id,
+    const ObLobId &lob_id,
+    const blocksstable::MacroBlockId &macro_id,
+    const bool is_logging,
+    const ObString &data,
+    share::SCN &scn)
+{
+  int ret = OB_SUCCESS;
+  ObTxLogBlock log_block;
+  ObTxLobOutTableDataLog::ConstructArg construct_arg(
+      lob_aux_table_id, lob_operation_seq_no, seq_id, lob_id, macro_id, is_logging, data);
+  ObTxLobOutTableDataLog::SubmitArg submit_arg;
+  ObTxLobOutTableDataLog log(construct_arg);
+  submit_arg.reset();
+  submit_arg.replay_barrier_type_ = logservice::ObReplayBarrierType::NO_NEED_BARRIER;
+  submit_arg.replay_hint_ = trans_id_.get_id();
+  submit_arg.log_cb_ = nullptr;
+  submit_arg.base_scn_ = share::SCN::min_scn();
+  submit_arg.suggested_buf_size_ = log.get_serialize_size() + 200;
+  ObTxCtxLogOperator<ObTxLobOutTableDataLog> log_op(
+      this, &log_block, &construct_arg, submit_arg);
+  if (OB_UNLIKELY(OB_INVALID_ID == lob_aux_table_id || !lob_operation_seq_no.is_valid()
+                  || seq_id.empty() || !lob_id.is_valid() || !macro_id.is_valid()
+                  || (is_logging && data.empty()) || (!is_logging && !data.empty()))) {
+    ret = OB_INVALID_ARGUMENT;
+    TRANS_LOG(WARN, "invalid lob outtable data log argument", KR(ret), K(construct_arg), KPC(this));
+  } else if (OB_FAIL(log_op(ObTxLogOpType::SUBMIT))) {
+    if (OB_TX_NOLOGCB != ret) {
+      TRANS_LOG(WARN, "submit lob outtable data log failed", KR(ret), K(construct_arg), KPC(this));
+    }
+  } else {
+    scn = log_op.get_scn();
+  }
+  return ret;
+}
+
 } // namespace transaction
 } // namespace oceanbase

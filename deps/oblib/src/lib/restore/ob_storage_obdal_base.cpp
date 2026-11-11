@@ -786,6 +786,8 @@ ObStorageObDalReader::ObStorageObDalReader()
   : ObStorageObDalBase(),
     is_opened_(false),
     has_meta_(false),
+    has_if_match_etag_(false),
+    if_match_etag_(),
     file_length_(-1),
     opendal_reader_(nullptr)
 {}
@@ -800,9 +802,10 @@ ObStorageObDalReader::~ObStorageObDalReader()
 void ObStorageObDalReader::reset()
 {
   int ret = OB_SUCCESS;
-  ObStorageObDalBase::reset();
   is_opened_ = false;
   has_meta_ = false;
+  has_if_match_etag_ = false;
+  if_match_etag_.reset();
   file_length_ = -1;
   if (opendal_reader_ != nullptr) {
     if (OB_FAIL(ObDalAccessor::obdal_reader_free(opendal_reader_))) {
@@ -810,6 +813,7 @@ void ObStorageObDalReader::reset()
     } 
     opendal_reader_ = nullptr;
   }
+  ObStorageObDalBase::reset();
 }
 
 
@@ -849,6 +853,23 @@ int ObStorageObDalReader::open(
   return ret;
 }
 
+int ObStorageObDalReader::set_if_match_etag(const char *etag)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_opened_)) {
+    ret = OB_NOT_INIT;
+    OB_LOG(WARN, "obdal reader not opened", K(ret));
+  } else if (OB_ISNULL(etag) || OB_UNLIKELY(0 == STRLEN(etag)) || OB_UNLIKELY(has_meta_)) {
+    ret = OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "invalid argument", K(ret), KP(etag));
+  } else if (OB_FAIL(ob_write_string(allocator_, ObString(etag), if_match_etag_, true/*c_style*/))) {
+    OB_LOG(WARN, "failed to copy if-match etag", K(ret));
+  } else {
+    has_if_match_etag_ = true;
+  }
+  return ret;
+}
+
 int ObStorageObDalReader::pread(
     char *buf, 
     const int64_t buf_size, 
@@ -877,6 +898,12 @@ int ObStorageObDalReader::pread(
     if (OB_FAIL(ret)) {
     } else if (get_data_size == 0) {
       read_size = 0;
+    } else if (has_if_match_etag_) {
+      if (OB_FAIL(ObDalAccessor::obdal_operator_read_with_if_match(
+          op_, object_.ptr(), if_match_etag_.ptr(), buf, get_data_size, offset, read_size))) {
+        OB_LOG(WARN, "failed to read object with if-match from obdal", K(ret), K(bucket_), K(object_),
+            K(offset), K(buf_size), K(has_meta_), K(file_length_));
+      }
     } else if (OB_FAIL(ObDalAccessor::obdal_reader_read(opendal_reader_, buf, get_data_size, offset, read_size))) {
       OB_LOG(WARN, "failed to read object from obdal", K(ret), K(bucket_), K(object_), 
           K(offset), K(buf_size), K(has_meta_), K(file_length_));

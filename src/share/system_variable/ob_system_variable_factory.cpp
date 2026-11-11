@@ -1111,6 +1111,7 @@ const char *ObSysVarFactory::SYS_VAR_NAMES_SORTED_BY_NAME[] = {
   "ob_compatibility_mode",
   "ob_compatibility_version",
   "ob_default_lob_inrow_threshold",
+  "ob_default_lob_intable_threshold",
   "ob_early_lock_release",
   "ob_enable_aggregation_pushdown",
   "ob_enable_index_direct_select",
@@ -1965,6 +1966,7 @@ const ObSysVarClassType ObSysVarFactory::SYS_VAR_IDS_SORTED_BY_NAME[] = {
   SYS_VAR_OB_COMPATIBILITY_MODE,
   SYS_VAR_OB_COMPATIBILITY_VERSION,
   SYS_VAR_OB_DEFAULT_LOB_INROW_THRESHOLD,
+  SYS_VAR_OB_DEFAULT_LOB_INTABLE_THRESHOLD,
   SYS_VAR_OB_EARLY_LOCK_RELEASE,
   SYS_VAR_OB_ENABLE_AGGREGATION_PUSHDOWN,
   SYS_VAR_OB_ENABLE_INDEX_DIRECT_SELECT,
@@ -3127,6 +3129,7 @@ const char *ObSysVarFactory::SYS_VAR_NAMES_SORTED_BY_ID[] = {
   "ap_query_replica_fallback",
   "_enable_catalog_fusion",
   "_show_sync_placeholder_table",
+  "ob_default_lob_intable_threshold",
   "_unified_catalog_token"
 };
 
@@ -4182,6 +4185,7 @@ int ObSysVarFactory::create_all_sys_vars()
         + sizeof(ObSysVarApQueryReplicaFallback)
         + sizeof(ObSysVarEnableCatalogFusion)
         + sizeof(ObSysVarShowSyncPlaceholderTable)
+        + sizeof(ObSysVarObDefaultLobIntableThreshold)
         + sizeof(ObSysVarUnifiedCatalogToken)
         ;
     void *ptr = NULL;
@@ -11839,6 +11843,15 @@ int ObSysVarFactory::create_all_sys_vars()
       } else {
         store_buf_[ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(SYS_VAR__SHOW_SYNC_PLACEHOLDER_TABLE))] = sys_var_ptr;
         ptr = (void *)((char *)ptr + sizeof(ObSysVarShowSyncPlaceholderTable));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarObDefaultLobIntableThreshold())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarObDefaultLobIntableThreshold", K(ret));
+      } else {
+        store_buf_[ObSysVarsToIdxMap::get_store_idx(static_cast<int64_t>(SYS_VAR_OB_DEFAULT_LOB_INTABLE_THRESHOLD))] = sys_var_ptr;
+        ptr = (void *)((char *)ptr + sizeof(ObSysVarObDefaultLobIntableThreshold));
       }
     }
     if (OB_SUCC(ret)) {
@@ -21207,6 +21220,17 @@ int ObSysVarFactory::create_sys_var(ObIAllocator &allocator_, ObSysVarClassType 
       } else if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarShowSyncPlaceholderTable())) {
         ret = OB_ALLOCATE_MEMORY_FAILED;
         LOG_ERROR("fail to new ObSysVarShowSyncPlaceholderTable", K(ret));
+      }
+      break;
+    }
+    case SYS_VAR_OB_DEFAULT_LOB_INTABLE_THRESHOLD: {
+      void *ptr = NULL;
+      if (OB_ISNULL(ptr = allocator_.alloc(sizeof(ObSysVarObDefaultLobIntableThreshold)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to alloc memory", K(ret), K(sizeof(ObSysVarObDefaultLobIntableThreshold)));
+      } else if (OB_ISNULL(sys_var_ptr = new (ptr)ObSysVarObDefaultLobIntableThreshold())) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("fail to new ObSysVarObDefaultLobIntableThreshold", K(ret));
       }
       break;
     }

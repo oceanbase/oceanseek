@@ -302,6 +302,7 @@ protected:
   // hence the caller must ensure the validity of the read range during pread operations.
   int open_for_util(void *&ctx);
   int open_for_reader(const char *pathname, void *&ctx, const bool head_meta = true);
+  int open_for_reader(const char *pathname, void *&ctx, const bool head_meta, const char *etag);
   int open_for_adaptive_reader_(const char *pathname, void *&ctx);
   int open_for_overwriter(const char *pathname, void*& ctx);
   int open_for_appender(const char *pathname, ObIODOpts *opts, void*& ctx);
@@ -309,6 +310,7 @@ protected:
   int open_for_parallel_multipart_writer_(const char *pathname, void *&ctx);
   int open_for_buffered_multipart_writer_(const char *pathname, void *&ctx);
   int open_for_async_reader(const char *pathname, void *&ctx, const bool head_meta = true);
+  int open_for_async_reader(const char *pathname, void *&ctx, const bool head_meta, const char *etag);
   int open_for_async_writer(const char *pathname, void *&ctx);
   int open_for_async_direct_multiwriter(const char *pathname, void *&ctx);
   int open_for_async_buffered_multiwriter(const char *pathname, void *&ctx);

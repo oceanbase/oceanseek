@@ -533,6 +533,17 @@ int ObDirManager::create_tenant_dir(const uint64_t tenant_id, const int64_t tena
                                                "%02lX", ObStorageObjectType::EXTERNAL_TABLE_FILE))) {
     LOG_WARN("fail to create scatter dir", KR(ret), K(dir_path));
   }
+  // External LOBs create only evictable local cache directories, not remote objects.
+  dir_path[0] = '\0';
+  if (FAILEDx(get_external_lob_cache_dir(dir_path, sizeof(dir_path), tenant_id, tenant_epoch_id))) {
+    LOG_WARN("failed to get external lob cache directory", KR(ret), K(tenant_id), K(tenant_epoch_id));
+  } else if (OB_FAIL(ObDirManager::create_dir(dir_path))) {
+    LOG_WARN("failed to create external lob cache directory", KR(ret), K(dir_path));
+  }
+  if (FAILEDx(ObDirManager::create_scatter_dir(dir_path, EXTERNAL_LOB_SCATTER_DIR_NUM, "%02lX",
+                                               ObStorageObjectType::SHARED_EXTERNAL_LOB_DATA_MACRO))) {
+    LOG_WARN("failed to create external lob cache scatter directories", KR(ret), K(dir_path));
+  }
   // step 11.1: create tenant_id_epoch_id/shared_inc_major_macro_cache/ directory
   // Note: shared_inc_major_macro_cache/ is the entry dir for MACRO_BLOCK calc_disk_space, it should not be counted in memory
   dir_path[0] = '\0';
@@ -2028,6 +2039,26 @@ int ObDirManager::get_external_table_file_dir(
   } else if (OB_FAIL(databuff_printf(path, length, "%s/%lu_%ld/%s",
       get_local_cache_root_dir(), tenant_id, tenant_epoch_id, EXTERNAL_TABLE_FILE_DIR_STR))) {
     LOG_WARN("failed to get external table file dir", KR(ret),
+        K(path), K(length), K(tenant_id), K(tenant_epoch_id));
+  }
+  return ret;
+}
+
+int ObDirManager::get_external_lob_cache_dir(
+    char *path,
+    const int64_t length,
+    const uint64_t tenant_id,
+    const int64_t tenant_epoch_id) const
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(path)
+      || OB_UNLIKELY(length <= 0 || length > common::MAX_PATH_SIZE
+          || !is_valid_tenant_id(tenant_id) || tenant_epoch_id < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(path), K(length), K(tenant_id), K(tenant_epoch_id));
+  } else if (OB_FAIL(databuff_printf(path, length, "%s/%lu_%ld/%s",
+      get_local_cache_root_dir(), tenant_id, tenant_epoch_id, EXTERNAL_LOB_CACHE_DIR_STR))) {
+    LOG_WARN("failed to format external lob cache directory", KR(ret),
         K(path), K(length), K(tenant_id), K(tenant_epoch_id));
   }
   return ret;

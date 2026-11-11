@@ -93,6 +93,8 @@ OB_ARROW_TRAITS_CUSTOM(ObMediumTextType, STRING,       StringBuilder);
 OB_ARROW_TRAITS_CUSTOM(ObMediumTextType, LARGE_BINARY, LargeBinaryBuilder);
 OB_ARROW_TRAITS_CUSTOM(ObLongTextType,   STRING,       StringBuilder);
 OB_ARROW_TRAITS_CUSTOM(ObLongTextType,   LARGE_BINARY, LargeBinaryBuilder);
+OB_ARROW_TRAITS_CUSTOM(ObExtendBLobType, STRING,       StringBuilder);
+OB_ARROW_TRAITS_CUSTOM(ObExtendBLobType, LARGE_BINARY, LargeBinaryBuilder);
 OB_ARROW_TRAITS_CUSTOM(ObEnumType,       STRING,       StringBuilder);
 OB_ARROW_TRAITS_CUSTOM(ObSetType,        STRING,       StringBuilder);
 OB_ARROW_TRAITS_CUSTOM(ObLobType,        LARGE_BINARY, LargeBinaryBuilder);

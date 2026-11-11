@@ -7,9 +7,12 @@
 
 #include "rootserver/ob_upgrade_executor.h"
 #include "rootserver/ob_ls_service_helper.h"
+#include "rootserver/ob_user_table_schema_applier.h"
 #include "rootserver/tenant_snapshot/ob_tenant_snapshot_util.h" //ObTenantSnapshotUtil
 #include "share/ob_global_stat_proxy.h"
 #include "share/ob_cluster_event_history_table_operator.h"//CLUSTER_EVENT_INSTANCE
+#include "share/ob_share_util.h"
+#include "common/ob_timeout_ctx.h"
 #include "rootserver/standby/ob_standby_service.h" // ObStandbyService
 #include "rootserver/standby/ob_recovery_ls_service.h"
 #include "rootserver/ob_server_zone_op_service.h"
@@ -987,6 +990,9 @@ int ObUpgradeExecutor::run_upgrade_system_table_job_(
       } else if (OB_TMP_FAIL(upgrade_system_table_(tenant_id))) {
         LOG_WARN("fail to upgrade system table", KR(tmp_ret), K(tenant_id));
         backup_ret = OB_SUCCESS == backup_ret ? tmp_ret : backup_ret;
+      } else if (OB_TMP_FAIL(upgrade_builtin_user_tables_(tenant_id))) {
+        LOG_WARN("fail to upgrade builtin user tables", KR(tmp_ret), K(tenant_id));
+        backup_ret = OB_SUCCESS == backup_ret ? tmp_ret : backup_ret;
       } else if (OB_FAIL(check_schema_sync_(tenant_id))) {
         LOG_WARN("fail to check schema sync", KR(ret), K(tenant_id));
       }
@@ -996,6 +1002,23 @@ int ObUpgradeExecutor::run_upgrade_system_table_job_(
       ROOTSERVICE_EVENT_ADD("upgrade", "finish_upgrade_system_table", K(tenant_id), K(ret), K(tmp_ret), K(cost));
     } // end for
     ret = OB_SUCC(ret) ? backup_ret : ret;
+  }
+  return ret;
+}
+
+int ObUpgradeExecutor::upgrade_builtin_user_tables_(const uint64_t tenant_id)
+{
+  int ret = OB_SUCCESS;
+  ObTimeoutCtx timeout_ctx;
+  ObUserTableSchemaApplier applier;
+  if (OB_FAIL(check_inner_stat_())) {
+    LOG_WARN("fail to check inner stat", KR(ret));
+  } else if (OB_FAIL(ObShareUtil::set_default_timeout_ctx(timeout_ctx, GCONF._ob_ddl_timeout))) {
+    LOG_WARN("fail to set ddl timeout", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(applier.init(*schema_service_, *sql_proxy_, timeout_ctx))) {
+    LOG_WARN("fail to init builtin user table schema applier", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(applier.apply_builtin_user_table_schemas(tenant_id))) {
+    LOG_WARN("fail to apply builtin user table schemas", KR(ret), K(tenant_id));
   }
   return ret;
 }

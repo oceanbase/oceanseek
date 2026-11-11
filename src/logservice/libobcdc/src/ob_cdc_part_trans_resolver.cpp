@@ -441,6 +441,14 @@ int ObCDCPartTransResolver::read_trans_log_(
       }
       break;
     }
+    case transaction::ObTxLogType::TX_LOB_OUTTABLE_DATA_LOG:
+    {
+      if (OB_FAIL(handle_lob_outtable_data_log_(tx_id, lsn, handling_miss_log, tx_log_block))) {
+        LOG_ERROR("handle_lob_outtable_data_log_ failed", KR(ret), K_(tls_id), K(tx_id), K(lsn),
+            K(handling_miss_log));
+      }
+      break;
+    }
     case transaction::ObTxLogType::TX_DIRECT_LOAD_INC_LOG:
     {
       if (OB_FAIL(handle_direct_load_inc_log_(tx_id, lsn, submit_ts, handling_miss_log, tx_log_block))) {
@@ -583,6 +591,44 @@ int ObCDCPartTransResolver::handle_redo_(
   } else {
     LOG_DEBUG("handle_trans_redo", K_(tls_id), K(tx_id), K(lsn), K(submit_ts), "cost", get_timestamp() - start_ts,
         K(redo_log), K(handling_miss_log), KPC(task));
+  }
+
+  return ret;
+}
+
+int ObCDCPartTransResolver::handle_lob_outtable_data_log_(
+    const transaction::ObTransID &tx_id,
+    const palf::LSN &lsn,
+    const bool handling_miss_log,
+    transaction::ObTxLogBlock &tx_log_block)
+{
+  int ret = OB_SUCCESS;
+  transaction::ObTxLobOutTableDataLog::ConstructArg construct_arg;
+  transaction::ObTxLobOutTableDataLog outtable_data_log(construct_arg);
+  PartTransTask *task = nullptr;
+  const char *buf = nullptr;
+  int64_t buf_len = 0;
+
+  if (OB_FAIL(tx_log_block.deserialize_log_body(outtable_data_log, buf, buf_len))) {
+    LOG_ERROR("deserialize lob outtable data log failed", KR(ret), K_(tls_id), K(tx_id), K(lsn));
+  } else if (OB_FAIL(obtain_task_(tx_id, task, handling_miss_log))) {
+    LOG_ERROR("obtain lob outtable data log task failed", KR(ret), K_(tls_id), K(tx_id), K(lsn),
+        K(handling_miss_log));
+  } else if (OB_FAIL(push_fetched_log_entry_(lsn, *task))) {
+    if (OB_ENTRY_EXIST == ret) {
+      LOG_WARN("redo already fetched, ignore", KR(ret), K_(tls_id), K(tx_id), K(lsn),
+          "task_sorted_log_entry_info", task->get_sorted_log_entry_info());
+      ret = OB_SUCCESS;
+    } else {
+      LOG_ERROR("push fetched log entry failed", KR(ret), K_(tls_id), K(tx_id), K(lsn));
+    }
+  } else if (OB_FAIL(task->push_lob_outtable_data_log(lsn, outtable_data_log, buf, buf_len))) {
+    if (OB_ENTRY_EXIST == ret) {
+      LOG_DEBUG("lob outtable data log duplication", KR(ret), K_(tls_id), K(tx_id), K(lsn), K(outtable_data_log));
+      ret = OB_SUCCESS;
+    } else if (OB_IN_STOP_STATE != ret) {
+      LOG_ERROR("push lob outtable data log failed", KR(ret), K_(tls_id), K(tx_id), K(lsn));
+    }
   }
 
   return ret;

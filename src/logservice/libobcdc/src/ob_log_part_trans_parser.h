@@ -20,6 +20,7 @@ namespace libobcdc
 {
 class PartTransTask;
 class DdlStmtTask;
+class RedoLogMetaNode;
 enum class ObCDCLobAuxTableType;
 
 class IObLogPartTransParser
@@ -69,6 +70,14 @@ private:
       const PartTransTask &part_trans_task,
       const MutatorRow &row,
       bool &need_rollback);
+  int check_seq_need_rollback_(
+      const PartTransTask &part_trans_task,
+      const transaction::ObTxSEQ &seq_no,
+      bool &need_rollback);
+  int parse_lob_outtable_data_log_(
+      ObLogTenant *tenant,
+      const RedoLogMetaNode &redo_log_node,
+      PartTransTask &part_trans_task);
   int parse_ddl_redo_log_(PartTransTask &task, const bool is_build_baseline, volatile bool &stop_flag);
   int parse_stmts_(
       ObLogTenant *tenant,
@@ -217,7 +226,7 @@ private:
       ObLogEntryTask &redo_log_entry_task,
       MemtableMutatorRow *&row,
       bool &is_ignored);
-  int check_lob_ext_info_log_need_filter_(
+  int check_lob_aux_table_need_filter_(
       ObLogTenant *tenant,
       const uint64_t lob_aux_table_id,
       bool &need_filter);

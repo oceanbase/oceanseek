@@ -7,14 +7,19 @@
 
 #include "lib/ob_define.h"
 #include "lib/ob_errno.h"
+#include "lib/container/ob_se_array.h"
 #include "lib/utility/ob_macro_utils.h"
+#include "lib/utility/ob_tracepoint.h"
 #include "ob_range.h"
 #include "storage/ddl/ob_pipeline.h"
 #include "storage/lob/common/ob_lob_context.h"
 #include "storage/lob/store/ob_lob_store_common.h"
 
 #include <type_traits>
+#include "storage/lob/common/ob_lob_util.h"
 #include "storage/lob/access/ob_lob_iterator.h"
+#include "storage/lob/store/ob_lob_outtable_io.h"
+#include "storage/lob/store/ob_outtable_lob_control_manager.h"
 #include "ob_lob_persistent_iterator.h"
 #include "storage/access/ob_table_scan_iterator.h"
 
@@ -308,7 +313,7 @@ int ObLobAuxTableBaseIterator::scan(
   if (OB_ISNULL(oas)) {
     ret = OB_ERR_INTERVAL_INVALID;
     LOG_ERROR("access service is null", K(ret), K(read_ctx), KPC(this));
-  } else if (OB_FAIL(adaptor_->prepare_lob_tablet_id(read_ctx))) {
+  } else if (OB_FAIL(ObLobUtil::refresh_lob_tablet_id(read_ctx))) {
     LOG_WARN("prepare_lob_tablet_id fail", K(ret));
   } else if (OB_FAIL(adaptor_->prepare_scan_param_schema_version(target, read_ctx, scan_param_))) {
     LOG_WARN("prepare_scan_param_schema_version fail", K(ret));
@@ -503,12 +508,12 @@ int ObLobWriteStats::add_chunk(const ObLobChunk &chunk)
                   || 0 == chunk.char_len_
                   || chunk.char_len_ > chunk.byte_len_)) {
     ret = OB_INVALID_ARGUMENT;
-    STORAGE_LOG(WARN, "invalid lob chunk", KR(ret), K(chunk));
+    LOG_WARN("invalid lob chunk", KR(ret), K(chunk));
   } else if (OB_UNLIKELY(UINT64_MAX - byte_len_ < chunk.byte_len_
                          || UINT64_MAX - char_len_ < chunk.char_len_
                          || UINT64_MAX == chunk_count_)) {
     ret = OB_SIZE_OVERFLOW;
-    STORAGE_LOG(WARN, "lob write stats overflow", KR(ret), KPC(this), K(chunk));
+    LOG_WARN("lob write stats overflow", KR(ret), KPC(this), K(chunk));
   } else {
     byte_len_ += chunk.byte_len_;
     char_len_ += chunk.char_len_;
@@ -528,6 +533,7 @@ ObLobInTablePieceInsertIter::ObLobInTablePieceInsertIter()
     lob_id_(),
     meta_array_(nullptr),
     write_stats_(nullptr),
+    reuse_start_seq_id_(false),
     data_meta_lob_info_(),
     seq_id_gen_(),
     chunk_(),
@@ -547,7 +553,7 @@ int ObLobInTablePieceInsertIter::init(
   int ret = OB_SUCCESS;
   if (IS_INIT) {
     ret = OB_INIT_TWICE;
-    STORAGE_LOG(WARN, "init in-table piece insert iterator twice", KR(ret), KPC(this));
+    LOG_WARN("init in-table piece insert iterator twice", KR(ret), KPC(this));
   } else if (OB_ISNULL(query_iter) || OB_ISNULL(allocator)
              || OB_ISNULL(meta_array) || OB_ISNULL(write_stats)
              || OB_UNLIKELY(chunk_size < OB_MIN_LOB_CHUNK_SIZE
@@ -555,11 +561,11 @@ int ObLobInTablePieceInsertIter::init(
              || OB_UNLIKELY(lob_col_idx < 0)
              || OB_UNLIKELY(!lob_id.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
-    STORAGE_LOG(WARN, "invalid in-table piece insert iterator argument", KR(ret),
+    LOG_WARN("invalid in-table piece insert iterator argument", KR(ret),
                 KP(query_iter), KP(allocator), K(chunk_size), K(lob_col_idx),
                 K(lob_id), KP(meta_array), KP(write_stats));
   } else if (OB_FAIL(row_.init(ObLobPieceInfo::COLUMN_CNT))) {
-    STORAGE_LOG(WARN, "initialize piece datum row failed", KR(ret));
+    LOG_WARN("initialize piece datum row failed", KR(ret));
   } else {
     meta_array->reset();
     write_stats->reset();
@@ -577,18 +583,21 @@ int ObLobInTablePieceInsertIter::init(
   return ret;
 }
 
-int ObLobInTablePieceInsertIter::set_start_seq_id(const common::ObString &start_seq_id)
+int ObLobInTablePieceInsertIter::set_start_seq_id(
+    const common::ObString &start_seq_id,
+    const bool reuse_start_seq_id)
 {
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-    STORAGE_LOG(WARN, "piece insert iterator is not initialized", KR(ret));
+    LOG_WARN("piece insert iterator is not initialized", KR(ret));
   } else if (OB_UNLIKELY(!ObLobSeqId(start_seq_id).is_valid())) {
     ret = OB_INVALID_ARGUMENT;
-    STORAGE_LOG(WARN, "invalid append start seq id", KR(ret), K(start_seq_id));
+    LOG_WARN("invalid append start seq id", KR(ret), K(start_seq_id));
   } else {
     ObString mutable_start_seq_id(start_seq_id);
     seq_id_gen_.set_seq_id(mutable_start_seq_id);
+    reuse_start_seq_id_ = reuse_start_seq_id;
   }
   return ret;
 }
@@ -599,7 +608,7 @@ int ObLobInTablePieceInsertIter::get_next_row(blocksstable::ObDatumRow *&row)
   row = nullptr;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-    STORAGE_LOG(WARN, "in-table piece insert iterator is not initialized", KR(ret));
+    LOG_WARN("in-table piece insert iterator is not initialized", KR(ret));
   } else if (is_end_) {
     ret = OB_ITER_END;
   } else {
@@ -608,23 +617,28 @@ int ObLobInTablePieceInsertIter::get_next_row(blocksstable::ObDatumRow *&row)
       if (OB_ITER_END == ret) {
         is_end_ = true;
       } else {
-        STORAGE_LOG(WARN, "get next source lob chunk failed", KR(ret), KPC(this));
+        LOG_WARN("get next source lob chunk failed", KR(ret), KPC(this));
       }
     } else {
       chunk_.lob_col_idx_ = lob_col_idx_;
       chunk_.lob_id_ = lob_id_;
       chunk_.lob_extra_info_.lob_chunk_type_.set_in_table();
       chunk_.lob_extra_info_.extra_info_type_ = ObLobMetaExtraInfo::LOB_DATA;
-      if (OB_FAIL(seq_id_gen_.get_next_seq_id(chunk_.seq_id_))) {
-        STORAGE_LOG(WARN, "generate lob chunk seq id failed", KR(ret), KPC(this));
+      if (reuse_start_seq_id_) {
+        seq_id_gen_.get_seq_id(chunk_.seq_id_);
+        reuse_start_seq_id_ = false;
+      } else if (OB_FAIL(seq_id_gen_.get_next_seq_id(chunk_.seq_id_))) {
+        LOG_WARN("generate lob chunk seq id failed", KR(ret), KPC(this));
+      }
+      if (OB_FAIL(ret)) {
       } else if (OB_FAIL(write_stats_->add_chunk(chunk_))) {
-        STORAGE_LOG(WARN, "update lob write stats failed", KR(ret), K(chunk_), KPC(this));
+        LOG_WARN("update lob write stats failed", KR(ret), K(chunk_), KPC(this));
       } else if (OB_FAIL(chunk_.to_meta(*allocator_, meta_info))) {
-        STORAGE_LOG(WARN, "transform lob chunk to meta failed", KR(ret), K(chunk_), KPC(this));
+        LOG_WARN("transform lob chunk to meta failed", KR(ret), K(chunk_), KPC(this));
       } else if (OB_FAIL(meta_array_->push_back(meta_info))) {
-        STORAGE_LOG(WARN, "append lob meta failed", KR(ret), KPC(this));
+        LOG_WARN("append lob meta failed", KR(ret), KPC(this));
       } else if (OB_FAIL(chunk_.to_piece(piece_info_))) {
-        STORAGE_LOG(WARN, "transform lob chunk to piece failed", KR(ret), K(chunk_), KPC(this));
+        LOG_WARN("transform lob chunk to piece failed", KR(ret), K(chunk_), KPC(this));
       } else {
         ObPersistentLobAdaptor::set_lob_row(row_, piece_info_);
         row = &row_;
@@ -647,10 +661,259 @@ void ObLobInTablePieceInsertIter::reset()
   lob_id_.reset();
   meta_array_ = nullptr;
   write_stats_ = nullptr;
+  reuse_start_seq_id_ = false;
   data_meta_lob_info_.reset();
   chunk_.reset();
   piece_info_.reset();
   row_.reset();
+}
+
+//==================== OutTable LOB Write Iterator ====================
+ObLobOutTableInsertIter::ObLobOutTableInsertIter()
+  : is_inited_(false),
+    is_end_(false),
+    insert_ctx_(nullptr),
+    query_iter_(nullptr),
+    allocator_(nullptr),
+    chunk_size_(0),
+    chunk_count_(0),
+    lob_col_idx_(OB_INVALID_INDEX_INT64),
+    lob_id_(),
+    meta_array_(nullptr),
+    idx_(0),
+    write_stats_(nullptr),
+    reuse_start_seq_id_(false),
+    seq_id_gen_(),
+    chunk_()
+{
+  reset();
+}
+
+ObLobOutTableInsertIter::~ObLobOutTableInsertIter()
+{
+  reset();
+}
+
+int ObLobOutTableInsertIter::init(
+    ObLobInsertContext *write_ctx,
+    ObLobQueryIter *query_iter,
+    ObIAllocator *allocator,
+    const int64_t chunk_size,
+    const int64_t chunk_count,
+    const int64_t lob_col_idx,
+    const ObLobId &lob_id,
+    ObIArray<ObLobMetaInfo> *meta_array,
+    ObLobWriteStats *write_stats)
+{
+  int ret = OB_SUCCESS;
+  if (IS_INIT) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("init outtable write iterator twice", KR(ret), KPC(this));
+  } else if (OB_ISNULL(write_ctx) || OB_ISNULL(query_iter) || OB_ISNULL(allocator)
+             || OB_ISNULL(meta_array) || OB_ISNULL(write_stats)
+             || OB_UNLIKELY(chunk_size != ObLobMetaUtil::LOB_OUTTABLE_BLOCK_DATA_SIZE)
+             || OB_UNLIKELY(lob_col_idx < 0)
+             || OB_UNLIKELY(chunk_count <= 0)
+             || OB_UNLIKELY(!lob_id.is_valid())
+             || OB_UNLIKELY(!write_ctx->lob_meta_tablet_id_.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid outtable write iterator argument", KR(ret),
+                KP(write_ctx), KP(query_iter), KP(allocator), K(chunk_size), K(lob_col_idx),
+                K(lob_id), KP(meta_array), KP(write_stats));
+  } else {
+    meta_array->reset();
+    write_stats->reset();
+    is_inited_ = true;
+    is_end_ = false;
+    insert_ctx_ = write_ctx;
+    query_iter_ = query_iter;
+    allocator_ = allocator;
+    chunk_size_ = chunk_size;
+    chunk_count_ = chunk_count;
+    lob_col_idx_ = lob_col_idx;
+    lob_id_ = lob_id;
+    meta_array_ = meta_array;
+    write_stats_ = write_stats;
+    seq_id_gen_.set_allocator(allocator_);
+    macro_id_array_.set_attr(ObMemAttr(MTL_ID(), "LobMacroIds"));
+  }
+  return ret;
+}
+
+int ObLobOutTableInsertIter::set_start_seq_id(
+    const common::ObString &start_seq_id,
+    const bool reuse_start_seq_id)
+{
+  int ret = OB_SUCCESS;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("outtable write iterator is not initialized", KR(ret));
+  } else if (OB_UNLIKELY(!ObLobSeqId(start_seq_id).is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid outtable write start seq id", KR(ret), K(start_seq_id));
+  } else {
+    ObString mutable_start_seq_id(start_seq_id);
+    seq_id_gen_.set_seq_id(mutable_start_seq_id);
+    reuse_start_seq_id_ = reuse_start_seq_id;
+  }
+  return ret;
+}
+
+int ObLobOutTableInsertIter::prepare_batch_(
+    ObIAllocator &batch_allocator,
+    ObIArray<ObString> &chunk_data,
+    ObIArray<ObOuttableLobControlKey> &control_keys)
+{
+  int ret = OB_SUCCESS;
+  chunk_data.reuse();
+  control_keys.reuse();
+  while (OB_SUCC(ret) && !is_end_
+      && control_keys.count() < ObLobConcurrentPuter::DEFAULT_CAPACITY) {
+    if (OB_FAIL(query_iter_->get_next_chunk(chunk_, chunk_size_))) {
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+        is_end_ = true;
+      } else {
+        LOG_WARN("get next outtable lob chunk failed", KR(ret), KPC(this));
+      }
+    } else if (OB_UNLIKELY(idx_ >= macro_id_array_.count()
+        || chunk_.lob_data_.empty() || chunk_.lob_data_.length() > chunk_size_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid outtable lob chunk or macro id count", KR(ret), K(chunk_), KPC(this));
+    } else {
+      ObLobMetaInfo meta_info;
+      ObOuttableLobControlKey key;
+      ObString data;
+      key.macro_id_ = macro_id_array_.at(idx_);
+      chunk_.lob_col_idx_ = lob_col_idx_;
+      chunk_.lob_id_ = lob_id_;
+      chunk_.lob_extra_info_.lob_chunk_type_.set_out_table();
+      chunk_.lob_extra_info_.extra_info_type_ = ObLobMetaExtraInfo::LOB_DATA;
+      if (reuse_start_seq_id_) {
+        seq_id_gen_.get_seq_id(chunk_.seq_id_);
+        reuse_start_seq_id_ = false;
+      } else if (OB_FAIL(seq_id_gen_.get_next_seq_id(chunk_.seq_id_))) {
+        LOG_WARN("generate outtable lob chunk seq id failed", KR(ret), KPC(this));
+      }
+      if (FAILEDx(ObLobOutTableIO::serialize_macro_id(
+          *allocator_, key.macro_id_, chunk_.lob_block_id_))) {
+        LOG_WARN("serialize outtable lob macro id failed", KR(ret), K(key));
+      } else if (OB_FAIL(ob_write_string(batch_allocator, chunk_.lob_data_, data))) {
+        LOG_WARN("failed to copy outtable lob batch data", KR(ret), K(chunk_));
+      } else {
+        key.hash_ = data.hash();
+        // Query and sequence buffers are reused; copy the data and Meta before the next read.
+        if (OB_FAIL(chunk_data.push_back(data))) {
+          LOG_WARN("failed to append outtable lob batch data", KR(ret));
+        } else if (OB_FAIL(control_keys.push_back(key))) {
+          LOG_WARN("failed to append outtable lob control key", KR(ret), K(key));
+        } else if (OB_FAIL(write_stats_->add_chunk(chunk_))) {
+          LOG_WARN("update outtable lob write stats failed", KR(ret), K(chunk_));
+        } else if (OB_FAIL(chunk_.to_meta(*allocator_, meta_info))) {
+          LOG_WARN("transform outtable lob chunk to meta failed", KR(ret), K(chunk_));
+        } else if (OB_FAIL(meta_array_->push_back(meta_info))) {
+          LOG_WARN("append outtable lob meta failed", KR(ret));
+        } else {
+          ++idx_;
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObLobOutTableInsertIter::write_batch_(
+    ObLobConcurrentPuter &puter,
+    ObOuttableLobControlManager &control_manager)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator batch_allocator(ObMemAttr(insert_ctx_->tenant_id_, "LobCtrlBatch"));
+  ObSEArray<ObString, ObLobConcurrentPuter::DEFAULT_CAPACITY> chunk_data;
+  ObSEArray<ObOuttableLobControlKey, ObLobConcurrentPuter::DEFAULT_CAPACITY> control_keys;
+  if (OB_FAIL(prepare_batch_(batch_allocator, chunk_data, control_keys))) {
+    LOG_WARN("failed to prepare outtable lob batch", KR(ret), KPC(this));
+  } else if (!control_keys.empty()) {
+    if (OB_FAIL(control_manager.insert(control_keys))) {
+      LOG_WARN("failed to insert outtable lob control batch", KR(ret), K(control_keys));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < control_keys.count(); ++i) {
+      if (OB_FAIL(insert_ctx_->outtable_lob_control_keys_->push_back(control_keys.at(i)))) {
+        LOG_WARN("failed to collect outtable lob control key", KR(ret), "key", control_keys.at(i));
+      }
+    }
+    // Upload only after this batch's control rows commit. submit owns a data copy,
+    // so there is no need to wait for all uploads in the batch to finish.
+    for (int64_t i = 0; OB_SUCC(ret) && i < control_keys.count(); ++i) {
+      if (OB_FAIL(puter.submit(control_keys.at(i).macro_id_, chunk_data.at(i)))) {
+        LOG_WARN("failed to submit outtable lob batch object", KR(ret), "key", control_keys.at(i));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObLobOutTableInsertIter::write_all()
+{
+  int ret = OB_SUCCESS;
+  ObLobConcurrentPuter puter;
+  ObOuttableLobControlManager control_manager;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("outtable write iterator is not initialized", KR(ret));
+  } else if (is_end_) {
+    ret = OB_ITER_END;
+  } else if (!insert_ctx_->allow_outtable_lob_) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("outtable lob writes are not supported by this write path", KR(ret), KPC(insert_ctx_));
+  } else if (OB_ISNULL(insert_ctx_->outtable_lob_control_keys_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("outtable lob control key collector is null", KR(ret), KPC(insert_ctx_));
+  } else if (OB_FAIL(control_manager.init(insert_ctx_->tenant_id_))) {
+    LOG_WARN("initialize outtable lob control manager failed", KR(ret), KPC(insert_ctx_));
+  } else if (OB_FAIL(puter.init(insert_ctx_->timeout_, chunk_size_, chunk_count_))) {
+    LOG_WARN("initialize outtable concurrent uploader failed", KR(ret), KPC(this));
+  } else if (OB_FAIL(ObLobOutTableIO::alloc_macro_ids(*insert_ctx_, chunk_count_, macro_id_array_))) {
+    LOG_WARN("failed to alloc macro ids", KR(ret), KPC(this));
+  } else {
+    while (OB_SUCC(ret) && !is_end_) {
+      if (OB_FAIL(write_batch_(puter, control_manager))) {
+        LOG_WARN("failed to write outtable lob batch", KR(ret), KPC(this));
+      }
+    }
+
+    // finish() must be called to wait for all in-flight requests.
+    int tmp_ret = OB_SUCCESS;
+    if (OB_TMP_FAIL(puter.finish())) {
+      ret = COVER_SUCC(tmp_ret);
+      LOG_WARN("finish outtable lob object writes failed", KR(tmp_ret), KR(ret), KPC(this));
+    }
+    if (OB_SUCC(ret)
+        && OB_FAIL(OB_E(common::EventTable::ERRSIM_LOB_OUTTABLE_AFTER_PUT) OB_SUCCESS)) {
+      LOG_WARN("injected failure after outtable lob object writes", KR(ret), KPC(this));
+    }
+  }
+  return ret;
+}
+
+void ObLobOutTableInsertIter::reset()
+{
+  seq_id_gen_.reset();
+  seq_id_gen_.set_allocator(nullptr);
+  is_inited_ = false;
+  is_end_ = false;
+  insert_ctx_ = nullptr;
+  query_iter_ = nullptr;
+  allocator_ = nullptr;
+  chunk_size_ = 0;
+  chunk_count_ = 0;
+  lob_col_idx_ = OB_INVALID_INDEX_INT64;
+  lob_id_.reset();
+  meta_array_ = nullptr;
+  write_stats_ = nullptr;
+  reuse_start_seq_id_ = false;
+  chunk_.reset();
+  macro_id_array_.reset();
+  idx_ = 0;
 }
 
 //==================== ObLobMetaTableBatchInsertIter ====================
@@ -659,12 +922,12 @@ int ObLobMetaTableBatchInsertIter::init(ObIArray<ObLobMetaInfo> *array)
   int ret = OB_SUCCESS;
   if (IS_INIT) {
     ret = OB_INIT_TWICE;
-    STORAGE_LOG(WARN, "init twice", KR(ret), KPC(array));
+    LOG_WARN("init twice", KR(ret), KPC(array));
   } else if (OB_ISNULL(array)) {
     ret = OB_INVALID_ARGUMENT;
-    STORAGE_LOG(WARN, "invalid argument", KR(ret), KP(array));
+    LOG_WARN("invalid argument", KR(ret), KP(array));
   } else if (OB_FAIL(row_.init(ObLobMetaInfo::COLUMN_CNT))) {
-    STORAGE_LOG(WARN, "init datum row fail", KR(ret));
+    LOG_WARN("init datum row fail", KR(ret));
   } else {
     array_ = array;
     is_inited_ = true;
@@ -685,10 +948,10 @@ int ObLobMetaTableBatchInsertIter::get_next_row(blocksstable::ObDatumRow *&row)
   int ret = OB_SUCCESS;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
-    STORAGE_LOG(WARN, "not init", KR(ret), KPC(this));
+    LOG_WARN("not init", KR(ret), KPC(this));
   } else if (OB_ISNULL(array_)) {
     ret = OB_ERR_UNEXPECTED;
-    STORAGE_LOG(WARN, "array should not be nullptr", KR(ret), KPC(this));
+    LOG_WARN("array should not be nullptr", KR(ret), KPC(this));
   } else if (idx_ >= array_->count()) {
     ret = OB_ITER_END;
   } else {

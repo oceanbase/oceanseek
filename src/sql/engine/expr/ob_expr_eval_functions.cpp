@@ -143,6 +143,8 @@
 #include "ob_expr_remove_const.h"
 #include "ob_expr_wrapper_inner.h"
 #include "ob_expr_lob_appendwrite.h"
+#include "ob_expr_external_lob.h"
+#include "ob_expr_lob_meta.h"
 #include "ob_expr_func_sleep.h"
 #include "ob_expr_errno.h"
 #include "ob_expr_get_package_var.h"
@@ -1526,8 +1528,8 @@ ObExprRandCanonical::calc_random_expr_canonical,                    /* 890 */
   NULL, // ObExprVecIVFBase::eval_vec_ivf_cid,                        /* 924 */
   NULL, // ObExprVecIVFBase::eval_vec_ivf_data,                       /* 925 */
   ObExprDslMultiValueRange::eval_dsl_multi_value_range,               /* 926 */
-  NULL, // ObExprExternalLob::eval_external_lob,                      /* 927 */
-  NULL, // ObExprLobMeta::eval_lob_meta,                              /* 928 */
+  ObExprExternalLob::eval_external_lob,                              /* 927 */
+  ObExprLobMeta::eval_lob_meta,                                      /* 928 */
   ObExprResultScan::eval_result_scan,                                 /* 929 */
   ObExprAIDecide::eval_ai_decide,                                     /* 930 */
   NULL, // ObExprDslParamValue::eval_value,                            /* 931 */

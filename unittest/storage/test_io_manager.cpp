@@ -275,6 +275,113 @@ TEST_F(TestIOStruct, IOAllocator)
   ASSERT_FALSE(allocator.is_inited_);
 }
 
+TEST_F(TestIOStruct, file_stat_owns_etag)
+{
+  const int64_t lengths[] = {0, 1, 63, 64, 65, 1023};
+  for (const int64_t length : lengths) {
+    ObIODFileStat copied;
+    const std::string expected(length, 'e');
+    const ObString expected_etag(expected.length(), expected.data());
+    {
+      ObIODFileStat source;
+      source.size_ = 123;
+      source.mtime_s_ = 456;
+      std::string etag(expected);
+      ASSERT_SUCC(source.etag_.set(ObString(etag.length(), etag.data())));
+      EXPECT_EQ(length <= 64, source.etag_.is_small());
+      if (length <= 64) {
+        EXPECT_EQ(0, source.etag_.allocator_.total());
+      } else {
+        EXPECT_GT(source.etag_.allocator_.total(), 0);
+      }
+      if (length > 0) {
+        etag[0] = 'X';
+      }
+      ASSERT_SUCC(copied.assign(source));
+      EXPECT_NE(source.etag_.ptr(), copied.etag_.ptr());
+      source.reset();
+    }
+    EXPECT_EQ(123, copied.size_);
+    EXPECT_EQ(456, copied.mtime_s_);
+    EXPECT_EQ(length, copied.etag_.length());
+    EXPECT_TRUE(expected_etag.compare_equal(ObString(copied.etag_.length(), copied.etag_.ptr())));
+    ASSERT_SUCC(copied.assign(copied));
+    EXPECT_EQ(length, copied.etag_.length());
+    EXPECT_TRUE(expected_etag.compare_equal(ObString(copied.etag_.length(), copied.etag_.ptr())));
+    ASSERT_SUCC(copied.etag_.set(ObString::make_string("short")));
+    EXPECT_TRUE(copied.etag_.is_small());
+    EXPECT_EQ(0, copied.etag_.allocator_.total());
+    copied.reset();
+    EXPECT_TRUE(copied.etag_.empty());
+    EXPECT_EQ(0, copied.size_);
+    EXPECT_EQ(0, copied.etag_.allocator_.total());
+  }
+}
+
+TEST_F(TestIOStruct, stat_io_deep_copies_etag_and_destroys_buffer)
+{
+  const ObIOReadMode modes[] = {ObIOReadMode::STAT, ObIOReadMode::ADAPTIVE_STAT};
+  for (const ObIOReadMode mode : modes) {
+    ObRefHolder<ObTenantIOManager> holder;
+    ASSERT_SUCC(OB_IO_MANAGER.get_tenant_io_manager(OB_SERVER_TENANT_ID, holder));
+    const std::string expected(65, 'e');
+    const ObString expected_etag(expected.length(), expected.data());
+    ObIODFileStat output(OB_SERVER_TENANT_ID);
+    ObIOInfo info;
+    info.tenant_id_ = OB_SERVER_TENANT_ID;
+    info.fd_.first_id_ = 0;
+    info.fd_.second_id_ = 1;
+    info.fd_.device_handle_ = &LOCAL_DEVICE_INSTANCE;
+    info.flag_.set_read(mode);
+    info.flag_.set_wait_event(1);
+    info.timeout_us_ = DEFAULT_IO_WAIT_TIME_US;
+    info.size_ = sizeof(ObIODFileStat);
+    info.user_data_buf_ = reinterpret_cast<char *>(&output);
+    ObIOResult result;
+    ObIORequest req;
+    result.tenant_io_mgr_.hold(holder.get_ptr());
+    req.tenant_io_mgr_.hold(holder.get_ptr());
+    result.inc_ref();
+    req.inc_ref();
+    ASSERT_SUCC(result.basic_init());
+    ASSERT_SUCC(result.init(info));
+    ASSERT_SUCC(req.init(info, &result));
+    char *io_buf = nullptr;
+    ASSERT_SUCC(req.alloc_io_buf(io_buf));
+    ObIODFileStat *source = nullptr;
+    ASSERT_SUCC(req.prepare_stat_buffer(source));
+    source->size_ = 321;
+    ASSERT_SUCC(source->etag_.set(ObString(expected.length(), expected.data())));
+    result.complete_size_ = sizeof(ObIODFileStat);
+    ASSERT_SUCC(req.recycle_buffer());
+    EXPECT_EQ(nullptr, req.stat_buf_);
+    EXPECT_EQ(nullptr, req.raw_buf_);
+    EXPECT_EQ(321, output.size_);
+    EXPECT_EQ(expected.length(), output.etag_.length());
+    EXPECT_TRUE(expected_etag.compare_equal(ObString(output.etag_.length(), output.etag_.ptr())));
+
+    // An unfinished request must also destroy its owning STAT result.
+    ASSERT_SUCC(req.alloc_io_buf(io_buf));
+    ASSERT_SUCC(req.prepare_stat_buffer(source));
+    ASSERT_SUCC(source->etag_.set(ObString(expected.length(), expected.data())));
+    ASSERT_SUCC(req.prepare_stat_buffer(source));
+    EXPECT_TRUE(source->etag_.empty());
+    EXPECT_EQ(0, source->etag_.allocator_.total());
+    ASSERT_SUCC(source->etag_.set(ObString(expected.length(), expected.data())));
+    result.is_canceled_ = true;
+    ASSERT_SUCC(req.recycle_buffer());
+    EXPECT_NE(nullptr, req.stat_buf_);
+    EXPECT_EQ(expected.length(), output.etag_.length());
+    EXPECT_TRUE(expected_etag.compare_equal(ObString(output.etag_.length(), output.etag_.ptr())));
+    req.destroy();
+    req.free_io_buffer();
+    EXPECT_EQ(nullptr, req.stat_buf_);
+    EXPECT_EQ(nullptr, req.raw_buf_);
+    EXPECT_EQ(expected.length(), output.etag_.length());
+    EXPECT_TRUE(expected_etag.compare_equal(ObString(output.etag_.length(), output.etag_.ptr())));
+  }
+}
+
 TEST_F(TestIOStruct, IORequest)
 {
   ObRefHolder<ObTenantIOManager> holder;

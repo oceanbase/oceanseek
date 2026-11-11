@@ -2377,6 +2377,148 @@ static int read_all_buckets_meta_scns(
   return ret;
 }
 
+static int read_all_buckets_lob_meta_kept(
+    const uint64_t tenant_id,
+    const int64_t round_id,
+    const int64_t bucket_cnt,
+    ObIAllocator &allocator,
+    ObIArray<MacroBlockId> &macro_ids)
+{
+  int ret = OB_SUCCESS;
+  macro_ids.reset();
+  for (int64_t bucket = 0; OB_SUCC(ret) && bucket < bucket_cnt; ++bucket) {
+    ObSSMarkSweepDiagFileReader reader;
+    if (OB_FAIL(reader.init(tenant_id, round_id, ObMarkSweepGroupType::DEL,
+        ObSSMarkSweepDiagFileType::LOB_META_KEPT, bucket))) {
+      ret = OB_SUCCESS;
+    } else {
+      ObArray<ObString> records;
+      while (OB_SUCC(ret)) {
+        records.reset();
+        if (OB_FAIL(reader.next_record_batch(allocator, records))) {
+          if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
+          }
+          break;
+        }
+        for (int64_t i = 0; OB_SUCC(ret) && i < records.count(); ++i) {
+          ObSSLobMetaGCDiagRows rows;
+          if (OB_FAIL(ObSSMarkSweepDiagMgr::decode_lob_meta_kept_record(records.at(i), rows))) {
+          } else {
+            for (int64_t j = 0; OB_SUCC(ret) && j < rows.macro_ids_.count(); ++j) {
+              if (OB_FAIL(macro_ids.push_back(rows.macro_ids_.at(j)))) {
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+static int read_all_buckets_lob_ctrl(
+    const uint64_t tenant_id,
+    const int64_t round_id,
+    const int64_t bucket_cnt,
+    const ObSSMarkSweepDiagFileType type,
+    ObIAllocator &allocator,
+    ObIArray<ObSSOuttableLobCtrlCandidate> &out_rows)
+{
+  int ret = OB_SUCCESS;
+  out_rows.reset();
+  for (int64_t bucket = 0; OB_SUCC(ret) && bucket < bucket_cnt; ++bucket) {
+    ObSSMarkSweepDiagFileReader reader;
+    if (OB_FAIL(reader.init(tenant_id, round_id, ObMarkSweepGroupType::DEL, type, bucket))) {
+      ret = OB_SUCCESS;
+    } else {
+      ObArray<ObString> records;
+      while (OB_SUCC(ret)) {
+        records.reset();
+        if (OB_FAIL(reader.next_record_batch(allocator, records))) {
+          if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
+          }
+          break;
+        }
+        for (int64_t i = 0; OB_SUCC(ret) && i < records.count(); ++i) {
+          ObSSLobCtrlGCDiagRows rows;
+          if (OB_FAIL(ObSSMarkSweepDiagMgr::decode_lob_ctrl_record(records.at(i), rows))) {
+          } else {
+            for (int64_t j = 0; OB_SUCC(ret) && j < rows.rows_.count(); ++j) {
+              const ObSSOuttableLobCtrlCandidate &row = rows.rows_.at(j);
+              const int64_t expected_bucket = static_cast<int64_t>(
+                  row.macro_id_.hash() % static_cast<uint64_t>(bucket_cnt));
+              if (OB_UNLIKELY(expected_bucket != bucket)) {
+                ret = OB_ERR_UNEXPECTED;
+              } else if (OB_FAIL(out_rows.push_back(row))) {
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+static int create_lob_ctrl_tmp_file(
+    const uint64_t tenant_id,
+    const int64_t file_buf_size,
+    const ObIArray<ObSSOuttableLobCtrlCandidate> &rows,
+    ObMarkSweepTmpFileMgr &file_mgr,
+    ObSSLobCtrlGCScanFile &file)
+{
+  int ret = OB_SUCCESS;
+  int64_t dir_id = -1;
+  ObFragmentWriterV2<ObSSOuttableLobCtrlCandidate> writer(OB_MALLOC_NORMAL_BLOCK_SIZE);
+  if (OB_UNLIKELY(rows.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(FILE_MANAGER_INSTANCE_WITH_MTL_SWITCH.alloc_dir(tenant_id, dir_id))) {
+  } else if (OB_FAIL(writer.open(file_buf_size, 0, tenant_id, dir_id))) {
+  } else if (OB_FAIL(file_mgr.acquire_file(
+      tenant_id, writer.get_dir_id(), writer.get_fd(), file.file_handle_))) {
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && i < rows.count(); ++i) {
+      ret = writer.write_item(rows.at(i));
+    }
+    if (OB_SUCC(ret) && OB_FAIL(writer.sync())) {
+    } else if (OB_SUCC(ret)) {
+      file.sample_item_ = writer.get_sample_item();
+      file.item_count_ = rows.count();
+    }
+  }
+  return ret;
+}
+
+static const ObSSOuttableLobCtrlCandidate *find_lob_ctrl_row(
+    const ObIArray<ObSSOuttableLobCtrlCandidate> &rows,
+    const MacroBlockId &macro_id)
+{
+  const ObSSOuttableLobCtrlCandidate *found = nullptr;
+  for (int64_t i = 0; OB_ISNULL(found) && i < rows.count(); ++i) {
+    if (rows.at(i).macro_id_ == macro_id) {
+      found = &rows.at(i);
+    }
+  }
+  return found;
+}
+
+static void check_lob_ctrl_rows(
+    const ObIArray<ObSSOuttableLobCtrlCandidate> &expected_rows,
+    const ObIArray<ObSSOuttableLobCtrlCandidate> &actual_rows)
+{
+  ASSERT_EQ(expected_rows.count(), actual_rows.count());
+  for (int64_t i = 0; i < expected_rows.count(); ++i) {
+    const ObSSOuttableLobCtrlCandidate &expected = expected_rows.at(i);
+    const ObSSOuttableLobCtrlCandidate *actual = find_lob_ctrl_row(actual_rows, expected.macro_id_);
+    ASSERT_NE(nullptr, actual);
+    EXPECT_EQ(expected.macro_id_, actual->macro_id_);
+    EXPECT_EQ(expected.hash_, actual->hash_);
+    EXPECT_EQ(expected.mark_row_scn_, actual->mark_row_scn_);
+  }
+}
+
 template <typename T>
 static const T *find_tablet_rec(const ObIArray<T> &recs, const ObSSGCTablet &tablet)
 {
@@ -2558,6 +2700,120 @@ TEST_F(TestSSMarkSweepGC, diagnose_manager_round_trip)
     ASSERT_EQ(a_kept_scns.count(), recs.at(0).meta_scns_.count());
     ASSERT_TRUE(recs.at(0).meta_scns_.at(0) == a_kept_scns.at(0));
   }
+}
+
+TEST_F(TestSSMarkSweepGC, diagnose_lob_meta_kept_file_round_trip)
+{
+  const int64_t round_id = 20002;
+  const int64_t bucket_cnt = 4;
+  const int64_t macro_count = 1025;
+  const int64_t memory_limit = 8L << 20;
+  const int64_t file_buf_size = 32L << 10;
+  const ObLSID ls_id(1001);
+  const ObTabletID tablet_id(400004);
+  ObGCMacroBlockCompare compare;
+  ObMarkSweepPipeline pipeline;
+  ObArray<MacroBlockId> expected_macro_ids;
+  share::ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(tenant_id_));
+  ASSERT_EQ(OB_SUCCESS, pipeline.init(
+      tenant_id_, memory_limit, file_buf_size, 0 /*expire_timestamp*/, &compare));
+  {
+    ObMarkSweepSorter sorter;
+    ObSEArray<ObSortedFileInfo, 16> files;
+    ASSERT_EQ(OB_SUCCESS, sorter.init(&pipeline));
+    for (int64_t i = 0; i < macro_count; ++i) {
+      MacroBlockId macro_id;
+      ASSERT_EQ(OB_SUCCESS, build_sstable_macro_id_(
+          blocksstable::ObStorageObjectType::SHARED_MINI_DATA_MACRO,
+          ls_id, tablet_id, i, macro_id));
+      ASSERT_EQ(OB_SUCCESS, expected_macro_ids.push_back(macro_id));
+      ASSERT_EQ(OB_SUCCESS, sorter.add_item(ObGCMacroBlockItem(macro_id)));
+    }
+    ASSERT_EQ(OB_SUCCESS, sorter.finish(files));
+    ASSERT_EQ(1, files.count());
+    ASSERT_EQ(OB_SUCCESS, pipeline.add_file(ObMarkSweepGroupType::KEPT, files.at(0)));
+  }
+  ASSERT_EQ(OB_SUCCESS, pipeline.prepare_merge());
+  ASSERT_EQ(OB_SUCCESS, pipeline.complete_group(ObMarkSweepGroupType::KEPT));
+  ObSortedFileInfo kept_file;
+  ASSERT_EQ(OB_SUCCESS, pipeline.get_merged_file(ObMarkSweepGroupType::KEPT, kept_file));
+  ASSERT_EQ(macro_count, kept_file.item_count_);
+
+  ObSSMarkSweepDiagMgr mgr;
+  ASSERT_EQ(OB_SUCCESS, mgr.init(tenant_id_, round_id, bucket_cnt));
+  ASSERT_EQ(OB_SUCCESS, mgr.write_lob_meta_kept_file(kept_file, file_buf_size));
+  ASSERT_EQ(OB_SUCCESS, mgr.complete());
+
+  ObArenaAllocator allocator;
+  ObArray<MacroBlockId> actual_macro_ids;
+  ASSERT_EQ(OB_SUCCESS, read_all_buckets_lob_meta_kept(
+      tenant_id_, round_id, bucket_cnt, allocator, actual_macro_ids));
+  ASSERT_EQ(expected_macro_ids.count(), actual_macro_ids.count());
+  for (int64_t i = 0; i < expected_macro_ids.count(); ++i) {
+    bool found = false;
+    for (int64_t j = 0; !found && j < actual_macro_ids.count(); ++j) {
+      found = expected_macro_ids.at(i) == actual_macro_ids.at(j);
+    }
+    ASSERT_TRUE(found) << "missing macro index " << i;
+  }
+}
+
+TEST_F(TestSSMarkSweepGC, diagnose_lob_ctrl_rows_and_file_round_trip)
+{
+  const int64_t round_id = 20003;
+  const int64_t bucket_cnt = 4;
+  const int64_t direct_row_count = 4;
+  const int64_t file_row_count = 1025;
+  const int64_t file_buf_size = 32L << 10;
+  const ObLSID ls_id(1001);
+  const ObTabletID tablet_id(400005);
+  ObArray<ObSSOuttableLobCtrlCandidate> expected_candidates;
+  ObArray<ObSSOuttableLobCtrlCandidate> expected_diffs;
+  share::ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(tenant_id_));
+  for (int64_t i = 0; i < direct_row_count; ++i) {
+    ObSSOuttableLobCtrlCandidate row;
+    ASSERT_EQ(OB_SUCCESS, build_sstable_macro_id_(
+        blocksstable::ObStorageObjectType::SHARED_MINI_DATA_MACRO,
+        ls_id, tablet_id, i, row.macro_id_));
+    row.hash_ = 0 == i ? 0 : (1 == i ? UINT64_MAX : i * 17);
+    row.mark_row_scn_ = 2000 + i;
+    ASSERT_EQ(OB_SUCCESS, expected_candidates.push_back(row));
+  }
+  for (int64_t i = 0; i < file_row_count; ++i) {
+    ObSSOuttableLobCtrlCandidate row;
+    ASSERT_EQ(OB_SUCCESS, build_sstable_macro_id_(
+        blocksstable::ObStorageObjectType::SHARED_MINI_DATA_MACRO,
+        ls_id, tablet_id, 10000 + i, row.macro_id_));
+    row.hash_ = 0 == i % 3 ? 0 : (1 == i % 3 ? UINT64_MAX : i * 31);
+    row.mark_row_scn_ = 5000 + i;
+    ASSERT_EQ(OB_SUCCESS, expected_diffs.push_back(row));
+  }
+
+  ObMarkSweepTmpFileMgr file_mgr;
+  ObSSLobCtrlGCScanFile diff_file;
+  ASSERT_EQ(OB_SUCCESS, file_mgr.init(tenant_id_));
+  ASSERT_EQ(OB_SUCCESS, create_lob_ctrl_tmp_file(
+      tenant_id_, file_buf_size, expected_diffs, file_mgr, diff_file));
+  ASSERT_TRUE(diff_file.is_valid());
+  ObSSMarkSweepDiagMgr diag_mgr;
+  ASSERT_EQ(OB_SUCCESS, diag_mgr.init(tenant_id_, round_id, bucket_cnt));
+  ASSERT_EQ(OB_SUCCESS, diag_mgr.write_lob_ctrl_rows(
+      ObSSMarkSweepDiagFileType::LOB_CTRL_CANDIDATE, expected_candidates));
+  ASSERT_EQ(OB_SUCCESS, diag_mgr.write_lob_ctrl_file(
+      ObSSMarkSweepDiagFileType::LOB_CTRL_DIFF, diff_file, file_buf_size));
+  ASSERT_EQ(OB_SUCCESS, diag_mgr.complete());
+
+  ObArenaAllocator allocator;
+  ObArray<ObSSOuttableLobCtrlCandidate> actual_candidates;
+  ObArray<ObSSOuttableLobCtrlCandidate> actual_diffs;
+  ASSERT_EQ(OB_SUCCESS, read_all_buckets_lob_ctrl(tenant_id_, round_id, bucket_cnt,
+      ObSSMarkSweepDiagFileType::LOB_CTRL_CANDIDATE, allocator, actual_candidates));
+  ASSERT_EQ(OB_SUCCESS, read_all_buckets_lob_ctrl(tenant_id_, round_id, bucket_cnt,
+      ObSSMarkSweepDiagFileType::LOB_CTRL_DIFF, allocator, actual_diffs));
+  ASSERT_NO_FATAL_FAILURE(check_lob_ctrl_rows(expected_candidates, actual_candidates));
+  ASSERT_NO_FATAL_FAILURE(check_lob_ctrl_rows(expected_diffs, actual_diffs));
 }
 
 // ---------------------------------------------------------------------------

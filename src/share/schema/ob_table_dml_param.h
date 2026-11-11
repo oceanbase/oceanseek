@@ -74,6 +74,7 @@ public:
   OB_INLINE ObString get_vec_index_param() const { return vec_index_param_; }
   OB_INLINE int64_t get_vec_dim() const { return vec_dim_; }
   OB_INLINE int64_t get_lob_inrow_threshold() const { return lob_inrow_threshold_; }
+  OB_INLINE int64_t get_lob_intable_threshold() const { return lob_intable_threshold_; }
   OB_INLINE bool is_table_without_pk() const { return is_table_without_pk_; }
   OB_INLINE int64_t get_column_count() const { return columns_.count(); }
   OB_INLINE const Columns &get_columns() const { return columns_; }

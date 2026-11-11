@@ -84,6 +84,7 @@ static const ObMySQLTypeMap type_maps_[ObMaxType] =
   {EMySQLFieldType::MYSQL_TYPE_DATE,      BINARY_FLAG, 0}, /* ObMySQLDateType */
   {EMySQLFieldType::MYSQL_TYPE_DATETIME,  BINARY_FLAG, 0}, /* ObMySQLDateTimeType */
   {EMySQLFieldType::MYSQL_TYPE_BLOB,       BLOB_FLAG, 0},                         /* ObRoaringBitmapType */
+  {EMySQLFieldType::MYSQL_TYPE_LONG_BLOB,  BLOB_FLAG, 0},                         /* ObExtendBLobType */
   /* ObMaxType */
 };
 

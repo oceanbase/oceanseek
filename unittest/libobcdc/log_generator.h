@@ -17,6 +17,7 @@
 #include "logservice/libobcdc/src/ob_log_utils.h"
 #include "logservice/libobcdc/src/ob_small_arena.h"
 #include "logservice/ob_log_base_header.h"
+#include "logservice/ob_garbage_collector.h"
 #include "logservice/palf/log_define.h"
 #include "logservice/palf/log_entry_header.h"
 #include "storage/memtable/utils_rowkey_builder.h"
@@ -101,40 +102,53 @@ public:
     lsn = last_lsn_();
     ObTxLogBlock &tx_log_block = block_builder_.build();
     LogEntryHeader entry_header;
-    char *tx_buf = tx_log_block.get_buf();
-    int64_t buf_len = tx_log_block.get_size();
-    char *buf = static_cast<char*>(allocator_.alloc(buf_len));
-    MEMCPY(buf, tx_buf, buf_len);
-    LogType log_type = palf::LOG_PADDING;
-    const bool is_padding_log = (palf::LOG_PADDING == log_type);
-    int64_t log_entry_header_size = entry_header.get_serialize_size();
-    int64_t ts = get_timestamp();
-    share::SCN scn;
-
-    if (OB_FAIL(scn.convert_for_logservice(ts))) {
-      LOG_ERROR("fail to convert ts", KR(ret), K(ts));
-    } else if (OB_FAIL(entry_header.generate_header(buf, buf_len, scn))) {
-      LOG_ERROR("generate_header failed", KR(ret), K(buf), K(buf_len), K(scn));
+    int64_t buf_len = 0;
+    char *buf = nullptr;
+    if (OB_FAIL(tx_log_block.seal(tx_log_block.get_header().get_tx_id().get_id()))) {
+      LOG_ERROR("seal generated transaction block failed", KR(ret));
     } else {
-      log_entry.header_ = entry_header;
-      log_entry.buf_ = buf;
-      lsn.val_ += (log_entry.get_serialize_size());
-      if (OB_UNLIKELY(! log_entry.is_valid())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_ERROR("log_entry is not valid", KR(ret));
-      } else if (OB_UNLIKELY(! lsn.is_valid())) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_ERROR("lsn is not valid", KR(ret));
-      } else if (OB_FAIL(block_builder_.next_log_block())) {
-        LOG_ERROR("next_log_block failed", "log_entry_no", block_builder_.get_log_entry_no());
-      } else if (has_record_log_) {
-        last_record_lsn_ = lsn;
-        last_normal_lsn_ = lsn;
-        has_record_log_ = false;
-      } else if (OB_FAIL(lsn_arr_.push_back(lsn))) {
-        LOG_ERROR("push_back lsn to lsn_arr failed", KR(ret), K(lsn));
+      char *tx_buf = tx_log_block.get_buf();
+      buf_len = tx_log_block.get_size();
+      if (OB_ISNULL(buf = static_cast<char*>(allocator_.alloc(buf_len)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_ERROR("allocate generated transaction entry buffer failed", KR(ret), K(buf_len));
       } else {
-        last_normal_lsn_ = lsn;
+        MEMCPY(buf, tx_buf, buf_len);
+      }
+    }
+
+    if (OB_SUCC(ret)) {
+      LogType log_type = palf::LOG_PADDING;
+      const bool is_padding_log = (palf::LOG_PADDING == log_type);
+      int64_t log_entry_header_size = entry_header.get_serialize_size();
+      int64_t ts = get_timestamp();
+      share::SCN scn;
+
+      if (OB_FAIL(scn.convert_for_logservice(ts))) {
+        LOG_ERROR("fail to convert ts", KR(ret), K(ts));
+      } else if (OB_FAIL(entry_header.generate_header(buf, buf_len, scn))) {
+        LOG_ERROR("generate_header failed", KR(ret), K(buf), K(buf_len), K(scn));
+      } else {
+        log_entry.header_ = entry_header;
+        log_entry.buf_ = buf;
+        lsn.val_ += (log_entry.get_serialize_size());
+        if (OB_UNLIKELY(! log_entry.is_valid())) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_ERROR("log_entry is not valid", KR(ret));
+        } else if (OB_UNLIKELY(! lsn.is_valid())) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_ERROR("lsn is not valid", KR(ret));
+        } else if (OB_FAIL(block_builder_.next_log_block())) {
+          LOG_ERROR("next_log_block failed", "log_entry_no", block_builder_.get_log_entry_no());
+        } else if (has_record_log_) {
+          last_record_lsn_ = lsn;
+          last_normal_lsn_ = lsn;
+          has_record_log_ = false;
+        } else if (OB_FAIL(lsn_arr_.push_back(lsn))) {
+          LOG_ERROR("push_back lsn to lsn_arr failed", KR(ret), K(lsn));
+        } else {
+          last_normal_lsn_ = lsn;
+        }
       }
     }
 
@@ -149,15 +163,16 @@ public:
     lsn = last_lsn_();
     LogEntryHeader entry_header;
     const int64_t ts = get_timestamp();
-    logservice::ObLogBaseHeader log_base_header(logservice::ObLogBaseType::GC_LS_LOG_BASE_TYPE, logservice::ObReplayBarrierType::NO_NEED_BARRIER, 1);
-    const int64_t serizlize_size = log_base_header.get_serialize_size();
+    // Include the base header, version and OFFLINE_LS type expected by the GC log parser.
+    logservice::ObGCLSLog gc_log(logservice::ObGCLSLOGType::OFFLINE_LS);
+    const int64_t serizlize_size = gc_log.get_serialize_size();
     char *buf = static_cast<char*>(allocator_.alloc(serizlize_size));
     share::SCN scn;
 
     if (OB_FAIL(scn.convert_for_logservice(ts))) {
       LOG_ERROR("fail to convert ts", KR(ret), K(ts));
-    } else if (OB_FAIL(log_base_header.serialize(buf, serizlize_size, pos))) {
-      LOG_ERROR("serialize log_base_header failed", KR(ret), K(buf), K(serizlize_size), K(pos));
+    } else if (OB_FAIL(gc_log.serialize(buf, serizlize_size, pos))) {
+      LOG_ERROR("serialize offline GC log failed", KR(ret), K(buf), K(serizlize_size), K(pos));
     } else if (OB_FAIL(entry_header.generate_header(buf, serizlize_size, scn))) {
       LOG_ERROR("generate_header for offline log_entry failed", KR(ret));
     } else {
@@ -175,6 +190,10 @@ public:
   }
 
   void gen_redo_log();
+  int gen_lob_outtable_data_log(ObTxLobOutTableDataLog &log)
+  {
+    return block_builder_.fill_tx_log_except_redo(log);
+  }
   void gen_rollback_to_log();
   void gen_mds_log();
   void gen_record_log();

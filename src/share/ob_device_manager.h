@@ -18,6 +18,9 @@ namespace oceanbase
 namespace common
 {
 
+// Resolve the storage IO tenant, including explicit access targets and background IO fallback.
+uint64_t get_storage_io_tenant_id();
+
 class ObObjectStorageInfo;
 class ObTenantStsCredentialMgr : public ObTenantStsCredentialBaseMgr
 {

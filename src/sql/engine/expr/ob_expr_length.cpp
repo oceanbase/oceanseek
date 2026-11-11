@@ -143,20 +143,27 @@ int ObExprLength::calc_mysql_mode(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &e
     expr_datum.set_int(static_cast<int64_t>(text_datum->len_));
   } else { // text tc only
     ObLobLocatorV2 locator(text_datum->get_string());
-    uint64_t lob_data_byte_len = 0;
-    if (OB_FAIL(ObLobManager::get_byte_length(locator, lob_data_byte_len))) {
-      LOG_WARN("get lob data byte length failed", K(ret), K(locator));
-    } else {
-      expr_datum.set_int(static_cast<int64_t>(lob_data_byte_len));
+    int64_t byte_length = 0;
+    if (locator.has_inrow_data()) {
+      if (OB_FAIL(locator.get_lob_inrow_data_byte_len(byte_length))) {
+        LOG_WARN("get inrow lob byte length failed", K(ret), K(locator));
+      }
+    // TODO by renhe: if use lob_mngr->get_byte_length, must build read_ctx first.
+    } else if (OB_FAIL(get_outline_lob_byte_length(expr, ctx, text_datum->get_string(),
+                                                   byte_length))) {
+      LOG_WARN("get lob byte length failed", K(ret), K(locator));
+    }
+    if (OB_SUCC(ret)) {
+      expr_datum.set_int(byte_length);
     }
   }
   return ret;
 }
 
-int ObExprLength::get_outrow_lob_byte_length(const ObExpr &expr,
-                                             ObEvalCtx &ctx,
-                                             const ObString &lob_str,
-                                             int64_t &byte_length)
+int ObExprLength::get_outline_lob_byte_length(const ObExpr &expr,
+                                              ObEvalCtx &ctx,
+                                              const ObString &lob_str,
+                                              int64_t &byte_length)
 {
   int ret = OB_SUCCESS;
   byte_length = 0;
@@ -165,21 +172,31 @@ int ObExprLength::get_outrow_lob_byte_length(const ObExpr &expr,
   ObSQLSessionInfo *session = ctx.exec_ctx_.get_my_session();
   ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
   ObLobReadContext read_ctx;
-  uint64_t lob_byte_len = 0;
+  ObLobAccessCtx *lob_access_ctx = nullptr;
   int64_t timeout = 0;
   if (OB_ISNULL(lob_mngr) || OB_ISNULL(session)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("null lob manager or session", K(ret), KP(lob_mngr), KP(session));
+  } else if (OB_UNLIKELY(locator.is_external_temp_lob())) {
+    ret = OB_NOT_SUPPORTED;
+    // Reject direct reads of temporary external LOBs and report the error to the user.
+    // Check at shared read entry points to avoid duplicating checks across SQL functions.
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "reading a temporary external LOB");
+    COMMON_LOG(WARN, "reading a temporary external LOB", K(ret), K(locator));
+  } else if (OB_FAIL(ctx.exec_ctx_.get_lob_access_ctx(lob_access_ctx))) {
+    LOG_WARN("failed to get lob access context", KR(ret), K(locator.size_), K(session->get_effective_tenant_id()));
   } else if (OB_FAIL(session->get_query_timeout(timeout))) {
     LOG_WARN("failed to get query timeout", K(ret));
   } else {
-    // build a query param from the result-row mem locator, then ask the lob
-    // manager for the byte length (scans the lob meta table for outrow lob).
+    // Manager reads Internal summary or resolves the External descriptor and undeclared length.
     timeout += session->get_query_start_time();
     if (OB_FAIL(lob_mngr->build_lob_read_context(read_ctx, tmp_alloc_g.get_allocator(),
                 expr.args_[0]->datum_meta_.cs_type_, 0/*offset*/, UINT64_MAX/*len*/,
-                timeout, locator, session->get_tx_desc(), nullptr/*lob_access_ctx*/))) {
-      LOG_WARN("failed to build lob read context", K(ret), K(locator));
+                timeout, locator, session->get_tx_desc(), lob_access_ctx))) {
+      LOG_WARN("failed to build lob read context", K(ret), K(locator.size_), K(timeout));
+    } else if (OB_UNLIKELY(read_ctx.byte_size_ > static_cast<uint64_t>(INT64_MAX))) {
+      ret = OB_SIZE_OVERFLOW;
+      LOG_WARN("lob length exceeds SQL integer range", KR(ret), K(read_ctx.byte_size_));
     } else {
       byte_length = static_cast<int64_t>(read_ctx.byte_size_);
     }
@@ -221,11 +238,11 @@ int ObExprLength::calc_mysql_length_vector_dispatch(const ObExpr &expr,
             if (OB_FAIL(locator.get_lob_inrow_data_byte_len(res_length))) {
               LOG_WARN("get inrow lob byte length failed", K(ret), K(locator), K(len));
             }
-          } else if (OB_FAIL(get_outrow_lob_byte_length(
+          // TODO by renhe: if use lob_mngr->get_byte_length, must build read_ctx first.
+          } else if (OB_FAIL(get_outline_lob_byte_length(
                          expr, ctx, ObString(len, ptr), res_length))) {
-            // outrow lob: the byte length cannot be read from the locator header
-            // alone, it must be queried from the lob storage (lob meta table).
-            LOG_WARN("failed to get outrow lob byte length", K(ret), K(idx), K(len));
+            // Manager retrieves the length for all outline LOBs.
+            LOG_WARN("failed to get outline lob byte length", K(ret), K(idx), K(len));
           }
         }
       }

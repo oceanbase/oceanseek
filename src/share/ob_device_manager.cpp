@@ -6,6 +6,7 @@
 #include <sys/vfs.h>
 #include <unistd.h>
 #include "lib/restore/ob_object_device.h"
+#include "lib/restore/ob_object_storage_base.h"
 #ifdef OB_BUILD_SHARED_STORAGE
 #include "storage/shared_storage/ob_table_device.h"
 #endif
@@ -16,6 +17,7 @@
 #include "share/ob_server_struct.h"
 #include "share/io/ob_io_manager.h"
 #include "share/io/ob_io_struct.h"
+#include "share/rc/ob_tenant_base.h"
 #include "share/ob_local_device.h"
 #include "share/external_table/ob_hdfs_table_device.h"
 #ifdef OB_BUILD_SHARED_STORAGE
@@ -28,6 +30,19 @@ namespace oceanbase
 {
 namespace common
 {
+
+uint64_t get_storage_io_tenant_id()
+{
+  // Only explicit access targets override MTL; ordinary storage guards keep the MTL selection.
+  uint64_t tenant_id = ObStorageAccessTenantGuard::get_target_tenant_id();
+  if (OB_INVALID_TENANT_ID == tenant_id) {
+    tenant_id = MTL_ID();
+  }
+  if (is_virtual_tenant_id(tenant_id) || (0 == tenant_id)) {
+    tenant_id = OB_SERVER_TENANT_ID; // use 500 tenant in io manager
+  }
+  return tenant_id;
+}
 
 int find_existing_parent_path(ObIAllocator &allocator, const char *path, char *&exist_path)
 {

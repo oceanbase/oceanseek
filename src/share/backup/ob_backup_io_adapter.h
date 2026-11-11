@@ -22,21 +22,23 @@ int switch_s3_compatible_to_s3(ObIAllocator &allocator, const common::ObString &
 class ObBackupIoAdapter
 {
 public:
-  // 表设备专用的打开参数。
-  struct TableOpenParam final
+  struct ExtOpenParam final
   {
-    TableOpenParam(const bool is_batch_write,
-                   const int64_t meta_type,
-                   const ObObjectReadResultFormat result_format)
+    ExtOpenParam(const bool is_batch_write,
+                 const int64_t meta_type,
+                 const ObObjectReadResultFormat result_format,
+                 const char *etag)
       : is_batch_write_(is_batch_write),
         meta_type_(meta_type),
-        result_format_(result_format)
+        result_format_(result_format),
+        etag_(etag)
     {}
-    TO_STRING_KV(K_(is_batch_write), K_(meta_type), K_(result_format));
+    TO_STRING_KV(K_(is_batch_write), K_(meta_type), K_(result_format), KCSTRING_(etag));
 
-    bool is_batch_write_;
-    int64_t meta_type_;
-    ObObjectReadResultFormat result_format_;
+    bool is_batch_write_; // Table device only.
+    int64_t meta_type_; // Table device only.
+    ObObjectReadResultFormat result_format_; // Table device only.
+    const char *etag_; // Object storage only; nullptr disables If-Match.
   };
 
   explicit ObBackupIoAdapter() {}
@@ -55,7 +57,14 @@ public:
                                    const common::ObString &uri,
                                    ObStorageAccessType access_type,
                                    const common::ObStorageIdMod &storage_id_mod,
-                                   const TableOpenParam &table_param);
+                                   const char *etag);
+  static int open_with_access_type(ObIODevice *&device_handle,
+                                   ObIOFd &fd,
+                                   const common::ObObjectStorageInfo *storage_info,
+                                   const common::ObString &uri,
+                                   ObStorageAccessType access_type,
+                                   const common::ObStorageIdMod &storage_id_mod,
+                                   const ExtOpenParam &ext_param);
   static int get_and_init_device(ObIODevice *&dev_handle, 
                                  const common::ObObjectStorageInfo *storage_info,
                                  const common::ObString &storage_type_prefix,
@@ -80,7 +89,8 @@ public:
                              int64_t &file_length);
   static int get_file_stat(const common::ObString &uri,
                            const common::ObObjectStorageInfo *storage_info,
-                           common::ObIODFileStat &statbuf);
+                           common::ObIODFileStat &statbuf,
+                           uint64_t timeout_us = 0);
   static int get_file_size(ObIODevice *device_handle, const ObIOFd &fd, int64_t &file_length);
   static int adaptively_get_file_length(const common::ObString &uri,
                                         const common::ObObjectStorageInfo *storage_info, 
@@ -216,6 +226,12 @@ public:
                    char *buf, const int64_t buf_size, const int64_t offset,
                    int64_t &read_size,
                    const common::ObStorageIdMod &storage_id_mod);
+  static int pread_with_if_match(const common::ObString &uri,
+                                 const common::ObObjectStorageInfo *storage_info,
+                                 const char *etag,
+                                 char *buf, const int64_t buf_size, const int64_t offset,
+                                 int64_t &read_size,
+                                 const common::ObStorageIdMod &storage_id_mod);
   // design for concurrent read one object.
   // @device_handle: ObObjectDevice obtained by open_with_access_type.
   // @fd: ObIOFd obtained by open_with_access_type.
@@ -367,6 +383,27 @@ public:
     }
     return ret;
   }
+
+  static int open_with_access_type(ObIODevice *&device_handle, ObIOFd &fd,
+                                   const common::ObObjectStorageInfo *storage_info,
+                                   const common::ObString &uri,
+                                   ObStorageAccessType access_type,
+                                   const common::ObStorageIdMod &storage_id_mod,
+                                   const char *etag)
+  {
+    int ret = OB_SUCCESS;
+    ObArenaAllocator allocator;
+    ObString new_uri;
+    if (OB_FAIL(switch_s3_compatible_to_s3(allocator, uri, new_uri))) {
+      OB_LOG(WARN, "fail to switch S3 alias to s3", K(ret), K(uri));
+    } else if (OB_FAIL(ObBackupIoAdapter::open_with_access_type(device_handle,fd, storage_info,
+                                                                new_uri, access_type,
+                                                                storage_id_mod, etag))) {
+      OB_LOG(WARN, "fail to open with access type", K(ret), K(new_uri), K(access_type));
+    }
+    return ret;
+  }
+
   static int get_and_init_device(ObIODevice *&device_handle,
                                  const common::ObObjectStorageInfo *storage_info,
                                  const common::ObString &storage_type_prefix,
@@ -395,6 +432,10 @@ public:
   EXTERNAL_IO_ADAPTER_FUNCTION(get_file_stat, const common::ObString &, uri,
                                             const common::ObObjectStorageInfo *, storage_info,
                                             common::ObIODFileStat &, statbuf)
+  EXTERNAL_IO_ADAPTER_FUNCTION(get_file_stat, const common::ObString &, uri,
+                                              const common::ObObjectStorageInfo *, storage_info,
+                                              common::ObIODFileStat &, statbuf,
+                                              uint64_t, timeout_us)
   EXTERNAL_IO_ADAPTER_FUNCTION(adaptively_get_file_length, const common::ObString &, uri, 
                                                            const common::ObObjectStorageInfo *, storage_info, 
                                                            int64_t &, file_length) 

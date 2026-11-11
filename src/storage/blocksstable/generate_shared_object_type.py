@@ -265,9 +265,7 @@ def start_generate_h(h_file_name):
 #ifndef OCEANBASE_BLOCKSSTABLE_OB_STORAGE_OBJECT_TYPE_H_
 #define OCEANBASE_BLOCKSSTABLE_OB_STORAGE_OBJECT_TYPE_H_
 
-#ifdef OB_BUILD_SHARED_STORAGE
 #include "storage/shared_storage/ob_ss_reader_writer.h"
-#endif
 #include "common/storage/ob_device_common.h"
 
 namespace oceanbase
@@ -373,7 +371,6 @@ public:
   // check macro block id valid
   virtual bool is_valid(const MacroBlockId &file_id) const { return false; }
   virtual bool has_effective_tablet_id() const { return false; }
-#ifdef OB_BUILD_SHARED_STORAGE
   // path format reverse, macro id to local path
   virtual int to_local_path_format(char *path, const int64_t length, int64_t &pos,
                                    const MacroBlockId &file_id, const uint64_t tenant_id,
@@ -404,7 +401,6 @@ public:
   int get_macro_cache_type(const uint64_t effective_tablet_id, const bool use_effective_tablet_id,
                            storage::ObSSMacroCacheType &macro_cache_type) const;
   int stract_remote_path_format(char *path, const int64_t length, int64_t &pos, const MacroBlockId &file_id, const char *object_storage_root_dir, const uint64_t cluster_id, const uint64_t tenant_id) const;
-#endif
   virtual int opt_to_string(char *buf, const int64_t buf_len, int64_t &pos, const ObStorageObjectOpt &opt) const { return OB_SUCCESS; }
   virtual int get_object_id(const ObStorageObjectOpt &opt, MacroBlockId &object_id) const { return OB_SUCCESS; }
   void set_ss_object_first_id_(const uint64_t column_group_id, MacroBlockId &object_id) const;
@@ -431,11 +427,9 @@ def start_generate_cpp(cpp_file_name):
 #include "ob_storage_object_type.h"
 #include "storage/blocksstable/ob_object_manager.h"
 #include "storage/meta_store/ob_tenant_storage_meta_service.h"
-#ifdef OB_BUILD_SHARED_STORAGE
-#include "src/storage/shared_storage/ob_file_helper.h"
-#include "src/storage/shared_storage/ob_dir_manager.h"
-#include "src/storage/shared_storage/storage_cache_policy/ob_storage_cache_service.h"
-#endif
+#include "close_modules/shared_storage/storage/shared_storage/ob_file_helper.h"
+#include "close_modules/shared_storage/storage/shared_storage/ob_dir_manager.h"
+#include "close_modules/shared_storage/storage/shared_storage/storage_cache_policy/ob_storage_cache_service.h"
 
 namespace oceanbase
 {
@@ -452,8 +446,6 @@ def end_generate_cpp():
     global cpp_f
     end = '''
 };
-
-#ifdef OB_BUILD_SHARED_STORAGE
 
 static inline const char *get_ls_inner_tablet_name_(const int64_t tablet_id)
 {
@@ -518,8 +510,6 @@ static int prewarm_file_remote_path_to_macro_id(const char *path, const ObStorag
   }
   return ret;
 }
-#endif
-
 const char *get_storage_objet_type_str(const ObStorageObjectType type)
 {
   return STI(type).get_type_str();
@@ -550,13 +540,14 @@ int64_t ObStorageObjectTypeBase::to_string(char *buf, const int64_t buf_len) con
   return pos;
 }
 
-#ifdef OB_BUILD_SHARED_STORAGE
 void ObStorageObjectTypeBase::get_ss_macro_block_type(
   const MacroBlockId &macro_id, storage::ObSSMacroBlockType &ss_macro_block_type) const
 {
   ss_macro_block_type = ObSSMacroBlockType::MAX_TYPE;
   if (ObStorageObjectType::EXTERNAL_TABLE_FILE == type_) {
     ss_macro_block_type = ObSSMacroBlockType::EXTERNAL_TABLE;
+  } else if (ObStorageObjectType::SHARED_EXTERNAL_LOB_DATA_MACRO == type_) {
+    ss_macro_block_type = ObSSMacroBlockType::EXTERNAL_LOB;
   } else if (macro_id.is_shared_data_or_meta()) {
     ss_macro_block_type = ObSSMacroBlockType::SHARED_MACRO;
   } else if (macro_id.is_private_data_or_meta()) {
@@ -705,6 +696,15 @@ int ObStorageObjectTypeBase::aio_read(
         }
         break;
       }
+      case ObStorageObjectType::SHARED_EXTERNAL_LOB_DATA_MACRO: {
+        ObSSExternalLobReader reader;
+        if (OB_FAIL(reader.init(&read_info))) {
+          LOG_WARN("failed to initialize external lob reader", KR(ret));
+        } else if (OB_FAIL(reader.aio_read(read_info, object_handle))) {
+          LOG_WARN("failed to read external lob piece", KR(ret), K(read_info.macro_block_id_));
+        }
+        break;
+      }
       case ObStorageObjectType::EXTERNAL_TABLE_FILE: {
         ObSSExternalFileReader external_file_reader;
         if (OB_FAIL(external_file_reader.init(&read_info))) {
@@ -778,6 +778,13 @@ int ObStorageObjectTypeBase::aio_write(
         }
         break;
       }
+      case ObStorageObjectType::SHARED_EXTERNAL_LOB_DATA_MACRO: {
+        // This ID is not a writable database object; cache writes use LocalCacheWriter.
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("writing an external lob object is not supported", KR(ret),
+            "macro_id", object_handle.get_macro_id(), K(write_info.size_));
+        break;
+      }
       case ObStorageObjectType::EXTERNAL_TABLE_FILE: {
         ObSSLocalCacheWriter local_cache_writer;
         if (OB_FAIL(local_cache_writer.aio_write(write_info, object_handle))) {
@@ -811,8 +818,6 @@ int ObStorageObjectTypeBase::stract_remote_path_format(char *path, const int64_t
   }
   return ret;
 }
-
-#endif
 
 bool ObStorageObjectTypeBase::has_write_back_strategy() const
 {
@@ -1034,12 +1039,11 @@ public:
             shared_storage_functions.append('  virtual int get_effective_tablet_id(const MacroBlockId &macro_id, uint64_t &effective_tablet_id) const;')
             h_f.write('  virtual bool has_effective_tablet_id() const { return true; }\n')
 
-        # Write shared storage functions under one macro
+        # Emit shared storage function declarations
         if shared_storage_functions:
-            h_f.write('\n#ifdef OB_BUILD_SHARED_STORAGE\n')
+            h_f.write('\n')
             for func_decl in shared_storage_functions:
                 h_f.write(func_decl + '\n')
-            h_f.write('\n#endif\n')
 
         if cfg.get('opt_to_string') and cfg['opt_to_string'] != 'OB_NOT_SUPPORTED':
             h_f.write('  virtual int opt_to_string(char *buf, const int64_t buf_len, int64_t &pos, const ObStorageObjectOpt &opt) const;\n')
@@ -1129,15 +1133,15 @@ def generate_class_implementations():
             impl += extract_function_body(cfg['get_effective_tablet_id'])
             shared_storage_impls.append(impl)
         
-        # Write shared storage implementations under one macro
+        # Emit shared storage function definitions
         if shared_storage_impls:
-            cpp_f.write('\n#ifdef OB_BUILD_SHARED_STORAGE')
+            cpp_f.write('\n')
             for i, impl in enumerate(shared_storage_impls):
-                cpp_f.write('\n' + impl)
-                # Add blank line between functions within the #ifdef block
+                cpp_f.write(impl)
+                # Separate function definitions with a blank line
                 if i < len(shared_storage_impls) - 1:
                     cpp_f.write('\n')
-            cpp_f.write('\n#endif\n')
+            cpp_f.write('\n')
         
         if cfg.get('opt_to_string') and cfg['opt_to_string'] != 'OB_NOT_SUPPORTED':
             cpp_f.write(f'\nint {class_name}::opt_to_string(char *buf, const int64_t buf_len, int64_t &pos,\n')

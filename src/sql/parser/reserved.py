@@ -976,6 +976,7 @@ class SqlKeywords:
          EXPANSION
          EXPIRE
          EXPORT
+         EXTBLOB
          EXTENDED
          EXTENT_SIZE
          FAST

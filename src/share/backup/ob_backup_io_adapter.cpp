@@ -88,9 +88,13 @@ struct DeviceGuard : public ObObjectStorageTenantGuard
       const ObString &uri,
       const common::ObObjectStorageInfo *storage_info,
       const ObStorageIdMod &storage_id_mod,
-      const ObStorageAccessType access_type = OB_STORAGE_ACCESS_UTIL)
+      const ObStorageAccessType access_type = OB_STORAGE_ACCESS_UTIL,
+      const uint64_t timeout_us = 0)
   {
     int ret = OB_SUCCESS;
+    if (0 != timeout_us) {
+      set_timeout_us(MIN(timeout_us, static_cast<uint64_t>(get_timeout_us())));
+    }
     if (OB_UNLIKELY(uri.empty()) || OB_NOT_NULL(uri.find('\0'))) {
       ret = OB_INVALID_ARGUMENT;
       OB_LOG(WARN, "uri is invalid, maybe contains '\0'",
@@ -122,12 +126,11 @@ int ObBackupIoAdapter::open_with_access_type(
     const int64_t meta_type)
 {
   int ret = OB_SUCCESS;
-  const TableOpenParam table_param(
-      is_batch_write, meta_type, ObObjectReadResultFormat::DEFAULT);
+  const ExtOpenParam ext_param(is_batch_write, meta_type, ObObjectReadResultFormat::DEFAULT, nullptr);
   if (OB_FAIL(open_with_access_type(device_handle, fd, storage_info, uri,
-                                    access_type, storage_id_mod, table_param))) {
+                                    access_type, storage_id_mod, ext_param))) {
     OB_LOG(WARN, "fail to open with access type", KR(ret), K(uri), KPC(storage_info),
-        K(access_type), K(storage_id_mod), K(table_param));
+        K(access_type), K(storage_id_mod), K(ext_param));
   }
   return ret;
 }
@@ -139,11 +142,33 @@ int ObBackupIoAdapter::open_with_access_type(
     const common::ObString &uri,
     ObStorageAccessType access_type,
     const common::ObStorageIdMod &storage_id_mod,
-    const TableOpenParam &table_param)
+    const char *etag)
+{
+  int ret = OB_SUCCESS;
+  const ExtOpenParam ext_param(false, -1, ObObjectReadResultFormat::DEFAULT, etag);
+  if (OB_FAIL(open_with_access_type(device_handle, fd, storage_info, uri,
+                                    access_type, storage_id_mod, ext_param))) {
+    OB_LOG(WARN, "fail to open with access type", KR(ret), K(uri), KPC(storage_info),
+        K(access_type), K(storage_id_mod), K(ext_param));
+  }
+  return ret;
+}
+
+int ObBackupIoAdapter::open_with_access_type(
+    ObIODevice *&device_handle,
+    ObIOFd &fd,
+    const common::ObObjectStorageInfo *storage_info,
+    const common::ObString &uri,
+    ObStorageAccessType access_type,
+    const common::ObStorageIdMod &storage_id_mod,
+    const ExtOpenParam &ext_param)
 {
   int ret = OB_SUCCESS;
   ObIODevice *acquired_device_handle = nullptr;
-  static constexpr int64_t IOD_OPT_ARRAY_SIZE = MAX(2, ObTableDeviceOpenOption::COUNT);
+  static constexpr int64_t IOD_OPT_ARRAY_SIZE = MAX(3, ObTableDeviceOpenOption::COUNT);
+  const bool is_object_storage_uri =
+      uri.prefix_match(OB_S3_PREFIX)
+      || uri.prefix_match(OB_AZBLOB_PREFIX);
   ObIODOpt iod_opt_array[IOD_OPT_ARRAY_SIZE];
   ObIODOpts iod_opts;
   iod_opts.opts_ = iod_opt_array;
@@ -170,12 +195,16 @@ int ObBackupIoAdapter::open_with_access_type(
   } else if (OB_UNLIKELY(!is_valid_device_uri)) {
     ret = OB_INVALID_BACKUP_DEST;
     OB_LOG(WARN, "invalid storage type prefix", KR(ret), K(uri), K(storage_id_mod));
+  } else if (OB_NOT_NULL(ext_param.etag_) && !is_object_storage_uri) {
+    ret = OB_NOT_SUPPORTED;
+    OB_LOG(WARN, "if-match read is unsupported for non-object device",
+        KR(ret), K(uri), K(ext_param));
   } else if (OB_UNLIKELY(
       !is_table_uri
-      && ObObjectReadResultFormat::DEFAULT != table_param.result_format_)) {
+      && ObObjectReadResultFormat::DEFAULT != ext_param.result_format_)) {
     ret = OB_NOT_SUPPORTED;
     OB_LOG(WARN, "non-default read result format is unsupported for non-table device",
-        KR(ret), K(uri), K(table_param));
+        KR(ret), K(uri), K(ext_param));
   } else {
     ObObjectStorageTenantGuard object_storage_tenant_guard(
         get_tenant_id(), OB_IO_MANAGER.get_object_storage_io_timeout_ms(get_tenant_id()) * 1000LL);
@@ -189,22 +218,26 @@ int ObBackupIoAdapter::open_with_access_type(
           KR(ret), K(uri), KPC(storage_info), K(access_type), KP(acquired_device_handle));
     } else {
       if (acquired_device_handle->is_table_device()) {
-        // 为表设备设置 is_batch_write、meta_type 和 read_result_format 选项
+        // Set table-device-specific open options.
         iod_opts.opts_[ObTableDeviceOpenOption::IS_BATCH_WRITE_IDX].set(
             ObTableDeviceOpenOption::KEYS[ObTableDeviceOpenOption::IS_BATCH_WRITE_IDX],
-            table_param.is_batch_write_);
+            ext_param.is_batch_write_);
         iod_opts.opts_[ObTableDeviceOpenOption::META_TYPE_IDX].set(
             ObTableDeviceOpenOption::KEYS[ObTableDeviceOpenOption::META_TYPE_IDX],
-            table_param.meta_type_);
+            ext_param.meta_type_);
         iod_opts.opts_[ObTableDeviceOpenOption::READ_RESULT_FORMAT_IDX].set(
             ObTableDeviceOpenOption::KEYS[ObTableDeviceOpenOption::READ_RESULT_FORMAT_IDX],
-            static_cast<int64_t>(table_param.result_format_));
+            static_cast<int64_t>(ext_param.result_format_));
         iod_opts.opt_cnt_ = ObTableDeviceOpenOption::COUNT;
       } else {
         // For object storage devices: set AccessType and OpenMode
         iod_opts.opts_[0].set("AccessType", OB_STORAGE_ACCESS_TYPES_STR[access_type]);
         if (access_type == OB_STORAGE_ACCESS_APPENDER) {
           iod_opts.opts_[1].set("OpenMode", "CREATE_OPEN_NOLOCK");
+          iod_opts.opt_cnt_++;
+        }
+        if (OB_NOT_NULL(ext_param.etag_)) {
+          iod_opts.opts_[iod_opts.opt_cnt_].set("EtagIfMatch", ext_param.etag_);
           iod_opts.opt_cnt_++;
         }
       }
@@ -351,7 +384,7 @@ int ObBackupIoAdapter::get_file_length(const common::ObString &uri,
     const common::ObObjectStorageInfo *storage_info, int64_t &file_length)
 {
   int ret = OB_SUCCESS;
-  ObIODFileStat statbuf;
+  ObIODFileStat statbuf(get_tenant_id());
   file_length = -1;
   if (OB_FAIL(get_file_stat(uri, storage_info, statbuf))) {
     OB_LOG(WARN, "fail to get file length", KR(ret), K(uri), KPC(storage_info));
@@ -361,15 +394,25 @@ int ObBackupIoAdapter::get_file_length(const common::ObString &uri,
   return ret;
 }
 
-int ObBackupIoAdapter::get_file_stat(const common::ObString &uri,
-    const common::ObObjectStorageInfo *storage_info, common::ObIODFileStat &statbuf)
+int ObBackupIoAdapter::get_file_stat(
+    const common::ObString &uri,
+    const common::ObObjectStorageInfo *storage_info,
+    common::ObIODFileStat &statbuf,
+    uint64_t timeout_us)
 {
   int ret = OB_SUCCESS;
-  statbuf = ObIODFileStat();
+  statbuf.reset();
   DeviceGuard device_guard;
-  if (OB_FAIL(device_guard.init(uri, storage_info, ObStorageIdMod::get_default_id_mod()))) {
+  if (OB_FAIL(device_guard.init(uri,
+                                storage_info,
+                                ObStorageIdMod::get_default_id_mod(),
+                                OB_STORAGE_ACCESS_UTIL,
+                                timeout_us))) {
     OB_LOG(WARN, "fail to init device guard", KR(ret), K(uri), KPC(storage_info));
-  } else if (OB_FAIL(OB_IO_MANAGER.stat(get_tenant_id(), device_guard.fd_, device_guard.uri_cstr_, statbuf))) {
+  } else if (OB_FAIL(OB_IO_MANAGER.stat(get_tenant_id(),
+                                        device_guard.fd_,
+                                        device_guard.uri_cstr_,
+                                        statbuf))) {
     OB_LOG(WARN, "fail to get file stat", KR(ret), K(uri), KPC(storage_info), K(device_guard));
   }
   return ret;
@@ -378,7 +421,7 @@ int ObBackupIoAdapter::get_file_stat(const common::ObString &uri,
 int ObBackupIoAdapter::adaptively_get_file_length(const common::ObString &uri, const common::ObObjectStorageInfo *storage_info, int64_t &file_length)
 {
   int ret = OB_SUCCESS;
-  ObIODFileStat statbuf;
+  ObIODFileStat statbuf(get_tenant_id());
   file_length = -1;
   DeviceGuard device_guard;
   if (OB_FAIL(device_guard.init(uri, storage_info, ObStorageIdMod::get_default_id_mod()))) {
@@ -395,7 +438,7 @@ int ObBackupIoAdapter::get_file_modify_time(const common::ObString &uri,
     const common::ObObjectStorageInfo *storage_info, int64_t &modify_time_s)
 {
   int ret = OB_SUCCESS;
-  ObIODFileStat statbuf;
+  ObIODFileStat statbuf(get_tenant_id());
   modify_time_s = -1;
   if (OB_FAIL(get_file_stat(uri, storage_info, statbuf))) {
     OB_LOG(WARN, "fail to get file stat", KR(ret), K(uri), KPC(storage_info));
@@ -1042,6 +1085,41 @@ int ObBackupIoAdapter::pread(
   return ret;
 }
 
+int ObBackupIoAdapter::pread_with_if_match(
+    const ObString &uri,
+    const common::ObObjectStorageInfo *storage_info,
+    const char *etag,
+    char *buf,
+    const int64_t buf_size,
+    const int64_t offset,
+    int64_t &read_size,
+    const common::ObStorageIdMod &storage_id_mod)
+{
+  int ret = OB_SUCCESS;
+  int ret_tmp = OB_SUCCESS;
+  ObIOFd fd;
+  ObIODevice *device_handle = nullptr;
+  read_size = 0;
+
+  if (OB_ISNULL(etag) || OB_UNLIKELY(0 == STRLEN(etag))) {
+    ret = OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "invalid if-match etag", KR(ret));
+  } else if (OB_FAIL(open_with_access_type(device_handle, fd, storage_info, uri,
+                                           OB_STORAGE_ACCESS_NOHEAD_READER, storage_id_mod, etag))) {
+    OB_LOG(WARN, "fail to get device and open file", K(uri), KR(ret));
+  } else if (FALSE_IT(fd.device_handle_ = device_handle)) {
+  } else if (OB_FAIL(io_manager_read(buf, offset, buf_size, fd, read_size))) {
+    OB_LOG(WARN, "fail to io manager read", KR(ret), K(uri), K(storage_info), K(offset), K(buf_size), K(fd));
+  }
+
+  if (OB_SUCCESS != (ret_tmp = close_device_and_fd(device_handle, fd))) {
+    ret = (OB_SUCCESS == ret) ? ret_tmp : ret;
+    OB_LOG(WARN, "fail to close device and fd", KR(ret), K(ret_tmp));
+  }
+
+  return ret;
+}
+
 int ObBackupIoAdapter::async_pread(
     ObIODevice &device_handle,
     ObIOFd &fd,
@@ -1527,7 +1605,7 @@ int ObBackupIoAdapter::is_directory(
     bool &is_directory)
 {
   int ret = OB_SUCCESS;
-  ObIODFileStat statbuf;
+  ObIODFileStat statbuf(get_tenant_id());
   is_directory = false;
   DeviceGuard device_guard;
   if (OB_UNLIKELY(!uri.prefix_match(OB_HDFS_PREFIX))) {
@@ -1828,15 +1906,7 @@ int ObBackupIoAdapter::async_io_manager_upload(
 
 uint64_t ObBackupIoAdapter::get_tenant_id()
 {
-  // 仅显式指定的访问目标优先；普通存储 guard 不改变原有的 MTL 选择规则。
-  uint64_t tenant_id = ObStorageAccessTenantGuard::get_target_tenant_id();
-  if (OB_INVALID_TENANT_ID == tenant_id) {
-    tenant_id = MTL_ID();
-  }
-  if (is_virtual_tenant_id(tenant_id) || (0 == tenant_id)) {
-    tenant_id = OB_SERVER_TENANT_ID; // use 500 tenant in io manager
-  }
-  return tenant_id;
+  return get_storage_io_tenant_id();
 }
 
 int ObFileListArrayOp::func(const dirent *entry)

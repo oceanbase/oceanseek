@@ -60,6 +60,7 @@ static void init_arrow_conv_table()
   REG_TEXT_DUAL(ObTextType);
   REG_TEXT_DUAL(ObMediumTextType);
   REG_TEXT_DUAL(ObLongTextType);
+  REG_TEXT_DUAL(ObExtendBLobType);
 #undef REG_TEXT_DUAL
 
   REG_CONV(ObEnumType, STRING, StrGroup);

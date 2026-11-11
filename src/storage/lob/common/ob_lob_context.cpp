@@ -24,27 +24,9 @@ namespace storage
 
 //==================== ObLobContextBase ====================
 ObLobContextBase::ObLobContextBase()
-  : allocator_(nullptr),
-    snapshot_(),
-    sql_mode_(SMO_DEFAULT),
-    tenant_id_(MTL_ID()),
-    ls_id_(),
-    tablet_id_(),
-    lob_meta_tablet_id_(),
-    lob_piece_tablet_id_(),
-    coll_type_(),
-    src_loc_(),
-    byte_size_(UINT64_MAX),
-    timeout_(0),
-    fb_snapshot_(),
-    offset_(0),
-    len_(0),
-    read_latest_(false),
-    need_read_latest_(false),
-    src_loc_wrapper_(),
-    store_column_idx_(0),
-    addr_()
-{}
+{
+  reset();
+}
 
 int ObLobContextBase::assign_common(const ObLobContextBase &other)
 {
@@ -79,15 +61,42 @@ int ObLobContextBase::assign_common(const ObLobContextBase &other)
   return ret;
 }
 
+void ObLobContextBase::reset()
+{
+  allocator_ = nullptr,
+  snapshot_.reset();
+  sql_mode_ = SMO_DEFAULT;
+  tenant_id_ = MTL_ID();
+  ls_id_ = share::ObLSID::INVALID_LS_ID;
+  tablet_id_ = common::ObTabletID::INVALID_TABLET_ID;
+  lob_meta_tablet_id_ = common::ObTabletID::INVALID_TABLET_ID,
+  lob_piece_tablet_id_ = common::ObTabletID::INVALID_TABLET_ID,
+  coll_type_ = CS_TYPE_INVALID,
+  src_loc_.reset();
+  byte_size_ = UINT64_MAX,
+  timeout_ = 0,
+  fb_snapshot_ = share::SCN::invalid_scn(),
+  offset_ = 0,
+  len_ = 0,
+  read_latest_ = false,
+  need_read_latest_ = false,
+  src_loc_wrapper_.reset();
+  store_column_idx_ = 0,
+  addr_.reset();
+}
+
 int ObLobContextBase::init_src_loc_wrapper_()
 {
   int ret = OB_SUCCESS;
   ObString disk_loc_buff;
   src_loc_wrapper_.reset();
-  if (src_loc_.is_null()) {
+  if (0 == src_loc_.size_) {
     // empty lob on insert has no disk locator yet
   } else if (!src_loc_.is_valid()) {
     LOG_WARN("invalid src loc", KR(ret));
+  } else if (src_loc_.is_external_temp_lob()) {
+    // TODO by renhe: remove this silent non-op, expose it outside
+    // Temporary External has no Disk locator; first insert gets references from the Mem descriptor.
   } else if (OB_FAIL(src_loc_.get_disk_locator(disk_loc_buff))) {
     LOG_WARN("failed to get disk locator", K(ret), K(src_loc_));
   } else if (OB_FAIL(src_loc_wrapper_.init(disk_loc_buff.ptr(),
@@ -100,18 +109,22 @@ int ObLobContextBase::init_src_loc_wrapper_()
 //==================== ObLobReadContext ====================
 
 ObLobReadContext::ObLobReadContext()
-  : ObLobContextBase(),
-    scan_backward_(false),
-    from_rpc_(false),
-    inrow_read_nocopy_(false),
-    no_need_retry_(false),
-    enable_remote_retry_(false),
-    is_full_table_scan_(false),
-    access_ctx_(nullptr),
-    seq_id_start_(),
-    seq_id_end_(),
-    iter_allocator_("LobIter", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID())
+  : iter_allocator_("LobIter", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID())
 {
+  reset();
+}
+
+void ObLobReadContext::reset()
+{
+  scan_backward_ = false;
+  from_rpc_ = false;
+  inrow_read_nocopy_ = false;
+  enable_remote_retry_ = false;
+  is_full_table_scan_ = false;
+  access_ctx_ = nullptr;
+  seq_id_start_.reset();
+  seq_id_end_.reset();
+  ObLobContextBase::reset();
 }
 
 ObLobReadContext::~ObLobReadContext()
@@ -163,9 +176,9 @@ int ObLobReadContext::build_for_dml(
     LOG_WARN("column is not lob storage", KR(ret), K(col_idx), KPC(column));
   } else if (FALSE_IT(datum.get_lob_locatorv2(disk_locator))) {
   } else if (OB_UNLIKELY(!disk_locator.is_valid()
-      || !disk_locator.is_outrow_disk_lob_locator())) {
+      || !disk_locator.is_outline_disk_lob_locator())) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("datum is not a valid outrow disk lob locator", KR(ret),
+    LOG_WARN("datum is not a valid outline disk lob locator", KR(ret),
         K(col_idx), K(datum), K(disk_locator));
   } else {
     const share::schema::ObTableSchemaParam &data_table =
@@ -254,6 +267,7 @@ int ObLobReadContext::build(
 {
   int ret = OB_SUCCESS;
   src_loc_ = lob_locator;
+  byte_size_ = UINT64_MAX;
   allocator_ = &allocator;
   offset_ = offset;
   len_ = len;
@@ -303,7 +317,6 @@ int ObLobReadContext::assign(const ObLobReadContext &read_ctx)
     scan_backward_ = read_ctx.scan_backward_;
     from_rpc_ = read_ctx.from_rpc_;
     inrow_read_nocopy_ = read_ctx.inrow_read_nocopy_;
-    no_need_retry_ = read_ctx.no_need_retry_;
     enable_remote_retry_ = read_ctx.enable_remote_retry_;
     is_full_table_scan_ = read_ctx.is_full_table_scan_;
     access_ctx_ = read_ctx.access_ctx_;
@@ -413,9 +426,13 @@ ObLobWriteContext::ObLobWriteContext()
     is_mlog_(false),
     try_flush_redo_(false),
     is_index_table_(false),
+    table_def_type_(share::schema::TABLE_DEF_TYPE_MAX),
     is_table_without_pk_(false),
     inrow_threshold_(OB_DEFAULT_LOB_INROW_THRESHOLD),
-    data_row_(nullptr)
+    intable_threshold_(OB_DEFAULT_LOB_INTABLE_THRESHOLD),
+    data_row_(nullptr),
+    outtable_lob_control_keys_(nullptr),
+    allow_outtable_lob_(false)
 {
   ObMemAttr attr(MTL_ID(), "LobOwn");
   own_allocator_.set_attr(attr);
@@ -457,9 +474,13 @@ int ObLobWriteContext::assign(const ObLobWriteContext &other)
     is_mlog_ = other.is_mlog_;
     try_flush_redo_ = other.try_flush_redo_;
     is_index_table_ = other.is_index_table_;
+    table_def_type_ = other.table_def_type_;
     is_table_without_pk_ = other.is_table_without_pk_;
     inrow_threshold_ = other.inrow_threshold_;
+    intable_threshold_ = other.intable_threshold_;
     data_row_ = other.data_row_;
+    outtable_lob_control_keys_ = other.outtable_lob_control_keys_;
+    allow_outtable_lob_ = other.allow_outtable_lob_;
   }
   return ret;
 }
@@ -496,9 +517,9 @@ int ObLobWriteContext::assign_source(const ObLobReadContext &source)
   return ret;
 }
 
-int64_t ObLobWriteContext::get_chunk_size() const
+int64_t ObLobWriteContext::get_chunk_size(const bool is_outtable) const
 {
-  return ObLobMetaUtil::LOB_PIECE_DATA_SIZE;
+  return is_outtable ? ObLobMetaUtil::LOB_OUTTABLE_BLOCK_DATA_SIZE : ObLobMetaUtil::LOB_PIECE_DATA_SIZE;
 }
 
 int64_t ObLobWriteContext::get_inrow_threshold() const
@@ -509,6 +530,25 @@ int64_t ObLobWriteContext::get_inrow_threshold() const
     res = OB_DEFAULT_LOB_INROW_THRESHOLD;
   }
   return res;
+}
+
+int64_t ObLobWriteContext::get_intable_threshold() const
+{
+  int64_t res = intable_threshold_;
+  if (res < inrow_threshold_ || res < OB_MIN_LOB_INTABLE_THRESHOLD || res > OB_MAX_LOB_INTABLE_THRESHOLD) {
+    LIB_LOG_RET(WARN, OB_ERR_UNEXPECTED,
+                "invalid intable threshold, use default intable threshold", K(res), K(inrow_threshold_));
+    res = OB_DEFAULT_LOB_INTABLE_THRESHOLD;
+  }
+  return res;
+}
+
+bool ObLobWriteContext::can_write_outtable() const
+{
+  // Unknown definition types must not enable OutTable writes.
+  return allow_outtable_lob_ && common::is_user_tenant(tenant_id_)
+         && !tablet_id_.is_inner_tablet()
+         && share::schema::TABLE_DEF_TYPE_USER == table_def_type_;
 }
 
 int ObLobWriteContext::is_timeout() const
@@ -545,12 +585,26 @@ int ObLobWriteContext::build(
   offset_ = 0;
   data_row_ = &data_row;
   is_index_table_ = run_ctx.relative_table_.is_index_table();
+  outtable_lob_control_keys_ = run_ctx.dml_param_.outtable_lob_control_keys_;
+  allow_outtable_lob_ = run_ctx.dml_param_.allow_outtable_lob_;
 
   // get inrow threshold and schema chunk size
   const ObTableDMLParam *table_param = nullptr;
   const ObColumnParam *column_param = nullptr;
   int32_t col_offset = OB_INVALID_INDEX;
-  if (OB_ISNULL(table_param = run_ctx.effective_table_param_)) {
+  // External requires EXTBLOB; locator pass-through conversions must check the target column.
+  // This write guard relies on External sources arriving as flagged Mem locators;
+  // it cannot reject bare External Disk locators.
+  if (OB_UNLIKELY(!src_loc_.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("failed to check source lob locator", KR(ret), K(tablet_id_), K(column.col_id_),
+             "locator_size", src_loc_.size_);
+  } else if (OB_UNLIKELY(src_loc_.is_mem_external_lob() && !column.col_type_.is_extblob())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "assigning an external LOB to a non-EXTBLOB column");
+    LOG_WARN("external lob requires an EXTBLOB column", KR(ret),
+             K(tablet_id_), K(column.col_id_), K(column.col_type_));
+  } else if (OB_ISNULL(table_param = run_ctx.effective_table_param_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("table_param is null", KR(ret), KPC(this));
   } else if (OB_ISNULL(column_param = table_param->get_data_table().get_column(column.col_id_))) {
@@ -558,9 +612,11 @@ int ObLobWriteContext::build(
     LOG_WARN("column param is null", KR(ret));
   } else {
     inrow_threshold_ = table_param->get_data_table().get_lob_inrow_threshold();
+    intable_threshold_ = table_param->get_data_table().get_lob_intable_threshold();
     is_table_without_pk_ = table_param->get_data_table().is_table_without_pk();
 
     const share::schema::ObTableSchemaParam &data_table = table_param->get_data_table();
+    table_def_type_ = data_table.get_def_type();
     const storage::ObTableReadInfo &read_info = data_table.get_read_info();
     if (OB_FAIL(data_table.get_col_map().get(column.col_id_, col_offset))) {
       LOG_WARN("get param idx by column_id fail", KR(ret), K(column.col_id_));
@@ -680,6 +736,24 @@ int ObLobWriteContext::set_aux_dml_base_param(
     dml_base_meta_param_ = value;
   } else if (LobAuxTarget::PIECE == target) {
     dml_base_piece_param_ = value;
+  }
+  return ret;
+}
+
+int ObLobWriteContext::get_trans_ctx(transaction::ObPartTransCtx *&tx_ctx) const
+{
+  int ret = OB_SUCCESS;
+  ObDMLBaseParam *meta_dml = nullptr;
+  tx_ctx = nullptr;
+  if (OB_FAIL(get_aux_dml_base_param(LobAuxTarget::META, meta_dml))) {
+    LOG_WARN("failed to get lob meta dml param", KR(ret), KPC(this));
+  } else if (OB_ISNULL(meta_dml) || OB_ISNULL(meta_dml->store_ctx_guard_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("lob meta store context is null", KR(ret), KP(meta_dml), KPC(this));
+  } else if (OB_ISNULL(tx_ctx =
+      meta_dml->store_ctx_guard_->get_store_ctx().mvcc_acc_ctx_.tx_ctx_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("transaction context is null", KR(ret), KPC(meta_dml), KPC(this));
   }
   return ret;
 }
@@ -834,7 +908,6 @@ int ObLobWriteContext::build_read_context(ObLobReadContext &read_ctx) const
   read_ctx.scan_backward_ = false;
   read_ctx.from_rpc_ = false;
   read_ctx.inrow_read_nocopy_ = false;
-  read_ctx.no_need_retry_ = false;
   read_ctx.need_read_latest_ = need_read_latest_;
   read_ctx.enable_remote_retry_ = false;
   read_ctx.is_full_table_scan_ = false;
@@ -915,7 +988,7 @@ int ObLobAppendContext::build(const ObDMLRunningCtx &run_ctx,
              "delta_collation", extern_header->cs_type_,
              "target_collation", coll_type_);
   } else if (!src_loc_wrapper_.is_inrow()
-             && OB_FAIL(src_loc_wrapper_.get_lob_id(old_lob_id_))) {
+             && OB_FAIL(src_loc_wrapper_.get_lob_id(lob_id_))) {
     LOG_WARN("failed to get old lob id for append", KR(ret), K(src_loc_wrapper_));
   } else {
     dml_op_ = ObLobDmlOp::UPDATE;

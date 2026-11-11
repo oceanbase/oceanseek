@@ -338,7 +338,7 @@ TEST_F(TestSSMarkSweepDiag, study_type_predicate_and_invalid_group)
   high[2].set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
   ASSERT_EQ(OB_SUCCESS, diag.handle_key_range_(range));
   ASSERT_TRUE(diag.has_group_filter_);
-  ASSERT_EQ(ObMarkSweepGroupType::KEPT, diag.group_filter_);
+  ASSERT_EQ(ObAllVirtualSharedGCDiagnose::DiagGroupType::KEPT, diag.group_filter_);
   ASSERT_EQ(ObSSMarkSweepDiagFileType::STUDY_RESULTS, diag.type_filter_);
 
   diag.reset();
@@ -451,10 +451,10 @@ TEST_F(TestSSMarkSweepDiag, study_record_filters_complete_tablet_key)
   diag.ls_id_filter_ = 1;
   diag.has_reorg_scn_filter_ = true;
   diag.reorg_scn_filter_ = SCN::min_scn().get_val_for_inner_table_field();
-  ASSERT_FALSE(diag.pass_optional_filters_(
-      ObSSGCTablet(ObLSID(2), ObTabletID(1002), SCN::min_scn())));
-  ASSERT_FALSE(diag.pass_optional_filters_(
-      ObSSGCTablet(ObLSID(1), ObTabletID(1002), SCN::max_scn())));
+  const ObSSGCTablet different_ls_tablet(ObLSID(2), ObTabletID(1002), SCN::min_scn());
+  const ObSSGCTablet different_reorg_tablet(ObLSID(1), ObTabletID(1002), SCN::max_scn());
+  ASSERT_FALSE(diag.pass_optional_filters_(&different_ls_tablet));
+  ASSERT_FALSE(diag.pass_optional_filters_(&different_reorg_tablet));
   diag.is_buckets_listed_ = true;
   diag.cur_row_.cells_ = cells;
   diag.cur_row_.count_ = ARRAYSIZEOF(cells);

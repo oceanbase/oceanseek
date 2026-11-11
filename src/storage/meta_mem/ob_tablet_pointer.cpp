@@ -607,10 +607,11 @@ int ObTabletPointer::remove_tablet_from_old_version_chain(ObTablet *tablet)
   return ret;
 }
 
-int ObTabletPointer::scan_all_tablets_on_chain(const ObFunction<int(ObTablet &)> &op)
+int ObTabletPointer::scan_all_tablets_on_chain(const ObFunction<int(ObTablet &)> &op, int64_t &tablet_cnt)
 {
   int ret = OB_SUCCESS;
   ObTablet *cur = old_version_chain_;
+  tablet_cnt = 0;
   if (!op.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     STORAGE_LOG(WARN, "receive an invalid operator", K(ret), K(obj_));
@@ -619,6 +620,7 @@ int ObTabletPointer::scan_all_tablets_on_chain(const ObFunction<int(ObTablet &)>
       if (OB_FAIL(op(*cur))) {
         STORAGE_LOG(WARN, "failed to apply op on old version tablet", K(ret), K(obj_));
       }
+      ++tablet_cnt;
       cur = cur->get_next_tablet();
     }
   }
@@ -828,12 +830,25 @@ int ObITabletFilterOp::operator()(const ObTabletResidentInfo &info, bool &is_ski
 #ifdef OB_BUILD_SHARED_STORAGE
 ScanAllVersionTabletsOp::GetMinTabletRelyInfo::GetMinTabletRelyInfo(
     share::SCN &min_dep_meta_scn,
-    int64_t &min_major_snapshot)
+    int64_t &min_major_snapshot,
+    share::SCN &clog_checkpoint_scn,
+    share::SCN &orig_clog_checkpoint_scn,
+    int64_t &multi_version_start,
+    bool &has_memtable,
+    const bool collect_lob_rely_info)
   : min_dep_meta_scn_(min_dep_meta_scn),
-    min_major_snapshot_(min_major_snapshot)
+    min_major_snapshot_(min_major_snapshot),
+    clog_checkpoint_scn_(clog_checkpoint_scn),
+    orig_clog_checkpoint_scn_(orig_clog_checkpoint_scn),
+    multi_version_start_(multi_version_start),
+    has_memtable_(has_memtable),
+    collect_lob_rely_info_(collect_lob_rely_info)
 {
   min_dep_meta_scn_.set_max();
   min_major_snapshot_ = INT64_MAX;
+  clog_checkpoint_scn_.set_max();
+  orig_clog_checkpoint_scn_.set_max();
+  multi_version_start_ = INT64_MAX;
 }
 
 int ScanAllVersionTabletsOp::GetMinTabletRelyInfo::operator()(ObTablet &tablet)
@@ -844,14 +859,36 @@ int ScanAllVersionTabletsOp::GetMinTabletRelyInfo::operator()(ObTablet &tablet)
   // 两类依赖最终约束同一个 TabletMeta GC 边界，在 Study RPC 前合并可保持原协议不变。
   const SCN min_tablet_meta_scn = SCN::min(min_minor_meta_scn, min_inc_major_meta_scn);
   const int64_t min_major_snapshot = tablet.get_min_major_snapshot_version();
-  if (min_dep_meta_scn_ > min_tablet_meta_scn || min_major_snapshot_ > min_major_snapshot) {
-    LOG_TRACE("find smaller tablet meta scn or major snapshot, will change it on tablet",
+  const SCN &clog_checkpoint_scn = tablet.get_clog_checkpoint_scn();
+  const int64_t multi_version_start = tablet.get_multi_version_start();
+  if (min_dep_meta_scn_ > min_tablet_meta_scn
+    || min_major_snapshot_ > min_major_snapshot
+    || (collect_lob_rely_info_ && (clog_checkpoint_scn_ > clog_checkpoint_scn
+        || multi_version_start_ > multi_version_start))) {
+    LOG_TRACE("find smaller tablet rely info, will change it on tablet",
         "ls_id", tablet.get_tablet_meta().ls_id_, "tablet_id", tablet.get_tablet_id(),
         K_(min_dep_meta_scn), K(min_minor_meta_scn), K(min_inc_major_meta_scn),
-        K_(min_major_snapshot), K(min_major_snapshot));
+        K_(min_major_snapshot), K(min_major_snapshot), K_(clog_checkpoint_scn),
+        K(clog_checkpoint_scn), K_(multi_version_start), K(multi_version_start));
   }
   min_dep_meta_scn_ = SCN::min(min_dep_meta_scn_, min_tablet_meta_scn);
   min_major_snapshot_ = MIN(min_major_snapshot_, min_major_snapshot);
+  if (collect_lob_rely_info_) {
+    common::ObArray<storage::ObITable *> memtables;
+    if (OB_FAIL(tablet.get_memtables(memtables))) {
+      LOG_WARN("failed to get memtables", K(ret), K(tablet));
+    } else {
+      has_memtable_ = !memtables.empty() || has_memtable_;
+      orig_clog_checkpoint_scn_ = SCN::min(orig_clog_checkpoint_scn_, clog_checkpoint_scn);
+      if (!tablet.is_data_complete() || tablet.get_tablet_meta().split_info_.is_data_incomplete()) {
+        // Keep MIN once any version is incomplete, while collecting the original checkpoint.
+        clog_checkpoint_scn_.set_min();
+      } else {
+        clog_checkpoint_scn_ = SCN::min(clog_checkpoint_scn_, clog_checkpoint_scn);
+      }
+      multi_version_start_ = MIN(multi_version_start_, multi_version_start);
+    }
+  }
   return ret;
 }
 

@@ -16,6 +16,9 @@
 #include "ob_cdc_lob_aux_table_parser.h" // ObCDCLobAuxTableParser
 #include "ob_cdc_lob_aux_storager.h"    // ObLobAuxKey
 #include "storage/lob/ob_ext_info_callback.h" // ObExtInfoLogHeader
+#include "storage/lob/common/ob_lob_seq.h"
+#include "storage/lob/store/ob_lob_store_common.h"
+#include "storage/tx/ob_tx_log.h"
 #include "src/storage/ddl/ob_ddl_redo_log_row_iterator.h"
 
 using namespace oceanbase::common;
@@ -170,13 +173,20 @@ int ObLogPartTransParser::parse(ObLogEntryTask &task, volatile bool &stop_flag)
       if (OB_ISNULL(redo_node)) {
         LOG_ERROR("redo_node is NULL");
         ret = OB_ERR_UNEXPECTED;
-      } else if (OB_UNLIKELY(! redo_node->is_valid())) {
+      } else if (OB_UNLIKELY(!redo_node->is_valid())) {
         LOG_ERROR("redo_node is invalid", "redo_node", redo_node);
         ret = OB_INVALID_DATA;
         // Calibrate data for completeness
-      } else if (OB_UNLIKELY(! redo_node->check_data_integrity())) {
+      } else if (OB_UNLIKELY(!redo_node->check_data_integrity())) {
         ret = OB_INVALID_DATA;
         LOG_ERROR("redo data is not valid", KR(ret), KPC(redo_node));
+      } else if (redo_node->is_lob_outtable_data_log()) {
+        if (OB_FAIL(parse_lob_outtable_data_log_(tenant, *redo_node, *part_trans_task))) {
+          LOG_ERROR("parse lob outtable data log failed", KR(ret), KPC(redo_node), K(task));
+        } else {
+          ATOMIC_AAF(&total_log_size_, redo_node->get_data_len());
+          LOG_DEBUG("[PARSE] LogEntryTask parse lob outtable data log succ", K(task));
+        }
       } else if (redo_node->is_direct_load_inc_log()) {
         if (OB_FAIL(parse_direct_load_inc_stmts_(tenant, *redo_node, task, *part_trans_task, row_index, stop_flag))) {
           LOG_ERROR("parse_ddl_stmts_ fail", KR(ret), K(tenant), KPC(redo_node), K(task), K(row_index));
@@ -250,11 +260,17 @@ int ObLogPartTransParser::parse_ddl_redo_log_(PartTransTask &task, const bool is
           else if (OB_UNLIKELY(! ddl_redo->check_data_integrity())) {
             LOG_ERROR("redo data is not valid", KPC(ddl_redo));
             ret = OB_INVALID_DATA;
+          } else if (ddl_redo->is_lob_outtable_data_log()) {
+            if (!is_build_baseline && OB_FAIL(parse_lob_outtable_data_log_(
+                tenant, *ddl_redo, task))) {
+              LOG_ERROR("parse ddl lob outtable data log failed", KR(ret), KPC(ddl_redo), K(task));
+            }
           } else if (OB_FAIL(parse_stmts_(tenant, *ddl_redo, is_build_baseline,
               invalid_redo_log_entry_task, task, row_index, &pending_ddl_stmts, stop_flag))) {
             LOG_ERROR("parse_stmts_ fail", KR(ret), K(tenant), "redo_node", *ddl_redo,
                 K(is_build_baseline), K(task), K(row_index));
-          } else {
+          }
+          if (OB_SUCC(ret)) {
             redo_num += ddl_redo->get_log_num();
             redo_iter++;
           }
@@ -637,14 +653,21 @@ int ObLogPartTransParser::check_row_need_rollback_(
     const MutatorRow &row,
     bool &need_rollback)
 {
+  return check_seq_need_rollback_(part_trans_task, row.get_seq_no(), need_rollback);
+}
+
+int ObLogPartTransParser::check_seq_need_rollback_(
+    const PartTransTask &part_trans_task,
+    const ObTxSEQ &seq_no,
+    bool &need_rollback)
+{
   int ret = OB_SUCCESS;
   need_rollback = false;
   const RollbackList &rollback_list = part_trans_task.get_rollback_list();
-  const auto &row_seq_no = row.get_seq_no();
   const RollbackNode *rollback_node = rollback_list.head_;
 
   while (OB_SUCC(ret) && OB_NOT_NULL(rollback_node) && ! need_rollback) {
-    need_rollback = rollback_node->should_rollback_stmt(row_seq_no);
+    need_rollback = rollback_node->should_rollback_stmt(seq_no);
     rollback_node = rollback_node->get_next();
   }
 
@@ -1228,7 +1251,75 @@ int ObLogPartTransParser::parse_ext_info_log_mutator_row_(
   return ret;
 }
 
-int ObLogPartTransParser::check_lob_ext_info_log_need_filter_(
+int ObLogPartTransParser::parse_lob_outtable_data_log_(
+    ObLogTenant *tenant,
+    const RedoLogMetaNode &redo_log_node,
+    PartTransTask &part_trans_task)
+{
+  int ret = OB_SUCCESS;
+  ObTxLobOutTableDataLog::ConstructArg arg;
+  ObTxLobOutTableDataLog log(arg);
+  const char *buf = redo_log_node.get_data();
+  const int64_t buf_len = redo_log_node.get_data_len();
+  int64_t pos = 0;
+  bool need_rollback = false;
+  bool need_filter = false;
+
+  if (OB_ISNULL(buf) || OB_UNLIKELY(buf_len <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_ERROR("invalid lob outtable payload", KR(ret), KP(buf), K(buf_len));
+  } else if (OB_FAIL(log.deserialize(buf, buf_len, pos))) {
+    LOG_ERROR("deserialize lob outtable data log failed", KR(ret), K(buf_len), K(pos));
+  } else if (OB_UNLIKELY((pos != buf_len)
+      || (OB_INVALID_ID == log.get_lob_aux_table_id())
+      || !log.get_lob_id().is_valid()
+      || !log.get_lob_operation_seq_no().is_valid()
+      || !ObLobSeqId(log.get_seq_id()).is_valid()
+      || !log.get_macro_id().is_valid()
+      || (log.is_logging() && (OB_ISNULL(log.get_data().ptr())
+          || (log.get_data().length() <= 0)))
+      || (!log.is_logging() && !log.get_data().empty())
+      || (log.get_data().length() > ObLobMetaUtil::LOB_OUTTABLE_BLOCK_DATA_SIZE))) {
+    ret = OB_INVALID_DATA;
+    LOG_ERROR("invalid lob outtable data log", KR(ret), K(buf_len), K(pos), K(log));
+  } else if (OB_FAIL(check_seq_need_rollback_(
+      part_trans_task, log.get_lob_operation_seq_no(), need_rollback))) {
+    LOG_ERROR("check lob outtable rollback failed", KR(ret), K(log));
+  } else if (need_rollback) {
+    LOG_DEBUG("skip rolled back lob outtable data log", K(log));
+  } else if (part_trans_task.is_sys_ls_part_trans()) {
+    need_filter = !part_trans_task.is_ddl_trans()
+        || (share::OB_ALL_DDL_OPERATION_AUX_LOB_PIECE_TID != log.get_lob_aux_table_id());
+  } else { // !part_trans_task.is_sys_ls_part_trans()
+    if (OB_FAIL(check_lob_aux_table_need_filter_(tenant,
+        log.get_lob_aux_table_id(), need_filter))) {
+      LOG_ERROR("check lob outtable subscription failed", KR(ret), K(log));
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (need_rollback || need_filter) {
+    LOG_DEBUG("skip rolled back or filtered lob outtable data log", K(log));
+  } else if (!log.is_logging()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_ERROR("CDC cannot reconstruct LOB data under _no_logging mode",
+        KR(ret), K(log), K(part_trans_task));
+  } else {
+    const ObLobAuxKey key(part_trans_task.get_trans_commit_version(),
+        part_trans_task.get_tenant_id(), part_trans_task.get_trans_id(),
+        log.get_lob_aux_table_id(), log.get_lob_id(), log.get_lob_operation_seq_no(),
+        log.get_seq_id());
+    if (OB_FAIL(TCTX.lob_aux_storager_.put(key, "lob_outtable_data", log.get_data().ptr(),
+        log.get_data().length()))) {
+      LOG_ERROR("publish lob outtable data log failed", KR(ret), K(key), K(log));
+    } else if (!part_trans_task.is_sys_ls_part_trans()) {
+      ATOMIC_AAF(&remaining_log_size_, buf_len); // only dml update remaining_log_size_ for statistics
+    }
+  }
+  return ret;
+}
+
+int ObLogPartTransParser::check_lob_aux_table_need_filter_(
     ObLogTenant *tenant,
     const uint64_t lob_aux_table_id,
     bool &need_filter)
@@ -1273,14 +1364,14 @@ int ObLogPartTransParser::publish_lob_summary_ext_info_log_(
     ret = OB_INVALID_DATA;
     LOG_ERROR("invalid lob summary ext info log", KR(ret), K(lob_id), K(log),
         K(ext_info_log.length()), K(pos));
-  } else if (OB_FAIL(check_lob_ext_info_log_need_filter_(
+  } else if (OB_FAIL(check_lob_aux_table_need_filter_(
       tenant, log.lob_aux_table_id_, need_filter))) {
     LOG_ERROR("check lob summary ext info log filter failed", KR(ret), K(lob_id), K(log));
   } else if (need_filter) {
     LOG_DEBUG("filter lob summary ext info log",
         "tenant_id", part_trans_task.get_tenant_id(),
         "trans_id", part_trans_task.get_trans_id(), K(lob_id), K(log));
-  } else if (OB_FAIL(extra_info.deserialize(log.lob_info_))) {
+  } else if (OB_FAIL(extra_info.deserialize(part_trans_task.get_allocator(), log.lob_info_))) {
     LOG_ERROR("deserialize lob summary extra info failed", KR(ret), K(lob_id),
         K(log));
   } else if (OB_UNLIKELY(storage::ObLobMetaExtraInfo::LOB_META_SUMMARY
@@ -1333,13 +1424,17 @@ int ObLogPartTransParser::publish_lob_data_ext_info_log_(
     ret = OB_INVALID_DATA;
     LOG_ERROR("invalid lob data ext info log", KR(ret), K(lob_id), K(log),
         K(ext_info_log.length()), K(pos));
-  } else if (OB_FAIL(check_lob_ext_info_log_need_filter_(
+  } else if (OB_FAIL(check_lob_aux_table_need_filter_(
       tenant, log.lob_aux_table_id_, need_filter))) {
     LOG_ERROR("check lob data ext info log filter failed", KR(ret), K(lob_id), K(log));
   } else if (need_filter) {
     LOG_DEBUG("filter lob data ext info log",
         "tenant_id", part_trans_task.get_tenant_id(),
         "trans_id", part_trans_task.get_trans_id(), K(lob_id), K(log));
+  } else if (!log.is_logging_) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_ERROR("CDC cannot reconstruct LOB data under _no_logging mode",
+        KR(ret), K(lob_id), K(log), K(part_trans_task));
   } else {
     const ObLobAuxKey key(part_trans_task.get_trans_commit_version(),
         part_trans_task.get_tenant_id(), part_trans_task.get_trans_id(),

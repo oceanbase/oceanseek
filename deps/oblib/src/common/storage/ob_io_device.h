@@ -11,6 +11,7 @@
 #include "lib/container/ob_iarray.h"
 #include "lib/container/ob_fixed_array.h"
 #include "lib/queue/ob_fixed_queue.h"
+#include "lib/restore/ob_i_storage.h"
 #include "lib/utility/ob_print_utils.h"
 
 namespace oceanbase
@@ -274,10 +275,14 @@ struct ObIODOpts
 
 struct ObIODFileStat
 {
-  ObIODFileStat()
+  ObIODFileStat();
+  explicit ObIODFileStat(const uint64_t tenant_id)
+    : etag_(tenant_id)
   {
-    memset(this, 0x00, sizeof(ObIODFileStat));
+    reset();
   }
+  void reset();
+  int assign(const ObIODFileStat &other);
   uint64_t rdev_;        // device id (if special file)
   uint64_t dev_;         // device id
   uint64_t inode_;       // inode number
@@ -293,9 +298,14 @@ struct ObIODFileStat
   int64_t mtime_s_;      // time of last modification
   int64_t ctime_s_;      // time of last status change
   int64_t btime_s_;      // time of birth
+  ObSmallString<64> etag_; // Inline space for 64-byte ETags
 
   TO_STRING_KV(K_(rdev), K_(dev), K_(inode), K_(mask), K_(mode), K_(nlink), K_(uid), K_(gid),
-    K_(size), K_(block_cnt), K_(block_size), K_(atime_s), K_(mtime_s), K_(ctime_s), K_(btime_s));
+    K_(size), K_(block_cnt), K_(block_size), K_(atime_s), K_(mtime_s), K_(ctime_s), K_(btime_s),
+    K_(etag));
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObIODFileStat);
 };
 
 class ObIODPreadChecker

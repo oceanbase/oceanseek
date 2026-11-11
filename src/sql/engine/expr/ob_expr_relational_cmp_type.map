@@ -75,6 +75,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObHexStringType,      /* RoaringBitmap */
+    ObMaxType,           /* ObNullType => ObExtendBLobType */
   },
 
   /*TinyIntType*/
@@ -134,6 +135,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObTinyIntType => ObExtendBLobType */
   },
 
   /*SmallIntType*/
@@ -193,6 +195,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObSmallIntType => ObExtendBLobType */
   },
 
   /*MediumIntType*/
@@ -252,6 +255,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObMediumIntType => ObExtendBLobType */
   },
 
   /*Int32Type*/
@@ -311,6 +315,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObInt32Type => ObExtendBLobType */
   },
 
   /*IntType*/
@@ -370,6 +375,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObIntType => ObExtendBLobType */
   },
 
   // for all uint cmp int, we must set cmp type to unsigned,
@@ -431,6 +437,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObUTinyIntType => ObExtendBLobType */
   },
 
   /*USmallIntType*/
@@ -490,6 +497,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObUSmallIntType => ObExtendBLobType */
   },
 
   /*UMediumIntType*/
@@ -549,6 +557,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObUMediumIntType => ObExtendBLobType */
   },
 
   /*UInt32Type*/
@@ -608,6 +617,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObUInt32Type => ObExtendBLobType */
   },
 
   /*UInt64Type*/
@@ -667,6 +677,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObUInt64Type => ObExtendBLobType */
   },
 
   /*FloatType*/
@@ -726,6 +737,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObFloatType => ObExtendBLobType */
   },
 
   /*DoubleType*/
@@ -785,6 +797,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObDoubleType => ObExtendBLobType */
   },
 
   /*UFloatType*/
@@ -844,6 +857,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObUFloatType => ObExtendBLobType */
   },
 
   /*UDoubleType*/
@@ -903,6 +917,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObUDoubleType => ObExtendBLobType */
   },
 
   /*NumberType*/
@@ -962,6 +977,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObNumberType => ObExtendBLobType */
   },
 
   /*UNumberType*/
@@ -1021,6 +1037,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObUNumberType => ObExtendBLobType */
   },
 
   /*DateTimeType*/
@@ -1080,6 +1097,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,           /* ObDateTimeType => ObExtendBLobType */
   },
 
   /*TimestampType*/
@@ -1139,6 +1157,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,            /* ObTimestampType => ObExtendBLobType */
   },
 
   /*DateType*/
@@ -1198,6 +1217,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,           /* ObDateType => ObExtendBLobType */
   },
 
   /*TimeType*/
@@ -1257,6 +1277,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,       /* ObTimeType => ObExtendBLobType */
   },
 
   /*YearType*/
@@ -1316,6 +1337,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObVarcharType,    /* MySQLDateType */
     ObVarcharType,    /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObYearType => ObExtendBLobType */
   },
 
   /*VarcharType*/
@@ -1375,6 +1397,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,           /* ObVarcharType => ObExtendBLobType */
   },
 
   /*CharType*/
@@ -1434,6 +1457,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,           /* ObCharType => ObExtendBLobType */
   },
 
   /*HexStringType*/
@@ -1493,6 +1517,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,           /* ObHexStringType => ObExtendBLobType */
   },
 
   /*ExtendType*/
@@ -1552,6 +1577,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,        /* MySQLDateType */
     ObMaxType,        /* MySQLDateTimeType */
     ObMaxType,        /* RoaringBitmap */
+    ObMaxType,      /* ObExtendType => ObExtendBLobType */
   },
 
   /*UnknownType*/
@@ -1611,6 +1637,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObIntType,        /* MySQLDateType */
     ObIntType,        /* MySQLDateTimeType */
     ObMaxType,        /* RoaringBitmap */
+    ObMaxType,      /* ObUnknownType => ObExtendBLobType */
   },
   /*TinyTextType*/
   {
@@ -1669,6 +1696,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,           /* ObTinyTextType => ObExtendBLobType */
   },
   /*TextType*/
   {
@@ -1727,6 +1755,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,           /* ObTextType => ObExtendBLobType */
   },
  /*MediumTextType*/
   {
@@ -1785,6 +1814,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,           /* ObMediumTextType => ObExtendBLobType */
   },
  /*LongTextType*/
   {
@@ -1843,6 +1873,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,           /* ObLongTextType => ObExtendBLobType */
   },
    /*BitType*/
   {
@@ -1901,6 +1932,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObNumberType,  /* MySQLDateType */
     ObNumberType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,         /* ObBitType => ObExtendBLobType */
   },
   
   /*EnumType*/
@@ -1960,6 +1992,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,           /* ObEnumType => ObExtendBLobType */
   },
   /*SetType*/
   {
@@ -2018,6 +2051,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,           /* ObSetType => ObExtendBLobType */
   },
   /*EnumInnerType*/
   {
@@ -2076,6 +2110,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,           /* ObEnumInnerType => ObExtendBLobType */
   },
   /*SetInnerType*/
   {
@@ -2134,6 +2169,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,           /* ObSetInnerType => ObExtendBLobType */
   },
   /*ObTimestampTZType*/
   {
@@ -2192,6 +2228,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObTimestampTZType,      /* MySQLDateType */
     ObTimestampTZType,      /* MySQLDateTimeType */
     ObTimestampTZType,      /* RoaringBitmap */
+    ObMaxType,              /* ObTimestampTZType => ObExtendBLobType */
   },
   /*ObTimestampLTZType*/
   {
@@ -2250,6 +2287,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObTimestampLTZType,      /* MySQLDateType */
     ObTimestampLTZType,      /* MySQLDateTimeType */
     ObTimestampLTZType,      /* RoaringBitmap */
+    ObMaxType,               /* ObTimestampLTZType => ObExtendBLobType */
   },
   /*ObTimestampNanoType*/
   {
@@ -2308,6 +2346,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObTimestampNanoType,      /* MySQLDateType */
     ObTimestampNanoType,      /* MySQLDateTimeType */
     ObTimestampNanoType,      /* RoaringBitmap */
+    ObMaxType,                /* ObTimestampNanoType => ObExtendBLobType */
   },
     /*ObRawType*/
   {
@@ -2366,6 +2405,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObRawType,        /* MySQLDateType */
     ObRawType,        /* MySQLDateTimeType */
     ObRoaringBitmapType,        /* RoaringBitmap */
+    ObMaxType,      /* ObRawType => ObExtendBLobType */
   },
     /*ObIntervalYMType*/
   {
@@ -2424,6 +2464,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObIntervalYMType,        /* MySQLDateType */
     ObIntervalYMType,        /* MySQLDateTimeType */
     ObMaxType,        /* RoaringBitmap */
+    ObMaxType,             /* ObIntervalYMType => ObExtendBLobType */
   },
   /*ObIntervalDSType*/
   {
@@ -2482,6 +2523,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObIntervalDSType,        /* MySQLDateType */
     ObIntervalDSType,        /* MySQLDateTimeType */
     ObMaxType,        /* RoaringBitmap */
+    ObMaxType,             /* ObIntervalDSType => ObExtendBLobType */
   },
 
   /*NumberFloatType*/
@@ -2541,6 +2583,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObMaxType,        /* RoaringBitmap */
+    ObMaxType,         /* ObNumberFloatType => ObExtendBLobType */
   },
   /*ObNVarchar2Type*/
   {
@@ -2599,6 +2642,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObMaxType,        /* RoaringBitmap */
+    ObMaxType,           /* ObNVarchar2Type => ObExtendBLobType */
   },
 
   /*NCharType*/
@@ -2658,6 +2702,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObMaxType,        /* RoaringBitmap */
+    ObMaxType,           /* ObNCharType => ObExtendBLobType */
   },
   /*ObURowIDType*/
   {
@@ -2716,6 +2761,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,        /* MySQLDateType */
     ObMaxType,        /* MySQLDateTimeType */
     ObMaxType,        /* RoaringBitmap */
+    ObMaxType,      /* ObURowIDType => ObExtendBLobType */
   },
   /*ObLobType*/
   {
@@ -2774,6 +2820,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,        /* MySQLDateType */
     ObMaxType,        /* MySQLDateTimeType */
     ObMaxType,        /* RoaringBitmap */
+    ObMaxType,      /* ObLobType => ObExtendBLobType */
   },
   /*ObJsonType*/
   {
@@ -2832,6 +2879,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObJsonType,  /* MySQLDateType */
     ObJsonType,  /* MySQLDateTimeType */
     ObJsonType,       /* RoaringBitmap */
+    ObMaxType,       /* ObJsonType => ObExtendBLobType */
   },
   /*ObGeometryType*/
   {
@@ -2890,6 +2938,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,  /* MySQLDateType */
     ObMaxType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,        /* RoaringBitmap */
+    ObMaxType,      /* ObGeometryType => ObExtendBLobType */
   },
   /*User Defined Sql Type*/
   {
@@ -2948,6 +2997,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,  /* MySQLDateType */
     ObMaxType,  /* MySQLDateTimeType */
     ObMaxType,        /* RoaringBitmap */
+    ObMaxType,      /* ObUserDefinedSQLType => ObExtendBLobType */
   },
   /*ObDecimalIntType*/
   {
@@ -3006,6 +3056,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,        /* RoaringBitmap */
+    ObMaxType,             /* ObDecimalIntType => ObExtendBLobType */
   },
   /*ObCollectionSQLType*/
   {
@@ -3064,6 +3115,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObCollectionSQLType,      /* MySQLDateType */
     ObCollectionSQLType,      /* MySQLDateTimeType */
     ObCollectionSQLType,      /* RoaringBitmap */
+    ObMaxType,                /* ObCollectionSQLType => ObExtendBLobType */
   },
   /*ObMySQLDateType*/
   {
@@ -3122,6 +3174,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateType,      /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,                /* ObMySQLDateType => ObExtendBLobType */
   },
   /*ObMySQLDateTimeType*/
   {
@@ -3180,6 +3233,7 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMySQLDateTimeType,  /* MySQLDateType */
     ObMySQLDateTimeType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,                /* ObMySQLDateTimeType => ObExtendBLobType */
   },
   /*ObRoaringBitmapType*/
   {
@@ -3238,6 +3292,66 @@ static constexpr ObObjType RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObRoaringBitmapType,  /* MySQLDateType */
     ObRoaringBitmapType,  /* MySQLDateTimeType */
     ObRoaringBitmapType,  /* RoaringBitmap */
+    ObMaxType,                /* ObRoaringBitmapType => ObExtendBLobType */
+  },
+  /*ObExtendBLobType*/
+  {
+    ObMaxType,           /* ObExtendBLobType => ObNullType */
+    ObMaxType,         /* ObExtendBLobType => ObTinyIntType */
+    ObMaxType,         /* ObExtendBLobType => ObSmallIntType */
+    ObMaxType,         /* ObExtendBLobType => ObMediumIntType */
+    ObMaxType,         /* ObExtendBLobType => ObInt32Type */
+    ObMaxType,         /* ObExtendBLobType => ObIntType */
+    ObMaxType,         /* ObExtendBLobType => ObUTinyIntType */
+    ObMaxType,         /* ObExtendBLobType => ObUSmallIntType */
+    ObMaxType,         /* ObExtendBLobType => ObUMediumIntType */
+    ObMaxType,         /* ObExtendBLobType => ObUInt32Type */
+    ObMaxType,         /* ObExtendBLobType => ObUInt64Type */
+    ObMaxType,         /* ObExtendBLobType => ObFloatType */
+    ObMaxType,         /* ObExtendBLobType => ObDoubleType */
+    ObMaxType,         /* ObExtendBLobType => ObUFloatType */
+    ObMaxType,         /* ObExtendBLobType => ObUDoubleType */
+    ObMaxType,         /* ObExtendBLobType => ObNumberType */
+    ObMaxType,         /* ObExtendBLobType => ObUNumberType */
+    ObMaxType,           /* ObExtendBLobType => ObDateTimeType */
+    ObMaxType,            /* ObExtendBLobType => ObTimestampType */
+    ObMaxType,           /* ObExtendBLobType => ObDateType */
+    ObMaxType,       /* ObExtendBLobType => ObTimeType */
+    ObMaxType,         /* ObExtendBLobType => ObYearType */
+    ObMaxType,           /* ObExtendBLobType => ObVarcharType */
+    ObMaxType,           /* ObExtendBLobType => ObCharType */
+    ObMaxType,           /* ObExtendBLobType => ObHexStringType */
+    ObMaxType,      /* ObExtendBLobType => ObExtendType */
+    ObMaxType,      /* ObExtendBLobType => ObUnknownType */
+    ObMaxType,           /* ObExtendBLobType => ObTinyTextType */
+    ObMaxType,           /* ObExtendBLobType => ObTextType */
+    ObMaxType,           /* ObExtendBLobType => ObMediumTextType */
+    ObMaxType,           /* ObExtendBLobType => ObLongTextType */
+    ObMaxType,         /* ObExtendBLobType => ObBitType */
+    ObMaxType,           /* ObExtendBLobType => ObEnumType */
+    ObMaxType,           /* ObExtendBLobType => ObSetType */
+    ObMaxType,           /* ObExtendBLobType => ObEnumInnerType */
+    ObMaxType,           /* ObExtendBLobType => ObSetInnerType */
+    ObMaxType,              /* ObExtendBLobType => ObTimestampTZType */
+    ObMaxType,               /* ObExtendBLobType => ObTimestampLTZType */
+    ObMaxType,                /* ObExtendBLobType => ObTimestampNanoType */
+    ObMaxType,      /* ObExtendBLobType => ObRawType */
+    ObMaxType,             /* ObExtendBLobType => ObIntervalYMType */
+    ObMaxType,             /* ObExtendBLobType => ObIntervalDSType */
+    ObMaxType,         /* ObExtendBLobType => ObNumberFloatType */
+    ObMaxType,           /* ObExtendBLobType => ObNVarchar2Type */
+    ObMaxType,           /* ObExtendBLobType => ObNCharType */
+    ObMaxType,      /* ObExtendBLobType => ObURowIDType */
+    ObMaxType,      /* ObExtendBLobType => ObLobType */
+    ObMaxType,       /* ObExtendBLobType => ObJsonType */
+    ObMaxType,      /* ObExtendBLobType => ObGeometryType */
+    ObMaxType,      /* ObExtendBLobType => ObUserDefinedSQLType */
+    ObMaxType,             /* ObExtendBLobType => ObDecimalIntType */
+    ObMaxType,                /* ObExtendBLobType => ObCollectionSQLType */
+    ObMaxType,                /* ObExtendBLobType => ObMySQLDateType */
+    ObMaxType,                /* ObExtendBLobType => ObMySQLDateTimeType */
+    ObMaxType,                /* ObExtendBLobType => ObRoaringBitmapType */
+    ObMaxType,           /* ObExtendBLobType => ObExtendBLobType */
   },
 };
 
@@ -3302,6 +3416,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObNullType => ObExtendBLobType */
   },
 
   /*TinyIntType*/
@@ -3361,6 +3476,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObTinyIntType => ObExtendBLobType */
   },
 
   /*SmallIntType*/
@@ -3420,6 +3536,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObSmallIntType => ObExtendBLobType */
   },
 
   /*MediumIntType*/
@@ -3479,6 +3596,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObMediumIntType => ObExtendBLobType */
   },
 
   /*Int32Type*/
@@ -3538,6 +3656,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObInt32Type => ObExtendBLobType */
   },
 
   /*IntType*/
@@ -3597,6 +3716,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObIntType => ObExtendBLobType */
   },
 
   // for all uint cmp int, we must set cmp type to unsigned,
@@ -3658,6 +3778,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObUTinyIntType => ObExtendBLobType */
   },
 
   /*USmallIntType*/
@@ -3717,6 +3838,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObUSmallIntType => ObExtendBLobType */
   },
 
   /*UMediumIntType*/
@@ -3776,6 +3898,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObUMediumIntType => ObExtendBLobType */
   },
 
   /*UInt32Type*/
@@ -3835,6 +3958,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObUInt32Type => ObExtendBLobType */
   },
 
   /*UInt64Type*/
@@ -3894,6 +4018,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObUInt64Type => ObExtendBLobType */
   },
 
   /*FloatType*/
@@ -3953,6 +4078,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,        /* ObFloatType => ObExtendBLobType */
   },
 
   /*DoubleType*/
@@ -4012,6 +4138,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObDoubleType => ObExtendBLobType */
   },
 
   /*UFloatType*/
@@ -4071,6 +4198,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,        /* ObUFloatType => ObExtendBLobType */
   },
 
   /*UDoubleType*/
@@ -4130,6 +4258,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObUDoubleType => ObExtendBLobType */
   },
 
   /*NumberType*/
@@ -4189,6 +4318,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObNumberType => ObExtendBLobType */
   },
 
   /*UNumberType*/
@@ -4248,6 +4378,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObUNumberType => ObExtendBLobType */
   },
 
   /*DateTimeType*/
@@ -4307,6 +4438,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObDateTimeType => ObExtendBLobType */
   },
 
   /*TimestampType*/
@@ -4366,6 +4498,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,            /* ObTimestampType => ObExtendBLobType */
   },
 
   /*DateType*/
@@ -4425,6 +4558,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObDateType => ObExtendBLobType */
   },
 
   /*TimeType*/
@@ -4484,6 +4618,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,       /* ObTimeType => ObExtendBLobType */
   },
 
   /*YearType*/
@@ -4543,6 +4678,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObYearType => ObExtendBLobType */
   },
 
   /*VarcharType*/
@@ -4602,6 +4738,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObVarcharType => ObExtendBLobType */
   },
 
   /*CharType*/
@@ -4661,6 +4798,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObCharType => ObExtendBLobType */
   },
 
   /*HexStringType*/
@@ -4720,6 +4858,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObHexStringType => ObExtendBLobType */
   },
 
   /*ExtendType*/
@@ -4779,6 +4918,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,      /* ObExtendType => ObExtendBLobType */
   },
 
   /*UnknownType*/
@@ -4838,6 +4978,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,      /* ObUnknownType => ObExtendBLobType */
   },
   /*TinyTextType*/
   {
@@ -4896,6 +5037,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObTinyTextType => ObExtendBLobType */
   },
   /*TextType*/
   {
@@ -4954,6 +5096,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObTextType => ObExtendBLobType */
   },
  /*MediumTextType*/
   {
@@ -5012,6 +5155,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObMediumTextType => ObExtendBLobType */
   },
  /*LongTextType*/
   {
@@ -5070,6 +5214,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObLongTextType => ObExtendBLobType */
   },
    /*BitType*/
   {
@@ -5128,6 +5273,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObBitType => ObExtendBLobType */
   },
   
   /*EnumType*/
@@ -5187,6 +5333,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObEnumType => ObExtendBLobType */
   },
   /*SetType*/
   {
@@ -5245,6 +5392,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObSetType => ObExtendBLobType */
   },
   /*EnumInnerType*/
   {
@@ -5303,6 +5451,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObEnumInnerType => ObExtendBLobType */
   },
   /*SetInnerType*/
   {
@@ -5361,6 +5510,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObSetInnerType => ObExtendBLobType */
   },
   /*ObTimestampTZType*/
   {
@@ -5419,6 +5569,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,              /* ObTimestampTZType => ObExtendBLobType */
   },
   /*ObTimestampLTZType*/
   {
@@ -5477,6 +5628,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,               /* ObTimestampLTZType => ObExtendBLobType */
   },
   /*ObTimestampNanoType*/
   {
@@ -5535,6 +5687,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,                /* ObTimestampNanoType => ObExtendBLobType */
   },
     /*ObRawType*/
   {
@@ -5593,6 +5746,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,      /* ObRawType => ObExtendBLobType */
   },
     /*ObIntervalYMType*/
   {
@@ -5651,6 +5805,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,             /* ObIntervalYMType => ObExtendBLobType */
   },
   /*ObIntervalDSType*/
   {
@@ -5709,6 +5864,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,             /* ObIntervalDSType => ObExtendBLobType */
   },
 
   /*NumberFloatType*/
@@ -5768,6 +5924,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObNumberFloatType => ObExtendBLobType */
   },
   /*ObNVarchar2Type*/
   {
@@ -5826,6 +5983,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObNVarchar2Type => ObExtendBLobType */
   },
 
   /*NCharType*/
@@ -5885,6 +6043,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObNCharType => ObExtendBLobType */
   },
 
   /* ObURowIDType */
@@ -5944,6 +6103,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,         /* ObURowIDType => ObExtendBLobType */
   },
   /* ObLobType */
   {
@@ -6002,6 +6162,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,           /* ObLobType => ObExtendBLobType */
   },
   /* ObJsonType */
   {
@@ -6060,6 +6221,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,       /* ObJsonType => ObExtendBLobType */
   },
   /* ObGeometryType */
   {
@@ -6118,6 +6280,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,      /* ObGeometryType => ObExtendBLobType */
   },
    /* UDT */
   {
@@ -6176,6 +6339,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,      /* ObUserDefinedSQLType => ObExtendBLobType */
   },
   /* ObDecimalIntType */
   {
@@ -6234,6 +6398,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,             /* ObDecimalIntType => ObExtendBLobType */
   },
   /* COLLECTION */
   {
@@ -6292,6 +6457,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,      /* ObCollectionSQLType => ObExtendBLobType */
   },
   /* ObMySQLDateType */
   {
@@ -6350,6 +6516,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,             /* RoaringBitmap */
+    ObMaxType,      /* ObMySQLDateType => ObExtendBLobType */
   },
   /* ObMySQLDateTimeType */
   {
@@ -6408,6 +6575,7 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,             /* ObMySQLDateType */
     ObMaxType,             /* ObMySQLDateTimeType */
     ObMaxType,        /* RoaringBitmap */
+    ObMaxType,      /* ObMySQLDateTimeType => ObExtendBLobType */
   },
   /*ObRoaringBitmapType*/
   {
@@ -6466,6 +6634,66 @@ static constexpr ObObjType ORACLE_RELATIONAL_CMP_TYPE[ObMaxType][ObMaxType] =
     ObMaxType,      /* ObMySQLDateType */
     ObMaxType,      /* ObMySQLDateTimeType */
     ObMaxType,      /* RoaringBitmap */
+    ObMaxType,      /* ObRoaringBitmapType => ObExtendBLobType */
+  },
+  /*ObExtendBLobType*/
+  {
+    ObMaxType,           /* ObExtendBLobType => ObNullType */
+    ObMaxType,         /* ObExtendBLobType => ObTinyIntType */
+    ObMaxType,         /* ObExtendBLobType => ObSmallIntType */
+    ObMaxType,         /* ObExtendBLobType => ObMediumIntType */
+    ObMaxType,         /* ObExtendBLobType => ObInt32Type */
+    ObMaxType,         /* ObExtendBLobType => ObIntType */
+    ObMaxType,         /* ObExtendBLobType => ObUTinyIntType */
+    ObMaxType,         /* ObExtendBLobType => ObUSmallIntType */
+    ObMaxType,         /* ObExtendBLobType => ObUMediumIntType */
+    ObMaxType,         /* ObExtendBLobType => ObUInt32Type */
+    ObMaxType,         /* ObExtendBLobType => ObUInt64Type */
+    ObMaxType,        /* ObExtendBLobType => ObFloatType */
+    ObMaxType,         /* ObExtendBLobType => ObDoubleType */
+    ObMaxType,        /* ObExtendBLobType => ObUFloatType */
+    ObMaxType,         /* ObExtendBLobType => ObUDoubleType */
+    ObMaxType,         /* ObExtendBLobType => ObNumberType */
+    ObMaxType,         /* ObExtendBLobType => ObUNumberType */
+    ObMaxType,           /* ObExtendBLobType => ObDateTimeType */
+    ObMaxType,            /* ObExtendBLobType => ObTimestampType */
+    ObMaxType,           /* ObExtendBLobType => ObDateType */
+    ObMaxType,       /* ObExtendBLobType => ObTimeType */
+    ObMaxType,         /* ObExtendBLobType => ObYearType */
+    ObMaxType,           /* ObExtendBLobType => ObVarcharType */
+    ObMaxType,           /* ObExtendBLobType => ObCharType */
+    ObMaxType,           /* ObExtendBLobType => ObHexStringType */
+    ObMaxType,      /* ObExtendBLobType => ObExtendType */
+    ObMaxType,      /* ObExtendBLobType => ObUnknownType */
+    ObMaxType,           /* ObExtendBLobType => ObTinyTextType */
+    ObMaxType,           /* ObExtendBLobType => ObTextType */
+    ObMaxType,           /* ObExtendBLobType => ObMediumTextType */
+    ObMaxType,           /* ObExtendBLobType => ObLongTextType */
+    ObMaxType,         /* ObExtendBLobType => ObBitType */
+    ObMaxType,           /* ObExtendBLobType => ObEnumType */
+    ObMaxType,           /* ObExtendBLobType => ObSetType */
+    ObMaxType,           /* ObExtendBLobType => ObEnumInnerType */
+    ObMaxType,           /* ObExtendBLobType => ObSetInnerType */
+    ObMaxType,              /* ObExtendBLobType => ObTimestampTZType */
+    ObMaxType,               /* ObExtendBLobType => ObTimestampLTZType */
+    ObMaxType,                /* ObExtendBLobType => ObTimestampNanoType */
+    ObMaxType,      /* ObExtendBLobType => ObRawType */
+    ObMaxType,             /* ObExtendBLobType => ObIntervalYMType */
+    ObMaxType,             /* ObExtendBLobType => ObIntervalDSType */
+    ObMaxType,         /* ObExtendBLobType => ObNumberFloatType */
+    ObMaxType,           /* ObExtendBLobType => ObNVarchar2Type */
+    ObMaxType,           /* ObExtendBLobType => ObNCharType */
+    ObMaxType,         /* ObExtendBLobType => ObURowIDType */
+    ObMaxType,           /* ObExtendBLobType => ObLobType */
+    ObMaxType,       /* ObExtendBLobType => ObJsonType */
+    ObMaxType,      /* ObExtendBLobType => ObGeometryType */
+    ObMaxType,      /* ObExtendBLobType => ObUserDefinedSQLType */
+    ObMaxType,             /* ObExtendBLobType => ObDecimalIntType */
+    ObMaxType,      /* ObExtendBLobType => ObCollectionSQLType */
+    ObMaxType,      /* ObExtendBLobType => ObMySQLDateType */
+    ObMaxType,      /* ObExtendBLobType => ObMySQLDateTimeType */
+    ObMaxType,      /* ObExtendBLobType => ObRoaringBitmapType */
+    ObMaxType,           /* ObExtendBLobType => ObExtendBLobType */
   },
 };
 

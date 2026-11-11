@@ -25,6 +25,7 @@
 #include "lib/charset/ob_charset_string_helper.h"
 #include "sql/engine/px/ob_px_sqc_handler.h"
 #include "sql/engine/expr/ob_expr_json_func_helper.h"
+#include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "lib/udt/ob_collection_type.h"
 #include "share/config/ob_server_config.h"
 #include "share/external_table/ob_external_table_utils.h"
@@ -1653,7 +1654,7 @@ int ObSelectIntoOp::write_lob_to_file(const ObObj &obj,
   while (OB_SUCC(ret)
          && (state = lob_iter.get_next_block(src_block_data)) == TEXTSTRING_ITER_NEXT) {
     // outrow lob最后一次才有可能为false, inrow lob只迭代一次, 为false
-    stop_when_truncated = (truncated_len != src_block_data.length()) && lob_iter.is_outrow_lob();
+    stop_when_truncated = (truncated_len != src_block_data.length()) && lob_iter.is_outline_lob();
     if (!use_shared_buf_ && OB_FAIL(check_buf_sufficient(data_writer,
                                                          escape_printer_.buf_,
                                                          escape_printer_.buf_len_,
@@ -5369,12 +5370,19 @@ int ObSelectIntoOp::into_varlist()
         LOG_WARN("eval expr failed", K(ret));
       } else if (OB_FAIL(datum->to_obj(obj, select_exprs.at(i)->obj_meta_))) {
         LOG_WARN("convert datum to obj failed", K(ret), KPC(select_exprs.at(i)));
-      } else if (obj.is_lob_storage()
-          // outrow lob can not be assigned to user var, so convert outrow to inrow lob
-          // user var has independent memory, so using temporary memory here is fine
-          && OB_FAIL(ObTextStringIter::convert_outrow_lob_to_inrow_templob(obj, obj, nullptr, &lob_tmp_allocator, true/*allow_persist_inrow*/))) {
-        LOG_WARN("convert outrow to inrow lob failed", K(ret), K(obj));
-      } else if (OB_FAIL(ObVariableSetExecutor::set_user_variable(obj, var_name,
+      } else if (obj.is_lob_storage()) {
+        storage::ObLobAccessCtx *lob_access_ctx = nullptr;
+        // User variables materialize data; External reads reuse this context's LOCATION access.
+        if (OB_FAIL(ctx_.get_lob_access_ctx(lob_access_ctx))) {
+          LOG_WARN("failed to get lob access context", KR(ret), K(i), K(obj.get_type()));
+        } else if (OB_FAIL(ObTextStringIter::convert_outrow_lob_to_inrow_templob(
+                           obj, obj, ctx_.get_my_session(), &lob_tmp_allocator,
+                           true/*allow_persist_inrow*/, false/*need_deep_copy*/, lob_access_ctx))) {
+          LOG_WARN("convert outrow to inrow lob failed", K(ret), K(i), K(obj.get_type()));
+        }
+      }
+      if (OB_SUCC(ret)
+          && OB_FAIL(ObVariableSetExecutor::set_user_variable(obj, var_name,
                   ctx_.get_my_session()))) {
         LOG_WARN("set user variable failed", K(ret));
       }

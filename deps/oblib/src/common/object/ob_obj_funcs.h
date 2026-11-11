@@ -1764,6 +1764,7 @@ DEF_TEXT_FUNCS(ObTinyTextType, string, ObString);
 DEF_TEXT_FUNCS(ObTextType, string, ObString);
 DEF_TEXT_FUNCS(ObMediumTextType, string, ObString);
 DEF_TEXT_FUNCS(ObLongTextType, string, ObString);
+DEF_TEXT_FUNCS(ObExtendBLobType, string, ObString);
 
 
 #define DEF_GEO_CS_FUNCS(OBJTYPE)                                    \

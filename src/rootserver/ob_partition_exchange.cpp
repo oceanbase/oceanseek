@@ -1304,6 +1304,10 @@ int ObPartitionExchange::check_table_lob_infos_(const ObTableSchema &base_table_
     LOG_WARN("has lob aux table type of exchanging partition tables are not equal", K(ret), K(base_table_schema.has_lob_aux_table()), K(inc_table_schema.has_lob_aux_table()));
   } else if (OB_UNLIKELY(base_table_schema.get_lob_inrow_threshold() != inc_table_schema.get_lob_inrow_threshold())) {
     LOG_WARN("lob inrow threshold of exchanging partition tables are not equal", K(ret), K(base_table_schema.get_lob_inrow_threshold()), K(inc_table_schema.get_lob_inrow_threshold()));
+  } else if (OB_UNLIKELY(base_table_schema.get_lob_intable_threshold()
+                         != inc_table_schema.get_lob_intable_threshold())) {
+    LOG_WARN("lob intable threshold of exchanging partition tables are not equal", KR(ret),
+             K(base_table_schema.get_lob_intable_threshold()), K(inc_table_schema.get_lob_intable_threshold()));
   } else {
     is_equal = true;
   }

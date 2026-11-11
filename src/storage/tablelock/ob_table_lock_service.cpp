@@ -2033,7 +2033,9 @@ int ObTableLockService::check_op_allowed_(const uint64_t table_id,
   if (!table_schema->is_user_table()
       && !table_schema->is_tmp_table()
       && !ObInnerTableLockUtil::in_inner_table_lock_white_list(table_id)
-      && !table_schema->is_external_table()) {
+      && !table_schema->is_external_table()
+      && !(table_schema->is_aux_outtable_lob_control_table()
+          && !is_sys_tenant(tenant_id))) {
     // all the tmp table is a normal table now, deal it as a normal user table
     // table lock not support virtual table/sys table(not in white list) etc.
     is_allowed = false;

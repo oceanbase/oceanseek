@@ -138,8 +138,8 @@ TEST_F(TestStorageFile, test_reader)
   ObIODevice* dev_handle = NULL;
   ObIOFd fd;
   ObIOFd fd_2;
-  const ObBackupIoAdapter::TableOpenParam row_result_param(
-      false, -1, ObObjectReadResultFormat::ROW_WITHOUT_ROWKEY);
+  const ObBackupIoAdapter::ExtOpenParam row_result_param(
+      false, -1, ObObjectReadResultFormat::ROW_WITHOUT_ROWKEY, nullptr);
 
   ASSERT_EQ(OB_INVALID_BACKUP_DEST,
       util.open_with_access_type(

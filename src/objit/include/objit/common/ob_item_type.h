@@ -76,7 +76,7 @@ typedef enum ObItemType
   T_UDT_SQL     = 49,
   T_COLLECTION  = 51,
   T_ROARINGBITMAP = 54,
-  T_EXTBLOB = 55, // Reserved for External LOB.
+  T_EXTBLOB = 55,
 
   T_IEEE754_NAN = 61,
   T_IEEE754_INFINITE = 62,

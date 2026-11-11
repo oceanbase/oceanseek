@@ -1145,6 +1145,11 @@ int ObTableModifyOp::execute_read(const char *sql, ObMySQLProxy::MySQLResult &re
  return ret;
 }
 
+int ObTableModifyOp::complete_outtable_lob_control_keys(ObDMLRtCtx &dml_rtctx)
+{
+  return dml_rtctx.complete_outtable_lob_control_keys();
+}
+
 int ObTableModifyOp::check_stack()
 {
   int ret = OB_SUCCESS;
@@ -1198,6 +1203,8 @@ int ObTableModifyOp::submit_all_dml_task()
       LOG_WARN("close all das task failed", K(ret));
     } else if (OB_FAIL(ObDMLService::handle_after_row_processing(this, &get_dml_modify_row_list()))) {
       LOG_WARN("perform batch foreign key constraints and after row trigger failed", K(ret));
+    } else if (OB_FAIL(complete_outtable_lob_control_keys(dml_rtctx_))) {
+      LOG_WARN("failed to complete outtable lob control rows", K(ret));
     } else {
       dml_modify_rows_.clear();
       dml_rtctx_.reuse();

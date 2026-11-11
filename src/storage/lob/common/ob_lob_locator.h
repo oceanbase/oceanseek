@@ -30,12 +30,12 @@ public:
 
   bool is_valid() const;
   bool is_inrow() const { return nullptr != lob_common_ && lob_common_->in_row_; }
-  bool is_outrow() const { return nullptr != lob_common_ && !lob_common_->in_row_; }
+  bool is_outline() const { return nullptr != lob_common_ && !lob_common_->in_row_; }
 
   const ObLobCommon *get_lob_common() const { return lob_common_; }
-  ObLobId get_lob_id() const { return (nullptr != ptr_ && is_outrow()) ? lob_id_ : ObLobId(); }
+  ObLobId get_lob_id() const { return (nullptr != ptr_ && is_outline()) ? lob_id_ : ObLobId(); }
   int get_lob_id(ObLobId &lob_id) const;
-  const ObLobId *get_lob_id_ptr() const { return (nullptr != ptr_ && is_outrow()) ? &lob_id_ : nullptr; }
+  const ObLobId *get_lob_id_ptr() const { return (nullptr != ptr_ && is_outline()) ? &lob_id_ : nullptr; }
   const char *get_inrow_data_ptr() const { return inrow_data_; }
   int64_t get_inrow_data_len() const { return inrow_data_len_; }
 
@@ -71,6 +71,8 @@ public:
           const common::ObString &input,
           const bool need_data);
 
+  // Initialize without a Disk locator; set External LOB info before build().
+  int init(common::ObIAllocator &allocator);
   int set_extern_info(const uint64_t table_id, 
                       const uint64_t column_idx,
                       const ObCollationType &cs_type);
@@ -86,13 +88,15 @@ public:
                         const int64_t tx_seq_base,
                         bool read_latest);
   int set_rowkey(const common::ObString &rowkey_str);
+  int set_external_lob_info(const common::ObExternalBlobInfo &external_lob_info);
+  int set_summary_info();
   int build(common::ObLobLocatorV2 &locator);
   TO_STRING_KV(K(is_inited_), K(input_.length()), K(extern_header_),
               K(location_info_), K(retry_info_), KPC(tx_read_snapshot_), K(read_snapshot_ls_id_), 
               K(fb_snapshot_), K(rowkey_), K(locator_size_), K(extern_body_size_), 
               K(disk_locator_size_), K(read_snapshot_size_), K(payload_offset_), K(payload_size_), 
               K(has_extern_), K(has_location_info_), K(has_retry_info_), K(has_read_snapshot_), 
-              K(has_row_key_), K(need_payload_));
+              K(has_row_key_), K(is_external_lob_), K(external_lob_info_), K(need_payload_));
 
 private:
   static const int64_t MAX_EXTERN_BODY_SIZE = UINT16_MAX;
@@ -119,6 +123,7 @@ private:
   common::ObMemLobExternHeader extern_header_;
   common::ObMemLobLocationInfo location_info_;
   common::ObMemLobRetryInfo retry_info_;
+  common::ObExternalBlobInfo external_lob_info_;
   transaction::ObTxReadSnapshot *tx_read_snapshot_;
   int64_t read_snapshot_ls_id_;
   share::SCN fb_snapshot_;
@@ -135,6 +140,7 @@ private:
   bool has_retry_info_;
   bool has_read_snapshot_;
   bool has_row_key_;
+  bool is_external_lob_;
   bool need_payload_;
 };
 

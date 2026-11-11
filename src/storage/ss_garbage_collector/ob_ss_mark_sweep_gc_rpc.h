@@ -24,6 +24,7 @@ namespace oceanbase
 namespace storage
 {
 class ObLS;
+class ObStorageSchema;
 
 class ObSSMarkSweepGCStudyReq final
 {
@@ -91,6 +92,7 @@ private:
       const share::SCN &deleted_scn,
       common::ObIArray<storage::ObSSGCTabletStudyResult> &tablet_meta_scn_list);
   int handle_tablet_exist_(
+      const share::SCN &ls_clog_checkpoint_scn,
       const storage::ObTabletHandle &tablet_handle,
       const storage::ObSSGCTablet &cur_gc_tablet,
       const int64_t ls_epoch,
@@ -103,6 +105,14 @@ private:
                                      bool &allow_tablet_version_gc);
   int check_tablets_belong_to_same_ls_(
       const common::ObIArray<storage::ObSSGCTabletWithDelScn> &tablet_list);
+  bool need_collect_lob_rely_info_(
+      const storage::ObStorageSchema &storage_schema);
+  bool update_cold_lob_rely_info_(
+      const bool collect_lob_rely_info,
+      const int64_t tablet_cnt,
+      const bool has_memtable,
+      const share::SCN &ls_clog_checkpoint_scn,
+      storage::ObSSGCTabletStudyInfo &study_info);
   DISALLOW_COPY_AND_ASSIGN(ObSSMarkSweepGCStudyP);
 };
 

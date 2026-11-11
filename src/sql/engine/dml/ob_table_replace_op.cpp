@@ -678,6 +678,8 @@ int ObTableReplaceOp::do_replace_into()
       LOG_WARN("fail to post all das task", K(ret));
     } else if (!check_is_duplicated() && OB_FAIL(ObDMLService::handle_after_row_processing(this, &dml_modify_rows_))) {
       LOG_WARN("try insert is not duplicated, failed to process foreign key handle", K(ret));
+    } else if (!check_is_duplicated() && OB_FAIL(complete_outtable_lob_control_keys(dml_rtctx_))) {
+      LOG_WARN("failed to complete outtable lob control rows for try insert", K(ret));
     } else if (!check_is_duplicated()) {
       LOG_DEBUG("try insert is not duplicated", K(ret));
     }
@@ -701,6 +703,8 @@ int ObTableReplaceOp::do_replace_into()
       LOG_WARN("do insert rows post process failed", K(ret));
     } else if (OB_FAIL(ObDMLService::handle_after_row_processing(this, &dml_modify_rows_, true))) {
       LOG_WARN("try insert is duplicated, failed to process foreign key handle", K(ret));
+    } else if (OB_FAIL(complete_outtable_lob_control_keys(dml_rtctx_))) {
+      LOG_WARN("failed to complete outtable lob control rows for final replace", K(ret));
     }
     GET_DIAGNOSTIC_INFO->get_ash_stat().in_duplicate_conflict_resolve_=false;
     if (OB_SUCC(ret) && !is_iter_end) {
@@ -1006,7 +1010,7 @@ int ObTableReplaceOp::reset_das_env()
   if (OB_FAIL(dml_rtctx_.das_ref_.close_all_task())) {
     LOG_WARN("close all das task failed", K(ret));
   } else {
-    dml_rtctx_.das_ref_.reuse();
+    dml_rtctx_.reuse();
     dml_modify_rows_.clear();
   }
 
@@ -1027,15 +1031,16 @@ int ObTableReplaceOp::reuse()
   if (dml_rtctx_.das_ref_.has_task()) {
     if (OB_FAIL(dml_rtctx_.das_ref_.close_all_task())) {
       LOG_WARN("close all insert das task failed", K(ret));
-    } else {
-      dml_rtctx_.das_ref_.reuse();
     }
+  }
+  if (OB_SUCC(ret)) {
+    dml_rtctx_.reuse();
   }
   if (OB_SUCC(ret)) {
     if (OB_FAIL(replace_rtctx_.das_ref_.close_all_task())) {
       LOG_WARN("close all update das task failed", K(ret));
     } else {
-      replace_rtctx_.das_ref_.reuse();
+      replace_rtctx_.reuse();
     }
   }
   if (OB_SUCC(ret)) {

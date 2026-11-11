@@ -264,6 +264,8 @@
 #include "sql/engine/expr/ob_expr_remove_const.h"
 #include "sql/engine/expr/ob_expr_wrapper_inner.h"
 #include "sql/engine/expr/ob_expr_lob_appendwrite.h"
+#include "sql/engine/expr/ob_expr_external_lob.h"
+#include "sql/engine/expr/ob_expr_lob_meta.h"
 #include "sql/engine/expr/ob_expr_calc_urowid.h"
 #include "sql/engine/expr/ob_expr_set.h"
 #include "sql/engine/expr/ob_expr_cardinality.h"
@@ -1059,6 +1061,8 @@ void ObExprOperatorFactory::register_expr_operators()
     REG_OP(ObExprOutputPack, EAGER_EVALUATION);
     REG_OP(ObExprWrapperInner, EAGER_EVALUATION);
     REG_OP(ObExprLobAppendWrite, EAGER_EVALUATION);
+    REG_OP(ObExprExternalLob, EAGER_EVALUATION);
+    REG_OP(ObExprLobMeta, EAGER_EVALUATION);
     REG_OP(ObExprDegrees, EAGER_EVALUATION);
     REG_OP(ObExprValidatePasswordStrength, EAGER_EVALUATION);
     REG_OP(ObExprDay, EAGER_EVALUATION);

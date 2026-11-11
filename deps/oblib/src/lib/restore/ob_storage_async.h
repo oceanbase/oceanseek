@@ -83,6 +83,10 @@ public:
   virtual int open(const common::ObString &uri, 
                    common::ObObjectStorageInfo *storage_info, 
                    const bool has_meta = true);
+  int open(const common::ObString &uri,
+           common::ObObjectStorageInfo *storage_info,
+           const bool has_meta,
+           const char *etag);
   virtual void reset() override;
   int pread(char *buf, 
             const int64_t size, 
@@ -95,6 +99,8 @@ public:
   static void callback(opendal_error *error, int64_t bytes, void *raw_ctx);
 protected:
   bool has_meta_;
+  bool has_if_match_etag_;
+  ObString if_match_etag_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObStorageAsyncReader);
 };

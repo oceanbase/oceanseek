@@ -488,7 +488,7 @@ int ObExtDefaultFileSystem::get_file_status_(const common::ObString &path, int64
   if (OB_FAIL(storage_holder.init(path, access_info_))) {
     LOG_WARN("ext get_file_status init storage failed", K(ret), K(path));
   } else {
-    common::ObIODFileStat statbuf;
+    common::ObIODFileStat statbuf(tenant_id_);
     const int stat_ret =
         common::ObExternalIoAdapter::get_file_stat(path, storage_holder.storage_info_, statbuf);
     if (OB_SUCCESS == stat_ret) {

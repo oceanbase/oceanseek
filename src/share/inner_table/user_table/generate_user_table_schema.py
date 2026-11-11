@@ -20,6 +20,11 @@ DEF_FILE = 'user_table_schema_def.py'
 HEADER_FILE = 'ob_user_table_schema.h'
 CPP_FILE = 'ob_user_table_schema.cpp'
 
+TABLE_TYPE_CPP = {
+  'user_table': 'USER_TABLE',
+  'aux_outtable_lob_control': 'AUX_OUTTABLE_LOB_CONTROL',
+}
+
 COPYRIGHT = '''/**
  * Copyright (c) 2021 OceanBase
  * SPDX-License-Identifier: Apache-2.0
@@ -55,6 +60,39 @@ def _parse_column_tuple(node):
   }
 
 
+def _parse_indexes(node):
+  if not isinstance(node, ast.Dict):
+    raise ValueError('index must be a dict')
+  indexes = []
+  for name_node, def_node in zip(node.keys, node.values):
+    index_name = str(_literal(name_node))
+    if not index_name:
+      raise ValueError('index name is required')
+    if not isinstance(def_node, ast.Dict):
+      raise ValueError('index definition must be a dict')
+    index_columns = None
+    store_columns = []
+    for key_node, value_node in zip(def_node.keys, def_node.values):
+      key = str(_literal(key_node))
+      if key not in ('index_columns', 'store_columns'):
+        raise ValueError('unsupported index option: %s' % key)
+      if not isinstance(value_node, (ast.Tuple, ast.List)):
+        raise ValueError('%s must be a list' % key)
+      columns = [str(_literal(item)) for item in value_node.elts]
+      if key == 'index_columns':
+        index_columns = columns
+      else:
+        store_columns = columns
+    if not index_columns:
+      raise ValueError('index_columns are required for %s' % index_name)
+    indexes.append({
+      'name': index_name,
+      'columns': index_columns,
+      'store_columns': store_columns,
+    })
+  return indexes
+
+
 def _parse_def_table_schema(call_node):
   if not isinstance(call_node, ast.Call):
     raise ValueError('expected Call node')
@@ -64,16 +102,18 @@ def _parse_def_table_schema(call_node):
   table = {
     'database_name': '',
     'table_name': '',
+    'table_type': 'user_table',
     'tablegroup_name': '',
     'partition_columns': [],
     'partition_expr': [],
     'rowkey_columns': [],
     'normal_columns': [],
+    'indexes': [],
   }
   for kw in call_node.keywords:
     key = kw.arg
     val = kw.value
-    if key in ('database_name', 'table_name', 'tablegroup_name', 'owner'):
+    if key in ('database_name', 'table_name', 'table_type', 'tablegroup_name', 'owner'):
       if key == 'owner':
         continue
       table[key] = str(_literal(val))
@@ -92,8 +132,31 @@ def _parse_def_table_schema(call_node):
         raise ValueError('%s must be list' % key)
       for item in val.elts:
         table[key].append(_parse_column_tuple(item))
+    elif key == 'index':
+      table['indexes'] = _parse_indexes(val)
   if not table['table_name'] or not table['database_name']:
     raise ValueError('table_name and database_name are required')
+  if table['table_type'] not in TABLE_TYPE_CPP:
+    raise ValueError('unsupported table_type: %s' % table['table_type'])
+  column_names = [col['name'] for col in table['rowkey_columns'] + table['normal_columns']]
+  index_names = set()
+  for index in table['indexes']:
+    if index['name'] in index_names:
+      raise ValueError('duplicate index name: %s' % index['name'])
+    index_names.add(index['name'])
+    seen_columns = set()
+    for column_name in index['columns']:
+      if column_name not in column_names:
+        raise ValueError('unknown index column %s in %s' % (column_name, index['name']))
+      if column_name in seen_columns:
+        raise ValueError('duplicate index column %s in %s' % (column_name, index['name']))
+      seen_columns.add(column_name)
+    for column_name in index['store_columns']:
+      if column_name not in column_names:
+        raise ValueError('unknown store column %s in %s' % (column_name, index['name']))
+      if column_name in seen_columns:
+        raise ValueError('duplicate index/store column %s in %s' % (column_name, index['name']))
+      seen_columns.add(column_name)
   return table
 
 
@@ -118,6 +181,10 @@ def _schema_func_name(table_name):
 
 def _table_name2tname(name):
   return 'OB_' + name.replace('$', '_').upper().strip('_') + '_TNAME'
+
+
+def _c_symbol(name):
+  return re.sub(r'[^A-Za-z0-9]+', '_', name).upper().strip('_')
 
 
 def _c_escape(s):
@@ -225,12 +292,46 @@ def _emit_add_column(f, col, rowkey_id, index_id, part_key_pos, use_default):
 ''' % (name, rowkey_id, index_id, part_key_pos, col_type, col_collation, col_len, col_prec, col_scale, nullable))
 
 
+def _emit_table_columns(f, table):
+  part_cols = table.get('partition_columns') or []
+
+  rowkey_id = 1
+  for col in table['rowkey_columns']:
+    part_key_pos = 0
+    if col['name'] in part_cols:
+      part_key_pos = part_cols.index(col['name']) + 1
+    _emit_add_column(f, col, rowkey_id, 0, part_key_pos, False)
+    rowkey_id += 1
+
+  for col in table['normal_columns']:
+    part_key_pos = 0
+    if col['name'] in part_cols:
+      part_key_pos = part_cols.index(col['name']) + 1
+    _emit_add_column(f, col, 0, 0, part_key_pos, False)
+
+
+def _emit_table_columns_func(f, table):
+  schema_func_name = _schema_func_name(table['table_name'])
+  func_name = 'add_%s_columns' % schema_func_name[:-len('_schema')]
+  f.write('static int %s(\n' % func_name)
+  f.write('    share::schema::ObTableSchema &table_schema,\n')
+  f.write('    uint64_t &column_id)\n')
+  f.write('{\n')
+  f.write('  int ret = OB_SUCCESS;\n\n')
+  _emit_table_columns(f, table)
+  f.write('  return ret;\n')
+  f.write('}\n\n')
+  return func_name
+
+
 def _emit_table_schema_func(f, table):
   func_name = _schema_func_name(table['table_name'])
   rowkey_cnt = len(table['rowkey_columns'])
-  part_cols = table.get('partition_columns') or []
   pe = table.get('partition_expr') or []
   tg = table.get('tablegroup_name') or ''
+  column_func_name = ''
+  if table['table_type'] == 'aux_outtable_lob_control':
+    column_func_name = _emit_table_columns_func(f, table)
 
   f.write('int %s(share::schema::ObTableSchema &table_schema)\n' % func_name)
   f.write('{\n')
@@ -243,7 +344,7 @@ def _emit_table_schema_func(f, table):
   f.write('  table_schema.set_rowkey_column_num(%d);\n' % rowkey_cnt)
   f.write('  table_schema.set_index_column_num(0);\n')
   f.write('  table_schema.set_load_type(TABLE_LOAD_TYPE_IN_DISK);\n')
-  f.write('  table_schema.set_table_type(USER_TABLE);\n')
+  f.write('  table_schema.set_table_type(%s);\n' % TABLE_TYPE_CPP[table['table_type']])
   f.write('  table_schema.set_index_type(INDEX_TYPE_IS_NOT);\n')
   f.write('  table_schema.set_def_type(TABLE_DEF_TYPE_INTERNAL);\n')
   f.write('  table_schema.set_part_level(PARTITION_LEVEL_ZERO);\n')
@@ -296,19 +397,16 @@ def _emit_table_schema_func(f, table):
 
 ''' % (type_str, expr_str, part_num))
 
-  rowkey_id = 1
-  for col in table['rowkey_columns']:
-    part_key_pos = 0
-    if col['name'] in part_cols:
-      part_key_pos = part_cols.index(col['name']) + 1
-    _emit_add_column(f, col, rowkey_id, 0, part_key_pos, False)
-    rowkey_id += 1
+  if column_func_name:
+    f.write('''  if (OB_SUCC(ret)) {
+    if (OB_FAIL(%s(table_schema, column_id))) {
+      LOG_WARN("fail to add column schemas", K(ret));
+    }
+  }
 
-  for col in table['normal_columns']:
-    part_key_pos = 0
-    if col['name'] in part_cols:
-      part_key_pos = part_cols.index(col['name']) + 1
-    _emit_add_column(f, col, 0, 0, part_key_pos, False)
+''' % column_func_name)
+  else:
+    _emit_table_columns(f, table)
 
   f.write('  table_schema.set_max_used_column_id(column_id);\n')
   f.write('  return ret;\n')
@@ -346,6 +444,16 @@ namespace schema
 class ObTableSchema;
 }
 
+struct ObUserTableBuiltinLocalIndexEntry
+{
+  const char *table_name_;
+  const char *index_name_;
+  const char *const *column_names_;
+  int64_t column_count_;
+  const char *const *store_column_names_;
+  int64_t store_column_count_;
+};
+
 struct ObUserTableBuiltinSchemaEntry
 {
   const char *database_name_;
@@ -360,10 +468,17 @@ OB_INLINE int64_t get_user_table_builtin_schema_count()
 
 const ObUserTableBuiltinSchemaEntry *get_user_table_builtin_schema_entries();
 
+OB_INLINE int64_t get_user_table_builtin_local_index_count()
+{
+  return %d;
+}
+
+const ObUserTableBuiltinLocalIndexEntry *get_user_table_builtin_local_index_entries();
+
 static const char META_TENANT_BUILTIN_USER_TABLEGROUP_NAME[] = "ss_meta";
 static const char SYS_TENANT_BUILTIN_USER_TABLEGROUP_NAME[] = "ss_meta";
 
-// Builtin SS Meta user table names (see user_table_schema_def).
+// Builtin user table names (see user_table_schema_def).
 %s
 
 // Sys/meta tenant builtin SS Meta user tables (see user_table_schema_def).
@@ -375,7 +490,7 @@ bool is_shared_builtin_user_table(const uint64_t tenant_id, const common::ObStri
 } // namespace oceanbase
 
 #endif /* OCEANBASE_SHARE_OB_USER_TABLE_SCHEMA_H_ */
-''' % (len(tables), tnames, decls))
+''' % (len(tables), sum(len(t.get('indexes') or []) for t in tables), tnames, decls))
 
 
 def generate_cpp(path, tables):
@@ -400,6 +515,35 @@ namespace share
     for table in tables:
       func_names.append(_emit_table_schema_func(f, table))
 
+    local_indexes = []
+    for table in tables:
+      indexes = table.get('indexes') or []
+      if indexes:
+        table_symbol = _c_symbol(table['table_name'])
+        for index in indexes:
+          column_symbol = '%s_%s_COLUMNS' % (table_symbol, _c_symbol(index['name']))
+          f.write('static const char *const %s[] = {\n' % column_symbol)
+          for column_name in index['columns']:
+            f.write('  "%s",\n' % _c_escape(column_name))
+          f.write('};\n\n')
+          store_column_symbol = 'nullptr'
+          if index['store_columns']:
+            store_column_symbol = '%s_%s_STORE_COLUMNS' % (table_symbol, _c_symbol(index['name']))
+            f.write('static const char *const %s[] = {\n' % store_column_symbol)
+            for column_name in index['store_columns']:
+              f.write('  "%s",\n' % _c_escape(column_name))
+            f.write('};\n\n')
+          local_indexes.append((table, index, column_symbol, store_column_symbol))
+
+    f.write('static const ObUserTableBuiltinLocalIndexEntry '
+            'OB_USER_TABLE_BUILTIN_LOCAL_INDEX_ENTRIES[] = {\n')
+    for table, index, column_symbol, store_column_symbol in local_indexes:
+      f.write('  {"%s", "%s", %s, %d, %s, %d},\n' % (
+          _c_escape(table['table_name']), _c_escape(index['name']),
+          column_symbol, len(index['columns']), store_column_symbol,
+          len(index['store_columns'])))
+    f.write('};\n\n')
+
     f.write('static const ObUserTableBuiltinSchemaEntry OB_USER_TABLE_BUILTIN_SCHEMA_ENTRIES[] = {\n')
     for table, func_name in zip(tables, func_names):
       f.write('  {"%s", "%s", %s},\n' % (
@@ -414,6 +558,11 @@ namespace share
   return OB_USER_TABLE_BUILTIN_SCHEMA_ENTRIES;
 }
 
+const ObUserTableBuiltinLocalIndexEntry *get_user_table_builtin_local_index_entries()
+{
+  return OB_USER_TABLE_BUILTIN_LOCAL_INDEX_ENTRIES;
+}
+
 bool is_shared_builtin_user_table(const uint64_t tenant_id, const ObString &table_name)
 {
   bool bret = false;
@@ -424,6 +573,28 @@ bool is_shared_builtin_user_table(const uint64_t tenant_id, const ObString &tabl
       if (OB_NOT_NULL(entries[i].table_name_)
           && 0 == table_name.case_compare(entries[i].table_name_)) {
         bret = true;
+      }
+    }
+    const int64_t index_prefix_len = strlen(OB_INDEX_PREFIX);
+    int64_t pos = index_prefix_len;
+    while (!bret && table_name.prefix_match(OB_INDEX_PREFIX)
+        && pos < table_name.length()
+        && table_name.ptr()[pos] >= '0'
+        && table_name.ptr()[pos] <= '9') {
+      ++pos;
+    }
+    if (!bret && pos > index_prefix_len && pos + 1 < table_name.length()
+        && '_' == table_name.ptr()[pos]) {
+      const ObString index_name(
+          table_name.length() - pos - 1, table_name.ptr() + pos + 1);
+      const ObUserTableBuiltinLocalIndexEntry *index_entries =
+          get_user_table_builtin_local_index_entries();
+      const int64_t index_cnt = get_user_table_builtin_local_index_count();
+      for (int64_t i = 0; !bret && i < index_cnt; ++i) {
+        if (OB_NOT_NULL(index_entries[i].index_name_)
+            && 0 == index_name.case_compare(index_entries[i].index_name_)) {
+          bret = true;
+        }
       }
     }
   }

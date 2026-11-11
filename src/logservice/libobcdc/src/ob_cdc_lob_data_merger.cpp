@@ -414,7 +414,7 @@ int ObCDCLobDataMerger::handle_prepare_task_(
     if (OB_SUCC(ret)) {
       ObString summary_value(summary_data_len, summary_data);
       if (OB_FAIL(ObCDCLobAuxTableParser::decode_summary_value(
-          summary_value, byte_len, char_len, extra_info))) {
+          allocator, summary_value, byte_len, char_len, extra_info))) {
         LOG_ERROR("decode lob summary failed", KR(ret), K(key));
       } else if (OB_UNLIKELY(storage::ObLobMetaExtraInfo::LOB_META_SUMMARY != extra_info.extra_info_type_)) {
         ret = OB_ERR_UNEXPECTED;
@@ -422,14 +422,14 @@ int ObCDCLobDataMerger::handle_prepare_task_(
       } else if (OB_UNLIKELY(storage::ObLobLastWriteType::INSERT != extra_info.last_write_type_)) {
         // CDC 仅支持 INSERT 类型的 LOB，不支持 APPEND 和 MULTIPART_WRITE 类型的 LOB
         ret = OB_NOT_SUPPORTED;
-        LOG_ERROR("unsupported in-table lob last write type", KR(ret), K(extra_info), K(key));
+        LOG_ERROR("unsupported lob last write type", KR(ret), K(extra_info), K(key));
       } else if (OB_UNLIKELY(
-          !extra_info.lob_chunk_type_.in_table() // TODO(binifei.bnf): 目前仅支持in_table，后续支持out_table时，再修改该限制
+          (!extra_info.lob_chunk_type_.in_table() && !extra_info.lob_chunk_type_.out_table())
           || (byte_len > static_cast<uint64_t>(INT64_MAX - 1))
           || ((0 == byte_len) != (0 == extra_info.chunk_count_))
           || ((byte_len > 0) && (extra_info.chunk_count_ > byte_len)))) {
         ret = OB_NOT_SUPPORTED;
-        LOG_ERROR("invalid in-table lob summary", KR(ret), K(extra_info), K(key));
+        LOG_ERROR("invalid lob summary", KR(ret), K(extra_info), K(key));
       } else if (OB_FAIL(build_and_dispatch_fragment_tasks_(
           task, extra_info.chunk_count_, byte_len, is_sync, stop_flag))) {
         if (OB_IN_STOP_STATE != ret) {
@@ -557,8 +557,7 @@ int ObCDCLobDataMerger::handle_fragment_task_(
       if (OB_UNLIKELY((task.idx_ >= col_ctx.chunk_count_)
           || OB_ISNULL(piece_data)
           || (piece_data_len <= 0)
-          // TODO(binifei.bnf): 目前仅支持in_table，后续支持out_table时，再改为2MB
-          || (piece_data_len > storage::ObLobMetaUtil::LOB_PIECE_DATA_SIZE))) {
+          || (piece_data_len > storage::ObLobMetaUtil::LOB_OUTTABLE_BLOCK_DATA_SIZE))) {
         ret = OB_INVALID_ARGUMENT;
         LOG_ERROR("invalid lob piece cache value", KR(ret), K(key), K(piece_data_len),
             K(task.idx_), K(col_ctx.chunk_count_));

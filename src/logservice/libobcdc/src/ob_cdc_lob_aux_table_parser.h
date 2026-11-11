@@ -18,6 +18,7 @@ class ObCDCLobAuxTableParser
 {
 public:
   static int parse_lob_aux_meta_table_row(
+      common::ObIAllocator &allocator,
       ColValueList &cols,
       storage::ObLobMetaInfo &meta_info,
       bool &is_summary,
@@ -41,6 +42,7 @@ public:
       const storage::ObLobMetaInfo &meta_info,
       common::ObString &value);
   static int decode_summary_value(
+      common::ObIAllocator &allocator,
       const common::ObString &value,
       uint64_t &byte_len,
       uint64_t &char_len,
@@ -48,6 +50,7 @@ public:
 
 private:
   static int parse_lob_meta_summary_info_(
+      common::ObIAllocator &allocator,
       const storage::ObLobMetaInfo &meta_info,
       bool &is_summary,
       storage::ObLobMetaExtraInfo &extra_info);

@@ -23,7 +23,11 @@ namespace oceanbase
 namespace storage
 {
 
+class ObOuttableLobControlManager;
+struct ObOuttableLobControlKey;
+
 class ObLobQueryIter;
+class ObLobConcurrentPuter;
 class ObPersistentLobAdaptor;
 struct ObLobMetaScanResult;
 class ObLobMetaScanIter;
@@ -287,11 +291,13 @@ public:
            const common::ObLobId &lob_id,
            common::ObIArray<ObLobMetaInfo> *meta_array,
            ObLobWriteStats *write_stats);
-  int set_start_seq_id(const common::ObString &start_seq_id);
+  int set_start_seq_id(const common::ObString &start_seq_id,
+                       const bool reuse_start_seq_id = false);
   virtual int get_next_row(blocksstable::ObDatumRow *&row) override;
   virtual void reset() override;
 
   bool is_end() const { return is_end_; }
+  ObLobPieceInfo &get_current_piece() { return piece_info_; }
 
   TO_STRING_KV(K_(is_inited), K_(is_end), KP_(query_iter), K_(chunk_size),
                K_(lob_col_idx), K_(lob_id), KPC_(write_stats));
@@ -306,6 +312,7 @@ private:
   common::ObLobId lob_id_;
   common::ObIArray<ObLobMetaInfo> *meta_array_;
   ObLobWriteStats *write_stats_;
+  bool reuse_start_seq_id_;
   common::ObString data_meta_lob_info_;
   ObLobSeqIdGenerator seq_id_gen_;
   ObLobChunk chunk_;
@@ -313,6 +320,60 @@ private:
   blocksstable::ObDatumRow row_;
 
   DISALLOW_COPY_AND_ASSIGN(ObLobInTablePieceInsertIter);
+};
+
+class ObLobOutTableInsertIter final
+{
+public:
+  ObLobOutTableInsertIter();
+  ~ObLobOutTableInsertIter();
+
+  int init(ObLobInsertContext *insert_ctx,
+           ObLobQueryIter *query_iter,
+           common::ObIAllocator *allocator,
+           const int64_t chunk_size,
+           const int64_t chunk_count,
+           const int64_t lob_col_idx,
+           const common::ObLobId &lob_id,
+           common::ObIArray<ObLobMetaInfo> *meta_array,
+           ObLobWriteStats *write_stats);
+  int set_start_seq_id(const common::ObString &start_seq_id,
+                       const bool reuse_start_seq_id = false);
+  int write_all();
+  void reset();
+
+  bool is_end() const { return is_end_; }
+
+  TO_STRING_KV(K_(is_inited), K_(is_end), KPC_(insert_ctx), KP_(query_iter), K_(chunk_size),
+               K_(lob_col_idx), K_(lob_id), "macro_id_array_.count", macro_id_array_.count(),
+               KPC_(write_stats));
+
+private:
+  int prepare_batch_(common::ObIAllocator &batch_allocator,
+                     common::ObIArray<common::ObString> &chunk_data,
+                     common::ObIArray<ObOuttableLobControlKey> &control_keys);
+  int write_batch_(ObLobConcurrentPuter &puter, ObOuttableLobControlManager &control_manager);
+
+private:
+  bool is_inited_;
+  bool is_end_;
+  ObLobInsertContext *insert_ctx_;
+  ObLobQueryIter *query_iter_;
+  common::ObIAllocator *allocator_;
+  int64_t chunk_size_;
+  int64_t chunk_count_;
+  int64_t lob_col_idx_;
+  common::ObLobId lob_id_;
+  common::ObArray<blocksstable::MacroBlockId> macro_id_array_;
+  common::ObIArray<ObLobMetaInfo> *meta_array_;
+  int64_t idx_;
+
+  ObLobWriteStats *write_stats_;
+  bool reuse_start_seq_id_;
+  ObLobSeqIdGenerator seq_id_gen_;
+  ObLobChunk chunk_;
+
+  DISALLOW_COPY_AND_ASSIGN(ObLobOutTableInsertIter);
 };
 
 class ObLobMetaTableBatchInsertIter : public blocksstable::ObDatumRowIterator

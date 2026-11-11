@@ -161,18 +161,6 @@ int ObLobMetaManager::update(ObLobUpdateContext &update_ctx, ObLobMetaInfo &old_
   return ret;
 }
 
-int ObLobMetaManager::fetch_lob_id(ObLobInsertContext &insert_ctx, uint64_t &lob_id)
-{
-  int ret = OB_SUCCESS;
-  if (IS_NOT_INIT) {
-    ret = OB_NOT_INIT;
-    LOG_WARN("ObLobMetaManager not inited", KR(ret));
-  } else if (OB_FAIL(adaptor_->fetch_lob_id(insert_ctx, lob_id))) {
-    LOG_WARN("fetch lob id failed.", K(ret), K(insert_ctx));
-  }
-  return ret;
-}
-
 int ObLobMetaManager::get_byte_length(ObLobReadContext &read_ctx, uint64_t &byte_length)
 {
   int ret = OB_SUCCESS;
@@ -262,15 +250,13 @@ int ObLobMetaManager::get_meta_summary_info(
 
 int ObLobMetaManager::get_last_meta_info(
     ObLobReadContext &read_ctx,
-    ObLobMetaInfo &last_meta,
-    bool &found)
+    ObLobMetaInfo &last_meta)
 {
   int ret = OB_SUCCESS;
-  found = false;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("ObLobMetaManager not inited", KR(ret));
-  } else if (OB_FAIL(adaptor_->get_last_meta_info(read_ctx, last_meta, found))) {
+  } else if (OB_FAIL(adaptor_->get_last_meta_info(read_ctx, last_meta))) {
     LOG_WARN("failed to get last lob meta info", KR(ret), K(read_ctx));
   }
   return ret;
@@ -419,15 +405,13 @@ int ObLobPieceManager::revert_scan_iter(ObLobPieceTableIter *iter)
 int ObLobPieceManager::get_piece_info(
     ObLobReadContext &read_ctx,
     const common::ObString &seq_id,
-    ObLobPieceInfo &piece_info,
-    bool &found)
+    ObLobPieceInfo &piece_info)
 {
   int ret = OB_SUCCESS;
-  found = false;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("ObLobPieceManager not inited", KR(ret));
-  } else if (OB_FAIL(adaptor_->get_lob_piece_info(read_ctx, seq_id, piece_info, found))) {
+  } else if (OB_FAIL(adaptor_->get_lob_piece_info(read_ctx, seq_id, piece_info))) {
     LOG_WARN("failed to get lob piece info", KR(ret), K(seq_id), K(read_ctx));
   }
   return ret;

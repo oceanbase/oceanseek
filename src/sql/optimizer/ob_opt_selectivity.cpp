@@ -4930,7 +4930,7 @@ int ObOptSelectivity::calc_expr_min_max(const OptTableMetas &table_metas,
   if (OB_ISNULL(expr) || OB_ISNULL(ctx.get_opt_ctx().get_exec_ctx())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null", K(ret));
-  } else if (expr->get_result_type().is_ext()) {
+  } else if (expr->get_result_type().is_ext() || ObExtendBLobType == expr->get_data_type()) {
     // do nothing
   } else if (expr->is_column_ref_expr()) {
     if (OB_FAIL(ObOptSelectivity::get_column_min_max(table_metas, ctx, *expr,

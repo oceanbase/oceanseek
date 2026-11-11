@@ -251,6 +251,8 @@ private:
 
   int reset_das_env();
 
+  int complete_outtable_lob_control_keys_();
+
   void add_need_conflict_result_flag();
 
   int reuse();

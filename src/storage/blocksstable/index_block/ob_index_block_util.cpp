@@ -151,7 +151,9 @@ int get_prefix_for_text_tc_datum(
     char *prefix_datum_buf)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(orig_datum.is_outrow() || !ob_is_text_tc(obj_type)) || OB_ISNULL(prefix_datum_buf)) {
+  if (OB_UNLIKELY(orig_datum.is_outline()
+                  || !ob_is_text_tc(obj_type))
+                  || OB_ISNULL(prefix_datum_buf)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected out row datum", K(ret), K(orig_datum), K(obj_type), KP(prefix_datum_buf));
   } else {

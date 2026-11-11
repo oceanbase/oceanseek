@@ -718,6 +718,7 @@ _optimizer_group_by_placement
 _optimizer_skip_scan_enabled
 _optimizer_sortmerge_join_enabled
 _orc_filter_pushdown_level
+_outtable_lob_fail_gc_timeout
 _parallel_ddl_control
 _parallel_max_active_sessions
 _parallel_min_message_pool

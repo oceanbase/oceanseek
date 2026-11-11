@@ -122,7 +122,7 @@ void ObIColAggregator::reuse()
 int ObIColAggregator::copy_agg_datum(const ObDatum &src, ObDatum &dst)
 {
   int ret = OB_SUCCESS;
-  if (OB_UNLIKELY(src.is_outrow())|| OB_ISNULL(dst.ptr_) || OB_UNLIKELY(src.is_nop()) ||
+  if (OB_UNLIKELY(src.is_outline())|| OB_ISNULL(dst.ptr_) || OB_UNLIKELY(src.is_nop()) ||
       OB_UNLIKELY(!src.is_null() && src.len_ > ObSkipIndexColMeta::MAX_SKIP_INDEX_COL_LENGTH) ) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("Unexpected agg datum for copy", K(ret), K(src), K(dst));
@@ -1415,7 +1415,7 @@ int ObISkipIndexAggregator::get_aggregated_row(const ObSkipIndexAggResult *&aggr
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("Fail to get aggregated column result", K(ret), K(i));
       } else if (OB_UNLIKELY(result->len_ > ObSkipIndexColMeta::MAX_SKIP_INDEX_COL_LENGTH
-          || result->is_outrow())) {
+          || result->is_outline())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("Unexpected aggregated result datum", K(ret), K(result), K(i), K_(full_agg_metas));
       }

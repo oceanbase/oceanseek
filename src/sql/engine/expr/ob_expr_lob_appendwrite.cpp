@@ -38,10 +38,9 @@ int ObExprLobAppendWrite::calc_result_type3(ObExprResType &type,
 {
   int ret = OB_SUCCESS;
   UNUSED(type_ctx);
-  if (OB_UNLIKELY(ObLongTextType != lob.get_type())) {
+  if (OB_UNLIKELY(ObLongTextType != lob.get_type() && ObExtendBLobType != lob.get_type())) {
     ret = OB_ERR_INVALID_TYPE_FOR_OP;
-    LOG_WARN("LOB_WRITEAPPEND requires LONGTEXT or LONGBLOB as its first argument",
-             K(ret), K(lob));
+    LOG_WARN("LOB_WRITEAPPEND requires LONGTEXT, LONGBLOB or EXTBLOB", K(ret), K(lob));
   } else if (OB_UNLIKELY(!(ObNullType == buffer.get_type()
                            || ob_is_string_type(buffer.get_type())
                            || ob_is_raw(buffer.get_type()) || ob_is_large_text(buffer.get_type())))) {
@@ -141,12 +140,6 @@ int ObExprLobAppendWrite::eval_lob_appendwrite(const ObExpr &expr,
       // 此时 'ABC' 作为 buffer，类型为 VARCHAR。
       //
       // buffer 为 LOB 的示例：
-      //   CREATE TABLE t (
-      //     id INT PRIMARY KEY,
-      //     data LONGTEXT,
-      //     buf LONGTEXT
-      //   );
-      //
       //   UPDATE t
       //      SET data = LOB_WRITEAPPEND(data, 6, REPEAT('!', 262139))
       //    WHERE id = 1;

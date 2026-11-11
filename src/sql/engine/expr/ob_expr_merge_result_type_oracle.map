@@ -56,6 +56,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObMySQLDateType,     /*NullType=>ObMySQLDateType  */
         ObMySQLDateTimeType, /*NullType=>ObMySQLDateTimeType  */
         ObRoaringBitmapType, /* NullType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObNullType => ObExtendBLobType */
     },
 
     /*TinyIntType*/
@@ -115,6 +116,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*TinyIntType=>ObMySQLDateType  */
         ObVarcharType,    /*TinyIntType=>ObMySQLDateTimeType  */
         ObMaxType,        /*TinyInt=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObTinyIntType => ObExtendBLobType */
     },
 
     /*SmallIntType*/
@@ -174,6 +176,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*SmallInt=>ObMySQLDateType  */
         ObVarcharType,    /*SmallInt=>ObMySQLDateTimeType  */
         ObMaxType,        /*SmallInt=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObSmallIntType => ObExtendBLobType */
     },
 
     /*MediumIntType*/
@@ -233,6 +236,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*MediumInt=>ObMySQLDateType  */
         ObVarcharType,    /*MediumInt=>ObMySQLDateTimeType  */
         ObMaxType,        /*MediumInt=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObMediumIntType => ObExtendBLobType */
     },
 
     /*Int32Type*/
@@ -292,6 +296,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*Int32Type=>ObMySQLDateType  */
         ObVarcharType,    /*Int32Type=>ObMySQLDateTimeType  */
         ObMaxType,        /*Int32Type=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObInt32Type => ObExtendBLobType */
     },
 
     /*IntType*/
@@ -351,6 +356,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*IntType=>ObMySQLDateType  */
         ObVarcharType,    /*IntType=>ObMySQLDateTimeType  */
         ObMaxType,        /*IntType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObIntType => ObExtendBLobType */
     },
 
     /*UTinyIntType*/
@@ -410,6 +416,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*UTinyIntType=>ObMySQLDateType  */
         ObVarcharType,    /*UTinyIntType=>ObMySQLDateTimeType  */
         ObMaxType,        /*UTinyIntType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUTinyIntType => ObExtendBLobType */
     },
 
     /*USmallIntType*/
@@ -469,6 +476,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*USmallIntType=>ObMySQLDateType  */
         ObVarcharType,    /*USmallIntType=>ObMySQLDateTimeType  */
         ObMaxType,        /*USmallIntType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUSmallIntType => ObExtendBLobType */
     },
 
     /*UMediumIntType*/
@@ -528,6 +536,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*UMediumIntType=>ObMySQLDateType  */
         ObVarcharType,    /*UMediumIntType=>ObMySQLDateTimeType  */
         ObMaxType,        /*UMediumIntType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUMediumIntType => ObExtendBLobType */
     },
 
     /*UInt32Type*/
@@ -587,6 +596,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*UInt32Type=>ObMySQLDateType  */
         ObVarcharType,    /*UInt32Type=>ObMySQLDateTimeType  */
         ObMaxType,        /*UInt32Type=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUInt32Type => ObExtendBLobType */
     },
 
     /*UIntType*/
@@ -646,6 +656,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*UIntType=>ObMySQLDateType  */
         ObVarcharType,    /*UIntType=>ObMySQLDateTimeType  */
         ObMaxType,        /*UIntType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUInt64Type => ObExtendBLobType */
     },
 
     /*FloatType*/
@@ -705,6 +716,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*FloatType=>ObMySQLDateType  */
         ObVarcharType,    /*FloatType=>ObMySQLDateTimeType  */
         ObMaxType,        /*FloatType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObFloatType => ObExtendBLobType */
     },
 
     /*DoubleType*/
@@ -764,6 +776,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*DoubleType=>ObMySQLDateType  */
         ObVarcharType,    /*DoubleType=>ObMySQLDateTimeType  */
         ObMaxType,        /*DoubleTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObDoubleType => ObExtendBLobType */
     },
 
     /*UFloatType*/
@@ -823,6 +836,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*UFloatType=>ObMySQLDateType  */
         ObVarcharType,    /*UFloatType=>ObMySQLDateTimeType  */
         ObMaxType,        /*UFloatTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUFloatType => ObExtendBLobType */
     },
 
     /*UDoubleType*/
@@ -882,6 +896,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*UDoubleType=>ObMySQLDateType  */
         ObVarcharType,    /*UDoubleType=>ObMySQLDateTimeType  */
         ObMaxType,        /*UDoubleTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUDoubleType => ObExtendBLobType */
     },
 
     /*NumberType*/
@@ -941,6 +956,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*NumberType=>ObMySQLDateType  */
         ObVarcharType,    /*NumberType=>ObMySQLDateTimeType  */
         ObMaxType,        /*NumberTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObNumberType => ObExtendBLobType */
     },
 
     /*UNumberType*/
@@ -1000,6 +1016,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*UNumberType=>ObMySQLDateType  */
         ObVarcharType,    /*UNumberType=>ObMySQLDateTimeType  */
         ObMaxType,        /*UNumberTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUNumberType => ObExtendBLobType */
     },
 
     /*DateTimeType*/
@@ -1059,6 +1076,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObMySQLDateTimeType, /*DateTimeType=>ObMySQLDateType  */
         ObMySQLDateTimeType, /*DateTimeType=>ObMySQLDateTimeType  */
         ObMaxType,           /*DateTimeTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObDateTimeType => ObExtendBLobType */
     },
 
     /*TimestampType*/
@@ -1118,6 +1136,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObMySQLDateTimeType, /*TimestampType=>ObMySQLDateType  */
         ObMySQLDateTimeType, /*TimestampType=>ObMySQLDateTimeType  */
         ObMaxType,           /*TimestampTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObTimestampType => ObExtendBLobType */
     },
 
     /*DateType*/
@@ -1177,6 +1196,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObMySQLDateType,     /*DateType=>ObMySQLDateType  */
         ObMySQLDateTimeType, /*DateType=>ObMySQLDateTimeType  */
         ObMaxType,           /*DateTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObDateType => ObExtendBLobType */
     },
 
     /*TimeType*/
@@ -1236,6 +1256,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObMySQLDateTimeType, /*TimeType=>ObMySQLDateType  */
         ObMySQLDateTimeType, /*TimeType=>ObMySQLDateTimeType  */
         ObMaxType,           /*TimeTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObTimeType => ObExtendBLobType */
     },
 
     /*YearType*/
@@ -1295,6 +1316,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*YearType=>ObMySQLDateType  */
         ObVarcharType,    /*YearType=>ObMySQLDateTimeType  */
         ObMaxType,        /*YearTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObYearType => ObExtendBLobType */
     },
 
     /*VarcharType*/
@@ -1354,6 +1376,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*VarcharType=>ObMySQLDateType  */
         ObVarcharType,    /*VarcharType=>ObMySQLDateTimeType  */
         ObMaxType,        /*VarcharTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObVarcharType => ObExtendBLobType */
     },
 
     /*CharType*/
@@ -1413,6 +1436,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObCharType,    /*CharType=>ObMySQLDateType  */
         ObCharType,    /*CharType=>ObMySQLDateTimeType  */
         ObMaxType,        /*CharType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObCharType => ObExtendBLobType */
     },
 
     /*HexStringType*/
@@ -1472,6 +1496,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*HexStringType=>ObMySQLDateType  */
         ObVarcharType,    /*HexStringType=>ObMySQLDateTimeType  */
         ObRoaringBitmapType, /*HexStringType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObHexStringType => ObExtendBLobType */
     },
 
     /*ExtendType*/
@@ -1531,6 +1556,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObMaxType,    /*ExtendType=>ObMySQLDateType  */
         ObMaxType,    /*ExtendType=>ObMySQLDateTimeType  */
         ObMaxType,       /*ExtendType=>ObRoaringBitmapType*/
+        ObMaxType,      /* ObExtendType => ObExtendBLobType */
     },
 
     /*UnknownType*/
@@ -1590,6 +1616,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*UnknownType=>ObMySQLDateType  */
         ObVarcharType,    /*UnknownType=>ObMySQLDateTimeType  */
         ObMaxType,        /*UnknownType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUnknownType => ObExtendBLobType */
     },
     /*ObTinyTextType*/
     {
@@ -1648,6 +1675,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObTinyTextType,    /*ObTinyTextType=>ObMySQLDateType  */
         ObTinyTextType,    /*ObTinyTextType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObTinyTextType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObTinyTextType => ObExtendBLobType */
     },
     /*ObTextType*/
     {
@@ -1706,6 +1734,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObTextType,    /*ObTextType=>ObMySQLDateType  */
         ObTextType,    /*ObTextType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObTextType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObTextType => ObExtendBLobType */
     },
 
     /*ObMediumTextType*/
@@ -1765,6 +1794,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObMediumTextType,    /*ObMediumTextType=>ObMySQLDateType  */
         ObMediumTextType,    /*ObMediumTextType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObMediumTextType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObMediumTextType => ObExtendBLobType */
     },
 
     /*ObLongTextType*/
@@ -1824,6 +1854,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObLongTextType,    /*ObLongTextType=>ObMySQLDateType  */
         ObLongTextType,    /*ObLongTextType=>ObMySQLDateTimeType  */
         ObMaxType,       /*ObLongTextType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObLongTextType => ObExtendBLobType */
     },
     /*ObBitType*/
     {
@@ -1882,6 +1913,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*ObBitType=>ObMySQLDateType  */
         ObVarcharType,    /*ObBitType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObBitType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObBitType => ObExtendBLobType */
     },
     /*ObEnumType*/
     {
@@ -1940,6 +1972,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*ObEnumType=>ObMySQLDateType  */
         ObVarcharType,    /*ObEnumType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObEnumType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObEnumType => ObExtendBLobType */
     },
     /*ObSetType*/
     {
@@ -1998,6 +2031,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*ObSetType=>ObMySQLDateType  */
         ObVarcharType,    /*ObSetType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObSetType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObSetType => ObExtendBLobType */
     },
     /*ObEnumInnerType*/
     {
@@ -2056,6 +2090,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*ObEnumInnerType=>ObMySQLDateType  */
         ObVarcharType,    /*ObEnumInnerType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObEnumInnerType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObEnumInnerType => ObExtendBLobType */
     },
     /*ObSetInnerType*/
     {
@@ -2114,6 +2149,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*ObSetInnerType=>ObMySQLDateType  */
         ObVarcharType,    /*ObSetInnerType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObSetInnerType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObSetInnerType => ObExtendBLobType */
     },
     /*ObTimestampTZType*/
     {
@@ -2172,6 +2208,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObTimestampTZType,    /*ObTimestampTZType=>ObMySQLDateType  */
         ObTimestampTZType,    /*ObTimestampTZType=>ObMySQLDateTimeType  */
         ObMaxType,         /*ObTimestampTZType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObTimestampTZType => ObExtendBLobType */
     },
     /*ObTimestampLTZType*/
     {
@@ -2230,6 +2267,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObTimestampLTZType,    /*ObTimestampLTZType=>ObMySQLDateType  */
         ObTimestampLTZType,    /*ObTimestampLTZType=>ObMySQLDateTimeType  */
         ObMaxType,          /*ObTimestampLTZType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObTimestampLTZType => ObExtendBLobType */
     },
     /*ObTimestampNanoType*/
     {
@@ -2288,6 +2326,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObTimestampNanoType,    /*ObTimestampNanoType=>ObMySQLDateType  */
         ObTimestampNanoType,    /*ObTimestampNanoType=>ObMySQLDateTimeType  */
         ObMaxType,           /*ObTimestampNanoType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObTimestampNanoType => ObExtendBLobType */
     },
     /*ObRawType*/
     {
@@ -2346,6 +2385,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObRawType,       /*ObRawType=>ObMySQLDateType  */
         ObRawType,       /*ObRawType=>ObMySQLDateTimeType  */
         ObMaxType,       /*ObRawType=>ObRoaringBitmapType*/
+        ObRawType,      /* ObRawType => ObExtendBLobType */
     },
     /*ObIntervalYMType*/
     {
@@ -2404,6 +2444,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObIntervalYMType,    /*ObIntervalYMType=>ObMySQLDateType  */
         ObIntervalYMType,    /*ObIntervalYMType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObIntervalYMType=>ObRoaringBitmapType*/
+        ObIntervalYMType,      /* ObIntervalYMType => ObExtendBLobType */
     },
     /*ObIntervalDSType*/
     {
@@ -2462,6 +2503,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObIntervalDSType,    /*ObIntervalDSType=>ObMySQLDateType  */
         ObMaxType,    /*ObIntervalDSType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObIntervalDSType=>ObRoaringBitmapType*/
+        ObIntervalDSType,      /* ObIntervalDSType => ObExtendBLobType */
     },
 
     /*ObNumberFloatType*/
@@ -2521,6 +2563,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*NumberFloatType=>ObMySQLDateType  */
         ObVarcharType,    /*NumberFloatType=>ObMySQLDateTimeType  */
         ObMaxType,        /*NumberFloatType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObNumberFloatType => ObExtendBLobType */
     },
     /*ObNVarchar2Type*/
     {
@@ -2579,6 +2622,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObNVarchar2Type, /*ObNVarchar2Type=>ObMySQLDateType  */
         ObNVarchar2Type, /*ObNVarchar2Type=>ObMySQLDateTimeType  */
         ObMaxType,       /*ObNVarchar2Type=>ObRoaringBitmapType*/
+        ObNVarchar2Type,      /* ObNVarchar2Type => ObExtendBLobType */
     },
     /*ObNCharType*/
     {
@@ -2637,6 +2681,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObNCharType,     /*ObNCharType=>ObMySQLDateType  */
         ObNCharType,     /*ObNCharType=>ObMySQLDateTimeType  */
         ObMaxType,       /*ObNCharType=>ObRoaringBitmapType*/
+        ObNCharType,      /* ObNCharType => ObExtendBLobType */
     },
     /*ObURowIDType*/
     {
@@ -2695,6 +2740,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObMaxType,     /*ObURowIDType=>ObMySQLDateType  */
         ObMaxType,     /*ObURowIDType=>ObMySQLDateTimeType  */
         ObMaxType,     /*ObURowIDType=>ObRoaringBitmapType*/
+        ObMaxType,      /* ObURowIDType => ObExtendBLobType */
     },
     /*ObLobType*/
     {
@@ -2753,6 +2799,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObMaxType,     /*ObLobType=>ObMySQLDateType  */
         ObMaxType,     /*ObLobType=>ObMySQLDateTimeType  */
         ObMaxType,     /* ObLobType=>ObRoaringBitmapType*/
+        ObMaxType,      /* ObLobType => ObExtendBLobType */
     },
     /*ObJsonType*/
     {
@@ -2811,6 +2858,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObJsonType,     /*ObJsonType=>ObMySQLDateType  */
         ObJsonType,     /*ObJsonType=>ObMySQLDateTimeType  */
         ObMaxType,      /*ObJsonType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObJsonType => ObExtendBLobType */
     },
     /*ObGeometryType*/
     {
@@ -2869,6 +2917,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObGeometryType,     /*ObGeometryType=>ObMySQLDateType  */
         ObGeometryType,     /*ObGeometryType=>ObMySQLDateTimeType  */
         ObMaxType,          /* ObGeometryType=>ObRoaringBitmapType*/
+        ObGeometryType,      /* ObGeometryType => ObExtendBLobType */
     },
     /*ObUserDefinedSQLType*/
     {
@@ -2927,6 +2976,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObMaxType,     /*ObUserDefinedSQLType=>ObMySQLDateType  */
         ObMaxType,     /*ObUserDefinedSQLType=>ObMySQLDateTimeType  */
         ObMaxType,     /* ObUserDefinedSQLType=>ObRoaringBitmapType*/
+        ObMaxType,      /* ObUserDefinedSQLType => ObExtendBLobType */
     },
     /*ObDecimalIntType*/
     {
@@ -2985,6 +3035,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObVarcharType,     /*ObUserDefinedSQLType=>ObMySQLDateType  */
         ObVarcharType,     /*ObUserDefinedSQLType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObDecimalIntType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObDecimalIntType => ObExtendBLobType */
     },
     /*ObCollectionSQLType*/
     {
@@ -3043,6 +3094,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObCollectionSQLType,     /* ObCollectionSQLType=>ObMySQLDateType  */
         ObCollectionSQLType,     /* ObCollectionSQLType=>ObMySQLDateTimeType  */
         ObMaxType,     /* ObCollectionSQLType=>ObRoaringBitmapType*/
+        ObCollectionSQLType,      /* ObCollectionSQLType => ObExtendBLobType */
     },
     /*MySQLDateType*/
     {
@@ -3101,6 +3153,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObMySQLDateType,     /*ObMySQLDateType=>ObMySQLDateType  */
         ObMySQLDateTimeType, /*ObMySQLDateType=>ObMySQLDateTimeType  */
         ObMaxType,     /* ObCollectionSQLType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObMySQLDateType => ObExtendBLobType */
     },
     /*MySQLDateTimeType*/
     {
@@ -3159,6 +3212,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObMySQLDateTimeType, /*ObMySQLDateTimeType=>ObMySQLDateType  */
         ObMySQLDateTimeType, /*ObMySQLDateTimeType=>ObMySQLDateTimeType  */
         ObMaxType,     /* ObCollectionSQLType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObMySQLDateTimeType => ObExtendBLobType */
     },
     /*ObRoaringBitmapType*/
     {
@@ -3217,6 +3271,66 @@ static constexpr ObObjType MERGE_RESULT_TYPE[ObMaxType][ObMaxType] = {
         ObMaxType,            /* ObRoaringBitmapType=>ObMySQLDateType */
         ObMaxType,            /* ObRoaringBitmapType=>ObMySQLDateTimeType */
         ObRoaringBitmapType,  /* ObRoaringBitmapType=>ObRoaringBitmapType */
+        ObMaxType,      /* ObRoaringBitmapType => ObExtendBLobType */
+    },
+    /*ObExtendBLobType*/
+    {
+        ObLongTextType,      /* ObExtendBLobType => ObNullType */
+        ObLongTextType,      /* ObExtendBLobType => ObTinyIntType */
+        ObLongTextType,      /* ObExtendBLobType => ObSmallIntType */
+        ObLongTextType,      /* ObExtendBLobType => ObMediumIntType */
+        ObLongTextType,      /* ObExtendBLobType => ObInt32Type */
+        ObLongTextType,      /* ObExtendBLobType => ObIntType */
+        ObLongTextType,      /* ObExtendBLobType => ObUTinyIntType */
+        ObLongTextType,      /* ObExtendBLobType => ObUSmallIntType */
+        ObLongTextType,      /* ObExtendBLobType => ObUMediumIntType */
+        ObLongTextType,      /* ObExtendBLobType => ObUInt32Type */
+        ObLongTextType,      /* ObExtendBLobType => ObUInt64Type */
+        ObLongTextType,      /* ObExtendBLobType => ObFloatType */
+        ObLongTextType,      /* ObExtendBLobType => ObDoubleType */
+        ObLongTextType,      /* ObExtendBLobType => ObUFloatType */
+        ObLongTextType,      /* ObExtendBLobType => ObUDoubleType */
+        ObLongTextType,      /* ObExtendBLobType => ObNumberType */
+        ObLongTextType,      /* ObExtendBLobType => ObUNumberType */
+        ObLongTextType,      /* ObExtendBLobType => ObDateTimeType */
+        ObLongTextType,      /* ObExtendBLobType => ObTimestampType */
+        ObLongTextType,      /* ObExtendBLobType => ObDateType */
+        ObLongTextType,      /* ObExtendBLobType => ObTimeType */
+        ObLongTextType,      /* ObExtendBLobType => ObYearType */
+        ObLongTextType,      /* ObExtendBLobType => ObVarcharType */
+        ObLongTextType,      /* ObExtendBLobType => ObCharType */
+        ObLongTextType,      /* ObExtendBLobType => ObHexStringType */
+        ObMaxType,      /* ObExtendBLobType => ObExtendType */
+        ObLongTextType,      /* ObExtendBLobType => ObUnknownType */
+        ObLongTextType,      /* ObExtendBLobType => ObTinyTextType */
+        ObLongTextType,      /* ObExtendBLobType => ObTextType */
+        ObLongTextType,      /* ObExtendBLobType => ObMediumTextType */
+        ObLongTextType,      /* ObExtendBLobType => ObLongTextType */
+        ObLongTextType,      /* ObExtendBLobType => ObBitType */
+        ObLongTextType,      /* ObExtendBLobType => ObEnumType */
+        ObLongTextType,      /* ObExtendBLobType => ObSetType */
+        ObMaxType,      /* ObExtendBLobType => ObEnumInnerType */
+        ObMaxType,      /* ObExtendBLobType => ObSetInnerType */
+        ObLongTextType,      /* ObExtendBLobType => ObTimestampTZType */
+        ObLongTextType,      /* ObExtendBLobType => ObTimestampLTZType */
+        ObLongTextType,      /* ObExtendBLobType => ObTimestampNanoType */
+        ObRawType,      /* ObExtendBLobType => ObRawType */
+        ObMaxType,      /* ObExtendBLobType => ObIntervalYMType */
+        ObMaxType,      /* ObExtendBLobType => ObIntervalDSType */
+        ObMaxType,      /* ObExtendBLobType => ObNumberFloatType */
+        ObNVarchar2Type,      /* ObExtendBLobType => ObNVarchar2Type */
+        ObNCharType,      /* ObExtendBLobType => ObNCharType */
+        ObMaxType,      /* ObExtendBLobType => ObURowIDType */
+        ObLongTextType,      /* ObExtendBLobType => ObLobType */
+        ObLongTextType,      /* ObExtendBLobType => ObJsonType */
+        ObGeometryType,      /* ObExtendBLobType => ObGeometryType */
+        ObMaxType,      /* ObExtendBLobType => ObUserDefinedSQLType */
+        ObLongTextType,      /* ObExtendBLobType => ObDecimalIntType */
+        ObCollectionSQLType,      /* ObExtendBLobType => ObCollectionSQLType */
+        ObLongTextType,      /* ObExtendBLobType => ObMySQLDateType */
+        ObLongTextType,      /* ObExtendBLobType => ObMySQLDateTimeType */
+        ObMaxType,      /* ObExtendBLobType => ObRoaringBitmapType */
+        ObLongTextType,      /* ObExtendBLobType => ObExtendBLobType */
     },
 };
 
@@ -3278,6 +3392,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObMySQLDateType,     /*NullType=>ObMySQLDateType  */
         ObMySQLDateTimeType, /*NullType=>ObMySQLDateTimeType  */
         ObMaxType,           /*NullType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObNullType => ObExtendBLobType */
     },
 
     /*TinyIntType*/
@@ -3337,6 +3452,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*TinyIntType=>ObMySQLDateType  */
         ObVarcharType,    /*TinyIntType=>ObMySQLDateTimeType  */
         ObMaxType,        /*TinyInt=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObTinyIntType => ObExtendBLobType */
     },
 
     /*SmallIntType*/
@@ -3396,6 +3512,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*SmallInt=>ObMySQLDateType  */
         ObVarcharType,    /*SmallInt=>ObMySQLDateTimeType  */
         ObMaxType,        /*SmallInt=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObSmallIntType => ObExtendBLobType */
     },
 
     /*MediumIntType*/
@@ -3455,6 +3572,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*MediumInt=>ObMySQLDateType  */
         ObVarcharType,    /*MediumInt=>ObMySQLDateTimeType  */
         ObMaxType,        /*MediumInt=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObMediumIntType => ObExtendBLobType */
     },
 
     /*Int32Type*/
@@ -3514,6 +3632,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*Int32Type=>ObMySQLDateType  */
         ObVarcharType,    /*Int32Type=>ObMySQLDateTimeType  */
         ObMaxType,        /*Int32Type=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObInt32Type => ObExtendBLobType */
     },
 
     /*IntType*/
@@ -3573,6 +3692,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*IntType=>ObMySQLDateType  */
         ObVarcharType,    /*IntType=>ObMySQLDateTimeType  */
         ObMaxType,        /*IntType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObIntType => ObExtendBLobType */
     },
 
     /*UTinyIntType*/
@@ -3632,6 +3752,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*UTinyIntType=>ObMySQLDateType  */
         ObVarcharType,    /*UTinyIntType=>ObMySQLDateTimeType  */
         ObMaxType,        /*IntType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUTinyIntType => ObExtendBLobType */
     },
 
     /*USmallIntType*/
@@ -3691,6 +3812,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*USmallIntType=>ObMySQLDateType  */
         ObVarcharType,    /*USmallIntType=>ObMySQLDateTimeType  */
         ObMaxType,        /*IntType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUSmallIntType => ObExtendBLobType */
     },
 
     /*UMediumIntType*/
@@ -3750,6 +3872,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*UMediumIntType=>ObMySQLDateType  */
         ObVarcharType,    /*UMediumIntType=>ObMySQLDateTimeType  */
         ObMaxType,        /*IntType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUMediumIntType => ObExtendBLobType */
     },
 
     /*UInt32Type*/
@@ -3809,6 +3932,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*UInt32Type=>ObMySQLDateType  */
         ObVarcharType,    /*UInt32Type=>ObMySQLDateTimeType  */
         ObMaxType,        /*IntType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUInt32Type => ObExtendBLobType */
     },
 
     /*UIntType*/
@@ -3868,6 +3992,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*UIntType=>ObMySQLDateType  */
         ObVarcharType,    /*UIntType=>ObMySQLDateTimeType  */
         ObMaxType,        /*UIntType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUInt64Type => ObExtendBLobType */
     },
 
     /*FloatType*/
@@ -3927,6 +4052,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*FloatType=>ObMySQLDateType  */
         ObVarcharType,    /*FloatType=>ObMySQLDateTimeType  */
         ObMaxType,        /*FloatType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObFloatType => ObExtendBLobType */
     },
 
     /*DoubleType*/
@@ -3986,6 +4112,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*DoubleType=>ObMySQLDateType  */
         ObVarcharType,    /*DoubleType=>ObMySQLDateTimeType  */
         ObMaxType,        /*DoubleType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObDoubleType => ObExtendBLobType */
     },
 
     /*UFloatType*/
@@ -4045,6 +4172,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*UFloatType=>ObMySQLDateType  */
         ObVarcharType,    /*UFloatType=>ObMySQLDateTimeType  */
         ObMaxType,        /*UFloatTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUFloatType => ObExtendBLobType */
     },
 
     /*UDoubleType*/
@@ -4104,6 +4232,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*UDoubleType=>ObMySQLDateType  */
         ObVarcharType,    /*UDoubleType=>ObMySQLDateTimeType  */
         ObMaxType,        /*UDoubleType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUDoubleType => ObExtendBLobType */
     },
 
     /*NumberType*/
@@ -4163,6 +4292,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*NumberType=>ObMySQLDateType  */
         ObVarcharType,    /*NumberType=>ObMySQLDateTimeType  */
         ObMaxType,        /*NumberTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObNumberType => ObExtendBLobType */
     },
 
     /*UNumberType*/
@@ -4222,6 +4352,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*UNumberType=>ObMySQLDateType  */
         ObVarcharType,    /*UNumberType=>ObMySQLDateTimeType  */
         ObMaxType,        /*UNumberTYpe=>RoaringBitmapType*/
+        ObLongTextType,      /* ObUNumberType => ObExtendBLobType */
     },
 
     /*DateTimeType*/
@@ -4281,6 +4412,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObMySQLDateTimeType, /*DateTimeType=>ObMySQLDateType  */
         ObMySQLDateTimeType, /*DateTimeType=>ObMySQLDateTimeType  */
         ObMaxType,           /*DateTimeTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObDateTimeType => ObExtendBLobType */
     },
 
     /*TimestampType*/
@@ -4340,6 +4472,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObMySQLDateTimeType, /*TimestampType=>ObMySQLDateType  */
         ObMySQLDateTimeType, /*TimestampType=>ObMySQLDateTimeType  */
         ObMaxType,           /*TimestampTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObTimestampType => ObExtendBLobType */
     },
 
     /*DateType*/
@@ -4399,6 +4532,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObMySQLDateType,     /*DateType=>ObMySQLDateType  */
         ObMySQLDateTimeType, /*DateType=>ObMySQLDateTimeType  */
         ObMaxType,           /*DateTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObDateType => ObExtendBLobType */
     },
 
     /*TimeType*/
@@ -4458,6 +4592,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObMySQLDateTimeType, /*TimeType=>ObMySQLDateType  */
         ObMySQLDateTimeType, /*TimeType=>ObMySQLDateTimeType  */
         ObMaxType,           /*TimeTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObTimeType => ObExtendBLobType */
     },
 
     /*YearType*/
@@ -4517,6 +4652,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*YearType=>ObMySQLDateType  */
         ObVarcharType,    /*YearType=>ObMySQLDateTimeType  */
         ObMaxType,        /*YearTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObYearType => ObExtendBLobType */
     },
 
     /*VarcharType*/
@@ -4576,6 +4712,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*VarcharType=>ObMySQLDateType  */
         ObVarcharType,    /*VarcharType=>ObMySQLDateTimeType  */
         ObMaxType,        /*VarcharTYpe=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObVarcharType => ObExtendBLobType */
     },
 
     /*CharType*/
@@ -4635,6 +4772,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObCharType,    /*CharType=>ObMySQLDateType  */
         ObCharType,    /*CharType=>ObMySQLDateTimeType  */
         ObMaxType,        /*CharType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObCharType => ObExtendBLobType */
     },
 
     /*HexStringType*/
@@ -4694,6 +4832,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*HexStringType=>ObMySQLDateType  */
         ObVarcharType,    /*HexStringType=>ObMySQLDateTimeType  */
         ObMaxType,        /*HexStringType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObHexStringType => ObExtendBLobType */
     },
 
     /*ExtendType*/
@@ -4753,6 +4892,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObMaxType,    /*ExtendType=>ObMySQLDateType  */
         ObMaxType,    /*ExtendType=>ObMySQLDateTimeType  */
         ObMaxType,       /*ExtendType=>ObRoaringBitmapType*/
+        ObMaxType,      /* ObExtendType => ObExtendBLobType */
     },
 
     /*UnknownType*/
@@ -4812,6 +4952,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*UnknownType=>ObMySQLDateType  */
         ObVarcharType,    /*UnknownType=>ObMySQLDateTimeType  */
         ObMaxType,        /*UnknownType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObUnknownType => ObExtendBLobType */
     },
     /*ObTinyTextType*/
     {
@@ -4870,6 +5011,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObTinyTextType,    /*ObTinyTextType=>ObMySQLDateType  */
         ObTinyTextType,    /*ObTinyTextType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObTinyTextType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObTinyTextType => ObExtendBLobType */
     },
     /*ObTextType*/
     {
@@ -4928,6 +5070,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObTextType,    /*ObTextType=>ObMySQLDateType  */
         ObTextType,    /*ObTextType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObTextType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObTextType => ObExtendBLobType */
     },
 
     /*ObMediumTextType*/
@@ -4987,6 +5130,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObMediumTextType,    /*ObMediumTextType=>ObMySQLDateType  */
         ObMediumTextType,    /*ObMediumTextType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObMediumTextType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObMediumTextType => ObExtendBLobType */
     },
 
     /*ObLongTextType*/
@@ -5046,6 +5190,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObLongTextType,    /*ObLongTextType=>ObMySQLDateType  */
         ObLongTextType,    /*ObLongTextType=>ObMySQLDateTimeType  */
         ObMaxType,       /*ObLongTextType=ObRoaringBitmapType*/
+        ObLongTextType,      /* ObLongTextType => ObExtendBLobType */
     },
     /*ObBitType*/
     {
@@ -5104,6 +5249,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*ObBitType=>ObMySQLDateType  */
         ObVarcharType,    /*ObBitType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObBitType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObBitType => ObExtendBLobType */
     },
     /*ObEnumType*/
     {
@@ -5162,6 +5308,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*ObEnumType=>ObMySQLDateType  */
         ObVarcharType,    /*ObEnumType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObEnumType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObEnumType => ObExtendBLobType */
     },
     /*ObSetType*/
     {
@@ -5220,6 +5367,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*ObSetType=>ObMySQLDateType  */
         ObVarcharType,    /*ObSetType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObSetType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObSetType => ObExtendBLobType */
     },
     /*ObEnumInnerType*/
     {
@@ -5278,6 +5426,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*ObEnumInnerType=>ObMySQLDateType  */
         ObVarcharType,    /*ObEnumInnerType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObEnumInnerType=>bRoaringBitmapType*/
+        ObLongTextType,      /* ObEnumInnerType => ObExtendBLobType */
     },
     /*ObSetInnerType*/
     {
@@ -5336,6 +5485,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*ObSetInnerType=>ObMySQLDateType  */
         ObVarcharType,    /*ObSetInnerType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObSetInnerType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObSetInnerType => ObExtendBLobType */
     },
     /*ObTimestampTZType*/
     {
@@ -5394,6 +5544,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObTimestampTZType,    /*ObTimestampTZType=>ObMySQLDateType  */
         ObTimestampTZType,    /*ObTimestampTZType=>ObMySQLDateTimeType  */
         ObMaxType,         /*ObTimestampTZType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObTimestampTZType => ObExtendBLobType */
     },
     /*ObTimestampLTZType*/
     {
@@ -5452,6 +5603,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObTimestampLTZType,    /*ObTimestampLTZType=>ObMySQLDateType  */
         ObTimestampLTZType,    /*ObTimestampLTZType=>ObMySQLDateTimeType  */
         ObMaxType,          /*ObTimestampLTZType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObTimestampLTZType => ObExtendBLobType */
     },
     /*ObTimestampNanoType*/
     {
@@ -5510,6 +5662,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObTimestampNanoType,    /*ObTimestampNanoType=>ObMySQLDateType  */
         ObTimestampNanoType,    /*ObTimestampNanoType=>ObMySQLDateTimeType  */
         ObMaxType,           /*ObTimestampNanoType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObTimestampNanoType => ObExtendBLobType */
     },
     /*ObRawType*/
     {
@@ -5568,6 +5721,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObRawType,       /*ObRawType=>ObMySQLDateType  */
         ObRawType,       /*ObRawType=>ObMySQLDateTimeType  */
         ObMaxType,       /*ObRawType=>ObRoaringBitmapType*/
+        ObRawType,      /* ObRawType => ObExtendBLobType */
     },
     /*ObIntervalYMType*/
     {
@@ -5626,6 +5780,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObIntervalYMType,    /*ObIntervalYMType=>ObMySQLDateType  */
         ObIntervalYMType,    /*ObIntervalYMType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObIntervalYMType=>ObRoaringBitmapType*/
+        ObIntervalYMType,      /* ObIntervalYMType => ObExtendBLobType */
     },
     /*ObIntervalDSType*/
     {
@@ -5684,6 +5839,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObIntervalDSType,    /*ObIntervalDSType=>ObMySQLDateType  */
         ObMaxType,    /*ObIntervalDSType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObIntervalDSType=>ObRoaringBitmapType*/
+        ObIntervalDSType,      /* ObIntervalDSType => ObExtendBLobType */
     },
 
     /*ObNumberFloatType*/
@@ -5743,6 +5899,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,    /*NumberFloatType=>ObMySQLDateType  */
         ObVarcharType,    /*NumberFloatType=>ObMySQLDateTimeType  */
         ObMaxType,        /*NumberFloatType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObNumberFloatType => ObExtendBLobType */
     },
     /*ObNVarchar2Type*/
     {
@@ -5801,6 +5958,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObNVarchar2Type, /*ObNVarchar2Type=>ObMySQLDateType  */
         ObNVarchar2Type, /*ObNVarchar2Type=>ObMySQLDateTimeType  */
         ObMaxType,       /*ObNVarchar2Type=>ObRoaringBitmapType*/
+        ObNVarchar2Type,      /* ObNVarchar2Type => ObExtendBLobType */
     },
     /*ObNCharType*/
     {
@@ -5859,6 +6017,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObNCharType,     /*ObNCharType=>ObMySQLDateType  */
         ObNCharType,     /*ObNCharType=>ObMySQLDateTimeType  */
         ObMaxType,       /*ObNCharType=>ObRoaringBitmapType*/
+        ObNCharType,      /* ObNCharType => ObExtendBLobType */
     },
     /*ObURowIDType*/
     {
@@ -5917,6 +6076,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObMaxType,     /*ObURowIDType=>ObMySQLDateType  */
         ObMaxType,     /*ObURowIDType=>ObMySQLDateTimeType  */
         ObMaxType,     /*ObURowIDType=>ObRoaringBitmapType*/
+        ObMaxType,      /* ObURowIDType => ObExtendBLobType */
     },
     /*ObLobType*/
     {
@@ -5975,6 +6135,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObMaxType,     /*ObLobType=>ObMySQLDateType  */
         ObMaxType,     /*ObLobType=>ObMySQLDateTimeType  */
         ObMaxType,     /* ObLobType=>ObRoaringBitmapType*/
+        ObMaxType,      /* ObLobType => ObExtendBLobType */
     },
     /*ObJsonType*/
     {
@@ -6033,6 +6194,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObJsonType,     /*ObJsonType=>ObMySQLDateType  */
         ObJsonType,     /*ObJsonType=>ObMySQLDateTimeType  */
         ObMaxType,     /*ObJsonType=>ObRoaringBitmapType*/
+        ObJsonType,      /* ObJsonType => ObExtendBLobType */
     },
     /*ObGeometryType*/
     {
@@ -6091,6 +6253,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObGeometryType,     /*ObGeometryType=>ObMySQLDateType  */
         ObGeometryType,     /*ObGeometryType=>ObMySQLDateTimeType  */
         ObMaxType,          /* ObGeometryType=>ObRoaringBitmapType*/
+        ObGeometryType,      /* ObGeometryType => ObExtendBLobType */
     },
     /*ObUserDefinedSQLType*/
     {
@@ -6149,6 +6312,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObMaxType,     /*ObUserDefinedSQLType=>ObMySQLDateType  */
         ObMaxType,     /*ObUserDefinedSQLType=>ObMySQLDateTimeType  */
         ObMaxType,     /* ObUserDefinedSQLType=>ObRoaringBitmapType*/
+        ObMaxType,      /* ObUserDefinedSQLType => ObExtendBLobType */
     },
     /*ObDecimalIntType*/
     {
@@ -6207,6 +6371,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObVarcharType,     /*ObDecimalIntType=>ObMySQLDateType  */
         ObVarcharType,     /*ObDecimalIntType=>ObMySQLDateTimeType  */
         ObMaxType,        /*ObDecimalIntType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObDecimalIntType => ObExtendBLobType */
     },
     /*ObCollectionSQLType*/
     {
@@ -6265,6 +6430,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObMaxType,     /* ObCollectionSQLType=>ObMySQLDateType  */
         ObMaxType,     /* ObCollectionSQLType=>ObMySQLDateTimeType  */
         ObMaxType,     /* ObCollectionSQLType=>ObRoaringBitmapType*/
+        ObMaxType,      /* ObCollectionSQLType => ObExtendBLobType */
     },
     /*MySQLDateType*/
     {
@@ -6323,6 +6489,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObMySQLDateType,     /*ObMySQLDateType=>ObMySQLDateType  */
         ObMySQLDateTimeType, /*ObMySQLDateType=>ObMySQLDateTimeType  */
         ObMaxType,     /* ObCollectionSQLType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObMySQLDateType => ObExtendBLobType */
     },
     /*MySQLDateTimeType*/
     {
@@ -6381,6 +6548,7 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObMySQLDateTimeType, /*ObMySQLDateTimeType=>ObMySQLDateType  */
         ObMySQLDateTimeType, /*ObMySQLDateTimeType=>ObMySQLDateTimeType  */
         ObMaxType,     /* ObCollectionSQLType=>ObRoaringBitmapType*/
+        ObLongTextType,      /* ObMySQLDateTimeType => ObExtendBLobType */
     },
     /*ObRoaringBitmapType*/
     {
@@ -6439,6 +6607,66 @@ static constexpr ObObjType MERGE_RESULT_TYPE_ORACLE[ObMaxType][ObMaxType] = {
         ObMaxType,     /* ObRoaringBitmapType=>ObMySQLDateType  */
         ObMaxType,     /* ObRoaringBitmapType=>ObMySQLDateTimeType  */
         ObMaxType,     /* ObRoaringBitmapType=>ObRoaringBitmapType*/
+        ObMaxType,      /* ObRoaringBitmapType => ObExtendBLobType */
+    },
+    /*ObExtendBLobType*/
+    {
+        ObLongTextType,      /* ObExtendBLobType => ObNullType */
+        ObLongTextType,      /* ObExtendBLobType => ObTinyIntType */
+        ObLongTextType,      /* ObExtendBLobType => ObSmallIntType */
+        ObLongTextType,      /* ObExtendBLobType => ObMediumIntType */
+        ObLongTextType,      /* ObExtendBLobType => ObInt32Type */
+        ObLongTextType,      /* ObExtendBLobType => ObIntType */
+        ObLongTextType,      /* ObExtendBLobType => ObUTinyIntType */
+        ObLongTextType,      /* ObExtendBLobType => ObUSmallIntType */
+        ObLongTextType,      /* ObExtendBLobType => ObUMediumIntType */
+        ObLongTextType,      /* ObExtendBLobType => ObUInt32Type */
+        ObLongTextType,      /* ObExtendBLobType => ObUInt64Type */
+        ObLongTextType,      /* ObExtendBLobType => ObFloatType */
+        ObLongTextType,      /* ObExtendBLobType => ObDoubleType */
+        ObLongTextType,      /* ObExtendBLobType => ObUFloatType */
+        ObLongTextType,      /* ObExtendBLobType => ObUDoubleType */
+        ObLongTextType,      /* ObExtendBLobType => ObNumberType */
+        ObLongTextType,      /* ObExtendBLobType => ObUNumberType */
+        ObLongTextType,      /* ObExtendBLobType => ObDateTimeType */
+        ObLongTextType,      /* ObExtendBLobType => ObTimestampType */
+        ObLongTextType,      /* ObExtendBLobType => ObDateType */
+        ObLongTextType,      /* ObExtendBLobType => ObTimeType */
+        ObLongTextType,      /* ObExtendBLobType => ObYearType */
+        ObLongTextType,      /* ObExtendBLobType => ObVarcharType */
+        ObLongTextType,      /* ObExtendBLobType => ObCharType */
+        ObLongTextType,      /* ObExtendBLobType => ObHexStringType */
+        ObMaxType,      /* ObExtendBLobType => ObExtendType */
+        ObLongTextType,      /* ObExtendBLobType => ObUnknownType */
+        ObLongTextType,      /* ObExtendBLobType => ObTinyTextType */
+        ObLongTextType,      /* ObExtendBLobType => ObTextType */
+        ObLongTextType,      /* ObExtendBLobType => ObMediumTextType */
+        ObLongTextType,      /* ObExtendBLobType => ObLongTextType */
+        ObLongTextType,      /* ObExtendBLobType => ObBitType */
+        ObLongTextType,      /* ObExtendBLobType => ObEnumType */
+        ObLongTextType,      /* ObExtendBLobType => ObSetType */
+        ObMaxType,      /* ObExtendBLobType => ObEnumInnerType */
+        ObMaxType,      /* ObExtendBLobType => ObSetInnerType */
+        ObLongTextType,      /* ObExtendBLobType => ObTimestampTZType */
+        ObLongTextType,      /* ObExtendBLobType => ObTimestampLTZType */
+        ObLongTextType,      /* ObExtendBLobType => ObTimestampNanoType */
+        ObRawType,      /* ObExtendBLobType => ObRawType */
+        ObMaxType,      /* ObExtendBLobType => ObIntervalYMType */
+        ObMaxType,      /* ObExtendBLobType => ObIntervalDSType */
+        ObMaxType,      /* ObExtendBLobType => ObNumberFloatType */
+        ObNVarchar2Type,      /* ObExtendBLobType => ObNVarchar2Type */
+        ObNCharType,      /* ObExtendBLobType => ObNCharType */
+        ObMaxType,      /* ObExtendBLobType => ObURowIDType */
+        ObLongTextType,      /* ObExtendBLobType => ObLobType */
+        ObJsonType,      /* ObExtendBLobType => ObJsonType */
+        ObGeometryType,      /* ObExtendBLobType => ObGeometryType */
+        ObMaxType,      /* ObExtendBLobType => ObUserDefinedSQLType */
+        ObLongTextType,      /* ObExtendBLobType => ObDecimalIntType */
+        ObMaxType,      /* ObExtendBLobType => ObCollectionSQLType */
+        ObLongTextType,      /* ObExtendBLobType => ObMySQLDateType */
+        ObLongTextType,      /* ObExtendBLobType => ObMySQLDateTimeType */
+        ObMaxType,      /* ObExtendBLobType => ObRoaringBitmapType */
+        ObLongTextType,      /* ObExtendBLobType => ObExtendBLobType */
     },
 };
 

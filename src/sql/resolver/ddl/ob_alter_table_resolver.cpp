@@ -474,6 +474,7 @@ int ObAlterTableResolver::set_table_options()
     alter_table_schema.set_tablespace_id(tablespace_id_);
     alter_table_schema.set_dop(table_dop_);
     alter_table_schema.set_lob_inrow_threshold(lob_inrow_threshold_);
+    alter_table_schema.set_lob_intable_threshold(lob_intable_threshold_);
     alter_table_schema.set_auto_increment_cache_size(auto_increment_cache_size_);
     alter_table_schema.set_semistruct_encoding_type(semistruct_encoding_type_);
     //deep copy
@@ -518,6 +519,27 @@ int ObAlterTableResolver::set_table_options()
         SQL_RESV_LOG(WARN, "Write storage_cache_policy to alter_table_schema failed!", K(ret));
       }
       storage_cache_policy_.reset();
+    }
+
+    if (OB_SUCC(ret)) {
+      if (OB_ISNULL(table_schema_)) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_RESV_LOG(WARN, "table schema is null", K(ret));
+      } else {
+        const int64_t new_inrow_threshold =
+            alter_table_bitset_.has_member(ObAlterTableArg::LOB_INROW_THRESHOLD)
+                ? lob_inrow_threshold_ : table_schema_->get_lob_inrow_threshold();
+        const int64_t new_intable_threshold =
+            alter_table_bitset_.has_member(ObAlterTableArg::LOB_INTABLE_THRESHOLD)
+                ? lob_intable_threshold_ : table_schema_->get_lob_intable_threshold();
+        if (new_intable_threshold < new_inrow_threshold) {
+          ret = OB_INVALID_ARGUMENT;
+          SQL_RESV_LOG(ERROR, "lob intable threshold is less than lob inrow threshold",
+                       K(ret), K(new_intable_threshold), K(new_inrow_threshold));
+          LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                         "lob intable threshold should be greater than or equal to lob inrow threshold");
+        }
+      }
     }
 
     if (OB_SUCC(ret) && alter_table_schema.get_compressor_type() == ObCompressorType::ZLIB_LITE_COMPRESSOR) {

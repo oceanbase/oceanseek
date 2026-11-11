@@ -18,6 +18,7 @@ namespace storage
 
 class ObLobMetaManager;
 class ObLobOutRowQueryIter;
+class ObLobQueryIter;
 class ObLobManager;
 struct ObLobWriteStats;
 
@@ -58,9 +59,11 @@ protected:
   virtual int do_execute();
 
 public:
-  ObLobOutRowQueryIter *result_;
+  ObLobQueryIter *result_;
 
 private:
+  int set_as_external_lob_iter_(ObLobQueryIter *&result);
+  int set_as_outrow_lob_iter_(ObLobQueryIter *&result);
   DISALLOW_COPY_AND_ASSIGN(ObLobQueryIterHandler);
 };
 
@@ -137,8 +140,8 @@ private:
 class ObLobInserter
 {
 public:
-  ObLobInserter() { reset(); }
-  ~ObLobInserter() { reset(); }
+  ObLobInserter();
+  ~ObLobInserter();
   void reset();
   int init(ObLobInsertContext *ctx,
            ObLobMetaManager *meta_mgr,
@@ -147,25 +150,39 @@ public:
 
   TO_STRING_KV(K(is_inited_), KPC(ctx_), KPC(meta_mgr_), KPC(piece_mgr_));
 private:
+  int get_source_lob_extra_info_(ObLobMetaExtraInfo &extra_info);
+  int insert_external_lob_(const common::ObLobId &lob_id,
+                           const common::ObExternalBlobInfo &source_info);
   int write_meta_summary_(const common::ObLobId &lob_id,
                           const uint64_t total_byte_len,
                           const uint64_t total_char_len,
-                          const uint64_t chunk_count);
+                          const uint64_t chunk_count,
+                          const bool is_outtable);
+  int write_external_lob_meta_summary_(const common::ObLobId &lob_id,
+                                       const common::ObExternalBlobInfo &external_info);
   // @brief 获取流式输入的 input，以迭代器方式返回，并顺便获取预计输入的长度，用于写后校验长度
-  int open_src_lob_query_(ObLobQueryIter *&query_iter,
-                          uint64_t &source_byte_len);
+  int open_src_lob_query_(ObLobQueryIter *&query_iter);
+  // Write OutRow chunks to the Piece table.
+  int insert_outrow_piece_(ObLobQueryIter *input_iter, ObLobWriteStats &write_stats);
+  // Write OutTable chunks to object storage.
+  int insert_outtable_piece_(ObLobQueryIter *input_iter, ObLobWriteStats &write_stats);
+  int write_outtable_clog_();
 private:
   bool is_inited_;
   ObLobInsertContext *ctx_;
   ObLobMetaManager *meta_mgr_;
   ObLobPieceManager *piece_mgr_;
+  common::ObLobId lob_id_;
+  common::ObArray<ObLobMetaInfo> metas_;
+  uint64_t source_byte_len_;
+  bool is_logging_;
 };
 
 class ObLobAppender
 {
 public:
-  ObLobAppender() { reset(); }
-  ~ObLobAppender() { reset(); }
+  ObLobAppender();
+  ~ObLobAppender();
   void reset();
   int init(ObLobAppendContext *ctx,
            ObLobMetaManager *meta_mgr,
@@ -174,49 +191,15 @@ public:
 
   TO_STRING_KV(K(is_inited_), KPC(ctx_), KPC(meta_mgr_), KPC(piece_mgr_));
 private:
-  static bool is_piece_consistent_with_meta_(const ObLobPieceInfo &piece,
-                                             const ObLobMetaInfo &meta);
-  int parse_append_data_(common::ObString &append_data,
-                         uint64_t &append_char_len);
-  int calculate_total_length_(const uint64_t old_byte_len,
-                              const uint64_t old_char_len,
-                              const uint64_t append_byte_len,
-                              const uint64_t append_char_len,
-                              uint64_t &total_byte_len,
-                              uint64_t &total_char_len);
-  int prepare_remaining_append_data_(const common::ObString &append_data,
-                                     const uint64_t append_char_len,
-                                     const uint64_t consumed_byte_len,
-                                     const uint64_t consumed_char_len,
-                                     common::ObString &remaining_append_data);
-  int write_new_chunks_(const common::ObLobId &lob_id,
-                        const common::ObString &old_inrow_data,
-                        const common::ObString &remaining_append_data,
-                        const common::ObString &start_seq_id,
-                        ObLobWriteStats &write_stats);
-  int validate_write_stats_(const ObLobWriteStats &write_stats,
-                            const uint64_t expected_byte_len,
-                            const uint64_t expected_char_len,
-                            const uint64_t old_chunk_count,
-                            uint64_t &total_chunk_count);
-  int read_old_summary_(const common::ObLobId &lob_id,
-                        ObLobMetaInfo &summary,
-                        ObLobMetaInfo &last_meta,
-                        uint64_t &chunk_count);
-  int try_fill_last_piece_(ObLobMetaInfo &last_meta,
-                           const common::ObString &append_data,
-                           uint64_t &consumed_byte_len,
-                           uint64_t &consumed_char_len);
-  int write_meta_summary_(const common::ObLobId &lob_id,
-                          const bool old_is_outrow,
-                          ObLobMetaInfo &old_summary,
-                          const uint64_t total_byte_len,
-                          const uint64_t total_char_len,
-                          const uint64_t chunk_count);
+  int parse_append_data_(common::ObString &append_data);
+  int prepare_append_context_(ObLobMetaInfo &summary_info,
+                              ObLobMetaInfo &last_meta_info,
+                              bool &is_outtable);
+  int set_next_seq_id_(const bool old_is_inrow,
+                       const ObLobMetaInfo &last_meta);
 private:
   bool is_inited_;
   ObLobAppendContext *ctx_;
-  ObLobReadContext read_ctx_;
   ObLobMetaManager *meta_mgr_;
   ObLobPieceManager *piece_mgr_;
 };

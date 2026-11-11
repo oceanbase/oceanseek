@@ -7,6 +7,7 @@
 #define OCEANBASE_TX_LOG_OPERATOR_HEADER
 
 #include "storage/ls/ob_ls_ddl_log_handler.h"
+#include "storage/lob/store/ob_lob_outtable_io.h"
 #include "storage/tx/ob_trans_define.h"
 #include "storage/tx/ob_trans_part_ctx.h"
 #include "storage/tx/ob_tx_log.h"
@@ -880,6 +881,82 @@ OB_INLINE int ObTxCtxLogOperator<ObTxDirectLoadIncMajorLog>::replay_in_ctx_()
  * Direct Load Inc TxLog Operator
  * End
  ****************************************/
+
+/****************************************
+ * Transaction log operator for OutTable LOB data
+ ****************************************/
+template <>
+OB_INLINE int ObTxCtxLogOperator<ObTxLobOutTableDataLog>::prepare_special_resource_()
+{
+  int ret = OB_SUCCESS;
+  CtxLockGuard guard;
+  if (!tx_ctx_->lock_.is_locked_by_self()) {
+    tx_ctx_->get_ctx_guard(guard, CtxLockGuard::MODE::CTX);
+  }
+  if (OB_FAIL(tx_ctx_->exec_info_.redo_lsns_.reserve(
+      tx_ctx_->exec_info_.redo_lsns_.count() + 1))) {
+    TRANS_LOG(WARN, "reserve memory for lob outtable redo lsn failed", KR(ret), KPC(this));
+  }
+  return ret;
+}
+
+template <>
+OB_INLINE void ObTxCtxLogOperator<ObTxLobOutTableDataLog>::after_submit_log_succ_()
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(tx_ctx_->exec_info_.redo_lsns_.push_back(
+      log_op_arg_.submit_arg_.log_cb_->get_lsn()))) {
+    TRANS_LOG(WARN, "push lob outtable redo lsn failed", KR(ret), KPC(this));
+  }
+}
+
+template <>
+OB_INLINE int ObTxCtxLogOperator<ObTxLobOutTableDataLog>::replay_out_ctx_()
+{
+  int ret = OB_SUCCESS;
+  bool is_exist = false;
+  const blocksstable::MacroBlockId &macro_id = log_object_ptr_->get_macro_id();
+  const common::ObString &data = log_object_ptr_->get_data();
+  const bool is_logging = log_object_ptr_->is_logging();
+
+  if (OB_UNLIKELY(!macro_id.is_valid()
+                  || (is_logging && data.empty()) || (!is_logging && !data.empty()))) {
+    ret = OB_INVALID_ARGUMENT;
+    TRANS_LOG(WARN, "invalid lob outtable replay data", KR(ret), K(macro_id), K(data.length()),
+              K(is_logging), KPC(this));
+  } else if (is_logging) {
+    if (OB_FAIL(storage::ObLobOutTableIO::is_exist(macro_id, tx_ctx_->ls_id_.id(), is_exist))) {
+      TRANS_LOG(WARN, "head lob outtable object failed", KR(ret), K(macro_id), KPC(this));
+    } else if (!is_exist && OB_FAIL(storage::ObLobOutTableIO::write(macro_id, data))) {
+      TRANS_LOG(WARN, "write lob outtable replay object failed", KR(ret), K(macro_id));
+    }
+  }
+
+  if (OB_SUCCESS != ret && storage::ObLobOutTableIO::is_retryable_error(ret)) {
+    const int io_ret = ret;
+    ret = OB_EAGAIN;
+    TRANS_LOG(INFO, "rewrite retryable outtable replay error", KR(ret), KR(io_ret), K(macro_id));
+  }
+  return ret;
+}
+
+template <>
+OB_INLINE int ObTxCtxLogOperator<ObTxLobOutTableDataLog>::replay_in_ctx_()
+{
+  int ret = OB_SUCCESS;
+  CtxLockGuard guard;
+  if (!tx_ctx_->lock_.is_locked_by_self()) {
+    tx_ctx_->get_ctx_guard(guard, CtxLockGuard::MODE::CTX);
+  }
+  bool need_replay = true;
+  if (OB_FAIL(tx_ctx_->check_replay_avaliable_(
+      lsn_, scn_, log_op_arg_.replay_arg_.part_log_no_, need_replay))) {
+    TRANS_LOG(INFO, "check lob outtable replay available failed", KR(ret), KPC(this));
+  } else if (!need_replay) {
+    TRANS_LOG(INFO, "lob outtable data log does not need replay", KPC(log_object_ptr_), KPC(tx_ctx_));
+  }
+  return ret;
+}
 
 } // namespace transaction
 

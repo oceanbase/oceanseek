@@ -561,10 +561,11 @@ TEST_F(TestDDLIncCommitLog, test_log_basic_lob_data_version_gate)
 TEST_F(TestDDLIncCommitLog, test_check_data_version_support_lob_direct_load)
 {
   ASSERT_EQ(OB_INVALID_ARGUMENT,
-      check_data_version_support_lob_direct_load(DATA_VERSION_4_6_2_0, nullptr));
+      ObLobUtil::check_data_version_support_lob_direct_load(DATA_VERSION_4_6_2_0, nullptr));
   ASSERT_EQ(OB_NOT_SUPPORTED,
-      check_data_version_support_lob_direct_load(DATA_VERSION_4_6_2_0, "direct load"));
-  ASSERT_SUCC(check_data_version_support_lob_direct_load(DATA_VERSION_4_6_2_1, "direct load"));
+      ObLobUtil::check_data_version_support_lob_direct_load(DATA_VERSION_4_6_2_0, "direct load"));
+  ASSERT_SUCC(ObLobUtil::check_data_version_support_lob_direct_load(
+      DATA_VERSION_4_6_2_1, "direct load"));
 }
 
 TEST_F(TestDDLIncCommitLog, test_log_basic_lob_aux_tablet_ids_must_be_paired)

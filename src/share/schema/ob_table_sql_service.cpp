@@ -3406,6 +3406,8 @@ int ObTableSqlService::gen_table_dml_without_check(
           && OB_FAIL(dml.add_column("name_generated_type", table.get_name_generated_type())))
       || (data_version >= DATA_VERSION_4_2_1_2
           && OB_FAIL(dml.add_column("lob_inrow_threshold", table.get_lob_inrow_threshold())))
+      || (data_version >= DATA_VERSION_4_6_3_1
+          && OB_FAIL(dml.add_column("lob_intable_threshold", table.get_lob_intable_threshold())))
       || (data_version >= DATA_VERSION_4_3_0_0
           && OB_FAIL(dml.add_column("max_used_column_group_id", table.get_max_used_column_group_id())))
       || (data_version >= DATA_VERSION_4_3_0_0
@@ -3509,6 +3511,10 @@ int ObTableSqlService::gen_table_dml(
              && OB_UNLIKELY(OB_DEFAULT_LOB_INROW_THRESHOLD != table.get_lob_inrow_threshold())) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("lob_inrow_threshold not support before 4.2.1.2", K(ret), K(table));
+  } else if (data_version < DATA_VERSION_4_6_3_1
+             && OB_UNLIKELY(OB_DEFAULT_LOB_INTABLE_THRESHOLD != table.get_lob_intable_threshold())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("lob_intable_threshold not supported before 4.6.3.1", K(ret), K(table));
   } else if (data_version < DATA_VERSION_4_3_0_0
              && OB_UNLIKELY(ObRowStoreType::CS_ENCODING_ROW_STORE == table.get_row_store_type() ||
                  ObStoreFormatType::OB_STORE_FORMAT_ARCHIVE_HIGH_ORACLE == table.get_store_format())) {

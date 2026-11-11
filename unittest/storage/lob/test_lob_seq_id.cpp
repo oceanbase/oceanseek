@@ -125,7 +125,6 @@ TEST_F(TestLobSeqId, next_seq_id)
   ASSERT_NE(seq_id.digits_, nullptr);
   ASSERT_EQ(seq_id.digits_[0], 256);
 
-  ASSERT_EQ(seq_id.cap_, 1024 * 8);
   ASSERT_EQ(seq_id.len_, ObLobSeqId::LOB_SEQ_ID_MIN_LEN);
   ASSERT_NE(seq_id.buf_, nullptr);
   ASSERT_EQ(static_cast<char>(ObLobSeqId::LOB_SEQ_ID_VERSION), next_seq_id.ptr()[0]);

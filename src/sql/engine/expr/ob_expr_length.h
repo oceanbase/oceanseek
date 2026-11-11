@@ -36,14 +36,11 @@ public:
                                       const EvalBound &bound);
 
 private:
-  // Query the byte length of an outrow (or mem-loc) lob from the lob storage.
-  // The byte length of an outrow lob cannot be read from the locator header
-  // alone, so a query param is built from the result-row locator and the lob
-  // manager scans the lob meta table to compute it.
-  static int get_outrow_lob_byte_length(const ObExpr &expr,
-                                        ObEvalCtx &ctx,
-                                        const common::ObString &lob_str,
-                                        int64_t &byte_length);
+  // Query the byte length of an outline LOB (internal outrow or external).
+  static int get_outline_lob_byte_length(const ObExpr &expr,
+                                         ObEvalCtx &ctx,
+                                         const common::ObString &lob_str,
+                                         int64_t &byte_length);
   template <typename ArgVec, typename ResVec>
   static int calc_mysql_length_vector_dispatch(const ObExpr &expr,
                                       ObEvalCtx &ctx,

@@ -61,6 +61,7 @@ ob_set_subtarget(ob_sql das
   das/ob_das_factory.cpp
   das/ob_das_insert_op.cpp
   das/ob_das_lock_op.cpp
+  das/ob_das_outtable_lob_control_key_collector.cpp
   das/ob_das_ref.cpp
   das/ob_das_rpc_processor.cpp
   das/ob_das_location_router.cpp
@@ -910,6 +911,8 @@ ob_set_subtarget(ob_sql engine_expr
   engine/expr/ob_expr_res_type_map.cpp
   engine/expr/ob_expr_result_type_util.cpp
   engine/expr/ob_expr_lob_appendwrite.cpp
+  engine/expr/ob_expr_external_lob.cpp
+  engine/expr/ob_expr_lob_meta.cpp
   engine/expr/ob_expr_returning_lob.cpp
   engine/expr/ob_expr_reverse.cpp
   engine/expr/ob_expr_right.cpp

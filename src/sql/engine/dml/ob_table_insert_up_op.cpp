@@ -1189,6 +1189,8 @@ int ObTableInsertUpOp::do_opt_insert_up()
       LOG_WARN("fail to do opt insert up cache", K(ret));
     } else if (OB_FAIL(post_all_dml_das_task(upd_rtctx_))) {
       LOG_WARN("do insert rows post process failed", K(ret));
+    } else if (OB_FAIL(complete_outtable_lob_control_keys_())) {
+      LOG_WARN("failed to complete optimized insert up outtable lob control rows", K(ret));
     }
     // no need to handle after row processing for opt insert up,
     // because there is no after row trigger or foreign key check
@@ -1841,6 +1843,8 @@ int ObTableInsertUpOp::do_insert_up()
       LOG_WARN("fail to post all das task", K(ret));
     } else if (!check_is_duplicated() && OB_FAIL(ObDMLService::handle_after_row_processing(this, &dml_modify_rows_))) {
       LOG_WARN("try insert is not duplicated, failed to process foreign key handle", K(ret));
+    } else if (!check_is_duplicated() && OB_FAIL(complete_outtable_lob_control_keys_())) {
+      LOG_WARN("failed to complete outtable lob control rows for try insert", K(ret));
     } else if (!check_is_duplicated()) {
       insert_rows_ += insert_rows;
       guarantee_session_last_insert_id();
@@ -1866,6 +1870,8 @@ int ObTableInsertUpOp::do_insert_up()
       LOG_WARN("do insert rows post process failed", K(ret));
     } else if (OB_FAIL(ObDMLService::handle_after_row_processing(this, &dml_modify_rows_, true))) {
       LOG_WARN("try insert is duplicated, failed to process foreign key handle", K(ret));
+    } else if (OB_FAIL(complete_outtable_lob_control_keys_())) {
+      LOG_WARN("failed to complete outtable lob control rows for final insert up", K(ret));
     }
     GET_DIAGNOSTIC_INFO->get_ash_stat().in_duplicate_conflict_resolve_=false;
     if (OB_SUCC(ret) && !is_iter_end) {
@@ -2276,7 +2282,7 @@ int ObTableInsertUpOp::reset_das_env()
   if (OB_FAIL(dml_rtctx_.das_ref_.close_all_task())) {
     LOG_WARN("close all das task failed", K(ret));
   } else {
-    dml_rtctx_.das_ref_.reuse();
+    dml_rtctx_.reuse();
     dml_modify_rows_.clear();
   }
 
@@ -2301,6 +2307,23 @@ int ObTableInsertUpOp::reset_das_env()
   return ret;
 }
 
+int ObTableInsertUpOp::complete_outtable_lob_control_keys_()
+{
+  int ret = OB_SUCCESS;
+  const common::ObIArray<storage::ObOuttableLobControlKey> *insert_keys =
+      dml_rtctx_.get_outtable_lob_control_keys();
+  const common::ObIArray<storage::ObOuttableLobControlKey> *update_keys =
+      upd_rtctx_.get_outtable_lob_control_keys();
+  if ((OB_ISNULL(insert_keys) || insert_keys->empty())
+      && (OB_ISNULL(update_keys) || update_keys->empty())) {
+  } else if (OB_FAIL(ObTableModifyOp::complete_outtable_lob_control_keys(dml_rtctx_))) {
+    LOG_WARN("failed to complete insert outtable lob control rows", K(ret));
+  } else if (OB_FAIL(ObTableModifyOp::complete_outtable_lob_control_keys(upd_rtctx_))) {
+    LOG_WARN("failed to complete update outtable lob control rows", K(ret));
+  }
+  return ret;
+}
+
 int ObTableInsertUpOp::reuse()
 {
   int ret = OB_SUCCESS;
@@ -2308,15 +2331,16 @@ int ObTableInsertUpOp::reuse()
   if (dml_rtctx_.das_ref_.has_task()) {
     if (OB_FAIL(dml_rtctx_.das_ref_.close_all_task())) {
       LOG_WARN("close all insert das task failed", K(ret));
-    } else {
-      dml_rtctx_.das_ref_.reuse();
     }
+  }
+  if (OB_SUCC(ret)) {
+    dml_rtctx_.reuse();
   }
   if (OB_SUCC(ret)) {
     if (OB_FAIL(upd_rtctx_.das_ref_.close_all_task())) {
       LOG_WARN("close all update das task failed", K(ret));
     } else {
-      upd_rtctx_.das_ref_.reuse();
+      upd_rtctx_.reuse();
     }
   }
   if (OB_SUCC(ret)) {

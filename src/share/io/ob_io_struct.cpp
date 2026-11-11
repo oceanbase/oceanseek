@@ -2671,15 +2671,19 @@ int ObSyncIOChannel::do_sync_io(ObIORequest &req)
         io_size = req.io_result_->size_;
       }
     } else if (ObIOReadMode::STAT == read_mode) {
-      ObIODFileStat *statbuf = new (io_buf) ObIODFileStat();
-      if (OB_FAIL(device_handle->stat(uri_cstr, *statbuf))) {
+      ObIODFileStat *statbuf = nullptr;
+      if (OB_FAIL(req.prepare_stat_buffer(statbuf))) {
+        LOG_WARN("failed to prepare stat IO buffer", KR(ret), K(req));
+      } else if (OB_FAIL(device_handle->stat(uri_cstr, *statbuf))) {
         LOG_WARN("failed to get file stat", K(ret), K(req));
       } else {
         io_size = req.io_result_->size_;
       }
     } else if (ObIOReadMode::ADAPTIVE_STAT == read_mode) {
-      ObIODFileStat *statbuf = new (io_buf) ObIODFileStat();
-      if (OB_FAIL(device_handle->adaptive_stat(uri_cstr, *statbuf))) {
+      ObIODFileStat *statbuf = nullptr;
+      if (OB_FAIL(req.prepare_stat_buffer(statbuf))) {
+        LOG_WARN("failed to prepare adaptive stat IO buffer", KR(ret), K(req));
+      } else if (OB_FAIL(device_handle->adaptive_stat(uri_cstr, *statbuf))) {
         LOG_WARN("failed to get file stat", K(ret), K(req));
       } else {
         io_size = req.io_result_->size_;
@@ -3256,7 +3260,9 @@ int ObIORunner::handle(ObIORequest *req)
           //const int64_t callback_queue_delay = get_io_interval(begin_time, req->time_log_.callback_enqueue_ts_);
           //EVENT_ADD(ObStatEventIds::IO_READ_CB_QUEUE_DELAY, callback_queue_delay);
           if (nullptr != req->get_callback()) {
-            if (OB_FAIL(req->get_callback()->process(req->get_io_data_buf(), req->io_result_->size_))) {
+            // External LOB allows short reads at EOF; callbacks must process only returned data.
+            if (OB_FAIL(req->get_callback()->process(req->get_io_data_buf(),
+                                                     req->get_data_size()))) {
               LOG_WARN("fail to callback", K(ret), K(*req), K(MTL_ID()));
             }
             time_guard.click("callback_process");

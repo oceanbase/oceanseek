@@ -11,6 +11,7 @@
 #include "lib/net/ob_addr.h"
 #include "lib/string/ob_string.h"
 #include "share/ob_ls_id.h"
+#include "share/schema/ob_schema_struct.h"
 #include "share/scn.h"
 #include "lib/alloc/alloc_struct.h"
 #include "lib/allocator/page_arena.h"
@@ -35,6 +36,7 @@ class ObDMLBaseParam;
 struct ObDMLRunningCtx;
 class ObLobAccessCtx;
 struct ObLobMetaInfo;
+struct ObOuttableLobControlKey;
 
 // ObLobContextBase 是 ObLobReadContext 和 ObLobWriteContext 的公共基类，包含
 // 两者共享的参数。它只能通过派生 context 构造、赋值和析构。
@@ -57,6 +59,7 @@ protected:
   ~ObLobContextBase() = default;
   int init_src_loc_wrapper_();
   int assign_common(const ObLobContextBase &other);
+  virtual void reset();
 
 public:
   common::ObIAllocator *allocator_;
@@ -87,6 +90,7 @@ struct ObLobReadContext : public ObLobContextBase
 public:
   ObLobReadContext();
   ~ObLobReadContext();
+  void reset() override;
 
   int build(common::ObLobLocatorV2 &lob_locator,
             common::ObIAllocator &allocator,
@@ -111,7 +115,7 @@ public:
 
   INHERIT_TO_STRING_KV("ObLobContextBase", ObLobContextBase,
       K_(scan_backward), K_(from_rpc), K_(inrow_read_nocopy),
-      K_(no_need_retry), K_(enable_remote_retry), K_(is_full_table_scan),
+      K_(enable_remote_retry), K_(is_full_table_scan),
       KP_(access_ctx), K_(seq_id_start), K_(seq_id_end));
 
 private:
@@ -124,7 +128,6 @@ public:
   bool scan_backward_;
   bool from_rpc_;
   bool inrow_read_nocopy_;
-  bool no_need_retry_;
   bool enable_remote_retry_;
   bool is_full_table_scan_;
   ObLobAccessCtx *access_ctx_;
@@ -200,10 +203,12 @@ public:
   bool is_blob() { return coll_type_ == common::ObCollationType::CS_TYPE_BINARY; }
 
   bool is_remote() const;
+  bool can_write_outtable() const;
 
-  virtual int64_t get_chunk_size() const;
+  virtual int64_t get_chunk_size(const bool is_outtable) const;
 
   int64_t get_inrow_threshold() const;
+  int64_t get_intable_threshold() const;
 
   int update_seq_no(const LobAuxTarget target);
 
@@ -214,13 +219,15 @@ public:
   int get_aux_tablet_id(const LobAuxTarget target, common::ObTabletID &tablet_id) const;
   int get_aux_column_cnt(const LobAuxTarget target, uint64_t &column_cnt) const;
   int get_aux_rowkey_col_cnt(const LobAuxTarget target, uint64_t &rowkey_col_cnt) const;
+  // Get the transaction context for writing OutTable CLOG. The LOB Meta DML base parameter must be initialized first.
+  int get_trans_ctx(transaction::ObPartTransCtx *&tx_ctx) const;
 
   INHERIT_TO_STRING_KV("ObLobContextBase", ObLobContextBase,
       K(dest_loc_), K_(dml_op), K_(parent_seq_no), K_(insert_lob_seq_no),
       K_(update_lob_seq_no), K_(delete_lob_seq_no), K_(is_total_quantity_log),
       K_(inrow_threshold), K_(is_mlog),
-      K_(try_flush_redo), K_(is_index_table), KPC_(data_row),
-      K_(is_table_without_pk));
+      K_(try_flush_redo), K_(is_index_table), K_(table_def_type), KPC_(data_row),
+      K_(is_table_without_pk), K_(intable_threshold), K_(allow_outtable_lob));
 
 public:
   ObArenaAllocator own_allocator_;
@@ -249,9 +256,13 @@ public:
   // 是否主动刷 redo，若为 false，则交给后续主表流程主动刷新 redo
   bool try_flush_redo_;
   bool is_index_table_;
+  share::schema::ObTableDefType table_def_type_;
   bool is_table_without_pk_;
   int64_t inrow_threshold_;
+  int64_t intable_threshold_;
   const blocksstable::ObDatumRow *data_row_; // for tablet split
+  common::ObIArray<ObOuttableLobControlKey> *outtable_lob_control_keys_;
+  bool allow_outtable_lob_;
 };
 
 struct ObLobInsertContext : public ObLobWriteContext
@@ -303,7 +314,17 @@ struct ObLobAppendContext : public ObLobUpdateContext
 {
 public:
   ObLobAppendContext()
-    : ObLobUpdateContext(), delta_loc_(), old_lob_id_(), is_main_table_rowkey_col_(false) {}
+    : ObLobUpdateContext(),
+      delta_loc_(),
+      next_seq_id_(),
+      update_first_(false),
+      cur_byte_length_(0),
+      cur_char_length_(0),
+      cur_chunk_count_(0),
+      total_byte_length_(0),
+      total_char_length_(0),
+      is_main_table_rowkey_col_(false)
+  {}
   ~ObLobAppendContext() {}
 
   int build_for_dml(const ObDMLRunningCtx &run_ctx,
@@ -319,9 +340,19 @@ public:
 
 public:
   INHERIT_TO_STRING_KV("ObLobUpdateContext", ObLobUpdateContext,
-                       K(delta_loc_), K(old_lob_id_), K(is_main_table_rowkey_col_));
+                       K(delta_loc_), K(next_seq_id_),
+                       K(update_first_), K(cur_byte_length_), K(cur_char_length_),
+                       K(cur_chunk_count_),
+                       K(total_byte_length_), K(total_char_length_),
+                       K(is_main_table_rowkey_col_));
   common::ObLobLocatorV2 delta_loc_;
-  common::ObLobId old_lob_id_;
+  common::ObString next_seq_id_;
+  bool update_first_;
+  uint64_t cur_byte_length_;
+  uint64_t cur_char_length_;
+  uint64_t cur_chunk_count_;
+  uint64_t total_byte_length_;
+  uint64_t total_char_length_;
   bool is_main_table_rowkey_col_;
 };
 

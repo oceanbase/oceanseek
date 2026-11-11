@@ -97,7 +97,8 @@ public: // self_function
   virtual ~ObTabletPointer();
 
 public:
-  int scan_all_tablets_on_chain(const ObFunction<int(ObTablet &)> &op);// must be called under t3m bucket lock's protection
+  // 必须在 t3m bucket lock 保护下调用。
+  int scan_all_tablets_on_chain(const ObFunction<int(ObTablet &)> &op, int64_t &tablet_cnt);
   void set_auto_part_size(const int64_t auto_part_size);
   int64_t get_auto_part_size() const;
   int deep_copy(char *buf, const int64_t buf_len, ObTabletPointer *&value) const;
@@ -231,12 +232,23 @@ struct ScanAllVersionTabletsOp
   struct GetMinTabletRelyInfo
   {
   public:
-    GetMinTabletRelyInfo(share::SCN &min_dep_meta_scn, int64_t &min_major_snapshot);
+    GetMinTabletRelyInfo(share::SCN &min_dep_meta_scn,
+                         int64_t &min_major_snapshot,
+                         share::SCN &clog_checkpoint_scn,
+                         share::SCN &orig_clog_checkpoint_scn,
+                         int64_t &multi_version_start,
+                         bool &has_memtable,
+                         const bool collect_lob_rely_info);
     virtual ~GetMinTabletRelyInfo() {}
     int operator()(ObTablet &);
   public:
     share::SCN &min_dep_meta_scn_;
     int64_t &min_major_snapshot_;
+    share::SCN &clog_checkpoint_scn_;
+    share::SCN &orig_clog_checkpoint_scn_;
+    int64_t &multi_version_start_;
+    bool &has_memtable_;
+    const bool collect_lob_rely_info_;
   };
 #endif
 };

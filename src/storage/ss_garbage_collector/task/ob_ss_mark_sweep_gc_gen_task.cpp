@@ -1085,7 +1085,8 @@ int ObSSMarkSweepGCGenTask::study_tablet_meta_scn_for_ls_(
             ls_id, gc_tablets, study_result_arr, DEFAULT_STUDY_TIMEOUT_US))) {
       LOG_WARN("fail to do mark sweep gc study", KR(ret), K_(tenant_id),
           K(ls_id), K(snapshot_meta_scn), K(gc_tablets.count()));
-    } else if (OB_FAIL(calc_min_meta_scn_(snapshot_meta_scn, study_result_arr, tablet_with_meta_scn_arr))) {
+    } else if (OB_FAIL(calc_min_meta_scn_(
+                   snapshot_meta_scn, study_result_arr, tablet_with_meta_scn_arr))) {
       LOG_WARN("fail to calc min meta scn", KR(ret), K_(tenant_id), K(ls_id),
           K(snapshot_meta_scn));
     } else if (OB_FAIL(filter_by_ls_ss_checkpoint_scn_(
@@ -1106,45 +1107,54 @@ int ObSSMarkSweepGCGenTask::calc_min_meta_scn_(
   int ret = OB_SUCCESS;
   for (int64_t i = 0; OB_SUCC(ret) && (i < study_result_arr.count()); ++i) {
     const ObSSGCTabletStudyResult &study_result = study_result_arr.at(i);
-    // meta_scn = min(min_dep_meta_scn_, the max meta_scn among versions whose
-    // max_major_snapshot_ does not exceed study_result.min_major_snapshot_).
-    // That version is the last usable bound before the still-needed min major appears.
-    // If no such version exists, major side cannot recycle any version.
-    // Optimize: min_major_snapshot_ == INT64_MAX means major side can recycle all
-    // versions (no major constraint), so no need to walk versions; just use min_dep_meta_scn_.
-    SCN meta_scn = study_result.study_info_.min_dep_meta_scn_;
-    if (INT64_MAX == study_result.study_info_.min_major_snapshot_) {
-      // no major constraint, keep meta_scn = min_minor_meta_scn_
-    } else {
+    const ObSSGCTabletStudyInfo &study_info = study_result.study_info_;
+    const bool need_major_rely = study_info.is_major_rely();
+    const bool need_lob_rely = study_info.is_lob_rely();
+    SCN meta_scn = study_info.min_dep_meta_scn_;
+    if (need_major_rely || need_lob_rely) {
       SCN max_major_meta_scn;
-      if (OB_FAIL(get_max_major_meta_scn_(snapshot_meta_scn, study_result.gc_tablet_,
-              study_result.study_info_.min_major_snapshot_, max_major_meta_scn))) {
-        LOG_WARN("fail to get max major meta scn", KR(ret), K_(tenant_id), K(study_result));
-      } else if (max_major_meta_scn.is_valid()) {
-        meta_scn = max_major_meta_scn < meta_scn ? max_major_meta_scn : meta_scn;
-      } else {
+      SCN max_lob_meta_scn;
+      if (OB_FAIL(get_max_rely_meta_scns_(snapshot_meta_scn, study_result.gc_tablet_,
+              study_info, max_major_meta_scn, max_lob_meta_scn))) {
+        LOG_WARN("fail to get max rely meta scns", KR(ret), K_(tenant_id), K(study_result));
+      } else if ((need_major_rely && !max_major_meta_scn.is_valid())
+          || (need_lob_rely && !max_lob_meta_scn.is_valid())) {
         meta_scn.set_min();
-        LOG_TRACE("no major meta scn found, set min scn", K_(tenant_id), K(study_result));
+        LOG_TRACE("no rely meta scn found, set min scn", K_(tenant_id), K(study_result),
+            K(need_major_rely), K(max_major_meta_scn), K(need_lob_rely), K(max_lob_meta_scn));
+      } else {
+        if (need_major_rely && max_major_meta_scn < meta_scn) {
+          meta_scn = max_major_meta_scn;
+        }
+        if (need_lob_rely && max_lob_meta_scn < meta_scn) {
+          meta_scn = max_lob_meta_scn;
+        }
       }
     }
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(tablet_with_meta_scn_arr.push_back(ObSSGCTabletWithMetaScn(
-            study_result.gc_tablet_, meta_scn)))) {
+            study_result.gc_tablet_, meta_scn, study_info.clog_checkpoint_scn_,
+            study_info.orig_clog_checkpoint_scn_)))) {
       LOG_WARN("fail to push back tablet with meta scn", KR(ret), K_(tenant_id), K(study_result));
     }
   }
   return ret;
 }
 
-int ObSSMarkSweepGCGenTask::get_max_major_meta_scn_(
+int ObSSMarkSweepGCGenTask::get_max_rely_meta_scns_(
     const SCN &snapshot_meta_scn,
     const ObSSGCTablet &gc_tablet,
-    const int64_t min_major_snapshot,
-    SCN &max_major_meta_scn)
+    const ObSSGCTabletStudyInfo &study_info,
+    SCN &max_major_meta_scn,
+    SCN &max_lob_meta_scn)
 {
   int ret = OB_SUCCESS;
   max_major_meta_scn.reset();
+  max_lob_meta_scn.reset();
+  const bool need_major_rely = study_info.is_major_rely();
+  const bool need_lob_rely = study_info.is_lob_rely();
   ObSSMetaService *meta_srv = nullptr;
+
   if (OB_ISNULL(meta_srv = MTL(ObSSMetaService *))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("ObSSMetaService is null", KR(ret), K_(tenant_id), K(gc_tablet));
@@ -1186,15 +1196,28 @@ int ObSSMarkSweepGCGenTask::get_max_major_meta_scn_(
           } else {
             LOG_WARN("fail to get next version tiny info", KR(ret), K_(tenant_id), K(gc_tablet));
           }
-        } else if (tiny_info.max_major_snapshot_ <= min_major_snapshot) {
-          // 收集 max_major_snapshot 不超过目标 min_major_snapshot 的版本中的最大 meta_scn。
-          if (!max_major_meta_scn.is_valid() || (max_major_meta_scn < key.meta_scn_)) {
+        } else if (OB_UNLIKELY(!tiny_info.is_valid())) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid tiny info from tablet iterator", KR(ret), K_(tenant_id),
+              K(gc_tablet), K(key), K(tiny_info));
+        } else {
+          if (need_major_rely
+              && tiny_info.max_major_snapshot_ <= study_info.min_major_snapshot_
+              && (!max_major_meta_scn.is_valid() || max_major_meta_scn < key.meta_scn_)) {
             max_major_meta_scn = key.meta_scn_;
+          }
+          // 两个事务条件必须由同一个共享 TabletMeta 版本同时满足。
+          if (need_lob_rely
+              && tiny_info.clog_checkpoint_scn_ <= study_info.clog_checkpoint_scn_
+              && tiny_info.multi_version_start_ <= study_info.multi_version_start_
+              && (!max_lob_meta_scn.is_valid() || max_lob_meta_scn < key.meta_scn_)) {
+            max_lob_meta_scn = key.meta_scn_;
           }
         }
       }
     }
   }
+
   return ret;
 }
 

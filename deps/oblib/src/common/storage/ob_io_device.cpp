@@ -5,9 +5,60 @@
 
 #define USING_LOG_PREFIX COMMON
 #include "ob_io_device.h"
+#include "share/rc/ob_tenant_base.h"
 
 namespace oceanbase {
 namespace common {
+
+ObIODFileStat::ObIODFileStat() : ObIODFileStat(MTL_ID()) {}
+
+void ObIODFileStat::reset()
+{
+  rdev_ = 0;
+  dev_ = 0;
+  inode_ = 0;
+  mask_ = 0;
+  mode_ = 0;
+  nlink_ = 0;
+  uid_ = 0;
+  gid_ = 0;
+  size_ = 0;
+  block_cnt_ = 0;
+  block_size_ = 0;
+  atime_s_ = 0;
+  mtime_s_ = 0;
+  ctime_s_ = 0;
+  btime_s_ = 0;
+  etag_.reset();
+}
+
+int ObIODFileStat::assign(const ObIODFileStat &other)
+{
+  int ret = OB_SUCCESS;
+  if (this != &other) {
+    reset();
+    if (OB_FAIL(etag_.assign(other.etag_))) {
+      LOG_WARN("failed to copy file stat", KR(ret), K(other.size_));
+    } else {
+      rdev_ = other.rdev_;
+      dev_ = other.dev_;
+      inode_ = other.inode_;
+      mask_ = other.mask_;
+      mode_ = other.mode_;
+      nlink_ = other.nlink_;
+      uid_ = other.uid_;
+      gid_ = other.gid_;
+      size_ = other.size_;
+      block_cnt_ = other.block_cnt_;
+      block_size_ = other.block_size_;
+      atime_s_ = other.atime_s_;
+      mtime_s_ = other.mtime_s_;
+      ctime_s_ = other.ctime_s_;
+      btime_s_ = other.btime_s_;
+    }
+  }
+  return ret;
+}
 
 /**
  * -------------------------------------ObIOFd--------------------------------------------

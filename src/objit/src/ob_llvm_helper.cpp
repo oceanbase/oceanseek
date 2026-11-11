@@ -106,7 +106,8 @@ static ObGetIRType OB_IR_TYPE[common::ObMaxType + 1] =
   reinterpret_cast<ObGetIRType>(ObIRType::getInt32Ty),     //52.ObMySQLDateType
   reinterpret_cast<ObGetIRType>(ObIRType::getInt64Ty),     //53.ObMySQLDateTimeType
   NULL,                                                    //54.ObRoaringBitmapType
-  NULL,                                                    //55.ObMaxType
+  NULL,                                                    //55.ObExtendBLobType
+  NULL,                                                    //56.ObMaxType
 };
 
 template<typename T, int64_t N>

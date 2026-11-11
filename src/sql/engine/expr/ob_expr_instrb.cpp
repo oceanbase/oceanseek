@@ -96,7 +96,7 @@ static int calc_instrb_text(ObTextStringIter &haystack_iter,
   } else {
     ObTextStringIterState state;
     size_t needle_byte_len = needle_data.length();
-    if (haystack_iter.is_outrow_lob()) {
+    if (haystack_iter.is_outline_lob()) {
       haystack_iter.set_reserved_byte_len(needle_byte_len - 1);
       if (pos_int > 0) {
         haystack_iter.set_start_offset(pos_int - 1); // start char len
@@ -147,7 +147,7 @@ static int calc_instrb_text(ObTextStringIter &haystack_iter,
       int64_t max_access_byte_len = 0;
       if (OB_FAIL(haystack_iter.get_byte_len(total_byte_len))) {
         LOG_WARN("get haystack char len failed", K(ret), K(state)); 
-      } else if (haystack_iter.is_outrow_lob()) {
+      } else if (haystack_iter.is_outline_lob()) {
         max_access_byte_len = total_byte_len + pos_int + 1;
         haystack_iter.set_start_offset(-pos_int - 1); // start char len
         pos_int = -1;

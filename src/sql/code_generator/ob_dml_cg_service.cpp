@@ -2811,6 +2811,9 @@ int ObDmlCgService::generate_das_dml_ctdef(ObLogDelUpd &op,
     das_dml_ctdef.is_update_pk_ = index_dml_info.is_update_primary_key_;
     das_dml_ctdef.is_vec_hnsw_index_vid_opt_ = index_dml_info.is_vec_hnsw_index_vid_opt_;
     das_dml_ctdef.is_async_index_opt_ = index_dml_info.is_async_index_opt_;
+    das_dml_ctdef.allow_outtable_lob_ = !session->get_ddl_info().is_ddl()
+        && !op.get_plan()->get_optimizer_context().get_direct_load_optimizer_ctx().use_direct_load()
+        && !das_dml_ctdef.table_param_.get_data_table().is_vector_index();
   }
 #ifdef OB_BUILD_TDE_SECURITY
   // generate encrypt_meta for table

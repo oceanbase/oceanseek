@@ -2596,6 +2596,7 @@ int ObLogFormatter::check_lob_meta_update_supported_(
       ret = OB_ERR_UNEXPECTED;
       LOG_ERROR("lob meta update new columns are nullptr", KR(ret), K(stmt_task));
     } else if (OB_FAIL(ObCDCLobAuxTableParser::parse_lob_aux_meta_table_row(
+        stmt_task.get_redo_log_entry_task().get_allocator(),
         *new_cols, meta_info, is_summary, extra_info))) {
       LOG_ERROR("parse lob meta update new row failed", KR(ret), K(stmt_task));
     } else if (!is_summary) {

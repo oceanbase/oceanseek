@@ -549,7 +549,8 @@ DEF_GET_OTIME_PK_VALUE(ObTimestampNanoType, timestamp_nano, uint16_t);
   ObCollectionSQLType,               \
   ObMySQLDateType,                   \
   ObMySQLDateTimeType,               \
-  ObRoaringBitmapType
+  ObRoaringBitmapType,               \
+  ObExtendBLobType
 
 #define DEF_GET_PK_FUNC(obj_type) ObURowIDData::inner_get_pk_value<obj_type>
 

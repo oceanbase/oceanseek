@@ -752,7 +752,7 @@ public:
   bool is_valid() const;
 
   TO_STRING_KV(K_(is_mark_delete), K_(deleted_scn), K_(max_replayed_scn), K_(min_major_snapshot),
-               K_(max_major_snapshot));
+               K_(max_major_snapshot), K_(clog_checkpoint_scn), K_(multi_version_start));
 
 public:
   bool is_mark_delete_;
@@ -760,6 +760,8 @@ public:
   share::SCN max_replayed_scn_;
   int64_t min_major_snapshot_;
   int64_t max_major_snapshot_;
+  share::SCN clog_checkpoint_scn_;
+  int64_t multi_version_start_;
 };
 
 

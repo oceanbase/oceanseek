@@ -10,8 +10,10 @@
 #include "rootserver/ob_cluster_event.h"          // CLUSTER_EVENT_ADD_CONTROL
 #include "rootserver/ob_tenant_event_def.h" // TENANT_EVENT
 #include "rootserver/ob_ls_service_helper.h"//ObTenantLSInfo
+#include "rootserver/ob_user_table_schema_applier.h"
 #include "share/ob_global_stat_proxy.h"//ObGlobalStatProxy
 #include "share/backup/ob_backup_config.h" // ObBackupConfigParserMgr
+#include "share/ob_share_util.h"
 #include "storage/high_availability/ob_transfer_lock_utils.h" // ObMemberListLockUtils
 #include "share/ob_license_utils.h"
 
@@ -207,6 +209,22 @@ int ObStandbyService::switch_tenant(const obrpc::ObSwitchTenantArg &arg)
       default :
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("unkown op_type", KR(ret), K(arg));
+    }
+    if (OB_SUCC(ret) && !is_verify
+        && (ObSwitchTenantArg::SWITCH_TO_PRIMARY == arg.get_op_type()
+            || ObSwitchTenantArg::FAILOVER_TO_PRIMARY == arg.get_op_type())) {
+      ObTimeoutCtx timeout_ctx;
+      ObUserTableSchemaApplier applier;
+      // A tenant restored from an old backup cannot create this table while it
+      // is RESTORE/STANDBY. Reconcile it after the tenant becomes writable.
+      if (OB_FAIL(ObShareUtil::set_default_timeout_ctx(timeout_ctx, GCONF._ob_ddl_timeout))) {
+        LOG_WARN("fail to set builtin user table ddl timeout", KR(ret), K(switch_tenant_id));
+      } else if (OB_FAIL(applier.init(*schema_service_, *sql_proxy_, timeout_ctx))) {
+        LOG_WARN("fail to init builtin user table schema applier", KR(ret), K(switch_tenant_id));
+      } else if (OB_FAIL(applier.apply_builtin_user_table_schemas(switch_tenant_id))) {
+        LOG_WARN("fail to apply builtin user table schemas after switch to primary",
+            KR(ret), K(switch_tenant_id), K(arg));
+      }
     }
     // reset return code to TIMEOUT, to prevent the error code which not user unfriendly
     if (THIS_WORKER.is_timeout() && OB_ERR_EXCLUSIVE_LOCK_CONFLICT == ret) {

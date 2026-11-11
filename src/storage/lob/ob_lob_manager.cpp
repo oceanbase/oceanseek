@@ -9,6 +9,7 @@
 #include "lib/allocator/page_arena.h"
 #include "lib/ob_errno.h"
 #include "lib/utility/ob_macro_utils.h"
+#include "share/backup/ob_backup_io_adapter.h"
 #include "storage/lob/access/ob_lob_iterator.h"
 #include "storage/lob/common/ob_lob_context.h"
 #include "storage/lob/common/ob_lob_util.h"
@@ -19,6 +20,7 @@
 #include "storage/lob/ob_lob_handler.h"
 #include "storage/lob/common/ob_lob_locator.h"
 #include "storage/lob/ob_lob_tablet_dml.h"
+#include "storage/lob/store/ob_lob_persistent_reader_cache.h"
 
 namespace oceanbase
 {
@@ -278,6 +280,7 @@ int ObLobManager::compare(ObLobReadContext &param_left,
                           ObLobReadContext &param_right,
                           int64_t &result) {
   INIT_SUCC(ret);
+  result = 0;
   common::ObCollationType collation_left = param_left.coll_type_;
   common::ObCollationType collation_right = param_right.coll_type_;
   common::ObCollationType cmp_collation = collation_left;
@@ -424,16 +427,8 @@ int ObLobManager::build_lob_read_context(
     LOG_WARN("build read context from locator failed",
              K(ret), K(lob), K(coll_type), K(offset), K(len), K(timeout));
   } else {
-    if (!read_ctx.snapshot_.tx_id().is_valid()) {
-      // 如果 tx_id 合法，read_ctx 在事务内, 无法设置 read_latest flag
-      // 所以仅在 tx_id 不合法时重用 table iter
-      //
-      // for exmaple
-      //   insert into t values (1,'v0');
-      //   insert ignore into t values (1,'v11'), (1,'v222') on duplicate key update c1 = md5(c1);
-      // second read shoud get "v11" not "v0"
-      read_ctx.access_ctx_ = lob_access_ctx;
-    }
+    // Transactions need the LOCATION provider; auxiliary table scan decides reader reuse.
+    read_ctx.access_ctx_ = lob_access_ctx;
     read_ctx.coll_type_ = coll_type;
     read_ctx.timeout_ = timeout;
     if (lob.has_inrow_data()) {
@@ -511,10 +506,10 @@ int ObLobManager::query(ObLobReadContext &read_ctx, ObString &buffer)
       uint64_t byte_length = 0;
 
       if (read_ctx.is_char()) {
-        convert_char_range_to_byte_range(
+        ObLobUtil::convert_char_range_to_byte_range(
             read_ctx.coll_type_, data.ptr(), data.length(), offset, length, byte_offset, byte_length);
       } else {
-        adjust_range(data.length(), offset, length);
+        ObLobUtil::adjust_range(data.length(), offset, length);
         byte_offset = offset;
         byte_length = length;
       }
@@ -558,11 +553,14 @@ int ObLobManager::query(ObLobReadContext &read_ctx, ObLobQueryIter *&iter)
       uint64_t byte_offset = 0;
       uint64_t byte_length = 0;
 
-      if (read_ctx.is_char()) {
-        convert_char_range_to_byte_range(
+      if (0 == offset && length >= static_cast<uint64_t>(data.length())) {
+        byte_offset = 0;
+        byte_length = data.length();
+      } else if (read_ctx.is_char()) {
+        ObLobUtil::convert_char_range_to_byte_range(
             read_ctx.coll_type_, data.ptr(), data.length(), offset, length, byte_offset, byte_length);
       } else {
-        adjust_range(data.length(), offset, length);
+        ObLobUtil::adjust_range(data.length(), offset, length);
         byte_offset = offset;
         byte_length = length;
       }
@@ -612,10 +610,17 @@ int ObLobManager::insert_before(ObLobInsertContext &ctx, bool &outrow)
   int ret = OB_SUCCESS;
   outrow = false;
   uint64_t byte_len = 0;
-  if (OB_FAIL(get_byte_length(ctx.src_loc_, byte_len))) {
+  bool is_inrow_lob = false;
+  if (ctx.src_loc_.is_mem_external_lob()) {
+    // external lob do not need a true byte_length
+  } else if (OB_FAIL(get_byte_length(ctx.src_loc_, byte_len))) {
     LOG_WARN("fail to get lob byte len", KR(ret), K(ctx));
   } else if (FALSE_IT(ctx.byte_size_ = byte_len)) {
   } else if (byte_len <= ctx.get_inrow_threshold()) {
+    is_inrow_lob = true;
+  }
+  if (OB_FAIL(ret)) {
+  } else if (is_inrow_lob) {
     // inrow case
   } else if (ctx.is_mlog_) {
     ret = OB_NOT_SUPPORTED;
@@ -625,7 +630,7 @@ int ObLobManager::insert_before(ObLobInsertContext &ctx, bool &outrow)
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "outrow lob in index table");
     LOG_WARN("outrow lob in index table is not supported", KR(ret), K(ctx));
-  } else if (OB_FAIL(prepare_outrow_locator_(ctx, ObLobId()))) {
+  } else if (OB_FAIL(prepare_outline_locator_(ctx, ObLobId()))) {
     LOG_WARN("failed to prepare outrow locator", KR(ret), K(ctx));
   } else {
     outrow = true;
@@ -638,10 +643,17 @@ int ObLobManager::update_before(ObLobUpdateContext &ctx, bool &outrow)
   int ret = OB_SUCCESS;
   outrow = false;
   uint64_t byte_len = 0;
-  if (OB_FAIL(get_byte_length(ctx.src_loc_, byte_len))) {
+  bool is_inrow_lob = false;
+  if (ctx.src_loc_.is_mem_external_lob()) {
+    // external lob do not need a true byte_length
+  } else if (OB_FAIL(get_byte_length(ctx.src_loc_, byte_len))) {
     LOG_WARN("fail to get lob byte len", KR(ret), K(ctx));
   } else if (FALSE_IT(ctx.byte_size_ = byte_len)) {
   } else if (byte_len <= ctx.get_inrow_threshold()) {
+    is_inrow_lob = true;
+  }
+  if (OB_FAIL(ret)) {
+  } else if (is_inrow_lob) {
     // new value is inrow (null->inrow or inrow->inrow), nothing to do.
     // old outrow -> new inrow is forbidden by the upper layer, so old must be inrow/null here.
   } else if (ctx.is_mlog_) {
@@ -652,7 +664,7 @@ int ObLobManager::update_before(ObLobUpdateContext &ctx, bool &outrow)
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "outrow lob in index table");
     LOG_WARN("outrow lob in index table is not supported", KR(ret), K(ctx));
-  } else if (OB_FAIL(prepare_outrow_locator_(ctx, ctx.lob_id_))) {
+  } else if (OB_FAIL(prepare_outline_locator_(ctx, ctx.lob_id_))) {
     // ctx.lob_id_ valid: outrow->outrow, reuse old lob id;
     // ctx.lob_id_ invalid: null/inrow->outrow, alloc new lob id.
     LOG_WARN("failed to prepare outrow locator", KR(ret), K(ctx));
@@ -668,13 +680,11 @@ int ObLobManager::append_before(ObLobAppendContext &ctx, bool &outrow)
   const ObMemLobExternHeader *extern_header = nullptr;
   ObString append_data;
   ObString old_data;
-  // TODO: 对于行外 LOB，此处的 get_byte_length() 会读取元信息摘要，
-  // append_after() -> ObLobAppender::append() -> read_old_summary_() 又会读取同一行。
-  // 可通过 ctx 缓存并复用该摘要，避免每次追加额外执行一次辅助表点查。
-  // 该优化优先级较低，不影响正确性。
+
   uint64_t old_byte_len = 0;
-  const bool old_is_outrow = ctx.old_loc_.is_outrow_disk_lob_locator();
+  const bool old_is_outrow = ctx.old_loc_.is_outline_disk_lob_locator();
   ObLobReadContext read_ctx;
+  ObLobMetaExtraInfo extra_info;
   ObLobDiskLocatorBuilder loc_builder;
   outrow = false;
   if (OB_FAIL(ctx.delta_loc_.get_append_delta(extern_header, append_data))) {
@@ -683,10 +693,6 @@ int ObLobManager::append_before(ObLobAppendContext &ctx, bool &outrow)
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "LOB_WRITEAPPEND on a rowkey column");
     LOG_WARN("lob append on rowkey column is not supported", KR(ret), K(ctx));
-  } else if (append_data.empty()) {
-    // DML 变更检查通常会过滤空增量；存储层兜底分支不产生副作用，
-    // 也不会将任务加入后处理队列。
-    ctx.dest_loc_ = ctx.old_loc_;
   } else if (ctx.old_loc_.has_inrow_data()) {
     if (OB_FAIL(ctx.old_loc_.get_inrow_data(old_data))) {
       LOG_WARN("failed to get old inrow data", KR(ret), K(ctx));
@@ -695,8 +701,33 @@ int ObLobManager::append_before(ObLobAppendContext &ctx, bool &outrow)
     }
   } else if (OB_FAIL(ctx.build_read_context(read_ctx))) {
     LOG_WARN("failed to build append read context", KR(ret), K(ctx));
+  } else if (GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_6_3_1) {
+    ObLobMetaInfo summary;
+    if (OB_ISNULL(read_ctx.allocator_)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("lob summary allocator is null", KR(ret), K(read_ctx.tablet_id_));
+    } else if (OB_FAIL(get_lob_summary_info(read_ctx, summary))) {
+      LOG_WARN("failed to read append target summary", KR(ret), K(read_ctx.tablet_id_), K(read_ctx.store_column_idx_));
+    } else if (OB_FAIL(extra_info.deserialize(*read_ctx.allocator_, summary.lob_extra_info_))) {
+      LOG_WARN("failed to deserialize append target summary", KR(ret), K(summary.lob_id_));
+    } else if (OB_UNLIKELY(ObLobMetaExtraInfo::LOB_META_SUMMARY != extra_info.extra_info_type_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid append target summary type", KR(ret), K(extra_info.extra_info_type_));
+    } else if (OB_UNLIKELY(extra_info.is_external_lob())) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "appending an external LOB");
+      LOG_WARN("appending an external lob is not supported", KR(ret), K(ctx.tablet_id_),
+              "append_length", append_data.length());
+    } else {
+      old_byte_len = summary.byte_len_;
+    }
   } else if (OB_FAIL(get_byte_length(read_ctx, old_byte_len))) {
     LOG_WARN("failed to get old outrow lob length", KR(ret), K(read_ctx));
+  }
+
+  if (OB_FAIL(ret)) {
+  } else if (append_data.empty()) {
+    ctx.dest_loc_ = ctx.old_loc_;
   }
 
   const uint64_t append_byte_len = static_cast<uint64_t>(append_data.length());
@@ -736,7 +767,7 @@ int ObLobManager::append_before(ObLobAppendContext &ctx, bool &outrow)
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "outrow LOB_WRITEAPPEND in index table");
     LOG_WARN("outrow lob append in index table is not supported", KR(ret), K(ctx));
-  } else if (OB_FAIL(prepare_outrow_locator_(ctx, ctx.old_lob_id_))) {
+  } else if (OB_FAIL(prepare_outline_locator_(ctx, ctx.lob_id_))) {
     LOG_WARN("failed to prepare append destination locator", KR(ret), K(ctx));
   } else {
     outrow = true;
@@ -784,7 +815,8 @@ int ObLobManager::get_byte_length(ObLobLocatorV2 &loc, uint64_t &byte_len)
 {
   int ret = OB_SUCCESS;
   int64_t len = 0;
-  if (OB_UNLIKELY(!loc.is_valid())) {
+  ObExternalBlobInfo external_info;
+  if (OB_UNLIKELY(!loc.is_valid() || loc.is_outline_disk_lob_locator())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid locator", KR(ret), K(loc));
   } else if (loc.has_inrow_data()) {
@@ -793,9 +825,14 @@ int ObLobManager::get_byte_length(ObLobLocatorV2 &loc, uint64_t &byte_len)
     } else {
       byte_len = len;
     }
-  } else if (OB_UNLIKELY(loc.is_outrow_disk_lob_locator())) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid argument, unexpected outrow disk lob locator", KR(ret), K(loc));
+  } else if (loc.is_mem_external_lob()) {
+    // TODO by renhe.wz: without access_ctx here, can not do head for external lob object
+    // DML uses declared length or 0 if absent; write preparation never accesses remote objects.
+    if (OB_FAIL(loc.get_external_lob_info(external_info))) {
+      LOG_WARN("failed to get external lob info", KR(ret), K(loc.size_));
+    } else {
+      byte_len = external_info.length_;
+    }
   } else {
     ObArenaAllocator allocator("LobQryLength", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
     ObLobReadContext read_ctx;
@@ -819,6 +856,15 @@ int ObLobManager::get_char_length(ObLobReadContext &read_ctx, uint64_t &char_len
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", KR(ret), K(read_ctx));
+  } else if (OB_UNLIKELY(!read_ctx.src_loc_.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("failed to check source lob locator", KR(ret), K(read_ctx.tablet_id_),
+             "locator_size", read_ctx.src_loc_.size_);
+  } else if (read_ctx.src_loc_.is_mem_external_lob()) {
+    // External is always binary, so character length equals byte length.
+    if (OB_FAIL(get_external_lob_byte_length_(read_ctx, char_len))) {
+      LOG_WARN("get_external_lob_byte_length_ failed", KR(ret), KPC(&read_ctx), K(char_len));
+    }
   } else if (OB_FAIL(handler.init(&meta_manager_, ObLobQueryLengthHandler::CHAR_LENGTH))) {
     LOG_WARN("failed to init handler", KR(ret), K(read_ctx));
   } else if (OB_FAIL(handler.execute())) {
@@ -836,12 +882,72 @@ int ObLobManager::get_byte_length(ObLobReadContext &read_ctx, uint64_t &byte_len
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", KR(ret), K(read_ctx));
+  } else if (OB_UNLIKELY(!read_ctx.src_loc_.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("failed to check source lob locator", KR(ret), K(read_ctx.tablet_id_),
+             "locator_size", read_ctx.src_loc_.size_);
+  } else if (read_ctx.src_loc_.is_mem_external_lob()) {
+    if (OB_FAIL(get_external_lob_byte_length_(read_ctx, byte_len))) {
+      LOG_WARN("get_external_lob_byte_length_ failed", KR(ret), KPC(&read_ctx), K(byte_len));
+    }
   } else if (OB_FAIL(handler.init(&meta_manager_, ObLobQueryLengthHandler::BYTE_LENGTH))) {
     LOG_WARN("failed to init handler", KR(ret), K(read_ctx));
   } else if (OB_FAIL(handler.execute())) {
     LOG_WARN("failed to execute handler", KR(ret), K(read_ctx));
   } else {
     byte_len = handler.result_;
+  }
+  return ret;
+}
+
+int ObLobManager::get_external_lob_byte_length_(
+    const ObLobReadContext &read_ctx,
+    uint64_t &byte_len)
+{
+  int ret = OB_SUCCESS;
+  ObExternalBlobInfo info;
+  ObString head_etag;
+  if (OB_UNLIKELY(read_ctx.src_loc_.is_external_temp_lob())) {
+    ret = OB_NOT_SUPPORTED;
+    // Reject direct reads of temporary external LOBs and report the error to the user.
+    // Check at shared read entry points to avoid duplicating checks across SQL functions.
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "reading a temporary external LOB");
+    LOG_WARN("reading a temporary external lob is not supported", KR(ret),
+             K(read_ctx.tablet_id_), "locator_size", read_ctx.src_loc_.size_);
+  } else if (UINT64_MAX != read_ctx.byte_size_) {
+    // Reuse the length resolved for this read without changing the source locator.
+    byte_len = read_ctx.byte_size_;
+  } else if (OB_FAIL(read_ctx.src_loc_.get_external_lob_info(info))) {
+    LOG_WARN("failed to get external lob descriptor", KR(ret),
+             K(read_ctx.tablet_id_), "locator_size", read_ctx.src_loc_.size_);
+  } else if (info.has_length_) {
+    byte_len = info.length_;
+  } else {
+    share::ObBackupStorageInfo access_info;
+    common::ObIODFileStat statbuf(ObExternalIoAdapter::get_tenant_id());
+    if (OB_ISNULL(read_ctx.access_ctx_)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "reading external LOB without SQL access context");
+      LOG_WARN("external lob access provider is unavailable for length query", KR(ret),
+               K(read_ctx.tablet_id_), KP(read_ctx.access_ctx_));
+    } else if (OB_FAIL(read_ctx.access_ctx_->get_external_access_info(info.url_, access_info))) {
+      LOG_WARN("failed to resolve external lob LOCATION", KR(ret),
+               K(read_ctx.tablet_id_), "url_length", info.url_.length());
+    } else if (OB_FAIL(ObExternalIoAdapter::get_file_stat(info.url_, &access_info, statbuf))) {
+      LOG_WARN("failed to HEAD external lob", KR(ret), K(read_ctx.tablet_id_), K(read_ctx.timeout_));
+    } else if (OB_UNLIKELY(statbuf.size_ < 0)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid external object length", KR(ret), K(statbuf.size_), K(read_ctx.tablet_id_));
+    } else if (FALSE_IT(head_etag = ObString(statbuf.etag_.length(), statbuf.etag_.ptr()))) {
+    // HEAD responses may include double quotes around the ETag.
+    } else if (!info.etag_.empty()
+               && !info.etag_.compare_equal(ObLobUtil::split_etag_quotes(head_etag))) {
+      ret = OB_OBJECT_STORAGE_CONDITION_NOT_MATCH;
+      LOG_USER_ERROR(OB_OBJECT_STORAGE_CONDITION_NOT_MATCH, "ETag mismatch while reading external LOB");
+      LOG_WARN("external object etag does not match", KR(ret), K(read_ctx.tablet_id_), K(info.etag_), K(statbuf.etag_));
+    } else {
+      byte_len = static_cast<uint64_t>(statbuf.size_);
+    }
   }
   return ret;
 }
@@ -863,7 +969,29 @@ int ObLobManager::get_lob_summary_info(
   return ret;
 }
 
-int ObLobManager::prepare_outrow_locator_(ObLobInsertContext &insert_ctx, const ObLobId &reuse_lob_id)
+int ObLobManager::get_meta_summary_extra_info(
+    ObLobReadContext &read_ctx,
+    ObLobMetaExtraInfo &extra_info)
+{
+  int ret = OB_SUCCESS;
+  ObLobMetaInfo summary;
+  extra_info.reset();
+  if (OB_ISNULL(read_ctx.allocator_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("lob summary allocator is null", KR(ret), KP(read_ctx.allocator_), K(read_ctx.tablet_id_));
+  } else if (OB_FAIL(get_lob_summary_info(read_ctx, summary))) {
+    LOG_WARN("failed to read lob summary", KR(ret), K(read_ctx.tablet_id_), K(read_ctx.store_column_idx_));
+  } else if (OB_FAIL(extra_info.deserialize(*read_ctx.allocator_, summary.lob_extra_info_))) {
+    LOG_WARN("failed to deserialize lob summary", KR(ret), K(summary.lob_id_),
+             "extra_info_length", summary.lob_extra_info_.length());
+  } else if (OB_UNLIKELY(ObLobMetaExtraInfo::LOB_META_SUMMARY != extra_info.extra_info_type_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid lob summary type", KR(ret), K(summary.lob_id_), K(extra_info.extra_info_type_));
+  }
+  return ret;
+}
+
+int ObLobManager::prepare_outline_locator_(ObLobInsertContext &insert_ctx, const ObLobId &reuse_lob_id)
 {
   int ret = OB_SUCCESS;
   ObLobDiskLocatorBuilder loc_builder;
@@ -915,15 +1043,17 @@ int ObLobManager::alloc_lob_id_(ObLobInsertContext &insert_ctx, ObLobId &lob_id)
       lob_id.set_auto_inc_id(insert_ctx.data_row_->storage_datums_[0].get_uint64());
     }
   } else {
-    uint64_t auto_inc_id = 0;
-    if (OB_FAIL(meta_manager_.fetch_lob_id(insert_ctx, auto_inc_id))) {
-      LOG_WARN("get lob id failed.", K(ret), K(insert_ctx));
+    uint64_t tablet_inc_id = 0;
+    // TODO by renhe: fetch_tablet_inc_id may alloc tablet_inc_id from splited new tablet_id,
+    //                instead of insert_ctx.lob_meta_tablet_id_.id()
+    if (OB_FAIL(ObLobUtil::fetch_tablet_inc_id(insert_ctx, tablet_inc_id))) {
+      LOG_WARN("get tablet inc id failed", K(ret), K(insert_ctx));
     } else if (!insert_ctx.lob_meta_tablet_id_.is_valid()) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("lob_meta_tablet_id is invalid", K(ret), K(insert_ctx));
     } else {
       lob_id.set_tablet_id(insert_ctx.lob_meta_tablet_id_.id());
-      lob_id.set_auto_inc_id(auto_inc_id);
+      lob_id.set_auto_inc_id(tablet_inc_id);
     }
   }
   return ret;

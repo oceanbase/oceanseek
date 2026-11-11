@@ -1487,7 +1487,9 @@ int ObOnDemandSchemaGetterGuard::get_index_meta_infos_with_data_table_id(
       LOG_WARN("failed to get full data table schema", KR(ret), K(tenant_id), K(data_table_id));
     } else if (OB_ISNULL(data_full_table_schema)) {
       ret = OB_TABLE_NOT_EXIST;
-    } else if (!data_full_table_schema->is_table() && !data_full_table_schema->is_tmp_table()) {
+    } else if (!data_full_table_schema->is_table()
+               && !data_full_table_schema->is_tmp_table()
+               && !data_full_table_schema->is_aux_outtable_lob_control_table()) {
       // not a data table
     } else if (OB_FAIL(data_full_table_schema->get_simple_index_infos(simple_index_infos))) {
       LOG_WARN("failed to get simple index infos", KR(ret), K(tenant_id), K(data_table_id));

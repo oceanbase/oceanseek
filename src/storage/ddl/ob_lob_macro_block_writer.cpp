@@ -210,7 +210,7 @@ int ObLobMacroBlockWriter::init(const ObWriteMacroParam &param,
       } else if (OB_FAIL(lob_id_generator_.init(slice_idx_ * ObTabletSliceParam::LOB_ID_SEQ_INTERVAL, // start
                                                 ObTabletSliceParam::LOB_ID_SEQ_INTERVAL, // interval
                                                 param.slice_count_ * ObTabletSliceParam::LOB_ID_SEQ_INTERVAL))) { // step
-        LOG_WARN("init lob id generator failed", K(param));
+        LOG_WARN("init lob id generator failed", KR(ret), K(param));
       }
     }
 
@@ -281,7 +281,10 @@ int ObLobMacroBlockWriter::write(const ObColumnSchemaItem &column_schema, const 
     lob_storage_param.inrow_threshold_ = lob_inrow_threshold_;
     lob_storage_param.is_index_table_ = param_.ddl_table_schema_.table_item_.is_index_table_;
     lob_storage_param.is_rowkey_col_ = column_schema.is_rowkey_column_;
-    if (lob_id_cache_.remain_count() < lob_column_count_ && OB_FAIL(switch_lob_id_cache())) {
+    // External references consume a LOB ID and a separate sequence from the same cache.
+    const int64_t required_id_count = 2;  // ObLobID, External Lob Marco Seq ID
+    if (lob_id_cache_.remain_count() < lob_column_count_ * required_id_count
+        && OB_FAIL(switch_lob_id_cache())) {
       LOG_WARN("switch lob id cache failed", K(ret), K(lob_id_cache_), K(lob_column_count_), K(lob_id_generator_));
     } else {
       const int64_t timeout_ts = ObTimeUtility::fast_current_time()

@@ -351,6 +351,16 @@ OB_TX_SERIALIZE_MEMBER(ObTxMultiDataSourceLog, compat_bytes_, /* 1 */ data_);
 
 OB_TX_SERIALIZE_MEMBER(ObTxDirectLoadIncLog, compat_bytes_, /* 1 */ ddl_log_type_, /* 2 */ log_buf_, /* 3 */ batch_key_);
 
+OB_TX_SERIALIZE_MEMBER(ObTxLobOutTableDataLog,
+                       compat_bytes_,
+                       /* 1 */ lob_aux_table_id_,
+                       /* 2 */ lob_operation_seq_no_,
+                       /* 3 */ seq_id_,
+                       /* 4 */ lob_id_,
+                       /* 5 */ macro_id_,
+                       /* 6 */ is_logging_,
+                       /* 7 */ data_);
+
 int ObTxActiveInfoLog::before_serialize()
 {
   int ret = OB_SUCCESS;
@@ -628,6 +638,28 @@ int ObTxDirectLoadIncLog::before_serialize()
   return ret;
 }
 
+int ObTxLobOutTableDataLog::before_serialize()
+{
+  int ret = OB_SUCCESS;
+  if (compat_bytes_.is_inited()) {
+    if (OB_FAIL(compat_bytes_.set_all_member_need_ser())) {
+      TRANS_LOG(WARN, "reset all compat bytes valid failed", K(ret));
+    }
+  } else if (OB_FAIL(compat_bytes_.init(7))) {
+    TRANS_LOG(WARN, "init compat bytes failed", K(ret));
+  }
+  if (OB_SUCC(ret)) {
+    TX_NO_NEED_SER(false, 1, compat_bytes_);
+    TX_NO_NEED_SER(false, 2, compat_bytes_);
+    TX_NO_NEED_SER(false, 3, compat_bytes_);
+    TX_NO_NEED_SER(false, 4, compat_bytes_);
+    TX_NO_NEED_SER(false, 5, compat_bytes_);
+    TX_NO_NEED_SER(false, 6, compat_bytes_);
+    TX_NO_NEED_SER(false, 7, compat_bytes_);
+  }
+  return ret;
+}
+
 
 // ============================== Tx Log Body ===========================
 
@@ -645,6 +677,7 @@ const ObTxLogType ObTxRollbackToLog::LOG_TYPE = ObTxLogType::TX_ROLLBACK_TO_LOG;
 const ObTxLogType ObTxMultiDataSourceLog::LOG_TYPE = ObTxLogType::TX_MULTI_DATA_SOURCE_LOG;
 const ObTxLogType ObTxDirectLoadIncLog::LOG_TYPE = ObTxLogType::TX_DIRECT_LOAD_INC_LOG;
 const ObTxLogType ObTxDirectLoadIncMajorLog::LOG_TYPE = ObTxLogType::TX_DIRECT_LOAD_INC_MAJOR_LOG;
+const ObTxLogType ObTxLobOutTableDataLog::LOG_TYPE = ObTxLogType::TX_LOB_OUTTABLE_DATA_LOG;
 
 int ObTxRedoLog::set_mutator_buf(char *buf)
 {
@@ -1170,6 +1203,25 @@ int ObTxRollbackToLog::ob_admin_dump(ObAdminMutatorStringArg &arg)
   } else {
     arg.writer_ptr_->dump_key("<TxRollbackToLog>");
     arg.writer_ptr_->start_object();
+    arg.writer_ptr_->dump_key("Members");
+    ObCStringHelper helper;
+    arg.writer_ptr_->dump_string(helper.convert(*this));
+    arg.writer_ptr_->end_object();
+  }
+  return ret;
+}
+
+int ObTxLobOutTableDataLog::ob_admin_dump(ObAdminMutatorStringArg &arg)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(arg.writer_ptr_)) {
+    ret = OB_INVALID_ARGUMENT;
+    TRANS_LOG(WARN, "invalid arg writer is null", K(arg), K(ret));
+  } else {
+    arg.writer_ptr_->dump_key("###<TxLobOuttableDataLog>");
+    arg.writer_ptr_->start_object();
+    arg.writer_ptr_->dump_key("Size");
+    arg.writer_ptr_->dump_int64(get_serialize_size());
     arg.writer_ptr_->dump_key("Members");
     ObCStringHelper helper;
     arg.writer_ptr_->dump_string(helper.convert(*this));

@@ -12656,13 +12656,13 @@ int ObRpcRemoteWriteDDLIncCommitLogArg::init(const uint64_t tenant_id,
   } else if (OB_UNLIKELY(!is_incremental_direct_load(direct_load_type))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("only support incremental direct load type", KR(ret), K(direct_load_type));
-  } else if (OB_UNLIKELY(is_data_version_support_lob_direct_load(data_format_version)
+  } else if (OB_UNLIKELY(ObLobUtil::is_data_version_support_lob_direct_load(data_format_version)
                          && lob_meta_tablet_id.is_valid() != lob_piece_tablet_id.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("lob auxiliary tablet ids are not paired", KR(ret),
         K(lob_meta_tablet_id), K(lob_piece_tablet_id), K(data_format_version));
   } else if (OB_UNLIKELY(lob_piece_tablet_id.is_valid()
-                         && !is_data_version_support_lob_direct_load(data_format_version))) {
+                         && !ObLobUtil::is_data_version_support_lob_direct_load(data_format_version))) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("data version does not support lob direct load", KR(ret),
         K(lob_piece_tablet_id), K(data_format_version));

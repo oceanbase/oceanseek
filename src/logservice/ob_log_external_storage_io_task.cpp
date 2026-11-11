@@ -308,7 +308,7 @@ int ObLogExternalStorageIOTaskHandleAdapter::get_file_size(const ObString &uri,
 {
   int ret = OB_SUCCESS;
   file_size = 0;
-  ObIODFileStat file_stat;
+  ObIODFileStat file_stat(common::get_storage_io_tenant_id());
   ObIODevice *io_device = NULL;
   if (OB_FAIL(get_and_init_io_device(uri, storage_info, io_device))) {
     CLOG_LOG(WARN, "get_io_device failed", K(uri), KP(io_device));

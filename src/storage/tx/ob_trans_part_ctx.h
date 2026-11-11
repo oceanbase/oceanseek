@@ -33,6 +33,11 @@ namespace common
 class ObAddr;
 }
 
+namespace blocksstable
+{
+class MacroBlockId;
+}
+
 namespace storage
 {
 struct ObStoreRowLockState;
@@ -460,6 +465,14 @@ public:
   // for instant logging and freezing
   int submit_redo_after_write(const bool force, const ObTxSEQ &write_seq_no);
   int submit_redo_log_for_freeze(const uint32_t freeze_clock);
+  int submit_lob_outtable_data_log(const uint64_t lob_aux_table_id,
+                                   const ObTxSEQ &lob_operation_seq_no,
+                                   const common::ObString &seq_id,
+                                   const common::ObLobId &lob_id,
+                                   const blocksstable::MacroBlockId &macro_id,
+                                   const bool is_logging,
+                                   const common::ObString &data,
+                                   share::SCN &scn);
   int submit_direct_load_inc_redo_log(storage::ObDDLRedoLog &ddl_redo_log,
                                  logservice::AppendCb *extra_cb,
                                  const int64_t replay_hint,

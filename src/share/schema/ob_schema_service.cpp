@@ -392,6 +392,7 @@ int AlterTableSchema::assign(const ObTableSchema &src_schema)
       session_id_ = src_schema.session_id_;
       compressor_type_ = src_schema.compressor_type_;
       lob_inrow_threshold_ = src_schema.lob_inrow_threshold_;
+      lob_intable_threshold_ = src_schema.lob_intable_threshold_;
       is_column_store_supported_ = src_schema.is_column_store_supported_;
       max_used_column_group_id_ = src_schema.max_used_column_group_id_;
       micro_index_clustered_ = src_schema.micro_index_clustered_;

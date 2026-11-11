@@ -15,6 +15,11 @@
 # Tablegroup (optional):
 #   tablegroup_name = 'shared_meta'    # partitioned tables (hash by ls_id, 64 partitions)
 #   tablegroup_name = 'oceanbase'  # non-partitioned tables
+# 局部索引（可选）：仅支持普通非唯一局部索引。
+#   index = {'索引名': {
+#       'index_columns': ['索引列名'],
+#       'store_columns': ['存储列名'],
+#   }}
 #
 # Shared-storage SS Meta V2 tables (moved from inner table 596/597/598).
 
@@ -82,4 +87,32 @@ def_table_schema(
     ('gmt_create', 'timestamp', 'true', 'null'),
     ('gmt_modified', 'timestamp', 'true', 'null'),
   ],
+)
+
+# Tenant-level OUTTABLE LOB control table.
+def_table_schema(
+  owner = 'lob',
+  database_name = 'oceanbase',
+  table_name = '__all_outtable_lob_control',
+  table_type = 'aux_outtable_lob_control',
+  partition_columns = ['hash'],
+  partition_expr = ['hash', 'hash', 128],
+  rowkey_columns = [
+    ('macro_id', 'varbinary:128', 'false', ''),
+    ('hash', 'bigint unsigned', 'false', ''),
+  ],
+  normal_columns = [
+    ('status', 'bigint', 'false', ''),
+    ('last_modify_time', 'timestamp:6', 'false', ''),
+    ('info', 'varbinary:OB_MAX_VARBINARY_LENGTH', 'true', 'NULL'),
+  ],
+  index = {
+    'idx_lob_ctrl_hash_status': {
+      'index_columns': ['hash', 'status', 'macro_id'],
+    },
+    'idx_lob_ctrl_status_time': {
+      'index_columns': ['status', 'last_modify_time', 'macro_id'],
+      'store_columns': ['info'],
+    },
+  },
 )

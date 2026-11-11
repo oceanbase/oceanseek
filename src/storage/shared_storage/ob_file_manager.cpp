@@ -618,7 +618,7 @@ int ObBaseFileManager::get_local_file_length(
     // thus, these is no need to get file length from local cache
     file_length = 0;
   } else {
-    ObIODFileStat statbuf;
+    ObIODFileStat statbuf(tenant_id_);
     ObPathContext ctx;
     if (OB_FAIL(ctx.set_file_ctx(file_id, ls_epoch_id, true/*is_local_cache*/, GCONF.observer_id, ls_id))) {
       LOG_WARN("fail to convert file path", KR(ret), K(ctx));
@@ -1447,6 +1447,7 @@ int ObTenantFileManager::calc_macro_block_disk_space(
   char shared_inc_major_dir[OB_MAX_FILE_PATH_LENGTH] = {0};
   char shared_tablet_sub_meta_dir[OB_MAX_FILE_PATH_LENGTH] = {0};
   char external_table_file_dir[OB_MAX_FILE_PATH_LENGTH] = {0};
+  char external_lob_cache_dir[OB_MAX_FILE_PATH_LENGTH] = {0};
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("file manager has not been inited", KR(ret), K_(is_inited), K_(tenant_id));
@@ -1494,6 +1495,12 @@ int ObTenantFileManager::calc_macro_block_disk_space(
     LOG_WARN("fail to get external table file dir", KR(ret));
   } else if (OB_FAIL(calc_disk_space(external_table_file_dir, ObSSMacroCacheType::MACRO_BLOCK, start_calc_time_s, calibrate_res))) {
     LOG_WARN("fail to calc disk space", KR(ret), K(external_table_file_dir));
+  } else if (OB_FAIL(OB_DIR_MGR.get_external_lob_cache_dir(external_lob_cache_dir,
+                                                           sizeof(external_lob_cache_dir),
+                                                           MTL_ID(), MTL_EPOCH_ID()))) {
+    LOG_WARN("fail to get external lob cache dir", KR(ret));
+  } else if (OB_FAIL(calc_disk_space(external_lob_cache_dir, ObSSMacroCacheType::MACRO_BLOCK, start_calc_time_s, calibrate_res))) {
+    LOG_WARN("fail to calc disk space", KR(ret), K(external_lob_cache_dir));
   } else {
     LOG_INFO("succ to calc macro block disk space", K(calibrate_res));
   }

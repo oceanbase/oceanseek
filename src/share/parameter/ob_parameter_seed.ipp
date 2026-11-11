@@ -3133,6 +3133,10 @@ DEF_TIME(_shared_meta_operation_timeout, OB_TENANT_PARAMETER, "1h", "[0,365d]",
         "The timeout for shared meta operations. If one shared meta operation exceeds this timeout, "
         "the shared meta will be GC. 0 is special, means disable fail gc. Range: [0, 365d]",
         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+DEF_TIME(_outtable_lob_fail_gc_timeout, OB_TENANT_PARAMETER, "1h", "[0,365d]",
+        "The timeout for outtable LOB Fail GC. Expired DOING rows are marked FAIL and expired FAIL "
+        "rows are deleted. 0 disables outtable LOB Fail GC. Range: [0, 365d]",
+        ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_TIME(_atomic_protocol_trans_timeout, OB_TENANT_PARAMETER, "60s", "[1s,)",
         "The transaction timeout for atomic protocol."
         "Range: [1s, )",

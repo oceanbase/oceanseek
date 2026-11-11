@@ -23,6 +23,7 @@ namespace oceanbase
 namespace storage
 {
 class ObDMLBaseParam;
+struct ObOuttableLobControlKey;
 }
 namespace sql
 {
@@ -89,6 +90,7 @@ public:
                        K_(is_batch_stmt),
                        K_(is_insert_up),
                        K_(is_table_api),
+                       K_(allow_outtable_lob),
                        K_(is_main_table_in_fts_ddl),
                        K_(tz_info),
                        K_(table_param),
@@ -116,7 +118,7 @@ public:
   common::ObFixedArray<transaction::ObEncryptMetaCache, common::ObIAllocator> encrypt_meta_;
   union {
     uint64_t flags_;
-    struct {
+    struct { // FARM COMPAT WHITELIST
       uint64_t is_total_quantity_log_           : 1;
       uint64_t is_ignore_                       : 1;
       uint64_t is_batch_stmt_                   : 1;
@@ -138,7 +140,9 @@ public:
       // Marks the optional trailing IVF metadata explicitly. Derived CtDefs
       // append their own fields, so remaining buffer bytes are not a boundary.
       uint64_t has_ivf_dml_ctdef_               : 1;
-      uint64_t reserved_                        : 43; //add new flag before reserved_
+      // Only SQL DML paths that complete Control rows may enable OutTable writes.
+      uint64_t allow_outtable_lob_              : 1;
+      uint64_t reserved_                        : 42; //add new flag before reserved_
       uint64_t compat_version_                  : 4; //prohibited to insert new flags between compat_version_ and reserved_
     };
   };
@@ -270,7 +274,8 @@ public:
       is_duplicated_(false),
       direct_insert_task_id_(0),
       use_put_(false),
-      ddl_task_id_(0)
+      ddl_task_id_(0),
+      outtable_lob_control_keys_(nullptr)
   { }
 
   INHERIT_TO_STRING_KV("ObDASBaseRtDef", ObDASDMLBaseRtDef,
@@ -290,6 +295,7 @@ public:
   // use put, only use in obkv for overlay writting.
   bool use_put_;
   int64_t ddl_task_id_;
+  common::ObIArray<storage::ObOuttableLobControlKey> *outtable_lob_control_keys_;
 };
 typedef DASDMLRtDefArray DASInsRtDefArray;
 
@@ -310,8 +316,10 @@ typedef DASDMLCtDefArray DASUpdCtDefArray;
 struct ObDASUpdRtDef : ObDASDMLBaseRtDef
 {
   ObDASUpdRtDef()
-    : ObDASDMLBaseRtDef(DAS_OP_TABLE_UPDATE)
+    : ObDASDMLBaseRtDef(DAS_OP_TABLE_UPDATE),
+      outtable_lob_control_keys_(nullptr)
   { }
+  common::ObIArray<storage::ObOuttableLobControlKey> *outtable_lob_control_keys_;
 };
 typedef DASDMLRtDefArray DASUpdRtDefArray;
 

@@ -2352,7 +2352,9 @@ int ObIndexBuilder::generate_schema(
     //do some check
     if (OB_SUCC(ret)) {
       if (!GCONF.enable_sys_table_ddl) {
-        if (!data_schema.is_user_table() && !data_schema.is_tmp_table()) {
+        if (!data_schema.is_user_table()
+            && !data_schema.is_tmp_table()
+            && !(arg.is_inner_ && data_schema.is_aux_outtable_lob_control_table())) {
           ret = OB_ERR_WRONG_OBJECT;
           ObCStringHelper helper;
           LOG_USER_ERROR(OB_ERR_WRONG_OBJECT, helper.convert(arg.database_name_),
@@ -2639,6 +2641,7 @@ int ObIndexBuilder::generate_schema(
         schema.set_table_mode_flag(data_schema.get_table_mode_flag());
       }
       schema.set_lob_inrow_threshold(data_schema.get_lob_inrow_threshold());
+      schema.set_lob_intable_threshold(data_schema.get_lob_intable_threshold());
       schema.set_table_state_flag(data_schema.get_table_state_flag());
       schema.set_mv_mode(data_schema.get_mv_mode());
       schema.set_duplicate_attribute(data_schema.get_duplicate_scope(), data_schema.get_duplicate_read_consistency());
@@ -3064,7 +3067,6 @@ int ObIndexBuilder::set_index_table_options(const obrpc::ObCreateIndexArg &arg,
           LOG_WARN("fail to set fts index params to index params", K(ret), K(fts_index_params));
         }
       }
-    } else if (is_vec_ivf_index(schema.get_index_type()) && FALSE_IT(schema.set_lob_inrow_threshold(OB_MAX_LOB_INROW_THRESHOLD))) {
     } else if (OB_FAIL(schema.set_storage_cache_policy(arg.index_option_.storage_cache_policy_))) {
       LOG_WARN("set storage cache policy failed", K(ret), "storage_cache_policy", arg.index_option_.storage_cache_policy_);
     }

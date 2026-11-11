@@ -8,6 +8,7 @@
 #include "sql/das/ob_das_dml_ctx_define.h"
 #include "sql/das/ob_das_ref.h"
 #include "sql/das/ob_das_scan_op.h"
+#include "storage/lob/store/ob_outtable_lob_control_ctx.h"
 namespace oceanbase
 {
 namespace sql
@@ -1127,19 +1128,24 @@ struct ObDMLRtCtx
       op_(op),
       exec_ctx_(exec_ctx),
       das_task_memory_size_(0),
-      das_parallel_task_size_(0)
+      das_parallel_task_size_(0),
+      outtable_lob_control_ctx_()
   { }
 
-  void reuse()
-  {
-    das_ref_.reuse();
-    das_task_memory_size_ = 0;
-    das_parallel_task_size_ = 0;
-  }
+  ~ObDMLRtCtx() = default;
 
-  void cleanup()
+  void reuse();
+  void cleanup();
+  int complete_outtable_lob_control_keys();
+  int prepare_outtable_lob_control_keys(
+      const ObDASInsCtDef &ins_ctdef,
+      ObDASInsRtDef &ins_rtdef);
+  int prepare_outtable_lob_control_keys(
+      const ObDASUpdCtDef &upd_ctdef,
+      ObDASUpdRtDef &upd_rtdef);
+  const common::ObIArray<storage::ObOuttableLobControlKey> *get_outtable_lob_control_keys() const
   {
-    das_ref_.reset();
+    return outtable_lob_control_ctx_.get_keys();
   }
 
   common::ObIAllocator &get_das_alloc() { return das_ref_.get_das_alloc(); }
@@ -1176,6 +1182,12 @@ struct ObDMLRtCtx
   ObExecContext &exec_ctx_;
   int64_t das_task_memory_size_;
   int64_t das_parallel_task_size_;
+
+private:
+  int prepare_outtable_lob_control_keys_(
+      const ObDASDMLBaseCtDef &dml_ctdef,
+      common::ObIArray<storage::ObOuttableLobControlKey> *&control_keys);
+  storage::ObOuttableLobControlCtx outtable_lob_control_ctx_;
 };
 
 template <typename T>

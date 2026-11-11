@@ -2330,6 +2330,12 @@ int ObDDLService::set_new_table_options(
   } else if (OB_FAIL(set_raw_table_options(
           alter_table_schema, new_table_schema, schema_guard, need_update_index_table))) {
     LOG_WARN("fail to set raw table options", K(ret), K(new_table_schema), K(orig_table_schema));
+  } else if (new_table_schema.get_lob_intable_threshold()
+             < new_table_schema.get_lob_inrow_threshold()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("lob intable threshold is less than lob inrow threshold", KR(ret), K(new_table_schema));
+    LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                   "lob intable threshold should be greater than or equal to lob inrow threshold");
   } else if (ObDuplicateScope::DUPLICATE_SCOPE_NONE != new_table_schema.get_duplicate_scope()
              && OB_INVALID_ID != new_table_schema.get_tablegroup_id()) {
     ret = OB_NOT_SUPPORTED;
@@ -2833,6 +2839,20 @@ int ObDDLService::set_raw_table_options(
             LOG_WARN("fail to check table has vector ivf index", K(ret), K(tenant_id));
           } else {
             new_table_schema.set_lob_inrow_threshold(alter_table_schema.get_lob_inrow_threshold());
+            need_update_index_table = true;
+          }
+          break;
+        }
+        case ObAlterTableArg::LOB_INTABLE_THRESHOLD: {
+          uint64_t compat_version = OB_INVALID_VERSION;
+          if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, compat_version))) {
+            LOG_WARN("get min data version failed", K(ret), K(tenant_id));
+          } else if (compat_version < DATA_VERSION_4_6_3_1) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_WARN("lob intable threshold is not supported before 4.6.3.1", KR(ret), K(compat_version));
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "lob intable threshold is not supported before 4.6.3.1");
+          } else {
+            new_table_schema.set_lob_intable_threshold(alter_table_schema.get_lob_intable_threshold());
             need_update_index_table = true;
           }
           break;
@@ -18098,7 +18118,7 @@ int ObDDLService::do_offline_ddl_in_trans(obrpc::ObAlterTableArg &alter_table_ar
       if (OB_SUCC(ret)
           && is_double_table_long_running_ddl(ddl_type)
           && new_table_schema.has_lob_column(true/*ignore_unused_column*/)
-          && OB_FAIL(check_data_version_support_lob_direct_load(
+          && OB_FAIL(ObLobUtil::check_data_version_support_lob_direct_load(
               tenant_data_version, "offline DDL"))) {
         LOG_WARN("data version does not support offline DDL with lob column",
                  K(ret), K(ddl_type), K(tenant_data_version));

@@ -230,7 +230,9 @@ int ObOriginalSchemaGetterGuard::get_index_schemas_with_data_table_id(
     LOG_WARN("fail to get table schema", KR(ret), K(tenant_id), K(data_table_id));
   } else if (OB_ISNULL(table_schema)) {
     ret = OB_TABLE_NOT_EXIST;
-  } else if ((table_schema->is_table() || table_schema->is_tmp_table())
+  } else if ((table_schema->is_table()
+              || table_schema->is_tmp_table()
+              || table_schema->is_aux_outtable_lob_control_table())
              && OB_FAIL(mgr->get_aux_schemas(tenant_id, data_table_id, schemas, USER_INDEX))) {
     LOG_WARN("fail to get aux schemas", KR(ret), K(tenant_id), K(data_table_id));
   }

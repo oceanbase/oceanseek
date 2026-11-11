@@ -50,6 +50,7 @@ const char *const SCHEDULER_DIR_STR = "scheduler";
 const char *const SHARED_TABLET_SSTABLE_DIR_STR = "sstable";
 const char *const IO_DETECT_FILE_NAME = "io_detect_file";
 const char *const EXTERNAL_TABLE_FILE_DIR_STR = "external_table_file";
+const char *const EXTERNAL_LOB_CACHE_DIR_STR = "external_lob_cache";
 const char *const MACRO_CACHE_CKPT_DIR_STR = "macro_cache_ckpt";
 const char *const CKM_ERROR_DIR_STR = "checksum_error_macro";
 const char *const OP_ID_DIR_STR = "op";

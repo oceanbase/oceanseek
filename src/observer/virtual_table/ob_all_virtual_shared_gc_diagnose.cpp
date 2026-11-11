@@ -28,7 +28,10 @@ static const ObMarkSweepGroupType GROUPS[] = {
 static const ObSSMarkSweepDiagFileType TYPES[] = {
   ObSSMarkSweepDiagFileType::MACROS,
   ObSSMarkSweepDiagFileType::TABLET_META_SCNS,
-  ObSSMarkSweepDiagFileType::STUDY_RESULTS
+  ObSSMarkSweepDiagFileType::STUDY_RESULTS,
+  ObSSMarkSweepDiagFileType::LOB_META_KEPT,
+  ObSSMarkSweepDiagFileType::LOB_CTRL_CANDIDATE,
+  ObSSMarkSweepDiagFileType::LOB_CTRL_DIFF
 };
 static const int64_t GROUP_NUM = ARRAYSIZEOF(GROUPS);
 static const int64_t TYPE_NUM = ARRAYSIZEOF(TYPES);
@@ -58,7 +61,7 @@ void ObAllVirtualSharedGCDiagnose::reset_state_()
   round_id_ = -1;
   target_tenant_id_ = OB_INVALID_TENANT_ID;
   has_group_filter_ = false;
-  group_filter_ = ObMarkSweepGroupType::DEL;
+  group_filter_ = DiagGroupType::DEL;
   has_type_filter_ = false;
   type_filter_ = ObSSMarkSweepDiagFileType::MACROS;
   has_ls_id_filter_ = false;
@@ -79,6 +82,8 @@ void ObAllVirtualSharedGCDiagnose::reset_state_()
   is_cur_record_decoded_ = false;
   cur_macros_.reset();
   cur_meta_scns_.reset();
+  cur_lob_meta_rows_.reset();
+  cur_lob_ctrl_rows_.reset();
   cur_study_results_.reset();
   item_idx_ = 0;
   batch_allocator_.reset();
@@ -114,15 +119,36 @@ int ObAllVirtualSharedGCDiagnose::inner_get_next_row(ObNewRow *&row)
   return ret;
 }
 
-const char *ObAllVirtualSharedGCDiagnose::group_to_str_(const ObMarkSweepGroupType group)
+ObAllVirtualSharedGCDiagnose::DiagGroupType ObAllVirtualSharedGCDiagnose::get_diag_group_(
+    const ObMarkSweepGroupType group,
+    const ObSSMarkSweepDiagFileType type)
+{
+  DiagGroupType diag_group = DiagGroupType::MAX;
+  if (type >= ObSSMarkSweepDiagFileType::LOB_META_KEPT
+      && type < ObSSMarkSweepDiagFileType::MAX) {
+    diag_group = DiagGroupType::LOB_USER_GC;
+  } else if (ObMarkSweepGroupType::DEL == group) {
+    diag_group = DiagGroupType::DEL;
+  } else if (ObMarkSweepGroupType::KEPT == group) {
+    diag_group = DiagGroupType::KEPT;
+  }
+  return diag_group;
+}
+
+const char *ObAllVirtualSharedGCDiagnose::group_to_str_(
+    const ObMarkSweepGroupType group,
+    const ObSSMarkSweepDiagFileType type)
 {
   const char *str = "unknown";
-  if (ObMarkSweepGroupType::DEL == group) {
+  const DiagGroupType diag_group = get_diag_group_(group, type);
+  if (DiagGroupType::DEL == diag_group) {
     str = "del";
-  } else if (ObMarkSweepGroupType::KEPT == group) {
+  } else if (DiagGroupType::KEPT == diag_group) {
     str = "kept";
+  } else if (DiagGroupType::LOB_USER_GC == diag_group) {
+    str = "lob_user_gc";
   } else {
-    SERVER_LOG_RET(WARN, OB_INVALID_ARGUMENT, "unknown group", K(group));
+    SERVER_LOG_RET(WARN, OB_INVALID_ARGUMENT, "unknown group", K(group), K(type));
   }
   return str;
 }
@@ -134,6 +160,12 @@ const char *ObAllVirtualSharedGCDiagnose::type_to_str_(const ObSSMarkSweepDiagFi
     str = "macros";
   } else if (ObSSMarkSweepDiagFileType::TABLET_META_SCNS == type) {
     str = "tablet_meta_scns";
+  } else if (ObSSMarkSweepDiagFileType::LOB_META_KEPT == type) {
+    str = "lob_meta_kept";
+  } else if (ObSSMarkSweepDiagFileType::LOB_CTRL_CANDIDATE == type) {
+    str = "lob_ctrl_candidate";
+  } else if (ObSSMarkSweepDiagFileType::LOB_CTRL_DIFF == type) {
+    str = "lob_ctrl_diff";
   } else if (ObSSMarkSweepDiagFileType::STUDY_RESULTS == type) {
     str = "study_results";
   } else {
@@ -205,7 +237,7 @@ int ObAllVirtualSharedGCDiagnose::handle_key_range_(ObNewRange &key_range)
     }
   }
 
-  // group (optional): "del"/"kept"
+  // group (optional): "del"/"kept"/"lob_user_gc"
   if (OB_SUCC(ret)) {
     const ObObj &group_low = low[2];
     const ObObj &group_high = high[2];
@@ -213,19 +245,22 @@ int ObAllVirtualSharedGCDiagnose::handle_key_range_(ObNewRange &key_range)
       ObString group_str = group_low.get_string();
       if (0 == group_str.case_compare("del")) {
         has_group_filter_ = true;
-        group_filter_ = ObMarkSweepGroupType::DEL;
+        group_filter_ = DiagGroupType::DEL;
       } else if (0 == group_str.case_compare("kept")) {
         has_group_filter_ = true;
-        group_filter_ = ObMarkSweepGroupType::KEPT;
+        group_filter_ = DiagGroupType::KEPT;
+      } else if (0 == group_str.case_compare("lob_user_gc")) {
+        has_group_filter_ = true;
+        group_filter_ = DiagGroupType::LOB_USER_GC;
       } else {
         ret = OB_INVALID_ARGUMENT;
-        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "group must be 'del' or 'kept'");
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "group must be 'del', 'kept' or 'lob_user_gc'");
         SERVER_LOG(WARN, "invalid group filter", KR(ret), K(group_str));
       }
     }
   }
 
-  // Optional type filter includes macros/tablet_meta_scns/study_results.
+  // type (optional)
   if (OB_SUCC(ret)) {
     const ObObj &type_low = low[3];
     const ObObj &type_high = high[3];
@@ -240,10 +275,18 @@ int ObAllVirtualSharedGCDiagnose::handle_key_range_(ObNewRange &key_range)
       } else if (0 == type_str.case_compare("study_results")) {
         has_type_filter_ = true;
         type_filter_ = ObSSMarkSweepDiagFileType::STUDY_RESULTS;
+      } else if (0 == type_str.case_compare("lob_meta_kept")) {
+        has_type_filter_ = true;
+        type_filter_ = ObSSMarkSweepDiagFileType::LOB_META_KEPT;
+      } else if (0 == type_str.case_compare("lob_ctrl_candidate")) {
+        has_type_filter_ = true;
+        type_filter_ = ObSSMarkSweepDiagFileType::LOB_CTRL_CANDIDATE;
+      } else if (0 == type_str.case_compare("lob_ctrl_diff")) {
+        has_type_filter_ = true;
+        type_filter_ = ObSSMarkSweepDiagFileType::LOB_CTRL_DIFF;
       } else {
         ret = OB_INVALID_ARGUMENT;
-        LOG_USER_ERROR(OB_INVALID_ARGUMENT,
-            "type must be 'macros', 'tablet_meta_scns' or 'study_results'");
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "invalid shared gc diagnose type");
         SERVER_LOG(WARN, "invalid type filter", KR(ret), K(type_str));
       }
     }
@@ -301,7 +344,7 @@ int ObAllVirtualSharedGCDiagnose::list_buckets_(
   if (OB_FAIL(ObSSMarkSweepDiagMgr::build_diag_root_dir(target_tenant_id_, diag_root, sizeof(diag_root)))) {
     SERVER_LOG(WARN, "fail to build diag root dir", KR(ret), K_(target_tenant_id));
   } else if (OB_FAIL(databuff_printf(dir_uri, sizeof(dir_uri), "%s/%s%ld/%s/%s",
-                     diag_root, ROUND_DIR_STR, round_id_, group_to_str_(group), type_to_str_(type)))) {
+                     diag_root, ROUND_DIR_STR, round_id_, group_to_str_(group, type), type_to_str_(type)))) {
     SERVER_LOG(WARN, "fail to build bucket dir uri", KR(ret), K_(round_id));
   } else if (OB_FAIL(ObSSMarkSweepDiagMgr::get_storage_dest_and_id(storage_dest, storage_id))) {
     SERVER_LOG(WARN, "fail to get storage dest and id", KR(ret));
@@ -346,8 +389,12 @@ int ObAllVirtualSharedGCDiagnose::open_next_file_(bool &opened)
   while (OB_SUCC(ret) && !opened && (group_idx_ < GROUP_NUM)) {
     const ObMarkSweepGroupType group = GROUPS[group_idx_];
     const ObSSMarkSweepDiagFileType type = TYPES[type_idx_];
+    const bool is_valid_combination = type < ObSSMarkSweepDiagFileType::LOB_META_KEPT
+        || ObMarkSweepGroupType::DEL == group;
+    const DiagGroupType diag_group = get_diag_group_(group, type);
     // apply group/type filters: skip whole (group, type) that cannot match.
-    const bool is_group_match = (!has_group_filter_ || (group_filter_ == group));
+    const bool is_group_match = is_valid_combination
+        && (!has_group_filter_ || group_filter_ == diag_group);
     const bool is_type_match = (!has_type_filter_ || (type_filter_ == type));
     const bool is_valid_type = (ObSSMarkSweepDiagFileType::STUDY_RESULTS != type
         || ObMarkSweepGroupType::KEPT == group);
@@ -441,16 +488,20 @@ int ObAllVirtualSharedGCDiagnose::advance_cursor_to_next_row_(bool &has_row)
     const ObSSMarkSweepDiagFileType type = TYPES[type_idx_];
     // ensure we have a current decoded record with remaining items.
     if (is_cur_record_decoded_) {
-      ObSSGCTablet tablet;
+      const ObSSGCTablet *tablet = nullptr;
       int64_t item_cnt = 0;
       if (ObSSMarkSweepDiagFileType::MACROS == type) {
-        tablet = cur_macros_.tablet_;
+        tablet = &cur_macros_.tablet_;
         item_cnt = cur_macros_.macro_ids_.count();
       } else if (ObSSMarkSweepDiagFileType::TABLET_META_SCNS == type) {
-        tablet = cur_meta_scns_.tablet_;
+        tablet = &cur_meta_scns_.tablet_;
         item_cnt = cur_meta_scns_.meta_scns_.count();
+      } else if (ObSSMarkSweepDiagFileType::LOB_META_KEPT == type) {
+        item_cnt = cur_lob_meta_rows_.macro_ids_.count();
+      } else if (ObSSMarkSweepDiagMgr::is_lob_ctrl_type(type)) {
+        item_cnt = cur_lob_ctrl_rows_.rows_.count();
       } else if (ObSSMarkSweepDiagFileType::STUDY_RESULTS == type) {
-        tablet = cur_study_results_.tablet_;
+        tablet = &cur_study_results_.tablet_;
         item_cnt = cur_study_results_.study_results_.count();
       } else {
         ret = OB_ERR_UNEXPECTED;
@@ -479,6 +530,8 @@ int ObAllVirtualSharedGCDiagnose::advance_cursor_to_next_row_(bool &has_row)
         record_allocator_.reset();
         cur_macros_.reset();
         cur_meta_scns_.reset();
+        cur_lob_meta_rows_.reset();
+        cur_lob_ctrl_rows_.reset();
         cur_study_results_.reset();
         item_idx_ = 0;
         const ObString &record = cur_records_.at(record_idx_);
@@ -495,6 +548,14 @@ int ObAllVirtualSharedGCDiagnose::advance_cursor_to_next_row_(bool &has_row)
           } else {
             tablet = &cur_meta_scns_.tablet_;
           }
+        } else if (ObSSMarkSweepDiagFileType::LOB_META_KEPT == type) {
+          if (OB_FAIL(ObSSMarkSweepDiagMgr::decode_lob_meta_kept_record(record, cur_lob_meta_rows_))) {
+            SERVER_LOG(WARN, "fail to decode lob meta kept record", KR(ret), K_(record_idx));
+          }
+        } else if (ObSSMarkSweepDiagMgr::is_lob_ctrl_type(type)) {
+          if (OB_FAIL(ObSSMarkSweepDiagMgr::decode_lob_ctrl_record(record, cur_lob_ctrl_rows_))) {
+            SERVER_LOG(WARN, "fail to decode lob ctrl record", KR(ret), K_(record_idx));
+          }
         } else if (ObSSMarkSweepDiagFileType::STUDY_RESULTS == type) {
           if (OB_FAIL(ObSSMarkSweepDiagMgr::decode_study_record(record, cur_study_results_))) {
             SERVER_LOG(WARN, "fail to decode study record", KR(ret), K_(record_idx));
@@ -506,7 +567,7 @@ int ObAllVirtualSharedGCDiagnose::advance_cursor_to_next_row_(bool &has_row)
           SERVER_LOG(WARN, "unexpected type", KR(ret), K(type));
         }
         if (OB_SUCC(ret)) {
-          if (!pass_optional_filters_(*tablet)) {
+          if (!pass_optional_filters_(tablet)) {
             // skip this record entirely.
             ++record_idx_;
             SERVER_LOG(TRACE, "skip record due to optional filters", KR(ret), K_(record_idx));
@@ -528,16 +589,20 @@ int ObAllVirtualSharedGCDiagnose::advance_cursor_to_next_row_(bool &has_row)
   return ret;
 }
 
-bool ObAllVirtualSharedGCDiagnose::pass_optional_filters_(const ObSSGCTablet &tablet) const
+bool ObAllVirtualSharedGCDiagnose::pass_optional_filters_(const ObSSGCTablet *tablet) const
 {
   bool pass = true;
-  if (has_ls_id_filter_ && (tablet.ls_id_.id() != ls_id_filter_)) {
+  if (OB_ISNULL(tablet)) {
+    pass = (!has_ls_id_filter_ || 0 == ls_id_filter_)
+        && (!has_tablet_id_filter_ || 0 == tablet_id_filter_)
+        && (!has_reorg_scn_filter_ || 0 == reorg_scn_filter_);
+  } else if (has_ls_id_filter_ && (tablet->ls_id_.id() != ls_id_filter_)) {
     pass = false;
   } else if (has_tablet_id_filter_
-             && (static_cast<int64_t>(tablet.tablet_id_.id()) != tablet_id_filter_)) {
+             && (static_cast<int64_t>(tablet->tablet_id_.id()) != tablet_id_filter_)) {
     pass = false;
   } else if (has_reorg_scn_filter_
-             && (tablet.transfer_scn_.get_val_for_inner_table_field() != reorg_scn_filter_)) {
+             && (tablet->transfer_scn_.get_val_for_inner_table_field() != reorg_scn_filter_)) {
     pass = false;
   }
   return pass;
@@ -564,6 +629,24 @@ int ObAllVirtualSharedGCDiagnose::construct_cur_value_(ObString &value)
       SERVER_LOG(WARN, "fail to print meta scn", KR(ret), K(scn));
     } else {
       value.assign_ptr(value_buf_, static_cast<int32_t>(pos));
+    }
+  } else if (ObSSMarkSweepDiagFileType::LOB_META_KEPT == type) {
+    const MacroBlockId &macro_id = cur_lob_meta_rows_.macro_ids_.at(item_idx_);
+    const int64_t len = macro_id.to_string(value_buf_, MAX_VALUE_LEN);
+    if (OB_UNLIKELY(len <= 0 || len >= MAX_VALUE_LEN)) {
+      ret = OB_ERR_UNEXPECTED;
+      SERVER_LOG(WARN, "fail to print lob meta macro id", KR(ret), K(macro_id), K(len));
+    } else {
+      value.assign_ptr(value_buf_, static_cast<int32_t>(len));
+    }
+  } else if (ObSSMarkSweepDiagMgr::is_lob_ctrl_type(type)) {
+    const ObSSOuttableLobCtrlCandidate &row = cur_lob_ctrl_rows_.rows_.at(item_idx_);
+    const int64_t len = row.to_string(value_buf_, MAX_VALUE_LEN);
+    if (OB_UNLIKELY(len <= 0 || len >= MAX_VALUE_LEN)) {
+      ret = OB_ERR_UNEXPECTED;
+      SERVER_LOG(WARN, "fail to print lob ctrl gc diag row", KR(ret), K(row), K(len));
+    } else {
+      value.assign_ptr(value_buf_, static_cast<int32_t>(len));
     }
   } else if (ObSSMarkSweepDiagFileType::STUDY_RESULTS == type) {
     char svr_ip[OB_IP_STR_BUFF] = {0};
@@ -594,7 +677,7 @@ int ObAllVirtualSharedGCDiagnose::construct_cur_value_(ObString &value)
   return ret;
 }
 
-int ObAllVirtualSharedGCDiagnose::fill_cells_(const ObSSGCTablet &tablet, const ObString &value)
+int ObAllVirtualSharedGCDiagnose::fill_cells_(const ObSSGCTablet *tablet, const ObString &value)
 {
   int ret = OB_SUCCESS;
   const ObMarkSweepGroupType group = GROUPS[group_idx_];
@@ -613,7 +696,7 @@ int ObAllVirtualSharedGCDiagnose::fill_cells_(const ObSSGCTablet &tablet, const 
         break;
       }
       case GROUP: {
-        cur_row_.cells_[i].set_varchar(ObString::make_string(group_to_str_(group)));
+        cur_row_.cells_[i].set_varchar(ObString::make_string(group_to_str_(group, type)));
         cur_row_.cells_[i].set_collation_type(cs_type);
         break;
       }
@@ -623,15 +706,17 @@ int ObAllVirtualSharedGCDiagnose::fill_cells_(const ObSSGCTablet &tablet, const 
         break;
       }
       case LS_ID: {
-        cur_row_.cells_[i].set_int(tablet.ls_id_.id());
+        cur_row_.cells_[i].set_int(OB_ISNULL(tablet) ? 0 : tablet->ls_id_.id());
         break;
       }
       case TABLET_ID: {
-        cur_row_.cells_[i].set_int(static_cast<int64_t>(tablet.tablet_id_.id()));
+        cur_row_.cells_[i].set_int(OB_ISNULL(tablet)
+            ? 0 : static_cast<int64_t>(tablet->tablet_id_.id()));
         break;
       }
       case REORGANIZATION_SCN: {
-        cur_row_.cells_[i].set_int(static_cast<int64_t>(tablet.transfer_scn_.get_val_for_inner_table_field()));
+        cur_row_.cells_[i].set_int(OB_ISNULL(tablet)
+            ? 0 : static_cast<int64_t>(tablet->transfer_scn_.get_val_for_inner_table_field()));
         break;
       }
       case VALUE: {

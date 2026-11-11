@@ -14,6 +14,7 @@ DEF_STORAGE_USE(STORAGE_USED_EXTERNAL, ALL_EXTERNAL_STORAGE_INFO)
 DEF_STORAGE_USE(STORAGE_USED_EXPORT, ALL_EXPORT_STORAGE_INFO)
 DEF_STORAGE_USE(STORAGE_USED_SQL_AUDIT, ALL_SQL_AUDIT_STORAGE_INFO)
 DEF_STORAGE_USE(STORAGE_USED_OTHER, ALL_OTHER_STORAGE_INFO)
+DEF_STORAGE_USE(STORAGE_USED_EXTERNAL_LOB, ALL_EXTERNAL_STORAGE_INFO)
 #endif // DEF_STORAGE_USE
 
 #ifndef SRC_LIBRARY_SRC_COMMON_STORAGE_OB_DEVICE_COMMON_
@@ -244,6 +245,13 @@ struct ObStorageIdMod
     return storage_id_mod;
   }
 
+  static const ObStorageIdMod get_default_external_lob_id_mod()
+  {
+    static const ObStorageIdMod storage_id_mod(
+        OB_STORAGE_ID_EXTERNAL_LOB, ObStorageUsedMod::STORAGE_USED_EXTERNAL_LOB);
+    return storage_id_mod;
+  }
+
   static const ObStorageIdMod get_default_export_id_mod()
   {
     static const ObStorageIdMod storage_id_mod(
@@ -260,6 +268,7 @@ public:
   static const uint64_t OB_STORAGE_ID_DDL = 2000;
   static const uint64_t OB_STORAGE_ID_EXTERNAL = 2001;
   static const uint64_t OB_STORAGE_ID_EXPORT = 2002;
+  static const uint64_t OB_STORAGE_ID_EXTERNAL_LOB = 2005;
 };
 
 }

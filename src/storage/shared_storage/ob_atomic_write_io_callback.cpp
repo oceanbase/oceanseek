@@ -49,6 +49,11 @@ int ObAtomicWriteIOCallback::rename_file()
   } else if (OB_FAIL(new_path_ctx.set_file_ctx(
       macro_block_id_, ls_epoch_id_, true/*is_local_cache*/, server_id_, ls_id_))) {
     LOG_WARN("fail to construct new file path", KR(ret), KPC(this), K(new_path_ctx));
+  } else if (ObStorageObjectType::SHARED_EXTERNAL_LOB_DATA_MACRO
+             == macro_block_id_.storage_object_type()
+             && OB_FAIL(ObIODeviceLocalFileOp::truncate(old_path_ctx.get_path(), size_))) {
+    // External LOB objects may be unaligned; truncate cache files to the actual bytes written.
+    LOG_WARN("failed to truncate external lob cache file", KR(ret), K_(macro_block_id), K_(size));
   } else if ((OB_SERVER_TENANT_ID == tenant_id_) ||                             // 1. 500 tenant, does not alloc space
              SSObjUtil::is_overwrite(macro_block_id_.storage_object_type()) || // 2. overwrite file, does not alloc space
              macro_block_id_.is_in_table()) {

@@ -54,6 +54,14 @@ public:
                                        const int64_t offset,
                                        OpenDalAsyncCallbackFn callback,
                                        void *ctx);
+  static void obdal_async_operator_read_with_if_match(const opendal_async_operator *op,
+                                                      const char *path,
+                                                      char *buf,
+                                                      const int64_t buf_size,
+                                                      const int64_t offset,
+                                                      const char *etag,
+                                                      OpenDalAsyncCallbackFn callback,
+                                                      void *ctx);
   static void obdal_async_operator_write(const opendal_async_operator *op,
                                         const char *path,
                                         const char *buf,
@@ -88,6 +96,13 @@ public:
   static int obdal_operator_free(opendal_operator *&op);
   static int obdal_operator_write(const opendal_operator *op, const char *path, const char *buf, const int64_t buf_size);
   static int obdal_operator_write_with_if_not_exists(const opendal_operator *op, const char *path, const char *buf, const int64_t buf_size);
+  static int obdal_operator_read_with_if_match(const opendal_operator *op,
+                                               const char *path,
+                                               const char *etag,
+                                               char *buf,
+                                               const int64_t buf_size,
+                                               const int64_t offset,
+                                               int64_t &read_size);
   static int obdal_operator_reader(const opendal_operator *op, const char *path, opendal_reader *&reader);
   static int obdal_operator_writer(const opendal_operator *op, const char *path, opendal_writer *&writer);
   static int obdal_operator_append_writer(const opendal_operator *op, const char *path, opendal_writer *&writer);

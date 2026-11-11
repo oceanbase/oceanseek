@@ -23,6 +23,15 @@ class ObSSGCTablet;
 class ObSSGCUtil
 {
 public:
+  static bool is_cold_lob_tablet(
+      const share::SCN &orig_clog_checkpoint_scn,
+      const share::SCN &clog_checkpoint_scn)
+  {
+    return clog_checkpoint_scn.is_valid_and_not_min() && !clog_checkpoint_scn.is_max()
+        && orig_clog_checkpoint_scn.is_valid_and_not_min()
+        && orig_clog_checkpoint_scn < clog_checkpoint_scn;
+  }
+
   static int check_enable_gc_service(
       const uint64_t tenant_id,
       bool &enable_gc_service);

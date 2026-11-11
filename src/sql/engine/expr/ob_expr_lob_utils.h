@@ -315,7 +315,7 @@ public:
         COMMON_LOG(WARN, "Lob: str iter init failed ", K(ret), K(str_iter));
       } else if (OB_FAIL(str_iter.get_full_data(str))) {
         COMMON_LOG(WARN, "Lob: str iter get full data failed ", K(ret), K(str_iter));
-      } else if (!str_iter.is_outrow_lob()) {
+      } else if (!str_iter.is_outline_lob()) {
         need_copy = true;
       }
     } else {
@@ -384,7 +384,7 @@ public:
     ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx);
     common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
     ObTextStringIter str_iter(meta.type_, meta.get_cs_type(), str);
-    if (OB_FAIL(str_iter.init(0, NULL, &temp_allocator))) {
+    if (OB_FAIL(build_text_iter(str_iter, &ctx.exec_ctx_, nullptr, &temp_allocator))) {
       COMMON_LOG(WARN, "Lob: init lob str iter failed ", K(ret), K(str_iter));
     } else if (OB_FAIL(str_iter.get_char_len(char_len))) {
       COMMON_LOG(WARN, "Lob: init lob str iter failed ", K(ret), K(str_iter));

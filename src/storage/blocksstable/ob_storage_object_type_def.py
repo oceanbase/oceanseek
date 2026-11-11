@@ -5012,8 +5012,9 @@ bool is_valid(const MacroBlockId &file_id) const
   return (file_id.second_id() >= 0)
       && (0 == file_id.third_id())
       && (file_id.fourth_id() >= 0)
-      && (type < 3)
+      && (type < 6)
       && (2 != type || 1 == group)
+      && (type < 3 || 0 == group)
       && (0 == reserved)
       && (0 == file_id.fifth_id());
 }''',
@@ -5022,7 +5023,10 @@ int to_relative_remote_path_format(char *path, const int64_t length, int64_t &po
 {
   int ret = OB_SUCCESS;
   static const char *GROUP_STRS[] = {"del", "kept"};
-  static const char *TYPE_STRS[]  = {"macros", "tablet_meta_scns", "study_results"};
+  static const char *TYPE_STRS[] = {
+    "macros", "tablet_meta_scns", "study_results",
+    "lob_meta_kept", "lob_ctrl_candidate", "lob_ctrl_diff"
+  };
   const uint64_t encoded = static_cast<uint64_t>(file_id.fourth_id());
   const int64_t group = static_cast<int64_t>(encoded & 0x1);
   const int64_t type = static_cast<int64_t>((encoded >> 1) & 0xFF);
@@ -5035,7 +5039,7 @@ int to_relative_remote_path_format(char *path, const int64_t length, int64_t &po
     LOG_WARN("invalid mark sweep gc diag object id", KR(ret), K(file_id), K(group), K(type), K(bucket));
   } else if (OB_FAIL(databuff_printf(path, length, pos, "%s/%s%ld/%s/%s/%s%ld%s%hhu",
                               MARK_SWEEP_GC_DIAG_DIR_STR, ROUND_DIR_STR, file_id.second_id(),
-                              GROUP_STRS[group], TYPE_STRS[type],
+                              (type < 3) ? GROUP_STRS[group] : "lob_user_gc", TYPE_STRS[type],
                               BKT_KEY_STR, bucket, OBJECT_TYPE_STR, obj_id))) {
     LOG_WARN("fail to databuff printf", KR(ret));
   }
@@ -5056,7 +5060,7 @@ int get_object_id(const ObStorageObjectOpt &opt, MacroBlockId &object_id) const
   int ret = OB_SUCCESS;
   const int64_t default_cg_id = 0;
   static const int64_t GROUP_CNT = 2;
-  static const int64_t TYPE_CNT = 3;
+  static const int64_t TYPE_CNT = 6;
   static const int64_t MAX_BUCKET_CNT = 1L << 20;
   if (OB_UNLIKELY(opt.ss_mark_sweep_gc_diag_opt_.round_id_ < 0
       || opt.ss_mark_sweep_gc_diag_opt_.group_ < 0
@@ -5064,6 +5068,8 @@ int get_object_id(const ObStorageObjectOpt &opt, MacroBlockId &object_id) const
       || opt.ss_mark_sweep_gc_diag_opt_.type_ < 0
       || opt.ss_mark_sweep_gc_diag_opt_.type_ >= TYPE_CNT
       || (2 == opt.ss_mark_sweep_gc_diag_opt_.type_ && 1 != opt.ss_mark_sweep_gc_diag_opt_.group_)
+      || (opt.ss_mark_sweep_gc_diag_opt_.type_ >= 3
+          && 0 != opt.ss_mark_sweep_gc_diag_opt_.group_)
       || opt.ss_mark_sweep_gc_diag_opt_.bucket_ < 0
       || opt.ss_mark_sweep_gc_diag_opt_.bucket_ >= MAX_BUCKET_CNT)) {
     ret = OB_INVALID_ARGUMENT;
@@ -5382,3 +5388,240 @@ def_storage_object_type_cfg(**create_ss_meta_ctrl_type_cfg(
 def_storage_object_type_cfg(**create_ss_meta_ctrl_type_cfg(
     'SHARED_INC_MAJOR_LOCK', 41, 'SSTABLE', 'LOCK_DIR_STR', is_lock_row=True,
     include_inner_tablet=True))
+
+def_storage_object_type_cfg(
+    obj_type = 'SHARED_OUTTABLE_LOB_DATA_MACRO',
+    id = 42,
+    owner = 'fengyun',
+    access_mode = 'shared',
+    data_type = 'macro_data',
+    read_odirect = False,
+    write_strategy = ["WRITE_THROUGH"],
+    is_support_fd_cache = False,
+    is_read_out_of_bounds = False,
+    is_valid = '''
+bool is_valid(const MacroBlockId &file_id) const
+{
+  // second_id: creation time; third_id: LOB Meta tablet ID; fourth_id: tenant-wide unique sequence number
+  return file_id.is_in_object_storage()
+      && file_id.second_id() > 0
+      && file_id.second_id() < INT64_MAX
+      && file_id.third_id() > 0
+      && file_id.third_id() < INT64_MAX
+      && file_id.fourth_id() > 0
+      && file_id.fifth_id() == 0;
+}
+''',
+    to_local_path_format = '''
+int to_local_path_format(char *path, const int64_t length, int64_t &pos,
+    const MacroBlockId &file_id, const uint64_t tenant_id, const uint64_t tenant_epoch_id,
+    const uint64_t server_id, const int64_t ls_id, const int64_t ls_epoch_id) const
+{
+  int ret = OB_SUCCESS;
+  const uint8_t obj_id = static_cast<uint8_t>(file_id.storage_object_type());
+  if (OB_FAIL(databuff_printf(path, length, pos,
+      "%s/%lu_%ld/%s/%02lX/tablet_%ld_create_%ld_seq_%ld.T%hhu",
+      OB_DIR_MGR.get_local_cache_root_dir(), tenant_id, tenant_epoch_id,
+      SHARED_MAJOR_MACRO_CACHE_DIR_STR,
+      file_id.hash() % ObDirManager::SHARED_MACRO_SCATTER_DIR_NUM,
+      file_id.third_id(), file_id.second_id(), file_id.fourth_id(), obj_id))) {
+    LOG_WARN("fail to format outtable lob local cache path", KR(ret), K(file_id));
+  }
+  return ret;
+}
+''',
+    local_path_to_macro_id = '''
+int local_path_to_macro_id(const char *path, MacroBlockId &macro_id) const
+{
+  int ret = OB_SUCCESS;
+  char format[128] = {0};
+  int num = 0;
+  const char *sub_path = nullptr;
+  int64_t tablet_id = 0;
+  int64_t create_ts_us = 0;
+  int64_t seq = 0;
+  if (OB_ISNULL(path)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments", KR(ret), KP(path));
+  } else if (OB_ISNULL(sub_path = ObString(path).reverse_find('/', 1))) {
+    ret = OB_UNEXPECTED_MACRO_CACHE_FILE;
+    LOG_WARN("unexpected outtable lob local cache path", KR(ret), K(path));
+  } else if (OB_FAIL(databuff_printf(format, sizeof(format),
+      "/tablet_%%ld_create_%%ld_seq_%%ld.T%hhu", static_cast<uint8_t>(type_)))) {
+    LOG_WARN("fail to build outtable lob local cache path format", KR(ret), K(type_));
+  } else if (FALSE_IT(num = sscanf(sub_path, format, &tablet_id, &create_ts_us, &seq))) {
+  } else if (OB_UNLIKELY(3 != num)) {
+    ret = OB_UNEXPECTED_MACRO_CACHE_FILE;
+    LOG_WARN("unexpected outtable lob local cache path", KR(ret), K(path), K(format), K(num));
+  } else {
+    macro_id.set_version_v1();
+    macro_id.set_id_mode(static_cast<uint64_t>(ObMacroBlockIdMode::ID_MODE_SHARE));
+    macro_id.set_storage_object_type(static_cast<uint64_t>(type_));
+    macro_id.set_location(ObMacroBlockIdLocation::OBJECT_STORAGE);
+    macro_id.set_second_id(create_ts_us);
+    macro_id.set_third_id(tablet_id);
+    macro_id.set_fourth_id(seq);
+    macro_id.set_fifth_id(0);
+  }
+  return ret;
+}
+''',
+    to_relative_remote_path_format = '''
+int to_relative_remote_path_format(char *path, const int64_t length, int64_t &pos,
+                                   const MacroBlockId &file_id) const
+{
+  int ret = OB_SUCCESS;
+  const uint8_t obj_id = static_cast<uint8_t>(file_id.storage_object_type());
+  if (OB_ISNULL(path) || OB_UNLIKELY(!file_id.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments", KR(ret), KP(path), K(file_id));
+  } else if (OB_FAIL(databuff_printf(path, length, pos,
+      "outtable_lob/%ld/%ld/%ld.T%hhu", file_id.third_id(), file_id.second_id(),
+      file_id.fourth_id(), obj_id))) {
+    LOG_WARN("fail to format outtable lob remote path", KR(ret), K(file_id));
+  }
+  return ret;
+}
+''',
+    to_remote_path_format = '''
+int to_remote_path_format(char *path, const int64_t length, int64_t &pos,
+    const MacroBlockId &file_id, const char *object_storage_root_dir,
+    const uint64_t cluster_id, const uint64_t tenant_id, const uint64_t tenant_epoch_id,
+    const uint64_t server_id, const int64_t ls_id, const int64_t ls_epoch_id) const
+{
+  return stract_remote_path_format(path, length, pos, file_id, object_storage_root_dir,
+                                   cluster_id, tenant_id);
+}
+''',
+    remote_path_to_macro_id = '''
+int remote_path_to_macro_id(const char *path, MacroBlockId &macro_id) const
+{
+  int ret = OB_SUCCESS;
+  char format[128] = {0};
+  int num = 0;
+  const char *sub_path = nullptr;
+  int64_t tablet_id = 0;
+  int64_t create_ts_us = 0;
+  int64_t seq = 0;
+  if (OB_ISNULL(path)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid arguments", KR(ret), KP(path));
+  } else if (OB_ISNULL(sub_path = STRSTR(path, "outtable_lob/"))) {
+    ret = OB_UNEXPECTED_MACRO_CACHE_FILE;
+    LOG_WARN("unexpected outtable lob path", KR(ret), K(path));
+  } else if (OB_FAIL(databuff_printf(format, sizeof(format),
+      "outtable_lob/%%ld/%%ld/%%ld.T%hhu", static_cast<uint8_t>(type_)))) {
+    LOG_WARN("fail to build outtable lob path format", KR(ret), K(type_));
+  } else if (FALSE_IT(num = sscanf(sub_path, format, &tablet_id, &create_ts_us, &seq))) {
+  } else if (OB_UNLIKELY(3 != num)) {
+    ret = OB_UNEXPECTED_MACRO_CACHE_FILE;
+    LOG_WARN("unexpected outtable lob path", KR(ret), K(path), K(format), K(num));
+  } else {
+    macro_id.set_version_v1();
+    macro_id.set_id_mode(static_cast<uint64_t>(ObMacroBlockIdMode::ID_MODE_SHARE));
+    macro_id.set_storage_object_type(static_cast<uint64_t>(type_));
+    macro_id.set_location(ObMacroBlockIdLocation::OBJECT_STORAGE);
+    macro_id.set_second_id(create_ts_us);
+    macro_id.set_third_id(tablet_id);
+    macro_id.set_fourth_id(seq);
+    macro_id.set_fifth_id(0);
+  }
+  return ret;
+}
+''',
+    get_effective_tablet_id = '''
+int get_effective_tablet_id(const MacroBlockId &macro_id, uint64_t &effective_tablet_id) const
+{
+  effective_tablet_id = static_cast<uint64_t>(macro_id.third_id());
+  return OB_SUCCESS;
+}
+''',
+)
+
+
+# External LOBs create reference IDs and cache paths, but never allocate or write data macro blocks.
+def_storage_object_type_cfg(
+    obj_type='SHARED_EXTERNAL_LOB_DATA_MACRO',
+    id=43,
+    owner='renhe.wz',
+    access_mode='shared',
+    data_type='others',
+    read_odirect=False,
+    write_strategy=[],
+    is_support_fd_cache=True,
+    need_fsync=False,
+    is_valid='''
+bool is_valid(const MacroBlockId &file_id) const
+{
+  return file_id.second_id() > 0 && file_id.third_id() > 0 && file_id.fourth_id() >= 0
+      && file_id.fifth_id() > 0 && file_id.fifth_id() <= 2L * 1024 * 1024
+      && file_id.fourth_id() <= INT64_MAX - file_id.fifth_id();
+}
+''',
+    to_local_path_format='''
+int to_local_path_format(char *path, const int64_t length, int64_t &pos, const MacroBlockId &file_id,
+    const uint64_t tenant_id, const uint64_t tenant_epoch_id, const uint64_t server_id,
+    const int64_t ls_id, const int64_t ls_epoch_id) const
+{
+  UNUSED(server_id);
+  UNUSED(ls_id);
+  UNUSED(ls_epoch_id);
+  return databuff_printf(path, length, pos, "%s/%lu_%lu/%s/%02lX/t%ldseq%ldoff%ldlen%ld.T%hhu",
+      OB_DIR_MGR.get_local_cache_root_dir(), tenant_id, tenant_epoch_id,
+      EXTERNAL_LOB_CACHE_DIR_STR, file_id.hash() % ObDirManager::EXTERNAL_LOB_SCATTER_DIR_NUM,
+      file_id.second_id(), file_id.third_id(), file_id.fourth_id(), file_id.fifth_id(),
+      static_cast<uint8_t>(type_));
+}
+''',
+    local_path_to_macro_id='''
+int local_path_to_macro_id(const char *path, MacroBlockId &macro_id) const
+{
+  int ret = OB_SUCCESS;
+  const char *name = nullptr;
+  int64_t tablet_id = 0;
+  int64_t seq_id = 0;
+  int64_t offset = 0;
+  int64_t length = 0;
+  uint8_t object_type = 0;
+  if (OB_ISNULL(path) || OB_ISNULL(name = STRRCHR(path, '/'))) {
+    ret = OB_UNEXPECTED_MACRO_CACHE_FILE;
+    LOG_WARN("invalid external lob cache path", KR(ret), K(path));
+  } else if (OB_UNLIKELY(5 != sscanf(name, "/t%ldseq%ldoff%ldlen%ld.T%hhu",
+                        &tablet_id, &seq_id, &offset, &length, &object_type)
+             || object_type != static_cast<uint8_t>(type_))) {
+    ret = OB_UNEXPECTED_MACRO_CACHE_FILE;
+    LOG_WARN("invalid external lob cache file name", KR(ret), K(name), K(object_type));
+  } else {
+    set_ss_object_first_id_(0, macro_id);
+    macro_id.set_second_id(tablet_id);
+    macro_id.set_third_id(seq_id);
+    macro_id.set_fourth_id(offset);
+    macro_id.set_fifth_id(length);
+    if (OB_UNLIKELY(!macro_id.is_valid())) {
+      ret = OB_UNEXPECTED_MACRO_CACHE_FILE;
+      LOG_WARN("invalid external lob cache identity", KR(ret), K(macro_id));
+    }
+  }
+  return ret;
+}
+''',
+    get_parent_dir='''
+int get_parent_dir(char *path, const int64_t length, int64_t &pos, const MacroBlockId &file_id,
+    const uint64_t tenant_id, const uint64_t tenant_epoch_id, const int64_t ls_id,
+    const int64_t ls_epoch_id) const
+{
+  UNUSED(ls_id);
+  UNUSED(ls_epoch_id);
+  return databuff_printf(path, length, pos, "%s/%lu_%lu/%s/%02lX",
+      OB_DIR_MGR.get_local_cache_root_dir(), tenant_id, tenant_epoch_id,
+      EXTERNAL_LOB_CACHE_DIR_STR, file_id.hash() % ObDirManager::EXTERNAL_LOB_SCATTER_DIR_NUM);
+}
+''',
+    get_effective_tablet_id='''
+int get_effective_tablet_id(const MacroBlockId &macro_id, uint64_t &effective_tablet_id) const
+{
+  effective_tablet_id = static_cast<uint64_t>(macro_id.second_id());
+  return OB_SUCCESS;
+}
+''',
+)

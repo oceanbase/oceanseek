@@ -362,8 +362,7 @@ int ObLobSeqIdGenerator::get_next_seq_id(ObString &seq_id, ObLobSeqIdGenerator &
 int ObLobSeqIdGenerator::get_next_seq_id(ObString &seq_id)
 {
   int ret = OB_SUCCESS;
-  if (!parsed_ &&
-      OB_FAIL(parse())) {
+  if (!parsed_ && OB_FAIL(parse())) {
     LOG_WARN("failed get next seq id, parse failed.", K(ret), K(seq_id_));
   } else if (empty()) {
     if (OB_FAIL(add_digits(ObLobSeqId::LOB_SEQ_ID_MIN)) || OB_FAIL(append_seq_buf(ObLobSeqId::LOB_SEQ_ID_MIN))) {

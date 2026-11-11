@@ -10,6 +10,10 @@
 
 namespace oceanbase
 {
+namespace common
+{
+class ObObjectStorageInfo;
+}
 namespace storage
 {
 
@@ -17,7 +21,24 @@ namespace storage
 class ObLobAuxTableBaseIterator;
 class ObLobAccessCtx;
 
-// @brief LOB reader cache key.
+// Resolves access information for a URL through LOCATION.
+// LOCATION lookup uses a schema guard and requires the current session's
+// privileges, enabled roles and tenant information.
+// URLs may come from row data, so access information is resolved on demand
+// rather than prepared and passed through every SQL read path.
+// Storage defines this base interface, while SQL implements it using its
+// execution context and passes the provider to storage. This lets storage
+// request access information without depending on SQL headers or concrete
+// SQL implementations.
+class ObExternalAccessProvider
+{
+public:
+  virtual ~ObExternalAccessProvider() = default;
+  virtual int get_access_info(const common::ObString &url,
+                              common::ObObjectStorageInfo &access_info) = 0;
+};
+
+// @brief Lob reader cache key
 struct ObPersistLobReaderCacheKey
 {
   ObPersistLobReaderCacheKey():
@@ -94,10 +115,12 @@ private:
 class ObLobAccessCtx
 {
 public:
-  ObLobAccessCtx():
+  explicit ObLobAccessCtx(ObExternalAccessProvider &provider):
     meta_reader_cache_(this),
-    piece_reader_cache_(this)
+    piece_reader_cache_(this),
+    external_lob_access_provider_(provider)
   {}
+  ~ObLobAccessCtx() = default;
 
   void reset()
   {
@@ -127,9 +150,20 @@ public:
     return ret;
   }
 
+  int get_external_access_info(const common::ObString &url,
+                               common::ObObjectStorageInfo &access_info) const
+  {
+    return external_lob_access_provider_.get_access_info(url, access_info);
+  }
+
 public:
   ObPersistLobReaderCache meta_reader_cache_;
   ObPersistLobReaderCache piece_reader_cache_;
+  // Borrowed from the owning exec context; storage needs no SQL header dependencies.
+  ObExternalAccessProvider &external_lob_access_provider_;
+
+private:
+  DISALLOW_COPY_AND_ASSIGN(ObLobAccessCtx);
 };
 
 

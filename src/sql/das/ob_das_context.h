@@ -78,6 +78,7 @@ public:
     same_server_ = 1;
     iter_uncommitted_row_ = 0;
     is_direct_load_stream_finishing_ = 0;
+    use_outtable_lob_control_current_snapshot_ = 0;
   }
   ~ObDASCtx()
   {
@@ -202,7 +203,7 @@ private:
 public:
   union {
     uint64_t flags_;
-    struct {
+    struct { // FARM COMPAT WHITELIST
       uint64_t is_fk_cascading_                 : 1; //fk starts to trigger nested sql
       uint64_t need_check_server_               : 1; //need to check if partitions hit the same server
       uint64_t same_server_                     : 1; //if partitions hit the same server, could be local or remote
@@ -210,7 +211,8 @@ public:
       uint64_t in_das_group_scan_               : 1; //the current execution in das group scan
       uint64_t in_ignore_cascading_             : 1; //is an ignore stmt when cascading
       uint64_t is_direct_load_stream_finishing_ : 1; //stream finish triggers nested SQL
-      uint64_t reserved_                        : 57;
+      uint64_t use_outtable_lob_control_current_snapshot_ : 1;
+      uint64_t reserved_                        : 56;
     };
   };
 };

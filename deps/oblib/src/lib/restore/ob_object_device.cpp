@@ -336,7 +336,7 @@ void get_opt_value(ObIODOpts *opts, const char* key, const char*& value)
   } else {
     value = NULL;
     for (int i = 0; i < opts->opt_cnt_; i++) {
-      if (0 == STRCMP(opts->opts_[i].key_, key)) {
+      if (OB_NOT_NULL(opts->opts_[i].key_) && 0 == STRCMP(opts->opts_[i].key_, key)) {
         value = opts->opts_[i].value_.value_str;
         break;
       }
@@ -350,7 +350,7 @@ void get_opt_value(ObIODOpts *opts, const char* key, int64_t& value)
     //do nothing
   } else {
     for (int i = 0; i < opts->opt_cnt_; i++) {
-      if (0 == STRCMP(opts->opts_[i].key_, key)) {
+      if (OB_NOT_NULL(opts->opts_[i].key_) && 0 == STRCMP(opts->opts_[i].key_, key)) {
         value = opts->opts_[i].value_.value_int64;
         break;
       }
@@ -418,6 +418,12 @@ int ObObjectDevice::open_for_util(void *&ctx)
 int ObObjectDevice::open_for_reader(const char *pathname, void *&ctx, const bool head_meta)
 {
   return open_ctx_in_pool<ObStorageReader>(pathname, ctx, reader_ctx_pool_, "reader", head_meta);
+}
+
+int ObObjectDevice::open_for_reader(
+    const char *pathname, void *&ctx, const bool head_meta, const char *etag)
+{
+  return open_ctx_in_pool<ObStorageReader>(pathname, ctx, reader_ctx_pool_, "reader", head_meta, etag);
 }
 
 int ObObjectDevice::open_for_adaptive_reader_(const char *pathname, void *&ctx)
@@ -515,6 +521,13 @@ int ObObjectDevice::open_for_buffered_multipart_writer_(const char *pathname, vo
 int ObObjectDevice::open_for_async_reader(const char *pathname, void *&ctx, const bool head_meta)
 {
   return open_ctx_in_pool<ObStorageAsyncReader>(pathname, ctx, async_reader_ctx_pool_, "async_reader", head_meta);
+}
+
+int ObObjectDevice::open_for_async_reader(
+    const char *pathname, void *&ctx, const bool head_meta, const char *etag)
+{
+  return open_ctx_in_pool<ObStorageAsyncReader>(
+      pathname, ctx, async_reader_ctx_pool_, "async_reader", head_meta, etag);
 }
 
 int ObObjectDevice::open_for_async_writer(const char *pathname, void *&ctx)
@@ -644,6 +657,8 @@ int ObObjectDevice::open(const char *pathname, const int flags, const mode_t mod
   void *ctx = NULL;
   ObStorageAccessType access_type = OB_STORAGE_ACCESS_MAX_TYPE;
   bool enable_async_io = false;
+  const char *etag_if_match = nullptr;
+  get_opt_value(opts, "EtagIfMatch", etag_if_match);
   //validate fd
   if (fd_mng_.validate_fd(fd, false)) {
     ret = OB_INIT_TWICE;
@@ -665,6 +680,9 @@ int ObObjectDevice::open(const char *pathname, const int flags, const mode_t mod
       OB_LOG(WARN, "for object device, opts should not be null!", K(ret));
     } else if (OB_FAIL(get_access_type(opts, access_type))) {
       OB_LOG(WARN, "fail to get access type!", KCSTRING(pathname), K(ret));
+    } else if (OB_NOT_NULL(etag_if_match) && OB_STORAGE_ACCESS_NOHEAD_READER != access_type) {
+      ret = OB_INVALID_ARGUMENT;
+      OB_LOG(WARN, "if-match requires nohead reader", KR(ret), K(access_type));
     } else {
       if (enable_async_io && (!is_valid_async_access_type(access_type) || !is_valid_async_storage_type(device_type_)) ) {
         enable_async_io = false; 
@@ -674,7 +692,11 @@ int ObObjectDevice::open(const char *pathname, const int flags, const mode_t mod
         if (OB_STORAGE_ACCESS_READER == access_type) {
           ret = open_for_async_reader(pathname, ctx, true/*head_meta*/);
         } else if (OB_STORAGE_ACCESS_NOHEAD_READER == access_type) {
-          ret = open_for_async_reader(pathname, ctx, false/*head_meta*/);
+          if (nullptr == etag_if_match) {
+            ret = open_for_async_reader(pathname, ctx, false/*head_meta*/);
+          } else {
+            ret = open_for_async_reader(pathname, ctx, false/*head_meta*/, etag_if_match);
+          }
         } else if (OB_STORAGE_ACCESS_OVERWRITER == access_type) {
           ret = open_for_async_writer(pathname, ctx);
         } else if (OB_STORAGE_ACCESS_DIRECT_MULTIPART_WRITER == access_type) {
@@ -689,7 +711,11 @@ int ObObjectDevice::open(const char *pathname, const int flags, const mode_t mod
         if (OB_STORAGE_ACCESS_READER == access_type) {
           ret = open_for_reader(pathname, ctx, true/*head_meta*/);
         } else if (OB_STORAGE_ACCESS_NOHEAD_READER == access_type) {
-          ret = open_for_reader(pathname, ctx, false/*head_meta*/);
+          if (nullptr == etag_if_match) {
+            ret = open_for_reader(pathname, ctx, false/*head_meta*/);
+          } else {
+            ret = open_for_reader(pathname, ctx, false/*head_meta*/, etag_if_match);
+          }
         } else if (OB_STORAGE_ACCESS_ADAPTIVE_READER == access_type) {
           ret = open_for_adaptive_reader_(pathname, ctx);
         } else if (OB_STORAGE_ACCESS_APPENDER == access_type) {

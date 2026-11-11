@@ -57,6 +57,7 @@ public:
   uint64_t get_tenant_id() const;
   share::SCN get_snapshot_meta_scn() const;
   ObSSDataCheckMode get_check_mode() const;
+  bool is_lob_meta_scan_enabled() const;
   int64_t get_memory_limit() const;
   int64_t get_file_buf_size() const;
   int64_t get_io_expire_timestamp() const;
@@ -82,6 +83,7 @@ private:
   uint64_t tenant_id_;
   share::SCN snapshot_meta_scn_;
   ObSSDataCheckMode check_mode_;
+  bool enable_lob_meta_scan_;
   int64_t memory_limit_;
   int64_t file_buf_size_;
   int64_t io_expire_timestamp_;

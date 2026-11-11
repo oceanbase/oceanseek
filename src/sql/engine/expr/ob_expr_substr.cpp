@@ -544,6 +544,22 @@ int ObExprSubstr::cg_expr(ObExprCGCtx &op_cg_ctx,
   return ret;
 }
 
+static int check_external_lob_substr_position(const ObString &input, int64_t pos)
+{
+  int ret = OB_SUCCESS;
+  if (pos < 0) {
+    ObLobLocatorV2 locator(input);
+    if (OB_UNLIKELY(!locator.is_valid())) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("failed to check external lob locator", K(ret), K(pos), K(locator.size_));
+    } else if (OB_UNLIKELY(locator.is_mem_external_lob())) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "SUBSTR with a negative position on an external LOB");
+    }
+  }
+  return ret;
+}
+
 static int eval_substr_text(const ObCollationType &cs_type,
                             ObTextStringIter &input_iter,
                             ObTextStringDatumResult &output_result,
@@ -602,7 +618,7 @@ static int eval_substr_text(const ObCollationType &cs_type,
         ObString src_block_data;
         while (OB_SUCC(ret) 
               && (state = input_iter.get_next_block(src_block_data)) == TEXTSTRING_ITER_NEXT) {
-          if (!input_iter.is_outrow_lob()) {
+          if (!input_iter.is_outline_lob()) {
             ObString inrow_result;
             if (OB_FAIL(ObExprSubstr::substr(inrow_result, src_block_data, pos, len,
                                             cs_type,
@@ -682,7 +698,12 @@ int ObExprSubstr::eval_substr(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_
         ObTextStringIter input_iter(input_meta.type_, input_meta.cs_type_, str_datum->get_string());
         ObTextStringDatumResult output_result(expr.datum_meta_.type_, &expr, &ctx, &expr_datum);
         int64_t total_byte_len = 0;
-        if (OB_FAIL(ObTextStringHelper::build_text_iter(input_iter, &ctx.exec_ctx_, NULL/*session*/, &calc_alloc))) {
+        if (OB_FAIL(check_external_lob_substr_position(input, pos))) {
+          LOG_WARN("invalid external lob substr position", K(ret), K(pos), K(len));
+        } else if (OB_FAIL(ObTextStringHelper::build_text_iter(input_iter,
+                                                               &ctx.exec_ctx_,
+                                                               NULL/*session*/,
+                                                               &calc_alloc))) {
           LOG_WARN("init input_iter failed ", K(ret), K(input_iter));
         } else if (OB_FAIL(input_iter.get_byte_len(total_byte_len))) {
           LOG_WARN("get input byte len failed", K(ret));
@@ -798,7 +819,12 @@ int ObExprSubstr::eval_substr_batch(const ObExpr &expr, ObEvalCtx &ctx,
             ObTextStringIter input_iter(input_meta.type_, input_meta.cs_type_, datum_array[j].get_string());
             ObTextStringDatumResult output_result(expr.datum_meta_.type_, &expr, &ctx, &results[j]);
             int64_t total_byte_len = 0;
-            if (OB_FAIL(ObTextStringHelper::build_text_iter(input_iter, &ctx.exec_ctx_, NULL/*session*/, &calc_alloc))) {
+            if (OB_FAIL(check_external_lob_substr_position(datum_array[j].get_string(), pos))) {
+              LOG_WARN("invalid external lob substr position", K(ret), K(pos), K(len), K(j));
+            } else if (OB_FAIL(ObTextStringHelper::build_text_iter(input_iter,
+                                                                   &ctx.exec_ctx_,
+                                                                   NULL/*session*/,
+                                                                   &calc_alloc))) {
               LOG_WARN("init input_iter failed ", K(ret), K(input_iter));
             } else if (OB_FAIL(input_iter.get_byte_len(total_byte_len))) {
               LOG_WARN("get input byte len failed", K(ret), K(j));
@@ -919,7 +945,12 @@ int ObExprSubstr::vector_substr(VECTOR_EVAL_FUNC_ARG_DECL)
             ObTextStringDatumResult output_result(expr.datum_meta_.type_, &expr, &ctx, res_vec,
                                                   idx);
             int64_t total_byte_len = 0;
-            if (OB_FAIL(input_iter.init(0, NULL, &calc_alloc))) {
+            if (OB_FAIL(check_external_lob_substr_position(arg0_vec->get_string(idx), pos))) {
+              LOG_WARN("invalid external lob substr position", K(ret), K(pos), K(len), K(idx));
+            } else if (OB_FAIL(ObTextStringHelper::build_text_iter(input_iter,
+                                                                   &ctx.exec_ctx_,
+                                                                   NULL/*session*/,
+                                                                   &calc_alloc))) {
               LOG_WARN("init input_iter failed ", K(ret), K(input_iter));
             } else if (OB_FAIL(input_iter.get_byte_len(total_byte_len))) {
               LOG_WARN("get input byte len failed", K(ret), K(idx));

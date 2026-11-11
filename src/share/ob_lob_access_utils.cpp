@@ -45,11 +45,11 @@ void ObLobTextIterCtx::reuse()
 
 ObTextStringIter::~ObTextStringIter()
 {
-  if (is_outrow_ && OB_NOT_NULL(ctx_)) {
+  if (is_outline_ && OB_NOT_NULL(ctx_)) {
     if (OB_NOT_NULL(ctx_->lob_query_iter_)) {
       ctx_->lob_query_iter_->reset();
       OB_DELETE(ObLobQueryIter, "unused", ctx_->lob_query_iter_);
-      ctx_->lob_query_iter_ = NULL;
+      ctx_->lob_query_iter_ = nullptr;
     }
   }
 }
@@ -66,7 +66,7 @@ int ObTextStringIter::init(uint32_t buffer_len,
     COMMON_LOG(WARN, "Lob: iter already initiated", K(ret));
   } else if (!(is_lob_storage(type_))) {
     is_lob_ = false;
-    is_outrow_ = false;
+    is_outline_ = false;
   } else if (datum_str_.length() == 0) {
     COMMON_LOG(DEBUG, "Lob: iter with null input str", K(ret), K(*this));
   } else {
@@ -76,8 +76,18 @@ int ObTextStringIter::init(uint32_t buffer_len,
     if (OB_UNLIKELY(!locator.is_valid())) {
       ret = OB_INVALID_ARGUMENT;
       COMMON_LOG(WARN, "Lob: invalid lob", K(ret));
-    } else if (FALSE_IT(is_outrow_ = !locator.has_inrow_data())) {
-    } else if (!is_outrow_ && !locator.is_append_delta_lob()) { // inrow LOB 始终读取完整数据，无需 ctx_
+    } else if (OB_UNLIKELY(locator.is_outline_disk_lob_locator())) {
+      // Reject outline Disk at initialization: it lacks Mem routing and snapshot data.
+      ret = OB_INVALID_ARGUMENT;
+      COMMON_LOG(WARN, "outline disk lob locator is not supported", K(ret), K(locator));
+    } else if (OB_UNLIKELY(locator.is_external_temp_lob())) {
+      ret = OB_NOT_SUPPORTED;
+      // Reject direct reads of temporary external LOBs and report the error to the user.
+      // Check at shared read entry points to avoid duplicating checks across SQL functions.
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "reading a temporary external LOB");
+      COMMON_LOG(WARN, "reading a temporary external LOB", K(ret), K(locator));
+    } else if (FALSE_IT(is_outline_ = !locator.has_inrow_data())) {
+    } else if (!is_outline_ && !locator.is_append_delta_lob()) { // inrow reads all; no ctx_
     } else if (OB_ISNULL(res_allocator)) {
       ret = OB_INVALID_ARGUMENT;
       COMMON_LOG(WARN, "Lob: iter with null allocator", K(ret));
@@ -116,6 +126,16 @@ static int init_lob_access_param(storage::ObLobReadContext &read_ctx,
   } else if (OB_ISNULL(allocator = (allocator == nullptr ? lob_iter_ctx->alloc_: allocator))) {
     ret = OB_INVALID_ARGUMENT;
     COMMON_LOG(WARN, "Lob: allocator is null", K(ret), KP(allocator), KP(lob_iter_ctx->alloc_)); 
+  } else if (OB_UNLIKELY(!lob_iter_ctx->locator_.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    COMMON_LOG(WARN, "invalid lob locator", KR(ret), K(lob_iter_ctx->locator_));
+  } else if (OB_UNLIKELY(lob_iter_ctx->locator_.is_external_temp_lob())) {
+    // Temporary External has no summary or persistent identity for stable virtual macro block IDs.
+    ret = OB_NOT_SUPPORTED;
+    // Reject direct reads of temporary external LOBs and report the error to the user.
+    // Check at shared read entry points to avoid duplicating checks across SQL functions.
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "reading a temporary external LOB");
+    COMMON_LOG(WARN, "reading a temporary external LOB", K(ret), K(lob_iter_ctx->locator_));
   } else if (!lob_iter_ctx->locator_.is_persist_lob()) {
     ret = OB_NOT_IMPLEMENT;
     COMMON_LOG(WARN, "Lob: outrow temp lob is not supported", K(ret), K(lob_iter_ctx->locator_));
@@ -140,19 +160,18 @@ static int init_lob_access_param(storage::ObLobReadContext &read_ctx,
   return ret;
 }
 
-int ObTextStringIter::get_outrow_lob_full_data(ObIAllocator *allocator /*nullptr*/ )
+int ObTextStringIter::get_outline_lob_full_data(ObIAllocator *allocator /*nullptr*/ )
 {
   int ret = OB_SUCCESS;
   storage::ObLobManager* lob_mngr = MTL(storage::ObLobManager*);
 
-  if (!is_outrow_ || OB_ISNULL(ctx_) || OB_ISNULL(ctx_->alloc_)) {
+  if (OB_ISNULL(ctx_) || !is_outline_ || OB_ISNULL(ctx_->alloc_)) {
     ret = OB_INVALID_ARGUMENT;
-    COMMON_LOG(WARN, "Lob: error condition",
-      K(ret), K(is_outrow_), KP(ctx_->session_), KP(ctx_));
+    COMMON_LOG(WARN, "Lob: error condition", K(ret), K(is_outline_), KPC(ctx_));
   } else if (OB_ISNULL(lob_mngr)) {
     ret = OB_ERR_UNEXPECTED;
     COMMON_LOG(WARN, "Lob: get lob manager failed.", K(ret));
-  } else { // outrow persist lob
+  } else { // Dispatch outline persistent LOBs by the type in the read context.
     storage::ObLobReadContext read_ctx;
     if (OB_SUCC(init_lob_access_param(read_ctx, ctx_, cs_type_, tmp_alloc_))) {
       read_ctx.len_ = (0 == ctx_->total_access_len_ ? read_ctx.byte_size_ : ctx_->total_access_len_);
@@ -167,7 +186,12 @@ int ObTextStringIter::get_outrow_lob_full_data(ObIAllocator *allocator /*nullptr
         ret = OB_ERR_UNEXPECTED;
         COMMON_LOG(WARN, "Lob: calc byte size is negative.", K(ret), K(read_ctx));
       } else if (read_ctx.byte_size_ > OB_MAX_LONGTEXT_LENGTH) {
-        ret = OB_ERR_UNEXPECTED;
+        if (ObLongTextType == type_ || ObExtendBLobType == type_) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "materializing a LOB larger than 536870911 bytes");
+        } else {
+          ret = OB_ERR_UNEXPECTED;
+        }
         COMMON_LOG(WARN, "Lob: unable to read full data over 512M lob.", K(ret), K(read_ctx));
       } else {
         ctx_->total_byte_len_ = read_ctx.byte_size_;
@@ -210,10 +234,9 @@ int ObTextStringIter::get_outrow_prefix_data(uint32_t prefix_char_len)
   int ret = OB_SUCCESS;
   storage::ObLobManager* lob_mngr = MTL(storage::ObLobManager*);
 
-  if (!is_outrow_ || OB_ISNULL(ctx_) || OB_ISNULL(ctx_->alloc_)) {
+  if (OB_ISNULL(ctx_) || !is_outline_ || OB_ISNULL(ctx_->alloc_)) {
     ret = OB_INVALID_ARGUMENT;
-    COMMON_LOG(WARN, "Lob: error condition",
-      K(ret), K(is_outrow_), KP(ctx_->session_), KP(ctx_));
+    COMMON_LOG(WARN, "Lob: error condition", K(ret), K(is_outline_), KPC(ctx_));
   } else if (OB_ISNULL(lob_mngr)) {
     ret = OB_ERR_UNEXPECTED;
     COMMON_LOG(WARN, "Lob: get lob manager failed.", K(ret));
@@ -286,13 +309,13 @@ int ObTextStringIter::get_full_data(ObString &data_str)
     }
   } else if (OB_NOT_NULL(ctx_) && OB_NOT_NULL(ctx_->lob_access_ctx_) &&
                FALSE_IT(ctx_->lob_access_ctx_->check_and_release_if_timeout())) {
-  } else if (!is_outrow_) { // inrow lob
+  } else if (!is_outline_) { // inrow lob
     if (OB_FAIL(loc.get_inrow_data(data_str))) {
       COMMON_LOG(WARN, "Lob: get lob inrow data failed", K(ret));
     }
   } else {
     // outrow lob, read full data into a inrow local tmp lob currently
-    if (OB_FAIL(get_outrow_lob_full_data())) {
+    if (OB_FAIL(get_outline_lob_full_data())) {
       COMMON_LOG(WARN, "Lob: get lob outrow data failed", K(ret));
     } else {
       data_str.assign_ptr(ctx_->buff_, ctx_->content_byte_len_);
@@ -329,7 +352,7 @@ int ObTextStringIter::get_inrow_or_outrow_prefix_data(ObString &data_str, uint32
         data_str.assign_ptr(datum_str_.ptr(), truncated_str_len);
       }
     }
-  } else if (!is_outrow_) { // inrow lob
+  } else if (!is_outline_) { // inrow lob
     ObLobLocatorV2 loc(datum_str_);
     if (OB_FAIL(loc.get_inrow_data(data_str))) {
       COMMON_LOG(WARN, "Lob: get lob inrow data failed", K(ret));
@@ -370,10 +393,10 @@ int ObTextStringIter::get_first_block(ObString &str)
   int ret = OB_SUCCESS;
   storage::ObLobManager* lob_mngr = MTL(storage::ObLobManager*);
 
-  if (!is_outrow_ || OB_ISNULL(ctx_)) {
+  if (!is_outline_ || OB_ISNULL(ctx_)) {
     ret = OB_INVALID_ARGUMENT;
     COMMON_LOG(WARN, "Lob: error condition",
-      K(ret), K(is_outrow_), KP(ctx_));
+      K(ret), K(is_outline_), KP(ctx_));
   } else if (OB_ISNULL(lob_mngr)) {
     ret = OB_ERR_UNEXPECTED;
     COMMON_LOG(WARN, "Lob: get lob manager failed.", K(ret));
@@ -420,7 +443,16 @@ int ObTextStringIter::get_first_block(ObString &str)
         } else if (OB_FAIL(lob_mngr->query(read_ctx, ctx_->lob_query_iter_))) {
           COMMON_LOG(WARN, "Lob: falied to query lob iter.", K(ret), K(read_ctx));
         } else if (OB_FAIL(ctx_->lob_query_iter_->get_next_row(output_data))) {
-          COMMON_LOG(WARN, "Lob: falied to get first block.", K(ret), K(read_ctx));
+          if (OB_ITER_END == ret) {
+            // A short first block may empty the range; end iteration, keeping OB_ITER_END from SQL.
+            state_ = TEXTSTRING_ITER_END;
+            ctx_->lob_query_iter_->reset();
+            OB_DELETE(ObLobQueryIter, "unused", ctx_->lob_query_iter_);
+            ctx_->lob_query_iter_ = nullptr;
+            ret = OB_SUCCESS;
+          } else {
+            COMMON_LOG(WARN, "Lob: failed to get first block.", K(ret), K(read_ctx));
+          }
         } else {
           ctx_->content_byte_len_ = output_data.length();
           // ToDo: @gehao get char len directly from lob mngr ?
@@ -445,9 +477,9 @@ int ObTextStringIter::get_first_block(ObString &str)
 int ObTextStringIter::reserve_data()
 {
   int ret = OB_SUCCESS;
-  if (!is_outrow_ || OB_ISNULL(ctx_) || OB_ISNULL(ctx_->lob_query_iter_)) {
+  if (!is_outline_ || OB_ISNULL(ctx_) || OB_ISNULL(ctx_->lob_query_iter_)) {
     ret = OB_INVALID_ARGUMENT;
-    COMMON_LOG(WARN, "Lob: error condition", K(ret), K(is_outrow_), KP(ctx_));
+    COMMON_LOG(WARN, "Lob: error condition", K(ret), K(is_outline_), KP(ctx_));
   } else if (ctx_->reserved_len_ == 0 && ctx_->reserved_byte_len_ == 0) {
     // do nothing
   } else if (ctx_->accessed_byte_len_ == ctx_->total_byte_len_) {
@@ -506,15 +538,15 @@ int ObTextStringIter::get_next_block_inner(ObString &str)
   // 2. update query buffer and query agin
   // 3. update access param
   int ret = OB_SUCCESS;
-  if (!is_outrow_ || OB_ISNULL(ctx_) || OB_ISNULL(ctx_->lob_query_iter_)) {
+  if (!is_outline_ || OB_ISNULL(ctx_) || OB_ISNULL(ctx_->lob_query_iter_)) {
     ret = OB_INVALID_ARGUMENT;
     COMMON_LOG(WARN, "Lob: error condition",
-      K(ret), K(is_outrow_), KP(ctx_));
+      K(ret), K(is_outline_), KP(ctx_));
   } else if (ctx_->content_byte_len_ == 0) {
     ret = OB_INVALID_ARGUMENT;
-    COMMON_LOG(WARN, "Lob: no data", K(ret), K(is_outrow_), KP(ctx_));
+    COMMON_LOG(WARN, "Lob: no data", K(ret), K(is_outline_), KP(ctx_));
   } else if (OB_FAIL(reserve_data())) {
-    COMMON_LOG(WARN, "Lob: reserve_data failed", K(ret), K(is_outrow_), KP(ctx_));
+    COMMON_LOG(WARN, "Lob: reserve_data failed", K(ret), K(is_outline_), KP(ctx_));
   } else {
     ObString output_data;
     if (!ctx_->is_backward_) {
@@ -529,7 +561,7 @@ int ObTextStringIter::get_next_block_inner(ObString &str)
         state_ = TEXTSTRING_ITER_END; // iter finished
         ctx_->lob_query_iter_->reset();
         OB_DELETE(ObLobQueryIter, "unused", ctx_->lob_query_iter_);
-        ctx_->lob_query_iter_ = NULL;
+        ctx_->lob_query_iter_ = nullptr;
         ret = OB_SUCCESS;
       } else {
         COMMON_LOG(WARN, "Lob: falied to get first block.", K(ret));
@@ -567,7 +599,7 @@ ObTextStringIterState ObTextStringIter::get_next_block(ObString &str)
   if (!is_init_ || state_ < TEXTSTRING_ITER_INIT) {
     state_ = TEXTSTRING_ITER_INVALID;
     COMMON_LOG(WARN, "Lob: iter not initiated", K(ret), K(*this));
-  } else if (!is_lob_ || !is_outrow_) { // if not outrow lob, get full data
+  } else if (!is_lob_ || !is_outline_) { // if not outrow lob, get full data
     switch (state_) {
       case TEXTSTRING_ITER_INIT: {
         OZ(get_full_data(str));
@@ -582,7 +614,7 @@ ObTextStringIterState ObTextStringIter::get_next_block(ObString &str)
         break;
       }
     }
-  } else if (is_outrow_) {
+  } else if (is_outline_) {
     switch (state_) {
       case TEXTSTRING_ITER_INIT: {
         OZ(get_first_block(str));
@@ -664,7 +696,7 @@ void ObTextStringIter::set_forward()
 uint64_t ObTextStringIter::get_start_offset()
 {
   uint64_t start_offset = 0;
-  if (!is_init_ || !is_outrow_
+  if (!is_init_ || !is_outline_
       || state_ <= TEXTSTRING_ITER_INIT || OB_ISNULL(ctx_)) {
   } else {
     start_offset = ctx_->start_offset_;
@@ -675,7 +707,7 @@ uint64_t ObTextStringIter::get_start_offset()
 uint32_t ObTextStringIter::get_last_accessed_len()
 {
   uint32_t last_accessed_len = 0;
-  if (!is_init_ || !is_outrow_
+  if (!is_init_ || !is_outline_
       || state_ <= TEXTSTRING_ITER_INIT || OB_ISNULL(ctx_)) {
   } else {
     last_accessed_len = ctx_->last_accessed_len_;
@@ -686,7 +718,7 @@ uint32_t ObTextStringIter::get_last_accessed_len()
 uint32_t ObTextStringIter::get_iter_count()
 {
   uint32_t iter_count = 0;
-  if (!is_init_ || !is_outrow_
+  if (!is_init_ || !is_outline_
       || state_ <= TEXTSTRING_ITER_INIT || OB_ISNULL(ctx_)) {
   } else {
     iter_count = ctx_->iter_count_;
@@ -697,7 +729,7 @@ uint32_t ObTextStringIter::get_iter_count()
 uint32_t ObTextStringIter::get_reserved_char_len()
 {
   uint32_t reserved_char_len = 0;
-  if (!is_init_ || !is_outrow_
+  if (!is_init_ || !is_outline_
       || state_ <= TEXTSTRING_ITER_INIT || OB_ISNULL(ctx_)) {
   } else {
     reserved_char_len = ctx_->reserved_len_;
@@ -708,7 +740,7 @@ uint32_t ObTextStringIter::get_reserved_char_len()
 uint32_t ObTextStringIter::get_reserved_byte_len()
 {
   uint32_t reserved_byte_len = 0;
-  if (!is_init_ || !is_outrow_
+  if (!is_init_ || !is_outline_
       || state_ <= TEXTSTRING_ITER_INIT || OB_ISNULL(ctx_)) {
   } else {
     reserved_byte_len = ctx_->reserved_byte_len_;
@@ -720,7 +752,7 @@ uint32_t ObTextStringIter::get_reserved_byte_len()
 uint32_t ObTextStringIter::get_last_accessed_byte_len()
 {
   uint32_t last_accessed_byte_len = 0;
-  if (!is_init_ || !is_outrow_
+  if (!is_init_ || !is_outline_
       || state_ <= TEXTSTRING_ITER_INIT || OB_ISNULL(ctx_)) {
   } else {
     last_accessed_byte_len = ctx_->last_accessed_byte_len_;
@@ -733,14 +765,14 @@ uint32_t ObTextStringIter::get_accessed_len()
   int32 ret = OB_SUCCESS;
   uint32_t accessed_len = 0;
   if (!is_init_ || state_ <= TEXTSTRING_ITER_INIT) {
-  } else if (!is_lob_ || !is_outrow_) { // string types
+  } else if (!is_lob_ || !is_outline_) { // string types
     int64_t total_char_len = 0;
     if (OB_FAIL(get_char_len(total_char_len))) {
       COMMON_LOG(WARN, "Lob: get lob inrow data failed", K(ret));
     } else {
       accessed_len = static_cast<uint32_t>(total_char_len);
     }
-  } else if (is_outrow_) {
+  } else if (is_outline_) {
     accessed_len = ctx_->accessed_len_;
   } else { // should not come here.
     ret = OB_UNEXPECT_INTERNAL_ERROR;
@@ -754,14 +786,14 @@ uint32_t ObTextStringIter::get_accessed_byte_len()
   int32 ret = OB_SUCCESS;
   uint32_t accessed_byte_len = 0;
   if (!is_init_ || state_ <= TEXTSTRING_ITER_INIT) {
-  } else if (!is_lob_ || !is_outrow_) { // string types
+  } else if (!is_lob_ || !is_outline_) { // string types
     int64_t total_byte_len = 0;
     if (OB_FAIL(get_byte_len(total_byte_len))) {
       COMMON_LOG(WARN, "Lob: get lob inrow data failed", K(ret));
     } else {
       accessed_byte_len = static_cast<uint32_t>(total_byte_len);
     }
-  } else if (is_outrow_) {
+  } else if (is_outline_) {
     accessed_byte_len = ctx_->accessed_byte_len_;
   } else { // should not come here.
     ret = OB_UNEXPECT_INTERNAL_ERROR;
@@ -776,7 +808,7 @@ int ObTextStringIter::get_byte_len(int64_t &byte_len)
   if (!is_init_) {
     ret = OB_INVALID_ARGUMENT;
     COMMON_LOG(WARN, "Lob: iter state error", K(ret), K(is_init_), K(state_));
-  } else if (!is_lob_ || !is_outrow_) {
+  } else if (!is_lob_ || !is_outline_) {
     ObString data_str = datum_str_;
     if (is_lob_) {
       ObLobLocatorV2 loc(data_str);
@@ -785,7 +817,7 @@ int ObTextStringIter::get_byte_len(int64_t &byte_len)
       }
     }
     byte_len = data_str.length();
-  } else { // outrow lob
+  } else {
     storage::ObLobManager* lob_mngr = MTL(storage::ObLobManager*);
     if (OB_ISNULL(ctx_)) {
       ret = OB_INVALID_ARGUMENT;
@@ -819,7 +851,7 @@ int ObTextStringIter::get_char_len(int64_t &char_length)
   if (!is_init_) {
     ret = OB_INVALID_ARGUMENT;
     COMMON_LOG(WARN, "Lob: iter state error", K(ret), K(is_init_), K(state_));
-  } else if (!is_lob_ || !is_outrow_) {
+  } else if (!is_lob_ || !is_outline_) {
     ObString data_str = datum_str_;
     if (is_lob_) {
       ObLobLocatorV2 loc(data_str);
@@ -828,12 +860,11 @@ int ObTextStringIter::get_char_len(int64_t &char_length)
       }
     }
     char_length = ObCharset::strlen_char(cs_type_, data_str.ptr(), static_cast<int64_t>(data_str.length()));
-  } else { // outrow lob
-    ObString disk_loc_str;
+  } else {
     storage::ObLobManager* lob_mngr = MTL(storage::ObLobManager*);
     if (OB_ISNULL(ctx_)) {
       ret = OB_INVALID_ARGUMENT;
-      COMMON_LOG(WARN, "Lob: error condition", K(ret), K(is_outrow_), KP(ctx_->session_), KP(ctx_));
+      COMMON_LOG(WARN, "Lob: error condition", K(ret), K(is_outline_), KP(ctx_));
     } else if (OB_ISNULL(lob_mngr)) {
       ret = OB_ERR_UNEXPECTED;
       COMMON_LOG(WARN, "Lob: get lob manager failed.", K(ret));
@@ -845,7 +876,7 @@ int ObTextStringIter::get_char_len(int64_t &char_length)
           ret = OB_INVALID_ARGUMENT;
           COMMON_LOG(WARN, "Lob: invalid param.", K(ret), K(read_ctx));
         } else if (OB_FAIL(lob_mngr->get_char_length(read_ctx, length))) {
-          COMMON_LOG(WARN, "Lob: falied to get outrow lob char len.", K(ret), K(read_ctx));
+          COMMON_LOG(WARN, "Lob: failed to get lob char len.", K(ret), K(read_ctx));
         } else {
           char_length = static_cast<int64_t>(length);
         }
@@ -869,11 +900,11 @@ int ObTextStringIter::convert_outrow_lob_to_inrow_templob(const ObObj &in_obj,
                                                           const sql::ObBasicSessionInfo *session,
                                                           ObIAllocator *allocator,
                                                           bool allow_persist_inrow,
-                                                          bool need_deep_copy)
+                                                          bool need_deep_copy,
+                                                          ObLobAccessCtx *lob_access_ctx)
 {
   int ret = OB_SUCCESS;
   ObObjType type = in_obj.get_type();
-  uint64_t byte_len = 0;
   int64_t lob_data_byte_len = 0;
   int64_t pos = 0;
   bool is_pass_thougth = true;
@@ -882,6 +913,8 @@ int ObTextStringIter::convert_outrow_lob_to_inrow_templob(const ObObj &in_obj,
   } else if (in_obj.is_null() || in_obj.is_nop_value()) {
   } else {
     ObLobLocatorV2 loc(in_obj.get_string());
+    ObArenaAllocator tmp_alloc("ConLobOutToIn", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+    ObTextStringIter instr_iter(in_obj);
     if (!loc.is_valid()) {
       ret = OB_INVALID_ARGUMENT;
       COMMON_LOG(WARN, "Lob: invalid lob loc", K(ret), K(loc), K(in_obj));
@@ -890,9 +923,10 @@ int ObTextStringIter::convert_outrow_lob_to_inrow_templob(const ObObj &in_obj,
     } else if (loc.is_append_delta_lob()) {
       ret = OB_INVALID_ARGUMENT;
       COMMON_LOG(WARN, "Lob: converting delta lob!", K(ret));
-    } else if (OB_FAIL(ObLobManager::get_byte_length(loc, byte_len))) {
+    } else if (OB_FAIL(instr_iter.init(0, session, allocator, &tmp_alloc, lob_access_ctx))) {
+      COMMON_LOG(WARN, "Lob: init text string iter failed", K(ret), K(instr_iter));
+    } else if (OB_FAIL(instr_iter.get_byte_len(lob_data_byte_len))) {
       COMMON_LOG(WARN, "Lob: failed to get lob data byte length", K(ret), K(in_obj));
-    } else if (FALSE_IT(lob_data_byte_len = static_cast<int64_t>(byte_len))) {
     } else if (lob_data_byte_len < 0 || lob_data_byte_len > UINT32_MAX) {
       ret = OB_INVALID_ARGUMENT;
       COMMON_LOG(WARN, "Lob: inrow lob data length error", K(lob_data_byte_len));
@@ -903,25 +937,27 @@ int ObTextStringIter::convert_outrow_lob_to_inrow_templob(const ObObj &in_obj,
         COMMON_LOG(WARN, "Lob: init tmp lob failed", K(ret), K(lob_data_byte_len));
       } else {
         // copy inrow data
-        ObTextStringIterState state;
+        ObTextStringIterState state = TEXTSTRING_ITER_INIT;
         ObString src_block_data;
-        ObArenaAllocator tmp_alloc("ConLobOutToIn", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
-        ObTextStringIter instr_iter(in_obj);
-        if (OB_FAIL(ret)) {
-        } else if (OB_FAIL(instr_iter.init(0, session, allocator, &tmp_alloc))) {
-          COMMON_LOG(WARN, "Lob: init text string iter failed", K(instr_iter));
-        } else {
-          while (OB_SUCC(ret)
-                && pos < lob_data_byte_len
-                && (state = instr_iter.get_next_block(src_block_data)) == TEXTSTRING_ITER_NEXT) {
-            if (OB_FAIL(new_tmp_lob.append(src_block_data))) {
-              COMMON_LOG(WARN, "Lob: tmp lob append failed",
-                K(ret), K(lob_data_byte_len), K(pos), K(src_block_data), K(new_tmp_lob));
-            } else {
-              pos += src_block_data.length();
-            }
+        while (OB_SUCC(ret)
+              && pos < lob_data_byte_len
+              && TEXTSTRING_ITER_NEXT == (state = instr_iter.get_next_block(src_block_data))) {
+          if (OB_FAIL(new_tmp_lob.append(src_block_data))) {
+            COMMON_LOG(WARN, "Lob: tmp lob append failed", K(ret), K(lob_data_byte_len), K(pos),
+                                                           K(src_block_data), K(new_tmp_lob));
+          } else {
+            pos += src_block_data.length();
           }
-          OB_ASSERT(pos == lob_data_byte_len);
+        }
+        if (OB_SUCC(ret) && OB_UNLIKELY(TEXTSTRING_ITER_INVALID == state)) {
+          ret = instr_iter.get_inner_ret();
+          if (OB_UNLIKELY(OB_SUCCESS == ret)) {
+            ret = OB_ERR_UNEXPECTED;
+          }
+          COMMON_LOG(WARN, "Lob: failed to read source data", KR(ret), K(pos), K(state));
+        }
+        if (OB_SUCC(ret)) {
+          // Allocate resolved length; short EOF reads return appended data only, no zero fill.
           ObString res;
           new_tmp_lob.get_result_buffer(res);
           out_obj = in_obj; // copy meta

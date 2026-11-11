@@ -13,6 +13,10 @@
 
 namespace oceanbase
 {
+namespace blocksstable
+{
+class MacroBlockId;
+}
 namespace storage
 {
 
@@ -44,13 +48,20 @@ public:
   };
   ObLobChunkType() : type_(INVALID_TYPE) {}
   void reset() { type_ = INVALID_TYPE; }
+  // Deprecated; use in_table() to handle INVALID_TYPE compatibility.
   bool is_valid() const { return type_ != INVALID_TYPE; }
   void set_in_table() { type_ = IN_TABLE; }
-  bool in_table() const { return (IN_TABLE == type_) || (INVALID_TYPE == type_); }
+  // Treat INVALID_TYPE as IN_TABLE for compatibility.
+  bool in_table() const { return type_ == IN_TABLE || type_ == INVALID_TYPE; }
+  void set_out_table() { type_ = OUT_TABLE; }
+  bool out_table() const { return type_ == OUT_TABLE; }
+  void set_external_reference() { type_ = EXTERNAL_REFERENCE; }
+  bool external_reference() const { return EXTERNAL_REFERENCE == type_; }
 
   const char *to_string() const;
   int64_t to_string(char *buf, int buf_len) const;
   int from_string(const char *str);
+  int from_string(const ObString &str);
 private:
   Type type_;
 };
@@ -69,14 +80,18 @@ public:
   ~ObLobMetaExtraInfo() { reset(); }
   void reset();
   int serialize(ObIAllocator &allocator, ObString &str);
-  int deserialize(const ObString &str);
+  int deserialize(ObIAllocator &allocator, const ObString &str);
+  int set_external_lob_info(ObIAllocator &allocator,
+                            const common::ObExternalBlobInfo &external_lob_info);
+  bool is_external_lob() const { return lob_chunk_type_.external_reference(); }
   bool is_valid();
-  TO_STRING_KV(K(extra_info_type_), K(lob_chunk_type_), K(chunk_count_), K(last_write_type_));
+  TO_STRING_KV(K(extra_info_type_), K(lob_chunk_type_), K(chunk_count_), K(last_write_type_), K(external_lob_info_));
 public:
   ExtraInfoType extra_info_type_;
   ObLobChunkType lob_chunk_type_;
   uint64_t chunk_count_;
   ObLobLastWriteType last_write_type_;
+  common::ObExternalBlobInfo external_lob_info_;
 };
 
 struct ObLobMetaInfo 
@@ -138,6 +153,7 @@ class ObLobMetaUtil
 public:
   static constexpr uint64_t LOB_META_COLUMN_CNT = 7;
   static constexpr uint64_t LOB_META_SCHEMA_ROWKEY_COL_CNT = 3;
+  static constexpr int64_t LOB_META_MACRO_ID_COLUMN_CNT = 2;
   static constexpr uint64_t LOB_COL_IDX_COL_ID   = 0;
   static constexpr uint64_t LOB_ID_COL_ID        = 1;
   static constexpr uint64_t SEQ_ID_COL_ID        = 2;
@@ -146,11 +162,24 @@ public:
   static constexpr uint64_t LOB_INFO_COL_ID      = 5;
   static constexpr uint64_t LOB_BLOCK_ID_COL_ID  = 6;
   static constexpr uint64_t LOB_PIECE_DATA_SIZE = 256 * 1024; // 256K
+  static constexpr int64_t LOB_OUTTABLE_BLOCK_DATA_SIZE = 2L * 1024L * 1024L;
   // direct load (DDL batch write) path, number of MVCC columns between rowkey and normal
   // metadata columns (2 columns: trans_version + seq_no)
   static constexpr uint64_t SKIP_INVALID_COLUMN = 2;
 
 public:
+  // Decode a projected [info, lob_block_id] row; non-OutTable rows return an invalid macro ID.
+  static int get_lob_meta_macro_id(const blocksstable::ObDatumRow &row,
+      common::ObIAllocator &allocator, blocksstable::MacroBlockId &macro_id);
+  // Store identity only in External summary; the caller's allocator manages the encoding buffer.
+  static int serialize_external_lob_block_id(ObIAllocator &allocator,
+                                             const uint64_t tablet_id,
+                                             const uint64_t external_lob_seq_id,
+                                             ObString &str);
+  static int deserialize_external_lob_block_id(const ObString &str,
+                                               uint64_t &tablet_id,
+                                               uint64_t &external_lob_seq_id);
+
   static int transform_from_info_to_row(const ObLobMetaInfo &info, blocksstable::ObDatumRow *row,
     bool with_extra_rowkey);
 

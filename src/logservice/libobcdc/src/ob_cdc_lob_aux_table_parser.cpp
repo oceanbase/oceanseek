@@ -77,6 +77,7 @@ int ObCDCLobAuxTableParser::get_string_value_(
 }
 
 int ObCDCLobAuxTableParser::parse_lob_aux_meta_table_row(
+    common::ObIAllocator &allocator,
     ColValueList &cols,
     storage::ObLobMetaInfo &meta_info,
     bool &is_summary,
@@ -174,7 +175,7 @@ int ObCDCLobAuxTableParser::parse_lob_aux_meta_table_row(
       || !storage::ObLobSeqId(meta_info.seq_id_).is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_ERROR("invalid lob meta table row", KR(ret), K(seen_columns), K(meta_info));
-  } else if (OB_FAIL(parse_lob_meta_summary_info_(meta_info, is_summary, extra_info))) {
+  } else if (OB_FAIL(parse_lob_meta_summary_info_(allocator, meta_info, is_summary, extra_info))) {
     LOG_ERROR("parse lob meta summary info failed", KR(ret), K(meta_info));
   }
 
@@ -267,12 +268,12 @@ int ObCDCLobAuxTableParser::parse_lob_aux_table_row(
     storage::ObLobMetaInfo meta_info;
     storage::ObLobMetaExtraInfo extra_info;
     bool is_summary = false;
-    if (OB_FAIL(parse_lob_aux_meta_table_row(cols, meta_info, is_summary, extra_info))) {
+    if (OB_FAIL(parse_lob_aux_meta_table_row(allocator, cols, meta_info, is_summary, extra_info))) {
       LOG_ERROR("parse lob meta table row failed", KR(ret));
     } else if (!is_summary) {
       // Non-summary Meta rows do not carry chunk data and are not cached.
-    } else if (OB_UNLIKELY(!extra_info.lob_chunk_type_.in_table())) {
-      // TODO(binifei.bnf): 目前仅支持in_table，后续支持out_table时，再加out_table判断
+    } else if (OB_UNLIKELY(!extra_info.lob_chunk_type_.in_table()
+        && !extra_info.lob_chunk_type_.out_table())) {
       ret = OB_NOT_SUPPORTED;
       LOG_ERROR("unsupported lob chunk type in summary", KR(ret), K(extra_info), K(meta_info));
     } else if (OB_FAIL(encode_summary_value(allocator, meta_info, cache_value))) {
@@ -318,6 +319,7 @@ int ObCDCLobAuxTableParser::is_summary_meta_(
 }
 
 int ObCDCLobAuxTableParser::parse_lob_meta_summary_info_(
+    common::ObIAllocator &allocator,
     const storage::ObLobMetaInfo &meta_info,
     bool &is_summary,
     storage::ObLobMetaExtraInfo &extra_info)
@@ -327,7 +329,7 @@ int ObCDCLobAuxTableParser::parse_lob_meta_summary_info_(
     LOG_ERROR("check lob summary row failed", KR(ret), K(meta_info));
   } else if (!is_summary) {
     // Non-summary Meta rows do not carry Summary extra info.
-  } else if (OB_FAIL(extra_info.deserialize(meta_info.lob_extra_info_))) {
+  } else if (OB_FAIL(extra_info.deserialize(allocator, meta_info.lob_extra_info_))) {
     LOG_ERROR("deserialize lob summary failed", KR(ret), K(meta_info));
   } else if (OB_UNLIKELY(
       storage::ObLobMetaExtraInfo::LOB_META_SUMMARY != extra_info.extra_info_type_)) {
@@ -367,6 +369,7 @@ int ObCDCLobAuxTableParser::encode_summary_value(
 }
 
 int ObCDCLobAuxTableParser::decode_summary_value(
+    common::ObIAllocator &allocator,
     const common::ObString &value,
     uint64_t &byte_len,
     uint64_t &char_len,
@@ -391,7 +394,7 @@ int ObCDCLobAuxTableParser::decode_summary_value(
           K(SUMMARY_VALUE_MAGIC), K(SUMMARY_EXTRA_INFO_OFFSET));
     } else {
       common::ObString info(info_len, value.ptr() + SUMMARY_EXTRA_INFO_OFFSET);
-      if (OB_FAIL(extra_info.deserialize(info))) {
+      if (OB_FAIL(extra_info.deserialize(allocator, info))) {
         LOG_ERROR("deserialize lob summary extra info failed", KR(ret), K(value));
       }
     }

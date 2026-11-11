@@ -10507,16 +10507,16 @@ const char *ob_table_type_str(ObTableType type)
       type_ptr = "AUX LOB META";
       break;
     }
-  case AUX_OUTTABLE_LOB_CONTROL: {
-      type_ptr = "AUX OUTTABLE LOB CONTROL";
-      break;
-    }
   case EXTERNAL_TABLE: {
       type_ptr = "EXTERNAL TABLE";
       break;
     }
   case MATERIALIZED_VIEW_LOG: {
       type_ptr = "MATERIALIZED VIEW LOG";
+      break;
+    }
+  case AUX_OUTTABLE_LOB_CONTROL: {
+      type_ptr = "AUX OUTTABLE LOB CONTROL";
       break;
     }
   default: {
@@ -10553,6 +10553,9 @@ const char *ob_mysql_table_type_str(ObTableType type)
       break;
     case EXTERNAL_TABLE:
       type_ptr = "EXTERNAL TABLE";
+      break;
+    case AUX_OUTTABLE_LOB_CONTROL:
+      type_ptr = "BASE TABLE";
       break;
     default:
       LOG_WARN_RET(OB_ERR_UNEXPECTED, "unkonw table type", K(type));
@@ -10608,6 +10611,11 @@ bool is_aux_lob_piece_table(const ObTableType table_type)
 bool is_aux_lob_table(const ObTableType table_type)
 {
   return is_aux_lob_meta_table(table_type) || is_aux_lob_piece_table(table_type);
+}
+
+bool is_aux_outtable_lob_control_table(const ObTableType table_type)
+{
+  return ObTableType::AUX_OUTTABLE_LOB_CONTROL == table_type;
 }
 
 bool is_mlog_table(const ObTableType table_type)

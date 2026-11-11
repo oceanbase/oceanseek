@@ -26,6 +26,8 @@ namespace storage
 
 class ObSSMetaCtrlTableOperator;
 class ObAtomicProtocolCtrl;
+class ObOuttableLobControlManager;
+struct ObOuttableLobControlRow;
 
 struct ObSSFailGCCtrlRow final
 {
@@ -223,6 +225,28 @@ public:
 private:
   bool is_inited_;
   DISALLOW_COPY_AND_ASSIGN(ObSSFailGCPrepareTask);
+};
+
+class ObSSLobCtrlFailGCTask final : public ObSharedGCBaseTask
+{
+public:
+  ObSSLobCtrlFailGCTask();
+  virtual ~ObSSLobCtrlFailGCTask() = default;
+  int init();
+  virtual int process() override;
+  VIRTUAL_TO_STRING_KV("task", "ObSSLobCtrlFailGCTask", KP(this), K_(is_inited));
+
+private:
+  int process_lob_ctrl_fail_gc_(ObSSFailGCDagCtx &ctx);
+  int delete_expired_fail_row_(
+      ObSSFailGCDagCtx &ctx,
+      ObOuttableLobControlManager &manager,
+      const ObOuttableLobControlRow &row,
+      bool &continue_scan);
+
+private:
+  bool is_inited_;
+  DISALLOW_COPY_AND_ASSIGN(ObSSLobCtrlFailGCTask);
 };
 
 class ObSSFailGCScheduleTask final : public ObSharedGCBaseTask

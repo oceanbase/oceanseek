@@ -189,6 +189,7 @@ int ObRemoteBaseExecuteP<T>::auto_start_phy_trans()
   int ret = OB_SUCCESS;
   ObPhysicalPlanCtx *plan_ctx = GET_PHY_PLAN_CTX(exec_ctx_);
   ObSQLSessionInfo *my_session = GET_MY_SESSION(exec_ctx_);
+  exec_ctx_.set_outtable_lob_control_owned_tx(nullptr);
   if (OB_ISNULL(plan_ctx) || OB_ISNULL(my_session)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("plan_ctx or my_session is NULL", K(ret), K(plan_ctx), K(my_session));
@@ -225,6 +226,8 @@ int ObRemoteBaseExecuteP<T>::auto_start_phy_trans()
           LOG_WARN("fail to start stmt", K(ret));
       } else {
         trans_state_.set_start_stmt_executed(OB_SUCC(ret));
+        // A forwarded transaction or PX branch must not inherit this local ownership proof.
+        exec_ctx_.set_outtable_lob_control_owned_tx(my_session->get_tx_desc());
       }
     }
 
@@ -387,6 +390,7 @@ int ObRemoteBaseExecuteP<T>::auto_end_phy_trans(bool is_rollback)
   int end_ret = OB_SUCCESS;
   bool ac = false;
   ObSQLSessionInfo *my_session = GET_MY_SESSION(exec_ctx_);
+  exec_ctx_.set_outtable_lob_control_owned_tx(nullptr);
   // NOTE: 事务状态已经在auto_start_phy_trans()里面改变过了，
   // 不可以再调用ObSqlTransUtil::is_remote_trans来判断。
   // 所以依据内部的trans_state_来判断即可
@@ -915,6 +919,7 @@ int ObRemoteBaseExecuteP<T>::base_after_process()
 template<typename T>
 void ObRemoteBaseExecuteP<T>::base_cleanup()
 {
+  exec_ctx_.set_outtable_lob_control_owned_tx(nullptr);
   exec_ctx_.cleanup_session();
   exec_errcode_ = OB_SUCCESS;
   obrpc::ObRpcProcessor<T>::cleanup();

@@ -39,6 +39,7 @@ public:
   static const int64_t TMP_FILE_SCATTER_DIR_NUM = 1000;
   static const int64_t SHARED_MACRO_SCATTER_DIR_NUM = 256;
   static const int64_t EXTERNAL_TABLE_FILE_SCATTER_DIR_NUM = 256;
+  static const int64_t EXTERNAL_LOB_SCATTER_DIR_NUM = 256;
   static ObDirManager &get_instance();
   int set_object_storage_root_dir(const char *dir_path);
   static int fsync_dir(const char *dir_path);
@@ -194,6 +195,11 @@ public:
                                                  const int64_t scatter_id);
   int get_object_storage_root_dir(char *&path);
   OB_INLINE const char *get_local_cache_root_dir() const { return OB_FILE_SYSTEM_ROUTER.get_sstable_dir(); }
+  int get_external_lob_cache_dir(
+      char *path,
+      const int64_t length,
+      const uint64_t tenant_id,
+      const int64_t tenant_epoch_id) const;
   int get_external_table_file_dir(
       char *path,
       const int64_t length,

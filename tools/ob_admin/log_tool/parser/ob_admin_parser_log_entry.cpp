@@ -352,6 +352,18 @@ int ObAdminParserLogEntry::parse_trans_service_log_(ObTxLogBlock &tx_log_block, 
               } else {/*do nothing*/}
               break;
             }
+            case transaction::ObTxLogType::TX_LOB_OUTTABLE_DATA_LOG: {
+              ObTxLobOutTableDataLog::ConstructArg arg;
+              ObTxLobOutTableDataLog outtable_log(arg);
+              if (OB_FAIL(dump_tx_id_ts_(str_arg_.writer_ptr_, tx_id, has_dumped_tx_id))) {
+                LOG_WARN("failed to dump_tx_id_ts_", K(ret));
+              } else if (OB_FAIL(tx_log_block.deserialize_log_body(outtable_log))) {
+                LOG_WARN("tx_log_block.deserialize_log_body failed", K(ret), K(outtable_log));
+              } else if (OB_FAIL(outtable_log.ob_admin_dump(str_arg_))) {
+                LOG_WARN("failed to dump ObTxLobOutTableDataLog", K(ret), K(outtable_log), K(str_arg_));
+              }
+              break;
+            }
             case transaction::ObTxLogType::TX_LOG_TYPE_LIMIT: {
               LOG_WARN("UNKNOWN tx log type", K(tx_log_block));
               break;

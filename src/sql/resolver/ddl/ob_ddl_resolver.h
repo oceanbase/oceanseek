@@ -747,6 +747,7 @@ protected:
       share::schema::ObColumnSchemaV2 &column_schema);
   int check_skip_index(share::schema::ObTableSchema &table_schema);
   int resolve_lob_inrow_threshold(const ParseNode *option_node, const bool is_index_option);
+  int resolve_lob_intable_threshold(const ParseNode *option_node, const bool is_index_option);
 
   int resolve_lob_storage_parameters(const ParseNode *node);
   int resolve_lob_storage_parameter(share::schema::ObColumnSchemaV2 &column, const ParseNode &param_node);
@@ -1206,6 +1207,8 @@ protected:
   bool have_generate_fts_arg_;
   bool is_set_lob_inrow_threshold_;
   int64_t lob_inrow_threshold_;
+  bool is_set_lob_intable_threshold_;
+  int64_t lob_intable_threshold_;
   bool have_generate_vec_arg_;
   int64_t auto_increment_cache_size_;
   ObExternalFileFormat::FormatType external_table_format_type_;

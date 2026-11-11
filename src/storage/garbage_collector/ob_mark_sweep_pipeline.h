@@ -334,6 +334,8 @@ public:
   // Pull merged_*_ from the underlying merger; only valid when
   // get_input_count(group, ...) returns <= 1 (caller's responsibility).
   int complete_group(const ObMarkSweepGroupType group);
+  // 发布一个有效的零行归并文件，用于表示输入已完整处理且结果集合为空。
+  int complete_empty_group(const ObMarkSweepGroupType group);
   // Final stage of merge: init diff iterator, release submitted file lists.
   int complete_merge();
 
@@ -343,6 +345,9 @@ public:
 
   // Deduplicated item count of the final merged file for a group (merged_del_/merged_kept_).
   int get_merged_item_count(const ObMarkSweepGroupType group, int64_t &count) const;
+  // 返回已归并文件的引用；未发布文件时返回 OB_ENTRY_NOT_EXIST，不作为空集合处理。
+  // 调用方必须在本管线 cleanup 前释放返回的文件引用。
+  int get_merged_file(const ObMarkSweepGroupType group, ObSortedFileInfo &file) const;
   // size of the final merged tmp file for a group (merged_del_/merged_kept_).
   // Returns 0 when the group has no merged file (empty group).
   int get_merged_file_size(const ObMarkSweepGroupType group, int64_t &size) const;

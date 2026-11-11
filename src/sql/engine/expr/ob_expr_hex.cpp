@@ -34,7 +34,8 @@ int ObExprHex::calc_result_type1(ObExprResType &type,
   const int32_t mbmaxlen = 4;
   if (ObTextType == param_type
       || ObMediumTextType == param_type
-      || ObLongTextType == param_type) {
+      || ObLongTextType == param_type
+      || ObExtendBLobType == param_type) {
     type.set_type(ObLongTextType);
     type.set_length(OB_MAX_LONGTEXT_LENGTH / mbmaxlen);
   } else if (ObTinyTextType ==param_type) {
@@ -259,7 +260,8 @@ int ObExprHex::eval_hex(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &expr_datum)
       } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(alloc_guard.get_allocator(),
                                                                    *arg,
                                                                    expr.args_[0]->datum_meta_,
-                                                                   input_str))) {
+                                                                   input_str,
+                                                                   &ctx.exec_ctx_))) {
         LOG_WARN("failed to get lob data", K(ret));
       }
       if (OB_SUCC(ret)) {
@@ -360,7 +362,8 @@ int ObExprHex::hex_string_vector(VECTOR_EVAL_FUNC_ARG_DECL)
         if (OB_FAIL(ObTextStringHelper::read_real_string_data(alloc_guard.get_allocator(),
                                                               tmp_datum,
                                                               expr.args_[0]->datum_meta_,
-                                                              input_str))) {
+                                                              input_str,
+                                                              &ctx.exec_ctx_))) {
           LOG_WARN("failed to read lob data", K(ret), K(idx));
         }
       }

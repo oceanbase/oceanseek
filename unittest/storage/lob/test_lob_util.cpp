@@ -18,6 +18,7 @@
 #include "share/schema/mock_schema_service.h"
 #include "share/schema/ob_schema_service_sql_impl.h"
 #include "storage/lob/access/ob_lob_retry.h"
+#include "storage/lob/common/ob_lob_context.h"
 #include "storage/lob/common/ob_lob_location.h"
 #include "storage/lob/common/ob_lob_util.h"
 #include "storage/lob/ob_lob_handler.h"
@@ -40,12 +41,69 @@ public:
   virtual void TearDown() {}
 };
 
+TEST_F(TestLobUtil, internal_and_system_tables_do_not_write_outtable)
+{
+  ObLobWriteContext ctx;
+  ctx.allow_outtable_lob_ = true;
+  ctx.tenant_id_ = 1002;
+  ctx.tablet_id_ = ObTabletID(200001);
+  ctx.intable_threshold_ = 0;
+  ASSERT_EQ(share::schema::TABLE_DEF_TYPE_MAX, ctx.table_def_type_);
+  ASSERT_FALSE(ctx.can_write_outtable());
+  ctx.table_def_type_ = share::schema::TABLE_DEF_TYPE_INTERNAL;
+  const uint64_t tenant_ids[] = {OB_SYS_TENANT_ID, 1001, 1002};
+  for (int64_t i = 0; i < ARRAYSIZEOF(tenant_ids); ++i) {
+    ctx.tenant_id_ = tenant_ids[i];
+    bool is_outtable = true;
+    ASSERT_EQ(OB_SUCCESS, ObLobUtil::check_write_outtable(ctx, UINT64_MAX, is_outtable));
+    ASSERT_FALSE(is_outtable);
+  }
+
+  ctx.table_def_type_ = share::schema::TABLE_DEF_TYPE_USER;
+  for (int64_t i = 0; i < 2; ++i) {
+    ctx.tenant_id_ = tenant_ids[i];
+    bool is_outtable = true;
+    ASSERT_EQ(OB_SUCCESS, ObLobUtil::check_write_outtable(ctx, UINT64_MAX, is_outtable));
+    ASSERT_FALSE(is_outtable);
+  }
+
+  ctx.tenant_id_ = 1002;
+  ctx.tablet_id_ = ObTabletID(1);
+  bool is_outtable = true;
+  ASSERT_EQ(OB_SUCCESS, ObLobUtil::check_write_outtable(ctx, UINT64_MAX, is_outtable));
+  ASSERT_FALSE(is_outtable);
+  ctx.tablet_id_ = ObTabletID(200001);
+  ASSERT_TRUE(ctx.can_write_outtable());
+}
+
+TEST_F(TestLobUtil, unsupported_outtable_write_uses_intable)
+{
+  ObLobWriteContext ctx;
+  ctx.tenant_id_ = 1002;
+  ctx.tablet_id_ = ObTabletID(200001);
+  ctx.table_def_type_ = share::schema::TABLE_DEF_TYPE_USER;
+  ctx.inrow_threshold_ = 0;
+  ctx.intable_threshold_ = 0;
+  ASSERT_FALSE(ctx.allow_outtable_lob_);
+  ASSERT_FALSE(ctx.can_write_outtable());
+
+  const uint64_t byte_lengths[] = {1, OB_DEFAULT_LOB_INTABLE_THRESHOLD + 1, UINT64_MAX};
+  for (int64_t i = 0; i < ARRAYSIZEOF(byte_lengths); ++i) {
+    bool is_outtable = true;
+    ASSERT_EQ(OB_SUCCESS, ObLobUtil::check_write_outtable(ctx, byte_lengths[i], is_outtable));
+    ASSERT_FALSE(is_outtable);
+  }
+
+  ctx.allow_outtable_lob_ = true;
+  ASSERT_TRUE(ctx.can_write_outtable());
+}
+
 //==================== adjust_range ====================
 TEST_F(TestLobUtil, adjust_range_in_range)
 {
   uint64_t offset = 10;
   uint64_t len = 50;
-  adjust_range(100, offset, len);
+  ObLobUtil::adjust_range(100, offset, len);
   ASSERT_EQ(10, offset);
   ASSERT_EQ(50, len);
 }
@@ -54,7 +112,7 @@ TEST_F(TestLobUtil, adjust_range_offset_overflow)
 {
   uint64_t offset = 200;
   uint64_t len = 50;
-  adjust_range(100, offset, len);
+  ObLobUtil::adjust_range(100, offset, len);
   ASSERT_EQ(100, offset);
   ASSERT_EQ(0, len);
 }
@@ -63,7 +121,7 @@ TEST_F(TestLobUtil, adjust_range_len_overflow)
 {
   uint64_t offset = 80;
   uint64_t len = 50;
-  adjust_range(100, offset, len);
+  ObLobUtil::adjust_range(100, offset, len);
   ASSERT_EQ(80, offset);
   ASSERT_EQ(20, len); // clamped to length - offset
 }
@@ -76,8 +134,9 @@ TEST_F(TestLobUtil, convert_range_ascii)
   uint64_t char_length = 3;
   uint64_t byte_offset = 0;
   uint64_t byte_length = 0;
-  convert_char_range_to_byte_range(CS_TYPE_UTF8MB4_BIN, data, 10,
-                                   char_offset, char_length, byte_offset, byte_length);
+  ObLobUtil::convert_char_range_to_byte_range(
+      CS_TYPE_UTF8MB4_BIN, data, 10,
+      char_offset, char_length, byte_offset, byte_length);
   ASSERT_EQ(2, byte_offset);
   ASSERT_EQ(3, byte_length);
 }
@@ -90,8 +149,9 @@ TEST_F(TestLobUtil, convert_range_multibyte)
   uint64_t char_length = 2;
   uint64_t byte_offset = 0;
   uint64_t byte_length = 0;
-  convert_char_range_to_byte_range(CS_TYPE_UTF8MB4_GENERAL_CI, data, 15,
-                                   char_offset, char_length, byte_offset, byte_length);
+  ObLobUtil::convert_char_range_to_byte_range(
+      CS_TYPE_UTF8MB4_GENERAL_CI, data, 15,
+      char_offset, char_length, byte_offset, byte_length);
   ASSERT_EQ(3, byte_offset);  // skip 1 char = 3 bytes
   ASSERT_EQ(6, byte_length);  // 2 chars = 6 bytes
 }
@@ -103,8 +163,9 @@ TEST_F(TestLobUtil, convert_range_clamp)
   uint64_t char_length = 100; // beyond remaining chars
   uint64_t byte_offset = 0;
   uint64_t byte_length = 0;
-  convert_char_range_to_byte_range(CS_TYPE_UTF8MB4_BIN, data, 10,
-                                   char_offset, char_length, byte_offset, byte_length);
+  ObLobUtil::convert_char_range_to_byte_range(
+      CS_TYPE_UTF8MB4_BIN, data, 10,
+      char_offset, char_length, byte_offset, byte_length);
   ASSERT_EQ(8, byte_offset);
   ASSERT_EQ(2, byte_length); // clamped to remaining 2 chars
 }

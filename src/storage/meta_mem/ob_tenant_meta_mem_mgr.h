@@ -204,7 +204,9 @@ public:
       const share::SCN &ls_checkpoint,
       share::SCN &min_end_scn_from_latest,
       share::SCN &min_end_scn_from_old);
-  int scan_all_version_tablets(const ObTabletMapKey &key, const ObFunction<int(ObTablet &)> &op);
+  int scan_all_version_tablets(const ObTabletMapKey &key,
+      const ObFunction<int(ObTablet &)> &op,
+      int64_t &tablet_cnt);
 
   // garbage collector for sstable and memtable.
   int push_table_into_gc_queue(ObITable *table, const ObITable::TableType table_type);

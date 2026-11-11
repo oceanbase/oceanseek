@@ -6483,6 +6483,13 @@ int ObSchemaPrinter::print_table_definition_lob_params(const ObTableSchema &tabl
   } else if (OB_FAIL(databuff_printf(buf, buf_len, pos, "LOB_INROW_THRESHOLD=%ld ", table_schema.get_lob_inrow_threshold()))) {
     SHARE_SCHEMA_LOG(WARN, "fail to print lob inrow threshold", K(ret), K(table_schema));
   }
+  if (OB_SUCC(ret) && data_version >= DATA_VERSION_4_6_3_1
+      && OB_DEFAULT_LOB_INTABLE_THRESHOLD != table_schema.get_lob_intable_threshold()) {
+    if (OB_FAIL(databuff_printf(buf, buf_len, pos, "LOB_INTABLE_THRESHOLD=%ld ",
+                                table_schema.get_lob_intable_threshold()))) {
+      SHARE_SCHEMA_LOG(WARN, "fail to print lob intable threshold", KR(ret), K(table_schema));
+    }
+  }
   return ret;
 }
 

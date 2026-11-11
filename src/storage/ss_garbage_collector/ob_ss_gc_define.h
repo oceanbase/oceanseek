@@ -13,6 +13,7 @@
 #include "lib/net/ob_addr.h"
 #include "share/scn.h"
 #include "share/ob_ls_id.h"
+#include "storage/ss_garbage_collector/ob_ss_gc_util.h"
 
 namespace oceanbase
 {
@@ -130,24 +131,38 @@ public:
   static const int32_t SS_GC_TABLET_WITH_META_SCN_VERSION = 1;
   OB_UNIS_VERSION(SS_GC_TABLET_WITH_META_SCN_VERSION);
 public:
-  ObSSGCTabletWithMetaScn() : gc_tablet_(), meta_scn_() {}
+  ObSSGCTabletWithMetaScn()
+    : gc_tablet_(), meta_scn_(), clog_checkpoint_scn_(share::SCN::max_scn()),
+      orig_clog_checkpoint_scn_(share::SCN::max_scn())
+  {}
   ObSSGCTabletWithMetaScn(const ObSSGCTablet &gc_tablet,
-                         const share::SCN &meta_scn)
-    : gc_tablet_(gc_tablet), meta_scn_(meta_scn)
+                          const share::SCN &meta_scn,
+                          const share::SCN &clog_checkpoint_scn = share::SCN::max_scn(),
+                          const share::SCN &orig_clog_checkpoint_scn = share::SCN::max_scn())
+    : gc_tablet_(gc_tablet), meta_scn_(meta_scn), clog_checkpoint_scn_(clog_checkpoint_scn),
+      orig_clog_checkpoint_scn_(orig_clog_checkpoint_scn)
   {}
   ObSSGCTabletWithMetaScn(const share::ObLSID &ls_id,
                          const common::ObTabletID &tablet_id,
                          const share::SCN &transfer_scn,
                          const share::SCN &meta_scn)
-    : gc_tablet_(ls_id, tablet_id, transfer_scn), meta_scn_(meta_scn)
+    : gc_tablet_(ls_id, tablet_id, transfer_scn), meta_scn_(meta_scn),
+      clog_checkpoint_scn_(share::SCN::max_scn()), orig_clog_checkpoint_scn_(share::SCN::max_scn())
   {}
   ~ObSSGCTabletWithMetaScn() {}
   bool is_valid() const;
+  bool is_cold() const
+  {
+    return ObSSGCUtil::is_cold_lob_tablet(orig_clog_checkpoint_scn_, clog_checkpoint_scn_);
+  }
 
 public:
   ObSSGCTablet gc_tablet_;
   share::SCN meta_scn_;
-  TO_STRING_KV(K_(gc_tablet), K_(meta_scn));
+  // Frozen Study checkpoints; MAX defaults preserve the shared cutoff for older inputs.
+  share::SCN clog_checkpoint_scn_;
+  share::SCN orig_clog_checkpoint_scn_;
+  TO_STRING_KV(K_(gc_tablet), K_(meta_scn), K_(clog_checkpoint_scn), K_(orig_clog_checkpoint_scn));
 };
 
 
@@ -158,13 +173,18 @@ public:
     : min_dep_meta_scn_(),
       min_major_snapshot_(0),
       clog_checkpoint_scn_(share::SCN::max_scn()),
-      multi_version_start_(INT64_MAX)
+      multi_version_start_(INT64_MAX),
+      orig_clog_checkpoint_scn_(share::SCN::max_scn())
   {}
-  ObSSGCTabletStudyInfo(const share::SCN &min_dep_meta_scn, const int64_t min_major_snapshot)
+  ObSSGCTabletStudyInfo(const share::SCN &min_dep_meta_scn,
+                        const int64_t min_major_snapshot,
+                        const share::SCN &clog_checkpoint_scn,
+                        const int64_t multi_version_start)
     : min_dep_meta_scn_(min_dep_meta_scn),
       min_major_snapshot_(min_major_snapshot),
-      clog_checkpoint_scn_(share::SCN::max_scn()),
-      multi_version_start_(INT64_MAX)
+      clog_checkpoint_scn_(clog_checkpoint_scn),
+      multi_version_start_(multi_version_start),
+      orig_clog_checkpoint_scn_(clog_checkpoint_scn)
   {}
   ~ObSSGCTabletStudyInfo() {}
   bool has_finite_rely() const
@@ -185,6 +205,7 @@ public:
     min_major_snapshot_ = INT64_MAX;
     clog_checkpoint_scn_.set_max();
     multi_version_start_ = INT64_MAX;
+    orig_clog_checkpoint_scn_.set_max();
   }
   void set_to_min()
   {
@@ -192,14 +213,26 @@ public:
     min_major_snapshot_ = 0;
     clog_checkpoint_scn_.set_min();
     multi_version_start_ = 0;
+    orig_clog_checkpoint_scn_.set_min();
   }
+  bool is_cold() const
+  {
+    return ObSSGCUtil::is_cold_lob_tablet(orig_clog_checkpoint_scn_, clog_checkpoint_scn_);
+  }
+  bool is_major_rely() const { return INT64_MAX != min_major_snapshot_; }
+  bool is_lob_rely() const { return !clog_checkpoint_scn_.is_max() || INT64_MAX != multi_version_start_; }
 
 public:
   share::SCN min_dep_meta_scn_;
   int64_t min_major_snapshot_;
-  share::SCN clog_checkpoint_scn_; // Reserved for OutTable LOB GC.
-  int64_t multi_version_start_; // Reserved for OutTable LOB GC.
-  TO_STRING_KV(K_(min_dep_meta_scn), K_(min_major_snapshot));
+  // Effective LOB checkpoint: LS checkpoint for cold tablets, MIN for incomplete data.
+  share::SCN clog_checkpoint_scn_;
+  // Minimum multi-version start across local versions and servers.
+  int64_t multi_version_start_;
+  // Minimum raw checkpoint across local versions and servers, before cold-tablet adjustment.
+  share::SCN orig_clog_checkpoint_scn_;
+  TO_STRING_KV(K_(min_dep_meta_scn), K_(min_major_snapshot), K_(clog_checkpoint_scn),
+      K_(multi_version_start), K_(orig_clog_checkpoint_scn));
 };
 
 
@@ -212,8 +245,11 @@ public:
   ObSSGCTabletStudyResult() : gc_tablet_(), study_info_() {}
   ObSSGCTabletStudyResult(const ObSSGCTablet &gc_tablet,
                           const share::SCN &min_dep_meta_scn,
-                          const int64_t min_major_snapshot)
-    : gc_tablet_(gc_tablet), study_info_(min_dep_meta_scn, min_major_snapshot)
+                          const int64_t min_major_snapshot,
+                          const share::SCN &clog_checkpoint_scn,
+                          const int64_t multi_version_start)
+    : gc_tablet_(gc_tablet),
+      study_info_(min_dep_meta_scn, min_major_snapshot, clog_checkpoint_scn, multi_version_start)
   {}
   ObSSGCTabletStudyResult(const ObSSGCTablet &gc_tablet,
                           const ObSSGCTabletStudyInfo &study_info)
@@ -223,9 +259,11 @@ public:
                           const common::ObTabletID &tablet_id,
                           const share::SCN &transfer_scn,
                           const share::SCN &min_dep_meta_scn,
-                          const int64_t min_major_snapshot)
+                          const int64_t min_major_snapshot,
+                          const share::SCN &clog_checkpoint_scn,
+                          const int64_t multi_version_start)
     : gc_tablet_(ls_id, tablet_id, transfer_scn),
-      study_info_(min_dep_meta_scn, min_major_snapshot)
+      study_info_(min_dep_meta_scn, min_major_snapshot, clog_checkpoint_scn, multi_version_start)
   {}
   ~ObSSGCTabletStudyResult() {}
   bool is_valid() const;

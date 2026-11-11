@@ -144,7 +144,9 @@ void ObStorageAsyncBase::free_async_context(ObStorageAsyncContext *&context)
 
 ObStorageAsyncReader::ObStorageAsyncReader()
   : ObStorageAsyncBase(), 
-    has_meta_(false)
+    has_meta_(false),
+    has_if_match_etag_(false),
+    if_match_etag_()
 {}
 
 ObStorageAsyncReader::~ObStorageAsyncReader() { ObStorageAsyncReader::reset(); }
@@ -152,6 +154,8 @@ ObStorageAsyncReader::~ObStorageAsyncReader() { ObStorageAsyncReader::reset(); }
 void ObStorageAsyncReader::reset() 
 {
   has_meta_ = false;
+  has_if_match_etag_ = false;
+  if_match_etag_.reset();
   ObStorageAsyncBase::reset();
 }
 
@@ -199,6 +203,30 @@ int ObStorageAsyncReader::open(
   return ret;
 }
 
+int ObStorageAsyncReader::open(
+    const ObString &uri,
+    ObObjectStorageInfo *storage_info,
+    const bool has_meta,
+    const char *etag)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(etag) || OB_UNLIKELY(0 == STRLEN(etag) || has_meta)) {
+    ret = OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "etag is null", KR(ret));
+  } else if (OB_FAIL(open(uri, storage_info, has_meta))) {
+    OB_LOG(WARN, "failed to open async reader", KR(ret), K(uri), KPC(storage_info));
+  } else if (OB_FAIL(ob_write_string(allocator_, ObString(etag), if_match_etag_, true/*c_style*/))) {
+    OB_LOG(WARN, "failed to copy if-match etag", KR(ret));
+  } else {
+    has_if_match_etag_ = true;
+  }
+
+  if (OB_FAIL(ret)) {
+    reset();
+  }
+  return ret;
+}
+
 int ObStorageAsyncReader::pread(
     char *buf, 
     const int64_t buf_size,
@@ -226,13 +254,16 @@ int ObStorageAsyncReader::pread(
       }
     }
     // Notice:
-    // Once the context is successfully allocated, obdal_async_operator_read must be called.
+    // Once the context is successfully allocated, an OpenDAL async read function must be called.
     // ObDal guarantees that this function will call the callback regardless of success or failure,
     // and only then will the context be released from memory. Otherwise, a memory leak will occur.
     // Therefore, you cannot add any operations that might fail between these two lines.
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(alloc_and_assign_async_context(cb, ctx, context, offset, expected_bytes))) {
       OB_LOG(WARN, "failed to alloc and assign async context", KR(ret), KP(cb), KP(ctx));
+    } else if (has_if_match_etag_) {
+      ObDalAccessor::obdal_async_operator_read_with_if_match(
+          async_op_, object_.ptr(), buf, buf_size, offset, if_match_etag_.ptr(), callback, context);
     } else {
       ObDalAccessor::obdal_async_operator_read(async_op_, object_.ptr(), buf, buf_size, offset, callback, context);
     }

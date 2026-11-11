@@ -176,8 +176,11 @@ int ObDirectLoadLobAuxRowIter::get_next_row(const ObDirectLoadDatumRow *&result_
 int ObDirectLoadLobAuxRowIter::switch_next_lob_aux_key()
 {
   int ret = OB_SUCCESS;
-  // 删除请求中的LOB都是out-row，必须能扫描到对应辅助表行
-  if (OB_UNLIKELY(nullptr != lob_aux_key_row_ && lob_aux_key_row_cnt_ == 0)) {
+  // OutTable LOBs have no Piece rows; allow empty Piece deletion scans, but require Meta rows.
+  if (OB_UNLIKELY(nullptr != lob_aux_key_row_ && lob_aux_key_row_cnt_ == 0
+                 && !(nullptr != origin_scanner_
+                      && origin_scanner_->is_lob_piece_table()
+                      && lob_aux_key_row_->is_delete_))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected lob aux row count", KR(ret), KPC(lob_aux_key_row_));
   } else if (FALSE_IT(lob_aux_key_row_cnt_ = 0)) {

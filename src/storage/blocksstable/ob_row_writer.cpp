@@ -12,14 +12,14 @@ using namespace common;
 using namespace storage;
 using namespace blocksstable;
 
-// Helper to check outrow status for both ObObj and ObStorageDatum in template code.
-// ObStorageDatum has is_outrow(); ObObj no longer does after ObLobScale cleanup.
-static OB_INLINE bool cell_is_outrow(const ObStorageDatum &datum)
+// Helper to check outline status for both ObObj and ObStorageDatum in template code.
+// ObStorageDatum uses is_outline(); ObObj uses is_outrow_lob().
+static OB_INLINE bool cell_is_outline(const ObStorageDatum &datum)
 {
-  return datum.is_outrow();
+  return datum.is_outline();
 }
 
-static OB_INLINE bool cell_is_outrow(const ObObj &obj)
+static OB_INLINE bool cell_is_outline(const ObObj &obj)
 {
   return obj.is_outrow_lob();
 }
@@ -1480,7 +1480,8 @@ int ObRowWriterV0::append_sparse_cell_array(
       } else if (cells[i].is_null()) {
         special_vals_[column_index_count_] = ObRowHeader::VAL_NULL;
       } else {
-        special_vals_[column_index_count_] = cell_is_outrow(cells[i]) ? ObRowHeader::VAL_OUTROW : ObRowHeader::VAL_NORMAL;
+        special_vals_[column_index_count_] = cell_is_outline(cells[i]) ? ObRowHeader::VAL_OUTROW
+                                                                       : ObRowHeader::VAL_NORMAL;
         if (OB_FAIL(append_column(cells[i]))) {
           if (OB_BUF_NOT_ENOUGH != ret) {
             LOG_WARN("row writer fail to append column", K(ret), K(i), K(cells[i]));
@@ -1528,7 +1529,8 @@ int ObRowWriterV0::append_flat_cell_array(
       } else if (cells[i].is_null()) {
         special_vals_[column_index_count_] = ObRowHeader::VAL_NULL;
       } else {
-        special_vals_[column_index_count_] = cell_is_outrow(cells[i]) ? ObRowHeader::VAL_OUTROW : ObRowHeader::VAL_NORMAL;
+        special_vals_[column_index_count_] = cell_is_outline(cells[i]) ? ObRowHeader::VAL_OUTROW
+                                                                       : ObRowHeader::VAL_NORMAL;
         if (OB_FAIL(append_column(cells[i]))) {
           if (OB_BUF_NOT_ENOUGH != ret) {
             LOG_WARN("row writer fail to append column", K(ret), K(i), K(cells[i]));

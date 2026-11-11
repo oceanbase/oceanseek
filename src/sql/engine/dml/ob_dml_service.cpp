@@ -424,6 +424,24 @@ int ObDMLService::create_rowkey_check_hashset(int64_t estimate_row,
   return ret;
 }
 
+// The caller verified both are Mem External; result is 0 for the same reference, 1 for a change.
+static int check_external_lob_column_changed(const ObLobLocatorV2 &old_lob,
+                                             const ObLobLocatorV2 &new_lob, int64_t &result)
+{
+  int ret = OB_SUCCESS;
+  ObExternalBlobInfo old_external_lob_info;
+  ObExternalBlobInfo new_external_lob_info;
+  if (OB_FAIL(old_lob.get_external_lob_info(old_external_lob_info))) {
+    LOG_WARN("failed to get old external lob info", KR(ret), K(old_lob.size_));
+  } else if (OB_FAIL(new_lob.get_external_lob_info(new_external_lob_info))) {
+    LOG_WARN("failed to get new external lob info", KR(ret), K(new_lob.size_));
+  } else {
+    // Compare source info only: same refs need no update; skip object reads and locator identity.
+    result = old_external_lob_info.is_equal(new_external_lob_info) ? 0 : 1;
+  }
+  return ret;
+}
+
 int ObDMLService::check_lob_column_changed(ObEvalCtx &eval_ctx,
             const ObExpr& old_expr, ObDatum& old_datum,
             const ObExpr& new_expr, ObDatum& new_datum,
@@ -448,28 +466,44 @@ int ObDMLService::check_lob_column_changed(ObEvalCtx &eval_ctx,
     if (new_is_lob && new_lob.is_append_delta_lob()) {
       const ObMemLobExternHeader *extern_header = nullptr;
       ObString append_data;
-      if (OB_FAIL(new_lob.get_append_delta(extern_header, append_data))) {
+      if (old_lob.is_mem_external_lob()){
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "appending an external LOB");
+        LOG_WARN("can't append into external lob", K(ret), K(old_lob), K(new_lob));
+      } else if (OB_FAIL(new_lob.get_append_delta(extern_header, append_data))) {
         LOG_WARN("failed to validate append delta lob", K(ret), K(new_lob));
       } else {
         // 追加增量表示一次操作，而不是完整的 LOB 值。
         // 空增量不执行任何操作；有效的非空增量一定会改变该列。
         result = append_data.empty() ? 0 : 1;
       }
+    } else if (OB_UNLIKELY((old_is_lob && !old_lob.is_valid())
+                            || (new_is_lob && !new_lob.is_valid()))) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("failed to check lob locator", KR(ret), K(old_lob.size_), K(new_lob.size_));
     } else if (old_is_lob && new_is_lob) {
-      bool is_equal = false;
-      ObLobCompareParams cmp_params;
-      // binary compare ignore charset
-      cmp_params.collation_left_ = CS_TYPE_BINARY;
-      cmp_params.collation_right_ = CS_TYPE_BINARY;
-      cmp_params.offset_left_ = 0;
-      cmp_params.offset_right_ = 0;
-      cmp_params.compare_len_ = UINT64_MAX;
-      cmp_params.timeout_ = timeout;
-      cmp_params.tx_desc_ = eval_ctx.exec_ctx_.get_my_session()->get_tx_desc();
-      if(OB_FAIL(lob_mngr->equal(old_lob, new_lob, cmp_params, is_equal))) {
-        LOG_WARN("fail to compare lob", K(ret), K(old_lob), K(new_lob));
+      if(old_lob.is_mem_external_lob() && new_lob.is_mem_external_lob()) {
+        // compare meta data for external lob
+        ret = check_external_lob_column_changed(old_lob, new_lob, result);
+      } else if (old_lob.is_mem_external_lob() || new_lob.is_mem_external_lob()) {
+        result = 1;
       } else {
-        result = is_equal ? 0 : 1;
+        // compare content for internal lob
+        bool is_equal = false;
+        ObLobCompareParams cmp_params;
+        // binary compare ignore charset
+        cmp_params.collation_left_ = CS_TYPE_BINARY;
+        cmp_params.collation_right_ = CS_TYPE_BINARY;
+        cmp_params.offset_left_ = 0;
+        cmp_params.offset_right_ = 0;
+        cmp_params.compare_len_ = UINT64_MAX;
+        cmp_params.timeout_ = timeout;
+        cmp_params.tx_desc_ = eval_ctx.exec_ctx_.get_my_session()->get_tx_desc();
+        if(OB_FAIL(lob_mngr->equal(old_lob, new_lob, cmp_params, is_equal))) {
+          LOG_WARN("fail to compare lob", K(ret), K(old_lob), K(new_lob));
+        } else {
+          result = is_equal ? 0 : 1;
+        }
       }
     } else {
       result = ObDatum::binary_equal(old_datum, new_datum) ? 0 : 1;
@@ -1760,6 +1794,7 @@ int ObDMLService::init_dml_param(const ObDASDMLBaseCtDef &base_ctdef,
   dml_param.is_batch_stmt_ = base_ctdef.is_batch_stmt_;
   dml_param.dml_allocator_ = &das_alloc;
   dml_param.is_main_table_in_fts_ddl_ = base_ctdef.is_main_table_in_fts_ddl_;
+  dml_param.allow_outtable_lob_ = base_ctdef.allow_outtable_lob_;
   if (OB_FAIL(dml_param.snapshot_.assign(snapshot))) {
     LOG_WARN("assign snapshot fail", K(ret));
   }
@@ -1969,6 +2004,9 @@ int ObDMLService::init_ins_rtdef(
     LOG_WARN("failed to init trigger for insert", K(ret));
   } else if (OB_FAIL(init_fk_checker_array(dml_rtctx, ins_ctdef, ins_rtdef.fk_checker_array_))) {
     LOG_WARN("failed to init foreign key checker array", K(ret));
+  } else if (OB_FAIL(dml_rtctx.prepare_outtable_lob_control_keys(
+      ins_ctdef.das_ctdef_, ins_rtdef.das_rtdef_))) {
+    LOG_WARN("failed to prepare outtable lob control key collector", K(ret));
   } else {
     ins_rtdef.das_rtdef_.related_ctdefs_ = &ins_ctdef.related_ctdefs_;
     ins_rtdef.das_rtdef_.related_rtdefs_ = &ins_rtdef.related_rtdefs_;
@@ -2164,6 +2202,9 @@ int ObDMLService::init_upd_rtdef(
     LOG_WARN("failed to init das dml rfdef", K(ret));
   } else if (OB_FAIL(init_related_das_rtdef(dml_rtctx, upd_ctdef.related_upd_ctdefs_, upd_rtdef.related_upd_rtdefs_))) {
     LOG_WARN("init related das ctdef failed", K(ret));
+  } else if (OB_FAIL(dml_rtctx.prepare_outtable_lob_control_keys(
+      upd_ctdef.dupd_ctdef_, upd_rtdef.dupd_rtdef_))) {
+    LOG_WARN("failed to prepare outtable lob control key collector for update", K(ret));
   } else if (OB_FAIL(init_trigger_for_update(dml_rtctx, upd_ctdef, upd_rtdef, dml_rtctx.op_, clear_exprs))) {
     LOG_WARN("failed to init trigger for update", K(ret));
   } else if (OB_FAIL(init_fk_checker_array(dml_rtctx, upd_ctdef, upd_rtdef.fk_checker_array_))) {
@@ -2308,6 +2349,9 @@ int ObDMLService::init_das_ins_rtdef_for_update(ObDMLRtCtx &dml_rtctx,
     LOG_WARN("init das insert rtdef failed", K(ret));
   } else if (OB_FAIL(init_related_das_rtdef(dml_rtctx, upd_ctdef.related_ins_ctdefs_, upd_rtdef.related_ins_rtdefs_))) {
     LOG_WARN("init related das insert ctdef failed", K(ret));
+  } else if (OB_FAIL(dml_rtctx.prepare_outtable_lob_control_keys(
+      *upd_ctdef.dins_ctdef_, *upd_rtdef.dins_rtdef_))) {
+    LOG_WARN("failed to prepare outtable lob control key collector for update", K(ret));
   } else {
     upd_rtdef.dins_rtdef_->related_ctdefs_ = &upd_ctdef.related_ins_ctdefs_;
     upd_rtdef.dins_rtdef_->related_rtdefs_ = &upd_rtdef.related_ins_rtdefs_;
@@ -2594,6 +2638,9 @@ int ObDMLService::write_one_row_post_proc(ObDMLRtCtx &dml_rtctx)
     if (OB_SUCCESS != (close_ret = (dml_rtctx.das_ref_.close_all_task()))) {
       LOG_WARN("close all das task failed", K(ret));
     } else {
+      if (FAILEDx(dml_rtctx.op_.complete_outtable_lob_control_keys(dml_rtctx))) {
+        LOG_WARN("failed to complete outtable lob control rows", K(ret));
+      }
       dml_rtctx.reuse();
     }
   } else {
@@ -2826,7 +2873,11 @@ int ObDMLService::check_nested_sql_legality(ObExecContext &ctx, common::ObTableI
   if (session->is_remote_session() && ctx.get_parent_ctx() != nullptr) {
     //in nested sql, and the sql is remote or distributed
     pl::ObPLContext *pl_ctx = ctx.get_parent_ctx()->get_pl_stack_ctx();
-    if (pl_ctx == nullptr || !pl_ctx->in_autonomous()) {
+    bool allow_control_complete = false;
+    if (OB_FAIL(ObSQLUtils::check_outtable_lob_control_complete(
+        ctx, ref_table_id, allow_control_complete))) {
+      LOG_WARN("failed to check control completion legality", K(ret), K(ref_table_id));
+    } else if (!allow_control_complete && (nullptr == pl_ctx || !pl_ctx->in_autonomous())) {
       //this nested sql require transaction scheduler control
       //but the session is remote, means this sql executing without transaction scheduler control
       ret = OB_NOT_SUPPORTED;

@@ -9,8 +9,10 @@
 #undef protected
 #undef private
 
+#include "lib/utility/ob_defer.h"
 #include "mtlenv/mock_tenant_module_env.h"
 #include "observer/omt/ob_tenant_config_mgr.h"
+#include "share/ob_cluster_version.h"
 #include "storage/blocksstable/ob_data_file_prepare.h"
 #include "storage/blocksstable/ob_macro_block_id.h"
 #include "storage/blocksstable/ob_ss_obj_util.h"
@@ -2174,6 +2176,38 @@ TEST_F(TestSSDataCheck, expected_merge_multi_pass)
   tmp_file_mgr.reset();
 }
 
+TEST_F(TestSSDataCheck, context_lob_meta_policy_is_frozen_for_round)
+{
+  const uint64_t previous_cluster_version = GET_MIN_CLUSTER_VERSION();
+  DEFER(ObClusterVersion::get_instance().update_cluster_version(previous_cluster_version));
+  ObClusterVersion::get_instance().update_cluster_version(CLUSTER_VERSION_4_6_3_0);
+  ObSSDataCheckCtx ctx;
+  EXPECT_FALSE(ctx.is_lob_meta_scan_enabled());
+  ASSERT_EQ(OB_SUCCESS, ctx.init(OB_SYS_TENANT_ID, data_check_snapshot_scn(),
+      ObSSDataCheckMode::SINGLE, MEM_LIMIT, BUF_SIZE, 0));
+  EXPECT_FALSE(ctx.is_lob_meta_scan_enabled());
+
+  ObClusterVersion::get_instance().update_cluster_version(CLUSTER_VERSION_4_6_3_1);
+  EXPECT_FALSE(ctx.is_lob_meta_scan_enabled());
+  EXPECT_EQ(OB_INIT_TWICE, ctx.init(OB_SYS_TENANT_ID, data_check_snapshot_scn(),
+      ObSSDataCheckMode::SINGLE, MEM_LIMIT, BUF_SIZE, 0));
+  EXPECT_FALSE(ctx.is_lob_meta_scan_enabled());
+  ObSSDataCheckCtx next_ctx;
+  ASSERT_EQ(OB_SUCCESS, next_ctx.init(OB_SYS_TENANT_ID, data_check_snapshot_scn(),
+      ObSSDataCheckMode::SINGLE, MEM_LIMIT, BUF_SIZE, 0));
+  EXPECT_TRUE(next_ctx.is_lob_meta_scan_enabled());
+  ASSERT_EQ(OB_SUCCESS, next_ctx.cleanup());
+  EXPECT_FALSE(next_ctx.is_lob_meta_scan_enabled());
+
+  ASSERT_EQ(OB_SUCCESS, ctx.cleanup());
+  EXPECT_FALSE(ctx.is_lob_meta_scan_enabled());
+  ASSERT_EQ(OB_SUCCESS, ctx.init(OB_SYS_TENANT_ID, data_check_snapshot_scn(),
+      ObSSDataCheckMode::SINGLE, MEM_LIMIT, BUF_SIZE, 0));
+  EXPECT_TRUE(ctx.is_lob_meta_scan_enabled());
+  ASSERT_EQ(OB_SUCCESS, ctx.cleanup());
+  EXPECT_FALSE(ctx.is_lob_meta_scan_enabled());
+}
+
 TEST_F(TestSSDataCheck, context_rejects_cleanup_with_active_task)
 {
   ObSSDataCheckCtx ctx;
@@ -2908,6 +2942,55 @@ TEST_F(TestSSDataCheck, list_checker_rechecks_missing_reference)
     EXPECT_EQ(reference_exist
         ? ObSSDataCheckStatus::NOT_HEALTH
         : ObSSDataCheckStatus::HEALTH,
+        status);
+    expected_file.reset();
+    ASSERT_EQ(OB_SUCCESS, ctx.cleanup());
+  }
+}
+
+TEST_F(TestSSDataCheck, missing_outtable_object_requires_live_source_reference)
+{
+  const MacroBlockId macro_id = make_data_check_object_id(
+      ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO, 1);
+  for (const bool reference_exist : {false, true}) {
+    ObSSDataCheckCtx ctx;
+    ASSERT_EQ(OB_SUCCESS, ctx.init(
+        OB_SYS_TENANT_ID, data_check_snapshot_scn(), ObSSDataCheckMode::SINGLE,
+        MEM_LIMIT, BUF_SIZE, 0));
+    ObSSDataCheckSortedFileInfo expected_file;
+    int64_t expected_count = 0;
+    std::vector<std::string> sorted_paths;
+    ASSERT_EQ(OB_SUCCESS, build_list_check_expected_by_macro_ids(
+        ctx, {macro_id}, expected_file, expected_count, sorted_paths));
+    ASSERT_EQ(1, expected_count);
+    ASSERT_EQ(1, sorted_paths.size());
+    std::string prefix;
+    std::string name;
+    ASSERT_EQ(OB_SUCCESS, split_data_check_path(sorted_paths.at(0), prefix, name));
+    FakeDataCheckObjectLister object_lister;
+    object_lister.set_listing(prefix, {});
+    FakeDataCheckMetaRefChecker meta_ref_checker;
+    meta_ref_checker.set_results({reference_exist});
+    FakeDataCheckListStopChecker stop_checker;
+    ObSSDataCheckListChecker checker;
+    ASSERT_EQ(OB_SUCCESS, checker.init(
+        OB_SYS_TENANT_ID, BUF_SIZE, 0,
+        object_lister, meta_ref_checker, stop_checker, ctx));
+    ASSERT_EQ(OB_SUCCESS, ctx.inc_active_task_count());
+    ObSSDataCheckListCompareStat stat;
+    const int check_ret = checker.check(expected_file, expected_count, stat);
+    ctx.dec_active_task_count(check_ret);
+    ASSERT_EQ(OB_SUCCESS, check_ret);
+    EXPECT_EQ(1, stat.missing_count_);
+    EXPECT_EQ(0, stat.found_count_);
+    EXPECT_EQ(reference_exist ? 1 : 0, stat.referenced_missing_count_);
+    EXPECT_EQ(reference_exist ? 0 : 1, stat.unreferenced_missing_count_);
+    EXPECT_EQ(1, meta_ref_checker.get_call_count());
+    ASSERT_EQ(OB_SUCCESS, ctx.finish_list_check());
+    ASSERT_EQ(OB_SUCCESS, ctx.publish_status());
+    ObSSDataCheckStatus status = ObSSDataCheckStatus::HEALTH;
+    ASSERT_EQ(OB_SUCCESS, ctx.get_status(status));
+    EXPECT_EQ(reference_exist ? ObSSDataCheckStatus::NOT_HEALTH : ObSSDataCheckStatus::HEALTH,
         status);
     expected_file.reset();
     ASSERT_EQ(OB_SUCCESS, ctx.cleanup());

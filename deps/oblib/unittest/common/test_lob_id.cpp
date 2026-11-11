@@ -80,6 +80,35 @@ TEST(TestLobId, invalid_binary_string_length)
   ASSERT_FALSE(lob_id.is_valid());
 }
 
+TEST(TestLobId, zero_hidden_row_id)
+{
+  ObLobId lob_id;
+  ASSERT_FALSE(lob_id.is_valid());
+
+  lob_id.assign(0, 200001, 0);
+  ASSERT_FALSE(lob_id.is_valid());
+  lob_id.assign(4, 0, 0);
+  ASSERT_FALSE(lob_id.is_valid());
+  lob_id.assign(4, 200001, 0);
+  ASSERT_TRUE(lob_id.is_valid());
+
+  ObLobId decoded;
+  ASSERT_EQ(OB_SUCCESS, decoded.from_string(lob_id.get_string()));
+  ASSERT_TRUE(decoded.is_valid());
+  ASSERT_EQ(lob_id, decoded);
+  ASSERT_EQ(lob_id.hash(), decoded.hash());
+  ASSERT_EQ(0, decoded.get_auto_inc_id());
+
+  ObLobId next_lob_id;
+  next_lob_id.assign(4, 200001, 1);
+  ASSERT_TRUE(next_lob_id.is_valid());
+  ASSERT_TRUE(lob_id < next_lob_id);
+  ASSERT_LT(MEMCMP(lob_id.get_string().ptr(), next_lob_id.get_string().ptr(), sizeof(ObLobId)), 0);
+
+  lob_id.reset();
+  ASSERT_FALSE(lob_id.is_valid());
+}
+
 TEST(TestLobId, short_c_string_still_invalid)
 {
   char mutable_buf[] = "short";

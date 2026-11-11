@@ -97,6 +97,7 @@ const char *ob_sql_type_str(ObObjType type)
       "MYSQL_DATE",
       "MYSQL_DATETIME",
       "ROARINGBITMAP",
+      "EXTBLOB",
       ""
     },
     {
@@ -157,6 +158,7 @@ const char *ob_sql_type_str(ObObjType type)
       "MYSQL_DATE",
       "MYSQL_DATETIME",
       "ROARINGBITMAP",
+      "EXTBLOB",
       ""
     }
   };
@@ -395,6 +397,7 @@ DEF_TYPE_TEXT_FUNCS_LENGTH(geometry, (lib::is_oracle_mode() ? "sdo_geometry" : "
 DEF_TYPE_STR_FUNCS(mysql_date, "mysql_date", "");
 DEF_TYPE_STR_FUNCS_SCALE_DEFAULT_ZERO(mysql_datetime, "mysql_datetime", "", "")
 DEF_TYPE_TEXT_FUNCS_LENGTH(roaringbitmap, "roaringbitmap", "roaringbitmap");
+DEF_TYPE_STR_FUNCS(extblob, "extblob", "");
 
 ///////////////////////////////////////////////////////////
 DEF_TYPE_STR_FUNCS_WITHOUT_ACCURACY_FOR_NON_STRING(null, "null", "");
@@ -448,6 +451,7 @@ DEF_TYPE_STR_FUNCS_WITHOUT_ACCURACY_FOR_STRING(geometry, (lib::is_oracle_mode() 
 DEF_TYPE_STR_FUNCS_WITHOUT_ACCURACY_FOR_NON_STRING(mysql_date, "mysql_date", "");
 DEF_TYPE_STR_FUNCS_WITHOUT_ACCURACY_FOR_ODATE(mysql_datetime, "mysql_datetime", "");
 DEF_TYPE_STR_FUNCS_WITHOUT_ACCURACY_FOR_STRING(roaringbitmap, "roaringbitmap", "roaringbitmap");
+DEF_TYPE_STR_FUNCS_WITHOUT_ACCURACY_FOR_NON_STRING(extblob, "extblob", "");
 
 
 int ob_empty_str(char *buff, int64_t buff_length, ObCollationType coll_type)
@@ -830,6 +834,7 @@ int ob_sql_type_str(char *buff,
     ob_date_str, // mysql date
     ob_datetime_str, // mysql datetime
     ob_roaringbitmap_str,//roaringbitmap
+    ob_extblob_str, // extend blob
     ob_empty_str             // MAX
   };
   static_assert(sizeof(sql_type_name) / sizeof(ObSqlTypeStrFunc) == ObMaxType + 1, "Not enough initializer");
@@ -937,6 +942,7 @@ int ob_sql_type_str(char *buff,
     ob_date_str_without_accuracy,//mysql date
     ob_datetime_str_without_accuracy,//mysql datetime
     ob_roaringbitmap_str_without_accuracy,//roaringbitmap
+    ob_extblob_str_without_accuracy,//extend blob
     ob_empty_str   // MAX
   };
   static_assert(sizeof(sql_type_name) / sizeof(obSqlTypeStrWithoutAccuracyFunc) == ObMaxType + 1, "Not enough initializer");

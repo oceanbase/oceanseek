@@ -36,7 +36,9 @@ OB_SERIALIZE_MEMBER(ObPxFinishSqcResultMsg, dfo_id_, sqc_id_, rc_, trans_result_
                     sqc_index_block_cache_hit_cnt_, sqc_blockscan_block_cnt_, 
                     sqc_blockscan_row_cnt_, sqc_pushdown_storage_filter_row_cnt_, 
                     sqc_fuse_row_cache_hit_, sqc_network_wait_time_,
-                    sqc_iceberg_data_files_, sqc_async_result_files_);
+                    sqc_iceberg_data_files_, sqc_async_result_files_,
+                    outtable_lob_control_keys_ // FARM COMPAT WHITELIST
+                    );
 OB_SERIALIZE_MEMBER(ObPxFinishTaskResultMsg, dfo_id_, sqc_id_, task_id_, rc_);
 OB_SERIALIZE_MEMBER(ObPxDmlRowInfo, row_match_count_, row_duplicated_count_, row_deleted_count_,
                     insert_update_or_replace_duplicate_row_count_);

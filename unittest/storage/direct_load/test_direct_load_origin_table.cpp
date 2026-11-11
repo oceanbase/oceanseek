@@ -10,6 +10,7 @@
 #include "observer/table_load/ob_table_load_table_ctx.h"
 #include "storage/blocksstable/ob_storage_datum.h"
 #include "storage/direct_load/ob_direct_load_insert_table_ctx.h"
+#include "storage/direct_load/ob_direct_load_lob_meta_row_iter.h"
 #include "storage/direct_load/ob_direct_load_merge_ctx.h"
 #include "storage/direct_load/ob_direct_load_origin_table.h"
 #include "storage/direct_load/ob_direct_load_tmp_file.h"
@@ -143,6 +144,79 @@ TEST_F(TestDirectLoadOriginTable, access_ctx_uses_frozen_snapshot)
   ASSERT_EQ(OB_SUCCESS, accessor.init_access_ctx(&origin_table));
   EXPECT_EQ(snapshot_version, accessor.get_access_snapshot_version());
   EXPECT_EQ(snapshot_version, accessor.get_store_snapshot_version());
+}
+
+class TestDirectLoadLobAuxRowIter : public ::testing::Test
+{
+protected:
+  void SetUp() override;
+
+  blocksstable::ObStorageDatumUtils datum_utils_;
+  ObDirectLoadLobAuxKeyConflictHandler conflict_handler_;
+  ObDirectLoadMultipleDatumRange range_;
+  ObDirectLoadDatumRow completed_key_;
+  ObDirectLoadLobAuxRowIter iter_;
+};
+
+void TestDirectLoadLobAuxRowIter::SetUp()
+{
+  ObDirectLoadMultipleSSTableScanMergeParam param;
+  param.table_data_desc_.rowkey_column_num_ = 2;
+  param.table_data_desc_.column_count_ = 2;
+  param.table_data_desc_.external_data_block_size_ = DIO_ALIGN_SIZE;
+  param.table_data_desc_.sstable_index_block_size_ = DIO_ALIGN_SIZE;
+  param.table_data_desc_.sstable_data_block_size_ = DIO_ALIGN_SIZE;
+  param.table_data_desc_.extra_buf_size_ = DIO_ALIGN_SIZE;
+  param.table_data_desc_.compressor_type_ = ObCompressorType::NONE_COMPRESSOR;
+  param.datum_utils_ = &datum_utils_;
+  param.dml_row_handler_ = &conflict_handler_;
+  range_.set_whole_range();
+  ObDirectLoadTableHandleArray tables;
+  ASSERT_EQ(OB_SUCCESS, iter_.scan_merge_.init(param, tables, range_));
+  ASSERT_EQ(OB_SUCCESS, completed_key_.init(2));
+  completed_key_.storage_datums_[0].set_int(0);
+  completed_key_.storage_datums_[1].set_string(ObString::make_string("completed_lob"));
+  completed_key_.is_delete_ = true;
+  void *scanner_buf = iter_.allocator_.alloc(sizeof(ObDirectLoadOriginTableScanner));
+  ASSERT_NE(nullptr, scanner_buf);
+  iter_.origin_scanner_ = new (scanner_buf) ObDirectLoadOriginTableScanner();
+  iter_.origin_scanner_->schema_param_.table_type_ = share::schema::AUX_LOB_META;
+  // Resume at the boundary after the last auxiliary key's physical scan has ended.
+  iter_.lob_aux_key_row_ = &completed_key_;
+}
+
+TEST_F(TestDirectLoadLobAuxRowIter, outtable_piece_delete_reaches_end_without_piece_rows)
+{
+  iter_.origin_scanner_->schema_param_.table_type_ = share::schema::AUX_LOB_PIECE;
+  EXPECT_EQ(OB_ITER_END, iter_.switch_next_lob_aux_key());
+}
+
+TEST_F(TestDirectLoadLobAuxRowIter, missing_meta_delete_remains_an_error)
+{
+  EXPECT_EQ(OB_ERR_UNEXPECTED, iter_.switch_next_lob_aux_key());
+}
+
+TEST_F(TestDirectLoadLobAuxRowIter, missing_piece_insert_remains_an_error)
+{
+  iter_.origin_scanner_->schema_param_.table_type_ = share::schema::AUX_LOB_PIECE;
+  completed_key_.is_delete_ = false;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, iter_.switch_next_lob_aux_key());
+}
+
+TEST_F(TestDirectLoadLobAuxRowIter, existing_auxiliary_rows_still_finish_normally)
+{
+  iter_.lob_aux_key_row_cnt_ = 1;
+  EXPECT_EQ(OB_ITER_END, iter_.switch_next_lob_aux_key());
+}
+
+TEST_F(TestDirectLoadLobAuxRowIter, missing_scanner_only_allows_initial_switch)
+{
+  ObDirectLoadOriginTableScanner *scanner = iter_.origin_scanner_;
+  iter_.origin_scanner_ = nullptr;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, iter_.switch_next_lob_aux_key());
+  iter_.lob_aux_key_row_ = nullptr;
+  EXPECT_EQ(OB_ITER_END, iter_.switch_next_lob_aux_key());
+  iter_.origin_scanner_ = scanner;
 }
 
 } // namespace unittest

@@ -227,6 +227,8 @@ int ObPxCoordOp::rescan()
       }
     }
     if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(coord_info_.check_outtable_lob_control_complete())) {
+      LOG_WARN("cannot rescan px with unfinished outtable lob control rows", K(ret));
     } else if (FALSE_IT(ObDetectManagerUtils::qc_unregister_detectable_id_from_dm(detectable_id_, register_detectable_id_))) {
     } else if (FALSE_IT(clear_interrupt())) {
     } else if (OB_FAIL(destroy_all_channel())) {
@@ -264,7 +266,9 @@ int ObPxCoordOp::rescan()
       LOG_WARN("fail setup loop proc", K(ret));
     }
   } else {
-    if (OB_FAIL(ObPxCoordOp::inner_rescan())) {
+    if (OB_FAIL(coord_info_.check_outtable_lob_control_complete())) {
+      LOG_WARN("cannot batch rescan px with unfinished outtable lob control rows", K(ret));
+    } else if (OB_FAIL(ObPxCoordOp::inner_rescan())) {
       LOG_WARN("failed to do inner rescan", K(ret));
     } else if (OB_FAIL(batch_rescan())) {
       LOG_WARN("fail to do batch rescan", K(ret));
@@ -542,6 +546,15 @@ int ObPxCoordOp::inner_close()
       } else {
         LOG_WARN("fail to terminate running dfo, ignore ret", K(terminate_ret));
       }
+    }
+  }
+
+  // Early close must not turn uncompleted control rows into a successful statement.
+  const int control_ret = coord_info_.check_outtable_lob_control_complete();
+  if (OB_SUCCESS != control_ret) {
+    LOG_WARN("cannot close px with unfinished outtable lob control rows", K(control_ret));
+    if (OB_SUCC(ret)) {
+      ret = control_ret;
     }
   }
 

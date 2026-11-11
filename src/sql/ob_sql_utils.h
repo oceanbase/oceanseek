@@ -680,6 +680,10 @@ public:
   static bool is_online_stat_gathering_nested_sql(ObExecContext *cur_ctx);
   static bool is_direct_load_stream_finish_nested_sql(ObExecContext *cur_ctx);
   static bool is_iter_uncommitted_row(ObExecContext *cur_ctx);
+  static bool need_outtable_lob_control_current_snapshot(ObExecContext *cur_ctx);
+  static bool is_outtable_lob_control_owner_sql(ObExecContext *cur_ctx);
+  static int check_outtable_lob_control_complete(
+      ObExecContext &ctx, const uint64_t ref_table_id, bool &allow_control_complete);
   static bool is_nested_sql(ObExecContext *cur_ctx);
   static bool is_in_autonomous_block(ObExecContext *cur_ctx);
   static bool is_select_from_dual(ObExecContext &ctx);

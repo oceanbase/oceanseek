@@ -719,7 +719,9 @@ ObSSMetaTabletTinyInfo::ObSSMetaTabletTinyInfo()
     deleted_scn_(),
     max_replayed_scn_(),
     min_major_snapshot_(0),
-    max_major_snapshot_(0)
+    max_major_snapshot_(0),
+    clog_checkpoint_scn_(),
+    multi_version_start_(0)
 {
 }
 
@@ -730,6 +732,8 @@ void ObSSMetaTabletTinyInfo::reset()
   max_replayed_scn_.reset();
   min_major_snapshot_ = 0;
   max_major_snapshot_ = 0;
+  clog_checkpoint_scn_.reset();
+  multi_version_start_ = 0;
 }
 
 bool ObSSMetaTabletTinyInfo::is_valid() const
@@ -737,6 +741,8 @@ bool ObSSMetaTabletTinyInfo::is_valid() const
   return min_major_snapshot_ >= 0
       && max_major_snapshot_ >= 0
       && max_replayed_scn_.is_valid()
+      && clog_checkpoint_scn_.is_valid()
+      && multi_version_start_ >= 0
       && (!is_mark_delete_ || deleted_scn_.is_valid());
 }
 

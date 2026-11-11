@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/shared_storage/ob_ss_reader_writer.h"
+#include "lib/allocator/page_arena.h"
 #include "storage/blocksstable/ob_ss_obj_util.h"
 #include "storage/compaction/ob_major_pre_warmer.h"
 #include "storage/meta_store/ob_tenant_storage_meta_service.h"
@@ -27,6 +28,7 @@
 #include "share/ob_io_device_helper.h"
 #include "storage/shared_storage/ob_file_helper.h"
 #include "storage/shared_storage/storage_cache_policy/ob_storage_cache_service.h"
+#include "common/storage/ob_io_device.h"
 
 namespace oceanbase
 {
@@ -148,6 +150,9 @@ int ObSSBaseReader::aio_read(
           // Note: don't free_io_callback_and_detach_original here
           if (ObIOCallbackType::EXTERNAL_DATA_LOAD_FROM_REMOTE_CALLBACK == io_info.callback_->get_type()) {
             sql::ObExternalRemoteIOCallback::free_io_callback_and_detach_original(io_info.callback_);
+          } else if (ObIOCallbackType::EXTERNAL_LOB_READ_CALLBACK
+                     == io_info.callback_->get_type()) {
+            free_io_callback<ObIOCallback>(io_info.callback_);
           }
         }
       } else if (OB_FAIL(object_handle.set_macro_block_id(read_info.macro_block_id_))) {
@@ -402,18 +407,23 @@ int ObSSBaseReader::try_adjust_read_size(
     const int64_t ls_epoch_id,
     ObIOInfo &io_info)
 {
+  UNUSED(macro_id);
+  UNUSED(ls_epoch_id);
+
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(!macro_id.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), K(macro_id));
   } else {
-    ObIODFileStat statbuf;
+    ObIODFileStat statbuf(io_info.tenant_id_);
     const int64_t ori_size = io_info.size_;
-    ObPathContext ctx;
-    if (OB_FAIL(ctx.set_file_ctx(macro_id, ls_epoch_id, true/*is_local_cache*/, io_info.server_id_, io_info.ls_id_))) {
-      LOG_WARN("fail to convert file path", KR(ret), K(ctx));
-    } else if (OB_FAIL(ObIODeviceLocalFileOp::stat(ctx.get_path(), statbuf))) {
-      LOG_WARN("fail to stat", KR(ret), K(ctx));
+    // fstat() will check first_id_, but first_id_ is kept unused in share-storage mode
+    // fstat() only use second_id_ as true-fd, but check first_id_ == NORMAL_FILE_ID
+    // reference@: ObSSIOCommonOp::get_fd_cache_handle/ObIOFd::is_normal_file()
+    ObIOFd fd_fstat = io_info.fd_;
+    fd_fstat.first_id_ = common::ObIOFd::NORMAL_FILE_ID;
+    if (OB_FAIL(ObIODeviceLocalFileOp::fstat(fd_fstat, statbuf))) {
+      LOG_WARN("fail to stat", KR(ret), K(io_info.fd_), K(fd_fstat));
     } else if (io_info.offset_ >= statbuf.size_) {
       ret = OB_DATA_OUT_OF_RANGE;
       LOG_WARN("read offset exceeds actual file length", KR(ret), "offset", io_info.offset_,
@@ -452,6 +462,35 @@ int ObSSBaseReader::push_to_preread_queue(
     LOG_WARN("file manager is null", KR(ret));
   } else if (OB_FAIL(file_manager->push_to_preread_queue(macro_id, ObTabletID(effective_tablet_id)))) {
     LOG_WARN("fail to push to preread queue", KR(ret), K(macro_id), K(effective_tablet_id));
+  }
+  return ret;
+}
+
+static int prepare_aligned_write_buffer(ObIAllocator &allocator,
+                                        const ObIOInfo &io_info,
+                                        ObIOInfo &aligned_info)
+{
+  int ret = OB_SUCCESS;
+  aligned_info = io_info;
+  int64_t io_aligned_size = 0;
+  int64_t aligned_size = 0;
+  if (OB_ISNULL(io_info.fd_.device_handle_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("io_info.fd_.device_handle_ is nullptr", K(aligned_size), K(io_info.size_), K(io_info.tenant_id_));
+  } else if (FALSE_IT(io_aligned_size = io_info.fd_.device_handle_->get_io_aligned_size())) {
+  } else if (FALSE_IT(aligned_size = upper_align(io_info.size_, io_aligned_size))) {
+  } else if (aligned_size != io_info.size_) {
+    char *aligned_buf = static_cast<char *>(allocator.alloc(aligned_size));
+    if (OB_ISNULL(aligned_buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate aligned write buffer", KR(ret), K(aligned_size),
+               K(io_info.size_), K(io_info.tenant_id_));
+    } else {
+      MEMCPY(aligned_buf, io_info.buf_, io_info.size_);
+      MEMSET(aligned_buf + io_info.size_, 0, aligned_size - io_info.size_);
+      aligned_info.buf_ = aligned_buf;
+      aligned_info.size_ = aligned_size;
+    }
   }
   return ret;
 }
@@ -495,12 +534,21 @@ int ObSSBaseWriter::aio_write(
       io_info.flag_.set_ss_public_dir();
     }
     const int64_t ls_epoch_id = write_info.get_ls_epoch_id();
+    ObArenaAllocator allocator("ExtLobCache", OB_MALLOC_NORMAL_BLOCK_SIZE, io_info.tenant_id_);
+    ObIOInfo aligned_info;
+    // Keep actual callback and cache lengths; pad writes, then truncate before publishing.
+    // The allocator lives until aio_write returns; IORequest copies the data before returning.
     if (OB_FAIL(get_write_device_and_fd(macro_id, ls_epoch_id, io_info))) {
       if (OB_NO_SUCH_FILE_OR_DIRECTORY != ret) {
         LOG_WARN("fail to get write device and fd", KR(ret), K(macro_id), K(ls_epoch_id),
                  "write_strategy", io_info.write_strategy_);
       }
-    } else if (OB_FAIL(ObIOManager::get_instance().aio_write(io_info, object_handle.get_io_handle()))) {
+    } else if (FALSE_IT(aligned_info = io_info)) {
+    } else if ((ObStorageObjectType::SHARED_EXTERNAL_LOB_DATA_MACRO
+               == macro_id.storage_object_type()
+               && OB_FAIL(prepare_aligned_write_buffer(allocator, io_info, aligned_info)))
+               || OB_FAIL(ObIOManager::get_instance().aio_write(aligned_info,
+                                                                object_handle.get_io_handle()))) {
       LOG_WARN("fail to aio_write", KR(ret), "macro_id", object_handle.get_macro_id(), K(write_info));
       if (OB_NOT_NULL(io_info.callback_)) {
         if (ObIOCallbackType::ATOMIC_WRITE_CALLBACK == io_info.callback_->get_type()) {
@@ -1731,6 +1779,122 @@ bool ObSSTmpFileWriter::need_add_macro_cache(const MacroBlockId &macro_id)
   // add macro cache for tmp_file in ObAtomicWriteIOCallback again.
   UNUSED(macro_id);
   return false;
+}
+
+/*************************************ObSSExternalLobReader***********************************/
+class ObExternalLobReadCallback : public ObIOCallback
+{
+public:
+  ObExternalLobReadCallback(ObIAllocator &allocator, const ObStorageObjectReadInfo &read_info)
+      : ObIOCallback(ObIOCallbackType::EXTERNAL_LOB_READ_CALLBACK), allocator_(allocator),
+        macro_id_(read_info.macro_block_id_), buffer_(read_info.buf_),
+        io_desc_(read_info.io_desc_) {}
+  virtual ObIAllocator *get_allocator() override { return &allocator_; }
+  virtual const char *get_data() override { return buffer_; }
+  virtual int64_t size() const override { return sizeof(*this); }
+  virtual const char *get_cb_name() const override { return "ObExternalLobReadCallback"; }
+  virtual int alloc_data_buf(const char *, const int64_t) override { return OB_NOT_SUPPORTED; }
+  virtual int inner_process(const char *data, const int64_t size) override
+  {
+    int ret = OB_SUCCESS;
+    // SHARED_EXTERNAL_LOB_DATA_MACRO uses five ID fields to locate an external LOB piece:
+    //   first_id  : magic (storage object type)
+    //   second_id : tablet_id (owning tablet, also the cache policy's effective_tablet_id)
+    //   third_id  : seq (an increasing ID for each external LOB within the tablet)
+    //   fourth_id : offset (piece start in the remote object)
+    //   fifth_id  : length (requested piece length and upper bound on returned bytes)
+    // The cache path uses (tablet_id, seq) for the reference and (offset, length) for the piece.
+    // A short read may return and cache fewer bytes than fifth_id.
+    if (OB_UNLIKELY(size < 0 || size > macro_id_.fifth_id() || (size > 0 && OB_ISNULL(data)))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid external lob read length", KR(ret), K(size), K(macro_id_), KP(data));
+    } else if (size > 0 && OB_NOT_NULL(buffer_)) {
+      MEMCPY(buffer_, data, size);
+      // Read the full piece. The object layer confirms short-read EOF; skip zero-byte cache writes.
+      ObSSLocalCacheService *cache_service = MTL(ObSSLocalCacheService *);
+      int tmp_ret = OB_SUCCESS;
+      // TODO by renhe: use the unified async cache framework here.
+      if (OB_NOT_NULL(cache_service) && OB_TMP_FAIL(cache_service->async_write_macro_to_lcache(
+                                      macro_id_, data, size, macro_id_.second_id(), io_desc_))) {
+        LOG_WARN("failed to cache external lob piece", KR(tmp_ret), K(macro_id_), K(size));
+      }
+    }
+    return ret;
+  }
+  VIRTUAL_TO_STRING_KV(K_(macro_id), KP_(buffer), K_(io_desc));
+private:
+  ObIAllocator &allocator_;
+  MacroBlockId macro_id_;
+  char *buffer_;
+  ObIOFlag io_desc_;
+};
+
+int ObSSExternalLobReader::init(const ObStorageObjectReadInfo *read_info)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(read_info) || OB_ISNULL(read_info->buf_) || OB_NOT_NULL(read_info->io_callback_)
+      || OB_UNLIKELY(!read_info->is_valid() || 0 != read_info->offset_
+      || read_info->size_ != read_info->macro_block_id_.fifth_id()
+      || ObStorageObjectType::SHARED_EXTERNAL_LOB_DATA_MACRO !=
+      read_info->macro_block_id_.storage_object_type())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid external lob piece read", KR(ret), KPC(read_info));
+  } else {
+    // The caller resolves LOCATION and access first; use its credentials on cache misses.
+    read_info_ = read_info;
+  }
+  return ret;
+}
+
+int ObSSExternalLobReader::get_read_device_and_fd(
+    const MacroBlockId &macro_id, const int64_t ls_epoch_id, ObIOInfo &io_info)
+{
+  UNUSED(ls_epoch_id);
+  int ret = OB_SUCCESS;
+  ObIODevice *device = nullptr;
+  ObIOFd fd;
+  ObIAllocator *allocator = nullptr;
+  ObExternalLobReadCallback *callback = nullptr;
+  ObArenaAllocator tmp_allocator("ExtLobOpen", OB_MALLOC_NORMAL_BLOCK_SIZE, io_info.tenant_id_);
+  char *etag = nullptr;
+  if (OB_ISNULL(read_info_) || OB_ISNULL(read_info_->access_info_)
+      || OB_UNLIKELY(read_info_->path_.empty())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("missing external lob access info", KR(ret), K(macro_id), KPC(read_info_));
+  } else if (!read_info_->etag_.empty()
+      && OB_FAIL(ob_dup_cstring(tmp_allocator, read_info_->etag_, etag))) {
+    LOG_WARN("failed to copy external lob ETag", KR(ret), K(macro_id), "etag_length", read_info_->etag_.length());
+  } else if (OB_FAIL(get_io_callback_allocator(io_info.tenant_id_, allocator))) {
+    LOG_WARN("failed to get external lob callback allocator", KR(ret), K(io_info.tenant_id_));
+  } else if (OB_ISNULL(callback = OB_NEWx(ObExternalLobReadCallback,
+                                          allocator, *allocator, *read_info_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to alloc for ObExternalLobReadCallback", KR(ret), K(macro_id), K(io_info.tenant_id_));
+  } else if (OB_FAIL(ObExternalIoAdapter::open_with_access_type(
+                                    device, fd, read_info_->access_info_,
+                                    read_info_->path_, OB_STORAGE_ACCESS_NOHEAD_READER,
+                                    ObStorageIdMod::get_default_external_lob_id_mod(), etag))) {
+    LOG_WARN("failed to open external lob object", KR(ret), K(macro_id), K(io_info.tenant_id_));
+  } else {
+    // The opened device owns the URL, credentials and ETag.
+    fd.device_handle_ = device;
+    io_info.fd_ = fd;
+    io_info.offset_ = macro_id.fourth_id();
+    io_info.callback_ = callback;
+    io_info.flag_.set_need_close_dev_and_fd();
+  }
+  if (OB_FAIL(ret)) {
+    if (OB_NOT_NULL(callback)) {
+      OB_DELETEx(ObExternalLobReadCallback, allocator, callback);
+    }
+    if (OB_NOT_NULL(device)) {
+      int tmp_ret = OB_SUCCESS;
+      if (OB_TMP_FAIL(ObExternalIoAdapter::close_device_and_fd(device, fd))) {
+        LOG_WARN("failed to close external lob device", KR(tmp_ret), K(macro_id), KP(device));
+      }
+    }
+  }
+  return ret;
 }
 
 /*************************************ObSSExternalFileReader***********************************/

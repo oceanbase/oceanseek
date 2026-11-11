@@ -141,6 +141,22 @@ TEST_F(TestLobExtInfo, test_lob_data_ext_info_log)
   ASSERT_EQ(log.lob_operation_seq_no_, decoded.lob_operation_seq_no_);
   ASSERT_EQ(log.seq_id_, decoded.seq_id_);
   ASSERT_EQ(log.lob_data_, decoded.lob_data_);
+  ASSERT_TRUE(decoded.is_logging_);
+
+  log.is_logging_ = false;
+  log.lob_data_.reset();
+  ASSERT_TRUE(log.is_valid());
+  const int64_t no_logging_buf_len = log.get_serialize_size();
+  char *no_logging_buf = static_cast<char *>(allocator.alloc(no_logging_buf_len));
+  ASSERT_NE(nullptr, no_logging_buf);
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, log.serialize(no_logging_buf, no_logging_buf_len, pos));
+  ObLobDataExtInfoLog no_logging_decoded;
+  pos = 0;
+  ASSERT_EQ(OB_SUCCESS, no_logging_decoded.deserialize(no_logging_buf, no_logging_buf_len, pos));
+  ASSERT_TRUE(no_logging_decoded.is_valid());
+  ASSERT_FALSE(no_logging_decoded.is_logging_);
+  ASSERT_TRUE(no_logging_decoded.lob_data_.empty());
 }
 
 TEST_F(TestLobExtInfo, test_lob_meta_info_serialize)
@@ -205,6 +221,96 @@ TEST_F(TestLobExtInfo, test_lob_meta_info_serialize)
   ASSERT_EQ(0, decoded.char_len_);
   ASSERT_TRUE(decoded.lob_extra_info_.empty());
   ASSERT_TRUE(decoded.lob_block_id_.empty());
+}
+
+TEST_F(TestLobExtInfo, test_summary_rpc_serialization)
+{
+  ObLobMetaInfo summary;
+  summary.lob_col_idx_ = 5;
+  summary.lob_id_.assign(5, 1001, 123456789);
+  summary.seq_id_ = ObString::make_string("summary");
+  summary.byte_len_ = 1ULL << 32;
+  summary.char_len_ = 1024;
+  summary.lob_extra_info_ = ObString::make_string("{\"chunk_count\":0}");
+  summary.lob_block_id_ = ObString::make_string("external-identity");
+  char buf[1024];
+  char body_buf[1024];
+  int64_t pos = 0;
+  int64_t body_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, serialization::encode(buf, sizeof(buf), pos, summary));
+  ASSERT_EQ(summary.get_serialize_size(), pos);
+
+  // Keep the upstream UNIS version header; encode LobId as a nested object with a version header.
+  int64_t header_pos = 0;
+  int64_t version = 0;
+  int64_t body_len = 0;
+  ASSERT_EQ(OB_SUCCESS, serialization::decode(buf, pos, header_pos, version));
+  ASSERT_EQ(1, version);
+  ASSERT_EQ(OB_SUCCESS, serialization::decode(buf, pos, header_pos, body_len));
+  ASSERT_EQ(pos - header_pos, body_len);
+  ASSERT_EQ(OB_SUCCESS, serialization::encode(body_buf, sizeof(body_buf), body_pos,
+                                             summary.lob_col_idx_));
+  ASSERT_EQ(OB_SUCCESS, serialization::encode(body_buf, sizeof(body_buf), body_pos,
+                                             summary.lob_id_));
+  ASSERT_EQ(OB_SUCCESS, serialization::encode(body_buf, sizeof(body_buf), body_pos,
+                                             summary.seq_id_));
+  ASSERT_EQ(OB_SUCCESS, serialization::encode(body_buf, sizeof(body_buf), body_pos,
+                                             summary.byte_len_));
+  ASSERT_EQ(OB_SUCCESS, serialization::encode(body_buf, sizeof(body_buf), body_pos,
+                                             summary.char_len_));
+  ASSERT_EQ(OB_SUCCESS, serialization::encode(body_buf, sizeof(body_buf), body_pos,
+                                             summary.lob_extra_info_));
+  ASSERT_EQ(OB_SUCCESS, serialization::encode(body_buf, sizeof(body_buf), body_pos,
+                                             summary.lob_block_id_));
+  ASSERT_EQ(body_len, body_pos);
+  ASSERT_EQ(0, MEMCMP(body_buf, buf + header_pos, body_len));
+
+  ObLobMetaInfo decoded;
+  int64_t read_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, serialization::decode(buf, pos, read_pos, decoded));
+  ASSERT_EQ(pos, read_pos);
+  ASSERT_EQ(summary.lob_col_idx_, decoded.lob_col_idx_);
+  ASSERT_TRUE(summary.lob_id_ == decoded.lob_id_);
+  ASSERT_EQ(summary.byte_len_, decoded.byte_len_);
+  ASSERT_EQ(summary.char_len_, decoded.char_len_);
+  ASSERT_EQ(summary.seq_id_, decoded.seq_id_);
+  ASSERT_EQ(summary.lob_extra_info_, decoded.lob_extra_info_);
+  ASSERT_EQ(summary.lob_block_id_, decoded.lob_block_id_);
+
+  // Summary handler deep-copies to read context allocator before RPC buffer release/reuse.
+  ObArenaAllocator allocator;
+  ObLobMetaInfo stable_summary;
+  ASSERT_EQ(OB_SUCCESS, stable_summary.deep_copy(allocator, decoded));
+  MEMSET(buf, 0, sizeof(buf));
+  ASSERT_EQ(summary.seq_id_, stable_summary.seq_id_);
+  ASSERT_EQ(summary.lob_extra_info_, stable_summary.lob_extra_info_);
+  ASSERT_EQ(summary.lob_block_id_, stable_summary.lob_block_id_);
+}
+
+TEST_F(TestLobExtInfo, test_summary_rpc_reject_truncated_response)
+{
+  ObLobMetaInfo summary;
+  summary.lob_col_idx_ = 1;
+  summary.lob_id_.assign(1, 1001, 9999);
+  summary.seq_id_ = ObString::make_string("summary");
+  summary.lob_extra_info_ = ObString::make_string("{\"chunk_count\":0}");
+  char buf[1024];
+  int64_t pos = 0;
+  ASSERT_EQ(OB_SUCCESS, summary.serialize(buf, sizeof(buf), pos));
+  // Keep the full UNIS length header to verify that responses truncated in transit fail.
+  int64_t header_pos = 0;
+  int64_t version = 0;
+  int64_t body_len = 0;
+  ASSERT_EQ(OB_SUCCESS, serialization::decode(buf, pos, header_pos, version));
+  ASSERT_EQ(1, version);
+  ASSERT_EQ(OB_SUCCESS, serialization::decode(buf, pos, header_pos, body_len));
+  ASSERT_EQ(pos - header_pos, body_len);
+  ASSERT_GT(body_len, 0);
+  for (int64_t len = header_pos; len < pos; ++len) {
+    ObLobMetaInfo decoded;
+    int64_t read_pos = 0;
+    ASSERT_NE(OB_SUCCESS, decoded.deserialize(buf, len, read_pos)) << "length=" << len;
+  }
 }
 
 } // namespace unittest

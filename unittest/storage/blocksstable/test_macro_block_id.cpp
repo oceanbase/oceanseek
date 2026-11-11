@@ -550,6 +550,8 @@ TEST_F(TestMacroBlockId, shared_mark_sweep_gc_diag_rejects_invalid_layout)
   ObStorageObjectOpt opt;
   MacroBlockId macro_id;
 
+  opt.set_shared_mark_sweep_gc_diag_opt(ROUND_ID, 0/*group*/, 6/*type*/, 0/*bucket*/);
+  ASSERT_EQ(OB_INVALID_ARGUMENT, ObObjectManager::ss_get_object_id(opt, macro_id));
   opt.set_shared_mark_sweep_gc_diag_opt(ROUND_ID, 0/*group*/, 2/*type*/, 0/*bucket*/);
   ASSERT_EQ(OB_INVALID_ARGUMENT, ObObjectManager::ss_get_object_id(opt, macro_id));
   opt.set_shared_mark_sweep_gc_diag_opt(ROUND_ID, 2/*group*/, 2/*type*/, 0/*bucket*/);
@@ -585,6 +587,30 @@ TEST_F(TestMacroBlockId, shared_mark_sweep_gc_diag_rejects_invalid_layout)
   ASSERT_FALSE(STI(ObStorageObjectType::SHARED_MARK_SWEEP_GC_DIAG).is_valid(macro_id));
   macro_id.set_fourth_id((1L << 30) | 5/*reserved_bit*/);
   ASSERT_FALSE(STI(ObStorageObjectType::SHARED_MARK_SWEEP_GC_DIAG).is_valid(macro_id));
+}
+
+TEST_F(TestMacroBlockId, shared_lob_gc_diag_object_id_and_path)
+{
+  static constexpr int64_t ROUND_ID = 20000;
+  static constexpr int64_t BUCKET = 17;
+  const int64_t types[] = {3, 4, 5};
+  const char *paths[] = {
+    "mark_sweep_gc_diag/round20000/lob_user_gc/lob_meta_kept/bkt17.T32",
+    "mark_sweep_gc_diag/round20000/lob_user_gc/lob_ctrl_candidate/bkt17.T32",
+    "mark_sweep_gc_diag/round20000/lob_user_gc/lob_ctrl_diff/bkt17.T32"
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(types); ++i) {
+    ObStorageObjectOpt opt;
+    opt.set_shared_mark_sweep_gc_diag_opt(ROUND_ID, 0/*group*/, types[i], BUCKET);
+    MacroBlockId macro_id;
+    ASSERT_EQ(OB_SUCCESS, ObObjectManager::ss_get_object_id(opt, macro_id));
+    ASSERT_TRUE(STI(ObStorageObjectType::SHARED_MARK_SWEEP_GC_DIAG).is_valid(macro_id));
+    char path[256] = {};
+    int64_t pos = 0;
+    ASSERT_EQ(OB_SUCCESS,
+        SSObjUtil::to_relative_remote_path_format(macro_id, path, sizeof(path), pos));
+    ASSERT_STREQ(paths[i], path);
+  }
 }
 
 TEST_F(TestMacroBlockId, serialization_round_trip)

@@ -7,6 +7,7 @@
 
 
 #include "ob_log_part_trans_task.h"
+#include "lib/allocator/page_arena.h"              // ObArenaAllocator
 #include "lib/string/ob_string.h"                   // ObString
 #include "share/schema/ob_schema_service.h"         // OB_INVALID_DDL_OP
 #include "share/schema/ob_table_schema.h"           // ObTableSchema
@@ -16,6 +17,8 @@
 #include "storage/memtable/ob_memtable_context.h"   // ObTransRowFlag
 #include "storage/blocksstable/ob_row_reader.h"     // ObRowReader
 #include "storage/lob/ob_ext_info_callback.h"       // ObExtInfoLog
+#include "storage/lob/store/ob_lob_store_common.h"  // ObLobMetaUtil
+#include "storage/tx/ob_tx_log.h"                   // ObTxLobOutTableDataLog
 
 #include "ob_log_binlog_record_pool.h"              // ObLogBRPool
 #include "ob_log_utils.h"                           // obj2str
@@ -142,6 +145,11 @@ int MutatorRow::parse_columns_(
             column_id,
             column_schema_info))) {
         LOG_ERROR("get_column_info", KR(ret), K(table_id), K(column_stored_idx));
+      } else if (OB_NOT_NULL(column_schema_info)
+          && OB_UNLIKELY(column_schema_info->get_meta_type().is_extblob())) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_ERROR("CDC does not support EXTBLOB columns", KR(ret), K(tenant_id), K(table_id),
+            K(column_id), K(column_stored_idx), K(is_parse_new_col));
       } else if (datum.is_nop()) {
         OBLOG_FORMATTER_LOG(DEBUG, "handle nop datum", K(column_stored_idx), K(is_parse_new_col), K(datum));
         if (OB_NOT_NULL(column_schema_info) && column_schema_info->is_usr_column()) {
@@ -278,7 +286,7 @@ int MutatorRow::parse_outrow_lob_column_(
   storage::ObLobDiskLocatorWrapper locator;
   if (OB_FAIL(locator.init(reinterpret_cast<const char *>(&lob_common), lob_locator_len))) {
     LOG_ERROR("init disk lob locator failed", KR(ret), K(column_id), K(lob_locator_len), K(lob_common));
-  } else if (OB_UNLIKELY(!locator.is_outrow())) {
+  } else if (OB_UNLIKELY(!locator.is_outline())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("lob locator is not outrow", KR(ret), K(column_id), K(locator));
   } else if (is_parse_new_col) {
@@ -2857,8 +2865,8 @@ int PartTransTask::push_direct_load_inc_log(
       || OB_UNLIKELY(buf_len <= 0)) {
     LOG_ERROR("invalid arguments", K(log_lsn), KP(buf), K(buf_len));
     ret = OB_INVALID_ARGUMENT;
-  } else if (OB_FAIL(push_dml_redo_on_row_start_(need_store_data, true/*enable_direct_load_inc*/,
-      log_lsn, buf, buf_len, buf_len))) {
+  } else if (OB_FAIL(push_dml_redo_on_row_start_(need_store_data,
+      DmlRedoLogNode::LogType::DIRECT_LOAD_INC, log_lsn, buf, buf_len, buf_len))) {
     if (OB_ENTRY_EXIST == ret) {
       // direct load inc log duplicate
     } else {
@@ -2875,6 +2883,48 @@ int PartTransTask::push_direct_load_inc_log(
         K(trans_id), K_(sorted_redo_list));
   }
 
+  return ret;
+}
+
+int PartTransTask::push_lob_outtable_data_log(
+    const palf::LSN &log_lsn,
+    const transaction::ObTxLobOutTableDataLog &log,
+    const char *buf,
+    const int64_t buf_len)
+{
+  int ret = OB_SUCCESS;
+  const bool need_store_data = need_store_data_();
+
+  if (OB_ISNULL(buf) || OB_UNLIKELY(!log_lsn.is_valid()
+      || (OB_INVALID_ID == log.get_lob_aux_table_id()) || !log.get_lob_operation_seq_no().is_valid()
+      || !log.get_lob_id().is_valid() || !storage::ObLobSeqId(log.get_seq_id()).is_valid()
+      || !log.get_macro_id().is_valid()
+      || (log.is_logging() && log.get_data().empty())
+      || (!log.is_logging() && !log.get_data().empty())
+      || (log.get_data().length() > storage::ObLobMetaUtil::LOB_OUTTABLE_BLOCK_DATA_SIZE)
+      || (buf_len <= 0))) {
+    ret = OB_INVALID_DATA;
+    LOG_ERROR("invalid lob outtable data log", KR(ret), K_(tls_id), K(log_lsn), K(log), K(buf_len));
+  } else if (is_sys_ls_part_trans()) {
+    if (OB_FAIL(push_ddl_redo_on_row_start_(DdlRedoLogNode::LogType::LOB_OUTTABLE_DATA,
+        log_lsn, buf, buf_len, buf_len))) {
+      if (OB_ENTRY_EXIST != ret) {
+        LOG_ERROR("push ddl lob outtable redo node failed", KR(ret), K_(tls_id), K(log_lsn));
+      }
+    }
+  } else {
+    if (OB_FAIL(push_dml_redo_on_row_start_(need_store_data,
+        DmlRedoLogNode::LogType::LOB_OUTTABLE_DATA, log_lsn, buf, buf_len, buf_len))) {
+      if (OB_ENTRY_EXIST != ret) {
+        LOG_ERROR("push lob outtable redo node failed", KR(ret), K_(tls_id), K(log_lsn));
+      }
+    } else if (need_store_data && OB_FAIL(get_and_submit_store_task_(tls_id_.get_tenant_id(),
+        ObTransRowFlag::NORMAL_ROW, log_lsn, buf, buf_len))) {
+      if (OB_IN_STOP_STATE != ret) {
+        LOG_ERROR("store lob outtable data log failed", KR(ret), K_(tls_id), K(log_lsn));
+      }
+    }
+  }
   return ret;
 }
 
@@ -3323,15 +3373,16 @@ int PartTransTask::push_redo_on_row_start_(
   const int64_t mutator_row_size = meta.get_data_size();
 
   if (is_sys_ls_part_trans()) {
-    if (OB_FAIL(push_ddl_redo_on_row_start_(meta, log_lsn, redo_data, redo_data_size, mutator_row_size))) {
+    if (OB_FAIL(push_ddl_redo_on_row_start_(DdlRedoLogNode::LogType::MUTATOR,
+        log_lsn, redo_data, redo_data_size, mutator_row_size))) {
       if (OB_ENTRY_EXIST != ret) {
         LOG_ERROR("push_ddl_redo_on_row_start_ fail", KR(ret), K(trans_id), K(meta), K(log_lsn),
             KP(redo_data), K(redo_data_size));
       }
     }
   } else {
-    if (OB_FAIL(push_dml_redo_on_row_start_(need_store_data, false, log_lsn, redo_data, redo_data_size,
-        mutator_row_size))) {
+    if (OB_FAIL(push_dml_redo_on_row_start_(need_store_data, DmlRedoLogNode::LogType::MUTATOR,
+        log_lsn, redo_data, redo_data_size, mutator_row_size))) {
       if (OB_ENTRY_EXIST != ret) {
         LOG_ERROR("push_dml_redo_on_row_start_ fail", KR(ret), K(trans_id), K(meta), K(log_lsn),
             KP(redo_data), K(redo_data_size));
@@ -3343,7 +3394,7 @@ int PartTransTask::push_redo_on_row_start_(
 }
 
 int PartTransTask::push_ddl_redo_on_row_start_(
-    const ObMemtableMutatorMeta &meta,
+    const DdlRedoLogNode::LogType log_type,
     const palf::LSN &log_lsn,
     const char *redo_data,
     const int64_t redo_data_size,
@@ -3353,20 +3404,23 @@ int PartTransTask::push_ddl_redo_on_row_start_(
   DdlRedoLogNode *node = NULL;
   char *mutator_row_data = NULL;
 
-  // alloc a Node
-  if (OB_ISNULL(node = static_cast<DdlRedoLogNode *>(allocator_.alloc(sizeof(DdlRedoLogNode))))) {
+  if (OB_UNLIKELY(!log_lsn.is_valid()) || OB_ISNULL(redo_data)
+      || OB_UNLIKELY((redo_data_size <= 0) || (mutator_row_size < redo_data_size))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_ERROR("invalid ddl redo data", KR(ret), K(log_type), K(log_lsn), KP(redo_data),
+        K(redo_data_size), K(mutator_row_size));
+  } else if (OB_ISNULL(node = static_cast<DdlRedoLogNode *>(allocator_.alloc(sizeof(DdlRedoLogNode))))) {
     LOG_ERROR("allocate memory for DdlRedoLogNode fail", "size", sizeof(DdlRedoLogNode));
     ret = OB_ALLOCATE_MEMORY_FAILED;
-  // DDL tls_ided transaction task allocates buffer of actual data length
   } else if (OB_ISNULL(mutator_row_data = static_cast<char *>(allocator_.alloc(mutator_row_size)))) {
-    LOG_ERROR("allocate memory for mutator row data fail", K(mutator_row_size), K(meta));
+    LOG_ERROR("allocate memory for mutator row data fail", K(mutator_row_size), K(log_type));
     ret = OB_ALLOCATE_MEMORY_FAILED;
   } else {
     // Fill the data carried in this redo
     (void)MEMCPY(mutator_row_data, redo_data, redo_data_size);
 
     // reset redo log node
-    node->reset(log_lsn, mutator_row_data, mutator_row_size, redo_data_size);
+    node->reset(log_lsn, mutator_row_data, mutator_row_size, redo_data_size, log_type);
 
     // Push to redo list
     if (OB_FAIL(sorted_redo_list_.push(true/*is_data_in_memory*/, node))) {
@@ -3396,7 +3450,7 @@ int PartTransTask::push_ddl_redo_on_row_start_(
 
 int PartTransTask::push_dml_redo_on_row_start_(
     const bool need_store_data,
-    const bool is_direct_load_inc_log,
+    const DmlRedoLogNode::LogType log_type,
     const palf::LSN &log_lsn,
     const char *redo_data,
     const int64_t redo_data_size,
@@ -3427,8 +3481,17 @@ int PartTransTask::push_dml_redo_on_row_start_(
       meta_node->init_for_data_persistence(log_lsn, mutator_row_size);
     }
 
-    if (OB_UNLIKELY(is_direct_load_inc_log)) {
-      meta_node->set_direct_load_inc_log();
+    if (OB_SUCC(ret)) {
+      if (DmlRedoLogNode::LogType::MUTATOR == log_type) {
+        // do nothing
+      } else if (DmlRedoLogNode::LogType::DIRECT_LOAD_INC == log_type) {
+        meta_node->set_direct_load_inc_log();
+      } else if (DmlRedoLogNode::LogType::LOB_OUTTABLE_DATA == log_type) {
+        meta_node->set_lob_outtable_data_log();
+      } else {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_ERROR("invalid log type", KR(ret), K(log_type));
+      }
     }
   }
 
@@ -3444,6 +3507,10 @@ int PartTransTask::push_dml_redo_on_row_start_(
   }
 
   if (OB_FAIL(ret)) {
+    if (NULL != mutator_row_data) {
+      allocator_.free(mutator_row_data);
+      mutator_row_data = NULL;
+    }
     if (NULL != meta_node) {
       meta_node->reset();
       allocator_.free(meta_node);

@@ -633,7 +633,7 @@ int ObTableLoadService::check_support_direct_load_impl(
     }
     // check data version for lob direct-load
     else if (table_schema->has_lob_column(true/*ignore_unused_column*/)
-             && OB_FAIL(check_data_version_support_lob_direct_load(
+             && OB_FAIL(ObLobUtil::check_data_version_support_lob_direct_load(
                  compat_version, lob_direct_load_operation))) {
       LOG_WARN("data version does not support direct-load with lob column", KR(ret), K(compat_version));
     }
@@ -763,6 +763,10 @@ int ObTableLoadService::check_support_direct_load_for_columns(
         LOG_WARN("invalid column schema", KR(ret), KP(column_schema));
       } else if (column_schema->is_unused()) {
         // 快速删除列, 仍然需要写宏块, 直接填null
+      } else if (ObExtendBLobType == column_schema->get_data_type()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("direct-load does not support EXTBLOB columns", KR(ret), KPC(column_schema));
+        FORWARD_USER_ERROR_MSG(ret, "%sdirect-load does not support EXTBLOB columns", tmp_prefix);
       } else if ((!ObDirectLoadMethod::is_full(method) || !ObDirectLoadMode::is_insert_into(load_mode)) && column_schema->is_generated_column()) {
         ret = OB_NOT_SUPPORTED;
         LOG_WARN("direct-load does not support table has generated column", KR(ret), KPC(column_schema), K(method), K(load_mode));

@@ -44,16 +44,12 @@ public:
   int del(ObLobDeleteContext &delete_ctx, ObLobMetaInfo &in_row);
   // specified range update
   int update(ObLobUpdateContext &update_ctx, ObLobMetaInfo &old_row, ObLobMetaInfo &new_row);
-  // fetch lob id
-  int fetch_lob_id(ObLobInsertContext &insert_ctx, uint64_t &lob_id);
   ObPersistentLobAdaptor *get_adaptor() const { return adaptor_; }
 
   int get_byte_length(ObLobReadContext &read_ctx, uint64_t &byte_length);
   int get_char_length(ObLobReadContext &read_ctx, uint64_t &char_length);
   int get_meta_summary_info(ObLobReadContext &read_ctx, ObLobMetaInfo &summary);
-  int get_last_meta_info(ObLobReadContext &read_ctx,
-                         ObLobMetaInfo &last_meta,
-                         bool &found);
+  int get_last_meta_info(ObLobReadContext &read_ctx, ObLobMetaInfo &last_meta);
   int get_table_param(const ObTableParam *&table_param);
   int get_table_dml_param(const ObTableDMLParam *&table_dml_param);
   TO_STRING_KV("[LOB]", "meta mngr");
@@ -88,8 +84,7 @@ public:
   int revert_scan_iter(ObLobPieceTableIter *iter);
   int get_piece_info(ObLobReadContext &read_ctx,
                      const common::ObString &seq_id,
-                     ObLobPieceInfo &piece_info,
-                     bool &found);
+                     ObLobPieceInfo &piece_info);
   int get_table_param(const ObTableParam *&table_param);
   int get_table_dml_param(const ObTableDMLParam *&table_dml_param);
   TO_STRING_KV("[LOB]", "piece mngr");

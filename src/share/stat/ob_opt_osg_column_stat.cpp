@@ -176,7 +176,7 @@ int ObOptOSGColumnStat::update_column_stat_info(const ObDatum *datum,
     col_stat_->add_num_null(1);
   } else if (OB_FALSE_IT(col_stat_->add_num_not_null(1))) {
     // do nothing
-  } else if (datum->is_outrow()) {
+  } else if (datum->is_outline()) {
     // do nothing
   } else if (is_lob_storage(meta.get_type())) {
     const static int64_t MAX_TEXT_CALC_NDV_LENGTH = 16 * 1024;

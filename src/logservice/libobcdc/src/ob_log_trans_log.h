@@ -197,6 +197,13 @@ private:
 class DmlRedoLogNode : public RedoLogMetaNode
 {
 public:
+  enum class LogType
+  {
+    MUTATOR = 0,
+    DIRECT_LOAD_INC = 1,
+    LOB_OUTTABLE_DATA = 2
+  };
+
   DmlRedoLogNode() { reset(); }
   ~DmlRedoLogNode() { reset(); }
   void reset();
@@ -236,6 +243,8 @@ public:
   bool is_direct_load_inc_log() const { return reserve_field_ & 0x04; }
   // Set teh third digit of reserve_field_ to 1
   void set_direct_load_inc_log() { reserve_field_ |= 0x04; }
+  bool is_lob_outtable_data_log() const { return reserve_field_ & 0x08; }
+  void set_lob_outtable_data_log() { reserve_field_ |= 0x08; }
   int set_data_info(char *data, int64_t data_len);
   bool is_readed() const { return ATOMIC_LOAD(&is_readed_); }
   void set_readed() { ATOMIC_SET(&is_readed_, true); }
@@ -281,8 +290,33 @@ private:
 class DdlRedoLogNode : public RedoLogMetaNode
 {
 public:
+  enum class LogType
+  {
+    MUTATOR = 0,
+    LOB_OUTTABLE_DATA = 1
+  };
+
   DdlRedoLogNode() { reset(); }
   ~DdlRedoLogNode() { reset(); }
+
+  void reset()
+  {
+    RedoLogMetaNode::reset();
+    log_type_ = LogType::MUTATOR;
+  }
+
+  void reset(const palf::LSN &log_lsn,
+             char *data,
+             const int64_t size,
+             const int64_t pos,
+             const LogType log_type)
+  {
+    reset();
+    RedoLogMetaNode::reset(log_lsn, data, size, pos);
+    log_type_ = log_type;
+  }
+
+  bool is_lob_outtable_data_log() const { return LogType::LOB_OUTTABLE_DATA == log_type_; }
 
   bool is_valid() const
   {
@@ -290,7 +324,10 @@ public:
     return RedoLogMetaNode::is_valid(true/*need_check_data*/);
   }
 
-  TO_STRING_KV("RedoLog", static_cast<const RedoLogMetaNode &>(*this));
+  TO_STRING_KV("RedoLog", static_cast<const RedoLogMetaNode &>(*this), K_(log_type));
+
+private:
+  LogType log_type_;
 };
 
 class RedoSortedProgress

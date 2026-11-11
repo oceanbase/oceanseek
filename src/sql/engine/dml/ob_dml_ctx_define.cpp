@@ -9,10 +9,102 @@
 #include "sql/das/ob_das_utils.h"
 #include "sql/engine/dml/ob_trigger_handler.h"
 #include "src/sql/engine/ob_exec_context.h"
+#include "sql/engine/px/ob_px_sqc_handler.h"
+#include "storage/lob/common/ob_outtable_lob_control_key.h"
 namespace oceanbase
 {
 namespace sql
 {
+
+void ObDMLRtCtx::reuse()
+{
+  outtable_lob_control_ctx_.reuse();
+  das_ref_.reuse();
+  das_task_memory_size_ = 0;
+  das_parallel_task_size_ = 0;
+}
+
+void ObDMLRtCtx::cleanup()
+{
+  outtable_lob_control_ctx_.reset();
+  das_ref_.reset();
+}
+
+int ObDMLRtCtx::complete_outtable_lob_control_keys()
+{
+  int ret = OB_SUCCESS;
+  ObPxSqcHandler *sqc_handler = exec_ctx_.get_sqc_handler();
+  if (outtable_lob_control_ctx_.empty()) {
+  } else if (OB_ISNULL(sqc_handler)) {
+    ret = outtable_lob_control_ctx_.complete(exec_ctx_);
+  } else {
+    ObPxTask *task = nullptr;
+    if (OB_FAIL(sqc_handler->get_sqc_ctx().get_task(exec_ctx_.get_px_task_id(), task))) {
+      LOG_WARN("failed to get px task for outtable lob control keys", K(ret));
+    } else if (OB_ISNULL(task)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("px task for outtable lob control keys is null", K(ret));
+    } else if (OB_FAIL(task->append_outtable_lob_control_keys(
+        *outtable_lob_control_ctx_.get_keys()))) {
+      LOG_WARN("failed to retain px outtable lob control keys", K(ret));
+    } else {
+      // The QC completes these rows in T1 after every SQC has finished successfully.
+      outtable_lob_control_ctx_.reuse();
+    }
+  }
+  return ret;
+}
+
+int ObDMLRtCtx::prepare_outtable_lob_control_keys(
+    const ObDASInsCtDef &ins_ctdef,
+    ObDASInsRtDef &ins_rtdef)
+{
+  return prepare_outtable_lob_control_keys_(
+      ins_ctdef, ins_rtdef.outtable_lob_control_keys_);
+}
+
+int ObDMLRtCtx::prepare_outtable_lob_control_keys(
+    const ObDASUpdCtDef &upd_ctdef,
+    ObDASUpdRtDef &upd_rtdef)
+{
+  return prepare_outtable_lob_control_keys_(
+      upd_ctdef, upd_rtdef.outtable_lob_control_keys_);
+}
+
+int ObDMLRtCtx::prepare_outtable_lob_control_keys_(
+    const ObDASDMLBaseCtDef &dml_ctdef,
+    common::ObIArray<storage::ObOuttableLobControlKey> *&control_keys)
+{
+  int ret = OB_SUCCESS;
+  bool has_lob_column = false;
+  control_keys = nullptr;
+  if (dml_ctdef.allow_outtable_lob_) {
+    const share::schema::ObTableDMLParam *storage_table_param = &dml_ctdef.table_param_;
+    if (dml_ctdef.is_logical_table()) {
+      if (OB_ISNULL(dml_ctdef.lt_physical_table_param_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("physical table param of logical table is null", K(ret));
+      } else {
+        storage_table_param = dml_ctdef.lt_physical_table_param_;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      const share::schema::ObTableDMLParam::ObColDescArray &col_descs =
+          storage_table_param->get_col_descs();
+      for (int64_t i = 0; !has_lob_column && i < col_descs.count(); ++i) {
+        has_lob_column = col_descs.at(i).col_type_.is_lob_storage();
+      }
+    }
+    if (OB_SUCC(ret) && has_lob_column
+        && OB_FAIL(outtable_lob_control_ctx_.init(exec_ctx_.get_allocator()))) {
+      LOG_WARN("failed to prepare outtable lob control keys", K(ret));
+    } else if (OB_SUCC(ret) && has_lob_column) {
+      control_keys = outtable_lob_control_ctx_.get_keys();
+    }
+  }
+  return ret;
+}
+
 OB_SERIALIZE_MEMBER(ObTrigDMLCtDef,
                     tg_event_,
                     tg_args_,

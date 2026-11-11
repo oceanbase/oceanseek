@@ -375,7 +375,12 @@ public:
   ObStorageReader();
   virtual ~ObStorageReader();
   virtual int open(const common::ObString &uri,
-      common::ObObjectStorageInfo *storage_info, const bool head_meta = true);
+                   common::ObObjectStorageInfo *storage_info,
+                   const bool head_meta = true);
+  int open(const common::ObString &uri,
+           common::ObObjectStorageInfo *storage_info,
+           const bool head_meta,
+           const char *etag);
   int pread(char *buf, const int64_t buf_size, int64_t offset, int64_t &read_size);
   int close();
   void reset();

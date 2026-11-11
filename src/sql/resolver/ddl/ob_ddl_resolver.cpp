@@ -118,6 +118,8 @@ ObDDLResolver::ObDDLResolver(ObResolverParams &params)
     have_generate_fts_arg_(false),
     is_set_lob_inrow_threshold_(false),
     lob_inrow_threshold_(OB_DEFAULT_LOB_INROW_THRESHOLD),
+    is_set_lob_intable_threshold_(false),
+    lob_intable_threshold_(OB_DEFAULT_LOB_INTABLE_THRESHOLD),
     have_generate_vec_arg_(false),
     auto_increment_cache_size_(0),
     external_table_format_type_(ObExternalFileFormat::INVALID_FORMAT),
@@ -3105,6 +3107,10 @@ int ObDDLResolver::resolve_table_option(const ParseNode *option_node, const bool
         ret = resolve_lob_inrow_threshold(option_node, is_index_option);
         break;
       }
+      case T_LOB_INTABLE_THRESHOLD: {
+        ret = resolve_lob_intable_threshold(option_node, is_index_option);
+        break;
+      }
       case T_LOB_STORAGE_CLAUSE : {
         ret = resolve_lob_storage_parameters(option_node);
         break;
@@ -5527,6 +5533,49 @@ int ObDDLResolver::resolve_lob_inrow_threshold(const ParseNode *option_node, con
   return ret;
 }
 
+int ObDDLResolver::resolve_lob_intable_threshold(
+    const ParseNode *option_node,
+    const bool is_index_option)
+{
+  int ret = OB_SUCCESS;
+  uint64_t tenant_id = OB_INVALID_TENANT_ID;
+  uint64_t tenant_data_version = 0;
+  if (OB_ISNULL(session_info_)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "session_info_ is null", K(ret));
+  } else if (FALSE_IT(tenant_id = session_info_->get_effective_tenant_id())) {
+  } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, tenant_data_version))) {
+    LOG_WARN("get tenant data version failed", K(ret), K(tenant_id));
+  } else if (tenant_data_version < DATA_VERSION_4_6_3_1) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("lob intable threshold is not supported before 4.6.3.1", K(ret), K(tenant_data_version));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "lob intable threshold is not supported before 4.6.3.1");
+  } else if (is_index_option) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("index option should not specify lob intable threshold", K(ret));
+  } else if (OB_ISNULL(option_node) || OB_ISNULL(option_node->children_) || OB_ISNULL(option_node->children_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "invalid lob intable threshold parse node", K(ret), KP(option_node));
+  } else if (OB_ISNULL(stmt_)) {
+    ret = OB_ERR_UNEXPECTED;
+    SQL_RESV_LOG(WARN, "stmt_ is null", K(ret));
+  } else {
+    lob_intable_threshold_ = option_node->children_[0]->value_;
+    is_set_lob_intable_threshold_ = true;
+    if (lob_intable_threshold_ < OB_MIN_LOB_INTABLE_THRESHOLD
+        || lob_intable_threshold_ > OB_MAX_LOB_INTABLE_THRESHOLD) {
+      ret = OB_INVALID_ARGUMENT;
+      SQL_RESV_LOG(ERROR, "invalid intable threshold", K(ret), K(lob_intable_threshold_));
+      LOG_USER_ERROR(OB_INVALID_ARGUMENT, "lob intable threshold, should be [0, 9223372036854775807]");
+    } else if (stmt::T_ALTER_TABLE == stmt_->get_stmt_type()) {
+      if (OB_FAIL(alter_table_bitset_.add_member(ObAlterTableArg::LOB_INTABLE_THRESHOLD))) {
+        SQL_RESV_LOG(WARN, "failed to add lob intable threshold option", K(ret));
+      }
+    }
+  }
+  return ret;
+}
+
 /*
 int ObDDLResolver::resolve_generated_column_definition(ObColumnSchemaV2 &column,
     ParseNode *node, ObColumnResolveStat &resolve_stat)
@@ -6150,6 +6199,8 @@ void ObDDLResolver::reset() {
   index_storage_cache_policy_.reset();
   is_set_lob_inrow_threshold_ = false;
   lob_inrow_threshold_ = OB_DEFAULT_LOB_INROW_THRESHOLD;
+  is_set_lob_intable_threshold_ = false;
+  lob_intable_threshold_ = OB_DEFAULT_LOB_INTABLE_THRESHOLD;
   auto_increment_cache_size_ = 0;
   index_params_.reset();
   mv_refresh_dop_ = 0;
@@ -6180,7 +6231,13 @@ int ObDDLResolver::check_prefix_key(const int32_t prefix_len,
 {
   int ret = OB_SUCCESS;
   if (prefix_len > 0) {
-    if (!is_valid_prefix_key_type(column_schema.get_data_type_class())) {
+    if (OB_UNLIKELY(ObExtendBLobType == column_schema.get_data_type())) {
+      // Prefix indexes create hidden VARCHAR columns; reject EXTBLOB before conversion.
+      ret = OB_ERR_WRONG_KEY_COLUMN;
+      const ObString &column_name = column_schema.get_column_name_str();
+      LOG_USER_ERROR(OB_ERR_WRONG_KEY_COLUMN, column_name.length(), column_name.ptr());
+      SQL_RESV_LOG(WARN, "EXTBLOB column cannot be a prefix key", K(ret), K(column_schema));
+    } else if (!is_valid_prefix_key_type(column_schema.get_data_type_class())) {
       ret = OB_WRONG_SUB_KEY;
 
       SQL_RESV_LOG(WARN, "The used key part isn't a string", "data_type_class",

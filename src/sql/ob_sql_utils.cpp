@@ -6001,11 +6001,66 @@ bool ObSQLUtils::is_iter_uncommitted_row(ObExecContext *cur_ctx)
   return bret;
 }
 
+bool ObSQLUtils::need_outtable_lob_control_current_snapshot(ObExecContext *cur_ctx)
+{
+  return OB_NOT_NULL(cur_ctx)
+      && OB_NOT_NULL(cur_ctx->get_parent_ctx())
+      && cur_ctx->get_parent_ctx()
+          ->get_das_ctx().use_outtable_lob_control_current_snapshot_;
+}
+
+bool ObSQLUtils::is_outtable_lob_control_owner_sql(ObExecContext *cur_ctx)
+{
+  bool is_owner_sql = false;
+  if (need_outtable_lob_control_current_snapshot(cur_ctx)) {
+    ObExecContext *parent_ctx = cur_ctx->get_parent_ctx();
+    ObSQLSessionInfo *session = cur_ctx->get_my_session();
+    transaction::ObTxDesc *owned_tx = parent_ctx->get_outtable_lob_control_owned_tx();
+    is_owner_sql = OB_NOT_NULL(session) && session->is_nested_session()
+        && session == parent_ctx->get_my_session()
+        && OB_NOT_NULL(owned_tx) && owned_tx == session->get_tx_desc()
+        && !owned_tx->is_shadow() && owned_tx->get_tx_id().is_valid()
+        && 0 == parent_ctx->get_das_ctx().get_write_branch_id()
+        && 0 == cur_ctx->get_das_ctx().get_write_branch_id()
+        && 0 == parent_ctx->get_das_ctx().get_savepoint().get_branch()
+        && 0 == cur_ctx->get_das_ctx().get_savepoint().get_branch();
+  }
+  return is_owner_sql;
+}
+
+int ObSQLUtils::check_outtable_lob_control_complete(
+    ObExecContext &ctx,
+    const uint64_t ref_table_id,
+    bool &allow_control_complete)
+{
+  int ret = OB_SUCCESS;
+  const schema::ObTableSchema *table_schema = nullptr;
+  allow_control_complete = false;
+  if (!is_outtable_lob_control_owner_sql(&ctx)) {
+  } else if (OB_ISNULL(ctx.get_sql_ctx()) || OB_ISNULL(ctx.get_sql_ctx()->schema_guard_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("schema guard is null for control completion", K(ret));
+  } else if (OB_FAIL(ctx.get_sql_ctx()->schema_guard_->get_table_schema(
+      ctx.get_my_session()->get_effective_tenant_id(), ref_table_id, table_schema))) {
+    LOG_WARN("failed to get control completion schema", K(ret), K(ref_table_id));
+  } else if (OB_ISNULL(table_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+    LOG_WARN("control completion table does not exist", K(ret), K(ref_table_id));
+  } else {
+    // Only the transaction owner may complete Control rows in this internal SQL scope.
+    allow_control_complete = table_schema->is_aux_outtable_lob_control_table();
+  }
+  return ret;
+}
+
 //notice: if a SQL is triggered by a PL defined as an autonomous transaction,
 //then it is not nested sql, nor is it restricted by the constraints of nested sql
 bool ObSQLUtils::is_nested_sql(ObExecContext *cur_ctx)
 {
-  return is_pl_nested_sql(cur_ctx)
+  return (need_outtable_lob_control_current_snapshot(cur_ctx)
+          && OB_NOT_NULL(cur_ctx->get_my_session())
+          && cur_ctx->get_my_session()->is_nested_session())
+      || is_pl_nested_sql(cur_ctx)
       || is_fk_nested_sql(cur_ctx)
       || is_online_stat_gathering_nested_sql(cur_ctx)
       || is_direct_load_stream_finish_nested_sql(cur_ctx);

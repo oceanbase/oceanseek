@@ -22,7 +22,7 @@ int ObExprUDFUtils::inner_vec_to_obj(ObIVector *in_vec, ObObj &obj, const ObObjM
 {
   int ret = OB_SUCCESS;
 
-  STATIC_ASSERT(ObMaxType == 55, "check if has new objtype and should adapt udf vectorization");
+  STATIC_ASSERT(ObMaxType == 56, "check if has new objtype and should adapt udf vectorization");
 
   ARG_VEC *arg_vec = static_cast<ARG_VEC *>(in_vec);
   if (arg_vec->is_null(batch_idx)) {
@@ -48,6 +48,7 @@ int ObExprUDFUtils::inner_vec_to_obj(ObIVector *in_vec, ObObj &obj, const ObObjM
         case ObTextType:
         case ObMediumTextType:
         case ObLongTextType:
+        case ObExtendBLobType:
         case ObEnumInnerType:
         case ObSetInnerType:
         case ObRawType:
@@ -200,6 +201,7 @@ int ObExprUDFUtils::inner_obj_to_vec(ObIVector *in_vec,
     case ObTextType:
     case ObMediumTextType:
     case ObLongTextType:
+    case ObExtendBLobType:
     case ObEnumInnerType:
     case ObSetInnerType:
     case ObRawType:
@@ -491,6 +493,7 @@ int ObExprUDFUtils::transfer_obj_to_vec(ObObj& result,
     HANDLE_VEC_TC_OBJ2VEC(ObTextType, VEC_TC_LOB);
     HANDLE_VEC_TC_OBJ2VEC(ObMediumTextType, VEC_TC_LOB);
     HANDLE_VEC_TC_OBJ2VEC(ObLongTextType, VEC_TC_LOB);
+    HANDLE_VEC_TC_OBJ2VEC(ObExtendBLobType, VEC_TC_LOB);
     HANDLE_VEC_TC_OBJ2VEC(ObBitType, VEC_TC_BIT);
     HANDLE_VEC_TC_OBJ2VEC(ObSetType, VEC_TC_ENUM_SET);
     HANDLE_VEC_TC_OBJ2VEC(ObEnumType, VEC_TC_ENUM_SET);

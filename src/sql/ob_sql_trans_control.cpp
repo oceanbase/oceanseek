@@ -1070,6 +1070,20 @@ int ObSqlTransControl::stmt_setup_snapshot_(ObSQLSessionInfo *session,
       LOG_WARN("fail to get snapshot", K(ret), K(local_single_ls_plan), K(first_ls_id), KPC(session));
     }
   }
+  if (OB_SUCC(ret) && ObSQLUtils::need_outtable_lob_control_current_snapshot(&exec_ctx)) {
+    const ObTxIsolationLevel isolation = session->is_in_transaction()
+        ? session->get_tx_desc()->get_isolation_level() : session->get_tx_isolation();
+    // RC already has a fresh statement snapshot; RR/SERIAL may still use T1's old snapshot.
+    if (is_RR_or_SERIAL_isolevel(isolation)) {
+      share::SCN current_snapshot_scn;
+      if (OB_FAIL(txs->get_read_snapshot_version(
+          get_stmt_expire_ts(plan_ctx, *session), current_snapshot_scn))) {
+        LOG_WARN("fail to get current snapshot for outtable lob control", K(ret));
+      } else if (snapshot.core_.version_ < current_snapshot_scn) {
+        snapshot.specify_snapshot_scn(current_snapshot_scn);
+      }
+    }
+  }
   return ret;
 }
 

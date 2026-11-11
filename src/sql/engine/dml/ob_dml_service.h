@@ -373,6 +373,11 @@ public:
       dml_param_()
   { }
   int write_tablet(DMLIterator &iter, int64_t &affected_rows);
+  void set_outtable_lob_control_keys(
+      common::ObIArray<storage::ObOuttableLobControlKey> *outtable_lob_control_keys)
+  {
+    dml_param_.outtable_lob_control_keys_ = outtable_lob_control_keys;
+  }
   // The main iterator invokes this after storage's write check and before
   // returning its first row. Auxiliary rewinds reuse the completed batch.
   // Regular and conflict-fetch INSERT must share this entry point.
@@ -679,6 +684,8 @@ int ObDASIndexDMLAdaptor<N, DMLIterator>::write_tablet_with_ignore(DMLIterator &
   while (OB_SUCC(ret) && OB_SUCC(write_iter.get_next_row(dml_row))) {
     transaction::ObTxSEQ savepoint_no;
     int64_t table_affected_rows = 0;
+    const int64_t control_key_count = OB_ISNULL(dml_param_.outtable_lob_control_keys_)
+        ? 0 : dml_param_.outtable_lob_control_keys_->count();
     ObDASWriteBuffer single_row_buffer;
     ObDASWriteBuffer::DmlShadowRow dsr;
     bool added = false;
@@ -776,6 +783,10 @@ int ObDASIndexDMLAdaptor<N, DMLIterator>::write_tablet_with_ignore(DMLIterator &
                                                          savepoint_no,
                                                          dml_param_.timeout_))) {
         SQL_DAS_LOG(WARN, "rollbakc to local savepoint failed", K(ret));
+      } else if (OB_NOT_NULL(dml_param_.outtable_lob_control_keys_)) {
+        while (dml_param_.outtable_lob_control_keys_->count() > control_key_count) {
+          dml_param_.outtable_lob_control_keys_->pop_back();
+        }
       }
     } else if (OB_SUCC(ret)) {
       ++affected_rows;

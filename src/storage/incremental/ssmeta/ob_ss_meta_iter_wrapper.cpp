@@ -1871,6 +1871,8 @@ int ObSSMetaTabletTinyInfoIterator::get_next(
         tiny_info.max_replayed_scn_ = tablet->get_tablet_meta().get_max_replayed_scn();
         tiny_info.min_major_snapshot_ = tablet->get_min_major_snapshot_version();
         tiny_info.max_major_snapshot_ = tablet->get_last_major_snapshot_version();
+        tiny_info.clog_checkpoint_scn_ = tablet->get_clog_checkpoint_scn();
+        tiny_info.multi_version_start_ = tablet->get_multi_version_start();
       }
       break;
     }

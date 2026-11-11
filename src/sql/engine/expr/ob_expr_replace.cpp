@@ -414,7 +414,10 @@ int ObExprReplace::eval_replace(const ObExpr &expr, ObEvalCtx &ctx, ObDatum &exp
       from_len = from->len_;
     } else {
       ObLobLocatorV2 locator(from->get_string());
-      if (OB_FAIL(ObLobManager::get_byte_length(locator, from_len))) {
+      if (OB_UNLIKELY(!from->is_null() && locator.is_mem_external_lob())) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "REPLACE with an external LOB search argument");
+      } else if (OB_FAIL(ObLobManager::get_byte_length(locator, from_len))) {
         LOG_WARN("get lob data byte length failed", K(ret), K(locator));
       }
     }

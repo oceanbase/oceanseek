@@ -483,6 +483,7 @@ private:
   inline bool is_large_data(ObObjType type) {
     bool b_large_data = false;
     if (type == ObLongTextType
+        || ObExtendBLobType == type
         || type == ObMediumTextType
         || type == ObTextType
         || type == ObLobType

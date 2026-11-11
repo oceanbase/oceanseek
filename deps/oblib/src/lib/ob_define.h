@@ -767,6 +767,7 @@ const char *const OB_HYBRID_SEARCH_SCORE_COLUMN_NAME = "__score";
 // backup and restore
 const int64_t OB_MAX_CLUSTER_NAME_LENGTH = OB_MAX_APP_NAME_LENGTH;
 const int64_t OB_MAX_URI_LENGTH = 2048;
+const int64_t OB_ETAG_CAPACITY = 1024;
 const int64_t OB_MAX_RETRY_TIMES = 3;
 const int64_t OB_AGENT_MAX_RETRY_TIME = 5 * 60 * 1000 * 1000;//300s
 const int64_t OB_AGENT_SINGLE_SLEEP_SECONDS = 5;//5s
@@ -1953,7 +1954,10 @@ const int64_t OB_DEFAULT_LOB_CHUNK_SIZE = OB_MAX_LOB_CHUNK_SIZE;
 const int64_t OB_MIN_LOB_INROW_THRESHOLD = 0; // 0 means disable inrow lob
 const int64_t OB_MAX_LOB_INROW_THRESHOLD = OB_MAX_USER_ROW_LENGTH / 2; // 1.5M/2
 const int64_t OB_DEFAULT_LOB_INROW_THRESHOLD = 4096; // 4K
-const int64_t OB_DEFAULT_LOB_INTABLE_THRESHOLD = 2L * 1024L * 1024L; // Reserved for LOB InTable threshold.
+
+const int64_t OB_MIN_LOB_INTABLE_THRESHOLD = 0;
+const int64_t OB_MAX_LOB_INTABLE_THRESHOLD = INT64_MAX;
+const int64_t OB_DEFAULT_LOB_INTABLE_THRESHOLD = 2L * 1024L * 1024L;
 
 // this's used for ob_default_lob_inrow_threshold system variable
 // used to set the default inrow threshold for newly created tables

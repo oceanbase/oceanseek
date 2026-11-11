@@ -642,11 +642,17 @@ TEST_F(ObStorageCachePolicyColdTest, test_convert_cold_to_auto)
   FLOG_INFO("[TEST] finish test_convert_cold_to_auto");
 }
 
-// cold policy is not persisted in macro cache or micro cache, but remains in KVCACHE
-// 场景：COLD 策略下验证缓存行为，等待预读结束时同时观察异步 put，区分读取未完成和写缓存未完成。
+// ----------------------------------------------------------------------------
+// COLD 普通宏块读取不进入 L2，显式预读后目标宏块在 L1 KVCACHE 中可见
+//
+// 场景：构造 COLD tablet，清除宏缓存后连续两轮读取，校验 miss 统计。
+// 操作：将该 tablet 的共享宏块投递预读，有界等待全部普通共享宏块在 KVCACHE 可见。
+// 校验：保留两轮 miss 校验，全部普通目标块进入 L1 后仍未进入 L2；保留 MINI 的 L2 例外。
+//       队列计数不是跨阶段一致快照，不能用来判定目标预读已完成。
+// ----------------------------------------------------------------------------
 TEST_F(ObStorageCachePolicyColdTest, test_cold_policy_cache_behavior)
 {
-  SCOPED_TRACE("COLD 策略下验证缓存行为，等待预读结束时同时观察异步 put，区分读取未完成和写缓存未完成。");
+  SCOPED_TRACE("有界等待本次预读的全部普通目标宏块在 KVCACHE 可见，再校验 COLD 的 L2 策略。");
   FLOG_INFO("[TEST] start test_cold_policy_cache_behavior");
   share::ObTenantSwitchGuard tguard;
   OK(tguard.switch_to(run_ctx_.tenant_id_));
@@ -660,6 +666,15 @@ TEST_F(ObStorageCachePolicyColdTest, test_cold_policy_cache_behavior)
       MTL(ObSSTenantMacroBlockKVCacheMgr *);
   ASSERT_NE(nullptr, tenant_kvcache_mgr);
   OK(exe_sql("alter system set default_storage_cache_policy = 'cold'"));
+  // ASSERT 提前退出时也恢复默认策略，避免失败影响后续用例。
+  DEFER({
+    const int cleanup_ret = exe_sql("alter system set default_storage_cache_policy = 'auto'");
+    EXPECT_EQ(OB_SUCCESS, cleanup_ret);
+    if (OB_SUCCESS != cleanup_ret) {
+      LOG_ERROR_RET(cleanup_ret,
+          "fail to restore default storage cache policy", KR(cleanup_ret), K(run_ctx_));
+    }
+  });
   OK(exe_sql("create table test_cold_cache_behavior (a int)"));
   set_ls_and_tablet_id_for_run_ctx("test_cold_cache_behavior");
 
@@ -762,31 +777,47 @@ TEST_F(ObStorageCachePolicyColdTest, test_cold_policy_cache_behavior)
   FLOG_INFO("[TEST] test cold policy in preread task");
   ObTenantFileManager *file_manager = MTL(ObTenantFileManager *);
   ASSERT_NE(nullptr, file_manager);
-  ObPrereadCacheManager &preread_cache_mgr = file_manager->preread_cache_mgr_;
-  ObSSPreReadTask &preread_task = preread_cache_mgr.preread_task_;
+  ObSEArray<MacroBlockId, 128> preread_target_ids;
+  preread_target_ids.set_attr(ObMemAttr(run_ctx_.tenant_id_, "SCPTestPreread"));
   for (int i = 0; i < data_block_ids.count(); i++) {
     if (data_block_ids.at(i).is_shared_data_or_meta()) {
       OK(file_manager->push_to_preread_queue(data_block_ids.at(i), run_ctx_.tablet_id_));
+      // MINI 允许保留在 L2；已在 L2 的块按设计跳过预读，不要求其必须再次进入 L1。
+      if (ObStorageObjectType::SHARED_MINI_DATA_MACRO != data_block_ids.at(i).storage_object_type()) {
+        OK(preread_target_ids.push_back(data_block_ids.at(i)));
+      }
     }
   }
-  // 6. wait preread_task read cold policy file to macro memory cache.
-  int ret = OB_SUCCESS;
-  int64_t start_us = ObTimeUtility::current_time();
-  const int64_t timeout_us = 20 * 1000 * 1000L; // 20s
-  while ((preread_cache_mgr.preread_queue_.size() != 0) ||
-        (preread_task.segment_files_.count() != 0) ||
-        (preread_task.free_list_.get_curr_total() != file_manager->preread_cache_mgr_.preread_task_.max_pre_read_parallelism_)) {
-    ob_usleep(1000);
-    if (timeout_us + start_us < ObTimeUtility::current_time()) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("waiting time is too long", KR(ret),
-          KR(preread_cache_mgr.preread_queue_.size()), KR(preread_task.segment_files_.count()),
-          KR(preread_task.async_read_list_.get_curr_total()), KR(preread_task.pending_put_count_));
-      break;
+  const int64_t preread_block_count = preread_target_ids.count();
+  ASSERT_GT(preread_block_count, 0);
+  LOG_INFO("step 5 done: cold macro blocks submitted for preread",
+      K(run_ctx_), K(preread_block_count), K(preread_target_ids), K(data_block_ids));
+
+  // 6. 只查询目标块是否可见，不主动读取填充缓存，也不读取异步线程内部容器。
+  static constexpr int64_t PREREAD_TIMEOUT_US = 20_s;
+  const int64_t preread_start_us = ObTimeUtility::current_time_us();
+  int64_t kvcache_count = 0;
+  do {
+    kvcache_count = 0;
+    for (int64_t i = 0; i < preread_target_ids.count(); ++i) {
+      bool is_kvcache_exist = false;
+      OK(tenant_kvcache_mgr->check_exist(preread_target_ids.at(i), is_kvcache_exist));
+      if (is_kvcache_exist) {
+        ++kvcache_count;
+      }
     }
-  }
-  
-  // 7. check macro block not in macro cache
+    if (kvcache_count != preread_block_count) {
+      ob_usleep(1_ms);
+    }
+  } while (kvcache_count != preread_block_count
+      && ObTimeUtility::current_time_us() - preread_start_us < PREREAD_TIMEOUT_US);
+  const int64_t preread_wait_us = ObTimeUtility::current_time_us() - preread_start_us;
+  LOG_INFO("step 6 done: verify cold preread targets visible in KVCACHE",
+      K(run_ctx_), K(preread_block_count), K(kvcache_count), K(preread_wait_us), K(preread_target_ids));
+  ASSERT_EQ(preread_block_count, kvcache_count);
+  ASSERT_GT(kvcache_count, 0);
+
+  // 7. 全部目标在 L1 可见后再验证 L2，保留原有 MINI 宏块例外。
   bool is_macro_cache_exist = false;
   int64_t macro_cache_count = 0;
   for (int i = 0; i < data_block_ids.count(); i++) {
@@ -797,23 +828,8 @@ TEST_F(ObStorageCachePolicyColdTest, test_cold_policy_cache_behavior)
       }
     }
   }
-  ASSERT_EQ(0, macro_cache_count);
   FLOG_INFO("[TEST] cold policy, macro cache count", K(macro_cache_count));
-  
-  // L2 不缓存普通 COLD 宏块，但 L1 仍允许预读写入；分别检查两级缓存，避免混淆策略。
-  // 8. check macro block in memory cache
-  bool is_kvcache_exist = false;
-  int64_t kvcache_count = 0;
-  for (int i = 0; i < data_block_ids.count(); i++) {
-    if (data_block_ids.at(i).is_shared_data_or_meta()) {
-      OK(tenant_kvcache_mgr->check_exist(data_block_ids.at(i), is_kvcache_exist));
-      if (is_kvcache_exist) {
-        kvcache_count++;
-      }
-    }
-  }
-  ASSERT_GT(kvcache_count, 0);
-  OK(exe_sql("alter system set default_storage_cache_policy = 'auto'"));
+  ASSERT_EQ(0, macro_cache_count);
   FLOG_INFO("[TEST] cold policy, KVCACHE count", K(kvcache_count));
   FLOG_INFO("[TEST] finish test_cold_policy_cache_behavior");
 }
@@ -1693,19 +1709,55 @@ TEST_F(ObStorageCachePolicyColdTest, test_schedule_failure_status_and_retry_scan
       K(tenant_id), K(RETRY_TABLET_ID), K(FAILED_TABLET_ID));
 }
 
+// 等待捕获的同一任务完成，避免虚拟表命中旧任务，或辅助函数中的 ASSERT 失败后调用方继续。
+static int wait_scp_test_task_finished(const ObStorageCacheTabletTaskHandle &task_handle)
+{
+  int ret = OB_SUCCESS;
+  static constexpr int64_t TASK_TIMEOUT_US = 2_min;
+  const int64_t start_us = ObTimeUtility::current_time_us();
+  ObStorageCacheTaskStatusType status = ObStorageCacheTaskStatus::OB_STORAGE_CACHE_TASK_STATUS_MAX;
+  if (!task_handle.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid storage cache test task handle", KR(ret), K(task_handle));
+  } else {
+    do {
+      status = task_handle()->get_status();
+      if (ObStorageCacheTaskStatus::OB_STORAGE_CACHE_TASK_FINISHED == status) {
+        ret = task_handle()->get_result();
+      } else if (ObStorageCacheTaskStatus::OB_STORAGE_CACHE_TASK_FAILED == status
+          || ObStorageCacheTaskStatus::OB_STORAGE_CACHE_TASK_CANCELED == status
+          || ObStorageCacheTaskStatus::OB_STORAGE_CACHE_TASK_SUSPENDED == status) {
+        ret = OB_ERR_UNEXPECTED;
+      } else {
+        ob_usleep(10_ms);
+      }
+    } while (OB_SUCC(ret) && ObStorageCacheTaskStatus::OB_STORAGE_CACHE_TASK_FINISHED != status
+        && ObTimeUtility::current_time_us() - start_us < TASK_TIMEOUT_US);
+    if (OB_SUCC(ret) && ObStorageCacheTaskStatus::OB_STORAGE_CACHE_TASK_FINISHED != status) {
+      ret = OB_TIMEOUT;
+    }
+    const int64_t wait_us = ObTimeUtility::current_time_us() - start_us;
+    LOG_INFO("finish waiting for captured storage cache test task",
+        KR(ret), K(status), K(wait_us), KPC(task_handle.get_ptr()));
+  }
+  return ret;
+}
+
 // ----------------------------------------------------------------------------
-// HOT 入队失败保持 WAITING，显式 AUTO 预热和周期 refresh 均按 HOT 恢复
+// HOT 入队失败保持 WAITING，显式 AUTO、普通 refresh 和 retry 扫描均按 HOT 恢复
 //
 // 场景：构造真实 HOT tablet，并在 TG_PUSH_TASK 前通过 EN_PUSH_TASK_FAILED
-//       连续模拟两次 OB_EAGAIN。
+//       模拟 OB_EAGAIN；周期 refresh 在整个用例内暂停，避免后台抢先恢复目标任务。
 // 操作：首次生成 HOT task 并注入 OB_EAGAIN；显式 AUTO 预热立即重试并再次失败；
-//       最后在 TG queue 为空时执行普通 refresh。
+//       执行普通 refresh 并等待完成，再重新注入失败，直接触发 retry 扫描恢复。
 // 校验：失败任务均为 INIT + OB_EAGAIN；显式 AUTO 请求不得将 HOT 降级为 AUTO；
-//       周期 refresh 最终生成新的 HOT task，并由 TG worker 执行至 FINISHED。
+//       两条恢复路径均生成新的 HOT task，并由真实 TG worker 执行至 FINISHED。
+//       全局提示仅在队列排空、成功扫描且不存在待重试任务后校验为 false。
 // ----------------------------------------------------------------------------
 TEST_F(ObStorageCachePolicyColdTest, test_push_eagain_waiting_and_refresh_regenerate)
 {
   int ret = OB_SUCCESS;
+  static constexpr int64_t RETRY_SCAN_TIMEOUT_US = 2_min;
   const uint64_t tenant_id = run_ctx_.tenant_id_;
   share::ObTenantSwitchGuard tguard;
   OK(tguard.switch_to(tenant_id));
@@ -1722,17 +1774,18 @@ TEST_F(ObStorageCachePolicyColdTest, test_push_eagain_waiting_and_refresh_regene
   DEFER({
     if (need_restore_refresh_task) {
       const int cleanup_ret = TG_SCHEDULE(policy_service->refresh_policy_scheduler_.tg_id_,
-          policy_service->refresh_policy_scheduler_.refresh_policy_task_, 30_s, true);
+          policy_service->refresh_policy_scheduler_.refresh_policy_task_, 30_s, true /*repeat*/);
+      EXPECT_EQ(OB_SUCCESS, cleanup_ret);
       if (OB_SUCCESS != cleanup_ret) {
         LOG_ERROR("fail to restore storage cache refresh task", KR(cleanup_ret), K(tenant_id));
       }
     }
   });
-  TG_CANCEL_TASK(policy_service->refresh_policy_scheduler_.tg_id_,
-      policy_service->refresh_policy_scheduler_.refresh_policy_task_);
-  TG_WAIT_TASK(policy_service->refresh_policy_scheduler_.tg_id_,
-      policy_service->refresh_policy_scheduler_.refresh_policy_task_);
+  OK(TG_CANCEL_TASK_R(policy_service->refresh_policy_scheduler_.tg_id_,
+      policy_service->refresh_policy_scheduler_.refresh_policy_task_));
   need_restore_refresh_task = true;
+  OK(TG_INVOKE(policy_service->refresh_policy_scheduler_.tg_id_, wait_task,
+      policy_service->refresh_policy_scheduler_.refresh_policy_task_));
 
   // 构造真实 HOT tablet，使普通 refresh 中的 active tablet 检查能够通过。
   static constexpr char TEST_TABLE_NAME[] = "test_queue_full_retry_refresh";
@@ -1770,9 +1823,16 @@ TEST_F(ObStorageCachePolicyColdTest, test_push_eagain_waiting_and_refresh_regene
   OK(exe_sql("insert into test_queue_full_retry_refresh values (2)"));
   OK(TestCompactionUtil::medium_compact(tenant_id, tablet_id, run_ctx_.ls_id_));
   OK(exe_sql("alter table test_queue_full_retry_refresh storage_cache_policy (global = 'hot')"));
+  // DDL 触发的一次性 force refresh 也须结束，之后由本用例同步刷新，防止故障点被后台抢先消费。
+  OK(TG_CANCEL_TASK_R(policy_service->refresh_policy_scheduler_.tg_id_,
+      policy_service->refresh_policy_scheduler_.force_refresh_policy_task_));
+  OK(TG_INVOKE(policy_service->refresh_policy_scheduler_.tg_id_, wait_task,
+      policy_service->refresh_policy_scheduler_.force_refresh_policy_task_));
   OK(policy_service->trigger_or_refresh_tablet(
       ObStorageCachePolicyRefreshType::REFRESH_TYPE_FORCE_REFRESH));
-  wait_task_finished(tablet_id);
+  ObStorageCacheTabletTaskHandle initial_task_handle;
+  OK(tablet_task_map.get_refactored(tablet_id, initial_task_handle));
+  OK(wait_scp_test_task_finished(initial_task_handle));
   LOG_INFO("step 1 done: real hot tablet prepared", K(tenant_id), K(tablet_id));
 
   // 注入一次 push OB_EAGAIN，退出 case 时始终关闭故障点，避免影响其他用例。
@@ -1818,22 +1878,34 @@ TEST_F(ObStorageCachePolicyColdTest, test_push_eagain_waiting_and_refresh_regene
   ASSERT_TRUE(second_retry_task->need_retry_push_task());
   ASSERT_TRUE(tablet_scheduler.has_retry_waiting_task());
 
-  // TG queue 为空时周期 refresh 扫描待重试 task，并通过真实 TG push 入队。
+  // 普通 refresh 可在 schema 扫描阶段重建任务；队列状态只作诊断，不代表 refresh 后仍为空。
   int64_t queue_task_count = -1;
   OK(TG_GET_QUEUE_NUM(tablet_scheduler.tg_id_, queue_task_count));
-  LOG_INFO("step 4: verify storage cache task queue has no pending task", K(queue_task_count));
-  ASSERT_LE(queue_task_count, 0);
+  LOG_INFO("step 4: inspect storage cache task queue before refresh", K(queue_task_count));
   LOG_INFO("step 4: trigger normal refresh for enqueue retry", K(tablet_id));
-  OK(policy_service->trigger_or_refresh_tablet(
-      ObStorageCachePolicyRefreshType::REFRESH_TYPE_NORMAL));
+  const int64_t refresh_start_us = ObTimeUtility::current_time_us();
+  int64_t normal_refresh_count = 0;
   ObStorageCacheTabletTaskHandle regenerated_task_handle;
-  OK(tablet_task_map.get_refactored(tablet_id, regenerated_task_handle));
-  ASSERT_TRUE(regenerated_task_handle.is_valid());
+  // schema 没有变化且队列非空时，普通 refresh 可暂时不重试；等待真实恢复而非要求单轮完成。
+  do {
+    OK(policy_service->trigger_or_refresh_tablet(
+        ObStorageCachePolicyRefreshType::REFRESH_TYPE_NORMAL));
+    ++normal_refresh_count;
+    // ObPtrHandle 不允许覆盖有效 handle；每轮查询前先释放上一轮快照。
+    regenerated_task_handle.reset();
+    OK(tablet_task_map.get_refactored(tablet_id, regenerated_task_handle));
+    ASSERT_TRUE(regenerated_task_handle.is_valid());
+    if (regenerated_task_handle()->need_retry_push_task()) {
+      ob_usleep(100_ms);
+    }
+  } while (regenerated_task_handle()->need_retry_push_task()
+      && ObTimeUtility::current_time_us() - refresh_start_us < RETRY_SCAN_TIMEOUT_US);
+  const int64_t refresh_wait_us = ObTimeUtility::current_time_us() - refresh_start_us;
   ObStorageCacheTabletTask *regenerated_task = regenerated_task_handle.get_ptr();
   const ObStorageCacheTaskStatusType second_retry_status_after_refresh =
       second_retry_task->get_status();
   LOG_INFO("step 4 done: enqueue retry task regenerated and enqueued",
-      K(tablet_id), K(second_retry_status_after_refresh),
+      K(tablet_id), K(normal_refresh_count), K(refresh_wait_us), K(second_retry_status_after_refresh),
       KPC(second_retry_task), KPC(regenerated_task));
   ASSERT_NE(second_retry_task, regenerated_task);
   ASSERT_EQ(ObStorageCacheTaskStatus::OB_STORAGE_CACHE_TASK_INIT,
@@ -1841,11 +1913,11 @@ TEST_F(ObStorageCachePolicyColdTest, test_push_eagain_waiting_and_refresh_regene
   ASSERT_EQ(OB_EAGAIN, second_retry_task->get_result());
   ASSERT_EQ(PolicyStatus::HOT, regenerated_task->get_policy_status());
   ASSERT_FALSE(regenerated_task->need_retry_push_task());
-  ASSERT_FALSE(tablet_scheduler.has_retry_waiting_task());
+  OK(regenerated_task->get_result());
 
   // 等待新任务完成，确认重生成任务已被真实 TG worker 消费。
   LOG_INFO("step 5: wait regenerated task finished", K(tablet_id));
-  wait_task_finished(tablet_id);
+  OK(wait_scp_test_task_finished(regenerated_task_handle));
   ObStorageCacheTabletTaskHandle finished_task_handle;
   OK(tablet_task_map.get_refactored(tablet_id, finished_task_handle));
   ASSERT_TRUE(finished_task_handle.is_valid());
@@ -1854,6 +1926,91 @@ TEST_F(ObStorageCachePolicyColdTest, test_push_eagain_waiting_and_refresh_regene
       K(tablet_id), K(finished_status), KPC(finished_task_handle.get_ptr()));
   ASSERT_EQ(regenerated_task, finished_task_handle.get_ptr());
   ASSERT_EQ(ObStorageCacheTaskStatus::OB_STORAGE_CACHE_TASK_FINISHED, finished_status);
+  OK(finished_task_handle()->get_result());
+
+  // 6. 独立制造活跃 tablet 的入队失败，后续不再调用 refresh，保证直接覆盖 retry scanner。
+  bool is_active = false;
+  OK(tablet_scheduler.check_is_active_tablet(tablet_id, is_active));
+  ASSERT_TRUE(is_active);
+  LOG_INFO("step 6: inject push failure for direct retry scan", K(tenant_id), K(tablet_id));
+  TP_SET_EVENT(common::EventTable::EN_PUSH_TASK_FAILED, OB_EAGAIN, 1 /*occur*/, 0 /*trigger_freq*/);
+  OK(tablet_scheduler.generate_partition_task(tenant_id, tablet_id, PolicyStatus::HOT));
+  TP_SET_EVENT(common::EventTable::EN_PUSH_TASK_FAILED, OB_SUCCESS, 0 /*occur*/, 0 /*trigger_freq*/);
+  ObStorageCacheTabletTaskHandle scan_retry_task_handle;
+  OK(tablet_task_map.get_refactored(tablet_id, scan_retry_task_handle));
+  ASSERT_TRUE(scan_retry_task_handle.is_valid());
+  LOG_INFO("step 6: verify active tablet waits for retry scan",
+      K(tablet_id), KPC(scan_retry_task_handle.get_ptr()));
+  ASSERT_NE(regenerated_task, scan_retry_task_handle.get_ptr());
+  ASSERT_EQ(ObStorageCacheTaskStatus::OB_STORAGE_CACHE_TASK_INIT, scan_retry_task_handle()->get_status());
+  ASSERT_EQ(OB_EAGAIN, scan_retry_task_handle()->get_result());
+  ASSERT_EQ(PolicyStatus::HOT, scan_retry_task_handle()->get_policy_status());
+  ASSERT_TRUE(scan_retry_task_handle()->need_retry_push_task());
+  ASSERT_TRUE(tablet_scheduler.has_retry_waiting_task());
+
+  const int64_t retry_scan_start_us = ObTimeUtility::current_time_us();
+  int64_t retry_scan_count = 0;
+  ObStorageCacheTabletTaskHandle scan_regenerated_task_handle;
+  OK(scan_regenerated_task_handle.assign(scan_retry_task_handle));
+  // 队列判空和扫描之间可能有新任务入队；若本次扫描跳过或再次遇到 EAGAIN，继续有界推进。
+  do {
+    OK(TG_GET_QUEUE_NUM(tablet_scheduler.tg_id_, queue_task_count));
+    if (queue_task_count <= 0) {
+      OK(tablet_scheduler.trigger_retry_waiting_tasks());
+      ++retry_scan_count;
+      // 旧任务由 scan_retry_task_handle 保持引用，查询出参须先清空再接收新任务。
+      scan_regenerated_task_handle.reset();
+      OK(tablet_task_map.get_refactored(tablet_id, scan_regenerated_task_handle));
+      ASSERT_TRUE(scan_regenerated_task_handle.is_valid());
+    }
+    if (scan_regenerated_task_handle()->need_retry_push_task()) {
+      ob_usleep(10_ms);
+    }
+  } while (scan_regenerated_task_handle()->need_retry_push_task()
+      && ObTimeUtility::current_time_us() - retry_scan_start_us < RETRY_SCAN_TIMEOUT_US);
+  const int64_t retry_scan_wait_us = ObTimeUtility::current_time_us() - retry_scan_start_us;
+  LOG_INFO("step 6 done: direct retry scan regenerated hot task",
+      K(tablet_id), K(queue_task_count), K(retry_scan_count), K(retry_scan_wait_us),
+      KPC(scan_retry_task_handle.get_ptr()), KPC(scan_regenerated_task_handle.get_ptr()));
+  ASSERT_GT(retry_scan_count, 0);
+  ASSERT_NE(scan_retry_task_handle.get_ptr(), scan_regenerated_task_handle.get_ptr());
+  ASSERT_TRUE(scan_retry_task_handle()->need_retry_push_task());
+  ASSERT_EQ(PolicyStatus::HOT, scan_regenerated_task_handle()->get_policy_status());
+  ASSERT_FALSE(scan_regenerated_task_handle()->need_retry_push_task());
+  OK(scan_regenerated_task_handle()->get_result());
+  OK(wait_scp_test_task_finished(scan_regenerated_task_handle));
+  // step 5 的完成任务仍被此 handle 持有，不能直接覆盖为 retry scan 生成的任务。
+  finished_task_handle.reset();
+  OK(tablet_task_map.get_refactored(tablet_id, finished_task_handle));
+  ASSERT_EQ(scan_regenerated_task_handle.get_ptr(), finished_task_handle.get_ptr());
+  ASSERT_EQ(ObStorageCacheTaskStatus::OB_STORAGE_CACHE_TASK_FINISHED, finished_task_handle()->get_status());
+  OK(finished_task_handle()->get_result());
+
+  // 7. 只在队列排空并完成无待重试任务的扫描后校验全局提示，不能仅因目标已完成就要求清零。
+  ObSEArray<uint64_t, 128> retry_tablet_ids;
+  retry_tablet_ids.set_attr(ObMemAttr(tenant_id, "SCPTestRetry"));
+  const int64_t drain_start_us = ObTimeUtility::current_time_us();
+  bool retry_scan_drained = false;
+  do {
+    OK(TG_GET_QUEUE_NUM(tablet_scheduler.tg_id_, queue_task_count));
+    if (queue_task_count <= 0) {
+      OK(tablet_scheduler.trigger_retry_waiting_tasks());
+      OK(tablet_scheduler.get_retry_waiting_tablet_ids(retry_tablet_ids));
+      retry_scan_drained = 0 == retry_tablet_ids.count() && !tablet_scheduler.has_retry_waiting_task();
+    }
+    if (!retry_scan_drained) {
+      ob_usleep(10_ms);
+    }
+  } while (!retry_scan_drained
+      && ObTimeUtility::current_time_us() - drain_start_us < RETRY_SCAN_TIMEOUT_US);
+  const int64_t drain_wait_us = ObTimeUtility::current_time_us() - drain_start_us;
+  LOG_INFO("step 7 done: verify retry hint cleared after queue drain and scan",
+      K(tablet_id), K(queue_task_count), K(retry_tablet_ids), K(retry_scan_drained),
+      K(drain_wait_us), K(tablet_scheduler.has_retry_waiting_task()));
+  ASSERT_TRUE(retry_scan_drained);
+  ASSERT_LE(queue_task_count, 0);
+  ASSERT_EQ(0, retry_tablet_ids.count());
+  ASSERT_FALSE(tablet_scheduler.has_retry_waiting_task());
   OK(tablet_task_map.erase_refactored(tablet_id));
   task_may_exist = false;
 

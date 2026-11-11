@@ -762,6 +762,10 @@ static void convert_http_error(const Aws::S3::S3Error &s3_err, int &ob_errcode)
       ob_errcode = OB_OBJECT_STORAGE_PERMISSION_DENIED;
       break;
     }
+    case S3_RANGE_NOT_SATISFIABLE: {
+      ob_errcode = OB_DATA_OUT_OF_RANGE;
+      break;
+    }
     case S3_SLOW_DOWN: {
       ob_errcode = OB_IO_LIMIT;
       break;

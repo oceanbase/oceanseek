@@ -414,7 +414,7 @@ static int calc_oracle_instr_text(ObTextStringIter &haystack_iter,
     // pattern length is bigger than content, just return zero
     idx = 0;
   } else {
-    if (haystack_iter.is_outrow_lob()) {
+    if (haystack_iter.is_outline_lob()) {
       haystack_iter.set_reserved_len(static_cast<size_t>(needle_char_len) - 1);
       if (pos_int > 0) {
         haystack_iter.set_start_offset(pos_int - 1); // start char len
@@ -471,7 +471,7 @@ static int calc_oracle_instr_text(ObTextStringIter &haystack_iter,
       bool access_inrow_lob_prefix = false; // only access prefix of an inrow lob
       if (OB_FAIL(haystack_iter.get_char_len(total_char_len))) {
         LOG_WARN("get haystack char len failed", K(ret), K(state)); 
-      } else if (haystack_iter.is_outrow_lob()) {
+      } else if (haystack_iter.is_outline_lob()) {
         max_access_len = total_char_len + pos_int + 1;
         haystack_iter.set_start_offset(-pos_int - 1); // start char len
         pos_int = -1;

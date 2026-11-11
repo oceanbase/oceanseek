@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX OBLOG
 
+#include <string>
 
 #include "log_generator.h" // must at last of header list
 #define private public
@@ -12,6 +13,10 @@
 #undef private
 #include "share/ob_define.h"
 #include "storage/ob_storage_log_type.h"
+#include "storage/blocksstable/ob_storage_object_type.h"
+#include "storage/lob/common/ob_lob_seq.h"
+#include "lib/alloc/ob_malloc_allocator.h"
+#include "lib/utility/ob_test_util.h"
 #include "storage/tx/ob_trans_log.h"
 #include "logservice/logfetcher/ob_log_fetch_stat_info.h"
 #include "logservice/libobcdc/src/ob_log_utils.h"
@@ -302,6 +307,283 @@ TEST(ObCDCPartTransResolver, test_ls_fetch_ctx)
   EXPECT_EQ(OB_SUCCESS, ls_fetch_mgr.remove_ls(tls_id));
   EXPECT_EQ(OB_ENTRY_NOT_EXIST, ls_fetch_mgr.get_ls_fetch_ctx(tls_id, ls_fetch_ctx));
   DESTROY_OBLOG_INSTANCE();
+}
+
+// Build a shared out-table LOB log body with a branch-aware operation sequence and embedded zero byte.
+int build_outtable_log_arg(ObIAllocator &allocator, ObTxLobOutTableDataLog::ConstructArg &arg)
+{
+  // Keep the piece sequence and LOB identity stable so both resolver tests use the same valid input.
+  LOG_INFO("build out-table LOB log argument: initialize piece sequence and identifiers");
+  int ret = ObLobSeqId::get_seq_id(allocator, 1 /*idx*/, arg.seq_id_);
+  arg.lob_aux_table_id_ = 2002;
+  arg.lob_operation_seq_no_ = ObTxSEQ(10 /*seq*/, 3 /*branch*/);
+  arg.lob_id_.set_column_idx(3 /*column_idx*/);
+  arg.lob_id_.set_tablet_id(1001 /*tablet_id*/);
+  arg.lob_id_.set_auto_inc_id(1 /*auto_inc_id*/);
+
+  // Use a valid shared-storage macro ID so serialization reaches the resolver entry under test.
+  arg.macro_id_.set_version_v1();
+  arg.macro_id_.set_id_mode(static_cast<uint64_t>(blocksstable::ObMacroBlockIdMode::ID_MODE_SHARE));
+  arg.macro_id_.set_storage_object_type(static_cast<uint64_t>(
+      blocksstable::ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO));
+  arg.macro_id_.set_location(blocksstable::ObMacroBlockIdLocation::OBJECT_STORAGE);
+  arg.macro_id_.set_second_id(1000 /*second_id*/);
+  arg.macro_id_.set_third_id(1001 /*third_id*/);
+  arg.macro_id_.set_fourth_id(1 /*fourth_id*/);
+  arg.macro_id_.set_fifth_id(0 /*fifth_id*/);
+
+  // Preserve the explicit byte length; the embedded zero must not truncate the serialized payload.
+  arg.data_.assign_ptr("lob\0data" /*bytes*/, 8 /*length*/);
+  LOG_INFO("build out-table LOB log argument completed", KR(ret), K(arg.lob_aux_table_id_),
+      K(arg.lob_operation_seq_no_), K(arg.lob_id_), K(arg.macro_id_),
+      "seq_id_length", arg.seq_id_.length(), "data_length", arg.data_.length());
+  return ret;
+}
+
+// Create or reuse the tenant allocator required by the production redo-node allocation path.
+int prepare_outtable_tenant_allocator(const uint64_t tenant_id)
+{
+  lib::ObMallocAllocator *allocator = lib::ObMallocAllocator::get_instance();
+  int ret = OB_SUCCESS;
+  LOG_INFO("prepare out-table tenant allocator: obtain allocator", K(tenant_id), KP(allocator));
+  if (OB_ISNULL(allocator)) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+  } else {
+    // Tests share the process allocator, so an already registered tenant is expected on later calls.
+    ret = allocator->create_and_add_tenant_allocator(tenant_id);
+    LOG_INFO("prepare out-table tenant allocator: tenant registration completed", KR(ret), K(tenant_id));
+    if (OB_ENTRY_EXIST == ret) {
+      ret = OB_SUCCESS;
+    }
+    if (OB_SUCC(ret)) {
+      // Give the small resolver fixture a fixed tenant allocation limit.
+      ret = allocator->set_tenant_limit(tenant_id, 1L << 30 /*bytes*/);
+      LOG_INFO("prepare out-table tenant allocator: limit configured", KR(ret), K(tenant_id),
+          "tenant_limit_bytes", 1L << 30);
+    }
+  }
+  LOG_INFO("prepare out-table tenant allocator completed", KR(ret), K(tenant_id));
+  return ret;
+}
+
+// ============================================================================
+// Out-table LOB log ingestion and missing-log recovery (2 cases)
+// ============================================================================
+
+// A LOB log retains its complete typed body, and duplicate delivery adds no extra node or fetched LSN.
+// Scenario: A user LS consumes a standalone LOB log in MEMORY_MODE, with binary data containing a zero byte.
+// Steps: Extract its raw replay slice, consume and redeliver the entry, then overwrite the input before decoding the node.
+// Checks: Exactly one node and fetched LSN remain; every raw byte survives input reuse, with the LOB type and fields intact.
+// Scope: Duplicate delivery is injected explicitly; this does not establish that normal refetches repeat entries.
+//        Parser publication, LOB assembly and final CDC output are outside this case.
+TEST(ObCDCPartTransResolver, outtable_log_becomes_typed_redo_with_complete_body)
+{
+  LOG_INFO("========== outtable_log_becomes_typed_redo_with_complete_body begin ==========");
+
+  // Use the memory path so the node body can be inspected without a storage worker.
+  LOG_INFO("step 1: prepare a user LS and construct a binary LOB log");
+  PREPARE_LS_FETCH_CTX();
+  int ret = prepare_outtable_tenant_allocator(tenant_id);
+  LOG_INFO("step 1: tenant allocator prepared", KR(ret), K(tenant_id), K(ls_id));
+  OK(ret);
+  instance->working_mode_ = WorkingMode::MEMORY_MODE;
+  ObArenaAllocator allocator;
+  ObTxLobOutTableDataLog::ConstructArg arg;
+  ret = build_outtable_log_arg(allocator, arg);
+  LOG_INFO("step 1: LOB fields prepared", KR(ret), K(arg.lob_aux_table_id_),
+      K(arg.lob_operation_seq_no_), "data_len", arg.data_.length());
+  OK(ret);
+  ObTxLobOutTableDataLog outtable_log(arg);
+  ret = log_generator.gen_lob_outtable_data_log(outtable_log);
+  LOG_INFO("step 1: LOB log added to transaction block", KR(ret));
+  OK(ret);
+  ipalf::ILogEntry log_entry;
+  palf::LSN lsn;
+  ret = log_generator.gen_log_entry(log_entry, lsn);
+  LOG_INFO("step 1 complete: log entry generated", KR(ret), K(lsn));
+  OK(ret);
+
+  // Extract the producer's exact body range, excluding the transaction and log headers.
+  ObTxLogBlock replay_block;
+  ObTxLogHeader tx_header;
+  ObTxLobOutTableDataLog::ConstructArg replay_arg;
+  ObTxLobOutTableDataLog replay_log(replay_arg);
+  const char *raw_body = nullptr;
+  int64_t raw_body_len = 0;
+  OK(replay_block.init_for_replay(log_entry.get_data_buf(), log_entry.get_data_len()));
+  OK(replay_block.get_next_log(tx_header));
+  OK(replay_block.deserialize_log_body(replay_log, raw_body, raw_body_len));
+  ASSERT_NE(nullptr, raw_body);
+  ASSERT_GT(raw_body_len, 0);
+  EXPECT_GT(raw_body, log_entry.get_data_buf());
+  EXPECT_EQ(log_entry.get_data_buf() + log_entry.get_data_len(), raw_body + raw_body_len);
+  const std::string expected_body(raw_body, raw_body_len);
+  LOG_INFO("step 1: raw replay slice captured", K(raw_body_len),
+      "entry_len", log_entry.get_data_len(),
+      "body_offset", raw_body - log_entry.get_data_buf());
+
+  // The resolver must register the entry and preserve its typed LOB body.
+  LOG_INFO("step 2: consume LOB entry through the normal path", K(lsn));
+  ret = ls_fetch_ctx->read_log(log_entry, lsn, missing_info, tsi, stop_flag);
+  LOG_INFO("step 2: entry consumed", KR(ret), K(lsn), K(missing_info));
+  OK(ret);
+  GET_PART_TRANS_TASK();
+  LOG_INFO("step 2: inspect participant task", K(tx_id), KP(part_trans_task));
+  ASSERT_NE(nullptr, part_trans_task);
+  LOG_INFO("step 2 complete: inspect node and fetched-entry counts",
+      "redo_count", part_trans_task->get_sorted_redo_list().get_node_number(),
+      "fetched_count", part_trans_task->get_sorted_log_entry_info().get_fetched_log_entry_node_arr().count());
+  ASSERT_EQ(1, part_trans_task->get_sorted_redo_list().get_node_number());
+  ASSERT_EQ(1, part_trans_task->get_sorted_log_entry_info().get_fetched_log_entry_node_arr().count());
+
+  // Inject duplicate delivery to check deduplication without assuming it occurs in normal refetches.
+  IObCDCPartTransResolver::MissingLogInfo duplicate_info;
+  duplicate_info.set_resolving_miss_log();
+  LOG_INFO("step 3: deliver the same LOB entry through the missing-log path", K(lsn));
+  ret = ls_fetch_ctx->read_miss_tx_log(log_entry, lsn, tsi, duplicate_info);
+  LOG_INFO("step 3 complete: inspect duplicate delivery result", KR(ret), K(duplicate_info),
+      "redo_count", part_trans_task->get_sorted_redo_list().get_node_number(),
+      "fetched_count", part_trans_task->get_sorted_log_entry_info().get_fetched_log_entry_node_arr().count());
+  OK(ret);
+  EXPECT_EQ(1, part_trans_task->get_sorted_redo_list().get_node_number());
+  EXPECT_EQ(1, part_trans_task->get_sorted_log_entry_info().get_fetched_log_entry_node_arr().count());
+
+  // The entry is no longer needed after duplicate delivery; invalidate its bytes
+  // so a borrowed replay pointer cannot accidentally pass the ownership checks.
+  MEMSET(const_cast<char *>(log_entry.get_data_buf()), 0, log_entry.get_data_len());
+  LOG_INFO("step 3: overwrite the consumed entry", "entry_len", log_entry.get_data_len());
+
+  // Decode the node itself so this check covers the stored body as well as resolver dispatch.
+  LOG_INFO("step 4: obtain and decode the typed redo node");
+  part_trans_task->get_sorted_redo_list().init_iterator();
+  DmlRedoLogNode *node = nullptr;
+  bool is_last = false;
+  ret = part_trans_task->next_redo_to_dispatch(node, is_last);
+  LOG_INFO("step 4: redo node selected", KR(ret), KP(node), K(is_last));
+  OK(ret);
+  ASSERT_NE(nullptr, node);
+  LOG_INFO("step 4: inspect redo type", K(is_last), "is_lob", node->is_lob_outtable_data_log(),
+      "is_direct_load", node->is_direct_load_inc_log(), "body_len", node->get_data_len());
+  EXPECT_TRUE(is_last);
+  EXPECT_TRUE(node->is_lob_outtable_data_log());
+  EXPECT_FALSE(node->is_direct_load_inc_log());
+  ASSERT_NE(nullptr, node->get_data());
+  EXPECT_NE(raw_body, node->get_data());
+  ASSERT_EQ(raw_body_len, node->get_data_len());
+  const int body_compare = MEMCMP(expected_body.data(), node->get_data(), raw_body_len);
+  LOG_INFO("step 4: compare raw body after entry reuse", K(raw_body_len), K(body_compare));
+  EXPECT_EQ(0, body_compare);
+  ObTxLobOutTableDataLog::ConstructArg empty_arg;
+  ObTxLobOutTableDataLog decoded(empty_arg);
+  int64_t pos = 0;
+  ret = decoded.deserialize(node->get_data(), node->get_data_len(), pos);
+  LOG_INFO("step 4: redo body decoded", KR(ret), K(pos), "body_len", node->get_data_len());
+  OK(ret);
+  LOG_INFO("step 4: compare decoded identifiers",
+      K(arg.lob_aux_table_id_), "decoded_table_id", decoded.get_lob_aux_table_id(),
+      K(arg.lob_operation_seq_no_), "decoded_operation_seq", decoded.get_lob_operation_seq_no(),
+      K(arg.lob_id_), "decoded_lob_id", decoded.get_lob_id(),
+      K(arg.macro_id_), "decoded_macro_id", decoded.get_macro_id());
+  LOG_INFO("step 4 complete: compare sequence and binary data",
+      "expected_seq_len", arg.seq_id_.length(), "decoded_seq_len", decoded.get_seq_id().length(),
+      "expected_data_len", arg.data_.length(), "decoded_data_len", decoded.get_data().length(),
+      "seq_compare", arg.seq_id_.compare(decoded.get_seq_id()),
+      "data_compare", arg.data_.compare(decoded.get_data()));
+  EXPECT_EQ(node->get_data_len(), pos);
+  EXPECT_EQ(arg.lob_aux_table_id_, decoded.get_lob_aux_table_id());
+  EXPECT_TRUE(arg.lob_operation_seq_no_ == decoded.get_lob_operation_seq_no());
+  EXPECT_TRUE(arg.lob_id_ == decoded.get_lob_id());
+  EXPECT_TRUE(arg.macro_id_ == decoded.get_macro_id());
+  EXPECT_EQ(0, arg.seq_id_.compare(decoded.get_seq_id()));
+  EXPECT_EQ(0, arg.data_.compare(decoded.get_data()));
+
+  LOG_INFO("step 5: release test instance");
+  DESTROY_OBLOG_INSTANCE();
+  LOG_INFO("========== outtable_log_becomes_typed_redo_with_complete_body end ==========",
+      "has_failure", ::testing::Test::HasFailure());
+}
+
+// A missing standalone LOB log blocks commit processing until its LSN is registered through refetch.
+// Scenario: Generate a LOB entry, then an entry containing REDO, COMMIT_INFO and COMMIT; consume the latter first.
+// Steps: Check the reported gap, supply the LOB entry through the missing-log path and reconsume the commit entry.
+// Checks: The missing LSN matches the LOB entry, commit reconsumption is requested and succeeds after refetch.
+// Scope: This checks LSN completeness and recovery; it does not verify recovered payload contents,
+//        issue network fetches or exercise LOB assembly and final CDC output.
+TEST(ObCDCPartTransResolver, missing_outtable_log_is_refetched_before_commit)
+{
+  LOG_INFO("========== missing_outtable_log_is_refetched_before_commit begin ==========");
+
+  // Generate but withhold the LOB entry so COMMIT_INFO can reveal a known missing LSN.
+  LOG_INFO("step 1: prepare a user LS and generate the LOB entry to withhold");
+  PREPARE_LS_FETCH_CTX();
+  int ret = prepare_outtable_tenant_allocator(tenant_id);
+  LOG_INFO("step 1: tenant allocator prepared", KR(ret), K(tenant_id), K(ls_id));
+  OK(ret);
+  instance->working_mode_ = WorkingMode::MEMORY_MODE;
+  ObArenaAllocator allocator;
+  ObTxLobOutTableDataLog::ConstructArg arg;
+  ret = build_outtable_log_arg(allocator, arg);
+  LOG_INFO("step 1: LOB fields prepared", KR(ret), K(arg.lob_aux_table_id_),
+      K(arg.lob_operation_seq_no_), "data_len", arg.data_.length());
+  OK(ret);
+  ObTxLobOutTableDataLog outtable_log(arg);
+  ret = log_generator.gen_lob_outtable_data_log(outtable_log);
+  LOG_INFO("step 1: LOB log added to transaction block", KR(ret));
+  OK(ret);
+  ipalf::ILogEntry lob_entry;
+  palf::LSN lob_lsn;
+  ret = log_generator.gen_log_entry(lob_entry, lob_lsn);
+  LOG_INFO("step 1 complete: LOB entry generated but not consumed", KR(ret), K(lob_lsn));
+  OK(ret);
+
+  // The later entry records the preceding LOB LSN and attempts to commit the same transaction.
+  LOG_INFO("step 2: generate REDO, COMMIT_INFO and COMMIT in one entry", K(lob_lsn));
+  log_generator.gen_redo_log();
+  log_generator.gen_commit_info_log();
+  log_generator.gen_commit_log();
+  ipalf::ILogEntry commit_entry;
+  palf::LSN commit_lsn;
+  ret = log_generator.gen_log_entry(commit_entry, commit_lsn);
+  LOG_INFO("step 2 complete: commit entry generated", KR(ret), K(lob_lsn), K(commit_lsn));
+  OK(ret);
+
+  // Commit processing must report the withheld LOB entry before it can proceed.
+  LOG_INFO("step 3: consume commit entry before the LOB entry", K(commit_lsn));
+  ret = ls_fetch_ctx->read_log(commit_entry, commit_lsn, missing_info, tsi, stop_flag);
+  LOG_INFO("step 3: inspect missing-log result", KR(ret), K(lob_lsn), K(missing_info),
+      "missing_count", missing_info.get_total_misslog_cnt(),
+      "need_reconsume", missing_info.need_reconsume_commit_log_entry());
+  EXPECT_EQ(OB_ITEM_NOT_SETTED, ret);
+  ASSERT_EQ(1, missing_info.get_total_misslog_cnt());
+  LOG_INFO("step 3 complete: compare the reported missing LSN", K(lob_lsn),
+      "missing_lsn", missing_info.get_miss_redo_lsn_arr().at(0 /*idx*/));
+  EXPECT_EQ(lob_lsn, missing_info.get_miss_redo_lsn_arr().at(0 /*idx*/));
+  EXPECT_TRUE(missing_info.need_reconsume_commit_log_entry());
+
+  // Supply the exact missing entry manually to exercise the LOB handler in refetch mode.
+  IObCDCPartTransResolver::MissingLogInfo refetch_info;
+  refetch_info.set_resolving_miss_log();
+  LOG_INFO("step 4: supply the missing LOB entry", K(lob_lsn));
+  ret = ls_fetch_ctx->read_miss_tx_log(lob_entry, lob_lsn, tsi, refetch_info);
+  LOG_INFO("step 4 complete: inspect refetch result", KR(ret), K(refetch_info),
+      "missing_count", refetch_info.get_total_misslog_cnt());
+  OK(ret);
+  EXPECT_EQ(0, refetch_info.get_total_misslog_cnt());
+
+  // Reconsume the same commit entry after the LOB LSN has been registered as fetched.
+  IObCDCPartTransResolver::MissingLogInfo reconsume_info;
+  reconsume_info.set_reconsuming();
+  LOG_INFO("step 5: reconsume commit entry after refetch", K(commit_lsn));
+  ret = ls_fetch_ctx->read_log(commit_entry, commit_lsn, reconsume_info, tsi, stop_flag);
+  LOG_INFO("step 5 complete: inspect commit reconsumption result", KR(ret), K(reconsume_info),
+      "missing_count", reconsume_info.get_total_misslog_cnt());
+  OK(ret);
+  EXPECT_EQ(0, reconsume_info.get_total_misslog_cnt());
+
+  LOG_INFO("step 6: release test instance");
+  DESTROY_OBLOG_INSTANCE();
+  LOG_INFO("========== missing_outtable_log_is_refetched_before_commit end ==========",
+      "has_failure", ::testing::Test::HasFailure());
 }
 
 // seq1: redo + commit_info + commit

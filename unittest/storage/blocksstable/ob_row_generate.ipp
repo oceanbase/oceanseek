@@ -500,6 +500,7 @@ int ObRowGenerate::set_obj(const ObObjType &column_type,
     case ObTextType:
     case ObMediumTextType:
     case ObLongTextType: 
+    case ObExtendBLobType:
     case ObJsonType: 
     case ObGeometryType:
     case ObRoaringBitmapType: {
@@ -515,7 +516,8 @@ int ObRowGenerate::set_obj(const ObObjType &column_type,
         if (column_type == ObTinyTextType) {
           byte_size = 2;
         }
-        obj.meta_.set_collation_type(column_type == (ObGeometryType || ObRoaringBitmapType) ? CS_TYPE_BINARY
+        obj.meta_.set_collation_type(column_type == (ObGeometryType || ObRoaringBitmapType)
+                                     || column_type == ObExtendBLobType ? CS_TYPE_BINARY
                                      :CS_TYPE_UTF8MB4_GENERAL_CI);
         obj.meta_.set_collation_level(CS_LEVEL_IMPLICIT);
         obj.set_type(column_type);
@@ -764,6 +766,7 @@ int ObRowGenerate::compare_obj(const ObObjType &column_type, const int64_t value
   case ObTextType:
   case ObMediumTextType:
   case ObLongTextType: 
+  case ObExtendBLobType:
   case ObJsonType:
   case ObGeometryType:
   case ObRoaringBitmapType:  {
@@ -1096,7 +1099,10 @@ int ObRowGenerate::generate_one_row(ObStoreRow &row, const int64_t seed, const O
         STORAGE_LOG(WARN, "fail to set obj.", K(ret), K(i), K(seed));
       } else {
         // row.row_val_.cells_[i].set_collation_type(column_collation_type);
-        if (ObTinyTextType == column_type || ObTextType == column_type || ObMediumTextType == column_type
+        if (ObExtendBLobType == column_type) {
+          row.row_val_.cells_[i].set_collation_type(CS_TYPE_BINARY);
+          row.row_val_.cells_[i].set_collation_level(CS_LEVEL_IMPLICIT);
+        } else if (ObTinyTextType == column_type || ObTextType == column_type || ObMediumTextType == column_type
             || ObLongTextType == column_type || ObNVarchar2Type == column_type || ObNCharType == column_type) {
           row.row_val_.cells_[i].set_collation_type(CS_TYPE_UTF8MB4_GENERAL_CI);
           row.row_val_.cells_[i].set_collation_level(CS_LEVEL_IMPLICIT);

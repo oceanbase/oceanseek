@@ -89,6 +89,7 @@ enum ObObjType
   ObMySQLDateType      = 52, // date type which is compatible with MySQL.
   ObMySQLDateTimeType  = 53, // datetime type which is compatible with MySQL.
   ObRoaringBitmapType  = 54, // Roaring Bitmap Type
+  ObExtendBLobType     = 55, // binary LOB supporting internal data and external references
   ObMaxType                 // invalid type, or count of obj type
 };
 
@@ -214,6 +215,7 @@ static ObObjOType OBJ_TYPE_TO_O_TYPE[ObMaxType+1] = {
   ObONotSupport,             //ObMySQLDateType = 52,
   ObONotSupport,             //ObMySQLDateTimeType = 53,
   ObORoaringBitmapType,      //Roaring Bitmap Type = 54，
+  ObONotSupport,             //ObExtendBLobType = 55,
   ObONotSupport              //ObMaxType,
 };
 
@@ -315,7 +317,8 @@ enum ObObjTypeClass
     (ObCollectionSQLType, ObCollectionSQLTC),  \
     (ObMySQLDateType, ObMySQLDateTC),          \
     (ObMySQLDateTimeType, ObMySQLDateTimeTC),  \
-    (ObRoaringBitmapType, ObRoaringBitmapTC)
+    (ObRoaringBitmapType, ObRoaringBitmapTC),  \
+    (ObExtendBLobType, ObTextTC)
 
 #define SELECT_SECOND(x, y) y
 #define SELECT_TC(arg) SELECT_SECOND arg
@@ -1292,8 +1295,10 @@ OB_INLINE VecValueTypeClass get_vec_value_tc(const ObObjType type, const int16_t
     VEC_TC_COLLECTION,        // ObCollectionSQLType
     VEC_TC_MYSQL_DATE,        // reserved for ObMySQLDateType
     VEC_TC_MYSQL_DATETIME,    // reserved for ObMySQLDateTimeType
-    VEC_TC_ROARINGBITMAP      // ObRoaringBitmapType
+    VEC_TC_ROARINGBITMAP,     // ObRoaringBitmapType
+    VEC_TC_LOB                // ObExtendBLobType
   };
+  static_assert(sizeof(maps) / sizeof(maps[0]) == ObMaxType, "Not enough initializer");
   VecValueTypeClass t = MAX_VEC_TC;
   if (type < 0 || type >= ObMaxType) {
     OB_ASSERT(false);
@@ -1608,7 +1613,9 @@ inline bool ob_is_accuracy_length_valid_tc(ObObjType type) { return ob_is_string
                                                              ob_is_geometry_tc(type) ||
                                                              ob_is_roaringbitmap_tc(type); }
 inline bool ob_is_string_or_enumset_tc(ObObjType type) { return ObStringTC == ob_obj_type_class(type) || ob_is_enumset_tc(type); }
-inline bool ob_is_large_text(const ObObjType type) { return ObTinyTextType <= type && ObLongTextType >= type; }
+inline bool ob_is_extblob(const ObObjType type) { return ObExtendBLobType == type; }
+inline bool ob_is_large_text(const ObObjType type)
+{ return (ObTinyTextType <= type && ObLongTextType >= type) || ob_is_extblob(type); }
 inline bool ob_is_datetime(const ObObjType type) { return ObDateTimeType == type; }
 inline bool ob_is_mysql_datetime(const ObObjType type) { return ObMySQLDateTimeType == type; }
 inline bool ob_is_timestamp_tz(const ObObjType type) { return ObTimestampTZType == type; }

@@ -26,8 +26,10 @@
 
 #include "common/ob_tenant_data_version_mgr.h"
 #include "lib/utility/ob_defer.h"
+#include "lib/utility/utility.h"
 #include "observer/ob_server_struct.h"
 #include "share/ob_cluster_version.h"
+#include "share/inner_table/user_table/ob_user_table_schema.h"
 #include "storage/ss_garbage_collector/ob_ss_gc_rpc.h"
 #include "storage/ss_garbage_collector/dag/ob_ss_fail_gc_dag.h"
 #include "storage/ss_garbage_collector/dag/ob_ss_gc_dag_util.h"
@@ -44,6 +46,7 @@
 #include "storage/compaction/ob_compaction_diagnose.h"
 #include "storage/incremental/ss_meta_ctrl/ob_ss_meta_ctrl_define.h"
 #include "storage/incremental/ss_meta_ctrl/ob_ss_meta_ctrl_table_operator.h"
+#include "storage/lob/store/ob_outtable_lob_control_operator.h"
 #include "simple_server/env/ob_simple_cluster_test_base.h"
 
 namespace oceanbase
@@ -128,9 +131,33 @@ public:
       const uint64_t tenant_id,
       const share::ObLSID &ls_id);
 
+  int append_lob_ctrl_pk_condition_(
+      const blocksstable::MacroBlockId &macro_id,
+      const uint64_t hash,
+      ObSqlString &sql);
+
 public:
   volatile bool task_stopped_ = false;
 };
+
+int TestSSFailGCGenTask::append_lob_ctrl_pk_condition_(
+    const blocksstable::MacroBlockId &macro_id,
+    const uint64_t hash,
+    ObSqlString &sql)
+{
+  int ret = OB_SUCCESS;
+  char macro_id_buf[128];
+  int64_t pos = 0;
+  if (OB_UNLIKELY(!macro_id.is_valid()
+      || macro_id.get_serialize_size() > sizeof(macro_id_buf))) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (OB_FAIL(macro_id.serialize(macro_id_buf, sizeof(macro_id_buf), pos))) {
+  } else if (OB_FAIL(sql.append("macro_id = "))) {
+  } else if (OB_FAIL(sql_append_hex_escape_str(ObString(pos, macro_id_buf), sql))) {
+  } else if (OB_FAIL(sql.append_fmt(" AND hash = %lu", hash))) {
+  }
+  return ret;
+}
 
 class AlwaysNeedScheduleSSFailGCGenTask : public ObSSFailGCGenTask
 {
@@ -1477,6 +1504,36 @@ TEST_F(TestSSFailGCGenTask, get_fail_gc_scn_disabled_when_timeout_zero)
   sleep(3);
 }
 
+TEST_F(TestSSFailGCGenTask, lob_ctrl_fail_gc_disabled_when_timeout_zero)
+{
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(OB_SYS_TENANT_ID));
+  ASSERT_GE(GET_MIN_CLUSTER_VERSION(), CLUSTER_VERSION_4_6_3_1);
+  auto &proxy = get_curr_simple_server().get_observer().get_mysql_proxy();
+  int64_t affected_rows = 0;
+  ASSERT_EQ(OB_SUCCESS, proxy.write(
+      "alter system set _outtable_lob_fail_gc_timeout = '0' tenant sys", affected_rows));
+  sleep(3);
+
+  ObSSFailGCDagCtx ctx;
+  ObSSLobCtrlFailGCTask task;
+  ASSERT_EQ(OB_SUCCESS, ctx.init(OB_SYS_TENANT_ID));
+  ctx.sql_timeout_us_ = 0;
+  ASSERT_EQ(OB_SUCCESS, task.init());
+  ASSERT_EQ(OB_SUCCESS, task.process_lob_ctrl_fail_gc_(ctx));
+
+  share::SCN gc_scn;
+  bool need_gc = false;
+  ASSERT_EQ(OB_SUCCESS, ObSSFailGCDagUtil::get_fail_gc_scn(
+      OB_SYS_TENANT_ID, need_gc, gc_scn));
+  ASSERT_TRUE(need_gc);
+  ASSERT_TRUE(gc_scn.is_valid());
+
+  ASSERT_EQ(OB_SUCCESS, proxy.write(
+      "alter system set _outtable_lob_fail_gc_timeout = '1h' tenant sys", affected_rows));
+  sleep(3);
+}
+
 // ============================================================================
 // new helpers introduced for major-sstable lock-row routing
 // ============================================================================
@@ -2672,10 +2729,11 @@ TEST_F(TestSSFailGCGenTask, fail_gc_dag_static_prepare_schedule_topology)
   ASSERT_EQ(OB_SUCCESS, param.init(OB_SYS_TENANT_ID));
   ASSERT_EQ(OB_SUCCESS, dag.init_by_param(&param));
   ASSERT_EQ(OB_SUCCESS, dag.create_first_task());
-  ASSERT_EQ(2, dag.get_task_list_count());
+  ASSERT_EQ(3, dag.get_task_list_count());
 
   ObSSFailGCPrepareTask *prepare_task = nullptr;
   ObSSFailGCScheduleTask *schedule_task = nullptr;
+  ObSSLobCtrlFailGCTask *lob_ctrl_task = nullptr;
   int64_t recognized_task_count = 0;
   ObITask *task = dag.task_list_.get_first();
   const ObITask *task_list_head = dag.task_list_.get_header();
@@ -2690,29 +2748,88 @@ TEST_F(TestSSFailGCGenTask, fail_gc_dag_static_prepare_schedule_topology)
       ASSERT_EQ(nullptr, schedule_task);
       schedule_task = static_cast<ObSSFailGCScheduleTask *>(task);
       ++recognized_task_count;
+    } else if (nullptr != dynamic_cast<ObSSLobCtrlFailGCTask *>(task)) {
+      ASSERT_EQ(nullptr, lob_ctrl_task);
+      lob_ctrl_task = static_cast<ObSSLobCtrlFailGCTask *>(task);
+      ++recognized_task_count;
     }
     task = task->get_next();
   }
-  ASSERT_EQ(2, recognized_task_count);
+  ASSERT_EQ(3, recognized_task_count);
   ASSERT_EQ(dag.get_task_list_count(), recognized_task_count);
   ASSERT_NE(nullptr, prepare_task);
   ASSERT_NE(nullptr, schedule_task);
+  ASSERT_NE(nullptr, lob_ctrl_task);
   ASSERT_TRUE(prepare_task->is_inited_);
   ASSERT_TRUE(schedule_task->is_inited_);
+  ASSERT_TRUE(lob_ctrl_task->is_inited_);
   ASSERT_EQ(0, schedule_task->ls_idx_);
   ASSERT_TRUE(schedule_task->is_ls_head_);
   ASSERT_EQ(nullptr, schedule_task->ls_ctx_);
 
   ASSERT_EQ(0, prepare_task->get_indegree());
   ASSERT_EQ(1, schedule_task->get_indegree());
+  ASSERT_EQ(1, lob_ctrl_task->get_indegree());
 
   ObSEArray<ObINodeWithChild *, 2> children;
   ASSERT_EQ(OB_SUCCESS, prepare_task->copy_child_nodes(children));
-  ASSERT_EQ(1, children.count());
-  ASSERT_EQ(static_cast<ObINodeWithChild *>(schedule_task), children.at(0));
+  ASSERT_EQ(2, children.count());
+  bool has_schedule_task = false;
+  bool has_lob_ctrl_task = false;
+  for (int64_t i = 0; i < children.count(); ++i) {
+    has_schedule_task |= static_cast<ObINodeWithChild *>(schedule_task) == children.at(i);
+    has_lob_ctrl_task |= static_cast<ObINodeWithChild *>(lob_ctrl_task) == children.at(i);
+  }
+  ASSERT_TRUE(has_schedule_task);
+  ASSERT_TRUE(has_lob_ctrl_task);
   children.reset();
   ASSERT_EQ(OB_SUCCESS, schedule_task->copy_child_nodes(children));
   ASSERT_EQ(0, children.count());
+  ASSERT_EQ(OB_SUCCESS, lob_ctrl_task->copy_child_nodes(children));
+  ASSERT_EQ(0, children.count());
+}
+
+TEST_F(TestSSFailGCGenTask, lob_ctrl_failure_does_not_block_shared_meta_fail_gc)
+{
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(OB_SYS_TENANT_ID));
+  ASSERT_GE(GET_MIN_CLUSTER_VERSION(), CLUSTER_VERSION_4_6_3_1);
+  ObArenaAllocator dag_allocator("FailGCDagTest");
+  ObSSFailGCDag dag;
+  ObSSFailGCDagParam param;
+  ASSERT_EQ(OB_SUCCESS, dag.basic_init(dag_allocator));
+  ASSERT_EQ(OB_SUCCESS, param.init(OB_SYS_TENANT_ID));
+  ASSERT_EQ(OB_SUCCESS, dag.init_by_param(&param));
+  ASSERT_EQ(OB_SUCCESS, dag.create_first_task());
+
+  ObSSFailGCDagCtx *ctx = dag.get_ctx();
+  ASSERT_NE(nullptr, ctx);
+  ctx->need_gc_ = true;
+  ASSERT_EQ(OB_SUCCESS, ctx->gc_scn_.convert_from_ts(1700000000000000L));
+  ctx->sql_timeout_us_ = 0;
+  ObSSLobCtrlFailGCTask *lob_ctrl_task = nullptr;
+  ObSSFailGCScheduleTask *schedule_task = nullptr;
+  ObITask *task = dag.task_list_.get_first();
+  const ObITask *task_list_head = dag.task_list_.get_header();
+  while (nullptr != task && task_list_head != task) {
+    if (nullptr != dynamic_cast<ObSSLobCtrlFailGCTask *>(task)) {
+      lob_ctrl_task = static_cast<ObSSLobCtrlFailGCTask *>(task);
+    } else if (nullptr != dynamic_cast<ObSSFailGCScheduleTask *>(task)) {
+      schedule_task = static_cast<ObSSFailGCScheduleTask *>(task);
+    }
+    task = task->get_next();
+  }
+  ASSERT_NE(nullptr, lob_ctrl_task);
+  ASSERT_NE(nullptr, schedule_task);
+  ASSERT_EQ(OB_SUCCESS, lob_ctrl_task->process());
+  ASSERT_EQ(OB_SUCCESS, dag.get_published_dag_ret());
+  ctx->sql_timeout_us_ = SQL_TIMEOUT_US;
+  ObSSFailGCLSCtx *ls_ctx = nullptr;
+  ASSERT_EQ(OB_SUCCESS, ctx->alloc_ls_ctx(ObLSID(899), ls_ctx));
+  ASSERT_NE(nullptr, ls_ctx);
+  ASSERT_EQ(OB_SUCCESS, schedule_task->process());
+  ASSERT_TRUE(ls_ctx->iterator_inited_);
+  ASSERT_TRUE(ls_ctx->scan_finished_);
 }
 
 TEST_F(TestSSFailGCGenTask, fail_gc_tasks_stop_at_process_entry)
@@ -2729,6 +2846,7 @@ TEST_F(TestSSFailGCGenTask, fail_gc_tasks_stop_at_process_entry)
 
   ObSSFailGCPrepareTask *prepare_task = nullptr;
   ObSSFailGCScheduleTask *schedule_task = nullptr;
+  ObSSLobCtrlFailGCTask *lob_ctrl_task = nullptr;
   ObITask *task = dag.task_list_.get_first();
   const ObITask *task_list_head = dag.task_list_.get_header();
   while (nullptr != task && task_list_head != task) {
@@ -2736,11 +2854,14 @@ TEST_F(TestSSFailGCGenTask, fail_gc_tasks_stop_at_process_entry)
       prepare_task = static_cast<ObSSFailGCPrepareTask *>(task);
     } else if (nullptr != dynamic_cast<ObSSFailGCScheduleTask *>(task)) {
       schedule_task = static_cast<ObSSFailGCScheduleTask *>(task);
+    } else if (nullptr != dynamic_cast<ObSSLobCtrlFailGCTask *>(task)) {
+      lob_ctrl_task = static_cast<ObSSLobCtrlFailGCTask *>(task);
     }
     task = task->get_next();
   }
   ASSERT_NE(nullptr, prepare_task);
   ASSERT_NE(nullptr, schedule_task);
+  ASSERT_NE(nullptr, lob_ctrl_task);
 
   ObSSFailGCDagCtx *ctx = dag.get_ctx();
   ASSERT_NE(nullptr, ctx);
@@ -2772,11 +2893,136 @@ TEST_F(TestSSFailGCGenTask, fail_gc_tasks_stop_at_process_entry)
   dag.simply_set_stop();
   ASSERT_EQ(OB_CANCELED, prepare_task->process());
   ASSERT_EQ(OB_CANCELED, schedule_task->process());
+  ASSERT_EQ(OB_CANCELED, lob_ctrl_task->process());
   ASSERT_EQ(OB_CANCELED, executor_task->process());
   ASSERT_EQ(nullptr, schedule_task->ls_ctx_);
   ASSERT_FALSE(ls_ctx->iterator_inited_);
   ASSERT_EQ(OB_SUCCESS, ls_ctx->get_first_error_code());
   ASSERT_EQ(OB_SUCCESS, ctx->get_first_error_code());
+}
+
+TEST_F(TestSSFailGCGenTask, lob_ctrl_fail_gc_processes_expired_rows)
+{
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(OB_SYS_TENANT_ID));
+  ASSERT_GE(GET_MIN_CLUSTER_VERSION(), CLUSTER_VERSION_4_6_3_1);
+  const uint64_t tenant_id = OB_SYS_TENANT_ID;
+  const uint64_t first_hash = 91000001;
+  const int64_t lob_fail_gc_timeout_us = 60L * 60L * 1000L * 1000L;
+  const int64_t cutoff_ts_us = ObTimeUtility::current_time_us() - lob_fail_gc_timeout_us;
+  const int64_t margin_us = 60L * 1000L * 1000L;
+  const int64_t old_ts_us = cutoff_ts_us - margin_us;
+  const int64_t recent_ts_us = cutoff_ts_us + margin_us;
+  ObMySQLProxy &sql_proxy = get_curr_simple_server().get_observer().get_mysql_proxy();
+  const blocksstable::MacroBlockId macro_ids[] = {
+      blocksstable::MacroBlockId(blocksstable::MacroBlockId::DEFAULT_FIRST_ID,
+          20261001, 0, 0, 0),
+      blocksstable::MacroBlockId(blocksstable::MacroBlockId::DEFAULT_FIRST_ID,
+          20261002, 0, 0, 0),
+      blocksstable::MacroBlockId(blocksstable::MacroBlockId::DEFAULT_FIRST_ID,
+          20261003, 0, 0, 0),
+      blocksstable::MacroBlockId(blocksstable::MacroBlockId::DEFAULT_FIRST_ID,
+          20261004, 0, 0, 0),
+      blocksstable::MacroBlockId(blocksstable::MacroBlockId::DEFAULT_FIRST_ID,
+          20261005, 0, 0, 0),
+  };
+  const int64_t statuses[] = {
+      OUTTABLE_LOB_CONTROL_DOING,
+      OUTTABLE_LOB_CONTROL_FAIL,
+      OUTTABLE_LOB_CONTROL_COMPLETE,
+      OUTTABLE_LOB_CONTROL_DOING,
+      OUTTABLE_LOB_CONTROL_FAIL,
+  };
+  ObSqlString cleanup_sql;
+  ASSERT_EQ(OB_SUCCESS, cleanup_sql.assign_fmt(
+      "DELETE FROM %s WHERE ", OB_ALL_OUTTABLE_LOB_CONTROL_TNAME));
+  for (int64_t i = 0; i < ARRAYSIZEOF(macro_ids); ++i) {
+    if (i > 0) {
+      ASSERT_EQ(OB_SUCCESS, cleanup_sql.append(" OR "));
+    }
+    ASSERT_EQ(OB_SUCCESS, cleanup_sql.append("("));
+    ASSERT_EQ(OB_SUCCESS,
+        append_lob_ctrl_pk_condition_(macro_ids[i], first_hash + i, cleanup_sql));
+    ASSERT_EQ(OB_SUCCESS, cleanup_sql.append(")"));
+  }
+  int64_t affected_rows = 0;
+  ASSERT_EQ(OB_SUCCESS, sql_proxy.write(tenant_id, cleanup_sql.ptr(), affected_rows));
+  DEFER({
+    int64_t cleanup_affected_rows = 0;
+    EXPECT_EQ(OB_SUCCESS,
+        sql_proxy.write(tenant_id, cleanup_sql.ptr(), cleanup_affected_rows));
+  });
+
+  for (int64_t i = 0; i < ARRAYSIZEOF(macro_ids); ++i) {
+    ObOuttableLobControlRow row;
+    row.key_.macro_id_ = macro_ids[i];
+    row.key_.hash_ = first_hash + i;
+    row.status_ = statuses[i];
+    ASSERT_EQ(OB_SUCCESS, ObOuttableLobControlOperator::insert(
+        sql_proxy, tenant_id, row, affected_rows));
+    ASSERT_EQ(1, affected_rows);
+  }
+
+  ObSqlString update_sql;
+  for (int64_t i = 0; i < ARRAYSIZEOF(macro_ids); ++i) {
+    const int64_t last_modify_time = i < 3 ? old_ts_us : recent_ts_us;
+    ASSERT_EQ(OB_SUCCESS, update_sql.assign_fmt(
+        "UPDATE %s SET last_modify_time = usec_to_time(%ld) WHERE ",
+        OB_ALL_OUTTABLE_LOB_CONTROL_TNAME, last_modify_time));
+    ASSERT_EQ(OB_SUCCESS,
+        append_lob_ctrl_pk_condition_(macro_ids[i], first_hash + i, update_sql));
+    ASSERT_EQ(OB_SUCCESS, sql_proxy.write(tenant_id, update_sql.ptr(), affected_rows));
+    ASSERT_EQ(1, affected_rows);
+  }
+
+  ObArenaAllocator dag_allocator("LobCtrlFailGC");
+  ObSSFailGCDag dag;
+  ObSSFailGCDagParam param;
+  ASSERT_EQ(OB_SUCCESS, dag.basic_init(dag_allocator));
+  ASSERT_EQ(OB_SUCCESS, param.init(tenant_id));
+  ASSERT_EQ(OB_SUCCESS, dag.init_by_param(&param));
+  ASSERT_EQ(OB_SUCCESS, dag.create_first_task());
+  ObSSFailGCDagCtx *ctx = dag.get_ctx();
+  ASSERT_NE(nullptr, ctx);
+  ASSERT_FALSE(ctx->need_gc_);
+  ASSERT_FALSE(ctx->gc_scn_.is_valid());
+  ctx->sql_timeout_us_ = SQL_TIMEOUT_US;
+  ObSSLobCtrlFailGCTask *lob_ctrl_task = nullptr;
+  ObITask *task = dag.task_list_.get_first();
+  const ObITask *task_list_head = dag.task_list_.get_header();
+  while (nullptr != task && task_list_head != task) {
+    if (nullptr != dynamic_cast<ObSSLobCtrlFailGCTask *>(task)) {
+      lob_ctrl_task = static_cast<ObSSLobCtrlFailGCTask *>(task);
+    }
+    task = task->get_next();
+  }
+  ASSERT_NE(nullptr, lob_ctrl_task);
+  ASSERT_EQ(OB_SUCCESS, lob_ctrl_task->process());
+
+  ObArenaAllocator allocator("LobCtrlVerify");
+  ObOuttableLobControlRow selected_row;
+  int64_t row_scn = 0;
+  for (int64_t i = 0; i < ARRAYSIZEOF(macro_ids); ++i) {
+    allocator.reuse();
+    selected_row.reset();
+    const int select_ret = ObOuttableLobControlOperator::select(
+        sql_proxy, tenant_id, macro_ids[i], first_hash + i,
+        false /*for_update*/, allocator, row_scn, selected_row);
+    if (1 == i) {
+      ASSERT_EQ(OB_ENTRY_NOT_EXIST, select_ret);
+    } else {
+      ASSERT_EQ(OB_SUCCESS, select_ret);
+      const int64_t expected_status = 0 == i ? OUTTABLE_LOB_CONTROL_FAIL : statuses[i];
+      ASSERT_EQ(expected_status, selected_row.status_);
+      if (0 == i) {
+        ASSERT_GT(selected_row.last_modify_time_, cutoff_ts_us);
+      } else if (2 == i) {
+        ASSERT_EQ(old_ts_us, selected_row.last_modify_time_);
+      } else {
+        ASSERT_EQ(recent_ts_us, selected_row.last_modify_time_);
+      }
+    }
+  }
 }
 
 TEST_F(TestSSFailGCGenTask, fail_gc_prepare_populates_dag_context)
@@ -2903,7 +3149,7 @@ TEST_F(TestSSFailGCGenTask, fail_gc_head_generates_ls_siblings_without_barrier)
     }
   }
 
-  ASSERT_EQ(4, dag.get_task_list_count());
+  ASSERT_EQ(5, dag.get_task_list_count());
   for (int64_t i = 0; i < 3; ++i) {
     ASSERT_NE(nullptr, heads[i]);
     ASSERT_EQ(i, heads[i]->ls_idx_);
@@ -2916,7 +3162,7 @@ TEST_F(TestSSFailGCGenTask, fail_gc_head_generates_ls_siblings_without_barrier)
 
   for (int64_t i = 0; i < 3; ++i) {
     ASSERT_EQ(OB_SUCCESS, heads[i]->process());
-    ASSERT_EQ(4, dag.get_task_list_count());
+    ASSERT_EQ(5, dag.get_task_list_count());
     ASSERT_TRUE(ctx->ls_ctxs_.at(i)->iterator_inited_);
     ASSERT_TRUE(ctx->ls_ctxs_.at(i)->scan_finished_);
     ASSERT_FALSE(ctx->ls_ctxs_.at(i)->scan_failed_);
@@ -2972,7 +3218,7 @@ TEST_F(TestSSFailGCGenTask, fail_gc_schedule_generates_bounded_batches)
     task = task->get_next();
   }
   ASSERT_NE(nullptr, head);
-  ASSERT_EQ(2, dag.get_task_list_count());
+  ASSERT_EQ(3, dag.get_task_list_count());
   ObSEArray<ObINodeWithChild *, 4> children;
   ASSERT_EQ(OB_SUCCESS, head->copy_child_nodes(children));
   ASSERT_EQ(0, children.count());
@@ -2982,7 +3228,7 @@ TEST_F(TestSSFailGCGenTask, fail_gc_schedule_generates_bounded_batches)
   ASSERT_FALSE(ls_ctx->scan_finished_);
   ASSERT_FALSE(ls_ctx->scan_failed_);
   ASSERT_FALSE(ls_ctx->checkpoint_meta_scn_.is_valid());
-  ASSERT_EQ(4, dag.get_task_list_count());
+  ASSERT_EQ(5, dag.get_task_list_count());
 
   ObSSFailGCExecutorTask *first_executor = nullptr;
   ObSSFailGCScheduleTask *continuation = nullptr;
@@ -3034,7 +3280,7 @@ TEST_F(TestSSFailGCGenTask, fail_gc_schedule_generates_bounded_batches)
       static_cast<ObITask *>(continuation)->generate_next_task());
   ASSERT_EQ(old_task_count, dag.get_task_list_count());
   ASSERT_EQ(OB_SUCCESS, continuation->process());
-  ASSERT_EQ(5, dag.get_task_list_count());
+  ASSERT_EQ(6, dag.get_task_list_count());
   ASSERT_TRUE(ls_ctx->scan_finished_);
   ASSERT_FALSE(ls_ctx->scan_failed_);
   ASSERT_TRUE(ls_ctx->page_iter_.is_finished());
@@ -3146,7 +3392,7 @@ TEST_F(TestSSFailGCGenTask,
   ASSERT_FALSE(ls_ctx->scan_failed_);
   ASSERT_EQ(row_count, ls_ctx->page_iter_.get_returned_row_count());
   ASSERT_EQ(row_count, ctx->get_scanned_ctrl_row_count());
-  ASSERT_EQ(4, dag.get_task_list_count());
+  ASSERT_EQ(5, dag.get_task_list_count());
 
   int64_t executor_count = 0;
   int64_t continuation_count = 0;

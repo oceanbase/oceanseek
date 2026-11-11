@@ -880,6 +880,10 @@ TEST_F(TestSSDataCheckExpectedSource, filter_shared_storage_objects)
           ObMacroBlockIdLocation::OBJECT_STORAGE)));
   ASSERT_TRUE(ObSSDataCheckExpectedCollectTask::is_checkable_object_(
       make_filter_test_object(
+          ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO,
+          ObMacroBlockIdLocation::OBJECT_STORAGE)));
+  ASSERT_TRUE(ObSSDataCheckExpectedCollectTask::is_checkable_object_(
+      make_filter_test_object(
           ObStorageObjectType::SHARED_TABLET_SUB_META,
           ObMacroBlockIdLocation::OBJECT_STORAGE)));
   ASSERT_FALSE(ObSSDataCheckExpectedCollectTask::is_checkable_object_(
@@ -982,6 +986,49 @@ TEST_F(TestSSDataCheckExpectedSource,
   reference_exist = false;
   ASSERT_EQ(OB_SUCCESS,
       checker.check_reference_exist(newer_item, reference_exist));
+  ASSERT_TRUE(reference_exist);
+}
+
+TEST_F(TestSSDataCheckExpectedSource, outtable_reference_recheck_uses_exact_source_version)
+{
+  MAKE_TENANT_SWITCH_SCOPE_GUARD(tenant_guard);
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(OB_SYS_TENANT_ID));
+  ASSERT_EQ(OB_SUCCESS, prepare_synthetic_rows());
+  ObSSMetaService *meta_service = MTL(ObSSMetaService *);
+  ASSERT_NE(nullptr, meta_service);
+  ObSEArray<ObSSMetaTabletKey, 8> keys;
+  ASSERT_EQ(OB_SUCCESS, build_tablet_keys(keys));
+  ASSERT_GE(keys.count(), 3);
+  const ObSSMetaTabletKey &source_key = keys.at(0);
+  const ObSSMetaTabletKey &newer_key = keys.at(2);
+  ASSERT_EQ(source_key.ls_id_, newer_key.ls_id_);
+  ASSERT_EQ(source_key.tablet_id_, newer_key.tablet_id_);
+  ASSERT_EQ(source_key.reorganization_scn_, newer_key.reorganization_scn_);
+  ASSERT_LT(source_key.meta_scn_, newer_key.meta_scn_);
+  const blocksstable::MacroBlockId macro_id = make_filter_test_object(
+      blocksstable::ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO,
+      blocksstable::ObMacroBlockIdLocation::OBJECT_STORAGE);
+  ObSSDataCheckExpectedItem source_item;
+  ObSSDataCheckExpectedItem newer_item;
+  ASSERT_EQ(OB_SUCCESS, source_item.init(
+      macro_id, source_key.ls_id_, source_key.tablet_id_,
+      source_key.reorganization_scn_, source_key.meta_scn_));
+  ASSERT_EQ(OB_SUCCESS, newer_item.init(
+      macro_id, newer_key.ls_id_, newer_key.tablet_id_,
+      newer_key.reorganization_scn_, newer_key.meta_scn_));
+  ObSSDataCheckMetaRefChecker checker;
+  ASSERT_EQ(OB_SUCCESS, checker.init(*meta_service));
+  bool reference_exist = false;
+  ASSERT_EQ(OB_SUCCESS, checker.check_reference_exist(source_item, reference_exist));
+  ASSERT_TRUE(reference_exist);
+
+  // Simulate source retirement after Expected was built; no object storage is involved.
+  int64_t affected_rows = 0;
+  ASSERT_EQ(OB_SUCCESS, delete_tablet_meta(source_key, affected_rows));
+  ASSERT_EQ(1, affected_rows);
+  ASSERT_EQ(OB_SUCCESS, checker.check_reference_exist(source_item, reference_exist));
+  ASSERT_FALSE(reference_exist);
+  ASSERT_EQ(OB_SUCCESS, checker.check_reference_exist(newer_item, reference_exist));
   ASSERT_TRUE(reference_exist);
 }
 

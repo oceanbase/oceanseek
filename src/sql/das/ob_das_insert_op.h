@@ -5,6 +5,7 @@
 
 #ifndef DEV_SRC_SQL_DAS_OB_DAS_INSERT_OP_H_
 #define DEV_SRC_SQL_DAS_OB_DAS_INSERT_OP_H_
+#include "sql/das/ob_das_outtable_lob_control_key_collector.h"
 #include "sql/das/ob_das_task.h"
 #include "storage/access/ob_dml_param.h"
 #include "sql/engine/basic/ob_chunk_datum_store.h"
@@ -76,6 +77,10 @@ public:
 
   int64_t get_affected_rows() { return affected_rows_; }
   bool get_is_duplicated() { return is_duplicated_; }
+  const common::ObIArray<storage::ObOuttableLobControlKey> *get_outtable_lob_control_keys() const
+  {
+    return outtable_lob_control_key_collector_.get_keys();
+  }
 
   INHERIT_TO_STRING_KV("parent", ObIDASTaskOp,
                        KPC_(ins_ctdef),
@@ -107,6 +112,7 @@ private:
   blocksstable::ObDatumRowIterator *result_;
   int64_t affected_rows_;  // local execute result, no need to serialize
   bool is_duplicated_;  // local execute result, no need to serialize
+  ObDASOuttableLobControlKeyCollector outtable_lob_control_key_collector_;
 };
 
 class ObDASInsertResult : public ObIDASTaskResult, public blocksstable::ObDatumRowIterator
@@ -128,6 +134,12 @@ public:
   bool is_duplicated() { return is_duplicated_; }
   void set_is_duplicated(bool is_duplicated) { is_duplicated_ = is_duplicated; }
   transaction::ObTxReadSnapshot &get_response_snapshot() { return response_snapshot_; }
+  int assign_outtable_lob_control_keys(
+      const common::ObIArray<storage::ObOuttableLobControlKey> &control_keys);
+  const common::ObIArray<storage::ObOuttableLobControlKey> *get_outtable_lob_control_keys() const
+  {
+    return outtable_lob_control_key_collector_.get_keys();
+  }
 
   INHERIT_TO_STRING_KV("ObIDASTaskResult", ObIDASTaskResult,
                        K_(affected_rows),
@@ -140,6 +152,7 @@ private:
   const ObjMetaFixedArray *output_types_;
   bool is_duplicated_;
   transaction::ObTxReadSnapshot response_snapshot_;
+  ObDASOuttableLobControlKeyCollector outtable_lob_control_key_collector_;
 };
 }  // namespace sql
 }  // namespace oceanbase

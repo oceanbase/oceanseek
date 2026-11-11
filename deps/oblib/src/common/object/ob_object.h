@@ -7,6 +7,7 @@
 #define OCEANBASE_COMMON_OB_OBJECT_H_
 
 #include "lib/ob_define.h"
+#include "lib/string/ob_fixed_length_string.h"
 #include "lib/string/ob_string.h"
 #include "common/ob_action_flag.h"
 #include "common/object/ob_obj_type.h"
@@ -42,6 +43,7 @@ namespace common
 
 struct ObCompareCtx;
 class ObSqlCollectionInfo;
+class ObJsonObject;
 enum ObCmpNullPos
 {
   NULL_LAST = 1,
@@ -106,6 +108,8 @@ public:
       set_collation_type(CS_TYPE_BINARY);
     } else if (ObJsonType == type_) {
       set_collation_type(CS_TYPE_UTF8MB4_BIN);
+    } else if (ObExtendBLobType == type_) {
+      set_extblob();
     } else if (ObUserDefinedSQLType == type_ ||
                ObCollectionSQLType == type_) {
       set_subschema_id(UINT_MAX16);
@@ -207,6 +211,12 @@ public:
   OB_INLINE void set_roaringbitmap()
   {
     type_ = static_cast<uint8_t>(ObRoaringBitmapType);
+    set_collation_level(CS_LEVEL_IMPLICIT);
+    set_collation_type(CS_TYPE_BINARY);
+  }
+  OB_INLINE void set_extblob()
+  {
+    type_ = static_cast<uint8_t>(ObExtendBLobType);
     set_collation_level(CS_LEVEL_IMPLICIT);
     set_collation_type(CS_TYPE_BINARY);
   }
@@ -339,6 +349,7 @@ public:
   OB_INLINE bool is_geometry() const { return type_ == static_cast<uint8_t>(ObGeometryType); }
 
   OB_INLINE bool is_roaringbitmap() const { return type_ == static_cast<uint8_t>(ObRoaringBitmapType); }
+  OB_INLINE bool is_extblob() const { return static_cast<uint8_t>(ObExtendBLobType) == type_; }
 
   // combination of above functions.
   OB_INLINE bool is_varbinary_or_binary() const { return is_varbinary() || is_binary(); }
@@ -751,7 +762,7 @@ enum ObMemLobType
   PERSISTENT_LOB = 1,
   TEMP_FULL_LOB = 2,
   APPEND_DELTA_LOB = 3,  // FARM COMPAT WHITELIST
-  EXTERNAL_TEMP_LOB = 4, // Reserved for External LOB.
+  EXTERNAL_TEMP_LOB = 4,
   MAX_LOB_TYPE
 };
 
@@ -788,6 +799,7 @@ struct ObMemLobCommon
   OB_INLINE bool is_persist() const { return type_ == PERSISTENT_LOB; }
   OB_INLINE bool is_temporary_full() const { return type_ == TEMP_FULL_LOB; }
   OB_INLINE bool is_append_delta() const { return type_ == APPEND_DELTA_LOB; }
+  OB_INLINE bool is_external_temp() const { return EXTERNAL_TEMP_LOB == type_; }
 
   OB_INLINE bool is_valid() const 
   {
@@ -805,7 +817,7 @@ struct ObMemLobCommon
 
   ObLobCommon lob_common_;
   uint8_t version_           : 4;
-  uint8_t type_              : 4; // ObMemLobType (Persistent/TempFull/AppendDelta)
+  uint8_t type_              : 4; // ObMemLobType
   uint8_t read_only_         : 1;
   uint8_t has_extern_        : 1; // Indicate whether the lob locator has extern segment
   uint8_t has_payload_       : 1; // Indicate whether the lob locator has payload segment which contain lob disk locator
@@ -854,6 +866,106 @@ struct ObMemLobRetryInfo
 
 STATIC_ASSERT(sizeof(ObMemLobRetryInfo) == 16, "sizeof ObMemLobRetryInfo isn't equal to 16");
 
+enum class ObExternalBlobKind : uint8_t
+{
+  REFERENCE = 0,
+  // INGEST = 1,
+  MAX
+};
+
+OB_INLINE bool is_valid_external_blob_kind(const ObExternalBlobKind kind)
+{
+  return ObExternalBlobKind::REFERENCE == kind;
+      // || ObExternalBlobKind::INGEST == kind;
+}
+
+OB_INLINE const char *ob_external_blob_kind_str(const ObExternalBlobKind kind)
+{
+  const char *str = "INVALID";
+  if (ObExternalBlobKind::REFERENCE == kind) {
+    str = "REFERENCE";
+  }
+  return str;
+}
+
+// This descriptor borrows strings; use deep_copy with the owner's allocator to outlive the source.
+struct ObExternalBlobInfo
+{
+  ObExternalBlobInfo()
+    : url_(), etag_(), offset_(0), length_(0), kind_(ObExternalBlobKind::MAX), has_length_(true) {}
+
+  bool is_valid() const
+  {
+    return OB_NOT_NULL(url_.ptr()) && url_.length() > 0 && url_.length() < OB_MAX_URI_LENGTH
+        && OB_ISNULL(url_.find('\0'))
+        && etag_.length() >= 0 && etag_.length() < OB_ETAG_CAPACITY
+        && (0 == etag_.length() || (OB_NOT_NULL(etag_.ptr())
+            && OB_ISNULL(etag_.find('\0'))))
+        && ((has_length_ && 0 != length_ && UINT64_MAX - length_ >= offset_)
+            || (!has_length_ && 0 == offset_ && 0 == length_))
+        && is_valid_external_blob_kind(kind_);
+  }
+
+  int deep_copy(ObIAllocator &allocator, const ObExternalBlobInfo &src);
+  // JSON nodes use allocator; URL and ETag bytes are borrowed until the object is printed.
+  int serialize(ObIAllocator &allocator, ObJsonObject &json_obj) const;
+  // Borrow strings from json_root; call deep_copy to keep them after json_root is released.
+  int deserialize(const ObJsonObject &json_root);
+  // Judge One ObExternalBlobInfo if is equal to another one
+  bool is_equal(ObExternalBlobInfo& another);
+
+  TO_STRING_KV(K_(url), K_(etag), K_(offset), K_(length), K_(has_length),
+               "kind", ob_external_blob_kind_str(kind_));
+
+  ObString url_;
+  ObString etag_;
+  uint64_t offset_;
+  uint64_t length_;
+  ObExternalBlobKind kind_;
+  bool has_length_; // false means SQL length=NULL; offset and length must both be 0.
+};
+
+// The locator stores lengths, scalars and URL/ETag bytes after the header, with no pointers.
+struct ObExternalBlobInfoLayout
+{
+  ObExternalBlobInfoLayout()
+    : url_length_(0), etag_length_(0), offset_(0), length_(0),
+      kind_(ObExternalBlobKind::MAX), has_length_(true), version_(1), reserved_{} {}
+
+  static int64_t get_size(const ObExternalBlobInfo &info)
+  {
+    return sizeof(ObExternalBlobInfoLayout) + info.url_.length() + info.etag_.length();
+  }
+  int64_t get_size() const
+  {
+    // Align the following snapshot; padding is not part of the string lengths.
+    return sizeof(ObExternalBlobInfoLayout) + int64_t(url_length_) + int64_t(etag_length_);
+  }
+  bool is_valid() const
+  {
+    return 1 == version_ && url_length_ > 0 && url_length_ < OB_MAX_URI_LENGTH
+           && etag_length_ < OB_ETAG_CAPACITY;
+  }
+  void assign(const ObExternalBlobInfo &info);
+  void get_info(ObExternalBlobInfo &info) const;
+  TO_STRING_KV(K_(url_length), K_(etag_length), K_(offset), K_(length), K_(kind), K_(has_length),
+               K_(version));
+
+  uint32_t url_length_;
+  uint32_t etag_length_;
+  uint64_t offset_;
+  uint64_t length_;
+  ObExternalBlobKind kind_;
+  bool has_length_;
+  uint8_t version_; // The current encoding version is 1.
+  uint8_t reserved_[5];
+  char buffer_[0]; // URL bytes followed by ETag bytes, with no trailing NULs.
+};
+
+STATIC_ASSERT(sizeof(ObExternalBlobInfoLayout) == 32, "unexpected external lob header size");
+STATIC_ASSERT(offsetof(ObExternalBlobInfoLayout, buffer_) == sizeof(ObExternalBlobInfoLayout),
+              "external lob bytes must follow the complete header");
+
 struct ObMemLobReadSnapshot
 {
   ObMemLobReadSnapshot(): version_(0), size_(0) {}
@@ -878,15 +990,19 @@ struct ObMemLobExternHeader
       has_retry_info_(0),
       has_read_snapshot_(0),
       has_row_key_(0),
+      is_external_lob_(0),
       reserved_(0),
       rowkey_size_(0),
       reserved2_(0)
   {}
 
   bool is_empty() const { return body_size_ == 0; }
+  bool is_external_lob() const { return 1 == is_external_lob_; }
 
-  TO_STRING_KV(K_(table_id), K_(column_idx), K_(cs_type), K_(body_size), K_(has_location_info),
-               K_(has_retry_info), K_(has_read_snapshot), K_(has_row_key), K_(reserved), K_(rowkey_size));
+  TO_STRING_KV(K_(table_id), K_(column_idx), K_(cs_type), K_(body_size),
+               K_(has_location_info), K_(has_retry_info),
+               K_(has_read_snapshot), K_(has_row_key), K_(is_external_lob),
+               K_(reserved), K_(rowkey_size));
 
   uint64_t table_id_;
   uint32_t column_idx_;
@@ -896,7 +1012,8 @@ struct ObMemLobExternHeader
   uint32_t has_retry_info_      : 1;
   uint32_t has_read_snapshot_   : 1;
   uint32_t has_row_key_         : 1;
-  uint32_t reserved_            : 12;
+  uint32_t is_external_lob_     : 1;
+  uint32_t reserved_            : 11;
   uint16_t rowkey_size_;
   // explicit tail padding: keep offsetof(buffer_) == sizeof so that the
   // flexible-array buffer_ matches the sizeof-based layout used by the builder.
@@ -916,6 +1033,7 @@ STATIC_ASSERT(offsetof(ObMemLobExternHeader, buffer_) == sizeof(ObMemLobExternHe
 // ObMemLobExternBody
 //   ObMemLobLocationInfo
 //   ObMemLobRetryInfo
+//   ObExternalBlobInfoLayout
 //   ObMemLobReadSnapshot
 //   row-key
 // DiskLocator
@@ -932,11 +1050,13 @@ public:
   static const uint32_t MEM_LOB_EXTERN_HEADER_LEN = sizeof(ObMemLobExternHeader);
   static const uint32_t MEM_LOB_EXTERN_LOCATIONINFO_LEN = sizeof(ObMemLobLocationInfo);
   static const uint32_t MEM_LOB_EXTERN_RETRYINFO_LEN = sizeof(ObMemLobRetryInfo);
+  static const uint32_t MEM_LOB_EXTERN_EXTERNAL_HEADER_LEN = sizeof(ObExternalBlobInfoLayout);
   static const uint16_t MEM_LOB_EXTERN_SIZE_LEN = sizeof(uint16_t);
   // outrow disk locator layout: ObLobCommon + ObLobId + ObTxSEQ.
   // oblib can not depend on the transaction layer, so use sizeof(int64_t) here
   // (static_assert(sizeof(ObTxSEQ) == sizeof(int64_t)) guarantees they match).
-  static const int64_t DISK_LOB_OUTROW_FULL_SIZE = sizeof(ObLobCommon) + sizeof(ObLobId) + sizeof(int64_t);
+  static constexpr int64_t DISK_LOB_OUTROW_FULL_SIZE = sizeof(ObLobCommon) + sizeof(ObLobId)
+                                                       + sizeof(int64_t);
   static int64_t get_append_delta_header_len()
   {
     return sizeof(ObMemLobCommon) + sizeof(ObMemLobExternHeader);
@@ -982,7 +1102,8 @@ public:
            (loc->is_valid()) && (loc->is_mem_loc_ == 0) && (loc->in_row_);
   }
 
-  OB_INLINE bool is_outrow_disk_lob_locator() const
+  // Outline includes internal outrow and external LOBs.
+  OB_INLINE bool is_outline_disk_lob_locator() const
   {
     ObLobCommon *loc = reinterpret_cast<ObLobCommon *>(ptr_);
     return (loc != nullptr) && (size_ >= sizeof(ObLobCommon)) &&
@@ -1009,7 +1130,8 @@ public:
         bret = false;
       }
       if (!bret) {
-        COMMON_LOG_RET(ERROR, common::OB_INVALID_ARGUMENT, "Invalid lob locator!", KP(ptr_), K(size_), KPC(this));
+        // Do not print the full locator: to_string() may validate it again and assert.
+        COMMON_LOG_RET(ERROR, common::OB_INVALID_ARGUMENT, "Invalid lob locator!", KP(ptr_), K(size_));
         if (OB_NOT_NULL(loc) && is_assert) {
           OB_ASSERT(0);
         }
@@ -1073,6 +1195,7 @@ public:
   int get_lob_inrow_data_byte_len(int64_t &len) const;
   int get_location_info(ObMemLobLocationInfo *&location_info) const;
   int get_retry_info(ObMemLobRetryInfo *&retry_info) const;
+  int get_external_lob_info(ObExternalBlobInfo &external_lob_info) const;
   int get_read_snapshot_data(ObString &data) const;
   int get_real_locator_len(int64_t &real_len) const;
   int get_chunk_size(int64_t &chunk_size) const;
@@ -1080,6 +1203,10 @@ public:
   bool is_empty_lob() const;
   bool is_inrow() const;
   bool is_null() const { return ptr_ == NULL || size_ == 0; }
+  bool has_extern_header() const;
+  // Check only the Memory locator's External flag, without reading the summary.
+  // False for a Disk locator does not mean Internal; use a read context to query its summary.
+  bool is_mem_external_lob() const;
 
   OB_INLINE bool is_readonly() const
   {
@@ -1139,6 +1266,13 @@ public:
            (reinterpret_cast<ObMemLobCommon *>(ptr_))->is_temporary_full();
   }
 
+  OB_INLINE bool is_external_temp_lob() const
+  {
+    return OB_NOT_NULL(ptr_) &&
+           !is_lob_disk_locator() && size_ >= MEM_LOB_COMMON_HEADER_LEN &&
+           (reinterpret_cast<ObMemLobCommon *>(ptr_))->is_external_temp();
+  }
+
   OB_INLINE bool is_append_delta_lob() const
   {
     return OB_NOT_NULL(ptr_) &&
@@ -1171,6 +1305,9 @@ public:
 
   char *ptr_; // ptr_ is ObMemLobCommon or ObLobCommon (disk locator)
   uint32_t size_; // full MemLobLocator size;
+
+private:
+  int get_external_lob_info_layout_(ObExternalBlobInfoLayout *&layout) const;
 };
 
 enum class ObDocIDType : uint16_t
@@ -1436,6 +1573,7 @@ public:
       case ObTextType:
       case ObMediumTextType:
       case ObLongTextType:
+      case ObExtendBLobType:
       case ObLobType:
       case ObJsonType:
       case ObGeometryType:
@@ -1576,6 +1714,8 @@ public:
   void set_raw(const ObString &value);
   void set_raw(const char *ptr, const ObString::obstr_size_t size);
   void set_raw_value(const char *ptr, const ObString::obstr_size_t size);
+  void set_extblob(const ObString &value);
+  void set_extblob(const char *ptr, const ObString::obstr_size_t size);
   void set_hex_string(const ObString &value);
   void set_hex_string_value(const ObString &value);
   void set_hex_string_value(const char *ptr, const ObString::obstr_size_t size);
@@ -1695,6 +1835,7 @@ public:
   inline int get_nchar(ObString &value) const;
   inline int get_varbinary(ObString &value) const;
   inline int get_raw(ObString &value) const;
+  inline int get_extblob(ObString &value) const;
   inline int get_binary(ObString &value) const;
   inline int get_hex_string(ObString &value) const;
   inline int get_print_string(ObString &value) const;
@@ -1758,6 +1899,7 @@ public:
   OB_INLINE ObString get_char() const { return ObString(val_len_, v_.string_); }
   OB_INLINE ObString get_varbinary() const { return ObString(val_len_, v_.string_); }
   OB_INLINE ObString get_raw() const { return ObString(val_len_, v_.string_); }
+  OB_INLINE ObString get_extblob() const { return ObString(val_len_, v_.string_); }
   OB_INLINE ObString get_binary() const { return ObString(val_len_, v_.string_); }
   OB_INLINE ObString get_hex_string() const { return ObString(val_len_, v_.string_); }
   OB_INLINE ObString get_print_string(const int64_t max_len) const { return ObString(MIN(val_len_, max_len), v_.string_); }
@@ -1978,6 +2120,7 @@ public:
 
   OB_INLINE bool is_geometry() const { return meta_.is_geometry(); }
   OB_INLINE bool is_roaringbitmap() const { return meta_.is_roaringbitmap(); }
+  OB_INLINE bool is_extblob() const { return meta_.is_extblob(); }
   OB_INLINE bool is_user_defined_sql_type() const { return meta_.is_user_defined_sql_type(); }
   OB_INLINE bool is_xml_sql_type() const {
     return meta_.is_user_defined_sql_type() && meta_.get_subschema_id() == ObXMLSqlType;
@@ -2840,6 +2983,18 @@ inline void ObObj::set_raw_value(const char *ptr, const ObString::obstr_size_t s
   val_len_ = size;
 }
 
+inline void ObObj::set_extblob(const ObString &value)
+{
+  set_extblob(value.ptr(), value.length());
+}
+
+inline void ObObj::set_extblob(const char *ptr, const ObString::obstr_size_t size)
+{
+  meta_.set_extblob();
+  v_.string_ = ptr;
+  val_len_ = size;
+}
+
 inline void ObObj::set_hex_string(const ObString &value)
 {
   meta_.set_hex_string();
@@ -3570,6 +3725,19 @@ inline int ObObj::get_raw(ObString &v) const
 {
   int ret = OB_OBJ_TYPE_ERROR;
   if (meta_.is_raw()) {
+    v.assign_ptr(v_.string_, val_len_);
+    ret = OB_SUCCESS;
+  } else if (meta_.is_null()) {
+    v.assign_ptr(NULL, 0);
+    ret = OB_SUCCESS;
+  }
+  return ret;
+}
+
+inline int ObObj::get_extblob(ObString &v) const
+{
+  int ret = OB_OBJ_TYPE_ERROR;
+  if (meta_.is_extblob()) {
     v.assign_ptr(v_.string_, val_len_);
     ret = OB_SUCCESS;
   } else if (meta_.is_null()) {

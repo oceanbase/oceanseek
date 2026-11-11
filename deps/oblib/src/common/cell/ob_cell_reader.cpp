@@ -520,6 +520,7 @@ int ObCellReader::parse(uint64_t *column_id)
       case ObTextType:
       case ObMediumTextType:
       case ObLongTextType:
+      case ObExtendBLobType:
       case ObJsonType:
       case ObGeometryType:
       case ObCollectionSQLType:
@@ -732,6 +733,7 @@ int ObCellReader::read_cell(common::ObObj &obj)
       case ObTextType:
       case ObMediumTextType:
       case ObLongTextType:
+      case ObExtendBLobType:
       case ObJsonType:
       case ObGeometryType:
       case ObCollectionSQLType:

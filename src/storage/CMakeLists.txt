@@ -746,6 +746,7 @@ ob_set_subtarget(ob_storage access
   access/ob_index_skip_scanner.cpp
   access/ob_multiple_mview_merge.cpp
   access/ob_table_scan_iterator.cpp
+  access/ob_lob_column_iterator.cpp
   access/ob_store_row_iterator.cpp
   access/ob_i_sample_iterator.cpp
   access/ob_block_sample_iterator.cpp
@@ -1176,8 +1177,14 @@ ob_set_subtarget(ob_storage lob
   lob/common/ob_lob_location.cpp
   lob/store/ob_lob_aux_manager.cpp
   lob/store/ob_lob_meta.cpp
+  lob/store/ob_outtable_lob_control_ctx.cpp
+  lob/store/ob_outtable_lob_control_manager.cpp
+  lob/store/ob_outtable_lob_control_operator.cpp
+  lob/store/ob_outtable_lob_control_page_iterator.cpp
   lob/store/ob_lob_store_common.cpp
+  lob/store/ob_lob_outtable_io.cpp
   lob/store/ob_lob_persistent_adaptor.cpp
+  lob/store/ob_lob_persistent_appender.cpp
   lob/store/ob_lob_persistent_reader_cache.cpp
   lob/store/ob_lob_persistent_iterator.cpp
   lob/access/ob_lob_rpc_struct.cpp
@@ -1336,12 +1343,15 @@ if(OB_BUILD_SHARED_STORAGE)
     ss_data_check/ob_ss_data_check_expected_sorter.cpp
     ss_data_check/ob_ss_data_check_expected_sort_task.cpp
     ss_data_check/ob_ss_data_check_expected_producer.cpp
+    ss_data_check/ob_ss_data_check_macro_id_iterator.cpp
     ss_data_check/ob_ss_data_check_list_sorter.cpp
     ss_data_check/ob_ss_data_check_list_checker.cpp
     ss_data_check/ob_ss_data_check_list_task.cpp
     ss_data_check/ob_ss_data_check_dag.cpp
     ss_data_check/ob_ss_data_check_gen_task.cpp
     ss_garbage_collector/ob_ss_mark_sweep_diag_mgr.cpp
+    ss_garbage_collector/ob_ss_mark_sweep_macro_id_iterator.cpp
+    ss_garbage_collector/ob_ss_lob_gc_scan_util.cpp
     ss_garbage_collector/ob_ss_gc_define.cpp
     ss_garbage_collector/dag/ob_shared_gc_base_task.cpp
     ss_garbage_collector/dag/ob_ss_gc_dag_base.cpp
@@ -1378,6 +1388,13 @@ if(OB_BUILD_SHARED_STORAGE)
     ss_garbage_collector/task/ob_ss_mark_sweep_diag_cleanup_task.cpp
     ss_garbage_collector/task/ob_ss_mark_sweep_diag_record_cleanup_task.cpp
     ss_garbage_collector/dag/ob_ss_gc_exec_dag.cpp
+    ss_garbage_collector/user_data_gc_dag_task/ob_ss_outtable_gc_task.cpp
+    ss_garbage_collector/user_data_gc_dag_task/ob_ss_outtable_lob_user_gc_define.cpp
+    ss_garbage_collector/user_data_gc_dag_task/ob_ss_lob_meta_gc_scan_task.cpp
+    ss_garbage_collector/user_data_gc_dag_task/ob_ss_lob_ctrl_gc_scan_task.cpp
+    ss_garbage_collector/user_data_gc_dag_task/ob_ss_lob_ctrl_gc_merge_task.cpp
+    ss_garbage_collector/user_data_gc_dag_task/ob_ss_lob_ctrl_gc_diff_task.cpp
+    ss_garbage_collector/user_data_gc_dag_task/ob_ss_lob_ctrl_gc_delete_task.cpp
     shared_storage/ob_ss_local_cache_service.cpp
     shared_storage/ob_ss_local_cache_util.cpp
     shared_storage/ob_ss_local_cache_stat.cpp

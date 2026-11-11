@@ -467,6 +467,9 @@ int modify_progressive_merge_num_for_tenant(ObExecContext &ctx,
               if (table->is_index_table()) {
                 do_alter = false;
               }
+              if (table->is_aux_outtable_lob_control_table()) {
+                do_alter = false;
+              }
               if (table->is_in_recyclebin()) {
                 do_alter = false;
               }

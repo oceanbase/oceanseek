@@ -69,6 +69,7 @@ const ObAccuracy ObAccuracy::DDL_DEFAULT_ACCURACY[ObMaxType] = {
   ObAccuracy(10, 0),         // mysql date.
   ObAccuracy(19, 6),         // mysql datetime.
   ObAccuracy(OB_MAX_LONGTEXT_LENGTH),     // roaringbitmap, roaringbitmap serialized size is possibly to exceed 512M.
+  ObAccuracy(OB_MAX_LONGTEXT_LENGTH),     // extend blob
 };
 
 const ObAccuracy ObAccuracy::DDL_DEFAULT_ACCURACY2[ORACLE_MODE + 1][ObMaxType] = {
@@ -128,6 +129,7 @@ const ObAccuracy ObAccuracy::DDL_DEFAULT_ACCURACY2[ORACLE_MODE + 1][ObMaxType] =
     ObAccuracy(10, 0),         // mysql date.
     ObAccuracy(19, 6),         // mysql datetime.
     ObAccuracy(OB_MAX_LONGTEXT_LENGTH),         // roaringbitmap
+    ObAccuracy(OB_MAX_LONGTEXT_LENGTH),         // extend blob
   },
   {
     ObAccuracy(),         // null.
@@ -185,6 +187,7 @@ const ObAccuracy ObAccuracy::DDL_DEFAULT_ACCURACY2[ORACLE_MODE + 1][ObMaxType] =
     ObAccuracy(10, 0),         // mysql date.
     ObAccuracy(19, 6),         // mysql datetime.
     ObAccuracy(OB_MAX_LONGTEXT_LENGTH),         // roaringbitmap
+    ObAccuracy(OB_MAX_LONGTEXT_LENGTH),         // extend blob
   }
 };
 
@@ -244,6 +247,7 @@ const ObAccuracy ObAccuracy::MAX_ACCURACY[ObMaxType] = {
   ObAccuracy(10, 0),         // mysql date.
   ObAccuracy(19, 6),         // mysql datetime.
   ObAccuracy(OB_MAX_LONGTEXT_LENGTH),        // roaringbitmap
+  ObAccuracy(OB_MAX_LONGTEXT_LENGTH),        // extend blob
 };
 
 const ObAccuracy ObAccuracy::MAX_ACCURACY2[ORACLE_MODE + 1][ObMaxType] = {
@@ -303,6 +307,7 @@ const ObAccuracy ObAccuracy::MAX_ACCURACY2[ORACLE_MODE + 1][ObMaxType] = {
     ObAccuracy(10, 0),         // mysql date.
     ObAccuracy(19, 6),         // mysql datetime.
     ObAccuracy(OB_MAX_LONGTEXT_LENGTH),        // roaringbitmap
+    ObAccuracy(OB_MAX_LONGTEXT_LENGTH),        // extend blob
   },
   { /* Oracle */
     ObAccuracy(),         // null.
@@ -360,6 +365,7 @@ const ObAccuracy ObAccuracy::MAX_ACCURACY2[ORACLE_MODE + 1][ObMaxType] = {
     ObAccuracy(10, 0),         // mysql date.
     ObAccuracy(19, 6),         // mysql datetime.
     ObAccuracy(OB_MAX_LONGTEXT_LENGTH),        // roaringbitmap
+    ObAccuracy(OB_MAX_LONGTEXT_LENGTH),        // extend blob
   }
 };
 
@@ -419,6 +425,7 @@ const ObAccuracy ObAccuracy::DML_DEFAULT_ACCURACY[ObMaxType] = {
   ObAccuracy(0, 0),         // mysql date.
   ObAccuracy(0, 6),         // mysql datetime.
   ObAccuracy(OB_MAX_LONGTEXT_LENGTH),        // roaringbitmap
+  ObAccuracy(OB_MAX_LONGTEXT_LENGTH),        // extend blob
 };
 
 const ObAccuracy ObAccuracy::MAX_ACCURACY_OLD[ObMaxType] = {

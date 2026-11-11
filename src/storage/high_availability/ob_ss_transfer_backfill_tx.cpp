@@ -7,6 +7,7 @@
 #include "storage/mds_table/ob_tablet_mds_reloc_helper.h"
 #include "ob_ss_transfer_backfill_tx.h"
 #include "share/scheduler/ob_dag_scheduler_config.h"
+#include "storage/high_availability/ob_storage_ha_utils.h"
 #include "storage/ls/ob_ls.h"
 #include "storage/tablet/ob_tablet_iterator.h"
 #include "storage/reorganization_info_table/ob_tablet_reorg_info_table_operation.h"

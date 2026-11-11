@@ -2435,6 +2435,10 @@ int ObExprOperator::calc_cmp_type2(ObExprResType &type,
                   || type_ == T_OP_NOT_IN)) {
     ret = OB_ERR_INVALID_TYPE_FOR_OP;
     LOG_WARN("Incorrect cmp type with geometry arguments", K(type1), K(type2), K(type_), K(ret));
+  } else if (type1.is_extblob() || type2.is_extblob()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "EXTBLOB comparison");
+    LOG_WARN("EXTBLOB comparison is not supported", KR(ret), K(get_type_name(type_)), K(type1), K(type2));
   } else if ((type1.is_roaringbitmap() || type2.is_roaringbitmap())
              && !(type_ == T_FUN_SYS_NULLIF)) {
     ret = OB_ERR_INVALID_TYPE_FOR_OP;
@@ -7369,7 +7373,7 @@ int ObLocationExprOperator::calc_(const ObExpr &expr, const ObExpr &sub_arg,
       } else {
         uint32_t idx = 0;
         ObTextStringIterState state;
-        if (ori_str_iter.is_outrow_lob()) { // set reserved len, to avoid sub_str split between get_next_block
+        if (ori_str_iter.is_outline_lob()) { // set reserved len, to avoid sub_str split between get_next_block
           size_t sub_str_char_len = ObCharset::strlen_char(sub_arg.datum_meta_.cs_type_,
                                                           sub_str_data.ptr(),
                                                           static_cast<int64_t>(sub_str_data.length()));
@@ -7433,7 +7437,7 @@ int ObLocationExprOperator::calc_vector(ObEvalCtx &ctx, const ObCollationType &c
       LOG_WARN("Lob: init lob str iter failed ", K(ret), K(sub_str_iter));
     } else {
       ObTextStringIterState state;
-      if (ori_str_iter.is_outrow_lob()) { // set reserved len, to avoid sub_str split between get_next_block
+      if (ori_str_iter.is_outline_lob()) { // set reserved len, to avoid sub_str split between get_next_block
         size_t sub_str_char_len = ObCharsetStringHelper::strlen_char_optimized(sub_arg.datum_meta_.cs_type_,
                                                                                sub_str_data.ptr(),
                                                                                sub_str_data.length());

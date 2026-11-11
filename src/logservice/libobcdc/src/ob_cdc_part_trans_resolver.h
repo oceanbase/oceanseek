@@ -302,6 +302,12 @@ private:
       const bool handling_miss_log,
       transaction::ObTxLogBlock &tx_log_block);
 
+  int handle_lob_outtable_data_log_(
+      const transaction::ObTransID &tx_id,
+      const palf::LSN &lsn,
+      const bool handling_miss_log,
+      transaction::ObTxLogBlock &tx_log_block);
+
   // read ObTxDirectLoadIncLog
   int handle_direct_load_inc_log_(
       const transaction::ObTransID &tx_id,

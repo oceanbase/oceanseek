@@ -218,6 +218,18 @@ int ObParallelCreateTenantExecutor::execute(obrpc::UInt64 &tenant_id)
           }
         }
       }
+      // Primary user tenants create their own LOB Control auxiliary table. Standby
+      // tenants receive this schema through primary-cluster schema replay.
+      if (OB_SUCC(ret) && create_tenant_arg_.get_tenant_role().is_primary()) {
+        FLOG_INFO("[CREATE_TENANT] STEP 7.1. start create builtin user tenant tables", K(tenant_id));
+        if (CLICK_TMP_FAIL(create_user_table_for_user_tenant_(tenant_id))) {
+          LOG_WARN("failed to create builtin user tenant tables", KR(ret), KR(tmp_ret), K(tenant_id));
+          ret = tmp_ret;
+        } else {
+          FLOG_INFO("[CREATE_TENANT] STEP 7.1. finish create builtin user tenant tables",
+              KR(ret), K(tenant_id));
+        }
+      }
     }
   }
   FLOG_INFO("[CREATE_TENANT] STEP 8. start finish create tenant", KR(ret));
@@ -1388,36 +1400,36 @@ int ObParallelCreateTenantExecutor::check_has_available_ls_for_tablet_alloc_(
   return ret;
 }
 
-int ObParallelCreateTenantExecutor::wait_meta_tenant_user_ls_leader_(const uint64_t meta_tenant_id)
+int ObParallelCreateTenantExecutor::wait_tenant_user_ls_leader_(const uint64_t tenant_id)
 {
   int ret = OB_SUCCESS;
   const int64_t retry_interval_us = 200l * 1000l; // 200ms
   ObWarningBufferIgnoreScope ignore_errors_in_warning_buffer;
-  FLOG_INFO("[CREATE_TENANT] wait meta user ls leader start", K(meta_tenant_id));
+  FLOG_INFO("[CREATE_TENANT] wait tenant user ls leader start", K(tenant_id));
   if (OB_FAIL(check_inner_stat_())) {
     LOG_WARN("failed to check inner stat", KR(ret));
-  } else if (!is_meta_tenant(meta_tenant_id)) {
+  } else if (!is_meta_tenant(tenant_id) && !is_user_tenant(tenant_id)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid meta tenant id", KR(ret), K(meta_tenant_id));
+    LOG_WARN("invalid tenant id", KR(ret), K(tenant_id));
   } else {
     while (OB_SUCC(ret)) {
       if (ctx_.is_timeouted()) {
         ret = OB_TIMEOUT;
-        LOG_WARN("wait meta user ls leader timeout", KR(ret), K(meta_tenant_id));
+        LOG_WARN("wait tenant user ls leader timeout", KR(ret), K(tenant_id));
       } else if (is_user_session_terminated(ret)) {
-        LOG_WARN("wait meta user ls leader interrupted by terminated user session",
-            KR(ret), K(meta_tenant_id));
+        LOG_WARN("wait tenant user ls leader interrupted by terminated user session",
+            KR(ret), K(tenant_id));
       } else {
         bool ready = false;
-        if (OB_FAIL(check_has_available_ls_for_tablet_alloc_(meta_tenant_id, ready))) {
-          LOG_WARN("failed to check meta tenant available ls for ddl", KR(ret), K(meta_tenant_id));
+        if (OB_FAIL(check_has_available_ls_for_tablet_alloc_(tenant_id, ready))) {
+          LOG_WARN("failed to check tenant available ls for ddl", KR(ret), K(tenant_id));
         } else if (ready) {
           break;
         } else {
-          ObLSAttrOperator ls_operator(meta_tenant_id, sql_proxy_);
+          ObLSAttrOperator ls_operator(tenant_id, sql_proxy_);
           ObLSAttrArray ls_attr_array;
           if (OB_FAIL(ls_operator.get_all_ls_by_order(ls_attr_array))) {
-            LOG_WARN("failed to get all ls attr for meta tenant", KR(ret), K(meta_tenant_id));
+            LOG_WARN("failed to get all ls attr for tenant", KR(ret), K(tenant_id));
           } else if (OB_ISNULL(location_service_)) {
             ret = OB_ERR_UNEXPECTED;
             LOG_WARN("location service is null", KR(ret));
@@ -1426,25 +1438,25 @@ int ObParallelCreateTenantExecutor::wait_meta_tenant_user_ls_leader_(const uint6
             bool waited_one_ls = false;
             for (int64_t i = 0; OB_SUCC(ret) && i < ls_attr_array.count(); ++i) {
               const ObLSAttr &ls_attr = ls_attr_array.at(i);
-              if (!is_balance_user_ls_for_tablet_alloc(meta_tenant_id, ls_attr)) {
+              if (!is_balance_user_ls_for_tablet_alloc(tenant_id, ls_attr)) {
                 // skip
               } else {
                 has_eligible_ls = true;
                 common::ObAddr leader;
                 int tmp_ret = location_service_->get_leader(
-                    GCONF.cluster_id, meta_tenant_id, ls_attr.get_ls_id(), false, leader);
+                    GCONF.cluster_id, tenant_id, ls_attr.get_ls_id(), false, leader);
                 if (OB_SUCCESS != tmp_ret || !leader.is_valid()) {
                   tmp_ret = location_service_->get_leader(
-                      GCONF.cluster_id, meta_tenant_id, ls_attr.get_ls_id(), true, leader);
+                      GCONF.cluster_id, tenant_id, ls_attr.get_ls_id(), true, leader);
                 }
                 if (OB_SUCCESS == tmp_ret && leader.is_valid()) {
                   // At least one ls already has leader; re-check in next round.
                 } else if (!waited_one_ls) {
-                  FLOG_INFO("[CREATE_TENANT] wait one meta balance user ls leader",
-                      K(meta_tenant_id), "ls_id", ls_attr.get_ls_id());
-                  if (OB_FAIL(wait_ls_leader_(meta_tenant_id, ls_attr.get_ls_id(), true/*force_renew*/))) {
-                    LOG_WARN("failed to wait meta balance user ls leader", KR(ret),
-                        K(meta_tenant_id), "ls_id", ls_attr.get_ls_id());
+                  FLOG_INFO("[CREATE_TENANT] wait one balance user ls leader",
+                      K(tenant_id), "ls_id", ls_attr.get_ls_id());
+                  if (OB_FAIL(wait_ls_leader_(tenant_id, ls_attr.get_ls_id(), true/*force_renew*/))) {
+                    LOG_WARN("failed to wait balance user ls leader", KR(ret),
+                        K(tenant_id), "ls_id", ls_attr.get_ls_id());
                   } else {
                     waited_one_ls = true;
                   }
@@ -1452,8 +1464,8 @@ int ObParallelCreateTenantExecutor::wait_meta_tenant_user_ls_leader_(const uint6
               }
             }
             if (OB_SUCC(ret) && !has_eligible_ls) {
-              FLOG_INFO("[CREATE_TENANT] meta tenant has no NORMAL balance user ls yet, retry",
-                  K(meta_tenant_id));
+              FLOG_INFO("[CREATE_TENANT] tenant has no NORMAL balance user ls yet, retry",
+                  K(tenant_id));
             }
             if (OB_SUCC(ret)) {
               ob_usleep(retry_interval_us);
@@ -1463,7 +1475,7 @@ int ObParallelCreateTenantExecutor::wait_meta_tenant_user_ls_leader_(const uint6
       }
     }
   }
-  FLOG_INFO("[CREATE_TENANT] wait meta user ls leader finish", KR(ret), K(meta_tenant_id));
+  FLOG_INFO("[CREATE_TENANT] wait tenant user ls leader finish", KR(ret), K(tenant_id));
   return ret;
 }
 
@@ -1528,7 +1540,7 @@ int ObParallelCreateTenantExecutor::create_user_table_for_meta_tenant_(const uin
   const uint64_t meta_tenant_id = gen_meta_tenant_id(user_tenant_id);
   if (OB_FAIL(check_inner_stat_())) {
     LOG_WARN("failed to check inner stat", KR(ret));
-  } else if (OB_FAIL(wait_meta_tenant_user_ls_leader_(meta_tenant_id))) {
+  } else if (OB_FAIL(wait_tenant_user_ls_leader_(meta_tenant_id))) {
     LOG_WARN("failed to wait meta tenant user ls leader", KR(ret), K(meta_tenant_id));
   } else if (OB_ISNULL(rs_mgr_) || OB_ISNULL(GCTX.rs_rpc_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
@@ -1547,6 +1559,23 @@ int ObParallelCreateTenantExecutor::create_user_table_for_meta_tenant_(const uin
     } else if (OB_FAIL(insert_shared_meta_reserved_info_(user_tenant_id))) {
       LOG_WARN("failed to insert shared meta reserved info", KR(ret), K(user_tenant_id));
     }
+  }
+  return ret;
+}
+
+int ObParallelCreateTenantExecutor::create_user_table_for_user_tenant_(const uint64_t tenant_id)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(check_inner_stat_())) {
+    LOG_WARN("failed to check inner stat", KR(ret));
+  } else if (!is_user_tenant(tenant_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid user tenant id", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(wait_tenant_user_ls_leader_(tenant_id))) {
+    LOG_WARN("failed to wait user tenant user ls leader", KR(ret), K(tenant_id));
+  } else if (OB_FAIL(apply_user_table_schema_defs_(
+                 tenant_id, *schema_service_, *sql_proxy_, ctx_))) {
+    LOG_WARN("failed to apply user tenant table schema defs", KR(ret), K(tenant_id));
   }
   return ret;
 }

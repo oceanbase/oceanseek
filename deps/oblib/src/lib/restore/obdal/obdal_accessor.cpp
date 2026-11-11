@@ -178,6 +178,25 @@ public:
     }
     return ret;
   }
+  static int obdal_operator_read_with_if_match(const opendal_operator *op,
+                                               const char *path,
+                                               const char *etag,
+                                               char *buf,
+                                               const int64_t buf_size,
+                                               const int64_t offset,
+                                               int64_t &read_size)
+  {
+    int ret = OB_SUCCESS;
+    opendal_result_read_with_range result = opendal_operator_read_with_if_match(
+        op, path, reinterpret_cast<uint8_t *>(buf), static_cast<uintptr_t>(buf_size),
+        static_cast<uintptr_t>(offset), etag);
+    if (OB_UNLIKELY(nullptr != result.error)) {
+      handle_obdal_error_and_free(result.error, ret);
+    } else {
+      read_size = static_cast<int64_t>(result.size);
+    }
+    return ret;
+  }
   static int obdal_operator_reader(const opendal_operator *op, const char *path, opendal_reader *&reader)
   {
     int ret = OB_SUCCESS;
@@ -571,7 +590,7 @@ void convert_obdal_error(const opendal_error *error, int &ob_errcode)
       ob_errcode = OB_OBJECT_STORAGE_CONDITION_NOT_MATCH;
     } else if (error->code == OPENDAL_RANGE_NOT_SATISFIED) {
       // The range of the content is not satisfied.
-      ob_errcode = OB_OBJECT_STORAGE_IO_ERROR;
+      ob_errcode = OB_DATA_OUT_OF_RANGE;
     } else if (error->code == OPENDAL_INVALID_OBJECT_STORAGE_ENDPOINT) {
       ob_errcode = OB_INVALID_OBJECT_STORAGE_ENDPOINT;
     } else if (error->code == OPENDAL_CHECKSUM_ERROR) {
@@ -724,6 +743,21 @@ void ObDalAccessor::obdal_async_operator_read(
 {
   ObDalLogSpanGuard obdal_span;
   opendal_async_operator_read(op, path, reinterpret_cast<uint8_t *>(buf), buf_size, offset, callback, ctx);
+}
+
+void ObDalAccessor::obdal_async_operator_read_with_if_match(
+    const opendal_async_operator *op,
+    const char *path,
+    char *buf,
+    const int64_t buf_size,
+    const int64_t offset,
+    const char *etag,
+    OpenDalAsyncCallbackFn callback,
+    void *ctx)
+{
+  ObDalLogSpanGuard obdal_span;
+  opendal_async_operator_read_with_if_match(
+      op, path, reinterpret_cast<uint8_t *>(buf), buf_size, offset, etag, callback, ctx);
 }
 
 void ObDalAccessor::obdal_async_operator_write(
@@ -911,6 +945,29 @@ int ObDalAccessor::obdal_operator_write_with_if_not_exists(
     OB_LOG(WARN, "invalid argument", K(ret), KP(op), KP(path), KP(buf), K(buf_size));
   } else if (OB_FAIL(ObDalWrapper::obdal_operator_write_with_if_not_exists(op, path, buf, buf_size))) {
     OB_LOG(WARN, "failed to exec operator write with if match", K(ret), K(path), K(buf_size));
+  }
+  return ret;
+}
+
+int ObDalAccessor::obdal_operator_read_with_if_match(
+    const opendal_operator *op,
+    const char *path,
+    const char *etag,
+    char *buf,
+    const int64_t buf_size,
+    const int64_t offset,
+    int64_t &read_size)
+{
+  ObDalLogSpanGuard obdal_span;
+  int ret = OB_SUCCESS;
+  read_size = 0;
+  if (OB_ISNULL(op) || OB_ISNULL(path) || OB_ISNULL(etag) || OB_ISNULL(buf)
+      || OB_UNLIKELY(buf_size <= 0) || OB_UNLIKELY(offset < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    OB_LOG(WARN, "invalid argument", K(ret), KP(op), KP(path), KP(etag), KP(buf), K(buf_size), K(offset));
+  } else if (OB_FAIL(ObDalWrapper::obdal_operator_read_with_if_match(
+      op, path, etag, buf, buf_size, offset, read_size))) {
+    OB_LOG(WARN, "failed to read object with if-match", K(ret), K(path), K(buf_size), K(offset));
   }
   return ret;
 }

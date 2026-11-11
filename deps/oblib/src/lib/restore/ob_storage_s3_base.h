@@ -79,6 +79,7 @@ static constexpr char S3_SDK[] = "S3SDK";
 constexpr int S3_BAD_REQUEST = 400;
 constexpr int S3_PERMISSION_DENIED = 403;
 constexpr int S3_ITEM_NOT_EXIST = 404;
+constexpr int S3_RANGE_NOT_SATISFIABLE = 416;
 constexpr int S3_TOO_MANY_REQUESTS = 429;
 constexpr int S3_SLOW_DOWN = 503;
 constexpr int S3_STORAGE_INSUFFICIENT = 507;

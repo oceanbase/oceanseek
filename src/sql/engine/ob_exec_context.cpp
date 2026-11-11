@@ -5,6 +5,10 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_exec_context.h"
+#include "share/backup/ob_backup_io_adapter.h"
+#include "share/backup/ob_backup_struct.h"
+#include "share/schema/ob_schema_getter_guard.h"
+#include "sql/ob_sql_context.h"
 #include "sql/engine/px/ob_px_util.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "observer/ob_server.h"
@@ -59,6 +63,42 @@ void ObOpKitStore::destroy()
   }
 }
 
+int ObSqlExternalAccessProvider::get_access_info(
+    const ObString &url, ObObjectStorageInfo &access_info)
+{
+  int ret = OB_SUCCESS;
+  ObSQLSessionInfo *session = exec_ctx_.get_my_session();
+  ObSqlCtx *sql_ctx = exec_ctx_.get_sql_ctx();
+  share::schema::ObSessionPrivInfo session_priv;
+  const share::schema::ObLocationSchema *location = nullptr;
+  ObArenaAllocator allocator("LobLocation", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+  ObString terminated_url;
+  ObString normalized_url;
+  access_info.reset();
+  if (OB_ISNULL(session) || OB_ISNULL(sql_ctx) || OB_ISNULL(sql_ctx->schema_guard_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("missing execution context for external lob LOCATION", KR(ret), KP(session), KP(sql_ctx));
+  } else if (OB_FAIL(session->get_session_priv_info(session_priv))) {
+    LOG_WARN("failed to get session privileges", KR(ret), K(session->get_effective_tenant_id()));
+  } else if (OB_FAIL(sql_ctx->schema_guard_->get_location_schema_by_prefix_match_with_priv(
+      session_priv, session->get_enable_role_array(), session->get_effective_tenant_id(),
+      url, location, false))) {
+    LOG_WARN("failed to resolve external lob LOCATION", KR(ret), K(session->get_effective_tenant_id()), K(url));
+  } else if (OB_ISNULL(location)) {
+    ret = OB_ERR_LOCATION_ACCESS_DENIED;
+    LOG_USER_ERROR(OB_ERR_LOCATION_ACCESS_DENIED);
+    LOG_WARN("no readable LOCATION matches external lob URL", KR(ret), K(url));
+  // Append '\0' to url so it can be used as a C string.
+  } else if (OB_FAIL(ob_write_string(allocator, url, terminated_url, true))) {
+    LOG_WARN("failed to terminate external lob URL", KR(ret), K(url));
+  } else if (OB_FAIL(switch_s3_compatible_to_s3(allocator, terminated_url, normalized_url))) {
+    LOG_WARN("failed to normalize external lob URL", KR(ret), K(url));
+  } else if (OB_FAIL(access_info.set(normalized_url.ptr(), location->get_location_access_info()))) {
+    LOG_WARN("failed to prepare external lob access info", KR(ret), K(url));
+  }
+  return ret;
+}
+
 ObExecContext::ObExecContext(ObIAllocator &allocator)
   : allocator_(allocator),
     phy_op_size_(0),
@@ -69,6 +109,7 @@ ObExecContext::ObExecContext(ObIAllocator &allocator)
     expr_op_ctx_store_(NULL),
     task_executor_ctx_(*this),
     my_session_(NULL),
+    outtable_lob_control_owned_tx_(nullptr),
     sql_proxy_(NULL),
     stmt_factory_(NULL),
     expr_factory_(NULL),
@@ -131,6 +172,7 @@ ObExecContext::ObExecContext(ObIAllocator &allocator)
     slice_idx_(0),
     slice_row_idx_(0),
     autoinc_range_interval_(0),
+    external_lob_access_provider_(*this),
     lob_access_ctx_(nullptr),
     auto_dop_map_(),
     force_local_plan_(false),
@@ -302,6 +344,7 @@ void ObExecContext::reset_op_ctx()
 
 void ObExecContext::reset_op_env()
 {
+  outtable_lob_control_owned_tx_ = nullptr;
   reset_op_ctx();
   op_kit_store_.reset();
   phy_op_size_ = 0;
@@ -1449,7 +1492,8 @@ int ObExecContext::get_lob_access_ctx(ObLobAccessCtx *&lob_access_ctx)
   ObIAllocator &allocator = get_allocator();
   if (OB_NOT_NULL(lob_access_ctx_)) {
     lob_access_ctx = lob_access_ctx_;
-  } else if (OB_ISNULL(lob_access_ctx_ = OB_NEWx(ObLobAccessCtx, &allocator))) {
+  } else if (OB_ISNULL(lob_access_ctx_ = OB_NEWx(
+      ObLobAccessCtx, &allocator, get_external_access_provider()))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("alloc", K(ret), "size", sizeof(ObLobAccessCtx));
   } else {

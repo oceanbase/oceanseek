@@ -857,6 +857,48 @@ int ObMarkSweepPipeline::complete_group(const ObMarkSweepGroupType group)
   return ret;
 }
 
+int ObMarkSweepPipeline::complete_empty_group(const ObMarkSweepGroupType group)
+{
+  int ret = OB_SUCCESS;
+  int64_t dir_id = -1;
+  ObFragmentWriterV2<ObGCMacroBlockItem> writer(OB_MALLOC_NORMAL_BLOCK_SIZE);
+  ObSortedFileInfo empty_file;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ObMarkSweepPipeline not init", KR(ret));
+  } else if (OB_UNLIKELY(ObMarkSweepGroupType::DEL != group
+      && ObMarkSweepGroupType::KEPT != group)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid empty group", KR(ret), K(group));
+  } else if (OB_UNLIKELY(0 != get_merger_(group).get_input_count())) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("cannot complete nonempty group as empty", KR(ret), K(group));
+  } else if (OB_FAIL(FILE_MANAGER_INSTANCE_WITH_MTL_SWITCH.alloc_dir(tenant_id_, dir_id))) {
+    LOG_WARN("fail to alloc empty group dir", KR(ret), K_(tenant_id), K(group));
+  } else if (OB_FAIL(writer.open(
+      file_buf_size_, expire_timestamp_, tenant_id_, dir_id))) {
+    LOG_WARN("fail to open empty group writer", KR(ret), K_(tenant_id), K(group));
+  } else if (OB_FAIL(tmp_file_mgr_.acquire_file(
+      tenant_id_, writer.get_dir_id(), writer.get_fd(), empty_file.file_handle_))) {
+    LOG_WARN("fail to acquire empty group file", KR(ret), K_(tenant_id), K(group));
+  } else if (OB_FAIL(writer.sync())) {
+    LOG_WARN("fail to sync empty group file", KR(ret), K_(tenant_id), K(group));
+  } else {
+    empty_file.sample_item_ = writer.get_sample_item();
+    empty_file.item_count_ = 0;
+    ObSpinLockGuard guard(file_lock_);
+    ObSortedFileInfo &merged =
+        (ObMarkSweepGroupType::DEL == group) ? merged_del_ : merged_kept_;
+    if (OB_UNLIKELY(merged.is_valid())) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_WARN("merged group file already exists", KR(ret), K(group), K(merged));
+    } else if (OB_FAIL(merged.assign(empty_file))) {
+      LOG_WARN("fail to publish empty group file", KR(ret), K(group));
+    }
+  }
+  return ret;
+}
+
 int ObMarkSweepPipeline::complete_merge()
 {
   int ret = OB_SUCCESS;
@@ -924,6 +966,32 @@ int ObMarkSweepPipeline::get_merged_item_count(
                                       ? merged_del_
                                       : merged_kept_);
     count = merged.item_count_;
+  }
+  return ret;
+}
+
+int ObMarkSweepPipeline::get_merged_file(
+    const ObMarkSweepGroupType group,
+    ObSortedFileInfo &file) const
+{
+  int ret = OB_SUCCESS;
+  file.reset();
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("mark sweep pipeline is not initialized", KR(ret));
+  } else if (OB_UNLIKELY(ObMarkSweepGroupType::DEL != group
+      && ObMarkSweepGroupType::KEPT != group)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid mark sweep merged file group", KR(ret), K(group));
+  } else {
+    ObSpinLockGuard guard(file_lock_);
+    const ObSortedFileInfo &merged =
+        (ObMarkSweepGroupType::DEL == group) ? merged_del_ : merged_kept_;
+    if (!merged.is_valid()) {
+      ret = OB_ENTRY_NOT_EXIST;
+    } else if (OB_FAIL(file.assign(merged))) {
+      LOG_WARN("failed to retain mark sweep merged file", KR(ret), K(group));
+    }
   }
   return ret;
 }

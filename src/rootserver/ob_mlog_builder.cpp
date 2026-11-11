@@ -925,6 +925,7 @@ int ObMLogBuilder::set_table_options(
     mlog_schema.set_tablespace_id(create_mlog_arg.mlog_schema_.get_tablespace_id());
     mlog_schema.set_comment(create_mlog_arg.mlog_schema_.get_comment());
     mlog_schema.set_lob_inrow_threshold(create_mlog_arg.mlog_schema_.get_lob_inrow_threshold());
+    mlog_schema.set_lob_intable_threshold(create_mlog_arg.mlog_schema_.get_lob_intable_threshold());
   }
   return ret;
 }

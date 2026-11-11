@@ -543,7 +543,7 @@ TEST_F(TestLSServiceSS, test_same_ls_rebuild_resets_study_info_by_ls_epoch)
 {
   const ObLSID ls_id(206);
   const ObTabletID tablet_id(200001);
-  const ObSSGCTabletStudyInfo old_study_info(SCN::max_scn(), 20);
+  const ObSSGCTabletStudyInfo old_study_info(SCN::max_scn(), 20, SCN::max_scn(), INT64_MAX);
   ObCreateLSArg arg;
   ObLSService *ls_service = MTL(ObLSService *);
   ObSSGCService *gc_service = MTL(ObSSGCService *);
@@ -554,12 +554,16 @@ TEST_F(TestLSServiceSS, test_same_ls_rebuild_resets_study_info_by_ls_epoch)
   ObSSGCTablet old_gc_tablet;
   ObSSGCTablet new_gc_tablet;
   ObSSGCTabletStudyInfo new_study_info;
+  bool has_memtable = false;
   ScanAllVersionTabletsOp::GetMinTabletRelyInfo study_op(
-      new_study_info.min_dep_meta_scn_, new_study_info.min_major_snapshot_);
+      new_study_info.min_dep_meta_scn_, new_study_info.min_major_snapshot_,
+      new_study_info.clog_checkpoint_scn_, new_study_info.orig_clog_checkpoint_scn_,
+      new_study_info.multi_version_start_, has_memtable, false /* collect_lob_rely_info */);
   ObSSGCTabletStudyInfo saved_study_info;
   int64_t saved_ls_epoch = -1;
   int64_t old_ls_epoch = -1;
   int64_t new_ls_epoch = -1;
+  int64_t tablet_cnt = 0;
   int64_t retry_count = 0;
   bool waiting = true;
 
@@ -615,7 +619,7 @@ TEST_F(TestLSServiceSS, test_same_ls_rebuild_resets_study_info_by_ls_epoch)
   ASSERT_TRUE(old_gc_tablet == new_gc_tablet);
   tablet_handle.reset();
   ASSERT_EQ(OB_SUCCESS,
-      t3m->scan_all_version_tablets(ObTabletMapKey(ls_id, tablet_id), study_op));
+      t3m->scan_all_version_tablets(ObTabletMapKey(ls_id, tablet_id), study_op, tablet_cnt));
   ASSERT_FALSE(new_study_info.has_finite_rely());
   ASSERT_EQ(1, new_study_info.min_major_snapshot_);
   ASSERT_EQ(OB_SUCCESS,
@@ -638,7 +642,7 @@ TEST_F(TestLSServiceSS, test_cleanup_cleans_tablet_gc_study_info)
   const ObLSID ls_id(207);
   const ObTabletID tablet_id(200003);
   const ObSSGCTabletStudyInfo study_info(
-      SCN::plus(SCN::base_scn(), 200), 20);
+      SCN::plus(SCN::base_scn(), 200), 20, SCN::max_scn(), INT64_MAX);
   const SCN create_commit_scn = SCN::plus(SCN::base_scn(), 100);
   const bool is_immediate_gc = false;
   ObCreateLSArg arg;

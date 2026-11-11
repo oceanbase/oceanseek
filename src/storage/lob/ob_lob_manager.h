@@ -19,6 +19,10 @@
 
 namespace oceanbase
 {
+namespace common
+{
+class ObObjectStorageInfo;
+}
 namespace storage
 {
 
@@ -103,6 +107,7 @@ public:
   int get_char_length(ObLobReadContext &read_ctx, uint64_t &char_len);
   int get_byte_length(ObLobReadContext &read_ctx, uint64_t &byte_len);
   int get_lob_summary_info(ObLobReadContext &read_ctx, ObLobMetaInfo &lob_info);
+  int get_meta_summary_extra_info(ObLobReadContext &read_ctx, ObLobMetaExtraInfo &extra_info);
 
 public:
   int compare(ObLobLocatorV2 &lob_left,
@@ -121,9 +126,10 @@ public:
   ObLobMetaManager &get_meta_manager() { return meta_manager_; }
   ObLobPieceManager &get_piece_manager() { return piece_manager_; }
 private:
+  int get_external_lob_byte_length_(const ObLobReadContext &read_ctx, uint64_t &byte_len);
   // @brief build outrow dest locator. reuse_lob_id valid: reuse it (outrow->outrow update);
   //  invalid: alloc a new lob id (insert or null/inrow->outrow update).
-  int prepare_outrow_locator_(ObLobInsertContext &insert_ctx, const ObLobId &reuse_lob_id);
+  int prepare_outline_locator_(ObLobInsertContext &insert_ctx, const ObLobId &reuse_lob_id);
   int prepare_lob_id_(ObLobInsertContext &insert_ctx,
                       ObLobDiskLocatorBuilder &locator_builder, 
                       const ObLobId &reuse_lob_id);

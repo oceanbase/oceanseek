@@ -28146,12 +28146,12 @@ static const _error _error_OB_OBJECT_STORAGE_CONDITION_NOT_MATCH = {
       .mysql_errno           = -1,
       .sqlstate              = "HY000",
       .str_error             = "object storage condition not match",
-      .str_user_error        = "object storage condition not match",
+      .str_user_error        = "%s",
       .oracle_errno          = 600,
       .oracle_str_error      = "ORA-00600: internal error code, arguments: -9145, object storage condition not match",
-      .oracle_str_user_error = "ORA-00600: internal error code, arguments: -9145, object storage condition not match",
+      .oracle_str_user_error = "ORA-00600: internal error code, arguments: -9145, %s",
       .ob_str_error          = "OBE-00600: internal error code, arguments: -9145, object storage condition not match",
-      .ob_str_user_error     = "OBE-00600: internal error code, arguments: -9145, object storage condition not match"
+      .ob_str_user_error     = "OBE-00600: internal error code, arguments: -9145, %s"
 };
 static const _error _error_OB_SSLOG_LS_NOT_EXIST = {
       .error_name            = "OB_SSLOG_LS_NOT_EXIST",

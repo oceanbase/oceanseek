@@ -259,6 +259,32 @@ int ObCreateTableResolverBase::set_table_option_to_schema(ObTableSchema &table_s
         table_schema.set_lob_inrow_threshold(lob_inrow_threshold_);
       }
     }
+    if (OB_SUCC(ret)) {
+      if (is_set_lob_intable_threshold_) {
+        table_schema.set_lob_intable_threshold(lob_intable_threshold_);
+      } else if (OB_ISNULL(session_info_)) {
+        ret = OB_ERR_UNEXPECTED;
+        SQL_RESV_LOG(WARN, "session is null", K(ret));
+      } else if (OB_FAIL(session_info_->get_sys_variable(
+                  SYS_VAR_OB_DEFAULT_LOB_INTABLE_THRESHOLD,
+                  lob_intable_threshold_))) {
+        SQL_RESV_LOG(WARN, "failed to get default lob intable threshold", K(ret));
+      } else if (lob_intable_threshold_ < OB_MIN_LOB_INTABLE_THRESHOLD
+                 || lob_intable_threshold_ > OB_MAX_LOB_INTABLE_THRESHOLD) {
+        ret = OB_INVALID_ARGUMENT;
+        SQL_RESV_LOG(WARN, "invalid default lob intable threshold",
+                     K(ret), K(lob_intable_threshold_));
+      } else {
+        table_schema.set_lob_intable_threshold(lob_intable_threshold_);
+      }
+      if (OB_SUCC(ret) && lob_intable_threshold_ < table_schema.get_lob_inrow_threshold()) {
+        ret = OB_INVALID_ARGUMENT;
+        SQL_RESV_LOG(ERROR, "lob intable threshold is less than lob inrow threshold", K(ret),
+                     K(lob_intable_threshold_), "lob_inrow_threshold", table_schema.get_lob_inrow_threshold());
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT,
+                       "lob intable threshold should be greater than or equal to lob inrow threshold");
+      }
+    }
     if (OB_SUCC(ret) && table_schema.is_external_table()) {
       ObString file_location;
       ObSchemaGetterGuard *schema_guard = schema_checker_->get_schema_guard();

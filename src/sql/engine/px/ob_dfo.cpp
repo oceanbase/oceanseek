@@ -96,6 +96,33 @@ OB_SERIALIZE_MEMBER(ObSqcTableLocationKey,
 OB_SERIALIZE_MEMBER(ObPxCleanDtlIntermResInfo, ch_total_info_, sqc_id_, task_count_);
 OB_SERIALIZE_MEMBER(ObPxCleanDtlIntermResArgs, info_, batch_size_);
 
+ObPxTask::~ObPxTask()
+{
+  ob_delete(outtable_lob_control_keys_);
+}
+
+int ObPxTask::append_outtable_lob_control_keys(
+    const ObIArray<storage::ObOuttableLobControlKey> &keys)
+{
+  int ret = OB_SUCCESS;
+  if (!keys.empty()) {
+    if (OB_ISNULL(outtable_lob_control_keys_)) {
+      const ObMemAttr attr(MTL_ID(), "LobCtrlKey");
+      outtable_lob_control_keys_ = OB_NEW(ObArray<storage::ObOuttableLobControlKey>, attr);
+      if (OB_ISNULL(outtable_lob_control_keys_)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate px task outtable lob control keys", K(ret));
+      } else {
+        outtable_lob_control_keys_->set_attr(attr);
+      }
+    }
+    if (FAILEDx(append(*outtable_lob_control_keys_, keys))) {
+      LOG_WARN("failed to retain px task outtable lob control keys", K(ret));
+    }
+  }
+  return ret;
+}
+
 int ObQCMonitoringInfo::init(const ObDfo &dfo) {
   int ret = OB_SUCCESS;
   qc_tid_ = GETTID();

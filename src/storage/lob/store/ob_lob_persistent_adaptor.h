@@ -54,13 +54,12 @@ public:
 
 public: // read
   int get_meta_summary_info(ObLobReadContext &read_ctx, ObLobMetaInfo &meta_summary_info);
+  // Read the tail chunk metadata during append.
   int get_last_meta_info(ObLobReadContext &read_ctx,
-                         ObLobMetaInfo &last_meta_info,
-                         bool &found);
+                         ObLobMetaInfo &last_meta_info);
   int get_lob_piece_info(ObLobReadContext &read_ctx,
                          const common::ObString &seq_id,
-                         ObLobPieceInfo &piece_info,
-                         bool &found);
+                         ObLobPieceInfo &piece_info);
 
   int scan_lob_meta(ObLobReadContext &read_ctx,
                     ObLobMetaTableIter *&iter);
@@ -70,7 +69,6 @@ public: // read
                     ObLobAuxTableBaseIterator *&iter);
 
   int revert_scan_iter(ObLobAuxTableBaseIterator *iter);
-  int fetch_lob_id(ObLobInsertContext &insert_ctx, uint64_t &lob_id);
 
 public: // write
   int write_lob_meta(ObLobInsertContext &insert_ctx, ObLobMetaInfo &row_info);
@@ -111,8 +109,6 @@ public:
                                ObIAllocator *stmt_allocator,
                                ObIAllocator *scan_allocator);
   
-  // 刷新 LOB meta 和 piece tablet id，需要 ctx.tablet_id_ 标识主表 tablet。
-  int prepare_lob_tablet_id(ObLobContextBase &ctx);
   // @brief prepare table scan param accroding target(maybe meta or piece).
   //        Set schema version through aux tablet handle.
   int prepare_scan_param_schema_version(const LobAuxTarget target,
@@ -123,24 +119,6 @@ public:
   int get_aux_table_dml_param(const LobAuxTarget target, const ObTableDMLParam *&table_param);
 
 private: // write
-  template<typename LobContext>
-  int inner_get_tablet(const LobContext &param,
-                       const common::ObTabletID &tablet_id,
-                       ObTabletHandle &handle);
-  template<typename LobContext>
-  int inner_get_tablet(const LobContext &param,
-                       const common::ObTabletID &tablet_id,
-                       ObLSHandle &ls_handle,
-                       ObTabletHandle &handle);
-
-  static bool check_lob_tablet_id(const common::ObTabletID &data_tablet_id,
-                                  const common::ObTabletID &lob_meta_tablet_id,
-                                  const common::ObTabletID &lob_piece_tablet_id);
-
-  int fetch_lob_id_for_split_src(const ObLobInsertContext &insert_ctx,
-                                 const ObTabletID &lob_tablet_id,
-                                 uint64_t &lob_id);
-
   // dml param preparation
   // Unified implementation of prepare_lob_{meta,piece}_dml and build_lob_{meta,piece}_table_dml.
   // The corresponding slot on param (dml_base_meta_param_ / dml_base_piece_param_) is selected by

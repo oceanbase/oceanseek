@@ -209,6 +209,7 @@ void TestFileManager::get_macro_block_scatter_dir_size(int64_t &scatter_dir_size
   // 2. shared mini/minor/major/inc_major macro (each has 00-FF scatter dirs)
   // 3. shared_tablet_sub_meta (00-FF scatter dirs)
   // 4. external_table_file (00-FF scatter dirs)
+  // 5. external_lob_cache (00-FF scatter dirs)
   // Note: Each shared macro type directory is counted separately because directory sizes
   // may differ across filesystems (e.g., XFS vs ext4) and some types have additional
   // subdirectories like /ls.
@@ -278,6 +279,16 @@ void TestFileManager::get_macro_block_scatter_dir_size(int64_t &scatter_dir_size
   dir_path[0] ='\0';
   ASSERT_EQ(OB_SUCCESS, OB_DIR_MGR.get_external_table_file_dir(dir_path, sizeof(dir_path), MTL_ID(), MTL_EPOCH_ID()));
   for (int64_t i = 0; i < ObDirManager::EXTERNAL_TABLE_FILE_SCATTER_DIR_NUM; ++i) {
+    scatter_dir_path[0] = '\0';
+    ASSERT_EQ(OB_SUCCESS, databuff_printf(scatter_dir_path,
+              sizeof(scatter_dir_path), "%s/%02lX", dir_path, i));
+    ASSERT_EQ(OB_SUCCESS, ObIODeviceLocalFileOp::stat(scatter_dir_path, statbuf));
+    scatter_dir_size += statbuf.size_;
+  }
+  dir_path[0] ='\0';
+  ASSERT_EQ(OB_SUCCESS, OB_DIR_MGR.get_external_lob_cache_dir(dir_path, sizeof(dir_path),
+            MTL_ID(), MTL_EPOCH_ID()));
+  for (int64_t i = 0; i < ObDirManager::EXTERNAL_LOB_SCATTER_DIR_NUM; ++i) {
     scatter_dir_path[0] = '\0';
     ASSERT_EQ(OB_SUCCESS, databuff_printf(scatter_dir_path,
               sizeof(scatter_dir_path), "%s/%02lX", dir_path, i));

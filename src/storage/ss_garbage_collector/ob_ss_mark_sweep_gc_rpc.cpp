@@ -14,11 +14,13 @@
 #include "share/ob_all_server_tracer.h"
 #include "share/ob_bucket_num_helper.h"
 #include "storage/ob_storage_rpc.h"
+#include "storage/ob_storage_schema.h"
 #include "storage/meta_mem/ob_tablet_pointer_handle.h"
 #include "storage/meta_mem/ob_tablet_pointer.h"
 #include "storage/meta_mem/ob_tablet_handle.h"
 #include "storage/meta_mem/ob_tablet_map_key.h"
 #include "storage/meta_mem/ob_tenant_meta_mem_mgr.h"
+#include "storage/tablet/ob_tablet_obj_load_helper.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/tx_storage/ob_ls_handle.h"
 #include "lib/hash/ob_hashset.h"
@@ -107,13 +109,14 @@ int ObSSMarkSweepGCStudyP::study_(
       ObLS &ls = *ls_handle.get_ls();
       const int64_t ls_epoch = ls.get_ls_epoch();
       ObTabletHandle tablet_handle;
+      const SCN &ls_clog_checkpoint_scn = ls.get_clog_checkpoint_scn();
       for (int64_t i = 0; OB_SUCC(ret) && (i < tablet_cnt); i++) {
         const ObSSGCTablet &cur_gc_tablet = tablet_list.at(i).gc_tablet_;
         const ObTabletID &tablet_id = cur_gc_tablet.tablet_id_;
         const SCN &deleted_scn = tablet_list.at(i).deleted_scn_;
-        if (deleted_scn.is_valid() && (ls.get_clog_checkpoint_scn() < deleted_scn)) {
+        if (deleted_scn.is_valid() && (ls_clog_checkpoint_scn < deleted_scn)) {
           LOG_TRACE("ls clog_checkpoint_scn has not advanced, cannot gc now", K(cur_gc_tablet),
-              "ls_clog_checkpoint_scn", ls.get_clog_checkpoint_scn(), "tablet_deleted_scn", deleted_scn);
+              "ls_clog_checkpoint_scn", ls_clog_checkpoint_scn, "tablet_deleted_scn", deleted_scn);
           ObSSGCTabletStudyInfo study_info;
           study_info.set_to_min();
           ObSSGCUtil::report_mark_sweep_set_to_min_event(cur_gc_tablet, "LS_CLOG_CHECKPOINT_SCN_BEHIND");
@@ -133,7 +136,8 @@ int ObSSMarkSweepGCStudyP::study_(
             LOG_WARN("fail to get tablet", KR(ret), K(cur_gc_tablet), K(deleted_scn));
           }
         } else if (OB_FAIL(handle_tablet_exist_(
-                       tablet_handle, cur_gc_tablet, ls_epoch, tablet_meta_scn_list))) {
+                       ls_clog_checkpoint_scn, tablet_handle, cur_gc_tablet,
+                       ls_epoch, tablet_meta_scn_list))) {
           LOG_WARN("fail to handle tablet exist", KR(ret), K(cur_gc_tablet), K(deleted_scn));
         }
       }
@@ -184,7 +188,30 @@ int ObSSMarkSweepGCStudyP::handle_tablet_not_exist_(
   return ret;
 }
 
+bool ObSSMarkSweepGCStudyP::need_collect_lob_rely_info_(
+    const ObStorageSchema &storage_schema)
+{
+  return storage_schema.is_aux_lob_meta_table()
+      || storage_schema.is_aux_outtable_lob_control_table();
+}
+
+bool ObSSMarkSweepGCStudyP::update_cold_lob_rely_info_(
+    const bool collect_lob_rely_info,
+    const int64_t tablet_cnt,
+    const bool has_memtable,
+    const SCN &ls_clog_checkpoint_scn,
+    ObSSGCTabletStudyInfo &study_info)
+{
+  if (collect_lob_rely_info && 1 == tablet_cnt && !has_memtable
+      && study_info.clog_checkpoint_scn_.is_valid_and_not_min()
+      && !study_info.clog_checkpoint_scn_.is_max()) {
+    study_info.clog_checkpoint_scn_ = ls_clog_checkpoint_scn;
+  }
+  return collect_lob_rely_info && study_info.is_cold();
+}
+
 int ObSSMarkSweepGCStudyP::handle_tablet_exist_(
+    const share::SCN &ls_clog_checkpoint_scn,
     const ObTabletHandle &tablet_handle,
     const ObSSGCTablet &cur_gc_tablet,
     const int64_t ls_epoch,
@@ -217,29 +244,66 @@ int ObSSMarkSweepGCStudyP::handle_tablet_exist_(
     ObSSGCUtil::report_mark_sweep_set_to_min_event(cur_gc_tablet, "TRANSFER_TABLE_NOT_REFRESHED");
   } else { // tablet_handle.get_obj()->get_reorganization_scn() == transfer_scn
     study_info.set_to_min();  // means can not recycle any versions
-    // min_dep_meta_scn_ carries the shared physical lower bound of Minor and IncMajor;
-    // RPC serialize order stays unchanged.
-    ScanAllVersionTabletsOp::GetMinTabletRelyInfo op(
-        study_info.min_dep_meta_scn_, study_info.min_major_snapshot_);
+    ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "GCStudySchema"));
+    ObStorageSchema *storage_schema = nullptr;
+    int64_t tablet_cnt = 0;
     const ObTabletMapKey key(ls_id, tablet_id);
     ObTenantMetaMemMgr *t3m = MTL(ObTenantMetaMemMgr *);
+    bool tablet_exist = false;
     if (OB_ISNULL(t3m)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("ObTenantMetaMemMgr is NULL", KR(ret), K(cur_gc_tablet));
-    } else if (OB_FAIL(t3m->scan_all_version_tablets(key, op))) {
-      LOG_WARN("fail to scan all version tablets", KR(ret), K(cur_gc_tablet));
-    } else if (!study_info.min_dep_meta_scn_.is_valid()) {
-      // Note: min_dep_meta_scn_.is_max() may occur when this tablet has not linked any minor.
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected min_dep_meta_scn", KR(ret), K(study_info), K(cur_gc_tablet));
+    } else if (OB_FAIL(t3m->has_tablet(key, tablet_exist))) {
+      LOG_WARN("fail to check tablet existence", KR(ret), K(cur_gc_tablet));
+    } else if (!tablet_exist) {
+      ret = OB_ENTRY_NOT_EXIST;
+      LOG_TRACE("tablet no longer exists before study", KR(ret), K(cur_gc_tablet));
+    } else if (tablet_handle.get_obj()->is_empty_shell()) {
+      // 空壳 Tablet 没有 StorageSchema，保留 MIN 边界并等待本地 Tablet GC 完成。
+      LOG_INFO("skip studying empty shell tablet", K(cur_gc_tablet), K(tablet_handle));
+    } else if (OB_FAIL(tablet_handle.get_obj()->load_storage_schema(allocator, storage_schema))) {
+      LOG_WARN("fail to load storage schema", KR(ret), K(cur_gc_tablet));
     } else {
-      is_normal_study = true;
+      const bool collect_lob_rely_info = need_collect_lob_rely_info_(*storage_schema);
+      bool has_memtable = false;
+      // 为兼容既有 Study RPC，min_dep_meta_scn_ 承载 Minor 与 IncMajor 的共同物理依赖下界。
+      ScanAllVersionTabletsOp::GetMinTabletRelyInfo op(study_info.min_dep_meta_scn_,
+                                                       study_info.min_major_snapshot_,
+                                                       study_info.clog_checkpoint_scn_,
+                                                       study_info.orig_clog_checkpoint_scn_,
+                                                       study_info.multi_version_start_,
+                                                       has_memtable,
+                                                       collect_lob_rely_info);
+      if (OB_FAIL(t3m->scan_all_version_tablets(key, op, tablet_cnt))) {
+        LOG_WARN("fail to scan all version tablets", KR(ret), K(cur_gc_tablet));
+      } else if (!study_info.min_dep_meta_scn_.is_valid()
+                 || !study_info.clog_checkpoint_scn_.is_valid()
+                 || !study_info.orig_clog_checkpoint_scn_.is_valid()
+                 || study_info.multi_version_start_ < 0) {
+        // Note: min_dep_meta_scn_.is_max() may occur when this tablet has not linked any minor.
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected tablet study info", KR(ret), K(study_info), K(cur_gc_tablet));
+      } else {
+        is_normal_study = true;
+      }
+
+      if (OB_FAIL(ret)) {
+      } else if (update_cold_lob_rely_info_(collect_lob_rely_info, tablet_cnt,
+          has_memtable, ls_clog_checkpoint_scn, study_info)) {
+        // cold tablet, using ls clog checkpoint scn as rely info
+        LOG_INFO("cold tablet, using ls clog checkpoint scn as rely info",
+            K(cur_gc_tablet), K(ls_clog_checkpoint_scn), K(study_info));
+      } else if (collect_lob_rely_info && study_info.clog_checkpoint_scn_.is_min()) {
+        LOG_INFO("lob tablet uses min checkpoint scn as rely info",
+            K(cur_gc_tablet), K(study_info));
+      }
     }
+    ObTabletObjLoadHelper::free(allocator, storage_schema);
   }
 
   // Note: must check check_allow_tablet_version_gc_(flying/external tablets) after scan_all_version_tablets.
   // if there are no flying/external tablets when check_allow_tablet_version_gc_ here, any flying/external
-  // tablets created afterwards will have a min tablet meta scn >= the @min_minor_meta_scn studied above.
+  // tablets created afterwards will have a min tablet meta scn >= the @min_dep_meta_scn studied above.
   // it is guaranteed by scan_all_version_tablets use RLock, and create flying/external tablets use WLock.
   if (FAILEDx(check_allow_tablet_version_gc_(tablet_handle, allow_tablet_version_gc))) {
     LOG_WARN("check allow_tablet_version_gc failed", KR(ret), K(ls_id), K(tablet_id));
@@ -537,13 +601,17 @@ int ObSSGCStudyUtil::try_handle_ls_deleted_(
       // tablet not yet mark-deleted -> min (do not recycle any version yet, safe).
       const SCN min_dep_meta_scn = (deleted_scn.is_valid() ? SCN::max_scn() : SCN::min_scn());
       const int64_t min_major_snapshot = (deleted_scn.is_valid() ? INT64_MAX : 0);
+      const SCN clog_checkpoint_scn = (deleted_scn.is_valid() ? SCN::max_scn() : SCN::min_scn());
+      const int64_t multi_version_start = (deleted_scn.is_valid() ? INT64_MAX : 0);
       if (!deleted_scn.is_valid() && !has_undeleted_tablet) {
         has_undeleted_tablet = true;
         first_undeleted_tablet = gc_tablet;
         ObSSGCUtil::report_mark_sweep_set_to_min_event(gc_tablet, "LS_DELETED_TABLET_UNDELETED");
       }
       if (OB_FAIL(tablet_meta_scn_arr.push_back(
-              ObSSGCTabletStudyResult(gc_tablet, min_dep_meta_scn, min_major_snapshot)))) {
+              ObSSGCTabletStudyResult(
+                  gc_tablet, min_dep_meta_scn, min_major_snapshot,
+                  clog_checkpoint_scn, multi_version_start)))) {
         LOG_WARN("fail to push back tablet_meta_scn_arr", KR(ret), K(gc_tablet));
       }
     }
@@ -711,7 +779,7 @@ int ObSSGCStudyUtil::merge_server_meta_scn_infos_(
     const int hash_ret = tablet_index_map.get_refactored(cur_info.gc_tablet_, idx);
     if (OB_SUCCESS == hash_ret) {
       ObSSGCTabletStudyResult &final_info = final_tablet_meta_scn_arr.at(idx);
-      // take the min of min_minor_meta_scn_ across servers.
+      // take the min of min_dep_meta_scn_ across servers.
       if (cur_info.study_info_.min_dep_meta_scn_.is_min()) {
         final_info.study_info_.min_dep_meta_scn_.set_min();
       } else if (cur_info.study_info_.min_dep_meta_scn_ < final_info.study_info_.min_dep_meta_scn_) {
@@ -720,6 +788,21 @@ int ObSSGCStudyUtil::merge_server_meta_scn_infos_(
       // take the min of min_major_snapshot_ across servers.
       if (cur_info.study_info_.min_major_snapshot_ < final_info.study_info_.min_major_snapshot_) {
         final_info.study_info_.min_major_snapshot_ = cur_info.study_info_.min_major_snapshot_;
+      }
+      // 计算节点侧的安全位点取全部成员和学习者的最小值。
+      if (cur_info.study_info_.clog_checkpoint_scn_
+          < final_info.study_info_.clog_checkpoint_scn_) {
+        final_info.study_info_.clog_checkpoint_scn_
+            = cur_info.study_info_.clog_checkpoint_scn_;
+      }
+      final_info.study_info_.orig_clog_checkpoint_scn_ = SCN::min(
+          final_info.study_info_.orig_clog_checkpoint_scn_,
+          cur_info.study_info_.orig_clog_checkpoint_scn_);
+      // 多版本起始点同样取全部成员和学习者的最小值。
+      if (cur_info.study_info_.multi_version_start_
+          < final_info.study_info_.multi_version_start_) {
+        final_info.study_info_.multi_version_start_
+            = cur_info.study_info_.multi_version_start_;
       }
     } else if (OB_HASH_NOT_EXIST == hash_ret) {
       const int64_t new_idx = final_tablet_meta_scn_arr.count();

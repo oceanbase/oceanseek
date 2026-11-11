@@ -165,7 +165,7 @@ public:
     : macro_block_id_(), offset_(), size_(), io_timeout_ms_(GCONF._data_storage_io_timeout / 1000L), io_desc_(),
       result_format_(common::ObObjectReadResultFormat::DEFAULT),
       io_callback_(NULL), buf_(NULL), mtl_tenant_id_(OB_INVALID_TENANT_ID), local_cache_read_info_(),
-      server_id_(GCONF.observer_id), path_(), access_info_(nullptr), io_metrics_(nullptr)
+      server_id_(GCONF.observer_id), path_(), access_info_(nullptr), io_metrics_(nullptr), etag_()
   {}
   ~ObStorageObjectReadInfo() = default;
   OB_INLINE bool is_valid() const
@@ -238,6 +238,7 @@ public:
   ObString path_;
   const ObObjectStorageInfo *access_info_;
   sql::ObLakeTableIOMetrics *io_metrics_;
+  common::ObString etag_;
 };
 
 } // namespace blocksstable

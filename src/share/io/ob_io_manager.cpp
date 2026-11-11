@@ -10,6 +10,7 @@
 #include "observer/ob_server.h"
 #include "src/share/io/io_schedule/ob_io_schedule_v2.h"
 #include "lib/restore/ob_object_device.h"
+#include "lib/restore/ob_object_storage_base.h"
 #ifdef OB_BUILD_SHARED_STORAGE
 #include "share/io/ob_ss_io_request.h"
 #endif
@@ -1644,7 +1645,7 @@ int ObIOManager::stat(const int64_t tenant_id, const ObIOFd &fd,
   info.user_data_buf_ = (char*)&statbuf;
   info.offset_ = 0;
   info.size_ = sizeof(ObIODFileStat);
-  info.timeout_us_ = get_object_storage_io_timeout_ms(tenant_id) * 1000L;
+  info.timeout_us_ = ObObjectStorageTenantGuard::get_timeout_us();
   info.flag_.set_wait_event(ObWaitEventIds::OBJECT_STORAGE_READ);
   info.flag_.set_read(ObIOReadMode::STAT);
   if (OB_FAIL(read(info, handle))) {

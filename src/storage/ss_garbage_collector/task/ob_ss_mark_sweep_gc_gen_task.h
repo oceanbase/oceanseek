@@ -92,11 +92,12 @@ private:
       const share::SCN &snapshot_meta_scn,
       const ObSSGCTabletStudyResultArray &study_result_arr,
       ObSSGCTabletWithMetaScnArray &tablet_with_meta_scn_arr);
-  int get_max_major_meta_scn_(
+  int get_max_rely_meta_scns_(
       const share::SCN &snapshot_meta_scn,
       const ObSSGCTablet &gc_tablet,
-      const int64_t min_major_snapshot,
-      share::SCN &max_major_meta_scn);
+      const ObSSGCTabletStudyInfo &study_info,
+      share::SCN &max_major_meta_scn,
+      share::SCN &max_lob_meta_scn);
   int filter_by_ls_ss_checkpoint_scn_(
       const share::ObLSID &ls_id,
       const share::SCN &snapshot_meta_scn,

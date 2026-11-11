@@ -17,10 +17,12 @@
 #include "sql/engine/px/ob_px_bloom_filter.h"
 #include "common/row/ob_row.h"
 #include "lib/compress/ob_compress_util.h"
+#include "lib/container/ob_array_serialization.h"
 #include "storage/tx/ob_trans_define.h"
 #include "sql/engine/ob_exec_feedback_info.h"
 #include "sql/ob_sql_define.h"
 #include "sql/table_format/iceberg/spec/manifest.h"
+#include "storage/lob/common/ob_outtable_lob_control_key.h"
 #include "sql/result_catalog/ob_async_result_file.h"
 
 namespace oceanbase
@@ -393,9 +395,11 @@ public:
         sqc_fuse_row_cache_hit_(0),
         sqc_network_wait_time_(0),
         sqc_iceberg_data_files_(),
-        sqc_async_result_files_()
+        sqc_async_result_files_(),
+        outtable_lob_control_keys_()
   {
     sqc_async_result_files_.set_attr(common::ObMemAttr(MTL_ID(), "ResultFiles"));
+    outtable_lob_control_keys_.set_attr(common::ObMemAttr(MTL_ID(), "PxLobCtrlKey"));
   }
   virtual ~ObPxFinishSqcResultMsg() = default;
   const transaction::ObTxExecResult &get_trans_result() const { return trans_result_; }
@@ -438,6 +442,7 @@ public:
     sqc_network_wait_time_ = 0;
     sqc_iceberg_data_files_.reset();
     sqc_async_result_files_.reset();
+    outtable_lob_control_keys_.reset();
   }
   TO_STRING_KV(K_(dfo_id), K_(sqc_id), K_(rc), K_(das_retry_rc), K_(sqc_affected_rows), K_(sqc_memstore_row_read_count), K_(sqc_ssstore_row_read_count));
 public:
@@ -477,6 +482,7 @@ public:
   int64_t sqc_network_wait_time_;
   common::ObSEArray<iceberg::ObSerializableDataFile, 1> sqc_iceberg_data_files_;
   common::ObSEArray<ObAsyncResultFileDesc, 1> sqc_async_result_files_;
+  common::ObSArray<storage::ObOuttableLobControlKey> outtable_lob_control_keys_;
 };
 
 class ObPxFinishTaskResultMsg

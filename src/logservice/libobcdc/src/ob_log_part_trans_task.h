@@ -36,6 +36,11 @@
 
 namespace oceanbase
 {
+namespace transaction
+{
+class ObTxLobOutTableDataLog;
+}
+
 namespace share
 {
 namespace schema
@@ -903,6 +908,13 @@ public:
       const char *buf,
       const int64_t buf_len);
 
+  // The borrowed serialized buf is copied before this call returns.
+  int push_lob_outtable_data_log(
+      const palf::LSN &log_lsn,
+      const transaction::ObTxLobOutTableDataLog &log,
+      const char *buf,
+      const int64_t buf_len);
+
   /**
    * @brief: push rollback_to info:
    * 1. lsn of rollback_to should push into all_recorded_lsns(ObTxRollbackToLog should has independent LogEntry)
@@ -1326,14 +1338,14 @@ private:
       const char *redo_data,
       const int64_t redo_data_size);
   int push_ddl_redo_on_row_start_(
-      const memtable::ObMemtableMutatorMeta &meta,
+      const DdlRedoLogNode::LogType log_type,
       const palf::LSN &log_lsn,
       const char *redo_data,
       const int64_t redo_data_size,
       const int64_t mutator_row_size);
   int push_dml_redo_on_row_start_(
       const bool need_store_data,
-      const bool is_direct_load_inc_log,
+      const DmlRedoLogNode::LogType log_type,
       const palf::LSN &log_lsn,
       const char *redo_data,
       const int64_t redo_data_size,

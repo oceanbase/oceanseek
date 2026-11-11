@@ -227,6 +227,7 @@ public:
   int end_nested_session();
   int execute_write(const char *sql);
   int execute_read(const char *sql, common::ObMySQLProxy::MySQLResult &res);
+  int complete_outtable_lob_control_keys(ObDMLRtCtx &dml_rtctx);
   int check_stack();
   bool is_nested_session() { return ObSQLUtils::is_nested_sql(&ctx_); }
   bool is_fk_nested_session() { return ObSQLUtils::is_fk_nested_sql(&ctx_); }

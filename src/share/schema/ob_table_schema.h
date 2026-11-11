@@ -1197,6 +1197,8 @@ public:
   inline bool is_aux_lob_piece_table() const { return share::schema::is_aux_lob_piece_table(table_type_); }
   inline bool is_aux_lob_meta_table() const { return share::schema::is_aux_lob_meta_table(table_type_); }
   inline bool is_aux_lob_table() const { return is_aux_lob_meta_table() || is_aux_lob_piece_table(); }
+  inline bool is_aux_outtable_lob_control_table() const
+  { return share::schema::is_aux_outtable_lob_control_table(table_type_); }
   inline bool is_aux_table() const { return share::schema::ObTableType::USER_INDEX == table_type_ || share::schema::ObTableType::AUX_VERTIAL_PARTITION_TABLE == table_type_ || share::schema::ObTableType::AUX_LOB_PIECE == table_type_ || share::schema::ObTableType::AUX_LOB_META == table_type_; }
   // Primary partition table judgment: still USER_TABLE, but data_table_id_ is the same as itself,
   // the default data_table_id_ is 0
@@ -1672,6 +1674,8 @@ public:
   int set_async_index_params(const common::ObString &async_index_params) { return deep_copy_str(async_index_params, async_index_params_); }
   int set_exec_env(const common::ObString &exec_env) { return deep_copy_str(exec_env, exec_env_); }
   void set_lob_inrow_threshold(const int64_t lob_inrow_threshold) { lob_inrow_threshold_ = lob_inrow_threshold;}
+  void set_lob_intable_threshold(const int64_t lob_intable_threshold)
+  { lob_intable_threshold_ = lob_intable_threshold; }
   inline void set_auto_increment_cache_size(const int64_t auto_increment_cache_size)
   { auto_increment_cache_size_ = auto_increment_cache_size; }
 //get methods
@@ -2641,7 +2645,7 @@ protected:
   int64_t external_file_pattern_type_;
   // async index
   common::ObString async_index_params_;
-  int64_t lob_intable_threshold_; // Reserved for LOB InTable threshold.
+  int64_t lob_intable_threshold_;
 };
 
 class ObPrintableTableSchema final : public ObTableSchema
@@ -3079,6 +3083,7 @@ inline bool ObSimpleTableSchemaV2::should_check_major_merge_progress() const
           || is_user_table()
           || is_tmp_table()
           || is_aux_lob_table()
+          || is_aux_outtable_lob_control_table()
           || is_mlog_table());
 }
 

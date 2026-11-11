@@ -712,13 +712,32 @@ int ObExprColumnConv::column_convert(const ObExpr &expr,
         ObString raw_str = val->get_string();
         ObLobLocatorV2 input_lob(raw_str.ptr(), raw_str.length());
         bool is_delta = input_lob.is_valid() && input_lob.is_append_delta_lob();
-        if (is_delta) { // delta lob
+        if (is_lob_storage(in_type)) {
+          if (OB_UNLIKELY(!input_lob.is_valid())) {
+            ret = OB_INVALID_ARGUMENT;
+            LOG_WARN("invalid input lob locator", KR(ret), K(in_type), K(out_type));
+          } else if (OB_UNLIKELY(input_lob.is_outline_disk_lob_locator())) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_USER_ERROR(OB_ERR_UNEXPECTED, "column conversion from a bare outline disk LOB locator");
+            LOG_WARN("bare outline disk lob locator is not supported", KR(ret), K(in_type), K(out_type));
+          } else if (OB_UNLIKELY(input_lob.is_mem_external_lob() && ObExtendBLobType != out_type)) {
+            ret = OB_NOT_SUPPORTED;
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "assigning an external LOB to a non-EXTBLOB column");
+            LOG_WARN("external lob assignment requires an EXTBLOB column", KR(ret), K(in_type), K(out_type));
+          }
+        }
+
+        if (OB_FAIL(ret)) {
+        } else if (is_delta) { // delta lob
           if (!(ob_is_text_tc(in_type) || ob_is_json(in_type))) {
             ret = OB_INVALID_ARGUMENT;
             LOG_WARN("delta lob can not convert to non-text type", K(ret), K(out_type));
           } else {
             datum.set_string(raw_str);
           }
+        } else if (is_lob_storage(in_type) && input_lob.is_mem_external_lob()) {
+          // Assign External LOB directly, without reading or converting it.
+          datum.set_string(raw_str);
         } else {
           ObEvalCtx::TempAllocGuard tmp_alloc_g(ctx); // temp alloc only used for lob types
           common::ObArenaAllocator &temp_allocator = tmp_alloc_g.get_allocator();
@@ -870,13 +889,32 @@ int ObExprColumnConv::column_convert_batch(const ObExpr &expr,
           ObString raw_str = vals[i].get_string();
           ObLobLocatorV2 input_lob(raw_str.ptr(), raw_str.length());
           bool is_delta = input_lob.is_valid() && input_lob.is_append_delta_lob();
-          if (is_delta) { // delta lob
+          if (is_lob_storage(in_type)) {
+            if (OB_UNLIKELY(!input_lob.is_valid())) {
+              ret = OB_INVALID_ARGUMENT;
+              LOG_WARN("invalid input lob locator", KR(ret), K(in_type), K(out_type));
+            } else if (OB_UNLIKELY(input_lob.is_outline_disk_lob_locator())) {
+              ret = OB_ERR_UNEXPECTED;
+              LOG_USER_ERROR(OB_ERR_UNEXPECTED, "column conversion from a bare outline disk LOB locator");
+              LOG_WARN("bare outline disk lob locator is not supported", KR(ret), K(in_type), K(out_type));
+            } else if (OB_UNLIKELY(input_lob.is_mem_external_lob() && ObExtendBLobType != out_type)) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_USER_ERROR(OB_NOT_SUPPORTED, "assigning an external LOB to a non-EXTBLOB column");
+              LOG_WARN("external lob assignment requires an EXTBLOB column", KR(ret), K(in_type), K(out_type));
+            }
+          }
+
+          if (OB_FAIL(ret)) {
+          } else if (is_delta) { // delta lob
             if (!(ob_is_text_tc(in_type) || ob_is_json(in_type))) {
               ret = OB_INVALID_ARGUMENT;
               LOG_WARN("delta lob can not convert to non-text type", K(ret), K(out_type));
             } else {
               results[i].set_string(raw_str);
             }
+          } else if (is_lob_storage(in_type) && input_lob.is_mem_external_lob()) {
+            // External assignment stores refs only; do not read or truncate remote data.
+            results[i].set_string(raw_str);
           } else {
             ObString str;
             // can_use_raw_str: skip striter unwrap, take the pre-cast string directly

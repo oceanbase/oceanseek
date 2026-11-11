@@ -1184,13 +1184,17 @@ int ObTenantMetaMemMgr::get_min_end_scn_from_single_tablet(ObTablet *tablet,
   return ret;
 }
 
-int ObTenantMetaMemMgr::scan_all_version_tablets(const ObTabletMapKey &key, const ObFunction<int(ObTablet &)> &op)
+int ObTenantMetaMemMgr::scan_all_version_tablets(
+    const ObTabletMapKey &key,
+    const ObFunction<int(ObTablet &)> &op,
+    int64_t &tablet_cnt)
 {
   int ret = OB_SUCCESS;
   ObTablet *cur_tablet = nullptr;
   ObArenaAllocator allocator(common::ObMemAttr(MTL_ID(), "ScanTablets"));
   ObTabletPointerHandle ptr_handle(tablet_map_);
   ObTabletHandle handle;
+  tablet_cnt = 0;
 
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
@@ -1213,10 +1217,12 @@ int ObTenantMetaMemMgr::scan_all_version_tablets(const ObTabletMapKey &key, cons
     if (OB_ISNULL(tablet_ptr)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("tablet ptr is NULL", K(ret), K(ptr_handle));
-    } else if (OB_FAIL(tablet_ptr->scan_all_tablets_on_chain(op))) {
+    } else if (OB_FAIL(tablet_ptr->scan_all_tablets_on_chain(op, tablet_cnt))) {
       LOG_WARN("fail to apply op on old chain tablets", K(ret), K(key));
     } else if (OB_FAIL(op(*cur_tablet))) {
       LOG_WARN("fail to apply op on current tablet", K(ret), K(key));
+    } else {
+      ++tablet_cnt;
     }
   }
   return ret;

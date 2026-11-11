@@ -442,6 +442,23 @@ int ObPxSQCProxy::report(int end_ret) const
     }
   }
 
+  if (OB_SUCCESS == finish_msg.rc_) {
+    // Workers have exited; only a successful SQC may publish keys for completion by the QC.
+    for (int64_t i = 0; OB_SUCC(ret) && i < tasks.count(); ++i) {
+      const common::ObArray<storage::ObOuttableLobControlKey> *control_keys =
+          tasks.at(i).outtable_lob_control_keys_;
+      if (OB_ISNULL(control_keys)) {
+      } else if (OB_FAIL(append(finish_msg.outtable_lob_control_keys_, *control_keys))) {
+        LOG_WARN("failed to collect px outtable lob control keys", K(ret), K(i));
+      }
+    }
+    if (OB_FAIL(ret)) {
+      // Sending the failure must not turn an incomplete key set into a successful result.
+      finish_msg.rc_ = ret;
+      finish_msg.outtable_lob_control_keys_.reuse();
+    }
+  }
+
 #ifdef ERRSIM
   if (OB_SUCC(ret)) {
     int64_t query_timeout = 0;

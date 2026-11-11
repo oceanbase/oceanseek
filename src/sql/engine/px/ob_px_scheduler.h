@@ -6,6 +6,7 @@
 #ifndef OCEANBASE_ENGINE_PX_OB_PX_SCHUDULER_H_
 #define OCEANBASE_ENGINE_PX_OB_PX_SCHUDULER_H_
 
+#include "lib/allocator/ob_malloc.h"
 #include "sql/engine/px/exchange/ob_receive_op.h"
 #include "sql/engine/px/ob_dfo_mgr.h"
 #include "sql/engine/px/ob_px_rpc_proxy.h"
@@ -21,6 +22,7 @@
 #include "sql/engine/px/datahub/components/ob_dh_range_dist_wf.h"
 #include "sql/engine/px/datahub/components/ob_dh_second_stage_reporting_wf.h"
 #include "sql/engine/px/datahub/components/ob_dh_opt_stats_gather.h"
+#include "storage/lob/common/ob_outtable_lob_control_key.h"
 
 namespace oceanbase
 {
@@ -116,9 +118,11 @@ public:
     qc_detectable_id_(),
     p2p_dfo_map_(),
     p2p_temp_table_info_(),
-    rf_dpd_info_()
+    rf_dpd_info_(),
+    outtable_lob_control_keys_(nullptr),
+    outtable_lob_control_ret_(common::OB_SUCCESS)
   {}
-  virtual ~ObPxCoordInfo() {}
+  virtual ~ObPxCoordInfo() { common::ob_delete(outtable_lob_control_keys_); }
   virtual void destroy()
   {
     dfo_mgr_.destroy();
@@ -126,6 +130,8 @@ public:
     p2p_dfo_map_.destroy();
     p2p_temp_table_info_.reset();
     rf_dpd_info_.destroy();
+    common::ob_delete(outtable_lob_control_keys_);
+    outtable_lob_control_ret_ = common::OB_SUCCESS;
   }
   void reset_for_rescan()
   {
@@ -135,8 +141,16 @@ public:
     batch_rescan_ctl_ = NULL;
     p2p_dfo_map_.reuse();
     p2p_temp_table_info_.reset();
+    if (OB_NOT_NULL(outtable_lob_control_keys_)) {
+      outtable_lob_control_keys_->reuse();
+    }
+    outtable_lob_control_ret_ = common::OB_SUCCESS;
   }
   int init();
+  int append_outtable_lob_control_keys(
+      const common::ObIArray<storage::ObOuttableLobControlKey> &keys);
+  int complete_outtable_lob_control_keys(ObExecContext &ctx);
+  int check_outtable_lob_control_complete() const;
   bool enable_px_batch_rescan() { return get_rescan_param_count() > 0; }
   int64_t get_rescan_param_count()
   {
@@ -168,6 +182,8 @@ public:
   hash::ObHashMap<int64_t, ObP2PDfoMapNode, hash::NoPthreadDefendMode> p2p_dfo_map_;
   ObTempTableP2PInfo p2p_temp_table_info_;
   RuntimeFilterDependencyInfo rf_dpd_info_;
+  common::ObArray<storage::ObOuttableLobControlKey> *outtable_lob_control_keys_;
+  int outtable_lob_control_ret_;
 };
 
 class ObDfoSchedulerBasic;

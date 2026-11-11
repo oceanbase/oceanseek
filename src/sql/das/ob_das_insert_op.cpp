@@ -97,7 +97,8 @@ ObDASInsertOp::ObDASInsertOp(ObIAllocator &op_alloc)
     ins_rtdef_(nullptr),
     result_(nullptr),
     affected_rows_(0),
-    is_duplicated_(false)
+    is_duplicated_(false),
+    outtable_lob_control_key_collector_()
 {
 }
 
@@ -142,7 +143,13 @@ int ObDASInsertOp::prepare_logical_insert_rtdef_(ObDASDMLIterator &dml_iter,
 int ObDASInsertOp::open_op()
 {
   int ret = OB_SUCCESS;
-  if (ins_rtdef_->need_fetch_conflict_ && OB_FAIL(insert_row_with_fetch())) {
+  outtable_lob_control_key_collector_.reuse();
+  if (OB_ISNULL(ins_ctdef_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("insert ctdef is null", K(ret));
+  } else if (OB_FAIL(outtable_lob_control_key_collector_.prepare_if_needed(*ins_ctdef_))) {
+    LOG_WARN("failed to prepare outtable lob control key array", K(ret));
+  } else if (ins_rtdef_->need_fetch_conflict_ && OB_FAIL(insert_row_with_fetch())) {
     LOG_WARN("fail to do insert with conflict fetch", K(ret), K(das_gts_opt_info_));
   } else if (!ins_rtdef_->need_fetch_conflict_ && OB_FAIL(insert_rows())) {
     LOG_WARN("fail to do insert", K(ret));
@@ -171,6 +178,7 @@ int ObDASInsertOp::insert_rows()
   ins_adaptor.is_do_gts_opt_ = das_gts_opt_info_.use_specify_snapshot_;
   ins_adaptor.das_allocator_ = &op_alloc_;
   ins_adaptor.tablet_loc_ = tablet_loc_;
+  ins_adaptor.set_outtable_lob_control_keys(outtable_lob_control_key_collector_.get_keys());
   if (OB_FAIL(prepare_logical_insert_rtdef_(dml_iter, "normal"))) {
     LOG_WARN("prepare logical INSERT runtime definition failed", K(ret));
   }
@@ -270,6 +278,7 @@ int ObDASInsertOp::insert_row_with_fetch()
   concurrent_control::ObWriteFlag write_flag;
   transaction::ObTxReadSnapshot *snapshot = snapshot_;
   common::ObSEArray<share::ObVectorIndexAcquireCtx, OB_DAS_VEC_INDEX_ACQUIRE_CTX_INLINE_CNT> vec_index_ctxs;
+  dml_param.outtable_lob_control_keys_ = outtable_lob_control_key_collector_.get_keys();
 
   // conflict-fetch and regular INSERT share one StoredRow. Materialize its
   // deferred CID once on the leader before any primary or auxiliary write.
@@ -430,6 +439,9 @@ int ObDASInsertOp::insert_row_with_fetch()
 
   if (OB_SUCC(ret)) {
     result_iter->init_curr_iter();
+    if (is_duplicated_) {
+      outtable_lob_control_key_collector_.reuse();
+    }
   }
 
   return ret;
@@ -481,6 +493,10 @@ int ObDASInsertOp::record_task_result_to_rtdef()
   int ret = OB_SUCCESS;
   ins_rtdef_->affected_rows_ += affected_rows_;
   ins_rtdef_->is_duplicated_ |= is_duplicated_;
+  if (OB_FAIL(outtable_lob_control_key_collector_.append_to(
+      ins_rtdef_->outtable_lob_control_keys_))) {
+    LOG_WARN("failed to record outtable lob control keys", K(ret));
+  }
   return ret;
 }
 int ObDASInsertOp::assign_task_result(ObIDASTaskOp *other)
@@ -493,6 +509,11 @@ int ObDASInsertOp::assign_task_result(ObIDASTaskOp *other)
     ObDASInsertOp *ins_op = static_cast<ObDASInsertOp *>(other);
     affected_rows_ = ins_op->get_affected_rows();
     is_duplicated_ = ins_op->get_is_duplicated();
+    const ObIArray<ObOuttableLobControlKey> *control_keys =
+        ins_op->get_outtable_lob_control_keys();
+    if (OB_FAIL(outtable_lob_control_key_collector_.assign(control_keys))) {
+      LOG_WARN("failed to assign outtable lob control keys", K(ret));
+    }
   }
   return ret;
 }
@@ -507,7 +528,13 @@ int ObDASInsertOp::decode_task_result(ObIDASTaskResult *task_result)
 
   if (OB_SUCC(ret)) {
     ObDASInsertResult *insert_result = static_cast<ObDASInsertResult*>(task_result);
-    if (ins_rtdef_->need_fetch_conflict_) {
+    const ObIArray<ObOuttableLobControlKey> *control_keys =
+        insert_result->get_outtable_lob_control_keys();
+    if (OB_FAIL(outtable_lob_control_key_collector_.assign(control_keys))) {
+      LOG_WARN("failed to decode outtable lob control keys", K(ret));
+    }
+    if (OB_FAIL(ret)) {
+    } else if (ins_rtdef_->need_fetch_conflict_) {
       if (OB_FAIL(insert_result->init_result_newrow_iter(&ins_ctdef_->table_rowkey_types_))) {
         LOG_WARN("init insert result iterator failed", K(ret));
       } else {
@@ -538,8 +565,17 @@ int ObDASInsertOp::fill_task_result(ObIDASTaskResult &task_result, bool &has_mor
 
   if (OB_SUCC(ret)) {
     ObDASInsertResult &ins_result = static_cast<ObDASInsertResult&>(task_result);
+    const ObIArray<ObOuttableLobControlKey> *control_keys =
+        outtable_lob_control_key_collector_.get_keys();
+    if (OB_NOT_NULL(control_keys)
+        && OB_FAIL(ins_result.assign_outtable_lob_control_keys(*control_keys))) {
+      LOG_WARN("failed to fill outtable lob control keys", K(ret));
+    } else {
+      memory_limit -= outtable_lob_control_key_collector_.get_serialize_size();
+    }
     // 只有need fetch conflict row, 回冲突行
-    if (ins_rtdef_->need_fetch_conflict_) {
+    if (OB_FAIL(ret)) {
+    } else if (ins_rtdef_->need_fetch_conflict_) {
       if (OB_FAIL(store_conflict_row(ins_result))) {
         LOG_WARN("fail to fetch conflict row", K(ret));
       } else {
@@ -619,7 +655,8 @@ ObDASInsertResult::ObDASInsertResult()
     result_newrow_iter_(),
     output_types_(nullptr),
     is_duplicated_(false),
-    response_snapshot_()
+    response_snapshot_(),
+    outtable_lob_control_key_collector_()
 {
 }
 
@@ -663,6 +700,7 @@ int ObDASInsertResult::init_result_newrow_iter(const ObjMetaFixedArray *output_t
 void ObDASInsertResult::reset()
 {
   output_types_ = nullptr;
+  outtable_lob_control_key_collector_.reset();
 }
 
 int ObDASInsertResult::init(const ObIDASTaskOp &op, common::ObIAllocator &alloc)
@@ -675,6 +713,7 @@ int ObDASInsertResult::init(const ObIDASTaskOp &op, common::ObIAllocator &alloc)
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("base ctdef is null", K(ret));
   } else {
+    outtable_lob_control_key_collector_.reset();
     const ObDASDMLBaseCtDef *ins_ctdef = static_cast<const ObDASDMLBaseCtDef*>(base_ctdef);
     tenant_id = MTL_ID();
     // replace和insert_up拉回冲突数据的das_write_buff暂时不需要带pay_load
@@ -683,7 +722,7 @@ int ObDASInsertResult::init(const ObIDASTaskOp &op, common::ObIAllocator &alloc)
       LOG_WARN("init result buffer failed", K(ret));
     }
   }
-  return OB_SUCCESS;
+  return ret;
 }
 
 int ObDASInsertResult::reuse()
@@ -694,18 +733,26 @@ int ObDASInsertResult::reuse()
   } else {
     affected_rows_ = 0;
     is_duplicated_ = false;
+    outtable_lob_control_key_collector_.reset();
     result_buffer_.~ObDASWriteBuffer();
     new(&result_buffer_) ObDASWriteBuffer();
   }
   return ret;
 }
 
+int ObDASInsertResult::assign_outtable_lob_control_keys(
+    const ObIArray<ObOuttableLobControlKey> &control_keys)
+{
+  return outtable_lob_control_key_collector_.assign(&control_keys);
+}
+
 OB_SERIALIZE_MEMBER((ObDASInsertResult, ObIDASTaskResult),
                     affected_rows_,
                     result_buffer_,
                     is_duplicated_,
-                    response_snapshot_);
-
+                    response_snapshot_,
+                    outtable_lob_control_key_collector_ // FARM COMPAT WHITELIST
+                    );
 
 void ObDASConflictIterator::reset()
 {

@@ -725,7 +725,8 @@ ObDASUpdateOp::ObDASUpdateOp(ObIAllocator &op_alloc)
     upd_ctdef_(nullptr),
     upd_rtdef_(nullptr),
     write_buffer_(),
-    affected_rows_(0)
+    affected_rows_(0),
+    outtable_lob_control_key_collector_()
 {
 }
 
@@ -739,7 +740,13 @@ int ObDASUpdateOp::open_op()
   // R9/R12: UPDATE open_op 填主 lt_rt 并 propagate
   // 本地 DAS 路径：write_row 已用 engine eval_ctx 预解析 lt_rt（enabled_=true）
   // Remote DAS 路径：eval_ctx_ 在反序列化时注入，此处补充解析
-  if (OB_NOT_NULL(upd_ctdef_) && OB_NOT_NULL(upd_rtdef_) && upd_ctdef_->is_logical_table()) {
+  outtable_lob_control_key_collector_.reuse();
+  if (OB_ISNULL(upd_ctdef_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("update ctdef is null", K(ret));
+  } else if (OB_FAIL(outtable_lob_control_key_collector_.prepare_if_needed(*upd_ctdef_))) {
+    LOG_WARN("failed to prepare outtable lob control key array", K(ret));
+  } else if (OB_NOT_NULL(upd_rtdef_) && upd_ctdef_->is_logical_table()) {
     ObLogicalTableRtDef &lt_rt = upd_rtdef_->lt_rt_;
     if (!lt_rt.enabled_ && OB_NOT_NULL(upd_rtdef_->eval_ctx_)) {
       if (OB_FAIL(ObDASUtils::resolve_lt_rt_from_dml_ctdef(
@@ -785,6 +792,7 @@ int ObDASUpdateOp::open_op()
   upd_adaptor.das_allocator_ = &op_alloc_;
   upd_adaptor.tablet_loc_ = tablet_loc_;
   upd_adaptor.ft_doc_word_infos_ = &doc_word_infos;
+  upd_adaptor.set_outtable_lob_control_keys(outtable_lob_control_key_collector_.get_keys());
   if (OB_FAIL(ret)) {
   } else if (OB_FAIL(ObDASDomainUtils::build_ft_doc_word_infos(ls_id_, trans_desc_, snapshot_, related_ctdefs_, related_tablet_ids_,
           upd_ctdef_->is_main_table_in_fts_ddl_, doc_word_infos))) {
@@ -827,6 +835,11 @@ int ObDASUpdateOp::assign_task_result(ObIDASTaskOp *other)
   } else {
     ObDASUpdateOp *upd_op = static_cast<ObDASUpdateOp *>(other);
     affected_rows_ = upd_op->get_affected_rows();
+    const ObIArray<ObOuttableLobControlKey> *control_keys =
+        upd_op->get_outtable_lob_control_keys();
+    if (OB_FAIL(outtable_lob_control_key_collector_.assign(control_keys))) {
+      LOG_WARN("failed to assign outtable lob control keys", K(ret));
+    }
   }
   return ret;
 }
@@ -835,6 +848,10 @@ int ObDASUpdateOp::record_task_result_to_rtdef()
 {
   int ret = OB_SUCCESS;
   upd_rtdef_->affected_rows_ += affected_rows_;
+  if (OB_FAIL(outtable_lob_control_key_collector_.append_to(
+      upd_rtdef_->outtable_lob_control_keys_))) {
+    LOG_WARN("failed to record outtable lob control keys", K(ret));
+  }
   return ret;
 }
 
@@ -846,8 +863,15 @@ int ObDASUpdateOp::decode_task_result(ObIDASTaskResult *task_result)
   CK(task_id_ == task_result->get_task_id());
 #endif
   if (OB_SUCC(ret)) {
-    ObDASUpdateResult *del_result = static_cast<ObDASUpdateResult*>(task_result);
-    affected_rows_ = del_result->get_affected_rows();
+    ObDASUpdateResult *update_result = static_cast<ObDASUpdateResult*>(task_result);
+    const ObIArray<ObOuttableLobControlKey> *control_keys =
+        update_result->get_outtable_lob_control_keys();
+    if (OB_FAIL(outtable_lob_control_key_collector_.assign(control_keys))) {
+      LOG_WARN("failed to decode outtable lob control keys", K(ret));
+    }
+    if (OB_SUCC(ret)) {
+      affected_rows_ = update_result->get_affected_rows();
+    }
   }
   return ret;
 }
@@ -855,14 +879,23 @@ int ObDASUpdateOp::decode_task_result(ObIDASTaskResult *task_result)
 int ObDASUpdateOp::fill_task_result(ObIDASTaskResult &task_result, bool &has_more, int64_t &memory_limit)
 {
   int ret = OB_SUCCESS;
-  UNUSED(memory_limit);
 #if !defined(NDEBUG)
   CK(typeid(task_result) == typeid(ObDASUpdateResult));
 #endif
   if (OB_SUCC(ret)) {
-    ObDASUpdateResult &del_result = static_cast<ObDASUpdateResult&>(task_result);
-    del_result.set_affected_rows(affected_rows_);
-    has_more = false;
+    ObDASUpdateResult &update_result = static_cast<ObDASUpdateResult&>(task_result);
+    const ObIArray<ObOuttableLobControlKey> *control_keys =
+        outtable_lob_control_key_collector_.get_keys();
+    if (OB_NOT_NULL(control_keys)
+        && OB_FAIL(update_result.assign_outtable_lob_control_keys(*control_keys))) {
+      LOG_WARN("failed to fill outtable lob control keys", K(ret));
+    } else {
+      memory_limit -= outtable_lob_control_key_collector_.get_serialize_size();
+    }
+    if (OB_SUCC(ret)) {
+      update_result.set_affected_rows(affected_rows_);
+      has_more = false;
+    }
   }
   return ret;
 }
@@ -918,7 +951,8 @@ OB_SERIALIZE_MEMBER((ObDASUpdateOp, ObIDASTaskOp),
 
 ObDASUpdateResult::ObDASUpdateResult()
   : ObIDASTaskResult(),
-    affected_rows_(0)
+    affected_rows_(0),
+    outtable_lob_control_key_collector_()
 {
 }
 
@@ -930,6 +964,7 @@ int ObDASUpdateResult::init(const ObIDASTaskOp &op, common::ObIAllocator &alloc)
 {
   UNUSED(op);
   UNUSED(alloc);
+  outtable_lob_control_key_collector_.reset();
   return OB_SUCCESS;
 }
 
@@ -937,10 +972,19 @@ int ObDASUpdateResult::reuse()
 {
   int ret = OB_SUCCESS;
   affected_rows_ = 0;
+  outtable_lob_control_key_collector_.reset();
   return ret;
 }
 
+int ObDASUpdateResult::assign_outtable_lob_control_keys(
+    const ObIArray<ObOuttableLobControlKey> &control_keys)
+{
+  return outtable_lob_control_key_collector_.assign(&control_keys);
+}
+
 OB_SERIALIZE_MEMBER((ObDASUpdateResult, ObIDASTaskResult),
-                    affected_rows_);
+                    affected_rows_,
+                    outtable_lob_control_key_collector_ // FARM COMPAT WHITELIST
+                    );
 }  // namespace sql
 }  // namespace oceanbase

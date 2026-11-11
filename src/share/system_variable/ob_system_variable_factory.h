@@ -6150,12 +6150,19 @@ public:
   inline virtual ObSysVarClassType get_type() const { return SYS_VAR__SHOW_SYNC_PLACEHOLDER_TABLE; }
   inline virtual const common::ObObj &get_global_default_value() const { return ObSysVariables::get_default_value(849); }
 };
+class ObSysVarObDefaultLobIntableThreshold : public ObIntSysVar
+{
+public:
+  ObSysVarObDefaultLobIntableThreshold() : ObIntSysVar(NULL, NULL, NULL, NULL, NULL) {}
+  inline virtual ObSysVarClassType get_type() const { return SYS_VAR_OB_DEFAULT_LOB_INTABLE_THRESHOLD; }
+  inline virtual const common::ObObj &get_global_default_value() const { return ObSysVariables::get_default_value(850); }
+};
 class ObSysVarUnifiedCatalogToken : public ObVarcharSysVar
 {
 public:
   ObSysVarUnifiedCatalogToken() : ObVarcharSysVar(NULL, NULL, NULL, NULL, NULL) {}
   inline virtual ObSysVarClassType get_type() const { return SYS_VAR__UNIFIED_CATALOG_TOKEN; }
-  inline virtual const common::ObObj &get_global_default_value() const { return ObSysVariables::get_default_value(850); }
+  inline virtual const common::ObObj &get_global_default_value() const { return ObSysVariables::get_default_value(851); }
 };
 
 
@@ -6180,7 +6187,7 @@ private:
 
 public:
   const static int64_t MYSQL_SYS_VARS_COUNT = 99;
-  const static int64_t OB_SYS_VARS_COUNT = 752;
+  const static int64_t OB_SYS_VARS_COUNT = 753;
   const static int64_t OB_SYS_DEFAULT_VALUE_CHANGED_SERIALIZED_VAR_COUNT = 10;
   const static int64_t ALL_SYS_VARS_COUNT = MYSQL_SYS_VARS_COUNT + OB_SYS_VARS_COUNT;
   const static int64_t INVALID_MAX_READ_STALE_TIME = -1;

@@ -5,8 +5,18 @@
 
 #include "lib/charset/ob_charset.h"
 #include "lib/ob_errno.h"
+#include "lib/worker.h"
 #define USING_LOG_PREFIX STORAGE
 #include "ob_lob_iterator.h"
+#include "lib/time/ob_time_utility.h"
+#include "lib/utility/ob_print_utils.h"
+#include "share/backup/ob_backup_io_adapter.h"
+#include "share/ob_errno.h"
+#include "storage/blocksstable/ob_object_manager.h"
+#include "storage/blocksstable/ob_storage_object_rw_info.h"
+#include "storage/blocksstable/ob_storage_object_type.h"
+#include "storage/lob/common/ob_lob_util.h"
+#include <algorithm>
 
 namespace oceanbase
 {
@@ -17,8 +27,8 @@ int ObLobQueryIter::get_next_chunk(ObLobChunk &chunk, const int64_t chunk_size)
 {
   int ret = OB_SUCCESS;
   chunk.reset();
-  if (OB_UNLIKELY(chunk_size < OB_MIN_LOB_CHUNK_SIZE
-                  || chunk_size > OB_MAX_LOB_CHUNK_SIZE)) {
+  if (OB_UNLIKELY(chunk_size < OB_MIN_CHUNK_SIZE
+                  || chunk_size > OB_MAX_CHUNK_SIZE)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid lob query chunk size", KR(ret), K(chunk_size));
   } else {
@@ -30,17 +40,19 @@ int ObLobQueryIter::get_next_chunk(ObLobChunk &chunk, const int64_t chunk_size)
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("lob query returned an empty chunk", KR(ret), K(chunk_size));
     } else {
-      const int64_t char_len = ObCharset::strlen_char(
-          cs_type_, chunk.lob_data_.ptr(), chunk.lob_data_.length());
-      if (OB_UNLIKELY(char_len <= 0
-                      || chunk.lob_data_.length() > static_cast<int64_t>(UINT32_MAX)
-                      || char_len > static_cast<int64_t>(UINT32_MAX))) {
+      const uint64_t data_length = static_cast<uint64_t>(chunk.lob_data_.length());
+      chunk.byte_len_ = data_length;
+      if (0 == chunk.char_len_) {
+        chunk.char_len_ = CS_TYPE_BINARY == cs_type_
+                          ? data_length
+                          : ObCharset::strlen_char(cs_type_, chunk.lob_data_.ptr(), chunk.lob_data_.length());
+      }
+      if (OB_UNLIKELY(chunk.byte_len_ != data_length
+                      || 0 == chunk.char_len_
+                      || chunk.char_len_ > chunk.byte_len_
+                      || chunk.byte_len_ > static_cast<uint64_t>(UINT32_MAX))) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("invalid lob query chunk length", KR(ret), K(char_len),
-                  "byte_len", chunk.lob_data_.length(), K_(cs_type));
-      } else {
-        chunk.byte_len_ = static_cast<uint64_t>(chunk.lob_data_.length());
-        chunk.char_len_ = static_cast<uint64_t>(char_len);
+        LOG_WARN("invalid lob query chunk length", KR(ret), K(chunk), K(data_length), K_(cs_type));
       }
     }
   }
@@ -79,6 +91,32 @@ int ObLobQueryIter::align_length_(
         }
       }
     }
+  }
+  return ret;
+}
+
+int ObLobQueryIter::align_forward_chunk_(
+    const ObString &data,
+    const ObCollationType cs_type,
+    const int64_t byte_length,
+    int64_t &aligned_byte_length,
+    int64_t &aligned_char_length)
+{
+  int ret = OB_SUCCESS;
+  aligned_byte_length = 0;
+  aligned_char_length = 0;
+  if (OB_UNLIKELY(!common::ObCharset::is_valid_collation(cs_type) || byte_length < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid argument", KR(ret), K(cs_type), K(byte_length));
+  } else if (CS_TYPE_BINARY == cs_type) {
+    aligned_byte_length = OB_MIN(data.length(), byte_length);
+    aligned_char_length = aligned_byte_length;
+  } else if (data.length() <= byte_length) {
+    aligned_byte_length = data.length();
+    aligned_char_length = ObCharset::strlen_char(cs_type, data.ptr(), data.length());
+  } else {
+    aligned_byte_length = ObCharset::max_bytes_charpos(
+        cs_type, data.ptr(), data.length(), byte_length, aligned_char_length);
   }
   return ret;
 }
@@ -170,23 +208,31 @@ int ObLobInRowQueryIter::get_next_chunk_impl_(ObLobChunk &chunk, const int64_t c
 {
   int ret = OB_SUCCESS;
   int64_t aligned_byte_length = 0;
+  int64_t aligned_char_length = 0;
   if (!is_inited_) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("iter is invalid.", KR(ret));
   } else if (remain_data_.empty()) {
     ret = OB_ITER_END;
-  } else if (OB_FAIL(align_length_(remain_data_, is_reverse_, cs_type_, chunk_size, aligned_byte_length))) {
-    LOG_WARN("failed to align length", KR(ret), K(remain_data_.length()), K(is_reverse_), K(cs_type_), K(chunk_size));
-  } else if (OB_UNLIKELY(aligned_byte_length <= 0 || aligned_byte_length > remain_data_.length())) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("invalid aligned byte length", KR(ret), K(aligned_byte_length), K(remain_data_.length()),
-        K(is_reverse_), K(cs_type_), K(chunk_size));
   } else if (is_reverse_) {
-    chunk.lob_data_.assign_ptr(remain_data_.ptr() + remain_data_.length() - aligned_byte_length, aligned_byte_length);
-    remain_data_.set_length(remain_data_.length() - aligned_byte_length);
+    if (OB_FAIL(align_length_(remain_data_, is_reverse_, cs_type_, chunk_size, aligned_byte_length))) {
+      LOG_WARN("failed to align length", KR(ret), K(remain_data_.length()), K(is_reverse_), K(cs_type_), K(chunk_size));
+    } else {
+      chunk.lob_data_.assign_ptr(remain_data_.ptr() + remain_data_.length() - aligned_byte_length, aligned_byte_length);
+      chunk.char_len_ = static_cast<uint64_t>(
+          ObCharset::strlen_char(cs_type_, chunk.lob_data_.ptr(), chunk.lob_data_.length()));
+      chunk.byte_len_ = static_cast<uint64_t>(aligned_byte_length);
+      remain_data_.set_length(remain_data_.length() - aligned_byte_length);
+    }
   } else {
-    chunk.lob_data_.assign_ptr(remain_data_.ptr(), aligned_byte_length);
-    remain_data_ += aligned_byte_length;
+    if (OB_FAIL(align_forward_chunk_(remain_data_, cs_type_, chunk_size, aligned_byte_length, aligned_char_length))) {
+      LOG_WARN("failed to align forward chunk", KR(ret), K(remain_data_.length()), K(cs_type_), K(chunk_size));
+    } else {
+      chunk.lob_data_.assign_ptr(remain_data_.ptr(), aligned_byte_length);
+      chunk.char_len_ = static_cast<uint64_t>(aligned_char_length);
+      chunk.byte_len_ = static_cast<uint64_t>(aligned_byte_length);
+      remain_data_ += aligned_byte_length;
+    }
   }
   is_end_ = is_end_ || (ret == OB_ITER_END);
 
@@ -326,10 +372,14 @@ int ObLobOutRowQueryIter::get_next_chunk_impl_(ObLobChunk &chunk, const int64_t 
     if (OB_ITER_END != ret) {
       LOG_WARN("failed to get next lob row", KR(ret), K(chunk_size));
     }
+  } else if (OB_UNLIKELY(buffer_.empty())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("buffer is empty", KR(ret), K(chunk_size), K(buffer_.length()));
   } else {
     chunk.lob_data_.assign_ptr(buffer_.ptr(), buffer_.length());
+    chunk.byte_len_ = static_cast<uint64_t>(buffer_.length());
+    chunk.char_len_ = static_cast<uint64_t>(ObCharset::strlen_char(cs_type_, buffer_.ptr(), buffer_.length()));
   }
-
   return ret;
 }
 
@@ -459,6 +509,339 @@ int ObLobAppendSourceIter::get_next_chunk_impl_(ObLobChunk &chunk, const int64_t
     chunk.lob_data_.assign_ptr(buffer_.ptr(), buffer_.length());
   }
   return ret;
+}
+
+/*************ObExternalLobMacroIterator*****************/
+
+int ObExternalLobMacroIterator::init(uint64_t tablet_id,uint64_t seq_id,
+                                     uint64_t offset, uint64_t length)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(is_inited_)) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("external lob piece iterator is initialized twice", KR(ret), K(tablet_id_), K(seq_id_));
+  } else if (OB_UNLIKELY(!common::ObTabletID(tablet_id).is_valid()
+                         || 0 == seq_id || seq_id > INT64_MAX
+                         || offset > INT64_MAX || length > INT64_MAX - offset)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid external lob range or identity", KR(ret), K(tablet_id), K(seq_id), K(offset), K(length));
+  } else if (length > 0) {
+    const uint64_t num_pieces = (offset + length - 1) / PIECE_SIZE - offset / PIECE_SIZE + 1;
+    if (OB_UNLIKELY(num_pieces > MAX_PIECE_COUNT)) {
+      ret = OB_SIZE_OVERFLOW;
+      LOG_WARN("external lob has too many pieces", KR(ret), K(offset), K(length), K(num_pieces));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    tablet_id_ = tablet_id;
+    seq_id_ = seq_id;
+    next_offset_ = offset;
+    end_offset_ = offset + length;
+    is_inited_ = true;
+  }
+  return ret;
+}
+
+int ObExternalLobMacroIterator::get_next(blocksstable::MacroBlockId &macro_id)
+{
+  int ret = OB_SUCCESS;
+  macro_id.reset();
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+  } else if (next_offset_ == end_offset_) {
+    ret = OB_ITER_END;
+  } else {
+    const uint64_t size = std::min(end_offset_ - next_offset_,
+                                   PIECE_SIZE - (next_offset_ % PIECE_SIZE));
+    const uint64_t type = static_cast<uint64_t>(
+                          blocksstable::ObStorageObjectType::SHARED_EXTERNAL_LOB_DATA_MACRO);
+    macro_id.set_storage_object_type(type);
+    macro_id.set_location(blocksstable::ObMacroBlockIdLocation::OBJECT_STORAGE);
+    macro_id.set_second_id(tablet_id_);
+    macro_id.set_third_id(seq_id_);
+    macro_id.set_fourth_id(next_offset_);
+    macro_id.set_fifth_id(size);
+    next_offset_ += size;
+  }
+  return ret;
+}
+
+void ObExternalLobMacroIterator::reset()
+{
+  tablet_id_ = 0;
+  seq_id_ = 0;
+  next_offset_ = 0;
+  end_offset_ = 0;
+  is_inited_ = false;
+}
+
+/*************ObExternalLobQueryIter*****************/
+
+ObExternalLobQueryIter::ObExternalLobQueryIter()
+  : ObLobQueryIter(), allocator_("ExternalLobIter", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID())
+{
+  reset();
+}
+
+int ObExternalLobQueryIter::open(const ObLobReadContext &read_ctx,
+                                 const common::ObExternalBlobInfo &external_info,
+                                 uint64_t tablet_id,
+                                 uint64_t seq_id,
+                                 const common::ObObjectStorageInfo &access_info)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(is_inited_)) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("external lob query iterator is initialized twice", KR(ret), K(tablet_id), K(seq_id));
+  } else if (OB_UNLIKELY(UINT64_MAX == read_ctx.byte_size_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("external lob length must be resolved before opening iterator", KR(ret), K(tablet_id), K(seq_id));
+  } else if (OB_UNLIKELY(!external_info.is_valid()
+             || common::ObExternalBlobKind::REFERENCE != external_info.kind_
+             || read_ctx.is_char() || read_ctx.scan_backward_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid external lob read", KR(ret), K(external_info.kind_),
+             "is_char", read_ctx.is_char(), K(read_ctx.scan_backward_));
+  } else if (OB_FAIL(access_info_.assign(access_info))) {
+    LOG_WARN("failed to copy external lob access info", KR(ret), K(tablet_id), K(seq_id));
+  } else if (OB_FAIL(external_info_.deep_copy(allocator_, external_info))) {
+    LOG_WARN("failed to copy external lob read info", KR(ret));
+  } else if (OB_FAIL(piece_iter_.init(tablet_id, seq_id, external_info_.offset_,
+                                      read_ctx.byte_size_))) {
+    LOG_WARN("failed to initialize external lob pieces", KR(ret));
+  } else {
+    const uint64_t length = read_ctx.byte_size_;
+    const uint64_t offset = std::min(read_ctx.offset_, length);
+    read_start_ = external_info.offset_ + offset;
+    read_end_ = read_start_ + std::min(read_ctx.len_, length - offset);
+    read_pos_ = read_start_;
+    tenant_id_ = read_ctx.tenant_id_;
+    timeout_us_ = read_ctx.timeout_;
+    is_inited_ = true;
+  }
+  return ret;
+}
+
+int ObExternalLobQueryIter::check_etag_still_match()
+{
+  int ret = OB_SUCCESS;
+  common::ObIODFileStat statbuf(tenant_id_);
+  ObString head_etag;
+  // A range error does not prove that the If-Match condition was satisfied.
+  if (OB_FAIL(THIS_WORKER.check_status())) {
+    LOG_WARN("external lob HEAD status check failed", KR(ret), K(read_pos_));
+  } else {
+    const int64_t remaining_us = timeout_us_ - common::ObTimeUtility::current_time_us();
+    if (OB_UNLIKELY(remaining_us <= 0)) {
+      ret = OB_TIMEOUT;
+      LOG_WARN("external lob HEAD deadline reached", KR(ret), K(read_pos_), K(timeout_us_));
+    } else if (OB_FAIL(common::ObExternalIoAdapter::get_file_stat(
+        external_info_.url_, &access_info_, statbuf, static_cast<uint64_t>(remaining_us)))) {
+      LOG_WARN("failed to HEAD external lob at EOF", KR(ret), K(tenant_id_), K(read_pos_));
+    } else if (FALSE_IT(head_etag = ObString(statbuf.etag_.length(), statbuf.etag_.ptr()))) {
+    // HEAD responses may include double quotes around the ETag.
+    } else if (!external_info_.etag_.compare_equal(ObLobUtil::split_etag_quotes(head_etag))) {
+      ret = OB_OBJECT_STORAGE_CONDITION_NOT_MATCH;
+      LOG_WARN("external lob etag does not match at EOF", KR(ret), K(tenant_id_), K(read_pos_));
+    }
+  }
+  return ret;
+}
+
+int ObExternalLobQueryIter::get_next_block(ObString &block_data)
+{
+  int ret = OB_SUCCESS;
+  blocksstable::MacroBlockId macro_id;
+  const int64_t remaining_us = timeout_us_ - common::ObTimeUtility::current_time_us();
+  if (reached_eof_ || read_start_ == read_end_) {
+    ret = OB_ITER_END;
+  } else {
+    // Skip pre-query macroblocks by ID without IO; read matching blocks in full.
+    do {
+      ret = piece_iter_.get_next(macro_id); // fourth_id: offset; fifth_id: length
+    } while (OB_SUCC(ret) && macro_id.fourth_id() + macro_id.fifth_id() <= read_start_);
+    if (OB_SUCC(ret) && macro_id.fourth_id() >= read_end_) {
+      ret = OB_ITER_END;
+    }
+  }
+  if (OB_FAIL(ret)) {
+    if (OB_ITER_END != ret) {
+      LOG_WARN("failed to get external lob piece", KR(ret), K(read_start_), K(read_end_), K(read_pos_));
+    }
+  } else if (OB_UNLIKELY(remaining_us <= 0)) {
+    ret = OB_TIMEOUT;
+    LOG_WARN("external lob read timed out", KR(ret), K(macro_id), K(timeout_us_), K(remaining_us));
+  } else {
+    if (OB_ISNULL(io_buffer_)) {
+      io_buffer_ = static_cast<char *>(allocator_.alloc(ObExternalLobMacroIterator::PIECE_SIZE));
+      if (OB_ISNULL(io_buffer_)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate external lob IO buffer", KR(ret), K(tenant_id_),
+                 "alloc_size", ObExternalLobMacroIterator::PIECE_SIZE);
+      }
+    }
+    if (OB_SUCC(ret)) {
+      // Release handle after consuming prior data to keep callback memory and IO buffers valid.
+      io_handle_.reset();
+      blocksstable::ObStorageObjectReadInfo read_info;
+      read_info.macro_block_id_ = macro_id;
+      read_info.offset_ = 0;
+      read_info.size_ = macro_id.fifth_id();
+      read_info.io_timeout_ms_ = std::max(int64_t(1), remaining_us / 1000);
+      read_info.io_desc_.set_mode(common::ObIOMode::READ);
+      read_info.io_desc_.set_wait_event(ObWaitEventIds::DB_FILE_DATA_READ);
+      read_info.mtl_tenant_id_ = tenant_id_;
+      read_info.buf_ = io_buffer_;
+      read_info.path_ = external_info_.url_;
+      read_info.etag_ = external_info_.etag_;
+      read_info.access_info_ = &access_info_;
+      if (OB_FAIL(blocksstable::ObObjectManager::read_object(read_info, io_handle_))) {
+        if (OB_DATA_OUT_OF_RANGE == ret && (0 == macro_id.fourth_id() || read_pos_ > read_start_)) {
+          // InvalidRange at object offset 0 means empty; after returned data it means EOF.
+          if (!external_info_.etag_.empty() && OB_FAIL(check_etag_still_match())) {
+            // check if the object still match the etag for the last marco
+            LOG_WARN("failed to validate external lob etag at EOF", KR(ret), K(macro_id), K(read_pos_));
+          } else {
+            reached_eof_ = true;
+            ret = OB_ITER_END;
+          }
+        } else {
+          LOG_WARN("failed to read external lob piece", KR(ret), K(macro_id), K(read_pos_));
+        }
+      } else {
+        const int64_t actual_size = io_handle_.get_data_size();
+        if (OB_UNLIKELY(actual_size < 0 || actual_size > read_info.size_)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid external lob read size", KR(ret), K(actual_size), K(macro_id));
+        } else {
+          // Short blocks require EOF; no zero padding or changes to the declared range's cache ID.
+          reached_eof_ = actual_size < read_info.size_;
+          const uint64_t piece_start = macro_id.fourth_id();
+          const uint64_t data_start = std::max(piece_start, read_start_);
+          const uint64_t data_end = std::min(piece_start + actual_size, read_end_);
+          // Cache the full original block; trim only the caller's view, with no zero padding.
+          if (data_start >= data_end) {
+            block_data.reset();
+            ret = (read_pos_ > read_start_) ? OB_ITER_END : OB_DATA_OUT_OF_RANGE;
+          } else {
+            block_data.assign_ptr(io_buffer_ + (data_start - piece_start), data_end - data_start);
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObExternalLobQueryIter::get_next_row(ObString &buffer)
+{
+  int ret = OB_SUCCESS;
+  const int64_t original_length = buffer.length();
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("external lob query iterator is not initialized", KR(ret), K(read_pos_), K(read_end_));
+  } else if (OB_ISNULL(buffer.ptr()) || OB_UNLIKELY(buffer.remain() <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid external lob output buffer", KR(ret), KP(buffer.ptr()), K(buffer.length()), K(buffer.remain()));
+  } else {
+    bool has_fill_full = false;
+    ObString block_data;
+    ObString remain_data;
+    while (OB_SUCC(ret) && !has_fill_full) {
+      // Consume all remaining data from the previous block before reading the next block.
+      if (OB_FAIL(THIS_WORKER.check_status())) {
+        LOG_WARN("external lob read status check failed", KR(ret), K(read_pos_), K(read_end_));
+      } else if (OB_FAIL(fill_buffer_(buffer, remaining_data_, remain_data))) {
+        LOG_WARN("failed to copy external lob data", KR(ret), K(buffer.remain()),
+                 "remaining_length", remaining_data_.length());
+      } else if (FALSE_IT(read_pos_ += remaining_data_.length() - remain_data.length())) {
+      } else if (0 == buffer.remain() || remain_data.length() > 0) {
+        has_fill_full = true;
+        remaining_data_ = remain_data;
+      } else if (OB_FALSE_IT(remaining_data_.reset())) {
+      } else if (OB_FAIL(get_next_block(block_data))) {
+        if (OB_ITER_END == ret) {
+          // No more data.
+        } else if (OB_OBJECT_STORAGE_CONDITION_NOT_MATCH == ret) {
+          LOG_USER_ERROR(OB_OBJECT_STORAGE_CONDITION_NOT_MATCH, "ETag mismatch while reading external LOB");
+          LOG_WARN("etag mismatch while reading external LOB", KR(ret), K(read_start_), K(read_end_), K(read_pos_));
+        } else if (OB_DATA_OUT_OF_RANGE == ret) {
+          FORWARD_USER_ERROR_MSG(ret, "External LOB read range out of bounds: offset=%lu, "
+                                 "length=%lu, object=%.*s", read_start_, read_end_ - read_start_,
+                                 external_info_.url_.length(), external_info_.url_.ptr());
+          LOG_WARN("failed to read next external lob block", KR(ret), K(read_start_), K(read_end_), K(read_pos_));
+        } else {
+          LOG_WARN("failed to read next external lob block", KR(ret), K(read_start_), K(read_end_), K(read_pos_));
+        }
+      } else {
+        remaining_data_ = block_data;
+      }
+    }
+    if (OB_ITER_END == ret && buffer.length() > original_length) {
+      ret = OB_SUCCESS;
+    }
+  }
+  is_end_ = is_end_ || (OB_ITER_END == ret);
+  return ret;
+}
+
+int ObExternalLobQueryIter::get_next_chunk_impl_(ObLobChunk &chunk, int64_t chunk_size)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("external lob query iterator is not initialized", KR(ret), K(chunk_size), K(read_pos_));
+  } else {
+    if (OB_ISNULL(buffer_.ptr())) {
+      char *buf = static_cast<char *>(allocator_.alloc(chunk_size));
+      if (OB_ISNULL(buf)) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("failed to allocate external lob chunk buffer", KR(ret), K(chunk_size), K(tenant_id_));
+      } else {
+        buffer_.assign_buffer(buf, chunk_size);
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_UNLIKELY(buffer_.size() != chunk_size)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("chunk size must be equal to the previous one", KR(ret), K(chunk_size), K(buffer_.size()));
+  } else if (FALSE_IT(buffer_.assign_buffer(buffer_.ptr(), buffer_.size()))) {
+  } else if (OB_FAIL(get_next_row(buffer_))) {
+    if (OB_ITER_END != ret) {
+      LOG_WARN("failed to read external lob chunk", KR(ret), K(chunk_size));
+    }
+  } else if (OB_UNLIKELY(buffer_.empty())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("buffer is empty", KR(ret), K(chunk_size), K(buffer_.length()));
+  } else {
+    chunk.lob_data_.assign_ptr(buffer_.ptr(), buffer_.length());
+    chunk.byte_len_ = static_cast<uint64_t>(buffer_.length());
+    chunk.char_len_ = chunk.byte_len_; // For binary-LOB, char_len==byte_len
+  }
+  return ret;
+}
+
+void ObExternalLobQueryIter::reset()
+{
+  // Reset of the last IO handle cancels pending IO and excludes concurrent copies to user buffers.
+  // Close the handle before freeing the arena, including on timeout.
+  io_handle_.reset();
+  remaining_data_.reset();
+  buffer_.reset();
+  allocator_.reset();
+  io_buffer_ = nullptr;
+  external_info_ = common::ObExternalBlobInfo();
+  piece_iter_.reset();
+  access_info_.reset();
+  tenant_id_ = 0;
+  read_start_ = 0;
+  read_end_ = 0;
+  read_pos_ = 0;
+  timeout_us_ = 0;
+  reached_eof_ = false;
+  is_end_ = false;
+  is_inited_ = false;
 }
 
 } // storage

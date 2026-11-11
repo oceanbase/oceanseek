@@ -115,16 +115,28 @@ inline bool is_allow_when_create_tenant(const obrpc::ObRpcPacketCode pcode)
   return bret;
 }
 
-// Allow meta tenant builtin user table DDL (e.g. STEP 7) while tenant is creating.
-inline bool is_allow_meta_user_table_ddl_when_create_tenant(
-    const obrpc::ObRpcPacketCode pcode, const uint64_t tenant_id)
+// Allow builtin auxiliary-table DDL while a meta/user tenant is being created.
+inline bool is_allow_builtin_user_table_ddl_when_create_tenant(
+    const obrpc::ObRpcPacketCode pcode,
+    const uint64_t tenant_id,
+    const obrpc::ObDDLArg *ddl_arg)
 {
-  return is_meta_tenant(tenant_id)
-         && (obrpc::OB_PARALLEL_CREATE_TABLE == pcode
-             || obrpc::OB_CREATE_TABLE == pcode
-             || obrpc::OB_PARALLEL_CREATE_TABLE_LIKE == pcode
-             || obrpc::OB_ALTER_TABLE == pcode
-             || obrpc::OB_CREATE_TABLEGROUP == pcode);
+  bool allow = false;
+  if (is_meta_tenant(tenant_id)) {
+    allow = obrpc::OB_PARALLEL_CREATE_TABLE == pcode
+        || obrpc::OB_CREATE_TABLE == pcode
+        || obrpc::OB_PARALLEL_CREATE_TABLE_LIKE == pcode
+        || obrpc::OB_ALTER_TABLE == pcode
+        || obrpc::OB_CREATE_TABLEGROUP == pcode;
+  } else if (is_user_tenant(tenant_id) && OB_NOT_NULL(ddl_arg)) {
+    if (obrpc::OB_PARALLEL_CREATE_TABLE == pcode || obrpc::OB_CREATE_TABLE == pcode) {
+      const obrpc::ObCreateTableArg *create_table_arg =
+          static_cast<const obrpc::ObCreateTableArg *>(ddl_arg);
+      allow = create_table_arg->is_inner_
+          && create_table_arg->schema_.is_aux_outtable_lob_control_table();
+    }
+  }
+  return allow;
 }
 inline bool is_allow_when_drop_tenant(const obrpc::ObRpcPacketCode pcode)
 {
@@ -331,7 +343,8 @@ protected:
                   }
                 } else if (tenant_schema->is_creating()) {
                   if (!is_allow_when_create_tenant(pcode)
-                      && !is_allow_meta_user_table_ddl_when_create_tenant(pcode, tenant_id)) {
+                      && !is_allow_builtin_user_table_ddl_when_create_tenant(
+                          pcode, tenant_id, ddl_arg_)) {
                     ret = OB_OP_NOT_ALLOW;
                     RS_LOG(WARN, "ddl operation during creating tenant not allowed", K(ret), K(ddl_arg_));
                     LOG_USER_ERROR(OB_OP_NOT_ALLOW, "ddl operation during creating tenant");

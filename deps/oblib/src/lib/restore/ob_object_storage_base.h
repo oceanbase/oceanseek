@@ -175,6 +175,10 @@ public:
   static uint64_t get_io_group_id();
   static int64_t get_timeout_ms();
 
+protected:
+  // Keep the saved timeout unchanged so destruction restores the outer scope.
+  void set_timeout_us(const int64_t timeout_us) { tl_timeout_us_ = timeout_us; }
+
 private:
   static thread_local uint64_t tl_tenant_id_;
   uint64_t old_tenant_id_;

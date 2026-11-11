@@ -136,6 +136,7 @@ public:
   virtual ~ObDirectLoadOriginTableScanner() = default;
   int init(ObDirectLoadOriginTable *table, bool skip_read_lob, bool skip_del_row);
   int open(const blocksstable::ObDatumRange &query_range);
+  bool is_lob_piece_table() const { return schema_param_.is_lob_piece_table(); }
 
 protected:
   virtual void reset() override;

@@ -736,7 +736,7 @@ int ObStorageUtil::get_file_stat(
     const common::ObString &uri, const bool is_adaptive, ObIODFileStat &statbuf)
 {
   int ret = OB_SUCCESS;
-  statbuf = ObIODFileStat();
+  statbuf.reset();
   const int64_t start_ts = ObTimeUtility::current_time();
   ObStorageObjectMeta obj_meta;
   OBJECT_STORAGE_GUARD(storage_info_, uri, IO_HANDLED_SIZE_ZERO);
@@ -760,8 +760,15 @@ int ObStorageUtil::get_file_stat(
   } else {
     statbuf.size_ = obj_meta.length_;
     statbuf.mtime_s_ = obj_meta.mtime_s_;
+    if (!obj_meta.digest_.empty()) {
+      if (OB_FAIL(statbuf.etag_.assign(obj_meta.digest_))) {
+        OB_LOG(WARN, "failed to copy object etag to file stat", K(ret), K(uri), K(obj_meta));
+      }
+    }
     // The storage metadata carries the file type, but not POSIX permissions.
-    statbuf.mode_ = obj_meta.is_dir_type() ? S_IFDIR : S_IFREG;
+    if (OB_SUCC(ret)) {
+      statbuf.mode_ = obj_meta.is_dir_type() ? S_IFDIR : S_IFREG;
+    }
   }
 
   return ret;
@@ -1857,6 +1864,34 @@ int ObStorageReader::open(const common::ObString &uri,
       EVENT_INC(ObStatEventIds::OBJECT_STORAGE_IO_HEAD_FAIL_COUNT);
     }
     EVENT_INC(ObStatEventIds::OBJECT_STORAGE_IO_HEAD_COUNT);
+  }
+  return ret;
+}
+
+int ObStorageReader::open(
+    const common::ObString &uri,
+    common::ObObjectStorageInfo *storage_info,
+    const bool head_meta,
+    const char *etag)
+{
+  int ret = OB_SUCCESS;
+  int tmp_ret = OB_SUCCESS;
+  if (OB_ISNULL(etag)) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "invalid argument", K(ret), KP(etag));
+  } else if (OB_FAIL(open(uri, storage_info, head_meta))) {
+    STORAGE_LOG(WARN, "failed to open reader", K(ret), K(uri), KPC(storage_info), K(head_meta));
+  } else if (OB_UNLIKELY(OB_STORAGE_HANDLE_OBDAL != handle_type_)) {
+    ret = OB_NOT_SUPPORTED;
+    STORAGE_LOG(WARN, "if-match requires obdal reader", K(ret), K(uri), K(handle_type_));
+  } else if (OB_FAIL(reader_union_.obdal_reader_.set_if_match_etag(etag))) {
+    STORAGE_LOG(WARN, "failed to set if-match etag", K(ret), K(uri));
+  }
+
+  if (OB_FAIL(ret) && OB_NOT_NULL(reader_)) {
+    if (OB_SUCCESS != (tmp_ret = close())) {
+      STORAGE_LOG(WARN, "failed to close reader", K(ret), K(tmp_ret), K(uri));
+    }
   }
   return ret;
 }

@@ -5,14 +5,19 @@
 
 #include <gtest/gtest.h>
 #include <cstring>
+#include <string>
 
 #define protected public
 #define private public
 
 #include "lib/allocator/page_arena.h"
+#include "storage/access/ob_dml_param.h"
+#include "storage/blocksstable/ob_storage_object_handle.h"
 #include "storage/lob/access/ob_lob_iterator.h"
+#include "storage/lob/common/ob_outtable_lob_control_key.h"
 #include "storage/lob/ob_lob_manager.h"
 #include "storage/lob/store/ob_lob_persistent_iterator.h"
+#include "storage/lob/store/ob_lob_outtable_io.h"
 #include "storage/lob/store/ob_lob_meta.h"
 #include "storage/lob/store/ob_lob_store_common.h"
 
@@ -53,6 +58,7 @@ public:
     return ret;
   }
 
+  ObArenaAllocator external_info_allocator_;
   ObLobManager lob_manager_;
 };
 
@@ -72,16 +78,94 @@ static ObString make_data(ObIAllocator &allocator, const char *unit, int64_t rep
 }
 
 //==================== ObLobMetaExtraInfo ====================
+TEST_F(TestLobChunkSpliter, external_lob_index_insert_is_not_supported)
+{
+  ObArenaAllocator allocator;
+  ObExternalBlobInfo info;
+  info.url_ = ObString::make_string("s3://bucket/object");
+  info.offset_ = 3;
+  info.length_ = 1;
+  info.kind_ = ObExternalBlobKind::REFERENCE;
+  ObMemLobLocatorBuilder builder;
+  ObLobLocatorV2 locator;
+  ASSERT_EQ(OB_SUCCESS, builder.init(allocator));
+  ASSERT_EQ(OB_SUCCESS, builder.set_external_lob_info(info));
+  ASSERT_EQ(OB_SUCCESS, builder.build(locator));
+
+  ObLobInsertContext ctx;
+  ctx.src_loc_ = locator;
+  ASSERT_EQ(OB_SUCCESS, ctx.init_src_loc_wrapper_());
+  ASSERT_FALSE(ctx.src_loc_wrapper_.is_valid());
+  uint64_t byte_len = 0;
+  ASSERT_EQ(OB_SUCCESS, lob_manager_.get_byte_length(locator, byte_len));
+  ASSERT_EQ(1, byte_len);
+
+  // External references must use outrow even with a small declared length; they are not inrow data.
+  ctx.is_index_table_ = true;
+  bool outrow = false;
+  ASSERT_EQ(OB_NOT_SUPPORTED, lob_manager_.insert_before(ctx, outrow));
+}
+
 TEST_F(TestLobChunkSpliter, lob_meta_extra_info_old_summary_defaults_to_insert)
 {
   const ObString old_summary = ObString::make_string(
       "{\"extra_info_type\":1,\"lob_chunk_type\":\"IN_TABLE\",\"chunk_count\":3}");
   ObLobMetaExtraInfo extra_info;
   extra_info.last_write_type_ = ObLobLastWriteType::APPEND;
+  ObExternalBlobInfo external_lob_info;
+  external_lob_info.url_ = ObString::make_string("s3://bucket/old");
+  external_lob_info.etag_ = ObString::make_string("old-etag");
+  external_lob_info.offset_ = 1;
+  external_lob_info.length_ = 2;
+  external_lob_info.kind_ = ObExternalBlobKind::REFERENCE;
+  ASSERT_EQ(OB_SUCCESS, extra_info.set_external_lob_info(external_info_allocator_,
+      external_lob_info));
 
-  ASSERT_EQ(OB_SUCCESS, extra_info.deserialize(old_summary));
+  ASSERT_EQ(OB_SUCCESS, extra_info.deserialize(external_info_allocator_, old_summary));
   ASSERT_EQ(ObLobMetaExtraInfo::LOB_META_SUMMARY, extra_info.extra_info_type_);
+  ASSERT_TRUE(extra_info.lob_chunk_type_.in_table());
   ASSERT_EQ(ObLobLastWriteType::INSERT, extra_info.last_write_type_);
+  ASSERT_EQ(3, extra_info.chunk_count_);
+  ASSERT_FALSE(extra_info.is_external_lob());
+  ASSERT_FALSE(extra_info.external_lob_info_.is_valid());
+  ASSERT_TRUE(extra_info.external_lob_info_.etag_.empty());
+}
+
+TEST_F(TestLobChunkSpliter, lob_meta_extra_info_legacy_invalid_type_round_trip)
+{
+  const ObString old_summary = ObString::make_string(
+      "{\"extra_info_type\":1,\"lob_chunk_type\":\"INVALID_TYPE\",\"chunk_count\":3}");
+  ObLobMetaExtraInfo extra_info;
+  ASSERT_EQ(OB_SUCCESS, extra_info.deserialize(external_info_allocator_, old_summary));
+  ASSERT_TRUE(extra_info.lob_chunk_type_.in_table());
+  ASSERT_EQ(ObLobLastWriteType::INSERT, extra_info.last_write_type_);
+
+  ObString serialized;
+  ASSERT_EQ(OB_SUCCESS, extra_info.serialize(external_info_allocator_, serialized));
+  ObLobMetaExtraInfo decoded;
+  ASSERT_EQ(OB_SUCCESS, decoded.deserialize(external_info_allocator_, serialized));
+  ASSERT_TRUE(decoded.lob_chunk_type_.in_table());
+  ASSERT_EQ(3, decoded.chunk_count_);
+}
+
+TEST_F(TestLobChunkSpliter, lob_meta_extra_info_uses_lob_chunk_type)
+{
+  ObArenaAllocator allocator;
+  ObString serialized;
+  ObLobMetaExtraInfo source;
+  source.extra_info_type_ = ObLobMetaExtraInfo::LOB_DATA;
+  source.lob_chunk_type_.set_out_table();
+
+  ASSERT_EQ(OB_SUCCESS, source.serialize(allocator, serialized));
+  const std::string json(serialized.ptr(), serialized.length());
+  ASSERT_NE(std::string::npos, json.find("\"lob_chunk_type\""));
+  ASSERT_EQ(std::string::npos, json.find("\"is_no_logging\""));
+  ASSERT_EQ(std::string::npos, json.find("storage_type"));
+
+  ObLobMetaExtraInfo decoded;
+  ASSERT_EQ(OB_SUCCESS, decoded.deserialize(external_info_allocator_, serialized));
+  ASSERT_EQ(ObLobMetaExtraInfo::LOB_DATA, decoded.extra_info_type_);
+  ASSERT_TRUE(decoded.lob_chunk_type_.out_table());
 }
 
 TEST_F(TestLobChunkSpliter, lob_meta_extra_info_rejects_invalid_last_write_type)
@@ -91,7 +175,398 @@ TEST_F(TestLobChunkSpliter, lob_meta_extra_info_rejects_invalid_last_write_type)
       "\"chunk_count\":3,\"last_write_type\":99}");
   ObLobMetaExtraInfo extra_info;
 
-  ASSERT_EQ(OB_INVALID_ARGUMENT, extra_info.deserialize(invalid_summary));
+  ASSERT_EQ(OB_INVALID_ARGUMENT, extra_info.deserialize(external_info_allocator_, invalid_summary));
+}
+
+TEST_F(TestLobChunkSpliter, external_summary_strings_outlive_input)
+{
+  ObArenaAllocator input_allocator;
+  ObArenaAllocator allocator;
+  ObLobMetaExtraInfo source;
+  ObExternalBlobInfo info;
+  info.url_ = ObString::make_string("s3://bucket/object");
+  info.etag_ = ObString::make_string("etag");
+  info.length_ = 9;
+  info.kind_ = ObExternalBlobKind::REFERENCE;
+  source.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
+  ASSERT_EQ(OB_SUCCESS, source.set_external_lob_info(input_allocator, info));
+  ObString serialized;
+  ASSERT_EQ(OB_SUCCESS, source.serialize(input_allocator, serialized));
+  ObLobMetaExtraInfo decoded;
+  ASSERT_EQ(OB_SUCCESS, decoded.deserialize(allocator, serialized));
+  source.reset();
+  input_allocator.reset();
+  EXPECT_EQ(0, decoded.external_lob_info_.url_.compare("s3://bucket/object"));
+  EXPECT_EQ(0, decoded.external_lob_info_.etag_.compare("etag"));
+  EXPECT_EQ(9, decoded.external_lob_info_.length_);
+}
+
+TEST_F(TestLobChunkSpliter, external_lob_meta_extra_info_round_trip)
+{
+  ObArenaAllocator allocator;
+  ObExternalBlobInfo external_lob_info;
+  external_lob_info.url_ = ObString::make_string("s3://bucket/path\\\"name");
+  const ObString etag = ObString::make_string("etag-\\\"value");
+  external_lob_info.etag_ = etag;
+  external_lob_info.offset_ = 3 * 1024 * 1024;
+  external_lob_info.length_ = 10 * 1024 * 1024;
+  external_lob_info.kind_ = ObExternalBlobKind::REFERENCE;
+
+  ObLobMetaExtraInfo source;
+  source.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
+  source.chunk_count_ = 5;
+  source.last_write_type_ = ObLobLastWriteType::INSERT;
+  ASSERT_EQ(OB_SUCCESS, source.set_external_lob_info(external_info_allocator_, external_lob_info));
+
+  ObString serialized;
+  ASSERT_EQ(OB_SUCCESS, source.serialize(allocator, serialized));
+
+  ObLobMetaExtraInfo decoded;
+  ASSERT_EQ(OB_SUCCESS, decoded.deserialize(external_info_allocator_, serialized));
+  ASSERT_TRUE(decoded.is_external_lob());
+  ASSERT_TRUE(decoded.lob_chunk_type_.external_reference());
+  ASSERT_EQ(ObLobMetaExtraInfo::LOB_META_SUMMARY, decoded.extra_info_type_);
+  ASSERT_EQ(5, decoded.chunk_count_);
+  ASSERT_EQ(0, decoded.external_lob_info_.url_.compare(
+                   external_lob_info.url_));
+  ASSERT_EQ(0, decoded.external_lob_info_.etag_.compare(etag));
+  ASSERT_EQ(external_lob_info.offset_, decoded.external_lob_info_.offset_);
+  ASSERT_EQ(external_lob_info.length_, decoded.external_lob_info_.length_);
+  ASSERT_EQ(ObExternalBlobKind::REFERENCE, decoded.external_lob_info_.kind_);
+
+  source.reset();
+  external_lob_info.etag_.reset();
+  ASSERT_FALSE(source.is_external_lob());
+  ASSERT_TRUE(source.external_lob_info_.etag_.empty());
+  ASSERT_EQ(0, decoded.external_lob_info_.etag_.compare(etag));
+}
+
+TEST_F(TestLobChunkSpliter, external_lob_meta_round_trip_without_identity)
+{
+  ObArenaAllocator allocator;
+  ObExternalBlobInfo external_lob_info;
+  external_lob_info.url_ = ObString::make_string("s3://bucket/object");
+  external_lob_info.length_ = 1;
+  external_lob_info.kind_ = ObExternalBlobKind::REFERENCE;
+
+  ObLobMetaExtraInfo source;
+  source.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
+  source.chunk_count_ = 1;
+  ASSERT_EQ(OB_SUCCESS, source.set_external_lob_info(external_info_allocator_, external_lob_info));
+  ASSERT_TRUE(source.is_valid());
+  ObString serialized;
+  ASSERT_EQ(OB_SUCCESS, source.serialize(allocator, serialized));
+  const std::string json(serialized.ptr(), serialized.length());
+  ASSERT_EQ(std::string::npos, json.find("\"is_external_lob\""));
+  ASSERT_NE(std::string::npos, json.find("\"EXTERNAL_REFERENCE\""));
+  ASSERT_EQ(std::string::npos, json.find("\"external_lob_location_id\""));
+  ASSERT_EQ(std::string::npos, json.find("\"external_lob_tablet_id\""));
+  ASSERT_EQ(std::string::npos, json.find("\"external_lob_seq_id\""));
+
+  ObLobMetaExtraInfo decoded;
+  ASSERT_EQ(OB_SUCCESS, decoded.deserialize(external_info_allocator_, serialized));
+  ASSERT_TRUE(decoded.is_valid());
+  ASSERT_TRUE(decoded.is_external_lob());
+  ASSERT_TRUE(decoded.lob_chunk_type_.external_reference());
+  ASSERT_EQ(1, decoded.external_lob_info_.length_);
+}
+
+TEST_F(TestLobChunkSpliter, external_lob_meta_etag_compatibility_and_bounds)
+{
+  const std::string prefix =
+      "{\"extra_info_type\":1,\"lob_chunk_type\":\"EXTERNAL_REFERENCE\","
+      "\"chunk_count\":1,\"last_write_type\":0,"
+      "\"external_lob_url\":\"s3://bucket/object\","
+      "\"external_lob_offset\":0,\"external_lob_length\":1,"
+      "\"external_lob_has_length\":true,"
+      "\"external_lob_kind\":0";
+  ObLobMetaExtraInfo extra_info;
+  extra_info.external_lob_info_.etag_ = ObString::make_string("old");
+
+  // ETag is optional; clear its previous value when reusing the object.
+  const std::string no_etag_summary = prefix + "}";
+  ASSERT_EQ(OB_SUCCESS, extra_info.deserialize(
+      external_info_allocator_, ObString(no_etag_summary.length(), no_etag_summary.data())));
+  ASSERT_TRUE(extra_info.is_external_lob());
+  ASSERT_TRUE(extra_info.lob_chunk_type_.external_reference());
+  ASSERT_TRUE(extra_info.external_lob_info_.etag_.empty());
+  ObArenaAllocator allocator;
+  ObString serialized;
+  ASSERT_EQ(OB_SUCCESS, extra_info.serialize(allocator, serialized));
+  ASSERT_FALSE(serialized.empty());
+  ASSERT_NE(std::string::npos,
+            std::string(serialized.ptr(), serialized.length()).find(
+                "\"external_lob_etag\""));
+  ObLobMetaExtraInfo decoded;
+  ASSERT_EQ(OB_SUCCESS, decoded.deserialize(external_info_allocator_, serialized));
+  ASSERT_TRUE(decoded.external_lob_info_.etag_.empty());
+
+  // ETag content must be shorter than OB_ETAG_CAPACITY.
+  const std::string etag(OB_ETAG_CAPACITY - 1, 'x');
+  const std::string summary = prefix + ",\"external_lob_etag\":\""
+      + etag + "\"}";
+  ASSERT_EQ(OB_SUCCESS, extra_info.deserialize(
+      external_info_allocator_, ObString(summary.length(), summary.data())));
+  ASSERT_EQ(OB_SUCCESS, extra_info.serialize(allocator, serialized));
+  ASSERT_EQ(OB_SUCCESS, decoded.deserialize(external_info_allocator_, serialized));
+  ASSERT_EQ(0, decoded.external_lob_info_.etag_.compare(
+                   ObString(etag.length(), etag.data())));
+
+  const std::string invalid_etags[] = {
+      "17", "null", "true", "[]", "{}", "\"first\\u0000last\"",
+      "\"" + std::string(OB_ETAG_CAPACITY, 'x') + "\""};
+  for (const std::string &invalid_etag : invalid_etags) {
+    SCOPED_TRACE(invalid_etag);
+    const std::string invalid_summary =
+        prefix + ",\"external_lob_etag\":" + invalid_etag + "}";
+    EXPECT_EQ(OB_INVALID_ARGUMENT, extra_info.deserialize(
+        external_info_allocator_, ObString(invalid_summary.length(), invalid_summary.data())));
+    EXPECT_EQ(0, extra_info.external_lob_info_.etag_.compare(
+                     ObString(etag.length(), etag.data())));
+  }
+}
+
+TEST_F(TestLobChunkSpliter,
+       external_lob_meta_extra_info_rejects_invalid_input_atomically)
+{
+  ObExternalBlobInfo external_lob_info;
+  external_lob_info.url_ = ObString::make_string("s3://bucket/original");
+  external_lob_info.etag_ = ObString::make_string("original-etag");
+  external_lob_info.offset_ = 11;
+  external_lob_info.length_ = 22;
+  external_lob_info.kind_ = ObExternalBlobKind::REFERENCE;
+  ObLobMetaExtraInfo extra_info;
+  extra_info.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
+  extra_info.chunk_count_ = 7;
+  extra_info.last_write_type_ = ObLobLastWriteType::APPEND;
+  ASSERT_EQ(OB_SUCCESS, extra_info.set_external_lob_info(external_info_allocator_,
+      external_lob_info));
+
+  const ObString invalid_summary = ObString::make_string(
+      "{\"extra_info_type\":1,\"lob_chunk_type\":\"EXTERNAL_REFERENCE\","
+      "\"chunk_count\":1,\"last_write_type\":0,"
+      "\"external_lob_url\":\"s3://bucket/invalid\","
+      "\"external_lob_offset\":1,\"external_lob_length\":0,"
+      "\"external_lob_has_length\":false,"
+      "\"external_lob_kind\":0}");
+  ASSERT_EQ(OB_INVALID_ARGUMENT, extra_info.deserialize(external_info_allocator_, invalid_summary));
+  const auto expect_unchanged = [&extra_info]() {
+    EXPECT_EQ(ObLobMetaExtraInfo::LOB_META_SUMMARY,
+              extra_info.extra_info_type_);
+    EXPECT_TRUE(extra_info.is_external_lob());
+    EXPECT_TRUE(extra_info.lob_chunk_type_.external_reference());
+    EXPECT_EQ(7, extra_info.chunk_count_);
+    EXPECT_EQ(ObLobLastWriteType::APPEND, extra_info.last_write_type_);
+    EXPECT_EQ(0, extra_info.external_lob_info_.url_.compare(
+                     ObString::make_string("s3://bucket/original")));
+    EXPECT_EQ(0, extra_info.external_lob_info_.etag_.compare(
+                     ObString::make_string("original-etag")));
+    EXPECT_EQ(11, extra_info.external_lob_info_.offset_);
+    EXPECT_EQ(22, extra_info.external_lob_info_.length_);
+    EXPECT_EQ(ObExternalBlobKind::REFERENCE,
+              extra_info.external_lob_info_.kind_);
+  };
+  expect_unchanged();
+
+  const std::string external_fields =
+      "\"external_lob_url\":\"s3://bucket/object\","
+      "\"external_lob_offset\":0,\"external_lob_length\":1,"
+      "\"external_lob_has_length\":true,"
+      "\"external_lob_kind\":0}";
+  const std::string valid_summary =
+      "{\"extra_info_type\":1,\"lob_chunk_type\":\"EXTERNAL_REFERENCE\","
+      "\"chunk_count\":1,\"last_write_type\":0," + external_fields;
+  ObLobMetaExtraInfo valid_extra_info;
+  ASSERT_EQ(OB_SUCCESS, valid_extra_info.deserialize(
+      external_info_allocator_, ObString(valid_summary.length(), valid_summary.data())));
+  const std::string invalid_types[] = {
+      "{\"extra_info_type\":1,\"lob_chunk_type\":\"IN_TABLE\","
+      "\"chunk_count\":1,\"last_write_type\":0,",
+      "{\"extra_info_type\":2,\"lob_chunk_type\":\"EXTERNAL_REFERENCE\","
+      "\"chunk_count\":1,",
+      "{\"extra_info_type\":2,\"lob_chunk_type\":\"IN_TABLE\","
+      "\"chunk_count\":1,"};
+  for (const std::string &prefix : invalid_types) {
+    const std::string summary = prefix + external_fields;
+    SCOPED_TRACE(summary);
+    EXPECT_EQ(OB_INVALID_ARGUMENT, extra_info.deserialize(
+        external_info_allocator_, ObString(summary.length(), summary.data())));
+    expect_unchanged();
+  }
+
+  // External references need full descriptors; missing required fields must preserve the old value.
+  const std::string required_fields[] = {
+      "\"external_lob_url\":\"s3://bucket/object\"",
+      "\"external_lob_offset\":0", "\"external_lob_length\":1",
+      "\"external_lob_has_length\":true",
+      "\"external_lob_kind\":0"};
+  for (int64_t missing = 0; missing < 5; ++missing) {
+    SCOPED_TRACE(required_fields[missing]);
+    std::string summary =
+        "{\"extra_info_type\":1,\"lob_chunk_type\":\"EXTERNAL_REFERENCE\","
+        "\"chunk_count\":1,\"last_write_type\":0";
+    for (int64_t field = 0; field < 5; ++field) {
+      if (field != missing) {
+        summary += "," + required_fields[field];
+      }
+    }
+    summary += "}";
+    EXPECT_NE(OB_SUCCESS, extra_info.deserialize(
+        external_info_allocator_, ObString(summary.length(), summary.data())));
+    expect_unchanged();
+  }
+
+  ASSERT_EQ(OB_SUCCESS,
+            extra_info.set_external_lob_info(external_info_allocator_,
+                extra_info.external_lob_info_));
+  ASSERT_EQ(0, extra_info.external_lob_info_.url_.compare(
+                   ObString::make_string("s3://bucket/original")));
+  ASSERT_EQ(11, extra_info.external_lob_info_.offset_);
+  ASSERT_EQ(22, extra_info.external_lob_info_.length_);
+
+  external_lob_info.length_ = 0;
+  external_lob_info.has_length_ = false;
+  ASSERT_EQ(OB_INVALID_ARGUMENT,
+            extra_info.set_external_lob_info(external_info_allocator_, external_lob_info));
+  external_lob_info.length_ = 22;
+  external_lob_info.has_length_ = true;
+  external_lob_info.offset_ = UINT64_MAX;
+  ASSERT_EQ(OB_INVALID_ARGUMENT,
+            extra_info.set_external_lob_info(external_info_allocator_, external_lob_info));
+  ASSERT_EQ(11, extra_info.external_lob_info_.offset_);
+  ASSERT_EQ(22, extra_info.external_lob_info_.length_);
+}
+
+TEST_F(TestLobChunkSpliter, external_lob_meta_rejects_zero_length)
+{
+  ObExternalBlobInfo external_lob_info;
+  external_lob_info.url_ = ObString::make_string("s3://bucket/empty");
+  external_lob_info.length_ = 0;
+  external_lob_info.has_length_ = true;
+  external_lob_info.kind_ = ObExternalBlobKind::REFERENCE;
+  ObLobMetaExtraInfo extra_info;
+  extra_info.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, extra_info.set_external_lob_info(
+      external_info_allocator_, external_lob_info));
+  const ObString serialized = ObString::make_string(
+      "{\"extra_info_type\":1,\"lob_chunk_type\":\"EXTERNAL_REFERENCE\",\"chunk_count\":0,"
+      "\"external_lob_url\":\"s3://bucket/empty\",\"external_lob_offset\":0,"
+      "\"external_lob_length\":0,\"external_lob_has_length\":true,\"external_lob_kind\":0}");
+  ObLobMetaExtraInfo decoded;
+  ASSERT_EQ(OB_INVALID_ARGUMENT, decoded.deserialize(external_info_allocator_, serialized));
+}
+
+TEST_F(TestLobChunkSpliter, external_lob_id_round_trip_and_invalid_values)
+{
+  ObArenaAllocator allocator;
+  const uint64_t valid_ids[][2] = {
+      {2002, 3003}, {UINT64_MAX, static_cast<uint64_t>(INT64_MAX)}};
+  ObString serialized;
+  for (const auto &id : valid_ids) {
+    ASSERT_EQ(OB_SUCCESS, ObLobMetaUtil::serialize_external_lob_block_id(
+        allocator, id[0], id[1], serialized));
+    ASSERT_EQ(17, serialized.length());
+    uint64_t tablet_id = 0;
+    uint64_t external_lob_seq_id = 0;
+    ASSERT_EQ(OB_SUCCESS, ObLobMetaUtil::deserialize_external_lob_block_id(
+        serialized, tablet_id, external_lob_seq_id));
+    ASSERT_EQ(id[0], tablet_id);
+    ASSERT_EQ(id[1], external_lob_seq_id);
+  }
+  const uint64_t invalid_ids[][2] = {
+      {0, 1}, {2002, 0}, {2002, static_cast<uint64_t>(INT64_MAX) + 1}};
+  for (const auto &id : invalid_ids) {
+    ASSERT_EQ(OB_INVALID_ARGUMENT,
+              ObLobMetaUtil::serialize_external_lob_block_id(
+                  allocator, id[0], id[1], serialized));
+  }
+}
+
+TEST_F(TestLobChunkSpliter, external_lob_id_rejects_malformed_data_atomically)
+{
+  ObArenaAllocator allocator;
+  uint64_t tablet_id = 2002;
+  uint64_t external_lob_seq_id = 3003;
+  ObString serialized;
+  ASSERT_EQ(OB_SUCCESS, ObLobMetaUtil::serialize_external_lob_block_id(
+      allocator, tablet_id, external_lob_seq_id, serialized));
+  ASSERT_EQ(17, serialized.length());
+  const std::string valid(serialized.ptr(), serialized.length());
+  std::string bad_version(valid);
+  bad_version[0] = 2;
+  std::string zero_tablet(valid);
+  zero_tablet.replace(1, 8, 8, '\0');
+  std::string zero_seq(valid);
+  zero_seq.replace(9, 8, 8, '\0');
+  std::string overflow_seq(zero_seq);
+  overflow_seq[9] = static_cast<char>(0x80);
+  const std::string invalid_data[] = {
+      "", valid.substr(0, valid.length() - 1), valid + "x", bad_version,
+      zero_tablet, zero_seq, overflow_seq};
+  // Reject truncation, trailing bytes, and invalid identities; preserve the existing identity.
+  for (const std::string &data : invalid_data) {
+    ASSERT_EQ(OB_INVALID_ARGUMENT,
+              ObLobMetaUtil::deserialize_external_lob_block_id(
+                  ObString(data.length(), data.data()), tablet_id,
+                  external_lob_seq_id));
+    ASSERT_EQ(2002, tablet_id);
+    ASSERT_EQ(3003, external_lob_seq_id);
+  }
+}
+
+TEST_F(TestLobChunkSpliter, external_lob_summary_block_id_survives_row_copy)
+{
+  ObArenaAllocator allocator;
+  ObExternalBlobInfo info;
+  info.url_ = ObString::make_string("s3://bucket/object");
+  info.length_ = 1;
+  info.kind_ = ObExternalBlobKind::REFERENCE;
+  ObLobMetaExtraInfo extra_info;
+  extra_info.extra_info_type_ = ObLobMetaExtraInfo::LOB_META_SUMMARY;
+  extra_info.lob_chunk_type_.set_in_table();
+  ASSERT_EQ(OB_SUCCESS, extra_info.set_external_lob_info(external_info_allocator_, info));
+
+  ObLobMetaInfo summary;
+  summary.lob_col_idx_ = 2;
+  summary.lob_id_.assign(2, 1001, 1002);
+  char seq_buf[ObLobSeqId::LOB_SEQ_ID_MIN_LEN];
+  summary.seq_id_.assign_ptr(seq_buf, sizeof(seq_buf));
+  ASSERT_EQ(OB_SUCCESS, ObLobSeqId::get_seq_id(0, summary.seq_id_));
+  summary.byte_len_ = 1;
+  summary.char_len_ = 1;
+  ASSERT_EQ(OB_SUCCESS,
+            extra_info.serialize(allocator, summary.lob_extra_info_));
+  const uint64_t tablet_id = 2002;
+  const uint64_t external_lob_seq_id = 3003;
+  ASSERT_EQ(OB_SUCCESS, ObLobMetaUtil::serialize_external_lob_block_id(
+      allocator, tablet_id, external_lob_seq_id, summary.lob_block_id_));
+
+  blocksstable::ObDatumRow row;
+  ASSERT_EQ(OB_SUCCESS, row.init(ObLobMetaInfo::COLUMN_CNT));
+  ASSERT_EQ(OB_SUCCESS,
+            ObLobMetaUtil::transform_from_info_to_row(summary, &row, false));
+  ASSERT_EQ(0, summary.lob_block_id_.compare(
+      row.storage_datums_[ObLobMetaUtil::LOB_BLOCK_ID_COL_ID].get_string()));
+  ObLobMetaInfo scanned;
+  ASSERT_EQ(OB_SUCCESS,
+            ObLobMetaUtil::transform_from_row_to_info(&row, scanned, false));
+  ObLobMetaInfo copied;
+  ASSERT_EQ(OB_SUCCESS, copied.deep_copy(allocator, scanned));
+
+  // Overwriting the source row buffer preserves the deep copy's identity and reference descriptor.
+  MEMSET(summary.lob_block_id_.ptr(), 0, summary.lob_block_id_.length());
+  MEMSET(summary.lob_extra_info_.ptr(), 'x', summary.lob_extra_info_.length());
+  uint64_t decoded_tablet_id = 0;
+  uint64_t decoded_external_lob_seq_id = 0;
+  ASSERT_EQ(OB_SUCCESS, ObLobMetaUtil::deserialize_external_lob_block_id(
+      copied.lob_block_id_, decoded_tablet_id, decoded_external_lob_seq_id));
+  ASSERT_EQ(2002, decoded_tablet_id);
+  ASSERT_EQ(3003, decoded_external_lob_seq_id);
+  ObLobMetaExtraInfo decoded_info;
+  ASSERT_EQ(OB_SUCCESS, decoded_info.deserialize(external_info_allocator_, copied.lob_extra_info_));
+  ASSERT_TRUE(decoded_info.is_external_lob());
+  ASSERT_EQ(0, decoded_info.external_lob_info_.url_.compare(
+      info.url_));
 }
 
 //==================== ObLobChunkType ====================
@@ -107,6 +582,190 @@ TEST_F(TestLobChunkSpliter, chunk_type_state)
 
   type.reset();
   ASSERT_FALSE(type.is_valid());
+}
+
+TEST_F(TestLobChunkSpliter, outtable_write_error_classification)
+{
+  ASSERT_TRUE(ObLobOutTableIO::is_retryable_error(OB_TIMEOUT));
+  ASSERT_TRUE(ObLobOutTableIO::is_retryable_error(OB_EAGAIN));
+  ASSERT_FALSE(ObLobOutTableIO::is_retryable_error(OB_INVALID_ARGUMENT));
+}
+
+TEST_F(TestLobChunkSpliter, concurrent_uploader_allocates_slots_by_chunk_count)
+{
+  ObLobConcurrentPuter puter;
+  const int64_t chunk_size = 1024;
+  const int64_t chunk_count = 3;
+
+  ASSERT_EQ(OB_SUCCESS, puter.init(ObTimeUtility::current_time() + 10 * 1000 * 1000,
+                                  chunk_size, chunk_count));
+  ASSERT_EQ(chunk_count, puter.capacity_);
+  ASSERT_EQ(chunk_size, puter.chunk_size_);
+  ASSERT_EQ(chunk_count, puter.slots_.count());
+  ASSERT_EQ(0, puter.count_);
+  puter.reset();
+  ASSERT_EQ(0, puter.slots_.count());
+}
+
+TEST_F(TestLobChunkSpliter, outtable_batch_preparation_preserves_chunks_and_errors)
+{
+  const int64_t capacity = ObLobConcurrentPuter::DEFAULT_CAPACITY;
+  const int64_t chunk_count = capacity + 2;
+  const int64_t chunk_size = ObLobMetaUtil::LOB_OUTTABLE_BLOCK_DATA_SIZE;
+  for (int64_t missing_macro_id = 0; missing_macro_id < 2; ++missing_macro_id) {
+    SCOPED_TRACE(missing_macro_id);
+    ObArenaAllocator allocator;
+    ObArenaAllocator batch_allocator;
+    ObString data = make_data(allocator, "a", (chunk_count - 1) * chunk_size + 17);
+    ObLobAppendSourceIter query_iter;
+    ASSERT_EQ(OB_SUCCESS, query_iter.open(&allocator, ObString(), data, CS_TYPE_BINARY));
+    ObLobInsertContext insert_ctx;
+    insert_ctx.lob_meta_tablet_id_ = ObTabletID(1001);
+    ObLobId lob_id;
+    lob_id.assign(2, 1001, 2002);
+    ObArray<ObLobMetaInfo> metas;
+    ObLobWriteStats stats;
+    ObLobOutTableInsertIter iter;
+    ASSERT_EQ(OB_SUCCESS, iter.init(&insert_ctx, &query_iter, &allocator, chunk_size,
+        chunk_count, 2, lob_id, &metas, &stats));
+    blocksstable::MacroBlockId macro_id;
+    macro_id.set_id_mode(static_cast<uint64_t>(blocksstable::ObMacroBlockIdMode::ID_MODE_SHARE));
+    macro_id.set_storage_object_type(
+        static_cast<uint64_t>(blocksstable::ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO));
+    macro_id.set_location(blocksstable::ObMacroBlockIdLocation::OBJECT_STORAGE);
+    macro_id.set_third_id(1001);
+    macro_id.set_fourth_id(2002);
+    for (int64_t i = 0; i < chunk_count; ++i) {
+      MEMSET(data.ptr() + i * chunk_size, 'a' + i, (i + 1 == chunk_count) ? 17 : chunk_size);
+      macro_id.set_second_id(100 + i);
+      if (i < chunk_count - missing_macro_id) {
+        ASSERT_EQ(OB_SUCCESS, iter.macro_id_array_.push_back(macro_id));
+      }
+    }
+    ObArray<ObString> chunk_data;
+    ObArray<ObOuttableLobControlKey> control_keys;
+    for (int64_t batch = 0; batch < 2; ++batch) {
+      batch_allocator.reuse();
+      const int ret = iter.prepare_batch_(batch_allocator, chunk_data, control_keys);
+      if (1 == missing_macro_id && 1 == batch) {
+        ASSERT_EQ(OB_ERR_UNEXPECTED, ret);
+        ASSERT_FALSE(iter.is_end());
+        ASSERT_EQ(chunk_count - 1, iter.idx_);
+        break;
+      }
+      ASSERT_EQ(OB_SUCCESS, ret);
+      ASSERT_EQ((0 == batch) ? capacity : 2, chunk_data.count());
+      ASSERT_EQ(chunk_data.count(), control_keys.count());
+      ASSERT_EQ(1 == batch, iter.is_end());
+      for (int64_t i = 0; i < chunk_data.count(); ++i) {
+        const int64_t idx = batch * capacity + i;
+        const ObString expected((idx + 1 == chunk_count) ? 17 : chunk_size,
+                                data.ptr() + idx * chunk_size);
+        ASSERT_EQ(expected, chunk_data.at(i));
+        ASSERT_NE(query_iter.buffer_.ptr(), chunk_data.at(i).ptr());
+        ASSERT_EQ(expected.hash(), control_keys.at(i).hash_);
+        ASSERT_EQ(iter.macro_id_array_.at(idx), control_keys.at(i).macro_id_);
+      }
+      ASSERT_EQ((0 == batch) ? capacity : chunk_count, iter.idx_);
+      ASSERT_EQ(iter.idx_, metas.count());
+    }
+    batch_allocator.reuse();
+    ASSERT_EQ(chunk_count - missing_macro_id, metas.count());
+    ASSERT_EQ(static_cast<uint64_t>(metas.count()), stats.chunk_count_);
+    const int64_t expected_len = missing_macro_id ? (chunk_count - 1) * chunk_size : data.length();
+    ASSERT_EQ(static_cast<uint64_t>(expected_len), stats.byte_len_);
+    ASSERT_EQ(stats.byte_len_, stats.char_len_);
+    for (int64_t i = 0; i < metas.count(); ++i) {
+      ObString expected_seq;
+      ASSERT_EQ(OB_SUCCESS, ObLobSeqId::get_seq_id(allocator, i + 1, expected_seq));
+      ASSERT_EQ(expected_seq, metas.at(i).seq_id_);
+      ASSERT_EQ(OB_SUCCESS,
+          ObLobOutTableIO::deserialize_macro_id(metas.at(i).lob_block_id_, macro_id));
+      ASSERT_EQ(iter.macro_id_array_.at(i), macro_id);
+      ASSERT_EQ(static_cast<uint64_t>((i + 1 == chunk_count) ? 17 : chunk_size),
+          metas.at(i).byte_len_);
+      ASSERT_EQ(metas.at(i).byte_len_, metas.at(i).char_len_);
+      ASSERT_EQ(lob_id, metas.at(i).lob_id_);
+      ASSERT_EQ(2, metas.at(i).lob_col_idx_);
+      ObLobMetaExtraInfo extra_info;
+      ASSERT_EQ(OB_SUCCESS, extra_info.deserialize(allocator, metas.at(i).lob_extra_info_));
+      ASSERT_TRUE(extra_info.lob_chunk_type_.out_table());
+    }
+  }
+}
+
+TEST_F(TestLobChunkSpliter, outtable_write_requires_explicit_permission)
+{
+  ObArenaAllocator allocator;
+  const ObString data = ObString::make_string("outtable");
+  ObLobAppendSourceIter query_iter;
+  ASSERT_EQ(OB_SUCCESS, query_iter.open(&allocator, ObString(), data, CS_TYPE_BINARY));
+  ObLobInsertContext insert_ctx;
+  EXPECT_FALSE(insert_ctx.allow_outtable_lob_);
+  insert_ctx.lob_meta_tablet_id_ = ObTabletID(1001);
+  ObLobId lob_id;
+  lob_id.assign(2, 1001, 2002);
+  ObArray<ObLobMetaInfo> metas;
+  ObLobWriteStats stats;
+  ObLobOutTableInsertIter iter;
+  ASSERT_EQ(OB_SUCCESS, iter.init(&insert_ctx, &query_iter, &allocator,
+      ObLobMetaUtil::LOB_OUTTABLE_BLOCK_DATA_SIZE, 1, 2, lob_id, &metas, &stats));
+  ASSERT_EQ(OB_NOT_SUPPORTED, iter.write_all());
+  ObArray<ObOuttableLobControlKey> control_keys;
+  insert_ctx.outtable_lob_control_keys_ = &control_keys;
+  ASSERT_EQ(OB_NOT_SUPPORTED, iter.write_all());
+  EXPECT_TRUE(control_keys.empty());
+  EXPECT_TRUE(iter.macro_id_array_.empty());
+  EXPECT_TRUE(metas.empty());
+  EXPECT_EQ(0, stats.chunk_count_);
+  EXPECT_EQ(0, iter.idx_);
+  EXPECT_FALSE(iter.is_end());
+
+  insert_ctx.allow_outtable_lob_ = true;
+  insert_ctx.outtable_lob_control_keys_ = nullptr;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, iter.write_all());
+  EXPECT_TRUE(iter.macro_id_array_.empty());
+  EXPECT_TRUE(metas.empty());
+  EXPECT_EQ(0, iter.idx_);
+}
+
+TEST_F(TestLobChunkSpliter, lob_write_context_copies_outtable_permission)
+{
+  ObDMLBaseParam dml_param;
+  EXPECT_FALSE(dml_param.allow_outtable_lob_);
+  ObLobInsertContext source;
+  ObLobInsertContext target;
+  EXPECT_FALSE(source.allow_outtable_lob_);
+  EXPECT_FALSE(target.allow_outtable_lob_);
+  source.allow_outtable_lob_ = true;
+  ASSERT_EQ(OB_SUCCESS, target.assign(source));
+  EXPECT_TRUE(target.allow_outtable_lob_);
+  source.allow_outtable_lob_ = false;
+  ASSERT_EQ(OB_SUCCESS, target.assign(source));
+  EXPECT_FALSE(target.allow_outtable_lob_);
+}
+
+TEST_F(TestLobChunkSpliter, outtable_async_read_rejects_expired_deadline)
+{
+  blocksstable::MacroBlockId macro_id;
+  macro_id.set_version_v1();
+  macro_id.set_id_mode(
+      static_cast<uint64_t>(blocksstable::ObMacroBlockIdMode::ID_MODE_SHARE));
+  macro_id.set_storage_object_type(static_cast<uint64_t>(
+      blocksstable::ObStorageObjectType::SHARED_OUTTABLE_LOB_DATA_MACRO));
+  macro_id.set_location(blocksstable::ObMacroBlockIdLocation::OBJECT_STORAGE);
+  macro_id.set_second_id(100);
+  macro_id.set_third_id(200);
+  macro_id.set_fourth_id(300);
+  macro_id.set_fifth_id(0);
+  ObArenaAllocator allocator;
+  ObString data;
+  blocksstable::ObStorageObjectHandle object_handle;
+
+  ASSERT_EQ(OB_TIMEOUT, ObLobOutTableIO::async_read(
+      macro_id, 1, ObTimeUtility::current_time() - 1, allocator, data, object_handle));
+  ASSERT_TRUE(data.empty());
+  ASSERT_TRUE(object_handle.is_empty());
 }
 
 //==================== ObLobChunk::to_meta / to_piece ====================
@@ -157,7 +816,7 @@ TEST_F(TestLobChunkSpliter, chunk_to_meta_fields)
 TEST_F(TestLobChunkSpliter, chunk_reset)
 {
   ObLobChunk chunk;
-  chunk.lob_extra_info_.lob_chunk_type_.set_in_table();
+  chunk.lob_extra_info_.lob_chunk_type_.set_out_table();
   chunk.lob_col_idx_ = 5;
   chunk.byte_len_ = 99;
   chunk.reset();
@@ -190,6 +849,95 @@ TEST_F(TestLobChunkSpliter, query_iter_returns_multibyte_chunks)
   ASSERT_EQ(OB_ITER_END, query_iter.get_next_chunk(chunk, chunk_size));
   ASSERT_TRUE(query_iter.is_end());
   ASSERT_FALSE(chunk.lob_extra_info_.lob_chunk_type_.is_valid());
+}
+
+TEST_F(TestLobChunkSpliter, append_source_iter_returns_binary_chunks)
+{
+  ObArenaAllocator allocator;
+  const int64_t chunk_size = OB_MIN_LOB_CHUNK_SIZE;
+  const int64_t tail_length = 17;
+  ObString first = make_data(allocator, "a", chunk_size - tail_length);
+  ObString second = make_data(allocator, "b", 2 * tail_length);
+  ObLobAppendSourceIter query_iter;
+  ASSERT_EQ(OB_SUCCESS, query_iter.open(&allocator, first, second, CS_TYPE_BINARY));
+
+  ObLobChunk chunk;
+  ASSERT_EQ(OB_SUCCESS, query_iter.get_next_chunk(chunk, chunk_size));
+  ASSERT_EQ(static_cast<uint64_t>(chunk_size), chunk.byte_len_);
+  ASSERT_EQ(static_cast<uint64_t>(chunk_size), chunk.char_len_);
+  ASSERT_EQ(0, MEMCMP(chunk.lob_data_.ptr(), first.ptr(), first.length()));
+  ASSERT_EQ(0, MEMCMP(chunk.lob_data_.ptr() + first.length(), second.ptr(), tail_length));
+
+  ASSERT_EQ(OB_SUCCESS, query_iter.get_next_chunk(chunk, chunk_size));
+  ASSERT_EQ(static_cast<uint64_t>(tail_length), chunk.byte_len_);
+  ASSERT_EQ(static_cast<uint64_t>(tail_length), chunk.char_len_);
+  ASSERT_EQ(0, MEMCMP(chunk.lob_data_.ptr(), second.ptr() + tail_length, tail_length));
+  ASSERT_TRUE(query_iter.is_end());
+  ASSERT_EQ(OB_ITER_END, query_iter.get_next_chunk(chunk, chunk_size));
+}
+
+TEST_F(TestLobChunkSpliter, append_source_iter_returns_multibyte_chunks)
+{
+  ObArenaAllocator allocator;
+  const int64_t chunk_size = OB_MIN_LOB_CHUNK_SIZE;
+  const int64_t first_char_count = 200;
+  const int64_t second_char_count = 200;
+  ObString first = make_data(allocator, "\xe4\xb8\xad", first_char_count);
+  ObString second = make_data(allocator, "\xf0\x9f\x98\x80", second_char_count);
+  const int64_t second_offset = chunk_size - first.length();
+  const uint64_t first_chunk_char_count = first_char_count + second_offset / 4;
+  const uint64_t second_chunk_char_count = second_char_count - second_offset / 4;
+  ObLobAppendSourceIter query_iter;
+  ASSERT_EQ(OB_SUCCESS, query_iter.open(
+      &allocator, first, second, CS_TYPE_UTF8MB4_GENERAL_CI));
+
+  ObLobChunk chunk;
+  ASSERT_EQ(OB_SUCCESS, query_iter.get_next_chunk(chunk, chunk_size));
+  ASSERT_EQ(static_cast<uint64_t>(chunk_size), chunk.byte_len_);
+  ASSERT_EQ(first_chunk_char_count, chunk.char_len_);
+  ASSERT_EQ(0, MEMCMP(chunk.lob_data_.ptr(), first.ptr(), first.length()));
+  ASSERT_EQ(0, MEMCMP(
+      chunk.lob_data_.ptr() + first.length(), second.ptr(), chunk_size - first.length()));
+
+  ASSERT_EQ(OB_SUCCESS, query_iter.get_next_chunk(chunk, chunk_size));
+  ASSERT_EQ(static_cast<uint64_t>(second.length() - second_offset), chunk.byte_len_);
+  ASSERT_EQ(second_chunk_char_count, chunk.char_len_);
+  ASSERT_EQ(0, MEMCMP(
+      chunk.lob_data_.ptr(), second.ptr() + second_offset, second.length() - second_offset));
+  ASSERT_TRUE(query_iter.is_end());
+  ASSERT_EQ(OB_ITER_END, query_iter.get_next_chunk(chunk, chunk_size));
+}
+
+TEST_F(TestLobChunkSpliter, multibyte_chunk_count_uses_upper_bound)
+{
+  const int64_t chunk_size = OB_MIN_LOB_CHUNK_SIZE;
+  const int64_t three_byte_char_count = 682;
+  std::string data;
+  for (int64_t i = 0; i < three_byte_char_count; ++i) {
+    data.append("\xe4\xb8\xad");
+  }
+  data.append("\xc2\xa2");
+  ObString source;
+  source.assign_ptr(data.data(), data.length());
+  ASSERT_EQ(2 * chunk_size, source.length());
+  int64_t mbmaxlen = 0;
+  ASSERT_EQ(OB_SUCCESS, ObCharset::get_mbmaxlen_by_coll(CS_TYPE_UTF8MB4_GENERAL_CI, mbmaxlen));
+  const int64_t min_chunk_size = chunk_size - mbmaxlen + 1;
+  const int64_t reserved_count = source.length() / min_chunk_size + (0 != source.length() % min_chunk_size);
+  ASSERT_EQ(3, reserved_count);
+
+  ObLobInRowQueryIter query_iter;
+  ASSERT_EQ(OB_SUCCESS, query_iter.open(
+      source, 0, static_cast<uint32_t>(source.length()), CS_TYPE_UTF8MB4_GENERAL_CI));
+
+  ObLobChunk chunk;
+  ASSERT_EQ(OB_SUCCESS, query_iter.get_next_chunk(chunk, chunk_size));
+  ASSERT_EQ(1023u, chunk.byte_len_);
+  ASSERT_EQ(OB_SUCCESS, query_iter.get_next_chunk(chunk, chunk_size));
+  ASSERT_EQ(1023u, chunk.byte_len_);
+  ASSERT_EQ(OB_SUCCESS, query_iter.get_next_chunk(chunk, chunk_size));
+  ASSERT_EQ(2u, chunk.byte_len_);
+  ASSERT_EQ(OB_ITER_END, query_iter.get_next_chunk(chunk, chunk_size));
 }
 
 TEST_F(TestLobChunkSpliter, piece_iter_streams_and_deep_copies_meta)
@@ -303,8 +1051,10 @@ TEST_F(TestLobChunkSpliter, lob_write_iter_emits_piece_then_meta)
       ASSERT_EQ(static_cast<uint64_t>(data.length()), result.meta_info_.byte_len_);
       ASSERT_EQ(static_cast<uint64_t>(data.length()), result.meta_info_.char_len_);
       ObLobMetaExtraInfo extra_info;
-      ASSERT_EQ(OB_SUCCESS, extra_info.deserialize(result.meta_info_.lob_extra_info_));
+      ASSERT_EQ(OB_SUCCESS, extra_info.deserialize(external_info_allocator_,
+          result.meta_info_.lob_extra_info_));
       ASSERT_EQ(ObLobMetaExtraInfo::LOB_META_SUMMARY, extra_info.extra_info_type_);
+      ASSERT_TRUE(extra_info.lob_chunk_type_.in_table());
       ASSERT_EQ(static_cast<uint64_t>(piece_count), extra_info.chunk_count_);
       ASSERT_TRUE(extra_info.lob_chunk_type_.in_table());
       summary_seen = true;
@@ -326,7 +1076,7 @@ TEST_F(TestLobChunkSpliter, lob_write_iter_emits_piece_then_meta)
   ASSERT_TRUE(write_iter.is_finished());
 
   ASSERT_EQ(OB_SUCCESS, write_iter.get_pending_locator(pending_locator));
-  ASSERT_TRUE(pending_locator.is_outrow_disk_lob_locator());
+  ASSERT_TRUE(pending_locator.is_outline_disk_lob_locator());
   ObString disk_locator;
   ASSERT_EQ(OB_SUCCESS, pending_locator.get_disk_locator(disk_locator));
   ObLobDiskLocatorWrapper locator_wrapper;
@@ -388,7 +1138,8 @@ TEST_F(TestLobChunkSpliter, lob_write_iter_accumulates_utf8mb4_char_len)
       ASSERT_FALSE(summary_seen);
       ASSERT_EQ(static_cast<uint64_t>(data.length()), result.meta_info_.byte_len_);
       ASSERT_EQ(static_cast<uint64_t>(emoji_count), result.meta_info_.char_len_);
-      ASSERT_EQ(OB_SUCCESS, extra_info.deserialize(result.meta_info_.lob_extra_info_));
+      ASSERT_EQ(OB_SUCCESS, extra_info.deserialize(external_info_allocator_,
+          result.meta_info_.lob_extra_info_));
       ASSERT_EQ(static_cast<uint64_t>(piece_count), extra_info.chunk_count_);
       summary_seen = true;
     } else {
@@ -482,7 +1233,8 @@ TEST_F(TestLobChunkSpliter, lob_write_iter_empty_lob_has_summary_only)
   ASSERT_EQ(0u, result.meta_info_.byte_len_);
   ASSERT_EQ(0u, result.meta_info_.char_len_);
   ObLobMetaExtraInfo extra_info;
-  ASSERT_EQ(OB_SUCCESS, extra_info.deserialize(result.meta_info_.lob_extra_info_));
+  ASSERT_EQ(OB_SUCCESS, extra_info.deserialize(external_info_allocator_,
+      result.meta_info_.lob_extra_info_));
   ASSERT_EQ(0u, extra_info.chunk_count_);
   ASSERT_EQ(OB_ITER_END, write_iter.get_next_row(result));
 
@@ -566,7 +1318,7 @@ TEST_F(TestLobChunkSpliter, lob_write_iter_reset_clears_finished_state)
 
   ObLobLocatorV2 pending_locator;
   ASSERT_EQ(OB_SUCCESS, write_iter.get_pending_locator(pending_locator));
-  ASSERT_TRUE(pending_locator.is_outrow_disk_lob_locator());
+  ASSERT_TRUE(pending_locator.is_outline_disk_lob_locator());
 
   write_iter.reset();
   ASSERT_FALSE(write_iter.is_finished());

@@ -5,12 +5,14 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 
+#include "lib/allocator/page_arena.h"
 #include "sql/engine/px/ob_px_scheduler.h"
 #include "sql/engine/px/ob_dfo_scheduler.h"
 #include "sql/engine/px/datahub/components/ob_dh_winbuf.h"
 #include "share/detect/ob_detect_manager_utils.h"
 #include "sql/engine/join/ob_join_filter_op.h"
 #include "src/sql/engine/px/datahub/components/ob_dh_join_filter_count_row.h"
+#include "storage/lob/store/ob_outtable_lob_control_ctx.h"
 
 namespace oceanbase
 {
@@ -418,6 +420,9 @@ int ObPxMsgProc::process_sqc_finish_msg_once(ObExecContext &ctx, const ObPxFinis
         ctx.get_physical_plan_ctx()->add_total_ssstore_read_row_count(
           pkt.sqc_ssstore_row_read_count_);
       }
+      if (FAILEDx(coord_info_.append_outtable_lob_control_keys(pkt.outtable_lob_control_keys_))) {
+        LOG_WARN("failed to collect sqc outtable lob control keys", K(ret));
+      }
     }
   }
 
@@ -438,7 +443,10 @@ int ObPxMsgProc::process_sqc_finish_msg_once(ObExecContext &ctx, const ObPxFinis
       LOG_TRACE("TIMERECORD ",
                 "reserve:=-1 name:=QC dfoid:=-1 sqcid:=-1 taskid:=-1 end:",
                 ObTimeUtility::current_time());
-      ret = OB_SUCCESS; // 需要覆盖，否则无法跳出 loop
+      // All SQC transaction results and keys are merged before completion in the owner's T1.
+      if (OB_FAIL(coord_info_.complete_outtable_lob_control_keys(ctx))) {
+        LOG_WARN("failed to complete px outtable lob control rows", K(ret));
+      }
     }
   }
   return ret;
@@ -684,6 +692,7 @@ int ObPxTerminateMsgProc::on_sqc_finish_msg(ObExecContext &ctx, const ObPxFinish
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("NULL ptr", KP(edge), KP(sqc), K(ret));
   } else {
+    const bool collect_control_keys = !sqc->is_thread_finish() && OB_SUCCESS == pkt.rc_;
     sqc->set_collect_finish_res_succ(OB_SUCCESS == collect_trans_result_ret);
     sqc->set_need_report(false);
     sqc->set_thread_finish(true);
@@ -700,6 +709,10 @@ int ObPxTerminateMsgProc::on_sqc_finish_msg(ObExecContext &ctx, const ObPxFinish
     LOG_TRACE("terminate msg : sqc finish", K(*edge), K(*sqc));
     LOG_TRACE("on_sqc_finish_msg update feedback info",
         K(pkt.fb_info_), K(ctx.get_feedback_info()));
+    if (collect_control_keys
+        && OB_FAIL(coord_info_.append_outtable_lob_control_keys(pkt.outtable_lob_control_keys_))) {
+      LOG_WARN("failed to collect terminating sqc outtable lob control keys", K(ret));
+    }
   }
   // set dfo finish status no matter whether succeed.
   if (OB_NOT_NULL(edge)) {
@@ -723,6 +736,10 @@ int ObPxTerminateMsgProc::on_sqc_finish_msg(ObExecContext &ctx, const ObPxFinish
     }
   }
   ret = OB_SUCC(ret) ? collect_trans_result_ret : ret;
+  if (OB_SUCCESS != ret && !pkt.outtable_lob_control_keys_.empty()
+      && OB_SUCCESS == coord_info_.outtable_lob_control_ret_) {
+    coord_info_.outtable_lob_control_ret_ = ret;
+  }
   return ret;
 }
 
@@ -815,6 +832,75 @@ int ObPxCoordInfo::init()
       "PxDfoMapKey",
       "PxDfoMapNode"))) {
     LOG_WARN("create hash table failed", K(ret));
+  }
+  return ret;
+}
+
+int ObPxCoordInfo::append_outtable_lob_control_keys(
+    const ObIArray<storage::ObOuttableLobControlKey> &keys)
+{
+  int ret = outtable_lob_control_ret_;
+  if (OB_FAIL(ret)) {
+  } else if (!keys.empty() && OB_ISNULL(outtable_lob_control_keys_)) {
+    const ObMemAttr mem_attr(MTL_ID(), "PxLobCtrlKey");
+    outtable_lob_control_keys_ = OB_NEW(ObArray<storage::ObOuttableLobControlKey>, mem_attr);
+    if (OB_ISNULL(outtable_lob_control_keys_)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate px outtable lob control keys", K(ret));
+    } else {
+      outtable_lob_control_keys_->set_attr(mem_attr);
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < keys.count(); ++i) {
+    if (OB_UNLIKELY(!keys.at(i).is_valid())) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid sqc outtable lob control key", K(ret), K(i));
+    } else if (OB_FAIL(outtable_lob_control_keys_->push_back(keys.at(i)))) {
+      LOG_WARN("failed to retain sqc outtable lob control key", K(ret), K(i));
+    }
+  }
+  if (OB_FAIL(ret)) {
+    outtable_lob_control_ret_ = ret;
+  }
+  return ret;
+}
+
+int ObPxCoordInfo::complete_outtable_lob_control_keys(ObExecContext &ctx)
+{
+  int ret = outtable_lob_control_ret_;
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(outtable_lob_control_keys_) || outtable_lob_control_keys_->empty()) {
+  } else if (OB_SUCCESS != first_error_code_) {
+    ret = first_error_code_;
+    LOG_WARN("cannot complete outtable lob control rows after px failure", K(ret));
+  } else if (!all_threads_finish_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("cannot complete outtable lob control rows before all sqcs finish", K(ret));
+  } else {
+    ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "PxLobCtrlKey"));
+    storage::ObOuttableLobControlCtx control_ctx;
+    if (OB_FAIL(control_ctx.init(allocator))) {
+      LOG_WARN("failed to init px outtable lob control context", K(ret));
+    } else if (OB_FAIL(control_ctx.assign(outtable_lob_control_keys_))) {
+      LOG_WARN("failed to prepare px outtable lob control completion", K(ret));
+    } else if (OB_FAIL(control_ctx.complete(ctx))) {
+      LOG_WARN("failed to complete px outtable lob control rows", K(ret));
+    } else {
+      outtable_lob_control_keys_->reuse();
+    }
+  }
+  if (OB_FAIL(ret)) {
+    outtable_lob_control_ret_ = ret;
+  }
+  return ret;
+}
+
+int ObPxCoordInfo::check_outtable_lob_control_complete() const
+{
+  int ret = outtable_lob_control_ret_;
+  if (OB_SUCC(ret) && OB_NOT_NULL(outtable_lob_control_keys_)
+      && !outtable_lob_control_keys_->empty()) {
+    ret = OB_ERR_UNEXPECTED;
   }
   return ret;
 }

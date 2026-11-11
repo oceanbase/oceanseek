@@ -10,7 +10,8 @@
 
 #define protected public
 #define private public
-#include "src/storage/ss_garbage_collector/dag/ob_ss_mark_sweep_dag.h"
+#include "storage/ss_garbage_collector/dag/ob_ss_mark_sweep_dag.h"
+#include "storage/ss_garbage_collector/task/ob_ss_mark_sweep_gc_gen_task.h"
 #include "lib/utility/ob_test_util.h"
 #include "storage/shared_storage/storage_cache_policy/ob_storage_cache_service.h"
 #include "mittest/mtlenv/mock_tenant_module_env.h"
@@ -19,6 +20,7 @@
 #include "mittest/shared_storage/test_ss_macro_cache_mgr_util.h"
 #include "unittest/storage/sslog/test_mock_palf_kv.h"
 #include "storage/incremental/ob_shared_meta_service.h"
+#include "storage/incremental/share/ob_shared_meta_iter_guard.h"
 #include "storage/incremental/atomic_protocol/ob_atomic_protocol_util.h"
 #include "storage/incremental/atomic_protocol/ob_lock_atomic_protocol.h"
 #include "src/storage/incremental/ob_sswriter_service.h"
@@ -152,6 +154,8 @@ public:
         LOG_INFO("create table test_svc2_floor_table done");
         OK(exe_sql("create table if not exists test_svc2_all_del_table (a int)"));
         LOG_INFO("create table test_svc2_all_del_table done");
+        OK(exe_sql("create table if not exists test_svc2_lob_rely_table (a int)"));
+        LOG_INFO("create table test_svc2_lob_rely_table done");
       }
       LOG_INFO("finish to create tt1 tenant");
     } else {
@@ -305,6 +309,119 @@ public:
     return ret;
   }
 
+  int get_min_tablet_meta_scn(ObSSMetaService &meta_svr,
+                              const ObLSID &ls_id,
+                              const ObTabletID &tablet_id,
+                              const share::SCN &reorgan_scn,
+                              share::SCN &min_meta_scn)
+  {
+    int ret = OB_SUCCESS;
+    ObSSMetaReadParamV2 read_param;
+    ObSSMetaIterGuard<ObSSMetaTabletTinyInfoIterator> iter_guard;
+    ObSSMetaTabletTinyInfoIterator *iter = nullptr;
+    min_meta_scn.reset();
+    read_param.set_tablet_level_param(
+        ObSSMetaReadParamType::TABLET_PREFIX,
+        ObSSMetaReadResultType::READ_WHOLE_ROW,
+        ObAtomicProtocolTypeEnum::TABLET_META,
+        ls_id,
+        tablet_id,
+        share::SCN::min_scn(),
+        reorgan_scn,
+        true /*is_in_table*/);
+    read_param.set_read_mark_delete(true);
+    if (OB_FAIL(meta_svr.get_tablet_tiny_info_iter(
+            read_param, share::SCN::max_scn(), iter_guard))) {
+      LOG_WARN("fail to get tablet tiny info iterator", KR(ret), K(ls_id), K(tablet_id));
+    } else if (OB_FAIL(iter_guard.get_iter(iter))) {
+      LOG_WARN("fail to get tablet tiny info iterator", KR(ret), K(ls_id), K(tablet_id));
+    } else if (OB_ISNULL(iter)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("tablet tiny info iterator is null", KR(ret), K(ls_id), K(tablet_id));
+    } else {
+      ObSSMetaTabletKey key;
+      ObSSMetaTabletTinyInfo tiny_info;
+      while (OB_SUCC(ret)) {
+        if (OB_FAIL(iter->get_next(key, tiny_info))) {
+          if (OB_ITER_END == ret) {
+            ret = OB_SUCCESS;
+          } else {
+            LOG_WARN("fail to get tablet tiny info", KR(ret), K(ls_id), K(tablet_id));
+          }
+          break;
+        } else if (!min_meta_scn.is_valid() || key.meta_scn_ < min_meta_scn) {
+          min_meta_scn = key.meta_scn_;
+        }
+      }
+      if (OB_SUCC(ret) && OB_UNLIKELY(!min_meta_scn.is_valid())) {
+        ret = OB_ENTRY_NOT_EXIST;
+        LOG_WARN("tablet meta version is empty", KR(ret), K(ls_id), K(tablet_id));
+      }
+    }
+    return ret;
+  }
+
+  int make_version_with_lob_rely_info(ObSSMetaService &meta_svr,
+      const ObLSID &ls_id, const ObTabletID &tablet_id, const share::SCN &reorgan_scn,
+      const share::SCN &src_meta_scn, const share::SCN &dst_meta_scn,
+      const share::SCN &clog_checkpoint_scn, const int64_t multi_version_start)
+  {
+    int ret = OB_SUCCESS;
+    ObArenaAllocator alloc("MkLobRelyVer");
+    ObTabletHandle hdl;
+    ObTablet *tablet = nullptr;
+    uint64_t data_version = 0;
+    ObTabletMacroInfo *macro_info = nullptr;
+    if (OB_FAIL(meta_svr.get_tablet(
+            ls_id, tablet_id, reorgan_scn, src_meta_scn, alloc, hdl))) {
+      LOG_WARN("fail to get tablet", KR(ret), K(ls_id), K(tablet_id), K(src_meta_scn));
+    } else if (OB_ISNULL(tablet = hdl.get_obj())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("tablet is null", KR(ret));
+    } else if (OB_UNLIKELY(!clog_checkpoint_scn.is_valid()
+        || multi_version_start < 0 || INT64_MAX == multi_version_start)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid lob rely info", KR(ret), K(clog_checkpoint_scn), K(multi_version_start));
+    } else if (FALSE_IT(tablet->tablet_meta_.clog_checkpoint_scn_ = clog_checkpoint_scn)) {
+    } else if (FALSE_IT(tablet->tablet_meta_.multi_version_start_ = multi_version_start)) {
+    } else if (FALSE_IT(tablet->tablet_meta_.snapshot_version_ = MAX(
+            tablet->tablet_meta_.snapshot_version_, multi_version_start))) {
+    } else if (OB_FAIL(GET_MIN_DATA_VERSION(MTL_ID(), data_version))) {
+      LOG_WARN("fail to get data version", KR(ret));
+    } else if (OB_FAIL(tablet->load_macro_info(0 /*ls_epoch*/, alloc, macro_info))) {
+      LOG_WARN("fail to load macro info", KR(ret));
+    } else {
+      ObSSTabletMetaValue value;
+      if (OB_FAIL(value.set_tablet_info(data_version, macro_info, tablet))) {
+        LOG_WARN("fail to set tablet info", KR(ret));
+      } else {
+        const int64_t size = value.get_serialize_size();
+        char *buf = static_cast<char *>(alloc.alloc(size));
+        int64_t pos = 0;
+        if (OB_ISNULL(buf)) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("fail to alloc tablet meta value", KR(ret), K(size));
+        } else if (OB_FAIL(value.serialize(buf, size, pos))) {
+          LOG_WARN("fail to serialize tablet meta value", KR(ret), K(size));
+        } else {
+          ObSSMetaTabletKey key;
+          key.ls_id_ = ls_id;
+          key.tablet_id_ = tablet_id;
+          key.reorganization_scn_ = reorgan_scn;
+          key.meta_scn_ = dst_meta_scn;
+          const ObSSMetaTabletRow row(
+              static_cast<int64_t>(ObSSMetaTypeEnum::TABLET_META),
+              key,
+              ObString(static_cast<int32_t>(pos), buf));
+          if (OB_FAIL(meta_svr.insert_tablet_meta(row))) {
+            LOG_WARN("fail to insert tablet meta", KR(ret), K(key));
+          }
+        }
+      }
+    }
+    return ret;
+  }
+
   int read_tablet_lock_row(const ObLSID &ls_id,
                            const ObTabletID &tablet_id,
                            const share::SCN &reorgan_scn,
@@ -444,6 +561,102 @@ protected:
 };
 
 TestRunCtx TestSSGCDelAndKeptCalculation::run_ctx_;
+
+TEST_F(TestSSGCDelAndKeptCalculation, lob_rely_requires_same_tablet_meta_version)
+{
+  share::ObTenantSwitchGuard tenant_guard;
+  OK(tenant_guard.switch_to(run_ctx_.tenant_id_));
+  ObSSMetaService *meta_svr = MTL(ObSSMetaService *);
+  ASSERT_NE(nullptr, meta_svr);
+
+  ObTabletID tablet_id;
+  ObLSID ls_id;
+  OK(get_tablet_and_ls_id("test_svc2_lob_rely_table", tablet_id, ls_id));
+  const share::SCN reorgan_scn = share::SCN::min_scn();
+  OK(meta_svr->create_tablet(ls_id, tablet_id, reorgan_scn, true /*check_lease*/));
+
+  share::SCN base_meta_scn;
+  share::SCN min_existing_meta_scn;
+  OK(meta_svr->get_tablet_latest_version(
+      ls_id, tablet_id, reorgan_scn, base_meta_scn));
+  OK(get_min_tablet_meta_scn(
+      *meta_svr, ls_id, tablet_id, reorgan_scn, min_existing_meta_scn));
+  ASSERT_GT(min_existing_meta_scn.get_val_for_inner_table_field(), 3U);
+  const share::SCN version_1 = share::SCN::minus(min_existing_meta_scn, 3);
+  const share::SCN version_2 = share::SCN::minus(min_existing_meta_scn, 2);
+  const share::SCN version_3 = share::SCN::minus(min_existing_meta_scn, 1);
+  ASSERT_TRUE(version_1.is_valid());
+  ASSERT_TRUE(version_2.is_valid());
+  ASSERT_TRUE(version_3.is_valid());
+
+  ObArenaAllocator allocator("LobRelyBase");
+  ObTabletHandle tablet_handle;
+  OK(meta_svr->get_tablet(
+      ls_id, tablet_id, reorgan_scn, base_meta_scn, allocator, tablet_handle));
+  ASSERT_NE(nullptr, tablet_handle.get_obj());
+  const share::SCN checkpoint_low = tablet_handle.get_obj()->tablet_meta_.start_scn_;
+  const share::SCN checkpoint_limit = share::SCN::plus(checkpoint_low, 1);
+  const share::SCN checkpoint_high = share::SCN::plus(checkpoint_low, 2);
+  const int64_t multi_version_start_low = 0;
+  const int64_t multi_version_start_limit = 1;
+  const int64_t multi_version_start_high = 2;
+  ASSERT_TRUE(checkpoint_low.is_valid());
+  ASSERT_TRUE(checkpoint_limit.is_valid());
+  ASSERT_TRUE(checkpoint_high.is_valid());
+
+  // 前两个版本各自仅满足一个条件，第三个版本同时满足两个条件。
+  OK(make_version_with_lob_rely_info(*meta_svr, ls_id, tablet_id, reorgan_scn,
+      base_meta_scn, version_1, checkpoint_low, multi_version_start_high));
+  OK(make_version_with_lob_rely_info(*meta_svr, ls_id, tablet_id, reorgan_scn,
+      base_meta_scn, version_2, checkpoint_high, multi_version_start_low));
+  OK(make_version_with_lob_rely_info(*meta_svr, ls_id, tablet_id, reorgan_scn,
+      base_meta_scn, version_3, checkpoint_limit, multi_version_start_limit));
+
+  volatile bool stopped = false;
+  ObSSMarkSweepGCGenTask task(stopped);
+  OK(task.init(run_ctx_.tenant_id_));
+  const ObSSGCTablet gc_tablet(ls_id, tablet_id, reorgan_scn);
+  const ObSSGCTabletStudyInfo study_info(base_meta_scn,
+      INT64_MAX, checkpoint_limit, multi_version_start_limit);
+  share::SCN max_major_meta_scn;
+  share::SCN max_lob_meta_scn;
+  OK(task.get_max_rely_meta_scns_(
+      version_3, gc_tablet, study_info, max_major_meta_scn, max_lob_meta_scn));
+  ASSERT_FALSE(max_major_meta_scn.is_valid());
+  ASSERT_EQ(version_3, max_lob_meta_scn);
+
+  max_major_meta_scn.reset();
+  max_lob_meta_scn.reset();
+  OK(task.get_max_rely_meta_scns_(
+      version_2, gc_tablet, study_info, max_major_meta_scn, max_lob_meta_scn));
+  ASSERT_FALSE(max_major_meta_scn.is_valid());
+  ASSERT_FALSE(max_lob_meta_scn.is_valid());
+
+  ObSSGCTabletStudyResultArray study_results;
+  ObSSGCTabletWithMetaScnArray tablet_with_meta_scns;
+  OK(study_results.push_back(ObSSGCTabletStudyResult(gc_tablet, study_info)));
+  OK(task.calc_min_meta_scn_(
+      version_3, study_results, tablet_with_meta_scns));
+  ASSERT_EQ(1, tablet_with_meta_scns.count());
+  ASSERT_EQ(version_3, tablet_with_meta_scns.at(0).meta_scn_);
+
+  tablet_with_meta_scns.reuse();
+  OK(task.calc_min_meta_scn_(
+      version_2, study_results, tablet_with_meta_scns));
+  ASSERT_EQ(1, tablet_with_meta_scns.count());
+  ASSERT_TRUE(tablet_with_meta_scns.at(0).meta_scn_.is_min());
+  task.destroy();
+
+  const share::SCN synthetic_versions[] = {version_1, version_2, version_3};
+  for (int64_t i = 0; i < ARRAYSIZEOF(synthetic_versions); ++i) {
+    ObSSMetaTabletKey key;
+    key.ls_id_ = ls_id;
+    key.tablet_id_ = tablet_id;
+    key.reorganization_scn_ = reorgan_scn;
+    key.meta_scn_ = synthetic_versions[i];
+    OK(delete_tablet_meta_row(*meta_svr, key));
+  }
+}
 
 TEST_F(TestSSGCDelAndKeptCalculation, final_min_reuses_committed_kept_meta_scn)
 {

@@ -2145,8 +2145,40 @@
 #
 #  run_root_inspection(cur, timeout)
 #####========******####======== actions begin ========####******========####
+#  if not across_version:
+#    run_upgrade_job(conn, cur, "UPGRADE_SYSTEM_TABLE", timeout)
+#  check_outtable_lob_control_schema(cur)
 #  upgrade_syslog_level(conn, cur)
 #  return
+#
+#def check_outtable_lob_control_schema(cur):
+#  tenant_ids = get_upgrade_tenant_ids(cur)
+#  if len(tenant_ids) <= 0:
+#    raise MyError("tenant count is unexpected")
+#  tenant_id_str = ','.join(map(str, tenant_ids))
+#  sql = """select count(*) from (
+#             select ctrl.tenant_id
+#             from oceanbase.__all_virtual_table ctrl
+#             join oceanbase.__all_virtual_table idx
+#               on idx.tenant_id = ctrl.tenant_id
+#              and idx.data_table_id = ctrl.table_id
+#             where ctrl.tenant_id in ({0})
+#               and ctrl.table_name = '__all_outtable_lob_control'
+#               and ctrl.table_type = 18
+#               and idx.table_type = 5
+#               and idx.index_type = 1
+#               and idx.index_status = 2
+#               and (idx.table_name like '%idx_lob_ctrl_hash_status'
+#                    or idx.table_name like '%idx_lob_ctrl_status_time')
+#             group by ctrl.tenant_id
+#             having count(distinct idx.table_name) = 2
+#           ) valid_tenant""".format(tenant_id_str)
+#  results = query(cur, sql)
+#  if len(results) != 1 or len(results[0]) != 1 or results[0][0] != len(tenant_ids):
+#    warn_text = "outtable lob control schema not ready, tenant_count:{0}, ready_count:{1}".format(
+#        len(tenant_ids), results)
+#    logging.warn(warn_text)
+#    raise MyError(warn_text)
 #
 #def upgrade_syslog_level(conn, cur):
 #  try:
@@ -2172,6 +2204,10 @@
 #
 #def get_tenant_ids(cur):
 #  return [_[0] for _ in query(cur, 'select tenant_id from oceanbase.__all_tenant')]
+#
+#def get_upgrade_tenant_ids(cur):
+#  sql = "select tenant_id from oceanbase.__all_tenant except select tenant_id from oceanbase.__all_virtual_tenant_info where tenant_role = 'STANDBY'"
+#  return [_[0] for _ in query(cur, sql)]
 #
 #def run_root_inspection(cur, timeout):
 #  sql = "select count(*) from oceanbase.__all_virtual_upgrade_inspection where info != 'succeed'"

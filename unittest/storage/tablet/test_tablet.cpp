@@ -785,30 +785,62 @@ TEST_F(TestTablet, test_ss_get_min_tablet_rely_info)
 {
   ObTablet first_tablet;
   ObTablet second_tablet;
+  ASSERT_EQ(OB_SUCCESS, first_tablet.tablet_meta_.ha_status_.init_status());
+  ASSERT_EQ(OB_SUCCESS, second_tablet.tablet_meta_.ha_status_.init_status());
+  ASSERT_TRUE(first_tablet.is_data_complete());
+  ASSERT_TRUE(second_tablet.is_data_complete());
   share::SCN first_minor_meta_scn;
   share::SCN second_minor_meta_scn;
   share::SCN first_inc_major_meta_scn;
   share::SCN second_inc_major_meta_scn;
+  share::SCN first_clog_checkpoint_scn;
+  share::SCN second_clog_checkpoint_scn;
   ASSERT_EQ(OB_SUCCESS, first_minor_meta_scn.convert_for_tx(300));
   ASSERT_EQ(OB_SUCCESS, second_minor_meta_scn.convert_for_tx(400));
   ASSERT_EQ(OB_SUCCESS, first_inc_major_meta_scn.convert_for_tx(500));
   ASSERT_EQ(OB_SUCCESS, second_inc_major_meta_scn.convert_for_tx(200));
+  ASSERT_EQ(OB_SUCCESS, first_clog_checkpoint_scn.convert_for_tx(600));
+  ASSERT_EQ(OB_SUCCESS, second_clog_checkpoint_scn.convert_for_tx(350));
   first_tablet.tablet_meta_.min_minor_meta_scn_ = first_minor_meta_scn;
   first_tablet.tablet_meta_.min_inc_major_meta_scn_ = first_inc_major_meta_scn;
+  first_tablet.tablet_meta_.clog_checkpoint_scn_ = first_clog_checkpoint_scn;
+  first_tablet.tablet_meta_.multi_version_start_ = 600;
   first_tablet.table_store_cache_.min_major_snapshot_ = 500;
   second_tablet.tablet_meta_.min_minor_meta_scn_ = second_minor_meta_scn;
   second_tablet.tablet_meta_.min_inc_major_meta_scn_ = second_inc_major_meta_scn;
+  second_tablet.tablet_meta_.clog_checkpoint_scn_ = second_clog_checkpoint_scn;
+  second_tablet.tablet_meta_.multi_version_start_ = 300;
   second_tablet.table_store_cache_.min_major_snapshot_ = 400;
 
   share::SCN min_tablet_meta_scn;
   int64_t min_major_snapshot = 0;
-  ScanAllVersionTabletsOp::GetMinTabletRelyInfo op(min_tablet_meta_scn, min_major_snapshot);
+  share::SCN clog_checkpoint_scn;
+  share::SCN orig_clog_checkpoint_scn;
+  int64_t multi_version_start = 0;
+  bool has_memtable = false;
+  ScanAllVersionTabletsOp::GetMinTabletRelyInfo op(
+      min_tablet_meta_scn, min_major_snapshot, clog_checkpoint_scn,
+      orig_clog_checkpoint_scn, multi_version_start, has_memtable, true);
   ASSERT_TRUE(min_tablet_meta_scn.is_max());
   ASSERT_EQ(INT64_MAX, min_major_snapshot);
+  ASSERT_TRUE(clog_checkpoint_scn.is_max());
+  ASSERT_TRUE(orig_clog_checkpoint_scn.is_max());
+  ASSERT_EQ(INT64_MAX, multi_version_start);
   ASSERT_EQ(OB_SUCCESS, op(first_tablet));
   ASSERT_EQ(OB_SUCCESS, op(second_tablet));
   ASSERT_EQ(second_inc_major_meta_scn, min_tablet_meta_scn);
   ASSERT_EQ(400, min_major_snapshot);
+  ASSERT_EQ(second_clog_checkpoint_scn, clog_checkpoint_scn);
+  ASSERT_EQ(second_clog_checkpoint_scn, orig_clog_checkpoint_scn);
+  ASSERT_EQ(300, multi_version_start);
+
+  ScanAllVersionTabletsOp::GetMinTabletRelyInfo non_lob_op(
+      min_tablet_meta_scn, min_major_snapshot, clog_checkpoint_scn,
+      orig_clog_checkpoint_scn, multi_version_start, has_memtable, false);
+  ASSERT_EQ(OB_SUCCESS, non_lob_op(first_tablet));
+  ASSERT_TRUE(clog_checkpoint_scn.is_max());
+  ASSERT_TRUE(orig_clog_checkpoint_scn.is_max());
+  ASSERT_EQ(INT64_MAX, multi_version_start);
 }
 #endif
 

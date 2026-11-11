@@ -859,6 +859,7 @@ namespace share
   static const char* const OB_SV_AP_QUERY_REPLICA_FALLBACK = "ap_query_replica_fallback";
   static const char* const OB_SV__ENABLE_CATALOG_FUSION = "_enable_catalog_fusion";
   static const char* const OB_SV__SHOW_SYNC_PLACEHOLDER_TABLE = "_show_sync_placeholder_table";
+  static const char* const OB_SV_DEFAULT_LOB_INTABLE_THRESHOLD = "ob_default_lob_intable_threshold";
   static const char* const OB_SV__UNIFIED_CATALOG_TOKEN = "_unified_catalog_token";
 
 }

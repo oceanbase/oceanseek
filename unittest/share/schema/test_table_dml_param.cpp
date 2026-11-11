@@ -25,6 +25,7 @@ TEST(ObTableSchemaParam, test_serialize)
 
   old_param1.table_id_ = 1;
   old_param1.index_status_ = INDEX_STATUS_AVAILABLE;
+  old_param1.def_type_ = TABLE_DEF_TYPE_INTERNAL;
   ObArenaAllocator allocator;
   int64_t buf_size = 1024;
   char *buf = (char*)allocator.alloc(buf_size);
@@ -42,8 +43,11 @@ TEST(ObTableSchemaParam, test_serialize)
   LOG_INFO("dump param", K(new_param2), K(pos), K(buf_size));
   ASSERT_EQ(old_param1.table_id_, new_param1.table_id_);
   ASSERT_EQ(old_param1.table_id_, new_param2.table_id_);
+  ASSERT_EQ(TABLE_DEF_TYPE_INTERNAL, new_param1.get_def_type());
+  ASSERT_EQ(TABLE_DEF_TYPE_INTERNAL, new_param2.get_def_type());
 
   new_param1.table_id_ = 2;
+  new_param1.def_type_ = TABLE_DEF_TYPE_USER;
   pos = 0;
   ASSERT_EQ(OB_SUCCESS, new_param1.serialize(buf, buf_size, pos));
   LOG_INFO("dump param", K(old_param1), K(pos), K(buf_size));
@@ -53,15 +57,51 @@ TEST(ObTableSchemaParam, test_serialize)
   ASSERT_EQ(OB_SUCCESS, old_param1.deserialize(buf, buf_size, pos));
   LOG_INFO("dump param", K(old_param1), K(pos), K(buf_size));
   ASSERT_EQ(new_param1.table_id_, old_param1.table_id_);
+  ASSERT_EQ(TABLE_DEF_TYPE_USER, old_param1.get_def_type());
   ASSERT_EQ(OB_SUCCESS, old_param1.deserialize(buf, buf_size, pos));
   LOG_INFO("dump param", K(old_param1), K(pos), K(buf_size));
   ASSERT_EQ(new_param2.table_id_, old_param1.table_id_);
+  ASSERT_EQ(TABLE_DEF_TYPE_INTERNAL, old_param1.get_def_type());
   pos = 0;
   ASSERT_EQ(OB_SUCCESS, new_param2.deserialize(buf, buf_size, pos));
   LOG_INFO("dump param", K(new_param2), K(pos), K(buf_size));
   ASSERT_EQ(OB_SUCCESS, new_param2.deserialize(buf, buf_size, pos));
   LOG_INFO("dump param", K(new_param2), K(pos), K(buf_size));
 
+}
+
+TEST(ObTableSchemaParam, definition_type_legacy_compatibility)
+{
+  ObArenaAllocator allocator;
+  ObTableSchemaParam param(allocator);
+  param.table_id_ = 500002;
+  param.def_type_ = TABLE_DEF_TYPE_INTERNAL;
+
+  char buf[4096];
+  int64_t write_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, param.serialize(buf, sizeof(buf), write_pos));
+  ASSERT_LE(write_pos, param.get_serialize_size());
+
+  int64_t header_pos = 0;
+  int64_t version = 0;
+  int64_t payload_len = 0;
+  ASSERT_EQ(OB_SUCCESS, serialization::decode(buf, write_pos, header_pos, version));
+  const int64_t length_pos = header_pos;
+  ASSERT_EQ(OB_SUCCESS, serialization::decode(buf, write_pos, header_pos, payload_len));
+  const int64_t def_type_len = serialization::encoded_length(param.get_def_type());
+  const int64_t legacy_len = write_pos - def_type_len;
+  int64_t encode_pos = length_pos;
+  // Remove the appended definition type and preserve the legacy UNIS object boundary.
+  ASSERT_EQ(OB_SUCCESS, serialization::encode_fixed_bytes_i64(
+      buf, sizeof(buf), encode_pos, payload_len - def_type_len));
+
+  // The missing definition type must preserve the initialized default.
+  ObTableSchemaParam decoded_param(allocator);
+  int64_t read_pos = 0;
+  ASSERT_EQ(OB_SUCCESS, decoded_param.deserialize(buf, legacy_len, read_pos));
+  ASSERT_EQ(legacy_len, read_pos);
+  ASSERT_EQ(param.get_table_id(), decoded_param.get_table_id());
+  ASSERT_EQ(TABLE_DEF_TYPE_MAX, decoded_param.get_def_type());
 }
 
 static void init_column_schema(ObColumnSchemaV2 &column,

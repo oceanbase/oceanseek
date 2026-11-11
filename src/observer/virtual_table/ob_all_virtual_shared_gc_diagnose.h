@@ -49,6 +49,14 @@ public:
   virtual void reset() override;
 
 private:
+  enum class DiagGroupType : uint8_t
+  {
+    DEL = 0,
+    KEPT,
+    LOB_USER_GC,
+    MAX
+  };
+
   enum COLUMN_ID
   {
     TENANT_ID = common::OB_APP_MIN_COLUMN_ID,
@@ -75,10 +83,13 @@ private:
   int open_next_file_(bool &opened);
   // load the next batch of records from the current file; has_batch=false when drained.
   int next_record_batch_(bool &has_batch);
-  bool pass_optional_filters_(const storage::ObSSGCTablet &tablet) const;
+  bool pass_optional_filters_(const storage::ObSSGCTablet *tablet) const;
   int construct_cur_value_(common::ObString &value);
-  int fill_cells_(const storage::ObSSGCTablet &tablet, const common::ObString &value);
-  static const char *group_to_str_(const storage::ObMarkSweepGroupType group);
+  int fill_cells_(const storage::ObSSGCTablet *tablet, const common::ObString &value);
+  static DiagGroupType get_diag_group_(const storage::ObMarkSweepGroupType group,
+                                      const storage::ObSSMarkSweepDiagFileType type);
+  static const char *group_to_str_(const storage::ObMarkSweepGroupType group,
+                                  const storage::ObSSMarkSweepDiagFileType type);
   static const char *type_to_str_(const storage::ObSSMarkSweepDiagFileType type);
 
 private:
@@ -90,7 +101,7 @@ private:
   int64_t round_id_;
   uint64_t target_tenant_id_;
   bool has_group_filter_;
-  storage::ObMarkSweepGroupType group_filter_;
+  DiagGroupType group_filter_;
   bool has_type_filter_;
   storage::ObSSMarkSweepDiagFileType type_filter_;
   bool has_ls_id_filter_;
@@ -114,6 +125,8 @@ private:
   bool is_cur_record_decoded_;
   storage::ObSSMarkSweepDiagTabletMacros cur_macros_;     // decoded when current type=macros
   storage::ObSSMarkSweepTabletMetaScns cur_meta_scns_;    // decoded when current type=tablet_meta_scns
+  storage::ObSSLobMetaGCDiagRows cur_lob_meta_rows_;
+  storage::ObSSLobCtrlGCDiagRows cur_lob_ctrl_rows_;
   storage::ObSSMarkSweepDiagStudyResults cur_study_results_; // Raw per-node watermarks of the current record
   int64_t item_idx_;     // index into the current record's items
 

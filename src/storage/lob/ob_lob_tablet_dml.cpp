@@ -7,6 +7,7 @@
 
 #include "lib/ob_errno.h"
 #include "lib/utility/ob_macro_utils.h"
+#include "lib/utility/utility.h"
 #include "object/ob_object.h"
 #include "storage/blocksstable/ob_storage_datum.h"
 #include "storage/lob/common/ob_lob_context.h"
@@ -199,7 +200,7 @@ int ObLobTabletDmlHelper::update_before(
 
     // Step 3: 若 old_loc_ 是 outrow，或者 dest_loc_ 是 outrow，则创建 ObLobDmlTask 添加到队列中，after 阶段执行
     if (OB_FAIL(ret)) {
-    } else if (upd_ctx.old_loc_.is_outrow_disk_lob_locator() || outrow) {
+    } else if (upd_ctx.old_loc_.is_outline_disk_lob_locator() || outrow) {
       ObLobDmlTask task;
       if (OB_FAIL(task.from_ctx(upd_ctx, row_idx, col_idx))) {
         LOG_WARN("failed build update task from update ctx", KR(ret), K(upd_ctx));
@@ -239,19 +240,12 @@ int ObLobTabletDmlHelper::update_after(
     // do nothing
   } else if (is_delete_and_insert) {
     // do nothing
-  } else if (is_outrow_lob_unsupported_index(run_ctx)) {
-    ret = OB_NOT_SUPPORTED;
-    LOG_USER_ERROR(OB_NOT_SUPPORTED, "outrow lob in index table");
-    LOG_WARN("outrow lob in index table is not supported", KR(ret),
-             "table_id", run_ctx.effective_table_param_->get_data_table().get_table_id(),
-             "index_type", run_ctx.effective_table_param_->get_data_table().get_index_type());
   } else {
-    ObLobDeleteContext del_ctx;    
-    if (OB_FAIL(del_ctx.build(run_ctx, old_row, task.col_idx_, task.old_loc_))) {
-      LOG_WARN("failed to build delete context", KR(ret), K(task));
-    } else if (FALSE_IT(del_ctx.try_flush_redo_ = true)) {
-    } else if (OB_FAIL(lob_mgr->del(del_ctx))) {
-      LOG_WARN("failed delete lob in update", KR(ret), K(task));
+    ObLobDeleteContext del_ctx;
+    blocksstable::ObStorageDatum &old_datum = old_row.storage_datums_[task.col_idx_];
+    if (OB_FAIL(delete_lob_col(run_ctx, old_row, task.col_idx_, old_datum, del_ctx,
+        nullptr/*old_row_log_column_idxs*/, true/*try_flush_redo*/))) {
+      LOG_WARN("failed delete old lob in update", KR(ret), K(task));
     }
   }
 
@@ -352,6 +346,7 @@ int ObLobTabletDmlHelper::delete_lob_col(
     const int16_t col_idx,
     blocksstable::ObStorageDatum &datum,
     ObLobDeleteContext &del_ctx,
+    const ObIArray<int64_t> *old_row_log_column_idxs,
     const bool try_flush_redo)
 {
   int ret = OB_SUCCESS;
@@ -378,8 +373,33 @@ int ObLobTabletDmlHelper::delete_lob_col(
     } else if (OB_FAIL(del_ctx.build_for_dml(run_ctx, data_row, col_idx, datum))) {
       LOG_WARN("failed to build param for dml", KR(ret), K(col_idx), K(datum));
     } else if (FALSE_IT(del_ctx.try_flush_redo_ = try_flush_redo)) {
-    } else if (OB_FAIL(lob_mgr->del(del_ctx))) {
-      LOG_WARN("failed to delete lob", KR(ret), K(del_ctx));
+    } else {
+      const uint64_t table_id = run_ctx.relative_table_.get_table_id();
+      // Read the LOB summary to identify OutTable old images, including no-logging ones.
+      // This may add one extra GET for an outrow LOB.
+      // TODO(@fengyun): delay the execution of the get operation until after
+      // delete, unnecessary overhead can be avoided.
+      if (!is_sys_table(table_id)
+          && !run_ctx.relative_table_.is_index_table()
+          && GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_6_3_1) {
+        ObLobTabletDmlCtx &lob_dml_ctx = run_ctx.lob_dml_ctx_;
+        if (((OB_INVALID_ID == lob_dml_ctx.lob_meta_table_id_) || (OB_INVALID_ID == lob_dml_ctx.lob_piece_table_id_))
+            && OB_FAIL(ObLobUtil::get_lob_aux_table_ids(
+                run_ctx, lob_dml_ctx.lob_meta_table_id_, lob_dml_ctx.lob_piece_table_id_))) {
+          LOG_WARN("failed to get lob aux table ids", KR(ret),
+              K(lob_dml_ctx.lob_meta_table_id_), K(lob_dml_ctx.lob_piece_table_id_));
+        } else if (OB_FAIL(try_register_lob_ext_info_log(
+            run_ctx, data_row, col_idx, del_ctx.delete_lob_seq_no_, true/*is_delete*/,
+            lob_dml_ctx.lob_meta_table_id_, lob_dml_ctx.lob_piece_table_id_, old_row_log_column_idxs))) {
+          LOG_WARN("failed to try register lob ext info log", KR(ret), K(col_idx),
+              K(del_ctx.delete_lob_seq_no_),
+              K(lob_dml_ctx.lob_meta_table_id_), K(lob_dml_ctx.lob_piece_table_id_));
+        }
+      }
+
+      if (OB_SUCC(ret) && OB_FAIL(lob_mgr->del(del_ctx))) {
+        LOG_WARN("failed to delete lob", KR(ret), K(del_ctx));
+      }
     }
   }
   return ret;
@@ -423,7 +443,7 @@ int ObLobTabletDmlHelper::prepare_lob_ext_info_log_task(
 
 int ObLobTabletDmlHelper::register_lob_summary_ext_info_log_(
     ObDMLRunningCtx &run_ctx,
-    const ObLobExtInfoLogTask &task,
+    const transaction::ObTxSEQ &lob_operation_seq_no,
     const ObLobId &lob_id,
     const ObLobMetaInfo &summary,
     const uint64_t lob_meta_table_id)
@@ -435,11 +455,11 @@ int ObLobTabletDmlHelper::register_lob_summary_ext_info_log_(
   if (OB_ISNULL(mem_ctx)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("memtable context is null when registering lob summary ext info log",
-        KR(ret), K(task), K(lob_id), K(summary));
+        KR(ret), K(lob_operation_seq_no), K(lob_id), K(summary));
   } else {
     ObLobSummaryExtInfoLog summary_log;
     summary_log.lob_aux_table_id_ = lob_meta_table_id;
-    summary_log.lob_operation_seq_no_ = task.lob_operation_seq_no_;
+    summary_log.lob_operation_seq_no_ = lob_operation_seq_no;
     summary_log.seq_id_ = summary.seq_id_;
     summary_log.byte_len_ = summary.byte_len_;
     summary_log.char_len_ = summary.char_len_;
@@ -448,7 +468,7 @@ int ObLobTabletDmlHelper::register_lob_summary_ext_info_log_(
         mem_ctx, run_ctx.store_ctx_, run_ctx.dml_param_.timeout_, run_ctx.dml_flag_,
         lob_id, summary_log))) {
       LOG_WARN("register lob full image summary callback failed", KR(ret),
-          K(task), K(lob_id), K(summary_log));
+          K(lob_operation_seq_no), K(lob_id), K(summary_log));
     }
   }
   return ret;
@@ -456,11 +476,12 @@ int ObLobTabletDmlHelper::register_lob_summary_ext_info_log_(
 
 int ObLobTabletDmlHelper::register_lob_data_ext_info_log_(
     ObDMLRunningCtx &run_ctx,
-    const ObLobExtInfoLogTask &task,
+    const transaction::ObTxSEQ &lob_operation_seq_no,
     const ObLobId &lob_id,
     const ObLobMetaInfo &summary,
     const ObLobMetaExtraInfo &extra_info,
     const uint64_t lob_piece_table_id,
+    const bool is_logging,
     ObLobReadContext &read_ctx,
     ObIAllocator &tmp_allocator)
 {
@@ -473,67 +494,71 @@ int ObLobTabletDmlHelper::register_lob_data_ext_info_log_(
   uint64_t scanned_chunk_count = 0;
   uint64_t scanned_byte_len = 0;
   uint64_t scanned_char_len = 0;
+  const int64_t chunk_size = extra_info.lob_chunk_type_.out_table()
+      ? ObLobMetaUtil::LOB_OUTTABLE_BLOCK_DATA_SIZE
+      : ObLobMetaUtil::LOB_PIECE_DATA_SIZE;
 
   if (OB_ISNULL(lob_mgr) || OB_ISNULL(mem_ctx)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid runtime context when registering lob data ext info log",
-        KR(ret), KP(lob_mgr), KP(mem_ctx), K(task), K(lob_id));
+        KR(ret), KP(lob_mgr), KP(mem_ctx), K(lob_operation_seq_no), K(lob_id));
   } else if (extra_info.chunk_count_ > 0) {
     ObString summary_seq_id = summary.seq_id_;
     seq_id_generator.set_allocator(&tmp_allocator);
     seq_id_generator.set_seq_id(summary_seq_id);
-    if (OB_FAIL(lob_mgr->query(read_ctx, query_iter))) {
-      LOG_WARN("open lob full image query iterator failed", KR(ret),
-          K(task), K(lob_id), K(read_ctx));
-    } else if (OB_ISNULL(query_iter)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("lob full image query iterator is null", KR(ret),
-          K(task), K(lob_id), K(read_ctx));
+    // INSERT chunk seq IDs are consecutive; no-logging markers need only the summary.
+    if (is_logging) {
+      if (OB_FAIL(lob_mgr->query(read_ctx, query_iter))) {
+        LOG_WARN("open lob full image query iterator failed", KR(ret), K(lob_operation_seq_no), K(lob_id), K(read_ctx));
+      } else if (OB_ISNULL(query_iter)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("lob full image query iterator is null", KR(ret), K(lob_operation_seq_no), K(lob_id), K(read_ctx));
+      }
     }
 
     for (uint64_t i = 0; OB_SUCC(ret) && (i < extra_info.chunk_count_); ++i) {
       ObLobChunk chunk;
       ObString expected_seq_id;
-      if (OB_ISNULL(query_iter)) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("lob full image query iterator is null", KR(ret),
-            K(i), K(task), K(lob_id));
-      } else if (OB_FAIL(query_iter->get_next_chunk(
-          chunk, ObLobMetaUtil::LOB_PIECE_DATA_SIZE))) {
-        if (OB_ITER_END == ret) {
+      if (is_logging) {
+        if (OB_ISNULL(query_iter)) {
           ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("lob full image query iterator is null", KR(ret), K(i), K(lob_operation_seq_no), K(lob_id));
+        } else if (OB_FAIL(query_iter->get_next_chunk(chunk, chunk_size))) {
+          if (OB_ITER_END == ret) {
+            ret = OB_ERR_UNEXPECTED;
+          }
+          LOG_WARN("get lob full image chunk failed", KR(ret), K(i), K(lob_operation_seq_no), K(lob_id));
+        } else if (OB_UNLIKELY(chunk.lob_data_.empty()
+            || (chunk.byte_len_ != static_cast<uint64_t>(chunk.lob_data_.length()))
+            || (chunk.byte_len_ > static_cast<uint64_t>(chunk_size))
+            || (chunk.char_len_ > chunk.byte_len_))) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected lob full image chunk", KR(ret), K(i), K(lob_operation_seq_no), K(lob_id), K(chunk));
+        } else if (OB_UNLIKELY(
+            (scanned_byte_len > UINT64_MAX - chunk.byte_len_)
+            || (scanned_char_len > UINT64_MAX - chunk.char_len_)
+            || (UINT64_MAX == scanned_chunk_count))) {
+          ret = OB_SIZE_OVERFLOW;
+          LOG_WARN("lob full image length overflow", KR(ret), K(i), K(lob_operation_seq_no),
+              K(lob_id), K(scanned_chunk_count), K(scanned_byte_len), K(scanned_char_len), K(chunk));
         }
-        LOG_WARN("get lob full image chunk failed", KR(ret),
-            K(i), K(task), K(lob_id));
+      }
+
+      if (OB_FAIL(ret)) {
       } else if (OB_FAIL(seq_id_generator.get_next_seq_id(expected_seq_id))) {
-        LOG_WARN("generate expected lob full image seq id failed", KR(ret),
-            K(i), K(task), K(lob_id));
-      } else if (OB_UNLIKELY(chunk.lob_data_.empty()
-          || (chunk.byte_len_ != static_cast<uint64_t>(chunk.lob_data_.length()))
-          || (chunk.byte_len_ > ObLobMetaUtil::LOB_PIECE_DATA_SIZE)
-          || (chunk.char_len_ > chunk.byte_len_))) {
-        ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected lob full image chunk", KR(ret),
-            K(i), K(task), K(lob_id), K(chunk));
-      } else if (OB_UNLIKELY(
-          (scanned_byte_len > UINT64_MAX - chunk.byte_len_)
-          || (scanned_char_len > UINT64_MAX - chunk.char_len_)
-          || (UINT64_MAX == scanned_chunk_count))) {
-        ret = OB_SIZE_OVERFLOW;
-        LOG_WARN("lob full image length overflow", KR(ret),
-            K(i), K(task), K(lob_id), K(scanned_chunk_count),
-            K(scanned_byte_len), K(scanned_char_len), K(chunk));
+        LOG_WARN("generate expected lob full image seq id failed", KR(ret), K(i), K(lob_operation_seq_no), K(lob_id));
       } else {
         ObLobDataExtInfoLog data_log;
         data_log.lob_aux_table_id_ = lob_piece_table_id;
-        data_log.lob_operation_seq_no_ = task.lob_operation_seq_no_;
+        data_log.lob_operation_seq_no_ = lob_operation_seq_no;
         data_log.seq_id_ = expected_seq_id;
-        data_log.lob_data_ = chunk.lob_data_;
+        data_log.lob_data_ = is_logging ? chunk.lob_data_ : ObString();
+        data_log.is_logging_ = is_logging;
         if (OB_FAIL(cb_register.register_lob_data_cb(
             mem_ctx, run_ctx.store_ctx_, run_ctx.dml_param_.timeout_, run_ctx.dml_flag_,
             lob_id, data_log))) {
           LOG_WARN("register lob full image data callback failed", KR(ret), K(i),
-              K(task), K(lob_id), K(data_log));
+              K(lob_operation_seq_no), K(lob_id), K(data_log));
         } else {
           ++scanned_chunk_count;
           scanned_byte_len += chunk.byte_len_;
@@ -542,23 +567,22 @@ int ObLobTabletDmlHelper::register_lob_data_ext_info_log_(
       }
     }
 
-    if (OB_SUCC(ret)) {
+    if (OB_SUCC(ret) && is_logging) {
       ObLobChunk extra_chunk;
-      const int tmp_ret = query_iter->get_next_chunk(
-          extra_chunk, ObLobMetaUtil::LOB_PIECE_DATA_SIZE);
+      const int tmp_ret = query_iter->get_next_chunk(extra_chunk, chunk_size);
       if (OB_SUCCESS == tmp_ret) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected extra lob full image chunk", KR(ret),
-            K(task), K(lob_id), K(extra_chunk), K(extra_info));
+            K(lob_operation_seq_no), K(lob_id), K(extra_chunk), K(extra_info));
       } else if (OB_ITER_END != tmp_ret) {
         ret = tmp_ret;
-        LOG_WARN("check lob full image query end failed", KR(ret), K(task), K(lob_id));
+        LOG_WARN("check lob full image query end failed", KR(ret), K(lob_operation_seq_no), K(lob_id));
       } else if (OB_UNLIKELY((scanned_chunk_count != extra_info.chunk_count_)
           || (scanned_byte_len != summary.byte_len_)
           || (scanned_char_len != summary.char_len_))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("lob full image summary and chunks mismatch", KR(ret),
-            K(task), K(lob_id), K(scanned_chunk_count), K(scanned_byte_len),
+            K(lob_operation_seq_no), K(lob_id), K(scanned_chunk_count), K(scanned_byte_len),
             K(scanned_char_len), K(summary), K(extra_info));
       }
     }
@@ -571,19 +595,41 @@ int ObLobTabletDmlHelper::register_lob_data_ext_info_log_(
   return ret;
 }
 
-int ObLobTabletDmlHelper::register_lob_ext_info_log(
+/*
+ * Ext info log registration after old-row projection filtering:
+ *
+ * +-----------+------------------+----------------------+---------+------+
+ * | is_delete | last_write_type_ | lob_chunk_type_      | Summary | Data |
+ * +-----------+------------------+----------------------+---------+------+
+ * | false     | INSERT           | IN_TABLE / OUT_TABLE | Yes     | Yes  |
+ * | false     | non-INSERT       | IN_TABLE / OUT_TABLE | Yes     | No   |
+ * | true      | INSERT           | IN_TABLE             | No      | No   |
+ * | true      | INSERT           | OUT_TABLE            | No      | Yes  |
+ * | true      | non-INSERT       | IN_TABLE / OUT_TABLE | No      | No   |
+ * +-----------+------------------+----------------------+---------+------+
+ *
+ * 1. is_delete means deleting the old LOB, including an updated column's old LOB.
+ * Its summary is already in meta redo;
+ * 2. IN_TABLE data is already in aux_lob_piece table redo.
+ * 3. Unsupported chunk types and columns excluded by the projection register neither log.
+ * 4. Data registration uses is_logging = in_table() || is_write_clog: OUT_TABLE with clog
+ * disabled registers empty no-logging markers instead of data payloads.
+ */
+int ObLobTabletDmlHelper::try_register_lob_ext_info_log(
     ObDMLRunningCtx &run_ctx,
     const blocksstable::ObDatumRow &old_row,
-    const ObLobExtInfoLogTask &task,
+    const int16_t col_idx,
+    const transaction::ObTxSEQ &lob_operation_seq_no,
+    const bool is_delete,
     const uint64_t lob_meta_table_id,
-    const uint64_t lob_piece_table_id)
+    const uint64_t lob_piece_table_id,
+    const ObIArray<int64_t> *old_row_log_column_idxs)
 {
   int ret = OB_SUCCESS;
   ObLobManager *lob_mgr = MTL(ObLobManager *);
   memtable::ObIMvccCtx *mem_ctx = run_ctx.store_ctx_.mvcc_acc_ctx_.mem_ctx_;
-  // build_for_dml() 将 mem locator 保存在 DML LOB allocator 中；后续把
-  // read_ctx 的工作 allocator 切换到这里，使 Summary、RPC buffer 和 seq_id
-  // 临时内存在单个 LOB image 处理完成后整体释放。
+  // build_for_dml() keeps the memory locator in the DML LOB allocator. Use a separate allocator here
+  // so temporary summary, RPC buffer, and seq_id memory can be released after one LOB image is handled.
   ObArenaAllocator tmp_allocator("LobExtInfoLog", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
   ObLobReadContext read_ctx;
   ObLobMetaInfo summary;
@@ -591,82 +637,100 @@ int ObLobTabletDmlHelper::register_lob_ext_info_log(
   ObLobId lob_id;
   char summary_seq_buf[ObLobSeqId::LOB_SEQ_ID_MIN_LEN];
   ObString summary_seq_id(sizeof(summary_seq_buf), summary_seq_buf);
-  bool need_register_ext_info_log = false;
+  bool is_write_clog = true;
+  bool need_register_summary_ext_info_log = false;
+  bool need_register_data_ext_info_log = false;
 
   if (OB_ISNULL(lob_mgr) || OB_ISNULL(mem_ctx) || OB_ISNULL(run_ctx.col_descs_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("invalid lob full image runtime context", KR(ret), KP(lob_mgr),
-        KP(mem_ctx), KP(run_ctx.col_descs_), K(task));
-  } else if (OB_UNLIKELY(!task.is_valid()
-      || (task.row_idx_ < 0)
-      || (task.col_idx_ < 0)
-      || (task.col_idx_ >= old_row.count_)
-      || (task.col_idx_ >= run_ctx.col_descs_->count())
+        KP(mem_ctx), KP(run_ctx.col_descs_), K(col_idx), K(lob_operation_seq_no), K(is_delete));
+  } else if (OB_UNLIKELY((col_idx < 0)
+      || (col_idx >= old_row.count_)
+      || (col_idx >= run_ctx.col_descs_->count())
+      || !lob_operation_seq_no.is_valid()
       || (OB_INVALID_ID == lob_meta_table_id)
       || (OB_INVALID_ID == lob_piece_table_id))) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid lob full image log argument", KR(ret), K(task), K(old_row.count_),
-        K(lob_meta_table_id), K(lob_piece_table_id));
+    LOG_WARN("invalid lob full image log argument", KR(ret), K(col_idx), K(lob_operation_seq_no),
+        K(is_delete), K(old_row.count_), K(lob_meta_table_id), K(lob_piece_table_id));
+  } else if (OB_NOT_NULL(old_row_log_column_idxs)
+      && col_idx >= run_ctx.relative_table_.get_rowkey_column_num()
+      && !has_exist_in_array(*old_row_log_column_idxs, static_cast<int64_t>(col_idx))) {
+    // MINIMAL mode delete do not need all columns, only need part of columns. thus, skip columns
+    // omitted from the old-row log. A null projection and rowkey columns always bypass this filter.
   } else {
-    const blocksstable::ObStorageDatum &old_datum = old_row.storage_datums_[task.col_idx_];
+    const blocksstable::ObStorageDatum &old_datum = old_row.storage_datums_[col_idx];
+    // Only INSERT can skip prefetching the global snapshot and use none_read. This function reads an
+    // existing LOB old image for UPDATE or DELETE, so allow_none_read_snapshot is always false.
     if (OB_UNLIKELY(old_datum.is_null() || old_datum.is_nop_value())) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("old lob datum is null or nop for full image log", KR(ret), K(task), K(old_datum));
-    }
-    // 注：只有 INSERT 才有可能跳过提前获取全局快照，使用 none_read。而 register_lob_ext_info_log 补充
-    // 未更新 lob 列前镜像的日志，不会用在 INSERT 场景下，因此这里 allow_none_read_snapshot 固定传 false。
-    else if (OB_FAIL(read_ctx.build_for_dml(
-        run_ctx, task.col_idx_, old_datum, false/*allow_none_read_snapshot*/))) {
-      LOG_WARN("build lob full image read context failed", KR(ret), K(task), K(old_datum));
+      LOG_WARN("old lob datum is null or nop for full image log", KR(ret), K(col_idx), K(old_datum));
+    } else if (OB_FAIL(read_ctx.build_for_dml(run_ctx, col_idx, old_datum, false/*allow_none_read_snapshot*/))) {
+      LOG_WARN("build lob full image read context failed", KR(ret), K(col_idx), K(old_datum));
     } else if (FALSE_IT(read_ctx.allocator_ = &tmp_allocator)) {
     } else if (OB_FAIL(read_ctx.src_loc_wrapper_.get_lob_id(lob_id))) {
-      LOG_WARN("get lob id from full image locator failed", KR(ret), K(task), K(read_ctx));
+      LOG_WARN("get lob id from full image locator failed", KR(ret), K(col_idx), K(read_ctx));
     } else if (OB_FAIL(lob_mgr->get_lob_summary_info(read_ctx, summary))) {
-      LOG_WARN("get lob full image summary failed", KR(ret), K(task), K(lob_id), K(read_ctx));
+      LOG_WARN("get lob full image summary failed", KR(ret), K(col_idx), K(lob_id), K(read_ctx));
     } else if (OB_FAIL(ObLobSeqId::get_summary_seq_id(summary_seq_id))) {
-      LOG_WARN("generate lob summary seq id failed", KR(ret), K(task), K(lob_id));
-    } else if (OB_FAIL(extra_info.deserialize(summary.lob_extra_info_))) {
-      LOG_WARN("deserialize lob full image summary failed", KR(ret), K(task), K(lob_id), K(summary));
+      LOG_WARN("generate lob summary seq id failed", KR(ret), K(col_idx), K(lob_id));
+    } else if (OB_FAIL(extra_info.deserialize(tmp_allocator, summary.lob_extra_info_))) {
+      LOG_WARN("deserialize lob full image summary failed", KR(ret), K(col_idx), K(lob_id), K(summary));
     } else if (OB_UNLIKELY((summary.lob_col_idx_ != read_ctx.column_idx())
         || (summary.lob_id_ != lob_id)
         || (summary.seq_id_ != summary_seq_id))) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected lob full image summary row", KR(ret), K(task), K(lob_id),
+      LOG_WARN("unexpected lob full image summary row", KR(ret), K(col_idx), K(lob_id),
           K(summary), K(read_ctx.column_idx()));
     } else if (OB_UNLIKELY(ObLobMetaExtraInfo::LOB_META_SUMMARY != extra_info.extra_info_type_)) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected lob full image extra info type", KR(ret), K(task),
+      LOG_WARN("unexpected lob full image extra info type", KR(ret), K(col_idx),
           K(lob_id), K(extra_info));
+    } else if (extra_info.is_external_lob()) {
+      // External has no Internal pieces; CDC full-image logging is not added yet.
+      // Skip before piece validation to avoid errors when updating only ordinary columns.
+      LOG_DEBUG("skip external lob full image log", K(col_idx), K(lob_id), K(extra_info));
     } else if (OB_UNLIKELY((summary.byte_len_ > static_cast<uint64_t>(INT64_MAX - 1))
         || (summary.char_len_ > summary.byte_len_)
         || ((0 == summary.byte_len_) != (0 == extra_info.chunk_count_))
         || ((summary.byte_len_ > 0) && (extra_info.chunk_count_ > summary.byte_len_)))) {
       ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("unexpected in-table lob full image summary", KR(ret), K(task),
-          K(lob_id), K(summary), K(extra_info));
-    } else if (OB_UNLIKELY(ObLobLastWriteType::INSERT != extra_info.last_write_type_)) {
-      // 当前只为 INSERT 类型的完整 LOB 镜像补日志，其他写入类型（例如 APPEND）不支持 CDC，跳过。
-      LOG_DEBUG("skip non-insert lob last write type", K(task), K(lob_id),
-          K(extra_info));
-    } else if (OB_UNLIKELY(!extra_info.lob_chunk_type_.in_table())) {
-      // TODO(binifei.bnf): 目前仅支持 IN_TABLE，后续支持 OUT_TABLE 时再增加处理逻辑。
-      LOG_DEBUG("skip non-in-table lob chunk type", K(task), K(lob_id),
-          K(extra_info));
+      LOG_WARN("unexpected lob full image summary", KR(ret), K(col_idx), K(lob_id), K(summary), K(extra_info));
     } else {
       read_ctx.byte_size_ = summary.byte_len_;
-      need_register_ext_info_log = true;
+    }
+
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(ObLobOutTableIO::enable_outtable_clog(MTL_ID(), is_write_clog))) {
+      LOG_WARN("failed to check whether to write outtable lob clog", KR(ret));
+    } else if (OB_UNLIKELY(!extra_info.lob_chunk_type_.in_table() && !extra_info.lob_chunk_type_.out_table())) {
+      LOG_DEBUG("skip unsupported lob chunk type", K(col_idx), K(lob_id), K(extra_info));
+    } else {
+      // 1. non-updated column: should register summary ext info log here.
+      // 2. delete or update column: already writes aux_lob_meta table redo, do not register again.
+      need_register_summary_ext_info_log = !is_delete;
+      // 1. only register data ext info log for INSERT type, other type (e.g., APPEND)
+      // do not support CDC and skip register data ext info log.
+      // 2. non-updated column: both IN_TABLE and OUT_TABLE chunk, should register data ext info log here.
+      // 3. delete or update column: IN_TABLE chunk already writes aux_lob_piece table redo, do not
+      // register again. OUT_TABLE chunk should register data ext info log here.
+      need_register_data_ext_info_log = (ObLobLastWriteType::INSERT == extra_info.last_write_type_)
+          && (!is_delete || extra_info.lob_chunk_type_.out_table());
     }
   }
 
-  if (OB_SUCC(ret) && need_register_ext_info_log) {
-    if (OB_FAIL(register_lob_summary_ext_info_log_(
-        run_ctx, task, lob_id, summary, lob_meta_table_id))) {
-      LOG_WARN("register lob summary ext info log failed", KR(ret), K(task), K(lob_id));
-    } else if (OB_FAIL(register_lob_data_ext_info_log_(
-        run_ctx, task, lob_id, summary, extra_info, lob_piece_table_id,
-        read_ctx, tmp_allocator))) {
-      LOG_WARN("register lob data ext info log failed", KR(ret), K(task), K(lob_id));
-    }
+  if (OB_SUCC(ret) && need_register_summary_ext_info_log
+      && OB_FAIL(register_lob_summary_ext_info_log_(
+          run_ctx, lob_operation_seq_no, lob_id, summary, lob_meta_table_id))) {
+    LOG_WARN("register lob summary ext info log failed", KR(ret), K(col_idx), K(lob_id));
+  }
+  if (OB_SUCC(ret) && need_register_data_ext_info_log
+      && OB_FAIL(register_lob_data_ext_info_log_(
+          run_ctx, lob_operation_seq_no, lob_id, summary, extra_info, lob_piece_table_id,
+          extra_info.lob_chunk_type_.in_table() || is_write_clog,
+          read_ctx, tmp_allocator))) {
+    LOG_WARN("register lob data ext info log failed", KR(ret), K(col_idx), K(lob_id));
   }
   return ret;
 }

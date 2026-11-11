@@ -72,6 +72,7 @@ public:
                             const int16_t col_idx,
                             blocksstable::ObStorageDatum &datum,
                             ObLobDeleteContext &del_ctx,
+                            const common::ObIArray<int64_t> *old_row_log_column_idxs,
                             const bool try_flush_redo = false);
 
   static int prepare_lob_ext_info_log_task(
@@ -79,28 +80,32 @@ public:
       const int16_t row_idx,
       const int16_t col_idx);
 
-  static int register_lob_ext_info_log(
+  static int try_register_lob_ext_info_log(
       ObDMLRunningCtx &run_ctx,
       const blocksstable::ObDatumRow &old_row,
-      const ObLobExtInfoLogTask &task,
+      const int16_t col_idx,
+      const transaction::ObTxSEQ &lob_operation_seq_no,
+      const bool is_delete,
       const uint64_t lob_meta_table_id,
-      const uint64_t lob_piece_table_id);
+      const uint64_t lob_piece_table_id,
+      const common::ObIArray<int64_t> *old_row_log_column_idxs);
 
 private:
   static int register_lob_summary_ext_info_log_(
       ObDMLRunningCtx &run_ctx,
-      const ObLobExtInfoLogTask &task,
+      const transaction::ObTxSEQ &lob_operation_seq_no,
       const ObLobId &lob_id,
       const ObLobMetaInfo &summary,
       const uint64_t lob_meta_table_id);
 
   static int register_lob_data_ext_info_log_(
       ObDMLRunningCtx &run_ctx,
-      const ObLobExtInfoLogTask &task,
+      const transaction::ObTxSEQ &lob_operation_seq_no,
       const ObLobId &lob_id,
       const ObLobMetaInfo &summary,
       const ObLobMetaExtraInfo &extra_info,
       const uint64_t lob_piece_table_id,
+      const bool is_logging,
       ObLobReadContext &read_ctx,
       common::ObIAllocator &tmp_allocator);
 

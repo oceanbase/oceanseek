@@ -327,7 +327,15 @@ int ObExprFromBase64::vector_from_base64(VECTOR_EVAL_FUNC_ARG_DECL) {
         }
         if (OB_SUCC(ret)) {
           if (in_raw.empty()) {
-            res_vec->set_string(i, nullptr, 0);
+            if (ob_is_text_tc(expr.datum_meta_.type_)) {
+              ObTextStringDatumResult res_text(expr.datum_meta_.type_, &expr, &ctx, res_vec, i);
+              if (OB_FAIL(ObExprUtil::set_expr_ascii_result(
+                      expr, ctx, res_text, ObString(), i, /* is_ascii= */true))) {
+                LOG_WARN("set empty lob result failed", K(ret));
+              }
+            } else {
+              res_vec->set_string(i, nullptr, 0);
+            }
           } else {
             int64_t buf_len = base64_needed_decoded_length(in_raw_len);
             int64_t pos = 0;

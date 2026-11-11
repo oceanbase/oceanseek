@@ -43,6 +43,10 @@ void ObMemLobLocatorBuilder::reset()
   allocator_ = nullptr;
   input_.reset(); 
   input_wrapper_.reset();
+  extern_header_ = common::ObMemLobExternHeader();
+  location_info_ = common::ObMemLobLocationInfo();
+  retry_info_ = common::ObMemLobRetryInfo();
+  external_lob_info_ = common::ObExternalBlobInfo();
   tx_read_snapshot_ = nullptr;
   read_snapshot_ls_id_ = ObLSID::INVALID_LS_ID;
   fb_snapshot_ = share::SCN::invalid_scn();
@@ -58,6 +62,7 @@ void ObMemLobLocatorBuilder::reset()
   has_retry_info_ = false;
   has_read_snapshot_ = false;
   has_row_key_ = false;
+  is_external_lob_ = false;
   need_payload_ = false;
 }
 
@@ -75,7 +80,7 @@ int ObMemLobLocatorBuilder::init(
   } else if (OB_UNLIKELY(!input_wrapper_.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid input wrapper", KR(ret), K(input_wrapper_));
-  } else if (input_wrapper_.is_outrow() && need_data) {
+  } else if (input_wrapper_.is_outline() && need_data) {
     need_payload_ = true;
   }
 
@@ -83,6 +88,19 @@ int ObMemLobLocatorBuilder::init(
   } else {
     allocator_ = &allocator;
     input_ = input;
+    is_inited_ = true;
+  }
+  return ret;
+}
+
+int ObMemLobLocatorBuilder::init(common::ObIAllocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  if (IS_INIT) {
+    ret = OB_INIT_TWICE;
+    STORAGE_LOG(WARN, "mem lob locator builder is init twice", KR(ret));
+  } else {
+    allocator_ = &allocator;
     is_inited_ = true;
   }
   return ret;
@@ -98,7 +116,8 @@ int ObMemLobLocatorBuilder::set_extern_info(
     ret = OB_NOT_INIT;
     STORAGE_LOG(WARN, "mem lob locator builder is not init", KR(ret));
   } else if (OB_UNLIKELY(!is_valid_id(table_id) || !is_valid_id(column_idx)
-    || (cs_type <= CS_TYPE_INVALID || cs_type >= CS_TYPE_MAX))) {
+            || (cs_type <= CS_TYPE_INVALID || cs_type >= CS_TYPE_MAX)
+            || (is_external_lob_ && CS_TYPE_BINARY != cs_type))) {
     ret = OB_INVALID_ARGUMENT;
     STORAGE_LOG(WARN, "invalid table info", KR(ret), K(table_id), K(column_idx));
   } else {
@@ -108,10 +127,11 @@ int ObMemLobLocatorBuilder::set_extern_info(
     has_extern_ = true;
   }
  
-  // 若 input 是 outrow，则优先取 lob id 中的 column_idx_
+  // 若 input 是 outline，则优先取 lob id 中的 column_idx_
   // 这里是临时的解决方案，Column Store 读路径中的 columns_index 会硬编码为 0，导致读路径失效
   if (OB_FAIL(ret)) {
-  } else if (input_wrapper_.is_outrow()) {
+  } else if (input_wrapper_.is_outline()) {
+    // Temporary External has no input Disk locator; only persisted outline references have a LobId.
     ObLobId lob_id;
     if (OB_FAIL(input_wrapper_.get_lob_id(lob_id))) {
       LOG_WARN("failed to get lob id from input_wrapper", KR(ret), K(input_wrapper_), KPC(this));
@@ -207,6 +227,67 @@ int ObMemLobLocatorBuilder::set_rowkey(const common::ObString &rowkey_str)
   return ret;
 }
 
+int ObMemLobLocatorBuilder::set_external_lob_info(
+    const common::ObExternalBlobInfo &external_lob_info)
+{
+  int ret = OB_SUCCESS;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    STORAGE_LOG(WARN, "mem lob locator builder is not init", KR(ret));
+  } else if (OB_UNLIKELY(
+                 !external_lob_info.is_valid()
+                 || (!input_.empty() && input_wrapper_.is_inrow())
+                 || (CS_TYPE_INVALID != extern_header_.cs_type_
+                     && CS_TYPE_BINARY != extern_header_.cs_type_))) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "invalid external lob info context", KR(ret),
+                K(external_lob_info), K(input_wrapper_), K(extern_header_));
+  } else {
+    external_lob_info_ = external_lob_info;
+    extern_header_.cs_type_ = CS_TYPE_BINARY;
+    is_external_lob_ = true;
+    has_extern_ = true;
+  }
+  return ret;
+}
+
+int ObMemLobLocatorBuilder::set_summary_info()
+{
+  int ret = OB_SUCCESS;
+  ObLobManager *lob_mgr = MTL(ObLobManager *);
+  ObArenaAllocator allocator("LobExtInfo", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID());
+  ObMemLobLocatorBuilder tmp_builder(*this);
+  ObLobLocatorV2 tmp_locator;
+  ObLobReadContext read_ctx;
+  ObLobMetaExtraInfo extra_info;
+  // Release the temporary locator with the local allocator.
+  tmp_builder.allocator_ = &allocator;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    STORAGE_LOG(WARN, "mem lob locator builder is not init", KR(ret));
+  } else if (OB_ISNULL(lob_mgr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("lob manager is null", KR(ret));
+  // build temp locator to get summary info, its memory alloced will free in this function
+  // TODO by renhe: consider to replace with build_query_param
+  } else if (OB_FAIL(tmp_builder.build(tmp_locator))) {
+    LOG_WARN("failed to build temporary lob locator", KR(ret), K(input_wrapper_));
+  } else if (OB_FAIL(read_ctx.build(tmp_locator, allocator, 0, UINT64_MAX))) {
+    LOG_WARN("failed to build extend lob read context", KR(ret), K(tmp_locator));
+  } else if (OB_FAIL(lob_mgr->get_meta_summary_extra_info(read_ctx, extra_info))) {
+    LOG_WARN("failed to get lob summary extra info", KR(ret), K(read_ctx));
+  } else if (extra_info.is_external_lob()) {
+    ObExternalBlobInfo external_lob_info;
+    // Keep the strings alive until build() encodes the final locator.
+    if (OB_FAIL(external_lob_info.deep_copy(*allocator_, extra_info.external_lob_info_))) {
+      LOG_WARN("failed to copy external lob info", KR(ret), K(read_ctx.tablet_id_));
+    } else if (OB_FAIL(set_external_lob_info(external_lob_info))) {
+      LOG_WARN("failed to set external lob info", KR(ret), K(external_lob_info));
+    }
+  }
+  return ret;
+}
+
 int ObMemLobLocatorBuilder::build(common::ObLobLocatorV2 &locator)
 {
   int ret = OB_SUCCESS;
@@ -273,6 +354,19 @@ int ObMemLobLocatorBuilder::build(common::ObLobLocatorV2 &locator)
         } else {
           new (buf + offset) ObMemLobRetryInfo(retry_info_);
           offset += sizeof(ObMemLobRetryInfo);
+        }
+      }
+
+      if (OB_FAIL(ret)) {
+      } else if (is_external_lob_) {
+        const int64_t info_size = ObExternalBlobInfoLayout::get_size(external_lob_info_);
+        if (OB_UNLIKELY(locator_size_ < offset + info_size)) {
+          ret = OB_SIZE_OVERFLOW;
+          STORAGE_LOG(WARN, "mem lob locator size overflow", KR(ret), K(locator_size_));
+        } else {
+          ObExternalBlobInfoLayout *info = new (buf + offset) ObExternalBlobInfoLayout();
+          info->assign(external_lob_info_);
+          offset += info_size;
         }
       }
 
@@ -351,6 +445,11 @@ int ObMemLobLocatorBuilder::calc_size_()
     if (has_retry_info_) {
       locator_size_ += sizeof(common::ObMemLobRetryInfo);
       extern_body_size_ += sizeof(common::ObMemLobRetryInfo);
+    }
+    if (is_external_lob_) {
+      const int64_t info_size = ObExternalBlobInfoLayout::get_size(external_lob_info_);
+      locator_size_ += info_size;
+      extern_body_size_ += info_size;
     }
     if (has_read_snapshot_) {
       locator_size_ += sizeof(common::ObMemLobReadSnapshot);
@@ -467,6 +566,10 @@ int ObMemLobLocatorBuilder::prepare_mem_lob_common_(common::ObMemLobCommon &mem_
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     STORAGE_LOG(WARN, "mem lob locator builder is not init", KR(ret));
+  } else if (is_external_lob_ && input_.empty()) {
+    mem_lob_common.type_ = ObMemLobType::EXTERNAL_TEMP_LOB;
+    mem_lob_common.lob_common_.in_row_ = 0;
+    mem_lob_common.lob_common_.is_mem_loc_ = 1;
   } else {
     ObLobLocatorV2 disk_locator(input_);
     if (OB_UNLIKELY(!disk_locator.is_valid() || !disk_locator.is_lob_disk_locator())) {
@@ -476,15 +579,16 @@ int ObMemLobLocatorBuilder::prepare_mem_lob_common_(common::ObMemLobCommon &mem_
       mem_lob_common.lob_common_ = *disk_locator.get_lob_common();
       mem_lob_common.lob_common_.is_mem_loc_ = 1;
     }
-    if (OB_FAIL(ret)) {
-    } else {
-      mem_lob_common.disk_locator_size_ = disk_locator_size_;
-      mem_lob_common.set_has_extern(has_extern_);
-      mem_lob_common.set_has_payload(need_payload_);
-      if (need_payload_) {
-        mem_lob_common.payload_offset_ = payload_offset_;
-        mem_lob_common.payload_size_ = payload_size_;
-      }
+  }
+
+  if (OB_FAIL(ret)) {
+  } else {
+    mem_lob_common.disk_locator_size_ = disk_locator_size_;
+    mem_lob_common.set_has_extern(has_extern_);
+    mem_lob_common.set_has_payload(need_payload_);
+    if (need_payload_) {
+      mem_lob_common.payload_offset_ = payload_offset_;
+      mem_lob_common.payload_size_ = payload_size_;
     }
   }
   return ret;
@@ -528,6 +632,7 @@ int ObMemLobLocatorBuilder::prepare_extern_header_(common::ObMemLobExternHeader 
     extern_header.has_retry_info_ = has_retry_info_ ? 1 : 0;
     extern_header.has_read_snapshot_ = has_read_snapshot_ ? 1 : 0;
     extern_header.has_row_key_ = has_row_key_ ? 1 : 0;
+    extern_header.is_external_lob_ = is_external_lob_ ? 1 : 0;
     extern_header.rowkey_size_ = rowkey_.length();
   }
   return ret;
@@ -739,6 +844,8 @@ int ObLobLocatorHelper::fill_lob_locator_v2(
             }
 
             if (OB_FAIL(ret)) {
+            } else if (datum_meta.is_extblob() && OB_FAIL(locator_builder.set_summary_info())) {
+              STORAGE_LOG(WARN, "failed to get lob summary info", KR(ret), K(locator_builder));
             } else if (OB_FAIL(locator_builder.build(locator))) {
               STORAGE_LOG(WARN, "failed to build locator", KR(ret), K(locator));
             } else {
@@ -796,6 +903,8 @@ int ObLobLocatorHelper::fill_lob_locator_v2(
       }
 
       if (OB_FAIL(ret)) {
+      } else if (datum_meta.is_extblob() && OB_FAIL(locator_builder.set_summary_info())) {
+        STORAGE_LOG(WARN, "failed to get lob summary info", KR(ret), K(locator_builder));
       } else if (OB_FAIL(locator_builder.build(locator))) {
         STORAGE_LOG(WARN, "failed to build locator", KR(ret), K(locator));
       } else {
@@ -924,6 +1033,9 @@ int ObLobDiskLocatorWrapper::init(const char *ptr, const int64_t len)
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), KP(ptr), K(len));
   } else if (FALSE_IT(lob_common_ = reinterpret_cast<const ObLobCommon *>(ptr))) {
+  } else if (OB_UNLIKELY(!lob_common_->is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid lob common", KR(ret), KP(ptr), K(len), KPC(lob_common_));
   } else if (OB_UNLIKELY(lob_common_->is_mem_loc_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("can not init with mem locator", KR(ret), K(lob_common_));
@@ -946,6 +1058,9 @@ int ObLobDiskLocatorWrapper::init(const char *ptr, const int64_t len)
       seq_no_ = transaction::ObTxSEQ::cast_from_int(raw_seq_no);
     }
   }
+  if (OB_FAIL(ret) && OB_ISNULL(ptr_)) {
+    reset();
+  }
   return ret;
 }
 
@@ -963,6 +1078,8 @@ void ObLobDiskLocatorWrapper::reset()
 bool ObLobDiskLocatorWrapper::is_valid() const {
   // 索引表的 outrow lob 的 seq_no 可能无效，因此不做校验
   return nullptr != lob_common_ &&
+         OB_NOT_NULL(ptr_) && len_ >= static_cast<int64_t>(sizeof(ObLobCommon)) &&
+         lob_common_->is_valid() && !lob_common_->is_mem_loc_ &&
          ((lob_common_->in_row_ && inrow_data_len_ >= 0) ||
           (!lob_common_->in_row_ && nullptr != ptr_));
 }

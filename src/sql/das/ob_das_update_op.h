@@ -5,6 +5,7 @@
 
 #ifndef DEV_SRC_SQL_DAS_OB_DAS_UPDATE_OP_H_
 #define DEV_SRC_SQL_DAS_OB_DAS_UPDATE_OP_H_
+#include "sql/das/ob_das_outtable_lob_control_key_collector.h"
 #include "sql/das/ob_das_task.h"
 #include "storage/access/ob_dml_param.h"
 #include "sql/engine/basic/ob_chunk_datum_store.h"
@@ -39,6 +40,10 @@ public:
   virtual int dump_data() const override
   { return write_buffer_.dump_data(*upd_ctdef_); }
   int64_t get_affected_rows() { return affected_rows_; }
+  const common::ObIArray<storage::ObOuttableLobControlKey> *get_outtable_lob_control_keys() const
+  {
+    return outtable_lob_control_key_collector_.get_keys();
+  }
 
   INHERIT_TO_STRING_KV("parent", ObIDASTaskOp,
                        KPC_(upd_ctdef),
@@ -49,6 +54,7 @@ private:
   ObDASUpdRtDef *upd_rtdef_;
   ObDASWriteBuffer write_buffer_;
   int64_t affected_rows_;  // local execute result, no need to serialize
+  ObDASOuttableLobControlKeyCollector outtable_lob_control_key_collector_;
 };
 
 class ObDASUpdateResult : public ObIDASTaskResult
@@ -61,10 +67,17 @@ public:
   virtual int reuse() override;
   int64_t get_affected_rows() const { return affected_rows_; }
   void set_affected_rows(int64_t affected_rows) { affected_rows_ = affected_rows; }
+  int assign_outtable_lob_control_keys(
+      const common::ObIArray<storage::ObOuttableLobControlKey> &control_keys);
+  const common::ObIArray<storage::ObOuttableLobControlKey> *get_outtable_lob_control_keys() const
+  {
+    return outtable_lob_control_key_collector_.get_keys();
+  }
   INHERIT_TO_STRING_KV("ObIDASTaskResult", ObIDASTaskResult,
                         K_(affected_rows));
 private:
   int64_t affected_rows_;
+  ObDASOuttableLobControlKeyCollector outtable_lob_control_key_collector_;
 };
 }  // namespace sql
 }  // namespace oceanbase

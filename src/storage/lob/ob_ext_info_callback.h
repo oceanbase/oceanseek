@@ -78,13 +78,13 @@ public:
   bool is_valid() const;
 
   TO_STRING_KV(K(lob_aux_table_id_), K(lob_operation_seq_no_),
-      "seq_id", ObLobSeqId(seq_id_), "lob_data_len", lob_data_.length());
+      "seq_id", ObLobSeqId(seq_id_), "lob_data_len", lob_data_.length(), K(is_logging_));
 public:
   uint64_t lob_aux_table_id_;
   transaction::ObTxSEQ lob_operation_seq_no_;
   ObString seq_id_;
   ObString lob_data_;
-  bool is_logging_; // Reserved for LOB logging metadata.
+  bool is_logging_;
 };
 
 class ObExtInfoCallback : public memtable::ObITransCallback

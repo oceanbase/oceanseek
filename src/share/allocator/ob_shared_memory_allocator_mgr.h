@@ -110,6 +110,10 @@ class TxShareMemThrottleUtil
 public:
   static const int64_t SLEEP_INTERVAL_PER_TIME = 20 * 1000; // 20ms;
 
+  // Returns true when the write task of the current thread has been canceled,
+  // i.e. the statement must not sleep on memory throttling any more.
+  typedef bool (*TaskCancelChecker)();
+
   template <typename ALLOCATOR>
   static int do_throttle(const bool for_replay,
                          const int64_t abs_expire_time,
@@ -117,7 +121,8 @@ public:
                          const ObLS &ls,
                          TxShareThrottleTool &throttle_tool,
                          ObThrottleInfoGuard &share_ti_guard,
-                         ObThrottleInfoGuard &module_ti_guard)
+                         ObThrottleInfoGuard &module_ti_guard,
+                         const TaskCancelChecker cancel_checker = nullptr)
   {
     int ret = OB_SUCCESS;
     bool has_printed_lbt = false;
@@ -135,7 +140,23 @@ public:
     while (throttle_tool.still_throttling<ALLOCATOR>(share_ti_guard, module_ti_guard) &&
            (left_interval > 0)) {
       int64_t expected_wait_time = 0;
-      if ((for_replay && MTL(ObTenantFreezer *)->exist_ls_throttle_is_skipping()) || ls.is_offline()) {
+      if (!for_replay && OB_NOT_NULL(cancel_checker) && cancel_checker()) {
+        // The task is canceled: the memory it throttles on has already been
+        // allocated and is held until the statement exits, so sleeping here
+        // only delays the statement exit and the transaction rollback. Stop
+        // and let the upper layer observe the cancel at its next check.
+        // A canceled statement re-enters this function for every following
+        // write, so rate limit the log to avoid flooding it.
+        if (TC_REACH_TIME_INTERVAL(1 * 1000 * 1000)) {
+          SHARE_LOG(INFO,
+                    "stop throttle for canceled task",
+                    K(ALLOCATOR::throttle_unit_name()),
+                    K(sleep_time),
+                    K(left_interval),
+                    K(abs_expire_time));
+        }
+        break;
+      } else if ((for_replay && MTL(ObTenantFreezer *)->exist_ls_throttle_is_skipping()) || ls.is_offline()) {
         // skip throttle if : 1) throttle need skipping; 2) this logstream offline
         break;
       } else if ((expected_wait_time =

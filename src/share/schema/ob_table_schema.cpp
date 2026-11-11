@@ -2437,7 +2437,13 @@ int ObTableSchema::check_valid(const bool for_create) const
     // no need checking other options for view
     // XIYU: TODO for materialized view
   } else {
-    if (is_virtual_table(table_id_) && 0 > rowkey_column_num_) {
+    if (lob_intable_threshold_ < OB_MIN_LOB_INTABLE_THRESHOLD
+        || lob_intable_threshold_ > OB_MAX_LOB_INTABLE_THRESHOLD
+        || lob_intable_threshold_ < lob_inrow_threshold_) {
+      ret = OB_INVALID_ERROR;
+      LOG_WARN_RET(OB_INVALID_ERROR, "invalid lob intable threshold",
+                   K_(lob_intable_threshold), K_(lob_inrow_threshold));
+    } else if (is_virtual_table(table_id_) && 0 > rowkey_column_num_) {
       ret = OB_INVALID_ERROR;
       LOG_WARN_RET(OB_INVALID_ERROR, "invalid rowkey_column_num:", K_(table_name), K_(rowkey_column_num));
       //TODO:(xiyu) confirm to delte it
@@ -5301,7 +5307,12 @@ int ObTableSchema::check_alter_column_type(const ObColumnSchemaV2 &src_column,
   const ObAccuracy &dst_accuracy = dst_column.get_accuracy();
   const ObObjMeta &src_meta = src_column.get_meta_type();
   const ObObjMeta &dst_meta = dst_column.get_meta_type();
-  if (src_column.get_data_type() != dst_column.get_data_type()) {
+  if (OB_UNLIKELY(ObExtendBLobType == src_col_type && ObExtendBLobType != dst_col_type)) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "altering EXTBLOB to a non-EXTBLOB LOB type");
+    LOG_WARN("altering EXTBLOB to an ordinary LOB is not supported", K(ret), K(src_col_type),
+                                                                     K(dst_col_type));
+  } else if (src_column.get_data_type() != dst_column.get_data_type()) {
     char err_msg[number::ObNumber::MAX_PRINTABLE_SIZE] = {0};
     bool is_same_category = is_same_type_category(src_column, dst_column);
     is_type_reduction = false;
@@ -7741,6 +7752,7 @@ int64_t ObTableSchema::to_string(char *buf, const int64_t buf_len) const
     K_(aux_lob_piece_tid),
     K_(name_generated_type),
     K_(lob_inrow_threshold),
+    K_(lob_intable_threshold),
     K_(is_column_store_supported),
     K_(max_used_column_group_id),
     K_(column_group_cnt),

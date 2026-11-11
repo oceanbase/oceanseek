@@ -118,8 +118,8 @@ int ObSSIOCommonOp::open_object_fd(
     ObBackupIoAdapter io_adapter;
     ObIODevice *io_device = nullptr;
     const ObStorageIdMod storage_id_mod(storage_id, ObStorageUsedMod::STORAGE_USED_DATA);
-    const ObBackupIoAdapter::TableOpenParam table_param(
-        io_info.is_batch_write_, io_info.meta_type_, io_info.result_format_);
+    const ObBackupIoAdapter::ExtOpenParam ext_param(
+        io_info.is_batch_write_, io_info.meta_type_, io_info.result_format_, nullptr);
     ObPathContext ctx;
 
     if (SSObjUtil::is_tmp_file(macro_id)) {
@@ -133,7 +133,7 @@ int ObSSIOCommonOp::open_object_fd(
     }
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(io_adapter.open_with_access_type(io_device, fd, storage_dest.get_storage_info(),
-                       ctx.get_path(), access_type, storage_id_mod, table_param))) {
+                       ctx.get_path(), access_type, storage_id_mod, ext_param))) {
       LOG_WARN("fail to open with access type", KR(ret), K(storage_dest), K(ctx),
                K(access_type), K(io_info.is_batch_write_), K(io_info.meta_type_), K(io_info.result_format_));
     } else {

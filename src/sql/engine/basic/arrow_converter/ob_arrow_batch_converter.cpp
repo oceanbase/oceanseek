@@ -1050,6 +1050,7 @@ int ObArrowBatchConverter::append_datum_to_builder(const ObExpr &expr,
       case ObTextType:
       case ObMediumTextType:
       case ObLongTextType:
+      case ObExtendBLobType:
       case ObEnumType:
       case ObSetType:
         ret = append_string_datum_to_builder(expr, datum, builder, lob_arena);

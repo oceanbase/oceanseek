@@ -7,6 +7,7 @@
 
 #include "ob_storage_table_guard.h"
 #include "share/allocator/ob_shared_memory_allocator_mgr.h"
+#include "sql/session/ob_sql_session_info.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/memtable/ob_memtable.h"
 
@@ -77,7 +78,8 @@ void ObStorageTableGuard::throttle_if_needed_()
                                                                              *ls,
                                                                              throttle_tool,
                                                                              share_ti_guard,
-                                                                             module_ti_guard);
+                                                                             module_ti_guard,
+                                                                             &ObStorageTableGuard::is_task_canceled_);
         }
       }
 
@@ -93,6 +95,28 @@ void ObStorageTableGuard::throttle_if_needed_()
       }
     }
   }
+}
+
+// A canceled statement must not keep sleeping in the throttle loop. A killed
+// session cannot be observed by the storage layer in any other way: KILL
+// QUERY/SESSION and the client-disconnect callback
+// (ObSMConnectionCallback::on_disconnect) only mark the state of the session
+// bound to the current worker, they do not interrupt the worker thread.
+// The check runs once per sleep interval (20ms), so the cancel latency is
+// bounded by it instead of by DEFAULT_MAX_THROTTLE_TIME (2h).
+bool ObStorageTableGuard::is_task_canceled_()
+{
+  bool canceled = false;
+  sql::ObSQLSessionInfo *session = THIS_WORKER.get_session();
+  if (OB_NOT_NULL(session)) {
+    const sql::ObSQLSessionState state = session->get_session_state();
+    canceled = (sql::SESSION_KILLED == state || sql::QUERY_KILLED == state);
+  }
+  if (!canceled && THIS_WORKER.is_timeout()) {
+    // the statement deadline of the worker has already been reached
+    canceled = true;
+  }
+  return canceled;
 }
 
 int ObStorageTableGuard::refresh_and_protect_memtable_for_write(ObRelativeTable &relative_table)

@@ -1749,6 +1749,7 @@ bool ObStorageCachePolicyService::is_scp_candidate_table(
         || is_mv_container
         || share::schema::is_aux_lob_meta_table(table_type)
         || share::schema::is_aux_lob_piece_table(table_type)
+        || share::schema::is_aux_outtable_lob_control_table(table_type)
         || share::schema::is_index_table(table_type);
   }
   return should_check;

@@ -2625,7 +2625,7 @@ public:
        DELTA_FORMAT,
        ASYNC_INDEX_PARAMS,
        TABLE_FLAGS,
-       LOB_INTABLE_THRESHOLD = 47, // Reserved for LOB InTable threshold.
+       LOB_INTABLE_THRESHOLD,
        MAX_OPTION = 1000
   };
   enum AlterPartitionType

@@ -540,15 +540,183 @@ int all_shared_tiered_meta_schema(share::schema::ObTableSchema &table_schema)
   return ret;
 }
 
+static int add_all_outtable_lob_control_columns(
+    share::schema::ObTableSchema &table_schema,
+    uint64_t &column_id)
+{
+  int ret = OB_SUCCESS;
+
+  if (OB_SUCC(ret)) {
+    ADD_COLUMN_SCHEMA("macro_id", //column_name
+      ++column_id, //column_id
+      1, //rowkey_id
+      0, //index_id
+      0, //part_key_pos
+      ObVarcharType, //column_type
+      CS_TYPE_BINARY, //column_collation_type
+      128, //column_length
+      -1, //column_precision
+      -1, //column_scale
+      false, //is_nullable
+      false); //is_autoincrement
+  }
+
+  if (OB_SUCC(ret)) {
+    ADD_COLUMN_SCHEMA("hash", //column_name
+      ++column_id, //column_id
+      2, //rowkey_id
+      0, //index_id
+      1, //part_key_pos
+      ObUInt64Type, //column_type
+      CS_TYPE_INVALID, //column_collation_type
+      sizeof(uint64_t), //column_length
+      -1, //column_precision
+      -1, //column_scale
+      false, //is_nullable
+      false); //is_autoincrement
+  }
+
+  if (OB_SUCC(ret)) {
+    ADD_COLUMN_SCHEMA("status", //column_name
+      ++column_id, //column_id
+      0, //rowkey_id
+      0, //index_id
+      0, //part_key_pos
+      ObIntType, //column_type
+      CS_TYPE_INVALID, //column_collation_type
+      sizeof(int64_t), //column_length
+      -1, //column_precision
+      -1, //column_scale
+      false, //is_nullable
+      false); //is_autoincrement
+  }
+
+  if (OB_SUCC(ret)) {
+    ObObj last_modify_time_default;
+    ObObj last_modify_time_default_null;
+    last_modify_time_default.set_ext(ObActionFlag::OP_DEFAULT_NOW_FLAG);
+    last_modify_time_default_null.set_null();
+    ADD_COLUMN_SCHEMA_TS_T("last_modify_time", //column_name
+      ++column_id, //column_id
+      0, //rowkey_id
+      0, //index_id
+      0, //part_key_pos
+      ObTimestampType, //column_type
+      CS_TYPE_INVALID, //column_collation_type
+      0, //column_length
+      -1, //column_precision
+      6, //column_scale
+      false, //is_nullable
+      false, //is_autoincrement
+      false, //is_on_update_for_timestamp
+      last_modify_time_default_null,
+      last_modify_time_default)
+  }
+
+  if (OB_SUCC(ret)) {
+    ADD_COLUMN_SCHEMA("info", //column_name
+      ++column_id, //column_id
+      0, //rowkey_id
+      0, //index_id
+      0, //part_key_pos
+      ObVarcharType, //column_type
+      CS_TYPE_BINARY, //column_collation_type
+      OB_MAX_VARBINARY_LENGTH, //column_length
+      -1, //column_precision
+      -1, //column_scale
+      true, //is_nullable
+      false); //is_autoincrement
+  }
+
+  return ret;
+}
+
+int all_outtable_lob_control_schema(share::schema::ObTableSchema &table_schema)
+{
+  int ret = OB_SUCCESS;
+  uint64_t column_id = OB_APP_MIN_COLUMN_ID - 1;
+
+  table_schema.set_table_id(OB_INVALID_ID);
+  table_schema.set_rowkey_split_pos(0);
+  table_schema.set_is_use_bloomfilter(false);
+  table_schema.set_progressive_merge_num(0);
+  table_schema.set_rowkey_column_num(2);
+  table_schema.set_index_column_num(0);
+  table_schema.set_load_type(TABLE_LOAD_TYPE_IN_DISK);
+  table_schema.set_table_type(AUX_OUTTABLE_LOB_CONTROL);
+  table_schema.set_index_type(INDEX_TYPE_IS_NOT);
+  table_schema.set_def_type(TABLE_DEF_TYPE_INTERNAL);
+  table_schema.set_part_level(PARTITION_LEVEL_ZERO);
+  table_schema.set_charset_type(ObCharset::get_default_charset());
+  table_schema.set_collation_type(ObCharset::get_default_collation(ObCharset::get_default_charset()));
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(table_schema.set_table_name("__all_outtable_lob_control"))) {
+      LOG_WARN("fail to set table_name", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(table_schema.set_compress_func_name(OB_DEFAULT_COMPRESS_FUNC_NAME))) {
+      LOG_WARN("fail to set compress_func_name", K(ret));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    table_schema.get_part_option().set_part_func_type(PARTITION_FUNC_TYPE_HASH);
+    if (OB_FAIL(table_schema.get_part_option().set_part_expr("hash"))) {
+      LOG_WARN("set_part_expr failed", K(ret));
+    } else {
+      table_schema.get_part_option().set_part_num(128);
+      table_schema.set_part_level(PARTITION_LEVEL_ONE);
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    if (OB_FAIL(add_all_outtable_lob_control_columns(table_schema, column_id))) {
+      LOG_WARN("fail to add column schemas", K(ret));
+    }
+  }
+
+  table_schema.set_max_used_column_id(column_id);
+  return ret;
+}
+
+static const char *const ALL_OUTTABLE_LOB_CONTROL_IDX_LOB_CTRL_HASH_STATUS_COLUMNS[] = {
+  "hash",
+  "status",
+  "macro_id",
+};
+
+static const char *const ALL_OUTTABLE_LOB_CONTROL_IDX_LOB_CTRL_STATUS_TIME_COLUMNS[] = {
+  "status",
+  "last_modify_time",
+  "macro_id",
+};
+
+static const char *const ALL_OUTTABLE_LOB_CONTROL_IDX_LOB_CTRL_STATUS_TIME_STORE_COLUMNS[] = {
+  "info",
+};
+
+static const ObUserTableBuiltinLocalIndexEntry OB_USER_TABLE_BUILTIN_LOCAL_INDEX_ENTRIES[] = {
+  {"__all_outtable_lob_control", "idx_lob_ctrl_hash_status", ALL_OUTTABLE_LOB_CONTROL_IDX_LOB_CTRL_HASH_STATUS_COLUMNS, 3, nullptr, 0},
+  {"__all_outtable_lob_control", "idx_lob_ctrl_status_time", ALL_OUTTABLE_LOB_CONTROL_IDX_LOB_CTRL_STATUS_TIME_COLUMNS, 3, ALL_OUTTABLE_LOB_CONTROL_IDX_LOB_CTRL_STATUS_TIME_STORE_COLUMNS, 1},
+};
+
 static const ObUserTableBuiltinSchemaEntry OB_USER_TABLE_BUILTIN_SCHEMA_ENTRIES[] = {
   {"oceanbase", "__all_shared_meta", all_shared_meta_schema},
   {"oceanbase", "__all_shared_meta_control", all_shared_meta_control_schema},
   {"oceanbase", "__all_shared_tiered_meta", all_shared_tiered_meta_schema},
+  {"oceanbase", "__all_outtable_lob_control", all_outtable_lob_control_schema},
 };
 
 const ObUserTableBuiltinSchemaEntry *get_user_table_builtin_schema_entries()
 {
   return OB_USER_TABLE_BUILTIN_SCHEMA_ENTRIES;
+}
+
+const ObUserTableBuiltinLocalIndexEntry *get_user_table_builtin_local_index_entries()
+{
+  return OB_USER_TABLE_BUILTIN_LOCAL_INDEX_ENTRIES;
 }
 
 bool is_shared_builtin_user_table(const uint64_t tenant_id, const ObString &table_name)
@@ -561,6 +729,28 @@ bool is_shared_builtin_user_table(const uint64_t tenant_id, const ObString &tabl
       if (OB_NOT_NULL(entries[i].table_name_)
           && 0 == table_name.case_compare(entries[i].table_name_)) {
         bret = true;
+      }
+    }
+    const int64_t index_prefix_len = strlen(OB_INDEX_PREFIX);
+    int64_t pos = index_prefix_len;
+    while (!bret && table_name.prefix_match(OB_INDEX_PREFIX)
+        && pos < table_name.length()
+        && table_name.ptr()[pos] >= '0'
+        && table_name.ptr()[pos] <= '9') {
+      ++pos;
+    }
+    if (!bret && pos > index_prefix_len && pos + 1 < table_name.length()
+        && '_' == table_name.ptr()[pos]) {
+      const ObString index_name(
+          table_name.length() - pos - 1, table_name.ptr() + pos + 1);
+      const ObUserTableBuiltinLocalIndexEntry *index_entries =
+          get_user_table_builtin_local_index_entries();
+      const int64_t index_cnt = get_user_table_builtin_local_index_count();
+      for (int64_t i = 0; !bret && i < index_cnt; ++i) {
+        if (OB_NOT_NULL(index_entries[i].index_name_)
+            && 0 == index_name.case_compare(index_entries[i].index_name_)) {
+          bret = true;
+        }
       }
     }
   }

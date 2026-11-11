@@ -9,8 +9,10 @@
 #include "observer/ob_server_event_history_table_operator.h"
 #include "storage/ss_garbage_collector/ob_ss_gc_service.h"
 #include "storage/ss_garbage_collector/ob_ss_gc_util.h"
+#include "storage/ss_garbage_collector/ob_ss_mark_sweep_macro_id_iterator.h"
 #include "storage/ss_garbage_collector/shared_gc_control/ob_shared_gc_control_operator.h"
 #include "storage/ss_garbage_collector/shared_gc_task/ob_shared_gc_task_util.h"
+#include "storage/ss_garbage_collector/user_data_gc_dag_task/ob_ss_outtable_gc_task.h"
 #include "storage/incremental/atomic_protocol/ob_atomic_protocol_util.h"
 #include "storage/incremental/atomic_protocol/ob_lock_atomic_protocol.h"
 #include "storage/incremental/ob_shared_meta_service.h"
@@ -317,7 +319,8 @@ int64_t ObSSMarkSweepProgress::merge_progress_to_string(
 
 // ============================ ObSSMarkSweepCtx ============================
 ObSSMarkSweepCtx::ObSSMarkSweepCtx()
-  : compare_(), del_meta_scn_info_lock_(ObLatchIds::OB_MARK_SWEEP_LOCK)
+  : compare_(), lob_ctrl_scan_file_lock_(ObLatchIds::OB_MARK_SWEEP_LOCK),
+    del_meta_scn_info_lock_(ObLatchIds::OB_MARK_SWEEP_LOCK)
 {
   reset();
 }
@@ -328,6 +331,16 @@ void ObSSMarkSweepCtx::reset()
   tablet_with_meta_scn_arr_.reset();
   snapshot_meta_scn_.reset();
   safe_meta_scn_.reset();
+  min_outtable_data_scn_.set_max();
+  lob_meta_scan_inputs_.reset();
+  lob_ctrl_scan_inputs_.reset();
+  lob_meta_pipeline_.cleanup();
+  lob_ctrl_scan_files_.reset();
+  lob_ctrl_merge_inputs_.reset();
+  lob_ctrl_merge_outputs_.reset();
+  lob_ctrl_merged_file_.reset();
+  lob_ctrl_diff_file_.reset();
+  lob_ctrl_scan_file_mgr_.reset();
   reserved_meta_scns_.reset();
   mark_deleted_tablets_.destroy();
   ls_ss_checkpoint_scn_map_.destroy();
@@ -353,6 +366,7 @@ bool ObSSMarkSweepCtx::is_valid() const
       && (round_id_ > 0)
       && (snapshot_meta_scn_.is_valid())
       && (safe_meta_scn_.is_valid())
+      && (min_outtable_data_scn_.is_valid())
       && !tablet_with_meta_scn_arr_.empty();
 }
 
@@ -370,8 +384,14 @@ int ObSSMarkSweepCtx::init_by_param(const ObSSMarkSweepDagParam &param)
     round_id_ = param.round_id_;
     snapshot_meta_scn_ = param.snapshot_meta_scn_;
     safe_meta_scn_ = param.safe_meta_scn_;
+    min_outtable_data_scn_.set_max();
 
     tablet_with_meta_scn_arr_.set_attr(ObMemAttr(tenant_id_, "SSGCTabletArr"));
+    lob_meta_scan_inputs_.set_attr(ObMemAttr(tenant_id_, "SSGCLobInputs"));
+    lob_ctrl_scan_inputs_.set_attr(ObMemAttr(tenant_id_, "SSGCLobCtrl"));
+    lob_ctrl_scan_files_.set_attr(ObMemAttr(tenant_id_, "SSGCLobFiles"));
+    lob_ctrl_merge_inputs_.set_attr(ObMemAttr(tenant_id_, "SSGCLobMerge"));
+    lob_ctrl_merge_outputs_.set_attr(ObMemAttr(tenant_id_, "SSGCLobMerge"));
     reserved_meta_scns_.set_attr(ObMemAttr(tenant_id_, "SSGCRsvMetaScn"));
     recyclable_deleted_ls_ids_.set_attr(ObMemAttr(tenant_id_, "SSGCDelLS"));
 
@@ -439,6 +459,36 @@ int ObSSMarkSweepCtx::append_tablet_del_meta_scn_info(const ObTabletDelMetaScnIn
     ObSpinLockGuard guard(del_meta_scn_info_lock_);
     if (OB_FAIL(tablet_del_meta_scn_infos_.push_back(info))) {
       LOG_WARN("fail to push back tablet del meta scn info", KR(ret), K(info));
+    }
+  }
+  return ret;
+}
+
+int ObSSMarkSweepCtx::append_lob_ctrl_scan_file(const ObSSLobCtrlGCScanFile &file)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!file.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid lob ctrl scan file", KR(ret), K(file));
+  } else {
+    ObSpinLockGuard guard(lob_ctrl_scan_file_lock_);
+    if (OB_FAIL(lob_ctrl_scan_files_.push_back(file))) {
+      LOG_WARN("failed to append lob ctrl scan file", KR(ret), K(file));
+    }
+  }
+  return ret;
+}
+
+int ObSSMarkSweepCtx::append_lob_ctrl_merge_file(const ObSSLobCtrlGCScanFile &file)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!file.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid lob ctrl merged file", KR(ret), K(file));
+  } else {
+    ObSpinLockGuard guard(lob_ctrl_scan_file_lock_);
+    if (OB_FAIL(lob_ctrl_merge_outputs_.push_back(file))) {
+      LOG_WARN("failed to append lob ctrl merged file", KR(ret), K(file));
     }
   }
   return ret;
@@ -876,7 +926,9 @@ int ObSSMarkSweepDag::init_by_param(const ObIDagInitParam *param)
 int ObSSMarkSweepDag::create_first_task()
 {
   int ret = OB_SUCCESS;
+  const bool enable_out_table_data_gc = (GET_MIN_CLUSTER_VERSION() >= CLUSTER_VERSION_4_6_3_1);
   ObSSMarkSweepPrepareTask *prepare_task = nullptr;
+  ObSSOuttableGCTask *user_gc_task = nullptr;
   ObSSMarkSweepSortTask *sort_task = nullptr;
   ObSSMarkSweepMergeStartTask *merge_start_task = nullptr;
   ObSSMarkSweepMergeCompleteTask *merge_complete_task = nullptr;
@@ -903,30 +955,47 @@ int ObSSMarkSweepDag::create_first_task()
   } else if (OB_FAIL(sort_task->init(0 /*start_idx*/,
                      MIN(ctx_->batch_size_, ctx_->progress_.get_total_tablet_count()) /*end_idx*/))) {
     LOG_WARN("fail to init worker task", KR(ret), KPC_(ctx));
-  } else if (OB_FAIL(merge_start_task->init(merge_complete_task))) {
+  } else if (OB_FAIL(merge_start_task->init(merge_complete_task, &ctx_->pipeline_))) {
     LOG_WARN("fail to init merge_start task", KR(ret));
-  } else if (OB_FAIL(merge_complete_task->init())) {
+  } else if (OB_FAIL(merge_complete_task->init(&ctx_->pipeline_))) {
     LOG_WARN("fail to init merge_complete task", KR(ret));
   } else if (OB_FAIL(diff_task->init())) {
     LOG_WARN("fail to init diff task", KR(ret));
-  } else if (OB_FAIL(prepare_task->add_child(*sort_task))) {
-    LOG_WARN("fail to add prepare->worker edge", KR(ret));
-  } else if (OB_FAIL(sort_task->add_child(*merge_start_task))) {
-    LOG_WARN("fail to add worker->merge_start edge", KR(ret));
-  } else if (OB_FAIL(merge_start_task->add_child(*merge_complete_task))) {
-    LOG_WARN("fail to add merge_start->merge_complete edge", KR(ret));
-  } else if (OB_FAIL(merge_complete_task->add_child(*diff_task))) {
-    LOG_WARN("fail to add merge_complete->diff edge", KR(ret));
-  } else if (OB_FAIL(add_task(*prepare_task))) {
-    LOG_WARN("fail to add prepare task", KR(ret));
-  } else if (OB_FAIL(add_task(*sort_task))) {
-    LOG_WARN("fail to add worker task", KR(ret));
-  } else if (OB_FAIL(add_task(*merge_start_task))) {
-    LOG_WARN("fail to add merge_start task", KR(ret));
-  } else if (OB_FAIL(add_task(*merge_complete_task))) {
-    LOG_WARN("fail to add merge_complete task", KR(ret));
-  } else if (OB_FAIL(add_task(*diff_task))) {
-    LOG_WARN("fail to add diff task", KR(ret));
+  } else {
+    if (enable_out_table_data_gc) {
+      if (OB_FAIL(alloc_task(user_gc_task))) {
+        LOG_WARN("fail to alloc outtable lob user gc task", KR(ret));
+      } else if (OB_FAIL(user_gc_task->init())) {
+        LOG_WARN("fail to init outtable lob user gc task", KR(ret));
+      } else if (OB_FAIL(prepare_task->add_child(*user_gc_task))) {
+        LOG_WARN("fail to add prepare->user_gc edge", KR(ret));
+      } else if (OB_FAIL(user_gc_task->add_child(*sort_task))) {
+        LOG_WARN("fail to add user_gc->worker edge", KR(ret));
+      }
+    } else if (OB_FAIL(prepare_task->add_child(*sort_task))) {
+      LOG_WARN("fail to add prepare->worker edge", KR(ret));
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(sort_task->add_child(*merge_start_task))) {
+        LOG_WARN("fail to add worker->merge_start edge", KR(ret));
+      } else if (OB_FAIL(merge_start_task->add_child(*merge_complete_task))) {
+        LOG_WARN("fail to add merge_start->merge_complete edge", KR(ret));
+      } else if (OB_FAIL(merge_complete_task->add_child(*diff_task))) {
+        LOG_WARN("fail to add merge_complete->diff edge", KR(ret));
+      } else if (OB_FAIL(add_task(*prepare_task))) {
+        LOG_WARN("fail to add prepare task", KR(ret));
+      } else if (enable_out_table_data_gc && OB_FAIL(add_task(*user_gc_task))) {
+        LOG_WARN("fail to add outtable lob user gc task", KR(ret));
+      } else if (OB_FAIL(add_task(*sort_task))) {
+        LOG_WARN("fail to add worker task", KR(ret));
+      } else if (OB_FAIL(add_task(*merge_start_task))) {
+        LOG_WARN("fail to add merge_start task", KR(ret));
+      } else if (OB_FAIL(add_task(*merge_complete_task))) {
+        LOG_WARN("fail to add merge_complete task", KR(ret));
+      } else if (OB_FAIL(add_task(*diff_task))) {
+        LOG_WARN("fail to add diff task", KR(ret));
+      }
+    }
   }
   LOG_INFO("finish to create mark sweep dag first task", KR(ret), KPC_(ctx));
   return ret;
@@ -934,7 +1003,7 @@ int ObSSMarkSweepDag::create_first_task()
 
 // ============================ ObSSMarkSweepBaseTask ============================
 ObSSMarkSweepBaseTask::ObSSMarkSweepBaseTask(const ObITask::ObITaskType task_type)
-  : ObSharedGCBaseTask(task_type)
+  : ObSharedGCBaseTask(task_type), meta_scn_scan_cost_us_(0), replayed_scn_check_cost_us_(0)
 {
 }
 
@@ -1169,8 +1238,8 @@ void ObSSMarkSweepPrepareTask::try_init_diag_mgr_(ObSSMarkSweepCtx &ctx)
 // ============================ ObSSMarkSweepSortTask ============================
 ObSSMarkSweepSortTask::ObSSMarkSweepSortTask()
   : ObSSMarkSweepBaseTask(TASK_TYPE_MARK_SWEEP_SORT), is_inited_(false), start_tablet_idx_(0),
-    end_tablet_idx_(0), kept_meta_scn_persist_items_(), meta_scn_scan_cost_us_(0),
-    replayed_scn_check_cost_us_(0), macro_iter_and_sorter_cost_us_(0), sorter_cost_us_(0)
+    end_tablet_idx_(0), kept_meta_scn_persist_items_(), macro_iter_and_sorter_cost_us_(0),
+    sorter_cost_us_(0)
 {
   kept_meta_scn_persist_items_.set_attr(ObMemAttr(MTL_ID(), "SSGCKeptItem"));
 }
@@ -1233,7 +1302,7 @@ int ObSSMarkSweepSortTask::generate_next_task(ObITask *&next_task)
   return ret;
 }
 
-int ObSSMarkSweepSortTask::get_all_meta_scns_(
+int ObSSMarkSweepBaseTask::get_all_meta_scns_(
     const ObSSGCTablet &gc_tablet,
     const SCN &snapshot_meta_scn,
     ObIArray<SCN> &all_meta_scns)
@@ -1360,7 +1429,7 @@ int ObSSMarkSweepSortTask::get_del_and_kept_meta_scns_(
 // 版本自身也判定为可删。mark-delete 之后 tablet 不会再产生新版本，因此位点之下的残留版本
 // （例如上一轮 diff 未删净的版本）仍然全是垃圾，本轮应继续全部回收，既不是「位点越过
 // mark_delete」的异常，也不是 stale 快照。
-int ObSSMarkSweepSortTask::calc_recycle_boundary_from_lock_row_(
+int ObSSMarkSweepBaseTask::calc_recycle_boundary_from_lock_row_(
     const ObSSGetDelKeptMetaScnParam &param,
     SCN &min_meta_scn,
     bool &can_del_all)
@@ -1406,7 +1475,7 @@ int ObSSMarkSweepSortTask::calc_recycle_boundary_from_lock_row_(
 
 // MIN3 分支：回收边界取自 MIN(tablet_meta_scn, safe_meta_scn, real_min_reserved_meta_scn)。
 // 这三者都不会越过 mark_delete 版本，因此不存在终态位点，也无需 stale 快照检查。
-int ObSSMarkSweepSortTask::calc_recycle_boundary_from_constraints_(
+int ObSSMarkSweepBaseTask::calc_recycle_boundary_from_constraints_(
     const ObSSGetDelKeptMetaScnParam &param,
     const SCN &min_meta_scn,
     bool &can_del_all)
@@ -1442,7 +1511,7 @@ int ObSSMarkSweepSortTask::calc_recycle_boundary_from_constraints_(
 //   3.4) 仅 Lock Row 分支可能出现 min_meta_scn == mark_delete_meta_scn + 1（终态位点）：
 //        说明此前已有一轮把该 tablet 的所有版本连 mark_delete 版本一起判定为可删；
 //        mark-delete 之后不会再有新版本，因此快照中残留的版本仍按 can_del_all 处理。
-int ObSSMarkSweepSortTask::get_del_and_kept_meta_scns_simply_(
+int ObSSMarkSweepBaseTask::get_del_and_kept_meta_scns_simply_(
     const ObSSGetDelKeptMetaScnParam &param,
     ObIArray<SCN> &del_meta_scns,
     ObIArray<SCN> &kept_meta_scns)
@@ -1707,7 +1776,7 @@ int ObSSMarkSweepSortTask::persist_kept_meta_scns_(
   return ret;
 }
 
-int ObSSMarkSweepSortTask::check_if_replayed_scn_exceed_checkpoint_scn_(
+int ObSSMarkSweepBaseTask::check_if_replayed_scn_exceed_checkpoint_scn_(
     const ObSSGCTablet &gc_tablet,
     const SCN &meta_scn,
     const ObHashMap<ObLSID, SCN> &ls_ss_checkpoint_scn_map,
@@ -1891,49 +1960,44 @@ int ObSSMarkSweepSortTask::process_one_group_(
 {
   ObCostTimer cost_timer(macro_iter_and_sorter_cost_us_);
   int ret = OB_SUCCESS;
-  ObSSMetaTabletMacroIDIterator macro_id_iter;
+  ObSSMarkSweepMacroIDIterator macro_id_iter;
   if (group_meta_scns.empty()) {
     // do nothing
   } else if (OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("sql proxy is null", KR(ret), K(group_type), K(gc_tablet), K(group_meta_scns));
-  } else if (OB_FAIL(macro_id_iter.init(*GCTX.sql_proxy_, MTL_ID(),
-                                        gc_tablet.ls_id_,
-                                        gc_tablet.tablet_id_,
-                                        gc_tablet.transfer_scn_,
-                                        group_meta_scns))) {
-    LOG_WARN("fail to init tablet macro id iterator", KR(ret), K(group_type),
-              K(gc_tablet), K(group_meta_scns));
+  } else if (OB_FAIL(macro_id_iter.init(*GCTX.sql_proxy_, MTL_ID(), gc_tablet, group_meta_scns))) {
+    LOG_WARN("fail to init mark sweep macro id iterator", KR(ret), K(group_type),
+        K(gc_tablet), K(group_meta_scns));
   } else {
     // When diagnose is enabled, collect the macro ids this group sees so the caller
     // (process_one_tablet_) can record them at the END of the tablet (retry-safe).
     // Recording itself never happens here.
-    ObTabletBlockInfo block_info;
+    // Both groups include Tablet blocks and OutTable references from every selected version.
+    MacroBlockId macro_id;
     bool is_iter_end = false;
     while (OB_SUCC(ret) && !is_iter_end) {
-      block_info.reset();
+      macro_id.reset();
       if (OB_FAIL(check_if_stopped_or_failed())) {
         LOG_WARN("fail to check if stopped or failed", KR(ret));
-      } else if (OB_FAIL(macro_id_iter.get_next(block_info))) {
+      } else if (OB_FAIL(macro_id_iter.get_next(macro_id))) {
         if (OB_ITER_END == ret) {
           ret = OB_SUCCESS;
           is_iter_end = true;
         } else {
-          LOG_WARN("fail to get next tablet macro id", KR(ret), K(group_type),
-              K(gc_tablet), K(block_info));
+          LOG_WARN("fail to get next mark sweep macro id", KR(ret), K(group_type), K(gc_tablet));
         }
-      } else if (OB_UNLIKELY(!block_info.macro_id().is_valid())) {
+      } else if (OB_UNLIKELY(!macro_id.is_valid())) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("invalid macro id", KR(ret), K(group_type), K(gc_tablet), K(block_info));
-      } else if (OB_FAIL(sorter.add_item(ObGCMacroBlockItem(block_info.macro_id())))) {
-        LOG_WARN("fail to add macro block item", KR(ret), K(group_type),
-                  K(gc_tablet), K(block_info));
+        LOG_WARN("invalid macro id", KR(ret), K(group_type), K(gc_tablet), K(macro_id));
+      } else if (OB_FAIL(sorter.add_item(ObGCMacroBlockItem(macro_id)))) {
+        LOG_WARN("fail to add macro block item", KR(ret), K(group_type), K(gc_tablet), K(macro_id));
       } else if (ctx.diag_mgr_.is_ready_record()) {
         int tmp_ret = OB_SUCCESS;
-        if (OB_TMP_FAIL(diag_macro_ids.push_back(block_info.macro_id()))) {
+        if (OB_TMP_FAIL(diag_macro_ids.push_back(macro_id))) {
           ctx.diag_mgr_.mark_diag_failed(tmp_ret);
           LOG_WARN("fail to push back diag macro id", KR(tmp_ret), K(group_type),
-                  K(gc_tablet), K(block_info));
+              K(gc_tablet), K(macro_id));
         }
       }
     }
@@ -2126,21 +2190,24 @@ int ObSSMarkSweepSortTask::process()
 // ============================ ObSSMarkSweepMergeStartTask ============================
 ObSSMarkSweepMergeStartTask::ObSSMarkSweepMergeStartTask()
   : ObSSMarkSweepBaseTask(TASK_TYPE_MARK_SWEEP_MERGE_START), is_inited_(false),
-    merge_complete_task_(nullptr)
+    merge_complete_task_(nullptr), pipeline_(nullptr)
 {
 }
 
-int ObSSMarkSweepMergeStartTask::init(ObSSMarkSweepMergeCompleteTask *merge_complete_task)
+int ObSSMarkSweepMergeStartTask::init(
+    ObSSMarkSweepMergeCompleteTask *merge_complete_task,
+    ObMarkSweepPipeline *pipeline)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(is_inited_)) {
     ret = OB_INIT_TWICE;
     LOG_WARN("ObSSMarkSweepMergeStartTask init twice", KR(ret));
-  } else if (OB_ISNULL(merge_complete_task)) {
+  } else if (OB_ISNULL(merge_complete_task) || OB_ISNULL(pipeline)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("merge_complete_task is null", KR(ret));
+    LOG_WARN("invalid merge start argument", KR(ret), KP(merge_complete_task), KP(pipeline));
   } else {
     merge_complete_task_ = merge_complete_task;
+    pipeline_ = pipeline;
     is_inited_ = true;
   }
   return ret;
@@ -2160,25 +2227,46 @@ int ObSSMarkSweepMergeStartTask::create_pass_ctrl_task_(const ObMarkSweepGroupTy
     LOG_WARN("ctx is null", KR(ret), K(group));
   } else if (OB_FAIL(dag->alloc_task(pass_ctrl_task))) {
     LOG_WARN("fail to alloc pass ctrl task", KR(ret), K(group));
-  } else if (OB_FAIL(pass_ctrl_task->init(group, 0 /*pass_idx*/, merge_complete_task_))) {
+  } else if (OB_FAIL(pass_ctrl_task->init(group, 0 /*pass_idx*/, merge_complete_task_, pipeline_))) {
     LOG_WARN("fail to init pass ctrl task", KR(ret), K(group));
   } else if (OB_FAIL(this->add_child(*pass_ctrl_task))) {
     LOG_WARN("fail to add merge_start->pass_ctrl edge", KR(ret), K(group));
   } else if (OB_ISNULL(merge_complete_task_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("merge_complete_task is null", KR(ret), K(group));
-  // Wire merge_complete as a child of EVERY pass ctrl task (not just the terminal one) to
-  // keep merge_complete's indegree >= 1 across every pass handoff: this pass ctrl task wires
-  // merge_complete here, before merge_start (its creator) finishes and decrements. Otherwise
-  // merge_start would drop merge_complete's indegree to 0 and the scheduler would run
-  // merge_complete before its real predecessors (the terminal pass ctrl tasks) finish.
-  // merge_complete is already added into the dag (TASK_STATUS_WAITING), so skip the child-status
-  // check; safe because the relay keeps merge_complete unschedulable (indegree > 0) until the
-  // last terminal pass ctrl task finishes.
+  // 各轮控制任务在前驱结束前挂接完成任务，保证轮次交接时完成任务入度不为零。
+  // 完成任务已处于 WAITING，跳过子任务状态检查；依赖边阻止它提前被调度。
   } else if (OB_FAIL(pass_ctrl_task->add_child(*merge_complete_task_, false /*check_child_task_status*/))) {
     LOG_WARN("fail to wire pass_ctrl->merge_complete edge", KR(ret), K(group));
   } else if (OB_FAIL(dag->add_task(*pass_ctrl_task))) {
     LOG_WARN("fail to add pass ctrl task", KR(ret), K(group));
+  }
+  return ret;
+}
+
+int ObSSMarkSweepMergeStartTask::process_lob_meta_pipeline_()
+{
+  int ret = OB_SUCCESS;
+  int64_t kept_input_count = 0;
+  if (OB_FAIL(pipeline_->get_input_count(ObMarkSweepGroupType::KEPT, kept_input_count))) {
+    LOG_WARN("fail to get kept reference input count", KR(ret));
+  } else if (0 == kept_input_count) {
+    if (OB_FAIL(pipeline_->complete_empty_group(ObMarkSweepGroupType::KEPT))) {
+      LOG_WARN("fail to publish empty kept reference file", KR(ret));
+    }
+  } else if (OB_FAIL(create_pass_ctrl_task_(ObMarkSweepGroupType::KEPT))) {
+    LOG_WARN("fail to create pass ctrl task for KEPT group", KR(ret));
+  }
+  return ret;
+}
+
+int ObSSMarkSweepMergeStartTask::process_system_gc_pipeline_()
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(create_pass_ctrl_task_(ObMarkSweepGroupType::DEL))) {
+    LOG_WARN("fail to create pass ctrl task for DEL group", KR(ret));
+  } else if (OB_FAIL(create_pass_ctrl_task_(ObMarkSweepGroupType::KEPT))) {
+    LOG_WARN("fail to create pass ctrl task for KEPT group", KR(ret));
   }
   return ret;
 }
@@ -2194,12 +2282,16 @@ int ObSSMarkSweepMergeStartTask::process()
     LOG_WARN("ObSSMarkSweepMergeStartTask not inited", KR(ret));
   } else if (OB_FAIL(get_ctx(ctx))) { // already check nullptr and valid for ctx in get_ctx
     LOG_WARN("fail to get ctx", KR(ret));
-  } else if (OB_FAIL(ctx->pipeline_.prepare_merge())) {
+  } else if (OB_FAIL(check_if_stopped_or_failed())) {
+    LOG_WARN("fail to check before preparing merge", KR(ret));
+  } else if (OB_FAIL(pipeline_->prepare_merge())) {
     LOG_WARN("fail to prepare merge", KR(ret));
-  } else if (OB_FAIL(create_pass_ctrl_task_(ObMarkSweepGroupType::DEL))) {
-    LOG_WARN("fail to create pass ctrl task for DEL group", KR(ret));
-  } else if (OB_FAIL(create_pass_ctrl_task_(ObMarkSweepGroupType::KEPT))) {
-    LOG_WARN("fail to create pass ctrl task for KEPT group", KR(ret));
+  } else if (pipeline_ == &ctx->lob_meta_pipeline_) {
+    if (OB_FAIL(process_lob_meta_pipeline_())) {
+      LOG_WARN("fail to process lob meta merge start", KR(ret));
+    }
+  } else if (OB_FAIL(process_system_gc_pipeline_())) {
+    LOG_WARN("fail to process system gc merge start", KR(ret));
   }
   FLOG_INFO("finish to process ObSSMarkSweepMergeStartTask", KR(ret), "cost_us", time_piece.fly_us());
   return ret;
@@ -2208,27 +2300,119 @@ int ObSSMarkSweepMergeStartTask::process()
 // ============================ ObSSMarkSweepMergePassCtrlTask ============================
 ObSSMarkSweepMergePassCtrlTask::ObSSMarkSweepMergePassCtrlTask()
   : ObSSMarkSweepBaseTask(TASK_TYPE_MARK_SWEEP_MERGE_PASS_CTRL), is_inited_(false),
-    group_(ObMarkSweepGroupType::DEL), pass_idx_(0), merge_complete_task_(nullptr)
+    group_(ObMarkSweepGroupType::DEL), pass_idx_(0), merge_complete_task_(nullptr),
+    pipeline_(nullptr)
 {
 }
 
 int ObSSMarkSweepMergePassCtrlTask::init(
     const ObMarkSweepGroupType group,
     const int64_t pass_idx,
-    ObSSMarkSweepMergeCompleteTask *merge_complete_task)
+    ObSSMarkSweepMergeCompleteTask *merge_complete_task,
+    ObMarkSweepPipeline *pipeline)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(is_inited_)) {
     ret = OB_INIT_TWICE;
     LOG_WARN("ObSSMarkSweepMergePassCtrlTask init twice", KR(ret));
-  } else if (OB_UNLIKELY(pass_idx < 0) || OB_ISNULL(merge_complete_task)) {
+  } else if (OB_UNLIKELY(pass_idx < 0) || OB_ISNULL(merge_complete_task) || OB_ISNULL(pipeline)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid arg", KR(ret), K(pass_idx), KP(merge_complete_task));
+    LOG_WARN("invalid arg", KR(ret), K(pass_idx), KP(merge_complete_task), KP(pipeline));
   } else {
     group_ = group;
     pass_idx_ = pass_idx;
     merge_complete_task_ = merge_complete_task;
+    pipeline_ = pipeline;
     is_inited_ = true;
+  }
+  return ret;
+}
+
+int ObSSMarkSweepMergePassCtrlTask::create_next_pass_tasks_(
+    ObSSMarkSweepCtx &ctx,
+    const int64_t input_cnt)
+{
+  int ret = OB_SUCCESS;
+  int64_t batch_count = 0;
+  ObSSMarkSweepMergePassCtrlTask *next_pass_ctrl_task = nullptr;
+  ObSSMarkSweepMergeBatchTask *first_batch_task = nullptr;
+  ObSSMarkSweepDag *dag = nullptr;
+  const bool record_system_stat = pipeline_ == &ctx.pipeline_;
+  if (OB_ISNULL(dag = static_cast<ObSSMarkSweepDag *>(get_dag()))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("dag is null", KR(ret), K_(group));
+  } else if (OB_FAIL(dag->alloc_task(next_pass_ctrl_task))) {
+    LOG_WARN("fail to alloc next pass ctrl task", KR(ret), K_(group));
+  } else if (OB_FAIL(next_pass_ctrl_task->init(group_, pass_idx_ + 1 /*pass_idx*/,
+      merge_complete_task_, pipeline_))) {
+    LOG_WARN("fail to init next pass ctrl task", KR(ret), K_(group));
+  } else if (OB_FAIL(dag->alloc_task(first_batch_task))) {
+    LOG_WARN("fail to alloc first batch task", KR(ret), K_(group));
+  } else if (OB_FAIL(pipeline_->get_batch_count(group_, batch_count))) {
+    LOG_WARN("fail to get batch count", KR(ret), K_(group));
+  } else if (OB_FAIL(first_batch_task->init(
+      group_, 0 /*batch_idx*/, batch_count, pass_idx_, pipeline_))) {
+    LOG_WARN("fail to init first batch task", KR(ret), K_(group), K(batch_count));
+  } else if (OB_FAIL(first_batch_task->add_child(*next_pass_ctrl_task))) {
+    LOG_WARN("fail to wire batch->next_pass_ctrl edge", KR(ret), K_(group));
+  } else if (OB_FAIL(this->add_child(*first_batch_task))) {
+    LOG_WARN("fail to wire pass_ctrl->first_batch edge", KR(ret), K_(group));
+  } else if (OB_FAIL(this->add_child(*next_pass_ctrl_task))) {
+    LOG_WARN("fail to wire pass_ctrl->next_pass_ctrl edge", KR(ret), K_(group));
+  } else if (OB_ISNULL(merge_complete_task_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("merge_complete_task is null", KR(ret), K_(group));
+  // 在本轮结束前挂接下一轮与完成任务，避免依赖交接时完成任务提前调度。
+  } else if (OB_FAIL(next_pass_ctrl_task->add_child(
+      *merge_complete_task_, false /*check_child_task_status*/))) {
+    LOG_WARN("fail to wire next_pass_ctrl->merge_complete edge", KR(ret), K_(group));
+  } else {
+    // TODO(muwei.ym): 这里需要记录 LOB Meta merge的归并进度。
+    if (record_system_stat) {
+      ctx.progress_.record_merge_pass(group_, pass_idx_, input_cnt, batch_count > 1);
+    }
+    if (FAILEDx(dag->add_task(*first_batch_task))) {
+      LOG_WARN("fail to add first batch task", KR(ret), K_(group));
+    } else if (OB_FAIL(dag->add_task(*next_pass_ctrl_task))) {
+      LOG_WARN("fail to add next pass ctrl task", KR(ret), K_(group));
+    }
+  }
+  return ret;
+}
+
+int ObSSMarkSweepMergePassCtrlTask::process_lob_meta_pipeline_(
+    ObSSMarkSweepCtx &ctx,
+    const int64_t input_cnt)
+{
+  int ret = OB_SUCCESS;
+  if (0 == input_cnt) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("lob meta merge pass has no input file", KR(ret), K_(group), K_(pass_idx));
+  } else if (input_cnt <= 1) {
+    // 完成任务的依赖已在控制任务创建时挂接，无需在末轮补边。
+    if (OB_FAIL(pipeline_->complete_group(group_))) {
+      LOG_WARN("fail to complete lob meta group", KR(ret), K_(group));
+    }
+  } else if (OB_FAIL(create_next_pass_tasks_(ctx, input_cnt))) {
+    LOG_WARN("fail to create next lob meta merge pass tasks", KR(ret), K_(group));
+  }
+  return ret;
+}
+
+int ObSSMarkSweepMergePassCtrlTask::process_system_gc_pipeline_(
+    ObSSMarkSweepCtx &ctx,
+    const int64_t input_cnt)
+{
+  int ret = OB_SUCCESS;
+  ctx.cost_stat_.record_merge_pass_input_count(group_, pass_idx_, input_cnt);
+  if (input_cnt <= 1) {
+    // 完成任务的依赖已在控制任务创建时挂接，无需在末轮补边。
+    ctx.progress_.record_merge_group_done(group_);
+    if (OB_FAIL(pipeline_->complete_group(group_))) {
+      LOG_WARN("fail to complete system gc group", KR(ret), K_(group));
+    }
+  } else if (OB_FAIL(create_next_pass_tasks_(ctx, input_cnt))) {
+    LOG_WARN("fail to create next system gc merge pass tasks", KR(ret), K_(group));
   }
   return ret;
 }
@@ -2246,81 +2430,26 @@ int ObSSMarkSweepMergePassCtrlTask::process()
   } else if (OB_FAIL(get_ctx(ctx))) { // already check nullptr and valid for ctx in get_ctx
     LOG_WARN("fail to get ctx", KR(ret));
   } else {
-    // Promote previous round's outputs to current round's inputs. the first pass ctrl task
-    // skips this — its cur_inputs_ is already populated by MergeStartTask::prepare_merge,
-    // and next_inputs_ is empty so a swap would erase cur_inputs_.
-    if (0 == pass_idx_) {
+    // 首轮输入已由入口准备，不能与尚为空的下一轮输入交换。
+    if (OB_FAIL(check_if_stopped_or_failed())) {
+      LOG_WARN("fail to check before merging references", KR(ret));
+    } else if (0 == pass_idx_) {
       LOG_INFO("skip prepare_next_pass for the first pass ctrl task");
     } else { // pass_idx_ > 0
-      if (OB_FAIL(ctx->pipeline_.prepare_next_pass(group_))) {
+      if (OB_FAIL(pipeline_->prepare_next_pass(group_))) {
         LOG_WARN("fail to prepare next pass", KR(ret), K_(group));
       }
     }
     int64_t input_cnt = 0;
     if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(ctx->pipeline_.get_input_count(group_, input_cnt))) {
+    } else if (OB_FAIL(pipeline_->get_input_count(group_, input_cnt))) {
       LOG_WARN("fail to get input count", KR(ret), K_(group));
-    } else {
-      // record how many tmp files this pass merges (= input file count).
-      ctx->cost_stat_.record_merge_pass_input_count(group_, pass_idx_, input_cnt);
-      if (input_cnt <= 1) {
-        // Terminal pass ctrl task: merge_complete was already wired as our child when this
-        // pass ctrl task was created (by the previous round's pass ctrl task, or by
-        // MergeStartTask for the first pass ctrl task). No edge wiring needed here.
-        ctx->progress_.record_merge_group_done(group_); // live progress: this group's merge is complete
-        if (OB_FAIL(ctx->pipeline_.complete_group(group_))) {
-          LOG_WARN("fail to complete group", KR(ret), K_(group));
-        }
-      } else { // input_cnt > 1
-        // still need at least one more pass. Allocate the next-round pass ctrl task and
-        // the first batch task of the current round; remaining batch tasks will be
-        // produced by ObSSMarkSweepMergeBatchTask::generate_next_task().
-        int64_t batch_count = 0;
-        ObSSMarkSweepMergePassCtrlTask *next_pass_ctrl_task = nullptr;
-        ObSSMarkSweepMergeBatchTask *first_batch_task = nullptr;
-        ObSSMarkSweepDag *dag = nullptr;
-        if (OB_ISNULL(dag = static_cast<ObSSMarkSweepDag *>(get_dag()))) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("dag is null", KR(ret), K_(group));
-        } else if (OB_FAIL(dag->alloc_task(next_pass_ctrl_task))) {
-          LOG_WARN("fail to alloc next pass ctrl task", KR(ret), K_(group));
-        } else if (OB_FAIL(next_pass_ctrl_task->init(group_, pass_idx_ + 1 /*pass_idx*/,
-                                                     merge_complete_task_))) {
-          LOG_WARN("fail to init next pass ctrl task", KR(ret), K_(group));
-        } else if (OB_FAIL(dag->alloc_task(first_batch_task))) {
-          LOG_WARN("fail to alloc first batch task", KR(ret), K_(group));
-        } else if (OB_FAIL(ctx->pipeline_.get_batch_count(group_, batch_count))) {
-          LOG_WARN("fail to get batch count", KR(ret), K_(group));
-        } else if (OB_FAIL(first_batch_task->init(group_, 0 /*batch_idx*/, batch_count, pass_idx_))) {
-          LOG_WARN("fail to init first batch task", KR(ret), K_(group), K(batch_count));
-        } else if (OB_FAIL(first_batch_task->add_child(*next_pass_ctrl_task))) {
-          LOG_WARN("fail to wire batch->next_pass_ctrl edge", KR(ret), K_(group));
-        } else if (OB_FAIL(this->add_child(*first_batch_task))) {
-          LOG_WARN("fail to wire pass_ctrl->first_batch edge", KR(ret), K_(group));
-        } else if (OB_FAIL(this->add_child(*next_pass_ctrl_task))) {
-          LOG_WARN("fail to wire pass_ctrl->next_pass_ctrl edge", KR(ret), K_(group));
-        } else if (OB_ISNULL(merge_complete_task_)) {
-          ret = OB_ERR_UNEXPECTED;
-          LOG_WARN("merge_complete_task is null", KR(ret), K_(group));
-        // Wire merge_complete as a child of EVERY pass ctrl task (not just the terminal one),
-        // before this task (next_pass_ctrl_task's creator) finishes and decrements, so that
-        // merge_complete's indegree stays >= 1 across the handoff and it is not scheduled before
-        // the terminal pass ctrl tasks finish. merge_complete is already added into the dag
-        // (TASK_STATUS_WAITING), so skip the child-status check; safe because the relay keeps
-        // merge_complete unschedulable (indegree > 0) until the last terminal pass ctrl finishes.
-        } else if (OB_FAIL(next_pass_ctrl_task->add_child(*merge_complete_task_, false /*check_child_task_status*/))) {
-          LOG_WARN("fail to wire next_pass_ctrl->merge_complete edge", KR(ret), K_(group));
-        } else {
-          // live progress: this pass merges input_cnt files; a further pass follows if this
-          // pass produces more than one output file (batch_count > 1). resets merged-file count.
-          ctx->progress_.record_merge_pass(group_, pass_idx_, input_cnt, batch_count > 1);
-          if (FAILEDx(dag->add_task(*first_batch_task))) {
-            LOG_WARN("fail to add first batch task", KR(ret), K_(group));
-          } else if (OB_FAIL(dag->add_task(*next_pass_ctrl_task))) {
-            LOG_WARN("fail to add next pass ctrl task", KR(ret), K_(group));
-          }
-        }
+    } else if (pipeline_ == &ctx->lob_meta_pipeline_) {
+      if (OB_FAIL(process_lob_meta_pipeline_(*ctx, input_cnt))) {
+        LOG_WARN("fail to process lob meta merge pass", KR(ret), K_(group));
       }
+    } else if (OB_FAIL(process_system_gc_pipeline_(*ctx, input_cnt))) {
+      LOG_WARN("fail to process system gc merge pass", KR(ret), K_(group));
     }
   }
   FLOG_INFO("finish to process ObSSMarkSweepMergePassCtrlTask", KR(ret), "cost_us",
@@ -2331,28 +2460,31 @@ int ObSSMarkSweepMergePassCtrlTask::process()
 // ============================ ObSSMarkSweepMergeBatchTask ============================
 ObSSMarkSweepMergeBatchTask::ObSSMarkSweepMergeBatchTask()
   : ObSSMarkSweepBaseTask(TASK_TYPE_MARK_SWEEP_MERGE_BATCH), is_inited_(false),
-    group_(ObMarkSweepGroupType::DEL), batch_idx_(0), total_batch_count_(0), pass_idx_(0)
+    group_(ObMarkSweepGroupType::DEL), batch_idx_(0), total_batch_count_(0), pass_idx_(0),
+    pipeline_(nullptr)
 {
 }
 
 int ObSSMarkSweepMergeBatchTask::init(const ObMarkSweepGroupType group,
                                   const int64_t batch_idx,
                                   const int64_t total_batch_count,
-                                  const int64_t pass_idx)
+                                  const int64_t pass_idx,
+                                  ObMarkSweepPipeline *pipeline)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(is_inited_)) {
     ret = OB_INIT_TWICE;
     LOG_WARN("ObSSMarkSweepMergeBatchTask init twice", KR(ret));
-  } else if (OB_UNLIKELY((batch_idx < 0) || (total_batch_count <= 0)
+  } else if (OB_ISNULL(pipeline) || OB_UNLIKELY((batch_idx < 0) || (total_batch_count <= 0)
                          || (batch_idx >= total_batch_count) || (pass_idx < 0))) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid batch idx", KR(ret), K(batch_idx), K(total_batch_count), K(pass_idx));
+    LOG_WARN("invalid batch argument", KR(ret), K(batch_idx), K(total_batch_count), K(pass_idx), KP(pipeline));
   } else {
     group_ = group;
     batch_idx_ = batch_idx;
     total_batch_count_ = total_batch_count;
     pass_idx_ = pass_idx;
+    pipeline_ = pipeline;
     is_inited_ = true;
   }
   return ret;
@@ -2377,7 +2509,7 @@ int ObSSMarkSweepMergeBatchTask::generate_next_task(ObITask *&next_task)
     LOG_WARN("dag is null", KR(ret));
   } else if (OB_FAIL(dag->alloc_task(next_batch_task))) {
     LOG_WARN("fail to alloc next batch task", KR(ret), K_(group), K_(batch_idx));
-  } else if (OB_FAIL(next_batch_task->init(group_, batch_idx_ + 1, total_batch_count_, pass_idx_))) {
+  } else if (OB_FAIL(next_batch_task->init(group_, batch_idx_ + 1, total_batch_count_, pass_idx_, pipeline_))) {
     LOG_WARN("fail to init next batch task", KR(ret), K_(group), K_(batch_idx));
   } else {
     next_task = next_batch_task;
@@ -2402,11 +2534,13 @@ int ObSSMarkSweepMergeBatchTask::MergeBatchFn::operator()()
   int ret = OB_SUCCESS;
   int64_t start = 0;
   int64_t end = 0;
-  if (OB_FAIL(ctx_.pipeline_.get_batch_range(group_, batch_idx_, start, end))) {
+  if (OB_FAIL(task_.check_if_stopped_or_failed())) {
+    LOG_WARN("fail to check before merging reference batch", KR(ret));
+  } else if (OB_FAIL(task_.pipeline_->get_batch_range(group_, batch_idx_, start, end))) {
     LOG_WARN("fail to get batch range", KR(ret), K_(group), K_(batch_idx), K_(total_batch_count));
-  } else if (OB_FAIL(ctx_.pipeline_.batch_merge(group_, start, end))) {
+  } else if (OB_FAIL(task_.pipeline_->batch_merge(group_, start, end))) {
     LOG_WARN("fail to batch merge", KR(ret), K_(group), K(start), K(end));
-  } else {
+  } else if (task_.pipeline_ == &ctx_.pipeline_) {
     // live progress: this batch merged [start, end) input files of the current pass.
     ctx_.progress_.inc_cur_pass_merged_files(group_, end - start);
   }
@@ -2457,7 +2591,7 @@ int ObSSMarkSweepMergeBatchTask::process()
       LOG_WARN("fail to execute merge batch task with retry", KR(ret), K(retry_cnt));
     }
   }
-  if (OB_NOT_NULL(ctx)) {
+  if (OB_NOT_NULL(ctx) && pipeline_ == &ctx->pipeline_) {
     ctx->cost_stat_.record_merge_pass_cost(group_, pass_idx_, time_piece.start_us(), ObTimeUtility::current_time_us());
   }
   LOG_INFO("finish to process ObSSMarkSweepMergeBatchTask", KR(ret), "cost_us", time_piece.fly_us(),
@@ -2467,43 +2601,47 @@ int ObSSMarkSweepMergeBatchTask::process()
 
 // ============================ ObSSMarkSweepMergeCompleteTask ============================
 ObSSMarkSweepMergeCompleteTask::ObSSMarkSweepMergeCompleteTask()
-  : ObSSMarkSweepBaseTask(TASK_TYPE_MARK_SWEEP_MERGE_COMPLETE), is_inited_(false)
+  : ObSSMarkSweepBaseTask(TASK_TYPE_MARK_SWEEP_MERGE_COMPLETE), is_inited_(false), pipeline_(nullptr)
 {
 }
 
-int ObSSMarkSweepMergeCompleteTask::init()
+int ObSSMarkSweepMergeCompleteTask::init(ObMarkSweepPipeline *pipeline)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(is_inited_)) {
     ret = OB_INIT_TWICE;
     LOG_WARN("ObSSMarkSweepMergeCompleteTask init twice", KR(ret));
+  } else if (OB_ISNULL(pipeline)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("merge pipeline is null", KR(ret));
   } else {
+    pipeline_ = pipeline;
     is_inited_ = true;
   }
   return ret;
 }
 
-ObSSMarkSweepMergeCompleteTask::CompleteMergeFn::CompleteMergeFn(
+ObSSMarkSweepMergeCompleteTask::CompleteSystemMergeFn::CompleteSystemMergeFn(
     ObSSMarkSweepMergeCompleteTask &task,
     ObSSMarkSweepCtx &ctx)
   : task_(task), ctx_(ctx)
 {}
 
-int ObSSMarkSweepMergeCompleteTask::CompleteMergeFn::operator()()
+int ObSSMarkSweepMergeCompleteTask::CompleteSystemMergeFn::operator()()
 {
   int ret = OB_SUCCESS;
   int64_t merged_del_size = -1;
   int64_t merged_kept_size = -1;
-  if (OB_FAIL(ctx_.pipeline_.complete_merge())) {
+  if (OB_FAIL(task_.pipeline_->complete_merge())) {
     LOG_WARN("fail to complete merge", KR(ret));
   } else {
     // best-effort: failing to read the sizes do not fail the GC task
     int tmp_ret = OB_SUCCESS;
-    if (OB_TMP_FAIL(ctx_.pipeline_.get_merged_file_size(
+    if (OB_TMP_FAIL(task_.pipeline_->get_merged_file_size(
             ObMarkSweepGroupType::DEL, merged_del_size))) {
       LOG_WARN("fail to get merged del file size", KR(tmp_ret));
     }
-    if (OB_TMP_FAIL(ctx_.pipeline_.get_merged_file_size(
+    if (OB_TMP_FAIL(task_.pipeline_->get_merged_file_size(
             ObMarkSweepGroupType::KEPT, merged_kept_size))) {
       LOG_WARN("fail to get merged kept file size", KR(tmp_ret));
     }
@@ -2525,6 +2663,40 @@ int ObSSMarkSweepMergeCompleteTask::CompleteMergeFn::operator()()
   return ret;
 }
 
+int ObSSMarkSweepMergeCompleteTask::process_lob_meta_pipeline_(ObSSMarkSweepCtx &ctx)
+{
+  int ret = OB_SUCCESS;
+  if (ctx.diag_mgr_.is_ready_record()) {
+    int tmp_ret = OB_SUCCESS;
+    ObSortedFileInfo kept_file;
+    if (OB_ENTRY_NOT_EXIST == (tmp_ret = pipeline_->get_merged_file(
+        ObMarkSweepGroupType::KEPT, kept_file))) {
+      tmp_ret = OB_SUCCESS;
+    } else if (OB_SUCCESS != tmp_ret) {
+      LOG_WARN_RET(tmp_ret, "failed to get lob meta kept file for diagnose",
+          K(ctx.tenant_id_), K(ctx.round_id_));
+      ctx.diag_mgr_.mark_diag_failed(tmp_ret);
+    } else if (OB_SUCCESS != (tmp_ret = ctx.diag_mgr_.write_lob_meta_kept_file(
+        kept_file, ctx.file_buf_size_))) {
+      LOG_WARN_RET(tmp_ret, "failed to record lob meta kept macros",
+          K(ctx.tenant_id_), K(ctx.round_id_));
+    }
+  }
+  return ret;
+}
+
+int ObSSMarkSweepMergeCompleteTask::process_system_gc_pipeline_(
+    ObSSMarkSweepCtx &ctx,
+    int64_t &retry_cnt)
+{
+  int ret = OB_SUCCESS;
+  CompleteSystemMergeFn complete_merge_fn(*this, ctx);
+  if (OB_FAIL(execute_with_retry(complete_merge_fn/*work_fn*/, retry_cnt))) {
+    LOG_WARN("fail to execute system gc complete merge task with retry", KR(ret), K(retry_cnt));
+  }
+  return ret;
+}
+
 int ObSSMarkSweepMergeCompleteTask::process()
 {
   int ret = OB_SUCCESS;
@@ -2537,11 +2709,19 @@ int ObSSMarkSweepMergeCompleteTask::process()
     LOG_WARN("ObSSMarkSweepMergeCompleteTask not inited", KR(ret));
   } else if (OB_FAIL(get_ctx(ctx))) { // already check nullptr and valid for ctx in get_ctx
     LOG_WARN("fail to get ctx", KR(ret));
-  } else {
-    CompleteMergeFn complete_merge_fn(*this, *ctx);
-    if (OB_FAIL(execute_with_retry(complete_merge_fn/*work_fn*/, retry_cnt))) {
-      LOG_WARN("fail to execute complete merge task with retry", KR(ret), K(retry_cnt));
+  } else if (OB_FAIL(check_if_stopped_or_failed())) {
+    LOG_WARN("fail to check before completing reference merge", KR(ret));
+  } else if (pipeline_ == &ctx->lob_meta_pipeline_) {
+    if (OB_FAIL(process_lob_meta_pipeline_(*ctx))) {
+      LOG_WARN("fail to process lob meta merge completion", KR(ret));
     }
+  } else if (pipeline_ == &ctx->pipeline_) {
+    if (OB_FAIL(process_system_gc_pipeline_(*ctx, retry_cnt))) {
+      LOG_WARN("fail to process system gc merge completion", KR(ret), K(retry_cnt));
+    }
+  } else {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected merge pipeline", KR(ret), KP_(pipeline));
   }
   FLOG_INFO("finish to process ObSSMarkSweepMergeCompleteTask", KR(ret), "cost_us",
       time_piece.fly_us(), K(retry_cnt));

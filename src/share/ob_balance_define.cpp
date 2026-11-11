@@ -32,7 +32,9 @@ bool check_if_need_balance_table(
   }
   need_balance = table_schema.is_user_table()
       || table_schema.is_global_index_table()
-      || table_schema.is_tmp_table();
+      || table_schema.is_tmp_table()
+      || (!is_sys_tenant(table_schema.get_tenant_id())
+          && table_schema.is_aux_outtable_lob_control_table());
   return need_balance;
 }
 

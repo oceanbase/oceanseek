@@ -96,21 +96,33 @@ bool ObSSGCTabletWithDelScn::is_valid() const
 }
 
 /****************************** ObSSGCTabletWithMetaScn *********************************/
-OB_SERIALIZE_MEMBER(ObSSGCTabletWithMetaScn, gc_tablet_, meta_scn_);
+OB_SERIALIZE_MEMBER(ObSSGCTabletWithMetaScn, gc_tablet_, meta_scn_,
+    clog_checkpoint_scn_, // FARM COMPAT WHITELIST
+    orig_clog_checkpoint_scn_ // FARM COMPAT WHITELIST
+    );
 
 bool ObSSGCTabletWithMetaScn::is_valid() const
 {
-  return gc_tablet_.is_valid() && meta_scn_.is_valid();
+  return gc_tablet_.is_valid() && meta_scn_.is_valid()
+      && clog_checkpoint_scn_.is_valid() && orig_clog_checkpoint_scn_.is_valid();
 }
 
 /****************************** ObSSGCTabletStudyResult ********************************/
+// Append fields without changing the wire version to preserve rolling-upgrade compatibility.
 OB_SERIALIZE_MEMBER(ObSSGCTabletStudyResult, gc_tablet_, study_info_.min_dep_meta_scn_,
-                    study_info_.min_major_snapshot_, study_info_.clog_checkpoint_scn_,
-                    study_info_.multi_version_start_);
+    study_info_.min_major_snapshot_, study_info_.clog_checkpoint_scn_,
+    study_info_.multi_version_start_,
+    study_info_.orig_clog_checkpoint_scn_ // FARM COMPAT WHITELIST
+    );
 
 bool ObSSGCTabletStudyResult::is_valid() const
 {
-  return gc_tablet_.is_valid() && study_info_.min_dep_meta_scn_.is_valid() && study_info_.min_major_snapshot_ >= 0;
+  return gc_tablet_.is_valid()
+      && study_info_.min_dep_meta_scn_.is_valid()
+      && study_info_.min_major_snapshot_ >= 0
+      && study_info_.clog_checkpoint_scn_.is_valid()
+      && study_info_.orig_clog_checkpoint_scn_.is_valid()
+      && study_info_.multi_version_start_ >= 0;
 }
 
 /******************************* ObSSGCTabletInfo **************************************/

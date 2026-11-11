@@ -439,7 +439,7 @@ int ObExprSubstrb::calc_substrb_expr(const ObExpr &expr, ObEvalCtx &ctx, ObDatum
         len_int = len == NULL ? total_byte_len : len_int;
       }
       int64_t result_byte_len = MIN((start_int >= 0 ? total_byte_len - start_int + 1 : -start_int), len_int);
-      if (!input_iter.is_outrow_lob()) {
+      if (!input_iter.is_outline_lob()) {
         // ObExprSubstrb::calc alloc memory from result buffer at least as input text len.
         result_byte_len = MAX(result_byte_len, total_byte_len);
       }
@@ -466,7 +466,7 @@ int ObExprSubstrb::calc_substrb_expr(const ObExpr &expr, ObEvalCtx &ctx, ObDatum
                && buf_size > 0
                && (state = input_iter.get_next_block(src_block_data)) == TEXTSTRING_ITER_NEXT) {
           ObDataBuffer data_buf(buf, buf_size);
-          if (!input_iter.is_outrow_lob()) {
+          if (!input_iter.is_outline_lob()) {
             ObString inrow_result;
             if (OB_FAIL(calc(inrow_result, src_block_data, start_int, len_int, cs_type, data_buf))) {
               LOG_WARN("get substr failed", K(ret));
