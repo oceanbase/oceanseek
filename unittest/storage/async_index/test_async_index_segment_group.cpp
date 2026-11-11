@@ -13,6 +13,7 @@
 
 #define private public
 #define protected public
+#include "storage/ls/ob_ls.h"
 #include "storage/async_index/ob_async_index_segment_group.h"
 #include "storage/tablet/ob_tablet.h"
 #include "storage/tablet/ob_tablet_table_store.h"
@@ -21,6 +22,7 @@
 #undef protected
 
 #include "lib/utility/ob_defer.h"
+#include "storage/meta_mem/ob_tablet_pointer.h"
 #include "storage/schema_utils.h"
 #include "storage/test_dml_common.h"
 #include "storage/test_tablet_helper.h"
@@ -443,14 +445,27 @@ TEST_F(ObAsyncIndexSegmentGroupCtxTest, deletion_transfer_route_includes_source_
   ObLSHandle target_ls;
   ASSERT_EQ(OB_SUCCESS, MTL(ObLSService *)->get_ls(
       ObLSID(TEST_LS_ID), target_ls, ObLSGetMod::STORAGE_MOD));
-  ObTabletHandle target;
-  ASSERT_EQ(OB_SUCCESS, mock_tablet(allocator_, next_tablet_id_++, target));
   ObTableSchema schema;
   TestSchemaUtils::prepare_data_schema(schema);
+  schema.set_table_type(USER_INDEX);
+  schema.set_index_type(INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL);
+  schema.set_index_status(INDEX_STATUS_AVAILABLE);
+  ObTabletHandle target;
+  ASSERT_EQ(OB_SUCCESS, TestTabletHelper::create_tablet(target_ls,
+      ObTabletID(next_tablet_id_++), schema, allocator_, ObTabletStatus::NORMAL,
+      SCN::min_scn(), target));
   ObTabletHandle source;
   ASSERT_EQ(OB_SUCCESS, TestTabletHelper::create_tablet(source_ls,
       target.get_obj()->get_tablet_id(), schema, allocator_, ObTabletStatus::NORMAL,
       SCN::min_scn(), source));
+  // This routing fixture starts with complete source compaction inputs.
+  // Restore readiness role before the earlier DEFER removes source_ls.
+  ObLSAsyncIndexScheduler &source_scheduler = source_ls.get_ls()->ls_async_index_scheduler_;
+  const bool saved_source_leader = source_scheduler.is_leader();
+  DEFER(ATOMIC_STORE(&source_scheduler.is_leader_, saved_source_leader));
+  ATOMIC_STORE(&source_scheduler.is_leader_, true);
+  source.get_obj()->get_pointer_handle().get_tablet_pointer()->
+      set_async_index_checked_leader_epoch(source_ls.get_ls()->get_async_index_leader_epoch());
   target.get_obj()->tablet_meta_.transfer_info_.has_transfer_table_ = true;
   // A transfer flag without matching committed TRANSFER_IN remains an error.
   int64_t snapshot = 0;

@@ -1796,7 +1796,15 @@ public:
       const ObMergeType merge_type,
       const int64_t merge_snapshot,
       const int64_t merge_base_snapshot = 0,
-      const int64_t timeout_sec = 120);
+      const int64_t timeout_sec = 120,
+      const ObExecMode exec_mode = EXEC_MODE_LOCAL);
+  void prepare_shared_async_index_compactions(
+      const char *table_name,
+      MultiAsyncIndexTabletCtx &ctx,
+      int64_t &major_snapshot,
+      int64_t &inc_snapshot);
+  void run_shared_async_index_readiness_case(
+      const char *table_name, const bool fail_inc_major, const bool follower);
   int resolve_inc_major_merge_snapshot(
       ObLS &ls,
       const ObTablet &tablet,

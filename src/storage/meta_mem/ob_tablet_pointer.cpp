@@ -39,10 +39,11 @@ ObTabletPointer::ObTabletPointer()
     old_version_chain_(nullptr),
     attr_(),
     next_meta_version_(0),
-    last_gc_version_(-1)
+    last_gc_version_(-1),
+    async_index_checked_leader_epoch_(-1)
 {
 #if defined(__x86_64__) && !defined(ENABLE_OBJ_LEAK_CHECK)
-  check_size<ObTabletPointer, 392>();
+  check_size<ObTabletPointer, 400>();
 #endif
 }
 
@@ -68,7 +69,8 @@ ObTabletPointer::ObTabletPointer(
     old_version_chain_(nullptr),
     attr_(),
     next_meta_version_(0),
-    last_gc_version_(-1)
+    last_gc_version_(-1),
+    async_index_checked_leader_epoch_(-1)
 {
 }
 
@@ -105,6 +107,7 @@ void ObTabletPointer::reset()
   attr_.reset();
   next_meta_version_ = 0;
   last_gc_version_ = -1;
+  ATOMIC_STORE(&async_index_checked_leader_epoch_, -1);
 }
 
 void ObTabletPointer::reset_obj()
@@ -425,6 +428,8 @@ int ObTabletPointer::deep_copy(char *buf, const int64_t buf_len, ObTabletPointer
       ATOMIC_STORE(&(pvalue->tablet_mds_status_written_), ATOMIC_LOAD(&tablet_mds_status_written_));
       pvalue->old_version_chain_ = old_version_chain_;
       pvalue->attr_ = attr_;
+      ATOMIC_STORE(&pvalue->async_index_checked_leader_epoch_,
+          ATOMIC_LOAD(&async_index_checked_leader_epoch_));
       value = pvalue;
       // NOTICE: cond and rw lock cannot be copied
     } else {

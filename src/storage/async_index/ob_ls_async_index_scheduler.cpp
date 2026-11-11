@@ -113,9 +113,10 @@ int ObLSAsyncIndexScheduler::switch_to_leader()
     ret = OB_NOT_INIT;
     LOG_WARN("not inited", K(ret), K_(ls_id));
   } else {
-    ATOMIC_STORE(&is_leader_, true);
-    ATOMIC_STORE(&need_do_for_switch_, true);
+    // Publish the new epoch before readiness can observe leader state.
     ATOMIC_AAF(&leader_epoch_, 1);
+    ATOMIC_STORE(&need_do_for_switch_, true);
+    ATOMIC_STORE(&is_leader_, true);
     LOG_INFO("ls async index scheduler switch to leader", K_(ls_id), K_(tenant_id),
              K_(leader_epoch));
   }

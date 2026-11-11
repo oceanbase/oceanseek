@@ -59,9 +59,7 @@
 #include "storage/lob/ob_lob_tablet_dml.h"
 #include "rootserver/truncate_info/ob_truncate_info_service.h"
 #include "rootserver/compaction_ttl/ob_compaction_ttl_service.h"
-#ifdef OB_BUILD_SHARED_STORAGE
-#include "storage/incremental/ob_shared_meta_service.h"
-#endif
+#include "storage/compaction_v2/ob_ss_compact_helper.h"
 
 using namespace oceanbase::share;
 using namespace oceanbase::share::schema;
@@ -10734,6 +10732,9 @@ int ObLSTabletService::get_async_index_segment_group_ctx(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(delete_tablet_id),
         "index_tablet_ids_count", index_tablet_ids.count());
+  } else if (OB_FAIL(SSCompactHelper::ensure_async_index_tablets_ready(
+      *ls_, index_tablet_ids, delete_tablet_id))) {
+    LOG_WARN("failed to ensure async index tablets before query", K(ret), K(delete_tablet_id));
   } else {
     // 1. collect version ranges for each index tablet
     for (int64_t i = 0; OB_SUCC(ret) && i < index_tablet_ids.count(); ++i) {
