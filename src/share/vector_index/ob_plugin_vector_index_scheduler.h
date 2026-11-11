@@ -46,6 +46,7 @@ enum ObVectorTaskScheduleType // FARM COMPAT WHITELIST
   HISTORY_CLEANUP = 8,
   IVF_CACHE_MAINTENANCE = 9,
   ALTER_INDEX_PARAM_PARENT = 10,
+  AUX_TABLET_STORAGE_MAINTENANCE = 11,
   SCHEDULE_MAX,
 };
 
@@ -61,6 +62,7 @@ static const int schedule_interval[SCHEDULE_MAX] = {
   30 * 1000 * 1000,            // history_cleanup: 30s
   10 * 1000 * 1000,            // ivf_cache_maintenance: 10s
   5 * 1000 * 1000,             // alter_index_param_parent: 5s
+  10 * 1000 * 1000,            // aux_tablet_storage_maintenance: 10s
 };
 
 class ObVectorIndexSyncLog

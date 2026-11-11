@@ -39,6 +39,24 @@ protected:
   ObVecIdxAsyncTaskScheduler scheduler_;
 };
 
+TEST_F(TestVecIdxAsyncTaskScheduler, stopped_aux_maintenance_skips_tenant_services)
+{
+  // No schema service or tenant LS service is available in this fixture. After
+  // stop(), neither collection phase may enter those services or start a round.
+  common::ObArray<common::ObTabletID> tablet_ids;
+  common::ObArray<ObVecIdxAsyncTaskScheduler::ObAuxTabletCandidate> freeze_candidates;
+  ASSERT_EQ(OB_SUCCESS, tablet_ids.push_back(common::ObTabletID(200001)));
+  scheduler_.stop();
+
+  ASSERT_EQ(OB_SUCCESS, scheduler_.collect_aux_tablet_ids_(tablet_ids));
+  ASSERT_EQ(1, tablet_ids.count());
+  ASSERT_EQ(OB_SUCCESS, scheduler_.collect_aux_tablet_candidates_(
+      tablet_ids, freeze_candidates));
+  ASSERT_TRUE(freeze_candidates.empty());
+  ASSERT_EQ(OB_SUCCESS, scheduler_.do_aux_storage_maintenance_());
+  ASSERT_EQ(0, scheduler_.aux_maintenance_round_seq_);
+}
+
 TEST_F(TestVecIdxAsyncTaskScheduler, sys_ls_skips_periodic_ivf_rewarm)
 {
   ObVecIdxLeaderExecutors exec;

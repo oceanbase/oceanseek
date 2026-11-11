@@ -10,6 +10,7 @@
 #include "lib/hash/ob_hashmap.h"
 #include "lib/hash/ob_hashset.h"
 #include "lib/lock/ob_spin_lock.h"
+#include "lib/container/ob_array.h"
 #include "share/ob_ls_id.h"
 #include "share/vector_index/ob_plugin_vector_index_scheduler.h"
 #include "share/vector_index/ob_vector_index_async_task.h"
@@ -138,6 +139,7 @@ public:
   ObVecIdxAsyncTaskScheduler()
     : is_inited_(false),
       is_stopped_(false),
+      stop_flag_(false),
       tenant_id_(OB_INVALID_TENANT_ID),
       schedule_tg_id_(-1),
       service_(nullptr),
@@ -172,7 +174,8 @@ public:
       last_thread_count_(0),
       last_total_queued_(0),
       last_water_level_config_hash_(UINT64_MAX),
-      sched_diag_stat_()
+      sched_diag_stat_(),
+      aux_maintenance_round_seq_(0)
   {}
   virtual ~ObVecIdxAsyncTaskScheduler();
 
@@ -241,6 +244,20 @@ public:
   TO_STRING_KV(K_(is_inited), K_(is_stopped), K_(tenant_id), K_(schedule_tg_id));
 
 private:
+  struct ObAuxTabletCandidate
+  {
+    ObAuxTabletCandidate()
+      : ls_id_(), tablet_id_()
+    {}
+    ObAuxTabletCandidate(const share::ObLSID &ls_id,
+                         const common::ObTabletID &tablet_id)
+      : ls_id_(ls_id), tablet_id_(tablet_id)
+    {}
+    TO_STRING_KV(K_(ls_id), K_(tablet_id));
+    share::ObLSID ls_id_;
+    common::ObTabletID tablet_id_;
+  };
+
   static const int64_t SCHEDULE_PERIOD_US = 1 * 1000 * 1000;         // 1s
   static const int64_t VEC_INDEX_LOAD_TIME_NORMAL_THRESHOLD = 10 * 1000 * 1000; // 10s
   static const int64_t DEFAULT_LS_EXECUTOR_MAP_SIZE = 64;
@@ -256,6 +273,10 @@ private:
   static const int64_t SCHED_DIAG_SNAPSHOT_INTERVAL_US = 60 * 1000 * 1000;     // 60s
   static const int64_t SCHED_DIAG_BLOCKED_INTERVAL_US = 10 * 1000 * 1000;      // 10s
   static const int64_t SCHED_DIAG_NO_POP_INTERVAL_US = 60 * 1000 * 1000;       // 60s
+  static const int64_t AUX_FAST_FREEZE_INTERVAL_US = 5 * 60 * 1000 * 1000;
+  static const int64_t AUX_FREEZE_PHASE_TIMEOUT_US = 60 * 1000 * 1000;
+  static const int64_t AUX_FREEZE_TABLET_LIMIT_PER_ROUND = 5000;
+  static const int64_t AUX_FREEZE_BATCH_SIZE = 512;
 
   // --- History cleanup (migrated from ObTenantVecAsyncTaskScheduler) ---
   static const int64_t HISTORY_MOVE_BATCH_SIZE = 1024L;
@@ -326,6 +347,19 @@ private:
   int finish_dropped_alter_param_parents_(
       common::ObIArray<int64_t> &alter_param_parent_cleanup_ids);
   int clear_history_task_();
+  int do_aux_storage_maintenance_();
+  int collect_aux_tablet_ids_(common::ObIArray<common::ObTabletID> &tablet_ids);
+  int check_aux_tablet_need_freeze_(storage::ObTablet &tablet,
+                                    bool &need_freeze,
+                                    int64_t &update_row_count,
+                                    int64_t &delete_row_count);
+  int collect_aux_tablet_candidates_(const common::ObIArray<common::ObTabletID> &tablet_ids,
+                                     common::ObIArray<ObAuxTabletCandidate> &freeze_candidates);
+  int execute_aux_freeze_(const common::ObIArray<ObAuxTabletCandidate> &freeze_candidates,
+                          int64_t &freeze_call_count);
+  int execute_aux_freeze_batch_(common::ObIArray<uint64_t> &freeze_tablet_ids,
+                                int64_t &freeze_call_count);
+
   // Sync ls_executor_map_ with current LS list in service, init executors for new LSes
   // and release executors for removed LSes.
   int sync_ls_executors();
@@ -420,6 +454,7 @@ private:
   void retire_follower_executor_(ObVecIdxFollowerExecutors *follower_exec);
   bool is_inited_;
   bool is_stopped_;
+  volatile bool stop_flag_;
   uint64_t tenant_id_;
   int schedule_tg_id_;
   ObPluginVectorIndexService *service_;
@@ -480,6 +515,7 @@ private:
   int64_t last_total_queued_;
   uint64_t last_water_level_config_hash_;
   ObVecAsyncSchedDiagStat sched_diag_stat_;
+  int64_t aux_maintenance_round_seq_;
 
   DISALLOW_COPY_AND_ASSIGN(ObVecIdxAsyncTaskScheduler);
 };

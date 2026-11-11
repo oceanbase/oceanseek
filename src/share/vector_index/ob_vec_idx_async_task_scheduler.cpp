@@ -5,6 +5,7 @@
 #define USING_LOG_PREFIX SERVER
 
 #include <algorithm>
+#include "common/ob_timeout_ctx.h"
 #include "lib/allocator/ob_malloc.h"
 #include "share/vector_index/ob_vec_idx_async_task_scheduler.h"
 #include "share/vector_index/ob_plugin_vector_index_service.h"
@@ -17,6 +18,10 @@
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/ls/ob_ls.h"
 #include "storage/high_availability/ob_tenant_startup_status.h"
+#include "storage/compaction/ob_partition_merge_policy.h"
+#include "storage/ob_tenant_tablet_stat_mgr.h"
+#include "storage/memtable/ob_memtable.h"
+#include "storage/vector_index/ob_vector_index_refresh.h"
 #include "share/ob_get_compat_mode.h"
 #include "share/ob_cluster_version.h"
 #include "observer/ob_server.h"
@@ -235,6 +240,7 @@ int ObVecIdxAsyncTaskScheduler::start()
     LOG_WARN("fail to schedule vec idx async task scheduler", KR(ret), K_(tenant_id));
   } else {
     is_stopped_ = false;
+    ATOMIC_STORE(&stop_flag_, false);
     FLOG_INFO("vec idx async task scheduler started", K_(tenant_id));
   }
   return ret;
@@ -243,6 +249,7 @@ int ObVecIdxAsyncTaskScheduler::start()
 void ObVecIdxAsyncTaskScheduler::stop()
 {
   FLOG_INFO("vec idx async task scheduler stop", K_(tenant_id));
+  ATOMIC_STORE(&stop_flag_, true);
   if (IS_INIT && schedule_tg_id_ >= 0) {
     TG_STOP(schedule_tg_id_);
     is_stopped_ = true;
@@ -473,6 +480,14 @@ void ObVecIdxAsyncTaskScheduler::run_timer_task()
       }
       tg.click("ivf sstable cache maintenance");
     }
+    if (can_schedule(ObVectorTaskScheduleType::AUX_TABLET_STORAGE_MAINTENANCE)) {
+      int tmp_ret = OB_SUCCESS;
+      if (OB_TMP_FAIL(do_aux_storage_maintenance_())) {
+        LOG_WARN("fail to execute vector auxiliary tablet storage maintenance",
+                 KR(tmp_ret), K_(tenant_id));
+      }
+      tg.click("aux tablet storage maintenance");
+    }
     LOG_TRACE("vec idx async task scheduler run_timer_task finish", KR(ret), K_(tenant_id), K(tg));
     schedule_finish();
   }
@@ -496,6 +511,326 @@ void ObVecIdxAsyncTaskScheduler::mark_ls_ivf_rewarm_requested(
       LOG_WARN_RET(tmp_ret, "fail to find IVF cache rewarm executor", K(tmp_ret), K(ls_id));
     }
   }
+}
+
+int ObVecIdxAsyncTaskScheduler::do_aux_storage_maintenance_()
+{
+  int ret = OB_SUCCESS;
+  if (ATOMIC_LOAD(&stop_flag_)) {
+    return ret;
+  }
+  const int64_t start_us = ObTimeUtility::fast_current_time();
+  const int64_t round_seq = ++aux_maintenance_round_seq_;
+  int64_t freeze_call_count = 0;
+  ObArray<ObTabletID> tablet_ids;
+  ObArray<ObAuxTabletCandidate> freeze_candidates;
+  tablet_ids.set_attr(ObMemAttr(tenant_id_, "VecAuxTablet"));
+  freeze_candidates.set_attr(ObMemAttr(tenant_id_, "VecAuxFreeze"));
+
+  if (OB_FAIL(collect_aux_tablet_ids_(tablet_ids))) {
+    LOG_WARN("fail to collect vector auxiliary tablet ids", KR(ret), K_(tenant_id));
+  } else if (OB_FAIL(collect_aux_tablet_candidates_(tablet_ids, freeze_candidates))) {
+    LOG_WARN("fail to collect vector auxiliary tablet candidates", KR(ret), K_(tenant_id));
+  } else if (OB_FAIL(execute_aux_freeze_(freeze_candidates, freeze_call_count))) {
+    LOG_WARN("fail to execute vector auxiliary tablet freeze",
+             KR(ret), K_(tenant_id), K(round_seq));
+  }
+  // Lakebase disables META Major scheduling; auxiliary maintenance only freezes.
+  const int64_t aux_total_cost_us = ObTimeUtility::fast_current_time() - start_us;
+  LOG_INFO("[VEC_AUX_STORAGE_MAINTENANCE]",
+           K_(tenant_id), K(round_seq), K(ret),
+           "freeze_candidate_count", freeze_candidates.count(),
+           K(freeze_call_count), K(aux_total_cost_us));
+  return ret;
+}
+
+int ObVecIdxAsyncTaskScheduler::collect_aux_tablet_ids_(ObIArray<ObTabletID> &tablet_ids)
+{
+  int ret = OB_SUCCESS;
+  if (ATOMIC_LOAD(&stop_flag_)) {
+    return ret;
+  }
+  bool has_ivf_index = false;
+  ObArray<uint64_t> vector_table_ids;
+  vector_table_ids.set_attr(ObMemAttr(tenant_id_, "VecAuxTableID"));
+
+  if (OB_FAIL(ObPluginVectorIndexUtils::get_tenant_vector_index_ids(
+          tenant_id_, has_ivf_index, vector_table_ids))) {
+    LOG_WARN("fail to get vector index table ids for auxiliary tablet maintenance",
+             KR(ret), K_(tenant_id));
+  }
+
+  for (int64_t i = 0;
+       OB_SUCC(ret) && !ATOMIC_LOAD(&stop_flag_) && i < vector_table_ids.count();
+       ++i) {
+    ObSchemaGetterGuard schema_guard;
+    const ObSimpleTableSchemaV2 *table_schema = nullptr;
+    if (OB_FAIL(ObMultiVersionSchemaService::get_instance().
+            get_tenant_schema_guard(tenant_id_, schema_guard))) {
+      LOG_WARN("fail to get schema guard for auxiliary tablet maintenance",
+               KR(ret), K_(tenant_id));
+    } else if (OB_FAIL(schema_guard.get_simple_table_schema(
+            tenant_id_, vector_table_ids.at(i), table_schema))) {
+      LOG_WARN("fail to get vector auxiliary table schema",
+               KR(ret), K_(tenant_id), "table_id", vector_table_ids.at(i));
+    } else if (OB_ISNULL(table_schema)) {
+      LOG_DEBUG("vector auxiliary table schema does not exist, skip",
+                K_(tenant_id), "table_id", vector_table_ids.at(i));
+    } else if (table_schema->is_vec_delta_buffer_type()
+               || table_schema->is_vec_index_id_type()) {
+      if (OB_FAIL(table_schema->get_tablet_ids(tablet_ids))) {
+        LOG_WARN("fail to expand vector auxiliary table tablet ids",
+                 KR(ret), K_(tenant_id), "table_id", vector_table_ids.at(i));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObVecIdxAsyncTaskScheduler::check_aux_tablet_need_freeze_(ObTablet &tablet,
+                                                              bool &need_freeze,
+                                                              int64_t &update_row_count,
+                                                              int64_t &delete_row_count)
+{
+  int ret = OB_SUCCESS;
+  need_freeze = false;
+  update_row_count = 0;
+  delete_row_count = 0;
+  ObTableHandleV2 table_handle;
+  ObITabletMemtable *tablet_memtable = nullptr;
+  if (OB_FAIL(tablet.get_active_memtable(table_handle))) {
+    if (OB_ENTRY_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("fail to get active memtable for vector auxiliary tablet",
+               KR(ret), K(tablet.get_tablet_id()));
+    }
+  } else if (OB_FAIL(table_handle.get_tablet_memtable(tablet_memtable))) {
+    LOG_WARN("fail to get active data memtable for vector auxiliary tablet",
+             KR(ret), K(tablet.get_tablet_id()));
+  } else if (OB_ISNULL(tablet_memtable)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("active memtable should not be null",
+              KR(ret), K(tablet.get_tablet_id()));
+  } else if (tablet_memtable->is_active_memtable()
+             && tablet_memtable->is_data_memtable()) {
+    // From ObFastFreezeChecker::check_tombstone_need_fast_freeze().
+    const memtable::ObMemtable *memtable =
+        static_cast<const memtable::ObMemtable *>(tablet_memtable);
+    const ObMtStat &mt_stat = memtable->get_mt_stat();
+    update_row_count = mt_stat.update_row_count_;
+    delete_row_count = mt_stat.delete_row_count_;
+    const ObTableQueuingModeCfg &queuing_cfg =
+        ObTableQueuingModeCfg::get_basic_config(schema::TABLE_MODE_QUEUING_EXTREME);
+    const int64_t memtable_alive_threshold_us =
+        queuing_cfg.get_memtable_alive_threshold(AUX_FAST_FREEZE_INTERVAL_US);
+    const int64_t memtable_alive_time_us =
+        ObTimeUtility::current_time() - memtable->get_timestamp();
+    if (memtable_alive_time_us >= memtable_alive_threshold_us) {
+      const int64_t update_delete_row_threshold =
+          compaction::ObAdaptiveMergePolicy::TOMBSTONE_ROW_COUNT_THRESHOLD
+          * queuing_cfg.queuing_factor_;
+      need_freeze = delete_row_count > queuing_cfg.total_delete_row_cnt_
+          || update_row_count + delete_row_count >= update_delete_row_threshold;
+    }
+  }
+  return ret;
+}
+
+int ObVecIdxAsyncTaskScheduler::collect_aux_tablet_candidates_(
+    const ObIArray<ObTabletID> &tablet_ids,
+    ObIArray<ObAuxTabletCandidate> &freeze_candidates)
+{
+  int ret = OB_SUCCESS;
+  if (ATOMIC_LOAD(&stop_flag_)) {
+    return ret;
+  }
+  ObLSService *ls_service = MTL(ObLSService *);
+  ObSEArray<share::ObLSID, DEFAULT_LS_EXECUTOR_MAP_SIZE> ls_ids;
+  ls_ids.set_attr(ObMemAttr(tenant_id_, "VecAuxLSID"));
+  if (OB_ISNULL(ls_service)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("ls service should not be null", KR(ret), K_(tenant_id));
+  } else {
+    int64_t ls_count = 0;
+    {
+      common::ObSpinLockGuard guard(ls_executor_lock_);
+      ls_count = ls_leader_executor_map_.size();
+    }
+    // Only sync_ls_executors() on this timer inserts entries; concurrent removals
+    // can only shrink the map. Reserve outside the lock before copying LS IDs.
+    if (OB_FAIL(ls_ids.reserve(ls_count))) {
+      LOG_WARN("fail to reserve vector auxiliary ls ids",
+               KR(ret), K_(tenant_id), K(ls_count));
+    }
+  }
+  if (OB_SUCC(ret) && !ATOMIC_LOAD(&stop_flag_)) {
+    common::ObSpinLockGuard guard(ls_executor_lock_);
+    auto collect_func =
+        [&](common::hash::HashMapPair<share::ObLSID,
+                                      ObVecIdxLeaderExecutors *> &entry) -> int {
+      int inner_ret = OB_SUCCESS;
+      ObVecIdxLeaderExecutors *exec = entry.second;
+      if (!ATOMIC_LOAD(&stop_flag_)
+          && OB_NOT_NULL(exec) && exec->is_inited_ && !exec->is_removed_) {
+        if (OB_SUCCESS != (inner_ret = ls_ids.push_back(entry.first))) {
+          LOG_WARN("fail to collect vector index ls for auxiliary tablet maintenance",
+                   KR(inner_ret), K_(tenant_id), "ls_id", entry.first);
+        }
+      }
+      return inner_ret;
+    };
+    if (OB_FAIL(ls_leader_executor_map_.foreach_refactored(collect_func))) {
+      LOG_WARN("fail to collect vector index ls managers",
+               KR(ret), K_(tenant_id));
+    }
+  }
+
+  for (int64_t i = 0;
+       OB_SUCC(ret)
+           && !ATOMIC_LOAD(&stop_flag_)
+           && i < ls_ids.count()
+           && freeze_candidates.count() < AUX_FREEZE_TABLET_LIMIT_PER_ROUND;
+       ++i) {
+    const share::ObLSID &ls_id = ls_ids.at(i);
+    ObLSHandle ls_handle;
+    common::ObRole role = common::FOLLOWER;
+    int64_t proposal_id = 0;
+    if (OB_FAIL(ls_service->get_ls(ls_id, ls_handle, ObLSGetMod::SHARE_MOD))) {
+      if (OB_LS_NOT_EXIST == ret) {
+        LOG_DEBUG("vector auxiliary ls disappeared before candidate collection",
+                  KR(ret), K_(tenant_id), K(ls_id));
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("fail to get ls for vector auxiliary tablet maintenance",
+                 KR(ret), K_(tenant_id), K(ls_id));
+      }
+    } else if (OB_FAIL(ls_handle.get_ls()->get_log_handler()->get_role(
+                   role, proposal_id))) {
+      if (OB_LS_NOT_EXIST == ret) {
+        LOG_DEBUG("vector auxiliary ls disappeared before candidate collection",
+                  KR(ret), K_(tenant_id), K(ls_id));
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("fail to get ls role for vector auxiliary tablet maintenance",
+                 KR(ret), K_(tenant_id), K(ls_id));
+      }
+    } else if (is_strong_leader(role)) {
+      for (int64_t j = 0;
+           OB_SUCC(ret)
+               && !ATOMIC_LOAD(&stop_flag_)
+               && freeze_candidates.count() < AUX_FREEZE_TABLET_LIMIT_PER_ROUND
+               && j < tablet_ids.count();
+           ++j) {
+        const ObTabletID &tablet_id = tablet_ids.at(j);
+        ObTabletHandle tablet_handle;
+        if (OB_FAIL(ls_handle.get_ls()->get_tablet_svr()->get_tablet(
+                tablet_id, tablet_handle))) {
+          if (OB_TABLET_NOT_EXIST == ret) {
+            ret = OB_SUCCESS;
+          } else {
+            LOG_WARN("fail to get vector auxiliary tablet from local ls",
+                     KR(ret), K_(tenant_id), K(ls_id), K(tablet_id));
+          }
+        } else {
+          ObTablet *tablet = tablet_handle.get_obj();
+          bool need_freeze = false;
+          int64_t update_row_count = 0;
+          int64_t delete_row_count = 0;
+          if (OB_FAIL(check_aux_tablet_need_freeze_(
+                  *tablet, need_freeze, update_row_count, delete_row_count))) {
+            LOG_WARN("fail to check vector auxiliary tablet freeze threshold",
+                     KR(ret), K_(tenant_id), K(ls_id), K(tablet_id));
+          } else if (need_freeze) {
+            const ObAuxTabletCandidate candidate(ls_id, tablet_id);
+            if (OB_FAIL(freeze_candidates.push_back(candidate))) {
+              LOG_WARN("fail to collect vector auxiliary tablet freeze candidate",
+                       KR(ret), K_(tenant_id), K(ls_id), K(tablet_id));
+            } else {
+              LOG_DEBUG("collect vector auxiliary tablet freeze candidate",
+                        K_(tenant_id), K_(aux_maintenance_round_seq),
+                        K(ls_id), K(tablet_id), K(update_row_count),
+                        K(delete_row_count), K(proposal_id));
+            }
+          }
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObVecIdxAsyncTaskScheduler::execute_aux_freeze_batch_(ObIArray<uint64_t> &freeze_tablet_ids,
+                                                          int64_t &freeze_call_count)
+{
+  int ret = OB_SUCCESS;
+  if (!freeze_tablet_ids.empty()) {
+    ++freeze_call_count;
+    if (OB_FAIL(ObVectorIndexRefresher::trigger_minor_freeze(
+            tenant_id_, freeze_tablet_ids))) {
+      LOG_WARN("fail to freeze vector auxiliary tablets",
+               KR(ret), K_(tenant_id), K_(aux_maintenance_round_seq),
+               "batch_tablet_count", freeze_tablet_ids.count());
+    }
+  }
+  return ret;
+}
+
+int ObVecIdxAsyncTaskScheduler::execute_aux_freeze_(
+    const ObIArray<ObAuxTabletCandidate> &freeze_candidates,
+    int64_t &freeze_call_count)
+{
+  int ret = OB_SUCCESS;
+  bool stopped_by_timeout = false;
+  ObArray<uint64_t> freeze_tablet_ids;
+  ObTimeoutCtx timeout_ctx;
+  freeze_tablet_ids.set_attr(ObMemAttr(tenant_id_, "VecAuxFreezeID"));
+  const int64_t freeze_deadline_us =
+      ObTimeUtility::current_time() + AUX_FREEZE_PHASE_TIMEOUT_US;
+  if (!freeze_candidates.empty()) {
+    if (OB_FAIL(timeout_ctx.set_abs_timeout(freeze_deadline_us))) {
+      LOG_WARN("fail to set vector auxiliary tablet freeze timeout",
+               KR(ret), K_(tenant_id), K(freeze_deadline_us));
+    }
+  }
+
+  for (int64_t candidate_idx = 0;
+       OB_SUCC(ret)
+           && !ATOMIC_LOAD(&stop_flag_)
+           && !stopped_by_timeout
+           && candidate_idx < freeze_candidates.count();
+       ++candidate_idx) {
+    const ObAuxTabletCandidate &candidate = freeze_candidates.at(candidate_idx);
+    if (ObTimeUtility::current_time() >= freeze_deadline_us) {
+      stopped_by_timeout = true;
+      LOG_WARN("stop vector auxiliary tablet freeze by timeout budget",
+               K_(tenant_id), K_(aux_maintenance_round_seq),
+               K(candidate_idx), "candidate_count", freeze_candidates.count(),
+               K(freeze_deadline_us));
+      break;
+    } else if (OB_FAIL(freeze_tablet_ids.push_back(candidate.tablet_id_.id()))) {
+      LOG_WARN("fail to collect vector auxiliary tablet freeze id",
+               KR(ret), K_(tenant_id), K(candidate));
+    } else if (freeze_tablet_ids.count() >= AUX_FREEZE_BATCH_SIZE) {
+      if (OB_FAIL(execute_aux_freeze_batch_(freeze_tablet_ids, freeze_call_count))) {
+        LOG_WARN("fail to execute vector auxiliary tablet freeze batch",
+                 KR(ret), K_(tenant_id), K_(aux_maintenance_round_seq),
+                 K(candidate_idx));
+      }
+      freeze_tablet_ids.reuse();
+    }
+  }
+
+  // A full batch is executed in the loop; flush the remaining freeze candidates here.
+  if (OB_SUCC(ret) && !stopped_by_timeout
+      && !ATOMIC_LOAD(&stop_flag_) && !freeze_tablet_ids.empty()) {
+    if (OB_FAIL(execute_aux_freeze_batch_(freeze_tablet_ids, freeze_call_count))) {
+      LOG_WARN("fail to execute vector auxiliary tablet freeze batch",
+               KR(ret), K_(tenant_id), K_(aux_maintenance_round_seq));
+    }
+    freeze_tablet_ids.reuse();
+  }
+  return ret;
 }
 
 bool ObVecIdxAsyncTaskScheduler::check_can_do_work()
