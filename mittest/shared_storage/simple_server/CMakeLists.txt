@@ -81,3 +81,5 @@ ob_unittest_observer(test_ss_fail_gc test_ss_fail_gc.cpp)
 ob_unittest_observer(test_ss_checkpoint_gc test_ss_checkpoint_gc.cpp)
 ob_unittest_observer(test_ss_gc_exec_dag_event test_ss_gc_exec_dag_event.cpp)
 ob_unittest_observer(test_ss_window_compaction_finish test_ss_window_compaction_finish.cpp)
+
+ob_unittest_observer(test_ddl_finish_recovery test_ddl_finish_recovery.cpp)

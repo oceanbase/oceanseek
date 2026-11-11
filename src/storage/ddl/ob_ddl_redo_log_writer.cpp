@@ -2169,6 +2169,11 @@ int ObDDLRedoLogWriter::local_write_ddl_finish_log(
   } else if (OB_ISNULL(ls = ls_handle.get_ls())){
     ret = OB_ERR_UNEXPECTED;
     LOG_ERROR("ls should not be null", K(ret));
+  } else if (OB_FAIL(share::SSCompactHelper::link_major(ls_id, log.get_table_key().get_tablet_id(),
+      compaction::ObMergeType::MEDIUM_MERGE, log.get_table_key().get_snapshot_version(),
+      0/*merge_base_version*/, false/*prewarm*/, true/*report*/))) {
+    // FINISH may release DDL KVs, so install the local major before submitting it.
+    LOG_WARN("failed to link major before writing ddl finish log", K(ret), K(log.get_table_key()));
   } else if (OB_FAIL(ls->get_tablet(log.get_table_key().get_tablet_id(), tablet_handle, 
                                     ObTabletCommon::DEFAULT_GET_TABLET_NO_WAIT, 
                                     ObMDSGetTabletMode::READ_ALL_COMMITED))) {
@@ -2310,7 +2315,7 @@ int ObDDLRedoLogWriter::write_finish_log(
   LOG_INFO("ddl write finish log", K(ret), "ddl_event_info", ObDDLEventInfo());
   return ret;
 }
-/* used for update tablet meta*/
+/* Schedule remaining DDL KV cleanup after the FINISH log has completed. */
 int ObDDLRedoLogWriter::wait_finish_log(
     const ObLSID &ls_id, 
     const ObITable::TableKey &table_key, 
@@ -2319,12 +2324,9 @@ int ObDDLRedoLogWriter::wait_finish_log(
   int ret = OB_SUCCESS;
   ObLSHandle ls_handle;
   ObLSService *ls_service = nullptr;
-  ObTabletHandle pre_tablet_handle;
-  ObTabletHandle new_tablet_handle;
+  ObTabletHandle tablet_handle;
   ObDDLKvMgrHandle ddl_kv_mgr_handle;
   const common::ObTabletID tablet_id = table_key.get_tablet_id();
-  int64_t pre_meta_version = OB_INVALID_TIMESTAMP;
-  int64_t new_meta_version = OB_INVALID_TIMESTAMP;
   /* finish log buff not safe here*/
   if (OB_UNLIKELY(!ls_id.is_valid() || !table_key.is_valid() || data_format_version <= 0)) {
     ret = OB_INVALID_ARGUMENT;
@@ -2334,27 +2336,12 @@ int ObDDLRedoLogWriter::wait_finish_log(
     LOG_WARN("ls service should not be null", K(ret), KP(ls_service));
   } else if (OB_FAIL(ls_service->get_ls(ls_id, ls_handle, ObLSGetMod::TABLET_MOD))) {
     LOG_WARN("failed to get log stream", K(ret), K(ls_id));
-  } else if (OB_FAIL(ObDDLUtil::ddl_get_tablet(ls_handle, tablet_id, pre_tablet_handle, ObMDSGetTabletMode::READ_ALL_COMMITED))) {
-    LOG_WARN("failed to get pre tablet handle", K(ret));
-  } else if (FALSE_IT(pre_meta_version = pre_tablet_handle.get_obj()->get_tablet_meta().snapshot_version_)) {
-  } else if (OB_FAIL(share::SSCompactHelper::link_major(ls_id,
-                                                        tablet_id,
-                                                        compaction::ObMergeType::MEDIUM_MERGE,
-                                                        table_key.get_snapshot_version(),
-                                                        0/*merge_base_version*/,
-                                                        false/*prewarm*/,
-                                                        true/*report*/))) {
-    LOG_WARN("failed to link major sstable", K(ret), K(table_key.get_snapshot_version()));
-  }
-
-  if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(ObDDLUtil::ddl_get_tablet(ls_handle, tablet_id, new_tablet_handle, ObMDSGetTabletMode::READ_ALL_COMMITED))) {
+  } else if (OB_FAIL(ObDDLUtil::ddl_get_tablet(ls_handle, tablet_id, tablet_handle, ObMDSGetTabletMode::READ_ALL_COMMITED))) {
     LOG_WARN("failed to get tablet", K(ret), K(ls_id), K(tablet_id));
-  } else if (OB_ISNULL(new_tablet_handle.get_obj())) {
+  } else if (OB_ISNULL(tablet_handle.get_obj())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("tablet should not be null", K(ret), K(ls_id), K(tablet_id));  
-  } else if (FALSE_IT(new_meta_version = new_tablet_handle.get_obj()->get_tablet_meta().snapshot_version_)) {
-  } else if (OB_FAIL(new_tablet_handle.get_obj()->get_ddl_kv_mgr(ddl_kv_mgr_handle, true /* allow create ddl kv mgr*/))) {
+  } else if (OB_FAIL(tablet_handle.get_obj()->get_ddl_kv_mgr(ddl_kv_mgr_handle, true /* allow create ddl kv mgr*/))) {
     /* when in remote write & all redo log replay has been skip, ddl kv mgr may not exist*/
     LOG_WARN("create ddl kv mgr failed", K(ret));
   } else if (OB_FAIL(ObDDLMergeScheduler::schedule_ddl_minor_merge_on_demand(true/*need_freeze*/, ls_id, ddl_kv_mgr_handle))) {

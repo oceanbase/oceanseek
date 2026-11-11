@@ -14,7 +14,10 @@
 #include "src/storage/ddl/ob_ddl_merge_task_utils.h"
 #include "mittest/mtlenv/mock_tenant_module_env.h"
 #include "unittest/storage/test_tablet_helper.h"
+#include "unittest/storage/mock_ob_log_handler.h"
 #include "test_ss_common_util.h"
+#include "storage/compaction_v2/ob_ss_compact_helper.h"
+#include "storage/compaction_v2/ob_ss_link_major_task.h"
 
 namespace oceanbase
 {
@@ -32,6 +35,57 @@ bool is_tenant_has_sslog(const uint64_t tenant_id)
 
 namespace
 {
+class FailingFinishLogHandler : public MockObLogHandler
+{
+public:
+  explicit FailingFinishLogHandler(const int error_code)
+    : error_code_(error_code), append_count_(0)
+  {}
+
+  int append(const void *buffer, const int64_t nbytes, const share::SCN &ref_scn,
+      const bool need_nonblock, const bool allow_compress, logservice::AppendCb *cb,
+      palf::LSN &lsn, share::SCN &scn) override
+  {
+    UNUSEDx(buffer, nbytes, ref_scn, need_nonblock, allow_compress, cb, lsn, scn);
+    ++append_count_;
+    return error_code_;
+  }
+
+  int64_t get_append_count() const { return append_count_; }
+
+private:
+  int error_code_;
+  int64_t append_count_;
+};
+
+class ScopedLinkMajorResult
+{
+public:
+  explicit ScopedLinkMajorResult(const int result)
+    : previous_(active_), result_(result), call_count_(0)
+  {
+    active_ = this;
+  }
+  ~ScopedLinkMajorResult() { active_ = previous_; }
+
+  static ScopedLinkMajorResult *get_active() { return active_; }
+  int invoke()
+  {
+    ++call_count_;
+    return result_;
+  }
+  int64_t get_call_count() const { return call_count_; }
+
+private:
+  static thread_local ScopedLinkMajorResult *active_;
+  ScopedLinkMajorResult *previous_;
+  int result_;
+  int64_t call_count_;
+  DISALLOW_COPY_AND_ASSIGN(ScopedLinkMajorResult);
+};
+
+thread_local ScopedLinkMajorResult *ScopedLinkMajorResult::active_ = nullptr;
+
 class ScopedNamedEvent
 {
 public:
@@ -73,6 +127,26 @@ private:
   bool is_inited_;
   DISALLOW_COPY_AND_ASSIGN(ScopedNamedEvent);
 };
+}
+
+namespace share
+{
+// Keep the real LINK implementation unless this test thread scripts its result.
+int SSCompactHelper::link_major(const ObLSID &ls_id, const ObTabletID &tablet_id,
+    const compaction::ObMergeType merge_type, const int64_t snapshot_version,
+    const int64_t merge_base_version, const bool prewarm, const bool report)
+{
+  int ret = OB_SUCCESS;
+  ScopedLinkMajorResult *script = ScopedLinkMajorResult::get_active();
+  if (nullptr != script) {
+    ret = script->invoke();
+  } else {
+    compaction::ObTabletSSLinkMajorTask task(ls_id, tablet_id, snapshot_version,
+        merge_base_version, merge_type, prewarm, report);
+    ret = task.process();
+  }
+  return ret;
+}
 }
 
 class TestDDLClogCase : public ::testing::Test
@@ -304,6 +378,8 @@ void TestDDLClogCase::TearDownTestCase()
 
 TEST_F(TestDDLClogCase, test_finish_log_write)
 {
+  // A successful LINK must precede a successful FINISH log submission.
+  ScopedLinkMajorResult link_result(OB_SUCCESS);
   /* preppare test*/
   ObDDLFinishLog finish_log;
 
@@ -338,10 +414,45 @@ TEST_F(TestDDLClogCase, test_finish_log_write)
   bool is_remote_write = false;
   ASSERT_EQ(OB_SUCCESS, writer.init(ObLSID(ls_id_), new_tablet_id));
   ASSERT_EQ(OB_SUCCESS, writer.write_finish_log(false /*disable remote write*/,finish_log, is_remote_write));
+  EXPECT_EQ(1, link_result.get_call_count());
+}
+
+TEST_F(TestDDLClogCase, test_finish_log_link_failure_does_not_submit)
+{
+  // A failed LINK must prevent appending FINISH and handing off a callback.
+  ScopedLinkMajorResult link_result(OB_TIMEOUT);
+  ObDDLFinishLog finish_log;
+  ObTabletID finish_tablet_id(tablet_id_);
+  prepare_ddl_finish_log(finish_tablet_id, finish_log);
+  FailingFinishLogHandler log_handler(OB_NOT_MASTER);
+  ObDDLRedoLogWriter writer;
+  ObDDLFinishLogHandle finish_handle;
+  ASSERT_EQ(OB_SUCCESS, writer.init(ObLSID(ls_id_), finish_tablet_id));
+  EXPECT_EQ(OB_TIMEOUT, writer.local_write_ddl_finish_log(
+      finish_log, ObLSID(ls_id_), &log_handler, finish_handle));
+  EXPECT_EQ(1, link_result.get_call_count());
+  EXPECT_EQ(0, log_handler.get_append_count());
+  EXPECT_EQ(nullptr, finish_handle.cb_);
+}
+
+TEST_F(TestDDLClogCase, test_finish_cleanup_does_not_link_again)
+{
+  // Cleanup after FINISH must not introduce a second fallible LINK operation.
+  ScopedLinkMajorResult link_result(OB_TIMEOUT);
+  ObDDLFinishLog finish_log;
+  ObTabletID finish_tablet_id(tablet_id_);
+  prepare_ddl_finish_log(finish_tablet_id, finish_log);
+  ObDDLRedoLogWriter writer;
+  ASSERT_EQ(OB_SUCCESS, writer.init(ObLSID(ls_id_), finish_tablet_id));
+  EXPECT_EQ(OB_SUCCESS, writer.wait_finish_log(
+      ObLSID(ls_id_), finish_log.get_table_key(), mock_data_format_version));
+  EXPECT_EQ(0, link_result.get_call_count());
 }
 
 TEST_F(TestDDLClogCase, test_finish_log_retry_releases_failed_callback)
 {
+  // A FINISH callback failure must retry FINISH even after LINK has succeeded.
+  ScopedLinkMajorResult link_result(OB_SUCCESS);
   ObDDLFinishLog finish_log;
   ObTabletID finish_tablet_id(tablet_id_);
   prepare_ddl_finish_log(finish_tablet_id, finish_log);
@@ -365,6 +476,7 @@ TEST_F(TestDDLClogCase, test_finish_log_retry_releases_failed_callback)
     ASSERT_EQ(OB_SUCCESS, writer.write_finish_log_with_retry(
         false /*allow_remote_write*/, finish_log, is_remote_write));
     EXPECT_FALSE(is_remote_write);
+    EXPECT_GE(link_result.get_call_count(), 2);
   }
 
   for (int64_t i = 0;
@@ -540,6 +652,41 @@ TEST_F(TestDDLClogCase, test_add_macro_ids_from_all_ddl_memtables)
       frozen_ddl_kvs, reversed_macro_ids));
   verify_macro_ids(reversed_macro_ids);
 }
+TEST_F(TestDDLClogCase, test_finish_append_failure_releases_callback)
+{
+  // Synchronous timeout and role errors must release the callback's Tablet reference.
+  ObDDLFinishLog finish_log;
+  ObTabletID tablet_id(tablet_id_);
+  prepare_ddl_finish_log(tablet_id, finish_log);
+  ObLSHandle ls_handle;
+  ObTabletHandle tablet_handle;
+  ASSERT_EQ(OB_SUCCESS, MTL(ObLSService *)->get_ls(
+      ObLSID(ls_id_), ls_handle, ObLSGetMod::DDL_MOD));
+  ASSERT_EQ(OB_SUCCESS, ls_handle.get_ls()->get_tablet(
+      tablet_id, tablet_handle, 0, ObMDSGetTabletMode::READ_WITHOUT_CHECK));
+
+  const int append_errors[] = {OB_TIMEOUT, OB_NOT_MASTER};
+  for (int64_t i = 0; i < ARRAYSIZEOF(append_errors); ++i) {
+    ScopedLinkMajorResult link_result(OB_SUCCESS);
+    FailingFinishLogHandler log_handler(append_errors[i]);
+    ObDDLRedoLogWriter writer;
+    ObDDLFinishLogHandle finish_handle;
+    ASSERT_EQ(OB_SUCCESS, writer.init(ObLSID(ls_id_), tablet_id));
+    const int64_t ref_cnt_before = tablet_handle.get_obj()->get_ref();
+    EXPECT_EQ(append_errors[i], writer.local_write_ddl_finish_log(
+        finish_log, ObLSID(ls_id_), &log_handler, finish_handle));
+    EXPECT_EQ(1, link_result.get_call_count());
+    EXPECT_EQ(1, log_handler.get_append_count());
+    EXPECT_EQ(nullptr, finish_handle.cb_);
+    for (int64_t retry = 0;
+         retry < 1000 && ref_cnt_before != tablet_handle.get_obj()->get_ref();
+         ++retry) {
+      ob_usleep(1000L);
+    }
+    EXPECT_EQ(ref_cnt_before, tablet_handle.get_obj()->get_ref()) << append_errors[i];
+  }
+}
+
 } // namespace oceanbase
 
 int main(int argc, char **argv)
