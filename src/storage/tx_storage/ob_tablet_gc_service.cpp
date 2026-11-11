@@ -289,6 +289,10 @@ void ObTabletGCService::ObTabletChangeTask::runTimerTask()
             if (ObTabletGCHandler::is_tablet_gc_trigger(tablet_persist_trigger)) {
               tablet_gc_handler->set_tablet_gc_trigger();
             }
+            // A full scan may have no original trigger; retry GC next round on timeout.
+            if (0 == times && OB_TIMEOUT == ret) {
+              tablet_gc_handler->set_tablet_gc_trigger();
+            }
           }
         }
       }
@@ -704,12 +708,14 @@ int ObTabletGCHandler::wait_unpersist_tablet_ids_flushed(const common::ObTabletI
 {
   int ret = OB_SUCCESS;
   const int64_t start_ts = ObTimeUtility::fast_current_time();
-  int64_t retry_times = FLUSH_CHECK_MAX_TIMES;
+  int64_t max_retry_times = FLUSH_CHECK_MAX_TIMES;
 
 #ifdef ERRSIM
-  retry_times = EN_GC_WAIT_FLUSH_RETRY_TIMES ? 10 : FLUSH_CHECK_MAX_TIMES;
+  max_retry_times = EN_GC_WAIT_FLUSH_RETRY_TIMES ? 10 : FLUSH_CHECK_MAX_TIMES;
 #endif
 
+  // Allow each persistence stage its own retry budget.
+  int64_t retry_times = max_retry_times;
   int64_t i = 0;
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
@@ -759,6 +765,7 @@ int ObTabletGCHandler::wait_unpersist_tablet_ids_flushed(const common::ObTabletI
   }
 
   bool mds_tablet_flush_finished = false;
+  retry_times = max_retry_times;
   while (!mds_tablet_flush_finished && OB_SUCC(ret)) {
     share::SCN mds_tablet_rec_scn = ls_->get_mds_table()->get_rec_scn();
     if (check_stop()) {
@@ -768,22 +775,33 @@ int ObTabletGCHandler::wait_unpersist_tablet_ids_flushed(const common::ObTabletI
       STORAGE_LOG(INFO, "[tabletgc] finish mds tablet flush", K(mds_tablet_rec_scn), K(decided_scn),
                   K(retry_times), K(i), K(ls_->get_ls_id()));
       mds_tablet_flush_finished = true;
+    } else if (0 == retry_times) {
+      ret = OB_TIMEOUT;
+      STORAGE_LOG(WARN, "[tabletgc] wait mds tablet flush timeout", KR(ret),
+                  K(mds_tablet_rec_scn), K(decided_scn), K(retry_times), K_(ls_id));
     } else {
       STORAGE_LOG(INFO, "[tabletgc] wait mds tablet flush", K(mds_tablet_rec_scn), K(decided_scn),
-                  K(retry_times), K(i), K(ls_->get_ls_id()));      
+                  K(retry_times), K(i), K(ls_->get_ls_id()));
       ob_usleep(FLUSH_CHECK_INTERVAL, true);
+      retry_times--;
     }
   }
   bool tx_data_flush_finished = false;
   int64_t last_tx_data_freeze_nudge_ts = 0;
+  retry_times = max_retry_times;
   while (!tx_data_flush_finished && OB_SUCC(ret)) {
     share::SCN tx_data_rec_scn = ls_->get_tx_table()->get_tx_data_table()->get_rec_scn();
     if (check_stop()) {
       ret = OB_EAGAIN;
       STORAGE_LOG(INFO, "tablet gc handler stop", KR(ret), KPC(this), KPC(ls_), K(ls_->get_ls_meta()));
     } else if (tx_data_rec_scn > decided_scn) {
-      STORAGE_LOG(INFO, "[tabletgc] finish tx data flush", K(tx_data_rec_scn), K(decided_scn), K(retry_times), K(i), K_(ls_id));
+      STORAGE_LOG(INFO, "[tabletgc] finish tx data flush", K(tx_data_rec_scn), K(decided_scn),
+                  K(retry_times), K(i), K_(ls_id));
       tx_data_flush_finished = true;
+    } else if (0 == retry_times) {
+      ret = OB_TIMEOUT;
+      STORAGE_LOG(WARN, "[tabletgc] wait tx data flush timeout", KR(ret),
+                  K(tx_data_rec_scn), K(decided_scn), K(retry_times), K_(ls_id));
     } else {
       const int64_t now_ts = ObTimeUtility::fast_current_time();
       if (0 == last_tx_data_freeze_nudge_ts
@@ -797,8 +815,10 @@ int ObTabletGCHandler::wait_unpersist_tablet_ids_flushed(const common::ObTabletI
           }
         }
       }
-      STORAGE_LOG(INFO, "[tabletgc] wait tx data flush", K(tx_data_rec_scn), K(decided_scn), K(retry_times), K(i), K_(ls_id));      
+      STORAGE_LOG(INFO, "[tabletgc] wait tx data flush", K(tx_data_rec_scn), K(decided_scn),
+                  K(retry_times), K(i), K_(ls_id));
       ob_usleep(FLUSH_CHECK_INTERVAL, true);
+      retry_times--;
     }
   }
 

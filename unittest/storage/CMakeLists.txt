@@ -150,6 +150,8 @@ endif()
 
 #storage_unittest(test_create_tablet_clog tx_storage/test_create_tablet_clog.cpp)
 storage_unittest(test_safe_destroy_handler tx_storage/test_safe_destroy_handler.cpp)
+storage_unittest(test_tablet_gc_retry tx_storage/test_tablet_gc_retry.cpp)
+storage_unittest_longer_timeout(test_tablet_gc_wait tx_storage/test_tablet_gc_wait.cpp)
 storage_unittest(test_simple_rows_merger)
 storage_unittest(test_global_iterator_pool)
 storage_unittest(test_partition_incremental_range_spliter)
