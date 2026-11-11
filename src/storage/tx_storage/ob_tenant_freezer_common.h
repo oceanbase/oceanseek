@@ -117,15 +117,15 @@ public:
   bool is_freeze_need_slow() const;
   bool is_freeze_slowed() const
   {
-    return slow_freeze_;
+    common::SpinRLockGuard guard(lock_);
+    return slow_freeze_cnt_ > 0;
   }
   void update_slow_freeze_interval();
   void set_slow_freeze(const common::ObTabletID &tablet_id,
                        const int64_t retire_clock,
                        const int64_t default_interval);
   void unset_slow_freeze(const common::ObTabletID &tablet_id);
-  TO_STRING_KV(K_(slow_freeze), K_(slow_freeze_timestamp), K_(freeze_interval),
-               K_(last_freeze_timestamp), K_(slow_tablet));
+  DECLARE_TO_STRING;
 public:
   uint64_t tenant_id_;
   bool is_loaded_;             // whether the memory limit set or not.
@@ -133,15 +133,14 @@ public:
   int64_t freeze_cnt_;         // minor freeze times.
   int64_t last_halt_ts_;       // Avoid frequent execution of abort preheating
 private:
-  // protect mem_lower_limit_/mem_upper_limit_/mem_memstore_limit_
-  // to make sure it is consistency
+  // Protect memstore limits and slow-freeze state.
   SpinRWLock lock_;
-  bool slow_freeze_;           // Avoid frequent freezing when abnormal
+  int64_t slow_freeze_cnt_;    // DATA memtables that have disabled freezing.
   int64_t slow_freeze_timestamp_; // the last slow freeze time timestamp
   int64_t slow_freeze_mt_retire_clock_;
   int64_t freeze_interval_;
   int64_t last_freeze_timestamp_;
-  common::ObTabletID slow_tablet_;
+  common::ObTabletID slow_tablet_; // A sampled blocker; may be empty while other blockers remain.
 
   int64_t mem_lower_limit_;    // the min memory limit
   int64_t mem_upper_limit_;    // the max memory limit

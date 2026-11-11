@@ -339,12 +339,16 @@ int ObTabletMemtableMgr::create_memtable_(const CreateMemtableArg &arg,
   } else if (FALSE_IT(block_freeze_if_memstore_full_(new_tablet_memtable))) {
   } else if (OB_FAIL(add_memtable_(memtable_handle))) {
     LOG_WARN("failed to add memtable", K(ret), K(ls_id), K(tablet_id_), K(memtable_handle));
+    // The last-slot check above may already have disabled freezing.
+    new_tablet_memtable->set_allow_freeze(true);
   } else if (FALSE_IT(tg.click("add memtable"))) {
   } else if (!new_tablet_memtable->need_add_to_data_checkpoint()) {
     // The concrete memtable owns an independent checkpoint lifecycle.
   } else if (OB_FAIL(new_tablet_memtable->add_to_data_checkpoint(freezer_->get_ls_data_checkpoint()))) {
     LOG_WARN("add to data_checkpoint failed", K(ret), K(ls_id), KPC(new_tablet_memtable));
     clean_tail_memtable_();
+    // Undo slow-freeze registration before the failed memtable waits for GC.
+    new_tablet_memtable->set_allow_freeze(true);
   } else if (FALSE_IT(tg.click("add to data_checkpoint"))) {
   } else {
     LOG_INFO("succeed to create memtable", K(arg), K(ret), K(ls_id), KPC(new_tablet_memtable), KPC(this));

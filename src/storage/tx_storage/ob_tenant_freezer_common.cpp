@@ -87,7 +87,7 @@ ObTenantInfo::ObTenantInfo()
     freeze_cnt_(0),
     last_halt_ts_(0),
     lock_(common::ObLatchIds::OB_TENANT_INFO_SPIN_RW_LOCK),
-    slow_freeze_(false),
+    slow_freeze_cnt_(0),
     slow_freeze_timestamp_(0),
     slow_freeze_mt_retire_clock_(0),
     freeze_interval_(0),
@@ -105,7 +105,7 @@ void ObTenantInfo::reset()
   frozen_scn_ = 0;
   freeze_cnt_ = 0;
   last_halt_ts_ = 0;
-  slow_freeze_ = false;
+  slow_freeze_cnt_ = 0;
   slow_freeze_timestamp_ = 0;
   slow_freeze_mt_retire_clock_ = 0;
   freeze_interval_ = 0;
@@ -174,7 +174,7 @@ bool ObTenantInfo::is_freeze_need_slow() const
 {
   bool need_slow = false;
   SpinRLockGuard guard(lock_);
-  if (slow_freeze_) {
+  if (slow_freeze_cnt_ > 0) {
     int64_t now = ObTimeUtility::fast_current_time();
     if (now - last_freeze_timestamp_ >= freeze_interval_) {
       need_slow = false;
@@ -188,14 +188,11 @@ bool ObTenantInfo::is_freeze_need_slow() const
 
 void ObTenantInfo::update_slow_freeze_interval()
 {
-  if (!slow_freeze_) {
-  } else {
-    SpinWLockGuard guard(lock_);
+  SpinWLockGuard guard(lock_);
+  if (slow_freeze_cnt_ > 0) {
     // if slow freeze, make freeze interval 2 times of now.
-    if (slow_freeze_) {
-      last_freeze_timestamp_ = ObTimeUtility::fast_current_time();
-      freeze_interval_ = MIN(freeze_interval_ * 2, MAX_FREEZE_INTERVAL);
-    }
+    last_freeze_timestamp_ = ObTimeUtility::fast_current_time();
+    freeze_interval_ = MIN(freeze_interval_ * 2, MAX_FREEZE_INTERVAL);
   }
 }
 
@@ -205,27 +202,60 @@ void ObTenantInfo::set_slow_freeze(
     const int64_t default_interval)
 {
   SpinWLockGuard guard(lock_);
-  if (!slow_freeze_) {
-    slow_freeze_ = true;
+  // Each DATA memtable reports only its allow_freeze true -> false transition.
+  if (0 == slow_freeze_cnt_++) {
     slow_freeze_timestamp_ = ObTimeUtility::fast_current_time();
-    slow_freeze_mt_retire_clock_ = retire_clock;
-    slow_tablet_ = tablet_id;
     last_freeze_timestamp_ = ObTimeUtility::fast_current_time();
     freeze_interval_ = default_interval;
+  }
+  if (!slow_tablet_.is_valid()) {
+    slow_tablet_ = tablet_id;
+    slow_freeze_mt_retire_clock_ = retire_clock;
   }
 }
 
 void ObTenantInfo::unset_slow_freeze(const common::ObTabletID &tablet_id)
 {
   SpinWLockGuard guard(lock_);
-  if (slow_freeze_ && slow_tablet_ == tablet_id) {
-    slow_freeze_ = false;
-    slow_freeze_timestamp_ = 0;
-    slow_freeze_mt_retire_clock_ = 0;
-    last_freeze_timestamp_ = 0;
-    freeze_interval_ = 0;
-    slow_tablet_.reset();
+  // Every blocker must be released, regardless of the diagnostic tablet ID.
+  if (OB_UNLIKELY(slow_freeze_cnt_ <= 0)) {
+    LOG_ERROR_RET(OB_ERR_UNEXPECTED, "unmatched slow freeze release", K(tablet_id), K_(slow_freeze_cnt));
+  } else {
+    --slow_freeze_cnt_;
+    if (slow_tablet_ == tablet_id || 0 == slow_freeze_cnt_) {
+      slow_tablet_.reset();
+      slow_freeze_mt_retire_clock_ = 0;
+    }
+    if (0 == slow_freeze_cnt_) {
+      slow_freeze_timestamp_ = 0;
+      last_freeze_timestamp_ = 0;
+      freeze_interval_ = 0;
+    }
   }
+}
+
+DEF_TO_STRING(ObTenantInfo)
+{
+  int64_t pos = 0;
+  int64_t slow_freeze_cnt = 0;
+  int64_t slow_freeze_timestamp = 0;
+  int64_t freeze_interval = 0;
+  int64_t last_freeze_timestamp = 0;
+  common::ObTabletID slow_tablet;
+  {
+    SpinRLockGuard guard(lock_);
+    slow_freeze_cnt = slow_freeze_cnt_;
+    slow_freeze_timestamp = slow_freeze_timestamp_;
+    freeze_interval = freeze_interval_;
+    last_freeze_timestamp = last_freeze_timestamp_;
+    slow_tablet = slow_tablet_;
+  }
+  // Format one consistent snapshot after releasing the tenant-info lock.
+  J_OBJ_START();
+  J_KV("slow_freeze", slow_freeze_cnt > 0, K(slow_freeze_cnt), K(slow_freeze_timestamp),
+       K(freeze_interval), K(last_freeze_timestamp), K(slow_tablet));
+  J_OBJ_END();
+  return pos;
 }
 
 ObTenantFreezeGuard::ObTenantFreezeGuard(int &err_code, const ObTenantInfo &tenant_info, const int64_t warn_threshold)
