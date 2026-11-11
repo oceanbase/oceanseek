@@ -724,6 +724,13 @@ protected:
     fusion_param_.rank_window_size_ = rank_window_size;
     fusion_param_.size_ = rank_window_size;
     fusion_param_.offset_ = 0;
+    fusion_param_.path_top_k_limits_.reset();
+    for (int64_t i = 0; i < fusion_ctdef_.children_cnt_; ++i) {
+      if (OB_FAIL(fusion_param_.path_top_k_limits_.push_back(rank_window_size))) {
+        LOG_WARN("failed to initialize path top k limit", K(ret), K(i));
+        return ret;
+      }
+    }
     // Set path weights: use provided weights or default to [0.5, 0.5]
     fusion_param_.weights_.reset();
     if (OB_NOT_NULL(path_weights) && path_weights->count() > 0) {
@@ -1798,6 +1805,8 @@ TEST_F(ObDASFusionIterTest, test_limit_expr)
   fusion_param_.fusion_method_ = ObFusionMethod::WEIGHT_SUM;
   fusion_param_.rank_window_size_ = 3;
   fusion_param_.size_ = 3;
+  // Final LIMIT is applied inside fusion only for a single partition.
+  fusion_param_.is_single_partition_ = true;
   fusion_param_.weights_.reset();
   fusion_param_.weights_.push_back(0.5);
   fusion_param_.weights_.push_back(0.5);

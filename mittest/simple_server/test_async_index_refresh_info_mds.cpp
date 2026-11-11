@@ -3,6 +3,7 @@
  * 本文件包含机密及专有信息，未经授权不得使用或披露。
  */
 
+#include <cstdio>
 #include <cstdlib>
 #include <gtest/gtest.h>
 #include <atomic>
@@ -16,8 +17,10 @@
 #include "lib/allocator/ob_malloc.h"
 #include "mittest/env/ob_simple_server_helper.h"
 #include "share/ob_debug_sync.h"
+#include "mittest/shared_storage/clean_residual_data.h"
 #include "unittest/storage/sslog/test_mock_palf_kv.h"
 #include "sensitive_test/object_storage/object_storage_authorization_info.h"
+#include "storage/shared_storage/ob_disk_space_manager.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/tablet/ob_async_index_refresh_info_mds_helper.h"
 #include "storage/tablet/ob_async_index_refresh_info_replay_executor.h"
@@ -144,8 +147,28 @@ class TestAsyncIndexRefreshInfoMds : public ObSimpleClusterTestBase
 {
 public:
   TestAsyncIndexRefreshInfoMds()
-      : ObSimpleClusterTestBase("test_async_index_refresh_info_", "50G", "50G", "50G")
+      : ObSimpleClusterTestBase("test_async_index_refresh_info_", "50G", "50G", "20G")
   {}
+
+  static void TearDownTestCase()
+  {
+    if (0 == ::testing::UnitTest::GetInstance()->failed_test_count()) {
+      ResidualDataCleaner cleaner;
+      int ret = cleaner.init_in_mock_env();
+      EXPECT_EQ(OB_SUCCESS, ret) << "failed to initialize residual data cleaner";
+      if (OB_SUCCESS == ret) {
+        ret = cleaner.clean_residual_data();
+        EXPECT_EQ(OB_SUCCESS, ret) << "failed to clean residual data";
+      }
+      if (OB_SUCCESS != ret) {
+        // Suite teardown assertions are excluded from the base's failed-case
+        // count. Fail explicitly and preserve the environment for diagnosis.
+        std::fflush(nullptr);
+        std::_Exit(EXIT_FAILURE);
+      }
+    }
+    ObSimpleClusterTestBase::TearDownTestCase();
+  }
 };
 
 // ---------------------------------------------------------------
@@ -158,10 +181,21 @@ TEST_F(TestAsyncIndexRefreshInfoMds, observer_start)
 
 TEST_F(TestAsyncIndexRefreshInfoMds, add_tenant)
 {
-  ASSERT_EQ(OB_SUCCESS, create_tenant("async_idx_t", "20G", "20G", false, 4));
+  ASSERT_EQ(OB_SUCCESS, create_tenant("async_idx_t", "5G", "10G", false, 4, "10G"));
   ASSERT_EQ(OB_SUCCESS, get_tenant_id(R.tenant_id_, "async_idx_t"));
   ASSERT_NE(0, R.tenant_id_);
   ASSERT_EQ(OB_SUCCESS, get_curr_simple_server().init_sql_proxy2("async_idx_t"));
+  ObTenantSwitchGuard guard;
+  ASSERT_EQ(OB_SUCCESS, guard.switch_to(R.tenant_id_));
+  ObTenantDiskSpaceManager *disk_mgr = MTL(ObTenantDiskSpaceManager *);
+  ASSERT_NE(nullptr, disk_mgr);
+  OB_SERVER_DISK_SPACE_MGR.hidden_sys_data_disk_config_size_ = 1024;
+  int64_t configured_size = 0;
+  int64_t actual_size = 0;
+  bool resized = false;
+  ASSERT_EQ(OB_SUCCESS, disk_mgr->get_tenant_unit_data_disk_size(
+      R.tenant_id_, configured_size, actual_size));
+  ASSERT_EQ(OB_SUCCESS, disk_mgr->resize_total_disk_size_(configured_size, resized));
 }
 
 // ---------------------------------------------------------------
@@ -1743,8 +1777,6 @@ int main(int argc, char **argv)
   oceanbase::unittest::init_log_and_gtest(argc, argv);
   OB_LOGGER.set_log_level("INFO");
   GCONF.ob_startup_mode.set_value("shared_storage");
-  GCONF.datafile_size.set_value("50G");
-  GCONF.memory_limit.set_value("50G");
   GCONF.system_memory.set_value("5G");
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

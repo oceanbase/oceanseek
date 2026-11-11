@@ -2224,7 +2224,8 @@ int ObTableLocation::set_location_calc_node(const ObDMLStmt &stmt,
         && OB_NOT_NULL(table_schema)
         && (table_schema->is_aux_lob_table()
             || (table_item->is_index_table_
-                && share::schema::is_local_fts_index(table_schema->get_index_type())))) {
+                && (share::schema::is_local_fts_index(table_schema->get_index_type())
+                    || table_schema->is_async_ivf_index())))) {
       get_all = true;
       is_range_get = false;
       is_col_part_expr = false;
@@ -2236,7 +2237,8 @@ int ObTableLocation::set_location_calc_node(const ObDMLStmt &stmt,
       LOG_INFO("index or lob aux direct select: fallback to scanning all partitions",
                 K(part_level), K(loc_meta_.ref_table_id_), K(ret),
                 "is_aux_lob", table_schema->is_aux_lob_table(),
-                "is_fts_index", table_item->is_index_table_);
+                "is_fts_index", table_item->is_index_table_,
+                "is_async_ivf_index", table_schema->is_async_ivf_index());
     }
   }
 

@@ -21,6 +21,7 @@
 #include "sql/engine/expr/ob_expr_lob_utils.h"
 #include "lib/time/ob_time_utility.h"
 #include "lib/thread/threads.h"
+#include "lib/utility/ob_sort.h"
 #include "lib/mysqlclient/ob_mysql_result.h"
 #include "share/vector_index/ob_ai_access_service.h"
 
@@ -28,6 +29,33 @@ namespace oceanbase
 {
 namespace share
 {
+
+namespace
+{
+struct ObIvfSSTableEvictionCandidate
+{
+  ObIvfSSTableEvictionCandidate()
+    : ls_id_(), key_(), mgr_(nullptr), cache_(nullptr), last_access_ts_(0)
+  {}
+  ObLSID ls_id_;
+  ObIvfCacheMgrKey key_;
+  ObIvfCacheMgr *mgr_;
+  ObIvfSSTableCentCache *cache_;
+  int64_t last_access_ts_;
+  TO_STRING_KV(K_(ls_id), K_(key), KP_(mgr), KP_(cache), K_(last_access_ts));
+};
+
+struct ObIvfSSTableEvictionCandidateCmp
+{
+  bool operator()(const ObIvfSSTableEvictionCandidate &lhs,
+                  const ObIvfSSTableEvictionCandidate &rhs) const
+  {
+    return lhs.last_access_ts_ != rhs.last_access_ts_
+        ? lhs.last_access_ts_ < rhs.last_access_ts_
+        : lhs.key_.get_group_id() > 0 && rhs.key_.get_group_id() == 0;
+  }
+};
+} // namespace
 
 class ObHoldAdaptorRefCallback
 {
@@ -206,6 +234,9 @@ void ObPluginVectorIndexMgr::destroy()
     vec_adaptor_map_.destroy();
     ivf_index_helper_map_.destroy();
     ivf_cache_mgr_map_.destroy();
+    if (ivf_hgraph_pending_set_.created()) {
+      ivf_hgraph_pending_set_.destroy();
+    }
     spfresh_task_queue_.destroy();
     hot_ns_ids_.destroy();
     mem_sync_info_.destroy();
@@ -276,6 +307,8 @@ int ObPluginVectorIndexMgr::init(uint64_t tenant_id,
     LOG_WARN("fail to create ivf index build helper map", KR(ret), K(ls_id));
   } else if (OB_FAIL(ivf_cache_mgr_map_.create(hash_capacity, "IvfMgrMap", "IvfMgrMap", tenant_id))) {
     LOG_WARN("fail to create ivf mgr map", KR(ret), K(ls_id));
+  } else if (OB_FAIL(ivf_hgraph_pending_set_.create(hash_capacity, ObMemAttr(tenant_id, "IvfHgrPending")))) {
+    LOG_WARN("fail to create IVF SSTable HGraph pending set", KR(ret), K(ls_id));
   } else if (OB_FAIL(mem_sync_info_.init(hash_capacity, tenant_id, ls_id))) {
     LOG_WARN("fail to create first mem sync set", K(ls_id), KR(ret));
   } else if (OB_FAIL(async_task_opt_.init(hash_capacity, tenant_id, ls_id))) {
@@ -1296,6 +1329,121 @@ int ObPluginVectorIndexService::process_spfresh_task_queue()
   return ret;
 }
 
+int ObPluginVectorIndexService::run_ivf_sstable_cache_maintenance()
+{
+  int ret = OB_SUCCESS;
+  bool run_lru = false;
+  uint64_t resident_before = 0;
+  uint64_t evicted_count = 0;
+  uint64_t evicted_bytes = 0;
+  common::ObSEArray<ObIvfSSTableEvictionCandidate, 64> candidates;
+  ObIvfSSTableCacheController &controller = get_ivf_sstable_cache_controller();
+
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("vector index service is not initialized for IVF SSTable cache maintenance",
+             KR(ret), K_(tenant_id));
+  } else {
+    const int config_ret = controller.refresh_config();
+    if (OB_SUCCESS != config_ret) {
+      LOG_WARN("failed to refresh IVF SSTable cache config",
+               K(config_ret), K_(tenant_id));
+    } else if (controller.try_start_eviction()) {
+      run_lru = true;
+      resident_before = controller.get_resident_hold();
+      // Snapshot cache entries while LS managers and their maps are protected.
+      // Each candidate owns one cache-manager reference after the locks are released.
+      TCRWLock::RLockGuard service_guard(ls_mgr_map_rwlock_);
+      FOREACH_X(ls_iter, index_ls_mgr_map_, OB_SUCC(ret)) {
+        ObPluginVectorIndexMgr *ls_mgr = ls_iter->second;
+        if (OB_ISNULL(ls_mgr)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("null LS vector manager during cache maintenance", KR(ret), K(ls_iter->first));
+        } else {
+          common::RWLock::RLockGuard cache_guard(ls_mgr->get_ivf_cache_mgr_map_rwlock());
+          FOREACH_X(cache_iter, ls_mgr->get_ivf_cache_mgr_map(), OB_SUCC(ret)) {
+            const ObIvfCacheMgrKey &key = cache_iter->first;
+            ObIvfCacheMgr *mgr = cache_iter->second;
+            if (!key.is_sstable_key() || OB_ISNULL(mgr)) {
+            } else {
+              ObIvfSSTableCentCache *cache = nullptr;
+              const int cache_ret = mgr->get_cache_node<ObIvfSSTableCentCache>(
+                  IVF_SSTABLE_CENTROID_CACHE, cache);
+              if (OB_SUCCESS == cache_ret && OB_NOT_NULL(cache)
+                  && cache->is_completed() && cache->is_memory_registered()) {
+                ObIvfSSTableEvictionCandidate candidate;
+                candidate.ls_id_ = ls_iter->first;
+                candidate.key_ = key;
+                candidate.mgr_ = mgr;
+                candidate.cache_ = cache;
+                candidate.last_access_ts_ = cache->get_last_access_ts();
+                mgr->inc_ref();
+                if (OB_FAIL(candidates.push_back(candidate))) {
+                  ObIvfCacheMgr *tmp_mgr = mgr;
+                  (void)ObPluginVectorIndexUtils::release_ivf_cache_mgr(tmp_mgr);
+                  LOG_WARN("failed to snapshot IVF SSTable cache candidate", KR(ret), K(key));
+                }
+              } else if (OB_SUCCESS != cache_ret && OB_HASH_NOT_EXIST != cache_ret
+                         && OB_ENTRY_NOT_EXIST != cache_ret) {
+                LOG_WARN("failed to inspect IVF SSTable centroid cache",
+                         K(cache_ret), K(key));
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (OB_SUCC(ret) && run_lru && candidates.count() > 1) {
+    lib::ob_sort(candidates.begin(), candidates.end(), ObIvfSSTableEvictionCandidateCmp());
+  }
+
+  for (int64_t i = 0; OB_SUCC(ret) && run_lru
+      && controller.get_resident_hold() > controller.get_low_watermark()
+      && i < candidates.count(); ++i) {
+    ObIvfSSTableEvictionCandidate &candidate = candidates.at(i);
+    bool erased = false;
+    uint64_t registered_hold = 0;
+    const int tmp_ret = try_erase_ivf_sstable_cache(
+        candidate.ls_id_, candidate.key_, candidate.mgr_, candidate.cache_,
+        candidate.last_access_ts_, false /* failed_build */,
+        erased, registered_hold);
+    if (OB_SUCCESS != tmp_ret) {
+      LOG_WARN("failed to erase IVF SSTable cache candidate", K(tmp_ret), K(candidate.key_));
+    } else if (erased) {
+      ++evicted_count;
+      // Release the snapshot now: child destruction can reclaim shared leaves
+      // and drop the parent's dependency before considering the next entry.
+      const uint64_t before_release = controller.get_resident_hold();
+      (void)ObPluginVectorIndexUtils::release_ivf_cache_mgr(candidate.mgr_);
+      candidate.mgr_ = nullptr;
+      const uint64_t after_release = controller.get_resident_hold();
+      // Map removal itself releases no quota. Observe reclamation only after
+      // the snapshot is dropped, including shared leaves released by children.
+      evicted_bytes += before_release > after_release ? before_release - after_release : 0;
+    }
+  }
+
+  if (run_lru) {
+    controller.record_eviction(evicted_count, evicted_bytes);
+    controller.finish_eviction();
+  }
+
+  for (int64_t i = 0; i < candidates.count(); ++i) {
+    ObIvfCacheMgr *mgr = candidates.at(i).mgr_;
+    if (mgr != nullptr) { (void)ObPluginVectorIndexUtils::release_ivf_cache_mgr(mgr); }
+  }
+
+  if (evicted_count > 0 || run_lru) {
+    const uint64_t resident_after = controller.get_resident_hold();
+    LOG_INFO("IVF SSTable cache maintenance finished", KR(ret), K_(tenant_id),
+             K(run_lru), K(resident_before), K(resident_after),
+             K(evicted_count), K(evicted_bytes), K(controller));
+  }
+  return ret;
+}
+
 int ObPluginVectorIndexService::attach_tenant_adaptors_to_ls_map_for_destroy(
     const share::ObLSID &ls_id,
     const common::ObIArray<common::ObTabletID> &tablet_ids)
@@ -1421,13 +1569,16 @@ int ObPluginVectorIndexService::acquire_vector_index_mgr(ObLSID ls_id,
             LOG_WARN("failed to init ls vector index mgr", KR(ret), K(ls_id));
           } else {
             new_ls_index_mgr->set_vector_index_service(this);
-            if (OB_FAIL(get_ls_index_mgr_map().set_refactored(ls_id, new_ls_index_mgr))) {
-              if (ret != OB_HASH_EXIST) {
-                LOG_WARN("set vector index mgr map faild", KR(ret), K(ls_id));
+            {
+              TCRWLock::WLockGuard map_guard(ls_mgr_map_rwlock_);
+              if (OB_FAIL(get_ls_index_mgr_map().set_refactored(ls_id, new_ls_index_mgr))) {
+                if (ret != OB_HASH_EXIST) {
+                  LOG_WARN("set vector index mgr map faild", KR(ret), K(ls_id));
+                }
+              } else {
+                LOG_INFO("[VEC_INDEX] created vector index mgr for ls",
+                         K(tenant_id_), K(ls_id), KP(new_ls_index_mgr), K(lbt()));
               }
-            } else {
-              LOG_INFO("[VEC_INDEX] created vector index mgr for ls",
-                       K(tenant_id_), K(ls_id), KP(new_ls_index_mgr), K(lbt()));
             }
           }
           if (OB_FAIL(ret)) {
@@ -1554,6 +1705,7 @@ void ObPluginVectorIndexService::destroy()
       }
     }
     index_ls_mgr_map_.destroy();
+    ivf_sstable_cache_controller_.reset();
 
     FOREACH(iter, tenant_adaptor_map_) {
       ObPluginVectorIndexAdaptor *adapter = iter->second;
@@ -1632,12 +1784,16 @@ int ObPluginVectorIndexService::init(const uint64_t tenant_id,
     ObSharedMemAllocMgr *shared_mem_mgr = MTL(ObSharedMemAllocMgr*);
     memory_context_ = shared_mem_mgr->vector_allocator().get_mem_context();
     all_vsag_use_mem_ = shared_mem_mgr->vector_allocator().get_used_mem_ptr();
-    tenant_id_ = tenant_id;
-    schema_service_ = schema_service;
-    ls_service_ = ls_service;
-    sql_proxy_ = GCTX.sql_proxy_;
-    is_inited_ = true;
-    LOG_INFO("plugin vector index service: init", KR(ret), K_(tenant_id));  
+    if (OB_FAIL(ivf_sstable_cache_controller_.init(tenant_id, all_vsag_use_mem_))) {
+      LOG_WARN("failed to init IVF SSTable cache controller", KR(ret), K(tenant_id));
+    } else {
+      tenant_id_ = tenant_id;
+      schema_service_ = schema_service;
+      ls_service_ = ls_service;
+      sql_proxy_ = GCTX.sql_proxy_;
+      is_inited_ = true;
+      LOG_INFO("plugin vector index service: init", KR(ret), K_(tenant_id));
+    }
   }
   return ret;
 }
@@ -2127,8 +2283,7 @@ int ObPluginVectorIndexMgr::replace_old_adapter_with_scn_check(ObPluginVectorInd
 }
 
 int ObPluginVectorIndexMgr::set_ivf_cache_mgr(const ObIvfCacheMgrKey &tablet_id,
-                                              ObIvfCacheMgr *cache_mgr,
-                                              int overwrite)
+                                              ObIvfCacheMgr *cache_mgr)
 {
   int ret = OB_SUCCESS;
   ObIvfCacheMgr *old_cache_mgr = nullptr;
@@ -2137,6 +2292,10 @@ int ObPluginVectorIndexMgr::set_ivf_cache_mgr(const ObIvfCacheMgrKey &tablet_id,
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid null IVF cache mgr", K(ret), K(tablet_id));
   } else {
+    // Establish the map ownership before publishing the pointer. Readers take
+    // the same rwlock while acquiring their guard, so a visible manager always
+    // has at least the map reference.
+    cache_mgr->inc_ref();
     {
       WLockGuard lock_guard(ivf_cache_mgr_map_rwlock_);
       int get_ret = ivf_cache_mgr_map_.get_refactored(tablet_id, old_cache_mgr);
@@ -2149,14 +2308,19 @@ int ObPluginVectorIndexMgr::set_ivf_cache_mgr(const ObIvfCacheMgrKey &tablet_id,
       }
       if (OB_SUCC(ret)) {
         if (OB_FAIL(ivf_cache_mgr_map_.set_refactored(
-            tablet_id, cache_mgr, replace_delete_pending ? 1 : overwrite))) {
+            tablet_id, cache_mgr, replace_delete_pending ? 1 : 0))) {
           LOG_WARN("failed to set vector index ivf cache mgr", K(tablet_id), KR(ret));
-        } else {
-          cache_mgr->inc_ref();
         }
       }
     }
-    if (OB_SUCC(ret) && replace_delete_pending) {
+    if (OB_FAIL(ret)) {
+      const bool reaches_zero = cache_mgr->dec_ref_and_check_release();
+      if (OB_UNLIKELY(!reaches_zero)) {
+        LOG_ERROR_RET(OB_ERR_UNEXPECTED,
+                      "unexpected reference on unpublished ivf cache manager",
+                      K(tablet_id), KPC(cache_mgr));
+      }
+    } else if (replace_delete_pending) {
       int tmp_ret = ObPluginVectorIndexUtils::release_ivf_cache_mgr(old_cache_mgr);
       if (OB_SUCCESS != tmp_ret) {
         LOG_WARN("failed to release replaced IVF cache mgr", K(tmp_ret), K(tablet_id));
@@ -2166,22 +2330,280 @@ int ObPluginVectorIndexMgr::set_ivf_cache_mgr(const ObIvfCacheMgrKey &tablet_id,
   return ret;
 }
 
-
-int ObPluginVectorIndexMgr::erase_ivf_cache_mgr(const ObIvfCacheMgrKey &cachr_mgr_key)
+int ObPluginVectorIndexMgr::enqueue_ivf_sstable_hgraph_build(
+    const ObIvfCacheMgrKey &cache_mgr_key)
 {
   int ret = OB_SUCCESS;
   ObIvfCacheMgr *cache_mgr = nullptr;
-  WLockGuard lock_guard(ivf_cache_mgr_map_rwlock_);
-  if (OB_FAIL(ivf_cache_mgr_map_.erase_refactored(cachr_mgr_key, &cache_mgr))) {
-    if (ret != OB_HASH_NOT_EXIST) {
-      LOG_WARN("failed to erase partial vector index ivf cache mgr", K(cachr_mgr_key), KR(ret));
+  // Serialize the presence check and enqueue with cache removal. The task
+  // validates the cache node and its build readiness when it runs.
+  RLockGuard lock_guard(ivf_cache_mgr_map_rwlock_);
+  if (cache_mgr_key.get_group_id() != 0) {
+    // Child groups remain FP32 arrays.
+  } else if (OB_FAIL(ivf_cache_mgr_map_.get_refactored(cache_mgr_key, cache_mgr))) {
+    if (OB_HASH_NOT_EXIST == ret) {
+      LOG_INFO("[DISK_BBQ] SSTable cache manager is missing, skip HGraph build enqueue",
+               K(ret), K(cache_mgr_key));
+      ret = OB_SUCCESS; // The cache may have been removed after publication.
+    } else {
+      LOG_WARN("[DISK_BBQ] failed to find SSTable cache before enqueue", K(ret), K(cache_mgr_key));
     }
   } else if (OB_ISNULL(cache_mgr)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("ivf cache mgr inst is null", K(cachr_mgr_key), KR(ret));
+    LOG_WARN("[DISK_BBQ] null SSTable cache manager before enqueue", K(ret), K(cache_mgr_key));
+  } else if (OB_FAIL(ivf_hgraph_pending_set_.set_refactored(cache_mgr_key))) {
+    if (OB_HASH_EXIST == ret) {
+      LOG_DEBUG("[DISK_BBQ] SSTable HGraph build is already pending, skip duplicate enqueue",
+                K(ret), K(cache_mgr_key));
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("failed to enqueue IVF SSTable HGraph build", KR(ret), K(cache_mgr_key));
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexMgr::erase_ivf_sstable_hgraph_pending_(
+    const ObIvfCacheMgrKey &cache_mgr_key)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(ivf_hgraph_pending_set_.erase_refactored(cache_mgr_key))) {
+    if (OB_HASH_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("failed to erase IVF SSTable HGraph pending key", KR(ret), K(cache_mgr_key));
+    }
+  }
+  return ret;
+}
+
+bool ObPluginVectorIndexMgr::has_ivf_sstable_hgraph_pending(const ObIvfCacheMgrKey &cache_mgr_key) const
+{
+  return OB_HASH_EXIST == ivf_hgraph_pending_set_.exist_refactored(cache_mgr_key);
+}
+
+int ObPluginVectorIndexMgr::try_erase_ivf_sstable_hgraph_pending(
+    const ObIvfCacheMgrKey &cache_mgr_key,
+    ObIvfCacheMgr *expected_mgr,
+    ObIvfSSTableCentCache *expected_cache)
+{
+  int ret = OB_SUCCESS;
+  ObIvfCacheMgr *cache_mgr = nullptr;
+  ObIvfSSTableCentCache *cache = nullptr;
+  RLockGuard lock_guard(ivf_cache_mgr_map_rwlock_);
+  if (!cache_mgr_key.is_sstable_key() || (OB_ISNULL(expected_mgr) && OB_NOT_NULL(expected_cache))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[DISK_BBQ] invalid SSTable HGraph completion", K(ret), K(cache_mgr_key),
+        KP(expected_mgr), KP(expected_cache));
+  } else if (OB_FAIL(ivf_cache_mgr_map_.get_refactored(cache_mgr_key, cache_mgr))) {
+    if (OB_HASH_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+      if (OB_ISNULL(expected_mgr)) { ret = erase_ivf_sstable_hgraph_pending_(cache_mgr_key); }
+    } else {
+      LOG_WARN("[DISK_BBQ] failed to find SSTable cache for HGraph completion", K(ret), K(cache_mgr_key));
+    }
+  } else if (cache_mgr != expected_mgr) {
+  } else if (OB_ISNULL(cache_mgr)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("[DISK_BBQ] null SSTable cache manager during HGraph completion", K(ret), K(cache_mgr_key));
+  } else if (OB_FAIL(cache_mgr->get_cache_node<ObIvfSSTableCentCache>(
+                 IVF_SSTABLE_CENTROID_CACHE, cache))) {
+    if (OB_HASH_NOT_EXIST == ret || OB_ENTRY_NOT_EXIST == ret) { ret = OB_SUCCESS; }
+    else { LOG_WARN("[DISK_BBQ] failed to get SSTable cache for HGraph completion", K(ret), K(cache_mgr_key)); }
+  } else if (cache == expected_cache) {
+    ret = erase_ivf_sstable_hgraph_pending_(cache_mgr_key);
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexMgr::erase_ivf_cache_mgr(const ObIvfCacheMgrKey &cache_mgr_key)
+{
+  int ret = OB_SUCCESS;
+  ObIvfCacheMgr *cache_mgr = nullptr;
+  {
+    WLockGuard lock_guard(ivf_cache_mgr_map_rwlock_);
+    if (OB_FAIL(ivf_cache_mgr_map_.erase_refactored(cache_mgr_key, &cache_mgr))) {
+      if (ret != OB_HASH_NOT_EXIST) {
+        LOG_WARN("failed to erase vector index IVF cache manager", K(cache_mgr_key), KR(ret));
+      }
+    } else if (OB_ISNULL(cache_mgr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("IVF cache manager is null", K(cache_mgr_key), KR(ret));
+    } else if (cache_mgr_key.is_sstable_key()
+        && OB_FAIL(erase_ivf_sstable_hgraph_pending_(cache_mgr_key))) {
+      LOG_WARN("[DISK_BBQ] failed to erase removed SSTable HGraph pending key", K(ret), K(cache_mgr_key));
+    }
+  }
+  // Visibility ends at map removal. Pinned buffers remain charged until their
+  // last owner releases them; destruction does not run under the map lock.
+  if (OB_NOT_NULL(cache_mgr)) {
+    const int release_ret = ObPluginVectorIndexUtils::release_ivf_cache_mgr(cache_mgr);
+    if (OB_SUCCESS != release_ret) {
+      LOG_WARN("failed to release vector index IVF cache manager", K(cache_mgr_key), K(release_ret));
+      if (OB_SUCC(ret)) { ret = release_ret; }
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexMgr::try_erase_sstable_cache_mgr(
+    const ObIvfCacheMgrKey &cache_mgr_key,
+    ObIvfCacheMgr *expected_mgr,
+    ObIvfSSTableCentCache *expected_cache,
+    const int64_t expected_last_access_ts,
+    const bool failed_build,
+    bool &erased,
+    uint64_t &registered_hold)
+{
+  int ret = OB_SUCCESS;
+  bool can_erase = false;
+  erased = false;
+  registered_hold = 0;
+  ObIvfCacheMgr *cache_mgr = nullptr;
+  ObIvfSSTableCentCache *cache = nullptr;
+  WLockGuard lock_guard(ivf_cache_mgr_map_rwlock_);
+  if (!cache_mgr_key.is_sstable_key() || OB_ISNULL(expected_mgr)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid SSTable cache erase argument", KR(ret), K(cache_mgr_key), KP(expected_mgr));
+  } else if (OB_FAIL(ivf_cache_mgr_map_.get_refactored(cache_mgr_key, cache_mgr))) {
+    if (OB_HASH_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("failed to get SSTable cache manager before erase", KR(ret), K(cache_mgr_key));
+    }
   } else {
+    const int cache_ret = cache_mgr->get_cache_node<ObIvfSSTableCentCache>(
+        IVF_SSTABLE_CENTROID_CACHE, cache);
+    if (OB_SUCCESS != cache_ret && OB_HASH_NOT_EXIST != cache_ret
+        && OB_ENTRY_NOT_EXIST != cache_ret) {
+      ret = cache_ret;
+      LOG_WARN("failed to get SSTable centroid cache before erase",
+               KR(ret), K(cache_mgr_key));
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (cache_mgr != expected_mgr) {
+    // A failed builder only needs its old generation to be absent from the
+    // map. Never erase a replacement generation for the same TableKey.
+    erased = failed_build;
+  } else if (failed_build && OB_ISNULL(expected_cache)) {
+    if (OB_NOT_NULL(cache)) {
+      // Another query completed cache-node creation. There is no empty
+      // manager left for this caller to clean.
+      erased = true;
+    } else {
+      // The two references are the map ownership and the current builder
+      // guard. An additional guard may be creating the cache node concurrently.
+      can_erase = 2 == cache_mgr->get_ref_cnt();
+    }
+  } else if (cache != expected_cache) {
+    erased = failed_build;
+  } else if (failed_build) {
+    can_erase = cache->is_writing() && !cache->is_hgraph_building();
+  } else {
+    // LRU only erases a quiescent cache. The two expected references are the
+    // map reference and the maintenance/task snapshot reference.
+    can_erase = (OB_ISNULL(cache)
+        || (cache->get_last_access_ts() == expected_last_access_ts
+            && !cache->is_hgraph_building()))
+        && 2 == cache_mgr->get_ref_cnt();
+  }
+  if (OB_SUCC(ret) && can_erase
+      && OB_FAIL(ivf_cache_mgr_map_.erase_refactored(cache_mgr_key, &cache_mgr))) {
+    if (OB_HASH_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("failed to erase SSTable cache manager", KR(ret), K(cache_mgr_key));
+    }
+  } else if (OB_SUCC(ret) && can_erase) {
+    const int pending_ret = erase_ivf_sstable_hgraph_pending_(cache_mgr_key);
+    if (OB_SUCCESS != pending_ret) {
+      LOG_WARN("failed to erase HGraph pending key with cache",
+               K(pending_ret), K(cache_mgr_key));
+    }
+    registered_hold = OB_ISNULL(cache) ? 0 : cache->get_registered_hold();
+    erased = true;
     if (OB_FAIL(ObPluginVectorIndexUtils::release_ivf_cache_mgr(cache_mgr))) {
-      LOG_WARN("fail to release vector index ivf cache mgr", K(cachr_mgr_key), KR(ret));
+      LOG_WARN("failed to release SSTable cache map reference", KR(ret), K(cache_mgr_key));
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexMgr::try_publish_sstable_cache(
+    const ObIvfCacheMgrKey &cache_mgr_key,
+    ObIvfCacheMgr *expected_mgr,
+    ObIvfSSTableCentCache *cache,
+    const uint64_t hold,
+    bool &published)
+{
+  int ret = OB_SUCCESS;
+  published = false;
+  ObIvfCacheMgr *cache_mgr = nullptr;
+  ObIvfSSTableCentCache *mapped_cache = nullptr;
+  RLockGuard lock_guard(ivf_cache_mgr_map_rwlock_);
+  if (OB_ISNULL(expected_mgr) || OB_ISNULL(cache)
+      || 0 == hold || OB_ISNULL(vector_index_service_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid IVF SSTable cache publish argument",
+             KR(ret), K(cache_mgr_key), KP(expected_mgr), KP(cache),
+             K(hold), KP_(vector_index_service));
+  } else if (OB_FAIL(ivf_cache_mgr_map_.get_refactored(cache_mgr_key, cache_mgr))) {
+    if (OB_HASH_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("failed to get IVF SSTable cache manager before publish",
+               KR(ret), K(cache_mgr_key));
+    }
+  } else if (cache_mgr != expected_mgr) {
+  } else if (OB_FAIL(cache_mgr->get_cache_node<ObIvfSSTableCentCache>(
+                 IVF_SSTABLE_CENTROID_CACHE, mapped_cache))) {
+    if (OB_HASH_NOT_EXIST == ret || OB_ENTRY_NOT_EXIST == ret) {
+      ret = OB_SUCCESS;
+    } else {
+      LOG_WARN("failed to get IVF SSTable centroid cache before publish",
+               KR(ret), K(cache_mgr_key));
+    }
+  } else if (mapped_cache != cache || !cache->is_writing()
+             || cache->get_count() != cache->get_capacity()) {
+  } else if (!vector_index_service_->get_ivf_sstable_cache_controller().is_cache_enabled()) {
+    // A build admitted before the quota was disabled must not repopulate the
+    // shared cache. Its caller detaches the buffer and retains it privately.
+  } else {
+    bool parent_dependency_satisfied = true;
+    if (cache->has_shared_leaf_refs()) {
+      parent_dependency_satisfied = false;
+      const ObIvfCacheMgrKey parent_key(cache_mgr_key.get_sstable_key(), 0);
+      ObIvfCacheMgr *parent_mgr = nullptr;
+      ObIvfSSTableCentCache *parent_cache = nullptr;
+      // The child guard keeps the old owner alive, but does not keep it mapped
+      // or registered. Validate that owner under the same lock as publication.
+      if (OB_FAIL(ivf_cache_mgr_map_.get_refactored(parent_key, parent_mgr))) {
+        if (OB_HASH_NOT_EXIST == ret) { ret = OB_SUCCESS; }
+        else { LOG_WARN("[DISK_BBQ] failed to find parent cache before child publication", K(ret), K(parent_key)); }
+      } else if (OB_ISNULL(parent_mgr)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("[DISK_BBQ] null parent cache manager before child publication", K(ret), K(parent_key));
+      } else if (parent_mgr != cache->get_parent_cache_mgr()) {
+        // A new root under the same TableKey cannot own this child's vectors.
+      } else if (OB_FAIL(parent_mgr->get_cache_node<ObIvfSSTableCentCache>(
+                     IVF_SSTABLE_CENTROID_CACHE, parent_cache))) {
+        if (OB_HASH_NOT_EXIST == ret || OB_ENTRY_NOT_EXIST == ret) { ret = OB_SUCCESS; }
+        else { LOG_WARN("[DISK_BBQ] failed to get parent cache before child publication", K(ret), K(parent_key)); }
+      } else if (OB_ISNULL(parent_cache)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("[DISK_BBQ] null parent cache before child publication", K(ret), K(parent_key));
+      } else {
+        parent_dependency_satisfied = parent_cache->is_completed() && parent_cache->is_memory_registered();
+      }
+      if (OB_SUCC(ret) && !parent_dependency_satisfied) {
+        LOG_DEBUG("[DISK_BBQ] skip child publication after parent removal or replacement", K(cache_mgr_key));
+      }
+    }
+    if (OB_SUCC(ret) && parent_dependency_satisfied) {
+      cache->register_memory_once(hold, &vector_index_service_->get_ivf_sstable_cache_controller());
+      cache->set_completed();
+      published = true;
     }
   }
   return ret;
@@ -2764,11 +3186,9 @@ int ObPluginVectorIndexService::process_pq_centroid_cache(ObIvfICache *cent_cach
   
   return ret;
 }
-// only for sq8
+// SQ8 min/max/step metadata is array-backed.
 int ObPluginVectorIndexService::process_centroid_cache(ObIvfICache *cent_cache, 
-                                                     ObIArray<float*> &aux_info,
-                                                     ObExprVecIvfCenterIdCache *expr_cache,
-                                                     ObIAllocator &allocator)
+                                                     ObIArray<float*> &aux_info)
 {
   int ret = OB_SUCCESS;
   
@@ -2777,19 +3197,11 @@ int ObPluginVectorIndexService::process_centroid_cache(ObIvfICache *cent_cache,
     LOG_WARN("cent_cache is null", K(ret));
   } else {
     uint64_t capacity = cent_cache->get_count();
-    // If expr_cache is provided, use its allocator (same as SQL query table logic)
-    ObIAllocator *used_allocator = OB_NOT_NULL(expr_cache) ? &expr_cache->get_allocator() : &allocator;
     
     for (uint64_t i = 1; i <= capacity && OB_SUCC(ret); ++i) {
       float *centroid_vec = nullptr;
-      if (cent_cache->has_hgraph_index()) {
-        if (OB_FAIL(cent_cache->read_centroid(i, centroid_vec, true /*deep_copy*/, used_allocator))) {
-          LOG_WARN("fail to get centroids from hgraph index", K(ret));
-        }
-      } else {
-        if (OB_FAIL(cent_cache->read_centroid(i, centroid_vec))) {
-          LOG_WARN("fail to read centroid", K(ret), K(i));
-        }
+      if (OB_FAIL(cent_cache->read_centroid(i, centroid_vec))) {
+        LOG_WARN("fail to read centroid", K(ret), K(i));
       }
       if (OB_FAIL(ret)) {
       } else if (OB_ISNULL(centroid_vec)) {
@@ -2872,7 +3284,7 @@ int ObPluginVectorIndexService::get_ivf_aux_info_from_cache(
             }
             case IvfCacheType::IVF_CENTROID_CACHE:
             case IvfCacheType::IVF_MAP_CENTROID_CACHE: {
-              if (OB_FAIL(process_centroid_cache(cent_cache, aux_info, expr_cache, allocator))) {
+              if (OB_FAIL(process_centroid_cache(cent_cache, aux_info))) {
                 LOG_WARN("failed to process centroid cache", K(ret));
               }
               break;
@@ -3250,6 +3662,127 @@ int ObPluginVectorIndexService::acquire_ivf_cache_mgr_guard(
       LOG_DEBUG("fail to get ivf cache mgr guard", K(ret), K(key));
     } else {
       LOG_WARN("fail to get ivf cache mgr guard", K(ret), K(key));
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexService::enqueue_ivf_sstable_hgraph_build(
+    const ObLSID ls_id, const ObIvfCacheMgrKey &cache_mgr_key)
+{
+  int ret = OB_SUCCESS;
+  ObPluginVectorIndexMgr *ls_index_mgr = nullptr;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("vector index service is not initialized for HGraph enqueue",
+             KR(ret), K_(tenant_id));
+  } else if (OB_UNLIKELY(!ls_id.is_valid() || !cache_mgr_key.is_sstable_key())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid IVF SSTable HGraph enqueue argument",
+             KR(ret), K(ls_id), K(cache_mgr_key));
+  } else {
+    TCRWLock::RLockGuard guard(ls_mgr_map_rwlock_);
+    if (OB_FAIL(index_ls_mgr_map_.get_refactored(ls_id, ls_index_mgr))) {
+      if (OB_HASH_NOT_EXIST != ret) {
+        LOG_WARN("failed to get LS manager for HGraph enqueue", KR(ret), K(ls_id));
+      }
+    } else if (OB_ISNULL(ls_index_mgr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("LS manager map returned null manager for HGraph enqueue",
+               KR(ret), K(ls_id), K(cache_mgr_key));
+    } else if (OB_FAIL(ls_index_mgr->enqueue_ivf_sstable_hgraph_build(cache_mgr_key))) {
+      LOG_WARN("failed to enqueue IVF SSTable HGraph build", KR(ret), K(ls_id), K(cache_mgr_key));
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexService::try_publish_ivf_sstable_cache(
+    const ObLSID ls_id,
+    const ObIvfCacheMgrKey &cache_mgr_key,
+    ObIvfCacheMgr *expected_mgr,
+    ObIvfSSTableCentCache *cache,
+    const uint64_t hold,
+    bool &published)
+{
+  int ret = OB_SUCCESS;
+  ObPluginVectorIndexMgr *ls_index_mgr = nullptr;
+  published = false;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("vector index service is not initialized for IVF SSTable cache publish",
+             KR(ret), K_(tenant_id));
+  } else if (!ls_id.is_valid() || !cache_mgr_key.is_sstable_key()
+             || OB_ISNULL(expected_mgr) || OB_ISNULL(cache) || 0 == hold) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid IVF SSTable cache publish argument",
+             KR(ret), K(ls_id), K(cache_mgr_key), KP(expected_mgr),
+             KP(cache), K(hold));
+  } else {
+    TCRWLock::RLockGuard guard(ls_mgr_map_rwlock_);
+    if (OB_FAIL(index_ls_mgr_map_.get_refactored(ls_id, ls_index_mgr))) {
+      if (OB_HASH_NOT_EXIST == ret) {
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("failed to get LS manager for IVF SSTable cache publish",
+                 KR(ret), K(ls_id), K(cache_mgr_key));
+      }
+    } else if (OB_ISNULL(ls_index_mgr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("LS manager map returned null manager for IVF SSTable cache publish",
+               KR(ret), K(ls_id), K(cache_mgr_key));
+    } else if (OB_FAIL(ls_index_mgr->try_publish_sstable_cache(
+                   cache_mgr_key, expected_mgr, cache, hold, published))) {
+      LOG_WARN("failed to publish IVF SSTable cache under LS guard",
+               KR(ret), K(ls_id), K(cache_mgr_key));
+    }
+  }
+  return ret;
+}
+
+int ObPluginVectorIndexService::try_erase_ivf_sstable_cache(
+    const ObLSID ls_id,
+    const ObIvfCacheMgrKey &cache_mgr_key,
+    ObIvfCacheMgr *expected_mgr,
+    ObIvfSSTableCentCache *expected_cache,
+    const int64_t expected_last_access_ts,
+    const bool failed_build,
+    bool &erased,
+    uint64_t &registered_hold)
+{
+  int ret = OB_SUCCESS;
+  ObPluginVectorIndexMgr *ls_index_mgr = nullptr;
+  erased = false;
+  registered_hold = 0;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("vector index service is not initialized for IVF SSTable cache erase",
+             KR(ret), K_(tenant_id));
+  } else if (!ls_id.is_valid() || !cache_mgr_key.is_sstable_key()
+             || OB_ISNULL(expected_mgr)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid IVF SSTable cache erase argument",
+             KR(ret), K(ls_id), K(cache_mgr_key), KP(expected_mgr),
+             KP(expected_cache), K(failed_build));
+  } else {
+    TCRWLock::RLockGuard guard(ls_mgr_map_rwlock_);
+    if (OB_FAIL(index_ls_mgr_map_.get_refactored(ls_id, ls_index_mgr))) {
+      if (OB_HASH_NOT_EXIST == ret) {
+        ret = OB_SUCCESS;
+      } else {
+        LOG_WARN("failed to get LS manager for IVF SSTable cache erase",
+                 KR(ret), K(ls_id), K(cache_mgr_key));
+      }
+    } else if (OB_ISNULL(ls_index_mgr)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("LS manager map returned null manager for IVF SSTable cache erase",
+               KR(ret), K(ls_id), K(cache_mgr_key));
+    } else if (OB_FAIL(ls_index_mgr->try_erase_sstable_cache_mgr(
+                   cache_mgr_key, expected_mgr, expected_cache,
+                   expected_last_access_ts, failed_build,
+                   erased, registered_hold))) {
+      LOG_WARN("failed to erase IVF SSTable cache under LS guard",
+               KR(ret), K(ls_id), K(cache_mgr_key));
     }
   }
   return ret;

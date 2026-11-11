@@ -14,7 +14,7 @@
 #include "lib/container/ob_se_array.h"
 #include "lib/hash/ob_hashset.h"
 #include "share/scn.h"
-#include "storage/ddl/ob_ddl_inc_clog.h"
+#include "storage/ddl/ob_ddl_inc_log_basic.h"
 #include "storage/tx/ob_tx_serialization.h"
 
 namespace oceanbase

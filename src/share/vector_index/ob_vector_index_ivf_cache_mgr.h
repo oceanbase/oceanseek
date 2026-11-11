@@ -7,6 +7,7 @@
 #define OCEANBASE_SHARE_IVF_CACHE_MGR_H_
 #include "share/datum/ob_datum.h"
 #include "storage/ob_i_store.h"
+#include "storage/ob_i_table.h"
 #include "share/ob_ls_id.h"
 #include "share/rc/ob_tenant_base.h"
 #include "lib/oblog/ob_log_module.h"
@@ -14,6 +15,8 @@
 #include "share/allocator/ob_tenant_vector_allocator.h"
 #include "ob_vector_index_util.h"
 #include "lib/lock/ob_recursive_mutex.h"
+#include "lib/lock/ob_small_spin_lock.h"
+#include "lib/lock/ob_spin_lock.h"
 #include "ob_plugin_vector_index_adaptor.h"
 #include "lib/hash/ob_hashmap.h"
 #include "share/scn.h"
@@ -22,7 +25,9 @@ namespace oceanbase
 {
 namespace share
 {
-// Key for IVF cache manager map: (tablet_id, namespace_id, ltable_id). Design Ch.3.
+// Key for IVF cache manager map. Existing IVF caches use tablet/namespace keys;
+// Disk-BBQ centroid caches use the complete SSTable TableKey so different
+// segments belonging to one tablet never alias each other.
 struct ObIvfCacheMgrKey final
 {
   static const int64_t INVALID_NS_ID = 0;
@@ -30,16 +35,23 @@ struct ObIvfCacheMgrKey final
 
   ObIvfCacheMgrKey()
       : tablet_id_(common::ObTabletID::INVALID_TABLET_ID), namespace_id_(INVALID_NS_ID),
-        ltable_id_(INVALID_LTABLE_ID)
+        ltable_id_(INVALID_LTABLE_ID), group_id_(0)
   {}
   ObIvfCacheMgrKey(const common::ObTabletID &tablet_id, int64_t namespace_id)
-      : tablet_id_(tablet_id), namespace_id_(namespace_id), ltable_id_(INVALID_LTABLE_ID)
+      : tablet_id_(tablet_id), namespace_id_(namespace_id), ltable_id_(INVALID_LTABLE_ID), group_id_(0)
   {}
   explicit ObIvfCacheMgrKey(const common::ObTabletID &tablet_id)
-      : tablet_id_(tablet_id), namespace_id_(INVALID_NS_ID), ltable_id_(INVALID_LTABLE_ID)
+      : tablet_id_(tablet_id), namespace_id_(INVALID_NS_ID), ltable_id_(INVALID_LTABLE_ID), group_id_(0)
   {}
   ObIvfCacheMgrKey(const common::ObTabletID &tablet_id, int64_t namespace_id, uint64_t ltable_id)
-      : tablet_id_(tablet_id), namespace_id_(namespace_id), ltable_id_(ltable_id)
+      : tablet_id_(tablet_id), namespace_id_(namespace_id), ltable_id_(ltable_id), group_id_(0)
+  {}
+  explicit ObIvfCacheMgrKey(const storage::ObITable::TableKey &sstable_key, int64_t group_id = 0)
+      : tablet_id_(sstable_key.is_valid()
+                       ? sstable_key.get_tablet_id()
+                       : common::ObTabletID(common::ObTabletID::INVALID_TABLET_ID)),
+        namespace_id_(INVALID_NS_ID),
+        ltable_id_(INVALID_LTABLE_ID), group_id_(group_id), sstable_key_(sstable_key)
   {}
 
   void reset()
@@ -47,10 +59,22 @@ struct ObIvfCacheMgrKey final
     tablet_id_.reset();
     namespace_id_ = INVALID_NS_ID;
     ltable_id_ = INVALID_LTABLE_ID;
+    sstable_key_.reset();
+    group_id_ = 0;
   }
-  bool is_valid() const { return tablet_id_.is_valid(); }
+  bool is_valid() const
+  {
+    return tablet_id_.is_valid() && group_id_ >= 0
+        && (is_sstable_key() || group_id_ == 0)
+        && (!is_sstable_key()
+            || (sstable_key_.is_ivf_sstable()
+                && tablet_id_ == sstable_key_.get_tablet_id()));
+  }
   uint64_t hash() const
   {
+    if (is_sstable_key()) {
+      return murmurhash(&group_id_, sizeof(group_id_), sstable_key_.hash());
+    }
     uint64_t h = tablet_id_.hash();
     h = murmurhash(&namespace_id_, sizeof(namespace_id_), h);
     return murmurhash(&ltable_id_, sizeof(ltable_id_), h);
@@ -64,13 +88,20 @@ struct ObIvfCacheMgrKey final
   {
     return tablet_id_ == other.tablet_id_
         && namespace_id_ == other.namespace_id_
-        && ltable_id_ == other.ltable_id_;
+        && ltable_id_ == other.ltable_id_
+        && sstable_key_ == other.sstable_key_
+        && group_id_ == other.group_id_;
   }
   int64_t id() const { return static_cast<int64_t>(tablet_id_.id()); }
   const common::ObTabletID &get_tablet_id() const { return tablet_id_; }
   bool has_namespace_id() const { return namespace_id_ != INVALID_NS_ID; }
+  bool is_sstable_key() const { return sstable_key_.is_valid(); }
+  const storage::ObITable::TableKey &get_sstable_key() const { return sstable_key_; }
+  int64_t get_group_id() const { return group_id_; }
   uint64_t get_ltable_id() const { return ltable_id_; }
 
+  // JSON statistics for logical namespace/ltable caches. SSTable cache
+  // statistics are emitted by their own branch in fill_cache_info().
   int print_to_string(char *buf, int64_t buf_len, int64_t &pos) const {
     int ret = OB_SUCCESS;
     if (OB_FAIL(databuff_printf(buf, buf_len, pos,
@@ -80,11 +111,13 @@ struct ObIvfCacheMgrKey final
     return ret;
   }
 
-  TO_STRING_KV(K_(tablet_id), K_(namespace_id), K_(ltable_id));
+  TO_STRING_KV(K_(tablet_id), K_(namespace_id), K_(ltable_id), K_(sstable_key), K_(group_id));
 
   common::ObTabletID tablet_id_;
   int64_t namespace_id_;
   uint64_t ltable_id_;
+  int64_t group_id_;
+  storage::ObITable::TableKey sstable_key_;
 };
 
 // Parameter for warmup_ivf_cache_by_ns_ids: one namespace + N ltable_ids that
@@ -137,7 +170,7 @@ struct ObIvfPrewarmParam final
   DISALLOW_COPY_AND_ASSIGN(ObIvfPrewarmParam);
 };
 
-// Pair of (ls_id, full cache mgr key) for iteration over all cached namespaces
+// Pair of (ls_id, full cache manager key) for cross-LS cache iteration.
 struct ObLSCacheMgrKeyPair
 {
   ObLSCacheMgrKeyPair() : ls_id_(), key_() {}
@@ -269,7 +302,8 @@ public:
   {
     return type_ == IvfCacheType::IVF_CENTROID_CACHE
            || type_ == IvfCacheType::IVF_MAP_CENTROID_CACHE
-           || type_ == IvfCacheType::IVF_PQ_CENTROID_CACHE;
+           || type_ == IvfCacheType::IVF_PQ_CENTROID_CACHE
+           || type_ == IvfCacheType::IVF_SSTABLE_CENTROID_CACHE;
   }
   bool is_pq_precompute_table() const
   {
@@ -310,7 +344,7 @@ public:
   {
     return ATOMIC_BCAS(&status_, IvfCacheStatus::IVF_CACHE_IDLE, IvfCacheStatus::IVF_CACHE_WRITING);
   }
-  OB_INLINE void set_completed() { ATOMIC_STORE(&status_, IvfCacheStatus::IVF_CACHE_COMPLETED); }
+  virtual void set_completed() { ATOMIC_STORE(&status_, IvfCacheStatus::IVF_CACHE_COMPLETED); }
   OB_INLINE bool is_completed()
   {
     return ATOMIC_LOAD(&status_) == IvfCacheStatus::IVF_CACHE_COMPLETED;
@@ -326,12 +360,16 @@ public:
                           ObIvfCentroidState state = ObIvfCentroidState::NORMAL);
   virtual int set_centroid_del_scn(int64_t cid, const SCN &del_scn);
 
-  // Centroid read interfaces: read_scn default nullptr means 0 (no version filter)
+  // ARRAY reads borrow cache data unless deep_copy is requested.
+  // read_scn nullptr means no version filter.
   virtual int read_centroid(int64_t centroid_idx, float *&centroid_vec, bool deep_copy = false,
                             ObIAllocator *allocator = nullptr, const SCN *read_scn = nullptr) = 0;
   virtual int read_pq_centroid(int64_t m_idx, int64_t centroid_idx, float *&centroid_vec,
                               bool deep_copy = false, ObIAllocator *allocator = nullptr,
                               const SCN *read_scn = nullptr) = 0;
+  // HGraph reads use 1-based IDs and materialize vectors in the caller's allocator.
+  virtual int read_centroid_from_hgraph(int64_t centroid_idx, float *&centroid_vec,
+                                        vsag::Allocator &allocator);
   // Centroid write interfaces: create_scn default nullptr means SCN::min_scn()
   virtual int write_centroid(const int64_t center_idx, const float *centroid, const int64_t length,
                              const SCN *create_scn = nullptr) = 0;
@@ -341,7 +379,7 @@ public:
                                            const int64_t length,
                                            const SCN *create_scn = nullptr) = 0;
   virtual float *get_centroids() = 0;
-  virtual int get_centroids(ObIAllocator *allocator, float **vectors,
+  virtual int get_centroids_from_hgraph(vsag::Allocator *allocator, float **vectors,
                             const SCN *read_scn = nullptr) = 0;
   virtual int release_centroids() = 0;
   virtual int build_hgraph_and_release_centers(const ObVectorIndexParam &param) = 0;
@@ -399,6 +437,8 @@ public:
   int read_pq_centroid(int64_t m_idx, int64_t centroid_idx, float *&centroid_vec,
                        bool deep_copy = false, ObIAllocator *allocator = nullptr,
                        const SCN *read_scn = nullptr) override;
+  int read_centroid_from_hgraph(int64_t centroid_idx, float *&centroid_vec,
+                                vsag::Allocator &allocator) override;
   int write_centroid(const int64_t center_idx, const float *centroid, const int64_t length,
                      const SCN *create_scn = nullptr) override;
   int write_pq_centroid(int64_t m_idx, const int64_t center_idx, const float *centroid,
@@ -406,7 +446,7 @@ public:
   int64_t get_capacity() const override { return capacity_; }
   int64_t get_count() const override { return count_; }
   float *get_centroids() override;
-  int get_centroids(ObIAllocator *allocator, float **vectors,
+  int get_centroids_from_hgraph(vsag::Allocator *allocator, float **vectors,
                     const SCN *read_scn = nullptr) override;
   int64_t get_cent_vec_dim() const override { return cent_vec_dim_; }
   int64_t get_nlist() const override { return nlist_; }
@@ -435,8 +475,7 @@ protected:
            const ObVectorIndexParam &param, uint64_t* all_vsag_use_mem) override;
   int build_hgraph_index(const ObVectorIndexParam &param, bool use_default_params);
   void cleanup_hgraph_index();
-  int get_raw_vector_from_hgraph(int64_t centroid_idx, float *&centroid_vec,
-                                 ObIAllocator *allocator = nullptr);
+  void release_centroid_memory();
 
   // NOTE(liyao): to avoid ObIArray using sizeof(float*) * capacity_ extra memory,
   //              we use float* to save centroids_
@@ -448,6 +487,153 @@ protected:
   common::obvsag::VectorIndexPtr hgraph_index_;  // VSAG's HGraph index
   share::ObVsagMemContext *hgraph_mem_ctx_;      // dedicated mem ctx for hgraph
 
+};
+
+class ObIvfCacheMgr;
+class ObIvfSSTableCacheController;
+
+class ObIvfCacheMgrGuard
+{
+public:
+  ObIvfCacheMgrGuard(ObIvfCacheMgr *cache_mgr = nullptr)
+      : cache_mgr_(cache_mgr), role_epoch_(-1) {}
+  // SPFresh tasks are copied by ObArray while queued and retried, so the guard
+  // must retain the cache reference across task copies.
+  ObIvfCacheMgrGuard(const ObIvfCacheMgrGuard &other);
+  ~ObIvfCacheMgrGuard();
+
+  ObIvfCacheMgrGuard &operator=(const ObIvfCacheMgrGuard &other);
+
+  bool is_valid() const { return OB_NOT_NULL(cache_mgr_); }
+  ObIvfCacheMgr *get_ivf_cache_mgr() const { return cache_mgr_; }
+  int64_t get_role_epoch() const { return role_epoch_; }
+  void set_role_epoch(const int64_t role_epoch) { role_epoch_ = role_epoch; }
+  int set_cache_mgr(ObIvfCacheMgr *cache_mgr);
+  void reset();
+  TO_STRING_KV(KPC_(cache_mgr), K_(role_epoch));
+
+private:
+  ObIvfCacheMgr *cache_mgr_;
+  int64_t role_epoch_;
+};
+
+
+// Cache-local state for one IVF SSTable centroid entry. ObIvfCacheMgr remains
+// a generic owner/lifetime container and does not carry this cache type's LRU,
+// memory-accounting, or HGraph-build state.
+class ObIvfSSTableCentCache final : public ObIvfCentCache
+{
+public:
+  explicit ObIvfSSTableCentCache(ObIAllocator &allocator, int64_t tenant_id)
+      : ObIvfCentCache(allocator, tenant_id),
+        hit_count_(0), first_load_ts_(0), last_access_ts_(0),
+        registered_hold_(0),
+        memory_registered_(false),
+        hgraph_building_(false),
+        group_id_(0),
+        centroid_ids_(nullptr),
+        child_counts_(nullptr),
+        shared_leaf_count_(0), leaf_cid_base_(0), shared_leaves_(nullptr), leaf_locks_(nullptr),
+        leaf_refs_(nullptr), parent_cache_(nullptr), parent_guard_(),
+        memory_lock_(common::ObLatchIds::VECTOR_IVF_CACHE_LOCK), memory_controller_(nullptr)
+  {}
+  virtual ~ObIvfSSTableCentCache();
+
+  void reuse() override;
+  int allocate_array(int64_t centroid_count, int64_t group_id = 0);
+  int write_entry(int64_t slot, int64_t cid, const float *vector, uint32_t child_count,
+      uint64_t *reservation = nullptr);
+  // Root directory owns each unique leaf; child groups hold one reference per member.
+  struct SharedLeaf
+  {
+    int64_t cid_;
+    uint32_t child_count_;
+    uint32_t ref_count_;
+    const float *vector() const { return reinterpret_cast<const float *>(this + 1); }
+  };
+  int init_shared_leaves(int64_t leaf_count, int64_t leaf_cid_base);
+  int attach_parent_cache(const ObIvfCacheMgrGuard &guard);
+  bool has_shared_leaf_refs() const { return leaf_refs_ != nullptr; }
+  ObIvfCacheMgr *get_parent_cache_mgr() const { return parent_guard_.get_ivf_cache_mgr(); }
+  const float *get_centroid_vector(int64_t slot) const
+  { return leaf_refs_ == nullptr ? centroids_ + slot * cent_vec_dim_ : leaf_refs_[slot]->vector(); }
+  int64_t get_centroid_id(int64_t slot) const
+  { return leaf_refs_ != nullptr ? leaf_refs_[slot]->cid_ : (centroid_ids_ == nullptr ? slot + 1 : centroid_ids_[slot]); }
+  uint32_t get_child_count(int64_t slot) const
+  { return leaf_refs_ != nullptr ? leaf_refs_[slot]->child_count_ : (child_counts_ == nullptr ? 0 : child_counts_[slot]); }
+  int read_centroid(int64_t cid, float *&vector, bool deep_copy = false,
+      ObIAllocator *allocator = nullptr, const SCN *read_scn = nullptr) override;
+  static uint64_t estimate_shared_group_memory(int64_t count, int64_t dim)
+  { return count * (dim * sizeof(float) + sizeof(SharedLeaf) + sizeof(SharedLeaf *) + sizeof(int64_t)); }
+  int64_t get_group_id() const { return group_id_; }
+  int write_centroid_with_real_idx(const int64_t real_idx,
+                                   const float *centroid,
+                                   const int64_t length,
+                                   const SCN *create_scn = nullptr) override;
+  int release_centroids() override { return OB_NOT_SUPPORTED; }
+  int build_hgraph_and_release_centers(const ObVectorIndexParam &param) override
+  {
+    UNUSED(param);
+    return OB_NOT_SUPPORTED;
+  }
+  // Build from the published ARRAY without blocking ARRAY readers. The final
+  // WLock publication switches this cache to HGraph and retires ARRAY.
+  int build_sstable_hgraph(const ObVectorIndexParam &param);
+  void set_completed() override;
+  // One access per centroid reader, recorded before releasing its lifetime guard.
+  // A reader that built this cache after a miss only updates the access time.
+  void record_iterator_access(bool cache_hit);
+  uint64_t get_hit_count() const { return ATOMIC_LOAD(&hit_count_); }
+  int64_t get_first_load_ts() const { return ATOMIC_LOAD(&first_load_ts_); }
+  void touch();
+  int64_t get_last_access_ts() const { return ATOMIC_LOAD(&last_access_ts_); }
+  bool register_memory_once(uint64_t hold, ObIvfSSTableCacheController *controller,
+      uint64_t *reservation = nullptr);
+  // Accounting follows this object's memory lifetime, including after map removal.
+  uint64_t get_registered_hold() const { return ATOMIC_LOAD(&registered_hold_); }
+  bool update_registered_hold(uint64_t hold, uint64_t released_reservation = 0);
+  bool is_memory_registered() const { return ATOMIC_LOAD(&memory_registered_); }
+  bool try_start_hgraph_build()
+  {
+    return ATOMIC_BCAS(&hgraph_building_, false, true);
+  }
+  void finish_hgraph_build() { ATOMIC_STORE(&hgraph_building_, false); }
+  bool is_hgraph_building() const { return ATOMIC_LOAD(&hgraph_building_); }
+  bool can_build_hgraph() override;
+
+protected:
+  int init(ObIvfMemContext *parent_mem_ctx, const IvfCacheKey &key,
+           const ObVectorIndexParam &param, uint64_t *all_vsag_use_mem) override;
+
+private:
+  uint64_t hit_count_;
+  int64_t first_load_ts_;
+  int64_t last_access_ts_;
+  uint64_t registered_hold_;
+  bool memory_registered_;
+  bool hgraph_building_;
+
+  int64_t group_id_;
+  int64_t *centroid_ids_;
+  uint32_t *child_counts_;
+  int64_t shared_leaf_count_;
+  int64_t leaf_cid_base_;
+  SharedLeaf **shared_leaves_;
+  common::ObByteLock *leaf_locks_;
+  SharedLeaf **leaf_refs_;
+  ObIvfSSTableCentCache *parent_cache_;
+  ObIvfCacheMgrGuard parent_guard_;
+  common::ObSpinLock memory_lock_;
+  ObIvfSSTableCacheController *memory_controller_;
+  // Called only after the cache's memory contexts have been released.
+  uint64_t unregister_memory();
+  int acquire_shared_leaf(int64_t cid, const float *vector, uint32_t child_count, SharedLeaf *&entry, uint64_t &allocated);
+  void release_shared_leaf(SharedLeaf *entry);
+  bool refresh_shared_memory(uint64_t released_reservation = 0);
+  void release_shared_leaves();
+  void release_metadata();
+
+  DISALLOW_COPY_AND_ASSIGN(ObIvfSSTableCentCache);
 };
 
 // Custom node allocator for IVF map centroid cache: routes all allocations through ObIvfMemContext
@@ -632,7 +818,7 @@ public:
   {
   return OB_NOT_SUPPORTED;
   }
-  int get_centroids(ObIAllocator *allocator, float **vectors, const SCN *read_scn) override
+  int get_centroids_from_hgraph(vsag::Allocator *allocator, float **vectors, const SCN *read_scn) override
   {
     return OB_NOT_SUPPORTED;
   }
@@ -968,6 +1154,7 @@ public:
            const ObIvfCacheMgrKey &key, int64_t dim, int64_t table_id, uint64_t* all_vsag_use_mem);
   void inc_ref();
   bool dec_ref_and_check_release();
+  int64_t get_ref_cnt() const { return ATOMIC_LOAD(&ref_cnt_); }
   int64_t get_ref_count() const { return ATOMIC_LOAD(&ref_cnt_); }
   bool is_delete_pending() const { return ATOMIC_LOAD(&delete_pending_); }
   void mark_delete_pending() { ATOMIC_STORE(&delete_pending_, true); }
@@ -991,6 +1178,7 @@ public:
   OB_INLINE int64_t get_tenant_id() const { return tenant_id_; }
   OB_INLINE ObIvfCacheMgrKey get_cache_mgr_key() const { return cache_mgr_key_; }
   OB_INLINE int64_t get_table_id() const { return table_id_; }
+  OB_INLINE const ObVectorIndexParam &get_vec_param() const { return vec_param_; }
 
   TO_STRING_KV(K(ref_cnt_), K(delete_pending_), K(is_inited_), K(is_reach_limit_),
                K(reach_limit_cnt_), K(tenant_id_), K(cache_mgr_key_), K(vec_param_), K(table_id_));
@@ -1010,36 +1198,12 @@ private:
   bool is_inited_;
   ObIAllocator &self_allocator_;  // allocator for alloc ObIvfCacheMgr self
   int64_t tenant_id_;
-  ObIvfCacheMgrKey cache_mgr_key_;  // equal to index tablet id currently
+  ObIvfCacheMgrKey cache_mgr_key_;
   ObVectorIndexParam vec_param_;
   int64_t table_id_;
   uint64_t *all_vsag_use_mem_;
 };
 
-class ObIvfCacheMgrGuard
-{
-public:
-  ObIvfCacheMgrGuard(ObIvfCacheMgr *cache_mgr = nullptr)
-      : cache_mgr_(cache_mgr), role_epoch_(-1) {}
-  // SPFresh tasks are copied by ObArray while queued and retried, so the guard
-  // must retain the cache reference across task copies.
-  ObIvfCacheMgrGuard(const ObIvfCacheMgrGuard &other);
-  ~ObIvfCacheMgrGuard();
-
-  ObIvfCacheMgrGuard &operator=(const ObIvfCacheMgrGuard &other);
-
-  bool is_valid() { return OB_NOT_NULL(cache_mgr_); }
-  ObIvfCacheMgr *get_ivf_cache_mgr() { return cache_mgr_; }
-  int64_t get_role_epoch() const { return role_epoch_; }
-  void set_role_epoch(const int64_t role_epoch) { role_epoch_ = role_epoch; }
-  int set_cache_mgr(ObIvfCacheMgr *cache_mgr);
-  void reset();
-  TO_STRING_KV(KPC_(cache_mgr), K_(role_epoch));
-
-private:
-  ObIvfCacheMgr *cache_mgr_;
-  int64_t role_epoch_;
-};
 
 template<typename CacheType>
 int ObIvfCacheMgr::get_or_create_cache_node(const IvfCacheKey &key, CacheType *&cache)

@@ -12946,7 +12946,7 @@ public:
                K_(lob_piece_tablet_id), KP_(tx_desc),
                K_(need_release), K_(direct_load_type), K_(trans_id), K_(seq_no),
                K_(snapshot_version), K_(data_format_version), K_(is_co_sstable),
-               K_(is_inv_sstable), K_(start_scn));
+               K_(is_inv_sstable), K_(table_type), K_(start_scn));
 public:
   ObArenaAllocator allocator_;
   uint64_t tenant_id_;
@@ -12967,6 +12967,7 @@ public:
   ObString lob_piece_inc_major_buffer_;
   share::SCN start_scn_;
   bool is_inv_sstable_;
+  storage::ObITable::TableType table_type_;
 private:
   DISALLOW_COPY_AND_ASSIGN(ObRpcRemoteWriteDDLIncCommitLogArg);
 };

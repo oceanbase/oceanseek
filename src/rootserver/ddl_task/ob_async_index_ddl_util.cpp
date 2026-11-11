@@ -86,6 +86,7 @@ int ObAsyncIndexDDLUtil::check_can_clear_async_index_options(
       const ObAuxTableMetaInfo &index_info = index_infos.at(i);
       if (share::schema::is_async_delete_index(index_info.index_type_)
           || share::schema::is_async_fts_index(index_info.index_type_)
+          || share::schema::is_async_ivf_index(index_info.index_type_)
           || share::schema::is_async_search_def_index(index_info.index_type_)) {
         can_clear = false;
       }

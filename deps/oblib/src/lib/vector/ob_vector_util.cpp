@@ -229,13 +229,14 @@ int cal_distance_by_id(obvsag::VectorIndexPtr index_handler,
 }
 
 int get_raw_vector_by_ids(obvsag::VectorIndexPtr &index_handler, const int64_t *ids, int64_t count, float *&vectors,
-                          void *allocator, int64_t dim)
+                          vsag::Allocator *allocator)
 {
   INIT_SUCC(ret);
+  vectors = nullptr;
 #ifdef OB_BUILD_CDC_DISABLE_VSAG
   return ret;
 #else
-  return obvsag::get_raw_vector_by_ids(index_handler, ids, count, vectors, allocator, dim);
+  return obvsag::get_raw_vector_by_ids(index_handler, ids, count, vectors, allocator);
 #endif
 }
 

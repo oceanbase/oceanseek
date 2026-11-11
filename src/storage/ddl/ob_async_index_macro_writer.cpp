@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/ddl/ob_async_index_macro_writer.h"
+#include "storage/blocksstable/vector_index/ob_ivf_tablet_context.h"
 #include "storage/ddl/ob_ddl_redo_log_writer.h"
 #include "storage/ddl/ob_ddl_inc_redo_log_writer.h"
 #include "storage/ddl/ob_macro_meta_store_manager.h"
@@ -33,12 +34,15 @@ ObAsyncIndexMacroWriterAdapter::ObAsyncIndexMacroWriterAdapter()
     nested_key_list_writer_(),
     pending_nested_row_(),
     inv_idx_row_desc_(),
+    ivf_row_desc_(),
     data_desc_(),
     index_builder_(nullptr),
     object_cleaner_(nullptr),
     ddl_redo_callback_(nullptr),
     is_inc_redo_callback_(false),
     inv_writer_(),
+    ivf_writer_(),
+    is_disk_bbq_writer_(false),
     tablet_id_(),
     cg_idx_(0),
     parallel_idx_(0),
@@ -55,6 +59,7 @@ ObAsyncIndexMacroWriterAdapter::~ObAsyncIndexMacroWriterAdapter()
 void ObAsyncIndexMacroWriterAdapter::reset()
 {
   inv_writer_.reset();
+  ivf_writer_.reset();
   reuse_nested_group();
   if (nullptr != ddl_redo_callback_) {
     if (is_inc_redo_callback_) {
@@ -73,11 +78,13 @@ void ObAsyncIndexMacroWriterAdapter::reset()
   }
   object_cleaner_ = nullptr; // owned by index_builder_
   inv_idx_row_desc_.reset();
+  ivf_row_desc_.reset();
   data_desc_.reset();
   tablet_id_.reset();
   cg_idx_ = 0;
   parallel_idx_ = 0;
   row_count_ = 0;
+  is_disk_bbq_writer_ = false;
   has_pending_nested_group_ = false;
   is_inc_redo_callback_ = false;
   pending_nested_row_.reset();
@@ -124,6 +131,30 @@ int ObAsyncIndexMacroWriterAdapter::build_inv_idx_row_desc(
   return ret;
 }
 
+int ObAsyncIndexMacroWriterAdapter::build_ivf_row_desc(
+    const ObWriteMacroParam &param,
+    ObIvfSSTableRowDesc &ivf_row_desc)
+{
+  int ret = OB_SUCCESS;
+  ivf_row_desc.reset();
+  if (OB_ISNULL(param.tablet_context_)
+      || OB_ISNULL(param.tablet_context_->ivf_ctx_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("Disk BBQ tablet context is null", K(ret), K(param));
+  } else {
+    const ObIvfSSTableMeta &ivf_meta =
+        param.tablet_context_->ivf_ctx_->ivf_meta_;
+    const int32_t format_version = ivf_meta.is_empty()
+        ? IVF_SSTABLE_FORMAT_VERSION
+        : ivf_meta.format_version_;
+    if (OB_FAIL(ivf_row_desc.init(format_version))) {
+      LOG_WARN("failed to initialize IVF SSTable row descriptor", K(ret),
+               K(ivf_meta));
+    }
+  }
+  return ret;
+}
+
 int ObAsyncIndexMacroWriterAdapter::build_search_inv_idx_row_desc(
     const bool has_nested_paths,
     const int64_t rowkey_column_cnt,
@@ -166,7 +197,9 @@ int ObAsyncIndexMacroWriterAdapter::prepare_data_store_desc(
                                      compaction::ObMergeType::MAJOR_MERGE,
                                      param.snapshot_version_,
                                      param.tenant_data_version_,
-                                     tablet_param.is_micro_index_clustered_,
+                                     is_disk_bbq_writer_
+                                         ? false /* ordinary row-store IVF data micro blocks */
+                                         : tablet_param.is_micro_index_clustered_,
                                      tablet_param.tablet_transfer_seq_,
                                      0/*concurrent_cnt*/,
                                      tablet_param.reorganization_scn_,
@@ -206,11 +239,13 @@ int ObAsyncIndexMacroWriterAdapter::prepare_callback(const ObWriteMacroParam &pa
   table_key.column_group_idx_ = cg_idx_;
   table_key.version_range_.snapshot_version_ = param.snapshot_version_;
   if (is_inc_major) {
-    table_key.table_type_ = ObITable::INC_INV_INDEX_SSTABLE;
+    table_key.table_type_ = is_disk_bbq_writer_ ? ObITable::INC_IVF_INDEX_SSTABLE
+                                           : ObITable::INC_INV_INDEX_SSTABLE;
     // version_range_ and scn_range_ share storage; keep end_scn/snapshot as param.snapshot_version_.
     table_key.scn_range_.start_scn_ = param.start_scn_;
   } else {
-    table_key.table_type_ = ObITable::INV_INDEX_SSTABLE;
+    table_key.table_type_ = is_disk_bbq_writer_ ? ObITable::IVF_INDEX_SSTABLE
+                                           : ObITable::INV_INDEX_SSTABLE;
   }
 #ifdef OB_BUILD_SHARED_STORAGE
   if (OB_SUCC(ret) && GCTX.is_shared_storage_mode()) {
@@ -295,7 +330,13 @@ int ObAsyncIndexMacroWriterAdapter::init(const ObWriteMacroParam &param)
                                                      param.slice_idx_,
                                                      start_seq))) {
     LOG_WARN("fail to init macro block seq", K(ret), K(param));
-  } else if (OB_FAIL(build_inv_idx_row_desc(param, inv_idx_row_desc_))) {
+  } else if (FALSE_IT(is_disk_bbq_writer_ = is_async_ivf_index(
+                 param.ddl_table_schema_.table_item_.index_type_))) {
+  } else if (is_disk_bbq_writer_
+             && OB_FAIL(build_ivf_row_desc(param, ivf_row_desc_))) {
+    LOG_WARN("fail to build IVF SSTable row descriptor", K(ret), K(param));
+  } else if (!is_disk_bbq_writer_
+             && OB_FAIL(build_inv_idx_row_desc(param, inv_idx_row_desc_))) {
     LOG_WARN("fail to build inv idx row desc", K(ret), K(param));
   } else if (OB_FAIL(prepare_data_store_desc(param, inv_idx_row_desc_))) {
     LOG_WARN("fail to prepare data store desc", K(ret), K(param));
@@ -314,19 +355,23 @@ int ObAsyncIndexMacroWriterAdapter::init(const ObWriteMacroParam &param)
     macro_seq_param.start_ = start_seq.macro_data_seq_;
     if (OB_FAIL(pre_warm_param.init(param.ls_id_, tablet_id_))) {
       LOG_WARN("fail to init pre warm param", K(ret), K(param));
-    } else if (OB_FAIL(inv_writer_.open(inv_idx_row_desc_,
-                                        data_desc_.get_desc(),
-                                        parallel_idx_,
-                                        macro_seq_param,
-                                        pre_warm_param,
-                                        *object_cleaner_,
-                                        ddl_redo_callback_,
-                                        !GCTX.is_shared_storage_mode()))) {
+    } else if (is_disk_bbq_writer_
+               && OB_FAIL(ivf_writer_.open(ivf_row_desc_, data_desc_.get_desc(), parallel_idx_,
+                                            macro_seq_param, pre_warm_param,
+                                            *object_cleaner_, ddl_redo_callback_))) {
+      LOG_WARN("fail to open IVF macro block writer", K(ret), K(param));
+    } else if (!is_disk_bbq_writer_
+               && OB_FAIL(inv_writer_.open(inv_idx_row_desc_, data_desc_.get_desc(),
+                                            parallel_idx_, macro_seq_param,
+                                            pre_warm_param, *object_cleaner_,
+                                            ddl_redo_callback_,
+                                            !GCTX.is_shared_storage_mode()))) {
       LOG_WARN("fail to open inverted index macro block writer", K(ret), K(param));
     } else {
       is_inited_ = true;
-      LOG_INFO("[ASYNC INDEX] open inverted index macro block writer",
-               K(ret), K_(tablet_id), K_(cg_idx), K_(parallel_idx), K_(inv_idx_row_desc));
+      LOG_INFO("[ASYNC INDEX] open async index macro block writer",
+               K(ret), K_(tablet_id), K_(cg_idx), K_(parallel_idx),
+               K_(is_disk_bbq_writer), K_(inv_idx_row_desc));
     }
   }
   if (OB_FAIL(ret)) {
@@ -341,10 +386,16 @@ int ObAsyncIndexMacroWriterAdapter::append_row(const ObDatumRow &row)
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
-  } else if (OB_FAIL(append_one_row(row))) {
+  } else if (is_disk_bbq_writer_ && OB_FAIL(ivf_writer_.append_row(row))) {
+    LOG_WARN("append IVF row failed", K(ret));
+  } else if (!is_disk_bbq_writer_ && OB_FAIL(append_one_row(row))) {
     LOG_WARN("append row failed", K(ret));
   } else {
-    ++row_count_;
+    if (is_disk_bbq_writer_) {
+      row_count_ = ivf_writer_.get_appended_row_count();
+    } else {
+      ++row_count_;
+    }
   }
   return ret;
 }
@@ -356,6 +407,12 @@ int ObAsyncIndexMacroWriterAdapter::append_batch(const ObBatchDatumRows &batch_r
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
+  } else if (is_disk_bbq_writer_) {
+    if (OB_FAIL(ivf_writer_.append_batch(batch_rows))) {
+      LOG_WARN("append IVF batch failed", K(ret), K(batch_rows));
+    }
+    // append_batch() may fail after a prefix has already been written.
+    row_count_ = ivf_writer_.get_appended_row_count();
   } else if (inv_idx_row_desc_.nested_key_col_idx_ < 0) {
     if (OB_FAIL(inv_writer_.append_batch(batch_rows))) {
       LOG_WARN("append batch failed", K(ret), K(batch_rows));
@@ -545,9 +602,11 @@ int ObAsyncIndexMacroWriterAdapter::close()
   if (IS_NOT_INIT) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
-  } else if (OB_FAIL(flush_nested_group())) {
+  } else if (is_disk_bbq_writer_ && OB_FAIL(ivf_writer_.close())) {
+    LOG_WARN("close IVF macro block writer failed", K(ret));
+  } else if (!is_disk_bbq_writer_ && OB_FAIL(flush_nested_group())) {
     LOG_WARN("flush pending nested search index posting failed", K(ret));
-  } else if (OB_FAIL(inv_writer_.close())) {
+  } else if (!is_disk_bbq_writer_ && OB_FAIL(inv_writer_.close())) {
     LOG_WARN("close inverted index macro block writer failed", K(ret));
   } else if (0 == row_count_) {
     LOG_INFO("[ASYNC INDEX] close empty async index slice", K_(tablet_id), K_(parallel_idx));

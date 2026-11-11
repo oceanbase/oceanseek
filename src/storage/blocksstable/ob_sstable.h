@@ -299,6 +299,8 @@ public:
       meta_type = storage::ObStorageMetaValue::MetaType::INV_SSTABLE;
     } else if (is_co_sstable()) {
       meta_type = storage::ObStorageMetaValue::MetaType::CO_SSTABLE;
+    } else if (is_ivf_sstable()) {
+      meta_type = storage::ObStorageMetaValue::MetaType::IVF_SSTABLE;
     }
     return meta_type;
   }

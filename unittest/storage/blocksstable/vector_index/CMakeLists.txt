@@ -1,0 +1,19 @@
+storage_unittest(test_ivf_sstable)
+storage_unittest(test_ivf_merge_object_id)
+storage_unittest(test_ivf_prefilter_bitmap_failure)
+storage_unittest(test_ivf_centroid_layout)
+storage_unittest(test_ivf_fastscan_micro_block_transformer)
+storage_unittest(test_ivf_merge_plan)
+storage_unittest(test_ivf_merge_dag)
+storage_unittest(test_ivf_initial_build_dag)
+storage_unittest(test_ivf_replay_memory_mgr)
+storage_dml_unittest(test_disk_bbq_searcher
+  test_disk_bbq_searcher.cpp
+  test_disk_bbq_common.cpp)
+storage_unittest(test_ivf_sstable_scan_iter
+  test_ivf_sstable_scan_iter.cpp
+  test_disk_bbq_common.cpp)
+storage_unittest(test_ivf_sstable_estimate
+  test_ivf_sstable_estimate.cpp
+  test_disk_bbq_common.cpp)
+storage_unittest(test_disk_bbq_build test_disk_bbq_build.cpp)

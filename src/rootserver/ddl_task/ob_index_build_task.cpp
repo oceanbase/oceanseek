@@ -479,6 +479,8 @@ int ObIndexBuildTask::init(
     }
     if (share::schema::is_rowkey_doc_aux(create_index_arg_.index_type_) ||
         share::schema::is_vec_rowkey_vid_type(create_index_arg_.index_type_) ||
+        share::schema::is_async_search_data_index(create_index_arg_.index_type_) ||
+        share::schema::is_user_defined_async_index(create_index_arg_.index_type_) ||
         is_async_inverted_storage_index(create_index_arg_.index_type_)) {
       if (snapshot_version_ <= 0 && !create_index_arg_.is_offline_or_restore()) {
         ret = OB_ERR_UNEXPECTED;
@@ -723,7 +725,8 @@ int ObIndexBuildTask::wait_trans_end()
   int64_t new_fetched_snapshot = 0;
   int64_t persisted_snapshot = 0;
   const bool data_tablet_pin = parent_task_id_ > 0
-                            && is_async_inverted_storage_index(create_index_arg_.index_type_)
+                            && (is_async_inverted_storage_index(create_index_arg_.index_type_)
+                                || is_async_ivf_index(create_index_arg_.index_type_))
                             && !create_index_arg_.is_offline_or_restore();
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
@@ -1349,6 +1352,7 @@ int ObIndexBuildTask::wait_data_complement()
       ret = OB_TABLE_NOT_EXIST;
       LOG_WARN("data table not exist", KR(ret));
     } else if (share::schema::is_fts_index_aux(create_index_arg_.index_type_)
+               || share::schema::is_user_defined_async_index(create_index_arg_.index_type_)
                || share::schema::is_async_inverted_storage_index(create_index_arg_.index_type_)
                || share::schema::is_fts_doc_word_aux(create_index_arg_.index_type_)
                || data_table_schema->is_oracle_tmp_table_v2()
@@ -1421,22 +1425,39 @@ int ObIndexBuildTask::wait_local_index_data_complement()
       LOG_WARN("fail to create schedule queue", K(ret), KPC(this));
     }
   }
+  const bool can_check_completed_job = OB_SUCC(ret);
 
   DEBUG_SYNC(CREATE_INDEX_REPLICA_BUILD);
-
-  if (OB_SUCC(ret) && !state_finished && is_sstable_complete_task_submitted()) {
+  // Consume a completed failure before dispatching unfinished tablets again.
+  // Otherwise a non-retryable build can replace the original error with TASK_EXPIRED.
+  if (OB_SUCC(ret) && is_sstable_complete_task_submitted()) {
     int end_ret = OB_SUCCESS;
     if (OB_FAIL(check_build_local_index_single_replica(is_request_end, end_ret))) {
-      LOG_WARN("fail to check build single replica", K(ret));
+      LOG_WARN("fail to check build single replica before dispatch", K(ret));
     } else if (is_request_end) {
       ret = end_ret;
       state_finished = true;
     }
   }
-
   if (OB_SUCC(ret) && !state_finished && is_sstable_complete_task_submitted()) {
     if (OB_FAIL(wait_and_send_single_partition_replica_task(state_finished, schema_guard))) {
       LOG_WARN("fail to send single partition replica task", K(ret), KPC(this));
+    }
+  }
+
+  // A callback may finish while dispatch is in progress. Check even when
+  // dispatch failed, so its error cannot hide an already received terminal failure.
+  if (can_check_completed_job && is_sstable_complete_task_submitted()) {
+    int end_ret = OB_SUCCESS;
+    const int check_ret = check_build_local_index_single_replica(is_request_end, end_ret);
+    if (OB_SUCCESS != check_ret) {
+      if (OB_SUCC(ret)) {
+        ret = check_ret;
+      }
+      LOG_WARN("fail to check build single replica", K(ret), K(check_ret));
+    } else if (is_request_end) {
+      ret = end_ret;
+      state_finished = true;
     }
   }
   if (OB_SUCC(ret) && state_finished && !create_index_arg_.is_spatial_index() && !create_index_arg_.is_multivalue_index()
@@ -1450,11 +1471,11 @@ int ObIndexBuildTask::wait_local_index_data_complement()
     // when the major compaction is delayed, skip verify column checksum
     need_verify_checksum = 0 == GCONF.errsim_ddl_major_delay_time;
 #endif
-    if (share::schema::is_fts_index_aux(create_index_arg_.index_type_) ||
-        share::schema::is_fts_doc_word_aux(create_index_arg_.index_type_) ||
-        share::schema::is_async_inverted_storage_index(create_index_arg_.index_type_)) {
-      // 异步全文索引构建的是倒排 SSTable，列语义已经转换为 term/doc_id 等倒排列，
-      // 无法和数据表做列 checksum 对比，处理方式与同步全文索引辅助表一致。
+    if (share::schema::is_fts_index_aux(create_index_arg_.index_type_)
+        || share::schema::is_fts_doc_word_aux(create_index_arg_.index_type_)
+        || share::schema::is_async_inverted_storage_index(create_index_arg_.index_type_)
+        || share::schema::is_async_ivf_index(create_index_arg_.index_type_)) {
+      // 异步倒排及 IVF 索引构建的是转换后的物理 SSTable，无法和数据表做列 checksum 对比。
       need_verify_checksum = false;
     }
     ObArray<int64_t> ignore_col_ids;
@@ -1540,6 +1561,7 @@ int ObIndexBuildTask::check_need_verify_checksum(bool &need_verify)
     LOG_WARN("invalid argument", KR(ret), KP(GCTX.sql_proxy_));
   } else if (create_index_arg_.is_spatial_index() ||
              share::schema::is_fts_or_async_fts_index(create_index_arg_.index_type_) ||
+             share::schema::is_async_ivf_index(create_index_arg_.index_type_) ||
              create_index_arg_.is_multivalue_index() ||
              create_index_arg_.is_search_index() ||
              share::schema::is_async_search_index(create_index_arg_.index_type_)) {
@@ -1662,6 +1684,7 @@ int ObIndexBuildTask::verify_checksum()
   if (OB_SUCC(ret) && state_finished) {
     share::schema::ObSchemaGetterGuard schema_guard;
     const share::schema::ObTableSchema *data_schema = nullptr;
+    const bool parent_managed = is_parent_managed_async_vector_child();
     if (OB_FAIL(ObMultiVersionSchemaService::get_instance().get_tenant_schema_guard(tenant_id_, schema_guard))) {
       LOG_WARN("fail to get tenant schema guard", K(ret), K(tenant_id_), K(object_id_));
     } else if (OB_FAIL(schema_guard.get_table_schema(tenant_id_, object_id_, data_schema))) {
@@ -1674,7 +1697,8 @@ int ObIndexBuildTask::verify_checksum()
                && !(create_index_arg_.is_offline_rebuild_ && parent_task_id_ > 0)) {
       next_status = ObDDLTaskStatus::TRIGGER_ASYNC_INDEX_REFRESH;
       LOG_INFO("has async index, need to trigger async index refresh", K(tenant_id_), K(object_id_));
-    } else if (parent_task_id_ > 0 && is_async_inverted_storage_index(create_index_arg_.index_type_)) {
+    } else if (parent_managed
+               || (parent_task_id_ > 0 && is_async_inverted_storage_index(create_index_arg_.index_type_))) {
       next_status = ObDDLTaskStatus::SUCCESS;
       LOG_INFO("[ASYNC_INDEX] async sub-task build finished, defer publish to parent",
                K(tenant_id_), K(object_id_), K(target_object_id_), K(snapshot_version_));
@@ -1692,6 +1716,48 @@ void ObIndexBuildTask::clear_old_status_context()
 {
   ObDDLTask::clear_old_status_context();
   async_index_publish_refresh_target_.reset();
+}
+
+bool ObIndexBuildTask::is_parent_managed_async_vector_child() const
+{
+  // Online DiskBBQ is introduced with parent-owned snapshot and publication.
+  // These persisted child arguments remain valid after the parent is deleted.
+  // Offline/restore children retain their enclosing DDL's snapshot lifecycle.
+  return parent_task_id_ > 0
+      && is_async_ivf_index(create_index_arg_.index_type_)
+      && !create_index_arg_.is_offline_or_restore();
+}
+
+int ObIndexBuildTask::persist_terminal_result()
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("not init", K(ret));
+  } else if (OB_UNLIKELY(ObDDLTaskStatus::SUCCESS != task_status_
+                         && ObDDLTaskStatus::FAIL != task_status_)) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("index child is not terminal", K(ret), K_(task_id), K_(task_status));
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("SQL proxy is null", K(ret));
+  } else {
+    const int old_ret_code = ret_code_;
+    if (ObDDLTaskStatus::FAIL == task_status_ && OB_SUCCESS == ret_code_) {
+      // FAIL/0 proves failure, but does not prove the original error's cause.
+      ret_code_ = OB_ERR_ADD_INDEX;
+      LOG_WARN("failed async vector child has no recorded error",
+          K_(task_id), K_(parent_task_id), K_(task_status), K_(ret_code));
+    }
+    // A parent can finish after seeing our result, even if our DELETE fails.
+    // Save the terminal error first so recovery cannot report FAIL as success.
+    if (OB_FAIL(ObDDLTaskRecordOperator::update_ret_code(
+            *GCTX.sql_proxy_, tenant_id_, task_id_, ret_code_))) {
+      ret_code_ = old_ret_code;
+      LOG_WARN("persist index child terminal result failed", K(ret), K_(task_id));
+    }
+  }
+  return ret;
 }
 
 int ObIndexBuildTask::trigger_async_index_refresh()
@@ -1809,24 +1875,28 @@ int ObIndexBuildTask::update_complete_sstable_job_status(
         LOG_WARN("fail to confirm batch tablets status", K(ret), K(execution_id), K(ret_code), K(addition_info));
       } else if (OB_FAIL(remove_sql_exec_addr(addition_info.ls_leader_addr_))) {
         LOG_WARN("failed to remove sql execute addr", K(ret), K(addition_info));
-      } else {
-        if (INT64_MAX == complete_sstable_job_ret_code_ || OB_SUCCESS == complete_sstable_job_ret_code_) {
-          complete_sstable_job_ret_code_ = ret_code;
-        } else { // fails previously, cannot change to success
-          complete_sstable_job_ret_code_ = ret_code == OB_SUCCESS ? complete_sstable_job_ret_code_ : ret_code;
-        }
-        sstable_complete_ts_ = ObTimeUtility::current_time(); // always update because it should be greater than all partition's major create time
-        execution_id_ = execution_id;
       }
-    } else {
-      if (OB_UNLIKELY(execution_id < execution_id_)) {
-        ret = OB_TASK_EXPIRED;
-        LOG_WARN("receive a mismatch execution result", K(ret), K(ret_code), K(execution_id), K(execution_id_));
-      } else {
+    } else if (OB_UNLIKELY(execution_id < execution_id_)) {
+      ret = OB_TASK_EXPIRED;
+      LOG_WARN("receive a mismatch execution result", K(ret), K(ret_code), K(execution_id), K(execution_id_));
+    }
+    if (OB_SUCC(ret)) {
+      const bool has_terminal_error = !is_retryable_ddl_
+          && INT64_MAX != complete_sstable_job_ret_code_
+          && OB_SUCCESS != complete_sstable_job_ret_code_;
+      const bool keep_failed_batch_result = is_create_partitioned_local_index()
+          && INT64_MAX != complete_sstable_job_ret_code_
+          && OB_SUCCESS != complete_sstable_job_ret_code_
+          && OB_SUCCESS == ret_code;
+      // Non-retryable builds retain the first terminal error. Other local-index
+      // builds must also prevent a later successful batch from hiding a failure.
+      if (!has_terminal_error && !keep_failed_batch_result) {
         complete_sstable_job_ret_code_ = ret_code;
-        sstable_complete_ts_ = ObTimeUtility::current_time();
-        execution_id_ = execution_id;
       }
+      // Completion time covers every accepted batch, including successful
+      // callbacks received after a failed batch.
+      sstable_complete_ts_ = ObTimeUtility::current_time();
+      execution_id_ = execution_id;
     }
   }
   LOG_INFO("update complete sstable job return code", K(ret), K(addr), K(target_object_id_), K(tablet_id), K(snapshot_version), K(ret_code), K(execution_id_), K(complete_sstable_job_ret_code_), K(sstable_complete_ts_));
@@ -1993,12 +2063,16 @@ int ObIndexBuildTask::update_index_status_in_schema(const ObTableSchema &index_s
 int ObIndexBuildTask::clean_on_failed()
 {
   int ret = OB_SUCCESS;
+  const bool parent_managed = is_parent_managed_async_vector_child();
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
   } else if (ObDDLTaskStatus::FAIL != task_status_) {
     ret = OB_STATE_NOT_MATCH;
     LOG_WARN("task status not match", K(ret), K(task_status_));
+  } else if (parent_managed) {
+    // Keep S and the target schema until the parent releases S and drops its cohort.
+    ret = cleanup();
   } else {
     // mark the schema of index to ERROR, so that observer can do clean up
     const ObTableSchema *index_schema = nullptr;
@@ -2153,11 +2227,17 @@ int ObIndexBuildTask::succ()
 int ObIndexBuildTask::cleanup_impl()
 {
   int ret = OB_SUCCESS;
+  const bool parent_managed = is_parent_managed_async_vector_child();
   ObString unused_str;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
-  } else if (snapshot_version_ > 0 && OB_FAIL(release_snapshot(snapshot_version_))) {
+  } else if (parent_managed && OB_FAIL(persist_terminal_result())) {
+    LOG_WARN("fail to persist async vector child result", K(ret));
+  } else if (snapshot_version_ > 0
+             && !parent_managed
+             && !(create_index_arg_.is_offline_rebuild_ && parent_task_id_ > 0)
+             && OB_FAIL(release_snapshot(snapshot_version_))) {
     LOG_WARN("release snapshot failed", K(ret), K(object_id_), K(index_table_id_), K(snapshot_version_));
   } else if (OB_FAIL(report_error_code(unused_str))) {
     LOG_WARN("report error code failed", K(ret));
@@ -2171,6 +2251,9 @@ int ObIndexBuildTask::cleanup_impl()
     LOG_WARN("invalid argument", KR(ret), KP(GCTX.sql_proxy_));
   } else if (OB_FAIL(ObDDLTaskRecordOperator::delete_record(*GCTX.sql_proxy_, tenant_id_, task_id_))) {
     LOG_WARN("delete task record failed", K(ret), K(task_id_), K(schema_version_));
+    if (parent_managed) {
+      DEBUG_SYNC(ASYNC_VECTOR_CHILD_DELETE_FAILED);
+    }
   } else {
     need_retry_ = false;      // clean succ, stop the task
   }
@@ -2505,7 +2588,8 @@ int ObIndexBuildTask::serialize_and_update_message(common::ObISQLClient &proxy)
         } else {
           ObString new_message;
           new_message.assign(buf, static_cast<int32_t>(serialize_size));
-          if (OB_FAIL(ObDDLTaskRecordOperator::update_message(proxy, tenant_id_, task_id_, new_message))) {
+          if (OB_FAIL(ObDDLTaskRecordOperator::update_message(
+                  proxy, tenant_id_, task_id_, new_message))) {
             LOG_WARN("update message failed", K(ret), K(tenant_id_), K(task_id_), K(serialize_size));
           }
         }

@@ -108,6 +108,7 @@ private:
 
   int set_column_collation(share::schema::AlterColumnSchema &alter_column_schema);
   int resolve_index_column_list(const ParseNode &node,
+                                ParseNode *table_option_node,
                                 obrpc::ObCreateIndexArg &index_arg,
                                 const int64_t index_name_value,
                                 ObIArray<ObString> &input_index_columns_name,

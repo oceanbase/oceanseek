@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/async_index/ob_async_index_refresh_task.h"
+#include "storage/blocksstable/vector_index/ob_ivf_refresh_monitor.h"
 #include "storage/async_index/ob_async_index_refresh_worker.h"
 #include "storage/async_index/ob_async_index_deps.h"
 #include "storage/async_index/ob_ls_async_index_scheduler.h"
@@ -28,11 +29,14 @@
 #include "storage/tx_storage/ob_ls_service.h"          // ObLSService, ObLSHandle
 #include "storage/tablet/ob_tablet.h"                  // ObTablet::get_async_index_max_published_version
 #include "storage/tablet/ob_async_index_refresh_info_mds_helper.h"
+#include "lib/utility/ob_tracepoint.h"
 
 namespace oceanbase
 {
 namespace storage
 {
+
+ERRSIM_POINT_DEF(EN_ASYNC_INDEX_REFRESH_BEFORE_COMMIT_FAIL);
 
 static int lock_table_lock_in_trans_(
     const uint64_t tenant_id,
@@ -305,6 +309,7 @@ int ObAsyncIndexRefreshTask::handle()
   ObRefreshTaskStat stat; // runtime stat as a local copy of the task's stat to avoid race conditions
   stat = stat_;
   stat.start_time_ = common::ObTimeUtility::current_time();
+  publish_stat(stat);
   CONSUMER_GROUP_FUNC_GUARD(share::ObFunctionType::PRIO_ASYNC_INDEX_REFRESH);
   // Schema drift is handled by the SQL itself: the cached refresh SQL carries an
   // ob_ddl_schema_version(data_table, ver) hint, so if a DDL bumped the data
@@ -354,6 +359,7 @@ int ObAsyncIndexRefreshTask::handle()
       ObAsyncIndexService *svc = MTL(ObAsyncIndexService *);
       bool registered = false;
       bool refresh_dop_acquired = false;
+      ObIVFRefreshMonitor *ivf_monitor = nullptr;
       share::ObCommonID unique_build_id;
       int64_t ddl_build_id = 0;
       if (OB_FAIL(ObCommonIDUtils::gen_unique_id(stat.tenant_id_, unique_build_id))) {
@@ -463,6 +469,7 @@ int ObAsyncIndexRefreshTask::handle()
             common::ObCurTraceId::init(observer::ObServer::get_instance().get_self());
             trace_id_owned = true;
           }
+          DEBUG_SYNC(BEFORE_ASYNC_INDEX_REFRESH_WRITE);
           DEBUG_SYNC(BEFORE_ASYNC_INDEX_REFRESH_INNER_SQL);
           if (OB_FAIL(trans.write(stat.tenant_id_, sql_.ptr(), stat.affected_rows_))) {
             LOG_WARN("[ASYNC_INDEX_REFRESH] failed to execute async index refresh sql", K(ret),
@@ -485,13 +492,33 @@ int ObAsyncIndexRefreshTask::handle()
           }
         }
       }
+      if (registered && nullptr != svc) {
+        const int monitor_ret = svc->acquire_ivf_refresh_monitor(stat.refresh_task_id_, ivf_monitor);
+        if (OB_SUCCESS != monitor_ret) {
+          LOG_WARN("failed to get IVF refresh performance summary", K(monitor_ret), K(stat.refresh_task_id_));
+        }
+        if (OB_SUCC(ret) && nullptr != ivf_monitor) {
+          ivf_monitor->begin_stage(share::ObIVFRefreshProgress::COMMIT);
+        }
+      }
       if (trans.is_started()) {
+        if (OB_SUCC(ret) && !skipped) {
+          DEBUG_SYNC(BEFORE_ASYNC_INDEX_REFRESH_COMMIT);
+          if (OB_FAIL(EVENT_CALL(EN_ASYNC_INDEX_REFRESH_BEFORE_COMMIT_FAIL, stat.tablet_id_.id()))) {
+            LOG_WARN("injected async index refresh failure before commit", K(ret), K(stat));
+          }
+        }
         int tmp_ret = OB_SUCCESS;
         if (OB_SUCCESS != (tmp_ret = trans.end(OB_SUCC(ret)))) {
           LOG_WARN("failed to end trans for async index refresh", K(ret), K(tmp_ret),
                    K(stat.tenant_id_), K(stat.tablet_id_));
           ret = OB_SUCC(ret) ? tmp_ret : ret;
         }
+      }
+      if (nullptr != ivf_monitor) {
+        ivf_monitor->finish(ret, stat.start_time_, stat.retry_cnt_);
+        ivf_monitor->dec_ref();
+        ivf_monitor = nullptr;
       }
       // Return the acquired DOP reservation after transaction cleanup on all
       // SQL success, failure, and commit-failure paths.

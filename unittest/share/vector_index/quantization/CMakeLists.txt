@@ -1,0 +1,6 @@
+ob_unittest(test_quantization_common)
+ob_unittest(test_fp32_quantizer)
+ob_unittest(test_fht_kac_rotator)
+ob_unittest(test_rabitq_quantizer)
+ob_unittest(test_rabitq_fast_scan_encoder)
+ob_unittest(test_extend_rabitq_quantizer)

@@ -256,6 +256,12 @@ private:
                                const DASScanCGCtx &cg_ctx,
                                ObDASScanCtDef &scan_ctdef,
                                common::ObIArray<ObRawExpr*> &access_exprs);
+  static bool is_async_ivf_related_scan(const ObDASScanCtDef &scan_ctdef);
+  static bool is_vec_related_scan(const ObLogTableScan &op,
+                                  const ObDASScanCtDef &scan_ctdef);
+  int extract_async_ivf_access_columns(const ObLogTableScan &op,
+                                       const ObDASScanCtDef &scan_ctdef,
+                                       common::ObIArray<ObRawExpr *> &access_exprs);
   //extract these column exprs need by TSC operator, these column will output by DAS scan
   int extract_tsc_access_columns(const ObLogTableScan &op, common::ObIArray<ObRawExpr*> &access_exprs);
   int extract_das_column_ids(const common::ObIArray<ObRawExpr*> &column_exprs, common::ObIArray<uint64_t> &column_ids);

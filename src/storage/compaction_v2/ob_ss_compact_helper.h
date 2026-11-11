@@ -63,6 +63,17 @@ struct SSCompactHelper
       storage::ObSSTableAtomicProtocol &sstable_protocol);
   static int finish_inc_major_compaction_task(
       storage::ObSSTableAtomicProtocol &sstable_protocol);
+  static int start_non_idem_major_task(
+      const share::ObLSID &ls_id,
+      const common::ObTabletID &tablet_id,
+      const share::SCN &transfer_scn,
+      const int64_t snapshot_version,
+      const int64_t seq_step_cnt,
+      const int64_t cg_cnt,
+      int64_t &op_id,
+      storage::ObSSTableAtomicProtocol &sstable_protocol);
+  static int finish_non_idem_major_task(
+      storage::ObSSTableAtomicProtocol &sstable_protocol);
   static int check_shared_major_exist(const share::ObLSID &ls_id,
                                       const common::ObTabletID &tablet_id,
                                       const share::SCN &reorganization_scn,

@@ -33,7 +33,7 @@ public:
   static const int64_t DEFAULT_MERGE_FACTOR = 10;
   static constexpr float LEVEL_LOG_SPAN = 0.75f;
   static const int64_t DEFAULT_MIN_MERGE_SIZE = 15000;
-  static const int64_t DEFAULT_MAX_MERGE_SIZE = 15000000L;
+  static constexpr int64_t DEFAULT_MAX_MERGE_SIZE = ObAsyncIndexMergePolicy::DEFAULT_MAX_MERGE_SIZE;
 
   static double calc_level(const int64_t seg_size, const int64_t merge_factor)
   {
@@ -748,31 +748,33 @@ TEST_F(TestAsyncIndexMergePolicy, lmp_min_merge_size_expansion_cap)
 TEST_F(TestAsyncIndexMergePolicy, lmp_max_merge_size_truncation)
 {
   ObSEArray<ObAsyncIndexSSTableMergeInfo, 16> merge_infos;
+  const int64_t segment_size = ObAsyncIndexMergePolicy::DEFAULT_MAX_MERGE_SIZE / 8;
   const MergeInfoSpec specs[] = {
-    {0, 10, 2000000}, {10, 20, 2000000}, {20, 30, 2000000}, {30, 40, 2000000},
-    {40, 50, 2000000}, {50, 60, 2000000}, {60, 70, 2000000}, {70, 80, 2000000},
-    {80, 90, 2000000}, {90, 100, 2000000},
+    {0, 10, segment_size}, {10, 20, segment_size}, {20, 30, segment_size}, {30, 40, segment_size},
+    {40, 50, segment_size}, {50, 60, segment_size}, {60, 70, segment_size}, {70, 80, segment_size},
+    {80, 90, segment_size}, {90, 100, segment_size},
   };
 
   ASSERT_EQ(OB_SUCCESS, build_merge_infos(specs, 10, merge_infos));
-  // 10 段各 2M，max_merge=15M，第 8 段触顶截断到 7 段；纯 TMP 不 merge
-  expect_merge(lmp_policy_, merge_infos, 0, 70);
+  // 前 8 段恰好达到生产上限 5GiB，第 9 段超限；等于上限时仍可选入。
+  // TMP 保留独立的 15MB 上限，这些段均过大，不参与合并。
+  expect_merge(lmp_policy_, merge_infos, 0, 80);
   expect_no_merge(tmp_policy_, merge_infos);
-  expect_merge(merge_policy_, merge_infos, 0, 70);
+  expect_merge(merge_policy_, merge_infos, 0, 80);
 }
 
 TEST_F(TestAsyncIndexMergePolicy, lmp_singleton_too_large_skipped)
 {
   ObSEArray<ObAsyncIndexSSTableMergeInfo, 16> merge_infos;
   const MergeInfoSpec specs[] = {
-    {0, 10, 20000000},
+    {0, 10, ObAsyncIndexMergePolicy::DEFAULT_MAX_MERGE_SIZE + 1},
     {10, 20, 10000}, {20, 30, 10000}, {30, 40, 10000}, {40, 50, 10000},
     {50, 60, 10000}, {60, 70, 10000}, {70, 80, 10000}, {80, 90, 10000},
     {90, 100, 10000}, {100, 110, 10000},
   };
 
   ASSERT_EQ(OB_SUCCESS, build_merge_infos(specs, 11, merge_infos));
-  // 首段 20M > max_merge_size，singleton 被 skip，滑到后 10 个小段
+  // 首段为生产上限 5GiB + 1B，跳过超大单段后选择后面 10 个小段。
   expect_merge(lmp_policy_, merge_infos, 10, 110);
   expect_merge(tmp_policy_, merge_infos, 10, 110);
   expect_merge(merge_policy_, merge_infos, 10, 110);
@@ -1099,17 +1101,19 @@ TEST_F(TestAsyncIndexMergePolicy, scenario_prefix_orphan_inc_no_merge)
   expect_merge(merge_policy_, merge_infos, 70, 170);
 }
 
-// 10x2M + max_merge=15M：LMP/生产策略合 7 段，纯 TMP 不 merge
+// 超过生产 5GiB 上限时截断；TMP 保留独立的 15MB 上限，不合并这些超大段。
 TEST_F(TestAsyncIndexMergePolicy, hit_too_large_merges_at_max_merged_cap)
 {
   ObSEArray<ObAsyncIndexSSTableMergeInfo, 16> merge_infos;
+  const int64_t segment_size = ObAsyncIndexMergePolicy::DEFAULT_MAX_MERGE_SIZE / 8 + 1;
   const MergeInfoSpec specs[] = {
-    {0, 10, 2000000}, {10, 20, 2000000}, {20, 30, 2000000}, {30, 40, 2000000},
-    {40, 50, 2000000}, {50, 60, 2000000}, {60, 70, 2000000}, {70, 80, 2000000},
-    {80, 90, 2000000}, {90, 100, 2000000},
+    {0, 10, segment_size}, {10, 20, segment_size}, {20, 30, segment_size}, {30, 40, segment_size},
+    {40, 50, segment_size}, {50, 60, segment_size}, {60, 70, segment_size}, {70, 80, segment_size},
+    {80, 90, segment_size}, {90, 100, segment_size},
   };
 
   ASSERT_EQ(OB_SUCCESS, build_merge_infos(specs, 10, merge_infos));
+  // 每段比 5GiB / 8 多 1B，第 8 段使总量超限，只选择前 7 段。
   expect_merge(lmp_policy_, merge_infos, 0, 70);
   expect_no_merge(tmp_policy_, merge_infos);
   expect_merge(merge_policy_, merge_infos, 0, 70);

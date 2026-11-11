@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX STORAGE_COMPACTION
 #include "storage/ddl/ob_inc_ddl_merge_helper.h"
+#include "storage/blocksstable/vector_index/ob_ivf_tablet_context.h"
 #include "storage/ddl/ob_ddl_merge_task_utils.h"
 #include "storage/ddl/ob_inc_ddl_merge_task_utils.h"
 #include "storage/ddl/ob_ddl_merge_task.h"
@@ -14,6 +15,7 @@
 #include "storage/tablet/ob_tablet_create_sstable_param.h"
 #include "storage/blocksstable/index_block/ob_macro_meta_temp_store.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable.h"
 #include "share/compaction/ob_shared_storage_compaction_util.h"
 #include "storage/ddl/ob_ddl_independent_dag.h"
 #include "storage/async_index/ob_async_index_define.h"
@@ -1884,6 +1886,8 @@ int ObSSIncMajorDDLMergeHelper::prepare_cg_table_key(
   } else if (FALSE_IT(cur_cg_table_key = dag_merge_param.table_key_)) {/* init table key */
   } else if (is_async_inverted_storage_index(storage_schema->get_index_type())) {
     cur_cg_table_key.table_type_ = ObITable::TableType::INC_INV_INDEX_SSTABLE;
+  } else if (storage_schema->is_async_ivf_index()) {
+    cur_cg_table_key.table_type_ = ObITable::TableType::INC_IVF_INDEX_SSTABLE;
   } else if (!storage_schema->is_row_store()) {
     if (cg_idx == dag_merge_param.table_key_.column_group_idx_) {
       /* update for cg when target is column store */
@@ -2092,6 +2096,7 @@ int ObSSIncMajorDDLMergeHelper::create_sstable(
 {
   int ret = OB_SUCCESS;
   ObTabletCreateSSTableParam param;
+  ObDDLTabletContext *tablet_context = dag_merge_param.get_tablet_ctx();
   const bool is_async_index_refresh
       = dag_merge_param.ddl_task_param_.is_async_index_refresh_;
   ObNewVersionRange async_index_logical_range;
@@ -2103,6 +2108,24 @@ int ObSSIncMajorDDLMergeHelper::create_sstable(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), K(dag_merge_param), KP(merge_ctx), K(res),
                                  K(cur_cg_table_key), KP(storage_schema));
+  } else if (cur_cg_table_key.is_ivf_sstable()
+             && OB_ISNULL(tablet_context)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("Disk BBQ tablet context is null", KR(ret), K(cur_cg_table_key));
+  } else if (cur_cg_table_key.is_ivf_sstable()
+             && (OB_ISNULL(tablet_context->ivf_ctx_)
+                 || !tablet_context->ivf_ctx_->is_built_)) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("Disk BBQ build-and-write pipeline has not completed before merge",
+             KR(ret), K(cur_cg_table_key));
+  } else if (cur_cg_table_key.is_ivf_sstable()
+             && OB_FAIL(res.ivf_meta_.assign(
+                    allocator, tablet_context->ivf_ctx_->ivf_meta_))) {
+    // init_for_ss_ddl deliberately rejects a non-empty IVF merge result with
+    // no valid physical-build metadata.  Supply the metadata produced by the
+    // specialized pipeline before that validation runs.
+    LOG_WARN("failed to copy Disk BBQ meta into merge result",
+             KR(ret), K(cur_cg_table_key));
   } else if (is_async_index_refresh) {
     const int64_t start_refresh_version
         = dag_merge_param.ddl_task_param_.async_index_start_refresh_version_;
@@ -2159,6 +2182,10 @@ int ObSSIncMajorDDLMergeHelper::create_sstable(
     } else if (cur_cg_table_key.is_inv_sstable()) {
       if (OB_FAIL(ObTabletCreateDeleteHelper::create_sstable<ObInvSSTable>(param, allocator, cg_sstable_handle))) {
         LOG_WARN("create inv sstable failed", KR(ret), K(param));
+      }
+    } else if (cur_cg_table_key.is_ivf_sstable()) {
+      if (OB_FAIL(ObTabletCreateDeleteHelper::create_sstable<ObIvfSSTable>(param, allocator, cg_sstable_handle))) {
+        LOG_WARN("create ivf sstable failed", KR(ret), K(param));
       }
     } else {
       if (OB_FAIL(ObTabletCreateDeleteHelper::create_sstable<ObSSTable>(param, allocator, cg_sstable_handle))) {

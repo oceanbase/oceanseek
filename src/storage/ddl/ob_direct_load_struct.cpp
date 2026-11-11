@@ -4915,6 +4915,8 @@ int ObDDLTabletMergeDagParamV2::init(const bool for_major,
       if (for_major) {
         if (is_async_inverted_storage_index(tablet_param->storage_schema_->get_index_type())) {
           table_key_.table_type_ = ObITable::TableType::INC_INV_INDEX_SSTABLE;
+        } else if (tablet_param->storage_schema_->is_async_ivf_index()) {
+          table_key_.table_type_ = ObITable::TableType::INC_IVF_INDEX_SSTABLE;
         } else if (is_column_store) {
           table_key_.table_type_ = ObITable::TableType::INC_COLUMN_ORIENTED_SSTABLE;
         } else {
@@ -4936,6 +4938,8 @@ int ObDDLTabletMergeDagParamV2::init(const bool for_major,
       if (for_major) {
         if (is_async_inverted_storage_index(tablet_param->storage_schema_->get_index_type())) {
           table_key_.table_type_ = ObITable::TableType::INV_INDEX_SSTABLE;
+        } else if (tablet_param->storage_schema_->is_async_ivf_index()) {
+          table_key_.table_type_ = ObITable::TableType::IVF_INDEX_SSTABLE;
         } else if (is_column_store) {
           table_key_.table_type_ = ObITable::TableType::COLUMN_ORIENTED_SSTABLE;
         } else {

@@ -282,6 +282,7 @@ class ObStorageIOUsageRepoter;
 class ObResourceLimitCalculator;
 class ObWorkloadRepositoryContext;
 class ObPluginVectorIndexService;
+class ObIVFReplayMemoryMgr;
 class ObNamespaceRUManager;
 class ObAutoSplitTaskCache;
 class ObLogicalTableMonitor;
@@ -458,6 +459,8 @@ using ObHMSClientUnifyPoolMgr = share::ObCatalogClientPoolMgr<oceanbase::share::
       storage::ObTenantCompactionMemPool*,           \
       TenantCompactionObjMgr                         \
       storage::ObDDLMergeBucketLock*,                \
+      /* Replay quotas outlive direct-load contexts and their DAGs. */ \
+      share::ObIVFReplayMemoryMgr*,                  \
       storage::ObTenantDirectLoadMgr*,               \
       share::ObTenantDagScheduler*,                  \
       storage::ObStorageHAService*,                  \

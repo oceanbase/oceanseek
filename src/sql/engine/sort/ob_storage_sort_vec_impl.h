@@ -1022,6 +1022,11 @@ int ObStorageVecSortImpl<Compare, Store_Row, has_addon>::sort()
           }
           output_chunks.reset();
         }
+        // This pass exhausted the merge iterator. Clear it so the next pass or
+        // final output can initialize it against the remaining chunks.
+        if (OB_NOT_NULL(external_sorter_) && external_sorter_->is_inited()) {
+          external_sorter_->reset();
+        }
       }
     }
   }

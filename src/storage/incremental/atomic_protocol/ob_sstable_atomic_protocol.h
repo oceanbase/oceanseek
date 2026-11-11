@@ -46,6 +46,10 @@ public:
   // 如果不存在则置 need_create=true，外部调用决定是否create/finish
   int load_if_exist(const int64_t snapshot_version, bool &need_create);
   bool is_inited() const { return is_inited_; }
+  bool is_non_idem_major() const
+  {
+    return ObAtomicProtocolTypeEnum::NON_IDEM_MAJOR_SSTABLE == type_.type_;
+  }
 
   INHERIT_TO_STRING_KV("ObAtomicProtocol", ObAtomicProtocol,
       K_(is_inited), K_(tenant_id), K_(ls_id), K_(tablet_id), K_(reorg_scn), K_(object_info));

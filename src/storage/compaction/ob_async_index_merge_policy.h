@@ -150,7 +150,8 @@ public:
   static constexpr int64_t DEFAULT_MERGE_FACTOR = 10;
   static constexpr float LEVEL_LOG_SPAN = 0.75f;
   static constexpr int64_t DEFAULT_MIN_MERGE_SIZE = 15000;
-  static constexpr int64_t DEFAULT_MAX_MERGE_SIZE = 15000000L;
+  // Segment sizes use physical bytes; allow normal batches of vector-index segments.
+  static constexpr int64_t DEFAULT_MAX_MERGE_SIZE = 5L * 1024L * 1024L * 1024L;
 
   static int choose_async_index_merge_range(
     storage::ObLS &ls,

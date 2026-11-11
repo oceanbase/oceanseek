@@ -359,17 +359,17 @@ private:
 };
 
 // Minimum of physical publish SCNs returned by get_publish_scns. Shared by the
-// timer trigger and the CREATE_INDEX refresh path.
+// timer trigger and the RPC refresh paths.
 int calc_min_publish_scn(
     const common::ObIArray<share::SCN> &publish_scns,
     share::SCN &min_publish_scn);
 
 // Compute the minimum physical publish SCN across all given index tablets via
 // get_publish_scns + calc_min_publish_scn (same as ObAsyncIndexTrigger). Used by
-// the CREATE_INDEX refresh path to supply a GC floor to
-// maintain_async_index_refresh_info when the data tablet's refresh_snapshots
-// array is still empty (Step 6.5 anchor). Returns base_scn() when the target
-// set is empty.
+// every RPC refresh path to retain the oldest physical index publication as a
+// GC floor before a sibling index advances. This also seeds an empty data-tablet
+// refresh_snapshots array after index creation (Step 6.5 anchor). Returns
+// base_scn() when the target set is empty.
 int get_min_index_published_scn(
     const uint64_t tenant_id,
     ObLS *ls,

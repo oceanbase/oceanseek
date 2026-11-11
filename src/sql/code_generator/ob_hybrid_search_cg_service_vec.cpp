@@ -426,6 +426,37 @@ int ObHybridSearchCgService::generate_ctdef(ObLogTableScan &op, const ObVecSearc
   ObDASVecIndexScanCtDef *vec_index_scan_ctdef = nullptr;
   if (OB_FAIL(ret)) {
     // skip
+  } else if (vec_search_node->vec_info_.is_async_ivf_scan()) {
+    ObDASVecIndexAsyncIVFScanCtDef *async_ctdef = nullptr;
+    ObDASScanCtDef *index_ctdef = nullptr;
+    ObDASScalarScanCtDef *delete_ctdef = nullptr;
+    ObVecSearchNode::VecIndexScanParams params;
+    params.table_id_ = vec_search_node->main_index_table_id_;
+    params.scan_type_ = OB_VEC_ASYNC_IVF_INDEX_SCAN;
+    const ObAsyncIndexDeleteInfo &deletion = vec_search_node->async_delete_info_;
+    for (int64_t i = 0; OB_SUCC(ret) && i < vec_search_node->vec_info_.aux_table_column_.count(); ++i) {
+      if (OB_FAIL(params.access_exprs_.push_back(vec_search_node->vec_info_.aux_table_column_.at(i)))) {
+        LOG_WARN("failed to prepare async IVF index expressions", K(ret));
+      }
+    }
+    if (!deletion.is_valid()) { ret = OB_ERR_UNEXPECTED; }
+    else if (OB_FAIL(ret)) { /* Keep expression preparation failure. */ }
+    else if (OB_FAIL(ObDASTaskFactory::alloc_das_ctdef(DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN,
+        ctdef_alloc, async_ctdef))) {
+      LOG_WARN("failed to allocate async IVF definition", K(ret));
+    } else if (OB_FAIL(generate_vec_aux_table_ctdef(op, params, index_ctdef, false))) {
+      LOG_WARN("failed to generate async IVF index scan", K(ret));
+    } else if (OB_FAIL(generate_async_delete_scan_ctdef(op, deletion.get_delete_idx_tid(),
+        deletion.get_delete_doc_id_column(), deletion.get_delete_rowscn_expr(), delete_ctdef))) {
+      LOG_WARN("failed to generate async IVF deletion scan", K(ret));
+    } else if (OB_ISNULL(async_ctdef->children_ = OB_NEW_ARRAY(ObDASBaseCtDef *, &ctdef_alloc, 2))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      async_ctdef->children_cnt_ = 2;
+      async_ctdef->children_[0] = index_ctdef;
+      async_ctdef->children_[1] = delete_ctdef;
+      vec_index_scan_ctdef = async_ctdef;
+    }
   } else if (vec_search_node->vec_info_.is_brute_force_scan()) {
     // Brute force branch: no auxiliary vector index table, the only child scans the main
     // table to feed the distance expression.
@@ -562,6 +593,8 @@ int ObHybridSearchCgService::generate_ctdef(ObLogTableScan &op, const ObVecSearc
 
   // 4. set vector query param for vec index scan ctdef
   int64_t dim = 0;
+  const bool is_async_ivf = vec_search_node->vec_info_.is_async_ivf_scan();
+  const ObColumnSchemaV2 *source_column = nullptr;
   const ObTableSchema *data_table_schema = nullptr;
   const ObTableSchema *main_index_table_schema = nullptr;
   ObTableID data_table_id = vec_search_node->get_data_table_id();
@@ -574,10 +607,17 @@ int ObHybridSearchCgService::generate_ctdef(ObLogTableScan &op, const ObVecSearc
   } else if (OB_ISNULL(data_table_schema) || OB_ISNULL(main_index_table_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("table schema is null", K(ret));
+  } else if (is_async_ivf && (nullptr == vec_search_node->field_
+      || nullptr == (source_column = data_table_schema->get_column_schema(vec_search_node->field_->get_column_id())))) {
+    ret = OB_SCHEMA_ERROR;
+  } else if (is_async_ivf && OB_FAIL(ObVectorIndexUtil::get_vector_dim_from_extend_type_info(
+      source_column->get_extended_type_info(), dim))) {
+    LOG_WARN("failed to resolve async IVF vector dimension", K(ret));
   } else if (vec_search_node->vec_info_.is_brute_force_scan()
              && OB_FAIL(get_brute_force_vector_dim(*data_table_schema, *vec_search_node, dim))) {
     LOG_WARN("fail to get brute force vector column dim", K(ret));
-  } else if (!vec_search_node->vec_info_.is_brute_force_scan()
+  } else if (!is_async_ivf
+             && !vec_search_node->vec_info_.is_brute_force_scan()
              && OB_FAIL(ObVectorIndexUtil::get_vector_index_column_dim(
                     *main_index_table_schema, *data_table_schema, dim))) {
     LOG_WARN("fail to get vector_index_column dim", K(ret));

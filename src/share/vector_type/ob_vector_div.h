@@ -18,7 +18,7 @@ namespace common
 {
 struct ObVectorDiv
 {
-  // a = a + f
+  // a = a / f
   static int calc(float *a, float f, const int64_t len);
 };
 
@@ -63,7 +63,7 @@ OB_DECLARE_SSE_AND_AVX_CODE(
       int64_t dim = len >> 2 << 2;
       if (OB_FAIL(vector_div_simd4_avx128(a, f, dim))) {
         LIB_LOG(WARN, "failed to cal vector div", K(ret), K(len), K(dim));
-      } else if (0 < len - dim && OB_FAIL(vector_div_normal(a + dim, f + dim, len - dim))) {
+      } else if (0 < len - dim && OB_FAIL(vector_div_normal(a + dim, f, len - dim))) {
         LIB_LOG(WARN, "failed to cal vector div", K(ret), K(len), K(dim));
       }
       return ret;
@@ -100,7 +100,7 @@ OB_DECLARE_AVX_ALL_CODE(
       if (OB_FAIL(vector_div_simd8_avx256(a, f, dim))) {
         LIB_LOG(WARN, "failed to cal vector div", K(ret), K(len), K(dim));
       } else if (0 < len - dim
-                 && OB_FAIL(vector_div_simd4_avx128_extra(a + dim, f + dim, len - dim))) {
+                 && OB_FAIL(vector_div_simd4_avx128_extra(a + dim, f, len - dim))) {
         LIB_LOG(WARN, "failed to cal vector div", K(ret), K(len), K(dim));
       }
       return ret;
@@ -142,7 +142,7 @@ OB_DECLARE_AVX512_SPECIFIC_CODE(
       if (OB_FAIL(vector_div_simd16_avx512(a, f, dim))) {
         LIB_LOG(WARN, "failed to cal vector div", K(ret), K(len), K(dim));
       } else if (0 < len - dim
-                 && OB_FAIL(vector_div_simd8_avx256_extra(a + dim, f + dim, len - dim))) {
+                 && OB_FAIL(vector_div_simd8_avx256_extra(a + dim, f, len - dim))) {
         LIB_LOG(WARN, "failed to cal vector div", K(ret), K(len), K(dim));
       }
       return ret;

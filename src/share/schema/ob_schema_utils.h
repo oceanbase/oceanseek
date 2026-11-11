@@ -73,6 +73,9 @@ public:
   static bool is_cte_generated_column(uint64_t flag);
   static bool is_default_expr_v2_column(uint64_t flag);
   static bool is_vec_index_column(const uint64_t flag);
+  static bool is_vec_ivf_type_column(const uint64_t flag);
+  static bool is_vec_ivf_cid_column(const uint64_t flag);
+  static bool is_vec_ivf_data_column(const uint64_t flag);
 
   static bool is_vec_ivf_center_id_column(const uint64_t flag);
   static bool is_vec_ivf_center_vector_column(const uint64_t flag);

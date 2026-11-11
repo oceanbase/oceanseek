@@ -230,7 +230,8 @@ ObSSTableMergeRes::ObSSTableMergeRes()
     table_backup_flag_(),
     root_row_store_type_(ObRowStoreType::MAX_ROW_STORE),
     is_small_sstable_(false),
-    inv_meta_()
+    inv_meta_(),
+    ivf_meta_()
 {
   MEMSET(encrypt_key_, 0, share::OB_MAX_TABLESPACE_ENCRYPT_KEY_LENGTH);
   table_backup_flag_.clear();
@@ -287,6 +288,7 @@ void ObSSTableMergeRes::reset()
   root_row_store_type_ = ObRowStoreType::MAX_ROW_STORE;
   is_small_sstable_ = false;
   inv_meta_.reset();
+  ivf_meta_.reset();
 }
 
 bool ObSSTableMergeRes::is_valid() const
@@ -348,6 +350,7 @@ int ObSSTableMergeRes::assign(const ObSSTableMergeRes &src)
     nested_offset_ = src.nested_offset_;
     root_row_store_type_ = src.root_row_store_type_;
     is_small_sstable_ = src.is_small_sstable_;
+    ivf_meta_ = src.ivf_meta_;
     MEMCPY(encrypt_key_, src.encrypt_key_, sizeof(encrypt_key_));
 
     if (OB_FAIL(inv_meta_.assign(src.inv_meta_))) {
@@ -473,6 +476,7 @@ ObSSTableIndexBuilder::ObSSTableIndexBuilder(const bool use_double_write_buffer)
     ModulePageAllocator(sstable_allocator_)),
     res_(),
     inv_meta_(),
+    ivf_meta_(),
     object_cleaner_(nullptr),
     optimization_mode_(ENABLE),
     enable_dump_disk_(false),
@@ -504,6 +508,7 @@ void ObSSTableIndexBuilder::reset()
   roots_.reset();
   res_.reset();
   inv_meta_.reset();
+  ivf_meta_.reset();
   if (OB_NOT_NULL(object_cleaner_)) {
     OB_DELETEx(ObISSTableObjectCleaner, &sstable_allocator_, object_cleaner_);
   }
@@ -1777,8 +1782,11 @@ int ObSSTableIndexBuilder::close_with_macro_seq_inner(
            share::OB_MAX_TABLESPACE_ENCRYPT_KEY_LENGTH);
     res.master_key_id_ = desc.get_master_key_id();
     res.set_table_flag_with_macro_id_array();
-    if (is_async_index_ && OB_FAIL(res.assign_inv_meta(inv_meta_))) {
-      STORAGE_LOG(WARN, "failed to copy inverted stats to merge result", K(ret));
+    if (is_async_index_) {
+      res.ivf_meta_ = ivf_meta_;
+      if (OB_FAIL(res.assign_inv_meta(inv_meta_))) {
+        STORAGE_LOG(WARN, "failed to copy inverted stats to merge result", K(ret));
+      }
     }
     if (OB_FAIL(ret)) {
     } else if (OB_FAIL(res_.assign(res))) {
@@ -2218,6 +2226,26 @@ int ObSSTableIndexBuilder::merge_macro_inv_meta(const ObInvMacroMeta &macro_meta
   } else if (OB_FAIL(inv_meta_.merge_macro(macro_meta))) {
     STORAGE_LOG(WARN, "failed to merge inverted macro metadata",
         K(ret), K_(inv_meta), K(macro_meta));
+  }
+  return ret;
+}
+
+int ObSSTableIndexBuilder::set_ivf_meta(const ObIvfSSTableMeta &ivf_meta)
+{
+  int ret = OB_SUCCESS;
+  ObBlockWriterConcurrentGuard guard(concurrent_lock_);
+  if (OB_UNLIKELY(!is_async_index_)) {
+    ret = OB_ERR_UNEXPECTED;
+    STORAGE_LOG(WARN, "set ivf meta called on non-async index builder",
+        K(ret), KPC(this), K(ivf_meta));
+  } else if (OB_UNLIKELY(!ivf_meta.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "invalid ivf meta", K(ret), K(ivf_meta));
+  } else if (OB_UNLIKELY(ivf_meta_.is_valid())) {
+    ret = OB_INIT_TWICE;
+    STORAGE_LOG(WARN, "ivf meta has already been set", K(ret), K_(ivf_meta), K(ivf_meta));
+  } else {
+    ivf_meta_ = ivf_meta;
   }
   return ret;
 }

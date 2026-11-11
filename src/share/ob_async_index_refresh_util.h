@@ -267,7 +267,7 @@ public:
   static bool is_async_index_adaptive_parallelism_enabled(const uint64_t tenant_id);
   // Requested-DOP limit: 0 uses 25 percent of tenant max CPU.
   static int64_t get_async_index_refresh_dop_limit(const uint64_t tenant_id);
-  // Collect async index table ids. Default: AVAILABLE only.
+  // Collect physical async refresh target table IDs. Default: AVAILABLE only.
   // allow_unavailable: also collect INDEX_STATUS_UNAVAILABLE.
   static int collect_async_index_table_ids(
       const uint64_t tenant_id,
@@ -275,7 +275,6 @@ public:
       common::ObIArray<uint64_t> &out_index_table_ids,
       const bool retry_on_missing_search_schema = false,
       const bool allow_unavailable = false);
-
 };
 
 } // end namespace share

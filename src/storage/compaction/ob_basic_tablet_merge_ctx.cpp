@@ -82,6 +82,7 @@ ObStaticMergeParam::ObStaticMergeParam(ObTabletMergeDagParam &dag_param)
     is_ha_compeleted_(true),
     for_unittest_(false),
     is_inv_index_(false),
+    is_ivf_index_(false),
     fill_tx_type_(FILL_TX_TYPE_NORMAL),
     merge_reason_(ObAdaptiveMergePolicy::AdaptiveMergeReason::NONE),
     sstable_logic_seq_(0),
@@ -131,6 +132,7 @@ void ObStaticMergeParam::reset()
   rec_scn_.reset();
   for_unittest_ = false;
   is_inv_index_ = false;
+  is_ivf_index_ = false;
   is_delete_insert_merge_ = false;
   is_ha_compeleted_ = true;
   co_static_param_.reset();
@@ -951,7 +953,7 @@ int ObBasicTabletMergeCtx::get_merge_tables(ObGetMergeTablesResult &get_merge_ta
   ObGetMergeTablesParam get_merge_table_param;
   get_merge_table_param.merge_type_ = get_merge_type();
   get_merge_table_param.merge_version_ = get_merge_version();
-  if (get_tablet()->is_async_inverted_storage_index()) {
+  if (get_tablet()->is_async_index_storage_tablet()) {
     get_merge_table_param.merge_base_version_ = get_merge_base_version();
   }
   get_merge_table_result.error_location_ = &info_collector_.error_location_;
@@ -1324,6 +1326,10 @@ ObITable::TableType ObBasicTabletMergeCtx::get_merged_table_type(
     table_type = is_inc_major_merge(get_merge_type())
                ? ObITable::TableType::INC_INV_INDEX_SSTABLE
                : ObITable::TableType::INV_INDEX_SSTABLE;
+  } else if (is_ivf_index_merge()) {
+    table_type = is_inc_major_merge(get_merge_type())
+               ? ObITable::TableType::INC_IVF_INDEX_SSTABLE
+               : ObITable::TableType::IVF_INDEX_SSTABLE;
   } else if (is_major_or_meta_merge_type(get_merge_type())) { // MAJOR / META MERGE
     const bool is_meta_merge = is_meta_major_merge(get_merge_type());
     if (nullptr == cg_schema) {
@@ -1570,7 +1576,7 @@ int ObBasicTabletMergeCtx::build_index_tree(
     LOG_WARN("failed to init index store desc", K(ret), KPC(this));
   } else if (OB_FAIL(merge_info.prepare_index_builder())) {
     LOG_WARN("failed to prepare index builder", K(ret), K(merge_info));
-  } else if (is_inv_index_merge()) {
+  } else if (is_inv_index_merge() || is_ivf_index_merge()) {
     merge_info.get_index_builder()->set_is_async_index(true);
   }
   return ret;

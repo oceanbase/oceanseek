@@ -38,7 +38,7 @@ enum class ObSerializeTableType : uint8_t
 OB_INLINE bool is_serialize_table_type_valid(const int8_t type)
 {
   return type >= static_cast<int8_t>(ObSerializeTableType::NORMAL)
-      && type <= static_cast<int8_t>(ObSerializeTableType::INV);
+      && type <= static_cast<int8_t>(ObSerializeTableType::IVF);
 }
 
 class ObSSTableArray

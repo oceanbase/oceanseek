@@ -11,6 +11,8 @@
 #include "storage/ddl/ob_tablet_slice_writer.h"
 #include "storage/blocksstable/ob_data_store_desc.h"
 #include "storage/blocksstable/async_index/ob_inv_idx_macro_block_writer.h"
+#include "storage/blocksstable/vector_index/ob_ivf_macro_block_writer.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable_struct.h"
 
 namespace oceanbase
 {
@@ -36,9 +38,9 @@ public:
   virtual ~ObAsyncIndexMacroWriter() {}
 };
 
-// Real adapter that drives ObInvIdxMacroBlockWriter so the DDL write pipeline
-// produces true inverted-index macro blocks. Macro block metas are routed into
-// the merge-side macro_meta_store through ObDDLRedoLogWriterCallback.
+// DDL macro-writer adapter shared by async inverted indexes and Disk BBQ.
+// Disk BBQ is dispatched to ObIvfMacroBlockWriter; macro-block metas are
+// routed into the merge-side macro_meta_store through the DDL redo callback.
 class ObAsyncIndexMacroWriterAdapter : public ObAsyncIndexMacroWriter
 {
 public:
@@ -65,6 +67,8 @@ private:
   bool is_same_posting(const blocksstable::ObDatumRow &row) const;
   int build_inv_idx_row_desc(const ObWriteMacroParam &param,
                              blocksstable::ObInvIdxRowDesc &inv_idx_row_desc);
+  int build_ivf_row_desc(const ObWriteMacroParam &param,
+                         blocksstable::ObIvfSSTableRowDesc &ivf_row_desc);
   static int build_search_inv_idx_row_desc(
       const bool has_nested_paths,
       const int64_t rowkey_column_cnt,
@@ -81,12 +85,15 @@ private:
   share::ObSearchIndexNestedKeyListWriter nested_key_list_writer_;
   blocksstable::ObDatumRow pending_nested_row_;
   blocksstable::ObInvIdxRowDesc inv_idx_row_desc_;
+  blocksstable::ObIvfSSTableRowDesc ivf_row_desc_;
   blocksstable::ObWholeDataStoreDesc data_desc_;
   blocksstable::ObSSTableIndexBuilder *index_builder_;
   blocksstable::ObISSTableObjectCleaner *object_cleaner_; // owned by index_builder_, not freed here
   blocksstable::ObIMacroBlockFlushCallback *ddl_redo_callback_;
   bool is_inc_redo_callback_;
   blocksstable::ObInvIdxMacroBlockWriter inv_writer_;
+  blocksstable::ObIvfMacroBlockWriter ivf_writer_;
+  bool is_disk_bbq_writer_;
   ObTabletID tablet_id_;
   int64_t cg_idx_;
   int64_t parallel_idx_;

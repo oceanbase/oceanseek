@@ -288,6 +288,7 @@ public:
   virtual ~ObVecSearchNode() {};
 
   int init_vec_info(ObSqlSchemaGuard *schema_guard);
+  ObAsyncIndexDeleteInfo async_delete_info_;
   virtual int explain_info(char *buf, int64_t buf_len, int64_t &pos, ExplainType type, int blank_space_count);
 public:
   struct VecIndexScanParams

@@ -20,6 +20,7 @@
 #endif
 #include "sql/das/ob_das_scan_op.h"
 #include "sql/das/ob_das_vec_define.h"
+#include "sql/das/iter/ob_das_vec_index_scan_iter.h"
 #include "sql/das/search/ob_das_search_context.h"
 #include "sql/das/search/ob_das_async_index_query_ctx.h"
 #include "sql/das/search/ob_das_async_segment_merge_op.h"
@@ -3124,11 +3125,11 @@ TEST_F(TestDASAsyncSegmentMerge, async_tree_detection_and_sqc_registry)
   root.children_ = root_children;
   root.children_cnt_ = ARRAYSIZEOF(root_children);
 
-  EXPECT_TRUE(ObDASAsyncIndexQueryCtx::contains_async_index_query(&root));
-  EXPECT_FALSE(ObDASAsyncIndexQueryCtx::contains_async_index_query(nullptr));
-  EXPECT_FALSE(ObDASAsyncIndexQueryCtx::contains_async_index_query(&ordinary_scan));
-  EXPECT_FALSE(ObDASAsyncIndexQueryCtx::contains_async_index_query(&sync_ir_scan));
-  EXPECT_TRUE(ObDASAsyncIndexQueryCtx::contains_async_index_query(&async_scalar_scan));
+  EXPECT_TRUE(ObDASAsyncIndexQueryCtx::contains_shared_async_index_query(&root));
+  EXPECT_FALSE(ObDASAsyncIndexQueryCtx::contains_shared_async_index_query(nullptr));
+  EXPECT_FALSE(ObDASAsyncIndexQueryCtx::contains_shared_async_index_query(&ordinary_scan));
+  EXPECT_FALSE(ObDASAsyncIndexQueryCtx::contains_shared_async_index_query(&sync_ir_scan));
+  EXPECT_TRUE(ObDASAsyncIndexQueryCtx::contains_shared_async_index_query(&async_scalar_scan));
 
   ObPxRpcInitSqcArgs sqc_args;
   ObSqcCtx sqc_ctx(sqc_args);
@@ -3140,6 +3141,65 @@ TEST_F(TestDASAsyncSegmentMerge, async_tree_detection_and_sqc_registry)
   ObDASAsyncIndexQueryCtx *found_ctx = nullptr;
   EXPECT_EQ(OB_SUCCESS, sqc_ctx.get_async_index_query_ctx(101, found_ctx));
   EXPECT_EQ(query_ctx, found_ctx);
+}
+
+TEST_F(TestDASAsyncSegmentMerge, async_index_access_and_shared_context_detection)
+{
+  ObDASVecAuxScanCtDef sync_vector(allocator_);
+  ObDASVecAuxScanCtDef async_vector(allocator_);
+  ObDASVecIndexAsyncIVFScanCtDef shared_vector(allocator_);
+  ObDASIRScanCtDef sync_ir(allocator_);
+  ObDASIRScanCtDef async_ir(allocator_);
+  ObDASScalarScanCtDef sync_scalar(allocator_);
+  ObDASScalarScanCtDef async_scalar(allocator_);
+  ObDASBooleanQueryCtDef async_boolean(allocator_);
+  async_vector.is_async_index_ = true;
+  async_ir.is_async_index_ = true;
+  async_scalar.is_async_index_ = true;
+  async_boolean.set_is_async(true);
+  const struct {
+    const ObDASBaseCtDef *ctdef_;
+    bool has_access_;
+    bool uses_shared_context_;
+  } cases[] = {
+    {nullptr, false, false},
+    {&sync_vector, false, false},
+    {&async_vector, true, false},
+    {&shared_vector, true, true},
+    {&sync_ir, false, false},
+    {&async_ir, true, true},
+    {&sync_scalar, false, false},
+    {&async_scalar, true, true},
+    {&async_boolean, true, true}
+  };
+  for (int64_t i = 0; i < ARRAYSIZEOF(cases); ++i) {
+    SCOPED_TRACE(i);
+    EXPECT_EQ(cases[i].has_access_,
+              ObDASAsyncIndexQueryCtx::contains_async_index_access(cases[i].ctdef_));
+    EXPECT_EQ(cases[i].uses_shared_context_,
+              ObDASAsyncIndexQueryCtx::contains_shared_async_index_query(cases[i].ctdef_));
+  }
+
+  ObDASTableLookupCtDef lookup(allocator_);
+  ObDASSortCtDef sort(allocator_);
+  ObDASBaseCtDef *lookup_children[] = {&sync_scalar, &async_vector};
+  ObDASBaseCtDef *sort_children[] = {&lookup};
+  lookup.children_ = lookup_children;
+  lookup.children_cnt_ = ARRAYSIZEOF(lookup_children);
+  sort.children_ = sort_children;
+  sort.children_cnt_ = ARRAYSIZEOF(sort_children);
+  EXPECT_TRUE(ObDASAsyncIndexQueryCtx::contains_async_index_access(&sort));
+  EXPECT_FALSE(ObDASAsyncIndexQueryCtx::contains_shared_async_index_query(&sort));
+  async_vector.is_async_index_ = false;
+  EXPECT_FALSE(ObDASAsyncIndexQueryCtx::contains_async_index_access(&sort));
+  EXPECT_FALSE(ObDASAsyncIndexQueryCtx::contains_shared_async_index_query(&sort));
+
+  ObDASBooleanQueryCtDef mixed(allocator_);
+  ObDASBaseCtDef *mixed_children[] = {nullptr, &sort, &async_scalar};
+  mixed.children_ = mixed_children;
+  mixed.children_cnt_ = ARRAYSIZEOF(mixed_children);
+  EXPECT_TRUE(ObDASAsyncIndexQueryCtx::contains_async_index_access(&mixed));
+  EXPECT_TRUE(ObDASAsyncIndexQueryCtx::contains_shared_async_index_query(&mixed));
 }
 
 TEST_F(TestDASAsyncSegmentMerge, collect_async_scalar_index_table_ids)

@@ -7,6 +7,7 @@
 #define OCEANBASE_SQL_ENGINE_EXPR_CALC_ODPS_SIZE_
 
 #include "sql/engine/expr/ob_expr_operator.h"
+#include "sql/engine/connector/ob_odps_jni_connector.h"
 
 namespace oceanbase
 {

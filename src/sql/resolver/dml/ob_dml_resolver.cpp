@@ -9185,7 +9185,8 @@ int ObDMLResolver::resolve_table_partition_expr(const TableItem &table_item, con
                K(part_str), K(part_type), K(table_schema.get_table_id()));
     } else if (table_item.is_index_table_
                && dml_stmt->is_select_stmt()
-               && share::schema::is_local_fts_index(table_schema.get_index_type())) {
+               && (share::schema::is_local_fts_index(table_schema.get_index_type())
+                   || table_schema.is_async_ivf_index())) {
       const ObTableSchema *data_table_schema = NULL;
       bool index_table_has_part_key = true;
       bool index_table_has_subpart_key = true;

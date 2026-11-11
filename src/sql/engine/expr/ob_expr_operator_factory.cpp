@@ -438,6 +438,7 @@
 #include "sql/engine/expr/ob_expr_vec_ivf_pq_center_vector.h"
 #include "sql/engine/expr/ob_expr_vec_vid.h"
 #include "sql/engine/expr/ob_expr_vec_type.h"
+#include "sql/engine/expr/ob_expr_vec_ivf.h"
 #include "sql/engine/expr/ob_expr_vec_vector.h"
 #include "sql/engine/expr/ob_expr_vec_scn.h"
 #include "sql/engine/expr/ob_expr_vec_key.h"
@@ -1252,6 +1253,9 @@ void ObExprOperatorFactory::register_expr_operators()
     REG_OP(ObExprVecIVFPQCenterVector, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprVecVid, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprVecType, SHORT_CIRCUIT_EVALUATION);
+    REG_OP(ObExprVecIVFType, SHORT_CIRCUIT_EVALUATION);
+    REG_OP(ObExprVecIVFCid, SHORT_CIRCUIT_EVALUATION);
+    REG_OP(ObExprVecIVFData, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprVecVector, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprVecScn, SHORT_CIRCUIT_EVALUATION);
     REG_OP(ObExprVecKey, SHORT_CIRCUIT_EVALUATION);

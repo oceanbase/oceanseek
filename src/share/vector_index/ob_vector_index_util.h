@@ -15,8 +15,10 @@
 #include "rootserver/ob_ddl_service.h"
 #include "sql/resolver/expr/ob_raw_expr.h"
 #include "share/vector_type/ob_vector_common_util.h"
+#include "share/vector_index/ob_vector_index_common_define.h"
 #include "share/vector_index/ob_vector_index_param.h"
 #include "share/ai_service/ob_ai_exec_struct.h"
+#include <vsag/allocator.h>
 
 namespace oceanbase
 {
@@ -71,15 +73,6 @@ enum ObVecAuxTableIdx { //FARM COMPAT WHITELIST
   FOURTH_VEC_AUX_TBL_IDX = 4,
   FIFTH_VEC_AUX_TBL_IDX = 5,
   SIXTH_VEC_AUX_TBL_IDX = 6,
-};
-
-enum ObVectorIndexDistAlgorithm
-{
-  VIDA_L2 = 0,
-  VIDA_IP = 1,
-  VIDA_COS = 2,
-  VIDA_L1 = 3,
-  VIDA_MAX
 };
 
 enum ObVectorIndexAlgorithmLib
@@ -243,10 +236,13 @@ struct ObVectorIndexParam //FARM COMPAT WHITELIST
   static constexpr float DEFAULT_REFINE_K = 4.0;
   static constexpr int DEFAULT_BQ_BITS_QUERY = 32;
   static constexpr int DEFAULT_WINDOW_SIZE = 60000;
+  static constexpr int64_t DEFAULT_DISK_BBQ_CLUSTER_SIZE = 384;
+  static constexpr int64_t MIN_DISK_BBQ_CLUSTER_SIZE = 64;
+  static constexpr int64_t MAX_DISK_BBQ_CLUSTER_SIZE = 65536;
 
   ObVectorIndexParam() :
     type_(VIAT_MAX), lib_(VIAL_MAX), dim_(0), m_(0), ef_construction_(0), ef_search_(0),
-    nlist_(0), sample_per_nlist_(0), extra_info_max_size_(0), extra_info_actual_size_(0),
+    nlist_(0), sample_per_nlist_(0), cluster_size_(0), extra_info_max_size_(0), extra_info_actual_size_(0),
     refine_type_(0), bq_bits_query_(DEFAULT_BQ_BITS_QUERY),
     refine_k_(DEFAULT_REFINE_K), bq_use_fht_(false), sync_interval_type_(VSIT_MAX), sync_interval_value_(0), nbits_(0),
     prune_(false), refine_(false), ob_sparse_drop_ratio_build_(0), window_size_(DEFAULT_WINDOW_SIZE),
@@ -266,6 +262,7 @@ struct ObVectorIndexParam //FARM COMPAT WHITELIST
     ef_search_ = 0;
     nlist_ = 0;
     sample_per_nlist_ = 0;
+    cluster_size_ = 0;
     extra_info_max_size_ = 0;
     extra_info_actual_size_ = 0;
     refine_type_ = 0;
@@ -299,6 +296,7 @@ struct ObVectorIndexParam //FARM COMPAT WHITELIST
     ef_search_ = other.ef_search_;
     nlist_ = other.nlist_;
     sample_per_nlist_ = other.sample_per_nlist_;
+    cluster_size_ = other.cluster_size_;
     extra_info_max_size_ = other.extra_info_max_size_;
     extra_info_actual_size_ = other.extra_info_actual_size_;
     refine_type_ = other.refine_type_;
@@ -331,6 +329,7 @@ struct ObVectorIndexParam //FARM COMPAT WHITELIST
   int64_t ef_search_;
   int64_t nlist_;
   int64_t sample_per_nlist_;
+  int64_t cluster_size_;
   // 0: close, 1: open, else: max_size
   // default: 1024
   int64_t extra_info_max_size_;
@@ -365,7 +364,7 @@ private:
   int print_ipivf_params(char *buf, int64_t buf_len, int64_t &pos) const;
 public:
   TO_STRING_KV(K_(type), K_(lib), K_(dist_algorithm), K_(dim), K_(m), K_(ef_construction), K_(ef_search),
-    K_(nlist), K_(sample_per_nlist), K_(extra_info_max_size), K_(extra_info_actual_size),
+    K_(nlist), K_(sample_per_nlist), K_(cluster_size), K_(extra_info_max_size), K_(extra_info_actual_size),
     K_(refine_type), K_(bq_bits_query), K_(refine_k), K_(bq_use_fht), K_(sync_interval_type), K_(sync_interval_value), K_(endpoint), K_(nbits),
     K_(prune), K_(refine), K_(ob_sparse_drop_ratio_build),K_(window_size), K_(ob_sparse_drop_ratio_search), K_(similarity_threshold),
     K_(fresh_mode), K_(content_type), K_(ai_service_tier), K_(allow_null_on_failure), "DUPLICATE_GROUP", support_duplicate_);
@@ -389,7 +388,7 @@ static const uint64_t MIN_BRUTEFORCE_FALLBACK_THRESHOLD = 1;
 static const uint64_t MAX_BRUTEFORCE_FALLBACK_THRESHOLD = 1000000;
 static const uint64_t MAX_HNSW_PRE_ROW_CNT_WITH_ROWKEY = 1000000;
 static const uint64_t MAX_HNSW_PRE_ROW_CNT_WITH_IDX = 300000;
-static constexpr uint64_t IVF_CENTERS_HGRAPH_THRESHOLD = 5000;  // minimum centers count to build hgraph index
+static constexpr uint64_t IVF_CENTERS_HGRAPH_THRESHOLD = 3000;  // minimum centers count to build hgraph index
 static constexpr uint64_t IVF_BUILD_HGRAPH_THRESHOLD = 3000;
 static constexpr double DEFAULT_IVFPQ_SELECTIVITY_RATE = 0.9;
 static const uint64_t MAX_IVF_BRUTE_FORCE_SIZE = 10000;
@@ -462,7 +461,9 @@ static const uint64_t MAX_IVF_POST_DIST_CALC_CNT = 500000;
       can_extract_range_(false),
       with_extra_info_(false),
       strategy_(ObVecIdxQueryStrategy::RECALL_FIRST),
-      pre_filtering_timeout_(-1) {}
+      pre_filtering_timeout_(-1),
+      is_async_index_(false),
+      is_adaptive_specify_by_hint_(false) {}
   inline void set_vec_idx_type(ObVecIndexType vec_idx_type) { vec_idx_type_ = vec_idx_type;}
   ObVecIndexType get_vec_idx_type() const { return vec_idx_type_; }
   inline double get_selectivity() const { return selectivity_; }
@@ -497,6 +498,15 @@ static const uint64_t MAX_IVF_POST_DIST_CALC_CNT = 500000;
            vector_index_param_.type_ == ObVectorIndexAlgorithmType::VIAT_IVF_SQ8 ||
            vector_index_param_.type_ == ObVectorIndexAlgorithmType::VIAT_IVF_PQ;
   }
+  inline bool is_async_ivf_scan() const
+  {
+    return is_async_index_ &&
+           vector_index_param_.type_ == ObVectorIndexAlgorithmType::VIAT_DISK_BBQ;
+  }
+  inline bool is_ivf_or_async_ivf_scan() const
+  {
+    return is_ivf_vec_scan() || is_async_ivf_scan();
+  }
   int64_t get_row_count() { return row_count_; }
   bool is_pre_filter() const { return vec_idx_type_ == ObVecIndexType::VEC_INDEX_PRE; }
   bool is_post_filter() const { return vec_idx_type_ == ObVecIndexType::VEC_INDEX_POST_WITHOUT_FILTER || vec_idx_type_ == ObVecIndexType::VEC_INDEX_POST_ITERATIVE_FILTER; }
@@ -512,9 +522,10 @@ static const uint64_t MAX_IVF_POST_DIST_CALC_CNT = 500000;
     return DEFAULT_SELECTIVITY_RATE;
   }
   TO_STRING_KV(K_(vec_idx_type), K_(adaptive_try_path), K_(selectivity), K_(row_count),
-  K_(can_use_vec_pri_opt), K_(is_multi_value_index), K_(is_spatial_index), 
+  K_(can_use_vec_pri_opt), K_(is_multi_value_index), K_(is_spatial_index),
   K_(can_extract_range), K_(with_extra_info), K_(vector_index_param),
-  K_(strategy), K_(pre_filtering_timeout));
+  K_(strategy), K_(pre_filtering_timeout), K_(is_async_index),
+  K_(is_adaptive_specify_by_hint));
   ObVecIndexType vec_idx_type_;                // pre & post & adaptive
   ObVecIdxAdaTryPath adaptive_try_path_;
   double selectivity_;
@@ -527,6 +538,8 @@ static const uint64_t MAX_IVF_POST_DIST_CALC_CNT = 500000;
   bool with_extra_info_;
   ObVecIdxQueryStrategy strategy_;
   int64_t pre_filtering_timeout_;
+  bool is_async_index_;
+  bool is_adaptive_specify_by_hint_;
 };
 
 struct VecIndexAccessInfo
@@ -767,6 +780,9 @@ public:
       const ObTableSchema &data_table_schema, 
       ObSchemaGetterGuard &schema_guard, 
       bool &has_vec_index);
+  static int check_table_has_async_ivf_index(
+    const ObTableSchema &data_table_schema,
+    bool &has_async_ivf_index);
   static int check_vector_index_column_id_match(
       const ObTableSchema &data_table_schema, 
       const ObTableSchema &index_table_schema, 
@@ -1128,7 +1144,8 @@ public:
                                     ObIArrayType *&arr);
   static int get_nearest_center_with_hgraph(const float *vector,
                                             share::ObIvfICache *hgraph_cache,
-                                            int64_t &center_idx);
+                                            int64_t &center_idx,
+                                            vsag::Allocator *allocator);
   static int estimate_hnsw_memory(
       uint64_t num_vectors,
       const ObVectorIndexParam &param, 

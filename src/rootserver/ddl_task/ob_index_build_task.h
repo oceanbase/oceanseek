@@ -142,6 +142,8 @@ private:
   int verify_checksum();
   int trigger_async_index_refresh();
   virtual void clear_old_status_context() override;
+  bool is_parent_managed_async_vector_child() const;
+  int persist_terminal_result();
   int enable_index();
   int clean_on_failed();
   int succ();

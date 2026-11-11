@@ -22,6 +22,7 @@
 #include "sql/das/search/ob_das_filter_bitmap_provider.h"
 #include "sql/das/search/ob_das_conjunction_op.h"
 #include "sql/das/search/ob_disjunctive_daat_merger.h"
+#include "sql/das/iter/ob_das_search_driver_iter.h"
 #include "sql/engine/ob_exec_context.h"
 #undef protected
 #undef private
@@ -767,7 +768,8 @@ public:
     return ret;
   }
 
-  void verify_provider_word_windows(const bool query_optional)
+  void verify_provider_word_windows(
+      const bool query_optional, const bool rescan_candidates = false)
   {
     BMMVectorizedMergeConfigGuard config_guard;
     ASSERT_TRUE(config_guard.is_valid());
@@ -794,6 +796,17 @@ public:
     ASSERT_NE(nullptr, provider);
     ASSERT_EQ(OB_SUCCESS, provider->create_view(search_ctx_, view));
     ASSERT_NE(nullptr, view);
+    ObDASBitmapOp *candidate_view = nullptr;
+    ObDASSearchDriverIter candidate_driver;
+    ObDASIter *candidate_iter = &candidate_driver;
+    if (rescan_candidates) {
+      ASSERT_EQ(OB_SUCCESS, provider->create_view(search_ctx_, candidate_view));
+      ASSERT_NE(nullptr, candidate_view);
+      ASSERT_EQ(OB_SUCCESS, candidate_view->open());
+      candidate_driver.set_root_op(candidate_view);
+      candidate_driver.set_search_ctx(&search_ctx_);
+      candidate_driver.inited_ = true;
+    }
     ObSEArray<ObIDASSearchOp *, 1> score_ops;
     ASSERT_EQ(OB_SUCCESS, score_ops.push_back(&scoring_op));
     ObDASBMMOp bmm(search_ctx_);
@@ -808,17 +821,40 @@ public:
     const int64_t begin = query_optional ? 0 : 1;
     const int64_t end = query_optional ? ARRAYSIZEOF(expected_ids) : 5;
     ObDASRowID rowid;
+    ObDASRowID target;
+    ObDASRowID candidate_id;
     double score = -1.0;
+    double candidate_score = 0.0;
+    target.set_uint64(33);
     for (int64_t i = begin; i < end; ++i) {
       ASSERT_EQ(OB_SUCCESS, bmm.next_rowid(rowid, score));
       EXPECT_EQ(expected_ids[i], rowid.get_uint64());
       EXPECT_DOUBLE_EQ(expected_scores[i], score);
+      if (rescan_candidates) {
+        // The fulltext BMM keeps its cursor/window while another branch
+        // rewinds its filter for candidates whose IDs can move backwards.
+        ASSERT_EQ(OB_SUCCESS, candidate_view->advance_to(
+            target, candidate_id, candidate_score));
+        ASSERT_EQ(33, candidate_id.get_uint64());
+        search_ctx_.set_is_vec_index_search(true);
+        ASSERT_EQ(OB_SUCCESS, candidate_iter->reuse());
+        ASSERT_EQ(OB_SUCCESS, candidate_iter->rescan_for_next_candidates());
+        search_ctx_.set_is_vec_index_search(false);
+        ASSERT_TRUE(provider->is_prepared());
+        ASSERT_NE(nullptr, provider->get_bitmap());
+        EXPECT_EQ(6, provider->get_bitmap()->cardinality());
+        ASSERT_EQ(OB_SUCCESS, candidate_view->next_rowid(candidate_id, candidate_score));
+        EXPECT_EQ(1, candidate_id.get_uint64());
+      }
     }
     EXPECT_EQ(OB_ITER_END, bmm.next_rowid(rowid, score));
     EXPECT_TRUE(provider->is_prepared());
     ASSERT_NE(nullptr, provider->get_bitmap());
     EXPECT_EQ(6, provider->get_bitmap()->cardinality());
     EXPECT_EQ(OB_SUCCESS, bmm.close());
+    if (rescan_candidates) {
+      EXPECT_EQ(OB_SUCCESS, candidate_view->close());
+    }
     search_ctx_.reset();
   }
 
@@ -3732,6 +3768,11 @@ TEST_F(TestDASBMM, provider_word_windows_preserve_required_results)
 TEST_F(TestDASBMM, provider_word_windows_keep_optional_zero_score_fallback)
 {
   verify_provider_word_windows(true);
+}
+
+TEST_F(TestDASBMM, disk_bbq_candidate_rescan_preserves_primed_bmm_provider_word_windows)
+{
+  verify_provider_word_windows(false, true);
 }
 
 TEST_F(TestDASBMM, query_optional_switches_to_sparse_after_dense_window)

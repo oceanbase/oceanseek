@@ -2632,8 +2632,9 @@ int ObMacroBlockWriter::alloc_block()
     const compaction::ObMergeType merge_type = data_store_desc_->get_merge_type();
     const bool is_inc_major_compaction =
         compaction::is_inc_major_merge(merge_type);
+    const bool is_non_idem_major = data_store_desc_->get_is_non_idem_major();
     const bool is_inc_major_ddl =
-        !is_inc_major_compaction && data_store_desc_->get_is_inc_major();
+        !is_inc_major_compaction && !is_non_idem_major && data_store_desc_->get_is_inc_major();
     ObStorageObjectType obj_type = ObStorageObjectType::MAX;
 #define COVERT_TO_OBJ_TYPE(T1) \
     (index_or_meta ? \
@@ -2641,6 +2642,8 @@ int ObMacroBlockWriter::alloc_block()
       ObStorageObjectType::SHARED_##T1##_DATA_MACRO)
     if (is_inc_major_compaction) {
       obj_type = COVERT_TO_OBJ_TYPE(INC_MAJOR_COMPACTION);
+    } else if (is_non_idem_major) {
+      obj_type = COVERT_TO_OBJ_TYPE(NON_IDEM_MAJOR);
     } else if (is_inc_major_ddl) {
       obj_type = COVERT_TO_OBJ_TYPE(INC_MAJOR);
     } else if (compaction::is_major_merge_type(merge_type)) {
@@ -2656,7 +2659,7 @@ int ObMacroBlockWriter::alloc_block()
 #undef COVERT_TO_OBJ_TYPE
     if (OB_SUCC(ret)) {
       int64_t fourth_id = OB_INVALID_ID;
-      if (is_inc_major_compaction) {
+      if (is_inc_major_compaction || is_non_idem_major) {
         fourth_id = data_store_desc_->get_op_id();
       } else if (is_inc_major_ddl) {
         fourth_id = data_store_desc_->get_inc_major_ddl_block_op_id();

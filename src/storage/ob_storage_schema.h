@@ -276,6 +276,8 @@ public:
     return share::schema::is_async_inverted_storage_index(index_type_);
   }
   inline bool is_async_delete_index() const { return share::schema::is_async_delete_index(index_type_); }
+  inline bool is_async_fts_index() const { return share::schema::is_async_fts_index(index_type_); }
+  inline bool is_async_ivf_index() const { return share::schema::is_async_ivf_index(index_type_); }
   virtual inline bool is_index_table() const override { return share::schema::is_index_table(table_type_); }
   virtual inline bool is_storage_index_table() const override
   {

@@ -6,9 +6,14 @@
 #define USING_LOG_PREFIX SHARE
 
 #include "ob_vector_index_ivf_cache_mgr.h"
+#include "share/vector_index/ob_plugin_vector_index_service.h"
+#include "observer/omt/ob_tenant_config_mgr.h"
 #include "share/vector_index/ob_plugin_vector_index_util.h"
 #include "share/vector_index/ob_vector_index_util.h"
 #include "share/vector_index/ob_vector_index_ivf_cache_util.h"
+#include "lib/time/ob_time_utility.h"
+#include "lib/worker.h"
+#include "lib/utility/ob_defer.h"
 
 namespace oceanbase
 {
@@ -202,6 +207,19 @@ int ObIvfCacheMgr::create_cache_obj(const IvfCacheKey &key, ObIvfICache *&cache_
 {
   int ret = OB_SUCCESS;
   switch (key.type_) {
+  case IvfCacheType::IVF_SSTABLE_CENTROID_CACHE: {
+    ObIvfSSTableCentCache *tmp_sstable_cache = nullptr;
+    void *tmp_buf = nullptr;
+    if (OB_ISNULL(tmp_buf = mem_ctx_->Allocate(sizeof(ObIvfSSTableCentCache)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate IVF SSTable centroid cache", K(ret));
+    } else {
+      tmp_sstable_cache = new (tmp_buf) ObIvfSSTableCentCache(
+          get_self_allocator(), tenant_id_);
+      cache_obj = tmp_sstable_cache;
+    }
+    break;
+  }
   case IvfCacheType::IVF_CENTROID_CACHE:
   case IvfCacheType::IVF_PQ_CENTROID_CACHE:
   case IvfCacheType::IVF_PQ_PRECOMPUTE_TABLE_CACHE: {
@@ -234,8 +252,12 @@ int ObIvfCacheMgr::create_cache_obj(const IvfCacheKey &key, ObIvfICache *&cache_
   }
   }
 
+  // The SSTable centroid ARRAY is allocated later, after its builder reserves
+  // the exact centroid_count through the dedicated tenant controller.
   if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(check_memory_limit(cache_obj->get_expect_memory_used(key, vec_param_)))) {
+  } else if (IVF_SSTABLE_CENTROID_CACHE != key.type_
+             && OB_FAIL(check_memory_limit(
+                    cache_obj->get_expect_memory_used(key, vec_param_)))) {
     LOG_WARN("fail to check memory limit", K(ret));
   } else if (OB_FAIL(cache_obj->init(mem_ctx_, key, vec_param_, all_vsag_use_mem_))) {
     LOG_WARN("fail to init cache obj", K(ret));
@@ -256,7 +278,6 @@ int ObIvfCacheMgr::fill_cache_info(ObVectorIndexInfo &info){
   info.rowkey_vid_table_id_ = table_id_;
   info.index_type_ = vec_param_.type_;
   info.data_table_id_ = OB_INVALID_ID;
-  ObVectorIndexParam *param;
   int64_t pos = 0;
   #define STAT_PRINT(...) \
   if (OB_SUCC(ret)) { \
@@ -329,25 +350,60 @@ int ObIvfCacheMgr::fill_cache_info(ObVectorIndexInfo &info){
     FOREACH_X(iter, cache_objs_, OB_SUCC(ret))
     {
       IvfCacheType cache_type = iter->first.type_;
+      ObIvfICache *cache_obj = iter->second;
+      common::RWLock::RLockGuard cache_guard(cache_obj->get_lock());
       if (!first_obj) {
         STAT_PRINT(",");
       }
       first_obj = false;
       STAT_PRINT("{\"cache_type\":%d", cache_type);
-      STAT_PRINT(",\"mem_used\":%lu", iter->second->get_actual_memory_used());
-      STAT_PRINT(",\"mem_hold\":%lu", iter->second->get_memory_hold());
+      STAT_PRINT(",\"mem_used\":%lu", cache_obj->get_actual_memory_used());
+      STAT_PRINT(",\"mem_hold\":%lu", cache_obj->get_memory_hold());
       switch (cache_type) {
         case IvfCacheType::IVF_CENTROID_CACHE:
         case IvfCacheType::IVF_PQ_PRECOMPUTE_TABLE_CACHE:
         case IvfCacheType::IVF_PQ_CENTROID_CACHE:
         {
-          ObIvfICache *cache = iter->second;
+          ObIvfICache *cache = cache_obj;
           STAT_PRINT(",\"cache_info\":{");
           STAT_PRINT("\"capacity\":%ld", cache->get_capacity());
           STAT_PRINT(",\"cent_vec_dim\":%ld", cache->get_cent_vec_dim());
           STAT_PRINT(",\"count\":%ld", cache->get_count());
           STAT_PRINT(",\"nlist\":%ld", cache->get_nlist());
           STAT_PRINT(",\"organization\":\"%s\"", cache->has_hgraph_index() ? "hgraph" : "array");
+          STAT_PRINT("}");
+          break;
+        }
+        case IvfCacheType::IVF_SSTABLE_CENTROID_CACHE:
+        {
+          ObIvfSSTableCentCache *cache =
+              static_cast<ObIvfSSTableCentCache *>(cache_obj);
+          STAT_PRINT(",\"cache_info\":{");
+          STAT_PRINT("\"capacity\":%ld", cache->get_capacity());
+          STAT_PRINT(",\"cent_vec_dim\":%ld", cache->get_cent_vec_dim());
+          STAT_PRINT(",\"count\":%ld", cache->get_count());
+          STAT_PRINT(",\"nlist\":%ld", cache->get_nlist());
+          STAT_PRINT(",\"organization\":\"%s\"", cache->has_hgraph_index() ? "hgraph" : "array");
+          if (cache_mgr_key_.is_sstable_key()) {
+            STAT_PRINT(",\"snapshot_version\":%ld",
+                cache_mgr_key_.get_sstable_key().get_snapshot_version());
+            STAT_PRINT(",\"group_id\":%ld", cache_mgr_key_.get_group_id());
+          }
+          STAT_PRINT(",\"hit_count\":%lu", cache->get_hit_count());
+          STAT_PRINT(",\"first_load_ts\":%ld", cache->get_first_load_ts());
+          STAT_PRINT(",\"last_access_ts\":%ld", cache->get_last_access_ts());
+          ObPluginVectorIndexService *service = MTL(ObPluginVectorIndexService *);
+          if (OB_NOT_NULL(service)) {
+            const ObIvfSSTableCacheController &controller =
+                service->get_ivf_sstable_cache_controller();
+            const uint64_t hits = controller.get_hit_count();
+            const uint64_t misses = controller.get_miss_count();
+            const double accesses = static_cast<double>(hits) + static_cast<double>(misses);
+            const double hit_ratio = accesses > 0 ? 100.0 * static_cast<double>(hits) / accesses : 0.0;
+            STAT_PRINT(",\"tenant_cache_hit_count\":%lu", hits);
+            STAT_PRINT(",\"tenant_cache_miss_count\":%lu", misses);
+            STAT_PRINT(",\"tenant_cache_hit_ratio\":\"%.2f%%\"", hit_ratio);
+          }
           STAT_PRINT("}");
           break;
         }
@@ -448,6 +504,13 @@ int ObIvfICache::inner_init(ObIvfMemContext *parent_mem_ctx, uint64_t* all_vsag_
   return ret;
 }
 
+int ObIvfICache::read_centroid_from_hgraph(int64_t /* centroid_idx */, float *&centroid_vec,
+                                         vsag::Allocator &/* allocator */)
+{
+  centroid_vec = nullptr;
+  return common::OB_NOT_SUPPORTED;
+}
+
 int ObIvfICache::add_centroid(int64_t /* cid */, const float */* vec */, int64_t /* dim */,
                               const SCN */* creat_scn */,
                               ObIvfCentroidState /* state */)
@@ -458,6 +521,460 @@ int ObIvfICache::add_centroid(int64_t /* cid */, const float */* vec */, int64_t
 int ObIvfICache::set_centroid_del_scn(int64_t /* cid */, const SCN &/* del_scn */)
 {
   return common::OB_NOT_SUPPORTED;
+}
+
+/////////////////////////////////////////
+// implement of ObIvfSSTableCentCache  //
+/////////////////////////////////////////
+
+ObIvfSSTableCentCache::~ObIvfSSTableCentCache()
+{
+  release_shared_leaves();
+  release_metadata();
+  release_centroid_memory();
+  ObIvfICache::reset();
+  unregister_memory();
+}
+
+void ObIvfSSTableCentCache::release_metadata()
+{
+  if (sub_mem_ctx_ != nullptr) {
+    if (centroid_ids_ != nullptr) { sub_mem_ctx_->Deallocate(centroid_ids_); }
+    if (child_counts_ != nullptr) { sub_mem_ctx_->Deallocate(child_counts_); }
+  }
+  centroid_ids_ = nullptr;
+  child_counts_ = nullptr;
+}
+
+int ObIvfSSTableCentCache::write_entry(int64_t slot, int64_t cid,
+    const float *vector, uint32_t child_count, uint64_t *reservation)
+{
+  int ret = OB_SUCCESS;
+  if (leaf_refs_ != nullptr) {
+    uint64_t allocated = 0;
+    if (slot != count_ || slot < 0 || slot >= capacity_ || vector == nullptr) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("[DISK_BBQ] invalid shared group slot", K(ret), K(slot), K_(count), K_(capacity));
+    } else if (OB_FAIL(parent_cache_->acquire_shared_leaf(cid, vector, child_count, leaf_refs_[slot], allocated))) {
+      LOG_WARN("[DISK_BBQ] failed to acquire shared group member", K(ret), K(cid), K(slot));
+    } else {
+      ++count_;
+      if (allocated > 0) {
+        // Admission stays group-sized. Transfer only materialized leaf objects
+        // out of that reservation; reused objects consume no additional bytes.
+        const uint64_t consumed = reservation == nullptr ? 0 : MIN(*reservation, allocated);
+        if (!parent_cache_->refresh_shared_memory(consumed)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("[DISK_BBQ] shared leaf owner lost memory accounting", K(ret), K(cid), K(consumed));
+        } else if (reservation != nullptr) {
+          *reservation -= consumed;
+        }
+      }
+    }
+  } else if (slot < 0 || slot >= capacity_ || cid <= 0 || child_counts_ == nullptr
+      || (centroid_ids_ == nullptr && cid != slot + 1)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[DISK_BBQ] invalid SSTable centroid cache entry", KR(ret), K(slot), K(cid),
+        K(child_count), K_(tenant_id), K_(capacity), K_(group_id), KP_(child_counts), KP_(centroid_ids));
+  } else if (OB_FAIL(write_centroid_with_real_idx(slot, vector, cent_vec_dim_ * sizeof(float)))) {
+    LOG_WARN("[DISK_BBQ] failed to write centroid cache entry", K(ret), K(slot), K(cid));
+  } else {
+    child_counts_[slot] = child_count;
+    if (centroid_ids_ != nullptr) { centroid_ids_[slot] = cid; }
+  }
+  return ret;
+}
+
+void ObIvfSSTableCentCache::set_completed()
+{
+  // Publish the load time before READY. Repeated completion or an ARRAY-to-
+  // HGraph transition must not restart this cache object's statistics.
+  (void)ATOMIC_BCAS(&first_load_ts_, 0, ObTimeUtility::current_time());
+  ObIvfICache::set_completed();
+}
+
+void ObIvfSSTableCentCache::record_iterator_access(const bool cache_hit)
+{
+  if (cache_hit) { ATOMIC_INC(&hit_count_); }
+  touch();
+}
+
+void ObIvfSSTableCentCache::touch()
+{
+  const int64_t now = ObTimeUtility::current_time();
+  int64_t previous = ATOMIC_LOAD(&last_access_ts_);
+  // Concurrent readers may release out of order after sampling the clock.
+  while (previous < now && !ATOMIC_BCAS(&last_access_ts_, previous, now)) {
+    previous = ATOMIC_LOAD(&last_access_ts_);
+  }
+}
+
+bool ObIvfSSTableCentCache::register_memory_once(
+    const uint64_t hold, ObIvfSSTableCacheController *controller, uint64_t *reservation)
+{
+  bool registered = false;
+  ObSpinLockGuard guard(memory_lock_);
+  if (!memory_registered_) {
+    memory_controller_ = controller;
+    ATOMIC_STORE(&registered_hold_, hold);
+    ATOMIC_STORE(&memory_registered_, true);
+    if (controller != nullptr) {
+      controller->update_cache_hold(0, hold, reservation == nullptr ? 0 : *reservation);
+      if (reservation != nullptr) { *reservation = 0; }
+    }
+    registered = true;
+  } else if (controller != nullptr && reservation != nullptr && *reservation > 0) {
+    controller->release_reservation(*reservation);
+    *reservation = 0;
+  }
+  return registered;
+}
+
+uint64_t ObIvfSSTableCentCache::unregister_memory()
+{
+  uint64_t hold = 0;
+  ObSpinLockGuard guard(memory_lock_);
+  if (memory_registered_) {
+    hold = ATOMIC_TAS(&registered_hold_, 0);
+    ATOMIC_STORE(&memory_registered_, false);
+    if (memory_controller_ != nullptr) { memory_controller_->on_cache_released(hold); }
+    memory_controller_ = nullptr;
+  }
+  return hold;
+}
+
+bool ObIvfSSTableCentCache::update_registered_hold(const uint64_t hold, const uint64_t released_reservation)
+{
+  bool updated = false;
+  // Pin the representation while sampling its allocator. Serialize the sample
+  // itself, not just its delta: different child builders may finish out of order.
+  RLockGuard array_guard(rwlock_);
+  ObSpinLockGuard guard(memory_lock_);
+  if (memory_registered_ && memory_controller_ != nullptr) {
+    const uint64_t current = shared_leaf_count_ > 0 ? get_memory_hold() : hold;
+    memory_controller_->update_cache_hold(registered_hold_, current, released_reservation);
+    ATOMIC_STORE(&registered_hold_, current);
+    updated = true;
+  }
+  return updated;
+}
+
+bool ObIvfSSTableCentCache::refresh_shared_memory(const uint64_t released_reservation)
+{
+  return update_registered_hold(0, released_reservation);
+}
+
+int ObIvfSSTableCentCache::init_shared_leaves(const int64_t leaf_count, const int64_t leaf_cid_base)
+{
+  int ret = OB_SUCCESS;
+  static_assert(sizeof(ObByteLock) == 1, "shared leaf locks must remain compact");
+  if (!is_writing() || group_id_ != 0 || sub_mem_ctx_ == nullptr) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("[DISK_BBQ] invalid shared leaf directory state", K(ret), K_(group_id));
+  } else if (shared_leaves_ != nullptr || leaf_locks_ != nullptr) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("[DISK_BBQ] shared leaf directory already initialized", K(ret));
+  } else if (leaf_count <= 0 || leaf_count > INT32_MAX || leaf_cid_base <= 0
+      || leaf_cid_base > INT64_MAX - leaf_count) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[DISK_BBQ] invalid shared leaf directory size", K(ret), K(leaf_count), K(leaf_cid_base));
+  } else if ((shared_leaves_ = static_cast<SharedLeaf **>(
+      sub_mem_ctx_->Allocate(leaf_count * sizeof(SharedLeaf *)))) == nullptr) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("[DISK_BBQ] failed to allocate shared leaf directory", K(ret), K(leaf_count));
+  } else {
+    MEMSET(shared_leaves_, 0, leaf_count * sizeof(SharedLeaf *));
+    if ((leaf_locks_ = static_cast<ObByteLock *>(
+        sub_mem_ctx_->Allocate(leaf_count * sizeof(ObByteLock)))) == nullptr) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("[DISK_BBQ] failed to allocate shared leaf locks", K(ret), K(leaf_count));
+    } else {
+      for (int64_t i = 0; i < leaf_count; ++i) { new (leaf_locks_ + i) ObByteLock(); }
+      shared_leaf_count_ = leaf_count;
+      leaf_cid_base_ = leaf_cid_base;
+    }
+  }
+  return ret;
+}
+
+int ObIvfSSTableCentCache::attach_parent_cache(const ObIvfCacheMgrGuard &guard)
+{
+  int ret = OB_SUCCESS;
+  ObIvfSSTableCentCache *parent = nullptr;
+  ObIvfCacheMgr *mgr = guard.get_ivf_cache_mgr();
+  if (!is_writing() || parent_cache_ != nullptr || count_ != 0) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("[DISK_BBQ] invalid child cache attachment state", K(ret), K_(count), KP_(parent_cache));
+  } else if (mgr == nullptr) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[DISK_BBQ] missing parent cache guard", K(ret));
+  } else if (OB_FAIL(mgr->get_cache_node<ObIvfSSTableCentCache>(IVF_SSTABLE_CENTROID_CACHE, parent))) {
+    LOG_WARN("[DISK_BBQ] failed to get shared leaf owner", K(ret));
+  } else if (parent == nullptr || !parent->is_completed() || !parent->is_memory_registered()
+      || parent->group_id_ != 0 || parent->shared_leaf_count_ <= 0
+      || parent->cent_vec_dim_ != cent_vec_dim_) {
+    ret = OB_ENTRY_NOT_EXIST;
+  } else {
+    parent_guard_ = guard;
+    parent_cache_ = parent;
+  }
+  return ret;
+}
+
+int ObIvfSSTableCentCache::acquire_shared_leaf(const int64_t cid,
+    const float *vector, const uint32_t child_count, SharedLeaf *&entry, uint64_t &allocated)
+{
+  int ret = OB_SUCCESS;
+  entry = nullptr;
+  allocated = 0;
+  const int64_t idx = cid >= leaf_cid_base_ ? cid - leaf_cid_base_ : -1;
+  if (vector == nullptr || cid < leaf_cid_base_ || idx >= shared_leaf_count_ || leaf_locks_ == nullptr) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("[DISK_BBQ] invalid shared leaf", K(ret), K(cid), K(idx), K_(shared_leaf_count));
+  } else {
+    ObByteLock &lock = leaf_locks_[idx];
+    bool locked = lock.try_lock();
+    while (OB_SUCC(ret) && !locked) {
+      for (int64_t spins = 0; spins < 500 && !locked; ++spins) {
+        PAUSE();
+        locked = lock.try_lock();
+      }
+      if (!locked) {
+        if (OB_FAIL(THIS_WORKER.check_status())) {
+          LOG_WARN("[DISK_BBQ] interrupted while waiting for shared leaf", K(ret), K(cid));
+        } else { ob_usleep(100); }
+      }
+    }
+    if (locked) {
+      DEFER(lock.unlock());
+      SharedLeaf *&slot = shared_leaves_[idx];
+      if (slot != nullptr) {
+        if (slot->ref_count_ == UINT32_MAX) {
+          ret = OB_SIZE_OVERFLOW;
+          LOG_WARN("[DISK_BBQ] shared leaf reference overflow", K(ret), K(cid));
+        } else if (slot->child_count_ != child_count) {
+          ret = OB_INVALID_DATA;
+          LOG_WARN("[DISK_BBQ] inconsistent shared leaf posting count", K(ret), K(cid), K(child_count));
+        } else { ++slot->ref_count_; entry = slot; }
+      } else {
+        const int64_t bytes = sizeof(SharedLeaf) + cent_vec_dim_ * sizeof(float);
+        void *buf = sub_mem_ctx_->Allocate(bytes);
+        if (buf == nullptr) {
+          ret = OB_ALLOCATE_MEMORY_FAILED;
+          LOG_WARN("[DISK_BBQ] failed to allocate shared leaf vector", K(ret), K(cid), K(bytes));
+        } else {
+          entry = new (buf) SharedLeaf{cid, child_count, 1};
+          MEMCPY(entry + 1, vector, cent_vec_dim_ * sizeof(float));
+          slot = entry;
+          allocated = bytes + sizeof(int64_t); // ObIvfMemContext's allocation header.
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+void ObIvfSSTableCentCache::release_shared_leaf(SharedLeaf *entry)
+{
+  if (entry != nullptr) {
+    const int64_t idx = entry->cid_ - leaf_cid_base_;
+    SharedLeaf *retired = nullptr;
+    if (idx < 0 || idx >= shared_leaf_count_) {
+      LOG_ERROR_RET(OB_ERR_UNEXPECTED, "[DISK_BBQ] invalid released shared leaf", K(idx), K_(shared_leaf_count));
+    } else {
+      {
+        ObByteLockGuard guard(leaf_locks_[idx]);
+        if (shared_leaves_[idx] != entry || entry->ref_count_ == 0) {
+          LOG_ERROR_RET(OB_ERR_UNEXPECTED, "[DISK_BBQ] invalid shared leaf reference", K(idx), KP(entry));
+        } else if (--entry->ref_count_ == 0) {
+          shared_leaves_[idx] = nullptr;
+          retired = entry;
+        }
+      }
+      if (retired != nullptr) { retired->~SharedLeaf(); sub_mem_ctx_->Deallocate(retired); }
+    }
+  }
+}
+
+void ObIvfSSTableCentCache::release_shared_leaves()
+{
+  if (leaf_refs_ != nullptr) {
+    for (int64_t i = 0; i < count_; ++i) { parent_cache_->release_shared_leaf(leaf_refs_[i]); }
+    sub_mem_ctx_->Deallocate(leaf_refs_);
+    leaf_refs_ = nullptr;
+    parent_cache_->refresh_shared_memory();
+  }
+  parent_cache_ = nullptr;
+  parent_guard_.reset();
+  if (shared_leaves_ != nullptr) {
+    for (int64_t i = 0; i < shared_leaf_count_; ++i) {
+      if (shared_leaves_[i] != nullptr) {
+        LOG_ERROR_RET(OB_ERR_UNEXPECTED, "[DISK_BBQ] parent cache still has shared leaf references", K(i));
+      }
+    }
+    sub_mem_ctx_->Deallocate(shared_leaves_);
+    shared_leaves_ = nullptr;
+  }
+  if (leaf_locks_ != nullptr) {
+    for (int64_t i = 0; i < shared_leaf_count_; ++i) { leaf_locks_[i].~ObByteLock(); }
+    sub_mem_ctx_->Deallocate(leaf_locks_);
+    leaf_locks_ = nullptr;
+  }
+  shared_leaf_count_ = leaf_cid_base_ = 0;
+}
+
+int ObIvfSSTableCentCache::read_centroid(const int64_t cid, float *&vector,
+    const bool deep_copy, ObIAllocator *allocator, const SCN *read_scn)
+{
+  int ret = OB_SUCCESS;
+  if (leaf_refs_ == nullptr) {
+    ret = ObIvfCentCache::read_centroid(cid, vector, deep_copy, allocator, read_scn);
+  } else {
+    vector = nullptr;
+    int64_t slot = 0;
+    while (slot < count_ && leaf_refs_[slot]->cid_ != cid) { ++slot; }
+    if (!is_completed() || slot == count_) { ret = OB_ENTRY_NOT_EXIST; }
+    else if (!deep_copy) { vector = const_cast<float *>(leaf_refs_[slot]->vector()); }
+    else if (allocator == nullptr) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("[DISK_BBQ] missing centroid copy allocator", K(ret), K(cid));
+    } else if ((vector = static_cast<float *>(allocator->alloc(cent_vec_dim_ * sizeof(float)))) == nullptr) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("[DISK_BBQ] failed to copy shared centroid", K(ret), K(cid));
+    } else { MEMCPY(vector, leaf_refs_[slot]->vector(), cent_vec_dim_ * sizeof(float)); }
+  }
+  return ret;
+}
+
+void ObIvfSSTableCentCache::reuse()
+{
+  if (is_completed() || is_memory_registered()) {
+    LOG_ERROR_RET(OB_STATE_NOT_MATCH,
+                  "cannot reuse a completed or accounted IVF SSTable centroid cache");
+  } else {
+    WLockGuard guard(rwlock_);
+    if (OB_NOT_NULL(centroids_) && OB_NOT_NULL(sub_mem_ctx_)) {
+      sub_mem_ctx_->Deallocate(centroids_);
+      centroids_ = nullptr;
+    }
+    release_shared_leaves();
+    release_metadata();
+    group_id_ = 0;
+    capacity_ = nlist_ = 0;
+    count_ = 0;
+    cleanup_hgraph_index();
+    ObIvfICache::reuse();
+  }
+}
+
+int ObIvfSSTableCentCache::init(
+    ObIvfMemContext *parent_mem_ctx,
+    const IvfCacheKey &key,
+    const ObVectorIndexParam &param,
+  uint64_t *all_vsag_use_mem)
+{
+  int ret = OB_SUCCESS;
+  if (IVF_SSTABLE_CENTROID_CACHE != key.type_
+      || param.dim_ <= 0 || param.dim_ > INT32_MAX) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid IVF SSTable centroid cache metadata", KR(ret), K(key), K(param));
+  } else if (OB_FAIL(ObIvfICache::inner_init(parent_mem_ctx, all_vsag_use_mem))) {
+    LOG_WARN("failed to initialize IVF SSTable centroid cache memory context", KR(ret));
+  } else {
+    centroids_ = nullptr;
+    cent_vec_dim_ = static_cast<int>(param.dim_);
+    nlist_ = 0;
+    capacity_ = 0;
+    count_ = 0;
+    hgraph_index_ = nullptr;
+    hgraph_mem_ctx_ = nullptr;
+    key_ = key;
+    is_inited_ = true;
+  }
+  return ret;
+}
+
+int ObIvfSSTableCentCache::allocate_array(const int64_t centroid_count, const int64_t group_id)
+{
+  int ret = OB_SUCCESS;
+  if (!is_inited_ || IVF_SSTABLE_CENTROID_CACHE != get_cache_type()
+      || !is_writing()) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("invalid IVF SSTable centroid ARRAY allocation state",
+             KR(ret), K_(is_inited), "cache_type", get_cache_type(),
+             "is_writing", is_writing());
+  } else if (OB_NOT_NULL(centroids_) || leaf_refs_ != nullptr || 0 != count_
+             || 0 != capacity_ || 0 != nlist_) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("IVF SSTable centroid ARRAY is already allocated",
+             KR(ret), KP_(centroids), K_(count), K_(capacity), K_(nlist));
+  } else if (centroid_count <= 0 || centroid_count > INT32_MAX || group_id < 0
+             || cent_vec_dim_ <= 0 || OB_ISNULL(sub_mem_ctx_)
+             || centroid_count > INT64_MAX / cent_vec_dim_
+             || centroid_count * cent_vec_dim_
+                    > INT64_MAX / static_cast<int64_t>(sizeof(float))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid IVF SSTable centroid ARRAY metadata",
+             KR(ret), K(centroid_count), K_(cent_vec_dim), KP_(sub_mem_ctx));
+  } else if (parent_cache_ != nullptr) {
+    if (group_id <= 0) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("[DISK_BBQ] invalid shared group ID", K(ret), K(group_id));
+    } else if ((leaf_refs_ = static_cast<SharedLeaf **>(
+        sub_mem_ctx_->Allocate(centroid_count * sizeof(SharedLeaf *)))) == nullptr) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("[DISK_BBQ] failed to allocate child group references", K(ret), K(centroid_count), K(group_id));
+    } else {
+      MEMSET(leaf_refs_, 0, centroid_count * sizeof(SharedLeaf *));
+      group_id_ = group_id;
+      capacity_ = nlist_ = static_cast<int32_t>(centroid_count);
+    }
+  } else {
+    const int64_t element_count = centroid_count * cent_vec_dim_;
+    const int64_t alloc_size = element_count * sizeof(float);
+    if (OB_ISNULL(centroids_ = static_cast<float *>(sub_mem_ctx_->Allocate(alloc_size)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("[DISK_BBQ] failed to allocate centroid ARRAY", KR(ret), K(centroid_count),
+          K(group_id), K_(tenant_id), K_(cent_vec_dim), K(alloc_size));
+    } else if (OB_ISNULL(child_counts_ = static_cast<uint32_t *>(
+        sub_mem_ctx_->Allocate(centroid_count * sizeof(uint32_t))))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("[DISK_BBQ] failed to allocate centroid child counts", KR(ret),
+          K(centroid_count), K(group_id), K_(tenant_id), "alloc_size", centroid_count * sizeof(uint32_t));
+    } else if (group_id > 0 && OB_ISNULL(centroid_ids_ = static_cast<int64_t *>(
+        sub_mem_ctx_->Allocate(centroid_count * sizeof(int64_t))))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("[DISK_BBQ] failed to allocate centroid ID mapping", KR(ret),
+          K(centroid_count), K(group_id), K_(tenant_id), "alloc_size", centroid_count * sizeof(int64_t));
+    } else {
+      MEMSET(child_counts_, 0, centroid_count * sizeof(uint32_t));
+      group_id_ = group_id;
+      capacity_ = static_cast<int32_t>(centroid_count);
+      nlist_ = static_cast<int>(centroid_count);
+    }
+  }
+  return ret;
+}
+
+int ObIvfSSTableCentCache::write_centroid_with_real_idx(
+    const int64_t real_idx,
+    const float *centroid,
+    const int64_t length,
+    const SCN *create_scn)
+{
+  int ret = OB_SUCCESS;
+  if (!is_writing()) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("cannot write IVF SSTable centroid cache outside WRITING state",
+             KR(ret), K(real_idx));
+  } else if (OB_ISNULL(centroids_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("IVF SSTable centroid ARRAY is not allocated", KR(ret), K(real_idx));
+  } else if (OB_FAIL(ObIvfCentCache::write_centroid_with_real_idx(
+                 real_idx, centroid, length, create_scn))) {
+    LOG_WARN("failed to write IVF SSTable centroid cache", KR(ret), K(real_idx));
+  }
+  return ret;
 }
 
 /////////////////////////////////
@@ -485,6 +1002,11 @@ void ObIvfCentCache::reuse()
 }
 
 ObIvfCentCache::~ObIvfCentCache()
+{
+  release_centroid_memory();
+}
+
+void ObIvfCentCache::release_centroid_memory()
 {
   cleanup_hgraph_index();
   if (OB_NOT_NULL(centroids_) && OB_NOT_NULL(sub_mem_ctx_)) {
@@ -614,24 +1136,9 @@ int ObIvfCentCache::inner_read_centroid(int64_t centroid_idx, float *&centroid_v
   } else if (centroid_idx >= get_capacity()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("centroid idx is out of range", K(ret), K(centroid_idx));
-  } else if (centroids_ == nullptr) {
-    if (OB_ISNULL(hgraph_index_)) {
-      ret = OB_ENTRY_NOT_EXIST;
-      LOG_WARN("centroid buffer released before hgraph built", K(ret), K(centroid_idx));
-    } else {
-      // When reading from hgraph, we must use deep copy because the vectors pointer
-      // returned by get_raw_vector_by_ids points to memory owned by a temporary DatasetPtr
-      // that will be destroyed after the function returns. So allocator is always required.
-      if (OB_ISNULL(allocator)) {
-        ret = OB_ERR_NULL_VALUE;
-        LOG_WARN("allocator is required when reading from hgraph", K(ret), K(centroid_idx));
-      } else if (OB_FAIL(get_raw_vector_from_hgraph(centroid_idx, centroid_vec, allocator))) {
-        LOG_WARN("invalid centroid without cache buffer", K(ret), K(centroid_idx));
-      }
-    }
-  } else if (OB_ISNULL(centroids_ + centroid_idx)) {
-    ret = OB_ERR_NULL_VALUE;
-    LOG_WARN("invalid null centroid", K(ret), K(centroid_idx));
+  } else if (OB_ISNULL(centroids_)) {
+    ret = OB_ENTRY_NOT_EXIST;
+    LOG_WARN("centroid array is not available", K(ret), K(centroid_idx));
   } else if (deep_copy) {
     if (OB_ISNULL(allocator)) {
       ret = OB_ERR_NULL_VALUE;
@@ -666,12 +1173,39 @@ int ObIvfCentCache::read_centroid(int64_t centroid_idx, float *&centroid_vec,
   return inner_read_centroid(centroid_idx - 1, centroid_vec, deep_copy, allocator, read_scn);
 }
 
+int ObIvfCentCache::read_centroid_from_hgraph(int64_t centroid_idx, float *&centroid_vec,
+                                            vsag::Allocator &allocator)
+{
+  int ret = OB_SUCCESS;
+  centroid_vec = nullptr;
+  if (!is_completed()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("can not read cache that not completed", K(ret), K(centroid_idx));
+  } else if (centroid_idx <= 0 || centroid_idx > get_capacity()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("centroid idx is out of range", K(ret), K(centroid_idx));
+  } else if (OB_ISNULL(hgraph_index_)) {
+    ret = OB_ENTRY_NOT_EXIST;
+    LOG_WARN("hgraph index not built yet", K(ret), K(centroid_idx));
+  } else {
+    const int64_t vids[] = {centroid_idx};
+    if (OB_FAIL(obvectorutil::get_raw_vector_by_ids(
+            hgraph_index_, vids, 1, centroid_vec, &allocator))) {
+      LOG_WARN("fail to get raw vector by id from hgraph", K(ret), K(centroid_idx));
+    } else if (OB_ISNULL(centroid_vec)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("raw vector from hgraph is null", K(ret), K(centroid_idx));
+    }
+  }
+  return ret;
+}
+
 float* ObIvfCentCache::get_centroids()
 {
   return centroids_;
 }
 
-int ObIvfCentCache::get_centroids(ObIAllocator *allocator, float **vectors,
+int ObIvfCentCache::get_centroids_from_hgraph(vsag::Allocator *allocator, float **vectors,
                                  const SCN *read_scn /* = nullptr */)
 {
   int ret = OB_SUCCESS;
@@ -681,9 +1215,7 @@ int ObIvfCentCache::get_centroids(ObIAllocator *allocator, float **vectors,
     LOG_WARN("vectors pointer is null", K(ret));
   } else {
     *vectors = nullptr;
-    if (OB_NOT_NULL(centroids_)) {
-      *vectors = centroids_;
-    } else if (OB_ISNULL(hgraph_index_)) {
+    if (OB_ISNULL(hgraph_index_)) {
       ret = OB_ENTRY_NOT_EXIST;
       LOG_WARN("hgraph index not built yet when getting centroids", K(ret));
     } else if (count_ <= 0) {
@@ -707,8 +1239,7 @@ int ObIvfCentCache::get_centroids(ObIAllocator *allocator, float **vectors,
           ret = OB_INVALID_ARGUMENT;
           LOG_WARN("allocator is required for get_raw_vector_by_ids", K(ret), KP(allocator));
         } else if (OB_FAIL(obvectorutil::get_raw_vector_by_ids(hgraph_index_, ids, count_, raw_vectors, 
-                                                         allocator, cent_vec_dim_))) {
-          ret = OB_ERR_UNEXPECTED;
+                                                         allocator))) {
           LOG_WARN("fail to get raw vectors by ids from hgraph", K(ret), K(count_));
         } else if (OB_ISNULL(raw_vectors)) {
           ret = OB_ERR_UNEXPECTED;
@@ -775,35 +1306,6 @@ int64_t ObIvfCentCache::get_expect_memory_used(
     }
   }
   return usage;
-}
-
-int ObIvfCentCache::get_raw_vector_from_hgraph(int64_t centroid_idx, float *&centroid_vec,
-                                                ObIAllocator *allocator)
-{
-  int ret = OB_SUCCESS;
-  centroid_vec = nullptr;
-  if (OB_ISNULL(hgraph_index_)) {
-    ret = OB_ENTRY_NOT_EXIST;
-    LOG_WARN("hgraph index not built yet", K(ret), K(centroid_idx));
-  } else {
-    int64_t vids[1];
-    vids[0] = centroid_idx + 1;
-    float *vectors = nullptr;
-    if (OB_ISNULL(allocator)) {
-      ret = OB_INVALID_ARGUMENT;
-      LOG_WARN("allocator is required for get_raw_vector_from_hgraph", K(ret), K(centroid_idx));
-    } else if (OB_FAIL(obvectorutil::get_raw_vector_by_ids(hgraph_index_, vids, 1, vectors, 
-                                                             allocator, cent_vec_dim_))) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("fail to get raw vector by id from hgraph", K(ret), K(centroid_idx));
-    } else if (OB_ISNULL(vectors)) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("raw vector from hgraph is null", K(ret), K(centroid_idx));
-    } else {
-      centroid_vec = vectors;
-    }
-  }
-  return ret;
 }
 
 int ObIvfCentCache::build_hgraph_index(const ObVectorIndexParam &param,
@@ -975,6 +1477,148 @@ int ObIvfCentCache::build_hgraph_and_release_centers(const ObVectorIndexParam &p
   }
   if (OB_SUCC(ret) && OB_FAIL(release_centroids())) {
     LOG_WARN("fail to release centroids after hgraph build", K(ret));
+  }
+  return ret;
+}
+
+bool ObIvfSSTableCentCache::can_build_hgraph()
+{
+  omt::ObTenantConfigGuard config(TENANT_CONF(tenant_id_));
+  const int64_t threshold = config.is_valid()
+      ? static_cast<int64_t>(config->_disk_bbq_centroid_hgraph_threshold)
+      : ObVecIdxExtraInfo::IVF_CENTERS_HGRAPH_THRESHOLD;
+  return get_cache_type() == IvfCacheType::IVF_SSTABLE_CENTROID_CACHE
+      && group_id_ == 0 && threshold > 0 && get_count() >= threshold;
+}
+
+int ObIvfSSTableCentCache::build_sstable_hgraph(const ObVectorIndexParam &param)
+{
+  int ret = OB_SUCCESS;
+  const float *centroids = nullptr;
+  common::obvsag::VectorIndexPtr existing_hgraph = nullptr;
+  int64_t count = 0;
+  int64_t dim = 0;
+  bool build_allowed = false;
+  common::obvsag::VectorIndexPtr new_hgraph = nullptr;
+  ObVsagMemContext *new_mem_ctx = nullptr;
+  void *mem_ctx_buf = nullptr;
+  int64_t *ids = nullptr;
+  ObVectorIndexParam hgraph_param = param;
+
+  {
+    RLockGuard guard(rwlock_);
+    if (IVF_SSTABLE_CENTROID_CACHE != get_cache_type() || group_id_ != 0) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid cache type for IVF SSTable HGraph build",
+               KR(ret), "cache_type", get_cache_type());
+    } else if (!is_completed()) {
+      ret = OB_ENTRY_NOT_EXIST;
+    } else if (OB_NOT_NULL(hgraph_index_)) {
+      existing_hgraph = hgraph_index_;
+    } else if (OB_ISNULL(centroids_) || count_ <= 0 || count_ != capacity_
+               || cent_vec_dim_ <= 0) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid ARRAY representation of IVF SSTable centroid cache", KR(ret),
+               KP_(centroids), K_(count), K_(cent_vec_dim));
+    } else {
+      centroids = centroids_;
+      count = count_;
+      dim = cent_vec_dim_;
+      // Snapshot eligibility once so a concurrent configuration change cannot
+      // start a graph build without its memory context having been allocated.
+      build_allowed = can_build_hgraph();
+    }
+  }
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to read IVF SSTable centroid cache for HGraph build", KR(ret));
+  } else if (OB_NOT_NULL(existing_hgraph)) {
+    // Another completed build already published the graph.
+  } else if (!build_allowed) {
+  } else if (OB_ISNULL(sub_mem_ctx_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("IVF SSTable centroid cache memory context is null",
+             KR(ret), K(count), K(dim));
+  } else if (OB_ISNULL(mem_ctx_buf = sub_mem_ctx_->Allocate(sizeof(ObVsagMemContext)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate IVF SSTable HGraph memory context",
+             KR(ret), "alloc_size", sizeof(ObVsagMemContext));
+  } else {
+    new_mem_ctx = new (mem_ctx_buf) ObVsagMemContext(sub_mem_ctx_->get_all_vsag_use_mem());
+    if (OB_FAIL(new_mem_ctx->init(sub_mem_ctx_->get_mem_context(),
+                                 sub_mem_ctx_->get_all_vsag_use_mem(),
+                                 tenant_id_, "IvfSSTHgraph"))) {
+      LOG_WARN("failed to init IVF SSTable HGraph memory context", KR(ret));
+    }
+  }
+
+  if (OB_SUCC(ret) && OB_ISNULL(existing_hgraph)
+      && build_allowed) {
+    hgraph_param.dim_ = dim;
+    hgraph_param.nlist_ = count;
+    const char *metric = VEC_INDEX_ALGTH[hgraph_param.dist_algorithm_];
+    const bool store_raw_vector =
+        hgraph_param.dist_algorithm_ == ObVectorIndexDistAlgorithm::VIDA_COS;
+    lib::ObLightBacktraceGuard light_backtrace_guard(false);
+    if (OB_FAIL(obvectorutil::create_index(
+            new_hgraph, hgraph_param.type_, "float32", metric, dim,
+            hgraph_param.m_, hgraph_param.ef_construction_, hgraph_param.ef_search_,
+            new_mem_ctx, hgraph_param.extra_info_actual_size_, hgraph_param.refine_type_,
+            hgraph_param.bq_bits_query_, hgraph_param.bq_use_fht_, store_raw_vector))) {
+      LOG_WARN("failed to create IVF SSTable HGraph", KR(ret), K(count), K(dim));
+    } else if (OB_ISNULL(ids = static_cast<int64_t *>(
+                   sub_mem_ctx_->Allocate(sizeof(int64_t) * count)))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate IVF SSTable HGraph centroid ids",
+               KR(ret), K(count));
+    } else {
+      for (int64_t i = 0; i < count; ++i) {
+        ids[i] = i + 1;
+      }
+      if (OB_FAIL(obvectorutil::build_index(
+              new_hgraph, const_cast<float *>(centroids), ids, dim, count, nullptr))) {
+        LOG_WARN("failed to build IVF SSTable HGraph", KR(ret), K(count), K(dim));
+      }
+    }
+  }
+
+  if (OB_NOT_NULL(ids) && OB_NOT_NULL(sub_mem_ctx_)) {
+    sub_mem_ctx_->Deallocate(ids);
+    ids = nullptr;
+  }
+
+  if (OB_SUCC(ret) && OB_NOT_NULL(new_hgraph)) {
+    WLockGuard guard(rwlock_);
+    if (!is_completed()) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_WARN("IVF SSTable centroid cache became incomplete during HGraph build",
+               KR(ret), K(count), K(dim));
+    } else if (OB_NOT_NULL(hgraph_index_)) {
+      // Another builder has already completed the one-way representation switch.
+    } else if (centroids_ != centroids || OB_ISNULL(centroids_)) {
+      ret = OB_STATE_NOT_MATCH;
+      LOG_WARN("IVF SSTable ARRAY changed during HGraph build", KR(ret),
+               KP(centroids), KP_(centroids));
+    } else {
+      hgraph_index_ = new_hgraph;
+      hgraph_mem_ctx_ = new_mem_ctx;
+      new_hgraph = nullptr;
+      new_mem_ctx = nullptr;
+      mem_ctx_buf = nullptr;
+      sub_mem_ctx_->Deallocate(centroids_);
+      centroids_ = nullptr;
+    }
+  }
+
+  if (OB_NOT_NULL(new_hgraph)) {
+    obvectorutil::delete_index(new_hgraph);
+    new_hgraph = nullptr;
+  }
+  if (OB_NOT_NULL(new_mem_ctx)) {
+    new_mem_ctx->~ObVsagMemContext();
+    if (OB_NOT_NULL(sub_mem_ctx_)) {
+      sub_mem_ctx_->Deallocate(mem_ctx_buf);
+    }
+    new_mem_ctx = nullptr;
   }
   return ret;
 }

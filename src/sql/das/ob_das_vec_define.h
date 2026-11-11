@@ -88,6 +88,13 @@ public:
   inline bool filter_in_hnsw_iter() const { return ObVecIndexType::VEC_INDEX_PRE == vec_type_ || ObVecIndexType::VEC_INDEX_POST_ITERATIVE_FILTER == vec_type_; }
   inline void set_can_use_vec_pri_opt(bool can_use_vec_pri_opt) {can_use_vec_pri_opt_ = can_use_vec_pri_opt;}
   inline bool can_use_vec_pri_opt() const { return can_use_vec_pri_opt_; }
+  inline bool is_async_ivf_pre_filter_path() const
+  {
+    return is_async_index_
+        && (ObVecIndexType::VEC_INDEX_PRE == vec_type_
+            || (ObVecIndexType::VEC_INDEX_ADAPTIVE_SCAN == vec_type_
+                && ObVecIdxAdaTryPath::VEC_INDEX_PRE_FILTER == adaptive_try_path_));
+  }
   inline bool is_hnsw() const
   {
     return algorithm_type_ == ObVectorIndexAlgorithmType::VIAT_HNSW ||
@@ -175,6 +182,24 @@ public:
     return static_cast<const ObDASFuncLookupCtDef*>(func_ctdef);
   }
 
+  const ObDASScanCtDef *get_async_ivf_index_scan_ctdef() const
+  {
+    return is_async_index_
+        ? get_vec_aux_tbl_ctdef(
+              ObVecAuxTableIdx::FIRST_VEC_AUX_TBL_IDX,
+              ObTSCIRScanType::OB_VEC_ASYNC_IVF_INDEX_SCAN)
+        : nullptr;
+  }
+
+  const ObDASScanCtDef *get_async_delete_scan_ctdef() const
+  {
+    return is_async_index_
+        ? get_vec_aux_tbl_ctdef(
+              ObVecAuxTableIdx::SECOND_VEC_AUX_TBL_IDX,
+              ObTSCIRScanType::OB_ASYNC_INDEX_DELETE_SCAN)
+        : nullptr;
+  }
+
   INHERIT_TO_STRING_KV("ObDASBaseCtDef", ObDASBaseCtDef,
                        KPC_(inv_scan_vec_id_col), K_(vec_index_param), K_(dim), 
                        K_(vec_type), K_(algorithm_type), K_(selectivity), K_(row_count),
@@ -182,7 +207,8 @@ public:
                        K_(vector_index_param), K_(adaptive_try_path), K_(is_multi_value_index),
                        K_(is_spatial_index), K_(can_extract_range), K_(is_hybrid),
                        K_(all_filters_can_be_picked_out), K_(use_rowkey_vid_tbl), K_(strategy),
-                       K_(pre_filtering_timeout), K_(has_upper_topn));
+                       K_(pre_filtering_timeout), K_(has_upper_topn), K_(is_async_index),
+                       K_(is_adaptive_specify_by_hint));
 
   ObExpr *inv_scan_vec_id_col_;
   ObString vec_index_param_;
@@ -239,7 +265,8 @@ public:
     const ObDASVecAuxScanCtDef *ctdef = static_cast<const ObDASVecAuxScanCtDef *>(ctdef_);
     const int64_t rtdef_idx = ctdef->get_functial_lookup_idx();
     ObDASFuncLookupRtDef* rtdef = nullptr;
-    if (children_cnt_ > rtdef_idx && children_ != nullptr && OB_NOT_NULL(ctdef->get_functional_lookup_ctdef())) {
+    if (children_cnt_ > rtdef_idx && children_ != nullptr
+        && OB_NOT_NULL(ctdef->get_functional_lookup_ctdef())) {
       rtdef = static_cast<ObDASFuncLookupRtDef*>(children_[rtdef_idx]);
     }
     return rtdef;
@@ -263,6 +290,23 @@ public:
     }
     return rtdef;
   }
+
+  ObDASScanRtDef *get_async_ivf_index_scan_rtdef() const
+  {
+    const ObDASVecAuxScanCtDef *ctdef = static_cast<const ObDASVecAuxScanCtDef *>(ctdef_);
+    return OB_NOT_NULL(ctdef) && ctdef->is_async_index_
+        ? get_vec_aux_tbl_rtdef(ObVecAuxTableIdx::FIRST_VEC_AUX_TBL_IDX)
+        : nullptr;
+  }
+
+  ObDASScanRtDef *get_async_delete_scan_rtdef() const
+  {
+    const ObDASVecAuxScanCtDef *ctdef = static_cast<const ObDASVecAuxScanCtDef *>(ctdef_);
+    return OB_NOT_NULL(ctdef) && ctdef->is_async_index_
+        ? get_vec_aux_tbl_rtdef(ObVecAuxTableIdx::SECOND_VEC_AUX_TBL_IDX)
+        : nullptr;
+  }
+
 };
 
 } // namespace sql

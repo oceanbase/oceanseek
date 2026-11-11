@@ -60,6 +60,10 @@ int ObAtomicProtocolType::get_ss_meta_ctrl_type(ObSSMetaCtrlType &ctrl_type)
       ctrl_type.type_ = blocksstable::ObStorageObjectType::SHARED_MAJOR_SSTABLE_CTRL;
       break;
     }
+    case ObAtomicProtocolTypeEnum::NON_IDEM_MAJOR_SSTABLE: {
+      ctrl_type.type_ = blocksstable::ObStorageObjectType::SHARED_NON_IDEM_MAJOR_SSTABLE_CTRL;
+      break;
+    }
     case ObAtomicProtocolTypeEnum::CHECKPOINT: {
       ctrl_type.type_ = blocksstable::ObStorageObjectType::SHARED_LS_CKPT;
       break;

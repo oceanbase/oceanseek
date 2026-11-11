@@ -196,6 +196,9 @@ static const uint64_t OB_MIN_ID  = 0;//used for lower_bound
 #define GENERATED_VEC_VISIBLE_COLUMN_FLAG (INT64_C(1) << 55)
 #define GENERATED_FTS_POS_LIST_COLUMN_FLAG (INT64_C(1) << 56)
 #define GENERATED_VEC_IVF_CENTER_STATE_COLUMN_FLAG (INT64_C(1) << 57)
+#define GENERATED_VEC_IVF_TYPE_COLUMN_FLAG (INT64_C(1) << 58)
+#define GENERATED_VEC_IVF_CID_COLUMN_FLAG (INT64_C(1) << 59)
+#define GENERATED_VEC_IVF_DATA_COLUMN_FLAG (INT64_C(1) << 60)
 #define SPATIAL_COLUMN_SRID_MASK (0xffffffffffffffe0L)
 
 #define STORED_COLUMN_FLAGS_MASK 0xFFFFFFFF
@@ -1250,17 +1253,49 @@ inline bool is_async_delete_index(const ObIndexType index_type)
   return INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL == index_type;
 }
 
+inline bool is_async_ivf_index(const ObIndexType index_type)
+{
+  return INDEX_TYPE_ASYNC_IVF_INDEX_LOCAL == index_type;
+}
+
+// User-defined asynchronous vector index types. Keep this grouped predicate so
+// future async vector algorithms do not have to be added at every call site.
+inline bool is_async_vec_index(const ObIndexType index_type)
+{
+  return is_async_ivf_index(index_type);
+}
+
+// Vector-index schema paths shared by synchronous and user-defined asynchronous
+// vector indexes. Internal async-index auxiliary tables are intentionally excluded.
+inline bool is_vec_or_async_vec_index(const ObIndexType index_type)
+{
+  return is_vec_index(index_type) || is_async_vec_index(index_type);
+}
+
+// User-defined async indexes exposed by DDL and SHOW INDEX. This excludes the
+// internal auxiliary index tables maintained by the async-index framework.
+inline bool is_user_defined_async_index(const ObIndexType index_type)
+{
+  return is_async_fts_index(index_type) || is_async_ivf_index(index_type);
+}
+
+// Internal auxiliary index table types maintained for user-defined async indexes.
+inline bool is_async_index_aux(const ObIndexType index_type)
+{
+  return is_async_delete_index(index_type);
+}
+
 // Excludes physical auxiliary tables.
 inline bool is_async_logical_index(const ObIndexType index_type)
 {
-  return is_async_fts_index(index_type) || is_async_search_def_index(index_type);
+  return is_user_defined_async_index(index_type) || is_async_search_def_index(index_type);
 }
 
 // Schema-level async index family, including logical definitions and physical auxiliary tables.
 inline bool is_async_index(const ObIndexType index_type)
 {
-  return is_async_fts_index(index_type)
-      || is_async_delete_index(index_type)
+  return is_user_defined_async_index(index_type)
+      || is_async_index_aux(index_type)
       || is_async_search_index(index_type);
 }
 
@@ -1268,7 +1303,8 @@ inline bool is_async_index_refresh_target(const ObIndexType index_type)
 {
   return is_async_fts_index(index_type)
       || is_async_search_data_index(index_type)
-      || is_async_delete_index(index_type);
+      || is_async_delete_index(index_type)
+      || is_async_ivf_index(index_type);
 }
 
 inline bool is_async_inverted_storage_index(const ObIndexType index_type)

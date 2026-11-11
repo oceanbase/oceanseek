@@ -1934,7 +1934,7 @@ int ObAsyncIndexCompactionTest::execute_async_index_merge_via_scheduler(
       ls_handle.get_ls()->get_ls_id(), *fts_handle.get_obj(), merge_type,
       merge_snapshot, exec_mode, param, merge_base_snapshot))) {
     LOG_WARN("failed to fill async index merge param", KR(ret));
-  } else if (!param.is_inv_index_) {
+  } else if (!param.is_use_async_index_dag_) {
     ret = OB_ERR_UNEXPECTED;
   } else {
     // Explicit async-index DAGs do not depend on could_major_merge_start().
@@ -1997,7 +1997,7 @@ int ObAsyncIndexCompactionTest::resolve_inc_major_merge_snapshot(
   merge_base_snapshot = 0;
   input_table_cnt = 0;
   param.merge_type_ = INC_MAJOR_MERGE;
-  if (tablet.is_async_inverted_storage_index()) {
+  if (tablet.is_async_index_storage_tablet()) {
     const int64_t last_major_snapshot = tablet.get_last_major_snapshot_version();
     int64_t max_published_version = 0;
     if (last_major_snapshot <= 0) {
@@ -6918,7 +6918,7 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_common_checkpoint_and_major_reten
     int64_t kept = INT64_MAX;
     ASSERT_EQ(OB_SUCCESS, handle.get_obj()->get_kept_snapshot_for_async_index(kept));
     ASSERT_EQ(caps[i], kept);
-    if (handle.get_obj()->is_async_inverted_storage_index()) {
+    if (handle.get_obj()->is_async_index_storage_tablet()) {
       ASSERT_GE(handle.get_obj()->get_snapshot_version(), caps[i]);
     }
   }
@@ -7137,7 +7137,7 @@ TEST_F(ObAsyncIndexCompactionTest, async_delete_gc_preserves_merge_and_refresh_p
   ASSERT_EQ(OB_SUCCESS, ObDagParamFunc::fill_param(
       ctx.ls_id_, *after_gc.get_obj(), MEDIUM_MERGE, published, EXEC_MODE_LOCAL,
       dag_param, 0 /*merge_base_version*/));
-  ASSERT_FALSE(dag_param.is_inv_index_);
+  ASSERT_FALSE(dag_param.is_use_async_index_dag_);
   const auto completion = std::make_shared<AsyncIndexMergeCompletion>();
   ObDagId dag_id;
   ObTenantTabletScheduler *scheduler = MTL(ObTenantTabletScheduler *);
@@ -8960,7 +8960,8 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_commit_replay_before_historical_c
     ObDDLIncMajorCommitReplayExecutor replay;
     ASSERT_EQ(OB_SUCCESS, replay.init(ls_handle.get_ls(), tablet_id, commit_scn,
         import_tx, import_seq, wide_snapshot, data_version,
-        false /*rollback*/, false /*co_sstable*/, original_buffer, original->get_start_scn(),
+        false /*rollback*/, false /*co_sstable*/, original->get_table_type(),
+        original_buffer, original->get_start_scn(),
         false /*need_check_ddl_checkpoint*/));
     ASSERT_EQ(OB_SUCCESS, replay.do_replay_(local));
     const ObSSTable *replayed_tables[] = {wide};
@@ -8986,7 +8987,8 @@ TEST_F(ObAsyncIndexCompactionTest, async_index_commit_replay_before_historical_c
     ObDDLIncMajorCommitReplayExecutor later_replay;
     ASSERT_EQ(OB_SUCCESS, later_replay.init(ls_handle.get_ls(), tablet_id, later_commit,
         transaction::ObTransID(102), transaction::ObTxSEQ(202, 0), later_snapshot, data_version,
-        false /*rollback*/, false /*co_sstable*/, later_buffer, later->get_start_scn(),
+        false /*rollback*/, false /*co_sstable*/, later->get_table_type(),
+        later_buffer, later->get_start_scn(),
         false /*need_check_ddl_checkpoint*/));
     ASSERT_EQ(OB_SUCCESS, later_replay.do_replay_(local));
     ObTabletSSLinkMajorTask older(ctx.ls_id_, tablet_id, narrow_snapshot,

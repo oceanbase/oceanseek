@@ -7,6 +7,7 @@
 
 #include "storage/compaction/ob_async_index_merge_task.h"
 #include "share/ob_debug_sync.h"
+#include "lib/utility/ob_tracepoint.h"
 
 namespace oceanbase
 {
@@ -15,6 +16,8 @@ using namespace share;
 using namespace blocksstable;
 namespace compaction
 {
+
+ERRSIM_POINT_DEF(EN_ASYNC_IVF_MERGE_BEFORE_PUBLISH_FAIL);
 
 ObAsyncIndexMergePrepareTask::ObAsyncIndexMergePrepareTask()
   : ObITask(ObITask::TASK_TYPE_SSTABLE_MERGE_PREPARE),
@@ -90,11 +93,18 @@ int ObAsyncIndexMergeFinishTask::process()
   } else {
     ObAsyncIndexMergeCtx *ctx = static_cast<ObAsyncIndexMergeCtx *>(merge_dag_->get_ctx());
     SET_MEM_CTX(ctx->mem_ctx_);
-    DEBUG_SYNC(BEFORE_ASYNC_INDEX_MERGE_UPDATE_TABLET);
-    if (OB_FAIL(ctx->update_tablet_after_merge())) {
-      LOG_WARN("failed to update tablet after async index merge", K(ret), KPC(ctx));
-    } else {
-      LOG_INFO("success to update tablet after async index merge", K(ret), KPC(ctx));
+    if (ctx->get_schema()->is_async_ivf_index()) {
+      if (OB_FAIL(EVENT_CALL(EN_ASYNC_IVF_MERGE_BEFORE_PUBLISH_FAIL, ctx->get_tablet_id().id()))) {
+        LOG_WARN("injected IVF merge failure before publication", K(ret), KPC(ctx));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      DEBUG_SYNC(BEFORE_ASYNC_INDEX_MERGE_UPDATE_TABLET);
+      if (OB_FAIL(ctx->update_tablet_after_merge())) {
+        LOG_WARN("failed to update tablet after async index merge", K(ret), KPC(ctx));
+      } else {
+        LOG_INFO("success to update tablet after async index merge", K(ret), KPC(ctx));
+      }
     }
   }
   return ret;
@@ -174,15 +184,23 @@ int ObAsyncIndexMergeTask::generate_next_task(ObITask *&next_task)
 }
 
 ObAsyncIndexMergeDag::ObAsyncIndexMergeDag(const share::ObDagType::ObDagTypeEnum type)
-  : ObTabletMergeDag(type)
+  : ObTabletMergeDag(type),
+    ivf_merge_dag_ctx_()
 {
+}
+
+ObAsyncIndexMergeDag::~ObAsyncIndexMergeDag()
+{
+  if (ivf_merge_dag_ctx_.has_monitor()) {
+    clear_task_list_with_lock();
+  }
 }
 
 int ObAsyncIndexMergeDag::init_by_param(const share::ObIDagInitParam *param)
 {
   int ret = ObTabletMergeDag::init_by_param(param);
   if (OB_FAIL(ret)) {
-  } else if (!get_param().is_inv_index_) {
+  } else if (!get_param().is_use_async_index_dag_) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("unexpected param for async index merge dag", K(ret), K(get_param()));
   }
@@ -204,20 +222,44 @@ int ObAsyncIndexMergeDag::create_first_task()
 int ObAsyncIndexMergeDag::generate_merge_task(ObBasicTabletMergeCtx &ctx, share::ObITask *prepare_task)
 {
   int ret = OB_SUCCESS;
+  ObAsyncIndexMergeCtx &async_index_ctx = static_cast<ObAsyncIndexMergeCtx &>(ctx);
+  SET_MEM_CTX(ctx.mem_ctx_);
+  if (async_index_ctx.get_schema()->is_async_ivf_index()) {
+    DEBUG_SYNC(AFTER_ASYNC_IVF_MERGE_INPUT_SELECTED);
+    if (OB_ISNULL(prepare_task)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("async index merge prepare task is null", K(ret));
+    } else if (OB_FAIL(ivf_merge_dag_ctx_.start(
+        *this, async_index_ctx, *prepare_task))) {
+      LOG_WARN("failed to start IVF merge DAG", K(ret), K(async_index_ctx));
+    }
+  } else {
+    if (OB_FAIL(generate_inv_merge_task(async_index_ctx, prepare_task))) {
+      LOG_WARN("failed to generate INV merge task", K(ret), K(async_index_ctx));
+    }
+  }
+  return ret;
+}
+
+int ObAsyncIndexMergeDag::generate_inv_merge_task(
+    ObAsyncIndexMergeCtx &ctx,
+    share::ObITask *prepare_task)
+{
+  int ret = OB_SUCCESS;
   ObAsyncIndexMergeTask *merge_task = nullptr;
   ObAsyncIndexMergeFinishTask *finish_task = nullptr;
-  SET_MEM_CTX(ctx.mem_ctx_);
   const int64_t start_task_idx = ctx.get_start_task_idx();
   if (start_task_idx < 0 || start_task_idx > ctx.get_concurrent_cnt()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected start task idx", K(ret), K(start_task_idx), K(ctx.get_concurrent_cnt()));
   } else if (start_task_idx == ctx.get_concurrent_cnt()) {
-    LOG_INFO("all merge task finish, just create finish task", K(ret), K(start_task_idx), K(ctx.get_concurrent_cnt()));
+    LOG_INFO("all merge task finish, just create finish task",
+        K(ret), K(start_task_idx), K(ctx.get_concurrent_cnt()));
     if (OB_FAIL(create_task(prepare_task, finish_task))) {
       LOG_WARN("failed to create async index finish task", K(ret), K(ctx));
     }
   } else if (OB_FAIL(create_task(
-      prepare_task, merge_task, start_task_idx, static_cast<ObAsyncIndexMergeCtx &>(ctx)))) {
+      prepare_task, merge_task, start_task_idx, ctx))) {
     LOG_WARN("failed to create async index merge task", K(ret), K(start_task_idx), K(ctx));
   } else if (OB_FAIL(create_task(merge_task, finish_task))) {
     LOG_WARN("failed to create async index finish task", K(ret), K(ctx));

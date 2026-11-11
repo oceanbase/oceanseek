@@ -6,8 +6,10 @@
 #define USING_LOG_PREFIX SQL_DAS
 
 #include "sql/das/search/ob_das_async_index_query_ctx.h"
+#include "sql/das/iter/ob_das_vec_index_scan_iter.h"
 #include "sql/das/ob_das_ir_define.h"
 #include "sql/das/ob_das_utils.h"
+#include "sql/das/ob_das_vec_define.h"
 #include "sql/das/search/ob_das_boolean_query.h"
 #include "sql/das/search/ob_das_scalar_define.h"
 #include "sql/session/ob_sql_session_info.h"
@@ -250,6 +252,23 @@ static int analyze_async_index_domain_impl(
   if (OB_ISNULL(ctdef)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("null ctdef for async index domain analysis", K(ret));
+  } else if (DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN == ctdef->op_type_) {
+    const auto *scan = static_cast<const ObDASVecIndexAsyncIVFScanCtDef *>(ctdef)->get_index_scan_ctdef();
+    if (nullptr == scan) { ret = OB_ERR_UNEXPECTED; }
+    else if (OB_FAIL(add_async_index_table_id(scan->ref_table_id_, table_ids))) {
+      LOG_WARN("failed to analyze async IVF logical leaf", K(ret));
+    }
+  } else if (DAS_OP_VEC_INDEX_DRIVER == ctdef->op_type_ && ctdef->children_cnt_ > 0
+             && nullptr != ctdef->children_ && nullptr != ctdef->children_[0]
+             && DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN == ctdef->children_[0]->op_type_) {
+    // Catalog alignment includes the logical IVF leaf and its actual filter domain.
+    // Its physical index/delete children are atomic; they are not Search branches.
+    for (int64_t i = 0; OB_SUCC(ret) && i < ctdef->children_cnt_; ++i) {
+      if (OB_FAIL(SMART_CALL(analyze_async_index_domain_impl(ctdef->children_[i], table_ids,
+          branch_counts, analyze_ctx, in_nested_scope, in_async_wrapper, count_semantic_roots)))) {
+        LOG_WARN("failed to analyze async IVF driver domain", K(ret), K(i));
+      }
+    }
   } else if (DAS_OP_IR_SCAN == ctdef->op_type_) {
     analyze_ctx.is_pure_range_subtree_ = false;
     const ObDASIRScanCtDef *ir_ctdef = static_cast<const ObDASIRScanCtDef *>(ctdef);
@@ -561,6 +580,12 @@ static int collect_async_wrappers(
   if (OB_ISNULL(ctdef)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("null ctdef while collecting async wrappers", K(ret));
+  } else if (DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN == ctdef->op_type_) {
+    const auto *scan = static_cast<const ObDASVecIndexAsyncIVFScanCtDef *>(ctdef)->get_index_scan_ctdef();
+    if (nullptr == scan) { ret = OB_ERR_UNEXPECTED; }
+    else if (OB_FAIL(add_async_index_table_id(scan->ref_table_id_, table_ids))) {
+      LOG_WARN("failed to collect async IVF index", K(ret));
+    } else { ++wrapper_cnt; }
   } else if (is_async_fts_wrapper(ctdef)) {
     ObSEArray<uint64_t, 2> wrapper_table_ids;
     ObDASAsyncIndexDomainAnalyzeCtx analyze_ctx;
@@ -610,20 +635,22 @@ static int collect_async_wrappers(
   return ret;
 }
 
-static bool contains_async_index_query_impl(const ObDASBaseCtDef *ctdef)
+static bool is_shared_async_index_query_node(const ObDASBaseCtDef *ctdef)
+{
+  return DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN == ctdef->op_type_ || is_async_fts_wrapper(ctdef)
+      || (DAS_OP_IR_SCAN == ctdef->op_type_
+          && static_cast<const ObDASIRScanCtDef *>(ctdef)->is_async_index_)
+      || (DAS_OP_SCALAR_SCAN_QUERY == ctdef->op_type_
+          && static_cast<const ObDASScalarScanCtDef *>(ctdef)->is_async_index_);
+}
+
+bool ObDASAsyncIndexQueryCtx::contains_shared_async_index_query(const ObDASBaseCtDef *ctdef)
 {
   bool found = false;
   if (OB_NOT_NULL(ctdef)) {
-    if (is_async_fts_wrapper(ctdef)
-        || (DAS_OP_IR_SCAN == ctdef->op_type_
-            && static_cast<const ObDASIRScanCtDef *>(ctdef)->is_async_index_)) {
-      found = true;
-    } else if (DAS_OP_SCALAR_SCAN_QUERY == ctdef->op_type_
-        && static_cast<const ObDASScalarScanCtDef *>(ctdef)->is_async_index_) {
-      found = true;
-    }
+    found = is_shared_async_index_query_node(ctdef);
     for (int64_t i = 0; !found && i < ctdef->children_cnt_; ++i) {
-      found = contains_async_index_query_impl(ctdef->children_[i]);
+      found = contains_shared_async_index_query(ctdef->children_[i]);
     }
   }
   return found;
@@ -649,9 +676,18 @@ int ObDASAsyncIndexQueryCtx::check_tx_isolation(const ObSQLSessionInfo *session)
   return ret;
 }
 
-bool ObDASAsyncIndexQueryCtx::contains_async_index_query(const ObDASBaseCtDef *ctdef)
+bool ObDASAsyncIndexQueryCtx::contains_async_index_access(const ObDASBaseCtDef *ctdef)
 {
-  return contains_async_index_query_impl(ctdef);
+  bool found = false;
+  if (OB_NOT_NULL(ctdef)) {
+    found = is_shared_async_index_query_node(ctdef)
+        || (DAS_OP_VEC_SCAN == ctdef->op_type_
+            && static_cast<const ObDASVecAuxScanCtDef *>(ctdef)->is_async_index_);
+    for (int64_t i = 0; !found && i < ctdef->children_cnt_; ++i) {
+      found = contains_async_index_access(ctdef->children_[i]);
+    }
+  }
+  return found;
 }
 
 int ObDASAsyncIndexQueryCtx::collect_async_index_table_ids(
@@ -697,6 +733,11 @@ static int collect_async_delete_table_id_from_ctdef(
   int ret = OB_SUCCESS;
   if (OB_ISNULL(ctdef)) {
     // skip
+  } else if (DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN == ctdef->op_type_) {
+    const auto *scan = static_cast<const ObDASVecIndexAsyncIVFScanCtDef *>(ctdef)->get_delete_scan_ctdef();
+    if (nullptr == scan) { ret = OB_ERR_UNEXPECTED; }
+    else if (OB_INVALID_ID == delete_table_id) { delete_table_id = scan->ref_table_id_; }
+    else if (delete_table_id != scan->ref_table_id_) { ret = OB_ERR_UNEXPECTED; }
   } else if (DAS_OP_BOOLEAN_QUERY == ctdef->op_type_
              && static_cast<const ObDASBooleanQueryCtDef *>(ctdef)->is_async()) {
     const ObDASBooleanQueryCtDef *boolean_ctdef =

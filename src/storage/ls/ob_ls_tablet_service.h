@@ -110,6 +110,7 @@ class ObTableScanRange;
 class ObTabletCreateDeleteMdsUserData;
 class ObBlockStatScanParam;
 class ObBlockStatIterator;
+class ObIvfSSTableScanIter;
 struct ObMultiRangeEstimation;
 
 struct ObITabletIDFilter
@@ -581,6 +582,10 @@ public:
       ObTableScanParam &scan_param,
       blocksstable::ObInvRangeScanParam &range_param,
       blocksstable::ObInvSSTableRangeIter *&iter);
+  int async_index_ivf_scan(
+      const ObTabletHandle &tablet_handle,
+      ObTableScanParam &scan_param,
+      ObIvfSSTableScanIter &iter);
 
   // iterator
   int build_tablet_iter(ObLSTabletIterator &iter, const bool except_ls_inner_tablet = false);

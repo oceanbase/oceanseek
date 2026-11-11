@@ -10,6 +10,7 @@
 #include "sql/das/search/ob_i_das_search_op.h"
 #include "sql/das/search/ob_das_async_index_query_ctx.h"
 #include "lib/roaringbitmap/ob_roaringbitmap.h"
+#include "sql/das/search/ob_das_scalar_scan_op.h"
 
 namespace oceanbase
 {
@@ -26,6 +27,43 @@ OB_SERIALIZE_MEMBER((ObDASVecIndexHNSWScanRtDef, ObDASVecIndexScanRtDef));
 OB_SERIALIZE_MEMBER((ObDASVecIndexIVFScanRtDef, ObDASVecIndexScanRtDef));
 OB_SERIALIZE_MEMBER((ObDASVecIndexBruteScanCtDef, ObDASVecIndexScanCtDef), filter_pushdown_);
 OB_SERIALIZE_MEMBER((ObDASVecIndexBruteScanRtDef, ObDASVecIndexScanRtDef));
+
+OB_SERIALIZE_MEMBER((ObDASVecIndexAsyncIVFScanCtDef, ObDASVecIndexScanCtDef));
+OB_SERIALIZE_MEMBER((ObDASVecIndexAsyncIVFScanRtDef, ObDASVecIndexScanRtDef));
+
+const ObDASScanCtDef *ObDASVecIndexAsyncIVFScanCtDef::get_index_scan_ctdef() const
+{
+  const ObDASScanCtDef *scan = nullptr;
+  if (2 == children_cnt_ && nullptr != children_ && nullptr != children_[0]
+      && DAS_OP_TABLE_SCAN == children_[0]->op_type_) {
+    const auto *child = static_cast<const ObDASScanCtDef *>(children_[0]);
+    if (OB_VEC_ASYNC_IVF_INDEX_SCAN == child->ir_scan_type_
+        && OB_INVALID_ID != child->ref_table_id_) { scan = child; }
+  }
+  return scan;
+}
+const ObDASScalarScanCtDef *ObDASVecIndexAsyncIVFScanCtDef::get_delete_scan_ctdef() const
+{
+  const ObDASScalarScanCtDef *scan = nullptr;
+  if (nullptr != get_index_scan_ctdef() && nullptr != children_[1]
+      && DAS_OP_SCALAR_SCAN_QUERY == children_[1]->op_type_) {
+    const auto *child = static_cast<const ObDASScalarScanCtDef *>(children_[1]);
+    if (OB_INVALID_ID != child->ref_table_id_) { scan = child; }
+  }
+  return scan;
+}
+ObDASScanRtDef *ObDASVecIndexAsyncIVFScanRtDef::get_index_scan_rtdef() const
+{
+  return 2 == children_cnt_ && nullptr != children_ && nullptr != children_[0]
+      && DAS_OP_TABLE_SCAN == children_[0]->op_type_
+      ? static_cast<ObDASScanRtDef *>(children_[0]) : nullptr;
+}
+ObDASScalarScanRtDef *ObDASVecIndexAsyncIVFScanRtDef::get_delete_scan_rtdef() const
+{
+  return nullptr != get_index_scan_rtdef() && nullptr != children_[1]
+      && DAS_OP_SCALAR_SCAN_QUERY == children_[1]->op_type_
+      ? static_cast<ObDASScalarScanRtDef *>(children_[1]) : nullptr;
+}
 
 /**
  * Check whether this vector scan participates in a query containing an async

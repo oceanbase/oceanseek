@@ -12614,7 +12614,8 @@ ObRpcRemoteWriteDDLIncCommitLogArg::ObRpcRemoteWriteDDLIncCommitLogArg()
     lob_meta_tablet_id_(), lob_piece_tablet_id_(), tx_desc_(nullptr), need_release_(false),
     direct_load_type_(ObDirectLoadType::DIRECT_LOAD_INVALID),
     trans_id_(), seq_no_(), snapshot_version_(0), data_format_version_(0),
-    is_co_sstable_(false), start_scn_(), is_inv_sstable_(false)
+    is_co_sstable_(false), start_scn_(), is_inv_sstable_(false),
+    table_type_(storage::ObITable::TableType::MAX_TABLE_TYPE)
 {}
 
 ObRpcRemoteWriteDDLIncCommitLogArg::~ObRpcRemoteWriteDDLIncCommitLogArg()
@@ -12724,6 +12725,7 @@ int ObRpcRemoteWriteDDLIncCommitLogArg::set_ss_inc_major(
   } else {
     is_co_sstable_ = data_inc_major->is_co_sstable();
     is_inv_sstable_ = data_inc_major->is_inv_sstable();
+    table_type_ = data_inc_major->get_key().table_type_;
   }
   return ret;
 }
@@ -12773,7 +12775,8 @@ OB_DEF_SERIALIZE(ObRpcRemoteWriteDDLIncCommitLogArg)
                 start_scn_,
                 lob_piece_tablet_id_,
                 lob_piece_inc_major_buffer_,
-                is_inv_sstable_);
+                is_inv_sstable_,
+                table_type_);
   }
   return ret;
 }
@@ -12808,7 +12811,8 @@ OB_DEF_DESERIALIZE(ObRpcRemoteWriteDDLIncCommitLogArg)
                 start_scn_,
                 lob_piece_tablet_id_,
                 lob_piece_inc_major_buffer_,
-                is_inv_sstable_);
+                is_inv_sstable_,
+                table_type_);
   }
 #ifdef OB_BUILD_SHARED_STORAGE
   if (OB_SUCC(ret)) {
@@ -12845,7 +12849,8 @@ OB_DEF_SERIALIZE_SIZE(ObRpcRemoteWriteDDLIncCommitLogArg)
               start_scn_,
               lob_piece_tablet_id_,
               lob_piece_inc_major_buffer_,
-              is_inv_sstable_);
+              is_inv_sstable_,
+              table_type_);
   return len;
 }
 

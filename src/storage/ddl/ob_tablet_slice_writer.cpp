@@ -947,6 +947,17 @@ int ObCsSliceWriter::init_async_index_writer_()
                            storage_slice_writer_)->init(writer_param_))) {
       LOG_WARN("init async delete slice macro writer failed", K(ret), K(writer_param_));
     }
+  } else if (INDEX_TYPE_ASYNC_IVF_INDEX_LOCAL == index_type) {
+    // Async IVF always uses the temp-file writer. Refresh and full-build DAGs
+    // consume its non-empty batches through the IVF capture pipeline.
+    if (OB_ISNULL(storage_slice_writer_ = OB_NEW(ObTabletSliceTempFileWriter,
+                                                 ObMemAttr(MTL_ID(), "slice_tmp_writr")))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("allocate async IVF temp-file writer failed", K(ret));
+    } else if (OB_FAIL(static_cast<ObTabletSliceTempFileWriter *>(
+                           storage_slice_writer_)->init(writer_param_))) {
+      LOG_WARN("init async IVF temp-file writer failed", K(ret), K(writer_param_));
+    }
   } else {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("unsupported async index type", K(ret), K(index_type), K(writer_param_));

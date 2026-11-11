@@ -1291,6 +1291,10 @@ public:
   inline bool is_fts_index() const;
   inline bool is_async_fts_index() const;
   inline bool is_async_delete_index() const;
+  inline bool is_user_defined_async_index() const;
+  inline bool is_async_ivf_index() const;
+  inline bool is_async_vec_index() const;
+  inline bool is_vec_or_async_vec_index() const;
   inline bool is_async_index() const;
   inline bool is_fts_or_async_fts_index() const;
   inline bool is_built_in_fts_index() const;
@@ -2961,6 +2965,26 @@ inline bool ObSimpleTableSchemaV2::is_async_fts_index() const
 inline bool ObSimpleTableSchemaV2::is_async_delete_index() const
 {
   return share::schema::is_async_delete_index(index_type_);
+}
+
+inline bool ObSimpleTableSchemaV2::is_user_defined_async_index() const
+{
+  return share::schema::is_user_defined_async_index(index_type_);
+}
+
+inline bool ObSimpleTableSchemaV2::is_async_ivf_index() const
+{
+  return share::schema::is_async_ivf_index(index_type_);
+}
+
+inline bool ObSimpleTableSchemaV2::is_async_vec_index() const
+{
+  return share::schema::is_async_vec_index(index_type_);
+}
+
+inline bool ObSimpleTableSchemaV2::is_vec_or_async_vec_index() const
+{
+  return share::schema::is_vec_or_async_vec_index(index_type_);
 }
 
 inline bool ObSimpleTableSchemaV2::is_async_index() const

@@ -4,6 +4,7 @@
  */
 
 #include "storage/ddl/ob_column_clustered_dag.h"
+#include "storage/blocksstable/vector_index/ob_ivf_tablet_context.h"
 #include "storage/ddl/ob_ddl_tablet_context.h"
 #include "storage/ddl/ob_tablet_slice_row_iterator.h"
 #include "storage/ddl/ob_cg_macro_block_write_task.h"
@@ -22,6 +23,7 @@
 // USING_LOG_PREFIX at the include site. Including it above the #define would
 // expand to a bare _LOG_RET(ERROR,...) with ERROR undeclared in the unity TU.
 #include "storage/async_index/ob_async_index_service.h"  // ObAsyncIndexService
+#include "storage/blocksstable/vector_index/ob_ivf_ddl_dag.h"
 
 using namespace oceanbase;
 using namespace oceanbase::storage;
@@ -45,7 +47,74 @@ ObColumnClusteredDag::ObColumnClusteredDag()
 
 ObColumnClusteredDag::~ObColumnClusteredDag()
 {
+}
 
+int ObColumnClusteredDag::generate_ivf_initial_build_tasks_(
+    ObIArray<ObITask *> &need_schedule_tasks)
+{
+  int ret = OB_SUCCESS;
+  const ObIVFProcessType process_type = ObIVFProcessType::INITIAL_BUILD;
+  ObDDLScanTask *scan_task = nullptr;
+  if (ls_tablet_ids_.empty()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("async IVF DDL has no target tablets", K(ret), KPC(this));
+  } else if (OB_FAIL(alloc_task(scan_task))) {
+    LOG_WARN("fail to allocate IVFDDL scan barrier", K(ret));
+  } else if (OB_FAIL(scan_task->init(this))) {
+    LOG_WARN("fail to initialize IVFDDL scan barrier", K(ret));
+  } else if (OB_FAIL(need_schedule_tasks.push_back(scan_task))) {
+    LOG_WARN("fail to retain IVFDDL scan barrier", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < ls_tablet_ids_.count(); ++i) {
+    ObDDLTabletContext *tablet_context = nullptr;
+    ObIVFDDLDagCtx *ivf_ddl_dag_ctx = nullptr;
+    ObArray<ObITask *> tablet_tasks;
+    const ObTabletID &tablet_id = ls_tablet_ids_.at(i).second;
+    if (OB_FAIL(get_tablet_context(tablet_id, tablet_context))) {
+      LOG_WARN("fail to get IVFDDL tablet context", K(ret), K(tablet_id));
+    } else if (OB_ISNULL(tablet_context)
+        || OB_ISNULL(tablet_context->ivf_ctx_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid IVFDDL tablet context", K(ret), K(tablet_id),
+          KP(tablet_context));
+    } else if (OB_NOT_NULL(
+        tablet_context->ivf_ctx_->ivf_ddl_dag_ctx_)) {
+      ret = OB_INIT_TWICE;
+      LOG_WARN("IVFDDL dag ctx already exists", K(ret), K(tablet_id));
+    } else if (OB_ISNULL(ivf_ddl_dag_ctx = OB_NEW(
+        ObIVFDDLDagCtx, ObMemAttr(MTL_ID(), "IVFDDLCtx")))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("fail to allocate IVFDDL dag ctx", K(ret), K(tablet_id));
+    } else if (OB_FAIL(ivf_ddl_dag_ctx->init(
+        *this, process_type, tablet_id))) {
+      LOG_WARN("fail to init IVFDDL dag ctx", K(ret), K(tablet_id),
+          K(static_cast<int64_t>(process_type)));
+    } else {
+      // Transfer ownership before any task starts borrowing the context.
+      tablet_context->ivf_ctx_->ivf_ddl_dag_ctx_ = ivf_ddl_dag_ctx;
+      ivf_ddl_dag_ctx = nullptr;
+      ObIVFDDLDagCtx *owned_ctx =
+          tablet_context->ivf_ctx_->ivf_ddl_dag_ctx_;
+      if (OB_FAIL(owned_ctx->generate_initial_tasks(tablet_tasks))) {
+        LOG_WARN("fail to generate IVFDDL initial task", K(ret), K(tablet_id),
+            K(static_cast<int64_t>(process_type)));
+      } else if (1 != tablet_tasks.count()
+          || OB_ISNULL(tablet_tasks.at(0))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected IVFDDL initial task count", K(ret), K(tablet_id),
+            "task_count", tablet_tasks.count());
+      } else if (OB_FAIL(scan_task->add_child(*tablet_tasks.at(0)))) {
+        LOG_WARN("fail to connect IVFDDL scan barrier", K(ret), K(tablet_id));
+      } else if (OB_FAIL(need_schedule_tasks.push_back(tablet_tasks.at(0)))) {
+        LOG_WARN("fail to retain IVFDDL initial task", K(ret), K(tablet_id));
+      }
+    }
+    if (OB_NOT_NULL(ivf_ddl_dag_ctx)) {
+      OB_DELETE(ObIVFDDLDagCtx, "IVFDDLCtx", ivf_ddl_dag_ctx);
+      ivf_ddl_dag_ctx = nullptr;
+    }
+  }
+  return ret;
 }
 
 int ObColumnClusteredDag::init_by_param(const share::ObIDagInitParam *param)
@@ -62,11 +131,18 @@ int ObColumnClusteredDag::init_by_param(const share::ObIDagInitParam *param)
     LOG_WARN("init sort provider failed", K(ret));
   } else {
     const bool is_partition_local = init_param->ddl_task_param_.is_partition_local_;
+    const bool is_ivf_ddl = is_async_ivf_index(
+        ddl_table_schema_.table_item_.index_type_);
     px_thread_count_ = init_param->px_thread_count_;
     is_inited_ = true;
     if (OB_SUCC(ret)) {
       ObArray<ObITask *> need_schedule_tasks;
-      if (is_partition_local && is_fts_doc_word_aux(ddl_table_schema_.table_item_.index_type_)) {
+      if (is_ivf_ddl && !init_param->ddl_task_param_.is_async_index_refresh_) {
+        if (OB_FAIL(generate_ivf_initial_build_tasks_(
+            need_schedule_tasks))) {
+          LOG_WARN("fail to generate IVF initial-build tasks", K(ret));
+        }
+      } else if (is_partition_local && is_fts_doc_word_aux(ddl_table_schema_.table_item_.index_type_)) {
         if (OB_FAIL(generate_partition_local_fixed_tasks(need_schedule_tasks))) {
           LOG_WARN("fail to generate partition local fixed tasks", KR(ret));
         }
@@ -264,7 +340,7 @@ int ObColumnClusteredDag::update_tablet_range_count()
           LOG_WARN("fail to set vec async task slice into", K(ret), K(ddl_task_param_.ddl_task_id_), K(ddl_slice_info));
         }
       } else if (ddl_task_param_.is_async_index_refresh_) {
-        // Async fulltext index refresh uses a synthetic ddl_task_id with no
+        // Async index refresh uses a synthetic ddl_task_id with no
         // __all_ddl_task_status record, so get_schedule_info would fail. Read the
         // slice info from the node-local ObAsyncIndexService map instead (stashed by
         // ObDynamicSamplePieceMsgCtx::build_whole_msg), mirroring the vec branch.
@@ -290,7 +366,31 @@ int ObColumnClusteredDag::update_tablet_range_count()
       } else {
         total_slice_count_ = 0;
         const common::Ob2DArray<sql::ObPxTabletRange> &part_ranges = ddl_slice_info.part_ranges_;
-        if (0 == part_ranges.count()) {
+        const bool is_disk_bbq_build = ddl_task_param_.is_async_index_refresh_
+            && is_async_ivf_index(ddl_table_schema_.table_item_.index_type_);
+        if (is_disk_bbq_build) {
+          // PX ranges describe capture input, but Disk BBQ removes those
+          // transport slices and the build-and-write pipeline writes exactly
+          // one sorted output slice after the per-tablet barrier. Model that
+          // output slice directly;
+          // this is also the legal zero-input representation when sampling
+          // produces no partition ranges at all.
+          if (OB_UNLIKELY(1 != ls_tablet_ids_.count())) {
+            ret = OB_ERR_UNEXPECTED;
+            LOG_WARN("Disk BBQ build tablet count not match", K(ret),
+                     K(ls_tablet_ids_), K(part_ranges));
+          } else {
+            ObDDLTabletContext *tablet_context = nullptr;
+            const ObTabletID &tablet_id = ls_tablet_ids_.at(0).second;
+            if (OB_FAIL(get_tablet_context(tablet_id, tablet_context))) {
+              LOG_WARN("get Disk BBQ tablet context failed", K(ret), K(tablet_id));
+            } else {
+              total_slice_count_ = 1;
+              tablet_context->slice_count_ = 1;
+              tablet_context->table_slice_offset_ = 0;
+            }
+          }
+        } else if (0 == part_ranges.count()) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("no partition range", K(ret), K(ddl_slice_info));
         } else if (1 == part_ranges.count() && 0 == part_ranges.at(0).tablet_id_) {

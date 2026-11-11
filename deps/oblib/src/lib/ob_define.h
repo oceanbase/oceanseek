@@ -749,6 +749,9 @@ const char *const OB_VEC_IVF_META_VECTOR_COLUMN_NAME_PREFIX = "__ivf_meta_vector
 const char *const OB_VEC_IVF_PQ_CENTER_ID_COLUMN_NAME_PREFIX = "__ivf_pq_center_id";
 const char *const OB_VEC_IVF_PQ_CENTER_VECTOR_COLUMN_NAME_PREFIX = "__ivf_pq_center_vector";
 const char *const OB_VEC_IVF_PQ_CENTER_IDS_COLUMN_NAME_PREFIX = "__ivf_pq_center_ids";
+const char *const OB_VEC_IVF_TYPE_COLUMN_NAME_PREFIX = "__ivf_type";
+const char *const OB_VEC_IVF_CID_COLUMN_NAME_PREFIX = "__ivf_cid";
+const char *const OB_VEC_IVF_DATA_COLUMN_NAME_PREFIX = "__ivf_data";
 
 // fulltext search
 const char *const OB_DOC_ID_COLUMN_NAME = "__doc_id";

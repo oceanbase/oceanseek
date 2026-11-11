@@ -1829,6 +1829,7 @@ int ObAlterTableResolver::resolve_drop_unused_columns(const ParseNode& node)
 }
 
 int ObAlterTableResolver::resolve_index_column_list(const ParseNode &node,
+                                                    ParseNode *table_option_node,
                                                     obrpc::ObCreateIndexArg &index_arg,
                                                     const int64_t index_name_value,
                                                     ObIArray<ObString> &input_index_columns_name,
@@ -1839,6 +1840,9 @@ int ObAlterTableResolver::resolve_index_column_list(const ParseNode &node,
       OB_ISNULL(node.children_)) {
     ret = OB_ERR_UNEXPECTED;
     SQL_RESV_LOG(WARN, "invalid parse tree!", K(ret));
+  } else if (ASYNC_VEC_KEY == index_keyname_ && 1 != node.num_child_) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "multi-column async DISK_BBQ index is");
   } else {
     obrpc::ObColumnSortItem sort_item;
     //reset sort column set
@@ -1904,14 +1908,15 @@ int ObAlterTableResolver::resolve_index_column_list(const ParseNode &node,
                   LOG_WARN("search index on map or non-single-layer array column is not supported", K(ret));
                   LOG_USER_ERROR(OB_NOT_SUPPORTED, "create search index on map or non-single-layer array column is");
                 }
-              } else if (index_keyname_ != VEC_KEY) {
+              } else if (index_keyname_ != VEC_KEY && index_keyname_ != ASYNC_VEC_KEY) {
                 ret = OB_NOT_SUPPORTED;
                 LOG_WARN("not support index create on vector column yet", K(ret));
                 LOG_USER_ERROR(OB_NOT_SUPPORTED, "create index on vector column is");
               }
             }
             if (OB_FAIL(ret)) {
-            } else if (OB_FAIL(resolve_search_index_constraint(*column_schema,
+            } else if (OB_FAIL(resolve_search_index_constraint(*table_schema_,
+                                                               sort_item.column_name_,
                                                                index_name_value))) {
               SQL_RESV_LOG(WARN, "check search index constraint fail", K(ret), K(sort_item.column_name_));
             }
@@ -1951,6 +1956,19 @@ int ObAlterTableResolver::resolve_index_column_list(const ParseNode &node,
             ret = OB_NOT_SUPPORTED;
             LOG_WARN("create fulltext/multivalue/vector index on materialized view not supported", K(ret));
             LOG_USER_ERROR(OB_NOT_SUPPORTED, "create fulltext/multivalue/vector index on materialized view");
+          }
+        } else if (ASYNC_VEC_KEY == index_keyname_) {
+          if (sort_item.is_func_index_) {
+            ret = OB_ERR_FUNCTIONAL_INDEX_ON_FIELD;
+            LOG_WARN("functional index for async DISK_BBQ is not supported", K(ret), K(sort_item));
+          } else if (OB_FAIL(resolve_vec_index_constraint(*table_schema_,
+                                                         *schema_checker_,
+                                                         sort_item.column_name_,
+                                                         index_name_value,
+                                                         table_option_node))) {
+            LOG_WARN("failed to check async DISK_BBQ column constraint", K(ret));
+          } else if (OB_FAIL(set_vec_column_name(sort_item.column_name_))) {
+            LOG_WARN("failed to set async DISK_BBQ column name", K(ret));
           }
         } else if (index_keyname_ == VEC_KEY) {
           // TODO@xiajin
@@ -2191,6 +2209,7 @@ int ObAlterTableResolver::resolve_add_index(const ParseNode &node)
               ret = OB_ERR_UNEXPECTED;
               SQL_RESV_LOG(WARN, "invalid parse tree", K(ret));
             } else if (OB_FAIL(resolve_index_column_list(*column_list_node,
+                                                         table_option_node,
                                                          *create_index_arg,
                                                          node.value_,
                                                          input_index_columns_name,
@@ -2986,6 +3005,43 @@ int ObAlterTableResolver::generate_index_arg(obrpc::ObCreateIndexArg &index_arg,
         global_ = (GLOBAL_INDEX == index_scope_);
       }
       if (OB_FAIL(ret)) {
+      } else if (ASYNC_VEC_KEY == index_keyname_) {
+        const uint64_t tenant_id = session_info_->get_effective_tenant_id();
+        if (tenant_data_version < DATA_VERSION_4_6_3_1) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "async DISK_BBQ index before version 4.6.3.1 is");
+        } else if (global_) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "global async DISK_BBQ index is");
+        } else if (!GCTX.is_shared_storage_mode() || !table_schema_->is_heap_organized_table()
+                   || table_schema_->is_mysql_tmp_table() || table_schema_->is_materialized_view()
+                   || table_schema_->is_table_with_clustering_key()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "async DISK_BBQ index on this table type is");
+        } else if (!share::ObAsyncIndexRefreshUtil::is_async_index_enabled(tenant_id)) {
+          ret = OB_OP_NOT_ALLOW;
+          LOG_USER_ERROR(OB_OP_NOT_ALLOW, "alter async DISK_BBQ index while _enable_async_index is false");
+        } else if (!share::ObAsyncIndexRefreshUtil::is_async_index_refresh_enabled(tenant_id)) {
+          ret = OB_OP_NOT_ALLOW;
+          LOG_USER_ERROR(OB_OP_NOT_ALLOW, "alter async DISK_BBQ index while _enable_async_index_refresh is false");
+        } else if (!is_async_ivf_index(vec_index_type_)) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "async index TYPE other than DISK_BBQ is");
+        } else {
+          char *buf = nullptr;
+          int64_t pos = 0;
+          if (OB_ISNULL(buf = static_cast<char *>(allocator_->alloc(OB_MAX_PROC_ENV_LENGTH)))) {
+            ret = OB_ALLOCATE_MEMORY_FAILED;
+            LOG_WARN("failed to allocate execution environment buffer", K(ret));
+          } else if (OB_FAIL(ObExecEnv::gen_exec_env(*session_info_, buf, OB_MAX_PROC_ENV_LENGTH, pos))) {
+            LOG_WARN("failed to generate execution environment", K(ret));
+          } else if (OB_FAIL(index_arg.index_schema_.set_index_params(index_params_))) {
+            LOG_WARN("failed to set async DISK_BBQ index parameters", K(ret));
+          } else {
+            type = vec_index_type_;
+            index_arg.vidx_refresh_info_.exec_env_.assign_ptr(buf, pos);
+          }
+        }
       } else if (is_unique_key) {
         if (global_) {
           type = INDEX_TYPE_UNIQUE_GLOBAL;
@@ -4620,6 +4676,7 @@ int ObAlterTableResolver::resolve_modify_clustering_key(const ParseNode &action_
   int ret = OB_SUCCESS;
   bool is_exist_add_clustering_key = false;
   bool is_exist_drop_clustering_key = false;
+  bool has_async_ivf_index = false;
   if (OB_FAIL(is_exist_item_type(action_node_list, T_CLUSTERING_KEY, is_exist_add_clustering_key))
       || OB_FAIL(is_exist_item_type(action_node_list, T_CLUSTERING_KEY_DROP, is_exist_drop_clustering_key))) {
     SQL_RESV_LOG(WARN, "failed to check item type!", KR(ret));
@@ -4634,6 +4691,15 @@ int ObAlterTableResolver::resolve_modify_clustering_key(const ParseNode &action_
     ret = OB_ERR_CANT_DROP_FIELD_OR_KEY;
     LOG_WARN("can't DROP 'CLUSTERING KEY', check clustering key exists", KR(ret), KPC(table_schema_));
     LOG_USER_ERROR(OB_ERR_CANT_DROP_FIELD_OR_KEY, clustering_key_name.length(), clustering_key_name.ptr());
+  } else if (OB_FAIL(ObVectorIndexUtil::check_table_has_async_ivf_index(
+                 *table_schema_, has_async_ivf_index))) {
+    SQL_RESV_LOG(WARN, "failed to check if table has async IVF index", KR(ret));
+  } else if (has_async_ivf_index) {
+    ret = OB_NOT_SUPPORTED;
+    SQL_RESV_LOG(WARN, "clustering key is not supported on table with async IVF index",
+                 KR(ret), KPC(table_schema_));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                   "modifying clustering key on tables with async DISK_BBQ indexes is");
   } else {
     obrpc::ObAlterPrimaryArg *alter_clustering_key_arg = NULL;
     void *tmp_ptr = NULL;
@@ -4762,6 +4828,10 @@ int ObAlterTableResolver::resolve_add_clustering_key(const ParseNode &node)
       bool has_vec_index = false;
       if (OB_FAIL(ObVectorIndexUtil::check_table_has_vector_index(*table_schema_, *params_.schema_checker_->get_schema_guard(), has_vec_index))) {
         SQL_RESV_LOG(WARN, "failed to check if table has vector indexes", KR(ret));
+      } else if (!has_vec_index
+                 && OB_FAIL(ObVectorIndexUtil::check_table_has_async_ivf_index(
+                     *table_schema_, has_vec_index))) {
+        SQL_RESV_LOG(WARN, "failed to check if table has async IVF index", KR(ret));
       } else if (has_vec_index) {
         ret = OB_NOT_SUPPORTED;
         SQL_RESV_LOG(WARN, "can't ADD Clustering Key, clustering key is not supported on tables with vector indexes", K(ret), KPC(table_schema_));

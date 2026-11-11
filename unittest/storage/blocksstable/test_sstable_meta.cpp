@@ -12,6 +12,7 @@
 #include "src/share/io/io_schedule/ob_io_mclock.h"
 #include "storage/blocksstable/ob_data_file_prepare.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable.h"
 #include "storage/tablet/ob_table_store_util.h"
 #include "storage/schema_utils.h"
 #include "storage/test_tablet_helper.h"
@@ -1077,7 +1078,6 @@ TEST_F(TestSSTableMeta, test_cosstable_illegal_serialize)
   int64_t pos = 0;
   ASSERT_EQ(OB_ERR_UNEXPECTED, sstable.serialize(DATA_CURRENT_VERSION, buf, buf_len, pos));
   ASSERT_EQ(OB_ERR_UNEXPECTED, sstable.serialize_full_table(DATA_CURRENT_VERSION, buf, buf_len, pos));
-  allocator_.reset();
 }
 
 TEST_F(TestSSTableMeta, deserialize_rejects_mismatched_sstable_object_type)
@@ -1085,7 +1085,8 @@ TEST_F(TestSSTableMeta, deserialize_rejects_mismatched_sstable_object_type)
   const ObITable::TableType table_types[] = {
       ObITable::MAJOR_SSTABLE, ObITable::NORMAL_COLUMN_GROUP_SSTABLE,
       ObITable::COLUMN_ORIENTED_SSTABLE, ObITable::INC_COLUMN_ORIENTED_SSTABLE,
-      ObITable::INV_INDEX_SSTABLE, ObITable::INC_INV_INDEX_SSTABLE
+      ObITable::INV_INDEX_SSTABLE, ObITable::INC_INV_INDEX_SSTABLE,
+      ObITable::IVF_INDEX_SSTABLE, ObITable::INC_IVF_INDEX_SSTABLE
   };
   const uint64_t data_version = DATA_CURRENT_VERSION;
   const int64_t start_pos = 7;
@@ -1105,6 +1106,7 @@ TEST_F(TestSSTableMeta, deserialize_rejects_mismatched_sstable_object_type)
     ObSSTable normal;
     ObCOSSTableV2 co;
     ObInvSSTable inv;
+    ObIvfSSTable ivf;
     ObSSTable *table = &normal;
     if (ObITable::is_co_sstable(table_type)) {
       param.co_base_type_ = ObCOSSTableBaseType::ALL_CG_TYPE;
@@ -1120,6 +1122,15 @@ TEST_F(TestSSTableMeta, deserialize_rejects_mismatched_sstable_object_type)
       stats.has_relevance_params_ = true;
       ASSERT_EQ(OB_SUCCESS, param.inv_meta_.init(stats));
       table = &inv;
+    } else if (ObITable::is_ivf_sstable(table_type)) {
+      param.ivf_meta_.dim_ = 128;
+      param.ivf_meta_.index_type_ = VIAT_DISK_BBQ;
+      param.ivf_meta_.dist_type_ = VIDA_L2;
+      param.ivf_meta_.format_version_ = IVF_SSTABLE_FORMAT_VERSION;
+      param.ivf_meta_.nbits_ = 1;
+      param.ivf_meta_.fht_algo_version_ =
+          quantization::ObFhtKacRotator::CURRENT_FHT_ALGO_VERSION;
+      table = &ivf;
     }
     ASSERT_EQ(OB_SUCCESS, table->init(param, &allocator_));
 
@@ -1173,7 +1184,7 @@ TEST_F(TestSSTableMeta, deserialize_rejects_mismatched_sstable_object_type)
 
       ObSSTable base;
       pos = start_pos;
-      if (table->is_co_sstable() || table->is_inv_sstable()) {
+      if (table->is_co_sstable() || table->is_inv_sstable() || table->is_ivf_sstable()) {
         ASSERT_EQ(OB_ERR_UNEXPECTED, base.deserialize(allocator_, buf, buf_len, pos));
         ASSERT_EQ(start_pos, pos);
         ASSERT_FALSE(base.is_valid());
@@ -1188,11 +1199,12 @@ TEST_F(TestSSTableMeta, deserialize_rejects_mismatched_sstable_object_type)
       // Derived decoders must still be able to call the base decoder.
       ObCOSSTableV2 decoded_co;
       ObInvSSTable decoded_inv;
+      ObIvfSSTable decoded_ivf;
       ObSSTable decoded_normal;
       ObSSTable *decoded = table->is_co_sstable()
           ? static_cast<ObSSTable *>(&decoded_co)
           : table->is_inv_sstable() ? static_cast<ObSSTable *>(&decoded_inv)
-          : &decoded_normal;
+          : table->is_ivf_sstable() ? static_cast<ObSSTable *>(&decoded_ivf) : &decoded_normal;
       pos = start_pos;
       ASSERT_EQ(OB_SUCCESS, decoded->deserialize(allocator_, buf, buf_len, pos));
       ASSERT_EQ(buf_len, pos);
@@ -1218,7 +1230,11 @@ TEST_F(TestSSTableMeta, deserialize_rejects_mismatched_sstable_object_type)
         ASSERT_EQ(table->get_key(), decoded_array.at(0)->get_key());
         ASSERT_EQ(table->get_addr(), decoded_array.at(0)->get_addr());
         ASSERT_FALSE(decoded_array.at(0)->is_loaded());
-        if (table->is_inv_sstable()) {
+        if (table->is_ivf_sstable()) {
+          const ObIvfSSTable *array_ivf = static_cast<const ObIvfSSTable *>(decoded_array.at(0));
+          ASSERT_EQ(ivf.get_ivf_meta().dim_, array_ivf->get_ivf_meta().dim_);
+          ASSERT_TRUE(array_ivf->get_fht_rotator().is_inited());
+        } else if (table->is_inv_sstable()) {
           const ObInvSSTable *array_inv = static_cast<const ObInvSSTable *>(decoded_array.at(0));
           ASSERT_EQ(inv.get_inv_meta().get_stats().min_doc_id_,
               array_inv->get_inv_meta().get_stats().min_doc_id_);
@@ -1226,7 +1242,14 @@ TEST_F(TestSSTableMeta, deserialize_rejects_mismatched_sstable_object_type)
               array_inv->get_inv_meta().get_stats().max_doc_id_);
         }
       }
-      if (table->is_inv_sstable()) {
+      if (table->is_ivf_sstable()) {
+        ASSERT_EQ(ivf.get_ivf_meta().dim_, decoded_ivf.get_ivf_meta().dim_);
+        ASSERT_EQ(ivf.get_ivf_meta().format_version_, decoded_ivf.get_ivf_meta().format_version_);
+        ASSERT_TRUE(decoded_ivf.get_fht_rotator().is_inited());
+        ASSERT_EQ(ivf.get_fht_rotator().signs_size(), decoded_ivf.get_fht_rotator().signs_size());
+        ASSERT_EQ(0, MEMCMP(ivf.get_fht_rotator().signs(), decoded_ivf.get_fht_rotator().signs(),
+            ivf.get_fht_rotator().signs_size()));
+      } else if (table->is_inv_sstable()) {
         ASSERT_EQ(inv.get_inv_meta().get_stats().min_doc_id_,
             decoded_inv.get_inv_meta().get_stats().min_doc_id_);
         ASSERT_EQ(inv.get_inv_meta().get_stats().max_doc_id_,
@@ -1466,7 +1489,7 @@ TEST_F(TestMigrationSSTableParam, test_migrate_sstable)
   ObMigrationSSTableParam mig_param;
   mig_param.basic_meta_ = src_meta.get_basic_meta();
   mig_param.table_key_ = src_sstable_param.table_key_;
-  for (int64_t i = 0; i < sstable_meta_.get_col_checksum_cnt(); ++i) {
+  for (int64_t i = 0; i < src_meta.get_col_checksum_cnt(); ++i) {
     ASSERT_EQ(OB_SUCCESS, mig_param.column_checksums_.push_back(src_meta.get_col_checksum()[i]));
   }
 
@@ -1476,6 +1499,8 @@ TEST_F(TestMigrationSSTableParam, test_migrate_sstable)
   ret = dest_sstable_param.init_for_ha(mig_param, data_block_ids, other_block_ids);
   ASSERT_EQ(OB_SUCCESS, ret);
 
+  ASSERT_EQ(1, dest_sstable_param.column_checksums_.count());
+  ASSERT_EQ(2022, dest_sstable_param.column_checksums_.at(0));
   ASSERT_TRUE(dest_sstable_param.encrypt_id_ == src_sstable_param.encrypt_id_);
   ASSERT_TRUE(dest_sstable_param.table_shared_flag_ == src_sstable_param.table_shared_flag_);
 }

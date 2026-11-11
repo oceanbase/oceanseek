@@ -79,12 +79,12 @@ int cal_distance_by_id(obvsag::VectorIndexPtr index_handler,
                        const int64_t *ids,
                        int64_t count,
                        const float *&distances);
+// The returned buffer belongs to allocator; release through its Deallocate().
 int get_raw_vector_by_ids(obvsag::VectorIndexPtr &index_handler, 
                          const int64_t *ids, 
                          int64_t count, 
                          float *&vectors,
-                         void *allocator = nullptr,
-                         int64_t dim = 0);
+                         vsag::Allocator *allocator);
 int get_extra_info_by_ids(obvsag::VectorIndexPtr& index_handler, 
                           const int64_t* ids, 
                           int64_t count, 

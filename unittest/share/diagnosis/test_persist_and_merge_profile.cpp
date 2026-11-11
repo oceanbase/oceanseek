@@ -21,6 +21,129 @@ using namespace std;
 class ObRuntimeProfileTest : public ::testing::Test
 {};
 
+TEST_F(ObRuntimeProfileTest, metric_slots_above_uint8_survive_persistence)
+{
+  ObArenaAllocator allocator;
+  ObOpProfile<ObMetric> profile(ObProfileId::VECTOR_SEARCH, &allocator);
+  ASSERT_GT(ObMetricId::MONITOR_STATNAME_END - 1, UINT8_MAX);
+  for (int64_t id = ObMetricId::MONITOR_STATNAME_BEGIN + 1;
+       id < ObMetricId::MONITOR_STATNAME_END; ++id) {
+    ObMetric *metric = nullptr;
+    ASSERT_EQ(nullptr, profile.get_metric(static_cast<ObMetricId>(id)));
+    ASSERT_EQ(OB_SUCCESS, profile.get_or_register_metric(static_cast<ObMetricId>(id), metric));
+    ASSERT_NE(nullptr, metric);
+    // Persistence converts CPU cycles to time; zero keeps this capacity test unit-independent.
+    metric->set(metric::Unit::CPU_CYCLE == get_metric_unit(static_cast<ObMetricId>(id)) ? 0 : id);
+  }
+  const char *persist = nullptr;
+  int64_t size = 0;
+  ObOpProfile<ObMetric> *restored = nullptr;
+  ASSERT_EQ(OB_SUCCESS, profile.to_persist_profile(persist, size, &allocator));
+  ASSERT_EQ(OB_SUCCESS, convert_persist_profile_to_realtime(persist, size, restored, &allocator));
+  ASSERT_NE(nullptr, restored);
+  for (int64_t id = ObMetricId::MONITOR_STATNAME_BEGIN + 1;
+       id < ObMetricId::MONITOR_STATNAME_END; ++id) {
+    ObMetric *metric = nullptr;
+    const ObMetricId metric_id = static_cast<ObMetricId>(id);
+    const uint64_t expected_value = metric::Unit::CPU_CYCLE == get_metric_unit(metric_id) ? 0 : id;
+    ASSERT_EQ(OB_SUCCESS, profile.get_or_register_metric(metric_id, metric));
+    ASSERT_EQ(profile.get_metric(metric_id), metric);
+    EXPECT_EQ(expected_value, metric->value());
+    ASSERT_NE(nullptr, restored->get_metric(metric_id));
+    EXPECT_EQ(expected_value, restored->get_metric(metric_id)->value());
+    bool exists = false;
+    uint64_t value = 0;
+    restored->get_metric_value(metric_id, exists, value);
+    EXPECT_TRUE(exists);
+    EXPECT_EQ(expected_value, value);
+  }
+  EXPECT_EQ(ObMetricId::MONITOR_STATNAME_END - 1, profile.metric_count_);
+  EXPECT_EQ(profile.metric_count_, restored->metric_count_);
+  restored->~ObOpProfile<ObMetric>();
+}
+
+TEST_F(ObRuntimeProfileTest, async_ivf_preserves_partition_and_segment_instances)
+{
+  int ret = OB_SUCCESS;
+  ObArenaAllocator allocator;
+  ObOpProfile<ObMetric> root(ObProfileId::VECTOR_SEARCH, &allocator);
+  for (int64_t execution = 0; execution < 2; ++execution) {
+    ObOpProfile<ObMetric> *partition = nullptr;
+    ObOpProfile<ObMetric> *vector_iter = nullptr;
+    ObOpProfile<ObMetric> *scan = nullptr;
+    ASSERT_EQ(OB_SUCCESS, root.register_child(ObProfileId::VECTOR_SEARCH_PARTITION, partition));
+    ObProfileSwitcher partition_switcher(partition);
+    SET_METRIC_VAL(ObMetricId::VEC_TABLET_ID, 1001);
+    ASSERT_EQ(OB_SUCCESS, ret);
+    ASSERT_EQ(OB_SUCCESS, partition->register_child(ObProfileId::VECTOR_SEARCH_VEC_ITER, vector_iter));
+    ASSERT_EQ(OB_SUCCESS, vector_iter->register_child(
+        ObProfileId::VECTOR_SEARCH_VEC_ASYNC_IVF_SCAN, scan));
+    for (int64_t range = 0; range < 2; ++range) {
+      ObOpProfile<ObMetric> *segment = nullptr;
+      ASSERT_EQ(OB_SUCCESS, scan->register_child(ObProfileId::VECTOR_SEARCH_IVF_SEGMENT, segment));
+      ObProfileSwitcher segment_switcher(segment);
+      SET_METRIC_VAL(ObMetricId::VEC_IVF_VERSION_RANGE_BASE, range * 100);
+      SET_METRIC_VAL(ObMetricId::VEC_IVF_VERSION_RANGE_SNAPSHOT, (range + 1) * 100);
+      INC_METRIC_VAL(ObMetricId::VEC_IVF_RAW_VECTOR_KEY_COUNT, 10 + execution + range);
+      ASSERT_EQ(OB_SUCCESS, ret);
+    }
+  }
+  const char *persist = nullptr;
+  int64_t size = 0;
+  ObOpProfile<ObMetric> *restored = nullptr;
+  ASSERT_EQ(OB_SUCCESS, root.to_persist_profile(persist, size, &allocator));
+  ASSERT_EQ(OB_SUCCESS, convert_persist_profile_to_realtime(persist, size, restored, &allocator));
+  ASSERT_NE(nullptr, restored);
+  int64_t partitions = 0;
+  int64_t segments = 0;
+  uint64_t key_sum = 0;
+  for (ObOpProfile<ObMetric>::ProfileWrap *p = restored->get_child_head(); nullptr != p; p = p->next_) {
+    ++partitions;
+    ASSERT_NE(nullptr, p->elem_->get_child_head());
+    ObOpProfile<ObMetric> *vector_iter = p->elem_->get_child_head()->elem_;
+    ASSERT_NE(nullptr, vector_iter->get_child_head());
+    ObOpProfile<ObMetric> *scan = vector_iter->get_child_head()->elem_;
+    int64_t ranges = 0;
+    uint64_t range_sum = 0;
+    for (ObOpProfile<ObMetric>::ProfileWrap *s = scan->get_child_head(); nullptr != s; s = s->next_) {
+      ++ranges;
+      ++segments;
+      bool exists = false;
+      uint64_t value = 0;
+      s->elem_->get_metric_value(ObMetricId::VEC_IVF_RAW_VECTOR_KEY_COUNT, exists, value);
+      ASSERT_TRUE(exists);
+      key_sum += value;
+      s->elem_->get_metric_value(ObMetricId::VEC_IVF_VERSION_RANGE_BASE, exists, value);
+      ASSERT_TRUE(exists);
+      range_sum += value;
+    }
+    ASSERT_EQ(2, ranges);
+    ASSERT_EQ(100, range_sum);
+  }
+  ASSERT_EQ(2, partitions);
+  ASSERT_EQ(4, segments);
+  ASSERT_EQ(44, key_sum);
+  ObOpProfile<ObMergeMetric> merged(ObProfileId::VECTOR_SEARCH, &allocator);
+  ASSERT_EQ(OB_SUCCESS, ObProfileUtil::merge_profile(merged, &root, &allocator));
+  ASSERT_EQ(OB_SUCCESS, ObProfileUtil::merge_profile(merged, restored, &allocator));
+  partitions = 0;
+  for (ObOpProfile<ObMergeMetric>::ProfileWrap *p = merged.get_child_head(); nullptr != p; p = p->next_) {
+    ++partitions;
+    ObOpProfile<ObMergeMetric> *scan = p->elem_->get_child_head()->elem_->get_child_head()->elem_;
+    int64_t ranges = 0;
+    for (ObOpProfile<ObMergeMetric>::ProfileWrap *s = scan->get_child_head(); nullptr != s; s = s->next_) {
+      ++ranges;
+    }
+    ASSERT_EQ(2, ranges);
+  }
+  ASSERT_EQ(4, partitions);
+  const char *json = nullptr;
+  ASSERT_EQ(OB_SUCCESS, merged.to_format_json(&allocator, json));
+  ASSERT_NE(nullptr, strstr(json, "Vector Index Async IVF Scan"));
+  ASSERT_NE(nullptr, strstr(json, "raw vector key count"));
+  restored->~ObOpProfile<ObMetric>();
+}
+
 // 只替换 next() 返回值，不连接数据库，用于验证读取错误的传播。
 class ProfileReadResult : public sqlclient::ObMySQLResultImpl
 {

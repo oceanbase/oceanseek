@@ -7943,10 +7943,12 @@ int ObStaticEngineCG::set_partition_range_info(ObLogTableScan &op, ObTableScanSp
       && stmt->is_select_stmt()
       && (index_schema->is_aux_lob_table()
           || (table_item->is_index_table_
-              && share::schema::is_local_fts_index(index_schema->get_index_type())))) {
+              && (share::schema::is_local_fts_index(index_schema->get_index_type())
+                  || index_schema->is_async_ivf_index())))) {
       LOG_INFO("index or lob aux direct select: fallback to scanning all partitions",
                K(table_id), K(ref_table_id), K(index_id), "is_aux_lob", index_schema->is_aux_lob_table(),
-               "is_fts_index", table_item->is_index_table_);
+               "is_fts_index", table_item->is_index_table_,
+               "is_async_ivf_index", index_schema->is_async_ivf_index());
   } else if (OB_ISNULL(part_expr)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("null part expr", K(ret));

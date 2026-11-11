@@ -44,6 +44,8 @@ ObCreateTableResolver::ObCreateTableResolver(ObResolverParams &params)
       cur_udt_set_id_(0),
       vec_index_col_ids_(),
       has_vec_index_(false),
+      has_sync_vec_index_(false),
+      has_async_ivf_index_(false),
       has_fts_index_(false),
       has_async_fts_index_(false),
       has_search_index_(false),
@@ -2846,9 +2848,12 @@ int ObCreateTableResolver::generate_index_arg(const bool process_heap_table_prim
         } else {
           type = INDEX_TYPE_SPATIAL_LOCAL;
         }
-      } else if (VEC_KEY == index_keyname_) {
+      } else if (VEC_KEY == index_keyname_ || ASYNC_VEC_KEY == index_keyname_) {
         const int64_t tenant_id = session_info_->get_effective_tenant_id();
-        if (tenant_data_version < DATA_VERSION_4_3_3_0) {
+        if (ASYNC_VEC_KEY == index_keyname_ && tenant_data_version < DATA_VERSION_4_6_3_1) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "async DISK_BBQ index before version 4.6.2.2 is");
+        } else if (tenant_data_version < DATA_VERSION_4_3_3_0) {
           ret = OB_NOT_SUPPORTED;
           LOG_WARN("tenant data version is less than 4.3.3, vector index not supported", K(ret), K(tenant_data_version));
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "tenant data version is less than 4.3.3, vector index");
@@ -2874,8 +2879,32 @@ int ObCreateTableResolver::generate_index_arg(const bool process_heap_table_prim
           LOG_WARN("mysql temp table not support vector index", KR(ret));
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "mysql temporary table create vector index is");
         }
-        if (OB_SUCC(ret)) {
-          type = INDEX_TYPE_VEC_DELTA_BUFFER_LOCAL; // 需要考虑ivf、hnsw、spiv这三种模式，其中ivf索引又分成ivfflat，ivfsq8，ivfpq三类
+        if (OB_SUCC(ret) && ASYNC_VEC_KEY == index_keyname_
+            && table_schema.is_table_with_clustering_key()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("async DISK_BBQ index is not supported on table with clustering key", K(ret));
+          LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                         "async DISK_BBQ index on table with clustering key is");
+        } else if (OB_SUCC(ret) && ASYNC_VEC_KEY == index_keyname_
+            && (!GCTX.is_shared_storage_mode() || !table_schema.is_heap_organized_table())) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "async DISK_BBQ index on non-heap or non-shared-storage table is");
+        } else if (OB_SUCC(ret) && ASYNC_VEC_KEY == index_keyname_
+                   && !share::ObAsyncIndexRefreshUtil::is_async_index_enabled(tenant_id)) {
+          ret = OB_OP_NOT_ALLOW;
+          LOG_WARN("async DISK_BBQ index with table not allowed while _enable_async_index is false", K(ret));
+          LOG_USER_ERROR(OB_OP_NOT_ALLOW,
+                         "create async DISK_BBQ index with table while _enable_async_index is false");
+        } else if (OB_SUCC(ret) && ASYNC_VEC_KEY == index_keyname_
+                   && !share::ObAsyncIndexRefreshUtil::is_async_index_refresh_enabled(tenant_id)) {
+          ret = OB_OP_NOT_ALLOW;
+          LOG_WARN("async DISK_BBQ index with table not allowed while _enable_async_index_refresh is false", K(ret));
+          LOG_USER_ERROR(OB_OP_NOT_ALLOW,
+                         "create async DISK_BBQ index with table while _enable_async_index_refresh is false");
+        } else if (OB_SUCC(ret)) {
+          type = ASYNC_VEC_KEY == index_keyname_
+                     ? INDEX_TYPE_ASYNC_IVF_INDEX_LOCAL
+                     : INDEX_TYPE_VEC_DELTA_BUFFER_LOCAL;
         }
       } else if (FTS_KEY == index_keyname_) {
         if (tenant_data_version < DATA_VERSION_4_3_1_0) {
@@ -3149,6 +3178,8 @@ int ObCreateTableResolver::resolve_index(
   } else {
     vec_index_col_ids_.reset();
     has_vec_index_ = false;
+    has_sync_vec_index_ = false;
+    has_async_ivf_index_ = false;
     has_fts_index_ = false;
     has_async_fts_index_ = false;
     has_search_index_ = false;
@@ -3235,7 +3266,8 @@ int ObCreateTableResolver::resolve_index_node(const ParseNode *node)
         }
         bool cnt_func_index_mysql = false;
         bool is_multi_value_index = false;
-        const bool is_vec_index = (index_keyname_ == INDEX_KEYNAME::VEC_KEY);
+        const bool is_vec_index = (index_keyname_ == INDEX_KEYNAME::VEC_KEY
+                                   || index_keyname_ == INDEX_KEYNAME::ASYNC_VEC_KEY);
         const bool is_fts_index = (index_keyname_ == INDEX_KEYNAME::FTS_KEY || index_keyname_ == INDEX_KEYNAME::ASYNC_FTS_KEY);
         const bool is_search_index = (index_keyname_ == INDEX_KEYNAME::SEARCH_KEY
                                       || index_keyname_ == INDEX_KEYNAME::ASYNC_SEARCH_KEY);
@@ -3252,6 +3284,15 @@ int ObCreateTableResolver::resolve_index_node(const ParseNode *node)
           ret = OB_NOT_SUPPORTED;
           LOG_WARN("multi column of vector index is not support yet", K(ret), K(index_column_list_node->num_child_));
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "multi vector index column is");
+        } else if ((VEC_KEY == index_keyname_ && has_async_ivf_index_)
+                   || (ASYNC_VEC_KEY == index_keyname_
+                       && (has_sync_vec_index_ || has_fts_index_ || has_search_index_))
+                   || ((FTS_KEY == index_keyname_ || SEARCH_KEY == index_keyname_)
+                       && has_async_ivf_index_)) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("synchronous vector, fulltext, or search index cannot coexist with async DISK_BBQ",
+                   K(ret), K(index_keyname_));
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "synchronous index with async DISK_BBQ on same table is");
         } else if (!is_support && ((is_vec_index && (has_fts_index_ || has_async_fts_index_)) || (is_fts_index && has_vec_index_))) {
           ret = OB_NOT_SUPPORTED;
           LOG_WARN("vector index and fts coexist in main table is not support yet", K(ret), K(index_column_list_node->num_child_));
@@ -3395,7 +3436,9 @@ int ObCreateTableResolver::resolve_index_node(const ParseNode *node)
                 if (ob_is_geometry(expr->get_data_type()) || static_cast<int64_t>(INDEX_KEYNAME::SPATIAL_KEY) == node->value_) {
                   ret = OB_ERR_SPATIAL_FUNCTIONAL_INDEX;
                   LOG_WARN("Spatial functional index is not supported.", K(ret), K(column_name));
-                } else if (ob_is_collection_sql_type(expr->get_data_type()) || static_cast<int64_t>(INDEX_KEYNAME::VEC_KEY) == node->value_) {
+                } else if (ob_is_collection_sql_type(expr->get_data_type())
+                           || static_cast<int64_t>(INDEX_KEYNAME::VEC_KEY) == node->value_
+                           || static_cast<int64_t>(INDEX_KEYNAME::ASYNC_VEC_KEY) == node->value_) {
                   ret = OB_ERR_FUNCTIONAL_INDEX_ON_FIELD;
                   LOG_WARN("Functional index for vector index is not supported.", K(ret), K(column_name));
                 } else if (OB_FAIL(ObIndexBuilderUtil::generate_ordinary_generated_column(*expr,
@@ -3486,7 +3529,8 @@ int ObCreateTableResolver::resolve_index_node(const ParseNode *node)
               } else if (!is_oracle_mode // oracle mode is not support vector column yet
                 && ob_is_collection_sql_type(column_schema->get_data_type())
                 && !is_search_index
-                && static_cast<int64_t>(INDEX_KEYNAME::VEC_KEY) != node->value_) {
+                && static_cast<int64_t>(INDEX_KEYNAME::VEC_KEY) != node->value_
+                && static_cast<int64_t>(INDEX_KEYNAME::ASYNC_VEC_KEY) != node->value_) {
                 ret = OB_NOT_SUPPORTED;
                 LOG_WARN("index column is vector column, but is not vector index is not supported", K(ret));
                 LOG_USER_ERROR(OB_NOT_SUPPORTED, "vector column index but not vector index is");
@@ -3494,6 +3538,7 @@ int ObCreateTableResolver::resolve_index_node(const ParseNode *node)
                   static_cast<int64_t>(INDEX_KEYNAME::FTS_KEY) != node->value_ &&
                   static_cast<int64_t>(INDEX_KEYNAME::ASYNC_FTS_KEY) != node->value_ &&
                   static_cast<int64_t>(INDEX_KEYNAME::VEC_KEY) != node->value_ &&
+                  static_cast<int64_t>(INDEX_KEYNAME::ASYNC_VEC_KEY) != node->value_ &&
                   static_cast<int64_t>(INDEX_KEYNAME::SEARCH_KEY) != node->value_ &&
                   static_cast<int64_t>(INDEX_KEYNAME::ASYNC_SEARCH_KEY) != node->value_) {
                 if (column_schema->is_hidden()) {
@@ -3535,6 +3580,7 @@ int ObCreateTableResolver::resolve_index_node(const ParseNode *node)
                       && static_cast<int64_t>(INDEX_KEYNAME::FTS_KEY) != node->value_
                       && static_cast<int64_t>(INDEX_KEYNAME::ASYNC_FTS_KEY) != node->value_
                       && static_cast<int64_t>(INDEX_KEYNAME::VEC_KEY) != node->value_
+                      && static_cast<int64_t>(INDEX_KEYNAME::ASYNC_VEC_KEY) != node->value_
                       && static_cast<int64_t>(INDEX_KEYNAME::SEARCH_KEY) != node->value_
                       && static_cast<int64_t>(INDEX_KEYNAME::ASYNC_SEARCH_KEY) != node->value_) {
                     // text or varchar column is bigger than 16k will be blocked
@@ -3784,7 +3830,7 @@ int ObCreateTableResolver::resolve_index_node(const ParseNode *node)
           }
         }
         if (OB_SUCC(ret)) {
-          if (is_vec_index(index_arg_.index_type_)) {
+          if (is_vec_or_async_vec_index(index_arg_.index_type_)) {
             if (tbl_schema.is_table_with_clustering_key()) {
               ret = OB_NOT_SUPPORTED;
               LOG_WARN("vector index is not supported on table with clustering key",
@@ -3792,7 +3838,7 @@ int ObCreateTableResolver::resolve_index_node(const ParseNode *node)
               LOG_USER_ERROR(OB_NOT_SUPPORTED, "vector index on clustering key table is");
             } else {
               // refresh vector index type
-              if (!is_vec_index(vec_index_type_)) {
+              if (!is_vec_or_async_vec_index(vec_index_type_)) {
                 ret = OB_ERR_UNEXPECTED;
                 LOG_WARN("unexpected index type", KR(ret), K(vec_index_type_));
               } else if (FALSE_IT(create_index_arg.index_type_ = vec_index_type_)) {
@@ -3807,10 +3853,21 @@ int ObCreateTableResolver::resolve_index_node(const ParseNode *node)
                                                                         allocator_,
                                                                         session_info_))) {
                 LOG_WARN("failed to append vec args", K(ret));
+              } else if (is_async_ivf_index(create_index_arg.index_type_)
+                         && OB_FAIL(ObDDLResolver::append_async_index_support_arg(
+                             resolve_result, create_index_arg,
+                             have_generate_async_index_arg_, resolve_results,
+                             index_arg_list, allocator_))) {
+                LOG_WARN("failed to append async IVF support arg", K(ret));
               } else if (OB_FAIL(vec_index_col_ids_.push_back(vec_index_col_id))) {
                 LOG_WARN("fail to push back vec index col id", K(ret));
               } else {
                 has_vec_index_ = true;
+                if (is_async_ivf_index(create_index_arg.index_type_)) {
+                  has_async_ivf_index_ = true;
+                } else {
+                  has_sync_vec_index_ = true;
+                }
               }
             }
           } else if (is_fts_or_async_fts_index(index_arg_.index_type_)) {

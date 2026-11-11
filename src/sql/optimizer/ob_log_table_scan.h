@@ -120,8 +120,8 @@ public:
 
 enum ObVectorAuxTableIdx //FARM COMPAT WHITELIST
 {
-  VEC_FIRST_AUX_TBL_IDX = 0,  // HNSW_DELTA_BUF_TABLE  or  IVF_CENTROID_TABLE or HNSW_HYBRID_LOG_TABLE
-  VEC_SECOND_AUX_TBL_IDX = 1, // HNSW_INDEX_ID_TABLE   or  IVF_CID_VEC_TABLE   or  IVF_PQ_CODE_TABLE
+  VEC_FIRST_AUX_TBL_IDX = 0,  // HNSW_DELTA_BUF_TABLE  or  IVF_CENTROID_TABLE or HNSW_HYBRID_LOG_TABLE or ASYNC_IVF_INDEX_TABLE
+  VEC_SECOND_AUX_TBL_IDX = 1, // HNSW_INDEX_ID_TABLE   or  IVF_CID_VEC_TABLE   or  IVF_PQ_CODE_TABLE or ASYNC_DELETE_TABLE
   VEC_THIRD_AUX_TBL_IDX = 2,  // HNSW_SNAPSHOT_DATA_TABLE  or  IVF_ROWKEY_CID_TABLE  or  IVF_PQ_ROWKEY_CID_TABLE
   VEC_FOURTH_AUX_TBL_IDX = 3, // HNSW_ROWKEY_VID_TABLE     or  IVF_SQ_META_TABLE     or  IVF_PQ_ID_TABLE
   VEC_FIFTH_AUX_TBL_IDX = 4,  // HNSW_VID_ROWKEY_TABLE
@@ -198,6 +198,15 @@ enum ObVectorIVFPQColumnIdx
   IVF_PQ_CODE_PIDS_COL = 7,        // pq_center_ids col in ivf_pq_code table
   IVF_PQ_ROWKEY_START = 8,
 };
+
+enum ObVectorAsyncIVFColumnIdx
+{
+  ASYNC_IVF_HIDDEN_PK_COL = 0,
+  ASYNC_IVF_TYPE_COL,
+  ASYNC_IVF_CID_COL,
+  ASYNC_IVF_DATA_COL,
+  ASYNC_IVF_MAX_COL_CNT
+};
 /*
 enum ObVectorAuxColumnIdx
 {
@@ -240,6 +249,7 @@ enum ObVectorAuxColumnIdx
 static const int IVF_FLAT_TBL_WITH_ROWKEY_CNT = 2;
 static const int IVF_SQ_TBL_WITH_ROWKEY_CNT = 2;
 static const int IVF_PQ_TBL_WITH_ROWKEY_CNT = 2;
+class ObAsyncIndexDeleteInfo;
 struct ObVecIndexInfo
 {
   ObVecIndexInfo(common::ObIAllocator &allocator)
@@ -269,14 +279,18 @@ struct ObVecIndexInfo
     knn_filter_mode_(ObKnnFilterMode::INVALID_KNN_FILTER_MODE),
     strategy_(ObVecIdxQueryStrategy::RECALL_FIRST),
     pre_filtering_timeout_(-1),
-    has_upper_topn_(true)
+    has_upper_topn_(true),
+    is_async_index_(false),
+    async_delete_info_(nullptr),
+    is_adaptive_specify_by_hint_(false)
   { }
   ~ObVecIndexInfo() {}
 
   TO_STRING_KV(K_(sort_key), KPC_(topk_limit_expr), KPC_(topk_offset_expr), KPC_(target_vec_column),
-              KPC_(vec_id_column), K_(aux_table_column), K_(aux_table_id), K_(main_table_tid), 
-              K_(vec_type), K_(vector_index_param), K_(query_param), K_(vec_index_name), K_(has_get_visible_column), K_(strategy),
-              K_(pre_filtering_timeout), K_(has_upper_topn));
+              KPC_(vec_id_column), K_(aux_table_column), K_(aux_table_id), K_(main_table_tid),
+              K_(vec_type), K_(vector_index_param), K_(query_param), K_(vec_index_name),
+              K_(has_get_visible_column), K_(strategy), K_(pre_filtering_timeout),
+              K_(has_upper_topn), K_(is_async_index), K_(is_adaptive_specify_by_hint));
   bool need_sort() const { return sort_key_.expr_ != nullptr; }
   inline void set_has_get_visible_column(bool value) { has_get_visible_column_ = value; }
   inline void set_vec_algorithm_type(ObVectorIndexAlgorithmType type) { vector_index_param_.type_ = type; }
@@ -307,6 +321,15 @@ struct ObVecIndexInfo
            vector_index_param_.type_ == ObVectorIndexAlgorithmType::VIAT_IVF_SQ8 ||
            vector_index_param_.type_ == ObVectorIndexAlgorithmType::VIAT_IVF_PQ;
   }
+  inline bool is_async_ivf_scan() const
+  {
+    return is_async_index_ &&
+           vector_index_param_.type_ == ObVectorIndexAlgorithmType::VIAT_DISK_BBQ;
+  }
+  inline void set_async_ivf_index(const VecIndexAccessInfo &access_info)
+  {
+    is_async_index_ = access_info.vec_extra_info_.is_async_index_;
+  }
   inline bool is_ivf_flat_scan() const { return vector_index_param_.type_ == ObVectorIndexAlgorithmType::VIAT_IVF_FLAT; }
   inline bool is_ivf_sq_scan() const { return vector_index_param_.type_ == ObVectorIndexAlgorithmType::VIAT_IVF_SQ8; }
   inline bool is_ivf_pq_scan() const { return vector_index_param_.type_ == ObVectorIndexAlgorithmType::VIAT_IVF_PQ; }
@@ -324,7 +347,10 @@ struct ObVecIndexInfo
   inline bool is_ivf_adaptive_scan() const { return is_ivf_vec_scan() && is_vec_adaptive_scan(); }
   inline bool is_ipivf_adaptive_scan() const { return is_ipivf_vec_scan() && is_vec_adaptive_scan(); }
   inline bool is_brute_force_scan() const { return vec_type_ == ObVecIndexType::VEC_INDEX_BRUTE_FORCE; }
-  inline bool need_index_back() const { return is_ivf_vec_scan() || is_hnsw_vec_scan() || is_spiv_scan();}
+  inline bool need_index_back() const
+  {
+    return is_ivf_vec_scan() || is_async_ivf_scan() || is_hnsw_vec_scan() || is_spiv_scan();
+  }
   uint64_t get_aux_table_id(ObVectorAuxTableIdx idx) const { return idx < aux_table_id_.count() ? aux_table_id_[idx] : OB_INVALID_ID; }
   ObColumnRefRawExpr* get_aux_table_column(int idx) const { return idx < aux_table_column_.count() ? aux_table_column_[idx] : nullptr; }
   int64_t get_extra_info_columns_count() const { return extra_info_columns_.count(); }
@@ -367,6 +393,10 @@ struct ObVecIndexInfo
   ObVecIdxQueryStrategy strategy_;
   int64_t pre_filtering_timeout_;
   bool has_upper_topn_;
+  bool is_async_index_;
+  // Owned either by the hybrid semantic node or by the logical plan allocator.
+  ObAsyncIndexDeleteInfo *async_delete_info_;
+  bool is_adaptive_specify_by_hint_;
 };
 
 struct ObPushDownTopNInfo
@@ -1062,6 +1092,8 @@ public:
     return is_skip_rowkey_doc_ ? is_tsc_with_domain_id() : is_tsc_with_domain_id() || has_func_lookup(); 
   }
   int prepare_hnsw_vector_access_exprs(ObVecIndexInfo &vc_info);
+  int prepare_async_ivf_vector_access_exprs();
+  int prepare_async_ivf_vector_access_exprs(ObVecIndexInfo &vec_info);
   int prepare_ivf_vector_access_exprs();
   int prepare_ivf_vector_access_exprs(ObVecIndexInfo &vc_info); // hybrid search overload
   int prepare_brute_force_vector_access_exprs(ObVecIndexInfo &vc_info);
@@ -1236,7 +1268,8 @@ public:
   inline bool need_get_rowkey_exprs() const
   {
     return index_back_ || has_func_lookup() || is_tsc_with_domain_id()
-      || ((is_text_retrieval_scan() || has_merge_fts_index() || has_es_match()) && need_skip_rowkey_doc());
+      || ((is_text_retrieval_scan() || has_merge_fts_index() || has_es_match()) && need_skip_rowkey_doc())
+      || (OB_NOT_NULL(vector_index_info_) && vector_index_info_->is_async_ivf_scan());
   }
 
   int check_das_need_keep_ordering();

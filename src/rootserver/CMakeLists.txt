@@ -165,6 +165,8 @@ ob_set_subtarget(ob_rootserver ddl_task
   ddl_task/ob_ddl_task.cpp
   ddl_task/ob_async_index_ddl_util.cpp
   ddl_task/ob_drop_index_task.cpp
+  ddl_task/ob_async_vector_index_build_task.cpp
+  ddl_task/ob_drop_async_vector_index_task.cpp
   ddl_task/ob_drop_fts_index_task.cpp
   ddl_task/ob_drop_vec_index_task.cpp
   ddl_task/ob_drop_primary_key_task.cpp

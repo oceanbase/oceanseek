@@ -23233,6 +23233,7 @@ SELECT
     when 33 then 'INC_DDL_DUMP' when 34 then 'INC_DDL_MERGE_CO' when 35 then 'INC_DDL_MERGE_CG'
     when 36 then 'INC_DDL_MEM_CO' when 37 then 'INC_DDL_MEM_CG' when 38 then 'INC_DDL_MEM'
     when 41 then 'INV_INDEX' when 42 then 'INC_INV_INDEX'
+    when 43 then 'IVF_INDEX' when 44 then 'INC_IVF_INDEX'
     else 'INVALID'
   end) as TABLE_TYPE,
  M.TENANT_ID,
@@ -45430,6 +45431,8 @@ def_table_schema(
         when 10 then "IVF_CACHE_REWARM"
         when 11 then "MEM_SYNC"
         when 12 then "ALTER_INDEX_PARAMS"
+        when 13 then "DISK_BBQ_CACHE_CLEAN"
+        when 14 then "DISK_BBQ_HGRAPH_BUILD"
         else "INVALID" END AS TASK_TYPE,
       target_scn as TASK_SCN,
       ret_code as RET_CODE,
@@ -45490,6 +45493,8 @@ def_table_schema(
         when 10 then "IVF_CACHE_REWARM"
         when 11 then "MEM_SYNC"
         when 12 then "ALTER_INDEX_PARAMS"
+        when 13 then "DISK_BBQ_CACHE_CLEAN"
+        when 14 then "DISK_BBQ_HGRAPH_BUILD"
         else "INVALID" END AS TASK_TYPE,
       target_scn as TASK_SCN,
       ret_code as RET_CODE,
@@ -45550,6 +45555,8 @@ def_table_schema(
         when 10 then "IVF_CACHE_REWARM"
         when 11 then "MEM_SYNC"
         when 12 then "ALTER_INDEX_PARAMS"
+        when 13 then "DISK_BBQ_CACHE_CLEAN"
+        when 14 then "DISK_BBQ_HGRAPH_BUILD"
         else "INVALID" END AS TASK_TYPE,
       target_scn as TASK_SCN,
       ret_code as RET_CODE,
@@ -45609,6 +45616,8 @@ def_table_schema(
         when 10 then "IVF_CACHE_REWARM"
         when 11 then "MEM_SYNC"
         when 12 then "ALTER_INDEX_PARAMS"
+        when 13 then "DISK_BBQ_CACHE_CLEAN"
+        when 14 then "DISK_BBQ_HGRAPH_BUILD"
         else "INVALID" END AS TASK_TYPE,
       target_scn as TASK_SCN,
       ret_code as RET_CODE,
@@ -46159,6 +46168,7 @@ SELECT
     when 33 then 'INC_DDL_DUMP' when 34 then 'INC_DDL_MERGE_CO' when 35 then 'INC_DDL_MERGE_CG'
     when 36 then 'INC_DDL_MEM_CO' when 37 then 'INC_DDL_MEM_CG' when 38 then 'INC_DDL_MEM'
     when 41 then 'INV_INDEX' when 42 then 'INC_INV_INDEX'
+    when 43 then 'IVF_INDEX' when 44 then 'INC_IVF_INDEX'
     else 'INVALID'
   end) as TABLE_TYPE,
  M.CG_IDX,
@@ -73725,6 +73735,7 @@ SELECT
     when 33 then 'INC_DDL_DUMP' when 34 then 'INC_DDL_MERGE_CO' when 35 then 'INC_DDL_MERGE_CG'
     when 36 then 'INC_DDL_MEM_CO' when 37 then 'INC_DDL_MEM_CG' when 38 then 'INC_DDL_MEM'
     when 41 then 'INV_INDEX' when 42 then 'INC_INV_INDEX'
+    when 43 then 'IVF_INDEX' when 44 then 'INC_IVF_INDEX'
     else 'INVALID'
   end) as TABLE_TYPE,
  M.LS_ID,

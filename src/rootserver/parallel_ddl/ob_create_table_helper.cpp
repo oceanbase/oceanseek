@@ -27,6 +27,7 @@
 #include "share/schema/ob_async_index_params.h"
 #include "share/ob_async_index_refresh_util.h"
 #include "share/schema/ob_schema_utils.h"
+#include "storage/async_index/ob_async_index_define.h"
 #include "storage/tablet/ob_async_index_refresh_info_mds_helper.h"
 
 using namespace oceanbase::lib;
@@ -769,19 +770,34 @@ int ObCreateTableHelper::generate_table_schema_()
       for (int64_t i = 0; OB_SUCC(ret) && i < arg_.index_arg_list_.size(); ++i) {
         if (share::schema::is_async_index(arg_.index_arg_list_.at(i).index_type_)) {
           uint64_t compat_version = 0;
+          const bool is_async_ivf = share::schema::is_async_ivf_index(
+              arg_.index_arg_list_.at(i).index_type_);
+          const uint64_t required_data_version = is_async_ivf
+                                                     ? DATA_VERSION_4_6_3_1
+                                                     : (has_async_search_index
+                                                        ? DATA_VERSION_4_6_2_1
+                                                        : DATA_VERSION_4_6_2_0);
           char default_params_buf[OB_MAX_INDEX_PARAMS_LENGTH] = {0};
           int64_t default_params_pos = 0;
           if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id_, compat_version))) {
             LOG_WARN("get min data_version failed", KR(ret), K_(tenant_id));
-          } else if (has_async_search_index
-                     && compat_version < DATA_VERSION_4_6_2_1) {
+          } else if (compat_version < required_data_version) {
             ret = OB_NOT_SUPPORTED;
-            LOG_WARN("async search index not supported before 4.6.2.1", KR(ret), K(compat_version));
-            LOG_USER_ERROR(OB_NOT_SUPPORTED, "async search index before version 4.6.2.1");
-          } else if (compat_version < DATA_VERSION_4_6_2_0) {
-            ret = OB_NOT_SUPPORTED;
-            LOG_WARN("async index not supported before 4.6.2", KR(ret), K(compat_version));
-            LOG_USER_ERROR(OB_NOT_SUPPORTED, "async index before version 4.6.2");
+            if (is_async_ivf) {
+              LOG_WARN("async DISK_BBQ index not supported before 4.6.2.2",
+                       KR(ret), K(compat_version));
+              LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                             "async DISK_BBQ index before version 4.6.2.2");
+            } else if (has_async_search_index) {
+              LOG_WARN("async search index not supported before 4.6.2.1",
+                       KR(ret), K(compat_version));
+              LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                             "async search index before version 4.6.2.1");
+            } else {
+              LOG_WARN("async index not supported before 4.6.2",
+                       KR(ret), K(compat_version));
+              LOG_USER_ERROR(OB_NOT_SUPPORTED, "async index before version 4.6.2");
+            }
           } else if (!arg_.index_arg_list_.at(i).is_inner_
                      && !share::ObAsyncIndexRefreshUtil::is_async_index_enabled(tenant_id_)) {
             // Defense-in-depth gate for user-triggered args. Inner paths

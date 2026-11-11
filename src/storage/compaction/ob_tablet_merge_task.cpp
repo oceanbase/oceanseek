@@ -313,7 +313,7 @@ ObTabletMergeDagParam::ObTabletMergeDagParam()
   :  skip_get_tablet_(false),
      need_swap_tablet_flag_(false),
      is_reserve_mode_(false),
-     is_inv_index_(false),
+     is_use_async_index_dag_(false),
      is_replace_minor_(false),
      is_transfer_replace_minor_(false),
      exec_mode_(ObExecMode::EXEC_MODE_LOCAL),
@@ -337,7 +337,7 @@ ObTabletMergeDagParam::ObTabletMergeDagParam(
   :  skip_get_tablet_(false),
      need_swap_tablet_flag_(false),
      is_reserve_mode_(false),
-     is_inv_index_(false),
+     is_use_async_index_dag_(false),
      is_replace_minor_(false),
      is_transfer_replace_minor_(false),
      exec_mode_(ObExecMode::EXEC_MODE_LOCAL),
@@ -360,7 +360,7 @@ bool ObTabletMergeDagParam::is_valid() const
          && is_valid_merge_type(merge_type_)
          && (!is_multi_version_merge(merge_type_) || merge_version_ >= 0)
          && is_valid_exec_mode(exec_mode_);
-  if (is_valid && is_inv_index_) {
+  if (is_valid && is_use_async_index_dag_) {
     is_valid = data_tablet_id_.is_valid();
   }
   if (is_valid && (is_replace_minor_ || is_transfer_replace_minor_)) {
@@ -369,7 +369,7 @@ bool ObTabletMergeDagParam::is_valid() const
   if (is_valid && is_minor_merge_type(merge_type_) && is_output_exec_mode(exec_mode_)) {
     is_valid = reorganization_scn_.is_valid();
   }
-  if (is_valid && is_inv_index_ && is_output_exec_mode(exec_mode_)) {
+  if (is_valid && is_use_async_index_dag_ && is_output_exec_mode(exec_mode_)) {
     is_valid = reorganization_scn_.is_valid();
   }
   if (is_valid && is_upload_minor_exec_mode(exec_mode_)) {
@@ -912,7 +912,7 @@ int ObTabletMergeDag::alloc_merge_ctx()
 #else
    ctx_ = NEW_CTX(ObTabletMiniMergeCtx);
 #endif
-  } else if (param_.is_inv_index_) {
+  } else if (param_.is_use_async_index_dag_) {
     if (is_local_exec_mode(param_.exec_mode_)) {
       ctx_ = NEW_CTX(ObAsyncIndexMergeCtx);
 #ifdef OB_BUILD_SHARED_STORAGE

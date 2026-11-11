@@ -1683,7 +1683,7 @@ int ObTenantTabletScheduler::user_request_schedule_medium_merge(
     } else if (OB_UNLIKELY(!tablet_handle.is_valid() || OB_ISNULL(tablet_handle.get_obj()))) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid tablet handle", KR(ret), K(ls_id), K(tablet_id));
-    } else if (tablet_handle.get_obj()->is_async_inverted_storage_index()) {
+    } else if (tablet_handle.get_obj()->is_async_index_storage_tablet()) {
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("not supported to schedule medium for async index tablet directly",
           K(ret), K(ls_id), K(tablet_id));

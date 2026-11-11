@@ -6,6 +6,13 @@
 #define USING_LOG_PREFIX TEST
 #include <getopt.h>
 #include <gtest/gtest.h>
+#include <string>
+#include <atomic>
+#include <chrono>
+#include <cinttypes>
+#include <cstdio>
+#include <future>
+#include <thread>
 #define protected public
 #define private public
 #include "share/scheduler/test_dag_common.h"
@@ -13,6 +20,8 @@
 #include "lib/random/ob_random.h"
 #include "storage/ddl/ob_ddl_independent_dag.h"
 #include "storage/ddl/ob_ddl_dag_monitor_mgr.h"
+#include "storage/ddl/ob_ddl_dag_monitor_entry.h"
+#include "storage/blocksstable/vector_index/ob_ivf_refresh_monitor.h"
 #include "observer/omt/ob_multi_tenant.h"
 #include "observer/table_load/dag/ob_table_load_dag.h"
 #include "observer/table_load/ob_table_load_store_ctx.h"
@@ -1269,10 +1278,19 @@ public:
 class ObTestMonitoredTask : public ObITaskWithMonitor
 {
 public:
-  ObTestMonitoredTask() : ObITaskWithMonitor(ObITask::TASK_TYPE_UT), result_(nullptr), ret_(OB_SUCCESS) {}
+  ObTestMonitoredTask() : ObITaskWithMonitor(ObITask::TASK_TYPE_UT), result_(nullptr), ret_(OB_SUCCESS),
+      destroyed_after_finish_(nullptr), node_(nullptr) {}
+  ~ObTestMonitoredTask() override
+  {
+    if (nullptr != destroyed_after_finish_) {
+      *destroyed_after_finish_ = node_->is_finished();
+    }
+  }
   int process() override { ++*result_; return ret_; }
   int64_t *result_;
   int ret_;
+  bool *destroyed_after_finish_;
+  storage::ObDDLDagMonitorNode *node_;
 };
 
 TEST_F(TestIndependentDag, monitor_registration_replaces_finished_node)
@@ -1350,14 +1368,22 @@ TEST_F(TestIndependentDag, table_load_monitor_initialization)
     ASSERT_EQ(OB_SUCCESS, node.init(storage::ObDDLDagMonitorNode::Key(&dag, id)));
     ASSERT_EQ(OB_SUCCESS, registration.init(node));
     ASSERT_EQ(OB_SUCCESS, dag.basic_init(allocator_));
-    // Exercise the real stack-allocated ObTableLoadDagInitParam, which is not a DDL param.
+    // TableLoad uses its own init param and must preserve non-refresh monitoring errors.
     ASSERT_EQ(fail ? OB_ALLOCATE_MEMORY_FAILED : OB_SUCCESS, dag.init(&store_ctx));
+    ASSERT_EQ(&node, dag.get_monitor_node());
     ASSERT_FALSE(node.is_async_index_refresh_);
     ASSERT_EQ(bool(fail), nullptr == dag.root_monitor_info_);
+    if (fail) {
+      ASSERT_GT(allocator.failures_, 0);
+      ASSERT_EQ(0, allocator.successes_);
+    } else {
+      ASSERT_EQ(0, allocator.failures_);
+      ASSERT_GT(allocator.successes_, 0);
+    }
   }
 }
 
-TEST_F(TestIndependentDag, async_refresh_node_allocation_failure)
+TEST_F(TestIndependentDag, ddl_build_and_refresh_node_allocation_failure)
 {
   // No tenant unit is registered: cleanup cannot raise the test allocator's limit.
   omt::ObMultiTenant omt;
@@ -1403,7 +1429,7 @@ TEST_F(TestIndependentDag, async_refresh_node_allocation_failure)
   }
 }
 
-TEST_F(TestIndependentDag, async_refresh_root_monitor_allocation_failure)
+TEST_F(TestIndependentDag, ddl_build_and_refresh_root_monitor_allocation_failure)
 {
   for (int async = 0; async < 2; ++async) {
     ObTestMonitorAllocator allocator;
@@ -1437,7 +1463,7 @@ TEST_F(TestIndependentDag, async_refresh_root_monitor_allocation_failure)
   }
 }
 
-TEST_F(TestIndependentDag, async_refresh_task_monitor_allocation_failure)
+TEST_F(TestIndependentDag, ddl_build_and_refresh_task_monitor_allocation_failure)
 {
   for (int async = 0; async < 2; ++async) {
     for (int batch = 0; batch < 2; ++batch) {
@@ -1474,6 +1500,8 @@ TEST_F(TestIndependentDag, async_refresh_task_monitor_allocation_failure)
         if (async) {
           ASSERT_EQ(OB_SUCCESS, dag.process());
           ASSERT_EQ(2, result);
+        } else {
+          ASSERT_EQ(0, result);
         }
       }
       ASSERT_TRUE(node.is_finished());
@@ -1481,7 +1509,7 @@ TEST_F(TestIndependentDag, async_refresh_task_monitor_allocation_failure)
   }
 }
 
-TEST_F(TestIndependentDag, async_refresh_batch_monitor_partial_allocation_failure)
+TEST_F(TestIndependentDag, ddl_build_and_refresh_batch_monitor_partial_allocation_failure)
 {
   for (int async = 0; async < 2; ++async) {
     ObTestMonitorAllocator allocator;
@@ -1527,7 +1555,7 @@ TEST_F(TestIndependentDag, async_refresh_batch_monitor_partial_allocation_failur
   }
 }
 
-TEST_F(TestIndependentDag, async_refresh_monitor_preserves_other_errors)
+TEST_F(TestIndependentDag, ddl_monitor_preserves_other_errors)
 {
   ObTestRefreshMonitorParam param;
   param.ddl_task_param_.is_async_index_refresh_ = true;
@@ -1564,6 +1592,314 @@ TEST_F(TestIndependentDag, async_refresh_monitor_preserves_other_errors)
       node.is_inited_ = true;
     }
   }
+}
+
+static bool read_monitor_log_counter(const std::string &text, const char *key, int64_t &value)
+{
+  const size_t pos = text.find(key);
+  return pos != std::string::npos
+      && 1 == sscanf(text.c_str() + pos + strlen(key), "%" SCNd64, &value);
+}
+
+TEST_F(TestIndependentDag, monitor_node_log_snapshot_format)
+{
+  storage::ObDDLDagMonitorNode node(&allocator_);
+  ObDagId id;
+  ASSERT_EQ(OB_SUCCESS, ObSysTaskStatMgr::get_instance().generate_task_id(id));
+  ASSERT_EQ(OB_SUCCESS, node.init(storage::ObDDLDagMonitorNode::Key(&node, id)));
+  char buf[2048] = {};
+  ASSERT_GT(node.to_string(buf, sizeof(buf)), 0);
+  int64_t value = -1;
+  ASSERT_TRUE(read_monitor_log_counter(buf, "ref_cnt:", value));
+  ASSERT_EQ(0, value);
+  ASSERT_TRUE(read_monitor_log_counter(buf, "finish_timestamp:", value));
+  ASSERT_EQ(0, value);
+  ASSERT_TRUE(read_monitor_log_counter(buf, "info_list_.get_size():", value));
+  ASSERT_EQ(0, value);
+  storage::ObDDLDagMonitorInfo *info = nullptr;
+  ASSERT_EQ(OB_SUCCESS, node.alloc_monitor_info(nullptr, info));
+  node.mark_finished();
+  ASSERT_GT(node.to_string(buf, sizeof(buf)), 0);
+  ASSERT_TRUE(read_monitor_log_counter(buf, "finish_timestamp:", value));
+  ASSERT_EQ(node.get_finish_timestamp(), value);
+  ASSERT_TRUE(read_monitor_log_counter(buf, "info_list_.get_size():", value));
+  ASSERT_EQ(1, value);
+  char small_buf[16];
+  MEMSET(small_buf, 'x', sizeof(small_buf));
+  node.to_string(small_buf, 8);
+  for (int i = 8; i < sizeof(small_buf); ++i) {
+    ASSERT_EQ('x', small_buf[i]);
+  }
+}
+
+static int64_t print_monitor_node_log(
+    storage::ObDDLDagMonitorNode *node, std::promise<void> *entered)
+{
+  char buf[2048] = {};
+  entered->set_value();
+  return node->to_string(buf, sizeof(buf));
+}
+
+TEST_F(TestIndependentDag, monitor_node_log_waits_for_info_list_lock)
+{
+  storage::ObDDLDagMonitorNode node(&allocator_);
+  ObDagId id;
+  ASSERT_EQ(OB_SUCCESS, ObSysTaskStatMgr::get_instance().generate_task_id(id));
+  ASSERT_EQ(OB_SUCCESS, node.init(storage::ObDDLDagMonitorNode::Key(&node, id)));
+  std::promise<void> entered;
+  std::future<void> started = entered.get_future();
+  std::future<int64_t> printed;
+  std::future_status status;
+  {
+    SpinWLockGuard guard(node.lock_);
+    printed = std::async(std::launch::async, print_monitor_node_log, &node, &entered);
+    started.wait();
+    // Logging must wait for a concurrent list mutation, not read its size without the lock.
+    status = printed.wait_for(std::chrono::milliseconds(100));
+  }
+  const int64_t printed_size = printed.get();
+  ASSERT_EQ(std::future_status::timeout, status);
+  ASSERT_GT(printed_size, 0);
+}
+
+struct ObTestMonitorLogContext
+{
+  explicit ObTestMonitorLogContext(storage::ObDDLDagMonitorNode *node)
+    : node_(node), start_(false), ready_(0), failures_(0) {}
+  storage::ObDDLDagMonitorNode *node_;
+  std::atomic<bool> start_;
+  std::atomic<int> ready_;
+  std::atomic<int> failures_;
+};
+
+static void wait_for_monitor_log_start(ObTestMonitorLogContext &ctx)
+{
+  ctx.ready_.fetch_add(1);
+  while (!ctx.start_.load()) {
+    std::this_thread::yield();
+  }
+}
+
+static void update_monitor_log_references(ObTestMonitorLogContext *ctx)
+{
+  wait_for_monitor_log_start(*ctx);
+  ctx->node_->mark_finished();
+  for (int i = 0; i < 4000; ++i) {
+    ctx->node_->inc_ref();
+    ctx->node_->dec_ref();
+  }
+}
+
+static void update_monitor_log_infos(ObTestMonitorLogContext *ctx)
+{
+  wait_for_monitor_log_start(*ctx);
+  for (int i = 0; i < 2000; ++i) {
+    storage::ObDDLDagMonitorInfo *info = nullptr;
+    if (OB_SUCCESS != ctx->node_->alloc_monitor_info(nullptr, info)
+        || nullptr == info || OB_SUCCESS != ctx->node_->clean_infos(false)) {
+      ctx->failures_.fetch_add(1);
+      break;
+    }
+  }
+}
+
+static void read_monitor_log_snapshots(ObTestMonitorLogContext *ctx)
+{
+  wait_for_monitor_log_start(*ctx);
+  for (int i = 0; i < 4000; ++i) {
+    char text[2048] = {};
+    int64_t ref_cnt = -1;
+    int64_t finish_timestamp = -1;
+    int64_t info_count = -1;
+    if (ctx->node_->to_string(text, sizeof(text)) <= 0
+        || !read_monitor_log_counter(text, "ref_cnt:", ref_cnt)
+        || !read_monitor_log_counter(text, "finish_timestamp:", finish_timestamp)
+        || !read_monitor_log_counter(text, "info_list_.get_size():", info_count)
+        || ref_cnt < 1 || ref_cnt > 2 || finish_timestamp < 0
+        || info_count < 0 || info_count > 1) {
+      ctx->failures_.fetch_add(1);
+      break;
+    }
+  }
+}
+
+TEST_F(TestIndependentDag, monitor_node_log_concurrent_updates)
+{
+  void *buf = allocator_.alloc(sizeof(storage::ObDDLDagMonitorNode));
+  ASSERT_NE(nullptr, buf);
+  auto *node = new (buf) storage::ObDDLDagMonitorNode(&allocator_);
+  node->inc_ref(); // Keep a base reference until every logging/writer thread has joined.
+  DEFER(node->dec_ref());
+  ObDagId id;
+  ASSERT_EQ(OB_SUCCESS, ObSysTaskStatMgr::get_instance().generate_task_id(id));
+  ASSERT_EQ(OB_SUCCESS, node->init(storage::ObDDLDagMonitorNode::Key(node, id)));
+  ObTestMonitorLogContext ctx(node);
+  std::thread references(update_monitor_log_references, &ctx);
+  std::thread infos(update_monitor_log_infos, &ctx);
+  std::thread reader(read_monitor_log_snapshots, &ctx);
+  while (ctx.ready_.load() < 3) {
+    std::this_thread::yield();
+  }
+  ctx.start_.store(true);
+  references.join();
+  infos.join();
+  reader.join();
+  ASSERT_EQ(0, ctx.failures_.load());
+  ASSERT_EQ(1, ATOMIC_LOAD(&node->ref_cnt_));
+  ASSERT_TRUE(node->is_finished());
+  ASSERT_EQ(0, node->info_list_.get_size());
+}
+
+TEST_F(TestIndependentDag, monitor_node_finishes_only_after_task_destruction)
+{
+  ObTestMonitorAllocator allocator;
+  storage::ObDDLDagMonitorNode node(&allocator);
+  bool destroyed_after_finish = true;
+  {
+    ObIndependentExampleDag dag;
+    ObDagId id;
+    ASSERT_EQ(OB_SUCCESS, ObSysTaskStatMgr::get_instance().generate_task_id(id));
+    ASSERT_EQ(OB_SUCCESS, node.init(storage::ObDDLDagMonitorNode::Key(&dag, id)));
+    ASSERT_EQ(OB_SUCCESS, dag.basic_init(allocator_));
+    dag.monitor_node_ = &node;
+    ObTestMonitoredTask *task = nullptr;
+    ASSERT_EQ(OB_SUCCESS, dag.alloc_task(task));
+    task->destroyed_after_finish_ = &destroyed_after_finish;
+    task->node_ = &node;
+    ASSERT_EQ(OB_SUCCESS, dag.add_task(*task));
+  }
+  ASSERT_FALSE(destroyed_after_finish);
+  ASSERT_TRUE(node.is_finished());
+}
+
+TEST_F(TestIndependentDag, reset_finishes_monitor_after_both_task_lists_and_is_repeatable)
+{
+  ObTestMonitorAllocator allocator;
+  storage::ObDDLDagMonitorNode node(&allocator);
+  bool destroyed_after_finish[2] = {true, true};
+  ObIndependentExampleDag dag;
+  ObDagId id;
+  ASSERT_EQ(OB_SUCCESS, ObSysTaskStatMgr::get_instance().generate_task_id(id));
+  ASSERT_EQ(OB_SUCCESS, node.init(storage::ObDDLDagMonitorNode::Key(&dag, id)));
+  ASSERT_EQ(OB_SUCCESS, dag.basic_init(allocator_));
+  dag.monitor_node_ = &node;
+  for (int i = 0; i < 2; ++i) {
+    ObTestMonitoredTask *task = nullptr;
+    ASSERT_EQ(OB_SUCCESS, dag.alloc_task(task));
+    task->destroyed_after_finish_ = &destroyed_after_finish[i];
+    task->node_ = &node;
+    ASSERT_EQ(OB_SUCCESS, dag.add_task(*task));
+    if (0 == i) {
+      // Move only the first task to the ready list; leave the second waiting.
+      ASSERT_EQ(OB_SUCCESS, dag.update_ready_task_list());
+    }
+  }
+  ASSERT_EQ(1, dag.task_list_.get_size());
+  ASSERT_EQ(1, dag.waiting_task_list_.get_size());
+  ASSERT_FALSE(node.is_finished());
+  dag.reset();
+  ASSERT_FALSE(destroyed_after_finish[0]);
+  ASSERT_FALSE(destroyed_after_finish[1]);
+  ASSERT_TRUE(dag.task_list_.is_empty());
+  ASSERT_TRUE(dag.waiting_task_list_.is_empty());
+  ASSERT_TRUE(node.is_finished());
+  ASSERT_EQ(nullptr, dag.get_monitor_node());
+  const int64_t finished_at = node.get_finish_timestamp();
+  // Repeated reset and the subsequent destructor must not finish the node again.
+  dag.reset();
+  ASSERT_EQ(nullptr, dag.get_monitor_node());
+  ASSERT_EQ(finished_at, node.get_finish_timestamp());
+}
+
+TEST_F(TestIndependentDag, monitor_cleanup_preserves_ttl_soft_limit_and_reader_refs)
+{
+  omt::ObMultiTenant omt;
+  auto *saved_omt = GCTX.omt_;
+  GCTX.omt_ = &omt;
+  DEFER(GCTX.omt_ = saved_omt);
+  storage::ObDDLDagMonitorMgr mgr;
+  ASSERT_EQ(OB_SUCCESS, mgr.node_map_.create(16, "TestDagMonitor"));
+  ASSERT_EQ(OB_SUCCESS, mgr.allocator_.init(&mgr, OB_MALLOC_NORMAL_BLOCK_SIZE,
+      ObMemAttr(MTL_ID(), "TestDagMonitor"), 16 * 1024 * 1024));
+  mgr.is_inited_ = true;
+  mgr.set_max_node_count(1);
+  int identities[3] = {0, 1, 2};
+  ObDagId ids[3];
+  storage::ObDDLDagMonitorNode *nodes[3] = {nullptr, nullptr, nullptr};
+  for (int i = 0; i < 3; ++i) {
+    ASSERT_EQ(OB_SUCCESS, ObSysTaskStatMgr::get_instance().generate_task_id(ids[i]));
+  }
+  ASSERT_EQ(OB_SUCCESS, mgr.register_node(&identities[0], ids[0], nodes[0]));
+  // Keep monitor info to exercise TTL retention; finished empty nodes are reclaimed eagerly.
+  storage::ObDDLDagMonitorInfo *retained_info = nullptr;
+  ASSERT_EQ(OB_SUCCESS, nodes[0]->alloc_monitor_info(nullptr, retained_info));
+  nodes[0]->inc_ref(); // A virtual-table reader outlives removal from the map.
+  DEFER(nodes[0]->dec_ref());
+  nodes[0]->mark_finished();
+  ASSERT_FALSE(nodes[0]->is_expired(ObTimeUtility::current_time(), mgr.ttl_us_));
+  ASSERT_EQ(OB_SUCCESS, mgr.register_node(&identities[1], ids[1], nodes[1]));
+  ASSERT_EQ(2, mgr.get_node_count()); // max count remains a cleanup threshold.
+  ASSERT_EQ(2, nodes[0]->ref_cnt_);
+  ASSERT_EQ(ids[0], nodes[0]->get_trace_id());
+  ASSERT_EQ(OB_SUCCESS, mgr.register_node(&identities[2], ids[2], nodes[2]));
+  ASSERT_NE(nullptr, nodes[2]);
+  ASSERT_EQ(OB_SUCCESS, mgr.clean_nodes(storage::ObDDLDagMonitorMgr::CLEAN_FINISHED_INFO));
+  ASSERT_EQ(3, mgr.get_node_count()); // Finished, unexpired nodes stay in the map.
+  ASSERT_FALSE(nodes[1]->is_finished());
+  ATOMIC_STORE(&nodes[0]->finish_timestamp_, ObTimeUtility::current_time() - mgr.ttl_us_ - 1);
+  ASSERT_EQ(OB_SUCCESS, mgr.clean_nodes(storage::ObDDLDagMonitorMgr::CLEAN_EXPIRED_NODE));
+  ASSERT_EQ(2, mgr.get_node_count());
+  ASSERT_EQ(1, nodes[0]->ref_cnt_); // Existing readers still own the expired node.
+  ASSERT_EQ(ids[0], nodes[0]->get_trace_id());
+}
+
+TEST_F(TestIndependentDag, monitor_cleanup_keeps_refresh_commit_visible_after_dag_finishes)
+{
+  omt::ObMultiTenant omt;
+  auto *saved_omt = GCTX.omt_;
+  GCTX.omt_ = &omt;
+  DEFER(GCTX.omt_ = saved_omt);
+  storage::ObDDLDagMonitorMgr mgr;
+  ASSERT_EQ(OB_SUCCESS, mgr.node_map_.create(16, "TestDagMonitor"));
+  ASSERT_EQ(OB_SUCCESS, mgr.allocator_.init(&mgr, OB_MALLOC_NORMAL_BLOCK_SIZE,
+      ObMemAttr(MTL_ID(), "TestDagMonitor"), 16 * 1024 * 1024));
+  mgr.is_inited_ = true;
+  int identity = 0;
+  ObDagId id;
+  ASSERT_EQ(OB_SUCCESS, ObSysTaskStatMgr::get_instance().generate_task_id(id));
+  storage::ObDDLDagMonitorNode *node = nullptr;
+  ASSERT_EQ(OB_SUCCESS, mgr.register_node(&identity, id, node));
+  auto *refresh = OB_NEW(storage::ObIVFRefreshMonitor, ObMemAttr(MTL_ID(), "IVFRefreshPerf"));
+  ASSERT_NE(nullptr, refresh);
+  DEFER(refresh->dec_ref());
+  refresh->init(node, 1, 1, 1001, 1, 2);
+  DEFER(refresh->finish(OB_CANCELED)); // Drain monitor ownership even if an assertion fails.
+  refresh->begin_stage(share::ObIVFRefreshProgress::COMMIT);
+  node->mark_finished(); // SQL DAG ended; refresh transaction has not ended yet.
+  ASSERT_EQ(2, node->ref_cnt_);
+  ASSERT_EQ(OB_SUCCESS, mgr.clean_nodes(storage::ObDDLDagMonitorMgr::CLEAN_FINISHED_INFO));
+  ASSERT_EQ(1, mgr.get_node_count());
+  storage::ObDDLDagMonitorNode *visible_node = nullptr;
+  ASSERT_EQ(OB_SUCCESS, mgr.node_map_.get_refactored(node->get_key(), visible_node));
+  ASSERT_EQ(node, visible_node);
+  ObSEArray<storage::ObDDLDagMonitorEntry *, 16> entries;
+  ASSERT_EQ(OB_SUCCESS, node->get_all_infos(allocator_, entries));
+  ASSERT_GT(entries.count(), 0);
+  bool commit_visible = false;
+  for (auto *entry : entries) {
+    const ObString &message = entry->get_message();
+    std::string text(message.ptr(), message.length());
+    commit_visible |= std::string::npos != text.find("\"stage\":\"COMMIT\"")
+        && std::string::npos != text.find("\"state\":\"RUNNING\"");
+    entry->~ObDDLDagMonitorEntry();
+    allocator_.free(entry);
+  }
+  ASSERT_TRUE(commit_visible);
+  refresh->finish(OB_SUCCESS);
+  ASSERT_EQ(1, node->ref_cnt_);
+  ASSERT_EQ(OB_SUCCESS, mgr.clean_nodes(storage::ObDDLDagMonitorMgr::CLEAN_FINISHED_INFO));
+  ASSERT_EQ(1, mgr.get_node_count());
+  ASSERT_EQ(0, node->info_list_.get_size());
 }
 
 TEST_F(TestIndependentDag, test_independent_dag)

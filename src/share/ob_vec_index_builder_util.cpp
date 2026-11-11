@@ -5,9 +5,11 @@
 
 #define USING_LOG_PREFIX COMMON
 #include "ob_vec_index_builder_util.h"
+#include "ob_ddl_common.h"
 #include "ob_index_builder_util.h"
 #include "sql/resolver/expr/ob_raw_expr_util.h"
 #include "ob_fts_index_builder_util.h"
+#include "sql/ob_sql_utils.h"
 #include "share/vector_index/ob_plugin_vector_index_utils.h"
 #include "share/vector_index/ob_plugin_vector_index_service.h"
 
@@ -42,6 +44,82 @@ const char * ObVecIndexBuilderUtil::IVF_PQ_CENTER_IDS_COL_TYPE_NAME = "ARRAY(VAR
 
 // spiv
 const char * ObVecIndexBuilderUtil::SPIV_DIM_DOCID_VALUE_TABLE_NAME_SUFFIX = "";
+
+int ObVecIndexBuilderUtil::adjust_async_ivf_args(
+    ObCreateIndexArg &index_arg,
+    ObTableSchema &data_schema,
+    ObIAllocator &allocator,
+    ObIArray<ObColumnSchemaV2 *> &gen_columns)
+{
+  int ret = OB_SUCCESS;
+  const ObColumnSchemaV2 *rowkey_column = nullptr;
+  enum VecIVFColumnIndex
+  {
+    VEC_IVF_TYPE_COLUMN = 0,
+    VEC_IVF_CID_COLUMN,
+    VEC_IVF_DATA_COLUMN,
+    VEC_IVF_GENERATED_COLUMN_COUNT
+  };
+  const VecColType column_types[VEC_IVF_GENERATED_COLUMN_COUNT] = {
+    VEC_IVF_TYPE_COL,
+    VEC_IVF_CID_COL,
+    VEC_IVF_DATA_COL
+  };
+  ObColumnSchemaV2 *generated_columns[VEC_IVF_GENERATED_COLUMN_COUNT] = {nullptr};
+  if (OB_UNLIKELY(!is_async_ivf_index(index_arg.index_type_)
+                  || 1 != index_arg.index_columns_.count())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async IVF index argument", K(ret), K(index_arg.index_type_),
+             K(index_arg.index_columns_.count()));
+  } else if (OB_FAIL(check_vec_cols(&index_arg, data_schema))) {
+    LOG_WARN("failed to check async IVF source column", K(ret), K(index_arg));
+  } else if (OB_ISNULL(rowkey_column =
+      data_schema.get_column_schema(OB_HIDDEN_PK_INCREMENT_COLUMN_ID))) {
+    ret = OB_SCHEMA_ERROR;
+    LOG_WARN("async IVF heap hidden pk column not found", K(ret), K(data_schema));
+  } else {
+    for (int64_t role = 0; OB_SUCC(ret) && role < VEC_IVF_GENERATED_COLUMN_COUNT; ++role) {
+      const uint64_t column_id = data_schema.get_max_used_column_id() + 1;
+      if (OB_FAIL(generate_vec_ivf_column(&index_arg, column_id, column_types[role],
+                                         data_schema, generated_columns[role]))) {
+        LOG_WARN("failed to generate async IVF column", K(ret), K(role), K(column_id));
+      } else if (OB_FAIL(gen_columns.push_back(generated_columns[role]))) {
+        LOG_WARN("failed to append async IVF generated column", K(ret), K(role));
+      }
+    }
+  }
+  if (OB_SUCC(ret)) {
+    index_arg.index_columns_.reuse();
+    index_arg.store_columns_.reuse();
+    const ObColumnSchemaV2 *rowkey_columns[] = {
+      generated_columns[VEC_IVF_TYPE_COLUMN],
+      generated_columns[VEC_IVF_CID_COLUMN],
+      rowkey_column
+    };
+    for (int64_t i = 0; OB_SUCC(ret) && i < ARRAYSIZEOF(rowkey_columns); ++i) {
+      ObColumnSortItem sort_item;
+      if (OB_ISNULL(rowkey_columns[i])) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("null async IVF rowkey column", K(ret), K(i));
+      } else if (OB_FAIL(ob_write_string(allocator,
+                 rowkey_columns[i]->get_column_name_str(), sort_item.column_name_))) {
+        LOG_WARN("failed to copy async IVF rowkey name", K(ret), K(i));
+      } else if (OB_FAIL(index_arg.index_columns_.push_back(sort_item))) {
+        LOG_WARN("failed to append async IVF rowkey", K(ret), K(i));
+      }
+    }
+    ObString data_column_name;
+    if (OB_FAIL(ret)) {
+    } else if (OB_FAIL(ob_write_string(allocator,
+               generated_columns[VEC_IVF_DATA_COLUMN]->get_column_name_str(),
+               data_column_name))) {
+      LOG_WARN("failed to copy async IVF data column name", K(ret));
+    } else if (OB_FAIL(index_arg.store_columns_.push_back(data_column_name))) {
+      LOG_WARN("failed to append async IVF data column", K(ret));
+    }
+  }
+  return ret;
+}
 
 int ObVecIndexBuilderUtil::append_vec_args(
     const share::schema::ObTableSchema &data_schema,
@@ -90,7 +168,13 @@ int ObVecIndexBuilderUtil::append_vec_args(
       && OB_FAIL(ObVecIndexBuilderUtil::generate_column_name_for_arg(index_arg.allocator_, data_schema, index_arg))) {
     LOG_WARN("failed to generate column name for create index arg", K(ret));
   } else {
-    if (index_arg.index_type_ == INDEX_TYPE_VEC_DELTA_BUFFER_LOCAL && 
+    if (share::schema::is_async_ivf_index(index_arg.index_type_)) {
+      if (OB_FAIL(index_arg_list.push_back(index_arg))) {
+        LOG_WARN("failed to append async IVF index arg", K(ret));
+      } else if (OB_FAIL(resolve_results.push_back(resolve_result))) {
+        LOG_WARN("failed to append async IVF resolve result", K(ret));
+      }
+    } else if (index_arg.index_type_ == INDEX_TYPE_VEC_DELTA_BUFFER_LOCAL &&
         OB_FAIL(ObVecIndexBuilderUtil::append_vec_hnsw_args(data_schema,
                                                             resolve_result, 
                                                             index_arg, 
@@ -664,16 +748,18 @@ int ObVecIndexBuilderUtil::check_vec_index_allowed(
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(data_schema));
   } else if (data_schema.is_partitioned_table() && data_schema.is_table_without_pk()) {
+    const bool is_ivf_index = share::schema::is_local_vec_ivf_index(index_type)
+                              || share::schema::is_async_ivf_index(index_type);
     if (share::schema::is_vec_spiv_index_aux(index_type) || share::schema::is_local_vec_hnsw_index(index_type) ||
-        share::schema::is_local_vec_ivf_index(index_type)) {
+        is_ivf_index) {
       uint64_t tenant_id = data_schema.get_tenant_id();
       uint64_t data_version = 0;
       if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, data_version))) {
         LOG_WARN("get tenant data version failed", K(ret));
-      } else if (!share::schema::is_local_vec_ivf_index(index_type) && data_version < DATA_VERSION_4_4_1_0) {
+      } else if (!is_ivf_index && data_version < DATA_VERSION_4_4_1_0) {
         ret = OB_NOT_SUPPORTED;
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "tcreate vector index on partition table without primary key");
-      } else if (share::schema::is_local_vec_ivf_index(index_type) && data_version < DATA_VERSION_4_5_1_0) {
+      } else if (is_ivf_index && data_version < DATA_VERSION_4_5_1_0) {
         ret = OB_NOT_SUPPORTED;
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "create vec ivf index on partition table without primary key");
       }
@@ -910,15 +996,27 @@ int ObVecIndexBuilderUtil::generate_vec_index_name(
   if (OB_ISNULL(allocator)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("allocator is nullptr", K(ret));
-  } else if (!share::schema::is_vec_index(type)) {
+  } else if (!share::schema::is_vec_or_async_vec_index(type)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(type));
+  } else if (share::schema::is_async_ivf_index(type)
+             && OB_FAIL(ObIndexBuilderUtil::check_async_index_name(index_name))) {
+    LOG_WARN("failed to check async vector index name", K(ret), K(index_name));
   } else if (OB_ISNULL(name_buf = static_cast<char *>(allocator->alloc(OB_MAX_TABLE_NAME_LENGTH)))) {
     ret = common::OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("fail to alloc mem", K(ret));
   } else {
     int64_t pos = 0;
-    if (share::schema::is_vec_ivf_index(type)) {
+    if (share::schema::is_async_ivf_index(type)) {
+      if (OB_FAIL(databuff_printf(name_buf,
+                                  OB_MAX_TABLE_NAME_LENGTH,
+                                  pos,
+                                  "%.*s",
+                                  index_name.length(),
+                                  index_name.ptr()))) {
+        LOG_WARN("fail to copy async DISK_BBQ index name", K(ret), K(index_name));
+      }
+    } else if (share::schema::is_vec_ivf_index(type)) {
       if (OB_FAIL(generate_vec_ivf_index_name(type, index_name, name_buf, pos))) {
         LOG_WARN("fail to generate vec ivf index name", K(ret), K(type));
       }
@@ -1948,6 +2046,10 @@ int ObVecIndexBuilderUtil::adjust_vec_args(
   } else if (share::schema::is_vec_spiv_index(index_type)) {
     if (OB_FAIL(adjust_vec_spiv_args(index_arg, data_schema, allocator, gen_columns))) {
       LOG_WARN("fail to adjust vec spiv args", K(ret));
+    }
+  } else if (share::schema::is_async_ivf_index(index_type)) {
+    if (OB_FAIL(adjust_async_ivf_args(index_arg, data_schema, allocator, gen_columns))) {
+      LOG_WARN("fail to adjust async IVF args", K(ret));
     }
   } else {
     ret = OB_ERR_UNEXPECTED;
@@ -3534,6 +3636,39 @@ int ObVecIndexBuilderUtil::construct_ivf_partial_column_info(
         }
         break;
       }
+      case VEC_IVF_TYPE_COL: {
+        if (OB_FAIL(databuff_printf(vec_expr_def, OB_MAX_DEFAULT_VALUE_LENGTH,
+                                    def_pos, "VEC_IVF_TYPE("))) {
+          LOG_WARN("print IVF type expression prefix failed", K(ret));
+        } else {
+          collation_type = CS_TYPE_BINARY;
+          obj_type = ObIntType;
+          col_flag = GENERATED_VEC_IVF_TYPE_COLUMN_FLAG;
+        }
+        break;
+      }
+      case VEC_IVF_CID_COL: {
+        if (OB_FAIL(databuff_printf(vec_expr_def, OB_MAX_DEFAULT_VALUE_LENGTH,
+                                    def_pos, "VEC_IVF_CID("))) {
+          LOG_WARN("print IVF cid expression prefix failed", K(ret));
+        } else {
+          collation_type = CS_TYPE_BINARY;
+          obj_type = ObIntType;
+          col_flag = GENERATED_VEC_IVF_CID_COLUMN_FLAG;
+        }
+        break;
+      }
+      case VEC_IVF_DATA_COL: {
+        if (OB_FAIL(databuff_printf(vec_expr_def, OB_MAX_DEFAULT_VALUE_LENGTH,
+                                    def_pos, "VEC_IVF_DATA("))) {
+          LOG_WARN("print IVF data expression prefix failed", K(ret));
+        } else {
+          collation_type = CS_TYPE_BINARY;
+          obj_type = ObVarcharType;
+          col_flag = GENERATED_VEC_IVF_DATA_COLUMN_FLAG;
+        }
+        break;
+      }
       default: 
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected col type", K(ret), K(col_type));
@@ -3582,6 +3717,7 @@ int ObVecIndexBuilderUtil::generate_vec_ivf_column(
       for (int64_t i = 0; OB_SUCC(ret) && !is_state_col && i < index_arg->index_columns_.count(); ++i) {
         const ObString &column_name = index_arg->index_columns_.at(i).column_name_;
         ObColumnSchemaV2 *tmp_col_schema = nullptr;
+        ObString escaped_column_name;
         if (column_name.empty()) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("column name is empty", K(ret), K(column_name));
@@ -3590,7 +3726,14 @@ int ObVecIndexBuilderUtil::generate_vec_ivf_column(
           LOG_USER_ERROR(OB_ERR_KEY_COLUMN_DOES_NOT_EXITS, column_name.length(), column_name.ptr());
         } else if (OB_FAIL(column_schema.add_cascaded_column_id(tmp_col_schema->get_column_id()))) {
           LOG_WARN("add cascaded column to generated column failed", K(ret));
-        } else if (OB_FAIL(databuff_printf(vec_expr_def, OB_MAX_DEFAULT_VALUE_LENGTH, def_pos, "`%s`, ", tmp_col_schema->get_column_name()))) {
+        } else if (OB_FAIL(sql::ObSQLUtils::generate_new_name_with_escape_character(
+                       tmp_alloc, tmp_col_schema->get_column_name_str(),
+                       escaped_column_name, false /* is_oracle_mode */))) {
+          LOG_WARN("failed to escape IVF source column name", K(ret), K(column_name));
+        } else if (OB_FAIL(databuff_printf(vec_expr_def, OB_MAX_DEFAULT_VALUE_LENGTH,
+                                          def_pos, "`%.*s`, ",
+                                          escaped_column_name.length(),
+                                          escaped_column_name.ptr()))) {
           LOG_WARN("print column name to buffer failed", K(ret));
         } else if (ObCollectionSQLType == obj_type) {
           if (tmp_col_schema->get_extended_type_info().count() != 1) {
@@ -3654,12 +3797,15 @@ int ObVecIndexBuilderUtil::generate_vec_ivf_column(
             column_schema.add_column_flag(VIRTUAL_GENERATED_COLUMN_FLAG);
           }
           column_schema.set_data_type(obj_type);
-          if (col_type == IVF_PQ_CENTER_IDS_COL) {
+          if (IVF_PQ_CENTER_IDS_COL == col_type || VEC_IVF_DATA_COL == col_type) {
             column_schema.set_data_length(OB_MAX_VARCHAR_LENGTH);
           } else {
             column_schema.set_data_length(0);
           }
           column_schema.set_collation_type(collection_type);
+          if (ob_is_string_type(obj_type)) {
+            column_schema.set_charset_type(ObCharset::charset_type_by_coll(collection_type));
+          }
           column_schema.set_prev_column_id(UINT64_MAX);
           column_schema.set_next_column_id(UINT64_MAX);
           // State column should not be nullable, it should have default value 0 (NORMAL state)
@@ -5041,6 +5187,27 @@ int ObVecIndexBuilderUtil::generate_ivf_col_name_prefix(
         }
         break;
       }
+      case VEC_IVF_TYPE_COL: {
+        if (OB_FAIL(databuff_printf(col_name_buf, buf_len, name_pos,
+                                    OB_VEC_IVF_TYPE_COLUMN_NAME_PREFIX))) {
+          LOG_WARN("print IVF type column prefix failed", K(ret));
+        }
+        break;
+      }
+      case VEC_IVF_CID_COL: {
+        if (OB_FAIL(databuff_printf(col_name_buf, buf_len, name_pos,
+                                    OB_VEC_IVF_CID_COLUMN_NAME_PREFIX))) {
+          LOG_WARN("print IVF cid column prefix failed", K(ret));
+        }
+        break;
+      }
+      case VEC_IVF_DATA_COL: {
+        if (OB_FAIL(databuff_printf(col_name_buf, buf_len, name_pos,
+                                    OB_VEC_IVF_DATA_COLUMN_NAME_PREFIX))) {
+          LOG_WARN("print IVF data column prefix failed", K(ret));
+        }
+        break;
+      }
       default : 
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected column type", K(ret), K(col_type));
@@ -6246,12 +6413,14 @@ int ObVecIndexBuilderUtil::generate_vec_index_aux_columns(
     common::ObIAllocator &allocator,
     oceanbase::rootserver::ObDDLOperator &ddl_operator, 
     common::ObMySQLTransaction &trans, 
+    const ObColumnNameMap &col_name_map,
     common::hash::ObHashMap<ObString, common::ObSEArray<ObString, common::OB_PREALLOCATED_NUM>> &generate_column_name_map,
     ObSEArray<obrpc::ObColumnSortItem, 2> &domain_index_columns,
     ObSEArray<ObString, 1> &domain_store_columns)
 {
   int ret = OB_SUCCESS;
-  if (new_index_schema.is_vec_index()) {
+  if (new_index_schema.is_vec_index()
+      || new_index_schema.is_async_ivf_index()) {
     // rowkey vid index cannot find col_names.
     ObSEArray<ObString, 1> col_names;
     ObString prefix;
@@ -6259,7 +6428,30 @@ int ObVecIndexBuilderUtil::generate_vec_index_aux_columns(
     
     HEAP_VAR(obrpc::ObCreateIndexArg, index_arg) {
       index_arg.index_type_ = new_index_schema.get_index_type();
-      if (!new_index_schema.is_vec_shared_table_type()) {
+      if (new_index_schema.is_async_ivf_index()) {
+        const ObColumnSchemaV2 *orig_source_column = nullptr;
+        const ObColumnSchemaV2 *new_source_column = nullptr;
+        ObString new_source_column_name;
+        obrpc::ObColumnSortItem sort_item;
+        if (OB_FAIL(ObIndexBuilderUtil::get_async_ivf_source_column(
+                orig_table_schema, index_table_schema, orig_source_column))) {
+          LOG_WARN("failed to resolve async IVF source column", K(ret), K(index_table_schema));
+        } else if (OB_FAIL(col_name_map.get(orig_source_column->get_column_name_str(),
+                                            new_source_column_name))) {
+          LOG_WARN("failed to map async IVF source column after offline DDL",
+                   K(ret), KPC(orig_source_column), K(col_name_map));
+        } else if (OB_ISNULL(new_source_column =
+                                new_table_schema.get_column_schema(new_source_column_name))) {
+          ret = OB_ERR_KEY_COLUMN_DOES_NOT_EXITS;
+          LOG_WARN("async IVF source column does not exist after offline DDL",
+                   K(ret), KPC(orig_source_column), K(new_source_column_name), K(new_table_schema));
+        } else if (OB_FALSE_IT(sort_item.column_name_ = new_source_column->get_column_name_str())) {
+        } else if (OB_FAIL(index_arg.index_columns_.push_back(sort_item))) {
+          LOG_WARN("failed to add async IVF source column", K(ret), K(sort_item));
+        } else if (OB_FAIL(index_arg.index_schema_.assign(new_index_schema))) {
+          LOG_WARN("failed to copy async IVF index schema", K(ret), K(new_index_schema));
+        }
+      } else if (!new_index_schema.is_vec_shared_table_type()) {
         if (OB_FAIL(ObVectorIndexUtil::get_vector_index_column_name(orig_table_schema, index_table_schema, col_names))) {
           LOG_WARN("fail to get vector index column name", K(ret), K(index_table_schema));
         } else {
@@ -6309,6 +6501,19 @@ int ObVecIndexBuilderUtil::generate_vec_index_aux_columns(
         FOREACH_X(it, gen_columns, OB_SUCC(ret)) {
           if (OB_FAIL(ddl_operator.insert_single_column(trans, tmp_table_schema, *(*it)))) {
             LOG_WARN("failed to insert vec column", K(ret), KP(*it));
+          }
+        }
+        if (OB_SUCC(ret) && new_index_schema.is_async_ivf_index()) {
+          // Publish the augmented base schema before the rebuilt IVF schema.
+          // A column-only update leaves the hidden table version stale.
+          if (OB_FAIL(tmp_table_schema.assign(new_table_schema))) {
+            LOG_WARN("failed to copy async IVF generated-column table schema", K(ret));
+          } else {
+            tmp_table_schema.set_in_offline_ddl_white_list(true);
+            if (OB_FAIL(ddl_operator.update_table_attribute(
+                    tmp_table_schema, trans, OB_DDL_ALTER_TABLE))) {
+              LOG_WARN("failed to update rebuilt async IVF generated-column table version", K(ret));
+            }
           }
         }
       }

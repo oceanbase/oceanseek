@@ -690,6 +690,7 @@ TEST_F(TestTenantAsyncIndexRefresher, test_build_delete_old_sql_uses_own_decisio
   ObAsyncIndexInfo del_index;
   del_index.index_table_id_ = 120001;
   del_index.index_table_name_ = ObString("del_buf");
+  del_index.index_type_ = share::schema::INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL;
   // async delete index rowkey is __pk_increment; the delete-old path writes that
   // rowkey column into the buffer table (it doubles as the docid), so the rowkey
   // columns are all the delete SQL needs to project.
@@ -749,6 +750,7 @@ TEST_F(TestTenantAsyncIndexRefresher, test_build_insert_new_sql_for_non_delete_i
   ObAsyncIndexInfo fts_index;
   fts_index.index_table_id_ = 110001;
   fts_index.index_table_name_ = ObString("fts_idx");
+  fts_index.index_type_ = share::schema::INDEX_TYPE_ASYNC_FTS_INDEX_LOCAL;
   fts_index.is_delete_index_ = false;
   ASSERT_EQ(OB_SUCCESS, fts_index.select_columns_.push_back(ObString("c1")));
   ASSERT_EQ(OB_SUCCESS, fts_index.select_columns_.push_back(ObString("c2")));
@@ -773,6 +775,59 @@ TEST_F(TestTenantAsyncIndexRefresher, test_build_insert_new_sql_for_non_delete_i
   ASSERT_NE(nullptr, strstr(sql.ptr(), "FROM `test_db`.`test_table`"));
   ASSERT_NE(nullptr, strstr(sql.ptr(), "`OLD_NEW$$` = 'N'"));
   ASSERT_NE(nullptr, strstr(sql.ptr(), "ORDER BY `c1`"));
+}
+
+// Async IVF now follows the common INSERT...SELECT orchestration. Its projected
+// names are main-table generated columns (not fixed target-only placeholders),
+// and COMPLETE/INCREMENTAL differ only in the common SQL window semantics.
+TEST_F(TestTenantAsyncIndexRefresher, test_async_ivf_builds_common_refresh_sql)
+{
+  ObTenantAsyncIndexRefresher refresher;
+  ObAsyncIndexDataTableInfo info;
+  info.data_table_id_ = 100001;
+  info.database_name_ = ObString("test_db");
+  info.data_table_name_ = ObString("test_table");
+  info.schema_version_ = 9;
+  ObAsyncIndexDataTabletInfo data_tablet;
+  data_tablet.data_tablet_id_ = ObTabletID(200001);
+  ASSERT_EQ(OB_SUCCESS, info.data_tablet_infos_.push_back(data_tablet));
+
+  ObAsyncIndexInfo ivf_index;
+  ivf_index.index_table_id_ = 130001;
+  ivf_index.index_table_name_ = ObString("ivf_idx");
+  ivf_index.index_type_ = share::schema::INDEX_TYPE_ASYNC_IVF_INDEX_LOCAL;
+  ASSERT_EQ(OB_SUCCESS, ivf_index.select_columns_.push_back(ObString("__ivf_type_16_1")));
+  ASSERT_EQ(OB_SUCCESS, ivf_index.select_columns_.push_back(ObString("__ivf_cid_16_1")));
+  ASSERT_EQ(OB_SUCCESS, ivf_index.select_columns_.push_back(ObString("__pk_increment")));
+  ASSERT_EQ(OB_SUCCESS, ivf_index.select_columns_.push_back(ObString("__ivf_data_16_1")));
+  ASSERT_EQ(OB_SUCCESS, ivf_index.rowkey_columns_.push_back(ObString("__ivf_type_16_1")));
+  ASSERT_EQ(OB_SUCCESS, ivf_index.rowkey_columns_.push_back(ObString("__ivf_cid_16_1")));
+  ASSERT_EQ(OB_SUCCESS, ivf_index.rowkey_columns_.push_back(ObString("__pk_increment")));
+  ASSERT_EQ(OB_SUCCESS, ivf_index.order_columns_.assign(ivf_index.rowkey_columns_));
+  ASSERT_EQ(OB_SUCCESS, ivf_index.partition_names_.push_back(ObString()));
+
+  ObRefreshDecision decision;
+  decision.index_tablet_id_ = ObTabletID(300001);
+  decision.start_refresh_scn_ = make_scn(100);
+  decision.target_refresh_scn_ = make_scn(200);
+  decision.parallelism_ = 2;
+
+  ObSqlString incremental_sql;
+  ASSERT_EQ(OB_SUCCESS, refresher.build_refresh_sql_(
+      info, 0, ivf_index, decision,
+      ObTenantAsyncIndexRefresher::REFRESH_SQL_INSERT_NEW, 88003, incremental_sql));
+  ASSERT_NE(nullptr, strstr(incremental_sql.ptr(), "INTO `test_db`.`ivf_idx`"));
+  ASSERT_NE(nullptr, strstr(incremental_sql.ptr(), "`__ivf_type_16_1`, `__ivf_cid_16_1`, `__pk_increment`, `__ivf_data_16_1`"));
+  ASSERT_NE(nullptr, strstr(incremental_sql.ptr(), "`OLD_NEW$$` = 'N'"));
+  ASSERT_NE(nullptr, strstr(incremental_sql.ptr(), "ORDER BY `__ivf_type_16_1`, `__ivf_cid_16_1`, `__pk_increment`"));
+
+  ObSqlString complete_sql;
+  ASSERT_EQ(OB_SUCCESS, refresher.build_refresh_sql_(
+      info, 0, ivf_index, decision,
+      ObTenantAsyncIndexRefresher::REFRESH_SQL_COMPLETE, 88004, complete_sql));
+  ASSERT_NE(nullptr, strstr(complete_sql.ptr(), "INTO `test_db`.`ivf_idx`"));
+  ASSERT_EQ(nullptr, strstr(complete_sql.ptr(), "OLD_NEW$$"));
+  ASSERT_NE(nullptr, strstr(complete_sql.ptr(), "AS OF SNAPSHOT"));
 }
 
 // acquire_scheduler hands out a ref-counted, live scheduler while it is

@@ -286,7 +286,8 @@ int ObColumnRedefinitionTask::copy_table_indexes()
               if ((index_schema->is_vec_index()
                    || index_schema->is_fts_index()
                    || index_schema->is_multivalue_index()
-                   || index_schema->is_async_fts_index())
+                   || index_schema->is_async_fts_index()
+                   || index_schema->is_async_ivf_index())
                   && OB_FAIL(ObDDLUtil::construct_domain_index_arg(table_schema, index_schema, *this, create_index_arg, ddl_type))) {
                 LOG_WARN("failed to construct domain index arg", K(ret));
               } else {

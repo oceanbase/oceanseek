@@ -812,7 +812,7 @@ int ObIncDDLMergeTaskUtils::deserialize_inc_major_from_string(
              KR(ret), KPC(inc_major), KP(inc_major_buffer.ptr()), K(inc_major_buffer.length()));
   } else if (pos != inc_major_buffer.length()) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("deserialize length mismatch", KR(ret), K(pos), K(inc_major_buffer.length()));
+    LOG_WARN("deserialize length mismatch", KR(ret), K(pos), K(inc_major_buffer.length()), KPC(inc_major));
   } else if (nullptr == inc_major || !inc_major->is_valid()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected inc major", KR(ret), KPC(inc_major));

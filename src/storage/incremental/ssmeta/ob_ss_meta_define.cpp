@@ -394,6 +394,7 @@ int get_meta_op_buf_size(const ObAtomicProtocolType &protocol_type, int64_t &buf
     }
     case ObAtomicProtocolTypeEnum::MINI_SSTABLE:
     case ObAtomicProtocolTypeEnum::MINOR_SSTABLE:
+    case ObAtomicProtocolTypeEnum::NON_IDEM_MAJOR_SSTABLE:
     case ObAtomicProtocolTypeEnum::MAJOR_SSTABLE: {
       buf_size = 1024;
       break;
@@ -581,6 +582,7 @@ bool ObSSMetaKeyParam::is_valid() const
   {
     case ObAtomicProtocolTypeEnum::MINI_SSTABLE:
     case ObAtomicProtocolTypeEnum::MINOR_SSTABLE:
+    case ObAtomicProtocolTypeEnum::NON_IDEM_MAJOR_SSTABLE:
     case ObAtomicProtocolTypeEnum::MAJOR_SSTABLE:
     case ObAtomicProtocolTypeEnum::TABLET_META:
       is_valid = tablet_key_.is_valid();
@@ -614,6 +616,7 @@ bool ObSSMetaReadParamV2::is_valid() const
       {
       case ObAtomicProtocolTypeEnum::MINI_SSTABLE:
       case ObAtomicProtocolTypeEnum::MINOR_SSTABLE:
+      case ObAtomicProtocolTypeEnum::NON_IDEM_MAJOR_SSTABLE:
       case ObAtomicProtocolTypeEnum::MAJOR_SSTABLE:
       case ObAtomicProtocolTypeEnum::TABLET_META:
         if (read_param_type_ == ObSSMetaReadParamType::TABLET_KEY) {

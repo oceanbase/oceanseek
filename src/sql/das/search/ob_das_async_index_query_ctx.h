@@ -269,8 +269,10 @@ public:
   { mock_fetcher_ = fetcher; mock_fetcher_arg_ = arg; }
 
   static int check_tx_isolation(const ObSQLSessionInfo *session);
-  // Recursively detect async fulltext or scalar index queries in an attach ctdef tree.
-  static bool contains_async_index_query(const ObDASBaseCtDef *ctdef);
+  // Detect reads requiring async-index transaction and plan-cache restrictions.
+  static bool contains_async_index_access(const ObDASBaseCtDef *ctdef);
+  // Detect nodes using this query context; ordinary vector scans manage their own context.
+  static bool contains_shared_async_index_query(const ObDASBaseCtDef *ctdef);
   // Validate async wrapper descriptors, analyze the user query domain, and count independent
   // semantic roots per logical async index.
   static int analyze_async_index_domain(

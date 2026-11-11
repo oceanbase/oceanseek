@@ -7,6 +7,7 @@
 #define OCEANBASE_BASIC_OB_RA_DATUM_STORE_H_
 
 #include "share/ob_define.h"
+#include "lib/atomic/ob_atomic.h"
 #include "lib/container/ob_se_array.h"
 #include "lib/allocator/page_arena.h"
 #include "lib/utility/ob_print_utils.h"
@@ -283,7 +284,10 @@ public:
 
   static_assert(std::is_pod<TryFreeMemBlk>::value == true, "TryFreeMemBlk should be pod");
 
-  // Reader must be deleted before ObRADatumStore
+  // Distinct Readers may read a stable store concurrently with the default allocator
+  // and no callbacks. Custom allocators/callbacks must also support concurrency.
+  // A Reader must not be shared concurrently; store mutation and destruction must
+  // not overlap with concurrent reads. Readers must be deleted before the store.
   class Reader
   {
     friend class ObRADatumStore;
@@ -382,7 +386,7 @@ public:
   void set_io_observer(ObIOEventObserver *io_observer) { io_observer_ = io_observer; }
 
   inline int64_t get_row_cnt() const { return row_cnt_; }
-  inline int64_t get_mem_hold() const { return mem_hold_; }
+  inline int64_t get_mem_hold() const { return ATOMIC_LOAD(&mem_hold_); }
   inline int64_t get_file_size() const { return file_size_; }
   inline int64_t get_inmemory_rows() const { return inmemory_rows_; }
   void set_mem_hold(int64_t hold);
@@ -390,7 +394,7 @@ public:
   void set_allocator(common::ObIAllocator &alloc) { allocator_ = &alloc; }
   void set_dir_id(int64_t dir_id) { dir_id_ = dir_id; }
 
-  TO_STRING_KV(K_(tenant_id), K_(label), K_(ctx_id),  K_(mem_limit), K_(mem_hold),
+  TO_STRING_KV(K_(tenant_id), K_(label), K_(ctx_id),  K_(mem_limit), "mem_hold", get_mem_hold(),
       K_(save_row_cnt), K_(row_cnt), K_(fd), K_(file_size), K_(inmemory_rows), K(blk_mem_list_.get_size()));
 
 private:

@@ -85,6 +85,9 @@ public:
 public:
   virtual int do_table_scan() override;
   virtual int rescan() override;
+  // Vector candidate batches keep the same partition, snapshot and query
+  // parameters. Rewind this filter without invalidating shared providers.
+  virtual int rescan_for_next_candidates() override;
 
   void set_bitmap(ObVecIndexBitmap *bitmap) { bitmap_ = bitmap; }
   ObDASSearchOpType get_root_op_type() const { return root_op_->get_op_type(); }
@@ -102,6 +105,7 @@ protected:
   virtual int inner_get_next_rows(int64_t &count, int64_t capacity) override;
 
 private:
+  int do_rescan(const bool reset_filter_providers);
   int init_bitmap_iter();
   
 private:

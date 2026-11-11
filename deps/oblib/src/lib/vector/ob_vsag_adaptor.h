@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <float.h>
 #include <string>
+#include <vsag/allocator.h>
 
 namespace oceanbase {
 namespace common {
@@ -107,7 +108,7 @@ int cal_distance_by_id(VectorIndexPtr& index_handler, const float* vector, const
 int cal_distance_by_id(VectorIndexPtr& index_handler, uint32_t len, uint32_t *dims, float *vals, const int64_t *ids,
     int64_t count, const float *&distances);
 int get_raw_vector_by_ids(VectorIndexPtr& index_handler, const int64_t* ids, int64_t count, float *&vectors,
-                          void *allocator = nullptr, int64_t dim = 0);
+                          vsag::Allocator *allocator);
 int get_vid_bound(VectorIndexPtr& index_handler, int64_t &min_vid, int64_t &max_vid);
 int knn_search(VectorIndexPtr& index_handler,float* query_vector, int dim, int64_t topk,
                const float*& dist, const int64_t*& ids, int64_t &result_size, int ef_search,

@@ -88,6 +88,9 @@ struct ObSSAsyncIndexMergeCtx : public ObAsyncIndexMergeCtx
   virtual int update_tablet_after_merge() override;
   virtual const share::ObPreWarmerParam &get_pre_warm_param() const override { return major_pre_warm_param_; }
 private:
+  int64_t get_data_macro_seq_slot_count() const;
+
+private:
   int task_cnt_;
   int64_t sswriter_epoch_;
   storage::ObHotTabletInfoWriter pre_warm_writer_;

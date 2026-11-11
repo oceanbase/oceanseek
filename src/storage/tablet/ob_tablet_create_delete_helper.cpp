@@ -5,6 +5,7 @@
 
 #include "storage/tablet/ob_tablet_create_delete_helper.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable.h"
 #include "lib/ob_errno.h"
 #include "storage/tx/ob_trans_part_ctx.h"
 #include "storage/tx/ob_trans_service.h"
@@ -836,6 +837,10 @@ int ObTabletCreateDeleteHelper::inner_create_empty_sstable(
     // 异步倒排索引 tablet：空基线是 ObInvSSTable，而非普通 major sstable
     if (OB_FAIL(create_sstable<blocksstable::ObInvSSTable>(param, allocator, table_handle))) {
       LOG_WARN("failed to create inv sstable", K(ret), K(param));
+    }
+  } else if (param.table_key().is_ivf_sstable()) {
+    if (OB_FAIL(create_sstable<blocksstable::ObIvfSSTable>(param, allocator, table_handle))) {
+      LOG_WARN("failed to create ivf sstable", K(ret), K(param));
     }
   } else if (OB_FAIL(create_sstable(param, allocator, table_handle))) {
     LOG_WARN("failed to create sstable", K(ret), K(param));

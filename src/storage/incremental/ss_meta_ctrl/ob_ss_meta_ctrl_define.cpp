@@ -745,7 +745,7 @@ bool ObSSMetaCtrlObjectInfo::is_valid() const
     //do nothing
   } else if (is_none()) {
     b_ret = true;
-  } else if (is_major() || is_inc_major()) {
+  } else if (is_major() || is_non_idem_major() || is_inc_major()) {
     b_ret = snapshot_version_.is_valid_and_not_min()
         && seq_step_ >= 0
         && parallel_cnt_ >= 0
@@ -774,7 +774,7 @@ bool ObSSMetaCtrlObjectInfo::operator==(const ObSSMetaCtrlObjectInfo &other) con
         || seq_step_ != other.seq_step_
         || parallel_cnt_ != other.parallel_cnt_) {
       b_ret = false;
-    } else if (is_major() || is_inc_major()) {
+    } else if (is_major() || is_non_idem_major() || is_inc_major()) {
       b_ret = cg_cnt_ == other.cg_cnt_;
     } else if (is_none_major()) {
       b_ret = true;
@@ -806,6 +806,20 @@ int ObSSMetaCtrlObjectInfo::init_by_major(
     seq_step_ = seq_step;
     parallel_cnt_ = parallel_cnt;
     cg_cnt_ = cg_cnt;
+  }
+  return ret;
+}
+
+int ObSSMetaCtrlObjectInfo::init_by_non_idem_major(
+    const share::SCN &snapshot_version, const int64_t seq_step,
+    const int64_t parallel_cnt, const int64_t cg_cnt)
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(init_by_major(snapshot_version, seq_step, parallel_cnt, cg_cnt))) {
+    LOG_WARN("init ss meta ctrl object info by non idempotent major get failed", K(ret),
+        K(snapshot_version), K(seq_step), K(parallel_cnt), K(cg_cnt));
+  } else {
+    type_ = TYPE::NON_IDEM_MAJOR;
   }
   return ret;
 }
@@ -869,7 +883,7 @@ int64_t ObSSMetaCtrlObjectInfo::to_string(char *buf, const int64_t buf_len) cons
         J_KV("snapshot_version", snapshot_version_,
           "seq_step", seq_step_,
           "parallel_cnt", parallel_cnt_);
-        if (is_major() || is_inc_major()) {
+        if (is_major() || is_non_idem_major() || is_inc_major()) {
           J_COMMA();
           J_KV("cg_cnt", cg_cnt_);
         }

@@ -123,13 +123,13 @@ struct ObTabletMergeDagParam : public share::ObIDagInitParam
   }
   VIRTUAL_TO_STRING_KV(K_(skip_get_tablet), "merge_type", merge_type_to_str(merge_type_), K_(merge_version),
      K_(merge_base_version), K_(ls_id), K_(tablet_id), "exec_mode", exec_mode_to_str(exec_mode_),
-     K_(data_tablet_id), K_(is_inv_index), K_(need_swap_tablet_flag), K_(is_reserve_mode), K_(schedule_private_transfer_epoch), K(reorganization_scn_),
+     K_(data_tablet_id), K_(is_use_async_index_dag), K_(need_swap_tablet_flag), K_(is_reserve_mode), K_(schedule_private_transfer_epoch), K(reorganization_scn_),
      K_(modified_start_scn), K_(is_replace_minor), K_(is_transfer_replace_minor));
 
   bool skip_get_tablet_;
   bool need_swap_tablet_flag_;
   bool is_reserve_mode_;
-  bool is_inv_index_;
+  bool is_use_async_index_dag_;
   bool is_replace_minor_; // 标识所有 Replace Upload 场景下生成的本地 Minor Merge
   bool is_transfer_replace_minor_; // 标识其中的 Transfer Replace Upload，生产路径会同时设置 is_replace_minor_
   ObExecMode exec_mode_;

@@ -124,6 +124,7 @@ public:
     SEARCH_KEY = 7,
     ASYNC_FTS_KEY = 8,
     ASYNC_SEARCH_KEY = 9,
+    ASYNC_VEC_KEY = 10,
   };
   enum COLUMN_NODE {
     COLUMN_REF_NODE = 0,
@@ -191,6 +192,13 @@ public:
       const ObPartitionResolveResult &resolve_result,
       const obrpc::ObCreateIndexArg &index_arg,
       bool &fts_common_aux_table_exist,
+      ObIArray<ObPartitionResolveResult> &resolve_results,
+      ObIArray<obrpc::ObCreateIndexArg> &index_arg_list,
+      ObIAllocator *allocator);
+  static int append_async_index_support_arg(
+      const ObPartitionResolveResult &resolve_result,
+      const obrpc::ObCreateIndexArg &index_arg,
+      bool &has_generated_async_index_support_arg,
       ObIArray<ObPartitionResolveResult> &resolve_results,
       ObIArray<obrpc::ObCreateIndexArg> &index_arg_list,
       ObIAllocator *allocator);

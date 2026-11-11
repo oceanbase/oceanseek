@@ -899,6 +899,12 @@ ob_set_subtarget(ob_share vector_index
   vector_index/ob_plugin_vector_index_utils.cpp
   vector_index/ob_vector_index_util.cpp
   vector_index/ob_vector_kmeans_ctx.cpp
+  vector_index/hca/ob_vector_hca_common.cpp
+  vector_index/hca/ob_vector_hca_simd.cpp
+  vector_index/hca/ob_vector_hca_cluster.cpp
+  vector_index/hca/ob_vector_hca_neighborhood.cpp
+  vector_index/hca/ob_vector_hca_refine.cpp
+  vector_index/hca/ob_vector_hca_soar.cpp
   vector_index/ob_vec_idx_async_task_scheduler.cpp
   vector_index/ob_vec_index_priority_queue_manager.cpp
   vector_index/ob_vector_index_async_task.cpp
@@ -935,12 +941,29 @@ ob_set_subtarget(ob_share vector_index
   vector_index/ob_ltable_bg_task_scheduler.cpp
   vector_index/ob_ltable_bg_dag.cpp
   vector_index/ob_ai_access_service.cpp
+  vector_index/disk_bbq_cache/ob_ivf_sstable_cache_controller.cpp
+  vector_index/disk_bbq_cache/ob_disk_bbq_cache_task.cpp
+  vector_index/disk_bbq_cache/ob_disk_bbq_cache_task_executor.cpp
+)
+
+ob_set_subtarget(ob_share vector_index_quantization
+  vector_index/quantization/ob_quantizer_registry.cpp
+  vector_index/quantization/ob_quantization_encoder.cpp
+  vector_index/quantization/ob_quantization_computer.cpp
+  vector_index/quantization/fp32_quantization/ob_fp32_quantizer.cpp
+  vector_index/quantization/rabitq_quantization/ob_fht_kac_rotator.cpp
+  vector_index/quantization/rabitq_quantization/ob_rabitq_quantizer.cpp
+  vector_index/quantization/rabitq_quantization/ob_rabitq_simd.cpp
+  vector_index/quantization/rabitq_quantization/ob_rabitq_fast_scan.cpp
+  vector_index/quantization/extend_rabitq_quantization/ob_extend_rabitq_quantizer.cpp
+  vector_index/quantization/extend_rabitq_quantization/ob_extend_rabitq_simd.cpp
 )
 
 ob_set_subtarget(ob_share vector_type
   vector_type/ob_vector_add.cpp
   vector_type/ob_vector_div.cpp
   vector_type/ob_vector_l2_distance.cpp
+  vector_type/ob_vector_soar_distance.cpp
   vector_type/ob_vector_ip_distance.cpp
   vector_type/ob_vector_cosine_distance.cpp
   vector_type/ob_vector_l1_distance.cpp

@@ -12875,6 +12875,17 @@ int ObLogPlan::collect_vec_index_location_related_info(ObLogTableScan &tsc_op,
   if (OB_ISNULL(vc_info)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected null vector index info", K(ret));
+  } else if (vc_info->is_async_ivf_scan()) {
+    if (OB_FAIL(add_var_to_array_no_dup(rel_info.related_ids_,
+                                        vc_info->get_aux_table_id(VEC_FIRST_AUX_TBL_IDX)))) {
+      LOG_WARN("failed to append async ivf index table id", K(ret));
+    } else if (OB_FAIL(add_var_to_array_no_dup(rel_info.related_ids_,
+                                               vc_info->get_aux_table_id(VEC_SECOND_AUX_TBL_IDX)))) {
+      LOG_WARN("failed to append async delete index table id", K(ret));
+    } else if (OB_FAIL(add_var_to_array_no_dup(rel_info.related_ids_,
+                                               tsc_op.get_real_ref_table_id()))) {
+      LOG_WARN("failed to append main table id", K(ret));
+    }
   } else if (OB_FAIL(vc_info->check_vec_aux_table_is_all_inited(is_all_table_id_inited, tsc_op.need_skip_rowkey_vid(), tsc_op.need_skip_rowkey_doc()))) {
     LOG_WARN("fail to check_all_table_id_inited", K(ret), K(vc_info->vec_type_), K(vc_info->aux_table_id_.count()));
   } else if (!is_all_table_id_inited) {
@@ -12954,6 +12965,16 @@ int ObLogPlan::collect_hybrid_search_location_related_info(ObLogTableScan &tsc_o
         if (OB_ISNULL(vc_info)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("unexpected null vec info", K(ret), K(i));
+        } else if (vc_info->is_async_ivf_scan()) {
+          if (OB_FAIL(add_var_to_array_no_dup(rel_info.related_ids_,
+                  vc_info->get_aux_table_id(VEC_FIRST_AUX_TBL_IDX)))) {
+            LOG_WARN("failed to append async IVF index table id", K(ret));
+          } else if (OB_FAIL(add_var_to_array_no_dup(rel_info.related_ids_,
+                  vc_info->get_aux_table_id(VEC_SECOND_AUX_TBL_IDX)))) {
+            LOG_WARN("failed to append async deletion table id", K(ret));
+          } else if (OB_FAIL(add_var_to_array_no_dup(rel_info.related_ids_, vc_info->main_table_tid_))) {
+            LOG_WARN("failed to append async IVF main table id", K(ret));
+          }
         } else if (vc_info->is_hnsw_vec_scan()) {
           // Collect HNSW auxiliary table IDs
           if (OB_FAIL(add_var_to_array_no_dup(rel_info.related_ids_, vc_info->get_aux_table_id(VEC_FIRST_AUX_TBL_IDX)))) {
@@ -16617,6 +16638,7 @@ int ObLogPlan::prepare_vector_index_info(AccessPath *ap,
       // 通过主表schema获取相关需要的所有index表的信息
       ObVecIndexInfo &vc_info = *table_scan->get_vector_index_info();
       vc_info.main_table_tid_ = table_scan->get_real_ref_table_id();
+      vc_info.set_async_ivf_index(*ap->vec_idx_info_);
       vc_info.sort_key_.expr_ = vector_expr;
       vc_info.topk_limit_expr_ = stmt->get_limit_expr();
       vc_info.topk_offset_expr_ = stmt->get_offset_expr();
@@ -16626,6 +16648,8 @@ int ObLogPlan::prepare_vector_index_info(AccessPath *ap,
       vc_info.set_can_use_vec_pri_opt(ap->vec_idx_info_->vec_extra_info_.can_use_vec_pri_opt());
       vc_info.vector_index_param_ = ap->vec_idx_info_->vec_extra_info_.get_vector_index_param();
       vc_info.adaptive_try_path_ = ap->vec_idx_info_->vec_extra_info_.adaptive_try_path_;
+      vc_info.is_adaptive_specify_by_hint_ =
+          ap->vec_idx_info_->vec_extra_info_.is_adaptive_specify_by_hint_;
       vc_info.can_extract_range_ = ap->vec_idx_info_->vec_extra_info_.can_extract_range_;
       vc_info.is_spatial_index_ =  ap->vec_idx_info_->vec_extra_info_.is_spatial_index_;
       vc_info.is_multi_value_index_ = ap->vec_idx_info_->vec_extra_info_.is_multi_value_index_;
@@ -16634,6 +16658,28 @@ int ObLogPlan::prepare_vector_index_info(AccessPath *ap,
       const ObVectorIndexQueryParam *query_param = stmt->get_vector_index_query_param();
       if (OB_NOT_NULL(query_param) && OB_FAIL(vc_info.set_query_param(*query_param))) {
         LOG_WARN("set query param fail", K(ret));
+      } else if (vc_info.is_async_ivf_scan()) {
+        const ObTableSchema *vec_table_schema = nullptr;
+        if (OB_UNLIKELY(ap->vec_idx_info_->vec_index_ids_.empty())) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("async IVF index table id is empty", K(ret));
+        } else if (OB_FAIL(schema_guard->get_table_schema(
+                       session->get_effective_tenant_id(),
+                       ap->vec_idx_info_->vec_index_ids_.at(0),
+                       vec_table_schema))) {
+          LOG_WARN("failed to get async IVF index schema", K(ret),
+                   K(ap->vec_idx_info_->vec_index_ids_.at(0)));
+        } else if (OB_ISNULL(vec_table_schema)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("async IVF index schema is null", K(ret),
+                   K(ap->vec_idx_info_->vec_index_ids_.at(0)));
+        } else if (OB_FAIL(vec_table_schema->get_index_name(vc_info.vec_index_name_))) {
+          LOG_WARN("failed to get async IVF index name", K(ret), KPC(vec_table_schema));
+        } else if (OB_FAIL(prepare_async_ivf_vector_index_scan(
+                       *table_schema, ap->vec_idx_info_->vec_index_ids_.at(0), table_scan))) {
+          LOG_WARN("failed to prepare async IVF index scan", K(ret),
+                   K(table_scan->get_table_id()), K(ap->vec_idx_info_->vec_index_ids_));
+        }
       } else if (vc_info.is_hnsw_vec_scan()) {
         vc_info.is_hybrid_index = is_hybrid_index; // TODO by tanzhu, only support hnsw now
         if (OB_FAIL(prepare_hnsw_vector_index_scan(schema_guard, *table_schema, ap->vec_idx_info_->vec_index_ids_.at(0), table_scan, is_hybrid_index))) {
@@ -16656,6 +16702,57 @@ int ObLogPlan::prepare_vector_index_info(AccessPath *ap,
   }
   return ret;
 }
+
+int ObLogPlan::prepare_async_ivf_vector_index_scan(const ObTableSchema &table_schema,
+                                                   const uint64_t &vec_idx_tid,
+                                                   ObLogTableScan *table_scan)
+{
+  int ret = OB_SUCCESS;
+  bool has_async_ivf_index = false;
+  ObSEArray<ObAuxTableMetaInfo, 16> simple_index_infos;
+  if (OB_ISNULL(table_scan) || OB_UNLIKELY(OB_INVALID_ID == vec_idx_tid) ||
+      OB_ISNULL(table_scan->get_vector_index_info())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async IVF index scan argument", K(ret), K(vec_idx_tid), KP(table_scan));
+  } else if (OB_FAIL(table_schema.get_simple_index_infos(simple_index_infos))) {
+    LOG_WARN("failed to get simple index infos", K(ret), K(table_schema.get_table_id()));
+  } else {
+    for (int64_t i = 0; i < simple_index_infos.count(); ++i) {
+      const ObAuxTableMetaInfo &index_info = simple_index_infos.at(i);
+      if (vec_idx_tid == index_info.table_id_ && schema::is_async_ivf_index(index_info.index_type_)) {
+        has_async_ivf_index = true;
+      }
+    }
+    if (OB_UNLIKELY(!has_async_ivf_index)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("failed to find async IVF index table", K(ret),
+               K(table_schema.get_table_id()), K(vec_idx_tid));
+    }
+  }
+
+  if (OB_SUCC(ret)) {
+    ObVecIndexInfo &vc_info = *table_scan->get_vector_index_info();
+    ObAsyncIndexDeleteInfo *delete_info =
+        OB_NEWx(ObAsyncIndexDeleteInfo, &allocator_);
+    if (OB_ISNULL(delete_info)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate async index deletion metadata", K(ret));
+    } else if (OB_FAIL(delete_info->resolve_delete_index(table_schema))) {
+      LOG_WARN("failed to resolve async delete index", K(ret),
+               K(table_schema.get_table_id()));
+    } else if (OB_FAIL(vc_info.aux_table_id_.push_back(vec_idx_tid))) {
+      LOG_WARN("failed to add async IVF index table id", K(ret), K(vec_idx_tid));
+    } else if (OB_FAIL(vc_info.aux_table_id_.push_back(
+                   delete_info->get_delete_idx_tid()))) {
+      LOG_WARN("failed to add async delete table id", K(ret),
+               "delete_index_tid", delete_info->get_delete_idx_tid());
+    } else {
+      vc_info.async_delete_info_ = delete_info;
+    }
+  }
+  return ret;
+}
+
 int ObLogPlan::prepare_spiv_vector_index_scan(ObSchemaGetterGuard *schema_guard,
                                               const ObTableSchema &table_schema,
                                               const uint64_t& vec_col_id,

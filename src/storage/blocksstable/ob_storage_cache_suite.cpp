@@ -14,6 +14,8 @@ namespace blocksstable
 ObStorageCacheSuite::ObStorageCacheSuite()
   : index_block_cache_(),
     user_block_cache_(),
+    ivf_fastscan_cache_(),
+    ivf_quantized_row_cache_(),
     user_row_cache_(),
     bf_cache_(),
     fuse_row_cache_(),
@@ -53,6 +55,10 @@ int ObStorageCacheSuite::init(
     STORAGE_LOG(ERROR, "init infrc block cache failed", K(ret));
   } else if (OB_FAIL(user_block_cache_.init("user_block_cache", user_block_cache_priority))) {
     STORAGE_LOG(ERROR, "init user block cache failed, ", K(ret));
+  } else if (OB_FAIL(ivf_fastscan_cache_.init("ivf_fastscan_block_cache", user_block_cache_priority))) {
+    STORAGE_LOG(ERROR, "init IVF FastScan block cache failed", K(ret));
+  } else if (OB_FAIL(ivf_quantized_row_cache_.init("ivf_quantized_row_cache", user_block_cache_priority))) {
+    STORAGE_LOG(ERROR, "init IVF quantized row cache failed", K(ret));
   } else if (OB_FAIL(user_row_cache_.init("user_row_cache", user_row_cache_priority))) {
     STORAGE_LOG(ERROR, "init user sstable row cache failed, ", K(ret));
   } else if (OB_FAIL(bf_cache_.init("bf_cache", bf_cache_priority))) {
@@ -96,6 +102,10 @@ int ObStorageCacheSuite::reset_priority(
     STORAGE_LOG(ERROR, "set priority for index block cache failed", K(ret));
   } else if (OB_FAIL(user_block_cache_.set_priority(user_block_cache_priority))) {
     STORAGE_LOG(ERROR, "set priority for user block cache failed, ", K(ret));
+  } else if (OB_FAIL(ivf_fastscan_cache_.set_priority(user_block_cache_priority))) {
+    STORAGE_LOG(ERROR, "set priority for IVF FastScan block cache failed", K(ret));
+  } else if (OB_FAIL(ivf_quantized_row_cache_.set_priority(user_block_cache_priority))) {
+    STORAGE_LOG(ERROR, "set priority for IVF quantized row cache failed", K(ret));
   } else if (OB_FAIL(user_row_cache_.set_priority(user_row_cache_priority))) {
     STORAGE_LOG(ERROR, "set priority for user sstable row cache failed, ", K(ret));
   } else if (OB_FAIL(bf_cache_.set_priority(bf_cache_priority))) {
@@ -127,6 +137,8 @@ void ObStorageCacheSuite::destroy()
 {
   index_block_cache_.destroy();
   user_block_cache_.destroy();
+  ivf_fastscan_cache_.destroy();
+  ivf_quantized_row_cache_.destroy();
   user_row_cache_.destroy();
   bf_cache_.destroy();
   fuse_row_cache_.destroy();

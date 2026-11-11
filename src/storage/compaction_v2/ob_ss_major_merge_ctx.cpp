@@ -9,6 +9,7 @@
 #include "storage/incremental/ss_meta_ctrl/ob_ss_meta_ctrl_define.h"
 #include "storage/incremental/ob_ss_tablet_merge_helper.h"
 #include "ob_ss_major_merge_ctx.h"
+#include "storage/blocksstable/vector_index/ob_ivf_merge_sstable_writer.h"
 #include "lib/statistic_event/ob_stat_event.h"
 
 
@@ -395,11 +396,11 @@ void ObSSCOTabletMergeCtx::destroy()
 void ObSSAsyncIndexMergeCtx::destroy()
 {
   int tmp_ret = OB_SUCCESS;
-  if (is_inc_major_merge(get_merge_type())
+  if ((is_inc_major_merge(get_merge_type()) || sstable_protocol_.is_non_idem_major())
       && sstable_protocol_.is_inited()
       && sstable_protocol_.is_status_start()
       && OB_TMP_FAIL(sstable_protocol_.abort())) {
-    LOG_WARN_RET(tmp_ret, "abort unfinished inc major compaction protocol fail",
+    LOG_WARN_RET(tmp_ret, "abort unfinished async index build protocol fail",
         K(sstable_protocol_));
   }
 }
@@ -415,6 +416,13 @@ int ObSSAsyncIndexMergeCtx::generate_macro_seq_info(const int64_t task_idx, int6
   return ret;
 }
 
+int64_t ObSSAsyncIndexMergeCtx::get_data_macro_seq_slot_count() const
+{
+  // IVF reserves one GC-aligned sequence slot per output writer, independently of merge concurrency.
+  return is_ivf_index_merge()
+      ? blocksstable::ObIVFMergeSSTableWriter::OUTPUT_WRITER_COUNT : task_cnt_;
+}
+
 int ObSSAsyncIndexMergeCtx::get_index_tree_macro_start_seq(int64_t &macro_start_seq) const
 {
   int ret = OB_SUCCESS;
@@ -422,7 +430,7 @@ int ObSSAsyncIndexMergeCtx::get_index_tree_macro_start_seq(int64_t &macro_start_
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid macro sequence task count", K(ret), K(task_cnt_));
   } else {
-    macro_start_seq = task_cnt_ * MACRO_STEP_SIZE;
+    macro_start_seq = get_data_macro_seq_slot_count() * MACRO_STEP_SIZE;
     if (OB_UNLIKELY(macro_start_seq >= INT64_MAX)) {
       ret = OB_SIZE_OVERFLOW;
       LOG_WARN("macro start seq is size overflow", K(ret), K(task_cnt_));
@@ -452,6 +460,8 @@ int ObSSAsyncIndexMergeCtx::init_tablet_merge_info()
   int ret = OB_SUCCESS;
   int64_t epoch = 0;
   const bool is_inc_major_compaction = is_inc_major_merge(get_merge_type());
+  const bool is_non_idem_major =
+      is_ivf_index_merge() && is_major_merge_type(get_merge_type());
   if (OB_FAIL(link_major_if_exist_(*this))) {
   } else if (OB_FAIL(SSCompactHelper::check_is_sswriter(get_ls_id(), get_tablet_id(), epoch))) {
     LOG_WARN("async index sswriter is not leader", K(ret), K(epoch));
@@ -462,15 +472,23 @@ int ObSSAsyncIndexMergeCtx::init_tablet_merge_info()
   } else if (OB_FAIL(major_pre_warm_param_.init(get_ls()->get_ls_id(), get_tablet_id()))) {
     LOG_WARN("failed to init pre warm param", KR(ret), KPC(this));
   } else {
-    // task_cnt_ 个数据任务序号段，再加 1 个索引树序号段。
-    const int64_t seq_step_cnt = task_cnt_ + INDEX_TREE_MACRO_SEQ_SLOT_CNT;
+    static_desc_.is_non_idem_major_ = is_non_idem_major;
+    // 数据 writer 个数对应的序号段，再加 1 个索引树序号段。
+    const int64_t seq_step_cnt = get_data_macro_seq_slot_count() + INDEX_TREE_MACRO_SEQ_SLOT_CNT;
+    // Each non-idempotent Major build gets its own op_id and dedicated object types.
     if (is_inc_major_compaction
         && OB_FAIL(SSCompactHelper::start_inc_major_compaction_task(
             get_ls_id(), get_tablet_id(), get_tablet()->get_reorganization_scn(),
             get_merge_version(), seq_step_cnt,
             0/*列组数*/, static_desc_.op_id_, sstable_protocol_))) {
       LOG_WARN("start inc major compaction task fail", K(ret));
-    } else if (!is_inc_major_compaction
+    } else if (is_non_idem_major
+        && OB_FAIL(SSCompactHelper::start_non_idem_major_task(
+            get_ls_id(), get_tablet_id(), get_tablet()->get_reorganization_scn(),
+            get_merge_version(), seq_step_cnt,
+            0/*列组数*/, static_desc_.op_id_, sstable_protocol_))) {
+      LOG_WARN("start non-idempotent build task fail", K(ret));
+    } else if (!is_inc_major_compaction && !is_non_idem_major
         && OB_FAIL(SSCompactHelper::start_major_task(
             get_ls_id(), get_tablet_id(), get_tablet()->get_reorganization_scn(),
             get_merge_version(), seq_step_cnt,
@@ -513,6 +531,10 @@ int ObSSAsyncIndexMergeCtx::update_tablet_after_merge()
     if (is_inc_major_merge(get_merge_type())) {
       if (OB_FAIL(SSCompactHelper::finish_inc_major_compaction_task(sstable_protocol_))) {
         LOG_WARN("finish inc major compaction task fail", K(ret));
+      }
+    } else if (sstable_protocol_.is_non_idem_major()) {
+      if (OB_FAIL(SSCompactHelper::finish_non_idem_major_task(sstable_protocol_))) {
+        LOG_WARN("finish non-idempotent build task fail", K(ret));
       }
     } else if (OB_FAIL(SSCompactHelper::finish_major_task(get_ls_id(),
                                                           get_tablet_id(),

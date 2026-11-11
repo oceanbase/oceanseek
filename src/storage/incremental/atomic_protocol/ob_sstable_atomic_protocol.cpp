@@ -40,6 +40,8 @@ int ObSSTableAtomicProtocol::init(
 {
   const bool is_major_protocol =
       ObAtomicProtocolTypeEnum::MAJOR_SSTABLE == type.type_;
+  const bool is_non_idem_major_protocol =
+      ObAtomicProtocolTypeEnum::NON_IDEM_MAJOR_SSTABLE == type.type_;
   const bool is_inc_major_protocol =
       ObAtomicProtocolTypeEnum::INC_MAJOR_COMPACTION_SSTABLE == type.type_;
   const bool is_none_major_protocol =
@@ -47,6 +49,7 @@ int ObSSTableAtomicProtocol::init(
       || ObAtomicProtocolTypeEnum::MINOR_SSTABLE == type.type_;
   const bool is_object_info_match =
       (is_major_protocol && object_info.is_major())
+      || (is_non_idem_major_protocol && object_info.is_non_idem_major())
       || (is_inc_major_protocol && object_info.is_inc_major())
       || (is_none_major_protocol && object_info.is_none_major());
   int ret = OB_SUCCESS;

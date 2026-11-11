@@ -7,6 +7,7 @@
 #define SRC_SHARE_VECTOR_INDEX_OB_VECTOR_KMEANS_CTX_H
 
 #include "lib/container/ob_se_array.h"
+#include "share/vector_index/ob_ivf_refresh_progress.h"
 #include "lib/allocator/page_arena.h"
 #include "ob_vector_index_util.h"
 #include "share/vector_type/ob_vector_l2_distance.h"
@@ -171,7 +172,8 @@ public:
       max_assign_tasks_(0),
       enable_parallel_(false),
       kmeans_monitor_(nullptr),
-      enable_hgraph_(false)
+      enable_hgraph_(false),
+      refresh_progress_(nullptr)
   {}
   virtual ~ObKmeansAlgo() {
     ObKmeansAlgo::destroy();
@@ -180,6 +182,7 @@ public:
   // ivfpq enable_parallel is false, because ivf_dim is small, there is no need for parallel kmeans.
   int init(ObKmeansCtx &kmeans_ctx, bool enable_parallel = false);
   int build(const ObKmeansVectorInput &input_vectors);
+  void set_refresh_progress(ObIVFRefreshProgress *progress) { refresh_progress_ = progress; }
   bool is_finish() const { return FINISH == status_; }
   int64_t next_idx() { return 1L - cur_idx_; }
   ObCentersBuffer<float> &get_cur_centers() { return centers_[cur_idx_]; }
@@ -243,6 +246,7 @@ protected:
   bool enable_parallel_; // Whether to enable parallel computation
   ObKmeansMonitor *kmeans_monitor_;
   bool enable_hgraph_; // control whether to enable HGraph acceleration
+  ObIVFRefreshProgress *refresh_progress_; // borrowed for synchronous refresh training
 };
 
 class ObElkanKmeansAlgo : public ObKmeansAlgo
@@ -354,6 +358,8 @@ public:
            const int64_t pq_m_size = 1) override;
   virtual int build(ObInsertMonitor *insert_monitor);
   int get_kmeans_algo(ObKmeansAlgo *&algo);
+  void set_refresh_progress(ObIVFRefreshProgress *progress)
+  { if (nullptr != algo_) { algo_->set_refresh_progress(progress); } }
   int64_t get_centers_count() const;
   int64_t get_centers_dim() const;
   int get_center(const int64_t pos, float *&center_vector) override;

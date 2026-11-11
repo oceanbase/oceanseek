@@ -965,6 +965,47 @@ TEST_F(ObStorageSortVecImplAddBatchTest, test_sort_full_external_merge_path)
   verify_chunk_sorted_data(final_chunk, expected_sorted, 6);
 }
 
+TEST_F(ObStorageSortVecImplAddBatchTest, test_read_after_intermediate_merge)
+{
+  const int64_t chunk_count = ObExternalMergeSorter<ObTestStorageCompare, ObTestStorageRow, false>::MAX_MERGE_WAYS + 1;
+  for (int64_t value = chunk_count - 1; value >= 0; --value) {
+    MockBatchDataIVector batch_vec(&value, 1);
+    ObFixedArray<ObIVector *, ObIAllocator> vectors(alloc_);
+    ASSERT_EQ(OB_SUCCESS, vectors.init(1));
+    ASSERT_EQ(OB_SUCCESS, vectors.push_back(&batch_vec));
+    uint16_t selector[1] = {0};
+    ObTestStorageRow *rows[1] = {nullptr};
+    int64_t inmem_row_size = 0;
+    ASSERT_EQ(OB_SUCCESS, sort_impl_.add_batch(
+        vectors, nullptr, selector, 1, rows, nullptr, inmem_row_size));
+    ASSERT_EQ(OB_SUCCESS, sort_impl_.do_dump());
+  }
+
+  ASSERT_EQ(chunk_count, sort_impl_.sort_chunks_.get_size());
+  // One more chunk than the merge fan-in limit forces a real intermediate pass.
+  ASSERT_EQ(OB_SUCCESS, sort_impl_.sort());
+  ASSERT_LT(sort_impl_.sort_chunks_.get_size(), chunk_count);
+  ASSERT_GE(sort_impl_.sort_chunks_.get_size(), 2);
+
+  int64_t total = 0;
+  int ret = OB_SUCCESS;
+  do {
+    int64_t row_count = 0;
+    ObIArray<ObIVector *> *output_rows = nullptr;
+    ObIArray<ObIVector *> *addon_rows = nullptr;
+    ret = sort_impl_.get_next_batch(row_count, output_rows, addon_rows);
+    if (ret == OB_SUCCESS) {
+      ASSERT_NE(nullptr, output_rows);
+      for (int64_t i = 0; i < row_count; ++i) {
+        ASSERT_LT(total, chunk_count);
+        EXPECT_EQ(total++, output_rows->at(0)->get_int(i));
+      }
+    }
+  } while (ret == OB_SUCCESS);
+  EXPECT_EQ(OB_ITER_END, ret);
+  EXPECT_EQ(chunk_count, total);
+}
+
 //测试 slice 决策器在 ObStorageVecSortImpl 中的集成
 TEST_F(ObStorageSortVecImplAddBatchTest, test_slice_decider_integration)
 {

@@ -82,6 +82,7 @@ public:
       "exec_mode", exec_mode_to_str(exec_mode_),
       K_(is_ddl),
       K_(is_inc_major),
+      K_(is_non_idem_major),
       K_(compressor_type),
       K_(macro_block_size),
       K_(macro_store_size),
@@ -112,6 +113,8 @@ private:
 public:
   bool is_ddl_; // only used to print ERROR or WARN log
   bool is_inc_major_;
+  // Non-idempotent Major build.
+  bool is_non_idem_major_;
   compaction::ObMergeType merge_type_;
   ObCompressorType compressor_type_;
   share::ObLSID ls_id_;
@@ -329,6 +332,7 @@ public:
   STATIC_DESC_FUNC(share::SCN, end_scn);
   STATIC_DESC_FUNC(bool, is_ddl);
   STATIC_DESC_FUNC(bool, is_inc_major);
+  STATIC_DESC_FUNC(bool, is_non_idem_major);
   STATIC_DESC_FUNC(ObCompressorType, compressor_type);
   STATIC_DESC_FUNC(int64_t, major_working_cluster_version);
   STATIC_DESC_FUNC(const char *, encrypt_key);

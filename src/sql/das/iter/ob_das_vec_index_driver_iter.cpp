@@ -8,9 +8,11 @@
 #include "sql/das/iter/ob_das_vec_index_brute_scan_iter.h"
 #include "sql/das/iter/ob_das_vec_index_hnsw_scan_iter.h"
 #include "sql/das/iter/ob_das_vec_index_ivf_scan_iter.h"
+#include "sql/das/iter/ob_das_vec_index_async_ivf_scan_iter.h"
 #include "sql/das/iter/ob_das_profile_iter.h"
 #include "share/vector_index/ob_vector_index_util.h"
 #include "lib/oblog/ob_log_module.h"
+#include "lib/alloc/alloc_struct.h"
 #include "sql/das/iter/ob_das_search_driver_iter.h"
 #include "lib/hash/ob_hashmap.h"
 #include "lib/utility/ob_sort.h"
@@ -60,6 +62,7 @@ int ObDASVecIndexDriverIter::do_table_scan()
 {
   int ret = OB_SUCCESS;
   common::ObOpProfile<common::ObMetric> *my_profile = nullptr;  
+  pre_filter_opened_ = false;
   if (OB_FAIL(ObDASProfileIter::init_runtime_profile(
           common::ObProfileId::HYBRID_SEARCH_VEC_ITER, my_profile))) {
     LOG_WARN("failed to init runtime profile", KR(ret));
@@ -74,9 +77,14 @@ int ObDASVecIndexDriverIter::do_table_scan()
     SET_METRIC_VAL(common::ObMetricId::HS_VEC_FILTER_EST_ROW_COUNT, static_cast<uint64_t>(last_filter_est_row_count_));
     if (OB_FAIL(vec_index_scan_iter_->do_table_scan())) {
       LOG_WARN("failed to do table scan", K(ret));
-    } else if (OB_NOT_NULL(pre_filter_iter_) && OB_FAIL(pre_filter_iter_->do_table_scan())) {
-      LOG_WARN("failed to do table scan on pre filter iter", K(ret));
-    } else if (OB_NOT_NULL(post_filter_iter_) && OB_FAIL(post_filter_iter_->do_table_scan())) {
+    } else if (!uses_group_pre_filter() && OB_NOT_NULL(pre_filter_iter_)) {
+      if (OB_FAIL(pre_filter_iter_->do_table_scan())) {
+        LOG_WARN("failed to do table scan on pre filter iter", K(ret));
+      } else {
+        pre_filter_opened_ = true;
+      }
+    }
+    if (OB_SUCC(ret) && OB_NOT_NULL(post_filter_iter_) && OB_FAIL(post_filter_iter_->do_table_scan())) {
       LOG_WARN("failed to do table scan on post filter iter", K(ret));
     }
   }
@@ -103,7 +111,7 @@ int ObDASVecIndexDriverIter::rescan()
       LOG_WARN("failed to rescan vec index scan iter", K(ret));
     } else if (!is_brute_force_scan() && OB_FAIL(evaluate_partition_path())) {
       LOG_WARN("failed to evaluate partition path for next partition", K(ret));
-    } else if (OB_NOT_NULL(filter_iter_) && OB_FAIL(filter_iter_->rescan())) {
+    } else if (!uses_group_pre_filter() && OB_NOT_NULL(filter_iter_) && OB_FAIL(rescan_filter_iter())) {
       LOG_WARN("failed to rescan filter iter", K(ret));
     } else {
       SET_METRIC_VAL(common::ObMetricId::HS_VEC_INDEX_PATH, static_cast<uint64_t>(get_vec_index_path_type()));
@@ -112,6 +120,28 @@ int ObDASVecIndexDriverIter::rescan()
     }
   }
 
+  return ret;
+}
+
+int ObDASVecIndexDriverIter::rescan_filter_iter()
+{
+  int ret = OB_SUCCESS;
+  if (filter_iter_ == pre_filter_iter_ && !pre_filter_opened_) {
+    // Group PRE can skip the ordinary filter tree on the first partition.
+    // Open it when a later partition needs the ordinary PRE path.
+    if (OB_ISNULL(search_ctx_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("missing search context for pre filter partition switch", K(ret));
+    } else if (OB_FAIL(search_ctx_->reset_filter_bitmap_providers_for_rescan())) {
+      LOG_WARN("failed to reset filter bitmap providers on partition switch", K(ret));
+    } else if (OB_FAIL(pre_filter_iter_->do_table_scan())) {
+      LOG_WARN("failed to open pre filter iter on partition switch", K(ret));
+    } else {
+      pre_filter_opened_ = true;
+    }
+  } else if (OB_FAIL(filter_iter_->rescan())) {
+    LOG_WARN("failed to rescan filter iter", K(ret));
+  }
   return ret;
 }
 
@@ -141,6 +171,7 @@ int ObDASVecIndexDriverIter::inner_init(ObDASIterParam &param)
     filter_iter_ = vec_index_driver_param.filter_iter_;
     pre_filter_iter_ = vec_index_driver_param.pre_filter_iter_;
     post_filter_iter_ = vec_index_driver_param.post_filter_iter_;
+    pre_filter_opened_ = false;
     vec_index_driver_ctdef_ = vec_index_driver_param.vec_index_driver_ctdef_;
     vec_index_driver_rtdef_ = vec_index_driver_param.vec_index_driver_rtdef_;
     vec_index_type_ = vec_index_driver_param.vec_index_type_;
@@ -277,6 +308,11 @@ int ObDASVecIndexDriverIter::inner_reuse()
 
   query_cond_built_ = false;
   bitmap_.reset();
+  if (nullptr != scalar_scan_rtdef_ && nullptr != expr_filter_vid_objs_) {
+    scalar_scan_rtdef_->key_ranges_.reset();
+  }
+  expr_filter_vid_objs_ = nullptr;
+  expr_filter_matched_flags_ = nullptr;
   if (nullptr != mem_context_) {
     mem_context_->reset_remain_one_page();
   }
@@ -309,6 +345,7 @@ int ObDASVecIndexDriverIter::inner_release()
 {
   int ret = OB_SUCCESS;
   profile_ = nullptr;
+  pre_filter_opened_ = false;
 
   int tmp_ret = OB_SUCCESS;
   if (OB_NOT_NULL(vec_index_scan_iter_) && OB_FAIL(release_input_iter(vec_index_scan_iter_))) {
@@ -343,6 +380,11 @@ int ObDASVecIndexDriverIter::inner_release()
 
   query_cond_built_ = false;
   bitmap_.reset();
+  if (nullptr != scalar_scan_rtdef_ && nullptr != expr_filter_vid_objs_) {
+    scalar_scan_rtdef_->key_ranges_.reset();
+  }
+  expr_filter_vid_objs_ = nullptr;
+  expr_filter_matched_flags_ = nullptr;
   if (nullptr != mem_context_) {
     mem_context_->reset_remain_one_page();
     DESTROY_CONTEXT(mem_context_);
@@ -411,6 +453,88 @@ void ObDASVecIndexDriverIter::update_go_brute_force_after_pre_filter()
   LOG_TRACE("update go_brute_force by actual pre filter row count",
             K(knn_filter_mode), K(go_brute_force_), K_(bruteforce_fallback_threshold),
             K(actual_filter_cnt), K(bitmap_.type_));
+}
+
+int ObDASVecIndexDriverIter::evaluate_async_ivf_partition_path()
+{
+  int ret = OB_SUCCESS;
+  auto *scan = static_cast<ObDASVecIndexAsyncIVFScanIter *>(vec_index_scan_iter_);
+  last_partition_row_count_ = 0;
+  last_filter_est_row_count_ = 0;
+  if (OB_ISNULL(scan) || OB_ISNULL(search_ctx_) || OB_ISNULL(vec_index_driver_ctdef_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null async IVF partition context", K(ret));
+  } else {
+    const auto mode = vec_index_driver_ctdef_->filter_mode_;
+    const bool fixed_pre = ObKnnFilterMode::PRE_KNN == mode
+        || ObKnnFilterMode::PRE_BRUTE_FORCE == mode;
+    // Fixed PRE has a PRE iterator but intentionally no cost-reevaluation rtdef.
+    // With no filter iterators/definition, even an explicit mode is unfiltered.
+    const bool has_filter = OB_NOT_NULL(pre_filter_iter_) || OB_NOT_NULL(post_filter_iter_)
+        || OB_NOT_NULL(filter_rtdef_for_reeval_);
+    ObVecIndexType new_type = vec_index_driver_ctdef_->vec_type_;
+    bool new_bf = false;
+    double selectivity = 1.0;
+    scan->set_selectivity(0.1);
+    if (fixed_pre && has_filter) {
+      new_type = ObVecIndexType::VEC_INDEX_PRE;
+      new_bf = ObKnnFilterMode::PRE_BRUTE_FORCE == mode;
+    } else if (!has_filter) {
+      new_type = ObVecIndexType::VEC_INDEX_POST_WITHOUT_FILTER;
+    } else if (OB_ISNULL(filter_rtdef_for_reeval_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("missing async IVF filter definition for partition estimate", K(ret), K(mode));
+    } else {
+      ObDASSearchCost cost;
+      if (OB_FAIL(ObDASVecIndexAsyncIVFScanIter::estimate_partition_filter(
+              *search_ctx_, *filter_rtdef_for_reeval_, cost, selectivity))) {
+        LOG_WARN("failed to refresh async IVF filter estimate", K(ret));
+      } else {
+        const ObDASSearchCost &partition_cost = search_ctx_->get_row_count();
+        last_partition_row_count_ = partition_cost.is_valid() ? partition_cost.cost() : 0;
+        last_filter_est_row_count_ = cost.is_valid() ? cost.cost() : 0;
+        const bool valid_estimate = partition_cost.is_valid() && partition_cost.cost() > 0
+            && cost.is_valid() && cost.cost() <= partition_cost.cost();
+        if (ObVecIndexType::VEC_INDEX_INVALID == new_type) {
+          // Keep the IVF policy; HNSW thresholds do not apply to this adapter.
+          new_type = ObVecIndexType::VEC_INDEX_POST_ITERATIVE_FILTER;
+          if (valid_estimate && cost.cost() <= ObDASVecIndexIVFBaseScanIter::MAX_IVF_BRUTE_FORCE_SIZE) {
+            new_type = ObVecIndexType::VEC_INDEX_PRE;
+            new_bf = true;
+          } else if (valid_estimate && selectivity > 0.9) {
+            new_type = ObVecIndexType::VEC_INDEX_POST_WITHOUT_FILTER;
+          } else if (valid_estimate && selectivity <= 0.3) {
+            new_type = ObVecIndexType::VEC_INDEX_PRE;
+          }
+        } else if (ObVecIndexType::VEC_INDEX_PRE == new_type) {
+          new_bf = ObKnnFilterMode::PRE_ADAPTIVE == mode && valid_estimate
+              && cost.cost() <= ObDASVecIndexIVFBaseScanIter::MAX_IVF_BRUTE_FORCE_SIZE;
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      const bool choose_pre = ObVecIndexType::VEC_INDEX_PRE == new_type;
+      if (has_filter && ((choose_pre && OB_ISNULL(pre_filter_iter_))
+          || (!choose_pre && OB_ISNULL(post_filter_iter_)))) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("missing async IVF filter iterator for partition path", K(ret), K(new_type));
+      } else {
+        if (!has_filter) {
+          filter_iter_ = nullptr;
+          filter_mode_ = ObVecFilterMode::VEC_FILTER_MODE_INVALID;
+        } else if (choose_pre) {
+          switch_to_pre_filter();
+        } else {
+          switch_to_post_filter();
+        }
+        vec_index_type_ = new_type;
+        go_brute_force_ = new_bf;
+        scan->set_selectivity(selectivity);
+        scan->set_vec_index_type(vec_index_type_, vec_idx_try_path_, go_brute_force_);
+      }
+    }
+  }
+  return ret;
 }
 
 int ObDASVecIndexDriverIter::decide_ivf_partition_path_(
@@ -504,7 +628,9 @@ int ObDASVecIndexDriverIter::evaluate_partition_path()
       && ObKnnFilterMode::PRE_ADAPTIVE != vec_index_driver_ctdef_->filter_mode_
       && ObKnnFilterMode::POST_FILTER != vec_index_driver_ctdef_->filter_mode_
       && ObKnnFilterMode::POST_INDEX_MERGE != vec_index_driver_ctdef_->filter_mode_;
-  if (is_ivf_index()) {
+  if (is_async_ivf_index()) {
+    ret = evaluate_async_ivf_partition_path();
+  } else if (is_ivf_index()) {
     const bool is_auto_ivf_path = OB_NOT_NULL(vec_index_driver_ctdef_)
                                   && ObVecIndexType::VEC_INDEX_INVALID
                                          == vec_index_driver_ctdef_->vec_type_
@@ -676,6 +802,10 @@ int ObDASVecIndexDriverIter::inner_get_next_rows(int64_t &count, int64_t capacit
         if (OB_FAIL(process_iterative_filter_mode_ivf(count, capacity))) {
           LOG_WARN("failed to process deferred calc mode", K(ret));
         }
+      } else if (is_iter_filter() && is_async_ivf_index()) {
+        if (OB_FAIL(process_iterative_filter_mode_async_ivf(count, capacity))) {
+          LOG_WARN("failed async IVF iterative filter", K(ret));
+        }
       } else if (is_iter_filter()) {
         if (OB_FAIL(process_iterative_filter_mode(count, capacity))) {
           if (OB_SCHEMA_EAGAIN != ret) {
@@ -749,15 +879,19 @@ int ObDASVecIndexDriverIter::inner_get_next_rows(int64_t &count, int64_t capacit
 
 uint64_t ObDASVecIndexDriverIter::get_bitmap_init_size() const
 {
-  return is_ivf_index() ? MAX_BITMAP_INIT_SIZE
+  return (is_ivf_index() || is_async_ivf_index()) ? MAX_BITMAP_INIT_SIZE
                         : static_cast<uint64_t>(bruteforce_fallback_threshold_);
 }
 
-int ObDASVecIndexDriverIter::build_bitmap_from_filter_iter()
+int ObDASVecIndexDriverIter::build_bitmap_from_filter_iter(int64_t &count)
 {
   int ret = OB_SUCCESS;
   int64_t min_vid = 0;
   int64_t max_vid = INT64_MAX;
+  blocksstable::ObIvfPreFilterBitmap *async_pre_bitmap = nullptr;
+  ObSEArray<uint64_t, 256> async_pre_vids(OB_MALLOC_NORMAL_BLOCK_SIZE,
+      ModulePageAllocator(ObMemAttr(MTL_ID(), "DASIVFTmp")));
+  count = 0;
 
   // Pre-filter runs before scan iter get_next_rows. HNSW adaptor may not be acquired yet;
   // ObVecIndexBitmap::init requires min_vid/max_vid >= 0 (INT64_MIN is invalid).
@@ -767,7 +901,7 @@ int ObDASVecIndexDriverIter::build_bitmap_from_filter_iter()
   } else if (is_brute_force_scan()) {
     // Heap-table hidden PKs do not have an HNSW adaptor bound.  Keep the full
     // non-negative VID domain and let the bitmap choose a sparse representation.
-  } else if (!is_ivf_index()) {
+  } else if (!is_ivf_index() && !is_async_ivf_index()) {
     ObDASVecIndexHNSWScanIter *hnsw_iter =
         static_cast<ObDASVecIndexHNSWScanIter *>(vec_index_scan_iter_);
     ObVidBound bound;
@@ -785,7 +919,13 @@ int ObDASVecIndexDriverIter::build_bitmap_from_filter_iter()
     }
   }
 
-  if (OB_SUCC(ret)) {
+  if (OB_FAIL(ret)) {
+  } else if (is_async_ivf_index()) {
+    if (OB_FAIL(static_cast<ObDASVecIndexAsyncIVFScanIter *>(vec_index_scan_iter_)
+        ->prepare_partition_pre_filter(async_pre_bitmap))) {
+      LOG_WARN("failed to prepare async IVF PRE bitmap", K(ret));
+    }
+  } else {
     // A bitmap is shared with scan/search iterators after it is materialized.  Their
     // reuse/release hooks run before the driver resets the bitmap, so never free an
     // existing representation here.  Reject an unexpected second build instead.
@@ -800,6 +940,19 @@ int ObDASVecIndexDriverIter::build_bitmap_from_filter_iter()
     }
   }
 
+  const auto add_vid = [&](int64_t vid) {
+    int ret = OB_SUCCESS;
+    if (nullptr != async_pre_bitmap) {
+      ret = async_pre_vids.push_back(static_cast<uint64_t>(vid));
+    } else {
+      ret = bitmap_.add_vid(vid);
+    }
+    // The async IVF path uses the completed bitmap's distinct count below.
+    if (OB_SUCC(ret)) {
+      ++count;
+    }
+    return ret;
+  };
   ObEvalCtx *eval_ctx = vec_index_driver_rtdef_->eval_ctx_;
   int64_t batch_row_count = eval_ctx->max_batch_size_ > 0 ? 
                             min(eval_ctx->max_batch_size_, ObVectorParamData::VI_PARAM_DATA_BATCH_SIZE) : 
@@ -807,6 +960,7 @@ int ObDASVecIndexDriverIter::build_bitmap_from_filter_iter()
   bool index_end = false;
   common::ScopedTimer timer(common::ObMetricId::HS_VEC_DRIVER_FILTER_TIME);
   while (OB_SUCC(ret) && !index_end) {
+    async_pre_vids.reuse();
     int64_t scan_row_cnt = 0;
     filter_iter_->clear_evaluated_flag();
     if (OB_FAIL(filter_iter_->get_next_rows(scan_row_cnt, batch_row_count))) {
@@ -842,7 +996,7 @@ int ObDASVecIndexDriverIter::build_bitmap_from_filter_iter()
       } else {
         for (int64_t i = 0; OB_SUCC(ret) && i < scan_row_cnt; ++i) {
           int64_t vid = vec->get_uint64(i);
-          if (OB_FAIL(bitmap_.add_vid(vid))) {
+          if (OB_FAIL(add_vid(vid))) {
             LOG_WARN("failed to add vid to bitmap", K(ret), K(vid), K(i));
           }
         }
@@ -858,11 +1012,15 @@ int ObDASVecIndexDriverIter::build_bitmap_from_filter_iter()
         for (int64_t i = 0; OB_SUCC(ret) && i < scan_row_cnt; ++i) {
           guard.set_batch_idx(i);
           int64_t vid = vid_datums[i].get_uint64();
-          if (OB_FAIL(bitmap_.add_vid(vid))) {
+          if (OB_FAIL(add_vid(vid))) {
             LOG_WARN("failed to add vid to bitmap", K(ret), K(vid), K(i));
           }
         }
       }
+    }
+    if (OB_SUCC(ret) && nullptr != async_pre_bitmap && !async_pre_vids.empty()
+        && OB_FAIL(async_pre_bitmap->value_add_many(async_pre_vids.get_data(), async_pre_vids.count()))) {
+      LOG_WARN("failed to append async IVF PRE bitmap batch", K(ret));
     }
   }
 
@@ -870,27 +1028,75 @@ int ObDASVecIndexDriverIter::build_bitmap_from_filter_iter()
     ret = OB_SUCCESS;
   }
 
+  if (OB_SUCC(ret) && nullptr != async_pre_bitmap) {
+    if (OB_FAIL(async_pre_bitmap->finish())) {
+      LOG_WARN("failed to finish async IVF PRE bitmap", K(ret));
+    } else {
+      count = async_pre_bitmap->get_cardinality();
+    }
+  }
+  if (OB_FAIL(ret) && nullptr != async_pre_bitmap) {
+    // async_pre_bitmap is borrowed from scan; scan owns binding and rollback.
+    const int cleanup_ret = static_cast<ObDASVecIndexAsyncIVFScanIter *>(vec_index_scan_iter_)
+        ->abort_partition_pre_filter_build();
+    if (OB_SUCCESS != cleanup_ret) {
+      LOG_WARN("failed to abort async IVF PRE bitmap build", K(ret), K(cleanup_ret));
+    }
+    count = 0;
+  }
   LOG_TRACE("[LT hybrid DAS] build_bitmap_from_filter_iter done",
-           K(ret), "bitmap_valid_cnt", bitmap_.get_valid_cnt());
+           K(ret), "bitmap_valid_cnt", count);
   return ret;
+}
+
+bool ObDASVecIndexDriverIter::uses_group_pre_filter() const
+{
+  return is_async_ivf_index()
+      && static_cast<const ObDASVecIndexAsyncIVFScanIter *>(vec_index_scan_iter_)->can_group_pre_filter();
+}
+
+void ObDASVecIndexDriverIter::update_async_ivf_go_brute_force_after_pre_filter(int64_t allowed_count)
+{
+  const ObKnnFilterMode mode = vec_index_driver_ctdef_->filter_mode_;
+  // Use brute force for small completed bitmaps, including
+  // PRE_KNN. Explicit PRE_BRUTE_FORCE also applies above the threshold.
+  go_brute_force_ = ObKnnFilterMode::PRE_BRUTE_FORCE == mode
+      || allowed_count <= ObDASVecIndexIVFBaseScanIter::MAX_IVF_BRUTE_FORCE_SIZE;
+  vec_index_scan_iter_->set_go_brute_force(go_brute_force_);
 }
 
 int ObDASVecIndexDriverIter::process_pre_filter_mode(int64_t &count, int64_t capacity)
 {
   int ret = OB_SUCCESS;
-
-  if (OB_FAIL(build_bitmap_from_filter_iter())) {
+  int64_t allowed_count = 0;
+  const bool group_pre = uses_group_pre_filter();
+  if (group_pre) {
+    if (OB_FAIL(static_cast<ObDASVecIndexAsyncIVFScanIter *>(vec_index_scan_iter_)
+        ->prepare_group_pre_filter(allowed_count))) {
+      LOG_WARN("failed to prepare async IVF Group PRE filter", K(ret));
+    }
+  } else if (OB_FAIL(build_bitmap_from_filter_iter(allowed_count))) {
     LOG_WARN("failed to build bitmap from filter iter", K(ret));
-  } else if (bitmap_.get_valid_cnt() == 0) {
+  }
+
+  if (OB_FAIL(ret)) {
+    allowed_count = 0;
+  } else if (0 == allowed_count) {
+    // Only a successfully completed filter can prove an empty allowed set.
     ret = OB_ITER_END;
   } else {
-    if (!is_ivf_index()) {
+    if (is_async_ivf_index()) {
+      update_async_ivf_go_brute_force_after_pre_filter(allowed_count);
+    } else if (!is_ivf_index()) {
       update_go_brute_force_after_pre_filter();
     }
-    // bitmap upgrade (VIDS → BYTE_ARRAY) is handled inside scan iter
-    // (IVF: do_ivf_flat/pq_pre_filter; HNSW: init_pre_filter)
+
     common::ScopedTimer timer(common::ObMetricId::HS_VEC_DRIVER_VEC_INDEX_TIME);
-    vec_index_scan_iter_->set_bitmap(&bitmap_);
+    if (!is_async_ivf_index()) {
+      // The old IVF/HNSW paths upgrade ObVecIndexBitmap (VIDS -> BYTE_ARRAY)
+      // inside do_ivf_flat/pq_pre_filter and init_pre_filter, respectively.
+      vec_index_scan_iter_->set_bitmap(&bitmap_);
+    }
     vec_index_scan_iter_->clear_evaluated_flag();
     int64_t dummy_count = 0;
     if (OB_FAIL(vec_index_scan_iter_->get_next_rows(dummy_count, capacity))) {
@@ -903,7 +1109,6 @@ int ObDASVecIndexDriverIter::process_pre_filter_mode(int64_t &count, int64_t cap
       }
     }
   }
-  
   return ret;
 }
 
@@ -974,7 +1179,7 @@ int ObDASVecIndexDriverIter::process_brute_force_mode(int64_t &count, int64_t ca
                      static_cast<uint64_t>(last_partition_row_count_));
     }
     if (OB_SUCC(ret) && OB_NOT_NULL(filter_iter_)) {
-      if (OB_FAIL(build_bitmap_from_filter_iter())) {
+      if (OB_FAIL(build_bitmap_from_filter_iter(actual_filter_cnt))) {
         LOG_WARN("failed to build bitmap for brute force scan", K(ret));
       } else if (0 == bitmap_.get_valid_cnt()) {
         access_mode = ObVecBruteAccessMode::UNKNOWN;
@@ -1073,6 +1278,105 @@ int ObDASVecIndexDriverIter::set_bitmap_to_filter_iter()
   return ret;
 }
 
+int ObDASVecIndexDriverIter::process_iterative_filter_mode_async_ivf(int64_t &count, int64_t capacity)
+{
+  int ret = OB_SUCCESS;
+  bool first = true;
+  bool stop = false;
+  ObSEArray<VidDistancePair, 128> accepted(OB_MALLOC_NORMAL_BLOCK_SIZE,
+      ModulePageAllocator(mem_context_->get_allocator()));
+  ObSEArray<VidDistancePair, 128> matched(OB_MALLOC_NORMAL_BLOCK_SIZE,
+      ModulePageAllocator(mem_context_->get_allocator()));
+  blocksstable::ObIvfKnnSearchResult selected(ObMemAttr(MTL_ID(), "DASIVFTmp"));
+  auto *async_iter = static_cast<ObDASVecIndexAsyncIVFScanIter *>(vec_index_scan_iter_);
+  const int64_t topk = limit_param_.limit_ + limit_param_.offset_;
+  search_ctx_->set_is_vec_index_search(true);
+  while (OB_SUCC(ret) && !stop) {
+    iter_added_cnt_ = 0;
+    matched.reuse();
+    selected.reset();
+    INC_METRIC_VAL(common::ObMetricId::HS_VEC_DRIVER_ITER_FILTER_ROUND, 1);
+    if (OB_FAIL(fetch_vids_from_vec_index(count, capacity))) {
+      LOG_WARN("failed async IVF candidate round", K(ret));
+    } else if (0 == iter_unfiltered_vid_cnt_) {
+      // Empty Segments need no filter rescan.
+    } else if (ObVecFilterMode::VEC_FILTER_MODE_EXPR_FILTER == filter_mode_) {
+      ret = do_expr_filter_batch(&matched);
+    } else if (!first && OB_FAIL(filter_iter_->reuse())) {
+      LOG_WARN("failed to reuse async IVF candidate filter", K(ret));
+    } else if (!first && OB_FAIL(static_cast<ObDASSearchDriverIter *>(filter_iter_)
+                                   ->rescan_for_next_candidates())) {
+      LOG_WARN("failed to rescan async IVF candidate filter", K(ret));
+    } else if (OB_FAIL(set_bitmap_to_filter_iter())) {
+      LOG_WARN("failed to bind async IVF candidate bitmap", K(ret));
+    } else if (OB_FAIL(post_query_vid_with_filter(&matched))) {
+      LOG_WARN("failed to validate async IVF candidates", K(ret));
+    }
+    for (int64_t i = 0; OB_SUCC(ret) && i < matched.count(); ++i) {
+      blocksstable::ObIvfKnnEntry entry;
+      entry.vid_ = matched.at(i).vid;
+      if (OB_FAIL(selected.add(entry))) {
+        LOG_WARN("failed to retain filtered IVF VID", K(ret));
+      }
+    }
+    if (OB_SUCC(ret) && selected.count() > 0) {
+      common::ScopedTimer timer(common::ObMetricId::HS_VEC_DRIVER_VEC_INDEX_TIME);
+      if (OB_FAIL(async_iter->refine_post_filter_candidates(selected))) {
+        LOG_WARN("failed to refine filtered IVF batch", K(ret));
+      } else {
+        const auto *refined = async_iter->get_adaptor_vid_iter();
+        for (int64_t i = 0; OB_SUCC(ret) && i < refined->get_total(); ++i) {
+          VidDistancePair pair;
+          pair.vid = refined->get_vids()[i];
+          pair.distance = refined->get_distance()[i];
+          if (OB_FAIL(accepted.push_back(pair))) {
+            LOG_WARN("failed to retain refined IVF candidate", K(ret));
+          }
+        }
+      }
+    }
+    if (OB_SUCC(ret)) {
+      // A filter can emit the same VID more than once. Compact identities
+      // before TopK truncation and before passing the accepted count to refill.
+      // Across Segments, the retained filtered Top-K is the identity set;
+      // rejected candidates need no epoch cache.
+      if (accepted.count() > 1) {
+        lib::ob_sort(accepted.get_data(), accepted.get_data() + accepted.count(),
+            [](const VidDistancePair &a, const VidDistancePair &b) { return a.vid < b.vid; });
+        int64_t unique_count = 1;
+        for (int64_t i = 1; i < accepted.count(); ++i) {
+          if (accepted.at(i).vid != accepted.at(unique_count - 1).vid) {
+            accepted.at(unique_count++) = accepted.at(i);
+          }
+        }
+        while (accepted.count() > unique_count) { accepted.pop_back(); }
+      }
+      // Retain the best accepted candidates encountered so far. Stopping after
+      // enough matches does not imply an exact TopK over all IVF centroids.
+      if (accepted.count() > 1) {
+        lib::ob_sort(accepted.get_data(), accepted.get_data() + accepted.count(),
+            [](const VidDistancePair &a, const VidDistancePair &b) {
+              return a.distance < b.distance || (a.distance == b.distance && a.vid < b.vid);
+            });
+      }
+      while (accepted.count() > topk) {
+        accepted.pop_back();
+      }
+      ret = async_iter->adjust_search_for_next_round(false, nullptr,
+          iter_unfiltered_vid_cnt_, accepted.count(), iter_scan_total_num_, stop);
+    }
+    if (iter_unfiltered_vid_cnt_ > 0) { first = false; }
+  }
+  search_ctx_->set_is_vec_index_search(false);
+  if (OB_SUCC(ret) && OB_FAIL(init_adaptor_vid_iter_if_null())) {
+    LOG_WARN("failed to allocate async IVF validated topk", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < accepted.count(); ++i) {
+    ret = adaptor_vid_iter_->add_result(accepted.at(i).vid, accepted.at(i).distance, nullptr);
+  }
+  return ret;
+}
+
 int ObDASVecIndexDriverIter::process_iterative_filter_mode(int64_t &count, int64_t capacity)
 {
   int ret = OB_SUCCESS;
@@ -1106,7 +1410,8 @@ int ObDASVecIndexDriverIter::process_iterative_filter_mode(int64_t &count, int64
     } else {
       if (!first_search && OB_FAIL(filter_iter_->reuse())) {
         LOG_WARN("failed to reuse filter iter", K(ret));
-      } else if (!first_search && OB_FAIL(filter_iter_->rescan())) {
+      } else if (!first_search && OB_FAIL(static_cast<ObDASSearchDriverIter *>(filter_iter_)
+                                            ->rescan_for_next_candidates())) {
         LOG_WARN("failed to rescan filter iter", K(ret));
       } else if (OB_FAIL(set_bitmap_to_filter_iter())) {
         LOG_WARN("failed to set bitmap to filter iter", K(ret));
@@ -1250,7 +1555,7 @@ int ObDASVecIndexDriverIter::fetch_vids_from_vec_index(int64_t &count, int64_t c
         if (OB_ISNULL(vids) || OB_ISNULL(distances)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("vids or distances is null", K(ret), KP(vids), KP(distances), K(total_count));
-        } else if (is_ivf_index()) {
+        } else if (is_ivf_index() || is_async_ivf_index()) {
           for (int64_t i = 0; i < total_count; ++i) {
             min_vid = min(min_vid, vids[i]);
             max_vid = max(max_vid, vids[i]);
@@ -1608,7 +1913,8 @@ int ObDASVecIndexDriverIter::process_post_filter_mode_ivf(int64_t &count, int64_
             if (OB_SUCC(ret)) {
               if (!first_search && OB_FAIL(filter_iter_->reuse())) {
                 LOG_WARN("failed to reuse filter iter", K(ret));
-              } else if (!first_search && OB_FAIL(filter_iter_->rescan())) {
+              } else if (!first_search && OB_FAIL(static_cast<ObDASSearchDriverIter *>(filter_iter_)
+                                                    ->rescan_for_next_candidates())) {
                 LOG_WARN("failed to rescan filter iter", K(ret));
               } else if (OB_FAIL(set_bitmap_to_filter_iter())) {
                 LOG_WARN("failed to set bitmap to filter iter", K(ret));
@@ -1781,7 +2087,8 @@ int ObDASVecIndexDriverIter::process_iterative_filter_mode_ivf(int64_t &count, i
         if (OB_SUCC(ret)) {
           if (!first_search && OB_FAIL(filter_iter_->reuse())) {
             LOG_WARN("failed to reuse filter iter", K(ret));
-          } else if (!first_search && OB_FAIL(filter_iter_->rescan())) {
+          } else if (!first_search && OB_FAIL(static_cast<ObDASSearchDriverIter *>(filter_iter_)
+                                                ->rescan_for_next_candidates())) {
             LOG_WARN("failed to rescan filter iter", K(ret));
           } else if (OB_FAIL(set_bitmap_to_filter_iter())) {
             LOG_WARN("failed to set bitmap to filter iter", K(ret));
@@ -2100,7 +2407,7 @@ int ObDASVecIndexDriverIter::post_query_vid_with_expr_filter()
   return ret;
 }
 
-int ObDASVecIndexDriverIter::do_expr_filter_batch()
+int ObDASVecIndexDriverIter::do_expr_filter_batch(ObIArray<VidDistancePair> *out_pairs)
 {
   int ret = OB_SUCCESS;
   int64_t processed = 0;
@@ -2109,6 +2416,8 @@ int ObDASVecIndexDriverIter::do_expr_filter_batch()
   if (OB_ISNULL(src_iter) || OB_ISNULL(scalar_scan_ctdef_) || OB_ISNULL(scalar_scan_rtdef_)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected nullptr", K(ret), KP(src_iter), KP(scalar_scan_ctdef_), KP(scalar_scan_rtdef_));
+  } else if (0 == src_iter->get_total()) {
+    // A deduplicated continuation round may have no new candidates.
   } else {
     const int64_t total_count = src_iter->get_total();
     const int64_t *vids = src_iter->get_vids();
@@ -2123,21 +2432,29 @@ int ObDASVecIndexDriverIter::do_expr_filter_batch()
       LOG_WARN("create vid_to_idx_map failed", K(ret));
     }
 
-    ObObj *vid_objs = static_cast<ObObj *>(arena.alloc(sizeof(ObObj) * batch_size));
-    bool *matched_flags = static_cast<bool *>(arena.alloc(sizeof(bool) * batch_size));
-    if (OB_ISNULL(vid_objs) || OB_ISNULL(matched_flags)) {
-      ret = OB_ALLOCATE_MEMORY_FAILED;
-      LOG_WARN("alloc vid_objs or matched_flags failed", K(ret), K(batch_size));
+    if (OB_SUCC(ret) && nullptr == expr_filter_vid_objs_) {
+      if (OB_ISNULL(expr_filter_vid_objs_ = static_cast<ObObj *>(arena.alloc(sizeof(ObObj) * batch_size)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("alloc expression filter vid buffer failed", K(ret), K(batch_size));
+      }
     }
+    if (OB_SUCC(ret) && nullptr == expr_filter_matched_flags_) {
+      if (OB_ISNULL(expr_filter_matched_flags_ = static_cast<bool *>(arena.alloc(sizeof(bool) * batch_size)))) {
+        ret = OB_ALLOCATE_MEMORY_FAILED;
+        LOG_WARN("alloc expression filter match buffer failed", K(ret), K(batch_size));
+      }
+    }
+    ObObj *vid_objs = expr_filter_vid_objs_;
+    bool *matched_flags = expr_filter_matched_flags_;
 
-    while (OB_SUCC(ret) && processed < total_count && !adaptor_vid_iter_->get_enough()) {
+    while (OB_SUCC(ret) && processed < total_count && (nullptr != out_pairs || !adaptor_vid_iter_->get_enough())) {
       vid_to_idx_map.reuse();
       MEMSET(matched_flags, 0, sizeof(bool) * batch_size);
       scalar_scan_rtdef_->key_ranges_.reset();
       int64_t batch_cnt = 0;
       const int64_t batch_start = processed;
 
-      const int64_t needed = adaptor_vid_iter_->get_alloc_size() - adaptor_vid_iter_->get_total();
+      const int64_t needed = nullptr != out_pairs ? 0 : adaptor_vid_iter_->get_alloc_size() - adaptor_vid_iter_->get_total();
       int64_t effective_batch = batch_size;
       if (needed > 0) {
         double selectivity = 0;
@@ -2171,7 +2488,8 @@ int ObDASVecIndexDriverIter::do_expr_filter_batch()
       if (OB_FAIL(ret) || batch_cnt == 0) {
       } else if (OB_FAIL(filter_iter_->reuse())) {
         LOG_WARN("filter_iter_ reuse failed", K(ret));
-      } else if (OB_FAIL(filter_iter_->rescan())) {
+      } else if (OB_FAIL(static_cast<ObDASSearchDriverIter *>(filter_iter_)
+                            ->rescan_for_next_candidates())) {
         LOG_WARN("filter_iter_ rescan failed", K(ret));
       } else {
         ObExpr *vid_expr = nullptr;
@@ -2266,10 +2584,17 @@ int ObDASVecIndexDriverIter::do_expr_filter_batch()
       if (OB_ITER_END == ret) {
         ret = OB_SUCCESS;
       }
-      for (int64_t i = 0; OB_SUCC(ret) && i < batch_cnt && !adaptor_vid_iter_->get_enough(); ++i) {
+      for (int64_t i = 0; OB_SUCC(ret) && i < batch_cnt && (nullptr != out_pairs || !adaptor_vid_iter_->get_enough()); ++i) {
         if (matched_flags[i]) {
           const int64_t idx = batch_start + i;
-          if (OB_FAIL(adaptor_vid_iter_->add_result(vids[idx], distances[idx], nullptr))) {
+          if (nullptr != out_pairs) {
+            VidDistancePair pair;
+            pair.vid = vids[idx];
+            pair.distance = distances[idx];
+            if (OB_FAIL(out_pairs->push_back(pair))) {
+              LOG_WARN("failed to retain validated async IVF candidate", K(ret));
+            } else { ++iter_added_cnt_; }
+          } else if (OB_FAIL(adaptor_vid_iter_->add_result(vids[idx], distances[idx], nullptr))) {
             LOG_WARN("add_result failed", K(ret), K(vids[idx]), K(idx));
           } else {
             iter_added_cnt_++;
@@ -2302,7 +2627,8 @@ int ObDASVecIndexDriverIter::filter_by_index_back(int64_t vid, float distance, b
     LOG_WARN("failed to reuse filter iter", K(ret));
   } else if (OB_FAIL(set_rowkey_by_vid(vid))) {
     LOG_WARN("failed to set rowkey by vid", K(ret), K(vid));
-  } else if (OB_FAIL(filter_iter_->rescan())) {
+  } else if (OB_FAIL(static_cast<ObDASSearchDriverIter *>(filter_iter_)
+                        ->rescan_for_next_candidates())) {
     LOG_WARN("failed to rescan filter iter", K(ret));
   } else {
     bool is_vectorized = vec_index_driver_rtdef_->eval_ctx_->is_vectorized();

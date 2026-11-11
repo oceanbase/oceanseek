@@ -7,6 +7,7 @@
 #define protected public
 #define private public
 #include "storage/tx_storage/ob_ls_service.h"
+#include "logservice/ob_garbage_collector.h"
 #include "sensitive_test/object_storage/object_storage_authorization_info.h"
 #include "mittest/shared_storage/simple_server/test_gc_util.h"
 #include "mittest/shared_storage/test_ss_common_util.h"
@@ -343,14 +344,22 @@ static void remove_ls_and_wait(ObLSService *ls_svr, const int64_t ls_id)
   bool exist = true;
   ASSERT_SUCC(ls_svr->check_ls_exist(id, exist));
   ASSERT_FALSE(exist);
+  logservice::ObGarbageCollector *gc_service = MTL(logservice::ObGarbageCollector *);
+  ASSERT_NE(nullptr, gc_service);
+  const int64_t deadline = ObTimeUtility::current_time() + 30 * 1000 * 1000;
   bool waiting = true;
-  for (int64_t i = 0; i < 30 && waiting; ++i) {
+  do {
+    // Like wait_ls_safe_destroy() in test_shared_meta_common.h, drive the
+    // real queue instead of depending on the background GC timer's phase.
+    // loop() serializes processing with GC through its existing queue lock.
+    gc_service->safe_destroy_handler_.queue_.loop();
     ASSERT_SUCC(ls_svr->check_ls_waiting_safe_destroy(id, waiting));
-    if (waiting) {
-      ::sleep(1);
+    if (!waiting || ObTimeUtility::current_time() >= deadline) {
+      break;
     }
-  }
-  ASSERT_FALSE(waiting);
+    ob_usleep(100 * 1000);
+  } while (true);
+  ASSERT_FALSE(waiting) << "LS " << ls_id << " is still waiting for safe destruction";
 }
 
 static void remove_all_ls_and_wait(ObLSService *ls_svr)

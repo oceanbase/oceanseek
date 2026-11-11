@@ -4,6 +4,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "common/ob_target_specific.h"
 #define private public
 #define protected public
 #include "share/vector_type/ob_vector_l2_distance.h"
@@ -16,6 +17,7 @@
 
 #include <iostream>
 #include <chrono>
+#include <vector>
 
 using namespace std;
 
@@ -188,6 +190,18 @@ TEST_F(TestSimdVectorOp, add)
   std::cout << "simd is " << double(dur_normal)/double(dur_simd) << "x faster than normal" << std::endl;
 }
 
+TEST_F(TestSimdVectorOp, div_simd_tail)
+{
+  for (const int64_t dim : {3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 768, 769}) {
+    SCOPED_TRACE(::testing::Message() << "dim=" << dim);
+    std::vector<float> values(dim, 12.0F);
+    ASSERT_EQ(OB_SUCCESS, ObVectorDiv::calc(values.data(), 3.0F, dim));
+    for (const float value : values) {
+      EXPECT_FLOAT_EQ(4.0F, value);
+    }
+  }
+}
+
 TEST_F(TestSimdVectorOp, div)
 {
   ObArenaAllocator allocator(ObModIds::TEST);
@@ -218,8 +232,12 @@ TEST_F(TestSimdVectorOp, div)
     dur_normal += duration_cast<nanoseconds>(high_resolution_clock::now() - start_normal).count();
 
     system_clock::time_point start_simd = high_resolution_clock::now();
-    ASSERT_EQ(OB_SUCCESS, vector_div_normal(vec_cp, divisor, VEC_SIZE));
+    ASSERT_EQ(OB_SUCCESS, ObVectorDiv::calc(vec_cp, divisor, VEC_SIZE));
     dur_simd += duration_cast<nanoseconds>(high_resolution_clock::now() - start_simd).count();
+  }
+
+  for (int i = 0; i < VEC_SIZE; ++i) {
+    ASSERT_EQ(vec3[i], vec_cp[i]);
   }
 
   std::cout << "normal div: " << dur_normal/1000000.0 << "ms, simd div: " << dur_simd/1000000.0 << "ms" << std::endl;
@@ -231,6 +249,7 @@ TEST_F(TestSimdVectorOp, div)
 
 int main(int argc, char **argv)
 {
+  oceanbase::common::init_arches();
   ::testing::InitGoogleTest(&argc, argv);
   // system("rm -f test_array_meta.log");
   // OB_LOGGER.set_file_name("test_array_meta.log");

@@ -93,6 +93,12 @@ const char *oceanbase::share::get_ddl_type(ObDDLType ddl_type)
     case ObDDLType::DDL_DROP_ASYNC_SEARCH_INDEX:
       ret_name = "DDL_DROP_ASYNC_SEARCH_INDEX";
       break;
+    case ObDDLType::DDL_CREATE_ASYNC_VEC_IVF_INDEX:
+      ret_name = "DDL_CREATE_ASYNC_VEC_IVF_INDEX";
+      break;
+    case ObDDLType::DDL_DROP_ASYNC_VEC_IVF_INDEX:
+      ret_name = "DDL_DROP_ASYNC_VEC_IVF_INDEX";
+      break;
     case ObDDLType::DDL_CREATE_MLOG:
       ret_name = "DDL_CREATE_MLOG";
       break;
@@ -3146,17 +3152,18 @@ int ObDDLUtil::hold_snapshot(
     common::ObMySQLTransaction &trans,
     const ObTableSchema &data_table_schema,
     const ObTableSchema &index_table_schema,
-    const int64_t snapshot)
+    const int64_t snapshot,
+    const int64_t snapshot_schema_version)
 {
   int ret = OB_SUCCESS;
   SCN snapshot_scn;
   const uint64_t tenant_id = data_table_schema.get_tenant_id();
   const int64_t data_table_id = data_table_schema.get_table_id();
   const int64_t index_table_id = index_table_schema.get_table_id();
-  const int64_t schema_version = index_table_schema.get_schema_version();
-  if (snapshot <= 0) {
+  const int64_t schema_version = snapshot_schema_version;
+  if (snapshot <= 0 || schema_version <= 0) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("snapshot version not valid", K(ret), K(snapshot));
+    LOG_WARN("snapshot retention key is invalid", K(ret), K(snapshot), K(schema_version));
   } else if (OB_FAIL(snapshot_scn.convert_for_tx(snapshot))) {
     LOG_WARN("failed to convert", K(snapshot), K(ret));
   } else {
@@ -3244,7 +3251,8 @@ int ObDDLUtil::obtain_snapshot(
     LOG_WARN("the snapshot is not valid", K(ret), K(new_fetched_snapshot));
   }
   if (OB_FAIL(ret)) {
-  } else if (OB_FAIL(ObDDLUtil::hold_snapshot(trans, data_table_schema, index_table_schema, new_fetched_snapshot))) {
+  } else if (OB_FAIL(ObDDLUtil::hold_snapshot(trans, data_table_schema, index_table_schema,
+          new_fetched_snapshot, index_table_schema.get_schema_version()))) {
     if (OB_SNAPSHOT_DISCARDED == ret) {
       LOG_INFO("snapshot discarded, need retry waiting trans", K(ret), K(new_fetched_snapshot));
     } else {
@@ -3359,6 +3367,8 @@ int ObDDLUtil::construct_domain_index_arg(const ObTableSchema *table_schema,
     ddl_type = ObDDLType::DDL_CREATE_SEARCH_INDEX;
   } else if (index_schema->is_async_fts_index()) {
     ddl_type = ObDDLType::DDL_CREATE_ASYNC_FTS_INDEX;
+  } else if (index_schema->is_async_ivf_index()) {
+    ddl_type = ObDDLType::DDL_CREATE_ASYNC_VEC_IVF_INDEX;
   } else {
     ddl_type = get_create_index_type(task.get_data_format_version(), *index_schema);
   }
@@ -3388,6 +3398,59 @@ int ObDDLUtil::construct_domain_index_arg(const ObTableSchema *table_schema,
   }
 
   if (OB_FAIL(ret)) {
+  } else if (index_schema->is_async_ivf_index() && create_index_arg.is_table_restore_) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("table restore is not supported for async DISK_BBQ", K(ret), KPC(index_schema));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "table restore with async DISK_BBQ index is");
+  } else if (index_schema->is_async_ivf_index()
+             && OB_FAIL(create_index_arg.index_schema_.assign(*index_schema))) {
+    LOG_WARN("failed to copy async DISK_BBQ index schema for offline rebuild",
+             K(ret), KPC(index_schema));
+  } else if (index_schema->is_async_ivf_index()) {
+    ObArray<std::pair<int64_t, ObColumnSortItem>> physical_index_columns;
+    for (ObTableSchema::const_column_iterator it = index_schema->column_begin();
+         OB_SUCC(ret) && it != index_schema->column_end(); ++it) {
+      const ObColumnSchemaV2 *column = *it;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("null async DISK_BBQ index column", K(ret), KPC(index_schema));
+      } else if (column->get_index_position() > 0) {
+        ObColumnSortItem sort_item;
+        sort_item.column_name_ = column->get_column_name_str();
+        sort_item.order_type_ = column->get_order_in_rowkey();
+        if (OB_FAIL(physical_index_columns.push_back(
+                std::make_pair(column->get_index_position(), sort_item)))) {
+          LOG_WARN("failed to save async DISK_BBQ index column", K(ret), KPC(column));
+        }
+      } else if (column->is_user_specified_storing_column()
+                 && OB_FAIL(create_index_arg.store_columns_.push_back(
+                                column->get_column_name_str()))) {
+        LOG_WARN("failed to save async DISK_BBQ storing column", K(ret), KPC(column));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      lib::ob_sort(physical_index_columns.begin(), physical_index_columns.end(),
+          [](const std::pair<int64_t, ObColumnSortItem> &lhs,
+             const std::pair<int64_t, ObColumnSortItem> &rhs) {
+            return lhs.first < rhs.first;
+          });
+      for (int64_t i = 0; OB_SUCC(ret) && i < physical_index_columns.count(); ++i) {
+        if (OB_FAIL(create_index_arg.index_columns_.push_back(
+                physical_index_columns.at(i).second))) {
+          LOG_WARN("failed to add async DISK_BBQ index column", K(ret), K(i));
+        }
+      }
+    }
+    if (OB_SUCC(ret) && (3 != create_index_arg.index_columns_.count()
+                         || 1 != create_index_arg.store_columns_.count())) {
+      ret = OB_SCHEMA_ERROR;
+      LOG_WARN("invalid async DISK_BBQ physical column contract", K(ret),
+               K(create_index_arg.index_columns_), K(create_index_arg.store_columns_));
+    }
+    if (OB_SUCC(ret)) {
+      create_index_arg.is_rebuild_index_ = true;
+      create_index_arg.index_table_id_ = index_schema->get_table_id();
+    }
   } else if (index_schema->is_vec_index()
              && OB_FAIL(create_index_arg.index_schema_.set_index_params(index_schema->get_index_params()))) {
     LOG_WARN("fail to copy vector index params for offline rebuild", K(ret), K(index_schema->get_index_params()));
@@ -3527,7 +3590,8 @@ bool ObDDLUtil::should_defer_async_index_snapshot(
     const uint64_t tenant_data_version)
 {
   return (is_async_fts_index(create_index_arg.index_type_)
-          || is_async_search_def_index(create_index_arg.index_type_))
+          || is_async_search_def_index(create_index_arg.index_type_)
+          || is_async_ivf_index(create_index_arg.index_type_))
       && !create_index_arg.is_offline_or_restore()
       && tenant_data_version >= DATA_VERSION_4_6_3_0;
 }
@@ -3547,7 +3611,8 @@ int ObDDLUtil::prepare_aux_and_async_index_build(
   int ret = OB_SUCCESS;
   const uint64_t tenant_id = data_table_schema.get_tenant_id();
   const bool is_async_index_ddl = is_async_fts_index(create_index_arg.index_type_)
-      || is_async_search_def_index(create_index_arg.index_type_);
+      || is_async_search_def_index(create_index_arg.index_type_)
+      || is_async_ivf_index(create_index_arg.index_type_);
   if (should_defer_async_index_snapshot(create_index_arg, tenant_data_version)) {
     if (OB_FAIL(write_defensive(trans, tenant_id, data_table_schema, schema_service))) {
       LOG_WARN("fail to write defensive for async index", K(ret), K(tenant_id), K(data_table_schema));

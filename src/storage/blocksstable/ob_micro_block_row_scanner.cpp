@@ -174,8 +174,15 @@ int ObIMicroBlockRowScanner::open(
   } else if (OB_UNLIKELY(!macro_id.is_valid() || !block_data.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(macro_id), K(block_data));
+  } else if (OB_UNLIKELY(nullptr == block_data.get_micro_header())) {
+    // The micro block carries no valid row-format micro header (e.g. an IVF FastScan encoded
+    // vector block in the block cache: ObMicroBlockCacheValue explicitly keeps micro_header_
+    // null for ObMicroBlockData::IVF_FASTSCAN_BLOCK). Dereferencing it would crash the observer.
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected micro block without valid micro header", K(ret), K(macro_id), K(block_data),
+             "is_data_block", ObMicroBlockData::DATA_BLOCK == block_data.type_);
   } else if (OB_FAIL(set_reader(*block_data.get_micro_header()))) {
-    LOG_WARN("failed to set reader", K(ret), "header", *block_data.get_micro_header());
+    LOG_WARN("failed to set reader", K(ret), K(block_data));
   } else if (OB_FAIL(reader_->init(block_data, *read_info_))) {
     LOG_WARN("failed to init micro block reader", K(ret), KPC(read_info_));
   } else {
@@ -204,8 +211,14 @@ int ObIMicroBlockRowScanner::open_column_block(
   } else if (OB_UNLIKELY(!macro_id.is_valid() || !block_data.is_valid() || !range.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(macro_id), K(block_data), K(range));
+  } else if (OB_UNLIKELY(nullptr == block_data.get_micro_header())) {
+    // See ObIMicroBlockRowScanner::open: a micro block without a valid row-format micro header
+    // (e.g. a FastScan encoded IVF vector block) can not be opened as a column block.
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected micro block without valid micro header", K(ret), K(macro_id), K(block_data),
+             K(range), "is_data_block", ObMicroBlockData::DATA_BLOCK == block_data.type_);
   } else if (OB_FAIL(set_reader(*block_data.get_micro_header()))) {
-    LOG_WARN("failed to set reader", K(ret), "header", *block_data.get_micro_header());
+    LOG_WARN("failed to set reader", K(ret), K(block_data));
   } else if (OB_FAIL(reader_->init(block_data, *read_info_))) {
     LOG_WARN("failed to init micro block reader", K(ret), KPC(read_info_));
   } else {
@@ -1554,8 +1567,17 @@ int ObMicroBlockRowScanner::estimate_row_count(
   if (OB_UNLIKELY(!range_->is_valid() || !block_data.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), KPC_(range), K(block_data));
+  } else if (OB_UNLIKELY(ObMicroBlockData::DATA_BLOCK != block_data.type_
+                        || nullptr == block_data.get_micro_header())) {
+    // Only a normal row-format data block can be estimated by opening it: an IVF FastScan encoded
+    // vector block has no micro header at all, and an index / inverted posting block has a
+    // different row format than read_info describes.
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected micro block type or missing micro header when estimating row count",
+             K(ret), K(block_data), KPC_(range),
+             "is_data_block", ObMicroBlockData::DATA_BLOCK == block_data.type_);
   } else if (OB_FAIL(set_reader(*block_data.get_micro_header()))) {
-    LOG_WARN("failed to set reader", K(ret), "header", *block_data.get_micro_header());
+    LOG_WARN("failed to set reader", K(ret), K(block_data));
   } else if (OB_FAIL(reader_->init(block_data, &read_info.get_datum_utils()))) {
     LOG_WARN("failed to init micro block reader", K(ret), K(block_data), K(read_info));
   } else {

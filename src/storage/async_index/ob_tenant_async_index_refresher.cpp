@@ -744,13 +744,18 @@ int ObTenantAsyncIndexRefresher::refresh_one_data_table_(
       ObRefreshSqlOp op = REFRESH_SQL_INSERT_NEW;
       if (decision.is_complete_refresh_) {
         op = REFRESH_SQL_COMPLETE;
-      } else if (index_info.is_delete_index_) {
+      } else if (index_info.is_async_delete_index()) {
         op = REFRESH_SQL_DELETE_OLD;
       }
       int64_t refresh_task_id = 0;
       ObSqlString refresh_sql;
       int tmp_ret = OB_SUCCESS;
-      if (OB_TMP_FAIL(generate_refresh_task_id_(refresh_task_id))) {
+      if (index_info.is_async_ivf_index() && decision.is_complete_refresh_) {
+        // TODO @lyl512932: support async_ivf_index complete_refresh
+        tmp_ret = OB_STATE_NOT_MATCH;
+        LOG_WARN("async IVF index has no initialized empty baseline",
+                 K(tmp_ret), K(data_table_id), K(decision), K(index_info));
+      } else if (OB_TMP_FAIL(generate_refresh_task_id_(refresh_task_id))) {
         LOG_WARN("failed to generate refresh_task_id, skip", K(tmp_ret),
                  K_(tenant_id), K(data_tablet_id), K(decision));
       } else if (OB_TMP_FAIL(build_refresh_sql_(data_table_info, data_tablet_pos, index_info,

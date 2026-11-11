@@ -78,10 +78,12 @@ int ObShardingInfo::init_partition_info(ObOptimizerContext &ctx,
           && stmt.is_select_stmt()
           && (table_schema->is_aux_lob_table()
               || (table_item->is_index_table_
-                  && share::schema::is_local_fts_index(table_schema->get_index_type())))) {
+                  && (share::schema::is_local_fts_index(table_schema->get_index_type())
+                      || table_schema->is_async_ivf_index())))) {
         LOG_INFO("index or lob aux direct select: fallback to scanning all partitions",
                  K(table_id), K(ref_table_id), "is_aux_lob", table_schema->is_aux_lob_table(),
-                 "is_fts_index", table_item->is_index_table_);
+                 "is_fts_index", table_item->is_index_table_,
+                 "is_async_ivf_index", table_schema->is_async_ivf_index());
         part_level_ = PARTITION_LEVEL_ZERO;
       } else if (OB_ISNULL(part_expr = stmt.get_part_expr(table_id, ref_table_id))) {
         ret = OB_ERR_UNEXPECTED;
@@ -153,7 +155,8 @@ int ObShardingInfo::get_all_partition_key(ObOptimizerContext &ctx,
       && stmt.is_select_stmt()
       && (table_schema->is_aux_lob_table()
           || (table_item->is_index_table_
-              && share::schema::is_local_fts_index(table_schema->get_index_type())))) {
+              && (share::schema::is_local_fts_index(table_schema->get_index_type())
+                  || table_schema->is_async_ivf_index())))) {
     LOG_INFO("index or lob aux direct select: fallback to scanning all partitions",
              K(table_id), K(ref_table_id), "is_aux_lob", table_schema->is_aux_lob_table(),
              "is_fts_index", table_item->is_index_table_);

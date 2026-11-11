@@ -179,7 +179,7 @@ int ObPartitionMergePolicy::get_inc_major_merge_tables(
 
   if (OB_UNLIKELY(tablet.is_ls_inner_tablet())) {
     ret = OB_NO_NEED_MERGE;
-  } else if (tablet.is_async_inverted_storage_index()) {
+  } else if (tablet.is_async_index_storage_tablet()) {
     if (OB_FAIL(get_async_index_inc_major_merge_tables(param, ls, tablet, result))) {
       if (OB_NO_NEED_MERGE != ret) {
         LOG_WARN("failed to get async index inc major merge tables", K(ret));

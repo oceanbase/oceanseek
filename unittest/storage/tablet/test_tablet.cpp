@@ -426,17 +426,17 @@ TEST_F(TestTablet, test_async_index_refresh_target_flags)
   ObTableStoreCache cache;
 
   ASSERT_FALSE(cache.is_async_index_refresh_target());
-  ASSERT_FALSE(cache.is_async_inverted_storage_index());
+  ASSERT_FALSE(cache.is_async_index_storage_tablet());
   ASSERT_FALSE(cache.is_async_delete_index());
 
   cache.is_async_index_refresh_target_ = true;
   ASSERT_TRUE(cache.is_async_index_refresh_target());
-  ASSERT_TRUE(cache.is_async_inverted_storage_index());
+  ASSERT_TRUE(cache.is_async_index_storage_tablet());
   ASSERT_FALSE(cache.is_async_delete_index());
 
   cache.is_async_delete_index_ = true;
   ASSERT_TRUE(cache.is_async_index_refresh_target());
-  ASSERT_FALSE(cache.is_async_inverted_storage_index());
+  ASSERT_FALSE(cache.is_async_index_storage_tablet());
   ASSERT_TRUE(cache.is_async_delete_index());
 }
 

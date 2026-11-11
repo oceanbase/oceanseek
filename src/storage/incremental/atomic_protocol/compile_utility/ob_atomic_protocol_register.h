@@ -71,4 +71,10 @@
                       COMPACTION,                                                /* sswriter 类型 */ \
                       USER_DEFINE                                                /* 类类型 */ \
                       )
+  REGISTER_ATOMIC_PROTOCOL(NON_IDEM_MAJOR_SSTABLE,                       /* 类型名 */ \
+                      12,                                                        /* 类型 ID */ \
+                      SSTABLE,                                                   /* 类型层级 */ \
+                      COMPACTION,                                                /* sswriter 类型 */ \
+                      USER_DEFINE                                                /* 类类型 */ \
+                      )
 #endif

@@ -68,7 +68,8 @@ public:
     CO_SSTABLE      = 1,
     TABLE_STORE     = 2,
     INV_SSTABLE     = 3,
-    MAX             = 4,
+    IVF_SSTABLE     = 4,
+    MAX             = 5,
   };
 public:
   ObStorageMetaValue();
@@ -101,6 +102,12 @@ public:
       const int64_t size,
       const ObTablet *tablet);
   static int process_inv_sstable(
+      ObStorageMetaValueHandle &handle,
+      const ObStorageMetaKey &key,
+      const char *buf,
+      const int64_t size,
+      const ObTablet *tablet);
+  static int process_ivf_sstable(
       ObStorageMetaValueHandle &handle,
       const ObStorageMetaKey &key,
       const char *buf,
@@ -295,13 +302,15 @@ private:
     const ObTabletTableStore &table_store,
     /* out */hash::ObHashSet<blocksstable::MacroBlockId> &normal_sst_ids,
     /* out */hash::ObHashSet<blocksstable::MacroBlockId> &co_sst_ids,
-    /* out */hash::ObHashSet<blocksstable::MacroBlockId> &inv_sst_ids);
+    /* out */hash::ObHashSet<blocksstable::MacroBlockId> &inv_sst_ids,
+    /* out */hash::ObHashSet<blocksstable::MacroBlockId> &ivf_sst_ids);
   int process_one_sstable_meta(
     const blocksstable::MacroBlockId &sst_block_id,
     const ObString &meta_raw_buf,
     const hash::ObHashSet<blocksstable::MacroBlockId> &normal_sst_ids,
     const hash::ObHashSet<blocksstable::MacroBlockId> &co_sst_ids,
     const hash::ObHashSet<blocksstable::MacroBlockId> &inv_sst_ids,
+    const hash::ObHashSet<blocksstable::MacroBlockId> &ivf_sst_ids,
     /* out */int64_t &prewarm_sst_cnt,
     /* out */ObStorageMetaValueHandle &handle);
   int inner_prefetch_table_store_and_sstable_meta(

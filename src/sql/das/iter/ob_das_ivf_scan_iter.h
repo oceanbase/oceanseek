@@ -6,6 +6,7 @@
 #ifndef OBDEV_SRC_SQL_DAS_ITER_OB_DAS_IVF_SCAN_ITER_H_
 #define OBDEV_SRC_SQL_DAS_ITER_OB_DAS_IVF_SCAN_ITER_H_
 
+#include "common/ob_range.h"
 #include "sql/das/iter/ob_das_iter.h"
 #include "sql/das/iter/ob_das_scan_iter.h"
 #include "sql/engine/expr/ob_expr_vector.h"
@@ -13,13 +14,31 @@
 #include "sql/engine/expr/ob_expr_vec_ivf_sq8_data_vector.h"
 #include "share/vector_index/ob_plugin_vector_index_service.h"
 #include "share/logical_table/ob_logical_table_define.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable_searcher.h"
+#include "storage/async_index/ob_async_index_segment_group.h"
+#include "storage/async_index/ob_deletion_bitmap_provider.h"
 #include "share/diagnosis/ob_runtime_profile.h"
 
 namespace oceanbase
 {
 using namespace common;
+namespace storage
+{
+class ObIvfSSTableScanIter;
+}
 namespace sql
 {
+// Write to an explicit metric node without changing query errors.
+class ObIVFProfileUtil
+{
+public:
+  static void set(common::ObOpProfile<common::ObMetric> *profile, common::ObMetricId id, uint64_t value);
+  static void inc(common::ObOpProfile<common::ObMetric> *profile, common::ObMetricId id, uint64_t value);
+  static void set_once(common::ObOpProfile<common::ObMetric> *profile, common::ObMetricId id, uint64_t value);
+  static common::ObOpProfile<common::ObMetric> *register_child(
+      common::ObOpProfile<common::ObMetric> *profile, common::ObProfileId id);
+};
+
 #define IVF_GET_NEXT_ROWS_BEGIN(iter)                                    \
   bool index_end = false;                                                \
   iter->clear_evaluated_flag();                                          \
@@ -119,6 +138,44 @@ public:
   bool is_primary_index_;
   ObVecIdxQueryStrategy strategy_;
 
+};
+
+struct ObDASIVFAsyncIterParam : public ObDASIvfScanIterParam
+{
+public:
+  ObDASIVFAsyncIterParam()
+    : ObDASIvfScanIterParam(ObVectorIndexAlgorithmType::VIAT_DISK_BBQ),
+      async_ivf_index_tablet_id_(),
+      async_delete_tablet_id_(),
+      is_adaptive_specify_by_hint_(false)
+  {
+    type_ = ObDASIterType::DAS_ITER_ASYNC_IVF_SCAN;
+  }
+
+  virtual bool is_valid() const override
+  {
+    return ObDASIterParam::is_valid()
+        && ls_id_.is_valid()
+        && nullptr != tx_desc_
+        && nullptr != snapshot_
+        && nullptr != vec_aux_ctdef_
+        && nullptr != vec_aux_rtdef_
+        && nullptr != sort_ctdef_
+        && nullptr != sort_rtdef_
+        && async_ivf_index_tablet_id_.is_valid()
+        && async_delete_tablet_id_.is_valid();
+  }
+
+  INHERIT_TO_STRING_KV("ObDASIVFAsyncIterParam", ObDASIvfScanIterParam,
+                       K_(ls_id), KP_(tx_desc), KP_(snapshot),
+                       KP_(vec_aux_ctdef), KP_(vec_aux_rtdef),
+                       KP_(sort_ctdef), KP_(sort_rtdef),
+                       K_(async_ivf_index_tablet_id), K_(async_delete_tablet_id),
+                       K_(is_adaptive_specify_by_hint));
+
+  common::ObTabletID async_ivf_index_tablet_id_;
+  common::ObTabletID async_delete_tablet_id_;
+  bool is_adaptive_specify_by_hint_;
 };
 
 struct ObIvfRowkeyDistItem
@@ -297,13 +354,78 @@ class ObIvfAadaptiveCtx
 
 class ObDASIvfBaseScanIter : public ObDASIter
 {
+private:
+  // Only scan/rescan allocations from a DISK_BBQ lookup batch enter this owner.
+  // Its address stays stable across rounds; the backing allocator is malloc.
+  class DiskBBQLookupAllocator final : public common::ObIAllocator
+  {
+    struct alignas(16) Allocation {
+      Allocation *prev_;
+      Allocation *next_;
+      int64_t size_;
+    };
+  public:
+    DiskBBQLookupAllocator() : backing_(nullptr), head_(nullptr), used_(0) {}
+    ~DiskBBQLookupAllocator() { reuse(); }
+    void bind(common::ObIAllocator &backing)
+    {
+      OB_ASSERT(nullptr == backing_ || backing_ == &backing);
+      backing_ = &backing;
+    }
+    void *alloc(const int64_t size) override
+    {
+      void *ptr = nullptr;
+      if (nullptr != backing_ && size > 0 && size <= INT64_MAX - sizeof(Allocation)) {
+        void *buf = backing_->alloc(sizeof(Allocation) + size);
+        if (nullptr != buf) {
+          Allocation *entry = new (buf) Allocation{nullptr, head_, size};
+          if (nullptr != head_) { head_->prev_ = entry; }
+          head_ = entry;
+          used_ += size;
+          ptr = entry + 1;
+        }
+      }
+      return ptr;
+    }
+    void *alloc(const int64_t size, const common::ObMemAttr &attr) override
+    {
+      UNUSED(attr);
+      return alloc(size);
+    }
+    void free(void *ptr) override
+    {
+      if (nullptr != ptr) {
+        Allocation *entry = static_cast<Allocation *>(ptr) - 1;
+        if (nullptr != entry->prev_) { entry->prev_->next_ = entry->next_; }
+        else { head_ = entry->next_; }
+        if (nullptr != entry->next_) { entry->next_->prev_ = entry->prev_; }
+        used_ -= entry->size_;
+        backing_->free(entry);
+      }
+    }
+    // Call only after the storage iterator successfully leaves this batch.
+    void reuse() override
+    {
+      while (nullptr != head_) { free(head_ + 1); }
+    }
+    void reset() override { reuse(); backing_ = nullptr; }
+    int64_t used() const override { return used_; }
+    int64_t total() const override { return used_; }
+  private:
+    common::ObIAllocator *backing_;
+    Allocation *head_;
+    int64_t used_;
+    DISALLOW_COPY_AND_ASSIGN(DiskBBQLookupAllocator);
+  };
 public:
   using IvfRowkeyHeap = share::ObVectorCenterClusterHelper<float, ObRowkey>;
   ObDASIvfBaseScanIter()
       : ObDASIter(ObDASIterType::DAS_ITER_IVF_SCAN),
         mem_context_(nullptr),
+        disk_bbq_lookup_alloc_(),
         vec_op_alloc_("IvfIdxLookupOp", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
         persist_alloc_(ObMemAttr(MTL_ID(), "IvfScan")),
+        query_vector_alloc_(ObMemAttr(MTL_ID(), "IvfQueryVec")),
         ls_id_(),
         tx_desc_(nullptr),
         snapshot_(nullptr),
@@ -399,6 +521,7 @@ protected:
   virtual int process_ivf_scan_post(bool is_vectorized) = 0;
   virtual int process_ivf_scan_pre(ObIAllocator &allocator, bool is_vectorized) = 0;
   int init_hgraph_search_alloc();
+  int refresh_query_vector();
 protected:
   int do_table_full_scan(bool is_vectorized,
                         const ObDASScanCtDef *ctdef,
@@ -412,7 +535,8 @@ protected:
                         const ObDASScanCtDef *ctdef,
                         ObDASScanRtDef *rtdef,
                         ObDASScanIter *iter,
-                        ObTabletID &tablet_id);
+                        ObTabletID &tablet_id,
+                        bool is_get = false);
 
   int build_cid_vec_query_range(const ObString &cid, int64_t rowkey_cnt, ObNewRange &cid_rowkey_range);
   int build_cid_vec_query_rowkey(const ObString &cid, bool is_min, int64_t rowkey_cnt, common::ObRowkey &rowkey);
@@ -420,7 +544,7 @@ protected:
   int gen_rowkeys_itr();
   int get_next_saved_rowkeys(int64_t &count);
   int get_next_saved_rowkey();
-  int get_rowkey(ObIAllocator &allocator, ObRowkey *&rowkey) {
+  virtual int get_rowkey(ObIAllocator &allocator, ObRowkey *&rowkey) {
     const ObDASScanCtDef *ctdef = vec_aux_ctdef_->get_vec_aux_tbl_ctdef(vec_aux_ctdef_->get_ivf_rowkey_cid_tbl_idx(),
                                                                         ObTSCIRScanType::OB_VEC_IVF_ROWKEY_CID_SCAN);
     ObDASScanRtDef *rtdef = vec_aux_rtdef_->get_vec_aux_tbl_rtdef(vec_aux_ctdef_->get_ivf_rowkey_cid_tbl_idx());
@@ -433,6 +557,7 @@ protected:
                      ObDASScanRtDef *cid_vec_rtdef, storage::ObTableScanIterator *&cid_vec_scan_iter);
   int64_t get_nprobe(const common::ObLimitParam &limit_param, int64_t enlargement_factor = 1);
   int64_t get_heap_size(const int64_t limit_k, const double select_ratio);
+  int64_t calc_next_nprobe(const int64_t limit_k, const int64_t matched_count) const;
   template <typename T>
   int generate_nearest_cid_heap(bool is_vectorized,
                                 T &nearest_cid_heap,
@@ -483,7 +608,9 @@ protected:
     int64_t batch_row_count);
   int do_post_filter(bool is_vectorized, ObIVFRowkeyDistMap &rowkey_dist_map, ObSEArray<ObIvfRowkeyDistEntry, 16> &rowkey_dist_heap);
   int do_simple_post_filter(ObIVFRowkeyDistMap &rowkey_dist_map, ObSEArray<ObIvfRowkeyDistEntry, 16> &rowkey_dist_heap);
-  int do_table_post_filter(bool is_vectorized, ObIVFRowkeyDistMap &rowkey_dist_map, ObSEArray<ObIvfRowkeyDistEntry, 16> &rowkey_dist_heap);
+  int do_table_post_filter(bool is_vectorized, ObIVFRowkeyDistMap &rowkey_dist_map,
+                          ObSEArray<ObIvfRowkeyDistEntry, 16> &rowkey_dist_heap,
+                          common::ObOpProfile<common::ObMetric> *filter_profile = nullptr);
 
   inline bool is_pre_filter() { return vec_index_type_ == ObVecIndexType::VEC_INDEX_PRE 
                       || (vec_index_type_ == ObVecIndexType::VEC_INDEX_ADAPTIVE_SCAN && vec_idx_try_path_ == ObVecIdxAdaTryPath::VEC_INDEX_PRE_FILTER);}
@@ -534,10 +661,13 @@ protected:
 
 protected:
   lib::MemoryContext mem_context_;
+  DiskBBQLookupAllocator disk_bbq_lookup_alloc_;
   ObArenaAllocator vec_op_alloc_;
   // unlike vec_op_alloc_ do reset() in inner_resuse()
   // persist_alloc_ do reset() in inner_release()
   ObArenaAllocator persist_alloc_;
+  // Query bytes survive Segment/POST continuation, but are reused for each binding.
+  ObArenaAllocator query_vector_alloc_;
   share::ObLSID ls_id_;
   transaction::ObTxDesc *tx_desc_;
   transaction::ObTxReadSnapshot *snapshot_;
@@ -621,6 +751,141 @@ protected:
   ObVecIdxAdaTryPath profile_try_path_;
   ObVecIdxAdaTryPath profile_current_path_;
   ObVecIdxPathSwitchReason profile_switch_reason_;
+};
+
+class ObDASIVFAsyncIter : public ObDASIvfBaseScanIter
+{
+public:
+  ObDASIVFAsyncIter();
+  virtual ~ObDASIVFAsyncIter() {}
+
+  virtual int do_table_scan() override;
+  virtual int rescan() override;
+  // Stable storage for the lookup snapshot, populated before emitting rowkeys.
+  transaction::ObTxReadSnapshot *get_async_read_snapshot() const { return async_read_snapshot_; }
+  int init_filter_input(ObDASIter *filter_iter);
+  int refresh_partition_filter_path();
+  common::ObOpProfile<common::ObMetric> *get_partition_profile() const { return partition_profile_; }
+  INHERIT_TO_STRING_KV("ObDASIVFAsyncIter", ObDASIvfBaseScanIter,
+      K_(async_ivf_index_tablet_id), K_(partition_scan_finished),
+      K_(profile_est_rows), K_(profile_est_total_rows),
+      KP_(partition_profile), KP_(profile));
+  void set_ls_tablet_ids(const share::ObLSID &ls_id,
+                         const ObDASRelatedTabletID &related_tablet_ids)
+  {
+    ls_id_ = ls_id;
+    async_ivf_index_tablet_id_ = related_tablet_ids.async_ivf_index_tablet_id_;
+    async_delete_tablet_id_ = related_tablet_ids.async_delete_tablet_id_;
+    set_related_tablet_ids(related_tablet_ids);
+  }
+
+protected:
+  virtual int inner_get_next_row() override;
+  virtual int inner_get_next_rows(int64_t &count, int64_t capacity) override;
+  virtual int inner_init(ObDASIterParam &param) override;
+  virtual int inner_reuse() override;
+  virtual int inner_release() override;
+  virtual int process_ivf_scan_post(bool is_vectorized) override;
+  virtual int process_ivf_scan_pre(ObIAllocator &allocator, bool is_vectorized) override;
+  virtual int get_rowkey(ObIAllocator &allocator, ObRowkey *&rowkey) override;
+
+private:
+  // Count only completed POST windows; duplicate VIDs and empty batches do
+  // not constitute progress. Keep this state local to one partition scan.
+  struct PostFilterProgress {
+    PostFilterProgress() : last_count_(0), stalled_windows_(0) {}
+    bool finish_window(int64_t count)
+    {
+      stalled_windows_ = count > last_count_ ? 0 : stalled_windows_ + 1;
+      last_count_ = count;
+      return stalled_windows_ >= 3;
+    }
+    int64_t last_count_;
+    int64_t stalled_windows_;
+  };
+  int run_async_pre_filter(ObIAllocator &allocator, bool is_vectorized,
+      const blocksstable::ObIvfKnnSearchResult *retained_post = nullptr);
+  int materialize_pre_filter(bool is_vectorized,
+      blocksstable::ObIvfPreFilterBitmap &pre_filter_bitmap);
+
+  enum ProfileFinishTag { PROFILE_RETURN_RESULT = 0, PROFILE_VECTOR_RETRY = 1, PROFILE_QUERY_ERROR = 2 };
+  void bind_partition_profile();
+  void record_profile_finish(int scan_ret);
+  void clear_partition_profile();
+  int get_filter_input_scan(ObDASScanIter *&scan_iter) const;
+  int start_filter_input(bool is_rescan);
+  int reset_partition_filter_path();
+  int estimate_partition_rows(const ObDASScanCtDef &ctdef,
+                              const ObTabletID &tablet_id,
+                              const ObQueryFlag &scan_flag,
+                              const common::ObIArray<common::ObNewRange> &ranges,
+                              int64_t &row_count);
+  int apply_partition_filter_estimate(int estimate_ret, int64_t partition_rows, int64_t filter_rows);
+  int scan_async_ivf_segments_iteratively(bool is_vectorized);
+  int scan_async_disk_bbq_post_filter(bool is_vectorized, bool &need_pre_filter,
+      blocksstable::ObIvfKnnSearchResult &retained_post);
+  int scan_async_ivf_segments(
+      bool first_round,
+      int64_t next_nprobe,
+      const common::ObIArray<storage::ObIvfSSTableScanIter *> &scan_iters,
+      blocksstable::ObIvfKnnSearchResult &round_result,
+      bool &has_active_segment,
+      const blocksstable::ObIvfScanBudget *scan_budget = nullptr);
+  int prepare_async_ivf_scan(
+      int64_t search_k,
+      const blocksstable::ObIvfPreFilter *pre_filter,
+      common::ObIArray<storage::ObIvfSSTableScanIter *> &scan_iters,
+      blocksstable::ObIvfScanBudget *scan_budget = nullptr);
+  int prepare_async_ivf_read();
+  int get_async_ivf_segment_group_ctx();
+  int prepare_async_read_snapshot(const share::SCN &read_snapshot);
+  int prepare_async_scan_params();
+  int prepare_filter_input_scan_params();
+  int64_t get_pre_filter_estimated_rows() const;
+  int scan_pre_filtered_segments(blocksstable::ObIvfPreFilterBitmap &pre_filter_bitmap,
+      const blocksstable::ObIvfKnnSearchResult *retained_post = nullptr);
+  int append_pre_filter_topk(const common::ObIArray<blocksstable::ObIvfKnnEntry> &candidates,
+      const blocksstable::ObIvfKnnSearchResult *retained_post = nullptr);
+  void reset_async_read_state();
+  int create_async_ivf_scan_iter(
+      const blocksstable::ObIvfKnnSearchParam &knn_param,
+      const common::ObNewVersionRange &version_range,
+      storage::ObIvfSSTableScanIter *&scan_iter);
+  void release_async_ivf_segment_scan_iters(
+      common::ObIArray<storage::ObIvfSSTableScanIter *> &scan_iters);
+  int add_async_ivf_filter_candidates(
+      const blocksstable::ObIvfKnnSearchResult &segment_result,
+      share::ObIVFRowkeyDistMap &rowkey_dist_map);
+  int collect_async_ivf_candidates(
+      const blocksstable::ObIvfKnnSearchResult &candidates,
+      blocksstable::ObIvfTopKCollector &collector,
+      int64_t &collected_count);
+  int collect_filtered_async_ivf_candidates(
+      const common::ObIArray<share::ObIvfRowkeyDistEntry> &candidates,
+      blocksstable::ObIvfTopKCollector &collector,
+      int64_t &collected_count);
+  int append_async_ivf_topk(blocksstable::ObIvfTopKCollector &collector);
+
+private:
+  common::ObTabletID async_ivf_index_tablet_id_;
+  common::ObTabletID async_delete_tablet_id_;
+  storage::ObTableScanParam async_ivf_scan_param_;
+  storage::ObTableScanParam async_delete_scan_param_;
+  storage::ObAsyncIndexSegmentGroupCtx segment_group_ctx_;
+  transaction::ObTxReadSnapshot *sql_snapshot_;
+  transaction::ObTxReadSnapshot *async_read_snapshot_;
+  storage::ObDeletionBitmapHandle deletion_bitmap_handle_;
+  // Rowkeys borrow this buffer through lookup; reuse only after the previous
+  // round finishes. Keep it alive on errors until the lookup is reused/released.
+  common::ObSEArray<common::ObObj, 16> filter_rowkey_objs_;
+  bool partition_scan_finished_;
+  bool is_adaptive_specify_by_hint_;
+  // Preserve tree-construction estimates until Profile binding.
+  int64_t profile_est_rows_;
+  int64_t profile_est_total_rows_;
+  // Partition metrics use the wrapper's per-execution Vector Iter node, owned by SQL Profile.
+  // Inherited profile_ is the async algorithm node containing the physical Segments.
+  common::ObOpProfile<common::ObMetric> *partition_profile_;
 };
 
 class ObDASIvfScanIter : public ObDASIvfBaseScanIter

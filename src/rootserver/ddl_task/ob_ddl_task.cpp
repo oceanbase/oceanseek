@@ -18,6 +18,8 @@
 #include "rootserver/ddl_task/ob_vec_ivf_index_build_task.h"
 #include "rootserver/ddl_task/ob_fts_index_build_task.h"
 #include "rootserver/ddl_task/ob_drop_fts_index_task.h"
+#include "rootserver/ddl_task/ob_drop_async_vector_index_task.h"
+#include "rootserver/ddl_task/ob_async_vector_index_build_task.h"
 #include "rootserver/ddl_task/ob_drop_search_index_task.h"
 
 const bool OB_DDL_TASK_ENABLE_TRACING = false;
@@ -782,6 +784,52 @@ int ObDDLTask::cleanup()
   return ret;
 }
 
+int ObDDLTask::wait_drop_index_task_finish(
+    const int64_t drop_index_task_id,
+    bool &is_finish,
+    bool &need_resubmit)
+{
+  int ret = OB_SUCCESS;
+  is_finish = false;
+  need_resubmit = false;
+  if (OB_UNLIKELY(drop_index_task_id < -1 || 0 == drop_index_task_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid drop index task id", K(ret), K(drop_index_task_id));
+  } else if (-1 == drop_index_task_id) {
+    is_finish = true;
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("sql proxy is null", K(ret));
+  } else {
+    HEAP_VAR(ObDDLErrorMessageTableOperator::ObBuildDDLErrorMessage, error_message) {
+      const int64_t target_object_id = -1;
+      int64_t unused_user_msg_len = 0;
+      ObAddr unused_addr;
+      if (OB_FAIL(ObDDLErrorMessageTableOperator::get_ddl_error_message(
+          dst_tenant_id_, drop_index_task_id, target_object_id, unused_addr,
+          false /* is_ddl_retry_task */, *GCTX.sql_proxy_, error_message,
+          unused_user_msg_len))) {
+        if (OB_ENTRY_NOT_EXIST == ret) {
+          ret = OB_SUCCESS;
+          LOG_INFO("drop index task has not finished",
+                   K(dst_tenant_id_), K(drop_index_task_id));
+        } else {
+          LOG_WARN("fail to get drop index task error message",
+                   K(ret), K(drop_index_task_id));
+        }
+      } else if (OB_SUCCESS != error_message.ret_code_) {
+        ret = error_message.ret_code_;
+        need_resubmit = true;
+        LOG_WARN("drop index task failed", K(ret), K(drop_index_task_id));
+      } else {
+        is_finish = true;
+        LOG_INFO("drop index task finished", K(drop_index_task_id));
+      }
+    }
+  }
+  return ret;
+}
+
 int ObDDLTask::get_ddl_type_str(const int64_t ddl_type, const char *&ddl_type_str)
 {
   int ret = OB_SUCCESS;
@@ -798,6 +846,9 @@ int ObDDLTask::get_ddl_type_str(const int64_t ddl_type, const char *&ddl_type_st
       break;
     case DDL_CREATE_ASYNC_SEARCH_INDEX:
       ddl_type_str =  "create async search index";
+      break;
+    case DDL_CREATE_ASYNC_VEC_IVF_INDEX:
+      ddl_type_str =  "create async DISK_BBQ index";
       break;
     case DDL_CREATE_VEC_INDEX:
     case DDL_CREATE_VEC_IVFFLAT_INDEX:
@@ -907,6 +958,9 @@ int ObDDLTask::get_ddl_type_str(const int64_t ddl_type, const char *&ddl_type_st
       break;
     case DDL_DROP_ASYNC_SEARCH_INDEX:
       ddl_type_str = "drop async search index";
+      break;
+    case DDL_DROP_ASYNC_VEC_IVF_INDEX:
+      ddl_type_str = "drop async DISK_BBQ index";
       break;
     case DDL_DROP_MULVALUE_INDEX:
       ddl_type_str = "drop mulvalue index";
@@ -1123,6 +1177,7 @@ bool ObDDLTask::is_ddl_task_can_be_cancelled() const
       task_type_ == ObDDLType::DDL_DROP_ASYNC_FTS_INDEX ||
       task_type_ == ObDDLType::DDL_DROP_SEARCH_INDEX ||
       task_type_ == ObDDLType::DDL_DROP_ASYNC_SEARCH_INDEX ||
+      task_type_ == ObDDLType::DDL_DROP_ASYNC_VEC_IVF_INDEX ||
       task_type_ == ObDDLType::DDL_DROP_MULVALUE_INDEX ||
       task_type_ == ObDDLType::DDL_DROP_VEC_IVFFLAT_INDEX ||
       task_type_ == ObDDLType::DDL_DROP_VEC_IVFSQ8_INDEX ||
@@ -3110,6 +3165,26 @@ int ObDDLTaskRecordOperator::update_parent_task_message(
       } else if (OB_FAIL(task.update_task_message(proxy))) {
         LOG_WARN("fail to update task message", K(ret), K(parent_task_id));
       }
+    } else if (DDL_CREATE_ASYNC_VEC_IVF_INDEX == task_record.ddl_type_) {
+      SMART_VAR(ObAsyncVectorIndexBuildTask, task) {
+        if (OB_FAIL(task.init(task_record))) {
+          LOG_WARN("fail to initialize async vector build parent", K(ret),
+              K(task_record));
+        } else if (UPDATE_CREATE_INDEX_ID == update_type) {
+          if (index_schema.is_async_delete_index()) {
+            task.set_shared_async_delete_table_id(target_table_id);
+          } else if (index_schema.is_async_ivf_index()) {
+            task.set_baseline_task(static_cast<int64_t>(target_task_id));
+          }
+        } else if (UPDATE_DROP_INDEX_TASK_ID == update_type) {
+          task.set_drop_task(target_task_id);
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(task.update_task_message(proxy))) {
+          LOG_WARN("fail to update async vector parent message", K(ret),
+              K(parent_task_id));
+        }
+      }
     } else if (ObRebuildIndexTask::is_ddl_type_for_rebuild_index_task(task_record.ddl_type_)) { // rebuild vec index
       SMART_VAR(ObRebuildIndexTask, task) {
         if (OB_FAIL(task.init(task_record))) {
@@ -3251,6 +3326,22 @@ int ObDDLTaskRecordOperator::update_parent_task_message(
         if (OB_FAIL(ret)) {
         } else if (OB_FAIL(task.update_task_message(proxy))) {
           LOG_WARN("fail to update task message", K(ret), K(parent_task_id));
+        }
+      }
+    } else if (DDL_DROP_ASYNC_VEC_IVF_INDEX == task_record.ddl_type_) {
+      SMART_VAR(ObDropAsyncVectorIndexTask, task) {
+        if (OB_FAIL(task.init(task_record))) {
+          LOG_WARN("fail to initialize async vector DROP task", K(ret), K(task_record));
+        } else if (UPDATE_DROP_INDEX_TASK_ID == update_type) {
+          if (index_schema.is_async_ivf_index()) {
+            task.set_drop_user_index_task_id(target_task_id);
+          } else if (index_schema.is_async_delete_index()) {
+            task.set_drop_async_delete_task_id(target_task_id);
+          }
+        }
+        if (OB_FAIL(ret)) {
+        } else if (OB_FAIL(task.update_task_message(proxy))) {
+          LOG_WARN("fail to update async vector DROP task message", K(ret), K(parent_task_id));
         }
       }
     } else if (task_record.ddl_type_ == DDL_DROP_SEARCH_INDEX
@@ -4290,9 +4381,14 @@ int ObDDLTaskRecordOperator::check_has_index_or_mlog_task(
       ObSqlString sql_string;
       SMART_VAR(ObMySQLProxy::MySQLResult, res) {
         sqlclient::ObMySQLResult *result = NULL;
-        if (OB_FAIL(sql_string.assign_fmt("SELECT EXISTS(SELECT 1 FROM %s WHERE object_id = %lu AND target_object_id = %lu AND ddl_type IN (%d, %d, %d, %d, %d)) as has",
-            OB_ALL_DDL_TASK_STATUS_TNAME, data_table_id, index_table_id, ObDDLType::DDL_CREATE_INDEX, ObDDLType::DDL_CREATE_PARTITIONED_LOCAL_INDEX, ObDDLType::DDL_DROP_INDEX,
-            ObDDLType::DDL_CREATE_MLOG, ObDDLType::DDL_DROP_MLOG))) {
+        if (OB_FAIL(sql_string.assign_fmt(
+            "SELECT EXISTS(SELECT 1 FROM %s WHERE object_id = %lu AND target_object_id = %lu "
+            "AND ddl_type IN (%d, %d, %d, %d, %d, %d)) as has",
+            OB_ALL_DDL_TASK_STATUS_TNAME, data_table_id, index_table_id,
+            ObDDLType::DDL_CREATE_INDEX, ObDDLType::DDL_CREATE_PARTITIONED_LOCAL_INDEX,
+            ObDDLType::DDL_DROP_INDEX,
+            ObDDLType::DDL_CREATE_MLOG, ObDDLType::DDL_DROP_MLOG,
+            ObDDLType::DDL_CREATE_ASYNC_VEC_IVF_INDEX))) {
           LOG_WARN("assign sql string failed", K(ret));
         } else if (OB_FAIL(proxy.read(res, tenant_id, sql_string.ptr()))) {
           LOG_WARN("query ddl task record failed", K(ret), K(sql_string));
@@ -4325,12 +4421,15 @@ int ObDDLTaskRecordOperator::get_create_index_or_mlog_task_cnt(
     ObSqlString sql_string;
     SMART_VAR(ObMySQLProxy::MySQLResult, res) {
       sqlclient::ObMySQLResult *result = NULL;
-      if (OB_FAIL(sql_string.assign_fmt("SELECT COUNT(*) as cnt FROM %s WHERE object_id = %lu AND ddl_type IN (%d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d)",
+      if (OB_FAIL(sql_string.assign_fmt(
+          "SELECT COUNT(*) as cnt FROM %s WHERE object_id = %lu "
+          "AND ddl_type IN (%d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d, %d)",
           OB_ALL_DDL_TASK_STATUS_TNAME, data_table_id,
             ObDDLType::DDL_CREATE_INDEX, ObDDLType::DDL_CREATE_PARTITIONED_LOCAL_INDEX, ObDDLType::DDL_CREATE_MLOG,
             ObDDLType::DDL_CREATE_VEC_INDEX, ObDDLType::DDL_CREATE_MULTIVALUE_INDEX, ObDDLType::DDL_CREATE_FTS_INDEX, ObDDLType::DDL_CREATE_SEARCH_INDEX,
             ObDDLType::DDL_CREATE_VEC_IVFFLAT_INDEX, ObDDLType::DDL_CREATE_VEC_IVFSQ8_INDEX, ObDDLType::DDL_CREATE_VEC_IVFPQ_INDEX, ObDDLType::DDL_CREATE_VEC_SPIV_INDEX,
-            ObDDLType::DDL_CREATE_ASYNC_FTS_INDEX, ObDDLType::DDL_CREATE_ASYNC_SEARCH_INDEX))) {
+            ObDDLType::DDL_CREATE_ASYNC_FTS_INDEX, ObDDLType::DDL_CREATE_ASYNC_SEARCH_INDEX,
+            ObDDLType::DDL_CREATE_ASYNC_VEC_IVF_INDEX))) {
         LOG_WARN("assign sql string failed", K(ret));
       } else if (OB_FAIL(proxy.read(res, tenant_id, sql_string.ptr()))) {
         LOG_WARN("query ddl task record failed", K(ret), K(sql_string));

@@ -605,7 +605,8 @@ int ObFtsIndexBuildTask::persist_and_hold_async_index_snapshot(
     // Reuse the saved and retained snapshot so retries keep reading the same data version.
     DEBUG_SYNC(ASYNC_INDEX_SNAPSHOT_REUSED);
   } else if (OB_FAIL(ObDDLUtil::hold_snapshot(
-      trans, data_table_schema, index_table_schema, new_fetched_snapshot))) {
+      trans, data_table_schema, index_table_schema, new_fetched_snapshot,
+      index_table_schema.get_schema_version()))) {
     LOG_WARN("fail to hold async index snapshot", K(ret), K(new_fetched_snapshot), K(*this));
   } else if (OB_FAIL(DDL_SIM(tenant_id_, task_id_, ASYNC_INDEX_SNAPSHOT_HOLD_DISCARDED))) {
     LOG_WARN("injected async index snapshot retention failure", K(ret), K(task_id_));
@@ -1372,24 +1373,14 @@ int ObFtsIndexBuildTask::construct_async_delete_arg(
     common::ObIAllocator &allocator)
 {
   int ret = OB_SUCCESS;
-  ObColumnSortItem pk_sort_item;
-  static const char PK_INCREMENT_COL_NAME[] = "__pk_increment";
   if (OB_FAIL(deep_copy_index_arg(allocator, create_index_arg_, arg))) {
     LOG_WARN("failed to deep copy index arg", K(ret));
-  } else if (FALSE_IT(arg.index_columns_.reuse())) {
-  } else if (FALSE_IT(arg.store_columns_.reuse())) {
-  } else if (FALSE_IT(arg.index_type_ = INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL)) {
-  } else if (FALSE_IT(arg.index_option_.parser_name_.reset())) {
-  } else if (OB_FAIL(ObIndexBuilderUtil::check_async_index_name(arg.index_name_))) {
+  } else if (OB_FAIL(ObIndexBuilderUtil::check_async_index_name(
+                 arg.index_name_))) {
     LOG_WARN("invalid async index name", K(ret), K(arg.index_name_));
-  } else if (OB_FAIL(ob_write_string(allocator,
-                                     ObString::make_string(PK_INCREMENT_COL_NAME),
-                                     pk_sort_item.column_name_))) {
-    LOG_WARN("failed to write pk increment column name", K(ret));
-  } else if (OB_FAIL(arg.index_columns_.push_back(pk_sort_item))) {
-    LOG_WARN("failed to push back pk increment column", K(ret));
-  } else if (OB_FAIL(ObIndexBuilderUtil::generate_async_delete_index_name(arg, &allocator))) {
-    LOG_WARN("failed to generate async delete index name", K(ret));
+  } else if (OB_FAIL(ObIndexBuilderUtil::normalize_async_delete_index_arg(
+                 arg, &allocator))) {
+    LOG_WARN("failed to normalize async delete index arg", K(ret));
   }
   return ret;
 }
@@ -2704,7 +2695,6 @@ int ObFtsIndexBuildTask::submit_drop_fts_index_task()
     drop_index_arg.is_parent_task_dropping_multivalue_index_ = is_multivalue_task();
     drop_index_arg.is_parent_task_dropping_spiv_index_ = is_spiv_task();
     drop_index_arg.is_parent_task_dropping_search_index_ = is_search_index_task() || is_async_search_task();
-    drop_index_arg.is_parent_task_dropping_user_async_index_ = is_async_fts_task();
     drop_index_arg.is_hidden_         = create_index_arg_.is_offline_or_restore();
     if (OB_FAIL(ObDDLUtil::get_ddl_rpc_timeout(data_table_schema->get_all_part_num() + data_table_schema->get_all_part_num(), ddl_rpc_timeout))) {
       LOG_WARN("failed to get ddl rpc timeout", KR(ret));
@@ -2739,44 +2729,21 @@ int ObFtsIndexBuildTask::append_rowkey_doc_table_id_for_cleanup(
 int ObFtsIndexBuildTask::wait_drop_index_finish(bool &is_finish)
 {
   int ret = OB_SUCCESS;
+  bool need_resubmit = false;
+  is_finish = false;
   if (OB_UNLIKELY(!is_inited_)) {
     ret = OB_NOT_INIT;
     LOG_WARN("not init", K(ret));
   } else if (ObDDLTaskStatus::FAIL != task_status_) {
     ret = OB_STATE_NOT_MATCH;
     LOG_WARN("task status not match", K(ret), K(task_status_));
-  } else if (-1 == drop_index_task_id_) {
-     is_finish = true;
-  } else {
-    HEAP_VAR(ObDDLErrorMessageTableOperator::ObBuildDDLErrorMessage, error_message) {
-      const int64_t target_object_id = -1;
-      int64_t unused_user_msg_len = 0;
-      ObAddr unused_addr;
-      if (OB_FAIL(ObDDLErrorMessageTableOperator::get_ddl_error_message(
-                                                  dst_tenant_id_,
-                                                  drop_index_task_id_,
-                                                  target_object_id,
-                                                  unused_addr,
-                                                  false /* is_ddl_retry_task */,
-                                                  *GCTX.sql_proxy_,
-                                                  error_message,
-                                                  unused_user_msg_len))) {
-        if (OB_ENTRY_NOT_EXIST == ret) {
-          ret = OB_SUCCESS;
-          LOG_INFO("ddl task not finish", K(dst_tenant_id_), K(drop_index_task_id_));
-        } else {
-          LOG_WARN("fail to get ddl error message", K(ret), K(drop_index_task_id_));
-        }
-      } else {
-        if (error_message.ret_code_ != OB_SUCCESS) {
-          ret = error_message.ret_code_;
-          drop_index_task_submitted_ = false; // retry
-        } else {
-          LOG_INFO("wait drop index task finish", K(*this), K(error_message));
-          is_finish = true;
-        }
-      }
+  } else if (OB_FAIL(wait_drop_index_task_finish(
+                 drop_index_task_id_, is_finish, need_resubmit))) {
+    if (need_resubmit) {
+      drop_index_task_submitted_ = false;
     }
+    LOG_WARN("fail to wait drop index task",
+             K(ret), K(drop_index_task_id_), K(need_resubmit));
   }
   return ret;
 }

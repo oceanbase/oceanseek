@@ -1099,13 +1099,14 @@ int ObSSMetaTabletLockRowHelper::get_tablet_sub_meta_op_id_(
   return ret;
 }
 
-// 按宏块类型分别恢复 SHARED_MINOR_LOCK 和 SHARED_INC_MAJOR_LOCK 高水位。
-// DDL inc-major、major 等类型的 fourth_id_ 具有其它语义，不参与统计。
+// 按宏块类型分别恢复 SHARED_MINOR_LOCK、SHARED_INC_MAJOR_LOCK 和 SHARED_NON_IDEM_MAJOR_LOCK 高水位。
+// DDL inc-major, 幂等 major 等类型的 fourth_id_ 具有其它语义，不参与统计。
 int ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
     const ObTabletID &tablet_id,
     const MacroBlockId &macro_id,
     int64_t &minor_op_id,
-    int64_t &inc_major_op_id)
+    int64_t &inc_major_op_id,
+    int64_t &non_idem_major_op_id)
 {
   int ret = OB_SUCCESS;
   const blocksstable::ObStorageObjectType object_type = macro_id.storage_object_type();
@@ -1118,8 +1119,12 @@ int ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
       blocksstable::ObStorageObjectType::SHARED_INC_MAJOR_COMPACTION_DATA_MACRO == object_type
       || blocksstable::ObStorageObjectType::SHARED_INC_MAJOR_COMPACTION_META_MACRO
           == object_type;
+  const bool is_non_idem_major_macro =
+      (blocksstable::ObStorageObjectType::SHARED_NON_IDEM_MAJOR_DATA_MACRO == object_type
+          || blocksstable::ObStorageObjectType::SHARED_NON_IDEM_MAJOR_META_MACRO == object_type);
   minor_op_id = -1;
   inc_major_op_id = -1;
+  non_idem_major_op_id = -1;
   if (!tablet_id.is_valid() || !macro_id.is_valid()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument for getting sstable macro op id",
@@ -1127,14 +1132,16 @@ int ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
   } else if (!macro_id.is_id_mode_share()
       || macro_id.second_id() != tablet_id.id()) {
     // 非共享对象或跨 tablet 引用的宏块，不参与统计。
-  } else if (!is_minor_macro && !is_inc_major_macro) {
-    // fourth_id_ 不表示这两个 lock op_id，不参与统计。
+  } else if (!is_minor_macro && !is_inc_major_macro && !is_non_idem_major_macro) {
+    // fourth_id_ 不属于这些 lock 的 op_id，不参与统计。
   } else if (macro_id.op_id() < 0) {
     ret = OB_INVALID_DATA;
     LOG_WARN("invalid shared sstable macro op id",
         K(ret), K(tablet_id), K(macro_id));
   } else if (is_minor_macro) {
     minor_op_id = macro_id.op_id();
+  } else if (is_non_idem_major_macro) {
+    non_idem_major_op_id = macro_id.op_id();
   } else {
     inc_major_op_id = macro_id.op_id();
   }
@@ -1145,13 +1152,15 @@ int ObSSMetaTabletLockRowHelper::accumulate_sstable_macro_op_id_(
     const ObTabletID &tablet_id,
     blocksstable::ObMacroIdIterator &macro_iter,
     int64_t &max_minor_op_id,
-    int64_t &max_inc_major_op_id)
+    int64_t &max_inc_major_op_id,
+    int64_t &max_non_idem_major_op_id)
 {
   int ret = OB_SUCCESS;
   while (OB_SUCC(ret)) {
     MacroBlockId macro_id;
     int64_t minor_op_id = -1;
     int64_t inc_major_op_id = -1;
+    int64_t non_idem_major_op_id = -1;
     if (OB_FAIL(macro_iter.get_next_macro_id(macro_id))) {
       if (OB_ITER_END == ret) {
         ret = OB_SUCCESS;
@@ -1159,11 +1168,13 @@ int ObSSMetaTabletLockRowHelper::accumulate_sstable_macro_op_id_(
       }
       LOG_WARN("failed to get next sstable macro id", K(ret), K(tablet_id));
     } else if (OB_FAIL(get_sstable_macro_op_id_(
-        tablet_id, macro_id, minor_op_id, inc_major_op_id))) {
+        tablet_id, macro_id, minor_op_id, inc_major_op_id,
+        non_idem_major_op_id))) {
       LOG_WARN("failed to get sstable macro op id", K(ret), K(tablet_id), K(macro_id));
     } else {
       max_minor_op_id = MAX(max_minor_op_id, minor_op_id);
       max_inc_major_op_id = MAX(max_inc_major_op_id, inc_major_op_id);
+      max_non_idem_major_op_id = MAX(max_non_idem_major_op_id, non_idem_major_op_id);
     }
   }
   return ret;
@@ -1179,6 +1190,7 @@ int ObSSMetaTabletLockRowHelper::get_lock_row_info(
   int64_t tablet_op_id = -1;
   int64_t max_minor_op_id = -1;
   int64_t max_inc_major_op_id = -1;
+  int64_t max_non_idem_major_op_id = -1;
   ObTabletMemberWrapper<ObTabletTableStore> table_store_wrapper;
   ObTableStoreIterator sstable_iter;
   lock_row_info.reset();
@@ -1218,7 +1230,8 @@ int ObSSMetaTabletLockRowHelper::get_lock_row_info(
         LOG_WARN("unexpected null or non-sstable table", K(ret), K(tablet_id), KP(table));
       } else if (ObITable::TableType::MINI_SSTABLE == table->get_table_type()
           || ObITable::TableType::MINOR_SSTABLE == table->get_table_type()
-          || table->is_inc_major_type_sstable()) {
+          || table->is_inc_major_type_sstable()
+          || table->is_non_idem_major_sstable()) {
         const bool is_inc_major_sstable = table->is_inc_major_type_sstable();
         blocksstable::ObSSTable *sstable =
             static_cast<blocksstable::ObSSTable *>(table);
@@ -1228,7 +1241,7 @@ int ObSSMetaTabletLockRowHelper::get_lock_row_info(
         } else if (meta_handle.get_sstable_meta().is_empty()) {
           // 空 SStable 没有任何持久化宏块，也不消耗 SSTABLE_LOCK_ROW 的 op_id。
         } else {
-          // inc-major SSTable 可能混用 DDL 与 compaction 宏块，需要同时扫描 OTHER 和 DATA。
+          // 非幂等 Major 和 inc-major SSTable 可能复用其它轮次的宏块，必须同时扫描 OTHER 和 DATA。
           // MINI/MINOR 仅在 OTHER 未取得本 tablet 的 minor op_id 时回退 DATA，
           // 避免恢复阶段遍历大量数据宏块。
           const blocksstable::ObSSTableMacroInfo &macro_info =
@@ -1236,20 +1249,23 @@ int ObSSMetaTabletLockRowHelper::get_lock_row_info(
           blocksstable::ObMacroIdIterator other_iter;
           int64_t cur_minor_op_id = -1;
           int64_t cur_inc_major_op_id = -1;
+          int64_t cur_non_idem_major_op_id = -1;
           if (OB_FAIL(macro_info.get_other_block_iter(other_iter))) {
             LOG_WARN("failed to get sstable other macro iterator",
                 K(ret), K(tablet_id), KPC(sstable));
           } else if (OB_FAIL(accumulate_sstable_macro_op_id_(
-              tablet_id, other_iter, cur_minor_op_id, cur_inc_major_op_id))) {
+              tablet_id, other_iter, cur_minor_op_id, cur_inc_major_op_id,
+              cur_non_idem_major_op_id))) {
             LOG_WARN("failed to accumulate sstable other macro op id",
                 K(ret), K(tablet_id), KPC(sstable));
-          } else if (is_inc_major_sstable || cur_minor_op_id < 0) {
+          } else if (is_inc_major_sstable || table->is_non_idem_major_sstable() || cur_minor_op_id < 0) {
             blocksstable::ObMacroIdIterator data_iter;
             if (OB_FAIL(macro_info.get_data_block_iter(data_iter))) {
               LOG_WARN("failed to get sstable data macro iterator",
                   K(ret), K(tablet_id), KPC(sstable));
             } else if (OB_FAIL(accumulate_sstable_macro_op_id_(
-                tablet_id, data_iter, cur_minor_op_id, cur_inc_major_op_id))) {
+                tablet_id, data_iter, cur_minor_op_id, cur_inc_major_op_id,
+                cur_non_idem_major_op_id))) {
               LOG_WARN("failed to accumulate sstable data macro op id",
                   K(ret), K(tablet_id), KPC(sstable));
             }
@@ -1257,6 +1273,8 @@ int ObSSMetaTabletLockRowHelper::get_lock_row_info(
           if (OB_SUCC(ret)) {
             max_minor_op_id = MAX(max_minor_op_id, cur_minor_op_id);
             max_inc_major_op_id = MAX(max_inc_major_op_id, cur_inc_major_op_id);
+            max_non_idem_major_op_id = MAX(
+                max_non_idem_major_op_id, cur_non_idem_major_op_id);
           }
         }
       }
@@ -1269,6 +1287,9 @@ int ObSSMetaTabletLockRowHelper::get_lock_row_info(
   }
   if (OB_SUCC(ret) && max_inc_major_op_id >= 0) {
     lock_row_info.inc_major_next_op_id_ = max_inc_major_op_id + 1;
+  }
+  if (OB_SUCC(ret) && max_non_idem_major_op_id >= 0) {
+    lock_row_info.non_idem_major_next_op_id_ = max_non_idem_major_op_id + 1;
   }
   return ret;
 }

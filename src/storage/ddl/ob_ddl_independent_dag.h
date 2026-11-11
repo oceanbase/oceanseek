@@ -136,6 +136,9 @@ protected:
   int check_is_first_ddl_kv(ObTabletDDLKvMgr &ddl_kv_mgr, bool &is_first);
 
   int inc_generate_fixed_tasks(common::ObIArray<share::ObITask *> &need_schedule_tasks, share::ObITask *next_task);
+  int init_async_ivf_build_pipeline(common::ObIArray<share::ObITask *> &need_schedule_tasks,
+                                    share::ObITask &group_write_task,
+                                    const common::ObTabletID &tablet_id);
   int inc_generate_async_index_refresh_tasks(common::ObIArray<share::ObITask *> &need_schedule_tasks, share::ObITask *next_task);
   int full_generate_normal_ddl_tasks(common::ObIArray<share::ObITask *> &need_schedule_tasks, share::ObITask *next_task);
   int full_generate_vector_index_tasks(common::ObIArray<share::ObITask *> &need_schedule_tasks, share::ObITask *next_task);

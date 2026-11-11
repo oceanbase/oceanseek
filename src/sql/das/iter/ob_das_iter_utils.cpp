@@ -23,6 +23,7 @@
 #include "sql/das/search/ob_das_scalar_scan_op.h"
 #include "sql/das/iter/ob_das_vec_index_ivf_scan_iter.h"
 #include "sql/das/iter/ob_das_vec_index_brute_scan_iter.h"
+#include "sql/das/iter/ob_das_vec_index_async_ivf_scan_iter.h"
 #include "sql/das/ob_das_utils.h"
 #include "lib/utility/ob_tracepoint.h"
 
@@ -418,6 +419,26 @@ bool ObDASIterUtils::is_vec_ivf_scan(const ObDASBaseCtDef *attach_ctdef, ObDASBa
     }
   }
 
+  return bret;
+}
+
+bool ObDASIterUtils::is_async_ivf_scan(
+    const ObDASBaseCtDef *attach_ctdef,
+    ObDASBaseRtDef *attach_rtdef)
+{
+  bool bret = false;
+  if (OB_NOT_NULL(attach_ctdef) && OB_NOT_NULL(attach_rtdef)) {
+    const ObDASVecAuxScanCtDef *vec_aux_ctdef = nullptr;
+    ObDASVecAuxScanRtDef *vec_aux_rtdef = nullptr;
+    bret = OB_SUCCESS == ObDASUtils::find_target_das_def(
+        attach_ctdef,
+        attach_rtdef,
+        DAS_OP_VEC_SCAN,
+        vec_aux_ctdef,
+        vec_aux_rtdef)
+        && OB_NOT_NULL(vec_aux_ctdef)
+        && vec_aux_ctdef->is_async_index_;
+  }
   return bret;
 }
 
@@ -1103,6 +1124,16 @@ int ObDASIterUtils::set_vec_lookup_related_ids(const ObDASBaseCtDef *attach_ctde
         if (OB_FAIL(set_vec_pre_filter_related_ids(vec_aux_ctdef, vec_aux_rtdef, 
                     ivf_scan_iter->get_inv_idx_scan_iter(), related_tablet_ids, ls_id))) {
             LOG_WARN("failed to set vec pre filter related ids", K(ret));
+        }
+      } else if (ObDASIterType::DAS_ITER_ASYNC_IVF_SCAN
+                 == local_lookup_iter->get_children()[0]->get_type()) {
+        ObDASIVFAsyncIter *async_ivf_iter =
+            static_cast<ObDASIVFAsyncIter *>(local_lookup_iter->get_children()[0]);
+        async_ivf_iter->set_ls_tablet_ids(ls_id, related_tablet_ids);
+        if (OB_NOT_NULL(async_ivf_iter->get_inv_idx_scan_iter())
+            && OB_FAIL(set_vec_pre_filter_related_ids(vec_aux_ctdef, vec_aux_rtdef,
+                async_ivf_iter->get_inv_idx_scan_iter(), related_tablet_ids, ls_id))) {
+          LOG_WARN("failed to set async ivf pre-filter related ids", K(ret));
         }
       } else if (ObDASIterType::DAS_ITER_HNSW_SCAN == local_lookup_iter->get_children()[0]->get_type()) {
         ObDASHNSWScanIter *hnsw_scan_iter = static_cast<ObDASHNSWScanIter *>(local_lookup_iter->get_children()[0]);
@@ -4560,11 +4591,16 @@ int ObDASIterUtils::create_vec_lookup_tree(ObTableScanParam &scan_param,
 {
   int ret = OB_SUCCESS;
   ObDASIterGuard iter_tree_guard(iter_tree, ret);
+  bool is_async_ivf = is_async_ivf_scan(attach_ctdef, attach_rtdef);
   bool is_ivf = is_vec_ivf_scan(attach_ctdef, attach_rtdef);
   bool is_spiv = is_vec_spiv_scan(attach_ctdef, attach_rtdef);
 
-  if (is_spiv) {
-    ret = create_vec_spiv_lookup_tree(scan_param, alloc, attach_ctdef, attach_rtdef, related_tablet_ids, trans_desc, snapshot, iter_tree);
+  if (is_async_ivf) {
+    ret = create_async_ivf_lookup_tree(
+        scan_param, alloc, attach_ctdef, attach_rtdef, related_tablet_ids, trans_desc, snapshot, iter_tree);
+  } else if (is_spiv) {
+    ret = create_vec_spiv_lookup_tree(
+        scan_param, alloc, attach_ctdef, attach_rtdef, related_tablet_ids, trans_desc, snapshot, iter_tree);
   } else if (!is_ivf) {
     ret = create_vec_hnsw_lookup_tree(scan_param, alloc, scan_ctdef, scan_rtdef, attach_ctdef, attach_rtdef, related_tablet_ids, trans_desc, snapshot, iter_tree);
   } else {
@@ -4581,6 +4617,251 @@ int ObDASIterUtils::create_vec_lookup_tree(ObTableScanParam &scan_param,
       LOG_WARN("failed to create SQL vector search profile iter", KR(ret));
     } else {
       iter_tree = profile_iter;
+    }
+  }
+  return ret;
+}
+
+/*
+ * Async IVF CtDef Tree:
+ *
+ * ObDASTableLookupCtDef
+ * |-- ObDASSortCtDef
+ * |   `-- ObDASVecAuxScanCtDef
+ * |       |-- children_[0]: Filter/Input CtDef
+ * |       |-- children_[1]: Async IVF Index Scan CtDef
+ * |       `-- children_[2]: Async Delete Scan CtDef
+ * `-- Main Table Lookup ObDASScanCtDef
+ *
+ *                              builds
+ *                                |
+ *                                v
+ *
+ * Async IVF Runtime Iter Tree:
+ *
+ *                            ObDASLocalLookupIter
+ *                           /                    \
+ *                          /                      \
+ * children_[0] / index_table_iter_    children_[1] / data_table_iter_
+ *                    /                              \
+ *          ObDASIVFAsyncIter                    ObDASScanIter
+ *       (partition Top-K rowkeys)           (main-table row lookup)
+ *                    |
+ *                    |-- ObDASScanIter (post-filter)
+ *                    |   (independent main-table filter runtime)
+ *                    `-- ObDASLocalLookupIter (pre-filter)
+ *                       /                   \
+ *              ObDASScanIter           ObDASScanIter
+ *            (original input)       (main-table predicates)
+ *
+ * Both filter branches are built for every try path. Async IVF opens/rescans
+ * the scalar input for filtered paths and consumes it only for pre-filtering.
+ * Unfiltered queries skip opening the input, which is the async IVF index itself.
+ * Main-table lookups stay lazy until rowkeys are available. The input keeps
+ * its original definitions and scan param.
+ *
+ * Async IVF Index Scan and Async Delete Scan CtDefs provide definitions and
+ * related tablet bindings, not standalone runtime Iters.
+ */
+int ObDASIterUtils::create_async_ivf_lookup_tree(
+    ObTableScanParam &scan_param,
+    common::ObIAllocator &alloc,
+    const ObDASBaseCtDef *attach_ctdef,
+    ObDASBaseRtDef *attach_rtdef,
+    const ObDASRelatedTabletID &related_tablet_ids,
+    transaction::ObTxDesc *trans_desc,
+    transaction::ObTxReadSnapshot *snapshot,
+    ObDASIter *&iter_tree)
+{
+  int ret = OB_SUCCESS;
+  const ObDASTableLookupCtDef *lookup_ctdef = nullptr;
+  ObDASTableLookupRtDef *lookup_rtdef = nullptr;
+  const ObDASSortCtDef *sort_ctdef = nullptr;
+  ObDASSortRtDef *sort_rtdef = nullptr;
+  const ObDASVecAuxScanCtDef *vec_aux_ctdef = nullptr;
+  ObDASVecAuxScanRtDef *vec_aux_rtdef = nullptr;
+  ObDASIVFAsyncIter *async_ivf_iter = nullptr;
+  ObDASLocalLookupIter *lookup_iter = nullptr;
+  ObDASScanIter *data_filter_iter = nullptr;
+
+  if (OB_ISNULL(attach_ctdef) || OB_ISNULL(attach_rtdef)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async ivf lookup definition", K(ret), KP(attach_ctdef), KP(attach_rtdef));
+  } else if (OB_FAIL(ObDASUtils::find_target_das_def(
+                 attach_ctdef, attach_rtdef, DAS_OP_TABLE_LOOKUP, lookup_ctdef, lookup_rtdef))) {
+    LOG_WARN("failed to find async ivf table lookup definition", K(ret));
+  } else if (OB_FAIL(ObDASUtils::find_target_das_def(
+                 attach_ctdef, attach_rtdef, DAS_OP_SORT, sort_ctdef, sort_rtdef))) {
+    LOG_WARN("failed to find async ivf sort definition", K(ret));
+  } else if (OB_FAIL(ObDASUtils::find_target_das_def(
+                 attach_ctdef, attach_rtdef, DAS_OP_VEC_SCAN, vec_aux_ctdef, vec_aux_rtdef))) {
+    LOG_WARN("failed to find async ivf vector scan definition", K(ret));
+  } else if (OB_ISNULL(lookup_ctdef->get_lookup_scan_ctdef())
+             || OB_ISNULL(lookup_rtdef->get_lookup_scan_rtdef())
+             || OB_ISNULL(vec_aux_ctdef)
+             || OB_ISNULL(vec_aux_rtdef)
+             || OB_UNLIKELY(!vec_aux_ctdef->is_async_index_)
+             || OB_ISNULL(vec_aux_rtdef->eval_ctx_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null async ivf runtime definition", K(ret), KPC(lookup_ctdef),
+             KP(lookup_rtdef), KPC(vec_aux_ctdef), KP(vec_aux_rtdef));
+  } else {
+    const ObDASScanCtDef *data_table_ctdef = lookup_ctdef->get_lookup_scan_ctdef();
+    ObDASIVFAsyncIterParam async_ivf_param;
+    async_ivf_param.max_size_ = vec_aux_rtdef->eval_ctx_->is_vectorized()
+        ? vec_aux_rtdef->eval_ctx_->max_batch_size_ : 1;
+    async_ivf_param.eval_ctx_ = vec_aux_rtdef->eval_ctx_;
+    async_ivf_param.exec_ctx_ = &vec_aux_rtdef->eval_ctx_->exec_ctx_;
+    async_ivf_param.output_ = &vec_aux_ctdef->result_output_;
+    async_ivf_param.ls_id_ = scan_param.ls_id_;
+    async_ivf_param.tx_desc_ = trans_desc;
+    async_ivf_param.snapshot_ = snapshot;
+    async_ivf_param.vec_aux_ctdef_ = vec_aux_ctdef;
+    async_ivf_param.vec_aux_rtdef_ = vec_aux_rtdef;
+    async_ivf_param.sort_ctdef_ = sort_ctdef;
+    async_ivf_param.sort_rtdef_ = sort_rtdef;
+    async_ivf_param.vec_index_type_ = vec_aux_ctdef->vec_type_;
+    async_ivf_param.vec_idx_try_path_ = vec_aux_ctdef->adaptive_try_path_;
+    async_ivf_param.is_adaptive_specify_by_hint_ = vec_aux_ctdef->is_adaptive_specify_by_hint_;
+    async_ivf_param.strategy_ = vec_aux_ctdef->strategy_;
+    async_ivf_param.async_ivf_index_tablet_id_ =
+        related_tablet_ids.async_ivf_index_tablet_id_;
+    async_ivf_param.async_delete_tablet_id_ =
+        related_tablet_ids.async_delete_tablet_id_;
+    async_ivf_param.data_filter_ctdef_ = data_table_ctdef;
+    async_ivf_param.data_filter_rtdef_ = lookup_rtdef->get_lookup_scan_rtdef();
+
+    if (OB_FAIL(create_das_scan_iter(
+            alloc,
+            async_ivf_param.data_filter_ctdef_,
+            async_ivf_param.data_filter_rtdef_,
+            data_filter_iter))) {
+      LOG_WARN("failed to create async ivf data filter iter", K(ret));
+    } else if (OB_FALSE_IT(async_ivf_param.data_filter_iter_ = data_filter_iter)) {
+    } else if (OB_FAIL(create_das_iter(alloc, async_ivf_param, async_ivf_iter))) {
+      LOG_WARN("failed to create async ivf iter", K(ret));
+    } else if (OB_FALSE_IT(async_ivf_iter->set_ls_tablet_ids(scan_param.ls_id_, related_tablet_ids))) {
+    } else if (OB_FAIL(create_async_ivf_filter_input_iter(
+                   scan_param, alloc, vec_aux_ctdef, vec_aux_rtdef,
+                   data_table_ctdef, lookup_rtdef->get_lookup_scan_rtdef(),
+                   related_tablet_ids.lookup_tablet_id_, trans_desc, async_ivf_iter))) {
+      LOG_WARN("failed to create async ivf filter input iter", K(ret));
+    } else if (OB_FAIL(async_ivf_iter->refresh_partition_filter_path())) {
+      LOG_WARN("failed to select async ivf partition filter path", K(ret));
+    } else if (OB_FAIL(create_local_lookup_sub_tree(
+                   scan_param, alloc, vec_aux_ctdef, vec_aux_rtdef,
+                   lookup_ctdef->get_lookup_scan_ctdef(),
+                   lookup_rtdef->get_lookup_scan_rtdef(),
+                   trans_desc, async_ivf_iter->get_async_read_snapshot(), async_ivf_iter,
+                   related_tablet_ids.lookup_tablet_id_, lookup_iter))) {
+      LOG_WARN("failed to create async ivf local lookup iter", K(ret));
+    }
+  }
+
+  if (OB_FAIL(ret)) {
+    if (OB_NOT_NULL(async_ivf_iter)) {
+      async_ivf_iter->release();
+      alloc.free(async_ivf_iter);
+      async_ivf_iter = nullptr;
+    }
+    if (OB_NOT_NULL(data_filter_iter)) {
+      // init() may fail before the Async iterator takes ownership of this scan.
+      if (DAS_ITER_INVALID != data_filter_iter->get_type()) {
+        data_filter_iter->release();
+      }
+      alloc.free(data_filter_iter);
+      data_filter_iter = nullptr;
+    }
+    if (OB_NOT_NULL(lookup_iter)) {
+      lookup_iter->release();
+      alloc.free(lookup_iter);
+      lookup_iter = nullptr;
+    }
+  } else {
+    iter_tree = lookup_iter;
+  }
+  return ret;
+}
+
+int ObDASIterUtils::create_async_ivf_filter_input_iter(
+    ObTableScanParam &filter_input_param,
+    common::ObIAllocator &alloc,
+    const ObDASVecAuxScanCtDef *vec_aux_ctdef,
+    ObDASVecAuxScanRtDef *vec_aux_rtdef,
+    const ObDASScanCtDef *lookup_ctdef,
+    ObDASScanRtDef *lookup_rtdef,
+    const ObTabletID &lookup_tablet_id,
+    transaction::ObTxDesc *trans_desc,
+    ObDASIVFAsyncIter *async_ivf_iter)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(vec_aux_ctdef) || OB_ISNULL(vec_aux_rtdef) || OB_ISNULL(async_ivf_iter)
+      || OB_ISNULL(lookup_ctdef) || OB_ISNULL(lookup_rtdef)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async ivf filter input arguments", K(ret), KP(vec_aux_ctdef),
+             KP(vec_aux_rtdef), KP(async_ivf_iter));
+  } else {
+    const ObDASBaseCtDef *input_ctdef = vec_aux_ctdef->get_inv_idx_scan_ctdef();
+    ObDASBaseRtDef *input_rtdef = vec_aux_rtdef->get_inv_idx_scan_rtdef();
+    const ObDASScanCtDef *async_index_ctdef = vec_aux_ctdef->get_async_ivf_index_scan_ctdef();
+    ObDASScanIter *scan_iter = nullptr;
+    ObDASLocalLookupIter *lookup_iter = nullptr;
+    ObDASIter *filter_iter = nullptr;
+    if (OB_ISNULL(input_ctdef) || OB_ISNULL(input_rtdef) || OB_ISNULL(async_index_ctdef)
+        || OB_UNLIKELY(async_index_ctdef->rowkey_exprs_.count() != 1)
+        || OB_ISNULL(async_index_ctdef->rowkey_exprs_.at(0))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid async ivf filter input definitions", K(ret), KP(input_ctdef),
+               KP(input_rtdef), KP(async_index_ctdef));
+    } else if (OB_UNLIKELY(input_ctdef->op_type_ != DAS_OP_TABLE_SCAN)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "async IVF non-scalar filter input");
+    } else {
+      const ObDASScanCtDef *input_scan_ctdef = static_cast<const ObDASScanCtDef *>(input_ctdef);
+      bool has_rowkey_output = false;
+      bool need_pre_lookup = true;
+      for (int64_t i = 0; OB_SUCC(ret) && !has_rowkey_output
+          && i < input_scan_ctdef->result_output_.count(); ++i) {
+        has_rowkey_output = input_scan_ctdef->result_output_.at(i) == async_index_ctdef->rowkey_exprs_.at(0);
+      }
+      // Match synchronous IVF's residual-filter check. A covering input must
+      // also produce the VID expression consumed by the pre-filter bitmap.
+      need_pre_lookup = !has_rowkey_output
+          || (input_scan_ctdef->ref_table_id_ != lookup_ctdef->ref_table_id_
+              && !lookup_ctdef->pd_expr_spec_.pushdown_filters_.empty()
+              && !vec_aux_ctdef->all_filters_can_be_picked_out_);
+      if (OB_FAIL(create_das_scan_iter(alloc, input_scan_ctdef,
+              static_cast<ObDASScanRtDef *>(input_rtdef), scan_iter))) {
+        LOG_WARN("failed to create async ivf scalar filter input", K(ret));
+      } else {
+        scan_iter->set_scan_param(filter_input_param);
+        if (vec_aux_ctdef->strategy_ == ObVecIdxQueryStrategy::LATENCY_FIRST) {
+          scan_iter->set_pre_filtering_timeout(vec_aux_ctdef->pre_filtering_timeout_);
+        }
+        if (need_pre_lookup) {
+          if (OB_FAIL(create_local_lookup_sub_tree(filter_input_param, alloc,
+                  input_ctdef, input_rtdef, lookup_ctdef, lookup_rtdef, trans_desc,
+                  async_ivf_iter->get_async_read_snapshot(), scan_iter, lookup_tablet_id, lookup_iter))) {
+            LOG_WARN("failed to create async ivf filter input lookup", K(ret));
+          } else {
+            filter_iter = lookup_iter;
+          }
+        } else {
+          filter_iter = scan_iter;
+        }
+      }
+    }
+    if (OB_SUCC(ret) && OB_FAIL(async_ivf_iter->init_filter_input(filter_iter))) {
+      LOG_WARN("failed to bind async ivf filter input tree", K(ret));
+    }
+    if (OB_FAIL(ret)) {
+      if (OB_NOT_NULL(lookup_iter)) {
+        lookup_iter->release();
+        alloc.free(lookup_iter);
+      } else if (OB_NOT_NULL(scan_iter)) {
+        scan_iter->release();
+        alloc.free(scan_iter);
+      }
     }
   }
   return ret;
@@ -4942,6 +5223,9 @@ int ObDASIterUtils::create_vec_search_iter(common::ObIAllocator &alloc,
   if (OB_ISNULL(vec_index_driver_ctdef) || OB_ISNULL(vec_index_driver_rtdef)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected nullptr", K(vec_index_driver_ctdef), K(vec_index_driver_rtdef));
+  } else if (OB_ISNULL(vec_index_driver_rtdef->eval_ctx_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("vec index driver rtdef eval ctx is null", K(ret), KPC(vec_index_driver_rtdef));
   } else {
     ObIDASSearchRtDef *filter_rtdef = nullptr;
     ObIDASSearchCtDef *filter_ctdef = nullptr;
@@ -4973,6 +5257,30 @@ int ObDASIterUtils::create_vec_search_iter(common::ObIAllocator &alloc,
     } else if (OB_ISNULL(vec_scan_base_ctdef) || OB_ISNULL(vec_scan_base_rtdef)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected nullptr", K(ret));
+    } else if (DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN == vec_scan_base_ctdef->op_type_
+               && (OB_ISNULL(search_ctx) || OB_ISNULL(snapshot))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("unexpected null async IVF scan context", K(ret), KP(search_ctx), KP(snapshot));
+    } else if (DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN == vec_scan_base_ctdef->op_type_) {
+      ObDASVecIndexAsyncIVFScanIterParam param;
+      param.ctdef_ = static_cast<const ObDASVecIndexAsyncIVFScanCtDef *>(vec_scan_base_ctdef);
+      param.rtdef_ = static_cast<ObDASVecIndexAsyncIVFScanRtDef *>(vec_scan_base_rtdef);
+      param.search_ctx_ = search_ctx;
+      param.tx_desc_ = trans_desc;
+      param.snapshot_ = snapshot;
+      // Extracted expressions keep the original filter tree, but conservatively
+      // disable scan-local Group PRE; the driver still supports partition PRE.
+      param.filter_rtdef_ = nullptr == extracted_filter_rtdef ? filter_rtdef : nullptr;
+      param.eval_ctx_ = vec_index_driver_rtdef->eval_ctx_;
+      param.exec_ctx_ = &param.eval_ctx_->exec_ctx_;
+      param.max_size_ = param.eval_ctx_->is_vectorized() ? param.eval_ctx_->max_batch_size_ : 1;
+      param.output_ = &vec_index_driver_ctdef->result_output_;
+      ObDASVecIndexAsyncIVFScanIter *async_iter = nullptr;
+      if (OB_FAIL(create_das_iter(alloc, param, async_iter))) {
+        LOG_WARN("failed to create async IVF adapter", K(ret));
+      } else {
+        vec_index_scan_iter = async_iter;
+      }
     } else if (vec_scan_base_ctdef->op_type_ == DAS_OP_VEC_INDEX_HNSW_SCAN) {
       // HNSW path
       const ObDASVecIndexHNSWScanCtDef *hnsw_ctdef = static_cast<const ObDASVecIndexHNSWScanCtDef *>(vec_scan_base_ctdef);
@@ -5018,7 +5326,8 @@ int ObDASIterUtils::create_vec_search_iter(common::ObIAllocator &alloc,
         go_brute_force = false;
       }
     } else {
-      // The automatic IVF and HNSW paths are refined per partition before scanning.
+      // The automatic IVF, HNSW and async IVF paths assemble both filters from an initial POST
+      // path. The driver selects the current partition path before querying.
       vec_index_type = ObVecIndexType::VEC_INDEX_POST_ITERATIVE_FILTER;
     }
 

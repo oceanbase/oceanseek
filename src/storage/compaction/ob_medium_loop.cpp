@@ -284,7 +284,7 @@ struct ObTabletCheckInfoProcessor
       LOG_WARN("invalid tablet handle", KR(ret), K(tablet_handle));
     // 在调度主表 tablet 时, 会同时触发异步索引 tablet 的调度
     // 所以这里不需要单独对异步索引 tablet 进行二次调度
-    } else if (OB_NOT_NULL(tablet_handle.get_obj()) && tablet_handle.get_obj()->is_async_inverted_storage_index()) {
+    } else if (OB_NOT_NULL(tablet_handle.get_obj()) && tablet_handle.get_obj()->is_async_index_storage_tablet()) {
       LOG_TRACE("async index tablet can only be scheduled via schedule_for_async_index on data tablet", K(tablet_handle));
     } else if (OB_FAIL(func.request_schedule_new_round(tablet_handle, false/*user_request*/, false/*need_load_tablet_status*/))) {
       LOG_WARN("failed to request schedule new round", KR(ret), K(tablet_handle));
@@ -348,7 +348,7 @@ int ObScheduleNewMediumLoop::schedule_async_index_medium(ObScheduleTabletFunc &f
             || index_tablet->get_ls_id() != check_info.get_ls_id()) {
           tmp_ret = OB_STATE_NOT_MATCH;
           LOG_WARN("finished tablet and check info are not match", K(tmp_ret), K(check_info), KPC(index_tablet));
-        } else if (index_tablet->is_async_inverted_storage_index()) {
+        } else if (index_tablet->is_async_index_storage_tablet()) {
           const ObTabletID &data_tablet_id = index_tablet->get_data_tablet_id();
           const share::ObTabletLSPair data_tablet_pair(data_tablet_id, current_ls_id);
           if (OB_UNLIKELY(!data_tablet_pair.is_valid() || data_tablet_id == check_info.get_tablet_id())) {

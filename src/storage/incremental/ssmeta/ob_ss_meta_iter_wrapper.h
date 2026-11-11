@@ -372,25 +372,30 @@ struct ObSSMetaTabletLockRowInfo final
   ObSSMetaTabletLockRowInfo()
     : tablet_next_op_id_(0),
       minor_next_op_id_(0),
-      inc_major_next_op_id_(0)
+      inc_major_next_op_id_(0),
+      non_idem_major_next_op_id_(0)
   {}
   void reset()
   {
     tablet_next_op_id_ = 0;
     minor_next_op_id_ = 0;
     inc_major_next_op_id_ = 0;
+    non_idem_major_next_op_id_ = 0;
   }
   bool is_valid() const
   {
     return tablet_next_op_id_ > 0
         && minor_next_op_id_ >= 0
-        && inc_major_next_op_id_ >= 0;
+        && inc_major_next_op_id_ >= 0
+        && non_idem_major_next_op_id_ >= 0;
   }
-  TO_STRING_KV(K_(tablet_next_op_id), K_(minor_next_op_id), K_(inc_major_next_op_id));
+  TO_STRING_KV(K_(tablet_next_op_id), K_(minor_next_op_id), K_(inc_major_next_op_id),
+      K_(non_idem_major_next_op_id));
 
   int64_t tablet_next_op_id_;
   int64_t minor_next_op_id_;
   int64_t inc_major_next_op_id_;
+  int64_t non_idem_major_next_op_id_;
 };
 
 class ObSSMetaTabletLockRowHelper final
@@ -406,16 +411,19 @@ private:
       const common::ObTabletID &tablet_id,
       int64_t &op_id);
   // 按宏块类型分别反解 minor 和 inc-major compaction 的 op_id。
+  // 同时提取非幂等 Major 宏块的 op_id。
   static int get_sstable_macro_op_id_(
       const common::ObTabletID &tablet_id,
       const blocksstable::MacroBlockId &macro_id,
       int64_t &minor_op_id,
-      int64_t &inc_major_op_id);
+      int64_t &inc_major_op_id,
+      int64_t &non_idem_major_op_id);
   static int accumulate_sstable_macro_op_id_(
       const common::ObTabletID &tablet_id,
       blocksstable::ObMacroIdIterator &macro_iter,
       int64_t &max_minor_op_id,
-      int64_t &max_inc_major_op_id);
+      int64_t &max_inc_major_op_id,
+      int64_t &max_non_idem_major_op_id);
 };
 
 // --------------------------------------------------------------------------

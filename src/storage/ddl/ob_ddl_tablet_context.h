@@ -31,6 +31,7 @@ class ObMacroMetaStoreManager;
 class ObDDLIndependentDag;
 class ObDDLTabletScanTask;
 class ObIDDLMergeHelper;
+struct ObIVFTabletContext;
 
 struct ObDDLChunk final
 {
@@ -202,6 +203,7 @@ public:
       const ObDirectLoadType direct_load_type,
       const ObDDLTableSchema &ddl_table_schema,
       const int64_t ddl_task_id = 0);
+  int init_ivf_context(const int64_t vector_dim);
   void reset();
   int update_max_lob_id(const int64_t lob_id);
   int64_t get_last_lob_id() const { return last_lob_id_; }
@@ -280,6 +282,7 @@ private:
 public:
   ObMacroMetaStoreManager *macro_meta_store_mgr_;
   ObVectorIndexTabletContext *vector_index_ctx_;
+  ObIVFTabletContext *ivf_ctx_;
   common::Ob2DArray<sql::ObPxTabletRange> fts_forward_part_ranges_;
   common::Ob2DArray<sql::ObPxTabletRange> fts_inverted_part_ranges_;
   sql::ObPxTabletRange fts_forward_final_range_;
@@ -290,4 +293,3 @@ public:
 }  // end namespace storage
 }  // end namespace oceanbase
 #endif//_OCEANBASE_STORAGE_DDL_OB_DDL_TABLET_CONTEXT_H_
-

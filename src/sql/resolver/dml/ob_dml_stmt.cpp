@@ -6226,8 +6226,10 @@ int ObDMLStmt::get_partition_columns(const int64_t table_id,
       } else if (OB_ISNULL(index_schema)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("index schema is null", K(ret), K(table_id), K(index_id));
-      } else if (index_schema->is_aux_lob_table() || (table_item->is_index_table_
-                 && share::schema::is_local_fts_index(index_schema->get_index_type()))) {
+      } else if (index_schema->is_aux_lob_table()
+                 || (table_item->is_index_table_
+                     && (share::schema::is_local_fts_index(index_schema->get_index_type())
+                         || index_schema->is_async_ivf_index()))) {
         fallback_scan_all_parts = true;
         partition_columns.reset();
         generate_columns.reset();

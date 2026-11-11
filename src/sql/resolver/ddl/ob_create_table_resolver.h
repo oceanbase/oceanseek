@@ -168,6 +168,8 @@ private:
   uint64_t cur_udt_set_id_;
   common::ObSEArray<uint64_t, 4> vec_index_col_ids_;
   bool has_vec_index_;
+  bool has_sync_vec_index_;
+  bool has_async_ivf_index_;
   bool has_fts_index_;
   bool has_async_fts_index_;
   bool has_search_index_;

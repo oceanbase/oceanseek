@@ -307,6 +307,7 @@ public:
       strategy_(ObVecIdxQueryStrategy::LATENCY_FIRST),
       lookup_streaming_ctx_(nullptr),
       runtime_index_type_(ObVectorIndexAlgorithmType::VIAT_MAX),
+      remaining_dist_offset_(-1),
       profile_(nullptr),
       profile_try_path_(ObVecIdxAdaTryPath::VEC_PATH_UNCHOSEN),
       profile_current_path_(ObVecIdxAdaTryPath::VEC_PATH_UNCHOSEN),
@@ -650,6 +651,7 @@ private:
   ObVecIdxQueryStrategy strategy_;
   ObDASHNSWLookupStreamingCtx *lookup_streaming_ctx_;
   ObVectorIndexAlgorithmType runtime_index_type_;
+  int64_t remaining_dist_offset_;
   // Algorithm metrics are collected only while this Profile is current.
   common::ObOpProfile<common::ObMetric> *profile_;
   ObVecIdxAdaTryPath profile_try_path_;

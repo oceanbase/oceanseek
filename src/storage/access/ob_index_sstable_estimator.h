@@ -72,6 +72,17 @@ struct ObEstimatedResult
   TO_STRING_KV(K_(total_row_count), K_(total_row_count_delta), K_(macro_block_cnt), K_(micro_block_cnt), K_(only_block));
 };
 
+// Estimation result of an async IVF index sstable. It is produced by traversing only the index
+// block tree, so the counts come from the index rows instead of opened data micro blocks.
+struct ObIvfEstimateResult
+{
+  ObIvfEstimateResult() : row_count_(0), macro_block_cnt_(0), micro_block_cnt_(0) {}
+  TO_STRING_KV(K_(row_count), K_(macro_block_cnt), K_(micro_block_cnt));
+  int64_t row_count_;
+  int64_t macro_block_cnt_;
+  int64_t micro_block_cnt_;
+};
+
 class ObIndexBlockScanEstimator
 {
 public:
@@ -89,6 +100,24 @@ public:
   // range. Traverses only the inverted index block tree (intermediate index levels down to
   // leaf index rows); it does NOT open any posting data micro block.
   static int estimate_inv_sstable_row_count(
+      blocksstable::ObSSTable &sstable,
+      const ObITableReadInfo &read_info,
+      const blocksstable::ObDatumRange &range,
+      ObTablet *tablet,
+      int64_t &row_count);
+  // Estimate the row count and block counts of an async IVF index sstable (baseline
+  // IVF_INDEX_SSTABLE and incremental INC_IVF_INDEX_SSTABLE) in the given range. Only the IVF
+  // index block tree is traversed: the low-precision vector data micro blocks may be FastScan
+  // encoded, holding no row-format micro header (see ObMicroBlockData::get_micro_header()), so
+  // they must never be opened here. The row/block counts of an index row are aggregated into
+  // its subtree, and a leaf data index row stands for exactly one data micro block.
+  static int estimate_ivf_sstable_result(
+      blocksstable::ObSSTable &sstable,
+      const ObITableReadInfo &read_info,
+      const blocksstable::ObDatumRange &range,
+      ObTablet *tablet,
+      ObIvfEstimateResult &result);
+  static int estimate_ivf_sstable_row_count(
       blocksstable::ObSSTable &sstable,
       const ObITableReadInfo &read_info,
       const blocksstable::ObDatumRange &range,

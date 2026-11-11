@@ -3,6 +3,7 @@
 #define USING_LOG_PREFIX STORAGE_COMPACTION
 #include "ob_tablet_merge_info.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable.h"
 #include "storage/compaction/ob_basic_tablet_merge_ctx.h"
 #include "storage/compaction/filter/ob_tx_data_minor_filter.h"
 
@@ -214,6 +215,13 @@ int ObTabletMergeInfo::create_sstable(
                                                                               ctx.mem_ctx_.get_allocator(),
                                                                               merge_table_handle))) {
           LOG_WARN("fail to create inv sstable", K(ret), K(param));
+          CTX_SET_DIAGNOSE_LOCATION(ctx);
+        }
+      } else if (param.table_key_.is_ivf_sstable()) {
+        if (OB_FAIL(ObTabletCreateDeleteHelper::create_sstable<blocksstable::ObIvfSSTable>(param,
+                                                                              ctx.mem_ctx_.get_allocator(),
+                                                                              merge_table_handle))) {
+          LOG_WARN("fail to create ivf sstable", K(ret), K(param));
           CTX_SET_DIAGNOSE_LOCATION(ctx);
         }
       } else if (NULL == cg_schema) { // not co major merge, only need to create one sstable

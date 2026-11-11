@@ -6,6 +6,8 @@
 #define USING_LOG_PREFIX RS
 
 #include "ob_ddl_scheduler.h"
+#include "rootserver/ddl_task/ob_drop_async_vector_index_task.h"
+#include "rootserver/ddl_task/ob_async_vector_index_build_task.h"
 #include "rootserver/ddl_task/ob_drop_fts_index_task.h"
 #include "rootserver/ddl_task/ob_drop_search_index_task.h"
 #include "rootserver/ddl_task/ob_drop_vec_index_task.h"
@@ -23,6 +25,7 @@
 #include "share/longops_mgr/ob_longops_mgr.h"
 #include "share/ob_common_rpc_proxy.h" // ObCommonRpcProxy
 #include "share/ob_ddl_sim_point.h"
+#include "share/ob_debug_sync.h"
 #include "share/restore/ob_import_util.h"
 #include "share/scheduler/ob_partition_auto_split_helper.h"
 #include "share/ob_fts_index_builder_util.h"
@@ -845,6 +848,7 @@ int ObDDLScheduler::DDLScanTask::schedule()
 void ObDDLScheduler::DDLScanTask::runTimerTask()
 {
   int ret = OB_SUCCESS;
+  DEBUG_SYNC(BEFORE_SYS_DDL_TASK_SCAN_EPOCH_ADVANCE);
   ddl_scheduler_.inc_rs_epoch();
   if (OB_FAIL(ObSysDDLSchedulerUtil::recover_task())) {
     LOG_WARN("failed to recover ddl tasks", K(ret));
@@ -1326,6 +1330,18 @@ int ObDDLScheduler::create_ddl_task(const ObCreateDDLTaskParam &param,
           LOG_WARN("fail to create build index task", K(ret));
         }
         break;
+      case DDL_CREATE_ASYNC_VEC_IVF_INDEX:
+        create_index_arg = static_cast<const obrpc::ObCreateIndexArg *>(param.ddl_arg_);
+        if (OB_FAIL(create_async_vector_index_build_task(
+                proxy, param.src_table_schema_, param.dest_table_schema_,
+                real_parallelism, param.parent_task_id_, param.consumer_group_id_,
+                param.sub_task_trace_id_, create_index_arg,
+                param.tenant_data_version_, *param.allocator_, task_record,
+                param.new_snapshot_version_,
+                param.ddl_need_retry_at_executor_))) {
+          LOG_WARN("fail to create async vector index build task", K(ret));
+        }
+        break;
       case DDL_CREATE_FTS_INDEX:
       case DDL_CREATE_MULTIVALUE_INDEX:
       case DDL_CREATE_VEC_SPIV_INDEX:
@@ -1418,6 +1434,19 @@ int ObDDLScheduler::create_ddl_task(const ObCreateDDLTaskParam &param,
                                                *param.allocator_,
                                                task_record))) {
           LOG_WARN("fail to create drop fts index task", K(ret));
+        }
+        break;
+      case DDL_DROP_ASYNC_VEC_IVF_INDEX:
+        drop_index_arg = static_cast<const obrpc::ObDropIndexArg *>(param.ddl_arg_);
+        if (OB_FAIL(create_drop_async_vector_index_task(proxy,
+                                                        param.src_table_schema_,
+                                                        param.schema_version_,
+                                                        param.consumer_group_id_,
+                                                        param.async_delete_schema_,
+                                                        drop_index_arg,
+                                                        *param.allocator_,
+                                                        task_record))) {
+          LOG_WARN("fail to create drop async vector index task", K(ret));
         }
         break;
       case DDL_DROP_VEC_IVFFLAT_INDEX:
@@ -2392,14 +2421,15 @@ int ObDDLScheduler::create_build_index_task(
     int64_t task_id = 0;
     // Skip WAIT_TRANS_END and enter REDEFINITION when parent snapshot is already available:
     // 1) online rowkey_doc / vec_rowkey_vid aux child;
-    // 2) offline DDL async FTS child (write_defensive_and_obtain_snapshot), scoped to
-    //    child tasks on offline-ddl-whitelist tables (not top-level ADD KEY / online async FTS).
+    // 2) offline DDL async FTS / DISK_BBQ child, scoped to children on
+    //    offline-ddl-whitelist tables (not top-level ADD KEY / online async-index DDL).
     const bool skip_wait_trans_end =
       ((index_schema->is_rowkey_doc_id()
         || index_schema->is_vec_rowkey_vid_type())
        && !create_index_arg->is_offline_or_restore())
       || (parent_task_id > 0
-          && index_schema->is_async_fts_index()
+          && (index_schema->is_async_fts_index()
+              || index_schema->is_async_ivf_index())
           && snapshot_version > 0
           && data_table_schema->get_in_offline_ddl_white_list());
     const share::ObDDLTaskStatus task_status = skip_wait_trans_end ? share::ObDDLTaskStatus::REDEFINITION : share::ObDDLTaskStatus::PREPARE;
@@ -2431,6 +2461,62 @@ int ObDDLScheduler::create_build_index_task(
       }
       LOG_INFO("ddl_scheduler create build index task finished", K(ret), "ddl_event_info", ObDDLEventInfo(), K(task_record));
     }
+  }
+  return ret;
+}
+
+int ObDDLScheduler::create_async_vector_index_build_task(
+    common::ObISQLClient &proxy,
+    const ObTableSchema *data_table_schema,
+    const ObTableSchema *index_schema,
+    const int64_t parallelism,
+    const int64_t parent_task_id,
+    const int64_t consumer_group_id,
+    const int32_t sub_task_trace_id,
+    const obrpc::ObCreateIndexArg *create_index_arg,
+    const uint64_t tenant_data_version,
+    ObIAllocator &allocator,
+    ObDDLTaskRecord &task_record,
+    const int64_t snapshot_version,
+    const bool ddl_need_retry_at_executor)
+{
+  int ret = OB_SUCCESS;
+  int64_t task_id = 0;
+  SMART_VAR(ObAsyncVectorIndexBuildTask, task) {
+    if (OB_UNLIKELY(!is_inited_)) {
+      ret = OB_NOT_INIT;
+      LOG_WARN("scheduler is not initialized", K(ret));
+    } else if (OB_ISNULL(create_index_arg)
+               || OB_ISNULL(data_table_schema)
+               || OB_ISNULL(index_schema)
+               || tenant_data_version <= 0
+               || snapshot_version < 0
+               || (0 == snapshot_version
+                   && !ObDDLUtil::should_defer_async_index_snapshot(
+                       *create_index_arg, tenant_data_version))
+               || parent_task_id < 0
+               || (create_index_arg->is_offline_rebuild_ && parent_task_id <= 0)
+               || OB_ISNULL(GCTX.sql_proxy_)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid async vector build arguments", K(ret),
+          KPC(create_index_arg), KPC(data_table_schema), KPC(index_schema),
+          K(tenant_data_version), K(snapshot_version));
+    } else if (OB_FAIL(ObDDLTask::fetch_new_task_id(
+                   *GCTX.sql_proxy_, data_table_schema->get_tenant_id(), task_id))) {
+      LOG_WARN("fail to fetch async vector build task id", K(ret));
+    } else if (OB_FAIL(task.init(
+                   data_table_schema->get_tenant_id(), task_id,
+                   data_table_schema, index_schema, data_table_schema->get_schema_version(),
+                   parallelism, parent_task_id, consumer_group_id, sub_task_trace_id,
+                   *create_index_arg, tenant_data_version, snapshot_version,
+                   !ddl_need_retry_at_executor))) {
+      LOG_WARN("fail to initialize async vector build task", K(ret));
+    } else if (OB_FAIL(task.set_trace_id(*ObCurTraceId::get_trace_id()))) {
+      LOG_WARN("fail to set async vector build trace id", K(ret));
+    } else if (OB_FAIL(insert_task_record(proxy, task, allocator, task_record))) {
+      LOG_WARN("fail to insert async vector build task", K(ret));
+    }
+    LOG_INFO("create async vector index build task finished", K(ret), K(task));
   }
   return ret;
 }
@@ -2514,7 +2600,8 @@ int ObDDLScheduler::create_drop_fts_index_task(
   } else if (OB_ISNULL(index_schema) || OB_ISNULL(drop_index_arg) || OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), KP(index_schema), KP(drop_index_arg), KP(GCTX.sql_proxy_));
-  } else if (FALSE_IT(is_async_fts_index = (index_schema->is_async_fts_index() || drop_index_arg->is_parent_task_dropping_user_async_index_))) {
+  } else if (FALSE_IT(is_async_fts_index = (index_schema->is_async_fts_index()
+                 || drop_index_arg->is_parent_task_dropping_user_async_index_))) {
   } else if (FALSE_IT(is_fts_index = (index_schema->is_fts_index_aux() || drop_index_arg->is_parent_task_dropping_fts_index_))) {
   } else if (FALSE_IT(is_multivalue_index = (index_schema->is_multivalue_index_aux() || drop_index_arg->is_parent_task_dropping_multivalue_index_))) {
   } else if (FALSE_IT(is_vec_spiv_index = (index_schema->is_vec_spiv_index_aux() || drop_index_arg->is_parent_task_dropping_spiv_index_))) {
@@ -2593,6 +2680,73 @@ int ObDDLScheduler::create_drop_fts_index_task(
     }
   }
   LOG_INFO("ddl_scheduler create drop fts index task finished", K(ret), K(index_task));
+  return ret;
+}
+
+int ObDDLScheduler::create_drop_async_vector_index_task(
+    common::ObISQLClient &proxy,
+    const share::schema::ObTableSchema *index_schema,
+    const int64_t schema_version,
+    const int64_t consumer_group_id,
+    const share::schema::ObTableSchema *async_delete_schema,
+    const obrpc::ObDropIndexArg *drop_index_arg,
+    ObIAllocator &allocator,
+    ObDDLTaskRecord &task_record)
+{
+  int ret = OB_SUCCESS;
+  int64_t task_id = 0;
+  ObDropAsyncVectorIndexTask task;
+  ObString user_index_name;
+  ObString async_delete_name;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("scheduler is not initialized", K(ret));
+  } else if (OB_ISNULL(index_schema)
+          || OB_ISNULL(drop_index_arg)
+          || OB_ISNULL(GCTX.sql_proxy_)
+          || schema_version <= 0
+          || !index_schema->is_async_ivf_index()
+          || (OB_NOT_NULL(async_delete_schema) && !async_delete_schema->is_async_delete_index())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async vector DROP arguments", K(ret), KP(index_schema),
+        KP(async_delete_schema), KP(drop_index_arg), K(schema_version));
+  } else if (OB_FAIL(ObDDLTask::fetch_new_task_id(
+                 *GCTX.sql_proxy_, index_schema->get_tenant_id(), task_id))) {
+    LOG_WARN("fail to fetch task id", K(ret));
+  } else if (OB_FAIL(index_schema->get_index_name(user_index_name))) {
+    LOG_WARN("fail to get user async vector index name", K(ret), KPC(index_schema));
+  } else if (OB_NOT_NULL(async_delete_schema)
+             && OB_FAIL(async_delete_schema->get_index_name(async_delete_name))) {
+    LOG_WARN("fail to get async delete index name", K(ret), KPC(async_delete_schema));
+  } else {
+    int64_t target_object_id = drop_index_arg->index_table_id_;
+    if (OB_INVALID_ID == target_object_id) {
+      target_object_id = index_schema->get_table_id();
+    }
+    ObVecIndexDDLChildTaskInfo user_index(
+        user_index_name, index_schema->get_table_id(), 0);
+    const uint64_t async_delete_table_id = OB_ISNULL(async_delete_schema)
+        ? OB_INVALID_ID : async_delete_schema->get_table_id();
+    ObVecIndexDDLChildTaskInfo async_delete(
+        async_delete_name, async_delete_table_id, 0);
+    if (OB_FAIL(task.init(index_schema->get_tenant_id(),
+                          task_id,
+                          index_schema->get_data_table_id(),
+                          DDL_DROP_ASYNC_VEC_IVF_INDEX,
+                          user_index,
+                          async_delete,
+                          drop_index_arg->ddl_stmt_str_,
+                          schema_version,
+                          consumer_group_id,
+                          target_object_id))) {
+      LOG_WARN("fail to init async vector DROP task", K(ret));
+    } else if (OB_FAIL(task.set_trace_id(*ObCurTraceId::get_trace_id()))) {
+      LOG_WARN("fail to set trace id", K(ret));
+    } else if (OB_FAIL(insert_task_record(proxy, task, allocator, task_record))) {
+      LOG_WARN("fail to insert async vector DROP task record", K(ret));
+    }
+  }
+  LOG_INFO("create async vector DROP task finished", K(ret), K(task));
   return ret;
 }
 
@@ -3665,6 +3819,9 @@ int ObDDLScheduler::schedule_ddl_task(const ObDDLTaskRecord &record)
       case ObDDLType::DDL_CREATE_PARTITIONED_LOCAL_INDEX:
         ret = schedule_build_index_task(record);
         break;
+      case ObDDLType::DDL_CREATE_ASYNC_VEC_IVF_INDEX:
+        ret = schedule_async_vector_index_build_task(record);
+        break;
       case ObDDLType::DDL_DROP_INDEX:
       case ObDDLType::DDL_DROP_MLOG:
         ret = schedule_drop_index_task(record);
@@ -3698,6 +3855,9 @@ int ObDDLScheduler::schedule_ddl_task(const ObDDLTaskRecord &record)
       case ObDDLType::DDL_DROP_MULVALUE_INDEX:
       case ObDDLType::DDL_DROP_VEC_SPIV_INDEX:
         ret = schedule_drop_fts_index_task(record);
+        break;
+      case ObDDLType::DDL_DROP_ASYNC_VEC_IVF_INDEX:
+        ret = schedule_drop_async_vector_index_task(record);
         break;
       case ObDDLType::DDL_DROP_SEARCH_INDEX:
       case ObDDLType::DDL_DROP_ASYNC_SEARCH_INDEX:
@@ -3893,6 +4053,33 @@ int ObDDLScheduler::schedule_build_index_task(
     build_index_task->~ObIndexBuildTask();
     allocator_.free(build_index_task);
     build_index_task = nullptr;
+  }
+  return ret;
+}
+
+int ObDDLScheduler::schedule_async_vector_index_build_task(
+    const ObDDLTaskRecord &task_record)
+{
+  int ret = OB_SUCCESS;
+  ObAsyncVectorIndexBuildTask *task = nullptr;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("scheduler is not initialized", K(ret));
+  } else if (OB_FAIL(alloc_ddl_task(task))) {
+    LOG_WARN("fail to allocate async vector build task", K(ret));
+  } else if (OB_FAIL(task->init(task_record))) {
+    LOG_WARN("fail to recover async vector build task", K(ret), K(task_record));
+  } else if (OB_FAIL(task->set_trace_id(task_record.trace_id_))) {
+    LOG_WARN("fail to restore async vector build trace id", K(ret));
+  } else if (OB_FAIL(inner_schedule_ddl_task(task, task_record))) {
+    if (OB_ENTRY_EXIST != ret) {
+      LOG_WARN("fail to schedule async vector build task", K(ret), K(task_record));
+    }
+  }
+  if (OB_FAIL(ret) && OB_NOT_NULL(task)) {
+    task->~ObAsyncVectorIndexBuildTask();
+    allocator_.free(task);
+    task = nullptr;
   }
   return ret;
 }
@@ -4276,6 +4463,36 @@ int ObDDLScheduler::schedule_drop_fts_index_task(const ObDDLTaskRecord &task_rec
     drop_fts_index_task->~ObDropFTSIndexTask();
     allocator_.free(drop_fts_index_task);
     drop_fts_index_task = nullptr;
+  }
+  return ret;
+}
+
+int ObDDLScheduler::schedule_drop_async_vector_index_task(
+    const ObDDLTaskRecord &task_record)
+{
+  int ret = OB_SUCCESS;
+  ObDropAsyncVectorIndexTask *task = nullptr;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("scheduler is not initialized", K(ret));
+  } else if (OB_FAIL(alloc_ddl_task(task))) {
+    LOG_WARN("fail to allocate async vector DROP task", K(ret));
+  } else if (OB_ISNULL(task)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("allocated async vector DROP task is null", K(ret));
+  } else if (OB_FAIL(task->init(task_record))) {
+    LOG_WARN("fail to recover async vector DROP task", K(ret), K(task_record));
+  } else if (OB_FAIL(task->set_trace_id(task_record.trace_id_))) {
+    LOG_WARN("fail to set trace id", K(ret));
+  } else if (OB_FAIL(inner_schedule_ddl_task(task, task_record))) {
+    if (OB_ENTRY_EXIST != ret) {
+      LOG_WARN("fail to schedule async vector DROP task", K(ret));
+    }
+  }
+  if (OB_FAIL(ret) && nullptr != task) {
+    task->~ObDropAsyncVectorIndexTask();
+    allocator_.free(task);
+    task = nullptr;
   }
   return ret;
 }

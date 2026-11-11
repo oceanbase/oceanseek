@@ -476,6 +476,7 @@ public:
   void reset_access_datums_ptr(const ObDASBaseCtDef *ctdef, ObEvalCtx &eval_ctx, int64_t capacity);
   bool is_contain_trans_info() {return NULL != scan_ctdef_->trans_info_expr_; }
   int get_vec_ir_tablet_ids(ObDASRelatedTabletID &related_tablet_ids);
+  int get_async_ivf_tablet_ids(ObDASRelatedTabletID &related_tablet_ids) const;
   int get_ivf_ir_tablet_ids(
       common::ObTabletID &vec_row_tid,
       common::ObTabletID &centroid_tid_,

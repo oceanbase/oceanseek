@@ -940,6 +940,14 @@ TEST_F(TestSSMetaCtrlIterator, major_sstable_value_iterator_filters_meta_type_in
   ASSERT_EQ(OB_SUCCESS, insert_iter_row(
       op, tenant_id, ls, major_key.type_, major_meta_key, major_meta_value));
 
+  ObSSMetaCtrlKey non_idem_key;
+  ASSERT_EQ(OB_SUCCESS, non_idem_key.assign(major_key));
+  non_idem_key.type_ = blocksstable::ObStorageObjectType::SHARED_NON_IDEM_MAJOR_SSTABLE_CTRL;
+  ObString non_idem_meta_key;
+  ASSERT_EQ(OB_SUCCESS, build_meta_key_str(non_idem_key, allocator, non_idem_meta_key));
+  ASSERT_EQ(OB_SUCCESS, insert_iter_row(op, tenant_id, ls, non_idem_key.type_,
+      non_idem_meta_key, build_string(allocator, "invalid non-idempotent ctrl value")));
+
   ObSSMetaCtrlKey minor_key;
   ASSERT_EQ(OB_SUCCESS, minor_key.assign(major_key));
   minor_key.type_ = blocksstable::ObStorageObjectType::SHARED_MINOR_SSTABLE_CTRL;
@@ -971,7 +979,7 @@ TEST_F(TestSSMetaCtrlIterator, major_sstable_value_iterator_filters_meta_type_in
       iter.get_next(actual_tenant_id, actual_ls, actual_key, actual_value));
   ASSERT_EQ(tenant_id, actual_tenant_id);
   ASSERT_EQ(ls, actual_ls);
-  ASSERT_EQ(blocksstable::ObStorageObjectType::SHARED_MAJOR_SSTABLE_CTRL, actual_key.type_);
+  ASSERT_EQ(major_key.type_, actual_key.type_);
   ASSERT_EQ(46001, actual_value.ctrl_info_.op_id_);
   ASSERT_EQ(OB_ITER_END,
       iter.get_next(actual_tenant_id, actual_ls, actual_key, actual_value));

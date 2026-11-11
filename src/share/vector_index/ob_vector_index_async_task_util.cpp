@@ -25,6 +25,7 @@
 #include "storage/ob_value_row_iterator.h"
 #include "share/vector_index/ob_ivf_async_task.h"
 #include "share/vector_index/ob_ivf_cache_rewarm_task.h"
+#include "share/vector_index/disk_bbq_cache/ob_disk_bbq_cache_task.h"
 #include "share/vector_index/ob_vector_index_aux_table_handler.h"
 #include "observer/ob_server.h"
 #include "sql/engine/expr/ob_expr_lob_utils.h"
@@ -586,7 +587,8 @@ int ObAsyncTaskCancelByTabletFunc::operator()(
   if (OB_NOT_NULL(task_ctx)
       && task_ctx->task_status_.task_type_ != ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_INDEX_IVF_CLEAN
       && task_ctx->task_status_.task_type_ != ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_MEM_SYNC_TASK
-      && task_ctx->task_status_.task_type_ != ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_IVF_CACHE_REWARM) {
+      && task_ctx->task_status_.task_type_ != ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_IVF_CACHE_REWARM
+      && task_ctx->task_status_.task_type_ != ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_DISK_BBQ_CACHE_CLEAN) {
     // Most tasks use the adapter-map key (incremental tablet) as tablet_id_.
     // HNSW merge is keyed by the vbitmap tablet and keeps the adapter-map key
     // in inc_tablet_id_, so adapter cleanup must match either identity.
@@ -1269,6 +1271,8 @@ static const VecTaskTypeNameEntry VEC_TASK_TYPE_NAME_TABLE[] = {
   {OB_VECTOR_ASYNC_ALTER_INDEX_PARAM,         "ALTER_INDEX_PARAM"},
   {OB_VECTOR_ASYNC_MEM_SYNC_TASK,            "MEM_SYNC"},
   {OB_VECTOR_ASYNC_IVF_CACHE_REWARM,         "IVF_CACHE_REWARM"},
+  {OB_VECTOR_ASYNC_DISK_BBQ_CACHE_CLEAN,     "DISK_BBQ_CACHE_CLEAN"},
+  {OB_VECTOR_ASYNC_DISK_BBQ_HGRAPH_BUILD,    "DISK_BBQ_HGRAPH_BUILD"},
 };
 
 static const int64_t VEC_TASK_TYPE_NAME_COUNT =
@@ -1746,7 +1750,9 @@ int ObVecIndexAsyncTaskUtil::get_duplicate_tablet_vec_task(
             EXTRACT_INT_FIELD_MYSQL(*result, "task_type", task_type, uint64_t);
             if (OB_FAIL(ret)) {
             } else if (static_cast<uint64_t>(ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_MEM_SYNC_TASK) == task_type ||
-                       static_cast<uint64_t>(ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_INDEX_IVF_CLEAN) == task_type) {
+                       static_cast<uint64_t>(ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_INDEX_IVF_CLEAN) == task_type ||
+                       static_cast<uint64_t>(ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_DISK_BBQ_CACHE_CLEAN) == task_type ||
+                       static_cast<uint64_t>(ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_DISK_BBQ_HGRAPH_BUILD) == task_type) {
               // These tasks may run on both leader and follower, so global tablet/task-type
               // de-duplication would incorrectly block one side.
             } else {
@@ -4301,6 +4307,31 @@ int ObVecIndexAsyncTaskHandler::push_task(
     } else if (OB_NOT_NULL(ivf_task)) {
       handle_ls_process_task_cnt(ivf_task->get_ls_id(), true);
     }
+  } else if (ctx->task_status_.task_type_ == OB_VECTOR_ASYNC_DISK_BBQ_CACHE_CLEAN
+          || ctx->task_status_.task_type_ == OB_VECTOR_ASYNC_DISK_BBQ_HGRAPH_BUILD) {
+    ObDiskBBQCacheAsyncTask *cache_task = nullptr;
+    if (OB_ISNULL(cache_task = OB_NEWx(ObDiskBBQCacheAsyncTask, allocator))) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate DiskBBQ cache task", KR(ret), K(tenant_id), K(ls_id));
+    } else if (OB_FAIL(cache_task->init(
+                   tenant_id, ls_id, ctx->task_status_.task_type_, ctx))) {
+      LOG_WARN("failed to init DiskBBQ cache task", KR(ret), K(tenant_id), K(ls_id));
+    } else {
+      // Publish lifecycle references before the task becomes visible to a
+      // worker, and roll them back if the queue push fails.
+      handle_ls_process_task_cnt(cache_task->get_ls_id(), true);
+      inc_async_task_ref();
+      if (OB_FAIL(TG_PUSH_TASK(tg_id_, cache_task))) {
+        LOG_WARN("failed to push DiskBBQ cache task", KR(ret), KPC(cache_task));
+        dec_async_task_ref();
+        handle_ls_process_task_cnt(cache_task->get_ls_id(), false);
+      }
+    }
+    if (OB_FAIL(ret) && OB_NOT_NULL(cache_task)) {
+      cache_task->~ObDiskBBQCacheAsyncTask();
+      allocator->free(cache_task);
+      cache_task = nullptr;
+    }
   } else if (ctx->task_status_.task_type_ == OB_VECTOR_ASYNC_INDEX_FREEZE) {
     ObVecIdxFreezeTask *freeze_task = nullptr;
     if (OB_ISNULL(freeze_task = static_cast<ObVecIdxFreezeTask *>(allocator->alloc(sizeof(ObVecIdxFreezeTask))))) {
@@ -4448,6 +4479,8 @@ void ObVecIndexAsyncTaskHandler::handle(void *task)
     || async_task->get_task_type() == ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_HYBRID_VECTOR_EMBEDDING
     || async_task->get_task_type() == ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_INDEX_IVF_LOAD
     || async_task->get_task_type() == ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_INDEX_IVF_CLEAN
+    || async_task->get_task_type() == ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_DISK_BBQ_CACHE_CLEAN
+    || async_task->get_task_type() == ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_DISK_BBQ_HGRAPH_BUILD
     || async_task->get_task_type() == ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_INDEX_FREEZE
     || async_task->get_task_type() == ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_INDEX_MERGE
     || async_task->get_task_type() == ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_ALTER_INDEX_PARAM
@@ -7443,7 +7476,8 @@ bool ObVecIndexAsyncTaskUtil::disallow_cancel_task(const ObVecIndexAsyncTaskCtx 
 {
   return OB_NOT_NULL(task_ctx)
       && (task_ctx->task_status_.task_type_ == ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_INDEX_IVF_CLEAN
-          || task_ctx->task_status_.task_type_ == ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_IVF_CACHE_REWARM);
+          || task_ctx->task_status_.task_type_ == ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_IVF_CACHE_REWARM
+          || task_ctx->task_status_.task_type_ == ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_DISK_BBQ_CACHE_CLEAN);
 }
 
 int ObVecIndexAsyncTaskUtil::get_merge_task_vec_cnt(

@@ -90,6 +90,7 @@ private:
 };
 
 class ObDASIvfBaseScanIter;
+class ObDASIVFAsyncIter;
 class ObDASHNSWScanIter;
 struct ObDASHNSWLookupStreamingCtx;
 class ObDASIvfScanIterParam;
@@ -189,6 +190,7 @@ public:
                                                   const ObDASRelatedTabletID &related_tablet_ids,
                                                   const ObLSID &ls_id);
   static bool is_vec_ivf_scan(const ObDASBaseCtDef *attach_ctdef, ObDASBaseRtDef *attach_rtdef);
+  static bool is_async_ivf_scan(const ObDASBaseCtDef *attach_ctdef, ObDASBaseRtDef *attach_rtdef);
   static bool is_vec_spiv_scan(const ObDASBaseCtDef *attach_ctdef, ObDASBaseRtDef *attach_rtdef);
   static bool is_vec_hnsw_scan(const ObDASBaseCtDef *attach_ctdef, ObDASBaseRtDef *attach_rtdef);
   static int check_fts_index_merge_and_opt(const ObDASScanCtDef *scan_ctdef,
@@ -393,6 +395,25 @@ private:
                                     transaction::ObTxDesc *trans_desc,
                                     transaction::ObTxReadSnapshot *snapshot,
                                     ObDASIter *&iter_tree);
+  static int create_async_ivf_lookup_tree(
+      ObTableScanParam &scan_param,
+      common::ObIAllocator &alloc,
+      const ObDASBaseCtDef *attach_ctdef,
+      ObDASBaseRtDef *attach_rtdef,
+      const ObDASRelatedTabletID &related_tablet_ids,
+      transaction::ObTxDesc *trans_desc,
+      transaction::ObTxReadSnapshot *snapshot,
+      ObDASIter *&iter_tree);
+  static int create_async_ivf_filter_input_iter(
+      ObTableScanParam &filter_input_param,
+      common::ObIAllocator &alloc,
+      const ObDASVecAuxScanCtDef *vec_aux_ctdef,
+      ObDASVecAuxScanRtDef *vec_aux_rtdef,
+      const ObDASScanCtDef *lookup_ctdef,
+      ObDASScanRtDef *lookup_rtdef,
+      const common::ObTabletID &lookup_tablet_id,
+      transaction::ObTxDesc *trans_desc,
+      ObDASIVFAsyncIter *async_ivf_iter);
 
   static int create_hybrid_search_tree(DAS_ITER_TREE_SIGNATURE, ObDASIter *&iter_tree);
   static int create_search_driver_iter(

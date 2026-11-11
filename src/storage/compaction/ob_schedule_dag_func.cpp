@@ -76,7 +76,7 @@ int ObScheduleDagFunc::schedule_tablet_merge_dag(
     const bool is_emergency)
 {
   int ret = OB_SUCCESS;
-  if (param.is_inv_index_) {
+  if (param.is_use_async_index_dag_) {
     if (is_major_merge_type(param.merge_type_)) {
       CREATE_DAG(ObAsyncIndexMajorMergeDag);
     } else {
@@ -200,7 +200,7 @@ int ObDagParamFunc::fill_param(
     param.ls_id_ = ls_id;
     param.tablet_id_ = tablet.get_tablet_meta().tablet_id_;
     param.data_tablet_id_ = tablet.get_data_tablet_id();
-    param.is_inv_index_ = tablet.is_async_inverted_storage_index();
+    param.is_use_async_index_dag_ = tablet.is_async_index_storage_tablet();
     param.merge_type_ = merge_type;
     param.merge_version_ = merge_snapshot_version;
     param.merge_base_version_ = merge_base_version;

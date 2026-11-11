@@ -24,8 +24,12 @@ namespace oceanbase
 {
 namespace storage
 {
+class ObIVFRefreshMonitor;
+class ObDDLDagMonitorNode;
+
 
 class ObLSAsyncIndexScheduler;
+class ObLS;
 
 // 异步索引逻辑版本的初始值。
 static const int64_t ASYNC_INDEX_INITIAL_VERSION = 0;
@@ -188,8 +192,8 @@ struct ObAsyncIndexRefreshTmpInfo final
   ObAsyncIndexRefreshTmpInfo()
     : start_refresh_scn_(), snapshot_version_(0), schema_version_(0), ddl_build_id_(0), ddl_slice_info_(),
       allocator_(lib::ObMemAttr(common::OB_SERVER_TENANT_ID, "AsyncIdxSlice")),
-      ref_cnt_(0), skipped_rows_(0) {}
-  ~ObAsyncIndexRefreshTmpInfo() {}
+      ref_cnt_(0), ivf_refresh_monitor_(nullptr), skipped_rows_(0) {}
+  ~ObAsyncIndexRefreshTmpInfo();
   void init(const uint64_t tenant_id) {
     allocator_.set_attr(lib::ObMemAttr(tenant_id, "AsyncIdxSlice"));
   }
@@ -213,6 +217,7 @@ struct ObAsyncIndexRefreshTmpInfo final
   rootserver::ObDDLSliceInfo ddl_slice_info_;
   common::ObArenaAllocator allocator_;  // owns deep-copied ddl_slice_info_ contents; init() sets tenant_id
   volatile int64_t ref_cnt_;  // reference count: protects against UAF between get/release
+  ObIVFRefreshMonitor *ivf_refresh_monitor_; // owning reference; initialized under tmp_info_map_ lock
   volatile int64_t skipped_rows_;  // 增量刷新跳过行计数（PX worker 原子累加）
 };
 
@@ -254,7 +259,8 @@ struct ObAsyncIndexDataTabletInfo
 // Complete information for a single async index on a data table, including
 // both schema metadata and per-partition tablet mappings.
 // Physical async refresh targets are represented as independent ObAsyncIndexInfo
-// entries. The shared delete index is identified by is_delete_index_ == true.
+// entries. index_type_ drives per-index refresh dispatch; is_delete_index_ is
+// retained for compatibility and delete-specific scheduling.
 // A data table has at most one delete index.
 //
 // tablet_ids_[t] is the index tablet corresponding to
@@ -338,6 +344,18 @@ struct ObAsyncIndexInfo
   {
     return OB_INVALID_ID != index_table_id_
         && !index_table_name_.empty();
+  }
+  bool is_async_fts_index() const
+  {
+    return share::schema::is_async_fts_index(index_type_);
+  }
+  bool is_async_ivf_index() const
+  {
+    return share::schema::is_async_ivf_index(index_type_);
+  }
+  bool is_async_delete_index() const
+  {
+    return is_delete_index_ || share::schema::is_async_delete_index(index_type_);
   }
   TO_STRING_KV(K_(index_table_id), K_(index_table_name),
                K_(def_index_table_id), K_(index_type),

@@ -115,6 +115,9 @@ public:
   // required by iters related to DAS SCAN OP
   virtual int do_table_scan() { return OB_NOT_IMPLEMENT; }
   virtual int rescan() { return OB_NOT_IMPLEMENT; }
+  // Candidate batches keep the same partition, snapshot and query parameters.
+  // Iterators with shared query state can override the ordinary rescan behavior.
+  virtual int rescan_for_next_candidates() { return rescan(); }
   virtual int advance_scan() { return OB_NOT_IMPLEMENT; }
   // required by iters related to DAS SCAN OP
 

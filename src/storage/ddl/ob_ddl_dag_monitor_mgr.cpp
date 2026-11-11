@@ -10,6 +10,7 @@
 #include "share/rc/ob_tenant_base.h"
 #include "share/ob_unit_getter.h"
 #include "share/ob_server_struct.h"
+#include "lib/utility/ob_tracepoint.h"
 
 #define USING_LOG_PREFIX STORAGE
 
@@ -19,6 +20,8 @@ namespace storage
 {
 
 using namespace common;
+
+ERRSIM_POINT_DEF(EN_DDL_DAG_MONITOR_NODE_ALLOC_FAIL);
 
 ObDDLDagMonitorMgr::MonitorAllocator::MonitorAllocator()
     : mgr_(nullptr), fifo_allocator_()
@@ -304,6 +307,8 @@ int ObDDLDagMonitorMgr::inner_create_node(const NodeKey &key, ObDDLDagMonitorNod
   } else if (OB_UNLIKELY(!key.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("node key is invalid", K(ret), K(key));
+  } else if (OB_FAIL(OB_E(EN_DDL_DAG_MONITOR_NODE_ALLOC_FAIL) OB_SUCCESS)) {
+    LOG_WARN("injected DDL monitor node allocation failure", K(ret));
   } else {
     ObDDLDagMonitorNode *tmp = nullptr;
     void *buf = allocator_.inner_alloc(sizeof(ObDDLDagMonitorNode));

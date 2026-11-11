@@ -1767,6 +1767,9 @@ public:
                                    const ObIArray<uint64_t> &merge_index_ids,
                                    ObLogicalOperator *scan);
   int prepare_vector_index_info(AccessPath *ap, ObLogicalOperator *scan);
+  int prepare_async_ivf_vector_index_scan(const ObTableSchema &table_schema,
+                                          const uint64_t &vec_idx_tid,
+                                          ObLogTableScan *table_scan);
   int prepare_hnsw_vector_index_scan(ObSchemaGetterGuard *schema_guard,
                                     const ObTableSchema &table_schema,
                                     const uint64_t& vec_col_id,

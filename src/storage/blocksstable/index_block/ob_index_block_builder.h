@@ -22,6 +22,7 @@
 #include "storage/blocksstable/ob_sstable_private_object_cleaner.h"
 #include "storage/blocksstable/ob_shared_macro_block_manager.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_struct.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable_struct.h"
 
 namespace oceanbase
 {
@@ -268,7 +269,7 @@ public:
                K_(root_row_store_type), K_(nested_offset), K_(nested_size), K_(is_small_sstable),
                K_(table_backup_flag), K_(encrypt_id),
                K_(master_key_id), KPHEX_(encrypt_key, sizeof(encrypt_key_)),
-               K_(inv_meta));
+               K_(inv_meta), K_(ivf_meta));
 
 public:
   ObIndexTreeRootBlockDesc root_desc_;
@@ -298,6 +299,7 @@ public:
   bool is_small_sstable_;
   char encrypt_key_[share::OB_MAX_TABLESPACE_ENCRYPT_KEY_LENGTH];
   ObInvSSTableMeta inv_meta_;
+  ObIvfSSTableMeta ivf_meta_;
   DISALLOW_COPY_AND_ASSIGN(ObSSTableMergeRes);
 };
 
@@ -691,7 +693,9 @@ public:
   void set_is_async_index(const bool is_async_index) { is_async_index_ = is_async_index; }
   int merge_inv_meta(const ObInvSSTableMeta &partial);
   int merge_macro_inv_meta(const ObInvMacroMeta &macro_meta);
+  int set_ivf_meta(const ObIvfSSTableMeta &ivf_meta);
   OB_INLINE const ObInvSSTableMeta &get_inv_meta() const { return inv_meta_; }
+  OB_INLINE const ObIvfSSTableMeta &get_ivf_meta() const { return ivf_meta_; }
   const ObDataStoreDesc &get_data_store_desc() const { return data_store_desc_.get_desc(); }
   OB_INLINE ObSpaceOptimizationMode get_optimization_mode() const { return optimization_mode_; }
   const compaction::ObMergeBlockInfo &get_merge_block_info() const { return macro_writer_.get_merge_block_info(); }
@@ -795,6 +799,7 @@ private:
   IndexTreeRootCtxList roots_;
   ObSSTableMergeRes res_;
   ObInvSSTableMeta inv_meta_;
+  ObIvfSSTableMeta ivf_meta_;
   ObISSTableObjectCleaner *object_cleaner_;
   ObSpaceOptimizationMode optimization_mode_;
   bool enable_dump_disk_;

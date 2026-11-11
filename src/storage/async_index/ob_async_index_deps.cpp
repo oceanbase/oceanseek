@@ -1249,7 +1249,9 @@ static int build_data_table_info_from_schema_(
       break;
     }
 
-    // select_columns
+    // select_columns. Async IVF uses main-table hidden generated columns whose
+    // ids/names are copied into the physical index schema, so it follows the
+    // same INSERT...SELECT metadata path as async FTS/delete.
     ObSEArray<ObColDesc, 16> index_col_ids;
     index_col_ids.set_attr(attr);
     if (OB_FAIL(index_schema->get_column_ids(index_col_ids))) {

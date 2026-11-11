@@ -9,6 +9,7 @@
 #include "storage/vector_index/ob_vector_index_sched_job_utils.h"
 #include "sql/engine/expr/ob_array_expr_utils.h"
 #include "sql/engine/ob_exec_context.h"
+#include "share/ob_index_builder_util.h"
 #include "share/ob_vec_index_builder_util.h"
 #include "share/ob_fts_index_builder_util.h"
 #include "share/vector_index/ob_plugin_vector_index_util.h"
@@ -64,6 +65,7 @@ int ObVectorIndexUtil::parser_params_from_string(
     const int64_t default_sample_per_nlist_value = 256;
     const int64_t default_nbits_value = 8;
     const int64_t default_sync_interval_value = 10;
+    bool cluster_size_is_set = false;
 
     for (int64_t i = 0; OB_SUCC(ret) && i < tmp_param_strs.count(); ++i) {
       ObString one_tmp_param_str = tmp_param_strs.at(i).trim();
@@ -110,6 +112,8 @@ int ObVectorIndexUtil::parser_params_from_string(
             param.type_ = ObVectorIndexAlgorithmType::VIAT_IVF_SQ8;
           } else if (new_param_value == "IVF_PQ") {
             param.type_ = ObVectorIndexAlgorithmType::VIAT_IVF_PQ;
+          } else if (new_param_value == "DISK_BBQ") {
+            param.type_ = ObVectorIndexAlgorithmType::VIAT_DISK_BBQ;
           } else if (new_param_value == "HNSW_BQ") {
             param.type_ = ObVectorIndexAlgorithmType::VIAT_HNSW_BQ;
           } else if (new_param_value == "SINDI") {
@@ -178,6 +182,19 @@ int ObVectorIndexUtil::parser_params_from_string(
           } else {
             ret = OB_NOT_SUPPORTED;
             LOG_WARN("not support vector index sample_per_nlist value", K(ret), K(int_value), K(new_param_value));
+          }
+        } else if (new_param_name == "CLUSTER_SIZE") {
+          int64_t int_value = 0;
+          if (OB_FAIL(ObSchemaUtils::str_to_int(new_param_value, int_value))) {
+            LOG_WARN("fail to str_to_int", K(ret), K(new_param_value));
+          } else if (int_value >= ObVectorIndexParam::MIN_DISK_BBQ_CLUSTER_SIZE
+                     && int_value <= ObVectorIndexParam::MAX_DISK_BBQ_CLUSTER_SIZE) {
+            param.cluster_size_ = int_value;
+            cluster_size_is_set = true;
+          } else {
+            ret = OB_NOT_SUPPORTED;
+            LOG_WARN("not support vector index cluster_size value",
+                K(ret), K(int_value), K(new_param_value));
           }
         } else if (new_param_name == "EXTRA_INFO_MAX_SIZE") {
           int64_t int_value = 0;
@@ -424,6 +441,13 @@ int ObVectorIndexUtil::parser_params_from_string(
       }
     }
 
+    if (OB_SUCC(ret)
+        && ObVectorIndexAlgorithmType::VIAT_DISK_BBQ != param.type_
+        && cluster_size_is_set) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("cluster_size is only supported for DISK_BBQ", K(ret), K(param.type_));
+    }
+
     if (OB_SUCC(ret) && set_default) {  // if vector param is not set, use default
       if (index_type == ObVectorIndexType::VIT_HNSW_INDEX) {
         if (param.m_ == 0) {
@@ -451,6 +475,12 @@ int ObVectorIndexUtil::parser_params_from_string(
           param.dist_algorithm_ = VIDA_IP;
         }
       } else if (index_type == ObVectorIndexType::VIT_IVF_INDEX) {
+        if (param.type_ == ObVectorIndexAlgorithmType::VIAT_DISK_BBQ
+            && param.cluster_size_ == 0) {
+          // New DDL stores CLUSTER_SIZE for DISK_BBQ. NLIST and
+          // SAMPLE_PER_NLIST remain parseable here for old persisted schemas.
+          param.cluster_size_ = ObVectorIndexParam::DEFAULT_DISK_BBQ_CLUSTER_SIZE;
+        }
         if (param.nlist_ == 0) {
           param.nlist_ = default_nlist_value;
         }
@@ -461,7 +491,9 @@ int ObVectorIndexUtil::parser_params_from_string(
           param.lib_ = ObVectorIndexAlgorithmLib::VIAL_OB;
         }
         if (param.nbits_ == 0) {
-          param.nbits_ = default_nbits_value;
+          param.nbits_ = param.type_ == ObVectorIndexAlgorithmType::VIAT_DISK_BBQ
+              ? DISK_BBQ_RABITQ_BITS
+              : default_nbits_value;
         }
       } else if (index_type == ObVectorIndexType::VIT_SPIV_INDEX) {
         if (param.dist_algorithm_ == VIDA_MAX) {
@@ -1049,6 +1081,9 @@ const char* ObVectorIndexUtil::get_type_str(ObVectorIndexAlgorithmType type)
     case ObVectorIndexAlgorithmType::VIAT_IVF_PQ:
       ret_str = "IVF_PQ";
       break;
+    case ObVectorIndexAlgorithmType::VIAT_DISK_BBQ:
+      ret_str = "DISK_BBQ";
+      break;
     case ObVectorIndexAlgorithmType::VIAT_HGRAPH:
       ret_str = "HGRAPH";
       break;
@@ -1092,7 +1127,8 @@ int ObVectorIndexParam::print_to_string(char *buf, int64_t buf_len, int64_t &pos
     if (OB_FAIL(print_hnsw_params(buf, buf_len, pos))) {
       LOG_WARN("fail to print hnsw params", K(ret));
     }
-  } else if (ObVectorIndexUtil::is_ivf_index_type(type_)) {
+  } else if (ObVectorIndexUtil::is_ivf_index_type(type_)
+      || type_ == ObVectorIndexAlgorithmType::VIAT_DISK_BBQ) {
     if (OB_FAIL(print_ivf_params(buf, buf_len, pos))) {
       LOG_WARN("fail to print ivf params", K(ret));
     }
@@ -1161,8 +1197,15 @@ int ObVectorIndexParam::print_ivf_params(char *buf, int64_t buf_len, int64_t &po
   PRINT_PARAM("lib=%d,", static_cast<int>(lib_));
   PRINT_PARAM("dist_algorithm=%s,", ObVectorIndexUtil::get_dist_algorithm_str(dist_algorithm_));
   PRINT_PARAM("dim=%ld,", dim_);
-  PRINT_PARAM("nlist=%ld,", nlist_);
-  PRINT_PARAM("sample_per_nlist=%ld,", sample_per_nlist_);
+  if (type_ == ObVectorIndexAlgorithmType::VIAT_DISK_BBQ) {
+    PRINT_PARAM("cluster_size=%ld", cluster_size_);
+    if (refine_k_ != DEFAULT_REFINE_K) {
+      PRINT_PARAM(",refine_k=%f", refine_k_);
+    }
+  } else {
+    PRINT_PARAM("nlist=%ld,", nlist_);
+    PRINT_PARAM("sample_per_nlist=%ld,", sample_per_nlist_);
+  }
   if (type_ == ObVectorIndexAlgorithmType::VIAT_IVF_PQ) {
     PRINT_PARAM("m=%ld,", m_);
     PRINT_PARAM("nbits=%ld,", nbits_);
@@ -1201,14 +1244,21 @@ int ObVectorIndexParam::build_search_param(const ObVectorIndexParam &index_param
                                            ObVectorIndexParam &search_param)
 {
   int ret = OB_SUCCESS;
-  if (OB_FAIL(search_param.assign(index_param))) {
+  if (query_param.is_set_ivf_nprobes_ && 0 == query_param.ivf_nprobes_
+      && ObVectorIndexAlgorithmType::VIAT_DISK_BBQ != index_param.type_) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("automatic nprobes is only supported for DiskBBQ", K(ret), K(index_param), K(query_param));
+  } else if (OB_FAIL(search_param.assign(index_param))) {
     LOG_WARN("fail to parser params from string", K(ret), K(index_param));
   } else {
     if (query_param.is_set_ef_search_) {
       search_param.ef_search_ = query_param.ef_search_;
     }
     if (query_param.is_set_refine_k_) {
-      if (ObVectorIndexAlgorithmType::VIAT_HNSW_BQ != index_param.type_ && ObVectorIndexAlgorithmType::VIAT_IPIVF != index_param.type_ && ObVectorIndexAlgorithmType::VIAT_IPIVF_SQ != index_param.type_) {
+      if (ObVectorIndexAlgorithmType::VIAT_HNSW_BQ != index_param.type_
+          && ObVectorIndexAlgorithmType::VIAT_IPIVF != index_param.type_
+          && ObVectorIndexAlgorithmType::VIAT_IPIVF_SQ != index_param.type_
+          && ObVectorIndexAlgorithmType::VIAT_DISK_BBQ != index_param.type_) {
         ret = OB_NOT_SUPPORTED;
         LOG_WARN("refine_k is not support parameter for current index", K(ret));
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "refine_k parameter for current index is");
@@ -1302,18 +1352,31 @@ int ObVectorIndexUtil::resolve_query_param(
           param.refine_k_ = out_val;
           param.is_set_refine_k_ = 1;
         }
-      } else if (param_name.case_compare("IVF_NPROBES") == 0) {
+      } else if (param_name.case_compare("IVF_NPROBES") == 0
+                 || param_name.case_compare("NPROBES") == 0) {
+        // DiskBBQ uses nprobe=0 (including 0.0) to enable automatic search.
+        // Decimal literals have no integer value_; check their digits without rounding.
+        bool is_zero = T_INT == value_node->type_ && 0 == value_node->value_;
+        if (T_NUMBER == value_node->type_) {
+          const ObString literal(static_cast<int32_t>(value_node->str_len_), value_node->str_value_);
+          is_zero = !literal.empty();
+          for (int64_t j = 0; is_zero && j < literal.length(); ++j) {
+            const char digit = literal.ptr()[j];
+            if ('e' == digit || 'E' == digit) { break; }
+            is_zero = digit < '1' || digit > '9';
+          }
+        }
         if (param.is_set_ivf_nprobes_) {
           ret = OB_ERR_PARAM_DUPLICATE;
           LOG_WARN("duplicate ivf_nprobes param", K(ret), K(i));
         } else if (value_node->type_ != T_INT && value_node->type_ != T_NUMBER) {
           ret = OB_INVALID_ARGUMENT;
           LOG_WARN("invalid query param", K(ret), K(i), K(param_name), K(value_node->type_));
-        } else if (! (value_node->value_ >= 1 && value_node->value_ <= 65536)) {
+        } else if (!((value_node->value_ >= 1 && value_node->value_ <= 65536) || is_zero)) {
           ret = OB_INVALID_ARGUMENT;
           LOG_WARN("invalid query param", K(ret), K(i), K(param_name), K(value_node->type_), K(value_node->value_));
         } else {
-          param.ivf_nprobes_ = value_node->value_;
+          param.ivf_nprobes_ = is_zero ? 0 : value_node->value_;
           param.is_set_ivf_nprobes_ = 1;
         }
       } else if (param_name.case_compare("SIMILARITY") == 0) {
@@ -2343,7 +2406,7 @@ int ObVectorIndexUtil::check_distance_algorithm_match(
         } else if (OB_ISNULL(index_schema)) {
           ret = OB_TABLE_NOT_EXIST;
           LOG_WARN("index table schema should not be null", K(ret), K(simple_index_infos.at(i).table_id_));
-        } else if (!index_schema->is_vec_index()) {  
+        } else if (!index_schema->is_vec_or_async_vec_index()) {
           // skip none vector index 
         } else if (index_schema->is_built_in_vec_index()) {  
           // skip built in vector index table
@@ -2354,7 +2417,7 @@ int ObVectorIndexUtil::check_distance_algorithm_match(
           LOG_WARN("unexpected vector index column cnt, should equal to one", K(ret), K(col_names.count()));
         } else if (ObColumnNameHashWrapper(col_names.at(0)) == ObColumnNameHashWrapper(index_column_name)) {
           ObVectorIndexType index_type = ObVectorIndexType::VIT_MAX;
-          if (index_schema->is_vec_ivf_index()) {
+          if (index_schema->is_vec_ivf_index() || index_schema->is_async_ivf_index()) {
             index_type = ObVectorIndexType::VIT_IVF_INDEX;
           } else if (index_schema->is_vec_hnsw_index()) {
             index_type = ObVectorIndexType::VIT_HNSW_INDEX;
@@ -2485,6 +2548,24 @@ int ObVectorIndexUtil::check_table_has_vector_index(const ObTableSchema &data_ta
   return ret;
 }
 
+int ObVectorIndexUtil::check_table_has_async_ivf_index(
+    const ObTableSchema &data_table_schema,
+    bool &has_async_ivf_index)
+{
+  int ret = OB_SUCCESS;
+  ObSEArray<ObAuxTableMetaInfo, 16> simple_index_infos;
+  has_async_ivf_index = false;
+
+  if (OB_FAIL(data_table_schema.get_simple_index_infos(simple_index_infos))) {
+    LOG_WARN("fail to get simple index infos", K(ret));
+  } else {
+    for (int64_t i = 0; OB_SUCC(ret) && !has_async_ivf_index && i < simple_index_infos.count(); ++i) {
+      has_async_ivf_index = schema::is_async_ivf_index(simple_index_infos.at(i).index_type_);
+    }
+  }
+  return ret;
+}
+
 int ObVectorIndexUtil::check_table_has_vector_of_fts_index(
     const ObTableSchema &data_table_schema, ObSchemaGetterGuard &schema_guard, bool &has_fts_index, bool &has_vec_index)
 {
@@ -2599,7 +2680,18 @@ int ObVectorIndexUtil::check_vector_index_column_id_match(
   is_match = false;
   const int64_t tenant_id = data_table_schema.get_tenant_id();
 
-  if (!index_table_schema.is_vec_index()) {  
+  if (index_table_schema.is_async_ivf_index()) {
+    const ObColumnSchemaV2 *source_column = nullptr;
+    if (OB_FAIL(ObIndexBuilderUtil::get_async_ivf_source_column(
+        data_table_schema, index_table_schema, source_column))) {
+      LOG_WARN("failed to get async IVF source column", K(ret), K(index_table_schema));
+    } else if (OB_ISNULL(source_column)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("async IVF source column is null", K(ret), K(index_table_schema));
+    } else {
+      is_match = source_column->get_column_id() == col_id;
+    }
+  } else if (!index_table_schema.is_vec_index()) {
     // skip none vector index 
   } else {  
     // handle delta_buffer_table index table
@@ -2662,10 +2754,10 @@ int ObVectorIndexUtil::check_vector_index_match(
   } else if (OB_ISNULL(index_schema)) {
     ret = OB_TABLE_NOT_EXIST;
     LOG_WARN("fail to get index table schema", K(ret), K(vec_index_tid));
-  } else if (!index_schema->is_vec_domain_index()) {
+  } else if (!index_schema->is_vec_domain_index() && !index_schema->is_async_ivf_index()) {
     // only check domain index.
   } else {
-    if (index_schema->is_vec_ivf_index()) {
+    if (index_schema->is_vec_ivf_index() || index_schema->is_async_ivf_index()) {
       index_type = ObVectorIndexType::VIT_IVF_INDEX;
     } else if (index_schema->is_vec_hnsw_index()) {
       index_type = ObVectorIndexType::VIT_HNSW_INDEX;
@@ -2751,7 +2843,7 @@ int ObVectorIndexUtil::check_column_has_vector_index(
       } else if (OB_ISNULL(index_table_schema)) {
         ret = OB_TABLE_NOT_EXIST;
         LOG_WARN("index table schema should not be null", K(ret), K(simple_index_infos.at(i).table_id_));
-      } else if (!index_table_schema->is_vec_index()) {
+      } else if (!index_table_schema->is_vec_or_async_vec_index()) {
         // skip none vector index
       } else if (index_table_schema->is_built_in_vec_index()) {
         // skip built in vector index table
@@ -2802,7 +2894,18 @@ int ObVectorIndexUtil::get_vector_index_column_id(
 {
   INIT_SUCC(ret);
   col_ids.reset();
-  if (!index_table_schema.is_vec_index()) {  
+  if (index_table_schema.is_async_ivf_index()) {
+    const ObColumnSchemaV2 *source_column = nullptr;
+    if (OB_FAIL(ObIndexBuilderUtil::get_async_ivf_source_column(
+        data_table_schema, index_table_schema, source_column))) {
+      LOG_WARN("failed to get async IVF source column", K(ret), K(index_table_schema));
+    } else if (OB_ISNULL(source_column)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("async IVF source column is null", K(ret), K(index_table_schema));
+    } else if (OB_FAIL(col_ids.push_back(source_column->get_column_id()))) {
+      LOG_WARN("failed to add async IVF source column id", K(ret), KPC(source_column));
+    }
+  } else if (!index_table_schema.is_vec_index()) {
     // skip none vector index 
   } else if (index_table_schema.is_vec_rowkey_vid_type() || index_table_schema.is_vec_vid_rowkey_type()) {  
     // skip rowkey_vid and vid_rowkey table
@@ -3533,12 +3636,13 @@ int ObVectorIndexUtil::get_matched_vector_index_tid(
       } else if (OB_ISNULL(index_table_schema)) {
         ret = OB_TABLE_NOT_EXIST;
         LOG_WARN("index table schema should not be null", K(ret), K(simple_index_infos.at(i).table_id_));
-      } else if (!index_table_schema->is_vec_domain_index()) {
+      } else if (!index_table_schema->is_vec_domain_index() &&
+                 !index_table_schema->is_async_ivf_index()) {
       } else if (OB_FAIL(ObVectorIndexUtil::get_vector_index_column_id(data_table_schema, *index_table_schema, index_column_id))) {
         LOG_WARN("failed to get vector index coolumn id", K(ret));
       } else if (index_column_id.empty() || index_column_id.at(0) != col_id) {
       } else {
-        if (index_table_schema->is_vec_ivf_index()) {
+        if (index_table_schema->is_vec_ivf_index() || index_table_schema->is_async_ivf_index()) {
           index_type = ObVectorIndexType::VIT_IVF_INDEX;
         } else if (index_table_schema->is_vec_hnsw_index()) {
           index_type = ObVectorIndexType::VIT_HNSW_INDEX;
@@ -3548,14 +3652,21 @@ int ObVectorIndexUtil::get_matched_vector_index_tid(
         if (OB_FAIL(parser_params_from_string(index_table_schema->get_index_params(), index_type, index_param))) {
           LOG_WARN("fail to parser params from string", K(ret), K(index_table_schema->get_index_params()));
         } else if (is_expr_type_and_distance_algorithm_match(expr_type, index_param.dist_algorithm_)) {
-          ObString index_prefix;
-          bool is_valid = false;
-          if (OB_FAIL(ObPluginVectorIndexUtils::get_vector_index_prefix(*index_table_schema, index_prefix))) {
-            LOG_WARN("failed to get index prefix", K(ret));
-          } else if (OB_FAIL(check_vector_index_by_index_prefix(schema_guard, data_table_schema, index_prefix, is_valid))) {
-            LOG_WARN("failed to check vector index by index prefix", K(ret));
-          } else if (is_valid) {
-            tid = simple_index_infos.at(i).table_id_;
+          if (index_table_schema->is_async_ivf_index()) { // Only need to check the async IVF index itself.
+            if (index_table_schema->can_read_index() && index_table_schema->is_index_visible()) {
+              tid = simple_index_infos.at(i).table_id_;
+            }
+          } else {
+            ObString index_prefix;
+            bool is_valid = false;
+            if (OB_FAIL(ObPluginVectorIndexUtils::get_vector_index_prefix(*index_table_schema, index_prefix))) {
+              LOG_WARN("failed to get index prefix", K(ret));
+            } else if (OB_FAIL(check_vector_index_by_index_prefix(
+                schema_guard, data_table_schema, index_prefix, is_valid))) {
+              LOG_WARN("failed to check vector index by index prefix", K(ret));
+            } else if (is_valid) {
+              tid = simple_index_infos.at(i).table_id_;
+            }
           }
         }
       }
@@ -4172,6 +4283,7 @@ int ObVectorIndexUtil::check_vec_index_param(
     int64_t vector_dim = 0;
     bool is_sparse_vec_col = false;
     bool is_text_col = false;
+    bool is_data_table_column_store = false;
     uint64_t tenant_data_version = 0;
     const ObColumnSchemaV2 *col_schema = nullptr;
     bool has_string_lob_in_key = false;
@@ -4199,13 +4311,8 @@ int ObVectorIndexUtil::check_vec_index_param(
     }
 
     if (OB_SUCC(ret)) {
-      bool is_data_table_column_store = false;
       if (OB_FAIL(tbl_schema.get_is_column_store(is_data_table_column_store))) {
         LOG_WARN("fail to get is column store", K(ret), K(tbl_schema));
-      } else if (is_data_table_column_store) {
-        ret = OB_NOT_SUPPORTED;
-        LOG_WARN("create vector index on table with column store not supported", K(ret), K(tbl_schema));
-        LOG_USER_ERROR(OB_NOT_SUPPORTED, "create vector index on table with column store is");
       }
     }
 
@@ -4221,6 +4328,12 @@ int ObVectorIndexUtil::check_vec_index_param(
         LOG_WARN("write string failed", K(ret), K(tmp_str), K(index_params));
       } else if (OB_FAIL(check_index_param(option_node, allocator, vector_dim, is_sparse_vec_col, is_text_col, index_params, vec_index_type, tbl_schema, session_info))) {
         LOG_WARN("fail to check vector index definition", K(ret));
+      } else if (is_data_table_column_store && !share::schema::is_async_ivf_index(vec_index_type)) {
+        // DISK_BBQ reads the heap table through the storage row interface;
+        // synchronous vector indexes retain their column-store restriction.
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("create vector index on table with column store not supported", K(ret), K(tbl_schema));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "create vector index on table with column store is");
       } else if (is_text_col && !share::schema::is_hybrid_vec_index_log_type(vec_index_type)) {
         ret = OB_NOT_SUPPORTED;
         LOG_WARN("not support hybrid vector index when endpoint and dim is empty", K(ret));
@@ -4584,6 +4697,7 @@ int ObVectorIndexUtil::check_index_param(
     int64_t sample_per_nlist_value = 0;
     int64_t extra_info_max_size = 0;
     int64_t nlist_value = 0;
+    int64_t cluster_size_value = 0;
     int64_t nbits_value = 0;
     int64_t sync_interval_value = 0;
     int64_t dim_value = 0;
@@ -4603,6 +4717,7 @@ int ObVectorIndexUtil::check_index_param(
     bool extra_info_max_size_is_set = false; // hnsw
     bool nlist_is_set = false;          // ivf
     bool sample_per_nlist_is_set = false; // ivf
+    bool cluster_size_is_set = false;   // disk bbq
     bool nbits_is_set = false;          // ivf
     bool endpoint_is_set = false;       // hybrid search
     bool content_type_is_set = false;   // hybrid search
@@ -4613,10 +4728,11 @@ int ObVectorIndexUtil::check_index_param(
     bool type_ivf_flat_is_set = false;  // ivf
     bool type_ivf_sq8_is_set = false;   // ivf
     bool type_ivf_pq_is_set = false;    // ivf
+    bool type_disk_bbq_is_set = false; // async ivf
     bool type_hnsw_bq_is_set = false;   // hnsw_bq
     bool type_hybrid_vec_is_set = false; // hybrid search
     bool refine_type_is_set = false; // hnsw_bq
-    bool refine_k_is_set = false;    // hnsw_bq
+    bool refine_k_is_set = false;    // hnsw_bq / sindi / disk bbq
     bool bq_use_fht_is_set = false;    // hnsw_bq
     bool bq_bits_query_set = false;    // hnsw_bq
     bool type_sindi_is_set = false; // sparse index with vsag
@@ -4667,6 +4783,7 @@ int ObVectorIndexUtil::check_index_param(
                    new_variable_name != "EF_SEARCH" &&
                    new_variable_name != "NLIST" &&
                    new_variable_name != "SAMPLE_PER_NLIST" &&
+                   new_variable_name != "CLUSTER_SIZE" &&
                    new_variable_name != "EXTRA_INFO_MAX_SIZE" &&
                    new_variable_name != "NBITS" &&
                    new_variable_name != "MODEL" &&
@@ -4767,6 +4884,8 @@ int ObVectorIndexUtil::check_index_param(
             type_ivf_sq8_is_set = true;
           } else if (new_parser_name == "IVF_PQ") {
             type_ivf_pq_is_set = true;
+          } else if (new_parser_name == "DISK_BBQ") {
+            type_disk_bbq_is_set = true;
           } else if (new_parser_name == "HNSW_BQ") {
             type_hnsw_is_set = true;
             type_hnsw_bq_is_set = true;
@@ -4815,6 +4934,16 @@ int ObVectorIndexUtil::check_index_param(
             ret = OB_NOT_SUPPORTED;
             LOG_WARN("invalid vector index sample_per_nlist value", K(ret), K(parser_value));
             LOG_USER_ERROR(OB_NOT_SUPPORTED, "this value of vector index sample_per_nlist is");
+          }
+        } else if (last_variable == "CLUSTER_SIZE") {
+          if (parser_value >= ObVectorIndexParam::MIN_DISK_BBQ_CLUSTER_SIZE
+              && parser_value <= ObVectorIndexParam::MAX_DISK_BBQ_CLUSTER_SIZE) {
+            cluster_size_is_set = true;
+            cluster_size_value = parser_value;
+          } else {
+            ret = OB_NOT_SUPPORTED;
+            LOG_WARN("invalid DISK_BBQ cluster_size value", K(ret), K(parser_value));
+            LOG_USER_ERROR(OB_NOT_SUPPORTED, "this value of DISK_BBQ cluster_size is");
           }
         } else if (last_variable == "EXTRA_INFO_MAX_SIZE") {
           if (parser_value >= 0 && parser_value <= ObVecExtraInfo::EXTRA_INFO_PARAM_MAX_VALUE) {
@@ -5061,6 +5190,38 @@ int ObVectorIndexUtil::check_index_param(
       }
     }
 
+    if (OB_SUCC(ret) && type_disk_bbq_is_set
+        && (m_is_set
+            || ef_construction_is_set
+            || ef_search_is_set
+            || extra_info_max_size_is_set
+            || nlist_is_set
+            || sample_per_nlist_is_set
+            || nbits_is_set
+            || endpoint_is_set
+            || content_type_is_set
+            || sync_mode_is_set
+            || sync_interval_is_set
+            || dim_is_set
+            || refine_type_is_set
+            || bq_use_fht_is_set
+            || bq_bits_query_set
+            || prune_is_set
+            || refine_is_set
+            || drop_ratio_build_is_set
+            || drop_ratio_search_is_set
+            || fresh_mode_is_set)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("parameter is not supported for DISK_BBQ index", K(ret));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "parameter for DISK_BBQ index is");
+    }
+
+    if (OB_SUCC(ret) && cluster_size_is_set && !type_disk_bbq_is_set) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("cluster_size is only supported for DISK_BBQ index", K(ret));
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "cluster_size for non-DISK_BBQ index is");
+    }
+
     if (OB_SUCC(ret) && type_sindi_is_set) {
       if (tenant_data_version < DATA_VERSION_4_5_0_0) {
         ret = OB_NOT_SUPPORTED;
@@ -5078,7 +5239,7 @@ int ObVectorIndexUtil::check_index_param(
     }
 
     if (OB_SUCC(ret) && ! type_hnsw_bq_is_set 
-        && (refine_type_is_set || (refine_k_is_set && (!type_sindi_is_set && !type_sindi_sq_is_set))
+        && (refine_type_is_set || (refine_k_is_set && (!type_sindi_is_set && !type_sindi_sq_is_set && !type_disk_bbq_is_set))
             || bq_use_fht_is_set || bq_bits_query_set)) {
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("not support parameter for current index", K(ret),
@@ -5123,7 +5284,8 @@ int ObVectorIndexUtil::check_index_param(
     }
     if (OB_FAIL(ret)) {
     } else if (!is_sparse_vec) {
-      bool ivf_is_set = type_ivf_sq8_is_set || type_ivf_pq_is_set || type_ivf_flat_is_set;
+      bool ivf_is_set = type_ivf_sq8_is_set || type_ivf_pq_is_set
+                        || type_ivf_flat_is_set || type_disk_bbq_is_set;
       bool hnsw_is_set = type_hnsw_is_set;
       type_hybrid_vec_is_set = is_text_col && endpoint_is_set && dim_is_set && hnsw_is_set;
       if (!distance_is_set || !(ivf_is_set || hnsw_is_set)) {
@@ -5176,15 +5338,23 @@ int ObVectorIndexUtil::check_index_param(
             K(ret), K(endpoint_is_set), K(content_type_is_set), K(sync_mode_is_set), K(sync_interval_is_set));
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "ivf vector index setting model or sync_mode or sync_interval is");
         }
-        nlist_value = nlist_is_set ? nlist_value : default_nlist_value;
-        sample_per_nlist_value = sample_per_nlist_is_set ? sample_per_nlist_value : default_sample_per_nlist_value;
+        if (type_disk_bbq_is_set) {
+          cluster_size_value = cluster_size_is_set
+              ? cluster_size_value
+              : ObVectorIndexParam::DEFAULT_DISK_BBQ_CLUSTER_SIZE;
+        } else {
+          nlist_value = nlist_is_set ? nlist_value : default_nlist_value;
+          sample_per_nlist_value = sample_per_nlist_is_set ? sample_per_nlist_value : default_sample_per_nlist_value;
+        }
         nbits_value = nbits_is_set ? nbits_value : default_nbits_value;
         if (OB_FAIL(ret)) {
-        } else if (INT64_MAX / sample_per_nlist_value < nlist_value) {
+        } else if (!type_disk_bbq_is_set
+                   && INT64_MAX / sample_per_nlist_value < nlist_value) {
           ret = OB_NOT_SUPPORTED;
           LOG_WARN("ivf vector index param nlist_value * sample_per_nlist_value should less than int64_max", K(ret), K(nlist_value), K(sample_per_nlist_value));
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "ivf vector index param nlist_value * sample_per_nlist_value should less than int64_max");
-        } else if (INT64_MAX / sample_per_nlist_value < (1L << nbits_value)) {
+        } else if (!type_disk_bbq_is_set
+                   && INT64_MAX / sample_per_nlist_value < (1L << nbits_value)) {
            ret = OB_NOT_SUPPORTED;
           LOG_WARN("ivf vector index param (1L << nbits_value) * sample_per_nlist_value should less than int64_max", K(ret), K(nbits_value), K(sample_per_nlist_value));
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "ivf vector index param (1L << nbits_value) * sample_per_nlist_value should less than int64_max");
@@ -5242,13 +5412,17 @@ int ObVectorIndexUtil::check_index_param(
                    OB_FAIL(databuff_printf(not_set_params_str, OB_MAX_TABLE_NAME_LENGTH, pos, 
                                            ", EF_SEARCH=%ld", default_ef_search_value))) {
           LOG_WARN("fail to printf databuff", K(ret));
-        } else if (!nlist_is_set && !hnsw_is_set && 
+        } else if (!nlist_is_set && !hnsw_is_set && !type_disk_bbq_is_set &&
                    OB_FAIL(databuff_printf(not_set_params_str, OB_MAX_TABLE_NAME_LENGTH, pos, 
                                            ", NLIST=%ld", default_nlist_value))) {
           LOG_WARN("fail to printf databuff", K(ret));
-        } else if (!sample_per_nlist_is_set && !hnsw_is_set && 
+        } else if (!sample_per_nlist_is_set && !hnsw_is_set && !type_disk_bbq_is_set &&
                    OB_FAIL(databuff_printf(not_set_params_str, OB_MAX_TABLE_NAME_LENGTH, pos, 
                                            ", SAMPLE_PER_NLIST=%ld", default_sample_per_nlist_value))) {
+          LOG_WARN("fail to printf databuff", K(ret));
+        } else if (!cluster_size_is_set && type_disk_bbq_is_set
+                   && OB_FAIL(databuff_printf(not_set_params_str, OB_MAX_TABLE_NAME_LENGTH, pos,
+                                              ", CLUSTER_SIZE=%ld", cluster_size_value))) {
           LOG_WARN("fail to printf databuff", K(ret));
         } else if (!nbits_is_set && type_ivf_pq_is_set && 
                    OB_FAIL(databuff_printf(not_set_params_str, OB_MAX_TABLE_NAME_LENGTH, pos, 
@@ -5358,6 +5532,8 @@ int ObVectorIndexUtil::check_index_param(
       out_index_type = INDEX_TYPE_VEC_IVFSQ8_CENTROID_LOCAL;
     } else if (type_ivf_pq_is_set) {
       out_index_type = INDEX_TYPE_VEC_IVFPQ_CENTROID_LOCAL;
+    } else if (type_disk_bbq_is_set) {
+      out_index_type = INDEX_TYPE_ASYNC_IVF_INDEX_LOCAL;
     } else {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected vec index type is set", K(ret));
@@ -7121,7 +7297,18 @@ int ObVectorIndexUtil::get_vector_index_column_name(
   INIT_SUCC(ret);
   col_names.reset();
   bool has_get_column_name = false;
-  if (!index_table_schema.is_vec_index()) {  
+  if (index_table_schema.is_async_ivf_index()) {
+    const ObColumnSchemaV2 *source_column = nullptr;
+    if (OB_FAIL(ObIndexBuilderUtil::get_async_ivf_source_column(
+        data_table_schema, index_table_schema, source_column))) {
+      LOG_WARN("failed to get async IVF source column", K(ret), K(index_table_schema));
+    } else if (OB_ISNULL(source_column)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("async IVF source column is null", K(ret), K(index_table_schema));
+    } else if (OB_FAIL(col_names.push_back(source_column->get_column_name_str()))) {
+      LOG_WARN("failed to add async IVF source column name", K(ret), KPC(source_column));
+    }
+  } else if (!index_table_schema.is_vec_index()) {
     // skip none vector index 
   } else if (index_table_schema.is_vec_rowkey_vid_type() || index_table_schema.is_vec_vid_rowkey_type()) {  
     // skip rowkey_vid and vid_rowkey table
@@ -7590,6 +7777,7 @@ int ObVectorIndexUtil::calc_residual_vector_by_use_hgraph(
   int64_t center_idx = 0;
   float *center_vec = nullptr;
   float *norm_vector = nullptr;
+  ObVsagSearchAlloc hgraph_allocator(MTL_ID());
   
   if (OB_ISNULL(vector) || dim <= 0) {
     ret = OB_INVALID_ARGUMENT;
@@ -7614,9 +7802,11 @@ int ObVectorIndexUtil::calc_residual_vector_by_use_hgraph(
     
     float *data = norm_vector == nullptr ? const_cast<float*>(vector) : norm_vector;
     if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(ObVectorIndexUtil::get_nearest_center_with_hgraph(data, cent_cache, center_idx))) {
+    } else if (OB_FAIL(ObVectorIndexUtil::get_nearest_center_with_hgraph(
+                   data, cent_cache, center_idx, &hgraph_allocator))) {
       LOG_WARN("failed to get nearest center with hgraph", K(ret));
-    } else if (OB_FAIL(cent_cache->read_centroid(center_idx, center_vec, true /*deep_copy*/, &allocator))) {
+    } else if (OB_FAIL(cent_cache->read_centroid_from_hgraph(
+                   center_idx, center_vec, hgraph_allocator))) {
       LOG_WARN("failed to read centroid from cache", K(ret), K(center_idx));
     } else if (OB_FAIL(calc_residual_vector(allocator, dim, data, center_vec, residual_vec))) {
       LOG_WARN("fail to calc residual vector", K(ret), K(dim));
@@ -7833,10 +8023,10 @@ int ObVectorIndexUtil::get_ivf_centers_cache(bool is_vectorized,
 int ObVectorIndexUtil::get_nearest_center_with_hgraph(
   const float *vector,
   ObIvfICache *hgraph_cache,
-  int64_t &center_idx)
+  int64_t &center_idx,
+  vsag::Allocator *allocator)
 {
   int ret = OB_SUCCESS;
-  ObVsagSearchAlloc temp_allocator(MTL_ID());
   center_idx = 0;
   int64_t dim = 0;
 
@@ -7878,7 +8068,7 @@ int ObVectorIndexUtil::get_nearest_center_with_hgraph(
           false,   // reverse_filter
           false,   // use_extra_info_filter
           1.0f,    // valid_ratio
-          &temp_allocator,
+          allocator,
           false))) { // need_extra_info
         LOG_WARN("HGraph knn search failed", K(ret));
       } else if (result_size <= 0 || OB_ISNULL(result_ids)) {
@@ -9143,7 +9333,7 @@ int ObVectorIndexUtil::set_adaptive_try_path(ObVecIdxExtraInfo& vc_info,
       }
     }
   } else if (vc_info.adaptive_try_path_ == ObVecIdxAdaTryPath::VEC_PATH_UNCHOSEN) {
-    if (vc_info.is_ivf_vec_scan()) {
+    if (vc_info.is_ivf_or_async_ivf_scan()) {
       if (output_row_count <= ObVecIdxExtraInfo::MAX_IVF_BRUTE_FORCE_SIZE) {
         vc_info.adaptive_try_path_ = ObVecIdxAdaTryPath::VEC_INDEX_PRE_FILTER;
       } else if (vc_info.can_use_vec_pri_opt()) {
@@ -9227,6 +9417,12 @@ int ObVecIdxExtraInfo::set_vec_param_info(const ObTableSchema *vec_index_schema)
       case ObIndexType::INDEX_TYPE_VEC_IVFPQ_CODE_LOCAL:
       case ObIndexType::INDEX_TYPE_VEC_IVFPQ_ROWKEY_CID_LOCAL: {
         vector_index_param_.type_  = ObVectorIndexAlgorithmType::VIAT_IVF_PQ;
+        vec_type = ObVectorIndexType::VIT_IVF_INDEX;
+        break;
+      }
+      case ObIndexType::INDEX_TYPE_ASYNC_IVF_INDEX_LOCAL: {
+        is_async_index_ = true;
+        vector_index_param_.type_ = ObVectorIndexAlgorithmType::VIAT_DISK_BBQ;
         vec_type = ObVectorIndexType::VIT_IVF_INDEX;
         break;
       }

@@ -6263,7 +6263,8 @@ int ObTablet::build_migration_sstable_param(
       }
     }
 
-    if (sstable.is_co_sstable()) {
+    if (OB_FAIL(ret)) {
+    } else if (sstable.is_co_sstable()) {
       const ObCOSSTableV2 &co_sstable = static_cast<const ObCOSSTableV2 &>(sstable);
       mig_sstable_param.column_group_cnt_ = co_sstable.get_cs_meta().column_group_cnt_;
       mig_sstable_param.full_column_cnt_ = co_sstable.get_cs_meta().full_column_cnt_;
@@ -6274,6 +6275,9 @@ int ObTablet::build_migration_sstable_param(
     } else if (sstable.is_inv_sstable()) {
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("not supported to build migration param for inverted index sstable", K(ret), K(sstable));
+    } else if (sstable.is_ivf_sstable()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("not supported to build migration param for ivf sstable", K(ret), K(sstable));
     }
 
     for (int64_t i = 0; OB_SUCC(ret) && i < sstable_meta.get_col_checksum_cnt(); ++i) {
@@ -6402,6 +6406,9 @@ int ObTablet::build_migration_sstable_param(
     } else if (sstable.is_inv_sstable()) {
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("not supported to build migration param for inverted index sstable", K(ret), K(sstable));
+    } else if (sstable.is_ivf_sstable()) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_WARN("not supported to build migration param for ivf sstable", K(ret), K(sstable));
     }
 
     for (int64_t i = 0; OB_SUCC(ret) && i < sstable_meta.get_col_checksum_cnt(); ++i) {
@@ -6789,7 +6796,7 @@ int ObTablet::get_async_index_snapshot_source(
     }
   }
   while (OB_SUCC(ret)) {
-    if (source_tablet->is_async_inverted_storage_index()) {
+    if (source_tablet->is_async_index_storage_tablet()) {
       // A future major target must exceed the installed major, even when it
       // precedes the common checkpoint. Protect it before medium registration.
       const int64_t last_major = source_tablet->get_last_major_snapshot_version();
@@ -7809,7 +7816,7 @@ int ObTablet::get_async_inv_bm25_stats(
   } else if (OB_UNLIKELY(!read_snapshot.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(read_snapshot));
-  } else if (OB_UNLIKELY(!is_async_inverted_storage_index())) {
+  } else if (OB_UNLIKELY(!is_async_index_storage_tablet())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("tablet is not async index tablet", K(ret), K(get_tablet_id()));
   } else if (OB_FAIL(fetch_table_store(table_store_wrapper))) {

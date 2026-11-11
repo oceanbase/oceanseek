@@ -8,6 +8,7 @@
 #include "ob_fts_index_builder_util.h"
 #include "ob_vec_index_builder_util.h"
 #include "search_index/ob_search_index_builder_util.h"
+#include "vector_index/ob_vector_index_util.h"
 #include "lib/utility/ob_tracepoint.h"
 
 #include "sql/resolver/ddl/ob_ddl_resolver.h"
@@ -47,8 +48,10 @@ int ObIndexBuilderUtil::check_async_index_name(const ObString &index_name)
   int ret = OB_SUCCESS;
   if (index_name.case_compare_equal(ASYNC_DELETE_INDEX_NAME)) {
     ret = OB_ERR_KEY_NAME_DUPLICATE;
-    LOG_USER_ERROR(OB_ERR_KEY_NAME_DUPLICATE, index_name.length(), index_name.ptr());
-    LOG_WARN("index name conflicts with async index internal table name", K(ret), K(index_name));
+    LOG_USER_ERROR(OB_ERR_KEY_NAME_DUPLICATE,
+                   index_name.length(), index_name.ptr());
+    LOG_WARN("user async index name conflicts with the shared delete index",
+             K(ret), K(index_name));
   }
   return ret;
 }
@@ -58,22 +61,133 @@ int ObIndexBuilderUtil::generate_async_delete_index_name(
     ObIAllocator *allocator)
 {
   int ret = OB_SUCCESS;
+  char *name_buf = nullptr;
   if (OB_ISNULL(allocator)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("allocator is nullptr", K(ret));
-  } else if (!is_async_delete_index(arg.index_type_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("allocator is null", K(ret));
+  } else if (OB_UNLIKELY(!is_async_delete_index(arg.index_type_))) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid async delete index type", K(ret), K(arg.index_type_));
-  } else if (OB_FAIL(ob_write_string(
-      *allocator, ObString::make_string(ASYNC_DELETE_INDEX_NAME), arg.index_name_))) {
-    LOG_WARN("failed to write async delete index name", K(ret));
+  } else if (OB_ISNULL(name_buf = static_cast<char *>(allocator->alloc(OB_MAX_TABLE_NAME_LENGTH)))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("fail to allocate async delete index name", K(ret));
+  } else {
+    int64_t pos = 0;
+    if (OB_FAIL(databuff_printf(name_buf, OB_MAX_TABLE_NAME_LENGTH, pos,
+                               ASYNC_DELETE_INDEX_NAME))) {
+      LOG_WARN("fail to build async delete index name", K(ret));
+    } else {
+      arg.index_name_.assign_ptr(name_buf, static_cast<int32_t>(pos));
+    }
+  }
+  return ret;
+}
+
+int ObIndexBuilderUtil::normalize_async_delete_index_arg(
+    ObCreateIndexArg &arg,
+    ObIAllocator *allocator)
+{
+  int ret = OB_SUCCESS;
+  ObColumnSortItem pk_sort_item;
+  static const char PK_INCREMENT_COL_NAME[] = "__pk_increment";
+  if (OB_ISNULL(allocator)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("allocator is null", K(ret));
+  } else if (OB_UNLIKELY(!is_user_defined_async_index(arg.index_type_)
+                         && !is_async_search_def_index(arg.index_type_))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid user async index type", K(ret), K(arg.index_type_));
+  } else if (FALSE_IT(arg.index_columns_.reuse())) {
+  } else if (FALSE_IT(arg.store_columns_.reuse())) {
+  } else if (FALSE_IT(arg.hidden_store_columns_.reuse())) {
+  } else if (FALSE_IT(arg.index_type_ = INDEX_TYPE_ASYNC_DELETE_INDEX_LOCAL)) {
+  } else if (FALSE_IT(arg.index_option_.parser_name_.reset())) {
+  } else if (OB_FAIL(ob_write_string(*allocator,
+                                     ObString::make_string(PK_INCREMENT_COL_NAME),
+                                     pk_sort_item.column_name_))) {
+    LOG_WARN("failed to write pk increment column name", K(ret));
+  } else if (OB_FAIL(arg.index_columns_.push_back(pk_sort_item))) {
+    LOG_WARN("failed to push back pk increment column", K(ret));
+  } else if (OB_FAIL(generate_async_delete_index_name(arg, allocator))) {
+    LOG_WARN("failed to generate shared async delete index name", K(ret));
+  }
+  return ret;
+}
+
+int ObIndexBuilderUtil::get_async_ivf_source_column(
+    const ObTableSchema &data_schema,
+    const ObTableSchema &index_schema,
+    const ObColumnSchemaV2 *&source_column)
+{
+  int ret = OB_SUCCESS;
+  bool is_sparse_vector = false;
+  const ObColumnSchemaV2 *generated_data_column = nullptr;
+  ObSEArray<uint64_t, 1> cascaded_column_ids;
+  source_column = nullptr;
+  if (OB_UNLIKELY(!is_async_ivf_index(index_schema.get_index_type()))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("not an async IVF index schema", K(ret), K(index_schema));
+  } else {
+    for (ObTableSchema::const_column_iterator it = data_schema.column_begin();
+         OB_SUCC(ret) && it != data_schema.column_end(); ++it) {
+      const ObColumnSchemaV2 *column = *it;
+      const ObColumnSchemaV2 *physical_column = nullptr;
+      if (OB_ISNULL(column)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("null data-table column while resolving async IVF source", K(ret), K(data_schema));
+      } else if (!column->is_virtual_generated_column()
+                 || !column->is_vec_ivf_data_column()) {
+      } else if (OB_ISNULL(physical_column =
+                     index_schema.get_column_schema(column->get_column_id()))) {
+        // The data table can own generated columns for multiple async IVF indexes.
+      } else if (OB_UNLIKELY(physical_column->is_virtual_generated_column()
+                             || physical_column->get_column_name_str()
+                                    != column->get_column_name_str())) {
+        ret = OB_SCHEMA_ERROR;
+        LOG_WARN("invalid async IVF physical data column", K(ret),
+                 KPC(column), KPC(physical_column), K(index_schema));
+      } else if (OB_NOT_NULL(generated_data_column)) {
+        ret = OB_SCHEMA_ERROR;
+        LOG_WARN("multiple async IVF data columns match the index schema",
+                 K(ret), K(index_schema));
+      } else {
+        generated_data_column = column;
+      }
+    }
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_ISNULL(generated_data_column)) {
+    ret = OB_SCHEMA_ERROR;
+    LOG_WARN("async IVF generated data column not found", K(ret),
+             K(data_schema), K(index_schema));
+  } else if (OB_FAIL(generated_data_column->get_cascaded_column_ids(cascaded_column_ids))) {
+    LOG_WARN("failed to get async IVF source column id", K(ret), KPC(generated_data_column));
+  } else if (OB_UNLIKELY(1 != cascaded_column_ids.count())) {
+    ret = OB_SCHEMA_ERROR;
+    LOG_WARN("async IVF data-column dependency is invalid", K(ret),
+             K(cascaded_column_ids), K(index_schema));
+  } else if (OB_ISNULL(source_column =
+      data_schema.get_column_schema(cascaded_column_ids.at(0)))) {
+    ret = OB_SCHEMA_ERROR;
+    LOG_WARN("async IVF source column not found in data table", K(ret),
+             K(cascaded_column_ids), K(data_schema));
+  } else if (OB_UNLIKELY(!ob_is_collection_sql_type(source_column->get_data_type()))) {
+    ret = OB_SCHEMA_ERROR;
+    LOG_WARN("async IVF source column is not a dense vector", K(ret), KPC(source_column));
+  } else if (OB_FAIL(ObVectorIndexUtil::is_sparse_vec_col(
+      source_column->get_extended_type_info(), is_sparse_vector))) {
+    LOG_WARN("failed to inspect async IVF source vector type", K(ret), KPC(source_column));
+  } else if (OB_UNLIKELY(is_sparse_vector)) {
+    ret = OB_SCHEMA_ERROR;
+    LOG_WARN("async IVF source column must be dense vector", K(ret), KPC(source_column));
   }
   return ret;
 }
 
 bool ObIndexBuilderUtil::is_do_create_dense_vec_index(const ObIndexType index_type) 
 {
-  return share::schema::is_vec_index(index_type) && !share::schema::is_built_in_vec_spiv_index(index_type);
+  return share::schema::is_vec_or_async_vec_index(index_type)
+         && !share::schema::is_built_in_vec_spiv_index(index_type);
 }
 
 void ObIndexBuilderUtil::del_column_flags_and_default_value(ObColumnSchemaV2 &column)
@@ -863,7 +977,8 @@ int ObIndexBuilderUtil::adjust_expr_index_args(
     } else if (OB_FAIL(gen_columns.push_back(spatial_cols.at(1)))) {
       LOG_WARN("push back mbr column to gen columns failed", K(ret));
     }
-  } else if (ObIndexBuilderUtil::is_do_create_dense_vec_index(arg.index_type_) || is_vec_spiv_index_aux(arg.index_type_)) {
+  } else if (ObIndexBuilderUtil::is_do_create_dense_vec_index(arg.index_type_)
+             || is_vec_spiv_index_aux(arg.index_type_)) {
     if (OB_FAIL(ObVecIndexBuilderUtil::check_vec_index_allowed(arg.index_type_, data_schema))) {
       LOG_WARN("fail to check vector index allowed", K(ret));
     } else if (OB_FAIL(ObVecIndexBuilderUtil::adjust_vec_args(arg, data_schema, allocator, gen_columns))) {
@@ -1584,6 +1699,25 @@ int ObIndexBuilderUtil::check_index_for_if_not_exist(const uint64_t tenant_id, c
   return ret;
 }
 
+int ObIndexBuilderUtil::check_column_match_async_ivf_index(
+    const share::schema::ObTableSchema &data_table_schema,
+    const share::schema::ObTableSchema &index_table_schema,
+    const int64_t col_id,
+    bool &is_match)
+{
+  int ret = OB_SUCCESS;
+  const ObColumnSchemaV2 *source_column = nullptr;
+  is_match = false;
+  if (OB_FAIL(get_async_ivf_source_column(
+      data_table_schema, index_table_schema, source_column))) {
+    LOG_WARN("failed to resolve async IVF source column", K(ret),
+             K(index_table_schema));
+  } else {
+    is_match = source_column->get_column_id() == static_cast<uint64_t>(col_id);
+  }
+  return ret;
+}
+
 int ObIndexBuilderUtil::check_column_has_async_index(
     const share::schema::ObTableSchema &table_schema,
     share::schema::ObSchemaGetterGuard &schema_guard,
@@ -1601,8 +1735,10 @@ int ObIndexBuilderUtil::check_column_has_async_index(
       const ObTableSchema *index_table_schema = nullptr;
       bool is_match = false;
       if (share::schema::is_async_fts_index(simple_index_infos.at(i).index_type_)
-          || share::schema::is_async_search_def_index(simple_index_infos.at(i).index_type_)) {
+          || share::schema::is_async_search_def_index(simple_index_infos.at(i).index_type_)
+          || share::schema::is_async_ivf_index(simple_index_infos.at(i).index_type_)) {
         const bool is_async_fts_index = share::schema::is_async_fts_index(simple_index_infos.at(i).index_type_);
+        const bool is_async_ivf_index = share::schema::is_async_ivf_index(simple_index_infos.at(i).index_type_);
         const bool is_async_search_index = share::schema::is_async_search_def_index(simple_index_infos.at(i).index_type_);
         if (OB_FAIL(schema_guard.get_table_schema(tenant_id, simple_index_infos.at(i).table_id_, index_table_schema))) {
           LOG_WARN("failed to get index table schema", K(ret), K(tenant_id), K(simple_index_infos.at(i)));
@@ -1611,6 +1747,10 @@ int ObIndexBuilderUtil::check_column_has_async_index(
           LOG_WARN("index table schema should not be null", K(ret), K(simple_index_infos.at(i)));
         } else if (is_async_fts_index && OB_FAIL(ObFtsIndexBuilderUtil::check_column_match_fts_index(table_schema, *index_table_schema, col_id, is_match))) {
           LOG_WARN("failed to check column match fts index", K(ret), K(col_id));
+        } else if (is_async_ivf_index
+                   && OB_FAIL(check_column_match_async_ivf_index(
+                       table_schema, *index_table_schema, col_id, is_match))) {
+          LOG_WARN("failed to check column match async IVF index", K(ret), K(col_id));
         } else if (is_async_search_index) {
           const ObColumnSchemaV2 *index_column = index_table_schema->get_column_schema(col_id);
           is_match = OB_NOT_NULL(index_column) && index_column->get_index_position() > 0;

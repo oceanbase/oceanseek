@@ -207,6 +207,7 @@ public:
       filter_iter_(nullptr),
       pre_filter_iter_(nullptr),
       post_filter_iter_(nullptr),
+      pre_filter_opened_(false),
       bitmap_(nullptr),
       vec_index_driver_ctdef_(nullptr),
       vec_index_driver_rtdef_(nullptr),
@@ -234,6 +235,8 @@ public:
       filter_mode_(ObVecFilterMode::VEC_FILTER_MODE_INVALID),
       scalar_scan_ctdef_(nullptr),
       scalar_scan_rtdef_(nullptr),
+      expr_filter_vid_objs_(nullptr),
+      expr_filter_matched_flags_(nullptr),
       filter_rtdef_for_reeval_(nullptr),
       go_brute_force_(false),
       bruteforce_fallback_threshold_(ObVecIdxExtraInfo::MIN_DEFAULT_HNSW_BRUTEFORCE_FALLBACK_THRESHOLD),
@@ -294,6 +297,7 @@ private:
 
   int init_limit_param();
   int init_sort();
+  int rescan_filter_iter();
   int process_pre_filter_mode(int64_t &count, int64_t capacity);
   int process_iterative_filter_mode(int64_t &count, int64_t capacity);
   int process_post_filter_mode(int64_t &count, int64_t capacity);
@@ -302,14 +306,15 @@ private:
   int save_vec_socre_expr_result(ObNewRow *row, int64_t size);
   int distance_to_score(double distance, double &score);
 
-  int build_bitmap_from_filter_iter();
+  int build_bitmap_from_filter_iter(int64_t &count);
   int set_bitmap_to_filter_iter();
   int fetch_vids_from_vec_index(int64_t &count, int64_t capacity);
   int post_query_vid_with_filter(ObIArray<VidDistancePair> *out_pairs = nullptr);
   int fill_results_to_eval_ctx(share::ObVectorQueryVidIterator *adaptor_vid_iter, int64_t &count, int64_t capacity);
 
   int post_query_vid_with_expr_filter();
-  int do_expr_filter_batch();
+  int do_expr_filter_batch(ObIArray<VidDistancePair> *out_pairs = nullptr);
+  int process_iterative_filter_mode_async_ivf(int64_t &count, int64_t capacity);
   int filter_by_index_back(int64_t vid, float distance, bool &filter_res);
   int set_rowkey_by_vid(int64_t vid);
   int get_single_row_from_filter_iter(bool is_vectorized);
@@ -325,8 +330,10 @@ private:
                                  int64_t partition_row_count,
                                  ObIvfPathDecision &decision) const;
   int apply_ivf_partition_path_(const ObIvfPathDecision &decision);
+  int evaluate_async_ivf_partition_path();
   int refresh_bruteforce_fallback_threshold(int64_t partition_row_count);
   void update_go_brute_force_after_pre_filter();
+  void update_async_ivf_go_brute_force_after_pre_filter(int64_t allowed_count);
   void switch_to_pre_filter();
   void switch_to_post_filter();
 
@@ -341,6 +348,9 @@ private:
     return OB_NOT_NULL(vec_index_scan_iter_) &&
            vec_index_scan_iter_->get_type() == ObDASIterType::DAS_ITER_VEC_INDEX_IVF_SCAN;
   }
+  OB_INLINE bool is_async_ivf_index() const
+  { return nullptr != vec_index_scan_iter_ && DAS_ITER_VEC_INDEX_ASYNC_IVF_SCAN == vec_index_scan_iter_->get_type(); }
+  bool uses_group_pre_filter() const;
   OB_INLINE bool is_post_without_filter() const { return vec_index_type_ == ObVecIndexType::VEC_INDEX_POST_WITHOUT_FILTER; }
   OB_INLINE bool is_post_with_filter() const
   {
@@ -364,6 +374,7 @@ private:
   ObDASIter *filter_iter_;
   ObDASIter *pre_filter_iter_;
   ObDASIter *post_filter_iter_;
+  bool pre_filter_opened_;
   ObVecIndexBitmap bitmap_;
 
   const ObDASVecIndexDriverCtDef *vec_index_driver_ctdef_;
@@ -404,6 +415,10 @@ private:
   ObVecFilterMode filter_mode_;
   const ObDASScalarScanCtDef *scalar_scan_ctdef_;
   ObDASScalarScanRtDef *scalar_scan_rtdef_;
+  // Reused across expression-filter batches and rounds; owned by mem_context_.
+  // key_ranges_ borrows the ObObj buffer until the filter scan is reset.
+  common::ObObj *expr_filter_vid_objs_;
+  bool *expr_filter_matched_flags_;
   ObIDASSearchRtDef *filter_rtdef_for_reeval_;
   bool go_brute_force_;
   int64_t bruteforce_fallback_threshold_;

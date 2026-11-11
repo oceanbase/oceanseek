@@ -10,6 +10,7 @@
 #include "sql/engine/table/ob_table_scan_op.h"
 #include "sql/rewrite/ob_transform_utils.h"
 #include "src/share/vector_index/ob_vector_index_util.h"
+#include "share/ob_index_builder_util.h"
 #include "share/domain_id/ob_domain_id.h"
 #include "share/external_table/ob_external_table_utils.h"
 #include "share/catalog/ob_catalog_properties.h"  // is_lake_plugin_table
@@ -470,8 +471,15 @@ int ObTscCgService::generate_tsc_ctdef(ObLogTableScan &op, ObTableScanCtDef &tsc
 
   if (OB_SUCC(ret)) {
     tsc_ctdef.is_async_index_query_ =
-        ObDASAsyncIndexQueryCtx::contains_async_index_query(root_ctdef);
-    if (tsc_ctdef.is_async_index_query_ && OB_FAIL(add_async_index_plan_constraint())) {
+        ObDASAsyncIndexQueryCtx::contains_shared_async_index_query(root_ctdef);
+    const bool has_async_index_access =
+        ObDASAsyncIndexQueryCtx::contains_async_index_access(root_ctdef);
+    if (has_async_index_access
+        && !ObSqlSchemaGuard::can_use_async_index(cg_.opt_ctx_->get_session_info())) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "Async index queries in a multi-statement transaction are");
+    } else if (has_async_index_access
+        && OB_FAIL(add_async_index_plan_constraint())) {
       LOG_WARN("failed to add async index plan constraint", K(ret));
     }
   }
@@ -1472,6 +1480,78 @@ int ObTscCgService::extract_fts_das_access_exprs(const ObLogTableScan &op,
   return ret;
 }
 
+int ObTscCgService::extract_async_ivf_access_columns(
+    const ObLogTableScan &op,
+    const ObDASScanCtDef &scan_ctdef,
+    ObIArray<ObRawExpr *> &access_exprs)
+{
+  int ret = OB_SUCCESS;
+  const ObVecIndexInfo *vec_info = op.get_vector_index_info();
+  const bool is_index_scan =
+      ObTSCIRScanType::OB_VEC_ASYNC_IVF_INDEX_SCAN == scan_ctdef.ir_scan_type_;
+  const bool is_delete_scan =
+      ObTSCIRScanType::OB_ASYNC_INDEX_DELETE_SCAN == scan_ctdef.ir_scan_type_;
+  const int64_t begin_idx = ASYNC_IVF_HIDDEN_PK_COL;
+  const int64_t end_idx = is_index_scan ? ASYNC_IVF_MAX_COL_CNT : ASYNC_IVF_TYPE_COL;
+  if (OB_ISNULL(vec_info)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null vector index info", K(ret));
+  } else if (OB_UNLIKELY(!vec_info->is_async_ivf_scan()
+                         || (!is_index_scan && !is_delete_scan))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async ivf scan type", K(ret), K(scan_ctdef.ir_scan_type_));
+  } else if (is_delete_scan) {
+    const ObAsyncIndexDeleteInfo *delete_info = vec_info->async_delete_info_;
+    if (OB_ISNULL(delete_info) || OB_UNLIKELY(!delete_info->is_valid())) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid async IVF deletion metadata", K(ret), KP(delete_info));
+    } else if (OB_FAIL(add_var_to_array_no_dup(
+                   access_exprs, static_cast<ObRawExpr *>(
+                       delete_info->get_delete_doc_id_column())))) {
+      LOG_WARN("failed to append async IVF deletion doc id expr", K(ret));
+    } else if (OB_FAIL(add_var_to_array_no_dup(
+                   access_exprs, static_cast<ObRawExpr *>(
+                       delete_info->get_delete_rowscn_expr())))) {
+      LOG_WARN("failed to append async IVF deletion rowscn expr", K(ret));
+    }
+  } else if (OB_UNLIKELY(ASYNC_IVF_MAX_COL_CNT != vec_info->aux_table_column_.count())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected async ivf access column count", K(ret),
+             K(vec_info->aux_table_column_.count()));
+  } else {
+    for (int64_t i = begin_idx; OB_SUCC(ret) && i < end_idx; ++i) {
+      ObRawExpr *column_expr = vec_info->get_aux_table_column(i);
+      if (OB_ISNULL(column_expr)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null async ivf access column", K(ret), K(i));
+      } else if (OB_FAIL(add_var_to_array_no_dup(access_exprs, column_expr))) {
+        LOG_WARN("failed to append async ivf access column", K(ret), K(i));
+      }
+    }
+  }
+  return ret;
+}
+
+bool ObTscCgService::is_async_ivf_related_scan(const ObDASScanCtDef &scan_ctdef)
+{
+  return ObTSCIRScanType::OB_VEC_ASYNC_IVF_INDEX_SCAN == scan_ctdef.ir_scan_type_
+      || ObTSCIRScanType::OB_ASYNC_INDEX_DELETE_SCAN == scan_ctdef.ir_scan_type_;
+}
+
+bool ObTscCgService::is_vec_related_scan(const ObLogTableScan &op,
+                                         const ObDASScanCtDef &scan_ctdef)
+{
+  const ObTableID &scan_table_id = scan_ctdef.ref_table_id_;
+  return (op.is_vec_idx_scan_post_filter()
+          || (op.is_vec_idx_scan_pre_filter()
+              && (op.is_vec_index_table_id(scan_table_id)
+                  || scan_ctdef.ir_scan_type_ == OB_VEC_COM_AUX_SCAN)))
+      && (scan_table_id != op.get_ref_table_id()
+          || scan_ctdef.ir_scan_type_ == OB_VEC_COM_AUX_SCAN)
+      && (!op.is_scan_domain_id_table(scan_table_id)
+          || scan_ctdef.ir_scan_type_ == OB_VEC_ROWKEY_VID_SCAN);
+}
+
 //extract the columns that required by DAS scan:
 //1. all columns required by TSC operator outputs
 //2. all columns required by TSC operator filters
@@ -1511,9 +1591,8 @@ int ObTscCgService::extract_das_access_exprs(const ObLogTableScan &op,
     if (OB_FAIL(extract_fts_das_access_exprs(op, cg_ctx, scan_ctdef, access_exprs))) {
       LOG_WARN("failed to extract text ir access columns for functional lookup", K(ret));
     }
-  } else if ((op.is_vec_idx_scan_post_filter() || (op.is_vec_idx_scan_pre_filter() && (op.is_vec_index_table_id(scan_table_id) || scan_ctdef.ir_scan_type_ == OB_VEC_COM_AUX_SCAN))) && 
-              (scan_table_id != op.get_ref_table_id() || scan_ctdef.ir_scan_type_ == OB_VEC_COM_AUX_SCAN) &&
-              (!op.is_scan_domain_id_table(scan_table_id) || scan_ctdef.ir_scan_type_ == OB_VEC_ROWKEY_VID_SCAN)) {
+  } else if (is_async_ivf_related_scan(scan_ctdef)
+             || is_vec_related_scan(op, scan_ctdef)) {
     if (OB_FAIL(extract_vec_ir_access_columns(op, scan_ctdef, access_exprs))) {
       LOG_WARN("failed to extract vector access columns", K(ret));
     }
@@ -1756,8 +1835,10 @@ int ObTscCgService::generate_access_ctdef(const ObLogTableScan &op,
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("expr is null", K(ret));
     } else if (T_ORA_ROWSCN == expr->get_expr_type()) {
-      //only data table need to produce rowscn
-      if (table_schema->is_index_table() && op.is_index_scan() && !op.get_index_back()) {
+      // Async deletion indexes also expose ORA_ROWSCN so the query can keep
+      // physical visibility at Q while filtering deletion rows by logical M.
+      if (table_schema->is_index_table() && op.is_index_scan() && !op.get_index_back()
+          && ObTSCIRScanType::OB_ASYNC_INDEX_DELETE_SCAN != scan_ctdef.ir_scan_type_) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("rowscn only can be produced by data table", K(ret));
       } else if (OB_FAIL(access_column_ids.push_back(OB_HIDDEN_TRANS_VERSION_COLUMN_ID))) {
@@ -1779,7 +1860,9 @@ int ObTscCgService::generate_access_ctdef(const ObLogTableScan &op,
       const bool is_doc_fun_lookup = cg_ctx.is_func_lookup_ && table_schema->is_rowkey_doc_id();
       const bool is_vec_rowkey_vid_scan = scan_ctdef.ir_scan_type_ == OB_VEC_ROWKEY_VID_SCAN;
       bool domain_id_in_rowkey_domain = op.is_scan_domain_id_table(table_schema->get_table_id());
-      real_table_id = (domain_id_in_rowkey_domain || is_doc_fun_lookup || is_vec_rowkey_vid_scan) ? table_id : real_table_id;
+      real_table_id = (domain_id_in_rowkey_domain || is_doc_fun_lookup
+                       || is_vec_rowkey_vid_scan)
+          ? table_id : real_table_id;
       if (!col_expr->has_flag(IS_COLUMN) || (col_expr->get_table_id() != real_table_id && !ObDomainIdUtils::is_domain_id_index_col_expr(col_expr))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("Expected basic column", K(ret),
@@ -2158,7 +2241,11 @@ int ObTscCgService::extract_das_output_column_ids(const ObLogTableScan &op,
   const ObTableID &table_id = scan_ctdef.ref_table_id_;
   const bool use_index_merge = scan_ctdef.is_index_merge_;
 
-  if (op.need_doc_id_index_back() && table_id == op.get_doc_id_index_table_id() &&
+  if (is_async_ivf_related_scan(scan_ctdef)) {
+    if (OB_FAIL(output_cids.assign(scan_ctdef.access_column_ids_))) {
+      LOG_WARN("failed to assign async ivf output column ids", K(ret), K(scan_ctdef));
+    }
+  } else if (op.need_doc_id_index_back() && table_id == op.get_doc_id_index_table_id() &&
       // use the 'OB_IR_DOC_ID_IDX_AGG' to compute the total doc number, and the 'OB_IR_DOC_ID_IDX_AGG' satisfies the above requirements also.
       // but we do not need the rowkey column, so we use the 'extract_rowkey_doc_output_columns_ids' method to get the output_cids.
       scan_ctdef.ir_scan_type_ != ObTSCIRScanType::OB_IR_DOC_ID_IDX_AGG) {
@@ -2630,8 +2717,13 @@ int ObTscCgService::generate_vec_aux_idx_tbl_ctdef(const ObLogTableScan &op,
       LOG_WARN("failed to generate spiv aux ctdef", K(ret));
     }
   } else {
-    ObTSCIRScanType first_ir_scan_type = vc_info->is_hnsw_vec_scan() ? OB_VEC_DELTA_BUF_SCAN : OB_VEC_IVF_CENTROID_SCAN;
-    ObTSCIRScanType second_ir_scan_type = vc_info->is_hnsw_vec_scan() ? OB_VEC_IDX_ID_SCAN : OB_VEC_IVF_CID_VEC_SCAN;
+    const bool is_async_ivf = vc_info->is_async_ivf_scan();
+    ObTSCIRScanType first_ir_scan_type = is_async_ivf
+        ? OB_VEC_ASYNC_IVF_INDEX_SCAN
+        : (vc_info->is_hnsw_vec_scan() ? OB_VEC_DELTA_BUF_SCAN : OB_VEC_IVF_CENTROID_SCAN);
+    ObTSCIRScanType second_ir_scan_type = is_async_ivf
+        ? OB_ASYNC_INDEX_DELETE_SCAN
+        : (vc_info->is_hnsw_vec_scan() ? OB_VEC_IDX_ID_SCAN : OB_VEC_IVF_CID_VEC_SCAN);
     ObTSCIRScanType third_ir_scan_type = vc_info->is_hnsw_vec_scan() ? OB_VEC_SNAPSHOT_SCAN : OB_VEC_IVF_ROWKEY_CID_SCAN;
     ObTSCIRScanType forth_ir_scan_type = vc_info->is_hnsw_vec_scan() ? OB_VEC_ROWKEY_VID_SCAN : OB_VEC_IVF_SPECIAL_AUX_SCAN;
     bool need_fifth_table = vc_info->is_hnsw_vec_scan() && vc_info->is_hybrid_index; 
@@ -2641,9 +2733,9 @@ int ObTscCgService::generate_vec_aux_idx_tbl_ctdef(const ObLogTableScan &op,
       LOG_WARN("failed to generate vec aux idx tbl ctdef", K(ret), K(first_ir_scan_type));
     } else if (OB_FAIL(generate_vec_aux_table_ctdef(op, second_ir_scan_type, vc_info->get_aux_table_id(ObVectorAuxTableIdx::VEC_SECOND_AUX_TBL_IDX), second_aux_ctdef))) {
       LOG_WARN("failed to generate vec aux idx tbl ctdef", K(ret), K(second_ir_scan_type));
-    } else if (OB_FAIL(generate_vec_aux_table_ctdef(op, third_ir_scan_type, vc_info->get_aux_table_id(ObVectorAuxTableIdx::VEC_THIRD_AUX_TBL_IDX), third_aux_ctdef))) {
+    } else if (!is_async_ivf && OB_FAIL(generate_vec_aux_table_ctdef(op, third_ir_scan_type, vc_info->get_aux_table_id(ObVectorAuxTableIdx::VEC_THIRD_AUX_TBL_IDX), third_aux_ctdef))) {
       LOG_WARN("failed to generate vec aux idx tbl ctdef", K(ret), K(third_ir_scan_type));
-    } else if (!vc_info->is_ivf_flat_scan() &&
+    } else if (!is_async_ivf && !vc_info->is_ivf_flat_scan() &&
                !op.need_skip_rowkey_vid() &&
                OB_FAIL(generate_vec_aux_table_ctdef(op, forth_ir_scan_type, vc_info->get_aux_table_id(ObVectorAuxTableIdx::VEC_FOURTH_AUX_TBL_IDX), forth_aux_ctdef))) {
       LOG_WARN("failed to generate vec aux idx tbl ctdef", K(ret), K(forth_ir_scan_type));
@@ -2715,10 +2807,14 @@ int ObTscCgService::generate_vec_idx_ctdef(const ObLogTableScan &op,
     const ObTableSchema *main_index_table_schema = nullptr;
     const ObTableSchema *hybrid_embedded_table_schema = nullptr;
     const ObTableSchema *data_table_schema = nullptr;
+    const ObColumnSchemaV2 *source_vector_column = nullptr;
     ObDASSortCtDef *sort_ctdef = nullptr;
     int64_t dim = 0;
     bool is_aux_table_all_inited = false;
     const ObVecIndexInfo &vc_info = *op.get_vector_index_info();
+    const bool is_async_ivf = vc_info.is_async_ivf_scan();
+    const uint64_t async_ivf_index_tid =
+        vc_info.get_aux_table_id(ObVectorAuxTableIdx::VEC_FIRST_AUX_TBL_IDX);
     bool is_hybrid = vc_info.is_hybrid_index;
     ObVectorAuxTableIdx main_index_tid = ObVectorAuxTableIdx::VEC_FIRST_AUX_TBL_IDX;
     ObVectorAuxTableIdx hybrid_embedded_tid = op.need_skip_rowkey_vid() ? VEC_FOURTH_AUX_TBL_IDX : VEC_SIXTH_AUX_TBL_IDX;
@@ -2750,9 +2846,20 @@ int ObTscCgService::generate_vec_idx_ctdef(const ObLogTableScan &op,
     } else if (OB_ISNULL(main_index_table_schema)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("fail to get table schema", K(ret));
-    } else if (!is_hybrid && OB_FAIL(ObVectorIndexUtil::get_vector_index_column_dim(*main_index_table_schema, *data_table_schema, dim))) {
+    } else if (is_async_ivf && OB_FAIL(ObIndexBuilderUtil::get_async_ivf_source_column(
+                   *data_table_schema, *main_index_table_schema, source_vector_column))) {
+      LOG_WARN("failed to get async ivf source column", K(ret), K(async_ivf_index_tid));
+    } else if (is_async_ivf && OB_ISNULL(source_vector_column)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("async ivf source vector column is null", K(ret));
+    } else if (is_async_ivf && OB_FAIL(ObVectorIndexUtil::get_vector_dim_from_extend_type_info(
+                   source_vector_column->get_extended_type_info(), dim))) {
+      LOG_WARN("failed to get async ivf vector dimension", K(ret), KPC(source_vector_column));
+    } else if (!is_async_ivf && !is_hybrid
+               && OB_FAIL(ObVectorIndexUtil::get_vector_index_column_dim(
+                   *main_index_table_schema, *data_table_schema, dim))) {
       LOG_WARN("fail to get vector_index_column dim", K(ret));
-    } else if (is_hybrid) {
+    } else if (!is_async_ivf && is_hybrid) {
       if (OB_FAIL(schema_guard->get_table_schema(op.get_vector_index_info()->get_aux_table_id(hybrid_embedded_tid), hybrid_embedded_table_schema))) {
         LOG_WARN("get table schema failed", K(ret), K(op.get_vector_index_info()->get_aux_table_id(hybrid_embedded_tid)));
       } else if (OB_ISNULL(hybrid_embedded_table_schema)) {
@@ -2808,7 +2915,10 @@ int ObTscCgService::generate_vec_idx_ctdef(const ObLogTableScan &op,
         // In scenarios with docid/vid pk_increment optimization, the rowkey-docid/rowkey-vid table may not exist.
         // Therefore, we initialize rowkey_exprs on tables that exist in both optimized and non-optimized cases.
         ExprFixedArray *target_rowkey_exprs = nullptr;
-        if (vc_info.is_spiv_scan()) {
+        if (is_async_ivf) {
+          // The related scan ctdef carries the logical main table rowkey layout returned by the Searcher.
+          target_rowkey_exprs = &first_aux_ctdef->rowkey_exprs_;
+        } else if (vc_info.is_spiv_scan()) {
           target_rowkey_exprs = &third_aux_ctdef->rowkey_exprs_;// main data table
         } else if (vc_info.is_hnsw_vec_scan()) {
           target_rowkey_exprs = &com_aux_ctdef->rowkey_exprs_;  // main data table
@@ -2839,6 +2949,10 @@ int ObTscCgService::generate_vec_idx_ctdef(const ObLogTableScan &op,
       } 
       
       if (OB_SUCC(ret)) {
+        const int64_t ASYNC_IVF_FILTER_INPUT_CHILD_IDX = 0;
+        const int64_t ASYNC_IVF_INDEX_SCAN_CHILD_IDX = 1;
+        const int64_t ASYNC_DELETE_SCAN_CHILD_IDX = 2;
+        const int64_t ASYNC_IVF_CHILD_COUNT = 3;
         const int64_t SPIV_DOCID_OPT = 4;
         const int64_t SPIV_NORMAL = 5;
         const int64_t IVF_FLAT = 5;
@@ -2852,7 +2966,9 @@ int ObTscCgService::generate_vec_idx_ctdef(const ObLogTableScan &op,
           hnsw_normal++;
         }
         int64_t vec_child_task_cnt = 0;
-        if (vc_info.is_spiv_scan()) {
+        if (is_async_ivf) {
+          vec_child_task_cnt = ASYNC_IVF_CHILD_COUNT;
+        } else if (vc_info.is_spiv_scan()) {
           vec_child_task_cnt = op.need_skip_rowkey_doc() ? SPIV_DOCID_OPT : SPIV_NORMAL;
         } else if (vc_info.is_hnsw_vec_scan()) {
           vec_child_task_cnt = op.need_skip_rowkey_vid() ? hnsw_vid_opt : hnsw_normal;
@@ -2877,7 +2993,11 @@ int ObTscCgService::generate_vec_idx_ctdef(const ObLogTableScan &op,
         } else {
           vec_scan_ctdef->children_cnt_ = vec_child_task_cnt; // number of ObDASScanCtDef
           
-          if (vc_info.is_hnsw_vec_scan()) {
+          if (is_async_ivf) {
+            vec_scan_ctdef->children_[ASYNC_IVF_FILTER_INPUT_CHILD_IDX] = inv_idx_scan_ctdef;
+            vec_scan_ctdef->children_[ASYNC_IVF_INDEX_SCAN_CHILD_IDX] = first_aux_ctdef;
+            vec_scan_ctdef->children_[ASYNC_DELETE_SCAN_CHILD_IDX] = second_aux_ctdef;
+          } else if (vc_info.is_hnsw_vec_scan()) {
             vec_scan_ctdef->children_[0] = inv_idx_scan_ctdef;
             vec_scan_ctdef->children_[1] = first_aux_ctdef;  // delta buf table
             vec_scan_ctdef->children_[2] = second_aux_ctdef;  // index id table
@@ -2934,12 +3054,14 @@ int ObTscCgService::generate_vec_idx_ctdef(const ObLogTableScan &op,
           vec_scan_ctdef->vector_index_param_ = op.get_vector_index_info()->get_vector_index_param();
           vec_scan_ctdef->extra_column_count_ = vc_info.get_extra_info_columns_count();
           vec_scan_ctdef->adaptive_try_path_ = vc_info.adaptive_try_path_;
+          vec_scan_ctdef->is_adaptive_specify_by_hint_ = vc_info.is_adaptive_specify_by_hint_;
           vec_scan_ctdef->can_extract_range_ = vc_info.can_extract_range_;
           vec_scan_ctdef->is_spatial_index_ = vc_info.is_spatial_index_;
           vec_scan_ctdef->is_multi_value_index_ = vc_info.is_multi_value_index_;
           vec_scan_ctdef->all_filters_can_be_picked_out_ = vc_info.all_filters_can_be_picked_out_;
           vec_scan_ctdef->strategy_ = vc_info.strategy_;
           vec_scan_ctdef->pre_filtering_timeout_ = vc_info.pre_filtering_timeout_;
+          vec_scan_ctdef->is_async_index_ = is_async_ivf;
           vec_scan_ctdef->has_upper_topn_ = vc_info.has_upper_topn_;
           cg_.phy_plan_->stat_.vec_index_exec_ctx_.cur_path_ = vc_info.adaptive_try_path_;
         }
@@ -3722,6 +3844,13 @@ int ObTscCgService::extract_vec_ir_access_columns(
       case ObTSCIRScanType::OB_VEC_IVF_SPECIAL_AUX_SCAN: {
         if (OB_FAIL(extract_ivf_access_columns(op, scan_ctdef, access_exprs))) {
           LOG_WARN("fail to extract rowkey vid access columns", K(ret));
+        }
+        break;
+      }
+      case ObTSCIRScanType::OB_VEC_ASYNC_IVF_INDEX_SCAN:
+      case ObTSCIRScanType::OB_ASYNC_INDEX_DELETE_SCAN: {
+        if (OB_FAIL(extract_async_ivf_access_columns(op, scan_ctdef, access_exprs))) {
+          LOG_WARN("failed to extract async ivf access columns", K(ret), K(scan_ctdef));
         }
         break;
       }

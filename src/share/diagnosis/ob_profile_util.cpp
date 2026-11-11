@@ -289,7 +289,8 @@ int ObProfileUtil::merge_profile(ObMergedProfile &merged_profile, const ObProfil
     if (OB_FAIL(hs_merge_metrics(merged_profile, *piece_profile))) {
       LOG_WARN("failed to merge metrics", KR(ret));
     } else if (is_hybrid_search_profile(merged_profile.get_id())
-               || merged_profile.get_id() == common::ObProfileId::VECTOR_SEARCH) {
+               || merged_profile.get_id() == common::ObProfileId::VECTOR_SEARCH
+               || merged_profile.get_id() == common::ObProfileId::VECTOR_SEARCH_VEC_ASYNC_IVF_SCAN) {
       if (OB_FAIL(merge_children_for_hybrid_search(merged_profile, piece_profile, alloc))) {
         LOG_WARN("failed to merge children without aggregation", K(ret));
       }
@@ -559,6 +560,7 @@ int ObProfileUtil::hs_merge_partition_tree(ObMergedProfile &merged_profile,
 // Task、混搜 Partition 在有序子树同构时聚合；其余节点继续保留实例。
 // Vector Search reuses the same behavior at its root so every Partition execution instance is
 // preserved instead of being merged by VECTOR_SEARCH_PARTITION profile ID.
+// Async IVF also preserves each physical Segment under its algorithm node.
 int ObProfileUtil::merge_children_for_hybrid_search(ObMergedProfile &merged_profile,
                                                     const ObProfile *piece_profile,
                                                     ObIAllocator *alloc)

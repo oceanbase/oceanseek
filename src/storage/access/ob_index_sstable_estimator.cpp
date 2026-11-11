@@ -66,6 +66,21 @@ int ObIndexBlockScanEstimator::estimate_row_count(ObSSTable &sstable,
       part_est.physical_row_count_ = part_est.logical_row_count_ = row_count;
     }
     STORAGE_LOG(DEBUG, "estimate inv row count result", K(ret), K(part_est));
+  } else if (sstable.is_ivf_sstable()) {
+    // Async IVF index sstable (both IVF_INDEX_SSTABLE and INC_IVF_INDEX_SSTABLE): estimate via the
+    // IVF-specific index-tree traversal (no data micro block IO). The low precision vector data
+    // micro blocks may be FastScan encoded and carry no row-format micro header, so they can not
+    // be opened for estimation at all, see estimate_ivf_sstable_result. Deletion is recorded in the
+    // deletion tablet, so the logical row count is the same as the physical one for a single sstable.
+    int64_t row_count = 0;
+    if (OB_FAIL(estimate_ivf_sstable_row_count(
+            sstable, context_.index_read_info_, datum_range,
+            context_.tablet_handle_.get_obj(), row_count))) {
+      STORAGE_LOG(WARN, "Failed to estimate ivf sstable row count", K(ret));
+    } else {
+      part_est.physical_row_count_ = part_est.logical_row_count_ = row_count;
+    }
+    STORAGE_LOG(DEBUG, "estimate ivf row count result", K(ret), K(part_est));
   } else {
     ObEstimatedResult result;
     if (OB_FAIL(cal_total_estimate_result(sstable, datum_range, result))) {
@@ -89,13 +104,28 @@ int ObIndexBlockScanEstimator::estimate_block_count(ObSSTable &sstable,
                                                     int64_t &micro_block_cnt)
 {
   int ret = OB_SUCCESS;
-  ObEstimatedResult result(true /* for block */);
-  if (OB_FAIL(cal_total_estimate_result(sstable, datum_range, result))) {
-    STORAGE_LOG(WARN, "Failed to get total estimate result", K(ret));
+  if (sstable.is_ivf_sstable()) {
+    // Async IVF index sstable: count blocks over the index block tree only. The data micro blocks
+    // (FastScan encoded low precision vectors) must not be opened, see estimate_ivf_sstable_result.
+    ObIvfEstimateResult ivf_result;
+    if (OB_FAIL(estimate_ivf_sstable_result(sstable, context_.index_read_info_, datum_range,
+                                            context_.tablet_handle_.get_obj(), ivf_result))) {
+      STORAGE_LOG(WARN, "Failed to estimate ivf sstable block count", K(ret));
+    } else {
+      macro_block_cnt = MAX(ivf_result.macro_block_cnt_, 1);
+      micro_block_cnt = MAX(ivf_result.micro_block_cnt_, 1);
+      STORAGE_LOG(TRACE, "estimate ivf block count result", K(ret), K(ivf_result),
+                  K(macro_block_cnt), K(micro_block_cnt));
+    }
   } else {
-    macro_block_cnt = MAX(result.macro_block_cnt_, 1);
-    micro_block_cnt = MAX(result.micro_block_cnt_, 1);
-    STORAGE_LOG(TRACE, "estimate block count result", K(ret), K(result), K(macro_block_cnt), K(micro_block_cnt));
+    ObEstimatedResult result(true /* for block */);
+    if (OB_FAIL(cal_total_estimate_result(sstable, datum_range, result))) {
+      STORAGE_LOG(WARN, "Failed to get total estimate result", K(ret));
+    } else {
+      macro_block_cnt = MAX(result.macro_block_cnt_, 1);
+      micro_block_cnt = MAX(result.micro_block_cnt_, 1);
+      STORAGE_LOG(TRACE, "estimate block count result", K(ret), K(result), K(macro_block_cnt), K(micro_block_cnt));
+    }
   }
   return ret;
 }
@@ -401,6 +431,137 @@ int ObIndexBlockScanEstimator::estimate_inv_sstable_row_count(
         }
       }
     }
+  }
+  return ret;
+}
+// Traverser context for async IVF index row count / block count estimation. The low precision
+// vector data micro blocks of an IVF sstable may be FastScan encoded and carry no row-format micro
+// header, so they must never be opened for estimation; this context only accumulates what the index
+// rows already carry: an index row aggregates the row count of its whole subtree, and a leaf data
+// index row stands for exactly one data micro block.
+class ObIvfIdxEstimateRowContext final : public ObIIndexTreeTraverserContext
+{
+public:
+  ObIvfIdxEstimateRowContext(const ObDatumRange &range, ObIvfEstimateResult &result)
+      : ObIIndexTreeTraverserContext(true /*is_never_estimate*/, false /*consider_multi_version*/),
+        range_(range),
+        result_(result),
+        is_ended_(false)
+  {
+    result_.row_count_ = 0;
+    result_.macro_block_cnt_ = 0;
+    result_.micro_block_cnt_ = 0;
+  }
+  ~ObIvfIdxEstimateRowContext() override = default;
+
+  bool is_valid() const override { return true; }
+  bool is_ended() const override { return is_ended_; }
+  const ObDatumRange &get_curr_range() const override { return range_; }
+  int next_range() override { is_ended_ = true; return OB_SUCCESS; }
+
+  int on_inner_node(const ObMicroIndexInfo &index_row,
+                    const bool is_coverd_by_range,
+                    ObTraverserOperationType &operation) override
+  {
+    if (is_coverd_by_range) {
+      // whole subtree / data block covered: accumulate it, no descent (no data micro block IO)
+      accumulate(index_row);
+      operation = NOTHING;
+    } else {
+      // boundary: descend the index tree (a boundary data block is routed to on_node_estimate)
+      operation = GOTO_NEXT_LEVEL;
+    }
+    return OB_SUCCESS;
+  }
+
+  int on_node_estimate(const ObMicroIndexInfo &index_row, const bool is_coverd_by_range) override
+  {
+    // Reached for a data block intersecting the range (the subtrees out of the range have already
+    // been pruned by locate_range). Opening the block is forbidden, so the whole block is counted
+    // conservatively, i.e. the estimation is a upper bound of the real row count.
+    UNUSED(is_coverd_by_range);
+    accumulate(index_row);
+    return OB_SUCCESS;
+  }
+
+  int on_leaf_node(const ObMicroIndexInfo &index_row, const ObPartitionEst &est) override
+  {
+    UNUSED(est);
+    int ret = OB_ERR_UNEXPECTED;
+    STORAGE_LOG(WARN, "ivf sstable estimation must not open data blocks", K(ret), K(index_row));
+    return ret;
+  }
+
+  VIRTUAL_TO_STRING_KV(K_(range), K_(result), K_(is_ended));
+
+private:
+  void accumulate(const ObMicroIndexInfo &index_row)
+  {
+    if (index_row.is_data_block()) {
+      // one data index row = one data micro block in one macro block. The block level counts of a
+      // leaf data index row may not be filled by the index builder, so floor them to 1.
+      result_.macro_block_cnt_ += 1;
+      result_.micro_block_cnt_ += 1;
+    } else {
+      const int64_t macro_block_cnt = static_cast<int64_t>(index_row.get_macro_block_count());
+      const int64_t micro_block_cnt = static_cast<int64_t>(index_row.get_micro_block_count());
+      result_.macro_block_cnt_ += MAX(macro_block_cnt, 1);
+      result_.micro_block_cnt_ += MAX(micro_block_cnt, 1);
+    }
+    result_.row_count_ += static_cast<int64_t>(index_row.get_row_count());
+  }
+
+private:
+  const ObDatumRange &range_;
+  ObIvfEstimateResult &result_;
+  bool is_ended_;
+};
+
+int ObIndexBlockScanEstimator::estimate_ivf_sstable_result(
+    ObSSTable &sstable,
+    const ObITableReadInfo &read_info,
+    const ObDatumRange &range,
+    ObTablet *tablet,
+    ObIvfEstimateResult &result)
+{
+  int ret = OB_SUCCESS;
+  result.row_count_ = 0;
+  result.macro_block_cnt_ = 0;
+  result.micro_block_cnt_ = 0;
+  if (OB_UNLIKELY(!read_info.is_valid() || !range.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "invalid argument for ivf sstable estimation", K(ret), K(range));
+  } else if (OB_UNLIKELY(!sstable.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    STORAGE_LOG(WARN, "invalid ivf sstable", K(ret));
+  } else if (sstable.is_empty()) {
+    // empty segment (e.g. an empty refreshed table or an empty incremental segment): 0 rows
+  } else {
+    ObIndexBlockTreeTraverser traverser;
+    ObIvfIdxEstimateRowContext context(range, result);
+    if (OB_FAIL(traverser.init(sstable, read_info, tablet, "OB_IVF_EST"))) {
+      STORAGE_LOG(WARN, "failed to init index block tree traverser for ivf sstable", K(ret));
+    } else if (OB_FAIL(traverser.traverse(context))) {
+      STORAGE_LOG(WARN, "failed to traverse ivf sstable index tree", K(ret), K(range));
+    }
+  }
+  return ret;
+}
+
+int ObIndexBlockScanEstimator::estimate_ivf_sstable_row_count(
+    ObSSTable &sstable,
+    const ObITableReadInfo &read_info,
+    const ObDatumRange &range,
+    ObTablet *tablet,
+    int64_t &row_count)
+{
+  int ret = OB_SUCCESS;
+  ObIvfEstimateResult result;
+  row_count = 0;
+  if (OB_FAIL(estimate_ivf_sstable_result(sstable, read_info, range, tablet, result))) {
+    STORAGE_LOG(WARN, "failed to estimate ivf sstable result", K(ret));
+  } else {
+    row_count = result.row_count_;
   }
   return ret;
 }

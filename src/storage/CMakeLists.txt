@@ -95,6 +95,43 @@ ob_set_subtarget(ob_storage blocksstable_async_index
   blocksstable/async_index/ob_inv_idx_macro_block_dumper.cpp
 )
 
+ob_set_subtarget(ob_storage blocksstable_vector_index
+  blocksstable/vector_index/ob_ivf_tablet_context.cpp
+  blocksstable/vector_index/ob_ivf_task_plan.cpp
+  blocksstable/vector_index/ob_ivf_dag_planner.cpp
+  blocksstable/vector_index/ob_ivf_ddl_dag.cpp
+  blocksstable/vector_index/ob_ivf_ddl_input.cpp
+  blocksstable/vector_index/ob_ivf_ddl_hca_adapter.cpp
+  blocksstable/vector_index/ob_ivf_ddl_runtime.cpp
+  blocksstable/vector_index/ob_ivf_merge_planner.cpp
+  blocksstable/vector_index/ob_ivf_merge_runtime.cpp
+  blocksstable/vector_index/ob_ivf_merge_strategy.cpp
+  blocksstable/vector_index/ob_ivf_ddl_sstable_writer.cpp
+  blocksstable/vector_index/ob_ivf_merge_sstable_writer.cpp
+  blocksstable/vector_index/ob_ivf_hca_algorithm_adapter.cpp
+  blocksstable/vector_index/ob_ivf_merge_capture_pipeline.cpp
+  blocksstable/vector_index/ob_ivf_merge_input.cpp
+  blocksstable/vector_index/ob_ivf_merge_dag.cpp
+  blocksstable/vector_index/ob_disk_bbq_algorithm.cpp
+  blocksstable/vector_index/ob_ivf_build_and_write_pipeline.cpp
+  blocksstable/vector_index/ob_ivf_build_schema_ctx.cpp
+  blocksstable/vector_index/ob_ivf_refresh_monitor.cpp
+  blocksstable/vector_index/ob_ivf_capture_pipeline.cpp
+  blocksstable/vector_index/ob_ivf_macro_block_writer.cpp
+  blocksstable/vector_index/ob_ivf_replay_input.cpp
+  blocksstable/vector_index/ob_ivf_sorter.cpp
+  blocksstable/vector_index/ob_ivf_sstable.cpp
+  blocksstable/vector_index/ob_ivf_centroid_iterator.cpp
+  blocksstable/vector_index/ob_ivf_centroid_layout.cpp
+  blocksstable/vector_index/ob_ivf_parent_centroid_build.cpp
+  blocksstable/vector_index/ob_ivf_sstable_searcher.cpp
+  blocksstable/vector_index/ob_ivf_sstable_struct.cpp
+  blocksstable/vector_index/ob_ivf_sstable_scan_iter.cpp
+  blocksstable/vector_index/ob_disk_bbq_fast_scanner.cpp
+  blocksstable/vector_index/ob_ivf_fastscan_micro_block_transformer.cpp
+  blocksstable/vector_index/ob_disk_bbq_searcher.cpp
+)
+
 ob_set_subtarget(ob_storage blocksstable_encoding1
   blocksstable/encoding/ob_bit_stream.cpp
   blocksstable/encoding/ob_column_equal_decoder.cpp

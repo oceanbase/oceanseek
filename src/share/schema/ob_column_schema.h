@@ -275,6 +275,9 @@ int assign(const ObColumnSchemaV2 &src_schema);
   }
   /* vector index */
   inline bool is_vec_index_column() const { return ObSchemaUtils::is_vec_index_column(column_flags_); }
+  inline bool is_vec_ivf_type_column() const { return ObSchemaUtils::is_vec_ivf_type_column(column_flags_); }
+  inline bool is_vec_ivf_cid_column() const { return ObSchemaUtils::is_vec_ivf_cid_column(column_flags_); }
+  inline bool is_vec_ivf_data_column() const { return ObSchemaUtils::is_vec_ivf_data_column(column_flags_); }
   inline bool is_vec_ivf_center_id_column() const { return ObSchemaUtils::is_vec_ivf_center_id_column(column_flags_); }
   inline bool is_vec_ivf_center_vector_column() const { return ObSchemaUtils::is_vec_ivf_center_vector_column(column_flags_); }
   inline bool is_vec_ivf_data_vector_column() const { return ObSchemaUtils::is_vec_ivf_data_vector_column(column_flags_); }

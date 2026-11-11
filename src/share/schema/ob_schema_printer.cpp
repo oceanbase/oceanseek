@@ -647,6 +647,10 @@ int ObSchemaPrinter::print_single_index_definition(const ObTableSchema *index_sc
         if (OB_FAIL(databuff_printf(buf, buf_len, pos, " ASYNC SEARCH INDEX "))) {
           SHARE_SCHEMA_LOG(WARN, "fail to print ASYNC SEARCH INDEX", K(ret));
         }
+      } else if (is_async_ivf_index(index_schema->get_index_type())) {
+        if (OB_FAIL(databuff_printf(buf, buf_len, pos, " ASYNC VECTOR INDEX "))) {
+          SHARE_SCHEMA_LOG(WARN, "fail to print ASYNC VECTOR INDEX", K(ret));
+        }
       } else if (index_schema->is_search_def_index()) {
         if (OB_FAIL(databuff_printf(buf, buf_len, pos, " SEARCH KEY "))) {
           SHARE_SCHEMA_LOG(WARN, "fail to print SEARCH KEY", K(ret));
@@ -706,6 +710,11 @@ int ObSchemaPrinter::print_single_index_definition(const ObTableSchema *index_sc
                      (col->is_vec_hnsw_vid_column() || col->is_hidden_pk_column_id(col->get_column_id()))) {
             // only need vec_type column to show index key, 
             // here skip vec_vid column / hidden pk column(for vid optimization)
+          } else if (is_async_ivf_index(index_schema->get_index_type())
+                     && (col->is_hidden_pk_column_id(col->get_column_id())
+                         || (OB_NOT_NULL(table_schema.get_column_schema(col->get_column_id()))
+                             && table_schema.get_column_schema(col->get_column_id())->is_vec_ivf_cid_column()))) {
+            // VEC_IVF_TYPE carries the logical vector dependency. Skip the other physical rowkey columns.
           } else if (!col->is_shadow_column()) {
             const ObColumnSchemaV2 *tmp_column = NULL;
             if ((index_schema->is_multivalue_index_aux() || index_schema->is_vec_ivf_index())&& 
@@ -742,7 +751,8 @@ int ObSchemaPrinter::print_single_index_definition(const ObTableSchema *index_sc
         // show storing columns in index
         if (OB_SUCC(ret) && !strict_compat_ && !is_no_key_options(sql_mode) 
             && !index_schema->is_fts_or_async_fts_index()
-            && !index_schema->is_multivalue_index() && !index_schema->is_vec_index()) {
+            && !index_schema->is_multivalue_index()
+            && !index_schema->is_vec_or_async_vec_index()) {
           int64_t column_count = index_schema->get_column_count();
           if (column_count >= rowkey_count) {
             bool first_storing_column = true;
@@ -859,7 +869,8 @@ int ObSchemaPrinter::print_table_definition_indexes(const ObTableSchema &table_s
       // Do not print global index.
     } else if (index_schema->is_built_in_index()) {
       // For full-text or vector index search index, only inverted table can be printed, and others table will not be printed.
-    } else if ((index_schema->is_async_fts_index() || index_schema->is_async_search_def_index())
+    } else if ((index_schema->is_async_fts_index() || index_schema->is_async_search_def_index()
+                || index_schema->is_async_ivf_index())
                && !index_schema->can_read_index()) {
       // Publish the initial async index before exposing its definition to users.
     } else if (index_schema->is_vec_index() && !ObVectorIndexUtil::check_index_is_all_ready(schema_guard_, table_schema, *index_schema)) {
@@ -1880,7 +1891,7 @@ int ObSchemaPrinter::print_table_definition_table_options(const ObTableSchema &t
       LOG_WARN("fail to print fts index params info", K(ret), K(table_schema));
     }
   }
-  if (OB_SUCC(ret) && table_schema.is_vec_index()) {
+  if (OB_SUCC(ret) && table_schema.is_vec_or_async_vec_index()) {
     if (OB_FAIL(ObVectorIndexUtil::print_index_param(table_schema, buf, buf_len, pos))) {
       SHARE_SCHEMA_LOG(WARN, "fail to print vec index param", K(ret), K(table_schema));
     }

@@ -153,6 +153,10 @@ public:
   // --- skipped rows 计数（PX 执行中回传）---
   int add_skipped_rows(const int64_t refresh_task_id, const int64_t cnt);
   int get_skipped_rows(const int64_t refresh_task_id, int64_t &skipped_rows);
+  // Caller releases the returned reference. Only IVF DAG initialization creates
+  // a monitor; the refresh worker retrieves it to report SQL/commit completion.
+  int acquire_ivf_refresh_monitor(int64_t refresh_task_id, ObIVFRefreshMonitor *&monitor,
+      ObDDLDagMonitorNode *node = nullptr, uint64_t tablet_id = 0, int64_t execution_id = 0);
 
   // --- RPC refresh skip-set for timer path coordination ---
   // When the RPC refresh path (ObAsyncIndexRefreshP::process) is performing

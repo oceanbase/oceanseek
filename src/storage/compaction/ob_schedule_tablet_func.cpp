@@ -466,7 +466,7 @@ int ObScheduleTabletFunc::request_schedule_new_round(
                  ls_status_.get_ls(), merge_version_, *tablet,
                  ls_could_schedule_new_round_))) {
     LOG_WARN("failed to init tablet status", KR(ret), K_(ls_status), K(tablet_id));
-  } else if (tablet->is_async_inverted_storage_index()
+  } else if (tablet->is_async_index_storage_tablet()
              && ObAdaptiveMergePolicy::ASYNC_INDEX_FORCE_MERGE != merge_reason_) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("async index tablet can only be scheduled via schedule_async_index on data tablet",
@@ -549,7 +549,7 @@ int ObScheduleTabletFunc::schedule_tablet_execute(ObTablet &tablet)
   ObMediumCompactionInfo::ObCompactionType compaction_type = ObMediumCompactionInfo::COMPACTION_TYPE_MAX;
   ObMergeType merge_type = INVALID_MERGE_TYPE;
 
-  if (tablet.is_async_inverted_storage_index()
+  if (tablet.is_async_index_storage_tablet()
       && OB_SUCCESS != EVENT_CALL(ERRSIM_BLOCK_ASYNC_INDEX_TABLET_COMPACTION, tablet_id.id())) {
     ret = OB_EAGAIN;
     LOG_INFO("ERRSIM defer async index tablet compaction", K(ret), K(ls_id), K(tablet_id));

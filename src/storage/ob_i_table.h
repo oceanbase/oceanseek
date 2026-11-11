@@ -200,6 +200,7 @@ public:
     OB_INLINE bool is_remote_logical_minor_sstable() const { return ObITable::is_remote_logical_minor_sstable(table_type_); }
     OB_INLINE bool is_co_sstable() const { return ObITable::is_co_sstable(table_type_); }
     OB_INLINE bool is_inv_sstable() const { return ObITable::is_inv_sstable(table_type_); }
+    OB_INLINE bool is_ivf_sstable() const { return ObITable::is_ivf_sstable(table_type_); }
     OB_INLINE bool is_rowkey_cg_sstable() const { return ObITable::is_rowkey_cg_sstable(table_type_); }
     OB_INLINE bool is_normal_cg_sstable() const { return ObITable::is_normal_cg_sstable(table_type_); }
     OB_INLINE bool is_cg_sstable() const { return ObITable::is_cg_sstable(table_type_); }
@@ -212,7 +213,12 @@ public:
     OB_INLINE bool is_inc_rowkey_cg_sstable() const { return ObITable::is_inc_rowkey_cg_sstable(table_type_); }
     OB_INLINE bool is_inc_normal_cg_sstable() const { return ObITable::is_inc_normal_cg_sstable(table_type_); }
     OB_INLINE bool is_inc_inv_sstable() const { return ObITable::is_inc_inv_sstable(table_type_); }
-    OB_INLINE bool is_inc_major_type_sstable() const { return is_inc_major_sstable() || is_inc_co_sstable() || is_inc_rowkey_cg_sstable() || is_inc_normal_cg_sstable() || is_inc_inv_sstable(); }
+    OB_INLINE bool is_inc_ivf_sstable() const { return ObITable::is_inc_ivf_sstable(table_type_); }
+    OB_INLINE bool is_inc_major_type_sstable() const
+    {
+      return is_inc_major_sstable() || is_inc_co_sstable() || is_inc_rowkey_cg_sstable()
+          || is_inc_normal_cg_sstable() || is_inc_inv_sstable() || is_inc_ivf_sstable();
+    }
     OB_INLINE bool is_inc_column_store_sstable() const { return is_inc_co_sstable() || is_inc_rowkey_cg_sstable() || is_inc_normal_cg_sstable(); }
     OB_INLINE bool is_inc_major_ddl_aggregate_sstable() const { return ObITable::is_inc_major_ddl_aggregate_sstable(table_type_); }
     OB_INLINE bool is_inc_major_ddl_aggregate_co_sstable() const { return ObITable::is_inc_major_ddl_aggregate_co_sstable(table_type_); }
@@ -312,12 +318,17 @@ public:
   virtual bool is_row_store_major_sstable() const { return is_row_store_major_sstable(key_.table_type_); }
   virtual bool is_co_sstable() const { return is_co_sstable(key_.table_type_); }
   virtual bool is_inv_sstable() const { return is_inv_sstable(key_.table_type_); }
+  virtual bool is_ivf_sstable() const { return is_ivf_sstable(key_.table_type_); }
   virtual bool is_rowkey_cg_sstable() const { return is_rowkey_cg_sstable(key_.table_type_); }
   virtual bool is_normal_cg_sstable() const { return is_normal_cg_sstable(key_.table_type_); }
   virtual bool is_cg_sstable() const { return is_cg_sstable(key_.table_type_); }
   virtual bool is_column_store_sstable() const { return is_co_sstable() || is_cg_sstable(); }
   virtual bool is_meta_major_sstable() const { return is_meta_major_sstable(key_.table_type_); }
   virtual bool is_major_sstable() const { return is_major_sstable(key_.table_type_) || is_meta_major_sstable(key_.table_type_); }
+  bool is_non_idem_major_sstable() const
+  {
+    return is_non_idem_major_sstable(key_.table_type_);
+  }
   virtual bool is_major_or_ddl_merge_sstable() const { return is_major_sstable()
                                                            || is_ddl_merge_sstable()
                                                            || is_inc_major_ddl_aggregate_sstable(key_.table_type_)
@@ -331,7 +342,12 @@ public:
   virtual bool is_inc_normal_cg_sstable() const { return is_inc_normal_cg_sstable(key_.table_type_); }
   virtual bool is_inc_cg_sstable() const { return is_inc_rowkey_cg_sstable() || is_inc_normal_cg_sstable(); }
   virtual bool is_inc_inv_sstable() const { return is_inc_inv_sstable(key_.table_type_); }
-  virtual bool is_inc_major_type_sstable() const { return is_inc_major_sstable() || is_inc_co_sstable() || is_inc_cg_sstable() || is_inc_inv_sstable(); }
+  virtual bool is_inc_ivf_sstable() const { return is_inc_ivf_sstable(key_.table_type_); }
+  virtual bool is_inc_major_type_sstable() const
+  {
+    return is_inc_major_sstable() || is_inc_co_sstable() || is_inc_cg_sstable()
+        || is_inc_inv_sstable() || is_inc_ivf_sstable();
+  }
   virtual bool is_major_type_sstable() const { return is_major_sstable() || is_inc_major_type_sstable(); }
   virtual bool is_multi_version_minor_sstable() const { return is_multi_version_minor_sstable(key_.table_type_); }
   virtual bool is_multi_version_table() const { return is_multi_version_table(key_.table_type_); }
@@ -378,7 +394,12 @@ public:
       || ObITable::TableType::COLUMN_ORIENTED_SSTABLE == table_type
       || ObITable::TableType::NORMAL_COLUMN_GROUP_SSTABLE == table_type
       || ObITable::TableType::ROWKEY_COLUMN_GROUP_SSTABLE == table_type
-      || ObITable::TableType::INV_INDEX_SSTABLE == table_type;
+      || ObITable::TableType::INV_INDEX_SSTABLE == table_type
+      || ObITable::TableType::IVF_INDEX_SSTABLE == table_type;
+  }
+  static bool is_non_idem_major_sstable(const TableType table_type)
+  {
+    return ObITable::TableType::IVF_INDEX_SSTABLE == table_type;
   }
   static bool is_minor_sstable(const TableType table_type)
   {
@@ -429,6 +450,11 @@ public:
     return ObITable::TableType::INV_INDEX_SSTABLE == table_type
         || ObITable::TableType::INC_INV_INDEX_SSTABLE == table_type;
   }
+  static bool is_ivf_sstable(const TableType table_type)
+  {
+    return ObITable::TableType::IVF_INDEX_SSTABLE == table_type
+        || ObITable::TableType::INC_IVF_INDEX_SSTABLE == table_type;
+  }
 
   static bool is_normal_cg_sstable(const TableType table_type)
   {
@@ -464,7 +490,8 @@ public:
    static bool is_inc_major_sstable(const TableType table_type)
    {
      return ObITable::INC_MAJOR_SSTABLE == table_type
-        || ObITable::INC_INV_INDEX_SSTABLE == table_type;
+        || ObITable::INC_INV_INDEX_SSTABLE == table_type
+        || ObITable::INC_IVF_INDEX_SSTABLE == table_type;
    }
    static bool is_inc_co_sstable(const TableType table_type)
    {
@@ -482,13 +509,18 @@ public:
    {
      return ObITable::INC_INV_INDEX_SSTABLE == table_type;
    }
+   static bool is_inc_ivf_sstable(const TableType table_type)
+   {
+     return ObITable::INC_IVF_INDEX_SSTABLE == table_type;
+   }
    static bool is_inc_major_type_sstable(const TableType table_type)
    {
      return is_inc_major_sstable(table_type)
          || is_inc_co_sstable(table_type)
          || is_inc_rowkey_cg_sstable(table_type)
          || is_inc_normal_cg_sstable(table_type)
-         || is_inc_inv_sstable(table_type);
+         || is_inc_inv_sstable(table_type)
+         || is_inc_ivf_sstable(table_type);
    }
 
    static bool is_inc_column_store_sstable(const TableType table_type)

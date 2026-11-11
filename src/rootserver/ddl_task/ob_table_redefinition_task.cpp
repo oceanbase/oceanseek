@@ -609,7 +609,8 @@ int ObTableRedefinitionTask::copy_table_indexes()
                   || index_schema->is_fts_index()
                   || index_schema->is_multivalue_index()
                   || index_schema->is_search_index()
-                  || index_schema->is_async_fts_index()) {
+                  || index_schema->is_async_fts_index()
+                  || index_schema->is_async_ivf_index()) {
                 has_rebuild_domain_indexes_ = true;
                 if (OB_FAIL(ObDDLUtil::construct_domain_index_arg(table_schema, index_schema, *this, create_index_arg, ddl_type))) {
                   LOG_WARN("failed to construct domain index arg", K(ret));
@@ -633,7 +634,8 @@ int ObTableRedefinitionTask::copy_table_indexes()
                 param.sub_task_trace_id_ = sub_task_trace_id_;
                 param.tenant_data_version_ = data_format_version_;
                 // Only async index offline DDL children borrow the parent snapshot.
-                if (index_schema->is_async_fts_index() || index_schema->is_async_search_index()) {
+                if (index_schema->is_async_fts_index() || index_schema->is_async_search_index()
+                    || index_schema->is_async_ivf_index()) {
                   param.new_snapshot_version_ = snapshot_version_;
                 }
                 bool is_active_task = false;

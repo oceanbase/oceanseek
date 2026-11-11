@@ -53,6 +53,7 @@ int ObStaticDataStoreDesc::assign(const ObStaticDataStoreDesc &desc)
   int ret = OB_SUCCESS;
   is_ddl_ = desc.is_ddl_;
   is_inc_major_ = desc.is_inc_major_;
+  is_non_idem_major_ = desc.is_non_idem_major_;
   merge_type_ = desc.merge_type_;
   compressor_type_ = desc.compressor_type_;
   ls_id_ = desc.ls_id_;

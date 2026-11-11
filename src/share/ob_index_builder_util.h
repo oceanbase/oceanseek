@@ -40,6 +40,20 @@ class ObSchemaGetterGuard;
 class ObIndexBuilderUtil
 {
 public:
+  static constexpr const char *ASYNC_DELETE_INDEX_NAME = "async_delete";
+  static int check_async_index_name(const common::ObString &index_name);
+  static int generate_async_delete_index_name(
+      obrpc::ObCreateIndexArg &arg,
+      common::ObIAllocator *allocator);
+  // Normalize an already deep-copied user async index argument into the
+  // shared async-delete index contract. Callers retain task-specific settings.
+  static int normalize_async_delete_index_arg(
+      obrpc::ObCreateIndexArg &arg,
+      common::ObIAllocator *allocator);
+  static int get_async_ivf_source_column(
+      const share::schema::ObTableSchema &data_schema,
+      const share::schema::ObTableSchema &index_schema,
+      const share::schema::ObColumnSchemaV2 *&source_column);
   static bool is_do_create_dense_vec_index(const ObIndexType index_type);
   static int adjust_expr_index_args(
       obrpc::ObCreateIndexArg &arg,
@@ -80,17 +94,17 @@ public:
         share::schema::ObSchemaGetterGuard &schema_guard,
         const int64_t col_id,
         bool &is_column_has_async_index);
-  static int check_async_index_name(const common::ObString &index_name);
+  static int check_column_match_async_ivf_index(
+        const share::schema::ObTableSchema &data_table_schema,
+        const share::schema::ObTableSchema &index_table_schema,
+        const int64_t col_id,
+        bool &is_match);
   static int check_sync_fts_async_search_index_conflict(
       const share::schema::ObIndexType new_index_type,
       const share::schema::ObIndexType existing_index_type);
-  static int generate_async_delete_index_name(
-      obrpc::ObCreateIndexArg &arg,
-      common::ObIAllocator *allocator);
 
 private:
   static const int SPATIAL_MBR_COLUMN_MAX_LENGTH = 32;
-  static constexpr const char *ASYNC_DELETE_INDEX_NAME = "async_delete";
   static int generate_prefix_column(
       const obrpc::ObColumnSortItem &sort_item,
       const ObSQLMode sql_mode,

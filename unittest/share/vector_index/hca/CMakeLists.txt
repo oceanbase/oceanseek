@@ -1,0 +1,2 @@
+ob_unittest(test_vector_hca_end_to_end)
+ob_unittest(test_vector_hca_simd)

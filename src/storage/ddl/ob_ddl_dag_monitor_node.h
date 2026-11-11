@@ -133,7 +133,7 @@ public:
   int clean_infos(const bool only_finished);
 
   void set_is_async_index_refresh(const bool value) { is_async_index_refresh_ = value; }
-  bool is_finished() const { return finish_timestamp_ > 0; }
+  bool is_finished() const { return ATOMIC_LOAD(&finish_timestamp_) > 0; }
   bool is_expired(const int64_t current_time, const int64_t ttl_us) const;
   // Returns true if the node currently holds no task-side monitor info.
   // Used by the manager's cleanup path to reclaim finished nodes whose
@@ -145,8 +145,8 @@ public:
   const void *get_dag_ptr() const { return reinterpret_cast<const void *>(key_.dag_ptr_); }
   const common::ObCurTraceId::TraceId &get_trace_id() const { return key_.trace_id_; }
   int64_t get_create_timestamp() const { return create_timestamp_; }
-  int64_t get_finish_timestamp() const { return finish_timestamp_; }
-  TO_STRING_KV(K_(is_inited), K_(is_async_index_refresh), K_(ref_cnt), KP_(allocator), K_(key), K_(create_timestamp), K_(finish_timestamp), K(info_list_.get_size()));
+  int64_t get_finish_timestamp() const { return ATOMIC_LOAD(&finish_timestamp_); }
+  DECLARE_TO_STRING;
 
 private:
   bool is_inited_;

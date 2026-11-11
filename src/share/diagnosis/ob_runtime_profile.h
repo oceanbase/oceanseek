@@ -88,6 +88,7 @@ class ObOpProfile
 public:
   static constexpr int MAX_METRIC_SLOT_CNT =
       ObMetricId::MONITOR_STATNAME_END - ObMetricId::MONITOR_STATNAME_BEGIN;
+  static constexpr int METRICS_ID_MAP_SLOT{sizeof(uint16_t) * ObMetricId::MONITOR_STATNAME_END};
   static constexpr uint8_t LOCAL_METRIC_CNT = 8;
 
 public:
@@ -109,7 +110,8 @@ public:
         non_local_metrics_(OB_MALLOC_NORMAL_BLOCK_SIZE, *alloc),
         child_array_(OB_MALLOC_NORMAL_BLOCK_SIZE, *alloc)
   {
-    MEMSET(metrics_id_map_, 0xFF, sizeof(metrics_id_map_));
+    // Fill each byte with 0xff so every uint16_t slot starts at UINT16_MAX.
+    MEMSET(metrics_id_map_, UINT8_MAX, METRICS_ID_MAP_SLOT);
     MEMSET(local_metrics_, 0, LOCAL_METRIC_CNT * sizeof(MetricWrap));
   }
 

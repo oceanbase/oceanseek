@@ -530,6 +530,56 @@ int ObTestAnnSearchHelper::get_recall_value(const int64_t topk)
   return ret;
 }
 
+TEST_F(TestVectorIndexKmeans, ip_quick_centers_normalize_center_only)
+{
+  const int64_t dim = 4;
+  const int64_t lists = 2;
+  uint64_t all_vsag_use_mem = 0;
+  lib::MemoryContext mem_context;
+  lib::ContextParam param;
+  param.set_mem_attr(ObMemAttr(OB_SERVER_TENANT_ID, "KmeansQuickUT"))
+       .set_page_size(OB_MALLOC_MIDDLE_BLOCK_SIZE)
+       .set_properties(lib::ALLOC_THREAD_SAFE
+                       | lib::RETURN_MALLOC_DEFAULT
+                       | lib::ADD_CHILD_THREAD_SAFE);
+  ASSERT_EQ(OB_SUCCESS, ROOT_CONTEXT->CREATE_CONTEXT(mem_context, param));
+
+  share::ObIvfMemContext ivf_mem_ctx(&all_vsag_use_mem);
+  ivf_mem_ctx.mem_context_ = mem_context;
+  ivf_mem_ctx.memory_context_ = mem_context;
+  ivf_mem_ctx.check_cnt_ = 0;
+  share::ObVectorNormalizeInfo norm_info;
+  share::ObSingleKmeansExecutor executor(ivf_mem_ctx);
+  float sample0[dim] = {100.0F, 0.0F, 0.0F, 0.0F};
+  float sample1[dim] = {0.0F, 2.0F, 0.0F, 0.0F};
+
+  ASSERT_EQ(OB_SUCCESS, executor.init(
+      share::ObKmeansAlgoType::KAT_ELKAN,
+      OB_SERVER_TENANT_ID,
+      lists,
+      1/*sample_per_nlist*/,
+      dim,
+      share::VIDA_IP,
+      &norm_info));
+  ASSERT_EQ(OB_SUCCESS, executor.append_sample_vector(sample0));
+  ASSERT_EQ(OB_SUCCESS, executor.append_sample_vector(sample1));
+  ASSERT_EQ(OB_SUCCESS, executor.build(nullptr/*insert_monitor*/));
+  ASSERT_EQ(lists, executor.get_centers_count());
+
+  float *center0 = nullptr;
+  float *center1 = nullptr;
+  ASSERT_EQ(OB_SUCCESS, executor.get_center(0, center0));
+  ASSERT_EQ(OB_SUCCESS, executor.get_center(1, center1));
+  ASSERT_NE(nullptr, center0);
+  ASSERT_NE(nullptr, center1);
+  EXPECT_FLOAT_EQ(1.0F, center0[0]);
+  EXPECT_FLOAT_EQ(0.0F, center0[1]);
+  EXPECT_FLOAT_EQ(0.0F, center1[0]);
+  EXPECT_FLOAT_EQ(1.0F, center1[1]);
+  EXPECT_FLOAT_EQ(100.0F, executor.ctx_.sample_vectors_.at(0)[0]);
+  EXPECT_FLOAT_EQ(2.0F, executor.ctx_.sample_vectors_.at(1)[1]);
+}
+
 TEST_F(TestVectorIndexKmeans, hgraph_centroid_distance_preserves_existing_metrics)
 {
   // L1 chooses center 10 (distance 3), while squared L2 chooses center 20 (distance 8).

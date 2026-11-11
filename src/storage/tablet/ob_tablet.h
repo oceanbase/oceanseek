@@ -142,7 +142,7 @@ public:
   inline bool is_global_index_table() const { return is_global_index_table_; }
   inline bool need_progressive_merge() const { return need_progressive_merge_; }
   inline bool is_async_index_refresh_target() const { return is_async_index_refresh_target_; }
-  inline bool is_async_inverted_storage_index() const
+  inline bool is_async_index_storage_tablet() const
   {
     return is_async_index_refresh_target_ && !is_async_delete_index_;
   }
@@ -286,9 +286,9 @@ public:
   {
     return table_store_cache_.is_async_index_refresh_target();
   }
-  inline bool is_async_inverted_storage_index() const
+  inline bool is_async_index_storage_tablet() const
   {
-    return table_store_cache_.is_async_inverted_storage_index();
+    return table_store_cache_.is_async_index_storage_tablet();
   }
   inline bool is_table_store_cache_inited() const { return table_store_cache_.is_inited(); }
   inline bool is_async_index() const { return table_store_cache_.is_async_index_refresh_target(); }

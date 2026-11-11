@@ -16,6 +16,7 @@
 #include "storage/blocksstable/ob_shared_macro_block_manager.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
 #include "storage/blocksstable/index_block/ob_sstable_index_scanner.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable.h"
 #include "storage/ddl/ob_tablet_ddl_kv.h"
 #include "storage/async_index/ob_async_index_define.h"
 #include "share/compaction_ttl/ob_compaction_ttl_util.h"
@@ -1157,11 +1158,12 @@ int ObSSTable::backfill_commit_version(
   const int64_t old_upper_trans_version = meta_cache_.upper_trans_version_;
   const SCN &old_filled_tx_scn = meta_cache_.filled_tx_scn_;
 
-  // Major INV_INDEX 无 DDL 事务 commit version 可回填。
-  // INC_INV_INDEX 属于 inc major，transfer/HA 需要回填 upper_trans_version 与 filled_tx_scn。
-  if (OB_UNLIKELY(is_inv_sstable() && !is_inc_inv_sstable())) {
+  // Major INV/IVF index 无 DDL 事务 commit version 可回填。
+  // INC_INV / INC_IVF 属于 inc major，transfer/HA 需要回填 upper_trans_version 与 filled_tx_scn。
+  if (OB_UNLIKELY((is_inv_sstable() && !is_inc_inv_sstable())
+      || (is_ivf_sstable() && !is_inc_ivf_sstable()))) {
     ret = OB_NOT_SUPPORTED;
-    LOG_WARN("backfill commit version is not supported for major inv sstable", K(ret), KPC(this));
+    LOG_WARN("backfill commit version is not supported for major inv/ivf sstable", K(ret), KPC(this));
   } else if (OB_UNLIKELY(!is_inc_major_type_sstable())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected table type", K(ret), KPC(this));
@@ -1412,10 +1414,11 @@ int ObSSTable::deserialize(common::ObArenaAllocator &allocator,
     LOG_WARN("failed to deserialize ObITable", K(ret), K(data_len), K(pos));
   } else if (OB_UNLIKELY(
       (is_co_sstable() && typeid(*this) != typeid(ObCOSSTableV2))
-      || (is_inv_sstable() && typeid(*this) != typeid(ObInvSSTable)))) {
+      || (is_inv_sstable() && typeid(*this) != typeid(ObInvSSTable))
+      || (is_ivf_sstable() && typeid(*this) != typeid(ObIvfSSTable)))) {
     ret = OB_ERR_UNEXPECTED;
     const char *expected_object_type = is_co_sstable() ? "ObCOSSTableV2"
-        : "ObInvSSTable";
+        : is_inv_sstable() ? "ObInvSSTable" : "ObIvfSSTable";
     LOG_WARN("sstable type does not match object type", K(ret), K_(key),
         "table_type", ObITable::get_table_type_name(get_table_type()),
         K(expected_object_type), "actual_object_type", typeid(*this).name());

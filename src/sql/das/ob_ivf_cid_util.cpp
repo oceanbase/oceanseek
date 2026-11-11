@@ -140,7 +140,9 @@ int ObIVFCidUtil::resolve_centroid_static(
     LOG_WARN("failed to get centers cache", K(ret), K(table_id), K(tablet_id));
   } else if (is_cache_usable && cent_cache->has_hgraph_index()) {
     float *vector_data = reinterpret_cast<float*>(arr->get_data());
-    if (OB_FAIL(ObVectorIndexUtil::get_nearest_center_with_hgraph(vector_data, cent_cache, center_idx))) {
+    share::ObVsagSearchAlloc hgraph_allocator(MTL_ID());
+    if (OB_FAIL(ObVectorIndexUtil::get_nearest_center_with_hgraph(
+            vector_data, cent_cache, center_idx, &hgraph_allocator))) {
       LOG_WARN("failed to get nearest center with hgraph", K(ret));
     } else {
       LOG_DEBUG("HGraph search succeeded", K(center_idx), K(tablet_id));
@@ -152,9 +154,7 @@ int ObIVFCidUtil::resolve_centroid_static(
         LOG_WARN("cent cache is null", K(ret));
       } else {
         centers_data = cent_cache->get_centroids();
-        if (OB_ISNULL(centers_data) && OB_FAIL(cent_cache->get_centroids(&allocator, &centers_data))) {
-          LOG_WARN("fail to get centroids from cache", K(ret));
-        } else if (OB_ISNULL(centers_data)) {
+        if (OB_ISNULL(centers_data)) {
           ret = OB_ERR_NULL_VALUE;
           LOG_WARN("centroids is null", K(ret));
         } else {

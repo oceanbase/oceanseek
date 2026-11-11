@@ -650,8 +650,9 @@ int convert_persist_profile_to_realtime(const char *persist_profile, const int64
       if (profile_head.parent_idx_ >= 0) {
         ObOpProfile<ObMetric> *parent_profile = profiles_array[profile_head.parent_idx_];
         if (ObProfileUtil::is_hybrid_search_profile(profile_head.id_)
-            || profile_head.id_ == ObProfileId::VECTOR_SEARCH_PARTITION) {
-          // Preserve distinct Hybrid Search and Vector Search Partition instances.
+            || profile_head.id_ == ObProfileId::VECTOR_SEARCH_PARTITION
+            || profile_head.id_ == ObProfileId::VECTOR_SEARCH_IVF_SEGMENT) {
+          // Preserve distinct Hybrid Search, Vector Search Partition and physical IVF Segment instances.
           if (OB_FAIL(parent_profile->register_child(profile_head.id_, new_profile))) {
             LOG_WARN("failed to register child profile", K(ret), K(i), K(profile_head.id_));
           }

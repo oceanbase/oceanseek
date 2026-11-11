@@ -2857,6 +2857,18 @@ DEF_INT(ob_vector_memory_limit_percentage, OB_TENANT_PARAMETER, "0",
         "Used to control the upper limit percentage of memory resources that the vector_index module can use. Range:[0, 100)."
         "The system will adjust automatically if ob_vector_memory_limit_percentage set to 0(by default).",
         ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+DEF_CAP(_vector_index_ivf_build_cache_size, OB_TENANT_PARAMETER, "0M", "[0M,)",
+        "Memory cache for intermediate replay data and prepared training samples of asynchronous IVF initial builds and merges "
+        "shared by one tenant on each observer. "
+        "Increasing the cache can reduce temporary-file I/O and improve build performance. "
+        "A build reserves the available budget and divides it across its input slices; exhausted builds spill. "
+        "0 disables this cache and spills its payload to temporary files; training still requires memory. "
+        "Positive values cap the shared retained-data quota, not total build memory. "
+        "Changes affect new reservations only. "
+        "A 1-byte per-slice threshold dumps all replay payload at seal; temporary-file caches remain. "
+        "Cluster and refinement samples reuse the build reservation left unused by sealed replay data. "
+        "Write blocks, reader buffers, training workspaces and allocator overhead are outside this budget.",
+        ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 DEF_STR_WITH_CHECKER(vector_task_thread_limit_percent, OB_TENANT_PARAMETER, "",
     common::ObVecTaskThreadLimitPercentChecker,
     "Per-task-type water level threshold override for vector async task scheduling. "
@@ -3555,6 +3567,26 @@ DEF_BOOL(enable_mv_binlog_minimal_mode, OB_TENANT_PARAMETER, "False",
 DEF_INT(_ivf_max_scan_vectors, OB_TENANT_PARAMETER, "1000",
         "The upper limit of ivf iter-filter search nums. Range: [0,)",
         ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+
+DEF_INT(_disk_bbq_max_scan_vectors, OB_TENANT_PARAMETER, "0", "[0,)",
+        "The scan budget for DISK_BBQ iterative filtering, counted in scanned low-precision vector rows. "
+        "0 disables the budget limit.",
+        ObParameterAttr(Section::OBSERVER, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+DEF_INT(_disk_bbq_centroid_hierarchy_threshold, OB_TENANT_PARAMETER, "300000", "[1,2147483647]",
+        "Minimum unique leaf centroid count for building a Disk BBQ parent centroid layer. "
+        "Applies to newly built SSTables only; existing SSTable layouts are unchanged.",
+        ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+
+DEF_INT(_disk_bbq_centroid_cache_mem_percentage, OB_TENANT_PARAMETER, "80", "[0,100]",
+        "Maximum percentage of tenant vector memory available to Disk BBQ SSTable centroid caches. "
+        "Zero bypasses centroid caches, disables new cache admission and asynchronously evicts existing entries.",
+        ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
+
+DEF_INT(_disk_bbq_centroid_hgraph_threshold, OB_TENANT_PARAMETER, "3000", "[0,2147483647]",
+        "Minimum root centroid count for building a Disk BBQ SSTable centroid HGraph. "
+        "Zero disables new builds. Applies to flat centroids and hierarchical parent centroids; "
+        "child groups remain ARRAY. Existing graphs are retained.",
+        ObParameterAttr(Section::TENANT, Source::DEFAULT, EditLevel::DYNAMIC_EFFECTIVE));
 
 DEF_INT(_max_access_entries_for_external_table_partition, OB_TENANT_PARAMETER, "1000000", "[1,)",
         "max number of entries accessed in a single partition for external table, including directories and files.",

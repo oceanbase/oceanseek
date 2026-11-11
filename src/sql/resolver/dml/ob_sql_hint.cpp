@@ -2923,7 +2923,9 @@ int LogTableHint::init_index_hints(const ObDMLStmt &stmt, ObSqlSchemaGuard &sche
                                                            false,
                                                            table_->access_all_part(),
                                                            true /*domain index*/,
-                                                           false /*spatial index*/))) {
+                                                           false /*spatial index*/,
+                                                           true /*vector index*/,
+                                                           true /*async index*/))) {
     LOG_WARN("failed to get can read index", K(ret));
   } else if (OB_FAIL(schema_guard.get_table_schema(table_->ref_id_, data_table_schema))) {
     LOG_WARN("failed to get data table schema", K(ret), K(table_->ref_id_));
@@ -2990,9 +2992,11 @@ int LogTableHint::init_index_hints(const ObDMLStmt &stmt, ObSqlSchemaGuard &sche
                  OB_ISNULL(index_schema)) {
         ret = OB_SCHEMA_ERROR;
         LOG_WARN("fail to get table schema", K(index_id), K(ret));
-      } else if (index_schema->is_built_in_fts_index() || (index_schema->is_vec_index() && !stmt.has_vec_approx())) {
+      } else if ((index_schema->is_async_index() && !index_schema->is_async_ivf_index()) ||
+                 index_schema->is_built_in_fts_index() ||
+                 (index_schema->is_vec_or_async_vec_index() && !stmt.has_vec_approx())) {
         is_index_hint_candidate = false;
-      } else if (stmt.has_vec_approx() && index_schema->is_vec_index() 
+      } else if (stmt.has_vec_approx() && index_schema->is_vec_or_async_vec_index()
           && OB_FAIL(check_vec_hint_index_id(stmt, schema_guard, index_id, is_vec_index_valid))) {
         LOG_WARN("failed to check vector index hint valid", K(ret));
       } else if (!is_vec_index_valid) {
@@ -3039,7 +3043,8 @@ int LogTableHint::init_index_hints(const ObDMLStmt &stmt, ObSqlSchemaGuard &sche
           } else if (0 != index_hint->get_index_name().case_compare(index_name)) {
             /* do nothing */
           } else if (T_VECTOR_INDEX_HINT == index_hint->get_hint_type()) {
-            if (OB_NOT_NULL(index_schema) && index_schema->is_vec_index() && stmt.has_vec_approx()) {
+            if (OB_NOT_NULL(index_schema) && index_schema->is_vec_or_async_vec_index() &&
+                stmt.has_vec_approx()) {
               vec_index_hint_pos = hint_i;
             }
           } else if (T_NO_INDEX_HINT == index_hint->get_hint_type()) {

@@ -19,6 +19,7 @@
 #include "lib/utility/ob_fast_convert.h"
 #include "sql/rewrite/ob_expand_aggregate_utils.h"
 #include "share/vector_index/ob_vector_index_util.h"
+#include "share/ob_index_builder_util.h"
 #include "share/search_index/ob_search_index_encoder.h"
 #include "lib/json_type/ob_json_parse.h"
 #include "lib/encode/ob_base64_encode.h"
@@ -2074,7 +2075,8 @@ int ObDSLResolver::get_dist_algo_type(
     algo_type = ObVectorIndexDistAlgorithm::VIDA_COS;
     is_brute_force = true;
   } else if (!is_local_vec_hnsw_index(idx_info->index_type_)
-             && !is_local_vec_ivf_index(idx_info->index_type_)) {
+             && !is_local_vec_ivf_index(idx_info->index_type_)
+             && !is_async_ivf_index(idx_info->index_type_)) {
     ret = OB_NOT_SUPPORTED;
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "knn search for vector column without hnsw or ivf index");
     LOG_WARN("vector index type is not supported for knn search", K(ret), K(idx_info->index_type_));
@@ -2440,6 +2442,41 @@ int ObDSLResolver::init_index_infos()
         LOG_WARN("index table schema should not be null", K(ret), K(index_info.table_id_));
       } else if (index_schema->is_built_in_index()) {
         continue;
+      } else if (is_async_ivf_index(index_schema->get_index_type())) {
+        const ObColumnSchemaV2 *source_column = nullptr;
+        ObColumnIndexInfo *existing = nullptr;
+        ObColumnIndexInfo *info = nullptr;
+        ObVectorIndexParam index_param;
+        ObString column_name;
+        if (!index_schema->can_read_index() || !index_schema->is_index_visible()) {
+          continue;
+        } else if (OB_FAIL(ObIndexBuilderUtil::get_async_ivf_source_column(
+            *table_schema_, *index_schema, source_column))) {
+          LOG_WARN("failed to resolve async IVF source column", K(ret));
+        } else if (OB_ISNULL(source_column)) {
+          ret = OB_ERR_UNEXPECTED;
+        } else if (OB_FAIL(ObCharset::tolower(CS_TYPE_UTF8MB4_GENERAL_CI,
+            source_column->get_column_name_str(), column_name, *allocator_))) {
+          LOG_WARN("failed to normalize async IVF column name", K(ret));
+        } else if (OB_FAIL(col_idx_map_.get_refactored(column_name, existing))) {
+          if (OB_HASH_NOT_EXIST == ret) {
+            ret = OB_SUCCESS;
+            if (OB_ISNULL(info = OB_NEWx(ObColumnIndexInfo, allocator_))) {
+              ret = OB_ALLOCATE_MEMORY_FAILED;
+            } else if (OB_FAIL(ObTableSchema::get_index_name(*allocator_, table_schema_->get_table_id(),
+                ObString::make_string(index_schema->get_table_name()), info->index_name_))) {
+              LOG_WARN("failed to resolve async IVF index name", K(ret));
+            } else if (OB_FAIL(ObVectorIndexUtil::parser_params_from_string(
+                index_schema->get_index_params(), ObVectorIndexType::VIT_IVF_INDEX, index_param))) {
+              LOG_WARN("failed to parse async IVF metric", K(ret));
+            } else {
+              info->index_type_ = index_schema->get_index_type();
+              info->index_schema_ = index_schema;
+              info->dist_algorithm_ = index_param.dist_algorithm_;
+              ret = col_idx_map_.set_refactored(column_name, info);
+            }
+          }
+        }
       } else if (share::schema::is_search_def_index(index_info.index_type_)) {
         if (OB_FAIL(collect_search_index_info(index_schema))) {
           LOG_WARN("fail to collect search index info", K(ret));
@@ -5141,16 +5178,22 @@ int ObDSLResolver::resolve_search_options(ObIJsonBase &req_node, ObDSLKnnQuery::
         search_option->param_.ob_sparse_drop_ratio_search_ = drop_ratio_search;
         search_option->param_.is_set_drop_ratio_search_ = 1;
       }
-    } else if (key.case_compare("ivf_nprobes") == 0) {
-      if (sub_node->json_type() != ObJsonNodeType::J_INT) {
+    } else if (key.case_compare("nprobes") == 0 || key.case_compare("ivf_nprobes") == 0) {
+      if (search_option->param_.is_set_ivf_nprobes_) {
         ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("ivf_nprobes should be int type", K(ret), K(sub_node->json_type()));
+        LOG_USER_ERROR(OB_INVALID_ARGUMENT, "duplicate field nprobes in search options");
+        LOG_WARN("duplicate field nprobes in search options", K(ret), K(key));
+      } else if (sub_node->json_type() != ObJsonNodeType::J_INT) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("nprobes should be int type", K(ret), K(sub_node->json_type()));
       } else if (OB_FAIL(sub_node->to_int(ivf_nprobes))) {
-        LOG_WARN("fail to get int value from ivf_nprobes", K(ret));
-      } else if (ivf_nprobes < 1 || ivf_nprobes > 65536) {
+        LOG_WARN("fail to get int value from nprobes", K(ret));
+      } else if (ivf_nprobes < 0 || ivf_nprobes > 65536) {
         ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("ivf_nprobes value not in valid range", K(ret), K(ivf_nprobes));
+        LOG_WARN("nprobes value not in valid range", K(ret), K(ivf_nprobes));
       } else {
+        // Explicit zero enables DiskBBQ automatic search. Other index types
+        // reject zero when the query parameters are bound to the chosen index.
         search_option->param_.ivf_nprobes_ = ivf_nprobes;
         search_option->param_.is_set_ivf_nprobes_ = 1;
       }

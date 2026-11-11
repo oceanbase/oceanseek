@@ -18,6 +18,8 @@ namespace oceanbase
 namespace storage
 {
 
+class ObIVFDDLDagCtx;
+
 struct ObColumnClusteredDagInitParam : public ObDDLIndependentDagInitParam
 {
 public:
@@ -59,6 +61,10 @@ public:
 
   INHERIT_TO_STRING_KV("DDLDag", ObDDLIndependentDag, K_(px_thread_count), K_(px_finished_count), K_(sample_scan_finished_count), K_(is_range_count_ready), K_(total_slice_count));
 private:
+  friend class ObIVFDDLDagCtx;
+
+  int generate_ivf_initial_build_tasks_(
+      common::ObIArray<share::ObITask *> &need_schedule_tasks);
   int convert_range_cut_to_ranges(const sql::ObPxTabletRange::RangeCut &range_cut,
                                   const uint64_t table_id,
                                   ObIAllocator &allocator,

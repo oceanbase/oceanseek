@@ -141,7 +141,8 @@ int ObAsyncIndexExecutor::check_has_available_async_index(
       const auto &info = index_infos.at(i);
       const bool is_search = share::schema::is_async_search_def_index(info.index_type_);
       const bool is_delete = share::schema::is_async_delete_index(info.index_type_);
-      if (share::schema::is_async_fts_index(info.index_type_) || is_search || is_delete) {
+      if (share::schema::is_async_fts_index(info.index_type_)
+          || share::schema::is_async_ivf_index(info.index_type_) || is_search || is_delete) {
         const share::schema::ObTableSchema *index_schema = nullptr;
         OZ(schema_guard.get_table_schema(tenant_id_, info.table_id_, index_schema));
         OV(OB_NOT_NULL(index_schema), OB_SCHEMA_EAGAIN, info);

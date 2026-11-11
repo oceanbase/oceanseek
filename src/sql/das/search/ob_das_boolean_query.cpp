@@ -719,6 +719,7 @@ int ObDASBooleanQueryRtDef::generate_async_op(
       static_cast<const ObDASBooleanQueryCtDef *>(ctdef_);
   ObDASAsyncBindingGuard binding_guard(search_ctx);
   int64_t max_group_cnt = 0;
+  const int64_t bound_group = search_ctx.get_async_group_slot();
   if (OB_ISNULL(query_ctx) || OB_UNLIKELY(!query_ctx->is_inited())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("async index query catalog is not initialized", K(ret), KP(query_ctx));
@@ -751,7 +752,12 @@ int ObDASBooleanQueryRtDef::generate_async_op(
     LOG_WARN("async query catalog has no segment group", K(ret), K(max_group_cnt));
   }
 
-  for (int64_t group_slot = 0; OB_SUCC(ret) && group_slot < max_group_cnt; ++group_slot) {
+  if (OB_SUCC(ret) && (bound_group < -1 || bound_group >= max_group_cnt)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("bound async group outside query catalog", K(ret), K(bound_group), K(max_group_cnt));
+  }
+  for (int64_t group_slot = bound_group < 0 ? 0 : bound_group;
+       OB_SUCC(ret) && group_slot < (bound_group < 0 ? max_group_cnt : bound_group + 1); ++group_slot) {
     ObIDASSearchOp *query_op = nullptr;
     ObIDASSearchOp *deletion_op = nullptr;
     ObIDASSearchOp *group_op = nullptr;
@@ -773,7 +779,10 @@ int ObDASBooleanQueryRtDef::generate_async_op(
       LOG_WARN("failed to append async Group query tree", K(ret), K(group_slot));
     }
   }
-  if (OB_SUCC(ret) && OB_FAIL(ObDASSearchUtils::create_async_segment_group_merge_op(
+  if (OB_SUCC(ret) && bound_group >= 0) {
+    if (1 != group_ops.count()) { ret = OB_ERR_UNEXPECTED; }
+    else { op = group_ops.at(0); }
+  } else if (OB_SUCC(ret) && OB_FAIL(ObDASSearchUtils::create_async_segment_group_merge_op(
           group_ops, ctdef->is_scoring(), search_ctx, op))) {
     LOG_WARN("failed to create async segment group merge", K(ret), K(max_group_cnt));
   }

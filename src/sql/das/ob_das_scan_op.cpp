@@ -930,7 +930,9 @@ static bool das_ctdef_tree_has_async_index(const ObDASBaseCtDef *ctdef)
 {
   bool found = false;
   if (OB_NOT_NULL(ctdef)) {
-    if (DAS_OP_BOOLEAN_QUERY == ctdef->op_type_
+    if (DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN == ctdef->op_type_) {
+      found = true;
+    } else if (DAS_OP_BOOLEAN_QUERY == ctdef->op_type_
         && static_cast<const ObDASBooleanQueryCtDef *>(ctdef)->is_async()) {
       found = true;
     } else if (DAS_OP_SCALAR_SCAN_QUERY == ctdef->op_type_
@@ -951,11 +953,15 @@ static bool das_ctdef_tree_has_async_index(const ObDASBaseCtDef *ctdef)
 // group that was created by another async leaf in the same hybrid-search tree.
 static int collect_async_index_scan_ctdefs(
     const ObDASBaseCtDef *ctdef,
-    ObIArray<const ObDASScalarScanCtDef *> &scan_ctdefs)
+    ObIArray<const ObDASBaseCtDef *> &scan_ctdefs)
 {
   int ret = OB_SUCCESS;
   if (OB_ISNULL(ctdef)) {
     // Empty child is tolerated here; the ordinary DAS tree validation reports malformed trees.
+  } else if (DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN == ctdef->op_type_) {
+    const auto *scan = static_cast<const ObDASVecIndexAsyncIVFScanCtDef *>(ctdef)->get_index_scan_ctdef();
+    if (nullptr == scan) { ret = OB_ERR_UNEXPECTED; }
+    else { ret = scan_ctdefs.push_back(scan); }
   } else if (DAS_OP_IR_SCAN == ctdef->op_type_) {
     const ObDASIRScanCtDef *ir_ctdef = static_cast<const ObDASIRScanCtDef *>(ctdef);
     const ObDASScalarScanCtDef *inv_scan_ctdef = nullptr;
@@ -1012,6 +1018,15 @@ int ObDASScanOp::collect_async_delete_tablet_id_from_ctdef_(
   int ret = OB_SUCCESS;
   if (OB_ISNULL(ctdef)) {
     // Empty child is allowed in a partially generated search tree.
+  } else if (DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN == ctdef->op_type_) {
+    const auto *scan = static_cast<const ObDASVecIndexAsyncIVFScanCtDef *>(ctdef)->get_delete_scan_ctdef();
+    ObTabletID current;
+    if (nullptr == scan) { ret = OB_ERR_UNEXPECTED; }
+    else if (OB_FAIL(get_related_tablet_id(scan, current))) {
+      LOG_WARN("failed to resolve async IVF deletion tablet", K(ret));
+    } else if (!current.is_valid() || (delete_tablet_id.is_valid() && current != delete_tablet_id)) {
+      ret = OB_ERR_UNEXPECTED;
+    } else { delete_tablet_id = current; }
   } else if (DAS_OP_BOOLEAN_QUERY == ctdef->op_type_
       && static_cast<const ObDASBooleanQueryCtDef *>(ctdef)->is_async()) {
     const ObDASBooleanQueryCtDef *boolean_ctdef =
@@ -1095,14 +1110,18 @@ int ObDASScanOp::build_async_index_query_ctx(ObDASAsyncIndexQueryCtx &query_ctx)
     }
   }
   if (OB_SUCC(ret) && !prepared_from_candidates) {
-    ObSEArray<const ObDASScalarScanCtDef *, 4> scan_ctdefs;
+    ObSEArray<const ObDASBaseCtDef *, 4> scan_ctdefs;
     if (OB_FAIL(collect_async_index_scan_ctdefs(attach_ctdef_, scan_ctdefs))) {
       LOG_WARN("failed to collect current async index scan ctdefs", K(ret));
     }
     for (int64_t i = 0; OB_SUCC(ret) && i < index_table_ids.count(); ++i) {
       ObTabletID index_tablet_id;
       for (int64_t j = 0; OB_SUCC(ret) && j < scan_ctdefs.count(); ++j) {
-        if (index_table_ids.at(i) == scan_ctdefs.at(j)->ref_table_id_) {
+        const ObDASBaseCtDef *scan = scan_ctdefs.at(j);
+        const uint64_t ref_id = DAS_OP_TABLE_SCAN == scan->op_type_
+            ? static_cast<const ObDASScanCtDef *>(scan)->ref_table_id_
+            : static_cast<const ObDASScalarScanCtDef *>(scan)->ref_table_id_;
+        if (index_table_ids.at(i) == ref_id) {
           ObTabletID current_index_tablet_id;
           if (OB_FAIL(get_related_tablet_id(
                   scan_ctdefs.at(j), current_index_tablet_id))) {
@@ -1522,6 +1541,26 @@ int ObDASScanOp::set_hybrid_search_tablet_ids(ObDASIter *result)
           } else {
             vec_index_driver_iter->set_related_tablet_ids(related_tablet_ids);
             vec_index_scan_iter->set_related_tablet_ids(related_tablet_ids);
+            vec_index_driver_iter->set_ls_id(ls_id_);
+            vec_index_scan_iter->set_ls_id(ls_id_);
+          }
+        } else if (driver_ctdef->children_[0]->op_type_ == DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN) {
+          const auto *scan_ctdef =
+              static_cast<const ObDASVecIndexAsyncIVFScanCtDef *>(driver_ctdef->children_[0]);
+          common::ObTabletID index_tablet_id;
+          common::ObTabletID delete_tablet_id;
+          if (OB_ISNULL(scan_ctdef->get_index_scan_ctdef())
+              || OB_ISNULL(scan_ctdef->get_delete_scan_ctdef())) {
+            ret = OB_ERR_UNEXPECTED;
+          } else if (OB_FAIL(get_related_tablet_id(scan_ctdef->get_index_scan_ctdef(), index_tablet_id))) {
+            LOG_WARN("failed to resolve async IVF index tablet", K(ret));
+          } else if (OB_FAIL(get_related_tablet_id(scan_ctdef->get_delete_scan_ctdef(), delete_tablet_id))) {
+            LOG_WARN("failed to resolve async IVF deletion tablet", K(ret));
+          } else {
+            // The adapter binds pinned index ranges through the shared query catalog.
+            // Scalar post-filter lookup uses the current data partition.
+            related_tablet_ids.lookup_tablet_id_ = scan_param_.tablet_id_;
+            vec_index_driver_iter->set_related_tablet_ids(related_tablet_ids);
             vec_index_driver_iter->set_ls_id(ls_id_);
             vec_index_scan_iter->set_ls_id(ls_id_);
           }
@@ -2663,9 +2702,14 @@ int ObDASScanOp::get_table_lookup_tablet_id(common::ObTabletID &tablet_id) const
 int ObDASScanOp::get_vec_ir_tablet_ids(ObDASRelatedTabletID &related_tablet_ids)
 {
   int ret = OB_SUCCESS;
+  bool is_async_ivf = ObDASIterUtils::is_async_ivf_scan(attach_ctdef_, attach_rtdef_);
   bool is_ivf = ObDASIterUtils::is_vec_ivf_scan(attach_ctdef_, attach_rtdef_);
   bool is_spiv = ObDASIterUtils::is_vec_spiv_scan(attach_ctdef_, attach_rtdef_);
-  if (is_spiv) {
+  if (is_async_ivf) {
+    if (OB_FAIL(get_async_ivf_tablet_ids(related_tablet_ids))) {
+      LOG_WARN("failed to get async ivf related tablet ids", K(ret));
+    }
+  } else if (is_spiv) {
     if (OB_FAIL(get_spiv_ir_tablet_ids(related_tablet_ids.inv_idx_tablet_id_,
                                        related_tablet_ids.dim_docid_value_tablet_id_,
                                        related_tablet_ids.rowkey_doc_tablet_id_))) {
@@ -2693,6 +2737,43 @@ int ObDASScanOp::get_vec_ir_tablet_ids(ObDASRelatedTabletID &related_tablet_ids)
     }
   }
 
+  return ret;
+}
+
+int ObDASScanOp::get_async_ivf_tablet_ids(ObDASRelatedTabletID &related_tablet_ids) const
+{
+  int ret = OB_SUCCESS;
+  const ObDASBaseCtDef *base_ctdef = nullptr;
+  const ObDASVecAuxScanCtDef *vec_aux_ctdef = nullptr;
+  related_tablet_ids.async_ivf_index_tablet_id_.reset();
+  related_tablet_ids.async_delete_tablet_id_.reset();
+  if (OB_FAIL(ObDASUtils::find_child_das_ctdef(
+          attach_ctdef_, DAS_OP_VEC_SCAN, base_ctdef))) {
+    LOG_WARN("failed to find async ivf vector scan ctdef", K(ret));
+  } else if (OB_ISNULL(base_ctdef)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("async ivf vector scan ctdef is null", K(ret));
+  } else if (FALSE_IT(vec_aux_ctdef = static_cast<const ObDASVecAuxScanCtDef *>(base_ctdef))) {
+  } else if (OB_UNLIKELY(!vec_aux_ctdef->is_async_index_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("vector scan ctdef is not async index", K(ret), KPC(vec_aux_ctdef));
+  } else if (OB_ISNULL(vec_aux_ctdef->get_async_ivf_index_scan_ctdef())
+             || OB_ISNULL(vec_aux_ctdef->get_async_delete_scan_ctdef())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("async ivf related scan ctdef is null", K(ret), KPC(vec_aux_ctdef));
+  } else if (OB_FAIL(get_related_tablet_id(
+                 vec_aux_ctdef->get_async_ivf_index_scan_ctdef(),
+                 related_tablet_ids.async_ivf_index_tablet_id_))) {
+    LOG_WARN("failed to get async ivf index tablet id", K(ret));
+  } else if (OB_FAIL(get_related_tablet_id(
+                 vec_aux_ctdef->get_async_delete_scan_ctdef(),
+                 related_tablet_ids.async_delete_tablet_id_))) {
+    LOG_WARN("failed to get async delete tablet id", K(ret));
+  } else if (OB_UNLIKELY(!related_tablet_ids.async_ivf_index_tablet_id_.is_valid()
+                         || !related_tablet_ids.async_delete_tablet_id_.is_valid())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async ivf related tablet id", K(ret), K_(related_tablet_ids));
+  }
   return ret;
 }
 

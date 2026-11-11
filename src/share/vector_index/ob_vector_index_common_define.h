@@ -5,6 +5,7 @@
  #ifndef OCEANBASE_SHARE_VECTOR_INDEX_COMMON_DEFINE_H_
  #define OCEANBASE_SHARE_VECTOR_INDEX_COMMON_DEFINE_H_
 
+#include <cstdint>
 #include "common/ob_tablet_id.h"
 #include "lib/string/ob_string.h"
 #include "lib/utility/ob_print_utils.h"
@@ -18,6 +19,9 @@ constexpr static int64_t  OB_VSAG_MAX_EF_SEARCH = 160000;
 constexpr static int64_t  OB_VECTOR_INDEX_MAX_SEGMENT_CNT = 10;
 constexpr static int64_t  OB_VECTOR_INDEX_SNAPSHOT_KEY_LENGTH = 256;
 constexpr static int64_t  OB_VECTOR_INDEX_MERGE_BASE_PERCENTAGE = 20;
+// TODO @lyl512932: DiskBBQ currently supports only 1-bit quantization;
+// revisit this default when additional bit widths are supported.
+constexpr static int8_t DISK_BBQ_RABITQ_BITS = 1;
 constexpr static int64_t OB_ALTER_INDEX_PARAMS_MIN_PARALLEL_BUILD = 0;
 constexpr static int64_t OB_ALTER_INDEX_PARAMS_MAX_PARALLEL_BUILD = 64;
 
@@ -29,6 +33,15 @@ enum ObVectorIndexRecordType
   VIRT_DATA, // data tablet/table
   VIRT_EMBEDDED, // embedded table
   VIRT_MAX
+};
+
+enum ObVectorIndexDistAlgorithm
+{
+  VIDA_L2 = 0,
+  VIDA_IP = 1,
+  VIDA_COS = 2,
+  VIDA_L1 = 3,
+  VIDA_MAX
 };
 
 enum ObCanSkip3rdAnd4thVecIndex

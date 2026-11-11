@@ -13,6 +13,7 @@
 #define private public
 #define protected public
 #include "share/vector_index/ob_vector_index_ivf_cache_mgr.h"
+#include "share/vector_index/disk_bbq_cache/ob_ivf_sstable_cache_controller.h"
 #include "lib/rc/context.h"
 #include "lib/alloc/ob_malloc_allocator.h"
 #include "common/ob_clock_generator.h"
@@ -29,6 +30,172 @@ static const int64_t TEST_BUCKET_NUM = 128;
 // 传一个远大于它的保留快照，满足 is_gc_erasable 的 snapshot 前置条件，
 // 从而只验证 delet_scn_/ref_cnt_ 语义，不测 snapshot 边界本身。
 static const int64_t TEST_MIN_RESERVED_SNAPSHOT = INT64_MAX;
+
+static storage::ObITable::TableKey make_ivf_sstable_key(
+    const uint64_t tablet_id, const int64_t snapshot_version)
+{
+  storage::ObITable::TableKey table_key;
+  table_key.table_type_ = storage::ObITable::TableType::IVF_INDEX_SSTABLE;
+  table_key.tablet_id_ = tablet_id;
+  table_key.version_range_.base_version_ = 0;
+  table_key.version_range_.snapshot_version_ = snapshot_version;
+  return table_key;
+}
+
+TEST(TestIvfSSTableCacheKey, full_table_key_is_the_cache_identity)
+{
+  const storage::ObITable::TableKey first_table = make_ivf_sstable_key(1001, 10);
+  const storage::ObITable::TableKey same_table = make_ivf_sstable_key(1001, 10);
+  const storage::ObITable::TableKey next_table = make_ivf_sstable_key(1001, 20);
+  const ObIvfCacheMgrKey first(first_table);
+  const ObIvfCacheMgrKey same(same_table);
+  const ObIvfCacheMgrKey next(next_table);
+  const ObIvfCacheMgrKey tablet_only(first_table.get_tablet_id());
+
+  ASSERT_TRUE(first.is_valid());
+  ASSERT_TRUE(first.is_sstable_key());
+  EXPECT_EQ(first_table.get_tablet_id(), first.get_tablet_id());
+  EXPECT_EQ(first, same);
+  EXPECT_EQ(first.hash(), same.hash());
+  EXPECT_FALSE(first == next);
+  EXPECT_FALSE(first == tablet_only);
+}
+
+TEST(TestIvfSSTableCacheController, high_low_watermark_has_hysteresis)
+{
+  ObIvfSSTableCacheController controller;
+  uint64_t vector_used = 0;
+  controller.is_inited_ = true;
+  controller.tenant_id_ = TEST_TENANT_ID;
+  controller.all_vector_used_ = &vector_used;
+  ATOMIC_STORE(&controller.vector_mem_limit_, 1000);
+  ATOMIC_STORE(&controller.mem_limit_, 800);
+  ATOMIC_STORE(&controller.mem_high_, 720);
+  ATOMIC_STORE(&controller.mem_low_, 400);
+  ATOMIC_STORE(&controller.admission_closed_, false);
+
+  ATOMIC_STORE(&controller.build_reserved_, 720);
+  controller.update_admission_state_();
+  EXPECT_TRUE(controller.is_admission_closed());
+  EXPECT_FALSE(controller.has_eviction_pending());
+  controller.release_reservation(720);
+  EXPECT_FALSE(controller.is_admission_closed());
+
+  controller.on_cache_allocated(720);
+  EXPECT_EQ(720, controller.get_resident_hold());
+  EXPECT_TRUE(controller.has_eviction_pending());
+  EXPECT_TRUE(controller.is_admission_closed());
+  EXPECT_TRUE(controller.try_start_eviction());
+
+  controller.on_cache_released(319);
+  controller.finish_eviction();
+  EXPECT_EQ(401, controller.get_resident_hold());
+  EXPECT_TRUE(controller.has_eviction_pending());
+  EXPECT_TRUE(controller.is_admission_closed());
+
+  ASSERT_TRUE(controller.try_start_eviction());
+  controller.on_cache_released(1);
+  controller.finish_eviction();
+  EXPECT_EQ(400, controller.get_resident_hold());
+  EXPECT_FALSE(controller.has_eviction_pending());
+  EXPECT_FALSE(controller.is_admission_closed());
+}
+
+TEST(TestIvfSSTableCacheController, reservation_conversion_preserves_other_builders_budget)
+{
+  ObIvfSSTableCacheController controller;
+  uint64_t vector_used = 0;
+  controller.is_inited_ = true;
+  controller.tenant_id_ = TEST_TENANT_ID;
+  controller.all_vector_used_ = &vector_used;
+  ATOMIC_STORE(&controller.vector_mem_limit_, 4000);
+  ATOMIC_STORE(&controller.mem_limit_, 2000);
+  ATOMIC_STORE(&controller.mem_high_, 1800);
+  ATOMIC_STORE(&controller.mem_low_, 1000);
+  ATOMIC_STORE(&controller.build_reserved_, 1200); // This builder 1000, another builder 200.
+  controller.update_admission_state_();
+  EXPECT_FALSE(controller.is_admission_closed());
+
+  controller.update_cache_hold(0, 800, 1000);
+  EXPECT_EQ(800, controller.get_resident_hold());
+  EXPECT_EQ(200, controller.get_reserved_hold());
+  EXPECT_FALSE(controller.is_admission_closed());
+  EXPECT_FALSE(controller.has_eviction_pending());
+
+  controller.release_reservation(200);
+  EXPECT_EQ(800, controller.get_resident_hold());
+  EXPECT_EQ(0, controller.get_reserved_hold());
+  controller.update_cache_hold(800, 1850);
+  EXPECT_TRUE(controller.has_eviction_pending()); // Actual memory reaches the high watermark.
+  EXPECT_TRUE(controller.is_admission_closed());
+  controller.on_cache_released(1850);
+  EXPECT_EQ(0, controller.get_resident_hold());
+  EXPECT_FALSE(controller.is_admission_closed());
+}
+
+TEST(TestIvfSSTableCentCache, owns_lru_and_memory_accounting_state)
+{
+  ObArenaAllocator allocator("IvfSSTCacheUT");
+  ObIvfSSTableCacheController controller;
+  uint64_t reservation = 2048;
+  ATOMIC_STORE(&controller.build_reserved_, reservation);
+  {
+    ObIvfSSTableCentCache cache(allocator, TEST_TENANT_ID);
+    EXPECT_EQ(0, cache.get_last_access_ts());
+    EXPECT_EQ(0, cache.get_registered_hold());
+    EXPECT_FALSE(cache.is_memory_registered());
+    EXPECT_FALSE(cache.is_hgraph_building());
+    cache.touch();
+    EXPECT_GT(cache.get_last_access_ts(), 0);
+    EXPECT_TRUE(cache.register_memory_once(1024, &controller, &reservation));
+    EXPECT_EQ(0, reservation);
+    EXPECT_EQ(0, controller.get_reserved_hold());
+    EXPECT_FALSE(cache.register_memory_once(2048, &controller));
+    EXPECT_TRUE(cache.is_memory_registered());
+    EXPECT_EQ(1024, cache.get_registered_hold());
+    EXPECT_EQ(1024, controller.get_resident_hold());
+    EXPECT_TRUE(cache.try_start_hgraph_build());
+    EXPECT_FALSE(cache.try_start_hgraph_build());
+    cache.finish_hgraph_build();
+    EXPECT_FALSE(cache.is_hgraph_building());
+  }
+  EXPECT_EQ(0, controller.get_resident_hold());
+}
+
+TEST(TestIvfSSTableCentCache, iterator_stats_keep_load_time_and_monotonic_access_time)
+{
+  ObArenaAllocator allocator("IvfSSTCacheUT");
+  ObIvfSSTableCentCache cache(allocator, TEST_TENANT_ID);
+  EXPECT_EQ(0, cache.get_hit_count());
+  EXPECT_EQ(0, cache.get_first_load_ts());
+  // Completion through the common cache interface must also publish the load time.
+  ObIvfICache &base = cache;
+  base.set_completed();
+  const int64_t first_load = cache.get_first_load_ts();
+  EXPECT_GT(first_load, 0);
+  EXPECT_EQ(0, cache.get_last_access_ts());
+  cache.record_iterator_access(false); // The builder used its new cache after a miss.
+  EXPECT_EQ(0, cache.get_hit_count());
+  EXPECT_GE(cache.get_last_access_ts(), first_load);
+  std::vector<std::thread> workers;
+  for (int64_t i = 0; i < 4; ++i) {
+    workers.emplace_back([&cache] {
+      for (int64_t j = 0; j < 1000; ++j) { cache.record_iterator_access(true); }
+    });
+  }
+  for (auto &worker : workers) { worker.join(); }
+  EXPECT_EQ(4000, cache.get_hit_count());
+  const int64_t access_time = cache.get_last_access_ts();
+  base.set_completed();
+  EXPECT_EQ(first_load, cache.get_first_load_ts());
+  EXPECT_EQ(access_time, cache.get_last_access_ts());
+  EXPECT_EQ(4000, cache.get_hit_count());
+  // A delayed timestamp update (or a backward clock adjustment) cannot age the cache.
+  const int64_t future = ObTimeUtility::current_time() + 1000000;
+  ATOMIC_STORE(&cache.last_access_ts_, future);
+  cache.touch();
+  EXPECT_EQ(future, cache.get_last_access_ts());
+}
 
 // ==================== Read functors (no lambda allowed) ====================
 
@@ -222,6 +389,53 @@ TEST_F(TestIvfMapCentCacheRefCnt, case_a_try_erase_normal_state_no_op)
   EXPECT_TRUE(entry_exists(cid));
   EXPECT_EQ(ObIvfCentroidState::NORMAL, read_state(cid));
   EXPECT_EQ(old_count, cache_->count_);
+}
+
+TEST_F(TestIvfMapCentCacheRefCnt, sstable_array_cache_keeps_dense_centroids)
+{
+  ObVectorIndexParam param;
+  param.type_ = VIAT_DISK_BBQ;
+  param.lib_ = VIAL_OB;
+  param.dist_algorithm_ = VIDA_L2;
+  param.dim_ = TEST_DIM;
+  ObIvfSSTableCentCache array_cache(allocator_, TEST_TENANT_ID);
+  ASSERT_EQ(OB_SUCCESS, array_cache.init(
+      sub_ctx_, IvfCacheKey(IVF_SSTABLE_CENTROID_CACHE),
+      param, &vsag_use_mem_));
+  EXPECT_EQ(nullptr, array_cache.get_centroids());
+  EXPECT_EQ(OB_STATE_NOT_MATCH, array_cache.allocate_array(2));
+  ASSERT_TRUE(array_cache.set_writing_if_idle());
+  EXPECT_FALSE(array_cache.set_writing_if_idle());
+  ASSERT_EQ(OB_SUCCESS, array_cache.allocate_array(2));
+  ASSERT_NE(nullptr, array_cache.get_centroids());
+
+  float first[TEST_DIM] = {0};
+  float second[TEST_DIM] = {0};
+  first[0] = 1.0F;
+  second[0] = 2.0F;
+  ASSERT_EQ(OB_SUCCESS, array_cache.write_centroid_with_real_idx(
+      0, first, sizeof(first)));
+  ASSERT_EQ(OB_SUCCESS, array_cache.write_centroid_with_real_idx(
+      1, second, sizeof(second)));
+  array_cache.set_completed();
+
+  const float *centroids = nullptr;
+  common::obvsag::VectorIndexPtr hgraph = nullptr;
+  int64_t count = 0;
+  int64_t dim = 0;
+  {
+    common::RWLock::RLockGuard guard(array_cache.get_lock());
+    centroids = array_cache.get_centroids();
+    hgraph = array_cache.get_hgraph_index();
+    count = array_cache.get_count();
+    dim = array_cache.get_cent_vec_dim();
+  }
+  ASSERT_NE(nullptr, centroids);
+  EXPECT_EQ(nullptr, hgraph);
+  EXPECT_EQ(2, count);
+  EXPECT_EQ(TEST_DIM, dim);
+  EXPECT_FLOAT_EQ(1.0F, centroids[0]);
+  EXPECT_FLOAT_EQ(2.0F, centroids[TEST_DIM]);
 }
 
 // Case B: 逻辑删除 + ref_cnt_=0 → try_erase 成功，count_-- 且 entry 消失

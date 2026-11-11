@@ -138,12 +138,14 @@ ObVecIndexTaskPriority get_auto_priority_by_task_type(ObVecIndexAsyncTaskType ta
       p = PRIORITY_P1;
       break;
     case OB_VECTOR_ASYNC_INDEX_IVF_CLEAN:
+    case OB_VECTOR_ASYNC_DISK_BBQ_CACHE_CLEAN:
     case OB_VECTOR_ASYNC_INDEX_FREEZE:
     case OB_VECTOR_ASYNC_ALTER_INDEX_PARAM:
       p = PRIORITY_P2;
       break;
     case OB_VECTOR_ASYNC_INDEX_MERGE:
     case OB_VECTOR_ASYNC_HYBRID_VECTOR_EMBEDDING:
+    case OB_VECTOR_ASYNC_DISK_BBQ_HGRAPH_BUILD:
       p = PRIORITY_P3;
       break;
     case OB_VECTOR_ASYNC_INDEX_OPTINAL:

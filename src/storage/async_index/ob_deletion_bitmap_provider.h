@@ -17,6 +17,8 @@ namespace oceanbase
 {
 namespace sql
 {
+struct ObDASScanCtDef;
+struct ObDASScanRtDef;
 struct ObDASScalarScanCtDef;
 struct ObDASScalarScanRtDef;
 }
@@ -29,6 +31,8 @@ public:
   ObDeletionBitmapHandle();
   ~ObDeletionBitmapHandle();
   void reset();
+  // Temporary lifetime diagnostics. Only handles sampled on a cache hit are logged.
+  void trace_cache_handle(const char *phase) const;
 
   bool is_valid() const { return is_valid_; }
   bool is_empty() const { return !is_valid_ || nullptr == bitmap_ || 0 == bitmap_->get_cardinality(); }
@@ -47,7 +51,9 @@ private:
 
   int init_from_cache(common::ObIAllocator &allocator,
                       const ObDeletionBitmapCacheValue *value,
-                      const common::ObKVCacheHandle &kv_handle);
+                      const common::ObKVCacheHandle &kv_handle,
+                      const ObDeletionBitmapCacheKey &cache_key,
+                      const char *source);
   int init_from_bitmap(common::ObIAllocator &allocator, common::ObRoaringBitmap *bitmap);
 
   common::ObIAllocator *allocator_;
@@ -56,6 +62,9 @@ private:
   ObDeletionBitmapCacheHandle cache_handle_;
   bool is_valid_;
   bool is_first_read_;
+  // Keep the sample identity across reset/reuse until the owning object is destroyed.
+  int64_t cache_diag_id_;
+  bool cache_diag_reset_logged_;
 
   DISALLOW_COPY_AND_ASSIGN(ObDeletionBitmapHandle);
 };
@@ -90,6 +99,17 @@ public:
       sql::ObDASScalarScanRtDef &rtdef,
       ObDeletionBitmapHandle &handle);
 
+  // Legacy vector DAS query path. The caller prepares scan_param's physical deletion snapshot
+  // and prevents flashback overrides; async_snapshot remains the logical bitmap boundary.
+  static int get_or_build_bitmap(
+      const common::ObTabletID &delete_log_tablet_id,
+      const int64_t async_snapshot,
+      common::ObIAllocator &allocator,
+      ObTableScanParam &scan_param,
+      const sql::ObDASScanCtDef &ctdef,
+      sql::ObDASScanRtDef &rtdef,
+      ObDeletionBitmapHandle &handle);
+
 private:
   static int scan_and_build_bitmap(
       const share::ObLSID &ls_id,
@@ -105,6 +125,14 @@ private:
       ObTableScanParam &scan_param,
       const sql::ObDASScalarScanCtDef &ctdef,
       sql::ObDASScalarScanRtDef &rtdef,
+      const int64_t async_snapshot,
+      common::ObRoaringBitmap *&bitmap);
+
+  static int scan_and_build_bitmap(
+      common::ObIAllocator &allocator,
+      ObTableScanParam &scan_param,
+      const sql::ObDASScanCtDef &ctdef,
+      sql::ObDASScanRtDef &rtdef,
       const int64_t async_snapshot,
       common::ObRoaringBitmap *&bitmap);
 

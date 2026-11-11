@@ -407,7 +407,7 @@ int ObMediumCompactionScheduleFunc::schedule_next_medium_primary_cluster(
   } else if (!medium_info_list_->could_schedule_next_round(
       last_major_snapshot_version, tablet->get_last_inc_major_snapshot_version())) { // check serialized list
     // do nothing
-  } else if (tablet->is_async_inverted_storage_index()) {
+  } else if (tablet->is_async_index_storage_tablet()) {
     // async index tablet can only be scheduled via schedule_async_index on data tablet
   } else if (OB_FAIL(get_adaptive_reason(schedule_major_snapshot))) {
     LOG_WARN("failed to get adaptive reason", KR(ret), K(schedule_major_snapshot));
@@ -2495,12 +2495,15 @@ int ObMediumCompactionScheduleFunc::schedule_for_async_index_impl(const int64_t 
     LOG_WARN("schedule_async_index must be called on data tablet", KR(ret), KPC(data_tablet));
   } else if (OB_FAIL(check_data_tablet_status_for_async_index_(*data_tablet))) {
     if (OB_STATE_NOT_MATCH == ret) {
+      LOG_DEBUG("skip async index merge", "ret", OB_NO_NEED_MERGE, "operation",
+          "ObMediumCompactionScheduleFunc::schedule_for_async_index_impl", K(tenant_major_snapshot));
       ret = OB_NO_NEED_MERGE;
     } else if (OB_NO_NEED_MERGE != ret) {
       LOG_WARN("failed to check data tablet status for async index schedule", KR(ret), KPC(data_tablet));
     }
   } else if (OB_FAIL(get_async_index_tablet_ids(
-      *data_tablet, index_tablet_ids, delete_index_tablet_id, async_index_params))) {
+      *data_tablet, index_tablet_ids, delete_index_tablet_id,
+      async_index_params))) {
     if (OB_NO_NEED_MERGE == ret) {
       // do nothing
     } else if (OB_TABLE_IS_DELETED == ret || OB_TABLE_NOT_EXIST == ret) {

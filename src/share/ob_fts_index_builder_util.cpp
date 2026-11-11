@@ -527,7 +527,7 @@ int ObFtsIndexBuilderUtil::build_fts_aux_index_name(const ObIndexType type,
     LOG_USER_ERROR(OB_ERR_KEY_NAME_DUPLICATE, index_name.length(), index_name.ptr());
     LOG_WARN("The index name is forbidden, there's potential conflict with inner implementation.", K(ret), K(index_name));
   } else if (OB_FAIL(ObIndexBuilderUtil::check_async_index_name(index_name))) {
-    LOG_WARN("invalid user index name", K(ret), K(index_name));
+    LOG_WARN("failed to check async index name", K(ret), K(index_name));
   } else if (share::schema::is_rowkey_doc_aux(type)) {
     if (OB_FAIL(databuff_printf(name_buf, OB_MAX_TABLE_NAME_LENGTH, pos, ObFTSConstants::ROWKEY_DOC_NAME))) {
       LOG_WARN("failed to print", K(ret));

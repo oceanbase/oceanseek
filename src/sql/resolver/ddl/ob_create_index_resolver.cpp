@@ -151,8 +151,9 @@ int ObCreateIndexResolver::resolve_index_column_node(
       SQL_RESV_LOG(WARN, "add session id key failed", K(ret));
     }
     bool cnt_func_index = false;
-    const bool is_vec_index = (index_keyname_ == INDEX_KEYNAME::VEC_KEY);
-    if (is_vec_index && index_column_node->num_child_ >= 2) {
+    const bool is_vector_index_key = (index_keyname_ == INDEX_KEYNAME::VEC_KEY
+                                      || index_keyname_ == INDEX_KEYNAME::ASYNC_VEC_KEY);
+    if (is_vector_index_key && index_column_node->num_child_ >= 2) {
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("multi column of vector index is not support yet", K(ret), K(index_column_node->num_child_));
       LOG_USER_ERROR(OB_NOT_SUPPORTED, "multi vector index column is");
@@ -233,7 +234,8 @@ int ObCreateIndexResolver::resolve_index_column_node(
                   LOG_WARN("search index on map or non-single-layer array column is not supported", K(ret));
                   LOG_USER_ERROR(OB_NOT_SUPPORTED, "create search index on map or non-single-layer array column is");
                 }
-              } else if (index_keyname_ != INDEX_KEYNAME::VEC_KEY) {
+              } else if (index_keyname_ != INDEX_KEYNAME::VEC_KEY
+                         && index_keyname_ != INDEX_KEYNAME::ASYNC_VEC_KEY) {
                 ret = OB_NOT_SUPPORTED;
                 LOG_WARN("not support index type create on vector or array column yet", K(ret), K(index_keyname_));
                 LOG_USER_ERROR(OB_NOT_SUPPORTED, "create index on vector or array column is");
@@ -241,6 +243,7 @@ int ObCreateIndexResolver::resolve_index_column_node(
 
               if (OB_FAIL(ret)) {
               } else if (index_keyname_ != INDEX_KEYNAME::VEC_KEY
+                         && index_keyname_ != INDEX_KEYNAME::ASYNC_VEC_KEY
                          && !(is_search_index && is_single_layer_array_for_search)) {
                 ret = OB_NOT_SUPPORTED;
                 LOG_WARN("vector column index but not vector index, and non-single-layer array SEARCH index are not supported",
@@ -263,7 +266,8 @@ int ObCreateIndexResolver::resolve_index_column_node(
               }
             }
             if (OB_FAIL(ret)) {
-            } else if (OB_FAIL(resolve_search_index_constraint(*column_schema,
+            } else if (OB_FAIL(resolve_search_index_constraint(*tbl_schema,
+                                                               sort_item.column_name_,
                                                                static_cast<int64_t>(index_keyname_)))) {
               LOG_WARN("resolve search index constraint fail", K(ret), K(sort_item.column_name_));
             }
@@ -360,7 +364,8 @@ int ObCreateIndexResolver::resolve_index_column_node(
           LOG_WARN("create fulltext index on mysql temporary not supported", K(ret));
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "create fulltext index on mysql temporary table");
         }
-      } else if (index_keyname_ == INDEX_KEYNAME::VEC_KEY) {
+      } else if (index_keyname_ == INDEX_KEYNAME::VEC_KEY
+                 || index_keyname_ == INDEX_KEYNAME::ASYNC_VEC_KEY) {
         if (sort_item.is_func_index_) {
           ret = OB_ERR_FUNCTIONAL_INDEX_ON_FIELD;
           LOG_WARN("Functional index for vector index is not supported.", K(ret), K(sort_item));
@@ -443,7 +448,7 @@ int ObCreateIndexResolver::resolve_index_column_node(
       }
     }
     ObCreateIndexArg &index_arg = crt_idx_stmt->get_create_index_arg();
-    if (OB_SUCC(ret) && is_vec_index && index_arg.index_columns_.count() > 0) {
+    if (OB_SUCC(ret) && is_vector_index_key && index_arg.index_columns_.count() > 0) {
       const ObColumnSortItem &sort_item = index_arg.index_columns_.at(0);
       if (OB_FAIL(set_vec_column_name(sort_item.column_name_))) {
         LOG_WARN("fail to set vec column name", K(ret));
@@ -888,10 +893,15 @@ int ObCreateIndexResolver::resolve(const ParseNode &parse_tree)
     ObCreateIndexArg &index_arg = crt_idx_stmt->get_create_index_arg();
     char* buf = nullptr;
     int64_t pos = 0;
-    if (is_vec_index(index_arg.index_type_)) {
-      if (!is_vec_index(vec_index_type_)) {
+    if (is_vec_or_async_vec_index(index_arg.index_type_)) {
+      const bool is_sync_vec_key = index_keyname_ == INDEX_KEYNAME::VEC_KEY;
+      const bool is_async_vec_key = index_keyname_ == INDEX_KEYNAME::ASYNC_VEC_KEY;
+      if (OB_UNLIKELY((is_sync_vec_key && !is_vec_index(vec_index_type_))
+                      || (is_async_vec_key && !is_async_ivf_index(vec_index_type_))
+                      || (!is_sync_vec_key && !is_async_vec_key))) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected index type", KR(ret), K(vec_index_type_));
+        LOG_WARN("vector index type does not match index key family",
+                 K(ret), K(index_keyname_), K(vec_index_type_));
       } else if (FALSE_IT(index_arg.index_type_ = vec_index_type_)) {
       } else if (FALSE_IT(index_arg.index_schema_.set_index_params(index_params_))) {
       } else if (tbl_schema->is_view_table()) {
@@ -1135,11 +1145,16 @@ int ObCreateIndexResolver::set_table_option_to_stmt(
       } else {
         index_arg.index_type_ = INDEX_TYPE_UNIQUE_MULTIVALUE_LOCAL;
       }
-    } else if (INDEX_KEYNAME::VEC_KEY == index_keyname_) {
+    } else if (INDEX_KEYNAME::VEC_KEY == index_keyname_
+               || INDEX_KEYNAME::ASYNC_VEC_KEY == index_keyname_) {
       uint64_t tenant_data_version = 0;
       uint64_t tenant_id = session_info_->get_effective_tenant_id();
       if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, tenant_data_version))) {
       LOG_WARN("get tenant data version failed", K(ret));
+      } else if (INDEX_KEYNAME::ASYNC_VEC_KEY == index_keyname_
+                 && tenant_data_version < DATA_VERSION_4_6_3_1) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "async DISK_BBQ index before version 4.6.2.2 is");
       } else if (tenant_data_version < DATA_VERSION_4_3_3_0) {
         ret = OB_NOT_SUPPORTED;
         LOG_WARN("tenant data version is less than 4.3.3, create vector index on existing table not supported", K(ret), K(tenant_data_version));
@@ -1151,7 +1166,32 @@ int ObCreateIndexResolver::set_table_option_to_stmt(
       } else if (global_) {
         // TODO @lhd support global index?
         ret = OB_NOT_SUPPORTED;
+      } else if (INDEX_KEYNAME::ASYNC_VEC_KEY == index_keyname_
+                 && tbl_schema.is_table_with_clustering_key()) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("async DISK_BBQ index is not supported on table with clustering key", K(ret));
+        LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                       "async DISK_BBQ index on table with clustering key is");
+      } else if (INDEX_KEYNAME::ASYNC_VEC_KEY == index_keyname_
+                 && (!GCTX.is_shared_storage_mode() || !tbl_schema.is_heap_organized_table())) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_USER_ERROR(OB_NOT_SUPPORTED, "async DISK_BBQ index on non-heap or non-shared-storage table is");
+      } else if (INDEX_KEYNAME::ASYNC_VEC_KEY == index_keyname_
+                 && !share::ObAsyncIndexRefreshUtil::is_async_index_enabled(tenant_id)) {
+        ret = OB_OP_NOT_ALLOW;
+        LOG_WARN("async DISK_BBQ index not allowed while _enable_async_index is false", K(ret));
+        LOG_USER_ERROR(OB_OP_NOT_ALLOW,
+                       "create async DISK_BBQ index while _enable_async_index is false");
+      } else if (INDEX_KEYNAME::ASYNC_VEC_KEY == index_keyname_
+                 && !share::ObAsyncIndexRefreshUtil::is_async_index_refresh_enabled(tenant_id)) {
+        ret = OB_OP_NOT_ALLOW;
+        LOG_WARN("async DISK_BBQ index not allowed while _enable_async_index_refresh is false", K(ret));
+        LOG_USER_ERROR(OB_OP_NOT_ALLOW,
+                       "create async DISK_BBQ index while _enable_async_index_refresh is false");
       } else {
+        // Sync and async vector keys share a provisional marker here. The final
+        // algorithm type is validated against the key family and assigned from
+        // vec_index_type_ in resolve() after vector options are fully parsed.
         index_arg.index_type_ = INDEX_TYPE_VEC_DELTA_BUFFER_LOCAL;
       }
     } else if (INDEX_KEYNAME::SEARCH_KEY == index_keyname_

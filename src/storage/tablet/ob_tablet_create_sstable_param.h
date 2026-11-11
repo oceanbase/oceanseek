@@ -17,6 +17,7 @@
 #include "storage/compaction/ob_compaction_util.h"
 #include "storage/compaction/ob_uncommit_tx_info.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_struct.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable_struct.h"
 
 namespace oceanbase
 {
@@ -321,6 +322,7 @@ public:
   int64_t upper_trans_version_;
   int64_t min_merged_trans_version_;
   blocksstable::ObInvSSTableMeta inv_meta_; // used for inv sstable
+  blocksstable::ObIvfSSTableMeta ivf_meta_; // used for ivf sstable
   share::SCN shared_tablet_meta_scn_;
 };
 

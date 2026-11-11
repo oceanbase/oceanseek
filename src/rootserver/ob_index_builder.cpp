@@ -383,29 +383,34 @@ int ObIndexBuilder::drop_index(const ObDropIndexArg &const_arg, obrpc::ObDropInd
       ObDDLTaskRecord task_record;
       bool has_other_domain_index = false;
       const bool is_vec_spiv_index = index_table_schema->is_vec_spiv_index_aux();
-      const bool is_search_or_vec_or_fts_or_multivalue_index = index_table_schema->is_fts_or_multivalue_index()
-          || index_table_schema->is_async_fts_index() || index_table_schema->is_vec_index()
-          || index_table_schema->is_search_index() || index_table_schema->is_async_search_index();
+      const bool is_composite_index = index_table_schema->is_fts_or_multivalue_index()
+          || index_table_schema->is_user_defined_async_index()
+          || index_table_schema->is_vec_index() || index_table_schema->is_search_index();
       const bool is_inner_and_fts_index = arg.is_inner_ && !arg.is_parent_task_dropping_fts_index_ && index_table_schema->is_fts_index();
-      const bool is_inner_and_async_fts_index = arg.is_inner_ && !arg.is_parent_task_dropping_user_async_index_ && index_table_schema->is_async_fts_index();
-      const bool need_check_domain_index_conflict = !arg.is_inner_ && (index_table_schema->is_fts_or_multivalue_index()
-          || index_table_schema->is_async_fts_index()
-          || index_table_schema->is_search_def_index()
-          || is_vec_spiv_index);
+      const bool is_inner_and_user_async_index = arg.is_inner_
+          && !arg.is_parent_task_dropping_user_async_index_
+          && index_table_schema->is_user_defined_async_index();
+      const bool need_check_domain_or_user_async_index_ddl_conflict = !arg.is_inner_
+          && (index_table_schema->is_fts_or_multivalue_index()
+              || index_table_schema->is_user_defined_async_index()
+              || index_table_schema->is_search_def_index()
+              || is_vec_spiv_index);
       const bool is_inner_and_multivalue_index = arg.is_inner_ && index_table_schema->is_multivalue_index();
       const bool is_inner_and_vec_index = arg.is_inner_ && !arg.is_vec_inner_drop_ && index_table_schema->is_vec_index();
       const bool is_inner_and_search_index = arg.is_inner_
           && (index_table_schema->is_search_index() || index_table_schema->is_async_search_index());
       const bool is_inner_and_async_delete_index = arg.is_inner_ && index_table_schema->is_async_delete_index();
       const bool need_check_vec_index_conflict = !arg.is_inner_ && index_table_schema->is_vec_index();
-      const bool is_inner_and_search_or_fts_or_mulvalue_or_vector_index = is_inner_and_fts_index || is_inner_and_async_fts_index
+      const bool is_inner_composite_index = is_inner_and_fts_index || is_inner_and_user_async_index
           || is_inner_and_multivalue_index || is_inner_and_vec_index || is_inner_and_search_index || is_inner_and_async_delete_index;
       bool has_index_task = false;
       typedef common::ObSEArray<share::schema::ObTableSchema, 4> TableSchemaArray;
       SMART_VAR(TableSchemaArray, new_index_schemas) {
-        if (need_check_domain_index_conflict && OB_FAIL(ddl_service_.check_domain_index_ddl_conflict(table_schema->get_tenant_id(), table_schema->get_table_id()))) {
+        if (need_check_domain_or_user_async_index_ddl_conflict
+            && OB_FAIL(ddl_service_.check_domain_or_user_async_index_conflict(
+                table_schema->get_tenant_id(), table_schema->get_table_id()))) {
           if (OB_EAGAIN != ret) {
-            LOG_WARN("failed to check domain index ddl conflict", K(ret), K(arg));
+            LOG_WARN("failed to check domain or user async index conflict", K(ret), K(arg));
           }
         } else if (need_check_vec_index_conflict && OB_FAIL(ddl_service_.check_vec_index_conflict(table_schema->get_tenant_id(), table_schema->get_table_id()))) {
           if (OB_EAGAIN != ret) {
@@ -431,7 +436,7 @@ int ObIndexBuilder::drop_index(const ObDropIndexArg &const_arg, obrpc::ObDropInd
           LOG_WARN("start transaction failed", KR(ret), K(tenant_id), K(refreshed_schema_version));
         // 最后用户判断必须与共享 Delete 的 rename 和任务提交处于同一 DDL 锁事务。
         } else if (index_table_schema->is_async_delete_index()
-            && OB_FAIL(check_has_none_shared_index_tables_for_async_index_(tenant_id,
+            && OB_FAIL(check_has_none_shared_index_tables_for_user_async_index_(tenant_id,
                 index_table_schema->get_data_table_id(),
                 arg.is_parent_task_dropping_user_async_index_ ? arg.table_id_ : OB_INVALID_ID,
                 schema_guard,
@@ -473,8 +478,6 @@ int ObIndexBuilder::drop_index(const ObDropIndexArg &const_arg, obrpc::ObDropInd
         uint64_t hnsw_aux_index_schema_count = 5;  // default value
         uint64_t hybrid_hnsw_aux_index_schema_count = 6;  // default value
         uint64_t search_index_schema_count = 2;
-        const uint64_t async_fts_index_schema_count_without_shared_delete = 1;
-        const uint64_t async_fts_index_schema_count_with_shared_delete = 2;
         uint64_t docid_col_id = OB_INVALID_ID;
         if (OB_FAIL(ret)) {
         } else if (!arg.is_inner_ && (index_table_schema->is_fts_index_aux() 
@@ -508,7 +511,7 @@ int ObIndexBuilder::drop_index(const ObDropIndexArg &const_arg, obrpc::ObDropInd
         if (OB_FAIL(ret) || has_other_domain_index) {
         } else if (need_rename_index && OB_FAIL(ddl_service_.rename_dropping_index_name(
                                                       *index_table_schema,
-                                                      is_inner_and_search_or_fts_or_mulvalue_or_vector_index,
+                                                      is_inner_composite_index,
                                                       arg,
                                                       schema_guard,
                                                       ddl_operator,
@@ -517,12 +520,12 @@ int ObIndexBuilder::drop_index(const ObDropIndexArg &const_arg, obrpc::ObDropInd
           LOG_WARN("rename index name failed", K(ret));
         } else if (!need_rename_index && OB_FAIL(new_index_schemas.push_back(*index_table_schema))) {
           LOG_WARN("failed to assign index table schema to new index schema", KR(ret));
-        } else if (is_inner_and_search_or_fts_or_mulvalue_or_vector_index && 0 == new_index_schemas.count()) {
+        } else if (is_inner_composite_index && 0 == new_index_schemas.count()) {
           if (OB_FAIL(new_index_schemas.push_back(*index_table_schema))) {
             LOG_WARN("fail to push back index schema", K(ret), KPC(index_table_schema));
           }
-        } else if (OB_UNLIKELY(!is_search_or_vec_or_fts_or_multivalue_index && new_index_schemas.count() != 1)
-                || OB_UNLIKELY(is_inner_and_search_or_fts_or_mulvalue_or_vector_index && new_index_schemas.count() != 1)
+        } else if (OB_UNLIKELY(!is_composite_index && new_index_schemas.count() != 1)
+                || OB_UNLIKELY(is_inner_composite_index && new_index_schemas.count() != 1)
                 || OB_UNLIKELY(!arg.is_inner_ && index_table_schema->is_hybrid_vec_index_log_type() && new_index_schemas.count() != hybrid_hnsw_aux_index_schema_count) // four or six index assistant table of hybrid vec index
                 || OB_UNLIKELY(!arg.is_inner_ && index_table_schema->is_vec_ivfflat_centroid_index() && new_index_schemas.count() != 3)
                 || OB_UNLIKELY(!arg.is_inner_ && index_table_schema->is_vec_delta_buffer_type() && new_index_schemas.count() != hnsw_aux_index_schema_count)
@@ -530,9 +533,10 @@ int ObIndexBuilder::drop_index(const ObDropIndexArg &const_arg, obrpc::ObDropInd
                 || OB_UNLIKELY(!arg.is_inner_ && index_table_schema->is_vec_ivfpq_centroid_index() && new_index_schemas.count() != 4)
                 || OB_UNLIKELY(!arg.is_inner_ && index_table_schema->is_fts_index_aux() && new_index_schemas.count() != fts_aux_index_schema_count)
                 || OB_UNLIKELY(!arg.is_inner_ && index_table_schema->is_multivalue_index_aux() && new_index_schemas.count() != multivalue_aux_index_schema_count)
-                || OB_UNLIKELY(!arg.is_inner_ && index_table_schema->is_async_fts_index()
-                    && new_index_schemas.count() != async_fts_index_schema_count_without_shared_delete
-                    && new_index_schemas.count() != async_fts_index_schema_count_with_shared_delete)
+                || OB_UNLIKELY(!arg.is_inner_
+                    && index_table_schema->is_user_defined_async_index()
+                    && new_index_schemas.count() != 2
+                    && new_index_schemas.count() != 1)
                 || OB_UNLIKELY(!arg.is_inner_
                     && INDEX_TYPE_SEARCH_DEF_INDEX_LOCAL == index_table_schema->get_index_type()
                     && new_index_schemas.count() != search_index_schema_count)
@@ -542,7 +546,7 @@ int ObIndexBuilder::drop_index(const ObDropIndexArg &const_arg, obrpc::ObDropInd
                 || OB_UNLIKELY(!arg.is_inner_ && index_table_schema->is_vec_spiv_index_aux() && new_index_schemas.count() != spiv_aux_index_schema_count)) {
           ret = OB_ERR_UNEXPECTED;
           LOG_WARN("unexpected error, invalid new index schema count", K(ret),
-              "is vec or fts or multivalue index", is_search_or_vec_or_fts_or_multivalue_index,
+              "is composite index", is_composite_index,
               "is inner", arg.is_inner_,
               "count", new_index_schemas.count(),
               "is vec index", index_table_schema->is_vec_delta_buffer_type(),
@@ -588,12 +592,15 @@ int ObIndexBuilder::drop_index(const ObDropIndexArg &const_arg, obrpc::ObDropInd
                         arg.task_id_, *index_table_schema, res.task_id_, res.task_id_, 
                         ObDDLUpdateParentTaskIDType::UPDATE_VEC_REBUILD_DROP_INDEX_TASK_ID, allocator, trans))) {
             LOG_WARN("fail to update parent task message", K(ret), K(arg.task_id_), K(res.task_id_));
-          } else if ((index_table_schema->is_fts_index() || index_table_schema->is_async_fts_index() || index_table_schema->is_async_delete_index()) &&
+          } else if ((index_table_schema->is_fts_index()
+                      || index_table_schema->is_user_defined_async_index()
+                      || index_table_schema->is_async_delete_index()) &&
                      ObDDLType::DDL_DROP_INDEX == task_record.ddl_type_ &&
                      OB_FAIL(ObDDLTaskRecordOperator::update_parent_task_message(tenant_id,
                                 arg.task_id_, *index_table_schema, 0/*target_table_id*/, res.task_id_, 
                                 ObDDLUpdateParentTaskIDType::UPDATE_DROP_INDEX_TASK_ID, allocator, trans))) {
-            LOG_WARN("fail to update drop fulltext index parent task message", K(ret), K(arg.task_id_), K(res.task_id_));
+            LOG_WARN("fail to update drop domain or user async index parent task message",
+                     K(ret), K(arg.task_id_), K(res.task_id_));
           }
         }
       }
@@ -815,17 +822,24 @@ int ObIndexBuilder::submit_build_index_task(
   const bool is_sync_search = is_search_index && !is_async_search;
   const bool is_fts_or_multivalue = share::schema::is_fts_or_multivalue_index(create_index_arg.index_type_);
   const bool is_vec_index = share::schema::is_vec_index(create_index_arg.index_type_);
+  const bool is_vec_or_async_vec_index = share::schema::is_vec_or_async_vec_index(create_index_arg.index_type_);
   const bool is_async_fts = share::schema::is_async_fts_index(create_index_arg.index_type_);
-  const bool is_async_index_ddl = is_async_fts
+  const bool is_async_index_ddl = share::schema::is_user_defined_async_index(create_index_arg.index_type_)
       || share::schema::is_async_search_def_index(create_index_arg.index_type_);
   const bool defer_async_index_snapshot =
       ObDDLUtil::should_defer_async_index_snapshot(create_index_arg, tenant_data_version);
-  if (tenant_data_version >= DATA_VERSION_4_6_2_1) {
-    param.ddl_need_retry_at_executor_ = (is_vec_index || is_fts_or_multivalue || is_search_index
-        || is_async_fts) && !create_index_arg.is_offline_or_restore();
+  if (tenant_data_version >= DATA_VERSION_4_6_3_1) {
+    param.ddl_need_retry_at_executor_ = (is_vec_or_async_vec_index || is_fts_or_multivalue
+                                         || is_search_index || is_async_fts)
+                                        && !create_index_arg.is_offline_or_restore();
+  } else if (tenant_data_version >= DATA_VERSION_4_6_2_1) {
+    param.ddl_need_retry_at_executor_ = (is_vec_index || is_fts_or_multivalue
+                                         || is_search_index || is_async_fts)
+                                        && !create_index_arg.is_offline_or_restore();
   } else if (tenant_data_version >= DATA_VERSION_4_6_2_0) {
-    param.ddl_need_retry_at_executor_ = (is_vec_index || is_fts_or_multivalue || is_sync_search
-        || is_async_fts) && !create_index_arg.is_offline_or_restore();
+    param.ddl_need_retry_at_executor_ = (is_vec_index || is_fts_or_multivalue
+                                         || is_sync_search || is_async_fts)
+                                        && !create_index_arg.is_offline_or_restore();
   } else if (tenant_data_version >= DATA_VERSION_4_5_1_0) {
     param.ddl_need_retry_at_executor_ = (is_vec_index || is_fts_or_multivalue || is_sync_search) && !create_index_arg.is_offline_or_restore();
   } else if (tenant_data_version >= DATA_VERSION_4_4_0_0) {
@@ -841,7 +855,8 @@ int ObIndexBuilder::submit_build_index_task(
               || (is_async_index_ddl && !defer_async_index_snapshot))
              && new_fetched_snapshot <= 0) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("the fts/vec/async fts snapshot version should be more than zero", K(ret), K(new_fetched_snapshot));
+    LOG_WARN("the fts/vec/user async index snapshot version should be more than zero",
+        K(ret), K(new_fetched_snapshot));
   } else if (data_schema->is_auto_partitioned_table() 
       && OB_FAIL(ObSplitPartitionHelper::check_split_supported_index(*data_schema, *index_schema))) {
     LOG_WARN("failed to check split supported index", K(ret), KPC(index_schema));
@@ -865,6 +880,8 @@ int ObIndexBuilder::submit_build_index_task(
       param.type_ = ObDDLType::DDL_CREATE_SEARCH_INDEX;
     } else if (share::schema::is_async_fts_index(create_index_arg.index_type_)) {
       param.type_ = ObDDLType::DDL_CREATE_ASYNC_FTS_INDEX;
+    } else if (share::schema::is_async_ivf_index(create_index_arg.index_type_)) {
+      param.type_ = ObDDLType::DDL_CREATE_ASYNC_VEC_IVF_INDEX;
     } else if (share::schema::is_async_search_def_index(create_index_arg.index_type_)) {
       param.type_ = ObDDLType::DDL_CREATE_ASYNC_SEARCH_INDEX;
     }
@@ -1253,7 +1270,7 @@ int ObIndexBuilder::recognize_search_index_schemas(
   return ret;
 }
 
-int ObIndexBuilder::recognize_async_fts_index_schemas(
+int ObIndexBuilder::recognize_user_async_index_schemas(
       const common::ObIArray<share::schema::ObTableSchema> &index_schemas,
       int64_t &index_ith,
       int64_t &async_delete_ith)
@@ -1266,8 +1283,13 @@ int ObIndexBuilder::recognize_async_fts_index_schemas(
     LOG_WARN("invalid arguments", K(ret), K(index_schemas));
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < index_schemas.count(); ++i) {
-      if (index_schemas.at(i).is_async_fts_index()) {
-        index_ith = i;
+      if (index_schemas.at(i).is_user_defined_async_index()) {
+        if (OB_UNLIKELY(-1 != index_ith)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("unexpected error, there are multiple user async indexes", K(ret), K(index_schemas));
+        } else {
+          index_ith = i;
+        }
       } else if (index_schemas.at(i).is_async_delete_index()) {
         if (OB_UNLIKELY(-1 != async_delete_ith)) {
           ret = OB_ERR_UNEXPECTED;
@@ -1283,7 +1305,7 @@ int ObIndexBuilder::recognize_async_fts_index_schemas(
     if (OB_SUCC(ret) && -1 == index_ith) {
       if (OB_UNLIKELY(-1 == async_delete_ith)) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("neither async fts index nor async delete found", K(ret), K(index_schemas));
+        LOG_WARN("neither user async index nor async delete found", K(ret), K(index_schemas));
       } else {
         index_ith = async_delete_ith;
       }
@@ -1378,11 +1400,14 @@ bool ObIndexBuilder::is_drop_search_index_task(const obrpc::ObDropIndexArg &arg,
   return is_drop_search_task;
 }
 
-bool ObIndexBuilder::is_drop_async_fts_index_task(const obrpc::ObDropIndexArg &arg, const share::schema::ObTableSchema &index_schema)
+bool ObIndexBuilder::is_drop_user_async_index_task(
+    const obrpc::ObDropIndexArg &arg,
+    const share::schema::ObTableSchema &index_schema)
 {
-  const bool is_drop_async_fts_task = (!arg.is_inner_ && index_schema.is_async_fts_index())
+  const bool is_drop_user_async_task = (!arg.is_inner_
+      && index_schema.is_user_defined_async_index())
       || arg.is_parent_task_dropping_user_async_index_;
-  return is_drop_async_fts_task;
+  return is_drop_user_async_task;
 }
 
 int ObIndexBuilder::submit_drop_index_task(ObMySQLTransaction &trans,
@@ -1431,16 +1456,16 @@ int ObIndexBuilder::submit_drop_index_task(ObMySQLTransaction &trans,
   const int64_t VEC_SPIV_INDEX_COUNT_WITHOUT_DOCID = 1;
   const int64_t SEARCH_INDEX_COUNT = 2;
   const int64_t ASYNC_SEARCH_INDEX_COUNT = 3;
-  const int64_t ASYNC_FTS_INDEX_COUNT_WITHOUT_SHARED_DELETE = 1;
-  const int64_t ASYNC_FTS_INDEX_COUNT_WITH_SHARED_DELETE = 2;
+  const int64_t USER_ASYNC_INDEX_SCHEMA_COUNT = 2;
+  const int64_t USER_ASYNC_INDEX_SCHEMA_COUNT_WITHOUT_SHARED_DELETE = 1;
   const bool should_recognize_search_index_schemas = arg.is_parent_task_dropping_search_index_
       || (index_schemas.count() > 0
           && (index_schemas.at(0).is_search_index() || index_schemas.at(0).is_async_search_index()));
-  // async search 和 async FTS 共用 async delete 索引，优先根据 search 父任务或索引类型消歧。
-  const bool should_recognize_async_fts_index_schemas = !should_recognize_search_index_schemas
+  // async search 和用户异步索引共用 async delete 索引，优先根据 search 父任务或索引类型消歧。
+  const bool should_recognize_user_async_index_schemas = !should_recognize_search_index_schemas
       && (arg.is_parent_task_dropping_user_async_index_
           || (index_schemas.count() > 0
-              && (index_schemas.at(0).is_async_fts_index() || index_schemas.at(0).is_async_delete_index())));
+              && (index_schemas.at(0).is_user_defined_async_index() || index_schemas.at(0).is_async_delete_index())));
 
   if (OB_UNLIKELY(index_schemas.count() != NORMAL_INDEX_COUNT &&
                   !arg.is_parent_task_dropping_fts_index_ && (index_schemas.count() != FTS_INDEX_COUNT && index_schemas.count() != FTS_INDEX_COUNT_WITHOUT_DOCID) &&
@@ -1450,8 +1475,8 @@ int ObIndexBuilder::submit_drop_index_task(ObMySQLTransaction &trans,
                   !arg.is_parent_task_dropping_search_index_ && (index_schemas.count() != SEARCH_INDEX_COUNT
                                                                   && index_schemas.count() != ASYNC_SEARCH_INDEX_COUNT) &&
                   !arg.is_parent_task_dropping_user_async_index_
-                      && (index_schemas.count() != ASYNC_FTS_INDEX_COUNT_WITHOUT_SHARED_DELETE
-                          && index_schemas.count() != ASYNC_FTS_INDEX_COUNT_WITH_SHARED_DELETE) &&
+                      && (index_schemas.count() != USER_ASYNC_INDEX_SCHEMA_COUNT
+                          && index_schemas.count() != USER_ASYNC_INDEX_SCHEMA_COUNT_WITHOUT_SHARED_DELETE) &&
                   !arg.is_vec_inner_drop_ && (index_schemas.count() != VEC_HNSW_INDEX_COUNT &&
                                               index_schemas.count() != HYBRID_VEC_HNSW_INDEX_COUNT &&
                                               index_schemas.count() != VEC_IVFFLAT_INDEX_COUNT && 
@@ -1475,9 +1500,9 @@ int ObIndexBuilder::submit_drop_index_task(ObMySQLTransaction &trans,
              && OB_FAIL(recognize_search_index_schemas(index_schemas, arg.is_parent_task_dropping_search_index_,
                                                         index_ith, def_index_ith, data_index_ith, async_delete_ith))) {
     LOG_WARN("fail to recognize search index from schema array", K(ret));
-  } else if (should_recognize_async_fts_index_schemas
-             && OB_FAIL(recognize_async_fts_index_schemas(index_schemas, index_ith, async_delete_ith))) {
-    LOG_WARN("fail to recognize async fts index from schema array", K(ret));
+  } else if (should_recognize_user_async_index_schemas
+             && OB_FAIL(recognize_user_async_index_schemas(index_schemas, index_ith, async_delete_ith))) {
+    LOG_WARN("fail to recognize user async index from schema array", K(ret));
   } else if (OB_UNLIKELY(index_ith < 0 || index_ith >= index_schemas.count())) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected error, invalid array index", K(ret), K(index_ith));
@@ -1486,7 +1511,7 @@ int ObIndexBuilder::submit_drop_index_task(ObMySQLTransaction &trans,
     bool is_drop_dense_vec_index = is_drop_dense_vec_index_task(arg, index_schema);
     bool is_drop_with_docid_index = is_drop_with_docid_index_task(arg, index_schema);
     bool is_drop_search_index = is_drop_search_index_task(arg, index_schema);
-    bool is_drop_async_fts_index = is_drop_async_fts_index_task(arg, index_schema);
+    bool is_drop_user_async_index = is_drop_user_async_index_task(arg, index_schema);
 
     if (OB_UNLIKELY(!index_schema.is_valid())) {
       ret = OB_INVALID_ARGUMENT;
@@ -1501,17 +1526,19 @@ int ObIndexBuilder::submit_drop_index_task(ObMySQLTransaction &trans,
     } else if (is_drop_with_docid_index && OB_FAIL(check_drop_with_docid_indexs_ith_valid(
                 arg, index_schema, index_schemas.count(), aux_rowkey_doc_ith, aux_doc_rowkey_ith, aux_doc_word_ith))) {
       LOG_WARN("unexpected error, invalid aux table id for with docid index", K(ret));
-    } else if (!is_drop_with_docid_index && !is_drop_dense_vec_index && !is_drop_search_index && !is_drop_async_fts_index) {
+    } else if (!is_drop_with_docid_index && !is_drop_dense_vec_index
+               && !is_drop_search_index && !is_drop_user_async_index) {
       if (OB_FAIL(submit_drop_normal_index_task_(arg, data_schema, index_schema, inc_data_tablet_ids, del_data_tablet_ids, 
                                                  allocator, trans, task_record, task_has_exist))) {
         LOG_WARN("fail to submit drop normal index task", K(ret));
       }
-    } else if (is_drop_async_fts_index) {
+    } else if (is_drop_user_async_index) {
       const ObTableSchema *async_delete_schema = async_delete_ith < 0
           ? nullptr : &index_schemas.at(async_delete_ith);
-      if (OB_FAIL(submit_drop_async_fts_index_task_(arg, data_schema, index_schema, async_delete_schema, inc_data_tablet_ids,
-                                                    del_data_tablet_ids,allocator, trans, task_record, task_has_exist))) {
-        LOG_WARN("fail to submit drop async fts index task", K(ret));
+      if (OB_FAIL(submit_drop_user_async_index_task_(arg, data_schema, index_schema,
+          async_delete_schema, inc_data_tablet_ids, del_data_tablet_ids,
+          allocator, trans, task_record, task_has_exist))) {
+        LOG_WARN("fail to submit drop user async index task", K(ret));
       }
     } else if (is_drop_with_docid_index) {
       if (OB_FAIL(submit_drop_with_docid_index_task_(arg, data_schema, index_schema, index_schemas, inc_data_tablet_ids, del_data_tablet_ids, allocator, 
@@ -1540,7 +1567,7 @@ int ObIndexBuilder::submit_drop_index_task(ObMySQLTransaction &trans,
   return ret;
 }
 
-int ObIndexBuilder::submit_drop_async_fts_index_task_(
+int ObIndexBuilder::submit_drop_user_async_index_task_(
     const obrpc::ObDropIndexArg &arg,
     const ObTableSchema &data_schema,
     const ObTableSchema &index_schema,
@@ -1554,8 +1581,10 @@ int ObIndexBuilder::submit_drop_async_fts_index_task_(
 {
   int ret = OB_SUCCESS;
   ObTableLockOwnerID owner_id;
+  const ObDDLType drop_ddl_type = index_schema.is_async_ivf_index()
+      ? DDL_DROP_ASYNC_VEC_IVF_INDEX : DDL_DROP_ASYNC_FTS_INDEX;
   ObCreateDDLTaskParam param(index_schema.get_tenant_id(),
-                             ObDDLType::DDL_DROP_ASYNC_FTS_INDEX,
+                             drop_ddl_type,
                              &index_schema,
                              nullptr/*dest_table_schema*/,
                              0/*object_id*/,
@@ -1571,7 +1600,7 @@ int ObIndexBuilder::submit_drop_async_fts_index_task_(
       task_has_exist = true;
       ret = OB_SUCCESS;
     } else {
-      LOG_WARN("submit drop async fts index ddl task failed", K(ret));
+      LOG_WARN("submit drop user async index ddl task failed", K(ret));
     }
   } else if (data_schema.is_user_hidden_table()) {
     // not lock hidden data table
@@ -1850,7 +1879,7 @@ int ObIndexBuilder::do_create_local_index(
     const ObString &database_name = create_index_arg.database_name_;
     const ObSysVariableSchema *sys_var_schema = nullptr;
     const bool is_async_index_ddl =
-        share::schema::is_async_fts_index(create_index_arg.index_type_)
+        share::schema::is_user_defined_async_index(create_index_arg.index_type_)
         || share::schema::is_async_search_def_index(create_index_arg.index_type_);
     if (database_name.empty()) {
       ret = OB_INVALID_ARGUMENT;
@@ -2167,7 +2196,8 @@ int ObIndexBuilder::check_async_index_refresh_enabled(
   int ret = OB_SUCCESS;
   const uint64_t tenant_id = table_schema.get_tenant_id();
   const bool is_async_index_ddl = share::schema::is_async_fts_index(arg.index_type_)
-                               || share::schema::is_async_search_def_index(arg.index_type_);
+                               || share::schema::is_async_search_def_index(arg.index_type_)
+                               || share::schema::is_async_ivf_index(arg.index_type_);
   const bool involves_async_index = is_async_index_ddl || table_schema.has_async_index();
   if (arg.is_inner_) {
     // Internal rebuild, restore and replay paths maintain their own refresh boundary.
@@ -2224,12 +2254,13 @@ int ObIndexBuilder::do_create_index(
     LOG_WARN("failed to check index mode conflict", K(ret), K(arg), K(table_id));
   } else if (!arg.is_inner_
              && (share::schema::is_fts_or_multivalue_index(arg.index_type_)
-                 || share::schema::is_async_fts_index(arg.index_type_)
+                 || share::schema::is_user_defined_async_index(arg.index_type_)
                  || share::schema::is_search_def_index(arg.index_type_)
                  || share::schema::is_vec_spiv_index(arg.index_type_))
-             && OB_FAIL(ddl_service_.check_domain_index_ddl_conflict(table_schema->get_tenant_id(), table_id))) {
+             && OB_FAIL(ddl_service_.check_domain_or_user_async_index_conflict(
+                 table_schema->get_tenant_id(), table_id))) {
     if (OB_EAGAIN != ret) {
-      LOG_WARN("failed to check domain index ddl conflict", K(ret), K(arg));
+      LOG_WARN("failed to check domain or user async index conflict", K(ret), K(arg));
     }
   } else if (!arg.is_inner_  && share::schema::is_vec_index(arg.index_type_)
              && OB_FAIL(ddl_service_.check_vec_index_conflict(table_schema->get_tenant_id(), table_id))) {
@@ -2278,7 +2309,7 @@ int ObIndexBuilder::do_create_index(
              || INDEX_TYPE_DOMAIN_CTXCAT_DEPRECATED == arg.index_type_
              || INDEX_TYPE_SPATIAL_LOCAL == arg.index_type_
              || is_fts_index(arg.index_type_)
-             || is_async_fts_index(arg.index_type_)
+             || is_user_defined_async_index(arg.index_type_)
              || is_multivalue_index(arg.index_type_)
              || is_vec_index(arg.index_type_)
              || is_search_index(arg.index_type_)
@@ -2425,30 +2456,92 @@ int ObIndexBuilder::generate_schema(
         }
       } else if (is_async_index(arg.index_type_)) {
         uint64_t tenant_data_version = 0;
+        const uint64_t required_data_version = is_async_ivf_index(arg.index_type_)
+                                                   ? DATA_VERSION_4_6_3_1
+                                                   : (share::schema::is_async_search_index(arg.index_type_)
+                                                          ? DATA_VERSION_4_6_2_1
+                                                          : DATA_VERSION_4_6_2_0);
         if (OB_FAIL(GET_MIN_DATA_VERSION(data_schema.get_tenant_id(),
                                          tenant_data_version))) {
           LOG_WARN("failed to get tenant data version", K(ret));
-        } else if (share::schema::is_async_search_index(arg.index_type_)
-                   && tenant_data_version < DATA_VERSION_4_6_2_1) {
+        } else if (tenant_data_version < required_data_version) {
           ret = OB_NOT_SUPPORTED;
-          LOG_WARN("async search index not supported before 4.6.2.1",
-                   K(ret), K(tenant_data_version));
-          LOG_USER_ERROR(OB_NOT_SUPPORTED,
-                         "async search index before version 4.6.2.1");
-        } else if (tenant_data_version < DATA_VERSION_4_6_2_0) {
+          if (is_async_ivf_index(arg.index_type_)) {
+            LOG_WARN("async DISK_BBQ index not supported before 4.6.2.2",
+                     K(ret), K(tenant_data_version));
+            LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                           "async DISK_BBQ index before version 4.6.2.2");
+          } else if (share::schema::is_async_search_index(arg.index_type_)) {
+            LOG_WARN("async search index not supported before 4.6.2.1",
+                     K(ret), K(tenant_data_version));
+            LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                           "async search index before version 4.6.2.1");
+          } else {
+            LOG_WARN("async fulltext index not supported before 4.6.2",
+                     K(ret), K(tenant_data_version));
+            LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                           "async fulltext index before version 4.6.2");
+          }
+        } else if (is_async_ivf_index(arg.index_type_)
+                   && (data_schema.is_tmp_table()
+                       || data_schema.is_external_table()
+                       || data_schema.is_materialized_view()
+                       || !data_schema.is_user_table())) {
           ret = OB_NOT_SUPPORTED;
-          LOG_WARN("async index not supported before 4.6.2",
-                   K(ret), K(tenant_data_version));
+          LOG_WARN("async DISK_BBQ requires a persistent user table", K(ret),
+                   K(data_schema.get_table_type()));
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "async DISK_BBQ index on this table type is");
+        } else if (is_async_ivf_index(arg.index_type_)
+                   && data_schema.is_table_with_clustering_key()) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("async DISK_BBQ index is not supported on table with clustering key",
+                   K(ret), K(data_schema));
           LOG_USER_ERROR(OB_NOT_SUPPORTED,
-                         "async index before version 4.6.2");
+                         "async DISK_BBQ index on table with clustering key is");
         } else if (!data_schema.is_heap_organized_table()) {
           ret = OB_NOT_SUPPORTED;
           LOG_WARN("async index only supported on heap table", K(ret));
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "async index on non-heap table");
         } else if (!GCTX.is_shared_storage_mode()) {
           ret = OB_NOT_SUPPORTED;
-          LOG_WARN("async index only supported in shared storage mode", K(ret));
-          LOG_USER_ERROR(OB_NOT_SUPPORTED, "async index in non-shared-storage mode");
+          if (is_async_ivf_index(arg.index_type_)) {
+            LOG_WARN("async DISK_BBQ index only supported in shared storage mode", K(ret));
+            LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                           "async DISK_BBQ index in non-shared-storage mode");
+          } else {
+            LOG_WARN("async fulltext index only supported in shared storage mode", K(ret));
+            LOG_USER_ERROR(OB_NOT_SUPPORTED,
+                           "async fulltext index in non-shared-storage mode");
+          }
+        } else if (is_async_ivf_index(arg.index_type_)
+                   && !is_user_tenant(data_schema.get_tenant_id())) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("async DISK_BBQ is only supported in a user tenant", K(ret),
+                   K(data_schema.get_tenant_id()));
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "async DISK_BBQ index outside a user tenant is");
+        } else if (is_async_ivf_index(arg.index_type_)
+                   && !share::ObAsyncIndexRefreshUtil::is_async_index_enabled(
+                           data_schema.get_tenant_id())) {
+          ret = OB_OP_NOT_ALLOW;
+          LOG_WARN("async DISK_BBQ index not allowed while _enable_async_index is false", K(ret),
+                   K(data_schema.get_tenant_id()));
+          LOG_USER_ERROR(OB_OP_NOT_ALLOW,
+                         "create async DISK_BBQ index while _enable_async_index is false");
+        } else if (is_async_ivf_index(arg.index_type_)
+                   && !share::ObAsyncIndexRefreshUtil::is_async_index_refresh_enabled(
+                           data_schema.get_tenant_id())) {
+          ret = OB_OP_NOT_ALLOW;
+          LOG_WARN("async DISK_BBQ index not allowed while _enable_async_index_refresh is false",
+                   K(ret), K(data_schema.get_tenant_id()));
+          LOG_USER_ERROR(OB_OP_NOT_ALLOW,
+                         "create async DISK_BBQ index while _enable_async_index_refresh is false");
+        } else if (is_async_ivf_index(arg.index_type_)
+                   && arg.is_offline_or_restore()
+                   && !(arg.is_offline_rebuild_ && arg.is_rebuild_index_)) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("unsupported offline, restore, or standalone rebuild for async DISK_BBQ",
+                   K(ret), K(arg.index_type_));
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "this async DISK_BBQ DDL is");
         }
       } else if (is_search_index(arg.index_type_)) {
         uint64_t tenant_data_version = 0;
@@ -2459,6 +2552,44 @@ int ObIndexBuilder::generate_schema(
           ret = OB_NOT_SUPPORTED;
           LOG_WARN("tenant data version is less than 4.5.1, search index is not supported", K(ret), K(tenant_data_version));
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "tenant data version is less than 4.5.1, search index");
+        }
+      }
+      if (OB_SUCC(ret) && is_async_ivf_index(arg.index_type_)) {
+        ObVectorIndexParam parsed_param;
+        const ObColumnSchemaV2 *type_column = nullptr;
+        const ObColumnSchemaV2 *cid_column = nullptr;
+        const ObColumnSchemaV2 *data_column = nullptr;
+        if (OB_UNLIKELY(3 != arg.index_columns_.count()
+                        || 1 != arg.store_columns_.count())) {
+          ret = OB_SCHEMA_ERROR;
+          LOG_WARN("invalid async DISK_BBQ physical column contract", K(ret),
+                   K(arg.index_columns_.count()), K(arg.store_columns_.count()));
+        } else if (OB_ISNULL(type_column = data_schema.get_column_schema(
+                       arg.index_columns_.at(0).column_name_))
+                   || OB_ISNULL(cid_column = data_schema.get_column_schema(
+                       arg.index_columns_.at(1).column_name_))
+                   || OB_ISNULL(data_column = data_schema.get_column_schema(
+                       arg.store_columns_.at(0)))) {
+          ret = OB_SCHEMA_ERROR;
+          LOG_WARN("async DISK_BBQ physical column does not exist in data schema",
+                   K(ret), K(arg.index_columns_), K(arg.store_columns_));
+        } else if (OB_UNLIKELY(!type_column->is_vec_ivf_type_column()
+                               || !cid_column->is_vec_ivf_cid_column()
+                               || !data_column->is_vec_ivf_data_column())) {
+          ret = OB_SCHEMA_ERROR;
+          LOG_WARN("invalid async DISK_BBQ physical column roles", K(ret),
+                   KPC(type_column), KPC(cid_column), KPC(data_column));
+        } else if (OB_FAIL(ObVectorIndexUtil::parser_params_from_string(
+            arg.index_schema_.get_index_params(), ObVectorIndexType::VIT_IVF_INDEX,
+            parsed_param, true /* set_default */))) {
+          LOG_WARN("fail to parse async DISK_BBQ parameters", K(ret),
+                   K(arg.index_schema_.get_index_params()));
+        } else if (parsed_param.type_ != ObVectorIndexAlgorithmType::VIAT_DISK_BBQ
+                   || parsed_param.lib_ != ObVectorIndexAlgorithmLib::VIAL_OB
+                   || parsed_param.dist_algorithm_ == ObVectorIndexDistAlgorithm::VIDA_MAX) {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("invalid async DISK_BBQ algorithm combination", K(ret), K(parsed_param));
+          LOG_USER_ERROR(OB_NOT_SUPPORTED, "invalid async DISK_BBQ algorithm combination is");
         }
       }
       if (OB_SUCC(ret)
@@ -2667,12 +2798,14 @@ int ObIndexBuilder::generate_schema(
                  OB_FAIL(set_global_index_auto_partition_infos(data_schema, schema))) {
         LOG_WARN("fail to set auto partition infos", KR(ret), K(data_schema), K(schema));
       } else {
+        const bool need_persist_index_params = !schema.is_async_index() || schema.is_async_ivf_index();
         if (!share::schema::is_built_in_vec_index(arg.index_type_)
             && !share::schema::is_local_vec_hnsw_index(arg.index_type_)
             && !schema.is_fts_index_aux()
             && !schema.is_fts_doc_word_aux()
-            && !schema.is_async_index()) {
-          // only ivf centroid_table set and fts index type set vector_index_params
+            && need_persist_index_params) {
+          // Persist algorithm parameters for vector auxiliaries and the user async
+          // IVF schema; other async index types keep their existing parameter path.
           if (OB_FAIL(schema.set_index_params(arg.index_schema_.get_index_params()))) {
             LOG_WARN("fail to set index params", K(ret), K(arg.index_schema_.get_index_params()));
           }
@@ -3173,16 +3306,16 @@ int ObIndexBuilder::check_has_none_shared_index_tables_for_vector_index_(
   return ret;
 }
 
-int ObIndexBuilder::check_has_none_shared_index_tables_for_async_index_(
+int ObIndexBuilder::check_has_none_shared_index_tables_for_user_async_index_(
     const uint64_t tenant_id,
     const uint64_t data_table_id,
-    const uint64_t dropping_async_index_table_id,
+    const uint64_t dropping_user_async_table_id,
     share::schema::ObSchemaGetterGuard &schema_guard,
-    bool &has_async_index)
+    bool &has_user_async_index)
 {
   int ret = OB_SUCCESS;
   ObSEArray<ObAuxTableMetaInfo, OB_MAX_AUX_TABLE_PER_MAIN_TABLE> index_meta_infos;
-  has_async_index = false;
+  has_user_async_index = false;
   if (OB_UNLIKELY(OB_INVALID_TENANT_ID == tenant_id || OB_INVALID_ID == data_table_id)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid tenant id or data table id", K(ret), K(tenant_id), K(data_table_id));
@@ -3190,15 +3323,24 @@ int ObIndexBuilder::check_has_none_shared_index_tables_for_async_index_(
       tenant_id, data_table_id, index_meta_infos))) {
     LOG_WARN("fail to get index meta infos with data table id", K(ret), K(tenant_id), K(data_table_id));
   } else {
-    for (int64_t i = 0; OB_SUCC(ret) && !has_async_index && i < index_meta_infos.count(); ++i) {
+    for (int64_t i = 0; OB_SUCC(ret) && !has_user_async_index && i < index_meta_infos.count(); ++i) {
       const ObAuxTableMetaInfo &index_meta = index_meta_infos.at(i);
-      if (index_meta.table_id_ == dropping_async_index_table_id) {
+      const ObSimpleTableSchemaV2 *index_schema = nullptr;
+      if (index_meta.table_id_ == dropping_user_async_table_id) {
         continue;
-      } else if (!share::schema::is_async_fts_index(index_meta.index_type_)
+      } else if (!share::schema::is_user_defined_async_index(index_meta.index_type_)
                  && !share::schema::is_async_search_def_index(index_meta.index_type_)) {
         continue;
+      } else if (OB_FAIL(schema_guard.get_simple_table_schema(
+          tenant_id, index_meta.table_id_, index_schema))) {
+        LOG_WARN("fail to get simple index schema", K(ret), K(tenant_id), K(data_table_id), K(index_meta));
+      } else if (OB_ISNULL(index_schema)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected error, index schema is nullptr", K(ret), K(i), K(index_meta));
+      } else if (index_schema->get_index_status() == ObIndexStatus::INDEX_STATUS_INDEX_ERROR) {
+        continue;
       } else {
-        has_async_index = true;
+        has_user_async_index = true;
       }
     }
   }
@@ -3212,7 +3354,8 @@ bool ObIndexBuilder::ignore_error_code_for_domain_index(
 {
   const bool is_domain_index = nullptr == index_schema ? 
     true : (index_schema->is_vec_index() || index_schema->is_fts_index()
-            || index_schema->is_async_fts_index() || index_schema->is_multivalue_index()
+            || index_schema->is_user_defined_async_index()
+            || index_schema->is_multivalue_index()
             || index_schema->is_search_index() || index_schema->is_async_search_index());
   bool ignore = false;
   if (!arg.is_inner_ || !is_domain_index) {

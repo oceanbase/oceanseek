@@ -1593,6 +1593,7 @@ struct MergeKeyInfoHelper
         need_domain_id_scan_(false),
         is_set_vec_strategy_(false),
         has_primary_hint_(false),
+        is_adaptive_specify_by_hint_(false),
         child_stmt_(NULL),
         pushdown_filters_(),
         filters_(),
@@ -1614,6 +1615,7 @@ struct MergeKeyInfoHelper
       bool need_domain_id_scan_;
       bool is_set_vec_strategy_;
       bool has_primary_hint_;
+      bool is_adaptive_specify_by_hint_;
       ObSelectStmt *child_stmt_;
       // when generate inner access path, save all pushdown filters
       // when generate subquery path, save all pushdown filters after rename

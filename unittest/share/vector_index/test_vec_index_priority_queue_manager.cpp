@@ -304,6 +304,8 @@ TEST_F(TestVecIndexPriorityQueueManager, task_type_queue_max_size)
   ASSERT_EQ(2048, mgr_.get_task_type_queue_max_size(OB_VECTOR_ASYNC_INDEX_IVF_LOAD));
   ASSERT_EQ(2048, mgr_.get_task_type_queue_max_size(OB_VECTOR_ASYNC_INDEX_FREEZE));
   ASSERT_EQ(2048, mgr_.get_task_type_queue_max_size(OB_VECTOR_ASYNC_INDEX_OPTINAL));
+  ASSERT_EQ(2048, mgr_.get_task_type_queue_max_size(OB_VECTOR_ASYNC_DISK_BBQ_CACHE_CLEAN));
+  ASSERT_EQ(2048, mgr_.get_task_type_queue_max_size(OB_VECTOR_ASYNC_DISK_BBQ_HGRAPH_BUILD));
   ASSERT_EQ(0, mgr_.get_task_type_queue_max_size(OB_VECTOR_ASYNC_INDEX_BUILT));
   ASSERT_EQ(2048, PRIORITY_QUEUE_MAX_SIZE[PRIORITY_P0]);
 }
@@ -458,9 +460,34 @@ TEST(TestPriorityHelpers, get_priority_by_task_type)
       get_priority_by_task_type(OB_VECTOR_ASYNC_HYBRID_VECTOR_EMBEDDING, OB_VEC_TRIGGER_AUTO));
   ASSERT_EQ(PRIORITY_P4,
       get_priority_by_task_type(OB_VECTOR_ASYNC_INDEX_OPTINAL, OB_VEC_TRIGGER_AUTO));
+  ASSERT_EQ(PRIORITY_P3,
+      get_priority_by_task_type(OB_VECTOR_ASYNC_DISK_BBQ_HGRAPH_BUILD,
+                                OB_VEC_TRIGGER_AUTO));
+  ASSERT_EQ(PRIORITY_P2,
+      get_priority_by_task_type(OB_VECTOR_ASYNC_DISK_BBQ_CACHE_CLEAN,
+                                OB_VEC_TRIGGER_AUTO));
   // BUILT / INVALID -> PRIORITY_MAX
   ASSERT_EQ(PRIORITY_MAX,
       get_priority_by_task_type(OB_VECTOR_ASYNC_INDEX_BUILT, OB_VEC_TRIGGER_AUTO));
+}
+
+TEST(TestPriorityHelpers, disk_bbq_task_type_name_round_trip)
+{
+  ObVecIndexAsyncTaskType task_type = OB_VECTOR_ASYNC_TASK_TYPE_INVALID;
+  ASSERT_STREQ("DISK_BBQ_CACHE_CLEAN",
+      ObVecIndexAsyncTaskUtil::get_vec_task_type_short_name(
+          OB_VECTOR_ASYNC_DISK_BBQ_CACHE_CLEAN));
+  ASSERT_EQ(OB_SUCCESS, ObVecIndexAsyncTaskUtil::get_vec_task_type_by_short_name(
+      "DISK_BBQ_CACHE_CLEAN", task_type));
+  ASSERT_EQ(OB_VECTOR_ASYNC_DISK_BBQ_CACHE_CLEAN, task_type);
+
+  task_type = OB_VECTOR_ASYNC_TASK_TYPE_INVALID;
+  ASSERT_STREQ("DISK_BBQ_HGRAPH_BUILD",
+      ObVecIndexAsyncTaskUtil::get_vec_task_type_short_name(
+          OB_VECTOR_ASYNC_DISK_BBQ_HGRAPH_BUILD));
+  ASSERT_EQ(OB_SUCCESS, ObVecIndexAsyncTaskUtil::get_vec_task_type_by_short_name(
+      "DISK_BBQ_HGRAPH_BUILD", task_type));
+  ASSERT_EQ(OB_VECTOR_ASYNC_DISK_BBQ_HGRAPH_BUILD, task_type);
 }
 
 // ---------------------------------------------------------------------------

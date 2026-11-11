@@ -834,6 +834,9 @@
 #define N_VEC_IVF_PQ_CENTER_ID "vec_ivf_pq_center_id"
 #define N_VEC_IVF_PQ_CENTER_IDS "vec_ivf_pq_center_ids"
 #define N_VEC_IVF_PQ_CENTER_VECTOR "vec_ivf_pq_center_vector"
+#define N_VEC_IVF_TYPE "vec_ivf_type"
+#define N_VEC_IVF_CID "vec_ivf_cid"
+#define N_VEC_IVF_DATA "vec_ivf_data"
 
 #define N_DOC_ID "doc_id"
 #define N_WORD_SEGMENT "word_segment"

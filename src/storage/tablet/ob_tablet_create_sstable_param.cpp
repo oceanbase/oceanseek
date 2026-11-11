@@ -82,6 +82,7 @@ ObTabletCreateSSTableParam::ObTabletCreateSSTableParam()
     upper_trans_version_(0),
     min_merged_trans_version_(0),
     inv_meta_(),
+    ivf_meta_(),
     shared_tablet_meta_scn_(SCN::max_scn())
 {
   data_block_ids_.set_attr(ObMemAttr(MTL_ID(), "CreateSSTable"));
@@ -315,12 +316,16 @@ int ObTabletCreateSSTableParam::init_for_empty_major_sstable(const ObTabletID &t
     const int64_t multi_version_col_cnt = ObMultiVersionRowkeyHelpper::get_extra_rowkey_col_cnt();
     // 异步倒排索引 tablet（异步全文索引或 Search Data 索引，不含 Def 及异步删除位图 tablet）持有
     // ObInvSSTable segment，因此其空基线必须标记为 INV_INDEX_SSTABLE，并携带有效的空 inv_meta。
+    // 异步 IVF 索引的空基线标记为 IVF_INDEX_SSTABLE。
     const bool is_inv_index = share::schema::is_async_inverted_storage_index(
         storage_schema.get_index_type());
+    const bool is_ivf_index = storage_schema.is_async_ivf_index();
     const bool is_column_oriented = 1 < storage_schema.get_column_group_count();
     ObITable::TableType table_type = ObITable::TableType::MAJOR_SSTABLE;
     if (is_inv_index) {
       table_type = ObITable::TableType::INV_INDEX_SSTABLE;
+    } else if (is_ivf_index) {
+      table_type = ObITable::TableType::IVF_INDEX_SSTABLE;
     } else if (is_column_oriented) {
       table_type = ObITable::TableType::COLUMN_ORIENTED_SSTABLE;
     }
@@ -381,6 +386,9 @@ int ObTabletCreateSSTableParam::init_for_empty_major_sstable(const ObTabletID &t
       LOG_WARN("fail to fill column checksum for empty major", K(ret), K(column_cnt_));
     } else if (is_inv_index && OB_FAIL(init_empty_inv_meta(storage_schema, inv_meta_))) {
       LOG_WARN("fail to initialize empty inverted index meta", K(ret), K(storage_schema));
+    } else if (is_ivf_index) {
+      // 空的 IVF segment：ObIvfSSTable::init 要求 ivf_meta 有效。
+      ivf_meta_.set_empty();
     }
   }
 
@@ -692,6 +700,7 @@ int ObTabletCreateSSTableParam::init_for_merge(const compaction::ObBasicTabletMe
   // Async-index IncMajor: refresh window lives in min/max; TableKey is clog identity.
   const bool is_async_index_inc_merge = is_inc_major_merge(static_param.get_merge_type())
       && (ctx.is_inv_index_merge()
+          || ctx.is_ivf_index_merge()
           || (OB_NOT_NULL(ctx.get_tablet()) && ctx.get_tablet()->is_async_index()));
   set_init_value_for_column_store_();
 
@@ -711,7 +720,7 @@ int ObTabletCreateSSTableParam::init_for_merge(const compaction::ObBasicTabletMe
     table_key.column_group_idx_ = (nullptr == cg_schema) ? 0 : column_group_idx;
     if (is_major_or_meta_merge_type(static_param.get_merge_type())) {
       table_key.version_range_.snapshot_version_ = static_param.version_range_.snapshot_version_;
-      if (ctx.is_inv_index_merge()) {
+      if (ctx.is_inv_index_merge() || ctx.is_ivf_index_merge()) {
         table_key.version_range_.base_version_ = static_param.version_range_.base_version_;
       }
     } else {
@@ -764,6 +773,8 @@ int ObTabletCreateSSTableParam::init_for_merge(const compaction::ObBasicTabletMe
     table_shared_flag_.reset();
     co_base_snapshot_version_ = ctx.static_param_.co_static_param_.co_base_snapshot_version_;
     tx_data_recycle_scn_.set_min();
+    ivf_meta_ = res.ivf_meta_;
+
     if (OB_FAIL(inv_meta_.assign(res.inv_meta_))) {
       LOG_WARN("failed to copy inverted stats to create param", K(ret));
     } else if (OB_FAIL(inner_init_with_merge_res(res))) {
@@ -982,6 +993,17 @@ int ObTabletCreateSSTableParam::init_for_ddl(blocksstable::ObSSTableIndexBuilder
       if (ddl_param.table_key_.is_inv_sstable()
           && OB_FAIL(inv_meta_.assign(res.inv_meta_))) {
         LOG_WARN("failed to copy inverted stats to ddl param", K(ret));
+      }
+      if (ddl_param.table_key_.is_ivf_sstable()) {
+        if (res.ivf_meta_.is_valid()) {
+          ivf_meta_ = res.ivf_meta_;
+        } else if (0 == res.row_count_) {
+          ivf_meta_.set_empty();
+        } else {
+          ret = OB_NOT_SUPPORTED;
+          LOG_WARN("non-empty async IVF refresh requires the specialized physical build pipeline",
+                   K(ret), K(res.row_count_), K(ddl_param.table_key_));
+        }
       }
       if (OB_FAIL(ret)) {
       } else if (OB_FAIL(inner_init_with_merge_res(res))) {
@@ -1345,6 +1367,19 @@ int ObTabletCreateSSTableParam::inner_init_for_ss_ddl_(
     // init_for_merge; left default (invalid) for non-inverted-index ddl sstables.
     if (OB_FAIL(inv_meta_.assign(res.inv_meta_))) {
       LOG_WARN("failed to copy inverted stats to create param", K(ret));
+    } else if (table_key.is_ivf_sstable()) {
+      if (res.ivf_meta_.is_valid()) {
+        ivf_meta_ = res.ivf_meta_;
+      } else if (0 == res.row_count_) {
+        ivf_meta_.set_empty();
+      } else {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("non-empty async IVF refresh requires the specialized physical build pipeline",
+                 K(ret), K(res.row_count_), K(table_key));
+      }
+    }
+
+    if (OB_FAIL(ret)) {
     } else if (OB_FAIL(inner_init_with_merge_res(res))) {
       LOG_WARN("fail to inner init with merge res", K(ret), K(res));
     } else if (table_key.is_co_sstable()) {

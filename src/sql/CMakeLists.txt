@@ -116,6 +116,7 @@ ob_set_subtarget(ob_sql das
   das/iter/ob_das_vec_index_driver_iter.cpp
   das/iter/ob_das_vec_index_scan_iter.cpp
   das/iter/ob_das_vec_index_hnsw_scan_iter.cpp
+  das/iter/ob_das_vec_index_async_ivf_scan_iter.cpp
   das/iter/ob_das_vec_index_ivf_scan_iter.cpp
   das/iter/ob_das_vec_index_brute_scan_iter.cpp
   das/iter/ob_das_fusion_parallel.cpp
@@ -168,6 +169,7 @@ ob_set_subtarget(ob_sql das
   das/search/ob_das_async_scalar_range_op.cpp
   das/search/ob_das_async_segment_merge_op.cpp
   das/search/ob_das_async_segment_group_merge_op.cpp
+  das/search/ob_das_async_ivf_search_op.cpp
   das/search/ob_das_async_index_query_ctx.cpp
   das/ob_das_search_index_utils.cpp
 )
@@ -712,6 +714,7 @@ ob_set_subtarget(ob_sql engine_expr
   engine/expr/ob_expr_vec_ivf_pq_center_vector.cpp
   engine/expr/ob_expr_vec_vid.cpp
   engine/expr/ob_expr_vec_type.cpp
+  engine/expr/ob_expr_vec_ivf.cpp
   engine/expr/ob_expr_vec_vector.cpp
   engine/expr/ob_expr_vec_scn.cpp
   engine/expr/ob_expr_vec_key.cpp

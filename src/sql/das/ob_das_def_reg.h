@@ -211,6 +211,10 @@ struct ObDASVecIndexIVFScanCtDef;
 struct ObDASVecIndexIVFScanRtDef;
 REGISTER_DAS_ATTACH_OP(DAS_OP_VEC_INDEX_IVF_SCAN, ObDASVecIndexIVFScanCtDef, ObDASVecIndexIVFScanRtDef);
 
+struct ObDASVecIndexAsyncIVFScanCtDef;
+struct ObDASVecIndexAsyncIVFScanRtDef;
+REGISTER_DAS_ATTACH_OP(DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN, ObDASVecIndexAsyncIVFScanCtDef, ObDASVecIndexAsyncIVFScanRtDef);
+
 struct ObDASVecIndexDriverCtDef;
 struct ObDASVecIndexDriverRtDef;
 REGISTER_DAS_ATTACH_OP(DAS_OP_VEC_INDEX_DRIVER, ObDASVecIndexDriverCtDef, ObDASVecIndexDriverRtDef);

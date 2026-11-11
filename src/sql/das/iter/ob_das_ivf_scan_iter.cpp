@@ -4,9 +4,12 @@
  */
 
 #define USING_LOG_PREFIX SQL_DAS
+#include <cmath>
+#include "lib/worker.h"
 #include "sql/das/iter/ob_das_ivf_scan_iter.h"
 #include "sql/das/ob_das_scan_op.h"
 #include "storage/tx_storage/ob_access_service.h"
+#include "storage/async_index/ob_deletion_row_iter.h"
 #include "src/storage/access/ob_table_scan_iterator.h"
 #include "share/vector_type/ob_vector_common_util.h"
 #include "sql/engine/expr/ob_expr_vec_ivf_sq8_data_vector.h"
@@ -14,10 +17,14 @@
 #include "share/ob_vec_index_builder_util.h"
 #include "share/vector_index/ob_vector_index_ivf_cache_util.h"
 #include "sql/das/iter/ob_das_vec_scan_utils.h"
+#include "sql/das/iter/ob_das_local_lookup_iter.h"
 #include "lib/roaringbitmap/ob_rb_memory_mgr.h"
 #include "deps/oblib/src/lib/vector/ob_vector_util.h"
 #include "lib/oblog/ob_warning_buffer.h"
 #include "share/vector_index/ob_vector_index_util.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable_scan_iter.h"
+#include "storage/access/ob_table_scan_range.h"
+#include "share/ob_debug_sync.h"
 #include "sql/das/iter/ob_das_profile_iter.h"
 
 namespace oceanbase
@@ -31,6 +38,40 @@ using namespace sql;
 namespace sql
 {
 
+ERRSIM_POINT_DEF(ERRSIM_ENABLE_ASYNC_IVF_FLASHBACK_RESET,
+                "Reset the async IVF flashback snapshot instead of rejecting flashback queries");
+
+void ObIVFProfileUtil::set(ObOpProfile<ObMetric> *profile, ObMetricId id, uint64_t value)
+{
+  int ret = OB_SUCCESS;
+  ObProfileSwitcher switcher(profile);
+  SET_METRIC_VAL(id, value);
+}
+
+void ObIVFProfileUtil::inc(ObOpProfile<ObMetric> *profile, ObMetricId id, uint64_t value)
+{
+  int ret = OB_SUCCESS;
+  ObProfileSwitcher switcher(profile);
+  INC_METRIC_VAL(id, value);
+}
+
+void ObIVFProfileUtil::set_once(ObOpProfile<ObMetric> *profile, ObMetricId id, uint64_t value)
+{
+  if (nullptr != profile && nullptr == profile->get_metric(id)) {
+    set(profile, id, value);
+  }
+}
+
+ObOpProfile<ObMetric> *ObIVFProfileUtil::register_child(ObOpProfile<ObMetric> *profile, ObProfileId id)
+{
+  int ret = OB_SUCCESS;
+  ObOpProfile<ObMetric> *child = nullptr;
+  if (nullptr != profile && OB_FAIL(profile->register_child(id, child))) {
+    LOG_WARN("failed to register async ivf profile child", KR(ret), K(id));
+    child = nullptr;
+  }
+  return child;
+}
 static common::ObOpProfile<common::ObMetric> *get_current_vector_iter_profile()
 {
   common::ObOpProfile<common::ObMetric> *profile = common::get_current_profile();
@@ -89,7 +130,6 @@ int ObDASIvfBaseScanIter::prepare_runtime_profile()
   }
   return ret;
 }
-
 int ObDASIvfBaseScanIter::do_table_scan()
 {
   int ret = OB_SUCCESS;
@@ -114,7 +154,10 @@ int ObDASIvfBaseScanIter::rescan()
   if (OB_SUCCESS != profile_ret) {
     LOG_WARN("failed to prepare ivf runtime profile for rescan", KR(profile_ret));
   }
-  if (OB_NOT_NULL(inv_idx_scan_iter_) && OB_FAIL(inv_idx_scan_iter_->rescan())) {
+  // Synchronous FLAT/SQ8/PQ also reuse this iterator across correlated bindings.
+  if (OB_FAIL(refresh_query_vector())) {
+    LOG_WARN("failed to refresh ivf query vector on rescan", K(ret));
+  } else if (OB_NOT_NULL(inv_idx_scan_iter_) && OB_FAIL(inv_idx_scan_iter_->rescan())) {
     LOG_WARN("failed to rescan inv_idx_scan_iter_", K(ret));
   }
 
@@ -200,14 +243,27 @@ int ObDASIvfBaseScanIter::do_aux_table_scan(bool &first_scan,
                                             const ObDASScanCtDef *ctdef,
                                             ObDASScanRtDef *rtdef,
                                             ObDASScanIter *iter,
-                                            ObTabletID &tablet_id)
+                                            ObTabletID &tablet_id,
+                                            bool is_get)
 {
   int ret = OB_SUCCESS;
 
   if (first_scan) {
     scan_param.need_switch_param_ = false;
+    // Storage owns and frees each lookup batch's datum rowkeys on reuse().
+    // Keep the allocator itself alive across rescans, without allocating these
+    // short-lived datums in the arena that holds cross-round IVF state.
+    const bool freeable_lookup = is_get && &scan_param == &data_filter_scan_param_
+        && OB_NOT_NULL(vec_aux_ctdef_)
+        && ObVectorIndexAlgorithmType::VIAT_DISK_BBQ == vec_aux_ctdef_->algorithm_type_;
+    if (freeable_lookup) {
+      disk_bbq_lookup_alloc_.bind(mem_context_->get_malloc_allocator());
+    }
+    ObIAllocator *scan_allocator = freeable_lookup
+        ? static_cast<ObIAllocator *>(&disk_bbq_lookup_alloc_)
+        : &mem_context_->get_arena_allocator();
     if (OB_FAIL(ObDasVecScanUtils::init_scan_param(
-            ls_id_, tablet_id, ctdef, rtdef, tx_desc_, snapshot_, scan_param, false/*is_get*/, &mem_context_->get_arena_allocator()))) {
+            ls_id_, tablet_id, ctdef, rtdef, tx_desc_, snapshot_, scan_param, is_get, scan_allocator))) {
       LOG_WARN("failed to init scan param", K(ret));
     } else if (OB_FALSE_IT(iter->set_scan_param(scan_param))) {
     } else if (OB_FAIL(iter->do_table_scan())) {
@@ -332,8 +388,11 @@ int ObDASIvfBaseScanIter::init_hgraph_search_alloc()
 int ObDASIvfBaseScanIter::inner_init(ObDASIterParam &param)
 {
   int ret = OB_SUCCESS;
+  const bool is_async_ivf =
+      ObDASIterType::DAS_ITER_ASYNC_IVF_SCAN == param.type_;
 
-  if (OB_UNLIKELY(ObDASIterType::DAS_ITER_IVF_SCAN != param.type_)) {
+  if (OB_UNLIKELY(ObDASIterType::DAS_ITER_IVF_SCAN != param.type_
+                  && !is_async_ivf)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid das iter param type for ivf scan iter", K(ret), K(param));
   } else {
@@ -391,22 +450,8 @@ int ObDASIvfBaseScanIter::inner_init(ObDASIterParam &param)
                        vec_aux_ctdef_->vec_index_param_, ObVectorIndexType::VIT_IVF_INDEX, vec_index_param_))) {
           LOG_WARN("fail to parse params from string", K(ret), K(vec_aux_ctdef_->vec_index_param_));
         } else if (OB_FALSE_IT(vec_index_param_.dim_ = vec_aux_ctdef_->dim_)) {
-        } else if (OB_FAIL(ObDasVecScanUtils::get_real_search_vec(persist_alloc_, sort_rtdef_->eval_ctx_, search_vec_,
-                                                                  real_search_vec_))) {
-          LOG_WARN("failed to get real search vec", K(ret));
-        } else if (OB_FAIL(ObDasVecScanUtils::get_distance_expr_type(*sort_ctdef_->sort_exprs_[0],
-                                                                     *sort_rtdef_->eval_ctx_, dis_type_))) {
-          LOG_WARN("failed to get distance type.", K(ret));
-        } else if (dis_type_ == oceanbase::sql::ObExprVectorDistance::ObVecDisType::COSINE) {
-          // nomolize serach_vec
-          if (OB_FAIL(ObVectorNormalize::L2_normalize_vector(vec_aux_ctdef_->dim_,
-                                                             reinterpret_cast<float *>(real_search_vec_.ptr()),
-                                                             reinterpret_cast<float *>(real_search_vec_.ptr())))) {
-            LOG_WARN("failed to normalize vector", K(ret));
-          } else {
-            need_norm_ = true;
-            dis_type_ = oceanbase::sql::ObExprVectorDistance::ObVecDisType::DOT;
-          }
+        } else if (OB_FAIL(refresh_query_vector())) {
+          LOG_WARN("failed to initialize query vector", K(ret));
         }
         if (OB_SUCC(ret)) {
           if (OB_FAIL(ObVectorIndexParam::build_search_param(vec_aux_ctdef_->vector_index_param_, vec_aux_ctdef_->vec_query_param_, search_param_))) {
@@ -442,7 +487,8 @@ int ObDASIvfBaseScanIter::inner_init(ObDASIterParam &param)
       }
     }
 
-    if (OB_SUCC(ret) && is_adaptive_filter()) {
+    // Async IVF selects its path per partition without updating the shared plan.
+    if (OB_SUCC(ret) && !is_async_ivf && is_adaptive_filter()) {
       ObPhysicalPlanCtx *plan_ctx = GET_PHY_PLAN_CTX(*exec_ctx_);
       ObVecIdxAdaTryPath cur_path = ObVecIdxAdaTryPath::VEC_PATH_UNCHOSEN;
       if (OB_ISNULL(plan_ctx->get_phy_plan())) {
@@ -474,7 +520,13 @@ int ObDASIvfBaseScanIter::inner_init(ObDASIterParam &param)
 
     if (OB_SUCC(ret)) {
       omt::ObTenantConfigGuard tenant_config(TENANT_CONF(MTL_ID())); 
-      max_scan_vectors_ = tenant_config->_ivf_max_scan_vectors;
+      if (tenant_config.is_valid()) {
+        max_scan_vectors_ = is_async_ivf
+            ? tenant_config->_disk_bbq_max_scan_vectors
+            : tenant_config->_ivf_max_scan_vectors;
+      }
+    }
+    if (OB_SUCC(ret) && !is_async_ivf) {
       const ObDASBaseRtDef *index_rtdef = vec_aux_rtdef_->get_inv_idx_scan_rtdef();
       if (OB_NOT_NULL(index_rtdef->table_loc_)) {
         scan_tablet_size_ = index_rtdef->table_loc_->get_tablet_locs().size();
@@ -482,7 +534,7 @@ int ObDASIvfBaseScanIter::inner_init(ObDASIterParam &param)
     }
   }
 
-  if (OB_SUCC(ret)) {
+  if (OB_SUCC(ret) && !is_async_ivf) {
     if (OB_FAIL(get_ns_id())) {
       LOG_WARN("failed to get ns_id", K(ret));
     }
@@ -492,6 +544,44 @@ int ObDASIvfBaseScanIter::inner_init(ObDASIterParam &param)
     selectivity_ = vec_aux_ctdef_->selectivity_;
     // mock ns_id
 
+  return ret;
+}
+
+int ObDASIvfBaseScanIter::refresh_query_vector()
+{
+  int ret = OB_SUCCESS;
+  ObString query_vector;
+  real_search_vec_.reset();
+  query_vector_alloc_.reuse();
+  need_norm_ = false;
+  if (OB_ISNULL(vec_aux_ctdef_) || OB_ISNULL(sort_ctdef_) || OB_ISNULL(sort_rtdef_)
+      || OB_ISNULL(sort_rtdef_->eval_ctx_) || OB_ISNULL(search_vec_)
+      || OB_UNLIKELY(vec_aux_ctdef_->dim_ <= 0 || sort_ctdef_->sort_exprs_.empty())
+      || OB_ISNULL(sort_ctdef_->sort_exprs_[0])) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid IVF query vector state", K(ret));
+  } else if (OB_FAIL(ObDasVecScanUtils::get_real_search_vec(
+                 query_vector_alloc_, sort_rtdef_->eval_ctx_, search_vec_, query_vector))) {
+    LOG_WARN("failed to evaluate current query vector", K(ret));
+  } else if (OB_UNLIKELY(query_vector.length() != vec_aux_ctdef_->dim_ * sizeof(float))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("IVF query vector dimension mismatch", K(ret), K(query_vector.length()), K(vec_aux_ctdef_->dim_));
+  } else if (OB_FAIL(ObDasVecScanUtils::get_distance_expr_type(
+                 *sort_ctdef_->sort_exprs_[0], *sort_rtdef_->eval_ctx_, dis_type_))) {
+    LOG_WARN("failed to get distance type", K(ret));
+  } else if (OB_FAIL(ob_write_string(query_vector_alloc_, query_vector, real_search_vec_))) {
+    LOG_WARN("failed to copy query vector", K(ret));
+  } else if (ObExprVectorDistance::ObVecDisType::COSINE == dis_type_) {
+    // Own the bytes: normalization must not overwrite an expression's cached datum.
+    if (OB_FAIL(ObVectorNormalize::L2_normalize_vector(
+                   vec_aux_ctdef_->dim_, reinterpret_cast<float *>(real_search_vec_.ptr()),
+                   reinterpret_cast<float *>(real_search_vec_.ptr())))) {
+      LOG_WARN("failed to normalize query vector", K(ret));
+    } else {
+      need_norm_ = true;
+      dis_type_ = ObExprVectorDistance::ObVecDisType::DOT;
+    }
+  }
   return ret;
 }
 
@@ -567,6 +657,7 @@ int ObDASIvfBaseScanIter::inner_release()
   saved_rowkeys_.reset();
   pre_fileter_rowkeys_.reset();
   // Reset memory context and clean up associated resources
+  disk_bbq_lookup_alloc_.reset();
   reset_memory_context();
   if (nullptr != mem_context_) {
     DESTROY_CONTEXT(mem_context_);
@@ -575,6 +666,7 @@ int ObDASIvfBaseScanIter::inner_release()
   tmp_main_rowkey_.reset();
   vec_op_alloc_.reset();
   persist_alloc_.reset();
+  query_vector_alloc_.reset();
   // Release any centroid ref_cnt_ before tearing down the cache mgr guard.
   {
     int tmp_ret = batch_guard_.release_all();
@@ -713,7 +805,7 @@ int ObDASIvfBaseScanIter::process_ivf_scan(bool is_vectorized)
     SET_METRIC_VAL(common::ObMetricId::VEC_SWITCH_REASON,
                    static_cast<int64_t>(profile_switch_reason_));
   }
-  can_retry_ = check_if_can_retry();
+  can_retry_ = ObDASIterType::DAS_ITER_ASYNC_IVF_SCAN != get_type() && check_if_can_retry();
   if (OB_FAIL(do_ivf_scan(is_vectorized))) {
     LOG_WARN("failed to process ivf_scan pre", K(ret));
   }
@@ -1063,6 +1155,23 @@ int64_t ObDASIvfBaseScanIter::get_heap_size(const int64_t limit_k, const double 
     else heap_size = std::ceil(limit_k / select_ratio);
   }
   return heap_size;
+}
+
+int64_t ObDASIvfBaseScanIter::calc_next_nprobe(
+    const int64_t limit_k,
+    const int64_t matched_count) const
+{
+  int64_t next_nprobe = nprobes_;
+  if (limit_k > 0) {
+    const int64_t left_search = OB_MAX(
+        limit_k - matched_count, static_cast<int64_t>(0));
+    next_nprobe = OB_MIN(
+        nprobes_,
+        OB_MAX(static_cast<int64_t>(1),
+               static_cast<int64_t>(nprobes_ * static_cast<double>(left_search)
+                                    / static_cast<double>(limit_k) + 1)));
+  }
+  return next_nprobe;
 }
 
 int ObDASIvfBaseScanIter::gen_near_cid_heap_from_cache(ObIvfICache &cent_cache,
@@ -1701,7 +1810,7 @@ int ObDASIvfBaseScanIter::get_pre_filter_rowkey_batch(ObIAllocator &allocator,
   int ret = OB_SUCCESS;
   const int64_t row_count_before = pre_fileter_rowkeys_.count();
   common::ObOpProfile<common::ObMetric> *vector_iter_profile =
-      get_current_vector_iter_profile();
+      DAS_ITER_ASYNC_IVF_SCAN == get_type() ? nullptr : get_current_vector_iter_profile();
   common::ScopedTimer pre_filter_timer(common::ObMetricId::VEC_PRE_FILTER_TIME,
                                        vector_iter_profile);
   index_end = false;
@@ -1850,9 +1959,19 @@ int ObDASIvfBaseScanIter::do_simple_post_filter(ObIVFRowkeyDistMap &rowkey_dist_
   return ret;
 }
 
-int ObDASIvfBaseScanIter::do_table_post_filter(bool is_vectorized, ObIVFRowkeyDistMap &rowkey_dist_map, ObSEArray<ObIvfRowkeyDistEntry, 16> &matched_rowkeys)
+int ObDASIvfBaseScanIter::do_table_post_filter(bool is_vectorized,
+    ObIVFRowkeyDistMap &rowkey_dist_map, ObSEArray<ObIvfRowkeyDistEntry, 16> &matched_rowkeys,
+    ObOpProfile<ObMetric> *filter_profile)
 {
   int ret = OB_SUCCESS;
+  // Use point gets only for DiskBBQ post-filter lookups; other IVF scans keep their existing path.
+  const bool is_get = OB_NOT_NULL(vec_aux_ctdef_)
+      && ObVectorIndexAlgorithmType::VIAT_DISK_BBQ == vec_aux_ctdef_->algorithm_type_;
+  ScopedTimer filter_timer(ObMetricId::VEC_ITER_FILTER_TIME,
+                          rowkey_dist_map.size() > 0 ? filter_profile : nullptr);
+  if (rowkey_dist_map.size() > 0) {
+    ObIVFProfileUtil::inc(filter_profile, ObMetricId::VEC_ITER_FILTER_LOOP_CNT, 1);
+  }
   int64_t scan_row_cnt = 0;
   int64_t batch_row_count = ObVectorParamData::VI_PARAM_DATA_BATCH_SIZE;
   int64_t count = 0;
@@ -1860,6 +1979,9 @@ int ObDASIvfBaseScanIter::do_table_post_filter(bool is_vectorized, ObIVFRowkeyDi
   ObIVFRowkeyDistMapIterator rowkey_iter = rowkey_dist_map.begin();
   ObIVFRowkeyDistMapIterator rowkey_end = rowkey_dist_map.end();
   while (OB_SUCC(ret) && rowkey_iter != rowkey_end) {
+    const int64_t count_before_batch = count;
+    bool scan_attempted = false;
+    bool scan_opened = false;
     for (int64_t i = 0; OB_SUCC(ret) && i < batch_row_count && rowkey_iter != rowkey_end; ++i) {
       ObRowkey &rowkey = rowkey_iter->first;
       if (OB_FAIL(ObDasVecScanUtils::set_lookup_key(
@@ -1871,14 +1993,35 @@ int ObDASIvfBaseScanIter::do_table_post_filter(bool is_vectorized, ObIVFRowkeyDi
         LOG_DEBUG("add filter rowkey", K(i), K(rowkey), K(count));
       }
     }
+    if (nullptr != filter_profile && count > count_before_batch) {
+      // Preserve prior rounds and count only the keys added by this batch, including partial work.
+      ObIVFProfileUtil::inc(filter_profile, ObMetricId::VEC_ITER_FILTER_ROW, count - count_before_batch);
+    }
+    if (OB_SUCC(ret)) {
+      scan_attempted = true;
+      LOG_DEBUG("begin IVF filter batch scan", K(is_get), K_(ls_id),
+                K_(data_filter_tablet_id), K_(data_filter_iter_first_scan),
+                "key_count", data_filter_scan_param_.key_ranges_.count());
+      if (OB_FAIL(do_aux_table_scan(data_filter_iter_first_scan_,
+                                   data_filter_scan_param_,
+                                   data_filter_ctdef_,
+                                   data_filter_rtdef_,
+                                   data_filter_iter_,
+                                   data_filter_tablet_id_,
+                                   is_get))) {
+        LOG_WARN("failed to do data filter table scan.", K(ret), K(count), K(data_filter_iter_first_scan_));
+      } else {
+        scan_opened = true;
+        LOG_DEBUG("IVF filter batch scan opened", K(is_get), K_(ls_id),
+                  K_(data_filter_tablet_id), K_(data_filter_iter_first_scan),
+                  "key_count", data_filter_scan_param_.key_ranges_.count());
+      }
+    }
     if (OB_FAIL(ret)) {
-    } else if (OB_FAIL(do_aux_table_scan(data_filter_iter_first_scan_, 
-                                      data_filter_scan_param_, 
-                                      data_filter_ctdef_, 
-                                      data_filter_rtdef_, 
-                                      data_filter_iter_, 
-                                      data_filter_tablet_id_))) {
-      LOG_WARN("failed to do data filter table scan.", K(ret), K(count), K(data_filter_iter_first_scan_));
+      LOG_WARN("skip IVF filter batch read after preparation failure", K(ret),
+               K(scan_attempted), K(scan_opened), K(is_get), K_(ls_id),
+               K_(data_filter_tablet_id), K_(data_filter_iter_first_scan),
+               "key_count", data_filter_scan_param_.key_ranges_.count());
     } else if (is_vectorized) {
       IVF_GET_NEXT_ROWS_BEGIN(data_filter_iter_)
         ObEvalCtx::BatchInfoScopeGuard guard(*vec_aux_rtdef_->eval_ctx_);
@@ -1899,7 +2042,7 @@ int ObDASIvfBaseScanIter::do_table_post_filter(bool is_vectorized, ObIVFRowkeyDi
             LOG_DEBUG("match filter rowkey", K(i), K(main_rowkey), K(matched_count));
           }
         }
-      IVF_GET_NEXT_ROWS_END(data_filter_iter_, data_filter_scan_param_, data_filter_tablet_id_)
+      } // IVF_GET_NEXT_ROWS_BEGIN loop; cleanup is shared with the scalar/error path below.
     } else {
       data_filter_iter_->clear_evaluated_flag();
       for (int i = 0; OB_SUCC(ret) && i < batch_row_count; ++i) {
@@ -1921,24 +2064,1563 @@ int ObDASIvfBaseScanIter::do_table_post_filter(bool is_vectorized, ObIVFRowkeyDi
           LOG_DEBUG("match filter rowkey", K(i), K(main_rowkey), K(matched_count));
         }
       }
-      int tmp_ret = (ret == OB_ITER_END) ? OB_SUCCESS : ret;
-      if (OB_FAIL(ObDasVecScanUtils::reuse_iter(ls_id_, data_filter_iter_, data_filter_scan_param_, data_filter_tablet_id_))) { 
-        LOG_WARN("failed to reuse data_filter iter.", K(ret));
-      } else {
-        ret = tmp_ret;
+    }
+    if (scan_opened || (is_get && scan_attempted)) {
+      const int scan_ret = OB_ITER_END == ret ? OB_SUCCESS : ret;
+      const int reuse_ret = ObDasVecScanUtils::reuse_iter(
+          ls_id_, data_filter_iter_, data_filter_scan_param_, data_filter_tablet_id_);
+      if (OB_SUCCESS != reuse_ret) {
+        LOG_WARN("failed to leave IVF filter batch", K(reuse_ret), K(scan_ret));
+      } else if (is_get) {
+        // All storage readers have left this batch. Free any allocations that
+        // the common code abandoned, without touching cross-round IVF state.
+        disk_bbq_lookup_alloc_.reuse();
       }
+      // On cleanup failure keep the batch owner alive until inner_release()
+      // drains the iterator; never free memory that may still be borrowed.
+      ret = is_get && OB_SUCCESS != scan_ret ? scan_ret
+          : (OB_SUCCESS != reuse_ret ? reuse_ret : scan_ret);
+    } else if (is_get && OB_FAIL(ret)) {
+      data_filter_scan_param_.key_ranges_.reuse();
     }
   }
   if (OB_SUCC(ret)) {
     adaptive_ctx_.iter_filter_row_cnt_ += count;
     adaptive_ctx_.iter_res_row_cnt_ += matched_count;
   }
+  // Keep completed work even when filtering failed.
+  ObIVFProfileUtil::inc(filter_profile, ObMetricId::VEC_ITER_FILTER_MATCHED_ROW_COUNT, matched_count);
   return ret;
 }
 
 void ObDASIvfBaseScanIter::reuse_cid_ctx()
 {
   iterative_filter_ctx_.reuse();
+}
+
+ObDASIVFAsyncIter::ObDASIVFAsyncIter()
+  : ObDASIvfBaseScanIter(),
+    async_ivf_index_tablet_id_(),
+    async_delete_tablet_id_(),
+    async_ivf_scan_param_(),
+    async_delete_scan_param_(),
+    segment_group_ctx_(),
+    sql_snapshot_(nullptr),
+    async_read_snapshot_(nullptr),
+    deletion_bitmap_handle_(),
+    filter_rowkey_objs_(),
+    partition_scan_finished_(false),
+    is_adaptive_specify_by_hint_(false),
+    profile_est_rows_(0),
+    profile_est_total_rows_(0),
+    partition_profile_(nullptr)
+{
+  filter_rowkey_objs_.set_attr(ObMemAttr(MTL_ID(), "AsyncIVFRkBuf"));
+}
+
+void ObDASIVFAsyncIter::bind_partition_profile()
+{
+  const int64_t selectivity_scale = 100; // integer percent
+  partition_profile_ = get_current_vector_iter_profile();
+  profile_ = ObIVFProfileUtil::register_child(
+      partition_profile_, ObProfileId::VECTOR_SEARCH_VEC_ASYNC_IVF_SCAN);
+  if (is_adaptive_filter() && !is_adaptive_specify_by_hint_) {
+    ObIVFProfileUtil::set(partition_profile_, ObMetricId::VEC_IVF_EST_ROWS, profile_est_rows_);
+    ObIVFProfileUtil::set(partition_profile_, ObMetricId::VEC_IVF_EST_SELECTIVITY,
+        profile_est_total_rows_ > 0
+            ? static_cast<int64_t>(std::min(1.0, static_cast<double>(profile_est_rows_)
+                / profile_est_total_rows_) * selectivity_scale)
+            : 0);
+  }
+}
+
+void ObDASIVFAsyncIter::record_profile_finish(const int scan_ret)
+{
+  if (OB_SUCCESS != scan_ret && OB_ITER_END != scan_ret) {
+    const int64_t tag = OB_VECTOR_INDEX_ADAPTIVE_NEED_RETRY == scan_ret
+        ? PROFILE_VECTOR_RETRY : PROFILE_QUERY_ERROR;
+    ObIVFProfileUtil::set(partition_profile_, ObMetricId::VEC_IVF_FINISH_TAG, tag);
+  } else if (OB_ITER_END == scan_ret || partition_scan_finished_) {
+    ObIVFProfileUtil::set_once(partition_profile_, ObMetricId::VEC_IVF_FINISH_TAG, PROFILE_RETURN_RESULT);
+  }
+}
+
+void ObDASIVFAsyncIter::clear_partition_profile()
+{
+  // Closing early must not invent a finish tag or retain another partition's estimates.
+  partition_profile_ = nullptr;
+  profile_ = nullptr;
+  profile_est_rows_ = 0;
+  profile_est_total_rows_ = 0;
+}
+
+int ObDASIVFAsyncIter::inner_get_next_row()
+{
+  int ret = ObDASIvfBaseScanIter::inner_get_next_row();
+  record_profile_finish(ret);
+  return ret;
+}
+
+int ObDASIVFAsyncIter::inner_get_next_rows(int64_t &count, int64_t capacity)
+{
+  int ret = ObDASIvfBaseScanIter::inner_get_next_rows(count, capacity);
+  record_profile_finish(ret);
+  return ret;
+}
+
+int ObDASIVFAsyncIter::inner_init(ObDASIterParam &param)
+{
+  int ret = ObDASIvfBaseScanIter::inner_init(param);
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to init async ivf base iter", K(ret));
+  } else if (OB_ISNULL(async_read_snapshot_ =
+                 OB_NEWx(transaction::ObTxReadSnapshot, &persist_alloc_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate async ivf read snapshot", K(ret));
+  } else {
+    ObDASIVFAsyncIterParam &async_param = static_cast<ObDASIVFAsyncIterParam &>(param);
+    async_ivf_index_tablet_id_ = async_param.async_ivf_index_tablet_id_;
+    async_delete_tablet_id_ = async_param.async_delete_tablet_id_;
+    is_adaptive_specify_by_hint_ = async_param.is_adaptive_specify_by_hint_;
+    sql_snapshot_ = snapshot_;
+    partition_scan_finished_ = false;
+    if (OB_NOT_NULL(data_filter_iter_)) {
+      data_filter_iter_->set_scan_param(data_filter_scan_param_);
+    }
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::do_table_scan()
+{
+  int ret = OB_SUCCESS;
+  bind_partition_profile();
+  ScopedTimer timer(ObMetricId::VEC_TOTAL_SEARCH_TIME, partition_profile_);
+  // The partition path was selected after binding the filter input at tree creation.
+  if (OB_ISNULL(vec_aux_ctdef_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null async ivf scan definition", K(ret));
+  } else if (OB_ISNULL(inv_idx_scan_iter_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async ivf filter input binding", K(ret), KP_(inv_idx_scan_iter));
+  } else if (OB_FAIL(prepare_async_ivf_read())) {
+    LOG_WARN("failed to prepare async ivf read state", K(ret));
+  } else if (OB_FAIL(start_filter_input(false))) {
+    LOG_WARN("failed to start async ivf filter input", K(ret));
+  }
+  if (OB_SUCCESS != ret) {
+    record_profile_finish(ret);
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::rescan()
+{
+  int ret = OB_SUCCESS;
+  clear_partition_profile();
+  bind_partition_profile();
+  ScopedTimer timer(ObMetricId::VEC_TOTAL_SEARCH_TIME, partition_profile_);
+  // DAS already reused the tree before filling the new input ranges. The SQL
+  // parameter setter invalidated dependent expressions; materialize this binding
+  // again before opening its Segment scans.
+  if (OB_ISNULL(vec_aux_ctdef_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null async ivf scan definition", K(ret));
+  } else if (OB_ISNULL(inv_idx_scan_iter_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async ivf filter input binding", K(ret), KP_(inv_idx_scan_iter));
+  } else if (OB_FAIL(refresh_partition_filter_path())) {
+    LOG_WARN("failed to select async ivf partition filter path on rescan", K(ret));
+  } else if (OB_FAIL(refresh_query_vector())) {
+    LOG_WARN("failed to refresh async ivf query vector on rescan", K(ret));
+  } else if (OB_FAIL(prepare_async_ivf_read())) {
+    LOG_WARN("failed to prepare async ivf rescan state", K(ret));
+  } else if (OB_FAIL(start_filter_input(true))) {
+    LOG_WARN("failed to rescan async ivf filter input", K(ret));
+  }
+  if (OB_SUCCESS != ret) {
+    record_profile_finish(ret);
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::get_filter_input_scan(ObDASScanIter *&scan_iter) const
+{
+  int ret = OB_SUCCESS;
+  ObDASIter *input = inv_idx_scan_iter_;
+  scan_iter = nullptr;
+  if (OB_NOT_NULL(input) && DAS_ITER_LOCAL_LOOKUP == input->get_type()) {
+    input = static_cast<ObDASLocalLookupIter *>(input)->get_index_table_iter();
+  }
+  if (OB_ISNULL(input) || DAS_ITER_SCAN != input->get_type()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async ivf filter scan", K(ret), KP(input));
+  } else {
+    scan_iter = static_cast<ObDASScanIter *>(input);
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::start_filter_input(const bool is_rescan)
+{
+  int ret = OB_SUCCESS;
+  ScopedTimer timer(ObMetricId::VEC_PRE_FILTER_TIME, is_pre_filter() ? partition_profile_ : nullptr);
+  // Filtered paths share the input lifecycle; only PRE consumes its rows.
+  if (ObVecIndexType::VEC_INDEX_POST_WITHOUT_FILTER == vec_index_type_) {
+    // The input is the async IVF index itself; unfiltered queries use Segment KNN scans.
+  } else if (OB_FAIL(prepare_filter_input_scan_params())) {
+    LOG_WARN("failed to prepare async ivf filter input", K(ret));
+  } else if (is_rescan) {
+    if (OB_FAIL(inv_idx_scan_iter_->rescan())) {
+      LOG_WARN("failed to rescan async ivf filter input", K(ret));
+    }
+  } else if (OB_FAIL(inv_idx_scan_iter_->do_table_scan())) {
+    LOG_WARN("failed to open async ivf filter input", K(ret));
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::estimate_partition_rows(
+    const ObDASScanCtDef &ctdef,
+    const ObTabletID &tablet_id,
+    const ObQueryFlag &scan_flag,
+    const ObIArray<ObNewRange> &ranges,
+    int64_t &row_count)
+{
+  int ret = OB_SUCCESS;
+  const ObAccessService *access_service = MTL(ObAccessService *);
+  ObArenaAllocator allocator(ObMemAttr(MTL_ID(), "IVFRowEstimate"));
+  ObTableScanParam est_param;
+  ObTableScanRange scan_range;
+  ObSimpleBatch batch;
+  ObNewRange whole_range;
+  SQLScanRangeArray scan_ranges;
+  ObSEArray<ObEstRowCountRecord, 1> records;
+  int64_t physical_rows = -1;
+  row_count = -1;
+  if (!tablet_id.is_valid() || !ls_id_.is_valid()) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async ivf estimate tablet or ls", K(ret), K(tablet_id), K_(ls_id));
+  } else if (OB_ISNULL(access_service)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null async ivf estimate access service", K(ret));
+  } else if (ranges.empty() && ctdef.enable_new_false_range_) {
+    // Preserve the scan's false-range convention.
+    row_count = 0;
+  } else {
+    est_param.index_id_ = ctdef.ref_table_id_;
+    est_param.tablet_id_ = tablet_id;
+    est_param.ls_id_ = ls_id_;
+    est_param.schema_version_ = ctdef.schema_version_;
+    est_param.scan_flag_ = scan_flag;
+    est_param.frozen_version_ = GET_BATCH_ROWS_READ_SNAPSHOT_VERSION;
+    if (ranges.empty()) {
+      whole_range.table_id_ = ctdef.ref_table_id_;
+      whole_range.set_whole_range();
+      batch.type_ = ObSimpleBatch::T_SCAN;
+      batch.range_ = &whole_range;
+    } else if (1 == ranges.count()) {
+      batch.type_ = ObSimpleBatch::T_SCAN;
+      batch.range_ = &ranges.at(0);
+    } else if (OB_FAIL(scan_ranges.assign(ranges))) {
+      LOG_WARN("failed to copy async ivf estimate ranges", K(ret));
+    } else {
+      batch.type_ = ObSimpleBatch::T_MULTI_SCAN;
+      batch.ranges_ = &scan_ranges;
+    }
+    if (FAILEDx(scan_range.init(est_param, batch, allocator))) {
+      LOG_WARN("failed to initialize async ivf estimate range", K(ret));
+    } else if (OB_FAIL(access_service->estimate_row_count(est_param, scan_range,
+                   THIS_WORKER.get_timeout_remain(), records, row_count, physical_rows))) {
+      LOG_WARN("failed to estimate async ivf partition rows", K(ret), K(tablet_id));
+    }
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::reset_partition_filter_path()
+{
+  int ret = OB_SUCCESS;
+  profile_est_rows_ = 0;
+  profile_est_total_rows_ = 0;
+  if (OB_ISNULL(vec_aux_ctdef_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null async ivf scan definition", K(ret));
+  } else if (is_adaptive_filter()) {
+    // Restore plan defaults even on failure; never retain another partition's estimates.
+    vec_idx_try_path_ = vec_aux_ctdef_->adaptive_try_path_;
+    profile_current_path_ = vec_idx_try_path_;
+    selectivity_ = vec_aux_ctdef_->selectivity_;
+    adaptive_ctx_.selectivity_ = vec_aux_ctdef_->selectivity_;
+    adaptive_ctx_.row_count_ = vec_aux_ctdef_->row_count_;
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::apply_partition_filter_estimate(
+    const int estimate_ret, const int64_t partition_rows, const int64_t filter_rows)
+{
+  int ret = OB_SUCCESS;
+  const double pre_filter_threshold = 0.10;
+  if (OB_FAIL(reset_partition_filter_path())) {
+    LOG_WARN("failed to restore async ivf plan defaults", K(ret));
+  } else if (is_adaptive_filter()) {
+    if (OB_SUCCESS == estimate_ret && partition_rows >= 0 && filter_rows >= 0) {
+      profile_est_rows_ = filter_rows;
+      profile_est_total_rows_ = partition_rows;
+      ObIVFProfileUtil::set(partition_profile_, ObMetricId::VEC_IVF_EST_ROWS, profile_est_rows_);
+    }
+    if (OB_INVALID_ARGUMENT == estimate_ret || OB_ERR_UNEXPECTED == estimate_ret
+        || OB_NOT_INIT == estimate_ret
+        || OB_TIMEOUT == estimate_ret || OB_ALLOCATE_MEMORY_FAILED == estimate_ret
+        || OB_TENANT_OUT_OF_MEM == estimate_ret || OB_CANCELED == estimate_ret
+        || OB_ERR_QUERY_INTERRUPTED == estimate_ret || OB_ERR_SESSION_INTERRUPTED == estimate_ret
+        || OB_SESSION_KILLED == estimate_ret || OB_ERR_INTERRUPTED == estimate_ret) {
+      ret = estimate_ret;
+    } else if (OB_SUCCESS == estimate_ret && partition_rows > 0 && filter_rows >= 0) {
+      const int64_t selectivity_scale = 100; // integer percent
+      selectivity_ = std::min(1.0, static_cast<double>(filter_rows) / partition_rows);
+      ObIVFProfileUtil::set(partition_profile_, ObMetricId::VEC_IVF_EST_SELECTIVITY,
+          static_cast<int64_t>(std::min(1.0, static_cast<double>(profile_est_rows_)
+              / profile_est_total_rows_) * selectivity_scale));
+      adaptive_ctx_.selectivity_ = selectivity_;
+      adaptive_ctx_.row_count_ = partition_rows;
+      vec_idx_try_path_ = filter_rows <= ObVecIdxExtraInfo::MAX_IVF_BRUTE_FORCE_SIZE
+          || selectivity_ <= pre_filter_threshold
+          ? ObVecIdxAdaTryPath::VEC_INDEX_PRE_FILTER
+          : ObVecIdxAdaTryPath::VEC_INDEX_ITERATIVE_FILTER;
+      profile_current_path_ = vec_idx_try_path_;
+    }
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::refresh_partition_filter_path()
+{
+  int ret = OB_SUCCESS;
+  int estimate_ret = OB_SUCCESS;
+  int64_t partition_rows = -1;
+  int64_t filter_rows = -1;
+  const int64_t start_time = ObTimeUtility::current_time();
+  const ObVecIdxAdaTryPath old_path = vec_idx_try_path_;
+  ObDASScanIter *input_scan = nullptr;
+  ObTabletID input_tablet_id;
+  ObNewRange whole_range;
+  ObSEArray<ObNewRange, 1> whole_ranges;
+  const ObDASBaseCtDef *input_def = nullptr;
+  const char *fallback_reason = "none";
+  if (OB_ISNULL(vec_aux_ctdef_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("null async ivf scan definition", K(ret));
+  } else if (!is_adaptive_filter() || is_adaptive_specify_by_hint_) {
+    // Hinted adaptive paths, fixed paths and unfiltered scans keep the plan choice.
+  } else if (OB_FAIL(reset_partition_filter_path())) {
+    LOG_WARN("failed to restore async ivf plan defaults", K(ret));
+  } else if (OB_ISNULL(data_filter_ctdef_) || OB_ISNULL(data_filter_rtdef_)
+             || OB_ISNULL(input_def = vec_aux_ctdef_->get_inv_idx_scan_ctdef())
+             || DAS_OP_TABLE_SCAN != input_def->op_type_) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async ivf estimate definitions", K(ret), KP(input_def));
+  } else if (OB_FAIL(get_filter_input_scan(input_scan))) {
+    LOG_WARN("failed to get async ivf estimate input", K(ret));
+  } else {
+    const ObDASScanCtDef &input_ctdef = *static_cast<const ObDASScanCtDef *>(input_def);
+    const ObTableScanParam &input_param = input_scan->get_scan_param();
+    input_tablet_id = input_param.tablet_id_;
+    whole_range.table_id_ = data_filter_ctdef_->ref_table_id_;
+    whole_range.set_whole_range();
+    if (!input_tablet_id.is_valid() || !data_filter_tablet_id_.is_valid() || !ls_id_.is_valid()) {
+      estimate_ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid async ivf partition estimate ids", K(estimate_ret),
+               K(input_tablet_id), K_(data_filter_tablet_id), K_(ls_id));
+    } else if (OB_SUCCESS != (estimate_ret = whole_ranges.push_back(whole_range))) {
+    } else if (OB_SUCCESS != (estimate_ret = estimate_partition_rows(*data_filter_ctdef_,
+                   data_filter_tablet_id_, data_filter_rtdef_->scan_flag_, whole_ranges, partition_rows))) {
+    } else if (input_ctdef.ref_table_id_ == data_filter_ctdef_->ref_table_id_
+               && input_param.key_ranges_.count() == 1 && input_param.key_ranges_.at(0).is_whole_range()) {
+      filter_rows = partition_rows;
+    } else {
+      estimate_ret = estimate_partition_rows(input_ctdef, input_tablet_id,
+          input_param.scan_flag_, input_param.key_ranges_, filter_rows);
+    }
+    if (OB_SUCCESS != estimate_ret) {
+      fallback_reason = "estimate_failed";
+    } else if (partition_rows <= 0 || filter_rows < 0) {
+      fallback_reason = "invalid_estimate";
+    }
+    if (OB_FAIL(apply_partition_filter_estimate(estimate_ret, partition_rows, filter_rows))) {
+      LOG_WARN("async ivf partition estimate failed", K(ret));
+    } else if (OB_NOT_NULL(exec_ctx_) && OB_FAIL(exec_ctx_->check_status())) {
+      LOG_WARN("async ivf query interrupted during partition estimation", K(ret));
+    }
+    LOG_INFO("async ivf partition filter path", K(ret), K_(ls_id), K_(data_filter_tablet_id),
+             K(input_tablet_id), K(partition_rows), K(filter_rows), K_(selectivity),
+             K(old_path), K_(vec_idx_try_path), K(estimate_ret), K(fallback_reason),
+             "estimate_time_us", ObTimeUtility::current_time() - start_time);
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::inner_reuse()
+{
+  int ret = OB_SUCCESS;
+  clear_partition_profile();
+  ObDASIter *input_iter = inv_idx_scan_iter_;
+  reset_async_read_state();
+  // Reuse both filter branches regardless of the chosen path. M is selected
+  // again before rescan; prepare_filter_input_scan_params() handles lazy lookups.
+  if (OB_NOT_NULL(input_iter) && DAS_ITER_LOCAL_LOOKUP == input_iter->get_type()) {
+    ObDASLocalLookupIter *lookup_iter = static_cast<ObDASLocalLookupIter *>(input_iter);
+    lookup_iter->get_lookup_param().need_switch_param_ = true;
+    input_iter = lookup_iter->get_index_table_iter();
+  }
+  if (OB_NOT_NULL(inv_idx_scan_iter_)) {
+    if (OB_ISNULL(input_iter) || DAS_ITER_SCAN != input_iter->get_type()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("invalid async ivf pre-filter input", K(ret), KP(input_iter));
+    } else {
+      static_cast<ObDASScanIter *>(input_iter)->get_scan_param().need_switch_param_ = true;
+    }
+  }
+  data_filter_scan_param_.need_switch_param_ = true;
+  if (OB_SUCC(ret) && OB_FAIL(ObDASIvfBaseScanIter::inner_reuse())) {
+    LOG_WARN("failed to reuse ivf base scan iter", K(ret));
+  }
+  if (OB_SUCC(ret)) {
+    filter_rowkey_objs_.reset();
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::inner_release()
+{
+  deletion_bitmap_handle_.trace_cache_handle("legacy_async_ivf_release_before");
+  clear_partition_profile();
+  // The base releases both filter branches, including scans never opened.
+  reset_async_read_state();
+  deletion_bitmap_handle_.trace_cache_handle("legacy_async_ivf_release_after");
+  if (OB_NOT_NULL(async_read_snapshot_)) {
+    async_read_snapshot_->~ObTxReadSnapshot();
+    async_read_snapshot_ = nullptr;
+  }
+  int ret = ObDASIvfBaseScanIter::inner_release();
+  if (OB_FAIL(ret)) {
+    LOG_WARN("failed to release ivf base scan iter", K(ret));
+  }
+  filter_rowkey_objs_.reset();
+  ls_id_.reset();
+  async_ivf_index_tablet_id_.reset();
+  async_delete_tablet_id_.reset();
+  sql_snapshot_ = nullptr;
+  is_adaptive_specify_by_hint_ = false;
+  return ret;
+}
+
+void ObDASIVFAsyncIter::reset_async_read_state()
+{
+  // Each search releases its Segment iterators before the read state is reset.
+  adaptive_ctx_.pre_scan_row_cnt_ = 0;
+  deletion_bitmap_handle_.reset();
+  ObDasVecScanUtils::release_scan_param(async_ivf_scan_param_);
+  ObDasVecScanUtils::release_scan_param(async_delete_scan_param_);
+  segment_group_ctx_.reset();
+  snapshot_ = sql_snapshot_;
+  if (OB_NOT_NULL(async_read_snapshot_)) {
+    async_read_snapshot_->reset();
+  }
+  partition_scan_finished_ = false;
+}
+
+int ObDASIVFAsyncIter::prepare_async_read_snapshot(const share::SCN &read_snapshot)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(sql_snapshot_) || OB_ISNULL(async_read_snapshot_) || OB_UNLIKELY(!read_snapshot.is_valid()
+      || read_snapshot <= share::SCN::min_scn() || read_snapshot > sql_snapshot_->version())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async ivf read snapshot", K(ret), K(read_snapshot), KP_(sql_snapshot));
+  } else if (OB_FAIL(async_read_snapshot_->assign(*sql_snapshot_))) {
+    LOG_WARN("failed to copy sql read snapshot", K(ret));
+  } else {
+    async_read_snapshot_->specify_snapshot_scn(read_snapshot);
+    ObIVFProfileUtil::set(partition_profile_, ObMetricId::VEC_IVF_SCN, read_snapshot.get_val_for_tx());
+    // The base iterator retains this scan param across partition reuse/rescan.
+    if (!data_filter_iter_first_scan_
+        && OB_FAIL(data_filter_scan_param_.snapshot_.assign(*async_read_snapshot_))) {
+      LOG_WARN("failed to refresh async ivf data-filter snapshot", K(ret));
+    } else {
+      snapshot_ = async_read_snapshot_;
+    }
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::prepare_async_scan_params()
+{
+  int ret = OB_SUCCESS;
+  const ObDASScanCtDef *scan_ctdef = vec_aux_ctdef_->get_async_ivf_index_scan_ctdef();
+  ObDASScanRtDef *scan_rtdef = vec_aux_rtdef_->get_async_ivf_index_scan_rtdef();
+  const ObDASScanCtDef *delete_ctdef = vec_aux_ctdef_->get_async_delete_scan_ctdef();
+  ObDASScanRtDef *delete_rtdef = vec_aux_rtdef_->get_async_delete_scan_rtdef();
+  if (OB_UNLIKELY(!async_delete_tablet_id_.is_valid())
+      || OB_ISNULL(scan_ctdef) || OB_ISNULL(scan_rtdef)
+      || OB_ISNULL(delete_ctdef) || OB_ISNULL(delete_rtdef)
+      || OB_ISNULL(sql_snapshot_) || OB_ISNULL(async_read_snapshot_)
+      || OB_ISNULL(scan_rtdef->p_pd_expr_op_) || OB_ISNULL(delete_rtdef->p_pd_expr_op_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async ivf scan definitions", K(ret),
+             K_(async_delete_tablet_id), KP(scan_ctdef), KP(scan_rtdef), KP(delete_ctdef),
+             KP(delete_rtdef), KP_(sql_snapshot), KP_(async_read_snapshot));
+  } else if (OB_FAIL(ObDasVecScanUtils::init_vec_aux_scan_param(
+                 ls_id_, async_ivf_index_tablet_id_, scan_ctdef, scan_rtdef,
+                 tx_desc_, sql_snapshot_, async_ivf_scan_param_, false, &vec_op_alloc_))) {
+    LOG_WARN("failed to init async ivf scan param", K(ret));
+  } else if (OB_FAIL(ObDasVecScanUtils::init_scan_param(
+                 ls_id_, async_delete_tablet_id_, delete_ctdef, delete_rtdef,
+                 tx_desc_, sql_snapshot_, async_delete_scan_param_, false, &vec_op_alloc_))) {
+    LOG_WARN("failed to init async ivf deletion scan param", K(ret));
+  } else if (OB_FALSE_IT(async_delete_scan_param_.need_scn_ =
+                 delete_ctdef->check_need_fill_scn())) {
+  } else if (OB_FAIL(async_delete_scan_param_.key_ranges_.assign(delete_rtdef->key_ranges_))) {
+    LOG_WARN("failed to assign async ivf deletion scan ranges", K(ret));
+  } else if (OB_FAIL(GDS.execute(BEFORE_ASYNC_IVF_DELETION_BITMAP,
+                 MTL_ID(), ls_id_.id(), async_delete_tablet_id_.id(),
+                 delete_ctdef->ref_table_id_))) {
+    // The segment handles and logical snapshot are fixed; no bitmap is held yet.
+    LOG_WARN("failed to wait before async ivf deletion bitmap", K(ret),
+             K_(async_delete_tablet_id), KPC(async_read_snapshot_));
+  } else if (0 != ERRSIM_ENABLE_ASYNC_IVF_FLASHBACK_RESET) {
+    // Segment selection has fixed the logical read version for this scan.
+    async_ivf_scan_param_.fb_snapshot_.reset();
+    async_ivf_scan_param_.fb_read_tx_uncommitted_ = false;
+    // Do not let flashback override the physical deletion snapshot prepared below.
+    async_delete_scan_param_.fb_snapshot_.reset();
+    async_delete_scan_param_.fb_read_tx_uncommitted_ = false;
+  } else if (async_ivf_scan_param_.fb_snapshot_.is_valid()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("flashback query with async IVF is not supported", K(ret),
+             K_(async_ivf_index_tablet_id), "fb_snapshot", async_ivf_scan_param_.fb_snapshot_);
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "flashback query with async IVF");
+  }
+  if (OB_SUCC(ret)) {
+    const int64_t sql_snapshot = async_delete_scan_param_.snapshot_.is_valid()
+        && async_delete_scan_param_.snapshot_.core_.version_.is_valid()
+        ? async_delete_scan_param_.snapshot_.core_.version_.get_val_for_tx() : 0;
+    if (OB_UNLIKELY(sql_snapshot <= 0 || INT64_MAX == sql_snapshot)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid async ivf SQL deletion snapshot", K(ret), K(sql_snapshot));
+    } else if (OB_FAIL(ObDeletionRowIter::prepare_read_snapshot(
+                   ls_id_, async_delete_tablet_id_, async_delete_scan_param_.timeout_,
+                   async_delete_scan_param_.snapshot_, sql_snapshot))) {
+      LOG_WARN("failed to prepare async ivf deletion physical snapshot", K(ret),
+               K_(async_delete_tablet_id), K(sql_snapshot));
+    } else if (OB_FAIL(ObDeletionBitmapProvider::get_or_build_bitmap(
+                   async_delete_tablet_id_, async_read_snapshot_->version().get_val_for_tx(),
+                   vec_op_alloc_, async_delete_scan_param_, *delete_ctdef, *delete_rtdef,
+                   deletion_bitmap_handle_))) {
+      LOG_WARN("failed to prepare async ivf deletion bitmap", K(ret), K_(async_delete_tablet_id));
+    }
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::process_ivf_scan_post(bool is_vectorized)
+{
+  int ret = OB_SUCCESS;
+  bool need_pre_filter = false;
+  ObIvfKnnSearchResult retained_post;
+  if (ObVecIndexType::VEC_INDEX_POST_WITHOUT_FILTER != vec_index_type_
+      && !is_iter_filter()) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("async ivf query path is not implemented", K(ret), K_(vec_index_type),
+             K_(vec_idx_try_path));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "async IVF query path");
+  } else if (partition_scan_finished_) {
+    // An empty scan does not create saved_rowkeys_itr_; keep it as a terminal result.
+  } else if (OB_ISNULL(vec_aux_ctdef_)
+             || OB_ISNULL(vec_aux_rtdef_)
+             || OB_ISNULL(snapshot_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async ivf partition state", K(ret), KP_(vec_aux_ctdef),
+             KP_(vec_aux_rtdef), KP_(snapshot));
+  } else if (OB_UNLIKELY(1 != vec_aux_ctdef_->result_output_.count())) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("async ivf only supports one hidden primary rowkey", K(ret),
+             "output_count", vec_aux_ctdef_->result_output_.count());
+  } else if (OB_FAIL(is_iter_filter()
+                 ? scan_async_disk_bbq_post_filter(is_vectorized, need_pre_filter, retained_post)
+                 : scan_async_ivf_segments_iteratively(is_vectorized))) {
+    LOG_WARN("failed to execute iterative async ivf segment scan", K(ret), K_(ls_id),
+             K_(async_ivf_index_tablet_id), K_(vec_index_type));
+  }
+  if (OB_SUCC(ret) && need_pre_filter) {
+    // POST's Segment borrowers have been released. Keep the query, snapshot,
+    // filter input and allocator alive while consuming the budgeted PRE input.
+    if (OB_FAIL(run_async_pre_filter(mem_context_->get_arena_allocator(),
+                                    is_vectorized, &retained_post))) {
+      LOG_WARN("failed to run async IVF POST fallback pre-filter", K(ret));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    partition_scan_finished_ = true;
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::add_async_ivf_filter_candidates(
+    const ObIvfKnnSearchResult &segment_result,
+    ObIVFRowkeyDistMap &rowkey_dist_map)
+{
+  int ret = OB_SUCCESS;
+  // Allocate before publishing any rowkey pointers. Capacity is reused across
+  // refill rounds, so memory follows the largest round, not the sum of rounds.
+  filter_rowkey_objs_.reuse();
+  if (OB_FAIL(filter_rowkey_objs_.prepare_allocate(segment_result.count()))) {
+    LOG_WARN("failed to prepare async ivf filter rowkeys", K(ret),
+             "candidate_count", segment_result.count());
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < segment_result.count(); ++i) {
+    const ObIvfKnnEntry &entry = segment_result.at(i);
+    if (OB_UNLIKELY(entry.vid_ < 0)) {
+      ret = OB_INVALID_DATA;
+      LOG_WARN("invalid async ivf candidate vid", K(ret), K(i), K(entry));
+    } else {
+      ObObj *rowkey_obj = &filter_rowkey_objs_.at(i);
+      rowkey_obj->set_uint64(static_cast<uint64_t>(entry.vid_));
+      ObRowkey rowkey(rowkey_obj, 1);
+      ObIvfRowkeyDistEntry rowkey_entry(rowkey, entry.distance_);
+      if (OB_FAIL(rowkey_dist_map.set_refactored(rowkey, rowkey_entry))) {
+        LOG_WARN("failed to add async ivf filter candidate", K(ret), K(i), K(entry));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::get_async_ivf_segment_group_ctx()
+{
+  int ret = OB_SUCCESS;
+  // Hold the query before the target partition resolves R. The test can run
+  // the delete refresh while this point is blocked, then let the scan pick up
+  // the post-refresh published versions.
+  DEBUG_SYNC(BEFORE_ASYNC_IVF_SEGMENT_GROUP_CTX);
+  ObAccessService *access_service = MTL(ObAccessService *);
+  ObSEArray<ObTabletID, 1> index_tablet_ids;
+  // Scan/rescan selects the groups at Q before binding the effective snapshot M.
+  if (OB_ISNULL(access_service)
+      || OB_ISNULL(snapshot_)
+      || OB_UNLIKELY(!ls_id_.is_valid()
+                     || !async_ivf_index_tablet_id_.is_valid()
+                     || dim_ <= 0
+                     || real_search_vec_.length() != dim_ * sizeof(float)
+                     || nprobes_ < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async ivf scan preparation state", K(ret), KP(access_service),
+             KP_(snapshot), K_(ls_id), K_(async_ivf_index_tablet_id), K_(dim),
+             "query_size", real_search_vec_.length(), K_(nprobes));
+  } else if (OB_FAIL(index_tablet_ids.push_back(async_ivf_index_tablet_id_))) {
+    LOG_WARN("failed to append async ivf tablet id", K(ret),
+             K_(async_ivf_index_tablet_id));
+  } else if (OB_FAIL(access_service->get_async_index_segment_group_ctx(
+                 ls_id_, index_tablet_ids, async_delete_tablet_id_, snapshot_->version(), segment_group_ctx_))) {
+    LOG_WARN("failed to get async ivf segment groups", K(ret), K_(ls_id),
+             K_(async_ivf_index_tablet_id));
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::prepare_async_ivf_read()
+{
+  int ret = OB_SUCCESS;
+  if (OB_FAIL(get_async_ivf_segment_group_ctx())) {
+    LOG_WARN("failed to get async ivf segment groups", K(ret));
+  } else {
+    if (nullptr != profile_) {
+      int64_t segment_count = 0;
+      for (int64_t i = 0; i < segment_group_ctx_.get_group_count(); ++i) {
+        const ObAsyncIndexSegmentGroup *group = segment_group_ctx_.get_group(i);
+        if (nullptr != group && group->get_tablet_cnt() > 0) {
+          segment_count += group->get_tablet_version_ranges(0).count();
+        }
+      }
+      ObIVFProfileUtil::set(profile_, ObMetricId::VEC_IVF_SEGMENT_COUNT, segment_count);
+    }
+    if (segment_group_ctx_.get_group_count() > 0) {
+      if (OB_FAIL(prepare_async_read_snapshot(segment_group_ctx_.get_async_index_read_snapshot()))) {
+        LOG_WARN("failed to prepare async ivf read snapshot", K(ret));
+      } else if (OB_FAIL(prepare_async_scan_params())) {
+        LOG_WARN("failed to prepare async ivf scan params", K(ret));
+      }
+    } else {
+      // An empty partition remains terminal until the next reuse.
+      partition_scan_finished_ = true;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    DEBUG_SYNC(AFTER_ASYNC_IVF_QUERY_READ_PREPARED);
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::prepare_filter_input_scan_params()
+{
+  int ret = OB_SUCCESS;
+  ObDASScanIter *scan_iter = nullptr;
+  if (OB_ISNULL(vec_aux_ctdef_) || OB_ISNULL(snapshot_)
+      || OB_ISNULL(inv_idx_scan_iter_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async ivf filter input tree", K(ret), KP_(inv_idx_scan_iter), KP_(snapshot));
+  } else if (OB_FAIL(get_filter_input_scan(scan_iter))) {
+    LOG_WARN("failed to get async ivf filter input scan", K(ret));
+  } else if (OB_FAIL(scan_iter->get_scan_param().snapshot_.assign(*snapshot_))) {
+    LOG_WARN("failed to assign async ivf filter input snapshot", K(ret));
+  } else {
+    // Both covering scans and lookup inputs must use M, including after reuse.
+    scan_iter->get_scan_param().need_switch_param_ = OB_NOT_NULL(scan_iter->get_output_result_iter());
+    if (DAS_ITER_LOCAL_LOOKUP == inv_idx_scan_iter_->get_type()) {
+      ObDASLocalLookupIter *lookup_iter = static_cast<ObDASLocalLookupIter *>(inv_idx_scan_iter_);
+      ObDASIter *data_iter = lookup_iter->get_data_table_iter();
+      if (OB_ISNULL(data_iter) || DAS_ITER_SCAN != data_iter->get_type()) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid async ivf filter data scan", K(ret), KP(data_iter));
+      } else if (OB_FAIL(lookup_iter->get_lookup_param().snapshot_.assign(*snapshot_))) {
+        LOG_WARN("failed to assign async ivf filter input lookup snapshot", K(ret));
+      } else {
+        // Lookup remains lazy: its first scan must initialize after partition reuse.
+        lookup_iter->get_lookup_param().need_switch_param_ =
+            OB_NOT_NULL(static_cast<ObDASScanIter *>(data_iter)->get_output_result_iter());
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::prepare_async_ivf_scan(
+    const int64_t search_k,
+    const blocksstable::ObIvfPreFilter *pre_filter,
+    ObIArray<ObIvfSSTableScanIter *> &scan_iters,
+    ObIvfScanBudget *scan_budget)
+{
+  int ret = OB_SUCCESS;
+  const int64_t async_ivf_tablet_idx = 0;
+  ObIvfKnnSearchParam knn_param;
+  ObIvfSSTableScanIter *scan_iter = nullptr;
+  if (OB_UNLIKELY(search_k <= 0 || scan_iters.count() != 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async ivf segment scan state", K(ret), K(search_k), K(scan_iters.count()));
+  } else if (segment_group_ctx_.get_group_count() > 0) {
+    knn_param.query_ = reinterpret_cast<const float *>(real_search_vec_.ptr());
+    knn_param.dim_ = dim_;
+    knn_param.nprobe_ = nprobes_;
+    // Unfiltered POST also refills when deleted or duplicate VIDs leave fewer than LIMIT rows.
+    knn_param.iterative_centroids_ = nullptr == pre_filter && is_post_filter();
+    knn_param.k_ = search_k;
+    knn_param.cluster_size_ = vec_index_param_.cluster_size_;
+    knn_param.refine_k_ = search_param_.refine_k_;
+    knn_param.deletion_bitmap_handle_ = &deletion_bitmap_handle_;
+    knn_param.pre_filter_ = pre_filter;
+    knn_param.selectivity_ = selectivity_;
+    knn_param.scan_budget_ = scan_budget;
+    knn_param.is_set_refine_k_ = vec_aux_ctdef_->vec_query_param_.is_set_refine_k_;
+    const int64_t limit_k = limit_param_.limit_ + limit_param_.offset_; // limit+offset
+    if (vec_aux_ctdef_->vec_query_param_.is_set_ivf_nprobes_ && 0 == vec_aux_ctdef_->vec_query_param_.ivf_nprobes_) {
+      const double candidates = std::ceil(static_cast<double>(limit_k) * search_param_.refine_k_);
+      if (!std::isfinite(candidates) || candidates < limit_k || candidates >= static_cast<double>(INT64_MAX)) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid DiskBBQ automatic candidate count", K(ret), K(limit_k), K(search_param_));
+      } else {
+        knn_param.original_k_ = limit_k;
+        knn_param.num_candidates_ = static_cast<int64_t>(candidates);
+      }
+    }
+    for (int64_t group_idx = 0;
+         OB_SUCC(ret) && group_idx < segment_group_ctx_.get_group_count();
+         ++group_idx) {
+      const ObAsyncIndexSegmentGroup *group = segment_group_ctx_.get_group(group_idx);
+      if (OB_ISNULL(group)
+          || OB_UNLIKELY(group->get_tablet_cnt() <= async_ivf_tablet_idx)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid async ivf segment group", K(ret), K(group_idx), KP(group));
+      } else {
+        const ObIArray<ObNewVersionRange> &version_ranges =
+            group->get_tablet_version_ranges(async_ivf_tablet_idx);
+        for (int64_t range_idx = 0;
+             OB_SUCC(ret) && range_idx < version_ranges.count();
+             ++range_idx) {
+          if (OB_FAIL(create_async_ivf_scan_iter(
+                  knn_param, version_ranges.at(range_idx), scan_iter))) {
+            LOG_WARN("failed to create async ivf segment scan iter", K(ret),
+                     K(group_idx), K(range_idx), K(version_ranges.at(range_idx)));
+          } else if (OB_FAIL(scan_iters.push_back(scan_iter))) {
+            LOG_WARN("failed to append async ivf segment scan iter", K(ret),
+                     K(group_idx), K(range_idx), KP(scan_iter));
+          } else {
+            scan_iter = nullptr;
+          }
+        }
+      }
+    }
+    if (OB_NOT_NULL(scan_iter)) {
+      scan_iter->~ObIvfSSTableScanIter();
+      async_ivf_scan_param_.allocator_->free(scan_iter);
+      scan_iter = nullptr;
+    }
+    if (OB_FAIL(ret)) {
+      release_async_ivf_segment_scan_iters(scan_iters);
+    }
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::create_async_ivf_scan_iter(
+    const ObIvfKnnSearchParam &knn_param,
+    const ObNewVersionRange &version_range,
+    ObIvfSSTableScanIter *&scan_iter)
+{
+  int ret = OB_SUCCESS;
+  ObOpProfile<ObMetric> *segment_profile =
+      ObIVFProfileUtil::register_child(profile_, ObProfileId::VECTOR_SEARCH_IVF_SEGMENT);
+  ScopedTimer timer(ObMetricId::VEC_IVF_SEGMENT_TOTAL_TIME, segment_profile);
+  if (version_range.is_valid()) {
+    ObIVFProfileUtil::set(segment_profile, ObMetricId::VEC_IVF_VERSION_RANGE_BASE,
+                           version_range.base_version_);
+    ObIVFProfileUtil::set(segment_profile, ObMetricId::VEC_IVF_VERSION_RANGE_SNAPSHOT,
+                           version_range.snapshot_version_);
+  }
+  const int64_t async_ivf_tablet_idx = 0;
+  ObAccessService *access_service = MTL(ObAccessService *);
+  // Keep the SSTable lookup on the tablet that supplied the segment version ranges.
+  scan_iter = nullptr;
+  if (OB_ISNULL(access_service)
+      || OB_ISNULL(sql_snapshot_)
+      || OB_ISNULL(async_ivf_scan_param_.allocator_)
+      || OB_UNLIKELY(!ls_id_.is_valid()
+                     || !async_ivf_index_tablet_id_.is_valid()
+                     || !knn_param.is_valid()
+                     || !version_range.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async ivf scan iter state", K(ret), KP(access_service),
+             K_(ls_id), K_(async_ivf_index_tablet_id), K(knn_param), K(version_range));
+  } else if (OB_FAIL(access_service->async_index_ivf_scan(
+                 ls_id_, segment_group_ctx_.get_index_tablet_handle(async_ivf_tablet_idx),
+                 async_ivf_scan_param_, scan_iter))) {
+    LOG_WARN("failed to create async ivf scan iter", K(ret), K_(ls_id),
+             K_(async_ivf_index_tablet_id));
+  } else if (OB_ISNULL(scan_iter)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("async ivf scan iter is null", K(ret), K_(ls_id),
+             K_(async_ivf_index_tablet_id));
+  } else if (OB_FAIL(scan_iter->set_query(knn_param))) {
+    LOG_WARN("failed to set async ivf query", K(ret), K(knn_param));
+  } else if (OB_FAIL(scan_iter->switch_sstable(
+                 version_range, sql_snapshot_->version()))) {
+    LOG_WARN("failed to bind async ivf segment", K(ret), K(version_range));
+  } else {
+    scan_iter->set_profile(segment_profile, is_iter_filter());
+  }
+  if (OB_FAIL(ret) && OB_NOT_NULL(scan_iter)) {
+    scan_iter->~ObIvfSSTableScanIter();
+    async_ivf_scan_param_.allocator_->free(scan_iter);
+    scan_iter = nullptr;
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::scan_async_ivf_segments(
+    bool first_round,
+    int64_t next_nprobe,
+    const ObIArray<ObIvfSSTableScanIter *> &scan_iters,
+    ObIvfKnnSearchResult &round_result,
+    bool &has_active_segment,
+    const ObIvfScanBudget *scan_budget)
+{
+  int ret = OB_SUCCESS;
+  ObIvfKnnSearchResult segment_result;
+  has_active_segment = false;
+  round_result.reset();
+  if (OB_UNLIKELY(next_nprobe < 0 || scan_iters.count() <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async ivf segment scan round", K(ret), K(next_nprobe),
+             "scan_iter_count", scan_iters.count());
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < scan_iters.count()
+       && (nullptr == scan_budget || !scan_budget->should_stop()); ++i) {
+    ObIvfSSTableScanIter *current_iter = scan_iters.at(i);
+    if (OB_ISNULL(current_iter)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("iterative async ivf scan iter is null", K(ret), K(i));
+    } else if (first_round || current_iter->has_remaining_centroids()) {
+      segment_result.reset();
+      if (OB_FAIL(current_iter->knn_search(next_nprobe, segment_result))) {
+        LOG_WARN("failed to search iterative async ivf segment", K(ret), K(i),
+                 K(next_nprobe));
+      }
+      ScopedTimer delivery_timer(ObMetricId::VEC_IVF_SEGMENT_TOTAL_TIME,
+                                 current_iter->get_profile());
+      for (int64_t j = 0; OB_SUCC(ret) && j < segment_result.count(); ++j) {
+        if (OB_FAIL(round_result.add(segment_result.at(j)))) {
+          LOG_WARN("failed to append async ivf round result", K(ret), K(i), K(j),
+                   K(segment_result.at(j)));
+        }
+      }
+    }
+    if (OB_SUCC(ret) && OB_NOT_NULL(current_iter) && current_iter->has_remaining_centroids()) {
+      has_active_segment = true;
+    }
+  }
+  return ret;
+}
+
+void ObDASIVFAsyncIter::release_async_ivf_segment_scan_iters(
+    ObIArray<ObIvfSSTableScanIter *> &scan_iters)
+{
+  for (int64_t i = 0; i < scan_iters.count(); ++i) {
+    ObIvfSSTableScanIter *scan_iter = scan_iters.at(i);
+    if (OB_NOT_NULL(scan_iter)) {
+      scan_iter->~ObIvfSSTableScanIter();
+      async_ivf_scan_param_.allocator_->free(scan_iter);
+      scan_iters.at(i) = nullptr;
+    }
+  }
+  scan_iters.reset();
+}
+
+int ObDASIVFAsyncIter::collect_async_ivf_candidates(
+    const ObIvfKnnSearchResult &candidates,
+    ObIvfTopKCollector &collector,
+    int64_t &collected_count)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(collected_count < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid collected async ivf candidate count", K(ret), K(collected_count));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < candidates.count(); ++i) {
+    const ObIvfKnnEntry &entry = candidates.at(i);
+    if (OB_FAIL(collector.push(entry.cid_, entry.vid_, entry.distance_))) {
+      LOG_WARN("failed to collect async ivf candidate", K(ret), K(i), K(entry));
+    } else {
+      ++collected_count;
+    }
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::collect_filtered_async_ivf_candidates(
+    const ObIArray<ObIvfRowkeyDistEntry> &candidates,
+    ObIvfTopKCollector &collector,
+    int64_t &collected_count)
+{
+  int ret = OB_SUCCESS;
+  // Post-filter results retain the VID rowkey but not the source CID. CID does
+  // not participate in partition Top-K ordering or the final DAS output.
+  const int64_t unused_cid = 0;
+  if (OB_UNLIKELY(collected_count < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid collected filtered async ivf candidate count", K(ret),
+             K(collected_count));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < candidates.count(); ++i) {
+    const ObIvfRowkeyDistEntry &entry = candidates.at(i);
+    const ObObj *vid_obj = nullptr;
+    uint64_t vid = 0;
+    bool retained = false;
+    if (OB_UNLIKELY(1 != entry.rowkey_.get_obj_cnt()
+                    || OB_ISNULL(vid_obj = entry.rowkey_.get_obj_ptr())
+                    || !vid_obj->is_uint64())) {
+      ret = OB_INVALID_DATA;
+      LOG_WARN("invalid filtered async ivf rowkey", K(ret), K(i), K(entry));
+    } else if (OB_FALSE_IT(vid = vid_obj->get_uint64())) {
+    } else if (OB_UNLIKELY(vid > static_cast<uint64_t>(INT64_MAX))) {
+      ret = OB_INVALID_DATA;
+      LOG_WARN("filtered async ivf vid is out of range", K(ret), K(i), K(vid));
+    } else if (OB_FALSE_IT(retained = collector.contains(static_cast<int64_t>(vid)))) {
+    } else if (OB_FAIL(collector.push(
+                   unused_cid, static_cast<int64_t>(vid), entry.distance_))) {
+      LOG_WARN("failed to collect filtered async ivf candidate", K(ret), K(i), K(entry));
+    } else if (!retained && collected_count < limit_param_.limit_ + limit_param_.offset_) {
+      // push() also succeeds for duplicate VIDs. Only new retained rows count
+      // towards the refill stop condition; a full heap stays at LIMIT + OFFSET.
+      ++collected_count;
+    }
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::append_async_ivf_topk(ObIvfTopKCollector &collector)
+{
+  int ret = OB_SUCCESS;
+  ObIvfKnnSearchResult topk_result;
+  if (OB_FAIL(collector.finish(topk_result))) {
+    LOG_WARN("failed to finish async ivf partition top-k", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < topk_result.count(); ++i) {
+    void *buf = vec_op_alloc_.alloc(sizeof(ObObj));
+    if (OB_ISNULL(buf)) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+      LOG_WARN("failed to allocate async ivf rowkey", K(ret), K(i));
+    } else {
+      ObObj *rowkey_obj = new (buf) ObObj();
+      rowkey_obj->set_uint64(static_cast<uint64_t>(topk_result.at(i).vid_));
+      ObRowkey rowkey(rowkey_obj, 1);
+      if (OB_FAIL(saved_rowkeys_.push_back(rowkey))) {
+        LOG_WARN("failed to append async ivf rowkey", K(ret), K(i), K(topk_result.at(i)));
+      }
+    }
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::scan_async_disk_bbq_post_filter(
+    bool is_vectorized, bool &need_pre_filter, ObIvfKnnSearchResult &retained_post)
+{
+  int ret = OB_SUCCESS;
+  need_pre_filter = false;
+  retained_post.reset();
+  PostFilterProgress progress;
+  const int64_t limit_k = limit_param_.limit_ + limit_param_.offset_;
+  // Aim to retain K * refine_k candidates after filtering. Match the existing
+  // post-filter 10x expansion cap when the estimated pass rate is very small.
+  const double filter_selectivity = std::isfinite(selectivity_)
+      && selectivity_ >= 0.0 && selectivity_ <= 1.0
+      ? std::max(0.1, selectivity_) : 1.0;
+  const double candidate_limit = std::ceil(
+      static_cast<double>(limit_k) * search_param_.refine_k_ / filter_selectivity);
+  int64_t search_k = 0;
+  ObSEArray<ObIvfSSTableScanIter *, 8> scan_iters;
+  ObIvfKnnSearchResult candidates;
+  ObIvfKnnSearchResult selected;
+  ObIvfKnnSearchResult refined;
+  ObIVFRowkeyDistMap rowkey_dist_map;
+  ObSEArray<ObIvfRowkeyDistEntry, 16> matched;
+  ObIvfTopKCollector collector;
+  ObIvfScanBudget scan_budget(max_scan_vectors_);
+  int64_t collected_count = 0;
+  int64_t next_nprobe = nprobes_;
+  bool first_round = true;
+  bool has_active_segment = false;
+  adaptive_ctx_.iter_times_ = 0;
+  adaptive_ctx_.iter_filter_row_cnt_ = 0;
+  adaptive_ctx_.iter_res_row_cnt_ = 0;
+  if (OB_UNLIKELY(limit_k <= 0 || !std::isfinite(candidate_limit)
+      || candidate_limit < limit_k || candidate_limit >= static_cast<double>(INT64_MAX))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid DiskBBQ quantized candidate limit", K(ret), K(limit_k), K(candidate_limit));
+  } else if (OB_ISNULL(data_filter_iter_) || OB_ISNULL(data_filter_ctdef_)
+      || OB_ISNULL(data_filter_rtdef_) || !data_filter_tablet_id_.is_valid()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid DiskBBQ filter state", K(ret));
+  } else if (OB_FALSE_IT(search_k = static_cast<int64_t>(candidate_limit))) {
+  } else if (OB_FAIL(prepare_async_ivf_scan(search_k, nullptr, scan_iters, &scan_budget))) {
+    LOG_WARN("failed to prepare DiskBBQ quantized scan", K(ret));
+  } else if (OB_FAIL(collector.init(limit_k, vec_op_alloc_))) {
+    LOG_WARN("failed to initialize filtered DiskBBQ Top-K", K(ret));
+  } else if (OB_FAIL(rowkey_dist_map.create(32, lib::ObMemAttr(MTL_ID(), "AsyncIVFFilter")))) {
+    LOG_WARN("failed to initialize DiskBBQ filter lookup", K(ret));
+  }
+  has_active_segment = scan_iters.count() > 0;
+  while (OB_SUCC(ret) && collected_count < limit_k
+      && has_active_segment && !scan_budget.is_exhausted()) {
+    ++adaptive_ctx_.iter_times_;
+    scan_budget.allow_batch_stop_ = !first_round && strategy_ == ObVecIdxQueryStrategy::LATENCY_FIRST;
+    has_active_segment = false;
+    // Keep each segment pinned through approximate selection, SQL filtering
+    // and RAW reads. Each segment/round retains at most search_k VIDs.
+    for (int64_t i = 0; OB_SUCC(ret) && i < scan_iters.count()
+         && !scan_budget.should_stop(); ++i) {
+      ObIvfSSTableScanIter *iter = scan_iters.at(i);
+      if (OB_ISNULL(iter)) {
+        ret = OB_ERR_UNEXPECTED;
+      } else if (first_round || iter->has_remaining_centroids()) {
+        rowkey_dist_map.reuse();
+        matched.reuse();
+        selected.reset();
+        refined.reset();
+        if (OB_FAIL(iter->knn_search(next_nprobe, candidates, true /* quantized_only */))) {
+          LOG_WARN("failed to select DiskBBQ quantized candidates", K(ret), K(i), K(next_nprobe));
+        } else if (OB_FAIL(add_async_ivf_filter_candidates(candidates, rowkey_dist_map))) {
+          LOG_WARN("failed to prepare DiskBBQ candidates for filtering", K(ret));
+        } else if (rowkey_dist_map.size() > 0 && OB_FAIL(do_table_post_filter(
+            is_vectorized, rowkey_dist_map, matched, partition_profile_))) {
+          LOG_WARN("failed to filter DiskBBQ quantized candidates", K(ret));
+        }
+        for (int64_t j = 0; OB_SUCC(ret) && j < matched.count(); ++j) {
+          const ObRowkey &rowkey = matched.at(j).rowkey_;
+          const ObObj *vid = rowkey.get_obj_ptr();
+          if (OB_UNLIKELY(rowkey.get_obj_cnt() != 1 || OB_ISNULL(vid)
+              || !vid->is_uint64() || vid->get_uint64() > static_cast<uint64_t>(INT64_MAX))) {
+            ret = OB_INVALID_DATA;
+            LOG_WARN("invalid filtered DiskBBQ VID", K(ret), K(rowkey));
+          } else {
+            ObIvfKnnEntry entry;
+            entry.vid_ = static_cast<int64_t>(vid->get_uint64());
+            if (OB_FAIL(selected.add(entry))) {
+              LOG_WARN("failed to retain filtered DiskBBQ VID", K(ret));
+            }
+          }
+        }
+        if (OB_SUCC(ret) && selected.count() > 0
+            && OB_FAIL(iter->refine_candidates(selected, refined))) {
+          LOG_WARN("failed to refine filtered DiskBBQ candidates", K(ret));
+        }
+        for (int64_t j = 0; OB_SUCC(ret) && j < refined.count(); ++j) {
+          const ObIvfKnnEntry &entry = refined.at(j);
+          const bool retained = collector.contains(entry.vid_);
+          if (OB_FAIL(collector.push(entry.cid_, entry.vid_, entry.distance_))) {
+            LOG_WARN("failed to merge refined DiskBBQ candidate", K(ret), K(entry));
+          } else if (!retained && collected_count < limit_k) {
+            ++collected_count;
+          }
+        }
+      }
+      if (OB_SUCC(ret) && OB_NOT_NULL(iter) && iter->has_remaining_centroids()) {
+        has_active_segment = true;
+      }
+    }
+    // A completed round covers one fixed/automatic window on every active
+    // Segment. Use the accumulated distinct Top-K count, not a batch's count.
+    // Do not turn an interrupted/partially processed window into a zero proof.
+    if (OB_SUCC(ret) && !scan_budget.should_stop()) {
+      const bool stalled = progress.finish_window(collected_count);
+      if (collected_count == 0 || stalled) {
+        need_pre_filter = true;
+        break;
+      }
+    }
+    first_round = false;
+    if (OB_SUCC(ret) && collected_count < limit_k
+        && has_active_segment && !scan_budget.is_exhausted()) {
+      next_nprobe = calc_next_nprobe(limit_k, collected_count);
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (need_pre_filter && OB_FAIL(collector.finish(retained_post))) {
+      LOG_WARN("failed to retain DiskBBQ POST candidates on fallback", K(ret));
+    } else if (!need_pre_filter && OB_FAIL(append_async_ivf_topk(collector))) {
+      LOG_WARN("failed to append filtered DiskBBQ Top-K", K(ret));
+    }
+  }
+  LOG_TRACE("DiskBBQ quantized post-filter finished", K(ret), K(search_k), K(collected_count),
+      K(limit_k), K(need_pre_filter), K_(selectivity), K(filter_selectivity), K(scan_budget), K_(adaptive_ctx));
+  release_async_ivf_segment_scan_iters(scan_iters);
+  return ret;
+}
+
+int ObDASIVFAsyncIter::scan_async_ivf_segments_iteratively(bool is_vectorized)
+{
+  int ret = OB_SUCCESS;
+  const bool need_post_filter = is_iter_filter();
+  const int64_t limit_k = limit_param_.limit_ + limit_param_.offset_;
+  const int64_t search_k = need_post_filter
+      ? get_heap_size(limit_k, selectivity_) : limit_k;
+  ObSEArray<ObIvfSSTableScanIter *, 8> scan_iters;
+  ObIvfKnnSearchResult round_result;
+  ObIVFRowkeyDistMap rowkey_dist_map;
+  ObSEArray<ObIvfRowkeyDistEntry, 16> filtered_candidates;
+  ObIvfTopKCollector collector;
+  int64_t collected_count = 0;
+  ObIvfScanBudget scan_budget(need_post_filter ? max_scan_vectors_ : 0);
+  int64_t next_nprobe = nprobes_;
+  bool first_round = true;
+  bool has_active_segment = false;
+  bool budget_exhausted = false;
+  adaptive_ctx_.iter_times_ = 0;
+  adaptive_ctx_.iter_filter_row_cnt_ = 0;
+  adaptive_ctx_.iter_res_row_cnt_ = 0;
+  if (OB_UNLIKELY(limit_k <= 0 || search_k <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid iterative async ivf scan limit", K(ret), K(limit_k), K(search_k));
+  } else if (need_post_filter
+             && (OB_ISNULL(data_filter_iter_)
+                 || OB_ISNULL(data_filter_ctdef_)
+                 || OB_ISNULL(data_filter_rtdef_)
+                 || OB_UNLIKELY(!data_filter_tablet_id_.is_valid()))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async ivf post-filter state", K(ret), KP_(data_filter_iter),
+             KP_(data_filter_ctdef), KP_(data_filter_rtdef), K_(data_filter_tablet_id));
+  } else if (OB_FAIL(prepare_async_ivf_scan(
+                 search_k, nullptr, scan_iters, &scan_budget))) {
+    LOG_WARN("failed to prepare async ivf scan", K(ret));
+  } else if (OB_FAIL(collector.init(limit_k, vec_op_alloc_))) {
+    LOG_WARN("failed to init async ivf partition top-k", K(ret), K(limit_k));
+  } else if (need_post_filter
+             && OB_FAIL(rowkey_dist_map.create(
+                    32, lib::ObMemAttr(MTL_ID(), "AsyncIVFFilter")))) {
+    LOG_WARN("failed to create async ivf rowkey distance map", K(ret));
+  }
+
+  has_active_segment = scan_iters.count() > 0;
+  while (OB_SUCC(ret) && collected_count < limit_k && has_active_segment && !budget_exhausted) {
+    ++adaptive_ctx_.iter_times_;
+    scan_budget.allow_batch_stop_ = !first_round && strategy_ == ObVecIdxQueryStrategy::LATENCY_FIRST;
+    if (OB_FAIL(scan_async_ivf_segments(
+            first_round, next_nprobe, scan_iters, round_result, has_active_segment, &scan_budget))) {
+      LOG_WARN("failed to scan iterative async ivf round", K(ret), K_(adaptive_ctx));
+    } else if (need_post_filter) {
+      rowkey_dist_map.reuse();
+      filtered_candidates.reuse();
+      if (OB_FAIL(add_async_ivf_filter_candidates(round_result, rowkey_dist_map))) {
+        LOG_WARN("failed to build async ivf post-filter candidates", K(ret),
+                 K(round_result.count()));
+      } else if (rowkey_dist_map.size() > 0
+                 && OB_FAIL(do_table_post_filter(
+                        is_vectorized, rowkey_dist_map, filtered_candidates, partition_profile_))) {
+        LOG_WARN("failed to filter iterative async ivf candidates", K(ret),
+                 "candidate_count", rowkey_dist_map.size());
+      } else if (OB_FAIL(collect_filtered_async_ivf_candidates(
+                     filtered_candidates, collector, collected_count))) {
+        LOG_WARN("failed to collect post-filtered async ivf candidates", K(ret),
+                 K(filtered_candidates.count()));
+      }
+    } else if (OB_FAIL(collect_async_ivf_candidates(
+                   round_result, collector, collected_count))) {
+      LOG_WARN("failed to collect async ivf round candidates", K(ret),
+               K(round_result.count()));
+    }
+    first_round = false;
+    budget_exhausted = scan_budget.is_exhausted();
+    if (OB_SUCC(ret) && collected_count < limit_k && has_active_segment && !budget_exhausted) {
+      const int64_t left_search = limit_k - collected_count;
+      const double select_ratio = adaptive_ctx_.iter_filter_row_cnt_ > 0
+          ? static_cast<double>(adaptive_ctx_.iter_res_row_cnt_)
+              / static_cast<double>(adaptive_ctx_.iter_filter_row_cnt_)
+          : 0.0;
+      next_nprobe = calc_next_nprobe(limit_k, collected_count);
+      LOG_INFO("async ivf scan continues", K_(vec_index_type), K(limit_k),
+               K(collected_count), K(left_search), K(next_nprobe), K(select_ratio),
+               K_(adaptive_ctx));
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(append_async_ivf_topk(collector))) {
+    LOG_WARN("failed to append async ivf top-k result", K(ret), K(collected_count));
+  }
+  LOG_INFO("async ivf iterative search finished", K(ret), K(collected_count), K(limit_k),
+           K(scan_budget), K(budget_exhausted), K(has_active_segment), K_(strategy), K_(adaptive_ctx));
+  release_async_ivf_segment_scan_iters(scan_iters);
+  return ret;
+}
+
+int64_t ObDASIVFAsyncIter::get_pre_filter_estimated_rows() const
+{
+  int64_t estimated_rows = -1;
+  if (nullptr != vec_aux_ctdef_) {
+    // Keep the full-predicate plan selectivity: adaptive_ctx_ may have been
+    // overwritten with a range-only estimate. The plan count is a weak hint
+    // when no partition estimate exists, including fixed PRE paths.
+    const double rows = profile_est_total_rows_ > 0
+        ? static_cast<double>(profile_est_total_rows_) : vec_aux_ctdef_->row_count_;
+    const double selectivity = vec_aux_ctdef_->selectivity_;
+    double estimate = -1;
+    if (std::isfinite(rows) && rows > 0 && std::isfinite(selectivity)
+        && selectivity >= 0 && selectivity <= 1) {
+      estimate = rows * selectivity;
+    }
+    const ObDASBaseCtDef *input_def = vec_aux_ctdef_->get_inv_idx_scan_ctdef();
+    if (profile_est_total_rows_ > 0 && profile_est_rows_ >= 0
+        && profile_est_rows_ <= profile_est_total_rows_
+        && nullptr != inv_idx_scan_iter_ && DAS_ITER_SCAN == inv_idx_scan_iter_->get_type()
+        && nullptr != input_def && DAS_OP_TABLE_SCAN == input_def->op_type_) {
+      const ObDASScanCtDef &input_ctdef = *static_cast<const ObDASScanCtDef *>(input_def);
+      // Range rows represent output only when the covering scan has no
+      // residual predicates. Otherwise use the full-predicate plan hint.
+      if (input_ctdef.pd_expr_spec_.pushdown_filters_.empty()
+          && input_ctdef.logical_residual_filters_.empty()) {
+        estimate = static_cast<double>(profile_est_rows_);
+      }
+    }
+    if (std::isfinite(estimate) && estimate >= 0 && estimate < static_cast<double>(INT64_MAX)) {
+      estimated_rows = static_cast<int64_t>(std::ceil(estimate));
+    }
+  }
+  return estimated_rows;
+}
+
+int ObDASIVFAsyncIter::process_ivf_scan_pre(ObIAllocator &allocator, bool is_vectorized)
+{
+  int ret = OB_SUCCESS;
+  if (partition_scan_finished_) {
+  } else if (!is_pre_filter() || OB_ISNULL(inv_idx_scan_iter_)
+             || OB_ISNULL(vec_aux_ctdef_) || OB_ISNULL(vec_aux_rtdef_)
+             || OB_UNLIKELY(vec_aux_ctdef_->result_output_.count() != 1)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async ivf pre-filter state", K(ret), KP_(inv_idx_scan_iter),
+             KP_(vec_aux_ctdef), KP_(vec_aux_rtdef));
+  } else if (segment_group_ctx_.get_group_count() > 0) {
+    if (OB_FAIL(run_async_pre_filter(allocator, is_vectorized))) {
+      LOG_WARN("failed to execute async IVF pre-filter", K(ret));
+    }
+  }
+  if (OB_SUCC(ret)) {
+    partition_scan_finished_ = true;
+  }
+  // All Segment borrowers have finished before the query-owned bitmap is released.
+  return ret;
+}
+
+namespace
+{
+// Expose the inherited check only inside IVF. The member pointer still calls
+// ObDASScanIter on the original input; no derived scan object or downcast is used.
+class ObIVFPreFilterBudgetChecker : public ObDASScanIter
+{
+public:
+  static int check(ObDASScanIter &input_scan)
+  {
+    const auto check_budget = &ObIVFPreFilterBudgetChecker::check_vec_pre_filter_status;
+    return (input_scan.*check_budget)();
+  }
+};
+}
+
+int ObDASIVFAsyncIter::run_async_pre_filter(
+    ObIAllocator &allocator, bool is_vectorized, const ObIvfKnnSearchResult *retained_post)
+{
+  int ret = OB_SUCCESS;
+  if (nullptr != retained_post && strategy_ == ObVecIdxQueryStrategy::LATENCY_FIRST) {
+    ObDASScanIter *input_scan = nullptr;
+    // Early success on a PRE budget stop must not hide a query failure.
+    if (OB_FAIL(THIS_WORKER.check_status())) {
+      LOG_WARN("query stopped before async IVF POST fallback", K(ret));
+      return ret;
+    } else if (OB_FAIL(get_filter_input_scan(input_scan))) {
+      LOG_WARN("failed to get async IVF POST fallback input", K(ret));
+      return ret;
+    } else if (input_scan->is_vec_pre_filtering_timeout_set()) {
+      const int budget_ret = ObIVFPreFilterBudgetChecker::check(*input_scan);
+      if (OB_VECTOR_INDEX_ADAPTIVE_NEED_RETRY == budget_ret) {
+        // Keep the original clock. The PRE budget is spent; return the POST
+        // candidates without reading input or constructing another bitmap.
+        if (retained_post->count() > 0) {
+          ObSEArray<ObIvfKnnEntry, 1> no_pre_candidates;
+          if (OB_FAIL(append_pre_filter_topk(no_pre_candidates, retained_post))) {
+            LOG_WARN("failed to preserve POST candidates after async IVF budget stop", K(ret));
+          }
+        }
+        return ret;
+      } else if (OB_SUCCESS != budget_ret) {
+        ret = budget_ret;
+        LOG_WARN("failed to check async IVF POST fallback budget", K(ret));
+        return ret;
+      }
+    }
+  }
+  blocksstable::ObIvfPreFilterBitmap pre_filter_bitmap(allocator, get_pre_filter_estimated_rows());
+  // Keep the original PRE budget and return policy, including after POST fallback.
+  if (OB_FAIL(materialize_pre_filter(is_vectorized, pre_filter_bitmap))) {
+    LOG_WARN("failed to materialize async IVF pre-filter", K(ret));
+  } else if (pre_filter_bitmap.get_cardinality() > 0) {
+    if (OB_FAIL(scan_pre_filtered_segments(pre_filter_bitmap, retained_post))) {
+      LOG_WARN("failed to search pre-filtered async IVF segments", K(ret));
+    }
+  } else if (nullptr != retained_post && retained_post->count() > 0) {
+    // An empty budgeted prefix does not invalidate candidates already filtered by POST.
+    ObSEArray<ObIvfKnnEntry, 1> no_pre_candidates;
+    if (OB_FAIL(append_pre_filter_topk(no_pre_candidates, retained_post))) {
+      LOG_WARN("failed to preserve POST candidates after empty async IVF pre-filter", K(ret));
+    }
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::init_filter_input(ObDASIter *filter_iter)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(filter_iter) || OB_NOT_NULL(inv_idx_scan_iter_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async ivf filter input binding", K(ret), KP(filter_iter));
+  } else {
+    inv_idx_scan_iter_ = filter_iter;
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::get_rowkey(ObIAllocator &allocator, ObRowkey *&rowkey)
+{
+  int ret = OB_SUCCESS;
+  const ObDASScanCtDef *ctdef = nullptr;
+  ObDASScanRtDef *rtdef = nullptr;
+  rowkey = nullptr;
+  if (OB_ISNULL(vec_aux_ctdef_) || OB_ISNULL(vec_aux_rtdef_)
+      || OB_ISNULL(ctdef = vec_aux_ctdef_->get_async_ivf_index_scan_ctdef())
+      || OB_ISNULL(rtdef = vec_aux_rtdef_->get_async_ivf_index_scan_rtdef())
+      || OB_ISNULL(rtdef->eval_ctx_)
+      || OB_UNLIKELY(ctdef->rowkey_exprs_.count() != 1)
+      || OB_ISNULL(ctdef->rowkey_exprs_.at(0))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async ivf rowkey scan definitions", K(ret), KP(ctdef), KP(rtdef));
+  } else if (OB_FAIL(ObDasVecScanUtils::get_rowkey(allocator, ctdef, rtdef, rowkey))) {
+    LOG_WARN("failed to get async ivf rowkey", K(ret));
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::materialize_pre_filter(
+    bool is_vectorized, blocksstable::ObIvfPreFilterBitmap &pre_filter_bitmap)
+{
+  int ret = OB_SUCCESS;
+  ScopedTimer timer(ObMetricId::VEC_PRE_FILTER_TIME, partition_profile_);
+  bool scan_end = false;
+  const ObDASScanCtDef *ctdef = nullptr;
+  ObDASScanRtDef *rtdef = nullptr;
+  ObExpr *vid_expr = nullptr;
+  ObSEArray<uint64_t, 256> vids;
+  if (OB_ISNULL(inv_idx_scan_iter_) || OB_ISNULL(vec_aux_ctdef_)
+      || OB_ISNULL(vec_aux_rtdef_) || OB_ISNULL(vec_aux_rtdef_->eval_ctx_)
+      || OB_UNLIKELY(inv_idx_scan_iter_->get_max_size() <= 0
+                     || vec_aux_ctdef_->result_output_.count() != 1)
+      || OB_ISNULL(vec_aux_ctdef_->result_output_.at(0))
+      || OB_ISNULL(ctdef = vec_aux_ctdef_->get_async_ivf_index_scan_ctdef())
+      || OB_ISNULL(rtdef = vec_aux_rtdef_->get_async_ivf_index_scan_rtdef())
+      || OB_ISNULL(rtdef->eval_ctx_)
+      || OB_UNLIKELY(ctdef->rowkey_exprs_.count() != 1)
+      || OB_ISNULL(vid_expr = ctdef->rowkey_exprs_.at(0))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async ivf pre-filter input", K(ret), KP_(inv_idx_scan_iter),
+             KP_(vec_aux_ctdef), KP_(vec_aux_rtdef));
+  } else if (OB_UNLIKELY(ObIntType != vid_expr->datum_meta_.type_
+                        && ObUInt64Type != vid_expr->datum_meta_.type_)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("invalid async ivf pre-filter vid type", K(ret), K(vid_expr->datum_meta_));
+  } else if (OB_FAIL(vids.reserve(inv_idx_scan_iter_->get_max_size()))) {
+    LOG_WARN("failed to reserve async ivf pre-filter vids", K(ret));
+  }
+  while (OB_SUCC(ret) && !scan_end) {
+    vids.reuse();
+    do {
+      int64_t count = 0;
+      inv_idx_scan_iter_->clear_evaluated_flag();
+      if (is_vectorized) {
+        ret = inv_idx_scan_iter_->get_next_rows(count, inv_idx_scan_iter_->get_max_size());
+      } else if (OB_SUCC(ret = inv_idx_scan_iter_->get_next_row())) {
+        count = 1;
+      }
+      if (OB_ITER_END == ret) {
+        ret = OB_SUCCESS;
+        scan_end = true; // A final vectorized batch may still contain rows.
+      } else if (OB_VECTOR_INDEX_ADAPTIVE_NEED_RETRY == ret
+                 && strategy_ == ObVecIdxQueryStrategy::LATENCY_FIRST) {
+        ret = OB_SUCCESS;
+        scan_end = true;
+        count = 0;
+        LOG_INFO("async ivf pre-filter budget finished", K_(strategy),
+                 "collected_vids", pre_filter_bitmap.get_cardinality(),
+                 "pending_valid_vids", vids.count());
+      } else if (OB_FAIL(ret)) {
+        LOG_WARN("failed to read async ivf pre-filter vids", K(ret));
+      }
+      if (OB_SUCC(ret) && OB_UNLIKELY(count < 0 || count > inv_idx_scan_iter_->get_max_size())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid async ivf pre-filter batch size", K(ret), K(count));
+      }
+      // Scalar predicates and MVCC are handled by the input tree. Copy only the
+      // VID while its datum is valid, without materializing generic rowkeys.
+      for (int64_t i = 0; OB_SUCC(ret) && i < count; ++i) {
+        const ObDatum &datum = is_vectorized ? vid_expr->locate_expr_datum(*rtdef->eval_ctx_, i)
+                                            : vid_expr->locate_expr_datum(*rtdef->eval_ctx_);
+        if (OB_UNLIKELY(datum.is_null() || nullptr == datum.ptr_
+                        || datum.len_ != sizeof(uint64_t) || datum.get_uint() > INT64_MAX)) {
+          ret = OB_ERR_UNEXPECTED;
+          LOG_WARN("invalid async ivf pre-filter vid", K(ret), K(i));
+        } else if (OB_FAIL(vids.push_back(datum.get_uint()))) {
+          LOG_WARN("failed to buffer async ivf pre-filter vid", K(ret));
+        }
+      }
+    } while (OB_SUCC(ret) && !scan_end && !is_vectorized
+             && vids.count() < inv_idx_scan_iter_->get_max_size());
+    if (OB_SUCC(ret) && vids.count() > 0
+        && OB_FAIL(pre_filter_bitmap.value_add_many(vids.get_data(), vids.count()))) {
+      LOG_WARN("failed to append async ivf pre-filter bitmap batch", K(ret));
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(pre_filter_bitmap.finish())) {
+    LOG_WARN("failed to finish async ivf pre-filter bitmap", K(ret));
+  }
+  ObIVFProfileUtil::set(partition_profile_, ObMetricId::VEC_PRE_FILTER_ROWS_SCANNED,
+                         pre_filter_bitmap.get_cardinality());
+  if (OB_SUCC(ret)) {
+    adaptive_ctx_.pre_scan_row_cnt_ = pre_filter_bitmap.get_cardinality();
+  } else {
+    pre_filter_bitmap.reset();
+    adaptive_ctx_.pre_scan_row_cnt_ = 0;
+  }
+  return ret;
+}
+
+int ObDASIVFAsyncIter::scan_pre_filtered_segments(
+    blocksstable::ObIvfPreFilterBitmap &pre_filter_bitmap, const ObIvfKnnSearchResult *retained_post)
+{
+  int ret = OB_SUCCESS;
+  const int64_t limit_k = limit_param_.limit_ + limit_param_.offset_;
+  ObSEArray<ObIvfSSTableScanIter *, 8> scan_iters;
+  ObIvfKnnSearchResult segment_result;
+  ObSEArray<ObIvfKnnEntry, 16> candidates;
+  blocksstable::ObIvfPreFilter pre_filter;
+  const uint64_t pre_filter_row_count = pre_filter_bitmap.get_cardinality();
+  adaptive_ctx_.is_brute_force_ =
+      pre_filter_row_count <= ObVecIdxExtraInfo::MAX_IVF_BRUTE_FORCE_SIZE;
+  if (OB_FAIL(pre_filter.init(pre_filter_bitmap))) {
+    LOG_WARN("failed to bind async ivf pre-filter bitmap", K(ret));
+  } else if (OB_FAIL(prepare_async_ivf_scan(limit_k, &pre_filter, scan_iters))) {
+    LOG_WARN("failed to prepare pre-filtered async ivf segments", K(ret));
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < scan_iters.count(); ++i) {
+    if (OB_ISNULL(scan_iters.at(i))) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("null pre-filtered async ivf segment iterator", K(ret), K(i));
+    } else if (adaptive_ctx_.is_brute_force_) {
+      ObIVFProfileUtil::set(partition_profile_, ObMetricId::VEC_IVF_IS_BRUTE_FORCE, true);
+      ret = scan_iters.at(i)->brute_force_search(segment_result);
+    } else {
+      ObIVFProfileUtil::set(partition_profile_, ObMetricId::VEC_IVF_IS_BRUTE_FORCE, false);
+      ret = scan_iters.at(i)->knn_search(nprobes_, segment_result);
+    }
+    if (OB_FAIL(ret)) {
+      LOG_WARN("failed to search pre-filtered async ivf segment", K(ret), K(i));
+    }
+    ScopedTimer delivery_timer(ObMetricId::VEC_IVF_SEGMENT_TOTAL_TIME,
+        nullptr != scan_iters.at(i) ? scan_iters.at(i)->get_profile() : nullptr);
+    for (int64_t j = 0; OB_SUCC(ret) && j < segment_result.count(); ++j) {
+      if (OB_FAIL(candidates.push_back(segment_result.at(j)))) {
+        LOG_WARN("failed to collect pre-filtered async ivf candidates", K(ret), K(i), K(j));
+      }
+    }
+  }
+  // POST candidates already passed the SQL filter at this snapshot. A budgeted
+  // PRE prefix may not contain them; merge them without re-filtering by bitmap.
+  if (OB_SUCC(ret) && OB_FAIL(append_pre_filter_topk(candidates, retained_post))) {
+    LOG_WARN("failed to append pre-filtered async ivf top-k", K(ret));
+  }
+  LOG_INFO("async ivf pre-filter search finished", K(ret), K(pre_filter_row_count),
+           K_(adaptive_ctx), K_(nprobes), "segment_count", scan_iters.count());
+  release_async_ivf_segment_scan_iters(scan_iters);
+  return ret;
+}
+
+int ObDASIVFAsyncIter::append_pre_filter_topk(
+    const ObIArray<ObIvfKnnEntry> &candidates, const ObIvfKnnSearchResult *retained_post)
+{
+  int ret = OB_SUCCESS;
+  ObIvfTopKCollector collector;
+  if (OB_FAIL(collector.init(limit_param_.limit_ + limit_param_.offset_, vec_op_alloc_))) {
+    LOG_WARN("failed to initialize pre-filtered async ivf top-k", K(ret));
+  }
+  // Retained entries own only CID/VID/distance values, so no POST Segment
+  // pointer crosses the switch. One collector deduplicates both paths.
+  for (int64_t i = 0; OB_SUCC(ret) && nullptr != retained_post && i < retained_post->count(); ++i) {
+    const ObIvfKnnEntry &entry = retained_post->at(i);
+    if (OB_FAIL(collector.push(entry.cid_, entry.vid_, entry.distance_))) {
+      LOG_WARN("failed to merge a retained POST candidate", K(ret), K(i));
+    }
+  }
+  for (int64_t i = 0; OB_SUCC(ret) && i < candidates.count(); ++i) {
+    const ObIvfKnnEntry &entry = candidates.at(i);
+    if (OB_FAIL(collector.push(entry.cid_, entry.vid_, entry.distance_))) {
+      LOG_WARN("failed to collect pre-filtered async ivf candidate", K(ret), K(i), K(entry));
+    }
+  }
+  if (OB_SUCC(ret) && OB_FAIL(append_async_ivf_topk(collector))) {
+    LOG_WARN("failed to append pre-filtered async ivf top-k", K(ret));
+  }
+  return ret;
 }
 
 /*************************** implement ObDASIvfScanIter ****************************/
@@ -3559,7 +5241,8 @@ int ObDASIvfPQScanIter::get_nearest_probe_centers_with_hgraph(
             center_id.tablet_id_ = centroid_tablet_id_.id();
             if (need_vectors) {
               float* center_vec = nullptr;
-              if (OB_FAIL(hgraph_cache->read_centroid(center_idx, center_vec, true /*deep_copy*/, &persist_alloc_))) {
+              if (OB_FAIL(hgraph_cache->read_centroid_from_hgraph(
+                      center_idx, center_vec, *hgraph_vsag_alloc_))) {
                 LOG_WARN("failed to read centroid for hgraph center vector", K(ret), K(center_idx));
               } else if (OB_ISNULL(center_vec)) {
                 ret = OB_ERR_UNEXPECTED;
@@ -4404,6 +6087,7 @@ int ObDASIvfPQScanIter::try_write_pq_precompute_table_cache(
       if (is_pq_cent_cache_usable && is_ivf_cent_cache_usable) {
         
           ObArenaAllocator tmp_allocator;
+          ObVsagSearchAlloc hgraph_allocator(MTL_ID());
           int64_t ksub = 1L << nbits_;
           int64_t sub_dim = dim_ / m_;
           float *ivf_centers = nullptr;
@@ -4411,14 +6095,15 @@ int ObDASIvfPQScanIter::try_write_pq_precompute_table_cache(
           float *precompute_table = cent_cache.get_centroids();
           float *r_norms = (float*)tmp_allocator.alloc(sizeof(float) * m_ * ksub);
           if (ivf_cent_cache->has_hgraph_index()) {
-            if (OB_FAIL(ivf_cent_cache->get_centroids(&tmp_allocator, &ivf_centers))) {
+            if (OB_FAIL(ivf_cent_cache->get_centroids_from_hgraph(&hgraph_allocator, &ivf_centers))) {
               LOG_WARN("fail to get ivf centers", K(ret));
             }
           } else {
             ivf_centers = ivf_cent_cache->get_centroids();
           }
 
-          if (OB_ISNULL(r_norms)) {
+          if (OB_FAIL(ret)) {
+          } else if (OB_ISNULL(r_norms)) {
             ret = OB_ALLOCATE_MEMORY_FAILED;
             LOG_WARN("fail to alloc norms", K(ret), K(m_), K(ksub));
           } else {

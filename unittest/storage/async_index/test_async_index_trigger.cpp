@@ -266,6 +266,40 @@ TEST_F(TestAsyncIndexTrigger, test_trigger_with_incr_data)
   ASSERT_EQ(provider.proposal_id_, decisions.at(0).leader_proposal_id_);
 }
 
+TEST_F(TestAsyncIndexTrigger, test_first_build_waits_for_both_baselines_before_periodic_refresh)
+{
+  FakeDepProvider provider;
+  provider.incr_total_ = 5000;
+  provider.sstable_count_ = 1;
+  add_index(provider, ObTabletID(200002), SCN::min_scn());
+  add_index(provider, ObTabletID(200003), SCN::min_scn());
+
+  ObAsyncIndexTrigger trigger;
+  ASSERT_EQ(OB_SUCCESS, trigger.init(1001, &provider));
+  ObAsyncIndexDataTableInfo dti;
+  build_data_table_info(provider, dti);
+  ObRefreshDecisionArray decisions;
+  ASSERT_EQ(OB_SUCCESS, trigger.check_and_generate_tasks(dti, 0, nullptr, decisions));
+  // The round really inspected new DML and saved a target, but neither new
+  // target may get a refresh task before its parent publishes the baseline.
+  ASSERT_EQ(1, provider.set_refresh_info_count_);
+  ASSERT_EQ(1, provider.refresh_info_.get_refresh_snapshots().count());
+  ASSERT_EQ(2000, provider.refresh_info_.get_refresh_snapshots().at(0));
+  ASSERT_EQ(0, decisions.count());
+  ASSERT_TRUE(provider.index_publish_scns_.at(0).is_min());
+  ASSERT_TRUE(provider.index_publish_scns_.at(1).is_min());
+
+  provider.index_publish_scns_.at(0) = make_scn(1000);
+  provider.index_publish_scns_.at(1) = make_scn(1000);
+  ASSERT_EQ(OB_SUCCESS, trigger.check_and_generate_tasks(dti, 0, nullptr, decisions));
+  ASSERT_EQ(2, decisions.count());
+  for (int64_t i = 0; i < decisions.count(); ++i) {
+    ASSERT_EQ(provider.index_tablets_.at(i), decisions.at(i).index_tablet_id_);
+    ASSERT_EQ(make_scn(1000), decisions.at(i).start_refresh_scn_);
+    ASSERT_EQ(make_scn(2000), decisions.at(i).target_refresh_scn_);
+  }
+}
+
 // No incremental data exists => no trigger.
 TEST_F(TestAsyncIndexTrigger, test_no_trigger_without_incr_data)
 {
@@ -707,9 +741,9 @@ TEST_F(TestAsyncIndexTrigger, test_get_min_index_published_scn_uses_min_across_s
   ASSERT_EQ(make_scn(1000), min_publish_scn);
 }
 
-// CREATE_INDEX post-build path: read physical publish scn via get_publish_scns,
-// then anchor S0 in empty refresh_info through maintain_async_index_refresh_info.
-TEST_F(TestAsyncIndexTrigger, test_create_index_path_anchors_s0_via_min_publish_scn)
+// Compose the helpers used by the RPC caller: read the oldest physical sibling
+// publication, then anchor S0 in refresh_info to protect its MVCC range.
+TEST_F(TestAsyncIndexTrigger, test_min_publish_scn_anchors_refresh_info_for_rpc_caller)
 {
   FakeDepProvider provider;
   add_index(provider, ObTabletID(200002), make_scn(1000));

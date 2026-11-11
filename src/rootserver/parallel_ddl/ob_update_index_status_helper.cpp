@@ -116,6 +116,13 @@ int ObUpdateIndexStatusHelper::generate_schemas_()
   } else if (is_available_index_status(new_status_) && !orig_index_table_schema_->is_unavailable_index()) {
     ret = OB_EAGAIN;
     LOG_WARN("set index status to available, but previous status is not unavailable, which is not expected", KR(ret));
+  } else if (INDEX_STATUS_INDEX_ERROR == new_status_
+             && arg_.task_id_ > 0
+             && is_async_ivf_index(orig_index_table_schema_->get_index_type())
+             && INDEX_STATUS_AVAILABLE == orig_index_table_schema_->get_index_status()) {
+    // Check under the existing object lock, after reading the latest schema.
+    ret = OB_EAGAIN;
+    LOG_WARN("skip stale failure of available async IVF index", KR(ret), K(arg_.index_table_id_), K(arg_.task_id_));
   } else if (OB_FAIL(schema_guard_wrapper_.get_table_schema(arg_.data_table_id_, orig_data_table_schema))) {
     LOG_WARN("fail to get data table schema", KR(ret), K_(arg_.data_table_id));
   } else if (OB_ISNULL(orig_data_table_schema)) {

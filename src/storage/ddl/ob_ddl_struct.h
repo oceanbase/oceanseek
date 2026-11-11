@@ -447,7 +447,7 @@ public:
   bool is_offline_index_rebuild_;
   bool is_partition_local_;
   bool is_vec_tablet_rebuild_;  // true when building HNSW index in rebuild scenario (vec tablet rebuild)
-  bool is_async_index_refresh_;  // true for async fulltext index incremental refresh inner sql
+  bool is_async_index_refresh_;  // true for common async-index refresh inner SQL
   int64_t async_index_start_refresh_version_; // logical base of async index refresh, i.e. previous published version (0 if no physical baseline yet)
 };
 
@@ -578,6 +578,11 @@ private:
                                            common::ObArenaAllocator &allocator,
                                            const ObIArray<ObColDesc> &column_descs,
                                            ObDDLTableSchema &ddl_table_schema);
+  static int fill_async_ivf_index_schema_item(const uint64_t tenant_id,
+                                              ObSchemaGetterGuard &schema_guard,
+                                              const ObTableSchema *table_schema,
+                                              common::ObArenaAllocator &allocator,
+                                              ObDDLTableSchema &ddl_table_schema);
 
 public:
   ObDDLTableSchema() : storage_schema_(nullptr), lob_meta_storage_schema_(nullptr), lob_piece_storage_schema_(nullptr),

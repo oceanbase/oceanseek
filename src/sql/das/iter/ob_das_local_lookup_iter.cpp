@@ -10,6 +10,7 @@
 #include "sql/das/iter/ob_das_functional_lookup_iter.h"
 #include "sql/das/iter/ob_das_func_data_iter.h"
 #include "sql/das/iter/ob_das_domain_id_merge_iter.h"
+#include "sql/das/iter/ob_das_iter_utils.h"
 #include "sql/das/ob_das_ir_define.h"
 #include "sql/das/ob_das_vec_define.h"
 #include "storage/concurrency_control/ob_data_validation_service.h"
@@ -303,10 +304,21 @@ int ObDASLocalLookupIter::do_index_lookup()
         lookup_param_.index_id_ = lt_physical_data_table_id_;
       }
     }
-    if (OB_FAIL(apply_async_index_read_snapshot_(lookup_param_))) {
-      LOG_WARN("failed to refresh async index read snapshot", K(ret));
-    } else if (OB_FAIL(data_table_iter_->rescan())) {
-      LOG_WARN("failed to rescan data table", K(ret));
+    if (ObDASIterUtils::is_async_ivf_scan(index_ctdef_, index_rtdef_)) {
+      // Async IVF may update the bound snapshot when switching partitions.
+      if (OB_ISNULL(snapshot_)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("unexpected null lookup snapshot", K(ret));
+      } else if (OB_FAIL(lookup_param_.snapshot_.assign(*snapshot_))) {
+        LOG_WARN("failed to refresh lookup snapshot", K(ret));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      if (OB_FAIL(apply_async_index_read_snapshot_(lookup_param_))) {
+        LOG_WARN("failed to refresh async index read snapshot", K(ret));
+      } else if (OB_FAIL(data_table_iter_->rescan())) {
+        LOG_WARN("failed to rescan data table", K(ret));
+      }
     }
   }
   return ret;

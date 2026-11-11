@@ -16,17 +16,17 @@ namespace compaction
 {
 
 // =============================================================================
-// ObAsyncIndexMergeCtx — merge context for async inverted index merge
+// ObAsyncIndexMergeCtx — common merge context for async indexes
 //
 // Inherits ObBasicTabletMergeCtx so it IS the merge context (tablet handle /
 // ls handle / arena / static_param_ all live in the base), and can be passed
 // directly into ObTabletCreateSSTableParam::init_for_merge without a borrowed
-// pointer hop. Being this type is itself the inverted-merge signal: the ctor
-// marks static_param_.is_inv_index_ = true so get_merged_table_type emits
-// INV_INDEX_SSTABLE.
+// pointer hop. The DAG is selected using the generic async-index flag before
+// the storage schema is loaded. prepare_schema() confirms the concrete index
+// type and only then marks the current inverted-index implementation.
 //
 // The base declares several pure virtuals geared to the row-store merge_info
-// lifecycle. Inverted merge produces its sstable through
+// lifecycle. The current inverted merge produces its sstable through
 // ObPartitionInvSSTableMerger instead, so those paths are not driven through
 // this ctx yet — they are stubbed to OB_NOT_SUPPORTED until the inverted merge
 // scheduling lands.
@@ -39,10 +39,7 @@ struct ObAsyncIndexMergeCtx : public ObBasicTabletMergeCtx
     : ObBasicTabletMergeCtx(param, allocator),
       delete_index_table_id_(common::OB_INVALID_ID),
       delete_index_tablet_id_()
-  {
-    // Being an inverted-merge ctx IS the type signal (res.inv_meta_ is payload only).
-    static_param_.is_inv_index_ = true;
-  }
+  {}
   virtual ~ObAsyncIndexMergeCtx() { reset(); }
   void reset();
 

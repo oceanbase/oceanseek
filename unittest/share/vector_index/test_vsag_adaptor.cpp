@@ -12,6 +12,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <new>
+#include "lib/utility/ob_defer.h"
 #include "lib/vector/ob_vector_util.h"
 #include "lib/utility/ob_macro_utils.h"
 #include "lib/oblog/ob_log.h"
@@ -1550,6 +1552,67 @@ TEST_F(TestVsagAdaptor, test_hgraph_bq)
   obvsag::delete_index(index_handler);
   default_allocator.Deallocate(test_ptr);
   ASSERT_EQ(0, default_allocator.total_);
+}
+
+TEST_F(TestVsagAdaptor, test_raw_vectors_use_caller_allocator)
+{
+  constexpr int dim = 16;
+  constexpr int count = 64;
+  float data[count * dim];
+  int64_t labels[count];
+  for (int i = 0; i < count; ++i) {
+    labels[i] = i + 1;
+    for (int j = 0; j < dim; ++j) {
+      data[i * dim + j] = static_cast<float>(i * dim + j) / 16;
+    }
+  }
+  DefaultVsagAllocator index_allocator;
+  obvsag::VectorIndexPtr index = nullptr;
+  DEFER(if (nullptr != index) { obvsag::delete_index(index); });
+  ASSERT_EQ(OB_SUCCESS, obvsag::create_index(index, obvsag::HGRAPH_TYPE,
+      "float32", "l2", dim, 16, 128, 64, &index_allocator));
+  ASSERT_EQ(OB_SUCCESS, obvsag::build_index(index, data, labels, dim, count));
+
+  DefaultVsagAllocator read_allocator;
+  const int64_t ids[] = {9, 2, 5};
+  float *batch = nullptr;
+  float *single = nullptr;
+  DEFER(if (nullptr != batch) { read_allocator.Deallocate(batch); }
+        if (nullptr != single) { read_allocator.Deallocate(single); });
+  ASSERT_EQ(OB_SUCCESS, obvectorutil::get_raw_vector_by_ids(index, ids, 3, batch, &read_allocator));
+  ASSERT_NE(nullptr, batch);
+  // The temporary Dataset has gone away; its one result buffer is still live.
+  EXPECT_EQ(3 * dim * sizeof(float) + DefaultVsagAllocator::MEM_PTR_HEAD_SIZE,
+            read_allocator.total_);
+  ASSERT_EQ(OB_SUCCESS, obvectorutil::get_raw_vector_by_ids(index, ids, 1, single, &read_allocator));
+  ASSERT_NE(nullptr, single);
+  for (int i = 0; i < 3; ++i) {
+    for (int j = 0; j < dim; ++j) {
+      EXPECT_FLOAT_EQ(data[(ids[i] - 1) * dim + j], batch[i * dim + j]);
+    }
+  }
+  for (int j = 0; j < dim; ++j) {
+    EXPECT_FLOAT_EQ(batch[j], single[j]);
+  }
+  read_allocator.Deallocate(batch);
+  batch = nullptr;
+  read_allocator.Deallocate(single);
+  single = nullptr;
+  EXPECT_EQ(0, read_allocator.total_);
+
+  EXPECT_EQ(OB_INVALID_ARGUMENT, obvectorutil::get_raw_vector_by_ids(index, ids, 3, batch, nullptr));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, obvectorutil::get_raw_vector_by_ids(index, nullptr, 3, batch, &read_allocator));
+  EXPECT_EQ(OB_INVALID_ARGUMENT, obvectorutil::get_raw_vector_by_ids(index, ids, 0, batch, &read_allocator));
+  EXPECT_EQ(nullptr, batch);
+  class FailingAllocator : public DefaultVsagAllocator
+  {
+  public:
+    void *Allocate(size_t) override { throw std::bad_alloc(); }
+  } failing_allocator;
+  EXPECT_EQ(OB_ALLOCATE_MEMORY_FAILED, obvectorutil::get_raw_vector_by_ids(index, ids, 3, batch, &failing_allocator));
+  EXPECT_EQ(nullptr, batch);
+  ASSERT_EQ(OB_SUCCESS, obvsag::delete_index(index));
+  EXPECT_EQ(0, index_allocator.total_);
 }
 
 }  // namespace common

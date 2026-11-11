@@ -10,6 +10,7 @@
 #include "storage/access/ob_table_scan_iterator.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_posting_iter.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_range_iter.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable_scan_iter.h"
 #include "storage/retrieval/ob_block_stat_iter.h"
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/tx_storage/ob_tenant_freezer.h"
@@ -1939,6 +1940,75 @@ int ObAccessService::async_index_range_scan(
   } else if (OB_FAIL(tablet_service->async_index_range_scan(
       *pinned_tablet_handle, version_range, scan_param, range_param, iter))) {
     LOG_WARN("failed to async range scan", K(ret), K(ls_id), K(tablet_id), K(version_range));
+  }
+  return ret;
+}
+
+
+int ObAccessService::async_index_ivf_scan(
+    const share::ObLSID &ls_id,
+    const ObTabletHandle *pinned_tablet_handle,
+    ObTableScanParam &scan_param,
+    ObIvfSSTableScanIter *&iter)
+{
+  int ret = OB_SUCCESS;
+  ObTabletHandle tablet_handle;
+  ObIvfSSTableScanIter *tmp_iter = nullptr;
+  ObLS *ls = nullptr;
+  ObLSTabletService *tablet_service = nullptr;
+  const common::ObTabletID &tablet_id = scan_param.tablet_id_;
+  const ObStoreAccessType access_type = scan_param.scan_flag_.is_read_latest()
+      ? ObStoreAccessType::READ_LATEST : ObStoreAccessType::READ;
+  SCN user_specified_snapshot_scn;
+  iter = nullptr;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ob access service is not running", K(ret));
+  } else if (OB_UNLIKELY(!ls_id.is_valid() || !tablet_id.is_valid()
+      || OB_ISNULL(scan_param.allocator_))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid async ivf scan argument", K(ret), K(ls_id), K(tablet_id));
+  } else if (nullptr != pinned_tablet_handle
+             && (!pinned_tablet_handle->is_valid()
+                 || pinned_tablet_handle->get_obj()->get_tablet_id() != tablet_id)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid catalog-pinned IVF tablet", K(ret), K(tablet_id));
+  } else if (OB_ISNULL(tmp_iter = OB_NEWx(
+      ObIvfSSTableScanIter, scan_param.allocator_, *scan_param.allocator_))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate ivf table scan iterator", K(ret));
+  } else if (ObAccessTypeCheck::is_read_access_type(access_type) && scan_param.fb_snapshot_.is_valid()) {
+    user_specified_snapshot_scn = scan_param.fb_snapshot_;
+  }
+  if (OB_FAIL(ret)) {
+  } else if (OB_FAIL(check_read_allowed_(
+      ls_id,
+      tablet_id,
+      access_type,
+      scan_param,
+      tablet_handle,
+      tmp_iter->get_ctx_guard(),
+      user_specified_snapshot_scn))) {
+    if (OB_TABLET_NOT_EXIST != ret) {
+      LOG_WARN("failed to check async ivf read", K(ret), K(ls_id), K(tablet_id));
+    }
+  } else if (OB_ISNULL(ls = tmp_iter->get_ctx_guard().get_ls_handle().get_ls())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("ls is null for async ivf scan", K(ret), K(ls_id));
+  } else if (OB_ISNULL(tablet_service = ls->get_tablet_svr())) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("tablet service is null for async ivf scan", K(ret), K(ls_id));
+  } else if (OB_FAIL(tablet_service->async_index_ivf_scan(
+      nullptr == pinned_tablet_handle ? tablet_handle : *pinned_tablet_handle, scan_param, *tmp_iter))) {
+    LOG_WARN("failed to initialize async ivf scan", K(ret), K(ls_id), K(tablet_id));
+  } else {
+    iter = tmp_iter;
+    tmp_iter = nullptr;
+  }
+  if (OB_FAIL(ret) && nullptr != tmp_iter) {
+    tmp_iter->~ObIvfSSTableScanIter();
+    scan_param.allocator_->free(tmp_iter);
+    tmp_iter = nullptr;
   }
   return ret;
 }

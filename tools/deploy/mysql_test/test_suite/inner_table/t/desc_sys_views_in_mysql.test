@@ -94,3 +94,14 @@ WHERE  c.table_id = t.table_id
        AND t.table_name LIKE 'GV$%'
 GROUP  BY t.table_name) t2
 on t1.table_name = substr(t2.table_name,2) and t1.column_name_list != t2.column_name_list;
+
+--echo ====== verify IVF_INDEX/INC_IVF_INDEX in GV\$OB_SSTABLES view_definition ======
+SELECT COUNT(*) AS cnt FROM oceanbase.__all_table
+WHERE table_name = 'GV$OB_SSTABLES'
+  AND view_definition LIKE '%when 43 then ''IVF_INDEX''%'
+  AND view_definition LIKE '%when 44 then ''INC_IVF_INDEX''%';
+--echo ====== verify IVF_INDEX/INC_IVF_INDEX in V\$OB_SHARED_SSTABLES view_definition ======
+SELECT COUNT(*) AS cnt FROM oceanbase.__all_table
+WHERE table_name = 'V$OB_SHARED_SSTABLES'
+  AND view_definition LIKE '%when 43 then ''IVF_INDEX''%'
+  AND view_definition LIKE '%when 44 then ''INC_IVF_INDEX''%';

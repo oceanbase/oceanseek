@@ -115,6 +115,8 @@ extern int easy_vsnprintf(char *buf, size_t size, const char *fmt, va_list args)
 %nonassoc REMAP
 %nonassoc ',' WITH
 %nonassoc OVERWRITE
+%nonassoc LOWER_ASYNC_VECTOR
+%nonassoc VECTOR
 %left	UNION EXCEPT MINUS
 %left	INTERSECT
 %left LOWER_ON /*on expr*/
@@ -6610,6 +6612,16 @@ column_definition
   malloc_non_terminal_node($$, result->malloc_pool_, T_INDEX, 5, $3, col_list, index_option, NULL, NULL);
   $$->value_ = 6;
 }
+| ASYNC VECTOR key_or_index opt_index_name '(' sort_column_list ')' opt_index_option_list
+{
+  (void)($3);
+  ParseNode *col_list = NULL;
+  ParseNode *index_option = NULL;
+  merge_nodes(col_list, result, T_INDEX_COLUMN_LIST, $6);
+  merge_nodes(index_option, result, T_TABLE_OPTION_LIST, $8);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_INDEX, 5, $4, col_list, index_option, NULL, NULL);
+  $$->value_ = 10; /* ASYNC_VEC_KEY */
+}
 | CONSTRAINT opt_constraint_name FOREIGN KEY opt_index_name '(' column_name_list ')' REFERENCES relation_factor '(' column_name_list ')' opt_match_option opt_reference_option_list
 {
   ParseNode *child_col_list= NULL;
@@ -11576,6 +11588,18 @@ opt_index_option_list opt_partition_option with_column_group
                            $15,                  /* column group */
                            $5,                   /* if not exists*/
                            $1);                  /* index hint*/
+}
+| create_with_opt_hint ASYNC VECTOR INDEX opt_if_not_exists normal_relation_factor
+  ON relation_factor '(' sort_column_list ')' opt_index_option_list opt_partition_option
+{
+  ParseNode *idx_columns = NULL;
+  ParseNode *index_options = NULL;
+  merge_nodes(idx_columns, result, T_INDEX_COLUMN_LIST, $10);
+  merge_nodes(index_options, result, T_TABLE_OPTION_LIST, $12);
+  $6->value_ = 10; /* ASYNC_VEC_KEY */
+  malloc_non_terminal_node($$, result->malloc_pool_, T_CREATE_INDEX, 9,
+                           $6, $8, idx_columns, index_options, NULL, $13,
+                           NULL, $5, $1);
 }
 | create_with_opt_hint SEARCH INDEX opt_if_not_exists normal_relation_factor opt_index_using_algorithm ON relation_factor '(' search_sort_column_list ')'
 opt_index_option_list opt_partition_option
@@ -21638,6 +21662,15 @@ ADD add_key_or_index_opt
   malloc_non_terminal_node($$, result->malloc_pool_, T_INDEX_ADD, 6, $5, col_list, index_option, $6, NULL, NULL);
   $$->value_ = 8;
 }
+| ADD ASYNC VECTOR INDEX opt_index_name '(' sort_column_list ')' opt_index_option_list
+{
+  ParseNode *col_list = NULL;
+  ParseNode *index_option = NULL;
+  merge_nodes(col_list, result, T_INDEX_COLUMN_LIST, $7);
+  merge_nodes(index_option, result, T_TABLE_OPTION_LIST, $9);
+  malloc_non_terminal_node($$, result->malloc_pool_, T_INDEX_ADD, 6, $5, col_list, index_option, NULL, NULL, NULL);
+  $$->value_ = 10; /* ASYNC_VEC_KEY */
+}
 | ADD add_constraint_pri_key_opt
 {
   $$ = $2;
@@ -28950,7 +28983,7 @@ ACCESS_INFO
 |       ARG_MIN
 |       ARRAY
 |       ASIS
-|       ASYNC
+|       ASYNC %prec LOWER_ASYNC_VECTOR
 |       ASYNC_INDEX_PARAMS
 |       ASCII
 |       ASYNCHRONOUS

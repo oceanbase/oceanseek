@@ -170,6 +170,27 @@ int ObDDLResolver::append_async_delete_index_arg(
   return ret;
 }
 
+int ObDDLResolver::append_async_index_support_arg(
+    const ObPartitionResolveResult &resolve_result,
+    const ObCreateIndexArg &index_arg,
+    bool &has_generated_async_index_support_arg,
+    ObIArray<ObPartitionResolveResult> &resolve_results,
+    ObIArray<ObCreateIndexArg> &index_arg_list,
+    ObIAllocator *allocator)
+{
+  int ret = OB_SUCCESS;
+  if (!has_generated_async_index_support_arg) {
+    if (OB_FAIL(append_async_delete_index_arg(index_arg, index_arg_list, allocator))) {
+      LOG_WARN("failed to append async delete index arg", K(ret));
+    } else if (OB_FAIL(resolve_results.push_back(resolve_result))) {
+      LOG_WARN("failed to append async delete resolve result", K(ret));
+    } else {
+      has_generated_async_index_support_arg = true;
+    }
+  }
+  return ret;
+}
+
 int ObDDLResolver::append_fts_args(const share::schema::ObTableSchema &data_schema,
                                    const ObPartitionResolveResult &resolve_result,
                                    const obrpc::ObCreateIndexArg &index_arg,
@@ -192,15 +213,13 @@ int ObDDLResolver::append_fts_args(const share::schema::ObTableSchema &data_sche
     } else if (OB_FAIL(resolve_results.push_back(resolve_result))) {
       LOG_WARN("fail to push back resolve result", K(ret));
     }
-    if (OB_SUCC(ret) && !fts_common_aux_table_exist) {
-      if (OB_FAIL(append_async_delete_index_arg(index_arg, index_arg_list, allocator))) {
-        LOG_WARN("failed to append async delete index arg", K(ret));
-      } else if (OB_FAIL(resolve_results.push_back(resolve_result))) {
-        LOG_WARN("fail to push back resolve result", K(ret));
-      }
-      if (OB_SUCC(ret)) {
-        fts_common_aux_table_exist = true;
-      }
+    if (OB_SUCC(ret) && OB_FAIL(append_async_index_support_arg(resolve_result,
+                                                               index_arg,
+                                                               fts_common_aux_table_exist,
+                                                               resolve_results,
+                                                               index_arg_list,
+                                                               allocator))) {
+      LOG_WARN("failed to append async FTS support arg", K(ret));
     }
   } else {
     // sync fts path
@@ -1899,7 +1918,7 @@ int ObDDLResolver::resolve_table_option(const ParseNode *option_node, const bool
       case T_STORING_COLUMN_LIST: {
         ParseNode *cur_node = NULL;
         ObString column_name;
-        if (INDEX_KEYNAME::VEC_KEY == index_keyname_) {
+        if (INDEX_KEYNAME::VEC_KEY == index_keyname_ || INDEX_KEYNAME::ASYNC_VEC_KEY == index_keyname_) {
           ret = OB_NOT_SUPPORTED;
           SQL_RESV_LOG(WARN, "vector index not support storing column", K(ret));
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "setting vector index storing column is");
@@ -1949,7 +1968,7 @@ int ObDDLResolver::resolve_table_option(const ParseNode *option_node, const bool
         break;
       }
       case T_VEC_INDEX_PARAMS: {
-        if (index_keyname_ != VEC_KEY) {
+        if (index_keyname_ != VEC_KEY && index_keyname_ != ASYNC_VEC_KEY) {
           ret = OB_NOT_SUPPORTED;
           LOG_WARN("index params was set in not vector index is not supported", K(ret));
           LOG_USER_ERROR(OB_NOT_SUPPORTED, "set index params in not vector index is");
@@ -1958,7 +1977,9 @@ int ObDDLResolver::resolve_table_option(const ParseNode *option_node, const bool
           if (stmt::T_CREATE_TABLE == stmt_->get_stmt_type()) {
             sql::ObCreateTableStmt *create_table_stmt = static_cast<sql::ObCreateTableStmt*>(stmt_);
             tbl_schema = &create_table_stmt->get_create_table_arg().schema_;
-          } else if (stmt::T_CREATE_INDEX == stmt_->get_stmt_type()) {
+          } else if (stmt::T_CREATE_INDEX == stmt_->get_stmt_type()
+                     || (stmt::T_ALTER_TABLE == stmt_->get_stmt_type()
+                         && ASYNC_VEC_KEY == index_keyname_)) {
             if (OB_FAIL(schema_checker_->get_table_schema(tenant_id, database_name_, table_name_, false, tbl_schema))) {
               LOG_WARN("table is not exist", K(tenant_id), K(database_name_), K(table_name_), K(ret));
             } else if (OB_ISNULL(tbl_schema)) {
@@ -1990,6 +2011,14 @@ int ObDDLResolver::resolve_table_option(const ParseNode *option_node, const bool
               LOG_WARN("centroids_fresh_mode only supports IVF_FLAT index type", K(ret),
                        K(parsed_param.fresh_mode_), K(parsed_param.type_));
               LOG_USER_ERROR(OB_NOT_SUPPORTED, "centroids_fresh_mode with non-IVF_FLAT index type is");
+            } else if (index_keyname_ == INDEX_KEYNAME::ASYNC_VEC_KEY
+                       && parsed_param.type_ != ObVectorIndexAlgorithmType::VIAT_DISK_BBQ) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_USER_ERROR(OB_NOT_SUPPORTED, "async vector index TYPE other than DISK_BBQ is");
+            } else if (index_keyname_ == INDEX_KEYNAME::VEC_KEY
+                       && parsed_param.type_ == ObVectorIndexAlgorithmType::VIAT_DISK_BBQ) {
+              ret = OB_NOT_SUPPORTED;
+              LOG_USER_ERROR(OB_NOT_SUPPORTED, "DISK_BBQ without ASYNC VECTOR INDEX is");
             }
           }
         }
@@ -6212,6 +6241,7 @@ void ObDDLResolver::reset() {
 
 void ObDDLResolver::reset_index()
 {
+  index_params_.reset();
   index_scope_ = NOT_SPECIFIED;
   parser_name_.reset();
   fts_index_type_ = OB_FTS_INDEX_TYPE_INVALID;
@@ -8532,7 +8562,8 @@ int ObDDLResolver::resolve_vec_index_constraint(
 {
   int ret = OB_SUCCESS;
 
-  bool is_vec_index = (index_keyname_value == static_cast<int64_t>(INDEX_KEYNAME::VEC_KEY));
+  bool is_vec_index = (index_keyname_value == static_cast<int64_t>(INDEX_KEYNAME::VEC_KEY)
+                       || index_keyname_value == static_cast<int64_t>(INDEX_KEYNAME::ASYNC_VEC_KEY));
   if (!is_vec_index) {
     // do nothing
   } else if (!column_schema.is_valid()) {
@@ -8563,6 +8594,10 @@ int ObDDLResolver::resolve_vec_index_constraint(
       LOG_WARN("fail to check is sparse vec col", K(ret));
     } else if (OB_FAIL(GET_MIN_DATA_VERSION(tenant_id, tenant_data_version))) {
       LOG_WARN("get tenant data version failed", K(ret));
+    } else if (index_keyname_value == static_cast<int64_t>(INDEX_KEYNAME::ASYNC_VEC_KEY)
+               && (is_text_column || is_sparse_vec_col)) {
+      ret = OB_NOT_SUPPORTED;
+      LOG_USER_ERROR(OB_NOT_SUPPORTED, "async DISK_BBQ index on non-dense-vector column is");
     } else if (is_text_column && !tenant_config->_enable_semantic_index) {
       ret = OB_NOT_SUPPORTED;
       LOG_WARN("semantic vector index not supported", K(ret), K(tenant_config->_enable_semantic_index));
@@ -8605,7 +8640,7 @@ int ObDDLResolver::resolve_vec_index_constraint(
         LOG_WARN("vector index dim larger than 4096 is not supported", K(ret), K(tenant_data_version));
         LOG_USER_ERROR(OB_NOT_SUPPORTED, "vec index dim larger than 4096 is");
       } else {
-        index_keyname_ = VEC_KEY;
+        index_keyname_ = static_cast<INDEX_KEYNAME>(index_keyname_value);
         ParseNode *option_node = NULL;
         bool has_set_params = false;
         if (OB_ISNULL(node)) {
@@ -8646,6 +8681,7 @@ int ObDDLResolver::resolve_fts_index_constraint(
 {
   int ret = OB_SUCCESS;
   const ObColumnSchemaV2 *column_schema = NULL;
+  bool has_async_ivf_index = false;
   if (!table_schema.is_valid() || column_name.empty()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argumnet", K(ret), K(table_schema), K(column_name));
@@ -8657,6 +8693,15 @@ int ObDDLResolver::resolve_fts_index_constraint(
     LOG_USER_ERROR(OB_ERR_KEY_COLUMN_DOES_NOT_EXITS,
                    column_name.length(),
                    column_name.ptr());
+  } else if (index_keyname_value == static_cast<int64_t>(INDEX_KEYNAME::FTS_KEY)
+             && OB_FAIL(ObVectorIndexUtil::check_table_has_async_ivf_index(
+                           table_schema, has_async_ivf_index))) {
+    LOG_WARN("fail to check table has async IVF index", K(ret), K(table_schema));
+  } else if (has_async_ivf_index) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("synchronous fulltext index on table with async DISK_BBQ index is not supported",
+             K(ret), K(table_schema));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "synchronous fulltext index on table with async DISK_BBQ index is");
   } else if (table_schema.is_mysql_tmp_table()) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("fulltext index on mysql temporary table is not supported", KR(ret));
@@ -8677,6 +8722,7 @@ int ObDDLResolver::resolve_vec_index_constraint(
 {
   int ret = OB_SUCCESS;
   const ObColumnSchemaV2 *column_schema = NULL;
+  bool has_async_ivf_index = false;
   bool is_column_has_vector_index = false;
   ObIndexType index_type = INDEX_TYPE_MAX;
   uint64_t tenant_id = table_schema.get_tenant_id();
@@ -8692,6 +8738,15 @@ int ObDDLResolver::resolve_vec_index_constraint(
     LOG_USER_ERROR(OB_ERR_KEY_COLUMN_DOES_NOT_EXITS,
                    column_name.length(),
                    column_name.ptr());
+  } else if (index_keyname_value == static_cast<int64_t>(INDEX_KEYNAME::VEC_KEY)
+             && OB_FAIL(ObVectorIndexUtil::check_table_has_async_ivf_index(
+                           table_schema, has_async_ivf_index))) {
+    LOG_WARN("fail to check table has async IVF index", K(ret), K(table_schema));
+  } else if (has_async_ivf_index) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("synchronous vector index on table with async DISK_BBQ index is not supported",
+             K(ret), K(table_schema));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "synchronous vector index on table with async DISK_BBQ index is");
   } else if (table_schema.is_table_with_clustering_key()) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("vector index is not supported on table with clustering key",
@@ -14452,7 +14507,8 @@ int ObDDLResolver::resolve_index_column_group(const ParseNode *cg_node, obrpc::O
     ret = OB_NOT_SUPPORTED;
     SQL_RESV_LOG(WARN, "data_version not support for index column_group", K(ret), K(compat_version));
     LOG_USER_ERROR(OB_NOT_SUPPORTED, "tenant data version is less than 4.3, create index with column group");
-  } else if (INDEX_KEYNAME::VEC_KEY == index_keyname_ || INDEX_KEYNAME::FTS_KEY == index_keyname_ 
+  } else if (INDEX_KEYNAME::VEC_KEY == index_keyname_ || INDEX_KEYNAME::ASYNC_VEC_KEY == index_keyname_
+      || INDEX_KEYNAME::FTS_KEY == index_keyname_
       || INDEX_KEYNAME::MULTI_KEY == index_keyname_ || INDEX_KEYNAME::MULTI_UNIQUE_KEY == index_keyname_) {
     ret = OB_NOT_SUPPORTED;
     SQL_RESV_LOG(WARN, "create vector/fulltext/multivalue index with column group not supported", K(ret), K(compat_version));
@@ -14980,6 +15036,7 @@ int ObDDLResolver::resolve_search_index_constraint(
 {
   int ret = OB_SUCCESS;
   const ObColumnSchemaV2 *column_schema = NULL;
+  bool has_async_ivf_index = false;
   if (!table_schema.is_valid() || column_name.empty()) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argumnet", K(ret), K(table_schema), K(column_name));
@@ -14988,6 +15045,15 @@ int ObDDLResolver::resolve_search_index_constraint(
     LOG_USER_ERROR(OB_ERR_KEY_COLUMN_DOES_NOT_EXITS,
                    column_name.length(),
                    column_name.ptr());
+  } else if (index_keyname_value == static_cast<int64_t>(INDEX_KEYNAME::SEARCH_KEY)
+             && OB_FAIL(ObVectorIndexUtil::check_table_has_async_ivf_index(
+                           table_schema, has_async_ivf_index))) {
+    LOG_WARN("fail to check table has async IVF index", K(ret), K(table_schema));
+  } else if (has_async_ivf_index) {
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("synchronous search index on table with async DISK_BBQ index is not supported",
+             K(ret), K(table_schema));
+    LOG_USER_ERROR(OB_NOT_SUPPORTED, "synchronous search index on table with async DISK_BBQ index is");
   } else if (OB_FAIL(resolve_search_index_constraint(*column_schema,
                                                      index_keyname_value))) {
     LOG_WARN("resolve search index constraint fail", K(ret), K(index_keyname_value));

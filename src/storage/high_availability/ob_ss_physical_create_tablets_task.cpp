@@ -179,6 +179,21 @@ int ObSSPhysicalCreateTabletsConsumerTask::create_or_verify_restored_tablet_lock
                   K(ret), K_(param), K(inc_major_lock_row_key), K(arg));
             }
           }
+          if (OB_SUCC(ret) && arg.lock_row_info_.non_idem_major_next_op_id_ > 0) {
+            const ObSSMetaCtrlKey non_idem_major_lock_row_key(
+                blocksstable::ObStorageObjectType::SHARED_NON_IDEM_MAJOR_LOCK,
+                arg.tablet_id_,
+                arg.reorganization_scn_,
+                share::SCN::min_scn(),
+                param_.ls_id_);
+            if (OB_FAIL(create_or_verify_restored_lock_row_(
+                non_idem_major_lock_row_key,
+                arg.lock_row_info_.non_idem_major_next_op_id_,
+                trans))) {
+              LOG_WARN("failed to create or verify restored non-idempotent major lock row",
+                  K(ret), K_(param), K(non_idem_major_lock_row_key), K(arg));
+            }
+          }
         }
         if (OB_TMP_FAIL(ObAtomicProtocolUtil::commit_trans(ret, trans))) {
           LOG_WARN("failed to end restored lock row transaction",
@@ -194,7 +209,7 @@ int ObSSPhysicalCreateTabletsConsumerTask::create_or_verify_restored_tablet_lock
 }
 
 // 重建本批 tablet 的 Lock Row。一批最多 CREATE_TABLETS_BATCH_CNT_PER_TASK 个 tablet、
-// 每个 tablet 最多 2 个锁行，每个锁行是 check_and_create + lock + update 若干条 inner SQL，
+// 每个 tablet 最多 4 个锁行，每个锁行是 check_and_create + lock + update 若干条 inner SQL，
 // 批次不能开大，否则单个事务的语句数和行锁数会逼近默认 60s 的
 // _atomic_protocol_trans_timeout，一旦超时整批回滚。
 int ObSSPhysicalCreateTabletsConsumerTask::rebuild_restored_tablet_lock_rows_()

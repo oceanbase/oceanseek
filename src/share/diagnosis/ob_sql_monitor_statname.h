@@ -353,6 +353,25 @@ SQL_MONITOR_STATNAME_DEF(HS_MERGED_TASK_COUNT, metric::Unit::INT, "merged task c
 // 追加分区聚合数量，已有持久化指标编号保持不变。
 SQL_MONITOR_STATNAME_DEF(HS_MERGED_PARTITION_COUNT, metric::Unit::INT, "merged partition count", "number of original partition profiles merged into this profile", M_SUM, metric::Level::STANDARD)
 
+// Async IVF: append IDs so existing persisted metrics retain their meaning.
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_FINISH_TAG, metric::Unit::INT, "finish tag", "0 completed, 1 explicit vector retry, 2 error", M_FIRST_VAL, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_SCN, metric::Unit::INT, "scn", "actual async IVF read snapshot", M_FIRST_VAL, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_EST_ROWS, metric::Unit::INT, "est rows", "estimated filtered rows", M_FIRST_VAL, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_EST_SELECTIVITY, metric::Unit::INT, "est selectivity", "estimated selectivity in integer percent", M_FIRST_VAL, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_IS_BRUTE_FORCE, metric::Unit::INT, "is brute force", "actual pre-filter search method", M_FIRST_VAL, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_SEGMENT_COUNT, metric::Unit::INT, "segment count", "physical ranges selected by the read view", M_FIRST_VAL, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_VERSION_RANGE_BASE, metric::Unit::INT, "version range base", "segment base version", M_FIRST_VAL, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_VERSION_RANGE_SNAPSHOT, metric::Unit::INT, "version range snapshot", "segment snapshot version", M_FIRST_VAL, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_LOW_PRECISION_VECTOR_SCAN_COUNT, metric::Unit::INT, "low precision vector scan count", "low precision posting-list scans", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_LOW_PRECISION_VECTOR_COUNT, metric::Unit::INT, "low precision vector count", "low precision vectors evaluated", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_RAW_VECTOR_READ_COUNT, metric::Unit::INT, "raw vector read count", "raw vector read operations", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_RAW_VECTOR_KEY_COUNT, metric::Unit::INT, "raw vector key count", "keys submitted to raw vector reads", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_RAW_VECTOR_REFINE_COUNT, metric::Unit::INT, "raw vector refine count", "exact FP32 distances evaluated", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_FIRST_LOW_PRECISION_VECTOR_SCAN_CID, metric::Unit::INT, "first low precision vector scan cid", "first valid posting-list CID", M_FIRST_VAL, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_ITER_CALL_BACK_TIME, metric::Unit::TIME_NS, "iter call back time", "segment KNN time on the post-filter path", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_SEGMENT_TOTAL_TIME, metric::Unit::TIME_NS, "segment total time", "segment binding, search and result delivery time", M_SUM, metric::Level::STANDARD)
+SQL_MONITOR_STATNAME_DEF(VEC_IVF_SEGMENT_RETURN_ROWS_COUNT, metric::Unit::INT, "segment return rows count", "successful segment result rows before common filtering", M_SUM, metric::Level::STANDARD)
+
 //end
 SQL_MONITOR_STATNAME_DEF(MONITOR_STATNAME_END, metric::Unit::INVALID, "monitor end", "monitor stat name end", E_MIN | E_MAX, metric::Level::AD_HOC)
 #endif

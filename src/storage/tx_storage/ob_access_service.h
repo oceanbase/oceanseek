@@ -41,6 +41,7 @@ namespace storage
 struct ObDMLBaseParam;
 class ObLSService;
 class ObStoreCtx;
+class ObIvfSSTableScanIter;
 
 class ObStoreCtxGuard
 {
@@ -281,6 +282,14 @@ public:
       ObTableScanParam &scan_param,
       blocksstable::ObInvRangeScanParam &range_param,
       blocksstable::ObInvSSTableRangeIter *&iter);
+  // TODO(yutong.lzs): Unify these overloads after ordinary async IVF queries
+  // adopt catalog-pinned Tablet handles. Keep their three-argument entry for now.
+  // Open hybrid scans against the catalog-pinned Tablet with normal read checks.
+  virtual int async_index_ivf_scan(
+      const share::ObLSID &ls_id,
+      const ObTabletHandle *pinned_tablet_handle,
+      ObTableScanParam &scan_param,
+      ObIvfSSTableScanIter *&iter);
   int revert_async_index_iter(ObIAsyncIndexIter *iter);
   virtual int get_async_inv_bm25_stats(
       const share::ObLSID &ls_id,

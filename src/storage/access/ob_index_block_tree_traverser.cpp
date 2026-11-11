@@ -140,9 +140,14 @@ int ObIndexBlockTreeTraverser::goto_next_level_node(const blocksstable::ObMicroI
 
   bool should_estimate = false;
 
-  if (sstable_->is_inv_sstable() && micro_index_info.is_data_block()) {
-    // 倒排索引 posting data 微块与普通微块的行格式不同。不能由 leaf_node_traverse 打开进行计算
-    // 而且由于异步倒排索引的中间层叶子行不会跨倒排索引键(term)，这里通过索引行的 row_count（posting 微块的文档数）进行估算
+  if ((sstable_->is_inv_sstable() || sstable_->is_ivf_sstable()) && micro_index_info.is_data_block()) {
+    // 异步索引(inv/ivf)的数据微块与普通微块的行格式不同，不能由 leaf_node_traverse 打开进行计算：
+    // 1. 倒排索引 posting data 微块与普通微块的行格式不同；而且由于异步倒排索引的中间层叶子行不会跨
+    //    倒排索引键(term)，这里通过索引行的 row_count（posting 微块的文档数）进行估算。
+    // 2. IVF 索引的数据微块可能是低精度向量的 FastScan 编码块，其 ObMicroBlockData 只有数据 buffer、
+    //    没有普通行格式的 micro_header（块缓存中的 ObMicroBlockCacheValue 对 IVF_FASTSCAN_BLOCK
+    //    显式将 micro_header_ 置空），打开会解引用空指针；且该块的 row_count 已由索引行携带，
+    //    这里同样只按索引行的信息估算。
     should_estimate = true;
   } else if (context_->is_never_estimate()) {
     // should_estimate = false;

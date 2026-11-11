@@ -15,6 +15,7 @@
 #include "storage/meta_mem/ob_tablet_handle.h"
 #include "lib/stat/ob_diagnose_info.h"
 #include "storage/blocksstable/ob_block_manager.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable_struct.h"
 
 
 namespace oceanbase
@@ -271,7 +272,7 @@ public:
 protected:
   friend class ObIMicroBlockCache;
   friend class ObDataMicroBlockCache;
-  int process_block(
+  virtual int process_block(
       ObMacroBlockReader *reader,
       const char *buffer,
       const int64_t offset,
@@ -314,6 +315,7 @@ private:
       ObMacroBlockReader &reader,
       char *&out_buf,
       int64_t &out_size);
+protected:
   int build_micro_block_value(
       const char *block_buf,
       const int64_t block_size,
@@ -359,6 +361,58 @@ private:
   // Notice: lifetime shoule be longer than AIO or deep copy here
   const ObMicroBlockCacheValue *micro_block_;
   common::ObKVCacheHandle cache_handle_;
+};
+
+// IVF vector caches own their read-time transformation policy. The generic block-cache
+// prefetch path only submits IO and fills common callback metadata.
+class ObIvfVectorBlockIOCallback final : public ObAsyncSingleMicroBlockIOCallback
+{
+public:
+  ObIvfVectorBlockIOCallback(
+      common::ObIAllocator &allocator,
+      const bool use_block_cache,
+      const ObIvfFastScanTransformContext &fastscan_ctx,
+      const ObMicroBlockData::Type target_cache_block_type);
+  virtual ~ObIvfVectorBlockIOCallback() = default;
+  virtual int64_t size() const override { return sizeof(*this); }
+  virtual const char *get_cb_name() const override { return "IvfVectorBlockIOCB"; }
+  TO_STRING_KV("callback_type:", "ObIvfVectorBlockIOCallback", K_(fastscan_ctx), K_(target_cache_block_type));
+
+protected:
+  virtual int process_block(
+      ObMacroBlockReader *reader,
+      const char *buffer,
+      const int64_t offset,
+      const int64_t size,
+      const ObLogicMicroBlockId &logic_micro_id,
+      const int64_t data_checksum,
+      const ObMicroBlockCacheValue *&micro_block,
+      common::ObKVCacheHandle &cache_handle) override;
+
+private:
+  int process_ivf_vector_block(
+      const char *buffer,
+      const int64_t offset,
+      const int64_t size,
+      const ObLogicMicroBlockId &logic_micro_id,
+      const int64_t data_checksum,
+      const ObMicroBlockCacheValue *&micro_block,
+      ObMacroBlockReader &reader,
+      common::ObKVCacheHandle &cache_handle);
+  int transform_ivf_vector_block(
+      const ObMicroBlockHeader &header,
+      const char *raw_buffer,
+      const int64_t raw_size,
+      ObMacroBlockReader &reader,
+      char *&transformed_buf,
+      int64_t &transformed_size);
+
+private:
+  ObIvfFastScanTransformContext fastscan_ctx_;
+  // Target cache representation, independent of the base block_type_
+  // populated by generic prefetch.
+  ObMicroBlockData::Type target_cache_block_type_;
+  DISALLOW_COPY_AND_ASSIGN(ObIvfVectorBlockIOCallback);
 };
 
 class ObMultiDataBlockIOCallback : public ObIMicroBlockIOCallback
@@ -445,6 +499,16 @@ public:
       ObStorageObjectHandle &macro_handle,
       ObIAllocator *allocator,
       const bool is_preread = false);
+  // The callback must be allocator-owned. It is set to nullptr once ownership
+  // transfers to the IO handle; otherwise the caller must release it.
+  int prefetch(
+      const uint64_t tenant_id,
+      const MacroBlockId &macro_id,
+      const ObMicroIndexInfo& idx_row,
+      const common::ObTabletID &effective_tablet_id,
+      ObStorageObjectHandle &macro_handle,
+      ObAsyncSingleMicroBlockIOCallback *&callback,
+      const bool is_preread = false);
   virtual int load_block(
       const ObMicroBlockId &micro_block_id,
       const ObMicroBlockDesMeta &des_meta,
@@ -481,14 +545,6 @@ public:
   virtual void cache_miss(int64_t &miss_cnt) = 0;
 
 protected:
-  int prefetch(
-      const uint64_t tenant_id,
-      const MacroBlockId &macro_id,
-      const ObMicroIndexInfo& idx_row,
-      const common::ObTabletID &effective_tablet_id,
-      ObStorageObjectHandle &macro_handle,
-      ObAsyncSingleMicroBlockIOCallback *&callback,
-      const bool is_preread = false);
   int prefetch(
       const uint64_t tenant_id,
       const MacroBlockId &macro_id,

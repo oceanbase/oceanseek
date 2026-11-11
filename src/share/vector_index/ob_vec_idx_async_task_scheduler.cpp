@@ -466,8 +466,13 @@ void ObVecIdxAsyncTaskScheduler::run_timer_task()
       if (OB_TMP_FAIL(check_and_execute_ivf_cache_maintenance_tasks_())) {
         LOG_WARN("fail to execute ivf cache maintenance tasks", KR(tmp_ret), K_(tenant_id));
       }
+      tg.click("ivf cache maintenance");
+      if (OB_TMP_FAIL(service_->run_ivf_sstable_cache_maintenance())) {
+        LOG_WARN("fail to run tenant IVF SSTable cache maintenance",
+                 KR(tmp_ret), K_(tenant_id));
+      }
+      tg.click("ivf sstable cache maintenance");
     }
-    tg.click("ivf cache maintenance");
     LOG_TRACE("vec idx async task scheduler run_timer_task finish", KR(ret), K_(tenant_id), K(tg));
     schedule_finish();
   }
@@ -1305,6 +1310,11 @@ void ObVecIdxAsyncTaskScheduler::clean_deprecated_ivf_caches(
       IvfCacheMgrMap &ivf_cache_mgr_map = mgr->get_ivf_cache_mgr_map();
       FOREACH_X(iter, ivf_cache_mgr_map, OB_SUCC(ret)) {
         const ObIvfCacheMgrKey &cache_mgr_key = iter->first;
+        if (cache_mgr_key.is_sstable_key()) {
+          // DiskBBQ SSTable cache invalidation is handled by the standard
+          // DISK_BBQ_CACHE_CLEAN task using the complete TableKey.
+          continue;
+        }
         const ObTabletID cache_tablet_id = cache_mgr_key.get_tablet_id();
         ObIvfCacheMgr *cache_mgr = iter->second;
         ObTabletHandle tablet_handle;
@@ -2123,6 +2133,9 @@ int ObVecIdxAsyncTaskScheduler::sync_ls_executors()
           LOG_WARN("fail to init embedding task executor", KR(ret), K(ls_id));
         } else if (OB_FAIL(leader_exec->ivf_task_exec_.init(tenant_id_, ls_handle))) {
           LOG_WARN("fail to init ivf task executor", KR(ret), K(ls_id));
+        } else if (OB_FAIL(leader_exec->disk_bbq_cache_task_exec_.init(
+                       tenant_id_, ls_handle))) {
+          LOG_WARN("fail to init DiskBBQ cache task executor", KR(ret), K(ls_id));
         } else if (OB_FAIL(leader_exec->freeze_exec_.init(tenant_id_, ls_handle))) {
           LOG_WARN("fail to init freeze executor", KR(ret), K(ls_id));
         } else if (OB_FAIL(leader_exec->merge_exec_.init(tenant_id_, ls_handle))) {
@@ -2137,9 +2150,12 @@ int ObVecIdxAsyncTaskScheduler::sync_ls_executors()
           LOG_WARN("fail to init follower mem sync executor", KR(ret), K(ls_id));
         } else if (OB_FAIL(follower_exec->ivf_task_exec_.init(tenant_id_, ls_handle))) {
           LOG_WARN("fail to init ivf task executor for follower", KR(ret), K(ls_id));
+        } else if (OB_FAIL(follower_exec->disk_bbq_cache_task_exec_.init(
+                       tenant_id_, ls_handle))) {
+          LOG_WARN("fail to init follower DiskBBQ cache task executor", KR(ret), K(ls_id));
         } else if (OB_FAIL(follower_exec->ivf_cache_cleanup_exec_.init(tenant_id_, ls_handle))) {
           LOG_WARN("fail to init IVF cache cleanup executor for follower", KR(ret), K(ls_id));
-        } 
+        }
         if (OB_SUCC(ret)) {
           leader_exec->is_inited_ = true;
           follower_exec->is_inited_ = true;
@@ -4818,6 +4834,14 @@ int ObVecIdxAsyncTaskScheduler::load_leader_ls_tasks(
       ret = OB_SUCC(ret) ? tmp_ret : ret;
     }
   }
+  if (can_schedule(ObVectorTaskScheduleType::IVF_CACHE_MAINTENANCE)) {
+    int tmp_ret = OB_SUCCESS;
+    if (OB_SUCCESS != (tmp_ret = exec.disk_bbq_cache_task_exec_.load_task(
+                                    task_trace_base_num))) {
+      LOG_WARN("fail to load DiskBBQ cache tasks", K(tmp_ret), K(ls_id));
+      ret = OB_SUCC(ret) ? tmp_ret : ret;
+    }
+  }
   return ret;
 }
 
@@ -4871,6 +4895,13 @@ int ObVecIdxAsyncTaskScheduler::load_follower_ls_tasks(const ObLSID &ls_id, ObVe
     } else if (OB_SUCCESS != (tmp_ret = exec.ivf_cache_cleanup_exec_.load_task(task_trace_base_num))) {
       LOG_WARN("fail to load IVF cache cleanup task", K(tmp_ret), K(ls_id));
       ret = tmp_ret;
+    }
+  }
+  if (can_schedule(ObVectorTaskScheduleType::IVF_CACHE_MAINTENANCE)) {
+    if (OB_SUCCESS != (tmp_ret = exec.disk_bbq_cache_task_exec_.load_task(
+                                    task_trace_base_num))) {
+      LOG_WARN("fail to load follower DiskBBQ cache tasks", K(tmp_ret), K(ls_id));
+      ret = OB_SUCC(ret) ? tmp_ret : ret;
     }
   }
   return ret;

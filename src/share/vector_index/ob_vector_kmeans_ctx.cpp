@@ -139,6 +139,7 @@ void ObKmeansAlgo::destroy()
   }
   task_handler_ = nullptr;
   kmeans_monitor_ = nullptr;
+  refresh_progress_ = nullptr;
 }
 
 bool ObKmeansAlgo::check_stop()
@@ -192,6 +193,14 @@ int ObKmeansAlgo::build(const ObKmeansVectorInput &input_vectors)
     ObKMeansStatus last_status = status_;
     int64_t status_start_time = ObTimeUtility::current_time_ms();
     while (OB_SUCC(ret) && !is_finish()) {
+      if (nullptr != refresh_progress_) {
+        switch (status_) {
+          case PREPARE_CENTERS: refresh_progress_->begin_stage(ObIVFRefreshProgress::TRAIN_PREPARE); break;
+          case INIT_CENTERS: refresh_progress_->begin_stage(ObIVFRefreshProgress::TRAIN_INIT); break;
+          case RUNNING_KMEANS: refresh_progress_->begin_stage(ObIVFRefreshProgress::TRAIN_ITERATE); break;
+          default: break;
+        }
+      }
       if (OB_FAIL(inner_build(input_vectors))) {
         SHARE_LOG(WARN, "failed to do kmeans", K(ret));
       } else if (check_stop()) {
@@ -264,6 +273,10 @@ int ObKmeansAlgo::quick_centers(const ObKmeansVectorInput &input_vectors)
     for (int64_t i = 0; OB_SUCC(ret) && i < input_vectors.count(); ++i) {
       if (OB_FAIL(centers_[cur_idx_].push_back(kmeans_ctx_->dim_, input_vectors.at(i)))) {
         SHARE_LOG(WARN, "failed to push back center", K(ret));
+      } else if (VIDA_IP == kmeans_ctx_->dist_algo_
+                 && OB_FAIL(kmeans_ctx_->try_normalize(
+                     kmeans_ctx_->dim_, centers_[cur_idx_].at(i), centers_[cur_idx_].at(i)))) {
+        SHARE_LOG(WARN, "failed to normalize inner product quick center", K(ret), K(i));
       }
     }
   }
@@ -1387,6 +1400,7 @@ int ObElkanKmeansAlgo::do_kmeans(const ObKmeansVectorInput &input_vectors)
     const int64_t dim = kmeans_ctx_->dim_;
     float prev_dis_obj = 0;
 
+    if (nullptr != refresh_progress_) { refresh_progress_->set_total(ObIVFRefreshProgress::TRAIN_ITERATE, N_ITER); }
     for (int64_t iter = 0; OB_SUCC(ret) && iter < N_ITER; ++iter) {
       if (check_stop()) {
         ret = OB_CANCELED;
@@ -1394,6 +1408,7 @@ int ObElkanKmeansAlgo::do_kmeans(const ObKmeansVectorInput &input_vectors)
         break;
       }
       int64_t iter_start_time = ObTimeUtility::current_time_ms();
+      const int64_t iter_start_us = nullptr != refresh_progress_ ? ObTimeUtility::current_time() : 0;
       float dis_obj = 0.0;
       MEMSET(data_cnt_in_cluster, 0, sizeof(int32_t) * kmeans_ctx_->lists_);
       centers_[next_idx()].clear();
@@ -1443,6 +1458,10 @@ int ObElkanKmeansAlgo::do_kmeans(const ObKmeansVectorInput &input_vectors)
         prev_dis_obj = dis_obj;
         if (OB_NOT_NULL(kmeans_monitor_)) {
           kmeans_monitor_->set_kmeams_monitor(iter, EARLY_FINISH_THRESHOLD, diff, imbalance_factor);
+        }
+        if (nullptr != refresh_progress_) {
+          refresh_progress_->iteration_finished(iter, ObTimeUtility::current_time() - iter_start_us,
+              diff, imbalance_factor);
         }
         if (iter > 0 && diff <= EARLY_FINISH_THRESHOLD) {
           LOG_DEBUG("finish do kmeans before all iters", K(ret), K(iter), K(dis_obj), K(diff), K(imbalance_factor));

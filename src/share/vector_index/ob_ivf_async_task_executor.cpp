@@ -56,7 +56,9 @@ int ObIvfAsyncTaskExecutor::LoadTaskCallback::load_clean_task(ObIvfCacheMgr &gua
   ObIvfCacheMgr *cache_mgr = &guarded_cache_mgr;
   ObTabletID tablet_id = cache_mgr->get_cache_mgr_key().get_tablet_id();
   bool is_deprecated = false;
-  if (OB_ISNULL(cache_mgr)) {
+  if (guarded_cache_mgr.get_cache_mgr_key().is_sstable_key()) {
+    // DiskBBQ SSTable caches are handled by ObDiskBBQCacheTaskExecutor.
+  } else if (OB_ISNULL(cache_mgr)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected nullptr", K(ret));
   } else if (OB_FAIL(is_cache_mgr_deprecated(*cache_mgr, is_deprecated))) {

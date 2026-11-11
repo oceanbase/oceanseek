@@ -276,6 +276,7 @@ public:
            const uint64_t data_format_version,
            const bool is_rollback,
            const bool is_co_sstable,
+           const ObITable::TableType table_type,
            const ObString &inc_major_buffer,
            const share::SCN &start_scn,
            const bool need_check_ddl_checkpoint);
@@ -302,6 +303,7 @@ private:
   uint64_t data_format_version_;
   bool is_rollback_;
   bool is_co_sstable_;
+  ObITable::TableType table_type_;
   ObString inc_major_buffer_;
   share::SCN start_scn_;
   bool need_check_ddl_checkpoint_;

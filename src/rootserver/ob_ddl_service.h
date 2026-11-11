@@ -1112,7 +1112,7 @@ int check_table_udt_id_is_exist(share::schema::ObSchemaGetterGuard &schema_guard
       ObDDLOperator &ddl_operator,
       ObMySQLTransaction &trans,
       common::ObIArray<share::schema::ObTableSchema> &new_index_schemas);
-  int rename_dropping_async_fts_index_(
+  int rename_dropping_user_async_index_(
       const uint64_t tenant_id,
       const uint64_t data_table_id,
       const uint64_t database_id,
@@ -2196,6 +2196,23 @@ int check_will_be_having_domain_index_operation(
     const ObArray<ObTabletID> &tablet_ids,
     const int64_t schema_version,
     ObDDLSQLTransaction &trans);
+  enum class TableDefenseType { WRITE_ONLY, READ_WRITE };
+  static bool use_write_only_defense_for_alter_table_(
+      const uint64_t tenant_data_version,
+      const ObTableSchema &orig_table_schema,
+      const ObTableSchema &new_table_schema,
+      const obrpc::ObAlterTableArg &alter_table_arg);
+  static TableDefenseType get_rename_table_defense_type_(
+      const uint64_t tenant_data_version,
+      const ObTableSchema &table_schema);
+  int build_defense_for_table_(
+      const TableDefenseType defense_type,
+      const uint64_t tenant_data_version,
+      const ObTableSchema &table_schema,
+      const int64_t new_data_table_schema_version,
+      const ObIArray<std::pair<uint64_t, int64_t>> &aux_schema_versions,
+      ObSchemaGetterGuard &schema_guard,
+      ObDDLSQLTransaction &trans);
   int build_write_defense_for_table_(
       const ObTableSchema &table_schema,
       const int64_t new_data_table_schema_version,
@@ -2239,13 +2256,14 @@ public:
                                        common::ObString &schema_name,
                                        common::ObString &object_name);
 
-  int check_domain_index_ddl_conflict(const uint64_t tenant_id, const uint64_t table_id);
+  int check_domain_or_user_async_index_conflict(const uint64_t tenant_id, const uint64_t table_id);
   int check_index_mode_conflict(const share::schema::ObTableSchema &data_table_schema,
                                 const share::schema::ObIndexType new_index_type);
-  int check_fts_rename_conflict(share::schema::ObSchemaGetterGuard &schema_guard,
-                                const share::schema::ObTableSchema &origin_table_schema,
-                                const common::ObString &database_name,
-                                const common::ObString &ori_index_name);
+  int check_index_rename_ddl_task_conflict(share::schema::ObSchemaGetterGuard &schema_guard,
+                                           const share::schema::ObTableSchema &origin_table_schema,
+                                           const common::ObString &database_name,
+                                           const common::ObString &ori_index_name,
+                                           const common::ObString &new_index_name);
   
   int check_vec_index_conflict(const uint64_t tenant_id, const uint64_t table_id);
   int update_vec_index_params_in_trans_(
@@ -2267,7 +2285,7 @@ private:
       const uint64_t tenant_data_version,
       ObTableSchema &index_schema,
       const int64_t parent_build_snapshot = 0);
-  int reuse_async_fts_offline_aux_index_task_(
+  int reuse_offline_async_index_aux_task_(
       const ObTableSchema &data_schema,
       const ObTableSchema &idx_schema,
       const int64_t parent_task_id,

@@ -35,6 +35,7 @@
 #include "storage/column_store/ob_column_oriented_sstable.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_posting_iter.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable_range_iter.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable_scan_iter.h"
 #include "storage/blocksstable/ob_sstable.h"
 #include "storage/ddl/ob_direct_insert_sstable_ctx_new.h"
 #include "storage/retrieval/ob_block_stat_iter.h"
@@ -10751,7 +10752,7 @@ int ObLSTabletService::get_async_index_segment_group_ctx(
       } else if (tablet_handle.get_obj()->get_tablet_meta().has_transfer_table()
           && OB_FAIL(get_async_index_src_tablet_(tablet_handle))) {
         LOG_WARN("failed to switch async index to transfer source tablet", K(ret), K(tablet_id));
-      } else if (OB_UNLIKELY(!tablet_handle.get_obj()->is_async_inverted_storage_index())) {
+      } else if (OB_UNLIKELY(!tablet_handle.get_obj()->is_async_index_storage_tablet())) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("tablet is not async index tablet", K(ret), K(tablet_id), K(tablet_handle));
       } else if (OB_FAIL(tablet_handle.get_obj()->get_latest_async_index_published_version(
@@ -11008,6 +11009,39 @@ int ObLSTabletService::async_index_range_scan(
     iter->~ObInvSSTableRangeIter();
     range_param.allocator_->free(iter);
     iter = nullptr;
+  }
+  return ret;
+}
+
+int ObLSTabletService::async_index_ivf_scan(
+    const ObTabletHandle &tablet_handle,
+    ObTableScanParam &scan_param,
+    ObIvfSSTableScanIter &iter)
+{
+  int ret = OB_SUCCESS;
+  ObStoreCtx &store_ctx = iter.get_ctx_guard().get_store_ctx();
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("ls tablet service is not initialized", K(ret), K_(is_inited));
+  } else if (OB_UNLIKELY(!tablet_handle.is_valid()
+      || !scan_param.tablet_id_.is_valid()
+      || OB_ISNULL(scan_param.allocator_)
+      || !store_ctx.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid ivf scan argument", K(ret), K(tablet_handle),
+        K(scan_param.tablet_id_), K(store_ctx));
+  } else if (OB_UNLIKELY(tablet_handle.get_obj()->get_tablet_id() != scan_param.tablet_id_)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("ivf scan tablet id mismatch", K(ret), K(scan_param.tablet_id_),
+        "tablet_handle_id", tablet_handle.get_obj()->get_tablet_id());
+  } else if (OB_FAIL(prepare_scan_table_param(
+      scan_param, *(MTL(ObTenantSchemaService*)->get_schema_service())))) {
+    LOG_WARN("failed to prepare ivf scan table param", K(ret), K(scan_param));
+  } else if (OB_UNLIKELY(!scan_param.is_valid())) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid prepared ivf scan param", K(ret), K(scan_param));
+  } else if (OB_FAIL(iter.init(scan_param, tablet_handle))) {
+    LOG_WARN("failed to initialize ivf sstable scan iterator", K(ret), K(scan_param.tablet_id_));
   }
   return ret;
 }

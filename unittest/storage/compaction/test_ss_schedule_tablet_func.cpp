@@ -11,6 +11,7 @@
 #include "share/scheduler/test_dag_common.h"
 #include "storage/compaction_v2/ob_ss_schedule_tablet_func.h"
 #include "storage/compaction_v2/ob_ss_skip_major_merge_dag.h"
+#include "storage/tablet/ob_tablet.h"
 #undef private
 #undef protected
 
@@ -24,6 +25,28 @@ namespace unittest
 
 class TestSSScheduleTabletFunc : public TestDagScheduler
 {};
+
+TEST_F(TestSSScheduleTabletFunc, async_index_skip_does_not_require_storage_schema)
+{
+  // The skip decision needs only the cached tablet flags and medium-info reason.
+  // Deliberately leave storage_schema_addr_ unset: scheduling must not load it.
+  storage::ObTablet tablet;
+  const ObTabletID tablet_id(200001);
+  tablet.tablet_meta_.tablet_id_ = tablet_id;
+  tablet.table_store_cache_.is_async_index_refresh_target_ = true;
+  tablet.table_store_cache_.is_async_delete_index_ = false;
+  ASSERT_TRUE(tablet.is_async_index_storage_tablet());
+
+  const int64_t merge_version = 100;
+  for (const auto reason : {ObAdaptiveMergePolicy::NO_INC_DATA, ObAdaptiveMergePolicy::DURING_DDL}) {
+    ObSSScheduleTabletFunc func(merge_version, reason, true);
+    EXPECT_EQ(OB_SUCCESS, func.schedule_merge_dag(ObLSID(1), tablet, MEDIUM_MERGE,
+        merge_version, 0, ObCOMajorMergeStrategy(), reason));
+    ASSERT_EQ(1, func.skip_merge_tablet_ids_.count());
+    EXPECT_EQ(tablet_id, func.skip_merge_tablet_ids_.at(0));
+    EXPECT_EQ(merge_version, func.skip_major_merge_scn_);
+  }
+}
 
 TEST_F(TestSSScheduleTabletFunc, duplicate_skip_major_dag_clears_transient_state)
 {

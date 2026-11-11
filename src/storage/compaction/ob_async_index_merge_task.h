@@ -8,6 +8,7 @@
 
 #include "storage/compaction/ob_tablet_merge_task.h"
 #include "storage/compaction/ob_async_index_merge_ctx.h"
+#include "storage/blocksstable/vector_index/ob_ivf_merge_dag.h"
 #include "storage/blocksstable/async_index/ob_partition_inv_sstable_merger.h"
 
 namespace oceanbase
@@ -62,10 +63,14 @@ class ObAsyncIndexMergeDag : public ObTabletMergeDag
 {
 public:
   ObAsyncIndexMergeDag(const share::ObDagType::ObDagTypeEnum type);
-  virtual ~ObAsyncIndexMergeDag() = default;
+  virtual ~ObAsyncIndexMergeDag() override;
   virtual int init_by_param(const share::ObIDagInitParam *param) override;
   virtual int create_first_task() override;
   virtual int generate_merge_task(ObBasicTabletMergeCtx &ctx, share::ObITask *prepare_task) override;
+
+private:
+  int generate_inv_merge_task(ObAsyncIndexMergeCtx &ctx, share::ObITask *prepare_task);
+  ObIVFMergeDagCtx ivf_merge_dag_ctx_;
 };
 
 class ObAsyncIndexMajorMergeDag : public ObAsyncIndexMergeDag

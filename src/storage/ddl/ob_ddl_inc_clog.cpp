@@ -246,7 +246,8 @@ ObDDLIncCommitLog::ObDDLIncCommitLog()
     is_rollback_(false),
     is_co_sstable_(false),
     start_scn_(),
-    need_check_ddl_checkpoint_(false)
+    need_check_ddl_checkpoint_(false),
+    table_type_(ObITable::TableType::MAX_TABLE_TYPE)
 {
 }
 
@@ -310,6 +311,7 @@ int ObDDLIncCommitLog::set_ss_inc_major(
   } else {
     is_co_sstable_ = data_inc_major->is_co_sstable();
     need_check_ddl_checkpoint_ = need_check_ddl_checkpoint;
+    table_type_ = data_inc_major->get_key().table_type_;
   }
   return ret;
 }
@@ -326,7 +328,8 @@ OB_DEF_SERIALIZE_SIZE(ObDDLIncCommitLog)
               lob_meta_inc_major_buffer_,
               start_scn_,
               lob_piece_inc_major_buffer_,
-              need_check_ddl_checkpoint_);
+              need_check_ddl_checkpoint_,
+              table_type_);
   return len;
 }
 
@@ -341,15 +344,17 @@ OB_DEF_SERIALIZE(ObDDLIncCommitLog)
               lob_meta_inc_major_buffer_,
               start_scn_,
               lob_piece_inc_major_buffer_,
-              need_check_ddl_checkpoint_);
+              need_check_ddl_checkpoint_,
+              table_type_);
   return ret;
 }
 
 OB_DEF_DESERIALIZE(ObDDLIncCommitLog)
 {
   int ret = OB_SUCCESS;
-  // Historical END logs do not contain the checkpoint-check flag.
+  // Historical END logs may omit the checkpoint-check flag and table type.
   need_check_ddl_checkpoint_ = false;
+  table_type_ = ObITable::TableType::MAX_TABLE_TYPE;
   LST_DO_CODE(OB_UNIS_DECODE,
               log_basic_,
               is_rollback_,
@@ -358,7 +363,8 @@ OB_DEF_DESERIALIZE(ObDDLIncCommitLog)
               lob_meta_inc_major_buffer_,
               start_scn_,
               lob_piece_inc_major_buffer_,
-              need_check_ddl_checkpoint_);
+              need_check_ddl_checkpoint_,
+              table_type_);
 
 #ifdef OB_BUILD_SHARED_STORAGE
   if (OB_SUCC(ret)) {

@@ -11,6 +11,8 @@
 #include "storage/ob_i_table.h"
 #include "storage/ddl/ob_direct_load_mgr_utils.h"
 #include "storage/ddl/ob_direct_insert_sstable_ctx_new.h"
+#include "share/ob_index_builder_util.h"
+#include "share/vector_index/ob_vector_index_util.h"
 
 using namespace oceanbase::storage;
 using namespace oceanbase::blocksstable;
@@ -807,6 +809,40 @@ int ObDDLTableSchema::fill_vector_index_schema_item(
   return ret;
 }
 
+int ObDDLTableSchema::fill_async_ivf_index_schema_item(
+    const uint64_t tenant_id,
+    ObSchemaGetterGuard &schema_guard,
+    const ObTableSchema *table_schema,
+    ObArenaAllocator &allocator,
+    ObDDLTableSchema &ddl_table_schema)
+{
+  int ret = OB_SUCCESS;
+  const ObTableSchema *data_table_schema = nullptr;
+  const ObColumnSchemaV2 *source_column = nullptr;
+  if (OB_FAIL(schema_guard.get_table_schema(
+          tenant_id, table_schema->get_data_table_id(), data_table_schema))) {
+    LOG_WARN("failed to get async IVF data table schema", K(ret), K(tenant_id), KPC(table_schema));
+  } else if (OB_ISNULL(data_table_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+    LOG_WARN("async IVF data table schema does not exist", K(ret), KPC(table_schema));
+  } else if (OB_FAIL(ObIndexBuilderUtil::get_async_ivf_source_column(
+                 *data_table_schema, *table_schema, source_column))) {
+    LOG_WARN("failed to resolve async IVF source vector", K(ret), KPC(table_schema));
+  } else if (OB_FAIL(ObVectorIndexUtil::get_vector_dim_from_extend_type_info(
+                 source_column->get_extended_type_info(),
+                 ddl_table_schema.table_item_.vec_dim_))) {
+    LOG_WARN("failed to resolve async IVF vector dimension", K(ret), KPC(source_column));
+  } else if (OB_UNLIKELY(ddl_table_schema.table_item_.vec_dim_ <= 0)) {
+    ret = OB_SCHEMA_ERROR;
+    LOG_WARN("invalid async IVF vector dimension", K(ret),
+             K(ddl_table_schema.table_item_.vec_dim_), KPC(source_column));
+  } else if (OB_FAIL(ob_write_string(allocator, table_schema->get_index_params(),
+                                     ddl_table_schema.table_item_.vec_idx_param_))) {
+    LOG_WARN("failed to copy async IVF index params", K(ret), KPC(table_schema));
+  }
+  return ret;
+}
+
 int ObDDLTableSchema::fill_ddl_table_schema(
     ObSchemaGetterGuard &schema_guard,
     const uint64_t tenant_id,
@@ -925,7 +961,12 @@ int ObDDLTableSchema::fill_ddl_table_schema(
       }
     }
     if (OB_SUCC(ret)) {
-      if (FALSE_IT(is_vector_data_complement = ObDDLUtil::is_vector_index_complement(table_schema->get_index_type()))) {
+      if (is_async_ivf_index(table_schema->get_index_type())) {
+        if (OB_FAIL(fill_async_ivf_index_schema_item(
+                tenant_id, schema_guard, table_schema, allocator, ddl_table_schema))) {
+          LOG_WARN("fail to prepare async IVF index data", K(ret));
+        }
+      } else if (FALSE_IT(is_vector_data_complement = ObDDLUtil::is_vector_index_complement(table_schema->get_index_type()))) {
       } else if (is_vector_data_complement && OB_FAIL(fill_vector_index_schema_item(tenant_id,
           schema_guard,
           table_schema,

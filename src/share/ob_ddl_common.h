@@ -252,6 +252,8 @@ enum ObDDLTaskStatus { // FARM COMPAT WHITELIST
   FORK_TABLE_CLEANUP_MDS_FINISHED = 63,
   FORK_TABLE_CLEANUP_RESOURCES_RELEASED = 64,
   FORK_TABLE_WRITE_REORG = 65,
+  GENERATE_ASYNC_VECTOR_INDEX_BASELINE = 66,
+  WAIT_ASYNC_VECTOR_INDEX_BASELINE = 67,
 
   FAIL = 99,
   SUCCESS = 100
@@ -478,6 +480,12 @@ static const char* ddl_task_status_to_str(const ObDDLTaskStatus &task_status) {
       break;
     case ObDDLTaskStatus::FORK_TABLE_WRITE_REORG:
       str = "FORK_TABLE_WRITE_REORG";
+      break;
+    case ObDDLTaskStatus::GENERATE_ASYNC_VECTOR_INDEX_BASELINE:
+      str = "GENERATE_ASYNC_VECTOR_INDEX_BASELINE";
+      break;
+    case ObDDLTaskStatus::WAIT_ASYNC_VECTOR_INDEX_BASELINE:
+      str = "WAIT_ASYNC_VECTOR_INDEX_BASELINE";
       break;
     case ObDDLTaskStatus::FAIL:
       str = "FAIL";
@@ -1589,7 +1597,8 @@ public:
       common::ObMySQLTransaction &trans,
       const ObTableSchema &data_table_schema,
       const ObTableSchema &index_table_schema,
-      const int64_t snapshot);
+      const int64_t snapshot,
+      const int64_t snapshot_schema_version);
   static int check_need_acquire_lob_snapshot(
       const ObTableSchema *data_table_schema,
       const ObTableSchema *index_table_schema,

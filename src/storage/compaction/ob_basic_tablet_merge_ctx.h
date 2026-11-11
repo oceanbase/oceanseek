@@ -155,6 +155,7 @@ public:
   bool is_ha_compeleted_; // only used for delete insert minor merge to control multi version row recycle logic, inited from tablet meta
   bool for_unittest_;
   bool is_inv_index_; // async inverted index merge: set by the inverted merge producer, drives INV_INDEX_SSTABLE table type
+  bool is_ivf_index_; // async IVF merge: drives IVF_INDEX_SSTABLE table type and metadata propagation
   ObFillTxType fill_tx_type_;
   ObMergeLevel merge_level_; // TODO: keep it for minor/mini merge now
   ObAdaptiveMergePolicy::AdaptiveMergeReason merge_reason_;
@@ -370,6 +371,7 @@ public:
   OB_INLINE bool is_build_all_cg_only() const { return static_param_.is_build_all_cg_only(); }
   OB_INLINE bool only_use_row_store() const { return static_param_.only_use_row_store(); }
   OB_INLINE bool is_inv_index_merge() const { return static_param_.is_inv_index_; }
+  OB_INLINE bool is_ivf_index_merge() const { return static_param_.is_ivf_index_; }
   int get_storage_schema(ObStorageSchema *&schema);
   
   /* SS ONLY */

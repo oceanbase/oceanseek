@@ -43,6 +43,8 @@ namespace storage
 struct ObStoreRowLockState;
 struct ObStoreCtx;
 class ObDDLRedoLog;
+class ObDDLIncStartLog;
+class ObDDLIncCommitLog;
 }
 
 namespace transaction

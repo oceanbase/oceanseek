@@ -248,6 +248,7 @@ int ObDDLRedoLogReplayer::replay_inc_commit(
                                              data_format_version,
                                              is_rollback,
                                              log.is_co_sstable(),
+                                             log.get_table_type(),
                                              log.get_data_inc_major_buffer(),
                                              start_scn,
                                              log.need_check_ddl_checkpoint()))) {
@@ -262,6 +263,7 @@ int ObDDLRedoLogReplayer::replay_inc_commit(
                                                     data_format_version,
                                                     is_rollback,
                                                     false/*LOB inc major 固定为行存*/,
+                                                    ObITable::TableType::INC_MAJOR_SSTABLE,
                                                     log.get_lob_meta_inc_major_buffer(),
                                                     start_scn,
                                                     log.need_check_ddl_checkpoint()))) {
@@ -276,6 +278,7 @@ int ObDDLRedoLogReplayer::replay_inc_commit(
                                                     data_format_version,
                                                     is_rollback,
                                                     false/*is_co_sstable, lob inc major is always row store*/,
+                                                    ObITable::TableType::INC_MAJOR_SSTABLE,
                                                     log.get_lob_piece_inc_major_buffer(),
                                                     start_scn,
                                                     log.need_check_ddl_checkpoint()))) {
@@ -378,6 +381,7 @@ int ObDDLRedoLogReplayer::do_replay_inc_major_commit(
     const uint64_t data_format_version,
     const bool is_rollback,
     const bool is_co_sstable,
+    const ObITable::TableType table_type,
     const ObString &inc_major_buffer,
     const share::SCN &start_scn,
     const bool need_check_ddl_checkpoint)
@@ -393,12 +397,13 @@ int ObDDLRedoLogReplayer::do_replay_inc_major_commit(
                                    data_format_version,
                                    is_rollback,
                                    is_co_sstable,
+                                   table_type,
                                    inc_major_buffer,
                                    start_scn,
                                    need_check_ddl_checkpoint))) {
     STORAGE_LOG(WARN, "failed to init ddl inc major commit log replay executor", KR(ret),
                 K(tablet_id), K(scn), K(trans_id), K(seq_no), K(snapshot_version),
-                K(data_format_version), K(is_rollback), K(is_co_sstable), K(start_scn));
+                K(data_format_version), K(is_rollback), K(is_co_sstable), K(table_type), K(start_scn));
   } else if (OB_FAIL(replay_executor.execute(scn, ls_->get_ls_id(), tablet_id))) {
     if (OB_TABLET_NOT_EXIST == ret || OB_NO_NEED_UPDATE == ret) {
       FLOG_INFO("no need to replay ddl inc major commit log", KR(ret));

@@ -22,6 +22,7 @@
 #include "lib/atomic/ob_atomic.h"
 #include "ob_vector_kmeans_ctx.h"
 #include "share/vector_index/ob_vector_index_ivf_cache_mgr.h"
+#include "share/vector_index/disk_bbq_cache/ob_ivf_sstable_cache_controller.h"
 #include "lib/hash/ob_hashset.h"
 #include "share/vector_index/ob_vec_logic_table_util.h"
 #include "share/vector_index/spfresh/ob_spfresh_task_queue.h"
@@ -99,6 +100,7 @@ public:
       ls_id_(),
       vec_adaptor_map_(),
       ivf_index_helper_map_(),
+      ivf_hgraph_pending_set_(),
       adapter_map_rwlock_(ObLatchIds::VECTOR_ADAPTER_MAP_LOCK),
       ivf_cache_mgr_map_rwlock_(ObLatchIds::VECTOR_IVF_CACHE_LOCK),
       maintenance_lock_(ObLatchIds::OB_PLUGIN_VECTOR_INDEX_MGR_LOCK),
@@ -251,10 +253,28 @@ public:
   int erase_ivf_build_helper(const ObIvfHelperKey &key, bool *fully_cleared = nullptr);
   int release_ivf_cache_mgr(ObIvfCacheMgr* &mgr); 
   int set_ivf_cache_mgr(const ObIvfCacheMgrKey& cachr_mgr_key,
-                        ObIvfCacheMgr *cache_mgr,
-                        int overwrite = 0);
+                        ObIvfCacheMgr *cache_mgr);
   int get_ivf_cache_mgr(const ObIvfCacheMgrKey& cachr_mgr_key, ObIvfCacheMgr *&cache_mgr);
-  int erase_ivf_cache_mgr(const ObIvfCacheMgrKey& cachr_mgr_key);
+  int erase_ivf_cache_mgr(const ObIvfCacheMgrKey &cache_mgr_key);
+  // registered_hold is the detached entry's charge, not necessarily reclaimed memory.
+  int try_erase_sstable_cache_mgr(const ObIvfCacheMgrKey &cache_mgr_key,
+                                  ObIvfCacheMgr *expected_mgr,
+                                  ObIvfSSTableCentCache *expected_cache,
+                                  int64_t expected_last_access_ts,
+                                  bool failed_build,
+                                  bool &erased,
+                                  uint64_t &registered_hold);
+  int try_publish_sstable_cache(const ObIvfCacheMgrKey &cache_mgr_key,
+                                ObIvfCacheMgr *expected_mgr,
+                                ObIvfSSTableCentCache *cache,
+                                uint64_t hold,
+                                bool &published);
+  int enqueue_ivf_sstable_hgraph_build(const ObIvfCacheMgrKey &cache_mgr_key);
+  // Ignore pending-marker completions for a cache replaced under the same key.
+  int try_erase_ivf_sstable_hgraph_pending(const ObIvfCacheMgrKey &cache_mgr_key,
+                                         ObIvfCacheMgr *expected_mgr,
+                                         ObIvfSSTableCentCache *expected_cache);
+  bool has_ivf_sstable_hgraph_pending(const ObIvfCacheMgrKey &cache_mgr_key) const;
   int get_ivf_cache_mgr_guard(const ObIvfCacheMgrKey& cachr_mgr_key, ObIvfCacheMgrGuard &cache_mgr_guard);
   int mark_namespace_cache_deleted(const common::ObTabletID &tablet_id,
                                    int64_t namespace_id);
@@ -338,6 +358,8 @@ public:
 
 private:
   // non-thread save inner functions
+  // Caller holds the cache-map lock, preventing a replacement from enqueueing.
+  int erase_ivf_sstable_hgraph_pending_(const ObIvfCacheMgrKey &cache_mgr_key);
   int get_adapter_inst_(ObTabletID tablet_id, ObPluginVectorIndexAdaptor *&index_inst);
   int set_vec_adaptor_(ObTabletID tablet_id, ObPluginVectorIndexAdaptor *adapter_inst);
   int attach_adapter_in_lock_(ObPluginVectorIndexAdaptor *adapter_inst, bool &attached);
@@ -369,6 +391,7 @@ private:
   VectorIndexAdaptorMap vec_adaptor_map_; // ls-local attached view keyed by inc_tablet_id
   IvfVectorIndexHelperMap ivf_index_helper_map_; // map of ivf inder build helper
   IvfCacheMgrMap ivf_cache_mgr_map_; // map of ivf cache managers
+  common::hash::ObHashSet<ObIvfCacheMgrKey> ivf_hgraph_pending_set_;
   TCRWLock adapter_map_rwlock_; // lock for adapter maps
   TCRWLock ivf_cache_mgr_map_rwlock_;  // protects iteration/size and manager insertion/erase
   HotNsIdsMap hot_ns_ids_;  // tablet_id -> hot namespace ids, filled by add_hot_ns_ids / warmup (design Ch.4)
@@ -439,6 +462,7 @@ public:
     sql_proxy_(NULL),
     memory_context_(NULL),
     all_vsag_use_mem_(NULL),
+    ivf_sstable_cache_controller_(),
     ai_service_init_lock_(common::ObLatchIds::OB_EMBEDDING_TASK_HANDLER_SPIN_LOCK),
     kmeans_tg_id_(OB_INVALID_TG_ID),
     embedding_tg_id_(OB_INVALID_TG_ID)
@@ -637,6 +661,29 @@ public:
                                   const int64_t expected_role_epoch);
   lib::MemoryContext &get_memory_context() { return memory_context_; }
   uint64_t *get_all_vsag_use_mem() { return all_vsag_use_mem_; }
+  ObIvfSSTableCacheController &get_ivf_sstable_cache_controller()
+  {
+    return ivf_sstable_cache_controller_;
+  }
+  int enqueue_ivf_sstable_hgraph_build(
+      ObLSID ls_id, const ObIvfCacheMgrKey &cache_mgr_key);
+  int try_publish_ivf_sstable_cache(
+      ObLSID ls_id,
+      const ObIvfCacheMgrKey &cache_mgr_key,
+      ObIvfCacheMgr *expected_mgr,
+      ObIvfSSTableCentCache *cache,
+      uint64_t hold,
+      bool &published);
+  int try_erase_ivf_sstable_cache(
+      ObLSID ls_id,
+      const ObIvfCacheMgrKey &cache_mgr_key,
+      ObIvfCacheMgr *expected_mgr,
+      ObIvfSSTableCentCache *expected_cache,
+      int64_t expected_last_access_ts,
+      bool failed_build,
+      bool &erased,
+      uint64_t &registered_hold);
+  int run_ivf_sstable_cache_maintenance();
 
   int start_kmeans_tg();
 
@@ -671,9 +718,7 @@ private:
                                 ObExprVecIvfCenterIdCache *expr_cache,
                                 int64_t m);
   int process_centroid_cache(ObIvfICache *cent_cache,
-                            ObIArray<float*> &aux_info,
-                            ObExprVecIvfCenterIdCache *expr_cache,
-                            ObIAllocator &allocator);
+                            ObIArray<float*> &aux_info);
   // startup warmup helpers
   // Collect the partition names of `table_schema` whose tablets live on the target LS.
   // Pure in-memory computation (tablet -> location cache -> partition name), no SQL.
@@ -702,7 +747,7 @@ private:
   // mismatches are reconciled asynchronously by adapter maintenance.
   VectorIndexAdaptorMap tenant_adaptor_map_;
   LSIndexMgrMap index_ls_mgr_map_;
-  TCRWLock ls_mgr_map_rwlock_; // protects concurrent iteration vs erase on index_ls_mgr_map_
+  TCRWLock ls_mgr_map_rwlock_; // protects index_ls_mgr_map_ iteration, publish and erase
   bool is_ls_or_tablet_changed_;
 
   share::schema::ObMultiVersionSchemaService *schema_service_;
@@ -716,6 +761,7 @@ private:
   // use wrapped memory context in ob_tenant_vector_allocator.h and init by this memory context
   lib::MemoryContext memory_context_;
   uint64_t *all_vsag_use_mem_;
+  ObIvfSSTableCacheController ivf_sstable_cache_controller_;
   ObVecIdxAsyncTaskScheduler vec_idx_async_task_sched_;
   ObVecIndexPriorityQueueManager vec_index_priority_queue_manager_;
   ObVecIndexAsyncTaskHandler vec_async_task_handle_;

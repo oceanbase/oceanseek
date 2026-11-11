@@ -1023,7 +1023,7 @@ int ObHybridSearchCgService::normalize_async_knn_filter_domains_(
         && root_ctdef->children_cnt_ > 1
         && OB_NOT_NULL(root_ctdef->children_)
         && OB_NOT_NULL(root_ctdef->children_[1])
-        && ObDASAsyncIndexQueryCtx::contains_async_index_query(
+        && ObDASAsyncIndexQueryCtx::contains_shared_async_index_query(
                root_ctdef->children_[1])) {
       ObDASBaseCtDef *filter_ctdef = root_ctdef->children_[1];
       ObDASAsyncIndexExecMode filter_exec_mode = ASYNC_INDEX_EXEC_LEGACY;

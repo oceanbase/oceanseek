@@ -4,6 +4,7 @@
  */
 
 #include "storage/tx/ob_tx_log.h"
+#include "storage/ddl/ob_ddl_inc_clog.h"
 #include "storage/memtable/ob_memtable_mutator.h"
 
 namespace oceanbase

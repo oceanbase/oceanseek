@@ -8,6 +8,7 @@
 #include "ob_table_store_util.h"
 #include "storage/blocksstable/ob_sstable.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable.h"
 #include "storage/ddl/ob_tablet_ddl_kv.h"
 
 
@@ -100,7 +101,7 @@ int ObSSTableArray::init(ObArenaAllocator &allocator, const blocksstable::ObSSTa
   } else if (OB_UNLIKELY(!sstable->is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("try to init sstable array with an unserialized sstable", K(ret), KPC(sstable));
-  } else if (OB_UNLIKELY(sstable->is_co_sstable() && sstable->is_inv_sstable())) {
+  } else if (OB_UNLIKELY(sstable->is_co_sstable() && (sstable->is_inv_sstable() || sstable->is_ivf_sstable()))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected sstable type", K(ret), KPC(sstable));
   } else {
@@ -116,6 +117,8 @@ int ObSSTableArray::init(ObArenaAllocator &allocator, const blocksstable::ObSSTa
         serialize_table_type_ = ObSerializeTableType::CO;
       } else if (sstable->is_inv_sstable()) {
         serialize_table_type_ = ObSerializeTableType::INV;
+      } else if (sstable->is_ivf_sstable()) {
+        serialize_table_type_ = ObSerializeTableType::IVF;
       } else {
         serialize_table_type_ = ObSerializeTableType::NORMAL;
       }
@@ -287,6 +290,7 @@ int ObSSTableArray::inner_init(
     }
     bool has_co = false;
     bool has_inv = false;
+    bool has_ivf = false;
     int64_t i = start_pos;
     for (; OB_SUCC(ret) && i < start_pos + count; ++i) {
       ObITable *table = tables.at(i);
@@ -296,17 +300,20 @@ int ObSSTableArray::inner_init(
       } else if (OB_UNLIKELY(!table->is_sstable() && !table->is_ddl_mem_sstable())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected table type", K(ret), KPC(table));
-      } else if (OB_UNLIKELY(table->is_co_sstable() && table->is_inv_sstable())) {
+      } else if (OB_UNLIKELY(table->is_co_sstable() && (table->is_inv_sstable() || table->is_ivf_sstable()))) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected table type", K(ret), KPC(table));
-      } else if (OB_UNLIKELY((has_co && table->is_inv_sstable()) || (has_inv && table->is_co_sstable()))) {
+      } else if (OB_UNLIKELY((has_co && (table->is_inv_sstable() || table->is_ivf_sstable()))
+          || (has_inv && (table->is_co_sstable() || table->is_ivf_sstable()))
+          || (has_ivf && (table->is_co_sstable() || table->is_inv_sstable())))) {
         ret = OB_ERR_UNEXPECTED;
-        LOG_WARN("unexpected mixed sstable types", K(ret), K(has_co), K(has_inv), KPC(table));
+        LOG_WARN("unexpected mixed sstable types", K(ret), K(has_co), K(has_inv), K(has_ivf), KPC(table));
       } else if (OB_FAIL(static_cast<ObSSTable *>(table)->deep_copy(allocator, sstable_array_[i - start_pos]))) {
         LOG_WARN("fail to copy sstable", K(ret), KPC(static_cast<ObSSTable *>(table)));
       } else {
         has_co = has_co || table->is_co_sstable();
         has_inv = has_inv || table->is_inv_sstable();
+        has_ivf = has_ivf || table->is_ivf_sstable();
       }
     }
     if (OB_SUCC(ret)) {
@@ -314,6 +321,8 @@ int ObSSTableArray::inner_init(
         serialize_table_type_ = ObSerializeTableType::CO;
       } else if (has_inv) {
         serialize_table_type_ = ObSerializeTableType::INV;
+      } else if (has_ivf) {
+        serialize_table_type_ = ObSerializeTableType::IVF;
       } else {
         serialize_table_type_ = ObSerializeTableType::NORMAL;
       }
@@ -346,7 +355,8 @@ int64_t ObSSTableArray::get_serialize_size(const uint64_t data_version) const
     for (int64_t i = 0; OB_SUCC(ret) && i < cnt_; ++i) {
       ObSSTable *sstable = sstable_array_[i];
       if (OB_ISNULL(sstable) ||
-          OB_UNLIKELY((sstable->is_co_sstable() || sstable->is_inv_sstable()) && !sstable->get_addr().is_valid())) {
+          OB_UNLIKELY((sstable->is_co_sstable() || sstable->is_inv_sstable()
+              || sstable->is_ivf_sstable()) && !sstable->get_addr().is_valid())) {
         len = 0;
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected invalid sstable", K(ret), KPC(sstable));
@@ -377,14 +387,17 @@ int ObSSTableArray::serialize(const uint64_t data_version, char *buf, const int6
   } else {
     for (int64_t i = 0; OB_SUCC(ret) && i < cnt_; ++i) {
       ObSSTable *sstable = sstable_array_[i];
-      if (OB_ISNULL(sstable) || OB_UNLIKELY((sstable->is_co_sstable() || sstable->is_inv_sstable()) && !sstable->get_addr().is_valid())) {
+      if (OB_ISNULL(sstable)
+          || OB_UNLIKELY((sstable->is_co_sstable() || sstable->is_inv_sstable()
+              || sstable->is_ivf_sstable()) && !sstable->get_addr().is_valid())) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected invalid sstable address", K(ret), KPC(sstable));
       } else {
         if (ObSerializeTableType::NORMAL != serialize_table_type_) {
           int8_t table_type_tag = static_cast<int8_t>(
-              sstable->is_inv_sstable() ? ObSerializeTableType::INV :
-              (sstable->is_co_sstable() ? ObSerializeTableType::CO : ObSerializeTableType::NORMAL));
+              sstable->is_ivf_sstable() ? ObSerializeTableType::IVF :
+              (sstable->is_inv_sstable() ? ObSerializeTableType::INV :
+              (sstable->is_co_sstable() ? ObSerializeTableType::CO : ObSerializeTableType::NORMAL)));
           if (OB_FAIL(serialization::encode_i8(buf, buf_len, pos, table_type_tag))) {
             LOG_WARN("fail to encode table type tag", K(ret), K(buf_len), K(pos), K(table_type_tag));
           }
@@ -486,6 +499,10 @@ int ObSSTableArray::inner_deserialize_tables(
         } else if (ObSerializeTableType::NORMAL == table_type) {
           if (OB_FAIL(deserialize_table(allocator, buf, data_len, pos, sstable_array_[i]))) {
             LOG_WARN("fail to deserialize_table", K(ret), K(i), KP(buf), K(data_len), K(pos));
+          }
+        } else if (ObSerializeTableType::IVF == table_type) {
+          if (OB_FAIL(deserialize_table<ObIvfSSTable>(allocator, buf, data_len, pos, sstable_array_[i]))) {
+            LOG_WARN("fail to deserialize ivf sstable", K(ret), K(i), KP(buf), K(data_len), K(pos));
           }
         } else {
           ret = OB_ERR_UNEXPECTED;

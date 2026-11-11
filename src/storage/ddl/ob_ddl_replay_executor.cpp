@@ -17,6 +17,7 @@
 #include "storage/compaction_v2/ob_ss_compact_helper.h"
 #include "storage/ddl/ob_ss_ddl_util.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable.h"
 #include "storage/incremental/ob_shared_meta_service.h"
 #include "share/scheduler/ob_partition_auto_split_helper.h"
 #endif
@@ -1883,6 +1884,7 @@ ObDDLIncMajorCommitReplayExecutor::ObDDLIncMajorCommitReplayExecutor()
     tablet_id_(),
     is_rollback_(false),
     is_co_sstable_(false),
+    table_type_(ObITable::TableType::MAX_TABLE_TYPE),
     inc_major_buffer_(nullptr),
     need_check_ddl_checkpoint_(false)
 {
@@ -1898,6 +1900,7 @@ int ObDDLIncMajorCommitReplayExecutor::init(
     const uint64_t data_format_version,
     const bool is_rollback,
     const bool is_co_sstable,
+    const ObITable::TableType table_type,
     const ObString &inc_major_buffer,
     const share::SCN &start_scn,
     const bool need_check_ddl_checkpoint)
@@ -1927,6 +1930,7 @@ int ObDDLIncMajorCommitReplayExecutor::init(
     data_format_version_ = data_format_version;
     is_rollback_ = is_rollback;
     is_co_sstable_ = is_co_sstable;
+    table_type_ = table_type;
     inc_major_buffer_ = inc_major_buffer;
     start_scn_ = start_scn;
     need_check_ddl_checkpoint_ = need_check_ddl_checkpoint;
@@ -1950,18 +1954,22 @@ int ObDDLIncMajorCommitReplayExecutor::deserialize_and_update_ss_inc_major(
     ObSSTable sstable;
     ObCOSSTableV2 co_sstable;
     ObInvSSTable inv_sstable;
+    ObIvfSSTable ivf_sstable;
     ObSSTable *inc_major_ptr = &sstable;
     bool can_skip_shared_add = false;
     ObStorageSchema *storage_schema = nullptr;
     if (is_co_sstable_) {
       inc_major_ptr = &co_sstable;
-    } else if (tablet_handle.get_obj()->is_async_inverted_storage_index()) {
+    } else if (ObITable::is_ivf_sstable(table_type_)) {
+      inc_major_ptr = &ivf_sstable;
+    } else if (tablet_handle.get_obj()->is_async_index_storage_tablet()) {
       inc_major_ptr = &inv_sstable;
     }
     if (OB_FAIL(ObIncDDLMergeTaskUtils::deserialize_inc_major_from_string(allocator,
                                                                           inc_major_buffer_,
                                                                           inc_major_ptr))) {
-      LOG_WARN("fail to deserialize inc major from string", KR(ret), K(is_co_sstable_));
+      LOG_WARN("fail to deserialize inc major from string", KR(ret), K_(is_co_sstable),
+               K_(table_type), K_(tablet_id), K_(scn), K_(trans_id), K_(seq_no));
     } else if (inc_major_ptr->is_empty()
                && (need_check_ddl_checkpoint_
                    || tablet_handle.get_obj()->is_async_index_refresh_target()

@@ -240,6 +240,10 @@ int ObDASVecIndexIVFBaseScanIter::inner_init(ObDASIterParam &param)
 
       // get nprobes: stmt-level > session-level > default
       if (OB_FAIL(ret)) {
+      } else if (vec_index_scan_ctdef_->query_param_.is_set_ivf_nprobes_
+          && 0 == vec_index_scan_ctdef_->query_param_.ivf_nprobes_) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("automatic nprobes is only supported for DiskBBQ", K(ret));
       } else if (vec_index_scan_ctdef_->query_param_.is_set_ivf_nprobes_) {
         nprobes_ = vec_index_scan_ctdef_->query_param_.ivf_nprobes_;
       } else if (OB_NOT_NULL(vec_index_scan_rtdef_) && OB_NOT_NULL(vec_index_scan_rtdef_->eval_ctx_)) {
@@ -3883,6 +3887,7 @@ int ObDASVecIndexIVFPQScanIter::try_write_pq_precompute_table_cache(
     } else {
       if (is_pq_cent_cache_usable && is_ivf_cent_cache_usable) {
         ObArenaAllocator tmp_allocator;
+        share::ObVsagSearchAlloc hgraph_allocator(MTL_ID());
         int64_t ksub = 1L << nbits_;
         int64_t sub_dim = dim_ / m_;
         float *ivf_centers = nullptr;
@@ -3890,14 +3895,15 @@ int ObDASVecIndexIVFPQScanIter::try_write_pq_precompute_table_cache(
         float *precompute_table = cent_cache.get_centroids();
         float *r_norms = (float *)tmp_allocator.alloc(sizeof(float) * m_ * ksub);
         if (ivf_cent_cache->has_hgraph_index()) {
-          if (OB_FAIL(ivf_cent_cache->get_centroids(&tmp_allocator, &ivf_centers))) {
+          if (OB_FAIL(ivf_cent_cache->get_centroids_from_hgraph(&hgraph_allocator, &ivf_centers))) {
             LOG_WARN("fail to get ivf centers", K(ret));
           }
         } else {
           ivf_centers = ivf_cent_cache->get_centroids();
         }
 
-        if (OB_ISNULL(r_norms)) {
+        if (OB_FAIL(ret)) {
+        } else if (OB_ISNULL(r_norms)) {
           ret = OB_ALLOCATE_MEMORY_FAILED;
           LOG_WARN("fail to alloc norms", K(ret), K(m_), K(ksub));
         } else {

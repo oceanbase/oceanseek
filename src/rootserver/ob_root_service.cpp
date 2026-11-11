@@ -4105,7 +4105,7 @@ int ObRootService::parallel_create_index(const ObCreateIndexArg &arg, obrpc::ObA
   } else if (data_version < DATA_VERSION_4_2_2_0
             || (data_version >= DATA_VERSION_4_3_0_0 && data_version < DATA_VERSION_4_3_5_0)
             || share::schema::is_fts_or_multivalue_index(arg.index_type_)
-            || share::schema::is_async_fts_index(arg.index_type_)
+            || share::schema::is_user_defined_async_index(arg.index_type_)
             || share::schema::is_vec_index(arg.index_type_)) {
     ret = OB_NOT_SUPPORTED;
     LOG_WARN("not supported", KR(ret), K(data_version), K(arg.index_type_));

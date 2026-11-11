@@ -22,6 +22,7 @@
 #include "storage/compaction/ob_uncommit_tx_info.h"
 #include "storage/compaction/ob_partition_merge_policy.h"
 #include "storage/ddl/ob_ddl_merge_schedule.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable.h"
 
 using namespace oceanbase::observer;
 using namespace oceanbase::share::schema;
@@ -1436,6 +1437,10 @@ int ObTabletDDLUtil::create_ddl_sstable(
     } else if (ddl_param.table_key_.is_co_sstable()) {
       if (OB_FAIL(ObTabletCreateDeleteHelper::create_sstable<ObCOSSTableV2>(param, allocator, sstable_handle))) {
         LOG_WARN("create sstable failed", K(ret), K(param));
+      }
+    } else if (ddl_param.table_key_.is_ivf_sstable()) {
+      if (OB_FAIL(ObTabletCreateDeleteHelper::create_sstable<ObIvfSSTable>(param, allocator, sstable_handle))) {
+        LOG_WARN("create ivf sstable failed", K(ret), K(param));
       }
     } else {
       if (OB_FAIL(ObTabletCreateDeleteHelper::create_sstable<ObSSTable>(param, allocator, sstable_handle))) {

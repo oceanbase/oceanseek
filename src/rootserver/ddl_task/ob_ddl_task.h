@@ -785,6 +785,16 @@ public:
   virtual const TraceId &get_trace_id() const { return trace_id_; }
   virtual int set_trace_id(const TraceId &trace_id) { return trace_id_.set(trace_id.get()); }
   virtual bool need_retry() const { return need_retry_; };
+  // Only paths with independently owned background cleanup may use this rule.
+  // Callers must also establish that FAIL cannot recover to SUCCESS; this
+  // predicate alone only checks the persisted state and executor retry policy.
+  static bool can_report_terminal_failure_before_cleanup(const ObDDLTaskRecord &record)
+  {
+    return share::ObDDLTaskStatus::FAIL == record.task_status_
+        && record.ret_code_ < common::OB_SUCCESS
+        && record.ret_code_ >= INT_MIN
+        && !share::ObIDDLTask::in_ddl_retry_white_list(static_cast<int>(record.ret_code_));
+  }
   share::ObDDLType get_task_type() const { return task_type_; }
   void set_not_running() { ATOMIC_SET(&is_running_, false); }
   void set_task_status(const share::ObDDLTaskStatus new_status) {task_status_ = new_status; }
@@ -900,6 +910,10 @@ public:
   static const int64_t DEFAULT_TASK_IDLE_TIME_US = 10L * 1000L; // 10ms
 protected:
   int copy_longops_stat(share::ObLongopsValue &value);
+  int wait_drop_index_task_finish(
+      const int64_t drop_index_task_id,
+      bool &is_finish,
+      bool &need_resubmit);
   // 检查任务取消和状态变化后，为异步索引刷新安排延迟重试。
   int retry_async_index_refresh(const int refresh_ret);
   virtual bool is_error_need_retry(const int ret_code)

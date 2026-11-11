@@ -25,6 +25,8 @@ namespace oceanbase
 namespace share
 {
 
+const int64_t ObVectorIndexSnapMetaHeader::HEAD_LEN;
+
 int64_t ObVectorIndexSegment::instacnce_cnt_ = 0;
 int64_t ObVecIdxActiveData::instacnce_cnt_ = 0;
 int64_t ObVecIdxVBitmapData::instacnce_cnt_ = 0;

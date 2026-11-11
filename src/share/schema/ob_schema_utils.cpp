@@ -128,6 +128,12 @@ int ObSchemaUtils::cascaded_generated_column(ObTableSchema &table_schema,
         column.add_column_flag(GENERATED_VEC_VID_COLUMN_FLAG);
       } else if (T_FUN_SYS_VEC_TYPE == root_expr_type) {
         column.add_column_flag(GENERATED_VEC_TYPE_COLUMN_FLAG);
+      } else if (T_FUN_SYS_VEC_IVF_TYPE == root_expr_type) {
+        column.add_column_flag(GENERATED_VEC_IVF_TYPE_COLUMN_FLAG);
+      } else if (T_FUN_SYS_VEC_IVF_CID == root_expr_type) {
+        column.add_column_flag(GENERATED_VEC_IVF_CID_COLUMN_FLAG);
+      } else if (T_FUN_SYS_VEC_IVF_DATA == root_expr_type) {
+        column.add_column_flag(GENERATED_VEC_IVF_DATA_COLUMN_FLAG);
       } else if (T_FUN_SYS_VEC_VECTOR == root_expr_type) {
         column.add_column_flag(GENERATED_VEC_VECTOR_COLUMN_FLAG);
       } else if (T_FUN_SYS_EMBEDDED_VEC == root_expr_type) {
@@ -260,6 +266,9 @@ bool ObSchemaUtils::is_vec_index_column(const uint64_t flag)
       || is_vec_hnsw_key_column(flag)
       || is_vec_hnsw_data_column(flag)
       || is_vec_hnsw_visible_column(flag)
+      || is_vec_ivf_type_column(flag)
+      || is_vec_ivf_cid_column(flag)
+      || is_vec_ivf_data_column(flag)
       || is_vec_ivf_center_id_column(flag)
       || is_vec_ivf_center_vector_column(flag)
       || is_vec_ivf_data_vector_column(flag)
@@ -271,6 +280,21 @@ bool ObSchemaUtils::is_vec_index_column(const uint64_t flag)
       || is_vec_spiv_dim_column(flag)
       || is_vec_spiv_value_column(flag)
       || is_hybrid_vec_index_chunk_column(flag);
+}
+
+bool ObSchemaUtils::is_vec_ivf_type_column(const uint64_t flag)
+{
+  return flag & GENERATED_VEC_IVF_TYPE_COLUMN_FLAG;
+}
+
+bool ObSchemaUtils::is_vec_ivf_cid_column(const uint64_t flag)
+{
+  return flag & GENERATED_VEC_IVF_CID_COLUMN_FLAG;
+}
+
+bool ObSchemaUtils::is_vec_ivf_data_column(const uint64_t flag)
+{
+  return flag & GENERATED_VEC_IVF_DATA_COLUMN_FLAG;
 }
 
 bool ObSchemaUtils::is_vec_spiv_dim_column(const uint64_t flag)

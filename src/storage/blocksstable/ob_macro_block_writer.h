@@ -227,6 +227,8 @@ protected:
       ObIMacroBlockValidator *validator,
       ObIODevice *device_handle,
       blocksstable::ObMacroSeqGenerator *macro_seq_generator);
+  // The caller must hold concurrent_lock_.
+  int append_row_inner(const ObDatumRow &row, const ObMacroBlockDesc *curr_macro_desc);
 private:
   template <typename MicroBlockWriterType, typename... Args>
   static int inner_build_micro_writer(ObIAllocator &allocator,
@@ -248,7 +250,6 @@ private:
                            const bool need_fill_logic_id);
   int init_pre_warmer(const share::ObPreWarmerParam &pre_warm_param);
   int data_aggregator_eval(const ObBatchDatumRows &datum_rows, const int64_t start, const int64_t write_row_count);
-  int append_row_inner(const ObDatumRow &row, const ObMacroBlockDesc *curr_macro_desc);
   int append_row(const ObDatumRow &row, const int64_t split_size);
   int append_batch(const ObBatchDatumRows &datum_rows,
                    const int64_t split_size);

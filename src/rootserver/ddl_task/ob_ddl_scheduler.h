@@ -427,6 +427,20 @@ private:
       ObDDLTaskRecord &task_record,
       const int64_t snapshot_version = 0,
       const bool ddl_need_retry_at_executor = false);
+  int create_async_vector_index_build_task(
+      common::ObISQLClient &proxy,
+      const share::schema::ObTableSchema *data_table_schema,
+      const share::schema::ObTableSchema *index_schema,
+      const int64_t parallelism,
+      const int64_t parent_task_id,
+      const int64_t consumer_group_id,
+      const int32_t sub_task_trace_id,
+      const obrpc::ObCreateIndexArg *create_index_arg,
+      const uint64_t tenant_data_version,
+      ObIAllocator &allocator,
+      ObDDLTaskRecord &task_record,
+      const int64_t snapshot_version,
+      const bool ddl_need_retry_at_executor);
   int create_build_fts_index_task(
       common::ObISQLClient &proxy,
       const share::schema::ObTableSchema *data_table_schema,
@@ -580,6 +594,15 @@ private:
       const obrpc::ObDropIndexArg *drop_index_arg,
       ObIAllocator &allocator,
       ObDDLTaskRecord &task_record);
+  int create_drop_async_vector_index_task(
+      common::ObISQLClient &proxy,
+      const share::schema::ObTableSchema *index_schema,
+      const int64_t schema_version,
+      const int64_t consumer_group_id,
+      const share::schema::ObTableSchema *async_delete_schema,
+      const obrpc::ObDropIndexArg *drop_index_arg,
+      ObIAllocator &allocator,
+      ObDDLTaskRecord &task_record);
   
   int create_drop_vec_ivf_index_task(
       common::ObISQLClient &proxy,
@@ -686,6 +709,8 @@ int create_partition_split_task(
       const ObDDLTaskRecord &task_record);
   int schedule_build_index_task(
       const ObDDLTaskRecord &task_record);
+  int schedule_async_vector_index_build_task(
+      const ObDDLTaskRecord &task_record);
   int schedule_build_mview_task(const ObDDLTaskRecord &task_record);
   int schedule_drop_primary_key_task(const ObDDLTaskRecord &task_record);
   int schedule_table_redefinition_task(const ObDDLTaskRecord &task_record);
@@ -697,6 +722,7 @@ int create_partition_split_task(
   int schedule_drop_vec_index_task(const ObDDLTaskRecord &task_record);
   int schedule_rebuild_index_task(const ObDDLTaskRecord &task_record);
   int schedule_drop_fts_index_task(const ObDDLTaskRecord &task_record);
+  int schedule_drop_async_vector_index_task(const ObDDLTaskRecord &task_record);
   int schedule_drop_lob_task(const ObDDLTaskRecord &task_record);
   int schedule_drop_search_index_task(const ObDDLTaskRecord &task_record);
   int schedule_fork_table_task(const ObDDLTaskRecord &task_record);

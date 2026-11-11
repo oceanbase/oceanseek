@@ -77,7 +77,9 @@ public:
   bool is_drop_dense_vec_index_task(const obrpc::ObDropIndexArg &arg, const share::schema::ObTableSchema &index_schema);
   bool is_drop_with_docid_index_task(const obrpc::ObDropIndexArg &arg, const share::schema::ObTableSchema &index_schema);
   bool is_drop_search_index_task(const obrpc::ObDropIndexArg &arg, const share::schema::ObTableSchema &index_schema);
-  bool is_drop_async_fts_index_task(const obrpc::ObDropIndexArg &arg, const share::schema::ObTableSchema &index_schema);
+  bool is_drop_user_async_index_task(
+      const obrpc::ObDropIndexArg &arg,
+      const share::schema::ObTableSchema &index_schema);
   int check_drop_with_docid_indexs_ith_valid(
       const obrpc::ObDropIndexArg &arg, 
       const share::schema::ObTableSchema &index_schema, 
@@ -180,7 +182,7 @@ private:
       const int64_t def_index_ith,
       const int64_t data_index_ith,
       const int64_t async_delete_ith);
-  int submit_drop_async_fts_index_task_(
+  int submit_drop_user_async_index_task_(
       const obrpc::ObDropIndexArg &arg,
       const share::schema::ObTableSchema &data_schema,
       const share::schema::ObTableSchema &index_schema,
@@ -231,7 +233,7 @@ private:
       int64_t &def_index_ith,
       int64_t &data_index_ith,
       int64_t &async_delete_ith);
-  int recognize_async_fts_index_schemas(
+  int recognize_user_async_index_schemas(
       const common::ObIArray<share::schema::ObTableSchema> &index_schemas,
       int64_t &index_ith,
       int64_t &async_delete_ith);
@@ -261,12 +263,12 @@ private:
       const uint64_t data_table_id,
       share::schema::ObSchemaGetterGuard &schema_guard,
       bool &has_none_share_vector_index);
-  int check_has_none_shared_index_tables_for_async_index_(
+  int check_has_none_shared_index_tables_for_user_async_index_(
       const uint64_t tenant_id,
       const uint64_t data_table_id,
-      const uint64_t dropping_async_index_table_id,
+      const uint64_t dropping_user_async_table_id,
       share::schema::ObSchemaGetterGuard &schema_guard,
-      bool &has_async_index);
+      bool &has_user_async_index);
   bool ignore_error_code_for_domain_index(
       const int ret,
       const obrpc::ObDropIndexArg &arg,

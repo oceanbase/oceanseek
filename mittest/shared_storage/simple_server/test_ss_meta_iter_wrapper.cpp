@@ -9,6 +9,8 @@
 #define USING_LOG_PREFIX SHARE
 
 #include <gmock/gmock.h>
+#include <cstdlib>
+#include "lib/utility/ob_defer.h"
 
 #define protected public
 #define private public
@@ -38,6 +40,9 @@
 #include "storage/shared_storage/ob_file_helper.h"
 #include "unittest/storage/schema_utils.h"
 #include "unittest/storage/test_tablet_helper.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable.h"
+#include "storage/high_availability/ob_ss_physical_create_tablets_task.h"
+#include "storage/incremental/atomic_protocol/ob_sstable_atomic_protocol.h"
 #undef private
 #undef protected
 
@@ -2788,6 +2793,7 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
   const ObTabletID cur_tablet_id(tablet_id);
   int64_t minor_op_id = -1;
   int64_t inc_major_op_id = -1;
+  int64_t non_idem_major_op_id = -1;
 
   // mini 的 data 与 meta 宏块。
   MacroBlockId mini_data_macro_id;
@@ -2801,7 +2807,8 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
   ASSERT_EQ(6, mini_data_macro_id.seq_id());
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, mini_data_macro_id, minor_op_id, inc_major_op_id));
+          cur_tablet_id, mini_data_macro_id, minor_op_id, inc_major_op_id,
+          non_idem_major_op_id));
   ASSERT_EQ(17, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
 
@@ -2814,7 +2821,8 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           mini_meta_macro_id));
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, mini_meta_macro_id, minor_op_id, inc_major_op_id));
+          cur_tablet_id, mini_meta_macro_id, minor_op_id, inc_major_op_id,
+          non_idem_major_op_id));
   ASSERT_EQ(19, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
   // Tablet 与 SStable 是两个独立的 op 空间。
@@ -2830,7 +2838,8 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           minor_data_macro_id));
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, minor_data_macro_id, minor_op_id, inc_major_op_id));
+          cur_tablet_id, minor_data_macro_id, minor_op_id, inc_major_op_id,
+          non_idem_major_op_id));
   ASSERT_EQ(23, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
 
@@ -2843,7 +2852,8 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           minor_meta_macro_id));
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, minor_meta_macro_id, minor_op_id, inc_major_op_id));
+          cur_tablet_id, minor_meta_macro_id, minor_op_id, inc_major_op_id,
+          non_idem_major_op_id));
   ASSERT_EQ(25, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
 
@@ -2857,7 +2867,8 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           inc_major_compaction_data_macro_id));
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, inc_major_compaction_data_macro_id, minor_op_id, inc_major_op_id));
+          cur_tablet_id, inc_major_compaction_data_macro_id, minor_op_id, inc_major_op_id,
+          non_idem_major_op_id));
   ASSERT_EQ(-1, minor_op_id);
   ASSERT_EQ(27, inc_major_op_id);
 
@@ -2870,7 +2881,8 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           inc_major_compaction_meta_macro_id));
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, inc_major_compaction_meta_macro_id, minor_op_id, inc_major_op_id));
+          cur_tablet_id, inc_major_compaction_meta_macro_id, minor_op_id, inc_major_op_id,
+          non_idem_major_op_id));
   ASSERT_EQ(-1, minor_op_id);
   ASSERT_EQ(29, inc_major_op_id);
 
@@ -2884,7 +2896,8 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           inc_major_ddl_data_macro_id));
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, inc_major_ddl_data_macro_id, minor_op_id, inc_major_op_id));
+          cur_tablet_id, inc_major_ddl_data_macro_id, minor_op_id, inc_major_op_id,
+          non_idem_major_op_id));
   ASSERT_EQ(-1, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
 
@@ -2897,7 +2910,8 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           inc_major_ddl_meta_macro_id));
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, inc_major_ddl_meta_macro_id, minor_op_id, inc_major_op_id));
+          cur_tablet_id, inc_major_ddl_meta_macro_id, minor_op_id, inc_major_op_id,
+          non_idem_major_op_id));
   ASSERT_EQ(-1, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
 
@@ -2905,7 +2919,8 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
   // 的宏块列表里会混有 SHARED_MINI 宏块，取 op_id 时不能因类型不符而报错。
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, mini_data_macro_id, minor_op_id, inc_major_op_id));
+          cur_tablet_id, mini_data_macro_id, minor_op_id, inc_major_op_id,
+          non_idem_major_op_id));
   ASSERT_EQ(17, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
 
@@ -2920,16 +2935,213 @@ TEST_F(TestSSMetaIterWrapper, get_lock_row_op_ids_from_persisted_metadata)
           other_tablet_macro_id));
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, other_tablet_macro_id, minor_op_id, inc_major_op_id));
+          cur_tablet_id, other_tablet_macro_id, minor_op_id, inc_major_op_id,
+          non_idem_major_op_id));
   ASSERT_EQ(-1, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
 
   // 不使用两套 lock 的宏块（这里用 tablet sub meta 代表）同样跳过。
   ASSERT_EQ(OB_SUCCESS,
       ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
-          cur_tablet_id, table_store_macro_id, minor_op_id, inc_major_op_id));
+          cur_tablet_id, table_store_macro_id, minor_op_id, inc_major_op_id,
+          non_idem_major_op_id));
   ASSERT_EQ(-1, minor_op_id);
   ASSERT_EQ(-1, inc_major_op_id);
+}
+
+TEST_F(TestSSMetaIterWrapper, restore_major_macro_op_id)
+{
+  ASSERT_TRUE(ObITable::is_non_idem_major_sstable(ObITable::IVF_INDEX_SSTABLE));
+  ASSERT_FALSE(ObITable::is_non_idem_major_sstable(ObITable::MAJOR_SSTABLE));
+  ASSERT_FALSE(ObITable::is_non_idem_major_sstable(ObITable::INV_INDEX_SSTABLE));
+  ASSERT_FALSE(ObITable::is_non_idem_major_sstable(ObITable::INC_IVF_INDEX_SSTABLE));
+
+  using namespace tablet_macro_id_iter_helper;
+  const uint64_t tablet_id = REAL_TABLET_TEST_ID_BASE + 10;
+  const ObTabletID cur_tablet_id(tablet_id);
+  int64_t minor_op_id = -1;
+  int64_t inc_major_op_id = -1;
+  int64_t non_idem_major_op_id = -1;
+  // Ordinary Major snapshots are not op_ids, even when referenced by a scanned SSTable.
+  for (const auto type : {blocksstable::ObStorageObjectType::SHARED_MAJOR_DATA_MACRO,
+                         blocksstable::ObStorageObjectType::SHARED_MAJOR_META_MACRO}) {
+    MacroBlockId ordinary_id;
+    ASSERT_EQ(OB_SUCCESS, make_sstable_macro_id(tablet_id, type, 10000, 0, ordinary_id));
+    ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
+        cur_tablet_id, ordinary_id, minor_op_id, inc_major_op_id, non_idem_major_op_id));
+    EXPECT_EQ(-1, minor_op_id);
+    EXPECT_EQ(-1, inc_major_op_id);
+    EXPECT_EQ(-1, non_idem_major_op_id);
+  }
+  // 非幂等 Major 的数据和元数据宏块都参与 op_id 高水位恢复。
+  for (const auto type : {blocksstable::ObStorageObjectType::SHARED_NON_IDEM_MAJOR_DATA_MACRO,
+                          blocksstable::ObStorageObjectType::SHARED_NON_IDEM_MAJOR_META_MACRO}) {
+    for (const int64_t op_id : {0, 37, 91}) {
+      MacroBlockId major_id;
+      ASSERT_EQ(OB_SUCCESS, make_sstable_macro_id(tablet_id, type, op_id, 0, major_id));
+      ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
+          cur_tablet_id, major_id, minor_op_id, inc_major_op_id,
+          non_idem_major_op_id));
+      EXPECT_EQ(-1, minor_op_id);
+      EXPECT_EQ(-1, inc_major_op_id);
+      EXPECT_EQ(op_id, non_idem_major_op_id);
+      ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletLockRowHelper::get_sstable_macro_op_id_(
+          ObTabletID(tablet_id + 1), major_id, minor_op_id, inc_major_op_id,
+          non_idem_major_op_id));
+      EXPECT_EQ(-1, non_idem_major_op_id);
+    }
+  }
+
+}
+
+TEST_F(TestSSMetaIterWrapper, restore_major_op_id_accumulates_reused_macro_blocks)
+{
+  using namespace tablet_macro_id_iter_helper;
+  using namespace blocksstable;
+  const ObTabletID tablet_id(REAL_TABLET_TEST_ID_BASE + 10);
+  MacroBlockId ids[4];
+  ASSERT_EQ(OB_SUCCESS, make_sstable_macro_id(tablet_id.id(),
+      ObStorageObjectType::SHARED_NON_IDEM_MAJOR_META_MACRO, 7, 0, ids[0]));
+  ASSERT_EQ(OB_SUCCESS, make_sstable_macro_id(tablet_id.id(),
+      ObStorageObjectType::SHARED_NON_IDEM_MAJOR_DATA_MACRO, 91, 0, ids[1]));
+  ASSERT_EQ(OB_SUCCESS, make_sstable_macro_id(tablet_id.id(),
+      ObStorageObjectType::SHARED_NON_IDEM_MAJOR_DATA_MACRO, 3, 1, ids[2]));
+  ASSERT_EQ(OB_SUCCESS, make_sstable_macro_id(tablet_id.id() + 1,
+      ObStorageObjectType::SHARED_NON_IDEM_MAJOR_DATA_MACRO, 999, 0, ids[3]));
+  int64_t minor = -1;
+  int64_t inc_major = -1;
+  int64_t non_idem_major = -1;
+  ObMacroIdIterator other_iter;
+  ASSERT_EQ(OB_SUCCESS, other_iter.init(ids, 1, ObMacroIdIterator::Type::OTHER_BLOCK));
+  ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletLockRowHelper::accumulate_sstable_macro_op_id_(
+      tablet_id, other_iter, minor, inc_major, non_idem_major));
+  ASSERT_EQ(7, non_idem_major);
+  ObMacroIdIterator data_iter;
+  ASSERT_EQ(OB_SUCCESS, data_iter.init(ids + 1, 3, ObMacroIdIterator::Type::DATA_BLOCK));
+  ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletLockRowHelper::accumulate_sstable_macro_op_id_(
+      tablet_id, data_iter, minor, inc_major, non_idem_major));
+  EXPECT_EQ(91, non_idem_major);
+  EXPECT_EQ(-1, minor);
+  EXPECT_EQ(-1, inc_major);
+}
+
+TEST_F(TestSSMetaIterWrapper, restore_ivf_lock_row_and_allocate_next_attempt)
+{
+  using namespace tablet_macro_id_iter_helper;
+  using namespace blocksstable;
+  ObTenantSwitchGuard tenant_guard;
+  ASSERT_EQ(OB_SUCCESS, tenant_guard.switch_to(OB_SYS_TENANT_ID));
+  const ObLSID ls_id(ObLSID::SYS_LS_ID);
+  const ObTabletID tablet_id(REAL_TABLET_TEST_ID_BASE + 20);
+  ObLSHandle ls_handle;
+  ASSERT_EQ(OB_SUCCESS, MTL(ObLSService *)->get_ls(ls_id, ls_handle, ObLSGetMod::STORAGE_MOD));
+  schema::ObTableSchema schema;
+  TestSchemaUtils::prepare_data_schema(schema);
+  ObArenaAllocator allocator;
+  ObTabletHandle tablet_handle;
+  ASSERT_EQ(OB_SUCCESS, TestTabletHelper::create_tablet(ls_handle, tablet_id, schema,
+      allocator, ObTabletStatus::NORMAL, SCN::min_scn(), tablet_handle));
+  DEFER(EXPECT_EQ(OB_SUCCESS, TestTabletHelper::remove_tablet(ls_handle, tablet_id)));
+  ObTablet &tablet = *tablet_handle.get_obj();
+
+  // Keep metadata in memory: exercise the real scan without object IO or background scheduling.
+  ObSSTableMeta ivf_meta;
+  ObSSTableMeta ordinary_meta;
+  ObIvfSSTable ivf;
+  ObSSTable ordinary;
+  ObTabletTableStore table_store;
+  MacroBlockId other_id;
+  MacroBlockId ordinary_id;
+  MacroBlockId data_ids[2];
+  ASSERT_EQ(OB_SUCCESS, make_sstable_macro_id(tablet_id.id(),
+      ObStorageObjectType::SHARED_NON_IDEM_MAJOR_META_MACRO, 7, 0, other_id));
+  ASSERT_EQ(OB_SUCCESS, make_sstable_macro_id(tablet_id.id(),
+      ObStorageObjectType::SHARED_NON_IDEM_MAJOR_DATA_MACRO, 91, 0, data_ids[0]));
+  ASSERT_EQ(OB_SUCCESS, make_sstable_macro_id(tablet_id.id() + 1,
+      ObStorageObjectType::SHARED_NON_IDEM_MAJOR_DATA_MACRO, 999, 0, data_ids[1]));
+  ivf_meta.is_inited_ = true;
+  ivf_meta.macro_info_.entry_id_ = ObServerSuperBlock::EMPTY_LIST_ENTRY_BLOCK;
+  ivf_meta.basic_meta_.data_macro_block_count_ = 2;
+  ivf_meta.macro_info_.other_block_ids_ = &other_id;
+  ivf_meta.macro_info_.other_block_count_ = 1;
+  ivf_meta.macro_info_.data_block_ids_ = data_ids;
+  ivf_meta.macro_info_.data_block_count_ = 2;
+  ivf.key_.table_type_ = ObITable::IVF_INDEX_SSTABLE;
+  ivf.key_.tablet_id_ = tablet_id;
+  ivf.meta_ = &ivf_meta;
+  ordinary.key_.table_type_ = ObITable::MAJOR_SSTABLE;
+  ordinary.key_.tablet_id_ = tablet_id;
+  // An ordinary Major snapshot must not inflate the non-idempotent op_id watermark.
+  ASSERT_EQ(OB_SUCCESS, make_sstable_macro_id(tablet_id.id(),
+      ObStorageObjectType::SHARED_MAJOR_DATA_MACRO, 10000, 0, ordinary_id));
+  ordinary_meta.is_inited_ = true;
+  ordinary_meta.basic_meta_.data_macro_block_count_ = 1;
+  ordinary_meta.macro_info_.entry_id_ = ObServerSuperBlock::EMPTY_LIST_ENTRY_BLOCK;
+  ordinary_meta.macro_info_.other_block_count_ = 0;
+  ordinary_meta.macro_info_.data_block_ids_ = &ordinary_id;
+  ordinary_meta.macro_info_.data_block_count_ = 1;
+  ordinary.meta_ = &ordinary_meta;
+  ObSSTable *tables[] = {&ordinary, &ivf};
+  table_store.is_inited_ = true;
+  table_store.major_tables_.is_inited_ = true;
+  table_store.major_tables_.sstable_array_ = tables;
+  table_store.major_tables_.cnt_ = 2;
+  ObTabletTableStore *saved_table_store = tablet.table_store_addr_.ptr_;
+  const ObMetaDiskAddr saved_table_store_addr = tablet.table_store_addr_.addr_;
+  DEFER({
+    tablet.table_store_addr_.ptr_ = saved_table_store;
+    tablet.table_store_addr_.addr_ = saved_table_store_addr;
+    table_store.major_tables_.sstable_array_ = nullptr;
+    table_store.major_tables_.cnt_ = 0;
+    ivf.meta_ = nullptr;
+    ordinary.meta_ = nullptr;
+    ordinary_meta.macro_info_.data_block_ids_ = nullptr;
+    ivf_meta.macro_info_.data_block_ids_ = nullptr;
+    ivf_meta.macro_info_.other_block_ids_ = nullptr;
+  });
+  tablet.table_store_addr_.ptr_ = &table_store;
+  ASSERT_EQ(OB_SUCCESS, make_tablet_sub_meta_addr(tablet_id.id(), 5, 0, true,
+      tablet.table_store_addr_.addr_));
+  ObSSMetaTabletLockRowInfo info;
+  ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletLockRowHelper::get_lock_row_info(tablet, info));
+  ASSERT_EQ(6, info.tablet_next_op_id_);
+  ASSERT_EQ(0, info.minor_next_op_id_);
+  ASSERT_EQ(0, info.inc_major_next_op_id_);
+  ASSERT_EQ(92, info.non_idem_major_next_op_id_);
+
+  // Non-IVF Inc Major may reference ordinary Major objects whose fourth ID is a snapshot.
+  for (const ObITable::TableType ordinary_type : {
+      ObITable::INC_MAJOR_SSTABLE, ObITable::INC_INV_INDEX_SSTABLE}) {
+    ordinary.key_.table_type_ = ordinary_type;
+    ASSERT_EQ(OB_SUCCESS, ObSSMetaTabletLockRowHelper::get_lock_row_info(tablet, info));
+    ASSERT_EQ(92, info.non_idem_major_next_op_id_);
+  }
+  ordinary.key_.table_type_ = ObITable::MAJOR_SSTABLE;
+
+  ObSSPhysicalCreateTabletsConsumerTask restore;
+  restore.param_.tenant_id_ = OB_SYS_TENANT_ID;
+  restore.param_.ls_id_ = ls_id;
+  restore.param_.snapshot_ = make_scn(100);
+  restore.sstablet_cnt_ = 1;
+  ASSERT_EQ(OB_SUCCESS, restore.sstablet_hdls_[0].assign(tablet_handle));
+  ASSERT_EQ(OB_SUCCESS, restore.rebuild_restored_tablet_lock_rows_());
+  // Replaying the restore must keep the watermark unchanged.
+  ASSERT_EQ(OB_SUCCESS, restore.rebuild_restored_tablet_lock_rows_());
+
+  ObAtomicProtocolType type;
+  type.type_ = ObAtomicProtocolTypeEnum::NON_IDEM_MAJOR_SSTABLE;
+  ObSSMetaCtrlObjectInfo object_info;
+  ASSERT_EQ(OB_SUCCESS, object_info.init_by_non_idem_major(make_scn(1000), 100, 1, 0));
+  for (int64_t expected_op_id : {92, 93}) {
+    ObSSTableAtomicProtocol protocol;
+    ASSERT_EQ(OB_SUCCESS, protocol.init(type, OB_SYS_TENANT_ID, ls_id, tablet_id,
+        tablet.get_reorganization_scn(), object_info));
+    ASSERT_EQ(OB_SUCCESS, protocol.create(false));
+    int64_t op_id = -1;
+    ASSERT_EQ(OB_SUCCESS, protocol.get_op_id(op_id));
+    EXPECT_EQ(expected_op_id, op_id);
+    ASSERT_EQ(OB_SUCCESS, protocol.abort());
+  }
 }
 
 TEST_F(TestSSMetaIterWrapper, wrapper_tablet_iter_real_tablet_roundtrip_with_inline_macro_info)
@@ -3551,11 +3763,18 @@ TEST_F(TestSSMetaIterWrapper, wrapper_tablet_macro_id_iter_with_real_sstable)
 int main(int argc, char **argv)
 {
   char buf[1000] = {0};
+  const auto env_or_default = [](const char *name, const char *fallback) {
+    const char *value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' ? value : fallback;
+  };
   const int64_t cur_time_ns = ObTimeUtility::current_time_ns();
   databuff_printf(buf, sizeof(buf),
       "%s/%lu?host=%s&access_id=%s&access_key=%s&s3_region=%s&max_iops=10000&max_bandwidth=200000000B&scope=region",
-      oceanbase::unittest::S3_BUCKET, cur_time_ns, oceanbase::unittest::S3_ENDPOINT,
-      oceanbase::unittest::S3_AK, oceanbase::unittest::S3_SK, oceanbase::unittest::S3_REGION);
+      env_or_default("OB_TEST_S3_BUCKET", oceanbase::unittest::S3_BUCKET), cur_time_ns,
+      env_or_default("OB_TEST_S3_ENDPOINT", oceanbase::unittest::S3_ENDPOINT),
+      env_or_default("OB_TEST_S3_AK", oceanbase::unittest::S3_AK),
+      env_or_default("OB_TEST_S3_SK", oceanbase::unittest::S3_SK),
+      env_or_default("OB_TEST_S3_REGION", oceanbase::unittest::S3_REGION));
   oceanbase::shared_storage_info = buf;
   oceanbase::unittest::init_log_and_gtest(argc, argv);
   OB_LOGGER.set_log_level("INFO");

@@ -164,6 +164,9 @@ public:
     // for spiv
   common::ObTabletID dim_docid_value_tablet_id_;
   common::ObTabletID vid_rowkey_tablet_id_;
+    // for async ivf
+  common::ObTabletID async_ivf_index_tablet_id_;
+  common::ObTabletID async_delete_tablet_id_;
   /* used by vector index */
 
   void reset()
@@ -183,6 +186,8 @@ public:
     snapshot_tablet_id_.reset();
     embedded_tablet_id_.reset();
     vid_rowkey_tablet_id_.reset();
+    async_ivf_index_tablet_id_.reset();
+    async_delete_tablet_id_.reset();
   }
 };
 

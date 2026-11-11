@@ -15,6 +15,7 @@
 #include "lib/alloc/ob_malloc_allocator.h"
 #include "lib/ob_errno.h"
 #include "lib/roaringbitmap/ob_roaringbitmap.h"
+#include "share/config/ob_server_config.h"
 #include "storage/async_index/ob_deletion_bitmap_cache.h"
 #include "storage/async_index/ob_deletion_bitmap_provider.h"
 
@@ -291,6 +292,72 @@ TEST_F(TestDeletionBitmapCache, handle_reset)
   handle.reset();
   EXPECT_FALSE(handle.is_valid());
   EXPECT_TRUE(handle.is_empty());
+}
+
+TEST_F(TestDeletionBitmapCache, handle_reset_returns_hazard_pointer_without_destructor)
+{
+  common::HazptrTLCache &cache = common::HazptrTLCache::get_instance();
+  void *buf = allocator_.alloc(sizeof(ObDeletionBitmapHandle));
+  ObDeletionBitmapHandle *handle = nullptr;
+  common::HazardPointer *hazptr = nullptr;
+  common::HazardPointer *reused_hazptr = nullptr;
+  ASSERT_TRUE(GCONF._enable_kvcache_hazard_pointer);
+  ASSERT_NE(nullptr, buf);
+  cache.flush();
+  for (int64_t i = 0; i < 1024; ++i) {
+    // Simulate arena reuse after DAS release(), which does not call the destructor.
+    handle = new (buf) ObDeletionBitmapHandle();
+    ASSERT_EQ(OB_SUCCESS, cache.acquire_hazptr(hazptr));
+    handle->cache_handle_.handle_.hazptr_holder_.hazptr_ = hazptr;
+    cache.flush();
+    // A cleared protection is not proof that the handle owns no pool resource.
+    EXPECT_FALSE(handle->cache_handle_.handle_.is_valid());
+    handle->reset();
+    EXPECT_EQ(nullptr, handle->cache_handle_.handle_.hazptr_holder_.hazptr_);
+    handle->reset();
+    ASSERT_EQ(OB_SUCCESS, cache.acquire_hazptr(reused_hazptr));
+    EXPECT_EQ(hazptr, reused_hazptr);
+    cache.release_hazptr(reused_hazptr);
+  }
+  handle->~ObDeletionBitmapHandle();
+  cache.flush();
+}
+
+TEST_F(TestDeletionBitmapCache, handle_reset_releases_bitmap_iterator_and_hazard_pointer)
+{
+  common::HazptrTLCache &cache = common::HazptrTLCache::get_instance();
+  ObDeletionBitmapHandle handle;
+  common::ObRoaringBitmap *bitmap = nullptr;
+  common::HazardPointer *hazptr = nullptr;
+  common::HazardPointer *reused_hazptr = nullptr;
+  ASSERT_TRUE(GCONF._enable_kvcache_hazard_pointer);
+  bitmap = OB_NEWx(common::ObRoaringBitmap, &allocator_, &allocator_);
+  ASSERT_NE(nullptr, bitmap);
+  ASSERT_EQ(OB_SUCCESS, bitmap->value_add(42));
+  ASSERT_EQ(OB_SUCCESS, handle.init_from_bitmap(allocator_, bitmap));
+  ASSERT_EQ(OB_SUCCESS, handle.open_iter());
+  ASSERT_NE(nullptr, handle.iter_);
+  cache.flush();
+  ASSERT_EQ(OB_SUCCESS, cache.acquire_hazptr(hazptr));
+  handle.cache_handle_.handle_.hazptr_holder_.hazptr_ = hazptr;
+  cache.flush();
+  handle.reset();
+  EXPECT_FALSE(handle.is_valid());
+  EXPECT_EQ(nullptr, handle.bitmap_);
+  EXPECT_EQ(nullptr, handle.iter_);
+  EXPECT_EQ(nullptr, handle.cache_handle_.handle_.hazptr_holder_.hazptr_);
+  ASSERT_EQ(OB_SUCCESS, cache.acquire_hazptr(reused_hazptr));
+  EXPECT_EQ(hazptr, reused_hazptr);
+  cache.release_hazptr(reused_hazptr);
+  // A reset handle can be initialized again and safely destroyed later.
+  bitmap = OB_NEWx(common::ObRoaringBitmap, &allocator_, &allocator_);
+  ASSERT_NE(nullptr, bitmap);
+  ASSERT_EQ(OB_SUCCESS, bitmap->value_add(84));
+  ASSERT_EQ(OB_SUCCESS, handle.init_from_bitmap(allocator_, bitmap));
+  EXPECT_TRUE(handle.contains(84));
+  EXPECT_FALSE(handle.contains(42));
+  handle.reset();
+  cache.flush();
 }
 
 // ==================== CacheValue Serialize/Deserialize Roundtrip ====================

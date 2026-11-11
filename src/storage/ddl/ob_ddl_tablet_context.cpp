@@ -16,12 +16,13 @@
 
 #define USING_LOG_PREFIX STORAGE
 
+#include "storage/blocksstable/vector_index/ob_ivf_tablet_context.h"
+
 using namespace oceanbase::lib;
 using namespace oceanbase::common;
 using namespace oceanbase::storage;
 using namespace oceanbase::blocksstable;
 using namespace oceanbase::share;
-
 
 ObDDLTabletContext::MergeCtx::~MergeCtx() 
 {
@@ -356,7 +357,7 @@ ObDDLTabletContext::ObDDLTabletContext()
   : is_inited_(false), arena_(ObMemAttr(MTL_ID(), "ddl_tblt_ctx")),
     slice_count_(0), table_slice_offset_(0), scan_task_(nullptr), mutex_(common::ObLatchIds::DDL_TABLET_CONTEXT_LOCK),
     last_lob_id_(0), last_autoinc_val_(0), bucket_count_(0),
-    macro_meta_store_mgr_(nullptr), vector_index_ctx_(nullptr),
+    macro_meta_store_mgr_(nullptr), vector_index_ctx_(nullptr), ivf_ctx_(nullptr),
     fts_expect_range_cnt_(0), fts_parallel_cnt_(0)
 {
 
@@ -646,11 +647,40 @@ int ObDDLTabletContext::init(
   return ret;
 }
 
+int ObDDLTabletContext::init_ivf_context(const int64_t vector_dim)
+{
+  int ret = OB_SUCCESS;
+  if (OB_UNLIKELY(!is_inited_)) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("DDL tablet context is not initialized", K(ret), K_(tablet_id));
+  } else if (OB_UNLIKELY(vector_dim <= 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid IVF vector dimension", K(ret), K_(tablet_id), K(vector_dim));
+  } else if (OB_NOT_NULL(ivf_ctx_)) {
+    ret = OB_INIT_TWICE;
+    LOG_WARN("IVF tablet context init twice", K(ret), K_(tablet_id));
+  } else if (OB_ISNULL(ivf_ctx_ = OB_NEW(
+                 ObIVFTabletContext, ObMemAttr(MTL_ID(), "IVFCtx")))) {
+    ret = OB_ALLOCATE_MEMORY_FAILED;
+    LOG_WARN("failed to allocate IVF tablet context", K(ret), K_(tablet_id));
+  } else if (OB_FAIL(ivf_ctx_->init_rotator(arena_, vector_dim))) {
+    LOG_WARN("failed to initialize IVF tablet rotator", K(ret),
+             K_(tablet_id), K(vector_dim));
+    OB_DELETE(ObIVFTabletContext, "IVFCtx", ivf_ctx_);
+    ivf_ctx_ = nullptr;
+  }
+  return ret;
+}
+
 int ObDDLTabletContext::init_vector_index_context(const int64_t snapshot_version, const int64_t ddl_task_id, const ObDDLTableSchema &ddl_table_schema)
 {
   int ret = OB_SUCCESS;
   void *buf = nullptr;
-  if (ddl_table_schema.table_item_.vec_dim_ > 0) {
+  if (ddl_table_schema.table_item_.vec_dim_ > 0
+      && !is_async_ivf_index(ddl_table_schema.table_item_.index_type_)) {
+    // IVF reuses the DDL schema's vector dimension/params, but it owns a
+    // distinct capture/build-and-write context. Do not route index type 49
+    // through the legacy HNSW/IVF complement tablet context or its pipelines.
     if (OB_ISNULL(buf = arena_.alloc(sizeof(ObVectorIndexTabletContext)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("allocate memory failed", K(ret));
@@ -669,6 +699,10 @@ void ObDDLTabletContext::reset()
   is_inited_ = false;
   ls_id_.reset();
   tablet_id_.reset();
+  if (nullptr != ivf_ctx_) {
+    OB_DELETE(ObIVFTabletContext, "IVFCtx", ivf_ctx_);
+    ivf_ctx_ = nullptr;
+  }
   if (nullptr != tablet_param_.cs_replica_storage_schema_) {
     ObTabletObjLoadHelper::free(arena_, tablet_param_.cs_replica_storage_schema_);
   }

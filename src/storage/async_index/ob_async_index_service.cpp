@@ -6,6 +6,7 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/async_index/ob_async_index_service.h"
+#include "storage/blocksstable/vector_index/ob_ivf_refresh_monitor.h"
 #include "storage/async_index/ob_async_index_define.h"
 #include "storage/async_index/ob_async_index_sql_gen.h"
 #include "storage/async_index/ob_async_index_refresh_task.h"
@@ -29,6 +30,15 @@ namespace oceanbase
 {
 namespace storage
 {
+
+ObAsyncIndexRefreshTmpInfo::~ObAsyncIndexRefreshTmpInfo()
+{
+  if (nullptr != ivf_refresh_monitor_) {
+    ivf_refresh_monitor_->finish(OB_CANCELED);
+    ivf_refresh_monitor_->dec_ref();
+    ivf_refresh_monitor_ = nullptr;
+  }
+}
 
 int ObAsyncIndexService::mtl_init(ObAsyncIndexService *&service)
 {
@@ -309,6 +319,50 @@ int ObAsyncIndexService::release_refresh_versions(const int64_t refresh_task_id)
   return ret;
 }
 
+int ObAsyncIndexService::acquire_ivf_refresh_monitor(int64_t refresh_task_id,
+    ObIVFRefreshMonitor *&monitor, ObDDLDagMonitorNode *node, uint64_t tablet_id,
+    int64_t execution_id)
+{
+  int ret = OB_SUCCESS;
+  monitor = nullptr;
+  if (IS_NOT_INIT) {
+    ret = OB_NOT_INIT;
+  } else {
+    struct GetMonitorFn {
+      int64_t task_id_;
+      ObDDLDagMonitorNode *node_;
+      uint64_t tablet_id_;
+      int64_t execution_id_;
+      ObIVFRefreshMonitor *&monitor_;
+      int ret_;
+      void operator()(common::hash::HashMapPair<int64_t, ObAsyncIndexRefreshTmpInfo *> &pair)
+      {
+        ObAsyncIndexRefreshTmpInfo *info = pair.second;
+        if (nullptr != info) {
+          if (nullptr == info->ivf_refresh_monitor_ && tablet_id_ > 0) {
+            ObIVFRefreshMonitor *perf = OB_NEW(ObIVFRefreshMonitor, ObMemAttr(MTL_ID(), "IVFRefreshPerf"));
+            if (nullptr == perf) {
+              ret_ = OB_ALLOCATE_MEMORY_FAILED;
+            } else {
+              perf->init(node_, task_id_, execution_id_, tablet_id_,
+                  info->start_refresh_scn_.get_val_for_inner_table_field(), info->snapshot_version_);
+              info->ivf_refresh_monitor_ = perf;
+            }
+          }
+          monitor_ = info->ivf_refresh_monitor_;
+          if (nullptr != monitor_) { monitor_->inc_ref(); }
+        }
+      }
+    } fn{refresh_task_id, node, tablet_id, execution_id, monitor, OB_SUCCESS};
+    if (OB_FAIL(tmp_info_map_.atomic_refactored(refresh_task_id, fn))) {
+      if (OB_HASH_NOT_EXIST == ret) { ret = OB_SUCCESS; }
+    } else {
+      ret = fn.ret_;
+    }
+  }
+  return ret;
+}
+
 int ObAsyncIndexService::add_skipped_rows(const int64_t refresh_task_id, const int64_t cnt)
 {
   int ret = OB_SUCCESS;
@@ -567,7 +621,6 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
       LOG_WARN("failed to get targeted refresh metadata", K(ret), K(param));
     }
   }
-
   // ── Steps 4-8 with retry loop ─────────────────────────────────────────────
   // When handle() returns OB_EAGAIN (index tablet lock conflict), another
   // refresh task is executing on the same tablet. Retry with fresh publish_scn
@@ -579,6 +632,7 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
   if (OB_SUCC(ret)) {
     const ObAsyncIndexDataTableInfo &data_table_info = *metadata;
     const ObAsyncIndexInfo *index_info = &data_table_info.index_infos_.at(0);
+    const bool is_async_ivf_refresh = index_info->is_async_ivf_index();
     const int64_t data_tablet_pos = 0;
     do {
       ret = OB_SUCCESS;
@@ -636,6 +690,17 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
                  K(param), K(start_refresh_scn), K(param.target_refresh_scn_), K(retry_cnt));
       } else {
         need_refresh = true;
+      }
+      if (OB_SUCC(ret) && need_refresh && is_async_ivf_refresh
+          && DIRECT_REFRESH_OP_COMPLETE == param.op_) {
+        ret = OB_NOT_SUPPORTED;
+        LOG_WARN("async IVF complete refresh is not supported", K(ret), K(param));
+      } else if (OB_SUCC(ret) && need_refresh && is_async_ivf_refresh
+                 && start_refresh_scn.is_min()
+                 && ASYNC_REFRESH_TYPE_CREATE_INDEX != param.refresh_type_) {
+        ret = OB_STATE_NOT_MATCH;
+        LOG_WARN("async IVF index has no initialized empty baseline",
+                 K(ret), K(param), K(start_refresh_scn));
       }
 
       int64_t refresh_parallelism = OB_ASYNC_INDEX_MIN_PARALLELISM;

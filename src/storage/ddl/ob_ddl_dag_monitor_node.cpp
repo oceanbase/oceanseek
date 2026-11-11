@@ -219,12 +219,32 @@ int ObDDLDagMonitorNode::init(const Key &key)
 
 bool ObDDLDagMonitorNode::is_expired(const int64_t current_time, const int64_t ttl_us) const
 {
-  return is_finished() && (current_time - finish_timestamp_ > ttl_us);
+  const int64_t finished_at = ATOMIC_LOAD(&finish_timestamp_);
+  return finished_at > 0 && current_time - finished_at > ttl_us;
 }
 
 void ObDDLDagMonitorNode::mark_finished()
 {
-  finish_timestamp_ = ObTimeUtility::current_time();
+  ATOMIC_STORE(&finish_timestamp_, ObTimeUtility::current_time());
+}
+
+int64_t ObDDLDagMonitorNode::to_string(char *buf, const int64_t buf_len) const
+{
+  const int64_t ref_cnt = ATOMIC_LOAD(&ref_cnt_);
+  const int64_t finish_timestamp = ATOMIC_LOAD(&finish_timestamp_);
+  int32_t info_count = 0;
+  {
+    SpinRLockGuard guard(lock_);
+    info_count = info_list_.get_size();
+  }
+  // Format after releasing the lock; these diagnostic fields need not share one instant.
+  int64_t pos = 0;
+  J_OBJ_START();
+  J_KV(K_(is_inited), K_(is_async_index_refresh), "ref_cnt", ref_cnt, KP_(allocator),
+       K_(key), K_(create_timestamp), "finish_timestamp", finish_timestamp,
+       "info_list_.get_size()", info_count);
+  J_OBJ_END();
+  return pos;
 }
 
 int ObDDLDagMonitorNode::get_all_infos(ObIAllocator &allocator, ObIArray<ObDDLDagMonitorEntry *> &entries) const

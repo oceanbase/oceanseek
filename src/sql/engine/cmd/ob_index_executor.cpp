@@ -105,7 +105,7 @@ int ObCreateIndexExecutor::execute(ObExecContext &ctx, ObCreateIndexStmt &stmt)
               || data_version < DATA_VERSION_4_2_2_0
               || (data_version >= DATA_VERSION_4_3_0_0 && data_version < DATA_VERSION_4_3_5_0)
               || share::schema::is_fts_or_multivalue_index(create_index_arg.index_type_)
-              || share::schema::is_async_fts_index(create_index_arg.index_type_)
+              || share::schema::is_user_defined_async_index(create_index_arg.index_type_)
               || share::schema::is_vec_index(create_index_arg.index_type_)
               || share::schema::is_search_index(create_index_arg.index_type_)
               || share::schema::is_async_search_index(create_index_arg.index_type_)) {

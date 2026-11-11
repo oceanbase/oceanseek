@@ -6,6 +6,8 @@
 #define USING_LOG_PREFIX STORAGE
 
 #include "storage/ddl/ob_ddl_independent_dag.h"
+#include "storage/blocksstable/vector_index/ob_ivf_refresh_monitor.h"
+#include "storage/blocksstable/vector_index/ob_ivf_tablet_context.h"
 #include "storage/ddl/ob_ddl_inc_task.h"
 #include "storage/ddl/ob_ddl_tablet_context.h"
 #include "storage/ddl/ob_cg_macro_block_write_task.h"
@@ -16,6 +18,9 @@
 #include "storage/ddl/ob_macro_meta_store_manager.h"
 #include "storage/ddl/ob_ddl_merge_task_v2.h"
 #include "storage/ddl/ob_full_text_index_write_task.h"
+#include "storage/blocksstable/vector_index/ob_ivf_build_and_write_pipeline.h"
+#include "storage/blocksstable/vector_index/ob_ivf_capture_pipeline.h"
+#include "storage/async_index/ob_async_index_service.h"
 #include "storage/ddl/ob_tablet_ddl_kv_mgr.h"
 #include "share/ob_fts_index_builder_util.h"
 #include "share/ob_order_perserving_encoder.h"
@@ -295,6 +300,22 @@ int ObDDLIndependentDag::init_tablet_context_map()
       LOG_WARN("get ddl table schema failed", K(ret), K(tablet_id));
     } else if (OB_FAIL(tablet_context->init(ls_id, tablet_id, ddl_thread_count_, ddl_task_param_.snapshot_version_, direct_load_type_, *use_schema, ddl_task_param_.ddl_task_id_))) {
       LOG_WARN("init ddl tablet context failed", K(ret), K(ls_id), K(tablet_id), K(ddl_thread_count_), KPC(use_schema));
+    } else if (is_async_ivf_index(use_schema->table_item_.index_type_)
+               && OB_FAIL(tablet_context->init_ivf_context(
+                    use_schema->table_item_.vec_dim_))) {
+      LOG_WARN("init IVF tablet context failed", K(ret), K(tablet_id));
+    }
+    if (OB_SUCC(ret) && ddl_task_param_.is_async_index_refresh_
+        && nullptr != tablet_context && nullptr != tablet_context->ivf_ctx_) {
+      ObAsyncIndexService *svc = MTL(ObAsyncIndexService *);
+      if (nullptr != svc) {
+        const int monitor_ret = svc->acquire_ivf_refresh_monitor(ddl_task_param_.ddl_task_id_,
+            tablet_context->ivf_ctx_->refresh_monitor_, get_monitor_node(), tablet_id.id(),
+            ddl_task_param_.execution_id_);
+        if (OB_SUCCESS != monitor_ret) {
+          LOG_WARN("failed to attach IVF refresh monitoring", K(monitor_ret), K(tablet_id));
+        }
+      }
     }
     if (OB_FAIL(ret)) {
       // handled below
@@ -619,7 +640,24 @@ int ObDDLIndependentDag::add_pipeline(
   bool is_vec_complement = ObDDLUtil::is_vector_index_complement(index_type);
   bool is_hybrid_log = schema::is_hybrid_vec_index_log_type(index_type);
   bool is_hybrid_embedded = schema::is_hybrid_vec_index_embedded_type(index_type);
-  if (ObDDLUtil::is_vector_index_complement(index_type)) {
+  if (schema::is_async_ivf_index(index_type)) {
+    ObIVFCapturePipeline *pipeline = nullptr;
+    if (OB_FAIL(alloc_task(pipeline))) {
+      LOG_WARN("failed to allocate IVF capture pipeline", K(ret));
+    } else if (OB_FAIL(pipeline->init(ddl_slice, tablet_context,
+                                      ddl_table_schema_, ddl_task_param_.is_async_index_refresh_))) {
+      LOG_WARN("failed to initialize IVF capture pipeline", K(ret));
+    } else if (nullptr != tablet_context->scan_task_
+               && OB_FAIL(pipeline->add_child(*tablet_context->scan_task_))) {
+      LOG_WARN("failed to link IVF capture pipeline", K(ret));
+    } else {
+      inc_pipeline_count();
+      if (OB_FAIL(add_task(*pipeline))) {
+        dec_pipeline_count();
+        LOG_WARN("failed to add IVF capture pipeline", K(ret));
+      }
+    }
+  } else if (ObDDLUtil::is_vector_index_complement(index_type)) {
     if (OB_FAIL(add_vector_index_append_pipeline(index_type, tablet_context, ddl_slice))) {
       LOG_WARN("add vector index pipeline failed", K(ret));
     }
@@ -936,6 +974,25 @@ int ObDDLIndependentDag::set_merge_tasks(
   return ret;
 }
 
+int ObDDLIndependentDag::init_async_ivf_build_pipeline(
+    ObIArray<ObITask *> &need_schedule_tasks,
+    ObITask &group_write_task,
+    const ObTabletID &tablet_id)
+{
+  int ret = OB_SUCCESS;
+  ObIVFBuildAndWritePipeline *pipeline = nullptr;
+  if (OB_FAIL(alloc_task(pipeline))) {
+    LOG_WARN("fail to alloc IVF build-and-write pipeline", KR(ret), K(tablet_id));
+  } else if (OB_FAIL(pipeline->init(this, tablet_id))) {
+    LOG_WARN("fail to init IVF build-and-write pipeline", KR(ret), K(tablet_id));
+  } else if (OB_FAIL(need_schedule_tasks.push_back(pipeline))) {
+    LOG_WARN("fail to push IVF build-and-write pipeline", KR(ret), K(tablet_id));
+  } else if (OB_FAIL(pipeline->add_child(group_write_task))) {
+    LOG_WARN("fail to link IVF build-and-write before group write", KR(ret), K(tablet_id));
+  }
+  return ret;
+}
+
 int ObDDLIndependentDag::inc_generate_async_index_refresh_tasks(ObIArray<ObITask *> &need_schedule_tasks,
                                                                 ObITask *next_task)
 {
@@ -946,6 +1003,7 @@ int ObDDLIndependentDag::inc_generate_async_index_refresh_tasks(ObIArray<ObITask
   ObArray<ObITask*> lob_meta_merge_tasks;
   ObArray<ObITask*> lob_piece_merge_tasks;
   const transaction::ObTxSEQ seq_no = transaction::ObTxSEQ::cast_from_int(tx_info_.seq_no_);
+  const bool is_disk_bbq_build = schema::is_async_ivf_index(ddl_table_schema_.table_item_.index_type_);
 
   if (OB_FAIL(alloc_task(group_write_task))) {
     LOG_WARN("fail to alloc group write task", K(ret));
@@ -986,6 +1044,10 @@ int ObDDLIndependentDag::inc_generate_async_index_refresh_tasks(ObIArray<ObITask
         LOG_WARN("fail to alloc wait dump task", KR(ret), K(ls_id), K(tablet_id), K(tx_info_));
       } else if (OB_FAIL(need_schedule_tasks.push_back(wait_dump_task))) {
         LOG_WARN("fail to push back", KR(ret));
+      } else if (is_disk_bbq_build
+                 && OB_FAIL(init_async_ivf_build_pipeline(
+                     need_schedule_tasks, *group_write_task, tablet_id))) {
+        LOG_WARN("fail to init async IVF build pipeline", KR(ret), K(tablet_id));
       } else if (OB_FAIL(group_write_task->add_child(*wait_dump_task))) {
         LOG_WARN("fail to add child", KR(ret));
       } else if (OB_FAIL(wait_dump_task->add_child(*data_merge_task))) {
@@ -1475,7 +1537,7 @@ int ObDDLIndependentDag::init_tablet_merge_task(
   } else if (OB_FAIL(merge_param.init(for_major  /*for major*/,
                                       ObDirectLoadTabletTarget::DATA,
                                       false /* for replay*/,
-                                      mock_start_scn, 
+                                      mock_start_scn,
                                       direct_load_type_,
                                       ddl_task_param_,
                                       tablet_context,

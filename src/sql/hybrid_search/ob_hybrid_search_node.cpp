@@ -2145,6 +2145,7 @@ int ObVecSearchNode::init_vec_info(ObSqlSchemaGuard *schema_guard)
     vec_info_.can_extract_range_ = ap_->vec_idx_info_->vec_extra_info_.can_extract_range_;
     vec_info_.is_spatial_index_ =  ap_->vec_idx_info_->vec_extra_info_.is_spatial_index_;
     vec_info_.is_multi_value_index_ = ap_->vec_idx_info_->vec_extra_info_.is_multi_value_index_;
+    vec_info_.set_async_ivf_index(*ap_->vec_idx_info_);
     bool is_hybrid = false;
     if (search_option_ != nullptr) {
       vec_info_.query_param_ = search_option_->param_;
@@ -2158,7 +2159,23 @@ int ObVecSearchNode::init_vec_info(ObSqlSchemaGuard *schema_guard)
         vec_info_.vec_type_ = VEC_INDEX_POST_ITERATIVE_FILTER;
       }
     }
-    if (vec_info_.is_hnsw_vec_scan()) {
+    if (vec_info_.is_async_ivf_scan()) {
+      const ObTableSchema *index_schema = nullptr;
+      vec_info_.async_delete_info_ = &async_delete_info_;
+      if (OB_FAIL(schema_guard->get_table_schema(main_index_table_id_, index_schema))) {
+        LOG_WARN("failed to get async IVF schema", K(ret));
+      } else if (OB_ISNULL(index_schema) || !index_schema->can_read_index()
+                 || !index_schema->is_index_visible()) {
+        ret = OB_SCHEMA_ERROR;
+        LOG_WARN("async IVF index is not readable", K(ret), K(main_index_table_id_));
+      } else if (OB_FAIL(async_delete_info_.resolve_delete_index(*table_schema_))) {
+        LOG_WARN("failed to resolve shared delete index", K(ret));
+      } else if (OB_FAIL(vec_info_.aux_table_id_.push_back(main_index_table_id_))) {
+        LOG_WARN("failed to append async IVF index id", K(ret));
+      } else if (OB_FAIL(vec_info_.aux_table_id_.push_back(async_delete_info_.get_delete_idx_tid()))) {
+        LOG_WARN("failed to append shared delete id", K(ret));
+      }
+    } else if (vec_info_.is_hnsw_vec_scan()) {
       uint64_t vid_rowkey_tid = OB_INVALID_ID;
       uint64_t rowkey_vid_tid = OB_INVALID_ID;
       uint64_t delta_buffer_tid = OB_INVALID_ID; // hybrid index log table when is_hybrid is true

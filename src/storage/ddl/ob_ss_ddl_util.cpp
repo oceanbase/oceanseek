@@ -8,6 +8,7 @@
 #include "storage/tx_storage/ob_ls_service.h"
 #include "storage/column_store/ob_column_oriented_sstable.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable.h"
 #include "storage/incremental/ob_shared_meta_service.h"
 #include "storage/incremental/ob_sswriter_service.h"
 #include "storage/compaction_v2/ob_ss_compact_helper.h"
@@ -81,11 +82,14 @@ int ObSSDDLUtil::update_shared_tablet_table_store_if_absent(
     blocksstable::ObSSTable sstable;
     storage::ObCOSSTableV2 co_sstable;
     blocksstable::ObInvSSTable inv_sstable;
+    blocksstable::ObIvfSSTable ivf_sstable;
     blocksstable::ObSSTable *sstable_ptr = &sstable;
     if (table_key.is_co_sstable()) {
       sstable_ptr = &co_sstable;
     } else if (table_key.is_inv_sstable()) {
       sstable_ptr = &inv_sstable;
+    } else if (table_key.is_ivf_sstable()) {
+      sstable_ptr = &ivf_sstable;
     }
     int64_t pos = 0;
     if (OB_FAIL(sstable_ptr->deserialize(allocator, sstable_buf.ptr(), sstable_buf.length(), pos))) {

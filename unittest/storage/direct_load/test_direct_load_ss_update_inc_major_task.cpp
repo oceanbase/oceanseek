@@ -481,7 +481,7 @@ TEST_F(TestDirectLoadSSUpdateIncMajorTask, test_replay_deserialize_classifies_em
   ASSERT_FALSE(skip_commit_log.get_data_inc_major_buffer().empty());
   ASSERT_EQ(OB_SUCCESS, skip_replay_executor.init(
       ls_, tablet_id_, replay_scn, trans_id, seq_no, snapshot_version,
-      data_format_version, false, false,
+      data_format_version, false, false, ObITable::TableType::MAX_TABLE_TYPE,
       skip_commit_log.get_data_inc_major_buffer(), start_scn,
       skip_commit_log.need_check_ddl_checkpoint()));
 
@@ -548,12 +548,12 @@ TEST_F(TestDirectLoadSSUpdateIncMajorTask, test_replay_publish_gate)
   ASSERT_FALSE(commit_log.get_data_inc_major_buffer().empty());
   ASSERT_EQ(OB_SUCCESS, skip_replay_executor.init(
       replay_ls_handle.get_ls(), tablet_id_, replay_scn, trans_id, seq_no,
-      snapshot_version, data_format_version, false, false,
+      snapshot_version, data_format_version, false, false, ObITable::TableType::MAX_TABLE_TYPE,
       commit_log.get_data_inc_major_buffer(), start_scn,
       commit_log.need_check_ddl_checkpoint()));
   ASSERT_EQ(OB_SUCCESS, publish_replay_executor.init(
       replay_ls_handle.get_ls(), tablet_id_, replay_scn, trans_id, seq_no,
-      snapshot_version, data_format_version, false, false,
+      snapshot_version, data_format_version, false, false, ObITable::TableType::MAX_TABLE_TYPE,
       commit_log.get_data_inc_major_buffer(), start_scn,
       commit_log.need_check_ddl_checkpoint()));
   ASSERT_EQ(OB_SUCCESS, finite_log_basic.init(
@@ -565,7 +565,7 @@ TEST_F(TestDirectLoadSSUpdateIncMajorTask, test_replay_publish_gate)
   ASSERT_FALSE(finite_commit_log.get_data_inc_major_buffer().empty());
   ASSERT_EQ(OB_SUCCESS, finite_replay_executor.init(
       replay_ls_handle.get_ls(), tablet_id_, replay_scn, finite_trans_id, finite_seq_no,
-      snapshot_version, data_format_version, false, false,
+      snapshot_version, data_format_version, false, false, ObITable::TableType::MAX_TABLE_TYPE,
       finite_commit_log.get_data_inc_major_buffer(), start_scn,
       finite_commit_log.need_check_ddl_checkpoint()));
 

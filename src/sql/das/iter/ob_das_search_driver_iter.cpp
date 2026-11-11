@@ -160,6 +160,18 @@ int ObDASSearchDriverIter::do_table_scan()
 
 int ObDASSearchDriverIter::rescan()
 {
+  int ret = do_rescan(true /* reset_filter_providers */);
+  return ret;
+}
+
+int ObDASSearchDriverIter::rescan_for_next_candidates()
+{
+  int ret = do_rescan(false /* reset_filter_providers */);
+  return ret;
+}
+
+int ObDASSearchDriverIter::do_rescan(const bool reset_filter_providers)
+{
   int ret = OB_SUCCESS;
   bool is_vec_index_search = false;
   // for vector index search, in post-iterative filter mode, we can reuse the old profile in the same tablet execution
@@ -178,7 +190,8 @@ int ObDASSearchDriverIter::rescan()
     if (!is_vec_index_search) {
       root_op_->reset_profile();
     }
-    if (OB_FAIL(search_ctx_->reset_filter_bitmap_providers_for_rescan())) {
+    if (reset_filter_providers
+        && OB_FAIL(search_ctx_->reset_filter_bitmap_providers_for_rescan())) {
       LOG_WARN("failed to refresh filter bitmap providers", KR(ret));
     } else if (OB_FAIL(root_op_->rescan())) {
       LOG_WARN("failed to rescan root op", KR(ret));
@@ -585,6 +598,31 @@ int ObDASSearchDriverIter::process_post_filter(int64_t &count, int64_t capacity)
   
   if (FAILEDx(init_bitmap_iter())) {
     LOG_WARN("failed to init bitmap iterator", K(ret));
+  } else if (DAS_SEARCH_OP_ASYNC_SEGMENT_GROUP_MERGE == root_op_->get_op_type()) {
+    // Group concatenation is not globally ordered by VID. Validate candidates
+    // against the complete partition filter without advancing across Groups.
+    if (OB_FAIL(init_rowid_and_score_vectors(capacity))) {
+      LOG_WARN("failed to initialize group candidate filter output", K(ret));
+    }
+    while (OB_SUCC(ret) && count < capacity) {
+      ObDASRowID root_rowid;
+      double root_score = 0.0;
+      if (OB_FAIL(root_op_->next_rowid(root_rowid, root_score))) {
+        LOG_WARN_IGNORE_ITER_END(ret, "failed to read group candidate filter", K(ret));
+      } else if (bitmap_->test(root_rowid.get_uint64())) {
+        if (OB_FAIL(search_ctx_->deep_copy_rowid(root_rowid, row_id, rowid_allocator_))) {
+          LOG_WARN("failed to copy group candidate rowid", K(ret));
+        } else if (OB_FAIL(row_ids_.push_back(row_id))) {
+          LOG_WARN("failed to retain group candidate rowid", K(ret));
+        } else {
+          ++count;
+        }
+      }
+    }
+    if (count > 0 && OB_ITER_END == ret) { ret = OB_SUCCESS; }
+    if (FAILEDx(project_rowid_and_score_to_expr(count))) {
+      LOG_WARN("failed to project group candidate filter output", K(ret));
+    }
   } else if (OB_LIKELY(search_ctx_->use_dynamic_pruning_)) {
     ObDASRowID root_rowid;
     ObDASRowID bitmap_rowid;

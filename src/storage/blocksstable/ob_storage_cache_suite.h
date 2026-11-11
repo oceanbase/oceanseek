@@ -43,6 +43,8 @@ public:
       const int64_t storage_meta_cache_priority);
   int set_bf_cache_miss_count_threshold(const int64_t bf_cache_miss_count_threshold);
   ObDataMicroBlockCache &get_block_cache() { return user_block_cache_; }
+  ObDataMicroBlockCache &get_ivf_fastscan_cache() { return ivf_fastscan_cache_; }
+  ObDataMicroBlockCache &get_ivf_quantized_row_cache() { return ivf_quantized_row_cache_; }
   ObIndexMicroBlockCache &get_index_block_cache() { return index_block_cache_; }
   ObDataMicroBlockCache &get_micro_block_cache(const bool is_data_block)
   { return is_data_block ? user_block_cache_ : index_block_cache_; }
@@ -64,6 +66,8 @@ private:
   static const int64_t TABLET_SPLIT_CACHE_PRIORITY = 10;
   ObIndexMicroBlockCache index_block_cache_;
   ObDataMicroBlockCache user_block_cache_;
+  ObDataMicroBlockCache ivf_fastscan_cache_;
+  ObDataMicroBlockCache ivf_quantized_row_cache_;
   ObRowCache user_row_cache_;
   ObBloomFilterCache bf_cache_;
   ObFuseRowCache fuse_row_cache_;

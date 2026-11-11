@@ -255,6 +255,7 @@ public:
   bool operator==(const ObSSMetaCtrlObjectInfo &other) const;
   int64_t to_string(char *buf, const int64_t buf_len) const;
   bool is_major() const { return TYPE::MAJOR == type_; }
+  bool is_non_idem_major() const { return TYPE::NON_IDEM_MAJOR == type_; }
   bool is_inc_major() const { return TYPE::INC_MAJOR == type_; }
   bool is_none_major() const { return TYPE::NONE_MAJOR == type_; }
   bool is_none() const { return TYPE::NONE == type_; }
@@ -263,6 +264,8 @@ public:
   // 通过单个接口绑定 type_ 和对应形态的字段，避免调用方混用不同形态的字段。
   // 需要完全清空对象时，先调用 reset() 再重新初始化。
   int init_by_major(const share::SCN &snapshot_version, const int64_t seq_step,
+      const int64_t parallel_cnt, const int64_t cg_cnt);
+  int init_by_non_idem_major(const share::SCN &snapshot_version, const int64_t seq_step,
       const int64_t parallel_cnt, const int64_t cg_cnt);
   int init_by_inc_major(const share::SCN &snapshot_version, const int64_t seq_step,
       const int64_t parallel_cnt, const int64_t cg_cnt);

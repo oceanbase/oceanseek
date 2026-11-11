@@ -3492,6 +3492,18 @@ int ObDDLOperator::alter_table_create_index(const share::schema::ObTableSchema &
             }
           }
         }
+        if (OB_SUCC(ret) && share::schema::is_async_ivf_index(index_schema.get_index_type())) {
+          // The IVF baseline reads both schemas at the index schema version.
+          // Persist the generated-column table version before creating the index.
+          HEAP_VAR(ObTableSchema, generated_column_table_schema) {
+            if (OB_FAIL(generated_column_table_schema.assign(new_table_schema))) {
+              LOG_WARN("failed to copy async IVF data table schema", K(ret));
+            } else if (OB_FAIL(update_table_attribute(
+                           generated_column_table_schema, trans, OB_DDL_ALTER_TABLE))) {
+              LOG_WARN("failed to update async IVF generated-column table version", K(ret));
+            }
+          }
+        }
         if (OB_SUCC(ret)) {
           if (OB_FAIL(schema_service_.gen_new_schema_version(tenant_id, new_schema_version))) {
             LOG_WARN("fail to gen new schema_version", K(ret), K(tenant_id));

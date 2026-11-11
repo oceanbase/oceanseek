@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SERVER
 #include "share/ob_fts_index_builder_util.h"
+#include "share/ob_index_builder_util.h"
 #include "share/vector_index/ob_vector_index_util.h"
 #include "observer/virtual_table/ob_table_index.h"
 
@@ -777,7 +778,7 @@ int ObTableIndex::add_normal_indexes(const ObTableSchema &table_schema,
             }
           } else if (index_schema->is_async_delete_index()) {
             is_sub_end = true;
-          } else if (index_schema->is_async_fts_index()) {
+          } else if (index_schema->is_user_defined_async_index()) {
             if (OB_FAIL(add_async_index_column(database_name,
                                                table_schema,
                                                index_schema,
@@ -1354,7 +1355,7 @@ int ObTableIndex::add_async_index_column(const ObString &database_name,
     ret = OB_ERR_UNEXPECTED;
     SERVER_LOG(WARN, "cells count is less than output column count",
                K(ret), K(cur_row_.count_), K(col_count));
-  } else if (index_schema->is_async_fts_index()) {
+  } else if (share::schema::is_user_defined_async_index(index_schema->get_index_type())) {
     uint64_t doc_id_col_id = OB_INVALID_ID;
     uint64_t ft_col_id = OB_INVALID_ID;
     ObDocIDType type = ObDocIDType::INVALID;
@@ -1367,25 +1368,42 @@ int ObTableIndex::add_async_index_column(const ObString &database_name,
     if (OB_INVALID_ID == static_cast<uint64_t>(async_dep_col_idx_)) {
       async_dep_col_idx_ = 0;
     }
-    if (OB_FAIL(index_schema->get_fulltext_typed_col_ids(doc_id_col_id, type, ft_col_id))) {
-      LOG_WARN("get generated column ids failed", K(ret));
-    } else if (OB_UNLIKELY(!ObDocIDUtils::is_docid_col_id_valid(doc_id_col_id) || ft_col_id <= OB_APP_MIN_COLUMN_ID
-                           || OB_INVALID_ID == ft_col_id)) {
-      ret = OB_INVALID_ARGUMENT;
-      LOG_WARN("invalid doc id or fulltext column id", K(ret), K(doc_id_col_id), K(ft_col_id));
-    } else if (OB_ISNULL(gen_column_schema = table_schema.get_column_schema(ft_col_id))) {
-      ret = OB_SCHEMA_ERROR;
-      SERVER_LOG(WARN, "fail to get data table column schema", K(ret));
-    } else if (OB_FAIL(ObFtsIndexBuilderUtil::get_index_column_ids_for_fts(table_schema,
-                                                                           *gen_column_schema,
-                                                                           dep_column_ids))) {
-      LOG_WARN("get cascaded column ids from column schema failed", K(ret), K(*gen_column_schema));
-    } else if (dep_column_ids.count() <= async_dep_col_idx_) {
-      is_end = true;
-      async_dep_col_idx_ = OB_INVALID_ID;
-    } else if (OB_ISNULL(column_schema = table_schema.get_column_schema(dep_column_ids[async_dep_col_idx_]))) {
-      ret = OB_SCHEMA_ERROR;
-      SERVER_LOG(WARN, "fail to get data table column schema", K(ret), K(dep_column_ids[async_dep_col_idx_]));
+    if (index_schema->is_async_fts_index()) {
+      if (OB_FAIL(index_schema->get_fulltext_typed_col_ids(doc_id_col_id, type, ft_col_id))) {
+        LOG_WARN("get generated column ids failed", K(ret));
+      } else if (OB_UNLIKELY(!ObDocIDUtils::is_docid_col_id_valid(doc_id_col_id)
+                             || ft_col_id <= OB_APP_MIN_COLUMN_ID
+                             || OB_INVALID_ID == ft_col_id)) {
+        ret = OB_INVALID_ARGUMENT;
+        LOG_WARN("invalid doc id or fulltext column id", K(ret), K(doc_id_col_id), K(ft_col_id));
+      } else if (OB_ISNULL(gen_column_schema = table_schema.get_column_schema(ft_col_id))) {
+        ret = OB_SCHEMA_ERROR;
+        SERVER_LOG(WARN, "fail to get data table column schema", K(ret));
+      } else if (OB_FAIL(ObFtsIndexBuilderUtil::get_index_column_ids_for_fts(
+          table_schema, *gen_column_schema, dep_column_ids))) {
+        LOG_WARN("get cascaded column ids from column schema failed", K(ret), K(*gen_column_schema));
+      } else if (dep_column_ids.count() <= async_dep_col_idx_) {
+        is_end = true;
+        async_dep_col_idx_ = OB_INVALID_ID;
+      } else if (OB_ISNULL(column_schema = table_schema.get_column_schema(
+          dep_column_ids[async_dep_col_idx_]))) {
+        ret = OB_SCHEMA_ERROR;
+        SERVER_LOG(WARN, "fail to get data table column schema", K(ret),
+                   K(dep_column_ids[async_dep_col_idx_]));
+      }
+    } else if (share::schema::is_async_ivf_index(index_schema->get_index_type())) {
+      if (async_dep_col_idx_ > 0) {
+        is_end = true;
+        async_dep_col_idx_ = OB_INVALID_ID;
+      } else if (OB_FAIL(ObIndexBuilderUtil::get_async_ivf_source_column(
+          table_schema, *index_schema, column_schema))) {
+        SERVER_LOG(WARN, "fail to resolve async IVF source column", K(ret), KPC(index_schema));
+      }
+    } else {
+      ret = OB_ERR_UNEXPECTED;
+      SERVER_LOG(WARN, "unexpected user async index type", K(ret), KPC(index_schema));
+    }
+    if (OB_FAIL(ret) || is_end) {
     } else if (OB_ISNULL(buf = static_cast<char*>(allocator_->alloc(buf_len)))) {
       ret = OB_ALLOCATE_MEMORY_FAILED;
       LOG_WARN("allocate memory for print buffer failed", K(ret), K(buf_len));
@@ -1492,7 +1510,8 @@ int ObTableIndex::add_async_index_column(const ObString &database_name,
           }
             // index_type
           case OB_APP_MIN_COLUMN_ID + 13: {
-            cells[cell_idx].set_varchar(ObString("ASYNC FULLTEXT"));
+            cells[cell_idx].set_varchar(index_schema->is_async_fts_index()
+                ? ObString("ASYNC FULLTEXT") : ObString("ASYNC VECTOR"));
             cells[cell_idx].set_collation_type(ObCharset::get_default_collation(ObCharset::get_default_charset()));
             break;
           }

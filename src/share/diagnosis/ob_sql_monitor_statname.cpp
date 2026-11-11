@@ -19,7 +19,7 @@ ObSqlMonitorStatIds::ObSqlMonitorStatIds()
 #include "share/diagnosis/ob_sql_monitor_statname.h"
 #undef SQL_MONITOR_STATNAME_DEF
 
-  // UINT16_MAX is reserved for an unregistered slot in ObOpProfile::metrics_id_map_.
+  // Keep this limit consistent with the uint16_t ObOpProfile::metrics_id_map_.
   static_assert(
       ObSqlMonitorStatEnum::MONITOR_STATNAME_END < UINT16_MAX,
       "metric define more than UINT16_MAX, please modify ObOpProfile::metrics_id_map_ also");

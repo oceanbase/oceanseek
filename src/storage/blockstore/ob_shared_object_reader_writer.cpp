@@ -144,6 +144,7 @@ int ObSharedObjectsWriteCtx::advance_data_seq()
 {
   int ret = OB_SUCCESS;
   if (ObStorageObjectType::SHARED_MAJOR_META_MACRO == next_opt_.object_type_
+      || ObStorageObjectType::SHARED_NON_IDEM_MAJOR_META_MACRO == next_opt_.object_type_
       || ObStorageObjectType::SHARED_INC_MAJOR_COMPACTION_META_MACRO
           == next_opt_.object_type_
       || ObStorageObjectType::SHARED_INC_MAJOR_META_MACRO == next_opt_.object_type_) {

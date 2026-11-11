@@ -274,7 +274,9 @@ void ObPluginVectorIndexLoadScheduler::sweep_terminal_centroids_in_all_caches()
     int64_t pushed = 0;
     FOREACH_X(iter, mgr_map, OB_SUCC(ret) && pushed < MAX_MGR_PER_ROUND) {
       ObIvfCacheMgr *cm = iter->second;
-      if (OB_NOT_NULL(cm)) {
+      if (iter->first.is_sstable_key()) {
+        // DiskBBQ SSTable caches do not contain versioned map centroids.
+      } else if (OB_NOT_NULL(cm)) {
         cm->inc_ref();
         if (OB_FAIL(mgr_snapshot.push_back(cm))) {
           LOG_WARN("fail to push back mgr snapshot", KR(ret));

@@ -450,6 +450,7 @@
 #include "ob_expr_vec_ivf_pq_center_id.h"
 #include "ob_expr_vec_ivf_pq_center_ids.h"
 #include "ob_expr_vec_ivf_pq_center_vector.h"
+#include "ob_expr_vec_ivf.h"
 #include "ob_expr_bool.h"
 #include "ob_expr_not_between.h"
 #include "ob_expr_inner_info_cols_printer.h"
@@ -1526,9 +1527,9 @@ ObExprRandCanonical::calc_random_expr_canonical,                    /* 890 */
   ObExprLobAppendWrite::eval_lob_appendwrite,                         /* 920 */
   ObExprLobIdToString::eval_lob_id_to_string,                         /* 921 */
   ObExprLobSeqIdToString::eval_lob_seq_id_to_string,                  /* 922 */
-  NULL, // ObExprVecIVFBase::eval_vec_ivf_type,                       /* 923 */
-  NULL, // ObExprVecIVFBase::eval_vec_ivf_cid,                        /* 924 */
-  NULL, // ObExprVecIVFBase::eval_vec_ivf_data,                       /* 925 */
+  ObExprVecIVFBase::eval_vec_ivf_type,                                /* 923 */
+  ObExprVecIVFBase::eval_vec_ivf_cid,                                 /* 924 */
+  ObExprVecIVFBase::eval_vec_ivf_data,                                /* 925 */
   ObExprDslMultiValueRange::eval_dsl_multi_value_range,               /* 926 */
   ObExprExternalLob::eval_external_lob,                              /* 927 */
   ObExprLobMeta::eval_lob_meta,                                      /* 928 */

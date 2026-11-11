@@ -876,7 +876,8 @@ static int merge_params_string(const ObString &existing,
     tl = token.length();
     if (tl == 0) continue;
     const char *tp = token.ptr();
-    bool is_nprobes = (tl >= 12 && strncasecmp(tp, "IVF_NPROBES=", 12) == 0);
+    bool is_nprobes = (tl >= 12 && strncasecmp(tp, "IVF_NPROBES=", 12) == 0)
+        || (tl >= 8 && strncasecmp(tp, "NPROBES=", 8) == 0);
     bool is_ef = (tl >= 10 && strncasecmp(tp, "EF_SEARCH=", 10) == 0);
     if (is_nprobes) {
       has_nprobes = true;

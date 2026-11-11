@@ -211,7 +211,7 @@ public:
                         const int64_t *ids, int64_t count, const float *&dist);
   int get_extra_info_by_ids(const int64_t *ids, int64_t count,
                             char *extra_infos);
-  int get_raw_vector_by_ids(const int64_t *ids, int64_t count, float *&vectors, void *allocator = nullptr, int64_t dim = 0);
+  int get_raw_vector_by_ids(const int64_t *ids, int64_t count, float *&vectors, vsag::Allocator *allocator);
   int get_vid_bound(int64_t &min_vid, int64_t &max_vid);
   int check_id_exist(int64_t id, bool &exist);
   uint64_t estimate_memory(const uint64_t row_count, const bool is_build);
@@ -369,33 +369,21 @@ int HnswIndexHandler::get_extra_info_by_ids(const int64_t *ids, int64_t count,
   return ret;
 }
 
-int HnswIndexHandler::get_raw_vector_by_ids(const int64_t *ids, int64_t count, float *&vectors, void *allocator, int64_t dim)
+int HnswIndexHandler::get_raw_vector_by_ids(const int64_t *ids, int64_t count, float *&vectors,
+                                          vsag::Allocator *allocator)
 {
   int ret = OB_SUCCESS;
   vectors = nullptr;
-  tl::expected<DatasetPtr, Error> result = index_->GetRawVectorByIds(ids, count);
+  tl::expected<DatasetPtr, Error> result = index_->GetRawVectorByIds(ids, count, allocator);
   if (result.has_value()) {
     DatasetPtr ds = result.value();
-    const float *raw_vectors = ds->GetFloat32Vectors();
-    if (OB_ISNULL(raw_vectors)) {
+    if (OB_ISNULL(ds) || OB_ISNULL(ds->GetFloat32Vectors())) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("[OBVSAG] get_raw_vector_by_ids returned null vectors", K(ret), KP(ids), K(count));
     } else {
-      if (OB_NOT_NULL(allocator) && dim > 0) {
-        common::ObIAllocator *ob_allocator = static_cast<common::ObIAllocator *>(allocator);
-        int64_t total_size = count * dim * sizeof(float);
-        float *copied_vectors = static_cast<float *>(ob_allocator->alloc(total_size));
-        if (OB_ISNULL(copied_vectors)) {
-          ret = OB_ALLOCATE_MEMORY_FAILED;
-          LOG_WARN("[OBVSAG] fail to alloc memory for deep copy", K(ret), K(count), K(dim));
-        } else {
-          MEMCPY(copied_vectors, raw_vectors, total_size);
-          vectors = copied_vectors;
-        }
-      } else {
-        ret = OB_INVALID_ARGUMENT;
-        LOG_WARN("[OBVSAG] allocator is required for get_raw_vector_by_ids", K(ret), KP(ids), K(count));
-      }
+      // Transfer the buffer to the caller before the temporary Dataset dies.
+      ds->Owner(false);
+      vectors = const_cast<float *>(ds->GetFloat32Vectors());
     }
   } else {
     ret = vsag_errcode2ob(result.error().type);
@@ -1538,15 +1526,17 @@ int get_extra_info_by_ids(VectorIndexPtr &index_handler,
 }
 
 int get_raw_vector_by_ids(VectorIndexPtr &index_handler, const int64_t* ids, int64_t count, float *&vectors,
-                          void *allocator, int64_t dim)
+                          vsag::Allocator *allocator)
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(index_handler)) {
+  vectors = nullptr;
+  if (OB_ISNULL(index_handler) || OB_ISNULL(ids) || count <= 0 || OB_ISNULL(allocator)) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("[OBVSAG] null pointer addr", K(ret), KP(index_handler));
+    LOG_WARN("[OBVSAG] invalid raw vector read arguments",
+             K(ret), KP(index_handler), KP(ids), K(count), KP(allocator));
   } else {
     HnswIndexHandler *hnsw = static_cast<HnswIndexHandler *>(index_handler);
-    if (OB_FAIL(hnsw->get_raw_vector_by_ids(ids, count, vectors, allocator, dim))) {
+    if (OB_FAIL(hnsw->get_raw_vector_by_ids(ids, count, vectors, allocator))) {
       LOG_WARN("[OBVSAG] get_raw_vector_by_ids error happend", K(ret));
     }
   }

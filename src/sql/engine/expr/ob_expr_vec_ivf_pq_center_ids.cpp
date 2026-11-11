@@ -286,9 +286,11 @@ int ObExprVecIVFPQCenterIds::calc_pq_center_ids(
             LOG_WARN("failed to get center id", K(ret));
           } else {
             float *center_vec = nullptr;
+            ObVsagSearchAlloc hgraph_allocator(MTL_ID());
             
             if (is_cache_usable && has_hgraph) {
-              if (OB_FAIL(cent_cache->read_centroid(center_id.center_id_, center_vec, true /*deep_copy*/, &tmp_allocator))) {
+              if (OB_FAIL(cent_cache->read_centroid_from_hgraph(
+                      center_id.center_id_, center_vec, hgraph_allocator))) {
                 LOG_WARN("failed to read centroid from cache", K(ret), K(center_id.center_id_));
               }
             } else {

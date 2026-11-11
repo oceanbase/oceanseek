@@ -28,6 +28,7 @@ using namespace storage;
 // never produce __all_shared_gc_task rows
 ERRSIM_POINT_DEF(EN_SS_ATOMIC_PROTOCOL_FINISH_FAIL_NONE_MAJOR_SSTABLE);
 ERRSIM_POINT_DEF(EN_SS_ATOMIC_PROTOCOL_FINISH_FAIL_MAJOR_SSTABLE);
+ERRSIM_POINT_DEF(EN_SS_ATOMIC_PROTOCOL_FINISH_FAIL_NON_IDEM_MAJOR_SSTABLE);
 ERRSIM_POINT_DEF(EN_SS_ATOMIC_PROTOCOL_FINISH_FAIL_TABLET_META);
 ERRSIM_POINT_DEF(EN_SS_ATOMIC_PROTOCOL_ABORT_FAIL);
 
@@ -757,6 +758,8 @@ int ObAtomicProtocol::finish_(
         int tmp_ret = type_.get_ss_meta_ctrl_type(ctrl_type);
         if (OB_SUCCESS == tmp_ret && ctrl_type.is_major_sstable_type()) {
           INJECT_SS_GC_ERRSIM(EN_SS_ATOMIC_PROTOCOL_FINISH_FAIL_MAJOR_SSTABLE, tenant_id);
+        } else if (ObAtomicProtocolTypeEnum::NON_IDEM_MAJOR_SSTABLE == type_.type_) {
+          INJECT_SS_GC_ERRSIM(EN_SS_ATOMIC_PROTOCOL_FINISH_FAIL_NON_IDEM_MAJOR_SSTABLE, tenant_id);
         } else {
           INJECT_SS_GC_ERRSIM(EN_SS_ATOMIC_PROTOCOL_FINISH_FAIL_NONE_MAJOR_SSTABLE, tenant_id);
         }

@@ -99,6 +99,7 @@
 #include "storage/async_index/ob_async_index_ddl_refresh.h"
 #include "storage/async_index/ob_async_index_define.h"
 #include "storage/blocksstable/async_index/ob_inv_sstable.h"
+#include "storage/blocksstable/vector_index/ob_ivf_sstable.h"
 #endif
 
 namespace oceanbase
@@ -3313,6 +3314,7 @@ int ObRpcRemoteWriteDDLIncCommitLogP::process()
       ObSSTable data_inc_major;
       ObCOSSTableV2 data_co_inc_major;
       ObInvSSTable data_inv_inc_major;
+      ObIvfSSTable data_ivf_inc_major;
       ObSSTable lob_meta_inc_major;
       ObSSTable lob_piece_inc_major;
       ObSSTable *data_inc_major_ptr = nullptr;
@@ -3343,6 +3345,8 @@ int ObRpcRemoteWriteDDLIncCommitLogP::process()
           DESERIALIZE_INC_MAJOR(data, data_co_inc_major);
         } else if (arg_.is_inv_sstable_) {
           DESERIALIZE_INC_MAJOR(data, data_inv_inc_major);
+        } else if (ObITable::is_ivf_sstable(arg_.table_type_)) {
+          DESERIALIZE_INC_MAJOR(data, data_ivf_inc_major);
         } else {
           DESERIALIZE_INC_MAJOR(data, data_inc_major);
         }
@@ -5498,6 +5502,7 @@ int ObAsyncIndexRefreshP::process()
       storage::ObLSService *ls_service = MTL(storage::ObLSService*);
       storage::ObLSHandle ls_handle;
       storage::ObLS *ls = nullptr;
+      share::SCN min_publish_scn = share::SCN::base_scn();
       int64_t leader_proposal_id = -1;
       share::SCN target_scn;
       storage::ObAsyncIndexService *async_index_service = MTL(storage::ObAsyncIndexService*);
@@ -5517,6 +5522,12 @@ int ObAsyncIndexRefreshP::process()
         LOG_WARN("[ASYNC_INDEX] failed to capture refresh RPC proposal", K(ret), K(arg_));
       } else if (OB_FAIL(target_scn.convert_for_tx(arg_.target_refresh_scn_))) {
         LOG_WARN("[ASYNC_INDEX] fail to convert refresh target", K(ret), K(arg_));
+      } else if (OB_FAIL(storage::get_min_index_published_scn(arg_.tenant_id_, ls,
+                           dep_provider, arg_.index_tablet_ids_, min_publish_scn))) {
+        LOG_WARN("[ASYNC_INDEX] fail to get min index published scn", K(ret), K(arg_));
+      } else if (OB_UNLIKELY(!min_publish_scn.is_valid_and_not_min())) {
+        ret = OB_EAGAIN;
+        LOG_WARN("[ASYNC_INDEX] index publish scn is not ready", K(ret), K(arg_), K(min_publish_scn));
       } else {
         storage::ObAsyncIndexDDLRefreshOp refresh_op(
             *ls, leader_proposal_id, *async_index_service, *dep_provider, arg_, target_scn);
@@ -5537,7 +5548,7 @@ int ObAsyncIndexRefreshP::process()
           storage::ObTabletAsyncIndexRefreshInfo info;
           if (OB_FAIL(storage::maintain_async_index_refresh_info(
               arg_.tenant_id_, ls, leader_proposal_id, arg_.tablet_id_, target_scn,
-              share::SCN::base_scn(),
+              min_publish_scn,
               dep_provider, info, storage::OB_ASYNC_INDEX_DDL_LOCK_TIMEOUT_US, true /*skip_incr_check*/,
               nullptr /*checkpoint_capacity_full*/, ASYNC_REFRESH_TYPE_MANUAL == arg_.refresh_type_))) {
             LOG_WARN("[ASYNC_INDEX] fail to maintain refresh info", K(ret), K(arg_));

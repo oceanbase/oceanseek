@@ -35,6 +35,8 @@ int ObSSFailGCUtil::detect_sstable_block_ids(
   const bool is_object_info_match =
       (ObStorageObjectType::SHARED_MAJOR_SSTABLE_CTRL == meta_type
           && object_info.is_major())
+      || (ObStorageObjectType::SHARED_NON_IDEM_MAJOR_SSTABLE_CTRL == meta_type
+          && object_info.is_non_idem_major())
       || (ObStorageObjectType::SHARED_INC_MAJOR_SSTABLE_CTRL == meta_type
           && object_info.is_inc_major())
       || (ObStorageObjectType::SHARED_MINOR_SSTABLE_CTRL == meta_type
@@ -46,6 +48,7 @@ int ObSSFailGCUtil::detect_sstable_block_ids(
       || OB_UNLIKELY(object_info.parallel_cnt_ <= 0)
       || OB_UNLIKELY(op_id < 0)
       || OB_UNLIKELY(!object_info.is_major()
+          && !object_info.is_non_idem_major()
           && !object_info.is_inc_major()
           && !object_info.is_none_major())
       || OB_UNLIKELY(!is_object_info_match)
@@ -58,14 +61,15 @@ int ObSSFailGCUtil::detect_sstable_block_ids(
     const int64_t seq_step = object_info.seq_step_;
     const int64_t parallel_cnt = object_info.parallel_cnt_;
 
-    if (blocksstable::ObStorageObjectType::SHARED_MAJOR_SSTABLE_CTRL == meta_type) {
+    if (blocksstable::ObStorageObjectType::SHARED_MAJOR_SSTABLE_CTRL == meta_type
+        || blocksstable::ObStorageObjectType::SHARED_NON_IDEM_MAJOR_SSTABLE_CTRL == meta_type) {
       if (OB_UNLIKELY(object_info.cg_cnt_ < 0)
           || OB_UNLIKELY(!object_info.snapshot_version_.is_valid_and_not_min())) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("invalid major object_info", KR(ret), K(object_info));
       } else {
-        const int64_t fourth_id =
-            static_cast<int64_t>(object_info.snapshot_version_.get_val_for_tx());
+        const int64_t fourth_id = object_info.is_non_idem_major()
+            ? op_id : static_cast<int64_t>(object_info.snapshot_version_.get_val_for_tx());
         const int64_t physical_cg_cnt = 0 == object_info.cg_cnt_ ? 1 : object_info.cg_cnt_;
         for (int64_t cg_id = 0; OB_SUCC(ret) && cg_id < physical_cg_cnt; ++cg_id) {
           for (int64_t i = 0; OB_SUCC(ret) && i < parallel_cnt; ++i) {
@@ -189,6 +193,11 @@ int ObSSFailGCUtil::get_obj_types_(
   case blocksstable::ObStorageObjectType::SHARED_MAJOR_SSTABLE_CTRL: {
     data_obj_type = ObStorageObjectType::SHARED_MAJOR_DATA_MACRO;
     meta_obj_type = ObStorageObjectType::SHARED_MAJOR_META_MACRO;
+    break;
+  }
+  case blocksstable::ObStorageObjectType::SHARED_NON_IDEM_MAJOR_SSTABLE_CTRL: {
+    data_obj_type = ObStorageObjectType::SHARED_NON_IDEM_MAJOR_DATA_MACRO;
+    meta_obj_type = ObStorageObjectType::SHARED_NON_IDEM_MAJOR_META_MACRO;
     break;
   }
   case blocksstable::ObStorageObjectType::SHARED_INC_MAJOR_SSTABLE_CTRL: {

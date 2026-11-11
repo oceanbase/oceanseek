@@ -387,6 +387,31 @@ public:
   }
 };
 
+struct ObDASScalarScanCtDef;
+struct ObDASScalarScanRtDef;
+
+struct ObDASVecIndexAsyncIVFScanCtDef : ObDASVecIndexScanCtDef
+{
+  OB_UNIS_VERSION(1);
+public:
+  explicit ObDASVecIndexAsyncIVFScanCtDef(common::ObIAllocator &alloc)
+    : ObDASVecIndexScanCtDef(alloc, DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN) {}
+  static constexpr int64_t INDEX_SCAN_IDX = 0;
+  static constexpr int64_t DELETE_SCAN_IDX = 1;
+  const ObDASScanCtDef *get_index_scan_ctdef() const;
+  const ObDASScalarScanCtDef *get_delete_scan_ctdef() const;
+};
+
+struct ObDASVecIndexAsyncIVFScanRtDef : ObDASVecIndexScanRtDef
+{
+  OB_UNIS_VERSION(1);
+public:
+  ObDASVecIndexAsyncIVFScanRtDef()
+    : ObDASVecIndexScanRtDef(DAS_OP_VEC_INDEX_ASYNC_IVF_SCAN) {}
+  ObDASScanRtDef *get_index_scan_rtdef() const;
+  ObDASScalarScanRtDef *get_delete_scan_rtdef() const;
+};
+
 class ObDASVecIndexScanIter : public ObDASIter
 {
 public:

@@ -6,6 +6,7 @@
 #include "ob_vector_index_i_task_executor.h"
 #include "share/vector_index/ob_hybrid_vector_refresh_task.h"
 #include "share/vector_index/ob_ivf_async_task_executor.h"
+#include "share/vector_index/disk_bbq_cache/ob_disk_bbq_cache_task_executor.h"
 #include "share/vector_index/ob_vector_index_async_task.h"
 #include "share/vector_index/ob_vector_index_freeze_task.h"
 #include "share/vector_index/ob_vector_index_merge_task.h"
@@ -719,6 +720,10 @@ int ObVecITaskExecutor::do_check_task_result(
       case ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_INDEX_IVF_LOAD:
       case ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_INDEX_IVF_CLEAN:
         ret = ObIvfAsyncTaskExecutor::do_check_task_result(task_ctx, action);
+        break;
+      case ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_DISK_BBQ_CACHE_CLEAN:
+      case ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_DISK_BBQ_HGRAPH_BUILD:
+        ret = ObDiskBBQCacheTaskExecutor::do_check_task_result(task_ctx, action);
         break;
       case ObVecIndexAsyncTaskType::OB_VECTOR_ASYNC_INDEX_FREEZE:
         ret = ObVecIdxFreezeTaskExecutor::do_check_task_result(task_ctx, action);

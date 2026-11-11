@@ -232,6 +232,62 @@ int SSCompactHelper::finish_inc_major_compaction_task(
   return ret;
 }
 
+int SSCompactHelper::start_non_idem_major_task(
+    const share::ObLSID &ls_id,
+    const common::ObTabletID &tablet_id,
+    const share::SCN &transfer_scn,
+    const int64_t snapshot_version,
+    const int64_t seq_step_cnt,
+    const int64_t cg_cnt,
+    int64_t &op_id,
+    storage::ObSSTableAtomicProtocol &sstable_protocol)
+{
+  int ret = OB_SUCCESS;
+  ObAtomicProtocolType protocol_type;
+  ObSSMetaCtrlObjectInfo object_info;
+  share::SCN snapshot_scn;
+  op_id = -1;
+  protocol_type.type_ = ObAtomicProtocolTypeEnum::NON_IDEM_MAJOR_SSTABLE;
+  snapshot_scn.convert_for_logservice(static_cast<uint64_t>(snapshot_version));
+  if (OB_FAIL(object_info.init_by_non_idem_major(
+      snapshot_scn, MACRO_STEP_SIZE, seq_step_cnt, cg_cnt))) {
+    LOG_WARN("init non-idempotent major object info fail", K(ret),
+        K(snapshot_version), K(seq_step_cnt), K(cg_cnt));
+  } else if (OB_FAIL(sstable_protocol.init(
+      protocol_type, MTL_ID(), ls_id, tablet_id, transfer_scn, object_info))) {
+    LOG_WARN("init non-idempotent major protocol fail", K(ret), K(ls_id), K(tablet_id),
+        K(transfer_scn), K(object_info));
+  } else if (OB_FAIL(sstable_protocol.create(true/*检查 SS writer*/))) {
+    LOG_WARN("create non-idempotent major protocol fail", K(ret), K(ls_id), K(tablet_id),
+        K(transfer_scn), K(object_info));
+  } else if (OB_FAIL(sstable_protocol.get_op_id(op_id))) {
+    LOG_WARN("get non-idempotent major op id fail", K(ret), K(ls_id), K(tablet_id),
+        K(transfer_scn));
+  }
+  return ret;
+}
+
+int SSCompactHelper::finish_non_idem_major_task(
+    storage::ObSSTableAtomicProtocol &sstable_protocol)
+{
+  int ret = OB_SUCCESS;
+  if (!sstable_protocol.is_inited()) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("non-idempotent major protocol is not initialized", K(ret));
+  } else if (sstable_protocol.is_status_complete()) {
+    LOG_INFO("non-idempotent major task already finished");
+  } else if (!sstable_protocol.is_status_start()) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("non-idempotent major protocol status is unexpected", K(ret), K(sstable_protocol));
+  } else {
+    ObSSMetaAtomicSSTableOp finish_op;
+    if (OB_FAIL(sstable_protocol.finish(finish_op))) {
+      LOG_WARN("finish non-idempotent major protocol fail", K(ret), K(sstable_protocol));
+    }
+  }
+  return ret;
+}
+
 int SSCompactHelper::check_shared_major_exist(const share::ObLSID &ls_id,
                                               const common::ObTabletID &tablet_id,
                                               const share::SCN &transfer_scn,

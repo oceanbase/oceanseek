@@ -286,7 +286,7 @@ protected:
     } else {
       ret = executor.init(ctx.ls_.get_ls(), ctx.tablet_id_, ctx.end_scn_,
           ObTransID(tx_id), ObTxSEQ::from_seq(seq_no), ctx.local_.get_obj()->get_snapshot_version(),
-          DATA_VERSION_4_6_3_0, false, false, buffer, SCN::scn_dec(ctx.rec_scn_),
+          DATA_VERSION_4_6_3_0, false, false, table.get_key().table_type_, buffer, SCN::scn_dec(ctx.rec_scn_),
           need_check_ddl_checkpoint);
     }
     return ret;

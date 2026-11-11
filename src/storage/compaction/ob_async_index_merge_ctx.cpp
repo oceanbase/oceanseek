@@ -33,7 +33,8 @@ int ObAsyncIndexMergeCtx::build_ctx(bool &finish_flag)
   if (OB_FAIL(ObBasicTabletMergeCtx::build_ctx(finish_flag))) {
     LOG_WARN("failed to build basic merge ctx", KR(ret), KPC(this));
     CTX_SET_DIAGNOSE_LOCATION(*this);
-  } else if (OB_FAIL(prepare_inv_row_desc())) {
+  } else if (is_inv_index_merge()
+      && OB_FAIL(prepare_inv_row_desc())) {
     LOG_WARN("failed to prepare inv row desc", KR(ret), KPC(this));
     CTX_SET_DIAGNOSE_LOCATION(*this);
   }
@@ -47,7 +48,7 @@ int ObAsyncIndexMergeCtx::prepare_compaction_filter()
 
 int ObAsyncIndexMergeCtx::check_merge_ctx_valid()
 {
-  // Verify all input tables are inv SSTables. If tables_handle_ is empty,
+  // Verify all input tables match the concrete async index schema. If tables_handle_ is empty,
   // return OB_NO_NEED_MERGE so DAG finishes without creating merge tasks.
   int ret = OB_SUCCESS;
   if (!tablet_handle_.is_valid()) {
@@ -57,9 +58,12 @@ int ObAsyncIndexMergeCtx::check_merge_ctx_valid()
     ret = OB_NO_NEED_MERGE;
     LOG_INFO("no async index sstables to merge", K(ret));
   } else {
+    const bool is_ivf_index = static_param_.schema_->is_async_ivf_index();
     for (int64_t i = 0; OB_SUCC(ret) && i < static_param_.tables_handle_.get_count(); ++i) {
       const storage::ObITable *table = static_param_.tables_handle_.get_table(i);
-      if (OB_ISNULL(table) || !table->is_inv_sstable()) {
+      if (OB_ISNULL(table)
+          || (is_ivf_index && !table->is_ivf_sstable())
+          || (!is_ivf_index && !table->is_inv_sstable())) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("unexpected input table for async index merge", K(ret), K(i), KPC(table));
       }
@@ -118,6 +122,21 @@ int ObAsyncIndexMergeCtx::prepare_schema()
     }
     if (OB_NOT_NULL(medium_info)) {
       ObTabletObjLoadHelper::free(allocator, medium_info);
+    }
+  }
+  if (OB_SUCC(ret)) {
+    if (OB_ISNULL(static_param_.schema_)) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("async index storage schema is null", KR(ret), KPC(this));
+    } else if (static_param_.schema_->is_async_inverted_storage_index()) {
+      // Async FTS and Search Data share the inverted-index merge path.
+      static_param_.is_inv_index_ = true;
+    } else if (static_param_.schema_->is_async_ivf_index()) {
+      // Async DiskBBQ uses the IVF SSTable and merge DAG implementation.
+      static_param_.is_ivf_index_ = true;
+    } else {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("unexpected schema for async index merge dag", KR(ret), KPC(this));
     }
   }
   return ret;
@@ -218,7 +237,7 @@ int ObAsyncIndexMergeCtx::check_deletion_bitmap_ready(
         K(delete_index_tablet_id), K(async_snapshot));
   } else if (query_published_version < async_snapshot) {
     ret = OB_NEED_RETRY;
-    LOG_INFO("deletion tablet has not reached the fulltext merge snapshot",
+    LOG_INFO("deletion tablet has not reached the async index merge snapshot",
         KR(ret), K(delete_index_tablet_id), K(async_snapshot),
         K(query_published_version));
   } else {
@@ -255,7 +274,7 @@ int ObAsyncIndexMergeCtx::prepare_deletion_bitmap()
     } else if (OB_FAIL(check_deletion_bitmap_ready(
         *get_ls(), delete_index_tablet_id_, async_snapshot))) {
       if (OB_NEED_RETRY == ret) {
-        LOG_INFO("deletion bitmap input is not ready, retry fulltext merge later",
+        LOG_INFO("deletion bitmap input is not ready, retry async index merge later",
             K(ret), K_(delete_index_tablet_id), K(async_snapshot));
       } else {
         LOG_WARN("failed to check deletion bitmap input", K(ret),
@@ -269,7 +288,8 @@ int ObAsyncIndexMergeCtx::prepare_deletion_bitmap()
           K_(delete_index_table_id), K(async_snapshot), K(base_snapshot));
     } else {
       LOG_INFO("success to prepare deletion bitmap", K(ret), K_(delete_index_tablet_id),
-          K_(delete_index_table_id), K(async_snapshot), K(base_snapshot));
+          K_(delete_index_table_id), K(async_snapshot), K(base_snapshot),
+          "deletion_count", deletion_bitmap_handle_.get_deletion_count());
     }
   }
   return ret;
@@ -453,7 +473,8 @@ int ObAsyncIndexMergeCtx::init_inc_major_uncommit_tx_info()
       const ObITable *table = tables_handle.get_table(i);
       const ObSSTable *sstable = nullptr;
       ObSSTableMetaHandle meta_handle;
-      if (OB_ISNULL(table) || !table->is_inc_inv_sstable()) {
+      if (OB_ISNULL(table)
+          || (!table->is_inc_inv_sstable() && !table->is_inc_ivf_sstable())) {
         ret = OB_INVALID_ARGUMENT;
         LOG_WARN("invalid input table for async index inc major merge", KR(ret), KPC(table));
       } else if (OB_FALSE_IT(sstable = static_cast<const ObSSTable *>(table))) {

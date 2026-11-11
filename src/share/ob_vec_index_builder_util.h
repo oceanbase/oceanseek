@@ -18,6 +18,7 @@ namespace oceanbase
 namespace share
 {
 
+class ObColumnNameMap;
 class ObVecIndexBuilderUtil
 {
 public:
@@ -139,6 +140,7 @@ public:
       common::ObIAllocator &allocator,
       oceanbase::rootserver::ObDDLOperator &ddl_operator, 
       common::ObMySQLTransaction &trans, 
+      const ObColumnNameMap &col_name_map,
       common::hash::ObHashMap<ObString, common::ObSEArray<ObString, common::OB_PREALLOCATED_NUM>> &generate_column_name_map,
       ObSEArray<obrpc::ObColumnSortItem, 2> &domain_index_columns,
       ObSEArray<ObString, 1> &domain_store_columns);
@@ -322,6 +324,11 @@ private:
   static int adjust_vec_spiv_args(
       obrpc::ObCreateIndexArg &index_arg,
       ObTableSchema &data_schema, // not const since will add column to data schema
+      ObIAllocator &allocator,
+      ObIArray<ObColumnSchemaV2 *> &gen_columns);
+  static int adjust_async_ivf_args(
+      obrpc::ObCreateIndexArg &index_arg,
+      ObTableSchema &data_schema,
       ObIAllocator &allocator,
       ObIArray<ObColumnSchemaV2 *> &gen_columns);
   static int adjust_vec_ivfflat_args(

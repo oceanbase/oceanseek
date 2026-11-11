@@ -8,6 +8,7 @@
 #include "src/storage/meta_mem/ob_tablet_pointer.h"
 #include "src/storage/meta_mem/ob_tablet_pointer.h"
 #include "storage/blocksstable/async_index/ob_inv_idx_micro_block_transformer.h"
+#include "storage/blocksstable/vector_index/ob_ivf_fastscan_micro_block_transformer.h"
 
 namespace oceanbase
 {
@@ -174,7 +175,9 @@ int ObMicroBlockCacheValue::init(
   if (OB_UNLIKELY(OB_ISNULL(buf) || size <= 0 || block_type >= ObMicroBlockData::MAX_TYPE)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid cache value args", K(ret), KP(buf), K(size), K(block_type));
-  } else if (ObMicroBlockData::INV_IDX_POSTING_BLOCK == block_type) {
+  } else if (ObMicroBlockData::INV_IDX_POSTING_BLOCK == block_type
+      || ObMicroBlockData::IVF_FASTSCAN_BLOCK == block_type
+      || ObMicroBlockData::IVF_QUANTIZED_ROW_BLOCK == block_type) {
     block_data_.get_buf() = buf;
     block_data_.get_buf_size() = size;
     block_data_.micro_header_ = nullptr;
@@ -204,7 +207,9 @@ int ObMicroBlockCacheValue::deep_copy(char *buf, const int64_t buf_len, ObIKVCac
 {
   int ret = OB_SUCCESS;
   ObMicroBlockCacheValue *pvalue = NULL;
-  const bool is_raw_block = ObMicroBlockData::INV_IDX_POSTING_BLOCK == block_data_.type_;
+  const bool is_raw_block = ObMicroBlockData::INV_IDX_POSTING_BLOCK == block_data_.type_
+      || ObMicroBlockData::IVF_FASTSCAN_BLOCK == block_data_.type_
+      || ObMicroBlockData::IVF_QUANTIZED_ROW_BLOCK == block_data_.type_;
 
   if (OB_UNLIKELY(NULL == buf || buf_len < size())) {
     ret = OB_INVALID_ARGUMENT;
@@ -249,6 +254,11 @@ int ObMicroBlockCacheValue::deep_copy(char *buf, const int64_t buf_len, ObIKVCac
         break;
       }
       case ObMicroBlockData::Type::INV_IDX_POSTING_BLOCK: {
+        MEMCPY(new_buf + block_data_.get_buf_size(), block_data_.get_extra_buf(), block_data_.get_extra_size());
+        break;
+      }
+      case ObMicroBlockData::Type::IVF_FASTSCAN_BLOCK:
+      case ObMicroBlockData::Type::IVF_QUANTIZED_ROW_BLOCK: {
         MEMCPY(new_buf + block_data_.get_buf_size(), block_data_.get_extra_buf(), block_data_.get_extra_size());
         break;
       }
@@ -841,6 +851,150 @@ int ObAsyncSingleMicroBlockIOCallback::process(
 const char *ObAsyncSingleMicroBlockIOCallback::get_data()
 {
   return reinterpret_cast<const char *>(micro_block_);
+}
+
+/*-----------------------------------ObIvfVectorBlockIOCallback-----------------------------------*/
+ObIvfVectorBlockIOCallback::ObIvfVectorBlockIOCallback(
+    ObIAllocator &allocator,
+    const bool use_block_cache,
+    const ObIvfFastScanTransformContext &fastscan_ctx,
+    const ObMicroBlockData::Type target_cache_block_type)
+  : ObAsyncSingleMicroBlockIOCallback(),
+    fastscan_ctx_(fastscan_ctx),
+    target_cache_block_type_(target_cache_block_type)
+{
+  allocator_ = &allocator;
+  use_block_cache_ = use_block_cache;
+  STATIC_ASSERT(sizeof(*this) <= CALLBACK_BUF_SIZE, "IOCallback buf size not enough");
+}
+
+int ObIvfVectorBlockIOCallback::process_block(
+    ObMacroBlockReader *reader,
+    const char *buffer,
+    const int64_t offset,
+    const int64_t size,
+    const ObLogicMicroBlockId &logic_micro_id,
+    const int64_t data_checksum,
+    const ObMicroBlockCacheValue *&micro_block,
+    ObKVCacheHandle &cache_handle)
+{
+  int ret = OB_SUCCESS;
+  if (OB_ISNULL(reader) || OB_ISNULL(buffer) || OB_UNLIKELY(offset < 0 || size < 0)) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid IVF vector callback arguments",
+        K(ret), KP(reader), KP(buffer), K(offset), K(size));
+  } else if (OB_FAIL(process_ivf_vector_block(
+      buffer, offset, size, logic_micro_id, data_checksum,
+      micro_block, *reader, cache_handle))) {
+    LOG_WARN("failed to process IVF vector block", K(ret), K(offset), K(size));
+  }
+  return ret;
+}
+
+int ObIvfVectorBlockIOCallback::process_ivf_vector_block(
+    const char *buffer,
+    const int64_t offset,
+    const int64_t size,
+    const ObLogicMicroBlockId &logic_micro_id,
+    const int64_t data_checksum,
+    const ObMicroBlockCacheValue *&micro_block,
+    ObMacroBlockReader &reader,
+    ObKVCacheHandle &cache_handle)
+{
+  int ret = OB_SUCCESS;
+  ObMicroBlockHeader header;
+  ObIMicroBlockCache::BaseBlockCache *kvcache = nullptr;
+  ObMicroBlockCacheKey key;
+  char *transformed_buf = nullptr;
+  int64_t transformed_size = 0;
+  const char *payload_buf = nullptr;
+  int64_t payload_size = 0;
+  if (OB_UNLIKELY(size <= ObMicroBlockHeader::COLUMN_CHECKSUM_PTR_OFFSET)) {
+    ret = OB_INVALID_DATA;
+    LOG_WARN("invalid IVF vector block size", K(ret), KP(buffer), K(size));
+  } else if (OB_FAIL(header.deserialize_and_check_header(buffer, size))) {
+    LOG_WARN("failed to deserialize IVF row micro header", K(ret), KP(buffer), K(size));
+  } else if (OB_FAIL(header.check_and_get_record(
+      buffer, size, MICRO_BLOCK_HEADER_MAGIC, payload_buf, payload_size))) {
+    LOG_WARN("IVF row micro data is corrupted", K(ret), K_(block_id), K(offset), K(size));
+  } else if (OB_UNLIKELY(!fastscan_ctx_.is_valid()
+      || (ObMicroBlockData::IVF_FASTSCAN_BLOCK != target_cache_block_type_
+          && ObMicroBlockData::IVF_QUANTIZED_ROW_BLOCK != target_cache_block_type_))) {
+    ret = OB_INVALID_ARGUMENT;
+    LOG_WARN("invalid IVF vector transform context", K(ret), K_(fastscan_ctx));
+  } else if (OB_FAIL(transform_ivf_vector_block(
+      header, buffer, size, reader, transformed_buf, transformed_size))) {
+    LOG_WARN("failed to transform IVF vector block",
+        K(ret), K(size), K_(fastscan_ctx));
+  } else if (!use_block_cache_) {
+    if (OB_FAIL(build_micro_block_value(
+        transformed_buf, transformed_size, target_cache_block_type_,
+        micro_block, cache_handle))) {
+      LOG_WARN("failed to build IVF vector cache value", K(ret));
+    }
+  } else {
+    logic_micro_id.is_valid()
+        ? key.set(tenant_id_, logic_micro_id, data_checksum)
+        : key.set(tenant_id_, block_id_, offset, size);
+    if (OB_FAIL(cache_->get_cache(kvcache))) {
+      LOG_WARN("failed to get block cache", K(ret));
+    } else if (OB_UNLIKELY(OB_SUCCESS == (ret =
+        kvcache->get(key, micro_block, cache_handle)))) {
+      // A concurrent reader populated this format-specific cache while IO was in flight.
+      if (OB_ISNULL(micro_block) || micro_block->get_block_data().type_ != target_cache_block_type_) {
+        ret = OB_INVALID_DATA;
+        cache_handle.reset();
+        micro_block = nullptr;
+        LOG_WARN("unexpected IVF vector cache format", K(ret), K_(target_cache_block_type), K(key));
+      }
+    } else if (OB_ENTRY_NOT_EXIST != ret) {
+      LOG_WARN("failed to get IVF vector block from cache", K(ret), K(key));
+    } else if (OB_FAIL(cache_->put_cache_block(
+        block_des_meta_, target_cache_block_type_,
+        transformed_buf, transformed_size, key, reader, *allocator_,
+        micro_block, cache_handle, table_read_info_))) {
+      LOG_WARN("failed to put IVF vector block to cache",
+          K(ret), K(key), K(transformed_size));
+    }
+  }
+  if (OB_NOT_NULL(transformed_buf)) {
+    allocator_->free(transformed_buf);
+    transformed_buf = nullptr;
+  }
+  return ret;
+}
+
+int ObIvfVectorBlockIOCallback::transform_ivf_vector_block(
+    const ObMicroBlockHeader &header,
+    const char *raw_buffer,
+    const int64_t raw_size,
+    ObMacroBlockReader &reader,
+    char *&transformed_buf,
+    int64_t &transformed_size)
+{
+  int ret = OB_SUCCESS;
+  ObIvfVectorMicroBlockTransformer transformer;
+  transformed_buf = nullptr;
+  transformed_size = 0;
+  if (OB_FAIL(transformer.init(
+      header, raw_buffer, raw_size, block_des_meta_, reader,
+      *allocator_, fastscan_ctx_))) {
+    LOG_WARN("failed to init IVF vector micro block transformer", K(ret), K(raw_size));
+  } else {
+    if (ObMicroBlockData::IVF_FASTSCAN_BLOCK == target_cache_block_type_) {
+      ret = transformer.transform(transformed_buf, transformed_size);
+    } else {
+      ret = transformer.transform_quantized_rows(transformed_buf, transformed_size);
+    }
+    if (OB_FAIL(ret)) {
+      LOG_WARN("failed to transform IVF vector block", K(ret), K(transformed_size));
+    }
+  }
+  if (OB_FAIL(ret) && OB_NOT_NULL(transformed_buf)) {
+    allocator_->free(transformed_buf);
+    transformed_buf = nullptr;
+  }
+  return ret;
 }
 
 /*-----------------------------------ObMultiDataBlockIOCallback-----------------------------------*/
@@ -1612,9 +1766,11 @@ int ObDataMicroBlockCache::put_cache_block(
   int64_t payload_size = 0;
   const char *payload_buf = nullptr;
   ObIMicroBlockCache::BaseBlockCache *kvcache = nullptr;
-  if (ObMicroBlockData::INV_IDX_POSTING_BLOCK == block_type) {
+  if (ObMicroBlockData::INV_IDX_POSTING_BLOCK == block_type
+      || ObMicroBlockData::IVF_FASTSCAN_BLOCK == block_type
+      || ObMicroBlockData::IVF_QUANTIZED_ROW_BLOCK == block_type) {
     if (OB_FAIL(put_posting_cache_block(raw_block_buf, buf_size, key, block_type, micro_block, cache_handle))) {
-      LOG_WARN("Fail to put posting cache block", K(ret));
+      LOG_WARN("Fail to put posting cache block", K(ret), K(block_type));
     }
   } else if (OB_UNLIKELY(ObMicroBlockData::DATA_BLOCK != block_type)) {
     ret = OB_ERR_UNEXPECTED;
@@ -1691,7 +1847,9 @@ int ObDataMicroBlockCache::put_posting_cache_block(
 {
   int ret = OB_SUCCESS;
   ObMicroBlockCacheValue cache_value;
-  if (OB_UNLIKELY(ObMicroBlockData::INV_IDX_POSTING_BLOCK != block_type)) {
+  if (OB_UNLIKELY(ObMicroBlockData::INV_IDX_POSTING_BLOCK != block_type
+      && ObMicroBlockData::IVF_FASTSCAN_BLOCK != block_type
+      && ObMicroBlockData::IVF_QUANTIZED_ROW_BLOCK != block_type)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid posting block type", K(ret), K(block_type));
   } else if (OB_UNLIKELY(OB_ISNULL(raw_block_buf) || buf_size <= 0 || !key.is_valid())) {

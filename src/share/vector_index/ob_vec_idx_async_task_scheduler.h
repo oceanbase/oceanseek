@@ -16,6 +16,7 @@
 #include "share/vector_index/ob_vector_index_i_task_executor.h"
 #include "share/vector_index/ob_hybrid_vector_refresh_task.h"
 #include "share/vector_index/ob_ivf_async_task_executor.h"
+#include "share/vector_index/disk_bbq_cache/ob_disk_bbq_cache_task_executor.h"
 #include "share/vector_index/ob_vector_index_freeze_task.h"
 #include "share/vector_index/ob_vector_index_merge_task.h"
 #include "share/vector_index/ob_vector_index_alter_param_task.h"
@@ -42,6 +43,7 @@ struct ObVecIdxLeaderExecutors
   void set_need_resume(bool val) { ATOMIC_STORE(&need_resume_, val); }
   bool test_and_clear_need_resume() { return ATOMIC_TAS(&need_resume_, false); }
   TO_STRING_KV(K_(is_inited), K_(need_resume), K_(async_task_exec), K_(ivf_task_exec),
+               K_(disk_bbq_cache_task_exec),
                K_(embedding_task_exec), K_(freeze_exec), K_(merge_exec), K_(mem_sync_exec),
                K_(ivf_cache_rewarm_exec), K_(alter_param_exec),K_(ref_cnt), K_(is_removed));
   bool is_inited_;
@@ -50,6 +52,7 @@ struct ObVecIdxLeaderExecutors
   bool is_removed_;
   ObVecAsyncTaskExecutor async_task_exec_;
   ObIvfAsyncTaskExecutor ivf_task_exec_;
+  ObDiskBBQCacheTaskExecutor disk_bbq_cache_task_exec_;
   ObVecEmbeddingAsyncTaskExecutor embedding_task_exec_;
   ObVecIdxFreezeTaskExecutor freeze_exec_;
   ObVecIdxMergeTaskExecutor merge_exec_;
@@ -71,7 +74,8 @@ struct ObVecIdxFollowerExecutors
   void set_need_resume(bool val) { ATOMIC_STORE(&need_resume_, val); }
   bool test_and_clear_need_resume() { return ATOMIC_TAS(&need_resume_, false); }
   TO_STRING_KV(K_(is_inited), K_(need_resume), K_(ref_cnt), K_(is_removed),
-               K_(mem_sync_exec), K_(ivf_task_exec), K_(ivf_cache_cleanup_exec));
+               K_(mem_sync_exec), K_(ivf_task_exec), K_(ivf_cache_cleanup_exec),
+               K_(disk_bbq_cache_task_exec));
   bool is_inited_;
   bool need_resume_;
   int64_t ref_cnt_;
@@ -79,6 +83,7 @@ struct ObVecIdxFollowerExecutors
   ObVecMemSyncExecutor mem_sync_exec_;
   ObIvfAsyncTaskExecutor ivf_task_exec_;
   ObIvfCacheRewarmExecutor ivf_cache_cleanup_exec_;
+  ObDiskBBQCacheTaskExecutor disk_bbq_cache_task_exec_;
 };
 
 struct ObVecAsyncSchedDiagStat
@@ -304,7 +309,7 @@ private:
   int cancel_tablet_async_tasks_(const common::ObTabletID &tablet_id,
                                  ObPluginVectorIndexMgr &mgr);
   // Cancel ctxs whose truncate_version_ is older than the table's current
-  // truncate_version. Skips IVF_CLEAN. Used when a tablet still exists but the
+  // truncate_version. Skips IVF_CLEAN and DISK_BBQ_CACHE_CLEAN. Used when a tablet still exists but the
   // schema has bumped truncate_version.
   int cancel_tablet_async_tasks_for_truncated_(const common::ObTabletID &tablet_id,
                                                const int64_t truncate_version,

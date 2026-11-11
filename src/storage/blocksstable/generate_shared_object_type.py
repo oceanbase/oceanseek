@@ -427,9 +427,11 @@ def start_generate_cpp(cpp_file_name):
 #include "ob_storage_object_type.h"
 #include "storage/blocksstable/ob_object_manager.h"
 #include "storage/meta_store/ob_tenant_storage_meta_service.h"
-#include "close_modules/shared_storage/storage/shared_storage/ob_file_helper.h"
-#include "close_modules/shared_storage/storage/shared_storage/ob_dir_manager.h"
-#include "close_modules/shared_storage/storage/shared_storage/storage_cache_policy/ob_storage_cache_service.h"
+#ifdef OB_BUILD_SHARED_STORAGE
+#include "src/storage/shared_storage/ob_file_helper.h"
+#include "src/storage/shared_storage/ob_dir_manager.h"
+#include "src/storage/shared_storage/storage_cache_policy/ob_storage_cache_service.h"
+#endif
 
 namespace oceanbase
 {

@@ -1026,7 +1026,8 @@ int ObJoinOrder::compute_base_table_parallel_and_server_info(const OpParallelRul
     if (OpParallelRule::OP_TABLE_DOP == op_parallel_rule) {
       final_parallel = index_schema->get_dop();
     }
-    if ((index_schema->is_spatial_index() || index_schema->is_vec_index()) && index_schema->get_partition_num() <  final_parallel) {
+    if ((index_schema->is_spatial_index() || index_schema->is_vec_or_async_vec_index()) &&
+        index_schema->get_partition_num() < final_parallel) {
       final_parallel = index_schema->get_partition_num();
     }
     if (final_parallel < ObGlobalHint::DEFAULT_PARALLEL) {
@@ -1865,12 +1866,13 @@ int ObJoinOrder::process_basic_vec_info_for_index_merge_node(const ObDMLStmt *st
         index_merge_path->vec_idx_info_->vec_extra_info_, stmt->get_vector_index_query_param(), false))) {
       LOG_WARN("set vector index adaptive try path", K(ret));
     }
-  } else if (vec_index_schema->is_vec_ivf_index()) {
+  } else if (vec_index_schema->is_vec_ivf_index() || vec_index_schema->is_async_ivf_index()) {
     // Index-merge / hybrid fusion previously only filled vector_index_param_ for HNSW; IVF kept
     // default nlist_=0 and broke DAS IVF cache init (OB_ALLOCATE_MEMORY_FAILED / -4013).
     index_merge_path->vec_idx_info_->inited_ = true;
     ObVecIndexType pre_vec_type =
-        (!ObVectorIndexUtil::is_enable_ivf_adaptive_scan(vec_index_schema->is_vec_ivf_index())
+        (!vec_index_schema->is_async_ivf_index()
+         && !ObVectorIndexUtil::is_enable_ivf_adaptive_scan(vec_index_schema->is_vec_ivf_index())
          && helper.vec_index_type_ == ObVecIndexType::VEC_INDEX_ADAPTIVE_SCAN)
             ? ObVecIndexType::VEC_INDEX_PRE
             : helper.vec_index_type_;
@@ -1986,7 +1988,7 @@ int ObJoinOrder::process_vec_index_info(const ObDMLStmt *stmt,
   } else if (OB_ISNULL(index_schema)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("unexpected nullptr to index schema", K(ret));
-  } else if (!index_schema->is_vec_index()) {
+  } else if (!index_schema->is_vec_or_async_vec_index()) {
     bool has_aggr = false;
     vector_expr = stmt->get_first_vector_expr();
     if (stmt->is_select_stmt() && FALSE_IT(select_stmt = static_cast<const ObSelectStmt*>(stmt))) {
@@ -2002,13 +2004,13 @@ int ObJoinOrder::process_vec_index_info(const ObDMLStmt *stmt,
       LOG_WARN("failed to get matched vector index table id", K(ret));
     } else if (vec_index_id == OB_INVALID_ID) {
       // not vec expr column, ignore
-    } else if (OB_FAIL(access_path.vec_idx_info_->vec_index_ids_.push_back(vec_index_id))) {
-      LOG_WARN("failed to push_back vec index tale id", K(ret));
-    }  else if (OB_FAIL(schema_guard->get_table_schema(vec_index_id, vec_index_schema))) {
+    } else if (OB_FAIL(schema_guard->get_table_schema(vec_index_id, vec_index_schema))) {
       LOG_WARN("failed to get index table schema", K(ret), K(vec_index_id));
     } else if (OB_ISNULL(vec_index_schema)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("unexpected nullptr to index schema", K(ret));
+    } else if (OB_FAIL(access_path.vec_idx_info_->vec_index_ids_.push_back(vec_index_id))) {
+      LOG_WARN("failed to push_back vec index tale id", K(ret));
     } else {
       is_ipivf = ObVectorIndexUtil::is_sindi_index(vec_index_schema);
       // if there is no filter and need vector index scan, set helper.vec_index_type_ to post without filter.
@@ -2051,7 +2053,7 @@ int ObJoinOrder::process_vec_index_info(const ObDMLStmt *stmt,
     ObVecIndexType post_vec_type =
         ((helper.filters_.count() > 0 || !stmt->get_subquery_exprs().empty() || helper.match_expr_infos_.count() > 0 ||
           helper.is_index_merge_) &&
-         (index_schema->is_vec_hnsw_index() ||
+         (index_schema->is_vec_hnsw_index() || index_schema->is_async_ivf_index() ||
           ObVectorIndexUtil::is_enable_ivf_iterative_filter(index_schema->is_vec_ivf_index())))
             ? ObVecIndexType::VEC_INDEX_POST_ITERATIVE_FILTER
             : ObVecIndexType::VEC_INDEX_POST_WITHOUT_FILTER;
@@ -2069,6 +2071,9 @@ int ObJoinOrder::process_vec_index_info(const ObDMLStmt *stmt,
     LOG_WARN("vec_table_schema unexpected null", K(ret));
   } else {
     double selectivity = 0.0;
+    access_path.vec_idx_info_->vec_extra_info_.is_adaptive_specify_by_hint_ =
+        helper.is_adaptive_specify_by_hint_
+        && helper.vec_index_id_ == vec_index_schema->get_table_id();
     if (OB_FAIL(ObOptSelectivity::calculate_selectivity(get_plan()->get_basic_table_metas(),
                                                         get_plan()->get_selectivity_ctx(),
                                                         get_restrict_infos(),
@@ -3133,7 +3138,7 @@ int ObJoinOrder::is_vector_inv_index_tid(const uint64_t index_table_id, bool& is
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("index schema should not be null", K(ret));
   } else {
-    is_vec_tid = index_schema->is_vec_index();
+    is_vec_tid = index_schema->is_vec_or_async_vec_index();
   }
   return ret;
 }
@@ -3291,7 +3296,7 @@ int ObJoinOrder::fill_index_info_entry(const uint64_t table_id,
         entry->set_is_unique_index(is_unique_index);
         entry->set_is_fulltext_index(index_schema->is_fts_index_aux());
         entry->set_is_multivalue_index(index_schema->is_multivalue_index_aux());
-        entry->set_is_vector_index(index_schema->is_vec_index());
+        entry->set_is_vector_index(index_schema->is_vec_or_async_vec_index());
         entry->set_is_search_index(index_schema->is_search_def_index());
         entry->get_ordering_info().set_scan_direction(direction);
         entry->set_force_direction(force_direction);
@@ -22711,7 +22716,9 @@ int ObJoinOrder::add_valid_vec_index_ids(const ObDMLStmt &stmt,
       // if hnsw, do not add vec_index_tid, mark adaptive_scan
       helper.vec_index_type_ = ObVecIndexType::VEC_INDEX_ADAPTIVE_SCAN;
     } else if (helper.vec_index_type_ != ObVecIndexType::VEC_INDEX_ADAPTIVE_SCAN
-          && ObVectorIndexUtil::is_enable_ivf_adaptive_scan(is_vec_ivf_index(index_type))) {
+               && (is_async_ivf_index(index_type)
+                   || ObVectorIndexUtil::is_enable_ivf_adaptive_scan(
+                       is_vec_ivf_index(index_type)))) {
       // if ivf, do not add vec_index_tid, mark adaptive_scan
       helper.vec_index_type_ = ObVecIndexType::VEC_INDEX_ADAPTIVE_SCAN;
     } else {
@@ -24036,13 +24043,15 @@ int ObJoinOrder::get_valid_vec_hint_index_list(const uint64_t table_id, const ui
       } else if (OB_ISNULL(index_hint_table_schema)) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("unexpected nullptr to index hint table schema", K(ret), K(tid));
-      } else if (index_hint_table_schema->is_vec_index()) {
+      } else if (index_hint_table_schema->is_vec_or_async_vec_index()) {
         has_vec_hint = true;
         const ObIndexHint* hint = hint_index_hints.at(i);
         if (OB_NOT_NULL(hint)) {
           helper.vec_index_id_ = tid;
           vec_hint_applied = true;
           int filter_type = hint->get_filter_type();
+          helper.is_adaptive_specify_by_hint_ =
+              VecFilterType::PRE_FILTER == filter_type || VecFilterType::POST_FILTER == filter_type;
           if (stmt->has_es_match()) {
             helper.vec_index_type_ = ObVecIndexType::VEC_INDEX_PRE;
           } else if (helper.filters_.count() > 0 || !stmt->get_subquery_exprs().empty() || has_match_expr_on_table) {
@@ -24119,7 +24128,7 @@ int ObJoinOrder::get_valid_hint_index_list(const ObDMLStmt &stmt,
       // scan with both global index and fulltext index is not supported yet
     } else if (stmt.has_vec_approx() && invalid_index_for_vec_pre_filter(index_hint_table_schema)) {
       // skip
-    } else if (index_hint_table_schema->is_vec_index()) {
+    } else if (index_hint_table_schema->is_vec_or_async_vec_index()) {
       has_vec_hint = true;
       if (helper.vec_index_id_ != OB_INVALID_ID) {
       } else if (helper.is_index_merge_ || !helper.match_expr_infos_.empty()) {
@@ -24134,7 +24143,9 @@ int ObJoinOrder::get_valid_hint_index_list(const ObDMLStmt &stmt,
             && index_hint_table_schema->is_vec_hnsw_index()) {
           // hint choose vec index post-with-filter
           vec_with_filter_index_type = ObVecIndexType::VEC_INDEX_ADAPTIVE_SCAN;
-        } else if (ObVectorIndexUtil::is_enable_ivf_adaptive_scan(index_hint_table_schema->is_vec_ivf_index())) {
+        } else if (index_hint_table_schema->is_async_ivf_index()
+                   || ObVectorIndexUtil::is_enable_ivf_adaptive_scan(
+                       index_hint_table_schema->is_vec_ivf_index())) {
           vec_with_filter_index_type = ObVecIndexType::VEC_INDEX_ADAPTIVE_SCAN;
         } else {
           vec_with_filter_index_type = ObVecIndexType::VEC_INDEX_POST_ITERATIVE_FILTER;

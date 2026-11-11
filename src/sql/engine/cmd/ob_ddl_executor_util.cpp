@@ -5,6 +5,7 @@
 
 #define USING_LOG_PREFIX SQL_ENG
 #include "ob_ddl_executor_util.h"
+#include "rootserver/ddl_task/ob_ddl_task.h"
 #include "observer/ob_server_event_history_table_operator.h"
 
 namespace oceanbase
@@ -31,6 +32,42 @@ int ObDDLExecutorUtil::handle_session_exception(ObSQLSessionInfo &session)
   } else if (is_standby) {
     ret = OB_SESSION_KILLED;
     LOG_WARN("session is killed", KR(ret));
+  }
+  return ret;
+}
+
+// Return only a reportable terminal DDL error. Lookup failures leave the DDL
+// pending for the next check rather than becoming its result.
+static int try_report_async_ivf_terminal_failure(
+    const uint64_t tenant_id,
+    const int64_t task_id,
+    bool &inspect_async_cleanup,
+    int64_t &next_failure_check_ts,
+    ObDDLErrorMessageTableOperator::ObBuildDDLErrorMessage &error_message)
+{
+  int ret = OB_SUCCESS;
+  // Final results still mean cleanup is complete. A persisted terminal
+  // failure of async IVF can be returned earlier while its task keeps the
+  // cleanup locks/snapshots, only if the executor will not retry it.
+  if (inspect_async_cleanup && ObTimeUtility::current_time() >= next_failure_check_ts) {
+    next_failure_check_ts = ObTimeUtility::current_time() + 1000 * 1000;
+    ObArenaAllocator allocator(ObMemAttr(tenant_id, "AsyncDdlFail"));
+    rootserver::ObDDLTaskRecord task_record;
+    const int record_ret = rootserver::ObDDLTaskRecordOperator::get_ddl_task_record(
+        tenant_id, task_id, *GCTX.sql_proxy_, allocator, task_record);
+    if (OB_SUCCESS == record_ret) {
+      inspect_async_cleanup = DDL_CREATE_ASYNC_VEC_IVF_INDEX == task_record.ddl_type_;
+      if (inspect_async_cleanup
+          && rootserver::ObDDLTask::can_report_terminal_failure_before_cleanup(task_record)) {
+        ret = static_cast<int>(task_record.ret_code_);
+        error_message.ret_code_ = ret;
+        FORWARD_USER_ERROR(ret, ob_strerror(ret));
+        LOG_INFO("return async IVF terminal failure while background cleanup continues",
+            K(ret), K(task_id));
+      }
+    } else if (OB_ENTRY_NOT_EXIST != record_ret) {
+      LOG_WARN("fail to inspect async IVF cleanup status", K(record_ret), K(task_id));
+    }
   }
   return ret;
 }
@@ -65,6 +102,8 @@ int ObDDLExecutorUtil::wait_ddl_finish(
     int tmp_ret = OB_SUCCESS;
     bool is_tenant_dropped = false;
     bool is_tenant_standby = false;
+    bool inspect_async_cleanup = true;
+    int64_t next_failure_check_ts = 0;
     while (OB_SUCC(ret)) {
       if (OB_SUCCESS == ObDDLErrorMessageTableOperator::get_ddl_error_message(
           tenant_id, task_id, -1 /* target_object_id */, unused_addr, false /* is_ddl_retry_task */, *GCTX.sql_proxy_, error_message, unused_user_msg_len)) {
@@ -100,6 +139,10 @@ int ObDDLExecutorUtil::wait_ddl_finish(
         }
         break;
       } else {
+        if (OB_FAIL(try_report_async_ivf_terminal_failure(
+                tenant_id, task_id, inspect_async_cleanup, next_failure_check_ts, error_message))) {
+          break;
+        }
         if (OB_FAIL(ret)) {
         } else if (OB_TMP_FAIL(ObDDLUtil::check_tenant_status_normal(GCTX.sql_proxy_, tenant_id))) {
           if (OB_TENANT_HAS_BEEN_DROPPED == tmp_ret) {

@@ -368,7 +368,7 @@ int ObRADatumStore::init(int64_t mem_limit,
 
 void ObRADatumStore::set_mem_hold(int64_t hold)
 {
-  inc_mem_hold(hold - mem_hold_);
+  inc_mem_hold(hold - get_mem_hold());
 }
 
 void ObRADatumStore::inc_mem_hold(int64_t hold)
@@ -380,7 +380,7 @@ void ObRADatumStore::inc_mem_hold(int64_t hold)
       mem_stat_->free(-hold);
     }
   }
-  mem_hold_ += hold;
+  ATOMIC_AAF(&mem_hold_, hold);
 }
 
 void ObRADatumStore::reset()
@@ -1387,14 +1387,14 @@ int ObRADatumStore::dump_block_if_need(const int64_t extra_size)
 {
   int ret = OB_SUCCESS;
   if (OB_UNLIKELY(need_dump(extra_size))) {
-    int64_t target_dump_size = extra_size + mem_hold_ - mem_limit_;
+    int64_t target_dump_size = extra_size + get_mem_hold() - mem_limit_;
     // Check whether an IndexBlock will be added, and pre-allocate the corresponding mem size
     if ((NULL == idx_blk_ && blocks_.count() >= DEFAULT_BLOCK_CNT - 1) ||
          (NULL != idx_blk_ && idx_blk_->is_full())) {
       target_dump_size += IndexBlock::INDEX_BLOCK_SIZE;
     }
     if (OB_FAIL(dump(false, std::max(target_dump_size, BIG_BLOCK_SIZE)))) {
-      LOG_WARN("fail to dump block", K(ret), K(mem_hold_), K(mem_limit_));
+      LOG_WARN("fail to dump block", K(ret), "mem_hold", get_mem_hold(), K(mem_limit_));
     }
   }
   return ret;
@@ -1405,9 +1405,9 @@ bool ObRADatumStore::need_dump(const int64_t extra_size)
   bool need_to_dump = false;
   if (!GCONF.is_sql_operator_dump_enabled()) { // no dump
   } else if (mem_limit_ > 0) {
-    if (mem_hold_ + extra_size > mem_limit_) {
+    if (get_mem_hold() + extra_size > mem_limit_) {
       need_to_dump = true;
-      LOG_TRACE("need dump", K(mem_hold_), K(mem_limit_));
+      LOG_TRACE("need dump", "mem_hold", get_mem_hold(), K(mem_limit_));
     }
   } else {
     const int64_t mem_ctx_pct_trigger = 80;

@@ -78,10 +78,6 @@ ObIndependentDag::ObIndependentDag(const ObDagType::ObDagTypeEnum type)
 
 ObIndependentDag::~ObIndependentDag()
 {
-  if (OB_NOT_NULL(monitor_node_)) {
-    monitor_node_->mark_finished();
-    monitor_node_ = nullptr;
-  }
   reset();
 }
 
@@ -354,6 +350,12 @@ void ObIndependentDag::reset()
   inner_clear_task_list(waiting_task_list_);
   is_independent_ = true;
   ObIDag::reset();
+  // Task destructors still publish into their monitor infos. Finish both task
+  // lists before publishing completion for expiration cleanup.
+  if (OB_NOT_NULL(monitor_node_)) {
+    monitor_node_->mark_finished();
+    monitor_node_ = nullptr;
+  }
 }
 
 int ObIndependentDag::check_cycle()
