@@ -65,6 +65,7 @@ struct ObRetryTaskNode : public common::ObDLinkBase<ObRetryTaskNode>
     param.is_complete_refresh_ = stat_.is_complete_refresh_;
     param.is_refresh_on_error_skip_ = stat_.is_refresh_on_error_skip_;
     param.is_search_index_ = stat_.is_search_index_;
+    param.is_ivf_index_ = stat_.is_ivf_index_;
     param.sql_ = &sql_;
     param.ls_scheduler_ = scheduler;
   }

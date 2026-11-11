@@ -1150,6 +1150,8 @@ int ObExternalSortRound<T, Compare>::init(
     merge_count_ = merge_count;
     file_buf_size_ = file_buf_size;
     iters_.reset();
+    iters_.set_tenant_id(tenant_id);
+    allocator_.set_tenant_id(tenant_id);
     expire_timestamp_ = expire_timestamp;
     compare_ = compare;
     tenant_id_ = tenant_id;
@@ -1495,7 +1497,7 @@ public:
   ObMemorySortRound(ObIAllocator &allocator);
   virtual ~ObMemorySortRound();
   int init(const int64_t mem_limit, const int64_t expire_timestamp,
-      Compare *compare, ExternalSortRound *next_round);
+      const uint64_t tenant_id, Compare *compare, ExternalSortRound *next_round);
   int add_item(const T &item);
   int build_fragment();
   virtual int get_next_item(const T *&item);
@@ -1545,7 +1547,7 @@ ObMemorySortRound<T, Compare>::~ObMemorySortRound()
 template<typename T, typename Compare>
 int ObMemorySortRound<T, Compare>::init(
     const int64_t mem_limit, const int64_t expire_timestamp,
-    Compare *compare, ExternalSortRound *next_round)
+    const uint64_t tenant_id, Compare *compare, ExternalSortRound *next_round)
 {
   int ret = common::OB_SUCCESS;
   if (OB_UNLIKELY(is_inited_)) {
@@ -1559,6 +1561,8 @@ int ObMemorySortRound<T, Compare>::init(
     STORAGE_LOG(WARN, "invalid arguments", K(ret), K(mem_limit), KP(compare),
         KP(next_round), "next round inited", next_round->is_inited());
   } else {
+    allocator_.set_tenant_id(tenant_id);
+    item_list_.get_allocator().set_tenant_id(tenant_id);
     is_inited_ = true;
     is_in_memory_ = false;
     has_data_ = false;
@@ -1877,7 +1881,7 @@ int ObExternalSort<T, Compare>::init(
         expire_timestamp, tenant_id_, compare_))) {
       STORAGE_LOG(WARN, "fail to init current sort round", K(ret));
     } else if (OB_FAIL(memory_sort_round_.init(buf_mem_limit_,
-        expire_timestamp, compare_, curr_round_))) {
+        expire_timestamp, tenant_id_, compare_, curr_round_))) {
       STORAGE_LOG(WARN, "fail to init memory sort round", K(ret));
     } else {
       is_inited_ = true;

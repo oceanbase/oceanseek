@@ -144,6 +144,9 @@ public:
 
   int get_ddl_sample_sort_column_count(int64_t &sample_sort_column_count);
 
+  int check_async_ivf_build(const IndexDMLInfo &index_dml_info,
+                                   bool &use_async_ivf_build) const;
+
   int get_ddl_sort_keys_with_part_expr(ObExchangeInfo &exch_info,
                                        common::ObIArray<OrderItem> &sort_keys,
                                        common::ObIArray<OrderItem> &sample_sort_keys);

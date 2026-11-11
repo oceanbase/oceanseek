@@ -583,6 +583,7 @@ struct ObRefreshTaskStat
     trace_id_buf_[0] = '\0';
     trace_id_len_ = 0;
     is_search_index_ = false;
+    is_ivf_index_ = false;
   }
 
   bool is_valid() const
@@ -621,7 +622,8 @@ struct ObRefreshTaskStat
                K_(is_partition_local),
                K_(is_delete_index),
                K_(is_complete_refresh),
-               K_(is_search_index));
+               K_(is_search_index),
+               K_(is_ivf_index));
 
   uint64_t tenant_id_;
   uint64_t data_table_id_;
@@ -658,6 +660,7 @@ struct ObRefreshTaskStat
   char trace_id_buf_[common::OB_MAX_TRACE_ID_BUFFER_SIZE];  // 刷新 SQL 的 trace_id
   int32_t trace_id_len_;
   bool is_search_index_;               // 当前刷新目标是否为 Search Data
+  bool is_ivf_index_;                  // Target consumes unordered IVF Capture input.
 };
 
 // ======================== 行级数据错误白名单 ========================
@@ -710,6 +713,7 @@ struct ObAsyncIndexRefreshTaskParam
       is_complete_refresh_(false),
       is_refresh_on_error_skip_(false),
       is_search_index_(false),
+      is_ivf_index_(false),
       skip_dop_quota_(false),
       sql_(nullptr),
       ls_scheduler_(nullptr)
@@ -747,6 +751,7 @@ struct ObAsyncIndexRefreshTaskParam
                K_(is_delete_index),
                K_(is_complete_refresh),
                K_(is_search_index),
+               K_(is_ivf_index),
                "sql_len", (nullptr == sql_ ? 0 : sql_->length()),
                KP_(ls_scheduler));
 
@@ -776,6 +781,7 @@ struct ObAsyncIndexRefreshTaskParam
   bool is_complete_refresh_;
   bool is_refresh_on_error_skip_;       // REFRESH_ON_ERROR=SKIP 时为 true
   bool is_search_index_;               // 当前刷新目标是否为 Search Data
+  bool is_ivf_index_;                  // Target consumes unordered IVF Capture input.
   bool skip_dop_quota_;                // RPC direct path: skip DOP pool admission, use parallelism=1
   const common::ObSqlString *sql_;      // pre-generated refresh SQL (referenced, not owned)
   ObLSAsyncIndexScheduler *ls_scheduler_;  // LS scheduler owning epoch/retry list (nullable)

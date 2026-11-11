@@ -10,6 +10,7 @@
 #include "share/vector_index/hca/ob_vector_hca_common.h"
 #include "share/vector_type/ob_vector_common_util.h"
 #include "storage/ddl/ob_cg_row_tmp_file.h"
+#include "storage/direct_load/ob_direct_load_batch_datum_rows.h"
 #include "storage/blocksstable/vector_index/ob_ivf_refresh_monitor.h"
 #include "storage/ddl/ob_ddl_independent_dag.h"
 #include <cmath>
@@ -175,14 +176,30 @@ int ObIVFCaptureOperator::init(
 
 int ObIVFCaptureOperator::consume_batch_(const ObBatchDatumRows &batch)
 {
+  return consume_batch(batch, 0, batch.row_count_);
+}
+
+int ObIVFCaptureOperator::consume_batch(
+    const ObBatchDatumRows &batch, const int64_t begin, const int64_t end)
+{
   int ret = OB_SUCCESS;
   const int64_t before_rows = nullptr == slice_input_ ? 0 : slice_input_->replay_.get_row_count();
-  if (OB_UNLIKELY(batch.row_count_ < 0
+  if (!is_valid()) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("IVF capture operator is not initialized", K(ret), K_(is_inited),
+             K_(vector_dim), KP_(rotator), KP_(slice_input));
+  } else if (slice_input_->replay_.is_sealed()) {
+    ret = OB_STATE_NOT_MATCH;
+    LOG_WARN("cannot append to sealed IVF replay", K(ret),
+             "slice_idx", slice_input_->slice_idx_,
+             "row_count", slice_input_->replay_.get_row_count(), K(begin), K(end));
+  } else if (OB_UNLIKELY(begin < 0 || end < begin || end > batch.row_count_
+      || batch.row_count_ < 0
       || (batch.row_count_ > 0 && batch.vectors_.empty())
       || vid_col_idx_ < 0 || vid_col_idx_ >= batch.vectors_.count()
       || data_col_idx_ < 0 || data_col_idx_ >= batch.vectors_.count())) {
     ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("invalid IVF capture batch", K(ret), K(batch),
+    LOG_WARN("invalid IVF capture batch", K(ret), K(begin), K(end), K(batch),
              K(vid_col_idx_), K(data_col_idx_));
   } else {
     row_allocator_.reuse();
@@ -190,7 +207,7 @@ int ObIVFCaptureOperator::consume_batch_(const ObBatchDatumRows &batch)
     if (OB_FAIL(row.init(row_allocator_, batch.vectors_.count()))) {
       LOG_WARN("failed to initialize IVF transport row", K(ret));
     }
-    for (int64_t i = 0; OB_SUCC(ret) && i < batch.row_count_; ++i) {
+    for (int64_t i = begin; OB_SUCC(ret) && i < end; ++i) {
       if (OB_FAIL(batch.to_datum_row(i, row))) {
         LOG_WARN("failed to materialize IVF transport row", K(ret), K(i));
       } else if (row.storage_datums_[data_col_idx_].is_null()) {
@@ -283,6 +300,13 @@ int ObIVFCaptureOperator::execute(
     LOG_WARN("IVF capture operator is not initialized", K(ret));
   } else if (input_chunk.is_end_chunk()) {
     // The slice terminator seals the replay in try_execute_finish().
+  } else if (input_chunk.is_direct_load_batch_datum_rows_type()) {
+    if (OB_ISNULL(input_chunk.direct_load_batch_rows_)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("IVF capture input batch is null", K(ret));
+    } else if (OB_FAIL(consume_batch_(input_chunk.direct_load_batch_rows_->datum_rows_))) {
+      LOG_WARN("failed to consume IVF input batch", K(ret));
+    }
   } else if (!input_chunk.is_cg_row_tmp_files_type()
              || nullptr == input_chunk.cg_row_file_arr_) {
     ret = OB_INVALID_ARGUMENT;
@@ -320,17 +344,13 @@ int ObIVFCaptureOperator::execute(
   return ret;
 }
 
-int ObIVFCaptureOperator::try_execute_finish(
-    const ObChunk &input_chunk,
-    ResultState &result_state,
-    ObChunk &output_chunk)
+int ObIVFCaptureOperator::seal()
 {
   int ret = OB_SUCCESS;
-  if (OB_ISNULL(slice_input_)) {
-    ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("IVF capture slice input is null", K(ret));
-  } else if (!input_chunk.is_end_chunk()) {
-    // Capture chunks remain writable until the explicit slice terminator.
+  if (!is_valid()) {
+    ret = OB_NOT_INIT;
+    LOG_WARN("IVF capture operator is not initialized for seal", K(ret), K_(is_inited),
+             K_(vector_dim), KP_(rotator), KP_(slice_input));
   } else if (OB_FAIL(slice_input_->replay_.seal())) {
     LOG_WARN("failed to seal IVF capture replay", K(ret));
   } else {
@@ -340,8 +360,18 @@ int ObIVFCaptureOperator::try_execute_finish(
               "sample_count", slice_input_->replay_.get_sample_count(),
               "max_sample_count", slice_input_->replay_.get_max_sample_count());
   }
-  if (OB_SUCC(ret)
-      && OB_FAIL(ObPipelineOperator::try_execute_finish(
+  return ret;
+}
+
+int ObIVFCaptureOperator::try_execute_finish(
+    const ObChunk &input_chunk,
+    ResultState &result_state,
+    ObChunk &output_chunk)
+{
+  int ret = OB_SUCCESS;
+  if (input_chunk.is_end_chunk() && OB_FAIL(seal())) {
+    LOG_WARN("failed to finish IVF capture replay", K(ret));
+  } else if (OB_FAIL(ObPipelineOperator::try_execute_finish(
              input_chunk, result_state, output_chunk))) {
     LOG_WARN("failed to finish IVF capture operator", K(ret));
   }

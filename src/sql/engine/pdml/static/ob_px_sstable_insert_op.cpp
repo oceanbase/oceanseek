@@ -12,6 +12,7 @@
 #include "rootserver/ddl_task/ob_ddl_task.h"
 #include "storage/ddl/ob_column_clustered_dag.h"
 #include "storage/ddl/ob_tablet_slice_writer.h"
+#include "storage/blocksstable/vector_index/ob_ivf_input_writer.h"
 #include "storage/ddl/ob_ddl_struct.h"
 #include "storage/ddl/ob_ddl_tablet_context.h"
 #include "storage/ddl/ob_fts_sample_pipeline.h"
@@ -1073,6 +1074,10 @@ int ObPxMultiPartSSTableInsertOp::switch_slice_if_need(
   } else if (OB_UNLIKELY(!tablet_id.is_valid() || slice_idx < 0)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", K(ret), K(tablet_id), K(slice_idx));
+  } else if (share::schema::is_async_ivf_index(ddl_dag_->get_ddl_table_schema().table_item_.index_type_)) {
+    if (OB_FAIL(ObIVFInputWriter::get_writer(*ddl_dag_, tablet_id, slice_idx, is_append_batch, slice_writer))) {
+      LOG_WARN("get IVF input writer failed", K(ret), K(tablet_id), K(slice_idx));
+    }
   } else if (OB_LIKELY(OB_NOT_NULL(slice_writer) && slice_writer->get_tablet_id() == tablet_id && slice_writer->get_slice_idx() == slice_idx)) {
     // do nothing
   } else {

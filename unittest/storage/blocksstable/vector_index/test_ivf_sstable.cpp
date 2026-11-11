@@ -71,6 +71,7 @@
 #include <cstring>
 #include <functional>
 #include <memory>
+#include <limits>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -105,6 +106,8 @@
 #include "storage/blocksstable/vector_index/ob_ivf_merge_input.h"
 #include "storage/blocksstable/vector_index/ob_ivf_merge_dag.h"
 #include "storage/blocksstable/vector_index/ob_ivf_merge_capture_pipeline.h"
+#include "storage/blocksstable/vector_index/ob_ivf_capture_pipeline.h"
+#include "storage/direct_load/ob_direct_load_batch_datum_rows.h"
 #include "storage/blocksstable/vector_index/ob_ivf_hca_algorithm_adapter.h"
 #include "storage/blocksstable/vector_index/ob_ivf_ddl_hca_adapter.h"
 #include "storage/blocksstable/vector_index/ob_ivf_ddl_input.h"
@@ -8028,6 +8031,245 @@ TEST_F(TestRADatumStoreReader, completed_ddl_tablet_releases_input_and_quota_bef
     ivf.release_capture_inputs();
     EXPECT_EQ(0, budget.get_active_build_count());
   }
+}
+
+namespace {
+// Materialize the physical six-column transport layout into an owning chunk.
+int make_ivf_capture_memory_chunk(ObChunk &chunk, const int64_t capacity)
+{
+  int ret = OB_SUCCESS;
+  ObArray<ObColumnSchemaItem> columns;
+  for (int64_t i = 0; OB_SUCC(ret) && i < 6; ++i) {
+    ObColumnSchemaItem column;
+    column.is_valid_ = true;
+    column.is_nullable_ = true;
+    column.col_type_.set_type(5 == i ? ObVarcharType : (2 == i ? ObUInt64Type : ObIntType));
+    if (5 == i) {
+      column.col_type_.set_collation_type(CS_TYPE_BINARY);
+      column.col_accuracy_.set_length(1024);
+    }
+    ret = columns.push_back(column);
+  }
+  ObDirectLoadBatchDatumRows *buffer = nullptr;
+  if (OB_SUCC(ret)) {
+    buffer = OB_NEW(ObDirectLoadBatchDatumRows, ObMemAttr(MTL_ID(), "IVFChunkUT"));
+    if (nullptr == buffer) {
+      ret = OB_ALLOCATE_MEMORY_FAILED;
+    } else {
+      chunk.type_ = ObChunk::DIRECT_LOAD_BATCH_DATUM_ROWS;
+      chunk.direct_load_batch_rows_ = buffer;
+      ObDirectLoadRowFlag flag;
+      if (OB_FAIL(buffer->batch_rows_.init(columns, capacity, flag))) {
+      } else {
+        for (int64_t i = 0; OB_SUCC(ret) && i < buffer->batch_rows_.get_vectors().count(); ++i) {
+          ret = buffer->datum_rows_.vectors_.push_back(buffer->batch_rows_.get_vectors().at(i)->get_vector());
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int append_ivf_capture_memory_row(ObChunk &chunk, const uint64_t vid,
+                                  const float *values, const int64_t bytes)
+{
+  ObStorageDatum cells[6];
+  ObArray<ObDatum *> datums;
+  int ret = OB_SUCCESS;
+  for (int64_t i = 0; OB_SUCC(ret) && i < 6; ++i) {
+    cells[i].set_int(0);
+    ret = datums.push_back(&cells[i]);
+  }
+  cells[2].set_uint(vid);
+  if (nullptr == values) {
+    cells[5].set_null();
+  } else {
+    cells[5].set_string(reinterpret_cast<const char *>(values), bytes);
+  }
+  if (OB_SUCC(ret)) {
+    ret = chunk.direct_load_batch_rows_->batch_rows_.append_row(datums);
+    chunk.direct_load_batch_rows_->datum_rows_.row_count_ = chunk.direct_load_batch_rows_->batch_rows_.size();
+  }
+  return ret;
+}
+
+void configure_ivf_capture_for_chunk_test(ObIVFCaptureOperator &capture,
+                                          ObIVFSliceInput &input,
+                                          const quantization::ObFhtKacRotator &rotator,
+                                          const int64_t dimension)
+{
+  capture.is_inited_ = true;
+  capture.vid_col_idx_ = 2;
+  capture.data_col_idx_ = 5;
+  capture.vector_dim_ = dimension;
+  capture.rotator_ = &rotator;
+  capture.slice_input_ = &input;
+}
+} // namespace
+
+TEST_F(TestRADatumStoreReader, capture_memory_chunk_owns_payload_filters_rows_and_seals_at_eof)
+{
+  const int64_t dim = 8;
+  ObArenaAllocator allocator("IVFChunkUT");
+  quantization::ObFhtKacRotator rotator;
+  ASSERT_EQ(OB_SUCCESS, quantization::ObFhtKacRotator::generate(allocator, dim, rotator));
+  ObIVFSliceInput input(0);
+  ASSERT_EQ(OB_SUCCESS, input.replay_.init(MTL_ID(), dim, 1L << 20, 4, 123, 0, true));
+  ObIVFCaptureOperator capture(nullptr);
+  configure_ivf_capture_for_chunk_test(capture, input, rotator, dim);
+  float original[2][dim];
+  float expected[2][dim];
+  for (int64_t i = 0; i < 2; ++i) {
+    for (int64_t d = 0; d < dim; ++d) {
+      original[i][d] = float(i * dim + d + 1);
+      expected[i][d] = original[i][d];
+    }
+    ASSERT_EQ(OB_SUCCESS, rotator.rotate(dim, expected[i]));
+  }
+  ObPipelineOperator::ResultState state = ObPipelineOperator::INVALID_VALUE;
+  ObChunk output;
+  {
+    ObChunk chunk;
+    ASSERT_EQ(OB_SUCCESS, make_ivf_capture_memory_chunk(chunk, 4));
+    ASSERT_EQ(OB_SUCCESS, append_ivf_capture_memory_row(chunk, 41, original[0], sizeof(original[0])));
+    ASSERT_EQ(OB_SUCCESS, append_ivf_capture_memory_row(chunk, 42, original[1], sizeof(original[1])));
+    ASSERT_EQ(OB_SUCCESS, append_ivf_capture_memory_row(chunk, 43, nullptr, 0));
+    float non_finite[dim] = {};
+    non_finite[0] = std::numeric_limits<float>::quiet_NaN();
+    ASSERT_EQ(OB_SUCCESS, append_ivf_capture_memory_row(chunk, 44, non_finite, sizeof(non_finite)));
+    // The producer can reuse its source buffers before Capture consumes the chunk.
+    MEMSET(original, 0, sizeof(original));
+    ASSERT_EQ(OB_SUCCESS, capture.execute_op(chunk, state, output));
+    EXPECT_FALSE(output.is_valid());
+    EXPECT_EQ(ObPipelineOperator::NEED_MORE_INPUT, state);
+    EXPECT_EQ(2, input.replay_.get_row_count());
+    EXPECT_EQ(2, input.replay_.get_sample_scan_count());
+    EXPECT_FALSE(input.replay_.is_sealed());
+    ObDatumRow row;
+    ASSERT_EQ(OB_SUCCESS, row.init(allocator, 6));
+    ASSERT_EQ(OB_SUCCESS, chunk.direct_load_batch_rows_->datum_rows_.to_datum_row(0, row));
+    float first_value = 0.0F;
+    MEMCPY(&first_value, row.storage_datums_[5].get_string().ptr(), sizeof(first_value));
+    EXPECT_FLOAT_EQ(1.0F, first_value); // Capture must not rotate the queued payload in place.
+  } // Destroying the owning input chunk must not invalidate replay data.
+  ObChunk end;
+  end.set_end_chunk();
+  ASSERT_EQ(OB_SUCCESS, capture.execute_op(end, state, output));
+  ASSERT_TRUE(input.replay_.is_sealed());
+  for (int64_t i = 0; i < 2; ++i) {
+    uint64_t vid = 0;
+    const float *values = nullptr;
+    ASSERT_EQ(OB_SUCCESS, input.replay_.get_row_at(i, vid, values));
+    EXPECT_EQ(uint64_t(41 + i), vid);
+    ASSERT_NE(nullptr, values);
+    for (int64_t d = 0; d < dim; ++d) { EXPECT_FLOAT_EQ(expected[i][d], values[d]); }
+  }
+}
+
+TEST_F(TestRADatumStoreReader, capture_memory_chunk_rejects_malformed_vector_without_sealing)
+{
+  ObArenaAllocator allocator("IVFChunkUT");
+  quantization::ObFhtKacRotator rotator;
+  ASSERT_EQ(OB_SUCCESS, quantization::ObFhtKacRotator::generate(allocator, 8, rotator));
+  ObIVFSliceInput input(0);
+  ASSERT_EQ(OB_SUCCESS, input.replay_.init(MTL_ID(), 8, 1L << 20));
+  ObIVFCaptureOperator capture(nullptr);
+  configure_ivf_capture_for_chunk_test(capture, input, rotator, 8);
+  ObChunk chunk;
+  ASSERT_EQ(OB_SUCCESS, make_ivf_capture_memory_chunk(chunk, 1));
+  float short_vector[7] = {};
+  ASSERT_EQ(OB_SUCCESS, append_ivf_capture_memory_row(chunk, 51, short_vector, sizeof(short_vector)));
+  ObPipelineOperator::ResultState state = ObPipelineOperator::INVALID_VALUE;
+  ObChunk output;
+  EXPECT_EQ(OB_ERR_UNEXPECTED, capture.execute_op(chunk, state, output));
+  EXPECT_EQ(0, input.replay_.get_row_count());
+  EXPECT_FALSE(input.replay_.is_sealed());
+}
+
+TEST_F(TestRADatumStoreReader, capture_empty_memory_chunk_waits_for_eof)
+{
+  ObArenaAllocator allocator("IVFChunkUT");
+  quantization::ObFhtKacRotator rotator;
+  ASSERT_EQ(OB_SUCCESS, quantization::ObFhtKacRotator::generate(allocator, 8, rotator));
+  ObIVFSliceInput input(0);
+  ASSERT_EQ(OB_SUCCESS, input.replay_.init(MTL_ID(), 8, 1L << 20));
+  ObIVFCaptureOperator capture(nullptr);
+  configure_ivf_capture_for_chunk_test(capture, input, rotator, 8);
+  ObChunk chunk;
+  ASSERT_EQ(OB_SUCCESS, make_ivf_capture_memory_chunk(chunk, 1));
+  chunk.direct_load_batch_rows_->datum_rows_.row_count_ = 0;
+  ObPipelineOperator::ResultState state = ObPipelineOperator::INVALID_VALUE;
+  ObChunk output;
+  ASSERT_EQ(OB_SUCCESS, capture.execute_op(chunk, state, output));
+  EXPECT_FALSE(input.replay_.is_sealed());
+  ObChunk end;
+  end.set_end_chunk();
+  ASSERT_EQ(OB_SUCCESS, capture.execute_op(end, state, output));
+  EXPECT_TRUE(input.replay_.is_sealed());
+  EXPECT_EQ(0, input.replay_.get_row_count());
+}
+
+TEST_F(TestRADatumStoreReader, synchronous_capture_consumes_selected_rows_and_owns_replay)
+{
+  const int64_t dim = 8;
+  ObArenaAllocator allocator("IVFSyncUT");
+  quantization::ObFhtKacRotator rotator;
+  ASSERT_EQ(OB_SUCCESS, quantization::ObFhtKacRotator::generate(allocator, dim, rotator));
+  for (const int64_t budget : {ObIVFReplayInput::NO_CACHE_MEMORY_LIMIT, 1L << 20}) {
+    ObIVFSliceInput input(0);
+    ASSERT_EQ(OB_SUCCESS, input.replay_.init(MTL_ID(), dim, budget, 4, 123, 0, true));
+    ObIVFCaptureOperator capture(nullptr);
+    configure_ivf_capture_for_chunk_test(capture, input, rotator, dim);
+    capture.is_cosine_ = true;
+    float source[dim] = {1.0F}; // unit vector: normalization is identity
+    float expected[dim];
+    MEMCPY(expected, source, sizeof(source));
+    ASSERT_EQ(OB_SUCCESS, rotator.rotate(dim, expected));
+    {
+      ObChunk chunk;
+      ASSERT_EQ(OB_SUCCESS, make_ivf_capture_memory_chunk(chunk, 5));
+      // Invalid vectors outside the selected interval must not be inspected.
+      ASSERT_EQ(OB_SUCCESS, append_ivf_capture_memory_row(chunk, 70, source, sizeof(float)));
+      ASSERT_EQ(OB_SUCCESS, append_ivf_capture_memory_row(chunk, 71, source, sizeof(source)));
+      ASSERT_EQ(OB_SUCCESS, append_ivf_capture_memory_row(chunk, 72, nullptr, 0));
+      float invalid[dim] = {};
+      invalid[0] = std::numeric_limits<float>::infinity();
+      ASSERT_EQ(OB_SUCCESS, append_ivf_capture_memory_row(chunk, 73, invalid, sizeof(invalid)));
+      ASSERT_EQ(OB_SUCCESS, append_ivf_capture_memory_row(chunk, 74, source, sizeof(float)));
+      ObBatchDatumRows &batch = chunk.direct_load_batch_rows_->datum_rows_;
+      EXPECT_EQ(OB_INVALID_ARGUMENT, capture.consume_batch(batch, -1, 1));
+      EXPECT_EQ(OB_INVALID_ARGUMENT, capture.consume_batch(batch, 2, 1));
+      EXPECT_EQ(OB_INVALID_ARGUMENT, capture.consume_batch(batch, 0, 6));
+      ASSERT_EQ(OB_SUCCESS, capture.consume_batch(batch, 1, 4));
+      EXPECT_EQ(1, input.replay_.get_row_count());
+      EXPECT_EQ(1, input.replay_.get_sample_scan_count());
+      EXPECT_FALSE(input.replay_.is_sealed());
+      ObDatumRow row;
+      ASSERT_EQ(OB_SUCCESS, row.init(allocator, 6));
+      ASSERT_EQ(OB_SUCCESS, batch.to_datum_row(1, row));
+      EXPECT_EQ(0, MEMCMP(source, row.storage_datums_[5].get_string().ptr(), sizeof(source)));
+      // Simulate the SQL producer reusing its vectors after synchronous return.
+      chunk.direct_load_batch_rows_->batch_rows_.reuse();
+      ASSERT_EQ(OB_SUCCESS, append_ivf_capture_memory_row(chunk, 99, invalid, sizeof(invalid)));
+    }
+    ASSERT_EQ(OB_SUCCESS, capture.seal());
+    uint64_t vid = 0;
+    const float *values = nullptr;
+    ASSERT_EQ(OB_SUCCESS, input.replay_.get_row_at(0, vid, values));
+    EXPECT_EQ(71, vid);
+    ASSERT_NE(nullptr, values);
+    for (int64_t d = 0; d < dim; ++d) { EXPECT_FLOAT_EQ(expected[d], values[d]); }
+    ObBatchDatumRows empty;
+    EXPECT_EQ(OB_STATE_NOT_MATCH, capture.consume_batch(empty, 0, 0));
+  }
+}
+
+TEST_F(TestRADatumStoreReader, synchronous_capture_requires_initialized_state)
+{
+  ObIVFCaptureOperator capture(nullptr);
+  ObBatchDatumRows empty;
+  EXPECT_EQ(OB_NOT_INIT, capture.consume_batch(empty, 0, 0));
+  EXPECT_EQ(OB_NOT_INIT, capture.seal());
 }
 
 TEST_F(TestRADatumStoreReader, replay_incomplete_captured_vids_reject_append_and_seal)

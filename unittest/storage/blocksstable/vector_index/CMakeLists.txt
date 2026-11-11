@@ -1,5 +1,6 @@
 storage_unittest(test_ivf_sstable)
 storage_unittest(test_ivf_merge_object_id)
+storage_unittest(test_ivf_input_writer)
 storage_unittest(test_ivf_prefilter_bitmap_failure)
 storage_unittest(test_ivf_centroid_layout)
 storage_unittest(test_ivf_fastscan_micro_block_transformer)

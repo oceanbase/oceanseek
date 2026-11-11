@@ -164,6 +164,7 @@ int ObAsyncIndexRefreshTask::set_task(const ObAsyncIndexRefreshTaskParam &param)
     stat.is_complete_refresh_ = param.is_complete_refresh_;
     stat.is_refresh_on_error_skip_ = param.is_refresh_on_error_skip_;
     stat.is_search_index_ = param.is_search_index_;
+    stat.is_ivf_index_ = param.is_ivf_index_;
     stat.queue_time_ = common::ObTimeUtility::current_time();
     stat.retry_cnt_ = param.retry_cnt_;
     stat.result_ = OB_SUCCESS;

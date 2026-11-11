@@ -117,6 +117,7 @@ ob_set_subtarget(ob_storage blocksstable_vector_index
   blocksstable/vector_index/ob_ivf_build_schema_ctx.cpp
   blocksstable/vector_index/ob_ivf_refresh_monitor.cpp
   blocksstable/vector_index/ob_ivf_capture_pipeline.cpp
+  blocksstable/vector_index/ob_ivf_input_writer.cpp
   blocksstable/vector_index/ob_ivf_macro_block_writer.cpp
   blocksstable/vector_index/ob_ivf_replay_input.cpp
   blocksstable/vector_index/ob_ivf_sorter.cpp

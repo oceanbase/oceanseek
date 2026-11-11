@@ -734,6 +734,7 @@ int ObTenantAsyncIndexRefresher::refresh_one_data_table_(
       base_param.is_delete_index_ = index_info.is_delete_index_;
       base_param.is_complete_refresh_ = decision.is_complete_refresh_;
       base_param.is_refresh_on_error_skip_ = index_info.is_refresh_on_error_skip_;
+      base_param.is_ivf_index_ = share::schema::is_async_ivf_index(index_info.index_type_);
       base_param.is_search_index_ =
           share::schema::is_async_search_data_index(index_info.index_type_);
       base_param.ls_scheduler_ = ls_scheduler;

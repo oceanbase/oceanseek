@@ -587,7 +587,7 @@ void TestParallelExternalSort::test_memory_sort_round(const int64_t buf_mem_limi
   ASSERT_EQ(OB_SUCCESS, ret);
   ret = sort_round.init(merge_count, buf_cap, expire_timestamp, OB_SYS_TENANT_ID, &compare);
   ASSERT_EQ(OB_SUCCESS, ret);
-  ret = memory_sort_round.init(buf_mem_limit, expire_timestamp, &compare, &sort_round);
+  ret = memory_sort_round.init(buf_mem_limit, expire_timestamp, OB_SYS_TENANT_ID, &compare, &sort_round);
   ASSERT_EQ(OB_SUCCESS, ret);
   for (int64_t i = 0; OB_SUCC(ret) && i < total_items.size(); ++i) {
     ret = memory_sort_round.add_item(*total_items.at(i));

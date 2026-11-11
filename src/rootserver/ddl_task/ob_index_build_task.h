@@ -135,6 +135,8 @@ private:
   int wait_trans_end();
   int wait_data_complement();
   int wait_local_index_data_complement();
+  int collect_async_ivf_redefinition_stat_(
+      const share::ObSqlMonitorStats &sql_monitor_stats, int64_t &pos);
   int build_partitioned_local_fts_replica_build_longops_message(
       const share::ObSqlMonitorStats &sql_monitor_stats,
       int64_t &pos);

@@ -30,6 +30,10 @@ public:
       vector_allocator_("IVFVec", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()) {}
   int init(ObDDLTabletContext &tablet_context, const ObDDLTableSchema &ddl_schema,
            const int64_t slice_idx, const bool is_async_index_refresh);
+  // Borrow the batch only for this call. Replay owns all captured payloads.
+  int consume_batch(const blocksstable::ObBatchDatumRows &batch,
+                    const int64_t begin, const int64_t end);
+  int seal();
   virtual bool is_valid() const override
   { return is_inited_ && vector_dim_ > 0
       && nullptr != rotator_ && nullptr != slice_input_; }

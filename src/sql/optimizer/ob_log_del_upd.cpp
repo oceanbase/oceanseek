@@ -582,8 +582,12 @@ int ObLogDelUpd::generate_ddl_slice_id_expr()
     }
   } else if (OB_FAIL(ObRawExprUtils::build_pseudo_ddl_slice_id(ctx.get_expr_factory(), *ctx.get_session_info(), ddl_slice_expr))) {
     LOG_WARN("build pseudo ddl slice id expr failed", K(ret));
-  } else if (OB_ISNULL(sort_op = get_child(ObLogicalOperator::first_child)) || sort_op->get_type() != log_op_def::LOG_SORT // sort op
-      || OB_ISNULL(consumer = sort_op->get_child(ObLogicalOperator::first_child)) || consumer->get_type() != log_op_def::LOG_EXCHANGE // exchange consumer
+  } else if (OB_ISNULL(sort_op = get_child(ObLogicalOperator::first_child))) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("DDL input is null", K(ret));
+  } else if (FALSE_IT(consumer = sort_op->get_type() == log_op_def::LOG_SORT
+      ? sort_op->get_child(ObLogicalOperator::first_child) : sort_op)) {
+  } else if (OB_ISNULL(consumer) || consumer->get_type() != log_op_def::LOG_EXCHANGE // exchange consumer
       || OB_ISNULL(producer = static_cast<ObLogExchange *>(consumer->get_child(ObLogicalOperator::first_child))) || !producer->is_producer()) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get ddl slice id producer failed", K(ret), KPC(sort_op), KPC(consumer), KPC(producer));

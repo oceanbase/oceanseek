@@ -2326,6 +2326,11 @@ int ObIndexBuildTask::collect_longops_stat(ObLongopsValue &value)
           LOG_WARN("failed to init ObSqlMonitorStats", K(ret), K(tenant_id_), K(task_id_), K(task_type_));
         } else if (OB_FAIL(sql_monitor_stats_collector.get_next_sql_plan_monitor_stat(sql_monitor_stats))) {
           LOG_WARN("failed to get next sql plan monitor stats", K(ret));
+        } else if (share::schema::is_async_ivf_index(create_index_arg_.index_type_)
+                   && sql_monitor_stats.sort_node_.empty()) {
+          if (OB_FAIL(collect_async_ivf_redefinition_stat_(sql_monitor_stats, pos))) {
+            LOG_WARN("failed to collect async IVF redefinition stat", K(ret));
+          }
         } else if (create_index_arg_.is_partition_local_ddl_) {
           if (OB_FAIL(build_partitioned_local_fts_replica_build_longops_message(sql_monitor_stats, pos))) {
             LOG_WARN("failed to build fulltext replica build longops message", K(ret));
@@ -2395,6 +2400,32 @@ int ObIndexBuildTask::collect_longops_stat(ObLongopsValue &value)
     LOG_WARN("failed to collect common longops stat", K(ret));
   }
 
+  return ret;
+}
+
+int ObIndexBuildTask::collect_async_ivf_redefinition_stat_(
+    const share::ObSqlMonitorStats &sql_monitor_stats, int64_t &pos)
+{
+  int ret = OB_SUCCESS;
+  // IVF input consumes scan batches without SORT. The generic DDL
+  // diagnose path derives INSERT counters from sort nodes and would
+  // otherwise report SCANNING throughout the IVF runtime.
+  int64_t scanned_rows = 0;
+  int64_t consumed_rows = 0;
+  int64_t scanning_threads = 0;
+  for (int64_t i = 0; i < sql_monitor_stats.scan_node_.count(); ++i) {
+    scanned_rows += sql_monitor_stats.scan_node_.at(i).output_rows_;
+    scanning_threads += 0 == sql_monitor_stats.scan_node_.at(i).last_refresh_time_ ? 1 : 0;
+  }
+  for (int64_t i = 0; i < sql_monitor_stats.insert_node_.count(); ++i) {
+    consumed_rows += sql_monitor_stats.insert_node_.at(i).sstable_row_inserted_;
+  }
+  if (OB_FAIL(databuff_printf(stat_info_.message_, MAX_LONG_OPS_MESSAGE_LENGTH, pos,
+          "STATUS: REPLICA BUILD, INDEX_TYPE: DISK_BBQ, EXECUTION_ID: %ld, SCAN_THREADS: %ld, "
+          "ROW_SCANNED: %ld, ROW_RECEIVED: %ld",
+          sql_monitor_stats.execution_id_, scanning_threads, scanned_rows, consumed_rows))) {
+    LOG_WARN("failed to print async IVF build progress", K(ret));
+  }
   return ret;
 }
 

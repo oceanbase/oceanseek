@@ -1511,6 +1511,37 @@ int ObDelUpdLogPlan::allocate_optimizer_stats_gathering_as_top(ObLogicalOperator
   return ret;
 }
 
+int ObDelUpdLogPlan::check_async_ivf_build(const IndexDMLInfo &index_dml_info,
+                                                 bool &use_async_ivf_build) const
+{
+  int ret = OB_SUCCESS;
+  use_async_ivf_build = false;
+  ObSQLSessionInfo *session = optimizer_context_.get_session_info();
+  ObSchemaGetterGuard *schema_guard = optimizer_context_.get_schema_guard();
+  const ObTableSchema *index_schema = nullptr;
+  if (OB_ISNULL(session)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null session for IVF unsorted input", K(ret));
+  } else if (!optimizer_context_.is_online_ddl()
+             || optimizer_context_.is_heap_table_ddl()
+             || !session->get_ddl_info().is_ddl()
+             || session->get_ddl_info().is_vec_tablet_rebuild()) {
+    // Keep the existing input plan for other DDL execution paths.
+  } else if (OB_ISNULL(schema_guard)) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_WARN("unexpected null schema guard for IVF unsorted input", K(ret));
+  } else if (OB_FAIL(schema_guard->get_table_schema(session->get_effective_tenant_id(),
+                                                   index_dml_info.ref_table_id_, index_schema))) {
+    LOG_WARN("failed to get async IVF target schema", K(ret), K(index_dml_info.ref_table_id_));
+  } else if (OB_ISNULL(index_schema)) {
+    ret = OB_TABLE_NOT_EXIST;
+    LOG_WARN("async IVF target schema does not exist", K(ret), K(index_dml_info.ref_table_id_));
+  } else {
+    use_async_ivf_build = index_schema->is_async_ivf_index();
+  }
+  return ret;
+}
+
 int ObDelUpdLogPlan::create_online_ddl_plan(ObLogicalOperator *&top,
                                             const ObExchangeInfo &exch_info,
                                             ObTablePartitionInfo *table_partition_info,
@@ -1525,11 +1556,14 @@ int ObDelUpdLogPlan::create_online_ddl_plan(ObLogicalOperator *&top,
 {
   int ret = OB_SUCCESS;
   ObExchangeInfo final_exch_info;
+  bool use_async_ivf_build = false;
   ObSQLSessionInfo *session = optimizer_context_.get_session_info();
   need_partition_id = session->get_ddl_info().is_partition_local_ddl() ? false : need_partition_id;
   if (OB_ISNULL(top) || OB_ISNULL(table_partition_info)) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("get unexpected null", K(top), K(table_partition_info), K(ret));
+  } else if (OB_FAIL(check_async_ivf_build(*index_dml_info, use_async_ivf_build))) {
+    LOG_WARN("check IVF build input failed", K(ret));
   } else if (get_optimizer_context().is_heap_table_ddl()) {
     if (OB_FAIL(allocate_exchange_as_top(top, exch_info))) {
       LOG_WARN("failed to allocate exchange as top", K(ret));
@@ -1558,7 +1592,8 @@ int ObDelUpdLogPlan::create_online_ddl_plan(ObLogicalOperator *&top,
       LOG_WARN("failed to prepare inverted sort keys", K(ret));
     } else if (exch_info.need_exchange() && OB_FAIL(allocate_exchange_as_top(top, exch_info))) {
       LOG_WARN("failed to allocate exchange as top", K(ret));
-    } else if (exch_info.need_exchange() && OB_FAIL(allocate_sort_as_top(top, sort_keys))) {
+    } else if (exch_info.need_exchange() && !use_async_ivf_build
+               && OB_FAIL(allocate_sort_as_top(top, sort_keys))) {
       LOG_WARN("failed to allocate sort as top", K(ret));
     } else if (OB_FAIL(allocate_pdml_insert_as_top(top,
                                                    is_index_maintenance,

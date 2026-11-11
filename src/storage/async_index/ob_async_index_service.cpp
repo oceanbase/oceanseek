@@ -819,6 +819,7 @@ int ObAsyncIndexService::trigger_incr_refresh(const ObAsyncIndexDirectRefreshPar
         task_param.is_delete_index_     = index_info->is_delete_index_;
         task_param.is_complete_refresh_ = (DIRECT_REFRESH_OP_COMPLETE == effective_op);
         task_param.is_refresh_on_error_skip_ = index_info->is_refresh_on_error_skip_;
+        task_param.is_ivf_index_        = share::schema::is_async_ivf_index(index_info->index_type_);
         task_param.is_search_index_     =
             share::schema::is_async_search_data_index(index_info->index_type_);
         task_param.skip_dop_quota_      = true;
