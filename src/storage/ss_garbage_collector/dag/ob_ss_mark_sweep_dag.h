@@ -278,6 +278,8 @@ public:
   // mark-deleted tablet -> meta_scn of its mark-delete tablet meta version
   common::hash::ObHashMap<ObSSGCTablet, share::SCN> mark_deleted_tablets_;
   common::hash::ObHashMap<share::ObLSID, share::SCN> ls_ss_checkpoint_scn_map_;
+  // Deleted LSs whose final versions satisfy safe/reservation bounds in this round's snapshot.
+  common::ObSEArray<share::ObLSID, 16> recyclable_deleted_ls_ids_;
   // PrepareTask 按相关 LS 全量读取 Tablet Lock Row 位点后冻结；SortTask 期间只读。
   common::hash::ObHashMap<ObSSGCTablet, share::SCN> tablet_kept_meta_scn_map_;
   // Per-tablet del_meta_scn info, produced by SortTask, consumed by DiffTask.
@@ -338,6 +340,8 @@ public:
   common::ObSEArray<share::SCN, 8> reserved_meta_scns_;
   common::ObSEArray<ObSSGCMarkDeletedTablet, 16> mark_deleted_tablets_;
   common::hash::ObHashMap<share::ObLSID, share::SCN> ls_ss_checkpoint_scn_map_;
+  // Deleted LSs whose final versions satisfy safe/reservation bounds in this round's snapshot.
+  common::ObSEArray<share::ObLSID, 16> recyclable_deleted_ls_ids_;
   uint64_t tenant_id_;
   int64_t batch_size_;
   int64_t memory_limit_;
@@ -361,7 +365,8 @@ public:
                              const share::SCN &mark_delete_meta_scn,
                              const common::ObIArray<share::SCN> &reserved_meta_scns,
                              const common::ObIArray<share::SCN> &all_meta_scns,
-                             const common::hash::ObHashMap<share::ObLSID, share::SCN> &ls_ss_checkpoint_scn_map)
+                             const common::hash::ObHashMap<share::ObLSID, share::SCN> &ls_ss_checkpoint_scn_map,
+                             const bool ls_can_del_all)
     : tablet_(tablet),
       tablet_meta_scn_(tablet_meta_scn),
       tablet_kept_meta_scn_(tablet_kept_meta_scn),
@@ -369,11 +374,12 @@ public:
       mark_delete_meta_scn_(mark_delete_meta_scn),
       reserved_meta_scns_(reserved_meta_scns),
       all_meta_scns_(all_meta_scns),
-      ls_ss_checkpoint_scn_map_(ls_ss_checkpoint_scn_map)
+      ls_ss_checkpoint_scn_map_(ls_ss_checkpoint_scn_map),
+      ls_can_del_all_(ls_can_del_all)
   {}
   ~ObSSGetDelKeptMetaScnParam() = default;
   TO_STRING_KV(K_(tablet), K_(tablet_meta_scn), K_(tablet_kept_meta_scn), K_(safe_meta_scn),
-      K_(mark_delete_meta_scn), K_(reserved_meta_scns), K_(all_meta_scns),
+      K_(mark_delete_meta_scn), K_(reserved_meta_scns), K_(all_meta_scns), K_(ls_can_del_all),
       "ls_ss_checkpoint_cnt", ls_ss_checkpoint_scn_map_.size());
 
 public:
@@ -387,6 +393,7 @@ public:
   const common::ObIArray<share::SCN> &reserved_meta_scns_;
   const common::ObIArray<share::SCN> &all_meta_scns_;
   const common::hash::ObHashMap<share::ObLSID, share::SCN> &ls_ss_checkpoint_scn_map_;
+  bool ls_can_del_all_;
 };
 
 
@@ -628,11 +635,13 @@ private:
                                          common::ObIArray<share::SCN> &del_meta_scns,
                                          common::ObIArray<share::SCN> &kept_meta_scns);
   // 判断 gc_tablet 在 cur_meta_scn 这个版本下的 max_replayed_scn 是否 >= 其所在 ls 的
-  // ss_checkpoint_scn。is_exceed=true 表示该 meta_scn 应保留(kept)，false 表示可删(del)。
+  // ss_checkpoint_scn. Allow equality only when both the deleted LS and tablet satisfy GC bounds.
+  // is_exceed=true keeps this version; false allows it to be deleted.
   int check_if_replayed_scn_exceed_checkpoint_scn_(
       const ObSSGCTablet &gc_tablet,
       const share::SCN &cur_meta_scn,
       const common::hash::ObHashMap<share::ObLSID, share::SCN> &ls_ss_checkpoint_scn_map,
+      const bool can_recycle_equal_checkpoint,
       bool &is_exceed);
   int process_one_tablet_(ObSSMarkSweepCtx &ctx,
                           const ObSSGCTabletWithMetaScn &tablet_with_meta_scn,

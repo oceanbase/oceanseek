@@ -34,6 +34,7 @@
 #include "storage/incremental/ob_shared_meta_service.h"
 #include "storage/incremental/share/ob_shared_meta_iter_guard.h"
 #include "storage/incremental/ssmeta/ob_ss_meta_define.h"
+#include "storage/incremental/ssmeta/ob_ss_meta_table_helper.h"
 #include "storage/reserve_shared_meta/ob_shared_meta_reserved_mgr.h"
 
 namespace oceanbase
@@ -843,12 +844,14 @@ int ObSSMarkSweepGCGenTask::get_all_ls_ss_checkpoint_scn_(
     const SCN &safe_meta_scn,
     const ObIArray<SCN> &reserved_meta_scns,
     const SCN &ckpt_ss_checkpoint_scn,
-    ObHashMap<ObLSID, SCN> &ls_ss_checkpoint_scn_map)
+    ObHashMap<ObLSID, SCN> &ls_ss_checkpoint_scn_map,
+    ObIArray<ObLSID> &recyclable_deleted_ls_ids)
 {
   int ret = OB_SUCCESS;
   ObSEArray<ObLSID, 16> ls_id_arr;
   ls_id_arr.set_attr(ObMemAttr(tenant_id_, "SSGCLSIDArr"));
   ObSSMetaService *meta_srv = nullptr;
+  recyclable_deleted_ls_ids.reuse();
   if (OB_FAIL(ls_ss_checkpoint_scn_map.reuse())) {
     LOG_WARN("fail to reuse ls ss checkpoint scn map", KR(ret), K_(tenant_id));
   } else if (OB_ISNULL(meta_srv = MTL(ObSSMetaService *))) {
@@ -902,6 +905,22 @@ int ObSSMarkSweepGCGenTask::get_all_ls_ss_checkpoint_scn_(
                 LOG_WARN("fail to set ls ss checkpoint scn",
                     KR(ret), K(ls_id), K(cur_meta_scn), K(clog_data_scn),
                     K(ckpt_ss_checkpoint_scn), K(effective_data_scn));
+              } else if (i == all_meta_scn_cnt - 1 && cur_meta_scn <= min_meta_scn
+                         && effective_data_scn == clog_data_scn) {
+                // Read the delete mark from this round's selected version to preserve snapshot consistency.
+                ObSSMetaReadParamV2 read_param;
+                read_param.set_ls_level_param(
+                    ObSSMetaReadParamType::LS_KEY, ObSSMetaReadResultType::READ_WHOLE_ROW,
+                    ObAtomicProtocolTypeEnum::LS_META, ls_id, cur_meta_scn, true /*is_in_table*/);
+                read_param.set_read_mark_delete(true);
+                SMART_VAR(ObDefaultSSMetaValue<ObSSLSMeta>, ls_value) {
+                  if (OB_FAIL(ObSSMetaTableHelper::get_ls(read_param, ls_value))) {
+                    LOG_WARN("fail to read final ls meta version", KR(ret), K(ls_id), K(cur_meta_scn));
+                  } else if (ls_value.get_meta_head_info().is_mark_deleted()
+                             && OB_FAIL(recyclable_deleted_ls_ids.push_back(ls_id))) {
+                    LOG_WARN("fail to append recyclable deleted ls", KR(ret), K(ls_id), K(cur_meta_scn));
+                  }
+                }
               }
             }
           }
@@ -1526,7 +1545,7 @@ void ObSSMarkSweepGCGenTask::runTimerTask()
           KR(ret), K_(tenant_id), K(SYS_LS));
     } else if (OB_FAIL(get_all_ls_ss_checkpoint_scn_(param.snapshot_meta_scn_, param.safe_meta_scn_,
         param.reserved_meta_scns_, ckpt_ss_checkpoint_scn,
-        param.ls_ss_checkpoint_scn_map_))) {
+        param.ls_ss_checkpoint_scn_map_, param.recyclable_deleted_ls_ids_))) {
       LOG_WARN("fail to get ls ss checkpoint scn",
           KR(ret), K_(tenant_id), K(param), K(ckpt_ss_checkpoint_scn));
     } else if (OB_FAIL(study_tablet_meta_scn_(param.snapshot_meta_scn_,
@@ -1653,7 +1672,6 @@ int ObSSMarkSweepGCGenTask::generate_ls_meta_gc_task_(
         const SCN min_meta_scn = ObSSGCUtil::calc_min_meta_scn(
             reserved_meta_scns, all_meta_scns, safe_meta_scn, SCN::max_scn()/*studied_meta_scn*/,
             min_reserved_meta_scn, real_min_reserved_meta_scn);
-        // 判断该 ls 是否已被 mark delete：deleted_scn 有效即表示已 mark delete。
         SCN ls_deleted_scn;
         if (OB_FAIL(ret)) {
         } else if (OB_FAIL(ObSSGCUtil::get_ls_deleted_scn(
@@ -1662,18 +1680,34 @@ int ObSSMarkSweepGCGenTask::generate_ls_meta_gc_task_(
         } else {
           const int64_t meta_scn_cnt = all_meta_scns.count();
           const bool is_mark_deleted = ls_deleted_scn.is_valid();
-          // 对于未被 mark delete 的存活 ls，如果所有 ls_meta 版本都 < min_meta_scn（即全部落在
-          // 可回收范围内），必须保留最新的一个版本（存活 ls 至少要保留一份 ls_meta）；已 mark
-          // delete 的 ls 则可以把所有版本都回收掉。
-          const bool retain_latest =
-              (!is_mark_deleted) && (all_meta_scns.at(meta_scn_cnt - 1) < min_meta_scn);
+          const SCN &latest_meta_scn = all_meta_scns.at(meta_scn_cnt - 1);
+          // A reservation may map to the final deleted version visible in this snapshot.
+          // Once all GC bounds reach it, generate its task; the executor waits for tablet cleanup.
+          bool can_del_all = false;
+          if (is_mark_deleted && latest_meta_scn <= min_meta_scn) {
+            ObSSMetaReadParamV2 read_param;
+            read_param.set_ls_level_param(
+                ObSSMetaReadParamType::LS_KEY, ObSSMetaReadResultType::READ_WHOLE_ROW,
+                ObAtomicProtocolTypeEnum::LS_META, ls_id, latest_meta_scn, true /*is_in_table*/);
+            read_param.set_read_mark_delete(true);
+            SMART_VAR(ObDefaultSSMetaValue<ObSSLSMeta>, ls_value) {
+              if (OB_FAIL(ObSSMetaTableHelper::get_ls(read_param, ls_value))) {
+                LOG_WARN("fail to read final ls meta version", KR(ret), K(ls_id), K(latest_meta_scn));
+              } else {
+                // The lock row may be marked deleted after the snapshot; check this version's mark.
+                can_del_all = ls_value.get_meta_head_info().is_mark_deleted();
+              }
+            }
+          }
+          // Keep the latest snapshot version unless all versions can be deleted.
+          const bool retain_latest = !can_del_all && latest_meta_scn < min_meta_scn;
           for (int64_t i = 0; OB_SUCC(ret) && (i < meta_scn_cnt); ++i) {
             const SCN &ls_meta_scn = all_meta_scns.at(i);
-            if (ls_meta_scn >= min_meta_scn) {
+            if (ls_meta_scn > min_meta_scn || (ls_meta_scn == min_meta_scn && !can_del_all)) {
               // all_meta_scns is ascending, remaining versions are all kept.
               break;
             } else if (retain_latest && (i == (meta_scn_cnt - 1))) {
-              // 存活 ls 保留最新版本，不回收。
+              // Keep the latest live version in the snapshot.
               LOG_TRACE("keep latest ls meta version for alive ls", K_(tenant_id), K(ls_id),
                   K(ls_meta_scn), K(min_meta_scn));
             } else if (ls_meta_scn <= generated_max_scn) {

@@ -18,6 +18,7 @@
 #include "storage/incremental/ob_shared_meta_service.h"
 #include "storage/incremental/atomic_protocol/ob_atomic_protocol_util.h"
 #include "storage/incremental/share/ob_shared_meta_iter_guard.h"
+#include "storage/incremental/ssmeta/ob_ss_meta_table_helper.h"
 #include "storage/meta_mem/ob_tablet_handle.h"
 #include "storage/ss_garbage_collector/shared_gc_task/ob_shared_gc_task_table_iterator.h"
 #include "storage/ss_garbage_collector/shared_gc_task/ob_shared_gc_task_table_operator.h"
@@ -645,16 +646,7 @@ int ObSSLSMetaGCPrepareTask::process()
         KPC(ctx));
   } else {
     static_cast<ObSSLSMetaGCDag *>(get_dag())->report_start_event();
-    if (OB_FAIL(ObAtomicProtocolUtil::get_gts(ctx->tenant_id_, cur_gts))) {
-      LOG_WARN("fail to get gts for ls meta gc", KR(ret),
-          K_(ctx->tenant_id));
-    } else if (OB_UNLIKELY(!cur_gts.is_valid()
-        || cur_gts.is_min()
-        || cur_gts.is_max())) {
-      ret = OB_ERR_UNEXPECTED;
-      LOG_WARN("invalid gts for ls meta gc", KR(ret),
-          K_(ctx->tenant_id), K(cur_gts));
-    } else if (OB_ISNULL(GCTX.sql_proxy_)) {
+    if (OB_ISNULL(GCTX.sql_proxy_)) {
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("sql proxy is null", KR(ret), K_(ctx->tenant_id));
     } else if (OB_FAIL(ctx->ls_meta_gc_tasks_map_.create(
@@ -664,10 +656,16 @@ int ObSSLSMetaGCPrepareTask::process()
           K_(ctx->tenant_id));
     } else {
       ctx->map_inited_ = true;
+      // Choose the tablet snapshot after collecting tasks so it covers every task's meta_scn.
       if (OB_FAIL(collect_ls_meta_gc_tasks_(
           *ctx, ls_count, gc_task_count))) {
         LOG_WARN("fail to collect ls meta gc tasks", KR(ret),
             K_(ctx->tenant_id), K(ls_count), K(gc_task_count));
+      } else if (OB_FAIL(ObAtomicProtocolUtil::get_gts(ctx->tenant_id_, cur_gts))) {
+        LOG_WARN("fail to get gts for ls meta gc", KR(ret), K_(ctx->tenant_id));
+      } else if (OB_UNLIKELY(!cur_gts.is_valid() || cur_gts.is_min() || cur_gts.is_max())) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("invalid gts for ls meta gc", KR(ret), K_(ctx->tenant_id), K(cur_gts));
       } else {
         ctx->cur_gts_ = cur_gts;
         ctx->map_iter_ = ctx->ls_meta_gc_tasks_map_.begin();
@@ -1090,30 +1088,39 @@ int ObSSLSMetaGCExecutorTask::build_tablet_replayed_scn_info_map_(
 int ObSSLSMetaGCExecutorTask::get_ls_meta_checkpoint_scn_(
     const ObSSLSMetaGCDagCtx &ctx,
     const SCN &ls_meta_scn,
-    SCN &ls_ss_checkpoint_scn)
+    SCN &ls_ss_checkpoint_scn,
+    bool &is_mark_deleted)
 {
   int ret = OB_SUCCESS;
-  ObSSMetaService *meta_service = nullptr;
-  ObSSLSMeta ls_meta;
   ls_ss_checkpoint_scn.reset();
+  is_mark_deleted = false;
   if (OB_UNLIKELY(!ctx.is_valid()
       || !ls_id_.is_valid()
       || !ls_meta_scn.is_valid())) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid ls meta query input", KR(ret), K(ctx), K_(ls_id),
         K(ls_meta_scn));
-  } else if (OB_ISNULL(meta_service = MTL(ObSSMetaService *))) {
+  } else if (OB_ISNULL(GCTX.sql_proxy_)) {
     ret = OB_ERR_UNEXPECTED;
-    LOG_WARN("shared meta service is null", KR(ret), K_(ls_id),
-        K_(ctx.tenant_id), K(ls_meta_scn));
-  } else if (OB_FAIL(meta_service->get_ls_meta(
-      ls_id_, ls_meta_scn, ls_meta))) {
-    if (OB_LS_NOT_EXIST != ret) {
-      LOG_WARN("fail to get ls meta", KR(ret), K_(ls_id),
-          K_(ctx.tenant_id), K(ls_meta_scn));
-    }
+    LOG_WARN("sql proxy is null", KR(ret), K_(ls_id), K_(ctx.tenant_id));
   } else {
-    ls_ss_checkpoint_scn = ls_meta.get_ss_checkpoint_scn();
+    ObSSMetaReadParamV2 read_param;
+    read_param.set_ls_level_param(
+        ObSSMetaReadParamType::LS_KEY, ObSSMetaReadResultType::READ_WHOLE_ROW,
+        ObAtomicProtocolTypeEnum::LS_META, ls_id_, ls_meta_scn, true /*is_in_table*/);
+    read_param.set_read_mark_delete(true);
+    SMART_VAR(ObDefaultSSMetaValue<ObSSLSMeta>, ls_value) {
+      if (OB_FAIL(ObSSMetaTableHelper::get_ls(read_param, ls_value))) {
+        if (OB_ENTRY_NOT_EXIST == ret) {
+          ret = OB_LS_NOT_EXIST;
+        } else {
+          LOG_WARN("fail to get ls meta", KR(ret), K_(ls_id), K_(ctx.tenant_id), K(ls_meta_scn));
+        }
+      } else {
+        ls_ss_checkpoint_scn = ls_value.meta_value_.get_ss_checkpoint_scn();
+        is_mark_deleted = ls_value.get_meta_head_info().is_mark_deleted();
+      }
+    }
   }
   return ret;
 }
@@ -1177,13 +1184,13 @@ int ObSSLSMetaGCExecutorTask::do_ls_meta_version_gc_(
     ObSSLSMetaGCDagCtx &ctx,
     const ObSharedGCTask &gc_task,
     const ObIArray<ObSSGCTabletBaseInfo> &tablet_infos,
-    const ObSSLSMetaGCTabletReplayedScnInfoMap
-        &tablet_replayed_scn_info_map,
+    ObSSLSMetaGCTabletReplayedScnInfoMap &tablet_replayed_scn_info_map,
     bool &is_gced)
 {
   int ret = OB_SUCCESS;
   ObSharedGCLSMetaInfo gc_info;
   SCN ls_ss_checkpoint_scn;
+  bool is_mark_deleted = false;
   bool can_gc_ls_meta_version = true;
   is_gced = false;
   if (OB_FAIL(gc_info.from_value(gc_task.value_))) {
@@ -1198,7 +1205,7 @@ int ObSSLSMetaGCExecutorTask::do_ls_meta_version_gc_(
   } else {
     const SCN &ls_meta_scn = gc_info.meta_scn_;
     if (OB_FAIL(get_ls_meta_checkpoint_scn_(
-        ctx, ls_meta_scn, ls_ss_checkpoint_scn))) {
+        ctx, ls_meta_scn, ls_ss_checkpoint_scn, is_mark_deleted))) {
       if (OB_LS_NOT_EXIST == ret) {
         ret = OB_SUCCESS;
         if (OB_FAIL(finish_ls_meta_gc_task_(
@@ -1216,7 +1223,26 @@ int ObSSLSMetaGCExecutorTask::do_ls_meta_version_gc_(
       ret = OB_ERR_UNEXPECTED;
       LOG_WARN("invalid ls ss checkpoint scn", KR(ret), K_(ls_id),
           K_(ctx.tenant_id), K(ls_meta_scn), K(ls_ss_checkpoint_scn));
+    } else if (is_mark_deleted && !tablet_infos.empty()) {
+      // Tablet GC enumerates LSs through LS_META. Keep the final deleted version until all shared
+      // tablet metadata, including deleted versions, is removed. Retain the task for retry; neither
+      // cold state nor replay progress can bypass this check.
+      LOG_INFO("keep final ls meta until shared tablet meta is cleared", K_(ls_id),
+          K_(ctx.tenant_id), K(ls_meta_scn), "tablet_count", tablet_infos.count());
     } else {
+      // Build replay info only when a version needs it; reuse it for later versions of this LS.
+      if (!tablet_infos.empty() && !tablet_replayed_scn_info_map.created()) {
+        if (OB_FAIL(tablet_replayed_scn_info_map.create(
+            common::hash::cal_next_prime(tablet_infos.count() + 1),
+            ObMemAttr(ctx.tenant_id_, "SSLSReplayScn")))) {
+          LOG_WARN("fail to create tablet replay info map", KR(ret), K_(ls_id),
+              K_(ctx.tenant_id), K(tablet_infos.count()));
+        } else if (OB_FAIL(build_tablet_replayed_scn_info_map_(
+            ctx, tablet_infos, tablet_replayed_scn_info_map))) {
+          LOG_WARN("fail to build tablet replay info map", KR(ret), K_(ls_id),
+              K_(ctx.tenant_id), K(tablet_infos.count()));
+        }
+      }
       for (int64_t i = 0; OB_SUCC(ret)
           && can_gc_ls_meta_version
           && i < tablet_infos.count(); ++i) {
@@ -1290,7 +1316,6 @@ int ObSSLSMetaGCExecutorTask::do_ls_meta_gc_(ObSSLSMetaGCDagCtx &ctx)
   ObArray<ObSharedGCTask> sorted_gc_tasks;
   ObArray<ObSSGCTabletBaseInfo> tablet_infos;
   ObSSLSMetaGCTabletReplayedScnInfoMap tablet_replayed_scn_info_map;
-  bool replay_map_inited = false;
   sorted_gc_tasks.set_attr(ObMemAttr(ctx.tenant_id_, "SSLSMetaGCTask"));
   tablet_infos.set_attr(ObMemAttr(ctx.tenant_id_, "SSLSMetaTablet"));
   if (OB_UNLIKELY(!ctx.is_valid()
@@ -1343,20 +1368,6 @@ int ObSSLSMetaGCExecutorTask::do_ls_meta_gc_(ObSSLSMetaGCDagCtx &ctx)
     if (OB_FAIL(get_ls_tablet_ids_(ctx, tablet_infos))) {
       LOG_WARN("fail to get ls tablet ids", KR(ret), K_(ls_id),
           K_(ctx.tenant_id));
-    } else if (!tablet_infos.empty()) {
-      if (OB_FAIL(tablet_replayed_scn_info_map.create(
-          common::hash::cal_next_prime(tablet_infos.count() + 1),
-          ObMemAttr(ctx.tenant_id_, "SSLSReplayScn")))) {
-        LOG_WARN("fail to create tablet replay info map", KR(ret), K_(ls_id),
-            K_(ctx.tenant_id), K(tablet_infos.count()));
-      } else {
-        replay_map_inited = true;
-        if (OB_FAIL(build_tablet_replayed_scn_info_map_(
-            ctx, tablet_infos, tablet_replayed_scn_info_map))) {
-          LOG_WARN("fail to build tablet replay info map", KR(ret), K_(ls_id),
-              K_(ctx.tenant_id), K(tablet_infos.count()));
-        }
-      }
     }
   }
 
@@ -1377,7 +1388,7 @@ int ObSSLSMetaGCExecutorTask::do_ls_meta_gc_(ObSSLSMetaGCDagCtx &ctx)
       break;
     }
   }
-  if (replay_map_inited) {
+  if (tablet_replayed_scn_info_map.created()) {
     tablet_replayed_scn_info_map.destroy();
   }
   return ret;

@@ -331,6 +331,7 @@ void ObSSMarkSweepCtx::reset()
   reserved_meta_scns_.reset();
   mark_deleted_tablets_.destroy();
   ls_ss_checkpoint_scn_map_.destroy();
+  recyclable_deleted_ls_ids_.reset();
   tablet_kept_meta_scn_map_.destroy();
   tablet_del_meta_scn_infos_.reset();
   tenant_id_ = OB_INVALID_TENANT_ID;
@@ -372,11 +373,14 @@ int ObSSMarkSweepCtx::init_by_param(const ObSSMarkSweepDagParam &param)
 
     tablet_with_meta_scn_arr_.set_attr(ObMemAttr(tenant_id_, "SSGCTabletArr"));
     reserved_meta_scns_.set_attr(ObMemAttr(tenant_id_, "SSGCRsvMetaScn"));
+    recyclable_deleted_ls_ids_.set_attr(ObMemAttr(tenant_id_, "SSGCDelLS"));
 
     if (OB_FAIL(tablet_with_meta_scn_arr_.assign(param.tablet_with_meta_scn_arr_))) {
       LOG_WARN("fail to assign tablet with meta scn arr", KR(ret));
     } else if (OB_FAIL(reserved_meta_scns_.assign(param.reserved_meta_scns_))) {
       LOG_WARN("fail to assign reserved meta scns", KR(ret));
+    } else if (OB_FAIL(recyclable_deleted_ls_ids_.assign(param.recyclable_deleted_ls_ids_))) {
+      LOG_WARN("fail to assign recyclable deleted ls ids", KR(ret));
     } else {
       const int64_t BUCKET_NUM = ObBucketNumHelper::get_bucket_num_by_mtl_mem(
                                             ObGetBucketNumType::TABLET_TYPE);
@@ -505,6 +509,7 @@ int ObSSMarkSweepDagParam::init(const uint64_t tenant_id,
     tablet_with_meta_scn_arr_.set_attr(ObMemAttr(tenant_id, "SSGCTabletArr"));
     reserved_meta_scns_.set_attr(ObMemAttr(tenant_id, "SSGCRsvMetaScn"));
     mark_deleted_tablets_.set_attr(ObMemAttr(tenant_id, "SSGCDelTablet"));
+    recyclable_deleted_ls_ids_.set_attr(ObMemAttr(tenant_id, "SSGCDelLS"));
     const int64_t LS_MAP_BUCKET_NUM = 32;
     if (OB_FAIL(ls_ss_checkpoint_scn_map_.create(
             LS_MAP_BUCKET_NUM, ObMemAttr(tenant_id, "SSGCLSCkptMap")))) {
@@ -1431,9 +1436,9 @@ int ObSSMarkSweepSortTask::calc_recycle_boundary_from_constraints_(
 //        此时所有 reserved 消费者与 GC 自身的约束都已推进到 mark_delete 版本，tablet 已不存在，
 //        连 mark_delete 版本自身（== min_meta_scn，亦即最后一个版本）也允许进入可删候选，
 //        仍需通过 3.3 的 checkpoint 检查后才真正可删。
-//   3.3) 只有 ls_ss_checkpoint_scn 推过 tablet_max_replayed_scn 的tablet版本，才能删除，即：
-//        tablet_max_replayed_scn >= ls_ss_checkpoint_scn -> kept；
-//        tablet_max_replayed_scn < ls_ss_checkpoint_scn -> del。
+//   3.3) 通常仅 tablet_max_replayed_scn < ls_ss_checkpoint_scn 的版本可删。
+//        LS 最终删除版本已满足 safe/reservation 且 tablet can_del_all 时，等号也可删；
+//        大于 checkpoint 的版本仍保留。
 //   3.4) 仅 Lock Row 分支可能出现 min_meta_scn == mark_delete_meta_scn + 1（终态位点）：
 //        说明此前已有一轮把该 tablet 的所有版本连 mark_delete 版本一起判定为可删；
 //        mark-delete 之后不会再有新版本，因此快照中残留的版本仍按 can_del_all 处理。
@@ -1465,8 +1470,8 @@ int ObSSMarkSweepSortTask::get_del_and_kept_meta_scns_simply_(
   // 3. (1) meta_scn <  min_meta_scn -> del; meta_scn >= min_meta_scn -> kept.
   //    (2) 除非 can_del_all，否则最后一个 meta_scn 必须始终保留；
   //        can_del_all 时 mark_delete 版本自身也进入可删候选。
-  //    (3) tablet_max_replayed_scn >= ls_ss_checkpoint_scn -> kept；
-  //        tablet_max_replayed_scn < ls_ss_checkpoint_scn -> del。
+  //    (3) Allow checkpoint equality only when both the LS and tablet can be fully reclaimed.
+  const bool can_recycle_equal_checkpoint = param.ls_can_del_all_ && can_del_all;
   for (int64_t i = 0; OB_SUCC(ret) && (i < all_meta_scn_cnt); ++i) {
     bool is_exceed = false;
     const SCN &cur_meta_scn = all_meta_scns.at(i);
@@ -1478,7 +1483,8 @@ int ObSSMarkSweepSortTask::get_del_and_kept_meta_scns_simply_(
         LOG_WARN("fail to push back to kept_meta_scns", KR(ret), K(cur_meta_scn), K(min_meta_scn));
       }
     } else if (OB_FAIL(check_if_replayed_scn_exceed_checkpoint_scn_(
-        param.tablet_, cur_meta_scn, param.ls_ss_checkpoint_scn_map_, is_exceed))) {
+        param.tablet_, cur_meta_scn, param.ls_ss_checkpoint_scn_map_,
+        can_recycle_equal_checkpoint, is_exceed))) {
       // TODO(binifei.bnf): 最好要提供+使用批量get_tablet的接口，否则百万分区场景，并且删除的版本比较多时，mark sweep就会很慢
       LOG_WARN("fail to check if replayed scn exceed checkpoint scn", KR(ret),
           K(cur_meta_scn), K(min_meta_scn));
@@ -1499,7 +1505,7 @@ int ObSSMarkSweepSortTask::get_del_and_kept_meta_scns_simply_(
   FLOG_INFO("finish to get del and kept meta scns simply", "cost_us", time_piece.fly_us(),
       "tablet", param.tablet_, "tablet_meta_scn", param.tablet_meta_scn_, "safe_meta_scn",
       param.safe_meta_scn_, "mark_delete_meta_scn", param.mark_delete_meta_scn_,
-      K(real_min_reserved_meta_scn), K(min_meta_scn), K(can_del_all),
+      K(real_min_reserved_meta_scn), K(min_meta_scn), K(can_del_all), K(can_recycle_equal_checkpoint),
       K(reserved_meta_scns), K(del_meta_scns), K(kept_meta_scns));
   return ret;
 }
@@ -1705,6 +1711,7 @@ int ObSSMarkSweepSortTask::check_if_replayed_scn_exceed_checkpoint_scn_(
     const ObSSGCTablet &gc_tablet,
     const SCN &meta_scn,
     const ObHashMap<ObLSID, SCN> &ls_ss_checkpoint_scn_map,
+    const bool can_recycle_equal_checkpoint,
     bool &is_exceed)
 {
   ObCostTimer cost_timer(replayed_scn_check_cost_us_);
@@ -1729,7 +1736,8 @@ int ObSSMarkSweepSortTask::check_if_replayed_scn_exceed_checkpoint_scn_(
     if (OB_FAIL(ls_ss_checkpoint_scn_map.get_refactored(gc_tablet.ls_id_, ls_ss_checkpoint_scn))) {
       LOG_WARN("fail to get ls ss checkpoint scn", KR(ret), K(gc_tablet), K(meta_scn));
     } else {
-      is_exceed = (tablet_max_replayed_scn >= ls_ss_checkpoint_scn);
+      is_exceed = tablet_max_replayed_scn > ls_ss_checkpoint_scn
+          || (tablet_max_replayed_scn == ls_ss_checkpoint_scn && !can_recycle_equal_checkpoint);
     }
   }
   return ret;
@@ -1804,10 +1812,13 @@ int ObSSMarkSweepSortTask::process_one_tablet_(
                                                   mark_delete_meta_scn))) {
     LOG_WARN("fail to get mark_delete meta_scn", KR(ret), K(tablet_with_meta_scn));
   } else {
+    const bool ls_can_del_all = has_exist_in_array(
+        ctx.recyclable_deleted_ls_ids_, tablet_with_meta_scn.gc_tablet_.ls_id_);
     const ObSSGetDelKeptMetaScnParam param(tablet_with_meta_scn.gc_tablet_,
         tablet_with_meta_scn.meta_scn_, tablet_kept_meta_scn,
         safe_meta_scn, mark_delete_meta_scn,
-        reserved_meta_scns, all_meta_scns, ctx.ls_ss_checkpoint_scn_map_);
+        reserved_meta_scns, all_meta_scns, ctx.ls_ss_checkpoint_scn_map_,
+        ls_can_del_all);
     if (OB_FAIL(get_del_and_kept_meta_scns_simply_(param, del_meta_scns, kept_meta_scns))) {
       LOG_WARN("fail to get del and kept meta scns", KR(ret), K(param));
     } else if (OB_FAIL(process_one_group_(ObMarkSweepGroupType::DEL, tablet_with_meta_scn.gc_tablet_,

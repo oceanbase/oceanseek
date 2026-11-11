@@ -229,7 +229,8 @@ protected:
   virtual int get_ls_meta_checkpoint_scn_(
       const ObSSLSMetaGCDagCtx &ctx,
       const share::SCN &ls_meta_scn,
-      share::SCN &ls_ss_checkpoint_scn);
+      share::SCN &ls_ss_checkpoint_scn,
+      bool &is_mark_deleted);
   virtual int remove_ls_meta_(
       const ObSSLSMetaGCDagCtx &ctx,
       const share::SCN &ls_meta_scn);
@@ -251,8 +252,7 @@ private:
       ObSSLSMetaGCDagCtx &ctx,
       const ObSharedGCTask &gc_task,
       const common::ObIArray<ObSSGCTabletBaseInfo> &tablet_infos,
-      const ObSSLSMetaGCTabletReplayedScnInfoMap
-          &tablet_replayed_scn_info_map,
+      ObSSLSMetaGCTabletReplayedScnInfoMap &tablet_replayed_scn_info_map,
       bool &is_gced);
 
   bool is_inited_;
