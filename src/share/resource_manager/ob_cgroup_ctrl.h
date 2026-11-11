@@ -8,6 +8,7 @@
 
 #include <stdint.h>
 #include <sys/types.h>
+#include "lib/utility/ob_macro_utils.h"
 #include "share/io/ob_io_define.h"
 namespace oceanbase
 {
@@ -24,6 +25,7 @@ namespace share
 class ObGroupName;
 class ObTenantBase;
 class ObResourcePlanManager;
+class ObSystemTenantCgroupGuard;
 
 typedef enum  : uint64_t {
   DEFAULT = 0,
@@ -228,7 +230,13 @@ private:
   friend class oceanbase::omt::ObTenant;
   friend class oceanbase::share::ObTenantBase;
   friend class oceanbase::share::ObResourcePlanManager;
+  friend class oceanbase::share::ObSystemTenantCgroupGuard;
   friend int oceanbase::lib::SET_GROUP_ID(uint64_t group_id, bool is_background);
+  // Explicit-tenant binding for callers that are not native tenant workers.
+  // Unlike SET_GROUP_ID, this does not change worker metadata or hide errors.
+  int add_self_to_cgroup(const uint64_t tenant_id, const uint64_t group_id);
+  // Attach the current thread to an already resolved CPU cgroup path.
+  int add_self_to_cgroup_path(const char *group_path);
   int add_self_to_cgroup_(const uint64_t tenant_id, const uint64_t group_id = OBCG_DEFAULT, const bool is_background = false);
   int add_thread_to_cgroup_(const int64_t tid,const uint64_t tenant_id, const uint64_t group_id = OBCG_DEFAULT, const bool is_background = false);
   static int init_dir_(const char *curr_dir);
@@ -251,6 +259,31 @@ private:
   int recursion_dec_cpu_cfs_quota_(const char *curr_path, const double cpu);
   int get_cpu_time_(const uint64_t tenant_id, int64_t &cpu_time, const uint64_t group_id = OB_INVALID_GROUP_ID, const bool is_background = false);
   int get_throttled_time_(const uint64_t tenant_id, int64_t &throttled_time, const uint64_t group_id = OB_INVALID_GROUP_ID, const bool is_background = false);
+};
+
+// Bind a system-tenant transport worker to an explicit tenant consumer group.
+// The outermost scope restores the system tenant default cgroup; nested scopes
+// restore the explicit parent binding recorded in worker metadata. Unlike
+// SET_GROUP_ID, attachment failures are returned to the caller.
+class ObSystemTenantCgroupGuard
+{
+public:
+  ObSystemTenantCgroupGuard();
+  ~ObSystemTenantCgroupGuard();
+  int switch_to(uint64_t tenant_id, uint64_t group_id);
+  int restore();
+
+private:
+  bool initialized_;
+  bool cgroup_changed_;
+  int64_t thread_id_;
+  uint64_t original_group_id_;
+  uint64_t original_origin_tenant_id_;
+  uint64_t restore_tenant_id_;
+  uint64_t restore_group_id_;
+  ObCgroupCtrl *cgroup_ctrl_;
+
+  DISALLOW_COPY_AND_ASSIGN(ObSystemTenantCgroupGuard);
 };
 
 }  // share

@@ -24,6 +24,8 @@
 #include "share/ob_errno.h"
 #include "share/ob_server_struct.h"
 #include "share/rc/ob_tenant_base.h"
+#include "share/resource_manager/ob_cgroup_ctrl.h"
+#include "share/resource_manager/ob_resource_manager.h"
 #include "share/schema/ob_schema_getter_guard.h"
 #include "share/schema/ob_multi_version_schema_service.h"
 #include "share/schema/ob_table_schema.h"
@@ -152,13 +154,18 @@ class ObFlightSqlExecutionScope
 public:
   explicit ObFlightSqlExecutionScope(ObFlightSqlSession &flight_session)
       : session_(flight_session.ob_session),
+        tenant_id_(flight_session.tenant_id),
         previous_session_(THIS_WORKER.get_session()),
+        previous_rpc_tenant_(THIS_WORKER.get_rpc_tenant()),
         compat_mode_guard_(OB_NOT_NULL(session_)
             && ORACLE_MODE == session_->get_compatibility_mode()
                 ? lib::Worker::CompatMode::ORACLE
                 : lib::Worker::CompatMode::MYSQL)
   {
     THIS_WORKER.set_session(session_);
+    // Native SQL derives RPC tenants from each SQL session, including nested
+    // meta-tenant statements. Do not inherit the Flight transport's override.
+    THIS_WORKER.reset_rpc_tenant();
     if (OB_NOT_NULL(session_)) {
       session_->set_current_trace_id(common::ObCurTraceId::get_trace_id());
       session_->init_use_rich_format();
@@ -169,14 +176,14 @@ public:
   ~ObFlightSqlExecutionScope()
   {
     THIS_WORKER.set_session(previous_session_);
+    THIS_WORKER.set_rpc_tenant(previous_rpc_tenant_);
   }
 
   int refresh_session_state()
   {
     int ret = OB_SUCCESS;
-    if (OB_ISNULL(session_)) {
-      ret = OB_NOT_INIT;
-      LOG_WARN("[FlightSQL] execution scope has no OB session", K(ret));
+    if (OB_FAIL(bind_resource_group())) {
+      LOG_WARN("[FlightSQL] failed to bind the current thread resource group", K(ret));
     } else if (OB_FAIL(session_->check_tenant_status())) {
       LOG_WARN("[FlightSQL] tenant is not available for execution", K(ret));
     } else if (OB_FAIL(session_->update_timezone_info())) {
@@ -193,10 +200,56 @@ public:
     return ret;
   }
 
+  int bind_resource_group()
+  {
+    int ret = OB_SUCCESS;
+    if (OB_ISNULL(session_)) {
+      ret = OB_NOT_INIT;
+      LOG_WARN("[FlightSQL] execution scope has no OB session", K(ret));
+    } else if (tenant_id_ != session_->get_effective_tenant_id() || tenant_id_ != MTL_ID()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("[FlightSQL] execution tenant differs from fixed session tenant", K(ret),
+               K(tenant_id_), "session_tenant_id", session_->get_effective_tenant_id(),
+               "mtl_tenant_id", MTL_ID());
+    } else {
+      ret = bind_default_resource_group();
+    }
+    return ret;
+  }
+
+  int switch_resource_group(const uint64_t group_id)
+  {
+    return cgroup_guard_.switch_to(tenant_id_, group_id);
+  }
+
 private:
+  int bind_default_resource_group()
+  {
+    int ret = OB_SUCCESS;
+    uint64_t group_id = 0;
+    session_->set_expect_group_id(common::OB_INVALID_ID);
+    // USER mappings are not recorded in every cached plan. Resolve the current
+    // mapping for each request, including removal of a previous mapping.
+    if (OB_NOT_NULL(GCTX.cgroup_ctrl_) && GCTX.cgroup_ctrl_->is_valid()) {
+      if (OB_FAIL(G_RES_MGR.get_mapping_rule_mgr().get_group_id_by_user(
+              tenant_id_, session_->get_user_id(), group_id))) {
+        LOG_WARN("[FlightSQL] failed to resolve default resource group", K(ret), K(tenant_id_));
+      } else if (common::OB_INVALID_ID == group_id) {
+        group_id = 0;
+      }
+    }
+    if (OB_SUCC(ret)) {
+      ret = switch_resource_group(group_id);
+    }
+    return ret;
+  }
+
   sql::ObSQLSessionInfo *session_;
+  const uint64_t tenant_id_;
   sql::ObSQLSessionInfo *previous_session_;
+  const uint64_t previous_rpc_tenant_;
   lib::CompatModeGuard compat_mode_guard_;
+  share::ObSystemTenantCgroupGuard cgroup_guard_;
   ObFlightSqlExecutionScope(const ObFlightSqlExecutionScope &) = delete;
   ObFlightSqlExecutionScope &operator=(const ObFlightSqlExecutionScope &) = delete;
 };
@@ -924,9 +977,114 @@ static int flight_sql_setup_task_exec_ctx_(sql::ObResultSet &result_set,
   return ret;
 }
 
+// Native compilation can request a resource-group switch or an SPM recompile
+// before open() starts SQL execution or consumes an Arrow ingest stream.
+// Group switches need a fresh SQL context; SPM retries retain the native
+// outline/baseline state, as ObMPQuery does. Never retry open()/fetch here.
+template <typename Compile>
+static int flight_sql_compile_in_resource_group_(
+    ObFlightSqlSession &session,
+    ObFlightSqlExecutionScope &execution_scope,
+    sql::ObSqlCtx &sql_ctx,
+    sql::ObResultSet &result_set,
+    const common::ObString &sql,
+    const bool ps_protocol,
+    Compile &&compile)
+{
+  int ret = OB_SUCCESS;
+  const int64_t max_group_switches = 2;
+  int64_t group_switches = 0;
+  bool retry = true;
+  share::schema::ObSchemaGetterGuard *const schema_guard = sql_ctx.schema_guard_;
+  common::ObIAllocator &allocator = result_set.get_mem_pool();
+  const bool sensitive_sql = sql_ctx.is_sensitive_;
+  while (retry) {
+    retry = false;
+    bool reset_sql_ctx = false;
+    session.ob_session->set_expect_group_id(common::OB_INVALID_ID);
+    ret = compile();
+    if (OB_NEED_SWITCH_CONSUMER_GROUP == ret) {
+      const uint64_t expected_group_id = session.ob_session->get_expect_group_id();
+      if (common::OB_INVALID_ID == expected_group_id
+          || expected_group_id == THIS_WORKER.get_group_id()
+          || group_switches >= max_group_switches) {
+        LOG_WARN("[FlightSQL] cannot resolve SQL resource group after compilation",
+                 K(ret), K(expected_group_id), K(group_switches),
+                 "current_group_id", THIS_WORKER.get_group_id());
+      } else if (THIS_WORKER.is_timeout()) {
+        ret = OB_TIMEOUT;
+      } else if (OB_FAIL(execution_scope.switch_resource_group(expected_group_id))) {
+        LOG_WARN("[FlightSQL] failed to move RPC thread to SQL resource group",
+                 K(ret), K(expected_group_id));
+      } else {
+        ++group_switches;
+        reset_sql_ctx = true;
+        retry = true;
+      }
+    } else if (OB_SQL_RETRY_SPM == ret) {
+      if (THIS_WORKER.is_timeout()) {
+        ret = OB_TIMEOUT;
+      } else {
+        retry = true;
+      }
+    }
+    if (retry) {
+      const bool is_sensitive = sensitive_sql || sql_ctx.is_sensitive_;
+      result_set.~ObResultSet();
+      if (reset_sql_ctx) {
+        sql_ctx.reset();
+        sql_ctx.session_info_ = session.ob_session;
+        sql_ctx.schema_guard_ = schema_guard;
+        sql_ctx.disable_privilege_check_ = PRIV_CHECK_FLAG_NORMAL;
+        sql_ctx.is_flight_sql_ = true;
+        sql_ctx.enable_sql_resource_manage_ = true;
+      } else {
+        // clear() drops per-attempt pointers but preserves first_outline_data_,
+        // first_plan_hash_, and spm_ctx_ required by native local retries. Their
+        // allocations belong to the request allocator, not the result object.
+        sql_ctx.clear();
+        ++sql_ctx.retry_times_;
+      }
+      sql_ctx.is_sensitive_ = is_sensitive;
+      sql_ctx.cur_sql_ = sql;
+      new (&result_set) sql::ObResultSet(*session.ob_session, allocator);
+      if (ps_protocol) {
+        result_set.set_ps_protocol();
+      }
+      if (OB_FAIL(result_set.init())) {
+        LOG_WARN("[FlightSQL] failed to initialize compilation retry result", K(ret));
+      } else if (OB_ISNULL(schema_guard)) {
+        ret = OB_ERR_UNEXPECTED;
+        LOG_WARN("[FlightSQL] compilation retry has no schema guard", K(ret));
+      } else if (OB_FAIL(flight_sql_setup_task_exec_ctx_(
+                     result_set, *schema_guard, session.tenant_id))) {
+        LOG_WARN("[FlightSQL] failed to initialize compilation retry task context", K(ret));
+      } else {
+        result_set.get_exec_context().set_flight_sql_stream_registry(
+            session.ob_session->get_flight_sql_stream_registry());
+      }
+      retry = OB_SUCC(ret);
+    }
+  }
+  session.ob_session->set_expect_group_id(common::OB_INVALID_ID);
+  return ret;
+}
+
+static int flight_sql_stmt_query_in_resource_group_(
+    ObFlightSqlSession &session,
+    ObFlightSqlExecutionScope &execution_scope,
+    const common::ObString &sql,
+    sql::ObSqlCtx &sql_ctx,
+    sql::ObResultSet &result_set)
+{
+  return flight_sql_compile_in_resource_group_(
+      session, execution_scope, sql_ctx, result_set, sql, false,
+      [&]() { return GCTX.sql_engine_->stmt_query(sql, sql_ctx, result_set); });
+}
+
 // ============================================================
 // GV$OB_SQL_AUDIT — same pipeline as obmp_query.cpp (mutate session audit_record_)
-// QUERY_SQL: optional non-secret catalog tag + newline (same rules as ob_flight_sql_audit.cpp)
+// QUERY_SQL: optional non-secret catalog/RPC tags + newline, then the statement.
 // ============================================================
 
 struct FlightSqlAuditTimeSource {
@@ -964,6 +1122,7 @@ static bool flight_sql_audit_tag_printable_(const char *const s, const size_t le
 // Build full QUERY_SQL text: optional `-- flightsql: …` line comment, newline, then statement
 static int flight_sql_build_tagged_audit_sql_(
     const ObFlightSqlSession &flight_sess,
+    const char *request_name,
     const common::ObString &sql_plain,
     sql::ObSQLSessionInfo &ob_sess,
     common::ObIAllocator &allocator,
@@ -979,9 +1138,21 @@ static int flight_sql_build_tagged_audit_sql_(
   const size_t cat_len = strnlen(cat.c_str(), cat.size());
   const bool cat_ok = cat_len > 0 && cat_len == cat.size()
                       && flight_sql_audit_tag_printable_(cat.c_str(), cat_len);
-  if (cat_ok) {
-    sql_full.append("-- flightsql: catalog=");
-    sql_full.append(cat.c_str(), cat_len);
+  static const size_t MAX_REQUEST_NAME_LEN = 64;
+  const size_t request_len = OB_ISNULL(request_name)
+      ? 0 : strnlen(request_name, MAX_REQUEST_NAME_LEN);
+  const bool request_ok = request_len > 0 && request_len < MAX_REQUEST_NAME_LEN
+                          && flight_sql_audit_tag_printable_(request_name, request_len);
+  if (cat_ok || request_ok) {
+    sql_full.append("-- flightsql:");
+    if (cat_ok) {
+      sql_full.append(" catalog=");
+      sql_full.append(cat.c_str(), cat_len);
+    }
+    if (request_ok) {
+      sql_full.append(" request=");
+      sql_full.append(request_name, request_len);
+    }
     sql_full.append("\n");
   }
   if (sql_plain.length() > 0 && OB_NOT_NULL(sql_plain.ptr())) {
@@ -1006,6 +1177,7 @@ static void flight_sql_finalize_statement_audit_like_mpquery_(
     const int exec_ret,
     common::ObIAllocator &allocator,
     const common::ObString &sql_plain,
+    const char *request_name,
     FlightSqlAuditTimeSource &ts,
     const bool enable_perf_event,
     common::ObWaitEventStat &total_wait_desc,
@@ -1041,7 +1213,7 @@ static void flight_sql_finalize_statement_audit_like_mpquery_(
   if (enable_sql_audit) {
     common::ObString tagged_sql;
     const int wret = flight_sql_build_tagged_audit_sql_(
-        flight_sess, sql_plain, session, allocator, tagged_sql);
+        flight_sess, request_name, sql_plain, session, allocator, tagged_sql);
     audit_record.seq_ = 0;
     audit_record.execution_id_ = session.get_current_execution_id();
     audit_record.client_addr_ = session.get_peer_addr();
@@ -1447,7 +1619,8 @@ static bool is_flight_sql_doget_stmt(const stmt::StmtType stmt_type)
 
 int ObFlightSqlQueryProcessor::prepare(ObFlightSqlSession &session,
                                        const common::ObString &sql,
-                                       const PrepareMode mode)
+                                       const PrepareMode mode,
+                                       const bool query_already_locked)
 {
   int ret = OB_SUCCESS;
   arrow_schema_.reset();
@@ -1471,7 +1644,7 @@ int ObFlightSqlQueryProcessor::prepare(ObFlightSqlSession &session,
     return ret;
   }
 
-  ObSessionQueryGuard query_guard(session);
+  ObSessionQueryGuard query_guard(session, query_already_locked);
   if (!query_guard.acquired()) {
     ret = OB_EAGAIN;
     LOG_WARN("[FlightSQL] prepare: concurrent query on same session rejected — "
@@ -1506,6 +1679,7 @@ int ObFlightSqlQueryProcessor::prepare(ObFlightSqlSession &session,
   sql_ctx.schema_guard_            = &schema_guard;
   sql_ctx.disable_privilege_check_ = PRIV_CHECK_FLAG_NORMAL;
   sql_ctx.is_flight_sql_           = true;
+  sql_ctx.enable_sql_resource_manage_ = true;
 
   lib::ContextParam ctx_param;
   ctx_param.set_mem_attr(session.tenant_id, "FlightSQL")
@@ -1527,7 +1701,8 @@ int ObFlightSqlQueryProcessor::prepare(ObFlightSqlSession &session,
         "sql", sql.ptr());
       return ret;
     }
-    if (OB_FAIL(GCTX.sql_engine_->stmt_query(sql, sql_ctx, *result_set))) {
+    if (OB_FAIL(flight_sql_stmt_query_in_resource_group_(
+            session, execution_scope, sql, sql_ctx, *result_set))) {
       LOG_WARN("[FlightSQL] QueryProcessor::prepare: stmt_query failed",
                K(ret), "ob_trace_id", ObCurTraceId::get_trace_id_str(),
                "sql", sql.ptr());
@@ -1612,7 +1787,8 @@ int ObFlightSqlQueryProcessor::prepare_prepared_update(
     common::ObPsStmtId &client_stmt_id,
     sql::stmt::StmtType &stmt_type,
     int64_t &parameter_count,
-    bool &sensitive_sql)
+    bool &sensitive_sql,
+    const char *audit_request_name)
 {
   int ret = OB_SUCCESS;
   client_stmt_id = common::OB_INVALID_ID;
@@ -1755,7 +1931,8 @@ int ObFlightSqlQueryProcessor::prepare_prepared_update(
         ? common::ObString(OB_MASKED_STR) : sql;
     flight_sql_finalize_statement_audit_like_mpquery_(
         session, ob_session, sql_ctx, *result_set, ret, arena_alloc, audit_sql,
-        audit_time, enable_perf_event, total_wait_desc, sql::EXECUTE_PS_PREPARE);
+        audit_request_name, audit_time, enable_perf_event, total_wait_desc,
+        sql::EXECUTE_PS_PREPARE);
   }
 
   session.ob_session->set_last_trace_id(common::ObCurTraceId::get_trace_id());
@@ -1771,7 +1948,9 @@ int ObFlightSqlQueryProcessor::execute_prepared_update(
     common::ObIAllocator &parameter_allocator,
     const common::ObString &sql,
     const bool sensitive_sql,
-    int64_t &failed_column)
+    const char *audit_request_name,
+    int64_t &failed_column,
+    const ObFlightSqlRequestCancellation *cancellation)
 {
   int ret = OB_SUCCESS;
   failed_column = -1;
@@ -1843,6 +2022,12 @@ int ObFlightSqlQueryProcessor::execute_prepared_update(
       ? common::ObString(OB_MASKED_STR) : sql;
   ObFlightSqlPreparedStateScope state_scope(
       session, display_sql, obmysql::ObMySQLCmd::COM_STMT_EXECUTE);
+  // QUERY_ACTIVE above can replace a query-killed state from cancellation
+  // between parameter rows. Keep the request cancellation sticky across rows
+  // and check after publishing the new native execution state.
+  if (OB_NOT_NULL(cancellation) && cancellation->is_cancelled()) {
+    return OB_CANCELED;
+  }
   lib::ContextParam ctx_param;
   ctx_param.set_mem_attr(session.tenant_id, "FlightSQLPS")
            .set_properties(lib::USE_TL_PAGE_OPTIONAL);
@@ -1884,17 +2069,31 @@ int ObFlightSqlQueryProcessor::execute_prepared_update(
 
     sql::ParamStore params((common::ObWrapperAllocator(parameter_allocator)));
     common::ObPsStmtId inner_stmt_id = common::OB_INVALID_ID;
-    if (OB_FAIL(ObFlightSqlParamConverter::convert_row(
-            parameter_batch, parameter_row_idx, session, result_set->get_exec_context(),
-            parameter_allocator, params, failed_column))) {
-      LOG_WARN("[FlightSQL] execute_prepared_update: Arrow parameter binding failed", K(ret),
-               K(parameter_row_idx), K(failed_column));
-    } else if (OB_FAIL(ob_session.get_inner_ps_stmt_id(client_stmt_id, inner_stmt_id))) {
-      LOG_WARN("[FlightSQL] execute_prepared_update: get inner statement ID failed",
-               K(ret), K(client_stmt_id));
-    } else if (OB_FAIL(GCTX.sql_engine_->stmt_execute(
-                   client_stmt_id, stmt_type, params, sql_ctx, *result_set,
-                   false /* is_inner_sql */))) {
+    if (OB_FAIL(flight_sql_compile_in_resource_group_(
+            session, execution_scope, sql_ctx, *result_set, sql, true,
+            [&]() {
+              int ret = OB_SUCCESS;
+              params.reuse();
+              failed_column = -1;
+              // Rebind this borrowed Arrow row after a compile-only retry so
+              // its collection subschemas belong to the fresh execution context.
+              if (OB_FAIL(ObFlightSqlParamConverter::convert_row(
+                      parameter_batch, parameter_row_idx, session,
+                      result_set->get_exec_context(), parameter_allocator,
+                      params, failed_column))) {
+                LOG_WARN("[FlightSQL] execute_prepared_update: Arrow parameter binding failed",
+                         K(ret), K(parameter_row_idx), K(failed_column));
+              } else if (OB_FAIL(ob_session.get_inner_ps_stmt_id(
+                             client_stmt_id, inner_stmt_id))) {
+                LOG_WARN("[FlightSQL] execute_prepared_update: get inner statement ID failed",
+                         K(ret), K(client_stmt_id));
+              } else {
+                ret = GCTX.sql_engine_->stmt_execute(
+                    client_stmt_id, stmt_type, params, sql_ctx, *result_set,
+                    false /* is_inner_sql */);
+              }
+              return ret;
+            }))) {
       LOG_WARN("[FlightSQL] execute_prepared_update: stmt_execute failed",
                K(ret), K(client_stmt_id),
                "ob_trace_id", common::ObCurTraceId::get_trace_id_str());
@@ -1943,7 +2142,8 @@ int ObFlightSqlQueryProcessor::execute_prepared_update(
     audit_record.ps_inner_stmt_id_ = inner_stmt_id;
     flight_sql_finalize_statement_audit_like_mpquery_(
         session, ob_session, sql_ctx, *result_set, ret, arena_alloc, display_sql,
-        audit_time, enable_perf_event, total_wait_desc, sql::EXECUTE_PS_EXECUTE);
+        audit_request_name, audit_time, enable_perf_event, total_wait_desc,
+        sql::EXECUTE_PS_EXECUTE);
   }
 
   session.ob_session->set_last_trace_id(common::ObCurTraceId::get_trace_id());
@@ -1964,11 +2164,25 @@ int ObFlightSqlQueryProcessor::close_prepared_statement(
     if (OB_FAIL(tenant_guard.switch_to(session.tenant_id))) {
       LOG_WARN("[FlightSQL] close_prepared_statement: switch_to failed",
                K(ret), "tenant_id", static_cast<int64_t>(session.tenant_id));
+    } else if (session.tenant_id != session.ob_session->get_effective_tenant_id()) {
+      ret = OB_ERR_UNEXPECTED;
+      LOG_WARN("[FlightSQL] close_prepared_statement: fixed session tenant changed",
+               K(ret), K(session.tenant_id),
+               "effective_tenant_id", session.ob_session->get_effective_tenant_id());
     } else {
       ObFlightSqlExecutionScope execution_scope(session);
+      const int group_ret = execution_scope.bind_resource_group();
+      if (OB_SUCCESS != group_ret) {
+        // The fixed tenant has already been entered. Release native prepared
+        // state even if cancellation or teardown prevents cgroup attachment.
+        LOG_WARN("[FlightSQL] close_prepared_statement: resource group bind failed",
+                 K(group_ret), K(client_stmt_id));
+      }
       if (OB_FAIL(session.ob_session->close_ps_stmt(client_stmt_id))) {
         LOG_WARN("[FlightSQL] close_prepared_statement: native close failed",
                  K(ret), K(client_stmt_id));
+      } else {
+        ret = group_ret;
       }
     }
   }
@@ -2079,11 +2293,12 @@ int ObFlightSqlQueryProcessor::execute_sql(ObFlightSqlSession &session,
     audit_rec.exec_record_.record_start();
   }
 
-  if (OB_FAIL(GCTX.sql_engine_->stmt_query(sql, sql_ctx, *result_set))) {
+  if (OB_FAIL(flight_sql_stmt_query_in_resource_group_(
+            session, execution_scope, sql, sql_ctx, *result_set))) {
     ts_src.exec_start_ts_ = common::ObTimeUtility::current_time();
     LOG_WARN("[FlightSQL] execute_sql: stmt_query failed", K(ret), "sql", sql.ptr());
     flight_sql_finalize_statement_audit_like_mpquery_(
-        session, *ob_sess, sql_ctx, *result_set, ret, arena_alloc, sql, ts_src,
+        session, *ob_sess, sql_ctx, *result_set, ret, arena_alloc, sql, nullptr, ts_src,
         enable_perf_event, total_wait_desc);
     return ret;
   }
@@ -2100,16 +2315,25 @@ int ObFlightSqlQueryProcessor::execute_sql(ObFlightSqlSession &session,
                K(close_ret), K(open_err), "ob_trace_id", ObCurTraceId::get_trace_id_str());
     }
     flight_sql_finalize_statement_audit_like_mpquery_(
-        session, *ob_sess, sql_ctx, *result_set, ret, arena_alloc, sql, ts_src,
+        session, *ob_sess, sql_ctx, *result_set, ret, arena_alloc, sql, nullptr, ts_src,
         enable_perf_event, total_wait_desc);
     return ret;
   }
   LOG_TRACE("[FlightSQL] execute_sql: result_set open OK (execution started)",
            "ob_trace_id", ObCurTraceId::get_trace_id_str(), "sql", sql.ptr());
-  result_set->close();
-  LOG_TRACE("[FlightSQL] execute_sql: OK (executed and closed)", "sql", sql.ptr());
+  const int close_ret = result_set->close();
+  if (OB_SUCCESS != close_ret) {
+    LOG_WARN("[FlightSQL] execute_sql: result_set->close failed",
+             K(close_ret), K(ret), "ob_trace_id", ObCurTraceId::get_trace_id_str());
+    if (OB_SUCC(ret)) {
+      ret = close_ret;
+    }
+  }
+  if (OB_SUCC(ret)) {
+    LOG_TRACE("[FlightSQL] execute_sql: OK (executed and closed)", "sql", sql.ptr());
+  }
   flight_sql_finalize_statement_audit_like_mpquery_(
-      session, *ob_sess, sql_ctx, *result_set, ret, arena_alloc, sql, ts_src,
+      session, *ob_sess, sql_ctx, *result_set, ret, arena_alloc, sql, nullptr, ts_src,
       enable_perf_event, total_wait_desc);
   }
   return ret;
@@ -2128,6 +2352,8 @@ int ObFlightSqlQueryProcessor::open_query(ObFlightSqlSession &session,
                                           ObFlightSqlQueryPtr<sql::ObResultSet> &out_result_set)
 {
   int ret = OB_SUCCESS;
+  resource_group_id_ = 0;
+  timeout_ts_ = INT64_MAX;
 
   if (OB_ISNULL(session.ob_session)) {
     ret = OB_NOT_INIT;
@@ -2232,7 +2458,8 @@ int ObFlightSqlQueryProcessor::open_query(ObFlightSqlSession &session,
     session.ob_session->reset_plsql_exec_time();
     session.ob_session->reset_plsql_compile_time();
     session.ob_session->set_stmt_type(sql::stmt::T_NONE);
-    if (OB_FAIL(GCTX.sql_engine_->stmt_query(sql, *sql_ctx, *result_set))) {
+    if (OB_FAIL(flight_sql_stmt_query_in_resource_group_(
+            session, execution_scope, sql, *sql_ctx, *result_set))) {
       LOG_WARN("[FlightSQL] open_query: stmt_query failed",
                K(ret), "ob_trace_id", ObCurTraceId::get_trace_id_str(), "sql", sql.ptr());
     }
@@ -2278,16 +2505,22 @@ int ObFlightSqlQueryProcessor::open_query(ObFlightSqlSession &session,
     }
   }
 
+  resource_group_id_ = THIS_WORKER.get_group_id();
+  timeout_ts_ = THIS_WORKER.get_timeout_ts();
   if (OB_FAIL(ret)) {
     if (open_attempted) {
       // open() can start a statement before it fails.  close() must still
       // release that state, while the original error remains the client result.
       result_set->set_errcode(ret);
-      WITH_CONTEXT(mem_ctx) {
-        const int close_ret = result_set->close();
-        if (OB_SUCCESS != close_ret && close_ret != ret) {
-          LOG_WARN("[FlightSQL] open_query: cleanup after failed open failed",
-                   K(close_ret), K(ret), "ob_trace_id", trace_id_str_.c_str());
+      const int open_ret = ret;
+      {
+        int ret = OB_SUCCESS;  // WITH_CONTEXT requires a successful local status.
+        WITH_CONTEXT(mem_ctx) {
+          const int close_ret = result_set->close();
+          if (OB_SUCCESS != close_ret && close_ret != open_ret) {
+            LOG_WARN("[FlightSQL] open_query: cleanup after failed open failed",
+                     K(close_ret), K(open_ret), "ob_trace_id", trace_id_str_.c_str());
+          }
         }
       }
     }
@@ -2316,7 +2549,10 @@ int ObFlightSqlQueryProcessor::open_query(ObFlightSqlSession &session,
 // ============================================================
 
 int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
-                                       const common::ObString &sql)
+                                       const common::ObString &sql,
+                                       const char *audit_request_name,
+                                       const bool query_already_locked,
+                                       const ObFlightSqlRequestCancellation *cancellation)
 {
   int ret = OB_SUCCESS;
   arrow_schema_.reset();
@@ -2350,7 +2586,7 @@ int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
     return ret;
   }
 
-  ObSessionQueryGuard query_guard(session);
+  ObSessionQueryGuard query_guard(session, query_already_locked);
   if (!query_guard.acquired()) {
     ret = OB_EAGAIN;
     LOG_WARN("[FlightSQL] execute: concurrent query on same session rejected — "
@@ -2406,6 +2642,10 @@ int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
       }
     }
   } flight_exec_state_guard_(session.ob_session, flight_session_tag_);
+
+  if (OB_NOT_NULL(cancellation) && cancellation->is_cancelled()) {
+    return OB_CANCELED;
+  }
 
   // gRPC threads have no per-request memory context set up by the tenant scheduler,
   // so THIS_WORKER.get_sql_arena_allocator() falls back to the process-global ROOT_CONTEXT
@@ -2464,13 +2704,14 @@ int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
     audit_rec.exec_record_.record_start();
   }
 
-  if (OB_FAIL(GCTX.sql_engine_->stmt_query(sql, sql_ctx, *result_set))) {
+  if (OB_FAIL(flight_sql_stmt_query_in_resource_group_(
+            session, execution_scope, sql, sql_ctx, *result_set))) {
     ts_src.exec_start_ts_ = common::ObTimeUtility::current_time();
     LOG_WARN("[FlightSQL] QueryProcessor::execute: stmt_query failed",
              K(ret), "ob_trace_id", ObCurTraceId::get_trace_id_str(),
              "sql", sql.ptr());
     flight_sql_finalize_statement_audit_like_mpquery_(
-        session, *ob_sess, sql_ctx, *result_set, ret, arena_alloc, sql, ts_src,
+        session, *ob_sess, sql_ctx, *result_set, ret, arena_alloc, sql, audit_request_name, ts_src,
         enable_perf_event, total_wait_desc);
     return ret;
   }
@@ -2482,7 +2723,7 @@ int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
           result_set->get_field_columns(), result_set->get_physical_plan(),
           trace_id_str_, error_detail_))) {
     flight_sql_finalize_statement_audit_like_mpquery_(
-        session, *ob_sess, sql_ctx, *result_set, ret, arena_alloc, sql, ts_src,
+        session, *ob_sess, sql_ctx, *result_set, ret, arena_alloc, sql, audit_request_name, ts_src,
         enable_perf_event, total_wait_desc);
     return ret;
   }
@@ -2625,14 +2866,21 @@ int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
     }
 
     affected_rows_ = result_set->get_affected_rows();
-    result_set->close();
+    const int close_ret = result_set->close();
+    if (OB_SUCCESS != close_ret) {
+      LOG_WARN("[FlightSQL] QueryProcessor::execute: result_set->close failed",
+               K(close_ret), K(ret), "ob_trace_id", ObCurTraceId::get_trace_id_str());
+      if (OB_SUCC(ret)) {
+        ret = close_ret;
+      }
+    }
     if (OB_SUCCESS == ret) {
       LOG_TRACE("[FlightSQL] QueryProcessor::execute: OK (executed, result_set closed)",
                "ob_trace_id", ObCurTraceId::get_trace_id_str(),
                "plan_id", plan_id_, "sql_id", sql_id_str_.c_str(),
                "sql", sql.ptr(), "batches", (int64_t)batches_.size());
     } else {
-      LOG_WARN("[FlightSQL] QueryProcessor::execute: finished with error after fetch",
+      LOG_WARN("[FlightSQL] QueryProcessor::execute: finished with error during fetch or close",
                K(ret), "ob_trace_id", ObCurTraceId::get_trace_id_str(),
                "plan_id", plan_id_, "sql_id", sql_id_str_.c_str(),
                "sql", sql.ptr(), "batches", (int64_t)batches_.size());
@@ -2640,7 +2888,7 @@ int ObFlightSqlQueryProcessor::execute(ObFlightSqlSession &session,
   }
 
   flight_sql_finalize_statement_audit_like_mpquery_(
-      session, *ob_sess, sql_ctx, *result_set, ret, arena_alloc, sql, ts_src,
+      session, *ob_sess, sql_ctx, *result_set, ret, arena_alloc, sql, audit_request_name, ts_src,
       enable_perf_event, total_wait_desc);
   } // CREATE_WITH_TEMP_CONTEXT
 

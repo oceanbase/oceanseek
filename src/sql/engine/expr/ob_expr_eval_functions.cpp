@@ -1513,8 +1513,8 @@ ObExprRandCanonical::calc_random_expr_canonical,                    /* 890 */
   ObExprImageType::eval_image_type,                                   /* 906 */
   NULL, // ObExprRandomPartNextval::eval_nextval,                     /* 907 */
   ObExprGetRoutineParamTypeStr::eval_routine_param_type_str,          /* 908 */
-  ObExprArrowStream::eval_arrow_stream,                               /* 909 */
-  ObExprArrowStreams::eval_arrow_streams,                             /* 910 */
+  ObExprArrowStream::eval_sentinel,                                   /* 909 */
+  ObExprArrowStreams::eval_sentinel,                                  /* 910 */
   ObExprNchr::calc_nchr_expr,                                         /* 911 */
   NULL, // ObExprToMonday::calc_to_monday,                            /* 912 */
   NULL, // ObExprSplitByString::calc_split_by_string,                 /* 913 */

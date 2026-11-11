@@ -17,6 +17,7 @@
 #include "sql/ob_result_set.h"
 #include "sql/session/ob_sql_session_info.h"
 #include "share/rc/ob_tenant_base.h"
+#include "share/resource_manager/ob_cgroup_ctrl.h"
 #include "lib/time/ob_time_utility.h"
 
 using std::bad_alloc;
@@ -29,6 +30,27 @@ namespace oceanbase
 namespace observer
 {
 
+// Flight callbacks may run on a different gRPC thread from open_query().
+// Install only this query's execution state and restore the callback thread.
+ObFlightSqlStreamExecutionScope::ObFlightSqlStreamExecutionScope(
+    sql::ObSQLSessionInfo *session, const int64_t timeout_ts)
+    : previous_session_(THIS_WORKER.get_session()),
+      previous_rpc_tenant_(THIS_WORKER.get_rpc_tenant()),
+      compat_mode_guard_(OB_NOT_NULL(session)
+          && ORACLE_MODE == session->get_compatibility_mode()
+              ? lib::Worker::CompatMode::ORACLE
+              : lib::Worker::CompatMode::MYSQL),
+      timeout_guard_(timeout_ts)
+{
+  THIS_WORKER.set_session(session);
+  THIS_WORKER.reset_rpc_tenant();
+}
+
+ObFlightSqlStreamExecutionScope::~ObFlightSqlStreamExecutionScope()
+{
+  THIS_WORKER.set_rpc_tenant(previous_rpc_tenant_);
+  THIS_WORKER.set_session(previous_session_);
+}
 
 ObFlightBatchReader::ObFlightBatchReader(
     std::shared_ptr<arrow::Schema> schema,
@@ -69,9 +91,6 @@ ObFlightBatchReader::ObFlightBatchReader(
     }
   }
   mark_session_active();
-  if (OB_NOT_NULL(ctx_.session) && OB_NOT_NULL(ctx_.session->ob_session)) {
-    THIS_WORKER.set_session(ctx_.session->ob_session);
-  }
 }
 
 void ObFlightBatchReader::mark_session_active()
@@ -105,6 +124,7 @@ void ObFlightBatchReader::write_sql_audit()
   }
   ObFlightSqlAuditRecord rec;
   rec.tenant_id     = ctx_.session->tenant_id;
+  rec.resource_group_id = ctx_.resource_group_id;
   rec.plan_id       = static_cast<int64_t>(ctx_.plan_id);
   rec.request_time  = ctx_.request_time;
   rec.elapsed_time  = common::ObTimeUtility::current_time() - ctx_.request_time;
@@ -129,46 +149,81 @@ void ObFlightBatchReader::write_sql_audit()
   FBR_SAFE_COPY(rec.trace_id, ctx_.trace_id);
 #undef FBR_SAFE_COPY
   rec.sql_text = ctx_.sql_text;
-  mirror_flight_sql_audit_record_to_gv_sql_audit(*ctx_.session->ob_session, rec);
+  mirror_flight_sql_audit_record_to_gv_sql_audit(
+      *ctx_.session->ob_session, rec, ctx_.request_name.c_str());
 }
 
 ObFlightBatchReader::~ObFlightBatchReader()
 {
-  MAKE_TENANT_SWITCH_SCOPE_GUARD(guard);
-  int ret = guard.switch_to(tenant_id_);
-  if (OB_FAIL(ret)) {
-    LOG_WARN("[FlightSQL] BatchReader dtor: tenant switch failed", K(ret), K(tenant_id_));
-  }
+  (void)Close();
+}
 
-  if (OB_NOT_NULL(result_set_)) {
-    // cur_exec_ctx 在析构时释放，必须在 result_set close 前清理
-    if (OB_NOT_NULL(ctx_.session) && OB_NOT_NULL(ctx_.session->ob_session)
-        && ctx_.session->ob_session->get_cur_exec_ctx() == &result_set_->get_exec_context()) {
-      ctx_.session->ob_session->set_cur_exec_ctx(nullptr);
-    }
-    const int close_ret = result_set_->close();
-    if (OB_SUCCESS != close_ret && OB_SUCCESS == last_ret_) {
-      last_ret_ = close_ret;
-      LOG_WARN("[FlightSQL] BatchReader close failed",
-               K(close_ret), "ob_trace_id", ctx_.trace_id.c_str(),
-               "sql_id", ctx_.sql_id.c_str(), "plan_id", ctx_.plan_id);
-    }
-    write_sql_audit();
-    result_set_.reset();
-    sql_ctx_.reset();
-    schema_guard_.reset();
-    arena_alloc_.reset();
-  } else {
-    write_sql_audit();
+arrow::Status ObFlightBatchReader::Close()
+{
+  int ret = OB_SUCCESS;
+  if (closed_) {
+    return arrow::Status::OK();
   }
-  mark_session_sleep();
-  // query_lock 的持有期覆盖整个流式读取过程，因此在 reader 析构时释放。
+  closed_ = true;
+  iter_end_ = true;
+  MAKE_TENANT_SWITCH_SCOPE_GUARD(guard);
+  share::ObSystemTenantCgroupGuard cgroup_guard;
+  if (OB_FAIL(guard.switch_to(tenant_id_))) {
+    LOG_WARN("[FlightSQL] BatchReader close: tenant switch failed", K(ret), K(tenant_id_));
+  } else if (OB_FAIL(cgroup_guard.switch_to(tenant_id_, ctx_.resource_group_id))) {
+    LOG_WARN("[FlightSQL] BatchReader close: cgroup switch failed",
+             K(ret), K(tenant_id_), K(ctx_.resource_group_id));
+  }
+  ObFlightSqlStreamExecutionScope reader_scope(
+      OB_NOT_NULL(ctx_.session) ? ctx_.session->ob_session : nullptr, ctx_.timeout_ts);
+  if (OB_NOT_NULL(ctx_.session) && OB_NOT_NULL(ctx_.session->ob_session)) {
+    ctx_.session->ob_session->set_thread_id(GETTID());
+  }
+  // Cleanup must still release the session lock and query allocations if a
+  // cgroup attachment fails during cancellation or tenant teardown.
+  const int close_ret = close_result();
+  if (OB_SUCC(ret)) {
+    ret = close_ret;
+  }
+  return sql::ob_ret_to_arrow_status(ret, ctx_.trace_id.c_str(), ctx_.sql_text);
+}
+
+int ObFlightBatchReader::close_result()
+{
+  int ret = OB_SUCCESS;
+  WITH_CONTEXT(mem_ctx_) {
+    if (OB_NOT_NULL(result_set_)) {
+      // cur_exec_ctx 在析构时释放，必须在 result_set close 前清理
+      if (OB_NOT_NULL(ctx_.session) && OB_NOT_NULL(ctx_.session->ob_session)
+          && ctx_.session->ob_session->get_cur_exec_ctx() == &result_set_->get_exec_context()) {
+        ctx_.session->ob_session->set_cur_exec_ctx(nullptr);
+      }
+      const int close_ret = result_set_->close();
+      if (OB_SUCCESS != close_ret && OB_SUCCESS == last_ret_) {
+        last_ret_ = close_ret;
+        ret = close_ret;
+        LOG_WARN("[FlightSQL] BatchReader close failed",
+                 K(close_ret), "ob_trace_id", ctx_.trace_id.c_str(),
+                 "sql_id", ctx_.sql_id.c_str(), "plan_id", ctx_.plan_id);
+      }
+      write_sql_audit();
+      result_set_.reset();
+      sql_ctx_.reset();
+      schema_guard_.reset();
+      arena_alloc_.reset();
+    } else {
+      write_sql_audit();
+    }
+    mark_session_sleep();
+  }
+  root_op_ = nullptr;
+  // query_lock 的持有期覆盖整个流式读取过程，因此在 reader 关闭时释放。
   if (query_locked_ && OB_NOT_NULL(ctx_.session) && OB_NOT_NULL(ctx_.session->ob_session)) {
     (void)ctx_.session->ob_session->unlock_query();
     query_locked_ = false;
   }
-  THIS_WORKER.set_session(nullptr);
   DESTROY_CONTEXT(mem_ctx_);
+  return ret;
 }
 
 arrow::Status ObFlightBatchReader::ReadNext(std::shared_ptr<arrow::RecordBatch> *out)
@@ -182,14 +237,31 @@ arrow::Status ObFlightBatchReader::ReadNext(std::shared_ptr<arrow::RecordBatch> 
   int ret = OB_SUCCESS;
   OB_TRY_BEGIN;
     MAKE_TENANT_SWITCH_SCOPE_GUARD(guard);
-    if (OB_FAIL(guard.switch_to(tenant_id_))) {
+    share::ObSystemTenantCgroupGuard cgroup_guard;
+    ObFlightSqlStreamExecutionScope reader_scope(
+        OB_NOT_NULL(ctx_.session) ? ctx_.session->ob_session : nullptr, ctx_.timeout_ts);
+    if (OB_ISNULL(out)) {
+      ret = OB_INVALID_ARGUMENT;
+    } else if (closed_) {
+      *out = nullptr;
+    } else if (OB_FAIL(guard.switch_to(tenant_id_))) {
       LOG_WARN("[FlightSQL] ReadNext: tenant switch failed", K(ret), K(tenant_id_));
+    } else if (OB_FAIL(cgroup_guard.switch_to(tenant_id_, ctx_.resource_group_id))) {
+      LOG_WARN("[FlightSQL] ReadNext: cgroup switch failed",
+               K(ret), K(tenant_id_), K(ctx_.resource_group_id));
     } else if (iter_end_) {
       *out = nullptr;
-    } else if (is_vectorized_) {
-      ret = read_next_vectorized(out);
     } else {
-      ret = read_next_rows(out);
+      if (OB_NOT_NULL(ctx_.session) && OB_NOT_NULL(ctx_.session->ob_session)) {
+        ctx_.session->ob_session->set_thread_id(GETTID());
+      }
+      WITH_CONTEXT(mem_ctx_) {
+        if (is_vectorized_) {
+          ret = read_next_vectorized(out);
+        } else {
+          ret = read_next_rows(out);
+        }
+      }
     }
   OB_TRY_END;
   if (OB_SUCC(ret) && OB_NOT_NULL(out) && OB_NOT_NULL(*out)) {

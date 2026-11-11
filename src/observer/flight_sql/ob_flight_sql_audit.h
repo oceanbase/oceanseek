@@ -28,6 +28,7 @@ struct ObFlightSqlAuditRecord
   bool     is_valid{false};
   int64_t  request_id{0};
   uint64_t tenant_id{0};
+  uint64_t resource_group_id{0};
   char     user_name[common::OB_MAX_USERNAME_LENGTH + 1]{};
   char     schema_name[common::OB_MAX_DATABASE_NAME_LENGTH + 1]{};
   char     catalog_name[common::OB_MAX_CATALOG_NAME_LENGTH + 1]{};
@@ -49,7 +50,10 @@ struct ObFlightSqlAuditRecord
   sql::stmt::StmtType stmt_type{sql::stmt::T_NONE};
 };
 
-void mirror_flight_sql_audit_record_to_gv_sql_audit(sql::ObSQLSessionInfo &session, const ObFlightSqlAuditRecord &rec);
+void mirror_flight_sql_audit_record_to_gv_sql_audit(
+    sql::ObSQLSessionInfo &session,
+    const ObFlightSqlAuditRecord &rec,
+    const char *request_name);
 
 } // namespace observer
 } // namespace oceanbase

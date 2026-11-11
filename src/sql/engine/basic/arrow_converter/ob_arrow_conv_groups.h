@@ -112,8 +112,8 @@ struct DateGroup
   };
 };
 
-// 字符串组。统一通过 ObTextStringHelper 解码 inrow/outrow/lob payload，
-// 只有真实 payload 为空时才补 null；builder 类型在构造时预先判定。
+// 字符串组。统一通过 ObTextStringHelper 解码 inrow/outrow/lob payload。
+// SQL NULL 已由 batch_convert 处理；非 NULL 的零长度 payload 必须保留为空值。
 template <common::ObObjType OT, arrow::Type::type AT>
 struct StrGroup
 {
@@ -146,11 +146,6 @@ struct StrGroup
       } else if (OB_FAIL(ObTextStringHelper::read_real_string_data(
                      *arena_, &vec_, datum_meta_, s, i))) {
         LOG_WARN("read string data failed", K(ret), K(i));
-      } else if (OB_ISNULL(s.ptr())) {
-        if (OB_ARROW_FAIL(builder_.AppendNull())) {
-          ret = arrow_status_to_ob_ret(status);
-          LOG_WARN("append null failed", K(ret), "st", status.ToString().c_str(), K(i));
-        }
       } else if (is_large_binary_) {
         if (OB_ARROW_FAIL(static_cast<arrow::LargeBinaryBuilder &>(builder_).Append(
                 reinterpret_cast<const uint8_t *>(s.ptr()),

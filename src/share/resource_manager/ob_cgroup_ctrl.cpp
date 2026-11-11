@@ -6,7 +6,12 @@
 #define USING_LOG_PREFIX SERVER_OMT
 
 #include "ob_cgroup_ctrl.h"
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
 #include "lib/file/file_directory_utils.h"
+#include "lib/worker.h"
+#include "share/ob_server_struct.h"
 #include "share/io/ob_io_manager.h"
 #include "share/resource_manager/ob_resource_manager.h"
 #include "observer/omt/ob_tenant.h"
@@ -561,6 +566,180 @@ int ObCgroupCtrl::add_process_to_cgroup(const pid_t pid, const uint64_t tenant_i
 int ObCgroupCtrl::add_self_to_cgroup_(const uint64_t tenant_id, const uint64_t group_id, const bool is_background)
 {
   return add_thread_to_cgroup_(GETTID(), tenant_id, group_id, is_background);
+}
+
+int ObCgroupCtrl::add_self_to_cgroup(const uint64_t tenant_id, const uint64_t group_id)
+{
+  int ret = OB_SUCCESS;
+  if (is_valid()) {
+    if (!is_valid_tenant_id(tenant_id) || !is_valid_resource_group(group_id)) {
+      ret = OB_INVALID_ARGUMENT;
+      LOG_WARN("invalid explicit cgroup binding", K(ret), K(tenant_id), K(group_id));
+    } else {
+      char group_path[PATH_BUFSIZE] = {};
+      bool exist_cgroup = false;
+      if (is_resource_manager_group(group_id)) {
+        char tenant_path[PATH_BUFSIZE] = {};
+        ObGroupName group_name;
+        if (OB_FAIL(get_group_info_by_group_id(tenant_id, group_id, group_name))) {
+          LOG_WARN("get explicit consumer group name failed", K(ret), K(tenant_id), K(group_id));
+        } else if (OB_FAIL(get_group_path(
+                       tenant_path, sizeof(tenant_path), tenant_id, OB_INVALID_GROUP_ID))) {
+          LOG_WARN("get explicit tenant cgroup path failed", K(ret), K(tenant_id));
+        } else {
+          // Resolve the name once: get_group_path's native fallback to the default
+          // group must not turn an unsuccessful explicit binding into success.
+          const int len = snprintf(group_path, sizeof(group_path), "%s/OBRM_%.*s", tenant_path,
+              group_name.get_value().length(), group_name.get_value().ptr());
+          if (len < 0 || len >= sizeof(group_path)) {
+            ret = OB_SIZE_OVERFLOW;
+          }
+        }
+      } else if (OB_FAIL(get_group_path(group_path, sizeof(group_path), tenant_id, group_id))) {
+        LOG_WARN("get explicit cgroup path failed", K(ret), K(tenant_id), K(group_id));
+      }
+      if (OB_SUCC(ret)) {
+        if (OB_FAIL(check_cgroup_root_dir())) {
+          LOG_WARN("check explicit cgroup root failed", K(ret));
+        } else if (OB_FAIL(FileDirectoryUtils::is_exists(group_path, exist_cgroup))) {
+          LOG_WARN("check explicit cgroup directory failed", K(ret), K(group_path));
+        } else if (!exist_cgroup && OB_FAIL(init_full_dir_(group_path))) {
+          LOG_WARN("initialize explicit cgroup directory failed", K(ret), K(group_path));
+        } else if (OB_FAIL(add_self_to_cgroup_path(group_path))) {
+          LOG_WARN("bind current thread to explicit cgroup failed", K(ret), K(tenant_id), K(group_id));
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+int ObCgroupCtrl::add_self_to_cgroup_path(const char *group_path)
+{
+  int ret = OB_SUCCESS;
+  int fd = -1;
+  char tasks_path[PATH_BUFSIZE + 16] = {};
+  char tid_value[VALUE_BUFSIZE] = {};
+  if (OB_ISNULL(group_path) || '\0' == group_path[0]) {
+    ret = OB_INVALID_ARGUMENT;
+  } else {
+    const int path_len = snprintf(tasks_path, sizeof(tasks_path), "%s/%s", group_path, TASKS_FILE);
+    const int tid_len = snprintf(tid_value, sizeof(tid_value), "%ld", GETTID());
+    if (path_len < 0 || path_len >= sizeof(tasks_path) || tid_len <= 0 || tid_len >= sizeof(tid_value)) {
+      ret = OB_SIZE_OVERFLOW;
+    } else {
+      do {
+        fd = ::open(tasks_path, O_WRONLY | O_CLOEXEC);
+      } while (fd < 0 && EINTR == errno);
+      if (fd < 0) {
+        ret = OB_IO_ERROR;
+        LOG_WARN("open current thread cgroup tasks failed", K(ret), K(tasks_path), K(errno), KERRMSG);
+      } else {
+        ssize_t write_size = -1;
+        do {
+          write_size = ::write(fd, tid_value, tid_len);
+        } while (write_size < 0 && EINTR == errno);
+        if (write_size != tid_len) {
+          ret = OB_IO_ERROR;
+          LOG_WARN("write current thread cgroup tasks failed", K(ret), K(tasks_path), K(write_size),
+              K(errno), KERRMSG);
+        }
+      }
+    }
+  }
+  if (fd >= 0 && 0 != ::close(fd)) {
+    ret = OB_IO_ERROR;
+    LOG_WARN("close current thread cgroup tasks failed", K(ret), K(tasks_path), K(fd), K(errno), KERRMSG);
+  }
+  return ret;
+}
+
+ObSystemTenantCgroupGuard::ObSystemTenantCgroupGuard()
+  : initialized_(false),
+    cgroup_changed_(false),
+    thread_id_(0),
+    original_group_id_(0),
+    original_origin_tenant_id_(0),
+    restore_tenant_id_(OB_SYS_TENANT_ID),
+    restore_group_id_(OBCG_DEFAULT),
+    cgroup_ctrl_(nullptr)
+{
+}
+
+ObSystemTenantCgroupGuard::~ObSystemTenantCgroupGuard()
+{
+  const int ret = restore();
+  if (OB_SUCCESS != ret) {
+    LOG_ERROR("restore tenant consumer group failed", K(ret), K_(thread_id), K_(original_group_id),
+              K_(restore_tenant_id), K_(restore_group_id));
+  }
+}
+
+int ObSystemTenantCgroupGuard::switch_to(const uint64_t tenant_id, const uint64_t group_id)
+{
+  int ret = OB_SUCCESS;
+  if (!is_valid_tenant_id(tenant_id) || !is_valid_resource_group(group_id)) {
+    ret = OB_INVALID_ARGUMENT;
+  } else if (initialized_ && thread_id_ != GETTID()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("tenant consumer group scope crossed OS threads",
+              K(ret), K_(thread_id), K(GETTID()));
+  } else {
+    if (!initialized_) {
+      original_group_id_ = GET_GROUP_ID();
+      original_origin_tenant_id_ = GET_ORIGIN_TENANT_ID();
+      // A system-tenant transport thread can have no native worker origin. Its
+      // physical baseline is nevertheless the system tenant default cgroup.
+      // Nested guards see the explicit origin installed by their parent.
+      const bool has_explicit_parent = is_valid_tenant_id(original_origin_tenant_id_);
+      restore_tenant_id_ = has_explicit_parent
+          ? original_origin_tenant_id_ : OB_SYS_TENANT_ID;
+      restore_group_id_ = has_explicit_parent ? original_group_id_ : OBCG_DEFAULT;
+      thread_id_ = GETTID();
+      initialized_ = true;
+    }
+    ObCgroupCtrl *ctrl = GCTX.cgroup_ctrl_;
+    if (nullptr != ctrl && ctrl->is_valid()) {
+      cgroup_ctrl_ = ctrl;
+      // Preserve restoration after every attempted attachment, including an
+      // error returned after opening the target tasks file.
+      cgroup_changed_ = true;
+      if (OB_FAIL(ctrl->add_self_to_cgroup(tenant_id, group_id))) {
+        LOG_WARN("switch tenant consumer group failed", K(ret), K(tenant_id), K(group_id));
+      }
+    }
+    if (OB_SUCC(ret)) {
+      THIS_WORKER.set_group_id_(group_id);
+      // Nested native guards derive cgroup ownership from the origin tenant.
+      ob_get_origin_tenant_id() = tenant_id;
+    }
+  }
+  return ret;
+}
+
+int ObSystemTenantCgroupGuard::restore()
+{
+  int ret = OB_SUCCESS;
+  if (!initialized_) {
+  } else if (thread_id_ != GETTID()) {
+    ret = OB_ERR_UNEXPECTED;
+    LOG_ERROR("restore tenant consumer group from another OS thread",
+              K(ret), K_(thread_id), K(GETTID()));
+  } else {
+    if (cgroup_changed_
+        && OB_FAIL(cgroup_ctrl_->add_self_to_cgroup(restore_tenant_id_, restore_group_id_))) {
+      LOG_ERROR("restore parent thread cgroup failed",
+                K(ret), K_(restore_tenant_id), K_(restore_group_id));
+    }
+    THIS_WORKER.set_group_id_(original_group_id_);
+    ob_get_origin_tenant_id() = original_origin_tenant_id_;
+    if (OB_SUCC(ret)) {
+      initialized_ = false;
+      cgroup_changed_ = false;
+      cgroup_ctrl_ = nullptr;
+    }
+  }
+  return ret;
 }
 
 int ObCgroupCtrl::add_thread_to_cgroup_(

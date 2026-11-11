@@ -4029,6 +4029,15 @@ int ob_flight_sql_get_output_col_desc(
   int ret = OB_SUCCESS;
   const int compatibility_mode = is_oracle_mode ? ORACLE_MODE : MYSQL_MODE;
   const arrow::Type::type arrow_id = arrow_field.type()->id();
+  const std::shared_ptr<const arrow::KeyValueMetadata> metadata = arrow_field.metadata();
+  if (metadata && metadata->Contains("ARROW:extension:name")) {
+    // IPC exposes an unregistered extension as its storage type with metadata.
+    // Reject it before treating that storage type as a supported middle type.
+    ret = OB_NOT_SUPPORTED;
+    LOG_WARN("[FlightSQL] Arrow extension ingest type is not supported", K(ret),
+             "field_name", arrow_field.name().c_str());
+    return ret;
+  }
 
   // This descriptor is the Arrow-plus-compatibility-mode middle type.  It is
   // intentionally independent of the table column selected by the INSERT.

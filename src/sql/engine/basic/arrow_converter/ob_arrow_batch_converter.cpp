@@ -673,15 +673,12 @@ static int append_string_datum_to_builder(const ObExpr &expr,
           arena, datum, expr.datum_meta_, s))) {
     LOG_WARN("read string payload failed", K(ret), K(expr.datum_meta_.type_));
   } else if (builder.type()->id() == arrow::Type::LARGE_BINARY) {
-    if (OB_NOT_NULL(s.ptr())) {
-      if (OB_ARROW_FAIL(static_cast<arrow::LargeBinaryBuilder &>(builder).Append(
-              reinterpret_cast<const uint8_t *>(s.ptr()), static_cast<int64_t>(s.length())))) {
-        ret = arrow_status_to_ob_ret(status);
-        LOG_WARN("append binary failed", K(ret), "st", status.ToString().c_str());
-      }
-    } else if (OB_ARROW_FAIL(builder.AppendNull())) {
+    // The caller checked datum.is_null(); a null pointer with length zero is
+    // a valid empty binary value, which Arrow Append preserves as non-null.
+    if (OB_ARROW_FAIL(static_cast<arrow::LargeBinaryBuilder &>(builder).Append(
+            reinterpret_cast<const uint8_t *>(s.ptr()), static_cast<int64_t>(s.length())))) {
       ret = arrow_status_to_ob_ret(status);
-      LOG_WARN("append null failed", K(ret), "st", status.ToString().c_str());
+      LOG_WARN("append binary failed", K(ret), "st", status.ToString().c_str());
     }
   } else if (OB_ARROW_FAIL(static_cast<arrow::StringBuilder &>(builder).Append(
                  s.ptr(), static_cast<int32_t>(s.length())))) {
@@ -1053,6 +1050,7 @@ int ObArrowBatchConverter::append_datum_to_builder(const ObExpr &expr,
       case ObExtendBLobType:
       case ObEnumType:
       case ObSetType:
+      case ObLobType:
         ret = append_string_datum_to_builder(expr, datum, builder, lob_arena);
         break;
       case ObURowIDType:
@@ -1061,19 +1059,6 @@ int ObArrowBatchConverter::append_datum_to_builder(const ObExpr &expr,
       case ObJsonType:
         ret = append_json_datum_to_builder(expr, datum, builder, lob_arena);
         break;
-      case ObLobType: {
-        common::ObString s;
-        if (OB_FAIL(ObTextStringHelper::read_real_string_data(
-                lob_arena, datum, expr.datum_meta_, s))) {
-          LOG_WARN("read lob payload failed", K(ret));
-        } else if (OB_NOT_NULL(s.ptr())) {
-          ret = arrow_status_to_ob_ret(static_cast<arrow::LargeBinaryBuilder&>(builder).Append(
-              reinterpret_cast<const uint8_t *>(s.ptr()), static_cast<int64_t>(s.length())));
-        } else {
-          ret = arrow_status_to_ob_ret(builder.AppendNull());
-        }
-        break;
-      }
       case ObCollectionSQLType:
         ret = append_collection_datum_to_builder(
             expr, datum, builder, lob_arena, eval_ctx);
@@ -1112,6 +1097,27 @@ int ObArrowBatchConverter::append_brs_to_builders(
       if (OB_ISNULL(expr) || OB_ISNULL(builders[col])) {
         ret = OB_ERR_UNEXPECTED;
         LOG_WARN("null expr or builder", K(ret), K(col));
+      } else if (UINT32_MAX == expr->vector_header_off_) {
+        // Legacy batch expressions have datum arrays without vector storage.
+        // Calling eval_vector/get_vector would read an invalid frame offset.
+        ObEvalCtx::BatchInfoScopeGuard batch_guard(eval_ctx);
+        batch_guard.set_batch_size(nrows);
+        batch_guard.set_batch_idx(0);
+        if (OB_FAIL(expr->eval_batch(eval_ctx, *brs.skip_, nrows))) {
+          LOG_WARN("eval_batch failed", K(ret), K(col));
+        } else {
+          const common::ObDatum *datums = expr->locate_batch_datums(eval_ctx);
+          for (int64_t row = 0; OB_SUCC(ret) && row < nrows; ++row) {
+            if (brs.all_rows_active_ || !brs.skip_->at(row)) {
+              batch_guard.set_batch_idx(row);
+              const common::ObDatum &datum = datums[expr->is_batch_result() ? row : 0];
+              if (OB_FAIL(append_datum_to_builder(
+                      *expr, datum, *builders[col], lob_arena, &eval_ctx))) {
+                LOG_WARN("append batch datum failed", K(ret), K(col), K(row));
+              }
+            }
+          }
+        }
       } else if (OB_FAIL(expr->eval_vector(eval_ctx, brs))) {
         LOG_WARN("eval_vector failed", K(ret), K(col));
       } else if (OB_ISNULL(vec = expr->get_vector(eval_ctx))) {
