@@ -131,8 +131,6 @@ int ObExprJsonOverlaps::json_overlaps_object(const ObJsonWrapper &wrapper_a,
   if (wrapper_a.json_type() != ObJsonNodeType::J_OBJECT
       || wrapper_b.json_type() != ObJsonNodeType::J_OBJECT) {
     result = false;
-  } else if (wrapper_a.element_count() == 0 && wrapper_b.element_count() == 0) {
-    result = true;
   } else {
     uint32_t cnt_b = wrapper_b.element_count();
     for (uint32_t i = 0; OB_SUCC(ret) && !result && i < cnt_b; ++i) {
