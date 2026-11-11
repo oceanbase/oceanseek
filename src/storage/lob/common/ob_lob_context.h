@@ -86,6 +86,7 @@ struct ObLobReadContext : public ObLobContextBase
 {
 public:
   ObLobReadContext();
+  ~ObLobReadContext();
 
   int build(common::ObLobLocatorV2 &lob_locator,
             common::ObIAllocator &allocator,
@@ -129,6 +130,8 @@ public:
   ObLobAccessCtx *access_ctx_;
   common::ObString seq_id_start_;
   common::ObString seq_id_end_;
+  // iter_allocator_ only used for query iter, can be reset in retry process
+  common::ObArenaAllocator iter_allocator_;
 };
 
 enum class ObLobDmlOp

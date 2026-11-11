@@ -159,13 +159,12 @@ int ObLobLocationUtil::lob_refresh_location(ObLobReadContext &read_ctx, int last
     has_retry_info = false;
   }
 
-  if (!has_retry_info) {
-    // do check remote
+  if (OB_FAIL(ObDASUtils::wait_das_retry(retry_cnt))) {
+    LOG_WARN("wait das retry failed", KR(ret), K(last_err), K(retry_cnt));
+  } else if (!has_retry_info) {
     if (OB_FAIL(ObLobLocationUtil::get_ls_leader(read_ctx))) {
-      LOG_WARN("fail to do check is remote", K(ret));
+      LOG_WARN("fail to do check is remote", KR(ret));
     }
-  } else if (OB_FAIL(ObDASUtils::wait_das_retry(retry_cnt))) {
-    LOG_WARN("wait das retry failed", K(ret), K(last_err), K(retry_cnt));
   } else {
     // do location refresh
     ObArenaAllocator tmp_allocator("LobRefLoc", OB_MALLOC_NORMAL_BLOCK_SIZE, read_ctx.tenant_id_);

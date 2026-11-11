@@ -109,8 +109,14 @@ ObLobReadContext::ObLobReadContext()
     is_full_table_scan_(false),
     access_ctx_(nullptr),
     seq_id_start_(),
-    seq_id_end_()
-{}
+    seq_id_end_(),
+    iter_allocator_("LobIter", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID())
+{
+}
+
+ObLobReadContext::~ObLobReadContext()
+{
+}
 
 int ObLobReadContext::build_for_dml(
     const ObDMLRunningCtx &run_ctx,

@@ -65,6 +65,7 @@ int ObLobQueryBaseHandler::execute()
       if (OB_NOT_NULL(read_ctx_.access_ctx_)) {
         read_ctx_.access_ctx_->reset();
       }
+      read_ctx_.iter_allocator_.reset();
       ++retry_cnt;
       LOG_INFO("[LOB RETRY] retry again", K(ret), K(retry_cnt), K(read_ctx_),
           K(read_ctx_.allocator_->total()), K(read_ctx_.allocator_->used()));

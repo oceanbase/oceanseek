@@ -23,12 +23,15 @@ namespace storage
 ObLobRemoteQueryHandler::ObLobRemoteQueryHandler()
   : is_inited_(false),
     allocator_(nullptr),
+    rpc_allocator_("LobRpc", OB_MALLOC_NORMAL_BLOCK_SIZE, MTL_ID()),
     handle_(),
     rpc_buffer_(),
     query_arg_(),
     rpc_buffer_pos_(0),
     buffer_()
-{}
+{
+  reset();
+}
 
 int ObLobRemoteQueryHandler::init(const ObLobReadContext &read_ctx, const ObLobQueryArg::QueryType &qtype)
 {
@@ -41,14 +44,14 @@ int ObLobRemoteQueryHandler::init(const ObLobReadContext &read_ctx, const ObLobQ
   } else if (OB_ISNULL(allocator_ = read_ctx.allocator_)) {
     ret = OB_INVALID_ARGUMENT;
     LOG_WARN("invalid argument", KR(ret), KP(read_ctx.allocator_));
-  } else if (OB_ISNULL(buf = static_cast<char *>(allocator_->alloc(buf_len)))) {
+  } else if (OB_ISNULL(buf = static_cast<char *>(rpc_allocator_.alloc(buf_len)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to alloc memory", KR(ret), K(buf_len));
   } else if (OB_UNLIKELY(!rpc_buffer_.set_data(buf, buf_len))) {
     ret = OB_ERR_UNEXPECTED;
     LOG_WARN("failed to set data for rpc_buffer_", KR(ret), KP(buf), K(buf_len));
   } else if (FALSE_IT(buf = nullptr)) {
-  } else if (OB_ISNULL(buf = static_cast<char *>(allocator_->alloc(buf_len)))) {
+  } else if (OB_ISNULL(buf = static_cast<char *>(rpc_allocator_.alloc(buf_len)))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("failed to alloc memory", KR(ret), K(buf_len));
   } else {
@@ -72,18 +75,13 @@ void ObLobRemoteQueryHandler::reset()
   if (handle_.has_more()) {
     handle_.abort();
   }
-  if (rpc_buffer_.get_data() != nullptr) {
-    allocator_->free(rpc_buffer_.get_data());
-  }
   rpc_buffer_.reset();
-  if (buffer_.ptr() != nullptr) {
-    allocator_->free(buffer_.ptr());
-  }
   buffer_.reset();
   allocator_ = nullptr;
   query_arg_.reset();
   rpc_buffer_pos_ = 0;
   is_inited_ = false;
+  rpc_allocator_.reset();
 }
 
 int ObLobRemoteQueryHandler::get_next_block(ObString &data)

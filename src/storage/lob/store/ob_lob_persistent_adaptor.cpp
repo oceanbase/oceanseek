@@ -864,14 +864,12 @@ int ObPersistentLobAdaptor::scan_lob_aux(
       // same cache only holds iters of this T, so the downcast is safe
       iter = static_cast<ObLobAuxTableIterator<T> *>(base_iter);
     }
-  } else if (OB_ISNULL(read_ctx.allocator_)) {
-    ret = OB_INVALID_ARGUMENT;
-    LOG_WARN("allocator is null", K(ret), K(read_ctx));
-  } else if (OB_ISNULL(tmp_iter = OB_NEWx(ObLobAuxTableIterator<T>, read_ctx.allocator_, nullptr))) {
+  } else if (OB_ISNULL(tmp_iter = OB_NEWx(ObLobAuxTableIterator<T>,
+                                          &read_ctx.iter_allocator_, nullptr/*access_ctx*/))) {
     ret = OB_ALLOCATE_MEMORY_FAILED;
     LOG_WARN("alloc iter fail", K(ret), K(read_ctx),
              "alloc_size", sizeof(ObLobAuxTableIterator<T>));
-  } else if (OB_FAIL(tmp_iter->open(target, read_ctx, this, read_ctx.allocator_))) {
+  } else if (OB_FAIL(tmp_iter->open(target, read_ctx, this, &read_ctx.iter_allocator_))) {
     LOG_WARN("open iter fail", K(ret), K(read_ctx), KPC(tmp_iter));
   } else {
     iter = tmp_iter;

@@ -7,6 +7,7 @@
 #define OCEANBASE_STORAGE_OB_LOB_REMOTE_H_
 
 #include "data_buffer.h"
+#include "lib/allocator/page_arena.h"
 #include "rpc/obrpc/ob_rpc_packet.h"
 #include "rpc/obrpc/ob_rpc_proxy.h"
 #include "storage/ob_storage_rpc.h"
@@ -45,6 +46,8 @@ private:
 private:
   bool is_inited_;
   ObIAllocator *allocator_;
+  // Owns only rpc_buffer_ and buffer_; its lifetime follows this handler.
+  common::ObArenaAllocator rpc_allocator_;
   obrpc::ObStorageRpcProxy::SSHandle<obrpc::OB_LOB_QUERY> handle_;
   common::ObDataBuffer rpc_buffer_;
   ObLobQueryArg query_arg_;
